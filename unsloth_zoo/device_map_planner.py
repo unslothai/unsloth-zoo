@@ -1954,6 +1954,16 @@ def _runtime_quantization_config(kwargs: dict[str, Any]) -> Any:
     return quantization_config
 
 
+def _quantization_method_is_known(quantization_config: Any) -> bool:
+    """``get_hf_quantizer``'s own check; anything it cannot judge is left to transformers."""
+    from transformers.quantizers import AutoHfQuantizer
+
+    try:
+        return bool(AutoHfQuantizer.supports_quant_method(quantization_config))
+    except Exception:
+        return True
+
+
 def _apply_config_overrides(config: Any, overrides: Mapping[str, Any]) -> Any:
     """Copy of ``config`` with overrides applied as ``PretrainedConfig.from_dict`` does."""
     import copy
@@ -2028,15 +2038,20 @@ def build_meta_model(
     checkpoint is sized as it will really be loaded.
 
     ``config`` overrides the repo's config (eg a VLM's ``text_config``).
+    ``rewritten_quantization_config`` replaces the serialized block (ModelOpt FP8 ->
+    ``fp8``), sized as pre-quantized.
     """
     from accelerate import init_empty_weights
     from transformers import AutoConfig
 
+    rewritten_qcfg = from_pretrained_kwargs.pop("rewritten_quantization_config", None)
     runtime_qcfg = _runtime_quantization_config(from_pretrained_kwargs)
     if config is not None:
         config = _apply_config_overrides(config, from_pretrained_kwargs)
     else:
         config = AutoConfig.from_pretrained(model_name_or_path, **from_pretrained_kwargs)
+    if rewritten_qcfg is not None:
+        config.quantization_config = rewritten_qcfg
     trust_remote_code = bool(from_pretrained_kwargs.get("trust_remote_code", False))
     auto_cls = _auto_class_for(config, trust_remote_code=trust_remote_code)
     hf_quantizer = None
@@ -2049,6 +2064,10 @@ def build_meta_model(
         # also what stops a calibration-free quantiser taking the wrong path.
         if serialized_qcfg is None:
             hf_quantizer = AutoHfQuantizer.from_config(runtime_qcfg, pre_quantized=False)
+        elif runtime_qcfg is not None and not _quantization_method_is_known(serialized_qcfg):
+            # Like get_hf_quantizer: an unloadable serialized method is ignored.
+            hf_quantizer = AutoHfQuantizer.from_config(runtime_qcfg, pre_quantized=False)
+            config.quantization_config = runtime_qcfg
         else:
             # The checkpoint's own method wins and the runtime config only
             # overlays its loading attributes -- an 8-bit checkpoint handed a
