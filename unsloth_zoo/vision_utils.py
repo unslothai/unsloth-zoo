@@ -1214,6 +1214,59 @@ def _raise_chat_template_error(error, processor, model = None):
     raise RuntimeError(error) from error
 
 
+def _adopt_tokenizer_chat_template(processor) -> bool:
+    """Remote processors whose __init__ takes no chat_template (MiniMax-M3 VL) never load
+    chat_template.jinja, which their inner tokenizer still does: render with that one."""
+    inner = getattr(processor, "tokenizer", None)
+    if getattr(processor, "chat_template", None) is None and \
+        inner is not None and inner is not processor and \
+        isinstance(getattr(inner, "chat_template", None), str):
+        processor.chat_template = inner.chat_template
+        return True
+    return False
+pass
+
+
+def _renders_content_list_as_repr(rendered, text) -> bool:
+    """A template that string-formats a content list (Nemotron Omni) renders its Python repr,
+    so the model would be trained to emit "[{'type': 'text', ...}]" instead of the text."""
+    return isinstance(rendered, str) and text in rendered and \
+        ("'type': 'text'" in rendered or '"type": "text"' in rendered)
+pass
+
+
+def _processor_takes_images(processor) -> bool:
+    """Remote processors can name their image component differently (Step-3.7 has
+    `image_preprocessor`); what the collator needs is a call that accepts `images`."""
+    import inspect
+    try:
+        params = inspect.signature(type(processor).__call__).parameters
+    except (TypeError, ValueError):
+        return False
+    return "images" in params
+pass
+
+
+def _tensorize_ragged_batch(batch):
+    """Tensorize a processor output made without return_tensors: rectangular fields become
+    tensors (same-shape tensor lists are stacked), ragged ones (per-image pixel tensors of
+    different sizes) stay lists of tensors."""
+    for key in list(batch.keys()):
+        value = batch[key]
+        if torch.is_tensor(value) or not isinstance(value, (list, tuple)) or len(value) == 0:
+            continue
+        items = [torch.as_tensor(v) if isinstance(v, np.ndarray) else v for v in value]
+        if all(torch.is_tensor(v) for v in items):
+            batch[key] = torch.stack(items) if len({tuple(v.shape) for v in items}) == 1 else list(items)
+            continue
+        try:
+            batch[key] = torch.tensor(items)
+        except (ValueError, TypeError, RuntimeError):
+            batch[key] = items
+    return batch
+pass
+
+
 class UnslothVisionDataCollator:
     # All Unsloth Zoo code licensed under LGPLv3
     __slots__ = (
@@ -1223,6 +1276,7 @@ class UnslothVisionDataCollator:
         "num_proc", "assistant_single_content", "patch_size",
         "resize_dimension", "snap_to_patch_size",
         "completion_only_loss", "pad_to_multiple_of", "size_func",
+        "_seen_supervised", "_warned_unsupervised",
     )
 
     def __init__(
@@ -1246,8 +1300,10 @@ class UnslothVisionDataCollator:
         snap_to_patch_size = False,
         last_response_only = False, # Train only on the last assistant turn
     ):
-        if not hasattr(processor, "image_processor"):
+        if not hasattr(processor, "image_processor") and not _processor_takes_images(processor):
             raise TypeError("Unsloth: UnslothVisionDataCollator is only for image models!")
+        self._seen_supervised = False
+        self._warned_unsupervised = False
 
         self.padding_token_ids = get_padding_tokens_ids(processor)
         self.dtype = _get_dtype(
@@ -1353,16 +1409,20 @@ class UnslothVisionDataCollator:
         else:
             self.train_on_responses_only = None
 
+        _adopt_tokenizer_chat_template(processor)
+
         # Check what type for assistant VLM tokenizer allows!
         # Good for Mistral V3 and Pixtral I think
         try:
-            processor.apply_chat_template([
+            rendered = processor.apply_chat_template([
                 {"role": "user", "content": [
                     {"type": "image"},
                     {"type": "text", "text": "Hello!"}]},
                 {"role": "assistant", "content": [
                     {"type": "text", "text": "How can I help you?"}]}
             ])
+            if _renders_content_list_as_repr(rendered, "How can I help you?"):
+                raise TypeError("assistant content rendered as a list repr")
             self.assistant_single_content = False
         except TypeError:
             try:
@@ -1462,7 +1522,22 @@ class UnslothVisionDataCollator:
             proc_kwargs["audio"] = audios
         if self.pad_to_multiple_of is not None:
             proc_kwargs["pad_to_multiple_of"] = self.pad_to_multiple_of
-        batch = self.processor(**proc_kwargs)
+        try:
+            batch = self.processor(**proc_kwargs)
+        except ValueError as e:
+            # Dynamic-resolution processors (e.g. Nemotron Omni) return one pixel tensor per
+            # image when sizes differ, and their outer BatchFeature then fails to stack them.
+            # Such models take the list; convert everything else ourselves.
+            if "Unable to convert output" not in str(e) or not images:
+                raise
+            proc_kwargs["return_tensors"] = None
+            batch = _tensorize_ragged_batch(self.processor(**proc_kwargs))
+            if not torch.is_tensor(batch.get("input_ids")):
+                raise ValueError(
+                    f"Unsloth: {type(self.processor).__name__} returned unpadded input_ids for a "
+                    "batch, so it cannot collate more than one example; use "
+                    "per_device_train_batch_size = 1."
+                ) from e
 
         # Truncate manually when audio is present (couldn't pass max_length to processor)
         if audios and self.truncation and self.max_seq_length:
@@ -1484,7 +1559,30 @@ class UnslothVisionDataCollator:
         batch["labels"] = labels
         if self.train_on_responses_only:
             batch["labels"] = self.train_on_responses_only(batch)["labels"]
+            self._check_supervised(batch["labels"])
         return batch
+
+    def _check_supervised(self, labels):
+        """Masking that matches no response marker leaves every label at ignore_index, and
+        training then runs with a zero loss. Raise on the first batch, warn once later."""
+        if not torch.is_tensor(labels) or labels.dim() != 2 or labels.shape[0] == 0:
+            return
+        empty = int(((labels != self.ignore_index).sum(dim = 1) == 0).sum())
+        if empty == 0:
+            self._seen_supervised = True
+            return
+        msg = (
+            f"Unsloth: {empty} of {labels.shape[0]} examples in this batch have no trainable "
+            "token after train_on_responses_only: the response marker was not found in the "
+            "rendered chat, or the answer was truncated away. Check instruction_part / "
+            "response_part against processor.apply_chat_template, or raise max_seq_length."
+        )
+        # getattr: subclasses may skip __init__ (slots stay unset until assigned).
+        if empty == labels.shape[0] and not getattr(self, "_seen_supervised", False):
+            raise ValueError(msg)
+        if not getattr(self, "_warned_unsupervised", False):
+            self._warned_unsupervised = True
+            logger.warning(msg)
 
     def _select_messages_or_raw(self, example):
         if "messages" in example:
