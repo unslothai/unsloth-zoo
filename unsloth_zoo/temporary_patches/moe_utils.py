@@ -17,11 +17,13 @@ import torch
 import torch.nn.functional as F
 import contextlib
 import json
+import math
 import os
 import shutil
 import stat
 import tempfile
 import sys
+import time
 import warnings
 import importlib
 import importlib.util
@@ -695,15 +697,73 @@ def _source_pins_large_dequant(source) -> bool:
         return False
 
 
-def _moe_recompute_enabled(source) -> bool:
+def _in_gc_recompute() -> bool:
+    try:
+        from unsloth_zoo.gradient_checkpointing import in_gradient_checkpoint_recompute
+        return bool(in_gradient_checkpoint_recompute())
+    except Exception:
+        return False
+
+
+_MOMENTARY_PIN_HEADROOM = 2.0   # free memory must cover this many copies of one layer's stack
+
+
+def _momentary_pin_fits(source, dtype = None) -> bool:
+    """Whether one layer's dequantized stack fits in free + cached-unused memory; unmeasurable means False."""
+    try:
+        param = source
+        while hasattr(param, "base_layer"):
+            param = param.base_layer
+        device = param.device
+        backend = getattr(torch, device.type, None) if device.type in ("cuda", "xpu") else None
+        if backend is None or not callable(getattr(backend, "mem_get_info", None)):
+            return False
+        shape = _logical_expert_shape(param)
+        if not shape:
+            return False
+        dtype = dtype or getattr(getattr(param, "quant_state", None), "dtype", None) or torch.bfloat16
+        need = math.prod(int(d) for d in shape) * dtype.itemsize
+        # Cached briefly: mem_get_info per source per replay costs more than the dequant it saves.
+        key = (device.type, device.index, need, _MOMENTARY_PIN_HEADROOM)
+        now = time.monotonic()
+        hit = _MOMENTARY_PIN_FITS_CACHE.get(key)
+        if hit is not None and now - hit[1] < _MOMENTARY_PIN_FITS_TTL_S:
+            return hit[0]
+        free, _ = backend.mem_get_info(device)
+        free += backend.memory_reserved(device) - backend.memory_allocated(device)
+        fits = free >= _MOMENTARY_PIN_HEADROOM * need
+        _MOMENTARY_PIN_FITS_CACHE[key] = (fits, now)
+        return fits
+    except Exception:
+        return False
+
+
+_MOMENTARY_PIN_FITS_CACHE = {}
+_MOMENTARY_PIN_FITS_TTL_S = 0.5
+
+
+def _moe_recompute_enabled(source, dtype = None) -> bool:
     """Whether to recompute the dequantized base stack in backward (True) or pin it
     for reuse (False). Only a frozen, grouped-mm-capable base can be recomputed; for
-    everything else the pinned eager path is used. A bnb 4-bit base prefers recompute
-    even under gradient checkpointing so the momentary pin never holds the full bf16
-    expert dequant (see _source_pins_large_dequant)."""
-    return _base_is_recomputable(source) and _moe_recompute_default(
-        prefer_memory = _source_pins_large_dequant(source)
-    )
+    everything else the pinned eager path is used. A bnb 4-bit base recomputes unless
+    UNSLOTH_MOE_GC_REPLAY_PIN=1 and, inside a gradient-checkpoint replay, the stack fits:
+    the pin then saves a dequant for the same layer's backward but raises peak memory."""
+    if not _base_is_recomputable(source):
+        return False
+    override = os.environ.get("UNSLOTH_MOE_RECOMPUTE")
+    if override == "1":
+        return True
+    if override == "0":
+        return False
+    if _source_pins_large_dequant(source):
+        if (
+            os.environ.get("UNSLOTH_MOE_GC_REPLAY_PIN") == "1"
+            and _in_gc_recompute()
+            and _momentary_pin_fits(source, dtype = dtype)
+        ):
+            return False
+        return True
+    return _moe_recompute_default()
 
 
 class _GroupedMMRecompute(torch.autograd.Function):
@@ -1721,16 +1781,20 @@ def _get_base_weight(param, target_dtype=None):
                 "MoE quantizer patch did not fire for this expert. "
                 f"data.shape={tuple(param.data.shape)}, device={param.device}."
             )
-        # An expert stack of 2**31 elements or more aborts inside the
-        # bitsandbytes dequantize kernel (csrc/ops.cu line 93), and this is the
-        # read the recompute and grouped-mm providers take on every forward and
-        # again on every backward recomputation. Slice it the same way the load
-        # does; the helper returns None for everything smaller, which leaves the
-        # single call below untouched.
-        # Resolved once and memoized rather than imported per call, since this
-        # is a read on every forward and every backward recomputation.
-        slicer = _get_dequantize_4bit_in_slices()
-        weight = slicer(param) if slicer is not None else None
+        # Absolute import: this file is also copied into unsloth_compiled_cache and imported top-level.
+        weight = None
+        try:
+            from unsloth_zoo.temporary_patches.moe_triton_kernels import nf4_dequant_triton
+        except ImportError:
+            nf4_dequant_triton = None
+        if nf4_dequant_triton is not None:
+            weight = nf4_dequant_triton(
+                param.data, param.quant_state, getattr(param, "_original_shape", None),
+            )
+        if weight is None:
+            # >= 2**31-element stacks abort in bitsandbytes dequantize (csrc/ops.cu:93); slice like the load does.
+            slicer = _get_dequantize_4bit_in_slices()
+            weight = slicer(param) if slicer is not None else None
         if weight is None:
             weight = bnb.functional.dequantize_4bit(param.data, param.quant_state)
         original_shape = getattr(param, "_original_shape", None)
@@ -3366,6 +3430,23 @@ def patch_param_wrapper_for_moe():
 # UNSLOTH_MOE_GATEGRAD=0 to revert to the standard <dOut, Y> path.
 
 
+_WEIGHTED_UNPERMUTE = None
+
+
+def weighted_unpermute(*args, **kwargs):
+    """Fused Triton combine, or None so the caller falls back to the eager reduction."""
+    global _WEIGHTED_UNPERMUTE
+    if _WEIGHTED_UNPERMUTE is None:
+        try:
+            from unsloth_zoo.temporary_patches.moe_triton_kernels import weighted_unpermute as _wu
+        except ImportError:
+            _wu = False
+        _WEIGHTED_UNPERMUTE = _wu
+    if _WEIGHTED_UNPERMUTE is False:
+        return None
+    return _WEIGHTED_UNPERMUTE(*args, **kwargs)
+
+
 @lru_cache(maxsize=1)
 def _moe_gategrad_enabled() -> bool:
     """Whether the MoE gate-gradient identity path is active (on by default).
@@ -3499,7 +3580,7 @@ def forward_native_grouped_mm(
         def _gate_up_provider(_src=_gate_up_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype, _mod=self):
             return preprocess_weight(_get_base_weight(_src, _dt), "gate_up", _h, _mt, experts_module=_mod)
         mm1_out = _base_grouped_mm(
-            permuted_input, offsets, _gate_up_provider, _moe_recompute_enabled(_gate_up_src),
+            permuted_input, offsets, _gate_up_provider, _moe_recompute_enabled(_gate_up_src, dtype=hidden_states.dtype),
         )
 
         # Separated LoRA: + ((X @ first) @ second) * scaling.
@@ -3678,7 +3759,7 @@ def forward_native_grouped_mm(
         def _down_provider(_src=_down_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype, _mod=self):
             return preprocess_weight(_get_base_weight(_src, _dt), "down", _h, _mt, experts_module=_mod)
         mm2_out = _base_grouped_mm(
-            inter, offsets, _down_provider, _moe_recompute_enabled(_down_src),
+            inter, offsets, _down_provider, _moe_recompute_enabled(_down_src, dtype=hidden_states.dtype),
         )
 
         if down_lora is not None:
@@ -3739,19 +3820,28 @@ def forward_native_grouped_mm(
     # Apply routing weights and scatter-add (reduce).
     if _gategrad:
         # Gate grad comes from the identity; detach so the multiply does not pin Y.
-        mm2_out = mm2_out * permuted_weights.detach().unsqueeze(-1)
+        permuted_weights = permuted_weights.detach()
     else:
         flat_weights = top_k_weights.reshape(-1)
         permuted_weights = flat_weights[sorted_indices]
-        mm2_out = mm2_out * permuted_weights.unsqueeze(-1)
 
-    final_hidden_states = combine_permuted_moe_outputs(
+    final_hidden_states = weighted_unpermute(
         mm2_out,
         sorted_indices,
+        permuted_weights,
         batch_size * sequence_length,
         top_k_index.shape[-1],
         out_dtype = hidden_states.dtype,
     )
+    if final_hidden_states is None:
+        mm2_out = mm2_out * permuted_weights.unsqueeze(-1)
+        final_hidden_states = combine_permuted_moe_outputs(
+            mm2_out,
+            sorted_indices,
+            batch_size * sequence_length,
+            top_k_index.shape[-1],
+            out_dtype = hidden_states.dtype,
+        )
 
     if is_2d_input:
         return final_hidden_states

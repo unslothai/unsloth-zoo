@@ -287,7 +287,16 @@ def _dequantize_bnb4bit_expert_weights(weight, target_dtype: torch.dtype):
     """
     if not _is_bnb4bit_param(weight):
         return None
-    dequant = _dequantize_4bit_in_slices(weight)
+    dequant = None
+    try:
+        from unsloth_zoo.temporary_patches.moe_triton_kernels import nf4_dequant_triton
+        dequant = nf4_dequant_triton(
+            weight.data, weight.quant_state, getattr(weight, "_original_shape", None),
+        )
+    except ImportError:
+        pass
+    if dequant is None:
+        dequant = _dequantize_4bit_in_slices(weight)
     if dequant is None:
         dequant = bnb.functional.dequantize_4bit(weight.data, weight.quant_state)
     original_shape = getattr(weight, "_original_shape", None)
@@ -325,27 +334,19 @@ def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
         forward_triton_grouped_gemm,
         forward_native_moe_loop,
         swap_moe_weights_for_call,
-        _moe_recompute_default,
+        _moe_recompute_enabled,
     )
 
     target_dtype = hidden_states.dtype
     if not target_dtype.is_floating_point:
         target_dtype = torch.bfloat16
 
-    # Defer dequant into forward_native_grouped_mm's providers instead of
-    # pre-dequantizing the full bf16 stack up front. The 4-bit base prefers recompute
-    # by default (prefer_memory=True) so that, even inside a gradient-checkpoint
-    # recompute pass, we never materialize and pin the full bf16 expert dequant the
-    # 4-bit storage exists to avoid; UNSLOTH_MOE_RECOMPUTE=0 still forces the pin for
-    # memory-rich runs. This keeps the packed Params4bit and rebuilds the dense stack
-    # on demand; the pre-dequantize path below is only taken when the policy says pin,
-    # so we never pre-dequantize into a dense stack and then re-hold it for a backward
-    # recompute. Matches the per-source decision in forward_native_grouped_mm.
+    # Same recompute-vs-pin policy as forward_native_grouped_mm; recompute keeps the packed Params4bit.
     if (
         select_moe_backend() == "grouped_mm"
         and _is_bnb4bit_param(self.gate_up_proj)
         and _is_bnb4bit_param(self.down_proj)
-        and _moe_recompute_default(prefer_memory = True)
+        and _moe_recompute_enabled(self.gate_up_proj, dtype=target_dtype)
     ):
         _log_moe_bnb4bit_backend_once(self, "Unsloth: MoE bnb4bit grouped_mm with backward-recompute.")
         return forward_native_grouped_mm(self, hidden_states.to(target_dtype), top_k_index, top_k_weights)
