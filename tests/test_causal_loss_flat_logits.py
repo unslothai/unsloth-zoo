@@ -89,3 +89,17 @@ def test_flat_logits_with_batched_labels_keep_row_boundaries(patched_loss):
     expected = stock(flat_logits, labels, vocab)
     torch.testing.assert_close(expected, stock(logits, labels, vocab))
     torch.testing.assert_close(unsloth(flat_logits, labels, vocab), expected)
+
+
+@pytest.mark.parametrize("flat", [False, True])
+def test_a_custom_ignore_index_matches_the_stock_loss(patched_loss, flat):
+    stock, unsloth = patched_loss
+    logits, labels, vocab = _inputs()
+    labels = labels.masked_fill(labels == -100, -1)
+    if flat:
+        logits, labels = logits.reshape(-1, vocab), labels.reshape(-1)
+    for n in (None, torch.tensor(5)):
+        torch.testing.assert_close(
+            unsloth(logits, labels, vocab, num_items_in_batch = n, ignore_index = -1),
+            stock(logits, labels, vocab, num_items_in_batch = n, ignore_index = -1),
+        )
