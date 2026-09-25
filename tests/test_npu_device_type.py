@@ -66,6 +66,10 @@ npu.default_stream = lambda i: "main"
 gc.DEVICE_TYPE, gc.DEVICE_TYPE_TORCH = "npu", "cpu"
 gc.initialize_unsloth_gradient_checkpointing()
 amp = getattr(gc.torch_amp_custom_fwd, "keywords", {}).get("device_type")
+import unsloth_zoo.vllm_utils as vu
+npu.mem_get_info = lambda *a: (1, 2)
+vu.DEVICE_TYPE = "npu"
+print("VLLM", vu.get_mem_info())
 print("GC", len(gc.GPU_BUFFERS), gc.GPU_BUFFERS[0].dtype, gc.MAIN_STREAMS, gc.EXTRA_STREAMS, amp)
 """
 
@@ -89,7 +93,7 @@ def answers():
         if line.startswith("CELL "):
             _, cell, *rest = line.split()
             got[cell] = " ".join(rest)
-        elif line.startswith(("HELPERS ", "GC ")):
+        elif line.startswith(("HELPERS ", "GC ", "VLLM ")):
             key, _, rest = line.partition(" ")
             got[key.lower()] = rest
     assert set(got) >= set(_CELLS), out.stderr[-2000:]
@@ -102,6 +106,10 @@ def test_an_ascend_host_gets_npu(answers):
 
 def test_npu_helpers_reach_torch_npu(answers):
     assert answers.get("helpers") == "synchronize,empty_cache True"
+
+
+def test_npu_vllm_memory_reads_torch_npu(answers):
+    assert answers.get("vllm") == "(1, 2)"
 
 
 def test_npu_gradient_checkpointing_initializes(answers):

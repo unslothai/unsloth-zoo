@@ -102,6 +102,8 @@ def get_target_device(index = 0):
 def get_mem_info():
     if DEVICE_TYPE == "xpu":
         free_memory, total_memory = torch.xpu.mem_get_info()
+    elif DEVICE_TYPE == "npu":
+        free_memory, total_memory = torch.npu.mem_get_info()
     else:
         free_memory, total_memory = torch.cuda.mem_get_info()
     return free_memory, total_memory
@@ -2804,6 +2806,8 @@ def load_vllm(
         _dtype = torch.bfloat16
     elif DEVICE_TYPE == "xpu":
         _dtype = torch.bfloat16
+    elif DEVICE_TYPE == "npu" and torch.npu.is_bf16_supported():
+        _dtype = torch.bfloat16
     else:
         _dtype = torch.float16
     if dtype == torch.bfloat16 and _dtype == torch.float16:
@@ -3028,6 +3032,10 @@ def load_vllm(
             platform = "Intel GPU"
             gpu_eu_count = torch.xpu.get_device_properties(0).gpu_eu_count
             message = f"{platform} has eu:{gpu_eu_count}"
+        elif DEVICE_TYPE == "npu":
+            # No CUDA capability to read; torch.cuda is unavailable on this path.
+            platform = "Ascend NPU"
+            message = f"{platform} {torch.npu.get_device_name(0)}"
         else:
             platform = "CUDA"
             major_version, minor_version = torch.cuda.get_device_capability()
