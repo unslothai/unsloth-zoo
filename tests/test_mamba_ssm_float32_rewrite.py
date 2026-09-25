@@ -179,7 +179,6 @@ _WORKER = textwrap.dedent("""
 
 
 def test_concurrent_processes_never_truncate_the_module(tmp_path):
-    """The failure seen on a real box: several processes import unsloth_zoo at once."""
     target = _make_package(tmp_path)
     workers = [
         subprocess.Popen([sys.executable, "-c", _WORKER, str(MISC), str(tmp_path), "40"])
