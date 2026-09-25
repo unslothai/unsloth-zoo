@@ -95,6 +95,50 @@ def get_mxfp4_config_for_training():
 
     return Mxfp4Config(dequantize=dequantize)
 
+
+def dequantize_mxfp4_moe_blocks_scales(blocks, scales):
+    """Dequantize MXFP4 MoE packed tensors to GPT-OSS expert layout.
+
+    Returns bf16/fp16 weights shaped [E, K, N] (transpose restored after
+    ``convert_moe_packed_tensors``). Uses live ``transformers.integrations.mxfp4``
+    hooks so Unsloth's patched ``dequantize_convertops`` / ``convert_moe_packed_tensors``
+    stay authoritative (transformers 5.16+ removed module-level ``dequantize``).
+    """
+    try:
+        import transformers.integrations.mxfp4 as mxfp4_mod
+    except Exception as exc:
+        raise ImportError(
+            "transformers.integrations.mxfp4 is required for MXFP4 dequantization"
+        ) from exc
+
+    dequantize_convertops = getattr(mxfp4_mod, "dequantize_convertops", None)
+    if dequantize_convertops is not None:
+        try:
+            convertops_params = tuple(inspect.signature(dequantize_convertops).parameters)
+        except (TypeError, ValueError):
+            convertops_params = ()
+
+        if convertops_params == ("blocks", "scales", "target_device"):
+            target_device = blocks.device if blocks.is_cuda else "cpu"
+            out = dequantize_convertops(blocks, scales, target_device)
+        elif convertops_params == ("blocks", "scales",):
+            out = dequantize_convertops(blocks, scales)
+        else:
+            out = None
+
+        if out is not None:
+            if isinstance(out, torch.nn.Parameter):
+                return out.data
+            return out
+
+    convert = getattr(mxfp4_mod, "convert_moe_packed_tensors", None)
+    if convert is None:
+        raise ImportError(
+            "MXFP4 dequantization requires transformers.integrations.mxfp4.convert_moe_packed_tensors"
+        )
+    return convert(blocks, scales).transpose(1, 2).contiguous()
+
+
 def patch_convert_moe_packed_tensors():
     """Pin the GPU convert_moe_packed_tensors with a smaller default chunk."""
     try:
