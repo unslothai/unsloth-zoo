@@ -1693,10 +1693,8 @@ def build_meta_model(model_name_or_path: str, **from_pretrained_kwargs: Any):
 
     ``quantization_config`` / ``load_in_4bit`` / ``load_in_8bit`` are honoured
     the way the loader honours them, so runtime quantisation of a full-precision
-    checkpoint is sized as it will really be loaded.
-
-    ``rewritten_quantization_config`` replaces the serialized quantization block
-    (e.g. ModelOpt FP8 rewritten to ``fp8``); weights are sized as pre-quantized.
+    checkpoint is sized as it will really be loaded. ``rewritten_quantization_config``
+    replaces the serialized block (ModelOpt FP8 -> ``fp8``), sized as pre-quantized.
     """
     from accelerate import init_empty_weights
     from transformers import AutoConfig

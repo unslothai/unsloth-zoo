@@ -2,8 +2,6 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""ModelOpt FP8 checkpoints (`quant_method: modelopt`) must plan via Unsloth's fp8 rewrite."""
-
 import pytest
 
 torch = pytest.importorskip("torch")
