@@ -885,6 +885,9 @@ def test_finite_logits_past_the_cap_match_the_saturated_loss(dtype, ratio):
 
 @pytest.mark.parametrize("quantized", [False, True])
 def test_lora_head_backward_recomputes_logits_past_the_budget(monkeypatch, quantized):
+    _skip_torch_shim()
+    if not mx.metal.is_available():
+        pytest.skip("requires Metal kernels")
     from unsloth_zoo.mlx.cce import runtime_cce
 
     mx.random.seed(6)

@@ -780,6 +780,7 @@ def test_trainer_compiled_step_uses_lora_head_cce(monkeypatch, tmp_path):
     assert calls == [3]
 
 
+@metal_only
 def test_lora_head_cce_without_metal_keeps_baseline(monkeypatch):
     model = _cce_text_model(2049, 1024, quantized=False, lora=True)
     monkeypatch.setattr(mx.metal, "is_available", lambda: False)
