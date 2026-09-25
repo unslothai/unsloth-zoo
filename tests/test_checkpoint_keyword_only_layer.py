@@ -175,3 +175,18 @@ def test_smart_offload_checkpointing_gives_keyword_only_layers_their_gradient():
             assert torch.allclose(a, b, atol = 1e-5)
     finally:
         unpatch_unsloth_smart_gradient_checkpointing()
+
+
+def test_disabling_a_requested_cache_still_warns(monkeypatch):
+    from transformers import modeling_layers
+    seen = []
+    monkeypatch.setattr(modeling_layers.logger, "warning_once", lambda message: seen.append(message))
+    torch.manual_seed(0)
+    class _CacheLayer(_CrossLayer):
+        pass
+    cross = _CacheLayer().train()
+    cross.gradient_checkpointing = True
+    cross._gradient_checkpointing_func = _CHECKPOINTERS["torch_reentrant"]
+    vision = nn.Linear(8, 8)(torch.randn(2, 8))
+    cross(torch.randn(2, 8, requires_grad = True), cross_attention_states = vision, use_cache = True)
+    assert seen and "use_cache=False" in seen[0] and "_CacheLayer" in seen[0]

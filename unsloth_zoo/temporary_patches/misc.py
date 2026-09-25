@@ -1684,6 +1684,7 @@ def patch_GradientCheckpointingLayer_keyword_inputs():
     try:
         from functools import partial
         from transformers.modeling_layers import GradientCheckpointingLayer
+        from transformers.modeling_layers import logger as modeling_layers_logger
         from ..gradient_checkpointing import _KeywordArgumentCall
     except Exception as e:
         return raise_error("transformers.modeling_layers.GradientCheckpointingLayer", e)
@@ -1696,13 +1697,21 @@ def patch_GradientCheckpointingLayer_keyword_inputs():
         keys = tuple(k for k, v in kwargs.items() if torch.is_tensor(v) and v.requires_grad)
         if not keys:
             return original(self, *args, **kwargs)
-        # The cache handling GradientCheckpointingLayer does before checkpointing.
+        # The cache handling (and warning) GradientCheckpointingLayer does before checkpointing.
+        message = f"Caching is incompatible with gradient checkpointing in {type(self).__name__}. Setting"
+        changed = False
         if kwargs.get("use_cache"):
             kwargs["use_cache"] = False
+            message += " `use_cache=False`,"
+            changed = True
         if not getattr(self, "_can_checkpoint_with_cache", False):
             for name in ("past_key_values", "layer_past"):
                 if kwargs.get(name) is not None:
                     kwargs[name] = None
+                    message += f" `{name}=None`,"
+                    changed = True
+        if changed:
+            modeling_layers_logger.warning_once(message.rstrip(",") + ".")
         constants = {k: v for k, v in kwargs.items() if k not in keys}
         function = _KeywordArgumentCall(partial(nn.Module.__call__, self), keys, constants)
         return self._gradient_checkpointing_func(function, *args, *(kwargs[k] for k in keys))
