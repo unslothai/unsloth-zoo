@@ -841,8 +841,7 @@ def _merged_parameter_patterns(model: nn.Module, hf_quantizer: Any = None) -> li
         try:
             conversions = get_model_conversion_mapping(model, hf_quantizer = hf_quantizer) or []
         except Exception:
-            # An unvalidated quantizer can raise here (compressed-tensors reads `use_fp8_kernel`);
-            # its hooks only prepend ops, so the model's own converters still name the merges.
+            # Unvalidated compressed-tensors raises here; quantizer hooks only prepend ops to the model's merges.
             conversions = None
     if conversions is None:
         try:
