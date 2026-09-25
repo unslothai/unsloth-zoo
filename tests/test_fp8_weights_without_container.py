@@ -24,6 +24,11 @@ import torch.nn.functional as F
 
 transformers = pytest.importorskip("transformers")
 pytest.importorskip("transformers.integrations.finegrained_fp8")
+from transformers.quantizers.quantizer_finegrained_fp8 import FineGrainedFP8HfQuantizer
+
+# Before importing Fp8Dequantize, which 4.57 lacks.
+if not hasattr(FineGrainedFP8HfQuantizer, "update_weight_conversions"):
+    pytest.skip("this transformers has no quantizer weight-conversion hook", allow_module_level = True)
 
 import unsloth_zoo  # noqa: F401
 from unsloth_zoo.temporary_patches.fp8_uncontained_weights import (
@@ -34,11 +39,7 @@ from unsloth_zoo.temporary_patches.fp8_uncontained_weights import (
 )
 
 from transformers.integrations.finegrained_fp8 import Fp8Dequantize, FP8Linear
-from transformers.quantizers.quantizer_finegrained_fp8 import FineGrainedFP8HfQuantizer
 from transformers.utils.quantization_config import FineGrainedFP8Config
-
-if not hasattr(FineGrainedFP8HfQuantizer, "update_weight_conversions"):
-    pytest.skip("this transformers has no quantizer weight-conversion hook", allow_module_level = True)
 
 E4M3 = torch.float8_e4m3fn
 patch_fp8_dequantize_weights_without_container()
@@ -385,3 +386,28 @@ def test_a_uint8_scale_does_not_read_as_a_packed_weight():
     e8m0 = torch.full((4, 4), 127, dtype = torch.uint8)
     op.convert({"weight$": [fp8], "weight_scale_inv": [e8m0]}, full_layer_name = "experts.weight", model = model)
     assert "experts.weight" in _dequantized_targets(model)
+
+
+def test_older_transformers_dequant_and_requant_land_in_the_right_dtype_and_names(monkeypatch):
+    """transformers 5.8 - 5.11 dequantize to float32 and name a bare `weight`'s scale `weight.weight_scale_inv`."""
+    model = _Holder()
+    op = _make_op(Fp8Dequantize)(_quantizer())
+    real = Fp8Dequantize._dequantize_one
+    monkeypatch.setattr(
+        Fp8Dequantize, "_dequantize_one",
+        lambda self, q, s, **kw: real(self, q, s, **kw).float(),
+    )
+    q, scale = _block_quantize(torch.randn(3, 8, 8), (4, 4))
+    out = op.convert({"weight$": [q], "weight_scale_inv": [scale]}, full_layer_name = "experts.weight", model = model)
+    assert out["experts.weight"].dtype == torch.bfloat16
+
+    reverse = op.reverse_op
+    old_quantize_one = type(reverse)._quantize_one
+
+    def quantize_one_5_8(self, key, value):
+        res = old_quantize_one(self, key, value)
+        return {(k.replace("weight_scale_inv", "weight.weight_scale_inv") if key == "weight" else k): v for k, v in res.items()}
+
+    monkeypatch.setattr(type(reverse), "_quantize_one", quantize_one_5_8)
+    saved = reverse.convert({"weight": [out["experts.weight"]]}, full_layer_name = "experts.weight", model = model)
+    assert set(saved) == {"experts.weight", "experts.weight_scale_inv"}

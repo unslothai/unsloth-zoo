@@ -50,6 +50,20 @@ def _first(value):
     return value[0] if isinstance(value, (list, tuple)) else value
 
 
+def _cast_to_target_dtype(out, model, full_layer_name):
+    module, attr = _module_and_attr(model, full_layer_name)
+    target = getattr(module, attr, None) if module is not None and attr else None
+    if not isinstance(target, torch.Tensor):
+        return out
+    dtype = target.dtype
+    if not dtype.is_floating_point or dtype.itemsize < 2:
+        return out
+    return {
+        k: v.to(dtype) if isinstance(v, torch.Tensor) and v.is_floating_point() and v.dtype.itemsize >= 2 else v
+        for k, v in out.items()
+    }
+
+
 def _dequantized_targets(model):
     # On the model, not the op: the loader deepcopies the op per target key, but save reverses the original.
     if model is None:
@@ -73,6 +87,9 @@ def _make_op(Fp8Dequantize):
             out = super().convert(input_dict, full_layer_name = full_layer_name, model = model, **kwargs)
             # Only weights that arrived with a scale are re-quantized on save.
             has_scale = any("scale_inv" in (k[:-1] if k.endswith("$") else k) for k in input_dict)
+            if has_scale:
+                # transformers < 5.12 dequantizes to float32, not the parameter's dtype.
+                out = _cast_to_target_dtype(out, model, full_layer_name)
             # Reverse op only writes e4m3, so skip packed FP4; skip scales (MXFP8 E8M0 is uint8).
             arrived_packed_fp4 = any(
                 isinstance(_first(v), torch.Tensor) and _first(v).dtype in _PACKED_FP4_DTYPES
@@ -151,7 +168,8 @@ def _make_reverse_op(Fp8Dequantize):
                 ):
                     out[name or key] = tensor
                 else:
-                    out.update(self._quantize_one(key, tensor))
+                    # Full name: < 5.12 turns a bare `weight` into `weight.weight_scale_inv`.
+                    out.update(self._quantize_one(name, tensor))
             return out
 
     return Fp8RequantizeWithoutContainer
