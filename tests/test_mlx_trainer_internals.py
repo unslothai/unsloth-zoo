@@ -1918,6 +1918,41 @@ def test_response_only_eval_batches_stay_a_finite_plan():
     assert [label for label in batch[2][0].tolist() if label != -100] == [102]
 
 
+def test_response_only_fractional_epochs_match_transformers_step_budget():
+    # int(num_train_epochs) dropped the partial pass: 0.5 epochs trained a full
+    # one and 1.5 trained one. Same shapes and golden row counts as the unmasked
+    # test_ordered_text_fractional_epochs_match_transformers_step_budget, where
+    # transformers.Trainer runs ceil(epochs * updates_per_epoch) updates.
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainer, MLXTrainingConfig, _resolve_training_steps,
+        train_on_responses_only,
+    )
+
+    def run(num_train_epochs):
+        trainer = MLXTrainer(
+            _MinimalTextModel(), _StreamingTextTokenizer(),
+            [{"text": f"10 {i} 20 {i}"} for i in range(1, 6)],
+            args=MLXTrainingConfig(
+                max_steps=-1, num_train_epochs=num_train_epochs,
+                per_device_train_batch_size=2, gradient_accumulation_steps=2,
+                completion_only_loss=False, dataset_order="sequential",
+            ),
+        )
+        train_on_responses_only(trainer, instruction_part="10", response_part="20")
+        batches = trainer._batches
+        rows = sum(int(batch[1].shape[0]) for batch in batches)
+        steps = _resolve_training_steps(
+            trainer.args, batches, None,
+            includes_epochs=trainer._prepared_batches_include_epochs,
+        )
+        return rows, steps
+
+    # 5 rows at batch 2 is 3 micro-batches, so 2 updates, per pass.
+    assert run(0.5) == (4, 1)
+    assert run(1) == (5, 2)
+    assert run(1.5) == (9, 3)
+
+
 def test_length_declaring_text_stream_supports_epoch_replay():
     MLXTrainer, trainer = _streaming_text_trainer(
         max_steps=0, num_train_epochs=2,

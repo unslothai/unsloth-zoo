@@ -8706,7 +8706,7 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
                             preserve_dataset_order=False,
                             num_epochs=None, return_dataset=False,
                             comm_group=None, distributed_pad_mode="cycle",
-                            return_plan=False):
+                            return_plan=False, grad_accum=None):
     """Create padded batches with label masks for train_on_responses_only.
 
     Tokenizes each dataset item, applies the masking closure to get labels,
@@ -8831,9 +8831,11 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
 
     # 3. Build `num_epochs` blocks so `batches[i % len]` cycle reseeds correctly.
     _n_epochs_materialize = (
-        max(1, int(num_epochs)) if num_epochs is not None else 1
+        max(1, math.ceil(num_epochs)) if num_epochs is not None else 1
     )
-    from .utils import _finite_text_pad_width, _normalize_seed
+    from .utils import (
+        _finite_epoch_batch_budget, _finite_text_pad_width, _normalize_seed,
+    )
     # Normalized so seed=None is deterministic (canonicalized) instead of
     # entropy-derived; explicit seeds are unchanged. Visits stay identity —
     # these plans carry explicitly materialized epoch blocks.
@@ -8879,6 +8881,9 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
         if cycle_length is None and len(epoch_schedule) > 0:
             cycle_length = len(epoch_schedule)
 
+    # A fractional epoch count ends mid-pass, on whole accumulation windows as HF does.
+    if num_batches is None and num_epochs is not None and cycle_length:
+        num_batches = _finite_epoch_batch_budget(cycle_length, num_epochs, grad_accum)
     if num_batches is not None and len(schedule) > num_batches:
         schedule = schedule[:num_batches]
         widths = widths[:num_batches]
@@ -9257,7 +9262,7 @@ def train_on_responses_only(
         # runs (max_steps>0) truncate to num_batches, so pre-building every epoch
         # just wastes tokenization/memory. Mirrors the unlabeled path's gate.
         labeled_num_epochs = (
-            int(args.num_train_epochs)
+            args.num_train_epochs
             if (args.max_steps <= 0 and getattr(args, "num_train_epochs", -1) > 0)
             else None
         )
@@ -9286,6 +9291,7 @@ def train_on_responses_only(
             return_dataset=True,
             comm_group=comm_group,
             return_plan=True,
+            grad_accum=args.gradient_accumulation_steps,
         )
         trainer.train_dataset = response_masked_dataset
         trainer._mlx_train_dataset_for_batches = response_masked_dataset
