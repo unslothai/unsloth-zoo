@@ -14,6 +14,7 @@
 
 __all__ = [
     "is_hip",
+    "npu_is_available",
     "get_amd_attention_implementation",
     "get_amd_flash_attn_func",
     "get_device_type",
@@ -210,6 +211,33 @@ def _amd_installation_hint():
 pass
 
 @functools.cache
+def npu_is_available():
+    """True only when torch.npu is present AND usable. Mirrors unsloth.device_type.
+
+    Only torch_npu >= 2.5.1 autoloads the namespace, and importing it without a driver
+    raises, so an unguarded probe would break `import unsloth_zoo` on CUDA, ROCm and XPU too.
+    """
+    if _IS_MLX:
+        return False
+    npu = getattr(torch, "npu", None)
+    if npu is None:
+        import importlib.util
+        if importlib.util.find_spec("torch_npu") is None:
+            return False
+        try:
+            import torch_npu  # noqa: F401
+        except Exception:
+            return False
+        npu = getattr(torch, "npu", None)
+        if npu is None:
+            return False
+    try:
+        return bool(npu.is_available())
+    except Exception:
+        return False
+pass
+
+@functools.cache
 def is_hip():
     if _IS_MLX:
         return False
@@ -377,6 +405,10 @@ def get_device_type():
         return "cuda"
     elif hasattr(torch, "xpu") and torch.xpu.is_available():
         return "xpu"
+    # After xpu: a host exposing both keeps selecting xpu, as it did before NPU. Without this
+    # an Ascend host raised here, and unsloth takes DEVICE_TYPE from this module.
+    elif npu_is_available():
+        return "npu"
     if hasattr(torch, "accelerator"):
         if not torch.accelerator.is_available():
             # Test-only CPU fallback; get_device_type is @functools.cache'd.
@@ -388,9 +420,10 @@ def get_device_type():
                 raise NotImplementedError(amd_hint)
             raise NotImplementedError("Unsloth cannot find any torch accelerator? You need a GPU.")
         accelerator = str(torch.accelerator.current_accelerator())
-        if accelerator in ("cuda", "xpu", "hip"):
+        # npu listed as in unsloth.device_type: torch.npu unusable here means a broken install.
+        if accelerator in ("cuda", "xpu", "hip", "npu"):
             raise RuntimeError(
-                f"Unsloth: Weirdly `torch.cuda.is_available()`, `torch.xpu.is_available()` and `is_hip` all failed.\n"\
+                f"Unsloth: Weirdly `torch.cuda.is_available()`, `torch.xpu.is_available()`, `torch.npu.is_available()` and `is_hip` all failed.\n"\
                 f"But `torch.accelerator.current_accelerator()` works with it being = `{accelerator}`\n"\
                 f"Please reinstall torch - it's most likely broken :("
             )
@@ -417,6 +450,8 @@ def get_device_count():
         return torch.cuda.device_count()
     elif DEVICE_TYPE == "xpu":
         return torch.xpu.device_count()
+    elif DEVICE_TYPE == "npu":
+        return torch.npu.device_count()
     else:
         return 1
 pass
