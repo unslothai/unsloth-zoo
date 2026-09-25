@@ -34,7 +34,6 @@ def _tiny():
 
 
 def _adapted(*, dora=False, train_embedding=False):
-    """Two adapted linears and, for DoRA, an adapted embedding."""
     from mlx_lm.tuner.dora import DoRAEmbedding, DoRALinear
     from mlx_lm.tuner.lora import LoRALinear
 
@@ -74,8 +73,7 @@ def _build(model, **options):
     "synced_adapter", "synced_dora", "synced_adapted_model",
 ])
 def test_reference_overrides_hold_inside_a_compiled_step(mode):
-    """The compiled step scores against the initial weights, or the mix taken at
-    a sync; a twin from the same seed is the oracle."""
+    """The compiled step scores against the initial weights or the synced mix."""
     import mlx.nn as nn
     import mlx.optimizers as optim
     from mlx.utils import tree_map

@@ -1168,7 +1168,6 @@ def test_adapter_config_keeps_dropout_while_preference_context_is_active():
 
 
 def test_a_precomputed_reference_travels_in_the_batch():
-    """A batch carries its rows' precomputed values; the loss and the evaluation read them."""
     import mlx.core as mx
     from unsloth_zoo.mlx.preference import (
         make_dpo_loss_fn, make_preference_eval_fn, precompute_reference_logps,
@@ -1517,7 +1516,6 @@ def test_trainer_applies_preference_formatter_once_per_row():
 
 @pytest.mark.parametrize("sync", [True, False, "reference_free"])
 def test_the_trainer_syncs_the_reference_on_its_cadence(tmp_path, monkeypatch, sync):
-    """Every ref_model_sync_steps optimizer steps; never when off or reference-free."""
     from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
 
     trainer = MLXDPOTrainer(
@@ -1561,8 +1559,6 @@ def test_the_trainer_syncs_the_reference_on_its_cadence(tmp_path, monkeypatch, s
 def test_the_trainer_precomputes_the_reference_once_per_split(
     tmp_path, monkeypatch, sampling,
 ):
-    """The training rows before the first step, an eval split when first built and
-    as an evaluation scores; a snapshot then goes unless the sampler reads it."""
     from unsloth_zoo.mlx import trainer as trainer_module
     from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
     from unsloth_zoo.mlx.utils import mlx_training_patches_active
@@ -1627,7 +1623,6 @@ def test_the_trainer_precomputes_the_reference_once_per_split(
 
 
 def _tiny_model(lora=False, tail=False):
-    """lora=True adds an adapter at zero delta; tail=True a tensor no adapter owns."""
     import mlx.core as mx
     import mlx.nn as nn
 
@@ -1700,11 +1695,7 @@ def _generation_common(tmp_path, **overrides):
 def _run_generation_trainer(
     trainer, monkeypatch, calls, generate_batch=None, probe=None,
 ):
-    """Drive one training step whose evaluation samples, recording engine calls.
-
-    ``generate_batch`` replaces the recording stub, for tests needing the engine
-    to fail or to return text of their own choosing; ``probe`` sees each call's model.
-    """
+    """Drive one training step whose evaluation samples, recording engine calls."""
     import mlx.core as mx
     import mlx.nn as nn
     from mlx.utils import tree_map
@@ -1863,7 +1854,6 @@ def test_generation_prompt_reserves_room_for_the_sample():
 def test_referenced_dpo_samples_the_reference_with_scales_zeroed(
     tmp_path, monkeypatch,
 ):
-    """The reference decodes the base policy; adapter and tensor come back afterwards."""
     import mlx.core as mx
     from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
     from unsloth_zoo.mlx.utils import iter_mlx_lora_modules

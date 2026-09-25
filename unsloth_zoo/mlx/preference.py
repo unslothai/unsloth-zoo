@@ -700,7 +700,6 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
         return self._widths[index]
 
     def batch_family(self, index):
-        # The precomputed reference element is shaped by the pair count the family keys on.
         pairs = len(self._schedule[index])
         return (
             "preference_tuple_3",
@@ -776,7 +775,6 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
         if self._reference is None:
             return materialized
         held = self._reference[list(indices)]
-        # Position four is the compaction indices, filled by prepare_cce_batch.
         return materialized + (
             None, mx.array(np.concatenate([held[:, 0], held[:, 1]])),
         )
@@ -810,9 +808,7 @@ def _pack_rows(rows, width, pad_id):
 
 
 def precompute_reference_logps(plan, model, reference_policy, *, batch_size):
-    """Score every row of ``plan`` once, ``batch_size`` pairs at a time, and hand
-    the plan the table its batches carry. A row's value is the live forward's at
-    its chunk's shape; the kernels round differently at another."""
+    """Precompute reference logps per row of ``plan``; kernels round per chunk shape, so batch like the live forward."""
     rows = plan.rows
     batch_size = max(1, int(batch_size))
     table = np.zeros((len(rows), 2), dtype=np.float32)
@@ -1088,17 +1084,13 @@ class PreferenceRunContext:
 
 
 class ReferencePolicy:
-    """The policy a referenced DPO run scores against: a model of its own, or the
-    policy model under overrides (a ``scale`` per adapter module, an array per
-    parameter) while active. ``paths`` names the trainable tensors ``sync``
-    moves toward the policy and ``save`` / ``load`` carry across a checkpoint."""
+    """The policy a referenced DPO run scores against: its own model, or the policy under overrides."""
 
     def __init__(
         self, *, model=None, scales=(), overrides=(), paths=(), mirrored=(),
         neftune_modules=(),
     ):
         self.model = model
-        # Scales are floats, apart from ``values``, the list a compiled step captures.
         self.scales = tuple(scales)
         self.targets = tuple((module, name) for module, name, _ in overrides)
         self.values = [value for _, _, value in overrides]
@@ -1115,8 +1107,7 @@ class ReferencePolicy:
 
     @contextmanager
     def activate(self, model):
-        """Yield the module to score with; overrides go on the owning module,
-        where value_and_grad installs its tracers, so the swap holds in a trace."""
+        """Yield the module to score with; overrides sit on the owning module so they hold under a trace."""
         if self.released:
             raise RuntimeError(
                 "Unsloth MLX DPO: the reference was released once its log "
@@ -1177,9 +1168,7 @@ class ReferencePolicy:
             raise RuntimeError("Unsloth MLX DPO: this reference does not sync.")
 
     def sync(self, policy, alpha):
-        """``(1 - alpha) * reference + alpha * policy`` over the policy's trainable
-        tensors, mixed in float32, stored at the reference's dtype one tensor at a
-        time, in place inside the list a compiled step captured."""
+        """In place ``(1 - alpha) * reference + alpha * policy``, mixed in float32."""
         self._require_synced()
         trainable = dict(mlx.utils.tree_flatten(policy.trainable_parameters()))
         for index, path in enumerate(self.paths):
@@ -1910,8 +1899,7 @@ def lora_modules_have_nonzero_delta(modules):
 
 
 def _dora_base_magnitude(module):
-    """The base weight's row norms, as ``set_linear`` / ``set_embedding`` set
-    DoRA's magnitude, so a trained ``m`` needs no persisted copy."""
+    """Base weight row norms, as set_linear / set_embedding set DoRA's magnitude."""
     if hasattr(module, "_dequantized_weight"):
         weight = module._dequantized_weight().astype(mx.float32)
     elif hasattr(getattr(module, "embedding", None), "weight"):
@@ -1946,8 +1934,7 @@ def _owner_of(by_name, parameter_path, *, of="the model"):
 
 
 def _reference_adapter_overrides(by_name, parameters, adapters, path, *, dora):
-    """Overrides putting a saved adapter's tensors in place of the model's; returns
-    the file's scale (None without a config), the overrides, and its names."""
+    """Return a saved adapter's scale, its tensors as overrides, and their names."""
     path = Path(path)
     weights_file = path / "adapters.safetensors"
     if not weights_file.is_file():
@@ -2027,8 +2014,7 @@ def build_reference_policy(
     ref_adapter_name=None, model_adapter_name=None,
     ref_model=None, force_use_ref_model=False, sync_ref_model=False,
 ):
-    """Validate the run's reference and construct its policy, in TRL's order: a
-    ``ref_model``, else the adapters disabled, else the starting weights."""
+    """Validate the reference and build its policy in TRL's order: ref_model, adapters off, start weights."""
     if reference_free:
         return None, {"kind": "reference_free"}
     if model_adapter_name not in (None, "default"):
@@ -2046,7 +2032,6 @@ def build_reference_policy(
             "reference."
         )
     provenance = {
-        # Also DoRA's base; checkpoints from when only LoRA was accepted still resume.
         "kind": "plain_lora_base",
         "base_repo": getattr(model, "_hf_repo", None),
         "base_revision": getattr(model, "_unsloth_base_revision", None),
@@ -2149,8 +2134,7 @@ def build_reference_policy(
         provenance["kind"] = "reference_adapter"
         provenance["reference_adapter"] = os.path.normpath(str(ref_adapter_name))
     _check_provenance(resume_provenance, provenance)
-    # A tensor no adapter owns is held at its starting value, as PEFT restores
-    # modules_to_save: refused once trained, unless a resume hydrates it later.
+    # Held at its start value, as PEFT restores modules_to_save.
     extra = [name for name in trainable if name not in adapters]
     reloaded = sorted(
         name for name in getattr(model, "_unsloth_reloaded_parameter_keys", ())
@@ -2168,7 +2152,6 @@ def build_reference_policy(
     )
     if ref_adapter_name is None:
         if sync_ref_model:
-            # A sync needs the reference's own copy of every trainable tensor: a snapshot.
             if delta or trained:
                 carried = (
                     f"the loader restored trained tensors beside the adapter "
@@ -2182,7 +2165,6 @@ def build_reference_policy(
                     "reference where the policy starts, as TRL's DPOTrainer "
                     "requires for TR-DPO."
                 )
-            # A frozen DoRA magnitude holds at the base norms without syncing.
             magnitude_paths = {
                 id(module): f"{name}.m" if name else "m"
                 for name, module in named_modules
