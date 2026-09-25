@@ -14,8 +14,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Patched ForCausalLM loss accepts flat (tokens, vocab) logits like stock (Ling-2.6-flash MTP head)."""
-
 from __future__ import annotations
 
 import pytest
