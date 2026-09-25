@@ -1247,6 +1247,13 @@ def _force_kernel_hub_fallback(packages=_REPAIR_MODELING):
     to a user-installed fla. Rebinding each wrapper to its ``__wrapped__`` (the torch
     implementation the decorator falls back to) keeps the model on pure torch without
     importing fla at all. Returns the names forced, for logging and tests.
+
+    unsloth's compiler copies the gated-delta source (including the kernel-hub
+    decorators, which are only marked ``torch.compiler.disable``, not stripped) into
+    ``unsloth_compiled_module_<model_type>``, and THAT copy is what runs. Its
+    decorator re-resolves fla independently, so the compiled module is scanned too,
+    the same way ``_patch_l2norm_fp32_on_torch_path`` does; otherwise the compiled
+    forward would still enter the installed fla and abort with FDOT2.
     """
     try:
         from transformers.integrations.hub_kernels import (  # noqa: F401
@@ -1256,8 +1263,13 @@ def _force_kernel_hub_fallback(packages=_REPAIR_MODELING):
         return ()               # transformers predates the decorator
 
     forced = []
-    for package in packages:
-        module = sys.modules.get(f"transformers.models.{package}.modeling_{package}")
+    names = [f"transformers.models.{package}.modeling_{package}" for package in packages]
+    names += sorted(
+        name for name in list(sys.modules)
+        if name.startswith(_UNSLOTH_COMPILED_MODULE_PREFIX) and name not in names
+    )
+    for modname in names:
+        module = sys.modules.get(modname)
         if module is None:
             continue
         for attribute in _KERNEL_HUB_DECORATED:
@@ -1268,7 +1280,7 @@ def _force_kernel_hub_fallback(packages=_REPAIR_MODELING):
             if wrapper is original:
                 continue        # already the bare fallback
             setattr(module, attribute, original)
-            forced.append(f"{package}.{attribute}")
+            forced.append(f"{modname}.{attribute}")
 
     if forced and UNSLOTH_ENABLE_LOGGING:
         logger.info(

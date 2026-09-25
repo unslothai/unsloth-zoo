@@ -1099,6 +1099,31 @@ def test_late_import_repair_keeps_the_wrapper_when_nothing_to_bind(monkeypatch):
     assert module.torch_chunk_gated_delta_rule is wrapper
 
 
+@requires_kernel_hub
+def test_force_fallback_rebinds_the_compiled_copy(monkeypatch):
+    """unsloth runs unsloth_compiled_module_<type>, whose kernel-hub decorator resolves
+    fla on its own. On RDNA1 that copy must be forced to the pure-torch fallback too, or
+    the compiled forward re-enters fla and aborts with FDOT2."""
+    from unsloth_zoo.temporary_patches import fla_vendor
+
+    def original(): return "torch"
+    def kernel(): return "fla"
+
+    module = _fake_modeling(monkeypatch, "qwen3_5", _fake_wrapper(kernel, original))
+
+    import types
+    compiled_name = "unsloth_compiled_module_qwen3_5"
+    compiled = types.ModuleType(compiled_name)
+    compiled.torch_chunk_gated_delta_rule = _fake_wrapper(kernel, original)
+    monkeypatch.setitem(sys.modules, compiled_name, compiled)
+
+    forced = fla_vendor._force_kernel_hub_fallback(packages=("qwen3_5",))
+
+    assert f"{compiled_name}.torch_chunk_gated_delta_rule" in forced, forced
+    assert module.torch_chunk_gated_delta_rule is original
+    assert compiled.torch_chunk_gated_delta_rule is original
+
+
 def test_late_import_repair_skips_undecorated_attributes(monkeypatch):
     """On a transformers that predates #47630 there is no __wrapped__ to rebuild from."""
     from unsloth_zoo.temporary_patches import fla_vendor
