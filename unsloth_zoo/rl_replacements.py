@@ -381,7 +381,8 @@ def autotune_batch_and_chunks(
 
     if valid_indices.shape[0] == 0:
         #This means your GPU will OOM
-        return 4, final_m
+        # Capped at the row count: unsloth's no-grad pass divides rows by this without max(1, ...).
+        return max(1, min(4, total_input_rows)), final_m
 
     best_idx = valid_indices[0].item()
     final_b = int(b_vals[best_idx].item())
@@ -505,6 +506,8 @@ def grpo_compute_loss(
             # Filter out extra leading prompt tokens after left-padding input_ids.
             # Match TRL: aggregate log-ratios then exp (product), not sum of exp ratios.
             importance_sampling_ratio = (old - sampling_per_token_logps) * mask
+            # Unscored vLLM tokens arrive as nan and nan * 0 survives the mask: ratio 1, as TRL does.
+            importance_sampling_ratio = torch.nan_to_num(importance_sampling_ratio, nan = 0.0)
 
             if vllm_importance_sampling_mode in ["sequence_mask", "sequence_truncate"]:
                 importance_sampling_ratio = importance_sampling_ratio.sum(dim=-1, keepdim=True)
@@ -620,6 +623,8 @@ def grpo_compute_loss(
         with torch.no_grad():
             delta = torch.abs(old - sampling_per_token_logps)
             delta = delta * mask
+            # Zeroed rather than filtered like TRL, to keep the returned shape.
+            delta = torch.nan_to_num(delta, nan = 0.0, posinf = math.inf)
             flat_is_ratio = importance_sampling_ratio * mask
     else:
         delta = torch.tensor([]).detach()
@@ -641,10 +646,15 @@ def grpo_compute_loss(
         loss = (loss_i * mask).sum() / (loss_i.size(0) * max_completion_length)
         loss = loss / current_gradient_accumulation_steps
     elif loss_type in ["cispo", "dapo", "vespo"]:
-        normalizer = num_items_in_batch/ num_processes
+        # Floor at 1 like TRL: a fully masked batch (mask_truncated_completions) is 0/0 = nan otherwise.
+        if torch.is_tensor(num_items_in_batch):
+            normalizer = num_items_in_batch.clamp(min = 1.0) / num_processes
+        else:
+            normalizer = max(float(num_items_in_batch), 1.0) / num_processes
         loss = (loss_i * mask).sum() / normalizer
     elif loss_type == "luspo":
-        loss = (loss_i * mask.sum(1, keepdim=True)).mean()
+        # loss_i is (B, T) unless sequence level with beta 0, so mask elementwise (TRL >= 1.10).
+        loss = (loss_i * mask).sum(-1).mean()
         normalizer = current_gradient_accumulation_steps
         loss = loss / normalizer
     else:
@@ -657,8 +667,14 @@ def grpo_compute_loss(
             if x.shape[1] == 1:  # when importance_sampling_level == "sequence"
                 return completion_length, x.mean()
             else:
-                mean_kl_per_reward = (x * mask).sum(1) / n_mask_per_reward
-                mean_kl = mean_kl_per_reward.mean()
+                # Rows with no tokens (mask_truncated_completions) are left out, as in TRL.
+                mean_kl_per_reward = (x * mask).sum(1) / n_mask_per_reward.clamp(min = 1.0)
+                kept_rows = (n_mask_per_reward > 0).sum()
+                mean_kl = torch.where(
+                    kept_rows == n_mask_per_reward.numel(),
+                    mean_kl_per_reward.mean(),
+                    mean_kl_per_reward.sum() / kept_rows.clamp(min = 1),
+                )
                 return completion_length, mean_kl
     completion_length, mean_kl = masked_batch_mean(kl_i)
     return loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1, mask
@@ -1460,24 +1476,11 @@ def grpo_accumulated_loss(
     vocab_dim = lm_head.shape[0]
 
     if trainer.args.unsloth_grpo_mini_batch is None:
-        if not hasattr(trainer, "_has_autotuned"):
-            trainer._has_autotuned = True
-            B, multiplier = autotune_batch_and_chunks(
-                total_rows, seq_len, hidden_dim, vocab_dim, dtype_bytes, trainer.args.unsloth_logit_chunk_multiplier
-            )
-            trainer.args.unsloth_grpo_mini_batch = max(1, total_rows//B)
-            trainer.args.unsloth_logit_chunk_multiplier = multiplier
-            B = trainer.args.unsloth_grpo_mini_batch
-            multiplier = trainer.args.unsloth_logit_chunk_multiplier
-        elif trainer._step % trainer.current_gradient_accumulation_steps == 0:
-            B = trainer.args.unsloth_grpo_mini_batch
-            multiplier = trainer.args.unsloth_logit_chunk_multiplier
-            del trainer._has_autotuned
-            del trainer.args.unsloth_grpo_mini_batch
-            del trainer.args.unsloth_logit_chunk_multiplier
-        else:
-            B = trainer.unsloth_grpo_mini_batch
-            multiplier = trainer.args.unsloth_logit_chunk_multiplier
+        # Size per call, as unsloth's copy does: caching in args froze the first step's plan.
+        B, multiplier = autotune_batch_and_chunks(
+            total_rows, seq_len, hidden_dim, vocab_dim, dtype_bytes, trainer.args.unsloth_logit_chunk_multiplier
+        )
+        B = max(1, total_rows//B)
     else:
         if trainer.args.unsloth_grpo_mini_batch > total_rows:
             B = total_rows
@@ -1488,6 +1491,18 @@ def grpo_accumulated_loss(
             multiplier = max(4, seq_len // 4096)
         else:
             multiplier = trainer.args.unsloth_logit_chunk_multiplier
+
+    # The text path rebuilds completion_mask from token ids, which would undo TRL's
+    # mask_truncated_completions row zeroing; keep TRL's rows and reapply them before the loss.
+    kept_completion_rows = None
+    if (
+        pixel_values is None
+        and getattr(trainer, "mask_truncated_completions", False)
+        and torch.is_tensor(completion_mask)
+        and completion_mask.dim() == 2
+        and completion_mask.shape[0] == input_ids.shape[0]
+    ):
+        kept_completion_rows = completion_mask.sum(dim = 1, keepdim = True) > 0
 
     if pixel_values is None:
         left_pad_tokens_per_prompt = calculate_pad_tokens_in_prompt(input_ids, logits_to_keep, trainer.processing_class.pad_token_id)
@@ -2144,6 +2159,11 @@ def grpo_accumulated_loss(
     if new_logprobs is None:
         # padded fallback (packing disabled / unsupported / not verified for this length)
         new_logprobs = torch.cat(all_logprobs_list, dim=0)
+
+    if kept_completion_rows is not None:
+        completion_mask = completion_mask * kept_completion_rows.to(
+            device = completion_mask.device, dtype = completion_mask.dtype,
+        )
 
     with autocaster:
         loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1 = UnslothEfficientGRPO.apply(
