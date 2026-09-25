@@ -76,7 +76,6 @@ def test_overrides_apply_to_a_copy(no_hub):
     assert config is not text_config
     assert config.max_position_embeddings == 64
     assert text_config.to_dict() == before
-    # Hub options are not config fields and never become attributes.
     assert not hasattr(config, "cache_dir")
     assert not hasattr(config, "local_files_only")
 

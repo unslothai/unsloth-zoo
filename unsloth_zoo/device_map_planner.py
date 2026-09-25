@@ -1666,8 +1666,7 @@ def _runtime_quantization_config(kwargs: dict[str, Any]) -> Any:
 
 
 def _apply_config_overrides(config: Any, overrides: Mapping[str, Any]) -> Any:
-    """A copy of ``config`` with the loader's overrides applied, as
-    ``PretrainedConfig.from_dict`` does. Hub options are dropped."""
+    """Copy of ``config`` with overrides applied as ``PretrainedConfig.from_dict`` does."""
     import copy
 
     config = copy.deepcopy(config)
@@ -1695,7 +1694,6 @@ def _apply_config_overrides(config: Any, overrides: Mapping[str, Any]) -> Any:
         if not hasattr(config, key):
             continue
         current = getattr(config, key)
-        # Merge a partial sub-config dict instead of replacing the config object
         if isinstance(value, Mapping) and hasattr(current, "to_dict") and not isinstance(current, Mapping):
             setattr(config, key, _merge_sub_config(current, value))
             continue
@@ -1704,8 +1702,7 @@ def _apply_config_overrides(config: Any, overrides: Mapping[str, Any]) -> Any:
 
 
 def _merge_sub_config(current: Any, override: Mapping[str, Any]) -> Any:
-    """``current`` with ``override`` merged in at any depth. Rebuilt as the same class
-    so derived fields (``layer_types``) are regenerated."""
+    """Deep-merge ``override``; rebuilt as the same class so derived fields regenerate."""
     merged = current.to_dict()
     for key, value in override.items():
         child = getattr(current, key, None)
@@ -1715,7 +1712,6 @@ def _merge_sub_config(current: Any, override: Mapping[str, Any]) -> Any:
     try:
         return current.__class__(**merged)
     except Exception:
-        # Cannot be rebuilt from its own dict, so update in place
         for key, value in override.items():
             child = getattr(current, key, None)
             if isinstance(value, Mapping) and hasattr(child, "to_dict") and not isinstance(child, Mapping):
@@ -1742,8 +1738,7 @@ def build_meta_model(
     the way the loader honours them, so runtime quantisation of a full-precision
     checkpoint is sized as it will really be loaded.
 
-    ``config`` overrides the repo's config, eg the ``text_config`` of a text-only
-    load of a vision-language checkpoint.
+    ``config`` overrides the repo's config (eg a VLM's ``text_config``).
     """
     from accelerate import init_empty_weights
     from transformers import AutoConfig
