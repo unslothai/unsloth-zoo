@@ -1201,10 +1201,8 @@ def make_runtime_cce_loss_fused_finalize(
         # set: logits and d_logits are always both live. Two cells break that ratio badly
         # enough to invert the result, so each is held out rather than re-calibrating the
         # rest. Trainable bfloat16 on the kernel path is 4x, not 2x: dlogits_out_dtype
-        # below writes d_logits float32 and the hidden GEMM casts it back. Label
-        # smoothing is 12-16 bytes, not 4: it disables the kernels, and _fallback_dlogits
-        # holds d_capped, zeros_like(d_capped) and the mx.where result as float32 at
-        # once. Promoting either one costs memory instead of saving it.
+        # below writes d_logits float32 and the hidden GEMM casts it back.
+        # Label smoothing stays excluded. Promoting either one costs memory instead of saving it.
         promoted_chunk = 4096
         promoted_bytes = promoted_chunk * compute_bytes
         token_bytes = compute_bytes
