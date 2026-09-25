@@ -640,9 +640,7 @@ def test_both_halves_declare_the_floor_that_peft_needs() -> None:
     )
 
 
-# The range unsloth's own `patch_datasets` refuses at import (import_fixes.py). Restated here
-# rather than read, because the zoo cannot import unsloth, and named rather than folded into the
-# window so the reason survives a future rewrite of the specifier.
+# unsloth's patch_datasets refuses this range at import; restated since the zoo cannot import unsloth.
 UNSLOTH_REFUSES_DATASETS = (Version("4.4.0"), Version("4.5.0"))
 
 
@@ -654,18 +652,12 @@ def _datasets_lists() -> dict[str, list[Requirement]]:
     }
 
 
-# The requirement lists that each have to carry the window. Named rather than discovered:
-# _datasets_lists drops a list that names no datasets at all, so on a DELETION from one of them
-# the survivor still yields a single-element window set and a discovered-only check passes. The
-# guard has to see a missing location, not just two disagreeing ones.
+# Named, not discovered: _datasets_lists drops a list with no datasets, so a deletion would pass.
 DATASETS_LOCATIONS = ("dependencies", "optional-dependencies.core")
 
 
 def test_every_list_declares_the_same_datasets_window() -> None:
-    """Two copies that can drift are how a cap goes stale in one place only.
-
-    Catches both ways they stop agreeing: a differing specifier, and a deletion from one list.
-    """
+    """Both lists carry the datasets requirement with the same specifier."""
     lists = _datasets_lists()
     assert lists, "pyproject.toml declares no datasets requirement at all"
     missing = [where for where in DATASETS_LOCATIONS if where not in lists]
@@ -681,12 +673,7 @@ def test_every_list_declares_the_same_datasets_window() -> None:
 
 
 def test_the_datasets_window_excludes_what_unsloth_refuses_at_import() -> None:
-    """unsloth raises on datasets 4.4.0 through 4.5.0, and unsloth is what imports this package.
-
-    pip intersects the two requirements, so a zoo window admitting one of those releases lets a
-    resolve succeed and then die at `import unsloth` with NotImplementedError. The zoo bound is
-    therefore not free to be wider than unsloth's, whatever the zoo's own code can handle.
-    """
+    """A window admitting 4.4.0-4.5.0 resolves, then dies at `import unsloth`."""
     lists = _datasets_lists()
     assert lists, "pyproject.toml declares no datasets requirement at all"
     low, high = UNSLOTH_REFUSES_DATASETS
@@ -703,9 +690,7 @@ def test_the_datasets_window_excludes_what_unsloth_refuses_at_import() -> None:
 
 
 def test_the_datasets_checker_rejects_the_window_that_would_ship_the_defect() -> None:
-    """NEGATIVE CONTROL: both assertions above are "nothing found" shapes, which is also what a
-    checker that has stopped checking reports.
-    """
+    """Negative control: the probe must still flag a permissive window."""
     low, high = UNSLOTH_REFUSES_DATASETS
     permissive = SpecifierSet(">=3.4.1,<5.0.0")
     admitted = [
