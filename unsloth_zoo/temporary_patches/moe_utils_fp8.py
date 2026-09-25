@@ -1237,8 +1237,7 @@ def patch_peft_param_wrapper_fp4_expert_shape():
             return param
         base_layer = self.get_base_layer()
         config = getattr(base_layer, "config", None)
-        # Only the implementations patch_fp8_experts_interface reroutes read the expert LoRA;
-        # eager (transformers' fallback when grouped_mm cannot dispatch) and megamoe would drop it.
+        # Only rerouted implementations read the expert LoRA; eager (grouped_mm fallback) and megamoe drop it.
         experts_impl = getattr(config, "_experts_implementation", None)
         if experts_impl is not None and experts_impl not in _UNSLOTH_FP8_EXPERTS_KEYS:
             raise NotImplementedError(
