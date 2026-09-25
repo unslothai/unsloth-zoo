@@ -14,7 +14,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""`relu2` keeps its input dtype under autocast (Nemotron-H bf16 `index_add_` combine)."""
 import pytest
 import torch
 

@@ -14,7 +14,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Integer inputs to a bitsandbytes 4-bit LoRA layer under autocast (Nemotron-H idle experts)."""
 import pytest
 import torch
 
