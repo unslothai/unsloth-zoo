@@ -71,8 +71,7 @@ def test_torch_reference_matches_transformers():
 @pytest.mark.parametrize("transpose", [False, True])
 @pytest.mark.parametrize("chunk_bytes", [1, 5 * 64 * 16 * 8, 1 << 30])
 def test_torch_fallback_chunks_are_bit_identical(monkeypatch, transpose, chunk_bytes):
-    # Chunks of 1 row, of a row count that does not divide N (so a transposed chunk is cut at an
-    # expert edge), and of the whole stack all write the unchunked result, into a fresh or given buffer.
+    # Chunk sizes incl. one not dividing N (cut at an expert edge) all match the unchunked result.
     monkeypatch.setattr(mxd, "_TORCH_CHUNK_BYTES", chunk_bytes)
     blocks, scales = _random_mxfp4(3, 7, 64, low = 0, high = 255)
     want = _reference(blocks, scales)
@@ -82,7 +81,6 @@ def test_torch_fallback_chunks_are_bit_identical(monkeypatch, transpose, chunk_b
     out = torch.full_like(want, float("nan"))
     assert mxfp4_dequantize_torch(blocks, scales, transpose = transpose, out = out) is out
     assert torch.equal(_bits(out), _bits(want))
-    # A non-contiguous buffer and a 2-D (rows, G, 16) input.
     strided = torch.empty(want.shape[:-1] + (want.shape[-1] * 2,), dtype = want.dtype)[..., ::2]
     mxfp4_dequantize_torch(blocks, scales, transpose = transpose, out = strided)
     assert torch.equal(_bits(strided), _bits(want))
@@ -187,7 +185,6 @@ def test_packed_param_survives_module_casts_and_copies():
     module.half()
     assert module.w.dtype == torch.uint8 and isinstance(module.w, Mxfp4ExpertParam)
     assert torch.equal(copy.deepcopy(param).dequantize(), _reference(blocks, scales))
-    # accelerate re-creates a parameter as cls(data, requires_grad, **param.__dict__).
     rebuilt = type(param)(param.data, requires_grad = False, **param.__dict__)
     assert isinstance(rebuilt, Mxfp4ExpertParam) and rebuilt._original_shape == param._original_shape
     if torch.cuda.is_available():
@@ -509,8 +506,7 @@ def test_full_save_writes_dequantized_experts(tmp_path, explicit_state_dict):
 
 @pytest.mark.skipif(not TRANSFORMERS_5, reason = "weight conversions are transformers 5")
 def test_full_save_of_a_loaded_model_writes_experts_under_their_own_names(tmp_path):
-    """from_pretrained records the Mxfp4Dequantize converters, and save_pretrained reverses them:
-    transformers 5.4 raised NotImplementedError, 5.17 wrote the stacks under "gate_up_proj$"."""
+    """Reversed converters: 5.4 raised NotImplementedError, 5.17 wrote "gate_up_proj$"."""
     safetensors = pytest.importorskip("safetensors.torch")
     from transformers.core_model_loading import WeightConverter
     from transformers.integrations.mxfp4 import Mxfp4Dequantize
@@ -723,8 +719,7 @@ def test_a_later_load_without_a_device_map_clears_the_offload_flag(monkeypatch):
 
 
 def test_load_state_dict_carries_the_scales():
-    """state_dict() holds each packed stack as an Mxfp4ExpertParam; loading it must take the
-    scales with the blocks, and bare uint8 blocks (a safetensors round trip) must be refused."""
+    """load_state_dict takes scales with the blocks and refuses bare uint8 blocks."""
     a, b = nn.Module(), nn.Module()
     a.w, b.w = _packed(4, 64, 64, seed = 1), _packed(4, 64, 64, seed = 2)
     assert not torch.equal(a.w.mxfp4_scales, b.w.mxfp4_scales)
@@ -733,7 +728,6 @@ def test_load_state_dict_carries_the_scales():
     assert b.w is target and isinstance(b.w, Mxfp4ExpertParam)
     assert torch.equal(b.w.dequantize(), a.w.dequantize())
     assert b.w.mxfp4_scales.data_ptr() != a.w.mxfp4_scales.data_ptr()   # copied, not aliased
-    # A pickled state_dict (torch.save / Trainer checkpoints) keeps the scales too.
     c = nn.Module()
     c.w = _packed(4, 64, 64, seed = 3)
     c.load_state_dict(pickle.loads(pickle.dumps(a.state_dict())))

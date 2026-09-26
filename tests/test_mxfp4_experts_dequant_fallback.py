@@ -14,17 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Mxfp4GptOssExperts.gate_up_proj / down_proj decode the packed blocks when nothing swizzled
-them at load, which is every transformers 5 load: load_and_swizzle_mxfp4 is only called by the
-4.x quantizer. The old code imported transformers.integrations.mxfp4.dequantize, which 5.16.0
-removed and which in every earlier release is a loader hook taking (module, param_name, ...),
-not (blocks, scales), so that path could not work on any version.
-
-_dequantize_mxfp4_experts must return GPT-OSS's (E, in, out) stack whichever
-convert_moe_packed_tensors is installed (stock self-transposing, or Unsloth's un-transposed
-replacement), must not call a loader-hook dequantize, and must decode on its own when
-transformers has neither. gpt-oss's down_proj is square, so orientation cannot be read off
-the output shape; the square case is covered explicitly."""
+"""_dequantize_mxfp4_experts returns (E, in, out) whichever convert_moe_packed_tensors is installed,
+never calls a loader-hook dequantize, and decodes on its own otherwise (square case included)."""
 import itertools
 import types
 
@@ -44,7 +35,6 @@ _E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -
 def _packed(E, rows, in_features, seed = 0):
     g = torch.Generator().manual_seed(seed)
     blocks = torch.randint(0, 256, (E, rows, in_features // 32, 16), dtype = torch.uint8, generator = g)
-    # Exponents around the bias plus the extremes a checkpoint can hold.
     scales = torch.randint(118, 136, (E, rows, in_features // 32), dtype = torch.uint8, generator = g)
     scales[0, 0, 0] = 0
     scales[-1, -1, -1] = 254
@@ -52,7 +42,7 @@ def _packed(E, rows, in_features, seed = 0):
 
 
 def _reference(blocks, scales):
-    """Spec decode, element by element: weight[e, k, r] is input feature k of output row r."""
+    """Spec decode: weight[e, k, r] = input k of output row r."""
     E, R, G, B = blocks.shape
     out = torch.empty(E, G * B * 2, R, dtype = torch.float64)
     for e, r, gi, b in itertools.product(range(E), range(R), range(G), range(B)):
@@ -70,7 +60,7 @@ def _stock_convert(blocks, scales, *, dtype = torch.bfloat16, rows_per_chunk = 0
 
 
 def _untransposed_convert(blocks, scales, *, dtype = torch.bfloat16, rows_per_chunk = 0):
-    """Unsloth's replacement convention (temporary_patches/mxfp4.py): (E, out, in)."""
+    """Unsloth's replacement: (E, out, in)."""
     lut = torch.tensor(_E2M1, dtype = torch.float32)
     *prefix, G, B = blocks.shape
     out = torch.empty(*prefix, G, B * 2, dtype = torch.float32)
@@ -87,7 +77,7 @@ def _fresh_probe_cache():
     gpt_oss._CONVERT_TRANSPOSES.clear()
 
 
-# (E, out rows, in features): gate_up-like (rows = 2 * in), down-like square, and wide.
+# (E, out, in): gate_up-like, square down-like, wide.
 SHAPES = [(2, 128, 64), (3, 64, 64), (2, 32, 96)]
 
 

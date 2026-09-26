@@ -283,7 +283,7 @@ def swiglu_torch_backward(pre_act, alpha, limit, g1):
     return g1 * grad.to(g1.dtype)
 pass
 
-# E2M1 code points, indexed by the 4-bit nibble (sign bit is the high bit of the nibble).
+# E2M1 code points by nibble.
 _MXFP4_E2M1_VALUES = (
     +0.0, +0.5, +1.0, +1.5, +2.0, +3.0, +4.0, +6.0,
     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
@@ -291,11 +291,7 @@ _MXFP4_E2M1_VALUES = (
 
 
 def _mxfp4_dequantize_experts_torch(blocks, scales, dtype = torch.bfloat16):
-    """Reference MXFP4 decode straight to the GPT-OSS (E, in, out) layout.
-
-    blocks: (E, out, in // 32, 16) uint8, two E2M1 values per byte, low nibble first.
-    scales: (E, out, in // 32) uint8 E8M0 exponents with bias 127, one per 32 values.
-    One expert at a time, so the temporaries stay a single expert's size."""
+    """Reference MXFP4 decode to (E, in, out), one expert at a time; low nibble first."""
     if blocks.dim() != 4 or blocks.shape[-1] != 16 or tuple(blocks.shape[:-1]) != tuple(scales.shape):
         raise ValueError(
             f"Unsloth: MXFP4 blocks {tuple(blocks.shape)} do not match scales {tuple(scales.shape)}"
@@ -321,12 +317,8 @@ _CONVERT_TRANSPOSES = {}
 
 
 def _convert_moe_packed_tensors_transposes(convert):
-    """Whether ``convert`` returns GPT-OSS's (E, in, out) layout or the un-transposed (E, out, in).
-
-    Stock transformers >= 4.56 transposes inside convert_moe_packed_tensors; Unsloth's own
-    replacement (temporary_patches/mxfp4.py) does not, and which one is installed depends on
-    whether that patch ran. gpt-oss's down_proj is square, so the output shape of the real
-    tensor cannot tell them apart: decode a tiny non-square stack once and look."""
+    """Whether ``convert`` returns (E, in, out) (stock >= 4.56) or (E, out, in) (Unsloth's patch).
+    down_proj is square, so probe a tiny non-square stack."""
     key = id(convert)
     if key not in _CONVERT_TRANSPOSES:
         probe = convert(
@@ -344,16 +336,8 @@ def _convert_moe_packed_tensors_transposes(convert):
 
 
 def _dequantize_mxfp4_experts(blocks, scales, dtype = torch.bfloat16):
-    """Dense GPT-OSS expert stack (E, in, out) from MXFP4 ``blocks`` / ``scales``, on any
-    transformers version. This is the layout Mxfp4GptOssExperts hands to matmul_ogs.
-
-    0. unsloth_zoo.mxfp4_dequant.mxfp4_dequantize on CUDA.
-    1. transformers.integrations.mxfp4.dequantize, only where it takes (blocks, scales).
-       Every release so far ships it as a loader hook (module, param_name, param_value, ...)
-       and 5.16.0 removed it, so this is kept only for a future (blocks, scales) helper.
-    2. transformers.integrations.mxfp4.convert_moe_packed_tensors (4.55 to 5.x), whichever
-       orientation the installed version returns.
-    3. A local E2M1 + E8M0 decode."""
+    """Dense GPT-OSS expert stack (E, in, out) on any transformers version. Tries the fused
+    kernel, transformers' dequantize (only if it takes (blocks, scales)), convert_moe_packed_tensors, local decode."""
     try:
         import transformers.integrations.mxfp4 as mxfp4_integration
     except Exception:
@@ -361,8 +345,6 @@ def _dequantize_mxfp4_experts(blocks, scales, dtype = torch.bfloat16):
     expected = (blocks.shape[0], blocks.shape[2] * blocks.shape[3] * 2, blocks.shape[1])
 
     if blocks.is_cuda and blocks.dtype == torch.uint8:
-        # Fused decode (unsloth_zoo/mxfp4_dequant.py): self-checked against the torch
-        # reference per device, and falls back to it on any mismatch.
         try:
             from unsloth_zoo.mxfp4_dequant import mxfp4_dequantize
             return mxfp4_dequantize(blocks, scales, dtype = dtype, transpose = True)
@@ -652,9 +634,7 @@ def patch_gpt_oss():
                     f"Try 'openai/gpt-oss-20b' with load_in_4bit=True instead."
                 )
 
-            # Blocks that stayed packed at load (transformers 5 never calls load_and_swizzle_mxfp4,
-            # the only place that turns them into a Triton tensor). Decode to the (E, in, out)
-            # stack matmul_ogs takes, per call and uncached, so the experts stay MXFP4 in memory.
+            # Still packed (transformers 5 skips load_and_swizzle_mxfp4): decode per call, uncached.
             try:
                 return _dequantize_mxfp4_experts(self.gate_up_proj_blocks, self.gate_up_proj_scales)
             except Exception as e:
@@ -683,9 +663,7 @@ def patch_gpt_oss():
                     f"Mxfp4GptOssExperts.down_proj: No weights loaded."
                 )
 
-            # Blocks that stayed packed at load (transformers 5 never calls load_and_swizzle_mxfp4,
-            # the only place that turns them into a Triton tensor). Decode to the (E, in, out)
-            # stack matmul_ogs takes, per call and uncached, so the experts stay MXFP4 in memory.
+            # Still packed (transformers 5 skips load_and_swizzle_mxfp4): decode per call, uncached.
             try:
                 return _dequantize_mxfp4_experts(self.down_proj_blocks, self.down_proj_scales)
             except Exception as e:

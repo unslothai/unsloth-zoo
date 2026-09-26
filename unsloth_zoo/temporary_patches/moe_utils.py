@@ -1835,8 +1835,7 @@ def _get_lora_wrapper_for_param(experts_module, param_name):
         wrapper = getattr(experts_module, f"{param_name}_lora_wrapper")
     else:
         if isinstance(inspect.getattr_static(type(experts_module), param_name, None), property):
-            # A property may decode on every read (packed MXFP4); only a value stored by
-            # its setter can be a ParamWrapper, so look there without evaluating it.
+            # Don't evaluate a property (packed MXFP4 decodes on read); its setter stores the wrapper.
             attr = experts_module.__dict__.get("_" + param_name, None)
         else:
             attr = getattr(experts_module, param_name, None)
@@ -2198,7 +2197,6 @@ def _is_moe_experts_module(module) -> bool:
         # 4-bit params are packed into 2D tensors.
         if HAS_BNB and isinstance(param, Params4bit) and param.ndim == 2:
             return True
-        # Packed MXFP4 stacks are 4D (num_experts, out, blocks, 16) uint8.
         if is_mxfp4_expert_param(param):
             return True
         # Standard MoE weights are 3D (num_experts, in, out).
