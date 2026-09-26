@@ -138,6 +138,12 @@ def add_new_tokens(
     is_tied = (old_input_embedding.data_ptr() == old_output_embedding.data_ptr()) \
         or (model.config.tie_word_embeddings)
 
+    # Tokenize before add_tokens: afterwards each token maps to its own fresh row.
+    if method == "interpolation":
+        new_token_pieces = [
+            tokenizer(token, add_special_tokens = False).input_ids for token in new_tokens
+        ]
+
     # Add tokens!
     old_length = len(tokenizer)
     tokenizer.add_tokens(new_tokens)
@@ -181,10 +187,13 @@ def add_new_tokens(
             "Unsloth: You are using interpolation to add new tokens.\n"\
             f"We shall set new tokens = mean(embeddings)*{1-interpolation} + mean(new_tokens)*{interpolation}"
         )
-        for j, token in enumerate(new_tokens):
-            input_ids = tokenizer(token, add_special_tokens = False).input_ids
-            mean_embedding_token = embedding_matrix[input_ids].mean(axis = 0, dtype = torch.float32)
-            mean_lm_head_token   = lm_head_matrix  [input_ids].mean(axis = 0, dtype = torch.float32)
+        for j, input_ids in enumerate(new_token_pieces):
+            # T5-style tokenizers split whitespace-only strings into no pieces; a mean of none is NaN.
+            if len(input_ids) == 0:
+                mean_embedding_token, mean_lm_head_token = mean_embedding, mean_lm_head
+            else:
+                mean_embedding_token = embedding_matrix[input_ids].mean(axis = 0, dtype = torch.float32)
+                mean_lm_head_token   = lm_head_matrix  [input_ids].mean(axis = 0, dtype = torch.float32)
 
             # Interpolate
             mean_embedding_token = mean_embedding*(1-interpolation) + mean_embedding_token*interpolation
