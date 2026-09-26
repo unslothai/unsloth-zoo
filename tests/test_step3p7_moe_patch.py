@@ -77,7 +77,7 @@ def test_patch_routes_the_forward_and_keeps_the_class_gate():
     assert callable(klass._unsloth_lora_extractor_fn)
     assert klass.forward.__name__ == mu.get_forward_moe_backend().__name__
     forward = klass.forward
-    patch_step3p7_moe()  # idempotent
+    patch_step3p7_moe()
     assert klass.forward is forward
 
 
