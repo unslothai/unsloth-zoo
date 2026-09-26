@@ -436,7 +436,6 @@ def _stage_cast_for_test(module, dtype):
 
 
 def _attach_tower_input_hooks(model):
-    # A vision tower split across cards needs its inputs moved to it (see device_map_planner).
     try:
         from .device_map_planner import attach_tower_input_hooks
         attach_tower_input_hooks(model)

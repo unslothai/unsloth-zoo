@@ -1155,12 +1155,8 @@ def _anchor_excluded(model: nn.Module, tower: str, no_split_classes: Sequence[st
 
 
 def attach_tower_input_hooks(model: nn.Module) -> list[str]:
-    """Move each split tower's inputs to its first parameter's device; returns the towers hooked.
-
-    A tower split across cards has no hook on its root, and Qwen3-VL's forward multiplies the
-    ``pos_embed`` output by weights built on ``grid_thw``'s device before any child hook runs.
-    Only inputs move (no weights), towers already hooked are left alone, and nothing here raises.
-    """
+    """Move each split tower's inputs to its first parameter's device (Qwen3-VL builds
+    interpolation weights on ``grid_thw``'s device before any child hook runs). Never raises."""
     try:
         device_map = getattr(model, "hf_device_map", None)
         if not isinstance(device_map, dict) or len(set(map(str, device_map.values()))) < 2:
