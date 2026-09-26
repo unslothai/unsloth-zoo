@@ -1728,7 +1728,6 @@ def _complete_mlx_vlm_processor_runtime(processor, model_path, eos_token_ids=Non
                 detokenizer_class = load_tokenizer(Path(model_path), return_tokenizer=False)
                 processor.detokenizer = detokenizer_class(tokenizer)
             except (AttributeError, TypeError, ValueError):
-                # Optimized detokenizers can require vocabulary APIs absent on custom tokenizers.
                 processor.detokenizer = NaiveStreamingDetokenizer(tokenizer)
         if getattr(tokenizer, "stopping_criteria", None) is None:
             from mlx_vlm.utils import StoppingCriteria
