@@ -13,6 +13,8 @@ import unsloth_zoo.device_map_planner as planner
 
 
 def _qwen3_5_moe(layers = 8, depth = 4, out_hidden_size = 64):
+    if not hasattr(transformers, "Qwen3_5MoeConfig"):
+        pytest.skip("transformers has no Qwen3.5 MoE")
     config = transformers.Qwen3_5MoeConfig(
         text_config = dict(
             vocab_size = 512, hidden_size = 64, num_hidden_layers = layers,
@@ -36,7 +38,7 @@ def _qwen3_vl():
         text_config = dict(
             vocab_size = 512, hidden_size = 64, intermediate_size = 128,
             num_hidden_layers = 8, num_attention_heads = 4, num_key_value_heads = 2,
-            head_dim = 16,
+            head_dim = 16, rope_scaling = dict(rope_type = "default", mrope_section = [4, 2, 2]),
         ),
         vision_config = dict(
             depth = 4, hidden_size = 64, intermediate_size = 128, num_heads = 4,
