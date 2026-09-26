@@ -496,7 +496,6 @@ def _undeclared_sibling_blocks(model: nn.Module, declared: set[str]) -> set[str]
             # A container class name would make every such container atomic model-wide.
             if isinstance(child, (nn.ModuleList, nn.ModuleDict, nn.Sequential)):
                 continue
-            # Zamba-style wrappers of a shared block: keeping them whole can make a model not fit.
             if any(type(sub).__name__ in declared for sub in child.modules()):
                 continue
             if any(True for _ in child.parameters(recurse=True)):
