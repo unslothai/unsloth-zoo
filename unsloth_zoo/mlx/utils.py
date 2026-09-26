@@ -404,7 +404,7 @@ def set_mlx_norm_output_cast_to_input_dtype(enabled: bool, model=None) -> None:
 # MLX raises instead of returning zero when a backward pass reaches a
 # gather/scatter index, aborting every graph that derives indices from activations:
 # MoE routing, SwitchGLU's gather-sort, GLM-5.x's sparse mask. Detaching changes no
-# forward value; producers are wrapped too, since `__getitem__` hides the consumer.
+# forward value; producers, consumers and integer `__getitem__` keys are all detached.
 _MLX_INDEX_PRODUCERS = ("argpartition", "argsort", "argmax", "argmin")
 _MLX_INDEX_CONSUMERS = {  # index-argument positions, by op
     "take": (1,), "take_along_axis": (1,), "put_along_axis": (1,),
@@ -442,6 +442,8 @@ def _wrap_mlx_index_op(name, original):
 
     @wraps(original)
     def wrapper(*args, **kwargs):
+        if not mlx_training_patches_active():
+            return original(*args, **kwargs)
         if positions is None:  # producer: the result is entirely an index
             return mx.stop_gradient(original(*args, **kwargs))
         return original(
@@ -467,14 +469,143 @@ def _set_mlx_index_gradient_stop(enabled: bool) -> None:
         elif not enabled and patched:
             setattr(mx, name, current._unsloth_index_original)
 
+    current = getattr(mx.array, "__getitem__", None)
+    if current is None:
+        return
+    patched = bool(getattr(current, "_unsloth_index_stop_gradient", False))
+    if enabled and not patched:
+        @wraps(current)
+        def getitem(array, key):
+            if mlx_training_patches_active():
+                key = _detach_integer_arrays(key)
+            return current(array, key)
+
+        getitem._unsloth_index_stop_gradient = True
+        getitem._unsloth_index_original = current
+        mx.array.__getitem__ = getitem
+    elif not enabled and patched:
+        mx.array.__getitem__ = current._unsloth_index_original
+
+
+# Training SDPA runs MLX's unfused fallback, scoring every key even outside the window.
+_TRAINING_ATTENTION_BLOCK = 512
+_WINDOW_MASKS = {}
+
+
+def _register_window_mask(mask, window):
+    key = id(mask)
+
+    def forget(ref):
+        if _WINDOW_MASKS.get(key, (None,))[0] is ref:
+            del _WINDOW_MASKS[key]
+
+    _WINDOW_MASKS[key] = (weakref.ref(mask, forget), window)
+
+
+def _registered_window(mask):
+    ref, window = _WINDOW_MASKS.get(id(mask), (None, None))
+    return window if ref is not None and ref() is mask else None
+
+
+def _carry_window_masks(outer, inner):
+    """`mx.checkpoint` hands the layer new array objects for its arguments."""
+    (outer_args, outer_kwargs), (inner_args, inner_kwargs) = outer, inner
+    pairs = [*zip(outer_args, inner_args),
+             *((outer_kwargs[k], inner_kwargs.get(k)) for k in outer_kwargs)]
+    for before, after in pairs:
+        if (window := _registered_window(before)) is not None:
+            _register_window_mask(after, window)
+
+
+def _wrap_create_causal_mask(original):
+    @wraps(original)
+    def wrapper(N, offset=0, window_size=None, *args, **kwargs):
+        mask = original(N, offset, window_size, *args, **kwargs)
+        if (window_size is not None and isinstance(offset, int) and offset == 0 and not args
+                and all(v is None for v in kwargs.values())
+                and mlx_training_patches_active()):
+            _register_window_mask(mask, window_size)
+        return mask
+
+    wrapper._unsloth_original = original
+    return wrapper
+
+
+def _windowed_attention(sdpa, q, k, v, scale, window, block):
+    # Query blocks folded into the batch, each vs its own + previous key block. Not per-block
+    # slices: their full-size gradient scatters fuse past Metal's kernel argument limit.
+    B, T = q.shape[0], q.shape[-2]
+    n = -(-T // block)
+
+    def fold(t, with_previous):
+        t = mx.pad(t, [(0, 0), (0, 0), (0, n * block - T), (0, 0)])
+        t = t.reshape(B, t.shape[1], n, block, t.shape[-1])
+        if with_previous:
+            previous = mx.pad(t[:, :, :-1], [(0, 0), (0, 0), (1, 0), (0, 0), (0, 0)])
+            t = mx.concatenate([previous, t], axis=3)
+        return t.transpose(0, 2, 1, 3, 4).reshape(B * n, t.shape[1], t.shape[3], t.shape[4])
+
+    rows = mx.arange(n)[:, None, None] * block + mx.arange(block)[:, None]
+    cols = mx.arange(n)[:, None, None] * block + mx.arange(-block, block)
+    mask = (cols >= 0) & (rows >= cols) & (rows < cols + window)
+    mask = mx.broadcast_to(mask[None, :, None], (B, n, 1, block, 2 * block))
+    mask = mask.reshape(B * n, 1, block, 2 * block)
+    out = sdpa(fold(q, False), fold(k, True), fold(v, True), scale=scale, mask=mask)
+    out = out.reshape(B, n, -1, block, out.shape[-1]).transpose(0, 2, 1, 3, 4)
+    return out.reshape(B, -1, n * block, out.shape[-1])[..., :T, :]
+
+
+def _windowing_pays(q, k, block):
+    # Skipped scores vs padded, folded q/k/v copies; 2.5 measured on bf16 training attention.
+    heads, T, dim = q.shape[1], q.shape[2], q.shape[3]
+    padded = -(-T // block) * block
+    skipped = heads * (T * T - 2 * block * padded)
+    return skipped >= 2.5 * (heads + 2 * k.shape[1]) * padded * dim
+
+
+def _wrap_training_sdpa(original):
+    @wraps(original)
+    def wrapper(q, k, v, *, scale, mask=None, **kwargs):
+        T = q.shape[-2]
+        if (isinstance(mask, mx.array) and mask.shape == (T, T) and k.shape[-2] == T
+                and all(value is None for value in kwargs.values())):
+            window = _registered_window(mask)
+            if window is not None:
+                block = max(_TRAINING_ATTENTION_BLOCK, window)
+                if _windowing_pays(q, k, block):
+                    return _windowed_attention(original, q, k, v, scale, window, block)
+        return original(q, k, v, scale=scale, mask=mask, **kwargs)
+
+    wrapper._unsloth_original = original
+    return wrapper
+
+
+def _set_mlx_windowed_attention(enabled: bool) -> None:
+    targets = [(mx.fast, "scaled_dot_product_attention", _wrap_training_sdpa)]
+    for name in ("mlx_lm.models.base", "mlx_vlm.models.base"):
+        if sys.modules.get(name) is not None:
+            targets.append((sys.modules[name], "create_causal_mask", _wrap_create_causal_mask))
+    for module, attr, wrap in targets:
+        current = getattr(module, attr, None)
+        if current is None:
+            continue
+        original = getattr(current, "_unsloth_original", None)
+        if enabled and original is None:
+            setattr(module, attr, wrap(current))
+        elif not enabled and original is not None:
+            setattr(module, attr, original)
+
 
 def acquire_mlx_training_patches() -> None:
     """Reference-counted: the `mlx.core` patches are process-wide while trainer
     runs are not, so an inner run must not unpatch an outer one."""
     global _MLX_TRAINING_PATCH_DEPTH
     with _MLX_INDEX_GRADIENT_LOCK:
+        from .attention import install_sparse_attention_training
+        install_sparse_attention_training()
         if _MLX_TRAINING_PATCH_DEPTH == 0:
             _set_mlx_index_gradient_stop(True)
+            _set_mlx_windowed_attention(True)
         _MLX_TRAINING_PATCH_DEPTH += 1
     _MLX_TRAINING_ACTIVE_DEPTH.set(_MLX_TRAINING_ACTIVE_DEPTH.get() + 1)
 
@@ -487,6 +618,7 @@ def release_mlx_training_patches() -> None:
         _MLX_TRAINING_PATCH_DEPTH -= 1
         if _MLX_TRAINING_PATCH_DEPTH == 0:
             _set_mlx_index_gradient_stop(False)
+            _set_mlx_windowed_attention(False)
     _MLX_TRAINING_ACTIVE_DEPTH.set(max(0, _MLX_TRAINING_ACTIVE_DEPTH.get() - 1))
 
 
@@ -509,6 +641,7 @@ def pause_mlx_training_patches() -> bool:
             return False
         _MLX_TRAINING_PATCH_DEPTH = 0
         _set_mlx_index_gradient_stop(False)
+        _set_mlx_windowed_attention(False)
         return True
 
 
@@ -526,6 +659,7 @@ def resume_mlx_training_patches(paused: bool) -> None:
         if paused:
             if _MLX_TRAINING_PATCH_DEPTH == 0:
                 _set_mlx_index_gradient_stop(True)
+                _set_mlx_windowed_attention(True)
             _MLX_TRAINING_PATCH_DEPTH += 1
     stack = _MLX_TRAINING_PAUSE_STACK.get()
     if stack:
@@ -861,9 +995,11 @@ def _patch_layer_class_for_gc(layer_cls):
             if "shared_kv" in kwargs:
                 args, kwargs["shared_kv"] = _tie_to_hidden_state(
                     args, kwargs["shared_kv"])
+            outer = (args, kwargs)
 
             def inner_fn(params, *args, **kwargs):
                 self.update(params)
+                _carry_window_masks(outer, (args, kwargs))
                 args = tuple(_detach_integer_arrays(a) for a in args)
                 kwargs = {k: _detach_integer_arrays(v) for k, v in kwargs.items()}
                 return fn(self, *args, **kwargs)
@@ -872,9 +1008,12 @@ def _patch_layer_class_for_gc(layer_cls):
 
         # Shared K/V crosses the checkpoint boundary as a traced argument and a
         # traced result; read off the slot and the VJP drops the gradient.
+        outer = (args, kwargs)
+
         def inner_fn(params, borrowed, *args, **kwargs):
             self.update(params)
             slot.install(borrowed)
+            _carry_window_masks(outer, (args, kwargs))
             args = tuple(_detach_integer_arrays(a) for a in args)
             kwargs = {k: _detach_integer_arrays(v) for k, v in kwargs.items()}
             out = fn(self, *args, **kwargs)
@@ -938,6 +1077,44 @@ def _get_text_backbone(model):
     """Get a separable hidden-state backbone when the model exposes one."""
     tm = _get_text_model(model)
     return getattr(tm, "model", None)
+
+
+def _get_encoder_decoder_backbone(model):
+    tm = _get_text_model(model)
+    backbone = getattr(model, "model", None)
+    if (getattr(tm, "_parent", None) is model
+            and callable(getattr(backbone, "encoder", None))
+            and getattr(backbone, "decoder", None) is getattr(tm, "model", None)):
+        return backbone
+    return None
+
+
+def _get_output_transform_owner(model):
+    # A non-owning decoder view omits the parent's post-projection transforms.
+    if _get_encoder_decoder_backbone(model) is not None:
+        return model
+    return _get_text_model(model)
+
+
+def _validate_output_token_mask(model):
+    tm = _get_text_model(model)
+    ids = getattr(tm, "_dummy_tokenizer_ids", None)
+    if ids is None or getattr(ids, "size", 0) == 0:
+        return
+    try:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(type(tm).__call__)))
+    except (OSError, TypeError, SyntaxError):
+        return
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Store)
+                and _self_attr_chain(node.slice) == "_dummy_tokenizer_ids"):
+            # This scatter's VJP can fault on Metal even when forward succeeds.
+            raise ValueError(
+                "Unsloth: unsafe output token mask: vocabulary token IDs index "
+                "the batch axis of [batch, sequence, vocabulary] logits. "
+                "Training is disabled to prevent a Metal address fault; the "
+                "backend must mask the final (vocabulary) axis instead."
+            )
 
 
 def _has_hidden_stack(obj):
@@ -1411,7 +1588,18 @@ def _has_direct_hidden_stack(model):
 
 def _forward_text_hidden_states(model, inputs, inputs_embeds=None, **kwargs):
     """Run a text stack up to pre-lm_head hidden states for CCE."""
+    composite = _get_encoder_decoder_backbone(model)
+    if composite is not None:
+        hidden, _ = composite(inputs, **_filter_backbone_kwargs(composite, kwargs))
+        return hidden
     tm = _get_text_model(model)
+    if (inputs_embeds is None and getattr(model, "_unsloth_text_only_vlm", False)
+            and _get_backbone_embed_kwarg(getattr(tm, "model", tm)) is not None
+            and callable(getattr(model, "get_input_embeddings", None))):
+        inputs_embeds, embed_kwargs = _unpack_embed_result(
+            model.get_input_embeddings(inputs, None), model, input_ids=inputs,
+        )
+        kwargs = {**embed_kwargs, **kwargs}
     backbone = getattr(tm, "model", None)
     if backbone is not None:
         if (
@@ -1754,7 +1942,7 @@ def _is_quantized_layer(layer):
 
 def _get_logit_softcap(model):
     """Get logit softcapping value if model uses it (e.g. Gemma-2/4), else 0.0."""
-    tm = _get_text_model(model)
+    tm = _get_output_transform_owner(model)
     softcap = getattr(tm, "final_logit_softcapping", None)
     if softcap is None and hasattr(tm, "args"):
         softcap = getattr(tm.args, "final_logit_softcapping", None)
@@ -1770,7 +1958,7 @@ def _get_logit_scale(model):
     ``(scale, invalid)``: scale None when absent or 1.0; ``invalid=True`` for
     bool/non-scalar/non-finite/out-of-range values (callers must fall back).
     """
-    tm = _get_text_model(model)
+    tm = _get_output_transform_owner(model)
     # Only the verified application sites — args (cohere/cohere2/cohere2_moe)
     # then config (aya_vision); no upstream forward reads a direct attribute.
     scale = None
@@ -1867,7 +2055,7 @@ def _detect_logit_softcap(model):
     mean no cap, a positive finite real caps, anything else (or both attrs
     present) fails closed rather than dropping the cap.
     """
-    tm = _get_text_model(model)
+    tm = _get_output_transform_owner(model)
     # Presence, not value: an explicitly-None legacy attr still makes the
     # dual-attr combination unverified.
     legacy = getattr(tm, "final_logit_softcapping", _KNOB_MISSING)
@@ -1912,7 +2100,7 @@ def _detect_head_transform(model, head_status):
     no-op case; accepted scales obey the ``_get_logit_scale`` range.
     ``head_status`` selects branch-conditional transforms as the forwards do.
     """
-    tm = _get_text_model(model)
+    tm = _get_output_transform_owner(model)
     present = {}
     for name, sites in _HEAD_TRANSFORM_KNOBS.items():
         value, conflict = _knob_value(tm, name, sites)
@@ -2019,6 +2207,76 @@ def _is_lm_head_trainable(model):
     return len(trainable) == 0  # no LoRA = full fine-tuning
 
 
+def _supports_text_lora_cce(desc, label_smoothing):
+    if (desc.status == "unknown" or desc.raw or label_smoothing != 0.0
+            or not mx.metal.is_available()):
+        return False
+    from .cce.runtime_cce import supported_lora_head
+
+    head = desc.module
+    if (not supported_lora_head(head) or not 1024 <= head.lora_a.shape[0] <= 4096
+            or head.linear.weight.shape[0] < 8192):
+        return False
+    return type(head.linear) is not nn.QuantizedLinear or head.lora_a.shape[1] <= 32
+
+
+def _make_text_lora_cce_loss_fn(head_desc, logit_scale, softcap):
+    from .cce.runtime_cce import make_lora_head_cce
+
+    head = head_desc.module
+    quantized = type(head.linear) is nn.QuantizedLinear
+    kernel = make_lora_head_cce(
+        chunk_size=4096 if head.lora_a.shape[0] > 2048 else 2048,
+        adapter_scale=head.scale,
+        logit_scale=1.0 if logit_scale is None else logit_scale,
+        logit_softcap=softcap,
+        group_size=head.linear.group_size if quantized else None,
+        bits=head.linear.bits if quantized else None,
+        mode=head.linear.mode if quantized else "affine",
+    )
+    baseline = make_baseline_loss_fn()
+    vocab_size = head.linear.weight.shape[0]
+    head_path = head_desc.path
+
+    def loss_fn(model, batch, lengths, labels=None):
+        n_tokens = batch.shape[0] * max(0, batch.shape[1] - 1)
+        if n_tokens < 1024 or n_tokens * vocab_size < 16 * 1024 * 1024:
+            return baseline(model, batch, lengths, labels)
+        inputs = batch[:, :-1]
+        targets = batch[:, 1:] if labels is None else labels[:, 1:]
+        hidden = _forward_text_hidden_states(model, inputs)
+        targets = _normalize_cce_label_dtype(targets)
+        steps = mx.arange(1, targets.shape[1] + 1)
+        mask = (steps >= lengths[:, 0:1]) & (steps < lengths[:, 1:])
+        if labels is not None:
+            mask = mask & (targets != -100)
+        targets = mx.where(mask, targets, mx.array(-100, dtype=targets.dtype))
+        count = mask.sum()
+        live_head = _resolve_module_path(model, head_path)
+        base = live_head.linear
+        hidden = hidden.reshape((-1, hidden.shape[-1]))
+        rank_hidden = live_head.dropout(hidden) @ live_head.lora_a
+        losses = kernel(
+            hidden, base.weight, base.scales if quantized else None,
+            base.get("biases") if quantized else None,
+            rank_hidden, live_head.lora_b, base.get("bias"), targets.reshape((-1,)),
+        )
+        return losses.sum() / _safe_token_denominator(count), count
+
+    loss_fn._unsloth_cce_backend = "runtime-cce-lora-head"
+    return loss_fn
+
+
+def _runtime_cce_by_mode(**kwargs):
+    loss_only = _get_runtime_cce(**kwargs)
+    if not (kwargs.get("quantized") or kwargs.get("weight_is_frozen")):
+        return lambda model: loss_only
+    # Training builds a frozen head's hidden gradient in the forward, which would
+    # double the cost of evaluation, where nothing is differentiated.
+    training = _get_runtime_cce(**kwargs, precompute_hidden_gradient=True)
+    return lambda model: training if model.training else loss_only
+
+
 def make_cce_loss_fn(model, label_smoothing=0.0):
     """Create a chunked cross-entropy (CCE) loss function.
 
@@ -2043,7 +2301,8 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
         loss_fn._unsloth_cce_backend = "baseline-fallback"
         return loss_fn
     head_desc = describe_output_head(model)
-    _ineligible = _cce_head_ineligibility(head_desc)
+    _lora_cce = _supports_text_lora_cce(head_desc, label_smoothing)
+    _ineligible = None if _lora_cce else _cce_head_ineligibility(head_desc)
     if _ineligible is not None:
         print(f"Unsloth: fused CCE cannot faithfully use this model's output "
               f"head ({_ineligible}); falling back to standard cross-entropy.")
@@ -2063,6 +2322,14 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
         loss_fn = make_baseline_loss_fn(label_smoothing=label_smoothing)
         loss_fn._unsloth_cce_backend = "baseline-fallback"
         return loss_fn
+    if _lora_cce:
+        loss_fn = make_baseline_loss_fn(label_smoothing=label_smoothing)
+        loss_fn._unsloth_cce_backend = "baseline-fallback"
+        loss_fn._unsloth_compiled_loss_fn = _make_text_lora_cce_loss_fn(
+            head_desc, logit_scale, softcap,
+        )
+        return loss_fn
+
     if softcap > 0:
         print(f"Unsloth: CCE using logit_softcap={softcap} for this model.")
     if logit_scale is not None:
@@ -2104,7 +2371,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
         )
         _has_biases = hasattr(lm_layer, "biases")
 
-        rt_cce = _get_runtime_cce(
+        rt_cce = _runtime_cce_by_mode(
             ignore_index=-100,
             logit_softcap=softcap,
             quantized=True,
@@ -2149,7 +2416,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
             hidden_flat, targets_flat = _compact_cce_inputs(
                 hidden_flat, targets_flat, cce_indices,
             )
-            loss = rt_cce(hidden_flat, w, sc, bi, targets_flat)
+            loss = rt_cce(model)(hidden_flat, w, sc, bi, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
     else:
@@ -2157,10 +2424,11 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
         if _skip_weight_grad:
             print("Unsloth: CCE skipping weight gradient (LM head is frozen).")
 
-        rt_cce = _get_runtime_cce(
+        rt_cce = _runtime_cce_by_mode(
             ignore_index=-100,
             logit_softcap=softcap,
             label_smoothing=label_smoothing,
+            weight_is_frozen=_skip_weight_grad,
         )
 
         def loss_fn(model, batch, lengths, labels=None, cce_indices=None):
@@ -2192,7 +2460,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
             hidden_flat, targets_flat = _compact_cce_inputs(
                 hidden_flat, targets_flat, cce_indices,
             )
-            loss = rt_cce(hidden_flat, w, targets_flat)
+            loss = rt_cce(model)(hidden_flat, w, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
 
@@ -2913,6 +3181,10 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
     return loss_fn
 
 
+# gemma4_unified shares the text model but its `Model.__call__` drops `mm_token_type_ids`.
+_VLM_MM_TOKEN_TYPE_FORWARDING_MODEL_TYPES = frozenset({"gemma4"})
+
+
 def _drop_pair_token_type_ids(batch_dict, kwargs):
     """Keep suffix/prefix pair markers out of the text stack.
 
@@ -2993,24 +3265,27 @@ def _unpack_embed_result(embed_result, model, input_ids=None, attention_mask=Non
 
 
 def _get_backbone_embed_kwarg(backbone):
+    # A backbone without its own __call__ (a bare nn.Module) takes no embeddings kwarg either.
     try:
         params = inspect.signature(backbone.__call__).parameters
-    except (TypeError, ValueError):
-        return "inputs_embeds"
-    if "inputs_embeds" in params:
-        return "inputs_embeds"
-    if "input_embeddings" in params:
-        return "input_embeddings"
-    if "input_embeds" in params:
-        return "input_embeds"
-    return "inputs_embeds"
+    except (AttributeError, TypeError, ValueError):
+        return None
+    for name in ("inputs_embeds", "input_embeddings", "input_embeds"):
+        if name in params and params[name].kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY,
+        ):
+            return name
+    return None
 
 
 def _filter_backbone_kwargs(backbone, kwargs):
     try:
         params = inspect.signature(backbone.__call__).parameters
-    except (TypeError, ValueError):
+    except (AttributeError, TypeError, ValueError):
         return kwargs
+    if "image_mask" in params and "image_mask" not in kwargs:
+        kwargs = dict(kwargs)
+        kwargs["image_mask"] = kwargs.pop("visual_pos_masks", None)
     cache = params.get("cache")
     if (
         cache is not None and cache.default is inspect.Parameter.empty
@@ -3051,16 +3326,25 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
     _apply_static_vlm_metadata(model, batch_dict, extra_kwargs)
     extra_kwargs = _trim_sequence_aligned_vlm_kwargs(extra_kwargs, inputs.shape[1])
 
-    embed_result = model.get_input_embeddings(
-        inputs,
-        pixel_values,
-        mask=fwd_attn_mask,
-        **extra_kwargs,
-    )
-    merged_embeds, backbone_kwargs = _unpack_embed_result(
-        embed_result, model, input_ids=inputs, attention_mask=attention_mask,
-    )
-    merged_embeds = _apply_vlm_embed_scale(model, inputs, merged_embeds)
+    backbone = _get_text_backbone(model)
+    if (_get_encoder_decoder_backbone(model) is not None
+            or (backbone is not None and _get_backbone_embed_kwarg(backbone) is None)):
+        merged_embeds = None
+        backbone_kwargs = dict(extra_kwargs, pixel_values=pixel_values)
+        backbone_kwargs["mask"] = (
+            fwd_attn_mask if _keeps_forwarded_mask(model) else None
+        )
+    else:
+        embed_result = model.get_input_embeddings(
+            inputs,
+            pixel_values,
+            mask=fwd_attn_mask,
+            **extra_kwargs,
+        )
+        merged_embeds, backbone_kwargs = _unpack_embed_result(
+            embed_result, model, input_ids=inputs, attention_mask=attention_mask,
+        )
+        merged_embeds = _apply_vlm_embed_scale(model, inputs, merged_embeds)
     # Prefer collator-built mRoPE IDs when present. Qwen/GLM collators build
     # CUDA-parity full-sequence positions; recomputing inside the embedder moved
     # Qwen3-VL first-step loss from ~6.45 to ~6.90 on the real-cat fixture.
@@ -3070,6 +3354,12 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         backbone_kwargs["token_type_ids"] = extra_kwargs["token_type_ids"]
         if attention_mask is not None:
             backbone_kwargs["attention_mask"] = attention_mask
+    if (
+        "mm_token_type_ids" in extra_kwargs
+        and _config_get(getattr(model, "config", None), "model_type")
+        in _VLM_MM_TOKEN_TYPE_FORWARDING_MODEL_TYPES
+    ):
+        backbone_kwargs["mm_token_type_ids"] = extra_kwargs["mm_token_type_ids"]
 
     shared_kv = _build_shared_kv_caches(model)
     if shared_kv is not None:
@@ -4181,6 +4471,12 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
         )
         return _marked_vlm_baseline()
 
+    backbone = getattr(tm, "model", None)
+    token_ids_only = (
+        backbone is not None and _get_backbone_embed_kwarg(backbone) is None
+        and _get_encoder_decoder_backbone(model) is None
+    )
+
     head_desc = describe_output_head(model)
     _ineligible = _cce_head_ineligibility(head_desc)
     if _ineligible is not None:
@@ -4236,7 +4532,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
         bits = getattr(lm_layer, "bits", 4)
         quant_mode = getattr(lm_layer, "mode", "affine")
 
-        rt_cce = _get_runtime_cce(
+        rt_cce = _runtime_cce_by_mode(
             ignore_index=-100,
             logit_softcap=softcap,
             quantized=True,
@@ -4270,16 +4566,17 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
                 flat = indices[:, 0] * masked_targets.shape[1] + columns
                 flat = mx.where((columns >= 0) & (columns < masked_targets.shape[1]), flat, -1)
                 hidden_flat, targets_flat = _compact_cce_inputs(hidden_flat, targets_flat, flat)
-            loss = rt_cce(hidden_flat, w, sc, bi, targets_flat)
+            loss = rt_cce(model)(hidden_flat, w, sc, bi, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
     else:
         if _skip_weight_grad:
             print("Unsloth: VLM CCE skipping weight gradient (LM head is frozen).")
 
-        rt_cce = _get_runtime_cce(
+        rt_cce = _runtime_cce_by_mode(
             ignore_index=-100,
             logit_softcap=softcap,
+            weight_is_frozen=_skip_weight_grad,
         )
 
         def loss_fn(model, batch_dict):
@@ -4300,9 +4597,26 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
                 flat = indices[:, 0] * masked_targets.shape[1] + columns
                 flat = mx.where((columns >= 0) & (columns < masked_targets.shape[1]), flat, -1)
                 hidden_flat, targets_flat = _compact_cce_inputs(hidden_flat, targets_flat, flat)
-            loss = rt_cce(hidden_flat, w, targets_flat)
+            loss = rt_cce(model)(hidden_flat, w, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
+
+    if token_ids_only:
+        cce_loss_fn = loss_fn
+        baseline_loss_fn = _marked_vlm_baseline()
+        noticed_media_fallback = False
+
+        def loss_fn(model, batch_dict):
+            nonlocal noticed_media_fallback
+            if (any(
+                    batch_dict.get(key) is not None
+                    for key in ("pixel_values", "pixel_values_videos")
+                ) or _vlm_batch_carries_audio(batch_dict)):
+                if not noticed_media_fallback:
+                    print("Unsloth: CCE backbone cannot accept multimodal embeddings; using standard cross-entropy for media batches.")
+                    noticed_media_fallback = True
+                return baseline_loss_fn(model, batch_dict)
+            return cce_loss_fn(model, batch_dict)
 
     loss_fn._unsloth_cce_backend = "runtime-cce"
     loss_fn._unsloth_cce_compaction = lm_layer.weight.shape[0] >= 8192
@@ -14249,6 +14563,11 @@ def iter_mlx_lora_modules(model):
             yield module_name, module
 
 
+def is_mlx_dora_module(module):
+    """Class-name gated: a LoRA wrapper with an unrelated ``m`` is not DoRA."""
+    return hasattr(module, "m") and type(module).__name__.startswith("DoRA")
+
+
 def collect_mlx_lora_adapter_tensors(model):
     """Collect tensors for every module exposing a complete LoRA attr pair.
 
@@ -14265,9 +14584,7 @@ def collect_mlx_lora_adapter_tensors(model):
         adapter_keys.add(f"{prefix}lora_b")
         adapter_keys.add(f"{prefix}lora_a.weight")
         adapter_keys.add(f"{prefix}lora_b.weight")
-        # Include DoRA magnitude `m`, gated on the DoRA class name so a
-        # future LoRA wrapper with an unrelated `m` attribute isn't exported.
-        if hasattr(module, "m") and type(module).__name__.startswith("DoRA"):
+        if is_mlx_dora_module(module):
             adapter_keys.add(f"{prefix}m")
     return {name: value for name, value in parameters.items() if name in adapter_keys}
 
@@ -15495,7 +15812,9 @@ def _mlx_sanitize_probe(model, weights):
     unmeasured; the caller treats that as unmeasurable, which is what the export
     did before this existed.
     """
-    return copy.copy(model).sanitize(weights)
+    probe = copy.copy(model)
+    probe._unsloth_measuring_norm_offsets = True
+    return probe.sanitize(weights)
 
 
 def _mlx_sanitizer_norm_offsets(model):
@@ -15520,38 +15839,39 @@ def _mlx_sanitizer_norm_offsets(model):
             weights.update(mx.load(str(weight_file)))
         if not weights:
             return None
-
-        zeroed = _mlx_sanitize_probe(model, _mlx_norm_offset_probe(weights, 0.0))
-        candidates = {}
-        for key, value in zeroed.items():
-            offset = _mlx_constant_1d_value(value)
-            if offset is None or abs(offset) <= _MLX_NORM_OFFSET_TOLERANCE:
-                continue
-            candidates[key] = (value, offset)
-        if not candidates:
-            # Nothing to confirm. Shifting nothing is the common case, so skip
-            # the second replay rather than pay for it on every model.
-            return {}
-
-        raised = _mlx_sanitize_probe(
-            model, _mlx_norm_offset_probe(weights, _MLX_NORM_OFFSET_PROBE)
+        return _mlx_measure_norm_offsets(
+            lambda probe: _mlx_sanitize_probe(model, probe), weights
         )
-
-        offsets = {}
-        for key, (value, offset) in candidates.items():
-            raised_value = raised.get(key)
-            if getattr(raised_value, "shape", None) != value.shape:
-                continue
-            delta = _mlx_constant_1d_value(raised_value - value)
-            if delta is None:
-                continue
-            if abs(delta - _MLX_NORM_OFFSET_PROBE) > _MLX_NORM_OFFSET_TOLERANCE:
-                continue
-            offsets[key] = offset
     except Exception as exc:
         print(f"Unsloth: Could not measure MLX norm offsets ({exc}); continuing.")
         return None
 
+
+def _mlx_measure_norm_offsets(replay, weights):
+    """The additive constants ``replay`` (a sanitizer) applies to ``weights``' 1-D floats."""
+    zeroed = replay(_mlx_norm_offset_probe(weights, 0.0))
+    candidates = {}
+    for key, value in zeroed.items():
+        offset = _mlx_constant_1d_value(value)
+        if offset is None or abs(offset) <= _MLX_NORM_OFFSET_TOLERANCE:
+            continue
+        candidates[key] = (value, offset)
+    if not candidates:
+        return {}
+
+    raised = replay(_mlx_norm_offset_probe(weights, _MLX_NORM_OFFSET_PROBE))
+
+    offsets = {}
+    for key, (value, offset) in candidates.items():
+        raised_value = raised.get(key)
+        if getattr(raised_value, "shape", None) != value.shape:
+            continue
+        delta = _mlx_constant_1d_value(raised_value - value)
+        if delta is None:
+            continue
+        if abs(delta - _MLX_NORM_OFFSET_PROBE) > _MLX_NORM_OFFSET_TOLERANCE:
+            continue
+        offsets[key] = offset
     return offsets
 
 

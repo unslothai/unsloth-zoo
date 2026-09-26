@@ -17,6 +17,7 @@
 __all__ = [
     "Version",
     "_get_dtype",
+    "device_guard",
     "is_main_process",
     "is_distributed",
     "current_rank",
@@ -119,6 +120,17 @@ def _get_dtype(dtype):
         elif isinstance(dtype, torch.dtype):
             return dtype
     return None
+pass
+
+
+def device_guard(tensor):
+    """Make tensor's device current: torch.ldexp (>= 2.12) launches on the current device."""
+    device = tensor.device
+    backend = getattr(torch, device.type, None) if device.type in ("cuda", "xpu") else None
+    guard = getattr(backend, "device", None)
+    if guard is None or device.index is None:
+        return contextlib.nullcontext()
+    return guard(device)
 pass
 
 

@@ -34,6 +34,10 @@ import textwrap
 
 import pytest
 
+# torch is intentionally NOT imported at module level: the CPU-safe structural
+# tests (AST / source checks) must still collect on a host without torch. The few
+# tensor tests below import it locally, and unsloth_zoo's own init pulls it in.
+
 # Importing unsloth_zoo on a GPU host runs its full init, which asserts Unsloth
 # is present. Set the flag defensively so the test is self-contained.
 os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
@@ -301,10 +305,27 @@ _HYGIENE_SUBPROCESS = textwrap.dedent(
 )
 
 
+def _rdna1_gpu_visible():
+    """These subprocess tests assert that the vendored fla IS injected. On a host with an
+    RDNA1 GPU visible unsloth routes gated-delta to the pure-torch path on purpose (no dot
+    instructions, see _NO_DOT_INSTRUCTION_GFX), so the assertion is wrong there by design."""
+    try:
+        from unsloth_zoo.temporary_patches.fla_vendor import _gpu_lacks_dot_instructions
+        return _gpu_lacks_dot_instructions()
+    except Exception:
+        return False
+
+
+_skip_on_rdna1 = pytest.mark.skipif(
+    _rdna1_gpu_visible(),
+    reason = "an RDNA1 GPU is visible: fla is routed to the pure-torch path here by design",
+)
+
 @pytest.mark.skipif(
     not _injection_supported(),
     reason="vendored fla kernels need CUDA + torch>=2.7 + triton>=3.3",
 )
+@_skip_on_rdna1
 def test_import_hygiene_subprocess():
     env = dict(os.environ)
     env["PYTHONPATH"] = str(ZOO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
@@ -436,6 +457,7 @@ _DECODE_ALIAS_SUBPROCESS = textwrap.dedent(
     not _injection_supported(),
     reason="vendored fla kernels need CUDA + torch>=2.7 + triton>=3.3",
 )
+@_skip_on_rdna1
 def test_decode_alias_resolves_through_transformers_subprocess():
     env = dict(os.environ)
     env["PYTHONPATH"] = str(ZOO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
@@ -503,6 +525,7 @@ _OLMO_SUBPROCESS = textwrap.dedent(
     not _transformers_has_models("qwen3_5", "olmo_hybrid"),
     reason="installed transformers lacks the qwen3_5 / olmo_hybrid modeling modules",
 )
+@_skip_on_rdna1
 def test_uncovered_model_imports_on_fallback_subprocess():
     env = dict(os.environ)
     env["PYTHONPATH"] = str(ZOO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
@@ -751,6 +774,7 @@ _TILELANG_NEUTRALIZED_SUBPROCESS = textwrap.dedent(
     not _injection_supported(),
     reason="vendored fla kernels need CUDA + torch>=2.7 + triton>=3.3",
 )
+@_skip_on_rdna1
 def test_broken_tilelang_does_not_abort_dispatch_subprocess():
     env = dict(os.environ)
     env["PYTHONPATH"] = str(ZOO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
@@ -807,6 +831,7 @@ _INTRACARD_NEUTRALIZED_SUBPROCESS = textwrap.dedent(
     not _injection_supported(),
     reason="vendored fla kernels need CUDA + torch>=2.7 + triton>=3.3",
 )
+@_skip_on_rdna1
 def test_reenabled_intracard_stays_unavailable_subprocess():
     env = dict(os.environ)
     env["PYTHONPATH"] = str(ZOO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
@@ -891,6 +916,7 @@ _FORCE_REBIND_SUBPROCESS = textwrap.dedent(
     not _injection_supported(),
     reason="vendored fla kernels need CUDA + torch>=2.7 + triton>=3.3",
 )
+@_skip_on_rdna1
 def test_force_rebinds_already_loaded_real_fla_subprocess():
     env = dict(os.environ)
     env["PYTHONPATH"] = str(ZOO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
@@ -1075,6 +1101,31 @@ def test_late_import_repair_keeps_the_wrapper_when_nothing_to_bind(monkeypatch):
     assert module.torch_chunk_gated_delta_rule is wrapper
 
 
+@requires_kernel_hub
+def test_force_fallback_rebinds_the_compiled_copy(monkeypatch):
+    """unsloth runs unsloth_compiled_module_<type>, whose kernel-hub decorator resolves
+    fla on its own. On RDNA1 that copy must be forced to the pure-torch fallback too, or
+    the compiled forward re-enters fla and aborts with FDOT2."""
+    from unsloth_zoo.temporary_patches import fla_vendor
+
+    def original(): return "torch"
+    def kernel(): return "fla"
+
+    module = _fake_modeling(monkeypatch, "qwen3_5", _fake_wrapper(kernel, original))
+
+    import types
+    compiled_name = "unsloth_compiled_module_qwen3_5"
+    compiled = types.ModuleType(compiled_name)
+    compiled.torch_chunk_gated_delta_rule = _fake_wrapper(kernel, original)
+    monkeypatch.setitem(sys.modules, compiled_name, compiled)
+
+    forced = fla_vendor._force_kernel_hub_fallback(packages=("qwen3_5",))
+
+    assert f"{compiled_name}.torch_chunk_gated_delta_rule" in forced, forced
+    assert module.torch_chunk_gated_delta_rule is original
+    assert compiled.torch_chunk_gated_delta_rule is original
+
+
 def test_late_import_repair_skips_undecorated_attributes(monkeypatch):
     """On a transformers that predates #47630 there is no __wrapped__ to rebuild from."""
     from unsloth_zoo.temporary_patches import fla_vendor
@@ -1122,3 +1173,214 @@ def test_patch_vendor_fla_survives_a_broken_repair(monkeypatch):
     )
     monkeypatch.setattr(fla_vendor, "_patch_vendor_fla", lambda phase=None: "sentinel")
     assert fla_vendor.patch_vendor_fla() == "sentinel"
+
+
+# ---------------------------------------------------------------------------
+# RDNA1 (gfx1010 / gfx1013) has no dot instructions. Triton emits v_dot2 for a
+# 16-bit tl.dot regardless, so every fla chunk kernel aborts the PROCESS in LLVM
+# ("Cannot select: AMDGPUISD::FDOT2"). Found on an RX 5700 XT: Qwen3.5 died at the
+# first kernel compile; routed to transformers' pure-torch gated-delta path it
+# trained 3/3 steps with losses matching an RX 6500 XT on the fla kernels.
+# ---------------------------------------------------------------------------
+
+def _fake_torch(hip, archs, available=True):
+    """A torch stand-in with only what _gpu_lacks_dot_instructions reads."""
+    from types import SimpleNamespace
+
+    def props(i):
+        return SimpleNamespace(gcnArchName=archs[i])
+
+    return SimpleNamespace(
+        version=SimpleNamespace(hip="7.13.99004" if hip else None),
+        cuda=SimpleNamespace(
+            is_available=lambda: available,
+            device_count=lambda: len(archs),
+            get_device_properties=props,
+        ),
+    )
+
+
+def test_rdna1_without_dot_instructions_is_detected():
+    from unsloth_zoo.temporary_patches.fla_vendor import _gpu_lacks_dot_instructions
+
+    assert _gpu_lacks_dot_instructions(_fake_torch(True, ["gfx1010:xnack-"])) is True
+    assert _gpu_lacks_dot_instructions(_fake_torch(True, ["gfx1013"])) is True
+    # Nonzero device index counts too: a model can be placed there.
+    assert _gpu_lacks_dot_instructions(_fake_torch(True, ["gfx1034", "gfx1010:xnack-"])) is True
+
+
+def test_gpus_with_dot_instructions_keep_fla():
+    from unsloth_zoo.temporary_patches.fla_vendor import _gpu_lacks_dot_instructions
+
+    # gfx1011 / gfx1012 are RDNA1 too but do have dot instructions (LLVM dot1/dot2-insts).
+    for arch in ("gfx1011", "gfx1012", "gfx1030", "gfx1034", "gfx1100", "gfx1201", "gfx90a", "gfx942"):
+        assert _gpu_lacks_dot_instructions(_fake_torch(True, [arch])) is False, arch
+
+
+def test_dot_instruction_gate_is_rocm_only_and_fails_open():
+    from unsloth_zoo.temporary_patches.fla_vendor import _gpu_lacks_dot_instructions
+
+    # A CUDA build never reports a gfx arch worth acting on.
+    assert _gpu_lacks_dot_instructions(_fake_torch(False, ["gfx1010"])) is False
+    # No usable accelerator, or an unreadable arch: nothing is narrowed.
+    assert _gpu_lacks_dot_instructions(_fake_torch(True, ["gfx1010"], available=False)) is False
+    assert _gpu_lacks_dot_instructions(_fake_torch(True, [""])) is False
+    assert _gpu_lacks_dot_instructions(_fake_torch(True, [])) is False
+    # A torch that raises anywhere answers False rather than propagating.
+    class Broken:
+        version = None
+    assert _gpu_lacks_dot_instructions(Broken()) is False
+
+
+def test_rdna1_takes_the_pure_torch_gated_delta_path(monkeypatch):
+    """On such a GPU patch_vendor_fla must do what the Hopper opt-out does: make the
+    availability probe answer False, unbind any already-imported gated-delta module, say
+    why, and never reach injection (which would compile the kernels and abort)."""
+    from unsloth_zoo.temporary_patches import fla_vendor
+
+    calls = []
+    monkeypatch.setattr(fla_vendor, "_gpu_lacks_dot_instructions", lambda torch_mod=None: True)
+    monkeypatch.setattr(fla_vendor, "_transformers_uses_availability_probe", lambda: True)
+    monkeypatch.setattr(fla_vendor, "_patch_is_available", lambda *a, **k: calls.append(("probe", a)))
+    monkeypatch.setattr(
+        fla_vendor, "_disable_already_imported_gated_delta", lambda *a, **k: calls.append(("unbind", k))
+    )
+    monkeypatch.setattr(fla_vendor, "_inject_vendored_fla", lambda: calls.append(("inject", None)) or (False, False))
+    monkeypatch.setattr(
+        fla_vendor, "_patch_l2norm_fp32_on_torch_path", lambda *a, **k: calls.append(("l2norm", None)) or []
+    )
+    monkeypatch.setattr(fla_vendor, "_FLA_DISABLED_REASON", None)
+
+    fla_vendor._patch_vendor_fla()
+
+    kinds = [kind for kind, _ in calls]
+    assert kinds[:3] == ["probe", "unbind", "l2norm"]
+    assert "inject" not in kinds
+    assert calls[0][1] == (fla_vendor._unavailable_probe,)
+    assert "RDNA1" in calls[1][1]["why"] or "dot instructions" in calls[1][1]["why"]
+    reason = fla_vendor.fla_unavailable_reason()
+    assert reason and "FDOT2" in reason and "pure-PyTorch" in reason
+
+
+def test_gpus_with_dot_instructions_do_not_trip_the_rdna1_path(monkeypatch):
+    from unsloth_zoo.temporary_patches import fla_vendor
+
+    monkeypatch.setattr(fla_vendor, "_gpu_lacks_dot_instructions", lambda torch_mod=None: False)
+    monkeypatch.setattr(fla_vendor, "_FLA_DISABLED_REASON", None)
+    marked = []
+    monkeypatch.setattr(fla_vendor, "_mark_fla_disabled_no_dot_instructions", lambda: marked.append(1))
+    # Stop before the real injection machinery: the Hopper opt-out is off, so the next
+    # thing _patch_vendor_fla does is consult the source-preference flags.
+    monkeypatch.setattr(fla_vendor, "_flag", lambda name: False)
+    monkeypatch.setattr(fla_vendor, "_torch_triton_cuda_supported", lambda: False)
+
+    fla_vendor._patch_vendor_fla()
+
+    assert marked == []
+    assert fla_vendor.fla_unavailable_reason() is None
+
+
+def _transformers_style_l2norm(x, dim = -1, eps = 1e-6):
+    """Verbatim shape of transformers' pure-torch l2norm: reduction in the input dtype."""
+    import torch
+    inv_norm = torch.rsqrt((x * x).sum(dim = dim, keepdim = True) + eps)
+    return x * inv_norm
+
+
+def test_fp32_l2norm_matches_fp32_reference_and_keeps_dtype():
+    import torch
+    from unsloth_zoo.temporary_patches.fla_vendor import _fp32_l2norm
+
+    x = torch.randn(4, 128, dtype = torch.float16)
+    out = _fp32_l2norm(x)
+    assert out.dtype == torch.float16
+    ref = _transformers_style_l2norm(x.float())
+    torch.testing.assert_close(out.float(), ref, atol = 2e-3, rtol = 2e-3)
+    # Rows end up unit length, as l2norm promises.
+    torch.testing.assert_close(out.float().norm(dim = -1), torch.ones(4), atol = 5e-3, rtol = 0)
+
+
+def test_fp32_l2norm_survives_the_float16_overflow_that_gives_nan_grads():
+    """128 * 300^2 = 1.15e7 overflows float16 (max 65504), so transformers' version stores
+    inv_norm = rsqrt(inf) = 0: a finite forward. fp16 training then backpropagates a
+    loss-scaled gradient; sum(x * grad) overflows to inf in float16 and inf * 0 inside
+    RsqrtBackward is the NaN seen on the RX 5700 XT. The loss itself is float32 in a
+    real trainer, so the scale is applied to a float32 sum here as well."""
+    import torch
+    from unsloth_zoo.temporary_patches.fla_vendor import _fp32_l2norm
+
+    loss_scale = 1024.0
+    x = torch.full((2, 128), 300.0, dtype = torch.float16, requires_grad = True)
+    bad = _transformers_style_l2norm(x)
+    assert torch.isfinite(bad).all()          # the forward looks fine ...
+    (bad.float().sum() * loss_scale).backward()
+    assert not torch.isfinite(x.grad).all()  # ... the backward is not
+
+    x2 = torch.full((2, 128), 300.0, dtype = torch.float16, requires_grad = True)
+    good = _fp32_l2norm(x2)
+    (good.float().sum() * loss_scale).backward()
+    assert torch.isfinite(good).all()
+    assert torch.isfinite(x2.grad).all()
+    torch.testing.assert_close(good.float().norm(dim = -1), torch.ones(2), atol = 5e-3, rtol = 0)
+
+
+def test_l2norm_patch_rebinds_only_imported_gated_delta_modules(monkeypatch):
+    import types
+    from unsloth_zoo.temporary_patches import fla_vendor
+
+    fake_pkg = "unsloth_test_gated_delta"
+    modname = f"transformers.models.{fake_pkg}.modeling_{fake_pkg}"
+    mod = types.ModuleType(modname)
+    mod.l2norm = _transformers_style_l2norm
+    monkeypatch.setitem(sys.modules, modname, mod)
+    plain_pkg = "unsloth_test_no_l2norm"
+    plain_name = f"transformers.models.{plain_pkg}.modeling_{plain_pkg}"
+    plain = types.ModuleType(plain_name)
+    monkeypatch.setitem(sys.modules, plain_name, plain)
+
+    # unsloth's compiled copy of a model module carries its own l2norm and is what runs.
+    compiled_name = "unsloth_compiled_module_unsloth_test_gated_delta"
+    compiled = types.ModuleType(compiled_name)
+    compiled.l2norm = _transformers_style_l2norm
+    monkeypatch.setitem(sys.modules, compiled_name, compiled)
+
+    patched = fla_vendor._patch_l2norm_fp32_on_torch_path(packages = (fake_pkg, plain_pkg, "never_imported_pkg"))
+
+    assert modname in patched and compiled_name in patched
+    assert mod.l2norm is fla_vendor._fp32_l2norm
+    assert compiled.l2norm is fla_vendor._fp32_l2norm
+    assert not hasattr(plain, "l2norm")
+    # Idempotent: a second pass finds nothing left to do.
+    assert fla_vendor._patch_l2norm_fp32_on_torch_path(packages = (fake_pkg, plain_pkg)) == []
+    assert mod.l2norm is fla_vendor._fp32_l2norm
+
+
+def test_rdna1_later_kernel_hub_decorations_never_resolve_fla(monkeypatch):
+    # unsloth's compiler re-applies the decorator after the last patch phase; an installed fla
+    # bound there aborts the first forward on RDNA1 (FDOT2).
+    hub_kernels = pytest.importorskip("transformers.integrations.hub_kernels")
+    import types
+    import transformers.integrations as integrations
+    from unsloth_zoo.temporary_patches import fla_vendor
+
+    original = getattr(hub_kernels, "use_kernel_func_from_hub_with_fallback", None)
+    if original is None:
+        pytest.skip("transformers predates the kernel-hub fallback decorator")
+    monkeypatch.setattr(hub_kernels, "use_kernel_func_from_hub_with_fallback", original)
+    monkeypatch.setattr(integrations, "use_kernel_func_from_hub_with_fallback", original, raising = False)
+    fake = types.ModuleType("fla")
+    def kernel(*a, **k):
+        raise RuntimeError("fla kernel reached")
+    fake.chunk_gated_delta_rule = kernel
+    monkeypatch.setitem(sys.modules, "fla", fake)
+    monkeypatch.setattr(fla_vendor, "_gpu_lacks_dot_instructions", lambda torch_mod=None: True)
+
+    assert fla_vendor._block_fla_hub_decorator() is True
+    assert fla_vendor._block_fla_hub_decorator() is True
+    from transformers.integrations import use_kernel_func_from_hub_with_fallback as decorate
+
+    def torch_path(q):
+        return q + 1
+    bound = decorate("chunk_gated_delta_rule", "fla")(torch_path)
+    assert bound is torch_path and bound(1) == 2
+    assert hub_kernels.use_kernel_func_from_hub_with_fallback.__wrapped__ is original

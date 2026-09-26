@@ -30,6 +30,7 @@ import torch.nn as nn
 from .common import (
     TEMPORARY_PATCHES,
     UNSLOTH_ENABLE_LOGGING,
+    WRAPPER_INNER_ATTR,
     is_transformers_v5_moe_quantization_available,
     logger,
 )
@@ -99,8 +100,186 @@ def _is_expert_module(module: nn.Module) -> bool:
 
 
 # ============================================================================
+# Quantization of oversized expert stacks
+# ============================================================================
+
+# bitsandbytes counts elements with a signed 32-bit int inside the 4-bit
+# quantize kernel, so handing it a tensor of 2**31 elements or more does not
+# raise: csrc/ops.cu prints "Error invalid argument at line 74" and the process
+# dies. One stacked MoE expert parameter crosses that line easily.
+# thinkingmachines/Inkling-Small ships gate_up_proj as (256, 6144, 4096), about
+# 6.4e9 elements, three times over. Quantize such a stack in expert-major
+# slices and splice the results instead.
+_BNB_MAX_QUANTIZE_NUMEL = 2 ** 31
+
+# Module level so the read path below runs no import statement per call.
+from math import prod as _prod
+
+
+def _quantize_expert_stack_in_slices(value, blocksize, quant_type, quant_storage = torch.uint8, module = None):
+    """Params4bit for a stack too large for one bitsandbytes quantize call.
+
+    Each slice holds whole experts, and one expert is a whole number of blocks
+    for every MoE shape shipped so far, so the packed bytes and the absmax
+    blocks concatenate exactly and nothing is requantized. Returns None when
+    that does not hold, leaving the caller on the unsliced path.
+
+    `quant_storage` is honoured: FSDP needs a floating point parameter storage
+    dtype, and silently handing it back uint8 breaks the wrap it asked for. A
+    slice must still be a whole number of storage elements for the packed
+    pieces to concatenate, which is why it is checked rather than assumed.
+    """
+    from bitsandbytes.functional import QuantState
+
+    if value.ndim < 2:
+        return None
+    per_expert = value[0].numel()
+    if per_expert == 0 or per_expert % blocksize != 0:
+        return None
+    # One packed element covers 2 weights per byte of its storage dtype.
+    storage_itemsize = torch.empty(0, dtype = quant_storage).element_size()
+    weights_per_storage_element = 2 * storage_itemsize
+    if per_expert % weights_per_storage_element != 0:
+        return None
+    experts_per_slice = (_BNB_MAX_QUANTIZE_NUMEL - 1) // per_expert
+    if experts_per_slice < 1:
+        # A single expert already overflows, which slicing by expert cannot fix.
+        return None
+
+    packed, absmax, code, dtype = [], [], None, None
+    for start in range(0, value.shape[0], experts_per_slice):
+        data, qs = bnb.functional.quantize_4bit(
+            value[start : start + experts_per_slice].contiguous(),
+            blocksize = blocksize,
+            quant_type = quant_type,
+            quant_storage = quant_storage,
+            # Double quantization nests absmax per call, and the nested states
+            # of separate calls do not concatenate. Keep the slices flat; the
+            # absmax of one expert stack is small next to its weights.
+            compress_statistics = False,
+        )
+        packed.append(data.reshape(-1))
+        absmax.append(_quantstate_absmax_fp32(qs))
+        code, dtype = qs.code, qs.dtype
+
+    quant_state = QuantState(
+        absmax = torch.cat(absmax),
+        shape = value.shape,
+        code = code,
+        blocksize = blocksize,
+        quant_type = quant_type,
+        dtype = dtype,
+    )
+    new_param = torch.Tensor._make_subclass(Params4bit, torch.cat(packed).unsqueeze(-1))
+    new_param.requires_grad = False
+    new_param.quant_state = quant_state
+    new_param.blocksize = blocksize
+    new_param.compress_statistics = False
+    new_param.quant_type = quant_type
+    new_param.quant_storage = quant_storage
+    new_param.bnb_quantized = True
+    # Params4bit.__torch_function__ reads .module on torch.chunk/torch.split, so
+    # leaving it undefined makes a sliced stack raise AttributeError where an
+    # unsliced one shards fine. The prequantized path below sets it for the same
+    # reason; the constructor defaults it to None.
+    new_param.module = module
+    return new_param
+
+
+def _make_expert_params4bit(value, **kwargs):
+    """Params4bit on the value's own device, slicing the quantization when the
+    stack is too large for bitsandbytes to count in 32 bits."""
+    if value.numel() >= _BNB_MAX_QUANTIZE_NUMEL and value.is_cuda:
+        sliced = _quantize_expert_stack_in_slices(
+            value,
+            blocksize = kwargs.get("blocksize") or 64,
+            quant_type = kwargs.get("quant_type") or "nf4",
+            quant_storage = kwargs.get("quant_storage") or torch.uint8,
+            module = kwargs.get("module"),
+        )
+        if sliced is not None:
+            return sliced
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info(
+                f"Unsloth: expert stack of {value.numel()} elements cannot be "
+                "sliced for bitsandbytes; quantizing it in one call, which may "
+                "abort inside bitsandbytes."
+            )
+    return Params4bit(value, **kwargs).to(value.device)
+
+
+# ============================================================================
 # Dequantization
 # ============================================================================
+
+def _dequantize_4bit_in_slices(weight):
+    """Dequantize an expert stack whose element count overflows bitsandbytes'
+    32-bit counter, in expert-major slices. Returns None when the stack is
+    small enough for one call, or when it cannot be split on a block boundary,
+    so the caller keeps the ordinary path.
+
+    The quantize kernel is not the only one that counts in 32 bits: dequantize
+    aborts the same way, at csrc/ops.cu line 93, and it runs on every forward
+    rather than once at load.
+    """
+    # Nothing above the size check runs an import or touches the data: this
+    # function is called on EVERY forward read of a 4-bit expert stack, and
+    # almost every such stack is under the cap, so the declining path is the
+    # hot one. torch.Size.numel() rather than math.prod over a tuple, and the
+    # QuantState import deferred past the return, keep it to a few attribute
+    # reads.
+    quant_state = weight.quant_state
+    shape = getattr(weight, "_original_shape", None) or quant_state.shape
+    numel = shape.numel() if isinstance(shape, torch.Size) else _prod(shape)
+    if numel < _BNB_MAX_QUANTIZE_NUMEL or len(shape) < 2:
+        return None
+
+    from bitsandbytes.functional import QuantState
+
+    shape = tuple(shape)
+    blocksize = quant_state.blocksize
+    per_expert = _prod(shape[1:])
+    if per_expert == 0 or per_expert % blocksize != 0:
+        return None
+    # The packed tensor is not necessarily uint8: bnb_4bit_quant_storage may be
+    # float16/bfloat16/float32, and a prequantized checkpoint keeps whatever it
+    # was saved with. Slice in ELEMENTS of that dtype, not in bytes, or every
+    # slice after the first starts two or four times too far in and the read
+    # runs off the end of the tensor.
+    flat = weight.data.reshape(-1)
+    weights_per_element = 2 * flat.element_size()
+    if per_expert % weights_per_element != 0:
+        return None
+    experts_per_slice = (_BNB_MAX_QUANTIZE_NUMEL - 1) // per_expert
+    if experts_per_slice < 1:
+        return None
+
+    absmax = _quantstate_absmax_fp32(quant_state)
+    blocks_per_expert = per_expert // blocksize
+    elements_per_expert = per_expert // weights_per_element
+
+    # Written into a preallocated output rather than collected and concatenated:
+    # keeping every slice alive and then calling torch.cat costs two full dense
+    # stacks at once, about 24 GiB rather than 12 GiB for Inkling-Small's
+    # (256, 6144, 4096) bfloat16 projection, and the recompute path pays that
+    # peak on every forward and backward. Only one slice is extra now.
+    out = torch.empty(shape, dtype = quant_state.dtype, device = weight.data.device)
+    for start in range(0, shape[0], experts_per_slice):
+        stop = min(start + experts_per_slice, shape[0])
+        sub_state = QuantState(
+            absmax = absmax[start * blocks_per_expert : stop * blocks_per_expert],
+            shape = torch.Size((stop - start,) + shape[1:]),
+            code = quant_state.code,
+            blocksize = blocksize,
+            quant_type = quant_state.quant_type,
+            dtype = quant_state.dtype,
+        )
+        out[start : stop] = bnb.functional.dequantize_4bit(
+            flat[start * elements_per_expert : stop * elements_per_expert].unsqueeze(-1),
+            sub_state,
+        ).reshape((stop - start,) + shape[1:])
+    return out
+
 
 def _dequantize_bnb4bit_expert_weights(weight, target_dtype: torch.dtype):
     """Dequantize a packed Params4bit MoE expert to its logical 3D shape at
@@ -108,7 +287,18 @@ def _dequantize_bnb4bit_expert_weights(weight, target_dtype: torch.dtype):
     """
     if not _is_bnb4bit_param(weight):
         return None
-    dequant = bnb.functional.dequantize_4bit(weight.data, weight.quant_state)
+    dequant = None
+    try:
+        from unsloth_zoo.temporary_patches.moe_triton_kernels import nf4_dequant_triton
+        dequant = nf4_dequant_triton(
+            weight.data, weight.quant_state, getattr(weight, "_original_shape", None),
+        )
+    except ImportError:
+        pass
+    if dequant is None:
+        dequant = _dequantize_4bit_in_slices(weight)
+    if dequant is None:
+        dequant = bnb.functional.dequantize_4bit(weight.data, weight.quant_state)
     original_shape = getattr(weight, "_original_shape", None)
     if original_shape is not None and tuple(dequant.shape) != tuple(original_shape):
         dequant = dequant.reshape(original_shape)
@@ -144,27 +334,19 @@ def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
         forward_triton_grouped_gemm,
         forward_native_moe_loop,
         swap_moe_weights_for_call,
-        _moe_recompute_default,
+        _moe_recompute_enabled,
     )
 
     target_dtype = hidden_states.dtype
     if not target_dtype.is_floating_point:
         target_dtype = torch.bfloat16
 
-    # Defer dequant into forward_native_grouped_mm's providers instead of
-    # pre-dequantizing the full bf16 stack up front. The 4-bit base prefers recompute
-    # by default (prefer_memory=True) so that, even inside a gradient-checkpoint
-    # recompute pass, we never materialize and pin the full bf16 expert dequant the
-    # 4-bit storage exists to avoid; UNSLOTH_MOE_RECOMPUTE=0 still forces the pin for
-    # memory-rich runs. This keeps the packed Params4bit and rebuilds the dense stack
-    # on demand; the pre-dequantize path below is only taken when the policy says pin,
-    # so we never pre-dequantize into a dense stack and then re-hold it for a backward
-    # recompute. Matches the per-source decision in forward_native_grouped_mm.
+    # Same recompute-vs-pin policy as forward_native_grouped_mm; recompute keeps the packed Params4bit.
     if (
         select_moe_backend() == "grouped_mm"
         and _is_bnb4bit_param(self.gate_up_proj)
         and _is_bnb4bit_param(self.down_proj)
-        and _moe_recompute_default(prefer_memory = True)
+        and _moe_recompute_enabled(self.gate_up_proj, dtype=target_dtype)
     ):
         _log_moe_bnb4bit_backend_once(self, "Unsloth: MoE bnb4bit grouped_mm with backward-recompute.")
         return forward_native_grouped_mm(self, hidden_states.to(target_dtype), top_k_index, top_k_weights)
@@ -199,6 +381,96 @@ def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
 # ============================================================================
 # transformers integration patches
 # ============================================================================
+
+# Unpatched families (tencent/Hy3) keep transformers' generic experts forward, which matmuls packed uint8.
+_GENERIC_EXPERTS_FORWARD_FILE = ("transformers", "integrations", "moe.py")
+
+# Module global, passed as an argument below: _forward_statically_reads_stash only follows global names the forward calls.
+from .moe_utils import get_forward_moe_backend
+
+
+def _is_generic_transformers_experts_forward(forward) -> bool:
+    code = getattr(forward, "__code__", None)
+    if code is None:
+        return False
+    parts = code.co_filename.replace("\\", "/").split("/")
+    return tuple(parts[-3:]) == _GENERIC_EXPERTS_FORWARD_FILE
+
+
+def _experts_have_own_apply_gate(module: nn.Module) -> bool:
+    apply_gate = getattr(type(module), "_apply_gate", None)
+    return apply_gate is not None and getattr(apply_gate, "__name__", "") != "_default_apply_gate"
+
+
+def _experts_layout_is_standard(module: nn.Module) -> bool:
+    """Concatenated [gate; up] gate_up_proj (E, 2*I, H), down_proj (E, H, I), no biases."""
+    # Newer flags are absent on transformers 5.0, whose only layout was the standard one.
+    if not getattr(module, "has_gate", True):
+        return False
+    if getattr(module, "has_bias", False) or getattr(module, "is_transposed", False):
+        return False
+    if not getattr(module, "is_concatenated", True):
+        return False
+    if not _experts_have_own_apply_gate(module) and not callable(getattr(module, "act_fn", None)):
+        return False
+    gate_up_shape = tuple(getattr(module.gate_up_proj, "_original_shape", None) or module.gate_up_proj.shape)
+    down_shape = tuple(getattr(module.down_proj, "_original_shape", None) or module.down_proj.shape)
+    if len(gate_up_shape) != 3 or len(down_shape) != 3:
+        return False
+    num_experts, two_intermediate, hidden = gate_up_shape
+    return (
+        down_shape == (num_experts, hidden, two_intermediate // 2)
+        and two_intermediate % 2 == 0
+    )
+
+
+def _forward_generic_experts_eagerly(resolve_backend, self, hidden_states, top_k_index, top_k_weights):
+    """Traced by Dynamo, the backend recomputes a different graph under checkpointing (CheckpointError)."""
+    return resolve_backend()(self, hidden_states, top_k_index, top_k_weights)
+
+
+if hasattr(torch, "compiler") and hasattr(torch.compiler, "disable"):
+    _forward_generic_experts_eagerly = torch.compiler.disable(_forward_generic_experts_eagerly)
+
+
+def _drop_expert_parallel_sentinel(module, top_k_index, top_k_weights):
+    """RouterParallel marks non-local routes with index num_experts; send them to expert 0 at zero weight."""
+    num_experts = getattr(module, "num_experts", None)
+    if num_experts is None:
+        num_experts = module.gate_up_proj.shape[0]
+    sentinel = top_k_index >= num_experts
+    return top_k_index.masked_fill(sentinel, 0), top_k_weights.masked_fill(sentinel, 0)
+
+
+def _route_generic_bnb4bit_experts_class(module: nn.Module) -> bool:
+    """Route bnb 4-bit instances of a generic-forward experts class; 16-bit ones keep the original."""
+    klass = type(module)
+    if getattr(klass, "_unsloth_bnb4bit_routed", False):
+        return True
+    original_forward = klass.__dict__.get("forward", None)
+    if not _is_generic_transformers_experts_forward(original_forward):
+        return False
+    if not _experts_layout_is_standard(module):
+        return False
+
+    def forward(self, hidden_states, top_k_index, top_k_weights, *args, **kwargs):
+        if not args and not kwargs and _moe_uses_bnb4bit_expert_weights(self):
+            top_k_index, top_k_weights = _drop_expert_parallel_sentinel(self, top_k_index, top_k_weights)
+            return _forward_generic_experts_eagerly(
+                get_forward_moe_backend, self, hidden_states, top_k_index, top_k_weights
+            )
+        return original_forward(self, hidden_states, top_k_index, top_k_weights, *args, **kwargs)
+
+    forward.__wrapped__ = original_forward
+    forward.__doc__ = original_forward.__doc__
+    # Set only on classes routed here, so every patched family computes as before.
+    klass._unsloth_own_apply_gate = _experts_have_own_apply_gate(module)
+    klass.forward = forward
+    klass._unsloth_bnb4bit_routed = True
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.info(f"Unsloth: routing bnb 4-bit {klass.__name__} through the Unsloth MoE backend.")
+    return True
+
 
 def replace_expert_params_with_bnb_params(
     model: nn.Module,
@@ -247,6 +519,7 @@ def replace_expert_params_with_bnb_params(
         module.gate_up_proj = placeholder_gate_up
         module.down_proj = placeholder_down
         has_been_replaced = True
+        _route_generic_bnb4bit_experts_class(module)
 
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(f"Unsloth: Prepared {module_name}'s gate_up_proj & down_proj for BNB 4-bit quantization (shapes: {gate_up_proj.shape}, {down_proj.shape})")
@@ -297,7 +570,7 @@ def patch_bnb4bit_quantize_convert():
             if _is_expert_module(module):
                 old_value = model.get_parameter_or_buffer(full_layer_name)
                 old_dict = {k: v for k, v in old_value.__dict__.items()}
-                new_value = Params4bit(value, requires_grad=False, **old_dict).to(value.device)
+                new_value = _make_expert_params4bit(value, requires_grad=False, **old_dict)
                 # _original_shape is needed by PEFT LoRA to recover the logical 3D shape.
                 new_value._original_shape = value.shape
                 module._is_hf_initialized = True
@@ -543,7 +816,20 @@ def patch_peft_param_wrapper_merge_4bit():
         device = reference.device
         if device.type == "meta":
             device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
-        new_param = Params4bit(new_data.detach().to("cpu").contiguous(), **kwargs).to(device)
+        if device.type == "cuda" and new_data.numel() >= _BNB_MAX_QUANTIZE_NUMEL:
+            # merge_and_unload() re-quantizes the very stack that had to be
+            # sliced to be quantized at all, so the same 32-bit element count
+            # aborts here. Route it through the sliced path too; below the
+            # threshold the original single call is unchanged.
+            new_param = _make_expert_params4bit(
+                new_data.detach().to(device).contiguous(),
+                requires_grad = False,
+                blocksize = kwargs["blocksize"],
+                quant_type = kwargs["quant_type"],
+                quant_storage = kwargs["quant_storage"],
+            )
+        else:
+            new_param = Params4bit(new_data.detach().to("cpu").contiguous(), **kwargs).to(device)
         new_param._original_shape = torch.Size(original_shape)
         return new_param
 
@@ -840,12 +1126,27 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
                     ], dim=0)
                     for e in range(num_experts)
                 ])
-                data, quant_state = bnb.functional.quantize_4bit(
-                    full.to(device, first_qs.dtype).contiguous(),
-                    blocksize=blocksize,
-                    quant_type=first_qs.quant_type,
-                    compress_statistics=False,
-                )
+                full = full.to(device, first_qs.dtype).contiguous()
+                # Repacking means one quantize call over the WHOLE stack, so this
+                # branch reaches the same 32-bit element count that the load path
+                # has to slice around. Reached by an old per-expert checkpoint
+                # whose segments end mid-block; nothing else about it is
+                # oversized-specific, so it would abort inside bitsandbytes on a
+                # stack the ordinary path handles. Slice it the same way.
+                sliced = None
+                if full.numel() >= _BNB_MAX_QUANTIZE_NUMEL:
+                    sliced = _quantize_expert_stack_in_slices(
+                        full, blocksize=blocksize, quant_type=first_qs.quant_type,
+                    )
+                if sliced is not None:
+                    data, quant_state = sliced.data, sliced.quant_state
+                else:
+                    data, quant_state = bnb.functional.quantize_4bit(
+                        full,
+                        blocksize=blocksize,
+                        quant_type=first_qs.quant_type,
+                        compress_statistics=False,
+                    )
                 quant_state.shape = torch.Size((num_experts, out_dim, in_dim))
             else:
                 packed_rows, absmax_rows = [], []
@@ -1030,6 +1331,14 @@ def patch_bnb4bit_model_conversion_mapping():
         return conversions
 
     patched_get_model_conversion_mapping._unsloth_moe_patched = True
+    # Publish the link to what we wrapped, so a later reader can walk past this wrapper. Without
+    # it this closure is an opaque lid: `conversion_mapping_rescope.py` installs underneath us on
+    # the same function, and its "am I already installed" probe and the one in `bitsandbytes.py`
+    # both walk the chain, find no link here, and conclude the repair is absent. Measured on
+    # transformers 5.5.4 before this line existed: pass 1 left the repair invisible, so the
+    # Linear4bit error still blamed the transformers version for a load the repair had fixed,
+    # and pass 2 stacked a second rescope wrapper on top.
+    setattr(patched_get_model_conversion_mapping, WRAPPER_INNER_ATTR, original)
     conversion_mapping.get_model_conversion_mapping = patched_get_model_conversion_mapping
     if getattr(modeling_utils, "get_model_conversion_mapping", None) is original:
         modeling_utils.get_model_conversion_mapping = patched_get_model_conversion_mapping

@@ -21,6 +21,7 @@ No GPU deps: uses mlx-lm (text) and mlx-vlm (VLM) instead of unsloth.models
 """
 
 import ast
+import copy
 import gc
 import hashlib
 import json
@@ -3036,6 +3037,20 @@ class _NativeVLMWeightSanitizer:
                 for key in tuple(native) if key.endswith(".weight")
                 for suffix in ("scales", "biases")
             })
+            import mlx.core as mx
+
+            # Snapshot 1-D values: sanitizers shift them with in-place `+=`.
+            # Restore, never subtract: (w + 1) - 1 != w in bf16.
+            # The export's offset probe must see the shift, or it measures none.
+            converted = (
+                bool(weights) and all(key in native for key in weights)
+                and not getattr(model, "_unsloth_measuring_norm_offsets", False)
+            )
+            source = dict(weights) if converted else None
+            before = {
+                key: mx.array(value)
+                for key, value in weights.items() if value.ndim == 1
+            } if converted else None
             sources = {}
             for key, value in weights.items():
                 if key in native:
@@ -3048,9 +3063,40 @@ class _NativeVLMWeightSanitizer:
                     original = candidates[0]
                     if original not in sanitized:
                         sanitized[original] = sanitized.pop(key)
+            if converted:
+                _restore_reapplied_offsets(
+                    source, before, sanitized,
+                    lambda probe: self.original.__get__(copy.copy(model), owner)(probe),
+                )
             return sanitized
 
         return preserving_native_names
+
+
+def _restore_reapplied_offsets(source, before, sanitized, replay):
+    """All-native keys and no moved N-D tensor = already converted, so a measured
+    1-D shift (mlx-vlm 0.6.4 Qwen3.5 RMSNorm +1) is being applied twice."""
+    import mlx.core as mx
+    from .utils import _mlx_measure_norm_offsets
+
+    for key, value in source.items():
+        if value.ndim != 1 and key in sanitized and sanitized[key] is not value:
+            return
+    try:
+        offsets = _mlx_measure_norm_offsets(
+            replay, {key: mx.array(value) for key, value in source.items()}
+        )
+    except Exception as exc:
+        print(f"Unsloth: Could not measure MLX norm offsets ({exc}); continuing.")
+        return
+    restored = [key for key in offsets if key in before]
+    for key in restored:
+        sanitized[key] = before[key]
+    if restored:
+        print(
+            f"Unsloth: mlx-vlm re-shifted {len(restored)} weight(s) of an "
+            "already-converted checkpoint; keeping the checkpoint's values."
+        )
 
 
 def _ensure_native_vlm_weight_names(model_type: str) -> None:
@@ -4546,6 +4592,7 @@ def _unfreeze_saved_mlx_non_adapter_parameters(model, adapter_weights_file):
             module.unfreeze(keys=[key], recurse=False, strict=False)
             restored.add(path)
             break
+    model._unsloth_reloaded_parameter_keys = restored
     _rebuild_cpt_full_module_weight_keys(model, restored)
 
 
@@ -5212,6 +5259,8 @@ def _dequantize_selected_mlx_modules(model, predicate):
     for path, module in model.named_modules():
         if not predicate(path, module):
             continue
+        if isinstance(module, (nn.QuantizedLinear, nn.QuantizedEmbedding)):
+            _materialize_weights(module)
         if isinstance(module, nn.QuantizedLinear):
             weight = mx.dequantize(
                 module.weight,
@@ -5351,6 +5400,7 @@ def _apply_dense_nf4_quantization(model, config, spec: _MLXQuantizationSpec, pre
         weight = getattr(module, "weight", None)
         if weight is None or len(getattr(weight, "shape", ())) != 2:
             continue
+        _materialize_weights(module)
         module.weight = _nf4_dense_dequantize_weight(weight, spec.group_size or 64)
         quantized[path] = {
             "bits": 4,
@@ -5517,6 +5567,8 @@ def _apply_mlx_quantization(model, config, spec: _MLXQuantizationSpec, *, is_vlm
         model._unsloth_quantized_source = "none"
         return model, config
 
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
     from mlx_lm.utils import quantize_model
 
     predicate = _compose_mlx_quant_predicate(
@@ -5548,6 +5600,7 @@ def _apply_mlx_quantization(model, config, spec: _MLXQuantizationSpec, *, is_vlm
         config.setdefault("quantization", {})
     if spec.mode == "nf4_dense":
         return _apply_dense_nf4_quantization(model, config, spec, predicate)
+    sources = dict(tree_flatten(model.leaf_modules(), is_leaf=lambda node: isinstance(node, nn.Module)))
     model, updated_config = quantize_model(
         model,
         config,
@@ -5556,6 +5609,7 @@ def _apply_mlx_quantization(model, config, spec: _MLXQuantizationSpec, *, is_vlm
         mode=spec.mode or "affine",
         quant_predicate=predicate,
     )
+    _evaluate_quantized_modules(model, sources)
     model._config = updated_config
     model._unsloth_quantization_config = updated_config.get(
         "quantization_config", updated_config.get("quantization")
@@ -7896,9 +7950,41 @@ def _coerce_list_extra_special_tokens():
     PreTrainedTokenizerBase.__init__ = patched_init
 
 
+_LAZY_WEIGHTS_ENV = "UNSLOTH_MLX_LAZY_WEIGHTS"
+
+
+def _materialize_weights(model):
+    """Left mapped, the first GPU kernel to touch a weight can stall long enough for
+    Apple's watchdog to kill the process's queue."""
+    if os.environ.get(_LAZY_WEIGHTS_ENV, "").strip().lower() in ("1", "true", "yes", "on"):
+        return
+    import mlx.core as mx
+
+    try:
+        mx.eval(model.parameters())
+    except Exception as error:
+        # Not fatal: the weights stay lazy, as before.
+        print(f"Unsloth: Could not read {type(model).__name__} weights at load time: {error}")
+
+
+def _evaluate_quantized_modules(model, sources):
+    """Evaluate a lazily quantized model module by module, each one's source weights read
+    first: a read still pending when its kernel runs keeps a GPU command buffer waiting on
+    the disk. One module at a time also keeps a single module's unquantized weights live."""
+    import mlx.core as mx
+
+    quantized = dict(model.named_modules())
+    for path in list(sources):
+        _materialize_weights(sources.pop(path))
+        target = quantized.get(path)
+        if target is not None:
+            mx.eval(target.parameters())
+
+
 def _finish_load(model, tokenizer):
     """The single exit from a load, so the patch installs after the runtimes the load imports."""
     install_quantized_attention()
+    _materialize_weights(model)
     return model, tokenizer
 
 
