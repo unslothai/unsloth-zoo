@@ -283,6 +283,122 @@ def swiglu_torch_backward(pre_act, alpha, limit, g1):
     return g1 * grad.to(g1.dtype)
 pass
 
+# E2M1 code points, indexed by the 4-bit nibble (sign bit is the high bit of the nibble).
+_MXFP4_E2M1_VALUES = (
+    +0.0, +0.5, +1.0, +1.5, +2.0, +3.0, +4.0, +6.0,
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+)
+
+
+def _mxfp4_dequantize_experts_torch(blocks, scales, dtype = torch.bfloat16):
+    """Reference MXFP4 decode straight to the GPT-OSS (E, in, out) layout.
+
+    blocks: (E, out, in // 32, 16) uint8, two E2M1 values per byte, low nibble first.
+    scales: (E, out, in // 32) uint8 E8M0 exponents with bias 127, one per 32 values.
+    One expert at a time, so the temporaries stay a single expert's size."""
+    if blocks.dim() != 4 or blocks.shape[-1] != 16 or tuple(blocks.shape[:-1]) != tuple(scales.shape):
+        raise ValueError(
+            f"Unsloth: MXFP4 blocks {tuple(blocks.shape)} do not match scales {tuple(scales.shape)}"
+        )
+    E, R, G, B = blocks.shape
+    out = torch.empty((E, G * B * 2, R), dtype = dtype, device = blocks.device)
+    lut = torch.tensor(_MXFP4_E2M1_VALUES, dtype = torch.float32, device = blocks.device)
+    # torch.ldexp on CUDA launches on the current device, not the operand's.
+    guard = torch.cuda.device(blocks.device) if blocks.is_cuda else contextlib.nullcontext()
+    with guard:
+        for e in range(E):
+            blk = blocks[e]
+            vals = torch.empty((R, G, B * 2), dtype = torch.float32, device = blocks.device)
+            vals[..., 0::2] = lut[(blk & 0x0F).long()]
+            vals[..., 1::2] = lut[(blk >> 4).long()]
+            vals = torch.ldexp(vals, (scales[e].to(torch.int32) - 127).unsqueeze(-1))
+            out[e].copy_(vals.reshape(R, G * B * 2).t())
+            del vals, blk
+    return out
+
+
+_CONVERT_TRANSPOSES = {}
+
+
+def _convert_moe_packed_tensors_transposes(convert):
+    """Whether ``convert`` returns GPT-OSS's (E, in, out) layout or the un-transposed (E, out, in).
+
+    Stock transformers >= 4.56 transposes inside convert_moe_packed_tensors; Unsloth's own
+    replacement (temporary_patches/mxfp4.py) does not, and which one is installed depends on
+    whether that patch ran. gpt-oss's down_proj is square, so the output shape of the real
+    tensor cannot tell them apart: decode a tiny non-square stack once and look."""
+    key = id(convert)
+    if key not in _CONVERT_TRANSPOSES:
+        probe = convert(
+            torch.zeros((1, 2, 1, 16), dtype = torch.uint8),
+            torch.full((1, 2, 1), 127, dtype = torch.uint8),
+        )
+        shape = tuple(probe.shape)
+        if shape == (1, 32, 2):
+            _CONVERT_TRANSPOSES[key] = True
+        elif shape == (1, 2, 32):
+            _CONVERT_TRANSPOSES[key] = False
+        else:
+            raise RuntimeError(f"Unsloth: convert_moe_packed_tensors returned an unexpected shape {shape}")
+    return _CONVERT_TRANSPOSES[key]
+
+
+def _dequantize_mxfp4_experts(blocks, scales, dtype = torch.bfloat16):
+    """Dense GPT-OSS expert stack (E, in, out) from MXFP4 ``blocks`` / ``scales``, on any
+    transformers version. This is the layout Mxfp4GptOssExperts hands to matmul_ogs.
+
+    0. unsloth_zoo.mxfp4_dequant.mxfp4_dequantize on CUDA.
+    1. transformers.integrations.mxfp4.dequantize, only where it takes (blocks, scales).
+       Every release so far ships it as a loader hook (module, param_name, param_value, ...)
+       and 5.16.0 removed it, so this is kept only for a future (blocks, scales) helper.
+    2. transformers.integrations.mxfp4.convert_moe_packed_tensors (4.55 to 5.x), whichever
+       orientation the installed version returns.
+    3. A local E2M1 + E8M0 decode."""
+    try:
+        import transformers.integrations.mxfp4 as mxfp4_integration
+    except Exception:
+        mxfp4_integration = None
+    expected = (blocks.shape[0], blocks.shape[2] * blocks.shape[3] * 2, blocks.shape[1])
+
+    if blocks.is_cuda and blocks.dtype == torch.uint8:
+        # Fused decode (unsloth_zoo/mxfp4_dequant.py): self-checked against the torch
+        # reference per device, and falls back to it on any mismatch.
+        try:
+            from unsloth_zoo.mxfp4_dequant import mxfp4_dequantize
+            return mxfp4_dequantize(blocks, scales, dtype = dtype, transpose = True)
+        except Exception:
+            pass
+
+    dequantize = getattr(mxfp4_integration, "dequantize", None)
+    if dequantize is not None:
+        try:
+            parameters = inspect.signature(dequantize).parameters
+            takes_blocks_scales = tuple(parameters)[:2] == ("blocks", "scales")
+        except (TypeError, ValueError):
+            takes_blocks_scales = False
+        if takes_blocks_scales:
+            try:
+                out = dequantize(blocks, scales)
+                if tuple(out.shape) == expected:
+                    return out.to(dtype).contiguous()
+            except Exception:
+                pass
+
+    convert = getattr(mxfp4_integration, "convert_moe_packed_tensors", None)
+    if convert is not None:
+        try:
+            transposes = _convert_moe_packed_tensors_transposes(convert)
+            out = convert(blocks, scales, dtype = dtype)
+            if not transposes:
+                out = out.transpose(1, 2)
+            if tuple(out.shape) == expected:
+                return out.to(device = blocks.device, dtype = dtype).contiguous()
+        except Exception as e:
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.warning(f"Unsloth: convert_moe_packed_tensors failed ({e}); using the local MXFP4 decode.")
+
+    return _mxfp4_dequantize_experts_torch(blocks, scales, dtype = dtype)
+
 def _mxfp4_hub_kernel_unreachable():
     """True when transformers loads MXFP4 kernels via the `kernels` hub and it is unusable."""
     try:
@@ -523,11 +639,12 @@ def patch_gpt_oss():
                 return self.__dict__["_gate_up_proj"]
 
             # MXFP4 weights present when blocks/scales are not all zeros
-            blocks_valid = (
+            blocks_valid = self.__dict__.get("_gate_up_proj_blocks_valid", False) or (
                 self.gate_up_proj_blocks.device.type != "meta"
                 and self.gate_up_proj_blocks.numel() > 0
-                and self.gate_up_proj_blocks.any()
+                and bool(self.gate_up_proj_blocks.any())
             )
+            self.__dict__["_gate_up_proj_blocks_valid"] = blocks_valid
 
             if not blocks_valid:
                 raise AttributeError(
@@ -535,17 +652,13 @@ def patch_gpt_oss():
                     f"Try 'openai/gpt-oss-20b' with load_in_4bit=True instead."
                 )
 
-            # Dequantize: (E, out_dim, in_dim//32, 16) -> (E, out_dim, in_dim), then cache
+            # Blocks that stayed packed at load (transformers 5 never calls load_and_swizzle_mxfp4,
+            # the only place that turns them into a Triton tensor). Decode to the (E, in, out)
+            # stack matmul_ogs takes, per call and uncached, so the experts stay MXFP4 in memory.
             try:
-                from transformers.integrations.mxfp4 import dequantize
-                dequantized = dequantize(self.gate_up_proj_blocks, self.gate_up_proj_scales)
-                self.__dict__["_gate_up_proj"] = dequantized
-                return dequantized
+                return _dequantize_mxfp4_experts(self.gate_up_proj_blocks, self.gate_up_proj_scales)
             except Exception as e:
-                raise RuntimeError(
-                    f"Failed to dequantize MXFP4 gate_up_proj: {e}. "
-                    f"Ensure transformers.integrations.mxfp4.dequantize is available."
-                )
+                raise RuntimeError(f"Failed to dequantize MXFP4 gate_up_proj: {e}") from e
 
         @gate_up_proj.setter
         def gate_up_proj(self, value):
@@ -558,27 +671,25 @@ def patch_gpt_oss():
             if "_down_proj" in self.__dict__:
                 return self.__dict__["_down_proj"]
 
-            blocks_valid = (
+            blocks_valid = self.__dict__.get("_down_proj_blocks_valid", False) or (
                 self.down_proj_blocks.device.type != "meta"
                 and self.down_proj_blocks.numel() > 0
-                and self.down_proj_blocks.any()
+                and bool(self.down_proj_blocks.any())
             )
+            self.__dict__["_down_proj_blocks_valid"] = blocks_valid
 
             if not blocks_valid:
                 raise AttributeError(
                     f"Mxfp4GptOssExperts.down_proj: No weights loaded."
                 )
 
-            # Dequantize: (E, out_dim, in_dim//32, 16) -> (E, out_dim, in_dim), then cache
+            # Blocks that stayed packed at load (transformers 5 never calls load_and_swizzle_mxfp4,
+            # the only place that turns them into a Triton tensor). Decode to the (E, in, out)
+            # stack matmul_ogs takes, per call and uncached, so the experts stay MXFP4 in memory.
             try:
-                from transformers.integrations.mxfp4 import dequantize
-                dequantized = dequantize(self.down_proj_blocks, self.down_proj_scales)
-                self.__dict__["_down_proj"] = dequantized
-                return dequantized
+                return _dequantize_mxfp4_experts(self.down_proj_blocks, self.down_proj_scales)
             except Exception as e:
-                raise RuntimeError(
-                    f"Failed to dequantize MXFP4 down_proj: {e}"
-                )
+                raise RuntimeError(f"Failed to dequantize MXFP4 down_proj: {e}") from e
 
         @down_proj.setter
         def down_proj(self, value):

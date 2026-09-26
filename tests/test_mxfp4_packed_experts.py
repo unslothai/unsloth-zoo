@@ -6,6 +6,7 @@
 
 import copy
 import os
+import pickle
 import subprocess
 import sys
 import textwrap
@@ -65,6 +66,40 @@ def test_torch_reference_matches_transformers():
     assert torch.equal(_bits(mxfp4_dequantize_torch(blocks, scales, transpose = True)), _bits(convert(blocks, scales)))
     assert torch.equal(_bits(mxfp4_dequantize_torch(blocks, scales, transpose = True)), _bits(_reference(blocks, scales)))
 
+
+
+@pytest.mark.parametrize("transpose", [False, True])
+@pytest.mark.parametrize("chunk_bytes", [1, 5 * 64 * 16 * 8, 1 << 30])
+def test_torch_fallback_chunks_are_bit_identical(monkeypatch, transpose, chunk_bytes):
+    # Chunks of 1 row, of a row count that does not divide N (so a transposed chunk is cut at an
+    # expert edge), and of the whole stack all write the unchunked result, into a fresh or given buffer.
+    monkeypatch.setattr(mxd, "_TORCH_CHUNK_BYTES", chunk_bytes)
+    blocks, scales = _random_mxfp4(3, 7, 64, low = 0, high = 255)
+    want = _reference(blocks, scales)
+    if not transpose:
+        want = want.transpose(-2, -1).contiguous()
+    assert torch.equal(_bits(mxfp4_dequantize_torch(blocks, scales, transpose = transpose)), _bits(want))
+    out = torch.full_like(want, float("nan"))
+    assert mxfp4_dequantize_torch(blocks, scales, transpose = transpose, out = out) is out
+    assert torch.equal(_bits(out), _bits(want))
+    # A non-contiguous buffer and a 2-D (rows, G, 16) input.
+    strided = torch.empty(want.shape[:-1] + (want.shape[-1] * 2,), dtype = want.dtype)[..., ::2]
+    mxfp4_dequantize_torch(blocks, scales, transpose = transpose, out = strided)
+    assert torch.equal(_bits(strided), _bits(want))
+    two_d = mxfp4_dequantize_torch(blocks[0], scales[0], transpose = transpose)
+    assert torch.equal(_bits(two_d), _bits(want[0]))
+
+
+@needs_cuda
+def test_torch_fallback_never_materialises_a_whole_stack_of_indices():
+    # One 64 MB packed stack: unchunked, its int64 indices alone are 512 MB.
+    blocks, scales = _random_mxfp4(8, 1024, 8192, device = "cuda")
+    out = torch.empty(8, 8192, 1024, dtype = torch.bfloat16, device = "cuda")
+    torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    mxfp4_dequantize_torch(blocks, scales, transpose = True, out = out)
+    torch.cuda.synchronize()
+    assert torch.cuda.max_memory_allocated() - base < 4 * mxd._TORCH_CHUNK_BYTES
 
 @needs_cuda
 @needs_triton
@@ -472,6 +507,34 @@ def test_full_save_writes_dequantized_experts(tmp_path, explicit_state_dict):
     assert experts.gate_up_proj is packed[0] and experts.down_proj is packed[1]
 
 
+@pytest.mark.skipif(not TRANSFORMERS_5, reason = "weight conversions are transformers 5")
+def test_full_save_of_a_loaded_model_writes_experts_under_their_own_names(tmp_path):
+    """from_pretrained records the Mxfp4Dequantize converters, and save_pretrained reverses them:
+    transformers 5.4 raised NotImplementedError, 5.17 wrote the stacks under "gate_up_proj$"."""
+    safetensors = pytest.importorskip("safetensors.torch")
+    from transformers.core_model_loading import WeightConverter
+    from transformers.integrations.mxfp4 import Mxfp4Dequantize
+    mx.patch_save_pretrained_mxfp4()
+    model, experts = _tiny_gpt_oss("cpu")
+    conversions = [
+        WeightConverter(
+            source_patterns = [f"{proj}_blocks", f"{proj}_scales"], target_patterns = rf"{proj}$",
+            operations = [Mxfp4Dequantize(None)],
+        )
+        for proj in ("down_proj", "gate_up_proj")
+    ]
+    model._weight_conversions = conversions   # as a load of a pre-quantized checkpoint leaves it
+    packed = experts.gate_up_proj, experts.down_proj
+    model.save_pretrained(tmp_path)
+    saved = safetensors.load_file(os.path.join(tmp_path, "model.safetensors"))
+    assert not any(key.endswith("$") for key in saved)
+    for name, param in zip(("gate_up_proj", "down_proj"), packed):
+        assert torch.equal(saved[f"model.layers.0.mlp.experts.{name}"], param.dequantize())
+    assert "quantization_config" not in open(os.path.join(tmp_path, "config.json")).read()
+    assert model._weight_conversions is conversions
+    assert experts.gate_up_proj is packed[0] and experts.down_proj is packed[1]
+
+
 def test_adapter_save_never_dequantizes(tmp_path, monkeypatch):
     peft = pytest.importorskip("peft")
     mx.patch_peft_param_wrapper_mxfp4()
@@ -657,3 +720,34 @@ def test_a_later_load_without_a_device_map_clears_the_offload_flag(monkeypatch):
     monkeypatch.setattr(mx, "_LOAD_OFFLOADS", [True])
     Mxfp4HfQuantizer.validate_environment(object.__new__(Mxfp4HfQuantizer), device_map = None)
     assert mx._LOAD_OFFLOADS[0] is False
+
+
+def test_load_state_dict_carries_the_scales():
+    """state_dict() holds each packed stack as an Mxfp4ExpertParam; loading it must take the
+    scales with the blocks, and bare uint8 blocks (a safetensors round trip) must be refused."""
+    a, b = nn.Module(), nn.Module()
+    a.w, b.w = _packed(4, 64, 64, seed = 1), _packed(4, 64, 64, seed = 2)
+    assert not torch.equal(a.w.mxfp4_scales, b.w.mxfp4_scales)
+    target = b.w
+    b.load_state_dict(a.state_dict())
+    assert b.w is target and isinstance(b.w, Mxfp4ExpertParam)
+    assert torch.equal(b.w.dequantize(), a.w.dequantize())
+    assert b.w.mxfp4_scales.data_ptr() != a.w.mxfp4_scales.data_ptr()   # copied, not aliased
+    # A pickled state_dict (torch.save / Trainer checkpoints) keeps the scales too.
+    c = nn.Module()
+    c.w = _packed(4, 64, 64, seed = 3)
+    c.load_state_dict(pickle.loads(pickle.dumps(a.state_dict())))
+    assert torch.equal(c.w.dequantize(), a.w.dequantize())
+    with pytest.raises(RuntimeError, match = "bare MXFP4 blocks"):
+        c.load_state_dict({"w": _packed(4, 64, 64, seed = 4).data.clone()})
+    assert torch.equal(c.w.dequantize(), a.w.dequantize())
+
+
+def test_load_state_dict_of_a_gpt_oss_model_takes_the_other_models_experts():
+    a, experts_a = _tiny_gpt_oss("cpu")
+    b, experts_b = _tiny_gpt_oss("cpu")
+    experts_b.gate_up_proj = _packed(4, 128, 128, seed = 21)
+    experts_b.down_proj = _packed(4, 128, 64, seed = 22)
+    b.load_state_dict(a.state_dict())
+    for name in ("gate_up_proj", "down_proj"):
+        assert torch.equal(getattr(experts_b, name).dequantize(), getattr(experts_a, name).dequantize())

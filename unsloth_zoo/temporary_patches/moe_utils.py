@@ -16,6 +16,7 @@
 import torch
 import torch.nn.functional as F
 import contextlib
+import inspect
 import json
 import math
 import os
@@ -1832,9 +1833,14 @@ def _get_lora_wrapper_for_param(experts_module, param_name):
     wrapper = None
     if hasattr(experts_module, f"{param_name}_lora_wrapper"):
         wrapper = getattr(experts_module, f"{param_name}_lora_wrapper")
-    elif hasattr(experts_module, param_name):
-        attr = getattr(experts_module, param_name)
-        if hasattr(attr, "lora_A"):  # ParamWrapper
+    else:
+        if isinstance(inspect.getattr_static(type(experts_module), param_name, None), property):
+            # A property may decode on every read (packed MXFP4); only a value stored by
+            # its setter can be a ParamWrapper, so look there without evaluating it.
+            attr = experts_module.__dict__.get("_" + param_name, None)
+        else:
+            attr = getattr(experts_module, param_name, None)
+        if attr is not None and hasattr(attr, "lora_A"):  # ParamWrapper
             wrapper = attr
 
     if wrapper is not None:

@@ -14,7 +14,15 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""MXFP4 to bf16 / fp16 in one Triton pass, same layout as transformers' convert_moe_packed_tensors."""
+"""MXFP4 (e2m1 nibbles + e8m0 block scales, 32 values per block) to bf16 / fp16.
+
+``mxfp4_dequantize(blocks, scales)`` takes the checkpoint layout, blocks ``(..., G, 16)`` uint8
+and scales ``(..., G)`` uint8, and returns ``(..., G * 32)``, the layout
+``transformers.integrations.mxfp4.convert_moe_packed_tensors`` returns. ``transpose = True``
+writes the last two dims swapped in the same pass (what GPT-OSS stores as ``gate_up_proj``),
+and ``experts`` restricts the work to those leading-dim slices. One Triton pass, no fp32 or
+int64 temporaries; the torch path is the fallback on CPU, MPS and without Triton.
+"""
 
 import torch
 
@@ -39,23 +47,51 @@ except Exception:
     _HAS_TRITON = False
 
 
-def mxfp4_dequantize_torch(blocks, scales, dtype = torch.bfloat16, transpose = False):
+# Rows per step of the torch path: bounds its int64 index and scaled temporaries to ~256 MB
+# instead of materialising them for a whole expert stack (8.5 GB for a gpt-oss-120b projection).
+_TORCH_CHUNK_BYTES = 256 << 20
+
+
+def mxfp4_dequantize_torch(blocks, scales, dtype = torch.bfloat16, transpose = False, out = None):
+    """Reference: the same arithmetic as transformers' convert_moe_packed_tensors, done in row
+    chunks written straight into the output."""
     lut = torch.tensor(_FP4_VALUES, dtype = dtype, device = blocks.device)
     *prefix, G, B = blocks.shape
-    out = torch.empty(*prefix, G, B * 2, dtype = dtype, device = blocks.device)
-    out[..., 0::2] = lut[(blocks & 0x0F).long()]
-    out[..., 1::2] = lut[(blocks >> 4).long()]
-    out = torch.ldexp(out, (scales.to(torch.int32) - 127).unsqueeze(-1)).to(dtype)
-    out = out.reshape(*prefix, G * B * 2)
-    if transpose:
-        out = out.transpose(-2, -1).contiguous()
-    return out
+    if transpose and not prefix:
+        raise ValueError("Unsloth: transpose needs MXFP4 blocks with a row dim")
+    N = prefix[-1] if prefix else 1
+    R = blocks.numel() // (G * B)
+    shape = (*prefix[:-1], G * B * 2, N) if transpose else (*prefix, G * B * 2)
+    buf = out if out is not None and out.is_contiguous() and out.dtype == dtype else torch.empty(shape, dtype = dtype, device = blocks.device)
+    rows_in = blocks.reshape(R, G, B)
+    scales_in = scales.reshape(R, G)
+    # Transposed: row r lands in column r % N of expert r // N; a chunk never crosses an expert.
+    dst = buf.view(R // N, G * B * 2, N) if transpose else buf.view(R, G * B * 2)
+    step = max(1, min(N if transpose else R, _TORCH_CHUNK_BYTES // (G * B * 2 * 8)))
+    for r0 in range(0, R, step):
+        r1 = min(r0 + step, (r0 // N + 1) * N if transpose else R)
+        b = rows_in[r0:r1]
+        piece = torch.empty(r1 - r0, G, B * 2, dtype = dtype, device = blocks.device)
+        piece[..., 0::2] = lut[(b & 0x0F).long()]
+        piece[..., 1::2] = lut[(b >> 4).long()]
+        piece = torch.ldexp(piece, (scales_in[r0:r1].to(torch.int32) - 127).unsqueeze(-1)).to(dtype)
+        piece = piece.reshape(r1 - r0, G * B * 2)
+        if transpose:
+            e, i0 = divmod(r0, N)
+            dst[e, :, i0:i0 + (r1 - r0)] = piece.T
+        else:
+            dst[r0:r1] = piece
+    if out is not None and buf is not out:
+        out.copy_(buf)
+        return out
+    return buf
 
 
 if _HAS_TRITON:
 
     @triton.jit
     def _e2m1_to_f32(nib):
+        # e2m1: sign bit 3, exponent bits 2..1, mantissa bit 0; exponent 0 is the subnormal 0 / 0.5.
         sign = tl.where((nib & 8) != 0, -1.0, 1.0)
         e = (nib >> 1) & 3
         m = (nib & 1).to(tl.float32)
@@ -78,6 +114,7 @@ if _HAS_TRITON:
         else:
             e = pid_e.to(tl.int64)
         if USE_COUNTS:
+            # An expert no token was routed to is never read by the grouped GEMM: skip it.
             if tl.load(counts_ptr + e) == 0:
                 return
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -85,16 +122,20 @@ if _HAS_TRITON:
         offs_b = tl.arange(0, 16)
         mask_ng = (offs_n[:, None] < N) & (offs_g[None, :] < G)
         row = e * N + offs_n
+        # bytes [BLOCK_N, BLOCK_G, 16]
         byte_offs = (row[:, None, None] * G + offs_g[None, :, None]) * 16 + offs_b[None, None, :]
         packed = tl.load(blocks_ptr + byte_offs, mask = mask_ng[:, :, None], other = 0).to(tl.int32)
         scale = tl.load(scales_ptr + row[:, None] * G + offs_g[None, :], mask = mask_ng, other = 127).to(tl.int32)
-        # e8m0 255 (2^128) overflows: scale by 2^127 then 2, so zero stays zero and 0.5 finite, as ldexp.
+        # e8m0 255 is 2^128, past the fp32 / bf16 range: scale by 2^127 and then by 2, so a zero
+        # nibble stays zero and 0.5 stays finite, as ldexp gives.
         top = scale == 255
         scale = tl.where(top, 254, scale)
         double = tl.where(top, 2.0, 1.0)
+        # 2^(scale - 127) built from its fp32 bits; scale 0 is the fp32 subnormal 2^-127.
         factor = tl.where(scale == 0, 5.877471754111438e-39, ((scale << 23).to(tl.int32, bitcast = True)).to(tl.float32, bitcast = True))
         if BF16_BITS:
-            # bf16 bits straight from the nibble (triton_kernels' portable upcast).
+            # bf16 bit patterns straight from the nibble (triton_kernels' portable upcast): sign to bit
+            # 15, exponent + mantissa shifted into place and rebiased, 0.5 (subnormal e2m1) set directly.
             em0 = packed & 0x07
             em1 = packed & 0x70
             x0 = (em0 << 6) | ((packed & 0x08) << 12)
@@ -105,6 +146,7 @@ if _HAS_TRITON:
             x1 = tl.where(em1 == 0x10, 16128 | (x1 & 0x8000), x1)
             lo = x0.to(tl.uint16).to(tl.bfloat16, bitcast = True)
             hi = x1.to(tl.uint16).to(tl.bfloat16, bitcast = True)
+            # 2^(scale - 127) as a bf16 bit pattern; scale 0 is the bf16 subnormal 2^-127. Exact product.
             s16 = tl.maximum(scale << 7, 0x0040).to(tl.uint16).to(tl.bfloat16, bitcast = True)
             lo = lo * s16[:, :, None]
             hi = hi * s16[:, :, None]
@@ -130,6 +172,7 @@ def _triton_usable(blocks):
 
 
 def _kernel_fail(exception):
+    # A Triton build that cannot compile the kernel (an old ROCm stack) falls back for good.
     global _KERNEL_FAILED
     _KERNEL_FAILED = True
     import warnings
@@ -137,7 +180,8 @@ def _kernel_fail(exception):
 
 
 def _kernel_verified(device, dtype, transpose):
-    """Once per (device, dtype, layout): the kernel must match the torch reference bit for bit."""
+    """Once per (device, dtype, layout): the kernel must reproduce the torch reference bit for bit
+    on every byte value, the edge e8m0 scales and partial tiles, else the torch path is used."""
     key = (str(device), dtype, bool(transpose))
     verified = _KERNEL_VERIFIED.get(key)
     if verified is not None:
@@ -166,6 +210,7 @@ def _kernel_verified(device, dtype, transpose):
 
 
 def mxfp4_kernel_available(device = None, dtype = torch.bfloat16) -> bool:
+    """Whether the fused kernel runs, and is exact, for the GPT-OSS transposed layout on ``device``."""
     if not _HAS_TRITON or _KERNEL_FAILED or not torch.cuda.is_available():
         return False
     if device is None:
@@ -179,7 +224,13 @@ def mxfp4_kernel_available(device = None, dtype = torch.bfloat16) -> bool:
 def mxfp4_dequantize(
     blocks, scales, dtype = torch.bfloat16, transpose = False, experts = None, token_counts = None, out = None,
 ):
-    """``experts`` / zero ``token_counts`` leave other slices UNINITIALISED: only for grouped GEMMs that skip them."""
+    """Dequantize MXFP4 ``blocks`` / ``scales`` to ``dtype``.
+
+    ``transpose`` swaps the last two output dims in the same pass. ``experts`` (1-D int tensor
+    of leading-dim indices) fills only those slices of a full-size output; the rest is left
+    uninitialised, which is safe for grouped GEMMs that never read an expert with no tokens.
+    ``token_counts`` (per-expert token counts, on device) does the same without a host sync:
+    experts with a zero count are skipped inside the kernel. ``out`` reuses a buffer."""
     if blocks.shape[:-1] != scales.shape or blocks.shape[-1] != 16:
         raise ValueError(f"Unsloth: MXFP4 blocks {tuple(blocks.shape)} do not match scales {tuple(scales.shape)}")
     from unsloth_zoo.utils import device_guard
@@ -195,20 +246,12 @@ def _mxfp4_dequantize(blocks, scales, dtype, transpose, experts, token_counts, o
         not _triton_usable(blocks) or blocks.dim() < 3
         or not _kernel_verified(blocks.device, dtype, transpose)
     ):
-        full = mxfp4_dequantize_torch(blocks, scales, dtype = dtype, transpose = transpose)
-        if out is not None:
-            out.copy_(full)
-            return out
-        return full
+        return mxfp4_dequantize_torch(blocks, scales, dtype = dtype, transpose = transpose, out = out)
     try:
         return _kernel_dequantize(blocks, scales, dtype, transpose, experts, token_counts, out)
     except Exception as exception:
         _kernel_fail(exception)
-        full = mxfp4_dequantize_torch(blocks, scales, dtype = dtype, transpose = transpose)
-        if out is not None:
-            out.copy_(full)
-            return out
-        return full
+        return mxfp4_dequantize_torch(blocks, scales, dtype = dtype, transpose = transpose, out = out)
 
 
 def _kernel_dequantize(blocks, scales, dtype, transpose, experts, token_counts, out):
@@ -241,6 +284,7 @@ def _kernel_dequantize(blocks, scales, dtype, transpose, experts, token_counts, 
             return out
     else:
         n_programs_e = E
+    # Swept on B200 over gpt-oss-20b shapes: a taller n tile keeps transposed stores coalesced.
     bf16_bits = dtype == torch.bfloat16
     if bf16_bits:
         BLOCK_N, BLOCK_G = (128, 4) if transpose else (32, 8)
@@ -267,7 +311,15 @@ def _launch(grid, blocks, scales, out, experts, token_counts, N, G, stride_e, st
 
 
 class Mxfp4ExpertParam(torch.nn.Parameter):
-    """Frozen MXFP4 expert stack. Must stay re-buildable as ``cls(data, requires_grad, **param.__dict__)`` (accelerate)."""
+    """A frozen MoE expert stack kept as MXFP4: ``.data`` holds the blocks ``(E, N, G, 16)``
+    uint8, ``mxfp4_scales`` the ``(E, N, G)`` e8m0 scales. ``_original_shape`` is the logical
+    stack (``(E, G * 32, N)`` when ``mxfp4_transposed``, GPT-OSS's ``(E, in, out)`` layout),
+    read wherever a packed parameter's logical shape is needed, as for bnb 4-bit experts.
+
+    Built as ``Mxfp4ExpertParam(blocks, mxfp4_scales = scales)`` and re-buildable as
+    ``cls(data, requires_grad, **param.__dict__)``, which is how accelerate re-creates a
+    parameter on another device. uint8 data is never touched by ``module.to(dtype)`` /
+    ``.half()``; the scales follow the blocks lazily in ``dequantize``."""
 
     def __new__(
         cls, data, requires_grad = False, mxfp4_scales = None, mxfp4_transposed = True,
@@ -299,6 +351,7 @@ class Mxfp4ExpertParam(torch.nn.Parameter):
         )
 
     def to(self, *args, **kwargs):
+        # Only a device move applies to the packed bytes; a dtype cast would destroy them.
         device, _, non_blocking, _ = torch._C._nn._parse_to(*args, **kwargs)
         if device is None or torch.device(device) == self.device:
             return self
@@ -306,8 +359,25 @@ class Mxfp4ExpertParam(torch.nn.Parameter):
         kwargs["mxfp4_scales"] = self.mxfp4_scales.to(device, non_blocking = non_blocking)
         return Mxfp4ExpertParam(self.data.to(device, non_blocking = non_blocking), **kwargs)
 
+    def copy_(self, src, non_blocking = False):
+        # load_state_dict copies into the parameter in place. The blocks are meaningless without
+        # their scales, so take both from a packed source and refuse bare uint8 blocks.
+        if not isinstance(src, Mxfp4ExpertParam):
+            raise RuntimeError(
+                "Unsloth: cannot copy bare MXFP4 blocks into a packed expert stack, their scales "
+                "would be left stale. Load a state_dict taken from a packed model, or reload the "
+                "model with UNSLOTH_MXFP4_KEEP_PACKED=0."
+            )
+        if src.mxfp4_transposed != self.mxfp4_transposed or src.mxfp4_scales.shape != self.mxfp4_scales.shape:
+            raise RuntimeError("Unsloth: MXFP4 expert stacks with different layouts cannot be copied")
+        torch.Tensor.copy_(self, src, non_blocking = non_blocking)
+        self.mxfp4_scales = src.mxfp4_scales.to(self.device, non_blocking = non_blocking, copy = True)
+        self.mxfp4_dtype = src.mxfp4_dtype
+        return self
+
     def detach(self):
-        # nn.Module._apply re-wraps meta moves as a Parameter; detach() must keep the subtype.
+        # nn.Module._apply re-wraps a moved tensor as a Parameter when it cannot assign .data
+        # (a move to or from meta), and Parameter requires detach() to keep the subtype.
         return Mxfp4ExpertParam(torch.Tensor.detach(self), **self._init_kwargs())
 
     def __deepcopy__(self, memo):
