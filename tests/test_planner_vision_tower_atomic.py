@@ -96,6 +96,7 @@ def test_the_vision_tower_lands_on_one_device(build):
     model = build()
     plan = _plan(model, 0.6)
     assert len(_devices(plan, "model.visual")) == 1, plan.device_map
+    assert "model.visual" in plan.device_map, plan.device_map
     assert any("placed whole" in n for n in plan.notes)
     if build is _qwen3_5_moe:
         assert _devices(plan, "model.language_model.layers") == {0, 1}
@@ -132,3 +133,18 @@ def test_an_explicit_no_split_override_keeps_the_per_unit_split():
     plan = _plan(model, 0.6, no_split_module_classes = planner.resolve_no_split_classes(model))
     assert _devices(plan, "model.visual") == {0, 1}
     assert not any("sub-model towers" in n for n in plan.notes)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU next to the CPU")
+@pytest.mark.parametrize("inputs_on", ["cpu", "cuda:0"])
+def test_a_whole_tower_runs_with_inputs_on_another_device(inputs_on):
+    from accelerate import dispatch_model
+    config = _qwen3_vl().config
+    config.dtype = torch.float32
+    model = transformers.Qwen3VLForConditionalGeneration._from_config(config).eval()
+    plan = _plan(model, 0.6)
+    device_map = {k: (0 if d == 0 else "cpu") for k, d in plan.device_map.items()}
+    model = dispatch_model(model, device_map = device_map, main_device = "cpu")
+    grid = torch.tensor([[1, 4, 4]], device = inputs_on)
+    with torch.no_grad():
+        model.model.visual(torch.randn(16, 96, device = inputs_on), grid_thw = grid)

@@ -1111,6 +1111,16 @@ def _sub_model_towers(model: nn.Module) -> list[str]:
         return []
 
 
+def _collapse_towers(device_map: dict[str, Any], towers: Sequence[str]) -> dict[str, Any]:
+    """One key per whole tower, so accelerate hooks its root and moves its inputs
+    (Qwen3-VL multiplies ``pos_embed`` by weights built on ``grid_thw``'s device)."""
+    out: dict[str, Any] = {}
+    for key, device in device_map.items():
+        tower = next((t for t in towers if key == t or key.startswith(t + ".")), None)
+        out[tower or key] = device
+    return out
+
+
 def _tower_blocks(model: nn.Module, tower: str, no_split_classes: Sequence[str]) -> list[str]:
     """The outermost no-split blocks inside ``tower``, in definition order."""
     no_split = set(no_split_classes)
@@ -1234,6 +1244,8 @@ def plan_device_map(
                 plan = plan_device_map(model, **call, _colocate = spec)
             except DeviceMapInfeasible:
                 continue
+            if spec is whole:
+                plan.device_map = _collapse_towers(plan.device_map, towers)
             plan.notes.append(f"sub-model towers {towers}: {how}")
             return plan
         plan = plan_device_map(model, **call, _colocate = ())
