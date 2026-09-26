@@ -150,7 +150,6 @@ class Mxfp4StackedExperts(nn.Module):
     """One MoE layer's experts as packed ``gate_up_proj`` / ``down_proj``; forward follows DeepSeek ``moe_infer``."""
 
     _unsloth_mxfp4_stacked_experts = True
-    # Stacks are (E, in, out): how the MoE LoRA extraction orients PEFT's factors.
     _unsloth_grouped_mm_format = True
 
     def __init__(self, num_experts, hidden_size, intermediate_size, act_fn, fused_gate_up_act,
