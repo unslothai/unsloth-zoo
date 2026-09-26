@@ -1734,7 +1734,7 @@ def patch_GradientCheckpointingLayer_keyword_inputs():
         from functools import partial
         from transformers.modeling_layers import GradientCheckpointingLayer
         from transformers.modeling_layers import logger as modeling_layers_logger
-        from ..gradient_checkpointing import _KeywordArgumentCall
+        from unsloth_zoo.gradient_checkpointing import _KeywordArgumentCall
     except Exception as e:
         return raise_error("transformers.modeling_layers.GradientCheckpointingLayer", e)
     original = GradientCheckpointingLayer.__call__
