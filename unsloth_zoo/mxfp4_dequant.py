@@ -316,13 +316,15 @@ class Mxfp4ExpertParam(torch.nn.Parameter):
             mxfp4_dtype = self.mxfp4_dtype,
         )
 
-    def dequantize(self, dtype = None, token_counts = None, out = None):
+    def dequantize(self, dtype = None, token_counts = None, out = None, transpose = None):
+        """Logical layout by default; ``transpose`` overrides it (False -> (E, N, K) packed-row order)."""
         scales = self.mxfp4_scales
         if scales.device != self.device:
             scales = self.mxfp4_scales = scales.to(self.device)
         return mxfp4_dequantize(
             self.data, scales, dtype = dtype or self.mxfp4_dtype,
-            transpose = self.mxfp4_transposed, token_counts = token_counts, out = out,
+            transpose = self.mxfp4_transposed if transpose is None else bool(transpose),
+            token_counts = token_counts, out = out,
         )
 
     def to(self, *args, **kwargs):

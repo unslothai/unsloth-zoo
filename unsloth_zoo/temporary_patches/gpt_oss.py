@@ -2021,6 +2021,78 @@ def _mxfp4_decode_stack(param, dtype, token_counts, role = "", slot = None):
     return slot.stack
 
 
+no_cudagraph_torch_compile_options = get_torch_compile_options(
+    epilogue_fusion = True,
+    max_autotune = False,
+    shape_padding = True,
+    # Every layer passes its own packed stack: CUDA graphs would re-record per layer (or copy the stacks).
+    cudagraphs = False,
+    coordinate_descent_tuning = use_coordinate_descent,
+    combo_kernels = False,
+    memory_planning = True,
+    multi_kernel = False,
+    use_block_ptr = True,
+    logging = UNSLOTH_ENABLE_LOGGING,
+)
+
+
+@_torch_compile(dynamic=None, fullgraph=True, options=no_cudagraph_torch_compile_options)
+def _moe_forward_inference_mxfp4_kernel(
+    hidden_states, routing_weights, router_indices,
+    gu_blocks, gu_scales, gate_up_proj_bias, gu_trans,
+    dn_blocks, dn_scales, down_proj_bias, dn_trans,
+    limit, alpha, hidden_size,
+):
+    """Decode-time MoE on packed MXFP4 stacks: sort the routed (token, expert) rows, two fused grouped GEMMs."""
+    from unsloth_zoo.mxfp4_gemm import mxfp4_grouped_mm_op
+    batch_size = hidden_states.shape[0]
+    x = hidden_states.reshape(-1, hidden_size)
+    num_experts = routing_weights.shape[1]
+    top_k = router_indices.shape[1]
+    flat = router_indices.reshape(-1)
+    counts = (flat[:, None] == torch.arange(num_experts, device = flat.device)).sum(0, dtype = torch.int32)
+    order = torch.argsort(flat, stable = True)
+    token = order // top_k
+    expert = flat[order]
+    # Biases may be float32 (the dense path promotes too); the GEMMs take the bf16 activations, as autocast would.
+    gate_up = mxfp4_grouped_mm_op(x[token], gu_blocks, gu_scales, counts, gu_trans) + gate_up_proj_bias[expert]
+    gate, up = gate_up[..., ::2], gate_up[..., 1::2]
+    gate = gate.clamp(min=None, max=limit)
+    up = up.clamp(min=-limit, max=limit)
+    glu = gate * torch.sigmoid(gate.to(torch.float32) * alpha).to(gate.dtype)
+    inter = ((up + 1) * glu).to(x.dtype)
+    down = mxfp4_grouped_mm_op(inter, dn_blocks, dn_scales, counts, dn_trans) + down_proj_bias[expert]
+    weighted = down * routing_weights[token, expert][:, None]
+    # Summed in fp32 and rounded once, as the dense path's sum over experts.
+    out = torch.zeros((x.shape[0], hidden_size), dtype = torch.float32, device = x.device)
+    out = out.index_add_(0, token, weighted.to(torch.float32))
+    return out.to(weighted.dtype).view(batch_size, -1, hidden_size)
+
+
+def _mxfp4_static_operands(param, experts_module, proj_type):
+    """(blocks, scales, transpose_b) as long-lived plain tensors, so compiled code sees stable inputs."""
+    cached = getattr(param, "_unsloth_fused_operands", None)
+    if cached is not None and cached[0].data_ptr() == param.data_ptr() and cached[1] is param.mxfp4_scales:
+        return cached[0], cached[2], cached[3]
+    from .moe_utils import _mxfp4_expert_layout
+    layout = _mxfp4_expert_layout(param, proj_type, experts_module.hidden_size, getattr(experts_module, "_unsloth_model_type", None), experts_module)
+    transpose_b = bool(param.mxfp4_transposed) if layout is None else layout[1]
+    scales = param.mxfp4_scales
+    if scales.device != param.device:
+        scales = param.mxfp4_scales = scales.to(param.device)
+    blocks = param.data
+    param._unsloth_fused_operands = (blocks, param.mxfp4_scales, scales.contiguous(), transpose_b)
+    return blocks, param._unsloth_fused_operands[2], transpose_b
+
+
+def _mxfp4_fused_decode_enabled(param, dtype):
+    from .moe_utils import _mxfp4_fused_enabled
+    from unsloth_zoo.mxfp4_gemm import mxfp4_grouped_mm_op
+    if os.environ.get("UNSLOTH_MXFP4_FUSED_GEMM") == "dequant":
+        return False
+    return mxfp4_grouped_mm_op is not None and _mxfp4_fused_enabled(param, dtype)
+
+
 def moe_forward_inference_bf16(self, hidden_states):
     """Wrapper that extracts weights from ParameterModule before calling the compiled kernel."""
     router_scores, router_indices = moe_router_forward(self.router, hidden_states)
@@ -2040,6 +2112,20 @@ def moe_forward_inference_bf16(self, hidden_states):
         down_proj = down_proj.get_param()
     elif hasattr(down_proj, "weight"):
         down_proj = down_proj.weight
+
+    if (
+        is_mxfp4_expert_param(gate_up_proj) and is_mxfp4_expert_param(down_proj)
+        and _mxfp4_fused_decode_enabled(gate_up_proj, hidden_states.dtype)
+    ):
+        # Routed experts only, read straight from the packed stacks: no 1.6 GB decode slots, no dense bmm.
+        gu_blocks, gu_scales, gu_trans = _mxfp4_static_operands(gate_up_proj, moe, "gate_up")
+        dn_blocks, dn_scales, dn_trans = _mxfp4_static_operands(down_proj, moe, "down")
+        return _moe_forward_inference_mxfp4_kernel(
+            hidden_states, routing_weights, router_indices,
+            gu_blocks, gu_scales, moe.gate_up_proj_bias, gu_trans,
+            dn_blocks, dn_scales, moe.down_proj_bias, dn_trans,
+            moe.limit, moe.alpha, moe.hidden_size,
+        )
 
     slots = []
     if is_mxfp4_expert_param(gate_up_proj) or is_mxfp4_expert_param(down_proj):
