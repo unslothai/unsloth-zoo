@@ -666,7 +666,7 @@ def unsloth_train(trainer):
     #     torch.FloatTensor([inverse_gradient_accumulation_steps])\
     #     .to(device = "cuda:0", non_blocking = True)[0]
 
-    # Mixed precision scaling. npu has its own autocast, scaler and device; hip aliases cuda.
+    # Mixed precision scaling
     _amp_device = "npu" if DEVICE_TYPE == "npu" else "cuda"
     torch_version = torch.__version__
     config_dtype = dtype_from_config(model.config)

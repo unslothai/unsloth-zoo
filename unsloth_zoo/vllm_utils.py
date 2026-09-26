@@ -100,7 +100,6 @@ def get_target_device(index = 0):
     return torch.device(DEVICE_TYPE, index)
 
 def _device_empty_cache():
-    # torch.cuda.empty_cache() leaves the NPU caching allocator untouched.
     if DEVICE_TYPE == "npu":
         torch.npu.empty_cache()
     else:
@@ -2865,7 +2864,7 @@ def load_vllm(
                 _block_flashinfer_import()
             _UNSLOTH_FLASHINFER_UNUSABLE = True
         elif DEVICE_TYPE != "npu" and importlib.util.find_spec("flashinfer"):
-            # FlashInfer JIT-compiles CUDA kernels (never on NPU, where major_version is unset); needs nvcc and ninja. If either
+            # FlashInfer JIT-compiles CUDA kernels; needs nvcc and ninja. If either
             # is missing, skip it so vLLM falls back to FLASH_ATTN + native sampler.
             _has_nvcc = (
                 shutil.which("nvcc") is not None
@@ -3041,7 +3040,6 @@ def load_vllm(
             gpu_eu_count = torch.xpu.get_device_properties(0).gpu_eu_count
             message = f"{platform} has eu:{gpu_eu_count}"
         elif DEVICE_TYPE == "npu":
-            # No CUDA capability to read; torch.cuda is unavailable on this path.
             platform = "Ascend NPU"
             message = f"{platform} {torch.npu.get_device_name(0)}"
         else:

@@ -92,7 +92,7 @@ _CELLS = ("cuda", "hip", "xpu", "npu", "xpu+npu", "none")
 def answers():
     env = {k: v for k, v in os.environ.items() if k != "UNSLOTH_ZOO_DISABLE_GPU_INIT"}
     env["UNSLOTH_ALLOW_CPU"] = "1"
-    env["UNSLOTH_DISABLE_PINNED_MEMORY"] = "1"  # the stub npu has no pinned allocator
+    env["UNSLOTH_DISABLE_PINNED_MEMORY"] = "1"  # stub npu has no pinned allocator
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(_ROOT), env.get("PYTHONPATH")]))
     out = subprocess.run(
         [sys.executable, "-c", _CHILD, *_CELLS],
@@ -133,12 +133,10 @@ def test_npu_vllm_memory_reads_torch_npu(answers):
 def test_npu_cache_cleanup_reaches_torch_npu(answers):
     if "nodep" in answers:
         pytest.skip(f"vllm_utils needs {answers['nodep']}")
-    # vLLM's cleanup helper and the checkpoint buffer reset each empty the NPU cache once.
     assert answers.get("cache") == "2", answers["stderr"]
 
 
 def test_npu_gradient_checkpointing_initializes(answers):
-    # One stream per device, and autocast bound to npu rather than cuda.
     assert answers.get("gc") == "1 torch.bfloat16 ('main',) (('stream', 0),) npu", answers["stderr"]
 
 
@@ -157,11 +155,10 @@ def test_every_other_host_answers_as_before(answers, cell, expected):
 
 
 def test_unsloth_train_takes_its_device_from_the_backend():
-    # Source-level: importing training_utils needs datasets, which not every runner has.
+    # Source-level: importing training_utils needs datasets.
     import ast
     tree = ast.parse((_ROOT / "unsloth_zoo" / "training_utils.py").read_text(encoding = "utf-8"))
     fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "unsloth_train")
-    # No call may be handed a literal cuda device: GradScaler, autocast, zeros, .to().
     passed = [
         a.value for c in ast.walk(fn) if isinstance(c, ast.Call)
         for a in [*c.args, *(k.value for k in c.keywords)]
