@@ -84,6 +84,7 @@ _CELLS = ("cuda", "hip", "xpu", "npu", "xpu+npu", "none")
 def answers():
     env = {k: v for k, v in os.environ.items() if k != "UNSLOTH_ZOO_DISABLE_GPU_INIT"}
     env["UNSLOTH_ALLOW_CPU"] = "1"
+    env["UNSLOTH_DISABLE_PINNED_MEMORY"] = "1"  # the stub npu has no pinned allocator
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(_ROOT), env.get("PYTHONPATH")]))
     out = subprocess.run(
         [sys.executable, "-c", _CHILD, *_CELLS],
@@ -101,6 +102,7 @@ def answers():
             key, _, rest = line.partition(" ")
             got[key.lower()] = rest
     assert set(got) >= set(_CELLS), out.stderr[-2000:]
+    got["stderr"] = out.stderr[-2000:]
     return got
 
 
@@ -113,17 +115,17 @@ def test_npu_helpers_reach_torch_npu(answers):
 
 
 def test_npu_vllm_memory_reads_torch_npu(answers):
-    assert answers.get("vllm") == "(1, 2)"
+    assert answers.get("vllm") == "(1, 2)", answers["stderr"]
 
 
 def test_npu_cache_cleanup_reaches_torch_npu(answers):
     # vLLM's cleanup helper and the checkpoint buffer reset each empty the NPU cache once.
-    assert answers.get("cache") == "2"
+    assert answers.get("cache") == "2", answers["stderr"]
 
 
 def test_npu_gradient_checkpointing_initializes(answers):
     # One stream per device, and autocast bound to npu rather than cuda.
-    assert answers.get("gc") == "1 torch.bfloat16 ('main',) (('stream', 0),) npu"
+    assert answers.get("gc") == "1 torch.bfloat16 ('main',) (('stream', 0),) npu", answers["stderr"]
 
 
 @pytest.mark.parametrize(
