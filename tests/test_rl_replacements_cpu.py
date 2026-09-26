@@ -47,6 +47,25 @@ import torch
 from unsloth_zoo import rl_replacements as rr
 
 
+@pytest.mark.parametrize("difference", [-1e-3, -1e-4, 0.0, 1e-4, 1e-3])
+def test_grpo_small_kl_matches_second_order_limit(difference):
+    new = torch.full((1, 2), -1.0, requires_grad=True)
+    ref = new.detach() + difference
+    mask = torch.ones_like(new)
+    loss, _, mean_kl, *_ = rr.grpo_compute_loss(
+        ref, new, new.detach(), None, torch.zeros_like(new, dtype=torch.long),
+        mask, 1.0, torch.zeros(1),
+    )
+
+    # exp(delta) - delta - 1 = delta^2/2 + delta^3/6 + delta^4/24 + O(delta^5).
+    delta = ref.double() - new.detach().double()
+    expected = (delta.square() / 2 + delta.pow(3) / 6 + delta.pow(4) / 24).mean()
+    torch.testing.assert_close(loss.double(), expected, rtol=1e-3, atol=1e-12)
+    torch.testing.assert_close(mean_kl.double(), expected, rtol=1e-3, atol=1e-12)
+    loss.backward()
+    torch.testing.assert_close(new.grad.double(), -torch.expm1(delta) / new.numel(), rtol=1e-3, atol=1e-7)
+
+
 def test_calculate_pad_tokens_in_prompt_counts_left_pads():
     PAD = 0
     # batch=2, seq_len=6, logits_to_keep=3 -> prompt_section is the
