@@ -85,7 +85,6 @@ def _make_op(Fp8Dequantize):
             if _target_owns_scale(model, full_layer_name):
                 return self._pass_through(input_dict, full_layer_name, model)
             out = super().convert(input_dict, full_layer_name = full_layer_name, model = model, **kwargs)
-            # Only weights that arrived with a scale are re-quantized on save.
             has_scale = any("scale_inv" in (k[:-1] if k.endswith("$") else k) for k in input_dict)
             if has_scale:
                 # transformers < 5.12 dequantizes to float32, not the parameter's dtype.
