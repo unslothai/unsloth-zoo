@@ -69,12 +69,17 @@ npu.default_stream = lambda i: "main"
 gc.DEVICE_TYPE, gc.DEVICE_TYPE_TORCH = "npu", "cpu"
 gc.initialize_unsloth_gradient_checkpointing()
 amp = getattr(gc.torch_amp_custom_fwd, "keywords", {}).get("device_type")
-import unsloth_zoo.vllm_utils as vu
-npu.mem_get_info = lambda *a: (1, 2)
-vu.DEVICE_TYPE = "npu"
-print("VLLM", vu.get_mem_info())
+try:
+    import unsloth_zoo.vllm_utils as vu
+except ModuleNotFoundError as e:  # e.g. no triton wheel on Windows
+    vu = None
+    print("NODEP", e.name)
 before = calls.count("empty_cache")
-vu._device_empty_cache()
+if vu is not None:
+    npu.mem_get_info = lambda *a: (1, 2)
+    vu.DEVICE_TYPE = "npu"
+    print("VLLM", vu.get_mem_info())
+    vu._device_empty_cache()
 gc.reset_unsloth_gradient_checkpointing_buffers()
 print("CACHE", calls.count("empty_cache") - before)
 print("GC", len(gc.GPU_BUFFERS), gc.GPU_BUFFERS[0].dtype, gc.MAIN_STREAMS, gc.EXTRA_STREAMS, amp)
@@ -103,7 +108,7 @@ def answers():
         if line.startswith("CELL "):
             _, cell, *rest = line.split()
             got[cell] = " ".join(rest)
-        elif line.startswith(("HELPERS ", "GC ", "VLLM ", "CACHE ")):
+        elif line.startswith(("HELPERS ", "GC ", "VLLM ", "CACHE ", "NODEP ")):
             key, _, rest = line.partition(" ")
             got[key.lower()] = rest
     assert set(got) >= set(_CELLS), out.stderr[-2000:]
@@ -120,10 +125,14 @@ def test_npu_helpers_reach_torch_npu(answers):
 
 
 def test_npu_vllm_memory_reads_torch_npu(answers):
+    if "nodep" in answers:
+        pytest.skip(f"vllm_utils needs {answers['nodep']}")
     assert answers.get("vllm") == "(1, 2)", answers["stderr"]
 
 
 def test_npu_cache_cleanup_reaches_torch_npu(answers):
+    if "nodep" in answers:
+        pytest.skip(f"vllm_utils needs {answers['nodep']}")
     # vLLM's cleanup helper and the checkpoint buffer reset each empty the NPU cache once.
     assert answers.get("cache") == "2", answers["stderr"]
 
