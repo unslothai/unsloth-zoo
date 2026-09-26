@@ -786,7 +786,8 @@ class _GroupedMMRecompute(torch.autograd.Function):
     def backward(ctx, grad_output):
         (offsets,) = ctx.saved_tensors
         with torch.no_grad():
-            weight_t = ctx.weight_provider().transpose(-2, -1).contiguous()
+            transposed = getattr(ctx.weight_provider, "transposed", None)
+            weight_t = transposed() if transposed is not None else ctx.weight_provider().transpose(-2, -1).contiguous()
             grad_input = _grouped_mm_with_backward_fix(grad_output.contiguous(), weight_t, offsets)
         return grad_input, None, None
 
@@ -796,6 +797,76 @@ def _base_grouped_mm(inputs, offsets, weight_provider, recompute):
     if recompute:
         return _GroupedMMRecompute.apply(inputs, offsets, weight_provider)
     return _grouped_mm_with_backward_fix(inputs, weight_provider(), offsets)
+
+
+def _mxfp4_expert_layout(source, proj_type, hidden_dim, model_type, experts_module):
+    """(packed param, transpose_b) when grouped_mm's weight for ``source`` is a frozen packed MXFP4 stack:
+    transpose_b means that weight is P^T for P = the (E, R, G * 32) packed rows. None otherwise."""
+    param = source
+    while hasattr(param, "base_layer"):
+        param = param.base_layer
+    if not is_mxfp4_expert_param(param) or param.requires_grad:
+        return None
+    cache = experts_module.__dict__.setdefault("_unsloth_mxfp4_layout", {})
+    key = (proj_type, hidden_dim, model_type, bool(param.mxfp4_transposed), tuple(param._original_shape))
+    if key not in cache:
+        # preprocess_weight on a meta stand-in: identity or a transpose view, anything else is unsupported.
+        meta = torch.empty(tuple(param._original_shape), device = "meta")
+        try:
+            weight = preprocess_weight(meta, proj_type, hidden_dim, model_type, experts_module = experts_module)
+        except Exception:
+            weight = None
+        flipped = meta.transpose(-2, -1)
+        if weight is meta or (weight is not None and weight.shape == meta.shape and weight.stride() == meta.stride()):
+            cache[key] = bool(param.mxfp4_transposed)
+        elif weight is not None and weight.shape == flipped.shape and weight.stride() == flipped.stride():
+            cache[key] = not param.mxfp4_transposed
+        else:
+            cache[key] = None
+    transpose_b = cache[key]
+    return None if transpose_b is None else (param, transpose_b)
+
+
+def _mxfp4_fused_enabled(param, dtype, rows = None) -> bool:
+    """Whether a packed stack runs through the fused decode-in-GEMM kernel. UNSLOTH_MXFP4_FUSED_GEMM:
+    "auto" (default) fused below UNSLOTH_MXFP4_FUSED_MAX_ROWS (192) rows per expert: there it is faster than,
+    or within ~3% of (checkpointed LoRA training, 128 rows), dequantize + cuBLAS on B200 and never allocates
+    the 1.6 GB dense stacks; above it cuBLAS amortises the dequant (fused +38% MoE GEMM time at 256 rows).
+    "1" always fused (least memory), "dequant" never, "0" never plus the legacy decode-slot path."""
+    if dtype != torch.bfloat16 or param.device.type != "cuda":
+        return False
+    mode = os.environ.get("UNSLOTH_MXFP4_FUSED_GEMM", "auto")
+    if mode in ("0", "dequant"):
+        return False
+    if mode != "1" and rows is not None:
+        limit = int(os.environ.get("UNSLOTH_MXFP4_FUSED_MAX_ROWS", "192"))
+        if rows >= limit * param.shape[0]:
+            return False
+    from unsloth_zoo.mxfp4_gemm import mxfp4_grouped_mm_available
+    return mxfp4_grouped_mm_available(param.device)
+
+
+def _mxfp4_base_grouped_mm(inputs, offsets, counts, weight_provider, recompute, layout):
+    """Packed MXFP4 base: fused decode-in-GEMM (no dense stack), else dequantize with a transposed
+    decode for backward instead of transpose().contiguous() of the dense stack."""
+    param, transpose_b = layout
+    scales = param.mxfp4_scales
+    if scales.device != param.device:
+        scales = param.mxfp4_scales = scales.to(param.device)
+    if (
+        inputs.dtype == torch.float32 and inputs.device.type == "cuda"
+        and torch.is_autocast_enabled("cuda") and torch.get_autocast_dtype("cuda") == torch.bfloat16
+    ):
+        inputs = inputs.to(torch.bfloat16)  # what autocast does to torch._grouped_mm's operands
+    if _mxfp4_fused_enabled(param, inputs.dtype, inputs.shape[0]):
+        from unsloth_zoo.mxfp4_gemm import mxfp4_expert_grouped_mm
+        return mxfp4_expert_grouped_mm(inputs, param.data, scales, counts, transpose_b = transpose_b)
+    if recompute and os.environ.get("UNSLOTH_MXFP4_FUSED_GEMM") != "0":
+        # W^T straight from the decode, not transpose().contiguous() of a second dense stack.
+        weight_provider.transposed = lambda: param.dequantize(
+            inputs.dtype, token_counts = counts, transpose = not transpose_b,
+        )
+    return _base_grouped_mm(inputs, offsets, weight_provider, recompute)
 
 
 _GROUPED_GEMM_AVAILABLE = None
@@ -3596,9 +3667,16 @@ def forward_native_grouped_mm(
         # backward instead of pinning it (grouped_mm needs contiguous weights).
         def _gate_up_provider(_src=_gate_up_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype, _mod=self, _n=num_tokens_per_expert):
             return preprocess_weight(_get_base_weight(_src, _dt, _n), "gate_up", _h, _mt, experts_module=_mod)
-        mm1_out = _base_grouped_mm(
-            permuted_input, offsets, _gate_up_provider, _moe_recompute_enabled(_gate_up_src, dtype=hidden_states.dtype),
-        )
+        _gate_up_layout = _mxfp4_expert_layout(_gate_up_src, "gate_up", hidden_dim, model_type, self)
+        if _gate_up_layout is not None:
+            mm1_out = _mxfp4_base_grouped_mm(
+                permuted_input, offsets, num_tokens_per_expert, _gate_up_provider,
+                _moe_recompute_enabled(_gate_up_src, dtype=hidden_states.dtype), _gate_up_layout,
+            )
+        else:
+            mm1_out = _base_grouped_mm(
+                permuted_input, offsets, _gate_up_provider, _moe_recompute_enabled(_gate_up_src, dtype=hidden_states.dtype),
+            )
 
         # Separated LoRA: + ((X @ first) @ second) * scaling.
         if gate_up_lora is not None:
@@ -3775,9 +3853,16 @@ def forward_native_grouped_mm(
         _down_src = self.down_proj
         def _down_provider(_src=_down_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype, _mod=self, _n=num_tokens_per_expert):
             return preprocess_weight(_get_base_weight(_src, _dt, _n), "down", _h, _mt, experts_module=_mod)
-        mm2_out = _base_grouped_mm(
-            inter, offsets, _down_provider, _moe_recompute_enabled(_down_src, dtype=hidden_states.dtype),
-        )
+        _down_layout = _mxfp4_expert_layout(_down_src, "down", hidden_dim, model_type, self)
+        if _down_layout is not None:
+            mm2_out = _mxfp4_base_grouped_mm(
+                inter, offsets, num_tokens_per_expert, _down_provider,
+                _moe_recompute_enabled(_down_src, dtype=hidden_states.dtype), _down_layout,
+            )
+        else:
+            mm2_out = _base_grouped_mm(
+                inter, offsets, _down_provider, _moe_recompute_enabled(_down_src, dtype=hidden_states.dtype),
+            )
 
         if down_lora is not None:
             first_weight, second_weight, scaling = down_lora

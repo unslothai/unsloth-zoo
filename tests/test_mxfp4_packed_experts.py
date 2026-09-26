@@ -389,6 +389,7 @@ def test_checkpoint_recompute_reuses_its_dequant_in_backward(monkeypatch, overri
         monkeypatch.delenv("UNSLOTH_MOE_RECOMPUTE", raising = False)
     else:
         monkeypatch.setenv("UNSLOTH_MOE_RECOMPUTE", override)
+    monkeypatch.setenv("UNSLOTH_MXFP4_FUSED_GEMM", "dequant")   # the dense-stack path; fused never dequantizes
     from unsloth_zoo.gradient_checkpointing import in_gradient_checkpoint_recompute
     packed_model, _ = _peft_pair("cuda")
     x, idx, w = _route("cuda")
@@ -674,8 +675,10 @@ def test_projections_of_the_same_shape_do_not_share_a_stack():
 
 
 @needs_cuda
-def test_another_stream_waits_for_the_last_kernel_on_the_shared_stack():
+def test_another_stream_waits_for_the_last_kernel_on_the_shared_stack(monkeypatch):
     from unsloth_zoo.temporary_patches import gpt_oss
+
+    monkeypatch.setenv("UNSLOTH_MXFP4_FUSED_GEMM", "0")   # the decode-slot path (fused decode has no slots)
 
     model, experts = _tiny_gpt_oss("cuda")
     mlp = model.model.layers[0].mlp
@@ -755,3 +758,50 @@ def test_torch_fallback_chunk_shorter_than_an_expert_writes_every_row(monkeypatc
     out = torch.full_like(want, float("nan"))
     got = mxd.mxfp4_dequantize_torch(blocks, scales, transpose = True, out = out)
     assert torch.equal(got, want)
+
+
+@needs_cuda
+def test_fused_decode_path_matches_the_slot_path_without_slots(monkeypatch):
+    """Fused decode reads the packed stacks directly: same tokens as the slot path, no slot allocated."""
+    from unsloth_zoo.temporary_patches import gpt_oss
+    from unsloth_zoo.mxfp4_gemm import mxfp4_grouped_mm_available
+    if not mxfp4_grouped_mm_available():
+        pytest.skip("fused MXFP4 GEMM unavailable")
+    model, experts = _tiny_gpt_oss("cuda")
+    mlp = model.model.layers[0].mlp
+    g = torch.Generator(device = "cuda").manual_seed(5)
+    inputs = [torch.randn(b, 1, 128, device = "cuda", dtype = torch.bfloat16, generator = g) for b in (1, 3, 8)]
+    with torch.no_grad():
+        monkeypatch.setenv("UNSLOTH_MXFP4_FUSED_GEMM", "0")
+        want = [gpt_oss.moe_forward_inference_bf16(mlp, h).clone() for h in inputs]
+        for param in (experts.gate_up_proj, experts.down_proj):
+            param._unsloth_decode_stacks = {}
+        import gc
+        gc.collect()
+        assert len(gpt_oss._MXFP4_DECODE_SLOTS) == 0
+        monkeypatch.setenv("UNSLOTH_MXFP4_FUSED_GEMM", "1")
+        got = [gpt_oss.moe_forward_inference_bf16(mlp, h) for h in inputs]
+    assert len(gpt_oss._MXFP4_DECODE_SLOTS) == 0
+    for a, b in zip(got, want):
+        assert a.shape == b.shape and a.dtype == b.dtype and torch.isfinite(a).all()
+        torch.testing.assert_close(a.float(), b.float(), rtol = 2e-2, atol = 2e-2 * b.abs().max().item())
+
+
+@needs_cuda
+@pytest.mark.parametrize("mode", ["1", "dequant"])
+def test_training_step_matches_across_fused_and_dequant(monkeypatch, mode):
+    """The fused decode-in-GEMM and the dense-stack path give the same loss and LoRA grads (bf16 rounding)."""
+    if not mu._check_torch_grouped_mm_supported():
+        pytest.skip("no torch._grouped_mm on this device")
+    packed_model, _ = _peft_pair("cuda")
+    x, idx, w = _route("cuda")
+    results = {}
+    for arm in ("dequant", mode):
+        monkeypatch.setenv("UNSLOTH_MXFP4_FUSED_GEMM", arm)
+        packed_model.zero_grad(set_to_none = True)
+        results[arm] = _train_step(packed_model, x, idx, w, checkpoint = False)
+    (a, ga), (b, gb) = results["dequant"], results[mode]
+    torch.testing.assert_close(b.float(), a.float(), rtol = 2e-2, atol = 2e-2 * a.abs().max().item())
+    assert ga.keys() == gb.keys() and "x" in ga and len(ga) > 1
+    for name in ga:
+        torch.testing.assert_close(gb[name], ga[name], rtol = 3e-2, atol = 3e-2 * ga[name].abs().max().item() + 1e-6)
