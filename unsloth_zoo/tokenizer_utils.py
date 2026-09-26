@@ -283,6 +283,40 @@ def _requires_arguments(method):
 pass
 
 
+_LANGUAGE_CORE_NAMES = frozenset(("language_model", "thinker", "text_model"))
+
+
+def _get_embedding_modules(model):
+    """(input embeddings, lm_head) through headless wrappers (Nemotron-3-Nano-Omni); only arg-requiring or NotImplementedError accessors read as None."""
+    def _own(module, name):
+        getter = getattr(module, name, None)
+        if not callable(getter): return None
+        if _requires_arguments(getter): return None
+        try: return getter()
+        except NotImplementedError: return None
+    embeddings = _own(model, "get_input_embeddings")
+    lm_head    = _own(model, "get_output_embeddings")
+    if lm_head is None:
+        candidates = []
+        for name, module in model.named_modules():
+            if module is model: continue
+            nested_head = _own(module, "get_output_embeddings")
+            if nested_head is None: continue
+            candidates.append((name, nested_head, _own(module, "get_input_embeddings")))
+        # Prefer the head beside the top-level embeddings: first-registered may be a vision decoder (silently corrupted).
+        for _, nested_head, nested_embeddings in candidates:
+            if embeddings is not None and nested_embeddings is embeddings:
+                return embeddings, nested_head
+        # Several heads (Qwen3-Omni: thinker, talker.code_predictor): only a language-model name disambiguates, else skip.
+        if len(candidates) > 1:
+            candidates = [c for c in candidates if c[0].rsplit(".", 1)[-1] in _LANGUAGE_CORE_NAMES]
+        if len(candidates) == 1:
+            _, lm_head, nested_embeddings = candidates[0]
+            if nested_embeddings is not None: embeddings = nested_embeddings
+    return embeddings, lm_head
+pass
+
+
 @_maybe_inference_mode
 def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAMES = [], eps = 1e-16):
     """
@@ -294,22 +328,9 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
     # say so: transformers' base get_input_embeddings raises NotImplementedError
     # for composite models (Qwen3-Omni), and remote code can declare a signature
     # that cannot be called (stepfun-ai/Step-3.7-Flash).
-    try:
-        # Each accessor judged before its own call: a TypeError from inside a
-        # callable one must never be read as an accessor we could not call.
-        if _requires_arguments(model.get_input_embeddings):
-            raise NotImplementedError("input embedding accessor requires arguments")
-        input_embeddings  = model.get_input_embeddings ()
-        if _requires_arguments(model.get_output_embeddings):
-            raise NotImplementedError("output embedding accessor requires arguments")
-        output_embeddings = model.get_output_embeddings()
-        # None is a legitimate "I have none", and `.weight` on it is an
-        # AttributeError several frames from the cause.
-        if input_embeddings is None or output_embeddings is None:
-            raise NotImplementedError("no input or output embeddings")
-        embedding_matrix = input_embeddings.weight
-        lm_head_matrix   = output_embeddings.weight
-    except NotImplementedError:
+    embeddings, lm_head = _get_embedding_modules(model)
+    if embeddings is None or lm_head is None or \
+        getattr(embeddings, "weight", None) is None or getattr(lm_head, "weight", None) is None:
         # Warning, not info: the logger sits at WARNING by default and this run
         # just lost the NaN guard.
         logger.warning(
@@ -318,6 +339,8 @@ def fix_untrained_tokens(model, tokenizer, train_dataset, IGNORED_TOKENIZER_NAME
             f"embedding."
         )
         return
+    embedding_matrix = embeddings.weight
+    lm_head_matrix   = lm_head.weight
     chat_template = getattr(tokenizer, "chat_template", None)
     tokenizer = tokenizer.tokenizer if hasattr(tokenizer, "tokenizer") else tokenizer
 
