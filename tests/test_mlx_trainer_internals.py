@@ -1306,15 +1306,53 @@ def test_norm_clip_dtype_restore_keeps_lora_and_norms_promotable():
     assert not should_restore_original_dtype("vision.blocks.0.norm1.weight")
 
 
-def test_global_norm_clip_reduces_in_float32():
-    import inspect
+@pytest.mark.parametrize("mode", ["global", "leaf"])
+@pytest.mark.parametrize("size", [64, 4096])
+def test_norm_clip_preserves_fp16_scale(mode, size):
+    import mlx.core as mx
+    import numpy as np
+    from unsloth_zoo.mlx.trainer import _clip_grad_by_leaf_norm, _clip_grad_norm_fp32
 
-    from unsloth_zoo.mlx.trainer import _clip_grad_norm_fp32, _global_grad_norm_fp32
+    grad = mx.full((size,), 60000.0, dtype=mx.float16)
+    if mode == "global":
+        clipped, norm = _clip_grad_norm_fp32({"weight": grad}, max_norm=0.01)
+        assert float(norm) == pytest.approx(60000.0 * size ** 0.5)
+    else:
+        clipped = _clip_grad_by_leaf_norm({"weight": grad}, max_grad_leaf_norm=0.01)
+    actual = clipped["weight"]
+    assert actual.dtype == mx.float16
+    expected = np.full(size, 0.01 / size ** 0.5, dtype=np.float16).astype(np.float32)
+    np.testing.assert_allclose(np.array(actual.astype(mx.float32)), expected, rtol=1e-3, atol=0)
 
-    norm_source = inspect.getsource(_global_grad_norm_fp32)
-    assert "g.astype(mx.float32)" in norm_source
-    assert "tree_reduce" in norm_source
-    assert "scale.astype(g.dtype)" in inspect.getsource(_clip_grad_norm_fp32)
+
+def test_norm_clip_keeps_small_gradients():
+    import mlx.core as mx
+    import numpy as np
+    from unsloth_zoo.mlx.trainer import _clip_grad_by_leaf_norm, _clip_grad_norm_fp32
+
+    grad = {"weight": mx.array([0.0, 0.125, -0.25], dtype=mx.float16)}
+    global_clipped, _ = _clip_grad_norm_fp32(grad, max_norm=1.0)
+    leaf_clipped = _clip_grad_by_leaf_norm(grad, max_grad_leaf_norm=1.0)
+    for clipped in (global_clipped, leaf_clipped):
+        np.testing.assert_array_equal(np.array(clipped["weight"]), np.array(grad["weight"]))
+
+
+def test_global_norm_clip_reduces_across_every_leaf():
+    """Norms 5 and 12 give global norm 13: global mode scales both by 5/13, leaf mode only the 12."""
+    import mlx.core as mx
+    import numpy as np
+    from unsloth_zoo.mlx.trainer import _clip_grad_by_leaf_norm, _clip_grad_norm_fp32
+
+    grad = {"a": mx.array([3.0, 4.0]), "b": mx.array([0.0, 12.0])}
+
+    clipped, norm = _clip_grad_norm_fp32(grad, max_norm=5.0)
+    assert float(norm) == pytest.approx(13.0)
+    np.testing.assert_allclose(np.array(clipped["a"]), [15 / 13, 20 / 13], rtol=1e-5)
+    np.testing.assert_allclose(np.array(clipped["b"]), [0.0, 60 / 13], rtol=1e-5)
+
+    leaf_clipped = _clip_grad_by_leaf_norm(grad, max_grad_leaf_norm=5.0)
+    np.testing.assert_allclose(np.array(leaf_clipped["a"]), [3.0, 4.0], rtol=1e-5)
+    np.testing.assert_allclose(np.array(leaf_clipped["b"]), [0.0, 5.0], rtol=1e-5)
 
 
 @pytest.mark.parametrize(

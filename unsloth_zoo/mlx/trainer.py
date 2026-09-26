@@ -919,8 +919,9 @@ def _clip_grad_by_leaf_norm(grad, max_grad_leaf_norm):
     def _clip_leaf_norm(g):
         g_f = g.astype(mx.float32)
         norm = mx.sqrt(mx.sum(g_f * g_f))
-        scale = mx.minimum(max_grad_leaf_norm / (norm + 1e-6), 1.0)
-        return g * scale.astype(g.dtype)
+        scale = mx.minimum(max_grad_leaf_norm / (norm + 1e-6), mx.array(1.0, dtype=mx.float32))
+        # fp16 scale can underflow though the clipped gradient is representable.
+        return (g_f * scale).astype(g.dtype)
 
     return tree_map(_clip_leaf_norm, grad)
 
@@ -1002,7 +1003,7 @@ def _clip_grad_norm_fp32(grad, max_norm):
         ),
         mx.array(1.0, dtype=mx.float32),
     )
-    return tree_map(lambda g: g * scale.astype(g.dtype), grad), total_norm
+    return tree_map(lambda g: (g.astype(mx.float32) * scale).astype(g.dtype), grad), total_norm
 
 
 def _validate_label_smoothing(value, is_vlm):
