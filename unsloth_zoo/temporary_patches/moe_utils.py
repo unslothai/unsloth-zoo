@@ -829,16 +829,17 @@ def _mxfp4_expert_layout(source, proj_type, hidden_dim, model_type, experts_modu
 
 def _mxfp4_fused_enabled(param, dtype, rows = None) -> bool:
     """Whether a packed stack runs through the fused decode-in-GEMM kernel. UNSLOTH_MXFP4_FUSED_GEMM:
-    "auto" (default) fused below UNSLOTH_MXFP4_FUSED_MAX_ROWS (256) rows per expert, where it beats
-    dequantize + cuBLAS on B200 and never allocates the dense stack; above that, cuBLAS amortises the
-    dequant and wins. "1" always fused (least memory), "dequant" never, "0" never plus the legacy decode path."""
+    "auto" (default) fused below UNSLOTH_MXFP4_FUSED_MAX_ROWS (192) rows per expert: there it is faster than,
+    or within ~3% of (checkpointed LoRA training, 128 rows), dequantize + cuBLAS on B200 and never allocates
+    the 1.6 GB dense stacks; above it cuBLAS amortises the dequant (fused +38% MoE GEMM time at 256 rows).
+    "1" always fused (least memory), "dequant" never, "0" never plus the legacy decode-slot path."""
     if dtype != torch.bfloat16 or param.device.type != "cuda":
         return False
     mode = os.environ.get("UNSLOTH_MXFP4_FUSED_GEMM", "auto")
     if mode in ("0", "dequant"):
         return False
     if mode != "1" and rows is not None:
-        limit = int(os.environ.get("UNSLOTH_MXFP4_FUSED_MAX_ROWS", "256"))
+        limit = int(os.environ.get("UNSLOTH_MXFP4_FUSED_MAX_ROWS", "192"))
         if rows >= limit * param.shape[0]:
             return False
     from unsloth_zoo.mxfp4_gemm import mxfp4_grouped_mm_available
