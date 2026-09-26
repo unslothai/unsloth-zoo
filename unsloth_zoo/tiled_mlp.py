@@ -79,6 +79,11 @@ def _default_target_gb():
             return torch.xpu.mem_get_info(0)[0] / 1024 / 1024 / 1024 * 0.5
         except Exception:
             return 4.0
+    if DEVICE_TYPE == "npu" and hasattr(torch, "npu"):
+        try:
+            return torch.npu.mem_get_info(0)[0] / 1024 / 1024 / 1024 * 0.5
+        except Exception:
+            return 4.0
     # CPU / MPS / unified-memory backends: activations live in host RAM, budget from it.
     try:
         import psutil

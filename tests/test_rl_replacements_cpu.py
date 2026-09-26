@@ -47,6 +47,25 @@ import torch
 from unsloth_zoo import rl_replacements as rr
 
 
+@pytest.mark.parametrize("difference", [-1e-3, -1e-4, 0.0, 1e-4, 1e-3])
+def test_grpo_small_kl_matches_second_order_limit(difference):
+    new = torch.full((1, 2), -1.0, requires_grad=True)
+    ref = new.detach() + difference
+    mask = torch.ones_like(new)
+    loss, _, mean_kl, *_ = rr.grpo_compute_loss(
+        ref, new, new.detach(), None, torch.zeros_like(new, dtype=torch.long),
+        mask, 1.0, torch.zeros(1),
+    )
+
+    # exp(delta) - delta - 1 = delta^2/2 + delta^3/6 + delta^4/24 + O(delta^5).
+    delta = ref.double() - new.detach().double()
+    expected = (delta.square() / 2 + delta.pow(3) / 6 + delta.pow(4) / 24).mean()
+    torch.testing.assert_close(loss.double(), expected, rtol=1e-3, atol=1e-12)
+    torch.testing.assert_close(mean_kl.double(), expected, rtol=1e-3, atol=1e-12)
+    loss.backward()
+    torch.testing.assert_close(new.grad.double(), -torch.expm1(delta) / new.numel(), rtol=1e-3, atol=1e-7)
+
+
 def test_calculate_pad_tokens_in_prompt_counts_left_pads():
     PAD = 0
     # batch=2, seq_len=6, logits_to_keep=3 -> prompt_section is the
@@ -475,6 +494,40 @@ def test_efficient_grpo_single_chunk_matches_naive(loss_type, disable_dynamo):
     ), f"{loss_type}: gradient mismatch"
 
 
+@pytest.mark.parametrize("loss_type", ["dapo", "cispo", "vespo"])
+@pytest.mark.parametrize("items", [0.0, torch.tensor(0.0)], ids=["python", "tensor"])
+def test_grpo_generation_normalizer_survives_an_empty_batch(loss_type, items):
+    """A fully masked generation batch (count 0) must contribute 0, not nan."""
+    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture(loss_type)
+    mask = torch.zeros_like(mask)
+    kwargs["num_items_in_batch"] = items
+
+    new = new.clone().requires_grad_(True)
+    loss = rr.grpo_compute_loss(ref, new, old, None, input_ids, mask, 0.0, advantages, **kwargs)[0]
+    assert torch.isfinite(loss), f"{loss_type}: loss is {loss.item()}"
+    assert loss.item() == 0.0
+    loss.backward()
+    assert torch.isfinite(new.grad).all(), f"{loss_type}: gradient is not finite"
+
+
+@pytest.mark.parametrize("loss_type", ["dapo", "cispo", "vespo"])
+def test_grpo_generation_normalizer_unchanged_on_a_normal_batch(loss_type):
+    """The floor must only bite at 0: a real token count still divides the sum as before."""
+    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture(loss_type)
+    new = new.clone().requires_grad_(True)
+    loss = rr.grpo_compute_loss(ref, new, old, None, input_ids, mask, 0.04, advantages, **kwargs)[0]
+
+    expected_denominator = max(float(kwargs["num_items_in_batch"]), 1.0) / kwargs["num_processes"]
+    assert expected_denominator > 1.0
+    torch.testing.assert_close(
+        loss * expected_denominator,
+        rr.grpo_compute_loss(
+            ref, new, old, None, input_ids, mask, 0.04, advantages,
+            **{**kwargs, "num_items_in_batch": 1.0},
+        )[0],
+    )
+
+
 # Per TRL _compute_loss (main @ f782735): kl_i *= the pre-clamp non-detached coef_1,
 # before the loss_type dispatch, feeding both the beta term and the kl metric.
 
@@ -555,6 +608,108 @@ def test_bias_correction_kl_is_not_scaled_by_the_vllm_ratio(mode, use_bias_corre
     assert torch.allclose(loss.detach(), loss_trl.detach(), atol=1e-10, rtol=1e-8)
     assert torch.allclose(mean_kl.detach(), mean_kl_trl.detach(), atol=1e-10, rtol=1e-8)
     assert torch.allclose(new_ours.grad, new_trl.grad, atol=1e-10, rtol=1e-8)
+
+
+@pytest.mark.parametrize(
+    "mode", ["token_mask", "token_truncate", "sequence_mask", "sequence_truncate"]
+)
+def test_unscored_vllm_token_does_not_nan_the_loss(mode):
+    # clamp passes nan and `nan < min` is False, so no IS mode caught an unscored token.
+    beta = 0.04
+    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("grpo")
+    sampling = old - 0.01
+    kwargs.update(
+        use_vllm=True,
+        vllm_importance_sampling_correction=True,
+        vllm_importance_sampling_mode=mode,
+        vllm_importance_sampling_clip_min=0.0,
+        vllm_importance_sampling_clip_max=3.0,
+    )
+
+    new_clean = new.clone().requires_grad_(True)
+    clean_loss = rr.grpo_compute_loss(
+        ref, new_clean, old, sampling.clone(), input_ids, mask, beta, advantages, **kwargs
+    )[0]
+    clean_loss.backward()
+
+    unscored = sampling.clone()
+    unscored[0, 2] = float("nan")
+    new_nan = new.clone().requires_grad_(True)
+    nan_loss = rr.grpo_compute_loss(
+        ref, new_nan, old, unscored, input_ids, mask, beta, advantages, **kwargs
+    )[0]
+    nan_loss.backward()
+
+    assert torch.isfinite(nan_loss), f"{mode}: one unscored token made the loss {nan_loss.item()}"
+    assert torch.isfinite(new_nan.grad).all(), f"{mode}: gradient is not finite"
+
+    assert torch.allclose(new_nan.grad[1:], new_clean.grad[1:], atol=1e-12, rtol=1e-10)
+
+
+def test_unscored_vllm_token_is_neutral_not_dropped():
+    # A zero ratio would drop the token from the policy term; TRL applies no correction instead.
+    beta = 0.0
+    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("grpo")
+    sampling = old.clone()
+    sampling[0, 2] = float("nan")
+    kwargs.update(
+        use_vllm=True,
+        vllm_importance_sampling_correction=True,
+        vllm_importance_sampling_mode="token_truncate",
+        vllm_importance_sampling_clip_min=0.0,
+        vllm_importance_sampling_clip_max=3.0,
+    )
+
+    new_vllm = new.clone().requires_grad_(True)
+    loss_vllm = rr.grpo_compute_loss(
+        ref, new_vllm, old, sampling, input_ids, mask, beta, advantages, **kwargs
+    )[0]
+
+    new_plain = new.clone().requires_grad_(True)
+    plain_kwargs = dict(kwargs)
+    plain_kwargs["use_vllm"] = False
+    plain_kwargs["vllm_importance_sampling_correction"] = False
+    loss_plain = rr.grpo_compute_loss(
+        ref, new_plain, old, None, input_ids, mask, beta, advantages, **plain_kwargs
+    )[0]
+
+    assert torch.allclose(loss_vllm, loss_plain, atol=1e-12, rtol=1e-10)
+
+
+@pytest.mark.parametrize(
+    "mode", ["token_mask", "token_truncate", "sequence_mask", "sequence_truncate"]
+)
+def test_unscored_vllm_token_keeps_the_logged_metrics_finite(mode):
+    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("grpo")
+    sampling = old - 0.01 * torch.arange(1, old.numel() + 1, dtype=old.dtype).reshape(old.shape)
+    kwargs.update(
+        use_vllm=True,
+        vllm_importance_sampling_correction=True,
+        vllm_importance_sampling_mode=mode,
+        vllm_importance_sampling_clip_min=0.0,
+        vllm_importance_sampling_clip_max=3.0,
+    )
+    clean_delta = rr.grpo_compute_loss(
+        ref, new, old, sampling, input_ids, mask, 0.04, advantages, **kwargs
+    )[3]
+
+    i, j = divmod(int(clean_delta.argmax()), clean_delta.shape[1])
+    unscored = sampling.clone()
+    unscored[i, j] = float("nan")
+    # nan * 0 is still nan, so a padding token counts too.
+    pad_i, pad_j = (mask == 0).nonzero()[0].tolist()
+    unscored[pad_i, pad_j] = float("nan")
+    _, _, _, delta, flat_is_ratio, _, _ = rr.grpo_compute_loss(
+        ref, new, old, unscored, input_ids, mask, 0.04, advantages, **kwargs
+    )
+
+    assert torch.isfinite(delta).all(), f"{mode}: delta carries {delta.isnan().sum()} nan"
+    assert torch.isfinite(flat_is_ratio).all(), f"{mode}: IS ratio metric is not finite"
+    expected = clean_delta.clone()
+    expected[i, j] = 0.0
+    assert delta.shape == clean_delta.shape
+    assert torch.equal(delta, expected)
+    assert torch.max(delta) < torch.max(clean_delta)
 
 
 @pytest.mark.parametrize("importance_sampling_level", ["token", "sequence"])
@@ -1176,3 +1331,63 @@ def test_sampling_logps_gated_on_actual_consumer():
     assert 'getattr(trainer.args,"off_policy_mask_threshold",None)isnotNone' in flat
     # The gate must actually condition the read (not keep sampling unconditionally).
     assert 'kwargs.get("sampling_per_token_logps",None)if_sampling_logps_usedelseNone' in flat
+
+
+def _luspo_reference(ref, new, old, mask, advantages, beta, level):
+    """TRL 1.13.0 GRPOTrainer._compute_loss for loss_type="luspo", in float64."""
+    log_ratio = new - old
+    if level == "sequence":
+        log_ratio = (log_ratio * mask).sum(-1, keepdim=True) / mask.sum(-1, keepdim=True).clamp(min=1.0)
+    coef_1 = torch.exp(log_ratio)
+    coef_2 = coef_1.clamp(1 - 0.2, 1 + 0.2)
+    per_token = -torch.min(coef_1 * advantages, coef_2 * advantages)
+    if beta != 0.0:
+        per_token = per_token + beta * (torch.expm1(ref - new) - (ref - new))
+    return (per_token * mask).sum(-1).mean()
+
+
+@pytest.mark.parametrize("level", ["token", "sequence"])
+@pytest.mark.parametrize("beta", [0.0, 0.04])
+def test_luspo_matches_trl_aggregation(level, beta, disable_dynamo):
+    # `loss_i * mask.sum(1)` only equals TRL when loss_i is (B, 1); token level or beta > 0 make it (B, T).
+    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("luspo")
+    kwargs["importance_sampling_level"] = level
+
+    loss, *_ = rr.grpo_compute_loss(
+        ref, new, old, None, input_ids, mask, beta, advantages, **kwargs
+    )
+    expected = _luspo_reference(ref, new, old, mask, advantages.unsqueeze(1), beta, level)
+    assert torch.allclose(loss.double(), expected, atol=1e-12, rtol=0), (
+        f"luspo {level} level, beta {beta}: got {loss.item()}, TRL gives {expected.item()}"
+    )
+
+
+@pytest.mark.parametrize("level", ["token", "sequence"])
+@pytest.mark.parametrize("beta", [0.0, 0.04])
+def test_luspo_ignores_fully_masked_columns(level, beta, disable_dynamo):
+    # Padding a batch out to a longer completion length must not move the loss.
+    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("luspo")
+    kwargs["importance_sampling_level"] = level
+    loss, *_ = rr.grpo_compute_loss(
+        ref, new, old, None, input_ids, mask, beta, advantages, **kwargs
+    )
+
+    pad = 4
+    B = mask.shape[0]
+    tail = torch.randn(B, pad, dtype=new.dtype)
+    padded = dict(kwargs)
+    padded["max_completion_length"] = mask.shape[1] + pad
+    loss_padded, *_ = rr.grpo_compute_loss(
+        torch.cat([ref, tail], 1),
+        torch.cat([new, tail], 1),
+        torch.cat([old, tail], 1),
+        None,
+        torch.cat([input_ids, torch.zeros(B, pad, dtype=input_ids.dtype)], 1),
+        torch.cat([mask, torch.zeros(B, pad, dtype=mask.dtype)], 1),
+        beta,
+        advantages,
+        **padded,
+    )
+    assert torch.allclose(loss.double(), loss_padded.double(), atol=1e-12, rtol=0), (
+        f"luspo {level} level, beta {beta}: padding moved the loss from {loss.item()} to {loss_padded.item()}"
+    )

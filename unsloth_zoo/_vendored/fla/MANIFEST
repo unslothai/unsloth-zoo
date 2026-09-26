@@ -17,6 +17,8 @@ exported_api =
     fla.modules.FusedRMSNormGated
     fla.ops.gated_delta_rule.chunk_gated_delta_rule
     fla.ops.gated_delta_rule.fused_recurrent_gated_delta_rule
+    fla.ops.simple_gla.chunk.chunk_simple_gla
+    fla.ops.simple_gla.fused_recurrent.fused_recurrent_simple_gla
 
 modifications =
     - Narrowed package __init__ exports for fla, fla.ops, fla.modules and
@@ -62,6 +64,15 @@ modifications =
           miscompiled tile. The probe uses compute capability 9, not
           ``check_shared_mem('hopper')``, which is a >=232448-byte shared-memory
           tier test that Blackwell B200 also passes.
+    - Added the fla.ops.simple_gla closure for remote-code lightning-attention
+      models that import it directly (inclusionAI Ling 2.5 / 2.6,
+      BailingMoeV2_5: `from fla.ops.simple_gla.chunk import chunk_simple_gla`,
+      `from fla.ops.simple_gla.fused_recurrent import fused_recurrent_simple_gla`):
+      ops/simple_gla/{chunk,fused_recurrent}.py and ops/common/{chunk_h,
+      fused_recurrent}.py verbatim from fla-core 0.5.1. ops/simple_gla/__init__.py
+      is narrowed to those two entry points (upstream also imports fused_chunk and
+      parallel, whose closures are not vendored). The backward reuses the vendored
+      ops/common/chunk_o.py, so it keeps the Hopper chunk_bwd_dqkwg fix above.
     - Dropped fla/ops/gated_delta_rule/naive.py (the only einops dependency; the
       reference implementation is unused on the fast path).
     - Dropped the three heavy tilelang kernel files
@@ -70,8 +81,9 @@ modifications =
       its lazy imports of those files execute only when the optional `tilelang`
       package is installed and its backend is selected (not the default path).
 
-file_count = 42 python modules + this MANIFEST + LICENSE
-closure_measured = 43 python modules (includes naive.py); vendored set drops
-    naive.py, leaving 42.
+file_count = 47 python modules + this MANIFEST + LICENSE
+closure_measured = 43 python modules for gated_delta_rule (includes naive.py);
+    vendored set drops naive.py, leaving 42, plus 5 for simple_gla (its __init__,
+    chunk.py, fused_recurrent.py, common/chunk_h.py, common/fused_recurrent.py).
 
 vendored_by = Unsloth (unsloth_zoo/_vendored/fla)

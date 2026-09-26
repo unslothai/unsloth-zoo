@@ -283,6 +283,14 @@ def get_chat_template_parts(tokenizer):
     tail = lambda s: s[s.rfind(U) + len(U):] if U in s else ""
     _gen_on, _gen_off = render(end_user, True), render(end_user, False)
     asst_header = "" if _gen_on == _gen_off else strip_shared(tail(_gen_on), tail(_gen_off))[0]
+    user_term = tail(_gen_off)
+    _rest = user_term
+    while _rest:
+        _t = next((s for s in specials if _rest.startswith(s)), None) or \
+             (re.match(r"\s+", _rest) and re.match(r"\s+", _rest).group())
+        if not _t: break
+        _rest = _rest[len(_t):]
+    if _rest: user_term = ""
 
     if asst_header and resp_gap.endswith(asst_header) and len(asst_header) < len(resp_gap):
         # Header template (Llama/Gemma/Qwen/Phi-4): terminator is the resp_gap prefix
@@ -301,6 +309,19 @@ def get_chat_template_parts(tokenizer):
         # empty prefixes, so an unset eos never strips a bare "\n".
         response_part    = strip_lead(resp_gap, " ", "\t", eos, bos)
         instruction_part = strip_lead(instr_gap, " ", "\t", eos, bos)
+
+    # Command A Vision splits the terminator with an image: "<|END_TEXT|><|IMG_PATCH|><|END_OF_TURN_TOKEN|>".
+    if user_term and response_part.startswith(user_term) and len(user_term) < len(response_part):
+        try:
+            with_image = render([
+                {"role": "user", "content": [{"type": "text", "text": U}, {"type": "image"}]},
+                {"role": "assistant", "content": awrap(A)},
+            ], False)
+            if response_part not in with_image and response_part[len(user_term):] in with_image:
+                response_part = response_part[len(user_term):]
+                instruction_part = strip_lead(instruction_part, user_term)
+        except Exception:
+            pass
 
     # Reasoning templates inject thinking-block scaffolding into the generation prompt
     # that a real assistant turn ("<think>...</think>answer") does not carry right after
