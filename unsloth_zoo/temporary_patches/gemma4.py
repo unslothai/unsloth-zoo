@@ -16,6 +16,7 @@
 
 import ast
 import contextlib
+import functools
 import inspect
 import linecache
 import sys
@@ -338,6 +339,7 @@ class _Gemma4SharedKVCarrier:
 def _make_gemma4_attention_carrier_forward(_orig_attn_forward):
     """Feed the carrier to attention as past_key_values when the real one is None
     (use_cache=False or nulled by GC). Pass-through otherwise -> no-op when unused."""
+    @functools.wraps(_orig_attn_forward)
     def forward(self, *args, **kwargs):
         carrier = getattr(self, "_unsloth_shared_kv_carrier", None)
         if carrier is not None:
@@ -352,8 +354,6 @@ def _make_gemma4_attention_carrier_forward(_orig_attn_forward):
                 kwargs["past_key_values"] = carrier
         return _orig_attn_forward(self, *args, **kwargs)
     forward._unsloth_gemma4_carrier_patched = True
-    forward.__qualname__ = getattr(_orig_attn_forward, "__qualname__", "forward")
-    forward.__doc__ = getattr(_orig_attn_forward, "__doc__", None)
     return forward
 
 
