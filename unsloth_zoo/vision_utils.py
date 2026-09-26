@@ -1391,12 +1391,11 @@ class UnslothVisionDataCollator:
 
     def __call__(self, examples):
         batch = self._collate(examples)
-        # Both data formats must apply response-only masking after building labels.
         response_masker = getattr(self, "train_on_responses_only", None)
         if response_masker:
             labels = batch["labels"]
             response_labels = response_masker(batch)["labels"]
-            # Only add exclusions; preserve completion/media masks and ignore_index.
+            # Masker writes -100; only add exclusions, in this collator's ignore_index.
             labels.masked_fill_(
                 response_labels.eq(-100).to(device = labels.device), self.ignore_index,
             )
