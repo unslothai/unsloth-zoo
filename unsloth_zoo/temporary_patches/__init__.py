@@ -35,6 +35,7 @@ from .glm4_moe import *
 from .deepseek_v3_moe import *
 from .gemma4_moe import *
 from .lfm2_moe import *
+from .step3p7_moe import *
 from .mixtral_moe import *
 from .llama4_moe import *
 from .inkling import *
