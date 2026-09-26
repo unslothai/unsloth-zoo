@@ -1417,10 +1417,42 @@ def patch_gpt_oss_bnb4bit():
     m.transformers_version = transformers_version
     m.Version              = Version
 
+    _rebind_gpt_oss_compiled_classes()
     return True
 
 
 pass
+
+
+def _gpt_oss_class_is_bnb4bit(cls):
+    # A BnB router (compiled or not) builds `self.linear`; stock builds `self.weight`.
+    if cls is GptOssExpertsBnb4bit:
+        return True
+    init = getattr(cls, "__init__", None)
+    return "linear" in getattr(getattr(init, "__code__", None), "co_names", ())
+
+
+def _rebind_gpt_oss_compiled_classes():
+    # The compiler runs once per process, so its module keeps the first load's flavor of these classes.
+    try:
+        import transformers.models.gpt_oss.modeling_gpt_oss as modeling
+    except Exception:
+        return
+    want_bnb = modeling.GptOssExperts is GptOssExpertsBnb4bit
+    seen = set()
+    for cls in list(vars(modeling).values()):
+        if not isinstance(cls, type):
+            continue
+        for fn in vars(cls).values():
+            g = getattr(fn, "__globals__", None)
+            if g is None or id(g) in seen:
+                continue
+            seen.add(id(g))
+            if not str(g.get("__name__", "")).startswith("unsloth_compiled_module_gpt_oss"):
+                continue
+            for name in ("GptOssExperts", "GptOssTopKRouter"):
+                if isinstance(g.get(name), type) and _gpt_oss_class_is_bnb4bit(g[name]) != want_bnb:
+                    g[name] = getattr(modeling, name)
 
 
 def restore_gpt_oss_original():
@@ -1435,6 +1467,7 @@ def restore_gpt_oss_original():
             transformers.models.gpt_oss.modeling_gpt_oss.GptOssTopKRouter = \
                 transformers.models.gpt_oss.modeling_gpt_oss._original_GptOssTopKRouter
             logger.info("Unsloth: Restored original GPT OSS classes")
+            _rebind_gpt_oss_compiled_classes()
             return True
     except Exception:
         pass
@@ -1699,12 +1732,13 @@ def patch_gpt_oss_bnb4bit_auto():
         _sync_gpt_oss_compiled_flavor("bnb4bit" if _should_use_gpt_oss_bnb4bit() else "stock")
 
     if not _should_use_gpt_oss_bnb4bit():
-        # The BnB patch swaps GptOssTopKRouter/GptOssExperts globally. A stale "_load_in_4bit_"
-        # in UNSLOTH_MODEL_NAME (inherited across a save->reload subprocess) would leave the BnB
-        # classes installed when later loading a 16bit checkpoint, whose router.weight + 3D
-        # experts then mismatch ("weights not initialized"). Restore the stock classes when this
-        # load is not BnB-4bit. The compiled-module file is handled by _sync above.
-        if os.environ.get("UNSLOTH_GPT_OSS_BNB4BIT_PATCHED", "0") == "1":
+        # Check the installed class too: the env flag can be cleared or inherited independently of it.
+        try:
+            import transformers.models.gpt_oss.modeling_gpt_oss as _modeling
+            _installed = _modeling.GptOssExperts is GptOssExpertsBnb4bit
+        except Exception:
+            _installed = False
+        if _installed or os.environ.get("UNSLOTH_GPT_OSS_BNB4BIT_PATCHED", "0") == "1":
             restore_gpt_oss_original()
             os.environ["UNSLOTH_GPT_OSS_BNB4BIT_PATCHED"] = "0"
         return
