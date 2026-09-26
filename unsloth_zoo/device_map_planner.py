@@ -1143,6 +1143,53 @@ def _tower_blocks(model: nn.Module, tower: str, no_split_classes: Sequence[str])
     return blocks
 
 
+def _anchor_excluded(model: nn.Module, tower: str, no_split_classes: Sequence[str]) -> tuple[str, ...]:
+    """Everything a split tower may spread: blocks after the first and the children defined after them (mergers)."""
+    blocks = _tower_blocks(model, tower, no_split_classes)
+    if not blocks:
+        return ()
+    children = [f"{tower}.{n}" for n, _ in _module_by_name(model, tower).named_children()]
+    first = next((i for i, c in enumerate(children) if blocks[0] == c or blocks[0].startswith(c + ".")), None)
+    after = children[first + 1:] if first is not None else []
+    return tuple(blocks[1:]) + tuple(c for c in after if not any(b.startswith(c + ".") or b == c for b in blocks))
+
+
+def attach_tower_input_hooks(model: nn.Module) -> list[str]:
+    """Move each split tower's inputs to its first parameter's device; returns the towers hooked.
+
+    A tower split across cards has no hook on its root, and Qwen3-VL's forward multiplies the
+    ``pos_embed`` output by weights built on ``grid_thw``'s device before any child hook runs.
+    Only inputs move (no weights), towers already hooked are left alone, and nothing here raises.
+    """
+    try:
+        device_map = getattr(model, "hf_device_map", None)
+        if not isinstance(device_map, dict) or len(set(map(str, device_map.values()))) < 2:
+            return []
+        from accelerate.hooks import ModelHook, add_hook_to_module
+        from accelerate.utils import send_to_device
+
+        class _MoveTowerInputs(ModelHook):
+            def __init__(self, device):
+                self.device = device
+
+            def pre_forward(self, module, *args, **kwargs):
+                return send_to_device(args, self.device), send_to_device(kwargs, self.device)
+
+        hooked = []
+        for name in _sub_model_towers(model):
+            tower = _module_by_name(model, name)
+            if hasattr(tower, "_hf_hook"):
+                continue
+            devices = {p.device for p in tower.parameters()}
+            if len(devices) < 2:
+                continue
+            add_hook_to_module(tower, _MoveTowerInputs(next(tower.parameters()).device))
+            hooked.append(name)
+        return hooked
+    except Exception:
+        return []
+
+
 def _usable_devices(max_memory: Mapping[Any, Any] | None) -> list[int]:
     if max_memory is not None:
         devs = sorted(int(k) for k in max_memory if isinstance(k, int) or str(k).isdigit())
@@ -1244,7 +1291,7 @@ def plan_device_map(
             return plan_device_map(model, **call, _colocate = ())
         whole = [(t, ()) for t in towers]
         no_split = resolve_no_split_classes(model)
-        anchored = [(t, tuple(_tower_blocks(model, t, no_split)[1:])) for t in towers]
+        anchored = [(t, _anchor_excluded(model, t, no_split)) for t in towers]
         steps = [
             (whole, "placed whole on one device"),
             (anchored, "split at its blocks; the parts outside them stay with its first block"),
