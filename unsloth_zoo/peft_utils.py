@@ -90,6 +90,7 @@ SKIP_QUANTIZATION_MODULES = [
     "router",                   # MoE Router
     "mlp.gate",                 # MoE Router
     "block_sparse_moe.gate",    # MoE Router
+    "moe.gate",                 # MoE Router (Step-3.7 reads its weight directly)
     'mamba',
     "audio_tower",              # Gemma3N audio encoder conformer
     "vision_tower",             # Gemma3 vision encoder (SigLIP)
@@ -553,6 +554,9 @@ def requires_grad_for_gradient_checkpointing(model):
                         break
                     elif re.search(r"for [^\s]{3,} in self\." + module_list, forward) is not None:
                         # Might have failed finding self.layers: like self.layers[...]:
+                        final_where = j
+                        break
+                    elif re.search(r"for [^\n:]+ in enumerate\(self\." + module_list + r"\b", forward) is not None:
                         final_where = j
                         break
                     pass

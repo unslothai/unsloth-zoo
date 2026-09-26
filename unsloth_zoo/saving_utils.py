@@ -3473,6 +3473,108 @@ def is_hf_sharded_safetensors(filenames: list[str]) -> bool:
     prefixes, _, totals = zip(*parsed)
     return len(set(prefixes)) == 1 and len(set(totals)) == 1
 
+def _loaded_with_trust_remote_code(model):
+    return _find_load_marker(model, "_unsloth_trust_remote_code") is True
+pass
+
+
+def _find_load_marker(model, attr):
+    seen, queue = set(), [model]
+    while queue and len(seen) < 8:
+        node = queue.pop(0)
+        if node is None or id(node) in seen: continue
+        seen.add(id(node))
+        value = getattr(node, attr, None)
+        if value is not None and value is not False: return value
+        queue.extend(getattr(node, a, None) for a in ("base_model", "model"))
+    return None
+pass
+
+
+def _trusted_code_commit(model):
+    # Stamped marker first: under text_only the nested config carries no _commit_hash.
+    commit = _find_load_marker(model, "_unsloth_trust_remote_code_commit")
+    if commit is None:
+        commit = getattr(getattr(model, "config", None), "_commit_hash", None)
+    return commit if isinstance(commit, str) and commit else None
+pass
+
+
+def _is_export_source_loaded_repo(model_name, model):
+    loaded = getattr(getattr(model, "config", None), "_name_or_path", None)
+    if not isinstance(loaded, str) or not isinstance(model_name, str): return False
+    if os.path.isdir(model_name) or os.path.isdir(loaded):
+        try: return os.path.samefile(model_name, loaded)
+        except OSError: return False
+    return model_name == loaded
+pass
+
+
+def _read_export_base_config(model_name, token, model, source_is_loaded_repo = False):
+    # Repo code re-runs only for the exact repo (and Hub commit) the load trusted; siblings were never approved.
+    from transformers import AutoConfig
+    try:
+        return AutoConfig.from_pretrained(model_name, token = token, trust_remote_code = False)
+    except Exception:
+        if not (source_is_loaded_repo and _loaded_with_trust_remote_code(model)): raise
+        commit = None if os.path.isdir(model_name) else _trusted_code_commit(model)
+        if commit is None and not os.path.isdir(model_name): raise
+    # No code_revision: transformers pins code to `revision` only when it lives in this repo, not cross-repo auto_map.
+    return AutoConfig.from_pretrained(model_name, token = token, trust_remote_code = True, revision = commit)
+pass
+
+
+def _is_remote_code_config(config):
+    module = getattr(type(config), "__module__", None)
+    return isinstance(module, str) and module.startswith("transformers_modules")
+pass
+
+
+def _copy_remote_code_files(model_name, save_directory, token = None, revision = None):
+    os.makedirs(save_directory, exist_ok = True)
+    copied = []
+    if os.path.isdir(model_name):
+        for name in sorted(os.listdir(model_name)):
+            src = os.path.join(model_name, name)
+            if not name.endswith(".py") or not os.path.isfile(src): continue
+            dst = os.path.join(save_directory, name)
+            if os.path.exists(dst) and os.path.samefile(src, dst): continue
+            shutil.copyfile(src, dst)
+            copied.append(name)
+        return copied
+    from huggingface_hub import HfApi, hf_hub_download
+    for name in sorted(HfApi().list_repo_files(model_name, token = token, revision = revision)):
+        if not name.endswith(".py") or "/" in name: continue
+        path = hf_hub_download(model_name, name, token = token, revision = revision)
+        shutil.copyfile(path, os.path.join(save_directory, name))
+        copied.append(name)
+    return copied
+pass
+
+
+def _copy_export_remote_code(model_name, save_directory, token, model):
+    if not _is_export_source_loaded_repo(model_name, model):
+        warnings.warn(
+            f"Unsloth: `{model_name}` is not the repo the model was loaded from, so its repo code was not "
+            f"copied into the export. Copy the loaded repo's *.py files into `{save_directory}` before "
+            f"loading it with trust_remote_code=True."
+        )
+        return []
+    commit = None if os.path.isdir(model_name) else _trusted_code_commit(model)
+    if not os.path.isdir(model_name) and commit is None:
+        warnings.warn(
+            f"Unsloth: `{model_name}` was loaded without a recorded commit, so its repo code was "
+            f"not copied into the export. Copy the repo's *.py files at the revision you loaded "
+            f"into `{save_directory}` before loading it with trust_remote_code=True."
+        )
+        return []
+    copied = _copy_remote_code_files(model_name, save_directory, token = token, revision = commit)
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.info(f"Unsloth: copied repo code {copied} from `{model_name}` into the export.")
+    return copied
+pass
+
+
 def _text_configs(config):
     # Where a composite config keeps its text vocab. `get_text_config()` also finds sections
     # not named `text_config` (qwen2_5_omni, t5gemma); it returns `config` itself for a plain LM.
@@ -3480,6 +3582,9 @@ def _text_configs(config):
     try: holders.append(config.get_text_config())
     except Exception: pass
     holders.append(getattr(config, "text_config", None))
+    # InternVL / Nemotron-Nano-VL.
+    holders.append(getattr(config, "llm_config", None))
+    holders.append(getattr(config, "language_config", None))
     seen = []
     for holder in holders:
         if holder is not None and not any(holder is s for s in seen): seen.append(holder)
@@ -4178,12 +4283,10 @@ def merge_and_overwrite_lora(
         # while the weights come from `model_name` and keep their VLM prefixes. Saving it wrote
         # a text-only config beside VLM weights and every tensor was silently re-initialized on
         # reload (#969). Take the config from the checkpoint the weights come from, as `mxfp4` does.
-        from transformers import AutoConfig
         try:
-            base_config = AutoConfig.from_pretrained(
-                model_name,
-                token = token,
-                trust_remote_code = False,
+            base_config = _read_export_base_config(
+                model_name, token, model,
+                source_is_loaded_repo = _is_export_source_loaded_repo(model_name, model),
             )
         except Exception as base_config_error:
             warnings.warn(
@@ -4195,6 +4298,8 @@ def merge_and_overwrite_lora(
         else:
             _carry_over_vocab_size(base_config, config)
         base_config.save_pretrained(save_directory)
+        if _is_remote_code_config(base_config):
+            _copy_export_remote_code(model_name, save_directory, token, model)
         _remove_quantization_config(config_path = Path(save_directory) / "config.json")
         _remove_transformers_version(config_path = Path(save_directory) / "config.json")
         # #5410: keep trained eos / sampling defaults on reload.

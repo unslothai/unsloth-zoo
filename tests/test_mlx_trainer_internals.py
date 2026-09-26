@@ -1306,15 +1306,53 @@ def test_norm_clip_dtype_restore_keeps_lora_and_norms_promotable():
     assert not should_restore_original_dtype("vision.blocks.0.norm1.weight")
 
 
-def test_global_norm_clip_reduces_in_float32():
-    import inspect
+@pytest.mark.parametrize("mode", ["global", "leaf"])
+@pytest.mark.parametrize("size", [64, 4096])
+def test_norm_clip_preserves_fp16_scale(mode, size):
+    import mlx.core as mx
+    import numpy as np
+    from unsloth_zoo.mlx.trainer import _clip_grad_by_leaf_norm, _clip_grad_norm_fp32
 
-    from unsloth_zoo.mlx.trainer import _clip_grad_norm_fp32, _global_grad_norm_fp32
+    grad = mx.full((size,), 60000.0, dtype=mx.float16)
+    if mode == "global":
+        clipped, norm = _clip_grad_norm_fp32({"weight": grad}, max_norm=0.01)
+        assert float(norm) == pytest.approx(60000.0 * size ** 0.5)
+    else:
+        clipped = _clip_grad_by_leaf_norm({"weight": grad}, max_grad_leaf_norm=0.01)
+    actual = clipped["weight"]
+    assert actual.dtype == mx.float16
+    expected = np.full(size, 0.01 / size ** 0.5, dtype=np.float16).astype(np.float32)
+    np.testing.assert_allclose(np.array(actual.astype(mx.float32)), expected, rtol=1e-3, atol=0)
 
-    norm_source = inspect.getsource(_global_grad_norm_fp32)
-    assert "g.astype(mx.float32)" in norm_source
-    assert "tree_reduce" in norm_source
-    assert "scale.astype(g.dtype)" in inspect.getsource(_clip_grad_norm_fp32)
+
+def test_norm_clip_keeps_small_gradients():
+    import mlx.core as mx
+    import numpy as np
+    from unsloth_zoo.mlx.trainer import _clip_grad_by_leaf_norm, _clip_grad_norm_fp32
+
+    grad = {"weight": mx.array([0.0, 0.125, -0.25], dtype=mx.float16)}
+    global_clipped, _ = _clip_grad_norm_fp32(grad, max_norm=1.0)
+    leaf_clipped = _clip_grad_by_leaf_norm(grad, max_grad_leaf_norm=1.0)
+    for clipped in (global_clipped, leaf_clipped):
+        np.testing.assert_array_equal(np.array(clipped["weight"]), np.array(grad["weight"]))
+
+
+def test_global_norm_clip_reduces_across_every_leaf():
+    """Norms 5 and 12 give global norm 13: global mode scales both by 5/13, leaf mode only the 12."""
+    import mlx.core as mx
+    import numpy as np
+    from unsloth_zoo.mlx.trainer import _clip_grad_by_leaf_norm, _clip_grad_norm_fp32
+
+    grad = {"a": mx.array([3.0, 4.0]), "b": mx.array([0.0, 12.0])}
+
+    clipped, norm = _clip_grad_norm_fp32(grad, max_norm=5.0)
+    assert float(norm) == pytest.approx(13.0)
+    np.testing.assert_allclose(np.array(clipped["a"]), [15 / 13, 20 / 13], rtol=1e-5)
+    np.testing.assert_allclose(np.array(clipped["b"]), [0.0, 60 / 13], rtol=1e-5)
+
+    leaf_clipped = _clip_grad_by_leaf_norm(grad, max_grad_leaf_norm=5.0)
+    np.testing.assert_allclose(np.array(leaf_clipped["a"]), [3.0, 4.0], rtol=1e-5)
+    np.testing.assert_allclose(np.array(leaf_clipped["b"]), [0.0, 5.0], rtol=1e-5)
 
 
 @pytest.mark.parametrize(
@@ -1916,6 +1954,38 @@ def test_response_only_eval_batches_stay_a_finite_plan():
     batch = next(iter(eval_batches))
     assert batch[0][0, :4].tolist() == [110, 101, 120, 102]
     assert [label for label in batch[2][0].tolist() if label != -100] == [102]
+
+
+def test_response_only_fractional_epochs_match_transformers_step_budget():
+    # int(num_train_epochs) ran 0.5 and 1.5 epochs as one; HF: ceil(epochs * updates).
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainer, MLXTrainingConfig, _resolve_training_steps,
+        train_on_responses_only,
+    )
+
+    def run(num_train_epochs):
+        trainer = MLXTrainer(
+            _MinimalTextModel(), _StreamingTextTokenizer(),
+            [{"text": f"10 {i} 20 {i}"} for i in range(1, 6)],
+            args=MLXTrainingConfig(
+                max_steps=-1, num_train_epochs=num_train_epochs,
+                per_device_train_batch_size=2, gradient_accumulation_steps=2,
+                completion_only_loss=False, dataset_order="sequential",
+            ),
+        )
+        train_on_responses_only(trainer, instruction_part="10", response_part="20")
+        batches = trainer._batches
+        rows = sum(int(batch[1].shape[0]) for batch in batches)
+        steps = _resolve_training_steps(
+            trainer.args, batches, None,
+            includes_epochs=trainer._prepared_batches_include_epochs,
+        )
+        return rows, steps
+
+    # 5 rows at batch 2 is 3 micro-batches, so 2 updates, per pass.
+    assert run(0.5) == (4, 1)
+    assert run(1) == (5, 2)
+    assert run(1.5) == (9, 3)
 
 
 def test_length_declaring_text_stream_supports_epoch_replay():
@@ -3550,6 +3620,76 @@ def test_gemma3_training_compile_verified():
     import unsloth_zoo.mlx.compile as mc
 
     assert "gemma3" in mc._VERIFIED_TRAINING_ARCHES
+
+
+def test_gemma4_unified_training_compile_is_wired_end_to_end():
+    import unsloth_zoo.mlx.compile as mc
+
+    assert "gemma4_unified" in mc._VERIFIED_TRAINING_ARCHES
+    assert mc._TRAINING_VERIFIER_HINTS["gemma4_unified"] == "verify_gemma4_unified"
+
+    bundle = next(b for b in mc.list_compile_pattern_bundles()
+                  if b.name == "gemma4_unified_multimodal")
+    assert bundle.matcher("gemma4_unified", None)
+    assert not bundle.matcher("gemma4", None)
+    declared = {p.name for p in mc.list_compile_patch_primitives()}
+    assert set(bundle.primitive_names) <= declared
+    installers = mc._runtime_patch_primitive_installers()
+    assert "gemma4_unified_multimodal_runtime" in bundle.runtime_primitive_names
+    assert (installers["gemma4_unified_multimodal_runtime"]
+            is mc._install_gemma4_unified_compile_patches)
+
+
+@pytest.mark.parametrize("base_default", [True, False])
+def test_gemma4_unified_installer_patches_both_blockers(monkeypatch, base_default):
+    import unsloth_zoo.mlx.compile as mc
+
+    calls = []
+
+    class Model:
+        def __init__(self):
+            self._base_no_chunked_prefill = base_default
+            self.language_model = types.SimpleNamespace(
+                no_chunked_prefill=not base_default)
+            self.no_chunked_prefill = not base_default
+
+        def _update_chunked_prefill_mode(self, input_ids=None, **kwargs):
+            calls.append(input_ids)
+
+    module = types.SimpleNamespace(
+        Model=Model, _compact_prefix_rows=lambda features, valid_mask: None)
+    monkeypatch.setattr(mc, "_try_import_module", lambda name: module)
+    monkeypatch.setattr(mc, "_PATCHED_ARCHES", set())
+    monkeypatch.setattr(mc, "_PATCH_BINDINGS", set())
+    mc._install_gemma4_unified_compile_patches()
+
+    assert module._compact_prefix_rows is mc._static_shape_prefix_rows
+    assert "gemma4_unified" in mc._PATCHED_ARCHES
+
+    model = Model()
+    model.training = True
+    model._update_chunked_prefill_mode("while-training")
+    assert calls == [], "the bookkeeping must not run on the compiled training step"
+    assert model.no_chunked_prefill is base_default
+    assert model.language_model.no_chunked_prefill is base_default
+
+    model.training = False
+    model._update_chunked_prefill_mode("while-generating")
+    assert calls == ["while-generating"], "generation still needs the flag"
+
+
+def test_gemma4_unified_installer_survives_an_mlx_vlm_without_it(monkeypatch):
+    import unsloth_zoo.mlx.compile as mc
+
+    monkeypatch.setattr(mc, "_PATCHED_ARCHES", set())
+    monkeypatch.setattr(mc, "_try_import_module", lambda name: None)
+    mc._install_gemma4_unified_compile_patches()
+    assert "gemma4_unified" not in mc._PATCHED_ARCHES
+
+    module = types.SimpleNamespace(Model=type("Model", (), {}), _compact_prefix_rows=None)
+    monkeypatch.setattr(mc, "_try_import_module", lambda name: module)
+    mc._install_gemma4_unified_compile_patches()
+    assert "gemma4_unified" not in mc._PATCHED_ARCHES
 
 
 def test_compile_discovers_no_archs_under_shim():

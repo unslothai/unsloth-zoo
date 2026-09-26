@@ -4620,3 +4620,130 @@ def test_swallowed_processor_refusal_is_not_returned_as_a_half_processor(
         _test_bound_vlm_load, allow_remote_code=True,
     )
     assert trusted(tmp_path) is not None
+
+
+@pytest.mark.parametrize("optimized", [True, False])
+def test_complete_processor_runtime_uses_live_tokenizer(monkeypatch, optimized):
+    import unsloth_zoo.mlx.loader as loader
+
+    tok = types.SimpleNamespace(decode=lambda ids: "decoded")
+    processor = types.SimpleNamespace(tokenizer=tok, additional_eos_token_ids=[7])
+    detok_module = types.ModuleType("mlx_vlm.tokenizer_utils")
+    utils_module = types.ModuleType("mlx_vlm.utils")
+
+    def native(tokenizer):
+        if not optimized:
+            raise AttributeError("vocab")
+        return types.SimpleNamespace(tokenizer=tokenizer, native=True)
+
+    detok_module.load_tokenizer = lambda *a, **k: native
+    detok_module.NaiveStreamingDetokenizer = lambda t: types.SimpleNamespace(tokenizer=t, native=False)
+    utils_module.StoppingCriteria = lambda eos, t, additional_eos_token_ids=(): (eos, t, additional_eos_token_ids)
+    monkeypatch.setitem(sys.modules, "mlx_vlm.tokenizer_utils", detok_module)
+    monkeypatch.setitem(sys.modules, "mlx_vlm.utils", utils_module)
+    assert loader._complete_mlx_vlm_processor_runtime(processor, "unused", [2, 4]) is processor
+    assert processor.detokenizer.tokenizer is tok
+    assert processor.detokenizer.native is optimized
+    assert tok.stopping_criteria == ([2, 4], tok, [7])
+    detok = processor.detokenizer
+    loader._complete_mlx_vlm_processor_runtime(processor, "unused", [9])
+    assert processor.detokenizer is detok
+    assert tok.stopping_criteria[0] == [2, 4]
+
+
+def test_processor_runtime_completes_older_stopping_criteria(monkeypatch):
+    import unsloth_zoo.mlx.loader as loader
+
+    utils_module = types.ModuleType("mlx_vlm.utils")
+    utils_module.StoppingCriteria = lambda eos, t: (eos, t)
+    monkeypatch.setitem(sys.modules, "mlx_vlm.utils", utils_module)
+    tokenizer = types.SimpleNamespace(eos_token_id=7, decode=lambda ids: "")
+    processor = types.SimpleNamespace(tokenizer=tokenizer, detokenizer=object())
+    loader._complete_mlx_vlm_processor_runtime(processor, "unused")
+    assert tokenizer.stopping_criteria == (7, tokenizer)
+
+
+def test_processor_runtime_failure_names_processor_and_cause(monkeypatch):
+    import unsloth_zoo.mlx.loader as loader
+
+    class BrokenProcessor:
+        def decode(self, ids):
+            return ""
+
+    module = types.ModuleType("mlx_vlm.tokenizer_utils")
+    def broken(*args, **kwargs):
+        raise ValueError("decode is unavailable")
+    module.load_tokenizer = broken
+    module.NaiveStreamingDetokenizer = broken
+    monkeypatch.setitem(sys.modules, "mlx_vlm.tokenizer_utils", module)
+    utils_module = types.ModuleType("mlx_vlm.utils")
+    utils_module.StoppingCriteria = object
+    monkeypatch.setitem(sys.modules, "mlx_vlm.utils", utils_module)
+    with pytest.raises(ValueError, match="cannot initialize generation for BrokenProcessor.*decode is unavailable"):
+        loader._complete_mlx_vlm_processor_runtime(BrokenProcessor(), "unused")
+
+
+@pytest.mark.parametrize("same_tokenizer", [True, False])
+def test_processor_recovery_does_not_bind_runtime_to_replaced_tokenizer(same_tokenizer):
+    from unsloth_zoo.mlx.loader import _inherit_mlx_vlm_processor_runtime
+
+    old = types.SimpleNamespace(stopping_criteria=object())
+    source = types.SimpleNamespace(tokenizer=old, detokenizer=object(), chat_template="template")
+    target = types.SimpleNamespace(tokenizer=old if same_tokenizer else types.SimpleNamespace())
+    _inherit_mlx_vlm_processor_runtime(source, target)
+    assert target.chat_template == "template"
+    assert hasattr(target, "detokenizer") is same_tokenizer
+    assert hasattr(target.tokenizer, "stopping_criteria") is same_tokenizer
+
+
+@pytest.mark.parametrize("serializable", [True, False])
+def test_processor_save_serializes_components_or_names_source_fallback(tmp_path, capsys, serializable):
+    from unsloth_zoo.mlx.utils import _save_vlm_processor_assets
+
+    source, output = tmp_path / "source", tmp_path / "output"
+    source.mkdir()
+    output.mkdir()
+    (source / "processor_config.json").write_text('{"processor_class":"SourceProcessor"}')
+    class Component:
+        def to_dict(self):
+            return {"size": 32} if serializable else {"unserializable": object()}
+    class Processor:
+        def save_pretrained(self, path):
+            (Path(path) / "processor_config.json").write_text('{"truncated":')
+            raise TypeError("cannot serialize component")
+        def to_dict(self):
+            return {"processor_class": "Processor", "image_processor": Component()}
+    _save_vlm_processor_assets(Processor(), output, [source])
+    config = json.loads((output / "processor_config.json").read_text())
+    if serializable:
+        assert config == {"processor_class":"Processor", "image_processor":{"size":32}}
+    else:
+        assert config == {"processor_class":"SourceProcessor"}
+        assert "copied processor source assets: processor_config.json" in capsys.readouterr().out
+
+
+def test_processor_runtime_leaves_decodeless_processors_bare(monkeypatch):
+    import unsloth_zoo.mlx.loader as loader
+
+    module = types.ModuleType("mlx_vlm.tokenizer_utils")
+    def detokenizer(tokenizer):
+        return tokenizer.decode([0])
+    module.load_tokenizer = lambda *a, **k: detokenizer
+    module.NaiveStreamingDetokenizer = detokenizer
+    monkeypatch.setitem(sys.modules, "mlx_vlm.tokenizer_utils", module)
+    processor = types.SimpleNamespace(image_processor=object())
+    assert loader._complete_mlx_vlm_processor_runtime(processor, "unused") is processor
+    assert not hasattr(processor, "detokenizer")
+
+
+def test_clean_processor_save_does_not_invent_processor_config(tmp_path):
+    from unsloth_zoo.mlx.utils import _save_vlm_processor_assets
+
+    class Processor:
+        def save_pretrained(self, path):
+            (Path(path) / "preprocessor_config.json").write_text('{"size": 32}')
+        def to_dict(self):
+            return {"processor_class": "Processor"}
+    _save_vlm_processor_assets(Processor(), tmp_path)
+    assert (tmp_path / "preprocessor_config.json").is_file()
+    assert not (tmp_path / "processor_config.json").exists()

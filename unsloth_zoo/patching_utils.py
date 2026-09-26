@@ -891,6 +891,19 @@ class WrapRecursiveCall(ast.NodeTransformer):
         return node
 
 
+_BNB_SKIP_MATCH = '(key + "." in current_key_name_str) or (key == current_key_name_str)'
+# New keys only: 4.x saves packed the routers its matcher missed (`mlp.gate`), so suffix-matching those breaks reloads.
+_BNB_SUFFIX_MATCH_KEYS = frozenset(("moe.gate",))
+
+
+def _add_suffix_match_to_bnb_skip(source: str) -> str:
+    return source.replace(
+        _BNB_SKIP_MATCH,
+        _BNB_SKIP_MATCH + ' or (key in _BNB_SUFFIX_MATCH_KEYS and current_key_name_str.endswith("." + key))',
+        1,
+    )
+
+
 # Patch for dynamic 4bit quantization
 import inspect
 try:
@@ -912,6 +925,7 @@ if _transformers_bnb is not None and \
     exec(f"from transformers.integrations.bitsandbytes import ({x})", globals())
     if "current_key_name_str" not in source:
         raise RuntimeError("Unsloth: Patch for dynamic quantization failed since current_key_name_str does not exist.")
+    source = _add_suffix_match_to_bnb_skip(source)
 
     # Patch recursive calls to mark the parent class, so we can access it
     # when checking for conversion_mappings

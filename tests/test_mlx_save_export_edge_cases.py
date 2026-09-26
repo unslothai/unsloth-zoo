@@ -1695,19 +1695,24 @@ def test_push_to_hub_gguf_positional_token_stays_token(monkeypatch, tmp_path):
     assert calls["uploads"] == ["model.F16.gguf"]
 
 
-def test_resolve_processor_class_follows_model_remapping(monkeypatch):
+@pytest.mark.parametrize("model_type,module_type", [
+    ("ALIAS-TYPE", "hyphen-module"),
+    ("alias_type", "other_module"),
+    ("hyphen-module", "hyphen-module"),
+])
+def test_resolve_processor_class_follows_model_remapping(monkeypatch, model_type, module_type):
     import unsloth_zoo.mlx.loader as loader
 
     class RemappedProcessor:
         pass
 
     fake_vlm_utils = types.ModuleType("mlx_vlm.utils")
-    fake_vlm_utils.MODEL_REMAPPING = {"alias_type": "real_type"}
+    fake_vlm_utils.MODEL_REMAPPING = {"alias-type": "hyphen-module", "alias_type": "other_module"}
     monkeypatch.setitem(sys.modules, "mlx_vlm.utils", fake_vlm_utils)
-    fake_processing = types.ModuleType("mlx_vlm.models.real_type.processing")
+    fake_processing = types.ModuleType(f"mlx_vlm.models.{module_type}.processing")
     fake_processing.RemappedProcessor = RemappedProcessor
     monkeypatch.setitem(
-        sys.modules, "mlx_vlm.models.real_type.processing", fake_processing
+        sys.modules, f"mlx_vlm.models.{module_type}.processing", fake_processing
     )
     # The alias package does not exist in real mlx-vlm; the permissive shim
     # would auto-create it, so block those imports to mirror production.
@@ -1717,7 +1722,7 @@ def test_resolve_processor_class_follows_model_remapping(monkeypatch):
     )
 
     resolved = loader._resolve_mlx_vlm_processor_class(
-        "alias-type", "RemappedProcessor"
+        model_type, "RemappedProcessor"
     )
     assert resolved is RemappedProcessor
 

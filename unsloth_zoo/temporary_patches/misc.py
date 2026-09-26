@@ -1727,6 +1727,50 @@ pass
 TEMPORARY_PATCHES.append(patch_MllamaVisionEncoderLayer)
 
 
+def patch_GradientCheckpointingLayer_keyword_inputs():
+    # Reentrant checkpoint ignores kwargs: lift grad-requiring keyword tensors (Llama 4 / Mllama vision
+    # layers get no grad; Mllama cross-attn walks the shared vision graph twice) to positional args.
+    try:
+        from functools import partial
+        from transformers.modeling_layers import GradientCheckpointingLayer
+        from transformers.modeling_layers import logger as modeling_layers_logger
+        from unsloth_zoo.gradient_checkpointing import _KeywordArgumentCall
+    except Exception as e:
+        return raise_error("transformers.modeling_layers.GradientCheckpointingLayer", e)
+    original = GradientCheckpointingLayer.__call__
+    if getattr(original, "_unsloth_keyword_inputs", False): return
+
+    def __call__(self, *args, **kwargs):
+        if not (self.gradient_checkpointing and self.training):
+            return original(self, *args, **kwargs)
+        keys = tuple(k for k, v in kwargs.items() if torch.is_tensor(v) and v.requires_grad)
+        if not keys:
+            return original(self, *args, **kwargs)
+        message = f"Caching is incompatible with gradient checkpointing in {type(self).__name__}. Setting"
+        changed = False
+        if kwargs.get("use_cache"):
+            kwargs["use_cache"] = False
+            message += " `use_cache=False`,"
+            changed = True
+        if not getattr(self, "_can_checkpoint_with_cache", False):
+            for name in ("past_key_values", "layer_past"):
+                if kwargs.get(name) is not None:
+                    kwargs[name] = None
+                    message += f" `{name}=None`,"
+                    changed = True
+        if changed:
+            modeling_layers_logger.warning_once(message.rstrip(",") + ".")
+        constants = {k: v for k, v in kwargs.items() if k not in keys}
+        function = _KeywordArgumentCall(partial(nn.Module.__call__, self), keys, constants)
+        return self._gradient_checkpointing_func(function, *args, *(kwargs[k] for k in keys))
+    pass
+    __call__._unsloth_keyword_inputs = True
+    __call__._unsloth_original = original
+    GradientCheckpointingLayer.__call__ = __call__
+pass
+TEMPORARY_PATCHES.append(patch_GradientCheckpointingLayer_keyword_inputs)
+
+
 # Patch Siglip for forced float32 / float16 only
 def patch_SiglipEncoderLayer():
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return

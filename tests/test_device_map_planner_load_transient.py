@@ -373,7 +373,7 @@ def test_the_pretrained_helper_forwards_the_opt_out(monkeypatch):
     planner.plan_device_map_for_pretrained(
         "some/model", max_memory = {0: 1 << 30, 1: 1 << 30}, reserve_load_transient = False,
     )
-    assert seen == {"config_kwargs": {}, "reserve_load_transient": False}
+    assert seen == {"config_kwargs": {"config": None}, "reserve_load_transient": False}
 
 
 def test_ernie_vl_fuse_and_split_experts_count_as_merging():
