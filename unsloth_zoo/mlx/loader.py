@@ -8014,6 +8014,12 @@ def _finish_load(model, tokenizer):
     return model, tokenizer
 
 
+def _warn_block_swap(kwargs):
+    if kwargs.pop("block_swap_layers", 0):
+        print("Unsloth: block_swap_layers has no effect on Apple Silicon; "
+              "unified memory has no separate RAM to swap to.")
+
+
 class FastMLXModel:
     """MLX model loader for Apple Silicon.
 
@@ -8089,6 +8095,7 @@ class FastMLXModel:
         back trainable too. Freeze them again after loading if the continued
         run should train the adapters alone.
         """
+        _warn_block_swap(kwargs)
         _coerce_list_extra_special_tokens()
         _mlx_active_distributed_groups(pipeline_group, tensor_group)
 
@@ -9169,6 +9176,7 @@ class FastMLXModel:
         tower (train_vision=True) and projector (train_projector=True). No-op
         when the model was loaded with ``full_finetuning=True``.
         """
+        _warn_block_swap(kwargs)
         loftq_config = kwargs.pop("loftq_config", None)
         if loftq_config is not None:
             raise NotImplementedError(
