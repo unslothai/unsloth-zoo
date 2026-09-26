@@ -192,19 +192,21 @@ class BlockSwap:
         if freed is not None:
             self.free[block.sig].append(freed)
 
-    def _acquire(self, sig):
-        free = self.free[sig]
-        if not free:
+    def _acquire(self, block, steal):
+        free = self.free[block.sig]
+        if not free and steal:
+            # Only after an interrupted step (backward died, blocks left resident).
+            # Prefetches never steal: they could evict the block about to run.
             for b in self.blocks:
-                if b.sig == sig and b.resident and b.slot is not None:
+                if b is not block and b.sig == block.sig and b.resident and b.slot is not None:
                     self._release(b)
                     break
         return free.pop() if free else None
 
-    def _fetch(self, block):
+    def _fetch(self, block, steal = False):
         if block.resident:
             return
-        slot = self._acquire(block.sig)
+        slot = self._acquire(block, steal)
         if slot is not None:
             block.prefetch(slot)
 
@@ -218,7 +220,7 @@ class BlockSwap:
     def _pre(self, i):
         def hook(module, args):
             b = self.blocks[i]
-            self._fetch(b)
+            self._fetch(b, steal = True)
             b.wait()
             # grad on = recompute sweep, which walks layers in reverse.
             nxt = i + self.depth if not torch.is_grad_enabled() else i - self.depth
@@ -357,6 +359,9 @@ def build_host_layers(make_layer, first_idx, count, tensors, device, compute_dty
                                         compute_dtype = compute_dtype, quant_type = w.quant_type,
                                         quant_storage = w.quant_storage, device = "meta")
                 w.module = new
+                # Prequantized quant_state carries the checkpoint dtype (bf16); fp16 GPUs need the compute dtype,
+                # which patch_model_and_tokenizer already applied to the layers loaded before these.
+                w.quant_state.dtype = compute_dtype
                 new.weight = w
                 new.quant_state = w.quant_state
                 w.data = _to_pinned_host(w.data)

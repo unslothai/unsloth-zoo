@@ -200,6 +200,24 @@ def test_enter_leave_ignore_layers_on_the_card():
     assert [b.resident for b in sw.blocks] == before
 
 
+def test_interrupted_step_never_evicts_the_block_about_to_run():
+    sw = _scheduler(8, depth = 2)
+    for i in range(8):
+        with torch.no_grad():
+            sw._pre(i)(None, None)
+            sw._post(i)(None, None, None)
+    # Recompute of the top blocks starts, then backward dies: their slots stay held.
+    with torch.enable_grad():
+        sw._pre(7)(None, None)
+        sw._pre(6)(None, None)
+    assert not sw.free["a"]
+    with torch.no_grad():
+        for i in range(8):
+            sw._pre(i)(None, None)
+            assert sw.blocks[i].resident, i
+            sw._post(i)(None, None, None)
+
+
 def test_find_decoder_layers_through_common_wrappers():
     class Inner(nn.Module):
         def __init__(self):
