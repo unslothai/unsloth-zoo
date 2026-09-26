@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2023-present the Unsloth team. All rights reserved.
 
-"""unsloth_train must build its scheduler when lr_scheduler_kwargs is None (the default)."""
-
 from __future__ import annotations
 
 from types import SimpleNamespace
