@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools==80.9.0", "setuptools-scm==9.2.0"]
+requires = ["setuptools==84.0.0", "setuptools-scm==10.2.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -83,7 +83,7 @@ dependencies = [
     # at 5.5.0 and is what makes an accidental move fail loudly.
     "transformers>=4.52.4,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.17.0 ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
     "transformers>=4.52.4,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.5.0 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
-    "datasets>=3.4.1,!=4.0.*,!=4.1.0,!=4.4.*,!=4.5.0,<5.0.0",
+    "datasets>=4.0,<5.1",
     "sentencepiece>=0.2.0",
     "tqdm",
     "psutil",
@@ -131,7 +131,7 @@ core = [
     # there, including why the floor is 4.52.4.
     "transformers>=4.52.4,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.17.0 ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
     "transformers>=4.52.4,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.5.0 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
-    "datasets>=3.4.1,!=4.0.*,!=4.1.0,!=4.4.*,!=4.5.0,<5.0.0",
+    "datasets>=4.0,<5.1",
     "sentencepiece>=0.2.0",
     "tqdm",
     "psutil",
