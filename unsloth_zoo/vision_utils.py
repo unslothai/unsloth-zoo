@@ -1215,8 +1215,7 @@ def _raise_chat_template_error(error, processor, model = None):
 
 
 def _adopt_tokenizer_chat_template(processor) -> bool:
-    """Remote processors whose __init__ takes no chat_template (MiniMax-M3 VL) never load
-    chat_template.jinja, which their inner tokenizer still does: render with that one."""
+    """MiniMax-M3 VL processors skip chat_template.jinja; use the inner tokenizer's."""
     inner = getattr(processor, "tokenizer", None)
     if getattr(processor, "chat_template", None) is None and \
         inner is not None and inner is not processor and \
@@ -1228,16 +1227,14 @@ pass
 
 
 def _renders_content_list_as_repr(rendered, text) -> bool:
-    """A template that string-formats a content list (Nemotron Omni) renders its Python repr,
-    so the model would be trained to emit "[{'type': 'text', ...}]" instead of the text."""
+    """Nemotron Omni templates render a content list as its Python repr."""
     return isinstance(rendered, str) and text in rendered and \
         ("'type': 'text'" in rendered or '"type": "text"' in rendered)
 pass
 
 
 def _processor_takes_images(processor) -> bool:
-    """Remote processors can name their image component differently (Step-3.7 has
-    `image_preprocessor`); what the collator needs is a call that accepts `images`."""
+    """Step-3.7 names its image component `image_preprocessor`."""
     import inspect
     try:
         params = inspect.signature(type(processor).__call__).parameters
@@ -1248,9 +1245,7 @@ pass
 
 
 def _tensorize_ragged_batch(batch):
-    """Tensorize a processor output made without return_tensors: rectangular fields become
-    tensors (same-shape tensor lists are stacked), ragged ones (per-image pixel tensors of
-    different sizes) stay lists of tensors."""
+    """Tensorize fields; ragged ones stay lists of tensors."""
     for key in list(batch.keys()):
         value = batch[key]
         if torch.is_tensor(value) or not isinstance(value, (list, tuple)) or len(value) == 0:
@@ -1548,8 +1543,7 @@ class UnslothVisionDataCollator:
         return batch
 
     def _check_supervised(self, labels):
-        """Masking that matches no response marker leaves every label at ignore_index, and
-        training then runs with a zero loss. Raise on the first batch, warn once later."""
+        """All labels masked means zero loss: raise on the first batch, warn once later."""
         if not torch.is_tensor(labels) or labels.dim() != 2 or labels.shape[0] == 0:
             return
         empty = int(((labels != self.ignore_index).sum(dim = 1) == 0).sum())
@@ -1607,9 +1601,7 @@ class UnslothVisionDataCollator:
         try:
             return self.processor(**proc_kwargs)
         except ValueError as e:
-            # Dynamic-resolution processors (e.g. Nemotron Omni) return one pixel tensor per
-            # image when sizes differ, and their outer BatchFeature then fails to stack them.
-            # Such models take the list; convert everything else ourselves.
+            # Nemotron Omni returns per-image pixel tensors that BatchFeature cannot stack.
             if "Unable to convert output" not in str(e) or not has_images:
                 raise
             proc_kwargs = dict(proc_kwargs, return_tensors = None)
@@ -1629,7 +1621,6 @@ class UnslothVisionDataCollator:
                     # Only extract text from items that have type "text"
                     text_parts = [item["text"] for item in content if isinstance(item, dict) and item.get("type") == "text"]
                     if text_parts:
-                        # A chat template renders every text part in order, so keep them all.
                         message["content"] = "".join(text_parts)
                     elif len(content) > 0 and isinstance(content[0], dict) and "text" in content[0]:
                         message["content"] = content[0]["text"]

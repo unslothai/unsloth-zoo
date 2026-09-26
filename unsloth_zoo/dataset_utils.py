@@ -283,8 +283,6 @@ def get_chat_template_parts(tokenizer):
     tail = lambda s: s[s.rfind(U) + len(U):] if U in s else ""
     _gen_on, _gen_off = render(end_user, True), render(end_user, False)
     asst_header = "" if _gen_on == _gen_off else strip_shared(tail(_gen_on), tail(_gen_off))[0]
-    # What closes a user turn: the tail without a generation prompt, when it is only special
-    # tokens / whitespace (never message text).
     user_term = tail(_gen_off)
     _rest = user_term
     while _rest:
@@ -312,10 +310,7 @@ def get_chat_template_parts(tokenizer):
         response_part    = strip_lead(resp_gap, " ", "\t", eos, bos)
         instruction_part = strip_lead(instr_gap, " ", "\t", eos, bos)
 
-    # A response marker that still carries the user-turn terminator can be split by an image
-    # placeholder the template puts inside it (Command A Vision renders
-    # "<|END_TEXT|><|IMG_PATCH|><|END_OF_TURN_TOKEN|>"), so it never matches an image turn and
-    # every label is masked. Drop the terminator only when an image turn shows exactly that.
+    # Command A Vision splits the terminator with an image: "<|END_TEXT|><|IMG_PATCH|><|END_OF_TURN_TOKEN|>".
     if user_term and response_part.startswith(user_term) and len(user_term) < len(response_part):
         try:
             with_image = render([

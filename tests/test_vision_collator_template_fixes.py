@@ -14,21 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Vision collator fixes found by running the notebooks' vision recipe on real processors.
-
-1. Command A Vision: the generation prompt opens with <|START_THINKING|> while a rendered
-   assistant turn opens with <|START_TEXT|>, so auto-detection fell back to a response marker
-   that carried the user turn's terminator. An image placeholder sits inside that terminator
-   ("<|END_TEXT|><|IMG_PATCH|><|END_OF_TURN_TOKEN|>"), the marker never matched, and every
-   label was masked: training silently ran on nothing. The collator now also refuses a batch
-   with no trainable token instead of training on it.
-2. Dynamic-resolution processors (Nemotron Omni) return one pixel tensor per image when the
-   sizes differ, and their outer BatchFeature fails to stack them.
-3. Remote processors that never load chat_template.jinja (MiniMax-M3 VL), that name the image
-   component differently (Step-3.7), or whose template renders a content list as its repr.
-
-Hermetic CPU tests: a byte-level tokenizer built in memory, no network.
-"""
+"""Vision collator fixes: Command A Vision marker split by an image, Nemotron Omni pixel lists,
+MiniMax-M3 / Step-3.7 remote processors. Hermetic CPU tests."""
 
 from __future__ import annotations
 
@@ -42,8 +29,7 @@ SPECIALS = [
     "<|CHATBOT_TOKEN|>", "<|START_TEXT|>", "<|END_TEXT|>", "<|START_THINKING|>", "<|IMG_PATCH|>",
 ]
 
-# Command A Vision shaped template: images go after the user text, the generation prompt
-# opens a thinking block, a finished assistant turn opens a text block.
+# Command A Vision shaped: generation prompt opens a thinking block, assistant turn a text block.
 TEMPLATE = (
     "{{ '<BOS>' }}"
     "{% for m in messages %}"
@@ -163,7 +149,6 @@ def test_processor_without_a_chat_template_adopts_its_tokenizers():
     processor = _Processor(tok)
     assert _adopt_tokenizer_chat_template(processor)
     assert processor.chat_template == tok.chat_template
-    # A processor that already has one keeps it.
     processor.chat_template = "{{ 'own' }}"
     assert not _adopt_tokenizer_chat_template(processor)
     assert processor.chat_template == "{{ 'own' }}"
@@ -217,7 +202,6 @@ class _RaggedProcessor:
 
 
 def test_the_ragged_fallback_serves_every_processor_call():
-    # Message batches and the prompt side of prompt/completion batches share one helper.
     collator = _bare_collator()
     collator.processor = _RaggedProcessor()
     batch = collator._call_processor(
