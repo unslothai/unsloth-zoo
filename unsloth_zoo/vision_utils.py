@@ -1543,8 +1543,7 @@ class UnslothVisionDataCollator:
         return batch
 
     def _check_supervised(self, labels, attention_mask = None):
-        """All labels masked means zero loss: raise on the first batch unless truncation explains
-        it (then, and on later batches, warn once)."""
+        """All labels masked means zero loss: raise on an untruncated first batch, else warn once."""
         if not torch.is_tensor(labels) or labels.dim() != 2 or labels.shape[0] == 0:
             return
         # train_on_responses_only masks with -100 whatever ignore_index is.
@@ -1564,8 +1563,7 @@ class UnslothVisionDataCollator:
         max_len = getattr(self, "max_seq_length", None)
         truncated = bool(max_len) and torch.is_tensor(attention_mask) and attention_mask.dim() == 2 \
             and bool((attention_mask.sum(dim = 1) >= max_len).any())
-        # Each DataLoader worker has its own flag, so only raise when no row was truncated: then
-        # the marker is missing, which every worker sees alike.
+        # Per-worker flag: raise only when untruncated, i.e. the marker is missing for every worker.
         if empty == labels.shape[0] and not truncated and not getattr(self, "_seen_supervised", False):
             raise ValueError(msg)
         if not getattr(self, "_warned_unsupervised", False):

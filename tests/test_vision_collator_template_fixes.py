@@ -208,7 +208,6 @@ def test_string_content_keeps_every_assistant_text_part():
 
 
 class _RaggedProcessor:
-    """Stacks like a dynamic-resolution processor: fails with tensors when images differ."""
     def __call__(self, text = None, images = None, return_tensors = None, **kwargs):
         from transformers import BatchFeature
         out = {"input_ids": [[1, 2, 3] for _ in text], "attention_mask": [[1, 1, 1] for _ in text]}
