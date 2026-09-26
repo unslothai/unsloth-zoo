@@ -12,7 +12,6 @@ from unsloth_zoo.compiler import (
 try:
     from transformers.utils.output_capturing import OutputRecorder
 except ImportError:
-    # transformers 4.5x keeps it in generic; skipping there hid that nothing was retargeted.
     OutputRecorder = getattr(
         pytest.importorskip("transformers.utils.generic"), "OutputRecorder", None
     )

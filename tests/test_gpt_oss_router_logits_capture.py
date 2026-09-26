@@ -91,15 +91,13 @@ try:
     err = None
 except Exception as e:
     got, err = None, f'{type(e).__name__}: {e}'
-# TRL leaves config.output_router_logits on after training; generating right after must still work
-# when zoo's generation path hands the model a per-layer-type mask mapping.
+# TRL leaves output_router_logits on after training; generate and the per-type mask mapping must still work.
 model.config.output_router_logits = True
 model.eval()
 try:
     with torch.no_grad():
         gen = model.generate(ids[:1, :6], max_new_tokens=4, do_sample=False, pad_token_id=0)
     gen_err = None if gen.shape == (1, 10) else f'shape {tuple(gen.shape)}'
-    # On GPU zoo's generation path passes the per-type mapping into the causal-LM forward.
     with torch.no_grad():
         model(input_ids=ids[:1, :6], attention_mask={'full_attention': None, 'sliding_attention': None}, use_cache=False)
 except Exception as e:
