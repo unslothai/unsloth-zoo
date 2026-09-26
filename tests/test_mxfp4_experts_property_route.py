@@ -1,6 +1,4 @@
-"""Exercises the Mxfp4GptOssExperts.gate_up_proj / down_proj properties themselves (the code that
-raised on main), not just the helper. Needs an importable triton_kernels (pip or vLLM's bundled copy)
-so patch_gpt_oss installs the Unsloth class."""
+"""Mxfp4GptOssExperts.gate_up_proj / down_proj properties themselves; needs triton_kernels."""
 import os, sys, importlib.util
 import pytest, torch
 

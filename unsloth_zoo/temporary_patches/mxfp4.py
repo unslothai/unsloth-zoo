@@ -97,8 +97,7 @@ def get_mxfp4_config_for_training():
 
     return Mxfp4Config(dequantize=dequantize)
 
-# Whether the device map of the load in progress offloads to "cpu" or "disk"; set by the
-# _get_device_map wrapper below, which transformers calls before converting any weight.
+# Whether the current load offloads to "cpu" / "disk"; set by the _get_device_map wrapper below.
 _LOAD_OFFLOADS = [False]
 
 
@@ -120,8 +119,7 @@ def patch_mxfp4_offload_guard():
         _get_device_map._unsloth_mxfp4_patched = True
         modeling_utils._get_device_map = _get_device_map
 
-    # _get_device_map only runs for a load given a device map, so the flag is cleared where
-    # every MXFP4 load passes first: the quantizer's environment check, before any weight.
+    # _get_device_map only runs with a device map, so reset here, which every MXFP4 load passes first.
     try:
         from transformers.quantizers.quantizer_mxfp4 import Mxfp4HfQuantizer
     except Exception:
@@ -142,18 +140,12 @@ TEMPORARY_PATCHES.append(patch_mxfp4_offload_guard)
 
 
 def keep_mxfp4_experts_packed() -> bool:
-    """Whether GPT-OSS MXFP4 experts stay packed in memory (dequantized per layer on the fly by the
-    grouped_mm MoE forward, with expert LoRA on top) instead of a bf16 copy made at load.
-
-    On by default for LoRA loads on transformers 5 with the grouped_mm backend: a checkpoint that
-    ships in MXFP4 stays in MXFP4. Where the fused kernel is not verified exact (ROCm, no Triton)
-    the exact torch dequant is used instead. UNSLOTH_MXFP4_KEEP_PACKED=0 restores the load-time
-    dequant."""
+    """Whether GPT-OSS MXFP4 experts stay packed (decoded per layer by grouped_mm) instead of a bf16
+    copy at load. Default on for transformers 5 + grouped_mm; UNSLOTH_MXFP4_KEEP_PACKED=0 disables."""
     setting = os.environ.get("UNSLOTH_MXFP4_KEEP_PACKED", "")
     if setting == "0" or transformers_version < Version("5.0.0"):
         return False
-    # CPU / disk offload stores the bare uint8 blocks without their scales, so an offloaded
-    # packed stack could not be decoded again; such loads keep the load-time dequant.
+    # Offload drops the scales, so an offloaded packed stack could not be decoded again.
     if _LOAD_OFFLOADS[0]:
         return False
     name = os.environ.get("UNSLOTH_MODEL_NAME", "").lower().replace("-", "_")
@@ -162,8 +154,7 @@ def keep_mxfp4_experts_packed() -> bool:
     if os.environ.get("UNSLOTH_ENABLE_FULL_FINETUNING", "0") == "1":
         return False
     try:
-        # Only the grouped_mm forward (patch_gpt_oss_moe_for_lora) reads experts through
-        # _get_base_weight; the loop and Triton backends index the stack directly.
+        # Only grouped_mm reads experts through _get_base_weight; other backends index the stack.
         from .moe_utils import select_moe_backend
         import transformers.models.gpt_oss.modeling_gpt_oss as modeling_gpt_oss
         if not getattr(modeling_gpt_oss.GptOssExperts, "_unsloth_lora_patched", False):
@@ -176,15 +167,13 @@ def keep_mxfp4_experts_packed() -> bool:
 
 
 def _dequantize_to_gpt_oss_layout(convert, blocks, scales):
-    """GPT-OSS's (E, in, out) expert stack: the fused kernel writes it transposed in one pass;
-    otherwise ``convert`` (the un-transposed Unsloth variant) plus a transposing copy."""
+    """GPT-OSS (E, in, out) stack: fused transposed kernel, else ``convert`` plus a transposing copy."""
     if blocks.is_cuda and blocks.dtype == torch.uint8 and blocks.dim() == 4:
         return mxfp4_dequantize(blocks, scales, transpose = True)
     return convert(blocks, scales).transpose(1, 2).contiguous()
 
 
 class _Mxfp4ShapeProxy:
-    """What PEFT's ParamWrapper sees for a packed stack: its logical shape and compute dtype."""
 
     def __init__(self, param):
         self._param = param
@@ -200,10 +189,7 @@ class _Mxfp4ShapeProxy:
 
 
 def patch_peft_param_wrapper_mxfp4():
-    """LoRA on packed MXFP4 experts through PEFT ``target_parameters``. ``get_param`` reports the
-    logical (E, in, out) shape so the adapters match the bf16 stack's. Merging adds the delta to
-    the dequantized stack and installs it as a bf16 parameter (a merged weight is not MXFP4);
-    unmerging restores the untouched packed stack."""
+    """PEFT ``target_parameters`` LoRA on packed experts. Merge installs a bf16 stack; unmerge restores the packed one."""
     try:
         from peft.tuners.lora.layer import ParamWrapper, check_adapters_to_merge
     except Exception:
@@ -255,8 +241,7 @@ def patch_peft_param_wrapper_mxfp4():
         base_layer = self.get_base_layer()
         current = getattr(base_layer, self.parameter_name, None)
         if current is not None and current.device != packed.device:
-            # The saved stack sits outside the module, so a model move since merge() left it
-            # behind; move it (blocks and scales) the way a module move would.
+            # The saved stack is outside the module: follow any model move since merge().
             holder = nn.Module()
             holder.param = packed
             packed = holder.to(current.device).param
@@ -274,10 +259,7 @@ TEMPORARY_PATCHES.append(patch_peft_param_wrapper_mxfp4)
 
 
 def patch_mxfp4_quantizer_element_size():
-    """transformers pre-allocates the model's size on the GPU before loading
-    (caching_allocator_warmup), counting dequantized experts as bf16. Experts kept packed take
-    17 / 32 bytes per value (4-bit values plus one e8m0 scale per 32), so count that instead;
-    otherwise loading needs the bf16 model's memory the packed experts exist to avoid."""
+    """caching_allocator_warmup counts experts as bf16; packed ones take 17 / 32 bytes per value."""
     try:
         from transformers.quantizers.quantizer_mxfp4 import Mxfp4HfQuantizer
     except Exception:
@@ -304,9 +286,7 @@ TEMPORARY_PATCHES.append(patch_mxfp4_quantizer_element_size)
 
 
 def patch_save_pretrained_mxfp4():
-    """A full ``save_pretrained`` of a model whose experts are kept packed writes them dequantized,
-    as the load-time path would have, and the packed stacks are put back afterwards. Adapter-only
-    saves (PEFT) never reach this and stay as cheap as before."""
+    """Full ``save_pretrained`` writes packed experts dequantized, then restores the packed stacks."""
     try:
         from transformers import PreTrainedModel
     except Exception:
@@ -328,10 +308,7 @@ def patch_save_pretrained_mxfp4():
         names = {id(param): name for name, param in self.named_parameters(remove_duplicate = False)
                  if is_mxfp4_expert_param(param)}
         dense = {}
-        # from_pretrained records the Mxfp4Dequantize converters, and save_pretrained reverses them:
-        # transformers 5.4 raises NotImplementedError, 5.17 writes the experts under "down_proj$" /
-        # "gate_up_proj$" (one layer's stack, the rest dropped). The stacks saved here are dense, so
-        # they are written under their own names.
+        # Reversing the Mxfp4Dequantize converters raises (5.4) or drops layers under "down_proj$" (5.17).
         conversions = self.__dict__.get("_weight_conversions", None)
         if isinstance(conversions, (list, tuple)):
             self._weight_conversions = [
@@ -343,7 +320,6 @@ def patch_save_pretrained_mxfp4():
                 weight = param.dequantize().cpu()
                 dense[names.get(id(param))] = weight
                 module._parameters[name] = nn.Parameter(weight, requires_grad = False)
-            # state_dict may come positionally (directory, is_main_process, state_dict).
             try:
                 bound = inspect.signature(original).bind(self, *args, **kwargs)
             except TypeError:
@@ -384,7 +360,7 @@ def patch_convert_moe_packed_tensors():
         if not blocks.is_cuda and torch.cuda.is_available():
             blocks = blocks.cuda()
             scales = scales.cuda()
-        # One fused Triton pass, bit-identical to the loop below, with no int64 / fp32 temporaries.
+        # Fused Triton pass, bit-identical to the loop below.
         if blocks.is_cuda and blocks.dtype == torch.uint8 and dtype in (torch.bfloat16, torch.float16):
             return mxfp4_dequantize(blocks, scales, dtype = dtype)
 

@@ -2,13 +2,8 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""GPT-OSS MXFP4 experts kept packed and dequantized per layer on the fly.
-
-The fused dequant must reproduce transformers' dequant bit for bit, the packed stack must give
-the grouped_mm MoE forward exactly the weight the load-time dequant gives it (outputs, dX and
-expert LoRA grads identical), gradient checkpointing must reuse the recompute's dequant for the
-backward, and merge / save must never write the packed bytes as a weight. Without Triton or
-CUDA everything falls back to the torch dequant and the load-time path."""
+"""GPT-OSS MXFP4 experts kept packed: bit-exact dequant, identical forward / grads / LoRA vs the
+load-time dequant, checkpoint reuse, and merge / save never writing packed bytes."""
 
 import copy
 import os
@@ -63,8 +58,6 @@ def _bits(t):
     return t.contiguous().view(torch.uint8).cpu()
 
 
-# ---------------------------------------------------------------------------------------------
-# Dequant kernel
 
 
 def test_torch_reference_matches_transformers():
@@ -82,8 +75,7 @@ def test_torch_reference_matches_transformers():
 @pytest.mark.parametrize("transpose", [False, True])
 @pytest.mark.parametrize("chunk_bytes", [1, 5 * 64 * 16 * 8, 1 << 30])
 def test_torch_fallback_chunks_are_bit_identical(monkeypatch, transpose, chunk_bytes):
-    # Chunks of 1 row, of a row count that does not divide N (so a transposed chunk is cut at an
-    # expert edge), and of the whole stack all write the unchunked result, into a fresh or given buffer.
+    # Chunk sizes incl. one not dividing N (cut at an expert edge) all match the unchunked result.
     monkeypatch.setattr(mxd, "_TORCH_CHUNK_BYTES", chunk_bytes)
     blocks, scales = _random_mxfp4(3, 7, 64, low = 0, high = 255)
     want = _reference(blocks, scales)
@@ -93,7 +85,6 @@ def test_torch_fallback_chunks_are_bit_identical(monkeypatch, transpose, chunk_b
     out = torch.full_like(want, float("nan"))
     assert mxfp4_dequantize_torch(blocks, scales, transpose = transpose, out = out) is out
     assert torch.equal(_bits(out), _bits(want))
-    # A non-contiguous buffer and a 2-D (rows, G, 16) input.
     strided = torch.empty(want.shape[:-1] + (want.shape[-1] * 2,), dtype = want.dtype)[..., ::2]
     mxfp4_dequantize_torch(blocks, scales, transpose = transpose, out = strided)
     assert torch.equal(_bits(strided), _bits(want))
@@ -117,7 +108,7 @@ def test_torch_fallback_never_materialises_a_whole_stack_of_indices():
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("transpose", [False, True])
 def test_fused_kernel_is_bit_identical(dtype, transpose):
-    # Every byte, every e8m0 exponent for bf16 / fp32 (fp16 cannot hold the extremes), partial tiles.
+    # fp16 cannot hold the extreme exponents.
     E, N, G = 3, 131, 9
     blocks = torch.randint(0, 256, (E, N, G, 16), dtype = torch.uint8, device = "cuda")
     blocks.view(-1)[:256] = torch.arange(256, dtype = torch.uint8)
@@ -163,7 +154,6 @@ def test_a_kernel_that_disagrees_with_the_reference_is_not_used(monkeypatch):
 
 
 def test_no_triton_imports_and_falls_back(monkeypatch):
-    # The module imports with Triton absent (Mac, Windows without triton, CPU wheels).
     code = textwrap.dedent(f"""
         import sys, importlib.util
         sys.modules["triton"] = None
@@ -180,7 +170,6 @@ def test_no_triton_imports_and_falls_back(monkeypatch):
     """)
     result = subprocess.run([sys.executable, "-c", code], capture_output = True, text = True, timeout = 300)
     assert result.returncode == 0 and "ok" in result.stdout, result.stderr[-2000:]
-    # With Triton unusable the experts still stay packed; the torch dequant decodes them.
     import transformers.models.gpt_oss.modeling_gpt_oss as modeling_gpt_oss
     monkeypatch.setattr(mx, "mxfp4_kernel_available", lambda *a, **k: False)
     monkeypatch.setattr(mu, "select_moe_backend", lambda: "grouped_mm")
@@ -191,8 +180,6 @@ def test_no_triton_imports_and_falls_back(monkeypatch):
     assert mx.keep_mxfp4_experts_packed() is TRANSFORMERS_5
 
 
-# ---------------------------------------------------------------------------------------------
-# Packed parameter and the load-time switch
 
 
 def test_packed_param_survives_module_casts_and_copies():
@@ -205,7 +192,6 @@ def test_packed_param_survives_module_casts_and_copies():
     module.half()
     assert module.w.dtype == torch.uint8 and isinstance(module.w, Mxfp4ExpertParam)
     assert torch.equal(copy.deepcopy(param).dequantize(), _reference(blocks, scales))
-    # accelerate re-creates a parameter as cls(data, requires_grad, **param.__dict__).
     rebuilt = type(param)(param.data, requires_grad = False, **param.__dict__)
     assert isinstance(rebuilt, Mxfp4ExpertParam) and rebuilt._original_shape == param._original_shape
     if torch.cuda.is_available():
@@ -243,7 +229,6 @@ def test_keep_packed_switch(monkeypatch):
     monkeypatch.setattr(mu, "select_moe_backend", lambda: "native_torch")
     assert mx.keep_mxfp4_experts_packed() is False   # the loop backend indexes the stack directly
     monkeypatch.setattr(mu, "select_moe_backend", lambda: "grouped_mm")
-    # An MXFP4 checkpoint stays MXFP4 where the fused kernel is not verified: ROCm or no Triton.
     monkeypatch.setattr(mx, "mxfp4_kernel_available", lambda *a, **k: False)
     assert mx.keep_mxfp4_experts_packed() is True
     monkeypatch.setattr(torch.version, "hip", "6.4")
@@ -271,8 +256,6 @@ def test_dequantize_convertops_keeps_or_dequantizes(monkeypatch):
     assert torch.equal(_bits(packed.dequantize()), _bits(dense))
 
 
-# ---------------------------------------------------------------------------------------------
-# Forward, backward, gradient checkpointing and expert LoRA through PEFT target_parameters
 
 
 @pytest.fixture
@@ -289,7 +272,7 @@ def grouped_mm_device(monkeypatch):
 
 
 class _GptOssExperts(nn.Module):
-    """Stock gpt-oss experts: (E, in, out) stacks, biases, clamped swiglu with (up + 1)."""
+
 
     def __init__(self, gate_up, down, E, hidden, inter):
         super().__init__()
@@ -322,7 +305,7 @@ class _Block(nn.Module):
 
 
 def _peft_pair(device, E = 4, hidden = 128, inter = 64, rank = 4):
-    """The same experts twice, packed and load-time dense, each with PEFT expert LoRA."""
+
     peft = pytest.importorskip("peft")
     mx.patch_peft_param_wrapper_mxfp4()
     assert mu.patch_param_wrapper_for_moe()
@@ -403,8 +386,7 @@ def test_packed_experts_train_like_the_load_time_dequant(monkeypatch, grouped_mm
 
 
 def test_a_4d_packed_stack_is_an_experts_module():
-    # A (E, out, G, 16) uint8 stack failed the 2-D / 3-D test, so PEFT's ParamWrapper fell back to
-    # `_activate_lora` and added a bf16 delta to the packed blocks.
+    # Regression: PEFT's `_activate_lora` once added a bf16 delta to the packed blocks.
     blocks, scales = _random_mxfp4(4, 128, 64)
     experts = _GptOssExperts(Mxfp4ExpertParam(blocks, mxfp4_scales = scales), _packed(4, 64, 64), 4, 64, 64)
     assert mu._is_moe_experts_module(experts)
@@ -416,9 +398,7 @@ def test_a_4d_packed_stack_is_an_experts_module():
 @needs_cuda
 @pytest.mark.parametrize("override, per_projection", [(None, 2), ("1", 3)])
 def test_checkpoint_recompute_reuses_its_dequant_in_backward(monkeypatch, override, per_projection):
-    """Unsloth gradient checkpointing: one dequant in the checkpointed forward, one in the recompute,
-    and the backward reuses the recompute's (none in backward). UNSLOTH_MOE_RECOMPUTE=1 rebuilds it
-    in backward instead, for the lowest peak."""
+    """One dequant in forward, one in recompute, none in backward (UNSLOTH_MOE_RECOMPUTE=1: in backward)."""
     if not mu._check_torch_grouped_mm_supported():
         pytest.skip("no torch._grouped_mm on this device")
     if override is None:
@@ -448,8 +428,6 @@ def test_checkpoint_recompute_reuses_its_dequant_in_backward(monkeypatch, overri
     assert calls.count("backward") == 2 * (per_projection - 2)
 
 
-# ---------------------------------------------------------------------------------------------
-# Merge, save and inference
 
 
 def test_merge_and_unmerge(grouped_mm_device):
@@ -473,8 +451,7 @@ def test_merge_and_unmerge(grouped_mm_device):
 
 
 def test_unmerge_after_a_model_move_restores_on_the_current_device(grouped_mm_device):
-    # The packed stack saved at merge() is outside the module; unmerge after model.to() must put
-    # it (and its scales) where the model now is, not where it was.
+    # unmerge after model.to() must move the saved packed stack too.
     packed_model, _ = _peft_pair(grouped_mm_device)
     base = packed_model.base_model.model.experts
     while hasattr(base, "base_layer"):
@@ -498,7 +475,6 @@ def test_unmerge_after_a_model_move_restores_on_the_current_device(grouped_mm_de
         for name in want:
             param = getattr(base, name)
             assert param.device.type == "cpu"
-            # Scales follow the blocks lazily on the next dequantize.
             assert torch.equal(param.dequantize(), want[name].cpu())
 
 
@@ -542,14 +518,12 @@ def test_full_save_writes_dequantized_experts(tmp_path, explicit_state_dict):
         weight = saved[f"model.layers.0.mlp.experts.{name}"]
         assert weight.dtype == torch.bfloat16 and tuple(weight.shape) == tuple(param._original_shape)
         assert torch.equal(weight, param.dequantize())
-    # The model keeps training on its packed stacks afterwards.
     assert experts.gate_up_proj is packed[0] and experts.down_proj is packed[1]
 
 
 @pytest.mark.skipif(not TRANSFORMERS_5, reason = "weight conversions are transformers 5")
 def test_full_save_of_a_loaded_model_writes_experts_under_their_own_names(tmp_path):
-    """from_pretrained records the Mxfp4Dequantize converters, and save_pretrained reverses them:
-    transformers 5.4 raised NotImplementedError, 5.17 wrote the stacks under "gate_up_proj$"."""
+    """Reversed converters: 5.4 raised NotImplementedError, 5.17 wrote "gate_up_proj$"."""
     safetensors = pytest.importorskip("safetensors.torch")
     from transformers.core_model_loading import WeightConverter
     from transformers.integrations.mxfp4 import Mxfp4Dequantize
@@ -594,8 +568,7 @@ def test_adapter_save_never_dequantizes(tmp_path, monkeypatch):
 
 @needs_cuda
 def test_bf16_inference_path_dequantizes_packed_experts():
-    """Decode reuses one static stack per shape and rewrites only the routed experts; slices left
-    over from earlier calls are weighted by 0, so every call matches the dense stack exactly."""
+    """One static stack per shape, only routed experts rewritten; still matches the dense stack."""
     from unsloth_zoo.temporary_patches import gpt_oss
     model, experts = _tiny_gpt_oss("cuda")
     mlp = model.model.layers[0].mlp
@@ -650,8 +623,7 @@ def test_offloaded_loads_keep_the_load_time_dequant(monkeypatch):
 
 
 def test_the_decode_lock_is_held_until_the_kernel_is_enqueued(monkeypatch):
-    # Two host threads sharing a stream: the slot's lock spans decode and kernel launch, so a
-    # second decode cannot rewrite the stack between them.
+    # The slot lock spans decode and launch across host threads.
     from unsloth_zoo.temporary_patches import gpt_oss
 
     model, experts = _tiny_gpt_oss("cpu")
@@ -671,8 +643,6 @@ def test_the_decode_lock_is_held_until_the_kernel_is_enqueued(monkeypatch):
 
 
 def test_stream_events_cover_every_asynchronous_backend(monkeypatch):
-    # XPU runs kernels on streams like CUDA: the decode on the next call must wait on the event
-    # recorded after the last kernel that read the shared stack, whatever the backend.
     from unsloth_zoo.temporary_patches import gpt_oss
 
     calls = []
@@ -726,8 +696,7 @@ def test_projections_of_the_same_shape_do_not_share_a_stack():
 
 @needs_cuda
 def test_another_stream_waits_for_the_last_kernel_on_the_shared_stack():
-    # One stack per shape whatever the stream (no copy per stream to leak); a decode on another
-    # stream waits on the event recorded after the last kernel that read it.
+    # One stack per shape across streams; other streams wait on the last reader's event.
     from unsloth_zoo.temporary_patches import gpt_oss
 
     model, experts = _tiny_gpt_oss("cuda")
@@ -770,8 +739,7 @@ def test_a_later_load_without_a_device_map_clears_the_offload_flag(monkeypatch):
 
 
 def test_load_state_dict_carries_the_scales():
-    """state_dict() holds each packed stack as an Mxfp4ExpertParam; loading it must take the
-    scales with the blocks, and bare uint8 blocks (a safetensors round trip) must be refused."""
+    """load_state_dict takes scales with the blocks and refuses bare uint8 blocks."""
     a, b = nn.Module(), nn.Module()
     a.w, b.w = _packed(4, 64, 64, seed = 1), _packed(4, 64, 64, seed = 2)
     assert not torch.equal(a.w.mxfp4_scales, b.w.mxfp4_scales)
@@ -780,7 +748,6 @@ def test_load_state_dict_carries_the_scales():
     assert b.w is target and isinstance(b.w, Mxfp4ExpertParam)
     assert torch.equal(b.w.dequantize(), a.w.dequantize())
     assert b.w.mxfp4_scales.data_ptr() != a.w.mxfp4_scales.data_ptr()   # copied, not aliased
-    # A pickled state_dict (torch.save / Trainer checkpoints) keeps the scales too.
     c = nn.Module()
     c.w = _packed(4, 64, 64, seed = 3)
     c.load_state_dict(pickle.loads(pickle.dumps(a.state_dict())))
