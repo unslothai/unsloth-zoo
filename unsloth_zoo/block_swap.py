@@ -250,8 +250,7 @@ class BlockSwap:
 
     def _state_dict(self, i):
         def hook(module, state_dict, prefix, local_metadata):
-            # Resolved per call: PEFT wrapping after install renames weights (q_proj.base_layer.weight),
-            # and state_dict() emits every alias; a missed one serializes an empty tensor.
+            # Per call: PEFT renames weights after install, and every alias must get the host copy.
             b = self.blocks[i]
             for name, p in module.named_parameters(remove_duplicate = False):
                 idx = b.index.get(id(p))
@@ -361,8 +360,7 @@ def build_host_layers(make_layer, first_idx, count, tensors, device, compute_dty
                                         compute_dtype = compute_dtype, quant_type = w.quant_type,
                                         quant_storage = w.quant_storage, device = "meta")
                 w.module = new
-                # Prequantized quant_state carries the checkpoint dtype (bf16); fp16 GPUs need the compute dtype,
-                # which patch_model_and_tokenizer already applied to the layers loaded before these.
+                # quant_state keeps the checkpoint dtype; match the compute dtype the resident layers got.
                 w.quant_state.dtype = compute_dtype
                 new.weight = w
                 new.quant_state = w.quant_state
