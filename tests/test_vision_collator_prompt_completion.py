@@ -125,3 +125,41 @@ def test_no_type_ids_emitted_is_a_noop():
     out = make_collator(None)(EXAMPLES)
     assert "token_type_ids" not in out and "mm_token_type_ids" not in out
     assert out["input_ids"].shape == out["attention_mask"].shape
+
+
+def _mask_token_a(batch):
+    # Stands in for train_on_responses_only: excludes token "a", re-exposes everything else.
+    ids = batch["input_ids"]
+    return {"labels": torch.where(ids == VOCAB["a"], torch.full_like(ids, -100), ids)}
+
+
+def test_train_on_responses_only_applies_to_pc_path():
+    collator = make_collator(None)
+    collator.completion_only_loss = False
+    collator.train_on_responses_only = _mask_token_a
+    out = collator(EXAMPLES)
+    labels, ids = out["labels"], out["input_ids"]
+    assert (labels[ids == VOCAB["a"]] == -100).all()
+    assert (labels[ids == VOCAB["x"]] == VOCAB["x"]).all()
+
+
+def test_train_on_responses_only_never_unmasks_pc_path():
+    collator = make_collator(None)
+    collator.ignore_index = -1
+    collator.train_on_responses_only = _mask_token_a
+    out = collator(EXAMPLES)
+    labels, ids = out["labels"], out["input_ids"]
+    completion = labels != -1
+    assert completion.any()
+    assert not completion[out["attention_mask"] == 0].any()
+    assert not completion[ids == IMG_ID].any()
+    assert not completion[ids == VOCAB["b"]].any()
+    assert (labels != -100).all()
+
+
+def test_train_on_responses_only_pc_path_raises_when_nothing_is_trained():
+    import pytest
+    collator = make_collator(None)
+    collator.train_on_responses_only = lambda batch: {"labels": torch.full_like(batch["input_ids"], -100)}
+    with pytest.raises(ValueError, match = "no trainable token"):
+        collator(EXAMPLES)
