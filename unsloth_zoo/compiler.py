@@ -1908,6 +1908,7 @@ def create_new_function(
             "        forward_native_grouped_mm,\n"
             "        forward_triton_grouped_gemm,\n"
             "        forward_native_moe_loop,\n"
+            "        _gate_up_is_interleaved,\n"
             "    )\n"
             "except Exception:\n"
             "    pass\n"
