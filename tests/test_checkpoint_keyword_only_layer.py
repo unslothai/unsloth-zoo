@@ -14,15 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A GradientCheckpointingLayer called only by keyword must still get gradients.
-
-The Llama 4 and Mllama vision encoders call `encoder_layer(hidden_state = hidden_states, ...)`,
-so GradientCheckpointingLayer hands the checkpointer `partial(layer.__call__, **kwargs)` and no
-positional input. A reentrant checkpoint then sees nothing requiring grad and every LoRA in the
-layer stays at zero. Mllama's cross-attention layers take the vision states by keyword, so once
-the vision tower trains, each nested backward walks that shared graph and the second one raises.
-CPU only, except the smart-offload case.
-"""
+"""GradientCheckpointingLayer called only by keyword (Llama 4 / Mllama) must still get gradients."""
 
 import functools
 
@@ -99,7 +91,6 @@ def test_positional_call_is_unchanged(name):
 
 
 def test_without_the_patch_a_keyword_only_call_loses_the_gradient():
-    # Guards the tests above: stock transformers leaves the reentrant checkpoint no input.
     call = GradientCheckpointingLayer.__call__
     GradientCheckpointingLayer.__call__ = getattr(call, "_unsloth_original", call)
     try:
@@ -120,7 +111,6 @@ class _CrossLayer(GradientCheckpointingLayer):
 
 @pytest.mark.parametrize("name", sorted(_CHECKPOINTERS))
 def test_a_keyword_tensor_shared_by_several_layers_backpropagates_once(name):
-    # Mllama: text layers take the (now trainable) vision states as a keyword argument.
     def run(checkpointer):
         torch.manual_seed(0)
         tower = nn.Linear(8, 8, bias = False)
@@ -159,8 +149,6 @@ def test_eval_mode_is_untouched():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
 def test_smart_offload_checkpointing_gives_keyword_only_layers_their_gradient():
-    # use_gradient_checkpointing = "unsloth" swaps torch's CheckpointFunction for
-    # UnslothCheckpointFunction; the layers keep torch's reentrant checkpoint function.
     from unsloth_zoo.gradient_checkpointing import (
         patch_unsloth_smart_gradient_checkpointing,
         unpatch_unsloth_smart_gradient_checkpointing,

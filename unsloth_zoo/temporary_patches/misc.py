@@ -1674,13 +1674,8 @@ TEMPORARY_PATCHES.append(patch_MllamaVisionEncoderLayer)
 
 
 def patch_GradientCheckpointingLayer_keyword_inputs():
-    # GradientCheckpointingLayer checkpoints partial(layer.__call__, **kwargs) with only the
-    # positional arguments. A tensor that requires grad but arrives by keyword is invisible to
-    # a reentrant checkpoint: the Llama 4 and Mllama vision encoders call their layers purely by
-    # keyword (encoder_layer(hidden_state = ...)), so those layers get no gradient at all, and
-    # Mllama's cross-attention layers take the vision states as a keyword, so once the vision
-    # tower trains the nested backward walks the shared vision graph twice. Pass such tensors
-    # to the checkpoint function positionally and put them back into keyword position.
+    # Reentrant checkpoint ignores kwargs: lift grad-requiring keyword tensors (Llama 4 / Mllama vision
+    # layers get no grad; Mllama cross-attn walks the shared vision graph twice) to positional args.
     try:
         from functools import partial
         from transformers.modeling_layers import GradientCheckpointingLayer
@@ -1697,7 +1692,6 @@ def patch_GradientCheckpointingLayer_keyword_inputs():
         keys = tuple(k for k, v in kwargs.items() if torch.is_tensor(v) and v.requires_grad)
         if not keys:
             return original(self, *args, **kwargs)
-        # The cache handling (and warning) GradientCheckpointingLayer does before checkpointing.
         message = f"Caching is incompatible with gradient checkpointing in {type(self).__name__}. Setting"
         changed = False
         if kwargs.get("use_cache"):
