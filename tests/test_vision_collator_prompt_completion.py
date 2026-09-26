@@ -157,3 +157,11 @@ def test_train_on_responses_only_never_unmasks_pc_path():
     assert not completion[ids == IMG_ID].any()
     assert not completion[ids == VOCAB["b"]].any()
     assert (labels != -100).all()
+
+
+def test_train_on_responses_only_pc_path_raises_when_nothing_is_trained():
+    import pytest
+    collator = make_collator(None)
+    collator.train_on_responses_only = lambda batch: {"labels": torch.full_like(batch["input_ids"], -100)}
+    with pytest.raises(ValueError, match = "no trainable token"):
+        collator(EXAMPLES)
