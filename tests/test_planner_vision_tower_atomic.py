@@ -198,3 +198,18 @@ def test_a_split_tower_runs_once_its_inputs_are_hooked(inputs_on):
         for d in ("cuda:0", _SECOND):
             x, g = pixels(d)
             model.model.visual(x, grid_thw = g)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU")
+def test_an_offloaded_tower_moves_its_inputs_to_the_execution_device():
+    from accelerate import dispatch_model
+    config = _qwen3_vl(layers = 2, depth = 12).config
+    config.dtype = torch.float32
+    model = transformers.Qwen3VLForConditionalGeneration._from_config(config).eval()
+    plan = _plan(model, 0.55)
+    # cpu entries under a cuda main device are offloaded: their weights are meta, run on cuda:0.
+    device_map = {k: (0 if d == 0 else "cpu") for k, d in plan.device_map.items()}
+    model = dispatch_model(model, device_map = device_map, main_device = "cuda:0")
+    assert planner.attach_tower_input_hooks(model) == ["model.visual"]
+    with torch.no_grad():
+        model.model.visual(torch.randn(16, 96, device = "cuda:0"), grid_thw = torch.tensor([[1, 4, 4]], device = "cuda:0"))

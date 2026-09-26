@@ -1154,6 +1154,20 @@ def _anchor_excluded(model: nn.Module, tower: str, no_split_classes: Sequence[st
     return tuple(blocks[1:]) + tuple(c for c in after if not any(b.startswith(c + ".") or b == c for b in blocks))
 
 
+def _first_execution_device(tower: nn.Module):
+    """Where the tower's first weight runs: its accelerate hook's device, since an offloaded weight is ``meta``."""
+    for module in tower.modules():
+        hook = getattr(module, "_hf_hook", None)
+        for h in getattr(hook, "hooks", None) or ([hook] if hook is not None else []):
+            device = getattr(h, "execution_device", None)
+            if device is not None:
+                return device
+        param = next(module.parameters(recurse = False), None)
+        if param is not None:
+            return None if param.device.type == "meta" else param.device
+    return None
+
+
 def attach_tower_input_hooks(model: nn.Module) -> list[str]:
     """Move each split tower's inputs to its first parameter's device (Qwen3-VL builds
     interpolation weights on ``grid_thw``'s device before any child hook runs). Never raises."""
@@ -1177,9 +1191,10 @@ def attach_tower_input_hooks(model: nn.Module) -> list[str]:
             if hasattr(tower, "_hf_hook"):
                 continue
             devices = {p.device for p in tower.parameters()}
-            if len(devices) < 2:
+            target = _first_execution_device(tower)
+            if len(devices) < 2 or target is None:
                 continue
-            add_hook_to_module(tower, _MoveTowerInputs(next(tower.parameters()).device))
+            add_hook_to_module(tower, _MoveTowerInputs(target))
             hooked.append(name)
         return hooked
     except Exception:
