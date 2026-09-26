@@ -172,6 +172,9 @@ from importlib.machinery import ModuleSpec as _ModuleSpec
 # isinstance(weight, AffineQuantizedTensor), which needs a real type.
 class _ROCmSentinelMeta(type):
     def __getattr__(cls, name):
+        # Dunders must miss: a sentinel __wrapped__ sends inspect.unwrap down an endless chain.
+        if name.startswith("__"):
+            raise AttributeError(name)
         child = _ROCmSentinelMeta(name, (), {"__module__": cls.__module__})
         setattr(cls, name, child)
         return child
@@ -196,8 +199,13 @@ def _rocm_make_torchao_stub(name):
     mod.__path__    = []
     mod.__package__ = name
     mod.__spec__    = _MS(name, loader=None)
+    # Below every minimum: without torchao dist-info, transformers 5 parses this.
+    mod.__version__ = "0.0.0"
 
     def _getattr(attr):
+        # Dunders must miss: inspect calls __file__.endswith() on every module in sys.modules.
+        if attr.startswith("__"):
+            raise AttributeError(attr)
         full = f"{name}.{attr}"
         # Reuse an already-imported sub-module; else a sentinel class.
         if full in _s.modules:
@@ -238,9 +246,8 @@ class _ROCmTorchaoFinder(_MetaPathFinder):
 # Only Windows + ROCm (HIP) PyTorch needs this stub -- the one build where
 # `import torchao` crashes on the missing torch.distributed C-extension stack.
 # Elsewhere a failing import just means torchao isn't installed (transformers
-# handles that), and the stub would be harmful: is_torchao_available() reads a
-# sentinel torchao.__version__ and crashes in packaging.version.parse() with
-# "'_ROCmSentinelMeta' object is not iterable".
+# handles that), and the stub would be harmful: it makes torchao look present,
+# so anything probing the package gets stub answers instead of a clean miss.
 _is_windows_rocm = False
 if _sys_rocm_stub.platform == "win32":
     try:
