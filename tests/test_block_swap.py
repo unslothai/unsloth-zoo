@@ -81,7 +81,6 @@ def test_forward_arm_prefetches_leading_blocks():
 
 def test_pool_never_exceeds_depth_plus_one_live():
     sw = _scheduler(8, depth = 2)
-    # Walk the forward sweep under no_grad: pre fetches ahead, post evicts.
     with torch.no_grad():
         for i in range(8):
             sw._pre(i)(None, None)
@@ -107,9 +106,7 @@ def test_prefetch_direction_flips_with_grad_mode():
 
 
 def test_post_hook_evicts_only_under_no_grad():
-    # Block 2, not 0: block 0's backward hook also re-arms the next step, which
-    # would fetch it straight back and hide what this test is checking. Depth 3
-    # so the look-ahead and look-behind fetches never contend for block 2's slot.
+    # Not block 0: its backward hook re-arms and refetches it.
     sw = _scheduler(6, depth = 3)
     for b in sw.blocks:
         sw._release(b)
@@ -217,8 +214,6 @@ def test_state_dict_substitutes_host_copies_for_evicted_blocks():
     for p in layers.parameters():
         p.requires_grad_(False)
     sw = BlockSwap(layers, 4, prefetch_depth = 1)
-    # Most blocks are evicted now (empty p.data), yet state_dict must still see
-    # the real base weights via the pinned host copies.
     sd = layers.state_dict()
     for k, v in ref.items():
         assert sd[k].shape == v.shape, k

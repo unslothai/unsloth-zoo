@@ -7942,7 +7942,6 @@ def _finish_load(model, tokenizer):
 
 
 def _warn_block_swap(kwargs):
-    # Unified memory: nothing to swap to. Accepted so CUDA notebooks run unchanged.
     if kwargs.pop("block_swap_layers", 0):
         print("Unsloth: block_swap_layers has no effect on Apple Silicon; "
               "unified memory has no separate RAM to swap to.")
