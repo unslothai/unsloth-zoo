@@ -22,6 +22,9 @@ and quantize those parameters and route the experts forward through the
 standard backend after on-the-fly dequantization.
 """
 
+import os
+import re
+import types
 from typing import Optional, List, Union
 
 import torch
@@ -59,6 +62,7 @@ __all__ = [
     "patch_bnb4bit_quantizer_process_model",
     "patch_bnb4bit_quantizer_weight_conversions",
     "patch_bnb4bit_model_conversion_mapping",
+    "patch_bnb4bit_keep_fused_experts",
     "patch_bnb4bit_dequantize_plain_params",
     "patch_transformers_weight_converter_kwargs",
     "replace_expert_params_with_bnb_params",
@@ -1305,6 +1309,284 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
     return twins
 
 
+# Unsloth Llama-4 bnb-4bit uploads store experts fused but as split 2-D gate / up / down
+# weights; transformers' pre-quantized swap to SequentialLlama4TextExperts drops them and
+# crashes initialising packed uint8 storage, so keep the fused module and load the bytes.
+# `(?:^|\.)` keeps `shared_experts.` (DeepSeek-style) out.
+_FUSED_EXPERT_KEY_RE = re.compile(r"(?:^|\.)experts\.(?:gate_up_proj|gate_proj|up_proj|down_proj)(?:\.|$)")
+_PER_EXPERT_KEY_RE = re.compile(r"(?:^|\.)experts\.\d+\.")
+
+
+def _checkpoint_expert_layout(checkpoint_files) -> Optional[str]:
+    """"fused" / "per_expert" from safetensors headers only; None when unknown."""
+    if not checkpoint_files:
+        return None
+    if isinstance(checkpoint_files, (str, os.PathLike)):
+        checkpoint_files = [checkpoint_files]
+    try:
+        from safetensors import safe_open
+    except Exception:
+        return None
+    for path in checkpoint_files:
+        if not str(path).endswith(".safetensors"):
+            continue
+        try:
+            with safe_open(str(path), framework = "pt") as f:
+                keys = list(f.keys())
+        except Exception:
+            continue
+        for key in keys:
+            if _PER_EXPERT_KEY_RE.search(key):
+                return "per_expert"
+            if _FUSED_EXPERT_KEY_RE.search(key):
+                return "fused"
+    return None
+
+
+# Keep a class fused only when a MoE forward that reads the fused stack ships here.
+_FUSED_FORWARD_PATCHES = {"Llama4TextExperts": "unsloth_zoo.temporary_patches.llama4_moe"}
+
+
+def _fused_forward_available(name) -> bool:
+    module = _FUSED_FORWARD_PATCHES.get(name)
+    if module is None:
+        return True
+    try:
+        import importlib.util
+        return importlib.util.find_spec(module) is not None
+    except Exception:
+        return False
+
+
+def _swappable_fused_expert_classes(model, swap_table) -> set:
+    names = set()
+    for module in model.modules():
+        name = type(module).__name__
+        if name in swap_table and _is_expert_module(module) and _fused_forward_available(name):
+            names.add(name)
+    return names
+
+
+def _model_keeps_swappable_fused_experts(model) -> bool:
+    try:
+        import transformers.quantizers.base as quantizers_base
+    except Exception:
+        return False
+    swap_table = getattr(quantizers_base, "MODULES_TO_PATCH_FOR_QUANTIZATION", None)
+    if not isinstance(swap_table, dict) or not swap_table:
+        return False
+    return bool(_swappable_fused_expert_classes(model, swap_table))
+
+
+def _convert_without(quantizer_cls, quantizers_base, kept):
+    """Stock `_convert_model_for_quantization` over a table copy minus `kept`, else None."""
+    method = getattr(quantizer_cls, "_convert_model_for_quantization", None)
+    fn = getattr(method, "__func__", method)
+    table_name = "MODULES_TO_PATCH_FOR_QUANTIZATION"
+    if (
+        not isinstance(fn, types.FunctionType)
+        or table_name not in fn.__code__.co_names
+        or fn.__globals__.get(table_name) is not getattr(quantizers_base, table_name, None)
+    ):
+        return None
+    table = {k: v for k, v in fn.__globals__[table_name].items() if k not in kept}
+    rebuilt = types.FunctionType(
+        fn.__code__, {**fn.__globals__, table_name: table},
+        fn.__name__, fn.__defaults__, fn.__closure__,
+    )
+    rebuilt.__kwdefaults__ = fn.__kwdefaults__
+    return rebuilt
+pass
+
+
+def patch_bnb4bit_keep_fused_experts():
+    """Skip the per-expert swap when the pre-quantized checkpoint stores experts fused."""
+    try:
+        from transformers.quantizers.quantizer_bnb_4bit import Bnb4BitHfQuantizer
+        import transformers.quantizers.base as quantizers_base
+    except Exception as e:
+        return raise_error("transformers.quantizers.base.MODULES_TO_PATCH_FOR_QUANTIZATION", e)
+
+    swap_table = getattr(quantizers_base, "MODULES_TO_PATCH_FOR_QUANTIZATION", None)
+    if not isinstance(swap_table, dict):
+        return
+    original_preprocess_model = getattr(Bnb4BitHfQuantizer, "preprocess_model", None)
+    if original_preprocess_model is None:
+        return
+    if getattr(original_preprocess_model, "_unsloth_keep_fused_patched", False):
+        return
+
+    def patched_preprocess_model(self, model, dtype = None, **kwargs):
+        kept = ()
+        if getattr(self, "pre_quantized", False):
+            names = _swappable_fused_expert_classes(model, swap_table)
+            if names and _checkpoint_expert_layout(kwargs.get("checkpoint_files")) == "fused":
+                kept = tuple(sorted(name for name in names if name in swap_table))
+        convert = _convert_without(type(self), quantizers_base, kept) if kept else None
+        if convert is None:
+            return original_preprocess_model(self, model, dtype, **kwargs)
+        logger.info(
+            f"Unsloth: the checkpoint stores {', '.join(kept)} experts fused; "
+            "keeping the fused module instead of transformers' per-expert swap."
+        )
+        # Never mutate the global swap table: concurrent loads must keep transformers' swap.
+        had_own = "_convert_model_for_quantization" in vars(self)
+        previous = vars(self).get("_convert_model_for_quantization")
+        self._convert_model_for_quantization = types.MethodType(convert, self)
+        try:
+            return original_preprocess_model(self, model, dtype, **kwargs)
+        finally:
+            if had_own:
+                self._convert_model_for_quantization = previous
+            else:
+                del self._convert_model_for_quantization
+
+    patched_preprocess_model._unsloth_keep_fused_patched = True
+    patch_function(Bnb4BitHfQuantizer, "preprocess_model", patched_preprocess_model, match_level = "relaxed")
+pass
+
+
+def _bnb4bit_split_fused_expert_conversions():
+    """Load split `experts.{gate,up,down}_proj.weight` into kept-fused stacks.
+
+    Block-aligned `inter`: packed bytes + absmax concatenate row-wise (bit-exact);
+    otherwise dequantize, concatenate, requantize.
+    """
+    from transformers.core_model_loading import WeightConverter, ConversionOps
+    from transformers.quantizers.quantizers_utils import get_module_from_name
+    from bitsandbytes.functional import QuantState
+
+    def _quant_state(input_dict, base, device):
+        qd = {
+            "weight" + suf: input_dict[base + suf]
+            for suf in _AUX_SUFFIXES
+            if (base + suf) in input_dict
+        }
+        return QuantState.from_dict(qs_dict = qd, device = device)
+
+    def _packed_param(data, quant_state, logical_shape, module, compress_statistics):
+        new_param = torch.Tensor._make_subclass(Params4bit, data)
+        new_param.requires_grad = False
+        new_param.quant_state = quant_state
+        new_param.blocksize = quant_state.blocksize
+        new_param.compress_statistics = compress_statistics
+        new_param.quant_type = quant_state.quant_type
+        new_param.quant_storage = data.dtype
+        new_param.bnb_quantized = True
+        new_param._original_shape = torch.Size(logical_shape)
+        new_param.module = module
+        return new_param
+
+    class _SplitFusedExpertDeserialize(ConversionOps):
+        def __init__(self, bases, anchored):
+            self.bases = bases
+            self.anchored = anchored
+
+        def convert(self, input_dict, model = None, full_layer_name = None,
+                    target_patterns = None, **kwargs):
+            input_dict = {
+                k: (v[0] if isinstance(v, list) else v) for k, v in input_dict.items()
+            }
+            missing = [a for a in self.anchored if a not in input_dict]
+            if missing:
+                raise ValueError(f"Unsloth: {full_layer_name} is missing checkpoint tensors {missing}")
+            module, pname = get_module_from_name(model, full_layer_name)
+            slot = getattr(module, pname)
+            expected = tuple(getattr(slot, "_original_shape", None) or slot.shape)
+            if len(expected) != 3:
+                raise ValueError(f"Unsloth: {full_layer_name} is {expected}, expected a 3-D expert stack")
+            num_experts, rows_per_expert, width = expected
+            part_width = width // len(self.bases)
+            part_shape = (num_experts, rows_per_expert, part_width)
+            quantized = any((self.bases[0] + suf) in input_dict for suf in _AUX_SUFFIXES)
+            device = input_dict[self.anchored[0]].device
+            module._is_hf_initialized = True
+
+            if not quantized:
+                parts = [input_dict[a] for a in self.anchored]
+                if any(p.numel() != _prod(part_shape) for p in parts):
+                    raise ValueError(
+                        f"Unsloth: {full_layer_name} expects parts of {part_shape}, "
+                        f"got {[tuple(p.shape) for p in parts]}"
+                    )
+                return {target_patterns[0]: torch.cat([p.reshape(part_shape) for p in parts], dim = -1)}
+
+            states = [_quant_state(input_dict, b, device) for b in self.bases]
+            for base, qs in zip(self.bases, states):
+                qshape = tuple(qs.shape)
+                if _prod(qshape) != _prod(part_shape) or qshape[-1] != part_width:
+                    raise ValueError(
+                        f"Unsloth: `{base}` for {full_layer_name} was quantized as {qshape}; "
+                        f"a fused stack of {expected} needs {len(self.bases)} part(s) of "
+                        f"{part_shape} flattened to (-1, {part_width})."
+                    )
+            first = states[0]
+            if any(
+                qs.blocksize != first.blocksize or qs.quant_type != first.quant_type
+                or qs.dtype != first.dtype or not torch.equal(qs.code, first.code)
+                for qs in states[1:]
+            ):
+                raise ValueError(f"Unsloth: the parts of {full_layer_name} were quantized differently")
+            datas = [input_dict[a] for a in self.anchored]
+
+            # Float slot = non-Unsloth forward; packed bytes would break it.
+            if not isinstance(slot, Params4bit):
+                parts = [
+                    bnb.functional.dequantize_4bit(d, qs).reshape(part_shape)
+                    for d, qs in zip(datas, states)
+                ]
+                return {target_patterns[0]: torch.cat(parts, dim = -1).to(slot.dtype)}
+
+            if len(self.bases) == 1:
+                qs = states[0]
+                qs.shape = torch.Size(expected)
+                return {target_patterns[0]: _packed_param(
+                    datas[0], qs, expected, module, getattr(qs, "nested", False),
+                )}
+
+            per_element = 2 * datas[0].element_size()
+            rows = num_experts * rows_per_expert
+            if part_width % first.blocksize == 0 and part_width % per_element == 0:
+                data = torch.cat([d.reshape(rows, -1) for d in datas], dim = 1).reshape(-1, 1)
+                absmax = torch.cat(
+                    [_quantstate_absmax_fp32(qs).reshape(rows, -1) for qs in states], dim = 1,
+                ).reshape(-1)
+                quant_state = QuantState(
+                    absmax = absmax,
+                    shape = torch.Size(expected),
+                    code = first.code,
+                    blocksize = first.blocksize,
+                    quant_type = first.quant_type,
+                    dtype = first.dtype,
+                )
+                return {target_patterns[0]: _packed_param(data, quant_state, expected, module, False)}
+
+            full = torch.cat([
+                bnb.functional.dequantize_4bit(d, qs).reshape(part_shape)
+                for d, qs in zip(datas, states)
+            ], dim = -1).contiguous()
+            packed = _make_expert_params4bit(
+                full, requires_grad = False, blocksize = first.blocksize,
+                quant_type = first.quant_type, quant_storage = datas[0].dtype,
+                compress_statistics = False, module = module,
+            )
+            packed._original_shape = torch.Size(expected)
+            return {target_patterns[0]: packed}
+
+    converters = []
+    for target, parts in (("gate_up_proj", ("gate_proj", "up_proj")), ("down_proj", ("down_proj",))):
+        # `(?<![^.])` excludes `shared_experts.`; zero width keeps the dot on rename.
+        bases = [f"(?<![^.])experts.{p}.weight" for p in parts]
+        anchored = [b + "$" for b in bases]
+        aux = [b + suf for b in bases for suf in _AUX_SUFFIXES]
+        converters.append(WeightConverter(
+            source_patterns = aux + anchored,
+            target_patterns = f"experts.{target}",
+            operations = [_SplitFusedExpertDeserialize(bases, anchored)],
+        ))
+    return converters
+
+
 def patch_bnb4bit_model_conversion_mapping():
     """Prepend per-expert quantized-MoE converters to the model conversion mapping."""
     try:
@@ -1328,6 +1610,9 @@ def patch_bnb4bit_model_conversion_mapping():
             except Exception as e:
                 if UNSLOTH_ENABLE_LOGGING:
                     logger.info(f"Unsloth: per-expert bnb4bit converters unavailable: {e}")
+            # Unguarded: a failure must surface, not fall back to initialising packed stacks.
+            if _model_keeps_swappable_fused_experts(model):
+                conversions = _bnb4bit_split_fused_expert_conversions() + conversions
         return conversions
 
     patched_get_model_conversion_mapping._unsloth_moe_patched = True
@@ -1421,6 +1706,7 @@ def _register_transformers_v5_moe_bnb4bit_patches():
     TEMPORARY_PATCHES.append(patch_bnb4bit_quantizer_process_model)
     TEMPORARY_PATCHES.append(patch_bnb4bit_quantizer_weight_conversions)
     TEMPORARY_PATCHES.append(patch_bnb4bit_model_conversion_mapping)
+    TEMPORARY_PATCHES.append(patch_bnb4bit_keep_fused_experts)
     TEMPORARY_PATCHES.append(patch_bnb4bit_dequantize_plain_params)
     TEMPORARY_PATCHES.append(patch_transformers_weight_converter_kwargs)
     TEMPORARY_PATCHES.append(patch_peft_param_wrapper_4bit_expert_shape)
