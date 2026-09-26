@@ -238,5 +238,18 @@ def test_force_match_false_masks_the_marker_newline():
     assert labels(False, row)[row.index(FINAL)] == FINAL
 
 
+
+@pytest.mark.parametrize("force_match", [True, False])
+def test_an_empty_user_turn_does_not_skip_the_next_answer(force_match):
+    # Plain-text markers have no special opener, so only the user-marker scan resumes here.
+    vocab = {c: i + 10 for i, c in enumerate("UAqXYZW\n")}
+    tokenizer = StubTokenizer(vocab=vocab, added={}, all_special_ids=[EOS],
+                              bos_token_id=BOS, eos_token_id=EOS)
+    row = [vocab[c] for c in "U\nq\nA\nXY\nU\nA\nZW"] + [EOS]
+    fn = train_on_responses_only(None, "U\n", "A\n", tokenizer=tokenizer,
+                                 return_function=True, force_match=force_match)
+    trained = supervised(row, fn({"input_ids": [row]})["labels"][0])
+    assert trained == [vocab[c] for c in "XY\nZW"] + [EOS]
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

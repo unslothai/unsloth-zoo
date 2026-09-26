@@ -906,9 +906,9 @@ def train_on_responses_only(
                             user_j = j
                             # Account for last item
                             if user_j != n_minus_1:
-                                # user_k = k
-                                # j = user_k
-                                j = k
+                                # The outer j += 1 lands on k: an assistant marker right after an
+                                # empty user turn must not be skipped.
+                                j = k - 1
                             else:
                                 user_j = n
                                 k = n
