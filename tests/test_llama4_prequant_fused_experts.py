@@ -14,23 +14,10 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Pre-quantized Llama-4 checkpoints that store the MoE experts fused.
+"""Pre-quantized Llama-4 checkpoints storing MoE experts fused (split gate / up / down).
 
-unsloth/Llama-4-Scout-17B-16E-Instruct-unsloth-bnb-4bit (written by transformers
-4.51) keeps every expert projection fused across experts, gate and up apart:
-
-    feed_forward.experts.gate_proj.weight   nf4 of (E * hidden, inter)
-    feed_forward.experts.up_proj.weight     nf4 of (E * hidden, inter)
-    feed_forward.experts.down_proj.weight   nf4 of (E * inter, hidden)
-
-transformers 5 swaps Llama4TextExperts for SequentialLlama4TextExperts on every
-pre-quantized bitsandbytes load, reports those keys UNEXPECTED and the per-expert
-`experts.<i>.*_proj.weight` MISSING, then fails initialising the missing packed
-weights: `NotImplementedError: "normal_kernel_cuda" not implemented for 'Byte'`.
-
-The fixtures here are built locally in that layout: a tiny Llama-4 text model,
-every Linear quantized the way transformers serializes Linear4bit, the experts
-quantized fused and split. CPU only, no network.
+transformers 5 swaps in SequentialLlama4TextExperts and fails with
+`"normal_kernel_cuda" not implemented for 'Byte'`. Tiny local fixtures, CPU only.
 """
 
 from __future__ import annotations
@@ -46,7 +33,6 @@ _core_model_loading = pytest.importorskip(
     "transformers.core_model_loading",
     reason = "requires transformers v5 core_model_loading",
 )
-# transformers < 5 gets an inert compat stub of the same name from unsloth.
 if not hasattr(_core_model_loading.WeightConverter, "target_patterns"):
     pytest.skip("transformers.core_model_loading is a transformers<5 compat stub", allow_module_level = True)
 
@@ -75,9 +61,6 @@ _REAL_FUSED_FORWARD_AVAILABLE = moe_bnb4bit._fused_forward_available
 NUM_EXPERTS, HIDDEN = 4, 64
 
 
-# The bnb-4bit loading patches, plus, where this tree has them, the patches that give
-# Llama4TextExperts a forward reading packed stacks. Without those the experts are
-# left in their float dtype and load dequantized (test_unpacked_expert_slot_*).
 _PATCH_MODULES = {
     moe_bnb4bit.__name__,
     "unsloth_zoo.temporary_patches.moe_experts_interface",
@@ -86,7 +69,6 @@ _PATCH_MODULES = {
 
 
 def _apply_bnb4bit_patches():
-    """The registered patches of _PATCH_MODULES, as unsloth applies them."""
     applied = 0
     for patch in TEMPORARY_PATCHES:
         module = getattr(patch, "__module__", "")
@@ -109,8 +91,7 @@ def _quantize_into(out, name, weight):
 
 
 def _build_checkpoint(path, layout, inter = 128):
-    """A tiny pre-quantized Llama-4 text checkpoint with its experts in `layout`:
-    "fused" (the unsloth Scout upload) or "per_expert" (what transformers expects)."""
+    """`layout`: "fused" (unsloth Scout upload) or "per_expert" (transformers)."""
     E, H, I = NUM_EXPERTS, HIDDEN, inter
     torch.manual_seed(0)
     config = Llama4TextConfig(
@@ -178,7 +159,6 @@ def _load(path):
 
 @pytest.fixture(autouse = True)
 def _fused_forward_present(monkeypatch):
-    # The kept-fused path needs the Llama-4 MoE forward patch; these tests exercise the load itself.
     monkeypatch.setattr(moe_bnb4bit, "_fused_forward_available", lambda name: True)
 
 
@@ -189,9 +169,7 @@ def fused_checkpoint(tmp_path_factory):
 
 @pytest.mark.parametrize("inter", [128, 96], ids = ["block_aligned", "block_unaligned"])
 def test_fused_checkpoint_loads_into_the_fused_stacks(tmp_path, inter):
-    """The failing load: after the patches it keeps Llama4TextExperts and fills its
-    stacks from the split keys. Block-aligned widths splice the packed bytes, so the
-    stacks dequantize bit-for-bit to the checkpoint; unaligned ones requantize."""
+    """Aligned widths splice packed bytes (bit-exact); unaligned ones requantize."""
     _apply_bnb4bit_patches()
     path = _build_checkpoint(tmp_path / "ckpt", "fused", inter = inter)
     model, info = _load(path)
@@ -215,14 +193,12 @@ def test_fused_checkpoint_loads_into_the_fused_stacks(tmp_path, inter):
         if inter % 64 == 0:
             assert torch.equal(got_gate_up, torch.cat([gate, up], dim = -1))
         else:
-            # Requantized: within one nf4 step of the checkpoint's values.
             want = torch.cat([gate, up], dim = -1).float()
             assert (got_gate_up.float() - want).abs().max() <= 0.25 * want.abs().max()
 
 
 def test_without_the_layout_decision_the_fused_checkpoint_still_fails(fused_checkpoint, monkeypatch):
-    """Negative arm: with the checkpoint's layout unknown, transformers' per-expert
-    swap runs as before and the load dies initialising packed weights."""
+    """Unknown layout: transformers' swap runs and the load still fails."""
     _apply_bnb4bit_patches()
     monkeypatch.setattr(moe_bnb4bit, "_checkpoint_expert_layout", lambda checkpoint_files: None)
     with pytest.raises(NotImplementedError, match = "Byte"):
@@ -230,8 +206,7 @@ def test_without_the_layout_decision_the_fused_checkpoint_still_fails(fused_chec
 
 
 def test_without_the_fused_forward_the_transformers_swap_still_runs(fused_checkpoint, monkeypatch):
-    """Without a MoE forward that reads kept-fused stacks, keeping them would only move the
-    failure to the first forward, so the load takes transformers' swap as before."""
+    """No fused-stack forward: keeping fused would only defer the failure, so swap."""
     _apply_bnb4bit_patches()
     monkeypatch.setattr(moe_bnb4bit, "_fused_forward_available", lambda name: False)
     with pytest.raises(NotImplementedError, match = "Byte"):
@@ -246,14 +221,12 @@ def test_fused_forward_available_follows_the_llama4_patch_module(monkeypatch):
     assert _REAL_FUSED_FORWARD_AVAILABLE("Llama4TextExperts") is False
     monkeypatch.setattr(importlib.util, "find_spec", lambda name: seen.append(name) or object())
     assert _REAL_FUSED_FORWARD_AVAILABLE("Llama4TextExperts") is True
-    # Classes without a registered forward patch are not gated.
     assert _REAL_FUSED_FORWARD_AVAILABLE("SomeOtherExperts") is True
     assert seen == ["unsloth_zoo.temporary_patches.llama4_moe"] * 2
 
 
 def test_per_expert_checkpoint_keeps_the_transformers_swap(tmp_path):
-    """Negative arm: a per-expert checkpoint (bnb-community style) must still get
-    SequentialLlama4TextExperts and load with nothing missing."""
+    """Per-expert checkpoints still get SequentialLlama4TextExperts."""
     _apply_bnb4bit_patches()
     model, info = _load(_build_checkpoint(tmp_path / "ckpt", "per_expert"))
     assert not info.get("missing_keys") and not info.get("unexpected_keys")
@@ -262,8 +235,7 @@ def test_per_expert_checkpoint_keeps_the_transformers_swap(tmp_path):
 
 
 def test_fused_load_never_mutates_the_global_swap_table(fused_checkpoint, monkeypatch):
-    """The kept class is filtered from a per-quantizer copy only, so a concurrent
-    pre-quantized load through any quantizer still sees transformers' full table."""
+    """Concurrent loads must still see transformers' full swap table."""
     import transformers.quantizers.base as quantizers_base
     from transformers.quantizers.quantizer_bnb_4bit import Bnb4BitHfQuantizer
 
@@ -274,7 +246,6 @@ def test_fused_load_never_mutates_the_global_swap_table(fused_checkpoint, monkey
     original = Bnb4BitHfQuantizer._process_model_before_weight_loading
 
     def spy(self, model, *args, **kwargs):
-        # Runs inside preprocess_model, right after the swap step.
         seen.append(("Llama4TextExperts" in table, "_convert_model_for_quantization" in vars(self)))
         return original(self, model, *args, **kwargs)
 
@@ -287,8 +258,7 @@ def test_fused_load_never_mutates_the_global_swap_table(fused_checkpoint, monkey
 
 
 def test_without_the_stock_convert_method_the_transformers_swap_runs(fused_checkpoint, monkeypatch):
-    """When transformers' convert method cannot be rebuilt over a filtered table, the
-    global table is left alone and the load takes transformers' swap, as on main."""
+    """Non-stock convert method: global table untouched, transformers' swap runs."""
     import transformers.quantizers.base as quantizers_base
 
     _apply_bnb4bit_patches()
@@ -301,8 +271,7 @@ def test_without_the_stock_convert_method_the_transformers_swap_runs(fused_check
 
 
 def test_unpacked_expert_slot_gets_dequantized_values(fused_checkpoint, monkeypatch):
-    """When the experts stay in their float dtype (their forward is not one that reads
-    packed stacks), the split keys load as dequantized values, never packed bytes."""
+    """Float expert slots get dequantized values, never packed bytes."""
     _apply_bnb4bit_patches()
     monkeypatch.setattr(moe_bnb4bit, "replace_expert_params_with_bnb_params", lambda model, **kwargs: model)
     model, info = _load(fused_checkpoint)

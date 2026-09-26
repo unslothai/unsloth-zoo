@@ -1308,32 +1308,16 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
     return twins
 
 
-# ----------------------------------------------------------------------------
-# Fused expert stacks saved as separate gate / up / down projections
-# ----------------------------------------------------------------------------
-# The unsloth Llama-4 bnb-4bit uploads (written by transformers 4.51) keep each
-# MoE projection FUSED across experts but store gate and up apart, flattened to
-# 2-D and quantized that way:
-#   feed_forward.experts.gate_proj.weight   (E * hidden, inter)   = gate_up_proj[..., :inter]
-#   feed_forward.experts.up_proj.weight     (E * hidden, inter)   = gate_up_proj[..., inter:]
-#   feed_forward.experts.down_proj.weight   (E * inter, hidden)   = down_proj
-# transformers swaps Llama4TextExperts for SequentialLlama4TextExperts on every
-# pre-quantized bnb load (quantizers/base.py `_convert_model_for_quantization`),
-# which expects `experts.<i>.gate_proj.weight` instead: the fused keys are dropped
-# as unexpected, the per-expert Linear4bit weights are reported missing, and
-# initialising their packed uint8 storage raises `"normal_kernel_*" not
-# implemented for 'Byte'`. For such checkpoints keep the fused module and load
-# the packed bytes into its gate_up_proj / down_proj stacks without requantizing.
-
-# An experts module key with no expert index after `experts.`, and the per-expert
-# form. The leading `(?:^|\.)` keeps `shared_experts.` (DeepSeek-style) out.
+# Unsloth Llama-4 bnb-4bit uploads store experts fused but as split 2-D gate / up / down
+# weights; transformers' pre-quantized swap to SequentialLlama4TextExperts drops them and
+# crashes initialising packed uint8 storage, so keep the fused module and load the bytes.
+# `(?:^|\.)` keeps `shared_experts.` (DeepSeek-style) out.
 _FUSED_EXPERT_KEY_RE = re.compile(r"(?:^|\.)experts\.(?:gate_up_proj|gate_proj|up_proj|down_proj)(?:\.|$)")
 _PER_EXPERT_KEY_RE = re.compile(r"(?:^|\.)experts\.\d+\.")
 
 
 def _checkpoint_expert_layout(checkpoint_files) -> Optional[str]:
-    """"fused" or "per_expert" from the first expert key found in the checkpoint's
-    safetensors headers (no tensor is read); None when unknown."""
+    """"fused" / "per_expert" from safetensors headers only; None when unknown."""
     if not checkpoint_files:
         return None
     if isinstance(checkpoint_files, (str, os.PathLike)):
@@ -1358,8 +1342,7 @@ def _checkpoint_expert_layout(checkpoint_files) -> Optional[str]:
     return None
 
 
-# A kept-fused expert stack is only usable with a MoE forward that reads it; keep the
-# class fused only when that patch ships in this unsloth_zoo, else transformers' swap runs.
+# Keep a class fused only when a MoE forward that reads the fused stack ships here.
 _FUSED_FORWARD_PATCHES = {"Llama4TextExperts": "unsloth_zoo.temporary_patches.llama4_moe"}
 
 
@@ -1375,8 +1358,6 @@ def _fused_forward_available(name) -> bool:
 
 
 def _swappable_fused_expert_classes(model, swap_table) -> set:
-    """Class names in transformers' pre-quantized module swap table that this model
-    holds as fused expert stacks (3-D gate_up_proj / down_proj parameters)."""
     names = set()
     for module in model.modules():
         name = type(module).__name__
@@ -1386,8 +1367,6 @@ def _swappable_fused_expert_classes(model, swap_table) -> set:
 
 
 def _model_keeps_swappable_fused_experts(model) -> bool:
-    """True when a fused experts module that transformers would have swapped for a
-    per-expert ModuleList was kept fused (see patch_bnb4bit_keep_fused_experts)."""
     try:
         import transformers.quantizers.base as quantizers_base
     except Exception:
@@ -1399,8 +1378,7 @@ def _model_keeps_swappable_fused_experts(model) -> bool:
 
 
 def _convert_without(quantizer_cls, quantizers_base, kept):
-    """transformers' `_convert_model_for_quantization` rebuilt over a copy of the
-    swap table without `kept`; None when the method is not the stock one."""
+    """Stock `_convert_model_for_quantization` over a table copy minus `kept`, else None."""
     method = getattr(quantizer_cls, "_convert_model_for_quantization", None)
     fn = getattr(method, "__func__", method)
     table_name = "MODULES_TO_PATCH_FOR_QUANTIZATION"
@@ -1421,8 +1399,7 @@ pass
 
 
 def patch_bnb4bit_keep_fused_experts():
-    """Skip transformers' per-expert swap of a fused experts module when the
-    pre-quantized checkpoint stores that module's experts fused."""
+    """Skip the per-expert swap when the pre-quantized checkpoint stores experts fused."""
     try:
         from transformers.quantizers.quantizer_bnb_4bit import Bnb4BitHfQuantizer
         import transformers.quantizers.base as quantizers_base
@@ -1451,8 +1428,7 @@ def patch_bnb4bit_keep_fused_experts():
             f"Unsloth: the checkpoint stores {', '.join(kept)} experts fused; "
             "keeping the fused module instead of transformers' per-expert swap."
         )
-        # Only this quantizer sees the filtered table; the global one is untouched,
-        # so concurrent loads through any quantizer keep transformers' swap.
+        # Never mutate the global swap table: concurrent loads must keep transformers' swap.
         had_own = "_convert_model_for_quantization" in vars(self)
         previous = vars(self).get("_convert_model_for_quantization")
         self._convert_model_for_quantization = types.MethodType(convert, self)
@@ -1470,14 +1446,10 @@ pass
 
 
 def _bnb4bit_split_fused_expert_conversions():
-    """Converters loading `experts.{gate,up,down}_proj.weight` (+ bnb aux keys) into a
-    kept-fused experts module's gate_up_proj / down_proj.
+    """Load split `experts.{gate,up,down}_proj.weight` into kept-fused stacks.
 
-    gate and up are concatenated along the last dim. When `inter` is a whole number
-    of quant blocks and packed elements, each (expert, hidden) row of both is a run
-    of whole blocks, so the packed bytes and the fp32 absmax concatenate row by row
-    and the stack dequantizes bit-for-bit to the checkpoint's values. Otherwise the
-    two are dequantized, concatenated and requantized.
+    Block-aligned `inter`: packed bytes + absmax concatenate row-wise (bit-exact);
+    otherwise dequantize, concatenate, requantize.
     """
     from transformers.core_model_loading import WeightConverter, ConversionOps
     from transformers.quantizers.quantizers_utils import get_module_from_name
@@ -1506,8 +1478,8 @@ def _bnb4bit_split_fused_expert_conversions():
 
     class _SplitFusedExpertDeserialize(ConversionOps):
         def __init__(self, bases, anchored):
-            self.bases = bases        # one per projection, concatenated in this order
-            self.anchored = anchored  # the same, "$"-anchored (collection keys)
+            self.bases = bases
+            self.anchored = anchored
 
         def convert(self, input_dict, model = None, full_layer_name = None,
                     target_patterns = None, **kwargs):
@@ -1556,8 +1528,7 @@ def _bnb4bit_split_fused_expert_conversions():
                 raise ValueError(f"Unsloth: the parts of {full_layer_name} were quantized differently")
             datas = [input_dict[a] for a in self.anchored]
 
-            # The experts forward is not Unsloth's (the stack was left in its float
-            # dtype), so packed bytes would break it: hand it dequantized values.
+            # Float slot = non-Unsloth forward; packed bytes would break it.
             if not isinstance(slot, Params4bit):
                 parts = [
                     bnb.functional.dequantize_4bit(d, qs).reshape(part_shape)
@@ -1603,8 +1574,7 @@ def _bnb4bit_split_fused_expert_conversions():
 
     converters = []
     for target, parts in (("gate_up_proj", ("gate_proj", "up_proj")), ("down_proj", ("down_proj",))):
-        # `(?<![^.])`: the match starts the key or follows a dot, so `shared_experts.`
-        # never matches; zero width, so the rename keeps the dot before `experts`.
+        # `(?<![^.])` excludes `shared_experts.`; zero width keeps the dot on rename.
         bases = [f"(?<![^.])experts.{p}.weight" for p in parts]
         anchored = [b + "$" for b in bases]
         aux = [b + suf for b in bases for suf in _AUX_SUFFIXES]
@@ -1639,9 +1609,7 @@ def patch_bnb4bit_model_conversion_mapping():
             except Exception as e:
                 if UNSLOTH_ENABLE_LOGGING:
                     logger.info(f"Unsloth: per-expert bnb4bit converters unavailable: {e}")
-            # Kept-fused experts (patch_bnb4bit_keep_fused_experts) read their stacks from
-            # split gate / up / down keys. Not guarded: an error here must surface, or the
-            # load falls back to initialising the packed stacks.
+            # Unguarded: a failure must surface, not fall back to initialising packed stacks.
             if _model_keeps_swappable_fused_experts(model):
                 conversions = _bnb4bit_split_fused_expert_conversions() + conversions
         return conversions
