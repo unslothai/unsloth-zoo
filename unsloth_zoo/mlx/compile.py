@@ -79,15 +79,19 @@ _VERIFIED_TRAINING_ARCHES: set[str] = {
     "gemma3n",
     "gemma4",
     "gemma4_unified",
+    # Nested `text_config` decoder must qualify too, else gemma4 stays eager.
+    "gemma4_text",
     "glm_ocr",
     "idefics2",
     "idefics3",
+    "kimi_vl",
     "llama4",
     "llava",
     "llava_bunny",
     "llava_next",
     "mistral3",
     "mistral4",
+    "moondream2",
     "mllama",
     "moondream3",
     "multi_modality",
@@ -216,15 +220,18 @@ _TRAINING_VERIFIER_HINTS: dict[str, str] = {
     "gemma3n": "verify_gemma3n",
     "gemma4": "verify_gemma4",
     "gemma4_unified": "verify_gemma4_unified",
+    "gemma4_text": "verify_gemma4_text",
     "glm_ocr": "verify_glm_ocr",
     "idefics2": "verify_idefics2",
     "idefics3": "verify_idefics3",
+    "kimi_vl": "verify_kimi_vl",
     "llama4": "verify_llama4",
     "llava": "verify_llava",
     "llava_bunny": "verify_llava_bunny",
     "llava_next": "verify_llava_next",
     "mistral3": "verify_mistral3",
     "mistral4": "verify_mistral4",
+    "moondream2": "verify_moondream2",
     "mllama": "verify_mllama",
     "moondream3": "verify_moondream3",
     "multi_modality": "verify_multi_modality",
@@ -614,6 +621,10 @@ def list_compile_patch_primitives() -> tuple[CompilePatchPrimitive, ...]:
         CompilePatchPrimitive(
             name="training_prefill_mode_bypass",
             description="Skip generation-only chunked-prefill bookkeeping while training, where it costs host syncs and mutable state but nothing reads it.",
+        ),
+        CompilePatchPrimitive(
+            name="presence_check_bypass",
+            description="Drop a host check for whether a token kind is present when its answer cannot change the result.",
         ),
     )
 
@@ -5031,6 +5042,46 @@ def _install_gemma4_unified_compile_patches():
     _PATCHED_ARCHES.add("gemma4_unified")
 
 
+def _install_gemma4_compile_patches():
+    """Vision overlay on sliding layers only, no host read (upstream's raises under mx.compile)."""
+
+    language_module = _try_import_module("mlx_vlm.models.gemma4.language")
+    text_model_cls = getattr(language_module, "Gemma4TextModel", None)
+    original_make_masks = getattr(text_model_cls, "_make_masks", None)
+    # mlx-vlm < 0.6.1 has no vision overlay and a two-argument `_make_masks`: nothing to fix.
+    if original_make_masks is None or not hasattr(
+        text_model_cls, "_apply_blockwise_bidirectional_overlay"
+    ):
+        return
+    from .utils import _SharedKVSlot
+
+    def patched_make_masks(self, h, cache, mm_token_type_ids=None):
+        # Only generation caches keep upstream's masks.
+        if any(c is not None and not isinstance(c, _SharedKVSlot) for c in cache):
+            return original_make_masks(self, h, cache, mm_token_type_ids)
+        masks = original_make_masks(self, h, cache, None)
+        n = h.shape[1]
+        if (
+            getattr(self.config, "use_bidirectional_attention", None) != "vision"
+            or mm_token_type_ids is None
+            or n <= 1
+        ):
+            return masks
+        positions = mx.arange(n)
+        in_window = mx.abs(positions[:, None] - positions[None]) < self.window_size
+        sliding = in_window & self._apply_blockwise_bidirectional_overlay(
+            language_module.create_causal_mask(n),
+            mm_token_type_ids,
+        )
+        return [
+            sliding if layer.layer_type == "sliding_attention" else mask
+            for layer, mask in zip(self.layers, masks)
+        ]
+
+    _patch_method(text_model_cls, "_make_masks", patched_make_masks)
+    _PATCHED_ARCHES.add("gemma4")
+
+
 def _install_deepseek_ocr_compile_patches():
     """Install DeepSeek OCR compile patches for SAM/projector/image merging."""
 
@@ -6028,6 +6079,13 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
             runtime_primitive_names=("gemma4_unified_multimodal_runtime",),
         ),
         CompilePatternBundle(
+            name="gemma4_vision_masks",
+            description="Gemma 4 vision attention masks for cache-free forwards, built as the reference does without a host read.",
+            matcher=lambda arch, report: arch == "gemma4",
+            primitive_names=("presence_check_bypass",),
+            runtime_primitive_names=("gemma4_vision_masks_runtime",),
+        ),
+        CompilePatternBundle(
             name="masked_scatter_multimodal",
             description="Shared compile-safe flattened masked-scatter replacement.",
             matcher=lambda arch, report: (
@@ -6193,6 +6251,7 @@ def _runtime_patch_primitive_installers() -> dict[str, Callable[[], None]]:
         "mistral4_attention_backend_runtime": _install_mistral4_compile_patches,
         "gemma3n_multiscale_fusion_runtime": _install_gemma3n_compile_patches,
         "gemma4_unified_multimodal_runtime": _install_gemma4_unified_compile_patches,
+        "gemma4_vision_masks_runtime": _install_gemma4_compile_patches,
         "deepseek_ocr_multimodal_runtime": _install_deepseek_ocr_compile_patches,
         "masked_scatter_multimodal_runtime": _install_masked_scatter_multimodal_patches,
         "padded_image_filtering_runtime": _install_idefics_family_compile_patches,
