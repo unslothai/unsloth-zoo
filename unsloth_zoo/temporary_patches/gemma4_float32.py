@@ -532,11 +532,12 @@ def patch_Gemma4UnifiedVisionEmbedder():
             for name in ("patch_ln1", "patch_dense", "patch_ln2", "pos_norm"):
                 getattr(self, name)._pre_set_compute_dtype = torch.float32
 
-    def forward(self, pixel_values, image_position_ids):
+    # *args/**kwargs: newer transformers added `return_dict` to this forward.
+    def forward(self, pixel_values, *args, **kwargs):
         if not getattr(self, "_unsloth_vision_fp32", False):
-            return original_forward(self, pixel_values, image_position_ids)
+            return original_forward(self, pixel_values, *args, **kwargs)
         with torch.autocast(device_type = pixel_values.device.type, enabled = False):
-            return original_forward(self, pixel_values, image_position_ids)
+            return original_forward(self, pixel_values, *args, **kwargs)
 
     cls.__init__ = __init__
     cls.forward = forward

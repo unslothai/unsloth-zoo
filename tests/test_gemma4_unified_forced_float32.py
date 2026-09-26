@@ -1,4 +1,9 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
 """Exercise real Gemma4 and Unified text modules on CPU, without checkpoints."""
+
+import inspect
 
 import pytest
 import torch
@@ -205,6 +210,7 @@ def test_unified_vision_projection_preserves_values_above_fp16_range(monkeypatch
     module = pytest.importorskip("transformers.models.gemma4_unified.modeling_gemma4_unified")
     from transformers.models.gemma4_unified.configuration_gemma4_unified import Gemma4UnifiedVisionConfig
     cls = module.Gemma4UnifiedVisionEmbedder
+    original_forward = cls.forward
     monkeypatch.setattr(cls, "__init__", cls.__init__)
     monkeypatch.setattr(cls, "forward", cls.forward)
     monkeypatch.setattr(cls, "_unsloth_vision_fp32_patched", False, raising=False)
@@ -229,6 +235,10 @@ def test_unified_vision_projection_preserves_values_above_fp16_range(monkeypatch
     with torch.autocast("cpu", dtype=torch.bfloat16):
         out = model(pixels, positions)
     handle.remove()
+    # Newer transformers return BaseModelOutputWithPooling (and accept return_dict), older a tensor.
+    out = getattr(out, "pooler_output", out)
+    if "return_dict" in inspect.signature(original_forward).parameters:
+        assert isinstance(model(pixels, positions, return_dict=False), tuple)
     assert projected[0].dtype == torch.float32
     assert projected[0].abs().max() > torch.finfo(torch.float16).max
     assert torch.isfinite(out).all()
