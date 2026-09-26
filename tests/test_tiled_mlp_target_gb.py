@@ -16,6 +16,7 @@
 
 from unittest import mock
 
+import pytest
 import torch
 
 from unsloth_zoo import tiled_mlp
@@ -65,6 +66,23 @@ def test_target_gb_xpu_unsupported_uses_bounded_default_not_host():
          mock.patch("psutil.virtual_memory") as host_ram:
         assert tiled_mlp._default_target_gb() == 4.0  # bounded default, not host RAM
         host_ram.assert_not_called()  # host RAM must not drive an accelerator budget
+
+
+@pytest.mark.parametrize("free, expected", [(2 * 1024 ** 3, 1.0), (None, 4.0)])
+def test_target_gb_npu_uses_npu_memory_not_host(free, expected):
+    fake_cuda = mock.MagicMock()
+    fake_cuda.is_available.return_value = False
+    fake_npu = mock.MagicMock()
+    if free is None:
+        fake_npu.mem_get_info.side_effect = RuntimeError("no free-memory query")
+    else:
+        fake_npu.mem_get_info.return_value = (free, 4 * 1024 ** 3)
+    with mock.patch.object(tiled_mlp, "DEVICE_TYPE", "npu"), \
+         mock.patch.object(torch, "cuda", fake_cuda), \
+         mock.patch.object(torch, "npu", fake_npu, create=True), \
+         mock.patch("psutil.virtual_memory") as host_ram:
+        assert tiled_mlp._default_target_gb() == expected
+        host_ram.assert_not_called()
 
 
 def test_target_gb_cpu_uses_host_memory():
