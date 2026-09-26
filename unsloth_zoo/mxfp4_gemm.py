@@ -107,7 +107,6 @@ if _HAS_TRITON:
     def _decode_tile2d(packed, scale, FAST_CVT: tl.constexpr, HAS_TOP: tl.constexpr):
         # packed (R, C // 2) uint8, scale (R, C // 32) uint8 -> (R, C) bf16, bits as mxfp4_dequant.
         R: tl.constexpr = packed.shape[0]
-        CB: tl.constexpr = packed.shape[1]
         CG: tl.constexpr = scale.shape[1]
         if FAST_CVT:
             pair = tl.inline_asm_elementwise(
