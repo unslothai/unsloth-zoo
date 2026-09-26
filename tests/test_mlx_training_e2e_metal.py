@@ -1454,6 +1454,7 @@ def test_reload_keeps_saved_non_adapter_trainables(tmp_path):
     assert aux <= trainable, sorted(aux - trainable)
     assert _adapter_keys(reloaded) <= trainable
     assert trainable == _adapter_keys(reloaded) | aux
+    assert reloaded._unsloth_reloaded_parameter_keys == aux
 
 
 def _record_cce_rows(monkeypatch):
@@ -1487,7 +1488,7 @@ def test_preference_cce_scores_hidden_states_like_the_logits(monkeypatch, head, 
         model.model.embed_tokens = adapter
         model.freeze()
         adapter.unfreeze(keys=["lora_a", "lora_b"])
-        policy = p.LoRAReferencePolicy([adapter])
+        policy = p.ReferencePolicy(scales=[(adapter, 0.0)])
     model.set_dtype(getattr(mx, dtype))
     rows = []
     for i in range(8):
@@ -1637,7 +1638,7 @@ def test_preference_eval_compacts_unequal_batches(monkeypatch, quantized, refere
         adapter = LoRAEmbedding.from_base(model.model.embed_tokens, r=4, scale=2.0)
         adapter.lora_b = mx.random.normal(adapter.lora_b.shape) * .02
         model.model.embed_tokens = adapter
-        policy = p.LoRAReferencePolicy([adapter])
+        policy = p.ReferencePolicy(scales=[(adapter, 0.0)])
     model.set_dtype(getattr(mx, dtype))
     model.eval()
     rows = []
