@@ -3584,6 +3584,76 @@ def test_gemma3_training_compile_verified():
     assert "gemma3" in mc._VERIFIED_TRAINING_ARCHES
 
 
+def test_gemma4_unified_training_compile_is_wired_end_to_end():
+    import unsloth_zoo.mlx.compile as mc
+
+    assert "gemma4_unified" in mc._VERIFIED_TRAINING_ARCHES
+    assert mc._TRAINING_VERIFIER_HINTS["gemma4_unified"] == "verify_gemma4_unified"
+
+    bundle = next(b for b in mc.list_compile_pattern_bundles()
+                  if b.name == "gemma4_unified_multimodal")
+    assert bundle.matcher("gemma4_unified", None)
+    assert not bundle.matcher("gemma4", None)
+    declared = {p.name for p in mc.list_compile_patch_primitives()}
+    assert set(bundle.primitive_names) <= declared
+    installers = mc._runtime_patch_primitive_installers()
+    assert "gemma4_unified_multimodal_runtime" in bundle.runtime_primitive_names
+    assert (installers["gemma4_unified_multimodal_runtime"]
+            is mc._install_gemma4_unified_compile_patches)
+
+
+@pytest.mark.parametrize("base_default", [True, False])
+def test_gemma4_unified_installer_patches_both_blockers(monkeypatch, base_default):
+    import unsloth_zoo.mlx.compile as mc
+
+    calls = []
+
+    class Model:
+        def __init__(self):
+            self._base_no_chunked_prefill = base_default
+            self.language_model = types.SimpleNamespace(
+                no_chunked_prefill=not base_default)
+            self.no_chunked_prefill = not base_default
+
+        def _update_chunked_prefill_mode(self, input_ids=None, **kwargs):
+            calls.append(input_ids)
+
+    module = types.SimpleNamespace(
+        Model=Model, _compact_prefix_rows=lambda features, valid_mask: None)
+    monkeypatch.setattr(mc, "_try_import_module", lambda name: module)
+    monkeypatch.setattr(mc, "_PATCHED_ARCHES", set())
+    monkeypatch.setattr(mc, "_PATCH_BINDINGS", set())
+    mc._install_gemma4_unified_compile_patches()
+
+    assert module._compact_prefix_rows is mc._static_shape_prefix_rows
+    assert "gemma4_unified" in mc._PATCHED_ARCHES
+
+    model = Model()
+    model.training = True
+    model._update_chunked_prefill_mode("while-training")
+    assert calls == [], "the bookkeeping must not run on the compiled training step"
+    assert model.no_chunked_prefill is base_default
+    assert model.language_model.no_chunked_prefill is base_default
+
+    model.training = False
+    model._update_chunked_prefill_mode("while-generating")
+    assert calls == ["while-generating"], "generation still needs the flag"
+
+
+def test_gemma4_unified_installer_survives_an_mlx_vlm_without_it(monkeypatch):
+    import unsloth_zoo.mlx.compile as mc
+
+    monkeypatch.setattr(mc, "_PATCHED_ARCHES", set())
+    monkeypatch.setattr(mc, "_try_import_module", lambda name: None)
+    mc._install_gemma4_unified_compile_patches()
+    assert "gemma4_unified" not in mc._PATCHED_ARCHES
+
+    module = types.SimpleNamespace(Model=type("Model", (), {}), _compact_prefix_rows=None)
+    monkeypatch.setattr(mc, "_try_import_module", lambda name: module)
+    mc._install_gemma4_unified_compile_patches()
+    assert "gemma4_unified" not in mc._PATCHED_ARCHES
+
+
 def test_compile_discovers_no_archs_under_shim():
     """No real mlx_vlm.models.* installed -> empty discovery, not crash."""
     import unsloth_zoo.mlx.compile as mc
