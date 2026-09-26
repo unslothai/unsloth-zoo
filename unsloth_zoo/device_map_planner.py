@@ -1112,8 +1112,7 @@ def _sub_model_towers(model: nn.Module) -> list[str]:
 
 
 def _collapse_towers(device_map: dict[str, Any], towers: Sequence[str]) -> dict[str, Any]:
-    """One key per whole tower, so accelerate hooks its root and moves its inputs
-    (Qwen3-VL multiplies ``pos_embed`` by weights built on ``grid_thw``'s device)."""
+    """One key per whole tower, so accelerate hooks its root and moves its inputs to it."""
     out: dict[str, Any] = {}
     for key, device in device_map.items():
         tower = next((t for t in towers if key == t or key.startswith(t + ".")), None)
@@ -1122,7 +1121,6 @@ def _collapse_towers(device_map: dict[str, Any], towers: Sequence[str]) -> dict[
 
 
 def _tower_blocks(model: nn.Module, tower: str, no_split_classes: Sequence[str]) -> list[str]:
-    """The outermost no-split blocks inside ``tower``, in definition order."""
     no_split = set(no_split_classes)
     blocks: list[str] = []
     for name, module in _module_by_name(model, tower).named_modules(prefix = tower):
