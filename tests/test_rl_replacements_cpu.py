@@ -514,9 +514,7 @@ def test_grpo_generation_normalizer_unchanged_on_a_normal_batch(loss_type):
 def test_grpo_generation_normalizer_covers_one_accumulation_window(
     loss_type, steps_per_generation, grad_accum,
 ):
-    """One optimizer window of dapo/cispo is the token mean over that window (TRL #6024),
-    though num_items_in_batch counts a whole generation batch of steps_per_generation.
-    Every micro-batch holds 10 tokens, so TRL's expected window count is exact here."""
+    """dapo/cispo window loss = token mean over that window (TRL #6024); 10 tokens per micro-batch."""
     torch.manual_seed(0)
     B, T = 3, 5
     micro = []

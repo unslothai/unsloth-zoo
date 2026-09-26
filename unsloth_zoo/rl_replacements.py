@@ -652,8 +652,7 @@ def grpo_compute_loss(
             normalizer = num_items_in_batch.clamp(min = 1.0) / num_processes
         else:
             normalizer = max(float(num_items_in_batch), 1.0) / num_processes
-        # num_items_in_batch counts the whole generation batch, so rescale it to one
-        # accumulation window like TRL. Only set while training.
+        # num_items_in_batch spans the whole generation batch; rescale to one accumulation window like TRL.
         if steps_per_generation:
             normalizer = normalizer * current_gradient_accumulation_steps / steps_per_generation
         loss = (loss_i * mask).sum() / normalizer
@@ -1455,7 +1454,7 @@ def grpo_accumulated_loss(
     # Follows TRL's own value; older TRL has no such field and False is correct there.
     kwargs["use_bias_correction_kl"] = getattr(trainer.args, "use_bias_correction_kl", False)
     kwargs["use_vllm"] = trainer.use_vllm
-    # An eval batch is neither split across steps nor accumulated, so it keeps the full count.
+    # Eval batches are not split or accumulated, so keep the full count.
     _training = getattr(getattr(trainer, "model", None), "training", True)
     kwargs["steps_per_generation"] = getattr(trainer.args, "steps_per_generation", None) if _training else None
     # Generated trainers still pass unsloth_num_chunks; nothing downstream reads it.
