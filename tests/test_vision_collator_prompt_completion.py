@@ -139,7 +139,6 @@ def test_train_on_responses_only_applies_to_pc_path():
     collator.train_on_responses_only = _mask_token_a
     out = collator(EXAMPLES)
     labels, ids = out["labels"], out["input_ids"]
-    # Before the fix the prompt/completion path returned before the masker ran.
     assert (labels[ids == VOCAB["a"]] == -100).all()
     assert (labels[ids == VOCAB["x"]] == VOCAB["x"]).all()
 
@@ -152,7 +151,6 @@ def test_train_on_responses_only_never_unmasks_pc_path():
     labels, ids = out["labels"], out["input_ids"]
     completion = labels != -1
     assert completion.any()
-    # Pads, image tokens and prompt tokens stay masked with the collator's ignore_index.
     assert not completion[out["attention_mask"] == 0].any()
     assert not completion[ids == IMG_ID].any()
     assert not completion[ids == VOCAB["b"]].any()
