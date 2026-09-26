@@ -1261,3 +1261,46 @@ def patch_Gemma4_static_cache_backport(phase = "post_compile"):
                 obj._supports_static_cache = False
 pass
 TEMPORARY_PATCHES.append(patch_Gemma4_static_cache_backport)
+
+
+def patch_Gemma4_token_type_ids_mask():
+    # Transformers 5.5.x moves token_type_ids to the embedding device, but
+    # leaves image_group_ids on the outer model's device. This also affects
+    # text-only training: Unsloth supplies all-zero multimodal token types.
+    try:
+        from transformers.models.gemma4 import modeling_gemma4
+    except ImportError:
+        return
+    original = getattr(modeling_gemma4, "token_type_ids_mask_function", None)
+    # Newer Transformers builds group IDs on inputs_embeds.device and no
+    # longer exposes this helper.
+    if original is None or getattr(original, "_unsloth_device_aligned", False):
+        return
+    if tuple(inspect.signature(original).parameters) != ("token_type_ids", "image_group_ids"):
+        return
+
+    def token_type_ids_mask_function(token_type_ids, image_group_ids):
+        if token_type_ids is None:
+            return None
+
+        # Move once when constructing the closure, not on every vmap index.
+        # The caller has already aligned token types with inputs_embeds.
+        image_group_ids = image_group_ids.to(token_type_ids.device)
+
+        def inner_mask(batch_idx, head_idx, q_idx, kv_idx):
+            seq_length = image_group_ids.shape[-1]
+            q_idx_clamped = q_idx.clamp(max=seq_length - 1)
+            kv_idx_clamped = kv_idx.clamp(max=seq_length - 1)
+            q_group = image_group_ids[batch_idx, q_idx_clamped]
+            kv_group = image_group_ids[batch_idx, kv_idx_clamped]
+            q_group = torch.where(q_idx < seq_length, q_group, -1)
+            kv_group = torch.where(kv_idx < seq_length, kv_group, -1)
+            return (q_group == kv_group) & (q_group >= 0)
+
+        return inner_mask
+
+    token_type_ids_mask_function._unsloth_device_aligned = True
+    modeling_gemma4.token_type_ids_mask_function = token_type_ids_mask_function
+
+
+TEMPORARY_PATCHES.append(patch_Gemma4_token_type_ids_mask)
