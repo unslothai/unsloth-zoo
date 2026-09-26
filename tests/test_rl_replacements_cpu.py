@@ -1405,8 +1405,8 @@ class _FixedScaler:
         return self.scale
 
 
-# DeepSpeed fp16 leaves accelerator.scaler unset and scales the returned loss itself; a
-# GradScaler instead reaches the forward and the loss is scaled by the same factor.
+# DeepSpeed fp16 leaves accelerator.scaler unset and scales the returned loss itself (upstream_scale set);
+# a GradScaler instead reaches the forward and the loss is scaled by the same factor.
 @pytest.mark.parametrize("scaler_scale, upstream", [(None, 1.0), (None, 128.0), (128.0, 128.0)])
 def test_efficient_grpo_backward_applies_upstream_gradient(scaler_scale, upstream, disable_dynamo):
     new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("grpo")
@@ -1418,6 +1418,7 @@ def test_efficient_grpo_backward_applies_upstream_gradient(scaler_scale, upstrea
     scaler = None if scaler_scale is None else _FixedScaler(scaler_scale)
     out = rr.UnslothEfficientGRPO.apply(
         new_eff, old, ref, None, lm_head, input_ids, mask, advantages, 0.04, scaler, 1, kwargs,
+        1.0 if scaler is None else None,
     )
     (out[0] * upstream).backward()
     assert torch.allclose(new_eff.grad, new_ref.grad * upstream, atol=1e-8, rtol=1e-6)
