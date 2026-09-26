@@ -14,15 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Module-level helpers that pull tensor data into Python must not be fullgraph compiled.
-
-The `.nonzero()` / `.tolist()` / `.item()` screen used to run on module forwards only, so
-a helper in `called_functions` such as Qwen3-Omni's `chunk_and_pad_features`
-(`split(chunk_lengths.tolist())`) was emitted under
-`@torch_compile_with_fallback(fullgraph = True)` and died on the first audio forward with
-GuardOnDataDependentSymNode. Such helpers are now treated like a DISABLE_COMPILE_FUNCTIONS
-name: emitted under `@torch.compiler.disable(recursive = False)`, with compiled callers
-demoted off fullgraph."""
+"""Helpers doing .nonzero() / .tolist() / .item() must not be emitted fullgraph = True."""
 
 import ast
 import importlib.util
@@ -87,8 +79,7 @@ def test_data_dependent_helpers_selects_only_readable_data_dependent_functions(t
 
 
 def _run_compiler_child(script, cwd):
-    """Own interpreter: the rewriter marks the modeling module `__UNSLOTH_PATCHED__` and
-    swaps what it emits back into it, so a compile run is one-way for its process."""
+    """Own interpreter: the rewriter patches the modeling module in place (one-way)."""
     env = dict(os.environ)
     env["UNSLOTH_ALLOW_CPU"] = "1"
     env["UNSLOTH_ZOO_DISABLE_GPU_INIT"] = "1"
@@ -119,7 +110,6 @@ def _run_compiler_child(script, cwd):
 
 
 def _decorators(generated):
-    """{top-level function name: its decorator source} for the generated cache."""
     tree = ast.parse(generated)
     return {
         node.name: "\n".join(ast.get_source_segment(generated, d) for d in node.decorator_list)
@@ -129,7 +119,6 @@ def _decorators(generated):
 
 
 def _fullgraph_functions_calling(generated, names):
-    """Top-level functions emitted fullgraph = True whose body calls one of `names`."""
     tree = ast.parse(generated)
     offenders = []
     for node in tree.body:
@@ -162,8 +151,7 @@ generated = open(
 '''
 
 
-# A real modeling package on disk (so inspect.getsource behaves as upstream), hung off
-# transformers.models.__path__ so the compiler's own import_module finds it.
+# Real package on disk so inspect.getsource works and the compiler's import_module finds it.
 _SYNTHETIC_CHILD = r'''
 import os, sys, json, importlib, io, contextlib, textwrap
 os.environ["UNSLOTH_COMPILE_LOCATION"] = "unsloth_compiled_cache"
@@ -248,11 +236,9 @@ def test_synthetic_data_dependent_helper_is_disabled_and_its_callers_demoted(tmp
         "is a hard GuardOnDataDependentSymNode error on its first call.\n"
         + decorators.get("synthetic_item_helper", "<not emitted>") + context
     )
-    # A helper with no data-dependent call keeps fullgraph: the fix is not a blanket demotion.
     assert "fullgraph = True" in decorators.get("synthetic_plain_helper", ""), (
         decorators.get("synthetic_plain_helper", "<not emitted>") + context
     )
-    # Callers of the disabled helper, helper or module, must not be fullgraph.
     assert "fullgraph = False" in decorators.get("synthetic_helper_caller", ""), (
         decorators.get("synthetic_helper_caller", "<not emitted>") + context
     )
@@ -269,7 +255,7 @@ _QWEN3_OMNI_HELPERS = ["chunk_and_pad_features", "get_valid_indices", "get_audio
 
 
 def _qwen3_omni_defines_the_helpers():
-    """Read the source rather than import it, so no half-patched module leaks out."""
+    """Read, not import, so no half-patched module leaks out."""
     try:
         spec = importlib.util.find_spec(
             f"transformers.models.{_QWEN3_OMNI}.modeling_{_QWEN3_OMNI}"
@@ -337,12 +323,10 @@ def test_qwen3_omni_audio_helpers_are_not_fullgraph(tmp_path):
         )
     assert _fullgraph_functions_calling(generated, set(_QWEN3_OMNI_HELPERS)) == []
 
-    # Helpers with no data-dependent call stay compiled.
     assert "fullgraph = True" in decorators.get("_get_feat_extract_output_lengths", ""), (
         decorators.get("_get_feat_extract_output_lengths", "<not emitted>") + context
     )
 
-    # The first audio forward used to die here with GuardOnDataDependentSymNode.
     assert payload["replaced"], "the compiled cache did not replace chunk_and_pad_features"
     assert payload["error"] is None, payload["error"]
     assert payload["matches"] is True

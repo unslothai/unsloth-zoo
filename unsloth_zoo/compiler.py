@@ -216,9 +216,7 @@ def calls_mask_creation_function(source):
 
 
 def has_data_dependent_call(source):
-    """True if `source` pulls tensor data into Python via `.nonzero()`, `.tolist()` or
-    `.item()`. Under fullgraph = True these give a data-dependent output shape or an
-    unbacked SymInt that Dynamo cannot guard on."""
+    """`.nonzero()` / `.tolist()` / `.item()`: unguardable under fullgraph = True."""
     return (
         ".nonzero()" in source
         or ".tolist()" in source
@@ -227,13 +225,7 @@ def has_data_dependent_call(source):
 
 
 def data_dependent_helpers(modeling_file, called_functions):
-    """Names in `called_functions` whose source makes a data-dependent call.
-
-    The module forward screen never sees standalone helpers, so without this they get
-    `@torch_compile_with_fallback(fullgraph = True)` and, like Qwen3-Omni's
-    `chunk_and_pad_features` (`split(chunk_lengths.tolist())`), die on the first
-    forward with GuardOnDataDependentSymNode. Helpers without readable source (C
-    extensions, builtins, generated code) are skipped; classes are left alone."""
+    """Helpers the module forward screen misses (e.g. Qwen3-Omni chunk_and_pad_features)."""
     found = []
     for name in called_functions:
         function = getattr(modeling_file, name, None)
@@ -5702,11 +5694,7 @@ def unsloth_compile_transformers(
             called_functions.append(function)
     pass
 
-    # Give helpers the same data-dependent screen module forwards get below. Treating
-    # them like a DISABLE_COMPILE_FUNCTIONS name emits them under
-    # `@torch.compiler.disable(recursive = False)` and demotes compiled callers off
-    # fullgraph (Tier 3); torch_compile_with_fallback only falls back on recompile
-    # limits, so a fullgraph = True helper is a hard error on the first forward.
+    # torch_compile_with_fallback only falls back on recompile limits, so these must be disabled.
     for function in data_dependent_helpers(modeling_file, called_functions):
         if function not in disable_compile_functions:
             print(
