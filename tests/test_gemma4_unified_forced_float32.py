@@ -29,7 +29,6 @@ def variant(request, monkeypatch):
         for suffix in ("TextScaledWordEmbedding", "RMSNorm", "TextAttention"):
             cls = getattr(patched_module, patched_prefix + suffix)
             monkeypatch.setattr(cls, "forward", cls.forward)
-    # The numerical kernels are tested eagerly here; GPU compile coverage is separate.
     for name in ("_gemma4_rms_norm_scaled", "_gemma4_rms_norm_unscaled"):
         fn = getattr(patches, name)
         while hasattr(fn, "__wrapped__"):
@@ -196,7 +195,6 @@ def test_unified_image_batch_backward_with_checkpointing(variant):
     ).loss
     assert torch.isfinite(loss)
     loss.backward()
-    # Both image projection and language attention must receive finite gradients.
     grads = {name: p.grad for name, p in model.named_parameters() if p.grad is not None}
     assert any("patch_dense" in name for name in grads)
     assert any("q_proj" in name for name in grads)
@@ -215,7 +213,6 @@ def test_unified_vision_projection_preserves_values_above_fp16_range(monkeypatch
     vision_config = Gemma4UnifiedVisionConfig(patch_size=2, pooling_kernel_size=1,
         mm_embed_dim=16, mm_posemb_size=8, output_proj_dims=16)
     model = cls(vision_config, _config(module, "Gemma4Unified")).half()
-    # Same module markers honored by patch_model_and_tokenizer's casting pass.
     for child in model.modules():
         if hasattr(child, "_pre_set_compute_dtype"):
             child.to(child._pre_set_compute_dtype)
@@ -227,8 +224,7 @@ def test_unified_vision_projection_preserves_values_above_fp16_range(monkeypatch
     positions = torch.tensor([[[0, 0], [1, 0]]])
     projected = []
     handle = model.patch_dense.register_forward_hook(lambda m, a, out: projected.append(out))
-    # Base multimodal norm preserves its input dtype unless forced-fp32 patches
-    # were installed. Use fp32 for this isolated projection/normalization test.
+    # Base norm keeps input dtype unless forced-fp32 patches are installed.
     model.multimodal_embedder.float()
     with torch.autocast("cpu", dtype=torch.bfloat16):
         out = model(pixels, positions)

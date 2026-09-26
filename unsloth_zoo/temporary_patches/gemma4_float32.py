@@ -265,15 +265,14 @@ TEMPORARY_PATCHES.append(patch_Gemma4PLEInputDtype)
 
 
 def _gemma4_text_variants(class_suffix = None):
-    # Unified has its own classes, but the same embedding, norm and attention
-    # contracts. Its decoder has no PLE, so keep the PLE patch separate.
+    # Unified decoder has no PLE, so the PLE patch stays separate.
     for name, prefix in (("gemma4", "Gemma4"), ("gemma4_unified", "Gemma4Unified")):
         try:
             module = importlib.import_module(f"transformers.models.{name}.modeling_{name}")
             if class_suffix is not None:
                 getattr(module, prefix + class_suffix)
         except ImportError:
-            continue  # Older transformers builds do not contain Unified.
+            continue
         except Exception as e:
             raise_error(f"{prefix} forced-float32 patches", e)
             continue
@@ -529,10 +528,7 @@ def patch_Gemma4UnifiedVisionEmbedder():
         original_init(self, *args, **kwargs)
         self._unsloth_vision_fp32 = os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1"
         if self._unsloth_vision_fp32:
-            # OCR patches overflow the fp16 projection before patch_ln2 can
-            # normalize them. Preserve this small block through the loader's
-            # forced-float32 casting pass; keep calling the actual modules so
-            # trainable weights, hooks and adapters remain part of the graph.
+            # OCR patches overflow fp16 before patch_ln2 normalizes them; keep this block fp32.
             for name in ("patch_ln1", "patch_dense", "patch_ln2", "pos_norm"):
                 getattr(self, name)._pre_set_compute_dtype = torch.float32
 
