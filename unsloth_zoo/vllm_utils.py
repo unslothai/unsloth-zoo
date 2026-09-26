@@ -2305,8 +2305,8 @@ def _clear_flashinfer_env_on_hip():
     # Remove any forced FlashInfer selection unconditionally, even when the package
     # is not installed but the env var was inherited, so vLLM does not try to use
     # FlashInfer and falls back to the ROCm/default attention backend. Returns True
-    # on HIP so the caller skips the CUDA FlashInfer setup.
-    if not is_hip():
+    # on HIP or NPU so the caller skips the CUDA FlashInfer setup.
+    if not is_hip() and DEVICE_TYPE != "npu":
         return False
     _fi_forced = False
     for _fi_env in ("VLLM_USE_FLASHINFER_SAMPLER", "VLLM_ATTENTION_BACKEND"):
@@ -2314,7 +2314,8 @@ def _clear_flashinfer_env_on_hip():
             del os.environ[_fi_env]
             _fi_forced = True
     if _fi_forced or importlib.util.find_spec("flashinfer"):
-        logger.info("Unsloth: FlashInfer skipped on AMD ROCm (requires CUDA nvcc). Using vLLM built-in attention.")
+        _platform = "Ascend NPU" if DEVICE_TYPE == "npu" else "AMD ROCm"
+        logger.info(f"Unsloth: FlashInfer skipped on {_platform} (requires CUDA nvcc). Using vLLM built-in attention.")
     return True
 
 
@@ -2863,7 +2864,7 @@ def load_vllm(
             if importlib.util.find_spec("flashinfer") is not None:
                 _block_flashinfer_import()
             _UNSLOTH_FLASHINFER_UNUSABLE = True
-        elif DEVICE_TYPE != "npu" and importlib.util.find_spec("flashinfer"):
+        elif importlib.util.find_spec("flashinfer"):
             # FlashInfer JIT-compiles CUDA kernels; needs nvcc and ninja. If either
             # is missing, skip it so vLLM falls back to FLASH_ATTN + native sampler.
             _has_nvcc = (

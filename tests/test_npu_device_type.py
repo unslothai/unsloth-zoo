@@ -79,6 +79,7 @@ if vu is not None:
     npu.mem_get_info = lambda *a: (1, 2)
     vu.DEVICE_TYPE = "npu"
     print("VLLM", vu.get_mem_info())
+    print("FLASHINFER", vu._clear_flashinfer_env_on_hip())
     vu._device_empty_cache()
 gc.reset_unsloth_gradient_checkpointing_buffers()
 print("CACHE", calls.count("empty_cache") - before)
@@ -108,7 +109,7 @@ def answers():
         if line.startswith("CELL "):
             _, cell, *rest = line.split()
             got[cell] = " ".join(rest)
-        elif line.startswith(("HELPERS ", "GC ", "VLLM ", "CACHE ", "NODEP ")):
+        elif line.startswith(("HELPERS ", "GC ", "VLLM ", "CACHE ", "NODEP ", "FLASHINFER ")):
             key, _, rest = line.partition(" ")
             got[key.lower()] = rest
     assert set(got) >= set(_CELLS), out.stderr[-2000:]
@@ -134,6 +135,12 @@ def test_npu_cache_cleanup_reaches_torch_npu(answers):
     if "nodep" in answers:
         pytest.skip(f"vllm_utils needs {answers['nodep']}")
     assert answers.get("cache") == "2", answers["stderr"]
+
+
+def test_npu_skips_the_cuda_flashinfer_setup(answers):
+    if "nodep" in answers:
+        pytest.skip(f"vllm_utils needs {answers['nodep']}")
+    assert answers.get("flashinfer") == "True", answers["stderr"]
 
 
 def test_npu_gradient_checkpointing_initializes(answers):
