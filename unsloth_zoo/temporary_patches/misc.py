@@ -585,8 +585,7 @@ TEMPORARY_PATCHES.append(patch_CsmProcessor_apply_chat_template)
 
 
 def patch_transformers_masks():
-    if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1":
-        return
+    # No UNSLOTH_COMPILE_DISABLE early return: `_torch_compile` is already a no-op there, and the kwarg fixes still apply.
     try:
         import transformers.masking_utils as masking_utils
         import transformers.generation.utils as generation_utils
@@ -628,17 +627,48 @@ def patch_transformers_masks():
         masking_utils.create_sliding_window_causal_mask,
     )
 
-    compiled_create_causal_mask = _torch_compile(
-        original_create_causal_mask, fullgraph = False, dynamic = True
-    )
-    compiled_create_sliding_window_causal_mask = _torch_compile(
-        original_create_sliding_window_causal_mask, fullgraph = False, dynamic = True
-    )
+    if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1":
+        # `_torch_compile` is `noop` here, i.e. torch.compiler.disable: a fullgraph user compile would refuse it.
+        compiled_create_causal_mask = original_create_causal_mask
+        compiled_create_sliding_window_causal_mask = original_create_sliding_window_causal_mask
+    else:
+        compiled_create_causal_mask = _torch_compile(
+            original_create_causal_mask, fullgraph = False, dynamic = True
+        )
+        compiled_create_sliding_window_causal_mask = _torch_compile(
+            original_create_sliding_window_causal_mask, fullgraph = False, dynamic = True
+        )
 
-    def wrap(f):
+    def wrap(f, original, prepared_mask_shortcut = True):
+        # `input_embeds` <= 5.1 vs `inputs_embeds` 5.2+ (transformers#43916); `cache_position` gone in 5.9 (#45884): read the signature, not the version.
+        try:
+            parameters = inspect.signature(original).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        accepted = set(parameters)
+        takes_var_kwargs = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+        embeds_name = None
+        if "inputs_embeds" in accepted and "input_embeds" not in accepted:
+            embeds_name = "inputs_embeds"
+        elif "input_embeds" in accepted and "inputs_embeds" not in accepted:
+            embeds_name = "input_embeds"
+        drop = () if takes_var_kwargs or not parameters else tuple(
+            name for name in ("cache_position",) if name not in accepted
+        )
+
         def return_attention_mask(*args, **kwargs):
-            input_embeds = kwargs.get("input_embeds", None)
-            if input_embeds is not None and getattr(input_embeds, "requires_grad", False):
+            if embeds_name is not None:
+                for other in ("input_embeds", "inputs_embeds"):
+                    if other != embeds_name and other in kwargs and embeds_name not in kwargs:
+                        kwargs[embeds_name] = kwargs.pop(other)
+            for name in drop:
+                kwargs.pop(name, None)
+            input_embeds = kwargs.get("inputs_embeds", kwargs.get("input_embeds", None))
+            if (
+                prepared_mask_shortcut
+                and input_embeds is not None
+                and getattr(input_embeds, "requires_grad", False)
+            ):
                 attention_mask = kwargs.get("attention_mask", None)
                 if isinstance(attention_mask, BlockMask) or (
                     isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 4
@@ -650,9 +680,33 @@ def patch_transformers_masks():
 
     masking_utils._unsloth_original_create_causal_mask = original_create_causal_mask
     masking_utils._unsloth_original_create_sliding_window_causal_mask = original_create_sliding_window_causal_mask
-    masking_utils.create_causal_mask = wrap(compiled_create_causal_mask)
-    masking_utils.create_sliding_window_causal_mask = wrap(compiled_create_sliding_window_causal_mask)
-    masking_utils.create_masks_for_generate = wrap(masking_utils.create_masks_for_generate)
+    masking_utils.create_causal_mask = wrap(compiled_create_causal_mask, original_create_causal_mask)
+    masking_utils.create_sliding_window_causal_mask = wrap(
+        compiled_create_sliding_window_causal_mask, original_create_sliding_window_causal_mask
+    )
+    # Llama 4 (attention_chunk_size) routes here too; not every supported transformers has it.
+    if hasattr(masking_utils, "create_chunked_causal_mask"):
+        original_create_chunked_causal_mask = getattr(
+            masking_utils, "_unsloth_original_create_chunked_causal_mask",
+            masking_utils.create_chunked_causal_mask,
+        )
+        masking_utils._unsloth_original_create_chunked_causal_mask = original_create_chunked_causal_mask
+        masking_utils.create_chunked_causal_mask = wrap(
+            masking_utils.create_chunked_causal_mask, original_create_chunked_causal_mask
+        )
+    pass
+    # Stash the original: a re-apply must read its signature, not the wrapper's (*args, **kwargs).
+    original_create_masks_for_generate = getattr(
+        masking_utils, "_unsloth_original_create_masks_for_generate",
+        masking_utils.create_masks_for_generate,
+    )
+    masking_utils._unsloth_original_create_masks_for_generate = original_create_masks_for_generate
+    # No prepared-mask shortcut: hybrid configs need the per-layer-type dict this returns.
+    masking_utils.create_masks_for_generate = wrap(
+        masking_utils.create_masks_for_generate,
+        original_create_masks_for_generate,
+        prepared_mask_shortcut = False,
+    )
     generation_utils.create_masks_for_generate = masking_utils.create_masks_for_generate
     # Multi-GPU device_map flex_attention fix: offset tensors may live on a
     # different device than inner_mask runs on. Move them inside the closure
@@ -1541,12 +1595,11 @@ def fix_mamba_ssm_float32():
         with open(ssd_chunk_scan_file, "r", encoding = "utf-8") as file: file = file.read()
     except Exception as e:
         return raise_error("mamba_ssm.ops.triton.ssd_chunk_scan", e)
+    original_file = file
 
     # Find `dst = tl.dot(a, b)` / `dst += tl.dot(a, b)`
-    matches = list(re.finditer(
-        r" ([a-zA-Z0-9\_]{1,}) (\=|\+\=) tl\.dot\(([a-zA-Z0-9\_]{1,})\, ([a-zA-Z0-9\_]{1,})\)",
-        file)
-    )
+    plain_dot = r" ([a-zA-Z0-9\_]{1,}) (\=|\+\=) tl\.dot\(([a-zA-Z0-9\_]{1,})\, ([a-zA-Z0-9\_]{1,})\)"
+    matches = list(re.finditer(plain_dot, file))
     for match in matches:
         old = match.group(0)
         dst, adder, a, b = match.groups()
@@ -1559,11 +1612,44 @@ def fix_mamba_ssm_float32():
         file = file.replace(old, new)
     pass
 
+    # File already upcast; a peer may have rewritten it after we imported, so reload unless loaded kernels are upcast.
+    if file == original_file:
+        module = mamba_ssm.ops.triton.ssd_chunk_scan
+        sources = []
+        for value in list(vars(module).values()):
+            # Triton: Autotuner / Heuristics wrap the JITFunction in `.fn`, which holds its source in `.src`.
+            for _ in range(4):
+                src = getattr(value, "src", None)
+                if isinstance(src, str):
+                    if "tl.dot" in src: sources.append(src)
+                    break
+                value = getattr(value, "fn", None)
+                if value is None: break
+        if sources and not any(re.search(plain_dot, src) for src in sources):
+            return
+        try:
+            importlib.reload(module)
+        except Exception as e:
+            return raise_error("mamba_ssm.ops.triton.ssd_chunk_scan", e)
+        return
+
+    # Atomic rename, not open("w"): truncation lets a concurrent patcher read and write back an empty module.
+    import tempfile
+    tmp_file = None
     try:
+        fd, tmp_file = tempfile.mkstemp(
+            dir = os.path.dirname(ssd_chunk_scan_file), prefix = ".ssd_chunk_scan.", suffix = ".tmp",
+        )
+        with os.fdopen(fd, "w", encoding = "utf-8") as f: f.write(file)
+        os.chmod(tmp_file, os.stat(ssd_chunk_scan_file).st_mode & 0o7777)
+        os.replace(tmp_file, ssd_chunk_scan_file)
+        tmp_file = None
         # Reload module since we editted it
-        with open(ssd_chunk_scan_file, "w", encoding = "utf-8") as f: f.write(file)
         importlib.reload(mamba_ssm.ops.triton.ssd_chunk_scan)
     except Exception as e:
+        if tmp_file is not None:
+            try: os.unlink(tmp_file)
+            except OSError: pass
         return raise_error("mamba_ssm.ops.triton.ssd_chunk_scan", e)
 pass
 TEMPORARY_PATCHES.append(fix_mamba_ssm_float32)
@@ -2544,3 +2630,69 @@ def patch_longrope_impossible_attention_factor():
         return
 pass
 TEMPORARY_PATCHES.append(patch_longrope_impossible_attention_factor)
+
+
+def patch_relu_squared_activation_dtype():
+    """`torch.square` autocasts to float32, breaking Nemotron-H's bf16 `index_add_`; use y * y."""
+    try:
+        import transformers.activations as activations_module
+    except Exception:
+        return
+    activation_class = getattr(activations_module, "ReLUSquaredActivation", None)
+    if activation_class is None or getattr(activation_class, "_unsloth_dtype_patched", False):
+        return
+
+    def forward(self, input):
+        relu_applied = torch.nn.functional.relu(input)
+        return relu_applied * relu_applied
+
+    activation_class.forward = forward
+    activation_class._unsloth_dtype_patched = True
+pass
+TEMPORARY_PATCHES.append(patch_relu_squared_activation_dtype)
+
+
+def _lora_integer_input(self, x):
+    """Prefer the autocast dtype: casting to compute_dtype (float32 default) promotes the output."""
+    if x.is_floating_point() or x.is_complex():
+        return x
+    dtype = None
+    try:
+        if torch.is_autocast_enabled(x.device.type):
+            dtype = torch.get_autocast_dtype(x.device.type)
+    except Exception:
+        dtype = None
+    if dtype is None:
+        dtype = getattr(self.base_layer, "compute_dtype", None)
+    if dtype is None:
+        for adapter in self.active_adapters:
+            if adapter in self.lora_A:
+                dtype = self.lora_A[adapter].weight.dtype
+                break
+    return x.to(dtype) if dtype is not None else x
+pass
+
+
+def patch_peft_lora_integer_input():
+    """Nemotron-H feeds uint8 zeros to idle 4-bit experts; PEFT LoRA under autocast then fails."""
+    try:
+        import peft.tuners.lora.bnb as peft_bnb
+        Linear4bit = getattr(peft_bnb, "Linear4bit", None)
+    except Exception:
+        return
+    if Linear4bit is None:
+        return
+    original_forward = Linear4bit.__dict__.get("forward")
+    if original_forward is None or getattr(original_forward, "_unsloth_integer_input", False):
+        return
+
+    @functools.wraps(original_forward)
+    def forward(self, x, *args, **kwargs):
+        if isinstance(x, torch.Tensor) and not x.is_floating_point():
+            x = _lora_integer_input(self, x)
+        return original_forward(self, x, *args, **kwargs)
+
+    forward._unsloth_integer_input = True
+    Linear4bit.forward = forward
+pass
+TEMPORARY_PATCHES.append(patch_peft_lora_integer_input)

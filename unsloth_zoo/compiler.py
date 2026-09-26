@@ -149,6 +149,9 @@ DISABLED_KEYWORDS = [
     "apply_mask_to_padding_states",  # falcon h1
     "reshape_into_chunks",  # falcon h1
     "pad_tensor_by_size",  # falcon h1
+    # MLA __init__ calls these float helpers under meta init; compiled, they fail on .item()
+    "def yarn_get_mscale(",
+    "def yarn_apply_mscale(",
 ]
 
 DISABLE_COMPILE_FUNCTIONS = [
@@ -4343,6 +4346,26 @@ def _patch_lora_input_cast(source, force_float32 = None):
 pass
 
 
+def _patch_lora_base_layer_input_cast(source):
+    # Outside autocast, match x to a float base weight (fp32 SigLIP under fp16); never to 4-bit / FP8 storage ("Promotion for Float8 Types is not supported").
+    _base_layer_call = "result = self.base_layer(x, *args, **kwargs)"
+    _m = re.search(r'^( *)' + re.escape(_base_layer_call), source, re.MULTILINE)
+    if not _m:
+        return source
+    _ind = _m.group(1)
+    return source.replace(
+        _base_layer_call,
+        f"if not torch.is_autocast_enabled() and hasattr(self.base_layer, 'weight') "
+        f"and self.base_layer.weight is not None "
+        f"and not hasattr(self.base_layer.weight, 'quant_state') "
+        f"and self.base_layer.weight.is_floating_point() "
+        f"and self.base_layer.weight.element_size() > 1 "
+        f"and x.dtype != self.base_layer.weight.dtype:\n"
+        f"{_ind}    x = x.to(self.base_layer.weight.dtype)\n"
+        f"{_ind}{_base_layer_call}",
+    )
+
+
 def patch_lora_forwards(torch_compile_options):
     # All Unsloth Zoo code licensed under LGPLv3
     Linear_LoRA_Layers = get_lora_layer_modules()
@@ -4403,9 +4426,13 @@ def patch_lora_forwards(torch_compile_options):
 
         # Check failed upcasting
         source = _patch_lora_input_cast(source)
+        # getsource unwrapped the integer-input wrapper, so on 4-bit re-add the cast inline.
+        check_forward_args = "self._check_forward_args(x, *args, **kwargs)"
+        integer_input_inline = "4bit" in child.lower() and check_forward_args in source
         source = source.replace(
-            "self._check_forward_args(x, *args, **kwargs)",
-            "",
+            check_forward_args,
+            "if not x.is_floating_point(): x = _unsloth_lora_integer_input(self, x)"
+            if integer_input_inline else "",
         )
 
         if hash(source) != old_hash:
@@ -4432,25 +4459,8 @@ def patch_lora_forwards(torch_compile_options):
                     "    return base_layer(x, *args, **kwargs)\n"
                 )
 
-            # Fix for fp16 + non-quantized base layers (e.g. SiGLIP vision encoder):
-            # When autocast is disabled and base_layer has float32 weights,
-            # cast x to match the weight dtype to prevent dtype mismatch.
             # For 8-bit layers, the base_layer call was already replaced above.
-            # For 4-bit layers, weight.dtype is uint8 (packed quantized bytes),
-            # so we must skip the cast to avoid corrupting input values.
-            _base_layer_call = "result = self.base_layer(x, *args, **kwargs)"
-            _m = re.search(r'^( *)' + re.escape(_base_layer_call), source, re.MULTILINE)
-            if _m:
-                _ind = _m.group(1)
-                source = source.replace(
-                    _base_layer_call,
-                    f"if not torch.is_autocast_enabled() and hasattr(self.base_layer, 'weight') "
-                    f"and self.base_layer.weight is not None "
-                    f"and not hasattr(self.base_layer.weight, 'quant_state') "
-                    f"and x.dtype != self.base_layer.weight.dtype:\n"
-                    f"{_ind}    x = x.to(self.base_layer.weight.dtype)\n"
-                    f"{_ind}{_base_layer_call}",
-                )
+            source = _patch_lora_base_layer_input_cast(source)
 
             # Fix for VARIANT_KWARG_KEYS (peft >= 0.18.0) - import from canonical source
             # if used in source but not available in parent module.
@@ -4464,6 +4474,11 @@ def patch_lora_forwards(torch_compile_options):
                     "    VARIANT_KWARG_KEYS = ['alora_offsets']\n"
                 )
 
+            if integer_input_inline:
+                extra_prepend += (
+                    "\nfrom unsloth_zoo.temporary_patches.misc import "
+                    "_lora_integer_input as _unsloth_lora_integer_input\n"
+                )
             forward = create_new_function(
                 f"{child}_peft_forward",
                 compiled_lora_forward + source,
@@ -4472,10 +4487,18 @@ def patch_lora_forwards(torch_compile_options):
                 prepend=f"\n{variant_kwarg_import}torch_compile_options = {torch_compile_options}\n"
                 + extra_prepend,
             ).unsloth_forward
+            if integer_input_inline:
+                forward._unsloth_integer_input = True
             exec(f"{parent}.{child}.forward = forward", globals(), locals())
         else:
             could_not_replace_modules.append(parent)
     pass
+    try:
+        from unsloth_zoo.temporary_patches.misc import patch_peft_lora_integer_input
+
+        patch_peft_lora_integer_input()
+    except Exception:
+        pass
     if success <= 5:
         print("Unsloth: Not an error, but could not optimize some PEFT modules.")
 
@@ -5415,8 +5438,8 @@ def unsloth_compile_transformers(
     pass
     UNSLOTH_FULLGRAPH = UNSLOTH_FULLGRAPH == "1"
 
-    # Patch PEFT lora forwards
-    if (not disable) and fast_lora_forwards:
+    # Gated on full disable only: the addmm forward needs no torch.compile, and PEFT's own runs fp32 GEMMs.
+    if (not full_disable) and fast_lora_forwards:
         print("Unsloth: Patching LoRA to make it faster")
         patch_lora_forwards(torch_compile_options)
     pass
