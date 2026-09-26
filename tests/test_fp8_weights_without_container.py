@@ -113,7 +113,6 @@ def test_container_target_passes_weight_and_scale_through():
 
 
 def test_container_scale_takes_the_parameter_dtype():
-    # Qwen3-FP8 ships bf16 scales; stock loading upcasts them into the fp32 `weight_scale_inv`.
     model = _Holder()
     op = _make_op(Fp8Dequantize)(_quantizer())
     q, scale = _block_quantize(torch.randn(8, 8), (4, 4))
