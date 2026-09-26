@@ -9,7 +9,7 @@ import pytest
 
 pytest.importorskip("accelerate")  # TrainingArguments needs it; absent on MLX-only installs
 import torch
-from transformers import TrainingArguments
+from transformers import TrainingArguments, get_scheduler
 
 import unsloth_zoo.training_utils as training_utils
 
@@ -23,6 +23,7 @@ def _scheduler_kwargs(monkeypatch, tmp_path, **args):
 
     def fake_get_scheduler(**kwargs):
         seen.update(kwargs)
+        seen["scheduler"] = get_scheduler(**kwargs)  # the real signature must accept the call
         raise _Stop
 
     monkeypatch.setattr(training_utils, "transformers_get_scheduler", fake_get_scheduler)
@@ -41,7 +42,7 @@ def _scheduler_kwargs(monkeypatch, tmp_path, **args):
 
 def test_default_lr_scheduler_kwargs_reach_the_scheduler(monkeypatch, tmp_path):
     kwargs = _scheduler_kwargs(monkeypatch, tmp_path)
-    assert set(kwargs) == {"name", "optimizer", "num_warmup_steps", "num_training_steps"}
+    assert kwargs["scheduler_specific_kwargs"] is None
 
 
 def test_given_lr_scheduler_kwargs_are_still_passed(monkeypatch, tmp_path):
@@ -51,4 +52,5 @@ def test_given_lr_scheduler_kwargs_are_still_passed(monkeypatch, tmp_path):
         lr_scheduler_type = "cosine_with_restarts",
         lr_scheduler_kwargs = {"num_cycles": 3},
     )
-    assert kwargs["num_cycles"] == 3
+    assert kwargs["scheduler_specific_kwargs"] == {"num_cycles": 3}
+    assert kwargs["scheduler"].lr_lambdas[0].keywords["num_cycles"] == 3
