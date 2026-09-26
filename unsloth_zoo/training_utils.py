@@ -26,6 +26,7 @@ import time
 from typing import Any, Optional, List, Dict, Tuple
 from .utils import _get_dtype, Version
 from .hf_utils import dtype_from_config
+from .device_type import DEVICE_TYPE
 from .gradient_checkpointing import (
     unpatch_unsloth_gradient_checkpointing,
     unpatch_unsloth_smart_gradient_checkpointing,
@@ -667,6 +668,7 @@ def unsloth_train(trainer):
     #     .to(device = "cuda:0", non_blocking = True)[0]
 
     # Mixed precision scaling
+    _amp_device = "npu" if DEVICE_TYPE == "npu" else "cuda"
     torch_version = torch.__version__
     config_dtype = dtype_from_config(model.config)
     if config_dtype == torch.float16:
@@ -676,7 +678,7 @@ def unsloth_train(trainer):
         if Version(torch_version) < Version("2.4.0"):
             float16_scaler = torch.cuda.amp.GradScaler()
         else:
-            float16_scaler = torch.amp.GradScaler("cuda")
+            float16_scaler = torch.amp.GradScaler(_amp_device)
     else:
         mixed_precision = "bf16"
         mixed_dtype = torch.bfloat16
@@ -694,14 +696,14 @@ def unsloth_train(trainer):
         )
     else:
         autocast_context_manager = torch.amp.autocast(
-            device_type = "cuda",
+            device_type = _amp_device,
             dtype = mixed_dtype,
             cache_enabled = False,
         )
     pass
 
     step = 0
-    accumulated_loss = torch.zeros(1, device = "cuda:0", dtype = torch.float32)[0]
+    accumulated_loss = torch.zeros(1, device = f"{_amp_device}:0", dtype = torch.float32)[0]
     debug_info = \
         f'==((====))==  Unsloth - 2x faster free finetuning | Num GPUs = {training_args.world_size}\n'\
         f'    \\   /|    Num examples = {n_training_samples:,} | Num Epochs = {num_train_epochs:,}\n'\
@@ -747,8 +749,8 @@ def unsloth_train(trainer):
 
                 # Gradient accumulation
                 for batch in batches:
-                    input_ids = batch["input_ids"].pin_memory().to(device = "cuda:0", non_blocking = True)
-                    labels    = batch["labels"]   .pin_memory().to(device = "cuda:0", non_blocking = True)
+                    input_ids = batch["input_ids"].pin_memory().to(device = f"{_amp_device}:0", non_blocking = True)
+                    labels    = batch["labels"]   .pin_memory().to(device = f"{_amp_device}:0", non_blocking = True)
 
                     with autocast_context_manager:
                         loss = model(input_ids = input_ids, labels = labels, n_items = n_items).loss
