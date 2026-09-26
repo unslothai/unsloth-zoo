@@ -67,12 +67,7 @@ def test_legacy_match_reaches_no_router_and_no_expert():
     def legacy_skip(full_name, keys):
         return any((key + "." in full_name) or (key == full_name) for key in keys)
 
-    for name in ROUTER_NAMES:
-        if name == "moe.gate":
-            assert legacy_skip(name, SKIP_QUANTIZATION_MODULES), name
-        else:
-            assert not legacy_skip(name, SKIP_QUANTIZATION_MODULES), name
-    for name in EXPERT_NAMES:
+    for name in ROUTER_NAMES + EXPERT_NAMES:
         assert not legacy_skip(name, SKIP_QUANTIZATION_MODULES), name
 
 
