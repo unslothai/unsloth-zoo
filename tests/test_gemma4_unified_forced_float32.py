@@ -13,6 +13,7 @@ from unsloth_zoo.temporary_patches import utils as patch_utils
 
 
 def test_older_transformers_without_unified_keeps_gemma4(monkeypatch):
+    pytest.importorskip("transformers.models.gemma4.modeling_gemma4")
     original_import = patches.importlib.import_module
 
     def import_without_unified(name, package=None):
