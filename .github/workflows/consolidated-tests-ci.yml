@@ -250,6 +250,8 @@ jobs:
           # `pytest.importorskip("gguf")`: 73 of them, the whole post conversion
           # verification file, silently and with the job still green.
           pip install gguf
+          # For the planner compressed-tensors gate; torch cap repeated or a newer release swaps in CUDA torch.
+          pip install compressed-tensors "torch>=2.4.0,<2.11.0"
 
       - uses: ./.github/actions/pip-cache-save
         with:
@@ -414,9 +416,11 @@ jobs:
         # test_compiled_cache_fail_closed pins that the compiled cache refuses bytes
         # it did not generate, bytecode included: the digest covers the .py, so the
         # pyc has to be dropped before every verified import.
+        # test_device_map_planner_compressed_tensors: pack-quantized checkpoints planned at packed bytes.
         run: |
           python -m pytest \
             tests/test_training_utils_use_cache.py \
+            tests/test_unsloth_train_scheduler_kwargs.py \
             tests/test_loss_normalization_contract.py \
             tests/test_mlx_finetune_last_n_layers.py \
             tests/test_mlx_double_quant_reject.py \
@@ -445,9 +449,11 @@ jobs:
             tests/test_vllm_flashinfer_survives_spawn.py \
             tests/test_sft_prepare_dataset_double_bos.py \
             tests/test_moe_preprocess_weight_transpose.py \
+            tests/test_relative_imports_resolve.py \
             tests/test_moe_weight_preprocessor_registry_shared.py \
             tests/test_moe_triton_down_lora_roworder.py \
             tests/test_moe_router_not_a_lora_target.py \
+            tests/test_moe_router_under_moe_block_not_quantized.py \
             tests/test_moe_stacked_expert_lora_reaches_forward.py \
             tests/test_bnb_expert_stack_slicing.py \
             tests/test_bnb_expert_stack_slicing_cpu.py \
@@ -482,6 +488,7 @@ jobs:
             tests/test_undefined_name_gate.py \
             tests/test_safe_serialization_none.py \
             tests/test_published_version_window.py \
+            tests/test_device_map_planner_compressed_tensors.py \
             -v
 
       - name: pytest MLX adapter-filter gate (HARD GATE)
@@ -1110,6 +1117,7 @@ jobs:
                   tests/test_vision_utils_grid_helpers_eager.py \
                   tests/test_modeling_local_vision_helpers_eager.py \
                   tests/test_disable_compile_functions_reach_imported_helpers.py \
+                  tests/test_data_dependent_helpers_not_fullgraph.py \
                   tests/test_temporary_patches_exhaustive.py \
                   tests/test_mxfp4_load_path_layout.py \
                   tests/test_linear4bit_packed_without_quant_state.py \

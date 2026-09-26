@@ -621,6 +621,7 @@ from .preference import (
     make_orpo_loss_fn,
     make_orpo_cce_loss_fn,
     make_preference_eval_fn,
+    precompute_reference_logps,
     resolve_preference_objective,
     resolve_preference_length_policy,
 )
@@ -1347,6 +1348,14 @@ class MLXTrainingConfig:
             "loss_type",
             "loss_weights",
             "discopop_tau",
+            "model_adapter_name",
+            "ref_adapter_name",
+            "force_use_ref_model",
+            "sync_ref_model",
+            "ref_model_mixup_alpha",
+            "ref_model_sync_steps",
+            "precompute_ref_log_probs",
+            "precompute_ref_batch_size",
         }
         _field_names = {field.name for field in config_fields}
         copied_all_fields = (_field_names - _appended_fields) <= set(provided)
@@ -1439,6 +1448,15 @@ class MLXDPOConfig(MLXTrainingConfig):
     loss_type: str | list[str] = field(default="sigmoid", kw_only=True)
     loss_weights: list[float] | None = field(default=None, kw_only=True)
     discopop_tau: float = field(default=0.05, kw_only=True)
+    # ref_adapter_name is a saved adapter directory: an MLX model has one unnamed adapter set.
+    model_adapter_name: str | None = field(default=None, kw_only=True)
+    ref_adapter_name: str | None = field(default=None, kw_only=True)
+    force_use_ref_model: bool = field(default=False, kw_only=True)
+    sync_ref_model: bool = field(default=False, kw_only=True)
+    ref_model_mixup_alpha: float = field(default=0.6, kw_only=True)
+    ref_model_sync_steps: int = field(default=512, kw_only=True)
+    precompute_ref_log_probs: bool = field(default=False, kw_only=True)
+    precompute_ref_batch_size: int | None = field(default=None, kw_only=True)
     disable_dropout: bool = field(default=True, kw_only=True)
     max_length: int | None = field(default=1024, kw_only=True)
     max_prompt_length: int | None = field(default=512, kw_only=True)
@@ -2069,6 +2087,23 @@ class MLXTrainer:
             )
             self._resolved_preference_length_policy = policy
         return policy
+
+    def _build_dpo_reference(self, model, *, resume_provenance):
+        args = self.args
+        return build_reference_policy(
+            model,
+            reference_free=bool(args.reference_free),
+            resume_provenance=resume_provenance,
+            neftune=(
+                [self._neftune_emb]
+                if getattr(self, "_neftune_emb", None) is not None else []
+            ),
+            ref_adapter_name=getattr(args, "ref_adapter_name", None),
+            model_adapter_name=getattr(args, "model_adapter_name", None),
+            ref_model=getattr(self, "ref_model", None),
+            force_use_ref_model=bool(getattr(args, "force_use_ref_model", False)),
+            sync_ref_model=bool(getattr(args, "sync_ref_model", False)),
+        )
 
     def __init__(
         self,
@@ -4436,7 +4471,7 @@ class MLXTrainer:
                 return out
 
         # Report the base class's name so the save-window DoRA detection
-        # (`type(module).__name__.startswith("DoRA")` in mlx/utils.py) sees
+        # (`is_mlx_dora_module` in mlx/utils.py) sees
         # through this transparent stand-in. An embedding-only DoRA adapter
         # (use_dora=True targets embed_tokens) is what NEFTune subclasses here,
         # so a bare "_NEFTuneEmbed" name would fail that check and silently
@@ -4681,6 +4716,12 @@ class MLXTrainer:
         try:
             from .loader import _keep_norm_parameters_float32
             _keep_norm_parameters_float32(model)
+            _reference_model = (
+                None if bool(getattr(args, "reference_free", False))
+                else getattr(self, "ref_model", None)
+            )
+            if _reference_model is not None:
+                _keep_norm_parameters_float32(_reference_model)
             _set_norm_output_cast_to_input_dtype(cast_norm_output, model)
             if cast_norm_output:
                 _main_print("Unsloth: Casting MLX norm outputs back to activation dtype.")
@@ -4970,6 +5011,10 @@ class MLXTrainer:
             # Full fine-tuning updates projections a fusion cached once.
             from .loader import _disable_fused_input_projections
             _unfused_projection_modules = _disable_fused_input_projections(model)
+            if _reference_model is not None:
+                _unfused_projection_modules += _disable_fused_input_projections(
+                    _reference_model,
+                )
             # Qwen2/2.5/3-VL language towers share the fused MRoPE kernel with
             # no VJP; flip it off so training takes the differentiable fallback.
             if any(t in model_type for t in ("qwen3_vl", "qwen2_vl", "qwen2_5_vl")):
@@ -5114,7 +5159,12 @@ class MLXTrainer:
             if use_cce:
                 loss_fn = make_cce_loss_fn(model, label_smoothing=label_smoothing)
                 cce_backend = getattr(loss_fn, "_unsloth_cce_backend", "unknown")
-                if cce_backend == "baseline-fallback":
+                if hasattr(loss_fn, "_unsloth_compiled_loss_fn"):
+                    _main_print(
+                        "Unsloth: LoRA head CCE is available for compiled steps; "
+                        "eager steps use standard cross-entropy."
+                    )
+                elif cce_backend == "baseline-fallback":
                     use_cce = False
                     # The factory already printed the specific reason (topology,
                     # head eligibility, or logit transform); keep this generic.
@@ -5333,6 +5383,13 @@ class MLXTrainer:
         self._reset_run_state()
 
         _resume_step = 0
+        _dpo_reference = None
+        _sync_reference = (
+            preference_kind == "dpo" and not bool(args.reference_free)
+            and bool(getattr(args, "sync_ref_model", False))
+        )
+        _sync_every = int(args.ref_model_sync_steps) if _sync_reference else 0
+        _sync_alpha = float(args.ref_model_mixup_alpha) if _sync_reference else 0.0
         ts = {}
         _resume_from = getattr(self, "_resume_from_checkpoint", None)
         _resume_from = self._validate_distributed_resume_checkpoint(_resume_from)
@@ -5369,10 +5426,9 @@ class MLXTrainer:
                         "Unsloth MLX DPO: checkpoint reference mode does not match."
                     )
                 if preference_kind == "dpo" and not bool(args.reference_free):
-                    build_reference_policy(
-                        model,
-                        reference_free=False,
-                        resume_provenance=resume_provenance,
+                    # Built before the checkpoint hydrates the model.
+                    _dpo_reference = self._build_dpo_reference(
+                        model, resume_provenance=resume_provenance,
                     )
 
                 # 1. Load trained adapter weights into the model. The model
@@ -5387,6 +5443,8 @@ class MLXTrainer:
                 )
                 # 2. Restore optimizer state (Adam moments m,v, step counter).
                 load_optimizer_state(optimizer, _resume_from)
+                if _sync_reference:
+                    _dpo_reference[0].load(_resume_from)
                 # 3. Restore trainer scalars (step counter, loss history, and
                 #    best-model / early-stopping tracking). .get defaults keep
                 #    pre-fix SFT checkpoints resumable.
@@ -5501,18 +5559,12 @@ class MLXTrainer:
                     discopop_tau=args.discopop_tau,
                     reference_free=bool(args.reference_free),
                 )
-                reference_policy, provenance = build_reference_policy(
-                    model,
-                    reference_free=bool(args.reference_free),
-                    resume_provenance=ts.get("preference_reference"),
-                    neftune=(
-                        [self._neftune_emb]
-                        if getattr(self, "_neftune_emb", None) is not None else []
-                    ),
-                )
+                if _dpo_reference is None:
+                    _dpo_reference = self._build_dpo_reference(
+                        model, resume_provenance=ts.get("preference_reference"),
+                    )
+                reference_policy, provenance = _dpo_reference
                 self._preference_reference_provenance = provenance
-                # Sampling borrows this policy's adapter modules so it zeroes
-                # the same ones the loss does. NEFTune is already off in eval.
                 _sampling_reference = reference_policy
                 loss_fn = (make_dpo_cce_loss_fn(model, objective, reference_policy=reference_policy)
                            if args.use_cce else make_dpo_loss_fn(objective, reference_policy=reference_policy))
@@ -5533,6 +5585,9 @@ class MLXTrainer:
                 batches.configure_cce_compaction(
                     getattr(loss_fn, "_unsloth_cce_compaction", False), kind=preference_kind,
                 )
+        _reference_compile_state = (
+            [] if _sampling_reference is None else [_sampling_reference.state]
+        )
 
         self.callback_handler.optimizer = optimizer
         self.callback_handler.lr_scheduler = getattr(self, "_lr_schedule", None)
@@ -5547,6 +5602,11 @@ class MLXTrainer:
 
         # Build loss+grad function — returns ((loss, ntoks), grads)
         loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
+        _compiled_loss_fn = getattr(loss_fn, "_unsloth_compiled_loss_fn", None)
+        _compiled_loss_and_grad_fn = (
+            nn.value_and_grad(model, _compiled_loss_fn)
+            if _compiled_loss_fn is not None else None
+        )
 
         lora_plus_ratio = args.lora_plus_ratio
         use_lora_plus = lora_plus_ratio > 0
@@ -5659,7 +5719,10 @@ class MLXTrainer:
         # that would add a report/no-report compile trace signature.
         _report_grad_norm = bool(getattr(args, "report_grad_norm", False))
         _compute_report_norm = _report_grad_norm and max_grad_norm <= 0
-        state = [model.state, optimizer.state, mx.random.state]
+        state = [
+            model.state, optimizer.state, mx.random.state,
+            *_reference_compile_state,
+        ]
         # grad_accum==1 fast path: only for unclipped updates, since
         # clip_grad_norm can spike peak memory on bf16 VLM runs.
         _direct_single_step_update = (
@@ -5797,9 +5860,14 @@ class MLXTrainer:
             return grad_norm
 
         def _loss_and_grad(batch_data):
+            compute = (
+                _compiled_loss_and_grad_fn
+                if _use_compile and _compiled_loss_and_grad_fn is not None
+                else loss_and_grad_fn
+            )
             if isinstance(batch_data, dict):
-                return loss_and_grad_fn(model, batch_data)
-            return loss_and_grad_fn(model, *batch_data)
+                return compute(model, batch_data)
+            return compute(model, *batch_data)
 
         def _accumulate_weighted_grad(grad, toks_f, prev_state):
             """Accumulate token-weighted grads without distributed collectives."""
@@ -5948,7 +6016,9 @@ class MLXTrainer:
         if _use_compile:
             _uncompiled_step_fn = step_fn
             if _ddp_compile_local_grad:
-                _compile_state = [model.state, mx.random.state]
+                _compile_state = [
+                    model.state, mx.random.state, *_reference_compile_state,
+                ]
                 _main_print(
                     "Unsloth: mx.compile enabled for MLX DDP local "
                     "loss/gradient accumulation; distributed collectives "
@@ -6116,6 +6186,32 @@ class MLXTrainer:
         text_completion_only_loss = _text_completion_only_loss_arg(args)
         text_assistant_only_loss = _text_assistant_only_loss_arg(args)
 
+        _precompute_reference = _sampling_reference is not None and bool(
+            getattr(args, "precompute_ref_log_probs", False)
+        )
+        _precompute_chunk = (
+            getattr(args, "precompute_ref_batch_size", None)
+            if _precompute_reference else None
+        )
+
+        def _precompute_eval_reference(plans, eval_batch_size):
+            plans = list(plans.values()) if isinstance(plans, dict) else [plans]
+            paused = pause_mlx_training_patches()
+            was_training = getattr(model, "training", True)
+            model.eval()
+            try:
+                for plan in plans:
+                    precompute_reference_logps(
+                        plan, model, _sampling_reference,
+                        batch_size=int(_precompute_chunk or eval_batch_size),
+                        scorer=getattr(preference_eval_fn, "_unsloth_cce_scorer", None),
+                    )
+            finally:
+                model.train(was_training)
+                resume_mlx_training_patches(paused)
+            if not _samples_prompts:
+                _sampling_reference.release()
+
         def _prepare_eval_batches():
             """Materialize eval batches the first time evaluation is requested.
 
@@ -6212,6 +6308,8 @@ class MLXTrainer:
                         eval_batches = _create_every_eval_split()
                 else:
                     eval_batches = _create_every_eval_split()
+                if _precompute_reference:
+                    _precompute_eval_reference(eval_batches, eval_batch_size)
             self.callback_handler.eval_dataloader = eval_batches
             _eval_steps = int(getattr(self.state, "eval_steps", 0) or 0)
             if eval_batches and _eval_steps > 0:
@@ -6238,6 +6336,20 @@ class MLXTrainer:
                         f"({eval_batch_count} eval batches)."
                     )
             return eval_batches
+
+        if _precompute_reference:
+            _train_chunk = int(_precompute_chunk or args.per_device_train_batch_size)
+            precompute_reference_logps(
+                batches, model, _sampling_reference, batch_size=_train_chunk,
+                scorer=getattr(loss_fn, "_unsloth_cce_scorer", None),
+            )
+            if self.eval_dataset is None and not _samples_prompts:
+                _sampling_reference.release()
+            _main_print(
+                "Unsloth: precomputed the reference log probabilities "
+                f"({len(batches.rows)} training rows, {_train_chunk} pairs "
+                "per chunk)."
+            )
 
         def _fire(event, **kwargs):
             """Dispatch an HF callback event on every rank, like HF Trainer.
@@ -6321,7 +6433,7 @@ class MLXTrainer:
         features = []
         if is_vlm:
             features.append("VLM")
-        if use_cce:
+        if use_cce and (_compiled_loss_fn is None or _use_compile):
             features.append("CCE")
         if args.gradient_checkpointing:
             features.append("GC")
@@ -6618,7 +6730,7 @@ class MLXTrainer:
 
                 defaults = self._generation_defaults
                 started = time.perf_counter()
-                def _decode(label):
+                def _decode(label, decode_model):
                     """Decode on every rank, or on none of them.
 
                     A rank that unwinds never reaches the
@@ -6629,7 +6741,8 @@ class MLXTrainer:
                     local_error = None
                     try:
                         result = generate_batch(
-                            model, self.tokenizer, requests, defaults=defaults,
+                            decode_model, self.tokenizer, requests,
+                            defaults=defaults,
                         )
                     except BaseException as error:
                         local_error = error
@@ -6651,22 +6764,18 @@ class MLXTrainer:
                         return None
                     return result
 
-                policy = _decode("policy")
+                policy = _decode("policy", model)
                 if policy is None:
                     self.last_generation_samples = []
                     return
 
                 reference = None
-                modules = tuple(getattr(_sampling_reference, "modules", ()) or ())
-                if modules and not self._distributed_should_stop():
-                    scales = [module.scale for module in modules]
-                    try:
-                        for module in modules:
-                            module.scale = 0.0
-                        reference = _decode("reference")
-                    finally:
-                        for module, scale in zip(modules, scales):
-                            module.scale = scale
+                if (
+                    _sampling_reference is not None
+                    and not self._distributed_should_stop()
+                ):
+                    with _sampling_reference.activate(model) as reference_model:
+                        reference = _decode("reference", reference_model)
                     if reference is None:
                         # The policy half alone is indistinguishable from what an
                         # unreferenced objective publishes, hiding the failure.
@@ -6922,6 +7031,8 @@ class MLXTrainer:
                         # succeeded, so log failures but keep it.
                         try:
                             save_optimizer_state(optimizer, ckpt_dir)
+                            if _sync_reference:
+                                _sampling_reference.save(ckpt_dir)
                             save_trainer_state(
                                 {
                                     "global_step": current_step,
@@ -7159,7 +7270,10 @@ class MLXTrainer:
                 _ddp_compile_local_grad = False
                 if isinstance(batches, _EAGER_REFETCHABLE_PLAN_TYPES):
                     batch_data = batches[scheduled_index]
-                state = [model.state, optimizer.state, mx.random.state]
+                state = [
+                    model.state, optimizer.state, mx.random.state,
+                    *_reference_compile_state,
+                ]
                 local_error = None
                 try:
                     result = step_fn(batch_data, prev_state, do_update)
@@ -7471,7 +7585,10 @@ class MLXTrainer:
                         if isinstance(batches, _EAGER_REFETCHABLE_PLAN_TYPES):
                             batch_data = batches[scheduled_index]
                         _restore_mlx_rng_key(rng_state_before)
-                        state = [model.state, optimizer.state, mx.random.state]
+                        state = [
+                            model.state, optimizer.state, mx.random.state,
+                            *_reference_compile_state,
+                        ]
                         lvalue, toks, stats, grad_accum_state, grad_norm = step_fn(
                             batch_data, grad_accum_state, do_update,
                         )
@@ -7667,6 +7784,8 @@ class MLXTrainer:
             self._global_step = current_step
             self.state.global_step = current_step
             accum_progress = 0
+            if _sync_reference and current_step % _sync_every == 0:
+                _sampling_reference.sync(model, _sync_alpha)
             # Advance the callback epoch only on an optimizer step, beside the
             # global_step it belongs to and just before on_step_end -- HF's
             # `state.global_step += 1; state.epoch = epoch + (step+1)/
@@ -8202,6 +8321,35 @@ class MLXTrainer:
                     raise ValueError(
                         "Unsloth MLX DPO: label_smoothing must be in [0, 0.5)."
                     )
+                if bool(getattr(args, "sync_ref_model", False)) and not bool(
+                    args.reference_free
+                ):
+                    alpha = float(args.ref_model_mixup_alpha)
+                    if not math.isfinite(alpha) or not 0 <= alpha <= 1:
+                        raise ValueError(
+                            "Unsloth MLX DPO: ref_model_mixup_alpha must be in "
+                            "[0, 1]."
+                        )
+                    if int(args.ref_model_sync_steps) < 1:
+                        raise ValueError(
+                            "Unsloth MLX DPO: ref_model_sync_steps must be at "
+                            "least 1."
+                        )
+                if bool(getattr(args, "precompute_ref_log_probs", False)) and not bool(
+                    args.reference_free
+                ):
+                    if bool(getattr(args, "sync_ref_model", False)):
+                        raise ValueError(
+                            "Unsloth MLX DPO: precompute_ref_log_probs scores "
+                            "the reference once, and sync_ref_model moves it "
+                            "during the run. Use one of the two."
+                        )
+                    chunk = getattr(args, "precompute_ref_batch_size", None)
+                    if chunk is not None and int(chunk) < 1:
+                        raise ValueError(
+                            "Unsloth MLX DPO: precompute_ref_batch_size must be "
+                            "at least 1."
+                        )
             try:
                 len(train_dataset)
                 train_dataset[0]
@@ -8696,6 +8844,10 @@ class MLXDPOTrainer(MLXTrainer):
     config_class = MLXDPOConfig
     preference_kind = "dpo"
 
+    def __init__(self, *args, ref_model=None, **kwargs):
+        self.ref_model = ref_model
+        super().__init__(*args, **kwargs)
+
 
 def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
                             max_seq_length, formatting_func=None,
@@ -8706,7 +8858,7 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
                             preserve_dataset_order=False,
                             num_epochs=None, return_dataset=False,
                             comm_group=None, distributed_pad_mode="cycle",
-                            return_plan=False):
+                            return_plan=False, grad_accum=None):
     """Create padded batches with label masks for train_on_responses_only.
 
     Tokenizes each dataset item, applies the masking closure to get labels,
@@ -8829,11 +8981,13 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
         # legacy default: length-sort once
         return sorted(range(len(all_items)), key=lambda i: len(all_items[i][0]))
 
-    # 3. Build `num_epochs` blocks so `batches[i % len]` cycle reseeds correctly.
+    # 3. Build ceil(num_epochs) blocks so `batches[i % len]` cycle reseeds correctly.
     _n_epochs_materialize = (
-        max(1, int(num_epochs)) if num_epochs is not None else 1
+        max(1, math.ceil(num_epochs)) if num_epochs is not None else 1
     )
-    from .utils import _finite_text_pad_width, _normalize_seed
+    from .utils import (
+        _finite_epoch_batch_budget, _finite_text_pad_width, _normalize_seed,
+    )
     # Normalized so seed=None is deterministic (canonicalized) instead of
     # entropy-derived; explicit seeds are unchanged. Visits stay identity —
     # these plans carry explicitly materialized epoch blocks.
@@ -8879,6 +9033,9 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
         if cycle_length is None and len(epoch_schedule) > 0:
             cycle_length = len(epoch_schedule)
 
+    # Fractional epochs end mid-pass on whole accumulation windows, as HF does.
+    if num_batches is None and num_epochs is not None and cycle_length:
+        num_batches = _finite_epoch_batch_budget(cycle_length, num_epochs, grad_accum)
     if num_batches is not None and len(schedule) > num_batches:
         schedule = schedule[:num_batches]
         widths = widths[:num_batches]
@@ -9253,11 +9410,8 @@ def train_on_responses_only(
             args.max_steps * args.gradient_accumulation_steps
             if args.max_steps > 0 else None
         )
-        # Only materialize all epoch blocks for true epoch-based runs. Step-based
-        # runs (max_steps>0) truncate to num_batches, so pre-building every epoch
-        # just wastes tokenization/memory. Mirrors the unlabeled path's gate.
         labeled_num_epochs = (
-            int(args.num_train_epochs)
+            args.num_train_epochs
             if (args.max_steps <= 0 and getattr(args, "num_train_epochs", -1) > 0)
             else None
         )
@@ -9286,6 +9440,7 @@ def train_on_responses_only(
             return_dataset=True,
             comm_group=comm_group,
             return_plan=True,
+            grad_accum=args.gradient_accumulation_steps,
         )
         trainer.train_dataset = response_masked_dataset
         trainer._mlx_train_dataset_for_batches = response_masked_dataset

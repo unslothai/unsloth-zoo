@@ -47,6 +47,25 @@ import torch
 from unsloth_zoo import rl_replacements as rr
 
 
+@pytest.mark.parametrize("difference", [-1e-3, -1e-4, 0.0, 1e-4, 1e-3])
+def test_grpo_small_kl_matches_second_order_limit(difference):
+    new = torch.full((1, 2), -1.0, requires_grad=True)
+    ref = new.detach() + difference
+    mask = torch.ones_like(new)
+    loss, _, mean_kl, *_ = rr.grpo_compute_loss(
+        ref, new, new.detach(), None, torch.zeros_like(new, dtype=torch.long),
+        mask, 1.0, torch.zeros(1),
+    )
+
+    # exp(delta) - delta - 1 = delta^2/2 + delta^3/6 + delta^4/24 + O(delta^5).
+    delta = ref.double() - new.detach().double()
+    expected = (delta.square() / 2 + delta.pow(3) / 6 + delta.pow(4) / 24).mean()
+    torch.testing.assert_close(loss.double(), expected, rtol=1e-3, atol=1e-12)
+    torch.testing.assert_close(mean_kl.double(), expected, rtol=1e-3, atol=1e-12)
+    loss.backward()
+    torch.testing.assert_close(new.grad.double(), -torch.expm1(delta) / new.numel(), rtol=1e-3, atol=1e-7)
+
+
 def test_calculate_pad_tokens_in_prompt_counts_left_pads():
     PAD = 0
     # batch=2, seq_len=6, logits_to_keep=3 -> prompt_section is the
@@ -473,6 +492,29 @@ def test_efficient_grpo_single_chunk_matches_naive(loss_type, disable_dynamo):
     assert torch.allclose(
         new_eff.grad, new_ref.grad, atol=1e-8, rtol=1e-6
     ), f"{loss_type}: gradient mismatch"
+
+
+def _efficient_grpo_grad(upstream, upstream_scale=None):
+    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("grpo")
+    new = new.clone().requires_grad_(True)
+    out = rr.UnslothEfficientGRPO.apply(
+        new, old, ref, None, torch.randn(17, 8, dtype=torch.float64), input_ids, mask, advantages,
+        0.04, None, 1, kwargs, upstream_scale,
+    )
+    (out[0] * upstream).backward()
+    return new.grad
+
+
+def test_efficient_grpo_backward_ignores_grad_output_by_default(disable_dynamo):
+    """TRL <= 0.21 training_step divides the already GAS-normalized loss by GAS again."""
+    assert torch.equal(_efficient_grpo_grad(0.25), _efficient_grpo_grad(1.0))
+
+
+def test_efficient_grpo_backward_applies_deepspeed_loss_scale(disable_dynamo):
+    """DeepSpeed FP16 multiplies the loss by its scale S; dropping it leaves ZeRO unscaling g to g / S."""
+    base = _efficient_grpo_grad(1.0)
+    assert torch.allclose(_efficient_grpo_grad(128.0, 1.0), 128.0 * base, rtol=1e-12)
+    assert torch.allclose(_efficient_grpo_grad(128.0 / 4, 4.0), 128.0 * base, rtol=1e-12)
 
 
 @pytest.mark.parametrize("loss_type", ["dapo", "cispo", "vespo"])
@@ -1372,3 +1414,28 @@ def test_luspo_ignores_fully_masked_columns(level, beta, disable_dynamo):
     assert torch.allclose(loss.double(), loss_padded.double(), atol=1e-12, rtol=0), (
         f"luspo {level} level, beta {beta}: padding moved the loss from {loss.item()} to {loss_padded.item()}"
     )
+
+
+class _FixedScaler:
+    def __init__(self, scale):
+        self.scale = scale
+
+    def get_scale(self):
+        return self.scale
+
+
+@pytest.mark.parametrize("scaler_scale, upstream", [(None, 1.0), (None, 128.0), (128.0, 128.0)])
+def test_efficient_grpo_backward_applies_upstream_gradient(scaler_scale, upstream, disable_dynamo):
+    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("grpo")
+    lm_head = torch.randn(17, 8, dtype=torch.float64)
+    new_ref = new.clone().requires_grad_(True)
+    rr.grpo_compute_loss(ref, new_ref, old, None, input_ids, mask, 0.04, advantages, **kwargs)[0].backward()
+
+    new_eff = new.clone().requires_grad_(True)
+    scaler = None if scaler_scale is None else _FixedScaler(scaler_scale)
+    out = rr.UnslothEfficientGRPO.apply(
+        new_eff, old, ref, None, lm_head, input_ids, mask, advantages, 0.04, scaler, 1, kwargs,
+        1.0 if scaler is None else None,
+    )
+    (out[0] * upstream).backward()
+    assert torch.allclose(new_eff.grad, new_ref.grad * upstream, atol=1e-8, rtol=1e-6)

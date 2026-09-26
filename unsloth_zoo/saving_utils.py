@@ -962,6 +962,7 @@ def _merge_and_overwrite_lora(
     length_of_header = 0
 
     try:
+        _ensure_shard_writable(filename_original)
         # Memory-map for in-place overwrite
         raw_pointer = open(filename_original, "r+b")
         mm = mmap.mmap(raw_pointer.fileno(), length = 0, access = mmap.ACCESS_WRITE)
@@ -3711,6 +3712,34 @@ def _materialize_shard_that_resolves_outside(file_path, save_directory):
     )
 
 
+def _ensure_shard_writable(file_path):
+    """Make an output shard owner-writable for the in-place "r+b" merge (hf_hub 1.x blobs are 0444).
+
+    A hard-linked shard gets a private copy first so the write never mutates the cache blob.
+    """
+    st = os.stat(file_path)
+    mode = stat.S_IMODE(st.st_mode) | stat.S_IWUSR
+    if st.st_nlink > 1:
+        _fd, staging = tempfile.mkstemp(
+            dir = os.path.dirname(file_path) or os.curdir, prefix = ".unsloth-private-",
+        )
+        try:
+            with os.fdopen(_fd, "wb") as _staging_file, open(file_path, "rb") as _source:
+                shutil.copyfileobj(_source, _staging_file)
+            os.chmod(staging, mode)
+            os.replace(staging, file_path)
+        except BaseException:
+            if os.path.exists(staging):
+                try:
+                    os.remove(staging)
+                except OSError:
+                    pass
+            raise
+    elif not st.st_mode & stat.S_IWUSR:
+        os.chmod(file_path, mode)
+pass
+
+
 def _assert_shard_is_inside(file_path, save_directory):
     """Last check before a writer opens a shard. Every write sink calls this.
 
@@ -3951,7 +3980,7 @@ def merge_and_overwrite_lora(
             if os.path.exists(tokenizer_model_path):
                 os.makedirs(save_directory, exist_ok=True)
                 # Copy from local
-                shutil.copy2(tokenizer_model_path, os.path.join(save_directory, "tokenizer.model"))
+                _copy_file_from_source(tokenizer_model_path, save_directory, "tokenizer.model")
                 print(f"Copied tokenizer.model from local model directory")
         else:
             # Original HF repo logic
@@ -4733,9 +4762,22 @@ def _copy_file_from_source(src_path: Union[str, Path], target_dir_str: str, file
     if not os.access(src_path, os.R_OK):
          raise PermissionError(f"No read permission for source file: {src_path}")
     # Target dir creation and permission check is handled by caller (_try_copy_all_from_cache)
+    # copy2 onto an existing read-only dst fails, so stage + os.replace; add owner-write for in-place writers.
+    _staging = None
     try:
-        shutil.copy2(str(src_path), dst_path) # Use string paths for shutil
+        _fd, _staging = tempfile.mkstemp(
+            dir = os.path.dirname(dst_path) or os.curdir, prefix = ".unsloth-copy-",
+        )
+        os.close(_fd)
+        shutil.copy2(str(src_path), _staging) # Use string paths for shutil
+        os.chmod(_staging, stat.S_IMODE(os.stat(_staging).st_mode) | stat.S_IWUSR)
+        os.replace(_staging, dst_path)
     except Exception as e:
+        if _staging is not None and os.path.exists(_staging):
+            try:
+                os.remove(_staging)
+            except OSError:
+                pass
         raise IOError(f"Failed to copy {src_path} to {dst_path}: {e}") from e
 pass
 

@@ -175,6 +175,144 @@ def test_recurrent_language_layers_receive_one_adapter_each(per_layer):
         assert model.low.q_proj is not model.high.q_proj
 
 
+@metal_only
+@pytest.mark.parametrize("window, T, windowed", [
+    (256, 1600, True), (640, 2000, True), (640, 1280, False), (None, 4100, False)])
+def test_training_attention_visits_only_the_window(monkeypatch, window, T, windowed):
+    from mlx_vlm.models import base as vlm_base
+
+    mx.random.seed(0)
+    B, heads, dim = 2, 4, 32
+
+    class Attention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.qkv = nn.Linear(dim, 2 * dim)
+
+        def __call__(self, x, mask=None):
+            q, kv = mx.split(self.qkv(x), [dim], axis=-1)
+            q = q.reshape(B, T, heads, -1).transpose(0, 2, 1, 3)
+            k, v = (t.reshape(B, T, heads // 2, -1).transpose(0, 2, 1, 3)
+                    for t in mx.split(kv, 2, axis=-1))
+            out = mx.fast.scaled_dot_product_attention(q, k, v, scale=0.3, mask=mask)
+            return out.transpose(0, 2, 1, 3).reshape(B, T, dim)
+
+    mlx_utils._patch_layer_class_for_gc(Attention)
+    layer, x = Attention(), mx.random.normal((B, T, dim))
+    windows = []
+    original = mlx_utils._windowed_attention
+    monkeypatch.setattr(mlx_utils, "_windowed_attention",
+                        lambda *a: windows.append(a[-2]) or original(*a))
+
+    def step():
+        def loss(params, x):
+            layer.update(params)
+            mask = "causal" if window is None else vlm_base.create_attention_mask(x, None, window_size=window)
+            return (layer(x, mask=mask) ** 2).sum()
+
+        params = layer.trainable_parameters()
+        out = mx.compile(mx.value_and_grad(loss, argnums=(0, 1)))(params, x)
+        mx.eval(out)
+        layer.update(params)
+        return out
+
+    try:
+        dense = step()
+        # A second run keeps the wrapper installed while this one evaluates.
+        mlx_utils.acquire_mlx_training_patches()
+        mlx_utils.acquire_mlx_training_patches()
+        try:
+            trained = step()
+            calls = len(windows)
+            paused = mlx_utils.pause_mlx_training_patches()
+            try:
+                step()
+            finally:
+                mlx_utils.resume_mlx_training_patches(paused)
+        finally:
+            mlx_utils.release_mlx_training_patches()
+            mlx_utils.release_mlx_training_patches()
+    finally:
+        mlx_utils._unpatch_layer_class_gc(Attention)
+    assert len(windows) == calls
+    assert set(windows) == ({window} if windowed else set())
+    assert not hasattr(mx.fast.scaled_dot_product_attention, "_unsloth_original")
+    assert not hasattr(vlm_base.create_causal_mask, "_unsloth_original")
+    (loss, (grads, dx)), (ref_loss, (ref_grads, ref_dx)) = trained, dense
+    assert mx.allclose(loss, ref_loss, rtol=1e-5)
+    assert mx.allclose(dx, ref_dx, atol=1e-4)
+    for key in ("weight", "bias"):
+        assert mx.allclose(grads["qkv"][key], ref_grads["qkv"][key], rtol=1e-4, atol=1e-4)
+
+
+@metal_only
+@pytest.mark.parametrize("heads, T, dim, pays", [
+    (8, 1536, 256, False), (8, 2048, 256, True), (8, 2048, 512, False), (8, 4096, 512, True)])
+def test_windowing_pays_only_past_the_break_even(heads, T, dim, pays):
+    q, k = mx.zeros((1, heads, T, dim)), mx.zeros((1, 1, T, dim))
+    assert mlx_utils._windowing_pays(q, k, 512) is pays
+
+
+@metal_only
+@pytest.mark.parametrize("family", ["gemma4", "gemma3n"])
+@pytest.mark.parametrize("T", [2048, 5200])
+def test_windowed_attention_trains_kv_shared_gemma(monkeypatch, family, T):
+    # gemma3n shares K/V through the zoo's slots, gemma4 through mlx-vlm itself.
+    import importlib
+    from mlx.utils import tree_flatten
+
+    config_module = importlib.import_module(f"mlx_vlm.models.{family}.config")
+    language = importlib.import_module(f"mlx_vlm.models.{family}.language")
+    mx.random.seed(0)
+    layers, types = 15, (["sliding_attention"] * 4 + ["full_attention"]) * 3
+    shape = dict(
+        num_hidden_layers=layers, num_kv_shared_layers=10, sliding_window=512, layer_types=types,
+        hidden_size=64, head_dim=32, num_attention_heads=2, num_key_value_heads=1,
+        hidden_size_per_layer_input=16, vocab_size=512, vocab_size_per_layer_input=512)
+    if family == "gemma4":
+        shape.update(intermediate_size=128, global_head_dim=64)
+    else:
+        shape.update(model_type="gemma3n_text", intermediate_size=[128] * layers, laurel_rank=8,
+                     activation_sparsity_pattern=[0.0] * layers)
+    model = language.LanguageModel(config_module.TextConfig(**shape))
+    ids = mx.random.randint(0, 512, (1, T))
+    windows = []
+    original = mlx_utils._windowed_attention
+    monkeypatch.setattr(mlx_utils, "_windowed_attention",
+                        lambda *a: windows.append(a[-2]) or original(*a))
+
+    def step():
+        def loss(params):
+            model.update(params)
+            caches = mlx_utils._build_shared_kv_caches(model)
+            return model(ids, cache=caches).logits.astype(mx.float32).mean()
+
+        params = model.trainable_parameters()
+        out = mx.compile(mx.value_and_grad(loss))(params)
+        mx.eval(out)
+        model.update(params)
+        return out
+
+    layer_class = type(model.model.layers[0])
+    mlx_utils._patch_layer_class_for_gc(layer_class)
+    try:
+        dense = step()
+        mlx_utils.acquire_mlx_training_patches()
+        try:
+            trained = step()
+        finally:
+            mlx_utils.release_mlx_training_patches()
+    finally:
+        mlx_utils._unpatch_layer_class_gc(layer_class)
+    # Every sliding layer, in the forward and in its checkpoint recompute.
+    assert windows == [512] * 2 * types.count("sliding_attention")
+    (loss, grads), (ref_loss, ref_grads) = trained, dense
+    assert mx.allclose(loss, ref_loss, rtol=1e-5)
+    ref = dict(tree_flatten(ref_grads))
+    for name, grad in tree_flatten(grads):
+        assert (grad - ref[name]).abs().max() <= 1e-2 * ref[name].abs().max() + 1e-8, name
+
+
 def _dataset(n=24):
     return [
         {"text": f"### Question: what is {i} plus {i}?\n### Answer: {2 * i}."}
@@ -748,6 +886,85 @@ def test_frozen_dense_cce_preserves_gradients_with_lower_peak(monkeypatch, compi
     assert peaks[1] < peaks[0]
 
 
+@metal_only
+def test_trainer_compiled_step_uses_lora_head_cce(monkeypatch, tmp_path):
+    calls = []
+    factory = mlx_utils._make_text_lora_cce_loss_fn
+
+    def recording(*args, **kwargs):
+        loss = factory(*args, **kwargs)
+
+        def record(model, *batch):
+            calls.append(len(batch))
+            return loss(model, *batch)
+
+        return record
+
+    monkeypatch.setattr(mlx_utils, "_make_text_lora_cce_loss_fn", recording)
+    mx.random.seed(919)
+    model = _cce_text_model(2049, 1024, quantized=False, lora=True)
+    ids = tuple(range(2049))
+    labels = tuple(i if i % 10 == 0 else -100 for i in ids)
+    trainer = MLXTrainer(model=model, tokenizer=None, train_dataset=[], args=MLXTrainingConfig(
+        max_steps=1, per_device_train_batch_size=1, gradient_accumulation_steps=1,
+        learning_rate=1e-4, logging_steps=1, save_steps=0, output_dir=str(tmp_path),
+        compile=True, gradient_checkpointing=False, report_to="none",
+    ))
+    trainer._batches = FiniteTextBatchPlan(
+        [_FiniteTextRow(ids, offset=0, labels=labels)], [(0,)], max_seq_length=2049, pad_id=0,
+    )
+    trainer.save_model = lambda output_dir=None: None
+    trainer.train()
+    assert calls == [3]
+
+
+@metal_only
+def test_lora_head_cce_without_metal_keeps_baseline(monkeypatch):
+    model = _cce_text_model(2049, 1024, quantized=False, lora=True)
+    monkeypatch.setattr(mx.metal, "is_available", lambda: False)
+    loss = mlx_utils.make_cce_loss_fn(model)
+    assert not hasattr(loss, "_unsloth_compiled_loss_fn")
+
+
+@metal_only
+@pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("tokens, softcap, dim, promoted", [(128, 0.0, 1024, False), (2048, 0.0, 1024, False), (2048, 5.0, 1024, False), (2048, 0.0, 4096, False), (2048, 0.0, 4096, True)])
+def test_lora_head_cce_live_gradients_and_early_fallback(quantized, tokens, softcap, dim, promoted):
+    calls = []
+    low_precision = softcap > 0 or (dim > 1024 and not promoted)
+    mx.random.seed(917)
+    model = _cce_text_model(2049, dim, quantized=quantized, lora=True, calls=calls, softcap=softcap)
+    if promoted:
+        model.model.embed_tokens.weight = model.model.embed_tokens.weight.astype(mx.float32)
+    ids = mx.arange(tokens + 1, dtype=mx.int32)[None, :]
+    labels = mx.where(ids % 5 == 0, -100, ids)
+    batch = (ids, mx.array([[0, tokens + 1]], dtype=mx.int32), labels)
+    loss = mlx_utils.make_cce_loss_fn(model)
+    grad = nn.value_and_grad(model, getattr(loss, "_unsloth_compiled_loss_fn", loss))
+    compiled = mx.compile(lambda *b: grad(model, *b), inputs=model.state, outputs=model.state)
+    native_loss = make_baseline_loss_fn()
+    reference = nn.value_and_grad(model, lambda m, *b: native_loss(lambda ids: m(ids).astype(mx.float32), *b))
+    first_loss = None
+    for iteration in range(2):
+        calls.clear()
+        actual = compiled(*batch)
+        mx.eval(actual)
+        assert calls == ([] if iteration else (["model", "backbone"] if tokens == 128 else ["backbone"]))
+        expected = reference(model, *batch)
+        mx.eval(expected)
+        assert actual[0][1].item() == expected[0][1].item()
+        assert actual[0][0].item() == pytest.approx(expected[0][0].item(), abs=(0.005 if low_precision else 1e-5) if tokens > 128 else 0, rel=0)
+        for (_, want), (_, got) in zip(tree_flatten(expected[1]), tree_flatten(actual[1])):
+            assert (mx.allclose(want, got, atol=2e-5 if low_precision else 2e-6, rtol=0.02 if low_precision else 2e-4) if tokens > 128 else mx.array_equal(want, got)).item()
+        for key in ("lora_a", "lora_b"):
+            assert mx.any(actual[1]["lm_head"][key] != 0).item()
+        if iteration:
+            assert actual[0][0].item() != first_loss
+        first_loss = actual[0][0].item()
+        model.lm_head.lora_a = model.lm_head.lora_a * 2.0
+        model.lm_head.lora_b = model.lm_head.lora_b * 3.0
+
+
 def _norm_model(seed=77, dtype=None):
     class _TinyLM(nn.Module):
         def __init__(self):
@@ -1237,6 +1454,7 @@ def test_reload_keeps_saved_non_adapter_trainables(tmp_path):
     assert aux <= trainable, sorted(aux - trainable)
     assert _adapter_keys(reloaded) <= trainable
     assert trainable == _adapter_keys(reloaded) | aux
+    assert reloaded._unsloth_reloaded_parameter_keys == aux
 
 
 def _record_cce_rows(monkeypatch):
@@ -1270,7 +1488,7 @@ def test_preference_cce_scores_hidden_states_like_the_logits(monkeypatch, head, 
         model.model.embed_tokens = adapter
         model.freeze()
         adapter.unfreeze(keys=["lora_a", "lora_b"])
-        policy = p.LoRAReferencePolicy([adapter])
+        policy = p.ReferencePolicy(scales=[(adapter, 0.0)])
     model.set_dtype(getattr(mx, dtype))
     rows = []
     for i in range(8):
@@ -1420,7 +1638,7 @@ def test_preference_eval_compacts_unequal_batches(monkeypatch, quantized, refere
         adapter = LoRAEmbedding.from_base(model.model.embed_tokens, r=4, scale=2.0)
         adapter.lora_b = mx.random.normal(adapter.lora_b.shape) * .02
         model.model.embed_tokens = adapter
-        policy = p.LoRAReferencePolicy([adapter])
+        policy = p.ReferencePolicy(scales=[(adapter, 0.0)])
     model.set_dtype(getattr(mx, dtype))
     model.eval()
     rows = []

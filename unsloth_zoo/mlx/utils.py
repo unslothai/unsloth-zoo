@@ -404,7 +404,7 @@ def set_mlx_norm_output_cast_to_input_dtype(enabled: bool, model=None) -> None:
 # MLX raises instead of returning zero when a backward pass reaches a
 # gather/scatter index, aborting every graph that derives indices from activations:
 # MoE routing, SwitchGLU's gather-sort, GLM-5.x's sparse mask. Detaching changes no
-# forward value; producers are wrapped too, since `__getitem__` hides the consumer.
+# forward value; producers, consumers and integer `__getitem__` keys are all detached.
 _MLX_INDEX_PRODUCERS = ("argpartition", "argsort", "argmax", "argmin")
 _MLX_INDEX_CONSUMERS = {  # index-argument positions, by op
     "take": (1,), "take_along_axis": (1,), "put_along_axis": (1,),
@@ -442,6 +442,8 @@ def _wrap_mlx_index_op(name, original):
 
     @wraps(original)
     def wrapper(*args, **kwargs):
+        if not mlx_training_patches_active():
+            return original(*args, **kwargs)
         if positions is None:  # producer: the result is entirely an index
             return mx.stop_gradient(original(*args, **kwargs))
         return original(
@@ -467,14 +469,143 @@ def _set_mlx_index_gradient_stop(enabled: bool) -> None:
         elif not enabled and patched:
             setattr(mx, name, current._unsloth_index_original)
 
+    current = getattr(mx.array, "__getitem__", None)
+    if current is None:
+        return
+    patched = bool(getattr(current, "_unsloth_index_stop_gradient", False))
+    if enabled and not patched:
+        @wraps(current)
+        def getitem(array, key):
+            if mlx_training_patches_active():
+                key = _detach_integer_arrays(key)
+            return current(array, key)
+
+        getitem._unsloth_index_stop_gradient = True
+        getitem._unsloth_index_original = current
+        mx.array.__getitem__ = getitem
+    elif not enabled and patched:
+        mx.array.__getitem__ = current._unsloth_index_original
+
+
+# Training SDPA runs MLX's unfused fallback, scoring every key even outside the window.
+_TRAINING_ATTENTION_BLOCK = 512
+_WINDOW_MASKS = {}
+
+
+def _register_window_mask(mask, window):
+    key = id(mask)
+
+    def forget(ref):
+        if _WINDOW_MASKS.get(key, (None,))[0] is ref:
+            del _WINDOW_MASKS[key]
+
+    _WINDOW_MASKS[key] = (weakref.ref(mask, forget), window)
+
+
+def _registered_window(mask):
+    ref, window = _WINDOW_MASKS.get(id(mask), (None, None))
+    return window if ref is not None and ref() is mask else None
+
+
+def _carry_window_masks(outer, inner):
+    """`mx.checkpoint` hands the layer new array objects for its arguments."""
+    (outer_args, outer_kwargs), (inner_args, inner_kwargs) = outer, inner
+    pairs = [*zip(outer_args, inner_args),
+             *((outer_kwargs[k], inner_kwargs.get(k)) for k in outer_kwargs)]
+    for before, after in pairs:
+        if (window := _registered_window(before)) is not None:
+            _register_window_mask(after, window)
+
+
+def _wrap_create_causal_mask(original):
+    @wraps(original)
+    def wrapper(N, offset=0, window_size=None, *args, **kwargs):
+        mask = original(N, offset, window_size, *args, **kwargs)
+        if (window_size is not None and isinstance(offset, int) and offset == 0 and not args
+                and all(v is None for v in kwargs.values())
+                and mlx_training_patches_active()):
+            _register_window_mask(mask, window_size)
+        return mask
+
+    wrapper._unsloth_original = original
+    return wrapper
+
+
+def _windowed_attention(sdpa, q, k, v, scale, window, block):
+    # Query blocks folded into the batch, each vs its own + previous key block. Not per-block
+    # slices: their full-size gradient scatters fuse past Metal's kernel argument limit.
+    B, T = q.shape[0], q.shape[-2]
+    n = -(-T // block)
+
+    def fold(t, with_previous):
+        t = mx.pad(t, [(0, 0), (0, 0), (0, n * block - T), (0, 0)])
+        t = t.reshape(B, t.shape[1], n, block, t.shape[-1])
+        if with_previous:
+            previous = mx.pad(t[:, :, :-1], [(0, 0), (0, 0), (1, 0), (0, 0), (0, 0)])
+            t = mx.concatenate([previous, t], axis=3)
+        return t.transpose(0, 2, 1, 3, 4).reshape(B * n, t.shape[1], t.shape[3], t.shape[4])
+
+    rows = mx.arange(n)[:, None, None] * block + mx.arange(block)[:, None]
+    cols = mx.arange(n)[:, None, None] * block + mx.arange(-block, block)
+    mask = (cols >= 0) & (rows >= cols) & (rows < cols + window)
+    mask = mx.broadcast_to(mask[None, :, None], (B, n, 1, block, 2 * block))
+    mask = mask.reshape(B * n, 1, block, 2 * block)
+    out = sdpa(fold(q, False), fold(k, True), fold(v, True), scale=scale, mask=mask)
+    out = out.reshape(B, n, -1, block, out.shape[-1]).transpose(0, 2, 1, 3, 4)
+    return out.reshape(B, -1, n * block, out.shape[-1])[..., :T, :]
+
+
+def _windowing_pays(q, k, block):
+    # Skipped scores vs padded, folded q/k/v copies; 2.5 measured on bf16 training attention.
+    heads, T, dim = q.shape[1], q.shape[2], q.shape[3]
+    padded = -(-T // block) * block
+    skipped = heads * (T * T - 2 * block * padded)
+    return skipped >= 2.5 * (heads + 2 * k.shape[1]) * padded * dim
+
+
+def _wrap_training_sdpa(original):
+    @wraps(original)
+    def wrapper(q, k, v, *, scale, mask=None, **kwargs):
+        T = q.shape[-2]
+        if (isinstance(mask, mx.array) and mask.shape == (T, T) and k.shape[-2] == T
+                and all(value is None for value in kwargs.values())):
+            window = _registered_window(mask)
+            if window is not None:
+                block = max(_TRAINING_ATTENTION_BLOCK, window)
+                if _windowing_pays(q, k, block):
+                    return _windowed_attention(original, q, k, v, scale, window, block)
+        return original(q, k, v, scale=scale, mask=mask, **kwargs)
+
+    wrapper._unsloth_original = original
+    return wrapper
+
+
+def _set_mlx_windowed_attention(enabled: bool) -> None:
+    targets = [(mx.fast, "scaled_dot_product_attention", _wrap_training_sdpa)]
+    for name in ("mlx_lm.models.base", "mlx_vlm.models.base"):
+        if sys.modules.get(name) is not None:
+            targets.append((sys.modules[name], "create_causal_mask", _wrap_create_causal_mask))
+    for module, attr, wrap in targets:
+        current = getattr(module, attr, None)
+        if current is None:
+            continue
+        original = getattr(current, "_unsloth_original", None)
+        if enabled and original is None:
+            setattr(module, attr, wrap(current))
+        elif not enabled and original is not None:
+            setattr(module, attr, original)
+
 
 def acquire_mlx_training_patches() -> None:
     """Reference-counted: the `mlx.core` patches are process-wide while trainer
     runs are not, so an inner run must not unpatch an outer one."""
     global _MLX_TRAINING_PATCH_DEPTH
     with _MLX_INDEX_GRADIENT_LOCK:
+        from .attention import install_sparse_attention_training
+        install_sparse_attention_training()
         if _MLX_TRAINING_PATCH_DEPTH == 0:
             _set_mlx_index_gradient_stop(True)
+            _set_mlx_windowed_attention(True)
         _MLX_TRAINING_PATCH_DEPTH += 1
     _MLX_TRAINING_ACTIVE_DEPTH.set(_MLX_TRAINING_ACTIVE_DEPTH.get() + 1)
 
@@ -487,6 +618,7 @@ def release_mlx_training_patches() -> None:
         _MLX_TRAINING_PATCH_DEPTH -= 1
         if _MLX_TRAINING_PATCH_DEPTH == 0:
             _set_mlx_index_gradient_stop(False)
+            _set_mlx_windowed_attention(False)
     _MLX_TRAINING_ACTIVE_DEPTH.set(max(0, _MLX_TRAINING_ACTIVE_DEPTH.get() - 1))
 
 
@@ -509,6 +641,7 @@ def pause_mlx_training_patches() -> bool:
             return False
         _MLX_TRAINING_PATCH_DEPTH = 0
         _set_mlx_index_gradient_stop(False)
+        _set_mlx_windowed_attention(False)
         return True
 
 
@@ -526,6 +659,7 @@ def resume_mlx_training_patches(paused: bool) -> None:
         if paused:
             if _MLX_TRAINING_PATCH_DEPTH == 0:
                 _set_mlx_index_gradient_stop(True)
+                _set_mlx_windowed_attention(True)
             _MLX_TRAINING_PATCH_DEPTH += 1
     stack = _MLX_TRAINING_PAUSE_STACK.get()
     if stack:
@@ -861,9 +995,11 @@ def _patch_layer_class_for_gc(layer_cls):
             if "shared_kv" in kwargs:
                 args, kwargs["shared_kv"] = _tie_to_hidden_state(
                     args, kwargs["shared_kv"])
+            outer = (args, kwargs)
 
             def inner_fn(params, *args, **kwargs):
                 self.update(params)
+                _carry_window_masks(outer, (args, kwargs))
                 args = tuple(_detach_integer_arrays(a) for a in args)
                 kwargs = {k: _detach_integer_arrays(v) for k, v in kwargs.items()}
                 return fn(self, *args, **kwargs)
@@ -872,9 +1008,12 @@ def _patch_layer_class_for_gc(layer_cls):
 
         # Shared K/V crosses the checkpoint boundary as a traced argument and a
         # traced result; read off the slot and the VJP drops the gradient.
+        outer = (args, kwargs)
+
         def inner_fn(params, borrowed, *args, **kwargs):
             self.update(params)
             slot.install(borrowed)
+            _carry_window_masks(outer, (args, kwargs))
             args = tuple(_detach_integer_arrays(a) for a in args)
             kwargs = {k: _detach_integer_arrays(v) for k, v in kwargs.items()}
             out = fn(self, *args, **kwargs)
@@ -2068,6 +2207,66 @@ def _is_lm_head_trainable(model):
     return len(trainable) == 0  # no LoRA = full fine-tuning
 
 
+def _supports_text_lora_cce(desc, label_smoothing):
+    if (desc.status == "unknown" or desc.raw or label_smoothing != 0.0
+            or not mx.metal.is_available()):
+        return False
+    from unsloth_zoo.mlx.cce.runtime_cce import supported_lora_head
+
+    head = desc.module
+    if (not supported_lora_head(head) or not 1024 <= head.lora_a.shape[0] <= 4096
+            or head.linear.weight.shape[0] < 8192):
+        return False
+    return type(head.linear) is not nn.QuantizedLinear or head.lora_a.shape[1] <= 32
+
+
+def _make_text_lora_cce_loss_fn(head_desc, logit_scale, softcap):
+    from unsloth_zoo.mlx.cce.runtime_cce import make_lora_head_cce
+
+    head = head_desc.module
+    quantized = type(head.linear) is nn.QuantizedLinear
+    kernel = make_lora_head_cce(
+        chunk_size=4096 if head.lora_a.shape[0] > 2048 else 2048,
+        adapter_scale=head.scale,
+        logit_scale=1.0 if logit_scale is None else logit_scale,
+        logit_softcap=softcap,
+        group_size=head.linear.group_size if quantized else None,
+        bits=head.linear.bits if quantized else None,
+        mode=head.linear.mode if quantized else "affine",
+    )
+    baseline = make_baseline_loss_fn()
+    vocab_size = head.linear.weight.shape[0]
+    head_path = head_desc.path
+
+    def loss_fn(model, batch, lengths, labels=None):
+        n_tokens = batch.shape[0] * max(0, batch.shape[1] - 1)
+        if n_tokens < 1024 or n_tokens * vocab_size < 16 * 1024 * 1024:
+            return baseline(model, batch, lengths, labels)
+        inputs = batch[:, :-1]
+        targets = batch[:, 1:] if labels is None else labels[:, 1:]
+        hidden = _forward_text_hidden_states(model, inputs)
+        targets = _normalize_cce_label_dtype(targets)
+        steps = mx.arange(1, targets.shape[1] + 1)
+        mask = (steps >= lengths[:, 0:1]) & (steps < lengths[:, 1:])
+        if labels is not None:
+            mask = mask & (targets != -100)
+        targets = mx.where(mask, targets, mx.array(-100, dtype=targets.dtype))
+        count = mask.sum()
+        live_head = _resolve_module_path(model, head_path)
+        base = live_head.linear
+        hidden = hidden.reshape((-1, hidden.shape[-1]))
+        rank_hidden = live_head.dropout(hidden) @ live_head.lora_a
+        losses = kernel(
+            hidden, base.weight, base.scales if quantized else None,
+            base.get("biases") if quantized else None,
+            rank_hidden, live_head.lora_b, base.get("bias"), targets.reshape((-1,)),
+        )
+        return losses.sum() / _safe_token_denominator(count), count
+
+    loss_fn._unsloth_cce_backend = "runtime-cce-lora-head"
+    return loss_fn
+
+
 def _runtime_cce_by_mode(**kwargs):
     loss_only = _get_runtime_cce(**kwargs)
     if not (kwargs.get("quantized") or kwargs.get("weight_is_frozen")):
@@ -2102,7 +2301,8 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
         loss_fn._unsloth_cce_backend = "baseline-fallback"
         return loss_fn
     head_desc = describe_output_head(model)
-    _ineligible = _cce_head_ineligibility(head_desc)
+    _lora_cce = _supports_text_lora_cce(head_desc, label_smoothing)
+    _ineligible = None if _lora_cce else _cce_head_ineligibility(head_desc)
     if _ineligible is not None:
         print(f"Unsloth: fused CCE cannot faithfully use this model's output "
               f"head ({_ineligible}); falling back to standard cross-entropy.")
@@ -2122,6 +2322,14 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
         loss_fn = make_baseline_loss_fn(label_smoothing=label_smoothing)
         loss_fn._unsloth_cce_backend = "baseline-fallback"
         return loss_fn
+    if _lora_cce:
+        loss_fn = make_baseline_loss_fn(label_smoothing=label_smoothing)
+        loss_fn._unsloth_cce_backend = "baseline-fallback"
+        loss_fn._unsloth_compiled_loss_fn = _make_text_lora_cce_loss_fn(
+            head_desc, logit_scale, softcap,
+        )
+        return loss_fn
+
     if softcap > 0:
         print(f"Unsloth: CCE using logit_softcap={softcap} for this model.")
     if logit_scale is not None:
@@ -2422,6 +2630,11 @@ def _get_vlm_ignore_token_ids(processor=None, config=None, model=None):
         ):
             token = getattr(tokenizer, attr, None)
             if token is not None:
+                _append_unique_int(ids, _convert_token_to_id(tokenizer, token))
+
+        for attr in ("image_token", "video_token", "audio_token"):
+            token = getattr(processor, attr, None)
+            if isinstance(token, str):
                 _append_unique_int(ids, _convert_token_to_id(tokenizer, token))
 
         for attr in (
@@ -2973,6 +3186,10 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
     return loss_fn
 
 
+# gemma4_unified shares the text model but its `Model.__call__` drops `mm_token_type_ids`.
+_VLM_MM_TOKEN_TYPE_FORWARDING_MODEL_TYPES = frozenset({"gemma4"})
+
+
 def _drop_pair_token_type_ids(batch_dict, kwargs):
     """Keep suffix/prefix pair markers out of the text stack.
 
@@ -3142,6 +3359,12 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         backbone_kwargs["token_type_ids"] = extra_kwargs["token_type_ids"]
         if attention_mask is not None:
             backbone_kwargs["attention_mask"] = attention_mask
+    if (
+        "mm_token_type_ids" in extra_kwargs
+        and _config_get(getattr(model, "config", None), "model_type")
+        in _VLM_MM_TOKEN_TYPE_FORWARDING_MODEL_TYPES
+    ):
+        backbone_kwargs["mm_token_type_ids"] = extra_kwargs["mm_token_type_ids"]
 
     shared_kv = _build_shared_kv_caches(model)
     if shared_kv is not None:
@@ -3258,16 +3481,7 @@ def _normalize_grid_thw(grid_thw):
 
 
 def _mlx_vlm_canonical_model_type(model_type):
-    """The name mlx-vlm resolves this config's `model_type` to.
-
-    mlx-vlm lower-cases the value and sends it through MODEL_REMAPPING to pick the
-    module, never writing the result back, so a family set keyed on the canonical
-    spelling has to resolve the same way or an aliased checkpoint misses it. Hyphens
-    are folded too, since MODEL_REMAPPING carries only the aliases it has met.
-
-    Any failure leaves the name alone: an mlx-vlm too old to have MODEL_REMAPPING is
-    exactly the case where the raw spelling is the only spelling.
-    """
+    """Resolve exactly the module spelling mlx-vlm imports, including hyphens."""
     if not model_type:
         return ""
     name = str(model_type).lower()
@@ -3276,7 +3490,7 @@ def _mlx_vlm_canonical_model_type(model_type):
         name = MODEL_REMAPPING.get(name, name)
     except Exception:
         pass
-    return name.replace("-", "_")
+    return name
 
 
 # Families whose mlx-vlm code indexes the vision grid as an array (`.tolist()`,
@@ -4539,6 +4753,7 @@ def normalize_mlx_chat_template(
     *,
     chat_template=None,
     model_name=None,
+    model_path=None,
     model_type=None,
     is_vlm=False,
     strict=False,
@@ -4558,7 +4773,7 @@ def normalize_mlx_chat_template(
     tokenizer = _get_processor_tokenizer(target)
     if is_vlm and not _has_chat_template(target):
         if not _has_chat_template(tokenizer):
-            for source in (getattr(target, "_unsloth_model_name", None),
+            for source in (model_path, getattr(target, "_unsloth_model_name", None),
                            getattr(tokenizer, "name_or_path", None)):
                 if not source or not Path(source).is_dir():
                     continue
@@ -4566,6 +4781,15 @@ def normalize_mlx_chat_template(
                 if template_path.is_file():
                     tokenizer.chat_template = template_path.read_text(encoding="utf-8")
                     break
+                template_path = Path(source) / "chat_template.json"
+                if template_path.is_file():
+                    from .loader import _read_json_file
+                    template = _read_json_file(template_path).get("chat_template")
+                    if isinstance(template, dict):
+                        template = template.get("default")
+                    if isinstance(template, str) and template:
+                        tokenizer.chat_template = template
+                        break
         if not _has_chat_template(target) and _has_chat_template(tokenizer):
             target.chat_template = tokenizer.chat_template
 
@@ -4580,6 +4804,7 @@ def normalize_vlm_processor_chat_template(
     *,
     chat_template=None,
     model_name=None,
+    model_path=None,
     model_type=None,
     strict=False,
 ):
@@ -4593,6 +4818,7 @@ def normalize_vlm_processor_chat_template(
         processor,
         chat_template=chat_template,
         model_name=model_name,
+        model_path=model_path,
         model_type=model_type,
         is_vlm=True,
         strict=strict,
@@ -5035,6 +5261,10 @@ def _render_vlm_messages(
         yield marked
         yield _flatten_vlm_content_for_text_template(messages, image_token)
         yield _flatten_vlm_messages_to_content_parts(marked)
+        if rendered is None:
+            yield messages
+            yield _mark_vlm_image_parts(messages, image_token)
+            yield _collapse_vlm_assistant_content(messages)
 
     error = None
     rendered = None
@@ -14345,6 +14575,11 @@ def iter_mlx_lora_modules(model):
             yield module_name, module
 
 
+def is_mlx_dora_module(module):
+    """Class-name gated: a LoRA wrapper with an unrelated ``m`` is not DoRA."""
+    return hasattr(module, "m") and type(module).__name__.startswith("DoRA")
+
+
 def collect_mlx_lora_adapter_tensors(model):
     """Collect tensors for every module exposing a complete LoRA attr pair.
 
@@ -14361,9 +14596,7 @@ def collect_mlx_lora_adapter_tensors(model):
         adapter_keys.add(f"{prefix}lora_b")
         adapter_keys.add(f"{prefix}lora_a.weight")
         adapter_keys.add(f"{prefix}lora_b.weight")
-        # Include DoRA magnitude `m`, gated on the DoRA class name so a
-        # future LoRA wrapper with an unrelated `m` attribute isn't exported.
-        if hasattr(module, "m") and type(module).__name__.startswith("DoRA"):
+        if is_mlx_dora_module(module):
             adapter_keys.add(f"{prefix}m")
     return {name: value for name, value in parameters.items() if name in adapter_keys}
 
@@ -15591,7 +15824,9 @@ def _mlx_sanitize_probe(model, weights):
     unmeasured; the caller treats that as unmeasurable, which is what the export
     did before this existed.
     """
-    return copy.copy(model).sanitize(weights)
+    probe = copy.copy(model)
+    probe._unsloth_measuring_norm_offsets = True
+    return probe.sanitize(weights)
 
 
 def _mlx_sanitizer_norm_offsets(model):
@@ -15616,38 +15851,39 @@ def _mlx_sanitizer_norm_offsets(model):
             weights.update(mx.load(str(weight_file)))
         if not weights:
             return None
-
-        zeroed = _mlx_sanitize_probe(model, _mlx_norm_offset_probe(weights, 0.0))
-        candidates = {}
-        for key, value in zeroed.items():
-            offset = _mlx_constant_1d_value(value)
-            if offset is None or abs(offset) <= _MLX_NORM_OFFSET_TOLERANCE:
-                continue
-            candidates[key] = (value, offset)
-        if not candidates:
-            # Nothing to confirm. Shifting nothing is the common case, so skip
-            # the second replay rather than pay for it on every model.
-            return {}
-
-        raised = _mlx_sanitize_probe(
-            model, _mlx_norm_offset_probe(weights, _MLX_NORM_OFFSET_PROBE)
+        return _mlx_measure_norm_offsets(
+            lambda probe: _mlx_sanitize_probe(model, probe), weights
         )
-
-        offsets = {}
-        for key, (value, offset) in candidates.items():
-            raised_value = raised.get(key)
-            if getattr(raised_value, "shape", None) != value.shape:
-                continue
-            delta = _mlx_constant_1d_value(raised_value - value)
-            if delta is None:
-                continue
-            if abs(delta - _MLX_NORM_OFFSET_PROBE) > _MLX_NORM_OFFSET_TOLERANCE:
-                continue
-            offsets[key] = offset
     except Exception as exc:
         print(f"Unsloth: Could not measure MLX norm offsets ({exc}); continuing.")
         return None
 
+
+def _mlx_measure_norm_offsets(replay, weights):
+    """The additive constants ``replay`` (a sanitizer) applies to ``weights``' 1-D floats."""
+    zeroed = replay(_mlx_norm_offset_probe(weights, 0.0))
+    candidates = {}
+    for key, value in zeroed.items():
+        offset = _mlx_constant_1d_value(value)
+        if offset is None or abs(offset) <= _MLX_NORM_OFFSET_TOLERANCE:
+            continue
+        candidates[key] = (value, offset)
+    if not candidates:
+        return {}
+
+    raised = replay(_mlx_norm_offset_probe(weights, _MLX_NORM_OFFSET_PROBE))
+
+    offsets = {}
+    for key, (value, offset) in candidates.items():
+        raised_value = raised.get(key)
+        if getattr(raised_value, "shape", None) != value.shape:
+            continue
+        delta = _mlx_constant_1d_value(raised_value - value)
+        if delta is None:
+            continue
+        if abs(delta - _MLX_NORM_OFFSET_PROBE) > _MLX_NORM_OFFSET_TOLERANCE:
+            continue
+        offsets[key] = offset
     return offsets
 
 
@@ -17319,6 +17555,7 @@ def _save_vlm_processor_assets(processor, path, sources=()):
     failures = []
     saved = set()
     asset_names = set()
+    recovered = []
 
     def valid_asset(file):
         try:
@@ -17361,6 +17598,8 @@ def _save_vlm_processor_assets(processor, path, sources=()):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(file, target)
                 saved.add(relative)
+                if source_only:
+                    recovered.append(str(relative))
             except Exception as error:
                 failures.append(f"{relative}: {error}")
 
@@ -17386,7 +17625,8 @@ def _save_vlm_processor_assets(processor, path, sources=()):
             success = False
         return success
 
-    if not save_component(processor, overwrite=True):
+    native_saved = save_component(processor, overwrite=True)
+    if not native_saved:
         if not failures:
             failures.append(f"{type(processor).__name__} has no save_pretrained")
     # Some processors' save methods omit components or are entirely no-ops.
@@ -17398,6 +17638,22 @@ def _save_vlm_processor_assets(processor, path, sources=()):
         if component is not None and id(component) not in seen:
             seen.add(id(component))
             save_component(component)
+
+    # A clean legacy save omits processor_config.json on purpose; only a failed one is rebuilt.
+    if (not native_saved and Path("processor_config.json") not in saved
+            and callable(getattr(processor, "to_dict", None))):
+        def serialize_component(value):
+            to_dict = getattr(value, "to_dict", None)
+            if callable(to_dict):
+                return to_dict()
+            raise TypeError(f"{type(value).__name__} has no JSON serialization")
+
+        try:
+            payload = json.dumps(processor.to_dict(), default=serialize_component, indent=2)
+            (path / "processor_config.json").write_text(payload, encoding="utf-8")
+            saved.add(Path("processor_config.json"))
+        except Exception as error:
+            failures.append(f"processor_config.json: {error}")
 
     for source in sources:
         if source is None:
@@ -17415,6 +17671,8 @@ def _save_vlm_processor_assets(processor, path, sources=()):
     if failures:
         print("Unsloth: Adapter saved; processor assets recovered where available: "
               + "; ".join(dict.fromkeys(failures)))
+        if recovered:
+            print("Unsloth: copied processor source assets: " + ", ".join(recovered))
 
 
 def _copy_source_sidecars(src_path, path):
