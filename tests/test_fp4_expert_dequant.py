@@ -175,12 +175,12 @@ needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason = "compile
 
 
 def _eager_fp4(fp8, packed, scale, dtype):
-    old = fp8._FP4_COMPILED
-    fp8._FP4_COMPILED = False
+    old = fp8._FP4_COMPILED.get(packed.device)
+    fp8._FP4_COMPILED[packed.device] = False
     try:
         return fp8._dequantize_full_expert_weights_fp4(packed, scale, dtype)
     finally:
-        fp8._FP4_COMPILED = old
+        fp8._FP4_COMPILED[packed.device] = old
 
 
 @needs_cuda
@@ -197,8 +197,8 @@ def test_compiled_fp4_dequant_is_bit_identical_to_eager(float_scales):
         return fp8._dequantize_full_expert_weights_fp4(packed, scale, torch.bfloat16)
 
     out = call_site()
-    assert fp8._FP4_COMPILED not in (None, False)
-    assert (tuple(packed.shape), scale.shape[-1], torch.bfloat16, packed.device) in fp8._FP4_COMPILED_SHAPES
+    assert fp8._FP4_COMPILED.get(packed.device) not in (None, False)
+    assert (tuple(packed.shape), scale.shape[-1], torch.bfloat16) in fp8._FP4_COMPILED_SHAPES[packed.device]
     assert torch.equal(out, _eager_fp4(fp8, packed, scale, torch.bfloat16))
 
 
@@ -207,8 +207,21 @@ def test_compiled_fp4_dequant_falls_back_past_the_shape_cap_and_when_disabled(mo
     from unsloth_zoo.temporary_patches import moe_utils_fp8 as fp8, common
     packed, scale = _fixture(E = 2, M = 8, K = 64)
     packed, scale = packed.cuda(), fp8._fp4_scale_to_float(scale.cuda())
-    monkeypatch.setattr(fp8, "_FP4_COMPILED_SHAPES", {("filler", i) for i in range(fp8._FP4_COMPILED_MAX_SHAPES)})
+    monkeypatch.setattr(fp8, "_FP4_COMPILED_SHAPES", {packed.device: {("filler", i) for i in range(fp8._FP4_COMPILED_MAX_SHAPES)}})
     assert fp8._dequantize_fp4_compiled(packed, scale, torch.bfloat16) is None
-    monkeypatch.setattr(fp8, "_FP4_COMPILED_SHAPES", set())
+    monkeypatch.setattr(fp8, "_FP4_COMPILED_SHAPES", {})
     monkeypatch.setattr(common, "UNSLOTH_COMPILE_DISABLE", True)
     assert fp8._dequantize_fp4_compiled(packed, scale, torch.bfloat16) is None
+
+
+def test_each_device_compiles_its_own_copy_of_the_fp4_kernel():
+    from unsloth_zoo.temporary_patches import moe_utils_fp8 as fp8
+    a = fp8._fp4_compiled_for(torch.device("cuda", 90))
+    b = fp8._fp4_compiled_for(torch.device("cuda", 91))
+    try:
+        assert a is fp8._fp4_compiled_for(torch.device("cuda", 90))
+        code_a, code_b = (getattr(f, "_torchdynamo_orig_callable", f).__code__ for f in (a, b))
+        assert code_a is not code_b and code_a is not fp8._fp4_dequant_whole_stack.__code__
+    finally:
+        fp8._FP4_COMPILED.pop(torch.device("cuda", 90), None)
+        fp8._FP4_COMPILED.pop(torch.device("cuda", 91), None)

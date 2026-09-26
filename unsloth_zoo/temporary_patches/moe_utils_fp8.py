@@ -16,6 +16,8 @@
 
 from typing import Optional
 
+import types
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -381,34 +383,43 @@ def _fp4_dequant_whole_stack(packed_u8, scale_f, values, target_dtype):
 
 # dynamic=False: an automatic-dynamic recompile ran slower than eager. Shapes stay below dynamo's
 # recompile limit, past which it would run the unchunked body eagerly and materialize GBs of indices.
-_FP4_COMPILED = None
-_FP4_COMPILED_SHAPES = set()
+# Dynamo counts that limit per code object and guards on device, so each device gets its own copy.
+_FP4_COMPILED = {}
+_FP4_COMPILED_SHAPES = {}
 _FP4_COMPILED_MAX_SHAPES = 6
 
 
+def _fp4_compiled_for(device):
+    compiled = _FP4_COMPILED.get(device)
+    if compiled is None:
+        body = _fp4_dequant_whole_stack
+        body = types.FunctionType(body.__code__.replace(), body.__globals__, body.__name__)
+        compiled = _FP4_COMPILED[device] = torch.compile(body, fullgraph = True, dynamic = False)
+    return compiled
+
+
 def _dequantize_fp4_compiled(weight, scale_f, target_dtype):
-    global _FP4_COMPILED
-    if _FP4_COMPILED is False or weight.device.type not in ("cuda", "xpu") or not weight.is_contiguous():
+    device = weight.device
+    if _FP4_COMPILED.get(device) is False or device.type not in ("cuda", "xpu") or not weight.is_contiguous():
         return None
-    key = (tuple(weight.shape), scale_f.shape[-1], target_dtype, weight.device)
-    if key not in _FP4_COMPILED_SHAPES and len(_FP4_COMPILED_SHAPES) >= _FP4_COMPILED_MAX_SHAPES:
+    shapes = _FP4_COMPILED_SHAPES.setdefault(device, set())
+    key = (tuple(weight.shape), scale_f.shape[-1], target_dtype)
+    if key not in shapes and len(shapes) >= _FP4_COMPILED_MAX_SHAPES:
         return None
     from .common import UNSLOTH_COMPILE_DISABLE
     if UNSLOTH_COMPILE_DISABLE:
         return None
     try:
-        if _FP4_COMPILED is None:
-            _FP4_COMPILED = torch.compile(_fp4_dequant_whole_stack, fullgraph = True, dynamic = False)
-        values = torch.tensor(_FP4_E2M1_VALUES, dtype = torch.float32, device = weight.device)
+        values = torch.tensor(_FP4_E2M1_VALUES, dtype = torch.float32, device = device)
         with torch.no_grad():
-            out = _FP4_COMPILED(weight.view(torch.uint8), scale_f.contiguous(), values, target_dtype)
+            out = _fp4_compiled_for(device)(weight.view(torch.uint8), scale_f.contiguous(), values, target_dtype)
     except torch.OutOfMemoryError:
         raise
     except Exception as exc:
-        _FP4_COMPILED = False
+        _FP4_COMPILED[device] = False
         logger.info(f"Unsloth: compiled FP4 expert dequant unavailable ({type(exc).__name__}); using the eager path.")
         return None
-    _FP4_COMPILED_SHAPES.add(key)
+    shapes.add(key)
     return out
 
 
