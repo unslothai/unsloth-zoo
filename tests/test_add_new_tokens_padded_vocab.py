@@ -163,8 +163,6 @@ def test_frozen_token_validation_uses_magnitude(row_value: float, untrained: boo
 
 
 def test_interpolation_mixes_in_the_pieces_the_token_replaces():
-    """interpolation sets a new row to mean(trained) * (1 - a) + mean(pieces) * a,
-    where pieces are the ids the string split into before it was added."""
     model, tokenizer = _build(8, 8)
     with torch.no_grad():
         for i in range(8):

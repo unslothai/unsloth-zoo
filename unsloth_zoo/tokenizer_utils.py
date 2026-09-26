@@ -138,8 +138,7 @@ def add_new_tokens(
     is_tied = (old_input_embedding.data_ptr() == old_output_embedding.data_ptr()) \
         or (model.config.tie_word_embeddings)
 
-    # Split each new token into its existing pieces now: once added, it
-    # tokenizes to its own fresh id and the interpolation mean would read that.
+    # Tokenize before add_tokens: afterwards each token maps to its own fresh row.
     if method == "interpolation":
         new_token_pieces = [
             tokenizer(token, add_special_tokens = False).input_ids for token in new_tokens
