@@ -40,7 +40,6 @@ EXPERT_NAMES = [
 
 
 def _should_convert_module():
-    # quantizers_utils exists on 4.x too; should_convert_module ships in 5.0, so gate on the symbol.
     module = pytest.importorskip("transformers.quantizers.quantizers_utils")
     function = getattr(module, "should_convert_module", None)
     if function is None:
@@ -65,7 +64,6 @@ def test_neighbouring_projections_still_convert(name):
 
 
 def test_legacy_match_reaches_no_router_and_no_expert():
-    """Unpatched transformers 4.57.6 matcher: never reaches a dotted leaf, and never an expert."""
     def legacy_skip(full_name, keys):
         return any((key + "." in full_name) or (key == full_name) for key in keys)
 

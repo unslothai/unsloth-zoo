@@ -892,13 +892,11 @@ class WrapRecursiveCall(ast.NodeTransformer):
 
 
 _BNB_SKIP_MATCH = '(key + "." in current_key_name_str) or (key == current_key_name_str)'
-# Only entries no existing 4.x save lists: those saves pack every router (e.g. `mlp.gate`) that the
-# 4.x matcher missed, so suffix-matching an old entry builds an nn.Linear the packed weight cannot load.
+# New keys only: 4.x saves packed the routers its matcher missed (`mlp.gate`), so suffix-matching those breaks reloads.
 _BNB_SUFFIX_MATCH_KEYS = frozenset(("moe.gate",))
 
 
 def _add_suffix_match_to_bnb_skip(source: str) -> str:
-    # 4.x never matches a dotted leaf like `moe.gate`; add the suffix match 5.x already does.
     return source.replace(
         _BNB_SKIP_MATCH,
         _BNB_SKIP_MATCH + ' or (key in _BNB_SUFFIX_MATCH_KEYS and current_key_name_str.endswith("." + key))',
