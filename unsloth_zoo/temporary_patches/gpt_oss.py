@@ -1732,8 +1732,7 @@ def patch_gpt_oss_bnb4bit_auto():
         _sync_gpt_oss_compiled_flavor("bnb4bit" if _should_use_gpt_oss_bnb4bit() else "stock")
 
     if not _should_use_gpt_oss_bnb4bit():
-        # BnB classes left installed make a 16bit load fail ("weights not initialized"). Check the
-        # installed class, not only the env flag, which can be cleared or inherited independently.
+        # Check the installed class too: the env flag can be cleared or inherited independently of it.
         try:
             import transformers.models.gpt_oss.modeling_gpt_oss as _modeling
             _installed = _modeling.GptOssExperts is GptOssExpertsBnb4bit
