@@ -696,7 +696,7 @@ RL_REPLACEMENTS["grpo_compute_loss_slow"] = \
 class UnslothEfficientGRPO(torch.autograd.Function):
     # All Unsloth Zoo code licensed under AGPL3
     @staticmethod
-    def forward(ctx, _new_logps, _old_logps, _ref_logps, _sampling_per_token_logps, lm_head, _input_ids, _mask, _advantages, beta, scaler = None, n_chunks = 1, extra_kwargs=None):
+    def forward(ctx, _new_logps, _old_logps, _ref_logps, _sampling_per_token_logps, lm_head, _input_ids, _mask, _advantages, beta, scaler = None, n_chunks = 1, extra_kwargs=None, upstream_scale = None):
         if extra_kwargs is None:
             extra_kwargs = {}
         def compute_loss(new_logps, old_logps, ref_logps, sampling_per_token_logps, input_ids, mask, advantages, scaling):
@@ -817,6 +817,7 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             accumulated_flat_is_ratio = None
         accumulated_coef_1  = torch.cat(accumulated_coef_1, dim=0)
         ctx.save_for_backward(grad_inputs)
+        ctx.upstream_scale = upstream_scale
         return (
             accumulated_loss,
             accumulated_completion_length,
@@ -830,7 +831,9 @@ class UnslothEfficientGRPO(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output, dcompletion_length, dmean_kl, ddelta, ddflat_is_ratio, dcoef_1):
         (grad_input,) = ctx.saved_tensors
-        return (grad_input, None, None, None, None, None, None, None, None, None, None, None)
+        if ctx.upstream_scale is not None:
+            grad_input = grad_input * (grad_output * ctx.upstream_scale)
+        return (grad_input, None, None, None, None, None, None, None, None, None, None, None, None)
     pass
 pass
 RL_REPLACEMENTS["UnslothEfficientGRPO"] = UnslothEfficientGRPO
@@ -2165,6 +2168,13 @@ def grpo_accumulated_loss(
             device = completion_mask.device, dtype = completion_mask.dtype,
         )
 
+    # Only DeepSpeed (no Accelerate scaler) needs grad_output; undo TRL <= 0.21's extra 1/GAS on the normalized loss.
+    upstream_scale = None
+    if trainer.accelerator.scaler is None and getattr(trainer, "is_deepspeed_enabled", False):
+        upstream_scale = 1.0
+        if getattr(trainer, "compute_loss_func", None) is None:
+            upstream_scale = float(kwargs.get("current_gradient_accumulation_steps", 1))
+
     with autocaster:
         loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1 = UnslothEfficientGRPO.apply(
             new_logprobs,
@@ -2178,7 +2188,8 @@ def grpo_accumulated_loss(
             trainer.beta,
             trainer.accelerator.scaler,
             1,
-            kwargs
+            kwargs,
+            upstream_scale,
         )
 
     # Force logits (not hidden states) again or output is gibberish.
