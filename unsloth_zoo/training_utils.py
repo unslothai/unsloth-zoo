@@ -652,7 +652,8 @@ def unsloth_train(trainer):
         optimizer = optimizer,
         num_warmup_steps = training_args.get_warmup_steps(max_steps),
         num_training_steps = max_steps,
-        **getattr(training_args, "lr_scheduler_kwargs", {}),
+        # get_scheduler takes options only here, as Trainer.create_scheduler passes them.
+        scheduler_specific_kwargs = getattr(training_args, "lr_scheduler_kwargs", None) or None,
     )
 
     # Gradient accumulation and grad norm clipping
