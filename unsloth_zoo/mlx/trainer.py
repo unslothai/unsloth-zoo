@@ -8829,7 +8829,7 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
         # legacy default: length-sort once
         return sorted(range(len(all_items)), key=lambda i: len(all_items[i][0]))
 
-    # 3. Build `num_epochs` blocks so `batches[i % len]` cycle reseeds correctly.
+    # 3. Build ceil(num_epochs) blocks so `batches[i % len]` cycle reseeds correctly.
     _n_epochs_materialize = (
         max(1, math.ceil(num_epochs)) if num_epochs is not None else 1
     )
@@ -8881,7 +8881,7 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
         if cycle_length is None and len(epoch_schedule) > 0:
             cycle_length = len(epoch_schedule)
 
-    # A fractional epoch count ends mid-pass, on whole accumulation windows as HF does.
+    # Fractional epochs end mid-pass on whole accumulation windows, as HF does.
     if num_batches is None and num_epochs is not None and cycle_length:
         num_batches = _finite_epoch_batch_budget(cycle_length, num_epochs, grad_accum)
     if num_batches is not None and len(schedule) > num_batches:
@@ -9258,9 +9258,7 @@ def train_on_responses_only(
             args.max_steps * args.gradient_accumulation_steps
             if args.max_steps > 0 else None
         )
-        # Only materialize all epoch blocks for true epoch-based runs. Step-based
-        # runs (max_steps>0) truncate to num_batches, so pre-building every epoch
-        # just wastes tokenization/memory. Mirrors the unlabeled path's gate.
+        # Epoch blocks only for epoch runs; max_steps runs truncate to num_batches.
         labeled_num_epochs = (
             args.num_train_epochs
             if (args.max_steps <= 0 and getattr(args, "num_train_epochs", -1) > 0)

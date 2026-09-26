@@ -1919,10 +1919,7 @@ def test_response_only_eval_batches_stay_a_finite_plan():
 
 
 def test_response_only_fractional_epochs_match_transformers_step_budget():
-    # int(num_train_epochs) dropped the partial pass: 0.5 epochs trained a full
-    # one and 1.5 trained one. Same shapes and golden row counts as the unmasked
-    # test_ordered_text_fractional_epochs_match_transformers_step_budget, where
-    # transformers.Trainer runs ceil(epochs * updates_per_epoch) updates.
+    # int(num_train_epochs) ran 0.5 and 1.5 epochs as one; HF: ceil(epochs * updates).
     from unsloth_zoo.mlx.trainer import (
         MLXTrainer, MLXTrainingConfig, _resolve_training_steps,
         train_on_responses_only,
