@@ -237,6 +237,35 @@ def test_state_dict_substitutes_host_copies_for_evicted_blocks():
     sw.remove()
 
 
+def test_state_dict_follows_weights_renamed_after_install():
+    # from_pretrained(block_swap_layers = N) installs before PEFT wraps each Linear in a base_layer.
+    if not torch.cuda.is_available():
+        print("[SKIP] CUDA not available")
+        return
+
+    class Wrap(nn.Module):
+        def __init__(self, base):
+            super().__init__()
+            self.base_layer = base
+
+    torch.manual_seed(0)
+    layers = nn.ModuleList([nn.Sequential(nn.Linear(8, 8, bias = False)) for _ in range(4)]).to("cuda")
+    for p in layers.parameters():
+        p.requires_grad_(False)
+    sw = BlockSwap(layers, 4, prefetch_depth = 1)
+    for layer in layers:
+        layer[0] = Wrap(layer[0])
+    ref = [layer[0].base_layer.weight for layer in layers]
+    sd = layers.state_dict()
+    for i, b in enumerate(sw.blocks):
+        v = sd[f"{i}.0.base_layer.weight"]
+        assert v.numel() == 64, i
+        assert torch.equal(v, b.host[0]), i
+    sw.remove()
+    for i, w in enumerate(ref):
+        assert w.numel() == 64, i
+
+
 def test_params4bit_round_trip_is_bitwise():
     if not torch.cuda.is_available():
         print("[SKIP] CUDA not available")

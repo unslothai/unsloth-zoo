@@ -70,7 +70,7 @@ def _swappable(module):
 
 
 class _Block:
-    __slots__ = ("params", "host", "devices", "names", "streams", "events", "resident", "slot", "sig")
+    __slots__ = ("params", "host", "devices", "index", "streams", "events", "resident", "slot", "sig")
 
     def __init__(self, layer, streams, device):
         self.params, self.host, self.devices = [], [], []
@@ -84,11 +84,7 @@ class _Block:
             else:
                 self.host.append(_to_pinned_host(p.data))
                 self.devices.append(p.data.device)
-        # state_dict() emits every alias; missing one serializes an empty tensor.
-        self.names = []
-        for name, p in layer.named_parameters(recurse = True, remove_duplicate = False):
-            if id(p) in index:
-                self.names.append((name, index[id(p)]))
+        self.index = index
         # One stream + event per device: sharded blocks must sync every card.
         for d in self.devices:
             if d not in streams:
@@ -252,11 +248,13 @@ class BlockSwap:
 
     def _state_dict(self, i):
         def hook(module, state_dict, prefix, local_metadata):
+            # Resolved per call: PEFT wrapping after install renames weights (q_proj.base_layer.weight),
+            # and state_dict() emits every alias; a missed one serializes an empty tensor.
             b = self.blocks[i]
-            for name, idx in b.names:
-                key = prefix + name
-                if key in state_dict:
-                    state_dict[key] = b.host[idx]
+            for name, p in module.named_parameters(remove_duplicate = False):
+                idx = b.index.get(id(p))
+                if idx is not None and prefix + name in state_dict:
+                    state_dict[prefix + name] = b.host[idx]
         return hook
 
     def enter(self, idx):
