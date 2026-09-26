@@ -14,10 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-# patch_GptOssModel replaces the stock forward and with it @capture_outputs, so router_logits
-# came back None, load_balancing_loss_func returned the int 0, and any forward with
-# output_router_logits = True (TRL >= 1.7 default for MoE) raised
-# AttributeError: 'int' object has no attribute 'to'.
+# Guards: patched forward dropped router_logits, so aux_loss.to() raised (TRL >= 1.7 MoE).
 from __future__ import annotations
 
 import json
@@ -140,9 +137,7 @@ def test_patched_forward_returns_router_logits_like_stock():
     assert res["generate_error"] is None, res
     assert res["n_router_logits"] == res["ref_n_router_logits"] == 4, res
     assert res["aux_type"] == "Tensor", res
-    # The aux loss, and the router gradient it carries, must match the stock forward.
     assert res["aux_diff"] < 1e-5 and res["loss_diff"] < 1e-5, res
     assert res["router_logits_diff"] < 1e-5 and res["router_grad_diff"] < 1e-5, res
-    # Not asked for: nothing collected, and no hook left behind on any router.
     assert res["plain_router_logits_is_none"] and res["plain_aux_is_none"], res
     assert res["hooks_left"] == 0, res

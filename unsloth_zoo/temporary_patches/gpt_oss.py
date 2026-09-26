@@ -3125,8 +3125,7 @@ def patch_GptOssModel():
         except:
             pass
 
-        # A per-type mask mapping only arrives from generation, which has no labels and whose
-        # causal-LM forward would hand that mapping to load_balancing_loss_func.
+        # Mask mapping = generation; its causal-LM forward would pass it to load_balancing_loss_func.
         _mask_is_mapping = isinstance(attention_mask, dict)
 
         # flex_attention_with_sink training windows its own BlockMask; all else needs the per-type mapping.
@@ -3214,10 +3213,7 @@ def patch_GptOssModel():
             )
             all_hidden_states = () if output_hidden_states else None
 
-            # This forward replaces the stock one and with it @capture_outputs, so collect
-            # router_logits here, as the stock OutputRecorder(GptOssTopKRouter, index=0) does.
-            # Without them load_balancing_loss_func returns the int 0 and GptOssForCausalLM
-            # raises on `aux_loss.to(loss.device)`; TRL >= 1.7 requests them for every MoE model.
+            # Replaces stock @capture_outputs: without router_logits, aux_loss.to() fails (TRL >= 1.7 MoE).
             all_router_logits = None
             router_hooks = []
             if not _mask_is_mapping and kwargs.get("output_router_logits", getattr(self.config, "output_router_logits", False)):
