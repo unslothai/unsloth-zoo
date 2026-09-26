@@ -4201,18 +4201,18 @@ def forward_native_moe_loop(
         else:
             gate = F.linear(current_state, self.w1[expert_idx])
             up = F.linear(current_state, self.w3[expert_idx])
-            gate_up = torch.cat((gate, up), dim=-1)
+            gate_up = None
 
         if own_apply_gate:
-            current_hidden_states = self._apply_gate(gate_up)
+            current_hidden_states = self._apply_gate(
+                gate_up if gate_up is not None else torch.cat((gate, up), dim=-1)
+            )
         elif is_gpt_oss:
             limit = getattr(self, "limit", 7.0)
             alpha = getattr(self, "alpha", 1.702)
             gate = gate.clamp(min=None, max=limit)
             up = up.clamp(min=-limit, max=limit)
             current_hidden_states = (up + 1.0) * (gate * torch.sigmoid(gate * alpha))
-        elif own_apply_gate:
-            current_hidden_states = self._apply_gate(torch.cat((gate, up), dim=-1))
         elif hasattr(self, "act_fn") and callable(self.act_fn):
             current_hidden_states = self.act_fn(gate) * up
         else:

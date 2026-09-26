@@ -77,7 +77,7 @@ def Llama4TextMoe_forward(self, hidden_states):
     routed_out = self.experts(routed_in, top_k_index.reshape(-1, 1), ones)
     routed_out = routed_out.reshape(n_tokens, top_k, self.hidden_dim).sum(dim = 1)
     out = self.shared_expert(hidden_states)
-    # Add in place: a promoting add turns the residual float32 under autocast and mixes dtypes in the next GEMM.
+    # Cast first: a promoting add turns the residual float32 under autocast and mixes dtypes in the next GEMM.
     out = out + routed_out.to(out.dtype)
     return out, router_logits
 

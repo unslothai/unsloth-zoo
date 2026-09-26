@@ -361,7 +361,6 @@ def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
         forward_native_moe_loop,
         swap_moe_weights_for_call,
         _gate_up_is_interleaved,
-        _moe_recompute_default,
         _moe_recompute_enabled,
     )
 
