@@ -1417,10 +1417,34 @@ def patch_gpt_oss_bnb4bit():
     m.transformers_version = transformers_version
     m.Version              = Version
 
+    _rebind_gpt_oss_compiled_classes()
     return True
 
 
 pass
+
+
+def _rebind_gpt_oss_compiled_classes():
+    # The compiler runs once per process, so its gpt_oss module keeps the experts / router classes of
+    # whichever flavor loaded first; a later 16bit load after a 4bit one (or the reverse) built the wrong ones.
+    try:
+        import transformers.models.gpt_oss.modeling_gpt_oss as modeling
+    except Exception:
+        return
+    seen = set()
+    for cls in list(vars(modeling).values()):
+        if not isinstance(cls, type):
+            continue
+        for fn in vars(cls).values():
+            g = getattr(fn, "__globals__", None)
+            if g is None or id(g) in seen:
+                continue
+            seen.add(id(g))
+            if not str(g.get("__name__", "")).startswith("unsloth_compiled_module_gpt_oss"):
+                continue
+            for name in ("GptOssExperts", "GptOssTopKRouter"):
+                if name in g:
+                    g[name] = getattr(modeling, name)
 
 
 def restore_gpt_oss_original():
@@ -1435,6 +1459,7 @@ def restore_gpt_oss_original():
             transformers.models.gpt_oss.modeling_gpt_oss.GptOssTopKRouter = \
                 transformers.models.gpt_oss.modeling_gpt_oss._original_GptOssTopKRouter
             logger.info("Unsloth: Restored original GPT OSS classes")
+            _rebind_gpt_oss_compiled_classes()
             return True
     except Exception:
         pass
