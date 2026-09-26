@@ -529,6 +529,9 @@ def requires_grad_for_gradient_checkpointing(model):
                         # Might have failed finding self.layers: like self.layers[...]:
                         final_where = j
                         break
+                    elif re.search(r"for [^\n:]+ in enumerate\(self\." + module_list + r"\b", forward) is not None:
+                        final_where = j
+                        break
                     pass
                 pass
             pass
