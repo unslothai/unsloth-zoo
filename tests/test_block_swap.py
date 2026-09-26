@@ -47,7 +47,7 @@ class _FakeBlock:
         pass
 
 
-def _scheduler(n, depth = 2, sigs = None):
+def _scheduler(n, depth = 2, sigs = None, start = 0):
     """A BlockSwap with fake blocks and pools, no CUDA touched."""
     sw = BlockSwap.__new__(BlockSwap)
     sw.depth = depth
@@ -55,6 +55,7 @@ def _scheduler(n, depth = 2, sigs = None):
     sigs = sigs or ["a"] * n
     sw.blocks = [_FakeBlock(s) for s in sigs]
     sw.free = {s: [object() for _ in range(depth + 1)] for s in set(sigs)}
+    sw.start = start
     for b in sw.blocks:
         sw._release(b)
     sw._arm(forward = True)
@@ -161,6 +162,31 @@ def test_slot_returns_to_the_pool_it_came_from():
     assert len(sw.free["b"]) == n_b and len(sw.free["a"]) == n_a
 
 
+def test_enter_leave_walks_a_decode_step():
+    # The fast decode loop reads weights without calling the layer. enter/leave
+    # take indices into the full layer list; the swapped tail starts at 4 here.
+    sw = _scheduler(6, depth = 2, start = 4)
+    for b in sw.blocks:
+        sw._release(b)
+    with torch.no_grad():
+        for idx in range(10):
+            sw.enter(idx)
+            if idx >= 4:
+                assert sw.blocks[idx - 4].resident
+            assert _live(sw) <= sw.depth + 1
+            sw.leave(idx)
+    # Leaving the last swapped layer arms the next step's leading fetches.
+    assert [b.resident for b in sw.blocks] == [True, True] + [False] * 4
+
+
+def test_enter_leave_ignore_layers_on_the_card():
+    sw = _scheduler(4, depth = 2, start = 10)
+    before = [b.resident for b in sw.blocks]
+    sw.enter(3)
+    sw.leave(3)
+    assert [b.resident for b in sw.blocks] == before
+
+
 def test_find_decoder_layers_through_common_wrappers():
     class Inner(nn.Module):
         def __init__(self):
@@ -227,3 +253,24 @@ def test_params4bit_round_trip_is_bitwise():
         after = lin(x)
     assert torch.equal(ref, after)
     assert all(len(l._forward_pre_hooks) == 0 for l in layers)
+
+
+def test_host_loaded_layer_is_adopted_not_copied():
+    if not torch.cuda.is_available():
+        print("[SKIP] CUDA not available")
+        return
+    torch.manual_seed(0)
+    lin = nn.Linear(64, 64, bias = False).requires_grad_(False)   # built on the host
+    host = lin.weight.data.pin_memory()
+    lin.weight.data = host
+    x = torch.randn(2, 64, device = "cuda")
+    ref = x @ host.to("cuda").t()
+    layers = nn.ModuleList([nn.Linear(64, 64).cuda(), lin])
+    sw = BlockSwap(layers, 1, prefetch_depth = 1, device = "cuda")
+    assert sw.blocks[0].host[0].data_ptr() == host.data_ptr(), "an already-pinned host weight is used as is"
+    with torch.no_grad():
+        sw.enter(1)
+        out = lin(x)
+        sw.leave(1)
+    assert torch.equal(ref, out)
+    assert lin.weight.device.type == "cuda"

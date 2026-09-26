@@ -44,6 +44,7 @@ from contextlib import contextmanager, nullcontext
 __all__ = [
     "BlockSwap",
     "find_decoder_layers",
+    "build_host_layers",
 ]
 
 
@@ -96,14 +97,20 @@ def _swappable(module):
 class _Block:
     __slots__ = ("params", "host", "devices", "names", "streams", "events", "resident", "slot", "sig")
 
-    def __init__(self, layer, streams):
+    def __init__(self, layer, streams, device):
         self.params, self.host, self.devices = [], [], []
         index = {}
         for name, p in _swappable(layer):
             index[id(p)] = len(self.params)
             self.params.append(p)
-            self.host.append(_to_pinned_host(p.data))
-            self.devices.append(p.data.device)
+            if p.data.device.type == "cpu":
+                # Loaded straight to host by build_host_layers: that copy is the
+                # authoritative one, and it runs on the swap's device.
+                self.host.append(p.data if p.data.is_pinned() else _to_pinned_host(p.data))
+                self.devices.append(device)
+            else:
+                self.host.append(_to_pinned_host(p.data))
+                self.devices.append(p.data.device)
         # named_parameters() dedups shared params, but state_dict() emits every
         # registered alias. Record all alias names per swapped param (name, host
         # index) so _state_dict substitutes the host copy for each one, not just
@@ -168,7 +175,7 @@ class _Block:
 class BlockSwap:
     """Install on a decoder-layer list; the tail `n` of them live on the host."""
 
-    def __init__(self, layers, n, prefetch_depth = 2):
+    def __init__(self, layers, n, prefetch_depth = 2, device = None):
         # Fully initialize state up front so a disabled swap (n <= 0) can still
         # be managed through reset()/pool_bytes()/signatures() without blowing up.
         self.blocks, self.handles = [], []
@@ -180,7 +187,16 @@ class BlockSwap:
             return
         n = min(n, len(layers))
         self.start = len(layers) - n
-        self.blocks = [_Block(l, self.streams) for l in layers[self.start:]]
+        if device is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        self.device = torch.device(device)
+        self.blocks = [_Block(l, self.streams, self.device) for l in layers[self.start:]]
+        # LoRA adapters PEFT attached to host-loaded layers were created next to
+        # their CPU base weight; training needs them on the card.
+        for layer in layers[self.start:]:
+            for name, p in layer.named_parameters():
+                if (p.requires_grad or "lora_" in name) and p.device.type == "cpu":
+                    p.data = p.data.to(self.device)
 
         # A Parameter shared across two swapped blocks (cross-layer weight tying,
         # or the same layer object listed twice) is owned by both: prefetching
@@ -333,6 +349,23 @@ class BlockSwap:
                     state_dict[key] = b.host[idx]
         return hook
 
+    def enter(self, idx):
+        """Make decoder layer `idx` (index into the full layer list) resident.
+
+        For code that reads a layer's weights without calling the layer, like
+        Unsloth's fast decode loop, so the forward hooks never fire."""
+        i = idx - self.start
+        if 0 <= i < len(self.blocks):
+            self._pre(i)(None, None)
+
+    def leave(self, idx):
+        i = idx - self.start
+        if 0 <= i < len(self.blocks):
+            self._release(self.blocks[i])
+            # The next decode step starts back at the first swapped block.
+            if i == len(self.blocks) - 1:
+                self._arm(forward = True)
+
     def reset(self):
         """Manual step-boundary reset. Not needed in training; the backward
         hook arms the next step itself. Kept for callers that run forward-only
@@ -399,3 +432,74 @@ def find_decoder_layers(model):
     if hasattr(m, "layers"):
         return m.layers
     raise RuntimeError("could not locate decoder layers")
+
+
+def build_host_layers(make_layer, first_idx, count, tensors, device, compute_dtype,
+                      quantize_4bit = False, skip_modules = (), prefix = "model.layers."):
+    """Build decoder layers [first_idx, first_idx + count) with their frozen
+    weights in pinned host RAM, so a model larger than the card can load.
+
+    `make_layer(idx)` constructs one layer (called under the meta device);
+    `tensors` maps checkpoint keys to a zero-arg loader. bnb-prequantized weights
+    are rebuilt as they are; with `quantize_4bit`, plain weights are quantized one
+    at a time on `device` and only the packed blob comes back. quant_state stays
+    on `device`, the same split BlockSwap keeps for a layer it evicts."""
+    import bitsandbytes as bnb
+    device = torch.device(device)
+    # A bnb-prequantized checkpoint stores the weights it chose not to quantize
+    # (Unsloth's dynamic quants) as plain tensors; those stay plain.
+    if any(".quant_state." in k for k in tensors):
+        quantize_4bit = False
+    out = []
+    for idx in range(first_idx, first_idx + count):
+        with torch.device("meta"):
+            layer = make_layer(idx)
+        base = f"{prefix}{idx}."
+        for mname, mod in list(layer.named_modules()):
+            if not isinstance(mod, torch.nn.Linear):
+                continue
+            key = base + mname + ".weight"
+            stats = {k[len(key) + 1:]: tensors[k] for k in tensors if k.startswith(key + ".")}
+            bias = None
+            if mod.bias is not None:
+                bias = torch.nn.Parameter(_to_pinned_host(tensors[base + mname + ".bias"]().to(compute_dtype)),
+                                          requires_grad = False)
+            skipped = any(s in mname.split(".") for s in skip_modules)
+            if stats or (quantize_4bit and not skipped):
+                if stats:
+                    w = bnb.nn.Params4bit.from_prequantized(
+                        tensors[key](), {k: v() for k, v in stats.items()}, requires_grad = False, device = device)
+                else:
+                    w = bnb.nn.Params4bit(tensors[key]().to(compute_dtype), requires_grad = False,
+                                          compress_statistics = True, quant_type = "nf4",
+                                          quant_storage = torch.uint8).to(device)
+                new = bnb.nn.Linear4bit(mod.in_features, mod.out_features, bias = bias is not None,
+                                        compute_dtype = compute_dtype, quant_type = w.quant_type,
+                                        quant_storage = w.quant_storage, device = "meta")
+                w.module = new
+                new.weight = w
+                new.quant_state = w.quant_state
+                w.data = _to_pinned_host(w.data)
+                torch.cuda.empty_cache()
+            else:
+                new = torch.nn.Linear(mod.in_features, mod.out_features, bias = bias is not None, device = "meta")
+                new.weight = torch.nn.Parameter(_to_pinned_host(tensors[key]().to(compute_dtype)),
+                                                requires_grad = False)
+            if bias is not None:
+                new.bias = bias
+            parent_name, _, child = mname.rpartition(".")
+            setattr(layer.get_submodule(parent_name) if parent_name else layer, child, new)
+        for pname, p in list(layer.named_parameters()):
+            if p.device.type != "meta":
+                continue
+            t = tensors[base + pname]()
+            if t.is_floating_point():
+                t = t.to(compute_dtype)
+            parent_name, _, child = pname.rpartition(".")
+            parent = layer.get_submodule(parent_name) if parent_name else layer
+            setattr(parent, child, torch.nn.Parameter(_to_pinned_host(t), requires_grad = False))
+        for bname, b in layer.named_buffers():
+            if b.device.type == "meta":
+                raise RuntimeError(f"block_swap: {base}{bname} is a buffer with no checkpoint value")
+        out.append(layer)
+    return out
