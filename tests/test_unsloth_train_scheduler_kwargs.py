@@ -8,6 +8,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+
+pytest.importorskip("accelerate")  # TrainingArguments needs it; absent on MLX-only installs
 import torch
 from transformers import TrainingArguments
 
