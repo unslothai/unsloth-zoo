@@ -121,6 +121,23 @@ def test_a_partially_supervised_first_batch_counts_as_supervised():
     collator._check_supervised(torch.full((2, 5), -100))
 
 
+def test_a_non_default_ignore_index_still_sees_response_only_masking():
+    collator = _bare_collator()
+    collator.ignore_index = -1
+    with pytest.raises(ValueError, match = "no trainable"):
+        collator._check_supervised(torch.full((2, 5), -100))
+
+
+def test_a_first_batch_emptied_by_truncation_only_warns():
+    collator = _bare_collator()
+    collator.max_seq_length = 5
+    collator._check_supervised(torch.full((2, 5), -100), torch.ones(2, 5, dtype = torch.long))
+    with pytest.raises(ValueError, match = "no trainable"):
+        fresh = _bare_collator()
+        fresh.max_seq_length = 8
+        fresh._check_supervised(torch.full((2, 5), -100), torch.ones(2, 5, dtype = torch.long))
+
+
 def test_ragged_pixel_values_stay_a_list_and_text_fields_become_tensors():
     from unsloth_zoo.vision_utils import _tensorize_ragged_batch
     batch = _tensorize_ragged_batch({

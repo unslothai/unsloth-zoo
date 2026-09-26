@@ -1539,14 +1539,17 @@ class UnslothVisionDataCollator:
         batch["labels"] = labels
         if self.train_on_responses_only:
             batch["labels"] = self.train_on_responses_only(batch)["labels"]
-            self._check_supervised(batch["labels"])
+            self._check_supervised(batch["labels"], batch.get("attention_mask"))
         return batch
 
-    def _check_supervised(self, labels):
-        """All labels masked means zero loss: raise on the first batch, warn once later."""
+    def _check_supervised(self, labels, attention_mask = None):
+        """All labels masked means zero loss: raise on the first batch unless truncation explains
+        it (then, and on later batches, warn once)."""
         if not torch.is_tensor(labels) or labels.dim() != 2 or labels.shape[0] == 0:
             return
-        empty = int(((labels != self.ignore_index).sum(dim = 1) == 0).sum())
+        # train_on_responses_only masks with -100 whatever ignore_index is.
+        trained = (labels != self.ignore_index) & (labels != -100)
+        empty = int((trained.sum(dim = 1) == 0).sum())
         if empty < labels.shape[0]:
             self._seen_supervised = True
         if empty == 0:
@@ -1558,7 +1561,12 @@ class UnslothVisionDataCollator:
             "response_part against processor.apply_chat_template, or raise max_seq_length."
         )
         # getattr: subclasses may skip __init__ (slots stay unset until assigned).
-        if empty == labels.shape[0] and not getattr(self, "_seen_supervised", False):
+        max_len = getattr(self, "max_seq_length", None)
+        truncated = bool(max_len) and torch.is_tensor(attention_mask) and attention_mask.dim() == 2 \
+            and bool((attention_mask.sum(dim = 1) >= max_len).any())
+        # Each DataLoader worker has its own flag, so only raise when no row was truncated: then
+        # the marker is missing, which every worker sees alike.
+        if empty == labels.shape[0] and not truncated and not getattr(self, "_seen_supervised", False):
             raise ValueError(msg)
         if not getattr(self, "_warned_unsupervised", False):
             self._warned_unsupervised = True
