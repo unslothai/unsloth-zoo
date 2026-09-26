@@ -91,7 +91,20 @@ try:
     err = None
 except Exception as e:
     got, err = None, f'{type(e).__name__}: {e}'
-res = {'model_patch_live': getattr(fwd, '__wrapped__', fwd).__module__ == G.__name__, 'error': err}
+# TRL leaves config.output_router_logits on after training; generating right after must still work
+# when zoo's generation path hands the model a per-layer-type mask mapping.
+model.config.output_router_logits = True
+model.eval()
+try:
+    with torch.no_grad():
+        gen = model.generate(ids[:1, :6], max_new_tokens=4, do_sample=False, pad_token_id=0)
+    gen_err = None if gen.shape == (1, 10) else f'shape {tuple(gen.shape)}'
+    # On GPU zoo's generation path passes the per-type mapping into the causal-LM forward.
+    with torch.no_grad():
+        model(input_ids=ids[:1, :6], attention_mask={'full_attention': None, 'sliding_attention': None}, use_cache=False)
+except Exception as e:
+    gen_err = f'{type(e).__name__}: {e}'
+res = {'model_patch_live': getattr(fwd, '__wrapped__', fwd).__module__ == G.__name__, 'error': err, 'generate_error': gen_err}
 if got is not None:
     res.update({
         'aux_type': got['aux_type'], 'n_router_logits': got['n_router_logits'],
@@ -124,6 +137,7 @@ def test_patched_forward_returns_router_logits_like_stock():
     res = json.loads(lines[-1][len("RESULT "):])
     assert res["model_patch_live"], res
     assert res["error"] is None, res
+    assert res["generate_error"] is None, res
     assert res["n_router_logits"] == res["ref_n_router_logits"] == 4, res
     assert res["aux_type"] == "Tensor", res
     # The aux loss, and the router gradient it carries, must match the stock forward.

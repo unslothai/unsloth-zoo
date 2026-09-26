@@ -3125,6 +3125,10 @@ def patch_GptOssModel():
         except:
             pass
 
+        # A per-type mask mapping only arrives from generation, which has no labels and whose
+        # causal-LM forward would hand that mapping to load_balancing_loss_func.
+        _mask_is_mapping = isinstance(attention_mask, dict)
+
         # flex_attention_with_sink training windows its own BlockMask; all else needs the per-type mapping.
         _flex_sink_training = self.training and _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED
         if not _flex_sink_training and not isinstance(attention_mask, dict):
@@ -3216,7 +3220,7 @@ def patch_GptOssModel():
             # raises on `aux_loss.to(loss.device)`; TRL >= 1.7 requests them for every MoE model.
             all_router_logits = None
             router_hooks = []
-            if kwargs.get("output_router_logits", getattr(self.config, "output_router_logits", False)):
+            if not _mask_is_mapping and kwargs.get("output_router_logits", getattr(self.config, "output_router_logits", False)):
                 all_router_logits = []
                 def _record_router_logits(module, args, output):
                     all_router_logits.append(output[0] if isinstance(output, tuple) else output)
