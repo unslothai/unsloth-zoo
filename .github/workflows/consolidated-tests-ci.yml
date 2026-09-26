@@ -417,6 +417,7 @@ jobs:
         # it did not generate, bytecode included: the digest covers the .py, so the
         # pyc has to be dropped before every verified import.
         # test_device_map_planner_compressed_tensors: pack-quantized checkpoints planned at packed bytes.
+        # test_grpo_mask_truncated_rows: truncated completions stay out of the GRPO loss; its UnslothEfficientGRPO stubs bind to the real forward.
         run: |
           python -m pytest \
             tests/test_training_utils_use_cache.py \
@@ -450,6 +451,7 @@ jobs:
             tests/test_sft_prepare_dataset_double_bos.py \
             tests/test_moe_preprocess_weight_transpose.py \
             tests/test_relative_imports_resolve.py \
+            tests/test_grpo_mask_truncated_rows.py \
             tests/test_moe_weight_preprocessor_registry_shared.py \
             tests/test_moe_triton_down_lora_roworder.py \
             tests/test_moe_router_not_a_lora_target.py \
