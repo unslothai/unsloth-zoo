@@ -1568,24 +1568,12 @@ def _is_processor_like_class(obj):
 
 def _resolve_mlx_vlm_processor_class(model_type, processor_class_name):
     """Resolve a custom mlx-vlm or Transformers processor class by name."""
-    module_model_type = (model_type or "").replace("-", "_")
-    module_types = [module_model_type]
-    # Aliased model types live under their MODEL_REMAPPING target package.
-    try:
-        from mlx_vlm.utils import MODEL_REMAPPING
-        remapped = MODEL_REMAPPING.get(module_model_type)
-        if remapped and remapped not in module_types:
-            module_types.append(str(remapped).replace("-", "_"))
-    except Exception:
-        pass
-    module_candidates = tuple(
-        name
-        for module_type in module_types
-        for name in (
-            f"mlx_vlm.models.{module_type}.processor",
-            f"mlx_vlm.models.{module_type}.processing",
-            f"mlx_vlm.models.{module_type}.processing_{module_type}",
-        )
+    from .utils import _mlx_vlm_canonical_model_type
+    module_type = _mlx_vlm_canonical_model_type(model_type)
+    module_candidates = (
+        f"mlx_vlm.models.{module_type}.processor",
+        f"mlx_vlm.models.{module_type}.processing",
+        f"mlx_vlm.models.{module_type}.processing_{module_type}",
     )
     for module_name in module_candidates:
         try:
@@ -1716,16 +1704,54 @@ def _inherit_mlx_vlm_processor_runtime(processor, repaired):
     chat_template = getattr(processor, "chat_template", None)
     if chat_template is not None and getattr(repaired, "chat_template", None) is None:
         repaired.chat_template = chat_template
+    source_tokenizer = getattr(processor, "tokenizer", processor)
+    target_tokenizer = getattr(repaired, "tokenizer", repaired)
+    if source_tokenizer is not target_tokenizer:
+        return repaired
     detokenizer = getattr(processor, "detokenizer", None)
     if detokenizer is not None:
         repaired.detokenizer = detokenizer
-
-    source_tokenizer = getattr(processor, "tokenizer", processor)
-    target_tokenizer = getattr(repaired, "tokenizer", repaired)
     stopping_criteria = getattr(source_tokenizer, "stopping_criteria", None)
     if stopping_criteria is not None:
         target_tokenizer.stopping_criteria = stopping_criteria
     return repaired
+
+
+def _complete_mlx_vlm_processor_runtime(processor, model_path, eos_token_ids=None):
+    tokenizer = getattr(processor, "tokenizer", processor)
+    # mlx-vlm's load_processor leaves processors without decode() (depth, detection) bare.
+    if not callable(getattr(tokenizer, "decode", None)):
+        return processor
+    try:
+        if getattr(processor, "detokenizer", None) is None:
+            from mlx_vlm.tokenizer_utils import load_tokenizer, NaiveStreamingDetokenizer
+            try:
+                detokenizer_class = load_tokenizer(Path(model_path), return_tokenizer=False)
+                processor.detokenizer = detokenizer_class(tokenizer)
+            except (AttributeError, TypeError, ValueError):
+                processor.detokenizer = NaiveStreamingDetokenizer(tokenizer)
+        if getattr(tokenizer, "stopping_criteria", None) is None:
+            from mlx_vlm.utils import StoppingCriteria
+            criteria_kwargs = {}
+            if "additional_eos_token_ids" in inspect.signature(StoppingCriteria).parameters:
+                criteria_kwargs["additional_eos_token_ids"] = getattr(
+                    processor, "additional_eos_token_ids", (),
+                )
+            if eos_token_ids is None:
+                eos_token_ids = getattr(tokenizer, "eos_token_ids", None)
+                if eos_token_ids is None:
+                    eos_token_ids = getattr(tokenizer, "eos_token_id", None)
+                if eos_token_ids is None:
+                    eos_token_ids = []
+            tokenizer.stopping_criteria = StoppingCriteria(
+                eos_token_ids, tokenizer, **criteria_kwargs,
+            )
+    except Exception as error:
+        raise ValueError(
+            f"Unsloth: cannot initialize generation for {type(processor).__name__} "
+            f"with {type(tokenizer).__name__}: {error}"
+        ) from error
+    return processor
 
 
 def _bind_mlx_vlm_processor_loader(load_callable, *, allow_remote_code=False):
@@ -2155,7 +2181,7 @@ def _repair_degraded_vlm_processor(
 
     if chat_template is not None and getattr(repaired, "chat_template", None) is None:
         repaired.chat_template = chat_template
-    return repaired
+    return _inherit_mlx_vlm_processor_runtime(processor, repaired)
 
 
 def _config_source_has_modality(package_dir: Path) -> bool:
@@ -8906,6 +8932,10 @@ class FastMLXModel:
                 token=token,
                 trust_remote_code=trust_remote_code,
             )
+            processor = _run_with_vlm_config_view(
+                _complete_mlx_vlm_processor_runtime,
+                processor, local_path or model_name, config_data.get("eos_token_id"),
+            )
 
             if target_dtype is not None:
                 _run_with_vlm_config_view(
@@ -8925,6 +8955,7 @@ class FastMLXModel:
                 processor,
                 chat_template=chat_template,
                 model_name=model_name,
+                model_path=local_path,
                 model_type=model_type,
                 strict=False,
             )

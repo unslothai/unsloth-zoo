@@ -5898,3 +5898,44 @@ def test_a_hugging_face_snapshot_symlink_is_still_followed(tmp_path):
 
     _save_vlm_processor_assets(_P(), out, (str(snapshot),))
     assert (out / "config.json").read_text() == '{"model_type": "real"}'
+
+
+@pytest.mark.parametrize("legacy_render", [None, "transformed history"])
+def test_typed_role_fallback_preserves_existing_render(monkeypatch, legacy_render):
+    import unsloth_zoo.mlx.utils as utils
+
+    class Processor:
+        image_token = "<image>"
+        chat_template = "typed"
+        def apply_chat_template(self, messages, **kwargs):
+            import jinja2
+            if isinstance(messages[0].get("content"), str) and legacy_render:
+                return legacy_render
+            template = "{% for m in messages %}{{ m.role }}:{% for p in m.content %}{% if p.type == 'text' %}{{ p.text }}{% elif p.type == 'image' %}{{ image_prompt_token }}{% endif %}{% endfor %};{% endfor %}"
+            return jinja2.Environment(undefined=jinja2.StrictUndefined).from_string(template).render(messages=messages)
+
+    monkeypatch.setattr(utils, "_vlm_token_messages", lambda p, ms: utils._flatten_vlm_content_for_text_template(ms, "<image>"))
+    messages = [
+        {"role":"user", "content":[{"type":"text", "text":"first"}]},
+        {"role":"assistant", "content":[{"type":"text", "text":"second"}]},
+        {"role":"user", "content":[{"type":"image"}, {"type":"text", "text":"third"}]},
+    ]
+    assert utils._render_vlm_messages(Processor(), messages) == (legacy_render or "user:first;assistant:second;user:<image>third;")
+
+
+@pytest.mark.parametrize("remote", [False, True])
+@pytest.mark.parametrize("template", ["source template", {"tool_use": "tool template", "default": "source template"}])
+def test_missing_processor_template_recovers_legacy_json(tmp_path, remote, template):
+    import json
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx.utils import normalize_vlm_processor_chat_template
+
+    (tmp_path / "chat_template.json").write_text(json.dumps({"chat_template": template}))
+    tokenizer = SimpleNamespace(chat_template=None)
+    processor = SimpleNamespace(tokenizer=tokenizer, chat_template=None)
+    kwargs = {"model_name": "org/model", "model_path": str(tmp_path)} if remote else {"model_name": str(tmp_path)}
+    normalize_vlm_processor_chat_template(processor, **kwargs)
+    assert processor.chat_template == tokenizer.chat_template == "source template"
+    processor.chat_template = "existing template"
+    normalize_vlm_processor_chat_template(processor, model_name=str(tmp_path))
+    assert processor.chat_template == "existing template"
