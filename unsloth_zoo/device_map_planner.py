@@ -479,6 +479,28 @@ def _name_of_module(model: nn.Module, target: nn.Module) -> str | None:
     return None
 
 
+def _undeclared_sibling_blocks(model: nn.Module, declared: set[str]) -> set[str]:
+    """Undeclared classes sharing a ModuleList with a declared block, e.g. an appended MTP layer."""
+    found: set[str] = set()
+    if not declared:
+        return found
+    for _, mod in model.named_modules():
+        if not isinstance(mod, nn.ModuleList):
+            continue
+        names = [type(child).__name__ for child in mod]
+        if not any(name in declared for name in names):
+            continue
+        for child, name in zip(mod, names):
+            if name in declared:
+                continue
+            # A container class name would make every such container atomic model-wide.
+            if type(child) in (nn.ModuleList, nn.ModuleDict, nn.Sequential):
+                continue
+            if any(True for _ in child.parameters(recurse=True)):
+                found.add(name)
+    return found
+
+
 def resolve_no_split_classes(model: nn.Module) -> list[str]:
     """Decoder / encoder block classes that must not be split across devices."""
     classes = getattr(model, "_no_split_modules", None)
@@ -487,17 +509,7 @@ def resolve_no_split_classes(model: nn.Module) -> list[str]:
     # Only `None`, the base-class default, means "not declared, go and detect".
     if classes is not None:
         declared = {str(c) for c in classes}
-        # Siblings of a declared block (Ling-2.6-flash's MTP layer) are blocks too: split, their attention hits a device mismatch.
-        if declared:
-            for _, mod in model.named_modules():
-                if not isinstance(mod, nn.ModuleList):
-                    continue
-                if not any(type(child).__name__ in declared for child in mod):
-                    continue
-                for child in mod:
-                    if any(True for _ in child.parameters(recurse=True)):
-                        declared.add(type(child).__name__)
-        return sorted(declared)
+        return sorted(declared | _undeclared_sibling_blocks(model, declared))
     # Fallback: every distinct child class of every nn.ModuleList that holds
     # more than one entry. That is where repeated transformer blocks live.
     found: set[str] = set()
