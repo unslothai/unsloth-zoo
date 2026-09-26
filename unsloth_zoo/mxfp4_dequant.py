@@ -58,7 +58,9 @@ def mxfp4_dequantize_torch(blocks, scales, dtype = torch.bfloat16, transpose = F
     # Transposed: row r lands in column r % N of expert r // N; a chunk never crosses an expert.
     dst = buf.view(R // N, G * B * 2, N) if transpose else buf.view(R, G * B * 2)
     step = max(1, min(N if transpose else R, _TORCH_CHUNK_BYTES // (G * B * 2 * 8)))
-    for r0 in range(0, R, step):
+    r0 = 0
+    while r0 < R:
+        # Advance to r1, not by step: a chunk cut at an expert edge is shorter.
         r1 = min(r0 + step, (r0 // N + 1) * N if transpose else R)
         b = rows_in[r0:r1]
         piece = torch.empty(r1 - r0, G, B * 2, dtype = dtype, device = blocks.device)
@@ -71,6 +73,7 @@ def mxfp4_dequantize_torch(blocks, scales, dtype = torch.bfloat16, transpose = F
             dst[e, :, i0:i0 + (r1 - r0)] = piece.T
         else:
             dst[r0:r1] = piece
+        r0 = r1
     if out is not None and buf is not out:
         out.copy_(buf)
         return out
