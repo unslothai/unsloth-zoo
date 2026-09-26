@@ -475,6 +475,29 @@ def test_efficient_grpo_single_chunk_matches_naive(loss_type, disable_dynamo):
     ), f"{loss_type}: gradient mismatch"
 
 
+def _efficient_grpo_grad(upstream, upstream_scale=None):
+    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("grpo")
+    new = new.clone().requires_grad_(True)
+    out = rr.UnslothEfficientGRPO.apply(
+        new, old, ref, None, torch.randn(17, 8, dtype=torch.float64), input_ids, mask, advantages,
+        0.04, None, 1, kwargs, upstream_scale,
+    )
+    (out[0] * upstream).backward()
+    return new.grad
+
+
+def test_efficient_grpo_backward_ignores_grad_output_by_default(disable_dynamo):
+    """TRL <= 0.21 training_step divides the already GAS-normalized loss by GAS again."""
+    assert torch.equal(_efficient_grpo_grad(0.25), _efficient_grpo_grad(1.0))
+
+
+def test_efficient_grpo_backward_applies_deepspeed_loss_scale(disable_dynamo):
+    """DeepSpeed FP16 multiplies the loss by its scale S; dropping it leaves ZeRO unscaling g to g / S."""
+    base = _efficient_grpo_grad(1.0)
+    assert torch.allclose(_efficient_grpo_grad(128.0, 1.0), 128.0 * base, rtol=1e-12)
+    assert torch.allclose(_efficient_grpo_grad(128.0 / 4, 4.0), 128.0 * base, rtol=1e-12)
+
+
 @pytest.mark.parametrize("loss_type", ["dapo", "cispo", "vespo"])
 @pytest.mark.parametrize("items", [0.0, torch.tensor(0.0)], ids=["python", "tensor"])
 def test_grpo_generation_normalizer_survives_an_empty_batch(loss_type, items):
