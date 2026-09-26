@@ -109,7 +109,7 @@ def test_custom_op_compiles_without_graph_breaks():
 
 def test_stacked_experts_calling_convention():
     from unsloth_zoo.mxfp4_gemm import mxfp4_gemm_available, mxfp4_grouped_matmul, mxfp4_grouped_mm
-    assert mxfp4_gemm_available(torch.device("cuda")) and not mxfp4_gemm_available(dtype = torch.float16)
+    assert mxfp4_gemm_available(torch.device("cuda")) and not mxfp4_gemm_available(dtype = torch.float32)
     blocks, scales = _stack(3, 128, 64, seed = 4)
     counts = torch.tensor([3, 0, 5], dtype = torch.int64, device = "cuda")
     x = torch.randn(8, 64, dtype = torch.bfloat16, device = "cuda")
@@ -119,3 +119,63 @@ def test_stacked_experts_calling_convention():
         mxfp4_grouped_matmul(g, blocks, scales, counts, trans = True),
         mxfp4_grouped_mm(g, blocks, scales, counts.int(), transpose_b = False),
     )
+
+
+def _single(N, K, seed, lo = 118, hi = 130):
+    blocks, scales = _stack(1, N, K, seed, lo, hi)
+    return blocks[0], scales[0]
+
+
+@pytest.mark.parametrize("asm", [True, False])
+def test_single_weight_decode_is_bit_exact_for_every_scale(asm, monkeypatch):
+    """Identity input makes every output one exact product: both decoders must equal mxfp4_dequant bit for bit."""
+    import unsloth_zoo.mxfp4_gemm as mg
+    monkeypatch.setattr(mg, "_ASM_OK", {k: asm for k in (None, 0, torch.cuda.current_device())})
+    # Rows scaled by >= 2^127 keep only |v| <= 0.5 so every value stays finite.
+    small = torch.tensor([0, 1, 8, 9], dtype = torch.uint8, device = "cuda")
+    blocks = torch.randint(0, 256, (256, 4, 16), dtype = torch.uint8, device = "cuda")
+    scales = torch.arange(256, dtype = torch.uint8, device = "cuda")[:, None].repeat(1, 4)
+    pick = torch.randint(0, 4, (2, 256, 4, 16), device = "cuda")
+    blocks = torch.where(scales[..., None] > 126, small[pick[0]] | (small[pick[1]] << 4), blocks)
+    want = mxfp4_dequantize_torch(blocks, scales, dtype = torch.bfloat16)
+    fwd = mg.mxfp4_matmul(torch.eye(128, dtype = torch.bfloat16, device = "cuda"), blocks, scales)
+    bwd = mg.mxfp4_matmul(torch.eye(256, dtype = torch.bfloat16, device = "cuda"), blocks, scales, trans = True)
+    # Values, not bits: the fp32 accumulator turns a decoded -0 into +0.
+    assert torch.equal(fwd.float().t(), want.float())
+    assert torch.equal(bwd.float(), want.float())
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("rows", [1, 8, 33, 64, 130])
+@pytest.mark.parametrize("trans", [False, True])
+def test_single_weight_matmul_matches_dequantize_then_matmul(rows, trans, dtype):
+    from unsloth_zoo.mxfp4_gemm import mxfp4_gemm_available, mxfp4_matmul
+    assert mxfp4_gemm_available(torch.device("cuda"), dtype)
+    N, K = 320, 256
+    blocks, scales = _single(N, K, seed = rows + trans)
+    w = mxfp4_dequantize_torch(blocks, scales, dtype = torch.float32)
+    x = torch.randn(rows, N if trans else K, device = "cuda").to(dtype)
+    bias = torch.randn(K if trans else N, device = "cuda").to(dtype)
+    want = x.float() @ (w if trans else w.t()) + bias.float()
+    got = mxfp4_matmul(x, blocks.reshape(N, K // 2), scales, trans = trans, bias = bias)
+    assert got.dtype == dtype and got.shape == want.shape
+    torch.testing.assert_close(got.float(), want, atol = 2e-2 * want.abs().max().item(), rtol = 2e-2)
+    out = torch.empty_like(got)
+    same = mxfp4_matmul(x, blocks, scales, trans = trans, bias = bias, out = out)
+    assert same.data_ptr() == out.data_ptr() and torch.equal(same, got)
+
+
+def test_single_weight_matmul_keeps_leading_dims_and_strided_input():
+    from unsloth_zoo.mxfp4_gemm import mxfp4_matmul
+    blocks, scales = _single(96, 128, seed = 7)
+    x = torch.randn(2, 3, 256, dtype = torch.bfloat16, device = "cuda")[..., ::2]
+    got = mxfp4_matmul(x, blocks, scales)
+    assert got.shape == (2, 3, 96)
+    assert torch.equal(got, mxfp4_matmul(x.contiguous(), blocks, scales))
+    assert mxfp4_matmul(x[:, :0], blocks, scales).shape == (2, 0, 96)
+
+
+def test_fused_gemm_off_switch(monkeypatch):
+    from unsloth_zoo.mxfp4_gemm import mxfp4_gemm_available
+    monkeypatch.setenv("UNSLOTH_MXFP4_FUSED_GEMM", "0")
+    assert not mxfp4_gemm_available(torch.device("cuda"), torch.bfloat16)

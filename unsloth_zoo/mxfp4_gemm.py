@@ -20,7 +20,8 @@ GEMM main loop, so no dense bf16 expert stack is ever materialised.
 The packed stack ``P`` is ``blocks (E, R, G, 16)`` + ``scales (E, R, G)``, one row of ``C = G * 32``
 values per ``r``. Rows of ``x`` are sorted by expert (``counts[e]`` rows each, like torch._grouped_mm's
 ``offs``). ``transpose_b=True`` computes ``x @ P[e]^T`` (GPT-OSS forward: logical weight ``(E, C, R)``),
-``transpose_b=False`` computes ``x @ P[e]`` (its dX backward)."""
+``transpose_b=False`` computes ``x @ P[e]`` (its dX backward). ``mxfp4_matmul`` runs the same kernel on one weight
+(no expert schedule), e.g. a packed MXFP4 Linear."""
 
 import torch
 
@@ -31,6 +32,7 @@ __all__ = [
     "mxfp4_expert_grouped_mm",
     "mxfp4_grouped_matmul",
     "mxfp4_gemm_available",
+    "mxfp4_matmul",
 ]
 
 try:
@@ -63,6 +65,66 @@ if _HAS_TRITON:
         return tl.reshape(vals, (ROWS, COLS))
 
     @triton.jit
+    def _decode_mxfp4_tile_asm(packed, scale):
+        # packed (R, C // 2) uint8, scale (R, C // 32) uint8 -> (R, C) bf16, bit-identical to mxfp4_dequant.
+        # Each nibble becomes bf16 bits sign << 15 | e2m1 << 6 (= value * 2^-126, subnormal for e = 0), then two
+        # exact bf16x2 fmas by 2^(min(s, 128) - 1) and 2^(max(s, 128) - 128): every e8m0 incl. 255 = 2^128.
+        R: tl.constexpr = packed.shape[0]
+        CB: tl.constexpr = packed.shape[1]
+        CG: tl.constexpr = scale.shape[1]
+        sc = tl.reshape(tl.broadcast_to(scale[:, :, None], (R, CG, 16)), (R, CB))
+        lo, hi = tl.inline_asm_elementwise(
+            asm = """
+            {
+            .reg .b32 t, u, s, f, g, z;
+            and.b32 s, $5, 0xFF;
+            min.u32 f, s, 128;
+            add.u32 f, f, 126;
+            shl.b32 f, f, 7;
+            prmt.b32 f, f, 0, 0x1010;
+            max.u32 g, s, 128;
+            sub.u32 g, g, 1;
+            shl.b32 g, g, 7;
+            prmt.b32 g, g, 0, 0x1010;
+            mov.b32 z, 0x80008000;
+            prmt.b32 t, $4, 0, 0x4140;
+            and.b32 u, t, 0x00070007;
+            shl.b32 u, u, 6;
+            and.b32 $0, t, 0x00080008;
+            shl.b32 $0, $0, 12;
+            or.b32 $0, $0, u;
+            fma.rn.bf16x2 $0, $0, f, z;
+            fma.rn.bf16x2 $0, $0, g, z;
+            and.b32 u, t, 0x00700070;
+            shl.b32 u, u, 2;
+            and.b32 $2, t, 0x00800080;
+            shl.b32 $2, $2, 8;
+            or.b32 $2, $2, u;
+            fma.rn.bf16x2 $2, $2, f, z;
+            fma.rn.bf16x2 $2, $2, g, z;
+            prmt.b32 t, $4, 0, 0x4342;
+            and.b32 u, t, 0x00070007;
+            shl.b32 u, u, 6;
+            and.b32 $1, t, 0x00080008;
+            shl.b32 $1, $1, 12;
+            or.b32 $1, $1, u;
+            fma.rn.bf16x2 $1, $1, f, z;
+            fma.rn.bf16x2 $1, $1, g, z;
+            and.b32 u, t, 0x00700070;
+            shl.b32 u, u, 2;
+            and.b32 $3, t, 0x00800080;
+            shl.b32 $3, $3, 8;
+            or.b32 $3, $3, u;
+            fma.rn.bf16x2 $3, $3, f, z;
+            fma.rn.bf16x2 $3, $3, g, z;
+            }
+            """,
+            constraints = "=r,=r,=r,=r,r,r",
+            args = [packed, sc], dtype = (tl.bfloat16, tl.bfloat16), is_pure = True, pack = 4,
+        )
+        return tl.reshape(tl.join(lo, hi), (R, CB * 2))
+
+    @triton.jit
     def _mxfp4_scale_factors(scale):
         """e8m0 -> (2^(scale - 1) or 2^(scale - 128), 1 or 2^127) as bf16; their product restores value * 2^-126."""
         big = scale > 128
@@ -85,33 +147,38 @@ if _HAS_TRITON:
 
     @triton.jit
     def _mxfp4_grouped_mm_kernel(
-        x_ptr, blocks_ptr, scales_ptr, out_ptr, counts_ptr,
-        E, R, G, K, N,
+        x_ptr, blocks_ptr, scales_ptr, out_ptr, counts_ptr, bias_ptr,
+        E, R, G, K, N, M,
         stride_xm, stride_om,
         TRANS_B: tl.constexpr, E_POW2: tl.constexpr,
         BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-        SPLIT: tl.constexpr,
+        SPLIT: tl.constexpr, GROUPED: tl.constexpr, HAS_BIAS: tl.constexpr, ASM: tl.constexpr,
     ):
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
-        # Tile pid_m -> (expert, tile within expert); tiles are laid out expert after expert.
-        e_offs = tl.arange(0, E_POW2)
-        counts = tl.load(counts_ptr + e_offs, mask = e_offs < E, other = 0)
-        tiles = (counts + BLOCK_M - 1) // BLOCK_M
-        tile_end = tl.cumsum(tiles, 0)
-        e = tl.sum((tile_end <= pid_m).to(tl.int32), 0)
-        if e >= E:
-            return
-        row_end_all = tl.cumsum(counts, 0)
-        row_end = tl.sum(tl.where(e_offs == e, row_end_all, 0), 0)
-        row_start = row_end - tl.sum(tl.where(e_offs == e, counts, 0), 0)
-        tile_start = tl.sum(tl.where(e_offs == e, tile_end - tiles, 0), 0)
-        m0 = row_start + (pid_m - tile_start) * BLOCK_M
+        if GROUPED:
+            # Tile pid_m -> (expert, tile within expert); tiles are laid out expert after expert.
+            e_offs = tl.arange(0, E_POW2)
+            counts = tl.load(counts_ptr + e_offs, mask = e_offs < E, other = 0)
+            tiles = (counts + BLOCK_M - 1) // BLOCK_M
+            tile_end = tl.cumsum(tiles, 0)
+            e = tl.sum((tile_end <= pid_m).to(tl.int32), 0)
+            if e >= E:
+                return
+            row_end_all = tl.cumsum(counts, 0)
+            row_end = tl.sum(tl.where(e_offs == e, row_end_all, 0), 0)
+            row_start = row_end - tl.sum(tl.where(e_offs == e, counts, 0), 0)
+            tile_start = tl.sum(tl.where(e_offs == e, tile_end - tiles, 0), 0)
+            m0 = row_start + (pid_m - tile_start) * BLOCK_M
+            e64 = e.to(tl.int64)
+        else:
+            m0 = pid_m * BLOCK_M
+            row_end = M
+            e64 = tl.full((), 0, tl.int64)
 
         offs_m = m0 + tl.arange(0, BLOCK_M)
         mask_m = offs_m < row_end
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-        e64 = e.to(tl.int64)
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype = tl.float32)
         x_rows = x_ptr + offs_m.to(tl.int64)[:, None] * stride_xm
         C = G * 32
@@ -130,8 +197,8 @@ if _HAS_TRITON:
                     offs_kg = k0 // 32 + tl.arange(0, BLOCK_K // 32)
                     scale = tl.load(scales_ptr + prow[:, None] * G + offs_kg[None, :], mask = mask_n[:, None], other = 127).to(tl.int32)
                     lo, hi = _decode_mxfp4_halves(packed, scale, BLOCK_N, BLOCK_K // 2)
-                    acc = tl.dot(a_lo, tl.trans(lo), acc)
-                    acc = tl.dot(a_hi, tl.trans(hi), acc)
+                    acc = tl.dot(a_lo, tl.trans(lo.to(a_lo.dtype)), acc)
+                    acc = tl.dot(a_hi, tl.trans(hi.to(a_hi.dtype)), acc)
             else:
                 for k0 in range(0, K, BLOCK_K):
                     offs_k = k0 + tl.arange(0, BLOCK_K)
@@ -140,14 +207,17 @@ if _HAS_TRITON:
                     packed = tl.load(
                         blocks_ptr + prow[:, None] * (G * 16) + offs_kb[None, :],
                         mask = mask_n[:, None] & (offs_kb[None, :] < G * 16), other = 0,
-                    ).to(tl.int32)
+                    )
                     offs_kg = k0 // 32 + tl.arange(0, BLOCK_K // 32)
                     scale = tl.load(
                         scales_ptr + prow[:, None] * G + offs_kg[None, :],
                         mask = mask_n[:, None] & (offs_kg[None, :] < G), other = 127,
-                    ).to(tl.int32)
-                    w = _decode_mxfp4_tile(packed, scale, BLOCK_N, BLOCK_K)
-                    acc = tl.dot(a, tl.trans(w), acc)
+                    )
+                    if ASM:
+                        w = _decode_mxfp4_tile_asm(packed, scale)
+                    else:
+                        w = _decode_mxfp4_tile(packed.to(tl.int32), scale.to(tl.int32), BLOCK_N, BLOCK_K)
+                    acc = tl.dot(a, tl.trans(w.to(a.dtype)), acc)
         else:
             # out[m, n] = sum_k x[m, k] * P[e, k, n]; K = R, N = C. Packed rows are k.
             mask_n = offs_n < C
@@ -171,8 +241,8 @@ if _HAS_TRITON:
                         mask = mask_k[:, None] & (offs_ng[None, :] < G), other = 127,
                     ).to(tl.int32)
                     lo, hi = _decode_mxfp4_halves(packed, scale, BLOCK_K, BLOCK_N // 2)
-                    acc_lo = tl.dot(a, lo, acc_lo)
-                    acc_hi = tl.dot(a, hi, acc_hi)
+                    acc_lo = tl.dot(a, lo.to(a.dtype), acc_lo)
+                    acc_hi = tl.dot(a, hi.to(a.dtype), acc_hi)
                 acc = tl.reshape(tl.join(acc_lo, acc_hi), (BLOCK_M, BLOCK_N))
             else:
                 offs_nb = pid_n * (BLOCK_N // 2) + tl.arange(0, BLOCK_N // 2)
@@ -185,13 +255,18 @@ if _HAS_TRITON:
                     packed = tl.load(
                         blocks_ptr + prow[:, None] * (G * 16) + offs_nb[None, :],
                         mask = mask_k[:, None] & (offs_nb[None, :] < G * 16), other = 0,
-                    ).to(tl.int32)
+                    )
                     scale = tl.load(
                         scales_ptr + prow[:, None] * G + offs_ng[None, :],
                         mask = mask_k[:, None] & (offs_ng[None, :] < G), other = 127,
-                    ).to(tl.int32)
-                    w = _decode_mxfp4_tile(packed, scale, BLOCK_K, BLOCK_N)
-                    acc = tl.dot(a, w, acc)
+                    )
+                    if ASM:
+                        w = _decode_mxfp4_tile_asm(packed, scale)
+                    else:
+                        w = _decode_mxfp4_tile(packed.to(tl.int32), scale.to(tl.int32), BLOCK_K, BLOCK_N)
+                    acc = tl.dot(a, w.to(a.dtype), acc)
+        if HAS_BIAS:
+            acc += tl.load(bias_ptr + offs_n, mask = mask_n, other = 0.0).to(tl.float32)[None, :]
         out = out_ptr + offs_m.to(tl.int64)[:, None] * stride_om + offs_n[None, :]
         tl.store(out, acc.to(out_ptr.dtype.element_ty), mask = mask_m[:, None] & mask_n[None, :])
 
@@ -253,21 +328,62 @@ def _split_permute(x, block_k):
     return x.view(M, K // block_k, block_k // 2, 2).transpose(-1, -2).reshape(M, K)
 
 
-def _launch(x, blocks, scales, counts, out, transpose_b, config, launcher):
+def _pick_dense_config(M, N, K, transpose_b):
+    """Single weight (no expert schedule), non-split tiles: narrow N tiles keep every SM busy for skinny inputs.
+    B200 sweep over Llama-3-8B Linear shapes, M <= 64; wider inputs reuse the grouped table."""
+    if M > 64:
+        return _pick_config(M, 1, N, K, transpose_b)
+    if transpose_b:
+        if M <= 16:
+            return (16, 32, 256, 4, 3, False) if N <= 4096 else (16, 64, 256, 4, 3, False)
+        if M <= 32:
+            return (16, 64, 256, 4, 3, False) if N <= 4096 else (32, 64, 256, 4, 2, False)
+        return (64, 32, 128, 4, 3, False) if N <= 4096 else (64, 64, 128, 4, 4, False)
+    if M <= 16:
+        return (16, 32, 256, 4, 3, False) if N <= 4096 else (16, 64, 256, 4, 3, False)
+    if M <= 32:
+        return (32, 32, 128, 4, 4, False) if N <= 4096 else (32, 64, 256, 4, 3, False)
+    return (64, 32, 256, 4, 3, False) if N <= 4096 else (64, 64, 128, 4, 4, False)
+
+
+_ASM_OK = {}
+
+
+def _asm_ok(device):
+    """Inline-PTX bf16x2 fma decode (Kimi-K3 port): sm_80+ CUDA; UNSLOTH_MXFP4_ASM=0 turns it off."""
+    ok = _ASM_OK.get(device.index)
+    if ok is None:
+        import os
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        ok = _ASM_OK[device.index] = (
+            torch.version.hip is None
+            and torch.cuda.get_device_capability(index) >= (8, 0)
+            and os.environ.get("UNSLOTH_MXFP4_ASM", "1") != "0"
+        )
+    return ok
+
+
+def _launch(x, blocks, scales, counts, out, transpose_b, config, launcher, bias = None):
     E, R, G, _ = blocks.shape
     M, K = x.shape
     N = out.shape[1]
-    BM, BN, BK, warps, stages, split = config or _pick_config(M, E, N, K, transpose_b)
+    grouped = counts is not None
+    if config is None:
+        config = _pick_config(M, E, N, K, transpose_b) if grouped else _pick_dense_config(M, N, K, transpose_b)
+    BM, BN, BK, warps, stages, split = config[:6]
+    asm = config[6] if len(config) > 6 else (not grouped and _asm_ok(x.device))
     split = split and (K % BK == 0 if transpose_b else BN >= 32)
     if split and transpose_b:
         x = _split_permute(x, BK)
-    grid = (triton.cdiv(M, BM) + E, triton.cdiv(N, BN))
+    # Plain ints: triton.cdiv / next_power_of_2 cost microseconds per call on the decode path.
+    grid = (-(-M // BM) + (E if grouped else 0), -(-N // BN))
     launcher(_mxfp4_grouped_mm_kernel)[grid](
-        x, blocks, scales, out, counts,
-        E, R, G, K, N,
+        x, blocks, scales, out, x if counts is None else counts, x if bias is None else bias,
+        E, R, G, K, N, M,
         x.stride(0), out.stride(0),
-        TRANS_B = transpose_b, E_POW2 = triton.next_power_of_2(E),
+        TRANS_B = transpose_b, E_POW2 = 1 << (E - 1).bit_length(),
         BLOCK_M = BM, BLOCK_N = BN, BLOCK_K = BK, SPLIT = split,
+        GROUPED = grouped, HAS_BIAS = bias is not None, ASM = asm,
         num_warps = warps, num_stages = stages,
     )
     return out
@@ -393,6 +509,89 @@ def mxfp4_grouped_matmul(x, blocks, scales, counts, trans = False):
     return mxfp4_grouped_mm(x, blocks.contiguous(), scales.contiguous(), counts.contiguous(), transpose_b = not trans)
 
 
+def mxfp4_matmul(x, blocks, scales, trans = False, out = None, bias = None):
+    """``x @ W^T (+ bias)`` (``trans=False``) or ``x @ W`` for one MXFP4 weight W = decode(blocks ``(N, G, 16)`` or
+    ``(N, G * 16)``, scales ``(N, G)``). bias is added to the fp32 accumulator; ``out`` (contiguous, x's dtype, right
+    size) is written in place, else a new tensor is returned."""
+    N, G = scales.shape[-2], scales.shape[-1]
+    blocks = blocks.contiguous().view(1, N, G, 16)
+    if scales.device != blocks.device:
+        scales = scales.to(blocks.device)
+    scales = scales.contiguous().view(1, N, G)
+    lead = x.shape[:-1]
+    x2 = x if x.dim() == 2 else x.reshape(-1, x.shape[-1])
+    if x2.stride(-1) != 1 or (x2.shape[0] > 1 and x2.stride(0) < x2.shape[1]):
+        x2 = x2.contiguous()
+    M = x2.shape[0]
+    n_out = G * 32 if trans else N
+    if x2.shape[1] != (N if trans else G * 32):
+        raise ValueError(f"Unsloth: MXFP4 matmul expects {N if trans else G * 32} input features, got {x2.shape[1]}")
+    if out is None or out.dtype != x.dtype or not out.is_contiguous() or out.numel() != M * n_out:
+        out = torch.empty((M, n_out), dtype = x.dtype, device = x.device)
+    else:
+        out = out.view(M, n_out)
+    if bias is not None:
+        bias = bias.to(device = x.device).contiguous()
+    if M > 0:
+        # Decode-sized calls are CPU bound: switch devices only when needed.
+        index = x.device.index
+        prior = torch.cuda.current_device()
+        switch = index is not None and index != prior
+        if switch:
+            torch.cuda.set_device(index)
+        try:
+            _launch(x2, blocks, scales, None, out, not trans, None, lambda kernel: kernel, bias = bias)
+        finally:
+            if switch:
+                torch.cuda.set_device(prior)
+    return out if x.dim() == 2 else out.view(*lead, n_out)
+
+
+_AVAILABLE_DTYPE = {}
+
+
+def _probe_dense(device, dtype):
+    from unsloth_zoo.mxfp4_dequant import mxfp4_dequantize_torch
+    gen = torch.Generator(device = device).manual_seed(0)
+    N, G = 96, 5
+    blocks = torch.randint(0, 256, (N, G, 16), dtype = torch.uint8, device = device, generator = gen)
+    scales = torch.randint(118, 130, (N, G), dtype = torch.uint8, device = device, generator = gen)
+    w = mxfp4_dequantize_torch(blocks, scales, dtype = torch.float32)
+    bias = torch.randn(N, device = device, generator = gen).to(dtype)
+    for rows in (1, 37):
+        x = torch.randn(rows, G * 32, device = device, generator = gen).to(dtype)
+        got = mxfp4_matmul(x, blocks, scales, bias = bias).float()
+        want = x.float() @ w.t() + bias.float()
+        gy = torch.randn(rows, N, device = device, generator = gen).to(dtype)
+        got_t = mxfp4_matmul(gy, blocks, scales, trans = True).float()
+        want_t = gy.float() @ w
+        for g, t in ((got, want), (got_t, want_t)):
+            if not torch.allclose(g, t, rtol = 2e-2, atol = 2e-2 * t.abs().max().item()):
+                return False
+    return True
+
+
 def mxfp4_gemm_available(device = None, dtype = torch.bfloat16) -> bool:
-    """``mxfp4_grouped_mm_available`` for bf16 activations (the in-register decode is bf16)."""
-    return dtype == torch.bfloat16 and mxfp4_grouped_mm_available(device)
+    """Fused kernel usable for ``dtype`` activations on ``device``: self-checked once per (device, dtype), grouped and
+    single-weight. bf16 and fp16 (the decode is exact in bf16, then cast); ``UNSLOTH_MXFP4_FUSED_GEMM=0`` turns it off."""
+    if dtype not in (torch.bfloat16, torch.float16):
+        return False
+    import os
+    if os.environ.get("UNSLOTH_MXFP4_FUSED_GEMM", "auto") in ("0", "dequant"):
+        return False
+    key = (None if device is None else str(device), dtype)
+    ok = _AVAILABLE_DTYPE.get(key)
+    if ok is not None:
+        return ok
+    ok = mxfp4_grouped_mm_available(device)
+    if ok:
+        device = torch.device(device) if device is not None else torch.device("cuda", torch.cuda.current_device())
+        try:
+            with torch.autocast(device.type, enabled = False), torch.no_grad():
+                ok = _probe_dense(device, dtype)
+        except Exception as exception:
+            import warnings
+            warnings.warn(f"Unsloth: fused MXFP4 GEMM unavailable for {dtype} ({exception}); dequantizing instead.")
+            ok = False
+    _AVAILABLE_DTYPE[key] = ok
+    return ok
