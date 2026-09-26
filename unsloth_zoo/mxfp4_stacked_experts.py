@@ -22,6 +22,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .mxfp4_dequant import Mxfp4ExpertParam, is_mxfp4_expert_param, mxfp4_dequantize
+from .mxfp4_gemm import mxfp4_gemm_available, mxfp4_grouped_matmul
 
 __all__ = [
     "Mxfp4StackedExperts",
@@ -83,8 +84,31 @@ def _chunked_grouped_mm(inputs, param, counts, ends, dtype, transpose):
     return out
 
 
+def _fused(inputs, param):
+    return (
+        inputs.is_cuda and is_mxfp4_expert_param(param) and param.mxfp4_transposed
+        and mxfp4_gemm_available(inputs.device, inputs.dtype)
+    )
+
+
+def _scales(param):
+    scales = param.mxfp4_scales
+    if scales.device != param.device:
+        scales = param.mxfp4_scales = scales.to(param.device)
+    return scales
+
+
+def _grouped(inputs, param, counts, ends, transpose):
+    # Fused: bytes decoded per tile inside the GEMM, only routed experts read, no 16-bit stack.
+    if _fused(inputs, param):
+        return mxfp4_grouped_matmul(inputs, param.data, _scales(param), counts, trans = not transpose)
+    if ends is None:
+        ends = torch.cumsum(counts, 0).tolist()
+    return _chunked_grouped_mm(inputs, param, counts, ends, inputs.dtype, transpose)
+
+
 class _Mxfp4GroupedLinear(torch.autograd.Function):
-    """Saves no weight: backward dequantizes W_e^T again."""
+    """Saves no weight: backward reads the packed W_e^T again."""
 
     @staticmethod
     def forward(ctx, inputs, param, counts, ends):
@@ -92,7 +116,7 @@ class _Mxfp4GroupedLinear(torch.autograd.Function):
         ctx.ends = ends
         ctx.save_for_backward(counts)
         with torch.no_grad():
-            return _chunked_grouped_mm(inputs, param, counts, ends, inputs.dtype, True)
+            return _grouped(inputs, param, counts, ends, True)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -100,18 +124,20 @@ class _Mxfp4GroupedLinear(torch.autograd.Function):
         grad_input = None
         if ctx.needs_input_grad[0]:
             with torch.no_grad():
-                grad_input = _chunked_grouped_mm(
-                    grad_output.contiguous(), ctx.param, counts, ctx.ends, grad_output.dtype, False,
-                )
+                grad_input = _grouped(grad_output.contiguous(), ctx.param, counts, ctx.ends, False)
         return grad_input, None, None, None
 
 
-def mxfp4_grouped_linear(inputs, param, counts, ends):
-    """Grouped ``inputs @ W_e`` over expert-sorted rows; ``ends`` is the host cumsum of ``counts``."""
+def mxfp4_grouped_linear(inputs, param, counts, ends = None):
+    """Grouped ``inputs @ W_e`` over expert-sorted rows; ``ends`` = host cumsum of ``counts`` (None: derived if needed)."""
     if not is_mxfp4_expert_param(param):
         offsets = torch.cumsum(counts, 0, dtype = torch.int32)
         return _grouped_mm(inputs.contiguous(), param.to(inputs.dtype), offsets)
-    return _Mxfp4GroupedLinear.apply(inputs.contiguous(), param, counts, ends)
+    inputs = inputs.contiguous()
+    if not (torch.is_grad_enabled() and inputs.requires_grad):
+        with torch.no_grad():
+            return _grouped(inputs, param, counts, ends, True)
+    return _Mxfp4GroupedLinear.apply(inputs, param, counts, ends)
 
 
 def _lora_delta(experts, name, inputs, ends_device):
@@ -212,9 +238,13 @@ class Mxfp4StackedExperts(nn.Module):
         flat_idx = topk_idx.reshape(-1)
         order = torch.argsort(flat_idx, stable = True)
         rows = hidden_states[order // top_k]
-        counts = torch.bincount(flat_idx, minlength = self.num_experts)
+        # scatter_add, not bincount: bincount reads max() back to the host, a sync per MoE layer.
+        flat_idx = flat_idx.long()
+        counts = torch.zeros(self.num_experts, dtype = torch.int64, device = flat_idx.device)
+        counts.scatter_add_(0, flat_idx, torch.ones_like(flat_idx))
         ends_device = torch.cumsum(counts, 0, dtype = torch.int32)
-        ends = ends_device.tolist()
+        # The fused GEMM schedules on device; only the chunked fallback needs host offsets (one sync).
+        ends = None if _fused(rows, self.gate_up_proj) or not is_mxfp4_expert_param(self.gate_up_proj) else ends_device.tolist()
 
         gate_up = mxfp4_grouped_linear(rows, self.gate_up_proj, counts, ends)
         delta = _lora_delta(self, "gate_up_proj", rows, ends_device)
