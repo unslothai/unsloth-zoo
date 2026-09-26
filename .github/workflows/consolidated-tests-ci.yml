@@ -1115,6 +1115,7 @@ jobs:
                   tests/test_vision_utils_grid_helpers_eager.py \
                   tests/test_modeling_local_vision_helpers_eager.py \
                   tests/test_disable_compile_functions_reach_imported_helpers.py \
+                  tests/test_data_dependent_helpers_not_fullgraph.py \
                   tests/test_temporary_patches_exhaustive.py \
                   tests/test_mxfp4_load_path_layout.py \
                   tests/test_linear4bit_packed_without_quant_state.py \
