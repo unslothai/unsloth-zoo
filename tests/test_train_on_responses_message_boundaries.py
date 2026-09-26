@@ -222,8 +222,6 @@ def test_a_whitespace_special_token_is_not_a_message_boundary():
 
 
 def test_force_match_false_masks_the_marker_newline():
-    """force_match=False splits the marker's trailing newline off as an optional token;
-    it must be skipped the same way force_match=True skips it, not trained on."""
     tokenizer = chatml_tokenizer()
     row = turn(USER, QUESTION) + turn(ASSISTANT, FINAL) + [EOS]
 
@@ -235,7 +233,7 @@ def test_force_match_false_masks_the_marker_newline():
         return fn({"input_ids": [list(row)]})["labels"][0]
 
     assert labels(False, row) == labels(True, row)
-    # Without the optional newline, the first response token must still be trained.
+    # Optional newline absent: the first response token is still trained.
     row = turn(USER, QUESTION) + [IM_START, ASSISTANT, FINAL, NL, TOOLCALL, IM_END, EOS]
     assert labels(False, row)[row.index(FINAL)] == FINAL
 
