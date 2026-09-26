@@ -435,6 +435,14 @@ def _stage_cast_for_test(module, dtype):
     module.to(dtype)
 
 
+def _attach_tower_input_hooks(model):
+    try:
+        from .device_map_planner import attach_tower_input_hooks
+        attach_tower_input_hooks(model)
+    except Exception:
+        pass
+
+
 def patch_model_and_tokenizer(
     model,
     tokenizer,
@@ -446,6 +454,7 @@ def patch_model_and_tokenizer(
     # All Unsloth Zoo code licensed under LGPLv3
     assert(type(downcast_rope) is bool)
     import gc
+    _attach_tower_input_hooks(model)
 
     # Fix dtype
     m = model

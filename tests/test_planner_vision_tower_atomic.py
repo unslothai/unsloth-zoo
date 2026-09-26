@@ -12,7 +12,7 @@ from accelerate import init_empty_weights
 import unsloth_zoo.device_map_planner as planner
 
 
-def _qwen3_5_moe(layers = 8, depth = 4, out_hidden_size = 64):
+def _qwen3_5_moe(layers = 8, depth = 4, out_hidden_size = 64, positions = 64, intermediate = 128):
     if not hasattr(transformers, "Qwen3_5MoeConfig"):
         pytest.skip("transformers has no Qwen3.5 MoE")
     config = transformers.Qwen3_5MoeConfig(
@@ -26,22 +26,22 @@ def _qwen3_5_moe(layers = 8, depth = 4, out_hidden_size = 64):
             layer_types = ["linear_attention", "full_attention"] * (layers // 2),
         ),
         vision_config = dict(
-            depth = depth, hidden_size = 64, intermediate_size = 128, num_heads = 4,
-            out_hidden_size = out_hidden_size, num_position_embeddings = 64, patch_size = 4,
+            depth = depth, hidden_size = 64, intermediate_size = intermediate, num_heads = 4,
+            out_hidden_size = out_hidden_size, num_position_embeddings = positions, patch_size = 4,
         ),
     )
     return _build(transformers.Qwen3_5MoeForConditionalGeneration, config)
 
 
-def _qwen3_vl():
+def _qwen3_vl(layers = 8, depth = 4):
     config = transformers.Qwen3VLConfig(
         text_config = dict(
             vocab_size = 512, hidden_size = 64, intermediate_size = 128,
-            num_hidden_layers = 8, num_attention_heads = 4, num_key_value_heads = 2,
+            num_hidden_layers = layers, num_attention_heads = 4, num_key_value_heads = 2,
             head_dim = 16, rope_scaling = dict(rope_type = "default", mrope_section = [4, 2, 2]),
         ),
         vision_config = dict(
-            depth = 4, hidden_size = 64, intermediate_size = 128, num_heads = 4,
+            depth = depth, hidden_size = 64, intermediate_size = 128, num_heads = 4,
             out_hidden_size = 64, num_position_embeddings = 64, patch_size = 4,
             deepstack_visual_indexes = [1, 2],
         ),
@@ -121,11 +121,22 @@ def test_a_tower_larger_than_a_card_keeps_its_embeddings_with_its_first_block():
     assert any("split at its blocks" in n for n in plan.notes)
 
 
-def test_a_tower_that_cannot_be_kept_together_still_plans_as_before():
-    # Loose parts plus one block exceed a card; each unit alone fits.
+def test_a_wide_merger_spreads_instead_of_splitting_the_embeddings():
     model = _qwen3_5_moe(layers = 4, depth = 2, out_hidden_size = 1024)
     plan = _plan(model, 0.52)
-    old = _plan(model, 0.52, no_split_module_classes = planner.resolve_no_split_classes(model))
+    anchor = {plan.device_map[k] for k in ("model.visual.patch_embed.proj", "model.visual.pos_embed", "model.visual.blocks.0")}
+    assert len(anchor) == 1, plan.device_map
+    assert any("split at its blocks" in n for n in plan.notes)
+
+
+def test_a_tower_that_cannot_be_kept_together_still_plans_as_before():
+    # Patch + position embeddings plus one block exceed a card; each unit alone fits.
+    model = _qwen3_5_moe(layers = 2, depth = 2, positions = 16384, intermediate = 4096)
+    sizes = planner._compute_module_sizes(model)
+    budget = sum(sizes[k] for k in ("model.visual.patch_embed", "model.visual.pos_embed", "model.visual.blocks.0")) - 1
+    kw = dict(max_memory = {0: budget, 1: budget}, headroom_bytes = 0)
+    plan = planner.plan_device_map(model, **kw)
+    old = planner.plan_device_map(model, no_split_module_classes = planner.resolve_no_split_classes(model), **kw)
     assert plan.device_map == old.device_map
     assert any("split per unit" in n for n in plan.notes)
 
@@ -150,3 +161,55 @@ def test_a_whole_tower_runs_with_inputs_on_another_device(inputs_on):
     grid = torch.tensor([[1, 4, 4]], device = inputs_on)
     with torch.no_grad():
         model.model.visual(torch.randn(16, 96, device = inputs_on), grid_thw = grid)
+
+
+def test_input_hooks_skip_models_that_are_not_split():
+    model = _qwen3_vl()
+    assert planner.attach_tower_input_hooks(model) == []
+    model.hf_device_map = {"": 0}
+    assert planner.attach_tower_input_hooks(model) == []
+
+
+# Planner device 1 is a real second GPU when there is one, else the CPU under the same hooks.
+_SECOND = "cuda:1" if torch.cuda.device_count() > 1 else "cpu"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU")
+@pytest.mark.parametrize("inputs_on", ["cuda:0", _SECOND])
+def test_a_split_tower_runs_once_its_inputs_are_hooked(inputs_on):
+    from accelerate import dispatch_model
+    config = _qwen3_vl(layers = 2, depth = 12).config
+    config.dtype = torch.float32
+    model = transformers.Qwen3VLForConditionalGeneration._from_config(config).eval()
+    plan = _plan(model, 0.55)
+    assert any("split at its blocks" in n for n in plan.notes), plan.notes
+    assert len(_devices(plan, "model.visual")) == 2
+    device_map = {k: (0 if d == 0 else _SECOND) for k, d in plan.device_map.items()}
+    model = dispatch_model(model, device_map = device_map, main_device = "cpu" if _SECOND == "cpu" else None)
+    anchor = model.model.visual.pos_embed.weight.device
+    pixels = lambda d: (torch.randn(16, 96, device = d), torch.tensor([[1, 4, 4]], device = d))
+    if torch.device(inputs_on) != anchor:
+        with pytest.raises(RuntimeError, match = "same device"), torch.no_grad():
+            x, g = pixels(inputs_on)
+            model.model.visual(x, grid_thw = g)
+    assert planner.attach_tower_input_hooks(model) == ["model.visual"]
+    assert planner.attach_tower_input_hooks(model) == []
+    with torch.no_grad():
+        for d in ("cuda:0", _SECOND):
+            x, g = pixels(d)
+            model.model.visual(x, grid_thw = g)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU")
+def test_an_offloaded_tower_moves_its_inputs_to_the_execution_device():
+    from accelerate import dispatch_model
+    config = _qwen3_vl(layers = 2, depth = 12).config
+    config.dtype = torch.float32
+    model = transformers.Qwen3VLForConditionalGeneration._from_config(config).eval()
+    plan = _plan(model, 0.55)
+    # cpu entries under a cuda main device are offloaded: their weights are meta, run on cuda:0.
+    device_map = {k: (0 if d == 0 else "cpu") for k, d in plan.device_map.items()}
+    model = dispatch_model(model, device_map = device_map, main_device = "cuda:0")
+    assert planner.attach_tower_input_hooks(model) == ["model.visual"]
+    with torch.no_grad():
+        model.model.visual(torch.randn(16, 96, device = "cuda:0"), grid_thw = torch.tensor([[1, 4, 4]], device = "cuda:0"))
