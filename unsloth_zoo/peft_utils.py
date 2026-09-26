@@ -448,7 +448,6 @@ def requires_grad_for_gradient_checkpointing(model):
                         final_where = j
                         break
                     elif re.search(r"for [^\n:]+ in enumerate\(self\." + module_list + r"\b", forward) is not None:
-                        # Vision towers: for layer_num, blk in enumerate(self.blocks):
                         final_where = j
                         break
                     pass

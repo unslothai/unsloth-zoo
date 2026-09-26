@@ -14,13 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Vision towers that loop `for layer_num, blk in enumerate(self.blocks):` must get the hook.
-
-Qwen3-VL, Qwen3-Omni and Muse Glimmer write their vision layer loop with enumerate(). The
-tower's input comes from a frozen patch embedding, so under reentrant checkpointing every
-block's LoRA gets no gradient unless the tower is hooked, while the loss still falls through
-the projector and language LoRA. CPU only.
-"""
+"""Vision towers looping `for i, blk in enumerate(self.blocks):` (Qwen3-VL, Qwen3-Omni) need the
+requires-grad hook: fed by a frozen patch embedding, reentrant-checkpointed blocks get no gradient."""
 
 import pytest
 import torch
@@ -69,7 +64,7 @@ class _PlainTower(_EnumerateTower):
 
 
 class _Composite(nn.Module):
-    """The tower is reached through a helper, never as `self.tower(` in forward."""
+    # Tower reached only via a helper, never as `self.tower(` in forward.
     def __init__(self, tower_cls):
         super().__init__()
         self.tower = tower_cls()
@@ -95,7 +90,6 @@ def test_every_tower_block_gets_a_gradient(tower_cls):
 
 
 def test_unhooked_enumerate_tower_really_loses_the_gradient():
-    # Guards the test above: without the hook the reentrant blocks get nothing.
     torch.manual_seed(0)
     model = _Composite(_EnumerateTower)
     model.tower.patch_embed.weight.requires_grad_(False)
