@@ -52,8 +52,21 @@ def moe_triton_kernels_available(device = None) -> bool:
     return _TRITON
 
 
+def _autograd_control_flow_errors():
+    from torch.utils import checkpoint
+    return tuple(
+        cls for cls in (
+            getattr(checkpoint, "_StopRecomputationError", None),
+            getattr(checkpoint, "CheckpointError", None),
+        ) if cls is not None
+    )
+
+
 def _disable(where, exc):
     global _DISABLED_REASON
+    # Checkpoint early stop raises from our save_for_backward; swallowing it trips early_stop's assertion.
+    if isinstance(exc, _autograd_control_flow_errors()):
+        raise exc
     _DISABLED_REASON = f"{where}: {type(exc).__name__}: {exc}"
     logger.warning(
         "Unsloth: the Triton MoE kernels failed to compile or launch and are disabled "
