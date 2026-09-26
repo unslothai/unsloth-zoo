@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Guards: gpt-oss GRPO crashed with `target_frame.early_stop is set` because the fused MoE combine
-swallowed torch checkpoint's early-stop signal and replayed the eager path during recomputation."""
+"""Guards: gpt-oss GRPO `target_frame.early_stop is set` (MoE combine swallowed checkpoint early stop)."""
 import pytest
 import torch
 from torch.utils import checkpoint

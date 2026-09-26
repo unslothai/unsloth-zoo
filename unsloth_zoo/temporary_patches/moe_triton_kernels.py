@@ -64,8 +64,7 @@ def _autograd_control_flow_errors():
 
 def _disable(where, exc):
     global _DISABLED_REASON
-    # Non-reentrant checkpoint ends recomputation early by raising from the save hook inside our
-    # autograd Function; swallowing it replays the eager path and trips early_stop's assertion.
+    # Checkpoint early stop raises from our save_for_backward; swallowing it trips early_stop's assertion.
     if isinstance(exc, _autograd_control_flow_errors()):
         raise exc
     _DISABLED_REASON = f"{where}: {type(exc).__name__}: {exc}"
