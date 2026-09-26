@@ -175,3 +175,15 @@ def test_interpolation_mixes_in_the_pieces_the_token_replaces():
     expected = torch.full((model.config.hidden_size,), 6.0)
     torch.testing.assert_close(model.get_input_embeddings().weight[new_id], expected)
     torch.testing.assert_close(model.get_output_embeddings().weight[new_id], expected)
+
+
+def test_interpolation_token_with_no_pieces_gets_the_trained_mean():
+    model, tokenizer = _build(8, 8)
+    with torch.no_grad():
+        for i in range(8):
+            model.get_input_embeddings().weight[i].fill_(i + 1)
+    assert tokenizer("  ", add_special_tokens=False).input_ids == []
+    add_new_tokens(model, tokenizer, new_tokens=["  "], method="interpolation")
+    new_id = tokenizer.convert_tokens_to_ids("  ")
+    expected = torch.full((model.config.hidden_size,), 4.5)
+    torch.testing.assert_close(model.get_input_embeddings().weight[new_id], expected)

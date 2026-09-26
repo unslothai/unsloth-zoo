@@ -188,8 +188,12 @@ def add_new_tokens(
             f"We shall set new tokens = mean(embeddings)*{1-interpolation} + mean(new_tokens)*{interpolation}"
         )
         for j, input_ids in enumerate(new_token_pieces):
-            mean_embedding_token = embedding_matrix[input_ids].mean(axis = 0, dtype = torch.float32)
-            mean_lm_head_token   = lm_head_matrix  [input_ids].mean(axis = 0, dtype = torch.float32)
+            # T5-style tokenizers split whitespace-only strings into no pieces; a mean of none is NaN.
+            if len(input_ids) == 0:
+                mean_embedding_token, mean_lm_head_token = mean_embedding, mean_lm_head
+            else:
+                mean_embedding_token = embedding_matrix[input_ids].mean(axis = 0, dtype = torch.float32)
+                mean_lm_head_token   = lm_head_matrix  [input_ids].mean(axis = 0, dtype = torch.float32)
 
             # Interpolate
             mean_embedding_token = mean_embedding*(1-interpolation) + mean_embedding_token*interpolation
