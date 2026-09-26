@@ -1602,7 +1602,8 @@ class UnslothVisionDataCollator:
             return self.processor(**proc_kwargs)
         except ValueError as e:
             # Nemotron Omni returns per-image pixel tensors that BatchFeature cannot stack.
-            if "Unable to convert output" not in str(e) or not has_images:
+            # transformers 5.x: "Unable to convert output", 4.x: "Unable to create tensor".
+            if not has_images or not any(m in str(e) for m in ("Unable to convert output", "Unable to create tensor")):
                 raise
             proc_kwargs = dict(proc_kwargs, return_tensors = None)
             batch = _tensorize_ragged_batch(self.processor(**proc_kwargs))

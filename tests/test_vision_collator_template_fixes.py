@@ -193,12 +193,12 @@ def test_string_content_keeps_every_assistant_text_part():
 class _RaggedProcessor:
     """Stacks like a dynamic-resolution processor: fails with tensors when images differ."""
     def __call__(self, text = None, images = None, return_tensors = None, **kwargs):
-        if images and return_tensors == "pt":
-            raise ValueError("Unable to convert output to PyTorch tensors format")
+        from transformers import BatchFeature
         out = {"input_ids": [[1, 2, 3] for _ in text], "attention_mask": [[1, 1, 1] for _ in text]}
         if images:
-            out["pixel_values"] = [torch.zeros(3, 8 + 8 * i, 8) for i in range(len(images))]
-        return out
+            out["pixel_values"] = [torch.zeros(3, 8 + 8 * i, 8).numpy() for i in range(len(images))]
+        # The installed BatchFeature raises its own wording (differs between 4.x and 5.x).
+        return BatchFeature(out, tensor_type = return_tensors)
 
 
 def test_the_ragged_fallback_serves_every_processor_call():
@@ -208,8 +208,8 @@ def test_the_ragged_fallback_serves_every_processor_call():
         {"text": ["a", "b"], "images": ["x", "y"], "return_tensors": "pt"}, True)
     assert torch.is_tensor(batch["input_ids"]) and batch["input_ids"].shape == (2, 3)
     assert isinstance(batch["pixel_values"], list)
-    with pytest.raises(ValueError, match = "Unable to convert"):
-        collator._call_processor({"text": ["a"], "images": ["x"], "return_tensors": "pt"}, False)
+    with pytest.raises(ValueError, match = "Unable to (convert output|create tensor)"):
+        collator._call_processor({"text": ["a", "b"], "images": ["x", "y"], "return_tensors": "pt"}, False)
 
 
 def test_prompt_completion_path_goes_through_the_shared_processor_call():
