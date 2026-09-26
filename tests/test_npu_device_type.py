@@ -20,7 +20,9 @@ import unsloth_zoo.device_type as dt
 import torch
 
 os.environ.pop("UNSLOTH_ALLOW_CPU", None)
-dt._IS_MLX = False  # an Apple Silicon runner with mlx answers "mlx" before any cell
+if dt._IS_MLX:  # Apple Silicon with mlx answers "mlx" first and never imports torch here
+    print("MLX")
+    sys.exit(0)
 for cell in sys.argv[1:]:
     torch.cuda.is_available = lambda cell=cell: cell in ("cuda", "hip")
     torch.version.hip = "7.2.0" if cell == "hip" else None
@@ -94,6 +96,8 @@ def answers():
         env = env,
         timeout = 900,
     )
+    if out.stdout.splitlines()[-1:] == ["MLX"]:
+        pytest.skip("an mlx host answers \"mlx\" before any accelerator")
     got = {}
     for line in out.stdout.splitlines():
         if line.startswith("CELL "):
