@@ -112,6 +112,16 @@ def test_container_target_passes_weight_and_scale_through():
     assert out["proj.weight"] is q and out["proj.weight_scale_inv"] is scale
 
 
+def test_container_scale_takes_the_parameter_dtype():
+    # Qwen3-FP8 ships bf16 scales; stock loading upcasts them into the fp32 `weight_scale_inv`.
+    model = _Holder()
+    op = _make_op(Fp8Dequantize)(_quantizer())
+    q, scale = _block_quantize(torch.randn(8, 8), (4, 4))
+    out = op.convert({"weight$": [q], "weight_scale_inv": [scale.to(torch.bfloat16)]}, full_layer_name = "proj.weight", model = model)
+    assert out["proj.weight_scale_inv"].dtype == model.proj.weight_scale_inv.dtype == torch.float32
+    assert torch.equal(out["proj.weight_scale_inv"], scale.to(torch.bfloat16).float())
+
+
 def test_save_keeps_a_container_packed_and_requantizes_a_dequantized_weight():
     """Weight must avoid the amax == 448 fixed point and the scale grid be block-divisible, or the old bug hides."""
     from transformers import PretrainedConfig

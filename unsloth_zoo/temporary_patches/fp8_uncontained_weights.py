@@ -46,6 +46,14 @@ def _target_owns_scale(model, full_layer_name):
     return isinstance(scale, torch.Tensor)
 
 
+def _as_param_dtype(module, name, value):
+    # Renamed keys load in the checkpoint dtype; stock loading casts floats to the parameter's (bf16 scales -> fp32).
+    param = getattr(module, name, None)
+    if isinstance(param, torch.Tensor) and isinstance(value, torch.Tensor) and value.is_floating_point() and param.is_floating_point():
+        return value.to(param.dtype)
+    return value
+
+
 def _first(value):
     return value[0] if isinstance(value, (list, tuple)) else value
 
@@ -113,9 +121,9 @@ def _make_op(Fp8Dequantize):
                     out[full_layer_name] = value
                 elif "scale_inv" in pattern:
                     scale = value
-                    out[base + _scale_attr_for(attr)] = value
+                    out[base + _scale_attr_for(attr)] = _as_param_dtype(module, _scale_attr_for(attr), value)
                 elif "activation_scale" in pattern:
-                    out[base + "activation_scale"] = value
+                    out[base + "activation_scale"] = _as_param_dtype(module, "activation_scale", value)
                 else:
                     out[base + pattern] = value
             if scale is None and weight is not None and module is not None:
