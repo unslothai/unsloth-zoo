@@ -2673,7 +2673,6 @@ def _padded_features(counts, width=8, dim=6):
     return features, valid
 
 
-# Short, full, empty and padded first rows, in both orders.
 @metal_only
 @pytest.mark.parametrize("counts", [
     (5,), (8,), (0,), (5, 3), (3, 5), (8, 4, 1), (1, 4, 8), (5, 0, 6), (0, 7), (7, 0), (0, 0), (8, 8),

@@ -5012,8 +5012,6 @@ def _static_shape_prefix_rows(features, valid_mask):
 
 
 def _install_gemma4_unified_compile_patches():
-    """Install Gemma 4 unified compile patches for feature compaction and prefill mode."""
-
     module = _try_import_module("mlx_vlm.models.gemma4_unified.gemma4_unified")
     if module is None:
         return
@@ -5026,8 +5024,7 @@ def _install_gemma4_unified_compile_patches():
         return
 
     def patched_update_chunked_prefill_mode(self, input_ids=None, **kwargs):
-        # Skip the `.item()` host syncs. `BatchGenerator` still reads the language
-        # model's flag, so restore the always-safe config default, not a stale one.
+        # Skip `.item()` syncs; `BatchGenerator` reads the language model flag, so restore the config default.
         if getattr(self, "training", False):
             self.no_chunked_prefill = self._base_no_chunked_prefill
             self.language_model.no_chunked_prefill = self._base_no_chunked_prefill

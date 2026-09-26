@@ -3578,7 +3578,6 @@ def test_gemma4_unified_installer_patches_both_blockers(monkeypatch, base_defaul
 
     class Model:
         def __init__(self):
-            # Start opposite the default so restoring it differs from any constant.
             self._base_no_chunked_prefill = base_default
             self.language_model = types.SimpleNamespace(
                 no_chunked_prefill=not base_default)
