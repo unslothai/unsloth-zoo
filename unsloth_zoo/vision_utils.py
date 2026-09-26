@@ -1214,6 +1214,54 @@ def _raise_chat_template_error(error, processor, model = None):
     raise RuntimeError(error) from error
 
 
+def _adopt_tokenizer_chat_template(processor) -> bool:
+    """MiniMax-M3 VL processors skip chat_template.jinja; use the inner tokenizer's."""
+    inner = getattr(processor, "tokenizer", None)
+    if getattr(processor, "chat_template", None) is None and \
+        inner is not None and inner is not processor and \
+        isinstance(getattr(inner, "chat_template", None), str):
+        processor.chat_template = inner.chat_template
+        return True
+    return False
+pass
+
+
+def _renders_content_list_as_repr(rendered, text) -> bool:
+    """Nemotron Omni templates render a content list as its Python repr."""
+    return isinstance(rendered, str) and text in rendered and \
+        ("'type': 'text'" in rendered or '"type": "text"' in rendered)
+pass
+
+
+def _processor_takes_images(processor) -> bool:
+    """Step-3.7 names its image component `image_preprocessor`."""
+    import inspect
+    try:
+        params = inspect.signature(type(processor).__call__).parameters
+    except (TypeError, ValueError):
+        return False
+    return "images" in params
+pass
+
+
+def _tensorize_ragged_batch(batch):
+    """Tensorize fields; ragged ones stay lists of tensors."""
+    for key in list(batch.keys()):
+        value = batch[key]
+        if torch.is_tensor(value) or not isinstance(value, (list, tuple)) or len(value) == 0:
+            continue
+        items = [torch.as_tensor(v) if isinstance(v, np.ndarray) else v for v in value]
+        if all(torch.is_tensor(v) for v in items):
+            batch[key] = torch.stack(items) if len({tuple(v.shape) for v in items}) == 1 else list(items)
+            continue
+        try:
+            batch[key] = torch.tensor(items)
+        except (ValueError, TypeError, RuntimeError):
+            batch[key] = items
+    return batch
+pass
+
+
 class UnslothVisionDataCollator:
     # All Unsloth Zoo code licensed under LGPLv3
     __slots__ = (
@@ -1223,6 +1271,7 @@ class UnslothVisionDataCollator:
         "num_proc", "assistant_single_content", "patch_size",
         "resize_dimension", "snap_to_patch_size",
         "completion_only_loss", "pad_to_multiple_of", "size_func",
+        "_seen_supervised", "_warned_unsupervised",
     )
 
     def __init__(
@@ -1246,8 +1295,10 @@ class UnslothVisionDataCollator:
         snap_to_patch_size = False,
         last_response_only = False, # Train only on the last assistant turn
     ):
-        if not hasattr(processor, "image_processor"):
+        if not hasattr(processor, "image_processor") and not _processor_takes_images(processor):
             raise TypeError("Unsloth: UnslothVisionDataCollator is only for image models!")
+        self._seen_supervised = False
+        self._warned_unsupervised = False
 
         self.padding_token_ids = get_padding_tokens_ids(processor)
         self.dtype = _get_dtype(
@@ -1353,16 +1404,20 @@ class UnslothVisionDataCollator:
         else:
             self.train_on_responses_only = None
 
+        _adopt_tokenizer_chat_template(processor)
+
         # Check what type for assistant VLM tokenizer allows!
         # Good for Mistral V3 and Pixtral I think
         try:
-            processor.apply_chat_template([
+            rendered = processor.apply_chat_template([
                 {"role": "user", "content": [
                     {"type": "image"},
                     {"type": "text", "text": "Hello!"}]},
                 {"role": "assistant", "content": [
                     {"type": "text", "text": "How can I help you?"}]}
             ])
+            if _renders_content_list_as_repr(rendered, "How can I help you?"):
+                raise TypeError("assistant content rendered as a list repr")
             self.assistant_single_content = False
         except TypeError:
             try:
@@ -1462,7 +1517,7 @@ class UnslothVisionDataCollator:
             proc_kwargs["audio"] = audios
         if self.pad_to_multiple_of is not None:
             proc_kwargs["pad_to_multiple_of"] = self.pad_to_multiple_of
-        batch = self.processor(**proc_kwargs)
+        batch = self._call_processor(proc_kwargs, bool(images))
 
         # Truncate manually when audio is present (couldn't pass max_length to processor)
         if audios and self.truncation and self.max_seq_length:
@@ -1484,7 +1539,36 @@ class UnslothVisionDataCollator:
         batch["labels"] = labels
         if self.train_on_responses_only:
             batch["labels"] = self.train_on_responses_only(batch)["labels"]
+            self._check_supervised(batch["labels"], batch.get("attention_mask"))
         return batch
+
+    def _check_supervised(self, labels, attention_mask = None):
+        """All labels masked means zero loss: raise on an untruncated first batch, else warn once."""
+        if not torch.is_tensor(labels) or labels.dim() != 2 or labels.shape[0] == 0:
+            return
+        # train_on_responses_only masks with -100 whatever ignore_index is.
+        trained = (labels != self.ignore_index) & (labels != -100)
+        empty = int((trained.sum(dim = 1) == 0).sum())
+        if empty < labels.shape[0]:
+            self._seen_supervised = True
+        if empty == 0:
+            return
+        msg = (
+            f"Unsloth: {empty} of {labels.shape[0]} examples in this batch have no trainable "
+            "token after train_on_responses_only: the response marker was not found in the "
+            "rendered chat, or the answer was truncated away. Check instruction_part / "
+            "response_part against processor.apply_chat_template, or raise max_seq_length."
+        )
+        # getattr: subclasses may skip __init__ (slots stay unset until assigned).
+        max_len = getattr(self, "max_seq_length", None)
+        truncated = bool(max_len) and torch.is_tensor(attention_mask) and attention_mask.dim() == 2 \
+            and bool((attention_mask.sum(dim = 1) >= max_len).any())
+        # Per-worker flag: raise only when untruncated, i.e. the marker is missing for every worker.
+        if empty == labels.shape[0] and not truncated and not getattr(self, "_seen_supervised", False):
+            raise ValueError(msg)
+        if not getattr(self, "_warned_unsupervised", False):
+            self._warned_unsupervised = True
+            logger.warning(msg)
 
     def _select_messages_or_raw(self, example):
         if "messages" in example:
@@ -1519,6 +1603,24 @@ class UnslothVisionDataCollator:
             )
         return messages
 
+    def _call_processor(self, proc_kwargs, has_images):
+        try:
+            return self.processor(**proc_kwargs)
+        except ValueError as e:
+            # Nemotron Omni returns per-image pixel tensors that BatchFeature cannot stack.
+            # transformers 5.x: "Unable to convert output", 4.x: "Unable to create tensor".
+            if not has_images or not any(m in str(e) for m in ("Unable to convert output", "Unable to create tensor")):
+                raise
+            proc_kwargs = dict(proc_kwargs, return_tensors = None)
+            batch = _tensorize_ragged_batch(self.processor(**proc_kwargs))
+            if not torch.is_tensor(batch.get("input_ids")):
+                raise ValueError(
+                    f"Unsloth: {type(self.processor).__name__} returned unpadded input_ids for a "
+                    "batch, so it cannot collate more than one example; use "
+                    "per_device_train_batch_size = 1."
+                ) from e
+            return batch
+
     def _collapse_assistant_content(self, messages):
         for message in messages:
             if message["role"] == "assistant":
@@ -1526,7 +1628,7 @@ class UnslothVisionDataCollator:
                     # Only extract text from items that have type "text"
                     text_parts = [item["text"] for item in content if isinstance(item, dict) and item.get("type") == "text"]
                     if text_parts:
-                        message["content"] = text_parts[0]
+                        message["content"] = "".join(text_parts)
                     elif len(content) > 0 and isinstance(content[0], dict) and "text" in content[0]:
                         message["content"] = content[0]["text"]
         return messages
@@ -1962,7 +2064,7 @@ class UnslothVisionDataCollator:
         if audios:
             prompt_kwargs["audio"] = audios
 
-        proc_prompts = self.processor(text=prompt_texts, **prompt_kwargs)
+        proc_prompts = self._call_processor(dict(prompt_kwargs, text = prompt_texts), len(images) > 0)
         # Encode completions (RIGHT pad) text-only
         proc_completions = self.processor(text=completion_texts, **completion_kwargs)
 
