@@ -16,9 +16,12 @@
 
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import ast
+import contextlib
 import functools
 import os
 import stat
+import threading
+import weakref
 import torch
 import torch.nn as nn
 import torch.nn.init as init
@@ -36,6 +39,7 @@ from .common import (
 )
 from importlib.metadata import version as importlib_version
 from unsloth_zoo.utils import Version
+from unsloth_zoo.mxfp4_dequant import is_mxfp4_expert_param
 transformers_version = Version(importlib_version("transformers"))
 has_static_cache = transformers_version >= Version("4.56.0.dev0")
 from .utils import (
@@ -279,6 +283,104 @@ def swiglu_torch_backward(pre_act, alpha, limit, g1):
     return g1 * grad.to(g1.dtype)
 pass
 
+# E2M1 code points by nibble.
+_MXFP4_E2M1_VALUES = (
+    +0.0, +0.5, +1.0, +1.5, +2.0, +3.0, +4.0, +6.0,
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+)
+
+
+def _mxfp4_dequantize_experts_torch(blocks, scales, dtype = torch.bfloat16):
+    """Reference MXFP4 decode to (E, in, out), one expert at a time; low nibble first."""
+    if blocks.dim() != 4 or blocks.shape[-1] != 16 or tuple(blocks.shape[:-1]) != tuple(scales.shape):
+        raise ValueError(
+            f"Unsloth: MXFP4 blocks {tuple(blocks.shape)} do not match scales {tuple(scales.shape)}"
+        )
+    E, R, G, B = blocks.shape
+    out = torch.empty((E, G * B * 2, R), dtype = dtype, device = blocks.device)
+    lut = torch.tensor(_MXFP4_E2M1_VALUES, dtype = torch.float32, device = blocks.device)
+    # torch.ldexp on CUDA launches on the current device, not the operand's.
+    guard = torch.cuda.device(blocks.device) if blocks.is_cuda else contextlib.nullcontext()
+    with guard:
+        for e in range(E):
+            blk = blocks[e]
+            vals = torch.empty((R, G, B * 2), dtype = torch.float32, device = blocks.device)
+            vals[..., 0::2] = lut[(blk & 0x0F).long()]
+            vals[..., 1::2] = lut[(blk >> 4).long()]
+            vals = torch.ldexp(vals, (scales[e].to(torch.int32) - 127).unsqueeze(-1))
+            out[e].copy_(vals.reshape(R, G * B * 2).t())
+            del vals, blk
+    return out
+
+
+_CONVERT_TRANSPOSES = {}
+
+
+def _convert_moe_packed_tensors_transposes(convert):
+    """Whether ``convert`` returns (E, in, out) (stock >= 4.56) or (E, out, in) (Unsloth's patch).
+    down_proj is square, so probe a tiny non-square stack."""
+    key = id(convert)
+    if key not in _CONVERT_TRANSPOSES:
+        probe = convert(
+            torch.zeros((1, 2, 1, 16), dtype = torch.uint8),
+            torch.full((1, 2, 1), 127, dtype = torch.uint8),
+        )
+        shape = tuple(probe.shape)
+        if shape == (1, 32, 2):
+            _CONVERT_TRANSPOSES[key] = True
+        elif shape == (1, 2, 32):
+            _CONVERT_TRANSPOSES[key] = False
+        else:
+            raise RuntimeError(f"Unsloth: convert_moe_packed_tensors returned an unexpected shape {shape}")
+    return _CONVERT_TRANSPOSES[key]
+
+
+def _dequantize_mxfp4_experts(blocks, scales, dtype = torch.bfloat16):
+    """Dense GPT-OSS expert stack (E, in, out) on any transformers version. Tries the fused
+    kernel, transformers' dequantize (only if it takes (blocks, scales)), convert_moe_packed_tensors, local decode."""
+    try:
+        import transformers.integrations.mxfp4 as mxfp4_integration
+    except Exception:
+        mxfp4_integration = None
+    expected = (blocks.shape[0], blocks.shape[2] * blocks.shape[3] * 2, blocks.shape[1])
+
+    if blocks.is_cuda and blocks.dtype == torch.uint8:
+        try:
+            from unsloth_zoo.mxfp4_dequant import mxfp4_dequantize
+            return mxfp4_dequantize(blocks, scales, dtype = dtype, transpose = True)
+        except Exception:
+            pass
+
+    dequantize = getattr(mxfp4_integration, "dequantize", None)
+    if dequantize is not None:
+        try:
+            parameters = inspect.signature(dequantize).parameters
+            takes_blocks_scales = tuple(parameters)[:2] == ("blocks", "scales")
+        except (TypeError, ValueError):
+            takes_blocks_scales = False
+        if takes_blocks_scales:
+            try:
+                out = dequantize(blocks, scales)
+                if tuple(out.shape) == expected:
+                    return out.to(dtype).contiguous()
+            except Exception:
+                pass
+
+    convert = getattr(mxfp4_integration, "convert_moe_packed_tensors", None)
+    if convert is not None:
+        try:
+            transposes = _convert_moe_packed_tensors_transposes(convert)
+            out = convert(blocks, scales, dtype = dtype)
+            if not transposes:
+                out = out.transpose(1, 2)
+            if tuple(out.shape) == expected:
+                return out.to(device = blocks.device, dtype = dtype).contiguous()
+        except Exception as e:
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.warning(f"Unsloth: convert_moe_packed_tensors failed ({e}); using the local MXFP4 decode.")
+
+    return _mxfp4_dequantize_experts_torch(blocks, scales, dtype = dtype)
+
 def _mxfp4_hub_kernel_unreachable():
     """True when transformers loads MXFP4 kernels via the `kernels` hub and it is unusable."""
     try:
@@ -519,11 +621,12 @@ def patch_gpt_oss():
                 return self.__dict__["_gate_up_proj"]
 
             # MXFP4 weights present when blocks/scales are not all zeros
-            blocks_valid = (
+            blocks_valid = self.__dict__.get("_gate_up_proj_blocks_valid", False) or (
                 self.gate_up_proj_blocks.device.type != "meta"
                 and self.gate_up_proj_blocks.numel() > 0
-                and self.gate_up_proj_blocks.any()
+                and bool(self.gate_up_proj_blocks.any())
             )
+            self.__dict__["_gate_up_proj_blocks_valid"] = blocks_valid
 
             if not blocks_valid:
                 raise AttributeError(
@@ -531,17 +634,11 @@ def patch_gpt_oss():
                     f"Try 'openai/gpt-oss-20b' with load_in_4bit=True instead."
                 )
 
-            # Dequantize: (E, out_dim, in_dim//32, 16) -> (E, out_dim, in_dim), then cache
+            # Still packed (transformers 5 skips load_and_swizzle_mxfp4): decode per call, uncached.
             try:
-                from transformers.integrations.mxfp4 import dequantize
-                dequantized = dequantize(self.gate_up_proj_blocks, self.gate_up_proj_scales)
-                self.__dict__["_gate_up_proj"] = dequantized
-                return dequantized
+                return _dequantize_mxfp4_experts(self.gate_up_proj_blocks, self.gate_up_proj_scales)
             except Exception as e:
-                raise RuntimeError(
-                    f"Failed to dequantize MXFP4 gate_up_proj: {e}. "
-                    f"Ensure transformers.integrations.mxfp4.dequantize is available."
-                )
+                raise RuntimeError(f"Failed to dequantize MXFP4 gate_up_proj: {e}") from e
 
         @gate_up_proj.setter
         def gate_up_proj(self, value):
@@ -554,27 +651,23 @@ def patch_gpt_oss():
             if "_down_proj" in self.__dict__:
                 return self.__dict__["_down_proj"]
 
-            blocks_valid = (
+            blocks_valid = self.__dict__.get("_down_proj_blocks_valid", False) or (
                 self.down_proj_blocks.device.type != "meta"
                 and self.down_proj_blocks.numel() > 0
-                and self.down_proj_blocks.any()
+                and bool(self.down_proj_blocks.any())
             )
+            self.__dict__["_down_proj_blocks_valid"] = blocks_valid
 
             if not blocks_valid:
                 raise AttributeError(
                     f"Mxfp4GptOssExperts.down_proj: No weights loaded."
                 )
 
-            # Dequantize: (E, out_dim, in_dim//32, 16) -> (E, out_dim, in_dim), then cache
+            # Still packed (transformers 5 skips load_and_swizzle_mxfp4): decode per call, uncached.
             try:
-                from transformers.integrations.mxfp4 import dequantize
-                dequantized = dequantize(self.down_proj_blocks, self.down_proj_scales)
-                self.__dict__["_down_proj"] = dequantized
-                return dequantized
+                return _dequantize_mxfp4_experts(self.down_proj_blocks, self.down_proj_scales)
             except Exception as e:
-                raise RuntimeError(
-                    f"Failed to dequantize MXFP4 down_proj: {e}"
-                )
+                raise RuntimeError(f"Failed to dequantize MXFP4 down_proj: {e}") from e
 
         @down_proj.setter
         def down_proj(self, value):
@@ -1911,6 +2004,129 @@ def _unwrap_peft_experts(module):
     return module
 
 
+# Weak: freed with the last model whose packed parameters hold the slot.
+_MXFP4_DECODE_SLOTS = weakref.WeakValueDictionary()
+
+
+class _Mxfp4DecodeSlot:
+    """Shared decode buffer per shape. `lock` spans decode to kernel enqueue; `event` = last reader,
+    so another stream's decode waits instead of overwriting."""
+
+    __slots__ = ("stack", "lock", "event", "__weakref__")
+
+    def __init__(self, shape, dtype, device):
+        # Parameter: CUDA graphs read it in place instead of copying each call.
+        self.stack = nn.Parameter(torch.zeros(shape, dtype = dtype, device = device), requires_grad = False)
+        self.lock = threading.Lock()
+        self.event = None
+
+
+def _device_stream_api(device):
+    """torch.cuda / torch.xpu for async-stream devices, else None (CPU / MPS run in order)."""
+    device_type = getattr(device, "type", None)
+    if device_type not in ("cuda", "xpu"):
+        return None
+    api = getattr(torch, device_type, None)
+    if api is None or not hasattr(api, "Event") or not hasattr(api, "current_stream"):
+        return None
+    return api
+
+
+def _mxfp4_decode_slot(param, dtype, role = ""):
+    key = (role, tuple(param._original_shape), dtype, param.device)
+    slot = _MXFP4_DECODE_SLOTS.get(key)
+    if slot is None:
+        slot = _Mxfp4DecodeSlot(param._original_shape, dtype, param.device)
+        _MXFP4_DECODE_SLOTS[key] = slot
+    held = getattr(param, "_unsloth_decode_stacks", None)
+    if held is None:
+        held = param._unsloth_decode_stacks = {}
+    held[key] = slot
+    return slot
+
+
+def _mxfp4_decode_stack(param, dtype, token_counts, role = "", slot = None):
+    """Decode only routed experts (others are weighted 0). Caller holds the slot lock until enqueue."""
+    slot = slot or _mxfp4_decode_slot(param, dtype, role)
+    api = _device_stream_api(param.device) if slot.event is not None else None
+    if api is not None:
+        api.current_stream(param.device).wait_event(slot.event)
+    param.dequantize(dtype, token_counts = token_counts, out = slot.stack.data)
+    return slot.stack
+
+
+no_cudagraph_torch_compile_options = get_torch_compile_options(
+    epilogue_fusion = True,
+    max_autotune = False,
+    shape_padding = True,
+    # Every layer passes its own packed stack: CUDA graphs would re-record per layer (or copy the stacks).
+    cudagraphs = False,
+    coordinate_descent_tuning = use_coordinate_descent,
+    combo_kernels = False,
+    memory_planning = True,
+    multi_kernel = False,
+    use_block_ptr = True,
+    logging = UNSLOTH_ENABLE_LOGGING,
+)
+
+
+@_torch_compile(dynamic=None, fullgraph=True, options=no_cudagraph_torch_compile_options)
+def _moe_forward_inference_mxfp4_kernel(
+    hidden_states, routing_weights, router_indices,
+    gu_blocks, gu_scales, gate_up_proj_bias, gu_trans,
+    dn_blocks, dn_scales, down_proj_bias, dn_trans,
+    limit, alpha, hidden_size,
+):
+    """Decode-time MoE on packed MXFP4 stacks: sort the routed (token, expert) rows, two fused grouped GEMMs."""
+    from unsloth_zoo.mxfp4_gemm import mxfp4_grouped_mm_op
+    batch_size = hidden_states.shape[0]
+    x = hidden_states.reshape(-1, hidden_size)
+    num_experts = routing_weights.shape[1]
+    top_k = router_indices.shape[1]
+    flat = router_indices.reshape(-1)
+    counts = (flat[:, None] == torch.arange(num_experts, device = flat.device)).sum(0, dtype = torch.int32)
+    order = torch.argsort(flat, stable = True)
+    token = order // top_k
+    expert = flat[order]
+    # Biases may be float32 (the dense path promotes too); the GEMMs take the bf16 activations, as autocast would.
+    gate_up = mxfp4_grouped_mm_op(x[token], gu_blocks, gu_scales, counts, gu_trans) + gate_up_proj_bias[expert]
+    gate, up = gate_up[..., ::2], gate_up[..., 1::2]
+    gate = gate.clamp(min=None, max=limit)
+    up = up.clamp(min=-limit, max=limit)
+    glu = gate * torch.sigmoid(gate.to(torch.float32) * alpha).to(gate.dtype)
+    inter = ((up + 1) * glu).to(x.dtype)
+    down = mxfp4_grouped_mm_op(inter, dn_blocks, dn_scales, counts, dn_trans) + down_proj_bias[expert]
+    weighted = down * routing_weights[token, expert][:, None]
+    # Summed in fp32 and rounded once, as the dense path's sum over experts.
+    out = torch.zeros((x.shape[0], hidden_size), dtype = torch.float32, device = x.device)
+    out = out.index_add_(0, token, weighted.to(torch.float32))
+    return out.to(weighted.dtype).view(batch_size, -1, hidden_size)
+
+
+def _mxfp4_static_operands(param, experts_module, proj_type):
+    """(blocks, scales, transpose_b) as long-lived plain tensors, so compiled code sees stable inputs."""
+    cached = getattr(param, "_unsloth_fused_operands", None)
+    if cached is not None and cached[0].data_ptr() == param.data_ptr() and cached[1] is param.mxfp4_scales:
+        return cached[0], cached[2], cached[3]
+    from .moe_utils import _mxfp4_expert_layout
+    layout = _mxfp4_expert_layout(param, proj_type, experts_module.hidden_size, getattr(experts_module, "_unsloth_model_type", None), experts_module)
+    transpose_b = bool(param.mxfp4_transposed) if layout is None else layout[1]
+    scales = param.mxfp4_scales
+    if scales.device != param.device:
+        scales = param.mxfp4_scales = scales.to(param.device)
+    blocks = param.data
+    param._unsloth_fused_operands = (blocks, param.mxfp4_scales, scales.contiguous(), transpose_b)
+    return blocks, param._unsloth_fused_operands[2], transpose_b
+
+
+def _mxfp4_fused_decode_enabled(param, dtype):
+    from .moe_utils import _mxfp4_fused_enabled
+    from unsloth_zoo.mxfp4_gemm import mxfp4_grouped_mm_op
+    if os.environ.get("UNSLOTH_MXFP4_FUSED_GEMM") == "dequant":
+        return False
+    return mxfp4_grouped_mm_op is not None and _mxfp4_fused_enabled(param, dtype)
+
+
 def moe_forward_inference_bf16(self, hidden_states):
     """Wrapper that extracts weights from ParameterModule before calling the compiled kernel."""
     router_scores, router_indices = moe_router_forward(self.router, hidden_states)
@@ -1931,17 +2147,56 @@ def moe_forward_inference_bf16(self, hidden_states):
     elif hasattr(down_proj, "weight"):
         down_proj = down_proj.weight
 
-    return _moe_forward_inference_bf16_kernel(
-        hidden_states,
-        routing_weights,
-        gate_up_proj,
-        moe.gate_up_proj_bias,
-        down_proj,
-        moe.down_proj_bias,
-        moe.limit,
-        moe.alpha,
-        moe.hidden_size,
-    )
+    if (
+        is_mxfp4_expert_param(gate_up_proj) and is_mxfp4_expert_param(down_proj)
+        and _mxfp4_fused_decode_enabled(gate_up_proj, hidden_states.dtype)
+    ):
+        # Routed experts only, read straight from the packed stacks: no 1.6 GB decode slots, no dense bmm.
+        gu_blocks, gu_scales, gu_trans = _mxfp4_static_operands(gate_up_proj, moe, "gate_up")
+        dn_blocks, dn_scales, dn_trans = _mxfp4_static_operands(down_proj, moe, "down")
+        return _moe_forward_inference_mxfp4_kernel(
+            hidden_states, routing_weights, router_indices,
+            gu_blocks, gu_scales, moe.gate_up_proj_bias, gu_trans,
+            dn_blocks, dn_scales, moe.down_proj_bias, dn_trans,
+            moe.limit, moe.alpha, moe.hidden_size,
+        )
+
+    slots = []
+    if is_mxfp4_expert_param(gate_up_proj) or is_mxfp4_expert_param(down_proj):
+        from .moe_utils import count_tokens_per_expert
+        counts = count_tokens_per_expert(router_indices.reshape(-1), routing_weights.shape[1], torch.int32)
+        if is_mxfp4_expert_param(gate_up_proj):
+            slots.append(_mxfp4_decode_slot(gate_up_proj, hidden_states.dtype, "gate_up"))
+        if is_mxfp4_expert_param(down_proj):
+            slots.append(_mxfp4_decode_slot(down_proj, hidden_states.dtype, "down"))
+
+    with contextlib.ExitStack() as held:
+        # Fixed order, so two threads never wait on each other's second lock.
+        for slot in sorted(slots, key = id):
+            held.enter_context(slot.lock)
+        if is_mxfp4_expert_param(gate_up_proj):
+            gate_up_proj = _mxfp4_decode_stack(gate_up_proj, hidden_states.dtype, counts, slot = slots[0])
+        if is_mxfp4_expert_param(down_proj):
+            down_proj = _mxfp4_decode_stack(down_proj, hidden_states.dtype, counts, slot = slots[-1])
+        out = _moe_forward_inference_bf16_kernel(
+            hidden_states,
+            routing_weights,
+            gate_up_proj,
+            moe.gate_up_proj_bias,
+            down_proj,
+            moe.down_proj_bias,
+            moe.limit,
+            moe.alpha,
+            moe.hidden_size,
+        )
+        api = _device_stream_api(hidden_states.device) if slots else None
+        if api is not None:
+            stream = api.current_stream(hidden_states.device)
+            for slot in slots:
+                if slot.event is None:
+                    slot.event = api.Event()
+                slot.event.record(stream)
+    return out
 
 
 
