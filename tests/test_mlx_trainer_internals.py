@@ -1269,6 +1269,42 @@ def test_decoupled_optimizers_use_hf_parity_manual_decay(optim_name):
         assert optimizer._kw["weight_decay"] == 0.0
 
 
+def test_adafactor_applies_hf_weight_decay():
+    """HF Trainer gives Adafactor weight_decay through its param groups and
+    Adafactor applies p -= wd * lr * p, skipping bias and norms. Built with
+    optim="adafactor", one decay step must shrink a weight by exactly that."""
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    class TinyModel:
+        def __init__(self):
+            self.params = {"proj": {"weight": mx.array([[10.0, 10.0]]),
+                                    "bias": mx.array([10.0])}}
+
+        def trainable_parameters(self):
+            return self.params
+
+        def update(self, updates):
+            self.params["proj"].update(updates["proj"])
+
+    lr, wd = 0.1, 0.05
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.model = TinyModel()
+    trainer.args = MLXTrainingConfig(
+        optim="adafactor", learning_rate=lr, weight_decay=wd,
+        lr_scheduler_type="constant", warmup_steps=0,
+    )
+    optimizer = trainer._build_optimizer(total_steps=4)
+    assert trainer._resolved_optimizer_name == "adafactor"
+
+    grad = {"proj": {"weight": mx.array([[1.0, 1.0]]), "bias": mx.array([1.0])}}
+    trainer._apply_manual_weight_decay(trainer.model, optimizer, grad)
+    flat = dict(tree_flatten(trainer.model.trainable_parameters()))
+    assert flat["proj.weight"].tolist()[0] == pytest.approx([10.0 * (1 - lr * wd)] * 2)
+    assert flat["proj.bias"].tolist() == pytest.approx([10.0])
+
+
 def test_sgd_weight_decay_is_coupled_not_decoupled():
     """SGD must use coupled decay (folded into the gradient before momentum)
     to match HF/PyTorch SGD, not the AdamW-style decoupled parameter shrink."""

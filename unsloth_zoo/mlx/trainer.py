@@ -3718,10 +3718,12 @@ class MLXTrainer:
                 opt_name = "adamw"
 
         if opt_name == "adafactor":
+            self._manual_weight_decay = float(wd or 0.0)
             optimizer = optim.Adafactor(
                 learning_rate=initial_lr,
                 relative_step=False,
                 scale_parameter=False,
+                weight_decay=0.0,
             )
         elif opt_name == "adamw":
             # Match HF/PyTorch AdamW semantics. MLX defaults bias_correction
@@ -3809,7 +3811,7 @@ class MLXTrainer:
     def _apply_manual_weight_decay(self, model, optimizer, grad):
         """Decoupled HF-parity decay on trainable non-bias/non-norm leaves.
 
-        Active for AdamW, Muon, and Lion. The underlying MLX optimizer is
+        Active for AdamW, Adafactor, Muon, and Lion. The underlying MLX optimizer is
         constructed with ``weight_decay=0.0`` so this helper owns the full
         update for the weight-decay term and matches what HF Trainer does
         via ``param_groups``. SGD uses coupled decay instead (see
