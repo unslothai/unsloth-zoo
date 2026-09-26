@@ -2,15 +2,7 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""Vision towers are placed on one card, not split per unit.
-
-Qwen3.5 / Qwen3-VL add ``self.pos_embed.weight`` to the ``patch_embed`` output
-inside the vision model's own forward, so a tower split between those two raises
-"Expected all tensors to be on the same device" on the first image.
-
-Meta-device models only: no GPU, no weights, no network. Budgets are fractions
-of the measured weights, so the layouts do not depend on exact byte counts.
-"""
+"""Vision towers stay on one card: their forward adds pos_embed.weight to patch_embed output."""
 import pytest
 import torch
 
@@ -106,7 +98,6 @@ def test_the_vision_tower_lands_on_one_device(build):
     assert len(_devices(plan, "model.visual")) == 1, plan.device_map
     assert any("placed whole" in n for n in plan.notes)
     if build is _qwen3_5_moe:
-        # The text decoder is still split: only the tower became atomic.
         assert _devices(plan, "model.language_model.layers") == {0, 1}
 
 
@@ -128,8 +119,7 @@ def test_a_tower_larger_than_a_card_keeps_its_embeddings_with_its_first_block():
 
 
 def test_a_tower_that_cannot_be_kept_together_still_plans_as_before():
-    # A wide merger makes the loose parts plus one block bigger than a card,
-    # while every unit on its own still fits.
+    # Loose parts plus one block exceed a card; each unit alone fits.
     model = _qwen3_5_moe(layers = 4, depth = 2, out_hidden_size = 1024)
     plan = _plan(model, 0.52)
     old = _plan(model, 0.52, no_split_module_classes = planner.resolve_no_split_classes(model))
