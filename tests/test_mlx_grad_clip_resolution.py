@@ -12,15 +12,7 @@ import pytest
 
 @pytest.fixture(autouse=True, scope="module")
 def _install_mlx_shim():
-    # Evicting unsloth_zoo.mlx.* is what makes the shim reach the code under
-    # test. Where a real mlx is installed -- every Apple Silicon machine, which
-    # is the hardware this module is about -- unsloth_zoo.mlx.trainer may
-    # already be imported and bound to the real mlx.core / mlx.utils at module
-    # scope. Installing the shim afterwards only changes what THIS file imports,
-    # so the test hands a torch tensor to a real mlx op. Dropping the modules
-    # forces the next import to rebuild them against the shim. Mirrors
-    # test_mlx_trainer_internals.py::_install_shim; see its comment for the
-    # module-identity hazard this snapshot/restore pair avoids.
+    # Evict unsloth_zoo.mlx.* so a module bound to real mlx is rebuilt against the shim (as _install_shim does).
     import sys
 
     from mlx_simulation import (

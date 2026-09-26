@@ -915,7 +915,7 @@ def _clip_grad_by_leaf_norm(grad, max_grad_leaf_norm):
         g_f = g.astype(mx.float32)
         norm = mx.sqrt(mx.sum(g_f * g_f))
         scale = mx.minimum(max_grad_leaf_norm / (norm + 1e-6), mx.array(1.0, dtype=mx.float32))
-        # A small scale can underflow in fp16 even when the clipped gradient is representable.
+        # fp16 scale can underflow though the clipped gradient is representable.
         return (g_f * scale).astype(g.dtype)
 
     return tree_map(_clip_leaf_norm, grad)

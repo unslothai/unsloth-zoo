@@ -1321,7 +1321,6 @@ def test_norm_clip_preserves_fp16_scale(mode, size):
         clipped = _clip_grad_by_leaf_norm({"weight": grad}, max_grad_leaf_norm=0.01)
     actual = clipped["weight"]
     assert actual.dtype == mx.float16
-    # A constant vector projected onto this L2 ball has this closed-form value.
     expected = np.full(size, 0.01 / size ** 0.5, dtype=np.float16).astype(np.float32)
     np.testing.assert_allclose(np.array(actual.astype(mx.float32)), expected, rtol=1e-3, atol=0)
 
@@ -1339,12 +1338,7 @@ def test_norm_clip_keeps_small_gradients():
 
 
 def test_global_norm_clip_reduces_across_every_leaf():
-    """Global clipping reduces over the whole tree; leaf clipping does not.
-
-    Norms 5 and 12 combine to a global norm of 13, so one cross-tree scale of
-    5/13 applies to both leaves. Leaf mode instead leaves the leaf already at
-    the cap alone and scales only the one above it.
-    """
+    """Norms 5 and 12 give global norm 13: global mode scales both by 5/13, leaf mode only the 12."""
     import mlx.core as mx
     import numpy as np
     from unsloth_zoo.mlx.trainer import _clip_grad_by_leaf_norm, _clip_grad_norm_fp32
