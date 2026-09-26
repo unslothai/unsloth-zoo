@@ -4163,9 +4163,7 @@ def forward_native_moe_loop(
         expert_mask = expert_mask.permute(2, 1, 0)  # (num_experts, top_k, n_tokens)
         expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
 
-    # Some patches (Qwen3-VL-MoE) store experts in grouped_mm layout (E, in, out)
-    # rather than F.linear's (E, out, in) and set _unsloth_grouped_mm_format=True.
-    # Prefer it over the shape check, which is unsafe when intermediate_dim == hidden_dim.
+    # A declared (E, in, out) layout (_unsloth_grouped_mm_format) wins over the shape test, which a square stack defeats.
     grouped_mm_format = bool(_module_flag(self, "_unsloth_grouped_mm_format", False)) or (
         _module_flag(self, "is_transposed", None) is True
     )
@@ -4203,18 +4201,18 @@ def forward_native_moe_loop(
         else:
             gate = F.linear(current_state, self.w1[expert_idx])
             up = F.linear(current_state, self.w3[expert_idx])
-            gate_up = torch.cat((gate, up), dim=-1)
+            gate_up = None
 
         if own_apply_gate:
-            current_hidden_states = self._apply_gate(gate_up)
+            current_hidden_states = self._apply_gate(
+                gate_up if gate_up is not None else torch.cat((gate, up), dim=-1)
+            )
         elif is_gpt_oss:
             limit = getattr(self, "limit", 7.0)
             alpha = getattr(self, "alpha", 1.702)
             gate = gate.clamp(min=None, max=limit)
             up = up.clamp(min=-limit, max=limit)
             current_hidden_states = (up + 1.0) * (gate * torch.sigmoid(gate * alpha))
-        elif own_apply_gate:
-            current_hidden_states = self._apply_gate(torch.cat((gate, up), dim=-1))
         elif hasattr(self, "act_fn") and callable(self.act_fn):
             current_hidden_states = self.act_fn(gate) * up
         else:

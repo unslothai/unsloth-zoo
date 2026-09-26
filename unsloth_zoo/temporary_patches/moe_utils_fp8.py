@@ -1210,8 +1210,7 @@ def _experts_are_expert_parallel(module) -> bool:
     return answer
 
 
-# Implementations routed to the Unsloth FP8 MoE backend; "unsloth" is the default one and
-# FP8Experts keeps the config's key, so it must resolve here too.
+# FP8Experts keeps the config's key, so the default "unsloth" must resolve here too.
 _UNSLOTH_FP8_EXPERTS_KEYS = ("grouped_mm", "batched_mm", "deepgemm", "unsloth")
 
 

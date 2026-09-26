@@ -77,7 +77,7 @@ def Llama4TextMoe_forward(self, hidden_states):
     routed_out = self.experts(routed_in, top_k_index.reshape(-1, 1), ones)
     routed_out = routed_out.reshape(n_tokens, top_k, self.hidden_dim).sum(dim = 1)
     out = self.shared_expert(hidden_states)
-    # Add in place: a promoting add turns the residual float32 under autocast and mixes dtypes in the next GEMM.
+    # Cast first: a promoting add turns the residual float32 under autocast and mixes dtypes in the next GEMM.
     out = out + routed_out.to(out.dtype)
     return out, router_logits
 
@@ -99,7 +99,6 @@ def patch_llama4_moe():
     original_experts_forward = Llama4TextExperts.__dict__.get("forward")
     original_moe_forward = Llama4TextMoe.__dict__.get("forward")
     ok = patch_function(Llama4TextMoe, "forward", Llama4TextMoe_forward)
-    # Signature differs from the model's forward, so force.
     ok = ok and patch_function(Llama4TextExperts, "forward", get_forward_moe_backend(), force = True)
     if not ok:
         if original_moe_forward is not None:
