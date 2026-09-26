@@ -15,8 +15,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Guards: the compiler runs once per process, so a 16bit gpt-oss load after a 4bit one (or the reverse)
-built the other flavor's experts from the compiled module; subprocess so the class swaps stay contained."""
+"""A 16bit gpt-oss load after a 4bit one (or the reverse) in one process must not reuse the compiled module's classes."""
 import json
 import os
 import subprocess

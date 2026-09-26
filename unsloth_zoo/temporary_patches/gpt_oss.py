@@ -1425,7 +1425,7 @@ pass
 
 
 def _gpt_oss_class_is_bnb4bit(cls):
-    # The BnB experts are one class; a BnB router (compiled or not) builds `self.linear`, stock builds `self.weight`.
+    # A BnB router (compiled or not) builds `self.linear`; stock builds `self.weight`.
     if cls is GptOssExpertsBnb4bit:
         return True
     init = getattr(cls, "__init__", None)
@@ -1433,8 +1433,7 @@ def _gpt_oss_class_is_bnb4bit(cls):
 
 
 def _rebind_gpt_oss_compiled_classes():
-    # The compiler runs once per process, so its gpt_oss module keeps the experts / router classes of
-    # whichever flavor loaded first; a later 16bit load after a 4bit one (or the reverse) built the wrong ones.
+    # The compiler runs once per process, so its module keeps the first load's flavor of these classes.
     try:
         import transformers.models.gpt_oss.modeling_gpt_oss as modeling
     except Exception:
@@ -1452,7 +1451,6 @@ def _rebind_gpt_oss_compiled_classes():
             if not str(g.get("__name__", "")).startswith("unsloth_compiled_module_gpt_oss"):
                 continue
             for name in ("GptOssExperts", "GptOssTopKRouter"):
-                # Only swap a class of the other flavor, so a matching compiled class is kept.
                 if isinstance(g.get(name), type) and _gpt_oss_class_is_bnb4bit(g[name]) != want_bnb:
                     g[name] = getattr(modeling, name)
 
@@ -1734,12 +1732,8 @@ def patch_gpt_oss_bnb4bit_auto():
         _sync_gpt_oss_compiled_flavor("bnb4bit" if _should_use_gpt_oss_bnb4bit() else "stock")
 
     if not _should_use_gpt_oss_bnb4bit():
-        # The BnB patch swaps GptOssTopKRouter/GptOssExperts globally. A stale "_load_in_4bit_"
-        # in UNSLOTH_MODEL_NAME (inherited across a save->reload subprocess) would leave the BnB
-        # classes installed when later loading a 16bit checkpoint, whose router.weight + 3D
-        # experts then mismatch ("weights not initialized"). Restore the stock classes when this
-        # load is not BnB-4bit. The compiled-module file is handled by _sync above.
-        # The installed class is the truth; the env flag can be cleared or inherited independently of it.
+        # BnB classes left installed make a 16bit load fail ("weights not initialized"). Check the
+        # installed class, not only the env flag, which can be cleared or inherited independently.
         try:
             import transformers.models.gpt_oss.modeling_gpt_oss as _modeling
             _installed = _modeling.GptOssExperts is GptOssExpertsBnb4bit
