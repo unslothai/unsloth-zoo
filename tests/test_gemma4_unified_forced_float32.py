@@ -216,6 +216,8 @@ def test_unified_vision_projection_preserves_values_above_fp16_range(monkeypatch
     monkeypatch.setattr(cls, "_unsloth_vision_fp32_patched", False, raising=False)
     monkeypatch.setenv("UNSLOTH_FORCE_FLOAT32", "1")
     patches.patch_Gemma4UnifiedVisionEmbedder()
+    # Unsloth's compiler picks what to compile from this source; it must stay upstream's.
+    assert inspect.getsource(cls.forward) == inspect.getsource(original_forward)
     vision_config = Gemma4UnifiedVisionConfig(patch_size=2, pooling_kernel_size=1,
         mm_embed_dim=16, mm_posemb_size=8, output_proj_dims=16)
     model = cls(vision_config, _config(module, "Gemma4Unified")).half()

@@ -38,6 +38,7 @@
 
 import os
 import ast
+import functools
 import inspect
 import importlib
 import linecache
@@ -524,6 +525,8 @@ def patch_Gemma4UnifiedVisionEmbedder():
     original_init = cls.__init__
     original_forward = cls.forward
 
+    # wraps: the compiler reads inspect.getsource(cls.forward); keep it seeing upstream's.
+    @functools.wraps(original_init)
     def __init__(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
         self._unsloth_vision_fp32 = os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1"
@@ -533,6 +536,7 @@ def patch_Gemma4UnifiedVisionEmbedder():
                 getattr(self, name)._pre_set_compute_dtype = torch.float32
 
     # *args/**kwargs: newer transformers added `return_dict` to this forward.
+    @functools.wraps(original_forward)
     def forward(self, pixel_values, *args, **kwargs):
         if not getattr(self, "_unsloth_vision_fp32", False):
             return original_forward(self, pixel_values, *args, **kwargs)
