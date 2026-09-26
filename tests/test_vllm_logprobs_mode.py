@@ -14,11 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""GRPO reuses load_vllm's engine, so its sampling logprobs must be temperature
-scaled like the training logprobs (TRL builds its own engine with
-logprobs_mode="processed_logprobs"); vLLM's raw_logprobs default skews the
-importance sampling ratio and off-policy mask. AST-level: load_vllm needs a GPU.
-"""
+"""GRPO's IS ratio and off-policy mask need temperature-scaled sampling logprobs,
+as TRL and verl request. AST-level: load_vllm needs a GPU."""
 
 import ast
 import pathlib

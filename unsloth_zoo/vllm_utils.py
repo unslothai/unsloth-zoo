@@ -862,8 +862,7 @@ pass
 
 
 def patch_vllm_processed_logprobs_fast_path():
-    # V1's TopKTopPSampler drops FlashInfer engine-wide under processed_logprobs; V2 only
-    # does so on steps that return logprobs (v1/worker/gpu/sample/sampler.py). Do the same.
+    # V1 drops FlashInfer engine-wide under processed_logprobs; V2 only on logprob steps, as here.
     try:
         from vllm.v1.sample.sampler import Sampler
         from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
