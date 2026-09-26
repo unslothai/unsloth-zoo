@@ -2211,7 +2211,7 @@ def _supports_text_lora_cce(desc, label_smoothing):
     if (desc.status == "unknown" or desc.raw or label_smoothing != 0.0
             or not mx.metal.is_available()):
         return False
-    from .cce.runtime_cce import supported_lora_head
+    from unsloth_zoo.mlx.cce.runtime_cce import supported_lora_head
 
     head = desc.module
     if (not supported_lora_head(head) or not 1024 <= head.lora_a.shape[0] <= 4096
@@ -2221,7 +2221,7 @@ def _supports_text_lora_cce(desc, label_smoothing):
 
 
 def _make_text_lora_cce_loss_fn(head_desc, logit_scale, softcap):
-    from .cce.runtime_cce import make_lora_head_cce
+    from unsloth_zoo.mlx.cce.runtime_cce import make_lora_head_cce
 
     head = head_desc.module
     quantized = type(head.linear) is nn.QuantizedLinear
