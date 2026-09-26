@@ -131,3 +131,39 @@ def test_the_kl_metric_leaves_dropped_rows_out():
     torch.testing.assert_close(full, per_row.mean())
     torch.testing.assert_close(only_row0, per_row[0])
     assert kl(torch.zeros_like(mask)).item() == 0.0
+
+
+@pytest.mark.parametrize("training, expected", [(True, 4), (False, None)])
+def test_steps_per_generation_reaches_the_loss_only_in_training(monkeypatch, training, expected):
+    """An eval batch is not split across steps, so its count must not be rescaled."""
+    monkeypatch.setenv("UNSLOTH_GRPO_SEQ_PACKING", "0")
+    monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER", "0")
+    seen = {}
+
+    class _Loss:
+        @staticmethod
+        def apply(new, old, ref, sampling, lm_head, ids, mask, advantages, beta, scaler, n, kwargs):
+            seen.update(kwargs)
+            zero = torch.zeros(())
+            return zero, zero, zero, zero, zero, zero
+
+    monkeypatch.setattr(_rl, "UnslothEfficientGRPO", _Loss)
+    model = _Model().train(training)
+    trainer = types.SimpleNamespace(
+        args = types.SimpleNamespace(unsloth_grpo_mini_batch = 1, unsloth_logit_chunk_multiplier = 1,
+                                     steps_per_generation = 4),
+        processing_class = types.SimpleNamespace(pad_token_id = 0),
+        model = model,
+        accelerator = types.SimpleNamespace(
+            unwrap_model = lambda m, keep_fp32_wrapper = False: m, scaler = None,
+        ),
+        use_vllm = False,
+        _autocast_dtype = None,
+        beta = 0.0,
+    )
+    _rl.grpo_accumulated_loss(
+        trainer, INPUT_IDS, (INPUT_IDS != 0).long(), 3, TRL_MASK,
+        torch.zeros(INPUT_IDS.shape[0]), None, None,
+        loss_type = "dapo", num_items_in_batch = int(TRL_MASK.sum()),
+    )
+    assert seen["steps_per_generation"] == expected

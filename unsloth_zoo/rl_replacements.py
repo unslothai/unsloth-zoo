@@ -446,6 +446,7 @@ def grpo_compute_loss(
     importance_sampling_level = kwargs.get("importance_sampling_level", "token")
     num_items_in_batch = kwargs.get("num_items_in_batch", None)
     current_gradient_accumulation_steps = kwargs.get("current_gradient_accumulation_steps", 1)
+    steps_per_generation = kwargs.get("steps_per_generation", None)
     num_processes = kwargs.get("num_processes", 1)
     use_vllm = kwargs.get("use_vllm", False)
     # The off-policy mask uses vLLM sampling logprobs whenever the batch supplies them (matching TRL);
@@ -651,6 +652,9 @@ def grpo_compute_loss(
             normalizer = num_items_in_batch.clamp(min = 1.0) / num_processes
         else:
             normalizer = max(float(num_items_in_batch), 1.0) / num_processes
+        # num_items_in_batch spans the whole generation batch; rescale to one accumulation window like TRL.
+        if steps_per_generation:
+            normalizer = normalizer * current_gradient_accumulation_steps / steps_per_generation
         loss = (loss_i * mask).sum() / normalizer
     elif loss_type == "luspo":
         # loss_i is (B, T) unless sequence level with beta 0, so mask elementwise (TRL >= 1.10).
@@ -1453,6 +1457,9 @@ def grpo_accumulated_loss(
     # Follows TRL's own value; older TRL has no such field and False is correct there.
     kwargs["use_bias_correction_kl"] = getattr(trainer.args, "use_bias_correction_kl", False)
     kwargs["use_vllm"] = trainer.use_vllm
+    # Eval batches are not split or accumulated, so keep the full count.
+    _training = getattr(getattr(trainer, "model", None), "training", True)
+    kwargs["steps_per_generation"] = getattr(trainer.args, "steps_per_generation", None) if _training else None
     # Generated trainers still pass unsloth_num_chunks; nothing downstream reads it.
     try:
         from unsloth_zoo.rl_replacements import _warn_deprecated_n_chunks
