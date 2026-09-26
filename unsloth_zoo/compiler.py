@@ -4960,7 +4960,11 @@ def patch_output_capture_targets(modeling_file, replacement_classes=None):
     try:
         from transformers.utils.output_capturing import OutputRecorder
     except ImportError:
-        return set()
+        # transformers 4.5x keeps it in generic; without it replaced classes are never captured.
+        try:
+            from transformers.utils.generic import OutputRecorder
+        except ImportError:
+            return set()
 
     replacement_classes = replacement_classes or {}
     target_names = set()

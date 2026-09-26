@@ -3125,9 +3125,6 @@ def patch_GptOssModel():
         except:
             pass
 
-        # Mask mapping = generation; its causal-LM forward would pass it to load_balancing_loss_func.
-        _mask_is_mapping = isinstance(attention_mask, dict)
-
         # flex_attention_with_sink training windows its own BlockMask; all else needs the per-type mapping.
         _flex_sink_training = self.training and _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED
         if not _flex_sink_training and not isinstance(attention_mask, dict):
@@ -3216,7 +3213,7 @@ def patch_GptOssModel():
             # Replaces stock @capture_outputs: without router_logits, aux_loss.to() fails (TRL >= 1.7 MoE).
             all_router_logits = None
             router_hooks = []
-            if not _mask_is_mapping and kwargs.get("output_router_logits", getattr(self.config, "output_router_logits", False)):
+            if kwargs.get("output_router_logits", getattr(self.config, "output_router_logits", False)):
                 all_router_logits = []
                 def _record_router_logits(module, args, output):
                     all_router_logits.append(output[0] if isinstance(output, tuple) else output)
@@ -3768,6 +3765,10 @@ def patch_gpt_oss_for_grpo(phase="post_compile"):
             **kwargs,
         ):
             # This Unsloth Zoo code section is licensed under AGPL3
+
+            # Generation passes a per-type mask mapping load_balancing_loss_func cannot read, and no labels.
+            if isinstance(attention_mask, dict) and labels is None:
+                kwargs["output_router_logits"] = False
 
             RETURN_HIDDEN_STATES = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
 

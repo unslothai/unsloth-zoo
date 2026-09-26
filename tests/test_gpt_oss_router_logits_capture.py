@@ -22,6 +22,8 @@ import os
 import subprocess
 import sys
 
+import pytest
+
 
 _RUNTIME = r"""
 import os, sys, json
@@ -82,6 +84,7 @@ ref = run(model)
 hooks_before = sum(len(l.mlp.router._forward_hooks) for l in model.model.layers)
 from unsloth_zoo.temporary_patches import gpt_oss as G
 G.patch_GptOssModel()
+G.patch_gpt_oss_for_grpo()
 fwd = M.GptOssModel.forward
 try:
     got = run(model)
@@ -119,6 +122,10 @@ print('RESULT ' + json.dumps(res))
 
 
 def test_patched_forward_returns_router_logits_like_stock():
+    transformers = pytest.importorskip("transformers")
+    from packaging.version import Version
+    if Version(transformers.__version__) < Version("5.0.0"):
+        pytest.skip("patch_GptOssModel's forward only replaces the transformers 5 signature")
     env = dict(os.environ)
     # CPU keeps parity exact; NVML would report GPUs CUDA_VISIBLE_DEVICES hides.
     env["CUDA_VISIBLE_DEVICES"] = ""
