@@ -1,11 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2023-present the Unsloth team. All rights reserved.
 
-"""`unsloth_train` must build its LR scheduler from default TrainingArguments.
-
-TrainingArguments defaults `lr_scheduler_kwargs` to None, and `**None` raised a
-TypeError before the first step. CPU-pure: the scheduler call is intercepted.
-"""
+"""unsloth_train must build its scheduler when lr_scheduler_kwargs is None (the default)."""
 
 from __future__ import annotations
 
