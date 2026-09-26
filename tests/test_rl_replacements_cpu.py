@@ -1395,3 +1395,29 @@ def test_luspo_ignores_fully_masked_columns(level, beta, disable_dynamo):
     assert torch.allclose(loss.double(), loss_padded.double(), atol=1e-12, rtol=0), (
         f"luspo {level} level, beta {beta}: padding moved the loss from {loss.item()} to {loss_padded.item()}"
     )
+
+
+class _FixedScaler:
+    def __init__(self, scale):
+        self.scale = scale
+
+    def get_scale(self):
+        return self.scale
+
+
+# DeepSpeed fp16 leaves accelerator.scaler unset and scales the returned loss itself; a
+# GradScaler instead reaches the forward and the loss is scaled by the same factor.
+@pytest.mark.parametrize("scaler_scale, upstream", [(None, 1.0), (None, 128.0), (128.0, 128.0)])
+def test_efficient_grpo_backward_applies_upstream_gradient(scaler_scale, upstream, disable_dynamo):
+    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("grpo")
+    lm_head = torch.randn(17, 8, dtype=torch.float64)
+    new_ref = new.clone().requires_grad_(True)
+    rr.grpo_compute_loss(ref, new_ref, old, None, input_ids, mask, 0.04, advantages, **kwargs)[0].backward()
+
+    new_eff = new.clone().requires_grad_(True)
+    scaler = None if scaler_scale is None else _FixedScaler(scaler_scale)
+    out = rr.UnslothEfficientGRPO.apply(
+        new_eff, old, ref, None, lm_head, input_ids, mask, advantages, 0.04, scaler, 1, kwargs,
+    )
+    (out[0] * upstream).backward()
+    assert torch.allclose(new_eff.grad, new_ref.grad * upstream, atol=1e-8, rtol=1e-6)
