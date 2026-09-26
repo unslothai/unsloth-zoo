@@ -110,23 +110,21 @@ def test_an_explicit_override_is_left_alone():
     assert "_MTPLayer" not in plan.no_split_module_classes
 
 
-class _SharedWrapper(nn.Module):
-    def __init__(self, shared):
+class _Wrapper(nn.Module):
+    def __init__(self):
         super().__init__()
-        self.shared = shared
         self.linear = nn.Linear(H, H, bias = False)
-        self.mamba = _Block()
+        self.inner = _Block()
 
 
-class _Hybrid(nn.Module):
+class _Nested(nn.Module):
     _no_split_modules = ["_Block"]
 
     def __init__(self, vocab = 512):
         super().__init__()
         self.embed_tokens = nn.Embedding(vocab, H)
-        shared = _Block()
         self.layers = nn.ModuleList(
-            [_Block(), _SharedWrapper(shared), _Block(), _SharedWrapper(shared)]
+            [_Block(), _Wrapper(), _Block()]
             + [nn.ModuleList([nn.Linear(H, H, bias = False)])]
         )
         self.lm_head = nn.Linear(H, vocab, bias = False)
@@ -135,7 +133,7 @@ class _Hybrid(nn.Module):
         return self.lm_head
 
 
-def test_a_wrapper_around_a_declared_block_and_a_container_are_not_added():
+def test_a_container_is_not_added_but_a_wrapper_is_kept_whole():
     with torch.device("meta"):
-        model = _Hybrid()
-    assert resolve_no_split_classes(model) == ["_Block"]
+        model = _Nested()
+    assert resolve_no_split_classes(model) == ["_Block", "_Wrapper"]
