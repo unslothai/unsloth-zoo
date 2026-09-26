@@ -70,13 +70,11 @@ def _swappable(module):
 
 
 class _Block:
-    __slots__ = ("params", "host", "devices", "names", "streams", "events", "resident", "slot", "sig")
+    __slots__ = ("params", "host", "devices", "streams", "events", "resident", "slot", "sig")
 
     def __init__(self, layer, streams, device):
         self.params, self.host, self.devices = [], [], []
-        index = {}
         for name, p in _swappable(layer):
-            index[id(p)] = len(self.params)
             self.params.append(p)
             if p.data.device.type == "cpu":
                 self.host.append(p.data if p.data.is_pinned() else _to_pinned_host(p.data))
@@ -84,11 +82,6 @@ class _Block:
             else:
                 self.host.append(_to_pinned_host(p.data))
                 self.devices.append(p.data.device)
-        # state_dict() emits every alias; missing one serializes an empty tensor.
-        self.names = []
-        for name, p in layer.named_parameters(recurse = True, remove_duplicate = False):
-            if id(p) in index:
-                self.names.append((name, index[id(p)]))
         # One stream + event per device: sharded blocks must sync every card.
         for d in self.devices:
             if d not in streams:
@@ -252,11 +245,14 @@ class BlockSwap:
 
     def _state_dict(self, i):
         def hook(module, state_dict, prefix, local_metadata):
+            # Names resolved now, not at install: PEFT wraps swapped Linears later
+            # (q_proj.weight -> q_proj.base_layer.weight). Every alias is replaced.
             b = self.blocks[i]
-            for name, idx in b.names:
-                key = prefix + name
-                if key in state_dict:
-                    state_dict[key] = b.host[idx]
+            index = {id(p): j for j, p in enumerate(b.params)}
+            for name, p in module.named_parameters(remove_duplicate = False):
+                j = index.get(id(p))
+                if j is not None and prefix + name in state_dict:
+                    state_dict[prefix + name] = b.host[j]
         return hook
 
     def enter(self, idx):
