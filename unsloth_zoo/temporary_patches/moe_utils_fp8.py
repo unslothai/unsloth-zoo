@@ -381,9 +381,8 @@ def _fp4_dequant_whole_stack(packed_u8, scale_f, values, target_dtype):
     return (pairs * scale_f.unsqueeze(-1)).to(target_dtype).view(E, M, 2 * K_packed)
 
 
-# dynamic=False: an automatic-dynamic recompile ran slower than eager. Shapes stay below dynamo's
-# recompile limit, past which it would run the unchunked body eagerly and materialize GBs of indices.
-# Dynamo counts that limit per code object and guards on device, so each device gets its own copy.
+# dynamic=False: automatic-dynamic ran slower than eager. Past dynamo's per-code-object recompile limit
+# the unchunked body would run eagerly (GBs of indices), so shapes are capped and each device has its own copy.
 _FP4_COMPILED = {}
 _FP4_COMPILED_SHAPES = {}
 _FP4_COMPILED_MAX_SHAPES = 6
