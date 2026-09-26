@@ -169,3 +169,46 @@ def test_fp4_experts_with_their_own_gate_are_refused_until_a_backend_applies_it(
 def test_fp8_moe_forward_stays_compiler_disabled():
     from unsloth_zoo.temporary_patches.moe_utils_fp8 import forward_moe_backend_fp8
     assert getattr(forward_moe_backend_fp8, "_torchdynamo_disable", False)
+
+
+needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason = "compiled FP4 dequant runs on CUDA")
+
+
+def _eager_fp4(fp8, packed, scale, dtype):
+    old = fp8._FP4_COMPILED
+    fp8._FP4_COMPILED = False
+    try:
+        return fp8._dequantize_full_expert_weights_fp4(packed, scale, dtype)
+    finally:
+        fp8._FP4_COMPILED = old
+
+
+@needs_cuda
+@pytest.mark.parametrize("float_scales", [False, True])
+def test_compiled_fp4_dequant_is_bit_identical_to_eager(float_scales):
+    from unsloth_zoo.temporary_patches import moe_utils_fp8 as fp8
+    packed, scale = _fixture(E = 4, M = 32, K = 256)
+    if float_scales:
+        scale = torch.rand(scale.shape, generator = torch.Generator().manual_seed(2)) * 0.3 + 0.01
+    packed, scale = packed.cuda(), scale.cuda()
+
+    @torch.compiler.disable
+    def call_site():
+        return fp8._dequantize_full_expert_weights_fp4(packed, scale, torch.bfloat16)
+
+    out = call_site()
+    assert fp8._FP4_COMPILED not in (None, False)
+    assert (tuple(packed.shape), scale.shape[-1], torch.bfloat16, packed.device) in fp8._FP4_COMPILED_SHAPES
+    assert torch.equal(out, _eager_fp4(fp8, packed, scale, torch.bfloat16))
+
+
+@needs_cuda
+def test_compiled_fp4_dequant_falls_back_past_the_shape_cap_and_when_disabled(monkeypatch):
+    from unsloth_zoo.temporary_patches import moe_utils_fp8 as fp8, common
+    packed, scale = _fixture(E = 2, M = 8, K = 64)
+    packed, scale = packed.cuda(), fp8._fp4_scale_to_float(scale.cuda())
+    monkeypatch.setattr(fp8, "_FP4_COMPILED_SHAPES", {("filler", i) for i in range(fp8._FP4_COMPILED_MAX_SHAPES)})
+    assert fp8._dequantize_fp4_compiled(packed, scale, torch.bfloat16) is None
+    monkeypatch.setattr(fp8, "_FP4_COMPILED_SHAPES", set())
+    monkeypatch.setattr(common, "UNSLOTH_COMPILE_DISABLE", True)
+    assert fp8._dequantize_fp4_compiled(packed, scale, torch.bfloat16) is None

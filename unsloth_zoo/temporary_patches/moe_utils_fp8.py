@@ -370,8 +370,50 @@ def _fp4_scale_to_float(scale: torch.Tensor) -> torch.Tensor:
     return scale.to(torch.float32)
 
 
+def _fp4_dequant_whole_stack(packed_u8, scale_f, values, target_dtype):
+    E, M, K_packed = packed_u8.shape
+    G = scale_f.shape[-1]
+    lo = values[(packed_u8 & 0xF).to(torch.int32)]
+    hi = values[(packed_u8 >> 4).to(torch.int32)]
+    pairs = torch.stack((lo, hi), dim = -1).view(E, M, G, (2 * K_packed) // G)
+    return (pairs * scale_f.unsqueeze(-1)).to(target_dtype).view(E, M, 2 * K_packed)
+
+
+# dynamic=False: an automatic-dynamic recompile ran slower than eager. Shapes stay below dynamo's
+# recompile limit, past which it would run the unchunked body eagerly and materialize GBs of indices.
+_FP4_COMPILED = None
+_FP4_COMPILED_SHAPES = set()
+_FP4_COMPILED_MAX_SHAPES = 6
+
+
+def _dequantize_fp4_compiled(weight, scale_f, target_dtype):
+    global _FP4_COMPILED
+    if _FP4_COMPILED is False or weight.device.type not in ("cuda", "xpu") or not weight.is_contiguous():
+        return None
+    key = (tuple(weight.shape), scale_f.shape[-1], target_dtype, weight.device)
+    if key not in _FP4_COMPILED_SHAPES and len(_FP4_COMPILED_SHAPES) >= _FP4_COMPILED_MAX_SHAPES:
+        return None
+    from .common import UNSLOTH_COMPILE_DISABLE
+    if UNSLOTH_COMPILE_DISABLE:
+        return None
+    try:
+        if _FP4_COMPILED is None:
+            _FP4_COMPILED = torch.compile(_fp4_dequant_whole_stack, fullgraph = True, dynamic = False)
+        values = torch.tensor(_FP4_E2M1_VALUES, dtype = torch.float32, device = weight.device)
+        with torch.no_grad():
+            out = _FP4_COMPILED(weight.view(torch.uint8), scale_f.contiguous(), values, target_dtype)
+    except torch.OutOfMemoryError:
+        raise
+    except Exception as exc:
+        _FP4_COMPILED = False
+        logger.info(f"Unsloth: compiled FP4 expert dequant unavailable ({type(exc).__name__}); using the eager path.")
+        return None
+    _FP4_COMPILED_SHAPES.add(key)
+    return out
+
+
 def _dequantize_full_expert_weights_fp4(weight: torch.Tensor, scale, target_dtype: torch.dtype):
-    """(E, M, K // 2) packed -> (E, M, K); chunked over experts since whole-stack int indices take GBs."""
+    """(E, M, K // 2) packed -> (E, M, K); the eager fallback chunks experts since whole-stack int indices take GBs."""
     if weight.ndim != 3 or not _is_fp4_packed_tensor(weight):
         return None
     if not isinstance(scale, torch.Tensor) or scale.ndim != 3 or scale.shape[0] != weight.shape[0]:
@@ -381,10 +423,13 @@ def _dequantize_full_expert_weights_fp4(weight: torch.Tensor, scale, target_dtyp
     if scale.shape[1] != M or K % scale.shape[2] != 0:
         return None
     group = K // scale.shape[2]
+    scale_f = _fp4_scale_to_float(scale)
+    out = _dequantize_fp4_compiled(weight, scale_f, target_dtype)
+    if out is not None:
+        return out
     # Multiply in fp32 and cast once, as transformers does; bf16 scales would round twice.
     table = _fp4_pair_table(torch.float32, weight.device)
     out = torch.empty(E, M, K, dtype = target_dtype, device = weight.device)
-    scale_f = _fp4_scale_to_float(scale)
     for start in range(0, E, _FP4_EXPERT_CHUNK):
         stop = min(start + _FP4_EXPERT_CHUNK, E)
         codes = weight[start:stop].contiguous().view(torch.uint8).to(torch.int32)
