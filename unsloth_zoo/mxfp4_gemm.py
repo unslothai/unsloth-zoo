@@ -299,9 +299,10 @@ def _decode_for_test(blocks, scales):
     return out
 
 
-def _pick_config(M, E, N, K, transpose_b):
-    """(BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages, split). Swept on B200 over gpt-oss-20b shapes with
-    uniform (decode) and real, skewed (prefill / training, hottest expert 3-6x the mean) routing."""
+def _pick_config(M, E, N, K, transpose_b, asm = False):
+    """(BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages, split). Swept on B200 over gpt-oss-20b / 120b and Kimi-K3
+    (896 experts, top-16) shapes with uniform (decode) and real, skewed (prefill / training, hottest expert 3-6x the
+    mean) routing."""
     per_expert = M / max(E, 1)
     if transpose_b:
         if per_expert <= 1:
@@ -313,6 +314,11 @@ def _pick_config(M, E, N, K, transpose_b):
         if per_expert <= 192:
             return (128, 256, 64, 4, 3, False)
         return (256, 256, 64, 8, 4, False)
+    if asm:
+        # The PTX decode makes the plain dX tile beat the lo / hi split; BLOCK_M 64 even for 1-row experts.
+        if per_expert <= 96:
+            return (64, 128, 128 if E >= 256 else 64, 4, 3, False)
+        return (128, 128, 64, 8, 3, False)
     if per_expert <= 1:
         return (16, 64, 256, 4, 2, True)
     if per_expert <= 16:
@@ -369,14 +375,17 @@ def _launch(x, blocks, scales, counts, out, transpose_b, config, launcher, bias 
     N = out.shape[1]
     grouped = counts is not None
     if config is None:
-        config = _pick_config(M, E, N, K, transpose_b) if grouped else _pick_dense_config(M, N, K, transpose_b)
+        asm = _asm_ok(x.device)
+        config = _pick_config(M, E, N, K, transpose_b, asm) if grouped else _pick_dense_config(M, N, K, transpose_b)
+    else:
+        asm = config[6] if len(config) > 6 else _asm_ok(x.device)
     BM, BN, BK, warps, stages, split = config[:6]
-    asm = config[6] if len(config) > 6 else (not grouped and _asm_ok(x.device))
     split = split and (K % BK == 0 if transpose_b else BN >= 32)
     if split and transpose_b:
         x = _split_permute(x, BK)
     # Plain ints: triton.cdiv / next_power_of_2 cost microseconds per call on the decode path.
-    grid = (-(-M // BM) + (E if grouped else 0), -(-N // BN))
+    # Each non-empty expert adds at most one partial tile; programs past the last tile exit at once.
+    grid = (-(-M // BM) + (torch.sym_min(E, M) if grouped else 0), -(-N // BN))
     launcher(_mxfp4_grouped_mm_kernel)[grid](
         x, blocks, scales, out, x if counts is None else counts, x if bias is None else bias,
         E, R, G, K, N, M,

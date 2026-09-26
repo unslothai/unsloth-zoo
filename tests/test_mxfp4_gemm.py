@@ -64,13 +64,18 @@ def test_grouped_mm_matches_dequantize_then_matmul(transpose_b, counts):
         torch.testing.assert_close(got.float(), want, rtol = 1e-2, atol = 1e-2 * want.abs().max().item())
 
 
-@pytest.mark.parametrize("M_per_expert", [1, 12, 40, 150, 300])
-def test_every_tile_config_matches(M_per_expert):
-    # _pick_config switches tiles by rows per expert; each branch must stay correct.
+@pytest.mark.parametrize("asm", [True, False])
+@pytest.mark.parametrize("E,M_per_expert", [(4, 1), (4, 12), (4, 40), (4, 150), (4, 300), (300, 1), (300, 3)])
+def test_every_tile_config_matches(E, M_per_expert, asm, monkeypatch):
+    # _pick_config switches tiles by rows per expert, expert count and decoder; each branch must stay correct.
+    import unsloth_zoo.mxfp4_gemm as mg
     from unsloth_zoo.mxfp4_gemm import mxfp4_grouped_mm
-    E, R, C = 4, 320, 192
+    monkeypatch.setattr(mg, "_ASM_OK", {k: asm for k in (None, 0, torch.cuda.current_device())})
+    R, C = (320, 192) if E < 256 else (64, 64)
     blocks, scales = _stack(E, R, C, seed = M_per_expert)
-    counts = torch.tensor([M_per_expert * 2, 0, M_per_expert, M_per_expert], dtype = torch.int32, device = "cuda")
+    counts = torch.full((E,), M_per_expert, dtype = torch.int32, device = "cuda")
+    counts[0] = M_per_expert * 2
+    counts[1] = 0
     dense = mxfp4_dequantize_torch(blocks, scales)
     for transpose_b in (True, False):
         x = torch.randn(int(counts.sum()), C if transpose_b else R, dtype = torch.bfloat16, device = "cuda")
