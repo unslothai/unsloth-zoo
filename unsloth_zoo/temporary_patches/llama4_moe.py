@@ -99,7 +99,6 @@ def patch_llama4_moe():
     original_experts_forward = Llama4TextExperts.__dict__.get("forward")
     original_moe_forward = Llama4TextMoe.__dict__.get("forward")
     ok = patch_function(Llama4TextMoe, "forward", Llama4TextMoe_forward)
-    # Signature differs from the model's forward, so force.
     ok = ok and patch_function(Llama4TextExperts, "forward", get_forward_moe_backend(), force = True)
     if not ok:
         if original_moe_forward is not None:

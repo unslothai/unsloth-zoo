@@ -4163,10 +4163,7 @@ def forward_native_moe_loop(
         expert_mask = expert_mask.permute(2, 1, 0)  # (num_experts, top_k, n_tokens)
         expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
 
-    # Some patches (Qwen3-VL-MoE) store experts in grouped_mm layout (E, in, out)
-    # rather than F.linear's (E, out, in) and set _unsloth_grouped_mm_format=True.
-    # Prefer it over the shape check, which is unsafe when intermediate_dim == hidden_dim.
-    # A declared (E, in, out) layout wins over the shape test, which a square stack defeats.
+    # A declared (E, in, out) layout (_unsloth_grouped_mm_format) wins over the shape test, which a square stack defeats.
     grouped_mm_format = bool(_module_flag(self, "_unsloth_grouped_mm_format", False)) or (
         _module_flag(self, "is_transposed", None) is True
     )
