@@ -105,3 +105,17 @@ def test_custom_op_compiles_without_graph_breaks():
     x = torch.randn(4, C, dtype = torch.bfloat16, device = "cuda")
     compiled = torch.compile(lambda t: mxfp4_grouped_mm_op(t * 2, blocks, scales, counts, True), fullgraph = True)
     assert torch.equal(compiled(x), mxfp4_grouped_mm(x * 2, blocks, scales, counts))
+
+
+def test_stacked_experts_calling_convention():
+    from unsloth_zoo.mxfp4_gemm import mxfp4_gemm_available, mxfp4_grouped_matmul, mxfp4_grouped_mm
+    assert mxfp4_gemm_available(torch.device("cuda")) and not mxfp4_gemm_available(dtype = torch.float16)
+    blocks, scales = _stack(3, 128, 64, seed = 4)
+    counts = torch.tensor([3, 0, 5], dtype = torch.int64, device = "cuda")
+    x = torch.randn(8, 64, dtype = torch.bfloat16, device = "cuda")
+    assert torch.equal(mxfp4_grouped_matmul(x, blocks, scales, counts), mxfp4_grouped_mm(x, blocks, scales, counts.int()))
+    g = torch.randn(8, 128, dtype = torch.bfloat16, device = "cuda")
+    assert torch.equal(
+        mxfp4_grouped_matmul(g, blocks, scales, counts, trans = True),
+        mxfp4_grouped_mm(g, blocks, scales, counts.int(), transpose_b = False),
+    )

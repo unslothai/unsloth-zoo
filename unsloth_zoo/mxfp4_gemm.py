@@ -29,6 +29,8 @@ __all__ = [
     "mxfp4_grouped_mm_available",
     "Mxfp4GroupedMM",
     "mxfp4_expert_grouped_mm",
+    "mxfp4_grouped_matmul",
+    "mxfp4_gemm_available",
 ]
 
 try:
@@ -380,3 +382,17 @@ def _probe(device):
             torch.allclose(got, want, rtol = 2e-2, atol = 2e-2 * want.abs().max().item())
             and torch.allclose(got_t, want_t, rtol = 2e-2, atol = 2e-2 * want_t.abs().max().item())
         )
+
+
+def mxfp4_grouped_matmul(x, blocks, scales, counts, trans = False):
+    """Stacked-experts calling convention: ``trans=False`` is ``x @ W^T`` (reduce over the packed axis),
+    ``trans=True`` its dX ``x @ W``; no autograd. Same kernel as ``mxfp4_grouped_mm``."""
+    counts = counts.to(device = x.device, dtype = torch.int32)
+    if scales.device != blocks.device:
+        scales = scales.to(blocks.device)
+    return mxfp4_grouped_mm(x, blocks.contiguous(), scales.contiguous(), counts.contiguous(), transpose_b = not trans)
+
+
+def mxfp4_gemm_available(device = None, dtype = torch.bfloat16) -> bool:
+    """``mxfp4_grouped_mm_available`` for bf16 activations (the in-register decode is bf16)."""
+    return dtype == torch.bfloat16 and mxfp4_grouped_mm_available(device)
