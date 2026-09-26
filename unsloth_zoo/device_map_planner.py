@@ -494,7 +494,7 @@ def _undeclared_sibling_blocks(model: nn.Module, declared: set[str]) -> set[str]
             if name in declared:
                 continue
             # A container class name would make every such container atomic model-wide.
-            if isinstance(child, (nn.ModuleList, nn.ModuleDict, nn.Sequential)):
+            if type(child) in (nn.ModuleList, nn.ModuleDict, nn.Sequential):
                 continue
             if any(True for _ in child.parameters(recurse=True)):
                 found.add(name)

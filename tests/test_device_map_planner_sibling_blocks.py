@@ -117,6 +117,11 @@ class _Wrapper(nn.Module):
         self.inner = _Block()
 
 
+class _Residual(nn.Sequential):
+    def forward(self, x):
+        return x + super().forward(x)
+
+
 class _Nested(nn.Module):
     _no_split_modules = ["_Block"]
 
@@ -124,7 +129,7 @@ class _Nested(nn.Module):
         super().__init__()
         self.embed_tokens = nn.Embedding(vocab, H)
         self.layers = nn.ModuleList(
-            [_Block(), _Wrapper(), _Block()]
+            [_Block(), _Wrapper(), _Block(), _Residual(nn.Linear(H, H, bias = False))]
             + [nn.ModuleList([nn.Linear(H, H, bias = False)])]
         )
         self.lm_head = nn.Linear(H, vocab, bias = False)
@@ -133,7 +138,7 @@ class _Nested(nn.Module):
         return self.lm_head
 
 
-def test_a_container_is_not_added_but_a_wrapper_is_kept_whole():
+def test_a_plain_container_is_not_added_but_a_wrapper_or_container_subclass_is_kept_whole():
     with torch.device("meta"):
         model = _Nested()
-    assert resolve_no_split_classes(model) == ["_Block", "_Wrapper"]
+    assert resolve_no_split_classes(model) == ["_Block", "_Residual", "_Wrapper"]
