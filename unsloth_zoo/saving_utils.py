@@ -3809,7 +3809,8 @@ pass
 
 
 # merged_16bit drops the quantization config, so packed `weight_packed` shards would reload as
-# missing weights: MXFP4 ones are decoded to a 16-bit `weight` first; other packed formats refuse.
+# missing weights: MXFP4 and INT pack-quantized ones are decoded to a 16-bit `weight` first; other
+# packed formats (NVFP4, mixed groups) refuse.
 
 def _find_quantization_config(config):
     """Kimi-K3 keeps ``quantization_config`` under ``text_config`` only."""
@@ -3826,8 +3827,7 @@ def _find_quantization_config(config):
 pass
 
 
-def _compressed_packed_format(model_name, token = None):
-    """``"mxfp4-pack-quantized"`` if every packed group is MXFP4, else the formats found; None if unpacked."""
+def _compressed_tensors_quantization_config(model_name, token = None):
     config = None
     try:
         if os.path.isdir(str(model_name)):
@@ -3849,12 +3849,200 @@ def _compressed_packed_format(model_name, token = None):
         quant = dict(inner, quant_method = quant.get("quant_method"))
     if str(quant.get("quant_method", "")).lower().replace("_", "-") not in ("compressed-tensors", "sparseml"):
         return None
+    return quant
+pass
+
+
+def _compressed_packed_format(model_name, token = None):
+    """``"mxfp4-pack-quantized"`` if every packed group is MXFP4, else the formats found; None if unpacked."""
+    quant = _compressed_tensors_quantization_config(model_name, token)
+    if quant is None:
+        return None
     top = quant.get("format")
     groups = [g for g in (quant.get("config_groups") or {}).values() if isinstance(g, dict)]
     formats = {str(g.get("format") or top) for g in groups} or {str(top)}
     if not any(f.endswith("pack-quantized") for f in formats):
         return None
     return "mxfp4-pack-quantized" if formats == {"mxfp4-pack-quantized"} else ",".join(sorted(formats))
+pass
+
+
+_INT_PACKED_SUFFIXES = ("weight_packed", "weight_scale", "weight_shape", "weight_zero_point", "weight_g_idx")
+
+
+def _compressed_int_pack_schemes(model_name, token = None):
+    """Weight args of every group of an all-``pack-quantized`` checkpoint, or a RuntimeError naming
+    why its merged_16bit export cannot be decoded exactly."""
+    quant = _compressed_tensors_quantization_config(model_name, token) or {}
+    refuse = lambda why: RuntimeError(  # noqa: E731
+        f"Unsloth: `{model_name}` stores its weights compressed-tensors packed (pack-quantized) "
+        f"and {why}, so a merged_16bit export of it is not supported. Nothing was written. Save "
+        "the adapter with `model.save_pretrained(...)` instead."
+    )
+    sparsity = quant.get("sparsity_config")
+    if isinstance(sparsity, dict) and str(sparsity.get("format") or "dense") != "dense":
+        raise refuse(f"is also sparsity-compressed ({sparsity.get('format')})")
+    if quant.get("kv_cache_scheme"):
+        raise refuse("also quantizes its KV cache")
+    schemes = []
+    for name, group in (quant.get("config_groups") or {}).items():
+        weights = group.get("weights") if isinstance(group, dict) else None
+        if not isinstance(weights, dict):
+            raise refuse(f"group `{name}` has no weight quantization")
+        if group.get("input_activations") or group.get("output_activations"):
+            raise refuse(f"group `{name}` also quantizes activations")
+        strategy = str(weights.get("strategy") or "")
+        if (
+            str(weights.get("type") or "int") != "int"
+            or weights.get("num_bits") not in (4, 8)
+            or strategy not in ("group", "channel")
+            or weights.get("block_structure")
+        ):
+            raise refuse(
+                f"group `{name}` is {weights.get('type')} {weights.get('num_bits')}-bit {strategy} "
+                "(only int 4 / 8-bit group or channel weights decode)"
+            )
+        schemes.append(dict(weights))
+    if not schemes:
+        raise refuse("has no config_groups")
+    return schemes
+pass
+
+
+def _pick_int_scheme(base, schemes, packed_shape, scale_shape, logical_shape, has_zero_point):
+    """The one config group whose args this tensor's layout agrees with; a tie or none refuses."""
+    out_features, in_features = logical_shape
+    found = {}
+    for weights in schemes:
+        bits, strategy = weights["num_bits"], weights["strategy"]
+        groups = 1 if strategy == "channel" else -(-in_features // int(weights.get("group_size") or in_features))
+        if (
+            tuple(packed_shape) == (out_features, -(-in_features // (32 // bits)))
+            and tuple(scale_shape) == (out_features, groups)
+            and has_zero_point == (not weights.get("symmetric", True))
+        ):
+            found[(bits, strategy, bool(weights.get("symmetric", True)))] = weights
+    if len(found) != 1:
+        raise RuntimeError(
+            f"Unsloth: `{base}.weight_packed` {tuple(packed_shape)} matches "
+            f"{'none' if not found else 'more than one'} of the checkpoint's pack-quantized groups, "
+            "so the merged_16bit export cannot decode it. Nothing was merged."
+        )
+    return next(iter(found.values()))
+pass
+
+
+def _plan_compressed_int_rewrite(save_directory, filenames, schemes):
+    """All refusals happen here, before any shard is touched; companions in other shards are read up front."""
+    locations, shapes, stored_shapes = {}, {}, {}
+    for filename in filenames:
+        with safe_open(os.path.join(save_directory, filename), framework = "pt", device = "cpu") as f:
+            for key in f.keys():
+                locations[key] = filename
+                if key.endswith(("_packed", ".weight_scale", ".weight_zero_point")):
+                    shapes[key] = tuple(f.get_slice(key).get_shape())
+                elif key.endswith(".weight_shape"):
+                    stored_shapes[key] = tuple(int(x) for x in f.get_tensor(key).tolist())
+
+    def read(key):
+        with safe_open(os.path.join(save_directory, locations[key]), framework = "pt", device = "cpu") as f:
+            return f.get_tensor(key)
+
+    bases, logical, elsewhere = {}, {}, {}
+    for key in sorted(k for k in locations if k.endswith("_packed")):
+        base = key[: -len(".weight_packed")]
+        if not key.endswith(".weight_packed") or len(shapes[key]) != 2 or base + ".weight_scale" not in locations:
+            raise RuntimeError(
+                f"Unsloth: `{key}` is not a 2D pack-quantized Linear weight with a `weight_scale`, so "
+                "the merged_16bit export cannot decode it. Nothing was merged."
+            )
+        if base + ".weight_shape" in stored_shapes:
+            shape = stored_shapes[base + ".weight_shape"]
+        else:
+            bits = {w["num_bits"] for w in schemes}
+            if len(bits) != 1:
+                raise RuntimeError(f"Unsloth: `{base}` has no `weight_shape`. Nothing was merged.")
+            shape = (shapes[key][0], shapes[key][1] * (32 // bits.pop()))
+        logical[base] = shape
+        bases[base] = _pick_int_scheme(
+            base, schemes, shapes[key], shapes[base + ".weight_scale"], shape,
+            base + ".weight_zero_point" in locations,
+        )
+        for suffix in _INT_PACKED_SUFFIXES[1:]:
+            companion = base + "." + suffix
+            if companion in locations and locations[companion] != locations[key]:
+                elsewhere[companion] = read(companion)
+    return dict(bases = bases, logical = logical, elsewhere = elsewhere)
+pass
+
+
+def _compressed_int_disk_view(save_directory, filenames, plan):
+    keys, shapes = _disk_module_shapes(save_directory, filenames)
+    for base, shape in plan["logical"].items():
+        for suffix in _INT_PACKED_SUFFIXES:
+            keys.discard(base + "." + suffix)
+        keys.add(base + ".weight")
+        shapes[base] = shape
+    return keys, shapes
+pass
+
+
+def _decompress_int_packed(state, weights):
+    """compressed-tensors' own decompressor, so the decoded weight is exactly what it loads."""
+    from compressed_tensors.compressors import BaseCompressor
+    from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
+
+    # Only these reach the decode; `actorder = "group"` fails validation on newer releases.
+    args = QuantizationArgs.model_validate(
+        {k: weights[k] for k in ("num_bits", "type", "symmetric", "strategy", "group_size") if k in weights}
+    )
+    compressor = BaseCompressor.get_value_from_registry("pack-quantized")
+    if hasattr(compressor, "decompress_weight"):  # compressed-tensors < 0.13
+        return BaseCompressor.load_from_registry("pack-quantized").decompress_weight(
+            compressed_data = state, quantization_args = args,
+        )
+    return compressor.decompress(state, QuantizationScheme(targets = ["Linear"], weights = args))["weight"]
+pass
+
+
+def _rewrite_compressed_int_shard(save_directory, filename, plan, output_dtype = None):
+    """Writes each decoded weight as `<base>.weight`; the LoRA merge that follows treats it as a dense one."""
+    dtype = output_dtype or torch.bfloat16
+    device = _active_merge_device()
+    bases, elsewhere = plan["bases"], plan["elsewhere"]
+
+    def split(key):
+        base, _, suffix = key.rpartition(".")
+        return (base, suffix) if base in bases and suffix in _INT_PACKED_SUFFIXES else (None, None)
+
+    path = os.path.join(save_directory, filename)
+    with safe_open(path, framework = "pt", device = "cpu") as f:
+        keys = list(f.keys())
+    if not any(split(k)[0] is not None for k in keys):
+        return
+    tensors = {}
+    with safe_open(path, framework = "pt", device = "cpu") as f:
+        metadata = f.metadata() or {"format": "pt"}
+        for key in keys:
+            base, suffix = split(key)
+            if base is None:
+                tensors[key] = f.get_tensor(key)
+                continue
+            if suffix != "weight_packed":
+                continue
+            state = {}
+            for companion in _INT_PACKED_SUFFIXES:
+                name = base + "." + companion
+                if name in elsewhere:
+                    state[companion] = elsewhere[name]
+                elif name in keys:
+                    state[companion] = f.get_tensor(name)
+            state["weight_shape"] = torch.tensor(plan["logical"][base])
+            state = {k: v.to(device) for k, v in state.items()}
+            weight = _decompress_int_packed(state, bases[base])
+            tensors[base + ".weight"] = weight.to(dtype).cpu().contiguous()
+    save_file(tensors, path + ".unsloth_tmp", metadata = metadata)
+    os.replace(path + ".unsloth_tmp", path)
 pass
 
 
@@ -4477,6 +4665,14 @@ def merge_and_overwrite_lora(
     # Default handle 16 bit merge and save/push
     # Before Step 1: an in-place export overwrites the source config.json without its quantization config.
     _ct_packed_format = _compressed_packed_format(model_name, token) if save_method == "merged_16bit" else None
+    if _ct_packed_format is not None and _ct_packed_format not in ("mxfp4-pack-quantized", "pack-quantized"):
+        raise RuntimeError(
+            f"Unsloth: `{model_name}` stores its weights compressed-tensors packed "
+            f"({_ct_packed_format}); a merged_16bit export of it is not supported, since the "
+            "packed tensors would be written unmerged. Nothing was written. Save the adapter "
+            "with `model.save_pretrained(...)` instead."
+        )
+    _ct_int_schemes = _compressed_int_pack_schemes(model_name, token) if _ct_packed_format == "pack-quantized" else None
     # Step 1: Save base model config/architecture (no weights needed here)
     if save_method == "merged_16bit":
         # `config` is `model.config`, already the nested text config under `text_only = True`,
@@ -4542,21 +4738,15 @@ def merge_and_overwrite_lora(
     _has_nested_shard = any(_has_directory_component(_f) for _f in safetensors_list)
     safe_tensor_index_files = ["model.safetensors.index.json"] if (len(safetensors_list) > 1 or is_hf_sharded or _has_nested_shard) else []
 
-    if _ct_packed_format is not None and _ct_packed_format != "mxfp4-pack-quantized":
-        raise RuntimeError(
-            f"Unsloth: `{model_name}` stores its weights compressed-tensors packed "
-            f"({_ct_packed_format}); a merged_16bit export of it is not supported yet, since the "
-            "packed tensors would be written unmerged. Nothing was written. Save the adapter "
-            "with `model.save_pretrained(...)` instead."
-        )
     _ct_mxfp4_dequant = _ct_packed_format == "mxfp4-pack-quantized"
+    _ct_dequant = _ct_mxfp4_dequant or _ct_int_schemes is not None
 
     # The original index lists scale keys, so it goes stale on MXFP4/FP8 dequant; skip
     # copying it (regenerated below). FP8 only dequantizes on a merged_16bit save, so an
     # FP8 base saved another way keeps its scales and must reuse the original index.
     _is_quant_dequant = (
         base_model_is_quantized and quant_type == "mxfp4" and save_method != "mxfp4"
-    ) or (base_model_is_quantized and quant_type == "fp8" and save_method == "merged_16bit") or _ct_mxfp4_dequant
+    ) or (base_model_is_quantized and quant_type == "fp8" and save_method == "merged_16bit") or _ct_dequant
     # Before any branch decides whether to copy it: filtering the in-memory list is not
     # enough, since a later from_pretrained joins the raw weight_map values itself.
     # Outside the branch below, which a dequant or splitting export skips. Scoped to
@@ -4723,7 +4913,7 @@ def merge_and_overwrite_lora(
     # so a non-dequantizing FP8 save keeps a correct index instead of none.
     _quant_dequant_index = (
         base_model_is_quantized and quant_type == "mxfp4" and save_method != "mxfp4"
-    ) or (base_model_is_quantized and quant_type == "fp8" and save_method == "merged_16bit") or _ct_mxfp4_dequant
+    ) or (base_model_is_quantized and quant_type == "fp8" and save_method == "merged_16bit") or _ct_dequant
     # A dequant or splitting export skips the index-copy block, so regeneration is the
     # only thing that can leave an index behind, and from_pretrained looks for exactly
     # `model.safetensors` then the index at the ROOT, which a nested singleton is neither.
@@ -4784,7 +4974,10 @@ def merge_and_overwrite_lora(
     _count_packed_mxfp4 = not (base_model_is_quantized and quant_type == "mxfp4" and save_method == "mxfp4")
 
     # Decoded per shard inside the merge loop so low-disk upload still streams; the decode folds in stack LoRAs.
-    _mxfp4_rewrite = _disk_view = None
+    _mxfp4_rewrite = _int_rewrite = _disk_view = None
+    if _ct_int_schemes is not None:
+        _int_rewrite = _plan_compressed_int_rewrite(save_directory, final_safetensors_list, _ct_int_schemes)
+        _disk_view = _compressed_int_disk_view(save_directory, final_safetensors_list, _int_rewrite)
     if _ct_mxfp4_dequant:
         _mxfp4_rewrite = _plan_compressed_mxfp4_rewrite(save_directory, final_safetensors_list, model)
         _disk_view = _compressed_mxfp4_disk_view(save_directory, final_safetensors_list, _mxfp4_rewrite)
@@ -4859,6 +5052,8 @@ def merge_and_overwrite_lora(
     for filename in ProgressBar(final_safetensors_list, desc=f'Unsloth: Merging weights into {"mxfp4" if save_method=="mxfp4" else "16bit"}'):
         if _mxfp4_rewrite is not None:
             _rewrite_compressed_mxfp4_shard(save_directory, filename, _mxfp4_rewrite, output_dtype)
+        if _int_rewrite is not None:
+            _rewrite_compressed_int_shard(save_directory, filename, _int_rewrite, output_dtype)
         merged_count, shard_keys = _merge_and_overwrite_lora(
             save_directory = save_directory,
             filename = filename,
