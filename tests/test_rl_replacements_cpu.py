@@ -1405,8 +1405,7 @@ class _FixedScaler:
         return self.scale
 
 
-# DeepSpeed fp16 leaves accelerator.scaler unset and scales the returned loss itself (upstream_scale set);
-# a GradScaler instead reaches the forward and the loss is scaled by the same factor.
+# DeepSpeed fp16 leaves accelerator.scaler unset and scales the loss itself (upstream_scale set); GradScaler scales both.
 @pytest.mark.parametrize("scaler_scale, upstream", [(None, 1.0), (None, 128.0), (128.0, 128.0)])
 def test_efficient_grpo_backward_applies_upstream_gradient(scaler_scale, upstream, disable_dynamo):
     new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("grpo")

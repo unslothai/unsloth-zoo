@@ -277,6 +277,10 @@ def disable_use_cache(model):
     under gradient checkpointing. Original values are remembered on the model
     so restore_use_cache can undo this for inference."""
     config = getattr(model, "config", None)
+    # DeepSpeedEngine.config is its own dict; the transformers config is on .module.
+    if isinstance(config, dict) and hasattr(model, "module"):
+        model = model.module
+        config = getattr(model, "config", None)
     if config is None:
         return
     originals = getattr(model, "_unsloth_use_cache_originals", None)

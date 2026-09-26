@@ -302,3 +302,29 @@ def test_late_config_does_not_disturb_the_first_baseline():
     disable_use_cache(model)
     restore_use_cache(model)
     assert model.config.use_cache is True
+
+
+class _EngineLike(nn.Module):
+    """DeepSpeedEngine shape: its own dict config, the model on .module, other attributes forwarded."""
+
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+        self.config = {"zero_optimization": {"stage": 2}}
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.module, name)
+
+
+def test_disable_after_restore_through_a_deepspeed_style_wrapper():
+    model = _tiny_llama(use_cache = True)
+    disable_use_cache(model)
+    engine = _EngineLike(model)
+    restore_use_cache(engine)
+    assert model.config.use_cache is True
+    disable_use_cache(engine)
+    assert model.config.use_cache is False
+    assert engine.config == {"zero_optimization": {"stage": 2}}
