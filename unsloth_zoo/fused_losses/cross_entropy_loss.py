@@ -575,6 +575,10 @@ class UnslothFusedLoss(torch.autograd.Function):
     pass
 pass
 
+# Resolved once here, not per call: under torch.compile dynamo ignores functools.cache, traces
+# inspect.signature and graph-breaks (it cannot key a dict on, or getattr, an autograd.Function).
+_FUSED_LOSS_PARAMETERS, _FUSED_LOSS_DEFAULTS = _get_mapping(UnslothFusedLoss)
+
 def unsloth_fused_ce_loss(
     trainer,
     hidden_states  : torch.Tensor,
@@ -617,7 +621,7 @@ def unsloth_fused_ce_loss(
     if hidden_states.device != device:
         hidden_states = hidden_states.to(device = device)
 
-    return apply_autograd_function(UnslothFusedLoss, dict(
+    mapping = dict(
         loss_function = compute_fused_ce_loss,
         hidden_states = hidden_states,
         lm_head_weight = lm_head_weight,
@@ -631,6 +635,10 @@ def unsloth_fused_ce_loss(
         torch_compile = torch_compile,
         overwrite = overwrite,
         extra_kwargs = kwargs,
+    )
+    return UnslothFusedLoss.apply(*(
+        mapping.get(key, default) \
+        for key, default in zip(_FUSED_LOSS_PARAMETERS, _FUSED_LOSS_DEFAULTS)
     ))
 pass
 
