@@ -1729,7 +1729,13 @@ def patch_gpt_oss_bnb4bit_auto():
         # classes installed when later loading a 16bit checkpoint, whose router.weight + 3D
         # experts then mismatch ("weights not initialized"). Restore the stock classes when this
         # load is not BnB-4bit. The compiled-module file is handled by _sync above.
-        if os.environ.get("UNSLOTH_GPT_OSS_BNB4BIT_PATCHED", "0") == "1":
+        # The installed class is the truth; the env flag can be cleared or inherited independently of it.
+        try:
+            import transformers.models.gpt_oss.modeling_gpt_oss as _modeling
+            _installed = _modeling.GptOssExperts is GptOssExpertsBnb4bit
+        except Exception:
+            _installed = False
+        if _installed or os.environ.get("UNSLOTH_GPT_OSS_BNB4BIT_PATCHED", "0") == "1":
             restore_gpt_oss_original()
             os.environ["UNSLOTH_GPT_OSS_BNB4BIT_PATCHED"] = "0"
         return
