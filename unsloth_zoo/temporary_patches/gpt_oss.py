@@ -3164,6 +3164,7 @@ def patch_GptOssModel():
             torch.compiler.cudagraph_mark_step_begin()
             # Initialize for common return path
             all_hidden_states = None
+            all_router_logits = None
             for layer_idx, decoder_layer in enumerate(self.layers):
                 mask = _gpt_oss_select_mask(
                     attention_mask,
@@ -3209,25 +3210,46 @@ def patch_GptOssModel():
             )
             all_hidden_states = () if output_hidden_states else None
 
-            for layer_idx, decoder_layer in enumerate(self.layers):
-                if output_hidden_states:
-                    all_hidden_states += (hidden_states,)
+            # This forward replaces the stock one and with it @capture_outputs, so collect
+            # router_logits here, as the stock OutputRecorder(GptOssTopKRouter, index=0) does.
+            # Without them load_balancing_loss_func returns the int 0 and GptOssForCausalLM
+            # raises on `aux_loss.to(loss.device)`; TRL >= 1.7 requests them for every MoE model.
+            all_router_logits = None
+            router_hooks = []
+            if kwargs.get("output_router_logits", getattr(self.config, "output_router_logits", False)):
+                all_router_logits = []
+                def _record_router_logits(module, args, output):
+                    all_router_logits.append(output[0] if isinstance(output, tuple) else output)
+                for decoder_layer in self.layers:
+                    router = getattr(getattr(decoder_layer, "mlp", None), "router", None)
+                    if router is not None:
+                        router_hooks.append(router.register_forward_hook(_record_router_logits))
 
-                mask = _gpt_oss_select_mask(
-                    attention_mask,
-                    _gpt_oss_layer_attention_type(decoder_layer, self.config, layer_idx),
-                )
-                hidden_states = decoder_layer(
-                    hidden_states,
-                    attention_mask=mask,
-                    position_ids=position_ids,
-                    past_key_values=past_key_values,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                    **kwargs,
-                )
-            pass
+            try:
+                for layer_idx, decoder_layer in enumerate(self.layers):
+                    if output_hidden_states:
+                        all_hidden_states += (hidden_states,)
+
+                    mask = _gpt_oss_select_mask(
+                        attention_mask,
+                        _gpt_oss_layer_attention_type(decoder_layer, self.config, layer_idx),
+                    )
+                    hidden_states = decoder_layer(
+                        hidden_states,
+                        attention_mask=mask,
+                        position_ids=position_ids,
+                        past_key_values=past_key_values,
+                        use_cache=use_cache,
+                        cache_position=cache_position,
+                        position_embeddings=position_embeddings,
+                        **kwargs,
+                    )
+                pass
+            finally:
+                for hook in router_hooks:
+                    hook.remove()
+            if all_router_logits is not None:
+                all_router_logits = tuple(all_router_logits)
             hidden_states = self.norm(hidden_states)
 
             if output_hidden_states:
@@ -3239,6 +3261,7 @@ def patch_GptOssModel():
                 "last_hidden_state": hidden_states,
                 "past_key_values": past_key_values,
                 "hidden_states": all_hidden_states,
+                "router_logits": all_router_logits,
             })
 
     patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel, "forward", forward, match_level = "relaxed")
