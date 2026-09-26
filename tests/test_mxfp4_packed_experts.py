@@ -743,3 +743,15 @@ def test_load_state_dict_of_a_gpt_oss_model_takes_the_other_models_experts():
     b.load_state_dict(a.state_dict())
     for name in ("gate_up_proj", "down_proj"):
         assert torch.equal(getattr(experts_b, name).dequantize(), getattr(experts_a, name).dequantize())
+
+
+def test_torch_fallback_chunk_shorter_than_an_expert_writes_every_row(monkeypatch):
+    # step=3 rows over N=7 rows per expert: chunks cut at an expert edge must not skip rows.
+    g = torch.Generator().manual_seed(0)
+    blocks = torch.randint(0, 256, (3, 7, 2, 16), dtype = torch.uint8, generator = g)
+    scales = torch.randint(118, 125, (3, 7, 2), dtype = torch.uint8, generator = g)
+    want = mxd.mxfp4_dequantize_torch(blocks, scales, transpose = True)
+    monkeypatch.setattr(mxd, "_TORCH_CHUNK_BYTES", 3 * 2 * 16 * 2 * 8)
+    out = torch.full_like(want, float("nan"))
+    got = mxd.mxfp4_dequantize_torch(blocks, scales, transpose = True, out = out)
+    assert torch.equal(got, want)
