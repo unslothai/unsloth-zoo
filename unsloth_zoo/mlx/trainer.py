@@ -9258,7 +9258,6 @@ def train_on_responses_only(
             args.max_steps * args.gradient_accumulation_steps
             if args.max_steps > 0 else None
         )
-        # Epoch blocks only for epoch runs; max_steps runs truncate to num_batches.
         labeled_num_epochs = (
             args.num_train_epochs
             if (args.max_steps <= 0 and getattr(args, "num_train_epochs", -1) > 0)
