@@ -24,6 +24,7 @@ class _FakeTokenizer:
     _vocab = {
         "<image>": 200,
         "<|image_pad|>": 201,
+        "<|media_pad|>": 163592,
     }
 
     def convert_tokens_to_ids(self, tokens):
@@ -204,6 +205,7 @@ def test_vlm_collate_creates_sft_labels_and_masks_special_tokens():
         [101, 10, -100, 11, -100],
         [101, 12, 13, -100, -100],
     ]
+    assert set(_get_vlm_ignore_token_ids(processor=type("_Kimi", (_FakeProcessor,), {"image_token": "<|media_pad|>"})())) == {200, 201, 163592}
 
 
 def test_vlm_response_mask_reapplies_special_token_masks():

@@ -2632,6 +2632,11 @@ def _get_vlm_ignore_token_ids(processor=None, config=None, model=None):
             if token is not None:
                 _append_unique_int(ids, _convert_token_to_id(tokenizer, token))
 
+        for attr in ("image_token", "video_token", "audio_token"):
+            token = getattr(processor, attr, None)
+            if isinstance(token, str):
+                _append_unique_int(ids, _convert_token_to_id(tokenizer, token))
+
         for attr in (
             "image_token_id",
             "video_token_id",
