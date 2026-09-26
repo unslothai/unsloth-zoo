@@ -60,3 +60,26 @@ def test_modes_are_valid_vllm_values():
     if not modes:
         pytest.skip("this vLLM predates logprobs_mode; load_vllm drops the key")
     assert {"processed_logprobs", "raw_logprobs"} <= modes
+
+
+def test_v1_sampler_keeps_fast_topk_topp_when_no_logprobs(monkeypatch):
+    sampler_mod = pytest.importorskip("vllm.v1.sample.sampler")
+    from types import SimpleNamespace
+    import unsloth_zoo.vllm_utils as vu
+
+    seen = []
+    monkeypatch.setattr(
+        sampler_mod.Sampler, "forward",
+        lambda self, logits, md, *a, **k: seen.append(self.topk_topp_sampler.logprobs_mode),
+    )
+    vu.patch_vllm_processed_logprobs_fast_path()
+    s = sampler_mod.Sampler(logprobs_mode = "processed_logprobs")
+    s.forward(None, SimpleNamespace(max_num_logprobs = None))
+    s.forward(None, SimpleNamespace(max_num_logprobs = 0))
+    s.forward(None, SimpleNamespace(max_num_logprobs = None), logprobs_mode_override = "processed_logits")
+    assert seen == ["raw_logprobs", "processed_logprobs", "processed_logprobs"]
+    assert s.topk_topp_sampler.logprobs_mode == "processed_logprobs"
+
+    raw = sampler_mod.Sampler(logprobs_mode = "raw_logprobs")
+    raw.forward(None, SimpleNamespace(max_num_logprobs = None))
+    assert seen[-1] == "raw_logprobs" and "_unsloth_raw_topk_topp_sampler" not in raw.__dict__
