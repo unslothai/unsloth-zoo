@@ -87,6 +87,19 @@ def hf_cache(tmp_path, monkeypatch):
     return tmp_path
 
 
+def _supervised_child(monkeypatch, *partials: str) -> int:
+    """A child that exists and writes exactly *partials*, whatever else is running on the host.
+
+    These tests pass a pid only to reach the data branch. A made-up pid (4242) left the outcome to
+    the runner: when some process of ours happened to hold it, psutil read it as a live child owning
+    no partial, the watchdog took the test's fresh partial for a peer's download and held the clock,
+    and three "must trip" tests failed together on a CI runner. Own the partials explicitly and use
+    a pid that is certainly alive, so the watchdog asks the question each test means to ask.
+    """
+    monkeypatch.setattr(xf, "_child_open_incomplete_blobs", lambda _pid: set(partials))
+    return os.getpid()
+
+
 def _blobs_dir(root: Path, repo_id: str = REPO) -> Path:
     d = root / f"models--{repo_id.replace('/', '--')}" / "blobs"
     d.mkdir(parents = True, exist_ok = True)
@@ -100,6 +113,70 @@ def _wait(predicate, timeout: float = 2.0, step: float = 0.02) -> bool:
             return True
         time.sleep(step)
     return predicate()
+
+
+def _watch_while_growing(
+    grown: Path, **watchdog_kwargs
+) -> "tuple[list[str], float, float, list[int]]":
+    """Grow *grown* every 0.05 s under a watchdog for past its stall timeout.
+
+    Returns ``(stall calls, longest gap between writes, stall_timeout, sizes read after each write)``,
+    the last being what the watchdog's own reader saw, so a firing says whether the grower paused
+    or the size the watchdog reads did not move. A stall is no growth for
+    stall_timeout, so a claim that growth keeps the watchdog quiet needs the grower to have kept
+    writing with no gap that long. On a loaded xdist runner a starved grower is a real stall and the
+    watchdog is right to fire; the gap tells the two apart (#1349).
+    """
+    grow_stop = threading.Event()
+    writes: list[float] = []
+
+    sizes: list[int] = []
+
+    # Appended and flushed, the way a download grows a partial. The watchdog reads st_blocks
+    # (sparse-aware), and rewriting the whole file with O_TRUNC every 0.05 s left that number to
+    # the filesystem's allocation: #1367's first CI run saw the repo-wide watchdog fire with the
+    # grower never idle for 1.5 s. Not reproduced on XFS here; fsync pins each write's blocks, and
+    # the sizes recorded below say which side moved if it happens again.
+    def _grow():
+        with open(grown, "ab") as out:
+            while not grow_stop.wait(0.05):
+                out.write(os.urandom(4096))
+                out.flush()
+                os.fsync(out.fileno())
+                writes.append(time.monotonic())
+                sizes.append(xf.blob_bytes_present(grown))
+
+    grower = threading.Thread(target = _grow, daemon = True)
+    grower.start()
+
+    # 1.5 s against a 0.05 s grower leaves a thirty-fold margin.
+    stall_timeout = 1.5
+    calls: list[str] = []
+    started = time.monotonic()
+    before = set(threading.enumerate())
+    stop = xf.start_watchdog(
+        repo_ids = [REPO], on_stall = calls.append, interval = 0.05, stall_timeout = stall_timeout,
+        **watchdog_kwargs,
+    )
+    watchdog = [t for t in threading.enumerate() if t not in before and t.name == "hf-xet-watchdog"]
+    assert len(watchdog) == 1, f"expected one new watchdog thread, found {watchdog}"
+    try:
+        time.sleep(stall_timeout + 0.5)
+    finally:
+        stop.set()
+        # Joined, not just signalled: stop.wait() can return and the thread be preempted mid-tick, so
+        # a callback could still land after the signal. The timestamp follows the join, so the
+        # measured interval covers everything the watchdog saw.
+        watchdog[0].join(timeout = 10)
+        stopped = time.monotonic()
+        grow_stop.set()
+        grower.join(timeout = 5)
+    assert not watchdog[0].is_alive(), "the watchdog thread did not stop"
+    # Through the moment the watchdog stopped: a grower starved after its last write leaves a
+    # trailing gap the watchdog saw too.
+    marks = [started] + [w for w in writes if w < stopped] + [stopped]
+    gap = max(b - a for a, b in zip(marks, marks[1:]))
+    return calls, gap, stall_timeout, sizes
 
 
 def test_constant_incomplete_fires_stall(hf_cache):
@@ -124,27 +201,14 @@ def test_growing_incomplete_never_stalls(hf_cache):
     part = blobs / "growing.incomplete"
     part.write_bytes(b"\0" * 1024)
 
-    grow_stop = threading.Event()
-
-    def _grow():
-        size = 1024
-        while not grow_stop.wait(0.05):
-            size += 4096
-            part.write_bytes(b"\0" * size)
-
-    grower = threading.Thread(target = _grow, daemon = True)
-    grower.start()
-
-    calls: list[str] = []
-    stop = xf.start_watchdog(
-        repo_ids = [REPO], on_stall = calls.append, interval = 0.05, stall_timeout = 0.5
+    calls, gap, stall_timeout, sizes = _watch_while_growing(part)
+    assert gap < stall_timeout, (
+        f"the partial went {gap:.2f}s without growing, so this run never tested the claim"
     )
-    try:
-        time.sleep(1.0)  # well past stall_timeout, but bytes keep growing
-        assert calls == [], "watchdog fired despite continuous progress"
-    finally:
-        stop.set()
-        grow_stop.set()
+    assert calls == [], (
+        f"watchdog fired despite continuous progress; its size reader saw {len(set(sizes))} "
+        f"distinct values over {len(sizes)} writes"
+    )
 
 
 def test_no_incomplete_never_stalls(hf_cache):
@@ -245,52 +309,15 @@ def test_repo_wide_watchdog_is_masked_by_sibling(hf_cache):
     sibling.write_bytes(b"\0" * 1024)
     (blobs / "child.incomplete").write_bytes(b"\0" * 2048)   # constant
 
-    grow_stop = threading.Event()
-    writes: list[float] = []
-
-    def _grow():
-        size = 1024
-        while not grow_stop.wait(0.05):
-            size += 4096
-            sibling.write_bytes(b"\0" * size)
-            writes.append(time.monotonic())
-
-    grower = threading.Thread(target = _grow, daemon = True)
-    grower.start()
-
-    # A stall is no growth for stall_timeout, so the claim needs the sibling to keep growing with no
-    # gap that long. On a loaded xdist runner a 0.5 s timeout against a 0.05 s grower was a coin
-    # flip: a starved grower is a real stall, and the watchdog was right to fire. 1.5 s leaves a
-    # thirty-fold margin, and the gap check below says which of the two happened.
-    stall_timeout = 1.5
-    calls: list[str] = []
-    started = time.monotonic()
-    before = set(threading.enumerate())
-    stop = xf.start_watchdog(   # default: repo-wide (watch_new_partials_only = False)
-        repo_ids = [REPO], on_stall = calls.append, interval = 0.05, stall_timeout = stall_timeout,
-    )
-    watchdog = [t for t in threading.enumerate() if t not in before and t.name == "hf-xet-watchdog"]
-    assert len(watchdog) == 1, f"expected one new watchdog thread, found {watchdog}"
-    try:
-        time.sleep(stall_timeout + 0.5)   # past stall_timeout, but repo-wide bytes keep growing
-    finally:
-        stop.set()
-        # Joined, not just signalled: stop.wait() can return and the thread be preempted mid-tick, so
-        # a callback could still land after the signal. The timestamp follows the join, so the
-        # measured interval covers everything the watchdog saw.
-        watchdog[0].join(timeout = 10)
-        stopped = time.monotonic()
-        grow_stop.set()
-        grower.join(timeout = 5)
-    assert not watchdog[0].is_alive(), "the watchdog thread did not stop"
-    # Through the moment the watchdog stopped: a grower starved after its last write leaves a
-    # trailing gap the watchdog saw too.
-    marks = [started] + [w for w in writes if w < stopped] + [stopped]
-    gap = max(b - a for a, b in zip(marks, marks[1:]))
+    # default: repo-wide (watch_new_partials_only = False)
+    calls, gap, stall_timeout, sizes = _watch_while_growing(sibling)
     assert gap < stall_timeout, (
         f"the sibling went {gap:.2f}s without growing, so this run never tested the claim"
     )
-    assert calls == [], "repo-wide watchdog should be reset by the growing sibling"
+    assert calls == [], (
+        f"repo-wide watchdog should be reset by the growing sibling; its size reader saw "
+        f"{len(set(sizes))} distinct values over {len(sizes)} writes"
+    )
 
 
 def test_file_watchdog_ignores_baseline_only_partials(hf_cache):
@@ -4887,7 +4914,7 @@ def test_a_child_buffering_from_the_network_is_not_a_stall(hf_cache, monkeypatch
     stop = xf.start_watchdog(
         repo_ids = [REPO], on_stall = calls.append,
         interval = 0.05, stall_timeout = 0.3, connect_timeout = 30.0,
-        child_pid = 4242,
+        child_pid = _supervised_child(monkeypatch, "buffering.incomplete"),
     )
     try:
         time.sleep(1.2)  # 4x the stall deadline
@@ -4907,7 +4934,7 @@ def test_a_child_that_stops_receiving_still_trips(hf_cache, monkeypatch):
     stop = xf.start_watchdog(
         repo_ids = [REPO], on_stall = calls.append,
         interval = 0.05, stall_timeout = 0.3, connect_timeout = 30.0,
-        child_pid = 4242,
+        child_pid = _supervised_child(monkeypatch, "hung.incomplete"),
     )
     try:
         assert _wait(lambda: bool(calls), timeout = 3.0), "a hung child never tripped"
@@ -4927,7 +4954,7 @@ def test_the_buffering_grace_is_skipped_when_rss_is_unreadable(hf_cache, monkeyp
     stop = xf.start_watchdog(
         repo_ids = [REPO], on_stall = calls.append,
         interval = 0.05, stall_timeout = 0.3, connect_timeout = 30.0,
-        child_pid = 4242,
+        child_pid = _supervised_child(monkeypatch, "hung.incomplete"),
     )
     try:
         assert _wait(lambda: bool(calls), timeout = 3.0), "unreadable RSS must not disarm the stall"
@@ -5075,7 +5102,7 @@ def test_a_second_buffering_episode_after_a_drain_is_not_a_stall(hf_cache, monke
     stop = xf.start_watchdog(
         repo_ids = [REPO], on_stall = calls.append,
         interval = 0.05, stall_timeout = 0.3, connect_timeout = 30.0,
-        child_pid = 4242,
+        child_pid = _supervised_child(monkeypatch, "shard.incomplete"),
     )
     try:
         time.sleep(0.15)
@@ -5110,7 +5137,7 @@ def test_a_thin_link_buffering_slowly_is_not_a_stall(hf_cache, monkeypatch):
     stop = xf.start_watchdog(
         repo_ids = [REPO], on_stall = calls.append,
         interval = 0.05, stall_timeout = 0.6, connect_timeout = 30.0,
-        child_pid = 4242,
+        child_pid = _supervised_child(monkeypatch, "slow.incomplete"),
     )
     try:
         time.sleep(1.0)
@@ -5235,7 +5262,7 @@ def test_a_link_below_the_rss_epsilon_rate_is_not_a_stall(hf_cache, monkeypatch)
     stop = xf.start_watchdog(
         repo_ids = [REPO], on_stall = calls.append,
         interval = 0.05, stall_timeout = 0.4, connect_timeout = 30.0,
-        child_pid = 4242,
+        child_pid = _supervised_child(monkeypatch, "shard.incomplete"),
     )
     try:
         for _ in range(30):                      # ~1.5s, nearly 4x the short deadline
@@ -5260,7 +5287,7 @@ def test_a_frozen_child_still_trips_on_the_short_deadline(hf_cache, monkeypatch)
     stop = xf.start_watchdog(
         repo_ids = [REPO], on_stall = calls.append,
         interval = 0.05, stall_timeout = 0.4, connect_timeout = 30.0,
-        child_pid = 4242,
+        child_pid = _supervised_child(monkeypatch, "shard.incomplete"),
     )
     try:
         assert _wait(lambda: bool(calls), timeout = 3.0), "a frozen child was given the patient deadline"

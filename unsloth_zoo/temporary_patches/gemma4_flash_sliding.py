@@ -52,6 +52,7 @@ except Exception:
 _ORIG_SDPA = [None]      # boxed reference to the wrapped sdpa function
 _ENGAGED = [0]           # count of FA2-path invocations (debug)
 _BANDED_ENGAGED = [0]    # count of banded-path invocations (debug)
+_CAUSAL_ENGAGED = [0]    # count of mask-free causal SDPA invocations (debug)
 
 
 @functools.lru_cache(maxsize=1)
@@ -101,9 +102,11 @@ def _sdpa_maybe_flash_sliding(module, query, key, value, attention_mask,
         # may take the causal window; a bidirectional call (is_causal False) must
         # stay bidirectional instead of being forced causal.
         causal = is_causal if is_causal is not None else getattr(module, "is_causal", True)
-        if (w and Sq == Sk and Sq > w
+        # No `Sq > w` gate: at seq_len == window transformers still passes a band mask (slow SDPA kernel).
+        if (w and Sq == Sk
                 and (attention_mask is not None or causal)
                 and _mask_is_plain_band(attention_mask, Sq, w)):
+            covers_all = Sq <= w
             # Prefer FlashAttention-2's window kernel when importable and the dtype
             # is supported; otherwise fall to the pure-SDPA banded kernel so the
             # O(S*w) speedup is automatic with or without flash-attn. A runtime FA2
@@ -133,8 +136,25 @@ def _sdpa_maybe_flash_sliding(module, query, key, value, attention_mask,
                     return out, None                      # (B, S, H, D), no weights
                 except Exception as e:
                     logger.warning_once(f"Unsloth: gemma-4 FA2 sliding fell back to banded SDPA ({e})")
-            # Reached when FA2 is not used or its attempt failed: try the pure-SDPA
-            # block-local kernel before deferring to the original SDPA.
+            # Band covers the whole sequence: is_causal instead of a mask lets SDPA pick flash.
+            if covers_all:
+                try:
+                    out = torch.nn.functional.scaled_dot_product_attention(
+                        query, key, value,
+                        dropout_p=dropout if module.training else 0.0,
+                        is_causal=True, scale=scaling, enable_gqa=True,
+                    )
+                    _CAUSAL_ENGAGED[0] += 1
+                    if _CAUSAL_ENGAGED[0] == 1:
+                        logger.info_once(
+                            f"Unsloth: causal SDPA engaged for gemma-4 sliding layers "
+                            f"(seq_len <= window={w})."
+                        )
+                    return out.transpose(1, 2).contiguous(), None   # (B, S, H, D)
+                except Exception as e:
+                    logger.warning_once(f"Unsloth: gemma-4 causal SDPA fell back to masked SDPA ({e})")
+                return _ORIG_SDPA[0](module, query, key, value, attention_mask,
+                                     dropout=dropout, scaling=scaling, is_causal=is_causal, **kwargs)
             try:
                 # Pure-SDPA block-local kernel; batch-general. ng folds the kv
                 # heads up to the q heads exactly as SDPA's GQA expansion does.
