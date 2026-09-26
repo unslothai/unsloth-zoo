@@ -23,6 +23,7 @@ copy. Hermetic CPU tests with a stub whitespace processor.
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from unsloth_zoo.vision_utils import UnslothVisionDataCollator
@@ -125,3 +126,42 @@ def test_no_type_ids_emitted_is_a_noop():
     out = make_collator(None)(EXAMPLES)
     assert "token_type_ids" not in out and "mm_token_type_ids" not in out
     assert out["input_ids"].shape == out["attention_mask"].shape
+
+
+class _ChatProcessor(_FakeProcessor):
+    """Renders `{"type": "image"}` as <img>, and records the images it is handed."""
+
+    def __init__(self):
+        super().__init__(None)
+        self.seen_images = []
+
+    def apply_chat_template(self, messages, **kwargs):
+        words = []
+        for m in messages:
+            for part in m["content"]:
+                words.append("<img>" if part["type"] == "image" else part["text"])
+        return " ".join(words)
+
+    def __call__(self, text, **kwargs):
+        self.seen_images.append(kwargs.get("images"))
+        return super().__call__(text, **kwargs)
+
+
+@pytest.mark.parametrize("prompt", [
+    [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "a"}]}],
+    "<img> a",
+])
+def test_top_level_images_reach_processor(prompt):
+    # TRL's vision format: images in a column, bare markers (or plain text) in the prompt.
+    # Both shapes used to drop the images with a warning and call the processor without them.
+    from PIL import Image
+
+    collator = make_collator(None)
+    collator.processor = _ChatProcessor()
+    collator.assistant_single_content = False
+    image = Image.new("RGB", (32, 32))
+    completion = [{"role": "assistant", "content": [{"type": "text", "text": "x"}]}]
+    collator([{"images": [image], "prompt": prompt,
+               "completion": completion if isinstance(prompt, list) else "x"}])
+    # The first processor call encodes the prompts, which is where images belong
+    assert collator.processor.seen_images[0] == [[image]]
