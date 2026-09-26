@@ -20,6 +20,7 @@ import unsloth_zoo.device_type as dt
 import torch
 
 os.environ.pop("UNSLOTH_ALLOW_CPU", None)
+dt._IS_MLX = False  # an Apple Silicon runner with mlx answers "mlx" before any cell
 for cell in sys.argv[1:]:
     torch.cuda.is_available = lambda cell=cell: cell in ("cuda", "hip")
     torch.version.hip = "7.2.0" if cell == "hip" else None
