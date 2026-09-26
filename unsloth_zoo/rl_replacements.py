@@ -2168,8 +2168,7 @@ def grpo_accumulated_loss(
             device = completion_mask.device, dtype = completion_mask.dtype,
         )
 
-    # grad_output is ignored except under DeepSpeed, which scales the FP16 loss in engine.backward with no
-    # Accelerate scaler; there undo training_step's 1/GAS (TRL <= 0.21), the loss is already GAS-normalized.
+    # Only DeepSpeed (no Accelerate scaler) needs grad_output; undo TRL <= 0.21's extra 1/GAS on the normalized loss.
     upstream_scale = None
     if trainer.accelerator.scaler is None and getattr(trainer, "is_deepspeed_enabled", False):
         upstream_scale = 1.0
