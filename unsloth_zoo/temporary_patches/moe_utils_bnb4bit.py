@@ -313,7 +313,16 @@ def _dequantize_bnb4bit_expert_weights(weight, target_dtype: torch.dtype):
     """
     if not _is_bnb4bit_param(weight):
         return None
-    dequant = _dequantize_4bit_in_slices(weight)
+    dequant = None
+    try:
+        from unsloth_zoo.temporary_patches.moe_triton_kernels import nf4_dequant_triton
+        dequant = nf4_dequant_triton(
+            weight.data, weight.quant_state, getattr(weight, "_original_shape", None),
+        )
+    except ImportError:
+        pass
+    if dequant is None:
+        dequant = _dequantize_4bit_in_slices(weight)
     if dequant is None:
         dequant = bnb.functional.dequantize_4bit(weight.data, weight.quant_state)
     original_shape = getattr(weight, "_original_shape", None)
@@ -352,27 +361,19 @@ def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
         forward_native_moe_loop,
         swap_moe_weights_for_call,
         _gate_up_is_interleaved,
-        _moe_recompute_default,
+        _moe_recompute_enabled,
     )
 
     target_dtype = hidden_states.dtype
     if not target_dtype.is_floating_point:
         target_dtype = torch.bfloat16
 
-    # Defer dequant into forward_native_grouped_mm's providers instead of
-    # pre-dequantizing the full bf16 stack up front. The 4-bit base prefers recompute
-    # by default (prefer_memory=True) so that, even inside a gradient-checkpoint
-    # recompute pass, we never materialize and pin the full bf16 expert dequant the
-    # 4-bit storage exists to avoid; UNSLOTH_MOE_RECOMPUTE=0 still forces the pin for
-    # memory-rich runs. This keeps the packed Params4bit and rebuilds the dense stack
-    # on demand; the pre-dequantize path below is only taken when the policy says pin,
-    # so we never pre-dequantize into a dense stack and then re-hold it for a backward
-    # recompute. Matches the per-source decision in forward_native_grouped_mm.
+    # Same recompute-vs-pin policy as forward_native_grouped_mm; recompute keeps the packed Params4bit.
     if (
         select_moe_backend() == "grouped_mm"
         and _is_bnb4bit_param(self.gate_up_proj)
         and _is_bnb4bit_param(self.down_proj)
-        and _moe_recompute_default(prefer_memory = True)
+        and _moe_recompute_enabled(self.gate_up_proj, dtype=target_dtype)
     ):
         _log_moe_bnb4bit_backend_once(self, "Unsloth: MoE bnb4bit grouped_mm with backward-recompute.")
         return forward_native_grouped_mm(self, hidden_states.to(target_dtype), top_k_index, top_k_weights)
@@ -408,18 +409,14 @@ def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
 # transformers integration patches
 # ============================================================================
 
-# Unpatched families keep transformers' generic experts forward, which matmuls packed uint8
-# ("got Byte" on tencent/Hy3); route them at quantization time, before accelerate hooks.
-
+# Unpatched families (tencent/Hy3) keep transformers' generic experts forward, which matmuls packed uint8.
 _GENERIC_EXPERTS_FORWARD_FILE = ("transformers", "integrations", "moe.py")
 
-# Module global on purpose: `_forward_statically_reads_stash` follows global names only; a
-# local import hides it and the recompute graph then differs from the forward's.
+# Module global, passed as an argument below: _forward_statically_reads_stash only follows global names the forward calls.
 from .moe_utils import get_forward_moe_backend
 
 
 def _is_generic_transformers_experts_forward(forward) -> bool:
-    """True iff `forward` is the dispatcher `use_experts_implementation` installs."""
     code = getattr(forward, "__code__", None)
     if code is None:
         return False
@@ -433,7 +430,7 @@ def _experts_have_own_apply_gate(module: nn.Module) -> bool:
 
 
 def _experts_layout_is_standard(module: nn.Module) -> bool:
-    """True iff laid out as forward_moe_backend computes: [gate; up] (E, 2I, H), down (E, H, I), no bias."""
+    """Concatenated [gate; up] gate_up_proj (E, 2*I, H), down_proj (E, H, I), no biases."""
     # Newer flags are absent on transformers 5.0, whose only layout was the standard one.
     if not getattr(module, "has_gate", True):
         return False
@@ -455,8 +452,7 @@ def _experts_layout_is_standard(module: nn.Module) -> bool:
 
 
 def _forward_generic_experts_eagerly(resolve_backend, self, hidden_states, top_k_index, top_k_weights):
-    """Run the backend outside torch.compile: traced, its log-once state and guards give the
-    checkpoint recompute a different graph (CheckpointError: recomputed values have different metadata)."""
+    """Traced by Dynamo, the backend recomputes a different graph under checkpointing (CheckpointError)."""
     return resolve_backend()(self, hidden_states, top_k_index, top_k_weights)
 
 
@@ -465,7 +461,7 @@ if hasattr(torch, "compiler") and hasattr(torch.compiler, "disable"):
 
 
 def _drop_expert_parallel_sentinel(module, top_k_index, top_k_weights):
-    """Point expert-parallel `num_experts` sentinel slots at expert 0 with zero weight, as transformers does."""
+    """RouterParallel marks non-local routes with index num_experts; send them to expert 0 at zero weight."""
     num_experts = getattr(module, "num_experts", None)
     if num_experts is None:
         num_experts = module.gate_up_proj.shape[0]
@@ -474,6 +470,7 @@ def _drop_expert_parallel_sentinel(module, top_k_index, top_k_weights):
 
 
 def _route_generic_bnb4bit_experts_class(module: nn.Module) -> bool:
+    """Route bnb 4-bit instances of a generic-forward experts class; 16-bit ones keep the original."""
     klass = type(module)
     if getattr(klass, "_unsloth_bnb4bit_routed", False):
         return True
@@ -493,7 +490,7 @@ def _route_generic_bnb4bit_experts_class(module: nn.Module) -> bool:
 
     forward.__wrapped__ = original_forward
     forward.__doc__ = original_forward.__doc__
-    # Set only on classes routed here, so patched families compute as before.
+    # Set only on classes routed here, so every patched family computes as before.
     klass._unsloth_own_apply_gate = _experts_have_own_apply_gate(module)
     klass.forward = forward
     klass._unsloth_bnb4bit_routed = True

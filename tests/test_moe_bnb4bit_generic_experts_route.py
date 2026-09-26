@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""bnb 4-bit experts of a family with no model-specific MoE patch (tencent/Hy3's HYV3Experts)."""
+"""bnb 4-bit experts of families without a model-specific MoE patch (tencent/Hy3 HYV3Experts)."""
 import copy
 import os
 from types import SimpleNamespace
@@ -82,7 +82,7 @@ def test_only_the_standard_layout_is_routable():
         try:
             klass = _make_experts_class(**kwargs)
         except TypeError:
-            continue  # this transformers has no such flag
+            continue
         assert not mb._experts_layout_is_standard(klass(_config())), kwargs
 
     custom_gate = _make_experts_class()
@@ -127,7 +127,7 @@ def test_routed_forward_is_seen_to_apply_the_expert_lora_stash():
 def test_the_backend_call_is_kept_out_of_compiled_regions():
     fn = mb._forward_generic_experts_eagerly
     if hasattr(torch, "compiler") and hasattr(torch.compiler, "disable"):
-        assert getattr(fn, "__wrapped__", None) is not None  # torch.compiler.disable wrapper
+        assert getattr(fn, "__wrapped__", None) is not None
 
 
 def test_a_class_with_its_own_forward_is_not_touched():
@@ -148,7 +148,6 @@ def test_a_class_with_its_own_forward_is_not_touched():
 
 
 def _quantize_like_the_loader(model, device):
-    """Mimic a 4-bit from_pretrained: meta Params4bit placeholders, then quantize the weight in."""
     from bitsandbytes.nn import Params4bit
     from transformers import BitsAndBytesConfig
 
@@ -264,6 +263,7 @@ def _make_own_gate_experts_class():
 
 
 def _init_large(module, seed = 0):
+    # Large enough that the +/-7 clamps are active on some entries.
     g = torch.Generator().manual_seed(seed)
     with torch.no_grad():
         module.gate_up_proj.copy_(torch.randn(E, 2 * I, H, generator = g) * 1.5)
@@ -327,7 +327,6 @@ def test_bnb4bit_own_gate_experts_match_dequantized_reference():
 
 @pytest.fixture
 def _restore_minimax_experts_class():
-    # Routing is recorded on the real transformers class; undo it so later tests see stock.
     modeling = pytest.importorskip("transformers.models.minimax_m3_vl.modeling_minimax_m3_vl")
     klass = modeling.MiniMaxM3VLExperts
     saved = {k: klass.__dict__[k] for k in ("forward", "_unsloth_own_apply_gate", "_unsloth_bnb4bit_routed") if k in klass.__dict__}
@@ -363,6 +362,7 @@ def test_minimax_m3_experts_4bit_match_their_own_forward():
         reference.down_proj.copy_(mb._dequantize_bnb4bit_expert_weights(experts.down_proj, torch.bfloat16))
     hidden, top_k_index, top_k_weights = _routing(64, device = "cuda")
     hidden = (hidden * 2).to(torch.bfloat16)
+    # The reference is a 16-bit instance: the routed class forward sends it to the original.
     expected = reference(hidden, top_k_index, top_k_weights.to(torch.bfloat16))
     out = experts(hidden, top_k_index, top_k_weights.to(torch.bfloat16))
     torch.testing.assert_close(out.float(), expected.float(), rtol = 2e-2, atol = 2e-2)
