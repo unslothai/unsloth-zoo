@@ -1768,13 +1768,16 @@ class UnslothVisionDataCollator:
         return batch
 
     def _extract_images_for_pc(self, example, p_msgs, c_msgs):
-        # PC: prefer embedded across prompt+completion; else top-level first image; else []
+        # PC: top-level images column first, as in the non-PC path; else embedded; else []
         imgs = None
         vids = None
         vids_kwarg = None
         try:
             msg_list = (p_msgs or []) + (c_msgs or [])
-            if msg_list:
+            if example.get("images"):
+                imgs = list(example["images"])
+                vids = []
+            elif msg_list:
                 imgs, vids, vids_kwarg = process_vision_info(
                     msg_list,
                     size_factor=self.patch_size*2,
@@ -1782,16 +1785,6 @@ class UnslothVisionDataCollator:
                 )
                 if imgs is None: imgs = []
                 if vids is None: vids = []
-            else:
-                if "images" in example:
-                    vision_infos = [{'image': example['images'][i]} for i in range(len(example['images']))]
-                    imgs, vids, vids_kwarg = process_vision_info(
-                        vision_infos,
-                        size_factor=self.patch_size*2,
-                        return_video_kwargs=True,
-                    )
-                    if imgs is None: imgs = []
-                    if vids is None: vids = []
         except Exception as e:
             logger.warning(f"Unsloth: _extract_images_for_pc failed to extract images/videos: {e}")
             imgs = []
