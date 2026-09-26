@@ -233,6 +233,15 @@ def mxfp4_dequantize(
     experts with a zero count are skipped inside the kernel. ``out`` reuses a buffer."""
     if blocks.shape[:-1] != scales.shape or blocks.shape[-1] != 16:
         raise ValueError(f"Unsloth: MXFP4 blocks {tuple(blocks.shape)} do not match scales {tuple(scales.shape)}")
+    from unsloth_zoo.utils import device_guard
+
+    # Triton and torch.ldexp launch on the current device; a card other than the current
+    # one (multi-GPU device maps) needs it made current first.
+    with device_guard(blocks):
+        return _mxfp4_dequantize(blocks, scales, dtype, transpose, experts, token_counts, out)
+
+
+def _mxfp4_dequantize(blocks, scales, dtype, transpose, experts, token_counts, out):
     if (
         not _triton_usable(blocks) or blocks.dim() < 3
         or not _kernel_verified(blocks.device, dtype, transpose)
