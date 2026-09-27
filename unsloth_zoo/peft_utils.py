@@ -87,6 +87,7 @@ SKIP_QUANTIZATION_MODULES = [
     "multi_modal_projector",    # Llama 3.2 Vision, Pixtral, Llava
     "merger",                   # Qwen2 VL
     "modality_projection",      # Idefics, SmolVLM
+    "mm_projector",             # Kimi K2.5 / K2.7, LLaVA-style remote code
     "router",                   # MoE Router
     "mlp.gate",                 # MoE Router
     "block_sparse_moe.gate",    # MoE Router
