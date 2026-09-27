@@ -604,12 +604,24 @@ def patch_gradient_checkpointing():
 pass
 
 
+def _restore_transformers_checkpoint(shim):
+    # The patch points transformers.modeling_utils.checkpoint at the shim as well, and that is
+    # the one gradient_checkpointing_enable() wraps. Left behind, a model set up for vanilla
+    # gradient checkpointing later in the process still runs the shim, including the offloaded
+    # one that allocates pinned host buffers.
+    import transformers.modeling_utils
+    if getattr(transformers.modeling_utils, "checkpoint", None) is shim:
+        transformers.modeling_utils.checkpoint = torch.utils.checkpoint.checkpoint
+pass
+
+
 def unpatch_unsloth_gradient_checkpointing():
     import torch.utils
     if hasattr(torch.utils.checkpoint, "_old_checkpoint"):
         torch.utils.checkpoint.checkpoint = torch.utils.checkpoint._old_checkpoint
         del torch.utils.checkpoint._old_checkpoint
     pass
+    _restore_transformers_checkpoint(unsloth_offloaded_gradient_checkpoint)
 pass
 
 
@@ -619,6 +631,7 @@ def unpatch_gradient_checkpointing():
         torch.utils.checkpoint.checkpoint = torch.utils.checkpoint._old_checkpoint
         del torch.utils.checkpoint._old_checkpoint
     pass
+    _restore_transformers_checkpoint(unsloth_gradient_checkpoint)
 pass
 
 

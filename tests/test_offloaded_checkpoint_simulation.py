@@ -340,27 +340,50 @@ def test_public_signature_is_unchanged(gc_module):
     assert parameters["use_reentrant"].default is None
 
 
-def test_patch_then_unpatch_restores_torch_exactly():
+@pytest.fixture
+def restore_checkpoint_patches(monkeypatch):
+    """The patch rebinds transformers.modeling_utils.checkpoint and sets UNSLOTH_PATCHED too.
+
+    Restoring only torch's left transformers on the offloaded shim for the rest of the worker,
+    so test_gemma4_unified_forced_float32's checkpointed backward went through it on a CPU
+    runner and died allocating pinned host memory.
+    """
+    import transformers.modeling_utils
+
+    monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", torch.utils.checkpoint.checkpoint)
+    monkeypatch.setattr(transformers.modeling_utils, "checkpoint", transformers.modeling_utils.checkpoint)
+    monkeypatch.delattr(torch.utils.checkpoint, "_old_checkpoint", raising = False)
+    monkeypatch.delenv("UNSLOTH_PATCHED", raising = False)
+
+
+@pytest.mark.parametrize(
+    "patch_name, unpatch_name",
+    [
+        ("patch_unsloth_gradient_checkpointing", "unpatch_unsloth_gradient_checkpointing"),
+        ("patch_gradient_checkpointing", "unpatch_gradient_checkpointing"),
+    ],
+)
+def test_patch_then_unpatch_restores_torch_exactly(restore_checkpoint_patches, patch_name, unpatch_name):
     """Else every later consumer in the process inherits Unsloth's checkpointing."""
+    import transformers.modeling_utils
     from unsloth_zoo import gradient_checkpointing as module
+
     original = torch.utils.checkpoint.checkpoint
-    try:
-        module.patch_unsloth_gradient_checkpointing()
-        assert torch.utils.checkpoint.checkpoint.__name__ == "unsloth_offloaded_gradient_checkpoint"
-        module.unpatch_unsloth_gradient_checkpointing()
-        assert torch.utils.checkpoint.checkpoint is original
-    finally:
-        torch.utils.checkpoint.checkpoint = original
+    original_transformers = transformers.modeling_utils.checkpoint
+    getattr(module, patch_name)()
+    assert torch.utils.checkpoint.checkpoint.__name__ in module._UNSLOTH_CKPT_SHIM_NAMES
+    assert transformers.modeling_utils.checkpoint is torch.utils.checkpoint.checkpoint
+    getattr(module, unpatch_name)()
+    assert torch.utils.checkpoint.checkpoint is original
+    # gradient_checkpointing_enable() wraps this one, not torch's.
+    assert transformers.modeling_utils.checkpoint is original_transformers
 
 
-def test_pristine_checkpoint_is_still_recoverable_after_patching():
+def test_pristine_checkpoint_is_still_recoverable_after_patching(restore_checkpoint_patches):
     """How the Gemma-4 KV-sharing fix escapes the shim to force use_reentrant=False."""
     from unsloth_zoo import gradient_checkpointing as module
-    original = torch.utils.checkpoint.checkpoint
-    try:
-        module.patch_unsloth_gradient_checkpointing()
-        recovered = getattr(torch.utils.checkpoint, "_unsloth_pristine_checkpoint", None)
-        assert recovered is not None
-        assert recovered.__name__ not in module._UNSLOTH_CKPT_SHIM_NAMES
-    finally:
-        torch.utils.checkpoint.checkpoint = original
+
+    module.patch_unsloth_gradient_checkpointing()
+    recovered = getattr(torch.utils.checkpoint, "_unsloth_pristine_checkpoint", None)
+    assert recovered is not None
+    assert recovered.__name__ not in module._UNSLOTH_CKPT_SHIM_NAMES
