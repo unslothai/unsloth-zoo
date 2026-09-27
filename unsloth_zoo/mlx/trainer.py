@@ -48,6 +48,7 @@ import random
 import socket
 import time
 import unicodedata
+import weakref
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -861,6 +862,32 @@ def _normalize_mlx_optimizer_name(name):
             f"Supported optimizers: {supported}."
         )
     return opt_name
+
+
+def _donate_optimizer_state(optimizer):
+    """Let MLX update each parameter and its optimizer state in place.
+
+    mx.compile fuses a leaf's new parameter and moments into one multi-output
+    kernel, whose inputs MLX never donates: every step copied them all. A
+    zero-copy reshape of each new state array splits that kernel into
+    single-output kernels that reuse the old buffers, with unchanged arithmetic.
+    """
+    apply_single = getattr(type(optimizer), "apply_single", None)
+    if apply_single is None:  # no per-leaf update hook to route
+        return optimizer
+    # Weak, so the instance attribute does not keep the optimizer and its state alive.
+    owner = weakref.ref(optimizer)
+
+    def _apply_single(gradient, parameter, state):
+        before = dict(state)
+        updated = apply_single(owner(), gradient, parameter, state)
+        for key, value in state.items():
+            if isinstance(value, mx.array) and value is not before.get(key):
+                state[key] = value.reshape((1, *value.shape)).reshape(value.shape)
+        return updated
+
+    optimizer.apply_single = _apply_single
+    return optimizer
 
 
 _part_is_norm = _mlx_norm_path_part_is_norm
@@ -3946,7 +3973,7 @@ class MLXTrainer:
             self._manual_weight_decay = float(wd or 0.0)
             optimizer = optim.Lion(learning_rate=initial_lr, weight_decay=0.0)
         self._resolved_optimizer_name = opt_name
-        return optimizer
+        return _donate_optimizer_state(optimizer)
 
     @staticmethod
     def _should_apply_weight_decay(name, parameter=None):
