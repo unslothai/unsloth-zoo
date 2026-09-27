@@ -10,6 +10,7 @@ argv: arch names. Prints one JSON line per (mode, arch).
 """
 
 import importlib
+import importlib.util
 import json
 import math
 import os
@@ -109,6 +110,10 @@ for _name in list(ALL_ATTENTION_FUNCTIONS.keys()):
     ALL_ATTENTION_FUNCTIONS[_name] = _strict(ALL_ATTENTION_FUNCTIONS[_name], _name)
 
 
+MODEL_TYPES = {"gemma4_e2b": "gemma4", "gemma4_26b_a4b_moe": "gemma4", "gemma4_unified_12b": "gemma4_unified",
+               "qwen3_5_fla": "qwen3_5", "qwen3_6_moe": "qwen3_5_moe", "muse_glimmer": "muse_glimmer"}
+
+
 def _apply_temporary_patches():
     from unsloth_zoo.temporary_patches import TEMPORARY_PATCHES
     for patch in TEMPORARY_PATCHES:
@@ -123,12 +128,12 @@ def _apply_temporary_patches():
 def run(arch):
     builder, forced = BUILDERS[arch]
     out = {"arch": arch, "mode": MODE, "ok": False, "error": None}
-    try:
-        model = builder().to(torch.bfloat16)
-    except (ImportError, AttributeError) as e:
-        out["error"] = f"UNAVAILABLE: {type(e).__name__}: {e}"
+    model_type = MODEL_TYPES[arch]
+    if importlib.util.find_spec(f"transformers.models.{model_type}") is None:
+        out["error"] = f"UNAVAILABLE: transformers has no {model_type}"
         return out
     try:
+        model = builder().to(torch.bfloat16)  # build errors on an installed arch are drift: fail
         if MODE == "t4" and forced:
             from unsloth_zoo.patching_utils import patch_model_and_tokenizer
             patch_model_and_tokenizer(model, None, do_forced_float32 = True)
