@@ -284,3 +284,35 @@ def test_unified_vision_block_survives_loader_fp16_cast(monkeypatch):
             assert dtypes[f"model.embed_vision.{block}.{suffix}"] == torch.float32, block
     assert dtypes["model.embed_vision.multimodal_embedder.embedding_projection.weight"] == torch.float16
     assert torch.bfloat16 not in dtypes.values()
+
+
+def test_every_forced_gemma4_family_arch_is_covered(monkeypatch):
+    # The loader forces float32 by substring (`"gemma4" in "gemma4_unified,"`), so any
+    # new gemma4* model type gets the fp16 load without these patches unless listed.
+    import importlib
+    import pkgutil
+    import transformers.models
+    from unsloth_zoo.model_lists import FORCE_FLOAT32
+    monkeypatch.setenv("UNSLOTH_FORCE_FLOAT32", "1")
+    monkeypatch.setattr(patch_utils, "UNSLOTH_COMPILE_DISABLE", True)
+    suffixes = ("TextScaledWordEmbedding", "RMSNorm", "TextAttention")
+    targets = []
+    for info in pkgutil.iter_modules(transformers.models.__path__):
+        mt = info.name
+        if not mt.startswith("gemma4") or not any(e in mt + "," for e in FORCE_FLOAT32):
+            continue
+        try:
+            module = importlib.import_module(f"transformers.models.{mt}.modeling_{mt}")
+        except ImportError:
+            continue
+        for name, cls in vars(module).items():
+            if isinstance(cls, type) and cls.__module__ == module.__name__ and name.endswith(suffixes):
+                monkeypatch.setattr(cls, "forward", cls.forward)
+                targets.append((mt, cls, cls.forward))
+    if not targets:
+        pytest.skip("no Gemma4 family in this transformers")
+    patches.patch_Gemma4TextScaledWordEmbedding()
+    patches.patch_Gemma4RMSNorm()
+    patches.patch_Gemma4TextAttention()
+    missed = [f"{mt}.{cls.__name__}" for mt, cls, before in targets if cls.forward is before]
+    assert not missed, f"forced-float32 model types left unpatched: {missed}"
