@@ -4473,6 +4473,7 @@ def merge_and_overwrite_lora(
                 filename = filename,
                 repo_type = "model",
                 local_dir = save_directory,
+                local_dir_use_symlinks = False,
                 cache_dir = _hf_cache_dir,
                 token = token,
             )
@@ -4496,6 +4497,7 @@ def merge_and_overwrite_lora(
                     filename = "tokenizer.model",
                     repo_type = "model",
                     local_dir = save_directory,
+                    local_dir_use_symlinks = False,
                     cache_dir = _hf_cache_dir,
                     token = token,
                 )
