@@ -104,7 +104,10 @@ def _kernels():
         vl = (tl.load(code_ptr + lo) * am).to(out_ptr.dtype.element_ty)
         w = tl.reshape(tl.join(vh, vl), (2 * BLOCK,))
         offs2 = pid * (2 * BLOCK) + tl.arange(0, 2 * BLOCK).to(tl.int64)
-        tl.store(out_ptr + offs2, w, mask = offs2 < 2 * n_bytes)
+        # offs2 // 2 < n_bytes, not offs2 < 2 * n_bytes: n_bytes arrives as int32 below 2**31, so
+        # 2 * n_bytes wraps negative for stacks of 2**31 to 2**32 weights (Inkling-Small's
+        # (256, 4096, 2048) down_proj) and every store was masked off, leaving torch.empty garbage.
+        tl.store(out_ptr + offs2, w, mask = (offs2 // 2) < n_bytes)
 
     @triton.jit
     def _combine_fwd_kernel(y_ptr, inv_ptr, w_ptr, out_ptr, T, H: tl.constexpr, TOPK: tl.constexpr,
