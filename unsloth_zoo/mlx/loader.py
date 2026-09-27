@@ -8497,8 +8497,8 @@ class FastMLXModel:
                 with open(adapter_cfg_path, "r") as f:
                     adapter_cfg = json.load(f)
                 # The config is rewritten by the latest save, so a native MLX
-                # config next to a stale PEFT weights file stays on the MLX path.
-                if "peft_type" in adapter_cfg and (os.path.exists(
+                # config (fine_tune_type) beside a stale PEFT file stays on the MLX path.
+                if "fine_tune_type" not in adapter_cfg and (os.path.exists(
                     os.path.join(local_path, "adapter_model.safetensors")
                 ) or os.path.exists(
                     os.path.join(
