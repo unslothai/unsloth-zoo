@@ -23,6 +23,7 @@ copy. Hermetic CPU tests with a stub whitespace processor.
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from unsloth_zoo.vision_utils import UnslothVisionDataCollator
@@ -163,3 +164,59 @@ def test_train_on_responses_only_pc_path_raises_when_nothing_is_trained():
     collator.train_on_responses_only = lambda batch: {"labels": torch.full_like(batch["input_ids"], -100)}
     with pytest.raises(ValueError, match = "no trainable token"):
         collator(EXAMPLES)
+
+
+class _ChatProcessor(_FakeProcessor):
+    def __init__(self):
+        super().__init__(None)
+        self.seen_images = []
+
+    def apply_chat_template(self, messages, **kwargs):
+        words = []
+        for m in messages:
+            for part in m["content"]:
+                words.append("<img>" if part["type"] == "image" else part["text"])
+        return " ".join(words)
+
+    def __call__(self, text, **kwargs):
+        self.seen_images.append(kwargs.get("images"))
+        return super().__call__(text, **kwargs)
+
+
+@pytest.mark.parametrize("prompt", [
+    [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "a"}]}],
+    "<img> a",
+])
+def test_top_level_images_reach_processor(prompt):
+    # TRL vision rows: images column + bare markers or plain text; both used to drop the images.
+    from PIL import Image
+
+    collator = make_collator(None)
+    collator.processor = _ChatProcessor()
+    collator.assistant_single_content = False
+    image = Image.new("RGB", (32, 32))
+    completion = [{"role": "assistant", "content": [{"type": "text", "text": "x"}]}]
+    collator([{"images": [image], "prompt": prompt,
+               "completion": completion if isinstance(prompt, list) else "x"}])
+    assert collator.processor.seen_images[0] == [[image]]
+
+
+def test_top_level_image_urls_use_guarded_fetch(monkeypatch):
+    import io
+    from PIL import Image
+    import unsloth_zoo.vision_utils as vu
+
+    buf = io.BytesIO()
+    Image.new("RGB", (32, 32)).save(buf, format = "PNG")
+    fetched = []
+    def fake_fetch(url):
+        fetched.append(url)
+        return io.BytesIO(buf.getvalue())
+    monkeypatch.setattr(vu, "fetch_remote_media_bytes", fake_fetch)
+
+    collator = make_collator(None)
+    collator.processor = _ChatProcessor()
+    collator.assistant_single_content = False
+    collator([{"images": ["https://example.com/a.png"], "prompt": "<img> a", "completion": "x"}])
+    assert fetched == ["https://example.com/a.png"]
+    assert isinstance(collator.processor.seen_images[0][0][0], Image.Image)
