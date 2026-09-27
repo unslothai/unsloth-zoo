@@ -400,21 +400,91 @@ def patch_to_dict():
         setattr(PretrainedConfig, "to_dict", wrapped_to_dict)
 pass
 
-# Above this, a dtype cast is staged through host memory so the device copy can
-# be freed before the replacement is allocated. 1 GiB is well clear of any
-# projection or norm and catches the embedding tables that actually matter:
-# gemma-4 E4B's embed_tokens_per_layer is 5.25 GiB.
+# Above this, a dtype cast avoids `.to()`, which would hold the source and a full
+# destination on the device at once. 1 GiB is well clear of any projection or
+# norm and catches the embedding tables that matter: gemma-4 E4B's
+# embed_tokens_per_layer is 5.25 GiB.
 _FORCED_FLOAT32_STAGE_BYTES = 1 * 1024 ** 3
+# Largest temporary any path below allocates, on the device or the host.
+_FORCED_FLOAT32_CHUNK_BYTES = 64 * 1024 ** 2
 
 
-def _stage_cast_for_test(module, dtype):
-    """The same staged cast the forced-float32 pass uses, reachable by tests.
+def _storage_is_private(tensor):
+    """True only if nothing but `tensor` and the parameter holding it references
+    its storage, so rewriting the bytes in place cannot corrupt an alias that
+    would still read them as the old dtype. Unknown (older torch) is False."""
+    use_count = getattr(torch._C, "_storage_Use_Count", None)
+    if use_count is None:
+        return False
+    try:
+        probe = torch.nn.Parameter(torch.empty(1, dtype = tensor.dtype, device = tensor.device))
+        baseline = use_count(probe.untyped_storage()._cdata)
+        return use_count(tensor.untyped_storage()._cdata) <= baseline
+    except Exception:
+        return False
 
-    The pass builds its helper as a closure so it can see `setted_dtype`; this
-    mirrors it exactly for `tests/test_forced_float32_cast_peak.py`, which has to
-    measure allocator behaviour rather than read the code.
+
+def _cast_in_place_same_size(param, dtype):
+    """Rewrite a contiguous tensor to another dtype of the same element size, in
+    chunks, inside its own storage: no host copy and one chunk of extra memory.
+    Each chunk is fully read before it is overwritten, so values are exactly
+    those of `.to(dtype)`."""
+    src = param.data.view(-1)
+    dst = src.view(dtype)
+    step = max(1, _FORCED_FLOAT32_CHUNK_BYTES // src.element_size())
+    with torch.no_grad():
+        for start in range(0, src.numel(), step):
+            dst[start : start + step].copy_(src[start : start + step].to(dtype))
+    param.data = param.data.view(dtype)
+
+
+def _cast_via_host_chunked(param, dtype):
+    """Stage through host memory already in the target dtype, filled chunk by
+    chunk, so the host peak is the new tensor plus one chunk rather than an
+    extra full copy in the source dtype."""
+    device = param.device
+    src = param.data
+    staged = torch.empty(src.shape, dtype = dtype, device = "cpu")
+    flat_src, flat_dst = src.reshape(-1), staged.view(-1)
+    step = max(1, _FORCED_FLOAT32_CHUNK_BYTES // max(src.element_size(), staged.element_size()))
+    for start in range(0, flat_src.numel(), step):
+        flat_dst[start : start + step].copy_(flat_src[start : start + step])
+    del flat_src, src
+    # Drop the device copy before the replacement is allocated.
+    param.data = torch.empty(0, dtype = dtype, device = device)
+    param.data = staged.to(device, non_blocking = False)
+    del staged
+
+
+def _cast_large_param(param, dtype):
+    new_bytes = param.numel() * torch.empty(0, dtype = dtype).element_size()
+    if (
+        param.element_size() == torch.empty(0, dtype = dtype).element_size()
+        and param.data.is_contiguous()
+        and _storage_is_private(param)
+    ):
+        return _cast_in_place_same_size(param, dtype)
+    try:
+        free, _ = torch.cuda.mem_get_info(param.device)
+    except Exception:
+        free = 0
+    if free >= new_bytes + _FORCED_FLOAT32_CHUNK_BYTES:
+        param.data = param.data.to(dtype)
+        return
+    return _cast_via_host_chunked(param, dtype)
+
+
+def _bounded_cast_module(module, dtype):
+    """`module.to(dtype)` without a full extra copy of any parameter over
+    `_FORCED_FLOAT32_STAGE_BYTES`, on the device or on the host.
+
+    This pass runs after the device map has placed the weights, so the planner
+    cannot budget for `.to()` briefly doubling a multi-GiB embedding. Staging
+    the whole tensor through host memory instead moved that doubling into RAM:
+    `.to("cpu", dtype = ...)` holds a CPU copy in the source dtype and its
+    converted copy together, 10.5 GiB for gemma-4 E4B, which exceeds a Colab
+    T4 VM's 12.7 GiB and gets the kernel OOM-killed during loading.
     """
-    big = []
     for param in module.parameters(recurse = False):
         if (
             param.dtype.is_floating_point
@@ -422,17 +492,13 @@ def _stage_cast_for_test(module, dtype):
             and param.device.type == "cuda"
             and param.numel() * param.element_size() >= _FORCED_FLOAT32_STAGE_BYTES
         ):
-            big.append(param)
-    if not big:
-        module.to(dtype)
-        return
-    for param in big:
-        device = param.device
-        staged = param.data.to("cpu", dtype = dtype, copy = True)
-        param.data = torch.empty(0, dtype = dtype, device = device)
-        param.data = staged.to(device, non_blocking = False)
-        del staged
+            _cast_large_param(param, dtype)
+    # Anything left under the threshold, plus buffers.
     module.to(dtype)
+
+
+# Kept for tests/test_forced_float32_cast_peak.py.
+_stage_cast_for_test = _bounded_cast_module
 
 
 def _attach_tower_input_hooks(model):
@@ -496,45 +562,7 @@ def patch_model_and_tokenizer(
     if do_forced_float32:
         correct_dtype = torch.float16
 
-        def _cast_module(module, dtype):
-            """`module.to(dtype)` with the peak bounded for very large parameters.
-
-            `.to()` builds the destination while the source is still live, so a
-            single parameter momentarily costs twice its size. That is invisible
-            for a projection and fatal for an embedding table: gemma-4 E4B's
-            `embed_tokens_per_layer` is [262144, 10752], 5.25 GiB, and this pass
-            runs AFTER the device map has already placed the weights to its own
-            budget. On two T4s holding a student and a teacher that is the
-            difference between fitting and an OOM the planner cannot foresee.
-
-            Staging the conversion through host memory lets the device copy be
-            released before the new one is allocated, so the peak is
-            max(old, new) rather than old + new. Only parameters above the
-            threshold pay the host round trip; everything else takes the plain
-            path, which is the overwhelming majority of modules.
-            """
-            big = []
-            for param in module.parameters(recurse = False):
-                if (
-                    param.dtype.is_floating_point
-                    and param.dtype != dtype
-                    and param.device.type == "cuda"
-                    and param.numel() * param.element_size() >= _FORCED_FLOAT32_STAGE_BYTES
-                ):
-                    big.append(param)
-            if not big:
-                module.to(dtype)
-                return
-            for param in big:
-                device = param.device
-                staged = param.data.to("cpu", dtype = dtype, copy = True)
-                # Drop the device copy BEFORE the replacement is allocated. The
-                # empty tensor keeps `.data` a real tensor in between.
-                param.data = torch.empty(0, dtype = dtype, device = device)
-                param.data = staged.to(device, non_blocking = False)
-                del staged
-            # Anything left under the threshold, plus buffers.
-            module.to(dtype)
+        _cast_module = _bounded_cast_module
 
         for name, module in model.named_modules():
             if hasattr(module, "_pre_set_compute_dtype"):
