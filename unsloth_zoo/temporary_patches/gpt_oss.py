@@ -283,7 +283,6 @@ def swiglu_torch_backward(pre_act, alpha, limit, g1):
     return g1 * grad.to(g1.dtype)
 pass
 
-# E2M1 code points by nibble.
 _MXFP4_E2M1_VALUES = (
     +0.0, +0.5, +1.0, +1.5, +2.0, +3.0, +4.0, +6.0,
     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
@@ -2116,7 +2115,6 @@ def moe_forward_inference_bf16(self, hidden_states):
         is_mxfp4_expert_param(gate_up_proj) and is_mxfp4_expert_param(down_proj)
         and _mxfp4_fused_decode_enabled(gate_up_proj, hidden_states.dtype)
     ):
-        # Routed experts only, read straight from the packed stacks: no 1.6 GB decode slots, no dense bmm.
         gu_blocks, gu_scales, gu_trans = _mxfp4_static_operands(gate_up_proj, moe, "gate_up")
         dn_blocks, dn_scales, dn_trans = _mxfp4_static_operands(down_proj, moe, "down")
         return _moe_forward_inference_mxfp4_kernel(

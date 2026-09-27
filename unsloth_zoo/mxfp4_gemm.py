@@ -66,9 +66,6 @@ if _HAS_TRITON:
 
     @triton.jit
     def _decode_mxfp4_tile_asm(packed, scale):
-        # packed (R, C // 2) uint8, scale (R, C // 32) uint8 -> (R, C) bf16, bit-identical to mxfp4_dequant.
-        # Each nibble becomes bf16 bits sign << 15 | e2m1 << 6 (= value * 2^-126, subnormal for e = 0), then two
-        # exact bf16x2 fmas by 2^(min(s, 128) - 1) and 2^(max(s, 128) - 128): every e8m0 incl. 255 = 2^128.
         R: tl.constexpr = packed.shape[0]
         CB: tl.constexpr = packed.shape[1]
         CG: tl.constexpr = scale.shape[1]
@@ -157,7 +154,6 @@ if _HAS_TRITON:
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
         if GROUPED:
-            # Tile pid_m -> (expert, tile within expert); tiles are laid out expert after expert.
             e_offs = tl.arange(0, E_POW2)
             counts = tl.load(counts_ptr + e_offs, mask = e_offs < E, other = 0)
             tiles = (counts + BLOCK_M - 1) // BLOCK_M
@@ -275,7 +271,6 @@ if _HAS_TRITON:
 
     @triton.jit
     def _decode_only_kernel(blocks_ptr, scales_ptr, out_ptr, RG, ROWS: tl.constexpr, COLS: tl.constexpr):
-        # Test hook: decode (rows, G) groups with the GEMM's decode, row-major (E * R, C) output.
         pid = tl.program_id(0)
         rows = pid * ROWS + tl.arange(0, ROWS)
         cols_b = tl.program_id(1) * (COLS // 2) + tl.arange(0, COLS // 2)
@@ -384,7 +379,6 @@ def _launch(x, blocks, scales, counts, out, transpose_b, config, launcher, bias 
     if split and transpose_b:
         x = _split_permute(x, BK)
     # Plain ints: triton.cdiv / next_power_of_2 cost microseconds per call on the decode path.
-    # Each non-empty expert adds at most one partial tile; programs past the last tile exit at once.
     grid = (-(-M // BM) + (torch.sym_min(E, M) if grouped else 0), -(-N // BN))
     launcher(_mxfp4_grouped_mm_kernel)[grid](
         x, blocks, scales, out, x if counts is None else counts, x if bias is None else bias,
@@ -542,7 +536,6 @@ def mxfp4_matmul(x, blocks, scales, trans = False, out = None, bias = None):
     if bias is not None:
         bias = bias.to(device = x.device).contiguous()
     if M > 0:
-        # Decode-sized calls are CPU bound: switch devices only when needed.
         index = x.device.index
         prior = torch.cuda.current_device()
         switch = index is not None and index != prior

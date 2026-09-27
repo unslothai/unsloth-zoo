@@ -77,7 +77,6 @@ def _fresh_probe_cache():
     gpt_oss._CONVERT_TRANSPOSES.clear()
 
 
-# (E, out, in): gate_up-like, square down-like, wide.
 SHAPES = [(2, 128, 64), (3, 64, 64), (2, 32, 96)]
 
 

@@ -862,7 +862,6 @@ def _mxfp4_base_grouped_mm(inputs, offsets, counts, weight_provider, recompute, 
         from unsloth_zoo.mxfp4_gemm import mxfp4_expert_grouped_mm
         return mxfp4_expert_grouped_mm(inputs, param.data, scales, counts, transpose_b = transpose_b)
     if recompute and os.environ.get("UNSLOTH_MXFP4_FUSED_GEMM") != "0":
-        # W^T straight from the decode, not transpose().contiguous() of a second dense stack.
         weight_provider.transposed = lambda: param.dequantize(
             inputs.dtype, token_counts = counts, transpose = not transpose_b,
         )

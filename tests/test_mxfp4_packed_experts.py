@@ -69,7 +69,6 @@ def test_torch_reference_matches_transformers():
 @pytest.mark.parametrize("transpose", [False, True])
 @pytest.mark.parametrize("chunk_bytes", [1, 5 * 64 * 16 * 8, 1 << 30])
 def test_torch_fallback_chunks_are_bit_identical(monkeypatch, transpose, chunk_bytes):
-    # Chunk sizes incl. one not dividing N (cut at an expert edge) all match the unchunked result.
     monkeypatch.setattr(mxd, "_TORCH_CHUNK_BYTES", chunk_bytes)
     blocks, scales = _random_mxfp4(3, 7, 64, low = 0, high = 255)
     want = _reference(blocks, scales)
