@@ -2022,7 +2022,6 @@ class UnslothVisionDataCollator:
             else:
                 c_txt = str(c)
 
-            # Images: prefer embedded; else first top-level image; else []
             imgs, vids, vids_kwarg = self._extract_images_for_pc(ex, p if is_p_msgs else None, c if is_c_msgs else None)
             imgs = self._resize_images_inplace(imgs)
 
