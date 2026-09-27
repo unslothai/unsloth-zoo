@@ -398,6 +398,20 @@
       "reason": "Installs a patched method compiled from an AST this file built from transformers source."
     },
     {
+      "file": "unsloth_zoo/temporary_patches/granitemoehybrid.py",
+      "sink": "compile",
+      "digest": "616eaf6a8e66264d",
+      "count": 1,
+      "reason": "Source is inspect.getsource of the installed transformers GraniteMoeHybridDecoderLayer.forward with three fixed regex substitutions; nothing user supplied reaches it."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/granitemoehybrid.py",
+      "sink": "exec",
+      "digest": "d0fa98df3b0d9137",
+      "count": 1,
+      "reason": "Source is inspect.getsource of the installed transformers GraniteMoeHybridDecoderLayer.forward with three fixed regex substitutions; nothing user supplied reaches it."
+    },
+    {
       "file": "unsloth_zoo/temporary_patches/misc.py",
       "sink": "exec",
       "digest": "4fa12b50b62060cd",
