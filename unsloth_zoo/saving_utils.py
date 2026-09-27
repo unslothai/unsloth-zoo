@@ -1611,9 +1611,7 @@ def _merge_moe_gate_or_up_expert(W, lora_stats, expert_idx, num_experts, output_
             num_experts = num_experts, out_dim = 2 * I, in_dim = H,
             lora_module = getattr(lora_stats, "module", None),
         )
-        # Ungated experts (NemotronH: experts.up_proj of I rows, no gate) carry an up LoRA
-        # whose output is I, not a fused 2 * I. Only tried after the fused check fails, and
-        # a fused LoRA can never match out_dim = I, so gated models are unaffected.
+        # Ungated experts (NemotronH) have an I-wide up LoRA; a fused 2 * I LoRA never matches this, so gated models are unaffected.
         ungated = False
         if layout == "unknown" and role == "up":
             ungated_layout, ungated_r = _detect_moe_lora_layout(
