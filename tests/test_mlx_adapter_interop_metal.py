@@ -21,7 +21,7 @@ from unsloth_zoo.mlx.utils import (
     detect_adapter_format,
     normalize_peft_adapter_config,
 )
-from unsloth_zoo.saving_utils import (
+from unsloth_zoo.mlx.peft_interop import (
     MLX_WEIGHTS_FILE,
     PEFT_WEIGHTS_FILE,
     convert_mlx_dir_to_peft,
@@ -200,7 +200,7 @@ def test_tied_output_head_snapshot_folds_or_refuses(tmp_path, tied_base_dir):
 
     # export_peft_adapter's own refusal: a modules_to_save snapshot of a tied
     # embedding has no untied PEFT form.
-    from unsloth_zoo.saving_utils import export_peft_adapter
+    from unsloth_zoo.mlx.peft_interop import export_peft_adapter
     ok_cfg = os.path.join(tmp_path, "ok", "adapter_config.json")
     _c = json.load(open(ok_cfg))
     _c["full_state_modules"] = {"model.embed_tokens": "modules_to_save"}
@@ -464,7 +464,7 @@ def test_converter_entries_reject_ambiguous_and_subclassed(tmp_path, base_dir):
 
 def test_helpers_import_without_torch(tmp_path):
     """Default Apple installs exclude torch: detection/validation and the
-    saving_utils module itself must import and run with torch blocked."""
+    peft_interop module itself must import and run with torch blocked."""
     import subprocess, sys, textwrap
     script = textwrap.dedent("""
         import importlib.abc, sys
@@ -474,7 +474,7 @@ def test_helpers_import_without_torch(tmp_path):
                 if name.split(".")[0] in self.BLOCKED:
                     raise ModuleNotFoundError("blocked: " + name)
         sys.meta_path.insert(0, _Block())
-        import unsloth_zoo.saving_utils as s
+        import unsloth_zoo.mlx.peft_interop as s
         cfg = {"peft_type": "LORA", "r": 8, "lora_alpha": 16}
         assert s.normalize_peft_adapter_config(cfg)["_unsloth_peft_import"]
         import unsloth_zoo.mlx.utils as mu
@@ -916,7 +916,7 @@ def test_grouping_admits_only_hugging_face_embedding_and_head_paths(path, accept
     ask and the directory it writes is loadable by stock mlx-lm, so the path is
     all this layer has; a leaf shared with a per-layer module is told apart by
     the numbered segment such a path always carries."""
-    from unsloth_zoo.saving_utils import group_peft_lora_pairs
+    from unsloth_zoo.mlx.peft_interop import group_peft_lora_pairs
     lora = "base_model.model.model.layers.0.self_attn.q_proj"
     _, full_state, rejected = group_peft_lora_pairs({
         f"{lora}.lora_A.weight": mx.zeros((8, HIDDEN)),
@@ -945,7 +945,7 @@ def _peft_task_type(name):
 def test_import_refuses_non_causal_task(cfg_extra, refused):
     # The backend serves causal LMs, so a differently-tasked adapter would
     # bind its backbone factors and answer with vocabulary logits.
-    from unsloth_zoo.saving_utils import normalize_peft_adapter_config
+    from unsloth_zoo.mlx.peft_interop import normalize_peft_adapter_config
     cfg = {"peft_type": "LORA", "r": 4, "lora_alpha": 8,
            "target_modules": ["q_proj"], **cfg_extra}
     if refused:
@@ -960,7 +960,7 @@ def test_import_accepts_a_live_peft_config():
     # "PeftType.LORA", so comparing it would refuse an ordinary causal adapter.
     # The task_type enum spelling is covered by the case above.
     import peft
-    from unsloth_zoo.saving_utils import normalize_peft_adapter_config
+    from unsloth_zoo.mlx.peft_interop import normalize_peft_adapter_config
     cfg = peft.LoraConfig(
         task_type="CAUSAL_LM", r=4, lora_alpha=8, target_modules=["q_proj"],
     ).to_dict()

@@ -15,10 +15,20 @@ gpu_available = (
 
 
 def _loop_reference(merged, lora_A, lora_B, num_experts, rank, alpha, use_transpose):
+    """The per-expert loop, written against PEFT's packing rather than against the code.
+
+    PEFT stores a fused expert LoRA as two ordinary Linear weights that are NOT flattened the
+    same way: `lora_A` is `(num_experts * rank, in)` expert-slowest, so expert `e` owns the
+    contiguous row block `e*rank : (e+1)*rank`; `lora_B` is `(out, num_experts * rank)`
+    expert-FASTEST, `reshape(out, rank, num_experts)` (ParamWrapper.get_delta_factors), so
+    expert `e` owns plane `e` of that reshape, i.e. columns `e::num_experts`. Spelled out here
+    instead of calling `unflatten_moe_lora_b` / `moe_lora_b_expert_columns` so this stays an
+    independent statement of what both the loop and the batched path have to compute.
+    """
     out = merged.clone()
     for e in range(num_experts):
-        s, t = e * rank, (e + 1) * rank
-        delta = lora_B[:, s:t] @ lora_A[s:t, :]
+        b_e = lora_B.reshape(lora_B.shape[0], rank, num_experts)[:, :, e]
+        delta = b_e @ lora_A[e * rank:(e + 1) * rank, :]
         out[e] = out[e].add(delta.T if use_transpose else delta, alpha=alpha)
     return out
 

@@ -51,12 +51,20 @@ jobs:
       UNSLOTH_COMPILE_DISABLE: '1'
       PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION: python
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.11"
-          cache: pip
+
+      # This file is its own key-file: the deps are named on the install line
+      # below and nowhere else. Small entry, so rolling it on any edit is cheap.
+      - id: pip-cache
+        uses: ./.github/actions/pip-cache-restore
+        with:
+          name: studio-export-fix
+          key-files: |
+            .github/workflows/studio-export-fix-ci.yml
 
       - name: Install minimal test deps
         run: |
@@ -64,6 +72,12 @@ jobs:
           # Pure-Python tests: monkeypatch subprocess + AST-parse upstream files.
           # No torch / transformers needed. Keep slim so Windows cold start stays under a minute.
           python -m pip install pytest psutil requests tqdm
+
+      - uses: ./.github/actions/pip-cache-save
+        with:
+          dir: ${{ steps.pip-cache.outputs.dir }}
+          key: ${{ steps.pip-cache.outputs.key }}
+          cache-hit: ${{ steps.pip-cache.outputs.cache-hit }}
 
       - name: Run patcher + q2_k_l unit tests
         shell: bash

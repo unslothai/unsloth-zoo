@@ -97,7 +97,6 @@ def test_inserts_missing_qwen35_aliases(tmp_path):
     # Names already covered by qwen3next entries are not duplicated.
     for shared in ("conv1d", "dt_proj", "A_log", "norm", "out_proj"):
         assert result.count(f'"model.layers.{{bid}}.linear_attn.{shared}"') == 1
-    # Patched file stays valid Python.
     ast.parse(result)
 
 
@@ -112,7 +111,6 @@ def test_idempotent_and_no_op_when_current(tmp_path):
 
 
 def test_partial_patch_completes_missing_entries(tmp_path):
-    # A file already holding one qwen3.5 alias still receives the rest.
     partial = STALE_TENSOR_MAPPING.replace(
         '            "model.layers.{bid}.self_attn.b_proj",       # Kimi Linear\n',
         '            "model.layers.{bid}.linear_attn.in_proj_b",  # qwen3.5\n'

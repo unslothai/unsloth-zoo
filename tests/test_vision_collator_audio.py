@@ -91,10 +91,6 @@ def msgs(part):
 CLIP = np.zeros(16, dtype=np.float32)
 
 
-# ---------------------------------------------------------------------------
-# extract_audio_info
-# ---------------------------------------------------------------------------
-
 def test_inline_array():
     out = extract_audio_info(msgs({"type": "audio", "audio": CLIP}))
     assert len(out) == 1 and out[0] is CLIP
@@ -127,10 +123,6 @@ def test_non_audio_parts_ignored():
     out = extract_audio_info(msgs({"type": "image", "image": "x.png"}))
     assert out == []
 
-
-# ---------------------------------------------------------------------------
-# _extract_audio_for_example
-# ---------------------------------------------------------------------------
 
 def test_top_level_dict_unwrapped():
     collator = make_collator()
@@ -251,10 +243,6 @@ def test_inline_audio_decode_false_dict_resolved():
     assert out == ["/tmp/a.wav"]
 
 
-# ---------------------------------------------------------------------------
-# _fix_audio_feature_extractor_padding_side
-# ---------------------------------------------------------------------------
-
 def test_left_padded_feature_extractor_reset_to_right():
     proc = _FakeProcessor()
     proc.feature_extractor.padding_side = "left"
@@ -281,10 +269,6 @@ def test_feature_extractor_without_padding_side_noop():
     assert not hasattr(proc.feature_extractor, "padding_side")
 
 
-# ---------------------------------------------------------------------------
-# _truncate_sequence_tensors
-# ---------------------------------------------------------------------------
-
 def _batch_left_padded():
     # seq_len 6, max_seq_length 4. Row 0 is short (2 left pads + 2 audio + 2
     # text tokens), row 1 is full length. input_features last dim deliberately
@@ -307,7 +291,6 @@ def test_truncation_left_padding_keeps_short_row_content():
     # Short row keeps its content (audio span intact), not its padding
     assert batch["input_ids"][0].tolist() == [AUDIO_ID, AUDIO_ID, 5, 6]
     assert batch["attention_mask"][0].tolist() == [1, 1, 1, 1]
-    # Long row truncates its tail
     assert batch["input_ids"][1].tolist() == [1, 2, 3, 4]
     assert batch["attention_mask"].shape == (2, 4)
     assert batch["mm_token_type_ids"].shape == (2, 4)
@@ -340,7 +323,6 @@ def test_truncation_cutting_audio_span_raises():
         collator._truncate_sequence_tensors(batch, seq_len=6)
 
 
-# ---------------------------------------------------------------------------
 # datasets >= 4 torchcodec AudioDecoder columns (unsloth/unsloth#7226)
 #
 # patch_torchcodec_audio_decoder grafts the mapping protocol onto AudioDecoder
@@ -348,7 +330,6 @@ def test_truncation_cutting_audio_span_raises():
 # it, dropped it into the raw-waveform catch-all and blew up inside np.fft.rfft.
 # _FakeAudioDecoder mirrors the patched surface and runs in CI; the real-decoder
 # tests below need datasets >= 4 + torchcodec and skip otherwise.
-# ---------------------------------------------------------------------------
 
 DECODED = np.linspace(-0.5, 0.5, 32, dtype=np.float32)
 
@@ -432,8 +413,6 @@ def test_non_mapping_audio_values_are_not_treated_as_mappings(value):
     assert not _is_audio_mapping(value)
 
 
-# --- the real decoder, when the optional deps are installed ----------------
-
 def _real_decoder():
     datasets = pytest.importorskip("datasets", minversion="4.0.0")
     pytest.importorskip("torchcodec")
@@ -479,7 +458,6 @@ def test_real_decoder_decodes_to_float32_at_every_gate(gate):
     assert clips[0].ndim == 1
 
 
-# ---------------------------------------------------------------------------
 # Unpatched torchcodec AudioDecoder (unsloth/unsloth#7226, follow-up)
 #
 # Driving the collator without importing `unsloth` skips
@@ -489,7 +467,6 @@ def test_real_decoder_decodes_to_float32_at_every_gate(gate):
 # In CI (no torchcodec) a fake stands in as the decoder type via _audio_decoder_types;
 # the real-decoder variant runs in a fresh subprocess since the patch mutates the
 # class process-wide.
-# ---------------------------------------------------------------------------
 
 
 class _UnpatchedFakeAudioDecoder:
@@ -506,7 +483,6 @@ class _UnpatchedFakeAudioDecoder:
 
 @pytest.fixture
 def _recognize_unpatched_decoder(monkeypatch):
-    # Treat _UnpatchedFakeAudioDecoder as the decoder type so these run in CI.
     # Patch the imported module object directly rather than the
     # "unsloth_zoo.vision_utils._audio_decoder_types" string path: the string
     # form resolves unsloth_zoo through sys.modules at runtime, so a preceding
@@ -540,7 +516,6 @@ def test_unpatched_decoder_top_level_gate(_recognize_unpatched_decoder):
 
 
 def test_unpatched_decoder_list_gate(_recognize_unpatched_decoder):
-    # A list of decoders is a list of clips.
     collator = make_collator()
     clips = collator._extract_audio_for_example(
         {"audio": [_UnpatchedFakeAudioDecoder(), _UnpatchedFakeAudioDecoder()]},
