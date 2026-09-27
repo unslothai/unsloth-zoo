@@ -253,6 +253,53 @@ def function_has_tensor_inputs(source: str) -> bool:
 pass
 
 
+_INIT_ONLY_CALLERS = frozenset(("__init__", "__post_init__", "_init_weights", "post_init"))
+
+
+def function_only_called_at_init(module_source: str, name: str) -> bool:
+    """True when every call to ``name`` in ``module_source`` sits in an ``__init__``-time
+    method, directly or through other module-level helpers that are themselves only
+    called there. Such helpers build constructor buffers (Qwen4Exp's
+    ``_build_layer_multipliers`` makes a LongTensor from Python ints), often on the meta
+    device, so compiling them only fails at load. Unparseable source answers False."""
+    try:
+        tree = ast.parse(textwrap.dedent(module_source))
+    except Exception:
+        return False
+    # caller function name -> names it calls (methods keyed by their own name)
+    callers_of = {}
+    def visit(node, owner):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                visit(child, child.name if owner is None or isinstance(node, ast.ClassDef) else owner)
+                continue
+            if isinstance(child, ast.Call):
+                func = child.func
+                called = func.id if isinstance(func, ast.Name) else None
+                if called is not None:
+                    callers_of.setdefault(called, set()).add(owner)
+            visit(child, owner)
+    visit(tree, None)
+    seen = set()
+    def init_only(fn):
+        if fn in seen:
+            return True
+        seen.add(fn)
+        owners = callers_of.get(fn)
+        if not owners:
+            return False
+        for owner in owners:
+            if owner is None:
+                return False  # called at module import time or from a class body
+            if owner in _INIT_ONLY_CALLERS:
+                continue
+            if not init_only(owner):
+                return False
+        return True
+    return init_only(name)
+pass
+
+
 def calls_mask_creation_function(source):
     """`transformers.masking_utils` `create*` factories that `source` CALLS.
 
@@ -6606,6 +6653,9 @@ def unsloth_compile_transformers(
                 if not function_has_tensor_inputs(source):
                     bad = True
                     bad_reason = "it takes no tensor inputs"
+                elif function_only_called_at_init(full_source, module):
+                    bad = True
+                    bad_reason = "it is only called while constructing modules"
             pass
             if not bad:
                 # Functions defined inside an if/else come back indented
