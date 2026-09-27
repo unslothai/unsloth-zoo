@@ -132,6 +132,7 @@ def run(arch):
     if importlib.util.find_spec(f"transformers.models.{model_type}") is None:
         out["error"] = f"UNAVAILABLE: transformers has no {model_type}"
         return out
+    torch.manual_seed(0)  # per run, so a result never depends on which archs ran before it
     try:
         model = builder().to(torch.bfloat16)  # build errors on an installed arch are drift: fail
         if MODE == "t4" and forced:

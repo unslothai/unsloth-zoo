@@ -203,10 +203,10 @@ _L2NORM_FP32_MARK = "_unsloth_fp32_l2norm"
 
 
 def _fp32_l2norm(x, dim = -1, eps = 1e-6):
-    """``l2norm`` with the reduction in float32, result in the input dtype: what fla's kernel does."""
+    """``l2norm`` with the reduction in at least float32, result in the input dtype: what fla's kernel does."""
     import torch
 
-    xf = x.float()
+    xf = x.float() if x.dtype in (torch.float16, torch.bfloat16) else x
     inv_norm = torch.rsqrt((xf * xf).sum(dim = dim, keepdim = True) + eps)
     return (xf * inv_norm).to(x.dtype)
 

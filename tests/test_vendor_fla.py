@@ -1396,6 +1396,17 @@ def test_rdna1_later_kernel_hub_decorations_never_resolve_fla(monkeypatch):
     assert hub_kernels.use_kernel_func_from_hub_with_fallback.__wrapped__ is original
 
 
+def test_fp32_l2norm_keeps_float64_precision():
+    torch = pytest.importorskip("torch")
+    from unsloth_zoo.temporary_patches.fla_vendor import _fp32_l2norm
+
+    x = torch.randn(4, 8, dtype = torch.float64) * 1e-3
+    ref = x * torch.rsqrt((x * x).sum(-1, keepdim = True) + 1e-6)
+    out = _fp32_l2norm(x)
+    assert out.dtype == torch.float64
+    assert torch.equal(out, ref)
+
+
 def test_every_host_gets_the_float32_l2norm_not_only_rdna1(monkeypatch):
     """A CPU-only or no-Triton host takes the pure-torch gated delta too. On transformers 5.5
     its l2norm runs in float16 there, and the T4 path's Qwen3.5 and Qwen3.6 grads came back
