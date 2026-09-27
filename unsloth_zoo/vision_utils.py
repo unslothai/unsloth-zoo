@@ -1956,14 +1956,21 @@ class UnslothVisionDataCollator:
         _, L = input_ids.shape
         if L <= max_len:
             return [input_ids, attention_mask, completion_mask] + ([token_type_ids] if token_type_ids is not None else [])
-        sl = slice(-max_len, None) if side == "left" else slice(0, max_len)
+        if side == "left":
+            # Keep each row's first max_len tokens like the right side does; a plain
+            # [-max_len:] cut the start of the prompt (and its image tokens) instead.
+            starts = L - attention_mask.sum(-1).clamp(min=max_len)
+            idx = starts.unsqueeze(1) + torch.arange(max_len, device=input_ids.device)
+            take = lambda t: torch.gather(t, 1, idx)
+        else:
+            take = lambda t: t[:, :max_len]
 
-        input_ids       = input_ids[:, sl]
-        attention_mask  = attention_mask[:, sl]
-        completion_mask = completion_mask[:, sl]
+        input_ids       = take(input_ids)
+        attention_mask  = take(attention_mask)
+        completion_mask = take(completion_mask)
 
         if token_type_ids is not None:
-            token_type_ids = token_type_ids[:, sl]
+            token_type_ids = take(token_type_ids)
         return [input_ids, attention_mask, completion_mask] + ([token_type_ids] if token_type_ids is not None else [])
 
     def _pad_to_multiple(self, input_ids, attention_mask, completion_mask, side, pad_id, multiple, token_type_ids=None, token_type_pad_id=0):

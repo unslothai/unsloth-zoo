@@ -122,6 +122,24 @@ def test_mm_token_type_ids_truncation_stays_aligned():
     assert torch.equal(mm, (out["input_ids"] == IMG_ID).long())
 
 
+@pytest.mark.parametrize("padding_side", ["left", "right"])
+def test_truncation_keeps_the_prompt_start_on_either_padding_side(padding_side):
+    # TRL keeps input_ids[:, :max_length]; a left-padded tokenizer must not drop
+    # the prompt's image token instead of the completion's tail.
+    collator = make_collator("mm_token_type_ids", max_seq_length=4)
+    collator.processor.tokenizer.padding_side = padding_side
+    out = collator([
+        {"prompt": "a", "completion": "x"},
+        {"prompt": "<img> a", "completion": "x y z"},
+    ])
+    rows = [
+        [t for t, m in zip(ids, mask) if m]
+        for ids, mask in zip(out["input_ids"].tolist(), out["attention_mask"].tolist())
+    ]
+    assert rows == [[1, 3], [IMG_ID, 1, 3, 4]]
+    assert torch.equal(out["mm_token_type_ids"], (out["input_ids"] == IMG_ID).long())
+
+
 def test_no_type_ids_emitted_is_a_noop():
     out = make_collator(None)(EXAMPLES)
     assert "token_type_ids" not in out and "mm_token_type_ids" not in out
