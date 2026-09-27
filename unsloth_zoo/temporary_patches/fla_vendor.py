@@ -929,6 +929,12 @@ def patch_vendor_fla(phase=None):
     try:
         return _patch_vendor_fla(phase)
     finally:
+        # Any host can land on the pure-torch path (CPU, no Triton, opt-outs); fla never calls it.
+        try:
+            _patch_l2norm_fp32_on_torch_path()
+        except Exception as e:
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.warning(f"Unsloth: could not patch the pure-torch gated-delta l2norm: {e}")
         if _gpu_lacks_dot_instructions():
             # RDNA1: never make fla reachable; force the torch fallback, no alias/repair.
             try:
