@@ -430,6 +430,20 @@ def test_peft_import_honors_quantized_base_request(tmp_path, base_dir):
     np.testing.assert_allclose(_mlx_logits(m2), _mlx_logits(model), atol=2e-3)
 
 
+def test_native_save_over_stale_peft_file_loads_as_mlx(tmp_path, base_dir):
+    import shutil
+    from unsloth_zoo.mlx.loader import FastMLXModel
+    from unsloth_zoo.mlx.utils import save_lora_adapters
+    peft_dir = str(tmp_path / "peft")
+    _make_peft_adapter(base_dir, peft_dir)
+    model, _ = FastMLXModel.from_pretrained(peft_dir, load_in_4bit=False, max_seq_length=64)
+    saved = str(tmp_path / "lora_model")
+    save_lora_adapters(model, saved)
+    shutil.copy(os.path.join(peft_dir, PEFT_WEIGHTS_FILE), saved)
+    m2, _ = FastMLXModel.from_pretrained(saved, load_in_4bit=False, max_seq_length=64)
+    np.testing.assert_allclose(_mlx_logits(m2), _mlx_logits(model), atol=2e-3)
+
+
 def test_converter_entries_reject_ambiguous_and_subclassed(tmp_path, base_dir):
     peft_dir = str(tmp_path / "peft")
     _, cfg = _make_peft_adapter(base_dir, peft_dir)
