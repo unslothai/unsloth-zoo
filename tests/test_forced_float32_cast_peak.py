@@ -221,11 +221,11 @@ def _rss_anon():
     return None
 
 
+_CAN_MEASURE_HOST = os.path.exists("/proc/self/status") and hasattr(torch._C, "_storage_Use_Count")
+
+
 @cuda
-@pytest.mark.skipif(
-    not os.path.exists("/proc/self/status") or not hasattr(torch._C, "_storage_Use_Count"),
-    reason = "needs /proc RSS accounting and in-place casting",
-)
+@pytest.mark.skipif(not _CAN_MEASURE_HOST, reason = "needs /proc RSS accounting and in-place casting")
 def test_a_large_cast_does_not_stage_through_host_memory():
     """Guards the gemma-4 E4B load being OOM-killed on a Colab T4 VM."""
     import threading, time
