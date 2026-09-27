@@ -603,11 +603,12 @@ pass
 
 
 def _bind_transformers_checkpoint(shim):
-    # Remember what transformers had, which need not be torch's function (a caller may have
-    # installed its own wrapper), so the unpatch can put exactly that back.
+    # Remember the binding transformers had immediately before, which need not be torch's
+    # function (a caller's own wrapper) and may be another Unsloth shim when patches stack.
+    # One slot, like torch.utils.checkpoint._old_checkpoint, so the two stay in step on unpatch.
     import transformers.modeling_utils
     current = getattr(transformers.modeling_utils, "checkpoint", None)
-    if getattr(current, "__name__", "") not in _UNSLOTH_CKPT_SHIM_NAMES:
+    if current is not shim:
         transformers.modeling_utils._unsloth_old_checkpoint = current
     transformers.modeling_utils.checkpoint = shim
 pass
@@ -620,7 +621,7 @@ def _restore_transformers_checkpoint(shim):
     # one that allocates pinned host buffers.
     import transformers.modeling_utils
     if getattr(transformers.modeling_utils, "checkpoint", None) is not shim: return
-    previous = getattr(transformers.modeling_utils, "_unsloth_old_checkpoint", None)
+    previous = transformers.modeling_utils.__dict__.pop("_unsloth_old_checkpoint", None)
     transformers.modeling_utils.checkpoint = (
         previous if previous is not None else torch.utils.checkpoint.checkpoint
     )

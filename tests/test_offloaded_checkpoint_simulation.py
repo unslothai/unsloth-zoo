@@ -404,6 +404,20 @@ def test_unpatch_puts_back_a_wrapper_transformers_already_had(
     assert transformers.modeling_utils.checkpoint is callers_wrapper
 
 
+def test_popping_a_stacked_patch_keeps_torch_and_transformers_in_step(restore_checkpoint_patches):
+    """Offloaded then plain: unpatching the plain one puts torch back on the offloaded shim via
+    _old_checkpoint, so transformers has to land on the same shim, not on the original."""
+    import transformers.modeling_utils
+    from unsloth_zoo import gradient_checkpointing as module
+
+    module.patch_unsloth_gradient_checkpointing()
+    module.patch_gradient_checkpointing()
+    assert transformers.modeling_utils.checkpoint is module.unsloth_gradient_checkpoint
+    module.unpatch_gradient_checkpointing()
+    assert torch.utils.checkpoint.checkpoint is module.unsloth_offloaded_gradient_checkpoint
+    assert transformers.modeling_utils.checkpoint is torch.utils.checkpoint.checkpoint
+
+
 def test_pristine_checkpoint_is_still_recoverable_after_patching(restore_checkpoint_patches):
     """How the Gemma-4 KV-sharing fix escapes the shim to force use_reentrant=False."""
     from unsloth_zoo import gradient_checkpointing as module
