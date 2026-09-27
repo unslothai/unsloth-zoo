@@ -167,8 +167,6 @@ def test_train_on_responses_only_pc_path_raises_when_nothing_is_trained():
 
 
 class _ChatProcessor(_FakeProcessor):
-    """Renders `{"type": "image"}` as <img>, and records the images it is handed."""
-
     def __init__(self):
         super().__init__(None)
         self.seen_images = []
@@ -204,7 +202,6 @@ def test_top_level_images_reach_processor(prompt):
 
 
 def test_top_level_image_urls_use_guarded_fetch(monkeypatch):
-    # A URL in the images column must be fetched by Unsloth's guarded loader, never handed to the processor.
     import io
     from PIL import Image
     import unsloth_zoo.vision_utils as vu
