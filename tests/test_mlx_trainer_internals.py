@@ -1270,9 +1270,7 @@ def test_decoupled_optimizers_use_hf_parity_manual_decay(optim_name):
 
 
 def test_adafactor_applies_hf_weight_decay():
-    """HF Trainer gives Adafactor weight_decay through its param groups and
-    Adafactor applies p -= wd * lr * p, skipping bias and norms. Built with
-    optim="adafactor", one decay step must shrink a weight by exactly that."""
+    """HF Adafactor decays p -= wd * lr * p via param groups, skipping bias and norms."""
     import mlx.core as mx
     from mlx.utils import tree_flatten
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig

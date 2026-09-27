@@ -3811,11 +3811,9 @@ class MLXTrainer:
     def _apply_manual_weight_decay(self, model, optimizer, grad):
         """Decoupled HF-parity decay on trainable non-bias/non-norm leaves.
 
-        Active for AdamW, Adafactor, Muon, and Lion. The underlying MLX optimizer is
-        constructed with ``weight_decay=0.0`` so this helper owns the full
-        update for the weight-decay term and matches what HF Trainer does
-        via ``param_groups``. SGD uses coupled decay instead (see
-        ``_apply_coupled_weight_decay``).
+        AdamW, Adafactor, Muon and Lion are built with ``weight_decay=0.0`` so
+        this owns the decay term, as HF does via ``param_groups``. SGD uses
+        coupled decay instead (``_apply_coupled_weight_decay``).
         """
         wd = float(getattr(self, "_manual_weight_decay", 0.0) or 0.0)
         if wd <= 0:
