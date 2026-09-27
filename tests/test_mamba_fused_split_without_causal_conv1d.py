@@ -59,20 +59,31 @@ def mamba_split_conv1d_scan_combined(*args, **kwargs):
     return causal_conv1d_fwd_function(*args)
 '''
 
+# mamba_ssm <= 2.2.x with causal_conv1d < 1.5 (no cpp_functions)
+STUB_SSD_LEGACY = '''
+try:
+    from causal_conv1d import causal_conv1d_fn
+    import causal_conv1d_cuda
+except ImportError:
+    causal_conv1d_fn, causal_conv1d_cuda = None, None
+def mamba_split_conv1d_scan_combined(*args, **kwargs):
+    return causal_conv1d_cuda.causal_conv1d_fwd(*args)
+'''
+
 STUB_CONV = {
     "__init__.py": "causal_conv1d_fn = lambda *a, **k: None\ncausal_conv1d_update = None\n",
     "cpp_functions.py": "def causal_conv1d_fwd_function(*a, **k):\n    raise RuntimeError('FUSED_KERNEL_CALLED')\n",
 }
 
 WORKER = r'''
-import ast, functools, importlib, json, logging, sys
+import ast, functools, importlib, json, logging, os, sys
 case, misc = sys.argv[1], sys.argv[2]
-if case != "conv_ok":
+if not case.endswith("conv_ok"):
     sys.modules["causal_conv1d"] = None
 import torch
 
 src = open(misc, encoding = "utf-8").read()
-ns = {"torch": torch, "importlib": importlib, "functools": functools,
+ns = {"torch": torch, "importlib": importlib, "functools": functools, "os": os,
       "logger": logging.getLogger("t")}
 wanted = ("_mamba_fused_split_needs_causal_conv1d_unusable",
           "patch_mamba_fused_split_without_causal_conv1d")
@@ -81,7 +92,7 @@ for node in ast.parse(src).body:
         exec(ast.get_source_segment(src, node), ns)
 patch = ns.get("patch_mamba_fused_split_without_causal_conv1d")
 
-if case in ("patch_first", "conv_ok"):
+if case in ("patch_first", "conv_ok", "legacy_conv_ok", "legacy_patch_first"):
     patch()
 import transformers.models.falcon_h1.modeling_falcon_h1 as mf
 if case == "patch_after":
@@ -110,12 +121,17 @@ def _run(case, tmp_path):
     ssd.mkdir(parents = True)
     for d in (root / "mamba_ssm", root / "mamba_ssm" / "ops", ssd):
         (d / "__init__.py").write_text("")
-    (ssd / "ssd_combined.py").write_text(STUB_SSD)
-    if case == "conv_ok":
+    legacy = case.startswith("legacy_")
+    (ssd / "ssd_combined.py").write_text(STUB_SSD_LEGACY if legacy else STUB_SSD)
+    if case.endswith("conv_ok"):
         conv = root / "causal_conv1d"
         conv.mkdir()
         for name, body in STUB_CONV.items():
-            (conv / name).write_text(body)
+            if not (legacy and name == "cpp_functions.py"):
+                (conv / name).write_text(body)
+        if legacy:
+            (root / "causal_conv1d_cuda.py").write_text(
+                "def causal_conv1d_fwd(*a, **k):\n    raise RuntimeError('FUSED_KERNEL_CALLED')\n")
     worker = tmp_path / "worker.py"
     worker.write_text(WORKER)
     env = dict(os.environ)
@@ -135,14 +151,15 @@ def test_unpatched_train_forward_hits_the_fused_kernel_and_fails(tmp_path):
     assert "NoneType" in res["err"]
 
 
-@pytest.mark.parametrize("case", ["patch_first", "patch_after"])
+@pytest.mark.parametrize("case", ["patch_first", "patch_after", "legacy_patch_first"])
 def test_patched_train_forward_takes_the_split_path(case, tmp_path):
     res = _run(case, tmp_path)
     assert res["ok"], res
     assert res["loss"] == res["loss"]  # finite, not NaN
 
 
-def test_usable_causal_conv1d_keeps_the_fused_kernel(tmp_path):
-    res = _run("conv_ok", tmp_path)
+@pytest.mark.parametrize("case", ["conv_ok", "legacy_conv_ok"])
+def test_usable_causal_conv1d_keeps_the_fused_kernel(case, tmp_path):
+    res = _run(case, tmp_path)
     assert not res["ok"]
     assert "FUSED_KERNEL_CALLED" in res["err"]

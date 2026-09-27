@@ -1317,20 +1317,45 @@ def _mamba_fused_split_needs_causal_conv1d_unusable():
     """True when mamba_ssm is installed but causal_conv1d, which its fused split path calls unconditionally, is not usable."""
     try:
         import importlib.util
-        if importlib.util.find_spec("mamba_ssm") is None:
+        spec = importlib.util.find_spec("mamba_ssm")
+        if spec is None:
             return False
     except Exception:
         return False
+    # mamba_ssm <= 2.2.x calls the `causal_conv1d_cuda` extension instead, and
+    # causal_conv1d < 1.5 has no `cpp_functions`: probe what this mamba_ssm uses.
+    source = ""
+    for root in (spec.submodule_search_locations or ()):
+        try:
+            with open(os.path.join(root, "ops", "triton", "ssd_combined.py"), encoding = "utf-8") as f:
+                source = f.read()
+            break
+        except Exception:
+            pass
+    uses_cpp_functions = "cpp_functions" in source
+    uses_cuda_module = "causal_conv1d_cuda" in source
+    if not (uses_cpp_functions or uses_cuda_module):
+        uses_cpp_functions = uses_cuda_module = True  # unknown layout: either works
     try:
         import causal_conv1d
-        from causal_conv1d.cpp_functions import causal_conv1d_fwd_function
     except Exception:
-        return True
-    if causal_conv1d_fwd_function is None:
         return True
     if getattr(causal_conv1d, "causal_conv1d_fn", None) is None:
         return True
-    return False
+    if uses_cpp_functions:
+        try:
+            from causal_conv1d.cpp_functions import causal_conv1d_fwd_function
+            if causal_conv1d_fwd_function is not None:
+                return False
+        except Exception:
+            pass
+    if uses_cuda_module:
+        try:
+            import causal_conv1d_cuda  # noqa: F401
+            return False
+        except Exception:
+            pass
+    return True
 
 
 def patch_mamba_fused_split_without_causal_conv1d():
