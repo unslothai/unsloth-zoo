@@ -845,9 +845,9 @@ RL_REPLACEMENTS["UnslothEfficientGRPO"] = UnslothEfficientGRPO
 
 def _warn_unsupported_grpo_options(trainer):
     """Warn once per trainer about TRL GRPOConfig options this path ignores, so setting
-    them is not silently dropped. Only top_entropy_quantile < 1.0 (entropy masking) is
-    unimplemented; its TRL default is 1.0 in 0.22.2 through 1.12.0, so only non-defaults
-    warn. use_bias_correction_kl is supported and must never be listed here.
+    them is not silently dropped. top_entropy_quantile < 1.0 (entropy masking) and the
+    entropy bonus (entropy_coef, use_adaptive_entropy) are unimplemented; their TRL defaults
+    are off, so only non-defaults warn. use_bias_correction_kl is supported and must never be listed here.
     """
     if getattr(trainer, "_unsloth_grpo_unsupported_warned", False):
         return
@@ -857,6 +857,12 @@ def _warn_unsupported_grpo_options(trainer):
     top_entropy_quantile = getattr(args, "top_entropy_quantile", 1.0)
     if top_entropy_quantile is not None and top_entropy_quantile < 1.0:
         unsupported.append(f"top_entropy_quantile={top_entropy_quantile}")
+    # TRL >= 1.8 entropy bonus (trl#6140); the loss here never subtracts it.
+    entropy_coef = getattr(args, "entropy_coef", 0.0)
+    if entropy_coef:
+        unsupported.append(f"entropy_coef={entropy_coef}")
+    if getattr(args, "use_adaptive_entropy", False):
+        unsupported.append("use_adaptive_entropy=True")
 
     if unsupported:
         message = (
