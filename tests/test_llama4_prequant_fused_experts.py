@@ -14,11 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Pre-quantized Llama-4 checkpoints storing MoE experts fused (split gate / up / down).
-
-transformers 5 swaps in SequentialLlama4TextExperts and fails with
-`"normal_kernel_cuda" not implemented for 'Byte'`. Tiny local fixtures, CPU only.
-"""
+"""Pre-quantized Llama-4 checkpoints storing MoE experts fused (split gate / up / down)."""
 
 from __future__ import annotations
 
@@ -80,7 +76,6 @@ def _apply_bnb4bit_patches():
 
 
 def _quantize_into(out, name, weight):
-    """Serialize like transformers' Linear4bit: packed bytes plus the aux tensors."""
     packed, quant_state = bnb.functional.quantize_4bit(
         weight, blocksize = 64, quant_type = "nf4",
         compress_statistics = True, quant_storage = torch.uint8,
@@ -91,7 +86,6 @@ def _quantize_into(out, name, weight):
 
 
 def _build_checkpoint(path, layout, inter = 128):
-    """`layout`: "fused" (unsloth Scout upload) or "per_expert" (transformers)."""
     E, H, I = NUM_EXPERTS, HIDDEN, inter
     torch.manual_seed(0)
     config = Llama4TextConfig(
@@ -198,7 +192,6 @@ def test_fused_checkpoint_loads_into_the_fused_stacks(tmp_path, inter):
 
 
 def test_without_the_layout_decision_the_fused_checkpoint_still_fails(fused_checkpoint, monkeypatch):
-    """Unknown layout: transformers' swap runs and the load still fails."""
     _apply_bnb4bit_patches()
     monkeypatch.setattr(moe_bnb4bit, "_checkpoint_expert_layout", lambda checkpoint_files: None)
     with pytest.raises(NotImplementedError, match = "Byte"):
@@ -226,7 +219,6 @@ def test_fused_forward_available_follows_the_llama4_patch_module(monkeypatch):
 
 
 def test_per_expert_checkpoint_keeps_the_transformers_swap(tmp_path):
-    """Per-expert checkpoints still get SequentialLlama4TextExperts."""
     _apply_bnb4bit_patches()
     model, info = _load(_build_checkpoint(tmp_path / "ckpt", "per_expert"))
     assert not info.get("missing_keys") and not info.get("unexpected_keys")
@@ -235,7 +227,6 @@ def test_per_expert_checkpoint_keeps_the_transformers_swap(tmp_path):
 
 
 def test_fused_load_never_mutates_the_global_swap_table(fused_checkpoint, monkeypatch):
-    """Concurrent loads must still see transformers' full swap table."""
     import transformers.quantizers.base as quantizers_base
     from transformers.quantizers.quantizer_bnb_4bit import Bnb4BitHfQuantizer
 
@@ -258,7 +249,6 @@ def test_fused_load_never_mutates_the_global_swap_table(fused_checkpoint, monkey
 
 
 def test_without_the_stock_convert_method_the_transformers_swap_runs(fused_checkpoint, monkeypatch):
-    """Non-stock convert method: global table untouched, transformers' swap runs."""
     import transformers.quantizers.base as quantizers_base
 
     _apply_bnb4bit_patches()
@@ -271,7 +261,6 @@ def test_without_the_stock_convert_method_the_transformers_swap_runs(fused_check
 
 
 def test_unpacked_expert_slot_gets_dequantized_values(fused_checkpoint, monkeypatch):
-    """Float expert slots get dequantized values, never packed bytes."""
     _apply_bnb4bit_patches()
     monkeypatch.setattr(moe_bnb4bit, "replace_expert_params_with_bnb_params", lambda model, **kwargs: model)
     model, info = _load(fused_checkpoint)

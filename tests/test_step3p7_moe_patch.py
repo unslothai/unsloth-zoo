@@ -156,7 +156,7 @@ def test_bnb4bit_experts_match_the_dequantized_native_loop():
     assert hidden.grad is not None and torch.isfinite(hidden.grad).all()
 
 
-FB = 128  # the checkpoint's 128x128 weight blocks
+FB = 128
 
 
 def _fp8_model(limits = (0.0, 1.0), device = "meta"):

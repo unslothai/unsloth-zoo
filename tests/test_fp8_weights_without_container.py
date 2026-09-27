@@ -306,7 +306,6 @@ def _write_fp8_checkpoint(reference, path, block):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "FP8 loading needs a CUDA device")
 def test_save_after_a_real_load_keeps_the_fp8_layout(tmp_path):
-    """The real loader deepcopies the op per target key, so provenance kept on the op never reaches the save."""
     from safetensors.torch import load_file
 
     torch.manual_seed(0)
