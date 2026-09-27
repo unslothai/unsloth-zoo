@@ -1536,6 +1536,22 @@ def test_preference_cce_scores_hidden_states_like_the_logits(monkeypatch, head, 
 
 
 @metal_only
+@pytest.mark.parametrize("frozen", [False, True])
+def test_preference_cce_declares_a_frozen_head(monkeypatch, frozen):
+    """A trainable-declared head may compute its weight gradient despite stop_gradient."""
+    from unsloth_zoo.mlx import preference as p, utils
+
+    model = _cce_text_model(2053, 64, quantized=False)
+    if frozen:
+        model.freeze()
+        model.model.unfreeze()
+    seen, build = [], utils._get_runtime_cce
+    monkeypatch.setattr(utils, "_get_runtime_cce", lambda **kw: seen.append(kw) or build(**kw))
+    assert p._make_preference_cce_scorer(model) is not None
+    assert [kw["weight_is_frozen"] for kw in seen] == [frozen]
+
+
+@metal_only
 @pytest.mark.parametrize("quantized", [False, True])
 @pytest.mark.parametrize("labeled", [False, True])
 def test_text_eval_compacts_finite_batches(monkeypatch, quantized, labeled):
