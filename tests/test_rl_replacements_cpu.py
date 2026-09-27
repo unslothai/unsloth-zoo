@@ -21,6 +21,8 @@ Covers:
   - `sanitize_logprob` (filter NaN logprob values from vLLM outputs)
   - `_warn_unsupported_grpo_options` (warn-once for ignored TRL GRPO options:
     top_entropy_quantile; use_bias_correction_kl is supported so it must not warn)
+  - the GRPO k3 KL clamp (log-ratio to [-20, 20], k3 to [-10, 10]) matches verl
+    `low_var_kl` / SkyRL `k3` in loss, mean_kl and gradient, before bias correction and beta
   - `grpo_compute_loss` with `use_bias_correction_kl=True` (KL x importance-sampling
     ratio, TRL GRPOConfig.use_bias_correction_kl) matches an inline TRL-mirror
     reference in loss, gradient and mean_kl for token and sequence IS levels
@@ -65,6 +67,61 @@ def test_grpo_small_kl_matches_second_order_limit(difference):
     loss.backward()
     torch.testing.assert_close(new.grad.double(), -torch.expm1(delta) / new.numel(), rtol=1e-3, atol=1e-7)
 
+
+
+def _verl_low_var_kl(new, ref):
+    # verl core_algos.kl_penalty_forward "low_var_kl" / SkyRL ppo_utils.compute_approx_kl "k3".
+    kl = torch.clamp(ref - new, min=-20, max=20)
+    return torch.clamp(torch.exp(kl) - kl - 1, min=-10, max=10)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_grpo_kl_is_clamped_like_verl_low_var_kl(dtype):
+    # Past |ref - new| of about 11 (below) or 2.6 (above) the raw k3 exceeds 10 and exp overflows
+    # past 88 in fp32; verl and SkyRL clamp the log-ratio to [-20, 20] and k3 to [-10, 10].
+    d = torch.tensor([[0.0, 1.0, -1.0, 5.0, -5.0, 10.0, -10.0, 11.0, -11.0, 20.0, -20.0, 88.0, -88.0, 200.0, -200.0]],
+                     dtype=dtype)
+    new = torch.zeros_like(d, requires_grad=True)
+    ref = new.detach() + d
+    mask = torch.ones_like(d)
+    loss, _, mean_kl, *_ = rr.grpo_compute_loss(
+        ref, new, new.detach(), None, torch.zeros_like(d, dtype=torch.long),
+        mask, 1.0, torch.zeros(1, dtype=dtype),
+    )
+    loss.backward()
+
+    new_ref = torch.zeros_like(d, requires_grad=True)
+    expected = _verl_low_var_kl(new_ref, new_ref.detach() + d)
+    expected.mean().backward()
+    assert torch.isfinite(loss) and torch.isfinite(new.grad).all()
+    assert float(mean_kl) <= 10.0
+    torch.testing.assert_close(loss, expected.mean().detach())
+    torch.testing.assert_close(mean_kl, expected.mean().detach())
+    torch.testing.assert_close(new.grad, new_ref.grad)
+    # Outside the band the clamp stops the gradient, as in verl.
+    saturated = expected.detach() >= 10.0
+    assert saturated.any() and (new.grad[saturated] == 0).all()
+
+
+@pytest.mark.parametrize("use_bias_correction_kl", [False, True])
+def test_grpo_kl_clamp_precedes_bias_correction_and_beta(use_bias_correction_kl):
+    # The clamp bounds the per-token estimator; the IS ratio (use_bias_correction_kl) and beta
+    # scale the clamped value afterwards, as verl/SkyRL apply kl_loss_coef after kl_penalty.
+    beta = 0.04
+    new = torch.tensor([[-1.0, -2.0, -3.0]], dtype=torch.float64)
+    old = new - torch.tensor([[0.1, -0.2, 0.0]], dtype=torch.float64)
+    ref = new + torch.tensor([[15.0, -30.0, 0.5]], dtype=torch.float64)
+    mask = torch.ones_like(new)
+    loss, _, mean_kl, *_ = rr.grpo_compute_loss(
+        ref, new, old, None, torch.zeros_like(new, dtype=torch.long),
+        mask, beta, torch.zeros(1, dtype=torch.float64),
+        use_bias_correction_kl=use_bias_correction_kl,
+    )
+    kl = _verl_low_var_kl(new, ref)
+    if use_bias_correction_kl:
+        kl = kl * torch.exp(new - old)
+    torch.testing.assert_close(mean_kl, kl.mean())
+    torch.testing.assert_close(loss, beta * kl.mean())
 
 def test_calculate_pad_tokens_in_prompt_counts_left_pads():
     PAD = 0
