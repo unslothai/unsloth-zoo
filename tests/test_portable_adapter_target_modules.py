@@ -168,7 +168,7 @@ def test_dropped_names_stop_pefts_v5_moe_conversion_doubling_the_rank():
     conversion = pytest.importorskip("peft.utils.transformers_weight_conversion")
     convert = getattr(conversion, "_convert_peft_config_moe", None)
     if convert is None or "qwen3_moe" not in getattr(conversion, "_MODEL_TO_CONVERSION_PATTERN", {}):
-        pytest.skip("this PEFT has no transformers v5 MoE conversion for qwen3_moe")
+        pytest.skip(reason = "this PEFT has no transformers v5 MoE conversion for qwen3_moe")
     # Unsloth's import_fixes wraps it to skip explicit targets; plain PEFT runs the original.
     while hasattr(convert, "__wrapped__"):
         convert = convert.__wrapped__
@@ -190,3 +190,14 @@ def test_dropped_names_stop_pefts_v5_moe_conversion_doubling_the_rank():
 def test_dense_adapter_is_left_alone():
     model = get_peft_model(TwoTowers(), LoraConfig(r = 2, target_modules = ["linear"]))
     assert MU.portable_lora_target_modules(model, "default", ["linear"]) is None
+
+
+def test_save_pretrained_hook_writes_the_portable_targets(tmp_path, monkeypatch):
+    from peft import PeftModel
+    monkeypatch.setattr(PeftModel, "save_pretrained", PeftModel.save_pretrained)
+    assert MU._patch_peft_save_pretrained_for_moe_layout()
+    model = _fused_expert_model()
+    model.base_model.model.config = {"model_type": "qwen3_moe"}
+    model.save_pretrained(str(tmp_path))
+    saved = json.loads((tmp_path / "adapter_config.json").read_text())["target_modules"]
+    assert saved == ["q_proj"]
