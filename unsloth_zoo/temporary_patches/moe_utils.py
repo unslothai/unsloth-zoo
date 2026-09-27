@@ -2599,7 +2599,13 @@ def _forward_statically_reads_stash(experts_module):
     """
     # This Unsloth Zoo code section is licensed under AGPL3
 
-    forward = getattr(experts_module, "forward", None)
+    # The instance's own forward if one was installed, else the class function. Not
+    # getattr(experts_module, "forward").__func__: on torch 2.14 Dynamo loses track of the
+    # function behind a bound method's __func__, and reading __globals__ from it raises
+    # AttributeError('__globals__') inside the compiled region (fullgraph=True: a hard error).
+    forward = vars(experts_module).get("forward", None) if hasattr(experts_module, "__dict__") else None
+    if forward is None:
+        forward = getattr(type(experts_module), "forward", None)
     forward = getattr(forward, "__func__", forward)
     code = getattr(forward, "__code__", None)
     if code is None:
