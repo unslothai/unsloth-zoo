@@ -1384,3 +1384,28 @@ def test_rdna1_later_kernel_hub_decorations_never_resolve_fla(monkeypatch):
     bound = decorate("chunk_gated_delta_rule", "fla")(torch_path)
     assert bound is torch_path and bound(1) == 2
     assert hub_kernels.use_kernel_func_from_hub_with_fallback.__wrapped__ is original
+
+
+def test_every_host_gets_the_float32_l2norm_not_only_rdna1(monkeypatch):
+    """A CPU-only or no-Triton host takes the pure-torch gated delta too. On transformers 5.5
+    its l2norm runs in float16 there, and the T4 path's Qwen3.5 and Qwen3.6 grads came back
+    non-finite in unsloth's Core zoo (HF=default) job."""
+    import types
+
+    from unsloth_zoo.temporary_patches import fla_vendor
+
+    monkeypatch.setattr(fla_vendor, "_gpu_lacks_dot_instructions", lambda torch_mod=None: False)
+    monkeypatch.setattr(fla_vendor, "_flag", lambda name: False)
+    monkeypatch.setattr(fla_vendor, "_vendored_already_injected", lambda: False)
+    monkeypatch.setattr(fla_vendor, "_should_defer_to_installed_fla", lambda: False)
+    monkeypatch.setattr(fla_vendor, "_torch_triton_cuda_supported", lambda: False)
+    fake_pkg = "unsloth_test_gated_delta_cpu"
+    mod = types.ModuleType(f"transformers.models.{fake_pkg}.modeling_{fake_pkg}")
+    mod.l2norm = _transformers_style_l2norm
+    monkeypatch.setitem(sys.modules, mod.__name__, mod)
+    monkeypatch.setattr(fla_vendor, "_GATED_DELTA_MODELING", (fake_pkg,))
+
+    fla_vendor.patch_vendor_fla()
+
+    assert mod.l2norm is fla_vendor._fp32_l2norm
+
