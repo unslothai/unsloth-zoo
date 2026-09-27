@@ -1,0 +1,67 @@
+"""_Gemma4KVSharedSafeProxy must be traceable by Dynamo.
+
+get_text_config() is called inside every Gemma-4 forward (Gemma4Model, the
+causal-LM head and masking_utils), so on the 26B-A4B / 31B configs
+(num_kv_shared_layers == 0) the proxy is built and read inside compiled
+regions. Reading its slot through object.__getattribute__ made Dynamo abandon
+the frame; plain attribute access traces.
+"""
+import copy
+import pickle
+
+import pytest
+import torch
+
+from unsloth_zoo.temporary_patches import gemma4 as g4
+
+
+class _Cfg:
+    def __init__(self):
+        self.num_kv_shared_layers = 0
+        self.hidden_size = 8
+        self.final_logit_softcapping = 30.0
+        self.layer_types = ["sliding_attention", "full_attention"]
+
+
+def _count_breaks(fn, *args):
+    from torch._dynamo.utils import counters
+    torch._dynamo.reset()
+    counters.clear()
+    out = torch.compile(fn, backend = "eager")(*args)
+    n = sum(counters["graph_break"].values()) + sum(counters["unimplemented"].values())
+    return out, n
+
+
+def test_proxy_reads_trace_without_graph_break():
+    cfg = _Cfg()
+
+    def f(x):
+        p = g4._Gemma4KVSharedSafeProxy(cfg)
+        y = x * p.hidden_size + p.final_logit_softcapping
+        if hasattr(p, "num_kv_shared_layers"):
+            y = y + 1000
+        if "layer_types" in p and "num_kv_shared_layers" not in p:
+            y = y + len(p.layer_types)
+        return y + p.get_text_config().hidden_size
+
+    x = torch.ones(3)
+    out, n = _count_breaks(f, x)
+    assert torch.equal(out, f(x))
+    assert torch.equal(out, x * 8 + 30.0 + 2 + 8)
+    assert n == 0, f"{n} graph breaks / abandoned frames from _Gemma4KVSharedSafeProxy"
+
+
+def test_proxy_semantics_unchanged():
+    cfg = _Cfg()
+    p = g4._Gemma4KVSharedSafeProxy(cfg)
+    assert not hasattr(p, "num_kv_shared_layers")
+    assert p.hidden_size == 8 and p.get_text_config() is p
+    assert p == g4._Gemma4KVSharedSafeProxy(cfg) and p == cfg
+    assert hash(p) == hash(cfg) and bool(p)
+    assert "_Cfg" in repr(p)
+    # Built without __init__ (copy/pickle protocol): must raise, not recurse.
+    bare = g4._Gemma4KVSharedSafeProxy.__new__(g4._Gemma4KVSharedSafeProxy)
+    with pytest.raises(AttributeError):
+        bare.hidden_size
+    c = copy.copy(p)
+    assert c.hidden_size == 8 and not hasattr(c, "num_kv_shared_layers")
