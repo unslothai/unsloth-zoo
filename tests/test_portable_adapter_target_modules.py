@@ -18,12 +18,12 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import re
 import subprocess
 import sys
-import types
 
 import pytest
 import torch
@@ -123,11 +123,16 @@ class MoEBlock(nn.Module):
         self.experts = Experts()
 
 
+@dataclasses.dataclass
+class TinyMoEConfig:
+    model_type: str = "qwen3_moe"
+
+
 class TinyMoE(nn.Module):
     def __init__(self):
         super().__init__()
         self.layers = nn.ModuleList([MoEBlock() for _ in range(2)])
-        self.config = types.SimpleNamespace(model_type = "qwen3_moe")
+        self.config = TinyMoEConfig()
 
 
 def _fused_expert_model():
@@ -182,7 +187,6 @@ def test_save_pretrained_hook_writes_the_portable_targets(tmp_path, monkeypatch)
     monkeypatch.setattr(PeftModel, "save_pretrained", PeftModel.save_pretrained)
     assert MU._patch_peft_save_pretrained_for_moe_layout()
     model = _fused_expert_model()
-    model.base_model.model.config = {"model_type": "qwen3_moe"}
     model.save_pretrained(str(tmp_path))
     saved = json.loads((tmp_path / "adapter_config.json").read_text())["target_modules"]
     assert saved == ["q_proj"]
