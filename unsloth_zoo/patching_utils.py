@@ -435,11 +435,7 @@ def _stage_cast_for_test(module, dtype):
     module.to(dtype)
 
 
-# F.layer_norm / F.group_norm need input and weight in one dtype (F.rms_norm does not). A norm
-# upcast by _pre_set_compute_dtype therefore only works under autocast, which the trainer
-# provides; a plain forward (custom loop, manual eval) raised "expected scalar type BFloat16
-# but found Float" in e.g. gemma-3's SigLIP LayerNorms. Outside autocast, run such a norm in
-# its weight dtype and hand the caller back its own dtype. Under autocast nothing changes.
+# F.layer_norm / F.group_norm need input and weight in one dtype, so an upcast norm fails outside autocast (gemma-3 SigLIP).
 _STRICT_DTYPE_NORMS = tuple(
     t for t in (getattr(torch.nn, "LayerNorm", None), getattr(torch.nn, "GroupNorm", None))
     if t is not None
