@@ -1364,6 +1364,41 @@ def _tensorize_ragged_batch(batch):
 pass
 
 
+def _probe_assistant_single_content(processor, model = None):
+    """True when the chat template only renders a plain string as the assistant content.
+
+    Templates that only take a string either fail in Python (TypeError), render the list's repr, or
+    reject the list in Jinja itself (Apertus 1.5 raises TemplateError("Invalid assistant content")).
+    Any of those falls back to the string form; if that fails too the original error is reported.
+    """
+    user = {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Hello!"}]}
+    try:
+        rendered = processor.apply_chat_template([
+            user,
+            {"role": "assistant", "content": [{"type": "text", "text": "How can I help you?"}]},
+        ])
+        if _renders_content_list_as_repr(rendered, "How can I help you?"):
+            raise TypeError("assistant content rendered as a list repr")
+        return False
+    except Exception as list_error:
+        try:
+            processor.apply_chat_template([
+                user, {"role": "assistant", "content": "How can I help you?"},
+            ])
+        except Exception as e:
+            # Neither form renders: report the list-form error unless it came from our repr probe.
+            _raise_chat_template_error(
+                e if isinstance(list_error, TypeError) else list_error, processor, model
+            )
+        print(
+            f"Unsloth: {processor.__class__.__name__} only accepts 1 "\
+            "text field for assistant roles!\n"\
+            "We will auto fix the data collator to support it!"
+        )
+        return True
+pass
+
+
 class UnslothVisionDataCollator:
     # All Unsloth Zoo code licensed under LGPLv3
     __slots__ = (
@@ -1511,35 +1546,7 @@ class UnslothVisionDataCollator:
 
         # Check what type for assistant VLM tokenizer allows!
         # Good for Mistral V3 and Pixtral I think
-        try:
-            rendered = processor.apply_chat_template([
-                {"role": "user", "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": "Hello!"}]},
-                {"role": "assistant", "content": [
-                    {"type": "text", "text": "How can I help you?"}]}
-            ])
-            if _renders_content_list_as_repr(rendered, "How can I help you?"):
-                raise TypeError("assistant content rendered as a list repr")
-            self.assistant_single_content = False
-        except TypeError:
-            try:
-                processor.apply_chat_template([
-                    {"role": "user", "content": [
-                        {"type": "image"},
-                        {"type": "text", "text": "Hello!"}]},
-                    {"role": "assistant", "content": "How can I help you?"}
-                ])
-                self.assistant_single_content = True
-                print(
-                    f"Unsloth: {processor.__class__.__name__} only accepts 1 "\
-                    "text field for assistant roles!\n"\
-                    "We will auto fix the data collator to support it!"
-                )
-            except Exception as e:
-                _raise_chat_template_error(e, processor, model)
-        except Exception as e:
-            _raise_chat_template_error(e, processor, model)
+        self.assistant_single_content = _probe_assistant_single_content(processor, model)
         return
 
     def _get_padding_token_ids_on_device(self, device):
