@@ -33,7 +33,23 @@ from unsloth_zoo.device_map_planner import (
     resolve_no_split_classes,
 )
 
-_HAS_CONVERSION_MAPPING = importlib.util.find_spec("transformers.conversion_mapping") is not None
+def _has_conversion_mapping() -> bool:
+    """Whether this transformers ships its own conversion_mapping, the one that merges on load.
+
+    On transformers 4.x, unsloth's import fixes put a stand-in module there for peft, built with
+    no __spec__. find_spec raises ValueError on such an entry, which took this whole file down at
+    collection in unsloth's Core zoo job. The stand-in merges nothing, so it counts as absent.
+    """
+    module = sys.modules.get("transformers.conversion_mapping")
+    if module is not None:
+        return getattr(module, "__spec__", None) is not None
+    try:
+        return importlib.util.find_spec("transformers.conversion_mapping") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+_HAS_CONVERSION_MAPPING = _has_conversion_mapping()
 needs_conversion_mapping = pytest.mark.skipif(
     not _HAS_CONVERSION_MAPPING,
     reason = "transformers 4.x loads checkpoints without merging converters",
@@ -519,3 +535,11 @@ def test_room_to_load_is_never_bought_with_activation_reserve():
             assert with_transient.activation_reserve_by_device[device] >= kept, (max_memory, device)
         checked += 1
     assert checked > 100
+
+
+def test_a_specless_stand_in_module_counts_as_no_conversion_mapping(monkeypatch):
+    stand_in = types.ModuleType("transformers.conversion_mapping")
+    stand_in.__spec__ = None
+    monkeypatch.setitem(sys.modules, "transformers.conversion_mapping", stand_in)
+    assert _has_conversion_mapping() is False
+
