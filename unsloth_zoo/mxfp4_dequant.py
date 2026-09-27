@@ -337,7 +337,6 @@ class Mxfp4ExpertParam(torch.nn.Parameter):
         return Mxfp4ExpertParam(self.data.to(device, non_blocking = non_blocking), **kwargs)
 
     def copy_(self, src, non_blocking = False):
-        # Blocks are meaningless without their scales: refuse bare uint8 blocks.
         if not isinstance(src, Mxfp4ExpertParam):
             raise RuntimeError(
                 "Unsloth: cannot copy bare MXFP4 blocks into a packed expert stack, their scales "

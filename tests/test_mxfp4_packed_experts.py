@@ -75,7 +75,6 @@ def test_torch_reference_matches_transformers():
 @pytest.mark.parametrize("transpose", [False, True])
 @pytest.mark.parametrize("chunk_bytes", [1, 5 * 64 * 16 * 8, 1 << 30])
 def test_torch_fallback_chunks_are_bit_identical(monkeypatch, transpose, chunk_bytes):
-    # Chunk sizes incl. one not dividing N (cut at an expert edge) all match the unchunked result.
     monkeypatch.setattr(mxd, "_TORCH_CHUNK_BYTES", chunk_bytes)
     blocks, scales = _random_mxfp4(3, 7, 64, low = 0, high = 255)
     want = _reference(blocks, scales)
@@ -108,7 +107,6 @@ def test_torch_fallback_never_materialises_a_whole_stack_of_indices():
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("transpose", [False, True])
 def test_fused_kernel_is_bit_identical(dtype, transpose):
-    # fp16 cannot hold the extreme exponents.
     E, N, G = 3, 131, 9
     blocks = torch.randint(0, 256, (E, N, G, 16), dtype = torch.uint8, device = "cuda")
     blocks.view(-1)[:256] = torch.arange(256, dtype = torch.uint8)
@@ -366,7 +364,6 @@ def test_packed_experts_train_like_the_load_time_dequant(monkeypatch, grouped_mm
     dense_shapes = {n: p.shape for n, p in dense_model.named_parameters() if "lora_" in n}
     lora = {n: p.shape for n, p in packed_model.named_parameters() if "lora_" in n}
     assert lora == dense_shapes and len(lora) == 4   # PEFT sized the adapters from the logical shape
-    # The packed stack must take the separated LoRA path, never PEFT's own `param + delta`.
     peft_calls = []
     original = mu._original_param_wrapper_forward
     monkeypatch.setattr(mu, "_original_param_wrapper_forward", lambda *a, **k: peft_calls.append(1) or original(*a, **k))
@@ -452,7 +449,6 @@ def test_merge_and_unmerge(grouped_mm_device):
 
 
 def test_unmerge_after_a_model_move_restores_on_the_current_device(grouped_mm_device):
-    # unmerge after model.to() must move the saved packed stack too.
     packed_model, _ = _peft_pair(grouped_mm_device)
     base = packed_model.base_model.model.experts
     while hasattr(base, "base_layer"):
@@ -624,7 +620,6 @@ def test_offloaded_loads_keep_the_load_time_dequant(monkeypatch):
 
 
 def test_the_decode_lock_is_held_until_the_kernel_is_enqueued(monkeypatch):
-    # The slot lock spans decode and launch across host threads.
     from unsloth_zoo.temporary_patches import gpt_oss
 
     model, experts = _tiny_gpt_oss("cpu")
@@ -697,7 +692,6 @@ def test_projections_of_the_same_shape_do_not_share_a_stack():
 
 @needs_cuda
 def test_another_stream_waits_for_the_last_kernel_on_the_shared_stack(monkeypatch):
-    # One stack per shape across streams; other streams wait on the last reader's event.
     from unsloth_zoo.temporary_patches import gpt_oss
 
     monkeypatch.setenv("UNSLOTH_MXFP4_FUSED_GEMM", "0")   # the decode-slot path (fused decode has no slots)

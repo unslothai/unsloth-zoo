@@ -360,7 +360,6 @@ def patch_convert_moe_packed_tensors():
         if not blocks.is_cuda and torch.cuda.is_available():
             blocks = blocks.cuda()
             scales = scales.cuda()
-        # Fused Triton pass, bit-identical to the loop below.
         if blocks.is_cuda and blocks.dtype == torch.uint8 and dtype in (torch.bfloat16, torch.float16):
             return mxfp4_dequantize(blocks, scales, dtype = dtype)
 
