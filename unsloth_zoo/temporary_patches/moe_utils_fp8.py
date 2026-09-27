@@ -645,6 +645,9 @@ def _expand_grouped_bias(bias, num_tokens_per_expert):
 def _forward_scaled_grouped_mm_fp8(self, hidden_states, top_k_index, top_k_weights):
     if not _check_torch_scaled_grouped_mm_supported():
         return None
+    # _scaled_grouped_mm has no autograd formula, so anything needing a backward takes the dequant path.
+    if torch.is_grad_enabled():
+        return None
     if not hasattr(self, "gate_up_proj") or not hasattr(self, "down_proj"):
         return None
 

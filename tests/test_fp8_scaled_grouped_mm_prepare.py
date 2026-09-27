@@ -60,3 +60,26 @@ def test_scaled_grouped_mm_path_is_opt_in(monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (9, 0))
     monkeypatch.delenv("UNSLOTH_FP8_SCALED_GROUPED_MM", raising=False)
     assert m._check_torch_scaled_grouped_mm_supported() is False
+
+
+@pytest.mark.skipif(FP8 is None or not hasattr(torch, "_scaled_grouped_mm"), reason = "needs fp8 + _scaled_grouped_mm")
+def test_scaled_grouped_mm_path_skipped_when_grad_enabled(monkeypatch):
+    # torch has no derivative for _scaled_grouped_mm, so a training forward must not take it.
+    x = torch.randn(8, H, device = "meta", dtype = torch.bfloat16, requires_grad = True)
+    out = torch._scaled_grouped_mm(
+        x.to(FP8),
+        torch.empty(E, 2 * I, H, dtype = FP8, device = "meta").mT,
+        torch.ones(8, device = "meta"),
+        torch.ones(E, 2 * I, device = "meta"),
+        offs = torch.tensor([4, 8], dtype = torch.int32, device = "meta"),
+        out_dtype = torch.bfloat16,
+    )
+    with pytest.raises(RuntimeError, match = "not implemented"):
+        out.sum().backward()
+
+    monkeypatch.setattr(m, "_TORCH_SCALED_GROUPED_MM_SUPPORTED", True)
+    ex = _experts("scale_inv")
+    hidden = torch.randn(4, H, requires_grad = True)
+    top_k_index = torch.tensor([[0], [1], [0], [1]])
+    top_k_weights = torch.ones(4, 1)
+    assert m._forward_scaled_grouped_mm_fp8(ex, hidden, top_k_index, top_k_weights) is None
