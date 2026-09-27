@@ -426,6 +426,20 @@
       "reason": "Executes the compiled form of the bytes compared above, not a fresh read of the path. Same window as the compiler's loader, closed the same way."
     },
     {
+      "file": "unsloth_zoo/temporary_patches/remote_mamba2.py",
+      "sink": "compile",
+      "digest": "08de7e0c49bfa7d7",
+      "count": 1,
+      "reason": "inspect.getsource of a remote mixer's torch_forward that transformers already imported and executed under trust_remote_code, with two fixed literal substitutions (sum dim, dt clamp). No new code is introduced beyond what the model repo already ran."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/remote_mamba2.py",
+      "sink": "exec",
+      "digest": "32809b4ed10761d5",
+      "count": 1,
+      "reason": "Executes that compiled torch_forward in the remote module's own namespace; the source is the already-trusted remote method with the two literal substitutions above."
+    },
+    {
       "file": "unsloth_zoo/vllm_utils.py",
       "sink": "eval",
       "digest": "6e5ae3bd4483e267",
