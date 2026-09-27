@@ -8,11 +8,8 @@
 
 """Pure planning for bounded ``mx.compile`` signatures.
 
-Two regimes share this module. A finite dataset, text or VLM, is planned whole
-from the widths its schedule already fixes. An unsized stream has no schedule to
-plan from and is instead held to an endpoint grid — anchored to
-``max_seq_length`` for text, anchor-free for VLM, whose compile-visible width is
-only known after image-token expansion.
+Finite datasets are planned whole; unsized streams widen onto an endpoint grid
+(anchored at ``max_seq_length`` for text, anchor-free for post-expansion VLM).
 
 The cap here counts application-visible callable signatures. It is not an MLX
 compiler-cache count and is not an estimate of Metal resources.
@@ -38,14 +35,11 @@ MAX_COMPILE_VARIANTS = 256
 FULL_STEP_SCOPE = "full_step"
 DDP_LOCAL_GRAD_SCOPE = "ddp_local_grad"
 
-# An unsized source cannot be surveyed, so endpoints are fixed up front:
-# widths widen onto this grid, confining compiled signatures to grid points.
 STREAM_GRID_FLOOR_WIDTH = 2
 STREAM_GRID_LINEAR_STEP = 32
 STREAM_GRID_ALIGNMENT = 8
-# Solved against MAX_PADDING_WORK_PERCENT under the planner's quadratic work
-# measure: log-uniform mean overhead (r^2 - 1) / (2 ln r) - 1 is 5.04% at 21/20.
-# Exact rationals keep the sequence identical across processes and ranks.
+# Log-uniform mean quadratic overhead (r^2 - 1) / (2 ln r) - 1 = 5.04% at 21/20;
+# exact rationals keep the sequence identical across ranks.
 STREAM_GRID_RATIO = Fraction(21, 20)
 
 
@@ -125,12 +119,7 @@ class TextShapeGuardReport:
 
 @dataclass(frozen=True)
 class StreamShapeGuardReport:
-    """Outcome of guarding an unsized streaming schedule.
-
-    Separate from ``TextShapeGuardReport``: a stream has no surveyed catalog,
-    so the meaningful numbers are what the run compiled and whether it hit the
-    cap. Emitted at training end, when those counts are final.
-    """
+    """Outcome of guarding an unsized streaming schedule, emitted at training end."""
 
     action: str
     reason: str
@@ -152,17 +141,8 @@ class StreamShapeGuardReport:
 
 
 class StreamShapeGrid:
-    """Fixed endpoint grid a streamed batch's width is widened onto.
-
-    One recurrence carries an exact value: ``x0 = floor``, ``x1 = step``, then
-    ``x -> max(x + step, x * ratio)``, so the additive branch spans short
-    widths and the geometric one long widths without a hand-placed crossover.
-    Terms after ``x0`` publish ``1 + alignment * ceil(x / alignment)``. The
-    sequence is materialized lazily, so lookups bisect and every endpoint maps
-    to itself. An ``anchor`` (text's ``max_seq_length``) terminates the grid;
-    without one it extends on demand, which VLM needs because image-token
-    expansion produces widths above ``max_seq_length`` and an endpoint below a
-    batch's own width could never materialize.
+    """Endpoint grid: ``x -> max(x + step, x * ratio)``, published as
+    ``1 + alignment * ceil(x / alignment)``; ``anchor`` terminates it, else it grows lazily.
     """
 
     __slots__ = ("_anchor", "_ratio", "_carried", "_endpoints", "_closed")
@@ -192,7 +172,6 @@ class StreamShapeGrid:
             self._endpoints.append(endpoint)
 
     def _grow(self):
-        """False once the grid is closed."""
         if self._closed:
             return False
         carried = self._carried
@@ -219,7 +198,6 @@ class StreamShapeGrid:
         return endpoints[low] if low < len(endpoints) else endpoints[-1]
 
     def endpoints_through(self, width):
-        """Materialized endpoints up to ``width``."""
         self.endpoint_for(width)
         return tuple(
             endpoint for endpoint in self._endpoints if endpoint <= width
@@ -244,11 +222,7 @@ class StreamShapeGrid:
 
 
 def stream_phase_count(compile_scope, gradient_accumulation_steps):
-    """Distinct compiled argument structures one width can produce.
-
-    The signature carries the accumulation micro-step's phase, so a single
-    endpoint backs this many cache entries rather than one.
-    """
+    """Cache entries one width costs: the signature carries the accumulation phase."""
     steps = operator.index(gradient_accumulation_steps)
     return len({
         phase_for_microstep(compile_scope, steps, index)
@@ -257,41 +231,17 @@ def stream_phase_count(compile_scope, gradient_accumulation_steps):
 
 
 def stream_exact_ceiling(grid, cap, phases_per_endpoint=1, in_flight=0):
-    """Signatures a stream may compile before widths widen onto the grid.
+    """Signatures a stream may compile exact before widening; ``None`` widens from the first batch.
 
-    Staging precedes admission, so the batch introducing the signature past
-    this count is itself staged exact and a synchronous run compiles one more
-    than the ceiling. A text prefetch producer consults this while staging and
-    can queue further exact batches ahead of the consumer; the VLM prefetch
-    path decides after dequeue, so it adds none.
-
-    Below this a width grid cannot pay for itself, the same judgement the
-    finite path makes with ``SMALL_EXACT_SIGNATURE_THRESHOLD``. Exact
-    signatures are sunk in the compile cache, so the allowance is also held
-    to a quarter of the cap and, for an anchored grid, to whatever the
-    endpoints leave unclaimed.
-
-    ``None`` disables the allowance and widens from the first batch. An
-    anchored grid's endpoint count grows with ``max_seq_length``, so a long
-    enough context, or a cap at or below the endpoint count, leaves nothing to
-    reserve. Widening immediately is the safe answer there, not a free one: an
-    allowance spent first would sink signatures the endpoints still need, so a
-    diverse stream would reach the cap and fall back to eager. A stream narrow
-    enough to have stayed under the cap regardless pays padding it never needed,
-    which is the price of not being able to tell the two apart in advance.
-    The corollary is that a stream is only guaranteed to stage exactly what an
-    unguarded run would when this returns a positive allowance.
+    Staging precedes admission, so a synchronous run compiles ceiling + 1 exact
+    signatures; ``in_flight`` covers text prefetch batches staged ahead.
     """
     cap = int(cap)
     phases = max(1, operator.index(phases_per_endpoint))
     ceiling = min(SMALL_EXACT_SIGNATURE_THRESHOLD, cap // 4)
     endpoints = grid.endpoint_count
     if endpoints is not None:
-        # Every endpoint costs one signature per phase, so reserving one slot
-        # each would let the allowance push a grid that fits over the cap. Two
-        # slots go beyond the allowance's own value: the crossing batch, since
-        # the allowance holds while the count is at or below it, and whatever a
-        # prefetch producer already staged before the consumer saw the release.
+        # Reserve endpoints * phases, the crossing batch, and prefetched batches.
         ceiling = min(
         ceiling, cap - endpoints * phases - 1 - max(0, operator.index(in_flight)),
     )
@@ -299,11 +249,7 @@ def stream_exact_ceiling(grid, cap, phases_per_endpoint=1, in_flight=0):
 
 
 def describe_stream_shape_grid(grid, cap, exact_ceiling=None):
-    """One-line summary of the endpoint policy a streaming run will use.
-
-    States configuration, not outcome: at startup a run that stays exact and
-    one that later widens are indistinguishable.
-    """
+    """One-line summary of the configured streaming endpoint policy."""
 
     count = grid.endpoint_count
     reach = "unbounded" if count is None else f"{count} endpoints"

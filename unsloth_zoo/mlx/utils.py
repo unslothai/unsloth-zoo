@@ -6243,9 +6243,6 @@ def _stage_tokenized_text_batch(
 ):
     """Host staging of one pretokenized text batch (no MLX work).
 
-    ``width_policy`` maps this batch's width to the width it is staged at;
-    ``None`` keeps the exact batch maximum, as unguarded runs do.
-
     ``host_valued=None`` computes the flag from the items; the lazy pipeline
     instead passes the stream-level flag recorded at row normalization, where
     MLX origin is still visible.
@@ -6259,9 +6256,7 @@ def _stage_tokenized_text_batch(
     if max_length == 0:
         max_length = min(2, max_seq_length)
     if width_policy is not None:
-        # Widen onto the grid so compiled signatures live only at grid
-        # points; true lengths stay in lengths_info, so masking is unaffected.
-        # A policy returning None is not in force.
+        # True lengths stay in lengths_info, so masking is unaffected.
         endpoint = width_policy(max_length)
         if endpoint is not None:
             max_length = endpoint
@@ -9641,9 +9636,7 @@ def _build_response_masked_vlm_batch(
     after expansion and response masking so padded tails stay inert, and the
     position phase then runs at the final width.
 
-    ``width_policy`` is the streaming form: a stream has no surveyed endpoint,
-    and expansion decides the compile-visible width, so the endpoint is chosen
-    from that width here. Returning None leaves the batch unpadded.
+    ``width_policy`` is the streaming form, chosen from the post-expansion width.
     """
     staged, is_prompt_completion = _collate_vlm_batch(
         items, processor, max_seq_length, image_size,
@@ -9656,8 +9649,6 @@ def _build_response_masked_vlm_batch(
     staged.config = config
     # Unplanned batches keep the historical single-pass order, including its
     # failure ordering (a broken batch raises before the response-mask callback).
-    # Splitting finalization defers the positions phase to the width seam, so
-    # a policy not in force must not split it.
     widening = target_width is not None or (
         width_policy is not None and getattr(width_policy, "armed", True)
     )
@@ -9667,12 +9658,10 @@ def _build_response_masked_vlm_batch(
         """Width seam: pad to the chosen endpoint, then record positions."""
         target = target_width
         if target is None and widening and width_policy is not None:
-            # The compile-visible width exists only now, after expansion.
             target = _resolve_stream_vlm_target(
                 batch_dict, config, processor, width_policy,
             )
         if target is None:
-            # Exact width is still a compiled signature.
             return _prepare_vlm_batch_for_compile(
                 batch_dict, config, phase="positions",
             ) if widening else batch_dict
@@ -11657,13 +11646,7 @@ def _vlm_has_sized_index_space(dataset):
 
 
 def _resolve_stream_vlm_target(batch_dict, config, processor, width_policy):
-    """Endpoint for a streamed VLM batch, or None to keep its exact width.
-
-    Widening is refused rather than attempted when it could not materialize:
-    no pad id to fill with, a batch the survey cannot prove right-paddable, or
-    an endpoint an untouched array already occupies. Such a batch still
-    compiles at its own width, which keeps it inside the cap.
-    """
+    """Endpoint for a streamed VLM batch, or None when widening cannot materialize."""
     ids = batch_dict.get("input_ids")
     shape = getattr(ids, "shape", None)
     if shape is None or len(shape) < 2:
@@ -11671,8 +11654,6 @@ def _resolve_stream_vlm_target(batch_dict, config, processor, width_policy):
     tokenizer = getattr(processor, "tokenizer", processor)
     if getattr(tokenizer, "pad_token_id", None) is None:
         return None
-    # The survey exists only to pick an endpoint; skip it while the policy is
-    # not choosing one.
     if getattr(width_policy, "holding", False):
         return None
     width, _axes, padable, forbidden = _vlm_width_survey(
@@ -11681,8 +11662,7 @@ def _resolve_stream_vlm_target(batch_dict, config, processor, width_policy):
     if not padable or width is None:
         return None
     target = width_policy(int(width))
-    # Bump past extents an untouched array occupies; the grid is strictly
-    # increasing, so this terminates on that batch's finite set.
+    # Bump past extents an untouched array occupies.
     seen = 0
     while target is not None and target in forbidden and seen <= len(forbidden):
         target = width_policy(int(target) + 1)
@@ -11693,13 +11673,7 @@ def _resolve_stream_vlm_target(batch_dict, config, processor, width_policy):
 
 
 def _widen_finalized_vlm_batch(batch_dict, config, processor, width_policy):
-    """Widen a finalized VLM batch onto the grid, then set positions.
-
-    The prefetch path's terminal width point; the synchronous path reaches the
-    same policy through the builder's width seam, after response masking.
-    Producer-staged streams have no mask to order against — they are rejected
-    at iterator entry.
-    """
+    """Prefetch-path widening of a finalized VLM batch, then positions."""
     target = _resolve_stream_vlm_target(
         batch_dict, config, processor, width_policy,
     )
@@ -11765,8 +11739,6 @@ def _iterate_lazy_vlm_training_batches(
             completion_only_loss=completion_only_loss,
             yield_host_staged=yield_host_staged,
             reject_mlx_valued=reject_mlx_valued,
-            # The synchronous path widens here, after expansion and masking;
-            # producer-staged batches widen in the prefetcher's finalize.
             width_policy=None if yield_host_staged else width_policy,
         )
 
@@ -12077,14 +12049,7 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
                 None,
                 prefetch_depth,
                 skip_batches=prefetch_skip_batches,
-                # The prefetch path's terminal width point. Safe to widen
-                # here: response-masked streams are rejected at iterator entry,
-                # so no mask can follow. Chosen on the policy's presence and
-                # never on ``armed``: this generator body runs at the first
-                # advance, which the audio peek performs before the policy is
-                # armed, so latching on ``armed`` would pin the plain finalizer
-                # and the stream would never widen. Widening is identity while
-                # the policy declines, so deciding per call is safe.
+                # Select on presence, not ``armed``: this body runs (audio peek) before arming.
                 finalize=(
                     _finalize_vlm_batch
                     if width_policy is None
@@ -12476,11 +12441,7 @@ def _make_text_batch_from_items(batch_items, tokenizer, max_seq_length):
 
 def _stage_text_batch_from_items(batch_items, tokenizer, max_seq_length,
                                  host_valued=True, width_policy=None):
-    """Build a text training batch from tokenized items.
-
-    ``width_policy`` replaces the mlx-lm rounding rule; ``None`` keeps it, as
-    unguarded runs do.
-    """
+    """Build a text training batch from tokenized items."""
     valid_items = [item for item in batch_items if item is not None]
     with_offsets = bool(
         valid_items
@@ -12512,8 +12473,7 @@ def _stage_text_batch_from_items(batch_items, tokenizer, max_seq_length,
         )
     pad_id = getattr(tokenizer, "pad_token_id", None)
     pad_id = 0 if pad_id is None else int(pad_id)
-    # The grid replaces the rounding rule (it caps at max_seq_length and
-    # carries its own floor); a policy returning None is not in force.
+    # The grid replaces the rounding rule; it caps at max_seq_length itself.
     max_length = None if width_policy is None else width_policy(max(lengths))
     if max_length is None:
         max_length = _finite_text_pad_width(

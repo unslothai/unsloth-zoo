@@ -1620,19 +1620,11 @@ def _effective_compile_mode(compile_policy, compile_decision):
 
 
 class _StreamWidthPolicy:
-    """Grid width policy a streaming producer consults for every batch.
+    """Grid width policy consulted per batch; returns None while disarmed or holding.
 
-    Handed over disarmed (returns None, so staging keeps its own rule) because
-    staging is wired before the compile decision resolves; the trainer arms
-    this same object later, which also reaches a running prefetch thread.
-
-    An armed policy still declines while the run has compiled no more than
-    ``exact_ceiling`` signatures, so a stream whose diversity never justifies
-    a grid pays no padding. Declining is per batch rather than a disarm so
-    that nothing has to be re-decided when it changes: every seam reads this
-    object when it stages, including the prefetch finalizers, which select on
-    the policy's presence rather than on ``armed`` precisely because their
-    generator body runs before arming.
+    Created disarmed (staging is wired before the compile decision) and armed
+    in place later, so a running prefetch thread sees it. Prefetch finalizers
+    select on the policy's presence, not ``armed``: their body runs before arming.
     """
 
     __slots__ = ("grid", "armed", "exact_ceiling", "observed", "gate_released")
@@ -1645,14 +1637,6 @@ class _StreamWidthPolicy:
         self.gate_released = False
 
     def arm(self, registry, phases_per_endpoint=1, in_flight=0):
-        """Arm against the set the cap binds on, so the exact allowance and
-        the bound it protects are counted in the same units.
-
-        ``phases_per_endpoint`` is how many compiled signatures one width
-        costs, which gradient accumulation raises above one. ``in_flight`` is
-        how many batches a prefetch producer may have staged exact before the
-        consumer reaches the release.
-        """
         self.observed = registry.observed
         self.exact_ceiling = stream_exact_ceiling(
             self.grid, registry.cap, phases_per_endpoint, in_flight,
@@ -1661,8 +1645,7 @@ class _StreamWidthPolicy:
 
     @property
     def holding(self):
-        """True while the exact allowance still applies. Lets a caller skip
-        work whose only purpose is choosing an endpoint."""
+        """True while the exact allowance still applies."""
         return (
             self.armed
             and self.exact_ceiling is not None
@@ -1678,11 +1661,7 @@ class _StreamWidthPolicy:
 
 
 def _stream_execution_key():
-    """The default device/stream pair the next compiled call will key on.
-
-    A runtime not exposing these has no compile cache to bound, so an
-    unreadable pair collapses to one constant rather than failing the step.
-    """
+    """Default device/stream pair the next compiled call keys on."""
     try:
         device = mx.default_device()
         return (str(device), str(mx.default_stream(device)))
@@ -1691,21 +1670,11 @@ def _stream_execution_key():
 
 
 def _stream_batch_signature(batch_data, phase, execution_key):
-    """Conservative key for one compiled call on a streamed batch.
-
-    Covers each argument leaf's shape and dtype, the accumulation phase, and
-    the default device/stream pair, which a step callback may legally change
-    mid-run. Finer than the true key is safe: the guard can only degrade
-    early, never late.
-    """
+    """Conservative (finer than true) compile key for a streamed batch."""
     if isinstance(batch_data, dict):
-        # A family the serializer cannot certify may span several real cache
-        # keys, so it is reported rather than recorded: counting it as one
-        # would understate the cache and make the cap unsound.
+        # Uncertifiable families may span several cache keys; never count them as one.
         family = _vlm_batch_family(batch_data)
         if not _vlm_family_is_plannable(family):
-            # None means uncertifiable; the family rides along so a strict
-            # refusal can name what it refused.
             return None, family
         return (phase, family, execution_key)
     leaves = []
@@ -1720,12 +1689,7 @@ def _stream_batch_signature(batch_data, phase, execution_key):
 
 
 class _StreamSignatureRegistry:
-    """Compiled signatures one streaming run has already paid for.
-
-    An unsized stream has no plan to cap, so the cap binds on what was
-    actually compiled. Scoped to one compiled callable, like the cache it
-    stands in for.
-    """
+    """Compiled signatures one streaming run has paid for; the cap binds on these."""
 
     __slots__ = (
         "cap", "observed", "tripped", "trip_reason", "uncertified",
@@ -1755,10 +1719,7 @@ def _stream_guard_report(policy, registry, compile_scope):
     """Final streaming-guard telemetry, built once the counts are settled."""
     grid = policy.grid
     return StreamShapeGuardReport(
-        # A run whose policy never released its exact allowance must not
-        # report a grid action. Tracks the policy's own transition, not
-        # per-batch outcomes: a released policy may still hand back an
-        # endpoint equal to the width it was given.
+        # Keyed on the policy's release, not per-batch widths.
         action="stream_grid" if policy.gate_released else "stream_exact",
         reason="streaming",
         cap=registry.cap,
@@ -2915,18 +2876,10 @@ class MLXTrainer:
 
     def _admit_stream_batch(self, registry, batch_data, compile_scope,
                             grad_accum, microstep, world_size):
-        """Decide whether one streamed batch may take the compiled path.
+        """True = go eager for the run, ``"eager_batch"`` = this batch only.
 
-        ``batch_data`` is None for a microstep not reaching a compiled call; it
-        still participates so the collective schedule stays fixed. Returns True
-        to hand the run over to the eager step, ``"eager_batch"`` for this
-        batch alone.
-
-        Exactly one reduction per fetch: an all-max where 2 (a rank failed)
-        dominates 1 (would trip) dominates 0. Consensus before acting keeps the
-        world uniform — a rank tripping alone would leave peers compiled, and
-        the runtime-fallback protocol reruns a step on every rank, which an
-        already-eager rank cannot repeat without drawing again from its RNG.
+        One all-max per fetch (2 failed > 1 trip > 0), even for ``batch_data=None``,
+        so every rank switches together: a lone eager rank cannot replay a step's RNG.
         """
         key = None
         uncertifiable = False
@@ -2960,8 +2913,6 @@ class MLXTrainer:
         if key is not None:
             registry.record(key)
         elif uncertifiable:
-            # Neither compiled nor counted, so an uncertifiable family
-            # cannot spend capacity certified ones need.
             registry.uncertified += 1
             return "eager_batch"
         return False
@@ -6204,26 +6155,14 @@ class MLXTrainer:
             and _use_compile
             and not _ddp_compile_local_grad
         ):
-            # The full-step callable captures optimizer.state, and MLX
-            # optimizers build per-parameter state lazily at the first update —
-            # two cache entries for one signature. Initialize before compile
-            # setup consumes this list, then refresh the captured entry, which
-            # an initializer may have replaced rather than filled. Safe over a
-            # resumed checkpoint: MLX initializes only per-parameter state that
-            # is still empty, so restored moments and step count survive.
+            # Lazy optimizer state would give one signature two cache entries;
+            # init now (keeps resumed state) and refresh the captured, maybe replaced, entry.
             try:
                 optimizer.init(model.trainable_parameters())
                 state[1] = optimizer.state
             except Exception as _init_error:
-                # Refresh here too: the initializer may have replaced the
-                # container before raising, and the eager steps below must not
-                # read the pre-initialization object.
                 state[1] = optimizer.state
-                # Captured state that changes later makes one batch signature
-                # several cache entries, and nothing bounds how often an
-                # unknown optimizer reshapes it — so no signature count can
-                # bound the cache. Compilation stops instead: an eager stream
-                # compiles nothing, closing the failure outright.
+                # Unbounded state reshapes make the cache unboundable: go eager.
                 _stream_capture_stable = False
                 if _effective_compile_mode(
                     compile_policy, _compile_decision,
@@ -7673,24 +7612,18 @@ class MLXTrainer:
             and _stream_capture_stable
             and _compile_scope in (FULL_STEP_SCOPE, DDP_LOCAL_GRAD_SCOPE)
         ):
-            # Armed only now: compile setup can still fall back to eager, and
-            # arming earlier would grid-pad that run, add a collective it does
-            # not need, and report a plan that never existed.
+            # Armed only after compile setup can no longer fall back to eager.
             _stream_registry = _StreamSignatureRegistry(
                 resolve_compile_max_variants(args.compile_max_variants),
             )
             _stream_policy.arm(
                 _stream_registry,
                 stream_phase_count(_compile_scope, grad_accum),
-                # Effective, not configured: DDP and non-lazy sources turn
-                # prefetch off, and reserving for a producer that will never
-                # run costs the allowance for nothing.
+                # Effective prefetch depth, not configured.
                 getattr(args, "streaming_prefetch_batches", 0)
                 if (getattr(self, "_mlx_prefetch_control", None)
                     and self._mlx_prefetch_control.get("eligible")) else 0,
             )
-            # A later fallback rewrites _compile_scope, which would make the
-            # report describe a callable that compiled none of these.
             _stream_scope = _compile_scope
             _main_print(describe_stream_shape_grid(
                 _stream_policy.grid, _stream_registry.cap,
@@ -7831,8 +7764,6 @@ class MLXTrainer:
                     distributed_world_size,
                 )
                 if _stream_trip == "eager_batch":
-                    # Uncertifiable family: eager for this batch, compiled
-                    # again next fetch.
                     if _effective_compile_mode(
                         compile_policy, _compile_decision,
                     ) == "strict":
@@ -7850,8 +7781,6 @@ class MLXTrainer:
                     if _effective_compile_mode(
                         compile_policy, _compile_decision,
                     ) == "strict":
-                        # Every rank saw the same reduced signal, so all ranks
-                        # raise together here.
                         raise RuntimeError(
                             "Unsloth: strict mx.compile exceeded the "
                             f"{_stream_registry.cap}-signature cap on a "
@@ -7868,9 +7797,7 @@ class MLXTrainer:
                         "compile_max_variants to change this bound."
                     )
                     _stream_registry.trip("signature_cap")
-                    # The runtime compile fallback's handover, so DDP
-                    # local-grad restores its own eager step. The batch in hand
-                    # is reused: re-fetching would consume the source.
+                    # Reuse the batch in hand: re-fetching would consume the source.
                     if _ddp_compile_local_grad:
                         step_fn = _ddp_eager_local_step_fn
                         _ddp_compile_local_grad = False
@@ -7879,8 +7806,6 @@ class MLXTrainer:
                     _use_compile = False
                     _compile_scope = "fallback_eager"
                     _compile_fallback_reason = "stream_signature_cap"
-                    # Nothing compiled will consume a grid width again, so the
-                    # eager tail should not keep paying to pad onto one.
                     _stream_policy.armed = False
                     state = [
                         model.state, optimizer.state, mx.random.state,
@@ -7889,8 +7814,6 @@ class MLXTrainer:
 
             _step_fn_for_batch = step_fn
             if _stream_eager_batch:
-                # Only a VLM mapping is uncertifiable and unsized VLM streams
-                # are refused under DDP, so this is single-process today.
                 _step_fn_for_batch = (
                     _ddp_eager_local_step_fn if _ddp_compile_local_grad
                     else _uncompiled_step_fn
@@ -7944,9 +7867,7 @@ class MLXTrainer:
                 except (ValueError, RuntimeError, TypeError) as e:
                     _is_compile_failure = (
                         _use_compile
-                        # Bypassed the compiled callable, so this is not a
-                        # compile failure: classifying it as one would rerun
-                        # the batch and degrade the whole run.
+                        # Bypassed the compiled callable: not a compile failure.
                         and not _stream_eager_batch
                         and not _ddp_compile_local_grad
                         and _is_compile_exception(e)
@@ -8864,9 +8785,7 @@ class MLXTrainer:
                     int(getattr(self, "_mlx_resume_step_for_prefetch", 0))
                     * args.gradient_accumulation_steps
                 )
-                # Anchor-free: expansion decides the compile-visible width and
-                # exceeds max_seq_length, so an endpoint below a batch's own
-                # width could never materialize.
+                # Anchor-free: expansion can exceed max_seq_length.
                 self._mlx_stream_width_policy = (
                     _StreamWidthPolicy(StreamShapeGrid()) if vlm_lazy else None
                 )
@@ -9014,15 +8933,11 @@ class MLXTrainer:
                     int(getattr(self, "_mlx_resume_step_for_prefetch", 0))
                     * args.gradient_accumulation_steps
                 )
-                # Disarmed: whether this run compiles is unresolved, and the
-                # grid must not touch widths unless the guard takes effect.
                 self._mlx_stream_width_policy = (
                     _StreamWidthPolicy(
                         StreamShapeGrid(anchor=int(args.max_seq_length)),
                     )
                     if (
-                        # Only the unsized-source branch consults the policy; a
-                        # map-style run keeps its own widths.
                         _is_mlx_lazy_text_source(train_dataset)
                         and int(args.max_seq_length) >= STREAM_GRID_FLOOR_WIDTH
                     )

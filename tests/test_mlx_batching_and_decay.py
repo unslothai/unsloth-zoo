@@ -2534,18 +2534,12 @@ def test_vlm_plan_reports_an_image_file_rewritten_after_the_plan_was_built(tmp_p
 
 
 def test_stream_grid_widens_vlm_batches_at_the_consumer_width_seam():
-    """The consumer width seam works on whatever width finalization produced —
-    for VLM that is the post-expansion width, which may exceed max_seq_length,
-    so the grid is anchor-free. Widening that could not materialize (no pad id,
-    or an endpoint an untouched array occupies) is refused or bumped rather
-    than attempted. The processor here emits the wide batch directly; the
-    expansion step itself is covered by the finite-plan VLM tests."""
+    """VLM widens at the post-expansion width; unmaterializable targets are refused or bumped."""
     _skip_if_mlx_core_was_replaced()
     from unsloth_zoo.mlx.shape_guard import StreamShapeGrid
     from unsloth_zoo.mlx.utils import _build_response_masked_vlm_batch
 
     class _ExpandingProcessor(_ContentProcessor):
-        # Post-expansion width, past max_seq_length, with a grid for its image.
         def __call__(self, text, **_kwargs):  # noqa: D401
             width = 40 + 7 * max(int(item) for item in text)
             rows = [[int(item), 200] + [2] * (width - 2) for item in text]
@@ -2570,18 +2564,15 @@ def test_stream_grid_widens_vlm_batches_at_the_consumer_width_seam():
     )
 
     raw_width = int(plain["input_ids"].shape[1])
-    # Guarded lands on a grid endpoint at or above the expanded width.
     assert raw_width > 8
     guarded_width = int(guarded["input_ids"].shape[1])
     assert guarded_width == grid.endpoint_for(raw_width)
-    # Content preserved, pad tail masked, positions rebuilt at the padded width.
     assert guarded["input_ids"][:, :raw_width].tolist() == plain["input_ids"].tolist()
     assert guarded["attention_mask"][:, raw_width:].sum().item() == 0
     assert int(guarded["position_ids"].shape[-1]) == guarded_width
     assert (guarded["position_ids"][..., :raw_width].tolist()
             == plain["position_ids"].tolist())
 
-    # Unmaterializable widening keeps the exact width instead of aborting.
     from unsloth_zoo.mlx.utils import _resolve_stream_vlm_target
 
     class _NoPadTokenizer(_TinyTokenizer):
@@ -2593,7 +2584,6 @@ def test_stream_grid_widens_vlm_batches_at_the_consumer_width_seam():
     assert _resolve_stream_vlm_target(
         plain, config, _NoPadProcessor(), grid.endpoint_for,
     ) is None
-    # An occupied endpoint is bumped past, never handed to the finalizer.
     bumped = dict(plain)
     bumped["media_extent"] = mx.zeros((1, guarded_width), dtype=mx.int32)
     target = _resolve_stream_vlm_target(
