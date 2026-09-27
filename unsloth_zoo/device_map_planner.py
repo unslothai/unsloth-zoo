@@ -874,8 +874,7 @@ def _merged_parameter_patterns(model: nn.Module, hf_quantizer: Any = None) -> li
             return []
     patterns = _merging_target_patterns(conversions)
     if not patterns:
-        # A text_only load builds the bare decoder of a VLM, whose own model_type registers no
-        # conversions; unsloth carries the parent's in at load time, so plan for them too.
+        # text_only VLM decoder: no conversions of its own, unsloth carries the parent's in at load.
         try:
             from transformers.conversion_mapping import get_checkpoint_conversion_mapping
         except Exception:

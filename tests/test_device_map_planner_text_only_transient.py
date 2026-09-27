@@ -50,7 +50,6 @@ def _meta_minimax_m3_text(layers = 6):
 
 
 def test_text_only_decoder_has_no_conversions_of_its_own():
-    # The premise: the bare decoder's model_type registers nothing; the loader borrows the VLM's.
     model = _meta_minimax_m3_text()
     assert get_checkpoint_conversion_mapping(model.config.model_type) is None
     assert get_checkpoint_conversion_mapping("minimax_m3_vl")
