@@ -931,7 +931,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
                         x = CPU_BUFFERS[CPU_INDEX]
                         if x.dtype != arg.dtype:
-                            # copy_ would convert silently, so the replay would see another dtype (fp16 layers, fp32 slots).
+                            # copy_ would convert silently, so the replay would see another dtype (forced-float32 fp16 layers, bf16 slots).
                             with _no_inference_mode():
                                 x = _new_host_buffer(max(new_size, x.numel()), arg.dtype)
                             CPU_BUFFERS[CPU_INDEX] = x
