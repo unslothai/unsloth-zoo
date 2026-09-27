@@ -1427,3 +1427,14 @@ def test_rdna1_later_kernel_hub_decorations_never_resolve_fla(monkeypatch):
     bound = decorate("chunk_gated_delta_rule", "fla")(torch_path)
     assert bound is torch_path and bound(1) == 2
     assert hub_kernels.use_kernel_func_from_hub_with_fallback.__wrapped__ is original
+
+
+def test_fp32_l2norm_keeps_float64_precision():
+    torch = pytest.importorskip("torch")
+    from unsloth_zoo.temporary_patches.fla_vendor import _fp32_l2norm
+
+    x = torch.randn(4, 8, dtype = torch.float64) * 1e-3
+    ref = x * torch.rsqrt((x * x).sum(-1, keepdim = True) + 1e-6)
+    out = _fp32_l2norm(x)
+    assert out.dtype == torch.float64
+    assert torch.equal(out, ref)
