@@ -743,8 +743,7 @@ def test_fp8_preserves_non_fp8_buffer_dtypes(tmp_path):
 
 
 def test_fp8_static_activation_scales_are_dropped(tmp_path):
-    """Static FP8 (Mistral layout) stores `activation_scale` per Linear and `<key>_activation_scale`
-    per fused expert stack; both belong to the FP8 weight and must not reach a 16bit export."""
+    """Static FP8 (Ministral-3, Mistral-Small-4) `.activation_scale` / fused `_activation_scale` are dropped."""
     from unsloth_zoo.saving_utils import _merge_and_overwrite_lora
 
     torch.manual_seed(3)
@@ -763,14 +762,13 @@ def test_fp8_static_activation_scales_are_dropped(tmp_path):
         "model.layers.0.mlp.experts.gate_up_proj_activation_scale": torch.tensor([0.05]),
         "model.norm.weight": torch.ones(8, dtype=torch.bfloat16),
     })
-    # The activation scale of a weight in the other shard is dropped by the post-pass.
     _write_shard(s2, {
         "model.layers.1.self_attn.q_proj.weight": W_fp8.clone(),
         "model.layers.1.self_attn.q_proj.weight_scale_inv": scale.clone(),
         "model.layers.0.self_attn.k_proj.activation_scale": torch.tensor(0.05),
         "model.layers.0.self_attn.k_proj.weight_scale_inv": scale.clone(),
     })
-    # k_proj weight lives in shard 1 (cross-shard companions).
+    # k_proj weight in shard 1, its scales in shard 2: dropped by the post-pass.
     with safe_open(str(s1), framework="pt", device="cpu") as f:
         t = {k: f.get_tensor(k) for k in f.keys()}
     t["model.layers.0.self_attn.k_proj.weight"] = W_fp8.clone()
