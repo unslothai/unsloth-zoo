@@ -17,6 +17,7 @@
 __all__ = [
     "train_on_responses_only",
     "get_chat_template_parts",
+    "is_trl_padding_free_collator",
     "sft_prepare_dataset",
     "standardize_data_formats",
     "patch_torchcodec_audio_decoder",
@@ -282,6 +283,14 @@ def get_chat_template_parts(tokenizer):
     tail = lambda s: s[s.rfind(U) + len(U):] if U in s else ""
     _gen_on, _gen_off = render(end_user, True), render(end_user, False)
     asst_header = "" if _gen_on == _gen_off else strip_shared(tail(_gen_on), tail(_gen_off))[0]
+    user_term = tail(_gen_off)
+    _rest = user_term
+    while _rest:
+        _t = next((s for s in specials if _rest.startswith(s)), None) or \
+             (re.match(r"\s+", _rest) and re.match(r"\s+", _rest).group())
+        if not _t: break
+        _rest = _rest[len(_t):]
+    if _rest: user_term = ""
 
     if asst_header and resp_gap.endswith(asst_header) and len(asst_header) < len(resp_gap):
         # Header template (Llama/Gemma/Qwen/Phi-4): terminator is the resp_gap prefix
@@ -300,6 +309,19 @@ def get_chat_template_parts(tokenizer):
         # empty prefixes, so an unset eos never strips a bare "\n".
         response_part    = strip_lead(resp_gap, " ", "\t", eos, bos)
         instruction_part = strip_lead(instr_gap, " ", "\t", eos, bos)
+
+    # Command A Vision splits the terminator with an image: "<|END_TEXT|><|IMG_PATCH|><|END_OF_TURN_TOKEN|>".
+    if user_term and response_part.startswith(user_term) and len(user_term) < len(response_part):
+        try:
+            with_image = render([
+                {"role": "user", "content": [{"type": "text", "text": U}, {"type": "image"}]},
+                {"role": "assistant", "content": awrap(A)},
+            ], False)
+            if response_part not in with_image and response_part[len(user_term):] in with_image:
+                response_part = response_part[len(user_term):]
+                instruction_part = strip_lead(instruction_part, user_term)
+        except Exception:
+            pass
 
     # Reasoning templates inject thinking-block scaffolding into the generation prompt
     # that a real assistant turn ("<think>...</think>answer") does not carry right after
@@ -670,6 +692,24 @@ class _MediaAwareCollator:
 pass
 
 
+def is_trl_padding_free_collator(collator):
+    """Is this TRL's `DataCollatorForLanguageModeling` in padding-free mode?
+
+    Such a collator flattens the batch, emits `position_ids` and consumes the
+    `labels` column, so replacing it costs padding-free batching and any
+    `torch_call` wrapper installed on the instance.
+
+    Matched by MRO and module prefix rather than by importing TRL: the class is
+    optional at runtime, and an unrelated collator that merely carries a truthy
+    `padding_free` must not qualify.
+    """
+    return bool(getattr(collator, "padding_free", False)) and any(
+        cls.__name__ == "DataCollatorForLanguageModeling" and cls.__module__.startswith("trl.")
+        for cls in type(collator).__mro__
+    )
+pass
+
+
 def train_on_responses_only(
     trainer,
     instruction_part  = None,
@@ -765,6 +805,32 @@ def train_on_responses_only(
     len_Q_must = len(Q_must)
     Q_left_reversed = Q_left[::-1]
     Q_right_forward = Q_right
+
+    # A shared special-token opener delimits every role, tool and system included; a
+    # plain-text common prefix could also occur inside an answer.
+    message_start = []
+    for q, a in zip(Q_must, A_must):
+        if q != a: break
+        message_start.append(q)
+    # all_special_ids holds only the attribute specials (bos/eos/pad/unk), so the opener -
+    # <|im_start|>, <|start_header_id|>, <start_of_turn> - has to come from added_tokens_decoder.
+    # Whitespace is rejected: Nemotron's bare "\n" special would cut every span at a newline.
+    added_tokens = getattr(tokenizer, "added_tokens_decoder", None) or {}
+    special_ids  = {i for i, t in added_tokens.items() if getattr(t, "special", False)}
+    special_ids.update(getattr(tokenizer, "all_special_ids", None) or [])
+    if not all(i in special_ids for i in message_start) or \
+        not any(getattr(added_tokens.get(i), "content", "").strip() for i in message_start):
+        message_start = []
+    bos_token_id = getattr(tokenizer, "bos_token_id", None)
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+
+    # Every boundary test below fires only on one of these ids: one set lookup per token
+    # replaces four comparisons, over every token of every row.
+    boundary_first = {A_first}
+    if bos_token_id is not None: boundary_first.add(bos_token_id)
+    if eos_token_id is not None: boundary_first.add(eos_token_id)
+    if message_start: boundary_first.add(message_start[0])
+
     torch_Tensor = torch.Tensor
     torch_int64  = torch.int64
 
@@ -805,7 +871,6 @@ def train_on_responses_only(
             n_minus_1 = n - 1
             j = 0
 
-            # Collect all (assistant_k, user_j) spans for this sample
             spans = []
             while j < n:
                 # Find <assistant>
@@ -819,18 +884,33 @@ def train_on_responses_only(
                         else: break
                     pass
                     for optional_right in A_right_forward:
-                        if k >= n_minus_1: break
-                        if optional_right == input_ids[k+1]: k += 1
+                        if k >= n: break
+                        if optional_right == input_ids[k]: k += 1
                         else: break
                     pass
                     # assistant_j = j
                     assistant_k = k
 
                     j = assistant_k
-                    # Find the next <user> (or the final item if assistant is last)
+                    # Keep the assistant's EOS, but never span another message/sample.
                     while j < n:
+                        token = input_ids[j]
+                        if token in boundary_first:
+                            if token == eos_token_id:
+                                spans.append((assistant_k, j + 1))
+                                break
+                            if token == bos_token_id or \
+                                (message_start and token == message_start[0] and \
+                                 input_ids[j : j + len(message_start)] == message_start) or \
+                                (token == A_first and input_ids[j : j + len_A_must] == A_must):
+                                spans.append((assistant_k, j))
+                                # Revisit the boundary so a following assistant is not skipped.
+                                j -= 1
+                                break
+                            pass
+                        pass
                         if (j == n_minus_1) or \
-                            ((input_ids[j] == Q_first) and \
+                            ((token == Q_first) and \
                              (input_ids[j : (k := j + len_Q_must)] == Q_must)):
 
                             # Extend over optional tokens, backward then forward
@@ -840,16 +920,15 @@ def train_on_responses_only(
                                 else: break
                             pass
                             for optional_right in Q_right_forward:
-                                if k >= n_minus_1: break
-                                if optional_right == input_ids[k+1]: k += 1
+                                if k >= n: break
+                                if optional_right == input_ids[k]: k += 1
                                 else: break
                             pass
                             user_j = j
                             # Account for last item
                             if user_j != n_minus_1:
-                                # user_k = k
-                                # j = user_k
-                                j = k
+                                # Outer j += 1 lands on k, so an empty user turn cannot hide the next marker.
+                                j = k - 1
                             else:
                                 user_j = n
                                 k = n
@@ -2043,6 +2122,9 @@ def train_on_responses_only(
     # Edit data collator to DataCollatorForSeq2Seq. Collators that rebuild labels
     # from a processor already returned above, so what is left here only pads.
     _collator = getattr(trainer, "data_collator", None)
+    # TRL's padding-free collator preserves labels and builds position_ids.
+    # Keep the instance so Unsloth's sequence-length wrapper survives too.
+    _padding_free_collator = is_trl_padding_free_collator(_collator)
     # A collator holding a processor (DataCollatorForSeq2Seq/WithPadding) pads
     # through a `.pad` processors do not have, so it dies on the first batch;
     # rebuild it around the unwrapped text tokenizer. A collator holding no
@@ -2059,7 +2141,8 @@ def train_on_responses_only(
     # anything was mapped.
     if hasattr(trainer, "data_collator") and (
         _processor_backed or _bypassed_vision_collator
-        or (not isinstance(_collator, DataCollatorForSeq2Seq) and not packing_enabled)
+        or (not isinstance(_collator, DataCollatorForSeq2Seq)
+            and not packing_enabled and not _padding_free_collator)
     ):
         # Keep the caller's settings when only swapping the tokenizer on a seq2seq
         # collator; for any other class this is a replacement, not a swap, and its
@@ -2270,6 +2353,18 @@ def train_on_responses_only(
 pass
 
 
+def _normalize_role_alias(role):
+    """Module level, not a closure: `_standardize_dataset` is sent through
+    `dataset.map(num_proc = ...)` and has to pickle."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    return role.strip().lower()
+pass
+
+
+# Only ever used to break a tie no value can break, so unconventional names are unaffected.
+_ROLE_KEY_NAMES = ("role", "from")
+
+
 def standardize_data_formats(
     dataset,
     tokenizer             = None,
@@ -2311,21 +2406,44 @@ def standardize_data_formats(
     assert(len(uniques.keys()) == 2)
 
     keys = list(uniques.keys())
-    length_first  = len(set(uniques[keys[0]]))
-    length_second = len(set(uniques[keys[1]]))
+    all_aliases = set(
+        _normalize_role_alias(alias)
+        for alias in (aliases_for_system + aliases_for_user + aliases_for_assistant)
+    )
 
-    if length_first < length_second:
-        # Role is assigned to the first element
-        role_key    = keys[0]
-        content_key = keys[1]
+    # The cardinality heuristic below ties on small datasets, picks the content column, and
+    # the alias check then rejects the user's own text.
+    alias_keys = [
+        key for key in keys
+        if set(_normalize_role_alias(value) for value in uniques[key]) <= all_aliases
+    ]
+
+    # Both columns alias-only is real: {"role": "user", "content": "assistant"} comes out
+    # swapped with no error anywhere. The key NAMES are the only tiebreak left.
+    named_role_keys = [key for key in keys if str(key).strip().lower() in _ROLE_KEY_NAMES]
+
+    if len(alias_keys) == 1:
+        role_key    = alias_keys[0]
+        content_key = keys[1] if keys[0] == role_key else keys[0]
+    elif len(alias_keys) == 2 and len(named_role_keys) == 1:
+        role_key    = named_role_keys[0]
+        content_key = keys[1] if keys[0] == role_key else keys[0]
     else:
-        role_key    = keys[1]
-        content_key = keys[0]
+        length_first  = len(set(uniques[keys[0]]))
+        length_second = len(set(uniques[keys[1]]))
+
+        if length_first < length_second:
+            # Role is assigned to the first element
+            role_key    = keys[0]
+            content_key = keys[1]
+        else:
+            role_key    = keys[1]
+            content_key = keys[0]
+        pass
     pass
 
     # Check roles are in aliases
-    all_aliases = set(aliases_for_system + aliases_for_user + aliases_for_assistant)
-    roles = set(uniques[role_key])
+    roles = set(_normalize_role_alias(value) for value in uniques[role_key])
     leftover_aliases = (all_aliases | roles) - all_aliases
     if len(leftover_aliases) != 0:
         raise TypeError(
@@ -2333,19 +2451,45 @@ def standardize_data_formats(
         )
     pass
 
-    # Mapping for aliases
+    # Normalization can collapse two aliases the caller meant to keep apart ("Human" for
+    # user, "human" for assistant), silently relabelling every such message. Refuse instead.
     aliases_mapping = {}
-    for x in aliases_for_system:    aliases_mapping[x] = "system"
-    for x in aliases_for_user:      aliases_mapping[x] = "user"
-    for x in aliases_for_assistant: aliases_mapping[x] = "assistant"
+    for group, role in (
+        (aliases_for_system, "system"),
+        (aliases_for_user, "user"),
+        (aliases_for_assistant, "assistant"),
+    ):
+        for x in group:
+            key = _normalize_role_alias(x)
+            previous = aliases_mapping.get(key)
+            if previous is not None and previous != role:
+                raise TypeError(
+                    f"Unsloth: the alias {x!r} normalizes to {key!r}, which is already "
+                    f"mapped to {previous!r}, so it cannot also mean {role!r}. Alias "
+                    f"lists are compared case insensitively and without surrounding "
+                    f"whitespace; give each role aliases that differ by more than that."
+                )
+            aliases_mapping[key] = role
+
+    # Normalise only on a miss and memoise the spelling this dataset uses, capped so a
+    # pathological dataset cannot grow the dict without limit.
+    _ALIAS_MEMO_LIMIT = 64
 
     def _standardize_dataset(examples):
         convos = examples["conversations"]
         all_convos = []
+        lookup = aliases_mapping.get
         for convo in convos:
             new_convo = []
             for message in convo:
-                role = aliases_mapping[message[role_key]]
+                raw_role = message[role_key]
+                role = lookup(raw_role)
+                if role is None:
+                    role = aliases_mapping[_normalize_role_alias(raw_role)]
+                    if len(aliases_mapping) < _ALIAS_MEMO_LIMIT:
+                        aliases_mapping[raw_role] = role
+                    pass
+                pass
                 text = message[content_key]
                 if is_vlm: text = [ {"type" : "text", "text" : text} ]
                 x = {"role" : role, "content" : text}
@@ -2624,7 +2768,9 @@ def sft_prepare_dataset(
     if packing:
         # Use TRL's pack_dataset if available
         try:
-            pack_dataset
+            # A presence probe, not a use: TRL exports pack_dataset only on some
+            # versions, and the bare name is what the except below is for.
+            pack_dataset  # noqa: F821
         except:
             print("Unsloth: Hugging Face's packing is currently buggy - we're disabling it for now!")
             return dataset
@@ -2633,7 +2779,7 @@ def sft_prepare_dataset(
             raise ValueError("When packing is enabled, `max_seq_length` can't be `None`.")
 
         if use_desc: map_kwargs["desc"] = f"Unsloth: Packing {dataset_name} dataset"
-        dataset = pack_dataset(
+        dataset = pack_dataset(  # noqa: F821 -- reached only past the probe above.
             dataset.select_columns(used_column_names),
             max_seq_length,
             getattr(args, "packing_strategy", "bfd"),

@@ -100,12 +100,10 @@ def _check(repo, ins, res):
         return "SKIP", f"{type(e).__name__}"
     if not hasattr(proc, "image_processor"):
         return "SKIP", "no image_processor"
-    # (A) constructor
     cA = UnslothVisionDataCollator(model, proc, train_on_responses_only=True,
                                    instruction_part=ins, response_part=res)
     if not _content_exact(cA, proc):
         return "FAIL", "constructor masking wrong"
-    # (B) in-place
     cB = UnslothVisionDataCollator(model, proc)
     if cB.train_on_responses_only is not None:
         return "FAIL", "bare collator already had masking"

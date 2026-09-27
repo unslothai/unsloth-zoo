@@ -98,7 +98,6 @@ def test_active_layer_k_norm_and_q_norm_still_raises():
 def test_non_qk_norm_mismatch_passes_through():
     from unsloth_zoo.mlx.loader import _raise_if_qk_norm_version_gap
 
-    # Other extra-weight mismatches / unrelated errors must pass through.
     _raise_if_qk_norm_version_gap(
         "gemma4",
         "Received 4 parameters not in model: per_layer_model_projection.scales",

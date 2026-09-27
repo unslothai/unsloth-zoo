@@ -147,8 +147,6 @@ def _real_post_hook():
     return hooks[0]
 
 
-# ---------------------------------------------------------------- eager path
-
 def test_pre_hook_still_fires_eagerly():
     hook = _real_pre_hook()
     x = torch.randn(2, 8)
@@ -169,8 +167,6 @@ def test_post_hook_still_fires_eagerly():
     hook(None, None, y)
     assert y.requires_grad
 
-
-# -------------------------------------------------------------- under compile
 
 def test_pre_hook_no_ops_while_compiling(monkeypatch):
     hook = _real_pre_hook()
@@ -281,7 +277,6 @@ def test_compiled_frozen_embedding_still_carries_gradients():
     assert "requires_grad_post_hook" in hooks[0].__qualname__
     assert not embedding.weight.requires_grad
 
-    # aot_eager keeps this off inductor's C++ codegen; the hook behaviour is the same.
     hidden_states = torch.compile(embedding, backend = "aot_eager")(
         torch.randint(0, 16, (2, 4))
     )
@@ -290,8 +285,6 @@ def test_compiled_frozen_embedding_still_carries_gradients():
     checkpoint(layer, hidden_states, use_reentrant = True).float().sum().backward()
     assert layer.adapter.weight.grad is not None, "no gradient reached the adapter"
 
-
-# ---------------------------------------------------------------- source shape
 
 def _guarded_functions(path, names):
     """Which of `names` open with `if torch.compiler.is_compiling(): return`?"""

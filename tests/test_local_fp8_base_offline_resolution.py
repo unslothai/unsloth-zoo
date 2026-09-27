@@ -98,8 +98,6 @@ def _same_path(a, b):
     return os.path.realpath(str(a)) == os.path.realpath(str(b))
 
 
-# The regression: a repo-id shaped local FP8 directory with the Hub down.
-
 @pytest.mark.parametrize("error", _TRANSPORT_ERRORS)
 @pytest.mark.parametrize("quant_config", [
     pytest.param(FP8_CONFIG,        id = "finegrained-fp8"),
@@ -148,8 +146,6 @@ def test_local_fp8_fallback_emits_no_warning(monkeypatch, tmp_path, error):
     assert [str(w.message) for w in caught
             if issubclass(w.category, UserWarning)] == []
 
-
-# Everything the merge cannot complete offline must keep raising.
 
 @pytest.mark.parametrize("error", _TRANSPORT_ERRORS)
 @pytest.mark.parametrize("quant_config, label", [
@@ -207,8 +203,6 @@ def test_the_4bit_merges_still_fall_back_at_any_quantization(monkeypatch, tmp_pa
     assert is_local is True
     assert source == "local_nf4"
 
-
-# A half downloaded snapshot is not a base the merge can read.
 
 def _shard(directory, name):
     open(os.path.join(directory, name), "wb").close()
@@ -502,8 +496,6 @@ def test_no_local_copy_still_raises(monkeypatch, tmp_path, error):
         saving_utils.determine_base_model_source("unsloth/does-not-exist")
 
 
-# A reachable Hub stays authoritative: nothing that resolved before changed.
-
 def test_reachable_hub_16bit_repo_still_outranks_the_local_fp8_copy(monkeypatch, tmp_path):
     """Catching the failure rather than hoisting priority 5 is what preserves this: with
     the Hub up, the 16bit repo still wins at priority 3."""
@@ -570,9 +562,6 @@ def test_local_mxfp4_still_resolves_before_the_probe(monkeypatch, tmp_path):
     assert source == "local_mxfp4"
     assert quant_type == "mxfp4"
 
-
-# The FP8 16bit sibling lookup must not report "no sibling" for a Hub it could not
-# reach.
 
 @pytest.mark.parametrize("error", _TRANSPORT_ERRORS)
 def test_sibling_lookup_says_so_when_the_hub_is_unreachable(monkeypatch, tmp_path, error):

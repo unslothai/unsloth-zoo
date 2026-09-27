@@ -22,19 +22,46 @@ Runs under the GPU-free harness in tests/conftest.py; no GPU required.
 from __future__ import annotations
 
 import importlib
+import os
 
 import pytest
 
+# Every `temporary_patches` submodule imports torch, so on a runner without it this whole
+# suite is a precondition failure, not a finding: 37 of its 40 cases go red on merge base
+# too. The macOS staging runner is one, because pyproject declares no torch on darwin/arm64.
+# The two sibling suites in the same CI step already guard this way.
+pytest.importorskip("torch")
 
-# ---------------------------------------------------------------------------
+
+# The switch `__init__.py:179` reads into _SKIP_GPU_INIT, which the device-capacity tests
+# below are entirely about: with it on, the import skips device detection and DEVICE_TYPE
+# becomes "cpu", so gpt_oss takes its `else` branch and device_memory is 0 rather than the
+# stubbed card's capacity. A child that inherits it therefore fails on a real GPU-less
+# machine and on a machine with a card, for a reason that is neither.
+#
+# It is inheritable in an ordinary run: hf_xet_fallback sets it on the PARENT process
+# around a download spawn (hf_xet_fallback.py:1520). So strip it here rather than assume
+# nothing in the session ever turns it on.
+_GPU_INIT_GATE = "UNSLOTH_ZOO_DISABLE_GPU_INIT"
+
+
+def _child_env(**overrides: str) -> dict:
+    """This process's environment minus the switch that would skip what is under test."""
+    env = {k: v for k, v in os.environ.items() if k != _GPU_INIT_GATE}
+    env.update(overrides)
+    return env
+
+
 # Per-submodule import smoke. Explicit (not a glob) so a silent drop or rename
 # surfaces as a missing test; new files must be added to this list.
-# ---------------------------------------------------------------------------
 
 
 TEMPORARY_PATCHES_SUBMODULES = [
     "unsloth_zoo.temporary_patches.common",
     "unsloth_zoo.temporary_patches.bitsandbytes",
+    "unsloth_zoo.temporary_patches.bitsandbytes_large_tensors",
+    "unsloth_zoo.temporary_patches.compiled_model_identity",
+    "unsloth_zoo.temporary_patches.conversion_mapping_rescope",
     "unsloth_zoo.temporary_patches.deepseek_v3_moe",
     "unsloth_zoo.temporary_patches.ernie4_5_moe",
     "unsloth_zoo.temporary_patches.fla_vendor",
@@ -48,14 +75,19 @@ TEMPORARY_PATCHES_SUBMODULES = [
     "unsloth_zoo.temporary_patches.gemma4_moe",
     "unsloth_zoo.temporary_patches.glm4_moe",
     "unsloth_zoo.temporary_patches.gpt_oss",
+    "unsloth_zoo.temporary_patches.inkling",
     "unsloth_zoo.temporary_patches.lfm2_moe",
+    "unsloth_zoo.temporary_patches.llama4_moe",
     "unsloth_zoo.temporary_patches.ministral",
     "unsloth_zoo.temporary_patches.amd_aiter",
+    "unsloth_zoo.temporary_patches.fp8_uncontained_weights",
     "unsloth_zoo.temporary_patches.misc",
     "unsloth_zoo.temporary_patches.muse_glimmer_banded_attention",
     "unsloth_zoo.temporary_patches.mixtral_moe",
     "unsloth_zoo.temporary_patches.moe_bnb",
+    "unsloth_zoo.temporary_patches.moe_experts_interface",
     "unsloth_zoo.temporary_patches.moe_grouped_modulelist",
+    "unsloth_zoo.temporary_patches.moe_triton_kernels",
     "unsloth_zoo.temporary_patches.moe_utils",
     "unsloth_zoo.temporary_patches.moe_utils_bnb4bit",
     "unsloth_zoo.temporary_patches.moe_utils_fp8",
@@ -66,6 +98,7 @@ TEMPORARY_PATCHES_SUBMODULES = [
     "unsloth_zoo.temporary_patches.qwen3_moe_float32",
     "unsloth_zoo.temporary_patches.qwen3_next_moe",
     "unsloth_zoo.temporary_patches.qwen3_vl_moe",
+    "unsloth_zoo.temporary_patches.step3p7_moe",
     "unsloth_zoo.temporary_patches.utils",
 ]
 
@@ -129,16 +162,14 @@ def test_gpt_oss_imports_without_visible_gpus():
     """gpt_oss.py computes device_memory at import; with UNSLOTH_ALLOW_CPU=1
     DEVICE_TYPE stays "cuda" on GPU-less hosts, so the capacity lookup must be
     guarded. Subprocess so conftest's mem_get_info stub cannot mask it."""
-    import os
     import subprocess
     import sys
 
-    env = {
-        **os.environ,
-        "UNSLOTH_ALLOW_CPU": "1",
-        "CUDA_VISIBLE_DEVICES": "",
-        "HIP_VISIBLE_DEVICES": "",
-    }
+    env = _child_env(
+        UNSLOTH_ALLOW_CPU = "1",
+        CUDA_VISIBLE_DEVICES = "",
+        HIP_VISIBLE_DEVICES = "",
+    )
     result = subprocess.run(
         [sys.executable, "-c",
          "import unsloth_zoo.temporary_patches.gpt_oss; print('IMPORT_OK')"],
@@ -154,7 +185,6 @@ def test_xet_submodule_import_does_not_query_free_device_memory():
     gpt_oss only needs total capacity to select combo-kernel options. Device
     properties provide that without the context-creating mem_get_info call.
     """
-    import os
     import subprocess
     import sys
 
@@ -185,11 +215,7 @@ assert gpt_oss.device_memory == Props.total_memory
 assert gpt_oss.use_combo_kernels is True
 print("IMPORT_OK")
 '''
-    env = {
-        **os.environ,
-        "UNSLOTH_IS_PRESENT": "1",
-        "UNSLOTH_ALLOW_CPU": "1",
-    }
+    env = _child_env(UNSLOTH_IS_PRESENT = "1", UNSLOTH_ALLOW_CPU = "1")
     result = subprocess.run(
         [sys.executable, "-c", script],
         env=env, capture_output=True, text=True, timeout=600,
@@ -205,7 +231,6 @@ def test_flex_attention_import_does_not_query_free_device_memory():
     mem_get_info() here would put back the context the gpt_oss fix removes for anyone
     who reaches the flex-attention path.
     """
-    import os
     import subprocess
     import sys
 
@@ -235,11 +260,7 @@ from unsloth_zoo.flex_attention import utils
 assert utils.kernel_options is None, utils.kernel_options
 print("IMPORT_OK")
 '''
-    env = {
-        **os.environ,
-        "UNSLOTH_IS_PRESENT": "1",
-        "UNSLOTH_ALLOW_CPU": "1",
-    }
+    env = _child_env(UNSLOTH_IS_PRESENT = "1", UNSLOTH_ALLOW_CPU = "1")
     result = subprocess.run(
         [sys.executable, "-c", script],
         env=env, capture_output=True, text=True, timeout=600,

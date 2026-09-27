@@ -25,6 +25,9 @@ import warnings
 import gc
 import threading
 from .utils import _get_dtype, Version
+# Re-exported under its old name: it lives in integrated_device.py so the import-time
+# allocator block can share the topic without importing torch.
+from .integrated_device import _any_device_integrated
 from .device_type import (
     is_hip,
     get_device_type,
@@ -59,19 +62,6 @@ INITIAL_CPU_BUFFER_COUNT = 200             # number of CPU buffers
 DOUBLE_BUFFER_HEADROOM = 512 * 1024 * 1024 # min free CUDA memory to enable double buffering
 
 
-def _any_device_integrated():
-    # True if ANY visible CUDA/HIP device is integrated (unified memory). A single
-    # static check on purpose: an integrated device anywhere makes double buffering
-    # pure overhead, and a mixed integrated + discrete box is rare.
-    try:
-        return any(
-            bool(getattr(torch.cuda.get_device_properties(i), "is_integrated", 0))
-            for i in range(torch.cuda.device_count())
-        )
-    except Exception:
-        return False
-
-
 @functools.cache
 def _double_buffer_disabled():
     # Cached: computed once on the first GC init (after device selection), never at
@@ -84,6 +74,87 @@ def _double_buffer_disabled():
     if env is not None: return env == "1"
     if DEVICE_TYPE not in ("cuda", "hip"): return False
     return _any_device_integrated()
+
+
+# Pinned (page-locked) host memory is a far smaller budget than VRAM or RAM, and
+# exhausting it looks like a bare "CUDA error: out of memory" on an empty GPU. WSL2
+# caps it near 1-2GB and refuses single pinned allocations past a few MB, so fall
+# back to pageable memory (slower, no compute overlap) instead of dying. See
+# unslothai/unsloth 338, 1552, 1744, 1797 and https://docs.nvidia.com/cuda/wsl-user-guide/index.html#known-limitations-for-linux-cuda-applications
+PINNED_MEMORY_AVAILABLE = True
+_WARNED_ABOUT_PINNED_MEMORY = False
+
+
+def _pinned_memory_disabled():
+    return os.environ.get("UNSLOTH_DISABLE_PINNED_MEMORY", "0") == "1"
+
+
+def _is_host_alloc_oom(exception):
+    # torch >= 2.9 raises AcceleratorError, older torch RuntimeError; both subclass RuntimeError.
+    text = str(exception).lower()
+    return ("out of memory" in text) or ("cudaerrormemoryallocation" in text)
+
+
+def _warn_pinned_unavailable(detail):
+    global PINNED_MEMORY_AVAILABLE, _WARNED_ABOUT_PINNED_MEMORY
+    PINNED_MEMORY_AVAILABLE = False
+    if _WARNED_ABOUT_PINNED_MEMORY: return
+    _WARNED_ABOUT_PINNED_MEMORY = True
+    print(
+        "Unsloth: Could not allocate pinned (page-locked) host memory for gradient "
+        "checkpointing offload, so pageable host memory will be used instead. "
+        "Training continues and results are unchanged, but the offload copies no "
+        "longer overlap with compute, so each step is somewhat slower.\n"
+        f"Unsloth: The allocator reported: {detail}\n"
+        "Unsloth: This is normal under WSL2, which caps pinned memory per process. "
+        "Set UNSLOTH_DISABLE_PINNED_MEMORY=1 to skip pinning from the start."
+    )
+
+
+# Tensor.is_pinned() is a cudaPointerGetAttributes driver query, not a cached flag,
+# and the two offload copies run once per checkpointed layer per micro batch. Cache
+# the answer on the buffer itself instead of in a list parallel to CPU_BUFFERS: a
+# parallel list can drift out of step with the slot it describes and claim a pageable
+# buffer is pinned, which would issue an async copy out of pageable memory. Readers
+# use getattr(..., False), so an unmarked buffer only costs a synchronous copy.
+HOST_PINNED_ATTR = "_unsloth_is_pinned"
+
+
+def _mark_host_buffer(buffer):
+    """Record whether `buffer` is page-locked. Call wherever a host buffer is made or regrown."""
+    try:
+        pinned = buffer.is_pinned()
+    except Exception:
+        pinned = False
+    try:
+        setattr(buffer, HOST_PINNED_ATTR, pinned)
+    except AttributeError:
+        pass  # exotic tensor subclass; readers fall back to False
+    return buffer
+
+
+def _new_host_buffer(numel, dtype):
+    if not (PINNED_MEMORY_AVAILABLE and not _pinned_memory_disabled()):
+        return _mark_host_buffer(torch.empty(numel, dtype = dtype, device = "cpu"))
+    try:
+        return _mark_host_buffer(torch.empty(numel, dtype = dtype, device = "cpu", pin_memory = True))
+    except RuntimeError as e:
+        if not _is_host_alloc_oom(e): raise
+        _warn_pinned_unavailable(e)
+        return _mark_host_buffer(torch.empty(numel, dtype = dtype, device = "cpu"))
+
+
+def _grow_host_buffer(buffer, new_size):
+    """resize_ on a pinned buffer issues a fresh, larger cudaHostAlloc, which can fail."""
+    if new_size <= buffer.numel(): return _mark_host_buffer(buffer)
+    try:
+        buffer.resize_(new_size)
+        return _mark_host_buffer(buffer)
+    except RuntimeError as e:
+        if not _is_host_alloc_oom(e) or not buffer.is_pinned(): raise
+        _warn_pinned_unavailable(e)
+        # Pinning is gone for this slot, so the cached flag has to flip with it.
+        return _mark_host_buffer(torch.empty(new_size, dtype = buffer.dtype, device = "cpu"))
 
 
 @contextmanager
@@ -102,8 +173,9 @@ if Version(torch_version) < Version("2.4.0"):
     torch_amp_custom_fwd = torch.cuda.amp.custom_fwd
     torch_amp_custom_bwd = torch.cuda.amp.custom_bwd
 else:
-    torch_amp_custom_fwd = torch.amp.custom_fwd(device_type = "cuda")
-    torch_amp_custom_bwd = torch.amp.custom_bwd(device_type = "cuda")
+    _amp_device_type = "npu" if DEVICE_TYPE == "npu" else "cuda"
+    torch_amp_custom_fwd = torch.amp.custom_fwd(device_type = _amp_device_type)
+    torch_amp_custom_bwd = torch.amp.custom_bwd(device_type = _amp_device_type)
 pass
 
 
@@ -598,6 +670,8 @@ if DEVICE_TYPE in ("cuda", "hip"):
     torch_gpu_stream = torch.cuda.stream
 elif DEVICE_TYPE == "xpu":
     torch_gpu_stream = torch.xpu.stream
+elif DEVICE_TYPE == "npu":
+    torch_gpu_stream = torch.npu.stream
 
 CPU_BUFFERS = []
 CPU_INDEX = None
@@ -628,20 +702,37 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
             major_version, minor_version = torch.cuda.get_device_capability()
             SUPPORTS_BFLOAT16 = (major_version >= 8)
         elif DEVICE_TYPE == "hip":
-            SUPPORTS_BFLOAT16 = True
+            # Ask rather than assume: RDNA 1/2 (gfx101x, gfx103x) have no native bf16,
+            # so Triton picks a dot intrinsic LLVM cannot lower and the process dies
+            # with no Python exception (unslothai/unsloth issue 7922). Unpatched ROCm
+            # still answers True here, so this is inert until unsloth patches the probe.
+            SUPPORTS_BFLOAT16 = torch.cuda.is_bf16_supported()
         elif DEVICE_TYPE == "xpu":
             SUPPORTS_BFLOAT16 = True
+        elif DEVICE_TYPE == "npu":
+            SUPPORTS_BFLOAT16 = torch.npu.is_bf16_supported()
         dtype = torch.bfloat16 if SUPPORTS_BFLOAT16 else torch.float16
     pass
 
+    # Re-probe: an earlier model in this process may have tripped the fallback. Clear
+    # the warning latch too, otherwise a second model falls back silently.
+    global PINNED_MEMORY_AVAILABLE
+    global _WARNED_ABOUT_PINNED_MEMORY
+    PINNED_MEMORY_AVAILABLE = True
+    _WARNED_ABOUT_PINNED_MEMORY = False
     with _no_inference_mode():
-        for i in range(200):
-            x = torch.empty(128*1024, dtype = dtype, device = "cpu", pin_memory = True)
+        for i in range(INITIAL_CPU_BUFFER_COUNT):
+            x = _new_host_buffer(INITIAL_CPU_BUFFER_SIZE, dtype)
             CPU_BUFFERS.append(x)
     pass
 
     # Allocate one buffer per GPU
-    n_gpus = torch.cuda.device_count() if DEVICE_TYPE in ("cuda", "hip") else torch.xpu.device_count()
+    if DEVICE_TYPE in ("cuda", "hip"):
+        n_gpus = torch.cuda.device_count()
+    elif DEVICE_TYPE == "npu":
+        n_gpus = torch.npu.device_count()
+    else:
+        n_gpus = torch.xpu.device_count()
     NEXT_BUFFER_SLOT = [0] * n_gpus
     try:
         with _no_inference_mode():
@@ -663,6 +754,8 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
                     event_ctor = torch.cuda.Event
                 elif DEVICE_TYPE == "xpu":
                     event_ctor = torch.xpu.Event
+                elif DEVICE_TYPE == "npu":
+                    event_ctor = torch.npu.Event
                 else:
                     raise RuntimeError(f"Double buffering unsupported on {DEVICE_TYPE}")
                 BUFFER_EVENTS_A = tuple([event_ctor() for _ in range(n_gpus)])
@@ -683,11 +776,19 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
         raise
 
     BACKWARD_PASS = True
-    EXTRA_STREAMS = tuple([torch.cuda.Stream() if DEVICE_TYPE_TORCH == "cuda" else torch.xpu.Stream() for i in range(n_gpus)])
+    # A bare Stream() lands on the current device, so create each card's side stream on that card
+    if DEVICE_TYPE == "npu":
+        EXTRA_STREAMS = tuple([torch.npu.Stream(device = i) for i in range(n_gpus)])
+    elif DEVICE_TYPE_TORCH == "cuda":
+        EXTRA_STREAMS = tuple([torch.cuda.Stream(device = torch.device(f"cuda:{i}")) for i in range(n_gpus)])
+    else:
+        EXTRA_STREAMS = tuple([torch.xpu.Stream(device = torch.device(f"xpu:{i}")) for i in range(n_gpus)])
     if DEVICE_TYPE in ("cuda", "hip"):
         MAIN_STREAMS  = tuple([torch.cuda.default_stream(torch.device(f"cuda:{i}")) for i in range(n_gpus)])
     elif DEVICE_TYPE == "xpu":
         MAIN_STREAMS  = tuple([torch.xpu.current_stream(torch.device(f"xpu:{i}")) for i in range(n_gpus)])
+    elif DEVICE_TYPE == "npu":
+        MAIN_STREAMS  = tuple([torch.npu.default_stream(i) for i in range(n_gpus)])
 
     # Minimum size to enable Unsloth GC is 2MB -> 32 layers = 64MB
     n_bytes = torch.finfo(dtype).bits // 8
@@ -791,6 +892,8 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                                         free_mem, _ = torch.cuda.mem_get_info(device_index)
                                     elif DEVICE_TYPE == "xpu":
                                         free_mem, _ = torch.xpu.mem_get_info(device_index)
+                                    elif DEVICE_TYPE == "npu":
+                                        free_mem, _ = torch.npu.mem_get_info(device_index)
                                     else:
                                         free_mem = 0
                                 except Exception as e:
@@ -807,13 +910,17 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         # Extend buffer size
                         if CPU_INDEX >= len(CPU_BUFFERS):
                             with _no_inference_mode():
-                                x = torch.empty(new_size, dtype = arg.dtype, device = "cpu", pin_memory = True)
+                                x = _new_host_buffer(new_size, arg.dtype)
                             CPU_BUFFERS.append(x)
                         pass
 
                         x = CPU_BUFFERS[CPU_INDEX]
                         shape = arg.shape
-                        if new_size > x.numel(): x.resize_(new_size)
+                        if new_size > x.numel():
+                            with _no_inference_mode():
+                                x = _grow_host_buffer(x, new_size)
+                            # Backward reads this slot by index, so store the replacement back.
+                            CPU_BUFFERS[CPU_INDEX] = x
                         if new_size > GPU_BUFFER.numel():
                             try:
                                 GPU_BUFFER.resize_(new_size)
@@ -845,13 +952,17 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                                     GPU_BUFFERS_B = None
                                     print("Unsloth: Disabled double buffering due to insufficient VRAM.")
 
+                        # Read the cached flag off the slot itself, before the view is
+                        # taken: a view is a fresh object and does not carry the attribute.
+                        host_is_pinned = getattr(x, HOST_PINNED_ATTR, False)
                         x = x[:new_size].view(shape)
 
                         # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
                         EXTRA_STREAM.wait_stream(MAIN_STREAM)
                         # x is a normal (non-inference) buffer, so copy_ is safe (unsloth#3828).
                         with torch_gpu_stream(EXTRA_STREAM):
-                            x.copy_(arg, non_blocking = True)
+                            # Only a pinned destination gives a genuinely async copy.
+                            x.copy_(arg, non_blocking = host_is_pinned)
 
                         global NEXT_BUFFER_SLOT
                         buffer_slot = NEXT_BUFFER_SLOT[device_index]
@@ -918,7 +1029,9 @@ class UnslothCheckpointFunction(torch.autograd.Function):
             else:
                 buffer = GPU_BUFFERS[device_index][:new_size].view(shape)
 
-            x = CPU_BUFFERS[CPU_INDEX][:new_size].view(shape)
+            host_buffer = CPU_BUFFERS[CPU_INDEX]
+            host_is_pinned = getattr(host_buffer, HOST_PINNED_ATTR, False)
+            x = host_buffer[:new_size].view(shape)
 
             # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
             if USE_DOUBLE_BUFFER:
@@ -931,7 +1044,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
             # buffer is a normal (non-inference) buffer, so this reload copy_ is safe (unsloth#3828).
             with torch_gpu_stream(EXTRA_STREAM):
-                buffer.copy_(x, non_blocking = True)
+                buffer.copy_(x, non_blocking = host_is_pinned)
         else:
             # No GPU buffer seen
             if len(tensor_indices) != 0:
@@ -1164,7 +1277,8 @@ def unpatch_unsloth_smart_gradient_checkpointing():
         BUFFER_EVENTS_A = None
         BUFFER_EVENTS_B = None
         NEXT_BUFFER_SLOT = None
-        torch.cuda.empty_cache()
+        if DEVICE_TYPE == "npu": torch.npu.empty_cache()
+        else: torch.cuda.empty_cache()
         gc.collect()
 
     if (torch.utils.checkpoint.checkpoint.__name__ == "unsloth_checkpoint") and \
@@ -1220,6 +1334,8 @@ def reset_unsloth_gradient_checkpointing_buffers():
         if i < INITIAL_CPU_BUFFER_COUNT:
             if CPU_BUFFERS[i] is not None and hasattr(CPU_BUFFERS[i], "resize_"):
                 CPU_BUFFERS[i].resize_(INITIAL_CPU_BUFFER_SIZE)
+                # resize_ keeps the object and its pinning, but re-read rather than assume.
+                _mark_host_buffer(CPU_BUFFERS[i])
         else:
             if CPU_BUFFERS[i] is not None and hasattr(CPU_BUFFERS[i], "resize_"):
                 CPU_BUFFERS[i].resize_(0)
@@ -1271,6 +1387,8 @@ def reset_unsloth_gradient_checkpointing_buffers():
                 event_ctor = torch.cuda.Event
             elif DEVICE_TYPE == "xpu":
                 event_ctor = torch.xpu.Event
+            elif DEVICE_TYPE == "npu":
+                event_ctor = torch.npu.Event
             else:
                 raise RuntimeError(f"Double buffering unsupported on {DEVICE_TYPE}")
             BUFFER_EVENTS_A = tuple([event_ctor() for _ in range(n_gpus)])
@@ -1279,7 +1397,8 @@ def reset_unsloth_gradient_checkpointing_buffers():
         except RuntimeError:
             pass
 
-    torch.cuda.empty_cache()
+    if DEVICE_TYPE == "npu": torch.npu.empty_cache()
+    else: torch.cuda.empty_cache()
     gc.collect()
 pass
 
@@ -1287,10 +1406,13 @@ pass
 @torch._disable_dynamo
 def unsloth_offloaded_gradient_checkpoint(function, *args, use_reentrant = None, **kwargs):
     global CPU_BUFFERS
-    if len(CPU_BUFFERS) == 0:
+    # Not `len(...) == 0`: unpatch_unsloth_smart_gradient_checkpointing sets CPU_BUFFERS
+    # to None, which is the state this shim normally starts from, and len(None) raises.
+    if not CPU_BUFFERS:
         initialize_unsloth_gradient_checkpointing(args[0].dtype)
+    preserve = kwargs.pop("preserve_rng_state", True)
     function, tensor_args = _bind_checkpoint_kwargs(function, kwargs)
-    return UnslothCheckpointFunction.apply(function, *args, *tensor_args)
+    return UnslothCheckpointFunction.apply(function, preserve, *args, *tensor_args)
 pass
 
 # Unsloth Zoo - Utilities for Unsloth
