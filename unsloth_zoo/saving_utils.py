@@ -1611,6 +1611,18 @@ def _merge_moe_gate_or_up_expert(W, lora_stats, expert_idx, num_experts, output_
             num_experts = num_experts, out_dim = 2 * I, in_dim = H,
             lora_module = getattr(lora_stats, "module", None),
         )
+        # Ungated experts (NemotronH: experts.up_proj of I rows, no gate) carry an up LoRA
+        # whose output is I, not a fused 2 * I. Only tried after the fused check fails, and
+        # a fused LoRA can never match out_dim = I, so gated models are unaffected.
+        ungated = False
+        if layout == "unknown" and role == "up":
+            ungated_layout, ungated_r = _detect_moe_lora_layout(
+                lora_stats.lora_A, lora_stats.lora_B,
+                num_experts = num_experts, out_dim = I, in_dim = H,
+                lora_module = getattr(lora_stats, "module", None),
+            )
+            if ungated_layout != "unknown" and ungated_r > 0:
+                layout, r, ungated = ungated_layout, ungated_r, True
         if layout == "unknown" or r <= 0:
             _record_moe_merge_fallback(
                 role, expert_idx,
@@ -1636,13 +1648,13 @@ def _merge_moe_gate_or_up_expert(W, lora_stats, expert_idx, num_experts, output_
         b_f     = b_slice.to(device, dtype = torch.float32, non_blocking = True)
 
         if layout == "swapped":
-            half = a_f[:, :I] if role == "gate" else a_f[:, I:]
+            half = a_f if ungated else (a_f[:, :I] if role == "gate" else a_f[:, I:])
             delta = b_f @ half
             merged = W.to(device, dtype = torch.float32, non_blocking = True).add(
                 delta.transpose(0, 1), alpha = lora_stats.alpha,
             )
         else:
-            half = b_f[:I, :] if role == "gate" else b_f[I:, :]
+            half = b_f if ungated else (b_f[:I, :] if role == "gate" else b_f[I:, :])
             delta = half @ a_f
             merged = W.to(device, dtype = torch.float32, non_blocking = True).add(
                 delta, alpha = lora_stats.alpha,
