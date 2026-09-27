@@ -203,6 +203,22 @@ def test_a_size_changing_cast_through_the_host_is_exact(monkeypatch, src, dst):
 
 
 @cuda
+def test_no_room_for_a_chunk_uses_the_host_path(monkeypatch):
+    """The in-place path allocates one chunk on the device; the host path allocates none."""
+    from unsloth_zoo import patching_utils
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *a, **k: (patching_utils._FORCED_FLOAT32_CHUNK_BYTES - 1, 0))
+    taken = []
+    for name in ("_cast_in_place_same_size", "_cast_via_host_chunked"):
+        real = getattr(patching_utils, name)
+        monkeypatch.setattr(patching_utils, name, lambda p, d, _r = real, _n = name: (taken.append(_n), _r(p, d))[1])
+    big = _param_over_the_threshold()
+    expected = big.weight.detach().to(torch.float16)
+    _cast_module(big, torch.float16)
+    assert taken == ["_cast_via_host_chunked"]
+    assert torch.equal(big.weight.detach(), expected)
+
+
+@cuda
 def test_a_tied_parameter_is_cast_once_for_both_modules():
     emb = torch.nn.Embedding(int(_TEST_STAGE_BYTES // 2048) + 1024, 1024).cuda().to(torch.bfloat16)
     head = torch.nn.Linear(1024, emb.num_embeddings, bias = False).cuda()

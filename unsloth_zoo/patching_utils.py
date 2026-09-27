@@ -447,16 +447,18 @@ def _cast_via_host_chunked(param, dtype):
 
 def _cast_large_param(param, dtype):
     new_bytes = param.numel() * torch.empty(0, dtype = dtype).element_size()
-    if (
-        param.element_size() == torch.empty(0, dtype = dtype).element_size()
-        and param.data.is_contiguous()
-        and _storage_is_private(param)
-    ):
-        return _cast_in_place_same_size(param, dtype)
     try:
         free, _ = torch.cuda.mem_get_info(param.device)
     except Exception:
         free = 0
+    # The host path needs no device memory, so it is the fallback when not even a chunk fits.
+    if (
+        free >= _FORCED_FLOAT32_CHUNK_BYTES
+        and param.element_size() == torch.empty(0, dtype = dtype).element_size()
+        and param.data.is_contiguous()
+        and _storage_is_private(param)
+    ):
+        return _cast_in_place_same_size(param, dtype)
     if free >= new_bytes + _FORCED_FLOAT32_CHUNK_BYTES:
         param.data = param.data.to(dtype)
         return
