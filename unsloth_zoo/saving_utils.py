@@ -3808,12 +3808,9 @@ def _export_index_atomically(source_path, destination, payload, mode_from = None
 pass
 
 
-# merged_16bit drops the quantization config, so packed `weight_packed` shards would reload as
-# missing weights: MXFP4 and INT pack-quantized ones are decoded to a 16-bit `weight` first; other
-# packed formats (NVFP4, mixed groups) refuse.
+# merged_16bit drops the quantization config: MXFP4 / INT packed weights are decoded to 16-bit, other packed formats refuse.
 
 def _find_quantization_config(config):
-    """Kimi-K3 keeps ``quantization_config`` under ``text_config`` only."""
     if not isinstance(config, dict):
         return None
     quant = config.get("quantization_config")
@@ -3871,8 +3868,7 @@ _INT_PACKED_SUFFIXES = ("weight_packed", "weight_scale", "weight_shape", "weight
 
 
 def _compressed_int_pack_schemes(model_name, token = None):
-    """Weight args of every group of an all-``pack-quantized`` checkpoint, or a RuntimeError naming
-    why its merged_16bit export cannot be decoded exactly."""
+    """Weight args of every group of an all-``pack-quantized`` checkpoint; RuntimeError if not exactly decodable."""
     quant = _compressed_tensors_quantization_config(model_name, token) or {}
     refuse = lambda why: RuntimeError(  # noqa: E731
         f"Unsloth: `{model_name}` stores its weights compressed-tensors packed (pack-quantized) "
@@ -4006,7 +4002,6 @@ pass
 
 
 def _rewrite_compressed_int_shard(save_directory, filename, plan, output_dtype = None):
-    """Writes each decoded weight as `<base>.weight`; the LoRA merge that follows treats it as a dense one."""
     dtype = output_dtype or torch.bfloat16
     device = _active_merge_device()
     bases, elsewhere = plan["bases"], plan["elsewhere"]

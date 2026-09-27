@@ -108,7 +108,6 @@ def _grouped(inputs, param, counts, ends, transpose):
 
 
 class _Mxfp4GroupedLinear(torch.autograd.Function):
-    """Saves no weight: backward reads the packed W_e^T again."""
 
     @staticmethod
     def forward(ctx, inputs, param, counts, ends):
