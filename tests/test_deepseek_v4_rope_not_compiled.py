@@ -107,5 +107,5 @@ def test_other_models_keep_their_rope_decorator(child):
 
 def test_cached_rope_gradient_matches_transformers(child):
     if "grad_rel_err" not in child:
-        pytest.skip("needs CUDA: the out-of-bounds read is in the Triton backward kernel")
+        pytest.skip(reason = "needs CUDA: the out-of-bounds read is in the Triton backward kernel")
     assert child["grad_rel_err"] < 1e-5, child
