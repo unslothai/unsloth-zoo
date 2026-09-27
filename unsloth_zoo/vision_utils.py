@@ -34,6 +34,7 @@ from __future__ import annotations
 __all__ = [
     "process_vision_info",
     "UnslothVisionDataCollator",
+    "patch_medias_processor",
 ]
 
 # Canonical media placeholder tokens live in vlm_tokens so the CUDA and MLX paths
@@ -1244,6 +1245,79 @@ def _processor_takes_images(processor) -> bool:
 pass
 
 
+def _flatten_images(images):
+    flat = []
+    for item in images if isinstance(images, (list, tuple)) else [images]:
+        if isinstance(item, (list, tuple)):
+            flat.extend(_flatten_images(item))
+        elif item is not None:
+            flat.append(item)
+    return flat
+pass
+
+
+def patch_medias_processor(processor):
+    """Kimi K2.5 / K2.7 processors take `medias=[{"type": "image", "image": ...}]` and one
+    unpadded `text`, and raise on the standard `processor(text=..., images=...)` call.
+    Patch the class so that call works: images go through the media processor
+    (`pixel_values`, `grid_thws`) and texts through the tokenizer with padding. The model
+    expands each `<|media_pad|>` into its image features itself. The remote calls
+    (`messages=` or `medias=` + `text=`) are unchanged. Returns True if patched."""
+    import inspect
+    from transformers.feature_extraction_utils import BatchFeature
+    cls = type(processor)
+    if getattr(cls, "_unsloth_medias_patched", False):
+        return True
+    try:
+        params = inspect.signature(cls.__call__).parameters
+    except (TypeError, ValueError):
+        return False
+    if "medias" not in params or "images" in params:
+        return False
+    if not hasattr(processor, "tokenizer") or \
+        not hasattr(getattr(processor, "media_processor", None) or getattr(processor, "image_processor", None), "preprocess"):
+        return False
+    original_call = cls.__call__
+
+    def __call__(self, messages = None, medias = None, text = None, return_tensors = "pt", images = None, videos = None, **kwargs):
+        if messages is not None or medias is not None or text is None:
+            if images is not None or videos is not None:
+                raise ValueError("Unsloth: pass images through `medias=` when calling with `messages=` or `medias=`.")
+            return original_call(self, messages = messages, medias = medias, text = text, return_tensors = return_tensors, **kwargs)
+        if videos is not None:
+            raise NotImplementedError(
+                f"Unsloth: {cls.__name__} videos must go through `medias=` (video chunks); "
+                "the `videos=` call is not supported."
+            )
+        texts = [text] if isinstance(text, str) else list(text)
+        images = _flatten_images(images) if images is not None else []
+        pad = getattr(self, "image_token", None) or "<|media_pad|>"
+        n_pad = sum(t.count(pad) for t in texts)
+        if n_pad != len(images):
+            raise ValueError(
+                f"Unsloth: {cls.__name__} got {len(images)} images for {n_pad} `{pad}` placeholders in the text."
+            )
+        # Only tokenizer arguments; image options have no meaning for the media processor.
+        tok_keys = ("padding", "truncation", "max_length", "add_special_tokens", "pad_to_multiple_of",
+                    "padding_side", "return_attention_mask")
+        tok_kwargs = {k: kwargs[k] for k in tok_keys if k in kwargs and kwargs[k] is not None}
+        if len(texts) > 1:
+            tok_kwargs.setdefault("padding", True)
+        data = dict(self.tokenizer(texts if not isinstance(text, str) else text,
+                                   return_tensors = return_tensors, **tok_kwargs))
+        if images:
+            media_processor = getattr(self, "media_processor", None) or self.image_processor
+            medias = [{"type": "image", "image": image} for image in images]
+            data.update(media_processor.preprocess(medias, return_tensors = return_tensors).data)
+        return BatchFeature(data = data, tensor_type = return_tensors)
+    pass
+    __call__.__wrapped__ = original_call
+    cls.__call__ = __call__
+    cls._unsloth_medias_patched = True
+    return True
+pass
+
+
 def _tensorize_ragged_batch(batch):
     """Tensorize fields; ragged ones stay lists of tensors."""
     for key in list(batch.keys()):
@@ -1299,6 +1373,8 @@ class UnslothVisionDataCollator:
             raise TypeError("Unsloth: UnslothVisionDataCollator is only for image models!")
         self._seen_supervised = False
         self._warned_unsupervised = False
+        # Kimi K2.5 / K2.7: medias= API, see patch_medias_processor.
+        patch_medias_processor(processor)
 
         self.padding_token_ids = get_padding_tokens_ids(processor)
         self.dtype = _get_dtype(
