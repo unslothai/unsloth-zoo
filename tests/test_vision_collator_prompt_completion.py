@@ -201,3 +201,25 @@ def test_top_level_images_reach_processor(prompt):
     collator([{"images": [image], "prompt": prompt,
                "completion": completion if isinstance(prompt, list) else "x"}])
     assert collator.processor.seen_images[0] == [[image]]
+
+
+def test_top_level_image_urls_use_guarded_fetch(monkeypatch):
+    # A URL in the images column must be fetched by Unsloth's guarded loader, never handed to the processor.
+    import io
+    from PIL import Image
+    import unsloth_zoo.vision_utils as vu
+
+    buf = io.BytesIO()
+    Image.new("RGB", (32, 32)).save(buf, format = "PNG")
+    fetched = []
+    def fake_fetch(url):
+        fetched.append(url)
+        return io.BytesIO(buf.getvalue())
+    monkeypatch.setattr(vu, "fetch_remote_media_bytes", fake_fetch)
+
+    collator = make_collator(None)
+    collator.processor = _ChatProcessor()
+    collator.assistant_single_content = False
+    collator([{"images": ["https://example.com/a.png"], "prompt": "<img> a", "completion": "x"}])
+    assert fetched == ["https://example.com/a.png"]
+    assert isinstance(collator.processor.seen_images[0][0][0], Image.Image)

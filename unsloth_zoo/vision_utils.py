@@ -1785,7 +1785,12 @@ class UnslothVisionDataCollator:
         try:
             msg_list = (p_msgs or []) + (c_msgs or [])
             if example.get("images"):
-                imgs = list(example["images"])
+                # Non-PIL entries go through fetch_image's SSRF guard; processors like Idefics2 fetch URLs unguarded.
+                imgs = [
+                    img if isinstance(img, Image.Image)
+                    else fetch_image({"image": img}, size_factor=self.patch_size*2)
+                    for img in example["images"]
+                ]
                 vids = []
             elif msg_list:
                 imgs, vids, vids_kwarg = process_vision_info(
