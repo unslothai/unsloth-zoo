@@ -99,6 +99,8 @@ def _run(case, tmp_path):
     ssd.mkdir(parents = True)
     for d in (root / "mamba_ssm", root / "mamba_ssm" / "ops", ssd):
         (d / "__init__.py").write_text("")
+    # Like the real package (via mamba_ssm.modules.mamba2); transformers 5.15 resolves from the root module only.
+    (root / "mamba_ssm" / "__init__.py").write_text("import mamba_ssm.ops.triton.ssd_combined\n")
     (ssd / "ssd_combined.py").write_text(STUB_SSD)
     if case == "conv_ok":
         conv = root / "causal_conv1d"
