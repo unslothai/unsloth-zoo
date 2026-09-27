@@ -142,8 +142,7 @@ def test_the_staged_cast_preserves_values():
 
 
 def _values_with_extremes(rows):
-    """bfloat16 values including ones float16 cannot hold, so `.to()` itself
-    produces inf and zero; the bounded cast must agree bit for bit."""
+    """Includes values float16 overflows and underflows."""
     w = torch.randn(rows, 1024, dtype = torch.float32)
     w[0, :4] = torch.tensor([1e5, -1e5, 1e-9, -1e-9])
     return w.to(torch.bfloat16).cuda()
@@ -189,8 +188,6 @@ def test_without_the_use_count_api_nothing_is_rewritten_in_place(monkeypatch):
 @cuda
 @pytest.mark.parametrize("src, dst", [(torch.float32, torch.float16), (torch.bfloat16, torch.float32)])
 def test_a_size_changing_cast_through_the_host_is_exact(monkeypatch, src, dst):
-    """No room on the device forces the host path; it must stage in the target
-    dtype so host memory holds one tensor, not a source copy plus the result."""
     from unsloth_zoo import patching_utils
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *a, **k: (0, 0))
     staged = []
@@ -230,9 +227,7 @@ def _rss_anon():
     reason = "needs /proc RSS accounting and in-place casting",
 )
 def test_a_large_cast_does_not_stage_through_host_memory():
-    """The failure this guards: a 5.25 GiB embedding staged via
-    `.to("cpu", dtype = ...)` briefly held 10.5 GiB of host RAM and a Colab T4
-    VM (12.7 GiB) OOM-killed the kernel while loading gemma-4 E4B."""
+    """Guards the gemma-4 E4B load being OOM-killed on a Colab T4 VM."""
     import threading, time
     big = torch.nn.Embedding(128 * 1024, 1024).cuda().to(torch.bfloat16)   # 256 MiB
     size = big.weight.numel() * big.weight.element_size()
