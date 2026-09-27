@@ -1313,6 +1313,132 @@ def patch_mamba_ssm_pre_ampere_fallback():
 TEMPORARY_PATCHES.append(patch_mamba_ssm_pre_ampere_fallback)
 
 
+def _mamba_fused_split_needs_causal_conv1d_unusable():
+    """True when mamba_ssm is installed but its fused split path cannot run.
+
+    mamba_ssm's `mamba_split_conv1d_scan_combined` calls
+    `causal_conv1d.cpp_functions.causal_conv1d_fwd_function` unconditionally,
+    and binds it to None when causal_conv1d cannot be imported (missing, or
+    blocked by Unsloth because its binary is ABI-broken). The CUDA probe above
+    also nullifies `causal_conv1d.causal_conv1d_fn` when the kernels have no
+    image for this GPU; the cpp functions share that binary.
+    """
+    try:
+        import importlib.util
+        if importlib.util.find_spec("mamba_ssm") is None:
+            return False
+    except Exception:
+        return False
+    try:
+        import causal_conv1d
+        from causal_conv1d.cpp_functions import causal_conv1d_fwd_function
+    except Exception:
+        return True
+    if causal_conv1d_fwd_function is None:
+        return True
+    if getattr(causal_conv1d, "causal_conv1d_fn", None) is None:
+        return True
+    return False
+
+
+def patch_mamba_fused_split_without_causal_conv1d():
+    """Keep Mamba2-family training off mamba_ssm's fused split path when
+    causal_conv1d is unusable.
+
+    transformers 5 resolves `mamba2_split_conv1d_scan_combined` to mamba_ssm's
+    fused kernel whenever mamba_ssm imports, and calls it in train mode with no
+    cache (Falcon-H1, NemotronH, GraniteMoeHybrid, Bamba, Mamba2, Zamba2). That
+    kernel needs causal_conv1d, so without it the first training forward raises
+    `TypeError: 'NoneType' object is not callable` (ssd_combined.py). The
+    modeling code already treats a None result as "no fused kernel" and runs
+    the split path: torch conv1d plus mamba_ssm's Triton chunk scan, which
+    needs no causal_conv1d. Route to that path by resolving the fused function
+    to transformers' own reference, which returns None.
+    """
+    if not _mamba_fused_split_needs_causal_conv1d_unusable():
+        return
+    try:
+        import transformers.integrations as _integrations
+        from transformers.integrations import hub_kernels as _hk
+    except Exception:
+        return
+    _original = getattr(_hk, "use_kernel_func_from_hub_with_fallback", None)
+    if _original is None:
+        return  # transformers < 5: gated by is_fast_path_available instead
+
+    import sys
+
+    if not getattr(_original, "_unsloth_no_causal_conv1d", False):
+        def use_kernel_func_from_hub_with_fallback(func_name, package, internal_path = None):
+            if func_name != "mamba_split_conv1d_scan_combined" or package != "mamba_ssm":
+                return _original(func_name, package, internal_path)
+            def decorator(torch_function):
+                try:
+                    return _hk.use_kernel_forward_from_hub(func_name)(torch_function)
+                except Exception:
+                    return torch_function
+            return decorator
+        use_kernel_func_from_hub_with_fallback._unsloth_no_causal_conv1d = True
+        use_kernel_func_from_hub_with_fallback.__wrapped__ = _original
+        _hk.use_kernel_func_from_hub_with_fallback = use_kernel_func_from_hub_with_fallback
+        try:
+            setattr(_integrations, "use_kernel_func_from_hub_with_fallback", use_kernel_func_from_hub_with_fallback)
+        except Exception:
+            pass
+    pass
+
+    # Modules imported before this patch already bound the fused kernel.
+    # `__dict__`, never getattr: transformers 5 alias modules import on access.
+    for _module_name, _module in list(sys.modules.items()):
+        if _module is None:
+            continue
+        if not (_module_name.startswith("transformers.models.") or "unsloth_compiled_module" in _module_name):
+            continue
+        try:
+            _fn = _module.__dict__.get("mamba2_split_conv1d_scan_combined", None)
+        except Exception:
+            continue
+        if _fn is None or getattr(_fn, "_unsloth_no_causal_conv1d", False):
+            continue
+        _resolves_to_mamba_ssm = False
+        _stack, _seen = [(_fn, 0)], set()
+        while _stack and not _resolves_to_mamba_ssm:
+            _g, _depth = _stack.pop()
+            if id(_g) in _seen or _depth > 6:
+                continue
+            _seen.add(id(_g))
+            _inner = [getattr(_g, "__wrapped__", None)]
+            for _cell in (getattr(_g, "__closure__", None) or ()):
+                try:
+                    _inner.append(_cell.cell_contents)
+                except ValueError:
+                    pass
+            for _c in _inner:
+                if not callable(_c):
+                    continue
+                if str(getattr(_c, "__module__", None) or "").startswith("mamba_ssm"):
+                    _resolves_to_mamba_ssm = True
+                    break
+                _stack.append((_c, _depth + 1))
+        if not _resolves_to_mamba_ssm:
+            continue
+        _stub = functools.wraps(_fn)(lambda *a, **k: None)
+        _stub._unsloth_no_causal_conv1d = True
+        _module.mamba2_split_conv1d_scan_combined = _stub
+    pass
+
+    if not getattr(patch_mamba_fused_split_without_causal_conv1d, "_warned", False):
+        patch_mamba_fused_split_without_causal_conv1d._warned = True
+        logger.warning(
+            "Unsloth: `causal_conv1d` is not usable, so Mamba2-family models "
+            "(Falcon-H1, Nemotron-H, Granite-4 hybrid, Bamba, Zamba2) skip mamba_ssm's "
+            "fused kernel and train with a PyTorch conv1d plus the chunked scan. "
+            "Install a causal_conv1d build matching this torch for full speed."
+        )
+pass
+TEMPORARY_PATCHES.append(patch_mamba_fused_split_without_causal_conv1d)
+
+
 def patch_datasets_map_worker_death_retry():
     """Retry `Dataset.map` single-process when a worker is killed outright.
 
