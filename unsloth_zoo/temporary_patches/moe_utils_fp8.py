@@ -495,7 +495,8 @@ def _dequantize_full_expert_weights(weight: torch.Tensor, quant_state, target_dt
 
 
 def _make_grouped_mm_rhs_column_major(weight: torch.Tensor) -> torch.Tensor:
-    return weight.mT.contiguous()
+    # Same (E, K, N) shape, column-major strides, as _scaled_grouped_mm requires of mat_b.
+    return weight.mT.contiguous().mT
 
 
 def _try_attach_block_size(tensor, block_size):
@@ -579,10 +580,8 @@ def _extract_scaled_grouped_mm_weight_scale(original_weight, processed_weight, q
     if scale.shape[0] != processed_weight.shape[0] or scale.shape[1] != processed_weight.shape[-1]:
         return None
 
-    scale = scale.to(torch.float32)
-    if quant_kind == "weight_scale_inv":
-        scale = scale.reciprocal()
-    return scale.contiguous()
+    # `weight_scale_inv` is already the dequant multiplier (w = q * s), like `weight_scale`.
+    return scale.to(torch.float32).contiguous()
 
 
 def _prepare_scaled_grouped_mm_weight(experts_module, param_name: str, proj_type: str, hidden_dim: int, model_type=None):
