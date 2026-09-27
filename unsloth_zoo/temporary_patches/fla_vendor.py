@@ -19,7 +19,9 @@
 Env: ``UNSLOTH_DISABLE_VENDORED_FLA=1`` never injects (an installed fla is untouched);
 an installed fla strictly newer than the snapshot wins unless ``UNSLOTH_FORCE_VENDORED_FLA=1``;
 ``UNSLOTH_DISABLE_HOPPER_FLA_BWD=1`` forces pure torch on Hopper + Triton [3.4.0, 3.7.1) (fla #640).
-Injects only with torch >= 2.7, triton >= 3.3 and CUDA.
+Injects only with torch >= 2.7, triton >= 3.3 and CUDA. When the snapshot shadows an installed
+fla of the same version, ``fla.*`` subpackages the snapshot does not ship (``fla.ops.kda`` for
+glm5_next / kimi_linear) load from that install; ``UNSLOTH_DISABLE_INSTALLED_FLA_FALLBACK=1`` stops it.
 """
 
 __all__ = [
@@ -334,6 +336,78 @@ def _should_defer_to_installed_fla():
     if ver is None:
         return True
     return _version_strictly_after(ver, _VENDORED_FLA_VERSION)
+
+
+def _installed_fla_root():
+    """Package dir of an installed fla whose version equals the snapshot's, else None."""
+    try:
+        import importlib.metadata as _md
+    except Exception:
+        return None
+    vendored = os.path.realpath(_vendored_fla_dir())
+    for dist_name in ("flash-linear-attention", "fla-core", "fla"):
+        try:
+            dist = _md.distribution(dist_name)
+            init_path = str(dist.locate_file(os.path.join("fla", "__init__.py")))
+        except Exception:
+            continue
+        if not os.path.isfile(init_path):
+            continue
+        root = os.path.realpath(os.path.dirname(init_path))
+        if root == vendored:
+            continue
+        try:
+            from packaging import version
+            base = version.parse(version.parse(str(dist.version).split("+")[0]).base_version)
+            if base != version.parse(_VENDORED_FLA_VERSION):
+                return None
+        except Exception:
+            return None
+        return root
+    return None
+
+
+class _InstalledFlaFallbackFinder:
+    """Loads ``fla.*`` subpackages the pruned snapshot lacks from the same-version install.
+
+    Sits after the path finder, so every module the snapshot ships (with its backported fixes)
+    still wins; only a missing subpackage, such as ``fla.ops.kda``, reaches the install. Single
+    files pruned from a shipped package (TileLang, intra-card CP) stay absent. Same version
+    only: the snapshot is that release's files plus fixes, so the two trees share one API.
+    """
+
+    def __init__(self, root):
+        self.root = root
+
+    def find_spec(self, fullname, path = None, target = None):
+        if not fullname.startswith("fla."):
+            return None
+        fla_mod = sys.modules.get("fla")
+        if fla_mod is None or getattr(fla_mod, _VENDORED_MARK, False) is not True:
+            return None
+        base = os.path.join(self.root, *fullname.split(".")[1:])
+        init_path = os.path.join(base, "__init__.py")
+        if not os.path.isfile(init_path):
+            return None
+        # Its children then resolve through this install directory, not the snapshot.
+        return importlib.util.spec_from_file_location(
+            fullname, init_path, submodule_search_locations = [base],
+        )
+
+
+def _install_installed_fla_fallback():
+    """Let ops the snapshot lacks resolve from a shadowed same-version fla. Idempotent."""
+    if _flag("UNSLOTH_DISABLE_INSTALLED_FLA_FALLBACK"):
+        return False
+    if any(isinstance(f, _InstalledFlaFallbackFinder) for f in sys.meta_path):
+        return True
+    root = _installed_fla_root()
+    if root is None:
+        return False
+    sys.meta_path.append(_InstalledFlaFallbackFinder(root))
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.info(f"Unsloth: fla ops missing from the vendored snapshot now load from {root}.")
+    return True
 
 
 def _neutralize_tilelang_backend_probe():
@@ -1016,6 +1090,11 @@ def _patch_vendor_fla(phase=None):
 
     _patch_is_available()
     _repair_already_imported_modeling(force_rebind=replaced_real)
+    try:
+        _install_installed_fla_fallback()
+    except Exception as e:
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.warning(f"Unsloth: could not reach the installed fla for ops the snapshot lacks: {e}")
 
 
 TEMPORARY_PATCHES.append(patch_vendor_fla)
