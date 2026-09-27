@@ -22,6 +22,7 @@ moe_utils backend with the class's own gate, matching the eager forward on W + P
 import json
 import os
 import subprocess
+from pathlib import Path
 import sys
 
 import pytest
@@ -100,8 +101,13 @@ print("RESULT " + json.dumps({"n_expert_lora": len(grads), "grads": grads, "rel"
 def test_deepseek_v4_bf16_expert_lora_is_applied(tmp_path):
     script = tmp_path / "child.py"
     script.write_text(_CHILD)
+    # The script lives in tmp_path, so without this the child would import the installed
+    # unsloth_zoo rather than the tree under test.
+    env = dict(os.environ)
+    repo_root = str(Path(__file__).resolve().parents[1])
+    env["PYTHONPATH"] = os.pathsep.join([repo_root] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
     proc = subprocess.run([sys.executable, str(script), str(tmp_path)], capture_output = True, text = True,
-                          timeout = 900, env = dict(os.environ))
+                          timeout = 900, env = env)
     line = next((l for l in proc.stdout.splitlines() if l.startswith("RESULT ")), None)
     assert line is not None, proc.stdout[-3000:] + proc.stderr[-3000:]
     r = json.loads(line[len("RESULT "):])
