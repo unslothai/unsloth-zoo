@@ -92,12 +92,20 @@ def test_top_level_single_leaf_still_excluded():
         assert hits == [f"model.layers.{i}.self_attn.q_proj" for i in range(n)], (n, hits, regex)
 
 
-def test_regex_unchanged_without_shared_experts():
+def test_shared_experts_do_not_hide_linear_attention():
+    # An explicit list on a text-only hybrid (Qwen3-Next: linear_attn + mlp.shared_expert) must
+    # keep linear_attn.*: a matcher that only reached the shared experts used to skip the
+    # no-match fallback that main relied on, dropping every linear_attn adapter.
     class Block(nn.Module):
         def __init__(self):
             super().__init__()
+            self.linear_attn = nn.Module()
+            self.linear_attn.in_proj_qkvz = nn.Linear(8, 8)
+            self.linear_attn.out_proj = nn.Linear(8, 8)
             self.mlp = nn.Module()
-            self.mlp.up_proj = nn.Linear(8, 8)
+            self.mlp.gate = nn.Linear(8, 4)
+            self.mlp.shared_expert = nn.Module()
+            self.mlp.shared_expert.up_proj = nn.Linear(8, 8)
 
     class Toy(nn.Module):
         def __init__(self):
@@ -105,5 +113,19 @@ def test_regex_unchanged_without_shared_experts():
             self.config = None
             self.model = nn.Module()
             self.model.layers = nn.ModuleList([Block() for _ in range(2)])
+            self.lm_head = nn.Linear(8, 8)
 
-    assert "shared_expert" not in get_peft_regex(Toy())
+    toy = Toy()
+    regex = get_peft_regex(toy, target_modules=["in_proj_qkvz", "out_proj", "up_proj"],
+                           finetune_vision_layers=False)
+    hits = {x for x, m in toy.named_modules() if isinstance(m, nn.Linear) and re.fullmatch(regex, x)}
+    assert hits == {f"model.layers.{i}.{leaf}" for i in range(2) for leaf in
+                    ("linear_attn.in_proj_qkvz", "linear_attn.out_proj", "mlp.shared_expert.up_proj")}, hits
+
+
+def test_text_branch_stays_inside_the_decoder_stack():
+    regex = get_peft_regex(_nemotron_h(["mamba", "attention", "moe"]), finetune_vision_layers=False)
+    assert re.fullmatch(regex, "model.layers.1.mixer.q_proj")
+    for name in ("vision_tower.model.layers.1.mixer.q_proj", "model.visual.blocks.0.attn.q_proj",
+                 "model.layers.1.mixer.q_proj_drop", "model.layers.2.mixer.gate"):
+        assert not re.fullmatch(regex, name), name

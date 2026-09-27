@@ -246,15 +246,17 @@ def get_peft_regex(
 
         # Also account for model.layers.0.self_attn/mlp type modules like Qwen
         if finetune_language_layers:
-            # Dense shared experts sit one level below the MoE block (NemotronH
-            # mixer.shared_experts.up_proj, Qwen2-MoE mlp.shared_expert.*); only emitted
-            # when the model has them, so every other regex stays byte-identical.
-            shared_child = ""
-            if any(re.search(r"\.shared_experts?\.[^.]+$", x) for x in linear_modules):
-                shared_child = r"(?:shared_experts?\.)?"
+            # Text-only loads (FastModel text_only=True, plain *ForCausalLM) name the
+            # decoder model.layers.N with no language/text tag, so this branch must
+            # select what the first branch selects under model.language_model:
+            # nested leaves (NemotronH mixer.shared_experts.up_proj, Qwen MoE
+            # mlp.shared_expert.gate_proj) and components that only contain a tag
+            # (Qwen3.5 / Qwen3-Next linear_attn.in_proj_qkv). It used to require the
+            # leaf directly under an exact component, so those adapters were dropped,
+            # or reached only through the no-match fallback below.
             regex_matcher = r"(?:" + regex_matcher + \
-            r")|(?:\bmodel\.layers\.[\d]{1,}\.(?:" + regex_components + \
-            r")\." + shared_child + r"(?:" + match_linear_modules + r"))"
+            r")|(?:\bmodel\.layers\.[\d]{1,}\..*?(?:" + regex_components + \
+            r").*?\.(?:" + match_linear_modules + r"))"
         pass
     pass
 
