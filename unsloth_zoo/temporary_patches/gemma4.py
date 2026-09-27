@@ -74,16 +74,20 @@ class _Gemma4KVSharedSafeProxy:
     # would drop the field from serialization. #6089
 
     def __init__(self, real):
-        object.__setattr__(self, "_real", real)
+        self._real = real
 
     def __getattr__(self, name):
         # Only invoked when normal attribute lookup fails.
+        if name == "_real":
+            # Unset slot (copy/pickle skip __init__): raise, don't recurse. Lets
+            # methods use plain self._real; object.__getattribute__ breaks Dynamo graphs.
+            raise AttributeError(name)
         if name == "num_kv_shared_layers":
             raise AttributeError(
                 "num_kv_shared_layers is 0 (no KV sharing) -- hidden from "
                 "the cache constructor to avoid layer_types[:-0] == [] bug"
             )
-        return getattr(object.__getattribute__(self, "_real"), name)
+        return getattr(self._real, name)
 
     def get_text_config(self, decoder=None, encoder=None):
         # Return self so recursive get_text_config calls don't unwrap the proxy.
@@ -94,7 +98,7 @@ class _Gemma4KVSharedSafeProxy:
         # Hide num_kv_shared_layers, like __getattr__/__contains__/__getitem__:
         # validate_token_ids does `for n in cfg: getattr(cfg, n)`, so yielding it
         # would re-raise the AttributeError from __getattr__. See unslothai/unsloth#6089.
-        for name in object.__getattribute__(self, "_real"):
+        for name in self._real:
             if name == "num_kv_shared_layers":
                 continue
             yield name
@@ -106,7 +110,7 @@ class _Gemma4KVSharedSafeProxy:
     def __contains__(self, item):
         if item == "num_kv_shared_layers":
             return False
-        real = object.__getattribute__(self, "_real")
+        real = self._real
         try:
             return item in real
         except TypeError:
@@ -115,7 +119,7 @@ class _Gemma4KVSharedSafeProxy:
     def __getitem__(self, key):
         if key == "num_kv_shared_layers":
             raise KeyError(key)
-        real = object.__getattribute__(self, "_real")
+        real = self._real
         try:
             return real[key]
         except TypeError:
@@ -123,20 +127,20 @@ class _Gemma4KVSharedSafeProxy:
 
     def __eq__(self, other):
         if isinstance(other, _Gemma4KVSharedSafeProxy):
-            other = object.__getattribute__(other, "_real")
-        return object.__getattribute__(self, "_real") == other
+            other = other._real
+        return self._real == other
 
     def __hash__(self):
         try:
-            return hash(object.__getattribute__(self, "_real"))
+            return hash(self._real)
         except TypeError:
             return id(self)
 
     def __bool__(self):
-        return bool(object.__getattribute__(self, "_real"))
+        return bool(self._real)
 
     def __repr__(self):
-        return f"_Gemma4KVSharedSafeProxy({object.__getattribute__(self, '_real')!r})"
+        return f"_Gemma4KVSharedSafeProxy({self._real!r})"
 
 
 def _wrap_get_text_config_for_kv_zero(cls):

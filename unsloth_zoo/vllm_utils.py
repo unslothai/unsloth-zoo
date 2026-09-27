@@ -870,6 +870,49 @@ def patch_vllm_graph_capture():
 pass
 
 
+def patch_vllm_processed_logprobs_fast_path():
+    # V1 drops FlashInfer engine-wide under processed_logprobs; V2 only on logprob steps, as here.
+    try:
+        from vllm.v1.sample.sampler import Sampler
+        from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
+    except Exception:
+        return
+    if hasattr(Sampler.forward, "_unsloth_processed_fast_path"): return
+    original_forward = Sampler.forward
+
+    @functools.wraps(original_forward)
+    def forward(self, logits, sampling_metadata, *args, **kwargs):
+        if (
+            str(getattr(self, "logprobs_mode", "")).startswith("processed_")
+            and kwargs.get("logprobs_mode_override") is None
+            and len(args) < 2
+            and getattr(sampling_metadata, "max_num_logprobs", 0) is None
+            and not getattr(sampling_metadata, "logprob_token_ids", None)
+        ):
+            fast = self.__dict__.get("_unsloth_raw_topk_topp_sampler")
+            if fast is None:
+                try:
+                    fast = TopKTopPSampler("raw_logprobs")
+                    if hasattr(self.topk_topp_sampler, "use_fp64_gumbel"):
+                        fast.use_fp64_gumbel = self.topk_topp_sampler.use_fp64_gumbel
+                except Exception:
+                    fast = False
+                self.__dict__["_unsloth_raw_topk_topp_sampler"] = fast
+            if fast is False:
+                return original_forward(self, logits, sampling_metadata, *args, **kwargs)
+            processed = self.topk_topp_sampler
+            self.topk_topp_sampler = fast
+            try:
+                return original_forward(self, logits, sampling_metadata, *args, **kwargs)
+            finally:
+                self.topk_topp_sampler = processed
+        return original_forward(self, logits, sampling_metadata, *args, **kwargs)
+
+    forward._unsloth_processed_fast_path = True
+    Sampler.forward = forward
+pass
+
+
 def patch_vllm(debug = True):
     # Disable vLLM multiprocessing so we can access model_executor.
     logger.info(f'Unsloth: Patching vLLM')
@@ -901,6 +944,7 @@ def patch_vllm(debug = True):
         patch_vllm_enable_sleep_mode()
         patch_vllm_reset_caches_on_sleep()
     patch_vllm_graph_capture()
+    patch_vllm_processed_logprobs_fast_path()
     global LORA_REQUEST_ID
     LORA_REQUEST_ID = 1
 pass
@@ -3175,6 +3219,8 @@ def load_vllm(
             max_num_batched_tokens = max_num_batched_tokens,
             max_num_seqs           = approx_max_num_seqs, # vLLM default uses 256 -> reduce if OOM
             max_logprobs           = max_logprobs, # Disallow logprobs being returned
+            # Match TRL when reusing this engine for RL, including temperature scaling.
+            logprobs_mode          = "processed_logprobs" if training else "raw_logprobs",
             seed                   = random_state, # Default is 0
 
             # lora_extra_vocab_size = 0, # Breaks vLLM so we leave it as 256

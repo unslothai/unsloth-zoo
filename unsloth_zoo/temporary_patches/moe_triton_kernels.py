@@ -336,6 +336,9 @@ def weighted_unpermute(permuted_output, sorted_indices, permuted_weights, num_to
         return None
     if permuted_output.dim() != 2 or sorted_indices.numel() != permuted_output.shape[0]:
         return None
+    # Odd hidden sizes are not bit-identical to eager (H == 1 reduces in warp-tree order; odd H with top_k 5/6); no MoE uses one.
+    if permuted_output.shape[1] % 2 == 1:
+        return None
     try:
         return _WeightedUnpermute.apply(
             permuted_output.contiguous(), sorted_indices.contiguous(),

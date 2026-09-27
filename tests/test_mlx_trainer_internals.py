@@ -1269,6 +1269,40 @@ def test_decoupled_optimizers_use_hf_parity_manual_decay(optim_name):
         assert optimizer._kw["weight_decay"] == 0.0
 
 
+def test_adafactor_applies_hf_weight_decay():
+    """HF Adafactor decays p -= wd * lr * p via param groups, skipping bias and norms."""
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    class TinyModel:
+        def __init__(self):
+            self.params = {"proj": {"weight": mx.array([[10.0, 10.0]]),
+                                    "bias": mx.array([10.0])}}
+
+        def trainable_parameters(self):
+            return self.params
+
+        def update(self, updates):
+            self.params["proj"].update(updates["proj"])
+
+    lr, wd = 0.1, 0.05
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.model = TinyModel()
+    trainer.args = MLXTrainingConfig(
+        optim="adafactor", learning_rate=lr, weight_decay=wd,
+        lr_scheduler_type="constant", warmup_steps=0,
+    )
+    optimizer = trainer._build_optimizer(total_steps=4)
+    assert trainer._resolved_optimizer_name == "adafactor"
+
+    grad = {"proj": {"weight": mx.array([[1.0, 1.0]]), "bias": mx.array([1.0])}}
+    trainer._apply_manual_weight_decay(trainer.model, optimizer, grad)
+    flat = dict(tree_flatten(trainer.model.trainable_parameters()))
+    assert flat["proj.weight"].tolist()[0] == pytest.approx([10.0 * (1 - lr * wd)] * 2)
+    assert flat["proj.bias"].tolist() == pytest.approx([10.0])
+
+
 def test_sgd_weight_decay_is_coupled_not_decoupled():
     """SGD must use coupled decay (folded into the gradient before momentum)
     to match HF/PyTorch SGD, not the AdamW-style decoupled parameter shrink."""
@@ -8313,3 +8347,143 @@ def test_qwen3_prompt_rows_defer_to_the_native_deepstack_path():
     mask_only = {"inputs_embeds": mx.zeros((1, 4, 1)), "visual_pos_masks": masks}
     filled = mc._pad_qwen3_prompt_rows([mask_only, compact_row])[0]
     assert not filled[mc._QWEN3_VISUAL_STATE_KEY].any().item()
+
+
+def test_stream_width_policy_and_registry_contracts():
+    """Disarmed policy is byte-identical; registry separates every keyed axis."""
+    import numpy as np
+
+    from unsloth_zoo.mlx.shape_guard import StreamShapeGrid
+    from unsloth_zoo.mlx.trainer import (
+        _StreamSignatureRegistry, _StreamWidthPolicy, _stream_batch_signature,
+        _stream_guard_report,
+    )
+    from unsloth_zoo.mlx.utils import (
+        _stage_text_batch_from_items, _stage_tokenized_text_batch,
+    )
+
+    class _Tok:
+        pad_token_id = 0
+
+    policy = _StreamWidthPolicy(StreamShapeGrid(anchor=512))
+    rows = [([1] * 40, [2] * 40), ([1] * 55, [3] * 55)]
+    raw = [[1] * 40, [1] * 55]
+    plain = _stage_tokenized_text_batch(rows, 512, pad_id=0)
+    plain_raw = _stage_text_batch_from_items(raw, _Tok(), 512)
+    assert policy(55) is None
+    for staged, reference in (
+        (_stage_tokenized_text_batch(rows, 512, pad_id=0, width_policy=policy), plain),
+        (_stage_text_batch_from_items(raw, _Tok(), 512, width_policy=policy), plain_raw),
+    ):
+        assert np.array_equal(np.asarray(staged.ids), np.asarray(reference.ids))
+        assert np.array_equal(
+            np.asarray(staged.lengths_info), np.asarray(reference.lengths_info),
+        )
+        assert np.array_equal(
+            np.asarray(staged.labels), np.asarray(reference.labels),
+        )
+
+    policy.armed = True
+    guarded = _stage_tokenized_text_batch(
+        rows, 512, pad_id=0, width_policy=policy,
+    )
+    assert guarded.ids.shape == (2, 65)
+    assert np.array_equal(guarded.lengths_info, plain.lengths_info)
+
+    gated, counted = _StreamWidthPolicy(StreamShapeGrid(anchor=512)), _StreamSignatureRegistry(128)
+    gated.arm(counted)
+    assert (gated.armed, gated.exact_ceiling) == (True, 32)
+    assert gated.observed is counted.observed
+    gated.exact_ceiling = 2
+    rep = lambda: _stream_guard_report(gated, counted, "full_step")
+    for index in range(3):
+        assert gated(55) is None, index
+        counted.record(("k", index))
+    assert (rep().action, rep().gate_released, rep().exact_ceiling) == (
+        "stream_exact", False, 2)
+    assert gated(55) == 65 and gated.gate_released
+    gated.armed = False
+    assert gated(55) is None
+    assert rep().action == "stream_grid"
+
+    registry = _StreamSignatureRegistry(1)
+
+    def _key(width, rows=2, phase="single", execution=("gpu", "s0")):
+        batch = (np.zeros((rows, width), dtype=np.int32), None, None)
+        return _stream_batch_signature(batch, phase, execution)
+
+    registry.record(_key(33))
+    assert not registry.would_trip(_key(33))
+    assert all(registry.would_trip(other) for other in (
+        _key(65), _key(33, rows=4), _key(33, phase="tree_update"),
+        _key(33, execution=("gpu", "s1")),
+    ))
+
+
+def test_streaming_guard_admission_protocol_is_one_collective_per_fetch():
+    """One reduction per fetch; failure outranks a trip; idle microsteps participate."""
+    import numpy as np
+
+    from unsloth_zoo.mlx.shape_guard import FULL_STEP_SCOPE
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainer, _StreamSignatureRegistry, _stream_batch_signature,
+        _stream_execution_key,
+    )
+
+    trainer = object.__new__(MLXTrainer)
+    trainer._distributed_initialized = True
+    trainer._distributed_rank = 0
+    trainer.stop_requested = False
+    reductions = []
+    peer_signal = 0
+
+    def _fake_max_int(value):
+        reductions.append(value)
+        return max(value, peer_signal)
+
+    trainer._distributed_max_int = _fake_max_int
+    registry = _StreamSignatureRegistry(1)
+    batch = (np.zeros((2, 33), dtype=np.int32), None, None)
+
+    def _admit(world=2, data=batch):
+        return trainer._admit_stream_batch(
+            registry, data, FULL_STEP_SCOPE, 1, 0, world,
+        )
+
+    assert _admit() is False
+    assert reductions == [0] and len(registry.observed) == 1
+
+    wide = (np.zeros((2, 65), dtype=np.int32), None, None)
+    assert _admit(data=wide) is True
+    assert reductions[-1] == 1
+
+    peer_signal = 1
+    assert _admit() is True
+    peer_signal = 0
+
+    before = len(reductions)
+    assert _admit(data=None) is False
+    assert len(reductions) == before + 1 and reductions[-1] == 0
+
+    peer_signal = 2
+    with pytest.raises(RuntimeError, match="peer rank failed"):
+        _admit()
+    assert len(reductions) == 5
+
+    uncertifiable = {"input_ids": np.zeros((1, 33), dtype=np.int32), "m": object()}
+    for _ in range(3):
+        assert trainer._admit_stream_batch(
+            registry, uncertifiable, FULL_STEP_SCOPE, 1, 0, 1,
+        ) == "eager_batch"
+    assert registry.uncertified == 3 and registry.uncertified_family
+    assert len(registry.observed) == 1
+
+    solo = _StreamSignatureRegistry(1)
+    before = len(reductions)
+    assert trainer._admit_stream_batch(
+        solo, batch, FULL_STEP_SCOPE, 1, 0, 1,
+    ) is False
+    assert len(reductions) == before
+    assert _stream_batch_signature(
+        batch, "single", _stream_execution_key(),
+    ) in solo.observed

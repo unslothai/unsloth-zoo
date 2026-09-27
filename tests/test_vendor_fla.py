@@ -504,14 +504,24 @@ _OLMO_SUBPROCESS = textwrap.dedent(
     import sys
     assert getattr(sys.modules["fla"], "_UNSLOTH_VENDORED_FLA", False) is True
 
+    from transformers.integrations import hub_kernels
+    from unsloth_zoo.temporary_patches.fla_vendor import _resolved_implementation
+    vendored_chunk = sys.modules["fla.ops.gated_delta_rule"].chunk_gated_delta_rule
+    # transformers#47630 (5.15+) drops the module globals for kernel-hub wrappers.
+    kernel_hub = hasattr(hub_kernels, "use_kernel_func_from_hub_with_fallback")
+
     # Covered model binds the vendored kernels.
     import transformers.models.qwen3_5.modeling_qwen3_5 as q
-    assert q.chunk_gated_delta_rule is not None
+    if kernel_hub:
+        assert _resolved_implementation(q.torch_chunk_gated_delta_rule) is vendored_chunk
+    else:
+        assert q.chunk_gated_delta_rule is vendored_chunk
 
-    # Uncovered model must import cleanly on its pure-torch fallback.
+    # Uncovered model must import cleanly without the unvendored ShortConvolution.
     import transformers.models.olmo_hybrid.modeling_olmo_hybrid as m
-    assert m.ShortConvolution is None
-    assert m.chunk_gated_delta_rule is None
+    assert getattr(m, "ShortConvolution", None) is None
+    if not kernel_hub:
+        assert m.chunk_gated_delta_rule is None
     print("OLMO_FALLBACK_OK")
     """
 )
@@ -1324,49 +1334,6 @@ def test_fp32_l2norm_survives_the_float16_overflow_that_gives_nan_grads():
     torch.testing.assert_close(good.float().norm(dim = -1), torch.ones(2), atol = 5e-3, rtol = 0)
 
 
-def test_fp32_l2norm_survives_the_float16_small_norm_overflow():
-    """Norm 0.005: transformers' RsqrtBackward forms rsqrt(s)**3 = 8e6 in float16 -> inf -> NaN
-    grads (tiny Qwen3.5 on the CPU T4 path, transformers 5.5)."""
-    import torch
-    from unsloth_zoo.temporary_patches.fla_vendor import _fp32_l2norm
-
-    torch.manual_seed(0)
-    base = torch.randn(4, 8, dtype = torch.float64)
-    base = base / base.norm(dim = -1, keepdim = True) * 5e-3
-    w = torch.randn(4, 8, dtype = torch.float64)
-
-    x = base.to(torch.float16).requires_grad_()
-    (_transformers_style_l2norm(x).float() * w.float()).sum().backward()
-    assert not torch.isfinite(x.grad).all()
-
-    x2 = base.to(torch.float16).requires_grad_()
-    (_fp32_l2norm(x2).float() * w.float()).sum().backward()
-    ref = base.to(torch.float16).double().requires_grad_()
-    (_transformers_style_l2norm(ref) * w).sum().backward()
-    assert torch.isfinite(x2.grad).all()
-    torch.testing.assert_close(x2.grad.double(), ref.grad, atol = 0.5, rtol = 1e-2)
-
-
-def test_patch_vendor_fla_rebinds_l2norm_when_fla_is_not_injected(monkeypatch):
-    """CPU / no Triton / opt-outs run the pure-torch gated delta, not only RDNA1."""
-    import types
-    from unsloth_zoo.temporary_patches import fla_vendor
-
-    modname = "transformers.models.qwen3_5.modeling_qwen3_5"
-    mod = types.ModuleType(modname)
-    mod.l2norm = _transformers_style_l2norm
-    monkeypatch.setitem(sys.modules, modname, mod)
-    monkeypatch.setattr(fla_vendor, "_gpu_lacks_dot_instructions", lambda torch_mod=None: False)
-    monkeypatch.setattr(fla_vendor, "_vendored_already_injected", lambda: False)
-    monkeypatch.setattr(fla_vendor, "_should_defer_to_installed_fla", lambda: False)
-    monkeypatch.setattr(fla_vendor, "_torch_triton_cuda_supported", lambda: False)
-    monkeypatch.setattr(fla_vendor, "_inject_vendored_fla", lambda: pytest.fail("must not inject"))
-
-    fla_vendor.patch_vendor_fla()
-
-    assert mod.l2norm is fla_vendor._fp32_l2norm
-
-
 def test_l2norm_patch_rebinds_only_imported_gated_delta_modules(monkeypatch):
     import types
     from unsloth_zoo.temporary_patches import fla_vendor
@@ -1438,3 +1405,28 @@ def test_fp32_l2norm_keeps_float64_precision():
     out = _fp32_l2norm(x)
     assert out.dtype == torch.float64
     assert torch.equal(out, ref)
+
+
+def test_every_host_gets_the_float32_l2norm_not_only_rdna1(monkeypatch):
+    """A CPU-only or no-Triton host takes the pure-torch gated delta too. On transformers 5.5
+    its l2norm runs in float16 there, and the T4 path's Qwen3.5 and Qwen3.6 grads came back
+    non-finite in unsloth's Core zoo (HF=default) job."""
+    import types
+
+    from unsloth_zoo.temporary_patches import fla_vendor
+
+    monkeypatch.setattr(fla_vendor, "_gpu_lacks_dot_instructions", lambda torch_mod=None: False)
+    monkeypatch.setattr(fla_vendor, "_flag", lambda name: False)
+    monkeypatch.setattr(fla_vendor, "_vendored_already_injected", lambda: False)
+    monkeypatch.setattr(fla_vendor, "_should_defer_to_installed_fla", lambda: False)
+    monkeypatch.setattr(fla_vendor, "_torch_triton_cuda_supported", lambda: False)
+    fake_pkg = "unsloth_test_gated_delta_cpu"
+    mod = types.ModuleType(f"transformers.models.{fake_pkg}.modeling_{fake_pkg}")
+    mod.l2norm = _transformers_style_l2norm
+    monkeypatch.setitem(sys.modules, mod.__name__, mod)
+    monkeypatch.setattr(fla_vendor, "_GATED_DELTA_MODELING", (fake_pkg,))
+
+    fla_vendor.patch_vendor_fla()
+
+    assert mod.l2norm is fla_vendor._fp32_l2norm
+

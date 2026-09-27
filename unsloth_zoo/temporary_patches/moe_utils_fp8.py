@@ -15,6 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import inspect
+import os
 from typing import Optional
 
 import types
@@ -69,6 +70,10 @@ def _check_torch_scaled_grouped_mm_supported():
     # FP8 scaled_grouped_mm path to Hopper (SM 9.x) only for now.
     major, _minor = torch.cuda.get_device_capability(torch.cuda.current_device())
     if major != 9:
+        _TORCH_SCALED_GROUPED_MM_SUPPORTED = False
+        return False
+    # Opt-in until validated end to end on Hopper (the probe never passed before the rhs layout fix).
+    if os.environ.get("UNSLOTH_FP8_SCALED_GROUPED_MM", "0") != "1":
         _TORCH_SCALED_GROUPED_MM_SUPPORTED = False
         return False
 
@@ -495,7 +500,8 @@ def _dequantize_full_expert_weights(weight: torch.Tensor, quant_state, target_dt
 
 
 def _make_grouped_mm_rhs_column_major(weight: torch.Tensor) -> torch.Tensor:
-    return weight.mT.contiguous()
+    # Same (E, K, N) shape, column-major strides, as _scaled_grouped_mm requires of mat_b.
+    return weight.mT.contiguous().mT
 
 
 def _try_attach_block_size(tensor, block_size):
@@ -579,10 +585,8 @@ def _extract_scaled_grouped_mm_weight_scale(original_weight, processed_weight, q
     if scale.shape[0] != processed_weight.shape[0] or scale.shape[1] != processed_weight.shape[-1]:
         return None
 
-    scale = scale.to(torch.float32)
-    if quant_kind == "weight_scale_inv":
-        scale = scale.reciprocal()
-    return scale.contiguous()
+    # `weight_scale_inv` is already the dequant multiplier (w = q * s), like `weight_scale`.
+    return scale.to(torch.float32).contiguous()
 
 
 def _prepare_scaled_grouped_mm_weight(experts_module, param_name: str, proj_type: str, hidden_dim: int, model_type=None):
@@ -639,6 +643,9 @@ def _expand_grouped_bias(bias, num_tokens_per_expert):
 
 def _forward_scaled_grouped_mm_fp8(self, hidden_states, top_k_index, top_k_weights):
     if not _check_torch_scaled_grouped_mm_supported():
+        return None
+    # No backward for _scaled_grouped_mm; training (incl. reentrant GC's no_grad forward) must match the dequant recompute.
+    if torch.is_grad_enabled() or self.training:
         return None
     if not hasattr(self, "gate_up_proj") or not hasattr(self, "down_proj"):
         return None
