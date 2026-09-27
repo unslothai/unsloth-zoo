@@ -3402,6 +3402,9 @@ def write_portable_target_modules(peft_model, save_directory, selected_adapters 
         if isinstance(replacement, str):
             for field in ("rank_pattern", "alpha_pattern"):
                 config[field] = _redirected_patterns(peft_model, adapter_name, config.get(field))
+            # PEFT rejects layer selectors beside a str target; the regex already names only those layers.
+            config["layers_to_transform"] = None
+            config["layers_pattern"] = None
         _atomic_write_text(path, json.dumps(config, indent = 2, sort_keys = True))
         written.append(path)
     return written

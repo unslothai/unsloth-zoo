@@ -239,3 +239,25 @@ def test_rank_and_alpha_patterns_follow_the_redirect(tmp_path):
     assert code == 0, err[-2000:]
     with torch.no_grad():
         assert torch.allclose(model(x), out)
+
+
+def test_layer_selectors_are_cleared_with_a_regex_target(tmp_path):
+    torch.manual_seed(0)
+    base = TwoTowers()
+    state = {k: v.clone() for k, v in base.state_dict().items()}
+    model = get_peft_model(base, LoraConfig(
+        r = 2, target_modules = r".*(?:text\.1\.q_proj|vision\.1\.q_proj\.linear)",
+    ))
+    _seed_lora_b(model)
+    model.save_pretrained(str(tmp_path))
+    path = tmp_path / "adapter_config.json"
+    config = json.loads(path.read_text())
+    config.update(target_modules = ["q_proj"], layers_to_transform = [1], layers_pattern = ["text", "vision"])
+    path.write_text(json.dumps(config))
+    MU.write_portable_target_modules(model, str(tmp_path))
+
+    x = torch.randn(3, 6)
+    code, err, out = _reload_in_plain_peft(tmp_path, state, x)
+    assert code == 0, err[-2000:]
+    with torch.no_grad():
+        assert torch.allclose(model(x), out)
