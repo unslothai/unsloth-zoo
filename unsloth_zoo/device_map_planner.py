@@ -1009,6 +1009,44 @@ def _load_transient_by_unit(
     return out
 
 
+_EXPERT_STACK_NAMES = ("gate_up_proj", "up_proj", "gate_proj", "down_proj")
+_FP8_DTYPES = tuple(
+    getattr(torch, name) for name in ("float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnuz")
+    if hasattr(torch, name)
+)
+
+
+def _moe_dequant_transient_by_unit(
+    model: nn.Module,
+    units: Sequence[tuple[str, int]],
+) -> dict[str, int]:
+    """Bytes each unit needs free at run time for its FP8 fused experts dequantized whole.
+
+    Unsloth's FP8 MoE fallback (`moe_utils_fp8.forward_moe_backend_fp8`) dequantizes a layer's whole
+    `gate_up_proj` and `down_proj` stacks to bf16 together on every forward, in generation, evaluation and
+    training alike: 14 + 7 GiB per layer on Mistral-Large-3. That is not an activation the balanced reserve
+    sizes for, and a relaxed reserve of 0 on a card holding such a layer OOMs on its first forward.
+    """
+    unit_names = sorted((u for u, _ in units), key=len, reverse=True)
+    per_module: dict[str, int] = {}
+    for name, tensor in model.named_parameters():
+        if tensor.dim() != 3 or tensor.dtype not in _FP8_DTYPES:
+            continue
+        module, _, leaf = name.rpartition(".")
+        if leaf not in _EXPERT_STACK_NAMES:
+            continue
+        per_module[module] = per_module.get(module, 0) + tensor.numel() * 2
+    out: dict[str, int] = {}
+    for module, need in per_module.items():
+        owner = next(
+            (u for u in unit_names if u == "" or module == u or module.startswith(u + ".")),
+            None,
+        )
+        if owner is not None:
+            out[owner] = max(out.get(owner, 0), int(need))
+    return out
+
+
 def _tied_parameter_groups(model: nn.Module) -> list[list[str]]:
     """Names of every tensor that is one shared object under several names.
 
@@ -1390,6 +1428,11 @@ def plan_device_map(
     )
     sizes = _compute_module_sizes(model, hf_quantizer)
     units = _split_units(model, no_split, sizes)
+    # FP8 fused experts dequantized whole at run time: a floor on what each card keeps free beyond its
+    # weights. A caller's explicit reserve is theirs to size, so it is only applied to the auto reserve.
+    runtime_of: dict[str, int] = (
+        {} if activation_reserve_bytes is not None else _moe_dequant_transient_by_unit(model, units)
+    )
     total = sizes.get("", sum(s for _, s in units))
 
     head_name, head_mod = resolve_output_head(model)
@@ -1856,6 +1899,14 @@ def plan_device_map(
             assign[p] = head_device
             used[head_device] += unit_size[p]
         weight_bytes = {d: used[d] for d in devices}
+        if runtime_of:
+            need = dict.fromkeys(devices, 0)
+            for unit, device in assign.items():
+                need[device] = max(need[device], runtime_of.get(unit, 0))
+            for d in devices:
+                left = raw_budgets[d] - weight_bytes[d] - (headroom if d == head_device else 0)
+                if need[d] and left < need[d]:
+                    return None
         # `budget` is the *remaining* capacity the packing walks were allowed to
         # use, so the head device has already paid for the pinned units. The
         # public field means "budget available to weights after every reserve"
@@ -2113,7 +2164,13 @@ def plan_device_map(
             + f" ({reserved_total / _GiB:.3f} GiB total)\n"
             f"  slack after weights     : {slack / _GiB:.3f} GiB\n"
             f"  head headroom needed    : {headroom / _GiB:.3f} GiB\n"
-            "Reduce rows_per_chunk, reduce retained_rows (run the log-softmax under "
+            + (
+                f"  FP8 expert dequant      : {max(runtime_of.values()) / _GiB:.3f} GiB kept free on every "
+                "card holding an FP8 MoE layer (its gate_up/down stacks are dequantized whole to bf16 "
+                "on each forward)\n"
+                if runtime_of else ""
+            )
+            + "Reduce rows_per_chunk, reduce retained_rows (run the log-softmax under "
             "no_grad), use a smaller quantisation, or add a GPU. Refusing to offload "
             "to CPU/disk: bitsandbytes cannot load a partially offloaded 4-bit model."
         )
