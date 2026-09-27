@@ -167,6 +167,13 @@ def _view_bytes_as(buffer, nbytes, dtype, shape):
     return buffer.view(torch.uint8)[:nbytes].view(dtype).view(shape)
 
 
+# float32 activations (FORCE_FLOAT32 residuals) offload as bfloat16, the same bytes as before, and are
+# cast back to float32 for the recompute. float16 overflows gemma3 residuals (~3e5) and per-row scaled
+# float16 spiked grad norms 20x on a T4 (outlier rows leave small entries subnormal). The dtype restore,
+# not the storage, is what the recompute needs. UNSLOTH_OFFLOAD_FP32=exact keeps the exact float32 bytes.
+FP32_OFFLOAD_EXACT = os.environ.get("UNSLOTH_OFFLOAD_FP32", "bf16").lower() == "exact"
+
+
 @contextmanager
 def _no_inference_mode():
     # Allocate GC buffers outside inference_mode (but in no_grad) so a later
@@ -685,6 +692,8 @@ CPU_INDEX = None
 
 def initialize_unsloth_gradient_checkpointing(dtype = None):
     # All Unsloth Zoo code licensed under LGPLv3
+    global FP32_OFFLOAD_EXACT
+    FP32_OFFLOAD_EXACT = os.environ.get("UNSLOTH_OFFLOAD_FP32", "bf16").lower() == "exact"
     global CPU_BUFFERS
     global CPU_INDEX
     global GPU_BUFFERS
@@ -852,7 +861,9 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                     global CURRENT_GC_INDEX
                     CURRENT_GC_INDEX += 1
 
-                    new_size = arg.numel() * arg.element_size()
+                    # The cutoff counts stored bytes, so bf16-stored float32 offloads exactly where it always did.
+                    store_dtype = torch.bfloat16 if (arg.dtype == torch.float32 and not FP32_OFFLOAD_EXACT) else arg.dtype
+                    new_size = arg.numel() * torch.empty((), dtype = store_dtype).element_size()
 
                     global MINIMUM_SIZE
                     global CPU_INDEX
@@ -942,11 +953,11 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         # Read the cached flag off the slot itself, before the view is
                         # taken: a view is a fresh object and does not carry the attribute.
                         host_is_pinned = getattr(x, HOST_PINNED_ATTR, False)
-                        # Casting here made the recompute see the buffer dtype (LLVM abort on ROCm gfx10).
-                        x = _view_bytes_as(x, new_size, arg.dtype, shape)
-
                         # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
                         EXTRA_STREAM.wait_stream(MAIN_STREAM)
+                        # Casting to the buffer dtype on reload made the recompute see it (LLVM abort on ROCm gfx10),
+                        # so the bytes are viewed as store_dtype here and cast back to arg.dtype in backward.
+                        x = _view_bytes_as(x, new_size, store_dtype, shape)
                         # x is a normal (non-inference) buffer, so copy_ is safe (unsloth#3828).
                         with torch_gpu_stream(EXTRA_STREAM):
                             # Only a pinned destination gives a genuinely async copy.
@@ -957,6 +968,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         NEXT_BUFFER_SLOT[device_index] ^= 1
                         ctx._saved_metadata = (new_size, shape, CPU_INDEX, device_index, MAIN_STREAM, EXTRA_STREAM, buffer_slot,)
                         ctx._saved_dtype = arg.dtype
+                        ctx._store_dtype = store_dtype
                         CPU_INDEX += 1
                         tensor_inputs.append(None)
 
@@ -1014,14 +1026,12 @@ class UnslothCheckpointFunction(torch.autograd.Function):
             global BUFFER_EVENTS_B
             # Select buffer from per-device buffer_slot
             saved_dtype = ctx._saved_dtype
-            if USE_DOUBLE_BUFFER and buffer_slot == 1:
-                buffer = _view_bytes_as(GPU_BUFFERS_B[device_index], new_size, saved_dtype, shape)
-            else:
-                buffer = _view_bytes_as(GPU_BUFFERS[device_index], new_size, saved_dtype, shape)
-
+            store_dtype = getattr(ctx, "_store_dtype", saved_dtype)
+            gpu_staging = GPU_BUFFERS_B[device_index] if (USE_DOUBLE_BUFFER and buffer_slot == 1) else GPU_BUFFERS[device_index]
+            buffer = _view_bytes_as(gpu_staging, new_size, store_dtype, shape)
             host_buffer = CPU_BUFFERS[CPU_INDEX]
             host_is_pinned = getattr(host_buffer, HOST_PINNED_ATTR, False)
-            x = _view_bytes_as(host_buffer, new_size, saved_dtype, shape)
+            x = _view_bytes_as(host_buffer, new_size, store_dtype, shape)
 
             # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
             if USE_DOUBLE_BUFFER:
@@ -1084,7 +1094,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
             # Wait for GPU buffer to finish
             if CPU_INDEX is not None:
                 MAIN_STREAM.wait_stream(EXTRA_STREAM)
-                x = buffer.detach()
+                x = buffer.detach() if store_dtype == saved_dtype else buffer.to(saved_dtype)
                 x.requires_grad_(True)
                 detached_inputs[0] = x
             pass

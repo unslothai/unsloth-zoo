@@ -31,9 +31,11 @@ _MISSING = object()
 
 
 @pytest.fixture
-def offload(request):
-    saved = {name: getattr(gc, name, _MISSING) for name in _STATE}
-    gc.initialize_unsloth_gradient_checkpointing(request.param)
+def offload(request, monkeypatch):
+    saved = {name: getattr(gc, name, _MISSING) for name in _STATE + ["FP32_OFFLOAD_EXACT"]}
+    dtype, mode = request.param if isinstance(request.param, tuple) else (request.param, "bf16")
+    monkeypatch.setenv("UNSLOTH_OFFLOAD_FP32", mode)
+    gc.initialize_unsloth_gradient_checkpointing(dtype)
     try:
         yield gc
     finally:
@@ -77,7 +79,7 @@ def test_the_recompute_sees_the_dtype_the_forward_saw(offload):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "drives the real offload path")
-@pytest.mark.parametrize("offload", [torch.float16], indirect = True)
+@pytest.mark.parametrize("offload", [(torch.float16, "exact")], indirect = True)
 def test_a_wider_activation_is_still_offloaded_exactly(offload):
     seen, handed_back, grad = _round_trip(torch.float32)
     assert set(seen) == {torch.float32}, f"the recompute ran in {sorted(map(str, set(seen)))}"
@@ -111,26 +113,56 @@ def test_elements_for_rounds_up_so_an_odd_byte_count_still_fits():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "initialisation allocates GPU buffers")
-@pytest.mark.parametrize("offload", [torch.bfloat16], indirect = True)
-def test_the_offload_cutoff_is_two_megabytes_whatever_the_dtype(offload):
-    # Old cutoff was in init-dtype elements, so a 3MB fp32 activation (gemma3) stayed on GPU.
+@pytest.mark.parametrize("offload", [(torch.bfloat16, "bf16"), (torch.bfloat16, "exact")], indirect = True)
+def test_the_offload_cutoff_counts_stored_bytes(offload):
+    # bf16-stored float32 must offload exactly where the old bf16 buffers did (numel > 1M), so host memory
+    # does not grow; exact float32 storage counts its own 4 bytes per element.
     assert gc.MINIMUM_SIZE == 2 * 1024 * 1024
     for dtype in (torch.float16, torch.float32):
         gc.initialize_unsloth_gradient_checkpointing(dtype)
         assert gc.MINIMUM_SIZE == 2 * 1024 * 1024, f"the cutoff moved with the init dtype {dtype}"
-
     gc.initialize_unsloth_gradient_checkpointing(torch.bfloat16)
 
     def layer(hidden):
         return hidden * 2
 
-    # 786,432 float32 elements = 3MB: over 2MB of bytes, under 2MB/2 elements.
+    # 786,432 float32 elements = 3MB of activation, 1.5MB when stored as bf16.
     hidden = torch.randn(1, 384, 2048, device = "cuda", dtype = torch.float32, requires_grad = True)
     out = gc.UnslothCheckpointFunction.apply(layer, False, hidden)
     out = gc.UnslothCheckpointFunction.apply(layer, False, out)
-    old_cutoff_in_elements = 2 * 1024 * 1024 // torch.empty(0, dtype = torch.bfloat16).element_size()
-    assert hidden.numel() * hidden.element_size() == 3 * 1024 * 1024
-    assert hidden.numel() < old_cutoff_in_elements, "this activation no longer straddles the change"
-    assert gc.CPU_INDEX >= 1, "a 3MB float32 activation was left on the GPU"
+    if gc.FP32_OFFLOAD_EXACT:
+        assert gc.CPU_INDEX >= 1, "exact storage holds 3MB, over the cutoff, yet nothing was offloaded"
+    else:
+        assert gc.CPU_INDEX == 0, "1.5MB of bf16 was offloaded; the old bf16 buffers kept it on the GPU"
     out.float().sum().backward()
     torch.cuda.synchronize()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "drives the real offload path")
+@pytest.mark.parametrize("offload", [(torch.bfloat16, "bf16")], indirect = True)
+def test_a_float32_activation_is_stored_as_bf16_and_recomputed_in_float32(offload):
+    seen = []
+    handed_back = []
+
+    def layer(hidden):
+        seen.append(hidden.dtype)
+        handed_back.append(hidden.detach().clone())
+        return hidden * 2
+
+    hidden = (torch.randn(2, 1024, 2048, device = "cuda") * 50).requires_grad_(True)
+    with torch.no_grad():
+        hidden[..., 3] = 2.0e5
+    out = gc.UnslothCheckpointFunction.apply(layer, False, hidden)
+    out = gc.UnslothCheckpointFunction.apply(layer, False, out)
+    stored = [x for x in gc.CPU_BUFFERS[: gc.CPU_INDEX]]
+    out.sum().backward()
+    torch.cuda.synchronize()
+    assert gc.CPU_INDEX >= 1, "nothing was offloaded, so this test proved nothing"
+    assert set(seen) == {torch.float32}, f"the recompute ran in {sorted(map(str, set(seen)))}"
+    for recomputed, original in ((handed_back[2], handed_back[1]), (handed_back[3], handed_back[0])):
+        assert torch.equal(recomputed, original.to(torch.bfloat16).float()), "not the bf16 rounding of the input"
+        assert torch.isfinite(recomputed).all()
+    # Same bytes as the old bf16 buffers: 2 per element, not 4.
+    assert all(x.untyped_storage().nbytes() >= hidden.numel() * 2 for x in stored)
+    assert all(x.untyped_storage().nbytes() < hidden.numel() * 4 for x in stored)
+    assert torch.equal(hidden.grad, torch.full_like(hidden.grad, 4.0))
