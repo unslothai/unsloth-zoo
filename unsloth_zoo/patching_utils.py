@@ -435,6 +435,52 @@ def _stage_cast_for_test(module, dtype):
     module.to(dtype)
 
 
+# F.layer_norm / F.group_norm need input and weight in one dtype (F.rms_norm does not). A norm
+# upcast by _pre_set_compute_dtype therefore only works under autocast, which the trainer
+# provides; a plain forward (custom loop, manual eval) raised "expected scalar type BFloat16
+# but found Float" in e.g. gemma-3's SigLIP LayerNorms. Outside autocast, run such a norm in
+# its weight dtype and hand the caller back its own dtype. Under autocast nothing changes.
+_STRICT_DTYPE_NORMS = tuple(
+    t for t in (getattr(torch.nn, "LayerNorm", None), getattr(torch.nn, "GroupNorm", None))
+    if t is not None
+)
+
+
+def _norm_input_to_weight_dtype(module, args):
+    if not args:
+        return None
+    x = args[0]
+    weight = getattr(module, "weight", None)
+    if (
+        not isinstance(x, torch.Tensor)
+        or not isinstance(weight, torch.Tensor)
+        or x.dtype == weight.dtype
+        or not x.dtype.is_floating_point
+        or torch.is_autocast_enabled(x.device.type)
+    ):
+        return None
+    module._unsloth_norm_input_dtype = x.dtype
+    return (x.to(weight.dtype),) + tuple(args[1:])
+
+
+def _norm_output_to_input_dtype(module, args, output):
+    input_dtype = module.__dict__.pop("_unsloth_norm_input_dtype", None)
+    if input_dtype is None or not isinstance(output, torch.Tensor):
+        return None
+    return output.to(input_dtype)
+
+
+def _match_norm_input_dtype(module):
+    """Idempotently let a strict-dtype norm whose weight was upcast accept the model dtype."""
+    if not isinstance(module, _STRICT_DTYPE_NORMS):
+        return
+    if getattr(module, "_unsloth_norm_dtype_hooks", False):
+        return
+    module.register_forward_pre_hook(_norm_input_to_weight_dtype)
+    module.register_forward_hook(_norm_output_to_input_dtype)
+    module._unsloth_norm_dtype_hooks = True
+
+
 def _attach_tower_input_hooks(model):
     try:
         from .device_map_planner import attach_tower_input_hooks
@@ -593,6 +639,7 @@ def patch_model_and_tokenizer(
     for name, module in model.named_modules():
         if hasattr(module, "_pre_set_compute_dtype"):
             module.to(module._pre_set_compute_dtype)
+            _match_norm_input_dtype(module)
     pass
 
     # Correct dtype
