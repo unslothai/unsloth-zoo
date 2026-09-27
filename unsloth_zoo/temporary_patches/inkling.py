@@ -18,8 +18,9 @@
 
 1. Inkling-Small config: its intermediate_size is the MoE width, not the dense width.
 2. transformers 5.17.0 applies embed_norm twice on the multimodal path (InklingModel norms the
-   token embeddings, then InklingTextModel norms them again). Fixed upstream by
-   huggingface/transformers#48786, which is not in a release yet.
+   token embeddings, then InklingTextModel norms them again). Introduced by
+   huggingface/transformers#47827, fixed by huggingface/transformers#48786, which is not in a
+   release yet. Inkling shipped in 5.14.0; 5.14, 5.15 and 5.16 norm once.
 """
 import functools
 import inspect
@@ -62,10 +63,24 @@ def _identity(hidden_states):
     return hidden_states
 
 
+def _transformers_has_double_embed_norm_release(version = None):
+    # Only the 5.17 series shipped the double norm (5.17.0 is the only such release so far)
+    try:
+        from packaging.version import Version
+        if version is None:
+            import transformers
+            version = transformers.__version__
+        return Version(version).release[:2] == (5, 17)
+    except Exception:
+        return False
+
+
 def patch_inkling_double_embed_norm():
     try:
         from transformers.models.inkling import modeling_inkling
     except Exception:
+        return
+    if not _transformers_has_double_embed_norm_release():
         return
     mm_model = getattr(modeling_inkling, "InklingModel", None)
     text_model = getattr(modeling_inkling, "InklingTextModel", None)

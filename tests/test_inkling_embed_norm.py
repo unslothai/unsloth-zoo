@@ -1,11 +1,15 @@
 """Inkling must apply embed_norm exactly once before the first decoder layer.
 
 transformers 5.17.0 norms the token embeddings in InklingModel.forward and again in
-InklingTextModel.forward, which breaks every real checkpoint (Inkling-Small wikitext PPL 1099
-instead of about 31). temporary_patches/inkling.py removes the duplicate norm.
+InklingTextModel.forward (huggingface/transformers#47827, fixed on main by #48786), which breaks
+every real checkpoint: Inkling-Small wikitext PPL 1099 instead of about 31.
+temporary_patches/inkling.py removes the duplicate norm on 5.17.x only.
 """
 import importlib
 import os
+import subprocess
+import sys
+import textwrap
 
 import pytest
 import torch
@@ -14,6 +18,30 @@ os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
 
 modeling_inkling = pytest.importorskip("transformers.models.inkling.modeling_inkling")
 from transformers.models.inkling.configuration_inkling import InklingConfig
+
+# thinkingmachines/Inkling-Small config.json (original checkpoint layout), shrunk: same flags, same
+# local/global layer pattern and dense-then-MoE schedule, tiny widths.
+INKLING_SMALL_SHRUNK = {
+    "architectures": ["InklingForConditionalGeneration"],
+    "model_type": "inkling_mm_model",
+    "eos_token_id": 200006,
+    "text_config": {
+        "model_max_length": 1048576, "hidden_size": 64, "num_hidden_layers": 6, "vocab_size": 160,
+        "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 16, "d_rel": 4, "rel_extent": 16,
+        "q_bias": False, "o_bias": False, "log_scaling_n_floor": 128000, "log_scaling_alpha": 0.1,
+        "rms_norm_eps": 1e-06, "use_embed_norm": True, "local_layer_ids": [0, 1, 2, 3, 4],
+        "dense_mlp_idx": 2, "use_sconv": True, "sconv_kernel_size": 4, "unpadded_vocab_size": 150,
+        "logits_mup_width_multiplier": 16.0, "final_logit_softcapping": None, "swa_head_dim": 16,
+        "swa_num_attention_heads": 4, "swa_num_key_value_heads": 2, "sliding_window_size": 8,
+        "n_routed_experts": 8, "num_experts_per_tok": 2, "n_shared_experts": 2, "shared_expert_sink": True,
+        "dense_intermediate_size": 128, "intermediate_size": 32, "route_scale": 8.0, "use_gate_bias": True,
+        "gate_activation": "sigmoid", "norm_after_topk": True, "use_global_scale": True,
+    },
+    "audio_config": {"decoder_dmodel": 64, "n_mel_bins": 4, "mel_vocab_size": 16},
+    "vision_config": {"decoder_dmodel": 64, "patch_size": 40, "temporal_patch_size": 2, "n_channels": 3,
+                      "n_layers": 1, "hidden_size": 32, "num_attention_heads": 2},
+    "mtp_config": {"num_nextn_predict_layers": 2, "chain_hidden_post_norm": False, "local_layer_ids": [0]},
+}
 
 
 def _apply_zoo_patches():
@@ -24,59 +52,89 @@ def _apply_zoo_patches():
             patch()
 
 
-def _tiny_model(device):
-    text_config = dict(
-        vocab_size=128, hidden_size=64, num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
-        head_dim=16, swa_num_attention_heads=4, swa_num_key_value_heads=2, swa_head_dim=16,
-        sliding_window_size=8, rel_extent=16, d_rel=4, local_layer_ids=[0],
-        dense_mlp_idx=1, dense_intermediate_size=96, intermediate_size=32,
-        n_routed_experts=4, num_experts_per_tok=2, n_shared_experts=1,
-    )
-    config = InklingConfig(
-        text_config=text_config,
-        vision_config=dict(hidden_size=32, num_hidden_layers=1, num_attention_heads=2),
-        audio_config=dict(n_mel_bins=4, mel_vocab_size=8),
-    )
+def _device():
+    # transformers routes the short convolutions to the causal_conv1d kernel when it is
+    # installed, and that kernel is CUDA only
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _tiny_model(device = None, dtype = torch.float32):
+    config = InklingConfig(**{k: v for k, v in INKLING_SMALL_SHRUNK.items() if k not in ("architectures", "model_type")})
     torch.manual_seed(0)
-    model = modeling_inkling.InklingForConditionalGeneration(config).to(device).eval()
+    model = modeling_inkling.InklingForConditionalGeneration(config).to(device or _device(), dtype).eval()
+    norm_weight = next(p for n, p in model.named_parameters() if n.endswith("embed_norm.weight"))
+    with torch.no_grad():
+        # the real checkpoints hold an embed_norm far from 1 (Inkling-Small: mean 0.07, max 3.45)
+        norm_weight.copy_(torch.rand_like(norm_weight) * 3 + 0.05)
     return model
+
+
+def _text_path_logits(model, input_ids):
+    # The text-only path of every transformers release (5.14 through main) norms the token embeddings once
+    language_model = model.model.language_model
+    raw = torch.nn.functional.embedding(input_ids, model.get_input_embeddings().weight)
+    norm_weight = next(p for n, p in model.named_parameters() if n.endswith("embed_norm.weight"))
+    eps = model.config.text_config.rms_norm_eps
+    normed = raw * torch.rsqrt(raw.pow(2).mean(-1, keepdim=True) + eps) * norm_weight
+    return normed
+
+
+def test_inkling_small_config_moe_width():
+    _apply_zoo_patches()
+    config = InklingConfig(**{k: v for k, v in INKLING_SMALL_SHRUNK.items() if k not in ("architectures", "model_type")})
+    assert config.text_config.intermediate_size == 128
+    assert config.text_config.moe_intermediate_size == 32
 
 
 @pytest.mark.parametrize("entry", ["conditional_generation", "inkling_model"])
 def test_inkling_embed_norm_applied_once(entry):
     _apply_zoo_patches()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = _tiny_model(device)
-    text_config = model.config.text_config
-    # The published MoE width comes from intermediate_size in the original config layout.
-    assert text_config.moe_intermediate_size == 32
-
-    norm_weight = next(p for n, p in model.named_parameters() if n.endswith("embed_norm.weight"))
-    with torch.no_grad():
-        norm_weight.copy_(torch.rand_like(norm_weight) * 3 + 0.1)  # far from 1, as in the checkpoints
-    embed_weight = model.get_input_embeddings().weight
-
+    model = _tiny_model()
+    device = next(model.parameters()).device
     captured = {}
-    first_layer = model.model.language_model.layers[0]
 
     def capture(module, args, kwargs):
         captured.setdefault("h", (args[0] if args else kwargs["hidden_states"]).detach())
 
-    handle = first_layer.register_forward_pre_hook(capture, with_kwargs=True)
-    input_ids = torch.randint(0, text_config.vocab_size, (2, 12), device=device)
+    handle = model.model.language_model.layers[0].register_forward_pre_hook(capture, with_kwargs = True)
+    input_ids = torch.randint(0, 150, (2, 12), device = device)
     try:
         with torch.no_grad():
             if entry == "conditional_generation":
-                model(input_ids=input_ids, use_cache=False)
+                model(input_ids = input_ids, use_cache = False)
             else:
-                model.model(input_ids=input_ids, use_cache=False)
+                model.model(input_ids = input_ids, use_cache = False)
     finally:
         handle.remove()
+    with torch.no_grad():
+        expected = _text_path_logits(model, input_ids)
+    torch.testing.assert_close(captured["h"], expected, rtol = 1e-5, atol = 1e-5)
 
-    raw = torch.nn.functional.embedding(input_ids, embed_weight).float()
-    eps = text_config.rms_norm_eps
-    expected = raw * torch.rsqrt(raw.pow(2).mean(-1, keepdim=True) + eps) * norm_weight.float()
-    torch.testing.assert_close(captured["h"].float(), expected, rtol=1e-4, atol=1e-4)
+
+def test_inkling_logits_match_single_norm_reference():
+    # Multimodal entry point == text-only entry point on the same weights (fp32)
+    _apply_zoo_patches()
+    model = _tiny_model()
+    device = next(model.parameters()).device
+    input_ids = torch.randint(0, 150, (2, 20), device = device)
+    with torch.no_grad():
+        logits = model(input_ids = input_ids, use_cache = False).logits
+        text_out = model.model.language_model(input_ids = input_ids, use_cache = False).last_hidden_state
+        reference = model.lm_head(text_out / model.config.text_config.logits_mup_width_multiplier)
+        reference = reference[..., : model.config.text_config.unpadded_vocab_size]
+    torch.testing.assert_close(logits, reference, rtol = 1e-5, atol = 1e-5)
+
+
+def test_inkling_generate_matches_single_norm_reference():
+    # KV cache + conv state decode path still norms once per new token
+    _apply_zoo_patches()
+    model = _tiny_model()
+    device = next(model.parameters()).device
+    input_ids = torch.randint(0, 150, (1, 10), device = device)
+    with torch.no_grad():
+        out = model.generate(input_ids = input_ids, max_new_tokens = 6, do_sample = False)
+        full = model(input_ids = out[:, :-1], use_cache = False).logits
+    assert torch.equal(full[0, 9:].argmax(-1), out[0, 10:])
 
 
 def test_inkling_patch_idempotent():
@@ -84,3 +142,31 @@ def test_inkling_patch_idempotent():
     first = modeling_inkling.InklingModel.forward
     _apply_zoo_patches()
     assert modeling_inkling.InklingModel.forward is first
+
+
+def test_inkling_patch_gate():
+    module = importlib.import_module("unsloth_zoo.temporary_patches.inkling")
+    gate = module._transformers_has_double_embed_norm_release
+    assert gate("5.17.0") and gate("5.17.1") and gate("5.17.0.dev0")
+    for version in ("4.57.6", "5.14.0", "5.16.0", "5.18.0", "5.18.0.dev0", "6.0.0"):
+        assert not gate(version)
+
+
+def test_inkling_patch_noop_when_gate_off():
+    # Outside 5.17.x the patch must leave transformers untouched
+    code = textwrap.dedent("""
+        import os
+        os.environ["UNSLOTH_IS_PRESENT"] = "1"
+        import unsloth_zoo.temporary_patches.inkling as inkling_patches
+        from transformers.models.inkling import modeling_inkling as mi
+        # simulate a release outside 5.17.x (importing unsloth_zoo re-reads transformers.__version__)
+        inkling_patches._transformers_has_double_embed_norm_release = lambda version = None: False
+        before = (mi.InklingModel.forward, mi.InklingTextModel.forward)
+        assert not getattr(before[0], "_unsloth_patched", False)
+        inkling_patches.patch_inkling_double_embed_norm()
+        assert (mi.InklingModel.forward, mi.InklingTextModel.forward) == before
+        print("NOOP_OK")
+    """)
+    env = dict(os.environ, PYTHONPATH = os.pathsep.join([os.path.dirname(os.path.dirname(os.path.abspath(__file__)))] + sys.path))
+    result = subprocess.run([sys.executable, "-c", code], capture_output = True, text = True, env = env)
+    assert "NOOP_OK" in result.stdout, result.stderr[-2000:]
