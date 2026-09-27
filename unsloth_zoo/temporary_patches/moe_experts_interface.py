@@ -182,6 +182,26 @@ def _dense_experts_without_expert_lora(module) -> bool:
     return found
 
 
+def _custom_gate_with_expert_lora(module) -> bool:
+    """Dense standard-layout experts with their own _apply_gate and an Unsloth expert LoRA attached."""
+    if getattr(module, "has_gate", True) is False or not _has_custom_gate(module):
+        return False
+    state = module.__dict__
+    if not any(state.get("_unsloth_lora_" + name) is not None for name in _EXPERT_STACK_NAMES):
+        return False
+    params = module._parameters
+    if any(
+        params.get(name) is not None and params[name].dtype not in _DENSE_STACK_DTYPES
+        for name in _EXPERT_STACK_NAMES
+    ):
+        return False
+    try:
+        from .moe_utils_bnb4bit import _experts_layout_is_standard
+        return bool(_experts_layout_is_standard(module))
+    except Exception:
+        return False
+
+
 def unsloth_experts_forward(
     self: nn.Module,
     hidden_states: torch.Tensor,
@@ -215,6 +235,17 @@ def _unsloth_experts_dispatch(
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
 ) -> torch.Tensor:
+    if _custom_gate_with_expert_lora(self):
+        # transformers' grouped_mm reads the raw stacks and skips the expert LoRA (DeepSeek-V4 bf16: lora_B
+        # never got a gradient). The moe_utils backends add it and call the class's own _apply_gate.
+        self.__dict__["_unsloth_own_apply_gate"] = True
+        backend = _moe_utils_module().get_forward_moe_backend()
+        stack = self._parameters.get("gate_up_proj")
+        if stack is not None and hidden_states.dtype != stack.dtype and torch.is_autocast_enabled():
+            # Eager transformers experts accept float32 activations under autocast; torch._grouped_mm does not.
+            out = backend(self, hidden_states.to(stack.dtype), top_k_index, top_k_weights)
+            return out.to(hidden_states.dtype)
+        return backend(self, hidden_states, top_k_index, top_k_weights)
     if getattr(self, "has_gate", True) is False or _has_custom_gate(self):
         interface = _experts_interface()
         fallback = interface["grouped_mm"] if interface is not None and "grouped_mm" in interface else None
