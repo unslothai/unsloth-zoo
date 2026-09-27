@@ -1815,6 +1815,22 @@ def _verify_compiled_cache_file_collectively(
         raise error
 pass
 
+_HUB_KERNEL_WRAPPER_RE = re.compile(r"^[ \t]*@use_kernel_func_from_hub_with_fallback\b", flags = re.MULTILINE)
+
+
+def is_hub_kernel_wrapper(source):
+    """True for a function transformers binds to an external kernel package (mamba_ssm, causal_conv1d, fla)
+    through `use_kernel_func_from_hub_with_fallback`. Emitted bare, never compiled: Unsloth keeps those
+    packages out of Dynamo (compile_mamba_ssm / compile_causal_conv1d), and on torch 2.11
+    `torch.compiler.is_exporting()` reads True inside a torch.compile trace, so the wrapper takes its export
+    branch and the compiled function is the torch reference. For Nemotron-H's
+    mamba2_split_conv1d_scan_combined that reference is a stub returning None, so training silently skipped
+    the fused Mamba-2 kernel (Colab, torch 2.11); on 2.14 the compile failed on the disabled kernel and fell
+    back to eager, one failed trace per new shape."""
+    return bool(_HUB_KERNEL_WRAPPER_RE.search(source or ""))
+pass
+
+
 def create_new_function(
     name,
     new_source,
@@ -6582,6 +6598,10 @@ def unsloth_compile_transformers(
                     bad = True
                     bad_reason = "disabled keyword is in it"
                     break
+            pass
+            if not bad and is_hub_kernel_wrapper(source):
+                bad = True
+                bad_reason = "it dispatches to an external kernel package"
             pass
             # Skipped for a DISABLE_COMPILE_FUNCTIONS name: `@torch.compiler.disable`
             # also stops Dynamo inlining it into a compiled caller, so downgrading it
