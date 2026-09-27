@@ -128,6 +128,44 @@ def test_no_type_ids_emitted_is_a_noop():
     assert out["input_ids"].shape == out["attention_mask"].shape
 
 
+def _mask_token_a(batch):
+    # Stands in for train_on_responses_only: excludes token "a", re-exposes everything else.
+    ids = batch["input_ids"]
+    return {"labels": torch.where(ids == VOCAB["a"], torch.full_like(ids, -100), ids)}
+
+
+def test_train_on_responses_only_applies_to_pc_path():
+    collator = make_collator(None)
+    collator.completion_only_loss = False
+    collator.train_on_responses_only = _mask_token_a
+    out = collator(EXAMPLES)
+    labels, ids = out["labels"], out["input_ids"]
+    assert (labels[ids == VOCAB["a"]] == -100).all()
+    assert (labels[ids == VOCAB["x"]] == VOCAB["x"]).all()
+
+
+def test_train_on_responses_only_never_unmasks_pc_path():
+    collator = make_collator(None)
+    collator.ignore_index = -1
+    collator.train_on_responses_only = _mask_token_a
+    out = collator(EXAMPLES)
+    labels, ids = out["labels"], out["input_ids"]
+    completion = labels != -1
+    assert completion.any()
+    assert not completion[out["attention_mask"] == 0].any()
+    assert not completion[ids == IMG_ID].any()
+    assert not completion[ids == VOCAB["b"]].any()
+    assert (labels != -100).all()
+
+
+def test_train_on_responses_only_pc_path_raises_when_nothing_is_trained():
+    import pytest
+    collator = make_collator(None)
+    collator.train_on_responses_only = lambda batch: {"labels": torch.full_like(batch["input_ids"], -100)}
+    with pytest.raises(ValueError, match = "no trainable token"):
+        collator(EXAMPLES)
+
+
 class _ChatProcessor(_FakeProcessor):
     """Renders `{"type": "image"}` as <img>, and records the images it is handed."""
 
@@ -152,8 +190,7 @@ class _ChatProcessor(_FakeProcessor):
     "<img> a",
 ])
 def test_top_level_images_reach_processor(prompt):
-    # TRL's vision format: images in a column, bare markers (or plain text) in the prompt.
-    # Both shapes used to drop the images with a warning and call the processor without them.
+    # TRL vision rows: images column + bare markers or plain text; both used to drop the images.
     from PIL import Image
 
     collator = make_collator(None)
@@ -163,5 +200,4 @@ def test_top_level_images_reach_processor(prompt):
     completion = [{"role": "assistant", "content": [{"type": "text", "text": "x"}]}]
     collator([{"images": [image], "prompt": prompt,
                "completion": completion if isinstance(prompt, list) else "x"}])
-    # The first processor call encodes the prompts, which is where images belong
     assert collator.processor.seen_images[0] == [[image]]

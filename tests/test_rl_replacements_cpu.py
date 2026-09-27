@@ -1469,3 +1469,27 @@ def test_efficient_grpo_backward_applies_upstream_gradient(scaler_scale, upstrea
     )
     (out[0] * upstream).backward()
     assert torch.allclose(new_eff.grad, new_ref.grad * upstream, atol=1e-8, rtol=1e-6)
+
+
+def test_warn_unsupported_grpo_options_fires_for_the_entropy_bonus(caplog):
+    trainer = _make_grpo_trainer(top_entropy_quantile=1.0, entropy_coef=0.5, use_adaptive_entropy=True)
+    with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
+        rr._warn_unsupported_grpo_options(trainer)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert len(msgs) == 1
+    assert "entropy_coef=0.5" in msgs[0] and "use_adaptive_entropy=True" in msgs[0]
+
+
+def test_warn_unsupported_grpo_options_silent_on_trl_entropy_defaults(caplog):
+    trl = pytest.importorskip("trl")
+    fields = {f.name: f.default for f in __import__("dataclasses").fields(trl.GRPOConfig)}
+    if "entropy_coef" not in fields:
+        pytest.skip("this TRL has no entropy bonus")
+    trainer = _make_grpo_trainer(
+        top_entropy_quantile=fields["top_entropy_quantile"],
+        entropy_coef=fields["entropy_coef"],
+        use_adaptive_entropy=fields.get("use_adaptive_entropy", False),
+    )
+    with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
+        rr._warn_unsupported_grpo_options(trainer)
+    assert caplog.records == []

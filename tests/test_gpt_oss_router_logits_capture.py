@@ -128,6 +128,9 @@ def test_patched_forward_returns_router_logits_like_stock():
     # CPU keeps parity exact; NVML would report GPUs CUDA_VISIBLE_DEVICES hides.
     env["CUDA_VISIBLE_DEVICES"] = ""
     env.pop("PYTORCH_NVML_BASED_CUDA_CHECK", None)
+    # Both runs compare the stock training forward, which needs logits and a loss. Inherited, a
+    # leftover UNSLOTH_RETURN_HIDDEN_STATES=1 makes the patched forward return loss=None.
+    env.pop("UNSLOTH_RETURN_HIDDEN_STATES", None)
     proc = subprocess.run(
         [sys.executable, "-c", _RUNTIME],
         capture_output = True, text = True, timeout = 600, env = env,
