@@ -957,6 +957,12 @@ def patch_Gemma4ClippableLinear_peft_reload():
     create_and_replace._unsloth_gemma4_clippable_linear_patched = True
     create_and_replace._unsloth_original_create_and_replace = original_create_and_replace
     LoraModel._create_and_replace = create_and_replace
+    # Saved target_modules must name the inner .linear for plain PEFT; see portable_lora_target_modules.
+    try:
+        from .moe_utils import _patch_peft_save_pretrained_for_moe_layout
+        _patch_peft_save_pretrained_for_moe_layout()
+    except Exception as e:
+        logger.warning(f"Unsloth: Gemma4 adapter save hook not installed ({e}).")
 pass
 TEMPORARY_PATCHES.append(patch_Gemma4ClippableLinear_peft_reload)
 

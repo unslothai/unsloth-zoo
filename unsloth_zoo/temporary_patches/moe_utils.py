@@ -3291,6 +3291,123 @@ def write_fused_expert_lora_layout(peft_model, save_directory, selected_adapters
     return written
 
 
+_LORA_INTERNAL_NAMES = frozenset((
+    "base_layer", "lora_A", "lora_B", "lora_dropout", "lora_embedding_A",
+    "lora_embedding_B", "lora_magnitude_vector",
+))
+
+
+def _lora_wrapped_module_names(base_model, adapter_name):
+    """(module names wrapped by `adapter_name`, whether it also has a fused expert parameter LoRA)."""
+    wrapped, has_param_lora = [], False
+    for name, module in base_model.named_modules():
+        # nn.Embedding LoRA lives in lora_embedding_A, its lora_A stays empty.
+        if not any(
+            hasattr(d, "keys") and adapter_name in d
+            for d in (getattr(module, "lora_A", None), getattr(module, "lora_embedding_A", None))
+        ):
+            continue
+        if getattr(module, "parameter_name", None):
+            has_param_lora = True
+            continue
+        if hasattr(module, "base_layer"):
+            wrapped.append(name)
+    return wrapped, has_param_lora
+
+
+def _target_regex_for(names, all_names):
+    """Fullmatch regex selecting exactly `names`; layer indices collapse to \\d+ only if that adds nothing."""
+    import re
+    wanted = set(names)
+    collapsed = sorted({re.sub(r"\\\.\d+(?=\\\.|$)", r"\\.\\d+", re.escape(n)) for n in wanted})
+    regex = "(?:" + "|".join(collapsed) + ")"
+    if {n for n in all_names if re.fullmatch(regex, n)} == wanted:
+        return regex
+    return "(?:" + "|".join(re.escape(n) for n in sorted(wanted)) + ")"
+
+
+def portable_lora_target_modules(peft_model, adapter_name, target_modules):
+    """`target_modules` that plain PEFT loads as Unsloth trained, or None if already fine (list form only).
+
+    Gemma 4: LoRA sits on the inner `.linear`; plain PEFT would pick the unsupported wrapper, so write a regex.
+    Fused experts: unmatched gate_proj / up_proj make PEFT's v5 MoE conversion double gate_up_proj's rank; drop them.
+    """
+    if not isinstance(target_modules, (list, tuple, set)) or not target_modules:
+        return None
+    try:
+        base_model = peft_model.get_base_model()
+    except Exception:
+        base_model = getattr(getattr(peft_model, "base_model", None), "model", None)
+    if base_model is None:
+        return None
+    wrapped, has_param_lora = _lora_wrapped_module_names(base_model, adapter_name)
+    targets = [t for t in target_modules if isinstance(t, str)]
+    if len(targets) != len(target_modules):
+        return None
+
+    def hit(key, target):
+        return key == target or key.endswith("." + target)
+
+    redirected = [
+        n for n in wrapped
+        if n.endswith(".linear") and any(hit(n[: -len(".linear")], t) for t in targets)
+    ]
+    if redirected:
+        all_names = [
+            n for n, _ in base_model.named_modules()
+            if n and not (set(n.split(".")) & _LORA_INTERNAL_NAMES)
+        ]
+        return _target_regex_for(wrapped, all_names)
+    if has_param_lora:
+        kept = [t for t in targets if any(hit(n, t) for n in wrapped)]
+        if len(kept) != len(targets):
+            return sorted(kept)
+    return None
+
+
+def _redirected_patterns(peft_model, adapter_name, patterns):
+    """Add a `(?:key)\\.linear` twin for each rank/alpha pattern key that matched a redirected
+    wrapper, since PEFT fullmatches `(.*\\.)?(key)$` against the inner `.linear` on reload."""
+    import re
+    if not isinstance(patterns, dict) or not patterns:
+        return patterns
+    wrapped, _ = _lora_wrapped_module_names(peft_model.get_base_model(), adapter_name)
+    inner = [n[: -len(".linear")] for n in wrapped if n.endswith(".linear")]
+    out = dict(patterns)
+    for key, value in patterns.items():
+        twin = f"(?:{key})\\.linear"
+        if twin not in out and any(re.match(rf"(.*\.)?({key})$", n) for n in inner):
+            out[twin] = value
+    return out
+
+
+def write_portable_target_modules(peft_model, save_directory, selected_adapters = None):
+    """Rewrite saved `target_modules` per `portable_lora_target_modules`; returns paths written."""
+    written = []
+    for adapter_name, path in _fused_expert_lora_adapter_config_paths(
+        peft_model, save_directory, selected_adapters,
+    ):
+        with open(path, "r", encoding = "utf-8") as f:
+            config = json.load(f)
+        if not isinstance(config, dict):
+            continue
+        replacement = portable_lora_target_modules(
+            peft_model, adapter_name, config.get("target_modules"),
+        )
+        if replacement is None:
+            continue
+        config["target_modules"] = replacement
+        if isinstance(replacement, str):
+            for field in ("rank_pattern", "alpha_pattern"):
+                config[field] = _redirected_patterns(peft_model, adapter_name, config.get(field))
+            # PEFT rejects layer selectors beside a str target; the regex already names only those layers.
+            config["layers_to_transform"] = None
+            config["layers_pattern"] = None
+        _atomic_write_text(path, json.dumps(config, indent = 2, sort_keys = True))
+        written.append(path)
+    return written
+
+
 def _atomic_write_text(path, text):
     """Replace `path` with `text`, or leave it exactly as it was.
 
@@ -3377,6 +3494,21 @@ def _patched_peft_model_save_pretrained(self, save_directory, *args, **kwargs):
             if logger is not None:
                 logger.warning(
                     f"Unsloth: could not record the fused MoE expert LoRA layout in "
+                    f"adapter_config.json ({type(exception).__name__}: {exception}). The "
+                    f"adapter itself saved correctly."
+                )
+        try:
+            write_portable_target_modules(
+                self, save_directory,
+                selected_adapters = _save_pretrained_argument(
+                    "selected_adapters", None, args, kwargs,
+                ),
+            )
+        except Exception as exception:
+            logger = _moe_utils_logger()
+            if logger is not None:
+                logger.warning(
+                    f"Unsloth: could not rewrite target_modules for plain PEFT in "
                     f"adapter_config.json ({type(exception).__name__}: {exception}). The "
                     f"adapter itself saved correctly."
                 )
