@@ -318,6 +318,16 @@ def test_attach_matches_peft_forward_with_patterns(tmp_path, base_dir):
     np.testing.assert_array_equal(_mlx_logits(model), _mlx_logits(model))
 
 
+def test_attach_normalizes_raw_config(tmp_path, base_dir):
+    peft_dir = str(tmp_path / "peft")
+    _, cfg = _make_peft_adapter(base_dir, peft_dir)
+    model, _ = load_model(Path(base_dir))
+    with pytest.raises(ValueError, match="aLoRA"):
+        attach_and_bind_peft_adapter(
+            model, peft_dir, {**cfg, "alora_invocation_tokens": [1, 2]}
+        )
+
+
 @pytest.mark.parametrize("key,shape,match", [
     ("base_model.model.decoder.blocks.0.attn.q_proj.lora_A.weight",
      (8, HIDDEN), "decoder.blocks"),

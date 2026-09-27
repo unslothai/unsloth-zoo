@@ -19509,6 +19509,9 @@ def attach_and_bind_peft_adapter(model, adapter_dir, cfg):
     from .loader import _patch_mlx_lora_from_base_compat
     _patch_mlx_lora_from_base_compat()
 
+    if not cfg.get("_unsloth_peft_import"):
+        from unsloth_zoo.mlx.peft_interop import normalize_peft_adapter_config
+        cfg = normalize_peft_adapter_config(dict(cfg), adapter_dir=adapter_dir)
     _reject_dora_dropout(cfg)
     use_dora = bool(cfg.get("use_dora"))
     if use_dora:
