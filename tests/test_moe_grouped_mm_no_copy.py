@@ -1,7 +1,7 @@
 """Regression tests for the copy-elimination in _grouped_mm_with_backward_fix.
 
 The fix passes the frozen base stack to torch._grouped_mm as a transposed view instead of
-copying it (~805 MB / ~57% of MoE GPU time on Qwen3-30B) every step, gated on the #186365
+copying it (~805 MB / ~57% of MoE GPU time on Qwen3-30B) every step, gated on the transposed-view self-check (formerly cited as pytorch#186365, a usage error upstream)
 safety probe. These pin: the view is kept on a probe-safe stack (else a copy is forced), the
 probe gates that choice, the probe leaves global RNG untouched, and view == contiguous
 bit-exactly in forward and backward where torch._grouped_mm runs for real.
@@ -61,7 +61,7 @@ def test_no_forced_copy_on_happy_path(monkeypatch):
 
 
 def test_probe_gates_the_forced_copy(monkeypatch):
-    """The #186365 gate: probe unsafe -> weight made contiguous; safe -> view passed as-is."""
+    """The transposed-view gate: probe unsafe -> weight made contiguous; safe -> view passed as-is."""
     from unsloth_zoo.temporary_patches.moe_utils import _grouped_mm_with_backward_fix
 
     inputs = torch.randn(5, 4)

@@ -360,9 +360,10 @@ def _grouped_mm_with_backward_fix(
 
     Forcing weight.contiguous() copies the frozen base stack (~805 MB for gate_up on Qwen3-30B,
     ~57% of MoE GPU time) every step. torch._grouped_mm takes the non-contiguous view directly,
-    but some CUDA builds silently miscompute it (pytorch/pytorch#186365), so we only skip the
-    copy when a one-time probe proves the view path matches the contiguous one; else we keep the
-    always-correct copy. Falls back to a per-group matmul when the device has no
+    and a one-time probe checks that the view path matches the contiguous one on this device
+    before we skip the copy; else we keep the always-correct copy. (pytorch/pytorch#186365,
+    once cited here, was a usage error: offs must be cumulative group END offsets, rows past
+    offs[-1] are left uninitialised. No view miscompute is known; the probe is insurance.) Falls back to a per-group matmul when the device has no
     torch._grouped_mm, and on the 16-byte stride error. Bit-exact vs the always-contiguous
     path in forward and backward.
     """
@@ -374,7 +375,7 @@ def _grouped_mm_with_backward_fix(
     if not _check_torch_grouped_mm_supported():
         return _manual_grouped_mm(inputs, weight, offsets)
     if not _transposed_view_grouped_mm_is_safe():
-        weight = weight.contiguous()   # #186365: view path unproven on this build -> safe copy
+        weight = weight.contiguous()   # view path unproven on this device -> safe copy
     try:
         return torch._grouped_mm(inputs, weight, offs=offsets)
     except RuntimeError as exc:
@@ -855,9 +856,12 @@ def _probe_torch_grouped_mm_supported():
     return _TORCH_GROUPED_MM_SUPPORTED
 
 
-# Some CUDA builds silently miscompute torch._grouped_mm for a transposed bf16 view preceded by a
-# broadcast op (pytorch/pytorch#186365, Blackwell + torch 2.11/2.13). This probe checks the view
-# matches the contiguous copy so _grouped_mm_with_backward_fix can skip the copy only when safe.
+# Self-check that torch._grouped_mm on a transposed bf16 view matches the contiguous copy, so
+# _grouped_mm_with_backward_fix can skip the copy only when proven on this device. It was added
+# for pytorch/pytorch#186365, which upstream closed as a usage error (per-group SIZES passed as
+# offs instead of cumulative ends, so most output rows were uninitialised memory); with valid offs
+# the view is bitwise equal to the copy on B200 torch 2.13 and 2.14 (fwd, dx, dw). Kept as cheap
+# insurance for untested archs/backends; it runs once per process.
 _TRANSPOSED_VIEW_GROUPED_MM_SAFE = None
 
 
@@ -893,7 +897,7 @@ def _probe_transposed_view_grouped_mm_is_safe():
             ok, ref = True, None
             for _ in range(6):
                 row_wise_max = A.abs().amax(dim=-1, keepdim=True)
-                _ = A / (row_wise_max / 448.0)     # the #186365 trigger (result discarded)
+                _ = A / (row_wise_max / 448.0)     # allocator churn from the #186365 report (harmless)
                 r_view = torch._grouped_mm(A, w_t, offs=offs)
                 r_contig = torch._grouped_mm(A, w_tc, offs=offs)
                 if (r_view - r_contig).abs().max().item() > 1e-2:   # view disagrees with contiguous
