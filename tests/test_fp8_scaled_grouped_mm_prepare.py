@@ -77,7 +77,6 @@ def test_scaled_grouped_mm_path_is_opt_in(monkeypatch):
 
 @pytest.mark.skipif(FP8 is None or not hasattr(torch, "_scaled_grouped_mm"), reason = "needs fp8 + _scaled_grouped_mm")
 def test_scaled_grouped_mm_path_skipped_when_grad_enabled(monkeypatch):
-    # torch has no derivative for _scaled_grouped_mm, so a training forward must not take it.
     x = torch.randn(8, H, device = "meta", dtype = torch.bfloat16, requires_grad = True)
     out = torch._scaled_grouped_mm(
         x.to(FP8),
