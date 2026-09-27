@@ -209,7 +209,6 @@ def test_padding_budget_exact_threshold_boundary_and_domain():
 
     assert (exact.action, exact.planned_signatures, exact.raw_signatures) == ("exact", 128, 128)
     assert (bucketed.action, bucketed.raw_signatures) == ("bucket", 129)
-    # No bounded points below the default; the ceiling caps above.
     for invalid in (31, AUTOMATIC_TEXT_COMPILE_CEILING + 1):
         with pytest.raises(ValueError):
             select_text_shape_padding_budget(
@@ -500,7 +499,6 @@ def test_stream_grid_anchor_and_report_contract():
     assert "1.05" in describe_stream_shape_grid(StreamShapeGrid(anchor=4096), 128)
     assert "2.00" in describe_stream_shape_grid(StreamShapeGrid(ratio=2), 128)
 
-    # 60 endpoints here, so cap 64 leaves only 4.
     wide = StreamShapeGrid(anchor=4096)
     assert [stream_exact_ceiling(g, c) for g, c in (
         (wide, 128), (wide, 64), (StreamShapeGrid(), 64), (wide, 60),
@@ -521,7 +519,6 @@ def test_stream_grid_anchor_and_report_contract():
                     assert admitted + grid.endpoint_count * phases <= cap, (
                         cap, anchor, phases, in_flight, ceiling,
                     )
-    # Guard against None-everywhere passing the invariant vacuously.
     assert stream_exact_ceiling(wide, 128, 2) > 0
     assert stream_exact_ceiling(wide, 128, 1, 4) == SMALL_EXACT_SIGNATURE_THRESHOLD
     assert "at most 32 signatures" in describe_stream_shape_grid(wide, 128, 32)
