@@ -152,8 +152,7 @@ def _retype_gpu_buffer(device_index, use_b, dtype, numel):
     if old.element_size() == torch.empty(0, dtype = dtype).element_size():
         new = old.view(dtype)   # fp16 <-> bf16: reinterpret the same storage, no second buffer
     else:
-        # Free the old storage first so the peak is one buffer, not two. Tensor.resize_(0) keeps
-        # the allocation; the storage resize releases it (the caller's stale view is never read).
+        # Tensor.resize_(0) keeps the allocation; freeing the storage keeps the peak at one buffer.
         size = max(numel, old.numel())
         device = old.device
         old.untyped_storage().resize_(0)
