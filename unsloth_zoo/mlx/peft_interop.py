@@ -167,6 +167,12 @@ def normalize_peft_adapter_config(cfg, adapter_dir=None):
             )
     init_mode = cfg.get("init_lora_weights")
     init_norm = init_mode.lower() if isinstance(init_mode, str) else ""
+    if init_norm == "mica":
+        raise ValueError(
+            "Unsloth MLX: MiCA adapters (init_lora_weights='mica') train only "
+            "lora_A with lora_B frozen; MLX LoRA would train both, so they "
+            "cannot be imported."
+        )
     if not _is_empty(cfg.get("loftq_config")) or init_norm == "loftq":
         _named = "LoftQ"
     elif init_norm.startswith(("pissa", "corda")) or init_norm == "olora":

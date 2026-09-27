@@ -235,6 +235,7 @@ def test_tied_output_head_snapshot_folds_or_refuses(tmp_path, tied_base_dir):
     ("lora_bias", True, "lora_bias"),
     ("init_lora_weights", "pissa_niter_4", "mutated"),
     ("init_lora_weights", "OLoRA", "mutated"),
+    ("init_lora_weights", "mica", "MiCA"),
     ("loftq_config", {"bits": 4}, "LoftQ"),
 ])
 def test_normalize_rejects_by_name(field, value, match):
