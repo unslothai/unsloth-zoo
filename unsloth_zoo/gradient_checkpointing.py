@@ -144,6 +144,28 @@ def _new_host_buffer(numel, dtype):
         return _mark_host_buffer(torch.empty(numel, dtype = dtype, device = "cpu"))
 
 
+def _retype_gpu_buffer(device_index, use_b, dtype, numel):
+    """Replace one device's GPU reload buffer with one of `dtype`, so a checkpointed input comes back in its own dtype."""
+    global GPU_BUFFERS, GPU_BUFFERS_B
+    buffers = GPU_BUFFERS_B if use_b else GPU_BUFFERS
+    old = buffers[device_index]
+    if old.element_size() == torch.empty(0, dtype = dtype).element_size():
+        new = old.view(dtype)   # fp16 <-> bf16: reinterpret the same storage, no second buffer
+    else:
+        # Tensor.resize_(0) keeps the allocation; freeing the storage keeps the peak at one buffer.
+        size = max(numel, old.numel())
+        device = old.device
+        old.untyped_storage().resize_(0)
+        with _no_inference_mode():
+            new = torch.empty(size, dtype = dtype, device = device)
+    updated = list(buffers)
+    updated[device_index] = new
+    updated = type(buffers)(updated)
+    if use_b: GPU_BUFFERS_B = updated
+    else: GPU_BUFFERS = updated
+    return new
+
+
 def _grow_host_buffer(buffer, new_size):
     """resize_ on a pinned buffer issues a fresh, larger cudaHostAlloc, which can fail."""
     if new_size <= buffer.numel(): return _mark_host_buffer(buffer)
@@ -915,6 +937,11 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         pass
 
                         x = CPU_BUFFERS[CPU_INDEX]
+                        if x.dtype != arg.dtype:
+                            # copy_ would convert silently, so the replay would see another dtype (forced-float32 fp16 layers, bf16 slots).
+                            with _no_inference_mode():
+                                x = _new_host_buffer(max(new_size, x.numel()), arg.dtype)
+                            CPU_BUFFERS[CPU_INDEX] = x
                         shape = arg.shape
                         if new_size > x.numel():
                             with _no_inference_mode():
@@ -1032,6 +1059,9 @@ class UnslothCheckpointFunction(torch.autograd.Function):
             host_buffer = CPU_BUFFERS[CPU_INDEX]
             host_is_pinned = getattr(host_buffer, HOST_PINNED_ATTR, False)
             x = host_buffer[:new_size].view(shape)
+            if buffer.dtype != x.dtype:
+                buffer = _retype_gpu_buffer(device_index, USE_DOUBLE_BUFFER and buffer_slot == 1, x.dtype, new_size)[:new_size].view(shape)
+                EXTRA_STREAM.wait_stream(MAIN_STREAM)
 
             # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
             if USE_DOUBLE_BUFFER:
