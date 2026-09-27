@@ -1497,6 +1497,60 @@ def patch_datasets_map_worker_death_retry():
 TEMPORARY_PATCHES.append(patch_datasets_map_worker_death_retry)
 
 
+def _gradient_checkpointing_donor(model):
+    """Name of the first submodule that can be checkpointed: a GradientCheckpointingLayer, or a
+    PreTrainedModel that declares supports_gradient_checkpointing. None if there is none."""
+    try:
+        from transformers.modeling_layers import GradientCheckpointingLayer
+    except Exception:
+        GradientCheckpointingLayer = None
+    from transformers import PreTrainedModel
+    for name, module in model.named_modules():
+        if not name or module is model:
+            continue
+        if GradientCheckpointingLayer is not None and isinstance(module, GradientCheckpointingLayer):
+            return name
+        if isinstance(module, PreTrainedModel) and getattr(type(module), "supports_gradient_checkpointing", False):
+            return name
+    return None
+pass
+
+
+def patch_gradient_checkpointing_enable_inherit():
+    # Remote-code wrappers (nvidia Nemotron-3-Nano-Omni: NemotronH_Nano_Omni_Reasoning_V3 and its inner
+    # NemotronHForCausalLM) leave PreTrainedModel.supports_gradient_checkpointing at False although their
+    # decoder blocks are GradientCheckpointingLayer, so gradient_checkpointing_enable() raises
+    # "... does not support gradient checkpointing" (e.g. from TRL / Trainer gradient_checkpointing=True).
+    # transformers' _set_gradient_checkpointing already walks every submodule, so only the gate is wrong:
+    # inherit the flag when a submodule supports it. Models with no checkpointable submodule still raise.
+    if os.environ.get("UNSLOTH_GC_INHERIT", "1") == "0":
+        return
+    try:
+        from transformers import PreTrainedModel
+    except Exception as e:
+        return raise_error("transformers.PreTrainedModel", e)
+    original = PreTrainedModel.gradient_checkpointing_enable
+    if getattr(original, "_unsloth_gc_inherit", False):
+        return
+
+    @functools.wraps(original)
+    def gradient_checkpointing_enable(self, *args, **kwargs):
+        if not getattr(self, "supports_gradient_checkpointing", False):
+            donor = _gradient_checkpointing_donor(self)
+            if donor is not None:
+                # Instance attribute: the class and its other instances stay as they are.
+                self.supports_gradient_checkpointing = True
+                logger.info(
+                    f"Unsloth: {type(self).__name__} inherits gradient checkpointing support from {donor}."
+                )
+        return original(self, *args, **kwargs)
+    gradient_checkpointing_enable._unsloth_gc_inherit = True
+    gradient_checkpointing_enable._unsloth_original = original
+    PreTrainedModel.gradient_checkpointing_enable = gradient_checkpointing_enable
+pass
+TEMPORARY_PATCHES.append(patch_gradient_checkpointing_enable_inherit)
+
+
 def patch_GraniteMoeHybridMambaLayer_cuda_kernels_forward():
     try:
         import transformers.models.granitemoehybrid.modeling_granitemoehybrid
