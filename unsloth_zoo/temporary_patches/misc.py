@@ -2740,3 +2740,37 @@ def patch_peft_lora_integer_input():
     Linear4bit.forward = forward
 pass
 TEMPORARY_PATCHES.append(patch_peft_lora_integer_input)
+
+
+def patch_granitemoe_router_logits_recording():
+    # transformers 5.x (through main) dropped router_logits from the Granite MoE family's _can_record_outputs, so
+    # output_router_logits=True yields router_logits=None, load_balancing_loss_func returns int 0 and the CausalLM
+    # forward crashes on `aux_loss.to(...)` (TRL >= 1.7 turns it on by default).
+    try:
+        from transformers.utils.output_capturing import OutputRecorder
+    except Exception:
+        return  # transformers 4.x collects router logits in the decoder loop itself
+    for module_name, prefix in (
+        ("granitemoe", "GraniteMoe"),
+        ("granitemoeshared", "GraniteMoeShared"),
+        ("granitemoe_swa", "GraniteMoeSWA"),
+        ("granitemoehybrid", "GraniteMoeHybrid"),
+    ):
+        try:
+            module = importlib.import_module(f"transformers.models.{module_name}.modeling_{module_name}")
+        except Exception:
+            continue
+        pretrained = getattr(module, f"{prefix}PreTrainedModel", None)
+        router = getattr(module, f"{prefix}TopKRouter", None)
+        recorded = getattr(pretrained, "_can_record_outputs", None)
+        if pretrained is None or router is None or not isinstance(recorded, dict) or "router_logits" in recorded:
+            continue
+        # GraniteMoeSWA returns (router_logits, ...) while the others end with it: read the position off the source.
+        try:
+            returned = re.findall(r"return ([^\n]+)", inspect.getsource(router.forward))[-1]
+            index = [x.strip() for x in returned.split(",")].index("router_logits")
+        except Exception:
+            continue
+        pretrained._can_record_outputs = {**recorded, "router_logits": OutputRecorder(router, index = index)}
+pass
+TEMPORARY_PATCHES.append(patch_granitemoe_router_logits_recording)
