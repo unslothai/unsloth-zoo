@@ -1022,10 +1022,15 @@ def _eager_selective_log_softmax(hidden_states, lm_head, index, chunks,
     return out.reshape(index.shape)
 
 
+def _line_at(src, needle):
+    """Start of the line holding `needle`, so the slice dedents at any body indent."""
+    return src.rindex("\n", 0, src.index(needle)) + 1
+
+
 def _offloaded_block_source():
     import textwrap
     src = inspect.getsource(rr.grpo_accumulated_loss)
-    return textwrap.dedent(src[src.index("    def to_device"):src.index("    def efficient_log_softmax")])
+    return textwrap.dedent(src[_line_at(src, "def to_device"):_line_at(src, "def efficient_log_softmax")])
 
 
 def _exec_offloaded_block(inner_fn):

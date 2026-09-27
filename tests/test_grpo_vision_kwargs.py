@@ -493,6 +493,7 @@ def _which_branch(monkeypatch, vision_kwargs):
     def _no_vision(*_a, **_k):
         raise _ReachedTheVisionBranch
 
+    monkeypatch.delenv("UNSLOTH_RETURN_HIDDEN_STATES", raising = False)
     monkeypatch.setattr(_rl, "left_pack_padding", _no_packing)
     trainer = types.SimpleNamespace(
         args = types.SimpleNamespace(
