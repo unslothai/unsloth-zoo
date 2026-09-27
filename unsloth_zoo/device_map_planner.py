@@ -872,6 +872,25 @@ def _merged_parameter_patterns(model: nn.Module, hf_quantizer: Any = None) -> li
             conversions = get_model_conversion_mapping(model) or []
         except Exception:
             return []
+    patterns = _merging_target_patterns(conversions)
+    if not patterns:
+        # text_only VLM decoder: no conversions of its own, unsloth carries the parent's in at load.
+        try:
+            from transformers.conversion_mapping import get_checkpoint_conversion_mapping
+        except Exception:
+            return patterns
+        for parent_type in _text_only_parent_model_types(model):
+            try:
+                parent = get_checkpoint_conversion_mapping(parent_type) or []
+            except Exception:
+                continue
+            patterns = _merging_target_patterns(parent, unanchored_only = True)
+            if patterns:
+                break
+    return patterns
+
+
+def _merging_target_patterns(conversions, unanchored_only: bool = False) -> list:
     patterns = []
     for conversion in conversions:
         if getattr(conversion, "force_cpu", False):
@@ -880,12 +899,37 @@ def _merged_parameter_patterns(model: nn.Module, hf_quantizer: Any = None) -> li
         if not any(_is_merging_op(op) for op in operations):
             continue
         for target in getattr(conversion, "target_patterns", None) or []:
+            # A parent's prefix-anchored target names the VLM layout, not the bare decoder's keys.
+            if unanchored_only and str(target).startswith("^"):
+                continue
             try:
                 # A backreference to a source capture group matches any text here.
                 patterns.append(re.compile(re.sub(r"\\\d", ".*", str(target))))
             except re.error:
                 continue
     return patterns
+
+
+def _text_only_parent_model_types(model: nn.Module) -> list[str]:
+    """Model types of the composite configs that declare this decoder's config as their ``text_config``."""
+    config = getattr(model, "config", None)
+    if config is None or getattr(config, "base_config_key", None) != "text_config":
+        return []
+    import importlib
+    try:
+        module = importlib.import_module(type(config).__module__)
+    except Exception:
+        return []
+    own = getattr(config, "model_type", None)
+    parents = []
+    for value in vars(module).values():
+        if not isinstance(value, type) or value is type(config):
+            continue
+        sub_configs = getattr(value, "sub_configs", None)
+        parent_type = getattr(value, "model_type", None)
+        if isinstance(sub_configs, Mapping) and "text_config" in sub_configs and parent_type and parent_type != own:
+            parents.append(parent_type)
+    return parents
 
 
 def _storage_bytes_per_element(model: nn.Module, hf_quantizer: Any):
