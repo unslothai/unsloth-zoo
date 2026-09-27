@@ -72,6 +72,14 @@ def qwen4_exp_qsa_indexer_forward(self, hidden_states, position_embeddings, atte
     return _reference_qsa_forward(self, hidden_states, position_embeddings, attention_mask, past_key_values)
 
 
+def _is_transformers_indexer_forward(function):
+    """The forward transformers ships, read off its code object: Unsloth's compiled copy
+    keeps the transformers ``__module__`` for identity checks but lives in its cache file."""
+    code = getattr(function, "__code__", None)
+    filename = str(getattr(code, "co_filename", "")).replace("\\", "/")
+    return "/transformers/models/qwen4_exp/" in filename
+
+
 def _make_fast_indexer_forward(original_forward):
     """Test hook: bind `original_forward` as the long-context reference."""
     global _reference_qsa_forward
@@ -94,7 +102,7 @@ def patch_qwen4_exp():
         and indexer_cls.forward is not qwen4_exp_qsa_indexer_forward
         # Only ever wrap transformers' own forward: after Unsloth's compiler swaps in its
         # generated class, a re-run must not take that copy (which calls us) as the reference.
-        and str(getattr(indexer_cls.forward, "__module__", "")).startswith("transformers.")
+        and _is_transformers_indexer_forward(indexer_cls.forward)
     ):
         try:
             _make_fast_indexer_forward(indexer_cls.forward)

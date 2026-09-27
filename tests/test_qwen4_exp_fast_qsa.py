@@ -136,6 +136,7 @@ def test_patch_installed_and_kill_switch(monkeypatch):
         # The compiler's generated copy lives outside transformers: never taken as the reference.
         def compiled_copy(self, *a, **k):
             return patch.qwen4_exp_qsa_indexer_forward(self, *a, **k)
+        compiled_copy.__module__ = original.__module__  # the compiler keeps the identity
         cls.forward = compiled_copy
         patch.patch_qwen4_exp()
         assert cls.forward is compiled_copy and patch._reference_qsa_forward is original
