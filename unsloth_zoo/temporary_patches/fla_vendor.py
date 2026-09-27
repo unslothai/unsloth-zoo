@@ -46,7 +46,9 @@ _VENDORED_MARK = "_UNSLOTH_VENDORED_FLA"
 _EXPORT_SUBMODULES = ("fla.modules", "fla.ops", "fla.ops.gated_delta_rule")
 
 # Modeling modules binding fla symbols as globals at import (None when unavailable).
-_REPAIR_MODELING = ("qwen3_5", "qwen3_5_moe", "qwen3_next")
+# qwen4_exp (Qwen3.8-Flash-Next) only reaches fla through the kernel-hub decorator
+# (transformers 5.x), same gating / l2norm contract as qwen3_5.
+_REPAIR_MODELING = ("qwen3_5", "qwen3_5_moe", "qwen3_next", "qwen4_exp")
 
 # olmo_hybrid also needs ShortConvolution (not vendored), so it is not covered.
 _VENDOR_COVERED_MODELS = frozenset(_REPAIR_MODELING)
@@ -803,6 +805,24 @@ def _resolved_implementation(wrapper):
     return None
 
 
+def _decorated_kernel_name(wrapper, default):
+    """The fla function name a kernel-hub wrapper was decorated with (its `func_name`
+    closure variable), else ``default``."""
+    code = getattr(wrapper, "__code__", None)
+    closure = getattr(wrapper, "__closure__", None) or ()
+    if code is None:
+        return default
+    for name, cell in zip(code.co_freevars, closure):
+        if name != "func_name":
+            continue
+        try:
+            value = cell.cell_contents
+        except ValueError:
+            return default
+        return value if isinstance(value, str) and value else default
+    return default
+
+
 def _live_gated_delta_kernel(name):
     """The kernel ``name`` currently resolves to on the live fla, or None."""
     module = sys.modules.get("fla.ops.gated_delta_rule")
@@ -829,6 +849,10 @@ def _repair_kernel_hub_closures(packages=_REPAIR_MODELING):
             original = getattr(wrapper, "__wrapped__", None)
             if original is None:
                 continue
+            # Re-decorate under the name the model asked for: qwen4_exp decorates its
+            # recurrent path as "fused_recurrent_gated_delta_rule", qwen3_5 as
+            # "recurrent_gated_delta_rule" (resolved through the alias above).
+            kernel = _decorated_kernel_name(wrapper, kernel)
             current = _resolved_implementation(wrapper)
             live = _live_gated_delta_kernel(kernel)
             if live is not None and current is live:
