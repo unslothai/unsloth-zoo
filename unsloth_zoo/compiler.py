@@ -4709,6 +4709,24 @@ def patch_gradient_accumulation(modeling_file, module):
 pass
 
 
+# transformers' AyaVisionForConditionalGeneration computes logits = lm_head(h) and drops the Cohere text
+# model's logit_scale (0.0625 on aya-vision-8b/32b), so its loss and logits are 16x too sharp
+# (aya-vision-32b wikitext PPL 2.4e8 raw vs 6.41 scaled). CohereForCausalLM applies it.
+_DROPPED_TEXT_LOGIT_SCALE = ("AyaVisionForConditionalGeneration",)
+
+
+def fixup_dropped_logit_scale(source, module = None):
+    if module not in _DROPPED_TEXT_LOGIT_SCALE or "logit_scale" in source:
+        return source
+    return re.sub(
+        r"^([ \t]+)(logits = self\.lm_head\(hidden_states[^\n]*\))[ \t]*$",
+        r"\1\2\n\1logits = logits * self.config.text_config.logit_scale",
+        source,
+        count = 1,
+        flags = re.MULTILINE,
+    )
+
+
 # Pre fix up some modules like Gemma3n
 def fixup_fused_lm_head(source):
     # Gemma 3N
@@ -6197,6 +6215,7 @@ def unsloth_compile_transformers(
                     continue
                 # Fix some arguments up like for Gemma 3N
                 new_source = fixup_fused_lm_head(source)
+                new_source = fixup_dropped_logit_scale(new_source, module)
                 # Apply fused LM transforms
                 new_source, supports_return_hidden_states = apply_fused_lm_head(
                     new_source, module
