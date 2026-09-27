@@ -251,3 +251,36 @@ def test_unified_vision_projection_preserves_values_above_fp16_range(monkeypatch
     ordinary = cls(vision_config, _config(module, "Gemma4Unified"))
     assert not ordinary._unsloth_vision_fp32
     assert not hasattr(ordinary.patch_dense, "_pre_set_compute_dtype")
+
+
+def test_unified_vision_block_survives_loader_fp16_cast(monkeypatch):
+    # Real forced-float32 cast pass: markers keep the image block fp32, the rest fp16.
+    module = pytest.importorskip("transformers.models.gemma4_unified.modeling_gemma4_unified")
+    from transformers.models.gemma4_unified.configuration_gemma4_unified import (
+        Gemma4UnifiedConfig,
+        Gemma4UnifiedVisionConfig,
+    )
+    from unsloth_zoo.patching_utils import patch_model_and_tokenizer
+    cls = module.Gemma4UnifiedVisionEmbedder
+    monkeypatch.setattr(cls, "__init__", cls.__init__)
+    monkeypatch.setattr(cls, "forward", cls.forward)
+    monkeypatch.setattr(cls, "_unsloth_vision_fp32_patched", False, raising=False)
+    monkeypatch.setenv("UNSLOTH_FORCE_FLOAT32", "1")
+    patches.patch_Gemma4UnifiedVisionEmbedder()
+    config = Gemma4UnifiedConfig(
+        text_config=_config(module, "Gemma4Unified"),
+        vision_config=Gemma4UnifiedVisionConfig(
+            patch_size=2, pooling_kernel_size=1, mm_embed_dim=16,
+            mm_posemb_size=8, output_proj_dims=16,
+        ),
+        image_token_id=28, video_token_id=29, audio_token_id=30,
+        boi_token_id=26, eoi_token_id=27,
+    )
+    model = module.Gemma4UnifiedForConditionalGeneration(config).to(torch.bfloat16)
+    patch_model_and_tokenizer(model, None, do_forced_float32=True)
+    dtypes = {name: p.dtype for name, p in model.named_parameters()}
+    for block in ("patch_ln1", "patch_dense", "patch_ln2", "pos_norm"):
+        for suffix in ("weight", "bias"):
+            assert dtypes[f"model.embed_vision.{block}.{suffix}"] == torch.float32, block
+    assert dtypes["model.embed_vision.multimodal_embedder.embedding_projection.weight"] == torch.float16
+    assert torch.bfloat16 not in dtypes.values()
