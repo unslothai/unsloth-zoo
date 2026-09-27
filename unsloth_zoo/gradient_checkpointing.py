@@ -149,8 +149,15 @@ def _retype_gpu_buffer(device_index, use_b, dtype, numel):
     global GPU_BUFFERS, GPU_BUFFERS_B
     buffers = GPU_BUFFERS_B if use_b else GPU_BUFFERS
     old = buffers[device_index]
-    with _no_inference_mode():
-        new = torch.empty(max(numel, old.numel()), dtype = dtype, device = old.device)
+    if old.element_size() == torch.empty(0, dtype = dtype).element_size():
+        new = old.view(dtype)   # fp16 <-> bf16: reinterpret the same storage, no second buffer
+    else:
+        # Free the old storage first so the peak is one buffer, not two.
+        size = max(numel, old.numel())
+        device = old.device
+        old.resize_(0)
+        with _no_inference_mode():
+            new = torch.empty(size, dtype = dtype, device = device)
     updated = list(buffers)
     updated[device_index] = new
     updated = type(buffers)(updated)
