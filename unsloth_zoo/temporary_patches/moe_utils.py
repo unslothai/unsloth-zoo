@@ -3300,8 +3300,7 @@ _LORA_INTERNAL_NAMES = frozenset((
 
 
 def _lora_wrapped_module_names(base_model, adapter_name):
-    """Module names (as PEFT matches them) that carry a module LoRA for `adapter_name`,
-    and whether the adapter also has a fused expert (parameter) LoRA."""
+    """(module names wrapped by `adapter_name`, whether it also has a fused expert parameter LoRA)."""
     wrapped, has_param_lora = [], False
     for name, module in base_model.named_modules():
         lora_A = getattr(module, "lora_A", None)
@@ -3316,8 +3315,7 @@ def _lora_wrapped_module_names(base_model, adapter_name):
 
 
 def _target_regex_for(names, all_names):
-    """A fullmatch regex that selects exactly `names` out of `all_names`: layer indices
-    collapsed to \\d+ when that selects nothing extra, the literal names otherwise."""
+    """Fullmatch regex selecting exactly `names`; layer indices collapse to \\d+ only if that adds nothing."""
     import re
     wanted = set(names)
     collapsed = sorted({re.sub(r"\\\.\d+(?=\\\.|$)", r"\\.\\d+", re.escape(n)) for n in wanted})
@@ -3328,18 +3326,10 @@ def _target_regex_for(names, all_names):
 
 
 def portable_lora_target_modules(peft_model, adapter_name, target_modules):
-    """What to write as `target_modules` so plain PEFT (a process that never imports
-    Unsloth) wraps the modules Unsloth trained, or None when the saved value already does.
+    """`target_modules` that plain PEFT loads as Unsloth trained, or None if already fine (list form only).
 
-    Two cases, both only for a list of names:
-    - Gemma 4 `Gemma4ClippableLinear`: Unsloth's `_create_and_replace` patch puts the LoRA
-      on the inner `.linear`, but plain PEFT matches the leaf name to the wrapper and raises
-      "Target module Gemma4ClippableLinear is not supported". Written as a regex over the
-      modules actually wrapped.
-    - Fused expert LoRA (`target_parameters`): leaf names such as gate_proj / up_proj that
-      wrapped nothing are read by PEFT's transformers v5 MoE conversion as a v4 adapter's
-      separate gate and up LoRA, which doubles the rank and alpha of gate_up_proj, so the
-      load fails on a size mismatch. Dropped, since they targeted nothing.
+    Gemma 4: LoRA sits on the inner `.linear`; plain PEFT would pick the unsupported wrapper, so write a regex.
+    Fused experts: unmatched gate_proj / up_proj make PEFT's v5 MoE conversion double gate_up_proj's rank; drop them.
     """
     if not isinstance(target_modules, (list, tuple, set)) or not target_modules:
         return None
@@ -3375,9 +3365,7 @@ def portable_lora_target_modules(peft_model, adapter_name, target_modules):
 
 
 def write_portable_target_modules(peft_model, save_directory, selected_adapters = None):
-    """Rewrite `target_modules` in the adapter_config.json PEFT just wrote when plain PEFT
-    would otherwise target different modules than Unsloth trained (see
-    `portable_lora_target_modules`). The weights file is untouched. Returns paths written."""
+    """Rewrite saved `target_modules` per `portable_lora_target_modules`; returns paths written."""
     written = []
     for adapter_name, path in _fused_expert_lora_adapter_config_paths(
         peft_model, save_directory, selected_adapters,
