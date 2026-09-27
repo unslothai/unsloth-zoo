@@ -72,8 +72,7 @@ def _check_torch_scaled_grouped_mm_supported():
     if major != 9:
         _TORCH_SCALED_GROUPED_MM_SUPPORTED = False
         return False
-    # The probe could never pass before the rhs layout fix, so this path has not
-    # been validated end to end on Hopper yet. Keep it opt-in until it has.
+    # Opt-in until validated end to end on Hopper (the probe never passed before the rhs layout fix).
     if os.environ.get("UNSLOTH_FP8_SCALED_GROUPED_MM", "0") != "1":
         _TORCH_SCALED_GROUPED_MM_SUPPORTED = False
         return False

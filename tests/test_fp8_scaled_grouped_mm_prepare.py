@@ -1,3 +1,19 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 """The SM90 `_scaled_grouped_mm` FP8 MoE path: rhs must be (E, K, N) column major, and
 `weight_scale_inv` is a dequant multiplier, not a divisor. Checked on meta + CPU (no Hopper needed)."""
 import pytest
@@ -7,7 +23,7 @@ import torch.nn.functional as F
 
 m = pytest.importorskip("unsloth_zoo.temporary_patches.moe_utils_fp8")
 FP8 = getattr(torch, "float8_e4m3fn", None)
-E, H, I = 2, 32, 48
+E, H, I = 2, 32, 48  # noqa: E741
 
 
 def _experts(kind):
@@ -50,9 +66,6 @@ def test_prepared_rhs_and_scale(kind, proj, proj_type, out_dim):
 
 
 def test_scaled_grouped_mm_path_is_opt_in(monkeypatch):
-    import torch
-    from unsloth_zoo.temporary_patches import moe_utils_fp8 as m
-
     monkeypatch.setattr(m, "_TORCH_SCALED_GROUPED_MM_SUPPORTED", None)
     monkeypatch.setattr(m, "_TORCH_SCALED_GROUPED_MM_AVAILABLE", True)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
