@@ -186,3 +186,27 @@ def test_save_pretrained_hook_writes_the_portable_targets(tmp_path, monkeypatch)
     model.save_pretrained(str(tmp_path))
     saved = json.loads((tmp_path / "adapter_config.json").read_text())["target_modules"]
     assert saved == ["q_proj"]
+
+
+def test_embedding_lora_target_is_kept():
+    class MoEWithEmbed(TinyMoE):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = nn.Embedding(10, 6)
+
+    targets = ["q_proj", "gate_proj", "up_proj", "embed_tokens"]
+    model = get_peft_model(MoEWithEmbed(), LoraConfig(
+        r = 2, lora_alpha = 4, target_modules = targets, target_parameters = ["experts.gate_up_proj"],
+    ))
+    assert MU.portable_lora_target_modules(model, "default", targets) == ["embed_tokens", "q_proj"]
+
+    class TowersWithEmbed(TwoTowers):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = nn.Embedding(10, 6)
+
+    model = get_peft_model(TowersWithEmbed(), LoraConfig(
+        r = 2, target_modules = r".*(?:text\.\d+\.q_proj|vision\.\d+\.q_proj\.linear|embed_tokens)",
+    ))
+    regex = MU.portable_lora_target_modules(model, "default", ["q_proj", "embed_tokens"])
+    assert re.fullmatch(regex, "embed_tokens")

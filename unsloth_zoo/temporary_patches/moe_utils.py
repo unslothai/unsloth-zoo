@@ -3303,8 +3303,11 @@ def _lora_wrapped_module_names(base_model, adapter_name):
     """(module names wrapped by `adapter_name`, whether it also has a fused expert parameter LoRA)."""
     wrapped, has_param_lora = [], False
     for name, module in base_model.named_modules():
-        lora_A = getattr(module, "lora_A", None)
-        if lora_A is None or not hasattr(lora_A, "keys") or adapter_name not in lora_A:
+        # nn.Embedding LoRA lives in lora_embedding_A, its lora_A stays empty.
+        if not any(
+            hasattr(d, "keys") and adapter_name in d
+            for d in (getattr(module, "lora_A", None), getattr(module, "lora_embedding_A", None))
+        ):
             continue
         if getattr(module, "parameter_name", None):
             has_param_lora = True
