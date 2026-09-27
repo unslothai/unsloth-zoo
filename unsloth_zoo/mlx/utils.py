@@ -14956,8 +14956,7 @@ def save_lora_adapters(model, path, adapter_config=None, adapter_format="mlx"):
             raise ValueError(
                 f"Unsloth MLX: {_m2s_emb} carry {_TIED_FULL_STATE_REASON}."
             )
-        # PEFT has no per-module dropout; a mixed-dropout model would
-        # silently train differently after export.
+        # PEFT has no per-module dropout.
         _dropouts = set()
         for _name, _module in model.named_modules():
             if _name in module_types:
@@ -15016,10 +15015,8 @@ def _model_ties_output_to_embedding(model, by_name=None):
         return True
     if by_name is None:
         by_name = dict(model.named_modules())
-    # No head module means output NECESSARILY routes through the embedding,
-    # outranking even a declared False (some declare False yet use as_linear).
-    # Bare "output" stays root-only so nested submodules cannot pose as the
-    # head.
+    # No head module => tied, even if declared False (some use as_linear).
+    # Bare "output" is root-only: nested attention projections share the name.
     return not any(
         name in ("lm_head", "output", "embed_out")
         or name.endswith(".lm_head")
@@ -19504,8 +19501,7 @@ def attach_and_bind_peft_adapter(model, adapter_dir, cfg):
     import mlx.nn as nn
     from mlx_lm.tuner.lora import LoRALinear
 
-    # Older mlx-lm wheels reject scale/dropout on from_base(); the native
-    # adapter path patches that gap and this path builds the same wrappers.
+    # Older mlx-lm from_base() rejects scale/dropout.
     from .loader import _patch_mlx_lora_from_base_compat
     _patch_mlx_lora_from_base_compat()
 
@@ -19549,8 +19545,7 @@ def attach_and_bind_peft_adapter(model, adapter_dir, cfg):
             unmatched.append(f"{path} (lora_A rank {rank} != lora_B rank {int(b.shape[1])})")
             continue
         module = by_name.get(path)
-        # Exact types only: nn.Linear subclasses accept these factor shapes,
-        # then misbehave inside a generic LoRALinear wrapper.
+        # Exact types only: Linear subclasses misbehave inside LoRALinear.
         if module is None or type(module) not in linear_types:
             found = type(module).__name__ if module is not None else "no module"
             unmatched.append(
@@ -19688,8 +19683,7 @@ def attach_and_bind_peft_adapter(model, adapter_dir, cfg):
             applied_full_state[path] = origin
         if origin == "modules_to_save" and path not in applied_full_state:
             applied_full_state[path] = origin
-    # peft replaces the ENTIRE module for modules_to_save, so a truncated
-    # snapshot would silently retain base state.
+    # peft replaces the ENTIRE module, so a truncated snapshot keeps base state.
     from mlx.utils import tree_flatten as _tree_flatten
     for _name in sorted(set(cfg.get("modules_to_save") or [])):
         for _parent_path, _parent in by_name.items():

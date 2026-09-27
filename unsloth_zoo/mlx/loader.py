@@ -6566,8 +6566,7 @@ def _mlx_push_to_hub_gguf(self, repo_id, tokenizer=None,
 
 
 def _mlx_save_lora_adapters(self, path, adapter_config=None, adapter_format="mlx"):
-    # Validate before routing: the trainable-tensor writer takes no
-    # adapter_format, so an unrecognized value would silently write MLX.
+    # Validate first: the trainable-tensor writer ignores adapter_format.
     if adapter_format not in ("mlx", "peft"):
         raise ValueError(
             f"Unsloth MLX: adapter_format={adapter_format!r}; expected "
@@ -8496,8 +8495,7 @@ class FastMLXModel:
             try:
                 with open(adapter_cfg_path, "r") as f:
                     adapter_cfg = json.load(f)
-                # The config is rewritten by the latest save, so a native MLX
-                # config (fine_tune_type) beside a stale PEFT file stays on the MLX path.
+                # The latest save wrote the config: native (fine_tune_type) wins over a stale PEFT file.
                 if "fine_tune_type" not in adapter_cfg and (os.path.exists(
                     os.path.join(local_path, "adapter_model.safetensors")
                 ) or os.path.exists(
@@ -8766,9 +8764,7 @@ class FastMLXModel:
                                 adapter_cfg,
                                 adapter_weights_file,
                             )
-                        # Catch a missing mlx_lm.tuner.dora before
-                        # load_adapters rebuilds plain LoRA and drops saved
-                        # `.m` via strict=False.
+                        # Without mlx_lm.tuner.dora, strict=False load would drop the saved `.m`.
                         if adapter_cfg.get("fine_tune_type") == "dora":
                             try:
                                 import mlx_lm.tuner.dora  # noqa: F401

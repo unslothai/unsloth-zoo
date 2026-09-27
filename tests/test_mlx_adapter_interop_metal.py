@@ -80,8 +80,7 @@ def _make_peft_adapter(base_dir, out, dtype=torch.float32,
             if "lora_B" in name or "lora_embedding_A" in name:
                 param.copy_(torch.randn_like(param) * 0.05)
             if "lora_" in name:
-                # peft autocasts adapter params to fp32; force the dtype so
-                # bf16 runs exercise real bf16 tensors.
+                # peft autocasts adapters to fp32; force dtype so bf16 runs test real bf16.
                 param.data = param.data.to(dtype)
     if mutate is not None:
         with torch.no_grad():
@@ -938,9 +937,7 @@ def test_import_refuses_non_causal_task(cfg_extra, refused):
 
 
 def test_import_accepts_a_live_peft_config():
-    # LoraConfig.to_dict() hands back peft's enum for peft_type, whose str() is
-    # "PeftType.LORA", so comparing it would refuse an ordinary causal adapter.
-    # The task_type enum spelling is covered by the case above.
+    # to_dict() returns peft's enum (str() "PeftType.LORA"); must still import.
     import peft
     from unsloth_zoo.mlx.peft_interop import normalize_peft_adapter_config
     cfg = peft.LoraConfig(
