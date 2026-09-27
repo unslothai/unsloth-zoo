@@ -14,19 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Tests patch_mamba_fused_split_without_causal_conv1d in temporary_patches/misc.py.
-
-transformers 5 resolves `mamba2_split_conv1d_scan_combined` to mamba_ssm's fused
-kernel whenever mamba_ssm imports; that kernel calls causal_conv1d's cpp function,
-which mamba_ssm binds to None when causal_conv1d is missing or blocked, so a
-train-mode forward without a cache raises TypeError. The patch must route to the
-split path (fused function returns None) only when causal_conv1d is unusable,
-whichever of the patch and the modeling import runs first.
-
-Each case runs in a subprocess with a stub `mamba_ssm` whose fused function
-fails exactly like the real one, a tiny Falcon-H1 on CPU, and the patch loaded
-from misc.py by AST.
-"""
+"""patch_mamba_fused_split_without_causal_conv1d: split path only when causal_conv1d is unusable, patch before or after
+the modeling import. Subprocess per case: stub mamba_ssm failing like the real one, tiny Falcon-H1 on CPU."""
 
 import json
 import os
