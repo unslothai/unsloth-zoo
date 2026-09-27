@@ -585,8 +585,7 @@ def patch_unsloth_gradient_checkpointing():
     _capture_pristine_checkpoint_once()
     torch.utils.checkpoint._old_checkpoint = torch.utils.checkpoint.checkpoint
     torch.utils.checkpoint.checkpoint = unsloth_offloaded_gradient_checkpoint
-    import transformers.modeling_utils
-    transformers.modeling_utils.checkpoint = unsloth_offloaded_gradient_checkpoint
+    _bind_transformers_checkpoint(unsloth_offloaded_gradient_checkpoint)
     os.environ["UNSLOTH_PATCHED"] = "1"
 pass
 
@@ -598,9 +597,19 @@ def patch_gradient_checkpointing():
     _capture_pristine_checkpoint_once()
     torch.utils.checkpoint._old_checkpoint = torch.utils.checkpoint.checkpoint
     torch.utils.checkpoint.checkpoint = unsloth_gradient_checkpoint
-    import transformers.modeling_utils
-    transformers.modeling_utils.checkpoint = unsloth_gradient_checkpoint
+    _bind_transformers_checkpoint(unsloth_gradient_checkpoint)
     os.environ["UNSLOTH_PATCHED"] = "1"
+pass
+
+
+def _bind_transformers_checkpoint(shim):
+    # Remember what transformers had, which need not be torch's function (a caller may have
+    # installed its own wrapper), so the unpatch can put exactly that back.
+    import transformers.modeling_utils
+    current = getattr(transformers.modeling_utils, "checkpoint", None)
+    if getattr(current, "__name__", "") not in _UNSLOTH_CKPT_SHIM_NAMES:
+        transformers.modeling_utils._unsloth_old_checkpoint = current
+    transformers.modeling_utils.checkpoint = shim
 pass
 
 
@@ -610,8 +619,11 @@ def _restore_transformers_checkpoint(shim):
     # gradient checkpointing later in the process still runs the shim, including the offloaded
     # one that allocates pinned host buffers.
     import transformers.modeling_utils
-    if getattr(transformers.modeling_utils, "checkpoint", None) is shim:
-        transformers.modeling_utils.checkpoint = torch.utils.checkpoint.checkpoint
+    if getattr(transformers.modeling_utils, "checkpoint", None) is not shim: return
+    previous = getattr(transformers.modeling_utils, "_unsloth_old_checkpoint", None)
+    transformers.modeling_utils.checkpoint = (
+        previous if previous is not None else torch.utils.checkpoint.checkpoint
+    )
 pass
 
 

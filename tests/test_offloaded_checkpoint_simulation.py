@@ -353,6 +353,7 @@ def restore_checkpoint_patches(monkeypatch):
     monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", torch.utils.checkpoint.checkpoint)
     monkeypatch.setattr(transformers.modeling_utils, "checkpoint", transformers.modeling_utils.checkpoint)
     monkeypatch.delattr(torch.utils.checkpoint, "_old_checkpoint", raising = False)
+    monkeypatch.delattr(transformers.modeling_utils, "_unsloth_old_checkpoint", raising = False)
     monkeypatch.delenv("UNSLOTH_PATCHED", raising = False)
 
 
@@ -377,6 +378,30 @@ def test_patch_then_unpatch_restores_torch_exactly(restore_checkpoint_patches, p
     assert torch.utils.checkpoint.checkpoint is original
     # gradient_checkpointing_enable() wraps this one, not torch's.
     assert transformers.modeling_utils.checkpoint is original_transformers
+
+
+@pytest.mark.parametrize(
+    "patch_name, unpatch_name",
+    [
+        ("patch_unsloth_gradient_checkpointing", "unpatch_unsloth_gradient_checkpointing"),
+        ("patch_gradient_checkpointing", "unpatch_gradient_checkpointing"),
+    ],
+)
+def test_unpatch_puts_back_a_wrapper_transformers_already_had(
+    restore_checkpoint_patches, monkeypatch, patch_name, unpatch_name
+):
+    """Not torch's function: the binding transformers held before the patch."""
+    import transformers.modeling_utils
+    from unsloth_zoo import gradient_checkpointing as module
+
+    def callers_wrapper(function, *args, **kwargs):
+        return torch.utils.checkpoint.checkpoint(function, *args, **kwargs)
+
+    monkeypatch.setattr(transformers.modeling_utils, "checkpoint", callers_wrapper)
+    getattr(module, patch_name)()
+    assert transformers.modeling_utils.checkpoint is not callers_wrapper
+    getattr(module, unpatch_name)()
+    assert transformers.modeling_utils.checkpoint is callers_wrapper
 
 
 def test_pristine_checkpoint_is_still_recoverable_after_patching(restore_checkpoint_patches):
