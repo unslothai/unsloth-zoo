@@ -170,6 +170,9 @@ def get_peft_regex(
         pass
 
     all_linear_modules = Counter(x.rsplit(".")[-1] for x in linear_modules)
+    _in_layer_stack = frozenset(
+        x.rsplit(".")[-1] for x in linear_modules if re.search(r"\.\d+\.", x)
+    )
 
     # Isolate lm_head / projection matrices (count == 1)
     if target_modules is None:
@@ -180,7 +183,10 @@ def get_peft_regex(
                 # Llama 4's and PhiMoE's routers return a tuple, so PEFT's LoRA
                 # forward reads `result.dtype` off one and the model cannot run.
                 continue
-            if count != 1:
+            if count != 1 or proj in _in_layer_stack:
+                # A leaf seen once is a head (lm_head, a projector) unless it sits inside a
+                # numbered layer stack: a config with one layer of a kind (tiny test models,
+                # a hybrid with a single attention block) still has real per-layer targets.
                 only_linear_modules.append(proj)
             else:
                 projection_modules[proj] = j
@@ -240,9 +246,15 @@ def get_peft_regex(
 
         # Also account for model.layers.0.self_attn/mlp type modules like Qwen
         if finetune_language_layers:
+            # Dense shared experts sit one level below the MoE block (NemotronH
+            # mixer.shared_experts.up_proj, Qwen2-MoE mlp.shared_expert.*); only emitted
+            # when the model has them, so every other regex stays byte-identical.
+            shared_child = ""
+            if any(re.search(r"\.shared_experts?\.[^.]+$", x) for x in linear_modules):
+                shared_child = r"(?:shared_experts?\.)?"
             regex_matcher = r"(?:" + regex_matcher + \
             r")|(?:\bmodel\.layers\.[\d]{1,}\.(?:" + regex_components + \
-            r")\.(?:" + match_linear_modules + r"))"
+            r")\." + shared_child + r"(?:" + match_linear_modules + r"))"
         pass
     pass
 
