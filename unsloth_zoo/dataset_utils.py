@@ -192,7 +192,42 @@ def _find_common_token_ids(component, tokenizer, force_match = False):
         return [], [], []
     optional_left  = original[:where]
     optional_right = original[where+len(substring):]
+    # A marker whose edge is plain text, not an added token (aya-vision renders <|START_RESPONSE|>
+    # as 7 BPE pieces), can merge with the neighbouring message: ">" + "\\sigma" -> ">\\". Keep the
+    # mergeable edge pieces optional so the core still matches.
+    start, end = _stable_marker_edges(component, original, tokenizer)
+    if where < end and where + len(substring) > start and (start > where or end < where + len(substring)):
+        new_start, new_end = max(where, start), min(where + len(substring), end)
+        if new_end > new_start:
+            substring      = original[new_start:new_end]
+            optional_left  = original[:new_start]
+            optional_right = original[new_end:]
     return substring, optional_left, optional_right
+pass
+
+
+_MARKER_EDGE_PROBES = ("\\", "{", "a", "A", "1", "(", ".", "<", "}", ">")
+
+
+def _stable_marker_edges(component, original, tokenizer):
+    """(start, end) of the part of `original` that keeps its ids whatever text touches it."""
+    n = len(original)
+    start, end = 0, n
+    if n == 0:
+        return start, end
+    try:
+        for c in _MARKER_EDGE_PROBES:
+            right = tokenizer(component + c, add_special_tokens = False).input_ids
+            k = 0
+            while k < min(n, len(right)) and right[k] == original[k]: k += 1
+            end = min(end, k)
+            left = tokenizer(c + component, add_special_tokens = False).input_ids
+            k = 0
+            while k < min(n, len(left)) and left[len(left) - 1 - k] == original[n - 1 - k]: k += 1
+            start = max(start, n - k)
+    except Exception:
+        return 0, n
+    return start, end
 pass
 
 
