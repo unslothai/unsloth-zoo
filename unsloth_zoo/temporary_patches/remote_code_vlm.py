@@ -35,6 +35,10 @@ passes through, and fix the loaded modules in place:
    dynamic-resolution processors return for a batch of images of different sizes. The forward
    is replaced by one that merges out of place (masked_scatter, the same values) and runs the
    vision tower per tile group. Language model call and loss are the original's.
+
+3. RADIO vision towers compute the `summary_idxs` buffer in __init__; checkpoints that do not
+   store it get zeros or uninitialized memory from the meta-device load (4-bit loads then hit a
+   device-side assert). It is recomputed from the config on the first forward.
 """
 
 import functools
@@ -49,6 +53,7 @@ from .common import TEMPORARY_PATCHES
 __all__ = [
     "repair_remote_hybrid_cache",
     "repair_internvl_style_forward",
+    "repair_radio_summary_idxs",
     "repair_remote_modules",
 ]
 
@@ -211,6 +216,58 @@ def repair_internvl_style_forward(cls):
     return True
 
 
+def _expected_summary_idxs(config):
+    args = getattr(config, "args", None)
+    teachers = args.get("teachers") if isinstance(args, dict) else getattr(args, "teachers", None)
+    if not isinstance(teachers, (list, tuple)):
+        return None
+    return [i for i, t in enumerate(teachers) if not isinstance(t, dict) or t.get("use_summary", True)]
+
+
+def _restore_summary_idxs(model):
+    base = getattr(model, "radio_model", None)
+    buffer = getattr(base, "summary_idxs", None)
+    if not isinstance(buffer, torch.Tensor) or buffer.device.type == "meta":
+        return
+    expected = _expected_summary_idxs(getattr(model, "config", None))
+    if expected is None or buffer.numel() != len(expected):
+        return
+    expected = torch.tensor(expected, dtype = buffer.dtype)
+    if not torch.equal(buffer.detach().cpu(), expected):
+        with torch.no_grad():
+            buffer.copy_(expected.to(buffer.device))
+
+
+def repair_radio_summary_idxs(cls):
+    """RADIO (C-RADIO vision towers) computes the `summary_idxs` buffer in __init__ and checkpoints
+    such as Nemotron-3-Nano-Omni do not store it. transformers 5 builds the model on the meta
+    device, so the missing buffer comes back as zeros or uninitialized memory; 4-bit loads then
+    index out of range (`all_summary[:, self.summary_idxs]`, a device-side assert). Recompute it
+    from the config on the first forward. True if the forward was wrapped."""
+    if getattr(cls, "__name__", "") != "RADIOModel":
+        return False
+    original = cls.__dict__.get("forward")
+    init = cls.__dict__.get("__init__")
+    if original is None or init is None or getattr(original, "_unsloth_summary_idxs", False):
+        return False
+    try:
+        if "summary_idxs" not in inspect.getsource(init):
+            return False
+    except (TypeError, OSError):
+        return False
+
+    @functools.wraps(original)
+    def forward(self, *args, **kwargs):
+        if not self.__dict__.get("_unsloth_summary_idxs_checked", False):
+            _restore_summary_idxs(self)
+            self.__dict__["_unsloth_summary_idxs_checked"] = True
+        return original(self, *args, **kwargs)
+
+    forward._unsloth_summary_idxs = True
+    cls.forward = forward
+    return True
+
+
 _REPAIRED_MODULES = set()
 
 
@@ -232,6 +289,8 @@ def repair_remote_modules():
                     repaired.append(f"{value.__name__}.get_query_offset")
                 if repair_internvl_style_forward(value):
                     repaired.append(f"{value.__name__}.forward")
+                if repair_radio_summary_idxs(value):
+                    repaired.append(f"{value.__name__}.summary_idxs")
             except Exception:
                 continue
     return repaired

@@ -146,6 +146,40 @@ _MODELING = textwrap.dedent('''
             return CausalLMOutputWithPast(loss = loss, logits = logits, past_key_values = outputs.past_key_values)
 
 
+    class TinyRadioConfig(PretrainedConfig):
+        model_type = "tiny_radio_zoo_test"
+
+        def __init__(self, args = None, **kwargs):
+            super().__init__(**kwargs)
+            self.args = args or {"teachers": [{"name": "a"}, {"name": "b"}, {"name": "c"}, {"name": "d", "use_summary": False}]}
+
+
+    class _RadioBase(nn.Module):
+        def __init__(self, summary_idxs):
+            super().__init__()
+            self.register_buffer("summary_idxs", summary_idxs)
+
+        def forward(self, x):
+            return x[:, self.summary_idxs]
+
+
+    class RADIOModel(PreTrainedModel):
+        """Like nvidia/C-RADIOv4-H hf_model.RADIOModel: summary_idxs is computed, not stored."""
+        config_class = TinyRadioConfig
+
+        def __init__(self, config):
+            super().__init__(config)
+            summary_idxs = torch.tensor(
+                [i for i, t in enumerate(config.args["teachers"]) if t.get("use_summary", True)],
+                dtype = torch.int64,
+            )
+            self.radio_model = _RadioBase(summary_idxs = summary_idxs)
+            self.post_init()
+
+        def forward(self, x):
+            return self.radio_model.forward(x)
+
+
     class PlainRemote(PreTrainedModel):
         """A remote class without the InternVL merge: must be left alone."""
         config_class = TinyOmniConfig
@@ -277,3 +311,15 @@ def test_other_remote_classes_untouched(remote):
     repair_remote_modules()
     assert repair_internvl_style_forward(remote.TinyOmni) is False
     assert remote.TinyOmni.forward is forward
+
+
+def test_radio_summary_idxs_restored(remote):
+    # transformers 5 meta-device loading returns a buffer missing from the checkpoint as zeros
+    # (16-bit) or uninitialized memory (4-bit, then a device-side assert when indexing).
+    model = remote.RADIOModel(remote.TinyRadioConfig())
+    with torch.no_grad():
+        model.radio_model.summary_idxs.zero_()
+    x = torch.arange(24.0).reshape(2, 4, 3)
+    out = model(x)
+    assert model.radio_model.summary_idxs.tolist() == [0, 1, 2]
+    torch.testing.assert_close(out, x[:, [0, 1, 2]])
