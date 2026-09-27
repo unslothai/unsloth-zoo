@@ -80,3 +80,39 @@ def test_fused_gate_up_unchanged():
                                    e, E, torch.float32)
         exp = W + alpha * (_peft_expert_lora_b(B, e, E)[I:] @ A[e * r:(e + 1) * r])
         torch.testing.assert_close(out.cpu(), exp, atol=1e-4, rtol=1e-4)
+
+
+def _merge_shard(tmp_path, parameter_name):
+    from collections import defaultdict
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+    from unsloth_zoo.saving_utils import _merge_and_overwrite_lora
+
+    torch.manual_seed(3)
+    E, r, I, H = 4, 2, 32, 16
+    pre = "backbone.layers.2.mixer.experts"
+    up = {e: torch.randn(I, H) for e in range(E)}
+    down = {e: torch.randn(H, I) for e in range(E)}
+    shard = tmp_path / "model.safetensors"
+    save_file({**{f"{pre}.{e}.up_proj.weight": up[e] for e in up},
+               **{f"{pre}.{e}.down_proj.weight": down[e] for e in down}},
+              str(shard), metadata={"format": "pt"})
+    A, B = torch.randn(E * r, H), torch.randn(I, E * r)
+    lora = defaultdict(lambda: LoraStats(None, None, None, 0))
+    # A lone expert wrapper is keyed on `experts` (no .base_layer) whichever parameter it wraps.
+    lora[pre] = LoraStats(None, A, B, 1.0, parameter_name=parameter_name)
+    _merge_and_overwrite_lora(
+        save_directory=str(tmp_path), filename="model.safetensors", lora_weights=lora,
+        output_dtype=torch.float32, model_class_name="NemotronHForCausalLM",
+    )
+    with safe_open(str(shard), framework="pt", device="cpu") as f:
+        for e in range(E):
+            exp_up = up[e] + _peft_expert_lora_b(B, e, E) @ A[e * r:(e + 1) * r]
+            yield f.get_tensor(f"{pre}.{e}.up_proj.weight"), exp_up, f.get_tensor(f"{pre}.{e}.down_proj.weight"), down[e]
+
+
+def test_up_only_expert_lora_lands_on_up_proj_not_down_proj(tmp_path):
+    _reset()
+    for got_up, exp_up, got_down, orig_down in _merge_shard(tmp_path, "up_proj"):
+        torch.testing.assert_close(got_up, exp_up, atol=1e-4, rtol=1e-4)
+        assert torch.equal(got_down, orig_down)
