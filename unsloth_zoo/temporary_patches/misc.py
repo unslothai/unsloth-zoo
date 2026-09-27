@@ -1314,15 +1314,7 @@ TEMPORARY_PATCHES.append(patch_mamba_ssm_pre_ampere_fallback)
 
 
 def _mamba_fused_split_needs_causal_conv1d_unusable():
-    """True when mamba_ssm is installed but its fused split path cannot run.
-
-    mamba_ssm's `mamba_split_conv1d_scan_combined` calls
-    `causal_conv1d.cpp_functions.causal_conv1d_fwd_function` unconditionally,
-    and binds it to None when causal_conv1d cannot be imported (missing, or
-    blocked by Unsloth because its binary is ABI-broken). The CUDA probe above
-    also nullifies `causal_conv1d.causal_conv1d_fn` when the kernels have no
-    image for this GPU; the cpp functions share that binary.
-    """
+    """True when mamba_ssm is installed but causal_conv1d, which its fused split path calls unconditionally, is not usable."""
     try:
         import importlib.util
         if importlib.util.find_spec("mamba_ssm") is None:
@@ -1342,19 +1334,9 @@ def _mamba_fused_split_needs_causal_conv1d_unusable():
 
 
 def patch_mamba_fused_split_without_causal_conv1d():
-    """Keep Mamba2-family training off mamba_ssm's fused split path when
-    causal_conv1d is unusable.
-
-    transformers 5 resolves `mamba2_split_conv1d_scan_combined` to mamba_ssm's
-    fused kernel whenever mamba_ssm imports, and calls it in train mode with no
-    cache (Falcon-H1, NemotronH, GraniteMoeHybrid, Bamba, Mamba2, Zamba2). That
-    kernel needs causal_conv1d, so without it the first training forward raises
-    `TypeError: 'NoneType' object is not callable` (ssd_combined.py). The
-    modeling code already treats a None result as "no fused kernel" and runs
-    the split path: torch conv1d plus mamba_ssm's Triton chunk scan, which
-    needs no causal_conv1d. Route to that path by resolving the fused function
-    to transformers' own reference, which returns None.
-    """
+    """transformers 5 binds mamba_ssm's fused split kernel whenever mamba_ssm imports; without causal_conv1d
+    it raises `'NoneType' object is not callable` on the first training step. Resolve it to transformers'
+    reference (None) so modeling code takes the split path (torch conv1d + mamba_ssm chunk scan)."""
     if not _mamba_fused_split_needs_causal_conv1d_unusable():
         return
     try:
@@ -1387,8 +1369,7 @@ def patch_mamba_fused_split_without_causal_conv1d():
             pass
     pass
 
-    # Modules imported before this patch already bound the fused kernel.
-    # `__dict__`, never getattr: transformers 5 alias modules import on access.
+    # Rebind already imported modules; `__dict__`, not getattr: transformers 5 alias modules import on access.
     for _module_name, _module in list(sys.modules.items()):
         if _module is None:
             continue
