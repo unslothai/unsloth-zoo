@@ -214,3 +214,28 @@ def test_embedding_lora_target_is_kept():
     ))
     regex = MU.portable_lora_target_modules(model, "default", ["q_proj", "embed_tokens"])
     assert re.fullmatch(regex, "embed_tokens")
+
+
+def test_rank_and_alpha_patterns_follow_the_redirect(tmp_path):
+    torch.manual_seed(0)
+    base = TwoTowers()
+    state = {k: v.clone() for k, v in base.state_dict().items()}
+    # Unsloth's redirect keys the vision wrapper as q_proj, so both towers get rank 3.
+    pattern = {"q_proj": 3, "q_proj.linear": 3}
+    model = get_peft_model(base, LoraConfig(
+        r = 2, lora_alpha = 4, rank_pattern = pattern, alpha_pattern = {k: 5 for k in pattern},
+        target_modules = r".*(?:text\.\d+\.q_proj|vision\.\d+\.q_proj\.linear)",
+    ))
+    _seed_lora_b(model)
+    model.save_pretrained(str(tmp_path))
+    path = tmp_path / "adapter_config.json"
+    config = json.loads(path.read_text())
+    config.update(target_modules = ["q_proj"], rank_pattern = {"q_proj": 3}, alpha_pattern = {"q_proj": 5})
+    path.write_text(json.dumps(config))
+    MU.write_portable_target_modules(model, str(tmp_path))
+
+    x = torch.randn(3, 6)
+    code, err, out = _reload_in_plain_peft(tmp_path, state, x)
+    assert code == 0, err[-2000:]
+    with torch.no_grad():
+        assert torch.allclose(model(x), out)

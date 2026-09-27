@@ -3367,6 +3367,22 @@ def portable_lora_target_modules(peft_model, adapter_name, target_modules):
     return None
 
 
+def _redirected_patterns(peft_model, adapter_name, patterns):
+    """Add a `(?:key)\\.linear` twin for each rank/alpha pattern key that matched a redirected
+    wrapper, since PEFT fullmatches `(.*\\.)?(key)$` against the inner `.linear` on reload."""
+    import re
+    if not isinstance(patterns, dict) or not patterns:
+        return patterns
+    wrapped, _ = _lora_wrapped_module_names(peft_model.get_base_model(), adapter_name)
+    inner = [n[: -len(".linear")] for n in wrapped if n.endswith(".linear")]
+    out = dict(patterns)
+    for key, value in patterns.items():
+        twin = f"(?:{key})\\.linear"
+        if twin not in out and any(re.match(rf"(.*\.)?({key})$", n) for n in inner):
+            out[twin] = value
+    return out
+
+
 def write_portable_target_modules(peft_model, save_directory, selected_adapters = None):
     """Rewrite saved `target_modules` per `portable_lora_target_modules`; returns paths written."""
     written = []
@@ -3383,6 +3399,9 @@ def write_portable_target_modules(peft_model, save_directory, selected_adapters 
         if replacement is None:
             continue
         config["target_modules"] = replacement
+        if isinstance(replacement, str):
+            for field in ("rank_pattern", "alpha_pattern"):
+                config[field] = _redirected_patterns(peft_model, adapter_name, config.get(field))
         _atomic_write_text(path, json.dumps(config, indent = 2, sort_keys = True))
         written.append(path)
     return written
