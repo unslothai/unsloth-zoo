@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Toy models for test_portable_adapter_target_modules.py. Imports nothing from Unsloth,
-so a subprocess can load an adapter with plain PEFT exactly as a user would."""
+"""Toy models for test_portable_adapter_target_modules.py; imports nothing from Unsloth."""
 
 import sys
 
