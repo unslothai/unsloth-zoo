@@ -1,7 +1,7 @@
 """Regression tests for the copy-elimination in _grouped_mm_with_backward_fix.
 
 The fix passes the frozen base stack to torch._grouped_mm as a transposed view instead of
-copying it (~805 MB / ~57% of MoE GPU time on Qwen3-30B) every step, gated on the transposed-view self-check (formerly cited as pytorch#186365, a usage error upstream)
+copying it (~805 MB / ~57% of MoE GPU time on Qwen3-30B) every step, gated on the transposed-view
 safety probe. These pin: the view is kept on a probe-safe stack (else a copy is forced), the
 probe gates that choice, the probe leaves global RNG untouched, and view == contiguous
 bit-exactly in forward and backward where torch._grouped_mm runs for real.

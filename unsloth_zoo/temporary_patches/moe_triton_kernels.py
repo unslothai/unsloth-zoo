@@ -336,10 +336,7 @@ def weighted_unpermute(permuted_output, sorted_indices, permuted_weights, num_to
         return None
     if permuted_output.dim() != 2 or sorted_indices.numel() != permuted_output.shape[0]:
         return None
-    # Bit-identity with the eager torch.sum is only established for even hidden sizes.
-    # hidden == 1 makes torch reduce top_k along the fastest dim (warp tree order), and on
-    # odd hidden sizes the compiled kernel stops following the 4-accumulator order for
-    # top_k 5/6. No supported MoE has an odd hidden size, so keep those on the eager path.
+    # Odd hidden sizes are not bit-identical to eager (H == 1 reduces in warp-tree order; odd H with top_k 5/6); no MoE uses one.
     if permuted_output.shape[1] % 2 == 1:
         return None
     try:
