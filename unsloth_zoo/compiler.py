@@ -192,6 +192,13 @@ DISABLE_COMPILE_FUNCTIONS = [
 ]
 
 
+# Per model_type DISABLE_COMPILE_FUNCTIONS. deepseek_v4 rope: dynamic = True Inductor backward of its
+# trailing `x[..., -rope_dim:]` slice reads out of bounds, giving wrong / NaN grads (pytorch#198553).
+DISABLE_COMPILE_MODEL_FUNCTIONS = {
+    "deepseek_v4": ["apply_rotary_pos_emb"],
+}
+
+
 def calls_disable_compile_function(source, disable_compile_functions):
     """Names from `DISABLE_COMPILE_FUNCTIONS` that `source` CALLS: a superset of the
     `called_functions` test above, which also wants `def <name>` locally and so misses
@@ -5379,6 +5386,7 @@ def unsloth_compile_transformers(
     # Later `eval(model_location)` calls need `transformers` bound in globals
     exec("import transformers", globals())
     disable_compile_functions = set(DISABLE_COMPILE_FUNCTIONS)
+    disable_compile_functions.update(DISABLE_COMPILE_MODEL_FUNCTIONS.get(model_type, ()))
 
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__"):
         # Get __UNSLOTH_SUPPORTS_SDPA__
