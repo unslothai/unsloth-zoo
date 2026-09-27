@@ -57,7 +57,13 @@ def _ct_decompress(packed, scale):
         format = "mxfp4-pack-quantized",
     )
     comp = BaseCompressor.get_value_from_registry("mxfp4-pack-quantized")
-    return comp.decompress({"weight_packed": packed, "weight_scale": scale}, scheme)["weight"].float()
+    try:
+        return comp.decompress({"weight_packed": packed, "weight_scale": scale}, scheme)["weight"].float()
+    except NotImplementedError:
+        # compressed-tensors < 0.16 (the newest on torch 2.6) has the format but no MXFP4 decompress.
+        return mxfp4_dequantize_torch(
+            packed.reshape(packed.shape[0], -1, 16), scale, dtype = torch.float32,
+        )
 
 
 def _experts(fused = True, seed = 0, finalize = True):
