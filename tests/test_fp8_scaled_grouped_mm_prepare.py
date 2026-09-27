@@ -96,3 +96,13 @@ def test_scaled_grouped_mm_path_skipped_when_grad_enabled(monkeypatch):
     top_k_index = torch.tensor([[0], [1], [0], [1]])
     top_k_weights = torch.ones(4, 1)
     assert m._forward_scaled_grouped_mm_fp8(ex, hidden, top_k_index, top_k_weights) is None
+
+
+def test_scaled_grouped_mm_path_skipped_in_training_mode_under_no_grad(monkeypatch):
+    # Reentrant checkpointing runs the training forward under no_grad, then recomputes with grad.
+    monkeypatch.setattr(m, "_TORCH_SCALED_GROUPED_MM_SUPPORTED", True)
+    ex = _experts("scale_inv")
+    ex.train()
+    with torch.no_grad():
+        out = m._forward_scaled_grouped_mm_fp8(ex, torch.randn(4, H), torch.tensor([[0], [1], [0], [1]]), torch.ones(4, 1))
+    assert out is None
