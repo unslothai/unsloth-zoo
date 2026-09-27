@@ -504,14 +504,24 @@ _OLMO_SUBPROCESS = textwrap.dedent(
     import sys
     assert getattr(sys.modules["fla"], "_UNSLOTH_VENDORED_FLA", False) is True
 
+    from transformers.integrations import hub_kernels
+    from unsloth_zoo.temporary_patches.fla_vendor import _resolved_implementation
+    vendored_chunk = sys.modules["fla.ops.gated_delta_rule"].chunk_gated_delta_rule
+    # transformers#47630 (5.15+) drops the module globals for kernel-hub wrappers.
+    kernel_hub = hasattr(hub_kernels, "use_kernel_func_from_hub_with_fallback")
+
     # Covered model binds the vendored kernels.
     import transformers.models.qwen3_5.modeling_qwen3_5 as q
-    assert q.chunk_gated_delta_rule is not None
+    if kernel_hub:
+        assert _resolved_implementation(q.torch_chunk_gated_delta_rule) is vendored_chunk
+    else:
+        assert q.chunk_gated_delta_rule is vendored_chunk
 
-    # Uncovered model must import cleanly on its pure-torch fallback.
+    # Uncovered model must import cleanly without the unvendored ShortConvolution.
     import transformers.models.olmo_hybrid.modeling_olmo_hybrid as m
-    assert m.ShortConvolution is None
-    assert m.chunk_gated_delta_rule is None
+    assert getattr(m, "ShortConvolution", None) is None
+    if not kernel_hub:
+        assert m.chunk_gated_delta_rule is None
     print("OLMO_FALLBACK_OK")
     """
 )
