@@ -15,6 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import inspect
+import os
 from typing import Optional
 
 import types
@@ -69,6 +70,11 @@ def _check_torch_scaled_grouped_mm_supported():
     # FP8 scaled_grouped_mm path to Hopper (SM 9.x) only for now.
     major, _minor = torch.cuda.get_device_capability(torch.cuda.current_device())
     if major != 9:
+        _TORCH_SCALED_GROUPED_MM_SUPPORTED = False
+        return False
+    # The probe could never pass before the rhs layout fix, so this path has not
+    # been validated end to end on Hopper yet. Keep it opt-in until it has.
+    if os.environ.get("UNSLOTH_FP8_SCALED_GROUPED_MM", "0") != "1":
         _TORCH_SCALED_GROUPED_MM_SUPPORTED = False
         return False
 

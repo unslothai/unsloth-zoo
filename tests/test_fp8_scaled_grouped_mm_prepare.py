@@ -47,3 +47,16 @@ def test_prepared_rhs_and_scale(kind, proj, proj_type, out_dim):
         got = x @ (rhs[e].float() * scale[e][None, :])
         ref = F.linear(x, q[e].float() * s[e][:, None])
         torch.testing.assert_close(got, ref)
+
+
+def test_scaled_grouped_mm_path_is_opt_in(monkeypatch):
+    import torch
+    from unsloth_zoo.temporary_patches import moe_utils_fp8 as m
+
+    monkeypatch.setattr(m, "_TORCH_SCALED_GROUPED_MM_SUPPORTED", None)
+    monkeypatch.setattr(m, "_TORCH_SCALED_GROUPED_MM_AVAILABLE", True)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (9, 0))
+    monkeypatch.delenv("UNSLOTH_FP8_SCALED_GROUPED_MM", raising=False)
+    assert m._check_torch_scaled_grouped_mm_supported() is False
