@@ -20,6 +20,9 @@ WORKER = Path(__file__).with_name("_fp16_path_tiny_worker.py")
 @pytest.fixture(scope = "module")
 def results():
     env = dict(os.environ, CUDA_VISIBLE_DEVICES = "")
+    # A flag leaked by another test would turn these forwards into hidden states / raw logits.
+    for flag in ("UNSLOTH_RETURN_HIDDEN_STATES", "UNSLOTH_RETURN_LOGITS"):
+        env.pop(flag, None)
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(WORKER.parent.parent), env.get("PYTHONPATH")]))
     proc = subprocess.run([sys.executable, str(WORKER), *ARCHS], capture_output = True, text = True,
                           env = env, timeout = 600)
