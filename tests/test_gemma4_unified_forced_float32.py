@@ -290,6 +290,7 @@ def test_every_forced_gemma4_family_arch_is_covered(monkeypatch):
     # The loader forces float32 by substring (`"gemma4" in "gemma4_unified,"`), so any
     # new gemma4* model type gets the fp16 load without these patches unless listed.
     import importlib
+    import importlib.util
     import pkgutil
     import transformers.models
     from unsloth_zoo.model_lists import FORCE_FLOAT32
@@ -301,10 +302,10 @@ def test_every_forced_gemma4_family_arch_is_covered(monkeypatch):
         mt = info.name
         if not mt.startswith("gemma4") or not any(e in mt + "," for e in FORCE_FLOAT32):
             continue
-        try:
-            module = importlib.import_module(f"transformers.models.{mt}.modeling_{mt}")
-        except ImportError:
+        name = f"transformers.models.{mt}.modeling_{mt}"
+        if importlib.util.find_spec(name) is None:
             continue
+        module = importlib.import_module(name)  # an installed module that fails to import is drift
         for name, cls in vars(module).items():
             if isinstance(cls, type) and cls.__module__ == module.__name__ and name.endswith(suffixes):
                 monkeypatch.setattr(cls, "forward", cls.forward)
