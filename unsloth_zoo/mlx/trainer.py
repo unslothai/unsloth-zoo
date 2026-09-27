@@ -570,6 +570,7 @@ from .utils import (
     _MLXIterableTokenizedDatasetView,
     create_vlm_batches,
     _create_vlm_batch_plan,
+    _vlm_batch_family,
     _vlm_family_is_plannable,
     FiniteVLMBatchPlan,
     _compact_vlm_cce_batch,
@@ -639,9 +640,16 @@ from .shape_guard import (
     AUTOMATIC_TEXT_COMPILE_CEILING,
     DDP_LOCAL_GRAD_SCOPE,
     FULL_STEP_SCOPE,
+    STREAM_GRID_FLOOR_WIDTH,
+    STREAM_GRID_RATIO,
+    StreamShapeGrid,
+    StreamShapeGuardReport,
     TextShapeEvent,
     TextShapeGuardReport,
     build_text_shape_frontier,
+    describe_stream_shape_grid,
+    stream_exact_ceiling,
+    stream_phase_count,
     materialize_text_shape_frontier,
     phase_for_microstep,
     plan_text_shape_buckets,
@@ -1609,6 +1617,123 @@ def _effective_compile_mode(compile_policy, compile_decision):
     """
     mode = getattr(compile_decision, "policy_mode", None)
     return mode if mode else compile_policy.mode
+
+
+class _StreamWidthPolicy:
+    """Grid width policy consulted per batch; returns None while disarmed or holding.
+
+    Created disarmed (staging is wired before the compile decision) and armed
+    in place later, so a running prefetch thread sees it. Prefetch finalizers
+    select on the policy's presence, not ``armed``: their body runs before arming.
+    """
+
+    __slots__ = ("grid", "armed", "exact_ceiling", "observed", "gate_released")
+
+    def __init__(self, grid):
+        self.grid = grid
+        self.armed = False
+        self.exact_ceiling = None
+        self.observed = None
+        self.gate_released = False
+
+    def arm(self, registry, phases_per_endpoint=1, in_flight=0):
+        self.observed = registry.observed
+        self.exact_ceiling = stream_exact_ceiling(
+            self.grid, registry.cap, phases_per_endpoint, in_flight,
+        )
+        self.armed = True
+
+    @property
+    def holding(self):
+        """True while the exact allowance still applies."""
+        return (
+            self.armed
+            and self.exact_ceiling is not None
+            and self.observed is not None
+            and len(self.observed) <= self.exact_ceiling
+        )
+
+    def __call__(self, width):
+        if not self.armed or self.holding:
+            return None
+        self.gate_released = True
+        return self.grid.endpoint_for(width)
+
+
+def _stream_execution_key():
+    """Default device/stream pair the next compiled call keys on."""
+    try:
+        device = mx.default_device()
+        return (str(device), str(mx.default_stream(device)))
+    except (AttributeError, NotImplementedError):
+        return ("default", "default")
+
+
+def _stream_batch_signature(batch_data, phase, execution_key):
+    """Conservative (finer than true) compile key for a streamed batch."""
+    if isinstance(batch_data, dict):
+        # Uncertifiable families may span several cache keys; never count them as one.
+        family = _vlm_batch_family(batch_data)
+        if not _vlm_family_is_plannable(family):
+            return None, family
+        return (phase, family, execution_key)
+    leaves = []
+    values = batch_data if isinstance(batch_data, (tuple, list)) else (batch_data,)
+    for value in values:
+        shape = getattr(value, "shape", None)
+        if shape is None:
+            leaves.append(repr(type(value)))
+        else:
+            leaves.append((tuple(int(extent) for extent in shape), str(value.dtype)))
+    return (phase, tuple(leaves), execution_key)
+
+
+class _StreamSignatureRegistry:
+    """Compiled signatures one streaming run has paid for; the cap binds on these."""
+
+    __slots__ = (
+        "cap", "observed", "tripped", "trip_reason", "uncertified",
+        "uncertified_family",
+    )
+
+    def __init__(self, cap):
+        self.cap = int(cap)
+        self.observed = set()
+        self.tripped = False
+        self.trip_reason = ""
+        self.uncertified = 0
+        self.uncertified_family = ""
+
+    def would_trip(self, key):
+        return key not in self.observed and len(self.observed) >= self.cap
+
+    def record(self, key):
+        self.observed.add(key)
+
+    def trip(self, reason):
+        self.tripped = True
+        self.trip_reason = reason
+
+
+def _stream_guard_report(policy, registry, compile_scope):
+    """Final streaming-guard telemetry, built once the counts are settled."""
+    grid = policy.grid
+    return StreamShapeGuardReport(
+        # Keyed on the policy's release, not per-batch widths.
+        action="stream_grid" if policy.gate_released else "stream_exact",
+        reason="streaming",
+        cap=registry.cap,
+        compile_scope=compile_scope,
+        grid_ratio=str(STREAM_GRID_RATIO),
+        grid_floor=STREAM_GRID_FLOOR_WIDTH,
+        grid_anchor=grid.anchor,
+        grid_endpoints=grid.endpoint_count,
+        observed_signatures=len(registry.observed),
+        tripped=registry.tripped,
+        trip_reason=registry.trip_reason,
+        exact_ceiling=policy.exact_ceiling,
+        gate_released=policy.gate_released,
+    )
 
 
 def _plan_single_process_vlm_shapes(
@@ -2748,6 +2873,49 @@ class MLXTrainer:
             context,
             exc,
         )
+
+    def _admit_stream_batch(self, registry, batch_data, compile_scope,
+                            grad_accum, microstep, world_size):
+        """True = go eager for the run, ``"eager_batch"`` = this batch only.
+
+        One all-max per fetch (2 failed > 1 trip > 0), even for ``batch_data=None``,
+        so every rank switches together: a lone eager rank cannot replay a step's RNG.
+        """
+        key = None
+        uncertifiable = False
+        error = None
+        try:
+            if batch_data is not None:
+                key = _stream_batch_signature(
+                    batch_data,
+                    phase_for_microstep(compile_scope, grad_accum, microstep),
+                    _stream_execution_key(),
+                )
+                if isinstance(key, tuple) and key and key[0] is None:
+                    registry.uncertified_family = repr(key[1])
+                    key = None
+                uncertifiable = key is None
+        except BaseException as exc:
+            error = exc
+        signal = 2 if error is not None else (
+            1 if key is not None and registry.would_trip(key) else 0
+        )
+        if world_size > 1:
+            signal = self._distributed_max_int(signal)
+            if signal >= 2:
+                self._raise_distributed_failure_from_any(
+                    True, "admitting a streaming batch shape", error,
+                )
+        elif error is not None:
+            raise error
+        if signal == 1:
+            return True
+        if key is not None:
+            registry.record(key)
+        elif uncertifiable:
+            registry.uncertified += 1
+            return "eager_batch"
+        return False
 
     def _distributed_sum_gradient_tree(self, grad):
         """All-sum a gradient tree while preserving MLX's grouped all-reduce."""
@@ -5977,6 +6145,41 @@ class MLXTrainer:
             f"shape_guard:{_compile_shape_guard_report.reason}"
             if _shape_guard_eager else None
         )
+        _stream_policy = getattr(self, "_mlx_stream_width_policy", None)
+        _stream_registry = None
+        _stream_scope = "none"
+        _stream_capture_stable = True
+        if (
+            _stream_policy is not None
+            and batch_iter is not None
+            and _use_compile
+            and not _ddp_compile_local_grad
+        ):
+            # Lazy optimizer state would give one signature two cache entries;
+            # init now (keeps resumed state) and refresh the captured, maybe replaced, entry.
+            try:
+                optimizer.init(model.trainable_parameters())
+                state[1] = optimizer.state
+            except Exception as _init_error:
+                state[1] = optimizer.state
+                # Unbounded state reshapes make the cache unboundable: go eager.
+                _stream_capture_stable = False
+                if _effective_compile_mode(
+                    compile_policy, _compile_decision,
+                ) == "strict":
+                    raise RuntimeError(
+                        "Unsloth: strict mx.compile cannot bound compiled "
+                        "shapes for a streaming source with this optimizer, "
+                        "because its captured state cannot be initialized "
+                        f"before the first compiled step ({_init_error})."
+                    ) from _init_error
+                _main_print(
+                    "Unsloth: compiling disabled for this streaming run — "
+                    "this optimizer's captured state cannot be initialized "
+                    "up front, so compiled shapes could not be bounded."
+                )
+                _use_compile = False
+                _compile_fallback_reason = "stream_capture_unstable"
         _compile_state = state
         class _DDPCompiledLocalGradError(RuntimeError):
             """Marks failures from the compiled DDP local-gradient graph."""
@@ -7269,6 +7472,8 @@ class MLXTrainer:
                 _compile_scope = "fallback_eager"
                 _compile_fallback_reason = "runtime_error"
                 _ddp_compile_local_grad = False
+                if _stream_policy is not None:
+                    _stream_policy.armed = False
                 if isinstance(batches, _EAGER_REFETCHABLE_PLAN_TYPES):
                     batch_data = batches[scheduled_index]
                 state = [
@@ -7400,6 +7605,30 @@ class MLXTrainer:
             _run_callback_epoch_begin(
                 float(microstep // epoch_event_microbatches)
             )
+        if (
+            _stream_policy is not None
+            and batch_iter is not None
+            and _use_compile
+            and _stream_capture_stable
+            and _compile_scope in (FULL_STEP_SCOPE, DDP_LOCAL_GRAD_SCOPE)
+        ):
+            # Armed only after compile setup can no longer fall back to eager.
+            _stream_registry = _StreamSignatureRegistry(
+                resolve_compile_max_variants(args.compile_max_variants),
+            )
+            _stream_policy.arm(
+                _stream_registry,
+                stream_phase_count(_compile_scope, grad_accum),
+                # Effective prefetch depth, not configured.
+                getattr(args, "streaming_prefetch_batches", 0)
+                if (getattr(self, "_mlx_prefetch_control", None)
+                    and self._mlx_prefetch_control.get("eligible")) else 0,
+            )
+            _stream_scope = _compile_scope
+            _main_print(describe_stream_shape_grid(
+                _stream_policy.grid, _stream_registry.cap,
+                _stream_policy.exact_ceiling,
+            ))
         while self._global_step < total_steps:
             it = microstep + 1
             if self._distributed_should_stop() or self._early_stopped:
@@ -7425,6 +7654,7 @@ class MLXTrainer:
 
             batch_error = None
             batch_data = None
+            _stream_eager_batch = False
             try:
                 if batch_iter is not None:
                     batch_data = next(batch_iter)
@@ -7520,6 +7750,74 @@ class MLXTrainer:
                 _use_compile = False
                 _compile_scope = "fallback_eager"
                 _compile_fallback_reason = "audio_inputs"
+                if _stream_policy is not None:
+                    _stream_policy.armed = False
+            if _stream_registry is not None:
+                _stream_trip = self._admit_stream_batch(
+                    _stream_registry,
+                    batch_data if _use_compile and _compile_scope in (
+                        FULL_STEP_SCOPE, DDP_LOCAL_GRAD_SCOPE,
+                    ) else None,
+                    _compile_scope,
+                    grad_accum,
+                    it - 1,
+                    distributed_world_size,
+                )
+                if _stream_trip == "eager_batch":
+                    if _effective_compile_mode(
+                        compile_policy, _compile_decision,
+                    ) == "strict":
+                        raise RuntimeError(
+                            "Unsloth: strict mx.compile cannot certify a "
+                            "streamed batch's compile-key family, so its "
+                            "compiled shapes could not be bounded: "
+                            f"{_stream_registry.uncertified_family}"
+                        )
+                    _stream_eager_batch = True
+                    _stream_trip = False
+                else:
+                    _stream_eager_batch = False
+                if _stream_trip:
+                    if _effective_compile_mode(
+                        compile_policy, _compile_decision,
+                    ) == "strict":
+                        raise RuntimeError(
+                            "Unsloth: strict mx.compile exceeded the "
+                            f"{_stream_registry.cap}-signature cap on a "
+                            "streaming source "
+                            f"({len(_stream_registry.observed)} compiled). "
+                            "Raise compile_max_variants or use a source with "
+                            "fewer distinct batch shapes."
+                        )
+                    _main_print(
+                        "Unsloth: streaming compile shapes reached the "
+                        f"{_stream_registry.cap}-signature cap "
+                        f"({len(_stream_registry.observed)} compiled); "
+                        "continuing eagerly. Raise or lower "
+                        "compile_max_variants to change this bound."
+                    )
+                    _stream_registry.trip("signature_cap")
+                    # Reuse the batch in hand: re-fetching would consume the source.
+                    if _ddp_compile_local_grad:
+                        step_fn = _ddp_eager_local_step_fn
+                        _ddp_compile_local_grad = False
+                    else:
+                        step_fn = _uncompiled_step_fn
+                    _use_compile = False
+                    _compile_scope = "fallback_eager"
+                    _compile_fallback_reason = "stream_signature_cap"
+                    _stream_policy.armed = False
+                    state = [
+                        model.state, optimizer.state, mx.random.state,
+                        *_reference_compile_state,
+                    ]
+
+            _step_fn_for_batch = step_fn
+            if _stream_eager_batch:
+                _step_fn_for_batch = (
+                    _ddp_eager_local_step_fn if _ddp_compile_local_grad
+                    else _uncompiled_step_fn
+                )
 
             do_update = (accum_progress + 1 >= grad_accum)
             # HF forces a sync step on an epoch's last micro-batch, so the epoch is
@@ -7563,12 +7861,14 @@ class MLXTrainer:
                 if _use_compile and not _ddp_compile_local_grad:
                     rng_state_before = _mlx_rng_key()
                 try:
-                    lvalue, toks, stats, grad_accum_state, grad_norm = step_fn(
+                    lvalue, toks, stats, grad_accum_state, grad_norm = _step_fn_for_batch(
                         batch_data, grad_accum_state, do_update,
                     )
                 except (ValueError, RuntimeError, TypeError) as e:
                     _is_compile_failure = (
                         _use_compile
+                        # Bypassed the compiled callable: not a compile failure.
+                        and not _stream_eager_batch
                         and not _ddp_compile_local_grad
                         and _is_compile_exception(e)
                     )
@@ -7583,6 +7883,8 @@ class MLXTrainer:
                         _use_compile = False
                         _compile_scope = "fallback_eager"
                         _compile_fallback_reason = "runtime_error"
+                        if _stream_policy is not None:
+                            _stream_policy.armed = False
                         if isinstance(batches, _EAGER_REFETCHABLE_PLAN_TYPES):
                             batch_data = batches[scheduled_index]
                         _restore_mlx_rng_key(rng_state_before)
@@ -8102,7 +8404,13 @@ class MLXTrainer:
                 _compile_decision.policy_mode if _compile_decision is not None else compile_policy.mode
             ),
             "compile_scope": _compile_scope,
-            "compile_shape_guard": _compile_shape_guard_report.to_dict(),
+            "compile_shape_guard": (
+                _stream_guard_report(
+                    _stream_policy, _stream_registry, _stream_scope,
+                ).to_dict()
+                if _stream_registry is not None
+                else _compile_shape_guard_report.to_dict()
+            ),
             "patch_mode": getattr(self.args, "patch_mode", "patched"),
             "compile_trace": (
                 asdict(self._compile_trace)
@@ -8477,6 +8785,10 @@ class MLXTrainer:
                     int(getattr(self, "_mlx_resume_step_for_prefetch", 0))
                     * args.gradient_accumulation_steps
                 )
+                # Anchor-free: expansion can exceed max_seq_length.
+                self._mlx_stream_width_policy = (
+                    _StreamWidthPolicy(StreamShapeGrid()) if vlm_lazy else None
+                )
                 return None, iterate_vlm_training_batches(
                     dataset=train_dataset,
                     processor=processor,
@@ -8498,6 +8810,7 @@ class MLXTrainer:
                         if vlm_prefetch_depth and vlm_lazy else 0
                     ),
                     prefetch_control=self._mlx_prefetch_control,
+                    width_policy=self._mlx_stream_width_policy,
                 )
             else:
                 self._prepared_batches_include_epochs = vlm_num_epochs is not None
@@ -8620,6 +8933,16 @@ class MLXTrainer:
                     int(getattr(self, "_mlx_resume_step_for_prefetch", 0))
                     * args.gradient_accumulation_steps
                 )
+                self._mlx_stream_width_policy = (
+                    _StreamWidthPolicy(
+                        StreamShapeGrid(anchor=int(args.max_seq_length)),
+                    )
+                    if (
+                        _is_mlx_lazy_text_source(train_dataset)
+                        and int(args.max_seq_length) >= STREAM_GRID_FLOOR_WIDTH
+                    )
+                    else None
+                )
                 return None, iterate_training_batches(
                     dataset=train_dataset,
                     tokenizer=self.tokenizer,
@@ -8644,6 +8967,7 @@ class MLXTrainer:
                             args, "streaming_text_length_window_batches", 8,
                         )
                     ),
+                    width_policy=self._mlx_stream_width_policy,
                     prefetch_batches=prefetch_depth,
                     prefetch_skip_batches=resume_skip if prefetch_depth else 0,
                     prefetch_control=self._mlx_prefetch_control,
