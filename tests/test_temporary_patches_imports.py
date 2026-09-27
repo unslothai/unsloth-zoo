@@ -66,6 +66,7 @@ TEMPORARY_PATCHES_SUBMODULES = [
     "unsloth_zoo.temporary_patches.ernie4_5_moe",
     "unsloth_zoo.temporary_patches.fla_vendor",
     "unsloth_zoo.temporary_patches.flex_attention_bwd",
+    "unsloth_zoo.temporary_patches.remote_code_vlm",
     "unsloth_zoo.temporary_patches.gemma",
     "unsloth_zoo.temporary_patches.gemma3n",
     "unsloth_zoo.temporary_patches.gemma4",
