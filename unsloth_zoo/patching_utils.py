@@ -476,7 +476,6 @@ def _bounded_cast_module(module, dtype):
             and param.numel() * param.element_size() >= _FORCED_FLOAT32_STAGE_BYTES
         ):
             _cast_large_param(param, dtype)
-    # Anything left under the threshold, plus buffers.
     module.to(dtype)
 
 
