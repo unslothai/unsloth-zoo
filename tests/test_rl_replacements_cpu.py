@@ -77,8 +77,6 @@ def _verl_low_var_kl(new, ref):
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_grpo_kl_is_clamped_like_verl_low_var_kl(dtype):
-    # Past |ref - new| of about 11 (below) or 2.6 (above) the raw k3 exceeds 10 and exp overflows
-    # past 88 in fp32; verl and SkyRL clamp the log-ratio to [-20, 20] and k3 to [-10, 10].
     d = torch.tensor([[0.0, 1.0, -1.0, 5.0, -5.0, 10.0, -10.0, 11.0, -11.0, 20.0, -20.0, 88.0, -88.0, 200.0, -200.0]],
                      dtype=dtype)
     new = torch.zeros_like(d, requires_grad=True)
@@ -98,15 +96,12 @@ def test_grpo_kl_is_clamped_like_verl_low_var_kl(dtype):
     torch.testing.assert_close(loss, expected.mean().detach())
     torch.testing.assert_close(mean_kl, expected.mean().detach())
     torch.testing.assert_close(new.grad, new_ref.grad)
-    # Outside the band the clamp stops the gradient, as in verl.
     saturated = expected.detach() >= 10.0
     assert saturated.any() and (new.grad[saturated] == 0).all()
 
 
 @pytest.mark.parametrize("use_bias_correction_kl", [False, True])
 def test_grpo_kl_clamp_precedes_bias_correction_and_beta(use_bias_correction_kl):
-    # The clamp bounds the per-token estimator; the IS ratio (use_bias_correction_kl) and beta
-    # scale the clamped value afterwards, as verl/SkyRL apply kl_loss_coef after kl_penalty.
     beta = 0.04
     new = torch.tensor([[-1.0, -2.0, -3.0]], dtype=torch.float64)
     old = new - torch.tensor([[0.1, -0.2, 0.0]], dtype=torch.float64)
