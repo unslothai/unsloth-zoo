@@ -17,6 +17,7 @@
 """DeepSeek-V4's rope must stay eager in the compiled cache: Inductor with dynamic = True
 reads out of bounds in its backward (pytorch#198553), so LoRA training went NaN."""
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -49,7 +50,7 @@ for mt in ("deepseek_v4", "llama"):
     out[mt] = generated[:where].rsplit("\n@", 1)[-1].strip() if where != -1 else None
     out[mt + "_path"] = path
 
-if torch.cuda.is_available():
+if torch.cuda.is_available() and os.environ.get("UNSLOTH_ZOO_DISABLE_GPU_INIT") != "1":
     spec = importlib.util.spec_from_file_location("dsv4_cache", out["deepseek_v4_path"])
     cache = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(cache)
@@ -80,6 +81,9 @@ def _run_child(tmp_path):
     )
     env.pop("UNSLOTH_COMPILE_DISABLE", None)
     env["UNSLOTH_ALLOW_CPU"] = "1"
+    if importlib.util.find_spec("unsloth") is None:
+        # Zoo-only checkout: the only way past the `unsloth` import guard.
+        env["UNSLOTH_ZOO_DISABLE_GPU_INIT"] = "1"
     result = subprocess.run(
         [sys.executable, "-c", _CHILD], cwd = str(tmp_path), env = env,
         capture_output = True, text = True, timeout = 1800,
@@ -107,5 +111,5 @@ def test_other_models_keep_their_rope_decorator(child):
 
 def test_cached_rope_gradient_matches_transformers(child):
     if "grad_rel_err" not in child:
-        pytest.skip(reason = "needs CUDA: the out-of-bounds read is in the Triton backward kernel")
+        pytest.skip(reason = "needs CUDA and unsloth installed: the out-of-bounds read is in the Triton backward kernel")
     assert child["grad_rel_err"] < 1e-5, child
