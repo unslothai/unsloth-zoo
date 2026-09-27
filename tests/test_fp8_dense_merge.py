@@ -740,3 +740,55 @@ def test_fp8_preserves_non_fp8_buffer_dtypes(tmp_path):
         ids = f.get_tensor("model.position_ids")
         assert ids.dtype == torch.int64
         assert torch.equal(ids, torch.arange(8, dtype=torch.int64))
+
+
+def test_fp8_static_activation_scales_are_dropped(tmp_path):
+    """Static FP8 (Ministral-3, Mistral-Small-4) `.activation_scale` / fused `_activation_scale` are dropped."""
+    from unsloth_zoo.saving_utils import _merge_and_overwrite_lora
+
+    torch.manual_seed(3)
+    W_real = torch.randn(64, 128, dtype=torch.float32) * 0.1
+    W_fp8, scale = _fp8_quant_channel(W_real)
+    E_real = torch.randn(2, 16, 24, dtype=torch.float32) * 0.1
+    q = [_fp8_quant_channel(E_real[e]) for e in range(2)]
+    s1 = tmp_path / "model-00001-of-00002.safetensors"
+    s2 = tmp_path / "model-00002-of-00002.safetensors"
+    _write_shard(s1, {
+        "model.layers.0.self_attn.q_proj.weight": W_fp8,
+        "model.layers.0.self_attn.q_proj.weight_scale_inv": scale,
+        "model.layers.0.self_attn.q_proj.activation_scale": torch.tensor(0.05),
+        "model.layers.0.mlp.experts.gate_up_proj": torch.stack([w for w, _ in q]),
+        "model.layers.0.mlp.experts.gate_up_proj_scale_inv": torch.stack([s for _, s in q]),
+        "model.layers.0.mlp.experts.gate_up_proj_activation_scale": torch.tensor([0.05]),
+        "model.norm.weight": torch.ones(8, dtype=torch.bfloat16),
+    })
+    _write_shard(s2, {
+        "model.layers.1.self_attn.q_proj.weight": W_fp8.clone(),
+        "model.layers.1.self_attn.q_proj.weight_scale_inv": scale.clone(),
+        "model.layers.0.self_attn.k_proj.activation_scale": torch.tensor(0.05),
+        "model.layers.0.self_attn.k_proj.weight_scale_inv": scale.clone(),
+    })
+    # k_proj weight in shard 1, its scales in shard 2: dropped by the post-pass.
+    with safe_open(str(s1), framework="pt", device="cpu") as f:
+        t = {k: f.get_tensor(k) for k in f.keys()}
+    t["model.layers.0.self_attn.k_proj.weight"] = W_fp8.clone()
+    _write_shard(s1, t)
+
+    for name in (s1.name, s2.name):
+        _merge_and_overwrite_lora(
+            save_directory=str(tmp_path), filename=name,
+            lora_weights=defaultdict(_FakeLoraStats), output_dtype=torch.bfloat16,
+            model_class_name="Qwen3MoeForCausalLM", base_model_is_quantized=True, quant_type="fp8",
+        )
+    from unsloth_zoo.saving_utils import _drop_resolved_fp8_scales_after_rewrite
+    _drop_resolved_fp8_scales_after_rewrite(
+        str(tmp_path), [s1.name, s2.name],
+        {"model.layers.0.self_attn.q_proj.weight", "model.layers.0.self_attn.k_proj.weight",
+         "model.layers.0.mlp.experts.gate_up_proj", "model.layers.1.self_attn.q_proj.weight"},
+    )
+    keys = set()
+    for path in (s1, s2):
+        with safe_open(str(path), framework="pt", device="cpu") as f:
+            keys |= set(f.keys())
+    assert not [k for k in keys if "scale" in k], sorted(keys)
+    assert "model.norm.weight" in keys and "model.layers.0.mlp.experts.gate_up_proj" in keys
