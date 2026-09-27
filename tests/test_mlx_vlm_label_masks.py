@@ -1248,6 +1248,47 @@ def test_the_check_leaves_no_state_behind_for_the_first_training_batch():
     assert model.language_model.weight is weight
 
 
+def _loaded_wrapper(**flags):
+    from unsloth_zoo.mlx.loader import _finish_load
+
+    model = nn.Module()
+    model.language_model = nn.Module()
+    model.language_model.embed = nn.Linear(2, 2)
+    model.vision_tower = nn.Linear(2, 2)
+    model.audio_tower = _AudioAttention()
+    model.embed_audio = nn.Module()
+    model.embed_audio.proj = nn.Linear(2, 2)
+    model.embed_audio.tied = model.language_model.embed
+    model.image_newline = mx.zeros((2,))
+    for name, value in flags.items():
+        setattr(model, name, value)
+    _finish_load(model, None)
+    return model
+
+
+def _ids(tree):
+    from mlx.utils import tree_flatten
+
+    return {id(value) for _, value in tree_flatten(tree)}
+
+
+def test_a_text_only_full_finetune_trains_only_the_language_model():
+    """Towers, embedders and wrapper-level arrays text never reaches stay out of
+    the optimizer; a module the language model shares stays in it."""
+    model = _loaded_wrapper(_unsloth_full_finetuning=True, _unsloth_text_only_vlm=True)
+    assert _ids(model.trainable_parameters()) == _ids(model.language_model.parameters())
+    assert len(_ids(model.language_model.trainable_parameters())) == 2
+
+
+@pytest.mark.parametrize("flags", [
+    {"_unsloth_full_finetuning": False, "_unsloth_text_only_vlm": True},
+    {"_unsloth_full_finetuning": True, "_unsloth_text_only_vlm": False},
+])
+def test_other_loads_keep_every_parameter_trainable(flags):
+    model = _loaded_wrapper(**flags)
+    assert _ids(model.trainable_parameters()) == _ids(model.parameters())
+
+
 @pytest.mark.parametrize("model_type", ["lfm2-vl", "lille-130m", "nemotron-nas"])
 def test_a_hyphenated_model_type_keeps_its_hyphens(model_type):
     """mlx_lm names these modules after the raw config spelling.
