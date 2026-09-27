@@ -2642,8 +2642,8 @@ pass
 _FP8_WEIGHT_DTYPES = tuple(
     getattr(torch, _n) for _n in ("float8_e4m3fn", "float8_e5m2") if hasattr(torch, _n)
 )
-_FP8_SCALE_SUFFIXES = (".weight_scale_inv", ".weight_scale", ".input_scale",
-                       "_scale_inv", "_scale")
+_FP8_SCALE_SUFFIXES = (".weight_scale_inv", ".weight_scale", ".input_scale", ".activation_scale",
+                       "_input_scale", "_activation_scale", "_scale_inv", "_scale")
 # safetensors header dtype tags for FP8 weights (used to find genuine scale companions).
 _FP8_HEADER_DTYPES = ("F8_E4M3", "F8_E5M2")
 
@@ -2752,7 +2752,7 @@ pass
 def _fp8_scale_key_weight_bases(scale_key):
     """Candidate FP8 weight keys a companion scale belongs to (most specific suffix wins),
     used to drop a scale whose dequantized weight lives in another shard."""
-    for suffix in (".weight_scale_inv", ".weight_scale", ".input_scale", "_scale_inv", "_scale"):
+    for suffix in _FP8_SCALE_SUFFIXES:
         if scale_key.endswith(suffix):
             base = scale_key[: -len(suffix)]
             return (base + ".weight", base)  # .weight_* -> <base>.weight ; fused -> <base>
