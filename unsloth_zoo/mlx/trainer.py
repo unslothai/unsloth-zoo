@@ -3766,7 +3766,11 @@ class MLXTrainer:
         if callable(get_warmup_steps):
             return max(0, int(get_warmup_steps(total_steps)))
 
-        warmup_steps = int(getattr(self.args, "warmup_steps", 0) or 0)
+        warmup_steps = getattr(self.args, "warmup_steps", 0) or 0
+        if isinstance(warmup_steps, float) and 0 < warmup_steps < 1:
+            # HF TrainingArguments.get_warmup_steps: below 1 is a ratio of total steps.
+            warmup_steps = math.ceil(max(0, int(total_steps)) * warmup_steps)
+        warmup_steps = int(warmup_steps)
         warmup_ratio = getattr(self.args, "warmup_ratio", 0.0)
         if warmup_ratio is None:
             return max(0, warmup_steps)

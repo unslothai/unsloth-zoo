@@ -23,6 +23,7 @@ If a test fails, the failing component identifies the next gap.
 from __future__ import annotations
 
 import dataclasses
+import math
 import os
 import tempfile
 import types
@@ -1216,6 +1217,17 @@ def test_trainer_drives_dynamic_lr_outside_optimizer_scheduler():
         warmup_ratio=0.1,
     )
     assert zero_steps_ratio_trainer._resolve_warmup_steps(total_steps=100) == 10
+
+
+@pytest.mark.parametrize("warmup_steps, total_steps", [(0.1, 100), (0.05, 30), (0.1, 8)])
+def test_fractional_warmup_steps_is_a_ratio_of_total_steps(warmup_steps, total_steps):
+    # HF TrainingArguments.get_warmup_steps: ceil(total_steps * warmup_steps) below 1.
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(warmup_steps=warmup_steps)
+    expected = math.ceil(total_steps * warmup_steps)
+    assert trainer._resolve_warmup_steps(total_steps=total_steps) == expected
 
 
 def test_adamw_weight_decay_uses_hf_bias_norm_filter():
