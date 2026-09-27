@@ -4267,6 +4267,38 @@ def test_a_module_shared_by_two_owners_is_frozen_once():
     assert shared.frozen
 
 
+class _RelativePosition(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+
+class _AudioAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.relative_k_proj = nn.Linear(2, 2)
+        # As mlx-vlm's Gemma 4 audio attention builds it: no Module.__init__.
+        self._rel_pos = _RelativePosition.__new__(_RelativePosition)
+        self._rel_pos.pos_proj = self.relative_k_proj
+
+
+def test_a_loaded_model_freezes_modules_built_without_init():
+    """A full fine-tune reaches no get_peft_model, so the load itself must leave
+    every module freezable before the trainer freezes the audio tower."""
+    from mlx.utils import tree_flatten
+    from unsloth_zoo.mlx.loader import _finish_load
+    from unsloth_zoo.mlx.utils import freeze_audio_modules
+
+    model = nn.Module()
+    model.language_model = nn.Linear(2, 2)
+    model.audio_tower = _AudioAttention()
+    _finish_load(model, None)
+
+    assert freeze_audio_modules(model) == ["audio_tower"]
+    assert {name for name, _ in tree_flatten(model.trainable_parameters())} == {
+        "language_model.weight", "language_model.bias",
+    }
+
+
 def test_nemotron_floor_clears_the_unconditional_sound_conv_sanitize():
     """Below 0.6.10, `sanitize_audio_weights` double-transposes a pre-converted
     sound conv ((128,3,3,1) -> (128,3,1,3)) and the checkpoint cannot load."""

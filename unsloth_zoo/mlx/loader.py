@@ -4740,7 +4740,6 @@ def _load_pathless_mlx_adapter(
         and _is_partial_mlx_checkpoint(model, adapter_weights_file)
     )
     if partial_full_module:
-        _fix_missing_no_grad(model)
         model.freeze()
     model = load_adapters(model, local_path)
     if partial_full_module:
@@ -8102,6 +8101,8 @@ def _evaluate_quantized_modules(model, sources):
 def _finish_load(model, tokenizer):
     """The single exit from a load, so the patch installs after the runtimes the load imports."""
     install_quantized_attention()
+    # Here rather than in get_peft_model: the trainer and callers freeze loaded models too.
+    _fix_missing_no_grad(model)
     _materialize_weights(model)
     return model, tokenizer
 
@@ -8778,7 +8779,6 @@ class FastMLXModel:
                                 ) from _dora_exc
                         if _saved_lora_paths:
                             if not full_finetuning:
-                                _fix_missing_no_grad(model)
                                 model.freeze()
                             _apply_lora_at_paths(
                                 model, _saved_lora_paths, adapter_cfg,
@@ -8827,7 +8827,6 @@ class FastMLXModel:
                         from .utils import iter_mlx_lora_modules
                         _lora_modules = list(iter_mlx_lora_modules(model))
                         if _lora_modules:
-                            _fix_missing_no_grad(model)
                             model.freeze()
                             model.unfreeze(keys=["lora_a", "lora_b"], strict=False)
                             # Per module, so an unrelated base parameter named
