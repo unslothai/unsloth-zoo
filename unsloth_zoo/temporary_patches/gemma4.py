@@ -79,11 +79,8 @@ class _Gemma4KVSharedSafeProxy:
     def __getattr__(self, name):
         # Only invoked when normal attribute lookup fails.
         if name == "_real":
-            # Slot unset (copy/pickle built us without __init__): fail instead of
-            # recursing. This guard is what lets every method below read the slot
-            # as plain `self._real`; `object.__getattribute__(self, ...)` is not
-            # traceable by Dynamo (graph break on every compiled gemma-4 forward
-            # that calls get_text_config()).
+            # Unset slot (copy/pickle skip __init__): raise, don't recurse. Lets
+            # methods use plain self._real; object.__getattribute__ breaks Dynamo graphs.
             raise AttributeError(name)
         if name == "num_kv_shared_layers":
             raise AttributeError(

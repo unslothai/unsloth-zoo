@@ -1,11 +1,5 @@
-"""_Gemma4KVSharedSafeProxy must be traceable by Dynamo.
-
-get_text_config() is called inside every Gemma-4 forward (Gemma4Model, the
-causal-LM head and masking_utils), so on the 26B-A4B / 31B configs
-(num_kv_shared_layers == 0) the proxy is built and read inside compiled
-regions. Reading its slot through object.__getattribute__ made Dynamo abandon
-the frame; plain attribute access traces.
-"""
+"""_Gemma4KVSharedSafeProxy is built inside compiled gemma-4 forwards via
+get_text_config() (26B-A4B / 31B, num_kv_shared_layers == 0): it must trace."""
 import copy
 import pickle
 
@@ -59,7 +53,6 @@ def test_proxy_semantics_unchanged():
     assert p == g4._Gemma4KVSharedSafeProxy(cfg) and p == cfg
     assert hash(p) == hash(cfg) and bool(p)
     assert "_Cfg" in repr(p)
-    # Built without __init__ (copy/pickle protocol): must raise, not recurse.
     bare = g4._Gemma4KVSharedSafeProxy.__new__(g4._Gemma4KVSharedSafeProxy)
     with pytest.raises(AttributeError):
         bare.hidden_size
