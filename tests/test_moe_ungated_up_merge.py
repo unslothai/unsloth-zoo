@@ -14,13 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Ungated MoE experts (NemotronH: experts.up_proj of I rows, no gate_proj) merge their up LoRA.
-
-_merge_moe_gate_or_up_expert classified every up LoRA against a fused gate_up_proj
-(out_dim = 2 * I), so NemotronH's up LoRA was "layout not detected" and
-save_pretrained_merged raised. Shapes below are the tiny NemotronH ones from the
-regression suite failure: A=(32, 16), B=(32, 32), per-expert W=(32, 16).
-"""
+"""Ungated MoE experts (NemotronH experts.up_proj of I rows, no gate_proj) merge their up LoRA."""
 import torch
 
 from unsloth_zoo import saving_utils as SU
@@ -41,8 +35,8 @@ def test_ungated_up_standard_layout_nemotronh_shapes():
     torch.manual_seed(0)
     E, r, I, H, alpha = 4, 8, 32, 16, 2.0
     W = torch.randn(I, H)
-    A = torch.randn(E * r, H)          # (E*r, in=H)
-    B = torch.randn(I, E * r)          # (out=I, E*r)
+    A = torch.randn(E * r, H)
+    B = torch.randn(I, E * r)
     _reset()
     for e in range(E):
         out = _merge_moe_up_expert(W.clone(), LoraStats(module=None, lora_A=A, lora_B=B, alpha=alpha),
@@ -57,8 +51,8 @@ def test_ungated_up_swapped_layout():
     torch.manual_seed(1)
     E, r, I, H, alpha = 4, 3, 8, 12, 4.0
     W = torch.randn(I, H)
-    A = torch.randn(E * r, I)          # swapped: (E*r, out=I)
-    B = torch.randn(H, E * r)          # (in=H, E*r)
+    A = torch.randn(E * r, I)
+    B = torch.randn(H, E * r)
     for e in range(E):
         out = _merge_moe_up_expert(W.clone(), LoraStats(module=None, lora_A=A, lora_B=B, alpha=alpha),
                                    e, E, torch.float32)
@@ -67,7 +61,6 @@ def test_ungated_up_swapped_layout():
 
 
 def test_gate_role_never_takes_the_ungated_branch():
-    # An I-row LoRA reaching the gate role is not a fused gate_up: still refused.
     E, r, I, H = 4, 2, 8, 12
     W = torch.randn(I, H)
     A, B = torch.randn(E * r, H), torch.randn(I, E * r)
@@ -81,7 +74,7 @@ def test_fused_gate_up_unchanged():
     E, r, I, H, alpha = 4, 3, 8, 12, 8.0
     W = torch.randn(I, H)
     A = torch.randn(E * r, H)
-    B = torch.randn(2 * I, E * r)      # fused gate_up, standard
+    B = torch.randn(2 * I, E * r)
     for e in range(E):
         out = _merge_moe_up_expert(W.clone(), LoraStats(module=None, lora_A=A, lora_B=B, alpha=alpha),
                                    e, E, torch.float32)
