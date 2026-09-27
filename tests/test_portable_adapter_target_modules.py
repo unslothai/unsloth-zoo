@@ -14,16 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""An adapter Unsloth saves must reload in plain PEFT (no Unsloth patches loaded).
-
-Two target_modules shapes broke that:
-- Gemma 4: the LoRA sits on Gemma4ClippableLinear's inner `.linear`, but the saved leaf
-  name ("q_proj") makes plain PEFT pick the wrapper and raise "not supported".
-- Fused MoE experts: leaf names that wrapped nothing (gate_proj, up_proj) make PEFT's
-  transformers v5 MoE conversion double the rank of gate_up_proj, so the load fails.
-
-CPU only.
-"""
+"""Adapters Unsloth saves for Gemma 4 and fused MoE experts must reload in plain PEFT. CPU only."""
 
 from __future__ import annotations
 
@@ -50,8 +41,7 @@ HELPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_portable_tar
 
 
 def _reload_in_plain_peft(adapter_dir, state, x):
-    """Load in a fresh interpreter that never imports Unsloth, whose patches would let
-    this process load what plain PEFT cannot. Returns (returncode, stderr, output)."""
+    """Load in a fresh interpreter without Unsloth's patches. Returns (returncode, stderr, output)."""
     torch.save(state, str(adapter_dir / "state.pt"))
     torch.save(x, str(adapter_dir / "x.pt"))
     env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
@@ -74,8 +64,7 @@ def _seed_lora_b(model):
 
 
 def _unsloth_style_gemma4_adapter(tmp_path):
-    """What Unsloth leaves on disk: LoRA on text q_proj and vision q_proj.linear, and
-    target_modules = ["q_proj"] in adapter_config.json."""
+    """LoRA on text q_proj and vision q_proj.linear, saved with target_modules = ["q_proj"]."""
     torch.manual_seed(0)
     base = TwoTowers()
     state = {k: v.clone() for k, v in base.state_dict().items()}
@@ -84,7 +73,6 @@ def _unsloth_style_gemma4_adapter(tmp_path):
     _seed_lora_b(model)
     model.peft_config["default"].target_modules = {"q_proj"}
     model.save_pretrained(str(tmp_path))
-    # Pin the pre-fix file whether or not this process has the save hook installed.
     path = tmp_path / "adapter_config.json"
     config = json.loads(path.read_text())
     config["target_modules"] = ["q_proj"]
@@ -93,7 +81,6 @@ def _unsloth_style_gemma4_adapter(tmp_path):
 
 
 def test_plain_peft_rejects_the_leaf_name_for_a_wrapped_linear(tmp_path):
-    # The bug being fixed: without the rewrite plain PEFT picks the wrapper.
     _, state = _unsloth_style_gemma4_adapter(tmp_path)
     code, err, _ = _reload_in_plain_peft(tmp_path, state, torch.randn(3, 6))
     assert code != 0 and "is not supported" in err
@@ -158,9 +145,7 @@ def test_fused_expert_adapter_drops_leaf_names_that_wrapped_nothing():
         model, "default", ["q_proj", "gate_proj", "up_proj", "down_proj"],
     )
     assert out == ["q_proj"]
-    # Nothing to drop: left alone.
     assert MU.portable_lora_target_modules(model, "default", ["q_proj"]) is None
-    # A regex is never rewritten.
     assert MU.portable_lora_target_modules(model, "default", ".*q_proj") is None
 
 
