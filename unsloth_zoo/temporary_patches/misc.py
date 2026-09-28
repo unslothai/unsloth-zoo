@@ -1503,6 +1503,10 @@ def _gradient_checkpointing_donor(model):
     except Exception:
         GradientCheckpointingLayer = None
     from transformers import PreTrainedModel
+    # Only the unset PreTrainedModel default: an explicit False (JetMoe, Blip-2) must keep raising.
+    owner = next((k for k in type(model).__mro__ if "supports_gradient_checkpointing" in vars(k)), None)
+    if owner is not PreTrainedModel:
+        return None
     for name, module in model.named_modules():
         if not name or module is model:
             continue

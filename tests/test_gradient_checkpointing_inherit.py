@@ -142,6 +142,15 @@ def test_model_without_checkpointable_submodule_still_raises(patched):
         _NoLayers(_Cfg()).gradient_checkpointing_enable()
 
 
+class _ExplicitFalse(_Wrapper):  # native JetMoe / Blip-2 style opt-out
+    supports_gradient_checkpointing = False
+
+
+def test_explicit_false_still_raises(patched):
+    with pytest.raises(ValueError, match="does not support gradient checkpointing"):
+        _ExplicitFalse(_Cfg()).gradient_checkpointing_enable()
+
+
 def test_kill_switch(monkeypatch):
     saved = PreTrainedModel.gradient_checkpointing_enable
     try:
