@@ -63,6 +63,7 @@ TEMPORARY_PATCHES_SUBMODULES = [
     "unsloth_zoo.temporary_patches.compiled_model_identity",
     "unsloth_zoo.temporary_patches.conversion_mapping_rescope",
     "unsloth_zoo.temporary_patches.deepseek_v3_moe",
+    "unsloth_zoo.temporary_patches.deepseek_v4",
     "unsloth_zoo.temporary_patches.ernie4_5_moe",
     "unsloth_zoo.temporary_patches.fla_vendor",
     "unsloth_zoo.temporary_patches.flex_attention_bwd",
