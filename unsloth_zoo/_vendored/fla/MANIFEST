@@ -90,6 +90,16 @@ modifications =
       (reference implementations; the first needs einops). The KDA files share
       the vendored ops/common/chunk_delta_h.py, ops/cp and ops/utils, so they
       run on the #953 fix above.
+    - Backported fla PR #1109 in ops/kda/chunk_bwd.py (+ IS_NVIDIA_SM100 in
+      utils/_device.py and utils/__init__.py, each marked with an inline
+      "Unsloth: backported from fla PR #1109" comment): on SM100 the
+      chunk_kda_bwd_kernel_wy_dqkg_fused autotune drops the BK=32 configs with
+      4 or 8 warps. Reproduced on B200 with torch 2.7.1 / triton 3.3.1: every
+      such config hits an illegal memory access, so the default KDA backward
+      crashes while autotuning. On triton 3.7.1 those configs are correct, and
+      excluding them costs at most 2.7% of a KDA layer fwd+bwd (B 1, T 8192,
+      H 64, D 128); the guard is kept unconditional, as upstream, because
+      triton 3.4 to 3.6 were not measured.
     - Dropped fla/ops/gated_delta_rule/naive.py (the only einops dependency; the
       reference implementation is unused on the fast path).
     - Dropped the three heavy tilelang kernel files

@@ -46,6 +46,15 @@ def test_kda_closure_is_vendored():
     assert "FlashKDABackend" in code and "tilelang" not in code.lower()
 
 
+def test_sm100_autotune_guard_is_backported():
+    """fla #1109: BK=32 with 4 or 8 warps hits an illegal memory access on SM100 + triton 3.3."""
+    code = (VENDORED / "ops" / "kda" / "chunk_bwd.py").read_text()
+    assert "if not (IS_NVIDIA_SM100 and BK == 32 and num_warps != 2)" in code
+    device = (VENDORED / "utils" / "_device.py").read_text()
+    assert "IS_NVIDIA_SM100 = (IS_NVIDIA and torch.cuda.get_device_capability()[0] == 10)" in device
+    assert "'IS_NVIDIA_SM100'" in (VENDORED / "utils" / "__init__.py").read_text()
+
+
 def test_kernel_hub_table_covers_kda():
     table = fla_vendor._KERNEL_HUB_DECORATED
     assert table["chunk_kimi_delta_attention"] == ("fla.ops.kda", "chunk_kda")
@@ -142,6 +151,13 @@ _KERNEL_CHILD = textwrap.dedent(
             errs += [rel(a, x.grad.double()) for a, x in zip(grads, (q, k, v, g, beta))]
         assert all(e < 2e-2 for e in errs), (fn_name, varlen, errs)
         print(fn_name, varlen, [round(e, 5) for e in errs])
+    from fla.ops.kda import chunk_bwd
+    from fla.utils import IS_NVIDIA_SM100
+    tuner = chunk_bwd.chunk_kda_bwd_kernel_wy_dqkg_fused
+    while not hasattr(tuner, "configs"):
+        tuner = tuner.fn
+    bad = [c for c in tuner.configs if c.kwargs["BK"] == 32 and c.num_warps != 2]
+    assert not (IS_NVIDIA_SM100 and bad), bad
     print("KDA_OK")
     """
 )
