@@ -1819,14 +1819,7 @@ _HUB_KERNEL_WRAPPER_RE = re.compile(r"^[ \t]*@use_kernel_func_from_hub_with_fall
 
 
 def is_hub_kernel_wrapper(source):
-    """True for a function transformers binds to an external kernel package (mamba_ssm, causal_conv1d, fla)
-    through `use_kernel_func_from_hub_with_fallback`. Emitted bare, never compiled: Unsloth keeps those
-    packages out of Dynamo (compile_mamba_ssm / compile_causal_conv1d), and on torch 2.11
-    `torch.compiler.is_exporting()` reads True inside a torch.compile trace, so the wrapper takes its export
-    branch and the compiled function is the torch reference. For Nemotron-H's
-    mamba2_split_conv1d_scan_combined that reference is a stub returning None, so training silently skipped
-    the fused Mamba-2 kernel (Colab, torch 2.11); on 2.14 the compile failed on the disabled kernel and fell
-    back to eager, one failed trace per new shape."""
+    # Emit bare: on torch 2.11 is_exporting() is True inside a compile trace, so the wrapper runs its torch reference (a None stub for Nemotron-H mamba2).
     return bool(_HUB_KERNEL_WRAPPER_RE.search(source or ""))
 pass
 

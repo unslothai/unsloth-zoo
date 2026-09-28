@@ -14,16 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Functions transformers binds to an external kernel package through
-`use_kernel_func_from_hub_with_fallback` must be emitted bare, not torch.compile'd.
-
-On torch 2.11 `torch.compiler.is_exporting()` is True inside a torch.compile trace, so the
-wrapper takes its export branch and the compiled function becomes the torch reference.
-Nemotron-H's `mamba2_split_conv1d_scan_combined` reference is a stub returning None, so on
-Colab (torch 2.11, RTX PRO 6000) Unsloth training never ran the fused Mamba-2 kernel
-(0 MambaSplitConv1dScanCombinedFn calls vs 1840 on torch 2.14) and causal_conv1d fell back
-to F.conv1d. On torch 2.14 the same compile fails on the disabled kernel and falls back to
-eager, one failed trace per new shape."""
+"""Hub-kernel wrapper functions must be emitted bare, not torch.compile'd."""
 
 import json
 import os
