@@ -2388,86 +2388,112 @@ def test_bitlinear_can_feed_a_downstream_head_adapter(targets, attention):
     assert mx.abs(grads["lm_head"]["lora_b"]).max().item() > 0
 
 
+_KV_SHARED_PEAK_SCRIPT = r"""
+import json
+import mlx.core as mx
+import mlx.nn as nn
+from mlx.utils import tree_flatten
+from mlx_vlm.models.gemma4.config import TextConfig
+from mlx_vlm.models.gemma4.language import DecoderLayer, Gemma4TextModel
+from unsloth_zoo.mlx import utils as mlx_utils
+
+seq_len = 512
+mx.random.seed(0)
+ids = mx.random.randint(0, 64, (1, seq_len))
+
+
+def build(num_kv_shared_layers):
+    mx.random.seed(0)
+    model = Gemma4TextModel(TextConfig(
+        hidden_size=64, num_hidden_layers=15, intermediate_size=128,
+        num_attention_heads=8, head_dim=16, global_head_dim=32,
+        vocab_size=64, vocab_size_per_layer_input=64,
+        hidden_size_per_layer_input=8, sliding_window=seq_len // 4,
+        num_kv_shared_layers=num_kv_shared_layers))
+    mx.eval(model.parameters())
+    return model
+
+
+def peak(model, repeats=5):
+    loss_and_grad = nn.value_and_grad(model, lambda m: (m(ids) ** 2).sum())
+    mx.eval(loss_and_grad(model))
+    readings, grads = [], None
+    for _ in range(repeats):
+        grads = None
+        mx.clear_cache()
+        resident = mx.get_active_memory()
+        mx.reset_peak_memory()
+        grads = loss_and_grad(model)[1]
+        mx.eval(grads)
+        readings.append((mx.get_peak_memory() - resident,
+                         sum(g.nbytes for _, g in tree_flatten(grads))))
+    return readings
+
+
+shared, unshared = build(10), build(0)
+mlx_utils._patch_layer_class_for_gc(DecoderLayer)
+print(json.dumps({"unshared": peak(unshared), "shared": peak(shared)}))
+"""
+
+
 @metal_only
 def test_checkpointed_kv_shared_layers_hold_what_unshared_layers_hold():
     """Borrowed K/V's cotangent is consumed by the source layer's backward; left
     to run by that consumer, each borrowing layer keeps its T x T attention
-    cotangents alive until then."""
+    cotangents alive until then.
+
+    The peaks are measured in a fresh interpreter. In this process, after the tests
+    before it, Metal's `get_peak_memory() - get_active_memory()` reads low for whole
+    stretches of a run: on repeated full-file runs the unshared peak read exactly
+    182285696 (pinned) or 183564288 (latest) when right, and 116 MB, 151 MB, 2284
+    bytes or negative when not, sometimes on every one of five repeats. Every flake
+    this test has had was such a low unshared reading (runs 35502075009, 36311394738,
+    36377153200). `mx.synchronize()` and `gc.collect()` do not remove them. No reading
+    was ever above the exact value, so each side is taken as the maximum of its
+    repeats, and a reading below the gradients that repeat produced is not kept.
+    """
+    import subprocess
+    import sys
     from mlx_vlm.models.gemma4.config import TextConfig
     from mlx_vlm.models.gemma4.language import DecoderLayer, Gemma4TextModel
 
+    run = subprocess.run(
+        [sys.executable, "-c", _KV_SHARED_PEAK_SCRIPT],
+        capture_output=True, text=True, timeout=900,
+    )
+    assert run.returncode == 0, run.stderr[-4000:]
+    readings = json.loads(run.stdout.strip().splitlines()[-1])
+
+    def ceiling(side):
+        kept = [p for p, produced in readings[side] if p >= produced]
+        assert kept, f"every {side} repeat read a peak below its gradients: {readings[side]}"
+        return max(kept)
+
+    shared_peak, unshared_peak = ceiling("shared"), ceiling("unshared")
+    assert shared_peak < 1.25 * unshared_peak, (shared_peak, unshared_peak, readings)
+
+    # Checkpointing must not change what the shared model computes.
     seq_len = 512
     ids = mx.random.randint(0, 64, (1, seq_len))
-
-    def build(num_kv_shared_layers):
-        mx.random.seed(0)
-        model = Gemma4TextModel(TextConfig(
-            hidden_size=64, num_hidden_layers=15, intermediate_size=128,
-            num_attention_heads=8, head_dim=16, global_head_dim=32,
-            vocab_size=64, vocab_size_per_layer_input=64,
-            hidden_size_per_layer_input=8, sliding_window=seq_len // 4,
-            num_kv_shared_layers=num_kv_shared_layers))
-        mx.eval(model.parameters())
-        return model
-
-    def peak_and_grads(model, repeats = 5):
-        """Peak above resident, taken as the MAXIMUM over `repeats` measurements.
-
-        On Metal the reading is exact when it is right and low when it is wrong: across
-        repeated full-file runs the unshared peak read 182285696 (pinned) or 183564288
-        (latest) every time it did not read low, and read 126 MB, 147 MB, 151 MB, even
-        negative, when it did. It never read above. The flakes this test has had are all
-        such low readings of the unshared model: run 35502075009 read shared 197663512
-        (its exact value) against unshared 151210728, and run 36311394738 took 2284 bytes
-        as the unshared peak. A minimum keeps exactly those, so the maximum is the
-        estimate. `mx.synchronize()` and `gc.collect()` before sampling `resident` were
-        both tried on Metal and neither removes the low readings.
-
-        The bound itself is unchanged. This makes the measurement less noisy rather than
-        the claim weaker.
-        """
-        loss_and_grad = nn.value_and_grad(model, lambda m: (m(ids) ** 2).sum())
-        mx.eval(loss_and_grad(model))
-        ceiling, grads, readings = None, None, []
-        for _ in range(repeats):
-            # Drop the previous repeat's gradients BEFORE `resident` is sampled, so
-            # `resident` holds nothing the measured run releases.
-            grads = None
-            mx.clear_cache()
-            resident = mx.get_active_memory()
-            mx.reset_peak_memory()
-            grads = loss_and_grad(model)[1]
-            mx.eval(grads)
-            peak = mx.get_peak_memory() - resident
-            readings.append(peak)
-            # The gradients this repeat produced are still live when it ends, so no real
-            # peak is smaller than they are; a reading under that is not kept.
-            if peak < sum(g.nbytes for _, g in tree_flatten(grads)):
-                continue
-            ceiling = peak if ceiling is None else max(ceiling, peak)
-        return ceiling, grads, readings
-
-    def floor_and_grads(model):
-        peak, grads, readings = peak_and_grads(model)
-        assert peak is not None, (
-            f"every repeat read a peak below the gradients it produced: {readings}"
-        )
-        return peak, grads
-
-    shared, unshared = build(10), build(0)
-    # Only the gradients of this pass are used, so its single peak reading is not
-    # checked: a dropped reading here says nothing about the claim under test.
-    _, reference, _ = peak_and_grads(shared, repeats = 1)
+    mx.random.seed(0)
+    shared = Gemma4TextModel(TextConfig(
+        hidden_size=64, num_hidden_layers=15, intermediate_size=128,
+        num_attention_heads=8, head_dim=16, global_head_dim=32,
+        vocab_size=64, vocab_size_per_layer_input=64,
+        hidden_size_per_layer_input=8, sliding_window=seq_len // 4,
+        num_kv_shared_layers=10))
+    mx.eval(shared.parameters())
+    loss_and_grad = nn.value_and_grad(shared, lambda m: (m(ids) ** 2).sum())
+    reference = loss_and_grad(shared)[1]
+    mx.eval(reference)
     mlx_utils._patch_layer_class_for_gc(DecoderLayer)
     try:
-        unshared_peak, _ = floor_and_grads(unshared)
-        shared_peak, grads = floor_and_grads(shared)
+        grads = loss_and_grad(shared)[1]
+        mx.eval(grads)
     finally:
         mlx_utils._unpatch_layer_class_gc(DecoderLayer)
-    assert shared_peak < 1.25 * unshared_peak, (shared_peak, unshared_peak)
     for (name, got), (_, want) in zip(tree_flatten(grads), tree_flatten(reference)):
         assert mx.allclose(got, want, rtol=1e-5, atol=1e-7).item(), name
-
 
 @metal_only
 def test_checkpointing_keeps_cacheless_kv_shared_gradients():
