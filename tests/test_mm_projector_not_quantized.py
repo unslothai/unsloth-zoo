@@ -15,15 +15,15 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
-"""Kimi K2.5 / K2.7 name their bf16 vision projector `mm_projector`; a 4-bit load must keep it
-in full precision like every other projector (the checkpoint's compressed-tensors ignore list does)."""
+"""Kimi K2.5 / K2.7 name their bf16 vision projector `mm_projector`; 4-bit loads must skip it."""
 
 import pytest
 
 from unsloth_zoo.peft_utils import SKIP_QUANTIZATION_MODULES
 
-PROJECTOR = ["mm_projector.proj.0", "mm_projector.proj.2"]
-# Kimi decoder / vision tower Linears that must keep their existing treatment.
+# Remote-code and native transformers 5 layouts.
+PROJECTOR = ["mm_projector.proj.0", "mm_projector.proj.2",
+             "model.mm_projector.in_proj", "model.mm_projector.out_proj"]
 OTHERS_CONVERT = ["language_model.model.layers.1.mlp.shared_experts.gate_proj",
                   "language_model.model.layers.0.self_attn.q_a_proj"]
 
