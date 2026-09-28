@@ -103,3 +103,24 @@ def test_a_failing_kernel_falls_back_to_the_exact_path(ogs, monkeypatch):
         out = gpt_oss.moe_forward_inference_bf16(mlp, _inputs()[0])
         assert gpt_oss._mxfp4_ogs_decode(mlp, _inputs()[0]) is None
     assert experts.gate_up_proj.device in gpt_oss._OGS_FAILED and torch.isfinite(out).all()
+
+
+def test_the_cached_ogs_views_follow_their_experts(ogs):
+    # The cache holds the packed storage: it must drop a rebound stack (copy_ swaps scales) and a freed model.
+    import gc
+    from test_mxfp4_packed_experts import _packed
+
+    model, experts = _tiny_gpt_oss("cuda")
+    mlp = model.model.layers[0].mlp
+    h = _inputs()[0]
+    with torch.no_grad():
+        before = gpt_oss._mxfp4_ogs_decode(mlp, h).float()
+        experts.gate_up_proj.copy_(_packed(4, 128, 128, device = "cuda", seed = 21))
+        experts.down_proj.copy_(_packed(4, 128, 64, device = "cuda", seed = 22))
+        after = gpt_oss._mxfp4_ogs_decode(mlp, h).float()
+    want = _dense_reference(mlp, experts, [h])[0]
+    assert not torch.equal(before, after) and (after - want).norm() / want.norm() < 2e-2
+    assert len(gpt_oss._OGS_WEIGHTS) == 2
+    del model, experts, mlp
+    gc.collect()
+    assert len(gpt_oss._OGS_WEIGHTS) == 0
