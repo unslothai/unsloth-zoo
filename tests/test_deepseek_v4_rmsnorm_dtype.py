@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A bf16 DeepSeek-V4 must run a plain forward: its float32 norm weights made every norm return float32,
-which the next bf16 Linear rejects. The patch returns DeepSeek's reference `(weight * x).to(dtype)`."""
+"""A bf16 DeepSeek-V4 must run a plain forward; norms match DeepSeek's reference `(weight * x).to(dtype)`."""
 
 import pytest
 import torch
@@ -49,14 +48,12 @@ def test_bf16_forward_without_autocast():
     _apply()
     torch.manual_seed(0)
     model = modeling.DeepseekV4ForCausalLM(_tiny_config()).to(torch.bfloat16).eval()
-    # transformers keeps the norms in float32 on load; mirror that here.
     for name, module in model.named_modules():
         if isinstance(module, modeling.DeepseekV4RMSNorm):
             module.float()
     ids = torch.randint(0, 256, (1, 24))
     with torch.no_grad():
         out = model(input_ids = ids, labels = ids, use_cache = False)
-    # Unsloth's fused loss may return empty logits; the forward completing is the check.
     assert torch.isfinite(out.loss)
     hidden = model.model(input_ids = ids, use_cache = False).last_hidden_state
     assert hidden.dtype == torch.bfloat16

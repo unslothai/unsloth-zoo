@@ -14,15 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""DeepSeek-V4 RMSNorm returns float32 for bfloat16 inputs.
-
-transformers keeps every DeepSeek-V4 norm weight in float32 (`_keep_in_fp32_modules_strict`), and
-`DeepseekV4RMSNorm.forward` ends with `self.weight * hidden_states.to(input_dtype)`, so the product is
-float32. The next bf16 `nn.Linear` (`q_a_proj` on a bf16 / dequantized model, `lm_head` always) then fails
-with "expected mat1 and mat2 to have the same dtype" unless autocast is on, so a 16-bit DeepSeek-V4 cannot
-run a plain forward or `generate`. DeepSeek's reference (`inference/model.py`, `RMSNorm.forward`) returns
-`(self.weight * x).to(dtype)`; this patch uses exactly that. float32 inputs are unchanged.
-"""
+"""transformers keeps DeepSeek-V4 norm weights in float32 and returns `weight * x.to(input_dtype)`, so a bf16
+model's next Linear gets float32 input. DeepSeek's reference (`inference/model.py`) returns `(weight * x).to(dtype)`."""
 import inspect
 
 import torch
@@ -47,7 +40,6 @@ def patch_deepseek_v4_rmsnorm_dtype():
         source = inspect.getsource(cls.forward)
     except Exception:
         return
-    # Only the known float32-leaking form; any upstream rewrite is left alone.
     if _BUGGY_RETURN not in source:
         return
 
