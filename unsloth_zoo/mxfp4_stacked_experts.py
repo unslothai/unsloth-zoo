@@ -271,7 +271,7 @@ class Mxfp4StackedExperts(nn.Module):
 def _dense_stack(param, dtype, device):
     if not is_mxfp4_expert_param(param):
         return param.detach().to(dtype).to(device)
-    # Chunked into `device`: a whole bf16 stack on the GPU is ~37 GiB per Kimi-K3 layer.
+    # Chunked into `device`: a whole bf16 stack per layer does not fit on the GPU.
     scales = param.mxfp4_scales
     if scales.device != param.device:
         scales = param.mxfp4_scales = scales.to(param.device)

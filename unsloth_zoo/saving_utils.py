@@ -5093,7 +5093,7 @@ def merge_and_overwrite_lora(
     # which clears quant_type; same value either way, the two branches are mutually exclusive.
     _count_packed_mxfp4 = not (base_model_is_quantized and quant_type == "mxfp4" and save_method == "mxfp4")
 
-    # Decoded per shard inside the merge loop so low-disk upload still streams; the decode folds in stack LoRAs.
+    # Decoded per shard in the merge loop (low-disk upload still streams), folding in stack LoRAs.
     _mxfp4_rewrite = _int_rewrite = _disk_view = None
     if _ct_int_schemes is not None:
         _int_rewrite = _plan_compressed_int_rewrite(save_directory, final_safetensors_list, _ct_int_schemes)
