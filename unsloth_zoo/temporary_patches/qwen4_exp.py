@@ -14,20 +14,11 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Qwen4Exp (Qwen3.8-Flash-Next, transformers `qwen4_exp`).
+"""Qwen4Exp (Qwen3.8-Flash-Next) patches.
 
-1. MoE: Qwen4ExpTextExperts / Qwen4ExpTextSparseMoeBlock are the Qwen3.5-MoE layout
-   (3D gate_up_proj [E, 2I, H] / down_proj [E, H, I], softmax top-k router, sigmoid-gated
-   shared expert), so they take the same grouped-GEMM backend and LoRA extractor.
-2. QSA indexer: the reference Qwen4ExpTextQSAIndexer.forward loops over batch x query in
-   Python with a torch.nonzero / topk per query (B*T host syncs per full-attention layer).
-   Its output is a token-selection mask: the top `indexer_budget // compress_ratio` blocks of
-   `compress_ratio` visible tokens plus the incomplete tail. A query sees at most kv_length
-   tokens, so when kv_length < budget + compress_ratio every complete block is selected and
-   the mask is exactly the visible mask. That case is answered from the input mask with no
-   host sync; longer contexts keep the reference. The selection is a topk over indices, so
-   no gradient reaches index_qk_proj through the LM loss either way.
-   Kill switch: UNSLOTH_QWEN4_EXP_FAST_QSA=0.
+MoE takes the Qwen3.5-MoE grouped-GEMM backend. QSA indexer: when kv_length < budget +
+compress_ratio every complete block is selected, so the mask is the visible mask and the
+per-query nonzero/topk loop (B*T host syncs) is skipped. Kill switch: UNSLOTH_QWEN4_EXP_FAST_QSA=0.
 """
 
 __all__ = ["patch_qwen4_exp"]
@@ -43,21 +34,17 @@ def _fast_qsa_enabled():
     return os.environ.get("UNSLOTH_QWEN4_EXP_FAST_QSA", "1") != "0"
 
 
-# The transformers forward, kept here because Unsloth's compiler replaces the modeling
-# class with a generated copy whose forward is the function below.
+# Long-context reference; the compiler's generated class calls the function below.
 _reference_qsa_forward = None
 
 
 def qwen4_exp_qsa_indexer_forward(self, hidden_states, position_embeddings, attention_mask, past_key_values=None):
-    # Self-contained on purpose: Unsloth's compiler copies this source into its cache
-    # module, so it may only use `torch`, `self` and the lazy import below.
+    # Compiler copies this source into its cache: use only `torch`, `self`, the lazy import.
     if (
         attention_mask is not None
         and attention_mask.dim() == 4
         and attention_mask.shape[-1] < self.token_budget + self.compress_ratio
     ):
-        # Every complete block is selected (block_topk >= complete blocks), plus the tail:
-        # the selection is exactly the visible mask.
         if past_key_values is not None:
             batch_size, seq_length, _ = hidden_states.shape
             token_k = self.index_qk_proj(hidden_states)[..., self.index_n_heads * self.index_head_dim:]
@@ -73,8 +60,7 @@ def qwen4_exp_qsa_indexer_forward(self, hidden_states, position_embeddings, atte
 
 
 def _is_transformers_indexer_forward(function):
-    """The forward transformers ships, read off its code object: Unsloth's compiled copy
-    keeps the transformers ``__module__`` for identity checks but lives in its cache file."""
+    """By code file: the compiled copy keeps transformers' ``__module__``."""
     code = getattr(function, "__code__", None)
     filename = str(getattr(code, "co_filename", "")).replace("\\", "/")
     return "/transformers/models/qwen4_exp/" in filename
@@ -94,14 +80,12 @@ def patch_qwen4_exp():
     except Exception:
         return
 
-    # ---- QSA indexer
     indexer_cls = getattr(modeling, "Qwen4ExpTextQSAIndexer", None)
     if (
         indexer_cls is not None
         and _fast_qsa_enabled()
         and indexer_cls.forward is not qwen4_exp_qsa_indexer_forward
-        # Only ever wrap transformers' own forward: after Unsloth's compiler swaps in its
-        # generated class, a re-run must not take that copy (which calls us) as the reference.
+        # Never take the compiler's copy (which calls us) as the reference.
         and _is_transformers_indexer_forward(indexer_cls.forward)
     ):
         try:
@@ -111,7 +95,6 @@ def patch_qwen4_exp():
             if UNSLOTH_ENABLE_LOGGING:
                 logger.warning(f"Unsloth: Could not patch Qwen4ExpTextQSAIndexer.forward: {e}")
 
-    # ---- MoE (same layout as Qwen3.5-MoE)
     experts_cls = getattr(modeling, "Qwen4ExpTextExperts", None)
     block_cls = getattr(modeling, "Qwen4ExpTextSparseMoeBlock", None)
     if experts_cls is None or block_cls is None:

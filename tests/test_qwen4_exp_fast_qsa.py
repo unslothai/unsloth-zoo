@@ -1,9 +1,4 @@
-"""Qwen4Exp QSA indexer fast path equals the reference whenever kv_length < budget + ratio.
-
-The reference loops over batch x query with a torch.nonzero per query (a host sync each);
-below that length every complete block is selected, so the selection mask is the visible
-mask. Checked against the reference on bool (sdpa) and float (eager) masks with causal,
-left-padded and packed (block-diagonal) layouts, plus the indexer-cache side effect."""
+"""Qwen4Exp QSA fast path equals the reference whenever kv_length < budget + ratio."""
 import pytest
 import torch
 
@@ -99,7 +94,7 @@ def test_long_context_still_selects():
     m = masks(T, "causal")
     with torch.no_grad():
         want = reference(idx, torch.randn(2, T, 64), rope(T), m, None)
-    assert not torch.equal(want, m)  # some visible tokens dropped
+    assert not torch.equal(want, m)
     fast = _make_fast_indexer_forward(reference)
     torch.manual_seed(1)
     h = torch.randn(2, T, 64)
@@ -122,7 +117,7 @@ def test_patch_installed_and_kill_switch(monkeypatch):
         patch.patch_qwen4_exp()
         assert cls.forward is patch.qwen4_exp_qsa_indexer_forward
         assert patch._reference_qsa_forward is original
-        patch.patch_qwen4_exp()  # idempotent
+        patch.patch_qwen4_exp()
         assert patch._reference_qsa_forward is original
         idx = make_indexer()
         T = 12
@@ -132,7 +127,7 @@ def test_patch_installed_and_kill_switch(monkeypatch):
         monkeypatch.setattr(torch, "nonzero", lambda *a, **k: calls.append(1) or real_nonzero(*a, **k))
         with torch.no_grad():
             out = idx(torch.randn(2, T, 64), rope(T), m, None)
-        assert torch.equal(out, m) and calls == []  # no per-query nonzero on the fast path
+        assert torch.equal(out, m) and calls == []
         # The compiler's generated copy lives outside transformers: never taken as the reference.
         def compiled_copy(self, *a, **k):
             return patch.qwen4_exp_qsa_indexer_forward(self, *a, **k)

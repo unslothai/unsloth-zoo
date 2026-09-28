@@ -1,11 +1,4 @@
-"""Qwen4Exp (Qwen3.8-Flash-Next) gated DeltaNet takes the vendored fla kernels even when its
-modeling module was imported before Unsloth.
-
-transformers >= 5.15 resolves fla once, when `@use_kernel_func_from_hub_with_fallback`
-decorates `torch_chunk_gated_delta_rule`. Imported after unsloth_zoo the closure binds the
-vendored kernel; imported before, it froze the pure-torch fallback (25.9 ms vs 3.7 ms fwd+bwd
-at B=1 T=512 H=48 D=128, 65 ms vs 2.0 ms at B=2 T=2048 on a B200) and
-_repair_kernel_hub_closures only re-resolved qwen3_5 / qwen3_5_moe / qwen3_next."""
+"""Qwen4Exp gets vendored fla kernels even when its modeling module is imported before Unsloth."""
 import os
 import subprocess
 import sys

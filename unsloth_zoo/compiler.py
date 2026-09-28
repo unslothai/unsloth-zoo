@@ -257,16 +257,12 @@ _INIT_ONLY_CALLERS = frozenset(("__init__", "__post_init__", "_init_weights", "p
 
 
 def function_only_called_at_init(module_source: str, name: str) -> bool:
-    """True when every call to ``name`` in ``module_source`` sits in an ``__init__``-time
-    method, directly or through other module-level helpers that are themselves only
-    called there. Such helpers build constructor buffers (Qwen4Exp's
-    ``_build_layer_multipliers`` makes a LongTensor from Python ints), often on the meta
-    device, so compiling them only fails at load. Unparseable source answers False."""
+    """True if ``name`` is only reached from ``__init__``-time methods (directly or via such
+    helpers): these build buffers on meta, so compiling them fails at load. False if unparseable."""
     try:
         tree = ast.parse(textwrap.dedent(module_source))
     except Exception:
         return False
-    # caller function name -> names it calls (methods keyed by their own name)
     callers_of = {}
     def visit(node, owner):
         for child in ast.iter_child_nodes(node):

@@ -1,9 +1,4 @@
-"""Module-level helpers that only build constructor buffers must not be compiled.
-
-Qwen4Exp's `_build_layer_multipliers(unigram_vocab_size, ngram_size, ple_layer_index, seed)`
-has unannotated arguments, so `function_has_tensor_inputs` cannot rule it out, and compiling
-it made `Qwen4ExpTextNGramEmbedding.__init__` fail under the meta device at load
-(Dynamo: "'NotImplementedType' object has no attribute 'detach_'" in torch.tensor)."""
+"""Init-only module helpers (Qwen4Exp `_build_layer_multipliers`) must not be compiled."""
 import importlib
 import inspect
 
@@ -45,7 +40,6 @@ def test_init_only_helpers_detected():
     assert not function_only_called_at_init(SOURCE, "_mix")
     assert not function_only_called_at_init(SOURCE, "rotate_half")
     assert not function_only_called_at_init(SOURCE, "used_in_forward")
-    # Never called in this source: unknown callers, keep compiling.
     assert not function_only_called_at_init(SOURCE, "missing_function")
     assert not function_only_called_at_init("not python (", "_mix")
 

@@ -1,9 +1,4 @@
-"""The device-map planner leaves a model's `_no_placement_params` owners out of the plan.
-
-Qwen4Exp (Qwen3.8-Flash-Next) declares its hashed n-gram table (~102 GB bf16 / ~51 GB FP8)
-unplaceable. Planned as part of its no-split decoder layer it needed a whole card, and the
-load placed a frozen lookup table on the GPU. Dropped from the META model, it is neither
-sized nor mapped, so the load keeps it on CPU."""
+"""The device-map planner leaves `_no_placement_params` owners out of the plan (on CPU)."""
 import pytest
 import torch
 from torch import nn

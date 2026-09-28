@@ -2449,12 +2449,8 @@ def _auto_class_for(config: Any, trust_remote_code: bool = False):
 
 
 def drop_no_placement_modules(model: nn.Module) -> list[str]:
-    """Take the modules owning ``model._no_placement_params`` out of a META model before
-    planning, so they are neither sized nor mapped: the load then leaves them on CPU with
-    no offload hook (transformers skips its device-map check for such models). Qwen4Exp
-    (Qwen3.8-Flash-Next) declares its 51B-parameter hashed n-gram table this way (~102 GB
-    bf16, ~51 GB FP8); planned as part of its decoder layer it needs a card of its own.
-    ``UNSLOTH_PLACE_NO_PLACEMENT_PARAMS=1`` keeps them in the plan. Returns the dropped paths."""
+    """Drop ``model._no_placement_params`` owners from a META model so the load keeps them on
+    CPU (e.g. Qwen4Exp's ~102 GB n-gram table). ``UNSLOTH_PLACE_NO_PLACEMENT_PARAMS=1`` opts out."""
     names = getattr(model, "_no_placement_params", None)
     if not names or os.environ.get("UNSLOTH_PLACE_NO_PLACEMENT_PARAMS", "0") == "1":
         return []
