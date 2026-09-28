@@ -603,6 +603,7 @@ class LoraStats:
     lora_B : torch.Tensor
     alpha  : float
     magnitude : object = None   # DoRA lora_magnitude_vector weight (None for plain LoRA)
+    parameter_name : object = None  # PEFT ParamWrapper target (MoE experts), e.g. "up_proj"
 pass
 
 
@@ -725,6 +726,7 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
 
         elif isinstance(module, Linear_LoRA_Layers):
             lora_weights[name].alpha = _get_lora_scaling(module)
+            lora_weights[name].parameter_name = getattr(module, "parameter_name", None)
             scaling_count += 1
             expand_module_keys(name, module, remove_keys)
 
@@ -735,6 +737,7 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
             (hasattr(module, "lora_A") or hasattr(module, "lora_B")) and \
             (hasattr(module, "active_adapters") or hasattr(module, "active_adapter")):
             lora_weights[name].alpha = _get_lora_scaling(module)
+            lora_weights[name].parameter_name = getattr(module, "parameter_name", None)
             scaling_count += 1
             expand_module_keys(name, module, remove_keys)
 
@@ -962,6 +965,7 @@ def _merge_and_overwrite_lora(
     length_of_header = 0
 
     try:
+        _ensure_shard_writable(filename_original)
         # Memory-map for in-place overwrite
         raw_pointer = open(filename_original, "r+b")
         mm = mmap.mmap(raw_pointer.fileno(), length = 0, access = mmap.ACCESS_WRITE)
@@ -1610,6 +1614,16 @@ def _merge_moe_gate_or_up_expert(W, lora_stats, expert_idx, num_experts, output_
             num_experts = num_experts, out_dim = 2 * I, in_dim = H,
             lora_module = getattr(lora_stats, "module", None),
         )
+        # Ungated experts (NemotronH) have an I-wide up LoRA; a fused 2 * I LoRA never matches this, so gated models are unaffected.
+        ungated = False
+        if layout == "unknown" and role == "up":
+            ungated_layout, ungated_r = _detect_moe_lora_layout(
+                lora_stats.lora_A, lora_stats.lora_B,
+                num_experts = num_experts, out_dim = I, in_dim = H,
+                lora_module = getattr(lora_stats, "module", None),
+            )
+            if ungated_layout != "unknown" and ungated_r > 0:
+                layout, r, ungated = ungated_layout, ungated_r, True
         if layout == "unknown" or r <= 0:
             _record_moe_merge_fallback(
                 role, expert_idx,
@@ -1635,13 +1649,13 @@ def _merge_moe_gate_or_up_expert(W, lora_stats, expert_idx, num_experts, output_
         b_f     = b_slice.to(device, dtype = torch.float32, non_blocking = True)
 
         if layout == "swapped":
-            half = a_f[:, :I] if role == "gate" else a_f[:, I:]
+            half = a_f if ungated else (a_f[:, :I] if role == "gate" else a_f[:, I:])
             delta = b_f @ half
             merged = W.to(device, dtype = torch.float32, non_blocking = True).add(
                 delta.transpose(0, 1), alpha = lora_stats.alpha,
             )
         else:
-            half = b_f[:I, :] if role == "gate" else b_f[I:, :]
+            half = b_f if ungated else (b_f[:I, :] if role == "gate" else b_f[I:, :])
             delta = half @ a_f
             merged = W.to(device, dtype = torch.float32, non_blocking = True).add(
                 delta, alpha = lora_stats.alpha,
@@ -1965,7 +1979,15 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
         shard_prefix = _moe_lora_to_shard_prefix.get(lora_key)
         if shard_prefix is None:
             continue
-        is_gate = lora_key.endswith(".base_layer")
+        # A lone expert LoRA sits on `experts` whatever it targets, so the wrapped parameter
+        # decides; by key alone an up_proj-only LoRA was merged into down_proj.
+        _param_name = getattr(lora_stats, "parameter_name", None)
+        if _param_name in ("gate_up_proj", "gate_proj", "up_proj"):
+            is_gate = True
+        elif _param_name == "down_proj":
+            is_gate = False
+        else:
+            is_gate = lora_key.endswith(".base_layer")
         prefix = shard_prefix
 
         # Handle GPT-OSS fused 3D tensor format
@@ -2641,8 +2663,8 @@ pass
 _FP8_WEIGHT_DTYPES = tuple(
     getattr(torch, _n) for _n in ("float8_e4m3fn", "float8_e5m2") if hasattr(torch, _n)
 )
-_FP8_SCALE_SUFFIXES = (".weight_scale_inv", ".weight_scale", ".input_scale",
-                       "_scale_inv", "_scale")
+_FP8_SCALE_SUFFIXES = (".weight_scale_inv", ".weight_scale", ".input_scale", ".activation_scale",
+                       "_input_scale", "_activation_scale", "_scale_inv", "_scale")
 # safetensors header dtype tags for FP8 weights (used to find genuine scale companions).
 _FP8_HEADER_DTYPES = ("F8_E4M3", "F8_E5M2")
 
@@ -2751,7 +2773,7 @@ pass
 def _fp8_scale_key_weight_bases(scale_key):
     """Candidate FP8 weight keys a companion scale belongs to (most specific suffix wins),
     used to drop a scale whose dequantized weight lives in another shard."""
-    for suffix in (".weight_scale_inv", ".weight_scale", ".input_scale", "_scale_inv", "_scale"):
+    for suffix in _FP8_SCALE_SUFFIXES:
         if scale_key.endswith(suffix):
             base = scale_key[: -len(suffix)]
             return (base + ".weight", base)  # .weight_* -> <base>.weight ; fused -> <base>
@@ -3472,6 +3494,108 @@ def is_hf_sharded_safetensors(filenames: list[str]) -> bool:
     prefixes, _, totals = zip(*parsed)
     return len(set(prefixes)) == 1 and len(set(totals)) == 1
 
+def _loaded_with_trust_remote_code(model):
+    return _find_load_marker(model, "_unsloth_trust_remote_code") is True
+pass
+
+
+def _find_load_marker(model, attr):
+    seen, queue = set(), [model]
+    while queue and len(seen) < 8:
+        node = queue.pop(0)
+        if node is None or id(node) in seen: continue
+        seen.add(id(node))
+        value = getattr(node, attr, None)
+        if value is not None and value is not False: return value
+        queue.extend(getattr(node, a, None) for a in ("base_model", "model"))
+    return None
+pass
+
+
+def _trusted_code_commit(model):
+    # Stamped marker first: under text_only the nested config carries no _commit_hash.
+    commit = _find_load_marker(model, "_unsloth_trust_remote_code_commit")
+    if commit is None:
+        commit = getattr(getattr(model, "config", None), "_commit_hash", None)
+    return commit if isinstance(commit, str) and commit else None
+pass
+
+
+def _is_export_source_loaded_repo(model_name, model):
+    loaded = getattr(getattr(model, "config", None), "_name_or_path", None)
+    if not isinstance(loaded, str) or not isinstance(model_name, str): return False
+    if os.path.isdir(model_name) or os.path.isdir(loaded):
+        try: return os.path.samefile(model_name, loaded)
+        except OSError: return False
+    return model_name == loaded
+pass
+
+
+def _read_export_base_config(model_name, token, model, source_is_loaded_repo = False):
+    # Repo code re-runs only for the exact repo (and Hub commit) the load trusted; siblings were never approved.
+    from transformers import AutoConfig
+    try:
+        return AutoConfig.from_pretrained(model_name, token = token, trust_remote_code = False)
+    except Exception:
+        if not (source_is_loaded_repo and _loaded_with_trust_remote_code(model)): raise
+        commit = None if os.path.isdir(model_name) else _trusted_code_commit(model)
+        if commit is None and not os.path.isdir(model_name): raise
+    # No code_revision: transformers pins code to `revision` only when it lives in this repo, not cross-repo auto_map.
+    return AutoConfig.from_pretrained(model_name, token = token, trust_remote_code = True, revision = commit)
+pass
+
+
+def _is_remote_code_config(config):
+    module = getattr(type(config), "__module__", None)
+    return isinstance(module, str) and module.startswith("transformers_modules")
+pass
+
+
+def _copy_remote_code_files(model_name, save_directory, token = None, revision = None):
+    os.makedirs(save_directory, exist_ok = True)
+    copied = []
+    if os.path.isdir(model_name):
+        for name in sorted(os.listdir(model_name)):
+            src = os.path.join(model_name, name)
+            if not name.endswith(".py") or not os.path.isfile(src): continue
+            dst = os.path.join(save_directory, name)
+            if os.path.exists(dst) and os.path.samefile(src, dst): continue
+            shutil.copyfile(src, dst)
+            copied.append(name)
+        return copied
+    from huggingface_hub import HfApi, hf_hub_download
+    for name in sorted(HfApi().list_repo_files(model_name, token = token, revision = revision)):
+        if not name.endswith(".py") or "/" in name: continue
+        path = hf_hub_download(model_name, name, token = token, revision = revision)
+        shutil.copyfile(path, os.path.join(save_directory, name))
+        copied.append(name)
+    return copied
+pass
+
+
+def _copy_export_remote_code(model_name, save_directory, token, model):
+    if not _is_export_source_loaded_repo(model_name, model):
+        warnings.warn(
+            f"Unsloth: `{model_name}` is not the repo the model was loaded from, so its repo code was not "
+            f"copied into the export. Copy the loaded repo's *.py files into `{save_directory}` before "
+            f"loading it with trust_remote_code=True."
+        )
+        return []
+    commit = None if os.path.isdir(model_name) else _trusted_code_commit(model)
+    if not os.path.isdir(model_name) and commit is None:
+        warnings.warn(
+            f"Unsloth: `{model_name}` was loaded without a recorded commit, so its repo code was "
+            f"not copied into the export. Copy the repo's *.py files at the revision you loaded "
+            f"into `{save_directory}` before loading it with trust_remote_code=True."
+        )
+        return []
+    copied = _copy_remote_code_files(model_name, save_directory, token = token, revision = commit)
+    if UNSLOTH_ENABLE_LOGGING:
+        logger.info(f"Unsloth: copied repo code {copied} from `{model_name}` into the export.")
+    return copied
+pass
+
+
 def _text_configs(config):
     # Where a composite config keeps its text vocab. `get_text_config()` also finds sections
     # not named `text_config` (qwen2_5_omni, t5gemma); it returns `config` itself for a plain LM.
@@ -3479,6 +3603,9 @@ def _text_configs(config):
     try: holders.append(config.get_text_config())
     except Exception: pass
     holders.append(getattr(config, "text_config", None))
+    # InternVL / Nemotron-Nano-VL.
+    holders.append(getattr(config, "llm_config", None))
+    holders.append(getattr(config, "language_config", None))
     seen = []
     for holder in holders:
         if holder is not None and not any(holder is s for s in seen): seen.append(holder)
@@ -3709,6 +3836,34 @@ def _materialize_shard_that_resolves_outside(file_path, save_directory):
         f"Unsloth: Copied {os.path.basename(file_path)} out of the link it pointed at, "
         f"so the merge does not write outside {save_directory}"
     )
+
+
+def _ensure_shard_writable(file_path):
+    """Make an output shard owner-writable for the in-place "r+b" merge (hf_hub 1.x blobs are 0444).
+
+    A hard-linked shard gets a private copy first so the write never mutates the cache blob.
+    """
+    st = os.stat(file_path)
+    mode = stat.S_IMODE(st.st_mode) | stat.S_IWUSR
+    if st.st_nlink > 1:
+        _fd, staging = tempfile.mkstemp(
+            dir = os.path.dirname(file_path) or os.curdir, prefix = ".unsloth-private-",
+        )
+        try:
+            with os.fdopen(_fd, "wb") as _staging_file, open(file_path, "rb") as _source:
+                shutil.copyfileobj(_source, _staging_file)
+            os.chmod(staging, mode)
+            os.replace(staging, file_path)
+        except BaseException:
+            if os.path.exists(staging):
+                try:
+                    os.remove(staging)
+                except OSError:
+                    pass
+            raise
+    elif not st.st_mode & stat.S_IWUSR:
+        os.chmod(file_path, mode)
+pass
 
 
 def _assert_shard_is_inside(file_path, save_directory):
@@ -3951,7 +4106,7 @@ def merge_and_overwrite_lora(
             if os.path.exists(tokenizer_model_path):
                 os.makedirs(save_directory, exist_ok=True)
                 # Copy from local
-                shutil.copy2(tokenizer_model_path, os.path.join(save_directory, "tokenizer.model"))
+                _copy_file_from_source(tokenizer_model_path, save_directory, "tokenizer.model")
                 print(f"Copied tokenizer.model from local model directory")
         else:
             # Original HF repo logic
@@ -4067,6 +4222,12 @@ def merge_and_overwrite_lora(
         break
     pass
 
+    # Read before Step 1 rewrites config.json: an in-place export would strip the block size.
+    _fp8_disk_block_size = (
+        _fp8_block_size_on_disk(model_name, token)
+        if base_model_is_quantized and quant_type == "fp8" and save_method == "merged_16bit" else None
+    )
+
     n_saved_modules = 0
     def upload_items(filename = None):
         extras = {"repo_id" : repo_id, "repo_type" : "model", "commit_message" : "(Trained with Unsloth)", }
@@ -4149,12 +4310,10 @@ def merge_and_overwrite_lora(
         # while the weights come from `model_name` and keep their VLM prefixes. Saving it wrote
         # a text-only config beside VLM weights and every tensor was silently re-initialized on
         # reload (#969). Take the config from the checkpoint the weights come from, as `mxfp4` does.
-        from transformers import AutoConfig
         try:
-            base_config = AutoConfig.from_pretrained(
-                model_name,
-                token = token,
-                trust_remote_code = False,
+            base_config = _read_export_base_config(
+                model_name, token, model,
+                source_is_loaded_repo = _is_export_source_loaded_repo(model_name, model),
             )
         except Exception as base_config_error:
             warnings.warn(
@@ -4166,6 +4325,8 @@ def merge_and_overwrite_lora(
         else:
             _carry_over_vocab_size(base_config, config)
         base_config.save_pretrained(save_directory)
+        if _is_remote_code_config(base_config):
+            _copy_export_remote_code(model_name, save_directory, token, model)
         _remove_quantization_config(config_path = Path(save_directory) / "config.json")
         _remove_transformers_version(config_path = Path(save_directory) / "config.json")
         # #5410: keep trained eos / sampling defaults on reload.
@@ -4420,6 +4581,9 @@ def merge_and_overwrite_lora(
                         break
             if isinstance(_wbs, (list, tuple)) and len(_wbs) == 2:
                 _merge_weight_block_size = tuple(int(x) for x in _wbs)
+        if _merge_weight_block_size is None:
+            # A 4bit load holds a bitsandbytes config in memory.
+            _merge_weight_block_size = _fp8_disk_block_size
     # Gated archs + 16bit merge only: fold each LoRA delta onto dequant(W4) instead of W16
     # (see _merge_lora). Strict no-op for every other model/merge.
     _use_dequant_base = (
@@ -4733,9 +4897,22 @@ def _copy_file_from_source(src_path: Union[str, Path], target_dir_str: str, file
     if not os.access(src_path, os.R_OK):
          raise PermissionError(f"No read permission for source file: {src_path}")
     # Target dir creation and permission check is handled by caller (_try_copy_all_from_cache)
+    # copy2 onto an existing read-only dst fails, so stage + os.replace; add owner-write for in-place writers.
+    _staging = None
     try:
-        shutil.copy2(str(src_path), dst_path) # Use string paths for shutil
+        _fd, _staging = tempfile.mkstemp(
+            dir = os.path.dirname(dst_path) or os.curdir, prefix = ".unsloth-copy-",
+        )
+        os.close(_fd)
+        shutil.copy2(str(src_path), _staging) # Use string paths for shutil
+        os.chmod(_staging, stat.S_IMODE(os.stat(_staging).st_mode) | stat.S_IWUSR)
+        os.replace(_staging, dst_path)
     except Exception as e:
+        if _staging is not None and os.path.exists(_staging):
+            try:
+                os.remove(_staging)
+            except OSError:
+                pass
         raise IOError(f"Failed to copy {src_path} to {dst_path}: {e}") from e
 pass
 
@@ -6524,6 +6701,39 @@ def _load_quant_config_or_raise(config_path, model_name_or_path):
             f"full rewrite, whatever save_method you asked for. Repair or remove "
             f"config.json (or re-download the base) and retry."
         ) from e
+pass
+
+def _fp8_block_size_on_disk(model_name_or_path, token = None):
+    """(rows, cols) fp8 block from the base config.json, else None; the scale-grid guess is wrong for ragged dims."""
+    try:
+        is_quantized, quant_type = check_model_quantization_status(model_name_or_path, token)
+    except Exception:
+        return None
+    if not is_quantized or quant_type != "fp8":
+        return None
+    config = None
+    try:
+        if os.path.isdir(str(model_name_or_path)):
+            config = _load_quant_config_or_raise(
+                os.path.join(model_name_or_path, "config.json"), model_name_or_path
+            )
+        else:
+            from huggingface_hub import hf_hub_download
+            repo_id, revision = _hub_repo_and_revision(model_name_or_path)
+            config = _load_quant_config_or_raise(
+                hf_hub_download(repo_id = repo_id, filename = "config.json", token = token, revision = revision),
+                model_name_or_path,
+            )
+    except Exception:
+        return None
+    quant = (config or {}).get("quantization_config") or {}
+    block = quant.get("weight_block_size") if isinstance(quant, dict) else None
+    if isinstance(block, (list, tuple)) and len(block) == 2:
+        try:
+            return tuple(int(x) for x in block)
+        except (TypeError, ValueError):
+            return None
+    return None
 pass
 
 def check_model_quantization_status(model_name_or_path, token=None, local_ok=True):

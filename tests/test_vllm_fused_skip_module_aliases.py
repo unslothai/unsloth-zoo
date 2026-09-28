@@ -341,14 +341,28 @@ def _skip_lists(tree):
     return {"leaf": leaf, "parent": parent}
 
 
+def _should_convert_module():
+    """Transformers' own quantize-or-skip predicate, or a skip where this release has none.
+
+    The module is older than the function: transformers 4.57.6 ships
+    `quantizers.quantizers_utils` without `should_convert_module`, so an importorskip on the
+    module alone gets past the guard and fails on the attribute instead of skipping.
+    """
+    utils = pytest.importorskip(
+        "transformers.quantizers.quantizers_utils",
+        reason = "needs a transformers exposing should_convert_module",
+    )
+    function = getattr(utils, "should_convert_module", None)
+    if function is None:
+        pytest.skip("this transformers has quantizers_utils but no should_convert_module")
+    return function
+
+
 @pytest.mark.parametrize("arch", sorted(MODULE_TREES))
 @pytest.mark.parametrize("shape", ["leaf", "parent"])
 def test_aliases_do_not_widen_the_transformers_skip_set(arch, shape):
     """No alias may change whether Transformers quantizes a real Linear."""
-    should_convert_module = pytest.importorskip(
-        "transformers.quantizers.quantizers_utils",
-        reason = "needs a transformers exposing should_convert_module",
-    ).should_convert_module
+    should_convert_module = _should_convert_module()
     from unsloth_zoo.saving_utils import vllm_compatible_skip_modules
 
     tree = MODULE_TREES[arch]
@@ -375,10 +389,7 @@ def test_aliases_do_not_widen_the_transformers_skip_set(arch, shape):
 def test_the_guard_is_what_keeps_the_adversarial_tower_safe():
     """Without the live tree the `model.` alias does reach the tower, which is
     why the merge writer supplies it."""
-    should_convert_module = pytest.importorskip(
-        "transformers.quantizers.quantizers_utils",
-        reason = "needs a transformers exposing should_convert_module",
-    ).should_convert_module
+    should_convert_module = _should_convert_module()
     from unsloth_zoo.saving_utils import vllm_compatible_skip_modules
 
     tree = MODULE_TREES["adversarial_suffix"]
@@ -401,10 +412,7 @@ def test_the_guard_is_what_keeps_the_adversarial_tower_safe():
 
 def test_the_widening_probe_can_actually_detect_widening():
     """Guard the guard: a deliberately over-broad entry must trip the assertion."""
-    should_convert_module = pytest.importorskip(
-        "transformers.quantizers.quantizers_utils",
-        reason = "needs a transformers exposing should_convert_module",
-    ).should_convert_module
+    should_convert_module = _should_convert_module()
 
     tree = MODULE_TREES["adversarial_suffix"]
     skip = _skip_lists(tree)["leaf"]

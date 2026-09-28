@@ -22,7 +22,7 @@ import torch.nn as nn
 import os
 import math
 from importlib.metadata import version as importlib_version
-from unsloth_zoo.utils import Version
+from unsloth_zoo.utils import Version, device_guard as _device_guard
 from .common import TEMPORARY_PATCHES, UNSLOTH_ENABLE_LOGGING, logger
 from .utils import patch_function, raise_error
 
@@ -130,22 +130,23 @@ def patch_convert_moe_packed_tensors():
 
         out = torch.empty(rows_total, B * 2, dtype=dtype, device=blocks.device)
 
-        for r0 in range(0, rows_total, rows_per_chunk):
-            r1 = min(r0 + rows_per_chunk, rows_total)
+        with _device_guard(blocks):
+            for r0 in range(0, rows_total, rows_per_chunk):
+                r1 = min(r0 + rows_per_chunk, rows_total)
 
-            blk = blocks[r0:r1]
-            exp = scales[r0:r1]
+                blk = blocks[r0:r1]
+                exp = scales[r0:r1]
 
-            # nibble indices -> int64
-            idx_lo = (blk & 0x0F).to(torch.long)
-            idx_hi = (blk >> 4).to(torch.long)
+                # nibble indices -> int64
+                idx_lo = (blk & 0x0F).to(torch.long)
+                idx_hi = (blk >> 4).to(torch.long)
 
-            sub = out[r0:r1]
-            sub[:, 0::2] = lut[idx_lo]
-            sub[:, 1::2] = lut[idx_hi]
+                sub = out[r0:r1]
+                sub[:, 0::2] = lut[idx_lo]
+                sub[:, 1::2] = lut[idx_hi]
 
-            torch.ldexp(sub, exp, out=sub)
-            del idx_lo, idx_hi, blk, exp, sub
+                torch.ldexp(sub, exp, out=sub)
+                del idx_lo, idx_hi, blk, exp, sub
 
         out = out.reshape(*prefix_shape, G, B * 2).view(*prefix_shape, G * B * 2)
         del blocks, scales, lut

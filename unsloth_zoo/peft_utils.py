@@ -41,15 +41,57 @@ MOE_ROUTER_MODULES = frozenset((
     "router",
 ))
 
+# Mirrors PEFT's _check_lora_target_modules_mamba in peft/tuners/tuners_utils.py.
+MAMBA_MODEL_TYPES = frozenset(("falcon_h1", "mamba", "mamba2", "falcon_mamba", "nemotron_h"))
+MAMBA_ONLY_LEAVES = frozenset(("out_proj", "conv1d"))
+# Mamba, Mamba2, Nemotron-H name the mixer `mixer`; Falcon-H1, Bamba, Zamba2 `mamba`.
+MAMBA_MIXER_NAMES = ("mixer", "mamba")
+
+
+def _mamba_scope(model):
+    """Return "root" (model is a Mamba family), "nested" (in a sub-config) or None."""
+    config = getattr(model, "config", None)
+    if config is None:
+        return None
+    if str(getattr(config, "model_type", "") or "").lower() in MAMBA_MODEL_TYPES:
+        return "root"
+    seen, stack = set(), [config]
+    while stack:
+        cfg = stack.pop()
+        if id(cfg) in seen or cfg is None:
+            continue
+        seen.add(id(cfg))
+        model_type = str(getattr(cfg, "model_type", "") or "").lower()
+        if model_type in MAMBA_MODEL_TYPES:
+            return "nested"
+        for value in list(vars(cfg).values()) if hasattr(cfg, "__dict__") else []:
+            if hasattr(value, "model_type") and not isinstance(value, (str, int, float, bool)):
+                stack.append(value)
+    return None
+
+
+def _mamba_only_leaves(model):
+    return MAMBA_ONLY_LEAVES if _mamba_scope(model) else frozenset()
+
+
+def _mamba_subtree_exclusion(leaves):
+    return (
+        r"(?!.*\.(?:" + "|".join(MAMBA_MIXER_NAMES) + r")\.(?:"
+        + "|".join(re.escape(x) for x in sorted(leaves)) + r")$)"
+    )
+
+
 # Skip some modules sensitive to quantization
 SKIP_QUANTIZATION_MODULES = [
     "lm_head",
     "multi_modal_projector",    # Llama 3.2 Vision, Pixtral, Llava
     "merger",                   # Qwen2 VL
     "modality_projection",      # Idefics, SmolVLM
+    "mm_projector",             # Kimi K2.5 / K2.7, LLaVA-style remote code
     "router",                   # MoE Router
     "mlp.gate",                 # MoE Router
     "block_sparse_moe.gate",    # MoE Router
+    "moe.gate",                 # MoE Router (Step-3.7 reads its weight directly)
     'mamba',
     "audio_tower",              # Gemma3N audio encoder conformer
     "vision_tower",             # Gemma3 vision encoder (SigLIP)
@@ -60,6 +102,30 @@ SKIP_QUANTIZATION_MODULES = [
     "classifier",               # *ForTokenClassification, *ForImageClassification, BERT-family head
     "qa_outputs",               # *ForQuestionAnswering head
 ]
+
+_LINEAR_FORWARD_RETURNS_TENSOR_CACHE = {}
+
+def _linear_forward_returns_tensor(cls) -> bool:
+    """False for an nn.Linear subclass whose forward returns a tuple, which LoRA cannot add to."""
+    cached = _LINEAR_FORWARD_RETURNS_TENSOR_CACHE.get(cls)
+    if cached is not None:
+        return cached
+    result = True
+    forward = getattr(cls, "forward", None)
+    if forward is not None and forward is not torch.nn.Linear.forward:
+        try:
+            import ast, textwrap
+            tree = ast.parse(textwrap.dedent(inspect.getsource(forward)))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Return) and isinstance(node.value, ast.Tuple):
+                    result = False
+                    break
+        except Exception:
+            result = True
+    _LINEAR_FORWARD_RETURNS_TENSOR_CACHE[cls] = result
+    return result
+pass
+
 
 def get_peft_regex(
     model,
@@ -90,7 +156,10 @@ def get_peft_regex(
 
     from collections import Counter
     modules = model.named_modules()
-    linear_modules = [name for name, module in modules if isinstance(module, torch.nn.Linear)]
+    linear_modules = [
+        name for name, module in modules
+        if isinstance(module, torch.nn.Linear) and _linear_forward_returns_tensor(type(module))
+    ]
 
     # Gemma4 ClippableLinear wraps nn.Linear as .linear child -- detect and add those
     try:
@@ -102,6 +171,9 @@ def get_peft_regex(
         pass
 
     all_linear_modules = Counter(x.rsplit(".")[-1] for x in linear_modules)
+    _in_layer_stack = frozenset(
+        x.rsplit(".")[-1] for x in linear_modules if re.search(r"\.\d+\.", x)
+    )
 
     # Isolate lm_head / projection matrices (count == 1)
     if target_modules is None:
@@ -112,7 +184,8 @@ def get_peft_regex(
                 # Llama 4's and PhiMoE's routers return a tuple, so PEFT's LoRA
                 # forward reads `result.dtype` off one and the model cannot run.
                 continue
-            if count != 1:
+            # Seen once = a head (lm_head), unless inside a numbered layer stack (one layer of a kind).
+            if count != 1 or proj in _in_layer_stack:
                 only_linear_modules.append(proj)
             else:
                 projection_modules[proj] = j
@@ -120,6 +193,26 @@ def get_peft_regex(
     else:
         assert(type(target_modules) is list)
         only_linear_modules = list(target_modules)
+    pass
+
+    # Mamba fused kernels read out_proj / conv1d weights directly (LoRA never runs) and PEFT >= 0.17 refuses them.
+    mamba_nested_exclusion = None
+    if target_modules is None:
+        mamba_scope = _mamba_scope(model)
+        mamba_leaves = MAMBA_ONLY_LEAVES if mamba_scope else frozenset()
+        if mamba_leaves:
+            dropped = [x for x in only_linear_modules if x in mamba_leaves]
+            if mamba_scope == "root":
+                only_linear_modules = [x for x in only_linear_modules if x not in mamba_leaves]
+            elif dropped:
+                # Only the Mamba subtree: a vision/audio tower's own out_proj stays a target.
+                mamba_nested_exclusion = _mamba_subtree_exclusion(mamba_leaves)
+            if dropped:
+                logger.info(
+                    f"Unsloth: leaving {', '.join(dropped)} out of the LoRA targets"
+                    + (" of the Mamba mixers" if mamba_scope == "nested" else "")
+                    + ": a Mamba mixer feeds them to its fused kernels, so an adapter on them would not train."
+                )
     pass
 
     regex_model_parts = []
@@ -137,6 +230,7 @@ def get_peft_regex(
     # "...attn.proj_drop" (a Dropout) match ("proj" + ".*?" eating "_drop") -> "Target module
     # Dropout is not supported". LoRA targets are leaf Linears whose names ARE the group entries,
     # so ending at the group keeps every real target and drops same-prefix non-linear modules.
+    # "." anchors whole leaf names: bare "proj" matched Nemotron-H's Identity fc1_latent_proj (PEFT rejects it).
     if regex_model_parts == "":
         # No vision/language model-part selected (e.g. audio-only finetuning):
         # the standard matcher would degenerate into matching every attention/mlp
@@ -147,13 +241,18 @@ def get_peft_regex(
         regex_matcher = \
             r".*?(?:"  + regex_model_parts + \
             r").*?(?:" + regex_components + \
-            r").*?"    + match_linear_modules
+            r").*?\."  + match_linear_modules
 
         # Also account for model.layers.0.self_attn/mlp type modules like Qwen
         if finetune_language_layers:
+            # Same shape as the composite branch, so text-only loads reach nested leaves
+            # (mlp.shared_expert.up_proj) and tag-containing components (linear_attn.*).
+            # Routed experts (mlp.experts.<N>.up_proj) stay out, as before: unsloth widens
+            # remote expert blocks to them itself and keeps native ones (Qwen3-MoE on
+            # transformers 4.x) off LoRA on every routed expert.
             regex_matcher = r"(?:" + regex_matcher + \
-            r")|(?:\bmodel\.layers\.[\d]{1,}\.(?:" + regex_components + \
-            r")\.(?:" + match_linear_modules + r"))"
+            r")|(?:\bmodel\.layers\.[\d]{1,}(?!.*\.experts\.\d)\..*?(?:" + regex_components + \
+            r").*?\.(?:" + match_linear_modules + r"))"
         pass
     pass
 
@@ -227,6 +326,20 @@ def get_peft_regex(
         if finetune_mlp_modules and _scoped(["embedding_projection"]):
             audio_cores.append(r"\bembed_audio\.embedding_projection")
         candidate_branches += _linear_aware_branches(audio_cores)
+    # Voxtral (Whisper-style) / Voxtral Realtime (Mistral-style) audio_tower + projector carry no language tag.
+    _is_voxtral = _model_type.startswith("voxtral") or "voxtral" in _architectures
+    if finetune_audio_layers and _is_voxtral:
+        audio_leaves = []
+        if finetune_attention_modules:
+            audio_leaves += ["q_proj", "k_proj", "v_proj", "out_proj", "o_proj"]
+        if finetune_mlp_modules:
+            audio_leaves += ["fc1", "fc2", "gate_proj", "up_proj", "down_proj"]
+        audio_leaves = _scoped(audio_leaves)
+        audio_cores = [r"\baudio_tower\.(?:.*\.)?" + re.escape(x) for x in audio_leaves]
+        if finetune_mlp_modules:
+            audio_cores += [r"\bmulti_modal_projector\." + re.escape(x)
+                            for x in _scoped(["linear_1", "linear_2"])]
+        candidate_branches += _linear_aware_branches(audio_cores)
     if finetune_vision_layers and finetune_mlp_modules and _is_gemma_mm:
         # The Gemma vision embedders are flat projection / dense Linears -> like the
         # audio projector, gate them under the mlp flag (attention-only stays clean).
@@ -255,7 +368,25 @@ def get_peft_regex(
         if not check:
             regex_matcher = \
                 r".*?(?:" + regex_components + \
-                r").*?"   + match_linear_modules
+                r").*?\." + match_linear_modules
+    pass
+
+    # Exclude parameter-free leaves by exact name only (Nemotron-H's Identity fc1_latent_proj is a Linear elsewhere).
+    placeholders = [
+        name for name, module in model.named_modules()
+        if name
+        and next(module.parameters(recurse = False), None) is None
+        and next(module.children(), None) is None
+        and re.fullmatch(regex_matcher, name, flags = re.DOTALL)
+    ]
+    if placeholders:
+        logger.info(
+            f"Unsloth: leaving {len(placeholders)} parameter-free placeholder module(s) out of "
+            f"the LoRA targets, e.g. {placeholders[0]}"
+        )
+        regex_matcher = (
+            r"(?!(?:" + "|".join(re.escape(x) for x in placeholders) + r")$)(?:" + regex_matcher + r")"
+        )
     pass
 
     # Final check to confirm if matches exist
@@ -269,6 +400,8 @@ def get_peft_regex(
             f"Unsloth: No layers to finetune for {model.config._name_or_path}. Please file a bug report!"
         )
     pass
+    if mamba_nested_exclusion is not None:
+        regex_matcher = mamba_nested_exclusion + r"(?:" + regex_matcher + r")"
     return regex_matcher
 pass
 
@@ -445,6 +578,9 @@ def requires_grad_for_gradient_checkpointing(model):
                         break
                     elif re.search(r"for [^\s]{3,} in self\." + module_list, forward) is not None:
                         # Might have failed finding self.layers: like self.layers[...]:
+                        final_where = j
+                        break
+                    elif re.search(r"for [^\n:]+ in enumerate\(self\." + module_list + r"\b", forward) is not None:
                         final_where = j
                         break
                     pass

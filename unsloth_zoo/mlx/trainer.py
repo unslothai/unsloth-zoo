@@ -545,6 +545,7 @@ def _mlx_declared_iterable_length(dataset):
 
 from .utils import (
     _config_get,
+    _validate_output_token_mask,
     _model_carries_audio_modules,
     _vlm_batch_carries_audio,
     audio_merge_patch_needed,
@@ -569,6 +570,7 @@ from .utils import (
     _MLXIterableTokenizedDatasetView,
     create_vlm_batches,
     _create_vlm_batch_plan,
+    _vlm_batch_family,
     _vlm_family_is_plannable,
     FiniteVLMBatchPlan,
     _compact_vlm_cce_batch,
@@ -620,6 +622,7 @@ from .preference import (
     make_orpo_loss_fn,
     make_orpo_cce_loss_fn,
     make_preference_eval_fn,
+    precompute_reference_logps,
     resolve_preference_objective,
     resolve_preference_length_policy,
 )
@@ -637,9 +640,16 @@ from .shape_guard import (
     AUTOMATIC_TEXT_COMPILE_CEILING,
     DDP_LOCAL_GRAD_SCOPE,
     FULL_STEP_SCOPE,
+    STREAM_GRID_FLOOR_WIDTH,
+    STREAM_GRID_RATIO,
+    StreamShapeGrid,
+    StreamShapeGuardReport,
     TextShapeEvent,
     TextShapeGuardReport,
     build_text_shape_frontier,
+    describe_stream_shape_grid,
+    stream_exact_ceiling,
+    stream_phase_count,
     materialize_text_shape_frontier,
     phase_for_microstep,
     plan_text_shape_buckets,
@@ -917,8 +927,9 @@ def _clip_grad_by_leaf_norm(grad, max_grad_leaf_norm):
     def _clip_leaf_norm(g):
         g_f = g.astype(mx.float32)
         norm = mx.sqrt(mx.sum(g_f * g_f))
-        scale = mx.minimum(max_grad_leaf_norm / (norm + 1e-6), 1.0)
-        return g * scale.astype(g.dtype)
+        scale = mx.minimum(max_grad_leaf_norm / (norm + 1e-6), mx.array(1.0, dtype=mx.float32))
+        # fp16 scale can underflow though the clipped gradient is representable.
+        return (g_f * scale).astype(g.dtype)
 
     return tree_map(_clip_leaf_norm, grad)
 
@@ -1000,7 +1011,7 @@ def _clip_grad_norm_fp32(grad, max_norm):
         ),
         mx.array(1.0, dtype=mx.float32),
     )
-    return tree_map(lambda g: g * scale.astype(g.dtype), grad), total_norm
+    return tree_map(lambda g: (g.astype(mx.float32) * scale).astype(g.dtype), grad), total_norm
 
 
 def _validate_label_smoothing(value, is_vlm):
@@ -1346,6 +1357,14 @@ class MLXTrainingConfig:
             "loss_type",
             "loss_weights",
             "discopop_tau",
+            "model_adapter_name",
+            "ref_adapter_name",
+            "force_use_ref_model",
+            "sync_ref_model",
+            "ref_model_mixup_alpha",
+            "ref_model_sync_steps",
+            "precompute_ref_log_probs",
+            "precompute_ref_batch_size",
         }
         _field_names = {field.name for field in config_fields}
         copied_all_fields = (_field_names - _appended_fields) <= set(provided)
@@ -1438,6 +1457,15 @@ class MLXDPOConfig(MLXTrainingConfig):
     loss_type: str | list[str] = field(default="sigmoid", kw_only=True)
     loss_weights: list[float] | None = field(default=None, kw_only=True)
     discopop_tau: float = field(default=0.05, kw_only=True)
+    # ref_adapter_name is a saved adapter directory: an MLX model has one unnamed adapter set.
+    model_adapter_name: str | None = field(default=None, kw_only=True)
+    ref_adapter_name: str | None = field(default=None, kw_only=True)
+    force_use_ref_model: bool = field(default=False, kw_only=True)
+    sync_ref_model: bool = field(default=False, kw_only=True)
+    ref_model_mixup_alpha: float = field(default=0.6, kw_only=True)
+    ref_model_sync_steps: int = field(default=512, kw_only=True)
+    precompute_ref_log_probs: bool = field(default=False, kw_only=True)
+    precompute_ref_batch_size: int | None = field(default=None, kw_only=True)
     disable_dropout: bool = field(default=True, kw_only=True)
     max_length: int | None = field(default=1024, kw_only=True)
     max_prompt_length: int | None = field(default=512, kw_only=True)
@@ -1589,6 +1617,123 @@ def _effective_compile_mode(compile_policy, compile_decision):
     """
     mode = getattr(compile_decision, "policy_mode", None)
     return mode if mode else compile_policy.mode
+
+
+class _StreamWidthPolicy:
+    """Grid width policy consulted per batch; returns None while disarmed or holding.
+
+    Created disarmed (staging is wired before the compile decision) and armed
+    in place later, so a running prefetch thread sees it. Prefetch finalizers
+    select on the policy's presence, not ``armed``: their body runs before arming.
+    """
+
+    __slots__ = ("grid", "armed", "exact_ceiling", "observed", "gate_released")
+
+    def __init__(self, grid):
+        self.grid = grid
+        self.armed = False
+        self.exact_ceiling = None
+        self.observed = None
+        self.gate_released = False
+
+    def arm(self, registry, phases_per_endpoint=1, in_flight=0):
+        self.observed = registry.observed
+        self.exact_ceiling = stream_exact_ceiling(
+            self.grid, registry.cap, phases_per_endpoint, in_flight,
+        )
+        self.armed = True
+
+    @property
+    def holding(self):
+        """True while the exact allowance still applies."""
+        return (
+            self.armed
+            and self.exact_ceiling is not None
+            and self.observed is not None
+            and len(self.observed) <= self.exact_ceiling
+        )
+
+    def __call__(self, width):
+        if not self.armed or self.holding:
+            return None
+        self.gate_released = True
+        return self.grid.endpoint_for(width)
+
+
+def _stream_execution_key():
+    """Default device/stream pair the next compiled call keys on."""
+    try:
+        device = mx.default_device()
+        return (str(device), str(mx.default_stream(device)))
+    except (AttributeError, NotImplementedError):
+        return ("default", "default")
+
+
+def _stream_batch_signature(batch_data, phase, execution_key):
+    """Conservative (finer than true) compile key for a streamed batch."""
+    if isinstance(batch_data, dict):
+        # Uncertifiable families may span several cache keys; never count them as one.
+        family = _vlm_batch_family(batch_data)
+        if not _vlm_family_is_plannable(family):
+            return None, family
+        return (phase, family, execution_key)
+    leaves = []
+    values = batch_data if isinstance(batch_data, (tuple, list)) else (batch_data,)
+    for value in values:
+        shape = getattr(value, "shape", None)
+        if shape is None:
+            leaves.append(repr(type(value)))
+        else:
+            leaves.append((tuple(int(extent) for extent in shape), str(value.dtype)))
+    return (phase, tuple(leaves), execution_key)
+
+
+class _StreamSignatureRegistry:
+    """Compiled signatures one streaming run has paid for; the cap binds on these."""
+
+    __slots__ = (
+        "cap", "observed", "tripped", "trip_reason", "uncertified",
+        "uncertified_family",
+    )
+
+    def __init__(self, cap):
+        self.cap = int(cap)
+        self.observed = set()
+        self.tripped = False
+        self.trip_reason = ""
+        self.uncertified = 0
+        self.uncertified_family = ""
+
+    def would_trip(self, key):
+        return key not in self.observed and len(self.observed) >= self.cap
+
+    def record(self, key):
+        self.observed.add(key)
+
+    def trip(self, reason):
+        self.tripped = True
+        self.trip_reason = reason
+
+
+def _stream_guard_report(policy, registry, compile_scope):
+    """Final streaming-guard telemetry, built once the counts are settled."""
+    grid = policy.grid
+    return StreamShapeGuardReport(
+        # Keyed on the policy's release, not per-batch widths.
+        action="stream_grid" if policy.gate_released else "stream_exact",
+        reason="streaming",
+        cap=registry.cap,
+        compile_scope=compile_scope,
+        grid_ratio=str(STREAM_GRID_RATIO),
+        grid_floor=STREAM_GRID_FLOOR_WIDTH,
+        grid_anchor=grid.anchor,
+        grid_endpoints=grid.endpoint_count,
+        observed_signatures=len(registry.observed),
+        tripped=registry.tripped,
+        trip_reason=registry.trip_reason,
+        exact_ceiling=policy.exact_ceiling,
+        gate_released=policy.gate_released,
+    )
 
 
 def _plan_single_process_vlm_shapes(
@@ -2068,6 +2213,23 @@ class MLXTrainer:
             )
             self._resolved_preference_length_policy = policy
         return policy
+
+    def _build_dpo_reference(self, model, *, resume_provenance):
+        args = self.args
+        return build_reference_policy(
+            model,
+            reference_free=bool(args.reference_free),
+            resume_provenance=resume_provenance,
+            neftune=(
+                [self._neftune_emb]
+                if getattr(self, "_neftune_emb", None) is not None else []
+            ),
+            ref_adapter_name=getattr(args, "ref_adapter_name", None),
+            model_adapter_name=getattr(args, "model_adapter_name", None),
+            ref_model=getattr(self, "ref_model", None),
+            force_use_ref_model=bool(getattr(args, "force_use_ref_model", False)),
+            sync_ref_model=bool(getattr(args, "sync_ref_model", False)),
+        )
 
     def __init__(
         self,
@@ -2711,6 +2873,49 @@ class MLXTrainer:
             context,
             exc,
         )
+
+    def _admit_stream_batch(self, registry, batch_data, compile_scope,
+                            grad_accum, microstep, world_size):
+        """True = go eager for the run, ``"eager_batch"`` = this batch only.
+
+        One all-max per fetch (2 failed > 1 trip > 0), even for ``batch_data=None``,
+        so every rank switches together: a lone eager rank cannot replay a step's RNG.
+        """
+        key = None
+        uncertifiable = False
+        error = None
+        try:
+            if batch_data is not None:
+                key = _stream_batch_signature(
+                    batch_data,
+                    phase_for_microstep(compile_scope, grad_accum, microstep),
+                    _stream_execution_key(),
+                )
+                if isinstance(key, tuple) and key and key[0] is None:
+                    registry.uncertified_family = repr(key[1])
+                    key = None
+                uncertifiable = key is None
+        except BaseException as exc:
+            error = exc
+        signal = 2 if error is not None else (
+            1 if key is not None and registry.would_trip(key) else 0
+        )
+        if world_size > 1:
+            signal = self._distributed_max_int(signal)
+            if signal >= 2:
+                self._raise_distributed_failure_from_any(
+                    True, "admitting a streaming batch shape", error,
+                )
+        elif error is not None:
+            raise error
+        if signal == 1:
+            return True
+        if key is not None:
+            registry.record(key)
+        elif uncertifiable:
+            registry.uncertified += 1
+            return "eager_batch"
+        return False
 
     def _distributed_sum_gradient_tree(self, grad):
         """All-sum a gradient tree while preserving MLX's grouped all-reduce."""
@@ -3681,10 +3886,12 @@ class MLXTrainer:
                 opt_name = "adamw"
 
         if opt_name == "adafactor":
+            self._manual_weight_decay = float(wd or 0.0)
             optimizer = optim.Adafactor(
                 learning_rate=initial_lr,
                 relative_step=False,
                 scale_parameter=False,
+                weight_decay=0.0,
             )
         elif opt_name == "adamw":
             # Match HF/PyTorch AdamW semantics. MLX defaults bias_correction
@@ -3772,11 +3979,9 @@ class MLXTrainer:
     def _apply_manual_weight_decay(self, model, optimizer, grad):
         """Decoupled HF-parity decay on trainable non-bias/non-norm leaves.
 
-        Active for AdamW, Muon, and Lion. The underlying MLX optimizer is
-        constructed with ``weight_decay=0.0`` so this helper owns the full
-        update for the weight-decay term and matches what HF Trainer does
-        via ``param_groups``. SGD uses coupled decay instead (see
-        ``_apply_coupled_weight_decay``).
+        AdamW, Adafactor, Muon and Lion are built with ``weight_decay=0.0`` so
+        this owns the decay term, as HF does via ``param_groups``. SGD uses
+        coupled decay instead (``_apply_coupled_weight_decay``).
         """
         wd = float(getattr(self, "_manual_weight_decay", 0.0) or 0.0)
         if wd <= 0:
@@ -4435,7 +4640,7 @@ class MLXTrainer:
                 return out
 
         # Report the base class's name so the save-window DoRA detection
-        # (`type(module).__name__.startswith("DoRA")` in mlx/utils.py) sees
+        # (`is_mlx_dora_module` in mlx/utils.py) sees
         # through this transparent stand-in. An embedding-only DoRA adapter
         # (use_dora=True targets embed_tokens) is what NEFTune subclasses here,
         # so a bare "_NEFTuneEmbed" name would fail that check and silently
@@ -4565,6 +4770,7 @@ class MLXTrainer:
         args = self.args
         model = self.model
         self._text_shape_guard_preflight = None
+        _validate_output_token_mask(model)
         if (
             hasattr(self, "_batches")
             and not getattr(self, "_is_vlm", False)
@@ -4679,6 +4885,12 @@ class MLXTrainer:
         try:
             from .loader import _keep_norm_parameters_float32
             _keep_norm_parameters_float32(model)
+            _reference_model = (
+                None if bool(getattr(args, "reference_free", False))
+                else getattr(self, "ref_model", None)
+            )
+            if _reference_model is not None:
+                _keep_norm_parameters_float32(_reference_model)
             _set_norm_output_cast_to_input_dtype(cast_norm_output, model)
             if cast_norm_output:
                 _main_print("Unsloth: Casting MLX norm outputs back to activation dtype.")
@@ -4968,6 +5180,10 @@ class MLXTrainer:
             # Full fine-tuning updates projections a fusion cached once.
             from .loader import _disable_fused_input_projections
             _unfused_projection_modules = _disable_fused_input_projections(model)
+            if _reference_model is not None:
+                _unfused_projection_modules += _disable_fused_input_projections(
+                    _reference_model,
+                )
             # Qwen2/2.5/3-VL language towers share the fused MRoPE kernel with
             # no VJP; flip it off so training takes the differentiable fallback.
             if any(t in model_type for t in ("qwen3_vl", "qwen2_vl", "qwen2_5_vl")):
@@ -5112,7 +5328,12 @@ class MLXTrainer:
             if use_cce:
                 loss_fn = make_cce_loss_fn(model, label_smoothing=label_smoothing)
                 cce_backend = getattr(loss_fn, "_unsloth_cce_backend", "unknown")
-                if cce_backend == "baseline-fallback":
+                if hasattr(loss_fn, "_unsloth_compiled_loss_fn"):
+                    _main_print(
+                        "Unsloth: LoRA head CCE is available for compiled steps; "
+                        "eager steps use standard cross-entropy."
+                    )
+                elif cce_backend == "baseline-fallback":
                     use_cce = False
                     # The factory already printed the specific reason (topology,
                     # head eligibility, or logit transform); keep this generic.
@@ -5331,6 +5552,13 @@ class MLXTrainer:
         self._reset_run_state()
 
         _resume_step = 0
+        _dpo_reference = None
+        _sync_reference = (
+            preference_kind == "dpo" and not bool(args.reference_free)
+            and bool(getattr(args, "sync_ref_model", False))
+        )
+        _sync_every = int(args.ref_model_sync_steps) if _sync_reference else 0
+        _sync_alpha = float(args.ref_model_mixup_alpha) if _sync_reference else 0.0
         ts = {}
         _resume_from = getattr(self, "_resume_from_checkpoint", None)
         _resume_from = self._validate_distributed_resume_checkpoint(_resume_from)
@@ -5367,10 +5595,9 @@ class MLXTrainer:
                         "Unsloth MLX DPO: checkpoint reference mode does not match."
                     )
                 if preference_kind == "dpo" and not bool(args.reference_free):
-                    build_reference_policy(
-                        model,
-                        reference_free=False,
-                        resume_provenance=resume_provenance,
+                    # Built before the checkpoint hydrates the model.
+                    _dpo_reference = self._build_dpo_reference(
+                        model, resume_provenance=resume_provenance,
                     )
 
                 # 1. Load trained adapter weights into the model. The model
@@ -5385,6 +5612,8 @@ class MLXTrainer:
                 )
                 # 2. Restore optimizer state (Adam moments m,v, step counter).
                 load_optimizer_state(optimizer, _resume_from)
+                if _sync_reference:
+                    _dpo_reference[0].load(_resume_from)
                 # 3. Restore trainer scalars (step counter, loss history, and
                 #    best-model / early-stopping tracking). .get defaults keep
                 #    pre-fix SFT checkpoints resumable.
@@ -5499,18 +5728,12 @@ class MLXTrainer:
                     discopop_tau=args.discopop_tau,
                     reference_free=bool(args.reference_free),
                 )
-                reference_policy, provenance = build_reference_policy(
-                    model,
-                    reference_free=bool(args.reference_free),
-                    resume_provenance=ts.get("preference_reference"),
-                    neftune=(
-                        [self._neftune_emb]
-                        if getattr(self, "_neftune_emb", None) is not None else []
-                    ),
-                )
+                if _dpo_reference is None:
+                    _dpo_reference = self._build_dpo_reference(
+                        model, resume_provenance=ts.get("preference_reference"),
+                    )
+                reference_policy, provenance = _dpo_reference
                 self._preference_reference_provenance = provenance
-                # Sampling borrows this policy's adapter modules so it zeroes
-                # the same ones the loss does. NEFTune is already off in eval.
                 _sampling_reference = reference_policy
                 loss_fn = (make_dpo_cce_loss_fn(model, objective, reference_policy=reference_policy)
                            if args.use_cce else make_dpo_loss_fn(objective, reference_policy=reference_policy))
@@ -5531,6 +5754,9 @@ class MLXTrainer:
                 batches.configure_cce_compaction(
                     getattr(loss_fn, "_unsloth_cce_compaction", False), kind=preference_kind,
                 )
+        _reference_compile_state = (
+            [] if _sampling_reference is None else [_sampling_reference.state]
+        )
 
         self.callback_handler.optimizer = optimizer
         self.callback_handler.lr_scheduler = getattr(self, "_lr_schedule", None)
@@ -5545,6 +5771,11 @@ class MLXTrainer:
 
         # Build loss+grad function — returns ((loss, ntoks), grads)
         loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
+        _compiled_loss_fn = getattr(loss_fn, "_unsloth_compiled_loss_fn", None)
+        _compiled_loss_and_grad_fn = (
+            nn.value_and_grad(model, _compiled_loss_fn)
+            if _compiled_loss_fn is not None else None
+        )
 
         lora_plus_ratio = args.lora_plus_ratio
         use_lora_plus = lora_plus_ratio > 0
@@ -5657,7 +5888,10 @@ class MLXTrainer:
         # that would add a report/no-report compile trace signature.
         _report_grad_norm = bool(getattr(args, "report_grad_norm", False))
         _compute_report_norm = _report_grad_norm and max_grad_norm <= 0
-        state = [model.state, optimizer.state, mx.random.state]
+        state = [
+            model.state, optimizer.state, mx.random.state,
+            *_reference_compile_state,
+        ]
         # grad_accum==1 fast path: only for unclipped updates, since
         # clip_grad_norm can spike peak memory on bf16 VLM runs.
         _direct_single_step_update = (
@@ -5795,9 +6029,14 @@ class MLXTrainer:
             return grad_norm
 
         def _loss_and_grad(batch_data):
+            compute = (
+                _compiled_loss_and_grad_fn
+                if _use_compile and _compiled_loss_and_grad_fn is not None
+                else loss_and_grad_fn
+            )
             if isinstance(batch_data, dict):
-                return loss_and_grad_fn(model, batch_data)
-            return loss_and_grad_fn(model, *batch_data)
+                return compute(model, batch_data)
+            return compute(model, *batch_data)
 
         def _accumulate_weighted_grad(grad, toks_f, prev_state):
             """Accumulate token-weighted grads without distributed collectives."""
@@ -5906,6 +6145,41 @@ class MLXTrainer:
             f"shape_guard:{_compile_shape_guard_report.reason}"
             if _shape_guard_eager else None
         )
+        _stream_policy = getattr(self, "_mlx_stream_width_policy", None)
+        _stream_registry = None
+        _stream_scope = "none"
+        _stream_capture_stable = True
+        if (
+            _stream_policy is not None
+            and batch_iter is not None
+            and _use_compile
+            and not _ddp_compile_local_grad
+        ):
+            # Lazy optimizer state would give one signature two cache entries;
+            # init now (keeps resumed state) and refresh the captured, maybe replaced, entry.
+            try:
+                optimizer.init(model.trainable_parameters())
+                state[1] = optimizer.state
+            except Exception as _init_error:
+                state[1] = optimizer.state
+                # Unbounded state reshapes make the cache unboundable: go eager.
+                _stream_capture_stable = False
+                if _effective_compile_mode(
+                    compile_policy, _compile_decision,
+                ) == "strict":
+                    raise RuntimeError(
+                        "Unsloth: strict mx.compile cannot bound compiled "
+                        "shapes for a streaming source with this optimizer, "
+                        "because its captured state cannot be initialized "
+                        f"before the first compiled step ({_init_error})."
+                    ) from _init_error
+                _main_print(
+                    "Unsloth: compiling disabled for this streaming run — "
+                    "this optimizer's captured state cannot be initialized "
+                    "up front, so compiled shapes could not be bounded."
+                )
+                _use_compile = False
+                _compile_fallback_reason = "stream_capture_unstable"
         _compile_state = state
         class _DDPCompiledLocalGradError(RuntimeError):
             """Marks failures from the compiled DDP local-gradient graph."""
@@ -5946,7 +6220,9 @@ class MLXTrainer:
         if _use_compile:
             _uncompiled_step_fn = step_fn
             if _ddp_compile_local_grad:
-                _compile_state = [model.state, mx.random.state]
+                _compile_state = [
+                    model.state, mx.random.state, *_reference_compile_state,
+                ]
                 _main_print(
                     "Unsloth: mx.compile enabled for MLX DDP local "
                     "loss/gradient accumulation; distributed collectives "
@@ -6114,6 +6390,32 @@ class MLXTrainer:
         text_completion_only_loss = _text_completion_only_loss_arg(args)
         text_assistant_only_loss = _text_assistant_only_loss_arg(args)
 
+        _precompute_reference = _sampling_reference is not None and bool(
+            getattr(args, "precompute_ref_log_probs", False)
+        )
+        _precompute_chunk = (
+            getattr(args, "precompute_ref_batch_size", None)
+            if _precompute_reference else None
+        )
+
+        def _precompute_eval_reference(plans, eval_batch_size):
+            plans = list(plans.values()) if isinstance(plans, dict) else [plans]
+            paused = pause_mlx_training_patches()
+            was_training = getattr(model, "training", True)
+            model.eval()
+            try:
+                for plan in plans:
+                    precompute_reference_logps(
+                        plan, model, _sampling_reference,
+                        batch_size=int(_precompute_chunk or eval_batch_size),
+                        scorer=getattr(preference_eval_fn, "_unsloth_cce_scorer", None),
+                    )
+            finally:
+                model.train(was_training)
+                resume_mlx_training_patches(paused)
+            if not _samples_prompts:
+                _sampling_reference.release()
+
         def _prepare_eval_batches():
             """Materialize eval batches the first time evaluation is requested.
 
@@ -6210,6 +6512,8 @@ class MLXTrainer:
                         eval_batches = _create_every_eval_split()
                 else:
                     eval_batches = _create_every_eval_split()
+                if _precompute_reference:
+                    _precompute_eval_reference(eval_batches, eval_batch_size)
             self.callback_handler.eval_dataloader = eval_batches
             _eval_steps = int(getattr(self.state, "eval_steps", 0) or 0)
             if eval_batches and _eval_steps > 0:
@@ -6236,6 +6540,20 @@ class MLXTrainer:
                         f"({eval_batch_count} eval batches)."
                     )
             return eval_batches
+
+        if _precompute_reference:
+            _train_chunk = int(_precompute_chunk or args.per_device_train_batch_size)
+            precompute_reference_logps(
+                batches, model, _sampling_reference, batch_size=_train_chunk,
+                scorer=getattr(loss_fn, "_unsloth_cce_scorer", None),
+            )
+            if self.eval_dataset is None and not _samples_prompts:
+                _sampling_reference.release()
+            _main_print(
+                "Unsloth: precomputed the reference log probabilities "
+                f"({len(batches.rows)} training rows, {_train_chunk} pairs "
+                "per chunk)."
+            )
 
         def _fire(event, **kwargs):
             """Dispatch an HF callback event on every rank, like HF Trainer.
@@ -6319,7 +6637,7 @@ class MLXTrainer:
         features = []
         if is_vlm:
             features.append("VLM")
-        if use_cce:
+        if use_cce and (_compiled_loss_fn is None or _use_compile):
             features.append("CCE")
         if args.gradient_checkpointing:
             features.append("GC")
@@ -6616,7 +6934,7 @@ class MLXTrainer:
 
                 defaults = self._generation_defaults
                 started = time.perf_counter()
-                def _decode(label):
+                def _decode(label, decode_model):
                     """Decode on every rank, or on none of them.
 
                     A rank that unwinds never reaches the
@@ -6627,7 +6945,8 @@ class MLXTrainer:
                     local_error = None
                     try:
                         result = generate_batch(
-                            model, self.tokenizer, requests, defaults=defaults,
+                            decode_model, self.tokenizer, requests,
+                            defaults=defaults,
                         )
                     except BaseException as error:
                         local_error = error
@@ -6649,22 +6968,18 @@ class MLXTrainer:
                         return None
                     return result
 
-                policy = _decode("policy")
+                policy = _decode("policy", model)
                 if policy is None:
                     self.last_generation_samples = []
                     return
 
                 reference = None
-                modules = tuple(getattr(_sampling_reference, "modules", ()) or ())
-                if modules and not self._distributed_should_stop():
-                    scales = [module.scale for module in modules]
-                    try:
-                        for module in modules:
-                            module.scale = 0.0
-                        reference = _decode("reference")
-                    finally:
-                        for module, scale in zip(modules, scales):
-                            module.scale = scale
+                if (
+                    _sampling_reference is not None
+                    and not self._distributed_should_stop()
+                ):
+                    with _sampling_reference.activate(model) as reference_model:
+                        reference = _decode("reference", reference_model)
                     if reference is None:
                         # The policy half alone is indistinguishable from what an
                         # unreferenced objective publishes, hiding the failure.
@@ -6920,6 +7235,8 @@ class MLXTrainer:
                         # succeeded, so log failures but keep it.
                         try:
                             save_optimizer_state(optimizer, ckpt_dir)
+                            if _sync_reference:
+                                _sampling_reference.save(ckpt_dir)
                             save_trainer_state(
                                 {
                                     "global_step": current_step,
@@ -7155,9 +7472,14 @@ class MLXTrainer:
                 _compile_scope = "fallback_eager"
                 _compile_fallback_reason = "runtime_error"
                 _ddp_compile_local_grad = False
+                if _stream_policy is not None:
+                    _stream_policy.armed = False
                 if isinstance(batches, _EAGER_REFETCHABLE_PLAN_TYPES):
                     batch_data = batches[scheduled_index]
-                state = [model.state, optimizer.state, mx.random.state]
+                state = [
+                    model.state, optimizer.state, mx.random.state,
+                    *_reference_compile_state,
+                ]
                 local_error = None
                 try:
                     result = step_fn(batch_data, prev_state, do_update)
@@ -7283,6 +7605,30 @@ class MLXTrainer:
             _run_callback_epoch_begin(
                 float(microstep // epoch_event_microbatches)
             )
+        if (
+            _stream_policy is not None
+            and batch_iter is not None
+            and _use_compile
+            and _stream_capture_stable
+            and _compile_scope in (FULL_STEP_SCOPE, DDP_LOCAL_GRAD_SCOPE)
+        ):
+            # Armed only after compile setup can no longer fall back to eager.
+            _stream_registry = _StreamSignatureRegistry(
+                resolve_compile_max_variants(args.compile_max_variants),
+            )
+            _stream_policy.arm(
+                _stream_registry,
+                stream_phase_count(_compile_scope, grad_accum),
+                # Effective prefetch depth, not configured.
+                getattr(args, "streaming_prefetch_batches", 0)
+                if (getattr(self, "_mlx_prefetch_control", None)
+                    and self._mlx_prefetch_control.get("eligible")) else 0,
+            )
+            _stream_scope = _compile_scope
+            _main_print(describe_stream_shape_grid(
+                _stream_policy.grid, _stream_registry.cap,
+                _stream_policy.exact_ceiling,
+            ))
         while self._global_step < total_steps:
             it = microstep + 1
             if self._distributed_should_stop() or self._early_stopped:
@@ -7308,6 +7654,7 @@ class MLXTrainer:
 
             batch_error = None
             batch_data = None
+            _stream_eager_batch = False
             try:
                 if batch_iter is not None:
                     batch_data = next(batch_iter)
@@ -7403,6 +7750,74 @@ class MLXTrainer:
                 _use_compile = False
                 _compile_scope = "fallback_eager"
                 _compile_fallback_reason = "audio_inputs"
+                if _stream_policy is not None:
+                    _stream_policy.armed = False
+            if _stream_registry is not None:
+                _stream_trip = self._admit_stream_batch(
+                    _stream_registry,
+                    batch_data if _use_compile and _compile_scope in (
+                        FULL_STEP_SCOPE, DDP_LOCAL_GRAD_SCOPE,
+                    ) else None,
+                    _compile_scope,
+                    grad_accum,
+                    it - 1,
+                    distributed_world_size,
+                )
+                if _stream_trip == "eager_batch":
+                    if _effective_compile_mode(
+                        compile_policy, _compile_decision,
+                    ) == "strict":
+                        raise RuntimeError(
+                            "Unsloth: strict mx.compile cannot certify a "
+                            "streamed batch's compile-key family, so its "
+                            "compiled shapes could not be bounded: "
+                            f"{_stream_registry.uncertified_family}"
+                        )
+                    _stream_eager_batch = True
+                    _stream_trip = False
+                else:
+                    _stream_eager_batch = False
+                if _stream_trip:
+                    if _effective_compile_mode(
+                        compile_policy, _compile_decision,
+                    ) == "strict":
+                        raise RuntimeError(
+                            "Unsloth: strict mx.compile exceeded the "
+                            f"{_stream_registry.cap}-signature cap on a "
+                            "streaming source "
+                            f"({len(_stream_registry.observed)} compiled). "
+                            "Raise compile_max_variants or use a source with "
+                            "fewer distinct batch shapes."
+                        )
+                    _main_print(
+                        "Unsloth: streaming compile shapes reached the "
+                        f"{_stream_registry.cap}-signature cap "
+                        f"({len(_stream_registry.observed)} compiled); "
+                        "continuing eagerly. Raise or lower "
+                        "compile_max_variants to change this bound."
+                    )
+                    _stream_registry.trip("signature_cap")
+                    # Reuse the batch in hand: re-fetching would consume the source.
+                    if _ddp_compile_local_grad:
+                        step_fn = _ddp_eager_local_step_fn
+                        _ddp_compile_local_grad = False
+                    else:
+                        step_fn = _uncompiled_step_fn
+                    _use_compile = False
+                    _compile_scope = "fallback_eager"
+                    _compile_fallback_reason = "stream_signature_cap"
+                    _stream_policy.armed = False
+                    state = [
+                        model.state, optimizer.state, mx.random.state,
+                        *_reference_compile_state,
+                    ]
+
+            _step_fn_for_batch = step_fn
+            if _stream_eager_batch:
+                _step_fn_for_batch = (
+                    _ddp_eager_local_step_fn if _ddp_compile_local_grad
+                    else _uncompiled_step_fn
+                )
 
             do_update = (accum_progress + 1 >= grad_accum)
             # HF forces a sync step on an epoch's last micro-batch, so the epoch is
@@ -7446,12 +7861,14 @@ class MLXTrainer:
                 if _use_compile and not _ddp_compile_local_grad:
                     rng_state_before = _mlx_rng_key()
                 try:
-                    lvalue, toks, stats, grad_accum_state, grad_norm = step_fn(
+                    lvalue, toks, stats, grad_accum_state, grad_norm = _step_fn_for_batch(
                         batch_data, grad_accum_state, do_update,
                     )
                 except (ValueError, RuntimeError, TypeError) as e:
                     _is_compile_failure = (
                         _use_compile
+                        # Bypassed the compiled callable: not a compile failure.
+                        and not _stream_eager_batch
                         and not _ddp_compile_local_grad
                         and _is_compile_exception(e)
                     )
@@ -7466,10 +7883,15 @@ class MLXTrainer:
                         _use_compile = False
                         _compile_scope = "fallback_eager"
                         _compile_fallback_reason = "runtime_error"
+                        if _stream_policy is not None:
+                            _stream_policy.armed = False
                         if isinstance(batches, _EAGER_REFETCHABLE_PLAN_TYPES):
                             batch_data = batches[scheduled_index]
                         _restore_mlx_rng_key(rng_state_before)
-                        state = [model.state, optimizer.state, mx.random.state]
+                        state = [
+                            model.state, optimizer.state, mx.random.state,
+                            *_reference_compile_state,
+                        ]
                         lvalue, toks, stats, grad_accum_state, grad_norm = step_fn(
                             batch_data, grad_accum_state, do_update,
                         )
@@ -7665,6 +8087,8 @@ class MLXTrainer:
             self._global_step = current_step
             self.state.global_step = current_step
             accum_progress = 0
+            if _sync_reference and current_step % _sync_every == 0:
+                _sampling_reference.sync(model, _sync_alpha)
             # Advance the callback epoch only on an optimizer step, beside the
             # global_step it belongs to and just before on_step_end -- HF's
             # `state.global_step += 1; state.epoch = epoch + (step+1)/
@@ -7980,7 +8404,13 @@ class MLXTrainer:
                 _compile_decision.policy_mode if _compile_decision is not None else compile_policy.mode
             ),
             "compile_scope": _compile_scope,
-            "compile_shape_guard": _compile_shape_guard_report.to_dict(),
+            "compile_shape_guard": (
+                _stream_guard_report(
+                    _stream_policy, _stream_registry, _stream_scope,
+                ).to_dict()
+                if _stream_registry is not None
+                else _compile_shape_guard_report.to_dict()
+            ),
             "patch_mode": getattr(self.args, "patch_mode", "patched"),
             "compile_trace": (
                 asdict(self._compile_trace)
@@ -8200,6 +8630,35 @@ class MLXTrainer:
                     raise ValueError(
                         "Unsloth MLX DPO: label_smoothing must be in [0, 0.5)."
                     )
+                if bool(getattr(args, "sync_ref_model", False)) and not bool(
+                    args.reference_free
+                ):
+                    alpha = float(args.ref_model_mixup_alpha)
+                    if not math.isfinite(alpha) or not 0 <= alpha <= 1:
+                        raise ValueError(
+                            "Unsloth MLX DPO: ref_model_mixup_alpha must be in "
+                            "[0, 1]."
+                        )
+                    if int(args.ref_model_sync_steps) < 1:
+                        raise ValueError(
+                            "Unsloth MLX DPO: ref_model_sync_steps must be at "
+                            "least 1."
+                        )
+                if bool(getattr(args, "precompute_ref_log_probs", False)) and not bool(
+                    args.reference_free
+                ):
+                    if bool(getattr(args, "sync_ref_model", False)):
+                        raise ValueError(
+                            "Unsloth MLX DPO: precompute_ref_log_probs scores "
+                            "the reference once, and sync_ref_model moves it "
+                            "during the run. Use one of the two."
+                        )
+                    chunk = getattr(args, "precompute_ref_batch_size", None)
+                    if chunk is not None and int(chunk) < 1:
+                        raise ValueError(
+                            "Unsloth MLX DPO: precompute_ref_batch_size must be "
+                            "at least 1."
+                        )
             try:
                 len(train_dataset)
                 train_dataset[0]
@@ -8326,6 +8785,10 @@ class MLXTrainer:
                     int(getattr(self, "_mlx_resume_step_for_prefetch", 0))
                     * args.gradient_accumulation_steps
                 )
+                # Anchor-free: expansion can exceed max_seq_length.
+                self._mlx_stream_width_policy = (
+                    _StreamWidthPolicy(StreamShapeGrid()) if vlm_lazy else None
+                )
                 return None, iterate_vlm_training_batches(
                     dataset=train_dataset,
                     processor=processor,
@@ -8347,6 +8810,7 @@ class MLXTrainer:
                         if vlm_prefetch_depth and vlm_lazy else 0
                     ),
                     prefetch_control=self._mlx_prefetch_control,
+                    width_policy=self._mlx_stream_width_policy,
                 )
             else:
                 self._prepared_batches_include_epochs = vlm_num_epochs is not None
@@ -8469,6 +8933,16 @@ class MLXTrainer:
                     int(getattr(self, "_mlx_resume_step_for_prefetch", 0))
                     * args.gradient_accumulation_steps
                 )
+                self._mlx_stream_width_policy = (
+                    _StreamWidthPolicy(
+                        StreamShapeGrid(anchor=int(args.max_seq_length)),
+                    )
+                    if (
+                        _is_mlx_lazy_text_source(train_dataset)
+                        and int(args.max_seq_length) >= STREAM_GRID_FLOOR_WIDTH
+                    )
+                    else None
+                )
                 return None, iterate_training_batches(
                     dataset=train_dataset,
                     tokenizer=self.tokenizer,
@@ -8493,6 +8967,7 @@ class MLXTrainer:
                             args, "streaming_text_length_window_batches", 8,
                         )
                     ),
+                    width_policy=self._mlx_stream_width_policy,
                     prefetch_batches=prefetch_depth,
                     prefetch_skip_batches=resume_skip if prefetch_depth else 0,
                     prefetch_control=self._mlx_prefetch_control,
@@ -8694,6 +9169,10 @@ class MLXDPOTrainer(MLXTrainer):
     config_class = MLXDPOConfig
     preference_kind = "dpo"
 
+    def __init__(self, *args, ref_model=None, **kwargs):
+        self.ref_model = ref_model
+        super().__init__(*args, **kwargs)
+
 
 def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
                             max_seq_length, formatting_func=None,
@@ -8704,7 +9183,7 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
                             preserve_dataset_order=False,
                             num_epochs=None, return_dataset=False,
                             comm_group=None, distributed_pad_mode="cycle",
-                            return_plan=False):
+                            return_plan=False, grad_accum=None):
     """Create padded batches with label masks for train_on_responses_only.
 
     Tokenizes each dataset item, applies the masking closure to get labels,
@@ -8827,11 +9306,13 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
         # legacy default: length-sort once
         return sorted(range(len(all_items)), key=lambda i: len(all_items[i][0]))
 
-    # 3. Build `num_epochs` blocks so `batches[i % len]` cycle reseeds correctly.
+    # 3. Build ceil(num_epochs) blocks so `batches[i % len]` cycle reseeds correctly.
     _n_epochs_materialize = (
-        max(1, int(num_epochs)) if num_epochs is not None else 1
+        max(1, math.ceil(num_epochs)) if num_epochs is not None else 1
     )
-    from .utils import _finite_text_pad_width, _normalize_seed
+    from .utils import (
+        _finite_epoch_batch_budget, _finite_text_pad_width, _normalize_seed,
+    )
     # Normalized so seed=None is deterministic (canonicalized) instead of
     # entropy-derived; explicit seeds are unchanged. Visits stay identity —
     # these plans carry explicitly materialized epoch blocks.
@@ -8877,6 +9358,9 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
         if cycle_length is None and len(epoch_schedule) > 0:
             cycle_length = len(epoch_schedule)
 
+    # Fractional epochs end mid-pass on whole accumulation windows, as HF does.
+    if num_batches is None and num_epochs is not None and cycle_length:
+        num_batches = _finite_epoch_batch_budget(cycle_length, num_epochs, grad_accum)
     if num_batches is not None and len(schedule) > num_batches:
         schedule = schedule[:num_batches]
         widths = widths[:num_batches]
@@ -9251,11 +9735,8 @@ def train_on_responses_only(
             args.max_steps * args.gradient_accumulation_steps
             if args.max_steps > 0 else None
         )
-        # Only materialize all epoch blocks for true epoch-based runs. Step-based
-        # runs (max_steps>0) truncate to num_batches, so pre-building every epoch
-        # just wastes tokenization/memory. Mirrors the unlabeled path's gate.
         labeled_num_epochs = (
-            int(args.num_train_epochs)
+            args.num_train_epochs
             if (args.max_steps <= 0 and getattr(args, "num_train_epochs", -1) > 0)
             else None
         )
@@ -9284,6 +9765,7 @@ def train_on_responses_only(
             return_dataset=True,
             comm_group=comm_group,
             return_plan=True,
+            grad_accum=args.gradient_accumulation_steps,
         )
         trainer.train_dataset = response_masked_dataset
         trainer._mlx_train_dataset_for_batches = response_masked_dataset

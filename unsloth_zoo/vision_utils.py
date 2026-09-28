@@ -34,6 +34,7 @@ from __future__ import annotations
 __all__ = [
     "process_vision_info",
     "UnslothVisionDataCollator",
+    "patch_medias_processor",
 ]
 
 # Canonical media placeholder tokens live in vlm_tokens so the CUDA and MLX paths
@@ -42,7 +43,7 @@ from .vlm_tokens import IMAGE_TOKENS, AUDIO_TOKENS
 
 import torch
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 import base64
 import contextvars
 from io import BytesIO
@@ -613,16 +614,12 @@ def smart_resize(
     return h_bar, w_bar
 
 
-def fetch_image(
-    ele: dict,
-    size_factor: int = IMAGE_FACTOR,
-) -> Image.Image:
-    if "image" in ele:
-        image = ele["image"]
-    else:
-        image = ele["image_url"]
-        if isinstance(image, dict) and "url" in image:
-            image = image["url"]
+def _decode_image(image) -> Image.Image:
+    # datasets Image(decode=False) rows are {"bytes": None, "path": <str>}; the path may be a URL.
+    if isinstance(image, dict) and not image.get("bytes") and isinstance(image.get("path"), str):
+        image = image["path"]
+    if isinstance(image, bytearray):
+        image = bytes(image)
     image_obj = None
     if isinstance(image, Image.Image):
         image_obj = image
@@ -636,8 +633,14 @@ def fetch_image(
                 _, base64_data = image.split("base64,", 1)
                 data = base64.b64decode(base64_data)
                 image_obj = Image.open(BytesIO(data))
-        else:
+        elif os.path.isfile(image):
             image_obj = Image.open(image)
+        else:
+            # Bare base64, as transformers.image_utils.load_image accepts; else surface the missing path.
+            try:
+                image_obj = Image.open(BytesIO(base64.decodebytes(image.encode())))
+            except Exception:
+                image_obj = Image.open(image)
     elif isinstance(image, bytes):
         image_obj = Image.open(BytesIO(image))
     elif isinstance(image, dict):
@@ -651,9 +654,21 @@ def fetch_image(
     if image_obj is None:
         raise ValueError(f"Unrecognized image input. We support local path, http url, base64 and PIL.Image, bytes and dict formats. Instead we got `{type(image).__name__}`")
     if image_obj.mode != "RGB":
-        image = image_obj.convert("RGB")
+        return image_obj.convert("RGB")
+    return image_obj
+
+
+def fetch_image(
+    ele: dict,
+    size_factor: int = IMAGE_FACTOR,
+) -> Image.Image:
+    if "image" in ele:
+        image = ele["image"]
     else:
-        image = image_obj
+        image = ele["image_url"]
+        if isinstance(image, dict) and "url" in image:
+            image = image["url"]
+    image = _decode_image(image)
     ## resize
     if "resized_height" in ele and "resized_width" in ele:
         resized_height, resized_width = smart_resize(
@@ -1214,15 +1229,300 @@ def _raise_chat_template_error(error, processor, model = None):
     raise RuntimeError(error) from error
 
 
+def _adopt_tokenizer_chat_template(processor) -> bool:
+    """MiniMax-M3 VL processors skip chat_template.jinja; use the inner tokenizer's."""
+    inner = getattr(processor, "tokenizer", None)
+    if getattr(processor, "chat_template", None) is None and \
+        inner is not None and inner is not processor and \
+        isinstance(getattr(inner, "chat_template", None), str):
+        processor.chat_template = inner.chat_template
+        return True
+    return False
+pass
+
+
+def _renders_content_list_as_repr(rendered, text) -> bool:
+    """Nemotron Omni templates render a content list as its Python repr."""
+    return isinstance(rendered, str) and text in rendered and \
+        ("'type': 'text'" in rendered or '"type": "text"' in rendered)
+pass
+
+
+_STRING_CONTENT_DEFAULTS = {"image": "<image>", "video": "<video>", "audio": "<audio>"}
+
+
+def _media_placeholder(processor, kind) -> str:
+    """`<kind>_token` on processor/tokenizer, else remote module's DEFAULT_<KIND>_TOKEN (Phi-4-reasoning-vision)."""
+    import sys
+    for obj in (processor, getattr(processor, "tokenizer", None)):
+        token = getattr(obj, f"{kind}_token", None) if obj is not None else None
+        if isinstance(token, str) and token:
+            return token
+    module = sys.modules.get(type(processor).__module__)
+    token = getattr(module, f"DEFAULT_{kind.upper()}_TOKEN", None)
+    if isinstance(token, str) and token:
+        return token
+    return _STRING_CONTENT_DEFAULTS[kind]
+pass
+
+
+def _flatten_message_content(messages, placeholders):
+    """Copy of messages with list content joined into one string (media parts -> placeholder)."""
+    flat = []
+    for message in messages:
+        content = message.get("content") if isinstance(message, Mapping) else None
+        if not isinstance(content, (list, tuple)):
+            flat.append(message)
+            continue
+        pieces = []
+        for part in content:
+            if isinstance(part, str):
+                pieces.append(part)
+                continue
+            if not isinstance(part, Mapping):
+                continue
+            kind = part.get("type")
+            if kind in placeholders:
+                pieces.append(placeholders[kind])
+            elif kind == "text" or (kind is None and "text" in part):
+                text = part.get("text")
+                if text is not None:
+                    pieces.append(str(text))
+            elif kind in ("image_url", "input_image"):
+                pieces.append(placeholders["image"])
+            elif kind in ("input_audio", "audio_url"):
+                pieces.append(placeholders["audio"])
+            elif kind == "video_url":
+                pieces.append(placeholders["video"])
+        flat.append({**message, "content": "\n".join(pieces)})
+    return flat
+pass
+
+
+def _template_needs_string_content(processor) -> bool:
+    """List content raises TypeError but the same turn as a string renders."""
+    try:
+        processor.apply_chat_template(
+            [{"role": "user", "content": [{"type": "text", "text": "Hello!"}]}], tokenize = False,
+        )
+        return False
+    except TypeError:
+        pass
+    except Exception:
+        return False
+    try:
+        rendered = processor.apply_chat_template(
+            [{"role": "user", "content": "Hello!"}], tokenize = False,
+        )
+    except Exception:
+        return False
+    return isinstance(rendered, str) and "Hello!" in rendered
+pass
+
+
+class _StringContentChatTemplate:
+    """Module-level (not a closure) so patched processors stay picklable for spawn DataLoader workers."""
+    __slots__ = ("original", "placeholders")
+    _unsloth_string_content = True
+
+    def __init__(self, original, placeholders):
+        self.original = original
+        self.placeholders = placeholders
+
+    def __getstate__(self):
+        return (self.original, self.placeholders)
+
+    def __setstate__(self, state):
+        self.original, self.placeholders = state
+
+    def __call__(self, conversation, *args, **kwargs):
+        if isinstance(conversation, (list, tuple)) and len(conversation) and \
+            isinstance(conversation[0], (list, tuple)):
+            conversation = [_flatten_message_content(c, self.placeholders) for c in conversation]
+        elif isinstance(conversation, (list, tuple)):
+            conversation = _flatten_message_content(conversation, self.placeholders)
+        return self.original(conversation, *args, **kwargs)
+pass
+
+
+def _patch_string_content_chat_template(processor) -> bool:
+    """Phi-4-reasoning-vision / LLaVA templates concatenate string content: flatten content lists."""
+    original = getattr(processor, "apply_chat_template", None)
+    if original is None or getattr(original, "_unsloth_string_content", False):
+        return False
+    if not _template_needs_string_content(processor):
+        return False
+    placeholders = {kind: _media_placeholder(processor, kind) for kind in _STRING_CONTENT_DEFAULTS}
+    processor.apply_chat_template = _StringContentChatTemplate(original, placeholders)
+    return True
+pass
+
+
+def _processor_takes_images(processor) -> bool:
+    """Step-3.7 names its image component `image_preprocessor`."""
+    import inspect
+    try:
+        params = inspect.signature(type(processor).__call__).parameters
+    except (TypeError, ValueError):
+        return False
+    return "images" in params
+pass
+
+
+def _flatten_images(images):
+    flat = []
+    for item in images if isinstance(images, (list, tuple)) else [images]:
+        if isinstance(item, (list, tuple)):
+            flat.extend(_flatten_images(item))
+        elif item is not None:
+            flat.append(item)
+    return flat
+pass
+
+
+def patch_medias_processor(processor):
+    """Let Kimi K2.5 / K2.7 `medias=` processors take `processor(text=..., images=...)`;
+    remote `messages=` / `medias=` calls are unchanged. Returns True if patched."""
+    import inspect
+    from transformers.feature_extraction_utils import BatchFeature
+    cls = type(processor)
+    if getattr(cls, "_unsloth_medias_patched", False):
+        return True
+    try:
+        params = inspect.signature(cls.__call__).parameters
+    except (TypeError, ValueError):
+        return False
+    if "medias" not in params or "images" in params:
+        return False
+    if not hasattr(processor, "tokenizer") or \
+        not hasattr(getattr(processor, "media_processor", None) or getattr(processor, "image_processor", None), "preprocess"):
+        return False
+    original_call = cls.__call__
+
+    def __call__(self, messages = None, medias = None, text = None, return_tensors = "pt", images = None, videos = None, **kwargs):
+        if messages is not None or medias is not None or text is None:
+            if images is not None or videos is not None:
+                raise ValueError("Unsloth: pass images through `medias=` when calling with `messages=` or `medias=`.")
+            return original_call(self, messages = messages, medias = medias, text = text, return_tensors = return_tensors, **kwargs)
+        if videos is not None:
+            raise NotImplementedError(
+                f"Unsloth: {cls.__name__} videos must go through `medias=` (video chunks); "
+                "the `videos=` call is not supported."
+            )
+        texts = [text] if isinstance(text, str) else list(text)
+        images = _flatten_images(images) if images is not None else []
+        pad = getattr(self, "image_token", None) or "<|media_pad|>"
+        n_pad = sum(t.count(pad) for t in texts)
+        if n_pad != len(images):
+            raise ValueError(
+                f"Unsloth: {cls.__name__} got {len(images)} images for {n_pad} `{pad}` placeholders in the text."
+            )
+        tok_keys = ("padding", "truncation", "max_length", "add_special_tokens", "pad_to_multiple_of",
+                    "padding_side", "return_attention_mask")
+        tok_kwargs = {k: kwargs[k] for k in tok_keys if k in kwargs and kwargs[k] is not None}
+        if len(texts) > 1:
+            tok_kwargs.setdefault("padding", True)
+        data = dict(self.tokenizer(texts if not isinstance(text, str) else text,
+                                   return_tensors = return_tensors, **tok_kwargs))
+        ids = data["input_ids"]
+        ids = ids.tolist() if hasattr(ids, "tolist") else ids
+        pad_id = self.tokenizer.convert_tokens_to_ids(pad)
+        kept = sum(row.count(pad_id) for row in (ids if ids and isinstance(ids[0], list) else [ids]))
+        if kept != n_pad:
+            raise ValueError(
+                f"Unsloth: truncation to max_length = {tok_kwargs.get('max_length')} removed {n_pad - kept} of "
+                f"{n_pad} `{pad}` image placeholders. Increase max_seq_length or shorten the conversation."
+            )
+        if images:
+            media_processor = getattr(self, "media_processor", None) or self.image_processor
+            medias = [{"type": "image", "image": image} for image in images]
+            data.update(media_processor.preprocess(medias, return_tensors = return_tensors).data)
+        return BatchFeature(data = data, tensor_type = return_tensors)
+    pass
+    __call__.__wrapped__ = original_call
+    cls.__call__ = __call__
+    cls._unsloth_medias_patched = True
+    return True
+pass
+
+
+def _media_feature_token_ids(model):
+    """Token ids a model forward matches one-to-one with media features."""
+    config = getattr(model, "config", None)
+    ids = set()
+    subs = (getattr(config, k, None) for k in ("text_config", "vision_config", "audio_config", "thinker_config"))
+    for cfg in (config, *subs):
+        for key in ("image_token_id", "image_token_index", "video_token_id", "video_token_index",
+                    "audio_token_id", "audio_token_index", "media_placeholder_token_id",
+                    "img_context_token_id"):
+            value = getattr(cfg, key, None)
+            if isinstance(value, int) and value >= 0:
+                ids.add(value)
+    # InternVL remote code sets it on the model at runtime; the forward reads that attribute.
+    value = getattr(model, "img_context_token_id", None)
+    if isinstance(value, int) and value >= 0:
+        ids.add(value)
+    return sorted(ids)
+pass
+
+
+def _tensorize_ragged_batch(batch):
+    """Tensorize fields; ragged ones stay lists of tensors."""
+    for key in list(batch.keys()):
+        value = batch[key]
+        if torch.is_tensor(value) or not isinstance(value, (list, tuple)) or len(value) == 0:
+            continue
+        items = [torch.as_tensor(v) if isinstance(v, np.ndarray) else v for v in value]
+        if all(torch.is_tensor(v) for v in items):
+            batch[key] = torch.stack(items) if len({tuple(v.shape) for v in items}) == 1 else list(items)
+            continue
+        try:
+            batch[key] = torch.tensor(items)
+        except (ValueError, TypeError, RuntimeError):
+            batch[key] = items
+    return batch
+pass
+
+
+def _probe_assistant_single_content(processor, model = None):
+    """Any list-form failure (TypeError, repr, Apertus 1.5 Jinja TemplateError) tries a string."""
+    user = {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Hello!"}]}
+    try:
+        rendered = processor.apply_chat_template([
+            user,
+            {"role": "assistant", "content": [{"type": "text", "text": "How can I help you?"}]},
+        ])
+        if _renders_content_list_as_repr(rendered, "How can I help you?"):
+            raise TypeError("assistant content rendered as a list repr")
+        return False
+    except Exception as list_error:
+        try:
+            processor.apply_chat_template([
+                user, {"role": "assistant", "content": "How can I help you?"},
+            ])
+        except Exception as e:
+            _raise_chat_template_error(
+                e if isinstance(list_error, TypeError) else list_error, processor, model
+            )
+        print(
+            f"Unsloth: {processor.__class__.__name__} only accepts 1 "\
+            "text field for assistant roles!\n"\
+            "We will auto fix the data collator to support it!"
+        )
+        return True
+pass
+
+
 class UnslothVisionDataCollator:
     # All Unsloth Zoo code licensed under LGPLv3
     __slots__ = (
-        "padding_token_ids", "dtype", "ignore_index",
+        "padding_token_ids", "_feature_token_ids", "dtype", "ignore_index",
         "processor", "formatting_func", "image_size",
         "max_seq_length", "truncation", "train_on_responses_only",
         "num_proc", "assistant_single_content", "patch_size",
         "resize_dimension", "snap_to_patch_size",
         "completion_only_loss", "pad_to_multiple_of", "size_func",
+        "_seen_supervised", "_warned_unsupervised",
     )
 
     def __init__(
@@ -1246,10 +1546,14 @@ class UnslothVisionDataCollator:
         snap_to_patch_size = False,
         last_response_only = False, # Train only on the last assistant turn
     ):
-        if not hasattr(processor, "image_processor"):
+        if not hasattr(processor, "image_processor") and not _processor_takes_images(processor):
             raise TypeError("Unsloth: UnslothVisionDataCollator is only for image models!")
+        self._seen_supervised = False
+        self._warned_unsupervised = False
+        patch_medias_processor(processor)
 
         self.padding_token_ids = get_padding_tokens_ids(processor)
+        self._feature_token_ids = _media_feature_token_ids(model)
         self.dtype = _get_dtype(
             dtype_from_config(model.config)
             if HAS_TORCH_DTYPE else
@@ -1353,35 +1657,12 @@ class UnslothVisionDataCollator:
         else:
             self.train_on_responses_only = None
 
+        _adopt_tokenizer_chat_template(processor)
+        _patch_string_content_chat_template(processor)
+
         # Check what type for assistant VLM tokenizer allows!
         # Good for Mistral V3 and Pixtral I think
-        try:
-            processor.apply_chat_template([
-                {"role": "user", "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": "Hello!"}]},
-                {"role": "assistant", "content": [
-                    {"type": "text", "text": "How can I help you?"}]}
-            ])
-            self.assistant_single_content = False
-        except TypeError:
-            try:
-                processor.apply_chat_template([
-                    {"role": "user", "content": [
-                        {"type": "image"},
-                        {"type": "text", "text": "Hello!"}]},
-                    {"role": "assistant", "content": "How can I help you?"}
-                ])
-                self.assistant_single_content = True
-                print(
-                    f"Unsloth: {processor.__class__.__name__} only accepts 1 "\
-                    "text field for assistant roles!\n"\
-                    "We will auto fix the data collator to support it!"
-                )
-            except Exception as e:
-                _raise_chat_template_error(e, processor, model)
-        except Exception as e:
-            _raise_chat_template_error(e, processor, model)
+        self.assistant_single_content = _probe_assistant_single_content(processor, model)
         return
 
     def _get_padding_token_ids_on_device(self, device):
@@ -1390,6 +1671,19 @@ class UnslothVisionDataCollator:
         return self.padding_token_ids
 
     def __call__(self, examples):
+        batch = self._collate(examples)
+        response_masker = getattr(self, "train_on_responses_only", None)
+        if response_masker:
+            labels = batch["labels"]
+            response_labels = response_masker(batch)["labels"]
+            # Masker writes -100; only add exclusions, in this collator's ignore_index.
+            labels.masked_fill_(
+                response_labels.eq(-100).to(device = labels.device), self.ignore_index,
+            )
+            self._check_supervised(labels, batch.get("attention_mask"))
+        return batch
+
+    def _collate(self, examples):
         if self.formatting_func is not None:
             examples = [self.formatting_func(example) for example in examples]
         
@@ -1423,8 +1717,8 @@ class UnslothVisionDataCollator:
             # Dataset with 2 columns messages / images
             image, video, video_kwarg = self._extract_images_videos_for_example(example, messages)
             image = self._resize_images_inplace(image)
-            if len(image) > 0:
-                images.append(image)
+            # One slot per row, empty for text-only rows: Gemma 3/4, Idefics3, LFM2-VL require len(images) == len(text).
+            images.append(image)
 
             if len(video) > 0:  # Works for list, tuple or tensor
                 videos.append(video)
@@ -1451,7 +1745,8 @@ class UnslothVisionDataCollator:
             # Safe to pass truncation kwargs top-level when no audio is involved
             proc_kwargs["truncation"] = self.truncation
             proc_kwargs["max_length"] = self.max_seq_length
-        if images:
+        has_images = any(len(x) > 0 for x in images)
+        if has_images:
             proc_kwargs["images"] = images
         if videos:
             proc_kwargs["videos"] = videos
@@ -1462,7 +1757,7 @@ class UnslothVisionDataCollator:
             proc_kwargs["audio"] = audios
         if self.pad_to_multiple_of is not None:
             proc_kwargs["pad_to_multiple_of"] = self.pad_to_multiple_of
-        batch = self.processor(**proc_kwargs)
+        batch = self._call_processor(proc_kwargs, has_images)
 
         # Truncate manually when audio is present (couldn't pass max_length to processor)
         if audios and self.truncation and self.max_seq_length:
@@ -1481,10 +1776,38 @@ class UnslothVisionDataCollator:
         labels = batch["input_ids"].clone()
         padding_ids = self._get_padding_token_ids_on_device(labels.device)
         labels[torch.isin(labels, padding_ids)] = self.ignore_index
+        # LLaVA IMAGE_TOKEN_INDEX (-200) sentinel is never a target.
+        labels[labels < 0] = self.ignore_index
         batch["labels"] = labels
-        if self.train_on_responses_only:
-            batch["labels"] = self.train_on_responses_only(batch)["labels"]
         return batch
+
+    def _check_supervised(self, labels, attention_mask = None):
+        """All labels masked means zero loss: raise on an untruncated first batch, else warn once."""
+        if not torch.is_tensor(labels) or labels.dim() != 2 or labels.shape[0] == 0:
+            return
+        # train_on_responses_only masks with -100 whatever ignore_index is.
+        trained = (labels != self.ignore_index) & (labels != -100)
+        empty = int((trained.sum(dim = 1) == 0).sum())
+        if empty < labels.shape[0]:
+            self._seen_supervised = True
+        if empty == 0:
+            return
+        msg = (
+            f"Unsloth: {empty} of {labels.shape[0]} examples in this batch have no trainable "
+            "token after train_on_responses_only: the response marker was not found in the "
+            "rendered chat, or the answer was truncated away. Check instruction_part / "
+            "response_part against processor.apply_chat_template, or raise max_seq_length."
+        )
+        # getattr: subclasses may skip __init__ (slots stay unset until assigned).
+        max_len = getattr(self, "max_seq_length", None)
+        truncated = bool(max_len) and torch.is_tensor(attention_mask) and attention_mask.dim() == 2 \
+            and bool((attention_mask.sum(dim = 1) >= max_len).any())
+        # Per-worker flag: raise only when untruncated, i.e. the marker is missing for every worker.
+        if empty == labels.shape[0] and not truncated and not getattr(self, "_seen_supervised", False):
+            raise ValueError(msg)
+        if not getattr(self, "_warned_unsupervised", False):
+            self._warned_unsupervised = True
+            logger.warning(msg)
 
     def _select_messages_or_raw(self, example):
         if "messages" in example:
@@ -1519,6 +1842,74 @@ class UnslothVisionDataCollator:
             )
         return messages
 
+    def _call_processor(self, proc_kwargs, has_images):
+        try:
+            return self.processor(**proc_kwargs)
+        except ValueError as e:
+            # Mllama rejects batches mixing image and text-only rows ("either no images or at least one image per sample").
+            if (
+                has_images and "at least one image per sample" in str(e)
+                and "videos" not in proc_kwargs and "audio" not in proc_kwargs
+            ):
+                return self._call_processor_mixed_rows(proc_kwargs)
+            # Nemotron Omni returns per-image pixel tensors that BatchFeature cannot stack.
+            # transformers 5.x: "Unable to convert output", 4.x: "Unable to create tensor".
+            if not has_images or not any(m in str(e) for m in ("Unable to convert output", "Unable to create tensor")):
+                raise
+            proc_kwargs = dict(proc_kwargs, return_tensors = None)
+            batch = _tensorize_ragged_batch(self.processor(**proc_kwargs))
+            if not torch.is_tensor(batch.get("input_ids")):
+                raise ValueError(
+                    f"Unsloth: {type(self.processor).__name__} returned unpadded input_ids for a "
+                    "batch, so it cannot collate more than one example; use "
+                    "per_device_train_batch_size = 1."
+                ) from e
+            return batch
+
+    def _call_processor_mixed_rows(self, proc_kwargs):
+        # Run image rows and text-only rows as two valid batches, then merge them back in row order.
+        # Text-only rows get Mllama's empty image slot (zeros, first tile of aspect_ratio_mask set)
+        # and an all-zero cross_attention_mask, so the model masks them out.
+        from transformers.feature_extraction_utils import BatchFeature
+        texts, images = proc_kwargs["text"], proc_kwargs["images"]
+        base = {k: v for k, v in proc_kwargs.items() if k not in ("text", "images")}
+        img_rows = [i for i, row in enumerate(images) if len(row) > 0]
+        txt_rows = [i for i, row in enumerate(images) if len(row) == 0]
+        out_i = self.processor(text = [texts[i] for i in img_rows], images = [images[i] for i in img_rows], **base)
+        out_t = self.processor(text = [texts[i] for i in txt_rows], **base)
+
+        tokenizer = getattr(self.processor, "tokenizer", self.processor)
+        side = proc_kwargs.get("padding_side") or getattr(tokenizer, "padding_side", "right")
+        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+        len_i, len_t = out_i["input_ids"].shape[1], out_t["input_ids"].shape[1]
+        length = max(len_i, len_t)
+
+        token_keys = ("input_ids", "attention_mask", "cross_attention_mask", "token_type_ids", "mm_token_type_ids")
+
+        def pad_seq(key, t, group_len, value):
+            # Pixel tensors can share shape[1] with the token width, so pad by key, not by shape.
+            if key not in token_keys or group_len == length:
+                return t
+            fill = torch.full((t.shape[0], length - group_len, *t.shape[2:]), value, dtype = t.dtype, device = t.device)
+            return torch.cat([fill, t] if side == "left" else [t, fill], dim = 1)
+
+        order = torch.tensor([(img_rows + txt_rows).index(i) for i in range(len(texts))])
+        merged = {}
+        for key in dict.fromkeys(list(out_i.keys()) + list(out_t.keys())):
+            value = pad_id if key == "input_ids" else 0
+            if key in out_i and key in out_t:
+                a, b = pad_seq(key, out_i[key], len_i, value), pad_seq(key, out_t[key], len_t, value)
+            elif key in out_i:
+                a = pad_seq(key, out_i[key], len_i, value)
+                b = torch.zeros((len(txt_rows), *a.shape[1:]), dtype = a.dtype, device = a.device)
+                if key == "aspect_ratio_mask":
+                    b[..., 0] = 1
+            else:
+                b = pad_seq(key, out_t[key], len_t, value)
+                a = torch.zeros((len(img_rows), *b.shape[1:]), dtype = b.dtype, device = b.device)
+            merged[key] = torch.cat([a, b], dim = 0)[order]
+        return BatchFeature(data = merged)
+
     def _collapse_assistant_content(self, messages):
         for message in messages:
             if message["role"] == "assistant":
@@ -1526,7 +1917,7 @@ class UnslothVisionDataCollator:
                     # Only extract text from items that have type "text"
                     text_parts = [item["text"] for item in content if isinstance(item, dict) and item.get("type") == "text"]
                     if text_parts:
-                        message["content"] = text_parts[0]
+                        message["content"] = "".join(text_parts)
                     elif len(content) > 0 and isinstance(content[0], dict) and "text" in content[0]:
                         message["content"] = content[0]["text"]
         return messages
@@ -1536,9 +1927,18 @@ class UnslothVisionDataCollator:
             prompt_messages + (completion_messages or []), tokenize=False, add_generation_prompt=add_generation_prompt, continue_final_message=continue_final_message
         )
 
+    def _load_column_images(self, images):
+        # SSRF-guarded decode (Idefics2-style processors fetch URLs unguarded); unresized and EXIF-transposed like datasets' PIL.
+        # None entries (text-only rows of a mixed images column) carry no image.
+        return [
+            ImageOps.exif_transpose(_decode_image(img)) if isinstance(img, (str, bytes, bytearray, dict)) else img
+            for img in images if img is not None
+        ]
+
     def _extract_images_videos_for_example(self, example, messages):
-        if "images" in example:
-            image = list(example["images"])
+        # images=None means no column value: fall back to images embedded in the messages, as the PC path does.
+        if example.get("images") is not None:
+            image = self._load_column_images(example["images"])
             video = []
             video_kwarg = None
         else:
@@ -1666,13 +2066,16 @@ class UnslothVisionDataCollator:
         return batch
 
     def _extract_images_for_pc(self, example, p_msgs, c_msgs):
-        # PC: prefer embedded across prompt+completion; else top-level first image; else []
+        # PC: top-level images column first, as in the non-PC path; else embedded; else []
         imgs = None
         vids = None
         vids_kwarg = None
         try:
             msg_list = (p_msgs or []) + (c_msgs or [])
-            if msg_list:
+            if example.get("images"):
+                imgs = self._load_column_images(example["images"])
+                vids = []
+            elif msg_list:
                 imgs, vids, vids_kwarg = process_vision_info(
                     msg_list,
                     size_factor=self.patch_size*2,
@@ -1680,16 +2083,6 @@ class UnslothVisionDataCollator:
                 )
                 if imgs is None: imgs = []
                 if vids is None: vids = []
-            else:
-                if "images" in example:
-                    vision_infos = [{'image': example['images'][i]} for i in range(len(example['images']))]
-                    imgs, vids, vids_kwarg = process_vision_info(
-                        vision_infos,
-                        size_factor=self.patch_size*2,
-                        return_video_kwargs=True,
-                    )
-                    if imgs is None: imgs = []
-                    if vids is None: vids = []
         except Exception as e:
             logger.warning(f"Unsloth: _extract_images_for_pc failed to extract images/videos: {e}")
             imgs = []
@@ -1856,6 +2249,29 @@ class UnslothVisionDataCollator:
             token_type_ids = token_type_ids[:, sl]
         return [input_ids, attention_mask, completion_mask] + ([token_type_ids] if token_type_ids is not None else [])
 
+    def _raise_if_truncation_cut_media(self, before, after, pad_id):
+        # Feature slots only: a cut delimiter alone (<|vision_end|>) still aligns at forward.
+        feature_ids = getattr(self, "_feature_token_ids", None)
+        if feature_ids:
+            media = torch.tensor(feature_ids, device = before.device)
+        else:
+            media = self._get_padding_token_ids_on_device(before.device)
+            # Processor-only placeholders (Step-3.7 `<im_patch>`) are absent from the tokenizer lists.
+            declared = [getattr(self.processor, f"{kind}_token_id", None) for kind in ("image", "video", "audio")]
+            declared = [x for x in declared if isinstance(x, int)]
+            if declared:
+                media = torch.cat((media, torch.tensor(declared, dtype = media.dtype, device = media.device)))
+        media = media[media != pad_id]
+        # Negative ids are processor-inserted sentinels (Phi-4-reasoning-vision -200).
+        count = lambda ids: int((torch.isin(ids, media) | (ids < 0)).sum())
+        cut = count(before) - count(after)
+        if cut > 0:
+            raise ValueError(
+                f"Unsloth: max_seq_length = {self.max_seq_length} truncated {cut} image / audio placeholder "
+                "tokens out of a prompt / completion batch, so the batch no longer matches its media "
+                "features. Increase max_seq_length or shorten the prompt."
+            )
+
     def _pad_to_multiple(self, input_ids, attention_mask, completion_mask, side, pad_id, multiple, token_type_ids=None, token_type_pad_id=0):
         B, L = input_ids.shape
         L2 = ((L + multiple - 1) // multiple) * multiple
@@ -1917,14 +2333,12 @@ class UnslothVisionDataCollator:
             else:
                 c_txt = str(c)
 
-            # Images: prefer embedded; else first top-level image; else []
             imgs, vids, vids_kwarg = self._extract_images_for_pc(ex, p if is_p_msgs else None, c if is_c_msgs else None)
             imgs = self._resize_images_inplace(imgs)
 
             prompt_texts.append(p_txt)
             completion_texts.append(c_txt)
-            if imgs:
-                images.append(imgs)
+            images.append(imgs or [])
 
             if vids:  # Works for list, tuple or tensor
                 videos.append(vids)
@@ -1952,7 +2366,8 @@ class UnslothVisionDataCollator:
             return_tensors="pt",
             add_special_tokens=False,
         )
-        if len(images) > 0:
+        pc_has_images = any(len(x) > 0 for x in images)
+        if pc_has_images:
             prompt_kwargs["images"] = images
         if len(videos) > 0:
             prompt_kwargs["videos"] = videos
@@ -1962,7 +2377,7 @@ class UnslothVisionDataCollator:
         if audios:
             prompt_kwargs["audio"] = audios
 
-        proc_prompts = self.processor(text=prompt_texts, **prompt_kwargs)
+        proc_prompts = self._call_processor(dict(prompt_kwargs, text = prompt_texts), pc_has_images)
         # Encode completions (RIGHT pad) text-only
         proc_completions = self.processor(text=completion_texts, **completion_kwargs)
 
@@ -1974,6 +2389,7 @@ class UnslothVisionDataCollator:
         p_tt, c_tt = proc_prompts.get(tt_key, None), proc_completions.get(tt_key, None)
 
         input_ids = torch.cat((p_ids, c_ids), dim=1)
+        untruncated_ids = input_ids
         attention_mask = torch.cat((p_m, c_m), dim=1)
         completion_mask = torch.cat((torch.zeros_like(p_m), c_m), dim=1)
         if p_tt is not None or c_tt is not None:
@@ -1987,6 +2403,7 @@ class UnslothVisionDataCollator:
         # Flush to tokenizer default padding side
         pad_id = self._pad_token_id_or_fail()
         flush_side = self._tokenizer_padding_side()
+        pre_flush = (attention_mask, input_ids)
         if token_type_ids is not None:
             attention_mask, input_ids, (completion_mask, token_type_ids) = self._flush_to_side(
                 attention_mask, input_ids, flush_side, pad_id, (completion_mask, token_type_ids)
@@ -2019,11 +2436,28 @@ class UnslothVisionDataCollator:
                     input_ids, attention_mask, completion_mask, flush_side, pad_id, self.pad_to_multiple_of
                 )
 
+        # Mllama: completion tokens see the images the last prompt token sees (prompts are left padded).
+        cross_mask = proc_prompts.get("cross_attention_mask", None)
+        if cross_mask is not None:
+            cross_mask = torch.cat((cross_mask, cross_mask[:, -1:].expand(-1, c_ids.shape[1], *cross_mask.shape[2:])), dim=1)
+            _, _, (cross_mask,) = self._flush_to_side(*pre_flush, flush_side, pad_id, (cross_mask,))
+            if cross_mask.shape[1] > input_ids.shape[1]:
+                cross_mask = cross_mask[:, -input_ids.shape[1]:] if flush_side == "left" else cross_mask[:, :input_ids.shape[1]]
+            elif cross_mask.shape[1] < input_ids.shape[1]:
+                fill = cross_mask.new_zeros((cross_mask.shape[0], input_ids.shape[1] - cross_mask.shape[1], *cross_mask.shape[2:]))
+                cross_mask = torch.cat((fill, cross_mask) if flush_side == "left" else (cross_mask, fill), dim=1)
+
+        # Cross-attention models (Mllama) do not align placeholder tokens with features.
+        if (pc_has_images or videos or audios) and cross_mask is None and self.max_seq_length is not None \
+            and untruncated_ids.shape[1] > self.max_seq_length:
+            self._raise_if_truncation_cut_media(untruncated_ids, input_ids, pad_id)
+
         # Labels: mask attention pads + image/pad tokens; completion-only if requested
         labels = input_ids.clone()
         labels[attention_mask == 0] = self.ignore_index
         padding_ids = self._get_padding_token_ids_on_device(labels.device)
         labels[torch.isin(labels, padding_ids)] = self.ignore_index
+        labels[labels < 0] = self.ignore_index
         if self.completion_only_loss:
             labels[completion_mask == 0] = self.ignore_index
 
@@ -2034,6 +2468,8 @@ class UnslothVisionDataCollator:
         out["labels"] = labels
         if token_type_ids is not None:
             out[tt_key] = token_type_ids
+        if cross_mask is not None:
+            out["cross_attention_mask"] = cross_mask
         if 'pixel_values' in out:
             out = self._cast_pixel_values_dtype_inplace(out)
         if 'pixel_values_videos' in out:

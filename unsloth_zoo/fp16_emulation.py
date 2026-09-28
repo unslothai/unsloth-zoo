@@ -102,6 +102,8 @@ import os
 
 import torch
 
+from .utils import device_guard
+
 __all__ = [
     "fp16_emulation_enabled",
     "pow2_scale",
@@ -311,21 +313,22 @@ def fp16_split_mm(
     if not _split_can_represent(A32) or not _split_can_represent(B32):
         return _mm_float32(A32, B32)
 
-    zero = torch.zeros((), device = A32.device, dtype = torch.int32)
-    eA = pow2_exponent(A32) if scale else zero
-    eB = pow2_exponent(B32) if scale else zero
-    a_terms = split_terms(torch.ldexp(A32, eA), dtype, terms)
-    b_terms = split_terms(torch.ldexp(B32, eB), dtype, terms)
+    with device_guard(A32):
+        zero = torch.zeros((), device = A32.device, dtype = torch.int32)
+        eA = pow2_exponent(A32) if scale else zero
+        eB = pow2_exponent(B32) if scale else zero
+        a_terms = split_terms(torch.ldexp(A32, eA), dtype, terms)
+        b_terms = split_terms(torch.ldexp(B32, eB), dtype, terms)
 
-    pairs = sorted(itertools.product(range(terms), repeat = 2), key = lambda ij: ij[0] + ij[1])
-    acc = None
-    for i, j in pairs[:products]:
-        part = _mm_f32_accumulate(a_terms[i], b_terms[j])
-        acc = part if acc is None else acc + part
-    # One ldexp with the combined exponent. Neither sA * sB nor a division per scale works: the
-    # product overflows for two small operands, and dividing in either order passes through inf
-    # for a large-times-small pair whose answer is perfectly representable.
-    return torch.ldexp(acc, -(eA + eB))
+        pairs = sorted(itertools.product(range(terms), repeat = 2), key = lambda ij: ij[0] + ij[1])
+        acc = None
+        for i, j in pairs[:products]:
+            part = _mm_f32_accumulate(a_terms[i], b_terms[j])
+            acc = part if acc is None else acc + part
+        # One ldexp with the combined exponent. Neither sA * sB nor a division per scale works: the
+        # product overflows for two small operands, and dividing in either order passes through inf
+        # for a large-times-small pair whose answer is perfectly representable.
+        return torch.ldexp(acc, -(eA + eB))
 
 
 class _FP16SplitMatmul(torch.autograd.Function):

@@ -24,6 +24,7 @@ these pin both halves: that the trap is real, and that no test module falls into
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 
 import pytest
@@ -268,6 +269,12 @@ def test_a_gate_evaluates_to_false_under_the_shim(path: Path, names: list):
 # listed, so a new refusal widens this automatically.
 
 
+# `mlx` itself or a submodule of it. `importorskip("mlx_vlm...")` is a different package, and
+# test_mlx_training_e2e_metal.py uses it inside tests that are already Metal-gated: the prefix
+# alone read that as an mlx gate (#1329).
+_MLX_IMPORTORSKIP = re.compile(r"""importorskip\(\s*["']mlx(?:["']|\.)""")
+
+
 def _shim_refused_ops() -> set:
     """Public ``mx.*`` names whose shim body raises NotImplementedError."""
     stub = _TESTS / "mlx_simulation" / "mlx_stub.py"
@@ -299,7 +306,7 @@ def _consults_the_simulation(source: str) -> bool:
 @pytest.mark.parametrize("path", _test_modules(), ids=lambda p: p.name)
 def test_a_module_calling_an_op_the_shim_refuses_asks_whether_it_is_real(path: Path):
     source = path.read_text(encoding="utf-8")
-    if 'importorskip("mlx' not in source and "importorskip('mlx" not in source:
+    if not _MLX_IMPORTORSKIP.search(source):
         return
     called = sorted(op for op in _shim_refused_ops() if f"mx.{op}" in source)
     if not called or _consults_the_simulation(source):
@@ -314,3 +321,18 @@ def test_a_module_calling_an_op_the_shim_refuses_asks_whether_it_is_real(path: P
         f"    if mlx_is_simulated():\n"
         f"        pytest.skip(..., allow_module_level = True)"
     )
+
+
+@pytest.mark.parametrize(
+    "call, gates",
+    [
+        ('pytest.importorskip("mlx")', True),
+        ('pytest.importorskip("mlx.core")', True),
+        ("pytest.importorskip('mlx.nn')", True),
+        ('pytest.importorskip( "mlx.core" )', True),
+        ('pytest.importorskip("mlx_vlm.models.diffusion_gemma.config")', False),
+        ('pytest.importorskip("mlx_lm")', False),
+    ],
+)
+def test_only_an_importorskip_of_mlx_itself_counts_as_an_mlx_gate(call, gates):
+    assert bool(_MLX_IMPORTORSKIP.search(call)) is gates

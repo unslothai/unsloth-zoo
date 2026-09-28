@@ -19,6 +19,7 @@
 """Chunked cross-entropy helpers built from MLX runtime custom kernels."""
 
 from collections import OrderedDict
+import math
 from typing import Callable
 
 import mlx.core as mx
@@ -108,6 +109,32 @@ def _resolve_chunk_size(
     # Align to 256 for Metal efficiency
     chunk_v = max(min_chunk_v, (chunk_v // 256) * 256)
     return min(chunk_v, vocab_size)
+
+
+_RECOMPUTE_LOGITS_BYTES: int | None = None
+
+
+def _recomputes_logits(n_tokens: int, vocab_size: int, bytes_per_element: int) -> bool:
+    """Recompute once compile-merged forward/backward logits would exceed a tenth of the working set."""
+    global _RECOMPUTE_LOGITS_BYTES
+    if _RECOMPUTE_LOGITS_BYTES is None:
+        try:
+            recommended = mx.device_info().get("max_recommended_working_set_size", 0)
+        except Exception:
+            recommended = 0
+        _RECOMPUTE_LOGITS_BYTES = recommended // 10 if recommended > 0 else 100 * 128 * 1024 * 1024
+    return n_tokens * vocab_size * bytes_per_element > _RECOMPUTE_LOGITS_BYTES
+
+
+def _unmerged_slice(x: mx.array | None, start: int, end: int, axis: int = 0) -> mx.array | None:
+    """``x[start:end]`` along ``axis`` with a traced start, which mx.compile cannot merge."""
+    if x is None:
+        return None
+    starts = [0] * x.ndim
+    starts[axis] = start
+    sizes = list(x.shape)
+    sizes[axis] = end - start
+    return mx.slice(x, mx.array(starts, dtype=mx.int32), tuple(range(x.ndim)), tuple(sizes))
 
 
 def _normalize_label_smoothing(value) -> float:
@@ -216,6 +243,14 @@ def _chunk_matmul(
     )
 
 
+# fast::tanh is not IEEE-strict (MSL 6.5.1): past ~44 it returns 0 or NaN, and true tanh is 1.0f by 20.
+_SOFTCAP_HEADER = """
+inline float cce_softcap_tanh(float ratio) {
+    return ratio > 20.0f ? 1.0f : fast::tanh(ratio);
+}
+"""
+
+
 def _build_forward_update_kernel() -> Callable:
     source = """
         uint gid = thread_position_in_grid.x;
@@ -244,7 +279,7 @@ def _build_forward_update_kernel() -> Callable:
             float raw = logits[base + int(col)];
             float val = raw;
             if (softcap > 0.0f) {
-                val = softcap * fast::tanh(raw / softcap);
+                val = softcap * cce_softcap_tanh(raw / softcap);
             }
             local_max = metal::max(local_max, val);
         }
@@ -266,7 +301,7 @@ def _build_forward_update_kernel() -> Callable:
             float raw = logits[base + int(col)];
             float val = raw;
             if (softcap > 0.0f) {
-                val = softcap * fast::tanh(raw / softcap);
+                val = softcap * cce_softcap_tanh(raw / softcap);
             }
             local_sum += fast::exp(val - chunk_max);
             int global_v = v_start + int(col);
@@ -322,6 +357,7 @@ def _build_forward_update_kernel() -> Callable:
         ],
         output_names=["running_max_out", "running_sum_out", "target_out"],
         source=source,
+        header=_SOFTCAP_HEADER,
         ensure_row_contiguous=True,
     )
 
@@ -357,7 +393,7 @@ def _build_forward_update_finalize_kernel() -> Callable:
             float raw = logits[base + int(col)];
             float val = raw;
             if (softcap > 0.0f) {
-                val = softcap * fast::tanh(raw / softcap);
+                val = softcap * cce_softcap_tanh(raw / softcap);
             }
             local_max = metal::max(local_max, val);
         }
@@ -379,7 +415,7 @@ def _build_forward_update_finalize_kernel() -> Callable:
             float raw = logits[base + int(col)];
             float val = raw;
             if (softcap > 0.0f) {
-                val = softcap * fast::tanh(raw / softcap);
+                val = softcap * cce_softcap_tanh(raw / softcap);
             }
             local_sum += fast::exp(val - chunk_max);
             int global_v = v_start + int(col);
@@ -443,6 +479,7 @@ def _build_forward_update_finalize_kernel() -> Callable:
         ],
         output_names=["running_max_out", "running_sum_out", "target_out", "loss_out", "lse_out"],
         source=source,
+        header=_SOFTCAP_HEADER,
         ensure_row_contiguous=True,
     )
 
@@ -490,13 +527,13 @@ def _build_dlogits_kernel() -> Callable:
             float raw = logits[elem];
             float capped = raw;
             if (softcap > 0.0f) {
-                capped = softcap * fast::tanh(raw / softcap);
+                capped = softcap * cce_softcap_tanh(raw / softcap);
             }
 
             float prob = fast::exp(capped - lse[row]);
             float grad = (prob - float(global_v == target)) * grad_output[row];
             if (softcap > 0.0f) {
-                float t = fast::tanh(raw / softcap);
+                float t = cce_softcap_tanh(raw / softcap);
                 grad *= (1.0f - t * t);
             }
             d_logits[elem] = static_cast<O>(grad);
@@ -516,6 +553,7 @@ def _build_dlogits_kernel() -> Callable:
         ],
         output_names=["d_logits"],
         source=source,
+        header=_SOFTCAP_HEADER,
         ensure_row_contiguous=True,
     )
 
@@ -598,14 +636,166 @@ def _with_single_simd_forward(fallback: Callable, finalize: bool) -> Callable:
             kwargs["threadgroup"] = (32, 1, 1)
             return kernel(**kwargs)
         return fallback(**kwargs)
+
     return call
 
 
+def _build_smoothing_forward_kernel(finalize: bool) -> Callable:
+    source = """
+        uint row = thread_position_in_grid.x / 256;
+        if (row >= logits_shape[0]) {
+            return;
+        }
+
+        uint lid = thread_position_in_grid.x % 256;
+        uint width = logits_shape[1];
+        uint base = row * width;
+        threadgroup float max_buf[256];
+        threadgroup float exp_buf[256];
+        threadgroup float capped_buf[256];
+        float softcap = softcap_arr[0];
+        float local_max = -INFINITY;
+        float local_capped = 0.0f;
+        for (uint col = lid; col < width; col += 256) {
+            float val = logits[base + col];
+            if (softcap > 0.0f) {
+                val = softcap * cce_softcap_tanh(val / softcap);
+            }
+            local_max = metal::max(local_max, val);
+            local_capped += val;
+        }
+        max_buf[lid] = local_max;
+        capped_buf[lid] = local_capped;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 128; stride > 0; stride >>= 1) {
+            if (lid < stride) {
+                max_buf[lid] = metal::max(max_buf[lid], max_buf[lid + stride]);
+                capped_buf[lid] += capped_buf[lid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        float chunk_max = max_buf[0];
+        float local_exp = 0.0f;
+        for (uint col = lid; col < width; col += 256) {
+            float val = logits[base + col];
+            if (softcap > 0.0f) {
+                val = softcap * cce_softcap_tanh(val / softcap);
+            }
+            local_exp += fast::exp(val - chunk_max);
+        }
+        exp_buf[lid] = local_exp;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 128; stride > 0; stride >>= 1) {
+            if (lid < stride) {
+                exp_buf[lid] += exp_buf[lid + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (lid == 0) {
+            float next_max = metal::max(running_max[row], chunk_max);
+            float next_sum = running_sum[row] * fast::exp(running_max[row] - next_max)
+                           + exp_buf[0] * fast::exp(chunk_max - next_max);
+            float next_capped = running_capped[row] + capped_buf[0];
+            int target = targets[row];
+            int start = start_arr[0];
+            float next_target = running_target[row];
+            if (target >= start && target < start + int(width)) {
+                next_target = logits[base + uint(target - start)];
+                if (softcap > 0.0f) {
+                    next_target = softcap * cce_softcap_tanh(next_target / softcap);
+                }
+            }
+            FINALIZE_BODY
+        }
+    """
+    if finalize:
+        body = """
+            float lse_value = next_max + fast::log(next_sum + 1e-9f);
+            lse[row] = lse_value;
+            losses[row] = lse_value - smoothing[0] * next_target
+                        - smoothing[1] * (next_capped / smoothing[2]);
+        """
+        output_names = ["losses", "lse"]
+    else:
+        body = """
+            out_max[row] = next_max;
+            out_sum[row] = next_sum;
+            out_target[row] = next_target;
+            out_capped[row] = next_capped;
+        """
+        output_names = ["out_max", "out_sum", "out_target", "out_capped"]
+    return mx.fast.metal_kernel(
+        name="cce_runtime_smoothing_forward_" + str(int(finalize)),
+        input_names=["logits", "targets", "running_max", "running_sum",
+                     "running_target", "running_capped", "start_arr", "softcap_arr", "smoothing"],
+        output_names=output_names,
+        source=source.replace("FINALIZE_BODY", body),
+        header=_SOFTCAP_HEADER,
+        ensure_row_contiguous=True,
+    )
+
+
+def _build_smoothing_dlogits_kernel() -> Callable:
+    source = """
+        uint base = thread_position_in_grid.x * 4;
+        uint total = logits_shape[0] * logits_shape[1];
+        uint width = logits_shape[1];
+        float softcap = softcap_arr[0];
+        for (uint i = 0; i < 4; i++) {
+            uint elem = base + i;
+            if (elem >= total) {
+                continue;
+            }
+            uint row = elem / width;
+            if (isnan(lse[row])) {
+                d_logits[elem] = static_cast<O>(0.0f / 0.0f);
+                continue;
+            }
+            int target = targets[row];
+            if (target == ignore_arr[0]) {
+                d_logits[elem] = static_cast<O>(0.0f);
+                continue;
+            }
+            int global_v = start_arr[0] + int(elem % width);
+            float raw = logits[elem];
+            float capped = raw;
+            float t = 0.0f;
+            if (softcap > 0.0f) {
+                t = cce_softcap_tanh(raw / softcap);
+                capped = softcap * t;
+            }
+            float prob = fast::exp(capped - lse[row]);
+            float grad = prob - smoothing[0] * float(global_v == target);
+            grad = (grad - smoothing[1]) * grad_output[row];
+            if (softcap > 0.0f) {
+                grad *= (1.0f - t * t);
+            }
+            d_logits[elem] = static_cast<O>(grad);
+        }
+    """
+    return mx.fast.metal_kernel(
+        name="cce_runtime_smoothing_dlogits",
+        input_names=["logits", "lse", "targets", "grad_output", "start_arr",
+                     "ignore_arr", "softcap_arr", "smoothing"],
+        output_names=["d_logits"], source=source,
+        header=_SOFTCAP_HEADER,
+        ensure_row_contiguous=True,
+    )
+
+
 def _build_kernel_set(
+    label_smoothing: float = 0.0,
     logit_softcap: float = 0.0,
 ) -> tuple[Callable | None, Callable | None, Callable | None]:
     if not mx.metal.is_available():
         return None, None, None
+
+    if label_smoothing > 0.0:
+        return (
+            _build_smoothing_forward_kernel(False),
+            _build_smoothing_forward_kernel(True),
+            _build_smoothing_dlogits_kernel(),
+        )
 
     update = _build_forward_update_kernel()
     finalize = _build_forward_update_finalize_kernel()
@@ -669,7 +859,7 @@ def _forward_chunked_fused_finalize(
     targets = targets_raw.astype(mx.int32)
     compute_bytes = 2 if hidden_compute.dtype in (mx.float16, mx.bfloat16) else 4
     if label_smoothing > 0.0:
-        compute_bytes = 4  # smoothing casts each logits chunk to fp32
+        compute_bytes = 4  # sized for the fallback, which casts each smoothed chunk to fp32
     chunk_size = _resolve_chunk_size(
         chunk_size,
         n,
@@ -699,8 +889,7 @@ def _forward_chunked_fused_finalize(
             )
             logits = _apply_softcap(logits, logit_softcap)
             if sum_capped is not None:
-                # eps>0 always takes this python path (kernels disabled), so
-                # match the Metal kernels' float32 LSE accumulation here.
+                # Match the Metal kernels' float32 LSE accumulation.
                 logits = logits.astype(mx.float32)
 
             chunk_max = mx.max(logits, axis=-1)
@@ -736,6 +925,10 @@ def _forward_chunked_fused_finalize(
     softcap_arr = mx.array([logit_softcap], dtype=mx.float32)
     chunk_starts = [mx.array([v_start], dtype=mx.int32) for v_start in range(0, vocab_size, chunk_size)]
     last_chunk_idx = len(chunk_starts) - 1
+    smoothing_arr = (
+        mx.array([1.0 - label_smoothing, label_smoothing, vocab_size], dtype=mx.float32)
+        if label_smoothing > 0.0 else None
+    )
 
     for v_start in range(0, vocab_size, chunk_size):
         chunk_idx = v_start // chunk_size
@@ -752,6 +945,30 @@ def _forward_chunked_fused_finalize(
             bits=bits,
             mode=mode,
         )
+
+        if sum_capped is not None:
+            finalize = chunk_idx == last_chunk_idx
+            kernel = forward_update_finalize_kernel if finalize else forward_update_kernel
+            count = 2 if finalize else 4
+            result = kernel(
+                inputs=[
+                    logits, targets, running_max, running_sum_exp, target_logit,
+                    sum_capped, chunk_starts[chunk_idx], softcap_arr, smoothing_arr,
+                ],
+                output_shapes=[(n,)] * count,
+                output_dtypes=[mx.float32] * count,
+                grid=(n * 256, 1, 1),
+                threadgroup=(256, 1, 1),
+            )
+            if finalize:
+                loss, lse = result
+                loss = mx.where(valid_pre, loss, mx.zeros_like(loss))
+                return (
+                    _poison_invalid_targets(loss, invalid_pre),
+                    _poison_invalid_targets(lse, invalid_pre),
+                )
+            running_max, running_sum_exp, target_logit, sum_capped = result
+            continue
 
         if chunk_idx == last_chunk_idx:
             _, _, _, loss, lse = forward_update_finalize_kernel(
@@ -972,12 +1189,8 @@ def make_runtime_cce_loss_fused_finalize(
 ):
     label_smoothing = _normalize_label_smoothing(label_smoothing)
     forward_update_kernel, forward_update_finalize_kernel, dlogits_kernel = _build_kernel_set(
-        logit_softcap,
+        label_smoothing, logit_softcap,
     )
-    if label_smoothing > 0.0:
-        # Smoothing lives in the chunked python path; the fused Metal kernels
-        # do not carry the vocabulary-sum term. eps=0 keeps the kernel path.
-        forward_update_kernel = forward_update_finalize_kernel = dlogits_kernel = None
     use_metal_kernel = dlogits_kernel is not None
     ignore_arr = mx.array([ignore_index], dtype=mx.int32)
     softcap_arr = mx.array([logit_softcap], dtype=mx.float32)
@@ -1001,7 +1214,7 @@ def make_runtime_cce_loss_fused_finalize(
         vocab_size = weight.shape[0]
         compute_bytes = 2 if hidden.dtype in (mx.float16, mx.bfloat16) else 4
         if label_smoothing > 0.0:
-            compute_bytes = 4  # smoothing casts each logits chunk to fp32
+            compute_bytes = 4  # sized for the fallback, which casts each smoothed chunk to fp32
         resolved_chunk_size = _resolve_chunk_size(
             chunk_size,
             n_tokens,
@@ -1015,10 +1228,8 @@ def make_runtime_cce_loss_fused_finalize(
         # set: logits and d_logits are always both live. Two cells break that ratio badly
         # enough to invert the result, so each is held out rather than re-calibrating the
         # rest. Trainable bfloat16 on the kernel path is 4x, not 2x: dlogits_out_dtype
-        # below writes d_logits float32 and the hidden GEMM casts it back. Label
-        # smoothing is 12-16 bytes, not 4: it disables the kernels, and _fallback_dlogits
-        # holds d_capped, zeros_like(d_capped) and the mx.where result as float32 at
-        # once. Promoting either one costs memory instead of saving it.
+        # below writes d_logits float32 and the hidden GEMM casts it back.
+        # Label smoothing stays excluded. Promoting either one costs memory instead of saving it.
         promoted_chunk = 4096
         promoted_bytes = promoted_chunk * compute_bytes
         token_bytes = compute_bytes
@@ -1169,6 +1380,10 @@ def make_runtime_cce_loss_fused_finalize(
 
             grad_hidden = mx.zeros_like(hidden_compute)
             n_reads = 4
+            smoothing_arr = (
+                mx.array([1.0 - label_smoothing, label_smoothing / vocab_size], dtype=mx.float32)
+                if label_smoothing > 0.0 else None
+            )
 
             for chunk_idx, v_start in enumerate(chunk_starts_int):
                 v_end = min(v_start + resolved_chunk_size, vocab_size)
@@ -1198,7 +1413,7 @@ def make_runtime_cce_loss_fused_finalize(
                             chunk_starts_arr[chunk_idx],
                             ignore_arr,
                             softcap_arr,
-                        ],
+                        ] + ([smoothing_arr] if smoothing_arr is not None else []),
                         output_shapes=[logits.shape],
                         output_dtypes=[dlogits_out_dtype],
                         template=[("O", dlogits_out_dtype)],
@@ -1307,6 +1522,10 @@ def make_runtime_cce_loss_fused_finalize(
         grad_weight = mx.zeros(weight_compute.shape, dtype=weight.dtype)
         hidden_f32 = hidden_compute.astype(mx.float32)
         n_reads = 4
+        smoothing_arr = (
+            mx.array([1.0 - label_smoothing, label_smoothing / vocab_size], dtype=mx.float32)
+            if label_smoothing > 0.0 else None
+        )
 
         for chunk_idx, v_start in enumerate(chunk_starts_int):
             v_end = min(v_start + resolved_chunk_size, vocab_size)
@@ -1327,7 +1546,7 @@ def make_runtime_cce_loss_fused_finalize(
                         chunk_starts_arr[chunk_idx],
                         ignore_arr,
                         softcap_arr,
-                    ],
+                    ] + ([smoothing_arr] if smoothing_arr is not None else []),
                     output_shapes=[logits.shape],
                     output_dtypes=[dlogits_out_dtype],
                     template=[("O", dlogits_out_dtype)],
@@ -1410,3 +1629,155 @@ def make_chunked_cross_entropy_loss(
         weight_is_frozen=weight_is_frozen,
         precompute_hidden_gradient=precompute_hidden_gradient,
     )
+
+
+def supported_lora_head(head):
+    import mlx.nn as nn
+    from mlx_lm.tuner.lora import LoRALinear
+    from mlx.utils import tree_flatten
+
+    if type(head) is not LoRALinear:
+        return False
+    base = head.linear
+    if type(base) not in (nn.Linear, nn.QuantizedLinear):
+        return False
+    if type(head.dropout) is not nn.Dropout or not math.isfinite(float(head.scale)):
+        return False
+    if any(key != "bias" for key, _ in tree_flatten(base.trainable_parameters())):
+        return False
+    a, b = head.lora_a, head.lora_b
+    hidden = base.weight.shape[1]
+    if type(base) is nn.QuantizedLinear:
+        hidden = hidden * 32 // base.bits
+    return (a.ndim == b.ndim == 2 and a.shape[1] == b.shape[0]
+            and a.shape[0] == hidden and a.shape[1] > 0
+            and b.shape[1] == base.weight.shape[0])
+
+
+def make_lora_head_cce(*, chunk_size=2048, adapter_scale=20.0,
+                       logit_scale=1.0, logit_softcap=0.0,
+                       group_size=None, bits=None, mode="affine"):
+    """Chunked cross entropy over a LoRA-adapted classifier."""
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    update, finalize, dlogits = _build_kernel_set(logit_softcap=logit_softcap)
+    if update is None:
+        raise RuntimeError("head CCE requires Metal")
+    ignore_arr = mx.array([-100], dtype=mx.int32)
+    softcap_arr = mx.array([logit_softcap], dtype=mx.float32)
+
+    def base_matmul(h, w, sc, qb, start, end, transpose=True):
+        return _chunk_matmul(
+            h, w[start:end], scales=None if sc is None else sc[start:end],
+            biases=None if qb is None else qb[start:end], group_size=group_size,
+            bits=bits, mode=mode, transpose=transpose)
+
+    def project(h, w, sc, qb, rank_h, b, bias, start, end):
+        if sc is None and bias is not None:
+            logits = mx.addmm(bias[start:end], h, w[start:end].T)
+        else:
+            logits = base_matmul(h, w, sc, qb, start, end)
+            if bias is not None:
+                logits = logits + bias[start:end]
+        delta = (adapter_scale * (rank_h @ b[:, start:end])).astype(h.dtype)
+        logits = logits + delta
+        if logit_scale != 1.0:
+            logits = logits * logit_scale
+        return logits
+
+    @mx.custom_function
+    def full(h, w, sc, qb, rank_h, b, bias, targets):
+        n, vocab = h.shape[0], w.shape[0]
+        if targets.ndim != 1 or targets.shape[0] != n:
+            raise ValueError("targets must match the flat hidden rows")
+        if n == 0:
+            return mx.zeros((0,), dtype=mx.float32), mx.zeros((0,), dtype=mx.float32)
+        # Promote before slicing so recomputation reuses one dense weight cast.
+        projection_weight = w
+        if sc is None:
+            dtype = mx.result_type(h.dtype, w.dtype, w.dtype if bias is None else bias.dtype)
+            projection_weight = w.astype(dtype)
+        _, invalid = _target_validity_masks(targets, vocab, -100)
+        targets32 = targets.astype(mx.int32)
+        running_max = mx.full((n,), -mx.inf, dtype=mx.float32)
+        running_sum = mx.zeros((n,), dtype=mx.float32)
+        target_logit = mx.zeros((n,), dtype=mx.float32)
+        for start in range(0, vocab, chunk_size):
+            end = min(start + chunk_size, vocab)
+            logits = project(h, projection_weight, sc, qb, rank_h, b, bias, start, end)
+            inputs = [logits, targets32, running_max, running_sum, target_logit,
+                      mx.array([start], dtype=mx.int32), ignore_arr, softcap_arr]
+            if end == vocab:
+                result = finalize(inputs=inputs, output_shapes=[(n,)] * 5,
+                                  output_dtypes=[mx.float32] * 5,
+                                  grid=(n * 256, 1, 1), threadgroup=(256, 1, 1))
+                return (_poison_invalid_targets(result[3], invalid),
+                        _poison_invalid_targets(result[4], invalid))
+            running_max, running_sum, target_logit = update(
+                inputs=inputs, output_shapes=[(n,)] * 3,
+                output_dtypes=[mx.float32] * 3,
+                grid=(n * 256, 1, 1), threadgroup=(256, 1, 1))
+
+    @full.vjp
+    def backward(primals, cotangents, outputs):
+        h, w, sc, qb, rank_h, b, bias, targets = primals
+        if h.shape[0] == 0:
+            return tuple(None if x is None else mx.zeros_like(x) for x in primals)
+        grad_output = cotangents[0].astype(mx.float32)
+        if sc is None:
+            base_dtype = mx.result_type(h.dtype, w.dtype, w.dtype if bias is None else bias.dtype)
+        elif mode == "affine":
+            base_dtype = mx.result_type(h.dtype, sc.dtype, sc.dtype if qb is None else qb.dtype)
+        else:
+            base_dtype = h.dtype
+        projection_weight = w.astype(base_dtype) if sc is None else w
+        adapter_dtype = mx.result_type(rank_h.dtype, b.dtype)
+        targets32 = targets.astype(mx.int32)
+        grad_h = mx.zeros_like(h)
+        grad_rank = mx.zeros_like(rank_h)
+        grad_b, grad_bias = [], []
+        recompute = _recomputes_logits(
+            h.shape[0], w.shape[0], 2 if base_dtype in (mx.float16, mx.bfloat16) else 4,
+        )
+        for start in range(0, w.shape[0], chunk_size):
+            end = min(start + chunk_size, w.shape[0])
+            if recompute:
+                logits = project(
+                    h, _unmerged_slice(projection_weight, start, end), _unmerged_slice(sc, start, end),
+                    _unmerged_slice(qb, start, end), rank_h, _unmerged_slice(b, start, end, axis=1),
+                    _unmerged_slice(bias, start, end), 0, end - start)
+            else:
+                logits = project(h, projection_weight, sc, qb, rank_h, b, bias, start, end)
+            dg = dlogits(
+                inputs=[logits, outputs[1], targets32, grad_output,
+                        mx.array([start], dtype=mx.int32), ignore_arr, softcap_arr],
+                output_shapes=[logits.shape], output_dtypes=[logits.dtype],
+                template=[("O", logits.dtype)],
+                grid=((logits.size + 3) // 4, 1, 1), threadgroup=(256, 1, 1))[0]
+            if logit_scale != 1.0:
+                dg = dg * logit_scale
+            grad_h = grad_h + base_matmul(
+                dg.astype(base_dtype), projection_weight, sc, qb, start, end, transpose=False).astype(h.dtype)
+            grad_delta = dg.astype(h.dtype).astype(adapter_dtype) * adapter_scale
+            grad_rank = grad_rank + (grad_delta @ b[:, start:end].T).astype(rank_h.dtype)
+            chunk_grads = [grad_h, grad_rank, (rank_h.T @ grad_delta).astype(b.dtype)]
+            if bias is not None:
+                chunk_grads.append(dg.sum(axis=0).astype(bias.dtype))
+            # mx.depends frees each chunk's dg; compiled graphs otherwise keep every chunk alive.
+            chunk_grads = mx.depends(chunk_grads, [dg])
+            grad_h, grad_rank = chunk_grads[:2]
+            grad_b.append(chunk_grads[2])
+            if bias is not None:
+                grad_bias.append(chunk_grads[3])
+        return (grad_h, mx.zeros_like(w),
+                None if sc is None else mx.zeros_like(sc),
+                None if qb is None else mx.zeros_like(qb),
+                grad_rank, mx.concatenate(grad_b, axis=1),
+                None if bias is None else mx.concatenate(grad_bias),
+                mx.zeros_like(targets))
+
+    def loss(h, w, sc, qb, rank_h, b, bias, targets):
+        losses, lse = full(h, w, sc, qb, rank_h, b, bias, targets)
+        return losses + lse * mx.array(0.0, dtype=mx.float32)
+
+    return loss

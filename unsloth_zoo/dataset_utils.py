@@ -192,7 +192,42 @@ def _find_common_token_ids(component, tokenizer, force_match = False):
         return [], [], []
     optional_left  = original[:where]
     optional_right = original[where+len(substring):]
+    # Plain-text marker edges can BPE-merge with the next message (aya-vision-32b: ">" + "\\sigma" -> ">\\"),
+    # so make them optional, but only while an added token anchors the core: "Q:" -> "Q" hits user text.
+    start, end = _stable_marker_edges(component, original, tokenizer)
+    new_start, new_end = max(where, start), min(where + len(substring), end)
+    if new_end > new_start and (new_start, new_end) != (where, where + len(substring)):
+        added = getattr(tokenizer, "added_tokens_decoder", None) or {}
+        if any(str(added.get(i, "")).strip() for i in original[new_start:new_end]):
+            substring      = original[new_start:new_end]
+            optional_left  = original[:new_start]
+            optional_right = original[new_end:]
     return substring, optional_left, optional_right
+pass
+
+
+_MARKER_EDGE_PROBES = ("\\", "{", "a", "A", "1", "(", ".", "<", "}", ">")
+
+
+def _stable_marker_edges(component, original, tokenizer):
+    """(start, end) of the part of `original` that keeps its ids whatever text touches it."""
+    n = len(original)
+    start, end = 0, n
+    if n == 0:
+        return start, end
+    try:
+        for c in _MARKER_EDGE_PROBES:
+            right = tokenizer(component + c, add_special_tokens = False).input_ids
+            k = 0
+            while k < min(n, len(right)) and right[k] == original[k]: k += 1
+            end = min(end, k)
+            left = tokenizer(c + component, add_special_tokens = False).input_ids
+            k = 0
+            while k < min(n, len(left)) and left[len(left) - 1 - k] == original[n - 1 - k]: k += 1
+            start = max(start, n - k)
+    except Exception:
+        return 0, n
+    return start, end
 pass
 
 
@@ -283,6 +318,14 @@ def get_chat_template_parts(tokenizer):
     tail = lambda s: s[s.rfind(U) + len(U):] if U in s else ""
     _gen_on, _gen_off = render(end_user, True), render(end_user, False)
     asst_header = "" if _gen_on == _gen_off else strip_shared(tail(_gen_on), tail(_gen_off))[0]
+    user_term = tail(_gen_off)
+    _rest = user_term
+    while _rest:
+        _t = next((s for s in specials if _rest.startswith(s)), None) or \
+             (re.match(r"\s+", _rest) and re.match(r"\s+", _rest).group())
+        if not _t: break
+        _rest = _rest[len(_t):]
+    if _rest: user_term = ""
 
     if asst_header and resp_gap.endswith(asst_header) and len(asst_header) < len(resp_gap):
         # Header template (Llama/Gemma/Qwen/Phi-4): terminator is the resp_gap prefix
@@ -301,6 +344,19 @@ def get_chat_template_parts(tokenizer):
         # empty prefixes, so an unset eos never strips a bare "\n".
         response_part    = strip_lead(resp_gap, " ", "\t", eos, bos)
         instruction_part = strip_lead(instr_gap, " ", "\t", eos, bos)
+
+    # Command A Vision splits the terminator with an image: "<|END_TEXT|><|IMG_PATCH|><|END_OF_TURN_TOKEN|>".
+    if user_term and response_part.startswith(user_term) and len(user_term) < len(response_part):
+        try:
+            with_image = render([
+                {"role": "user", "content": [{"type": "text", "text": U}, {"type": "image"}]},
+                {"role": "assistant", "content": awrap(A)},
+            ], False)
+            if response_part not in with_image and response_part[len(user_term):] in with_image:
+                response_part = response_part[len(user_term):]
+                instruction_part = strip_lead(instruction_part, user_term)
+        except Exception:
+            pass
 
     # Reasoning templates inject thinking-block scaffolding into the generation prompt
     # that a real assistant turn ("<think>...</think>answer") does not carry right after
@@ -863,8 +919,8 @@ def train_on_responses_only(
                         else: break
                     pass
                     for optional_right in A_right_forward:
-                        if k >= n_minus_1: break
-                        if optional_right == input_ids[k+1]: k += 1
+                        if k >= n: break
+                        if optional_right == input_ids[k]: k += 1
                         else: break
                     pass
                     # assistant_j = j
@@ -899,16 +955,15 @@ def train_on_responses_only(
                                 else: break
                             pass
                             for optional_right in Q_right_forward:
-                                if k >= n_minus_1: break
-                                if optional_right == input_ids[k+1]: k += 1
+                                if k >= n: break
+                                if optional_right == input_ids[k]: k += 1
                                 else: break
                             pass
                             user_j = j
                             # Account for last item
                             if user_j != n_minus_1:
-                                # user_k = k
-                                # j = user_k
-                                j = k
+                                # Outer j += 1 lands on k, so an empty user turn cannot hide the next marker.
+                                j = k - 1
                             else:
                                 user_j = n
                                 k = n

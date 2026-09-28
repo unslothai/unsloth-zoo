@@ -276,3 +276,7 @@ jobs:
         # model, plus the paths that must not change (already-quantized base,
         # merged_16bit, push_to_hub_merged).
         run: python -m pytest tests/test_mlx_quantized_merge_save_metal.py -v -rs
+
+      - name: tests/test_mlx_decision_metal.py
+        # Typed-decision model logits against a torch reference of laya's DecisionModel.
+        run: python -m pytest tests/test_mlx_decision_metal.py -v -rs
