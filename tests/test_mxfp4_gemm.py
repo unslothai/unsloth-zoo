@@ -96,7 +96,7 @@ def test_autograd_gives_dx_of_the_dense_product():
     y = mxfp4_expert_grouped_mm(x, blocks, scales, counts, transpose_b = True)
     dy = torch.randn_like(y)
     y.backward(dy)
-    dense = mxfp4_dequantize_torch(blocks, scales)   # (E, R, C)
+    dense = mxfp4_dequantize_torch(blocks, scales)
     xr = x.detach().float().requires_grad_(True)
     rows = torch.repeat_interleave(torch.arange(E, device = "cuda"), counts.long())
     torch.bmm(xr.unsqueeze(1), dense.float()[rows].transpose(1, 2)).squeeze(1).backward(dy.float())

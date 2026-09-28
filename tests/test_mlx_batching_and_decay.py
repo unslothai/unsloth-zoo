@@ -2533,6 +2533,65 @@ def test_vlm_plan_reports_an_image_file_rewritten_after_the_plan_was_built(tmp_p
         plan.materialize_all()
 
 
+def test_stream_grid_widens_vlm_batches_at_the_consumer_width_seam():
+    """VLM widens at the post-expansion width; unmaterializable targets are refused or bumped."""
+    _skip_if_mlx_core_was_replaced()
+    from unsloth_zoo.mlx.shape_guard import StreamShapeGrid
+    from unsloth_zoo.mlx.utils import _build_response_masked_vlm_batch
+
+    class _ExpandingProcessor(_ContentProcessor):
+        def __call__(self, text, **_kwargs):  # noqa: D401
+            width = 40 + 7 * max(int(item) for item in text)
+            rows = [[int(item), 200] + [2] * (width - 2) for item in text]
+            return {
+                "input_ids": np.array(rows, dtype=np.int32),
+                "attention_mask": np.array(
+                    [[1] * width for _ in rows], dtype=np.int32,
+                ),
+                "image_grid_thw": np.array([[1, 2, 2]] * len(text), np.int32),
+            }
+
+    grid = StreamShapeGrid()
+    config = {"model_type": "qwen3_5", "image_size": 16, "image_token_id": 200,
+              "video_token_id": 201, "vision_config": {"spatial_merge_size": 2}}
+    items = [{"text": "5"}]
+    plain = _build_response_masked_vlm_batch(
+        items, _ExpandingProcessor(), config, 8, 16,
+    )
+    guarded = _build_response_masked_vlm_batch(
+        items, _ExpandingProcessor(), config, 8, 16,
+        width_policy=grid.endpoint_for,
+    )
+
+    raw_width = int(plain["input_ids"].shape[1])
+    assert raw_width > 8
+    guarded_width = int(guarded["input_ids"].shape[1])
+    assert guarded_width == grid.endpoint_for(raw_width)
+    assert guarded["input_ids"][:, :raw_width].tolist() == plain["input_ids"].tolist()
+    assert guarded["attention_mask"][:, raw_width:].sum().item() == 0
+    assert int(guarded["position_ids"].shape[-1]) == guarded_width
+    assert (guarded["position_ids"][..., :raw_width].tolist()
+            == plain["position_ids"].tolist())
+
+    from unsloth_zoo.mlx.utils import _resolve_stream_vlm_target
+
+    class _NoPadTokenizer(_TinyTokenizer):
+        pad_token_id = None
+
+    class _NoPadProcessor(_ExpandingProcessor):
+        tokenizer = _NoPadTokenizer()
+
+    assert _resolve_stream_vlm_target(
+        plain, config, _NoPadProcessor(), grid.endpoint_for,
+    ) is None
+    bumped = dict(plain)
+    bumped["media_extent"] = mx.zeros((1, guarded_width), dtype=mx.int32)
+    target = _resolve_stream_vlm_target(
+        bumped, config, _ExpandingProcessor(), grid.endpoint_for,
+    )
+    assert target is not None and target > guarded_width
+
+
 @pytest.mark.parametrize("arch", ["kimi_vl", "moondream2"])
 def test_a_family_qualified_without_a_patch_still_has_to_clear_the_gate(arch):
     """No compile patch needed: qualification alone decides."""

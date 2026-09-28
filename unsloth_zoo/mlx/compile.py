@@ -67,6 +67,7 @@ def set_qwen3_vision_norm_cast_output(enabled: bool) -> None:
 # - qwen2_5_vl: real end-to-end compiled training via train.py
 # - gemma3 / qwen3_vl / qwen3_5 / qwen3_5_moe / gemma4 / paligemma / moondream3:
 #   compiled synthetic forward+backward
+# - gemma4_unified: real compiled LoRA training on gemma-4-12B, text and image
 # SmolVLM has processor/template support, but real mlx-vlm training still hits
 # MLX primitive-less-array failures after a compiled call. Keep it patched but
 # unqualified until a real dataset compile run passes.
@@ -77,6 +78,7 @@ _VERIFIED_TRAINING_ARCHES: set[str] = {
     "gemma3",
     "gemma3n",
     "gemma4",
+    "gemma4_unified",
     # Nested `text_config` decoder must qualify too, else gemma4 stays eager.
     "gemma4_text",
     "glm_ocr",
@@ -217,6 +219,7 @@ _TRAINING_VERIFIER_HINTS: dict[str, str] = {
     "gemma3": "verify_gemma3",
     "gemma3n": "verify_gemma3n",
     "gemma4": "verify_gemma4",
+    "gemma4_unified": "verify_gemma4_unified",
     "gemma4_text": "verify_gemma4_text",
     "glm_ocr": "verify_glm_ocr",
     "idefics2": "verify_idefics2",
@@ -610,6 +613,14 @@ def list_compile_patch_primitives() -> tuple[CompilePatchPrimitive, ...]:
         CompilePatchPrimitive(
             name="padded_image_filtering",
             description="Replace Python-side padded image filtering with compile-safe MLX operations.",
+        ),
+        CompilePatchPrimitive(
+            name="static_shape_feature_compaction",
+            description="Reorder padded multimodal features instead of compacting them, so the shape stops depending on mask contents.",
+        ),
+        CompilePatchPrimitive(
+            name="training_prefill_mode_bypass",
+            description="Skip generation-only chunked-prefill bookkeeping while training, where it costs host syncs and mutable state but nothing reads it.",
         ),
         CompilePatchPrimitive(
             name="presence_check_bypass",
@@ -4983,6 +4994,51 @@ def _install_gemma3n_compile_patches():
     _PATCHED_ARCHES.add("gemma3n")
 
 
+def _valid_first_sort_key(valid_flat, rows):
+    # The position term keeps keys distinct; MLX argsort is not guaranteed stable.
+    import mlx.core as mx
+
+    return (~valid_flat).astype(mx.int32) * rows + mx.arange(rows)
+
+
+def _static_shape_prefix_rows(features, valid_mask):
+    """Reorder valid rows first; `masked_scatter` never reads past them."""
+    import mlx.core as mx
+
+    rows = features.shape[0] * features.shape[1]
+    flat = features.reshape(rows, features.shape[-1])
+    order = mx.argsort(_valid_first_sort_key(valid_mask.reshape(rows), rows))
+    return mx.take(flat, order, axis=0)
+
+
+def _install_gemma4_unified_compile_patches():
+    module = _try_import_module("mlx_vlm.models.gemma4_unified.gemma4_unified")
+    if module is None:
+        return
+    if getattr(module, "_compact_prefix_rows", None) is not None:
+        setattr(module, "_compact_prefix_rows", _static_shape_prefix_rows)
+
+    model_cls = getattr(module, "Model", None)
+    original_update = getattr(model_cls, "_update_chunked_prefill_mode", None)
+    if original_update is None:
+        return
+
+    def patched_update_chunked_prefill_mode(self, input_ids=None, **kwargs):
+        # Skip `.item()` syncs; `BatchGenerator` reads the language model flag, so restore the config default.
+        if getattr(self, "training", False):
+            self.no_chunked_prefill = self._base_no_chunked_prefill
+            self.language_model.no_chunked_prefill = self._base_no_chunked_prefill
+            return
+        return original_update(self, input_ids=input_ids, **kwargs)
+
+    _patch_method(
+        model_cls,
+        "_update_chunked_prefill_mode",
+        patched_update_chunked_prefill_mode,
+    )
+    _PATCHED_ARCHES.add("gemma4_unified")
+
+
 def _install_gemma4_compile_patches():
     """Vision overlay on sliding layers only, no host read (upstream's raises under mx.compile)."""
 
@@ -6008,6 +6064,18 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
             runtime_primitive_names=("deepseek_ocr_multimodal_runtime",),
         ),
         CompilePatternBundle(
+            name="gemma4_unified_multimodal",
+            description="Gemma 4 unified padded-feature compaction and chunked-prefill bookkeeping.",
+            matcher=lambda arch, report: arch == "gemma4_unified",
+            primitive_names=(
+                "static_shape_feature_compaction",
+                "training_prefill_mode_bypass",
+            ),
+            adapter_name="gemma_vision_family",
+            protocol_names=("multimodal_merge",),
+            runtime_primitive_names=("gemma4_unified_multimodal_runtime",),
+        ),
+        CompilePatternBundle(
             name="gemma4_vision_masks",
             description="Gemma 4 vision attention masks for cache-free forwards, built as the reference does without a host read.",
             matcher=lambda arch, report: arch == "gemma4",
@@ -6179,6 +6247,7 @@ def _runtime_patch_primitive_installers() -> dict[str, Callable[[], None]]:
         "single_image_token_merge_runtime": _install_llama_pixtral_mistral_compile_patches,
         "mistral4_attention_backend_runtime": _install_mistral4_compile_patches,
         "gemma3n_multiscale_fusion_runtime": _install_gemma3n_compile_patches,
+        "gemma4_unified_multimodal_runtime": _install_gemma4_unified_compile_patches,
         "gemma4_vision_masks_runtime": _install_gemma4_compile_patches,
         "deepseek_ocr_multimodal_runtime": _install_deepseek_ocr_compile_patches,
         "masked_scatter_multimodal_runtime": _install_masked_scatter_multimodal_patches,

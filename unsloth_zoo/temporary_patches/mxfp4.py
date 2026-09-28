@@ -140,8 +140,7 @@ TEMPORARY_PATCHES.append(patch_mxfp4_offload_guard)
 
 
 def keep_mxfp4_experts_packed() -> bool:
-    """Whether GPT-OSS MXFP4 experts stay packed (decoded per layer by grouped_mm) instead of a bf16
-    copy at load. Default on for transformers 5 + grouped_mm; UNSLOTH_MXFP4_KEEP_PACKED=0 disables."""
+    """GPT-OSS experts stay MXFP4 (decoded per layer by grouped_mm); UNSLOTH_MXFP4_KEEP_PACKED=0 disables."""
     setting = os.environ.get("UNSLOTH_MXFP4_KEEP_PACKED", "")
     if setting == "0" or transformers_version < Version("5.0.0"):
         return False
@@ -167,7 +166,6 @@ def keep_mxfp4_experts_packed() -> bool:
 
 
 def _dequantize_to_gpt_oss_layout(convert, blocks, scales):
-    """GPT-OSS (E, in, out) stack: fused transposed kernel, else ``convert`` plus a transposing copy."""
     if blocks.is_cuda and blocks.dtype == torch.uint8 and blocks.dim() == 4:
         return mxfp4_dequantize(blocks, scales, transpose = True)
     return convert(blocks, scales).transpose(1, 2).contiguous()

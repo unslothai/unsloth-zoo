@@ -71,6 +71,8 @@ def sized(monkeypatch):
         calls.append((total_rows, seq_len, multiplier))
         return real(total_rows, seq_len, hidden, vocab, dtype_bytes, multiplier)
 
+    # grpo_accumulated_loss flips this on; monkeypatch owns it so the stop below cannot leak it.
+    monkeypatch.delenv("UNSLOTH_RETURN_HIDDEN_STATES", raising = False)
     monkeypatch.setattr(rr, "autotune_batch_and_chunks", recording)
     monkeypatch.setattr(
         rr, "calculate_pad_tokens_in_prompt", lambda *a, **k: (_ for _ in ()).throw(_Stop())

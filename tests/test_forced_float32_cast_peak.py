@@ -26,6 +26,8 @@ fitting and an OOM.
 These measure the peak rather than inspecting the code, because the whole claim
 is about allocator behaviour.
 """
+import os
+
 import pytest
 import torch
 
@@ -49,6 +51,10 @@ def _small_staging_threshold(monkeypatch):
     from unsloth_zoo import patching_utils
     monkeypatch.setattr(
         patching_utils, "_FORCED_FLOAT32_STAGE_BYTES", _TEST_STAGE_BYTES,
+    )
+    monkeypatch.setattr(
+        patching_utils, "_FORCED_FLOAT32_CHUNK_BYTES", _TEST_STAGE_BYTES // 8,
+        raising = False,
     )
 
 
@@ -133,6 +139,131 @@ def test_the_staged_cast_preserves_values():
     expected = big.weight[:4].detach().to(torch.float16).clone()
     _cast_module(big, torch.float16)
     assert torch.equal(big.weight[:4].detach(), expected)
+
+
+def _values_with_extremes(rows):
+    """Includes values float16 overflows and underflows."""
+    w = torch.randn(rows, 1024, dtype = torch.float32)
+    w[0, :4] = torch.tensor([1e5, -1e5, 1e-9, -1e-9])
+    return w.to(torch.bfloat16).cuda()
+
+
+@cuda
+def test_same_size_cast_rewrites_the_storage_in_place():
+    big = _param_over_the_threshold()
+    with torch.no_grad():
+        big.weight.copy_(_values_with_extremes(big.weight.shape[0]))
+    expected = big.weight.detach().to(torch.float16)
+    before = big.weight.data_ptr()
+    _cast_module(big, torch.float16)
+    assert big.weight.dtype == torch.float16
+    assert big.weight.data_ptr() == before, "no new device or host tensor should be needed"
+    assert torch.equal(big.weight.detach().view(torch.int16), expected.view(torch.int16))
+
+
+@cuda
+def test_an_aliased_storage_is_not_rewritten(monkeypatch):
+    """Rewriting bytes an alias still reads as bfloat16 would corrupt it."""
+    big = _param_over_the_threshold()
+    alias = big.weight.detach()
+    original = alias.clone()
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *a, **k: (0, 0))
+    _cast_module(big, torch.float16)
+    assert big.weight.dtype == torch.float16
+    assert alias.dtype == torch.bfloat16 and torch.equal(alias, original)
+    assert torch.equal(big.weight.detach(), original.to(torch.float16))
+
+
+@cuda
+def test_without_the_use_count_api_nothing_is_rewritten_in_place(monkeypatch):
+    from unsloth_zoo import patching_utils
+    monkeypatch.delattr(torch._C, "_storage_Use_Count", raising = False)
+    big = _param_over_the_threshold()
+    assert not patching_utils._storage_is_private(big.weight)
+    expected = big.weight.detach().to(torch.float16)
+    _cast_module(big, torch.float16)
+    assert torch.equal(big.weight.detach(), expected)
+
+
+@cuda
+@pytest.mark.parametrize("src, dst", [(torch.float32, torch.float16), (torch.bfloat16, torch.float32)])
+def test_a_size_changing_cast_through_the_host_is_exact(monkeypatch, src, dst):
+    from unsloth_zoo import patching_utils
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *a, **k: (0, 0))
+    staged = []
+    real = patching_utils._cast_via_host_chunked
+    monkeypatch.setattr(patching_utils, "_cast_via_host_chunked",
+                        lambda p, d: (staged.append(d), real(p, d))[1])
+    big = _param_over_the_threshold().to(src)
+    expected = big.weight.detach().to(dst)
+    _cast_module(big, dst)
+    assert staged == [dst]
+    assert big.weight.dtype == dst and big.weight.device.type == "cuda"
+    assert torch.equal(big.weight.detach(), expected)
+
+
+@cuda
+def test_no_room_for_a_chunk_uses_the_host_path(monkeypatch):
+    """The in-place path allocates one chunk on the device; the host path allocates none."""
+    from unsloth_zoo import patching_utils
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *a, **k: (patching_utils._FORCED_FLOAT32_CHUNK_BYTES - 1, 0))
+    taken = []
+    for name in ("_cast_in_place_same_size", "_cast_via_host_chunked"):
+        real = getattr(patching_utils, name)
+        monkeypatch.setattr(patching_utils, name, lambda p, d, _r = real, _n = name: (taken.append(_n), _r(p, d))[1])
+    big = _param_over_the_threshold()
+    expected = big.weight.detach().to(torch.float16)
+    _cast_module(big, torch.float16)
+    assert taken == ["_cast_via_host_chunked"]
+    assert torch.equal(big.weight.detach(), expected)
+
+
+@cuda
+def test_a_tied_parameter_is_cast_once_for_both_modules():
+    emb = torch.nn.Embedding(int(_TEST_STAGE_BYTES // 2048) + 1024, 1024).cuda().to(torch.bfloat16)
+    head = torch.nn.Linear(1024, emb.num_embeddings, bias = False).cuda()
+    head.weight = emb.weight
+    expected = emb.weight.detach().to(torch.float16)
+    _cast_module(emb, torch.float16)
+    assert head.weight is emb.weight and head.weight.dtype == torch.float16
+    assert torch.equal(head.weight.detach(), expected)
+
+
+def _rss_anon():
+    with open("/proc/self/status") as f:
+        for line in f:
+            if line.startswith("RssAnon:"):
+                return int(line.split()[1]) * 1024
+    return None
+
+
+_CAN_MEASURE_HOST = os.path.exists("/proc/self/status") and hasattr(torch._C, "_storage_Use_Count")
+
+
+@cuda
+@pytest.mark.skipif(not _CAN_MEASURE_HOST, reason = "needs /proc RSS accounting and in-place casting")
+def test_a_large_cast_does_not_stage_through_host_memory():
+    """Guards the gemma-4 E4B load being OOM-killed on a Colab T4 VM."""
+    import threading, time
+    big = torch.nn.Embedding(128 * 1024, 1024).cuda().to(torch.bfloat16)   # 256 MiB
+    size = big.weight.numel() * big.weight.element_size()
+    torch.cuda.synchronize()
+    base = _rss_anon()
+    peak, done = [base], threading.Event()
+    def sample():
+        while not done.is_set():
+            peak[0] = max(peak[0], _rss_anon()); time.sleep(0.0005)
+    t = threading.Thread(target = sample); t.start()
+    try:
+        _cast_module(big, torch.float16)
+        torch.cuda.synchronize()
+        time.sleep(0.05)
+    finally:
+        done.set(); t.join()
+    assert big.weight.dtype == torch.float16
+    assert peak[0] - base < 0.25 * size, (
+        f"cast used {(peak[0] - base)/2**20:.0f} MiB of host memory for a "
+        f"{size/2**20:.0f} MiB parameter")
 
 
 def test_the_threshold_is_above_ordinary_projections():

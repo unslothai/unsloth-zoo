@@ -15,6 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """mask_truncated_completions must survive the text path's mask rebuild in grpo_accumulated_loss."""
+import inspect
 import types
 
 import pytest
@@ -48,6 +49,19 @@ INPUT_IDS = torch.tensor([[1, 2, 3, 4, 5], [1, 2, 6, 7, 3], [0, 2, 5, 5, 0]])
 TRL_MASK = torch.tensor([[1, 1, 1], [0, 0, 0], [1, 1, 0]])
 
 
+def _forward_arguments(args):
+    """The arguments grpo_accumulated_loss passed to UnslothEfficientGRPO.apply, by name.
+
+    Bound against the real forward rather than spelled out in each stub: a call that no
+    longer matches forward still fails here, but a new trailing parameter (#1399 added
+    upstream_scale) does not break every stub that happened to list the old ones.
+    """
+    return inspect.signature(_REAL_FORWARD).bind(None, *args).arguments
+
+
+_REAL_FORWARD = _rl.UnslothEfficientGRPO.forward
+
+
 def _loss_mask(monkeypatch, completion_mask, **trainer_attrs):
     """The completion_mask grpo_accumulated_loss passes to the loss."""
     monkeypatch.setenv("UNSLOTH_GRPO_SEQ_PACKING", "0")
@@ -57,8 +71,8 @@ def _loss_mask(monkeypatch, completion_mask, **trainer_attrs):
 
     class _Loss:
         @staticmethod
-        def apply(new, old, ref, sampling, lm_head, ids, mask, advantages, beta, scaler, n, kwargs):
-            seen["mask"] = mask.clone()
+        def apply(*args):
+            seen["mask"] = _forward_arguments(args)["_mask"].clone()
             zero = torch.zeros(())
             return zero, zero, zero, zero, zero, zero
 
@@ -131,3 +145,39 @@ def test_the_kl_metric_leaves_dropped_rows_out():
     torch.testing.assert_close(full, per_row.mean())
     torch.testing.assert_close(only_row0, per_row[0])
     assert kl(torch.zeros_like(mask)).item() == 0.0
+
+
+@pytest.mark.parametrize("training, expected", [(True, 4), (False, None)])
+def test_steps_per_generation_reaches_the_loss_only_in_training(monkeypatch, training, expected):
+    """An eval batch is not split across steps, so its count must not be rescaled."""
+    monkeypatch.setenv("UNSLOTH_GRPO_SEQ_PACKING", "0")
+    monkeypatch.setenv("UNSLOTH_GRPO_PREFIX_GROUPER", "0")
+    seen = {}
+
+    class _Loss:
+        @staticmethod
+        def apply(*args):
+            seen.update(_forward_arguments(args)["extra_kwargs"])
+            zero = torch.zeros(())
+            return zero, zero, zero, zero, zero, zero
+
+    monkeypatch.setattr(_rl, "UnslothEfficientGRPO", _Loss)
+    model = _Model().train(training)
+    trainer = types.SimpleNamespace(
+        args = types.SimpleNamespace(unsloth_grpo_mini_batch = 1, unsloth_logit_chunk_multiplier = 1,
+                                     steps_per_generation = 4),
+        processing_class = types.SimpleNamespace(pad_token_id = 0),
+        model = model,
+        accelerator = types.SimpleNamespace(
+            unwrap_model = lambda m, keep_fp32_wrapper = False: m, scaler = None,
+        ),
+        use_vllm = False,
+        _autocast_dtype = None,
+        beta = 0.0,
+    )
+    _rl.grpo_accumulated_loss(
+        trainer, INPUT_IDS, (INPUT_IDS != 0).long(), 3, TRL_MASK,
+        torch.zeros(INPUT_IDS.shape[0]), None, None,
+        loss_type = "dapo", num_items_in_batch = int(TRL_MASK.sum()),
+    )
+    assert seen["steps_per_generation"] == expected

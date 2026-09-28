@@ -47,10 +47,7 @@ if _HAS_TRITON:
 
     @triton.jit
     def _decode_mxfp4_tile(packed, scale, ROWS: tl.constexpr, COLS: tl.constexpr):
-        """(ROWS, COLS // 2) bytes + (ROWS, COLS // 32) e8m0 scales -> (ROWS, COLS) bf16, low nibble first.
-        The e2m1 bits go straight into the bf16 exponent / mantissa, giving value * 2^-126 for every
-        code (0.5 lands on the bf16 subnormal 2^-127); the per-group factor 2^(scale - 1) restores it.
-        Powers of two only, so each value is exact (checked bit for bit against mxfp4_dequantize)."""
+        """e2m1 bits into bf16 give value * 2^-126 (0.5 on the subnormal 2^-127); 2^(scale - 1) restores it exactly."""
         x0 = ((packed & 0x07) << 6) | ((packed & 0x08) << 12)
         x1 = ((packed & 0x70) << 2) | ((packed & 0x80) << 8)
         lo = x0.to(tl.uint16).to(tl.bfloat16, bitcast = True)
@@ -131,8 +128,7 @@ if _HAS_TRITON:
 
     @triton.jit
     def _decode_mxfp4_halves(packed, scale, ROWS: tl.constexpr, BYTES: tl.constexpr):
-        """(ROWS, BYTES) bytes + (ROWS, BYTES // 16) scales -> low-nibble and high-nibble (ROWS, BYTES) bf16
-        tiles, no interleave (the caller pairs them with even / odd columns)."""
+        """Low- and high-nibble bf16 tiles, not interleaved (caller pairs them with even / odd columns)."""
         lo = (((packed & 0x07) << 6) | ((packed & 0x08) << 12)).to(tl.uint16).to(tl.bfloat16, bitcast = True)
         hi = (((packed & 0x70) << 2) | ((packed & 0x80) << 8)).to(tl.uint16).to(tl.bfloat16, bitcast = True)
         f1, f2 = _mxfp4_scale_factors(scale)
@@ -324,7 +320,6 @@ if _HAS_TRITON:
 
 
 def _decode_for_test(blocks, scales):
-    """(E, R, G, 16) -> (E, R, G * 32) bf16 through the GEMM's in-register decode."""
     *prefix, G, _ = blocks.shape
     rows = blocks.numel() // (G * 16)
     out = torch.empty((*prefix, G * 32), dtype = torch.bfloat16, device = blocks.device)
@@ -333,10 +328,7 @@ def _decode_for_test(blocks, scales):
 
 
 def _pick_config(M, E, N, K, transpose_b, asm = False, big_tiles = True):
-    """(BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages, split). Swept on B200 over gpt-oss-20b / 120b and Kimi-K3
-    (896 experts, top-16) shapes with uniform (decode) and real, skewed (prefill / training, hottest expert 3-6x the
-    mean) routing. ``big_tiles=False`` (no sm_100 tensor memory): RTX PRO 6000 (sm_120) sweep on gpt-oss-20b, where
-    the 128x256 tiles spill (4-7x slower) and 256x256 needs 123 KB of its 99 KB shared memory."""
+    """Swept on B200 (gpt-oss, Kimi-K3, uniform + skewed routing); ``big_tiles=False`` = sm_120 sweep, where 128x256 spills."""
     per_expert = M / max(E, 1)
     if not big_tiles and (transpose_b or asm):
         if transpose_b:
@@ -367,14 +359,12 @@ def _pick_config(M, E, N, K, transpose_b, asm = False, big_tiles = True):
 
 
 def _split_permute(x, block_k):
-    """Columns of each block_k block reordered [even | odd] for the split forward."""
     M, K = x.shape
     return x.view(M, K // block_k, block_k // 2, 2).transpose(-1, -2).reshape(M, K)
 
 
 def _pick_dense_config(M, N, K, transpose_b, big_tiles = True):
-    """Single weight (no expert schedule), non-split tiles: narrow N tiles keep every SM busy for skinny inputs.
-    B200 sweep over Llama-3-8B Linear shapes, M <= 64; wider inputs reuse the grouped table."""
+    """Single-weight tiles (B200 sweep, Llama-3-8B shapes, M <= 64); wider inputs reuse the grouped table."""
     if M > 64:
         return _pick_config(M, 1, N, K, transpose_b, big_tiles = big_tiles)
     if transpose_b:
@@ -478,8 +468,7 @@ def _out_shape(x, blocks, transpose_b):
 
 
 def mxfp4_grouped_mm(x, blocks, scales, counts, transpose_b = True, out = None, config = None):
-    """Grouped ``x @ P[e]^T`` (``transpose_b``) or ``x @ P[e]`` over rows sorted by expert.
-    ``counts`` (E,) int32 on device: rows per expert, sum == x.shape[0]. Returns (M, N) in x.dtype."""
+    """Grouped ``x @ P[e]^T`` (``transpose_b``) or ``x @ P[e]``; rows sorted by expert, ``counts`` (E,) int32 on device."""
     shape = _out_shape(x, blocks, transpose_b)
     if x.stride(-1) != 1:
         x = x.contiguous()
@@ -542,7 +531,6 @@ class Mxfp4GroupedMM(torch.autograd.Function):
 
 
 def mxfp4_expert_grouped_mm(x, blocks, scales, counts, transpose_b = True):
-    """Autograd-aware ``mxfp4_grouped_mm`` (dX only; the packed stack is frozen)."""
     if torch.is_grad_enabled() and x.requires_grad:
         return Mxfp4GroupedMM.apply(x, counts, blocks, scales, transpose_b)
     return mxfp4_grouped_mm(x, blocks, scales, counts, transpose_b = transpose_b)
@@ -582,7 +570,7 @@ def _probe(device):
         scales = torch.randint(118, 136, (E, R, G), dtype = torch.uint8, device = device, generator = gen)
         counts = torch.tensor([5, 0, 19], dtype = torch.int32, device = device)
         x = torch.randn(24, G * 32, dtype = torch.bfloat16, device = device, generator = gen)
-        dense = mxfp4_dequantize_torch(blocks, scales, dtype = torch.bfloat16)  # (E, R, C)
+        dense = mxfp4_dequantize_torch(blocks, scales, dtype = torch.bfloat16)
         got = mxfp4_grouped_mm(x, blocks, scales, counts, transpose_b = True).float()
         rows = torch.repeat_interleave(torch.arange(E, device = device), counts.long())
         want = torch.bmm(x.float().unsqueeze(1), dense.float()[rows].transpose(1, 2)).squeeze(1)
@@ -596,8 +584,7 @@ def _probe(device):
 
 
 def mxfp4_grouped_matmul(x, blocks, scales, counts, trans = False):
-    """Stacked-experts calling convention: ``trans=False`` is ``x @ W^T`` (reduce over the packed axis),
-    ``trans=True`` its dX ``x @ W``; no autograd. Same kernel as ``mxfp4_grouped_mm``."""
+    """``trans=False``: ``x @ W^T``; ``trans=True``: ``x @ W``. No autograd."""
     counts = counts.to(device = x.device, dtype = torch.int32)
     if scales.device != blocks.device:
         scales = scales.to(blocks.device)
@@ -605,9 +592,7 @@ def mxfp4_grouped_matmul(x, blocks, scales, counts, trans = False):
 
 
 def mxfp4_matmul(x, blocks, scales, trans = False, out = None, bias = None):
-    """``x @ W^T (+ bias)`` (``trans=False``) or ``x @ W`` for one MXFP4 weight W = decode(blocks ``(N, G, 16)`` or
-    ``(N, G * 16)``, scales ``(N, G)``). bias is added to the fp32 accumulator; ``out`` (contiguous, x's dtype, right
-    size) is written in place, else a new tensor is returned."""
+    """``x @ W^T (+ bias)`` (``trans=False``) or ``x @ W`` for one MXFP4 weight; bias added in fp32."""
     N, G = scales.shape[-2], scales.shape[-1]
     blocks = blocks.contiguous().view(1, N, G, 16)
     if scales.device != blocks.device:
@@ -666,8 +651,7 @@ def _probe_dense(device, dtype):
 
 
 def mxfp4_gemm_available(device = None, dtype = torch.bfloat16) -> bool:
-    """Fused kernel usable for ``dtype`` activations on ``device``: self-checked once per (device, dtype), grouped and
-    single-weight. bf16 and fp16 (the decode is exact in bf16, then cast); ``UNSLOTH_MXFP4_FUSED_GEMM=0`` turns it off."""
+    """Self-checked once per (device, dtype), bf16 / fp16; ``UNSLOTH_MXFP4_FUSED_GEMM=0`` turns it off."""
     if dtype not in (torch.bfloat16, torch.float16):
         return False
     import os
