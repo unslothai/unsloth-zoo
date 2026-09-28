@@ -180,3 +180,16 @@ def test_prompt_completion_cross_attention_mask_all_image_rows():
         ids = out["input_ids"][j][attn[j]]
         after_image = torch.cumsum(ids == IMG_ID, 0) > 0
         assert torch.equal(cross[j][attn[j]][:, 0, 0].bool(), after_image)
+
+
+def test_image_axis_equal_to_token_width_is_not_padded():
+    # An image-only prompt is one token wide, the same size as its image axis
+    collator = make_collator()
+    texts = ["<img>", "x y z w a b"]
+    out = collator._call_processor(dict(text = texts, images = [[IMG], []], padding_side = "left"), True)
+    assert out["input_ids"].shape == (2, 6)
+    assert out["cross_attention_mask"].shape == (2, 6, 1, TILES)
+    assert out["pixel_values"].shape[1] == 1
+    assert out["aspect_ratio_ids"].shape == (2, 1)
+    assert out["aspect_ratio_mask"].shape == (2, 1, TILES)
+    assert (out["pixel_values"][0] == 5).all() and (out["pixel_values"][1] == 0).all()

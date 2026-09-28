@@ -1863,8 +1863,11 @@ class UnslothVisionDataCollator:
         len_i, len_t = out_i["input_ids"].shape[1], out_t["input_ids"].shape[1]
         length = max(len_i, len_t)
 
-        def pad_seq(t, group_len, value):
-            if t.dim() < 2 or t.shape[1] != group_len or group_len == length:
+        token_keys = ("input_ids", "attention_mask", "cross_attention_mask", "token_type_ids", "mm_token_type_ids")
+
+        def pad_seq(key, t, group_len, value):
+            # Pixel tensors can share shape[1] with the token width, so pad by key, not by shape.
+            if key not in token_keys or group_len == length:
                 return t
             fill = torch.full((t.shape[0], length - group_len, *t.shape[2:]), value, dtype = t.dtype, device = t.device)
             return torch.cat([fill, t] if side == "left" else [t, fill], dim = 1)
@@ -1874,14 +1877,14 @@ class UnslothVisionDataCollator:
         for key in dict.fromkeys(list(out_i.keys()) + list(out_t.keys())):
             value = pad_id if key == "input_ids" else 0
             if key in out_i and key in out_t:
-                a, b = pad_seq(out_i[key], len_i, value), pad_seq(out_t[key], len_t, value)
+                a, b = pad_seq(key, out_i[key], len_i, value), pad_seq(key, out_t[key], len_t, value)
             elif key in out_i:
-                a = pad_seq(out_i[key], len_i, value)
+                a = pad_seq(key, out_i[key], len_i, value)
                 b = torch.zeros((len(txt_rows), *a.shape[1:]), dtype = a.dtype, device = a.device)
                 if key == "aspect_ratio_mask":
                     b[..., 0] = 1
             else:
-                b = pad_seq(out_t[key], len_t, value)
+                b = pad_seq(key, out_t[key], len_t, value)
                 a = torch.zeros((len(img_rows), *b.shape[1:]), dtype = b.dtype, device = b.device)
             merged[key] = torch.cat([a, b], dim = 0)[order]
         return BatchFeature(data = merged)
