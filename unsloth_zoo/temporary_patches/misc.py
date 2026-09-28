@@ -2847,3 +2847,38 @@ def patch_peft_lora_integer_input():
     Linear4bit.forward = forward
 pass
 TEMPORARY_PATCHES.append(patch_peft_lora_integer_input)
+
+
+def _list_main_input_numel(value):
+    if all(isinstance(v, torch.Tensor) for v in value):
+        return sum(v.numel() for v in value)
+    return None
+
+
+def patch_trainer_flops_list_main_input():
+    # Nemotron-3-Nano-Omni's main_input_name is pixel_values, a list of ragged tiles: Trainer's `.numel()` crashes.
+    try:
+        from transformers import Trainer
+    except Exception:
+        return
+    original = Trainer.__dict__.get("floating_point_ops")
+    if original is None or getattr(original, "_unsloth_list_main_input", False):
+        return
+
+    @functools.wraps(original)
+    def floating_point_ops(self, inputs):
+        model = getattr(self, "model", None)
+        main_input = getattr(model, "main_input_name", "input_ids")
+        # BatchFeature is a UserDict, not a dict.
+        value = inputs.get(main_input, None) if hasattr(inputs, "get") else None
+        if isinstance(value, (list, tuple)) and hasattr(model, "num_parameters"):
+            numel = _list_main_input_numel(value)
+            if numel is None:
+                return 0
+            return 6 * numel * model.num_parameters(exclude_embeddings = True)
+        return original(self, inputs)
+
+    floating_point_ops._unsloth_list_main_input = True
+    Trainer.floating_point_ops = floating_point_ops
+pass
+TEMPORARY_PATCHES.append(patch_trainer_flops_list_main_input)
