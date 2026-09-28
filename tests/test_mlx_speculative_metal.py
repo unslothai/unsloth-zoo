@@ -58,15 +58,15 @@ def _drafter(model, **kwargs):
     return drafter
 
 
-def _prefill(lm, prompt, sampling, processors = ()):
+def _prefill(lm, prompt, sampling, processors = (), drafter = None):
     from mlx_vlm.models.cache import make_prompt_cache
-    from unsloth_zoo.mlx.speculative import _RowSampler
+    from unsloth_zoo.mlx.speculative import _RowSampler, _capture, _features
     cache = make_prompt_cache(lm)
-    out = lm(mx.array([prompt]), cache = cache, return_hidden = True)
+    out = lm(mx.array([prompt]), cache = cache, **_capture(drafter))
     logits = out.logits[:, -1]
     for processor in processors:
         logits = processor(mx.array(prompt), logits)
-    return cache, int(_RowSampler(sampling)(logits - mx.logsumexp(logits, -1, keepdims = True), 0).item()), out.hidden_states[-1]
+    return cache, int(_RowSampler(sampling)(logits - mx.logsumexp(logits, -1, keepdims = True), 0).item()), _features(drafter, out)
 
 
 def _solo(model, prompt, n, sampling, processors = ()):
@@ -98,7 +98,7 @@ def _run(model, prompts, n, controller, sampling, processors = None, patch = Non
     out = {}
     for uid, prompt in enumerate(prompts):
         extra = (processors or {}).get(uid, ())
-        cache, first, hidden = _prefill(model.language_model, prompt, sampling, extra)
+        cache, first, hidden = _prefill(model.language_model, prompt, sampling, extra, drafter)
         engine.add(EngineRow(cache = cache, pending = first, prompt = prompt, sampling = sampling, max_tokens = n, processors = extra, hidden = hidden, uid = uid))
         out[uid] = [first]
     drafted = {}
@@ -302,3 +302,43 @@ def test_other_mtp_heads_match_a_head_that_never_drafted_even_in_a_wrapping_wind
     _run(model, [prompt], 96, _script(("draft", 3), ("draft", 3), ("plain", 12), ("copy", 4), ("draft", 2)), SamplingParams(), drafter = drafter)
     assert len(compared) > 6 and all(compared)
     assert max(sum(len(t) for t, _ in chunk) for chunk in chunks[1:]) <= 8  # max_lag - 1 pending plus one 5-token round
+
+
+
+def _tiny_companion(model, repo):
+    from mlx_vlm.speculative.drafters import dflash2, dspark, qwen3_dflash
+    from mlx_vlm.utils import load_config
+    config, n = load_config(repo), (text := model.language_model.config.text_config).num_hidden_layers
+    config.update(hidden_size = text.hidden_size, vocab_size = text.vocab_size, num_hidden_layers = 2, num_attention_heads = 4, num_key_value_heads = 2,
+                  head_dim = 64, intermediate_size = 256, num_target_layers = n, layer_types = config.get("layer_types", [])[:2])
+    config["dflash_config"].update(target_layer_ids = [1, n // 2, n - 2], num_target_layers = n, selector_rank = 16, markov_rank = 16)
+    module = {"DFlash2DraftModel": dflash2, "DSparkDraftModel": dspark}.get(config["architectures"][0], qwen3_dflash)
+    return module.Model(module.ModelConfig.from_dict(config))
+
+
+@pytest.mark.parametrize("repo", ["z-lab/Qwen3.5-4B-DFlash", "incoai/Qwen3.8-27B-DFlash2", "RadixArk/Qwen3.8-27B-DSpark"])
+def test_dflash_family_drafts_from_every_committed_feature_alone_batched_and_through_the_seam(qwen, repo, monkeypatch):
+    from unsloth_zoo.mlx import generate, speculative
+    (model, ids), ar, SamplingParams = qwen, __import__("mlx_vlm.generate.ar", fromlist = ["ar"]), generate.SamplingParams
+    drafter, blocks, rows, sequences = speculative.ContextDrafter(_tiny_companion(model, repo), model.language_model, max_lag = 8), [], [], []
+    block, start = drafter._block, drafter.start
+    drafter._block = lambda row, depth: blocks.append((row, row.pending, mx.concatenate(row.features), got := block(row, depth))) or got
+    drafter.start = lambda prompt, hidden, pending: rows.append((started := start(prompt, hidden, pending))[0]) or started
+    # Only the lone row mixes in plain windows: batched ones carry ordinary batched numerics.
+    for prompts, script in ((ids[:1], (("draft", 3), ("plain", 9), ("copy", 4), ("draft", 5))), (ids[:2], (("draft", 3), ("copy", 4), ("draft", 5)))):
+        out, drafted, _ = _run(model, prompts, 48, _script(*script), SamplingParams(), drafter = drafter)
+        assert out == [_solo(model, prompt, 48, SamplingParams()) for prompt in prompts] and all(n for n, _ in drafted.values())
+        sequences += [[*prompt, *tokens] for prompt, tokens in zip(prompts, out)]
+    [monkeypatch.setattr(ar, name, getattr(ar, name)) for name in ("run_speculative_rounds", "SpeculativePrefill")]
+    speculative.install_speculative_seam()
+    (draft := speculative.SpeculativeDraft(_script(("draft", 4)), drafter)).prepare(ids[0], SamplingParams())
+    sequences.append([*ids[0], *(int(token) for token, _ in ar.generate_step(
+        mx.array([ids[0]]), model, None, None, max_tokens = 48, temperature = 0.0, draft_model = draft, draft_kind = draft.draft_kind, prefill_step_size = 16))])
+    assert sequences[-1] == sequences[0] and start(ids[0], None, 0) == (None, [])
+    # Contexts run on from the prompt's first position (six prefill chunks); anchors follow; drafts equal a fresh drafter's.
+    for row, sequence in zip(rows, sequences, strict = True):
+        reference, fed, fresh = drafter.features(model.language_model(mx.array([sequence]), **drafter.capture))[0], 0, drafter.model.make_cache()
+        for pending, context, got in [block[1:] for block in blocks if block[0] is row]:
+            fed += len(context)
+            assert pending == sequence[fed] and (context - reference[fed - len(context) : fed]).abs().mean().item() < 0.5
+            assert mx.array_equal(got, drafter.model.draft_block(pending, context[None], fresh, got.shape[-1] + 1, lambda logits: mx.argmax(logits, axis = -1)))

@@ -34,6 +34,7 @@ from .generate import SamplingParams
 
 __all__ = [
     "AssistantDrafter",
+    "ContextDrafter",
     "DraftController",
     "EngineRow",
     "HeadDrafter",
@@ -46,6 +47,7 @@ __all__ = [
     "SpeculativeDraft",
     "SpeculativeEngine",
     "StepOutput",
+    "companion_drafter",
     "install_speculative_seam",
     "native_mtp_drafter",
     "speculative_unavailable_reason",
@@ -726,6 +728,15 @@ class _Row:
         return taken
 
 
+def _capture(drafter) -> dict:
+    return getattr(drafter, "capture", {"return_hidden": True})
+
+
+def _features(drafter, out) -> mx.array:
+    features = getattr(drafter, "features", None)
+    return out.hidden_states[-1] if features is None else features(out)
+
+
 def _language_call(family: str):
     try:
         module = __import__(f"mlx_vlm.models.{family}.language", fromlist = ["LanguageModel"])
@@ -850,12 +861,15 @@ class SpeculativeEngine:
     def _kwargs(self) -> dict:
         kwargs = self._position_kwargs()
         if any(row.draft is not None for row in self._rows):
-            kwargs["return_hidden"] = True
+            kwargs.update(_capture(self.drafter))
         return kwargs
 
-    @staticmethod
-    def _hidden(out) -> mx.array | None:
-        return out.hidden_states[-1] if out.hidden_states else None
+    def _hidden(self, out) -> mx.array | None:
+        if not any(row.draft is not None for row in self._rows):
+            return None
+        if not out.hidden_states:
+            raise RuntimeError(f"{type(self.lm).__name__} returned no hidden states for the drafter")
+        return _features(self.drafter, out)
 
     def _step(self, inputs: mx.array, ahead: int = 0) -> tuple[mx.array, mx.array | None]:
         """Forward one token per row and sample the next; ``ahead`` counts tokens already sampled
@@ -868,7 +882,7 @@ class SpeculativeEngine:
 
     def _verify(self, inputs: mx.array):
         if self._exact:
-            out = self.lm(inputs, cache = self.cache, capture_layer_ids = [], speculative_verify = True, **self._kwargs())
+            out = self.lm(inputs, cache = self.cache, speculative_verify = True, **{"capture_layer_ids": [], **self._kwargs()})
             return out.logits, self._hidden(out), out.gdn_states
         out, transaction = self._verify_forward(self.lm, inputs, self.cache, **self._kwargs())
         return out.logits, self._hidden(out), transaction
@@ -1014,17 +1028,24 @@ class SpeculativeDraft:
     generation; mlx-vlm does not pass on the prompt or sampling. Not for requests with logits processors:
     they cannot speculate, and the seam does not see them. The controller persists."""
 
-    draft_kind = "mtp"
-
     def __init__(self, controller: DraftController, drafter = None):
         self.controller = controller
         self.drafter = drafter
         self._request = None
 
     @property
+    def draft_kind(self) -> str:
+        return getattr(self.drafter, "kind", "mtp")
+
+    @property
+    def config(self):
+        # mlx-vlm reads the capture layers of dflash/eagle3 drafters from here.
+        return getattr(self.drafter, "config", None)
+
+    @property
     def prompt_tail(self) -> int:
-        """How many of the prompt's last hidden states the drafter starts from."""
-        return 0 if self.drafter is None else getattr(self.drafter, "max_lag", 1)
+        """How many of the prompt's last hidden states an MTP drafter starts from; other kinds take the whole prompt."""
+        return getattr(self.drafter, "max_lag", 1) if self.drafter is not None and self.draft_kind == "mtp" else 0
 
     def prepare(self, prompt: Sequence[int], sampling: SamplingParams) -> None:
         self._request = (list(prompt), sampling)
@@ -1036,7 +1057,9 @@ class SpeculativeDraft:
         first = int(first_token.item())
         yield first, logprobs
         deltas = getattr(getattr(model, "language_model", model), "_rope_deltas", None)
-        hidden = last_outputs.hidden_states[-1][:, -self.prompt_tail :] if self.drafter is not None and last_outputs.hidden_states else None
+        hidden = _features(self.drafter, last_outputs) if self.drafter is not None and last_outputs.hidden_states else None
+        if hidden is not None and self.prompt_tail:
+            hidden = hidden[:, -self.prompt_tail :]
         engine = SpeculativeEngine(model, self.controller, self.drafter)
         engine.add(EngineRow(
             cache = prompt_cache, pending = first, prompt = prompt, sampling = sampling, max_tokens = max_tokens,
@@ -1406,7 +1429,91 @@ class HeadDrafter:
         return [0] * len(rows)
 
 
-def native_mtp_drafter(model_path: str | Path, target: nn.Module, **kwargs) -> MTPDrafter | HeadDrafter | None:
+class ContextRow:
+    def __init__(self, cache: list):
+        self.cache = cache
+        self.pending = 0
+        self.features: list[mx.array] = []
+
+    @property
+    def ready(self) -> bool:
+        return bool(self.features)
+
+
+class ContextDrafter:
+    """Drafts with a DFlash-family drafter (DFlash, DFlash2, DSpark): a block reads the target features of the
+    committed tokens as context and caches only that context, so a rejected draft leaves nothing to undo.
+    Each row drafts alone with its own caches, whose scalar offsets cannot be batched."""
+
+    kind = "dflash"
+
+    def __init__(self, model: nn.Module, target: nn.Module, max_lag: int = 512):
+        from mlx_vlm.speculative.drafters import DFlashDraftModel
+
+        model.bind(target)
+        self.model = model
+        self.max_lag = max_lag
+        self.capture = {"capture_layer_ids": list(model.config.target_layer_ids)}
+        # The trained block, not mlx-vlm's fixed runtime default: the controller picks the depth below it.
+        self.max_depth = int(model.config.block_size) - 1
+        # The greedy shortcut would bypass an overridden draft_block (DFlash2's selector, DSpark's Markov head).
+        self._draft = model.draft_block_greedy if type(model).draft_block is DFlashDraftModel.draft_block else model.draft_block
+
+    @property
+    def config(self):
+        return self.model.config
+
+    @staticmethod
+    def features(out) -> mx.array:
+        return mx.concatenate(out.hidden_states, axis = -1)
+
+    def new_cache(self) -> list:
+        return []
+
+    def start(self, prompt: Sequence[int], hidden: mx.array | None, pending: int) -> tuple[ContextRow | None, list]:
+        """``hidden`` holds the features of every prefilled position; without them the row does not draft."""
+        if hidden is None:
+            return None, []
+        row = ContextRow(self.model.make_cache())
+        self.push(row, [pending], hidden[0])
+        return row, []
+
+    def push(self, row: ContextRow, tokens: Sequence[int], hidden: mx.array) -> None:
+        row.pending = int(tokens[-1])
+        row.features.append(hidden)
+        if sum(len(chunk) for chunk in row.features) >= self.max_lag:
+            # A discarded one-token block moves the backlog into the context cache.
+            mx.async_eval(self._block(row, 1))
+
+    def catch_up(self, cache: list, rows: Sequence[ContextRow | None]) -> int:
+        return 0
+
+    def _block(self, row: ContextRow, depth: int) -> mx.array:
+        context, row.features = mx.concatenate(row.features)[None], []
+        return self._draft(row.pending, context, row.cache, depth + 1, lambda logits: mx.argmax(logits, axis = -1), mx.int32)
+
+    def draft(self, cache: list, rows: Sequence[ContextRow | None], depth: int, target: list) -> mx.array:
+        return mx.concatenate([
+            self._block(row, depth).reshape(1, depth) if row is not None and row.ready else mx.zeros((1, depth), mx.int32)
+            for row in rows
+        ])
+
+    def settle(self, cache: list, rows: Sequence[ContextRow | None], appended: int, keep: Sequence[int]) -> list[int]:
+        return [0] * len(rows)
+
+
+def companion_drafter(model_path: str | Path, target: nn.Module, **kwargs) -> ContextDrafter:
+    """A drafter from a separate DFlash, DFlash2 or DSpark checkpoint, checked against ``target``."""
+    from mlx_vlm.speculative.drafters import load_drafter, validate_drafter_compatibility
+
+    model, kind = load_drafter(str(model_path))
+    if kind != "dflash":
+        raise ValueError(f"{kind} companion drafters are not supported")
+    validate_drafter_compatibility(target, model, kind)
+    return ContextDrafter(model, target, **kwargs)
+
+
+def native_mtp_drafter(model_path: str | Path, target: nn.Module, **kwargs) -> MTPDrafter | HeadDrafter | ContextDrafter | None:
     """A drafter for the target's own MTP head, built in memory from only the ``mtp.*`` tensors of its
     checkpoint as mlx-vlm's MTP splitter would write it; None when no splitter knows the checkpoint."""
     from mlx_vlm.fp8 import transform_fp8_weights
@@ -1452,6 +1559,9 @@ def native_mtp_drafter(model_path: str | Path, target: nn.Module, **kwargs) -> M
         )
     model.load_weights(list(weights.items()), strict = True)
     mx.eval(model.parameters())
+    from mlx_vlm.speculative.drafters import DRAFTER_KIND_BY_MODEL_TYPE
     from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
 
+    if DRAFTER_KIND_BY_MODEL_TYPE.get(splitter.output_model_type) == "dflash":
+        return ContextDrafter(model, target, **kwargs)
     return (MTPDrafter if type(model) is Qwen3_5MTPDraftModel else HeadDrafter)(model, target, **kwargs)
