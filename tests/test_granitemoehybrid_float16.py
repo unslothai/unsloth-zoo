@@ -60,7 +60,7 @@ def test_rewrite_matches_installed_and_legacy_source():
         out = patch._rewrite_decoder_source(source)
         assert out is not None
         assert out.startswith("def forward")
-        assert out.count("self.residual_multiplier") == 2  # attention add + MoE branch
+        assert out.count("self.residual_multiplier") == 2
         assert "_granite_scaled_shared_mlp(self, hidden_states)" in out
         assert "hidden_states = residual + hidden_states\n" in out
 
@@ -109,7 +109,6 @@ def test_float16_dispatch_and_overflow(monkeypatch):
     with torch.no_grad(): fixed = model(ids, use_cache = False).logits
     assert torch.isfinite(fixed).all()
 
-    # bfloat16 and float32 take the stock forward untouched.
     calls = []
     stock = gm.GraniteMoeHybridDecoderLayer.forward.__wrapped__
     def spy(self, hidden_states, *args, **kwargs):
@@ -124,7 +123,6 @@ def test_float16_dispatch_and_overflow(monkeypatch):
 
 
 def test_float16_fold_keeps_lora_bias_scaled(monkeypatch):
-    # PEFT lora_bias=True gives lora_B a bias the fold would leave unscaled by residual_multiplier.
     peft = pytest.importorskip("peft")
     model = _tiny_model(0, torch.float32)
     config = peft.LoraConfig(r = 4, target_modules = ["output_linear"], lora_bias = True, init_lora_weights = False)
@@ -142,7 +140,7 @@ def test_float16_fold_keeps_lora_bias_scaled(monkeypatch):
 
 
 def test_float16_forward_helper_is_a_module_global():
-    # torch.compile guards resolve the exec'd forward's globals via sys.modules[__name__]; a namespace-only helper crashed guard creation.
+    # torch.compile guards resolve globals via sys.modules[__name__].
     import sys
     folded = patch._build_float16_decoder_forward(gm, _stock_forward())
     owner = sys.modules[folded.__globals__["__name__"]]

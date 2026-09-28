@@ -14,12 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-# Granite-4 dense checkpoints (granite-4.0-350m, granite-4.0-micro) carry massive activations
-# in the shared MLP: in bf16, silu(gate) * up reaches ~65k and output_linear ~47k, against
-# float16's 65504, so float16 LoRA training overflows to inf within a few steps. The decoder
-# only scales that output by residual_multiplier (~0.25) afterwards. output_linear is linear,
-# so in float16 the multiplier is folded into `up` before the product instead. Hybrid
-# checkpoints peak ~2.7k and are unaffected; other dtypes run the stock forward.
+# Granite-4 dense (granite-4.0-350m, -micro) shared MLP activations reach ~65k, past float16's 65504, so float16
+# LoRA training overflows. residual_multiplier is applied only afterwards and output_linear is linear, so float16
+# folds it into `up` before the product. Other dtypes run the stock forward.
 
 import functools
 import inspect
