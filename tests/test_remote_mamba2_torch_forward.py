@@ -1,3 +1,19 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 """Remote Mamba2 torch_forward repairs vs the exact float64 recurrence; fixture = verbatim remote code. CPU only."""
 import importlib.util
 import os
@@ -52,11 +68,8 @@ def repaired():
     module = _load_fixture("transformers_modules.unsloth_test_remote_mamba2")
     cls = module.FakeRemoteMamba2Mixer
     original = cls.torch_forward
-    try:
-        from unsloth_zoo.temporary_patches.remote_mamba2 import repair_remote_mamba2_torch_forward
-    except ImportError:
-        repair_remote_mamba2_torch_forward = None
-    changed = repair_remote_mamba2_torch_forward(cls) if repair_remote_mamba2_torch_forward else False
+    from unsloth_zoo.temporary_patches.remote_mamba2 import repair_remote_mamba2_torch_forward
+    changed = repair_remote_mamba2_torch_forward(cls)
     yield cls, original, changed
     cls.torch_forward = original
     sys.modules.pop("transformers_modules.unsloth_test_remote_mamba2", None)
@@ -102,10 +115,7 @@ def test_repair_is_idempotent_and_skips_fixed_code(repaired):
 
 
 def test_kill_switch(monkeypatch):
-    try:
-        from unsloth_zoo.temporary_patches.remote_mamba2 import repair_remote_mamba2_torch_forward
-    except ImportError:
-        pytest.skip("repair not present")
+    from unsloth_zoo.temporary_patches.remote_mamba2 import repair_remote_mamba2_torch_forward
     module = _load_fixture("transformers_modules.unsloth_test_remote_mamba2_ks")
     monkeypatch.setenv("UNSLOTH_REMOTE_MAMBA2_FIX", "0")
     assert repair_remote_mamba2_torch_forward(module.FakeRemoteMamba2Mixer) is False
@@ -113,10 +123,7 @@ def test_kill_switch(monkeypatch):
 
 
 def test_hook_repairs_remote_classes_loaded_later(monkeypatch):
-    try:
-        from unsloth_zoo.temporary_patches import remote_mamba2
-    except ImportError:
-        pytest.skip("repair not present")
+    from unsloth_zoo.temporary_patches import remote_mamba2
     import transformers.dynamic_module_utils as dynamic_module_utils
     name = "transformers_modules.unsloth_test_remote_mamba2_hook"
 
