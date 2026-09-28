@@ -794,11 +794,13 @@ def set_additional_modules(new_model, quant_state_dict, config):
         # Qwen 3 VL visual embeddings
         set_embedding(new_model.model.visual.pos_embed, 'model.visual.pos_embed.weight', None, requires_grad=False)
 
-    norm_key = f"{language_model_prefix}.norm.weight"
+    # LFM2 calls its final norm embedding_norm
+    norm_name = "norm" if hasattr(language_model, "norm") else "embedding_norm"
+    norm_key = f"{language_model_prefix}.{norm_name}.weight"
     norm = quant_state_dict[norm_key]
     norm = _unwrap_tensor(norm)
     norm = torch.nn.Parameter(norm, requires_grad = False)
-    language_model.norm.weight = norm
+    getattr(language_model, norm_name).weight = norm
 
     # LM Head. For some models (e.g. Mistral3ForConditionalGeneration)
     # tie_word_embeddings can differ between config and text_config; prefer
@@ -1078,6 +1080,15 @@ def get_model_layer_config(return_non_layered=True):
             "model.layers.{kk}.linear_attn.dt_bias",
             "model.layers.{kk}.linear_attn.A_log",
 
+            # LFM2
+            "model.layers.{kk}.self_attn.out_proj",
+            "model.layers.{kk}.conv.in_proj",
+            "model.layers.{kk}.conv.out_proj",
+            "model.layers.{kk}.conv.conv",
+            "model.layers.{kk}.feed_forward.w1",
+            "model.layers.{kk}.feed_forward.w2",
+            "model.layers.{kk}.feed_forward.w3",
+
             # Gemma4 per-layer input modules
             "model.language_model.layers.{kk}.per_layer_input_gate",
             "model.language_model.layers.{kk}.per_layer_projection",
@@ -1130,6 +1141,12 @@ def get_model_layer_config(return_non_layered=True):
             "model.visual.deepstack_merger_list.{kk}.norm",
             "model.language_model.layers.{kk}.linear_attn.norm",
             "model.layers.{kk}.linear_attn.norm",
+
+            # LFM2
+            "model.layers.{kk}.operator_norm",
+            "model.layers.{kk}.ffn_norm",
+            "model.layers.{kk}.self_attn.q_layernorm",
+            "model.layers.{kk}.self_attn.k_layernorm",
 
             # Gemma4 per-layer input norm
             "model.language_model.layers.{kk}.post_per_layer_input_norm",
