@@ -55,8 +55,7 @@ def _build(config_name):
 def test_granite_moe_aux_loss_is_a_tensor_added_to_the_loss(config_name):
     patch_granitemoe_router_logits_recording()
     model = _build(config_name)
-    # The CausalLM forward does not pass its output_router_logits kwarg to the inner model, which reads the config;
-    # TRL >= 1.7 sets the config flag, so mirror that.
+    # The inner model reads output_router_logits from the config, which TRL >= 1.7 sets.
     model.config.output_router_logits = True
     ids = torch.randint(0, 64, (2, 7))
     with torch.no_grad():
