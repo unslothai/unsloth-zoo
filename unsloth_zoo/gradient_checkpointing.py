@@ -684,8 +684,19 @@ def set_device_states(devices, states, *, device_type=None) -> None:
         return
     device_module = _get_device_module(device_type)
     for device, state in zip(devices, states):
-        with device_module.device(device):
-            device_module.set_rng_state(state)
+        device_module.set_rng_state(state, device)
+pass
+
+
+def _cuda_tensor_arg_devices(args):
+    """Device ids of args that are all plain CUDA tensors (transformers passes just hidden_states), else None.
+    Matches _infer_device_type + get_device_states for that case without their per-layer pytree walks."""
+    device_ids = []
+    for arg in args:
+        if (type(arg) is not torch.Tensor and type(arg) is not torch.nn.Parameter) or arg.device.type != "cuda":
+            return None
+        device_ids.append(arg.get_device())
+    return device_ids or None
 pass
 
 global CPU_BUFFERS
@@ -851,7 +862,8 @@ class UnslothCheckpointFunction(torch.autograd.Function):
         ctx.run_function = run_function
         ctx.preserve_rng_state = preserve_rng_state
         # Handle autocast enabled for cpu AND gpu.
-        ctx.device_type = _infer_device_type(*args)
+        cuda_devices = _cuda_tensor_arg_devices(args)
+        ctx.device_type = "cuda" if cuda_devices is not None else _infer_device_type(*args)
         ctx.device_autocast_kwargs, ctx.cpu_autocast_kwargs = _get_autocast_kwargs(
             ctx.device_type
         )
@@ -863,7 +875,11 @@ class UnslothCheckpointFunction(torch.autograd.Function):
             device_module = _get_device_module(ctx.device_type)
             if getattr(device_module, "_initialized", False):
                 ctx.had_device_in_fwd = True
-                ctx.fwd_devices, ctx.fwd_device_states = get_device_states(*args)
+                if cuda_devices is not None:
+                    ctx.fwd_devices = cuda_devices
+                    ctx.fwd_device_states = [torch.cuda.get_rng_state(device) for device in cuda_devices]
+                else:
+                    ctx.fwd_devices, ctx.fwd_device_states = get_device_states(*args)
 
         # Save non-tensor inputs in ctx, keep a placeholder None for tensors
         # to be filled out during the backward.

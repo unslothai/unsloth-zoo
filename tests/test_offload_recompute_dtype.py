@@ -154,3 +154,20 @@ def test_a_float32_activation_is_stored_as_bf16_and_recomputed_in_float32(offloa
     assert all(x.untyped_storage().nbytes() >= hidden.numel() * 2 for x in stored)
     assert all(x.untyped_storage().nbytes() < hidden.numel() * 4 for x in stored)
     assert torch.equal(hidden.grad, torch.full_like(hidden.grad, 4.0))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA tensors")
+def test_cuda_arg_fast_path_matches_torch_device_state_helpers():
+    from torch.utils.checkpoint import _infer_device_type, get_device_states
+    a = torch.randn(4, device = "cuda")
+    p = torch.nn.Parameter(torch.randn(4, device = "cuda"))
+    for args in ((a,), (a, p), (a, a)):
+        devices = gc._cuda_tensor_arg_devices(args)
+        assert _infer_device_type(*args) == "cuda"
+        torch_devices, torch_states = get_device_states(*args)
+        assert devices == torch_devices
+        for device, state in zip(devices, torch_states):
+            assert torch.equal(torch.cuda.get_rng_state(device), state)
+    # Anything else keeps torch's pytree walk.
+    for args in ((a, None), ((a,),), (a.cpu(),), (a, 1), ()):
+        assert gc._cuda_tensor_arg_devices(args) is None
