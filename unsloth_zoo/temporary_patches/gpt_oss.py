@@ -2050,22 +2050,7 @@ def _mxfp4_decode_stack(param, dtype, token_counts, role = "", slot = None):
     return slot.stack
 
 
-no_cudagraph_torch_compile_options = get_torch_compile_options(
-    epilogue_fusion = True,
-    max_autotune = False,
-    shape_padding = True,
-    # Every layer passes its own packed stack: CUDA graphs would re-record per layer (or copy the stacks).
-    cudagraphs = False,
-    coordinate_descent_tuning = use_coordinate_descent,
-    combo_kernels = False,
-    memory_planning = True,
-    multi_kernel = False,
-    use_block_ptr = True,
-    logging = UNSLOTH_ENABLE_LOGGING,
-)
-
-
-@_torch_compile(dynamic=None, fullgraph=True, options=no_cudagraph_torch_compile_options)
+@_torch_compile(dynamic=None, fullgraph=True, options=no_combo_fused_torch_compile_options)
 def _moe_forward_inference_mxfp4_kernel(
     hidden_states, routing_weights, router_indices,
     gu_blocks, gu_scales, gate_up_proj_bias, gu_trans,
@@ -2073,7 +2058,7 @@ def _moe_forward_inference_mxfp4_kernel(
     limit, alpha, hidden_size,
 ):
     """Decode-time MoE on packed MXFP4 stacks: sort the routed (token, expert) rows, two fused grouped GEMMs."""
-    from unsloth_zoo.mxfp4_gemm import mxfp4_grouped_mm_op
+    from unsloth_zoo.mxfp4_gemm import mxfp4_grouped_mm_compiled
     batch_size = hidden_states.shape[0]
     x = hidden_states.reshape(-1, hidden_size)
     num_experts = routing_weights.shape[1]
@@ -2085,13 +2070,13 @@ def _moe_forward_inference_mxfp4_kernel(
     token = order // top_k
     expert = flat[order]
     # Biases may be float32 (the dense path promotes too); the GEMMs take the bf16 activations, as autocast would.
-    gate_up = mxfp4_grouped_mm_op(x[token], gu_blocks, gu_scales, counts, gu_trans) + gate_up_proj_bias[expert]
+    gate_up = mxfp4_grouped_mm_compiled(x[token], gu_blocks, gu_scales, counts, gu_trans) + gate_up_proj_bias[expert]
     gate, up = gate_up[..., ::2], gate_up[..., 1::2]
     gate = gate.clamp(min=None, max=limit)
     up = up.clamp(min=-limit, max=limit)
     glu = gate * torch.sigmoid(gate.to(torch.float32) * alpha).to(gate.dtype)
     inter = ((up + 1) * glu).to(x.dtype)
-    down = mxfp4_grouped_mm_op(inter, dn_blocks, dn_scales, counts, dn_trans) + down_proj_bias[expert]
+    down = mxfp4_grouped_mm_compiled(inter, dn_blocks, dn_scales, counts, dn_trans) + down_proj_bias[expert]
     weighted = down * routing_weights[token, expert][:, None]
     # Fixed-order fp32 sum: index_add_'s atomics made greedy decode nondeterministic.
     rows = torch.empty(weighted.shape, dtype = torch.float32, device = x.device)
@@ -2112,8 +2097,12 @@ def _mxfp4_static_operands(param, experts_module, proj_type):
     if scales.device != param.device:
         scales = param.mxfp4_scales = scales.to(param.device)
     blocks = param.data
-    param._unsloth_fused_operands = (blocks, param.mxfp4_scales, scales.contiguous(), transpose_b)
-    return blocks, param._unsloth_fused_operands[2], transpose_b
+    scales = scales.contiguous()
+    # Fixed addresses: CUDA graph trees then replay one graph per layer instead of copying the stacks in.
+    torch._dynamo.mark_static_address(blocks)
+    torch._dynamo.mark_static_address(scales)
+    param._unsloth_fused_operands = (blocks, param.mxfp4_scales, scales, transpose_b)
+    return blocks, scales, transpose_b
 
 
 def _mxfp4_fused_decode_enabled(param, dtype):

@@ -187,3 +187,52 @@ def test_fused_gemm_off_switch(monkeypatch):
     from unsloth_zoo.mxfp4_gemm import mxfp4_gemm_available
     monkeypatch.setenv("UNSLOTH_MXFP4_FUSED_GEMM", "0")
     assert not mxfp4_gemm_available(torch.device("cuda"), torch.bfloat16)
+
+
+@pytest.mark.parametrize("asm", [True, False])
+@pytest.mark.parametrize("E,rows", [(8, 1), (8, 4), (32, 16), (300, 12)])
+def test_decode_rows_take_the_grouped_gemv(E, rows, asm, monkeypatch):
+    import unsloth_zoo.mxfp4_gemm as mg
+    from unsloth_zoo.mxfp4_gemm import mxfp4_grouped_mm
+    monkeypatch.setattr(mg, "_ASM_OK", {k: asm for k in (None, 0, torch.cuda.current_device())})
+    launched = []
+    real = mg._mxfp4_grouped_gemv_kernel
+    monkeypatch.setattr(mg, "_mxfp4_grouped_gemv_kernel", type("K", (), {"__getitem__": lambda self, grid: launched.append(grid) or real[grid]})())
+    R, C = 200, 320
+    blocks, scales = _stack(E, R, C, seed = rows)
+    g = torch.Generator().manual_seed(rows)
+    counts = torch.bincount(torch.randperm(E, generator = g)[:rows] if rows <= E else torch.randint(0, E, (rows,), generator = g), minlength = E)
+    counts = counts.to(torch.int32).cuda()
+    x = torch.randn(rows, C, dtype = torch.bfloat16, device = "cuda")
+    got = mxfp4_grouped_mm(x, blocks, scales, counts, transpose_b = True).float()
+    want = _reference(x, mxfp4_dequantize_torch(blocks, scales), counts, True)
+    assert launched
+    torch.testing.assert_close(got, want, rtol = 1e-2, atol = 1e-2 * want.abs().max().item())
+
+
+def test_compiled_region_switches_between_gemv_and_tile_kernel_by_row_count():
+    # The choice has to be a dynamo guard: made inside the op, the first traced size would fix it for every size.
+    import unsloth_zoo.mxfp4_gemm as mg
+    if mg.mxfp4_grouped_gemv_op is None:
+        pytest.skip("needs torch.library.triton_op")
+    E, R, C = 8, 128, 256
+    blocks, scales = _stack(E, R, C, seed = 7)
+    dense = mxfp4_dequantize_torch(blocks, scales)
+
+    @torch.compile(fullgraph = True, dynamic = True)
+    def f(x, counts):
+        return mg.mxfp4_grouped_mm_compiled(x, blocks, scales, counts, True)
+
+    for rows in (64, 3, 40, 2):
+        counts = torch.bincount(torch.randint(0, E, (rows,), generator = torch.Generator().manual_seed(rows)), minlength = E)
+        counts = counts.to(torch.int32).cuda()
+        x = torch.randn(rows, C, dtype = torch.bfloat16, device = "cuda")
+        want = _reference(x, dense, counts, True)
+        with torch.profiler.profile(activities = [torch.profiler.ProfilerActivity.CUDA]) as prof:
+            got = f(x, counts).float()
+            torch.cuda.synchronize()
+        names = {e.name for e in prof.events()}
+        gemv = 2 * rows <= E
+        assert any("_mxfp4_grouped_gemv_kernel" in n for n in names) == gemv
+        assert any("_mxfp4_grouped_mm_kernel" in n for n in names) == (not gemv)
+        torch.testing.assert_close(got, want, rtol = 1e-2, atol = 1e-2 * want.abs().max().item())
