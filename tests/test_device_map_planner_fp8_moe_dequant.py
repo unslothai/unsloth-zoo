@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""FP8 fused experts are dequantized whole to bf16 on every forward (moe_utils_fp8.forward_moe_backend_fp8),
-so every card holding such a layer must keep that much free beyond its weights. Mistral-Large-3 on 8 B200s
-was planned with a 0.000 GiB reserve on a card holding FP8 MoE layers and peaked 28 GiB over its budget."""
+"""Every card holding an FP8 MoE layer keeps that layer's bf16 dequant free (Mistral-Large-3 peaked 28 GiB over)."""
 import pytest
 import torch
 import torch.nn as nn
@@ -26,8 +24,8 @@ from unsloth_zoo.device_map_planner import DeviceMapInfeasible, plan_device_map
 pytestmark = pytest.mark.skipif(not hasattr(torch, "float8_e4m3fn"), reason = "no float8 dtype")
 
 _E, _H, _I, _LAYERS, _VOCAB = 8, 64, 128, 4, 64
-_FP8_LAYER = _E * 2 * _I * _H + _E * _H * _I          # bytes of one layer's fp8 expert stacks
-_BF16_DEQUANT = 2 * _FP8_LAYER                         # both stacks dequantized to bf16 together
+_FP8_LAYER = _E * 2 * _I * _H + _E * _H * _I
+_BF16_DEQUANT = 2 * _FP8_LAYER
 
 
 class Experts(nn.Module):
@@ -73,8 +71,7 @@ def _moe_devices(plan):
 
 
 def test_every_card_with_an_fp8_moe_layer_keeps_its_bf16_dequant_free():
-    # Unequal cards: the balanced reserve packs a layer onto a card with less than its dequant free,
-    # although placing layers only where the dequant fits exists (1 + 2 on cuda:1, 3 + 2 on cuda:2 ... ).
+    # Unequal cards: the balanced reserve alone packs a layer where its dequant does not fit.
     budgets = [int(_FP8_LAYER * 1.5), _FP8_LAYER * 4, int(_FP8_LAYER * 5.25)]
     plan = _plan(_meta(), budgets)
     left = _left(plan)
@@ -83,7 +80,6 @@ def test_every_card_with_an_fp8_moe_layer_keeps_its_bf16_dequant_free():
 
 
 def test_refuses_rather_than_plans_an_oom():
-    # Room for the weights, never for weights plus one layer's dequant on any card.
     budgets = [_FP8_LAYER * 2 + _FP8_LAYER // 2] * 2
     with pytest.raises(DeviceMapInfeasible, match = "FP8 expert dequant"):
         _plan(_meta(), budgets)
@@ -96,7 +92,6 @@ def test_explicit_reserve_is_left_to_the_caller():
 
 
 def test_bf16_experts_are_not_floored():
-    # bf16 experts are used in place, nothing is dequantized: same plan as before this floor existed.
     budgets = [2 * _FP8_LAYER * 2 + 4096, 2 * _FP8_LAYER * 6]
     plan = _plan(_meta(torch.bfloat16), budgets)
     assert plan is not None
@@ -104,9 +99,7 @@ def test_bf16_experts_are_not_floored():
 
 
 def test_a_real_fine_grained_fp8_mixtral_is_detected(monkeypatch, tmp_path):
-    # What the planner sees for a pre-quantized FP8 MoE repo on a GPU host: FineGrainedFP8 swaps the
-    # experts to FP8Experts with float8 stacks on meta. Without a GPU the quantiser falls back to
-    # dequantizing, so skip that fallback here to size the GPU load.
+    # Without a GPU the quantiser would dequantize on load; skip that to see the FP8Experts a GPU host gets.
     qf = pytest.importorskip("transformers.quantizers.quantizer_finegrained_fp8")
     from transformers import MixtralConfig
     from unsloth_zoo.device_map_planner import (

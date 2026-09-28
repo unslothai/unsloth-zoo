@@ -1020,13 +1020,8 @@ def _moe_dequant_transient_by_unit(
     model: nn.Module,
     units: Sequence[tuple[str, int]],
 ) -> dict[str, int]:
-    """Bytes each unit needs free at run time for its FP8 fused experts dequantized whole.
-
-    Unsloth's FP8 MoE fallback (`moe_utils_fp8.forward_moe_backend_fp8`) dequantizes a layer's whole
-    `gate_up_proj` and `down_proj` stacks to bf16 together on every forward, in generation, evaluation and
-    training alike: 14 + 7 GiB per layer on Mistral-Large-3. That is not an activation the balanced reserve
-    sizes for, and a relaxed reserve of 0 on a card holding such a layer OOMs on its first forward.
-    """
+    """Bytes each unit must keep free for its FP8 fused experts, dequantized whole to bf16 on every forward
+    by `moe_utils_fp8.forward_moe_backend_fp8` (14 + 7 GiB per layer on Mistral-Large-3)."""
     unit_names = sorted((u for u, _ in units), key=len, reverse=True)
     per_module: dict[str, int] = {}
     for name, tensor in model.named_parameters():
@@ -1428,8 +1423,7 @@ def plan_device_map(
     )
     sizes = _compute_module_sizes(model, hf_quantizer)
     units = _split_units(model, no_split, sizes)
-    # FP8 fused experts dequantized whole at run time: a floor on what each card keeps free beyond its
-    # weights. A caller's explicit reserve is theirs to size, so it is only applied to the auto reserve.
+    # Floor on what a card holding FP8 fused experts keeps free; an explicit reserve is the caller's to size.
     runtime_of: dict[str, int] = (
         {} if activation_reserve_bytes is not None else _moe_dequant_transient_by_unit(model, units)
     )
