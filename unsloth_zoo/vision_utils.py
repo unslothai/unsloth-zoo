@@ -1446,6 +1446,26 @@ def patch_medias_processor(processor):
 pass
 
 
+def _media_feature_token_ids(model):
+    """Token ids a model forward matches one-to-one with media features."""
+    config = getattr(model, "config", None)
+    ids = set()
+    subs = (getattr(config, k, None) for k in ("text_config", "vision_config", "audio_config", "thinker_config"))
+    for cfg in (config, *subs):
+        for key in ("image_token_id", "image_token_index", "video_token_id", "video_token_index",
+                    "audio_token_id", "audio_token_index", "media_placeholder_token_id",
+                    "img_context_token_id"):
+            value = getattr(cfg, key, None)
+            if isinstance(value, int) and value >= 0:
+                ids.add(value)
+    # InternVL remote code sets it on the model at runtime; the forward reads that attribute.
+    value = getattr(model, "img_context_token_id", None)
+    if isinstance(value, int) and value >= 0:
+        ids.add(value)
+    return sorted(ids)
+pass
+
+
 def _tensorize_ragged_batch(batch):
     """Tensorize fields; ragged ones stay lists of tensors."""
     for key in list(batch.keys()):
@@ -1496,7 +1516,7 @@ pass
 class UnslothVisionDataCollator:
     # All Unsloth Zoo code licensed under LGPLv3
     __slots__ = (
-        "padding_token_ids", "dtype", "ignore_index",
+        "padding_token_ids", "_feature_token_ids", "dtype", "ignore_index",
         "processor", "formatting_func", "image_size",
         "max_seq_length", "truncation", "train_on_responses_only",
         "num_proc", "assistant_single_content", "patch_size",
@@ -1533,6 +1553,7 @@ class UnslothVisionDataCollator:
         patch_medias_processor(processor)
 
         self.padding_token_ids = get_padding_tokens_ids(processor)
+        self._feature_token_ids = _media_feature_token_ids(model)
         self.dtype = _get_dtype(
             dtype_from_config(model.config)
             if HAS_TORCH_DTYPE else
@@ -2228,6 +2249,29 @@ class UnslothVisionDataCollator:
             token_type_ids = token_type_ids[:, sl]
         return [input_ids, attention_mask, completion_mask] + ([token_type_ids] if token_type_ids is not None else [])
 
+    def _raise_if_truncation_cut_media(self, before, after, pad_id):
+        # Feature slots only: a cut delimiter alone (<|vision_end|>) still aligns at forward.
+        feature_ids = getattr(self, "_feature_token_ids", None)
+        if feature_ids:
+            media = torch.tensor(feature_ids, device = before.device)
+        else:
+            media = self._get_padding_token_ids_on_device(before.device)
+            # Processor-only placeholders (Step-3.7 `<im_patch>`) are absent from the tokenizer lists.
+            declared = [getattr(self.processor, f"{kind}_token_id", None) for kind in ("image", "video", "audio")]
+            declared = [x for x in declared if isinstance(x, int)]
+            if declared:
+                media = torch.cat((media, torch.tensor(declared, dtype = media.dtype, device = media.device)))
+        media = media[media != pad_id]
+        # Negative ids are processor-inserted sentinels (Phi-4-reasoning-vision -200).
+        count = lambda ids: int((torch.isin(ids, media) | (ids < 0)).sum())
+        cut = count(before) - count(after)
+        if cut > 0:
+            raise ValueError(
+                f"Unsloth: max_seq_length = {self.max_seq_length} truncated {cut} image / audio placeholder "
+                "tokens out of a prompt / completion batch, so the batch no longer matches its media "
+                "features. Increase max_seq_length or shorten the prompt."
+            )
+
     def _pad_to_multiple(self, input_ids, attention_mask, completion_mask, side, pad_id, multiple, token_type_ids=None, token_type_pad_id=0):
         B, L = input_ids.shape
         L2 = ((L + multiple - 1) // multiple) * multiple
@@ -2345,6 +2389,7 @@ class UnslothVisionDataCollator:
         p_tt, c_tt = proc_prompts.get(tt_key, None), proc_completions.get(tt_key, None)
 
         input_ids = torch.cat((p_ids, c_ids), dim=1)
+        untruncated_ids = input_ids
         attention_mask = torch.cat((p_m, c_m), dim=1)
         completion_mask = torch.cat((torch.zeros_like(p_m), c_m), dim=1)
         if p_tt is not None or c_tt is not None:
@@ -2401,6 +2446,11 @@ class UnslothVisionDataCollator:
             elif cross_mask.shape[1] < input_ids.shape[1]:
                 fill = cross_mask.new_zeros((cross_mask.shape[0], input_ids.shape[1] - cross_mask.shape[1], *cross_mask.shape[2:]))
                 cross_mask = torch.cat((fill, cross_mask) if flush_side == "left" else (cross_mask, fill), dim=1)
+
+        # Cross-attention models (Mllama) do not align placeholder tokens with features.
+        if (pc_has_images or videos or audios) and cross_mask is None and self.max_seq_length is not None \
+            and untruncated_ids.shape[1] > self.max_seq_length:
+            self._raise_if_truncation_cut_media(untruncated_ids, input_ids, pad_id)
 
         # Labels: mask attention pads + image/pad tokens; completion-only if requested
         labels = input_ids.clone()
