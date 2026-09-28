@@ -1300,6 +1300,15 @@ def patch_medias_processor(processor):
             tok_kwargs.setdefault("padding", True)
         data = dict(self.tokenizer(texts if not isinstance(text, str) else text,
                                    return_tensors = return_tensors, **tok_kwargs))
+        ids = data["input_ids"]
+        ids = ids.tolist() if hasattr(ids, "tolist") else ids
+        pad_id = self.tokenizer.convert_tokens_to_ids(pad)
+        kept = sum(row.count(pad_id) for row in (ids if ids and isinstance(ids[0], list) else [ids]))
+        if kept != n_pad:
+            raise ValueError(
+                f"Unsloth: truncation to max_length = {tok_kwargs.get('max_length')} removed {n_pad - kept} of "
+                f"{n_pad} `{pad}` image placeholders. Increase max_seq_length or shorten the conversation."
+            )
         if images:
             media_processor = getattr(self, "media_processor", None) or self.image_processor
             medias = [{"type": "image", "image": image} for image in images]

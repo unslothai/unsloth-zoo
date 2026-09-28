@@ -167,3 +167,16 @@ def test_standard_processors_are_not_patched():
 
     assert not patch_medias_processor(_Standard())
     assert "__wrapped__" not in vars(_Standard.__call__)
+
+
+def test_truncation_that_drops_a_media_pad_raises():
+    from unsloth_zoo.vision_utils import patch_medias_processor
+    tok = _tokenizer()
+    processor = _processor_class()(tok)
+    assert patch_medias_processor(processor)
+    image = Image.new("RGB", (28, 28))
+    text = tok.apply_chat_template(_examples()[0]["messages"][:1], tokenize = False)
+    n = processor(text = [text], images = [image])["input_ids"].shape[1]
+    assert processor(text = [text], images = [image], truncation = True, max_length = n)["input_ids"].shape[1] == n
+    with pytest.raises(ValueError, match = "removed 1 of 1"):
+        processor(text = [text], images = [image], truncation = True, max_length = 8)
