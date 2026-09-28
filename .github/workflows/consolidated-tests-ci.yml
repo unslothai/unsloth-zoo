@@ -371,6 +371,9 @@ jobs:
         # runs the dtype decision alone on CPU; left to --collect-only it would prove
         # only that it imports, which is the failure this comment already lists twice.
         #
+        # test_offload_recompute_dtype: follow-up; GPU cases skip here, the CPU byte-view
+        # and rounding checks still guard against a refactor reintroducing the cast.
+        #
         # The two compiled-cache files cover create_new_function's distributed
         # protocol: the rank-local guard that let one rank skip a broadcast and
         # hang the group under torchrun, and the digest agreement that stops two
@@ -474,6 +477,7 @@ jobs:
             tests/test_mtp_config_reconcile.py \
             tests/test_llama_cpp_converter_scan.py \
             tests/test_compiled_cache_fail_closed.py \
+            tests/test_forced_float32_lora_forward_result_dtype.py \
             tests/test_inductor_codegen_fallback.py \
             tests/test_inductor_single_compile_worker.py \
             tests/test_eager_fallback_latch.py \
@@ -483,6 +487,7 @@ jobs:
             tests/test_missing_parent_package_is_drift.py \
             tests/test_sibling_imports_do_not_go_through_a_tests_package.py \
             tests/test_hip_bf16_offload_dtype.py \
+            tests/test_offload_recompute_dtype.py \
             tests/test_disabled_hook_checkpoint_guard.py \
             tests/test_conftest_module_leak_gate.py \
             tests/test_compiled_cache_collective.py \
@@ -491,6 +496,8 @@ jobs:
             tests/test_safe_serialization_none.py \
             tests/test_published_version_window.py \
             tests/test_device_map_planner_compressed_tensors.py \
+            tests/test_gemma3n_kv_sharing_without_cache.py \
+            tests/test_gemma3n_rmsnorm_with_scale.py \
             -v
 
       - name: pytest MLX adapter-filter gate (HARD GATE)
