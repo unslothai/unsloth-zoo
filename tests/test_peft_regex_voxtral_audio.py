@@ -15,8 +15,6 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """finetune_audio_layers=True on Voxtral used to leave the audio_tower and projector without LoRA."""
-import re
-import pytest
 import torch.nn as nn
 
 from unsloth_zoo.peft_utils import get_peft_regex
