@@ -8,67 +8,101 @@
 
 """Import-smoke regression suite for `unsloth_zoo.temporary_patches`.
 
-The temporary-patches subsystem is the model-specific monkey-patch
-layer that lands ahead of upstream HF/TRL changes. It has 22
-submodules (one per model family) and an `__init__.py` that
-star-imports every one of them. A broken decorator or top-level
-syntax error in ANY submodule cascades into the whole package
-failing to import, which is exactly what zoo's downstream users
-hit at training time -- a confusing `ImportError: cannot import
-name 'PatchUnsloth_GPT_OSS_Triton'` rather than the actual file
-that broke.
-
-This suite pins that contract:
-
+The subsystem star-imports every model-family submodule from __init__.py, so
+a broken decorator or syntax error in any one cascades into a confusing
+package-wide ImportError at training time. This suite pins:
   - Every submodule imports cleanly.
-  - The `__init__.py` star-import chain succeeds (so
-    `from unsloth_zoo.temporary_patches import *` doesn't blow up).
-  - `temporary_patches.common.torch_compile_options` is a dict
-    (rl_replacements.py imports it at module top, so a contract
-    break here breaks RL training too).
+  - The __init__.py star-import chain succeeds.
+  - `common.torch_compile_options` is a dict (rl_replacements.py imports it
+    at module top, so a break here breaks RL training too).
 
-Runs under the GPU-free harness in `tests/conftest.py` which
-pre-loads `unsloth_zoo.device_type` under a mocked
-`torch.cuda.is_available()`. No GPU required; no actual model
-forward pass.
+Runs under the GPU-free harness in tests/conftest.py; no GPU required.
 """
 
 from __future__ import annotations
 
 import importlib
+import os
 
 import pytest
 
+# Every `temporary_patches` submodule imports torch, so on a runner without it this whole
+# suite is a precondition failure, not a finding: 37 of its 40 cases go red on merge base
+# too. The macOS staging runner is one, because pyproject declares no torch on darwin/arm64.
+# The two sibling suites in the same CI step already guard this way.
+pytest.importorskip("torch")
 
-# ---------------------------------------------------------------------------
-# Per-submodule import smoke. One parametrize per file under
-# unsloth_zoo/temporary_patches/. New files added there should land on
-# this list -- the suite is intentionally explicit (not a glob) so a
-# silent drop or rename surfaces as a missing test, not a green CI.
-# ---------------------------------------------------------------------------
+
+# The switch `__init__.py:179` reads into _SKIP_GPU_INIT, which the device-capacity tests
+# below are entirely about: with it on, the import skips device detection and DEVICE_TYPE
+# becomes "cpu", so gpt_oss takes its `else` branch and device_memory is 0 rather than the
+# stubbed card's capacity. A child that inherits it therefore fails on a real GPU-less
+# machine and on a machine with a card, for a reason that is neither.
+#
+# It is inheritable in an ordinary run: hf_xet_fallback sets it on the PARENT process
+# around a download spawn (hf_xet_fallback.py:1520). So strip it here rather than assume
+# nothing in the session ever turns it on.
+_GPU_INIT_GATE = "UNSLOTH_ZOO_DISABLE_GPU_INIT"
+
+
+def _child_env(**overrides: str) -> dict:
+    """This process's environment minus the switch that would skip what is under test."""
+    env = {k: v for k, v in os.environ.items() if k != _GPU_INIT_GATE}
+    env.update(overrides)
+    return env
+
+
+# Per-submodule import smoke. Explicit (not a glob) so a silent drop or rename
+# surfaces as a missing test; new files must be added to this list.
 
 
 TEMPORARY_PATCHES_SUBMODULES = [
     "unsloth_zoo.temporary_patches.common",
     "unsloth_zoo.temporary_patches.bitsandbytes",
+    "unsloth_zoo.temporary_patches.bitsandbytes_large_tensors",
+    "unsloth_zoo.temporary_patches.compiled_model_identity",
+    "unsloth_zoo.temporary_patches.conversion_mapping_rescope",
     "unsloth_zoo.temporary_patches.deepseek_v3_moe",
+    "unsloth_zoo.temporary_patches.deepseek_v4",
+    "unsloth_zoo.temporary_patches.ernie4_5_moe",
+    "unsloth_zoo.temporary_patches.fla_vendor",
     "unsloth_zoo.temporary_patches.flex_attention_bwd",
+    "unsloth_zoo.temporary_patches.remote_code_vlm",
     "unsloth_zoo.temporary_patches.gemma",
     "unsloth_zoo.temporary_patches.gemma3n",
     "unsloth_zoo.temporary_patches.gemma4",
+    "unsloth_zoo.temporary_patches.gemma4_banded_attention",
+    "unsloth_zoo.temporary_patches.gemma4_float32",
+    "unsloth_zoo.temporary_patches.gemma4_flash_sliding",
     "unsloth_zoo.temporary_patches.gemma4_moe",
     "unsloth_zoo.temporary_patches.glm4_moe",
     "unsloth_zoo.temporary_patches.gpt_oss",
+    "unsloth_zoo.temporary_patches.granitemoehybrid",
+    "unsloth_zoo.temporary_patches.inkling",
+    "unsloth_zoo.temporary_patches.lfm2_moe",
+    "unsloth_zoo.temporary_patches.llama4_moe",
     "unsloth_zoo.temporary_patches.ministral",
+    "unsloth_zoo.temporary_patches.amd_aiter",
+    "unsloth_zoo.temporary_patches.fp8_uncontained_weights",
     "unsloth_zoo.temporary_patches.misc",
+    "unsloth_zoo.temporary_patches.muse_glimmer_banded_attention",
+    "unsloth_zoo.temporary_patches.mixtral_moe",
     "unsloth_zoo.temporary_patches.moe_bnb",
+    "unsloth_zoo.temporary_patches.moe_experts_interface",
+    "unsloth_zoo.temporary_patches.moe_grouped_modulelist",
+    "unsloth_zoo.temporary_patches.moe_triton_kernels",
     "unsloth_zoo.temporary_patches.moe_utils",
+    "unsloth_zoo.temporary_patches.moe_utils_bnb4bit",
+    "unsloth_zoo.temporary_patches.moe_utils_fp8",
     "unsloth_zoo.temporary_patches.mxfp4",
     "unsloth_zoo.temporary_patches.pixtral",
     "unsloth_zoo.temporary_patches.qwen3_5_moe",
     "unsloth_zoo.temporary_patches.qwen3_moe",
+    "unsloth_zoo.temporary_patches.qwen3_moe_float32",
     "unsloth_zoo.temporary_patches.qwen3_next_moe",
     "unsloth_zoo.temporary_patches.qwen3_vl_moe",
+    "unsloth_zoo.temporary_patches.remote_mamba2",
+    "unsloth_zoo.temporary_patches.step3p7_moe",
     "unsloth_zoo.temporary_patches.utils",
 ]
 
@@ -80,20 +114,14 @@ def test_temporary_patches_submodule_imports(module_path):
 
 
 def test_temporary_patches_star_import_chain():
-    """`unsloth_zoo.temporary_patches.__init__` star-imports every
-    submodule above. If ANY submodule blows up at import time, the
-    star-import chain fails wholesale and downstream `from
-    unsloth_zoo.temporary_patches import *` users get a wall of red.
-    """
+    """The __init__ star-imports every submodule; if any blows up at import,
+    downstream `from unsloth_zoo.temporary_patches import *` fails wholesale."""
     importlib.import_module("unsloth_zoo.temporary_patches")
 
 
 def test_torch_compile_options_is_dict():
-    """`temporary_patches.common.torch_compile_options` is imported
-    by `unsloth_zoo.rl_replacements` at module top level. If the
-    contract changes from dict to None / callable / removed, every
-    @torch.compile decorator in rl_replacements.py breaks at import.
-    """
+    """`common.torch_compile_options` is imported by rl_replacements at module
+    top; a non-dict contract breaks every @torch.compile decorator there."""
     from unsloth_zoo.temporary_patches import common
     assert hasattr(common, "torch_compile_options"), (
         "common.torch_compile_options removed -- rl_replacements.py "
@@ -109,11 +137,8 @@ def test_torch_compile_options_is_dict():
 
 
 def test_temporary_patches_submodule_list_is_complete():
-    """The hand-maintained TEMPORARY_PATCHES_SUBMODULES list above
-    must stay in sync with the actual files on disk. A new
-    submodule added to the directory without being added here would
-    silently bypass the per-submodule import smoke above.
-    """
+    """TEMPORARY_PATCHES_SUBMODULES must stay in sync with files on disk; a new
+    submodule not added here would silently bypass the import smoke above."""
     import unsloth_zoo.temporary_patches as tp
     import pathlib
 
@@ -135,3 +160,114 @@ def test_temporary_patches_submodule_list_is_complete():
         "TEMPORARY_PATCHES_SUBMODULES references modules that don't "
         f"exist on disk: {sorted(extra)}. Remove them."
     )
+
+
+def test_gpt_oss_imports_without_visible_gpus():
+    """gpt_oss.py computes device_memory at import; with UNSLOTH_ALLOW_CPU=1
+    DEVICE_TYPE stays "cuda" on GPU-less hosts, so the capacity lookup must be
+    guarded. Subprocess so conftest's mem_get_info stub cannot mask it."""
+    import subprocess
+    import sys
+
+    env = _child_env(
+        UNSLOTH_ALLOW_CPU = "1",
+        CUDA_VISIBLE_DEVICES = "",
+        HIP_VISIBLE_DEVICES = "",
+    )
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import unsloth_zoo.temporary_patches.gpt_oss; print('IMPORT_OK')"],
+        env=env, capture_output=True, text=True, timeout=600,
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert "IMPORT_OK" in result.stdout
+
+
+def test_xet_submodule_import_does_not_query_free_device_memory():
+    """Importing a download helper must not create an accelerator context.
+
+    gpt_oss only needs total capacity to select combo-kernel options. Device
+    properties provide that without the context-creating mem_get_info call.
+    """
+    import subprocess
+    import sys
+
+    script = r'''
+import torch
+
+class Props:
+    major = 8
+    minor = 9
+    total_memory = 48 * 1024**3
+    multi_processor_count = 108
+    name = "stub"
+
+def forbidden(*args, **kwargs):
+    raise AssertionError("mem_get_info was called during import")
+
+torch.cuda.is_available = lambda: True
+torch.cuda.device_count = lambda: 1
+torch.cuda.current_device = lambda: 0
+torch.cuda.get_device_capability = lambda *args, **kwargs: (8, 9)
+torch.cuda.get_device_properties = lambda *args, **kwargs: Props()
+torch.cuda.mem_get_info = forbidden
+torch.cuda.memory.mem_get_info = forbidden
+
+import unsloth_zoo.hf_xet_fallback
+from unsloth_zoo.temporary_patches import gpt_oss
+assert gpt_oss.device_memory == Props.total_memory
+assert gpt_oss.use_combo_kernels is True
+print("IMPORT_OK")
+'''
+    env = _child_env(UNSLOTH_IS_PRESENT = "1", UNSLOTH_ALLOW_CPU = "1")
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env, capture_output=True, text=True, timeout=600,
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert "IMPORT_OK" in result.stdout
+
+
+def test_flex_attention_import_does_not_query_free_device_memory():
+    """The same probe pattern in flex_attention/utils.py.
+
+    It only needs total capacity, like gpt_oss, and gpt_oss imports it, so leaving
+    mem_get_info() here would put back the context the gpt_oss fix removes for anyone
+    who reaches the flex-attention path.
+    """
+    import subprocess
+    import sys
+
+    script = r'''
+import torch
+
+class Props:
+    major = 8
+    minor = 9
+    total_memory = 48 * 1024**3
+    multi_processor_count = 108
+    name = "stub"
+
+def forbidden(*args, **kwargs):
+    raise AssertionError("mem_get_info was called during import")
+
+torch.cuda.is_available = lambda: True
+torch.cuda.device_count = lambda: 1
+torch.cuda.current_device = lambda: 0
+torch.cuda.get_device_capability = lambda *args, **kwargs: (8, 9)
+torch.cuda.get_device_properties = lambda *args, **kwargs: Props()
+torch.cuda.mem_get_info = forbidden
+torch.cuda.memory.mem_get_info = forbidden
+
+from unsloth_zoo.flex_attention import utils
+# 48 GB is above the 16 GB threshold, so the low-memory kernel options stay off.
+assert utils.kernel_options is None, utils.kernel_options
+print("IMPORT_OK")
+'''
+    env = _child_env(UNSLOTH_IS_PRESENT = "1", UNSLOTH_ALLOW_CPU = "1")
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env, capture_output=True, text=True, timeout=600,
+    )
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert "IMPORT_OK" in result.stdout

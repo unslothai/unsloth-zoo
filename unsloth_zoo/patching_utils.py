@@ -18,11 +18,13 @@ import torch
 import os
 import re
 import ast
+import importlib
 
 __all__ = [
     "patch_compiling_bitsandbytes",
     "patch_layernorm",
     "patch_torch_compile",
+    "stop_compiling_weak_dictionary_writes",
     "patch_model_and_tokenizer",
     "patch_compiled_autograd",
 ]
@@ -41,18 +43,37 @@ def patch_compiling_bitsandbytes():
         if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
             print("Unsloth: Bitsandbytes >= 0.46.0 supports torch.compile - enabling.")
     else:
-        # Disable dynamo on Linear4bit, Linear8bit and other future modules
+        # Disable dynamo on Linear4bit, Linear8bit etc
         if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
             print("Unsloth: Bitsandbytes < 0.46.0 does not support torch.compile - disabling.")
         for x in ["bitsandbytes.nn.modules", "peft.tuners.lora.bnb",]:
-            exec(f"import {x}", globals(), locals())
-            layers = dir(eval(x))
-            for fx in layers:
-                try: layer = eval(f"{x}.{fx}")
-                except: continue
+            try:
+                module = importlib.import_module(x)
+            except ImportError as e:
+                # Genuinely absent package = the missing module is the target
+                # or one of its parents. Anything else (e.g. a broken
+                # transitive dependency inside an installed package) must
+                # surface its real error, not an install hint.
+                missing = getattr(e, "name", "") or ""
+                target_missing = isinstance(e, ModuleNotFoundError) and missing and (
+                    x == missing or x.startswith(missing + ".")
+                )
+                if not target_missing:
+                    raise
+                # peft is required for LoRA training
+                if x.startswith("peft"):
+                    raise ImportError(
+                        "Unsloth: Please install peft via `pip install peft`"
+                    ) from e
+                if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
+                    print(f"Unsloth: Skipping {x} - module not found: {e}")
+                continue
+            for fx in dir(module):
+                try: layer = getattr(module, fx)
+                except Exception: continue
                 if not hasattr(layer, "forward"): continue
-                if hasattr(eval(f"{x}.{fx}.forward"), "__wrapped__"): continue
-                exec(f"{x}.{fx}.forward = torch._disable_dynamo({x}.{fx}.forward)", globals(), locals())
+                if hasattr(layer.forward, "__wrapped__"): continue
+                layer.forward = torch._disable_dynamo(layer.forward)
             pass
         pass
     pass
@@ -83,6 +104,56 @@ def patch_layernorm(fast_layernorm):
 pass
 
 
+# Dynamo inlines the stdlib, so checkpointing's bookkeeping gets these compiled.
+_WEAK_DICTIONARY_WRITERS = (
+    ("WeakKeyDictionary",   "__setitem__"),
+    ("WeakKeyDictionary",   "__delitem__"),
+    ("WeakValueDictionary", "__setitem__"),
+    ("WeakValueDictionary", "__delitem__"),
+)
+
+
+def stop_compiling_weak_dictionary_writes():
+    """Mark `weakref`'s dictionary writes never-compile. Returns how many.
+
+    Fine-tuning gemma-4-E2B-it on a T4 dies in the second step with
+    "AssertionError: Something went unexpectedly wrong in activation
+    checkpoint". The exhausted recompile budget is `weakref.__setitem__`'s --
+    1030 compiles against a `recompile_limit` of 1024 in that step -- NOT the
+    gemma4 RMSNorm kernel the warning names, which compiles six times in the
+    whole run and is only named because the failure surfaces inside whichever
+    compiled kernel is on the stack.
+
+    Non-reentrant checkpointing saves recomputed intermediates through weakly
+    keyed bookkeeping, which runs on the autograd thread under a compiled
+    region with a fresh key object per region: one unusable compilation each.
+    The budget runs out after the kernel has packed its activations, so the
+    eager retry packs them again and torch's recomputation hook asserts.
+
+    Compiling a weak-dictionary insert buys nothing, so skipping these four
+    code objects costs nothing and keeps the model compiled.
+    """
+    try:
+        import weakref
+        from torch._dynamo.eval_frame import skip_code
+    except Exception:
+        # Older torch, or no Dynamo: not worth failing an import over.
+        return 0
+    marked = 0
+    for owner_name, method_name in _WEAK_DICTIONARY_WRITERS:
+        owner = getattr(weakref, owner_name, None)
+        method = getattr(owner, method_name, None)
+        code = getattr(method, "__code__", None)
+        if code is None:
+            continue
+        try:
+            skip_code(code)
+        except Exception:
+            continue
+        marked += 1
+    return marked
+
+
 def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
     # All Unsloth Zoo code licensed under LGPLv3
     assert(type(debug) is bool)
@@ -110,7 +181,10 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
     else:
         DEBUGGING = ""
         os.environ.pop("TORCHDYNAMO_VERBOSE", None)
-        os.environ.pop("TORCHINDUCTOR_COMPILE_THREADS", None)
+        # Keep _gpu_init's forcing: Inductor's compile workers cannot enumerate a cgroup
+        # pinned GPU and raise "Could not find an active GPU backend".
+        if os.environ.get("UNSLOTH_FORCE_SINGLE_COMPILE_WORKER", "0") != "1":
+            os.environ.pop("TORCHINDUCTOR_COMPILE_THREADS", None)
         os.environ.pop("TORCHINDUCTOR_FORCE_DISABLE_CACHES", None)
         os.environ.pop("TORCH_LOGS", None)
         torch._logging.set_logs(all = logging.CRITICAL)
@@ -123,8 +197,8 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
     pass
 
     os.environ["UNSLOTH_PATCHED"] = "1"
-    # See https://pytorch.org/tutorials/recipes/torch_compile_caching_tutorial.html
-    # Caches kernel generations for faster restarts
+    # Cache kernel generations for faster restarts. See
+    # https://pytorch.org/tutorials/recipes/torch_compile_caching_tutorial.html
     # https://dev-discuss.pytorch.org/t/impact-of-multithreading-and-local-caching-on-torch-compile/2498/3
     os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"
     os.environ["TORCHINDUCTOR_AUTOTUNE_REMOTE_CACHE"] = "1"
@@ -135,6 +209,10 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
 
     # https://github.com/sayakpaul/diffusers-torchao?tab=readme-ov-file#things-to-keep-in-mind-when-benchmarking
     os.environ["ENABLE_AOT_AUTOGRAD_CACHE"] = "1"
+    # ENABLE_AOT_AUTOGRAD_CACHE is no longer read by torch >= 2.12; the
+    # AOTAutograd cache env override was renamed. Set the current name too so
+    # backward graphs are also cached on disk across process restarts.
+    os.environ["TORCHINDUCTOR_AUTOGRAD_CACHE"] = "1"
 
     # Torch compile arguments
     torch_compile_arguments = [
@@ -206,6 +284,8 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
         try:    exec(_try_dynamo_argument)
         except: pass
     pass
+    # Must happen before anything compiles.
+    stop_compiling_weak_dictionary_writes()
 pass
 
 def get_model(model):
@@ -218,8 +298,7 @@ def get_model(model):
         elif hasattr(x, "model"):
             x = x.model
         elif hasattr(x, "base_model") and x.base_model !=x:
-            # for VLMs x.base_model = x causing this to be stuck in endless loop
-            # the check x.base_model != x is to prevent this
+            # x.base_model != x guards against VLMs where base_model is self (infinite loop)
             x = x.base_model
         elif hasattr(x, "language_model"):
             x = x.language_model
@@ -230,15 +309,63 @@ def get_model(model):
 pass
 
 
+def _execution_device_for_meta_layer(module):
+    """Where accelerate will actually run a layer whose weights are still on meta.
+
+    `execution_device` is typed `int | str | torch.device | None` and can itself be "meta"
+    mid-build, so only a real device is returned.
+    """
+    for hook in _iter_accelerate_hooks(getattr(module, "_hf_hook", None)):
+        execution_device = getattr(hook, "execution_device", None)
+        if execution_device is None:
+            continue
+        try:
+            device = torch.device(execution_device)
+        except (RuntimeError, TypeError, ValueError):
+            continue
+        if device.type != "meta":
+            return device
+    return None
+
+
+def _iter_accelerate_hooks(hook, _depth = 0):
+    """`hook` and every hook nested inside it, outermost first: accelerate chains rather
+    than replaces, and the `SequentialHook` wrapper defines no `execution_device` of its
+    own. Depth-limited, since the chain is another library's data."""
+    if hook is None or _depth > 8:
+        return
+    yield hook
+    for nested in getattr(hook, "hooks", ()) or ():
+        yield from _iter_accelerate_hooks(nested, _depth + 1)
+
+
 def verify_and_set_device(module,):
     """
-    Verify that all parameters of a module are on the same device.
+    Verify that all parameters of a module are on the same device, and record that
+    device on the module for the pipeline-parallel inference paths to read back.
+
+    `_per_layer_device_index` stays an index because readers subscript per-device tuples
+    with it. CPU and meta have index None, which `move_to_device` rejects (unsloth#3538),
+    so the device TYPE is published instead; the obvious `or 0` would move activations to
+    cuda:0. meta is never published at all: it passes every type check yet propagates
+    through matmul rather than raising, so a decode runs and returns nothing. For a meta
+    layer accelerate's execution device is published instead, or nothing if there is none.
     """
     set_of_devices = set(x.device for x in module.parameters())
     if len(set_of_devices) > 1:
         raise ValueError(f"Unsloth: All parameters of {module} should be on the same device")
     device = set_of_devices.pop()
-    module._per_layer_device_index = device.index
+    if device.type == "meta":
+        device = _execution_device_for_meta_layer(module)
+        if device is None:
+            # Clear a stale pair: a layer moved back must not keep describing where it was.
+            for name in ("_per_layer_device", "_per_layer_device_index"):
+                module.__dict__.pop(name, None)
+            return
+    module._per_layer_device = device
+    module._per_layer_device_index = (
+        device.index if device.index is not None else device.type
+    )
 pass
 
 def patch_to_dict():
@@ -273,6 +400,97 @@ def patch_to_dict():
         setattr(PretrainedConfig, "to_dict", wrapped_to_dict)
 pass
 
+# Casts above this avoid `.to()` holding two full copies (gemma-4 E4B's embed_tokens_per_layer is 5.25 GiB).
+_FORCED_FLOAT32_STAGE_BYTES = 1 * 1024 ** 3
+_FORCED_FLOAT32_CHUNK_BYTES = 64 * 1024 ** 2
+
+
+def _storage_is_private(tensor):
+    """No alias would read in-place rewritten bytes as the old dtype. False if unknown (torch without the API)."""
+    use_count = getattr(torch._C, "_storage_Use_Count", None)
+    if use_count is None:
+        return False
+    try:
+        probe = torch.nn.Parameter(torch.empty(1, dtype = tensor.dtype, device = tensor.device))
+        baseline = use_count(probe.untyped_storage()._cdata)
+        return use_count(tensor.untyped_storage()._cdata) <= baseline
+    except Exception:
+        return False
+
+
+def _cast_in_place_same_size(param, dtype):
+    """Same element size: convert inside the storage, one chunk at a time. Each chunk is read before
+    it is overwritten, so values equal `.to(dtype)`."""
+    src = param.data.view(-1)
+    dst = src.view(dtype)
+    step = max(1, _FORCED_FLOAT32_CHUNK_BYTES // src.element_size())
+    with torch.no_grad():
+        for start in range(0, src.numel(), step):
+            dst[start : start + step].copy_(src[start : start + step].to(dtype))
+    param.data = param.data.view(dtype)
+
+
+def _cast_via_host_chunked(param, dtype):
+    """Host buffer already in the target dtype: the host peak is the new tensor plus one chunk."""
+    device = param.device
+    src = param.data
+    staged = torch.empty(src.shape, dtype = dtype, device = "cpu")
+    flat_src, flat_dst = src.reshape(-1), staged.view(-1)
+    step = max(1, _FORCED_FLOAT32_CHUNK_BYTES // max(src.element_size(), staged.element_size()))
+    for start in range(0, flat_src.numel(), step):
+        flat_dst[start : start + step].copy_(flat_src[start : start + step])
+    del flat_src, src
+    param.data = torch.empty(0, dtype = dtype, device = device)
+    param.data = staged.to(device, non_blocking = False)
+    del staged
+
+
+def _cast_large_param(param, dtype):
+    new_bytes = param.numel() * torch.empty(0, dtype = dtype).element_size()
+    try:
+        free, _ = torch.cuda.mem_get_info(param.device)
+    except Exception:
+        free = 0
+    # The host path needs no device memory, so it is the fallback when not even a chunk fits.
+    if (
+        free >= _FORCED_FLOAT32_CHUNK_BYTES
+        and param.element_size() == torch.empty(0, dtype = dtype).element_size()
+        and param.data.is_contiguous()
+        and _storage_is_private(param)
+    ):
+        return _cast_in_place_same_size(param, dtype)
+    if free >= new_bytes + _FORCED_FLOAT32_CHUNK_BYTES:
+        param.data = param.data.to(dtype)
+        return
+    return _cast_via_host_chunked(param, dtype)
+
+
+def _bounded_cast_module(module, dtype):
+    """`module.to(dtype)` without a full extra copy of any large parameter on the device or the host.
+    `.to("cpu", dtype=...)` holds both copies on the host: 10.5 GiB for gemma-4 E4B, which OOM-kills a Colab T4 VM."""
+    for param in module.parameters(recurse = False):
+        if (
+            param.dtype.is_floating_point
+            and param.dtype != dtype
+            and param.device.type == "cuda"
+            and param.numel() * param.element_size() >= _FORCED_FLOAT32_STAGE_BYTES
+        ):
+            _cast_large_param(param, dtype)
+    module.to(dtype)
+
+
+# Kept for tests/test_forced_float32_cast_peak.py.
+_stage_cast_for_test = _bounded_cast_module
+
+
+def _attach_tower_input_hooks(model):
+    try:
+        from .device_map_planner import attach_tower_input_hooks
+        attach_tower_input_hooks(model)
+    except Exception:
+        pass
+
+
 def patch_model_and_tokenizer(
     model,
     tokenizer,
@@ -284,6 +502,7 @@ def patch_model_and_tokenizer(
     # All Unsloth Zoo code licensed under LGPLv3
     assert(type(downcast_rope) is bool)
     import gc
+    _attach_tower_input_hooks(model)
 
     # Fix dtype
     m = model
@@ -303,8 +522,7 @@ def patch_model_and_tokenizer(
         elif config_dtype ==  "float16": set_dtype_in_config(m.config, torch.float16)
     pass
 
-    # Also patch all dtypes - BnB seems to not allocate the correct type?
-    # BnB default dtype seems to be float16!
+    # Patch all dtypes: BnB defaults to float16 and may not allocate correctly
     try:
         from bitsandbytes.nn  import Linear4bit as Bnb_Linear4bit
     except:
@@ -315,7 +533,7 @@ def patch_model_and_tokenizer(
         raise ImportError("Unsloth: Please install peft via `pip install peft`")
     pass
 
-    # Get most likely the correct data-type of the model
+    # Determine the model's correct data type
     if correct_dtype is None:
         try:
             correct_dtype = _get_dtype(dtype_from_config(model.config))
@@ -325,23 +543,44 @@ def patch_model_and_tokenizer(
     # If we force float32, we first use bfloat16, then downcast to float16
     if do_forced_float32:
         correct_dtype = torch.float16
+
+        _cast_module = _bounded_cast_module
+
         for name, module in model.named_modules():
             if hasattr(module, "_pre_set_compute_dtype"):
                 setted_dtype = module._pre_set_compute_dtype
             else:
                 setted_dtype = torch.float16
             if "down_proj" in name or "up_proj" in name or "gate_proj" in name or "fc1" in name or "fc2" in name:
-                module.to(setted_dtype)
+                _cast_module(module, setted_dtype)
             if "q_proj" in name or "k_proj" in name or "v_proj" in name or "o_proj" in name or "out_proj" in name:
-                module.to(setted_dtype)
+                _cast_module(module, setted_dtype)
+            # `embed_tokens` is a substring test, so it also selects gemma-4's
+            # `embed_tokens_per_layer`. That is wanted; it is also why the one
+            # tensor here can be several GiB.
             if "lm_head" in name or "embed_tokens" in name:
-                module.to(setted_dtype)
-            if "embed_tokens" in name or "patch_embedding" in name:
-                module.to(setted_dtype)
+                _cast_module(module, setted_dtype)
+            if "patch_embedding" in name:
+                _cast_module(module, setted_dtype)
             if name.endswith("norm") and hasattr(module, "weight"):
-                module.to(setted_dtype)
+                _cast_module(module, setted_dtype)
             if "bias" in name:
-                module.to(setted_dtype)
+                _cast_module(module, setted_dtype)
+        pass
+        # empty_cache() used to run here once per module, and that corrupted memory on a
+        # model split across GPUs: the casts above are async, and empty_cache() cudaFrees
+        # cached blocks on EVERY device with no device guard, while cudaFree only
+        # synchronises the current one. Blocks on the other card went back to the driver
+        # mid-write, surfacing as an illegal memory access at a later, unrelated sync.
+        # Only FORCE_FLOAT32 architectures reach this pass, which is why llama never
+        # showed it. Sync the devices this model occupies, then release once -- taking the
+        # set from the model rather than device_count() keeps a DDP rank from creating a
+        # CUDA context on a card it never uses.
+        _model_devices  = {p.device for p in model.parameters() if p.device.type == "cuda"}
+        _model_devices |= {b.device for b in model.buffers()    if b.device.type == "cuda"}
+        for _device in _model_devices:
+            torch.cuda.synchronize(_device)
+        if _model_devices:
             torch.cuda.empty_cache()
 
         # Convert any remaining bfloat16 parameters
@@ -374,7 +613,23 @@ def patch_model_and_tokenizer(
             if key == "torch_dtype" or key == "dtype":
                 setattr(config, key, correct_dtype)
             else:
-                __fix_dtype(getattr(config, key, None))
+                # getattr's default only covers AttributeError, and transformers
+                # >= 5.15 raises AmbiguousGlobalPerLayerAttributeError straight
+                # out of PretrainedConfig.__getattribute__ for any attribute
+                # that varies per layer on a heterogeneous config. So reading a
+                # key that to_dict() itself just listed can raise, and it kills
+                # the whole load: unsloth/gemma-4-E2B-it on transformers 5.15.1
+                # dies here on 'head_dim' before a single weight is touched.
+                #
+                # Not fatal, because of what this walk is FOR. It descends
+                # looking for nested config objects that might carry a dtype
+                # key; a per-layer scalar like head_dim is never one, so an
+                # unreadable key has nothing to contribute either way.
+                try:
+                    child = getattr(config, key, None)
+                except Exception:
+                    continue
+                __fix_dtype(child)
     m = model
     while hasattr(m, "model"):
         if hasattr(m, "dtype"):
@@ -389,18 +644,16 @@ def patch_model_and_tokenizer(
         except: pass
     pass
 
-    # since we are now setting actual dtypes in config
-    # and there is a transition from torch.dtype to dtype
-    # support for auto dtype conversion is not stable
-    # patch to dict makes sure that any torch.dtype is converted to
-    # string when trying to save the config or serialize it
+    # We now set actual dtypes in config; the torch.dtype -> dtype transition's
+    # auto conversion is unstable, so patch_to_dict() stringifies any torch.dtype
+    # when saving / serializing the config.
     patch_to_dict()
 
     # Check all params and patch!
     for name, module in model.named_modules():
         if isinstance(module, (Bnb_Linear4bit, Peft_Linear4bit)):
             weight = module.weight
-            # Check if quant_state exists for vision models like unsloth/Llama-3.2-11B-Vision-Instruct-bnb-4bit, unsloth/granite-vision-3.2-2b
+            # Some vision models (e.g. Llama-3.2-11B-Vision, granite-vision) lack quant_state
             if not hasattr(weight, 'quant_state'):
                 print(f"Skipping {name}: no quant_state found")
                 continue
@@ -413,8 +666,8 @@ def patch_model_and_tokenizer(
                 setted_dtype = correct_dtype
 
             if type(quant_state) is list:
-                # BnB seems to have float16 as default!
-                module.weight.quant_state[2] = setted_dtype # Cast to correct dtype
+                # BnB defaults to float16; cast to correct dtype
+                module.weight.quant_state[2] = setted_dtype
             else:
                 # https://github.com/TimDettmers/bitsandbytes/pull/763/files
                 quant_state.dtype = setted_dtype
@@ -553,7 +806,8 @@ def patch_compiled_autograd():
     good_items = [x for x in all_items if x in source]
     exec("from torch._dynamo.compiled_autograd import (" + ", ".join(x for x in good_items) + ")", globals())
     exec(source, globals())
-    torch._dynamo.compiled_autograd.AutogradCompilerInstance.end_capture = unsloth_end_capture
+    # Defined by the exec(source, globals()) directly above.
+    torch._dynamo.compiled_autograd.AutogradCompilerInstance.end_capture = unsloth_end_capture  # noqa: F821
 
     # From https://github.com/pytorch/pytorch/pull/135795/files
     try:
@@ -579,7 +833,8 @@ def patch_compiled_autograd():
     good_items = [x for x in all_items if x in source]
     exec("from torch._dynamo.variables.misc import (" + ", ".join(x for x in good_items) + ")", globals())
     exec(source, globals())
-    torch._dynamo.variables.misc.AutogradEngineVariable.call_method = unsloth_call_method
+    # Defined by the exec(source, globals()) directly above.
+    torch._dynamo.variables.misc.AutogradEngineVariable.call_method = unsloth_call_method  # noqa: F821
     return
 pass
 
@@ -591,28 +846,21 @@ def check_conversion_mappings(model, current_key_name_str, skip_modules):
     if model_root_cls is None:
         return False
     if hasattr(model_root_cls, "_checkpoint_conversion_mapping") and len(model_root_cls._checkpoint_conversion_mapping) > 0:
-        # if this is true, then it means that we must be on transformers >=4.52.0 because conversion_mappings was added in 4.52.0
-        # we cant know if the skip module naming convention is new or old
-        # but if we are supposed to skip this current_key_name_str, and it didn't pass
-        # (current_key_name_str in quantization_config.llm_int8_skip_modules)
-        # then new transformers + new module hierarchy means it should not be skipped, ie no BC check needed
-        # and new transformers + old module hierarchy means we still need to check to skip
-        # old transformers + old module hierarchy means no BC needed
-        # old transformers + new module hierarchy is problematic since we don't have the conversion_mappings to reverse
-        # follow the logic from save_pretrained in transformers.modeling_utils
+        # Non-empty conversion_mappings => transformers >=4.52.0. We can't tell
+        # if the skip-module naming is new or old, so reverse-map the key (per
+        # save_pretrained in transformers.modeling_utils) and re-check, which
+        # covers the old-module-hierarchy case that still needs the BC skip.
         reverse_conversion_mappings = {v: k for k, v in model_root_cls._checkpoint_conversion_mapping.items()}
         new_current_key_names_str = current_key_name_str
         for pattern, replacement in reverse_conversion_mappings.items():
             try:
-                replacement = replacement.lstrip("^")  # strip off un-needed chars and patterns
+                replacement = replacement.lstrip("^")  # strip unneeded chars/patterns
                 replacement = re.sub(r"\(.*?\)", "", replacement)
                 key, n_replace = re.subn(pattern, replacement, current_key_name_str)
-                # Early exit of the loop
                 if n_replace > 0:
                     new_current_key_names_str = key
                     break
             except Exception as e:
-                # skip this pattern but log
                 do_logging = os.environ.get('UNSLOTH_ENABLE_LOGGING', '0') == '1'
                 if do_logging:
                     print(f"Unsloth: Replace bnb issue: {str(e)}")
@@ -622,18 +870,18 @@ def check_conversion_mappings(model, current_key_name_str, skip_modules):
 
 
 def _mark_parent(child, parent_type):
-    """Attach the parent’s class so the child can inspect it later."""
+    """Attach the parent's class so the child can inspect it later."""
     child._root_cls = parent_type
 
 
 def _unmark_parent(child):
-    """Remove the temporary attribute if it is present."""
+    """Remove the temporary _root_cls attribute if present."""
     if hasattr(child, "_root_cls"):
         delattr(child, "_root_cls")
 
 
 def parsed_statement(code: str) -> ast.stmt:
-    """Return the statement parsed from a one-liner."""
+    """Parse a one-liner into a single statement node."""
     return ast.parse(code).body[0]
 
 
@@ -646,19 +894,8 @@ class WrapRecursiveCall(ast.NodeTransformer):
     unmark_statement = parsed_statement('_unmark_parent(module)')
 
     def visit_Assign(self, node: ast.Assign):
-        """
-        Replace
-            _, has_been_replaced = _replace_with_bnb_linear(...)
-        with
-            try:
-                _mark_parent(module,
-                             model._root_cls
-                             if hasattr(model, "_root_cls")
-                             else type(model))
-                _, has_been_replaced = _replace_with_bnb_linear(...)
-            finally:
-                _unmark_parent(module)
-        """
+        """Wrap each `_replace_with_bnb_linear(...)` call in try/finally that
+        marks the parent class before the call and unmarks it after."""
         if (
             isinstance(node.value, ast.Call)
             and getattr(node.value.func, "id", None) == self.function_name
@@ -673,24 +910,44 @@ class WrapRecursiveCall(ast.NodeTransformer):
         return node
 
 
+_BNB_SKIP_MATCH = '(key + "." in current_key_name_str) or (key == current_key_name_str)'
+# New keys only: 4.x saves packed the routers its matcher missed (`mlp.gate`), so suffix-matching those breaks reloads.
+_BNB_SUFFIX_MATCH_KEYS = frozenset(("moe.gate",))
+
+
+def _add_suffix_match_to_bnb_skip(source: str) -> str:
+    return source.replace(
+        _BNB_SKIP_MATCH,
+        _BNB_SKIP_MATCH + ' or (key in _BNB_SUFFIX_MATCH_KEYS and current_key_name_str.endswith("." + key))',
+        1,
+    )
+
+
 # Patch for dynamic 4bit quantization
 import inspect
-import transformers.integrations.bitsandbytes
-if hasattr(transformers.integrations.bitsandbytes, "_replace_with_bnb_linear") and \
-    (transformers.integrations.bitsandbytes._replace_with_bnb_linear.__name__ != "_unsloth_replace_with_bnb_linear"):
+try:
+    import transformers.integrations.bitsandbytes as _transformers_bnb
+except Exception:
+    # Not just ImportError: this transformers module imports bitsandbytes at its own module
+    # scope, and a bitsandbytes mismatched with torch fails its own import with AttributeError.
+    _transformers_bnb = None
+if _transformers_bnb is not None and \
+    hasattr(_transformers_bnb, "_replace_with_bnb_linear") and \
+    (_transformers_bnb._replace_with_bnb_linear.__name__ != "_unsloth_replace_with_bnb_linear"):
 
     # All Unsloth Zoo code licensed under LGPLv3
-    source = inspect.getsource(transformers.integrations.bitsandbytes._replace_with_bnb_linear)
-    functions = dir(transformers.integrations.bitsandbytes)
+    source = inspect.getsource(_transformers_bnb._replace_with_bnb_linear)
+    functions = dir(_transformers_bnb)
     functions = [x for x in functions if f" {x}" in source or f"{x}." in source or f"{x}(" in source]
     functions = [x for x in functions if x != "_replace_with_bnb_linear"]
     x = ", ".join(functions)
     exec(f"from transformers.integrations.bitsandbytes import ({x})", globals())
     if "current_key_name_str" not in source:
         raise RuntimeError("Unsloth: Patch for dynamic quantization failed since current_key_name_str does not exist.")
+    source = _add_suffix_match_to_bnb_skip(source)
 
-    # First patch recursive calls to mark the parent class
-    # we need it to access the parent class to check for conversion_mappings
+    # Patch recursive calls to mark the parent class, so we can access it
+    # when checking for conversion_mappings
     try:
         mark_parent_error = False
         new_source = source.replace(
@@ -721,7 +978,7 @@ if hasattr(transformers.integrations.bitsandbytes, "_replace_with_bnb_linear") a
         mark_parent_error = True
 
     if mark_parent_error:
-        # we sitll have the original source without the mark_parent and unmark_parent patches
+        # Fall back to original source without the mark/unmark patches
         source = source.replace(
             "name in quantization_config.llm_int8_skip_modules\n",
             "((name in quantization_config.llm_int8_skip_modules) or (current_key_name_str in quantization_config.llm_int8_skip_modules))\n",
@@ -749,18 +1006,20 @@ if hasattr(transformers.integrations.bitsandbytes, "_replace_with_bnb_linear") a
     source = re.sub(pattern, add_score_code, source, flags=re.MULTILINE)
 
     exec(source, globals())
-    transformers.integrations.bitsandbytes._replace_with_bnb_linear = _unsloth_replace_with_bnb_linear
+    # Defined by the exec(source, globals()) directly above.
+    _transformers_bnb._replace_with_bnb_linear = _unsloth_replace_with_bnb_linear  # noqa: F821
 pass
 
-# Patch for transformers 5.x: should_convert_module uses re.match (prefix-anchored)
-# and endswith, but does not do substring component matching. This means entries like
-# "vision_tower" in llm_int8_skip_modules fail to match module names like
-# "model.vision_tower.vision_model.encoder.layers.0.self_attn.q_proj".
-# On 4.x, Unsloth patches _replace_with_bnb_linear with check_conversion_mappings
-# (substring matching). On 5.x, _replace_with_bnb_linear doesn't exist, so we
-# patch should_convert_module instead.
+# Patch for transformers 5.x: should_convert_module uses re.match + endswith
+# but no substring component matching, so entries like "vision_tower" in
+# llm_int8_skip_modules miss names like "model.vision_tower.vision_model...".
+# 4.x patches _replace_with_bnb_linear (substring matching); on 5.x that no
+# longer exists, so patch should_convert_module instead.
 import transformers.quantizers.quantizers_utils as _quantizers_utils
-if not hasattr(transformers.integrations.bitsandbytes, "_replace_with_bnb_linear") and \
+# A bitsandbytes too broken to import leaves _transformers_bnb None, which rules out 4.x's
+# _replace_with_bnb_linear the same way 5.x does. should_convert_module below is the marker
+# that actually separates the two, so the 5.x patch still applies instead of being skipped.
+if (_transformers_bnb is None or not hasattr(_transformers_bnb, "_replace_with_bnb_linear")) and \
     hasattr(_quantizers_utils, "should_convert_module") and \
     getattr(_quantizers_utils.should_convert_module, "__name__", "") != "_unsloth_should_convert_module":
 
@@ -780,8 +1039,8 @@ if not hasattr(transformers.integrations.bitsandbytes, "_replace_with_bnb_linear
 
     _quantizers_utils.should_convert_module = _unsloth_should_convert_module
     # Also patch the imported reference in bitsandbytes module
-    if hasattr(transformers.integrations.bitsandbytes, "should_convert_module"):
-        transformers.integrations.bitsandbytes.should_convert_module = _unsloth_should_convert_module
+    if _transformers_bnb is not None and hasattr(_transformers_bnb, "should_convert_module"):
+        _transformers_bnb.should_convert_module = _unsloth_should_convert_module
 pass
 
 # Unsloth Zoo - Utilities for Unsloth

@@ -32,10 +32,7 @@ from .utils import (
 )
 
 
-# ============================================================================
 # Grouped GEMM kernel integration for MoE training acceleration
-# ============================================================================
-
 from .moe_utils import (
     patch_param_wrapper_for_moe,
     get_forward_moe_backend,
@@ -82,6 +79,14 @@ def _make_qwen_moe_experts_forward(module_name: Optional[str] = None):
 
 
 def _make_qwen_moe_sparse_moe_block_forward(use_shared_expert: bool, module_name: Optional[str] = None):
+    # Kept because compiling this block is still blocked (B200, torch 2.13.0,
+    # Qwen3.5-35B-A3B): fullgraph=True dies building guards on a stale global
+    # (Qwen3_5MoeMLP_forward), and fullgraph=False leaves 8 graph breaks, all
+    # torch._C.Generator, 6 of them present with no LoRA at all. The routing counter
+    # is not the blocker: breaks are identical with bincount and with the sync-free
+    # counter. Dropping the decorator did run 1.22-1.40x faster, but PR #608 measured
+    # only 1.03-1.04x end to end and found capture incompatible with gradient
+    # checkpointing, so do not remove it without an end-to-end measurement.
     @torch.compiler.disable
     def sparse_moe_block_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         use_shared_expert = hasattr(self, "shared_expert") and hasattr(self, "shared_expert_gate")
@@ -208,7 +213,11 @@ def patch_qwen3_moe():
     # Transformers >= 5       uses self.gate_up_proj = nn.Parameter(...)
     # whilst old transformers uses self.experts = nn.ModuleList(...)
 
-    # Patch ParamWrapper.forward for MoE separated LoRA
+    # Patch ParamWrapper.forward for MoE separated LoRA.
+    # Ordering is load-bearing: this unconditional call installs the
+    # peft.get_peft_model wrapper during the import-time patch pass, before
+    # unsloth.models.llama/vision capture their get_peft_model alias. Do not
+    # gate it by model name or move it below the qwen3 import check.
     patch_param_wrapper_for_moe()
 
     try:
@@ -316,11 +325,8 @@ def patch_qwen3_moe():
                 final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
             return final_hidden_states.to(hidden_states.dtype), router_logits
     else:
-    # ====================================================================
-        # New transformers (5.0+) with stacked expert weights
-        # Uses Triton grouped GEMM kernels for high performance
-        # ====================================================================
-
+        # New transformers (5.0+) with stacked expert weights; uses Triton
+        # grouped GEMM kernels.
         _qwen3_lora_extractor = _make_qwen_moe_lora_extractor()
 
         transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeExperts._unsloth_lora_extractor_fn = staticmethod(_qwen3_lora_extractor)
@@ -331,18 +337,16 @@ def patch_qwen3_moe():
             module_name=__name__,
         )
 
-    # For old transformers, patch Qwen3MoeSparseMoeBlock
-    # For new transformers, patch Qwen3MoeExperts (which has the expert loop)
+    # Old transformers: patch Qwen3MoeSparseMoeBlock.
+    # New transformers: patch Qwen3MoeExperts (which has the expert loop).
     if old_transformers:
         patch_function(transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeSparseMoeBlock, "forward", forward)
     else:
         patch_function(transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeExperts, "forward", forward)
         patch_function(transformers.models.qwen3_moe.modeling_qwen3_moe.Qwen3MoeSparseMoeBlock, "forward", sparse_moe_block_forward)
 
-    # ====================================================================
-    # Patch Qwen3MoeForCausalLM.forward for GRPO training
-    # When UNSLOTH_RETURN_HIDDEN_STATES=1, return hidden_states instead of logits
-    # ====================================================================
+    # Patch Qwen3MoeForCausalLM.forward for GRPO: return hidden_states instead
+    # of logits when UNSLOTH_RETURN_HIDDEN_STATES=1.
     try:
         from transformers.models.qwen3_moe.modeling_qwen3_moe import (
             Qwen3MoeForCausalLM,

@@ -8,30 +8,25 @@
 
 """AST-level rewriter for the canonical HF lm_head / loss_function triplet.
 
-Match:
-    <LOGITS> = self.<HEAD>(<HIDDEN>)              # optional .float()/[slice]/.contiguous() wrappers
-    if labels is not None:
-        <LOSS> = self.loss_function(<LOGITS>, labels, vocab_size=..., **kwargs)
+Matches ``<LOGITS> = self.<HEAD>(<HIDDEN>)`` (optional .float()/.contiguous()/
+.to() wrappers, and a ``* scale`` / ``/ scale`` the fused kernel reapplies as
+``logit_scale_multiply`` / ``logit_scale_divide``) followed by an ``if labels is
+not None:`` branch computing ``self.loss_function(<LOGITS>, labels,
+vocab_size=..., **kwargs)``. Any other wrapper bails out of the rewrite.
 
-Rewrite the labels branch to two paths:
-  - default (``UNSLOTH_RETURN_LOGITS`` unset): ``unsloth_fused_lm_head_loss(
-    <HIDDEN>, self.<HEAD>, labels, ...)`` (skipping the bf16 logits + fp32
-    cast); ``logits = EMPTY_LOGITS``. No lm_head matmul on the hot path.
+Rewrites the labels branch to two paths:
+  - default (``UNSLOTH_RETURN_LOGITS`` unset): ``unsloth_fused_lm_head_loss``
+    (no lm_head matmul on the hot path); ``logits = EMPTY_LOGITS``.
   - opt-in (``UNSLOTH_RETURN_LOGITS=1``): materialise logits once via the
-    original ``self.<HEAD>(<HIDDEN>)`` expression, then route the loss
-    through the model's own ``self.loss_function`` on those logits. One
-    lm_head matmul total (vs two if we kept the fused kernel and computed
-    logits separately for the return slot).
+    original head expr, then route loss through ``self.loss_function`` on
+    them. One lm_head matmul total.
 
-The else (generation) branch keeps the original RHS verbatim. Forwards
-that miss the triplet fall through to ``_UNMATCHED``; the LOSS_MAPPING
-sweep is the backstop.
+The else (generation) branch keeps the original RHS. Forwards missing the
+triplet fall through; the LOSS_MAPPING sweep is the backstop.
 
-``UNSLOTH_RETURN_HIDDEN_STATES`` is intentionally not handled here:
-GRPO's hidden-states fast path lives in the compiler-rewritten forward
-(``unsloth_zoo/compiler.py``), which always overrides the AST forward
-for the unsloth-supported ``*ForCausalLM`` classes that callers actually
-use with that env var.
+``UNSLOTH_RETURN_HIDDEN_STATES`` is handled instead in the compiler-rewritten
+forward (``unsloth_zoo/compiler.py``), which overrides the AST forward for
+the supported ``*ForCausalLM`` classes used with that env var.
 """
 
 from __future__ import annotations
@@ -43,7 +38,7 @@ __all__ = [
 
 import ast
 import textwrap
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -59,6 +54,8 @@ class TripletCapture:
     lm_head_assign_idx: int   # index in the function body of the `logits = self.lm_head(...)` stmt
     if_block_idx: int         # index of the `if labels is not None:` stmt
     loss_init_idx: int | None # index of the `loss = None` stmt that we delete (may be None)
+    # [(name, ast.AST)] post-head scaling; fused call only. Defaulted + last for existing callers.
+    scale_kws: list = field(default_factory = list)
 
 
 def _is_self_attr_call(node: ast.AST) -> bool:
@@ -70,18 +67,53 @@ def _is_self_attr_call(node: ast.AST) -> bool:
     )
 
 
-def _find_inner_self_call(value: ast.AST) -> ast.Call | None:
-    """First Call descendant whose func is `self.<X>`. Lets us see through
-    `.float()` / `[slice]` / `.contiguous()` chains."""
-    for node in ast.walk(value):
+def _contains_self_attr_call(node: ast.AST) -> bool:
+    return any(_is_self_attr_call(n) for n in ast.walk(node))
+
+
+# Wrappers the fused kernel makes redundant (it casts + accumulates in fp32 itself).
+_TRANSPARENT_METHODS = frozenset(("float", "contiguous", "to"))
+
+
+def _unwrap_logits_rhs(value: ast.AST):
+    """``(self.<HEAD>(...) call, scale_kws)``, or None for any wrapper besides ``* s`` / ``/ s``
+    (peeling blindly dropped it and trained on wrongly scaled logits)."""
+    scale_kws: list = []
+    node = value
+    while True:
         if _is_self_attr_call(node):
-            return node
-    return None
+            return node, scale_kws
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in _TRANSPARENT_METHODS
+        ):
+            node = node.func.value
+            continue
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Mult, ast.Div)):
+            left_has, right_has = (
+                _contains_self_attr_call(node.left),
+                _contains_self_attr_call(node.right),
+            )
+            if left_has and not right_has:
+                kw = "logit_scale_multiply" if isinstance(node.op, ast.Mult) else "logit_scale_divide"
+                scale, node = node.right, node.left
+            elif right_has and not left_has and isinstance(node.op, ast.Mult):
+                # `scale / head` is not a scaling.
+                kw, scale, node = "logit_scale_multiply", node.left, node.right
+            else:
+                return None
+            # A repeat would emit a duplicate keyword argument.
+            if any(name == kw for name, _ in scale_kws):
+                return None
+            scale_kws.append((kw, scale))
+            continue
+        return None
 
 
 def _find_loss_function_call(if_block: ast.If) -> ast.Call | None:
-    # Only direct body statements -- nested ifs (guards) inside the labels
-    # branch would be silently dropped by the wholesale rewrite.
+    # Only direct body statements: nested ifs inside the labels branch would
+    # be dropped by the wholesale rewrite.
     for stmt in if_block.body:
         if isinstance(stmt, ast.Assign):
             v = stmt.value
@@ -129,8 +161,9 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> TripletCapture | Non
     if if_node is None:
         return None
 
-    # Reject non-trivial label branches: anything more than `[loss = self.loss_function(...)]`
-    # is silently lost by the wholesale rewrite (e.g. CSM auxiliary depth-decoder loss).
+    # Reject non-trivial label branches: anything beyond a single
+    # `loss = self.loss_function(...)` is lost by the wholesale rewrite (e.g.
+    # CSM auxiliary depth-decoder loss).
     if if_node.orelse:
         return None
     if len(if_node.body) != 1:
@@ -203,6 +236,7 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> TripletCapture | Non
     hidden_expr = None
     logits_rhs_src = None
     lm_head_assign_idx = None
+    scale_kws: list = []
     for j in range(if_idx - 1, -1, -1):
         stmt = body[j]
         if not (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1):
@@ -210,14 +244,11 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> TripletCapture | Non
         tgt = stmt.targets[0]
         if not (isinstance(tgt, ast.Name) and tgt.id == logits_name):
             continue
-        inner = _find_inner_self_call(stmt.value)
-        if inner is None:
-            # The logits-bearing name is re-assigned by a non-lm_head
-            # expression (e.g. `logits = logits * self.logit_scale` for
-            # Cohere). Removing the original lm_head call would leave the
-            # rebinding referencing an undefined `logits`. Bail out and
-            # let the LOSS_MAPPING patch handle this class.
+        unwrapped = _unwrap_logits_rhs(stmt.value)
+        if unwrapped is None:
+            # Non-lm_head reassign (Cohere's `logits * self.logit_scale`) or unreproducible wrapper.
             return None
+        inner, scale_kws = unwrapped
         head_attr = inner.func.attr
         if not inner.args:
             return None
@@ -241,10 +272,9 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> TripletCapture | Non
             loss_init_idx = j
             break
 
-    # Bail if any statement between lm_head and the labels-if touches
-    # logits (e.g. Gemma3 final_logit_softcapping): it would run on
-    # EMPTY_LOGITS in the labels branch, so fused loss would see
-    # un-softcapped logits.
+    # Bail if any statement between lm_head and the labels-if touches logits
+    # (e.g. Gemma3 final_logit_softcapping): it would run on EMPTY_LOGITS in
+    # the labels branch, so fused loss would see un-softcapped logits.
     for j in range(lm_head_assign_idx + 1, if_idx):
         if j == loss_init_idx:
             continue
@@ -261,6 +291,7 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> TripletCapture | Non
         vocab_expr=vocab_expr,
         kwargs_name=kwargs_name,
         extra_loss_kws=extra_loss_kws,
+        scale_kws=scale_kws,
         lm_head_assign_idx=lm_head_assign_idx,
         if_block_idx=if_idx,
         loss_init_idx=loss_init_idx,
@@ -276,15 +307,21 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
     extra = "".join(
         f", {name}={ast.unparse(value)}" for name, value in cap.extra_loss_kws
     )
+    # Fused call only (other branches re-evaluate the RHS); an explicit same-name kwarg wins.
+    already = {name for name, _ in cap.extra_loss_kws}
+    scale_extra = "".join(
+        f", {name}={ast.unparse(value)}"
+        for name, value in cap.scale_kws
+        if name not in already
+    )
     kwargs_unpack = f", **{cap.kwargs_name}" if cap.kwargs_name else ""
     hidden_src = ast.unparse(cap.hidden_expr)
     logits_rhs = cap.logits_rhs_src or f"self.{head_attr}({hidden_src})"
 
-    # Labels branch. Default path: fused kernel, logits = EMPTY_LOGITS
-    # (no lm_head matmul at all). UNSLOTH_RETURN_LOGITS=1 path: materialise
-    # the full lm_head matmul once and route loss through the model's own
-    # self.loss_function on those logits. Avoids double matmul (fused
-    # kernel chunks lm_head internally; logits_rhs runs the full matmul).
+    # Labels branch. Default: fused kernel, logits = EMPTY_LOGITS (no lm_head
+    # matmul). UNSLOTH_RETURN_LOGITS=1: run the full lm_head matmul once and
+    # route loss through self.loss_function on those logits (avoids the double
+    # matmul of fused-kernel + separate logits_rhs).
     template = textwrap.dedent(f"""
         if labels is not None:
             if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1':
@@ -293,7 +330,7 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
             else:
                 {loss} = unsloth_fused_lm_head_loss(
                     {hidden_src}, self.{head_attr}, labels,
-                    vocab_size={vocab}{extra}{kwargs_unpack},
+                    vocab_size={vocab}{extra}{scale_extra}{kwargs_unpack},
                 )
                 {logits} = EMPTY_LOGITS
         else:
@@ -335,8 +372,8 @@ def rewrite_forward_source(source: str) -> tuple[str | None, TripletCapture | No
             continue
         new_body.append(stmt)
     fn.body = new_body
-    # @can_return_tuple carries return_dict=False semantics and must
-    # survive; only strip the docstring-only decorators below.
+    # @can_return_tuple carries return_dict=False semantics and must survive;
+    # strip only the docstring-only decorators below.
     _DROP_DECORATORS = {
         "auto_docstring",
         "add_start_docstrings",

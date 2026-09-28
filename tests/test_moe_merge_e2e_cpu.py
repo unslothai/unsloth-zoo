@@ -68,10 +68,25 @@ def _build_synthetic_layer(num_experts, rank_per, hidden, intermediate, layout, 
     return fused_gate_up, fused_down, A_gu, B_gu, A_dn, B_dn
 
 
-def _analytic_gate_up_delta(A, B, alpha, expert_idx, num_experts, role, layout, I, H):
+def _peft_expert_factors(A, B, expert_idx, num_experts):
+    """One expert's `(lora_A_rows, lora_B_columns)` out of a fused pair, as PEFT packs them.
+
+    The two halves are flattened differently and that asymmetry is the whole point: `lora_A`
+    is `(num_experts * rank, in)` with the expert index SLOWEST, so expert `e` is the
+    contiguous row block `e*rank : (e+1)*rank`; `lora_B` is `(out, num_experts * rank)` with
+    the expert index FASTEST, `reshape(out, rank, num_experts)` in
+    `ParamWrapper.get_delta_factors`, so expert `e` is plane `e` of that reshape. Restated
+    from PEFT here rather than imported from unsloth_zoo, so this file keeps an independent
+    expectation instead of echoing the code it checks.
+    """
     r = A.shape[0] // num_experts
-    s, e = expert_idx * r, (expert_idx + 1) * r
-    a = A[s:e].to(torch.float64); b = B[:, s:e].to(torch.float64)
+    a = A[expert_idx * r:(expert_idx + 1) * r].to(torch.float64)
+    b = B.reshape(B.shape[0], r, num_experts)[:, :, expert_idx].to(torch.float64)
+    return a, b
+
+
+def _analytic_gate_up_delta(A, B, alpha, expert_idx, num_experts, role, layout, I, H):
+    a, b = _peft_expert_factors(A, B, expert_idx, num_experts)
     if layout == "swapped":
         half = a[:, :I] if role == "gate" else a[:, I:]
         return alpha * (b @ half).T
@@ -80,9 +95,7 @@ def _analytic_gate_up_delta(A, B, alpha, expert_idx, num_experts, role, layout, 
 
 
 def _analytic_down_delta(A, B, alpha, expert_idx, num_experts, layout):
-    r = A.shape[0] // num_experts
-    s, e = expert_idx * r, (expert_idx + 1) * r
-    a = A[s:e].to(torch.float64); b = B[:, s:e].to(torch.float64)
+    a, b = _peft_expert_factors(A, B, expert_idx, num_experts)
     if layout == "swapped":
         return alpha * (b @ a).T
     return alpha * (b @ a)
@@ -90,7 +103,10 @@ def _analytic_down_delta(A, B, alpha, expert_idx, num_experts, layout):
 
 @pytest.mark.parametrize("layout", ["swapped", "standard"])
 def test_per_layer_merge_round_trip(layout):
-    num_layers, num_experts, rank_per = 2, 4, 4
+    # num_experts != rank_per, and both > 1: with E == r the two packings of lora_B still
+    # differ, but a shape error between the two axes would not show up, and with either of
+    # them 1 the packings coincide and the test would prove nothing at all.
+    num_layers, num_experts, rank_per = 2, 4, 3
     hidden, intermediate = 12, 8
     alpha = 8.0
     dtype = torch.float32

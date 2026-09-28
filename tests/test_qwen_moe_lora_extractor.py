@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+from unsloth_zoo.temporary_patches.moe_utils import moe_lora_b_expert_columns
 from unsloth_zoo.temporary_patches.qwen3_moe import _make_qwen_moe_lora_extractor
 
 
@@ -35,7 +36,7 @@ def _assert_layout_equivalence(layout, first, second, weight_A, weight_B, E, R, 
     x = torch.randn(6, in_dim)
     for e in range(E):
         Ae = weight_A[e * R : (e + 1) * R]
-        Be = weight_B[:, e * R : (e + 1) * R]
+        Be = weight_B[:, moe_lora_b_expert_columns(e, E, R)]
         if layout == "canonical":
             naive = x @ Ae.T @ Be.T
         else:
@@ -102,7 +103,7 @@ def test_extractor_fallback_numerical_equivalence_per_expert():
     x = torch.randn(6, in_dim)
     for e in range(E):
         Ae = wA[e * R : (e + 1) * R]
-        Be = wB[:, e * R : (e + 1) * R]
+        Be = wB[:, moe_lora_b_expert_columns(e, E, R)]
         naive = x @ Ae.T @ Be.T
         via = (x @ first[e]) @ second[e]
         torch.testing.assert_close(via, naive, atol=1e-4, rtol=1e-4)
@@ -163,13 +164,11 @@ class _SquareWrapper:
         self.parameter_name = parameter_name
         self.base_layer = type("_Base", (), {})()
         if parameter_name == "down_proj":
-            # down_proj: (E, hidden_dim, intermediate_dim). Force in == out by
-            # setting intermediate_dim == hidden_dim.
+            # down_proj (E, hidden_dim, intermediate_dim): force in == out
             self.base_layer.intermediate_dim = dim
             self.base_layer.hidden_dim = dim
         elif parameter_name == "gate_up_proj":
-            # gate_up_proj: input_dim = hidden_dim, output_dim = 2*intermediate_dim.
-            # Make square by intermediate_dim = hidden_dim/2.
+            # gate_up_proj in=hidden_dim, out=2*intermediate_dim: square via intermediate_dim=hidden_dim/2
             self.base_layer.hidden_dim = dim
             self.base_layer.intermediate_dim = dim // 2
         self._did_swap_in_out_features = did_swap
@@ -193,16 +192,15 @@ def test_extractor_disambiguates_square_dims_via_did_swap(did_swap):
     assert first.shape == (E, dim, R)
     assert second.shape == (E, R, dim)
 
-    # Reference: under PEFT 0.18 the reshape is the canonical permutation;
-    # under PEFT 0.19 swapped, weight_A and weight_B roles are flipped.
+    # PEFT 0.19+ adds B @ A per expert; PEFT 0.18 adds (B @ A).T.
     x = torch.randn(5, dim)
     for e in range(E):
         Ae = wA[e * R : (e + 1) * R]
-        Be = wB[:, e * R : (e + 1) * R]
+        Be = wB[:, moe_lora_b_expert_columns(e, E, R)]
         if did_swap:
-            naive = x @ Be @ Ae   # PEFT 0.19 reversed
+            naive = x @ Ae.T @ Be.T
         else:
-            naive = x @ Ae.T @ Be.T  # PEFT 0.18 canonical
+            naive = x @ Be @ Ae
         via = (x @ first[e]) @ second[e]
         torch.testing.assert_close(via, naive, atol=1e-4, rtol=1e-4)
 
@@ -237,7 +235,6 @@ def test_extractor_fallback_warns_when_dims_mismatch(caplog):
 
     assert first.shape == (E, weird_dim, R)
     assert second.shape == (E, R, weird_dim)
-    # At least one warning record mentions the extractor.
     assert any(
         "Qwen MoE LoRA extractor could not match either layout" in rec.getMessage()
         for rec in caplog.records

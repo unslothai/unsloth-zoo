@@ -1,0 +1,763 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+"""The compiled cache must never execute bytes it did not generate.
+
+`create_new_function` writes generated source into a cwd-relative cache and
+imports it back, so whatever is in that file runs. It failed open three ways:
+`write_file` reported success after a failed write, the sha256 gate only had a
+digest under a process group, and `install_to_cache` swallowed the copy failure.
+
+Getting content into that directory is a local prerequisite, not something a
+model repo can do alone, but a dataset directory, an output directory or a
+mode-preserving archive extraction all reach the working directory.
+"""
+
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import os
+import pathlib
+import shutil
+import stat
+import sys
+import tempfile
+import warnings
+
+import pytest
+
+from unsloth_zoo import compiler
+from unsloth_zoo.temporary_patches import moe_utils
+
+# A marker written into os.environ, so a planted module that runs is visible
+# even when its definitions are never called.
+_MARKER = "UNSLOTH_TEST_PLANTED_CACHE_EXECUTED"
+
+_PLANTED_SOURCE = (
+    "import os\n"
+    f"os.environ[{_MARKER!r}] = '1'\n"
+    "def probe():\n"
+    "    return 'planted'\n"
+)
+_GENUINE_SOURCE = "def probe():\n    return 'genuine'\n"
+
+
+# These lean on a mode bit stopping a write, which root bypasses entirely.
+# Costs 36 of 161 cells on Windows, so the Windows outcome of the repair path is
+# pinned by no test -- it is measured instead: there os.replace over a 0444
+# destination, or one merely held open by a reader, raises WinError 5, so the
+# planted file survives and the caller recovers into temp. Read the skip count
+# before trusting a green Windows run.
+_needs_mode_enforcement = pytest.mark.skipif(
+    os.name != "posix" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+    reason = "POSIX file permissions, which root bypasses",
+)
+
+
+@pytest.fixture(autouse = True)
+def _sandbox(tmp_path, monkeypatch):
+    """Keep the cache, the temp fallback and sys.modules inside this test."""
+    monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_USE_TEMP", False)
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path / "tempdir"))
+    os.makedirs(tmp_path / "tempdir", exist_ok = True)
+    # setenv, not delenv: a planted module that runs sets this itself, and
+    # delenv records nothing to restore when the variable is already absent, so
+    # one failure would otherwise leak the marker into the rest of the session.
+    monkeypatch.setenv(_MARKER, "0")
+    yield
+    for name in list(sys.modules):
+        if name.startswith("UnslothFailClosedProbe") or name.startswith(
+            "unsloth_cache_UnslothFailClosedProbe"
+        ):
+            del sys.modules[name]
+
+
+@pytest.fixture
+def cache_dir(tmp_path, monkeypatch):
+    """An isolated persistent cache directory, restored to writable on teardown."""
+    location = tmp_path / "unsloth_compiled_cache"
+    location.mkdir()
+    monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_LOCATION", str(location))
+    try:
+        yield location
+    finally:
+        # A test that drops write permission has to give it back, or pytest's
+        # own tmp_path cleanup is the thing that fails.
+        for root, directories, _files in os.walk(location):
+            for directory in directories:
+                os.chmod(os.path.join(root, directory), 0o700)
+        os.chmod(location, 0o700)
+
+
+def _emit(name, source = _GENUINE_SOURCE):
+    """create_new_function() as the ordinary single-process call sites reach it."""
+    return compiler.create_new_function(name, source, "math", [])
+
+
+def _plant(cache_dir, name, mode):
+    path = cache_dir / f"{name}.py"
+    path.write_text(_PLANTED_SOURCE)
+    os.chmod(path, mode)
+    return path
+
+
+def _planted_ran():
+    return os.environ.get(_MARKER, "0") == "1"
+
+
+@_needs_mode_enforcement
+def test_planted_read_only_cache_file_is_not_executed(cache_dir):
+    """The core case: a 0444 cache file is replaced, never imported."""
+    name = "UnslothFailClosedProbeReadOnly"
+    planted = _plant(cache_dir, name, 0o444)
+
+    module = _emit(name)
+
+    assert not _planted_ran(), "the planted cache file was imported and executed"
+    assert module.probe() == "genuine"
+    assert "planted" not in planted.read_text()
+    assert "def probe():" in planted.read_text()
+
+
+@_needs_mode_enforcement
+def test_victim_writable_planted_cache_file_is_overwritten(cache_dir):
+    """Already-safe behaviour that has to stay: a writable file is rewritten."""
+    name = "UnslothFailClosedProbeWritable"
+    planted = _plant(cache_dir, name, 0o644)
+
+    module = _emit(name)
+
+    assert not _planted_ran()
+    assert module.probe() == "genuine"
+    assert "planted" not in planted.read_text()
+
+
+def test_generated_cache_file_is_written_and_imported(cache_dir):
+    """The ordinary path: generate, write, import, and stay idempotent."""
+    name = "UnslothFailClosedProbeGenuine"
+
+    module = _emit(name)
+    written = (cache_dir / f"{name}.py").read_text()
+
+    assert module.probe() == "genuine"
+    assert "__UNSLOTH_VERSIONING__" in written
+
+    # A second call has to reach the same bytes rather than trip the new gate.
+    again = _emit(name)
+    assert again.probe() == "genuine"
+    assert (cache_dir / f"{name}.py").read_text() == written
+
+
+@_needs_mode_enforcement
+def test_read_only_cache_directory_still_falls_back(cache_dir):
+    """Already-safe behaviour that has to stay: an unwritable directory recovers."""
+    name = "UnslothFailClosedProbeReadOnlyDir"
+    os.chmod(cache_dir, 0o500)
+
+    module = _emit(name)
+
+    assert module.probe() == "genuine"
+    assert not (cache_dir / f"{name}.py").exists()
+    assert os.path.realpath(module.__file__).startswith(
+        os.path.realpath(tempfile.gettempdir())
+    )
+
+
+@_needs_mode_enforcement
+def test_unlandable_rewrite_over_planted_bytes_is_not_imported(cache_dir, monkeypatch):
+    """When even the replacement cannot land, the write must report failure."""
+    name = "UnslothFailClosedProbeUnlandable"
+    planted = _plant(cache_dir, name, 0o444)
+
+    def cannot_replace(function_location, new_write_bytes):
+        raise PermissionError("simulated replacement failure")
+
+    monkeypatch.setattr(compiler, "_replace_compiled_cache_file", cannot_replace)
+
+    module = _emit(name)
+
+    assert not _planted_ran(), "the planted cache file was imported and executed"
+    assert module.probe() == "genuine"
+    # Untouched, and the module came from the node-local temp cache instead.
+    assert planted.read_text() == _PLANTED_SOURCE
+    assert os.path.realpath(module.__file__).startswith(
+        os.path.realpath(tempfile.gettempdir())
+    )
+
+
+def test_write_decision_carries_a_digest_without_a_process_group(cache_dir):
+    """The digest gate has to be armed when no process group exists."""
+    location = str(cache_dir / "UnslothFailClosedProbeDigest.py")
+
+    should_write, digest = compiler._compiled_cache_decision(
+        location, _GENUINE_SOURCE, True,
+    )
+
+    assert should_write is True
+    assert digest is not None
+
+
+def test_digest_verification_rejects_bytes_we_did_not_write(cache_dir):
+    """The gate itself: mismatched bytes raise rather than reaching the import."""
+    location = cache_dir / "UnslothFailClosedProbeGate.py"
+    location.write_text(_GENUINE_SOURCE)
+    _should_write, digest = compiler._compiled_cache_decision(
+        str(location), _GENUINE_SOURCE, True,
+    )
+    location.write_text(_PLANTED_SOURCE)
+
+    with pytest.raises(RuntimeError, match = "changed after"):
+        compiler._verified_cache_source(str(location), digest)
+
+    assert not _planted_ran()
+
+
+def test_cache_file_swapped_after_the_write_is_not_imported(cache_dir, monkeypatch):
+    """Plant between the write and the first import: needs no permissions, hits root."""
+    name = "UnslothFailClosedProbeSwapped"
+    real_write = compiler._write_compiled_cache_file
+    swapped = []
+
+    def swap_after_write(function_location, new_write_bytes):
+        real_write(function_location, new_write_bytes)
+        # Once only: the recovery below writes too, and planting into that as
+        # well would test a cache nothing can repair instead of this one.
+        if not swapped:
+            swapped.append(function_location)
+            with open(function_location, "w") as file:
+                file.write(_PLANTED_SOURCE)
+
+    monkeypatch.setattr(compiler, "_write_compiled_cache_file", swap_after_write)
+
+    module = _emit(name)
+
+    assert swapped, "the write path under test was never reached"
+    assert not _planted_ran(), "the swapped cache file was imported and executed"
+    assert module.probe() == "genuine"
+
+
+@_needs_mode_enforcement
+def test_read_only_moe_utils_cache_copy_is_replaced(tmp_path, monkeypatch):
+    """install_to_cache() must land its copy over a read-only destination."""
+    location = tmp_path / "moe_cache_replaceable"
+    location.mkdir()
+    monkeypatch.setenv("UNSLOTH_COMPILE_LOCATION", str(location))
+    planted = location / "moe_utils.py"
+    planted.write_text(_PLANTED_SOURCE)
+    os.chmod(planted, 0o444)
+
+    installed = moe_utils.install_to_cache(moe_utils.__file__, "moe_utils.py")
+
+    with open(moe_utils.__file__, "rb") as handle:
+        assert planted.read_bytes() == handle.read()
+    assert installed is True
+
+
+@_needs_mode_enforcement
+def test_unreplaceable_moe_utils_cache_copy_is_not_loaded(tmp_path, monkeypatch):
+    """When the copy cannot land, the planted file must not be executed."""
+    location = tmp_path / "moe_cache_readonly"
+    location.mkdir()
+    planted = location / "moe_utils.py"
+    planted.write_text(_PLANTED_SOURCE)
+    os.chmod(planted, 0o444)
+    os.chmod(location, 0o500)
+    monkeypatch.setenv("UNSLOTH_COMPILE_LOCATION", str(location))
+    monkeypatch.setattr(moe_utils, "_CACHED_MOE_UTILS_MODULE", None)
+    monkeypatch.setattr(moe_utils, "_CACHED_FORWARD_MOE_BACKEND", None)
+    monkeypatch.delitem(sys.modules, "unsloth_cached_moe_utils", raising = False)
+
+    try:
+        # Recorded rather than asserted with pytest.warns, so the assertions
+        # that matter are reached whether or not anything warned.
+        with warnings.catch_warnings(record = True) as caught:
+            warnings.simplefilter("always")
+            installed = moe_utils.install_to_cache(moe_utils.__file__, "moe_utils.py")
+
+        assert moe_utils._load_cached_moe_utils_module() is None
+        assert moe_utils.get_forward_moe_backend() is moe_utils.forward_moe_backend
+        assert not _planted_ran(), "the planted cache copy was imported and executed"
+        assert planted.read_text() == _PLANTED_SOURCE
+
+        assert installed is False
+        assert [entry for entry in caught if "does not match" in str(entry.message)]
+
+        # install_to_cache() runs at import time, so the report itself must not
+        # be what fails the import under a consumer's warnings-as-errors filter.
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            assert moe_utils.install_to_cache(
+                moe_utils.__file__, "moe_utils.py",
+            ) is False
+    finally:
+        os.chmod(location, 0o700)
+        sys.modules.pop("unsloth_cached_moe_utils", None)
+
+
+def test_install_to_cache_survives_a_cache_it_cannot_create(tmp_path, monkeypatch):
+    """A cache path that cannot exist at all reports failure without raising."""
+    blocker = tmp_path / "not_a_directory"
+    blocker.write_text("")
+    monkeypatch.setenv("UNSLOTH_COMPILE_LOCATION", str(blocker / "cache"))
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert moe_utils.install_to_cache(moe_utils.__file__, "moe_utils.py") is False
+
+
+def test_the_moe_helper_runs_the_bytes_it_compared(tmp_path, monkeypatch):
+    """Comparing one open and executing from a later one leaves a window."""
+    location = tmp_path / "moe_cache_swap"
+    monkeypatch.setenv("UNSLOTH_COMPILE_LOCATION", str(location))
+    monkeypatch.setattr(moe_utils, "_CACHED_MOE_UTILS_MODULE", None)
+    monkeypatch.setattr(moe_utils, "_CACHED_FORWARD_MOE_BACKEND", None)
+    monkeypatch.delitem(sys.modules, "unsloth_cached_moe_utils", raising = False)
+
+    assert moe_utils.install_to_cache(moe_utils.__file__, "moe_utils.py") is True
+    copy_path = location / "moe_utils.py"
+    marker = tmp_path / "SWAPPED_RAN"
+
+    real_read = moe_utils._read_file_bytes
+    swapped = {"done": False}
+
+    def read_then_swap(path):
+        data = real_read(path)
+        # Swap immediately after the comparison read, which is the window.
+        if not swapped["done"] and os.path.abspath(path) == os.path.abspath(copy_path):
+            swapped["done"] = True
+            copy_path.write_text(
+                "import pathlib\n"
+                f"pathlib.Path({str(marker)!r}).write_text('yes')\n"
+                "forward_moe_backend = 'planted'\n",
+                encoding = "utf-8",
+            )
+        return data
+
+    monkeypatch.setattr(moe_utils, "_read_file_bytes", read_then_swap)
+    try:
+        module = moe_utils._load_cached_moe_utils_module()
+        assert not marker.exists(), "the swapped bytes were executed"
+        if module is not None:
+            assert getattr(module, "forward_moe_backend", None) != "planted"
+    finally:
+        sys.modules.pop("unsloth_cached_moe_utils", None)
+
+
+def test_moe_utils_cache_copy_loads_when_it_matches(tmp_path, monkeypatch):
+    """The verification must not break the copy the MoE backends rely on."""
+    location = tmp_path / "moe_cache_genuine"
+    monkeypatch.setenv("UNSLOTH_COMPILE_LOCATION", str(location))
+    monkeypatch.setattr(moe_utils, "_CACHED_MOE_UTILS_MODULE", None)
+    monkeypatch.setattr(moe_utils, "_CACHED_FORWARD_MOE_BACKEND", None)
+    monkeypatch.delitem(sys.modules, "unsloth_cached_moe_utils", raising = False)
+
+    try:
+        assert moe_utils.install_to_cache(moe_utils.__file__, "moe_utils.py") is True
+        copy = moe_utils._load_cached_moe_utils_module()
+        assert copy is not None
+        assert copy is not moe_utils
+        assert moe_utils.get_forward_moe_backend() is copy.forward_moe_backend
+    finally:
+        sys.modules.pop("unsloth_cached_moe_utils", None)
+
+
+@_needs_mode_enforcement
+def test_foreign_bytes_are_reported_rather_than_accepted(cache_dir):
+    """The write-side helpers: absent and generated are fine, other bytes are not."""
+    location = str(cache_dir / "UnslothFailClosedProbeForeign.py")
+    generated = _GENUINE_SOURCE.encode("utf-8")
+
+    assert compiler._compiled_cache_file_is_foreign(location, generated) is False
+    with open(location, "wb") as file:
+        file.write(generated)
+    assert compiler._compiled_cache_file_is_foreign(location, generated) is False
+    with open(location, "wb") as file:
+        file.write(_PLANTED_SOURCE.encode("utf-8"))
+    assert compiler._compiled_cache_file_is_foreign(location, generated) is True
+
+    # And the replacement path lands the generated bytes over a read-only file.
+    os.chmod(location, 0o444)
+    compiler._write_compiled_cache_file(location, generated)
+    assert compiler._compiled_cache_file_is_foreign(location, generated) is False
+    # Readable, so a shared cache directory is not permanently narrowed, but
+    # never writable by anyone else, which is what would allow a re-plant.
+    assert stat.S_IMODE(os.stat(location).st_mode) == 0o644
+
+
+def _plant_bytecode_over(source_path, payload_source):
+    """Compile payload_source into the pyc CPython would load for source_path.
+
+    UNCHECKED_HASH: accepted without ever comparing it to the .py beside it.
+    """
+    import py_compile
+
+    payload = source_path.parent / "planted_payload.py"
+    payload.write_text(payload_source)
+    bytecode_location = importlib.util.cache_from_source(str(source_path))
+    os.makedirs(os.path.dirname(bytecode_location), exist_ok = True)
+    py_compile.compile(
+        str(payload),
+        cfile = bytecode_location,
+        dfile = str(source_path),
+        invalidation_mode = py_compile.PycInvalidationMode.UNCHECKED_HASH,
+    )
+    payload.unlink()
+    return bytecode_location
+
+
+def test_planted_bytecode_beside_expected_source_is_not_executed(cache_dir):
+    """A cache holding the expected source plus a planted pyc must not run it."""
+    name = "UnslothFailClosedProbeBytecode"
+
+    # Phase 1: let the real generator write the canonical source, license header
+    # and all, so phase 2 plants against bytes the digest will accept.
+    first = _emit(name)
+    assert first.probe() == "genuine"
+    source_path = cache_dir / f"{name}.py"
+    canonical = source_path.read_text()
+
+    bytecode_location = _plant_bytecode_over(source_path, _PLANTED_SOURCE)
+    assert os.path.isfile(bytecode_location)
+
+    # Phase 2: a fresh import of the same name, with the source untouched.
+    sys.modules.pop(name, None)
+    module = _emit(name)
+
+    assert source_path.read_text() == canonical, "the source was never the thing under attack"
+    assert not _planted_ran(), "the planted cache bytecode was executed"
+    assert module.probe() == "genuine"
+
+
+def test_planted_bytecode_beside_moe_utils_cache_copy_is_not_executed(tmp_path, monkeypatch):
+    """Same vector through the MoE cache copy, which execs the file directly."""
+    location = tmp_path / "unsloth_compiled_cache"
+    location.mkdir()
+    monkeypatch.setattr(moe_utils, "_get_compile_location", lambda: str(location))
+
+    # A copy identical to the package file, which is what the comparison accepts.
+    package_file = os.path.abspath(moe_utils.__file__)
+    cache_copy = location / "moe_utils.py"
+    shutil.copyfile(package_file, cache_copy)
+
+    _plant_bytecode_over(cache_copy, _PLANTED_SOURCE)
+
+    sys.modules.pop("unsloth_cached_moe_utils", None)
+    moe_utils._CACHED_MOE_UTILS_MODULE = None
+    moe_utils._load_cached_moe_utils_module()
+
+    assert not _planted_ran(), "the planted moe_utils cache bytecode was executed"
+
+
+def _plant_checked_hash_bytecode_over(source_path, payload_source):
+    """A CHECKED_HASH pyc carrying the real source hash and a foreign body.
+
+    Whoever writes the pyc writes its header, so CPython validates and runs it.
+    """
+    import py_compile
+    import struct
+
+    payload = source_path.parent / "planted_checked_payload.py"
+    payload.write_text(payload_source)
+    bytecode_location = importlib.util.cache_from_source(str(source_path))
+    os.makedirs(os.path.dirname(bytecode_location), exist_ok = True)
+    py_compile.compile(
+        str(payload),
+        cfile = bytecode_location,
+        dfile = str(source_path),
+        invalidation_mode = py_compile.PycInvalidationMode.CHECKED_HASH,
+    )
+    data = bytearray(pathlib.Path(bytecode_location).read_bytes())
+    data[8:16] = importlib.util.source_hash(source_path.read_bytes())
+    pathlib.Path(bytecode_location).write_bytes(bytes(data))
+    payload.unlink()
+    flags = struct.unpack("<I", bytes(data[4:8]))[0]
+    assert flags & 0b1 and flags & 0b10, "the planted pyc must be CHECKED_HASH"
+    return bytecode_location
+
+
+@_needs_mode_enforcement
+def test_an_undeletable_checked_hash_pyc_is_refused(cache_dir, monkeypatch):
+    """Removal failing is fatal even when the pyc claims to be checked: the header is as attacker-controlled as the body."""
+    name = "UnslothFailClosedProbeCheckedHash"
+
+    first = _emit(name)
+    assert first.probe() == "genuine"
+    source_path = cache_dir / f"{name}.py"
+    bytecode_location = _plant_checked_hash_bytecode_over(source_path, _PLANTED_SOURCE)
+
+    # Stand in for the pyc an attacker made undeletable.
+    def refuse_removal(path, *args, **kwargs):
+        if str(path) == str(bytecode_location):
+            raise PermissionError("simulated undeletable pycache entry")
+        return _real_remove(path, *args, **kwargs)
+    _real_remove = os.remove
+    monkeypatch.setattr(compiler.os, "remove", refuse_removal)
+
+    sys.modules.pop(name, None)
+    # The refusal does not have to surface as an exception: the caller treats an
+    # unremovable pyc as an unwritable cache and recovers into a node-local temp
+    # directory. What must hold either way is that the planted body never runs.
+    try:
+        module = _emit(name)
+    except Exception:
+        module = None
+
+    assert not _planted_ran(), "the planted checked-hash bytecode was executed"
+    if module is not None:
+        assert module.probe() == "genuine"
+        assert os.path.abspath(module.__file__) != os.path.abspath(str(source_path)), (
+            "recovery should have imported from somewhere other than the poisoned cache"
+        )
+
+
+def test_a_planted_package_does_not_shadow_the_verified_module(cache_dir):
+    """A `<name>/__init__.py` beats `<name>.py`, so it must not be imported."""
+    name = "UnslothFailClosedProbeShadowPkg"
+
+    first = _emit(name)
+    assert first.probe() == "genuine"
+
+    package = cache_dir / name
+    package.mkdir()
+    (package / "__init__.py").write_text(_PLANTED_SOURCE)
+
+    sys.modules.pop(name, None)
+    try:
+        module = _emit(name)
+    except Exception:
+        module = None
+
+    assert not _planted_ran(), "the planted package was imported and executed"
+    if module is not None:
+        assert module.probe() == "genuine"
+
+
+@_needs_mode_enforcement
+def test_the_replacement_writes_through_the_descriptor_it_created(cache_dir, monkeypatch):
+    """The temp file is written by descriptor, so its NAME cannot be redirected."""
+    name = "UnslothFailClosedProbeFdRace"
+    outside = cache_dir.parent / "outside_the_cache.txt"
+    outside.write_text("untouched")
+    os.chmod(outside, 0o600)
+
+    real_mkstemp = tempfile.mkstemp
+
+    def redirecting_mkstemp(*args, **kwargs):
+        descriptor, location = real_mkstemp(*args, **kwargs)
+        os.remove(location)
+        os.symlink(str(outside), location)
+        return descriptor, location
+
+    monkeypatch.setattr(compiler.tempfile, "mkstemp", redirecting_mkstemp)
+
+    _plant(cache_dir, name, 0o444)
+    sys.modules.pop(name, None)
+    try:
+        _emit(name)
+    except Exception:
+        pass
+
+    assert outside.read_text() == "untouched", (
+        "the replacement followed the temp file's NAME and wrote outside the cache"
+    )
+    assert stat.S_IMODE(os.stat(outside).st_mode) == 0o600, (
+        "the mode change followed the temp file's NAME and landed outside the cache"
+    )
+    assert not _planted_ran()
+
+
+def test_an_interrupted_guard_entry_does_not_block_moe_utils_forever(
+    cache_dir, monkeypatch,
+):
+    """A BaseException during guard ENTRY must not leave `moe_utils` blocked."""
+    class _Interrupt(BaseException):
+        pass
+
+    class _InterruptingBlock(dict):
+        def __setitem__(self, key, value):
+            if key == "depth" and value == 1:
+                raise _Interrupt()
+            super().__setitem__(key, value)
+
+    sentinel = object()
+    previous = sys.modules.get("moe_utils", sentinel)
+    try:
+        # A foreign copy, so the folder is untrusted and the guard really engages.
+        (cache_dir / "moe_utils.py").write_text("raise RuntimeError('not ours')\n")
+        monkeypatch.setattr(
+            compiler, "_MOE_UTILS_BLOCK",
+            _InterruptingBlock(depth = 0, previous = None, was_present = False),
+        )
+
+        with pytest.raises(_Interrupt):
+            with compiler._untrusted_cache_kept_out_of_imports(str(cache_dir)):
+                pass
+
+        assert compiler._MOE_UTILS_BLOCK["depth"] == 0, (
+            "the guard left a depth nothing will ever unwind"
+        )
+        assert sys.modules.get("moe_utils", sentinel) is previous, (
+            "moe_utils is still blocked after an interrupted guard entry"
+        )
+    finally:
+        if previous is sentinel:
+            sys.modules.pop("moe_utils", None)
+        else:
+            sys.modules["moe_utils"] = previous
+
+
+def test_a_matching_cache_copy_is_not_rewritten(cache_dir, monkeypatch):
+    """install_to_cache() must not replace a copy that already matches."""
+    destination = cache_dir / "moe_utils.py"
+    shutil.copyfile(moe_utils.__file__, destination)
+    before = os.stat(destination).st_ino
+
+    calls = []
+    monkeypatch.setattr(
+        moe_utils, "_replace_with_copy",
+        lambda *args, **kwargs: calls.append(args),
+    )
+    monkeypatch.setattr(moe_utils, "_get_compile_location", lambda: str(cache_dir))
+
+    assert moe_utils.install_to_cache(moe_utils.__file__, "moe_utils.py") is True
+    assert calls == [], "an identical cache copy was replaced anyway"
+    assert os.stat(destination).st_ino == before
+
+
+def test_a_source_suffix_that_is_not_py_cannot_shadow_the_verified_module(
+    cache_dir, monkeypatch,
+):
+    """Every SOURCE suffix but `.py` is refused beside the verified file.
+
+    POSIX has no second source suffix, so the LIST is stood in for; the property
+    is that the code reads it rather than spelling Windows' `.pyw` out.
+    """
+    name = "UnslothFailClosedProbeSourceShadow"
+    suffixes = list(importlib.machinery.SOURCE_SUFFIXES)
+    if ".pyw" not in suffixes:
+        monkeypatch.setattr(
+            importlib.machinery, "SOURCE_SUFFIXES", suffixes + [".pyw"],
+        )
+
+    (cache_dir / f"{name}.pyw").write_text(_PLANTED_SOURCE)
+
+    with pytest.raises(RuntimeError, match = "Refusing to import"):
+        compiler._reject_shadowing_import_candidates(str(cache_dir), name)
+
+    # And the verified `.py` beside it is still perfectly loadable: the refusal
+    # is about the shadow, not about the directory.
+    assert not _planted_ran()
+
+
+def test_moe_utils_swapped_after_the_check_is_not_imported(cache_dir):
+    """A verified cache copy is BOUND, not re-resolved off the filesystem."""
+    genuine = cache_dir / "moe_utils.py"
+    shutil.copyfile(moe_utils.__file__, genuine)
+
+    original_path = list(sys.path)
+    sentinel = object()
+    previous = sys.modules.get("moe_utils", sentinel)
+    try:
+        with compiler._untrusted_cache_kept_out_of_imports(str(cache_dir)):
+            # The generated module's own prologue puts the cache on sys.path
+            # mid-exec, which is what makes the bare import resolvable at all.
+            sys.path.insert(0, str(cache_dir))
+            # The window: the copy that passed is replaced before the import.
+            genuine.write_text(_PLANTED_SOURCE)
+            try:
+                resolved = importlib.import_module("moe_utils")
+            except Exception:
+                resolved = None
+    finally:
+        sys.path[:] = original_path
+        if previous is sentinel:
+            sys.modules.pop("moe_utils", None)
+        else:
+            sys.modules["moe_utils"] = previous
+
+    assert not _planted_ran(), (
+        "the replacement was imported and executed after passing the check"
+    )
+    assert resolved is not None, "a verified copy should still answer the import"
+    assert resolved is moe_utils, (
+        "the import resolved off the filesystem instead of the verified module"
+    )
+
+
+def test_no_cache_copy_still_leaves_the_bare_import_alone(cache_dir):
+    """With no copy, the guard must not invent a binding."""
+    sentinel = object()
+    previous = sys.modules.get("moe_utils", sentinel)
+    try:
+        with compiler._untrusted_cache_kept_out_of_imports(str(cache_dir)):
+            during = sys.modules.get("moe_utils", sentinel)
+        assert during is previous, "the guard bound a name with no copy to vouch for"
+    finally:
+        if previous is sentinel:
+            sys.modules.pop("moe_utils", None)
+        else:
+            sys.modules["moe_utils"] = previous
+
+
+def test_a_symlinked_pycache_does_not_get_a_file_outside_the_cache_deleted(
+    cache_dir, tmp_path,
+):
+    """The pyc removal must not follow a `__pycache__` symlink out of the cache."""
+    name = "UnslothFailClosedProbePycacheLink"
+    source = cache_dir / f"{name}.py"
+    source.write_text(_GENUINE_SOURCE)
+
+    outside = tmp_path / "somebody_elses_pycache"
+    outside.mkdir()
+    victim = pathlib.Path(
+        importlib.util.cache_from_source(str(source))
+    ).name
+    (outside / victim).write_text("not ours to delete")
+
+    (cache_dir / "__pycache__").symlink_to(outside, target_is_directory = True)
+
+    with pytest.raises(RuntimeError, match = "outside the compiled cache"):
+        compiler._remove_compiled_cache_bytecode(str(source))
+
+    assert (outside / victim).read_text() == "not ours to delete", (
+        "the unlink followed the __pycache__ symlink out of the cache"
+    )
+    # moe_utils' copy of the same removal refuses rather than raising, because
+    # its caller falls back to this module's own definitions.
+    assert moe_utils._remove_cached_bytecode(str(source)) is False
+    assert (outside / victim).read_text() == "not ours to delete"
+
+
+def test_a_user_set_pycache_prefix_is_not_treated_as_a_redirect(
+    cache_dir, tmp_path, monkeypatch,
+):
+    """sys.pycache_prefix must keep working: negative control for the test above."""
+    name = "UnslothFailClosedProbePycachePrefix"
+    source = cache_dir / f"{name}.py"
+    source.write_text(_GENUINE_SOURCE)
+
+    prefix = tmp_path / "pycache_prefix"
+    prefix.mkdir()
+    monkeypatch.setattr(sys, "pycache_prefix", str(prefix))
+
+    bytecode = pathlib.Path(importlib.util.cache_from_source(str(source)))
+    bytecode.parent.mkdir(parents = True, exist_ok = True)
+    bytecode.write_bytes(b"\x00" * 16)
+
+    compiler._remove_compiled_cache_bytecode(str(source))
+    assert not bytecode.exists(), "the pyc under the user's prefix was not removed"
+    assert moe_utils._remove_cached_bytecode(str(source)) is True

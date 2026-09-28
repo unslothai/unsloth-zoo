@@ -6,7 +6,7 @@
 /unsloth_zoo/compiler_replacements.py @danielhanchen
 /unsloth_zoo/device_type.py @danielhanchen
 /unsloth_zoo/tokenizer_utils.py @mmathew23 @danielhanchen
-/unsloth_zoo/saving_utils.py @rolandtannous @danielhanchen
+/unsloth_zoo/saving_utils.py @danielhanchen
 /unsloth_zoo/peft_utils.py @danielhanchen
 /unsloth_zoo/loss_utils.py @danielhanchen
 

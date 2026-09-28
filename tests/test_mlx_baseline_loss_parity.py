@@ -2,15 +2,12 @@
 # Pin `make_baseline_loss_fn` source so the labels=None fast path stays
 # byte-for-byte equivalent to mlx_lm.tuner.trainer.default_loss.
 #
-# Why pin source rather than run a numerical comparison: the test
-# harness uses a torch-based MLX shim that doesn't faithfully reproduce
-# MLX's autodiff graph or its rounding; an apples-to-apples numerical
-# parity check requires a real MLX runtime (Apple Silicon), so it's
-# done in the Round BP probe matrix on
-# danielhanchen/unsloth-staging-2. Locally we guard against future
-# refactors silently re-introducing the divergent code patterns
-# (fp32-cast mask, mx.where(safe_targets), _safe_token_denominator)
-# that mlx_lm.tuner.trainer.default_loss does NOT do.
+# Source is pinned rather than numerically compared because the torch-based
+# MLX shim doesn't reproduce MLX's autodiff graph / rounding (real numerical
+# parity needs Apple Silicon, done in the Round BP probe matrix on
+# danielhanchen/unsloth-staging-2). Locally we guard against refactors
+# re-introducing the divergent patterns (fp32-cast mask, mx.where(safe_targets),
+# _safe_token_denominator) that default_loss does NOT do.
 
 from __future__ import annotations
 
@@ -38,8 +35,6 @@ def _labels_none_block():
     )
     assert m, "make_baseline_loss_fn must keep a `labels is None` fast path"
     raw = textwrap.dedent(m.group(1))
-    # Strip whole-line comments so test assertions on code don't trip on
-    # explanatory prose like "no safe_targets mx.where" in docstrings.
     code_lines = []
     for line in raw.splitlines():
         stripped = line.strip()
@@ -55,8 +50,6 @@ def test_no_fp32_mask_cast_in_fast_path():
     casting to fp32 produces a different MLX autodiff graph and shifts
     gradients by ~1e-2 per step on small fixtures."""
     block = _labels_none_block()
-    # Anything that would cast a mask to fp32: `.astype(mx.float32)` or
-    # `astype(float32)` immediately on a `mask` / `length_mask` name.
     bad_patterns = (
         r"length_mask\.astype\(mx\.float32\)",
         r"mask\s*=\s*[^=]*\.astype\(mx\.float32\)",
@@ -99,9 +92,8 @@ def test_fast_path_returns_ce_and_ntoks_in_that_order():
     """Match the (loss, ntoks) return signature mlx-lm uses; the test
     pins return-order so a future refactor doesn't accidentally swap."""
     block = _labels_none_block()
-    # Look for a `return X, Y` somewhere in the fast path. The variable
-    # names are loose (mlx-lm uses `ce`; zoo previously used `loss`),
-    # but the order matters.
+    # The names are loose (mlx-lm uses `ce`; zoo previously used `loss`), so only
+    # the order is pinned.
     m = re.search(r"return\s+(\w+),\s*(\w+)", block)
     assert m, "labels=None fast path must return a (loss, ntoks) tuple"
     loss_name, ntoks_name = m.group(1), m.group(2)
@@ -116,8 +108,7 @@ def test_labels_aware_path_still_uses_safe_targets():
     `safe_targets` and the fp32 mask because labels can contain -100."""
     from unsloth_zoo.mlx import utils
     src = inspect.getsource(utils.make_baseline_loss_fn)
-    # The labels-aware path lives after the fast path's `return`. Look
-    # at the full source to verify the machinery still exists somewhere.
+    # This path lives after the fast path's `return`, so read the full source.
     assert "mx.where" in src, (
         "make_baseline_loss_fn must still call mx.where on the labels-aware path"
     )

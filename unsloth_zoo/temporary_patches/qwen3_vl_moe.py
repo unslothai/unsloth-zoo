@@ -76,8 +76,7 @@ def patch_qwen3_vl_moe():
         old_transformers = True
 
     if old_transformers:
-        # Fallback for older transformers if they exist (unlikely for Qwen3VL MoE but good for robustness)
-        # Assuming typical sparse block structure if Experts class is missing
+        # Fallback for older transformers missing the Experts class.
         @torch.compiler.disable
         def old_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
             """ """
@@ -97,7 +96,6 @@ def patch_qwen3_vl_moe():
             )
             if self.norm_topk_prob:
                 routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-            # we cast back to the input dtype
             routing_weights = routing_weights.to(hidden_states.dtype)
 
             final_hidden_states = torch.zeros(
@@ -106,12 +104,11 @@ def patch_qwen3_vl_moe():
                 device=hidden_states.device,
             )
 
-            # One hot encode the selected experts to create an expert mask
+            # One-hot encode selected experts into an expert mask
             expert_mask = torch.nn.functional.one_hot(
                 selected_experts, num_classes=self.num_experts
             ).permute(2, 1, 0)
 
-            # Loop over all available experts in the model and perform the computation on each expert
             expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
             for expert_idx in expert_hit:
                 expert_layer = self.experts[expert_idx]
@@ -142,7 +139,6 @@ def patch_qwen3_vl_moe():
                 routing_weights = routing_weights / routing_weights.sum(
                     dim=-1, keepdim=True
                 )
-            # we cast back to the input dtype
             routing_weights = routing_weights.to(hidden_states.dtype)
             router_scores = torch.zeros_like(
                 router_logits, dtype=hidden_states.dtype
@@ -187,30 +183,17 @@ def patch_qwen3_vl_moe():
         # New transformers with stacked expert weights
         # ====================================================================
 
-        # Qwen3-VL-MoE checkpoints store weights in grouped_mm format (transposed):
-        #   gate_up_proj: (E, H, 2*I)  - ready for X @ W in grouped_mm
-        #   down_proj:    (E, I, H)    - ready for X @ W in grouped_mm
-        #
-        # But transformers defines them in F.linear format:
-        #   gate_up_proj: (E, 2*I, H)  - for F.linear: out = x @ weight.T
-        #   down_proj:    (E, H, I)
-        #
-        # We patch __init__ to match checkpoint format so loading works correctly.
-        # The forward() then uses these weights directly with grouped_mm.
+        # Qwen3-VL-MoE checkpoints store weights transposed for grouped_mm
+        # (gate_up_proj: (E, H, 2*I); down_proj: (E, I, H)), whereas transformers
+        # defines them in F.linear format. Patch __init__ to the checkpoint
+        # layout so loading works and forward() can use grouped_mm directly.
 
         from transformers.activations import ACT2FN
 
         def patched_experts_init(self, config):
-            """
-            Patched __init__ for Qwen3VLMoeTextExperts.
-
-            Creates weight parameters in grouped_mm format to match checkpoint:
-            - gate_up_proj: (E, H, 2*I) instead of (E, 2*I, H)
-            - down_proj: (E, I, H) instead of (E, H, I)
-
-            This ensures checkpoint loading works correctly, and the forward
-            can use weights directly with torch._grouped_mm without transposition.
-            """
+            """__init__ creating Qwen3VLMoeTextExperts weights in grouped_mm
+            layout (transposed from F.linear) so checkpoint loading and
+            torch._grouped_mm both work without transposition."""
             # This Unsloth Zoo code section is licensed under AGPL3
 
             super(
@@ -222,20 +205,19 @@ def patch_qwen3_vl_moe():
             self.hidden_dim = config.hidden_size
             self.intermediate_dim = config.moe_intermediate_size
 
-            # Weights in grouped_mm format (transposed from F.linear format)
-            # gate_up_proj: (E, H, 2*I) for X @ W where X is (N, H)
+            # grouped_mm layout: gate_up_proj (E, H, 2*I) for X @ W, X is (N, H)
             self.gate_up_proj = nn.Parameter(
                 torch.empty(
                     self.num_experts, self.hidden_dim, 2 * self.intermediate_dim
                 )
             )
-            # down_proj: (E, I, H) for X @ W where X is (N, I)
+            # down_proj (E, I, H) for X @ W, X is (N, I)
             self.down_proj = nn.Parameter(
                 torch.empty(self.num_experts, self.intermediate_dim, self.hidden_dim)
             )
             self.act_fn = ACT2FN[config.hidden_act]
 
-            # Mark that weights are already in grouped_mm format (no transpose needed)
+            # Weights already in grouped_mm format (no transpose needed)
             self._unsloth_grouped_mm_format = True
 
         # Patch __init__ before any model instantiation
@@ -260,10 +242,7 @@ def patch_qwen3_vl_moe():
                 top_k_index: torch.Tensor,
                 top_k_weights: torch.Tensor,
             ) -> torch.Tensor:
-                """
-                Native Pytorch grouped GEMM MoE forward pass.
-                Uses torch._grouped_mm which is significantly faster than loop and works without Triton dependencies.
-                """
+                """Native PyTorch grouped-GEMM MoE forward (torch._grouped_mm, no Triton)."""
                 return forward_native_grouped_mm(
                     self, hidden_states, top_k_index, top_k_weights
                 )
@@ -276,14 +255,7 @@ def patch_qwen3_vl_moe():
                 top_k_index: torch.Tensor,
                 top_k_weights: torch.Tensor,
             ) -> torch.Tensor:
-                """
-                Grouped GEMM MoE forward pass using Triton kernels.
-
-                Uses fused permutation (permute_x for first GEMM, permute_y for second GEMM)
-                to minimize memory traffic and achieve high GPU utilization.
-
-                Uses cached kernel configs (created once at start) for efficient operation.
-                """
+                """Grouped-GEMM MoE forward via Triton kernels (fused permutation, cached configs)."""
                 return forward_triton_grouped_gemm(
                     self, hidden_states, top_k_index, top_k_weights
                 )
@@ -302,16 +274,11 @@ def patch_qwen3_vl_moe():
                     self, hidden_states, top_k_index, top_k_weights
                 )
 
-        # SparseMoeBlock forward is disabled from compilation due to dynamic routing
+        # SparseMoeBlock forward not compiled due to dynamic routing
         @torch.compiler.disable
         def sparse_moe_block_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-            """
-            Forward for Qwen3VLMoeTextSparseMoeBlock in new transformers (v5+).
-
-            In v5, self.gate is Qwen3VLMoeTextTopKRouter which returns:
-                (router_logits, router_scores, router_indices)
-            where router_scores are already normalized.
-            """
+            """Qwen3VLMoeTextSparseMoeBlock forward for transformers v5+ (gate is
+            Qwen3VLMoeTextTopKRouter returning normalized router_scores)."""
             # This Unsloth Zoo code section is licensed under AGPL3
 
             if hidden_states.dim() == 3:
@@ -323,15 +290,13 @@ def patch_qwen3_vl_moe():
 
             hidden_states_reshaped = hidden_states.view(-1, hidden_dim)
 
-            # In v5, self.gate is Qwen3VLMoeTextTopKRouter
-            # It returns (router_logits, router_scores, router_indices)
             gate_output = self.gate(hidden_states_reshaped)
 
             if isinstance(gate_output, tuple):
-                # New transformers v5: (router_logits, router_scores, router_indices)
+                # v5: (router_logits, router_scores, router_indices)
                 _, routing_weights, selected_experts = gate_output
             else:
-                # Fallback: old-style gate that returns just logits
+                # Fallback: old-style gate returning just logits
                 router_logits = gate_output
                 top_k = getattr(self.gate, "top_k", getattr(self, "top_k", 2))
                 norm_topk_prob = getattr(
@@ -347,7 +312,6 @@ def patch_qwen3_vl_moe():
                         dim=-1, keepdim=True
                     )
                 routing_weights = routing_weights.to(hidden_states.dtype)
-
             final_hidden_states = self.experts(
                 hidden_states_reshaped, selected_experts, routing_weights
             )
@@ -365,14 +329,9 @@ def patch_qwen3_vl_moe():
             forward,
         )
     else:
-        # __init__ was patched above to create weights in grouped_mm format
-        # matching the Qwen3-VL-MoE checkpoint format:
-        #   gate_up_proj: (E, H, 2*I)  - for X @ W in grouped_mm
-        #   down_proj:    (E, I, H)    - for X @ W in grouped_mm
-        #
-        # The forward() uses these weights directly with torch._grouped_mm.
-        # LoRA extraction in moe_utils must account for this transposed layout.
-
+        # __init__ (patched above) creates weights in grouped_mm layout matching
+        # the checkpoint; forward() uses torch._grouped_mm directly. LoRA
+        # extraction in moe_utils must account for this transposed layout.
         patch_function(
             transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe.Qwen3VLMoeTextExperts,
             "forward",
@@ -386,10 +345,8 @@ def patch_qwen3_vl_moe():
             force=True,
         )
 
-    # ====================================================================
-    # Patch Qwen3VLMoeForConditionalGeneration.forward for GRPO training
-    # When UNSLOTH_RETURN_HIDDEN_STATES=1, return hidden_states instead of logits
-    # ====================================================================
+    # Patch Qwen3VLMoeForConditionalGeneration.forward for GRPO: when
+    # UNSLOTH_RETURN_HIDDEN_STATES=1, return hidden_states instead of logits.
     try:
         from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
             Qwen3VLMoeForConditionalGeneration,
@@ -437,7 +394,7 @@ def patch_qwen3_vl_moe():
                     **kwargs,
                 )
 
-            # RETURN_HIDDEN_STATES mode - return hidden_states instead of logits
+            # RETURN_HIDDEN_STATES mode: return hidden_states instead of logits
             outputs = self.model(
                 input_ids=input_ids,
                 pixel_values=pixel_values,
@@ -454,13 +411,13 @@ def patch_qwen3_vl_moe():
 
             hidden_states = outputs[0]
 
-            # Apply slice_indices to hidden_states (same indexing as for logits)
+            # Slice hidden_states the same way logits would be sliced
             slice_indices = (
                 slice(-logits_to_keep, None)
                 if isinstance(logits_to_keep, int)
                 else logits_to_keep
             )
-            # Return hidden_states as "logits" for GRPO to use
+            # Return hidden_states as "logits" for GRPO
             logits = hidden_states[:, slice_indices, :]
 
             return Qwen3VLMoeCausalLMOutputWithPast(
@@ -473,8 +430,8 @@ def patch_qwen3_vl_moe():
                 rope_deltas=outputs.rope_deltas,
             )
 
-        # Preserve __qualname__ so _unsloth_get_batch_samples can detect
-        # this is a ForConditionalGeneration forward and compute num_items_in_batch properly.
+        # Preserve __qualname__ so _unsloth_get_batch_samples can detect this is
+        # a ForConditionalGeneration forward and compute num_items_in_batch.
         _patched_causal_lm_forward.__qualname__ = _original_causal_lm_forward.__qualname__
         Qwen3VLMoeForConditionalGeneration.forward = _patched_causal_lm_forward
         if UNSLOTH_ENABLE_LOGGING:
