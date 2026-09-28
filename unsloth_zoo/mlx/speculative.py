@@ -36,6 +36,7 @@ __all__ = [
     "AssistantDrafter",
     "ContextDrafter",
     "DraftController",
+    "Eagle3Drafter",
     "EngineRow",
     "HeadDrafter",
     "MTPDrafter",
@@ -933,12 +934,13 @@ class SpeculativeEngine:
         )
         start = time.perf_counter()
         depth = max((spec.length for spec in plan.rows if spec.source == "draft"), default = 0)
+        draft_rows = [row.draft if spec.source == "draft" else None for row, spec in zip(rows, plan.rows)]
         drafts, draft_seconds = None, 0.0
         if depth:
             with mx.stream(self._stream):
                 # Replay is one head forward, as costly for one pair as for many, so it counts as drafting.
-                self.drafter.catch_up(self.draft_cache, [row.draft if spec.source == "draft" else None for row, spec in zip(rows, plan.rows)])
-                drafts = self.drafter.draft(self.draft_cache, [row.draft for row in rows], depth, self.cache).astype(inputs.dtype)
+                self.drafter.catch_up(self.draft_cache, draft_rows)
+                drafts = self.drafter.draft(self.draft_cache, draft_rows, depth, self.cache).astype(inputs.dtype)
                 if plan.split:
                     mx.eval(drafts)
                     draft_seconds = time.perf_counter() - start
@@ -956,7 +958,7 @@ class SpeculativeEngine:
             self.cache[:] = entries
             transaction.abort()
             if depth:
-                self.drafter.settle(self.draft_cache, [row.draft for row in rows], depth - 1, [0] * len(rows))
+                self.drafter.settle(self.draft_cache, draft_rows, depth - 1, [0] * len(rows))
             self.round_refusal = f"{type(self.lm).__name__} replaced its cache objects during a verify forward"
             return None
         try:
@@ -1004,7 +1006,7 @@ class SpeculativeEngine:
         kept = [0] * len(rows)
         if depth:
             accepted_drafts = [min(count, depth - 1) if spec.source == "draft" else 0 for spec, count in zip(plan.rows, accepted)]
-            kept = self.drafter.settle(self.draft_cache, [row.draft for row in rows], depth - 1, accepted_drafts)
+            kept = self.drafter.settle(self.draft_cache, draft_rows, depth - 1, accepted_drafts)
         # Left lazy, the commit makes the next decode copy whole cache buffers instead of writing in place.
         mx.async_eval([entry.state for entry in [*self.cache, *(self.draft_cache or [])]])
         emitted = []
@@ -1402,15 +1404,18 @@ class HeadDrafter:
             self.hidden_shape, self.hidden_dtype = hidden.shape[2:], hidden.dtype
             row.head.accept_verified_tokens(hidden, mx.array([tokens[:-1]], mx.int32), len(tokens) - 1, tokens[-1:], None, greedy = True)
             # Left lazy, the head's state would keep every replayed hidden alive.
-            mx.async_eval(row.head.draft_eval_state())
+            head = row.head
+            mx.async_eval(head.draft_eval_state() if hasattr(head, "draft_eval_state") else [head._seed_token, head._seed_hidden, *(entry.state for entry in head._cache)])
             replayed += len(tokens)
             row.tokens, row.hidden = [], []
         return replayed
 
     def draft(self, cache: list, rows: Sequence[HeadRow | None], depth: int, target: list) -> mx.array:
+        return mx.concatenate([self._draft(row, depth) if row is not None else mx.zeros((1, depth), mx.int32) for row in rows])
+
+    def _draft(self, row: HeadRow, depth: int) -> mx.array:
         from mlx_vlm.models.cache import RotatingKVCache
 
-        (row,) = rows
         # Trimming a rotating cache cannot bring back the slots a rejected draft overwrote.
         rotating = [entry for entry in getattr(row.head, "_cache", []) if isinstance(entry, RotatingKVCache)]
         row.saved = [(entry, [None if a is None else mx.array(a) for a in (entry.keys, entry.values)], entry.meta_state) for entry in rotating]
@@ -1427,6 +1432,31 @@ class HeadDrafter:
                     entry.keys, entry.values, entry.meta_state = keys, values, meta
                 row.saved = []
         return [0] * len(rows)
+
+
+class Eagle3Drafter(HeadDrafter):
+    """Drafts with an EAGLE-3 drafter, whose lifecycle is a head's, from the target layers it was trained on."""
+
+    kind = "eagle3"
+
+    def __init__(self, model: nn.Module, target: nn.Module, max_lag: int = 128):
+        from mlx_vlm.speculative.eagle3 import _eagle3_capture_layer_ids
+
+        super().__init__(model, target, max_lag)
+        self.capture = {"capture_layer_ids": _eagle3_capture_layer_ids(model)}
+        self.max_depth = int(model.config.block_size) - 1
+
+    def start(self, prompt: Sequence[int], hidden: mx.array | None, pending: int) -> tuple[HeadRow | None, list]:
+        # Like a DFlash context, EAGLE-3's cache must start from the prompt's features.
+        return (None, []) if hidden is None else super().start(prompt, hidden, pending)
+
+    @property
+    def config(self):
+        return self.model.config
+
+    @staticmethod
+    def features(out) -> mx.array:
+        return mx.concatenate(out.hidden_states, axis = -1)
 
 
 class ContextRow:
@@ -1502,15 +1532,16 @@ class ContextDrafter:
         return [0] * len(rows)
 
 
-def companion_drafter(model_path: str | Path, target: nn.Module, **kwargs) -> ContextDrafter:
-    """A drafter from a separate DFlash, DFlash2 or DSpark checkpoint, checked against ``target``."""
+def companion_drafter(model_path: str | Path, target: nn.Module, **kwargs) -> ContextDrafter | Eagle3Drafter:
+    """A drafter from a separate DFlash, DFlash2, DSpark or EAGLE-3 checkpoint, checked against ``target``."""
     from mlx_vlm.speculative.drafters import load_drafter, validate_drafter_compatibility
 
     model, kind = load_drafter(str(model_path))
-    if kind != "dflash":
+    wrapper = {"dflash": ContextDrafter, "eagle3": Eagle3Drafter}.get(kind)
+    if wrapper is None:
         raise ValueError(f"{kind} companion drafters are not supported")
     validate_drafter_compatibility(target, model, kind)
-    return ContextDrafter(model, target, **kwargs)
+    return wrapper(model, target, **kwargs)
 
 
 def native_mtp_drafter(model_path: str | Path, target: nn.Module, **kwargs) -> MTPDrafter | HeadDrafter | ContextDrafter | None:

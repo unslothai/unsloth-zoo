@@ -121,8 +121,8 @@ def _script(*cycle):
             self.steps_planned += 1
             if kind == "plain":
                 return RoundPlan("plain", n)
-            available = lambda s: s.copy_available if kind == "copy" else n * s.can_draft
-            return RoundPlan("round", rows = tuple(RowPlan(kind, min(available(s), n, max(0, s.remaining - 1))) if available(s) else RowPlan() for s in rows))
+            available = lambda kind, s: s.copy_available if kind == "copy" else n * s.can_draft
+            return RoundPlan("round", rows = tuple(RowPlan(k, min(available(k, s), n, max(0, s.remaining - 1))) if available(k, s) else RowPlan() for k, s in zip(kind.split("/") * len(rows), rows)))
     controller = Script(max_depth = 4, max_copy = 16)
     controller.steps_planned = 0
     return controller
@@ -302,6 +302,19 @@ def test_other_mtp_heads_match_a_head_that_never_drafted_even_in_a_wrapping_wind
     _run(model, [prompt], 96, _script(("draft", 3), ("draft", 3), ("plain", 12), ("copy", 4), ("draft", 2)), SamplingParams(), drafter = drafter)
     assert len(compared) > 6 and all(compared)
     assert max(sum(len(t) for t, _ in chunk) for chunk in chunks[1:]) <= 8  # max_lag - 1 pending plus one 5-token round
+
+
+def test_eagle3_narrower_than_its_target_drafts_from_the_concatenated_layers_row_by_row(qwen):
+    from mlx_vlm.speculative.drafters import eagle3
+    from mlx_vlm.utils import load_config
+    from unsloth_zoo.mlx import generate, speculative
+    (model, ids), config, text = qwen, load_config("RedHatAI/gemma-4-26B-A4B-it-speculator.eagle3"), qwen[0].language_model.config.text_config
+    config["transformer_layer_config"].update(hidden_size = 256, vocab_size = text.vocab_size, intermediate_size = 256, num_attention_heads = 4, num_key_value_heads = 2, head_dim = 64)
+    config.update(target_hidden_size = text.hidden_size, draft_vocab_size = 4096, eagle_aux_hidden_state_layer_ids = [2, text.num_hidden_layers // 2, text.num_hidden_layers - 1])
+    drafter, SamplingParams = speculative.Eagle3Drafter(eagle3.Model(eagle3.ModelConfig.from_dict(config)), model.language_model), generate.SamplingParams
+    for prompts, script in ((ids[:1], (("draft", 3), ("plain", 9), ("copy", 4), ("draft", 4))), (ids[:2], (("copy/draft", 4), ("draft", 3), ("copy", 4)))):
+        out, drafted, _ = _run(model, prompts, 48, _script(*script), SamplingParams(), drafter = drafter)
+        assert out == [_solo(model, prompt, 48, SamplingParams()) for prompt in prompts] and all(n for n, _ in drafted.values()) and drafter.start(prompts[0], None, 0) == (None, [])
 
 
 
