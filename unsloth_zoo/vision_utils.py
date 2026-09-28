@@ -1453,10 +1453,15 @@ def _media_feature_token_ids(model):
     subs = (getattr(config, k, None) for k in ("text_config", "vision_config", "audio_config", "thinker_config"))
     for cfg in (config, *subs):
         for key in ("image_token_id", "image_token_index", "video_token_id", "video_token_index",
-                    "audio_token_id", "audio_token_index", "media_placeholder_token_id"):
+                    "audio_token_id", "audio_token_index", "media_placeholder_token_id",
+                    "img_context_token_id"):
             value = getattr(cfg, key, None)
             if isinstance(value, int) and value >= 0:
                 ids.add(value)
+    # InternVL remote code sets it on the model at runtime; the forward reads that attribute.
+    value = getattr(model, "img_context_token_id", None)
+    if isinstance(value, int) and value >= 0:
+        ids.add(value)
     return sorted(ids)
 pass
 

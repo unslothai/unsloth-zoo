@@ -303,3 +303,6 @@ def test_feature_token_ids_cover_every_config_spelling():
     omni = types.SimpleNamespace(thinker_config = types.SimpleNamespace(
         image_token_index = 151655, video_token_index = 151656, audio_token_index = 151646))
     assert _media_feature_token_ids(types.SimpleNamespace(config = omni)) == [151646, 151655, 151656]
+    internvl = types.SimpleNamespace(img_context_token_id = 92546)
+    assert _media_feature_token_ids(types.SimpleNamespace(config = internvl)) == [92546]
+    assert _media_feature_token_ids(types.SimpleNamespace(config = None, img_context_token_id = 92546)) == [92546]
