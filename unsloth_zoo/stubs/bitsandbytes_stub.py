@@ -15,12 +15,14 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """
-Bitsandbytes stub for Apple Silicon / MLX.
+Bitsandbytes stub for hosts that skip GPU init (gated in unsloth_zoo/__init__.py).
 
-Any `import bitsandbytes.X.Y` auto-resolves to a permissive stub module.
-Only injected on macOS ARM64 with MLX (gated in unsloth_zoo/__init__.py).
+Any `import bitsandbytes.X.Y` auto-resolves to a permissive stub module. Injected only
+when no real bitsandbytes is installed: shadowing a working one makes bnb-quantized
+checkpoints unloadable.
 """
 
+import importlib.util
 import types
 import sys
 from importlib.abc import MetaPathFinder
@@ -40,7 +42,10 @@ class _Noop:
     Optional-feature probes that use ``hasattr`` or ``if bnb.foo`` still
     work via ``__getattr__`` and ``__bool__``.
     """
-    def __init__(self, name="stub"): self._name = name
+    def __init__(self, *args, **kwargs):
+        # Accept any args, incl. the (name, bases, namespace) triple Python
+        # passes when a stubbed class is subclassed at import (e.g. Linear4bit).
+        self._name = args[0] if args else kwargs.get("name", "stub")
     def __call__(self, *a, **kw):
         raise NotImplementedError(
             f"Unsloth: '{self._name}' was called on Apple Silicon / MLX, "
@@ -59,6 +64,10 @@ def _make_module(name, attrs=None):
     mod = _PermissiveModule(name)
     mod.__path__ = []
     mod.__package__ = name
+    # Set on every stub module, including finder-minted ones: without a real attribute,
+    # the permissive __getattr__ answers the stub check with a falsy _Noop and every
+    # caller reads "this is a real wheel".
+    mod.IS_UNSLOTH_STUB = True
     if attrs:
         for k, v in attrs.items():
             setattr(mod, k, v)
@@ -88,12 +97,32 @@ class _BnbFinder(MetaPathFinder):
 
 __version__ = "0.46.0"
 __path__ = []
+# Lets callers tell this stub from real bitsandbytes (e.g. drift tests skip on it).
+IS_UNSLOTH_STUB = True
 
 def __getattr__(name):
     """Module-level __getattr__ (Python 3.7+): any missing attr returns a _Noop."""
     if name.startswith("__") and name.endswith("__"):
         raise AttributeError(name)
     return _Noop(f"bitsandbytes.{name}")
+
+
+def real_bitsandbytes_available():
+    """Whether a real (non-stub) bitsandbytes is installed.
+
+    Locates it rather than importing it: importing pulls in torch, which costs about a
+    second on the hosts that skip GPU init to avoid exactly that.
+    """
+    existing = sys.modules.get("bitsandbytes")
+    if existing is not None:
+        return not getattr(existing, "IS_UNSLOTH_STUB", False)
+    try:
+        spec = importlib.util.find_spec("bitsandbytes")
+    except Exception:  # noqa: BLE001 -- an unlocatable install is not usable either
+        return False
+    # A namespace package (loaderless, e.g. a half-removed install) imports to an empty
+    # module; standing aside for it leaves the caller with neither a wheel nor the stub.
+    return spec is not None and spec.loader is not None
 
 
 def inject_into_sys_modules():

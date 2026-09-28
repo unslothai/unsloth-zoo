@@ -46,6 +46,11 @@ FORCE_FLOAT32 = [
     "gemma3,",     # trailing comma is a substring-path delimiter for the CUDA loader
     "gemma3text",  # EmbeddingGemma / standalone text-only Gemma3 (config: "gemma3_text")
     "gemma3n",
+    "gemma4",      # substring-matches "gemma4" and "gemma4_text" on CUDA; fp16 NaNs the grad_norm in the backward (targeted float32 via gemma4_float32.py)
+    "gemma4text",  # standalone text-only Gemma4 (config: "gemma4_text") for the MLX exact-match helper
+    "glm4_moe",    # GLM-4.x MoE (glm4_moe / glm4_moe_lite on CUDA): fp16 NaNs grad_norm; bf16 load is dtype-consistent
+    "glm4_moe_lite",  # explicit entry for the MLX exact-match helper
     "gpt_oss",
     "qwen3_5",     # Qwen3.5 GDN layers NaN on fp16
+    "qwen3_moe",   # Qwen3-MoE (Qwen3-30B-A3B): fp16 NaNs grad_norm in the backward (targeted float32 via qwen3_moe_float32.py)
 ]
