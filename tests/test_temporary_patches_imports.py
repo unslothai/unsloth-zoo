@@ -76,6 +76,7 @@ TEMPORARY_PATCHES_SUBMODULES = [
     "unsloth_zoo.temporary_patches.gemma4_moe",
     "unsloth_zoo.temporary_patches.glm4_moe",
     "unsloth_zoo.temporary_patches.gpt_oss",
+    "unsloth_zoo.temporary_patches.granitemoehybrid",
     "unsloth_zoo.temporary_patches.inkling",
     "unsloth_zoo.temporary_patches.lfm2_moe",
     "unsloth_zoo.temporary_patches.llama4_moe",

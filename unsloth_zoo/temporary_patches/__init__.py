@@ -19,6 +19,7 @@ from .common import *
 from .fla_vendor import *
 from .gemma import *
 from .misc import *
+from .granitemoehybrid import *
 from .gemma3n import *
 from .gemma4 import *
 from .gemma4_float32 import *
