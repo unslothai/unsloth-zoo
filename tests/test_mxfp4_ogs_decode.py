@@ -70,7 +70,6 @@ def test_no_grad_decode_runs_matmul_ogs_and_matches_the_dequantized_experts(ogs)
         got = [gpt_oss.moe_forward_inference_bf16(mlp, h).float() for h in inputs]
     assert ogs["op"] > 0
     for a, b in zip(got, want):
-        # bf16 activations x MXFP4 in one fused GEMM vs dequantize-then-bf16 GEMM: rounding only.
         assert torch.isfinite(a).all() and (a - b).norm() / b.norm() < 2e-2
 
 
@@ -106,7 +105,7 @@ def test_a_failing_kernel_falls_back_to_the_exact_path(ogs, monkeypatch):
 
 
 def test_the_cached_ogs_views_follow_their_experts(ogs):
-    # The cache holds the packed storage: it must drop a rebound stack (copy_ swaps scales) and a freed model.
+    # The cache holds the packed storage: rebound stacks and freed models must leave it.
     import gc
     from test_mxfp4_packed_experts import _packed
 
