@@ -579,6 +579,15 @@ pass
 # inspect.signature and graph-breaks (it cannot key a dict on, or getattr, an autograd.Function).
 _FUSED_LOSS_PARAMETERS, _FUSED_LOSS_DEFAULTS = _get_mapping(UnslothFusedLoss)
 
+# torch 2.11 traces UnslothFusedLoss (whose forward computes the gradients with torch.func) into a graph
+# whose saved gradients come back as zeros: a compiled causal LM trained no LoRA weight at all, while the
+# loss looked normal. 2.7, 2.10 and 2.12+ trace it correctly, so only 2.11 keeps it out of the graph.
+_FUSED_LOSS_OPAQUE = torch.__version__.split("+")[0].split(".")[:2] == ["2", "11"]
+
+@torch.compiler.disable
+def _fused_loss_opaque(*args):
+    return UnslothFusedLoss.apply(*args)
+
 def unsloth_fused_ce_loss(
     trainer,
     hidden_states  : torch.Tensor,
@@ -636,7 +645,8 @@ def unsloth_fused_ce_loss(
         overwrite = overwrite,
         extra_kwargs = kwargs,
     )
-    return UnslothFusedLoss.apply(*(
+    apply = _fused_loss_opaque if _FUSED_LOSS_OPAQUE else UnslothFusedLoss.apply
+    return apply(*(
         mapping.get(key, default) \
         for key, default in zip(_FUSED_LOSS_PARAMETERS, _FUSED_LOSS_DEFAULTS)
     ))
