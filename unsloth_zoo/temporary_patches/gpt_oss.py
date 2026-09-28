@@ -1911,7 +1911,7 @@ def _unwrap_peft_experts(module):
     return module
 
 
-# Weak: freed with the last model whose packed parameters hold the slot.
+# Weak values: freed with the last packed parameter (and so model) that holds the slot.
 _MXFP4_DECODE_SLOTS = weakref.WeakValueDictionary()
 
 
@@ -1921,7 +1921,7 @@ class _Mxfp4DecodeSlot:
     __slots__ = ("stack", "lock", "event", "__weakref__")
 
     def __init__(self, shape, dtype, device):
-        # Parameter: CUDA graphs read it in place instead of copying each call.
+        # A Parameter so the CUDA-graphed kernel reads it in place; other tensors are copied every call.
         self.stack = nn.Parameter(torch.zeros(shape, dtype = dtype, device = device), requires_grad = False)
         self.lock = threading.Lock()
         self.event = None
@@ -1951,7 +1951,7 @@ def _mxfp4_decode_slot(param, dtype, role = ""):
 
 
 def _mxfp4_decode_stack(param, dtype, token_counts, role = "", slot = None):
-    """Decode only routed experts (others are weighted 0). Caller holds the slot lock until enqueue."""
+    """Only routed experts are rewritten; the kernel weighs the others by 0, so stale slices are harmless."""
     slot = slot or _mxfp4_decode_slot(param, dtype, role)
     api = _device_stream_api(param.device) if slot.event is not None else None
     if api is not None:
