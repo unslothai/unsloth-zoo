@@ -799,8 +799,7 @@ def _base_grouped_mm(inputs, offsets, weight_provider, recompute):
 
 
 def _mxfp4_expert_layout(source, proj_type, hidden_dim, model_type, experts_module):
-    """(packed param, transpose_b) when grouped_mm's weight for ``source`` is a frozen packed MXFP4 stack:
-    transpose_b means that weight is P^T for P = the (E, R, G * 32) packed rows. None otherwise."""
+    """(packed param, transpose_b: weight is P^T of the packed rows) for a frozen packed MXFP4 stack, else None."""
     param = source
     while hasattr(param, "base_layer"):
         param = param.base_layer
@@ -827,11 +826,8 @@ def _mxfp4_expert_layout(source, proj_type, hidden_dim, model_type, experts_modu
 
 
 def _mxfp4_fused_enabled(param, dtype, rows = None) -> bool:
-    """Whether a packed stack runs through the fused decode-in-GEMM kernel. UNSLOTH_MXFP4_FUSED_GEMM:
-    "auto" (default) fused below UNSLOTH_MXFP4_FUSED_MAX_ROWS (192) rows per expert: there it is faster than,
-    or within ~3% of (checkpointed LoRA training, 128 rows), dequantize + cuBLAS on B200 and never allocates
-    the 1.6 GB dense stacks; above it cuBLAS amortises the dequant (fused +38% MoE GEMM time at 256 rows).
-    "1" always fused (least memory), "dequant" never, "0" never plus the legacy decode-slot path."""
+    """UNSLOTH_MXFP4_FUSED_GEMM: "auto" fused below UNSLOTH_MXFP4_FUSED_MAX_ROWS (192) rows/expert (above, dequant +
+    cuBLAS wins on B200); "1" always, "dequant" never, "0" never plus the legacy decode-slot path."""
     if dtype != torch.bfloat16 or param.device.type != "cuda":
         return False
     mode = os.environ.get("UNSLOTH_MXFP4_FUSED_GEMM", "auto")
@@ -846,8 +842,7 @@ def _mxfp4_fused_enabled(param, dtype, rows = None) -> bool:
 
 
 def _mxfp4_base_grouped_mm(inputs, offsets, counts, weight_provider, recompute, layout):
-    """Packed MXFP4 base: fused decode-in-GEMM (no dense stack), else dequantize with a transposed
-    decode for backward instead of transpose().contiguous() of the dense stack."""
+    """Fused decode-in-GEMM, else dequantize with a transposed decode for backward."""
     param, transpose_b = layout
     scales = param.mxfp4_scales
     if scales.device != param.device:

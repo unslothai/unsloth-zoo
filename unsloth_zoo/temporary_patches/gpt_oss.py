@@ -316,8 +316,7 @@ _CONVERT_TRANSPOSES = {}
 
 
 def _convert_moe_packed_tensors_transposes(convert):
-    """Whether ``convert`` returns (E, in, out) (stock >= 4.56) or (E, out, in) (Unsloth's patch).
-    down_proj is square, so probe a tiny non-square stack."""
+    """(E, in, out) (stock >= 4.56) vs (E, out, in) (Unsloth's patch); down_proj is square, so probe non-square."""
     key = id(convert)
     if key not in _CONVERT_TRANSPOSES:
         probe = convert(
@@ -335,8 +334,7 @@ def _convert_moe_packed_tensors_transposes(convert):
 
 
 def _dequantize_mxfp4_experts(blocks, scales, dtype = torch.bfloat16):
-    """Dense GPT-OSS expert stack (E, in, out) on any transformers version. Tries the fused
-    kernel, transformers' dequantize (only if it takes (blocks, scales)), convert_moe_packed_tensors, local decode."""
+    """Dense (E, in, out) stack on any transformers version."""
     try:
         import transformers.integrations.mxfp4 as mxfp4_integration
     except Exception:
@@ -2008,7 +2006,7 @@ _MXFP4_DECODE_SLOTS = weakref.WeakValueDictionary()
 
 
 class _Mxfp4DecodeSlot:
-    """Shared dense decode target: `lock` spans decode to kernel enqueue, `event` guards cross-stream reuse."""
+    """Shared decode buffer; `lock` spans decode to enqueue, `event` = last reader so other streams wait."""
 
     __slots__ = ("stack", "lock", "event", "__weakref__")
 
@@ -2020,7 +2018,6 @@ class _Mxfp4DecodeSlot:
 
 
 def _device_stream_api(device):
-    """None for CPU and MPS: they run in issue order, so the shared stack needs no event."""
     device_type = getattr(device, "type", None)
     if device_type not in ("cuda", "xpu"):
         return None
@@ -2096,8 +2093,7 @@ def _moe_forward_inference_mxfp4_kernel(
     inter = ((up + 1) * glu).to(x.dtype)
     down = mxfp4_grouped_mm_op(inter, dn_blocks, dn_scales, counts, dn_trans) + down_proj_bias[expert]
     weighted = down * routing_weights[token, expert][:, None]
-    # Back to (token, expert) order, then a fixed-order fp32 sum rounded once: index_add_'s atomics made greedy
-    # decode differ run to run.
+    # Fixed-order fp32 sum: index_add_'s atomics made greedy decode nondeterministic.
     rows = torch.empty(weighted.shape, dtype = torch.float32, device = x.device)
     rows = rows.index_copy_(0, order, weighted.to(torch.float32))
     out = rows.view(x.shape[0], top_k, hidden_size).sum(1)

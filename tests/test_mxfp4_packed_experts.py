@@ -726,7 +726,7 @@ def test_load_state_dict_carries_the_scales():
     b.load_state_dict(a.state_dict())
     assert b.w is target and isinstance(b.w, Mxfp4ExpertParam)
     assert torch.equal(b.w.dequantize(), a.w.dequantize())
-    assert b.w.mxfp4_scales.data_ptr() != a.w.mxfp4_scales.data_ptr()   # copied, not aliased
+    assert b.w.mxfp4_scales.data_ptr() != a.w.mxfp4_scales.data_ptr()
     c = nn.Module()
     c.w = _packed(4, 64, 64, seed = 3)
     c.load_state_dict(pickle.loads(pickle.dumps(a.state_dict())))

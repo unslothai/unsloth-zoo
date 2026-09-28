@@ -139,7 +139,7 @@ TEMPORARY_PATCHES.append(patch_mxfp4_offload_guard)
 
 
 def keep_mxfp4_experts_packed() -> bool:
-    """GPT-OSS MXFP4 experts stay packed, dequantized per layer by grouped_mm. UNSLOTH_MXFP4_KEEP_PACKED=0 opts out."""
+    """GPT-OSS experts stay MXFP4 (decoded per layer by grouped_mm); UNSLOTH_MXFP4_KEEP_PACKED=0 disables."""
     setting = os.environ.get("UNSLOTH_MXFP4_KEEP_PACKED", "")
     if setting == "0" or transformers_version < Version("5.0.0"):
         return False

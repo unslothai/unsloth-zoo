@@ -212,8 +212,7 @@ def mxfp4_kernel_available(device = None, dtype = torch.bfloat16) -> bool:
 def mxfp4_dequantize(
     blocks, scales, dtype = torch.bfloat16, transpose = False, experts = None, token_counts = None, out = None,
 ):
-    """Dequantize MXFP4 to ``dtype``. ``experts`` / ``token_counts`` fill only those (or nonzero-count)
-    leading slices, leaving the rest uninitialised (grouped GEMMs never read them)."""
+    """``experts`` / ``token_counts`` fill only those slices; the rest stay uninitialised (grouped GEMMs skip them)."""
     if blocks.shape[:-1] != scales.shape or blocks.shape[-1] != 16:
         raise ValueError(f"Unsloth: MXFP4 blocks {tuple(blocks.shape)} do not match scales {tuple(scales.shape)}")
     from unsloth_zoo.utils import device_guard
@@ -293,8 +292,7 @@ def _launch(grid, blocks, scales, out, experts, token_counts, N, G, stride_e, st
 
 
 class Mxfp4ExpertParam(torch.nn.Parameter):
-    """Frozen MoE expert stack kept as MXFP4: ``.data`` = blocks ``(E, N, G, 16)``, ``mxfp4_scales`` =
-    ``(E, N, G)``; ``_original_shape`` = logical shape. Rebuildable as ``cls(data, requires_grad, **__dict__)`` (accelerate)."""
+    """Frozen MXFP4 expert stack: blocks ``(E, N, G, 16)`` + ``mxfp4_scales``; rebuildable as ``cls(data, requires_grad, **__dict__)`` (accelerate)."""
 
     def __new__(
         cls, data, requires_grad = False, mxfp4_scales = None, mxfp4_transposed = True,
