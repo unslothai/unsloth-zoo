@@ -62,3 +62,37 @@ def test_link_local_url_is_refused(monkeypatch):
         _collator()._extract_images_videos_for_example(
             {"images": ["http://169.254.169.254/latest/meta-data/"]}, [],
         )
+
+
+def test_arrays_and_tensors_pass_through_untouched():
+    import numpy as np
+    import torch
+    array = np.zeros((8, 8, 3), dtype = np.uint8)
+    tensor = torch.zeros(3, 8, 8, dtype = torch.uint8)
+    images, _, _ = _collator()._extract_images_videos_for_example({"images": [array, tensor]}, [])
+    assert images[0] is array and images[1] is tensor
+
+
+def test_datasets_url_path_dict_uses_guarded_fetch(monkeypatch):
+    buf = io.BytesIO()
+    Image.new("RGB", (32, 32)).save(buf, format = "PNG")
+    fetched = []
+    def fake_fetch(url):
+        fetched.append(url)
+        return io.BytesIO(buf.getvalue())
+    monkeypatch.setattr(vu, "fetch_remote_media_bytes", fake_fetch)
+
+    images, _, _ = _collator()._extract_images_videos_for_example(
+        {"images": [{"bytes": None, "path": "https://example.com/a.png"}]}, [],
+    )
+    assert fetched == ["https://example.com/a.png"]
+    assert isinstance(images[0], Image.Image)
+
+
+def test_datasets_local_path_dict_loads(tmp_path):
+    path = tmp_path / "a.png"
+    Image.new("RGB", (32, 32)).save(path)
+    images, _, _ = _collator()._extract_images_videos_for_example(
+        {"images": [{"bytes": None, "path": str(path)}]}, [],
+    )
+    assert isinstance(images[0], Image.Image)

@@ -623,6 +623,11 @@ def fetch_image(
         image = ele["image_url"]
         if isinstance(image, dict) and "url" in image:
             image = image["url"]
+    # datasets Image(decode=False) rows are {"bytes": None, "path": <str>}; the path may be a URL.
+    if isinstance(image, dict) and not image.get("bytes") and isinstance(image.get("path"), str):
+        image = image["path"]
+    if isinstance(image, bytearray):
+        image = bytes(image)
     image_obj = None
     if isinstance(image, Image.Image):
         image_obj = image
@@ -1649,10 +1654,11 @@ class UnslothVisionDataCollator:
         )
 
     def _load_column_images(self, images):
-        # Non-PIL entries go through fetch_image's SSRF guard; processors like Idefics2 fetch URLs unguarded.
+        # URL/path-like entries go through fetch_image's SSRF guard; processors like Idefics2 fetch URLs unguarded.
+        # PIL images, arrays and tensors are processor-native and pass through.
         return [
-            img if isinstance(img, Image.Image)
-            else fetch_image({"image": img}, size_factor=self.patch_size*2)
+            fetch_image({"image": img}, size_factor=self.patch_size*2)
+            if isinstance(img, (str, bytes, bytearray, dict)) else img
             for img in images
         ]
 
