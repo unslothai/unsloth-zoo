@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import copy
 import importlib
 import json
 import time
@@ -35,6 +36,7 @@ __all__ = [
     "AssistantDrafter",
     "DraftController",
     "EngineRow",
+    "HeadDrafter",
     "MTPDrafter",
     "NgramProposer",
     "ReplyStats",
@@ -963,7 +965,16 @@ class SpeculativeEngine:
                 while count < len(proposal) and proposal[count] == target[count]:
                     count += 1
                 accepted.append(count)
-            transaction.commit([count + 1 for count in accepted])
+            try:
+                transaction.validate([count + 1 for count in accepted])
+            except RuntimeError:
+                if len(rows) > 1:
+                    raise
+                # State the transaction has no record of (Inkling's short convolutions): undo, forward the accepted prefix again.
+                transaction.abort()
+                self.lm(inputs[:, : accepted[0] + 1], cache = self.cache, **self._position_kwargs())
+            else:
+                transaction.commit([count + 1 for count in accepted])
             if len(set(accepted)) > 1:
                 # A ragged commit grows BatchKVCache.left_padding in place, but qwen3_5 memoizes decode pads by that array's identity.
                 for entry in self.cache:
@@ -1201,9 +1212,91 @@ class AssistantDrafter:
         return [0] * len(rows)
 
 
-def native_mtp_drafter(model_path: str | Path, target: nn.Module, **kwargs) -> MTPDrafter | None:
-    """An ``MTPDrafter`` built in memory from only the ``mtp.*`` tensors of the target's checkpoint, as
-    mlx-vlm's MTP splitter would write it; None when no splitter knows the checkpoint."""
+class HeadRow:
+    """A reply's own copy of an MTP head (weights shared) and the pairs it has not consumed."""
+
+    def __init__(self, head: nn.Module):
+        self.head = head
+        self.tokens: list[int] = []
+        self.hidden: list[mx.array] = []
+        self.drafted: mx.array | None = None
+        self.saved: list = []
+
+    @property
+    def ready(self) -> bool:
+        return getattr(self.head, "_seed_token", None) is not None or bool(self.tokens)
+
+
+class HeadDrafter:
+    """Drafts with any other native MTP head, one reply at a time, through the head's own methods:
+    ``accept_verified_tokens`` replays (token, target hidden) pairs and, with nothing accepted, undoes a
+    draft. Heads keep that state on the module, so each reply drafts with its own shallow copy."""
+
+    def __init__(self, model: nn.Module, target: nn.Module, max_lag: int = 128):
+        self.model = model
+        self.target = target
+        self.max_lag = max_lag
+
+    def new_cache(self) -> list:
+        return []
+
+    def start(self, prompt: Sequence[int], hidden: mx.array | None, pending: int) -> tuple[HeadRow, list]:
+        head = copy.copy(self.model)
+        head.reset(self.target)
+        row = HeadRow(head)
+        if hidden is not None:
+            count = min(int(hidden.shape[1]), len(prompt))
+            if hasattr(head, "_next_position"):
+                head._next_position = len(prompt) - count
+            self.push(row, [*prompt[len(prompt) - count + 1 :], pending], hidden[0, -count:])
+            self.catch_up([], [row])
+        return row, []
+
+    def push(self, row: HeadRow, tokens: Sequence[int], hidden: mx.array) -> None:
+        row.tokens.extend(int(token) for token in tokens)
+        row.hidden.append(hidden)
+        if len(row.tokens) >= self.max_lag:
+            self.catch_up([], [row])
+
+    def catch_up(self, cache: list, rows: Sequence[HeadRow | None]) -> int:
+        replayed = 0
+        for row in rows:
+            if row is None or not row.tokens:
+                continue
+            tokens, hidden = row.tokens, mx.concatenate(row.hidden)[None]
+            self.hidden_shape, self.hidden_dtype = hidden.shape[2:], hidden.dtype
+            row.head.accept_verified_tokens(hidden, mx.array([tokens[:-1]], mx.int32), len(tokens) - 1, tokens[-1:], None, greedy = True)
+            # Left lazy, the head's state would keep every replayed hidden alive.
+            mx.async_eval(row.head.draft_eval_state())
+            replayed += len(tokens)
+            row.tokens, row.hidden = [], []
+        return replayed
+
+    def draft(self, cache: list, rows: Sequence[HeadRow | None], depth: int, target: list) -> mx.array:
+        from mlx_vlm.models.cache import RotatingKVCache
+
+        (row,) = rows
+        # Trimming a rotating cache cannot bring back the slots a rejected draft overwrote.
+        rotating = [entry for entry in getattr(row.head, "_cache", []) if isinstance(entry, RotatingKVCache)]
+        row.saved = [(entry, [None if a is None else mx.array(a) for a in (entry.keys, entry.values)], entry.meta_state) for entry in rotating]
+        row.drafted = row.head.draft_block(0, None, None, depth + 1, None, greedy = True)
+        return row.drafted
+
+    def settle(self, cache: list, rows: Sequence[HeadRow | None], appended: int, keep: Sequence[int]) -> list[int]:
+        for row in rows:
+            if row is not None:
+                # Some heads read the verify block's shape even when nothing is accepted.
+                hidden = mx.zeros((1, row.drafted.shape[1] + 1, *self.hidden_shape), self.hidden_dtype)
+                row.head.accept_verified_tokens(hidden, row.drafted, 0, [], None, greedy = True)
+                for entry, (keys, values), meta in row.saved:
+                    entry.keys, entry.values, entry.meta_state = keys, values, meta
+                row.saved = []
+        return [0] * len(rows)
+
+
+def native_mtp_drafter(model_path: str | Path, target: nn.Module, **kwargs) -> MTPDrafter | HeadDrafter | None:
+    """A drafter for the target's own MTP head, built in memory from only the ``mtp.*`` tensors of its
+    checkpoint as mlx-vlm's MTP splitter would write it; None when no splitter knows the checkpoint."""
     from mlx_vlm.fp8 import transform_fp8_weights
     from mlx_vlm.speculative.drafters.mtp_split import _is_mlx_safetensors, detect_mtp_splitter
 
@@ -1211,8 +1304,9 @@ def native_mtp_drafter(model_path: str | Path, target: nn.Module, **kwargs) -> M
     splitter = detect_mtp_splitter(path)
     if splitter is None:
         return None
-    if splitter.output_model_type != "qwen3_5_mtp":
-        raise ValueError(f"{splitter.output_model_type} MTP heads are not supported")
+    module = importlib.import_module(f"mlx_vlm.speculative.drafters.{splitter.output_model_type}")
+    if not hasattr(module, "Model"):
+        raise ValueError(f"mlx-vlm has no drafter for {splitter.output_model_type} MTP heads")
     source_config = json.loads((path / "config.json").read_text())
     text_config = splitter.read_text_config(source_config)
     tensors, source_is_mlx = {}, False
@@ -1225,7 +1319,6 @@ def native_mtp_drafter(model_path: str | Path, target: nn.Module, **kwargs) -> M
     weights = splitter.transform(tensors, text_config, source_is_mlx)
     quantization = splitter.quantization(weights, source_config, text_config, {})
 
-    module = importlib.import_module(f"mlx_vlm.speculative.drafters.{splitter.output_model_type}")
     config = {
         "model_type": splitter.output_model_type,
         "text_config": text_config,
@@ -1240,8 +1333,13 @@ def native_mtp_drafter(model_path: str | Path, target: nn.Module, **kwargs) -> M
             group_size = quantization["group_size"],
             bits = quantization["bits"],
             mode = quantization.get("mode", "affine"),
-            class_predicate = lambda name, layer: hasattr(layer, "to_quantized") and f"{name}.scales" in weights,
+            # Some splitters give per-module settings (DeepSeek-V4: MXFP4 experts, MXFP8 projections).
+            class_predicate = lambda name, layer: (
+                quantization[name] if isinstance(quantization.get(name), dict) else hasattr(layer, "to_quantized") and f"{name}.scales" in weights
+            ),
         )
     model.load_weights(list(weights.items()), strict = True)
     mx.eval(model.parameters())
-    return MTPDrafter(model, target, **kwargs)
+    from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
+
+    return (MTPDrafter if type(model) is Qwen3_5MTPDraftModel else HeadDrafter)(model, target, **kwargs)

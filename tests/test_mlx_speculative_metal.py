@@ -233,3 +233,43 @@ def test_assistant_drafts_from_the_target_kv_alone_and_in_batches(gemma, monkeyp
     assert len(compared) > 20 and sum(compared) >= 0.9 * len(compared)
     _, drafted, _ = _run(model, ids[:1], 64, _script(("draft", 3)), SamplingParams(), drafter = drafter)
     assert drafted[0][1] >= 0.4 * drafted[0][0]
+
+
+
+
+def test_rounds_the_transaction_cannot_record_replay_the_accepted_prefix(qwen, monkeypatch):
+    from mlx_vlm.speculative.cache_state import SpeculativeCacheTransaction
+    from unsloth_zoo.mlx.generate import SamplingParams
+    model, ids = qwen
+    monkeypatch.setattr(SpeculativeCacheTransaction, "validate", lambda self, lengths: (_ for _ in ()).throw(RuntimeError("no record")))
+    (out,), drafted, _ = _run(model, ids[:1], 128, _rounds_only(), SamplingParams())
+    assert drafted[0][0] > 0 and out == _solo(model, ids[0], 128, SamplingParams())
+
+def test_other_mtp_heads_match_a_head_that_never_drafted_even_in_a_wrapping_window():
+    import copy
+    from mlx_vlm.speculative.drafters import deepseek_v4_mtp
+    from mlx_vlm.utils import get_model_and_args
+    from unsloth_zoo.mlx.generate import SamplingParams
+    from unsloth_zoo.mlx.speculative import HeadDrafter
+    config = dict(model_type = "deepseek_v4", vocab_size = 256, hidden_size = 64, moe_intermediate_size = 32, num_hidden_layers = 2, compress_ratios = [0, 4],
+                  num_attention_heads = 2, head_dim = 16, qk_rope_head_dim = 8, q_lora_rank = 16, o_groups = 1, o_lora_rank = 16, n_routed_experts = 4,
+                  num_experts_per_tok = 2, index_n_heads = 1, index_head_dim = 16, num_hash_layers = 0, hc_mult = 2, sliding_window = 16)
+    model = (arch := get_model_and_args(dict(config))[0]).Model(arch.ModelConfig.from_dict(config))
+    head = deepseek_v4_mtp.Model(deepseek_v4_mtp.ModelConfig.from_dict({"model_type": "deepseek_v4_mtp", "text_config": config}))
+    drafter, chunks, compared, prompt = HeadDrafter(head, model, max_lag = 4), [[]], [], [(7 * i + 3) % 200 + 1 for i in range(37)]
+    start, push, catch_up, draft = drafter.start, drafter.push, drafter.catch_up, drafter.draft
+    drafter.start = lambda prompt, hidden, token: start(prompt, hidden[:, -20:], token)  # as after a reused prompt prefix
+    drafter.push = lambda row, tokens, hidden: chunks[-1].append((list(tokens), hidden)) or push(row, tokens, hidden)
+    drafter.catch_up = lambda cache, rows: (catch_up(cache, rows), chunks.append([]))[0]
+    def against_replay(cache, rows, depth, target):
+        (fresh := copy.copy(head)).reset(model)
+        fresh._next_position = len(prompt) - 20
+        for chunk in filter(None, chunks):
+            tokens, hidden = sum((t for t, _ in chunk), []), mx.concatenate([h for _, h in chunk])[None]
+            fresh.accept_verified_tokens(hidden, mx.array([tokens[:-1]]), len(tokens) - 1, tokens[-1:], None, greedy = True)
+        compared.append(all(mx.array_equal(a, b).item() for a, b in zip(*[(h._seed_hidden, h._cache[0].keys, h._cache[0].values) for h in (rows[0].head, fresh)])))
+        return draft(cache, rows, depth, target)
+    drafter.draft = against_replay
+    _run(model, [prompt], 96, _script(("draft", 3), ("draft", 3), ("plain", 12), ("copy", 4), ("draft", 2)), SamplingParams(), drafter = drafter)
+    assert len(compared) > 6 and all(compared)
+    assert max(sum(len(t) for t, _ in chunk) for chunk in chunks[1:]) <= 8  # max_lag - 1 pending plus one 5-token round
