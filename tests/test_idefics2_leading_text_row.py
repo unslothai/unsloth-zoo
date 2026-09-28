@@ -14,7 +14,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Idefics2 image processors accept a batch whose first row has no images."""
 
 import importlib
 
