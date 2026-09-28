@@ -48,8 +48,14 @@ _EXPORT_SUBMODULES = ("fla.modules", "fla.ops", "fla.ops.gated_delta_rule")
 # Modeling modules binding fla symbols as globals at import (None when unavailable).
 _REPAIR_MODELING = ("qwen3_5", "qwen3_5_moe", "qwen3_next")
 
+# Kimi delta attention consumers; they reach fla only through kernel-hub wrappers.
+_KDA_MODELING = ("glm5_next", "kimi_linear")
+
+# Modules whose kernel-hub wrappers are re-resolved against the live fla.
+_HUB_REPAIR_MODELING = _REPAIR_MODELING + _KDA_MODELING
+
 # olmo_hybrid also needs ShortConvolution (not vendored), so it is not covered.
-_VENDOR_COVERED_MODELS = frozenset(_REPAIR_MODELING)
+_VENDOR_COVERED_MODELS = frozenset(_HUB_REPAIR_MODELING)
 
 # All gated-delta consumers; olmo_hybrid can bind an installed fla's #640 kernel.
 # Kimi Linear absent: remote code on KDA ops, never reaches chunk_bwd_dqkwg.
@@ -784,10 +790,12 @@ def _alias_missing_gated_delta_names():
     return tuple(added)
 
 
-# Kernel-hub decorated wrapper -> fla kernel. causal_conv1d is not vendored.
+# Kernel-hub decorated wrapper -> (fla module, kernel). causal_conv1d is not vendored.
 _KERNEL_HUB_DECORATED = {
-    "torch_chunk_gated_delta_rule": "chunk_gated_delta_rule",
-    "torch_recurrent_gated_delta_rule": "recurrent_gated_delta_rule",
+    "torch_chunk_gated_delta_rule": ("fla.ops.gated_delta_rule", "chunk_gated_delta_rule"),
+    "torch_recurrent_gated_delta_rule": ("fla.ops.gated_delta_rule", "recurrent_gated_delta_rule"),
+    "chunk_kimi_delta_attention": ("fla.ops.kda", "chunk_kda"),
+    "recurrent_kimi_delta_attention": ("fla.ops.kda", "fused_recurrent_kda"),
 }
 
 
@@ -803,13 +811,13 @@ def _resolved_implementation(wrapper):
     return None
 
 
-def _live_gated_delta_kernel(name):
+def _live_fla_kernel(module_name, name):
     """The kernel ``name`` currently resolves to on the live fla, or None."""
-    module = sys.modules.get("fla.ops.gated_delta_rule")
+    module = sys.modules.get(module_name)
     return getattr(module, name, None) if module is not None else None
 
 
-def _repair_kernel_hub_closures(packages=_REPAIR_MODELING):
+def _repair_kernel_hub_closures(packages=_HUB_REPAIR_MODELING):
     """Re-apply kernel-hub decorators frozen before the live fla existed (post-#47630).
     Re-decorate rather than patch cell_contents: the wrapper also closes over param names."""
     try:
@@ -824,13 +832,13 @@ def _repair_kernel_hub_closures(packages=_REPAIR_MODELING):
         module = sys.modules.get(f"transformers.models.{package}.modeling_{package}")
         if module is None:
             continue
-        for attribute, kernel in _KERNEL_HUB_DECORATED.items():
+        for attribute, (kernel_module, kernel) in _KERNEL_HUB_DECORATED.items():
             wrapper = getattr(module, attribute, None)
             original = getattr(wrapper, "__wrapped__", None)
             if original is None:
                 continue
             current = _resolved_implementation(wrapper)
-            live = _live_gated_delta_kernel(kernel)
+            live = _live_fla_kernel(kernel_module, kernel)
             if live is not None and current is live:
                 continue
             try:
@@ -854,7 +862,7 @@ def _repair_kernel_hub_closures(packages=_REPAIR_MODELING):
 _NO_FLA_HUB_MARK = "_unsloth_rdna1_no_fla"
 
 
-def _block_fla_hub_decorator(packages=_GATED_DELTA_MODELING):
+def _block_fla_hub_decorator(packages=_GATED_DELTA_MODELING + _KDA_MODELING):
     """RDNA1: later kernel-hub decorations bind the torch function; the decorator resolves fla when applied, and unsloth's compiler re-applies it after the last patch phase."""
     try:
         from transformers.integrations import hub_kernels
@@ -887,7 +895,7 @@ def _block_fla_hub_decorator(packages=_GATED_DELTA_MODELING):
     return True
 
 
-def _force_kernel_hub_fallback(packages=_GATED_DELTA_MODELING):
+def _force_kernel_hub_fallback(packages=_GATED_DELTA_MODELING + _KDA_MODELING):
     """RDNA1: bind kernel-hub wrappers (incl. compiled copies) to their torch fallback."""
     try:
         from transformers.integrations.hub_kernels import (  # noqa: F401

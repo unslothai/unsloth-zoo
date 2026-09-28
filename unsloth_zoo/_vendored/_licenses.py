@@ -97,12 +97,15 @@ description =
     Minimal, pinned, pruned snapshot of fla-core 0.5.1. Only the transitive file
     closure needed by the gated-delta-rule fast path is vendored, so Unsloth can
     enable the Triton kernels for the Qwen3.5 / Qwen3.6 / Qwen3-Next
-    gated-deltanet models without requiring `pip install flash-linear-attention`.
+    gated-deltanet models and the GLM-5.3-Flash / Kimi-Linear Kimi delta
+    attention models without requiring `pip install flash-linear-attention`.
 
 exported_api =
     fla.modules.FusedRMSNormGated
     fla.ops.gated_delta_rule.chunk_gated_delta_rule
     fla.ops.gated_delta_rule.fused_recurrent_gated_delta_rule
+    fla.ops.kda.chunk_kda
+    fla.ops.kda.fused_recurrent_kda
     fla.ops.simple_gla.chunk.chunk_simple_gla
     fla.ops.simple_gla.fused_recurrent.fused_recurrent_simple_gla
 
@@ -159,6 +162,20 @@ modifications =
       is narrowed to those two entry points (upstream also imports fused_chunk and
       parallel, whose closures are not vendored). The backward reuses the vendored
       ops/common/chunk_o.py, so it keeps the Hopper chunk_bwd_dqkwg fix above.
+    - Added the fla.ops.kda closure for the Kimi delta attention models
+      (transformers glm5_next and kimi_linear resolve `chunk_kda` /
+      `fused_recurrent_kda` from fla through their kernel-hub wrappers):
+      ops/kda/{__init__,chunk,chunk_bwd,chunk_fwd,chunk_intra,
+      chunk_intra_token_parallel,fused_recurrent,gate,wy_fast}.py,
+      ops/kda/backends/flashkda.py and ops/gla/{__init__,chunk,fused_chunk,
+      fused_recurrent}.py (chunk_kda reuses chunk_gla_fwd_o_gk) verbatim from
+      fla-core 0.5.1. ops/kda/backends/__init__.py is narrowed to register only
+      the FlashKDA backend (optional `flash_kda` package, inference only); the
+      TileLang KDA backend and its kernel backends/tilelang/chunk_bwd_dqkg.py
+      are not vendored. ops/kda/naive.py and ops/gla/naive.py are dropped
+      (reference implementations; the first needs einops). The KDA files share
+      the vendored ops/common/chunk_delta_h.py, ops/cp and ops/utils, so they
+      run on the #953 fix above.
     - Dropped fla/ops/gated_delta_rule/naive.py (the only einops dependency; the
       reference implementation is unused on the fast path).
     - Dropped the three heavy tilelang kernel files
@@ -167,10 +184,11 @@ modifications =
       its lazy imports of those files execute only when the optional `tilelang`
       package is installed and its backend is selected (not the default path).
 
-file_count = 47 python modules + this MANIFEST + LICENSE
+file_count = 62 python modules + this MANIFEST + LICENSE
 closure_measured = 43 python modules for gated_delta_rule (includes naive.py);
     vendored set drops naive.py, leaving 42, plus 5 for simple_gla (its __init__,
-    chunk.py, fused_recurrent.py, common/chunk_h.py, common/fused_recurrent.py).
+    chunk.py, fused_recurrent.py, common/chunk_h.py, common/fused_recurrent.py),
+    plus 15 for kda (11 under ops/kda, 4 under ops/gla).
 
 vendored_by = Unsloth (unsloth_zoo/_vendored/fla)
 """
