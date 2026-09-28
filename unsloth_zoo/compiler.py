@@ -4709,9 +4709,7 @@ def patch_gradient_accumulation(modeling_file, module):
 pass
 
 
-# transformers' AyaVisionForConditionalGeneration computes logits = lm_head(h) and drops the Cohere text
-# model's logit_scale (0.0625 on aya-vision-8b/32b), so its loss and logits are 16x too sharp
-# (aya-vision-32b wikitext PPL 2.4e8 raw vs 6.41 scaled). CohereForCausalLM applies it.
+# transformers' AyaVision forward drops the text logit_scale CohereForCausalLM applies (Command-A vision ships 1.0).
 _DROPPED_TEXT_LOGIT_SCALE = ("AyaVisionForConditionalGeneration",)
 
 

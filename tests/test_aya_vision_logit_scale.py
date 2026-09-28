@@ -2,27 +2,19 @@
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Lesser General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
+# GNU Affero General Public License for more details.
 #
-# You should have received a copy of the GNU Lesser General Public License
+# You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""AyaVisionForConditionalGeneration drops the Cohere text model's logit_scale.
-
-transformers computes `logits = self.lm_head(hidden_states[...])` and never multiplies by
-`config.text_config.logit_scale` (0.0625 on aya-vision-8b/32b), which CohereForCausalLM does.
-On aya-vision-32b wikitext-2 PPL is 2.4e8 raw and 6.41 with the scale. The compiled forward
-must carry the scale into the fused cross entropy and into returned logits.
-
-CPU only: source-level, no weights.
-"""
+"""AyaVision drops its Cohere text logit_scale; the compiled forward must apply it (CPU, source only)."""
 
 import inspect
 import re
