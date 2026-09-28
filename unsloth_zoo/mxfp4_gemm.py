@@ -346,8 +346,10 @@ def _pick_config(M, E, N, K, transpose_b, asm = False, big_tiles = True):
         return (256, 256, 64, 8, 4, False)
     if asm:
         # The PTX decode makes the plain dX tile beat the lo / hi split; BLOCK_M 64 even for 1-row experts.
-        if per_expert <= 96:
+        if per_expert <= 64:
             return (64, 128, 128 if E >= 256 else 64, 4, 3, False)
+        if per_expert <= 96 and E >= 256:
+            return (64, 128, 128, 4, 3, False)
         return (128, 128, 64, 8, 3, False)
     if per_expert <= 1:
         return (16, 64, 256, 4, 2, True)
