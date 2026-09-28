@@ -2725,11 +2725,7 @@ def _preserved_rng_for_probe(x):
                 pass
 
 
-# Disabled, not merely guarded by `is_compiling()`: with fullgraph = False an eager caller's
-# callees are handed to Dynamo frame by frame, so this helper was compiled on its own while
-# `_patched_param_wrapper_forward` ran eagerly. Its guard then answered None on every call,
-# no verdict was ever cached, and a stash-ignoring experts forward (GLM-5.3-Flash's clamped
-# gate routes to transformers' grouped_mm) trained with no gradient on the expert LoRA.
+# Disabled, not just `is_compiling()`-guarded: fullgraph=False compiles this frame alone, so the guard never cached a verdict.
 @torch.compiler.disable
 def _measure_moe_lora_stash_read(wrapper, experts_module, parameter_name, x, args, kwargs) -> bool:
     """Run one throwaway experts forward under `no_grad` and report whether it read the stash.

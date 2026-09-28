@@ -14,12 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The stash probe must answer when Dynamo hands it a frame of its own.
-
-With fullgraph = False, an eager `_patched_param_wrapper_forward` still has its callees
-compiled frame by frame. The probe then saw `is_compiling()` True, answered None on every
-call, no verdict was cached, and a stash-ignoring experts forward (GLM-5.3-Flash, whose
-clamped gate routes to transformers' grouped_mm) trained with no expert LoRA gradient."""
+"""The stash probe must still give a verdict when Dynamo compiles its frame alone (fullgraph=False)."""
 
 import pytest
 import torch

@@ -14,10 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""DeepSeek-V4's bf16 experts have their own clamped-SwiGLU `_apply_gate`. The dispatcher sent such
-classes to transformers' grouped_mm, which never reads Unsloth's expert LoRA: the routed-expert
-lora_A / lora_B got no gradient and the experts output ignored the adapter. They must go through the
-moe_utils backend with the class's own gate, matching the eager forward on W + PEFT's delta."""
+"""DeepSeek-V4 bf16 custom-gate experts must apply the expert LoRA (grads + output match eager W + delta)."""
 
 import json
 import os
@@ -101,8 +98,7 @@ print("RESULT " + json.dumps({"n_expert_lora": len(grads), "grads": grads, "rel"
 def test_deepseek_v4_bf16_expert_lora_is_applied(tmp_path):
     script = tmp_path / "child.py"
     script.write_text(_CHILD)
-    # The script lives in tmp_path, so without this the child would import the installed
-    # unsloth_zoo rather than the tree under test.
+    # Child runs from tmp_path: point it at the tree under test, not the installed unsloth_zoo.
     env = dict(os.environ)
     repo_root = str(Path(__file__).resolve().parents[1])
     env["PYTHONPATH"] = os.pathsep.join([repo_root] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
@@ -113,5 +109,5 @@ def test_deepseek_v4_bf16_expert_lora_is_applied(tmp_path):
     r = json.loads(line[len("RESULT "):])
     assert r["n_expert_lora"] == 16  # 4 layers x (gate_up, down) x (A, B)
     assert all(g > 0 for g in r["grads"]), r["grads"]
-    # bf16 backend vs fp32 eager reference on W + delta; ignoring the adapter is about 0.5
+    # Ignoring the adapter gives ~0.5.
     assert max(r["rel"]) < 0.02, r["rel"]

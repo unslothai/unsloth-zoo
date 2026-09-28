@@ -236,13 +236,12 @@ def _unsloth_experts_dispatch(
     top_k_weights: torch.Tensor,
 ) -> torch.Tensor:
     if _custom_gate_with_expert_lora(self):
-        # transformers' grouped_mm reads the raw stacks and skips the expert LoRA (DeepSeek-V4 bf16: lora_B
-        # never got a gradient). The moe_utils backends add it and call the class's own _apply_gate.
+        # transformers' grouped_mm ignores the expert LoRA stash; the moe_utils backends apply it with the own gate.
         self.__dict__["_unsloth_own_apply_gate"] = True
         backend = _moe_utils_module().get_forward_moe_backend()
         stack = self._parameters.get("gate_up_proj")
         if stack is not None and hidden_states.dtype != stack.dtype and torch.is_autocast_enabled():
-            # Eager transformers experts accept float32 activations under autocast; torch._grouped_mm does not.
+            # torch._grouped_mm rejects float32 activations that eager experts accept under autocast.
             out = backend(self, hidden_states.to(stack.dtype), top_k_index, top_k_weights)
             return out.to(hidden_states.dtype)
         return backend(self, hidden_states, top_k_index, top_k_weights)
