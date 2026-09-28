@@ -21,6 +21,8 @@ import os
 import subprocess
 import sys
 
+import importlib.util
+from pathlib import Path
 import pytest
 
 
@@ -85,7 +87,22 @@ def _compile(tmp_path, model_type):
     return json.loads(next(l[3:] for l in r.stdout.splitlines() if l.startswith("@@@")))
 
 
+def _uses_hub_kernel_fallback(model_type):
+    """Whether this transformers wraps any of the model's functions in a hub-kernel fallback."""
+    try:
+        spec = importlib.util.find_spec(f"transformers.models.{model_type}.modeling_{model_type}")
+    except ModuleNotFoundError:  # the model is newer than this transformers
+        return False
+    if spec is None or spec.origin is None:
+        return False
+    return "use_kernel_func_from_hub_with_fallback" in Path(spec.origin).read_text(encoding = "utf-8")
+
+
 def test_nemotron_h_hub_kernel_functions_are_not_compiled(tmp_path):
+    # transformers before the hub-kernel wrappers (5.5) has nothing to keep uncompiled. Keyed on
+    # its own source, not on `hub` being empty, so a broken discovery still fails on 5.17+.
+    if not _uses_hub_kernel_fallback("nemotron_h"):
+        pytest.skip("nemotron_h has no hub-kernel wrappers in this transformers")
     payload = _compile(tmp_path, "nemotron_h")
     generated, hub = payload["generated"], payload["hub"]
     assert "mamba2_split_conv1d_scan_combined" in hub
