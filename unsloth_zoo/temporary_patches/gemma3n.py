@@ -233,6 +233,7 @@ pass
 
 _GEMMA3N_SHARED_KV = {}
 _GEMMA3N_ATTENTION_FORWARD = {}
+_GEMMA3N_KV_LEAVES_KEY = "_unsloth_kv_leaves"
 
 def _gemma3n_shared_kv_stand_in(config, anchor):
     # One stand-in per forward: every layer of a forward, and its checkpoint recompute, gets the same
@@ -248,8 +249,7 @@ pass
 
 def _gemma3n_attention_forward_shared_kv(self, *args, **kwargs):
     if _GEMMA3N_ATTENTION_FORWARD.get("mode") == "kwarg":
-        holder = kwargs.get("shared_kv_states")
-        shared = holder
+        shared = kwargs.get("shared_kv_states")
     else:
         holder = kwargs.get("past_key_values", kwargs.get("past_key_value"))
         if holder is None and len(args) < 4 and (self.is_kv_shared_layer or self.store_full_length_kv):
@@ -262,22 +262,19 @@ def _gemma3n_attention_forward_shared_kv(self, *args, **kwargs):
 
     # Reentrant checkpointing stores source KV with no graph and recomputes shared layers first:
     # collect their KV gradient on leaves and hand it to the source layer's recompute below.
+    # Leaves live in the mapping itself (plain dict on 5.6 - 5.8, UserDict later), which is only indexed by layer.
     grad_enabled = torch.is_grad_enabled()
-    leaves = getattr(holder, "_unsloth_kv_leaves", None) if shared is not None else None
+    leaves = shared.get(_GEMMA3N_KV_LEAVES_KEY) if shared is not None else None
     if self.is_kv_shared_layer and shared is not None and grad_enabled:
         index = self.kv_shared_layer_index
         stored = shared.get(index)
         if stored is not None and not stored[0].requires_grad:
             if leaves is None:
-                try:
-                    leaves = holder._unsloth_kv_leaves = {}
-                except Exception:
-                    leaves = None
-            if leaves is not None:
-                entry = leaves.get(index)
-                if entry is None or entry[0] is not stored[0]:
-                    entry = leaves[index] = (stored[0], stored[0].detach().requires_grad_(), stored[1].detach().requires_grad_())
-                shared[index] = (entry[1], entry[2])
+                leaves = shared[_GEMMA3N_KV_LEAVES_KEY] = {}
+            entry = leaves.get(index)
+            if entry is None or entry[0] is not stored[0]:
+                entry = leaves[index] = (stored[0], stored[0].detach().requires_grad_(), stored[1].detach().requires_grad_())
+            shared[index] = (entry[1], entry[2])
 
     output = _GEMMA3N_ATTENTION_FORWARD["original"](self, *args, **kwargs)
 

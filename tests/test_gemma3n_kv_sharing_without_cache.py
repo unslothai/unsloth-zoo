@@ -25,6 +25,7 @@ from transformers import Gemma3nTextConfig
 from unsloth_zoo.temporary_patches import gemma3n as zoo_gemma3n
 
 SHARES_THROUGH_CACHE_ONLY = "shared_kv_states[self.kv_shared_layer_index]" not in inspect.getsource(modeling)
+SHARES_THROUGH_USERDICT = "shared_kv_states = UserDict()" in inspect.getsource(modeling)
 
 
 def _tiny_model():
@@ -130,3 +131,11 @@ def _two_forward_grads(reentrant):
 def test_two_forwards_before_one_backward_keep_their_own_shared_kv(pristine):
     zoo_gemma3n.patch_Gemma3nTextAttention_kv_sharing()
     assert _max_relative_error(_two_forward_grads(None), _two_forward_grads(True)) < 1e-5
+
+
+@pytest.mark.skipif(not SHARES_THROUGH_USERDICT, reason = "needs the UserDict shared_kv_states carrier to swap for a plain dict")
+def test_plain_dict_shared_kv_states_keeps_gradients(pristine, monkeypatch):
+    # transformers 5.6 - 5.8 build shared_kv_states as a plain dict.
+    monkeypatch.setattr(modeling, "UserDict", dict)
+    zoo_gemma3n.patch_Gemma3nTextAttention_kv_sharing()
+    assert _max_relative_error(_grads(None), _grads(True)) < 1e-5
