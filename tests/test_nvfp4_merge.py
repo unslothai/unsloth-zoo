@@ -48,8 +48,13 @@ def _nvfp4(out_f, in_f, seed):
 
 def _reference(packed, scale, global_scale):
     ct = pytest.importorskip("compressed_tensors.compressors.nvfp4.base")
+    from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
+
+    # compressed-tensors >= 0.19 reads the weight args from the scheme instead of inferring them.
+    args = QuantizationArgs(num_bits=4, type="float", strategy="tensor_group", group_size=16)
     return ct.NVFP4PackedCompressor.decompress(
-        {"weight_packed": packed, "weight_scale": scale, "weight_global_scale": global_scale}, None
+        {"weight_packed": packed, "weight_scale": scale, "weight_global_scale": global_scale},
+        QuantizationScheme(targets=["Linear"], weights=args),
     )["weight"].float()
 
 
