@@ -87,6 +87,7 @@ SKIP_QUANTIZATION_MODULES = [
     "multi_modal_projector",    # Llama 3.2 Vision, Pixtral, Llava
     "merger",                   # Qwen2 VL
     "modality_projection",      # Idefics, SmolVLM
+    "mm_projector",             # Kimi K2.5 / K2.7, LLaVA-style remote code
     "router",                   # MoE Router
     "mlp.gate",                 # MoE Router
     "block_sparse_moe.gate",    # MoE Router
@@ -170,6 +171,9 @@ def get_peft_regex(
         pass
 
     all_linear_modules = Counter(x.rsplit(".")[-1] for x in linear_modules)
+    _in_layer_stack = frozenset(
+        x.rsplit(".")[-1] for x in linear_modules if re.search(r"\.\d+\.", x)
+    )
 
     # Isolate lm_head / projection matrices (count == 1)
     if target_modules is None:
@@ -180,7 +184,8 @@ def get_peft_regex(
                 # Llama 4's and PhiMoE's routers return a tuple, so PEFT's LoRA
                 # forward reads `result.dtype` off one and the model cannot run.
                 continue
-            if count != 1:
+            # Seen once = a head (lm_head), unless inside a numbered layer stack (one layer of a kind).
+            if count != 1 or proj in _in_layer_stack:
                 only_linear_modules.append(proj)
             else:
                 projection_modules[proj] = j
@@ -240,9 +245,14 @@ def get_peft_regex(
 
         # Also account for model.layers.0.self_attn/mlp type modules like Qwen
         if finetune_language_layers:
+            # Same shape as the composite branch, so text-only loads reach nested leaves
+            # (mlp.shared_expert.up_proj) and tag-containing components (linear_attn.*).
+            # Routed experts (mlp.experts.<N>.up_proj) stay out, as before: unsloth widens
+            # remote expert blocks to them itself and keeps native ones (Qwen3-MoE on
+            # transformers 4.x) off LoRA on every routed expert.
             regex_matcher = r"(?:" + regex_matcher + \
-            r")|(?:\bmodel\.layers\.[\d]{1,}\.(?:" + regex_components + \
-            r")\.(?:" + match_linear_modules + r"))"
+            r")|(?:\bmodel\.layers\.[\d]{1,}(?!.*\.experts\.\d)\..*?(?:" + regex_components + \
+            r").*?\.(?:" + match_linear_modules + r"))"
         pass
     pass
 
@@ -315,6 +325,20 @@ def get_peft_regex(
         # The audio projector is a feed-forward projection -> gate under the mlp flag.
         if finetune_mlp_modules and _scoped(["embedding_projection"]):
             audio_cores.append(r"\bembed_audio\.embedding_projection")
+        candidate_branches += _linear_aware_branches(audio_cores)
+    # Voxtral (Whisper-style) / Voxtral Realtime (Mistral-style) audio_tower + projector carry no language tag.
+    _is_voxtral = _model_type.startswith("voxtral") or "voxtral" in _architectures
+    if finetune_audio_layers and _is_voxtral:
+        audio_leaves = []
+        if finetune_attention_modules:
+            audio_leaves += ["q_proj", "k_proj", "v_proj", "out_proj", "o_proj"]
+        if finetune_mlp_modules:
+            audio_leaves += ["fc1", "fc2", "gate_proj", "up_proj", "down_proj"]
+        audio_leaves = _scoped(audio_leaves)
+        audio_cores = [r"\baudio_tower\.(?:.*\.)?" + re.escape(x) for x in audio_leaves]
+        if finetune_mlp_modules:
+            audio_cores += [r"\bmulti_modal_projector\." + re.escape(x)
+                            for x in _scoped(["linear_1", "linear_2"])]
         candidate_branches += _linear_aware_branches(audio_cores)
     if finetune_vision_layers and finetune_mlp_modules and _is_gemma_mm:
         # The Gemma vision embedders are flat projection / dense Linears -> like the

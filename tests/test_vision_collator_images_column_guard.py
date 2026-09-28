@@ -146,3 +146,22 @@ def test_line_wrapped_base64_decodes():
     assert "\n" in wrapped
     images, _, _ = _collator()._extract_images_videos_for_example({"images": [wrapped]}, [])
     assert images[0].size == (64, 64)
+
+
+def test_none_entries_are_dropped():
+    image = Image.new("RGB", (8, 8))
+    images, _, _ = _collator()._extract_images_videos_for_example({"images": [None, image, None]}, [])
+    assert images == [image]
+
+
+def test_images_none_falls_back_to_embedded_messages():
+    image = Image.new("RGB", (56, 56))
+    messages = [{"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": "a"}]}]
+    images, videos, _ = _collator()._extract_images_videos_for_example({"images": None, "messages": messages}, messages)
+    assert len(images) == 1 and videos == []
+
+
+def test_images_none_text_row_has_no_images():
+    messages = [{"role": "user", "content": [{"type": "text", "text": "a"}]}]
+    images, videos, _ = _collator()._extract_images_videos_for_example({"images": None, "messages": messages}, messages)
+    assert images == [] and videos == []
