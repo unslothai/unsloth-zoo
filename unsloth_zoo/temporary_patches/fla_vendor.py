@@ -372,6 +372,19 @@ def _neutralize_intracard_backend_probe():
             logger.info(f"Unsloth: could not neutralize vendored intracard backend: {e}")
 
 
+def _withhold_kda_on_rocm():
+    """ROCm: Triton's AMD pipeline pass fails compiling the KDA kernels (gfx1151, triton 3.6), so
+    fla.ops.kda stays unimportable and the kernel-hub wrappers keep the torch fallback."""
+    try:
+        import torch
+        if getattr(torch.version, "hip", None) is None:
+            return False
+    except Exception:
+        return False
+    sys.modules["fla.ops.kda"] = None
+    return True
+
+
 def _blackwell_import_device(torch_mod):
     """Blackwell device to make current during import, else None: fla.utils freezes
     IS_NVIDIA_BLACKWELL from the current device at import."""
@@ -446,6 +459,7 @@ def _inject_vendored_fla():
                 importlib.import_module(sub)
             _neutralize_tilelang_backend_probe()
             _neutralize_intracard_backend_probe()
+            _withhold_kda_on_rocm()
         finally:
             if _bw_prev is not None:
                 try:

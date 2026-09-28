@@ -220,3 +220,41 @@ def test_kda_models_bind_vendored_kernels(package, order):
     out = json.loads(line[3:])
     assert out["chunk_kimi_delta_attention"] == "fla.ops.kda.chunk.chunk_kda", out
     assert out["recurrent_kimi_delta_attention"] == "fla.ops.kda.fused_recurrent.fused_recurrent_kda", out
+
+
+_ROCM_CHILD = textwrap.dedent(
+    """
+    import importlib, json, sys, torch
+    torch.version.hip = "7.0.0"
+    from unsloth_zoo.temporary_patches import fla_vendor
+    fla_vendor.patch_vendor_fla()
+    import fla
+    out = {"vendored": bool(getattr(fla, "_UNSLOTH_VENDORED_FLA", False))}
+    try:
+        import fla.ops.kda
+        out["kda"] = "imported"
+    except ImportError:
+        out["kda"] = "withheld"
+    import fla.ops.gated_delta_rule
+    out["gated_delta"] = "imported"
+    if importlib.util.find_spec("transformers.models.kimi_linear") is not None:
+        from transformers.models.kimi_linear import modeling_kimi_linear as mk
+        impl = fla_vendor._resolved_implementation(mk.chunk_kimi_delta_attention)
+        out["kimi_chunk"] = f"{impl.__module__}.{impl.__name__}"
+    print("@@@" + json.dumps(out))
+    """
+)
+
+
+@_GPU
+def test_rocm_withholds_kda_and_keeps_gated_delta():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(ZOO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    proc = subprocess.run([sys.executable, "-c", _ROCM_CHILD], env = env,
+                          capture_output = True, text = True, timeout = 600)
+    assert proc.returncode == 0, proc.stderr[-4000:]
+    import json
+    out = json.loads(next(l for l in proc.stdout.splitlines() if l.startswith("@@@"))[3:])
+    assert out["vendored"] and out["kda"] == "withheld" and out["gated_delta"] == "imported", out
+    if "kimi_chunk" in out:
+        assert not out["kimi_chunk"].startswith("fla."), out
