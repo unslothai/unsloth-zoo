@@ -2092,13 +2092,8 @@ UNSLOTH_DECODE_COMPILE = [False]
 
 
 def torch_compiler_disable_unless_decode(func):
-    """`torch.compiler.disable(recursive = False)`, except inside a compiled decode step.
-
-    Generated modules keep large forwards out of training graphs with that decorator,
-    but it also graph-breaks HF's compiled decode step at every layer. While
-    `UNSLOTH_DECODE_COMPILE[0]` is set and Dynamo is tracing, the forward is inlined;
-    otherwise the disabled copy runs exactly as before.
-    """
+    """`torch.compiler.disable(recursive = False)`, except while Dynamo traces a compiled decode
+    step (`UNSLOTH_DECODE_COMPILE[0]`), which would otherwise graph-break at every layer."""
     func = getattr(func, "_unsloth_undisabled", func)
     disabled = torch.compiler.disable(func, recursive = False)
 
