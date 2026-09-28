@@ -171,7 +171,7 @@ def test_pruned_and_kept_files():
 def test_all_vendored_python_compiles():
     import py_compile
     py_files = sorted(VENDORED.rglob("*.py"))
-    assert len(py_files) == 47, f"expected 47 vendored .py files, got {len(py_files)}"
+    assert len(py_files) == 62, f"expected 62 vendored .py files, got {len(py_files)}"
     for p in py_files:
         py_compile.compile(str(p), doraise=True)
 
@@ -1028,7 +1028,7 @@ def test_late_import_repair_leaves_the_live_kernel_alone(monkeypatch):
 
     wrapper = _fake_wrapper(kernel, original)
     module = _fake_modeling(monkeypatch, "qwen3_5", wrapper)
-    monkeypatch.setattr(fla_vendor, "_live_gated_delta_kernel", lambda name: kernel)
+    monkeypatch.setattr(fla_vendor, "_live_fla_kernel", lambda module_name, name: kernel)
 
     import transformers.integrations.hub_kernels as hub
     monkeypatch.setattr(
@@ -1053,7 +1053,7 @@ def test_late_import_repair_replaces_a_purged_install_kernel(monkeypatch):
 
     wrapper = _fake_wrapper(purged, original)
     module = _fake_modeling(monkeypatch, "qwen3_5", wrapper)
-    monkeypatch.setattr(fla_vendor, "_live_gated_delta_kernel", lambda name: vendored)
+    monkeypatch.setattr(fla_vendor, "_live_fla_kernel", lambda module_name, name: vendored)
 
     import transformers.integrations.hub_kernels as hub
     monkeypatch.setattr(
@@ -1077,7 +1077,7 @@ def test_late_import_repair_prefers_torch_over_a_purged_kernel(monkeypatch):
     def purged(): return "gone"
 
     module = _fake_modeling(monkeypatch, "qwen3_5", _fake_wrapper(purged, original))
-    monkeypatch.setattr(fla_vendor, "_live_gated_delta_kernel", lambda name: None)
+    monkeypatch.setattr(fla_vendor, "_live_fla_kernel", lambda module_name, name: None)
 
     import transformers.integrations.hub_kernels as hub
     monkeypatch.setattr(
@@ -1100,7 +1100,7 @@ def test_late_import_repair_keeps_the_wrapper_when_nothing_to_bind(monkeypatch):
     def original(): return "torch"
     wrapper = _fake_wrapper(original, original)
     module = _fake_modeling(monkeypatch, "qwen3_5", wrapper)
-    monkeypatch.setattr(fla_vendor, "_live_gated_delta_kernel", lambda name: None)
+    monkeypatch.setattr(fla_vendor, "_live_fla_kernel", lambda module_name, name: None)
 
     import transformers.integrations.hub_kernels as hub
     monkeypatch.setattr(
@@ -1156,7 +1156,8 @@ def test_late_import_repair_is_scoped_to_vendor_covered_models():
         fla_vendor._repair_kernel_hub_closures
     ).parameters["packages"].default
     assert "olmo_hybrid" not in default
-    assert default is fla_vendor._REPAIR_MODELING
+    assert default is fla_vendor._HUB_REPAIR_MODELING
+    assert set(default) <= fla_vendor._VENDOR_COVERED_MODELS
 
 
 def test_late_import_repair_survives_missing_hub_kernels(monkeypatch):
