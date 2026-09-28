@@ -43,9 +43,12 @@ __all__ = [
     "RoundPlan",
     "RowPlan",
     "RowState",
+    "SpeculativeDraft",
     "SpeculativeEngine",
     "StepOutput",
+    "install_speculative_seam",
     "native_mtp_drafter",
+    "speculative_unavailable_reason",
 ]
 
 
@@ -1003,6 +1006,115 @@ class SpeculativeEngine:
             plan, states, accepted, seconds = time.perf_counter() - start, draft_seconds = draft_seconds
         )
         return emitted
+
+
+class SpeculativeDraft:
+    """``draft_model`` for mlx-vlm's ``generate_step`` (with ``draft_kind = draft.draft_kind``): after
+    ``install_speculative_seam`` the reply decodes through the engine. Call ``prepare`` before each
+    generation; mlx-vlm does not pass on the prompt or sampling. Not for requests with logits processors:
+    they cannot speculate, and the seam does not see them. The controller persists."""
+
+    draft_kind = "mtp"
+
+    def __init__(self, controller: DraftController, drafter = None):
+        self.controller = controller
+        self.drafter = drafter
+        self._request = None
+
+    @property
+    def prompt_tail(self) -> int:
+        """How many of the prompt's last hidden states the drafter starts from."""
+        return 0 if self.drafter is None else getattr(self.drafter, "max_lag", 1)
+
+    def prepare(self, prompt: Sequence[int], sampling: SamplingParams) -> None:
+        self._request = (list(prompt), sampling)
+
+    def rounds(self, model, prompt_cache, input_ids, first_token, logprobs, last_outputs, *, max_tokens, **_):
+        if self._request is None:
+            raise RuntimeError("SpeculativeDraft.prepare() must be called before each generation")
+        (prompt, sampling), self._request = self._request, None
+        first = int(first_token.item())
+        yield first, logprobs
+        deltas = getattr(getattr(model, "language_model", model), "_rope_deltas", None)
+        hidden = last_outputs.hidden_states[-1][:, -self.prompt_tail :] if self.drafter is not None and last_outputs.hidden_states else None
+        engine = SpeculativeEngine(model, self.controller, self.drafter)
+        engine.add(EngineRow(
+            cache = prompt_cache, pending = first, prompt = prompt, sampling = sampling, max_tokens = max_tokens,
+            rope_delta = 0 if deltas is None else int(mx.array(deltas).reshape(-1)[0].item()), hidden = hidden,
+        ))
+        while engine.rows:
+            for step in engine.step():
+                yield from ((token, None) for token in step.tokens)
+
+
+def install_speculative_seam() -> None:
+    """Route ``SpeculativeDraft`` drafters of ``generate_step`` to the engine; others keep mlx-vlm's rounds."""
+    import importlib
+
+    if (reason := speculative_unavailable_reason()) is not None:
+        raise RuntimeError(reason)
+    # The attribute mlx_vlm.generate is not always the package, so go through the module registry.
+    ar = importlib.import_module("mlx_vlm.generate.ar")
+    if getattr(ar.run_speculative_rounds, "unsloth_upstream", None) is None:
+        ar.run_speculative_rounds = _engine_rounds(ar.run_speculative_rounds)
+    if getattr(ar.SpeculativePrefill, "unsloth_upstream", None) is None:
+        ar.SpeculativePrefill = _prompt_tail_prefill(ar.SpeculativePrefill)
+
+
+def _engine_rounds(upstream: Callable) -> Callable:
+    def run_speculative_rounds(model, draft_model, *args, **kwargs):
+        if isinstance(draft_model, SpeculativeDraft):
+            return draft_model.rounds(model, *args, **kwargs)
+        return upstream(model, draft_model, *args, **kwargs)
+
+    run_speculative_rounds.unsloth_upstream = upstream
+    return run_speculative_rounds
+
+
+def _prompt_tail_prefill(upstream: type) -> type:
+    # A chunked prefill keeps hidden states only for dflash/eagle3, so an MTP drafter would start from the
+    # prompt's last position alone; keep the drafter's tail of them across chunks instead.
+    class SpeculativePrefill(upstream):
+        unsloth_upstream = upstream
+
+        def __init__(self, draft_kind, drafter):
+            super().__init__(draft_kind, drafter)
+            self.tail = drafter.prompt_tail if isinstance(drafter, SpeculativeDraft) else 0
+            if self.tail:
+                self.kwargs = {"return_hidden": True}
+
+        def append(self, output):
+            if not self.tail:
+                return super().append(output)
+            self.chunks = [mx.concatenate([*self.chunks, output.hidden_states[-1]], axis = 1)[:, -self.tail :]]
+            mx.async_eval(self.chunks)
+
+        def finish(self, output):
+            if not self.tail or not self.chunks:
+                return super().finish(output)
+            output.hidden_states = [*output.hidden_states[:-1], mx.concatenate([*self.chunks, output.hidden_states[-1]], axis = 1)]
+            self.chunks = []
+            return output
+
+    return SpeculativePrefill
+
+
+def speculative_unavailable_reason() -> str | None:
+    """Why the installed mlx-vlm cannot run the engine, or None."""
+    import importlib
+    import inspect
+
+    try:
+        ar = importlib.import_module("mlx_vlm.generate.ar")
+        from mlx_vlm.speculative.cache_state import SpeculativeCacheTransaction
+        from mlx_vlm.speculative.common import generation_stream, verify_forward  # noqa: F401
+    except ImportError as exc:
+        return f"mlx-vlm lacks the speculative decoding primitives ({exc})"
+    if not callable(getattr(ar, "run_speculative_rounds", None)) or not {"draft_model", "draft_kind"} <= set(inspect.signature(ar.generate_step).parameters):
+        return "mlx-vlm's generate_step does not hand drafters to run_speculative_rounds"
+    if not all(callable(getattr(SpeculativeCacheTransaction, name, None)) for name in ("validate", "commit", "abort")):
+        return "mlx-vlm's speculative cache transaction lacks validate, commit or abort"
+    return None
 
 
 # Draft sources for the speculative engine.
