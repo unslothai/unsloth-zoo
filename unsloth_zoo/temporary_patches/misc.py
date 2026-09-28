@@ -2761,14 +2761,16 @@ def patch_granitemoe_router_logits_recording():
         except Exception:
             continue
         pretrained = getattr(module, f"{prefix}PreTrainedModel", None)
-        router = getattr(module, f"{prefix}TopKRouter", None)
+        # transformers <= 5.5 calls it TopKGating and returns the logits as `logits`.
+        router = getattr(module, f"{prefix}TopKRouter", None) or getattr(module, f"{prefix}TopKGating", None)
         recorded = getattr(pretrained, "_can_record_outputs", None)
         if pretrained is None or router is None or not isinstance(recorded, dict) or "router_logits" in recorded:
             continue
         # GraniteMoeSWA returns (router_logits, ...) while the others end with it: read the position off the source.
         try:
             returned = re.findall(r"return ([^\n]+)", inspect.getsource(router.forward))[-1]
-            index = [x.strip() for x in returned.split(",")].index("router_logits")
+            names = [x.strip() for x in returned.split(",")]
+            index = names.index("router_logits") if "router_logits" in names else names.index("logits")
         except Exception:
             continue
         pretrained._can_record_outputs = {**recorded, "router_logits": OutputRecorder(router, index = index)}
