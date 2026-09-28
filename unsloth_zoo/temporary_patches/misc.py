@@ -2743,9 +2743,8 @@ TEMPORARY_PATCHES.append(patch_peft_lora_integer_input)
 
 
 def patch_granitemoe_router_logits_recording():
-    # transformers 5.x (through main) dropped router_logits from the Granite MoE family's _can_record_outputs, so
-    # output_router_logits=True yields router_logits=None, load_balancing_loss_func returns int 0 and the CausalLM
-    # forward crashes on `aux_loss.to(...)` (TRL >= 1.7 turns it on by default).
+    # transformers 5.x dropped router_logits from Granite MoE _can_record_outputs, so output_router_logits=True
+    # (TRL >= 1.7 default) makes aux_loss an int 0 and the CausalLM forward crashes on `aux_loss.to(...)`.
     try:
         from transformers.utils.output_capturing import OutputRecorder
     except Exception:
