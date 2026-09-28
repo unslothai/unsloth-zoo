@@ -143,3 +143,13 @@ def test_self_check_rejects_a_wrong_layout(fresh):
     # Experts rolled by one: every routed GEMM reads its neighbour's weights.
     fresh.setattr(tkc, "mxfp4_ogs_weight", lambda b, s: real(b.roll(1, 0), s.roll(1, 0)))
     assert tkc._self_check(torch.device("cuda")) is False
+
+
+def test_no_cuda_answers_false_without_touching_cuda(fresh):
+    fresh.setattr(torch.cuda, "is_available", lambda: False)
+
+    def no_cuda(*args, **kwargs):
+        raise AssertionError("queried CUDA on a host without it")
+
+    fresh.setattr(torch.cuda, "current_device", no_cuda)
+    assert tkc.matmul_ogs_available() is False
