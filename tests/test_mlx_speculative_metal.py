@@ -8,20 +8,22 @@ pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason = "Requires 
 
 MODEL = "mlx-community/Qwen3.5-0.8B-bf16"
 MTP_MODEL = "Qwen/Qwen3.5-0.8B"
+GEMMA, GEMMA_ASSISTANT = "mlx-community/gemma-4-e4b-it-bf16", "mlx-community/gemma-4-E4B-it-assistant-bf16"
 CODE = (
     "def merge_sort(values):\n    if len(values) <= 1:\n        return values\n    middle = len(values) // 2\n"
     "    left = merge_sort(values[:middle])\n    right = merge_sort(values[middle:])\n    return merge(left, right)\n"
 )
 PROMPTS = [f"Copy this code exactly, then add a docstring to it:\n{CODE}", "Explain what a hash map is in two sentences."]
+PAST_WINDOW = "Summarize these notes in one paragraph:\n" + "The planets orbit the sun in order: Mercury, Venus, Earth, Mars, Jupiter, Saturn, Uranus, Neptune. " * 30
 
 
-def _load(repo):
+def _load(repo, *extra):
     from mlx_vlm import load
     model, processor = load(repo)
     tok = processor.tokenizer
     ids = [
         tok.encode(tok.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt = True, tokenize = False), add_special_tokens = False)
-        for p in PROMPTS
+        for p in [*PROMPTS, *extra]
     ]
     return model, ids
 
@@ -34,6 +36,14 @@ def qwen():
 @pytest.fixture(scope = "module")
 def qwen_mtp():
     return _load(MTP_MODEL)
+
+
+@pytest.fixture(scope = "module")
+def gemma():
+    from mlx_vlm.speculative.drafters import load_drafter
+    from unsloth_zoo.mlx.speculative import AssistantDrafter
+    model, ids = _load(GEMMA, PAST_WINDOW)
+    return model, ids, AssistantDrafter(load_drafter(GEMMA_ASSISTANT)[0], model)
 
 
 def _drafter(model, **kwargs):
@@ -96,7 +106,7 @@ def _run(model, prompts, n, controller, sampling, processors = None, patch = Non
         for step in engine.step():
             out[step.uid].extend(step.tokens)
             drafted[step.uid] = (step.draft_n, step.draft_n_accepted)
-        if drafter is not None and engine.rows:
+        if engine.draft_cache:
             _head_in_step(engine)
     return [out[uid] for uid in range(len(prompts))], drafted, engine
 
@@ -198,3 +208,28 @@ def test_native_mtp_head_is_built_in_memory_from_mtp_tensors_only(qwen_mtp, monk
     monkeypatch.setattr(mx, "save_safetensors", lambda *args, **kwargs: pytest.fail("the build wrote a checkpoint"))
     assert _drafter(model) is not None
     assert loaded and all(key.startswith("mtp.") for key in loaded)
+
+
+
+def test_assistant_drafts_from_the_target_kv_alone_and_in_batches(gemma, monkeypatch):
+    from unsloth_zoo.mlx.generate import SamplingParams
+    model, ids, drafter = gemma
+    lm, cache = model.language_model, model.language_model.make_cache()
+    out = lm(mx.array([ids[0]]), cache = cache, return_hidden = True, return_shared_kv = True)
+    bound, bind, n = [], drafter.model.set_shared_kv, len(ids[0])
+    monkeypatch.setattr(drafter.model, "set_shared_kv", lambda shared, offset, **kwargs: bound.append((shared, kwargs)) or bind(shared, offset, **kwargs))
+    drafter.draft([], [drafter.start(ids[0], out.hidden_states[-1], 0)[0]], 3, cache)
+    assert [where["position"].tolist() + where["kv_valid_len"].tolist() for _, where in bound] == [[n - 1, n]]
+    assert all(mx.array_equal(bound[0][0][kind][0], keys) for kind, (keys, _) in out.shared_kv_states.items())
+
+    compared, draft = [], drafter.draft
+    def against_each_row(cache, rows, depth, target):
+        drafts = draft(cache, rows, depth, target)
+        alone = [draft(cache, [row], depth, [entry.extract(i) for entry in target]) for i, row in enumerate(rows) if len(rows) > 1 and row]
+        compared.extend(row.tolist()[0] == batch for row, batch in zip(alone, drafts.tolist()))
+        return drafts
+    monkeypatch.setattr(drafter, "draft", against_each_row)
+    _run(model, ids, 64, _script(("plain", 4), ("draft", 3)), SamplingParams(), drafter = drafter)
+    assert len(compared) > 20 and sum(compared) >= 0.9 * len(compared)
+    _, drafted, _ = _run(model, ids[:1], 64, _script(("draft", 3)), SamplingParams(), drafter = drafter)
+    assert drafted[0][1] >= 0.4 * drafted[0][0]

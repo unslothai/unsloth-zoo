@@ -32,6 +32,7 @@ import mlx.nn as nn
 from .generate import SamplingParams
 
 __all__ = [
+    "AssistantDrafter",
     "DraftController",
     "EngineRow",
     "MTPDrafter",
@@ -918,7 +919,7 @@ class SpeculativeEngine:
             with mx.stream(self._stream):
                 # Replay is one head forward, as costly for one pair as for many, so it counts as drafting.
                 self.drafter.catch_up(self.draft_cache, [row.draft if spec.source == "draft" else None for row, spec in zip(rows, plan.rows)])
-                drafts = self.drafter.draft(self.draft_cache, [row.draft for row in rows], depth).astype(inputs.dtype)
+                drafts = self.drafter.draft(self.draft_cache, [row.draft for row in rows], depth, self.cache).astype(inputs.dtype)
                 if plan.split:
                     mx.eval(drafts)
                     draft_seconds = time.perf_counter() - start
@@ -972,9 +973,10 @@ class SpeculativeEngine:
         except BaseException:
             transaction.abort()
             raise
-        kept = [min(count, depth - 1) if spec.source == "draft" else 0 for spec, count in zip(plan.rows, accepted)]
+        kept = [0] * len(rows)
         if depth:
-            self.drafter.settle(self.draft_cache, [row.draft for row in rows], depth - 1, kept)
+            accepted_drafts = [min(count, depth - 1) if spec.source == "draft" else 0 for spec, count in zip(plan.rows, accepted)]
+            kept = self.drafter.settle(self.draft_cache, [row.draft for row in rows], depth - 1, accepted_drafts)
         # Left lazy, the commit makes the next decode copy whole cache buffers instead of writing in place.
         mx.async_eval([entry.state for entry in [*self.cache, *(self.draft_cache or [])]])
         emitted = []
@@ -983,7 +985,7 @@ class SpeculativeEngine:
             row.draft_n_accepted += count
             taken = row.take(proposal[:count] + [target[count]])
             if row.draft is not None and len(taken) > kept[i]:
-                # The head already holds the accepted drafts it appended; record the rest.
+                # A head that kept its accepted draft entries already holds those pairs; record the rest.
                 self.drafter.push(row.draft, taken[kept[i] :], hidden[i, kept[i] : len(taken)])
             emitted.append(taken)
         self.controller.record_round(
@@ -1086,7 +1088,7 @@ class MTPDrafter:
                 row.tokens, row.hidden = [], []
         return sum(lengths)
 
-    def draft(self, cache: list, rows: Sequence[DraftRow | None], depth: int) -> mx.array:
+    def draft(self, cache: list, rows: Sequence[DraftRow | None], depth: int, target: list) -> mx.array:
         """``[B, depth]`` greedy drafts; rows the head has not caught up get placeholders.
         Appends ``depth - 1`` entries to every row's cache, which ``settle`` trims."""
         like = next(row.last for row in rows if row is not None and row.last is not None)
@@ -1100,8 +1102,9 @@ class MTPDrafter:
             drafts.append(token)
         return mx.concatenate(drafts, axis = 1)
 
-    def settle(self, cache: list, rows: Sequence[DraftRow | None], appended: int, keep: Sequence[int]) -> None:
-        """Keep each row's first ``keep[i]`` appended entries (its accepted drafts); drop the rest."""
+    def settle(self, cache: list, rows: Sequence[DraftRow | None], appended: int, keep: Sequence[int]) -> list[int]:
+        """Keep each row's first ``keep[i]`` appended entries (its accepted drafts), drop the rest, and
+        return how many pairs each row's head now holds from this round."""
         trims = [appended - count for count in keep]
         if len(set(trims)) == 1:
             if trims[0]:
@@ -1115,6 +1118,87 @@ class MTPDrafter:
             if row is not None:
                 row.position += count
                 row.last = None
+        return list(keep)
+
+
+class AssistantRow:
+    """A reply's pending token and the target hidden that produced it."""
+
+    def __init__(self):
+        self.token = 0
+        self.hidden: mx.array | None = None
+
+    @property
+    def ready(self) -> bool:
+        return self.hidden is not None
+
+
+class AssistantDrafter:
+    """Drafts greedily with a Gemma 4 assistant, which keeps no cache of its own and attends to the
+    target's last full- and sliding-attention KV, read from the engine's caches at draft time."""
+
+    def __init__(self, model: nn.Module, target: nn.Module):
+        from mlx_vlm.speculative.drafters.gemma4_assistant import Gemma4AssistantDraftModel
+
+        if type(model) is not Gemma4AssistantDraftModel:
+            raise ValueError(f"{type(model).__name__} is not a Gemma 4 assistant")
+        self.model = model.bind(target)
+        self.lm = getattr(target, "language_model", target)
+        layers = self.lm.model.layers[: self.lm.model.first_kv_shared_layer_idx]
+        # Shared-KV layers of each type reuse the last cached layer of that type.
+        self.sources = {layer.layer_type: i for i, layer in enumerate(layers)}
+
+    def new_cache(self) -> list:
+        return []
+
+    def start(self, prompt: Sequence[int], hidden: mx.array | None, pending: int) -> tuple[AssistantRow, list]:
+        row = AssistantRow()
+        if hidden is not None:
+            self.push(row, [pending], hidden[0, -1:])
+        return row, []
+
+    def push(self, row: AssistantRow, tokens: Sequence[int], hidden: mx.array) -> None:
+        row.token = int(tokens[-1])
+        row.hidden = self.lm.speculative_draft_hidden(hidden[None, -1:])
+
+    def catch_up(self, cache: list, rows: Sequence[AssistantRow | None]) -> int:
+        return 0
+
+    def _shared_kv(self, target: list) -> tuple[dict, mx.array]:
+        from mlx_vlm.models.cache import dynamic_roll
+
+        # Each row's keys moved to the front; the assistant's masks drop keys past its valid length.
+        shared = {}
+        for layer_type, index in self.sources.items():
+            entry = target[index]
+            keys, values = entry.keys, entry.values
+            if not hasattr(entry, "left_padding"):
+                keys, values = entry.state[:2]
+                if hasattr(entry, "_temporal_order"):
+                    keys, values = entry._temporal_order(keys), entry._temporal_order(values)
+                shared[layer_type] = (keys, values)
+                continue
+            if getattr(entry, "rotated", False):
+                keys, values = mx.roll(keys, -entry._idx, axis = 2), mx.roll(values, -entry._idx, axis = 2)
+            else:
+                keys, values = keys[..., : entry._idx, :], values[..., : entry._idx, :]
+            padding = mx.maximum(entry.left_padding, 0)[:, None]
+            shared[layer_type] = (dynamic_roll(keys, -padding, axis = 2), dynamic_roll(values, -padding, axis = 2))
+        lengths = mx.array(target[self.sources["full_attention"]].offset).reshape(-1)
+        return shared, lengths
+
+    def draft(self, cache: list, rows: Sequence[AssistantRow | None], depth: int, target: list) -> mx.array:
+        """``[B, depth]`` greedy drafts from each row's pending token; rows without a hidden get placeholders."""
+        shared, lengths = self._shared_kv(target)
+        self.model.set_shared_kv(shared, int(lengths.max().item()), position = lengths - 1, kv_valid_len = lengths)
+        like = next(row.hidden for row in rows if row is not None and row.ready)
+        hidden = mx.concatenate([row.hidden if row is not None and row.ready else mx.zeros_like(like) for row in rows])
+        tokens = mx.array([row.token if row is not None else 0 for row in rows])
+        greedy = lambda logits: mx.argmax(logits, axis = -1)
+        return self.model.draft_block(tokens, hidden, None, depth + 1, greedy, greedy = True)
+
+    def settle(self, cache: list, rows: Sequence[AssistantRow | None], appended: int, keep: Sequence[int]) -> list[int]:
+        return [0] * len(rows)
 
 
 def native_mtp_drafter(model_path: str | Path, target: nn.Module, **kwargs) -> MTPDrafter | None:
