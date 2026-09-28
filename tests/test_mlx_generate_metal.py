@@ -1135,14 +1135,247 @@ def test_loader_generate_enters_the_nax_scope(monkeypatch, vlm):
     entered = []
 
     @contextmanager
-    def scope(model):
-        entered.append(model)
+    def scope(model, int8_prefill):
+        entered.append((model, int8_prefill))
         yield model
 
     def stream(model, *args, **kwargs):
-        assert entered == [root]
+        assert entered == [(root, vlm)] and "int8_prefill" not in kwargs
         yield types.SimpleNamespace(token = 7)
 
     monkeypatch.setattr(loader, "nax_quantized_linear", scope)
     monkeypatch.setattr(mlx_vlm if vlm else mlx_lm, "stream_generate", stream)
-    assert loader._mlx_generate(root, input_ids = [[1, 2]], max_new_tokens = 1).tolist() == [[1, 2, 7]]
+    generated = loader._mlx_generate(root, input_ids = [[1, 2]], max_new_tokens = 1, int8_prefill = vlm)
+    assert generated.tolist() == [[1, 2, 7]]
+
+
+def _packed_codes(codes, bits):
+    import numpy as np
+    per = 32 // bits
+    grouped = codes.astype(np.uint64).reshape(*codes.shape[:-1], -1, per)
+    return mx.array((grouped << (np.arange(per, dtype = np.uint64) * bits)).sum(-1).astype(np.uint32))
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+@metal_only
+def test_nax_int8_prefill_partial_is_exact(bits):
+    import numpy as np
+    from unsloth_zoo.mlx import nax
+
+    # Integer activations peaking at 127 per group quantize to themselves; zero weights under the three
+    # peaks and four +-1 entries per row keep every integer output (at most 4 * 510) exact in float16.
+    # Code sums of 377 to 385 need both bfloat16 halves, and 17 groups span a full and a partial block.
+    rng = np.random.default_rng(bits)
+    E, N, K = 3, 320, 17 * 64
+    peaks = (np.arange(0, K, 64)[:, None] + [0, 21, 42]).ravel()
+    codes = rng.integers(0, 1 << bits, (E, N, K), dtype = np.uint8)
+    s = rng.integers(1, 3, (E, N, K // 64)).astype(np.float32)
+    codes[..., peaks] = np.repeat(rng.integers(0, 4, (E, N, K // 64)), 3, -1)
+    b = -s * codes[..., ::64]
+    a = np.zeros((131, K), np.float32)
+    a[:, peaks] = 127
+    off_peak = np.setdiff1d(np.arange(K), peaks)
+    for row in a:
+        row[rng.choice(off_peak, 4, replace = False)] = rng.choice([-1, 1], 4)
+    W = codes * np.repeat(s, 64, -1) + np.repeat(b, 64, -1)
+    exact = np.einsum("mk,enk->emn", a.astype(np.float64), W.astype(np.float64))
+    a, s, b = (mx.array(v).astype(mx.float16) for v in (a, s, b))
+    w = _packed_codes(codes, bits)
+    dense = nax.int8_qmm(a, w[1], s[1], b[1], bits)
+    assert np.array_equal(np.array(dense.astype(mx.float32)), exact[1])
+    experts = np.repeat([0, 2], [60, 71]).astype(np.uint32)   # a ragged segment and an empty expert
+    gathered = nax.int8_gather_qmm(a, w, s, b, mx.array(experts), bits)
+    assert np.array_equal(np.array(gathered.astype(mx.float32)), exact[experts, np.arange(131)])
+    x = mx.where(mx.arange(131)[:, None] == 70, mx.nan, a).astype(mx.bfloat16)
+    y = nax.int8_qmm(x, w[0], *(v[0].astype(mx.bfloat16) for v in (s, b)), bits)
+    rows = mx.isnan(y).any(axis = 1)
+    assert rows.tolist() == [i == 70 for i in range(131)]
+
+
+_A8_EVERY_ROW = ((4, 0, 0, 64), (8, 0, 0, 64))
+
+
+class _QuantizedMoE(nn.Module):
+    def __init__(self):
+        super().__init__()
+        from mlx_lm.models.switch_layers import SwitchGLU
+        self.proj = nn.QuantizedLinear(256, 320, bias = True, group_size = 64, bits = 8)
+        self.small = nn.QuantizedLinear(256, 256, bias = False, group_size = 64, bits = 4)
+        self.odd = nn.QuantizedLinear(256, 256, bias = False, group_size = 32, bits = 4)
+        self.moe = SwitchGLU(256, 128, 8, bias = False)
+        nn.quantize(self.moe, group_size = 64, bits = 8)
+        self.set_dtype(mx.bfloat16)
+        self.eval()
+
+    def __call__(self, x, indices):
+        return self.proj(x), self.small(x) + self.odd(x), self.moe(x, indices)
+
+
+@metal_only
+def test_nax_int8_prefill_routes_dense_and_expert_prefill_only(monkeypatch):
+    from unsloth_zoo.mlx import inference, nax
+    from unsloth_zoo.mlx.generate import generation_mode
+
+    model = _QuantizedMoE()
+    calls = []
+    for name in ("int8_qmm", "int8_gather_qmm"):
+        kernel = getattr(nax, name)
+        monkeypatch.setattr(nax, name, lambda *a, kernel = kernel, name = name: calls.append(
+            ("gather" if "gather" in name else "dense", a[0].shape[0], a[1].shape[-2])) or kernel(*a))
+    monkeypatch.setattr(nax, "nax_available", lambda: True)
+    monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: True)
+    monkeypatch.setattr(nax, "_A8_ROWS_BY_GPU", {nax._gpu_generation(): _A8_EVERY_ROW})
+    monkeypatch.setattr(nax, "_INT8_PREFILL_MIN_K", 0)
+    monkeypatch.setattr(nax, "_A8_EXPERT_ROWS_BY_GPU", {nax._gpu_generation(): ((8, 0, 0, 20),)})
+    monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {})
+    monkeypatch.setattr(inference, "_NAX_INT8_QMM_VERIFIED", {})
+
+    def run(rows, top = 2):
+        calls.clear()
+        x = mx.random.normal((1, rows, 256), key = mx.random.key(rows)).astype(mx.bfloat16)
+        indices = mx.random.randint(0, 8, (1, rows, top), key = mx.random.key(rows + 1)).astype(mx.uint32)
+        return model(x, indices)
+
+    natives = {rows: run(rows) for rows in (1, 20, 64, 100)}
+    monkeypatch.delenv("UNSLOTH_MLX_INT8_PREFILL", raising = False)
+    with generation_mode(model):   # off by default: bitwise stock
+        assert all(mx.array_equal(a, b).item() for a, b in zip(run(100), natives[100])) and not calls
+    monkeypatch.setenv("UNSLOTH_MLX_INT8_PREFILL", "1")
+    with inference.nax_quantized_linear(model, False), inference.nax_quantized_linear(model, True), \
+            inference.nax_quantized_linear(model):   # the outermost scope decides
+        assert all(mx.array_equal(a, b).item() for a, b in zip(run(100), natives[100])) and not calls
+    monkeypatch.delenv("UNSLOTH_MLX_INT8_PREFILL")
+    for scope, packed in ((inference.nax_quantized_linear, False), (generation_mode, True)):
+        with scope(model, True):   # alone, and with the gate and up projections packed into one gathered call
+            assert type(model.odd) is nn.QuantizedLinear
+            assert type(model.moe.down_proj).__name__.startswith("_NaxInt8Prefill")
+            assert (type(model.moe).__name__ != "SwitchGLU") is packed
+            for rows, native in natives.items():
+                routed = run(rows)
+                # Dense projections route from 64 rows; the 2 * rows expert routes sort from 32 and route
+                # from 20 per expert (160).
+                T = 2 * rows
+                experts = [("gather", T, 256)] * 2 if packed else [("gather", T, 128)] * 2 + [("gather", T, 256)]
+                assert calls == [("dense", rows, 320), ("dense", rows, 256)] * (rows >= 64) + experts * (T >= 160)
+                for a, b in zip(routed, native):
+                    assert mx.allclose(a, b, rtol = 5e-2, atol = 5e-2).item()
+            model.train()
+            run(100)
+            assert not calls   # training stays native
+            model.eval()
+    assert type(model.moe.down_proj).__name__ == "QuantizedSwitchLinear" and type(model.proj) is nn.QuantizedLinear
+    assert "_unsloth_nax_int8_prefill_rows" not in model.proj.__dict__
+    assert "_unsloth_nax_int8_prefill" not in model.moe.up_proj.__dict__
+    verified = inference._NAX_INT8_QMM_VERIFIED
+    assert sorted(key[0] for key in verified) == ["dense", "dense", "gather", "gather", "gather"]
+    assert all(inference._NAX_INT8_QMM_VERIFIED.values())
+
+
+@metal_only
+def test_nax_int8_prefill_first_use_check_rejects_a_wrong_kernel(monkeypatch):
+    from unsloth_zoo.mlx import inference, nax
+
+    model = _QuantizedMoE()
+    kernel = nax.int8_qmm
+    monkeypatch.setattr(nax, "int8_qmm", lambda *args: kernel(*args) * 1.05)
+    monkeypatch.setattr(nax, "nax_available", lambda: True)
+    monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: True)
+    monkeypatch.setattr(nax, "_A8_ROWS_BY_GPU", {nax._gpu_generation(): _A8_EVERY_ROW})
+    monkeypatch.setattr(nax, "_INT8_PREFILL_MIN_K", 0)
+    monkeypatch.setattr(inference, "_NAX_INT8_QMM_VERIFIED", {})
+    x = mx.random.normal((96, 256), key = mx.random.key(3)).astype(mx.bfloat16)
+    native = model.proj(x)
+    with inference.nax_quantized_linear(model, int8_prefill = True):
+        assert mx.array_equal(model.proj(x), native).item()
+    assert list(inference._NAX_INT8_QMM_VERIFIED.values()) == [False]
+
+
+@metal_only
+def test_nax_int8_prefill_first_use_check_accepts_all_zero_rows():
+    from unsloth_zoo.mlx import inference, nax
+
+    # mx.quantize stores an all-zero row as codes 0, biases 0 and a tiny scale.
+    w = mx.random.normal((256, 512), key = mx.random.key(0)) * 0.05
+    w = mx.where(mx.arange(256)[:, None] % 7 == 0, 0.0, w).astype(mx.bfloat16)
+    x = mx.random.normal((200, 512), key = mx.random.key(1)).astype(mx.bfloat16)
+    for bits in (4, 8):
+        wq, s, b = mx.quantize(w, group_size = 64, bits = bits)
+        routed = nax.int8_qmm(x, wq, s, b, bits)
+        assert inference._nax_int8_qmm_matches_native(x, wq, s, b, 64, bits, routed, None)
+        assert not inference._nax_int8_qmm_matches_native(x, wq, s, b, 64, bits, routed * 1.05, None)
+    # The allowance for those rows stays small enough to reject a 5% error on deeper fp16 rows too.
+    x = mx.random.normal((160, 3072), key = mx.random.key(1)).astype(mx.float16)
+    wq, s, b = mx.quantize((mx.random.normal((1024, 3072), key = mx.random.key(2)) * 0.03).astype(mx.float16),
+                           group_size = 64, bits = 8)
+    routed = nax.int8_qmm(x, wq, s, b, 8)
+    assert inference._nax_int8_qmm_matches_native(x, wq, s, b, 64, 8, routed, None)
+    assert not inference._nax_int8_qmm_matches_native(x, wq, s, b, 64, 8, routed * 1.05, None)
+
+
+@metal_only
+def test_nax_int8_prefill_differentiates_through_the_stock_op(monkeypatch):
+    from unsloth_zoo.mlx import inference, nax
+    from mlx.utils import tree_flatten
+
+    model = _QuantizedMoE()
+    calls = []
+    kernel = nax._int8_qmm
+    monkeypatch.setattr(nax, "_int8_qmm", lambda *args: calls.append(args[1].ndim) or kernel(*args))
+    monkeypatch.setattr(nax, "nax_available", lambda: True)
+    monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: True)
+    monkeypatch.setattr(nax, "_A8_ROWS_BY_GPU", {nax._gpu_generation(): _A8_EVERY_ROW})
+    monkeypatch.setattr(nax, "_INT8_PREFILL_MIN_K", 0)
+    monkeypatch.setattr(nax, "_A8_EXPERT_ROWS_BY_GPU", {nax._gpu_generation(): ((8, 0, 0, 20),)})
+    monkeypatch.setattr(inference, "_NAX_INT8_QMM_VERIFIED", {})
+    x = mx.random.normal((1, 100, 256), key = mx.random.key(5)).astype(mx.bfloat16)
+    indices = mx.random.randint(0, 8, (1, 100, 2), key = mx.random.key(6)).astype(mx.uint32)
+    model.proj.unfreeze(keys = ["scales", "biases"], recurse = False)
+    weight = mx.random.normal((1, 100, 320), key = mx.random.key(7))   # a non-uniform cotangent
+    loss = lambda x: (model.proj(x).astype(mx.float32) * weight).sum()
+    dense = lambda x: {"x": mx.grad(loss)(x), **dict(tree_flatten(nn.value_and_grad(model.proj, loss)(x)[1]))}
+    moe = mx.grad(lambda x: model.moe(x, indices).astype(mx.float32).sum())
+    native_dense, native_moe = dense(x), moe(x)
+    state = tree_flatten(model.parameters())
+    with inference.nax_quantized_linear(model, int8_prefill = True):
+        model(x, indices)
+        calls.clear()
+        routed_dense = dense(x)
+        routed_moe = mx.compile(moe, inputs = model.state, outputs = model.state)(x)
+    assert 2 in calls and 3 in calls   # both routes were taken
+    # The dense gradients never read the forward output, so they match stock bitwise.
+    assert sorted(routed_dense) == sorted(native_dense) == ["biases", "scales", "x"]
+    assert all(mx.array_equal(routed_dense[k], native_dense[k]).item() for k in native_dense)
+    assert mx.allclose(routed_moe, native_moe, rtol = 5e-2, atol = 5e-2).item()
+    after = tree_flatten(model.parameters())
+    assert [k for k, _ in after] == [k for k, _ in state]
+    assert all(mx.array_equal(a, b).item() for (_, a), (_, b) in zip(after, state))
+
+
+@metal_only
+def test_nax_int8_prefill_probes_gate_their_own_route(monkeypatch):
+    from unsloth_zoo.mlx import inference, nax
+
+    model = _QuantizedMoE()
+    monkeypatch.setattr(nax, "nax_available", lambda: True)
+    monkeypatch.setattr(nax, "_A8_ROWS_BY_GPU", {nax._gpu_generation(): _A8_EVERY_ROW})
+    monkeypatch.setattr(nax, "_INT8_PREFILL_MIN_K", 0)
+    monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {nax._gpu_generation(): _EVERY_ROW})
+    for failed in (nax.QMM_PROBE_KEY, nax.INT8_QMM_PROBE_KEY):
+        monkeypatch.setattr(nax, "kernel_probe_passed", lambda key, *args: key != failed)
+        with inference.nax_quantized_linear(model, True):
+            assert (model.proj._unsloth_nax_qmm_rows != (0, -1)) is (failed != nax.QMM_PROBE_KEY)
+            assert bool(model.proj._unsloth_nax_int8_prefill_rows) is (failed != nax.INT8_QMM_PROBE_KEY)
+            assert (type(model.moe.down_proj).__name__.startswith("_NaxInt8Prefill")
+                    is (failed != nax.INT8_QMM_PROBE_KEY))
+
+
+def test_nax_int8_prefill_rows_follow_the_gpu_generation(monkeypatch):
+    from unsloth_zoo.mlx import nax
+
+    for architecture, rows in (("applegpu_g17s", (128, 0, 256, 0, 128)), ("applegpu_g17c", (128, 0, 256, 0, 128)),
+                               ("applegpu_g18s", (0, 0, 0, 0, 128)), ("", (0, 0, 0, 0, 128))):
+        monkeypatch.setattr(nax, "_gpu_architecture", lambda: architecture)
+        got = (nax.int8_prefill_min_rows(2048, 2048, 4), nax.int8_prefill_min_rows(8192, 512, 4),
+               nax.int8_prefill_expert_min_rows(8, 1024, 1024, 8), nax.int8_prefill_expert_min_rows(8, 512, 2048, 8),
+               nax.int8_prefill_min_rows(4096, 2048, 8))
+        assert got == rows, architecture

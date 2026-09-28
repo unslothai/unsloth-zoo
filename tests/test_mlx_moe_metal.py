@@ -596,6 +596,28 @@ def test_routed_experts_kill_switch_keeps_native(monkeypatch):
         assert gathers
 
 
+@pytest.mark.parametrize("int8_prefill_first", [False, True])
+def test_routed_experts_run_under_the_int8_prefill_scope(int8_prefill_first, monkeypatch):
+    from unsloth_zoo.mlx import nax
+    block = _expert_block(vlm_qwen, (8, "affine", 64), mx.bfloat16)
+    x = mx.random.normal((2, 1, 512)).astype(mx.bfloat16)
+    expected = block(x)
+    monkeypatch.setattr(nax, "nax_available", lambda: True)
+    monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: True)
+    monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {})
+    monkeypatch.setattr(nax, "_A8_EXPERT_ROWS_BY_GPU", {nax._gpu_generation(): ((8, 0, 0, 8),)})
+    gathers = _counting_gather_qmm(monkeypatch)
+    scopes = [functools.partial(fusion.nax_quantized_linear, int8_prefill = True), _routed]
+    with contextlib.ExitStack() as stack:
+        for scope in scopes if int8_prefill_first else scopes[::-1]:
+            stack.enter_context(scope(block))
+        assert type(block.switch_mlp.down_proj).__name__.startswith("_NaxInt8Prefill")
+        mx.eval(block(x))
+        gathers.clear()
+        _identical(block(x), expected)
+        assert not gathers
+
+
 class _Doubled(vlm.SwitchGLU):
     def __call__(self, x, indices):
         return super().__call__(x, indices) * 2
