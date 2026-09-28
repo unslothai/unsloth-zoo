@@ -1248,6 +1248,116 @@ def _renders_content_list_as_repr(rendered, text) -> bool:
 pass
 
 
+_STRING_CONTENT_DEFAULTS = {"image": "<image>", "video": "<video>", "audio": "<audio>"}
+
+
+def _media_placeholder(processor, kind) -> str:
+    """`<kind>_token` on processor/tokenizer, else remote module's DEFAULT_<KIND>_TOKEN (Phi-4-reasoning-vision)."""
+    import sys
+    for obj in (processor, getattr(processor, "tokenizer", None)):
+        token = getattr(obj, f"{kind}_token", None) if obj is not None else None
+        if isinstance(token, str) and token:
+            return token
+    module = sys.modules.get(type(processor).__module__)
+    token = getattr(module, f"DEFAULT_{kind.upper()}_TOKEN", None)
+    if isinstance(token, str) and token:
+        return token
+    return _STRING_CONTENT_DEFAULTS[kind]
+pass
+
+
+def _flatten_message_content(messages, placeholders):
+    """Copy of messages with list content joined into one string (media parts -> placeholder)."""
+    flat = []
+    for message in messages:
+        content = message.get("content") if isinstance(message, Mapping) else None
+        if not isinstance(content, (list, tuple)):
+            flat.append(message)
+            continue
+        pieces = []
+        for part in content:
+            if isinstance(part, str):
+                pieces.append(part)
+                continue
+            if not isinstance(part, Mapping):
+                continue
+            kind = part.get("type")
+            if kind in placeholders:
+                pieces.append(placeholders[kind])
+            elif kind == "text" or (kind is None and "text" in part):
+                text = part.get("text")
+                if text is not None:
+                    pieces.append(str(text))
+            elif kind in ("image_url", "input_image"):
+                pieces.append(placeholders["image"])
+            elif kind in ("input_audio", "audio_url"):
+                pieces.append(placeholders["audio"])
+            elif kind == "video_url":
+                pieces.append(placeholders["video"])
+        flat.append({**message, "content": "\n".join(pieces)})
+    return flat
+pass
+
+
+def _template_needs_string_content(processor) -> bool:
+    """List content raises TypeError but the same turn as a string renders."""
+    try:
+        processor.apply_chat_template(
+            [{"role": "user", "content": [{"type": "text", "text": "Hello!"}]}], tokenize = False,
+        )
+        return False
+    except TypeError:
+        pass
+    except Exception:
+        return False
+    try:
+        rendered = processor.apply_chat_template(
+            [{"role": "user", "content": "Hello!"}], tokenize = False,
+        )
+    except Exception:
+        return False
+    return isinstance(rendered, str) and "Hello!" in rendered
+pass
+
+
+class _StringContentChatTemplate:
+    """Module-level (not a closure) so patched processors stay picklable for spawn DataLoader workers."""
+    __slots__ = ("original", "placeholders")
+    _unsloth_string_content = True
+
+    def __init__(self, original, placeholders):
+        self.original = original
+        self.placeholders = placeholders
+
+    def __getstate__(self):
+        return (self.original, self.placeholders)
+
+    def __setstate__(self, state):
+        self.original, self.placeholders = state
+
+    def __call__(self, conversation, *args, **kwargs):
+        if isinstance(conversation, (list, tuple)) and len(conversation) and \
+            isinstance(conversation[0], (list, tuple)):
+            conversation = [_flatten_message_content(c, self.placeholders) for c in conversation]
+        elif isinstance(conversation, (list, tuple)):
+            conversation = _flatten_message_content(conversation, self.placeholders)
+        return self.original(conversation, *args, **kwargs)
+pass
+
+
+def _patch_string_content_chat_template(processor) -> bool:
+    """Phi-4-reasoning-vision / LLaVA templates concatenate string content: flatten content lists."""
+    original = getattr(processor, "apply_chat_template", None)
+    if original is None or getattr(original, "_unsloth_string_content", False):
+        return False
+    if not _template_needs_string_content(processor):
+        return False
+    placeholders = {kind: _media_placeholder(processor, kind) for kind in _STRING_CONTENT_DEFAULTS}
+    processor.apply_chat_template = _StringContentChatTemplate(original, placeholders)
+    return True
+pass
+
+
 def _processor_takes_images(processor) -> bool:
     """Step-3.7 names its image component `image_preprocessor`."""
     import inspect
@@ -1351,6 +1461,35 @@ def _tensorize_ragged_batch(batch):
         except (ValueError, TypeError, RuntimeError):
             batch[key] = items
     return batch
+pass
+
+
+def _probe_assistant_single_content(processor, model = None):
+    """Any list-form failure (TypeError, repr, Apertus 1.5 Jinja TemplateError) tries a string."""
+    user = {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Hello!"}]}
+    try:
+        rendered = processor.apply_chat_template([
+            user,
+            {"role": "assistant", "content": [{"type": "text", "text": "How can I help you?"}]},
+        ])
+        if _renders_content_list_as_repr(rendered, "How can I help you?"):
+            raise TypeError("assistant content rendered as a list repr")
+        return False
+    except Exception as list_error:
+        try:
+            processor.apply_chat_template([
+                user, {"role": "assistant", "content": "How can I help you?"},
+            ])
+        except Exception as e:
+            _raise_chat_template_error(
+                e if isinstance(list_error, TypeError) else list_error, processor, model
+            )
+        print(
+            f"Unsloth: {processor.__class__.__name__} only accepts 1 "\
+            "text field for assistant roles!\n"\
+            "We will auto fix the data collator to support it!"
+        )
+        return True
 pass
 
 
@@ -1498,38 +1637,11 @@ class UnslothVisionDataCollator:
             self.train_on_responses_only = None
 
         _adopt_tokenizer_chat_template(processor)
+        _patch_string_content_chat_template(processor)
 
         # Check what type for assistant VLM tokenizer allows!
         # Good for Mistral V3 and Pixtral I think
-        try:
-            rendered = processor.apply_chat_template([
-                {"role": "user", "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": "Hello!"}]},
-                {"role": "assistant", "content": [
-                    {"type": "text", "text": "How can I help you?"}]}
-            ])
-            if _renders_content_list_as_repr(rendered, "How can I help you?"):
-                raise TypeError("assistant content rendered as a list repr")
-            self.assistant_single_content = False
-        except TypeError:
-            try:
-                processor.apply_chat_template([
-                    {"role": "user", "content": [
-                        {"type": "image"},
-                        {"type": "text", "text": "Hello!"}]},
-                    {"role": "assistant", "content": "How can I help you?"}
-                ])
-                self.assistant_single_content = True
-                print(
-                    f"Unsloth: {processor.__class__.__name__} only accepts 1 "\
-                    "text field for assistant roles!\n"\
-                    "We will auto fix the data collator to support it!"
-                )
-            except Exception as e:
-                _raise_chat_template_error(e, processor, model)
-        except Exception as e:
-            _raise_chat_template_error(e, processor, model)
+        self.assistant_single_content = _probe_assistant_single_content(processor, model)
         return
 
     def _get_padding_token_ids_on_device(self, device):
@@ -1643,6 +1755,8 @@ class UnslothVisionDataCollator:
         labels = batch["input_ids"].clone()
         padding_ids = self._get_padding_token_ids_on_device(labels.device)
         labels[torch.isin(labels, padding_ids)] = self.ignore_index
+        # LLaVA IMAGE_TOKEN_INDEX (-200) sentinel is never a target.
+        labels[labels < 0] = self.ignore_index
         batch["labels"] = labels
         return batch
 
@@ -2231,6 +2345,7 @@ class UnslothVisionDataCollator:
         labels[attention_mask == 0] = self.ignore_index
         padding_ids = self._get_padding_token_ids_on_device(labels.device)
         labels[torch.isin(labels, padding_ids)] = self.ignore_index
+        labels[labels < 0] = self.ignore_index
         if self.completion_only_loss:
             labels[completion_mask == 0] = self.ignore_index
 
