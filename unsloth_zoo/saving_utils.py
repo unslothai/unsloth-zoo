@@ -2676,16 +2676,30 @@ _NVFP4_COMPANION_SUFFIXES = (".weight_scale", ".weight_global_scale", ".input_gl
 _E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
 def _nvfp4_dequantize(packed, scale, global_scale):
-    """fp32 (rows, 2 * cols) weight from compressed-tensors NVFP4 storage (NVFP4PackedCompressor.decompress)."""
-    rows, half = packed.shape
-    codes = torch.stack((packed & 0x0F, packed >> 4), dim = -1).reshape(rows, half * 2)
+    """fp32 (..., rows, 2 * cols) weight from compressed-tensors NVFP4 storage (NVFP4PackedCompressor.decompress).
+    Leading dims (3-D fused MoE experts) are kept; packing and 16-column groups run along the last dim."""
+    lead, half = packed.shape[:-1], packed.shape[-1]
+    codes = torch.stack((packed & 0x0F, packed >> 4), dim = -1).reshape(*lead, half * 2)
     values = torch.tensor(_E2M1_VALUES, dtype = torch.float32)[(codes & 0x07).long()]
     values = torch.where((codes & 0x08).bool(), -values, values)
     group_scale = scale.to(torch.float32)
     if global_scale is not None:
-        group_scale = group_scale / global_scale.to(torch.float32)
+        global_scale = global_scale.to(torch.float32)
+        experts = 1
+        for dim in lead[:-1]:
+            experts *= dim
+        if global_scale.numel() == 1:
+            group_scale = group_scale / global_scale.reshape(())
+        elif global_scale.numel() == experts:
+            # Fused MoE experts: one global scale per expert, broadcast over its rows and groups.
+            group_scale = group_scale / global_scale.reshape(*lead[:-1], 1, 1)
+        else:
+            raise RuntimeError(
+                f"Unsloth: NVFP4 weight of shape {tuple(packed.shape)} has {global_scale.numel()} global "
+                "scales; expected 1 or one per expert. The merged model would be corrupted."
+            )
     group = (half * 2) // group_scale.shape[-1]
-    return (values.view(rows, -1, group) * group_scale.view(rows, -1, 1)).view(rows, half * 2)
+    return (values.view(*lead, -1, group) * group_scale.reshape(*lead, -1, 1)).view(*lead, half * 2)
 pass
 
 def _is_nvfp4_compressed_tensors_config(quant_config):

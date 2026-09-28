@@ -151,3 +151,37 @@ def test_nvfp4_checkpoints_are_detected_for_dequant(tmp_path, fmt):
     (tmp_path / "config.json").write_text(json.dumps({"quantization_config": {
         "quant_method": "compressed-tensors", "format": fmt, "config_groups": groups}}))
     assert check_model_quantization_status(str(tmp_path)) == (True, "fp8")
+
+
+@pytest.mark.parametrize("global_shape", [(1,), (3,), (3, 1)])
+def test_fused_expert_nvfp4_merges_per_expert(tmp_path, global_shape):
+    # A 3-D fused-expert weight_packed (E, rows, cols / 2) must merge like three separate 2-D weights,
+    # with or without per-expert global scales, even when no LoRA targets the experts.
+    from unsloth_zoo.saving_utils import _nvfp4_dequantize
+
+    experts = [_nvfp4(32, 64, seed) for seed in range(3)]
+    packed = torch.stack([p for p, _, _ in experts])
+    scale = torch.stack([s for _, s, _ in experts])
+    gs = torch.tensor([37.5, 12.0, 3.25][: global_shape[0]]).reshape(global_shape)
+    per_expert = [gs.reshape(-1)[i if gs.numel() > 1 else 0].reshape(1) for i in range(3)]
+    expected = torch.stack([_nvfp4_dequantize(p, s, g) for (p, s, _), g in zip(experts, per_expert)])
+    assert torch.equal(_nvfp4_dequantize(packed, scale, gs), expected)
+
+    shard = tmp_path / "model.safetensors"
+    save_file({
+        "model.layers.0.mlp.experts.gate_up_proj.weight_packed": packed,
+        "model.layers.0.mlp.experts.gate_up_proj.weight_scale": scale,
+        "model.layers.0.mlp.experts.gate_up_proj.weight_global_scale": gs,
+        "model.norm.weight": torch.ones(64, dtype=torch.bfloat16),
+    }, str(shard), metadata={"format": "pt"})
+    count, out = _merge(tmp_path, [shard], defaultdict(_FakeLoraStats), [shard.name])
+    assert set(out) == {"model.layers.0.mlp.experts.gate_up_proj.weight", "model.norm.weight"}
+    assert torch.equal(out["model.layers.0.mlp.experts.gate_up_proj.weight"], expected.to(torch.bfloat16))
+
+
+def test_nvfp4_global_scale_count_mismatch_is_refused():
+    from unsloth_zoo.saving_utils import _nvfp4_dequantize
+
+    packed, scale, _ = _nvfp4(32, 64, 0)
+    with pytest.raises(RuntimeError, match="global scales"):
+        _nvfp4_dequantize(packed[None].expand(3, -1, -1), scale[None].expand(3, -1, -1), torch.ones(2))
