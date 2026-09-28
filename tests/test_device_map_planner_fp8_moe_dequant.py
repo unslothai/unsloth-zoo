@@ -109,7 +109,7 @@ def test_a_real_fine_grained_fp8_mixtral_is_detected(monkeypatch, tmp_path):
     monkeypatch.setattr(qf.FineGrainedFP8HfQuantizer, "validate_environment", lambda self, *a, **k: None)
     config = MixtralConfig(
         hidden_size = 256, intermediate_size = 512, num_local_experts = 8, num_hidden_layers = 2,
-        num_attention_heads = 4, num_key_value_heads = 2, vocab_size = 512,
+        num_attention_heads = 4, num_key_value_heads = 2, vocab_size = 512, dtype = "bfloat16",
     )
     config.quantization_config = {"quant_method": "fp8", "activation_scheme": "dynamic", "weight_block_size": [128, 128]}
     config.save_pretrained(tmp_path)
@@ -145,3 +145,11 @@ def test_dequant_peak_follows_the_scale_layout(gate_up_scale, down_scale, copies
     units = [(f"layers.{i}", 0) for i in range(_LAYERS)]
     expected = max(copies * gate_up, gate_up + copies * down)
     assert _moe_dequant_transient_by_unit(model, units) == dict.fromkeys((u for u, _ in units), expected)
+
+
+def test_a_float32_load_sizes_a_float32_dequant():
+    from unsloth_zoo.device_map_planner import _moe_dequant_transient_by_unit
+    model = _meta()
+    model.config = type("Config", (), {"dtype": torch.float32})()
+    units = [(f"layers.{i}", 0) for i in range(_LAYERS)]
+    assert _moe_dequant_transient_by_unit(model, units) == dict.fromkeys((u for u, _ in units), 2 * _BF16_DEQUANT)

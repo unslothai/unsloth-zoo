@@ -1051,6 +1051,13 @@ def _moe_dequant_transient_by_unit(
     by `moe_utils_fp8.forward_moe_backend_fp8` (14 + 7 GiB per layer on Mistral-Large-3)."""
     unit_names = sorted((u for u, _ in units), key=len, reverse=True)
     modules = dict(model.named_modules())
+    # Stacks dequantize to the hidden states' dtype, which is the load dtype (float32 loads need 4 bytes).
+    compute = _model_dtype(model)
+    itemsize = (
+        compute.itemsize
+        if isinstance(compute, torch.dtype) and compute.is_floating_point and compute not in _FP8_DTYPES
+        else 2
+    )
     stacks: dict[str, list[tuple[int, int]]] = {}
     for name, tensor in model.named_parameters():
         if tensor.dim() != 3 or tensor.dtype not in _FP8_DTYPES:
@@ -1059,7 +1066,7 @@ def _moe_dequant_transient_by_unit(
         if leaf not in _EXPERT_STACK_NAMES:
             continue
         stacks.setdefault(module, []).append(
-            (tensor.numel() * 2, _dequant_copies(modules.get(module), leaf, tensor))
+            (tensor.numel() * itemsize, _dequant_copies(modules.get(module), leaf, tensor))
         )
     per_module: dict[str, int] = {}
     for module, parts in stacks.items():
