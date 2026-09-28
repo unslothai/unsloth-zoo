@@ -112,3 +112,21 @@ def test_checkpointed_gradients_match_the_uncheckpointed_ones(pristine, reentran
     zoo_gemma3n.patch_Gemma3nTextAttention_kv_sharing()
     reference = _grads(None)
     assert _max_relative_error(reference, _grads(reentrant)) < 1e-5
+
+
+def _two_forward_grads(reentrant):
+    torch.manual_seed(3407)
+    model = _tiny_model().train()
+    if reentrant is not None:
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": reentrant})
+    first = torch.randint(0, 128, (2, 12), generator = torch.Generator().manual_seed(0))
+    second = torch.randint(0, 128, (2, 9), generator = torch.Generator().manual_seed(1))
+    loss = model(input_ids = first, labels = first, use_cache = False).loss
+    loss = loss + model(input_ids = second, labels = second, use_cache = False).loss
+    loss.backward()
+    return {name: param.grad for name, param in model.named_parameters() if param.grad is not None}
+
+
+def test_two_forwards_before_one_backward_keep_their_own_shared_kv(pristine):
+    zoo_gemma3n.patch_Gemma3nTextAttention_kv_sharing()
+    assert _max_relative_error(_two_forward_grads(None), _two_forward_grads(True)) < 1e-5

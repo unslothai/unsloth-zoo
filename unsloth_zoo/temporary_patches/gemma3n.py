@@ -17,6 +17,7 @@
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import torch
 import torch.nn as nn
+import weakref
 from .common import TEMPORARY_PATCHES, torch_compile
 from .utils import (
     patch_function,
@@ -231,44 +232,60 @@ pass
 
 
 _GEMMA3N_SHARED_KV = {}
-_GEMMA3N_SHARED_KV_LEAVES = {}
 _GEMMA3N_ATTENTION_FORWARD = {}
 
+def _gemma3n_shared_kv_stand_in(config, anchor):
+    # One stand-in per forward: every layer of a forward, and its checkpoint recompute, gets the same
+    # rotary cos tensor, so it scopes the entry and a finalizer drops it with that tensor.
+    key = (id(config), None if anchor is None else id(anchor))
+    stand_in = _GEMMA3N_SHARED_KV.get(key)
+    if stand_in is None:
+        stand_in = _GEMMA3N_SHARED_KV[key] = _Gemma3nSharedKV()
+        if anchor is not None:
+            weakref.finalize(anchor, _GEMMA3N_SHARED_KV.pop, key, None)
+    return stand_in
+pass
+
 def _gemma3n_attention_forward_shared_kv(self, *args, **kwargs):
-    shared = None
     if _GEMMA3N_ATTENTION_FORWARD.get("mode") == "kwarg":
-        shared = kwargs.get("shared_kv_states")
+        holder = kwargs.get("shared_kv_states")
+        shared = holder
     else:
-        cache = kwargs.get("past_key_values", kwargs.get("past_key_value"))
-        if cache is None and len(args) < 4 and (self.is_kv_shared_layer or self.store_full_length_kv):
+        holder = kwargs.get("past_key_values", kwargs.get("past_key_value"))
+        if holder is None and len(args) < 4 and (self.is_kv_shared_layer or self.store_full_length_kv):
+            position_embeddings = kwargs.get("position_embeddings", args[1] if len(args) > 1 else None)
+            anchor = position_embeddings[0] if isinstance(position_embeddings, (tuple, list)) else None
+            holder = _gemma3n_shared_kv_stand_in(self.config, anchor)
             kwargs.pop("past_key_value", None)
-            cache = _GEMMA3N_SHARED_KV.get(id(self.config))
-            if cache is None:
-                cache = _GEMMA3N_SHARED_KV[id(self.config)] = _Gemma3nSharedKV()
-            kwargs["past_key_values"] = cache
-        shared = getattr(cache, "shared_layers", None)
+            kwargs["past_key_values"] = holder
+        shared = getattr(holder, "shared_layers", None)
 
     # Reentrant checkpointing stores source KV with no graph and recomputes shared layers first:
     # collect their KV gradient on leaves and hand it to the source layer's recompute below.
     grad_enabled = torch.is_grad_enabled()
+    leaves = getattr(holder, "_unsloth_kv_leaves", None) if shared is not None else None
     if self.is_kv_shared_layer and shared is not None and grad_enabled:
         index = self.kv_shared_layer_index
         stored = shared.get(index)
         if stored is not None and not stored[0].requires_grad:
-            key = (id(self.config), index)
-            leaves = _GEMMA3N_SHARED_KV_LEAVES.get(key)
-            if leaves is None or leaves[0] is not stored[0]:
-                leaves = (stored[0], stored[0].detach().requires_grad_(), stored[1].detach().requires_grad_())
-                _GEMMA3N_SHARED_KV_LEAVES[key] = leaves
-            shared[index] = (leaves[1], leaves[2])
+            if leaves is None:
+                try:
+                    leaves = holder._unsloth_kv_leaves = {}
+                except Exception:
+                    leaves = None
+            if leaves is not None:
+                entry = leaves.get(index)
+                if entry is None or entry[0] is not stored[0]:
+                    entry = leaves[index] = (stored[0], stored[0].detach().requires_grad_(), stored[1].detach().requires_grad_())
+                shared[index] = (entry[1], entry[2])
 
     output = _GEMMA3N_ATTENTION_FORWARD["original"](self, *args, **kwargs)
 
-    if self.store_full_length_kv and shared is not None:
-        leaves = _GEMMA3N_SHARED_KV_LEAVES.pop((id(self.config), self.layer_idx), None)
+    if self.store_full_length_kv and leaves is not None:
+        entry = leaves.pop(self.layer_idx, None)
         stored = shared.get(self.layer_idx)
-        if leaves is not None and grad_enabled and stored is not None and stored[0].requires_grad:
-            grad_key, grad_value = leaves[1].grad, leaves[2].grad
+        if entry is not None and grad_enabled and stored is not None and stored[0].requires_grad:
+            grad_key, grad_value = entry[1].grad, entry[2].grad
             if grad_key is not None or grad_value is not None:
                 grad_key = torch.zeros_like(stored[0]) if grad_key is None else grad_key.to(stored[0].dtype)
                 grad_value = torch.zeros_like(stored[1]) if grad_value is None else grad_value.to(stored[1].dtype)
