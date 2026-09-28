@@ -270,6 +270,44 @@ if _HAS_TRITON:
 if _HAS_TRITON:
 
     @triton.jit
+    def _mxfp4_grouped_gemv_kernel(
+        x_ptr, blocks_ptr, scales_ptr, out_ptr, counts_ptr,
+        E, R, G, stride_xm, stride_om,
+        E_POW2: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, ASM: tl.constexpr,
+    ):
+        # out[m] = x[m] @ P[e(m)]^T, one routed row per program on CUDA cores: at about one row per expert the
+        # tile kernel's MMA pipeline is latency bound (B200: 34 -> 17 us for gpt-oss gate_up at 4 rows).
+        m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        e_offs = tl.arange(0, E_POW2)
+        counts = tl.load(counts_ptr + e_offs, mask = e_offs < E, other = 0)
+        e = tl.sum((tl.cumsum(counts, 0) <= m).to(tl.int32), 0).to(tl.int64)
+        offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask_n = offs_n < R
+        prow = e * R + offs_n
+        K = G * 32
+        acc = tl.zeros((BLOCK_N,), dtype = tl.float32)
+        for k0 in range(0, K, BLOCK_K):
+            offs_k = k0 + tl.arange(0, BLOCK_K)
+            a = tl.load(x_ptr + m * stride_xm + offs_k, mask = offs_k < K, other = 0.0).to(tl.float32)
+            offs_kb = k0 // 2 + tl.arange(0, BLOCK_K // 2)
+            packed = tl.load(
+                blocks_ptr + prow[:, None] * (G * 16) + offs_kb[None, :],
+                mask = mask_n[:, None] & (offs_kb[None, :] < G * 16), other = 0,
+            )
+            offs_kg = k0 // 32 + tl.arange(0, BLOCK_K // 32)
+            scale = tl.load(
+                scales_ptr + prow[:, None] * G + offs_kg[None, :],
+                mask = mask_n[:, None] & (offs_kg[None, :] < G), other = 127,
+            )
+            if ASM:
+                w = _decode_mxfp4_tile_asm(packed, scale)
+            else:
+                w = _decode_mxfp4_tile(packed.to(tl.int32), scale.to(tl.int32), BLOCK_N, BLOCK_K)
+            acc += tl.sum(w.to(tl.float32) * a[None, :], axis = 1)
+        tl.store(out_ptr + m * stride_om + offs_n, acc.to(out_ptr.dtype.element_ty), mask = mask_n)
+
+    @triton.jit
     def _decode_only_kernel(blocks_ptr, scales_ptr, out_ptr, RG, ROWS: tl.constexpr, COLS: tl.constexpr):
         pid = tl.program_id(0)
         rows = pid * ROWS + tl.arange(0, ROWS)
@@ -381,11 +419,29 @@ def _asm_ok(device):
     return ok
 
 
+def _gemv_rows(M, E, transpose_b):
+    """Decode: at most one row per two experts, where the CUDA-core GEMV beats the MMA tile kernel."""
+    return transpose_b and 2 * M <= E
+
+
+def _launch_gemv(x, blocks, scales, counts, out, launcher):
+    E, R, G, _ = blocks.shape
+    BN, BK = 32, 256
+    launcher(_mxfp4_grouped_gemv_kernel)[(x.shape[0], -(-R // BN))](
+        x, blocks, scales, out, counts, E, R, G, x.stride(0), out.stride(0),
+        E_POW2 = 1 << (E - 1).bit_length(), BLOCK_N = BN, BLOCK_K = BK, ASM = _asm_ok(x.device),
+        num_warps = 4, num_stages = 2,
+    )
+    return out
+
+
 def _launch(x, blocks, scales, counts, out, transpose_b, config, launcher, bias = None):
     E, R, G, _ = blocks.shape
     M, K = x.shape
     N = out.shape[1]
     grouped = counts is not None
+    if config is None and grouped and bias is None and _gemv_rows(M, E, transpose_b):
+        return _launch_gemv(x, blocks, scales, counts, out, launcher)
     if config is None:
         asm, big = _asm_ok(x.device), _big_tiles(x.device)
         config = (
@@ -437,6 +493,7 @@ def mxfp4_grouped_mm(x, blocks, scales, counts, transpose_b = True, out = None, 
 
 # Custom op so torch.compile (and CUDA graphs) can capture the kernel inside a fused MoE region.
 mxfp4_grouped_mm_op = None
+mxfp4_grouped_gemv_op = None
 if _HAS_TRITON:
     try:
         from torch.library import triton_op as _triton_op, wrap_triton as _wrap_triton
@@ -448,8 +505,24 @@ if _HAS_TRITON:
             x = x.contiguous()
             out = torch.empty(_out_shape(x, blocks, transpose_b), dtype = x.dtype, device = x.device)
             return _launch(x, blocks, scales, counts, out, transpose_b, None, _wrap_triton)
+
+        @_triton_op("unsloth_zoo::mxfp4_grouped_gemv", mutates_args = ())
+        def mxfp4_grouped_gemv_op(
+            x: torch.Tensor, blocks: torch.Tensor, scales: torch.Tensor, counts: torch.Tensor,
+        ) -> torch.Tensor:
+            x = x.contiguous()
+            out = torch.empty(_out_shape(x, blocks, True), dtype = x.dtype, device = x.device)
+            return _launch_gemv(x, blocks, scales, counts, out, _wrap_triton)
     except Exception:
-        mxfp4_grouped_mm_op = None
+        mxfp4_grouped_mm_op = mxfp4_grouped_gemv_op = None
+
+
+def mxfp4_grouped_mm_compiled(x, blocks, scales, counts, transpose_b):
+    """``mxfp4_grouped_mm_op`` for compiled regions. The GEMV / tile choice is made here, where dynamo guards on the
+    row count; inside the op the trace-time shape would freeze it for every later size."""
+    if mxfp4_grouped_gemv_op is not None and _gemv_rows(x.shape[0], blocks.shape[0], transpose_b):
+        return mxfp4_grouped_gemv_op(x, blocks, scales, counts)
+    return mxfp4_grouped_mm_op(x, blocks, scales, counts, transpose_b)
 
 
 class Mxfp4GroupedMM(torch.autograd.Function):

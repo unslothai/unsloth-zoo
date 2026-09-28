@@ -796,7 +796,8 @@ def test_fused_decode_path_matches_the_slot_path_without_slots(monkeypatch):
         gc.collect()
         assert len(gpt_oss._MXFP4_DECODE_SLOTS) == 0
         monkeypatch.setenv("UNSLOTH_MXFP4_FUSED_GEMM", "1")
-        got = [gpt_oss.moe_forward_inference_bf16(mlp, h) for h in inputs]
+        # CUDA-graphed like the slot path above: a replay reuses its output buffer, so clone like `want`.
+        got = [gpt_oss.moe_forward_inference_bf16(mlp, h).clone() for h in inputs]
     assert len(gpt_oss._MXFP4_DECODE_SLOTS) == 0
     for a, b in zip(got, want):
         assert a.shape == b.shape and a.dtype == b.dtype and torch.isfinite(a).all()
