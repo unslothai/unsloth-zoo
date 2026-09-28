@@ -2600,7 +2600,10 @@ def _forward_statically_reads_stash(experts_module):
     # This Unsloth Zoo code section is licensed under AGPL3
 
     # Not getattr(module, "forward").__func__: torch 2.14 Dynamo then raises AttributeError('__globals__').
-    forward = vars(experts_module).get("forward", None) if hasattr(experts_module, "__dict__") else None
+    try:
+        forward = experts_module.__dict__.get("forward")
+    except AttributeError:
+        forward = None
     if forward is None:
         forward = getattr(type(experts_module), "forward", None)
     forward = getattr(forward, "__func__", forward)
