@@ -2599,10 +2599,7 @@ def _forward_statically_reads_stash(experts_module):
     """
     # This Unsloth Zoo code section is licensed under AGPL3
 
-    # The instance's own forward if one was installed, else the class function. Not
-    # getattr(experts_module, "forward").__func__: on torch 2.14 Dynamo loses track of the
-    # function behind a bound method's __func__, and reading __globals__ from it raises
-    # AttributeError('__globals__') inside the compiled region (fullgraph=True: a hard error).
+    # Not getattr(module, "forward").__func__: torch 2.14 Dynamo then raises AttributeError('__globals__').
     forward = vars(experts_module).get("forward", None) if hasattr(experts_module, "__dict__") else None
     if forward is None:
         forward = getattr(type(experts_module), "forward", None)
@@ -2611,31 +2608,9 @@ def _forward_statically_reads_stash(experts_module):
     if code is None:
         return None
 
-    # Keyed on the code objects themselves, never on id(). Tracing id(forward) makes
-    # Dynamo guard the expression it tracked, `experts_module.forward`, a bound method
-    # CPython reallocates on every access, so ___check_obj_id can never match again and
-    # Dynamo raises "Guard failed on the same frame it was created" under both fullgraph
-    # settings with no eager fallback. Code objects are hashable, stable and 1:1 with the
-    # functions here, so they also make the separate function set redundant.
-    # Keyed on the code objects themselves, never on id(), and remembering the SHALLOWEST
-    # depth each was reached at. A plain visited set makes the answer depend on the hash
-    # seed: a helper reachable both directly and through a chain can be popped first at
-    # the depth limit, where its own callees are not followed, and the later shallow entry
-    # is then dropped as already seen. Measured on a synthetic forward with both routes,
-    # 5 of 14 PYTHONHASHSEED values returned False for a forward that does reach the
-    # stash, which would send that compiled cold start down the failing PEFT path.
-    # A LIST keyed by `is`, not a dict and not id().
-    #
-    # Equality is wrong: two functions compiled from identical source at the same filename
-    # and name have code objects that compare and hash equal while being distinct objects
-    # with different __globals__, so a dict collapses them and the scan misses whichever
-    # route is second.
-    #
-    # id() is right but untraceable: Dynamo rejects it on a code object with
-    # "Unsupported: id() with unsupported args" on some torch versions, which is a hard
-    # compile failure in the branch that exists to keep compilation working. `is` gives
-    # the same identity semantics and traces everywhere. The list stays tiny, bounded by
-    # the depth limit, so the linear scan costs nothing.
+    # (code, shallowest depth) pairs matched by `is`: id() is untraceable on some torch versions,
+    # equality merges same-source functions with different __globals__, and a plain visited set
+    # makes a helper first reached at the depth limit hide its deeper callees (hash-seed dependent).
     seen_code = []
     pending = [(code, getattr(forward, "__globals__", {}), 0)]
 
@@ -2647,13 +2622,6 @@ def _forward_statically_reads_stash(experts_module):
 
     while pending:
         current, namespace, depth = pending.pop()
-        # Keyed by IDENTITY, not equality. Two functions compiled from identical source at
-        # the same filename and name have code objects that compare equal and hash equal
-        # while being distinct objects with different __globals__, so a dict keyed on the
-        # code objects themselves collapses them: if the first resolves its names to an
-        # unrelated helper and the second to take_moe_lora_stash, the second is skipped
-        # and the scan wrongly answers False. `alive` holds a reference to everything
-        # visited, so no id() can be recycled by the collector mid-walk.
         if _visited_at_or_above(current, depth):
             continue
         seen_code.append((current, depth))

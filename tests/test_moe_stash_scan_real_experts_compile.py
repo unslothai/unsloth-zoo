@@ -1,10 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The static stash scan must trace under fullgraph Dynamo for a real transformers experts class.
-
-On torch 2.14, reading __globals__ from `getattr(module.forward, "__func__", ...)` raised
-AttributeError('__globals__') inside the compiled region, so the first compiled training step of
-MiMo-V2-Flash (MiMoV2FlashExperts behind a PEFT ParamWrapper) died with "Observed exception".
-"""
+"""Stash scan traces under fullgraph for a real experts class (torch 2.14 AttributeError('__globals__'))."""
 import pytest
 import torch
 
@@ -39,7 +34,7 @@ def test_instance_forward_still_wins():
     experts = _experts()
 
     def forward(self, *args, **kwargs):
-        return take_moe_lora_stash(self)  # noqa: F821  (only the name matters to the scan)
+        return take_moe_lora_stash(self)  # noqa: F821
 
     experts.forward = types.MethodType(forward, experts)
     assert MU._forward_statically_reads_stash(experts) is True
