@@ -1313,6 +1313,113 @@ def patch_mamba_ssm_pre_ampere_fallback():
 TEMPORARY_PATCHES.append(patch_mamba_ssm_pre_ampere_fallback)
 
 
+def _mamba_fused_split_needs_causal_conv1d_unusable():
+    """True when mamba_ssm is installed but causal_conv1d, which its fused split path calls unconditionally, is not usable."""
+    try:
+        import importlib.util
+        if importlib.util.find_spec("mamba_ssm") is None:
+            return False
+    except Exception:
+        return False
+    try:
+        import causal_conv1d
+        from causal_conv1d.cpp_functions import causal_conv1d_fwd_function
+    except Exception:
+        return True
+    if causal_conv1d_fwd_function is None:
+        return True
+    if getattr(causal_conv1d, "causal_conv1d_fn", None) is None:
+        return True
+    return False
+
+
+def patch_mamba_fused_split_without_causal_conv1d():
+    """transformers 5 binds mamba_ssm's fused split kernel whenever mamba_ssm imports; without causal_conv1d
+    it raises `'NoneType' object is not callable` on the first training step. Resolve it to transformers'
+    reference (None) so modeling code takes the split path (torch conv1d + mamba_ssm chunk scan)."""
+    if not _mamba_fused_split_needs_causal_conv1d_unusable():
+        return
+    try:
+        import transformers.integrations as _integrations
+        from transformers.integrations import hub_kernels as _hk
+    except Exception:
+        return
+    _original = getattr(_hk, "use_kernel_func_from_hub_with_fallback", None)
+    if _original is None:
+        return  # transformers < 5: gated by is_fast_path_available instead
+
+    import sys
+
+    if not getattr(_original, "_unsloth_no_causal_conv1d", False):
+        def use_kernel_func_from_hub_with_fallback(func_name, package, internal_path = None):
+            if func_name != "mamba_split_conv1d_scan_combined" or package != "mamba_ssm":
+                return _original(func_name, package, internal_path)
+            def decorator(torch_function):
+                try:
+                    return _hk.use_kernel_forward_from_hub(func_name)(torch_function)
+                except Exception:
+                    return torch_function
+            return decorator
+        use_kernel_func_from_hub_with_fallback._unsloth_no_causal_conv1d = True
+        use_kernel_func_from_hub_with_fallback.__wrapped__ = _original
+        _hk.use_kernel_func_from_hub_with_fallback = use_kernel_func_from_hub_with_fallback
+        try:
+            setattr(_integrations, "use_kernel_func_from_hub_with_fallback", use_kernel_func_from_hub_with_fallback)
+        except Exception:
+            pass
+    pass
+
+    # Rebind already imported modules; `__dict__`, not getattr: transformers 5 alias modules import on access.
+    for _module_name, _module in list(sys.modules.items()):
+        if _module is None:
+            continue
+        if not (_module_name.startswith("transformers.models.") or "unsloth_compiled_module" in _module_name):
+            continue
+        try:
+            _fn = _module.__dict__.get("mamba2_split_conv1d_scan_combined", None)
+        except Exception:
+            continue
+        if _fn is None or getattr(_fn, "_unsloth_no_causal_conv1d", False):
+            continue
+        _resolves_to_mamba_ssm = False
+        _stack, _seen = [(_fn, 0)], set()
+        while _stack and not _resolves_to_mamba_ssm:
+            _g, _depth = _stack.pop()
+            if id(_g) in _seen or _depth > 6:
+                continue
+            _seen.add(id(_g))
+            _inner = [getattr(_g, "__wrapped__", None)]
+            for _cell in (getattr(_g, "__closure__", None) or ()):
+                try:
+                    _inner.append(_cell.cell_contents)
+                except ValueError:
+                    pass
+            for _c in _inner:
+                if not callable(_c):
+                    continue
+                if str(getattr(_c, "__module__", None) or "").startswith("mamba_ssm"):
+                    _resolves_to_mamba_ssm = True
+                    break
+                _stack.append((_c, _depth + 1))
+        if not _resolves_to_mamba_ssm:
+            continue
+        _stub = functools.wraps(_fn)(lambda *a, **k: None)
+        _stub._unsloth_no_causal_conv1d = True
+        _module.mamba2_split_conv1d_scan_combined = _stub
+    pass
+
+    if not getattr(patch_mamba_fused_split_without_causal_conv1d, "_warned", False):
+        patch_mamba_fused_split_without_causal_conv1d._warned = True
+        logger.warning(
+            "Unsloth: `causal_conv1d` is not usable, so Mamba2-family models "
+            "(Falcon-H1, Nemotron-H, Granite-4 hybrid, Bamba, Zamba2) skip mamba_ssm's "
+            "fused kernel and train with a PyTorch conv1d plus the chunked scan. "
+            "Install a causal_conv1d build matching this torch for full speed."
+        )
+pass
+TEMPORARY_PATCHES.append(patch_mamba_fused_split_without_causal_conv1d)
+
+
 def patch_datasets_map_worker_death_retry():
     """Retry `Dataset.map` single-process when a worker is killed outright.
 
@@ -1388,6 +1495,58 @@ def patch_datasets_map_worker_death_retry():
 
 
 TEMPORARY_PATCHES.append(patch_datasets_map_worker_death_retry)
+
+
+def _gradient_checkpointing_donor(model):
+    try:
+        from transformers.modeling_layers import GradientCheckpointingLayer
+    except Exception:
+        GradientCheckpointingLayer = None
+    from transformers import PreTrainedModel
+    # Only the unset PreTrainedModel default: an explicit False (JetMoe, Blip-2) must keep raising.
+    owner = next((k for k in type(model).__mro__ if "supports_gradient_checkpointing" in vars(k)), None)
+    if owner is not PreTrainedModel:
+        return None
+    for name, module in model.named_modules():
+        if not name or module is model:
+            continue
+        if GradientCheckpointingLayer is not None and isinstance(module, GradientCheckpointingLayer):
+            return name
+        if isinstance(module, PreTrainedModel) and getattr(type(module), "supports_gradient_checkpointing", False):
+            return name
+    return None
+pass
+
+
+def patch_gradient_checkpointing_enable_inherit():
+    # Remote-code wrappers (Nemotron-3-Nano-Omni) leave supports_gradient_checkpointing False over
+    # GradientCheckpointingLayer blocks; _set_gradient_checkpointing already walks submodules, only the gate is wrong.
+    if os.environ.get("UNSLOTH_GC_INHERIT", "1") == "0":
+        return
+    try:
+        from transformers import PreTrainedModel
+    except Exception as e:
+        return raise_error("transformers.PreTrainedModel", e)
+    original = PreTrainedModel.gradient_checkpointing_enable
+    if getattr(original, "_unsloth_gc_inherit", False):
+        return
+
+    @functools.wraps(original)
+    def gradient_checkpointing_enable(self, *args, **kwargs):
+        if not getattr(self, "supports_gradient_checkpointing", False):
+            donor = _gradient_checkpointing_donor(self)
+            if donor is not None:
+                # Instance only: the class and its other instances keep False.
+                self.supports_gradient_checkpointing = True
+                logger.info(
+                    f"Unsloth: {type(self).__name__} inherits gradient checkpointing support from {donor}."
+                )
+        return original(self, *args, **kwargs)
+    gradient_checkpointing_enable._unsloth_gc_inherit = True
+    gradient_checkpointing_enable._unsloth_original = original
+    PreTrainedModel.gradient_checkpointing_enable = gradient_checkpointing_enable
+pass
+TEMPORARY_PATCHES.append(patch_gradient_checkpointing_enable_inherit)
 
 
 def patch_GraniteMoeHybridMambaLayer_cuda_kernels_forward():
@@ -2085,6 +2244,57 @@ pass
 TEMPORARY_PATCHES.append(patch_qwen2vl_image_processor_pixel_attrs)
 
 
+def patch_idefics2_image_processor_leading_text_row():
+    # Idefics2 image processors read processed_images[0][0] for channels/device, so a batch whose
+    # first row is text-only raises IndexError. Put an image row first, then restore row order.
+    import functools
+    classes = []
+    for module, names in (
+        ("transformers.models.idefics2.image_processing_idefics2", ("Idefics2ImageProcessor",)),
+        ("transformers.models.idefics2.image_processing_pil_idefics2", ("Idefics2ImageProcessorPil",)),
+        ("transformers.models.idefics2.image_processing_idefics2_fast", ("Idefics2ImageProcessorFast",)),
+    ):
+        try:
+            mod = importlib.import_module(module)
+        except Exception:
+            continue
+        # __dict__ lookup: transformers 5.x serves old class names through a warning module __getattr__.
+        classes.extend(mod.__dict__[n] for n in names if n in mod.__dict__)
+
+    def _reorder(value, order, n):
+        if hasattr(value, "shape") and len(value.shape) > 0 and value.shape[0] == n:
+            return value[order]
+        if isinstance(value, (list, tuple)) and len(value) == n:
+            return type(value)(value[i] for i in order)
+        return value
+
+    for cls in classes:
+        original = cls.__dict__.get("preprocess")
+        if original is None or getattr(original, "_unsloth_leading_text_row", False):
+            continue
+
+        @functools.wraps(original)
+        def preprocess(self, images, *args, _original = original, **kwargs):
+            if (
+                isinstance(images, (list, tuple)) and len(images) > 1
+                and all(isinstance(row, (list, tuple)) for row in images)
+                and len(images[0]) == 0 and any(len(row) > 0 for row in images)
+            ):
+                n = len(images)
+                first = next(i for i, row in enumerate(images) if len(row) > 0)
+                perm = [first] + [i for i in range(n) if i != first]
+                inverse = [perm.index(i) for i in range(n)]
+                out = _original(self, [images[i] for i in perm], *args, **kwargs)
+                for key in list(out.keys()):
+                    out[key] = _reorder(out[key], inverse, n)
+                return out
+            return _original(self, images, *args, **kwargs)
+        preprocess._unsloth_leading_text_row = True
+        cls.preprocess = preprocess
+pass
+TEMPORARY_PATCHES.append(patch_idefics2_image_processor_leading_text_row)
+
+
 def patch_deepseek_v2_moe_alias():
     # transformers 5.x renamed DeepseekV2MoE -> DeepseekV2Moe; trust_remote_code
     # models (e.g. DeepSeek-OCR) still import the old name. Alias it back when
@@ -2740,6 +2950,41 @@ def patch_peft_lora_integer_input():
     Linear4bit.forward = forward
 pass
 TEMPORARY_PATCHES.append(patch_peft_lora_integer_input)
+
+
+def _list_main_input_numel(value):
+    if all(isinstance(v, torch.Tensor) for v in value):
+        return sum(v.numel() for v in value)
+    return None
+
+
+def patch_trainer_flops_list_main_input():
+    # Nemotron-3-Nano-Omni's main_input_name is pixel_values, a list of ragged tiles: Trainer's `.numel()` crashes.
+    try:
+        from transformers import Trainer
+    except Exception:
+        return
+    original = Trainer.__dict__.get("floating_point_ops")
+    if original is None or getattr(original, "_unsloth_list_main_input", False):
+        return
+
+    @functools.wraps(original)
+    def floating_point_ops(self, inputs):
+        model = getattr(self, "model", None)
+        main_input = getattr(model, "main_input_name", "input_ids")
+        # BatchFeature is a UserDict, not a dict.
+        value = inputs.get(main_input, None) if hasattr(inputs, "get") else None
+        if isinstance(value, (list, tuple)) and hasattr(model, "num_parameters"):
+            numel = _list_main_input_numel(value)
+            if numel is None:
+                return 0
+            return 6 * numel * model.num_parameters(exclude_embeddings = True)
+        return original(self, inputs)
+
+    floating_point_ops._unsloth_list_main_input = True
+    Trainer.floating_point_ops = floating_point_ops
+pass
+TEMPORARY_PATCHES.append(patch_trainer_flops_list_main_input)
 
 
 def patch_granitemoe_router_logits_recording():

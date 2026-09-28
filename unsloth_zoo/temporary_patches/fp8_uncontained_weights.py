@@ -47,7 +47,6 @@ def _target_owns_scale(model, full_layer_name):
 
 
 def _as_param_dtype(module, name, value):
-    # Renamed keys load in the checkpoint dtype; stock loading casts floats to the parameter's (bf16 scales -> fp32).
     param = getattr(module, name, None)
     if isinstance(param, torch.Tensor) and isinstance(value, torch.Tensor) and value.is_floating_point() and param.is_floating_point():
         return value.to(param.dtype)

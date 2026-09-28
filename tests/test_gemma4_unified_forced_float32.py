@@ -251,3 +251,69 @@ def test_unified_vision_projection_preserves_values_above_fp16_range(monkeypatch
     ordinary = cls(vision_config, _config(module, "Gemma4Unified"))
     assert not ordinary._unsloth_vision_fp32
     assert not hasattr(ordinary.patch_dense, "_pre_set_compute_dtype")
+
+
+def test_unified_vision_block_survives_loader_fp16_cast(monkeypatch):
+    # Real forced-float32 cast pass: markers keep the image block fp32, the rest fp16.
+    module = pytest.importorskip("transformers.models.gemma4_unified.modeling_gemma4_unified")
+    from transformers.models.gemma4_unified.configuration_gemma4_unified import (
+        Gemma4UnifiedConfig,
+        Gemma4UnifiedVisionConfig,
+    )
+    from unsloth_zoo.patching_utils import patch_model_and_tokenizer
+    cls = module.Gemma4UnifiedVisionEmbedder
+    monkeypatch.setattr(cls, "__init__", cls.__init__)
+    monkeypatch.setattr(cls, "forward", cls.forward)
+    monkeypatch.setattr(cls, "_unsloth_vision_fp32_patched", False, raising=False)
+    monkeypatch.setenv("UNSLOTH_FORCE_FLOAT32", "1")
+    patches.patch_Gemma4UnifiedVisionEmbedder()
+    config = Gemma4UnifiedConfig(
+        text_config=_config(module, "Gemma4Unified"),
+        vision_config=Gemma4UnifiedVisionConfig(
+            patch_size=2, pooling_kernel_size=1, mm_embed_dim=16,
+            mm_posemb_size=8, output_proj_dims=16,
+        ),
+        image_token_id=28, video_token_id=29, audio_token_id=30,
+        boi_token_id=26, eoi_token_id=27,
+    )
+    model = module.Gemma4UnifiedForConditionalGeneration(config).to(torch.bfloat16)
+    patch_model_and_tokenizer(model, None, do_forced_float32=True)
+    dtypes = {name: p.dtype for name, p in model.named_parameters()}
+    for block in ("patch_ln1", "patch_dense", "patch_ln2", "pos_norm"):
+        for suffix in ("weight", "bias"):
+            assert dtypes[f"model.embed_vision.{block}.{suffix}"] == torch.float32, block
+    assert dtypes["model.embed_vision.multimodal_embedder.embedding_projection.weight"] == torch.float16
+    assert torch.bfloat16 not in dtypes.values()
+
+
+def test_every_forced_gemma4_family_arch_is_covered(monkeypatch):
+    # The loader forces float32 by substring (`"gemma4" in "gemma4_unified,"`), so any
+    # new gemma4* model type gets the fp16 load without these patches unless listed.
+    import importlib
+    import importlib.util
+    import pkgutil
+    import transformers.models
+    from unsloth_zoo.model_lists import FORCE_FLOAT32
+    monkeypatch.setenv("UNSLOTH_FORCE_FLOAT32", "1")
+    monkeypatch.setattr(patch_utils, "UNSLOTH_COMPILE_DISABLE", True)
+    suffixes = ("TextScaledWordEmbedding", "RMSNorm", "TextAttention")
+    targets = []
+    for info in pkgutil.iter_modules(transformers.models.__path__):
+        mt = info.name
+        if not mt.startswith("gemma4") or not any(e in mt + "," for e in FORCE_FLOAT32):
+            continue
+        name = f"transformers.models.{mt}.modeling_{mt}"
+        if importlib.util.find_spec(name) is None:
+            continue
+        module = importlib.import_module(name)  # an installed module that fails to import is drift
+        for name, cls in vars(module).items():
+            if isinstance(cls, type) and cls.__module__ == module.__name__ and name.endswith(suffixes):
+                monkeypatch.setattr(cls, "forward", cls.forward)
+                targets.append((mt, cls, cls.forward))
+    if not targets:
+        pytest.skip("no Gemma4 family in this transformers")
+    patches.patch_Gemma4TextScaledWordEmbedding()
+    patches.patch_Gemma4RMSNorm()
+    patches.patch_Gemma4TextAttention()
+    missed = [f"{mt}.{cls.__name__}" for mt, cls, before in targets if cls.forward is before]
+    assert not missed, f"forced-float32 model types left unpatched: {missed}"

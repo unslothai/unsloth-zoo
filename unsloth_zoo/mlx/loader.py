@@ -4421,6 +4421,8 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg, adapter_weights_file=
     # Defer rank validation until a module needs wrapping, so a legacy adapter
     # with no rank (but already wrapped by load_adapters) doesn't crash here.
     _metadata = {"rank": None, "scale": None, "dropout": None}
+    _per_path_ranks = adapter_cfg.get("unsloth_mlx_lora_module_ranks") or {}
+    _per_path_scales = adapter_cfg.get("unsloth_mlx_lora_module_scales") or {}
 
     def _ensure_metadata(module_path=None):
         if _metadata["rank"] is not None:
@@ -4471,9 +4473,36 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg, adapter_weights_file=
         if module is None:
             _skipped_paths.append((name, "module_missing"))
             continue
-        # Skip already-wrapped paths so we don't nest LoRALinear(LoRALinear).
         if hasattr(module, "lora_a") and hasattr(module, "lora_b"):
-            continue
+            _want_rank = _per_path_ranks.get(name)
+            _want_scale = _per_path_scales.get(name)
+            _have_rank = None
+            try:
+                _b = getattr(module, "lora_b", None)
+                if hasattr(module, "num_experts") and getattr(_b, "ndim", 0) >= 3:
+                    _have_rank = int(_b.shape[-1])
+                else:
+                    _have_rank = int(module.lora_a.shape[-1])
+            except Exception:
+                pass
+            _have_scale = getattr(module, "scale", None)
+            _rank_ok = _want_rank is None or _have_rank == int(_want_rank)
+            try:
+                _scale_ok = (
+                    _want_scale is None
+                    or (_have_scale is not None
+                        and float(_have_scale) == float(_want_scale))
+                )
+            except (TypeError, ValueError):
+                _scale_ok = True
+            _base_mod = (
+                getattr(module, "linear", None)
+                or getattr(module, "embedding", None)
+            )
+            if (_rank_ok and _scale_ok) or _base_mod is None:
+                continue
+            module = _base_mod
+            by_name[name] = module
         type_spec = _mlx_lora_spec_for_module(module, type_specs)
         if use_dora and isinstance(module, linear_types):
             type_spec = None
@@ -4515,15 +4544,34 @@ def _apply_lora_at_paths(model, module_paths, adapter_cfg, adapter_weights_file=
                 (name, f"unhandled_type:{type(module).__name__}"),
             )
             continue
-        _ensure_metadata(module_path=name)
+        if name in _per_path_ranks or name in _per_path_scales:
+            if name not in _per_path_ranks or name not in _per_path_scales:
+                _ensure_metadata(module_path=name)
+            _rank = int(_per_path_ranks.get(name, _metadata["rank"] or 0))
+            _scale = float(
+                _per_path_scales.get(
+                    name,
+                    _metadata["scale"] if _metadata["scale"] is not None else 1.0,
+                )
+            )
+            _dropout = _metadata["dropout"] if _metadata["dropout"] is not None else 0.0
+            if _metadata["dropout"] is None:
+                _lp = adapter_cfg.get("lora_parameters") or {}
+                _dropout = float(_lp.get("dropout", adapter_cfg.get("dropout", 0.0)))
+        else:
+            _ensure_metadata(module_path=name)
+            _rank = _metadata["rank"]
+            _scale = _metadata["scale"]
+            _dropout = _metadata["dropout"]
         if type_spec is not None:
             wrapped = _mlx_lora_from_base(
-                module, _metadata, specs=type_specs,
+                module,
+                {**_metadata, "rank": _rank, "scale": _scale, "dropout": _dropout},
+                specs=type_specs,
             )
         else:
             wrapped = _lora_from_base_compat(
-                lora_cls, module,
-                _metadata["rank"], _metadata["scale"], _metadata["dropout"],
+                lora_cls, module, _rank, _scale, _dropout,
             )
         # Resolve numeric path segments (e.g. `...layers.0`) via parent[int(seg)]
         # then getattr; same pattern on the leaf so list-indexed wrappers install.
@@ -4983,6 +5031,22 @@ def _adapter_actual_quant_config(adapter_cfg, resolved_map):
         expected["quantize_modules"] = None
         return expected
     return _quant_config_from_resolved_map(resolved_map)
+
+
+def _peft_import_quant_override(flags):
+    if flags.get("load_in_4bit") is False:
+        return True
+    if any(
+        flags.get(k)
+        for k in ("load_in_8bit", "load_in_16bit", "load_in_fp8",
+                  "load_in_mxfp4", "load_in_nvfp4")
+    ):
+        return True
+    return any(
+        flags.get(k) is not None
+        for k in ("q_bits", "q_mode", "q_group_size",
+                  "mlx_quantization_config", "quantization_config")
+    )
 
 
 def _adapter_base_revision(adapter_cfg):
@@ -6501,7 +6565,13 @@ def _mlx_push_to_hub_gguf(self, repo_id, tokenizer=None,
                      quantization_method=quantization_method, **kwargs)
 
 
-def _mlx_save_lora_adapters(self, path, adapter_config=None):
+def _mlx_save_lora_adapters(self, path, adapter_config=None, adapter_format="mlx"):
+    # Validate first: the trainable-tensor writer ignores adapter_format.
+    if adapter_format not in ("mlx", "peft"):
+        raise ValueError(
+            f"Unsloth MLX: adapter_format={adapter_format!r}; expected "
+            "'mlx' or 'peft'."
+        )
     import mlx.utils as _mu
     from .utils import (
         save_lora_adapters, save_trainable_adapters,
@@ -6517,18 +6587,40 @@ def _mlx_save_lora_adapters(self, path, adapter_config=None):
     _lora_names = [name for name, _ in iter_mlx_lora_modules(self)]
     _lora_prefixes = tuple(f"{name}." for name in _lora_names if name)
     _root_lora = any(name == "" for name in _lora_names)
+    _fs_paths = frozenset(
+        path
+        for path, origin in (
+            getattr(self, "_unsloth_full_state_modules", None) or {}
+        ).items()
+        if origin == "modules_to_save"
+    )
+
+    from unsloth_zoo.mlx.peft_interop import _full_state_owner
+
+    def _is_adapter_full_state(key):
+        return _full_state_owner(key.rsplit(".", 1)[0], _fs_paths) is not None
     # A tree nothing froze reports EVERY parameter trainable, which is not CPT
     # evidence: keep the LoRA-only writer. The wrapped-base filter matches
     # MLXTrainer.save_model, so a reload-leaked q_proj.weight does not count.
     _has_full_module = len(_trainable) < len(_all) and any(
         k not in _lora
         and not _is_base_tensor_inside_lora_module(k, _lora_prefixes, _root_lora)
+        and not _is_adapter_full_state(k)
         for k in _trainable
     )
     if _has_full_module:
+        if adapter_format == "peft":
+            raise ValueError(
+                "Unsloth MLX: this checkpoint trains full modules "
+                "(continued pretraining), which the PEFT adapter format "
+                "cannot represent here. Export the MLX adapter, or merge "
+                "the model and export the merged weights."
+            )
         save_trainable_adapters(self, path, adapter_config=adapter_config)
     else:
-        save_lora_adapters(self, path, adapter_config=adapter_config)
+        save_lora_adapters(
+            self, path, adapter_config=adapter_config, adapter_format=adapter_format,
+        )
 
 
 def _mlx_prompt_to_ids(prompt):
@@ -8403,6 +8495,31 @@ class FastMLXModel:
             try:
                 with open(adapter_cfg_path, "r") as f:
                     adapter_cfg = json.load(f)
+                # The latest save wrote the config: native (fine_tune_type) wins over a stale PEFT file.
+                if "fine_tune_type" not in adapter_cfg and (os.path.exists(
+                    os.path.join(local_path, "adapter_model.safetensors")
+                ) or os.path.exists(
+                    os.path.join(
+                        local_path, "adapter_model.safetensors.index.json"
+                    )
+                )):
+                    from .utils import (
+                        detect_adapter_format,
+                        normalize_peft_adapter_config,
+                    )
+                    adapter_cfg = normalize_peft_adapter_config(
+                        adapter_cfg, adapter_dir=local_path,
+                    )
+                    detect_adapter_format(local_path)
+                    if full_finetuning:
+                        raise ValueError(
+                            "Unsloth MLX: full_finetuning=True cannot be "
+                            "combined with importing a PEFT LoRA adapter; "
+                            "training the unfrozen base would move weights "
+                            "the adapter save does not capture. Load "
+                            "without full_finetuning, or merge the adapter "
+                            "first."
+                        )
                 base_model_id = adapter_cfg.get("base_model_name_or_path", "")
                 if base_model_id:
                     print(f"Unsloth: Detected LoRA adapter, loading base model '{base_model_id}'...")
@@ -8525,16 +8642,57 @@ class FastMLXModel:
                     # Reload the base via FastMLXModel.from_pretrained (text +
                     # VLM); the old mlx_lm.load fallback broke VLM adapters
                     # (mlx-lm load is text-only).
+                    _base_quant_flags = (
+                        {
+                            "load_in_4bit": load_in_4bit,
+                            "load_in_8bit": load_in_8bit,
+                            "load_in_16bit": load_in_16bit,
+                            "load_in_fp8": load_in_fp8,
+                            "load_in_mxfp4": load_in_mxfp4,
+                            "load_in_nvfp4": load_in_nvfp4,
+                            **{
+                                _qk: _qv
+                                for _qk, _qv in (
+                                    ("q_bits", q_bits),
+                                    ("q_group_size", q_group_size),
+                                    ("q_mode", q_mode),
+                                    ("mlx_quantization_config", mlx_quantization_config),
+                                    ("quantization_config", quantization_config),
+                                    ("quant_predicate", quant_predicate),
+                                    ("quantize_modules", quantize_modules),
+                                )
+                                if _qv is not None
+                            },
+                            **({"force_requantize": True} if force_requantize else {}),
+                        }
+                        if adapter_cfg.get("_unsloth_peft_import")
+                        else {
+                            "load_in_4bit": False,
+                            "load_in_8bit": False,
+                            "load_in_16bit": False,
+                            "load_in_fp8": False,
+                            "load_in_mxfp4": False,
+                            "load_in_nvfp4": False,
+                        }
+                    )
+                    if (
+                        adapter_mlx_quant_config is not None
+                        and adapter_cfg.get("_unsloth_peft_import")
+                    ):
+                        _caller_quant_override = _peft_import_quant_override(_base_quant_flags)
+                        if _caller_quant_override:
+                            adapter_mlx_quant_config = None
+                        else:
+                            _base_quant_flags.pop("mlx_quantization_config", None)
+                            _base_quant_flags.pop("quantization_config", None)
+                    elif adapter_mlx_quant_config is not None:
+                        _base_quant_flags.pop("mlx_quantization_config", None)
+                        _base_quant_flags.pop("quantization_config", None)
                     model, tokenizer = FastMLXModel.from_pretrained(
                         base_model_id,
                         max_seq_length=max_seq_length,
                         dtype=dtype,
-                        load_in_4bit=False,
-                        load_in_8bit=False,
-                        load_in_16bit=False,
-                        load_in_fp8=False,
-                        load_in_mxfp4=False,
-                        load_in_nvfp4=False,
+                        **_base_quant_flags,
                         full_finetuning=full_finetuning,
                         token=token,
                         trust_remote_code=trust_remote_code,
@@ -8552,101 +8710,120 @@ class FastMLXModel:
                         ),
                     )
                     _validate_mlx_adapter_base(model, adapter_cfg)
-                    # why: load_adapters rebuilds only language-tower LoRA;
-                    # vision/projector LoRA must be re-attached so load_weights
-                    # binds the trained tensors.
-                    _saved_lora_paths = _normalize_mlx_lora_module_paths(
-                        adapter_cfg.get("unsloth_mlx_lora_module_paths"),
-                    )
-                    # Saved exact paths win: build and shape-check those wrappers before strict=False can mutate them.
-                    # Let older mlx-lm load_adapters accept scale=/dropout=.
-                    _patch_mlx_lora_from_base_compat()
-                    adapter_weights_file = os.path.join(local_path, "adapters.safetensors")
-                    _tensor_lora_shapes = _saved_mlx_lora_tensor_shapes(
-                        adapter_weights_file,
-                    )
-                    if _saved_lora_paths:
-                        _unbacked_paths = sorted(
-                            path for path in _saved_lora_paths
-                            if set(_tensor_lora_shapes.get(path, ())) != {"a", "b"}
+                    if adapter_cfg.get("_unsloth_peft_import"):
+                        from .utils import attach_and_bind_peft_adapter
+                        attach_and_bind_peft_adapter(
+                            model, local_path, adapter_cfg,
                         )
-                        if _unbacked_paths:
-                            raise RuntimeError(
-                                "Unsloth MLX: saved LoRA module paths have no "
-                                "complete A/B tensor pair; refusing to load a "
-                                f"partial adapter ({_unbacked_paths[:5]!r})."
-                            )
+                        adapter_weights_file = os.path.join(
+                            local_path, "adapters.safetensors",
+                        )
                     else:
-                        _validate_pathless_switch_adapter(
-                            model,
-                            _tensor_lora_shapes,
-                            adapter_cfg,
+                        _saved_lora_paths = _normalize_mlx_lora_module_paths(
+                            adapter_cfg.get("unsloth_mlx_lora_module_paths"),
+                        )
+                        _fs_prebind = {}
+                        _fs_cfg_map = dict(
+                            adapter_cfg.get("full_state_modules") or {}
+                        )
+                        if _fs_cfg_map:
+                            from mlx.utils import tree_flatten as _tf
+                            _params0 = dict(_tf(model.parameters()))
+                            for _p in _fs_cfg_map:
+                                for _t in ("weight", "bias"):
+                                    _bare_v = _params0.get(f"{_p}.{_t}")
+                                    for _k in (
+                                        f"{_p}.{_t}",
+                                        f"{_p}.embedding.{_t}",
+                                        f"{_p}.linear.{_t}",
+                                    ):
+                                        _v = _params0.get(_k, _bare_v)
+                                        if _v is not None:
+                                            _fs_prebind[_k] = tuple(_v.shape)
+                        # Let older mlx-lm load_adapters accept scale=/dropout=.
+                        _patch_mlx_lora_from_base_compat()
+                        adapter_weights_file = os.path.join(local_path, "adapters.safetensors")
+                        _tensor_lora_shapes = _saved_mlx_lora_tensor_shapes(
                             adapter_weights_file,
                         )
-                    # Pre-validate DoRA: catch missing mlx_lm.tuner.dora before
-                    # load_adapters rebuilds plain LoRA and drops saved DoRA
-                    # `.m` via strict=False (distinct from the per-module
-                    # post-check in _apply_lora_at_paths).
-                    if adapter_cfg.get("fine_tune_type") == "dora":
-                        try:
-                            import mlx_lm.tuner.dora  # noqa: F401
-                        except Exception as _dora_exc:
-                            raise RuntimeError(
-                                "Unsloth MLX: adapter_config declares "
-                                "fine_tune_type='dora' but mlx_lm.tuner.dora "
-                                "is unavailable; install a DoRA-capable "
-                                "mlx-lm or convert the adapter to plain "
-                                "LoRA before reload."
-                            ) from _dora_exc
-                    if _saved_lora_paths:
-                        if not full_finetuning:
-                            _fix_missing_no_grad(model)
-                            model.freeze()
-                        _apply_lora_at_paths(
-                            model, _saved_lora_paths, adapter_cfg,
-                            adapter_weights_file=adapter_weights_file,
-                        )
-                        _missing_before_load = _warn_missing_adapter_keys(
-                            model, adapter_weights_file,
-                        )
-                        if _missing_before_load:
-                            raise RuntimeError(
-                                "Unsloth MLX: saved LoRA tensors are missing "
-                                "or shape-incompatible with the exact module "
-                                "paths; refusing to load a partial adapter "
-                                f"({_missing_before_load[:5]!r})."
+                        if _saved_lora_paths:
+                            _unbacked_paths = sorted(
+                                path for path in _saved_lora_paths
+                                if set(_tensor_lora_shapes.get(path, ())) != {"a", "b"}
                             )
-                        model.load_weights(adapter_weights_file, strict=False)
-                    else:
-                        model = _load_pathless_mlx_adapter(
-                            model, local_path, adapter_weights_file,
-                            adapter_cfg, full_finetuning,
-                        )
-                        if os.path.exists(adapter_weights_file):
-                            _missing_after_load = _warn_missing_adapter_keys(
+                            if _unbacked_paths:
+                                raise RuntimeError(
+                                    "Unsloth MLX: saved LoRA module paths have no "
+                                    "complete A/B tensor pair; refusing to load a "
+                                    f"partial adapter ({_unbacked_paths[:5]!r})."
+                                )
+                        else:
+                            _validate_pathless_switch_adapter(
+                                model,
+                                _tensor_lora_shapes,
+                                adapter_cfg,
+                                adapter_weights_file,
+                            )
+                        # Without mlx_lm.tuner.dora, strict=False load would drop the saved `.m`.
+                        if adapter_cfg.get("fine_tune_type") == "dora":
+                            try:
+                                import mlx_lm.tuner.dora  # noqa: F401
+                            except Exception as _dora_exc:
+                                raise RuntimeError(
+                                    "Unsloth MLX: adapter_config declares "
+                                    "fine_tune_type='dora' but mlx_lm.tuner.dora "
+                                    "is unavailable; install a DoRA-capable "
+                                    "mlx-lm or convert the adapter to plain "
+                                    "LoRA before reload."
+                                ) from _dora_exc
+                        if _saved_lora_paths:
+                            if not full_finetuning:
+                                _fix_missing_no_grad(model)
+                                model.freeze()
+                            _apply_lora_at_paths(
+                                model, _saved_lora_paths, adapter_cfg,
+                                adapter_weights_file=adapter_weights_file,
+                            )
+                            _missing_before_load = _warn_missing_adapter_keys(
                                 model, adapter_weights_file,
                             )
-                            if _missing_after_load:
-                                _preview = ", ".join(_missing_after_load[:5])
-                                if len(_missing_after_load) > 5:
-                                    _preview += (
-                                        f", ... (+{len(_missing_after_load) - 5} more)"
-                                    )
+                            if _missing_before_load:
                                 raise RuntimeError(
-                                    "Unsloth MLX: load_adapters succeeded but "
-                                    f"{len(_missing_after_load)} saved LoRA "
-                                    "tensor(s) are missing or shape-incompatible "
-                                    "with the live module tree "
-                                    f"({_preview}). Refusing to return a "
-                                    "partially loaded adapter."
+                                    "Unsloth MLX: saved LoRA tensors are missing "
+                                    "or shape-incompatible with the exact module "
+                                    "paths; refusing to load a partial adapter "
+                                    f"({_missing_before_load[:5]!r})."
                                 )
+                            model.load_weights(adapter_weights_file, strict=False)
+                        else:
+                            model = _load_pathless_mlx_adapter(
+                                model, local_path, adapter_weights_file,
+                                adapter_cfg, full_finetuning,
+                            )
+                            if os.path.exists(adapter_weights_file):
+                                _missing_after_load = _warn_missing_adapter_keys(
+                                    model, adapter_weights_file,
+                                )
+                                if _missing_after_load:
+                                    _preview = ", ".join(_missing_after_load[:5])
+                                    if len(_missing_after_load) > 5:
+                                        _preview += (
+                                            f", ... (+{len(_missing_after_load) - 5} more)"
+                                        )
+                                    raise RuntimeError(
+                                        "Unsloth MLX: load_adapters succeeded but "
+                                        f"{len(_missing_after_load)} saved LoRA "
+                                        "tensor(s) are missing or shape-incompatible "
+                                        "with the live module tree "
+                                        f"({_preview}). Refusing to return a "
+                                        "partially loaded adapter."
+                                    )
                     # mlx-lm's load_adapters applies the adapter layers but,
                     # unlike get_peft_model, never freezes the base, so a fresh
                     # MLXTrainer would full-finetune it at a LoRA learning rate.
-                    # Skipped for full_finetuning, and when there are no LoRA
-                    # modules (a fine_tune_type="full" adapter) since that would
-                    # leave the model fully frozen.
-                    if not full_finetuning:
+                    if not full_finetuning and not adapter_cfg.get(
+                        "_unsloth_peft_import"
+                    ):
                         from .utils import iter_mlx_lora_modules
                         _lora_modules = list(iter_mlx_lora_modules(model))
                         if _lora_modules:
@@ -8665,6 +8842,18 @@ class FastMLXModel:
                     if os.path.exists(adapter_weights_file):
                         _unfreeze_saved_mlx_non_adapter_parameters(
                             model, adapter_weights_file,
+                        )
+                    if adapter_cfg.get("unsloth_peft_converted"):
+                        model._unsloth_peft_converted = True
+                    _fs_map = dict(adapter_cfg.get("full_state_modules") or {})
+                    if _fs_map and not adapter_cfg.get("_unsloth_peft_import"):
+                        from .utils import _mark_full_state_modules
+                        _mark_full_state_modules(
+                            model, _fs_map, adapter_weights_file,
+                            expected_shapes=_fs_prebind,
+                            trainable_paths=adapter_cfg.get(
+                                "full_state_trainable"
+                            ),
                         )
                     model = _eval_mlx_model_after_adapter_reload(model)
                     loaded_model_config = getattr(model, "_config", None)

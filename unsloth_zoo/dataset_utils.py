@@ -192,7 +192,42 @@ def _find_common_token_ids(component, tokenizer, force_match = False):
         return [], [], []
     optional_left  = original[:where]
     optional_right = original[where+len(substring):]
+    # Plain-text marker edges can BPE-merge with the next message (aya-vision-32b: ">" + "\\sigma" -> ">\\"),
+    # so make them optional, but only while an added token anchors the core: "Q:" -> "Q" hits user text.
+    start, end = _stable_marker_edges(component, original, tokenizer)
+    new_start, new_end = max(where, start), min(where + len(substring), end)
+    if new_end > new_start and (new_start, new_end) != (where, where + len(substring)):
+        added = getattr(tokenizer, "added_tokens_decoder", None) or {}
+        if any(str(added.get(i, "")).strip() for i in original[new_start:new_end]):
+            substring      = original[new_start:new_end]
+            optional_left  = original[:new_start]
+            optional_right = original[new_end:]
     return substring, optional_left, optional_right
+pass
+
+
+_MARKER_EDGE_PROBES = ("\\", "{", "a", "A", "1", "(", ".", "<", "}", ">")
+
+
+def _stable_marker_edges(component, original, tokenizer):
+    """(start, end) of the part of `original` that keeps its ids whatever text touches it."""
+    n = len(original)
+    start, end = 0, n
+    if n == 0:
+        return start, end
+    try:
+        for c in _MARKER_EDGE_PROBES:
+            right = tokenizer(component + c, add_special_tokens = False).input_ids
+            k = 0
+            while k < min(n, len(right)) and right[k] == original[k]: k += 1
+            end = min(end, k)
+            left = tokenizer(c + component, add_special_tokens = False).input_ids
+            k = 0
+            while k < min(n, len(left)) and left[len(left) - 1 - k] == original[n - 1 - k]: k += 1
+            start = max(start, n - k)
+    except Exception:
+        return 0, n
+    return start, end
 pass
 
 
@@ -884,8 +919,8 @@ def train_on_responses_only(
                         else: break
                     pass
                     for optional_right in A_right_forward:
-                        if k >= n_minus_1: break
-                        if optional_right == input_ids[k+1]: k += 1
+                        if k >= n: break
+                        if optional_right == input_ids[k]: k += 1
                         else: break
                     pass
                     # assistant_j = j
@@ -920,16 +955,15 @@ def train_on_responses_only(
                                 else: break
                             pass
                             for optional_right in Q_right_forward:
-                                if k >= n_minus_1: break
-                                if optional_right == input_ids[k+1]: k += 1
+                                if k >= n: break
+                                if optional_right == input_ids[k]: k += 1
                                 else: break
                             pass
                             user_j = j
                             # Account for last item
                             if user_j != n_minus_1:
-                                # user_k = k
-                                # j = user_k
-                                j = k
+                                # Outer j += 1 lands on k, so an empty user turn cannot hide the next marker.
+                                j = k - 1
                             else:
                                 user_j = n
                                 k = n

@@ -164,6 +164,9 @@ DISABLE_COMPILE_FUNCTIONS = [
     # nothing today; it is here so one that goes back to importing it by name, the
     # way transformers 5.2 does for chunk_gated_delta_rule, stays uncompiled.
     "recurrent_gated_delta_rule",
+    # KDA chunk fallback (glm5_next, kimi_linear): Inductor unrolls the per-chunk loop, 25+ min AOT compile.
+    # recurrent_kimi_delta_attention stays compiled: decode only (seq_len 1), 2x faster than eager.
+    "chunk_kimi_delta_attention",
 
     # transformers 5.9+ VL files import these; `grid_thw.tolist()` builds shapes from
     # unbacked SymInts, so fullgraph = True is a hard error on the first vision forward.
@@ -190,6 +193,13 @@ DISABLE_COMPILE_FUNCTIONS = [
     "get_vision_frame_index",           # kimi_k25
     "get_vision_temporal_merge_index",  # kimi_k25
 ]
+
+
+# Per model_type DISABLE_COMPILE_FUNCTIONS. deepseek_v4 rope: dynamic = True Inductor backward of its
+# trailing `x[..., -rope_dim:]` slice reads out of bounds, giving wrong / NaN grads (pytorch#198553).
+DISABLE_COMPILE_MODEL_FUNCTIONS = {
+    "deepseek_v4": ["apply_rotary_pos_emb"],
+}
 
 
 def calls_disable_compile_function(source, disable_compile_functions):
@@ -1814,6 +1824,15 @@ def _verify_compiled_cache_file_collectively(
     if error is not None:
         raise error
 pass
+
+_HUB_KERNEL_WRAPPER_RE = re.compile(r"^[ \t]*@use_kernel_func_from_hub_with_fallback\b", flags = re.MULTILINE)
+
+
+def is_hub_kernel_wrapper(source):
+    # Emit bare: on torch 2.11 is_exporting() is True inside a compile trace, so the wrapper runs its torch reference (a None stub for Nemotron-H mamba2).
+    return bool(_HUB_KERNEL_WRAPPER_RE.search(source or ""))
+pass
+
 
 def create_new_function(
     name,
@@ -4709,6 +4728,22 @@ def patch_gradient_accumulation(modeling_file, module):
 pass
 
 
+# transformers' AyaVision forward drops the text logit_scale CohereForCausalLM applies (Command-A vision ships 1.0).
+_DROPPED_TEXT_LOGIT_SCALE = ("AyaVisionForConditionalGeneration",)
+
+
+def fixup_dropped_logit_scale(source, module = None):
+    if module not in _DROPPED_TEXT_LOGIT_SCALE or "logit_scale" in source:
+        return source
+    return re.sub(
+        r"^([ \t]+)(logits = self\.lm_head\(hidden_states[^\n]*\))[ \t]*$",
+        r"\1\2\n\1logits = logits * self.config.text_config.logit_scale",
+        source,
+        count = 1,
+        flags = re.MULTILINE,
+    )
+
+
 # Pre fix up some modules like Gemma3n
 def fixup_fused_lm_head(source):
     # Gemma 3N
@@ -5379,6 +5414,7 @@ def unsloth_compile_transformers(
     # Later `eval(model_location)` calls need `transformers` bound in globals
     exec("import transformers", globals())
     disable_compile_functions = set(DISABLE_COMPILE_FUNCTIONS)
+    disable_compile_functions.update(DISABLE_COMPILE_MODEL_FUNCTIONS.get(model_type, ()))
 
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__"):
         # Get __UNSLOTH_SUPPORTS_SDPA__
@@ -6197,6 +6233,7 @@ def unsloth_compile_transformers(
                     continue
                 # Fix some arguments up like for Gemma 3N
                 new_source = fixup_fused_lm_head(source)
+                new_source = fixup_dropped_logit_scale(new_source, module)
                 # Apply fused LM transforms
                 new_source, supports_return_hidden_states = apply_fused_lm_head(
                     new_source, module
@@ -6582,6 +6619,11 @@ def unsloth_compile_transformers(
                     bad = True
                     bad_reason = "disabled keyword is in it"
                     break
+            pass
+            # DISABLE_COMPILE_FUNCTIONS names keep the stronger @torch.compiler.disable below.
+            if not bad and module not in disable_compile_functions and is_hub_kernel_wrapper(source):
+                bad = True
+                bad_reason = "it dispatches to an external kernel package"
             pass
             # Skipped for a DISABLE_COMPILE_FUNCTIONS name: `@torch.compiler.disable`
             # also stops Dynamo inlining it into a compiled caller, so downgrading it

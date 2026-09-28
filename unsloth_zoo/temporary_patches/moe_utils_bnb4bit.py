@@ -1339,16 +1339,12 @@ def _bnb4bit_per_expert_conversions(model_conversions, hf_quantizer):
     return twins
 
 
-# Unsloth Llama-4 bnb-4bit uploads store experts fused but as split 2-D gate / up / down
-# weights; transformers' pre-quantized swap to SequentialLlama4TextExperts drops them and
-# crashes initialising packed uint8 storage, so keep the fused module and load the bytes.
-# `(?:^|\.)` keeps `shared_experts.` (DeepSeek-style) out.
+# Unsloth Llama-4 bnb-4bit uploads store fused experts as split gate/up/down; `(?:^|\.)` excludes `shared_experts.`.
 _FUSED_EXPERT_KEY_RE = re.compile(r"(?:^|\.)experts\.(?:gate_up_proj|gate_proj|up_proj|down_proj)(?:\.|$)")
 _PER_EXPERT_KEY_RE = re.compile(r"(?:^|\.)experts\.\d+\.")
 
 
 def _checkpoint_expert_layout(checkpoint_files) -> Optional[str]:
-    """"fused" / "per_expert" from safetensors headers only; None when unknown."""
     if not checkpoint_files:
         return None
     if isinstance(checkpoint_files, (str, os.PathLike)):
@@ -1430,7 +1426,6 @@ pass
 
 
 def patch_bnb4bit_keep_fused_experts():
-    """Skip the per-expert swap when the pre-quantized checkpoint stores experts fused."""
     try:
         from transformers.quantizers.quantizer_bnb_4bit import Bnb4BitHfQuantizer
         import transformers.quantizers.base as quantizers_base
@@ -1477,11 +1472,7 @@ pass
 
 
 def _bnb4bit_split_fused_expert_conversions():
-    """Load split `experts.{gate,up,down}_proj.weight` into kept-fused stacks.
-
-    Block-aligned `inter`: packed bytes + absmax concatenate row-wise (bit-exact);
-    otherwise dequantize, concatenate, requantize.
-    """
+    """Block-aligned `inter` splices packed bytes + absmax (bit-exact); else dequantize, concatenate, requantize."""
     from transformers.core_model_loading import WeightConverter, ConversionOps
     from transformers.quantizers.quantizers_utils import get_module_from_name
     from bitsandbytes.functional import QuantState

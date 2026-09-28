@@ -603,6 +603,7 @@ class LoraStats:
     lora_B : torch.Tensor
     alpha  : float
     magnitude : object = None   # DoRA lora_magnitude_vector weight (None for plain LoRA)
+    parameter_name : object = None  # PEFT ParamWrapper target (MoE experts), e.g. "up_proj"
 pass
 
 
@@ -725,6 +726,7 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
 
         elif isinstance(module, Linear_LoRA_Layers):
             lora_weights[name].alpha = _get_lora_scaling(module)
+            lora_weights[name].parameter_name = getattr(module, "parameter_name", None)
             scaling_count += 1
             expand_module_keys(name, module, remove_keys)
 
@@ -735,6 +737,7 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
             (hasattr(module, "lora_A") or hasattr(module, "lora_B")) and \
             (hasattr(module, "active_adapters") or hasattr(module, "active_adapter")):
             lora_weights[name].alpha = _get_lora_scaling(module)
+            lora_weights[name].parameter_name = getattr(module, "parameter_name", None)
             scaling_count += 1
             expand_module_keys(name, module, remove_keys)
 
@@ -1611,6 +1614,16 @@ def _merge_moe_gate_or_up_expert(W, lora_stats, expert_idx, num_experts, output_
             num_experts = num_experts, out_dim = 2 * I, in_dim = H,
             lora_module = getattr(lora_stats, "module", None),
         )
+        # Ungated experts (NemotronH) have an I-wide up LoRA; a fused 2 * I LoRA never matches this, so gated models are unaffected.
+        ungated = False
+        if layout == "unknown" and role == "up":
+            ungated_layout, ungated_r = _detect_moe_lora_layout(
+                lora_stats.lora_A, lora_stats.lora_B,
+                num_experts = num_experts, out_dim = I, in_dim = H,
+                lora_module = getattr(lora_stats, "module", None),
+            )
+            if ungated_layout != "unknown" and ungated_r > 0:
+                layout, r, ungated = ungated_layout, ungated_r, True
         if layout == "unknown" or r <= 0:
             _record_moe_merge_fallback(
                 role, expert_idx,
@@ -1636,13 +1649,13 @@ def _merge_moe_gate_or_up_expert(W, lora_stats, expert_idx, num_experts, output_
         b_f     = b_slice.to(device, dtype = torch.float32, non_blocking = True)
 
         if layout == "swapped":
-            half = a_f[:, :I] if role == "gate" else a_f[:, I:]
+            half = a_f if ungated else (a_f[:, :I] if role == "gate" else a_f[:, I:])
             delta = b_f @ half
             merged = W.to(device, dtype = torch.float32, non_blocking = True).add(
                 delta.transpose(0, 1), alpha = lora_stats.alpha,
             )
         else:
-            half = b_f[:I, :] if role == "gate" else b_f[I:, :]
+            half = b_f if ungated else (b_f[:I, :] if role == "gate" else b_f[I:, :])
             delta = half @ a_f
             merged = W.to(device, dtype = torch.float32, non_blocking = True).add(
                 delta, alpha = lora_stats.alpha,
@@ -1966,7 +1979,15 @@ def _merge_moe_experts_file(mm, header_metadata, length_of_header, file, convert
         shard_prefix = _moe_lora_to_shard_prefix.get(lora_key)
         if shard_prefix is None:
             continue
-        is_gate = lora_key.endswith(".base_layer")
+        # A lone expert LoRA sits on `experts` whatever it targets, so the wrapped parameter
+        # decides; by key alone an up_proj-only LoRA was merged into down_proj.
+        _param_name = getattr(lora_stats, "parameter_name", None)
+        if _param_name in ("gate_up_proj", "gate_proj", "up_proj"):
+            is_gate = True
+        elif _param_name == "down_proj":
+            is_gate = False
+        else:
+            is_gate = lora_key.endswith(".base_layer")
         prefix = shard_prefix
 
         # Handle GPT-OSS fused 3D tensor format
@@ -2642,8 +2663,8 @@ pass
 _FP8_WEIGHT_DTYPES = tuple(
     getattr(torch, _n) for _n in ("float8_e4m3fn", "float8_e5m2") if hasattr(torch, _n)
 )
-_FP8_SCALE_SUFFIXES = (".weight_scale_inv", ".weight_scale", ".input_scale",
-                       "_scale_inv", "_scale")
+_FP8_SCALE_SUFFIXES = (".weight_scale_inv", ".weight_scale", ".input_scale", ".activation_scale",
+                       "_input_scale", "_activation_scale", "_scale_inv", "_scale")
 # safetensors header dtype tags for FP8 weights (used to find genuine scale companions).
 _FP8_HEADER_DTYPES = ("F8_E4M3", "F8_E5M2")
 
@@ -2752,7 +2773,7 @@ pass
 def _fp8_scale_key_weight_bases(scale_key):
     """Candidate FP8 weight keys a companion scale belongs to (most specific suffix wins),
     used to drop a scale whose dequantized weight lives in another shard."""
-    for suffix in (".weight_scale_inv", ".weight_scale", ".input_scale", "_scale_inv", "_scale"):
+    for suffix in _FP8_SCALE_SUFFIXES:
         if scale_key.endswith(suffix):
             base = scale_key[: -len(suffix)]
             return (base + ".weight", base)  # .weight_* -> <base>.weight ; fused -> <base>

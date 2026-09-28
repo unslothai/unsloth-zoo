@@ -195,15 +195,18 @@ def _mark_fla_disabled_no_dot_instructions():
 
 
 # transformers' pure-torch l2norm reduces in the input dtype; in fp16 it overflows to
-# inf and gives NaN grads in eager mode (RX 5700 XT). fla reduces in float32.
+# inf and gives NaN grads in eager mode (RX 5700 XT). fla reduces in float32. Up to at least
+# transformers 5.5 torch_chunk_gated_delta_rule calls it before casting to float32, so any host
+# that takes the pure-torch path in float16 (no Triton/CUDA, the Hopper opt-out, RDNA1) needs it;
+# later releases cast first, where this is a no-op in effect.
 _L2NORM_FP32_MARK = "_unsloth_fp32_l2norm"
 
 
 def _fp32_l2norm(x, dim = -1, eps = 1e-6):
-    """``l2norm`` with the reduction in float32, result in the input dtype: what fla's kernel does."""
+    """``l2norm`` with the reduction in at least float32, result in the input dtype: what fla's kernel does."""
     import torch
 
-    xf = x.float()
+    xf = x.float() if x.dtype in (torch.float16, torch.bfloat16) else x
     inv_norm = torch.rsqrt((xf * xf).sum(dim = dim, keepdim = True) + eps)
     return (xf * inv_norm).to(x.dtype)
 
@@ -929,6 +932,13 @@ def patch_vendor_fla(phase=None):
     try:
         return _patch_vendor_fla(phase)
     finally:
+        # Whichever way the kernels were resolved, the pure-torch fallback is what runs when
+        # they are not, and it must not overflow in float16. Only that fallback calls l2norm.
+        try:
+            _patch_l2norm_fp32_on_torch_path()
+        except Exception as e:
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.warning(f"Unsloth: could not make the pure-torch l2norm reduce in float32: {e}")
         if _gpu_lacks_dot_instructions():
             # RDNA1: never make fla reachable; force the torch fallback, no alias/repair.
             try:

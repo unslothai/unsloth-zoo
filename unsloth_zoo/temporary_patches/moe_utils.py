@@ -360,9 +360,8 @@ def _grouped_mm_with_backward_fix(
 
     Forcing weight.contiguous() copies the frozen base stack (~805 MB for gate_up on Qwen3-30B,
     ~57% of MoE GPU time) every step. torch._grouped_mm takes the non-contiguous view directly,
-    but some CUDA builds silently miscompute it (pytorch/pytorch#186365), so we only skip the
-    copy when a one-time probe proves the view path matches the contiguous one; else we keep the
-    always-correct copy. Falls back to a per-group matmul when the device has no
+    and a one-time probe confirms the view matches the contiguous copy on this device before we
+    skip the copy; else we keep the copy. Falls back to a per-group matmul when the device has no
     torch._grouped_mm, and on the 16-byte stride error. Bit-exact vs the always-contiguous
     path in forward and backward.
     """
@@ -374,7 +373,7 @@ def _grouped_mm_with_backward_fix(
     if not _check_torch_grouped_mm_supported():
         return _manual_grouped_mm(inputs, weight, offsets)
     if not _transposed_view_grouped_mm_is_safe():
-        weight = weight.contiguous()   # #186365: view path unproven on this build -> safe copy
+        weight = weight.contiguous()   # view path unproven on this device -> safe copy
     try:
         return torch._grouped_mm(inputs, weight, offs=offsets)
     except RuntimeError as exc:
@@ -855,9 +854,8 @@ def _probe_torch_grouped_mm_supported():
     return _TORCH_GROUPED_MM_SUPPORTED
 
 
-# Some CUDA builds silently miscompute torch._grouped_mm for a transposed bf16 view preceded by a
-# broadcast op (pytorch/pytorch#186365, Blackwell + torch 2.11/2.13). This probe checks the view
-# matches the contiguous copy so _grouped_mm_with_backward_fix can skip the copy only when safe.
+# One-time check that torch._grouped_mm on a transposed bf16 view matches the contiguous copy. Insurance
+# only: pytorch/pytorch#186365 was a usage error (offs must be cumulative group ends), no view miscompute is known.
 _TRANSPOSED_VIEW_GROUPED_MM_SAFE = None
 
 
@@ -893,7 +891,7 @@ def _probe_transposed_view_grouped_mm_is_safe():
             ok, ref = True, None
             for _ in range(6):
                 row_wise_max = A.abs().amax(dim=-1, keepdim=True)
-                _ = A / (row_wise_max / 448.0)     # the #186365 trigger (result discarded)
+                _ = A / (row_wise_max / 448.0)     # allocator churn from the #186365 report
                 r_view = torch._grouped_mm(A, w_t, offs=offs)
                 r_contig = torch._grouped_mm(A, w_tc, offs=offs)
                 if (r_view - r_contig).abs().max().item() > 1e-2:   # view disagrees with contiguous
@@ -2601,37 +2599,21 @@ def _forward_statically_reads_stash(experts_module):
     """
     # This Unsloth Zoo code section is licensed under AGPL3
 
-    forward = getattr(experts_module, "forward", None)
+    # Not getattr(module, "forward").__func__: torch 2.14 Dynamo then raises AttributeError('__globals__').
+    try:
+        forward = experts_module.__dict__.get("forward")
+    except AttributeError:
+        forward = None
+    if forward is None:
+        forward = getattr(type(experts_module), "forward", None)
     forward = getattr(forward, "__func__", forward)
     code = getattr(forward, "__code__", None)
     if code is None:
         return None
 
-    # Keyed on the code objects themselves, never on id(). Tracing id(forward) makes
-    # Dynamo guard the expression it tracked, `experts_module.forward`, a bound method
-    # CPython reallocates on every access, so ___check_obj_id can never match again and
-    # Dynamo raises "Guard failed on the same frame it was created" under both fullgraph
-    # settings with no eager fallback. Code objects are hashable, stable and 1:1 with the
-    # functions here, so they also make the separate function set redundant.
-    # Keyed on the code objects themselves, never on id(), and remembering the SHALLOWEST
-    # depth each was reached at. A plain visited set makes the answer depend on the hash
-    # seed: a helper reachable both directly and through a chain can be popped first at
-    # the depth limit, where its own callees are not followed, and the later shallow entry
-    # is then dropped as already seen. Measured on a synthetic forward with both routes,
-    # 5 of 14 PYTHONHASHSEED values returned False for a forward that does reach the
-    # stash, which would send that compiled cold start down the failing PEFT path.
-    # A LIST keyed by `is`, not a dict and not id().
-    #
-    # Equality is wrong: two functions compiled from identical source at the same filename
-    # and name have code objects that compare and hash equal while being distinct objects
-    # with different __globals__, so a dict collapses them and the scan misses whichever
-    # route is second.
-    #
-    # id() is right but untraceable: Dynamo rejects it on a code object with
-    # "Unsupported: id() with unsupported args" on some torch versions, which is a hard
-    # compile failure in the branch that exists to keep compilation working. `is` gives
-    # the same identity semantics and traces everywhere. The list stays tiny, bounded by
-    # the depth limit, so the linear scan costs nothing.
+    # (code, shallowest depth) pairs matched by `is`: id() is untraceable on some torch versions,
+    # equality merges same-source functions with different __globals__, and a plain visited set
+    # makes a helper first reached at the depth limit hide its deeper callees (hash-seed dependent).
     seen_code = []
     pending = [(code, getattr(forward, "__globals__", {}), 0)]
 
@@ -2643,13 +2625,6 @@ def _forward_statically_reads_stash(experts_module):
 
     while pending:
         current, namespace, depth = pending.pop()
-        # Keyed by IDENTITY, not equality. Two functions compiled from identical source at
-        # the same filename and name have code objects that compare equal and hash equal
-        # while being distinct objects with different __globals__, so a dict keyed on the
-        # code objects themselves collapses them: if the first resolves its names to an
-        # unrelated helper and the second to take_moe_lora_stash, the second is skipped
-        # and the scan wrongly answers False. `alive` holds a reference to everything
-        # visited, so no id() can be recycled by the collector mid-walk.
         if _visited_at_or_above(current, depth):
             continue
         seen_code.append((current, depth))
@@ -3293,6 +3268,123 @@ def write_fused_expert_lora_layout(peft_model, save_directory, selected_adapters
     return written
 
 
+_LORA_INTERNAL_NAMES = frozenset((
+    "base_layer", "lora_A", "lora_B", "lora_dropout", "lora_embedding_A",
+    "lora_embedding_B", "lora_magnitude_vector",
+))
+
+
+def _lora_wrapped_module_names(base_model, adapter_name):
+    """(module names wrapped by `adapter_name`, whether it also has a fused expert parameter LoRA)."""
+    wrapped, has_param_lora = [], False
+    for name, module in base_model.named_modules():
+        # nn.Embedding LoRA lives in lora_embedding_A, its lora_A stays empty.
+        if not any(
+            hasattr(d, "keys") and adapter_name in d
+            for d in (getattr(module, "lora_A", None), getattr(module, "lora_embedding_A", None))
+        ):
+            continue
+        if getattr(module, "parameter_name", None):
+            has_param_lora = True
+            continue
+        if hasattr(module, "base_layer"):
+            wrapped.append(name)
+    return wrapped, has_param_lora
+
+
+def _target_regex_for(names, all_names):
+    """Fullmatch regex selecting exactly `names`; layer indices collapse to \\d+ only if that adds nothing."""
+    import re
+    wanted = set(names)
+    collapsed = sorted({re.sub(r"\\\.\d+(?=\\\.|$)", r"\\.\\d+", re.escape(n)) for n in wanted})
+    regex = "(?:" + "|".join(collapsed) + ")"
+    if {n for n in all_names if re.fullmatch(regex, n)} == wanted:
+        return regex
+    return "(?:" + "|".join(re.escape(n) for n in sorted(wanted)) + ")"
+
+
+def portable_lora_target_modules(peft_model, adapter_name, target_modules):
+    """`target_modules` that plain PEFT loads as Unsloth trained, or None if already fine (list form only).
+
+    Gemma 4: LoRA sits on the inner `.linear`; plain PEFT would pick the unsupported wrapper, so write a regex.
+    Fused experts: unmatched gate_proj / up_proj make PEFT's v5 MoE conversion double gate_up_proj's rank; drop them.
+    """
+    if not isinstance(target_modules, (list, tuple, set)) or not target_modules:
+        return None
+    try:
+        base_model = peft_model.get_base_model()
+    except Exception:
+        base_model = getattr(getattr(peft_model, "base_model", None), "model", None)
+    if base_model is None:
+        return None
+    wrapped, has_param_lora = _lora_wrapped_module_names(base_model, adapter_name)
+    targets = [t for t in target_modules if isinstance(t, str)]
+    if len(targets) != len(target_modules):
+        return None
+
+    def hit(key, target):
+        return key == target or key.endswith("." + target)
+
+    redirected = [
+        n for n in wrapped
+        if n.endswith(".linear") and any(hit(n[: -len(".linear")], t) for t in targets)
+    ]
+    if redirected:
+        all_names = [
+            n for n, _ in base_model.named_modules()
+            if n and not (set(n.split(".")) & _LORA_INTERNAL_NAMES)
+        ]
+        return _target_regex_for(wrapped, all_names)
+    if has_param_lora:
+        kept = [t for t in targets if any(hit(n, t) for n in wrapped)]
+        if len(kept) != len(targets):
+            return sorted(kept)
+    return None
+
+
+def _redirected_patterns(peft_model, adapter_name, patterns):
+    """Add a `(?:key)\\.linear` twin for each rank/alpha pattern key that matched a redirected
+    wrapper, since PEFT fullmatches `(.*\\.)?(key)$` against the inner `.linear` on reload."""
+    import re
+    if not isinstance(patterns, dict) or not patterns:
+        return patterns
+    wrapped, _ = _lora_wrapped_module_names(peft_model.get_base_model(), adapter_name)
+    inner = [n[: -len(".linear")] for n in wrapped if n.endswith(".linear")]
+    out = dict(patterns)
+    for key, value in patterns.items():
+        twin = f"(?:{key})\\.linear"
+        if twin not in out and any(re.match(rf"(.*\.)?({key})$", n) for n in inner):
+            out[twin] = value
+    return out
+
+
+def write_portable_target_modules(peft_model, save_directory, selected_adapters = None):
+    """Rewrite saved `target_modules` per `portable_lora_target_modules`; returns paths written."""
+    written = []
+    for adapter_name, path in _fused_expert_lora_adapter_config_paths(
+        peft_model, save_directory, selected_adapters,
+    ):
+        with open(path, "r", encoding = "utf-8") as f:
+            config = json.load(f)
+        if not isinstance(config, dict):
+            continue
+        replacement = portable_lora_target_modules(
+            peft_model, adapter_name, config.get("target_modules"),
+        )
+        if replacement is None:
+            continue
+        config["target_modules"] = replacement
+        if isinstance(replacement, str):
+            for field in ("rank_pattern", "alpha_pattern"):
+                config[field] = _redirected_patterns(peft_model, adapter_name, config.get(field))
+            # PEFT rejects layer selectors beside a str target; the regex already names only those layers.
+            config["layers_to_transform"] = None
+            config["layers_pattern"] = None
+        _atomic_write_text(path, json.dumps(config, indent = 2, sort_keys = True))
+        written.append(path)
+    return written
+
+
 def _atomic_write_text(path, text):
     """Replace `path` with `text`, or leave it exactly as it was.
 
@@ -3379,6 +3471,21 @@ def _patched_peft_model_save_pretrained(self, save_directory, *args, **kwargs):
             if logger is not None:
                 logger.warning(
                     f"Unsloth: could not record the fused MoE expert LoRA layout in "
+                    f"adapter_config.json ({type(exception).__name__}: {exception}). The "
+                    f"adapter itself saved correctly."
+                )
+        try:
+            write_portable_target_modules(
+                self, save_directory,
+                selected_adapters = _save_pretrained_argument(
+                    "selected_adapters", None, args, kwargs,
+                ),
+            )
+        except Exception as exception:
+            logger = _moe_utils_logger()
+            if logger is not None:
+                logger.warning(
+                    f"Unsloth: could not rewrite target_modules for plain PEFT in "
                     f"adapter_config.json ({type(exception).__name__}: {exception}). The "
                     f"adapter itself saved correctly."
                 )

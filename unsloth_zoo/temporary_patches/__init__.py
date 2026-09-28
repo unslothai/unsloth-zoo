@@ -19,6 +19,7 @@ from .common import *
 from .fla_vendor import *
 from .gemma import *
 from .misc import *
+from .granitemoehybrid import *
 from .gemma3n import *
 from .gemma4 import *
 from .gemma4_float32 import *
@@ -33,6 +34,7 @@ from .qwen3_next_moe import *
 from .qwen3_5_moe import *
 from .glm4_moe import *
 from .deepseek_v3_moe import *
+from .deepseek_v4 import *
 from .gemma4_moe import *
 from .lfm2_moe import *
 from .step3p7_moe import *
@@ -41,6 +43,7 @@ from .llama4_moe import *
 from .inkling import *
 from .compiled_model_identity import *
 from .bitsandbytes_large_tensors import *
+from .remote_mamba2 import *
 from .ernie4_5_moe import *
 from .pixtral import *
 from .ministral import *
