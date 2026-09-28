@@ -1420,9 +1420,6 @@ pass
 TEMPORARY_PATCHES.append(patch_mamba_fused_split_without_causal_conv1d)
 
 
-# Hub kernel names whose code is the pip package of the same name (underscored). Remote modeling code
-# written for older transformers (nvidia Nemotron-3-Nano-Omni's modeling_nemotron_h.py) resolves its
-# Mamba kernels with lazy_load_kernel("mamba-ssm") / lazy_load_kernel("causal-conv1d").
 _LOCAL_KERNEL_PACKAGES = {
     "mamba-ssm"     : ("mamba_ssm", "ops.triton.ssd_combined"),
     "causal-conv1d" : ("causal_conv1d", None),
@@ -1435,7 +1432,6 @@ def _local_kernel_fallback_allowed():
     if not torch.cuda.is_available() or getattr(torch.version, "hip", None) is not None:
         return False
     try:
-        # Same line as patch_mamba_ssm_pre_ampere_fallback: the Triton kernels need sm_80+.
         return torch.cuda.get_device_capability() >= (8, 0)
     except Exception:
         return False
@@ -1443,13 +1439,7 @@ pass
 
 
 def patch_lazy_load_kernel_local_packages():
-    # transformers 5.17 dropped "mamba-ssm" / "causal-conv1d" from _HUB_KERNEL_MAPPING, and
-    # lazy_load_kernel returns None for any name missing from it WITHOUT trying the local package
-    # (integrations/hub_kernels.py:742-745). Older releases fell back to `import mamba_ssm` when the
-    # `kernels` library was absent. So remote code that asks for these kernels always takes its torch
-    # reference Mamba path even with working mamba_ssm + causal_conv1d wheels installed ("The fast path
-    # is not available ..."). Restore the local-package fallback for those two names only; names in the
-    # Hub mapping and every other name are untouched.
+    # transformers 5.17 dropped mamba-ssm / causal-conv1d from _HUB_KERNEL_MAPPING; lazy_load_kernel returns None for unmapped names without trying the local package.
     if not _local_kernel_fallback_allowed():
         return
     try:
@@ -1468,7 +1458,7 @@ def patch_lazy_load_kernel_local_packages():
         try:
             module = importlib.import_module(package)
             if submodule is not None:
-                # A broken install (e.g. a truncated ssd_chunk_scan.py) fails here, not mid-forward.
+                # Import ssd_combined so a broken install falls back to None, not a mid-forward crash.
                 importlib.import_module(f"{package}.{submodule}")
             return module
         except Exception as e:
@@ -1495,7 +1485,7 @@ def patch_lazy_load_kernel_local_packages():
     lazy_load_kernel._unsloth_local_packages = True
     lazy_load_kernel._unsloth_original = original
     hub_kernels.lazy_load_kernel = lazy_load_kernel
-    # `from transformers.integrations import lazy_load_kernel` reads the lazy package namespace.
+    # `from transformers.integrations import lazy_load_kernel` reads the package namespace.
     try:
         import transformers.integrations as integrations
         integrations.lazy_load_kernel = lazy_load_kernel
