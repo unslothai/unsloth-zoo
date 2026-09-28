@@ -164,9 +164,7 @@ DISABLE_COMPILE_FUNCTIONS = [
     # nothing today; it is here so one that goes back to importing it by name, the
     # way transformers 5.2 does for chunk_gated_delta_rule, stays uncompiled.
     "recurrent_gated_delta_rule",
-    # Kimi delta attention (KDA) torch fallbacks (glm5_next, kimi_linear) when fla has no
-    # KDA kernel: a 63 step in-place Python loop per chunk that Inductor unrolls. The first
-    # grad-mode call (the gradient checkpoint replay) sat in AOT compile for over 25 minutes.
+    # KDA torch fallbacks (glm5_next, kimi_linear): Inductor unrolls the per-chunk loop, 25+ min AOT compile.
     "chunk_kimi_delta_attention",
     "recurrent_kimi_delta_attention",
 

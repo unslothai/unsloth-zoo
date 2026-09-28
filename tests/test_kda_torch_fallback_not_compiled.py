@@ -14,10 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The torch fallbacks of Kimi delta attention (glm5_next, kimi_linear) must stay eager.
-chunk_kimi_delta_attention is a 63 step in-place loop per 64 token chunk; compiled with
-fullgraph it spent over 25 minutes in AOT compile on the first gradient checkpoint replay
-of GLM-5.3-Flash."""
+"""Kimi delta attention torch fallbacks (glm5_next, kimi_linear) must stay eager: compiled, the chunk loop
+took 25+ minutes of AOT compile on GLM-5.3-Flash's first checkpoint replay."""
 
 import importlib.util
 import json
@@ -60,8 +58,12 @@ print("@@@" + json.dumps(out))
 
 @pytest.mark.parametrize("model_type", ["glm5_next", "kimi_linear"])
 def test_kda_fallbacks_not_wrapped_in_torch_compile(model_type, tmp_path):
-    if importlib.util.find_spec(f"transformers.models.{model_type}.modeling_{model_type}") is None:
-        pytest.skip(f"transformers has no {model_type}")
+    try:
+        spec = importlib.util.find_spec(f"transformers.models.{model_type}.modeling_{model_type}")
+    except ModuleNotFoundError:  # parent package missing on older transformers
+        spec = None
+    if spec is None:
+        pytest.skip(reason = f"installed transformers predates {model_type}")
     env = dict(os.environ)
     env["UNSLOTH_ALLOW_CPU"] = "1"
     env["UNSLOTH_ZOO_DISABLE_GPU_INIT"] = "1"
@@ -74,5 +76,5 @@ def test_kda_fallbacks_not_wrapped_in_torch_compile(model_type, tmp_path):
     payload = next(json.loads(l[3:]) for l in r.stdout.splitlines() if l.startswith("@@@"))
     for name, head in payload.items():
         if head is None:
-            continue  # emitted by import, not by source: nothing to wrap
+            continue  # imported, not emitted from source
         assert "torch_compile_with_fallback" not in head and "torch.compile(" not in head, (name, head)
