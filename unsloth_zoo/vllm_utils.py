@@ -1335,11 +1335,11 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             state_dict[f"{vllm_text_model_prefix}.layers.{kk}.layer_scalar"] = layer.layer_scalar.data
             quant_state_dict[f"{vllm_text_model_prefix}.layers.{kk}.layer_scalar"] = layer.layer_scalar.data
 
+        # LFM2: vLLM fuses HF w1 (gate) + w3 (up) as w13 (w1 in vLLM <= 0.15)
         feed_forward = getattr(layer, "feed_forward", None)
-        if not hasattr(layer, "mlp") and hasattr(feed_forward, "w2"):
-            # LFM2: vLLM fuses HF w1 (gate) + w3 (up) as w13 (w1 in older vLLM)
+        w13 = getattr(feed_forward, "w13", None) or getattr(feed_forward, "w1", None)
+        if not hasattr(layer, "mlp") and w13 is not None:
             prefix = f"{vllm_text_model_prefix}.layers.{kk}.feed_forward"
-            w13 = getattr(feed_forward, "w13", None) or feed_forward.w1
             get_state_dict(f"{prefix}.w1", 0, state_dict, w13)
             get_state_dict(f"{prefix}.w3", 1, state_dict, w13)
             get_state_dict(f"{prefix}.w2", 0, state_dict, feed_forward.w2)
