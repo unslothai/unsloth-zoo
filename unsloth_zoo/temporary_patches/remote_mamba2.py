@@ -14,20 +14,10 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Repair the torch reference Mamba2 path of remote (trust_remote_code) NemotronH modeling code.
-
-nvidia Nemotron-3-Nano-Omni's modeling_nemotron_h.py, NemotronHMamba2Mixer.torch_forward (the path taken
-without mamba_ssm / causal_conv1d: no wheels, pre-Ampere, ROCm, or no CUDA) has two defects that
-transformers' own Mamba2 / NemotronH / Bamba torch paths do not:
- 1. The inter-chunk state pass sums over the TARGET chunk axis: decay_chunk is [b, h, target, source] and
-    `(decay_chunk[..., None, None] * states_permuted[:, :, None, ...]).sum(dim=2)` must reduce `source`
-    (dim=3). Every token after the first chunk_size tokens reads the wrong state (float64: 7.6% relative
-    error against the exact recurrence on a real layer, 6e-8 with dim=3).
- 2. `dt = torch.clamp(dt, self.time_step_min)` floors dt at time_step_min (0.001), while the fused kernels
-    and transformers clamp to time_step_limit ((0, inf) for Nemotron-3-Nano-Omni, i.e. no floor).
-Remote classes only exist once `from_pretrained` imports them, so the fix hooks
-`transformers.dynamic_module_utils.get_class_in_module`, which every remote class load passes through.
-UNSLOTH_REMOTE_MAMBA2_FIX=0 disables it.
+"""Repair remote NemotronH NemotronHMamba2Mixer.torch_forward (the no-mamba_ssm path): the inter-chunk sum must
+reduce the source chunk axis (dim=3; decay_chunk is [b, h, target, source], not transposed), and dt must clamp to
+time_step_limit like the remote fused path, not floor at time_step_min. Remote classes load via
+transformers.dynamic_module_utils.get_class_in_module, so that is hooked. UNSLOTH_REMOTE_MAMBA2_FIX=0 disables.
 """
 
 import functools
@@ -53,7 +43,6 @@ _MAMBA2_GOOD_CLAMP = (
 
 
 def repair_remote_mamba2_torch_forward(cls):
-    """Rewrite a remote Mamba2 mixer's torch_forward without the two defects above. True if rewritten."""
     if not isinstance(cls, type) or os.environ.get("UNSLOTH_REMOTE_MAMBA2_FIX", "1") == "0":
         return False
     fn = cls.__dict__.get("torch_forward", None)
@@ -63,7 +52,6 @@ def repair_remote_mamba2_torch_forward(cls):
         source = inspect.getsource(fn)
     except Exception:
         return False
-    # Only the exact remote layout: the un-transposed decay_chunk followed by the dim=2 reduction.
     if _MAMBA2_BAD_SUM not in source or "decay_chunk = torch.exp(segment_sum(" not in source \
             or "segment_sum(nn.functional.pad(A_cumsum[:, :, :, -1], (1, 0)))).transpose" in source:
         return False
@@ -72,7 +60,7 @@ def repair_remote_mamba2_torch_forward(cls):
     module = sys.modules.get(cls.__module__, None)
     if module is None:
         return False
-    # The module's own globals, so the rewritten method sees later rebinds exactly like the original.
+    # Module globals: the rewrite sees later rebinds like the original.
     local_namespace = {}
     exec(compile(textwrap.dedent(new_source), f"<unsloth remote mamba2 {cls.__module__}>", "exec"),
          module.__dict__, local_namespace)
@@ -90,7 +78,6 @@ _REPAIRED_MODULES = set()
 
 
 def repair_remote_mamba2_modules():
-    """Repair every loaded remote-code module once. Returns the repaired class names."""
     repaired = []
     for name, module in list(sys.modules.items()):
         if module is None or not name.startswith("transformers_modules"):
