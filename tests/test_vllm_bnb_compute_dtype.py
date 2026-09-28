@@ -14,9 +14,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""vLLM >= 0.28 builds the vllm-bnb-plugin config with no kwargs for online
-quantization, so the compute dtype override must not index a missing key."""
-
 import pytest
 
 from unsloth_zoo import vllm_utils
