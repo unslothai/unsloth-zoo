@@ -21,6 +21,12 @@ from unsloth_zoo.temporary_patches import mxfp4 as mx
 from unsloth_zoo.utils import Version
 
 TRANSFORMERS_5 = Version(importlib_version("transformers")) >= Version("5.0.0")
+
+
+@pytest.fixture(autouse = True)
+def _exact_packed_decode(monkeypatch):
+    # These tests pin the exact packed decode; test_mxfp4_ogs_decode.py covers the matmul_ogs one.
+    monkeypatch.setenv("UNSLOTH_MXFP4_OGS", "0")
 needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a CUDA device")
 needs_triton = pytest.mark.skipif(not mxd._HAS_TRITON, reason = "needs Triton")
 
@@ -547,8 +553,10 @@ def test_adapter_save_never_dequantizes(tmp_path, monkeypatch):
 
 
 @needs_cuda
-def test_bf16_inference_path_dequantizes_packed_experts():
+def test_bf16_inference_path_dequantizes_packed_experts(monkeypatch):
     from unsloth_zoo.temporary_patches import gpt_oss
+    # The decode-slot path; the fused kernels are not bit-exact and are covered in test_mxfp4_gemm.py.
+    monkeypatch.setenv("UNSLOTH_MXFP4_FUSED_GEMM", "dequant")
     model, experts = _tiny_gpt_oss("cuda")
     mlp = model.model.layers[0].mlp
     g = torch.Generator(device = "cuda").manual_seed(13)
