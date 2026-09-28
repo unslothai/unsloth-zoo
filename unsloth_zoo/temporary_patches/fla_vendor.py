@@ -19,9 +19,8 @@
 Env: ``UNSLOTH_DISABLE_VENDORED_FLA=1`` never injects (an installed fla is untouched);
 an installed fla strictly newer than the snapshot wins unless ``UNSLOTH_FORCE_VENDORED_FLA=1``;
 ``UNSLOTH_DISABLE_HOPPER_FLA_BWD=1`` forces pure torch on Hopper + Triton [3.4.0, 3.7.1) (fla #640).
-Injects only with torch >= 2.7, triton >= 3.3 and CUDA. When the snapshot shadows an installed
-fla of the same version, ``fla.*`` subpackages the snapshot does not ship (``fla.ops.kda`` for
-glm5_next / kimi_linear) load from that install; ``UNSLOTH_DISABLE_INSTALLED_FLA_FALLBACK=1`` stops it.
+Injects only with torch >= 2.7, triton >= 3.3 and CUDA. Subpackages the snapshot lacks (``fla.ops.kda``)
+load from a same-version install unless ``UNSLOTH_DISABLE_INSTALLED_FLA_FALLBACK=1``.
 """
 
 __all__ = [
@@ -368,13 +367,8 @@ def _installed_fla_root():
 
 
 class _InstalledFlaFallbackFinder:
-    """Loads ``fla.*`` subpackages the pruned snapshot lacks from the same-version install.
-
-    Sits after the path finder, so every module the snapshot ships (with its backported fixes)
-    still wins; only a missing subpackage, such as ``fla.ops.kda``, reaches the install. Single
-    files pruned from a shipped package (TileLang, intra-card CP) stay absent. Same version
-    only: the snapshot is that release's files plus fixes, so the two trees share one API.
-    """
+    """Serves ``fla.*`` packages missing from the snapshot out of a same-version install.
+    Appended after the path finder, so snapshot modules and pruned single files never reach it."""
 
     def __init__(self, root):
         self.root = root
@@ -389,14 +383,13 @@ class _InstalledFlaFallbackFinder:
         init_path = os.path.join(base, "__init__.py")
         if not os.path.isfile(init_path):
             return None
-        # Its children then resolve through this install directory, not the snapshot.
         return importlib.util.spec_from_file_location(
             fullname, init_path, submodule_search_locations = [base],
         )
 
 
 def _install_installed_fla_fallback():
-    """Let ops the snapshot lacks resolve from a shadowed same-version fla. Idempotent."""
+    """Idempotent."""
     if _flag("UNSLOTH_DISABLE_INSTALLED_FLA_FALLBACK"):
         return False
     if any(isinstance(f, _InstalledFlaFallbackFinder) for f in sys.meta_path):

@@ -1,24 +1,8 @@
-# Unsloth Zoo - Utilities for Unsloth
+# SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Lesser General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU Lesser General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The vendored fla snapshot shadows an installed fla-core <= 0.5.1 so the gated-delta models
-get its backported fixes, but it ships only the gated-delta closure. Kimi delta attention
-(glm5_next, kimi_linear) asks transformers for fla.ops.kda, which an installed fla-core 0.5.1
-has; that op must still load from the install, while every module the snapshot ships keeps
-coming from the snapshot. An install of another version is not mixed in."""
+"""fla.ops.kda (glm5_next, kimi_linear) loads from a same-version install the snapshot shadows;
+snapshot modules stay vendored and other versions are never mixed in."""
 
 import json
 import os
@@ -49,13 +33,12 @@ pytestmark = pytest.mark.skipif(
 
 
 def _fake_install(site, version):
-    """A minimal installed fla: an op the snapshot lacks, plus a module the snapshot ships."""
     files = {
         "fla/__init__.py": f'__version__ = "{version}"\n',
         "fla/ops/__init__.py": "",
         "fla/ops/common/__init__.py": "",
         "fla/ops/common/chunk_delta_h.py": 'SOURCE = "installed"\n',
-        # A file the snapshot prunes from a package it ships: must stay unimportable.
+        # Pruned from a package the snapshot ships: must stay unimportable.
         "fla/ops/common/intracard_cp.py": 'SOURCE = "installed"\n',
         "fla/ops/kda/__init__.py": textwrap.dedent(
             """
@@ -129,12 +112,10 @@ def _run(tmp_path, version, extra_env = None):
 def test_same_version_install_serves_ops_the_snapshot_lacks(tmp_path):
     out, site = _run(tmp_path, "0.5.1")
     assert out["vendored"]
-    # The snapshot keeps every module it ships, including the one KDA shares with gated delta.
     assert "_vendored" in out["gdr_file"]
     assert "_vendored" in out["shared_file"]
     assert out["kda_shared_file"] == out["shared_file"]
     assert out["pruned_file_spec"] is False
-    # KDA is not in the snapshot, so it comes from the install.
     assert out["kda_file"] is not None and out["kda_file"].startswith(site), out
     if "glm5_next_chunk" in out:
         assert "fla.ops.kda.chunk_kda" in out["glm5_next_chunk"], out
