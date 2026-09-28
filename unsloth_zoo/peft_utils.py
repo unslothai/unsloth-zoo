@@ -316,10 +316,7 @@ def get_peft_regex(
         if finetune_mlp_modules and _scoped(["embedding_projection"]):
             audio_cores.append(r"\bembed_audio\.embedding_projection")
         candidate_branches += _linear_aware_branches(audio_cores)
-    # Voxtral / Voxtral Realtime (speech in, text out): a Whisper-style (Voxtral) or
-    # Mistral-style (Realtime) audio_tower whose layers carry no language tag, plus an
-    # audio-only multi_modal_projector. Without this branch finetune_audio_layers=True
-    # silently trained a language-only adapter on them.
+    # Voxtral (Whisper-style) / Voxtral Realtime (Mistral-style) audio_tower + projector carry no language tag.
     _is_voxtral = _model_type.startswith("voxtral") or "voxtral" in _architectures
     if finetune_audio_layers and _is_voxtral:
         audio_leaves = []

@@ -14,10 +14,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""finetune_audio_layers=True on Voxtral (mistralai/Voxtral-Mini-3B-2507) used to be a silent
-no-op: its Whisper-style audio_tower (q/k/v/out_proj, fc1, fc2) and the audio projector got no
-LoRA, so an explicit audio request trained a language-only adapter. Module names are the
-transformers 5 VoxtralForConditionalGeneration names."""
+"""finetune_audio_layers=True on Voxtral used to leave the audio_tower and projector without LoRA."""
 import re
 import pytest
 import torch.nn as nn
