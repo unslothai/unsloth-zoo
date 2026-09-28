@@ -65,7 +65,7 @@ from unsloth_zoo.temporary_patches.common import (
     UNSLOTH_ENABLE_LOGGING,
 )
 from .log import logger
-from .device_type import DEVICE_TYPE, is_hip
+from .device_type import DEVICE_TYPE, is_hip, device_is_bf16_supported
 global LORA_REQUEST_ID
 
 # Align FlashInfer workspace with Unsloth compiled cache to avoid stale JIT paths.
@@ -119,6 +119,17 @@ pass
 # Whichever bitsandbytes module we resolved below, if vLLM is installed at all.
 # Defined out here because load_vllm reads it and lives outside that branch.
 _vllm_bnb = None
+
+
+def _resolve_bnb_compute_dtype(kwargs):
+    # vLLM >= 0.28 builds the plugin config with no kwargs for online quantization,
+    # so fall back to the dtype the GPU computes in.
+    dtype = os.environ.get("UNSLOTH_bnb_4bit_compute_dtype")
+    if dtype is None:
+        dtype = kwargs.get("bnb_4bit_compute_dtype")
+    if dtype is None:
+        dtype = "bfloat16" if device_is_bf16_supported() else "float16"
+    return dtype
 
 
 def _set_registered_quant_config(method, config_cls):
@@ -350,8 +361,7 @@ if importlib.util.find_spec("vllm") is not None:
     class BitsAndBytesConfig(_BitsAndBytesConfigBase):
         # All Unsloth Zoo code licensed under LGPLv3
         def __init__(self, *args, **kwargs):
-            dtype = os.environ.get("UNSLOTH_bnb_4bit_compute_dtype", kwargs["bnb_4bit_compute_dtype"])
-            kwargs["bnb_4bit_compute_dtype"] = dtype
+            kwargs["bnb_4bit_compute_dtype"] = _resolve_bnb_compute_dtype(kwargs)
             print(f"Unsloth: vLLM Bitsandbytes config using kwargs = {kwargs}")
             super().__init__(*args, **kwargs)
         pass

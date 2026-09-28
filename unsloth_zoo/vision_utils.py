@@ -1446,6 +1446,26 @@ def patch_medias_processor(processor):
 pass
 
 
+def _media_feature_token_ids(model):
+    """Token ids a model forward matches one-to-one with media features."""
+    config = getattr(model, "config", None)
+    ids = set()
+    subs = (getattr(config, k, None) for k in ("text_config", "vision_config", "audio_config", "thinker_config"))
+    for cfg in (config, *subs):
+        for key in ("image_token_id", "image_token_index", "video_token_id", "video_token_index",
+                    "audio_token_id", "audio_token_index", "media_placeholder_token_id",
+                    "img_context_token_id"):
+            value = getattr(cfg, key, None)
+            if isinstance(value, int) and value >= 0:
+                ids.add(value)
+    # InternVL remote code sets it on the model at runtime; the forward reads that attribute.
+    value = getattr(model, "img_context_token_id", None)
+    if isinstance(value, int) and value >= 0:
+        ids.add(value)
+    return sorted(ids)
+pass
+
+
 def _tensorize_ragged_batch(batch):
     """Tensorize fields; ragged ones stay lists of tensors."""
     for key in list(batch.keys()):
@@ -1496,7 +1516,7 @@ pass
 class UnslothVisionDataCollator:
     # All Unsloth Zoo code licensed under LGPLv3
     __slots__ = (
-        "padding_token_ids", "dtype", "ignore_index",
+        "padding_token_ids", "_feature_token_ids", "dtype", "ignore_index",
         "processor", "formatting_func", "image_size",
         "max_seq_length", "truncation", "train_on_responses_only",
         "num_proc", "assistant_single_content", "patch_size",
@@ -1533,6 +1553,7 @@ class UnslothVisionDataCollator:
         patch_medias_processor(processor)
 
         self.padding_token_ids = get_padding_tokens_ids(processor)
+        self._feature_token_ids = _media_feature_token_ids(model)
         self.dtype = _get_dtype(
             dtype_from_config(model.config)
             if HAS_TORCH_DTYPE else
@@ -1825,6 +1846,12 @@ class UnslothVisionDataCollator:
         try:
             return self.processor(**proc_kwargs)
         except ValueError as e:
+            # Mllama rejects batches mixing image and text-only rows ("either no images or at least one image per sample").
+            if (
+                has_images and "at least one image per sample" in str(e)
+                and "videos" not in proc_kwargs and "audio" not in proc_kwargs
+            ):
+                return self._call_processor_mixed_rows(proc_kwargs)
             # Nemotron Omni returns per-image pixel tensors that BatchFeature cannot stack.
             # transformers 5.x: "Unable to convert output", 4.x: "Unable to create tensor".
             if not has_images or not any(m in str(e) for m in ("Unable to convert output", "Unable to create tensor")):
@@ -1838,6 +1865,50 @@ class UnslothVisionDataCollator:
                     "per_device_train_batch_size = 1."
                 ) from e
             return batch
+
+    def _call_processor_mixed_rows(self, proc_kwargs):
+        # Run image rows and text-only rows as two valid batches, then merge them back in row order.
+        # Text-only rows get Mllama's empty image slot (zeros, first tile of aspect_ratio_mask set)
+        # and an all-zero cross_attention_mask, so the model masks them out.
+        from transformers.feature_extraction_utils import BatchFeature
+        texts, images = proc_kwargs["text"], proc_kwargs["images"]
+        base = {k: v for k, v in proc_kwargs.items() if k not in ("text", "images")}
+        img_rows = [i for i, row in enumerate(images) if len(row) > 0]
+        txt_rows = [i for i, row in enumerate(images) if len(row) == 0]
+        out_i = self.processor(text = [texts[i] for i in img_rows], images = [images[i] for i in img_rows], **base)
+        out_t = self.processor(text = [texts[i] for i in txt_rows], **base)
+
+        tokenizer = getattr(self.processor, "tokenizer", self.processor)
+        side = proc_kwargs.get("padding_side") or getattr(tokenizer, "padding_side", "right")
+        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+        len_i, len_t = out_i["input_ids"].shape[1], out_t["input_ids"].shape[1]
+        length = max(len_i, len_t)
+
+        token_keys = ("input_ids", "attention_mask", "cross_attention_mask", "token_type_ids", "mm_token_type_ids")
+
+        def pad_seq(key, t, group_len, value):
+            # Pixel tensors can share shape[1] with the token width, so pad by key, not by shape.
+            if key not in token_keys or group_len == length:
+                return t
+            fill = torch.full((t.shape[0], length - group_len, *t.shape[2:]), value, dtype = t.dtype, device = t.device)
+            return torch.cat([fill, t] if side == "left" else [t, fill], dim = 1)
+
+        order = torch.tensor([(img_rows + txt_rows).index(i) for i in range(len(texts))])
+        merged = {}
+        for key in dict.fromkeys(list(out_i.keys()) + list(out_t.keys())):
+            value = pad_id if key == "input_ids" else 0
+            if key in out_i and key in out_t:
+                a, b = pad_seq(key, out_i[key], len_i, value), pad_seq(key, out_t[key], len_t, value)
+            elif key in out_i:
+                a = pad_seq(key, out_i[key], len_i, value)
+                b = torch.zeros((len(txt_rows), *a.shape[1:]), dtype = a.dtype, device = a.device)
+                if key == "aspect_ratio_mask":
+                    b[..., 0] = 1
+            else:
+                b = pad_seq(key, out_t[key], len_t, value)
+                a = torch.zeros((len(img_rows), *b.shape[1:]), dtype = b.dtype, device = b.device)
+            merged[key] = torch.cat([a, b], dim = 0)[order]
+        return BatchFeature(data = merged)
 
     def _collapse_assistant_content(self, messages):
         for message in messages:
@@ -2178,6 +2249,29 @@ class UnslothVisionDataCollator:
             token_type_ids = token_type_ids[:, sl]
         return [input_ids, attention_mask, completion_mask] + ([token_type_ids] if token_type_ids is not None else [])
 
+    def _raise_if_truncation_cut_media(self, before, after, pad_id):
+        # Feature slots only: a cut delimiter alone (<|vision_end|>) still aligns at forward.
+        feature_ids = getattr(self, "_feature_token_ids", None)
+        if feature_ids:
+            media = torch.tensor(feature_ids, device = before.device)
+        else:
+            media = self._get_padding_token_ids_on_device(before.device)
+            # Processor-only placeholders (Step-3.7 `<im_patch>`) are absent from the tokenizer lists.
+            declared = [getattr(self.processor, f"{kind}_token_id", None) for kind in ("image", "video", "audio")]
+            declared = [x for x in declared if isinstance(x, int)]
+            if declared:
+                media = torch.cat((media, torch.tensor(declared, dtype = media.dtype, device = media.device)))
+        media = media[media != pad_id]
+        # Negative ids are processor-inserted sentinels (Phi-4-reasoning-vision -200).
+        count = lambda ids: int((torch.isin(ids, media) | (ids < 0)).sum())
+        cut = count(before) - count(after)
+        if cut > 0:
+            raise ValueError(
+                f"Unsloth: max_seq_length = {self.max_seq_length} truncated {cut} image / audio placeholder "
+                "tokens out of a prompt / completion batch, so the batch no longer matches its media "
+                "features. Increase max_seq_length or shorten the prompt."
+            )
+
     def _pad_to_multiple(self, input_ids, attention_mask, completion_mask, side, pad_id, multiple, token_type_ids=None, token_type_pad_id=0):
         B, L = input_ids.shape
         L2 = ((L + multiple - 1) // multiple) * multiple
@@ -2295,6 +2389,7 @@ class UnslothVisionDataCollator:
         p_tt, c_tt = proc_prompts.get(tt_key, None), proc_completions.get(tt_key, None)
 
         input_ids = torch.cat((p_ids, c_ids), dim=1)
+        untruncated_ids = input_ids
         attention_mask = torch.cat((p_m, c_m), dim=1)
         completion_mask = torch.cat((torch.zeros_like(p_m), c_m), dim=1)
         if p_tt is not None or c_tt is not None:
@@ -2308,6 +2403,7 @@ class UnslothVisionDataCollator:
         # Flush to tokenizer default padding side
         pad_id = self._pad_token_id_or_fail()
         flush_side = self._tokenizer_padding_side()
+        pre_flush = (attention_mask, input_ids)
         if token_type_ids is not None:
             attention_mask, input_ids, (completion_mask, token_type_ids) = self._flush_to_side(
                 attention_mask, input_ids, flush_side, pad_id, (completion_mask, token_type_ids)
@@ -2340,6 +2436,22 @@ class UnslothVisionDataCollator:
                     input_ids, attention_mask, completion_mask, flush_side, pad_id, self.pad_to_multiple_of
                 )
 
+        # Mllama: completion tokens see the images the last prompt token sees (prompts are left padded).
+        cross_mask = proc_prompts.get("cross_attention_mask", None)
+        if cross_mask is not None:
+            cross_mask = torch.cat((cross_mask, cross_mask[:, -1:].expand(-1, c_ids.shape[1], *cross_mask.shape[2:])), dim=1)
+            _, _, (cross_mask,) = self._flush_to_side(*pre_flush, flush_side, pad_id, (cross_mask,))
+            if cross_mask.shape[1] > input_ids.shape[1]:
+                cross_mask = cross_mask[:, -input_ids.shape[1]:] if flush_side == "left" else cross_mask[:, :input_ids.shape[1]]
+            elif cross_mask.shape[1] < input_ids.shape[1]:
+                fill = cross_mask.new_zeros((cross_mask.shape[0], input_ids.shape[1] - cross_mask.shape[1], *cross_mask.shape[2:]))
+                cross_mask = torch.cat((fill, cross_mask) if flush_side == "left" else (cross_mask, fill), dim=1)
+
+        # Cross-attention models (Mllama) do not align placeholder tokens with features.
+        if (pc_has_images or videos or audios) and cross_mask is None and self.max_seq_length is not None \
+            and untruncated_ids.shape[1] > self.max_seq_length:
+            self._raise_if_truncation_cut_media(untruncated_ids, input_ids, pad_id)
+
         # Labels: mask attention pads + image/pad tokens; completion-only if requested
         labels = input_ids.clone()
         labels[attention_mask == 0] = self.ignore_index
@@ -2356,6 +2468,8 @@ class UnslothVisionDataCollator:
         out["labels"] = labels
         if token_type_ids is not None:
             out[tt_key] = token_type_ids
+        if cross_mask is not None:
+            out["cross_attention_mask"] = cross_mask
         if 'pixel_values' in out:
             out = self._cast_pixel_values_dtype_inplace(out)
         if 'pixel_values_videos' in out:

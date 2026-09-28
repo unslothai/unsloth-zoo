@@ -579,6 +579,13 @@ pass
 # inspect.signature and graph-breaks (it cannot key a dict on, or getattr, an autograd.Function).
 _FUSED_LOSS_PARAMETERS, _FUSED_LOSS_DEFAULTS = _get_mapping(UnslothFusedLoss)
 
+# torch 2.11 alone traces UnslothFusedLoss into a graph that saves zero gradients (right loss, nothing trains).
+_FUSED_LOSS_OPAQUE = torch.__version__.split("+")[0].split(".")[:2] == ["2", "11"]
+
+@torch.compiler.disable
+def _fused_loss_opaque(*args):
+    return UnslothFusedLoss.apply(*args)
+
 def unsloth_fused_ce_loss(
     trainer,
     hidden_states  : torch.Tensor,
@@ -636,7 +643,8 @@ def unsloth_fused_ce_loss(
         overwrite = overwrite,
         extra_kwargs = kwargs,
     )
-    return UnslothFusedLoss.apply(*(
+    apply = _fused_loss_opaque if _FUSED_LOSS_OPAQUE else UnslothFusedLoss.apply
+    return apply(*(
         mapping.get(key, default) \
         for key, default in zip(_FUSED_LOSS_PARAMETERS, _FUSED_LOSS_DEFAULTS)
     ))

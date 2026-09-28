@@ -104,7 +104,8 @@ def _kernels():
         vl = (tl.load(code_ptr + lo) * am).to(out_ptr.dtype.element_ty)
         w = tl.reshape(tl.join(vh, vl), (2 * BLOCK,))
         offs2 = pid * (2 * BLOCK) + tl.arange(0, 2 * BLOCK).to(tl.int64)
-        tl.store(out_ptr + offs2, w, mask = offs2 < 2 * n_bytes)
+        # Not offs2 < 2 * n_bytes (int32 wraps for 2**31..2**32 weights) nor offs2 // 2 (~15% slower).
+        tl.store(out_ptr + offs2, w, mask = (offs2 - n_bytes) < n_bytes)
 
     @triton.jit
     def _combine_fwd_kernel(y_ptr, inv_ptr, w_ptr, out_ptr, T, H: tl.constexpr, TOPK: tl.constexpr,
