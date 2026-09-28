@@ -4222,6 +4222,12 @@ def merge_and_overwrite_lora(
         break
     pass
 
+    # Read before Step 1 rewrites config.json: an in-place export would strip the block size.
+    _fp8_disk_block_size = (
+        _fp8_block_size_on_disk(model_name, token)
+        if base_model_is_quantized and quant_type == "fp8" and save_method == "merged_16bit" else None
+    )
+
     n_saved_modules = 0
     def upload_items(filename = None):
         extras = {"repo_id" : repo_id, "repo_type" : "model", "commit_message" : "(Trained with Unsloth)", }
@@ -4576,9 +4582,8 @@ def merge_and_overwrite_lora(
             if isinstance(_wbs, (list, tuple)) and len(_wbs) == 2:
                 _merge_weight_block_size = tuple(int(x) for x in _wbs)
         if _merge_weight_block_size is None:
-            # A 4bit load of the fp8 checkpoint holds a bitsandbytes config in memory, but the
-            # merge reads the fp8 shards on disk, so their own config.json has the block size.
-            _merge_weight_block_size = _fp8_block_size_on_disk(model_name, token)
+            # A 4bit load of the fp8 checkpoint holds a bitsandbytes config; the shards' config.json has it.
+            _merge_weight_block_size = _fp8_disk_block_size
     # Gated archs + 16bit merge only: fold each LoRA delta onto dequant(W4) instead of W16
     # (see _merge_lora). Strict no-op for every other model/merge.
     _use_dequant_base = (

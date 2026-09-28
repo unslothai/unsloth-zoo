@@ -96,3 +96,51 @@ def test_on_disk_block_size_dequantizes_an_evenly_divided_ragged_dim(tmp_path):
     assert torch.equal(got.to(torch.bfloat16), expected)
     # What the merge produced before: 192 / 2 scale rows read as a 96-row block.
     assert not torch.equal(guessed.to(torch.bfloat16), expected)
+
+
+def _fp8_llama_base(base_dir):
+    """Tiny llama with a ragged 192-wide MLP, stored as 128x128 block fp8 like the -FP8 repos."""
+    import os
+    import transformers as T
+    cfg = T.LlamaConfig(hidden_size = 256, intermediate_size = 192, num_hidden_layers = 1,
+                        num_attention_heads = 4, num_key_value_heads = 2, vocab_size = 64,
+                        max_position_embeddings = 64)
+    torch.manual_seed(0)
+    model = T.LlamaForCausalLM(cfg).to(torch.bfloat16)
+    model.save_pretrained(base_dir, safe_serialization = True)
+    with safe_open(os.path.join(base_dir, "model.safetensors"), framework = "pt") as handle:
+        tensors = {key: handle.get_tensor(key) for key in handle.keys()}
+    expected = {}
+    for key in [k for k in tensors if ".mlp." in k]:
+        quant, scale = _quantize(tensors[key].float())
+        tensors[key], tensors[key + "_scale_inv"] = quant, scale
+        expected[key] = _reference(quant, scale)
+    save_file(tensors, os.path.join(base_dir, "model.safetensors"), metadata = {"format": "pt"})
+    config = json.loads((base_dir / "config.json").read_text())
+    config["quantization_config"] = {"quant_method": "fp8", "fmt": "e4m3", "weight_block_size": [128, 128]}
+    (base_dir / "config.json").write_text(json.dumps(config))
+    # What a 4bit load of this checkpoint holds in memory: a bitsandbytes config, no block size.
+    model.config.quantization_config = {"quant_method": "bitsandbytes", "load_in_4bit": True,
+                                        "bnb_4bit_quant_type": "nf4"}
+    model.config._name_or_path = str(base_dir)
+    return model, expected
+
+
+@pytest.mark.parametrize("in_place", [False, True])
+def test_merge_of_4bit_loaded_fp8_base_dequantizes_ragged_dims_exactly(tmp_path, monkeypatch, in_place):
+    """In place, Step 1 rewrites the source config.json without quantization_config before the
+    shards are read, so the block size has to be taken from disk before that."""
+    import os
+    import sys
+    from peft import LoraConfig, get_peft_model
+    monkeypatch.syspath_prepend(os.path.dirname(__file__))
+    import _merge_e2e_helpers as H
+    H.set_offline_cpu_env()
+    base_dir = tmp_path / "base"
+    model, expected = _fp8_llama_base(base_dir)
+    peft_model = get_peft_model(model, LoraConfig(r = 8, lora_alpha = 16, target_modules = ["q_proj"]))
+    out_dir = base_dir if in_place else tmp_path / "merged"
+    H.run_merge(peft_model, str(base_dir), str(out_dir), save_dtype = torch.bfloat16)
+    merged = H.read_safetensors_dir(str(out_dir))
+    for key, reference in expected.items():
+        assert torch.equal(merged[key].to(torch.bfloat16), reference), key
