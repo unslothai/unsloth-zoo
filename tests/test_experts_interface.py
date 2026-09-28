@@ -516,3 +516,23 @@ def test_decode_switch_wrapper_counts_only_unsloth_models_off_cpu(monkeypatch):
         with wrapped(model("cuda", "unsloth")):
             raise RuntimeError
     assert MEI._DECODING_DEPTH == 0
+
+
+def test_custom_gate_expert_lora_casts_under_non_cuda_autocast(monkeypatch):
+    import unsloth_zoo.temporary_patches.moe_experts_interface as mei
+
+    seen = {}
+
+    def backend(module, h, idx, w):
+        seen["dtype"] = h.dtype
+        return h
+
+    monkeypatch.setattr(mei, "_custom_gate_with_expert_lora", lambda m: True)
+    monkeypatch.setattr(mei, "_moe_utils_module", lambda: types.SimpleNamespace(get_forward_moe_backend = lambda: backend))
+    experts = nn.Module()
+    experts.gate_up_proj = nn.Parameter(torch.zeros(2, 8, 4, dtype = torch.bfloat16))
+    h = torch.randn(3, 4)
+    with torch.autocast("cpu", dtype = torch.bfloat16):
+        out = mei._unsloth_experts_dispatch(experts, h, torch.zeros(3, 1, dtype = torch.long), torch.ones(3, 1))
+    assert seen["dtype"] == torch.bfloat16
+    assert out.dtype == torch.float32

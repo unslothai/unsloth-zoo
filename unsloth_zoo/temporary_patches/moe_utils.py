@@ -2702,6 +2702,8 @@ def _preserved_rng_for_probe(x):
                 pass
 
 
+# Disabled, not just `is_compiling()`-guarded: fullgraph=False compiles this frame alone, so the guard never cached a verdict.
+@torch.compiler.disable
 def _measure_moe_lora_stash_read(wrapper, experts_module, parameter_name, x, args, kwargs) -> bool:
     """Run one throwaway experts forward under `no_grad` and report whether it read the stash.
 
