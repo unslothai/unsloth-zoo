@@ -177,3 +177,34 @@ def test_a_partial_scale_block_adds_one_expert_for_the_per_expert_triton_loop():
     assert set(_moe_dequant_transient_by_unit(model, [(f"layers.{i}", 0) for i in range(_LAYERS)]).values()) == {
         gate_up + down + down // _E
     }
+
+
+def test_an_fp8_layer_pinned_with_the_head_keeps_its_dequant_free():
+    # An MTP-style last block owning the head: the whole block is pinned to the head's card.
+    class HeadBlock(Block):
+        def __init__(self, dtype):
+            super().__init__(dtype)
+            self.lm_head = nn.Linear(_H, _VOCAB, bias = False, dtype = torch.bfloat16)
+
+    class WithHeadBlock(nn.Module):
+        def __init__(self, dtype):
+            super().__init__()
+            self.embed_tokens = nn.Embedding(_VOCAB, _H, dtype = torch.bfloat16)
+            self.layers = nn.ModuleList([Block(dtype) for _ in range(_LAYERS - 1)] + [HeadBlock(dtype)])
+
+        def get_output_embeddings(self):
+            return self.layers[-1].lm_head
+
+    with torch.device("meta"):
+        model = WithHeadBlock(torch.float8_e4m3fn)
+    # cuda:3, tried first as the head's card, fits the pinned block's weights but not its dequant.
+    budgets = [_FP8_LAYER * 16 // 5] * 3 + [_FP8_LAYER * 3 // 2]
+    try:
+        plan = plan_device_map(
+            model, max_memory = dict(enumerate(budgets)), headroom_bytes = 0,
+            no_split_module_classes = ["Block", "HeadBlock"], reserve_load_transient = False,
+        )
+    except DeviceMapInfeasible:
+        return
+    head_card = plan.device_map["layers.3"]
+    assert _left(plan)[head_card] >= _BF16_DEQUANT, (plan.device_map, _left(plan))

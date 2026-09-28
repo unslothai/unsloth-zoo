@@ -1916,6 +1916,8 @@ def plan_device_map(
             return None
         if _group_transient(pinned) > _transient_cap(head_device)[head_device]:
             return None
+        if _group_runtime(pinned) > _runtime_cap(head_device)[head_device]:
+            return None
         used, assign = _walk_in_order(free_groups, budget, head_device)
         if used is None:
             # The in-order walk is next-fit with a first-fit rescue, and neither
