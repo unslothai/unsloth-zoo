@@ -613,16 +613,7 @@ def smart_resize(
     return h_bar, w_bar
 
 
-def fetch_image(
-    ele: dict,
-    size_factor: int = IMAGE_FACTOR,
-) -> Image.Image:
-    if "image" in ele:
-        image = ele["image"]
-    else:
-        image = ele["image_url"]
-        if isinstance(image, dict) and "url" in image:
-            image = image["url"]
+def _decode_image(image) -> Image.Image:
     # datasets Image(decode=False) rows are {"bytes": None, "path": <str>}; the path may be a URL.
     if isinstance(image, dict) and not image.get("bytes") and isinstance(image.get("path"), str):
         image = image["path"]
@@ -656,9 +647,21 @@ def fetch_image(
     if image_obj is None:
         raise ValueError(f"Unrecognized image input. We support local path, http url, base64 and PIL.Image, bytes and dict formats. Instead we got `{type(image).__name__}`")
     if image_obj.mode != "RGB":
-        image = image_obj.convert("RGB")
+        return image_obj.convert("RGB")
+    return image_obj
+
+
+def fetch_image(
+    ele: dict,
+    size_factor: int = IMAGE_FACTOR,
+) -> Image.Image:
+    if "image" in ele:
+        image = ele["image"]
     else:
-        image = image_obj
+        image = ele["image_url"]
+        if isinstance(image, dict) and "url" in image:
+            image = image["url"]
+    image = _decode_image(image)
     ## resize
     if "resized_height" in ele and "resized_width" in ele:
         resized_height, resized_width = smart_resize(
@@ -1654,11 +1657,10 @@ class UnslothVisionDataCollator:
         )
 
     def _load_column_images(self, images):
-        # URL/path-like entries go through fetch_image's SSRF guard; processors like Idefics2 fetch URLs unguarded.
-        # PIL images, arrays and tensors are processor-native and pass through.
+        # URL/path-like entries decode through the SSRF-guarded loader; processors like Idefics2 fetch URLs unguarded.
+        # No resize here, so they match PIL entries; PIL images, arrays and tensors pass through.
         return [
-            fetch_image({"image": img}, size_factor=self.patch_size*2)
-            if isinstance(img, (str, bytes, bytearray, dict)) else img
+            _decode_image(img) if isinstance(img, (str, bytes, bytearray, dict)) else img
             for img in images
         ]
 

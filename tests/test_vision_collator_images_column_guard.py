@@ -96,3 +96,14 @@ def test_datasets_local_path_dict_loads(tmp_path):
         {"images": [{"bytes": None, "path": str(path)}]}, [],
     )
     assert isinstance(images[0], Image.Image)
+
+
+def test_decoded_entries_are_not_resized():
+    source = Image.effect_noise((100, 100), 64).convert("RGB")
+    buf = io.BytesIO()
+    source.save(buf, format = "PNG")
+    images, _, _ = _collator()._extract_images_videos_for_example(
+        {"images": [{"bytes": buf.getvalue(), "path": None}]}, [],
+    )
+    assert images[0].size == (100, 100)
+    assert images[0].tobytes() == source.tobytes()
