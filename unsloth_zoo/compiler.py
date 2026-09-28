@@ -201,6 +201,28 @@ DISABLE_COMPILE_MODEL_FUNCTIONS = {
     "deepseek_v4": ["apply_rotary_pos_emb"],
 }
 
+# Matched rewrites leave DISABLE_COMPILE_MODEL_FUNCTIONS; deepseek_v4 `split` avoids the slice pytorch#198553 miscompiles.
+MODEL_FUNCTION_SOURCE_REWRITES = {
+    "deepseek_v4": {
+        "apply_rotary_pos_emb": (
+            "nope, rope = x[..., :-rope_dim], x[..., -rope_dim:]",
+            "nope, rope = x.split([x.shape[-1] - rope_dim, rope_dim], dim = -1)",
+        ),
+    },
+}
+
+
+def model_function_source_rewrites(modeling_file, model_type):
+    applicable = {}
+    for name, (old, new) in MODEL_FUNCTION_SOURCE_REWRITES.get(model_type, {}).items():
+        try:
+            source = inspect.getsource(getattr(modeling_file, name))
+        except Exception:
+            continue
+        if source.count(old) == 1:
+            applicable[name] = (old, new)
+    return applicable
+
 
 def calls_disable_compile_function(source, disable_compile_functions):
     """Names from `DISABLE_COMPILE_FUNCTIONS` that `source` CALLS: a superset of the
@@ -4360,11 +4382,14 @@ torch_float16 = torch.float16
 def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
     xA = dropout(x.to(torch_float16)) @ lora_A.weight.to(torch_float16).t()
     # output = result + scaling * xA @ lora_B.weight.t()
+    # Add in result's dtype: a base layer kept in float32 (gpt-oss expert down_projs reach
+    # 66795) overflows if rounded to float16 here. Float16 results take the same kernel.
     shape = result.shape
+    result_dtype = result.dtype
     output = torch_addmm(
-        result.view(-1, shape[-1]).to(torch_float16),
-        xA.view(-1, xA.shape[-1]),
-        lora_B.weight.to(torch_float16).t(),
+        result.view(-1, shape[-1]),
+        xA.view(-1, xA.shape[-1]).to(result_dtype),
+        lora_B.weight.to(result_dtype).t(),
         alpha = scaling,
         beta = 1,
     ).view(shape)
@@ -4373,7 +4398,7 @@ def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
     if bias is not None:
         output = torch_add(
             output,
-            bias.to(torch_float16),
+            bias.to(result_dtype),
             alpha = scaling,
         )
     return output
@@ -5415,6 +5440,8 @@ def unsloth_compile_transformers(
     exec("import transformers", globals())
     disable_compile_functions = set(DISABLE_COMPILE_FUNCTIONS)
     disable_compile_functions.update(DISABLE_COMPILE_MODEL_FUNCTIONS.get(model_type, ()))
+    function_source_rewrites = model_function_source_rewrites(modeling_file, model_type)
+    disable_compile_functions.difference_update(function_source_rewrites)
 
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__"):
         # Get __UNSLOTH_SUPPORTS_SDPA__
@@ -6412,7 +6439,7 @@ def unsloth_compile_transformers(
     items_in_trainer = dir(transformers.trainer)
     good_items = []
     for item in items_in_trainer:
-        if item in inner_training_loop:
+        if not item.startswith("__") and item in inner_training_loop:
             good_items.append(item)
     pass
     exec(
@@ -6592,6 +6619,8 @@ def unsloth_compile_transformers(
                     print(f"Unsloth: Cannot patch {module} with error = {str(e)}")
                     continue
             pass
+            if module in function_source_rewrites:
+                source = source.replace(*function_source_rewrites[module])
 
             if sdpa_bool_masks:
                 source = convert_attention_masks_to_bool(module, source)

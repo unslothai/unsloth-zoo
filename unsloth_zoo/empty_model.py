@@ -379,6 +379,8 @@ def patch_gemma4_vllm_lora_support():
                 cls.embedding_modules = {}
             cls._unsloth_gemma4_class_patched = True
 
+    _patch_gemma4_vllm_expert_mapping()
+
     original_supports_lora = getattr(
         lora_model_runner_mixin, "supports_lora", vllm_model_interfaces.supports_lora
     )
@@ -406,6 +408,41 @@ def patch_gemma4_vllm_lora_support():
         vllm_lora_model_manager.create_lora_manager = patched_create_lora_manager
         vllm_lora_worker_manager.create_lora_manager = patched_create_lora_manager
 pass
+
+def _patch_gemma4_vllm_expert_mapping():
+    # Only vLLM 0.19-0.24 lacks it; on 0.25+ a top-level shim would shadow RoutedExperts.get_expert_mapping.
+    try:
+        from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
+    except Exception:
+        return
+    try:
+        from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts as experts_cls
+    except Exception:
+        try:
+            from vllm.model_executor.layers.fused_moe.layer import FusedMoE as experts_cls
+        except Exception:
+            return
+    if hasattr(experts_cls, "get_expert_mapping") or hasattr(Gemma4ForCausalLM, "get_expert_mapping"):
+        return
+    make_expert_params_mapping = getattr(experts_cls, "make_expert_params_mapping", None)
+    if make_expert_params_mapping is None:
+        return
+
+    def get_expert_mapping(self):
+        num_experts = getattr(self.config, "num_experts", None) or 0
+        if num_experts == 0:
+            return []
+        return make_expert_params_mapping(
+            self,
+            ckpt_gate_proj_name = "gate_proj",
+            ckpt_down_proj_name = "down_proj",
+            ckpt_up_proj_name = "up_proj",
+            num_experts = num_experts,
+            num_redundant_experts = getattr(self, "num_redundant_experts", 0),
+        )
+    Gemma4ForCausalLM.get_expert_mapping = get_expert_mapping
+pass
+
 
 # Prequantized BnB Gemma4 k_eq_v layers lack a synthetic v quant-state shard;
 # we duplicate K -> V at loader-side quant-state stacking time.
@@ -721,6 +758,10 @@ def set_additional_modules(new_model, quant_state_dict, config):
     elif hasattr(new_model, "model") and hasattr(new_model.model, "language_model"):
         language_model = new_model.model.language_model
         language_model_prefix = "model.language_model"
+    elif hasattr(new_model, "model") and hasattr(new_model.model, "text_model"):
+        # Idefics3 nests the text model at model.text_model
+        language_model = new_model.model.text_model
+        language_model_prefix = "model.text_model"
     else:
         language_model_prefix = "model"
         language_model = new_model.model
@@ -800,7 +841,7 @@ def set_additional_modules(new_model, quant_state_dict, config):
         x for x in quant_state_dict.keys()
         if (
             any(x == n or x.startswith(n + ".") for n in exact_non_layered)
-            or not any(substr in x for substr in ("layers", "blocks", embed_tokens_key, norm_key, "lm_head", "mlp", "linear", "list"))
+            or not any(substr in x for substr in ("layers", "blocks", embed_tokens_key, norm_key, "lm_head", "mlp", "linear", "list", "connector"))
         )
     )
     print(f'Performing substitution for {additional_keys=}')
@@ -1053,6 +1094,17 @@ def get_model_layer_config(return_non_layered=True):
             "model.language_model.layers.{kk}.per_layer_projection",
             "model.layers.{kk}.per_layer_input_gate",
             "model.layers.{kk}.per_layer_projection",
+
+            # Idefics3 text model
+            "model.text_model.layers.{kk}.self_attn.q_proj",
+            "model.text_model.layers.{kk}.self_attn.k_proj",
+            "model.text_model.layers.{kk}.self_attn.v_proj",
+            "model.text_model.layers.{kk}.self_attn.qkv_proj",
+            "model.text_model.layers.{kk}.self_attn.o_proj",
+            "model.text_model.layers.{kk}.mlp.gate_proj",
+            "model.text_model.layers.{kk}.mlp.up_proj",
+            "model.text_model.layers.{kk}.mlp.gate_up_proj",
+            "model.text_model.layers.{kk}.mlp.down_proj",
         },
         'layernorms': {
             "model.language_model.layers.{kk}.input_layernorm",
@@ -1099,6 +1151,12 @@ def get_model_layer_config(return_non_layered=True):
             # Gemma4 per-layer input norm
             "model.language_model.layers.{kk}.post_per_layer_input_norm",
             "model.layers.{kk}.post_per_layer_input_norm",
+
+            # Idefics3
+            "model.text_model.layers.{kk}.input_layernorm",
+            "model.text_model.layers.{kk}.post_attention_layernorm",
+            "model.vision_model.encoder.layers.{kk}.layer_norm1",
+            "model.vision_model.encoder.layers.{kk}.layer_norm2",
         },
         'vision_layers': {
 
@@ -1174,6 +1232,15 @@ def get_model_layer_config(return_non_layered=True):
             "model.visual.blocks.{kk}.mlp.linear_fc1",
             "model.visual.blocks.{kk}.mlp.linear_fc2",
 
+            # Idefics3
+            "model.vision_model.encoder.layers.{kk}.self_attn.q_proj",
+            "model.vision_model.encoder.layers.{kk}.self_attn.k_proj",
+            "model.vision_model.encoder.layers.{kk}.self_attn.v_proj",
+            "model.vision_model.encoder.layers.{kk}.self_attn.qkv_proj",
+            "model.vision_model.encoder.layers.{kk}.self_attn.out_proj",
+            "model.vision_model.encoder.layers.{kk}.mlp.fc1",
+            "model.vision_model.encoder.layers.{kk}.mlp.fc2",
+
         },
         'additional_layers': {
             # Primarily for layers that are neither language decoder layers or vision transformer layers/blocks.
@@ -1193,6 +1260,9 @@ def get_model_layer_config(return_non_layered=True):
             # qwen 3 vl
             "model.visual.deepstack_merger_list.{kk}.linear_fc1",
             "model.visual.deepstack_merger_list.{kk}.linear_fc2",
+
+            # Idefics3
+            "model.connector.modality_projection.proj",
 
         },
         "non_layered_components":{
@@ -1239,6 +1309,11 @@ def get_model_layer_config(return_non_layered=True):
             "model.language_model.embed_tokens_per_layer",
             "model.language_model.per_layer_model_projection",
             "model.language_model.per_layer_projection_norm",
+
+            # Idefics3
+            "model.vision_model.embeddings.patch_embedding",
+            "model.vision_model.embeddings.position_embedding",
+            "model.vision_model.post_layernorm",
         }
     }
 
@@ -1286,6 +1361,11 @@ def get_model_layer_counts(config):
         return {
             "text_layers": getattr(text_config, "num_hidden_layers", 32),
             "vision_layers": getattr(vision_config, "num_hidden_layers", 32),
+        }
+    elif model_type in ("idefics3", "idefics3_vision"):
+        return {
+            "text_layers": getattr(text_config, "num_hidden_layers", 30),
+            "vision_layers": getattr(vision_config, "num_hidden_layers", 12),
         }
     else:
         # Standard causal LM

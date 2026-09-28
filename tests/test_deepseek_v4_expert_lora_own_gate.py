@@ -73,6 +73,8 @@ for n, m in experts:
     m.register_forward_hook(hook(n), with_kwargs = True)
 ids = torch.randint(4, 500, (2, 48), device = "cuda")
 model.train()
+from torch._dynamo.utils import counters
+counters.clear()
 with torch.autocast("cuda", dtype = torch.bfloat16):
     loss = model(input_ids = ids, labels = ids).loss
 loss.backward()
@@ -91,7 +93,9 @@ for n, m in experts:
     with torch.no_grad():
         want = eager(ref, h.float(), idx, w.float())
     rel.append(float((got.float() - want).norm() / want.norm()))
-print("RESULT " + json.dumps({"n_expert_lora": len(grads), "grads": grads, "rel": rel}))
+own_gate = [bool(m.__dict__.get("_unsloth_own_apply_gate")) for _, m in experts]
+breaks = [str(k) for k in counters["graph_break"]]
+print("RESULT " + json.dumps({"n_expert_lora": len(grads), "grads": grads, "rel": rel, "own_gate": own_gate, "breaks": breaks}))
 '''
 
 
@@ -110,3 +114,6 @@ def test_deepseek_v4_bf16_expert_lora_is_applied(tmp_path):
     assert r["n_expert_lora"] == 16  # 4 layers x (gate_up, down) x (A, B)
     assert all(g > 0 for g in r["grads"]), r["grads"]
     assert max(r["rel"]) < 0.02, r["rel"]
+    assert all(r["own_gate"]), r["own_gate"]
+    removed = ("_unsloth_experts_dispatch", "apply_rotary_pos_emb", "_run_probe_eagerly", "normpath")
+    assert not [b for b in r["breaks"] if any(name in b for name in removed)], r["breaks"]
