@@ -121,3 +121,30 @@ def test_bare_base64_string_decodes():
 def test_missing_local_path_still_raises_file_not_found():
     with pytest.raises(FileNotFoundError):
         _collator()._extract_images_videos_for_example({"images": ["/no/such/image.png"]}, [])
+
+
+def _rotated_jpeg():
+    image = Image.new("RGB", (20, 10), (200, 10, 10))
+    exif = image.getexif()
+    exif[0x0112] = 6  # Orientation: rotate 90 CW on display
+    buf = io.BytesIO()
+    image.save(buf, format = "JPEG", exif = exif)
+    return buf.getvalue()
+
+
+def test_exif_orientation_matches_datasets_decode():
+    datasets = pytest.importorskip("datasets")
+    data = _rotated_jpeg()
+    expected = datasets.Image().decode_example({"bytes": data, "path": None})
+    images, _, _ = _collator()._extract_images_videos_for_example({"images": [{"bytes": data, "path": None}]}, [])
+    assert images[0].size == expected.size == (10, 20)
+
+
+def test_line_wrapped_base64_decodes():
+    import base64
+    buf = io.BytesIO()
+    Image.new("RGB", (64, 64)).save(buf, format = "PNG")
+    wrapped = base64.encodebytes(buf.getvalue()).decode()
+    assert "\n" in wrapped
+    images, _, _ = _collator()._extract_images_videos_for_example({"images": [wrapped]}, [])
+    assert images[0].size == (64, 64)

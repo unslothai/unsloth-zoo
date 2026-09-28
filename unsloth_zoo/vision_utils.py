@@ -42,7 +42,7 @@ from .vlm_tokens import IMAGE_TOKENS, AUDIO_TOKENS
 
 import torch
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 import base64
 import contextvars
 from io import BytesIO
@@ -637,7 +637,7 @@ def _decode_image(image) -> Image.Image:
         else:
             # Bare base64, as transformers.image_utils.load_image accepts; else surface the missing path.
             try:
-                image_obj = Image.open(BytesIO(base64.b64decode(image, validate=True)))
+                image_obj = Image.open(BytesIO(base64.decodebytes(image.encode())))
             except Exception:
                 image_obj = Image.open(image)
     elif isinstance(image, bytes):
@@ -1664,9 +1664,10 @@ class UnslothVisionDataCollator:
 
     def _load_column_images(self, images):
         # URL/path-like entries decode through the SSRF-guarded loader; processors like Idefics2 fetch URLs unguarded.
-        # No resize here, so they match PIL entries; PIL images, arrays and tensors pass through.
+        # No resize here, and EXIF orientation applied as datasets' Image decode does, so they match PIL entries.
+        # PIL images, arrays and tensors pass through.
         return [
-            _decode_image(img) if isinstance(img, (str, bytes, bytearray, dict)) else img
+            ImageOps.exif_transpose(_decode_image(img)) if isinstance(img, (str, bytes, bytearray, dict)) else img
             for img in images
         ]
 
