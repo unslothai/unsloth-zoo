@@ -247,8 +247,11 @@ def get_peft_regex(
         if finetune_language_layers:
             # Same shape as the composite branch, so text-only loads reach nested leaves
             # (mlp.shared_expert.up_proj) and tag-containing components (linear_attn.*).
+            # Routed experts (mlp.experts.<N>.up_proj) stay out, as before: unsloth widens
+            # remote expert blocks to them itself and keeps native ones (Qwen3-MoE on
+            # transformers 4.x) off LoRA on every routed expert.
             regex_matcher = r"(?:" + regex_matcher + \
-            r")|(?:\bmodel\.layers\.[\d]{1,}\..*?(?:" + regex_components + \
+            r")|(?:\bmodel\.layers\.[\d]{1,}(?!.*\.experts\.\d)\..*?(?:" + regex_components + \
             r").*?\.(?:" + match_linear_modules + r"))"
         pass
     pass
