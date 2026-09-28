@@ -294,11 +294,16 @@ def _decode_for_test(blocks, scales):
     return out
 
 
-def _pick_config(M, E, N, K, transpose_b, asm = False):
+def _pick_config(M, E, N, K, transpose_b, asm = False, big_tiles = True):
     """(BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages, split). Swept on B200 over gpt-oss-20b / 120b and Kimi-K3
     (896 experts, top-16) shapes with uniform (decode) and real, skewed (prefill / training, hottest expert 3-6x the
-    mean) routing."""
+    mean) routing. ``big_tiles=False`` (no sm_100 tensor memory): RTX PRO 6000 (sm_120) sweep on gpt-oss-20b, where
+    the 128x256 tiles spill (4-7x slower) and 256x256 needs 123 KB of its 99 KB shared memory."""
     per_expert = M / max(E, 1)
+    if not big_tiles and (transpose_b or asm):
+        if transpose_b:
+            return (16, 64, 128, 4, 4, False) if per_expert <= 64 else (64, 128, 64, 4, 3, False)
+        return (32, 128, 64, 4, 3, False) if per_expert <= 32 else (64, 128, 64, 4, 3, False)
     if transpose_b:
         if per_expert <= 1:
             return (16, 64, 128, 4, 4, False)
@@ -329,11 +334,11 @@ def _split_permute(x, block_k):
     return x.view(M, K // block_k, block_k // 2, 2).transpose(-1, -2).reshape(M, K)
 
 
-def _pick_dense_config(M, N, K, transpose_b):
+def _pick_dense_config(M, N, K, transpose_b, big_tiles = True):
     """Single weight (no expert schedule), non-split tiles: narrow N tiles keep every SM busy for skinny inputs.
     B200 sweep over Llama-3-8B Linear shapes, M <= 64; wider inputs reuse the grouped table."""
     if M > 64:
-        return _pick_config(M, 1, N, K, transpose_b)
+        return _pick_config(M, 1, N, K, transpose_b, big_tiles = big_tiles)
     if transpose_b:
         if M <= 16:
             return (16, 32, 256, 4, 3, False) if N <= 4096 else (16, 64, 256, 4, 3, False)
@@ -345,6 +350,18 @@ def _pick_dense_config(M, N, K, transpose_b):
     if M <= 32:
         return (32, 32, 128, 4, 4, False) if N <= 4096 else (32, 64, 256, 4, 3, False)
     return (64, 32, 256, 4, 3, False) if N <= 4096 else (64, 64, 128, 4, 4, False)
+
+
+_BIG_TILES = {}
+
+
+def _big_tiles(device):
+    """sm_100 / sm_103 (tensor-memory MMA) take the B200 tile table; mma.sync GPUs spill its widest tiles."""
+    ok = _BIG_TILES.get(device.index)
+    if ok is None:
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        ok = _BIG_TILES[device.index] = torch.version.hip is None and torch.cuda.get_device_capability(index)[0] == 10
+    return ok
 
 
 _ASM_OK = {}
@@ -370,8 +387,10 @@ def _launch(x, blocks, scales, counts, out, transpose_b, config, launcher, bias 
     N = out.shape[1]
     grouped = counts is not None
     if config is None:
-        asm = _asm_ok(x.device)
-        config = _pick_config(M, E, N, K, transpose_b, asm) if grouped else _pick_dense_config(M, N, K, transpose_b)
+        asm, big = _asm_ok(x.device), _big_tiles(x.device)
+        config = (
+            _pick_config(M, E, N, K, transpose_b, asm, big) if grouped else _pick_dense_config(M, N, K, transpose_b, big)
+        )
     else:
         asm = config[6] if len(config) > 6 else _asm_ok(x.device)
     BM, BN, BK, warps, stages, split = config[:6]
