@@ -16,17 +16,25 @@
 
 """The stash probe must still give a verdict when Dynamo compiles its frame alone (fullgraph=False)."""
 
+import importlib.util
+import pathlib
+
 import pytest
 import torch
 
-from tests.test_moe_stacked_expert_lora_reaches_forward import (
-    MU,
-    _StashIgnoringExperts,
-    _StashReadingExperts,
-    _build,
-    _inputs,
-    restore_param_wrapper,  # noqa: F401  (fixture)
+# By path, not `tests.`: that name binds to unsloth's own tests package under its CI.
+_spec = importlib.util.spec_from_file_location(
+    "_moe_stacked_expert_lora_sibling",
+    pathlib.Path(__file__).with_name("test_moe_stacked_expert_lora_reaches_forward.py"),
 )
+_sibling = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_sibling)
+MU = _sibling.MU
+_StashIgnoringExperts = _sibling._StashIgnoringExperts
+_StashReadingExperts = _sibling._StashReadingExperts
+_build = _sibling._build
+_inputs = _sibling._inputs
+restore_param_wrapper = _sibling.restore_param_wrapper
 
 
 def _wrapper_and_experts(model):
