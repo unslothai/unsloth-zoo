@@ -3060,3 +3060,38 @@ def patch_trainer_flops_list_main_input():
     Trainer.floating_point_ops = floating_point_ops
 pass
 TEMPORARY_PATCHES.append(patch_trainer_flops_list_main_input)
+
+
+def patch_granitemoe_router_logits_recording():
+    # transformers 5.x dropped router_logits from Granite MoE _can_record_outputs, so output_router_logits=True
+    # (TRL >= 1.7 default) makes aux_loss an int 0 and the CausalLM forward crashes on `aux_loss.to(...)`.
+    try:
+        from transformers.utils.output_capturing import OutputRecorder
+    except Exception:
+        return  # transformers 4.x collects router logits in the decoder loop itself
+    for module_name, prefix in (
+        ("granitemoe", "GraniteMoe"),
+        ("granitemoeshared", "GraniteMoeShared"),
+        ("granitemoe_swa", "GraniteMoeSWA"),
+        ("granitemoehybrid", "GraniteMoeHybrid"),
+    ):
+        try:
+            module = importlib.import_module(f"transformers.models.{module_name}.modeling_{module_name}")
+        except Exception:
+            continue
+        pretrained = getattr(module, f"{prefix}PreTrainedModel", None)
+        # transformers <= 5.5 calls it TopKGating and returns the logits as `logits`.
+        router = getattr(module, f"{prefix}TopKRouter", None) or getattr(module, f"{prefix}TopKGating", None)
+        recorded = getattr(pretrained, "_can_record_outputs", None)
+        if pretrained is None or router is None or not isinstance(recorded, dict) or "router_logits" in recorded:
+            continue
+        # GraniteMoeSWA returns (router_logits, ...) while the others end with it: read the position off the source.
+        try:
+            returned = re.findall(r"return ([^\n]+)", inspect.getsource(router.forward))[-1]
+            names = [x.strip() for x in returned.split(",")]
+            index = names.index("router_logits") if "router_logits" in names else names.index("logits")
+        except Exception:
+            continue
+        pretrained._can_record_outputs = {**recorded, "router_logits": OutputRecorder(router, index = index)}
+pass
+TEMPORARY_PATCHES.append(patch_granitemoe_router_logits_recording)
