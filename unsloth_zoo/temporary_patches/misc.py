@@ -3098,16 +3098,9 @@ TEMPORARY_PATCHES.append(patch_granitemoe_router_logits_recording)
 
 
 def patch_kv_cache_compute_dtype():
-    # Full finetuning upcasts the trainable weights to float32, but the rollout used
-    # by GRPO (and eval generation) runs under a bf16/fp16 autocast. apply_rotary_pos_emb
-    # rotates the keys through the float32 cos/sin buffers, so the key reaching the cache
-    # is float32 while the value (no RoPE) stays the compute dtype. transformers sizes the
-    # cache buffer from the first key written (float32), then the value write mismatches:
-    #   cache_utils.py  self.values.index_copy_(...)  ->  self Float vs source BFloat16
-    # Align the key and value at the cache write: the first write follows the value
-    # (compute) dtype, so the rollout cache is allocated in fp16/bf16 (fast, half the KV
-    # memory), and later writes follow the existing cache dtype, so they can never disagree.
-    # A no-op when the key and value already match (LoRA, QLoRA, plain float32 inference).
+    # Full finetuning keeps float32 weights, so under a bf16/fp16 autocast RoPE yields a float32 key
+    # but a half value; the cache sizes itself from the key and the value write then fails:
+    # index_copy_(): self Float vs source BFloat16. Allocate from the value dtype, then keep both aligned.
     try:
         import transformers.cache_utils as cache_utils
         base = cache_utils.CacheLayerMixin
@@ -3118,15 +3111,14 @@ def patch_kv_cache_compute_dtype():
         if getattr(original_update, "_unsloth_dtype_safe", False):
             return original_update
         @functools.wraps(original_update)
-        def update(self, key_states, value_states, cache_kwargs = None):
+        def update(self, key_states, value_states, *args, **kwargs):
             cache_dtype = getattr(self, "dtype", None)
             if getattr(self, "is_initialized", False) and cache_dtype is not None:
                 if key_states.dtype   != cache_dtype: key_states   = key_states.to(cache_dtype)
                 if value_states.dtype != cache_dtype: value_states = value_states.to(cache_dtype)
             elif key_states.dtype != value_states.dtype:
-                # First write: the un-rotated value carries the true compute dtype.
                 key_states = key_states.to(value_states.dtype)
-            return original_update(self, key_states, value_states, cache_kwargs)
+            return original_update(self, key_states, value_states, *args, **kwargs)
         update._unsloth_dtype_safe = True
         return update
 
