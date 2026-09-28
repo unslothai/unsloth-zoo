@@ -2183,7 +2183,9 @@ class UnslothVisionDataCollator:
         # misaligns them at model forward.
         media = self._get_padding_token_ids_on_device(before.device)
         media = media[media != pad_id]
-        cut = int(torch.isin(before, media).sum()) - int(torch.isin(after, media).sum())
+        # Negative ids are processor-inserted sentinels (Phi-4-reasoning-vision -200).
+        count = lambda ids: int((torch.isin(ids, media) | (ids < 0)).sum())
+        cut = count(before) - count(after)
         if cut > 0:
             raise ValueError(
                 f"Unsloth: max_seq_length = {self.max_seq_length} truncated {cut} image / audio placeholder "
