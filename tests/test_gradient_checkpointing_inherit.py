@@ -1,10 +1,4 @@
-"""gradient_checkpointing_enable() on remote-code wrappers that leave supports_gradient_checkpointing False.
-
-nvidia Nemotron-3-Nano-Omni's NemotronH_Nano_Omni_Reasoning_V3 (and its inner remote NemotronHForCausalLM)
-keep the PreTrainedModel default False while their decoder blocks are GradientCheckpointingLayer, so
-transformers raises "does not support gradient checkpointing". The zoo patch inherits the flag from a
-checkpointable submodule. CPU only.
-"""
+"""Remote-code wrappers (Nemotron-3-Nano-Omni) inherit gradient checkpointing support from their blocks. CPU only."""
 import pytest
 import torch
 import torch.nn as nn
@@ -98,13 +92,12 @@ def test_wrapper_and_inner_enable_and_recompute(patched, which):
     target.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     assert all(b.gradient_checkpointing for b in model.language_model.layers)
     assert target.is_gradient_checkpointing
-    # The class default is untouched; only this instance inherits.
     assert type(target).supports_gradient_checkpointing is False
     model.train()
     ids = torch.randint(0, 16, (2, 5))
     _Block.calls = 0
     model(ids).sum().backward()
-    # 3 blocks, forward + recompute in backward = 6 calls.
+    # 3 blocks x (forward + recompute)
     assert _Block.calls == 6
     assert model.language_model.layers[0].lin.weight.grad is not None
 

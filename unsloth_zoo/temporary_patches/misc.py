@@ -1498,8 +1498,6 @@ TEMPORARY_PATCHES.append(patch_datasets_map_worker_death_retry)
 
 
 def _gradient_checkpointing_donor(model):
-    """Name of the first submodule that can be checkpointed: a GradientCheckpointingLayer, or a
-    PreTrainedModel that declares supports_gradient_checkpointing. None if there is none."""
     try:
         from transformers.modeling_layers import GradientCheckpointingLayer
     except Exception:
@@ -1517,12 +1515,8 @@ pass
 
 
 def patch_gradient_checkpointing_enable_inherit():
-    # Remote-code wrappers (nvidia Nemotron-3-Nano-Omni: NemotronH_Nano_Omni_Reasoning_V3 and its inner
-    # NemotronHForCausalLM) leave PreTrainedModel.supports_gradient_checkpointing at False although their
-    # decoder blocks are GradientCheckpointingLayer, so gradient_checkpointing_enable() raises
-    # "... does not support gradient checkpointing" (e.g. from TRL / Trainer gradient_checkpointing=True).
-    # transformers' _set_gradient_checkpointing already walks every submodule, so only the gate is wrong:
-    # inherit the flag when a submodule supports it. Models with no checkpointable submodule still raise.
+    # Remote-code wrappers (Nemotron-3-Nano-Omni) leave supports_gradient_checkpointing False over
+    # GradientCheckpointingLayer blocks; _set_gradient_checkpointing already walks submodules, only the gate is wrong.
     if os.environ.get("UNSLOTH_GC_INHERIT", "1") == "0":
         return
     try:
@@ -1538,7 +1532,7 @@ def patch_gradient_checkpointing_enable_inherit():
         if not getattr(self, "supports_gradient_checkpointing", False):
             donor = _gradient_checkpointing_donor(self)
             if donor is not None:
-                # Instance attribute: the class and its other instances stay as they are.
+                # Instance only: the class and its other instances keep False.
                 self.supports_gradient_checkpointing = True
                 logger.info(
                     f"Unsloth: {type(self).__name__} inherits gradient checkpointing support from {donor}."
