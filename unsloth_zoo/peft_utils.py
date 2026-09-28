@@ -323,6 +323,20 @@ def get_peft_regex(
         if finetune_mlp_modules and _scoped(["embedding_projection"]):
             audio_cores.append(r"\bembed_audio\.embedding_projection")
         candidate_branches += _linear_aware_branches(audio_cores)
+    # Voxtral (Whisper-style) / Voxtral Realtime (Mistral-style) audio_tower + projector carry no language tag.
+    _is_voxtral = _model_type.startswith("voxtral") or "voxtral" in _architectures
+    if finetune_audio_layers and _is_voxtral:
+        audio_leaves = []
+        if finetune_attention_modules:
+            audio_leaves += ["q_proj", "k_proj", "v_proj", "out_proj", "o_proj"]
+        if finetune_mlp_modules:
+            audio_leaves += ["fc1", "fc2", "gate_proj", "up_proj", "down_proj"]
+        audio_leaves = _scoped(audio_leaves)
+        audio_cores = [r"\baudio_tower\.(?:.*\.)?" + re.escape(x) for x in audio_leaves]
+        if finetune_mlp_modules:
+            audio_cores += [r"\bmulti_modal_projector\." + re.escape(x)
+                            for x in _scoped(["linear_1", "linear_2"])]
+        candidate_branches += _linear_aware_branches(audio_cores)
     if finetune_vision_layers and finetune_mlp_modules and _is_gemma_mm:
         # The Gemma vision embedders are flat projection / dense Linears -> like the
         # audio projector, gate them under the mlp flag (attention-only stays clean).
