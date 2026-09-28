@@ -268,10 +268,23 @@ class Mxfp4StackedExperts(nn.Module):
         )
 
 
-def _dense_stack(param, dtype):
-    if is_mxfp4_expert_param(param):
-        return param.dequantize(dtype)
-    return param.detach().to(dtype)
+def _dense_stack(param, dtype, device):
+    if not is_mxfp4_expert_param(param):
+        return param.detach().to(dtype).to(device)
+    # Chunked into `device`: a whole bf16 stack on the GPU is ~37 GiB per Kimi-K3 layer.
+    scales = param.mxfp4_scales
+    if scales.device != param.device:
+        scales = param.mxfp4_scales = scales.to(param.device)
+    E, step, out = param.data.shape[0], _experts_per_chunk(param, dtype), None
+    for start in range(0, E, step):
+        end = min(E, start + step)
+        piece = mxfp4_dequantize(
+            param.data[start:end], scales[start:end], dtype = dtype, transpose = param.mxfp4_transposed,
+        )
+        if out is None:
+            out = torch.empty((E, *piece.shape[1:]), dtype = dtype, device = device)
+        out[start:end].copy_(piece)
+    return out
 
 
 def dense_expert_modules(experts, device = "cpu"):
@@ -279,8 +292,8 @@ def dense_expert_modules(experts, device = "cpu"):
     experts.finalize()
     dtype = experts.mxfp4_dtype
     I = experts.intermediate_size
-    gate_up = _dense_stack(experts.gate_up_proj, dtype).to(device)
-    down = _dense_stack(experts.down_proj, dtype).to(device)
+    gate_up = _dense_stack(experts.gate_up_proj, dtype, device)
+    down = _dense_stack(experts.down_proj, dtype, device)
     out = nn.ModuleList()
     for e in range(experts.num_experts):
         expert = nn.Module()

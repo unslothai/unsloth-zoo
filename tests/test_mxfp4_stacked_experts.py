@@ -357,6 +357,24 @@ def test_dense_expert_modules_are_the_checkpoint_linears():
     assert torch.equal(experts[2].w3.weight, (gate_up[2, :, I:] + 1).t().cpu())
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "peak memory is measured on the CUDA allocator")
+def test_dense_expert_modules_decode_in_chunks_without_a_full_stack_on_the_gpu(monkeypatch):
+    from unsloth_zoo import mxfp4_stacked_experts as mse
+
+    module, ckpt = _experts()
+    monkeypatch.setattr(mse, "_chunk_bytes", lambda: 1)
+    full_stack = E * H * 2 * I * torch.empty((), dtype = module.mxfp4_dtype).element_size()
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    before = torch.cuda.memory_allocated()
+    experts = mse.dense_expert_modules(module)
+    torch.cuda.synchronize()
+    assert torch.cuda.max_memory_allocated() - before < full_stack
+    for e in range(E):
+        for w in ("w1", "w2", "w3"):
+            assert torch.equal(getattr(experts[e], w).weight, _ct_decompress(*ckpt[w][e]).to(torch.bfloat16))
+
+
 def _write_expert_shard(root, ckpt, prefix = "model.experts"):
     from safetensors.torch import save_file
 
