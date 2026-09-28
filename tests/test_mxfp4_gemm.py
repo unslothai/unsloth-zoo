@@ -64,12 +64,14 @@ def test_grouped_mm_matches_dequantize_then_matmul(transpose_b, counts):
         torch.testing.assert_close(got.float(), want, rtol = 1e-2, atol = 1e-2 * want.abs().max().item())
 
 
+@pytest.mark.parametrize("big_tiles", [True, False])
 @pytest.mark.parametrize("asm", [True, False])
-@pytest.mark.parametrize("E,M_per_expert", [(4, 1), (4, 12), (4, 40), (4, 150), (4, 300), (300, 1), (300, 3)])
-def test_every_tile_config_matches(E, M_per_expert, asm, monkeypatch):
+@pytest.mark.parametrize("E,M_per_expert", [(4, 1), (4, 12), (4, 40), (4, 80), (4, 150), (4, 300), (300, 1), (300, 3)])
+def test_every_tile_config_matches(E, M_per_expert, asm, big_tiles, monkeypatch):
     import unsloth_zoo.mxfp4_gemm as mg
     from unsloth_zoo.mxfp4_gemm import mxfp4_grouped_mm
     monkeypatch.setattr(mg, "_ASM_OK", {k: asm for k in (None, 0, torch.cuda.current_device())})
+    monkeypatch.setattr(mg, "_BIG_TILES", {k: big_tiles for k in (None, 0, torch.cuda.current_device())})
     R, C = (320, 192) if E < 256 else (64, 64)
     blocks, scales = _stack(E, R, C, seed = M_per_expert)
     counts = torch.full((E,), M_per_expert, dtype = torch.int32, device = "cuda")
