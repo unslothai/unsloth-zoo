@@ -159,7 +159,8 @@ def patch_merge_quantization_configs():
     # escapes this function and ends `import unsloth` outright. No published transformers
     # reaches it: the list is non-empty on every version from 4.49.0 to 5.17.0, 12 names on
     # 4.55.0. Kept anyway for a patched or future quantizers.auto, and cheap.
-    used = [x for x in items if x in source]
+    # No dunders: `__class__.__name__` in the source imported `__name__`, renaming this module (breaks Dynamo guards).
+    used = [x for x in items if not x.startswith("__") and x in source]
     if used:
         try:
             exec("from transformers.quantizers.auto import (" + ",".join(used) + ")", globals())
