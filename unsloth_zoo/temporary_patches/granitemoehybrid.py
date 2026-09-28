@@ -17,10 +17,11 @@
 # Granite-4 dense checkpoints (granite-4.0-350m, granite-4.0-micro) carry massive activations
 # in the shared MLP: in bf16, silu(gate) * up reaches ~65k and output_linear ~47k, against
 # float16's 65504, so float16 LoRA training overflows to inf within a few steps. The decoder
-# only scales that output by residual_multiplier (~0.25) afterwards. output_linear has no
-# bias, so in float16 the multiplier is folded into `up` before the product instead. Hybrid
+# only scales that output by residual_multiplier (~0.25) afterwards. output_linear is linear,
+# so in float16 the multiplier is folded into `up` before the product instead. Hybrid
 # checkpoints peak ~2.7k and are unaffected; other dtypes run the stock forward.
 
+import functools
 import inspect
 import re
 import textwrap
@@ -34,9 +35,13 @@ __all__ = []
 
 
 def _granite_scaled_shared_mlp(layer, hidden_states):
-    mlp = layer.shared_mlp
+    mlp, scale = layer.shared_mlp, layer.residual_multiplier
     gate, up = mlp.input_linear(hidden_states).chunk(2, dim = -1)
-    return mlp.output_linear(mlp.activation(gate) * (up * layer.residual_multiplier))
+    out = mlp.output_linear(mlp.activation(gate) * (up * scale))
+    # A bias (PEFT lora_bias=True on lora_B) escapes the fold: scale * f(x) == f(scale * x) + (scale - 1) * f(0).
+    if any(getattr(sub, "bias", None) is not None for sub in mlp.output_linear.modules()):
+        out = out + (scale - 1) * mlp.output_linear(up.new_zeros(1, up.shape[-1]))
+    return out
 
 
 def _rewrite_decoder_source(source):
@@ -65,8 +70,9 @@ def _rewrite_decoder_source(source):
 def _build_float16_decoder_forward(module, original_forward):
     source = _rewrite_decoder_source(inspect.getsource(original_forward))
     if source is None: return None
+    # torch.compile guards resolve globals through sys.modules[__name__], so the helper must live on the module.
+    module._granite_scaled_shared_mlp = _granite_scaled_shared_mlp
     namespace = dict(vars(module))
-    namespace["_granite_scaled_shared_mlp"] = _granite_scaled_shared_mlp
     exec(compile(source, f"<unsloth granitemoehybrid float16 {module.__name__}>", "exec"), namespace)
     return namespace["forward"]
 
@@ -86,11 +92,11 @@ def patch_GraniteMoeHybridDecoderLayer_float16():
     if float16_forward is None:
         return raise_error("GraniteMoeHybridDecoderLayer.forward", "source layout changed")
 
+    @functools.wraps(original_forward)
     def forward(self, hidden_states, *args, **kwargs):
         if hidden_states.dtype == torch.float16:
             return float16_forward(self, hidden_states, *args, **kwargs)
         return original_forward(self, hidden_states, *args, **kwargs)
     forward._unsloth_granite_float16 = True
-    forward.__wrapped__ = original_forward
     layer_class.forward = forward
 TEMPORARY_PATCHES.append(patch_GraniteMoeHybridDecoderLayer_float16)
