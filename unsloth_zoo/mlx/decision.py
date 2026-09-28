@@ -226,4 +226,7 @@ def load_decision_model(folder, dtype = mx.float32):
     model.load_weights(weights, strict = True)
     model.eval()
     mx.eval(model.parameters())
+    # eval returns before the command buffer drops the cast's source tensors; wait, then empty the process-wide cache.
+    mx.synchronize()
+    mx.clear_cache()
     return model

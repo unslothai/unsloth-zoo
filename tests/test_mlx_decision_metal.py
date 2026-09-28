@@ -120,3 +120,12 @@ def test_logits_match_the_torch_reference(checkpoint):
     got = load_decision_model(folder, dtype = mx.float32).logits(batch)
     np.testing.assert_allclose(got, expected, atol = 2e-5, rtol = 0)
     assert got[1, 2] == -1e4
+
+
+def test_casting_load_leaves_no_source_buffers_cached(checkpoint):
+    folder = checkpoint[1]
+    assert {v.dtype for v in mx.load(str(folder / "model.safetensors")).values()} == {mx.float32}
+    model = load_decision_model(folder, dtype = mx.float16)
+    mx.synchronize()
+    assert mx.get_cache_memory() < (folder / "model.safetensors").stat().st_size // 10
+    del model
