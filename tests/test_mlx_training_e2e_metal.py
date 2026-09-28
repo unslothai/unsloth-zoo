@@ -2410,30 +2410,28 @@ def test_checkpointed_kv_shared_layers_hold_what_unshared_layers_hold():
         mx.eval(model.parameters())
         return model
 
-    def peak_and_grads(model, repeats = 3):
-        """Peak above resident, taken as the MINIMUM over `repeats` measurements.
+    def peak_and_grads(model, repeats = 5):
+        """Peak above resident, taken as the MAXIMUM over `repeats` measurements.
 
-        A peak is a maximum over a run, so noise can only push it up: allocator state
-        left by whatever ran before it, a cache the runtime had not reclaimed yet. The
-        floor is the algorithmic requirement, and the floor is what the ratio below is
-        about, so the minimum of a few readings estimates it where a single reading does
-        not. One reading is what made this flake: run 35502075009 on main reported
-        shared 197663512 against unshared 151210728, a ratio of 1.307 over the 1.25
-        bound, and the same commit with the same pins passed on re-run.
+        On Metal the reading is exact when it is right and low when it is wrong: across
+        repeated full-file runs the unshared peak read 182285696 (pinned) or 183564288
+        (latest) every time it did not read low, and read 126 MB, 147 MB, 151 MB, even
+        negative, when it did. It never read above. The flakes this test has had are all
+        such low readings of the unshared model: run 35502075009 read shared 197663512
+        (its exact value) against unshared 151210728, and run 36311394738 took 2284 bytes
+        as the unshared peak. A minimum keeps exactly those, so the maximum is the
+        estimate. `mx.synchronize()` and `gc.collect()` before sampling `resident` were
+        both tried on Metal and neither removes the low readings.
 
         The bound itself is unchanged. This makes the measurement less noisy rather than
         the claim weaker.
         """
         loss_and_grad = nn.value_and_grad(model, lambda m: (m(ids) ** 2).sum())
         mx.eval(loss_and_grad(model))
-        floor, grads, dropped = None, None, []
+        ceiling, grads, readings = None, None, []
         for _ in range(repeats):
-            # Drop the previous repeat's gradients BEFORE `resident` is sampled. Holding
-            # them would put a tree in `resident` that the assignment below releases
-            # before the measured run, so the subtraction would remove memory that was
-            # not resident during it and the repeat would read low. A floor made of
-            # readings like that is lower than the algorithmic floor, which is the one
-            # direction this must not move in.
+            # Drop the previous repeat's gradients BEFORE `resident` is sampled, so
+            # `resident` holds nothing the measured run releases.
             grads = None
             mx.clear_cache()
             resident = mx.get_active_memory()
@@ -2441,24 +2439,20 @@ def test_checkpointed_kv_shared_layers_hold_what_unshared_layers_hold():
             grads = loss_and_grad(model)[1]
             mx.eval(grads)
             peak = mx.get_peak_memory() - resident
+            readings.append(peak)
             # The gradients this repeat produced are still live when it ends, so no real
-            # peak above `resident` is smaller than they are. A reading under that is the
-            # allocator reporting nothing for the run, and a minimum keeps exactly such a
-            # reading: run 36311394738 on main took unshared 2284 bytes as its floor and
-            # failed 193222844 < 1.25 * 2284. Readings like that are dropped, not kept.
-            produced = sum(g.nbytes for _, g in tree_flatten(grads))
-            if peak < produced:
-                dropped.append((peak, produced))
+            # peak is smaller than they are; a reading under that is not kept.
+            if peak < sum(g.nbytes for _, g in tree_flatten(grads)):
                 continue
-            floor = peak if floor is None else min(floor, peak)
-        return floor, grads, dropped
+            ceiling = peak if ceiling is None else max(ceiling, peak)
+        return ceiling, grads, readings
 
     def floor_and_grads(model):
-        floor, grads, dropped = peak_and_grads(model)
-        assert floor is not None, (
-            f"every repeat read a peak below the gradients it produced: {dropped}"
+        peak, grads, readings = peak_and_grads(model)
+        assert peak is not None, (
+            f"every repeat read a peak below the gradients it produced: {readings}"
         )
-        return floor, grads
+        return peak, grads
 
     shared, unshared = build(10), build(0)
     # Only the gradients of this pass are used, so its single peak reading is not
