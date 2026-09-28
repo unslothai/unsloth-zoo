@@ -197,3 +197,11 @@ def test_non_nvfp4_packed_weights_are_refused():
     # A (N, 1) scale against a (1, N) packed row would broadcast to (1, N, 2N) instead of failing.
     with pytest.raises(RuntimeError, match="is not NVFP4"):
         _nvfp4_dequantize(packed[:1], scale.reshape(-1, 1), gs)
+
+
+def test_missing_nvfp4_global_scale_is_refused():
+    from unsloth_zoo.saving_utils import _nvfp4_dequantize
+
+    packed, scale, _ = _nvfp4(32, 64, 0)
+    with pytest.raises(RuntimeError, match="no weight_global_scale"):
+        _nvfp4_dequantize(packed, scale, None)
