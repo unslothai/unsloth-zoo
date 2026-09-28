@@ -1251,9 +1251,7 @@ _STRING_CONTENT_DEFAULTS = {"image": "<image>", "video": "<video>", "audio": "<a
 
 
 def _media_placeholder(processor, kind) -> str:
-    """Placeholder a string-content template expects for one media part: the processor's or
-    tokenizer's `<kind>_token`, else the remote module's DEFAULT_<KIND>_TOKEN (LLaVA-derived
-    code such as Phi-4-reasoning-vision), else `<kind>`."""
+    """`<kind>_token` on processor/tokenizer, else remote module's DEFAULT_<KIND>_TOKEN (Phi-4-reasoning-vision)."""
     import sys
     for obj in (processor, getattr(processor, "tokenizer", None)):
         token = getattr(obj, f"{kind}_token", None) if obj is not None else None
@@ -1301,8 +1299,7 @@ pass
 
 
 def _template_needs_string_content(processor) -> bool:
-    """True when the chat template concatenates `message['content']` as a string: a content
-    list raises TypeError while the same turn as a plain string renders."""
+    """List content raises TypeError but the same turn as a string renders."""
     try:
         processor.apply_chat_template(
             [{"role": "user", "content": [{"type": "text", "text": "Hello!"}]}], tokenize = False,
@@ -1348,11 +1345,7 @@ pass
 
 
 def _patch_string_content_chat_template(processor) -> bool:
-    """Phi-4-reasoning-vision (phi4-siglip) and other LLaVA-style templates only take
-    `'<image>\\n' + text` string content. Make this processor's apply_chat_template accept
-    the standard content-list format by joining parts, media parts becoming the placeholder
-    the processor tokenizes (`<image>` -> IMAGE_TOKEN_INDEX there). Instance-level, idempotent;
-    templates that already take lists are untouched."""
+    """Phi-4-reasoning-vision / LLaVA templates concatenate string content: flatten content lists."""
     original = getattr(processor, "apply_chat_template", None)
     if original is None or getattr(original, "_unsloth_string_content", False):
         return False
@@ -1394,12 +1387,7 @@ pass
 
 
 def _probe_assistant_single_content(processor, model = None):
-    """True when the chat template only renders a plain string as the assistant content.
-
-    Templates that only take a string either fail in Python (TypeError), render the list's repr, or
-    reject the list in Jinja itself (Apertus 1.5 raises TemplateError("Invalid assistant content")).
-    Any of those falls back to the string form; if that fails too the original error is reported.
-    """
+    """Any list-form failure (TypeError, repr, Apertus 1.5 Jinja TemplateError) tries a string."""
     user = {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Hello!"}]}
     try:
         rendered = processor.apply_chat_template([
@@ -1415,7 +1403,6 @@ def _probe_assistant_single_content(processor, model = None):
                 user, {"role": "assistant", "content": "How can I help you?"},
             ])
         except Exception as e:
-            # Neither form renders: report the list-form error unless it came from our repr probe.
             _raise_chat_template_error(
                 e if isinstance(list_error, TypeError) else list_error, processor, model
             )
@@ -1688,8 +1675,7 @@ class UnslothVisionDataCollator:
         labels = batch["input_ids"].clone()
         padding_ids = self._get_padding_token_ids_on_device(labels.device)
         labels[torch.isin(labels, padding_ids)] = self.ignore_index
-        # LLaVA-style processors put a negative sentinel (IMAGE_TOKEN_INDEX = -200) where the
-        # model splices image features; it is never a valid target.
+        # LLaVA IMAGE_TOKEN_INDEX (-200) sentinel is never a target.
         labels[labels < 0] = self.ignore_index
         batch["labels"] = labels
         return batch

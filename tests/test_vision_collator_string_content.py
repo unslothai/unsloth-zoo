@@ -14,10 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""String-content chat templates (Phi-4-reasoning-vision, phi4-siglip remote code): the template
-concatenates message['content'] as a string and the processor splices IMAGE_TOKEN_INDEX (-200)
-where `<image>` appears. The collator must render content lists as `<image>\\ntext` and never
-supervise the sentinel. Hermetic CPU tests; the stub mirrors processing_phi4_visionr.py."""
+"""Phi-4-reasoning-vision string-content templates; stub mirrors processing_phi4_visionr.py."""
 
 from __future__ import annotations
 
@@ -33,7 +30,6 @@ from PIL import Image
 IMAGE_TOKEN_INDEX = -200
 DEFAULT_IMAGE_TOKEN = "<image>"
 
-# processing_phi4_visionr.py is imported as its own module; the collator reads its constant.
 _remote = types.ModuleType("processing_phi4_visionr_stub")
 _remote.DEFAULT_IMAGE_TOKEN = DEFAULT_IMAGE_TOKEN
 sys.modules[_remote.__name__] = _remote
@@ -159,11 +155,9 @@ def test_string_content_template_renders_list_content_with_placeholder():
     msgs = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Describe."}]}]
     prompt = processor.apply_chat_template(msgs, tokenize = False, add_generation_prompt = True)
     assert prompt.endswith("<|im_start|>user<|im_sep|><image>\nDescribe.<|im_end|><|im_start|>assistant<|im_sep|>")
-    # Plain string content (the model card's own usage) is unchanged, and the input is not mutated.
     assert isinstance(msgs[0]["content"], list)
     same = processor.apply_chat_template([{"role": "user", "content": "<image>\nDescribe."}], tokenize = False)
     assert "<image>\nDescribe." in same
-    # Idempotent: a second collator does not wrap twice.
     wrapped = processor.apply_chat_template
     _collator(processor)
     assert processor.apply_chat_template is wrapped
@@ -191,7 +185,6 @@ class _PicklableStringProcessor:
 
 
 def test_patched_processor_is_picklable():
-    # Spawn / forkserver DataLoader workers pickle the collator and its processor.
     import pickle
     from unsloth_zoo.vision_utils import _patch_string_content_chat_template
     processor = _PicklableStringProcessor()

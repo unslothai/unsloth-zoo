@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The collator's assistant-content probe. Apertus 1.5's template rejects list assistant content inside
-Jinja (TemplateError "Invalid assistant content"), which the probe used to re-raise instead of falling
-back to the string form. Hermetic CPU tests with a stub processor rendering a real Jinja template."""
+"""Apertus 1.5 rejects list assistant content in Jinja; the probe must fall back to a string."""
 
 from __future__ import annotations
 
@@ -31,7 +29,6 @@ def _raise(message):
     raise jinja2.exceptions.TemplateError(message)
 
 
-# Apertus 1.5 shaped: assistant content must be a string (or its own block list), lists of parts raise.
 STRING_ONLY = (
     "{% for m in messages %}"
     "{% if m['role'] == 'user' %}<u>{% for p in m['content'] %}"
