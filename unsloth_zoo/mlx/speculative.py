@@ -18,17 +18,23 @@
 
 from __future__ import annotations
 
+import importlib
+import json
 import time
 from dataclasses import dataclass, field, replace
+from itertools import combinations
+from pathlib import Path
 from typing import Any, Callable, Literal, Sequence
 
 import mlx.core as mx
+import mlx.nn as nn
 
 from .generate import SamplingParams
 
 __all__ = [
     "DraftController",
     "EngineRow",
+    "MTPDrafter",
     "NgramProposer",
     "ReplyStats",
     "RoundPlan",
@@ -36,6 +42,7 @@ __all__ = [
     "RowState",
     "SpeculativeEngine",
     "StepOutput",
+    "native_mtp_drafter",
 ]
 
 
@@ -180,7 +187,7 @@ class DraftController:
     drafted position, one rate for copies), seeded from the load's aggregate. Time is kept per
     component, since the components move independently: verify by batch size and width,
     drafting per row by depth, drafter catch-up per token, plain decoding per step by batch
-    size. A candidate is worth its expected emitted tokens over its expected seconds, so a
+    size, and the drafting a fused round hides behind building its verify, by batch size. A candidate is worth its expected emitted tokens over its expected seconds, so a
     drafter forward or a catch-up is paid for only where it earns more than a free copy.
 
     Plain decoding is timed as the pipelined decode it is, so a drafter that loses to ordinary
@@ -232,6 +239,7 @@ class DraftController:
         self.plain_cost: dict[int, _Ema] = {}
         self.draft_cost = {depth: _Ema() for depth in range(1, self.max_depth + 1)}
         self.catch_up_cost = _Ema()
+        self.hidden_drafting: dict[int, _Ema] = {}
         self.tokens = 0
         # Probes and staleness run on sequence positions, so a wide batch probes no more often.
         self.steps = 0.0
@@ -252,6 +260,7 @@ class DraftController:
     _DRAFT_SLOPE = 0.25
     _CATCH_UP = 0.1
     _COPY_PROBE = 4
+    _EXHAUSTIVE_ROWS = 6
 
     def new_reply(self) -> ReplyStats:
         return ReplyStats(self.draft_acceptance, self.copy_acceptance, self._base_backoff)
@@ -304,9 +313,14 @@ class DraftController:
             return 0.0
         return self._draft_seconds(row.length) + state.catch_up * self._catch_up_seconds()
 
+    def _drafting_paid(self, bucket: int, drafting: float) -> float:
+        hidden = self.hidden_drafting.get(bucket)
+        return drafting if hidden is None or hidden.value is None else max(drafting - hidden.value, 0.0)
+
     def round_seconds(self, plan: RoundPlan, rows: Sequence[RowState], width: int | None = None) -> float:
-        seconds = self._verify_seconds(_bucket(len(rows)), width or plan.width)
-        return seconds + sum(self._row_seconds(row, state) for row, state in zip(plan.rows, rows))
+        bucket = _bucket(len(rows))
+        drafting = sum(self._row_seconds(row, state) for row, state in zip(plan.rows, rows))
+        return self._verify_seconds(bucket, width or plan.width) + self._drafting_paid(bucket, drafting)
 
     def score(self, plan: RoundPlan, rows: Sequence[RowState], width: int | None = None) -> float:
         if plan.kind == "plain":
@@ -319,9 +333,8 @@ class DraftController:
         return length if state.remaining is None else max(0, min(length, state.remaining - 1))
 
     def _round_at(self, width: int, rows: Sequence[RowState]) -> RoundPlan:
-        # Drafting rows add tokens and their own forward to one shared verify, so the best set is
-        # a prefix by tokens gained per second. Scored at the nominal width, so the first row to
-        # draft does not carry the whole widening alone.
+        # Drafting rows add tokens and their own forward to one shared verify. Scored at the
+        # nominal width, so the first row to draft does not carry the whole widening alone.
         base, options = [], []
         for i, state in enumerate(rows):
             copy = self._cap(state, min(state.copy_available, self.max_copy, width - 1))
@@ -331,20 +344,33 @@ class DraftController:
                 draft = RowPlan("draft", depth)
                 gain = state.stats.expected(draft) - state.stats.expected(base[i])
                 options.append((gain, self._row_seconds(draft, state), i, draft))
+        bucket = _bucket(len(rows))
         tokens = sum(state.stats.expected(row) for row, state in zip(base, rows))
-        seconds = self._verify_seconds(_bucket(len(rows)), width)
+        verify = self._verify_seconds(bucket, width)
+        rate = lambda gain, cost: (tokens + gain) / (verify + self._drafting_paid(bucket, cost))
+        options.sort(key = lambda option: option[0] / option[1], reverse = True)
+        if len({option[1] for option in options}) > 1 and len(options) <= self._EXHAUSTIVE_ROWS:
+            # Drafting hidden behind the verify makes unequal costs a knapsack; few rows try every set.
+            scored = [
+                (sum(option[0] for option in chosen), sum(option[1] for option in chosen), chosen)
+                for size in range(1, len(options) + 1) for chosen in combinations(options, size)
+            ]
+        else:
+            # Equal costs make the best set of each size its top gains, a prefix of the ratio order;
+            # a round needs a drafter when no row copies, and the least harmful lone one may trail.
+            scored, gain, cost = [], 0.0, 0.0
+            for size, option in enumerate(options, 1):
+                gain, cost = gain + option[0], cost + option[1]
+                scored.append((gain, cost, options[:size]))
+            scored += [(option[0], option[1], (option,)) for option in options]
         best = RoundPlan("round", rows = tuple(base))
-        best_score = tokens / seconds
-        if best.width == 1 and options:
-            # A round needs a drafter; the least harmful lone one need not lead the ratio order.
-            gain, cost, i, draft = max(options, key = lambda option: (tokens + option[0]) / (seconds + option[1]))
-            best, best_score = RoundPlan("round", rows = best.rows[:i] + (draft,) + best.rows[i + 1 :]), (tokens + gain) / (seconds + cost)
-        choice = base
-        for gain, cost, i, draft in sorted(options, key = lambda option: option[0] / option[1], reverse = True):
-            choice[i] = draft
-            tokens, seconds = tokens + gain, seconds + cost
-            if tokens / seconds > best_score:
-                best, best_score = RoundPlan("round", rows = tuple(choice)), tokens / seconds
+        best_score = rate(0.0, 0.0) if best.width > 1 else 0.0
+        for gain, cost, chosen in scored:
+            if rate(gain, cost) > best_score:
+                plan = list(base)
+                for _, _, i, draft in chosen:
+                    plan[i] = draft
+                best, best_score = RoundPlan("round", rows = tuple(plan)), rate(gain, cost)
         return best
 
     @staticmethod
@@ -378,7 +404,9 @@ class DraftController:
         chosen, probing = self._choose(candidates, rows, bucket)
         if not probing:
             chosen = self._with_source_probes(chosen, rows)
-        if chosen.kind == "round" and (probing or not self._measured_parts(chosen, rows)):
+        # A probe's first round re-measures the parts; the rest run fused, as a winner would.
+        starting = probing and self._probe_left == self.probe_rounds - 1
+        if chosen.kind == "round" and (starting or not self._measured_parts(chosen, rows)):
             chosen = replace(chosen, split = True)
         return self._split_due(chosen)
 
@@ -510,8 +538,8 @@ class DraftController:
     ) -> None:
         """Account a finished round; ``accepted[i]`` counts row ``i``'s accepted drafts.
 
-        ``seconds`` is the whole round. The drafting and catch-up shares are read only from a
-        split round; a fused round rescales the current estimates to its total instead.
+        ``seconds`` is the whole round. A split round times its parts apart; a fused round,
+        whose drafting overlaps building its verify, measures how much of the drafting it hid.
         """
         bucket = _bucket(len(rows))
         alpha = self.acceptance_alpha
@@ -539,32 +567,25 @@ class DraftController:
 
         depths = [row.length for row in plan.rows if row.source == "draft" and row.length]
         catch_up = sum(state.catch_up for row, state in zip(plan.rows, rows) if row.source == "draft")
+        verify = self.verify_cost.setdefault(bucket, {}).setdefault(plan.width, _Ema())
         if plan.split:
             self._since_split = 0
-            verify_seconds = max(seconds - draft_seconds - catch_up_seconds, 1e-9)
+            verify.update(max(seconds - draft_seconds - catch_up_seconds, 1e-9), self.cost_alpha)
+            # Only a round drafting one depth for every row can attribute its drafting time.
+            if depths and len(set(depths)) == 1:
+                self.draft_cost[depths[0]].update(draft_seconds / len(depths), self.cost_alpha)
+            if catch_up:
+                self.catch_up_cost.update(catch_up_seconds / catch_up, self.cost_alpha)
         else:
             self._since_split += 1
-            verify_seconds = self._verify_seconds(bucket, plan.width)
-            drafts = sum(self._draft_seconds(depth) for depth in depths)
-            replay = catch_up * self._catch_up_seconds()
-            scale = seconds / (verify_seconds + drafts + replay)
-            verify_seconds *= scale
-            catch_up_seconds = replay * scale
-        self.verify_cost.setdefault(bucket, {}).setdefault(plan.width, _Ema()).update(
-            verify_seconds, self.cost_alpha
-        )
-        if depths:
-            # A split round only apportions drafting time it can attribute: one depth for
-            # every drafting row. A fused round moves each depth by the round's own scale.
-            if not plan.split:
-                for depth in set(depths):
-                    self.draft_cost[depth].update(self._draft_seconds(depth) * scale, self.cost_alpha)
-            elif len(set(depths)) == 1:
-                self.draft_cost[depths[0]].update(draft_seconds / len(depths), self.cost_alpha)
-            if self._warmup and self._warmup[0] >= max(depths):
-                self._warmup.pop(0)
-        if catch_up:
-            self.catch_up_cost.update(catch_up_seconds / catch_up, self.cost_alpha)
+            drafting = sum(self._draft_seconds(depth) for depth in depths) + catch_up * self._catch_up_seconds()
+            if drafting:
+                hidden = min(max(self._verify_seconds(bucket, plan.width) + drafting - seconds, 0.0), drafting)
+                self.hidden_drafting.setdefault(bucket, _Ema()).update(hidden, self.cost_alpha)
+            else:
+                verify.update(seconds, self.cost_alpha)
+        if depths and self._warmup and self._warmup[0] >= max(depths):
+            self._warmup.pop(0)
         self.steps += (sum(min(int(a), row.length) for a, row in zip(accepted, plan.rows)) + len(rows)) / len(rows)
         self._measured_at[self._identity(plan, bucket)] = self.steps
 
@@ -622,7 +643,8 @@ class EngineRow:
 
     ``cache`` holds the prompt; ``pending`` is the last sampled token, already emitted but not yet
     forwarded; ``emitted`` counts the tokens emitted so far, ``pending`` included, and is the
-    position of the next draw.
+    position of the next draw. ``hidden`` is the target's last-layer hidden ``[1, N, H]`` at the
+    last N prompt positions, which a drafter starts from.
     """
 
     cache: list
@@ -634,6 +656,7 @@ class EngineRow:
     stop_tokens: frozenset = frozenset()
     processors: Sequence[Callable] = ()
     rope_delta: int = 0
+    hidden: Any = None
     uid: Any = None
 
 
@@ -664,6 +687,7 @@ class _Row:
         self.finished = self.pending in self.stop_tokens or self.remaining == 0
         self.draft_n = 0
         self.draft_n_accepted = 0
+        self.draft = None
 
     @property
     def remaining(self) -> int | None:
@@ -675,7 +699,11 @@ class _Row:
             history = mx.array(self.tokens)
             for processor in self.processors:
                 logits = processor(history, logits)
-        return logits - mx.logsumexp(logits, axis = -1, keepdims = True)
+        return self.normalize(logits)
+
+    def normalize(self, logits: mx.array) -> mx.array:
+        # A greedy draw is the argmax, which normalizing leaves unchanged.
+        return logits if self.sample.temperature == 0 else logits - mx.logsumexp(logits, axis = -1, keepdims = True)
 
     def take(self, tokens: Sequence[int]) -> list[int]:
         """Emit ``tokens`` up to a stop token or the budget; the last one taken becomes pending."""
@@ -700,17 +728,43 @@ def _language_call(family: str):
     return module.LanguageModel.__call__
 
 
+def _join(batch: list | None, new: list, size: int) -> list:
+    if not size:
+        return list(new)
+    if size == 1:
+        return [type(entry).merge([entry, row]) for entry, row in zip(batch, new)]
+    for entry, row in zip(batch, new):
+        entry.extend(type(row).merge([row]))
+    return batch
+
+
+def _split(batch: list, keep: list[int]) -> list | None:
+    if not keep:
+        return None
+    if len(keep) == 1:
+        # A single-row batch cache sends some families down per-row paths that replace it.
+        from mlx_vlm.models.cache import KVCache
+
+        # Drafter caches of rows that never drafted hold no entries to extract.
+        return [KVCache() if getattr(entry, "keys", 0) is None else entry.extract(keep[0]) for entry in batch]
+    indices = mx.array(keep)
+    for entry in batch:
+        entry.filter(indices)
+    return batch
+
+
 class SpeculativeEngine:
     """Decodes B rows with the controller's choice each step: a verify round at one width, each
     row verifying its own proposal and committing its own accepted count, or a window of
     ordinary decode steps. Rows join and leave only between steps, when every row holds exactly
     one pending token and the caches hold everything before it."""
 
-    def __init__(self, model, controller: DraftController):
+    def __init__(self, model, controller: DraftController, drafter = None):
         from mlx_vlm.speculative.common import generation_stream, verify_forward
 
         self.lm = getattr(model, "language_model", model)
         self.controller = controller
+        self.drafter = drafter
         self._verify_forward = verify_forward
         self._stream = generation_stream
         # qwen3_5's exact verifier matches one-token decoding bitwise, alone and batched, and passing
@@ -722,6 +776,7 @@ class SpeculativeEngine:
         self._mrope = hasattr(self.lm, "_rope_deltas")
         self._rows: list[_Row] = []
         self.cache: list | None = None
+        self.draft_cache: list | None = None
         self.round_refusal: str | None = None
 
     @property
@@ -731,29 +786,24 @@ class SpeculativeEngine:
     def add(self, row: EngineRow) -> None:
         if any(existing.uid == row.uid for existing in self._rows):
             raise ValueError(f"row {row.uid!r} is already in the engine")
-        if not self._rows:
-            self.cache = list(row.cache)
-        elif len(self._rows) == 1:
-            self.cache = [type(batch).merge([batch, new]) for batch, new in zip(self.cache, row.cache)]
-        else:
-            for batch, new in zip(self.cache, row.cache):
-                batch.extend(type(new).merge([new]))
-        self._rows.append(_Row(row, self.controller))
+        state = _Row(row, self.controller)
+        if self.drafter is not None:
+            if state.processors:
+                draft_cache = self.drafter.new_cache()
+            else:
+                state.draft, draft_cache = self.drafter.start(row.prompt, row.hidden, state.pending)
+            self.draft_cache = _join(self.draft_cache, draft_cache, len(self._rows))
+        self.cache = _join(self.cache, row.cache, len(self._rows))
+        self._rows.append(state)
 
     def remove(self, uid) -> None:
         keep = [i for i, row in enumerate(self._rows) if row.uid != uid]
         if len(keep) == len(self._rows):
             raise KeyError(uid)
         self._rows = [self._rows[i] for i in keep]
-        if not keep:
-            self.cache = None
-        elif len(keep) == 1:
-            # A single-row batch cache sends some families down per-row paths that replace it.
-            self.cache = [batch.extract(keep[0]) for batch in self.cache]
-        else:
-            indices = mx.array(keep)
-            for batch in self.cache:
-                batch.filter(indices)
+        self.cache = _split(self.cache, keep)
+        if self.drafter is not None:
+            self.draft_cache = _split(self.draft_cache, keep)
 
     def step(self) -> list[StepOutput]:
         """One round or plain window, one output per row. Finished rows leave the engine."""
@@ -783,6 +833,7 @@ class SpeculativeEngine:
             state.copy_available = (
                 0 if row.processors else len(row.proposer.propose(row.tokens, self.controller.max_copy))
             )
+            state.can_draft = row.draft is not None and row.draft.ready
         return [row.state for row in self._rows]
 
     def _position_kwargs(self) -> dict:
@@ -790,23 +841,31 @@ class SpeculativeEngine:
             return {}
         return {"rope_deltas": mx.array([[row.rope_delta] for row in self._rows])}
 
-    def _forward(self, inputs: mx.array) -> mx.array:
-        return self.lm(inputs, cache = self.cache, **self._position_kwargs()).logits
+    def _kwargs(self) -> dict:
+        kwargs = self._position_kwargs()
+        if any(row.draft is not None for row in self._rows):
+            kwargs["return_hidden"] = True
+        return kwargs
+
+    @staticmethod
+    def _hidden(out) -> mx.array | None:
+        return out.hidden_states[-1] if out.hidden_states else None
+
+    def _step(self, inputs: mx.array, ahead: int = 0) -> tuple[mx.array, mx.array | None]:
+        """Forward one token per row and sample the next; ``ahead`` counts tokens already sampled
+        for each row but not taken yet."""
+        out = self.lm(inputs, cache = self.cache, **self._kwargs())
+        tokens = mx.concatenate(
+            [row.sample(row.logprobs(out.logits[i : i + 1, -1]), row.emitted + ahead) for i, row in enumerate(self._rows)]
+        )
+        return tokens, self._hidden(out)
 
     def _verify(self, inputs: mx.array):
         if self._exact:
-            out = self.lm(
-                inputs, cache = self.cache, capture_layer_ids = [], speculative_verify = True, **self._position_kwargs()
-            )
-            return out.logits, out.gdn_states
-        out, transaction = self._verify_forward(self.lm, inputs, self.cache, **self._position_kwargs())
-        return out.logits, transaction
-
-    def _sample_step(self, logits: mx.array, ahead: int = 0) -> mx.array:
-        # ``ahead``: tokens already sampled for each row but not taken yet.
-        return mx.concatenate(
-            [row.sample(row.logprobs(logits[i : i + 1, -1]), row.emitted + ahead) for i, row in enumerate(self._rows)]
-        )
+            out = self.lm(inputs, cache = self.cache, capture_layer_ids = [], speculative_verify = True, **self._kwargs())
+            return out.logits, self._hidden(out), out.gdn_states
+        out, transaction = self._verify_forward(self.lm, inputs, self.cache, **self._kwargs())
+        return out.logits, self._hidden(out), transaction
 
     def _plain(self, length: int, states: list[RowState]) -> list[list[int]]:
         rows = self._rows
@@ -815,7 +874,7 @@ class SpeculativeEngine:
         pipelined = not any(row.processors for row in rows)
         start = time.perf_counter()
         with mx.stream(self._stream):
-            tokens = self._sample_step(self._forward(mx.array([[row.pending] for row in rows])))
+            tokens, hidden = self._step(mx.array([[row.pending] for row in rows]))
         steps = 0
         while True:
             steps += 1
@@ -823,19 +882,22 @@ class SpeculativeEngine:
             upcoming = None
             if not last and pipelined:
                 with mx.stream(self._stream):
-                    upcoming = self._sample_step(self._forward(tokens[:, None]), ahead = 1)
-                mx.async_eval(upcoming)
+                    upcoming = self._step(tokens[:, None], ahead = 1)
+                mx.async_eval(upcoming[0])
             for i, token in enumerate(tokens.tolist()):
-                emitted[i].extend(rows[i].take([token]))
+                taken = rows[i].take([token])
+                emitted[i].extend(taken)
+                if taken and rows[i].draft is not None:
+                    self.drafter.push(rows[i].draft, taken, hidden[i, -1:])
             if last:
                 break
             if upcoming is None:
                 with mx.stream(self._stream):
-                    upcoming = self._sample_step(self._forward(tokens[:, None]))
+                    upcoming = self._step(tokens[:, None])
             elif self.controller.interrupts_plain(self._states()):
                 # The next step is already queued, so it becomes the window's last.
                 length = steps + 1
-            tokens = upcoming
+            tokens, hidden = upcoming
         self.controller.record_plain(states, steps, time.perf_counter() - start)
         return emitted
 
@@ -845,30 +907,55 @@ class SpeculativeEngine:
             row.proposer.propose(row.tokens, spec.length) if spec.source == "copy" else []
             for row, spec in zip(rows, plan.rows)
         ]
+        lengths = [spec.length if spec.source == "draft" else len(proposal) for spec, proposal in zip(plan.rows, proposals)]
         inputs = mx.array(
             [[row.pending, *proposal] + [row.pending] * (width - 1 - len(proposal)) for row, proposal in zip(rows, proposals)]
         )
         start = time.perf_counter()
+        depth = max((spec.length for spec in plan.rows if spec.source == "draft"), default = 0)
+        drafts, draft_seconds = None, 0.0
+        if depth:
+            with mx.stream(self._stream):
+                # Replay is one head forward, as costly for one pair as for many, so it counts as drafting.
+                self.drafter.catch_up(self.draft_cache, [row.draft if spec.source == "draft" else None for row, spec in zip(rows, plan.rows)])
+                drafts = self.drafter.draft(self.draft_cache, [row.draft for row in rows], depth).astype(inputs.dtype)
+                if plan.split:
+                    mx.eval(drafts)
+                    draft_seconds = time.perf_counter() - start
+                else:
+                    # The head drafts on the GPU while the host builds the verify graph.
+                    mx.async_eval(drafts)
+                columns = mx.arange(width - 1)[None]
+                drafting = mx.array([[spec.length if spec.source == "draft" else 0] for spec in plan.rows])
+                padded = mx.pad(drafts, [(0, 0), (0, width - 1 - depth)])
+                inputs = mx.concatenate([inputs[:, :1], mx.where(columns < drafting, padded, inputs[:, 1:])], axis = 1)
         entries = list(self.cache)
         with mx.stream(self._stream):
-            logits, transaction = self._verify(inputs)
+            logits, hidden, transaction = self._verify(inputs)
         if any(now is not before for now, before in zip(self.cache, entries)):
             self.cache[:] = entries
             transaction.abort()
+            if depth:
+                self.drafter.settle(self.draft_cache, [row.draft for row in rows], depth - 1, [0] * len(rows))
             self.round_refusal = f"{type(self.lm).__name__} replaced its cache objects during a verify forward"
             return None
         try:
             with mx.stream(self._stream):
                 targets = []
-                for i, (row, proposal) in enumerate(zip(rows, proposals)):
+                for i, (row, length) in enumerate(zip(rows, lengths)):
                     if row.processors:
                         logprobs = row.logprobs(logits[i : i + 1, 0])
                     else:
-                        logprobs = logits[i, : len(proposal) + 1]
-                        logprobs = logprobs - mx.logsumexp(logprobs, axis = -1, keepdims = True)
+                        logprobs = row.normalize(logits[i, : length + 1])
                     targets.append(row.sample(logprobs, row.emitted))
-            mx.eval(targets)
+            mx.eval(targets if drafts is None else [*targets, drafts])
             targets = [target.tolist() for target in targets]
+            if depth:
+                drafted = drafts.tolist()
+                proposals = [
+                    drafted[i][:length] if spec.source == "draft" else proposal
+                    for i, (spec, length, proposal) in enumerate(zip(plan.rows, lengths, proposals))
+                ]
             accepted = []
             for proposal, target in zip(proposals, targets):
                 count = 0
@@ -885,10 +972,190 @@ class SpeculativeEngine:
         except BaseException:
             transaction.abort()
             raise
+        kept = [min(count, depth - 1) if spec.source == "draft" else 0 for spec, count in zip(plan.rows, accepted)]
+        if depth:
+            self.drafter.settle(self.draft_cache, [row.draft for row in rows], depth - 1, kept)
         emitted = []
-        for row, proposal, target, count in zip(rows, proposals, targets, accepted):
+        for i, (row, proposal, target, count) in enumerate(zip(rows, proposals, targets, accepted)):
             row.draft_n += len(proposal)
             row.draft_n_accepted += count
-            emitted.append(row.take(proposal[:count] + [target[count]]))
-        self.controller.record_round(plan, states, accepted, seconds = time.perf_counter() - start)
+            taken = row.take(proposal[:count] + [target[count]])
+            if row.draft is not None and len(taken) > kept[i]:
+                # The head already holds the accepted drafts it appended; record the rest.
+                self.drafter.push(row.draft, taken[kept[i] :], hidden[i, kept[i] : len(taken)])
+            emitted.append(taken)
+        self.controller.record_round(
+            plan, states, accepted, seconds = time.perf_counter() - start, draft_seconds = draft_seconds
+        )
         return emitted
+
+
+# Draft sources for the speculative engine.
+
+
+class DraftRow:
+    """A reply's unconsumed (token, target hidden) pairs from head cache slot ``position``, and the head's last output."""
+
+    def __init__(self, position: int):
+        self.position = position
+        self.tokens: list[int] = []
+        self.hidden: list[mx.array] = []
+        self.last: mx.array | None = None
+
+    @property
+    def ready(self) -> bool:
+        return self.last is not None or bool(self.tokens)
+
+
+class MTPDrafter:
+    """Drafts greedily with a Qwen-style MTP head, whose KV cache slot ``j`` holds the pair (token ``j + 1``,
+    target hidden ``j``). Plain windows and copy rounds only record pairs; a row replays them just before
+    it drafts, so an unused head costs nothing. The engine joins and splits head caches with the target's."""
+
+    def __init__(self, model: nn.Module, target: nn.Module, max_lag: int = 128):
+        from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
+
+        if type(model) is not Qwen3_5MTPDraftModel:
+            raise ValueError(f"{type(model).__name__} is not a Qwen-style MTP head")
+        self.model = model.bind(target)
+        lm = getattr(target, "language_model", target)
+        self._draft_hidden = getattr(lm, "speculative_draft_hidden", None)
+        # A longer stretch replays only its tail, leaving a gap the head attends across.
+        self.max_lag = max_lag
+
+    def new_cache(self) -> list:
+        return self.model.make_cache()
+
+    def start(self, prompt: Sequence[int], hidden: mx.array | None, pending: int) -> tuple[DraftRow, list]:
+        """A row from its prompt, the target hidden ``[1, N, H]`` of its last N prompt positions
+        (or None), and its pending token; returns its state and its head cache."""
+        cache = self.new_cache()
+        count = 0 if hidden is None else min(int(hidden.shape[1]), len(prompt))
+        row = DraftRow(len(prompt) - count)
+        if count:
+            self.push(row, [*prompt[len(prompt) - count + 1 :], pending], hidden[0, -count:])
+            self.catch_up(cache, [row])
+        return row, cache
+
+    def push(self, row: DraftRow, tokens: Sequence[int], hidden: mx.array) -> None:
+        """Record pairs: ``tokens[k]`` follows the position whose target hidden is ``hidden[k]``."""
+        row.tokens.extend(int(token) for token in tokens)
+        row.hidden.append(hidden)
+        row.last = None
+        excess = len(row.tokens) - self.max_lag
+        if excess > 0:
+            row.hidden = [mx.concatenate(row.hidden)[excess:]]
+            row.tokens = row.tokens[excess:]
+            row.position += excess
+
+    def _forward(self, cache: list, tokens: mx.array, hidden: mx.array, positions: mx.array) -> mx.array:
+        model = self.model
+        if self._draft_hidden is not None:
+            hidden = self._draft_hidden(hidden)
+        embed = model._input_embed(tokens) * model._input_embed_scale
+        return model._forward_hidden(embed, hidden, cache, positions)
+
+    def catch_up(self, cache: list, rows: Sequence[DraftRow | None]) -> int:
+        """Replay the recorded pairs of ``rows`` (None leaves a row as is); returns how many."""
+        lengths = [len(row.tokens) if row is not None else 0 for row in rows]
+        width = max(lengths)
+        if not width:
+            return 0
+        like = next(row.hidden[0] for row in rows if row is not None and row.tokens)
+        pads = [width - length for length in lengths]
+        tokens = mx.array([(row.tokens if row is not None else []) + [0] * pad for row, pad in zip(rows, pads)])
+        hidden = mx.stack([
+            mx.pad(mx.concatenate(row.hidden), [(0, pad), (0, 0)]) if length else mx.zeros((width, like.shape[-1]), like.dtype)
+            for row, length, pad in zip(rows, lengths, pads)
+        ])
+        starts = mx.array([row.position if row is not None else 0 for row in rows])
+        if any(pads):
+            for entry in cache:
+                entry.prepare(right_padding = pads)
+        out = self._forward(cache, tokens, hidden, starts[:, None] + mx.arange(width))
+        if any(pads):
+            for entry in cache:
+                entry.finalize()
+        last = mx.take_along_axis(out, mx.array([max(length - 1, 0) for length in lengths])[:, None, None], axis = 1)
+        for i, (row, length) in enumerate(zip(rows, lengths)):
+            if length:
+                row.last = last[i : i + 1]
+                row.position += length
+                row.tokens, row.hidden = [], []
+        return sum(lengths)
+
+    def draft(self, cache: list, rows: Sequence[DraftRow | None], depth: int) -> mx.array:
+        """``[B, depth]`` greedy drafts; rows the head has not caught up get placeholders.
+        Appends ``depth - 1`` entries to every row's cache, which ``settle`` trims."""
+        like = next(row.last for row in rows if row is not None and row.last is not None)
+        hidden = mx.concatenate([row.last if row is not None and row.last is not None else mx.zeros_like(like) for row in rows])
+        starts = mx.array([row.position if row is not None else 0 for row in rows])[:, None]
+        token = self.model._greedy_token(hidden)
+        drafts = [token]
+        for step in range(depth - 1):
+            hidden = self._forward(cache, token, hidden, starts + step)
+            token = self.model._greedy_token(hidden)
+            drafts.append(token)
+        return mx.concatenate(drafts, axis = 1)
+
+    def settle(self, cache: list, rows: Sequence[DraftRow | None], appended: int, keep: Sequence[int]) -> None:
+        """Keep each row's first ``keep[i]`` appended entries (its accepted drafts); drop the rest."""
+        trims = [appended - count for count in keep]
+        if len(set(trims)) == 1:
+            if trims[0]:
+                for entry in cache:
+                    entry.trim(trims[0])
+        else:
+            for entry in cache:
+                entry.prepare(right_padding = trims)
+                entry.finalize()
+        for row, count in zip(rows, keep):
+            if row is not None:
+                row.position += count
+                row.last = None
+
+
+def native_mtp_drafter(model_path: str | Path, target: nn.Module, **kwargs) -> MTPDrafter | None:
+    """An ``MTPDrafter`` built in memory from only the ``mtp.*`` tensors of the target's checkpoint, as
+    mlx-vlm's MTP splitter would write it; None when no splitter knows the checkpoint."""
+    from mlx_vlm.fp8 import transform_fp8_weights
+    from mlx_vlm.speculative.drafters.mtp_split import _is_mlx_safetensors, detect_mtp_splitter
+
+    path = Path(model_path)
+    splitter = detect_mtp_splitter(path)
+    if splitter is None:
+        return None
+    if splitter.output_model_type != "qwen3_5_mtp":
+        raise ValueError(f"{splitter.output_model_type} MTP heads are not supported")
+    source_config = json.loads((path / "config.json").read_text())
+    text_config = splitter.read_text_config(source_config)
+    tensors, source_is_mlx = {}, False
+    for file, keys in splitter.iter_selected(path, text_config):
+        source_is_mlx = source_is_mlx or (splitter.supports_mlx_source and _is_mlx_safetensors(file))
+        tensors.update(splitter.load_shard(file, keys))
+    tensors, fp8_quantization = transform_fp8_weights(tensors, source_config)
+    if fp8_quantization is not None:
+        source_config = {**source_config, "quantization": fp8_quantization}
+    weights = splitter.transform(tensors, text_config, source_is_mlx)
+    quantization = splitter.quantization(weights, source_config, text_config, {})
+
+    module = importlib.import_module(f"mlx_vlm.speculative.drafters.{splitter.output_model_type}")
+    config = {
+        "model_type": splitter.output_model_type,
+        "text_config": text_config,
+        "block_size": splitter.depth(text_config) + splitter.block_size_extra,
+        "tie_word_embeddings": bool(text_config.get("tie_word_embeddings", splitter.tie_word_embeddings_default)),
+        **splitter.extra_config(text_config),
+    }
+    model = module.Model(module.ModelConfig.from_dict(config))
+    if quantization is not None:
+        nn.quantize(
+            model,
+            group_size = quantization["group_size"],
+            bits = quantization["bits"],
+            mode = quantization.get("mode", "affine"),
+            class_predicate = lambda name, layer: hasattr(layer, "to_quantized") and f"{name}.scales" in weights,
+        )
+    model.load_weights(list(weights.items()), strict = True)
+    mx.eval(model.parameters())
+    return MTPDrafter(model, target, **kwargs)

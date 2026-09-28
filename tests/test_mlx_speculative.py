@@ -141,17 +141,16 @@ def test_controller_drafts_alone_but_not_in_a_wide_batch():
     assert [controller.plain_cost[b].value for b in (1, 8)] == pytest.approx([machine.plain(1), machine.plain(8)])
 
 
-def test_fused_rounds_rescale_the_last_split():
+def test_fused_rounds_learn_how_much_drafting_they_hide():
     controller = DraftController(max_depth = 2, can_copy = False, split_every = 4)
     state = [RowState(controller.new_reply())]
     plan = RoundPlan("round", rows = (RowPlan("draft", 2),), split = True)
     controller.record_round(plan, state, [1], seconds = 1.5, draft_seconds = 0.5)
     fused = RoundPlan("round", rows = (RowPlan("draft", 2),))
     for _ in range(40):
-        controller.record_round(fused, state, [1], seconds = 3.0)
-    verify, draft = controller.verify_cost[1][3].value, controller.draft_cost[2].value
-    assert verify + draft == pytest.approx(3.0, rel = 0.01)
-    assert draft / verify == pytest.approx(0.5, rel = 0.01)
+        controller.record_round(fused, state, [1], seconds = 1.2)
+    assert (controller.verify_cost[1][3].value, controller.draft_cost[2].value) == pytest.approx((1.0, 0.5))
+    assert controller.round_seconds(fused, state) == pytest.approx(1.2, rel = 0.01)
     assert controller._split_due(fused).split
 
 
@@ -258,3 +257,16 @@ def test_lone_drafter_can_trail_the_ratio_order():
     for state, rate in zip(states, (0.9, 0.1)):
         state.stats.draft, state.stats.draft_seen = [_Ema(rate)], [True]
     assert [row.source == "draft" for row in controller._round_at(2, states).rows] == [False, True]
+
+
+def test_hidden_drafting_picks_the_best_set_of_unequal_drafters():
+    # Drafting up to the hidden time is free, so two cheap rows beat the best ratio.
+    controller = DraftController(max_depth = 1, can_copy = False)
+    rows = [RowState(controller.new_reply(), catch_up = catch_up) for catch_up in (1, 0, 0)]
+    for state, rate in zip(rows, (0.6, 0.45, 0.45)):
+        state.stats.draft[0].value = rate
+    controller.plain_cost[4] = _Ema(1.0)
+    controller.verify_cost[4] = {2: _Ema(1.0)}
+    controller.draft_cost[1], controller.catch_up_cost = _Ema(1.0), _Ema(0.2)
+    controller.hidden_drafting[4] = _Ema(2.0)
+    assert [row.source for row in controller._round_at(2, rows).rows] == ["none", "draft", "draft"]
