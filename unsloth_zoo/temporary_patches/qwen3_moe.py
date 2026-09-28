@@ -29,6 +29,7 @@ from .utils import (
     patch_function,
     raise_error,
     logger,
+    torch_compiler_disable_unless_decode,
 )
 
 
@@ -86,8 +87,9 @@ def _make_qwen_moe_sparse_moe_block_forward(use_shared_expert: bool, module_name
     # is not the blocker: breaks are identical with bincount and with the sync-free
     # counter. Dropping the decorator did run 1.22-1.40x faster, but PR #608 measured
     # only 1.03-1.04x end to end and found capture incompatible with gradient
-    # checkpointing, so do not remove it without an end-to-end measurement.
-    @torch.compiler.disable
+    # checkpointing, so do not remove it without an end-to-end measurement. A compiled
+    # decode step (inference only) still traces it, like the other disabled forwards.
+    @torch_compiler_disable_unless_decode
     def sparse_moe_block_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         use_shared_expert = hasattr(self, "shared_expert") and hasattr(self, "shared_expert_gate")
         if hidden_states.dim() == 3:
