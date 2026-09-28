@@ -14,14 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Trainer.floating_point_ops with a list-valued main input.
-
-Nemotron-3-Nano-Omni (trust_remote_code) sets main_input_name = "pixel_values", which its
-processor returns as a list of (3, H, W) tiles for a batch of images of different sizes.
-Trainer counts FLOPs from inputs[main_input_name].numel() (transformers 4 through
-PreTrainedModel.estimate_tokens), so the first training step failed with
-"'list' object has no attribute 'numel'". CPU only.
-"""
+"""Trainer.floating_point_ops with a list-valued main input (Nemotron-3-Nano-Omni pixel_values). CPU only."""
 
 from collections import UserDict
 
@@ -34,7 +27,7 @@ from transformers import LlamaConfig, LlamaForCausalLM, Trainer
 def trainer():
     try:
         from unsloth_zoo.temporary_patches.misc import patch_trainer_flops_list_main_input
-    except ImportError:  # unsloth-zoo without the patch: the tests show the original failure
+    except ImportError:
         patch_trainer_flops_list_main_input = lambda: None
     patch_trainer_flops_list_main_input()
 
@@ -58,14 +51,12 @@ def test_list_main_input_counted(trainer):
 
 
 def test_batch_feature_list_main_input_counted(trainer):
-    # Collators return a BatchFeature, a UserDict and not a dict.
     n_params = trainer.model.num_parameters(exclude_embeddings = True)
     tiles = [torch.zeros(3, 8, 8), torch.zeros(3, 8, 12)]
     assert trainer.floating_point_ops(UserDict({"pixel_values": tiles})) == 6 * (192 + 288) * n_params
 
 
 def test_tensor_main_input_unchanged(trainer):
-    # A tensor main input still goes through transformers' own count.
     n_params = trainer.model.num_parameters(exclude_embeddings = True)
     pixel_values = torch.zeros(2, 3, 8, 8)
     assert trainer.floating_point_ops({"pixel_values": pixel_values}) == 6 * 384 * n_params

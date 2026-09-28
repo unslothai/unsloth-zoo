@@ -2856,11 +2856,7 @@ def _list_main_input_numel(value):
 
 
 def patch_trainer_flops_list_main_input():
-    """`Trainer.floating_point_ops` counts `inputs[model.main_input_name].numel()` (on transformers 4
-    through `PreTrainedModel.estimate_tokens`). Remote VLMs such as Nemotron-3-Nano-Omni set
-    `main_input_name = "pixel_values"`, which dynamic-resolution processors return as a list of
-    differently sized tiles, so the first training step fails with
-    "'list' object has no attribute 'numel'". Count a list of tensors by its total size."""
+    # Nemotron-3-Nano-Omni's main_input_name is pixel_values, a list of ragged tiles: Trainer's `.numel()` crashes.
     try:
         from transformers import Trainer
     except Exception:
@@ -2873,7 +2869,7 @@ def patch_trainer_flops_list_main_input():
     def floating_point_ops(self, inputs):
         model = getattr(self, "model", None)
         main_input = getattr(model, "main_input_name", "input_ids")
-        # A dict or a BatchFeature (UserDict) from the collator.
+        # BatchFeature is a UserDict, not a dict.
         value = inputs.get(main_input, None) if hasattr(inputs, "get") else None
         if isinstance(value, (list, tuple)) and hasattr(model, "num_parameters"):
             numel = _list_main_input_numel(value)
