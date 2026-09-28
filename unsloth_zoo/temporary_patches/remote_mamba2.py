@@ -82,7 +82,8 @@ def repair_remote_mamba2_modules():
     for name, module in list(sys.modules.items()):
         if module is None or not name.startswith("transformers_modules"):
             continue
-        key = (name, id(module))
+        # A changed remote file is re-executed into the same module object with a new hash.
+        key = (name, id(module), getattr(module, "__transformers_module_hash__", None))
         if key in _REPAIRED_MODULES:
             continue
         _REPAIRED_MODULES.add(key)

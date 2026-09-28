@@ -148,3 +148,28 @@ def test_hook_repairs_remote_classes_loaded_later(monkeypatch):
         assert torch.allclose(y, ref, rtol=1e-5, atol=1e-6)
     finally:
         sys.modules.pop(name, None)
+
+
+def test_hook_repairs_classes_reexecuted_into_the_same_module(monkeypatch):
+    from unsloth_zoo.temporary_patches import remote_mamba2
+    import transformers.dynamic_module_utils as dynamic_module_utils
+    name = "transformers_modules.unsloth_test_remote_mamba2_reload"
+    module = _load_fixture(name)
+    source = open(FIXTURE).read()
+
+    def fake_get_class_in_module(class_name, module_path, **kwargs):
+        # transformers re-executes a changed remote file into the SAME module object (new hash).
+        exec(compile(source, FIXTURE, "exec"), module.__dict__)
+        module.__transformers_module_hash__ = str(getattr(module, "__transformers_module_hash__", "")) + "x"
+        return getattr(module, class_name)
+
+    monkeypatch.setattr(dynamic_module_utils, "get_class_in_module", fake_get_class_in_module)
+    remote_mamba2.patch_remote_mamba2_torch_forward()
+    try:
+        first = dynamic_module_utils.get_class_in_module("FakeRemoteMamba2Mixer", "unused")
+        second = dynamic_module_utils.get_class_in_module("FakeRemoteMamba2Mixer", "unused")
+        assert first is not second
+        assert first.torch_forward._unsloth_mamba2_fixed
+        assert getattr(second.torch_forward, "_unsloth_mamba2_fixed", False)
+    finally:
+        sys.modules.pop(name, None)
