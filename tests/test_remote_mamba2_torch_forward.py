@@ -158,7 +158,6 @@ def test_hook_repairs_classes_reexecuted_into_the_same_module(monkeypatch):
     source = open(FIXTURE).read()
 
     def fake_get_class_in_module(class_name, module_path, **kwargs):
-        # transformers re-executes a changed remote file into the SAME module object (new hash).
         exec(compile(source, FIXTURE, "exec"), module.__dict__)
         module.__transformers_module_hash__ = str(getattr(module, "__transformers_module_hash__", "")) + "x"
         return getattr(module, class_name)
@@ -176,7 +175,6 @@ def test_hook_repairs_classes_reexecuted_into_the_same_module(monkeypatch):
 
 
 def test_repaired_fp16_with_unrepresentable_upper_limit(repaired):
-    # Nemotron-3-Nano-Omni's config sets time_step_limit = [0.0, 1e30]; 1e30 overflows fp16.
     cls, _, changed = repaired
     assert changed
     torch.manual_seed(0)
