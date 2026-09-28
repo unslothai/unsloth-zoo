@@ -119,3 +119,29 @@ def test_a_real_fine_grained_fp8_mixtral_is_detected(monkeypatch, tmp_path):
     units = _split_units(model, resolve_no_split_classes(model), _compute_module_sizes(model, quantizer))
     need = _moe_dequant_transient_by_unit(model, units)
     assert need == dict.fromkeys(("model.layers.0", "model.layers.1"), 2 * (8 * 1024 * 256 + 8 * 256 * 512))
+
+
+def test_a_packing_that_breaks_the_floor_is_repacked_not_refused():
+    # cuda:0 fits a layer's weights but not its dequant; the in-order walk puts one there first.
+    budgets = [_FP8_LAYER * 10 // 4, _FP8_LAYER * 25 // 4]
+    plan = _plan(_meta(), budgets)
+    assert _moe_devices(plan) == {1}
+    assert _left(plan)[1] >= _BF16_DEQUANT
+
+
+@pytest.mark.parametrize("gate_up_scale, down_scale, copies", [
+    ((_E, 4, 1), (_E, 1, 2), 1),   # 64 x 64 blocks: Triton block kernel, one bf16 copy per stack
+    ((_E, 1, 1), (_E, 1, 1), 2),   # per-expert scale: vectorized `weight.to(bf16) * scale`
+    ((_E, 4, 4), (_E, 4, 4), 3),   # non-square blocks: vectorized, scale expanded to full size too
+])
+def test_dequant_peak_follows_the_scale_layout(gate_up_scale, down_scale, copies):
+    from unsloth_zoo.device_map_planner import _moe_dequant_transient_by_unit
+    model = _meta()
+    with torch.device("meta"):
+        for block in model.layers:
+            block.experts.gate_up_proj_scale_inv = nn.Parameter(torch.empty(gate_up_scale), requires_grad = False)
+            block.experts.down_proj_scale_inv = nn.Parameter(torch.empty(down_scale), requires_grad = False)
+    gate_up, down = 2 * _E * 2 * _I * _H, 2 * _E * _H * _I
+    units = [(f"layers.{i}", 0) for i in range(_LAYERS)]
+    expected = max(copies * gate_up, gate_up + copies * down)
+    assert _moe_dequant_transient_by_unit(model, units) == dict.fromkeys((u for u, _ in units), expected)

@@ -1010,10 +1010,37 @@ def _load_transient_by_unit(
 
 
 _EXPERT_STACK_NAMES = ("gate_up_proj", "up_proj", "gate_proj", "down_proj")
+_SCALE_SUFFIXES = ("_weight_scale_inv", "_weight_scale", "_scale_inv", "_scale")
 _FP8_DTYPES = tuple(
     getattr(torch, name) for name in ("float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnuz")
     if hasattr(torch, name)
 )
+
+
+def _dequant_copies(module: nn.Module | None, leaf: str, weight: torch.Tensor) -> int:
+    """bf16 copies of a stack live while it dequantizes: 1 on the Triton block kernel, else the vectorized
+    fallback's `weight.to(dtype) * scale` (2), plus the expanded scale for a non-square block grid (3)."""
+    scale = None
+    for suffix in _SCALE_SUFFIXES:
+        scale = getattr(module, leaf + suffix, None)
+        if isinstance(scale, torch.Tensor):
+            break
+    if not isinstance(scale, torch.Tensor):
+        return 1
+    if weight.dtype != torch.float8_e4m3fn or scale.dim() != 3 or scale.shape[0] != weight.shape[0]:
+        return 2
+    p, q = scale.shape[1], scale.shape[2]
+    if p == 0 or q == 0:
+        return 2
+    bm, bn = -(-weight.shape[1] // p), -(-weight.shape[2] // q)
+    try:
+        from .temporary_patches.moe_utils_fp8 import _triton_max_tensor_numel
+        cap = _triton_max_tensor_numel()
+    except Exception:
+        cap = 1 << 20
+    if bm == bn and bm * bn <= cap:
+        return 1
+    return 2 if p == q == 1 else 3
 
 
 def _moe_dequant_transient_by_unit(
@@ -1023,14 +1050,25 @@ def _moe_dequant_transient_by_unit(
     """Bytes each unit must keep free for its FP8 fused experts, dequantized whole to bf16 on every forward
     by `moe_utils_fp8.forward_moe_backend_fp8` (14 + 7 GiB per layer on Mistral-Large-3)."""
     unit_names = sorted((u for u, _ in units), key=len, reverse=True)
-    per_module: dict[str, int] = {}
+    modules = dict(model.named_modules())
+    stacks: dict[str, list[tuple[int, int]]] = {}
     for name, tensor in model.named_parameters():
         if tensor.dim() != 3 or tensor.dtype not in _FP8_DTYPES:
             continue
         module, _, leaf = name.rpartition(".")
         if leaf not in _EXPERT_STACK_NAMES:
             continue
-        per_module[module] = per_module.get(module, 0) + tensor.numel() * 2
+        stacks.setdefault(module, []).append(
+            (tensor.numel() * 2, _dequant_copies(modules.get(module), leaf, tensor))
+        )
+    per_module: dict[str, int] = {}
+    for module, parts in stacks.items():
+        # Stacks are dequantized one after another and all stay live, each costing `copies` while it converts.
+        done = peak = 0
+        for size, copies in parts:
+            peak = max(peak, done + copies * size)
+            done += size
+        per_module[module] = peak
     out: dict[str, int] = {}
     for module, need in per_module.items():
         owner = next(
@@ -1893,14 +1931,6 @@ def plan_device_map(
             assign[p] = head_device
             used[head_device] += unit_size[p]
         weight_bytes = {d: used[d] for d in devices}
-        if runtime_of:
-            need = dict.fromkeys(devices, 0)
-            for unit, device in assign.items():
-                need[device] = max(need[device], runtime_of.get(unit, 0))
-            for d in devices:
-                left = raw_budgets[d] - weight_bytes[d] - (headroom if d == head_device else 0)
-                if need[d] and left < need[d]:
-                    return None
         # `budget` is the *remaining* capacity the packing walks were allowed to
         # use, so the head device has already paid for the pinned units. The
         # public field means "budget available to weights after every reserve"
@@ -1916,6 +1946,18 @@ def plan_device_map(
 
     def _group_transient(names) -> int:
         return max((transient_of.get(n, 0) for n in names), default = 0)
+
+    def _runtime_cap(head_device: int) -> dict[int, int]:
+        # The FP8 dequant floor is kept beside the weights and the head's logit headroom, not the reserve.
+        return {d: raw_budgets[d] - (pinned_bytes + headroom if d == head_device else 0) for d in devices}
+
+    def _group_runtime(names) -> int:
+        return max((runtime_of.get(n, 0) for n in names), default = 0)
+
+    def _start_runtime(head_device: int) -> dict[int, int]:
+        rt = dict.fromkeys(devices, 0)
+        rt[head_device] = _group_runtime(pinned)
+        return rt
 
     def _start_peak(head_device: int) -> dict[int, int]:
         # Pinned units skip the packers but can still be merged into (a concatenated lm_head).
@@ -1935,21 +1977,24 @@ def plan_device_map(
         used = dict.fromkeys(devices, 0)
         peak = _start_peak(head_device)
         cap = _transient_cap(head_device)
+        rt, rt_cap = _start_runtime(head_device), _runtime_cap(head_device)
         assign: dict[str, int] = {}
         cursor = 0
 
-        def fits(d, size, t):
-            return used[d] + size <= budget[d] and used[d] + size + max(peak[d], t) <= cap[d]
+        def fits(d, size, t, r):
+            return (used[d] + size <= budget[d] and used[d] + size + max(peak[d], t) <= cap[d]
+                    and used[d] + size + max(rt[d], r) <= rt_cap[d])
 
         for names, size in free:
-            t = _group_transient(names)
+            t, r = _group_transient(names), _group_runtime(names)
             placed = False
             while cursor < len(order):
                 d = order[cursor]
-                if fits(d, size, t):
+                if fits(d, size, t, r):
                     assign.update(dict.fromkeys(names, d))
                     used[d] += size
                     peak[d] = max(peak[d], t)
+                    rt[d] = max(rt[d], r)
                     placed = True
                     break
                 cursor += 1
@@ -1957,10 +2002,11 @@ def plan_device_map(
                 # Sequential cursor exhausted: try any earlier device that still
                 # has room rather than falling off to CPU.
                 for d in order:
-                    if fits(d, size, t):
+                    if fits(d, size, t, r):
                         assign.update(dict.fromkeys(names, d))
                         used[d] += size
                         peak[d] = max(peak[d], t)
+                        rt[d] = max(rt[d], r)
                         placed = True
                         break
             if not placed:
@@ -1972,18 +2018,21 @@ def plan_device_map(
         used = dict.fromkeys(devices, 0)
         peak = _start_peak(head_device)
         cap = _transient_cap(head_device)
+        rt, rt_cap = _start_runtime(head_device), _runtime_cap(head_device)
         assign: dict[str, int] = {}
         for names, size in sorted(free, key=lambda item: -item[1]):
-            t = _group_transient(names)
+            t, r = _group_transient(names), _group_runtime(names)
             room = [(budget[d] - used[d] - size, d) for d in devices
                     if used[d] + size <= budget[d]
-                    and used[d] + size + max(peak[d], t) <= cap[d]]
+                    and used[d] + size + max(peak[d], t) <= cap[d]
+                    and used[d] + size + max(rt[d], r) <= rt_cap[d]]
             if not room:
                 return None, None
             _, d = min(room)
             assign.update(dict.fromkeys(names, d))
             used[d] += size
             peak[d] = max(peak[d], t)
+            rt[d] = max(rt[d], r)
         return used, assign
 
     def _exact_fit(free, budget, head_device: int, node_budget=20000, max_units=512):
@@ -2005,6 +2054,7 @@ def plan_device_map(
         remaining = {d: budget[d] for d in devices}
         peak = _start_peak(head_device)
         cap = _transient_cap(head_device)
+        rt, rt_cap = _start_runtime(head_device), _runtime_cap(head_device)
         assign: dict[str, int] = {}
         visited = 0
 
@@ -2016,23 +2066,25 @@ def plan_device_map(
             if visited > node_budget:
                 raise _SearchExhausted
             names, size = order[i]
-            t = _group_transient(names)
-            tried: set[tuple[int, int, int]] = set()
+            t, r = _group_transient(names), _group_runtime(names)
+            tried: set[tuple[int, int, int, int, int]] = set()
             for d in devices:
                 room = remaining[d]
                 used_d = budget[d] - room
-                state = (room, cap[d] - used_d, peak[d])
-                if size > room or used_d + size + max(peak[d], t) > cap[d] or state in tried:
+                state = (room, cap[d] - used_d, peak[d], rt_cap[d] - used_d, rt[d])
+                if (size > room or used_d + size + max(peak[d], t) > cap[d]
+                        or used_d + size + max(rt[d], r) > rt_cap[d] or state in tried):
                     continue
                 tried.add(state)
-                previous = peak[d]
+                previous, previous_rt = peak[d], rt[d]
                 remaining[d] -= size
                 peak[d] = max(previous, t)
+                rt[d] = max(previous_rt, r)
                 assign.update(dict.fromkeys(names, d))
                 if place(i + 1):
                     return True
                 remaining[d] += size
-                peak[d] = previous
+                peak[d], rt[d] = previous, previous_rt
                 for n in names:
                     assign.pop(n, None)
             return False
@@ -2061,7 +2113,7 @@ def plan_device_map(
             return False
 
         try:
-            fitted = place(0) if transient_of else place_plain(0)
+            fitted = place(0) if transient_of or runtime_of else place_plain(0)
         except (_SearchExhausted, RecursionError):
             return None, None
         if not fitted:
