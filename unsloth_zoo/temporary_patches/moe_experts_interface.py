@@ -316,11 +316,15 @@ def _warm_moe_backend(model) -> None:
         moe_utils = _moe_utils_module()
         backend = moe_utils.get_forward_moe_backend()
         backend_module = sys.modules.get(getattr(backend, "__module__", None) or "", moe_utils)
-        for module in {moe_utils, backend_module}:
-            module._check_torch_grouped_mm_supported()
-            module._transposed_view_grouped_mm_is_safe()
     except Exception:
-        pass
+        return
+    # The package module and the compiled-cache copy each cache their own probe results.
+    for module in (moe_utils,) if backend_module is moe_utils else (moe_utils, backend_module):
+        for probe in ("_check_torch_grouped_mm_supported", "_transposed_view_grouped_mm_is_safe"):
+            try:
+                getattr(module, probe)()
+            except Exception:
+                pass
 
 
 def _patch_decode_switch():
