@@ -491,6 +491,8 @@ jobs:
             tests/test_safe_serialization_none.py \
             tests/test_published_version_window.py \
             tests/test_device_map_planner_compressed_tensors.py \
+            tests/test_gemma3n_kv_sharing_without_cache.py \
+            tests/test_gemma3n_rmsnorm_with_scale.py \
             -v
 
       - name: pytest MLX adapter-filter gate (HARD GATE)

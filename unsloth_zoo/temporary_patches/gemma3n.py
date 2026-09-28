@@ -53,8 +53,7 @@ def Gemma3nRMSNorm_forward(self, x: torch.Tensor) -> torch.Tensor:
     # Llama does x.to(float16) * w whilst Gemma2 is (x * w).to(float16)
     # See https://github.com/huggingface/transformers/pull/29402
     output = self._norm(x.float())
-    # with_scale=False norms (embedding_post_projection_norm) have no weight on transformers >= 5.5.0,
-    # which dropped the tensor(1.0) placeholder buffer.
+    # transformers 5.5 dropped the tensor(1.0) weight of with_scale=False norms.
     if getattr(self, "with_scale", True) and hasattr(self, "weight"):
         output = output * self.weight.float()
     return output.type_as(x)
@@ -208,8 +207,7 @@ TEMPORARY_PATCHES.append(patch_Gemma3nModel_get_placeholder_mask)
 
 
 class _Gemma3nSharedKV:
-    # Stands in for the cache when none is passed: KV-shared layers read their source layer's
-    # keys and values from `shared_layers`, and `update` stores nothing.
+    # Cache stand-in: carries shared_layers, update() stores nothing.
     def __init__(self):
         self.shared_layers = {}
 
@@ -217,29 +215,71 @@ class _Gemma3nSharedKV:
         return key_states, value_states
 pass
 
+
+class _Gemma3nInjectSharedKVGrad(torch.autograd.Function):
+    # Identity whose backward adds the shared layers' KV gradient to the source layer's recomputed KV.
+    @staticmethod
+    def forward(ctx, attn_output, key_states, value_states, grad_key, grad_value):
+        ctx.save_for_backward(grad_key, grad_value)
+        return attn_output.view_as(attn_output)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_key, grad_value = ctx.saved_tensors
+        return grad_output, grad_key, grad_value, None, None
+pass
+
+
 _GEMMA3N_SHARED_KV = {}
+_GEMMA3N_SHARED_KV_LEAVES = {}
 _GEMMA3N_ATTENTION_FORWARD = {}
 
 def _gemma3n_attention_forward_shared_kv(self, *args, **kwargs):
-    if (
-        kwargs.get("past_key_values") is None
-        and kwargs.get("past_key_value") is None
-        and len(args) < 4
-        and (self.is_kv_shared_layer or self.store_full_length_kv)
-    ):
-        kwargs.pop("past_key_value", None)
-        store = _GEMMA3N_SHARED_KV.get(id(self.config))
-        if store is None:
-            store = _GEMMA3N_SHARED_KV[id(self.config)] = _Gemma3nSharedKV()
-        kwargs["past_key_values"] = store
-    return _GEMMA3N_ATTENTION_FORWARD["original"](self, *args, **kwargs)
+    shared = None
+    if _GEMMA3N_ATTENTION_FORWARD.get("mode") == "kwarg":
+        shared = kwargs.get("shared_kv_states")
+    else:
+        cache = kwargs.get("past_key_values", kwargs.get("past_key_value"))
+        if cache is None and len(args) < 4 and (self.is_kv_shared_layer or self.store_full_length_kv):
+            kwargs.pop("past_key_value", None)
+            cache = _GEMMA3N_SHARED_KV.get(id(self.config))
+            if cache is None:
+                cache = _GEMMA3N_SHARED_KV[id(self.config)] = _Gemma3nSharedKV()
+            kwargs["past_key_values"] = cache
+        shared = getattr(cache, "shared_layers", None)
+
+    # Reentrant checkpointing stores source KV with no graph and recomputes shared layers first:
+    # collect their KV gradient on leaves and hand it to the source layer's recompute below.
+    grad_enabled = torch.is_grad_enabled()
+    if self.is_kv_shared_layer and shared is not None and grad_enabled:
+        index = self.kv_shared_layer_index
+        stored = shared.get(index)
+        if stored is not None and not stored[0].requires_grad:
+            key = (id(self.config), index)
+            leaves = _GEMMA3N_SHARED_KV_LEAVES.get(key)
+            if leaves is None or leaves[0] is not stored[0]:
+                leaves = (stored[0], stored[0].detach().requires_grad_(), stored[1].detach().requires_grad_())
+                _GEMMA3N_SHARED_KV_LEAVES[key] = leaves
+            shared[index] = (leaves[1], leaves[2])
+
+    output = _GEMMA3N_ATTENTION_FORWARD["original"](self, *args, **kwargs)
+
+    if self.store_full_length_kv and shared is not None:
+        leaves = _GEMMA3N_SHARED_KV_LEAVES.pop((id(self.config), self.layer_idx), None)
+        stored = shared.get(self.layer_idx)
+        if leaves is not None and grad_enabled and stored is not None and stored[0].requires_grad:
+            grad_key, grad_value = leaves[1].grad, leaves[2].grad
+            if grad_key is not None or grad_value is not None:
+                grad_key = torch.zeros_like(stored[0]) if grad_key is None else grad_key.to(stored[0].dtype)
+                grad_value = torch.zeros_like(stored[1]) if grad_value is None else grad_value.to(stored[1].dtype)
+                attn_output = _Gemma3nInjectSharedKVGrad.apply(output[0], stored[0], stored[1], grad_key, grad_value)
+                output = (attn_output, *output[1:])
+    return output
 pass
 
 def patch_Gemma3nTextAttention_kv_sharing():
-    # transformers <= 5.5 reuses a source layer's keys and values only through the cache, so with
-    # use_cache=False (training, gradient checkpointing) the KV-shared layers project their own and
-    # the last num_kv_shared_layers layers are wrong (gemma-3n-E2B eval loss 10.85 vs 5.94).
-    # transformers 5.6 passes shared_kv_states instead; this does the same through a stand-in cache.
+    # transformers <= 5.5 shares KV only through the cache, so uncached training ran KV-shared layers
+    # on their own KV (gemma-3n-E2B loss 10.85 vs 5.94); 5.6+ uses shared_kv_states.
     try:
         import inspect
         import transformers.models.gemma3n.modeling_gemma3n as modeling
@@ -247,14 +287,18 @@ def patch_Gemma3nTextAttention_kv_sharing():
         source = inspect.getsource(modeling)
     except Exception as e:
         return raise_error("Gemma3nTextAttention.forward", e)
-    if "shared_kv_states" in source or "past_key_values.shared_layers[self.kv_shared_layer_index]" not in source:
+    if "shared_kv_states[self.kv_shared_layer_index]" in source:
+        mode = "kwarg"
+    elif "past_key_values.shared_layers[self.kv_shared_layer_index]" in source:
+        mode = "cache"
+    else:
         return
     current = Gemma3nTextAttention.forward
     if getattr(current, "_unsloth_gemma3n_kv_sharing", False):
         return
-    # Keep the first original only: the compiler rebuilds this class from the patched source,
-    # and a later pass must not wrap that rebuilt forward.
+    # First original only: a later pass must not wrap the compiler's rebuilt forward.
     _GEMMA3N_ATTENTION_FORWARD.setdefault("original", current)
+    _GEMMA3N_ATTENTION_FORWARD["mode"] = mode
 
     # Self-contained body: the compiler copies it into its own module.
     def forward(self, *args, **kwargs):

@@ -24,7 +24,7 @@ from transformers import Gemma3nTextConfig
 
 from unsloth_zoo.temporary_patches import gemma3n as zoo_gemma3n
 
-SHARES_THROUGH_CACHE_ONLY = "shared_kv_states" not in inspect.getsource(modeling)
+SHARES_THROUGH_CACHE_ONLY = "shared_kv_states[self.kv_shared_layer_index]" not in inspect.getsource(modeling)
 
 
 def _tiny_model():
@@ -86,9 +86,29 @@ def test_the_patch_makes_an_uncached_forward_match_the_cached_one(pristine):
     assert modeling.Gemma3nTextAttention.forward is patched
 
 
-@pytest.mark.skipif(SHARES_THROUGH_CACHE_ONLY, reason = "only a no-op where transformers shares KV itself")
-def test_the_patch_is_a_no_op_when_transformers_shares_kv_itself(pristine):
+def _grads(reentrant):
+    torch.manual_seed(3407)
+    model = _tiny_model().train()
+    if reentrant is not None:
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": reentrant})
+    ids = torch.randint(0, 128, (2, 12), generator = torch.Generator().manual_seed(0))
+    model(input_ids = ids, labels = ids, use_cache = False).loss.backward()
+    return {name: param.grad for name, param in model.named_parameters() if param.grad is not None}
+
+
+def _max_relative_error(reference, other):
+    return max(float((other[name] - grad).norm() / (grad.norm() + 1e-12)) for name, grad in reference.items())
+
+
+@pytest.mark.skipif(SHARES_THROUGH_CACHE_ONLY, reason = "only transformers >= 5.6 shares KV by itself")
+def test_without_the_patch_reentrant_checkpointing_drops_shared_kv_gradients(pristine):
+    # The first checkpointed forward stores keys and values with no graph, and the shared layers
+    # are recomputed in backward before their source layer.
+    assert _max_relative_error(_grads(None), _grads(True)) > 0.05
+
+
+@pytest.mark.parametrize("reentrant", [True, False], ids = ["reentrant", "non_reentrant"])
+def test_checkpointed_gradients_match_the_uncheckpointed_ones(pristine, reentrant):
     zoo_gemma3n.patch_Gemma3nTextAttention_kv_sharing()
-    assert modeling.Gemma3nTextAttention.forward is pristine
-    cached, uncached = _losses(_tiny_model())
-    torch.testing.assert_close(uncached, cached)
+    reference = _grads(None)
+    assert _max_relative_error(reference, _grads(reentrant)) < 1e-5
