@@ -42,6 +42,7 @@ from .llama4_moe import *
 from .inkling import *
 from .compiled_model_identity import *
 from .bitsandbytes_large_tensors import *
+from .remote_mamba2 import *
 from .ernie4_5_moe import *
 from .pixtral import *
 from .ministral import *
