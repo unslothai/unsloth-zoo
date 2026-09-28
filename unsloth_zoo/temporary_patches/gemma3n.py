@@ -52,7 +52,11 @@ pass
 def Gemma3nRMSNorm_forward(self, x: torch.Tensor) -> torch.Tensor:
     # Llama does x.to(float16) * w whilst Gemma2 is (x * w).to(float16)
     # See https://github.com/huggingface/transformers/pull/29402
-    output = self._norm(x.float()) * self.weight.float()
+    output = self._norm(x.float())
+    # with_scale=False norms (embedding_post_projection_norm) have no weight on transformers >= 5.5.0,
+    # which dropped the tensor(1.0) placeholder buffer.
+    if getattr(self, "with_scale", True) and hasattr(self, "weight"):
+        output = output * self.weight.float()
     return output.type_as(x)
 
 def patch_Gemma3nMultimodalEmbedder_forward():
@@ -201,3 +205,62 @@ def patch_Gemma3nModel_get_placeholder_mask():
     patch_function(transformers.models.gemma3n.modeling_gemma3n.Gemma3nModel, "get_placeholder_mask", get_placeholder_mask, match_level="relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_Gemma3nModel_get_placeholder_mask)
+
+
+class _Gemma3nSharedKV:
+    # Stands in for the cache when none is passed: KV-shared layers read their source layer's
+    # keys and values from `shared_layers`, and `update` stores nothing.
+    def __init__(self):
+        self.shared_layers = {}
+
+    def update(self, key_states, value_states, *args, **kwargs):
+        return key_states, value_states
+pass
+
+_GEMMA3N_SHARED_KV = {}
+_GEMMA3N_ATTENTION_FORWARD = {}
+
+def _gemma3n_attention_forward_shared_kv(self, *args, **kwargs):
+    if (
+        kwargs.get("past_key_values") is None
+        and kwargs.get("past_key_value") is None
+        and len(args) < 4
+        and (self.is_kv_shared_layer or self.store_full_length_kv)
+    ):
+        kwargs.pop("past_key_value", None)
+        store = _GEMMA3N_SHARED_KV.get(id(self.config))
+        if store is None:
+            store = _GEMMA3N_SHARED_KV[id(self.config)] = _Gemma3nSharedKV()
+        kwargs["past_key_values"] = store
+    return _GEMMA3N_ATTENTION_FORWARD["original"](self, *args, **kwargs)
+pass
+
+def patch_Gemma3nTextAttention_kv_sharing():
+    # transformers <= 5.5 reuses a source layer's keys and values only through the cache, so with
+    # use_cache=False (training, gradient checkpointing) the KV-shared layers project their own and
+    # the last num_kv_shared_layers layers are wrong (gemma-3n-E2B eval loss 10.85 vs 5.94).
+    # transformers 5.6 passes shared_kv_states instead; this does the same through a stand-in cache.
+    try:
+        import inspect
+        import transformers.models.gemma3n.modeling_gemma3n as modeling
+        Gemma3nTextAttention = modeling.Gemma3nTextAttention
+        source = inspect.getsource(modeling)
+    except Exception as e:
+        return raise_error("Gemma3nTextAttention.forward", e)
+    if "shared_kv_states" in source or "past_key_values.shared_layers[self.kv_shared_layer_index]" not in source:
+        return
+    current = Gemma3nTextAttention.forward
+    if getattr(current, "_unsloth_gemma3n_kv_sharing", False):
+        return
+    # Keep the first original only: the compiler rebuilds this class from the patched source,
+    # and a later pass must not wrap that rebuilt forward.
+    _GEMMA3N_ATTENTION_FORWARD.setdefault("original", current)
+
+    # Self-contained body: the compiler copies it into its own module.
+    def forward(self, *args, **kwargs):
+        from unsloth_zoo.temporary_patches.gemma3n import _gemma3n_attention_forward_shared_kv
+        return _gemma3n_attention_forward_shared_kv(self, *args, **kwargs)
+    forward._unsloth_gemma3n_kv_sharing = True
+    Gemma3nTextAttention.forward = forward
+pass
+TEMPORARY_PATCHES.append(patch_Gemma3nTextAttention_kv_sharing)
