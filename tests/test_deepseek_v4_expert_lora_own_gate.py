@@ -114,7 +114,6 @@ def test_deepseek_v4_bf16_expert_lora_is_applied(tmp_path):
     assert r["n_expert_lora"] == 16  # 4 layers x (gate_up, down) x (A, B)
     assert all(g > 0 for g in r["grads"]), r["grads"]
     assert max(r["rel"]) < 0.02, r["rel"]
-    # Separated route, not a W + delta fold, and none of the breaks it used to cost (dispatch, rope, probes, os.path).
     assert all(r["own_gate"]), r["own_gate"]
     removed = ("_unsloth_experts_dispatch", "apply_rotary_pos_emb", "_run_probe_eagerly", "normpath")
     assert not [b for b in r["breaks"] if any(name in b for name in removed)], r["breaks"]

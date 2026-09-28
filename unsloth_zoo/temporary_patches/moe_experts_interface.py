@@ -217,7 +217,6 @@ def _custom_gate_with_expert_lora(module) -> bool:
 
 
 def own_gate_route_reads_stash(module) -> bool:
-    """Static answer for the compiled first call: this module's experts forward is Unsloth's and takes the own-gate route."""
     if not hasattr(getattr(type(module), "forward", None), "__wrapped__"):
         return False
     config = getattr(module, "config", None)

@@ -201,9 +201,7 @@ DISABLE_COMPILE_MODEL_FUNCTIONS = {
     "deepseek_v4": ["apply_rotary_pos_emb"],
 }
 
-# Per model_type {function: (old, new)} source rewrites. A rewritten function leaves
-# DISABLE_COMPILE_MODEL_FUNCTIONS and is compiled; unmatched upstream text keeps it disabled.
-# deepseek_v4: `split` gives the same tensors without the negative-offset slice pytorch#198553 miscompiles.
+# Matched rewrites leave DISABLE_COMPILE_MODEL_FUNCTIONS; deepseek_v4 `split` avoids the slice pytorch#198553 miscompiles.
 MODEL_FUNCTION_SOURCE_REWRITES = {
     "deepseek_v4": {
         "apply_rotary_pos_emb": (
@@ -215,7 +213,6 @@ MODEL_FUNCTION_SOURCE_REWRITES = {
 
 
 def model_function_source_rewrites(modeling_file, model_type):
-    """{function: (old, new)} for MODEL_FUNCTION_SOURCE_REWRITES entries whose old text is present."""
     applicable = {}
     for name, (old, new) in MODEL_FUNCTION_SOURCE_REWRITES.get(model_type, {}).items():
         try:
