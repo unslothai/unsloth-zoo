@@ -39,7 +39,7 @@ INKLING_SMALL_SHRUNK = {
     },
     "audio_config": {"decoder_dmodel": 64, "n_mel_bins": 4, "mel_vocab_size": 16},
     "vision_config": {"decoder_dmodel": 64, "patch_size": 40, "temporal_patch_size": 2, "n_channels": 3,
-                      "n_layers": 1, "hidden_size": 32, "num_attention_heads": 2},
+                      "n_layers": 6, "hidden_size": 32, "num_attention_heads": 2},
     "mtp_config": {"num_nextn_predict_layers": 2, "chain_hidden_post_norm": False, "local_layer_ids": [0]},
 }
 
