@@ -975,6 +975,8 @@ class SpeculativeEngine:
         kept = [min(count, depth - 1) if spec.source == "draft" else 0 for spec, count in zip(plan.rows, accepted)]
         if depth:
             self.drafter.settle(self.draft_cache, [row.draft for row in rows], depth - 1, kept)
+        # Left lazy, the commit makes the next decode copy whole cache buffers instead of writing in place.
+        mx.async_eval([entry.state for entry in [*self.cache, *(self.draft_cache or [])]])
         emitted = []
         for i, (row, proposal, target, count) in enumerate(zip(rows, proposals, targets, accepted)):
             row.draft_n += len(proposal)
