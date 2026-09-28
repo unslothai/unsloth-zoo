@@ -153,3 +153,27 @@ def test_a_float32_load_sizes_a_float32_dequant():
     model.config = type("Config", (), {"dtype": torch.float32})()
     units = [(f"layers.{i}", 0) for i in range(_LAYERS)]
     assert _moe_dequant_transient_by_unit(model, units) == dict.fromkeys((u for u, _ in units), 2 * _BF16_DEQUANT)
+
+
+def test_ungated_experts_keep_transformers_kernels_and_no_floor():
+    from unsloth_zoo.device_map_planner import _moe_dequant_transient_by_unit
+    model = _meta()
+    with torch.device("meta"):
+        for block in model.layers:
+            del block.experts.gate_up_proj
+            block.experts.up_proj = nn.Parameter(torch.empty(_E, _I, _H, dtype = torch.float8_e4m3fn), requires_grad = False)
+    assert _moe_dequant_transient_by_unit(model, [(f"layers.{i}", 0) for i in range(_LAYERS)]) == {}
+
+
+def test_a_partial_scale_block_adds_one_expert_for_the_per_expert_triton_loop():
+    from unsloth_zoo.device_map_planner import _moe_dequant_transient_by_unit
+    model = _meta()
+    with torch.device("meta"):
+        for block in model.layers:
+            # down: 64 x 128 in 22 x 22 blocks, 3 x 6 of them, the last row of blocks partial (66 > 64).
+            block.experts.gate_up_proj_scale_inv = nn.Parameter(torch.empty(_E, 4, 1), requires_grad = False)
+            block.experts.down_proj_scale_inv = nn.Parameter(torch.empty(_E, 3, 6), requires_grad = False)
+    gate_up, down = 2 * _E * 2 * _I * _H, 2 * _E * _H * _I
+    assert set(_moe_dequant_transient_by_unit(model, [(f"layers.{i}", 0) for i in range(_LAYERS)]).values()) == {
+        gate_up + down + down // _E
+    }

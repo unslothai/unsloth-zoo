@@ -1009,7 +1009,8 @@ def _load_transient_by_unit(
     return out
 
 
-_EXPERT_STACK_NAMES = ("gate_up_proj", "up_proj", "gate_proj", "down_proj")
+# The only stacks `forward_moe_backend_fp8` dequantizes whole; ungated (`up_proj`) experts keep transformers' kernels.
+_EXPERT_STACK_NAMES = ("gate_up_proj", "down_proj")
 _SCALE_SUFFIXES = ("_weight_scale_inv", "_weight_scale", "_scale_inv", "_scale")
 _FP8_DTYPES = tuple(
     getattr(torch, name) for name in ("float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnuz")
@@ -1017,21 +1018,22 @@ _FP8_DTYPES = tuple(
 )
 
 
-def _dequant_copies(module: nn.Module | None, leaf: str, weight: torch.Tensor) -> int:
-    """bf16 copies of a stack live while it dequantizes: 1 on the Triton block kernel, else the vectorized
-    fallback's `weight.to(dtype) * scale` (2), plus the expanded scale for a non-square block grid (3)."""
+def _dequant_peak(module: nn.Module | None, leaf: str, weight: torch.Tensor, size: int) -> int:
+    """Bytes live while one stack of `size` dequantized bytes converts: the Triton block kernel writes it
+    once (plus one expert when a partial block forces its per-expert loop), the vectorized fallback holds
+    `weight.to(dtype)` and `* scale` (2x), and a non-square block grid also expands the scale (3x)."""
     scale = None
     for suffix in _SCALE_SUFFIXES:
         scale = getattr(module, leaf + suffix, None)
         if isinstance(scale, torch.Tensor):
             break
     if not isinstance(scale, torch.Tensor):
-        return 1
+        return size
     if weight.dtype != torch.float8_e4m3fn or scale.dim() != 3 or scale.shape[0] != weight.shape[0]:
-        return 2
+        return 2 * size
     p, q = scale.shape[1], scale.shape[2]
     if p == 0 or q == 0:
-        return 2
+        return 2 * size
     bm, bn = -(-weight.shape[1] // p), -(-weight.shape[2] // q)
     try:
         from .temporary_patches.moe_utils_fp8 import _triton_max_tensor_numel
@@ -1039,8 +1041,8 @@ def _dequant_copies(module: nn.Module | None, leaf: str, weight: torch.Tensor) -
     except Exception:
         cap = 1 << 20
     if bm == bn and bm * bn <= cap:
-        return 1
-    return 2 if p == q == 1 else 3
+        return size if weight.shape[1] == p * bm else size + size // weight.shape[0]
+    return (2 if p == q == 1 else 3) * size
 
 
 def _moe_dequant_transient_by_unit(
@@ -1058,22 +1060,24 @@ def _moe_dequant_transient_by_unit(
         if isinstance(compute, torch.dtype) and compute.is_floating_point and compute not in _FP8_DTYPES
         else 2
     )
-    stacks: dict[str, list[tuple[int, int]]] = {}
+    stacks: dict[str, dict[str, tuple[int, int]]] = {}
     for name, tensor in model.named_parameters():
         if tensor.dim() != 3 or tensor.dtype not in _FP8_DTYPES:
             continue
         module, _, leaf = name.rpartition(".")
         if leaf not in _EXPERT_STACK_NAMES:
             continue
-        stacks.setdefault(module, []).append(
-            (tensor.numel() * itemsize, _dequant_copies(modules.get(module), leaf, tensor))
-        )
+        size = tensor.numel() * itemsize
+        stacks.setdefault(module, {})[leaf] = (size, _dequant_peak(modules.get(module), leaf, tensor, size))
     per_module: dict[str, int] = {}
     for module, parts in stacks.items():
-        # Stacks are dequantized one after another and all stay live, each costing `copies` while it converts.
+        if "gate_up_proj" not in parts:
+            continue
+        # gate_up then down, the first staying live while the second converts.
         done = peak = 0
-        for size, copies in parts:
-            peak = max(peak, done + copies * size)
+        for leaf in _EXPERT_STACK_NAMES:
+            size, need = parts.get(leaf, (0, 0))
+            peak = max(peak, done + need)
             done += size
         per_module[module] = peak
     out: dict[str, int] = {}
