@@ -13,11 +13,7 @@
 #
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""The fused CE loss inside a torch.compile region must return the same gradient as eager.
-
-On torch 2.11 a traced UnslothFusedLoss gave the right loss and a zero gradient, so a compiled
-causal LM trained no LoRA weight at all. This compares compiled against eager on every torch.
-"""
+"""Compiled fused CE must give eager's gradient (torch 2.11 traced it to zeros)."""
 
 import pytest
 import torch
