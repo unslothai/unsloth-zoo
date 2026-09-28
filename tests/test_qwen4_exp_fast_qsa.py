@@ -153,3 +153,31 @@ def test_patch_installed_and_kill_switch(monkeypatch):
         assert cls.forward is compiled_copy and patch._reference_qsa_forward is original
     finally:
         cls.forward = original
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for torch._grouped_mm")
+def test_grouped_mm_experts_take_fp32_input_under_autocast():
+    # Unsloth's generate runs under bf16 autocast, where Qwen4Exp's PLE sum makes the residual
+    # fp32; torch._grouped_mm is not autocast-cast and raised on the bf16 expert stacks.
+    from unsloth_zoo.temporary_patches import moe_utils
+    if not moe_utils._check_torch_grouped_mm_supported():
+        pytest.skip("torch._grouped_mm unsupported on this device")
+    cfg = Qwen4ExpTextConfig(
+        hidden_size=64, num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2, head_dim=16,
+        linear_num_key_heads=2, linear_num_value_heads=2, linear_key_head_dim=16,
+        linear_value_head_dim=16, num_experts=4, num_experts_per_tok=2, moe_intermediate_size=16,
+        shared_expert_intermediate_size=16, vocab_size=128, hc_count=2, hc_lowrank=8,
+        ple_layer_ids=[], ngram_vocab_size_base=100,
+    )
+    torch.manual_seed(0)
+    experts = modeling.Qwen4ExpTextExperts(cfg).to("cuda", torch.bfloat16)
+    for p in experts.parameters():
+        torch.nn.init.normal_(p, 0, 0.1)
+    x = torch.randn(6, 64, device="cuda")
+    idx = torch.randint(0, 4, (6, 2), device="cuda")
+    w = torch.rand(6, 2, device="cuda")
+    with torch.no_grad():
+        ref = moe_utils.forward_native_grouped_mm(experts, x.bfloat16(), idx, w)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            out = moe_utils.forward_native_grouped_mm(experts, x, idx, w)
+    torch.testing.assert_close(out.float(), ref.float())
