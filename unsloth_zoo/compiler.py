@@ -6592,7 +6592,8 @@ def unsloth_compile_transformers(
                     bad_reason = "disabled keyword is in it"
                     break
             pass
-            if not bad and is_hub_kernel_wrapper(source):
+            # DISABLE_COMPILE_FUNCTIONS names keep the stronger @torch.compiler.disable below.
+            if not bad and module not in disable_compile_functions and is_hub_kernel_wrapper(source):
                 bad = True
                 bad_reason = "it dispatches to an external kernel package"
             pass

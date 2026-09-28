@@ -43,10 +43,11 @@ import os, json, io, contextlib, importlib
 os.environ["UNSLOTH_COMPILE_LOCATION"] = "unsloth_compiled_cache"
 import torch
 from unsloth_zoo.compiler import unsloth_compile_transformers
-MT = "nemotron_h"
+MT = os.environ["UNSLOTH_TEST_MODEL_TYPE"]
 modeling = importlib.import_module(f"transformers.models.{MT}.modeling_{MT}")
 hub = [n for n in ("causal_conv1d_update", "causal_conv1d_fn", "mamba2_split_conv1d_scan_combined",
-                   "mamba2_selective_state_update", "mamba2_chunk_scan") if hasattr(modeling, n)]
+                   "mamba2_selective_state_update", "mamba2_chunk_scan",
+                   "torch_chunk_gated_delta_rule", "torch_recurrent_gated_delta_rule") if hasattr(modeling, n)]
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     unsloth_compile_transformers(model_type = MT, fast_lora_forwards = False, fullgraph = True,
@@ -69,18 +70,23 @@ def _decorators_of(generated, name):
     return decs
 
 
-def test_nemotron_h_hub_kernel_functions_are_not_compiled(tmp_path):
-    pytest.importorskip("transformers.models.nemotron_h.modeling_nemotron_h")
+def _compile(tmp_path, model_type):
+    pytest.importorskip(f"transformers.models.{model_type}.modeling_{model_type}")
     env = dict(os.environ)
     env["UNSLOTH_ALLOW_CPU"] = "1"
     env["UNSLOTH_ZOO_DISABLE_GPU_INIT"] = "1"
+    env["UNSLOTH_TEST_MODEL_TYPE"] = model_type
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     env["PYTHONPATH"] = os.pathsep.join([repo_root] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
     env.pop("UNSLOTH_COMPILE_DISABLE", None)
     r = subprocess.run([sys.executable, "-c", _CHILD], cwd = str(tmp_path), env = env,
                        capture_output = True, text = True, timeout = 1800)
     assert r.returncode == 0, r.stdout[-4000:] + r.stderr[-4000:]
-    payload = json.loads(next(l[3:] for l in r.stdout.splitlines() if l.startswith("@@@")))
+    return json.loads(next(l[3:] for l in r.stdout.splitlines() if l.startswith("@@@")))
+
+
+def test_nemotron_h_hub_kernel_functions_are_not_compiled(tmp_path):
+    payload = _compile(tmp_path, "nemotron_h")
     generated, hub = payload["generated"], payload["hub"]
     assert "mamba2_split_conv1d_scan_combined" in hub
     checked = 0
@@ -94,3 +100,17 @@ def test_nemotron_h_hub_kernel_functions_are_not_compiled(tmp_path):
         )
         checked += 1
     assert checked >= 1, "no hub-kernel wrapper reached the generated module, so the test proves nothing"
+
+
+def test_disable_listed_hub_wrappers_keep_compiler_disable(tmp_path):
+    payload = _compile(tmp_path, "qwen3_next")
+    generated = payload["generated"]
+    names = [n for n in ("torch_chunk_gated_delta_rule", "torch_recurrent_gated_delta_rule")
+             if n in payload["hub"] and f"\ndef {n}(" in generated]
+    if not names:
+        pytest.skip("qwen3_next has no hub-wrapped gated delta rule in this transformers")
+    for name in names:
+        decs = _decorators_of(generated, name)
+        if not any("use_kernel_func_from_hub_with_fallback" in d for d in decs):
+            continue
+        assert any("torch.compiler.disable" in d for d in decs), (name, decs)
