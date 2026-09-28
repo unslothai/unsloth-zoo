@@ -40,7 +40,7 @@ _CASES = {
 def _build(config_name):
     config_cls = getattr(transformers, config_name, None)
     if config_cls is None:
-        pytest.skip(f"{config_name} not in this transformers")
+        pytest.skip(f"{config_name} not in this transformers")  # reason: older 5.x ship fewer Granite MoE classes and the patch only touches classes that exist
     kwargs = {**_BASE, **_CASES[config_name]}
     try:
         config = config_cls(**kwargs)
