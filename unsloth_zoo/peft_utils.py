@@ -183,10 +183,8 @@ def get_peft_regex(
                 # Llama 4's and PhiMoE's routers return a tuple, so PEFT's LoRA
                 # forward reads `result.dtype` off one and the model cannot run.
                 continue
+            # Seen once = a head (lm_head), unless inside a numbered layer stack (one layer of a kind).
             if count != 1 or proj in _in_layer_stack:
-                # A leaf seen once is a head (lm_head, a projector) unless it sits inside a
-                # numbered layer stack: a config with one layer of a kind (tiny test models,
-                # a hybrid with a single attention block) still has real per-layer targets.
                 only_linear_modules.append(proj)
             else:
                 projection_modules[proj] = j
@@ -246,14 +244,8 @@ def get_peft_regex(
 
         # Also account for model.layers.0.self_attn/mlp type modules like Qwen
         if finetune_language_layers:
-            # Text-only loads (FastModel text_only=True, plain *ForCausalLM) name the
-            # decoder model.layers.N with no language/text tag, so this branch must
-            # select what the first branch selects under model.language_model:
-            # nested leaves (NemotronH mixer.shared_experts.up_proj, Qwen MoE
-            # mlp.shared_expert.gate_proj) and components that only contain a tag
-            # (Qwen3.5 / Qwen3-Next linear_attn.in_proj_qkv). It used to require the
-            # leaf directly under an exact component, so those adapters were dropped,
-            # or reached only through the no-match fallback below.
+            # Same shape as the composite branch, so text-only loads reach nested leaves
+            # (mlp.shared_expert.up_proj) and tag-containing components (linear_attn.*).
             regex_matcher = r"(?:" + regex_matcher + \
             r")|(?:\bmodel\.layers\.[\d]{1,}\..*?(?:" + regex_components + \
             r").*?\.(?:" + match_linear_modules + r"))"

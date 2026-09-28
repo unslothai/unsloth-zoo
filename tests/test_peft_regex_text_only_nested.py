@@ -1,10 +1,20 @@
-"""get_peft_regex must select the same decoder leaves for a text-only load (model.layers.N...)
-as for the composite VLM load (model.language_model.layers.N...).
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-Before: the text-only branch required the leaf directly under an exact component name, so
-FastModel(text_only=True) + finetune_* filters (or target_modules=None) dropped LoRA on
-Qwen3.5 / Qwen3-Next / Qwen4Exp linear_attn.in_proj_* / out_proj and on every
-mlp.shared_expert.* projection, while the same call on the VLM kept them."""
+"""Text-only decoders (model.layers.N) get the same LoRA leaves as model.language_model.layers.N."""
 import re
 
 import pytest
@@ -81,12 +91,11 @@ def test_text_only_matches_composite(targets):
     assert text == comp
     assert "model.layers.1.mlp.shared_expert.down_proj" in text
     if targets is None:
-        return  # auto targets: single-use leaves (this toy's in_proj_*) count as projections
+        return
     assert "model.layers.0.linear_attn.in_proj_qkv" in text
     assert "model.layers.0.linear_attn.out_proj" in text
     assert "model.layers.1.mlp.shared_expert.down_proj" in text
     assert "model.layers.1.self_attn.q_proj" in text
-    # routers, the PLE projection and the head stay out
     assert not any(n.endswith("mlp.gate") or "ple." in n or n == "lm_head" for n in text), text
 
 

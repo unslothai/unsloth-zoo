@@ -14,13 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""all-linear / automatic LoRA targets on a model with one layer of a kind.
-
-get_peft_regex drops a Linear leaf name that occurs once, to skip heads like lm_head. A
-config with a single attention / Mamba / MoE layer (tiny NemotronH test models, hybrids with
-one attention block) then lost every per-layer target, and the regex ended in an empty
-group: only the routed experts (target_parameters) got LoRA.
-"""
+"""Automatic LoRA targets on a model with one layer of a kind (leaves seen once)."""
 import re
 
 import pytest
@@ -34,7 +28,7 @@ def _nemotron_h(block_types):
     transformers = pytest.importorskip("transformers")
     NemotronHConfig = getattr(transformers, "NemotronHConfig", None)
     if NemotronHConfig is None:
-        pytest.skip("transformers has no nemotron_h")
+        pytest.skip(reason="native nemotron_h needs transformers 5.x")
     cfg = NemotronHConfig(
         vocab_size=128, hidden_size=16, intermediate_size=32, moe_intermediate_size=32,
         moe_shared_expert_intermediate_size=32, n_routed_experts=4, num_experts_per_tok=2,
@@ -59,7 +53,6 @@ def test_one_layer_per_kind_keeps_layer_targets():
     for leaf in ("q_proj", "k_proj", "v_proj", "o_proj", "in_proj", "up_proj", "down_proj"):
         assert leaf in leaves, (leaf, sorted(leaves))
     assert "model.layers.2.mixer.shared_experts.up_proj" in _targets(_nemotron_h(["mamba", "attention", "moe"]))[2]
-    # Mamba out_proj stays excluded (fused kernels), lm_head / router never targeted.
     assert "out_proj" not in leaves and "lm_head" not in leaves and "gate" not in leaves
 
 
@@ -83,7 +76,7 @@ def test_top_level_single_leaf_still_excluded():
             self.model = nn.Module()
             self.model.layers = nn.ModuleList([Block() for _ in range(n)])
             self.lm_head = nn.Linear(8, 8)
-            self.mlp_proj = nn.Linear(8, 8)  # a lone head outside any layer stack
+            self.mlp_proj = nn.Linear(8, 8)
 
     for n in (1, 3):
         toy = Toy(n)
@@ -93,9 +86,7 @@ def test_top_level_single_leaf_still_excluded():
 
 
 def test_shared_experts_do_not_hide_linear_attention():
-    # An explicit list on a text-only hybrid (Qwen3-Next: linear_attn + mlp.shared_expert) must
-    # keep linear_attn.*: a matcher that only reached the shared experts used to skip the
-    # no-match fallback that main relied on, dropping every linear_attn adapter.
+    # Qwen3-Next shape: reaching shared experts once skipped the fallback that kept linear_attn.*.
     class Block(nn.Module):
         def __init__(self):
             super().__init__()
