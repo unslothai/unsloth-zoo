@@ -28,6 +28,7 @@ torch = pytest.importorskip("torch")
 from unsloth_zoo.temporary_patches.utils import (
     UNSLOTH_DECODE_COMPILE,
     torch_compiler_disable_unless_decode,
+    unsloth_decode_compile,
 )
 
 
@@ -115,3 +116,42 @@ def test_stance_block_skipped_around_compiled_decode():
     UNSLOTH_DECODE_COMPILE[0] = True
     assert _stance_block(calls)() == 1
     assert calls == []
+
+
+def _stance():
+    import torch._dynamo.eval_frame as eval_frame
+    return eval_frame._stance.stance
+
+
+def test_scope_is_reference_counted_across_overlapping_calls():
+    first, second = unsloth_decode_compile(), unsloth_decode_compile()
+    first.__enter__()
+    second.__enter__()
+    first.__exit__(None, None, None)  # the earlier call finishes while the later one decodes
+    assert UNSLOTH_DECODE_COMPILE[0] is True
+    second.__exit__(None, None, None)
+    assert UNSLOTH_DECODE_COMPILE[0] is False
+
+
+def test_scope_clears_on_error():
+    with pytest.raises(RuntimeError):
+        with unsloth_decode_compile():
+            raise RuntimeError
+    assert UNSLOTH_DECODE_COMPILE[0] is False
+
+
+@pytest.mark.skipif(not hasattr(torch.compiler, "set_stance"), reason = "torch without set_stance")
+def test_scope_compiles_under_eager_on_recompile_and_restores_it():
+    calls = []
+    def backend(gm, example_inputs):
+        calls.append(1)
+        return gm.forward
+    torch.compiler.set_stance("eager_on_recompile")
+    try:
+        with unsloth_decode_compile():
+            assert _stance() == "default"
+            torch.compile(lambda x: x.sin() + 1, backend = backend)(torch.randn(4))
+        assert _stance() == "eager_on_recompile"
+    finally:
+        torch.compiler.set_stance("default")
+    assert calls, "eager_on_recompile never compiles a new frame, so decode stayed eager"

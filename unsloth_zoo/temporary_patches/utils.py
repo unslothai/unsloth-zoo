@@ -17,6 +17,7 @@
 __all__ = [
     "patch_function",
     "UNSLOTH_DECODE_COMPILE",
+    "unsloth_decode_compile",
     "torch_compiler_disable_unless_decode",
     "compile_with_eager_fallback",
     "patch_function_past_key_values",
@@ -44,8 +45,10 @@ __all__ = [
     "apply_pending_eager_fallbacks",
     "torch_compile_with_fallback",
 ]
+import contextlib
 import functools
 import inspect
+import threading
 import weakref
 import typing as t
 import torch
@@ -2089,6 +2092,43 @@ def _settle_abandoned_checkpoint_generator():
 # True only while generate() runs a compiled decode step for a model that opted in. A
 # one-element list so Dynamo guards on the value and retraces when it flips.
 UNSLOTH_DECODE_COMPILE = [False]
+_DECODE_COMPILE_LOCK = threading.Lock()
+_DECODE_COMPILE_STATE = {"depth": 0, "stance": None}
+
+
+@contextlib.contextmanager
+def unsloth_decode_compile():
+    """Scope one generate() whose decode step compiles. Reference counted, so overlapping
+    calls keep the flag set until the last one exits. Dynamo runs under the default stance
+    meanwhile: eager_on_recompile, left by earlier eager inference, never compiles a new frame."""
+    set_stance = getattr(torch.compiler, "set_stance", None)
+    with _DECODE_COMPILE_LOCK:
+        _DECODE_COMPILE_STATE["depth"] += 1
+        if _DECODE_COMPILE_STATE["depth"] == 1:
+            UNSLOTH_DECODE_COMPILE[0] = True
+            stance = _current_stance()
+            _DECODE_COMPILE_STATE["stance"] = stance
+            if set_stance is not None and stance is not None and stance[0] != "default":
+                set_stance("default")
+    try:
+        yield
+    finally:
+        with _DECODE_COMPILE_LOCK:
+            _DECODE_COMPILE_STATE["depth"] -= 1
+            if _DECODE_COMPILE_STATE["depth"] == 0:
+                UNSLOTH_DECODE_COMPILE[0] = False
+                stance = _DECODE_COMPILE_STATE["stance"]
+                _DECODE_COMPILE_STATE["stance"] = None
+                if set_stance is not None and stance is not None and stance[0] != "default":
+                    set_stance(stance[0], skip_guard_eval_unsafe = stance[1])
+
+
+def _current_stance():
+    try:
+        import torch._dynamo.eval_frame as eval_frame
+        return (eval_frame._stance.stance, eval_frame._stance.skip_guard_eval_unsafe)
+    except Exception:
+        return None
 
 
 def torch_compiler_disable_unless_decode(func):
