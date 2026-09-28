@@ -2050,21 +2050,6 @@ def _mxfp4_decode_stack(param, dtype, token_counts, role = "", slot = None):
     return slot.stack
 
 
-no_cudagraph_torch_compile_options = get_torch_compile_options(
-    epilogue_fusion = True,
-    max_autotune = False,
-    shape_padding = True,
-    # Every layer passes its own packed stack: CUDA graphs would re-record per layer (or copy the stacks).
-    cudagraphs = False,
-    coordinate_descent_tuning = use_coordinate_descent,
-    combo_kernels = False,
-    memory_planning = True,
-    multi_kernel = False,
-    use_block_ptr = True,
-    logging = UNSLOTH_ENABLE_LOGGING,
-)
-
-
 @_torch_compile(dynamic=None, fullgraph=True, options=no_combo_fused_torch_compile_options)
 def _moe_forward_inference_mxfp4_kernel(
     hidden_states, routing_weights, router_indices,
