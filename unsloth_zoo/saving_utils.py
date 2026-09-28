@@ -6165,6 +6165,10 @@ def _unbacked_trained_tensors(lora_weights, shard_keys, model_class_name,
     a tied or prefix-bridged `lm_head` reaches the base through `embed_tokens`, and seeding
     a bare `lm_head.weight` for it puts an unexpected key in the export.
     """
+    # An NVFP4 <base>.weight_packed is rewritten to <base>.weight, so it backs that module too.
+    shard_keys = set(shard_keys) | {
+        k[: -len(_NVFP4_PACKED_SUFFIX)] + ".weight" for k in shard_keys if k.endswith(_NVFP4_PACKED_SUFFIX)
+    }
     converted = _convert_lora_keys_to_safetensor_format(
         lora_weights, shard_keys, model_class_name = model_class_name,
     )

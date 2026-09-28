@@ -205,3 +205,34 @@ def test_missing_nvfp4_global_scale_is_refused():
     packed, scale, _ = _nvfp4(32, 64, 0)
     with pytest.raises(RuntimeError, match="no weight_global_scale"):
         _nvfp4_dequantize(packed, scale, None)
+
+
+def test_modules_to_save_on_an_nvfp4_layer_is_not_seeded_twice(tmp_path):
+    # The packed base backs the module: seeding a second <base>.weight broke the Step-7 count.
+    import collections
+    from unsloth_zoo.saving_utils import LoraStats, _unbacked_trained_tensors
+
+    class _Saved(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.modules_to_save = torch.nn.ModuleDict({"default": torch.nn.Linear(64, 32, bias=False)})
+
+    stats = LoraStats(None, None, None, 0)
+    stats.module = _Saved()
+    lora = collections.defaultdict(lambda: LoraStats(None, None, None, 0))
+    lora["model.layers.0.mlp.gate_proj"] = stats
+    keys = {"model.layers.0.mlp.gate_proj.weight_packed", "model.layers.0.mlp.gate_proj.weight_scale"}
+    assert _unbacked_trained_tensors(lora, keys, "Qwen3ForCausalLM") == {}
+
+    # The rewrite then writes the trained weight under <base>.weight.
+    packed, scale, gs = _nvfp4(32, 64, 0)
+    shard = tmp_path / "model.safetensors"
+    save_file({
+        "model.layers.0.mlp.gate_proj.weight_packed": packed,
+        "model.layers.0.mlp.gate_proj.weight_scale": scale,
+        "model.layers.0.mlp.gate_proj.weight_global_scale": gs,
+    }, str(shard), metadata={"format": "pt"})
+    count, out = _merge(tmp_path, [shard], lora, [shard.name])
+    want = stats.module.modules_to_save["default"].weight.detach().to(torch.bfloat16)
+    assert count == 1 and set(out) == {"model.layers.0.mlp.gate_proj.weight"}
+    assert torch.equal(out["model.layers.0.mlp.gate_proj.weight"], want)
