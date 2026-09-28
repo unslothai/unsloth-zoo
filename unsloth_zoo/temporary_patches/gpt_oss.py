@@ -482,92 +482,6 @@ def patch_gpt_oss():
         return w, w_scale
     patch_function(transformers.integrations.mxfp4, "swizzle_mxfp4", swizzle_mxfp4, match_level = "relaxed")
 
-    class Mxfp4GptOssExperts_Training(torch.autograd.Function):
-        @staticmethod
-        def forward(
-            ctx,
-            hidden_states,
-            self_class,
-            routing_data,
-            gather_idx,
-            scatter_idx,
-        ):
-            pre_activation = matmul_ogs(
-                hidden_states.to(torch.bfloat16), # tl.dot_scaled upcasts to BF16 for old hardware
-                self_class.gate_up_proj,
-                self_class.gate_up_proj_bias,
-                routing_data,
-                gather_indx=gather_idx,
-                scatter_indx=None,
-                precision_config=self_class.gate_up_proj_precision_config,
-                gammas=None,
-                fused_activation=None,
-            )
-            swiglu_output = swiglu_torch_forward(
-                pre_activation,
-                self_class.alpha,
-                self_class.limit,
-            )
-            out = matmul_ogs(
-                swiglu_output,
-                self_class.down_proj,
-                self_class.down_proj_bias,
-                routing_data,
-                gather_indx=None,
-                scatter_indx=scatter_idx,
-                precision_config=self_class.down_proj_precision_config,
-                gammas=routing_data.gate_scal,
-                fused_activation=None,
-            )
-            ctx.save_for_backward(
-                pre_activation,
-                routing_data.gate_scal,
-                gather_idx.src_indx,
-                gather_idx.dst_indx,
-                scatter_idx.src_indx,
-                scatter_idx.dst_indx,
-            )
-            ctx.self_class   = self_class
-            ctx.gather_idx   = gather_idx
-            ctx.scatter_idx  = scatter_idx
-            ctx.routing_data = routing_data
-            return out
-        pass
-
-        @staticmethod
-        def backward(ctx, grad_token):
-            raise NotImplementedError(
-                "Backwards pass using MXFP4 is still under construction!\n"
-                "Instead, use `unsloth/gpt-oss-20b-BF16` for bfloat16 training which will work for LoRA.\n"
-                "Or, use `load_in_4bit = True` which allows finetuning."
-            )
-            (pre_act, gamma, gather_src, gather_dst, scatter_src, scatter_dst,) = ctx.saved_tensors
-            self_class = ctx.self_class
-            limit = self_class.limit
-            alpha = self_class.alpha
-
-            # 1) token ➜ expert (reverse of forward scatter)
-            grad_exp = grad_token.index_select(0, scatter_src)
-            grad_exp.mul_(gamma.unsqueeze(-1))
-            # 2) grad_exp · Wdᵀ (reuse forward GEMM kernel)
-            Wd_T = ctx.self_class.down_proj.data.swapaxes(1, 2).transpose(1, 2).contiguous().transpose(1, 2) # (E, d_model, d_ff)
-            g1   = matmul_ogs(grad_exp, Wd_T, None, ctx.routing_data, gather_indx=ctx.scatter_idx)
-            del Wd_T
-            # 3) activation derivative
-            g1 = swiglu_torch_backward(pre_act, alpha, limit, g1)
-            # 4) g1 · Wuᵀ
-            Wu_T = ctx.self_class.gate_up_proj.data.swapaxes(1, 2).transpose(1, 2).contiguous().transpose(1, 2) # (E, 2*d_ff, d_model)
-            dx_exp = matmul_ogs(g1, Wu_T, None, ctx.routing_data, scatter_indx=ctx.gather_idx)
-            del Wu_T
-
-            # 5) expert ➜ token (reverse of forward gather)
-            dx_token = torch.zeros_like(grad_token)
-            dx_token.index_add_(0, gather_dst, dx_exp)
-            return (dx_token, None, None, None, None,)
-        pass
-
-    pass
-
     class Mxfp4GptOssExperts(nn.Module):
         def __init__(self, config):
             super().__init__()
@@ -677,7 +591,7 @@ def patch_gpt_oss():
             with torch_cuda_device(hidden_states.device):
                 if not hasattr(self, "act"):
                     self.act = FusedActivation(FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")), (self.alpha, self.limit), 2)
-                if not hidden_states.requires_grad:
+                if not (torch.is_grad_enabled() and hidden_states.requires_grad):
                     intermediate_cache1 = matmul_ogs(
                         hidden_states.to(torch.bfloat16),  # tl.dot_scaled upcasts to BF16 for old hardware
                         self.gate_up_proj,
@@ -698,12 +612,8 @@ def patch_gpt_oss():
                         gammas=routing_data.gate_scal if routing_data else None,
                     )
                 else:
-                    intermediate_cache3 = Mxfp4GptOssExperts_Training.apply(
-                        hidden_states,
-                        self,
-                        routing_data,
-                        gather_idx,
-                        scatter_idx,
+                    intermediate_cache3 = mxfp4_ogs_experts_forward(
+                        self, hidden_states, routing_data, gather_idx, scatter_idx,
                     )
             return intermediate_cache3
 
@@ -2113,8 +2023,130 @@ def _mxfp4_fused_decode_enabled(param, dtype):
     return mxfp4_grouped_mm_op is not None and _mxfp4_fused_enabled(param, dtype)
 
 
+# matmul_ogs decode: bf16 activations x the packed MXFP4 stacks, routed rows only, no dequantized copy.
+_OGS_WEIGHTS = {}
+_OGS_FAILED = set()
+
+
+@functools.lru_cache(maxsize = 1)
+def _ogs_modules():
+    from unsloth_zoo.triton_kernels_compat import get_triton_kernels
+    import importlib
+    tk = get_triton_kernels()  # top-level install or vLLM's vendored copy, never a lasting alias
+    if tk is None:
+        return None
+    try:
+        sub = lambda name: importlib.import_module(f"{tk.__name__}.{name}")
+        return tk, sub("matmul_ogs"), sub("routing"), sub("swiglu"), sub("tensor"), sub("tensor_details.layout")
+    except Exception:
+        return None
+
+
+def _ogs_kernels():
+    """UNSLOTH_MXFP4_OGS=0 keeps decode on the exact packed path; read per call so tests can flip it."""
+    if os.environ.get("UNSLOTH_MXFP4_OGS", "1") == "0":
+        return None
+    return _ogs_modules()
+
+
+def _ogs_weight(blocks, scales, in_dim):
+    """Triton view of a packed (E, out, G, 16) stack; strided layouts share the packed bytes."""
+    key = (blocks.data_ptr(), scales.data_ptr(), tuple(blocks.shape))
+    cached = _OGS_WEIGHTS.get(key)
+    if cached is not None:
+        return cached
+    _, mo, _, _, T, L = _ogs_kernels()
+    E, out_dim = blocks.shape[:2]
+    rows = blocks.reshape(E, out_dim, -1)
+    value_layout, value_opts, strided = _mxfp4_layout_arguments(L, rows)
+    w = T.convert_layout(T.wrap_torch_tensor(rows.transpose(-2, -1), dtype = T.FP4), value_layout, **value_opts)
+    w.shape = torch.Size([E, in_dim, out_dim])
+    w_scale = T.convert_layout(T.wrap_torch_tensor(scales.reshape(E, out_dim, -1).transpose(-2, -1)), strided)
+    precision = mo.PrecisionConfig(weight_scale = w_scale, flex_ctx = mo.FlexCtx(rhs_data = mo.InFlexData()))
+    _OGS_WEIGHTS[key] = (w, precision)
+    return w, precision
+
+
+@torch.library.custom_op("unsloth_zoo::mxfp4_ogs_moe", mutates_args = ())
+def mxfp4_ogs_moe(
+    x: torch.Tensor, router_logits: torch.Tensor, top_k: int,
+    gu_blocks: torch.Tensor, gu_scales: torch.Tensor, gu_bias: torch.Tensor,
+    dn_blocks: torch.Tensor, dn_scales: torch.Tensor, dn_bias: torch.Tensor,
+    alpha: float, limit: float,
+) -> torch.Tensor:
+    tk, mo, rt, sw, _, _ = _ogs_kernels()
+    hidden = x.shape[-1]
+    intermediate = dn_blocks.shape[2] * 32
+    w_gu, p_gu = _ogs_weight(gu_blocks, gu_scales, hidden)
+    w_dn, p_dn = _ogs_weight(dn_blocks, dn_scales, intermediate)
+    # Top-k + softmax over the top-k, as the router does; only an exact bf16 tie at k can pick another expert.
+    # expt_indx (the router's own indices) is not used: it mis-builds the expert histogram in vLLM 0.30's copy.
+    routing_data, gather, scatter = rt.routing(router_logits, top_k)
+    act = mo.FusedActivation(mo.FnSpecs("swiglu", sw.swiglu_fn, ("alpha", "limit")), (alpha, limit), 2)
+    inter = mo.matmul_ogs(
+        x, w_gu, gu_bias, routing_data, gather_indx = gather, precision_config = p_gu, fused_activation = act,
+    )
+    return mo.matmul_ogs(
+        inter, w_dn, dn_bias, routing_data, scatter_indx = scatter, precision_config = p_dn,
+        gammas = routing_data.gate_scal,
+    )
+
+
+@mxfp4_ogs_moe.register_fake
+def _(x, router_logits, top_k, gu_blocks, gu_scales, gu_bias, dn_blocks, dn_scales, dn_bias, alpha, limit):
+    return torch.empty_like(x)
+
+
+@_torch_compile(dynamic=None, fullgraph=True, options=no_combo_fused_torch_compile_options)
+def _moe_forward_inference_ogs_kernel(
+    hidden_states, router_weight, router_bias, top_k,
+    gu_blocks, gu_scales, gate_up_proj_bias, dn_blocks, dn_scales, down_proj_bias, alpha, limit, hidden_size,
+):
+    batch_size = hidden_states.shape[0]
+    x = hidden_states.reshape(-1, hidden_size)
+    logits = F.linear(x.to(router_weight.dtype), router_weight, router_bias)
+    out = torch.ops.unsloth_zoo.mxfp4_ogs_moe(
+        x.to(torch.bfloat16), logits, top_k,
+        gu_blocks, gu_scales, gate_up_proj_bias.to(torch.float32),
+        dn_blocks, dn_scales, down_proj_bias.to(torch.float32), alpha, limit,
+    )
+    return out.to(hidden_states.dtype).view(batch_size, -1, hidden_size)
+
+
+def _mxfp4_ogs_decode(self, hidden_states):
+    """None unless both stacks are packed, nothing needs gradients, and triton_kernels runs them."""
+    if torch.is_grad_enabled() or _ogs_kernels() is None:
+        return None
+    moe = _unwrap_peft_experts(self.experts)
+    gate_up, down = moe.gate_up_proj, moe.down_proj
+    if not (is_mxfp4_expert_param(gate_up) and is_mxfp4_expert_param(down)):
+        return None
+    if not (gate_up.mxfp4_transposed and down.mxfp4_transposed) or gate_up.device in _OGS_FAILED:
+        return None
+    from unsloth_zoo.triton_kernels_compat import matmul_ogs_available
+    if not matmul_ogs_available(gate_up.device):  # once per device: import, layout, launch and accuracy
+        _OGS_FAILED.add(gate_up.device)
+        return None
+    gu_blocks, gu_scales, _ = _mxfp4_static_operands(gate_up, moe, "gate_up")
+    dn_blocks, dn_scales, _ = _mxfp4_static_operands(down, moe, "down")
+    try:
+        return _moe_forward_inference_ogs_kernel(
+            hidden_states, self.router.weight, self.router.bias, self.router.top_k,
+            gu_blocks, gu_scales, moe.gate_up_proj_bias, dn_blocks, dn_scales, moe.down_proj_bias,
+            float(moe.alpha), float(moe.limit), moe.hidden_size,
+        )
+    except Exception as error:
+        # One failure per device drops to the exact packed path for the rest of the process.
+        _OGS_FAILED.add(gate_up.device)
+        logger.warning(f"Unsloth: matmul_ogs MXFP4 decode failed ({error}); using the exact packed path.")
+        return None
+
+
 def moe_forward_inference_bf16(self, hidden_states):
     """Wrapper that extracts weights from ParameterModule before calling the compiled kernel."""
+    out = _mxfp4_ogs_decode(self, hidden_states)
+    if out is not None:
+        return out
     router_scores, router_indices = moe_router_forward(self.router, hidden_states)
     routing_weights = router_scores
 
@@ -2291,6 +2323,230 @@ TEMPORARY_PATCHES.append(patch_gpt_oss_moe_for_lora)
 # ============================================================================
 
 _MXFP4_LORA_PATH_LOGGED = False
+_OGS_DEFAULT_CHUNK_BYTES = 2 << 30
+
+
+def _ogs_chunk_bytes():
+    try:
+        return max(1, int(os.environ.get("UNSLOTH_MXFP4_EXPERT_CHUNK_MB", "")) << 20)
+    except ValueError:
+        return _OGS_DEFAULT_CHUNK_BYTES
+
+
+def _ogs_dense_chunks(weight, precision_config, dtype):
+    """Yield (first, last, dense (E_c, K, N)) exact decodes of a matmul_ogs expert weight, a chunk
+    of experts at a time: MXFP4 scales group along K, so W^T cannot reuse the packed blocks."""
+    if isinstance(weight, torch.Tensor):
+        yield 0, weight.shape[0], weight.to(dtype)
+        return
+    from unsloth_zoo.mxfp4_dequant import mxfp4_dequantize
+
+    E, K, N = (int(x) for x in weight.shape)
+    data = weight.storage.layout.unswizzle_data(weight.storage.data)
+    scale = precision_config.weight_scale
+    scale = scale.storage.layout.unswizzle_data(scale.storage.data)
+    # Back to the checkpoint layout (E, N, K / 32, 16) / (E, N, K / 32) the exact decoder reads.
+    blocks, scales = data.transpose(-2, -1), scale.transpose(-2, -1)
+    if tuple(blocks.shape) != (E, N, K // 2) or tuple(scales.shape) != (E, N, K // 32):
+        raise RuntimeError(
+            f"Unsloth: unexpected MXFP4 layout {tuple(blocks.shape)} / {tuple(scales.shape)} for {(E, K, N)}"
+        )
+    step = max(1, min(E, _ogs_chunk_bytes() // (K * N * torch.empty((), dtype = dtype).element_size())))
+    for first in range(0, E, step):
+        last = min(E, first + step)
+        yield first, last, mxfp4_dequantize(
+            blocks[first:last].contiguous().view(last - first, N, K // 32, 16),
+            scales[first:last].contiguous(), dtype = dtype, transpose = True,
+        )
+
+
+def _ogs_expert_offsets(routing_data):
+    # One host sync per backward: row ranges of each expert in the expert-sorted order.
+    counts = routing_data.expt_hist.tolist()
+    offsets = [0]
+    for count in counts:
+        offsets.append(offsets[-1] + int(count))
+    return offsets
+
+
+def _matmul_ogs_for(weight):
+    """matmul_ogs from the triton_kernels copy that built `weight`: after vLLM's package-only alias, a dotted
+    `from triton_kernels.matmul_ogs import ...` loads a second copy whose Tensor classes reject this weight."""
+    import importlib
+    root = type(weight).__module__.rsplit(".tensor", 1)[0]
+    return importlib.import_module(root + ".matmul_ogs").matmul_ogs
+
+
+class _OgsGateUp(torch.autograd.Function):
+    """Expert-sorted rows ``x[src // k] @ W[e] + b[e]`` via matmul_ogs; frozen MXFP4 ``W``."""
+
+    @staticmethod
+    def forward(ctx, x, bias, module, routing_data, gather_idx):
+        matmul_ogs = _matmul_ogs_for(module.gate_up_proj)
+
+        out = matmul_ogs(
+            x.to(torch.bfloat16), module.gate_up_proj, bias, routing_data,
+            gather_indx = gather_idx, precision_config = module.gate_up_proj_precision_config,
+        )
+        ctx.module, ctx.routing_data, ctx.gather_idx = module, routing_data, gather_idx
+        ctx.x_shape, ctx.x_dtype = x.shape, x.dtype
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        module, routing_data = ctx.module, ctx.routing_data
+        k = routing_data.n_expts_act
+        rows = ctx.gather_idx.src_indx.long()
+        need_x, need_bias = ctx.needs_input_grad[0], ctx.needs_input_grad[1]
+        grad_out = grad_out.to(torch.bfloat16)
+        grad_rows = grad_out.new_empty((grad_out.shape[0], ctx.x_shape[-1])) if need_x else None
+        grad_bias = None
+        if need_bias:
+            grad_bias = torch.zeros_like(module.gate_up_proj_bias, dtype = torch.float32)
+        offsets = _ogs_expert_offsets(routing_data)
+        for first, last, dense in _ogs_dense_chunks(
+            module.gate_up_proj, module.gate_up_proj_precision_config, torch.bfloat16,
+        ):
+            for e in range(first, last):
+                lo, hi = offsets[e], offsets[e + 1]
+                if hi == lo:
+                    continue
+                if need_x:
+                    grad_rows[lo:hi] = grad_out[lo:hi] @ dense[e - first].t()
+                if need_bias:
+                    grad_bias[e] = grad_out[lo:hi].float().sum(0)
+            del dense
+        grad_x = None
+        if need_x:
+            grad_x = torch.zeros(ctx.x_shape, dtype = torch.float32, device = grad_out.device)
+            grad_x.index_add_(0, rows // k, grad_rows.float())
+            grad_x = grad_x.to(ctx.x_dtype)
+        if grad_bias is not None:
+            grad_bias = grad_bias.to(module.gate_up_proj_bias.dtype)
+        return grad_x, grad_bias, None, None, None
+
+
+class _OgsDown(torch.autograd.Function):
+    """``out[dst // k] += gamma * (h @ W[e] + b[e])`` via matmul_ogs; frozen MXFP4 ``W``."""
+
+    @staticmethod
+    def forward(ctx, h, gammas, bias, module, routing_data, scatter_idx):
+        matmul_ogs = _matmul_ogs_for(module.down_proj)
+
+        out = matmul_ogs(
+            h, module.down_proj, bias, routing_data, scatter_indx = scatter_idx,
+            precision_config = module.down_proj_precision_config,
+            gammas = None if gammas is None else gammas.detach(),
+        )
+        ctx.module, ctx.routing_data, ctx.scatter_idx = module, routing_data, scatter_idx
+        ctx.h_dtype, ctx.bias = h.dtype, bias
+        # h only feeds the routing-weight gradient.
+        ctx.save_for_backward(h if ctx.needs_input_grad[1] else None, gammas)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        h, gammas = ctx.saved_tensors
+        module, routing_data = ctx.module, ctx.routing_data
+        k = routing_data.n_expts_act
+        dst = ctx.scatter_idx.dst_indx.long()
+        valid = (dst >= 0).unsqueeze(-1)
+        grad_rows = grad_out.to(torch.bfloat16)[(dst // k).clamp_min(0)] * valid
+        scaled = grad_rows if gammas is None else grad_rows * gammas.to(grad_rows.dtype).unsqueeze(-1)
+        need_h, need_gamma, need_bias = ctx.needs_input_grad[0], ctx.needs_input_grad[1], ctx.needs_input_grad[2]
+        bias = ctx.bias
+        grad_h = scaled.new_empty((scaled.shape[0], int(module.down_proj.shape[1]))) if need_h else None
+        grad_gamma = torch.zeros(dst.shape[0], dtype = torch.float32, device = dst.device) if need_gamma else None
+        grad_bias = torch.zeros_like(bias, dtype = torch.float32) if need_bias else None
+        offsets = _ogs_expert_offsets(routing_data)
+        for first, last, dense in _ogs_dense_chunks(
+            module.down_proj, module.down_proj_precision_config, torch.bfloat16,
+        ):
+            for e in range(first, last):
+                lo, hi = offsets[e], offsets[e + 1]
+                if hi == lo:
+                    continue
+                weight = dense[e - first]
+                if need_h:
+                    grad_h[lo:hi] = scaled[lo:hi] @ weight.t()
+                if need_gamma:
+                    y = (h[lo:hi] @ weight).float()
+                    if bias is not None:
+                        y = y + bias[e].float()
+                    grad_gamma[lo:hi] = (grad_rows[lo:hi].float() * y).sum(-1)
+                if need_bias:
+                    grad_bias[e] = scaled[lo:hi].float().sum(0)
+            del dense
+        if grad_h is not None:
+            grad_h = grad_h.to(ctx.h_dtype)
+        if grad_gamma is not None:
+            grad_gamma = grad_gamma.to(gammas.dtype)
+        if grad_bias is not None:
+            grad_bias = grad_bias.to(bias.dtype)
+        return grad_h, grad_gamma, grad_bias, None, None, None
+
+
+class _OgsSwiglu(torch.autograd.Function):
+    """gpt-oss clamped SwiGLU on interleaved gate/up; saves only the bf16 pre-activation."""
+
+    @staticmethod
+    def forward(ctx, pre_activation, alpha, limit):
+        ctx.alpha, ctx.limit = alpha, limit
+        ctx.save_for_backward(pre_activation)
+        return swiglu_torch_forward(pre_activation, alpha, limit)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        (pre_activation,) = ctx.saved_tensors
+        alpha, limit = ctx.alpha, ctx.limit
+        gate, linear = pre_activation[..., ::2].float(), pre_activation[..., 1::2].float()
+        grad = grad_out.float()
+        if limit is not None:
+            gate_kept, linear_kept = gate <= limit, linear.abs() <= limit
+            gate, linear = gate.clamp(max = limit), linear.clamp(min = -limit, max = limit)
+        sigmoid = torch.sigmoid(alpha * gate)
+        grad_gate = grad * (sigmoid + alpha * gate * sigmoid * (1 - sigmoid)) * (linear + 1)
+        grad_linear = grad * gate * sigmoid
+        if limit is not None:
+            grad_gate, grad_linear = grad_gate * gate_kept, grad_linear * linear_kept
+        grad_pre = torch.empty_like(pre_activation)
+        grad_pre[..., ::2], grad_pre[..., 1::2] = grad_gate, grad_linear
+        return grad_pre, None, None
+
+
+def _ogs_lora_offsets(routing_data):
+    return torch.cumsum(routing_data.expt_hist, dim = 0, dtype = torch.int32)
+
+
+def mxfp4_ogs_experts_forward(self, hidden_states, routing_data, gather_idx, scatter_idx, gate_up_lora = None, down_lora = None):
+    """Differentiable native MXFP4 experts: matmul_ogs forward, exact chunked dequant in backward."""
+    k = routing_data.n_expts_act
+    alpha = getattr(self, "alpha", 1.702)
+    limit = getattr(self, "limit", 7.0)
+    # triton_kernels' routing() backpropagates through gate_scal into the router logits.
+    gammas = routing_data.gate_scal
+    pre_activation = _OgsGateUp.apply(hidden_states, self.gate_up_proj_bias, self, routing_data, gather_idx)
+    if gate_up_lora is not None:
+        first, second, scaling, _ = gate_up_lora
+        permuted = hidden_states[gather_idx.src_indx.long() // k].to(torch.bfloat16)
+        pre_activation = pre_activation + _apply_lora_grouped_mm(
+            permuted, first, second, _ogs_lora_offsets(routing_data), scaling,
+            grouped_mm_func = native_moe_grouped_mm,
+        ).to(pre_activation.dtype)
+    swiglu_output = _OgsSwiglu.apply(pre_activation, alpha, limit)
+    out = _OgsDown.apply(swiglu_output, gammas, self.down_proj_bias, self, routing_data, scatter_idx)
+    if down_lora is not None:
+        first, second, scaling, _ = down_lora
+        delta = _apply_lora_grouped_mm(
+            swiglu_output, first, second, _ogs_lora_offsets(routing_data), scaling,
+            grouped_mm_func = native_moe_grouped_mm,
+        )
+        dst = scatter_idx.dst_indx.long()
+        valid = dst >= 0
+        delta = (delta * gammas.unsqueeze(-1).to(delta.dtype))[valid]
+        out = out.index_add(0, dst[valid] // k, delta.to(out.dtype))
+    return out
+
 
 @torch.compiler.disable
 def forward_mxfp4_gpt_oss_with_lora(
@@ -2300,10 +2556,8 @@ def forward_mxfp4_gpt_oss_with_lora(
     gather_idx,
     scatter_idx,
 ) -> torch.Tensor:
-    """
-    MXFP4 GPT OSS MoE forward with LoRA: output = base_output (frozen MXFP4, no grad) + lora_delta.
-    Requires triton_kernels for native MXFP4 matmul; else load with Mxfp4Config(dequantize=True).
-    """
+    """Native MXFP4 GPT OSS experts (triton_kernels matmul_ogs) with optional expert LoRA; trains
+    through the frozen MXFP4 weights (exact dequant in backward)."""
     if not is_triton_kernels_available():
         raise RuntimeError(
             "triton_kernels is required for native MXFP4 GPT OSS forward pass. "
@@ -2313,156 +2567,29 @@ def forward_mxfp4_gpt_oss_with_lora(
             "  3. Use the BF16 model: 'unsloth/gpt-oss-20b-BF16'\n"
             "Set UNSLOTH_MXFP4_NO_DEQUANTIZE=0 (default) to auto-dequantize."
         )
-
-    from triton_kernels import matmul_ogs, swiglu
-
-    matmul_ogs_fn = matmul_ogs.matmul_ogs
-    FnSpecs = matmul_ogs.FnSpecs
-    FusedActivation = matmul_ogs.FusedActivation
-    swiglu_fn = swiglu.swiglu_fn
-
     gate_up_wrapper = _get_lora_wrapper_for_param(self, "gate_up_proj")
     down_wrapper = _get_lora_wrapper_for_param(self, "down_proj")
+    gate_up_lora = _get_moe_lora_weights(gate_up_wrapper) if gate_up_wrapper is not None else None
+    down_lora = _get_moe_lora_weights(down_wrapper) if down_wrapper is not None else None
 
-    has_lora = gate_up_wrapper is not None or down_wrapper is not None
-
-    # Log path info once
     global _MXFP4_LORA_PATH_LOGGED
     if not _MXFP4_LORA_PATH_LOGGED:
         _MXFP4_LORA_PATH_LOGGED = True
         logger.warning_once(
-            f"Unsloth: GPT-OSS MoE training path: MXFP4 + triton_kernels. "
-            f"LoRA={has_lora}, experts={self.num_experts}. "
-            f"Tip: Increase batch_size for better GPU utilization."
+            f"Unsloth: GPT-OSS MoE path: MXFP4 + triton_kernels. "
+            f"LoRA={gate_up_lora is not None or down_lora is not None}, experts={self.num_experts}."
         )
 
-    # If no LoRA, use the original MXFP4 forward (inference path)
-    if not has_lora:
-        with torch_cuda_device(hidden_states.device):
-            if not hasattr(self, "act"):
-                self.act = FusedActivation(
-                    FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")),
-                    (self.alpha, self.limit),
-                    2,
-                )
-            intermediate_cache1 = matmul_ogs_fn(
-                hidden_states.to(torch.bfloat16),
-                self.gate_up_proj,
-                self.gate_up_proj_bias,
-                routing_data,
-                gather_indx=gather_idx,
-                precision_config=self.gate_up_proj_precision_config,
-                gammas=None,
-                fused_activation=self.act,
-            )
-            intermediate_cache3 = matmul_ogs_fn(
-                intermediate_cache1,
-                self.down_proj,
-                self.down_proj_bias,
-                routing_data,
-                scatter_indx=scatter_idx,
-                precision_config=self.down_proj_precision_config,
-                gammas=routing_data.gate_scal if routing_data else None,
-            )
-        return intermediate_cache3
-
-    # With LoRA: base MXFP4 output (no grad) + LoRA delta (with grad)
     with torch_cuda_device(hidden_states.device):
-        # 1. MXFP4 base output, no gradients for base weights
-        with torch.no_grad():
-            if not hasattr(self, "act"):
-                self.act = FusedActivation(
-                    FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")),
-                    (self.alpha, self.limit),
-                    2,
-                )
-
-            pre_activation = matmul_ogs_fn(
-                hidden_states.to(torch.bfloat16),
-                self.gate_up_proj,
-                self.gate_up_proj_bias,
-                routing_data,
-                gather_indx=gather_idx,
-                precision_config=self.gate_up_proj_precision_config,
-                gammas=None,
-                fused_activation=None,  # Don't fuse activation so we can add LoRA before
-            )
-
-        # 2. Add LoRA for gate_up_proj using grouped_mm
-        if gate_up_wrapper is not None:
-            lora_data = _get_moe_lora_weights(gate_up_wrapper)
-            if lora_data is not None:
-                lora_A, lora_B, scaling, num_experts = lora_data
-
-                # routing_data.exp_indx (expert index per token) -> grouped_mm offsets
-                gather_src = gather_idx.src_indx
-                permuted_input = hidden_states[gather_src].to(torch.bfloat16)
-
-                # Offsets = cumsum of per-expert token counts
-                expert_ids = routing_data.exp_indx
-                from .moe_utils import count_tokens_per_expert
-                num_tokens_per_expert = count_tokens_per_expert(
-                    expert_ids, num_experts, torch.int32
-                )
-                offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
-
-                lora_delta = _apply_lora_grouped_mm(
-                    permuted_input,
-                    lora_A,
-                    lora_B,
-                    offsets,
-                    scaling,
-                    grouped_mm_func=native_moe_grouped_mm,
-                )
-                pre_activation = pre_activation + lora_delta
-
-        # 3. Apply SwiGLU activation
-        alpha = getattr(self, "alpha", 1.702)
-        limit = getattr(self, "limit", 7.0)
-        swiglu_output = swiglu_torch_forward(pre_activation, alpha, limit)
-
-        # 4. Down projection (MXFP4)
-        with torch.no_grad():
-            base_output = matmul_ogs_fn(
-                swiglu_output.detach(),  # Detach to prevent grad through MXFP4
-                self.down_proj,
-                self.down_proj_bias,
-                routing_data,
-                scatter_indx=scatter_idx,
-                precision_config=self.down_proj_precision_config,
-                gammas=routing_data.gate_scal if routing_data else None,
-            )
-
-        # 5. Add LoRA for down_proj using grouped_mm
-        if down_wrapper is not None:
-            lora_data = _get_moe_lora_weights(down_wrapper)
-            if lora_data is not None:
-                lora_A, lora_B, scaling, num_experts = lora_data
-
-                expert_ids = routing_data.exp_indx
-                from .moe_utils import count_tokens_per_expert
-                num_tokens_per_expert = count_tokens_per_expert(
-                    expert_ids, num_experts, torch.int32
-                )
-                offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
-
-                lora_delta = _apply_lora_grouped_mm(
-                    swiglu_output,
-                    lora_A,
-                    lora_B,
-                    offsets,
-                    scaling,
-                    grouped_mm_func=native_moe_grouped_mm,
-                )
-
-                # Scatter LoRA delta back to output (apply routing weights)
-                scatter_dst = scatter_idx.dst_indx
-                gamma = routing_data.gate_scal.unsqueeze(-1)
-                base_output.index_add_(
-                    0, scatter_dst, (lora_delta * gamma).to(base_output.dtype)
-                )
-
-    return base_output
+        if (
+            gate_up_lora is None and down_lora is None
+            and not (torch.is_grad_enabled() and hidden_states.requires_grad)
+        ):
+            return self._original_forward(hidden_states, routing_data, gather_idx, scatter_idx)
+        return mxfp4_ogs_experts_forward(
+            self, hidden_states, routing_data, gather_idx, scatter_idx,
+            gate_up_lora = gate_up_lora, down_lora = down_lora,
+        )
 
 
 def patch_mxfp4_gpt_oss_for_lora():
