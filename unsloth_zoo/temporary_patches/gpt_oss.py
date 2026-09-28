@@ -2047,7 +2047,8 @@ def _moe_forward_inference_mxfp4_kernel(
     x = hidden_states.reshape(-1, hidden_size)
     num_experts = routing_weights.shape[1]
     top_k = router_indices.shape[1]
-    flat = router_indices.reshape(-1)
+    # Each token's experts ascending, so the fixed-order sum below adds them in the dense path's expert order.
+    flat = router_indices.sort(dim = -1).values.reshape(-1)
     counts = (flat[:, None] == torch.arange(num_experts, device = flat.device)).sum(0, dtype = torch.int32)
     order = torch.argsort(flat, stable = True)
     token = order // top_k
@@ -2061,9 +2062,11 @@ def _moe_forward_inference_mxfp4_kernel(
     inter = ((up + 1) * glu).to(x.dtype)
     down = mxfp4_grouped_mm_op(inter, dn_blocks, dn_scales, counts, dn_trans) + down_proj_bias[expert]
     weighted = down * routing_weights[token, expert][:, None]
-    # Summed in fp32 and rounded once, as the dense path's sum over experts.
-    out = torch.zeros((x.shape[0], hidden_size), dtype = torch.float32, device = x.device)
-    out = out.index_add_(0, token, weighted.to(torch.float32))
+    # Back to (token, expert) order, then a fixed-order fp32 sum rounded once: index_add_'s atomics made greedy
+    # decode differ run to run.
+    rows = torch.empty(weighted.shape, dtype = torch.float32, device = x.device)
+    rows = rows.index_copy_(0, order, weighted.to(torch.float32))
+    out = rows.view(x.shape[0], top_k, hidden_size).sum(1)
     return out.to(weighted.dtype).view(batch_size, -1, hidden_size)
 
 
