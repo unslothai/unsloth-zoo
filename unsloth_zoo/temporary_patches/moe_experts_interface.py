@@ -240,7 +240,11 @@ def _unsloth_experts_dispatch(
         self.__dict__["_unsloth_own_apply_gate"] = True
         backend = _moe_utils_module().get_forward_moe_backend()
         stack = self._parameters.get("gate_up_proj")
-        if stack is not None and hidden_states.dtype != stack.dtype and torch.is_autocast_enabled():
+        device_type = hidden_states.device.type
+        if (
+            stack is not None and hidden_states.dtype != stack.dtype
+            and device_type != "meta" and torch.is_autocast_enabled(device_type)
+        ):
             # torch._grouped_mm rejects float32 activations that eager experts accept under autocast.
             out = backend(self, hidden_states.to(stack.dtype), top_k_index, top_k_weights)
             return out.to(hidden_states.dtype)
