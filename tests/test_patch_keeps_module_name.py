@@ -14,15 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Patches that exec `from X import (...)` into a module's globals must not import dunders.
-
-`patch_merge_quantization_configs` imported every name of transformers.quantizers.auto that
-appears in the rewritten source, and the source says `__class__.__name__`, so misc.py's own
-`__name__` became "transformers.quantizers.auto". Every function defined there afterwards
-carried that __module__, and torch.compile(fullgraph = True) through the SDPA wrapper died with
-
-    InternalTorchDynamoError: AttributeError: module 'transformers.quantizers.auto' has no attribute 'torch'
-"""
+"""exec'd `from X import (...)` patches must not import dunders such as `__name__`."""
 
 import os
 
