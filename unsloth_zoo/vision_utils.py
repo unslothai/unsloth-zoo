@@ -1450,7 +1450,7 @@ def _media_feature_token_ids(model):
     """Token ids a model forward matches one-to-one with media features."""
     config = getattr(model, "config", None)
     ids = set()
-    subs = (getattr(config, k, None) for k in ("text_config", "vision_config", "audio_config"))
+    subs = (getattr(config, k, None) for k in ("text_config", "vision_config", "audio_config", "thinker_config"))
     for cfg in (config, *subs):
         for key in ("image_token_id", "image_token_index", "video_token_id", "video_token_index",
                     "audio_token_id", "audio_token_index", "media_placeholder_token_id"):

@@ -300,3 +300,6 @@ def test_feature_token_ids_cover_every_config_spelling():
                                    audio_config = types.SimpleNamespace(audio_token_id = 200011))
     assert _media_feature_token_ids(types.SimpleNamespace(config = llava_onevision)) == [151646, 151647]
     assert _media_feature_token_ids(types.SimpleNamespace(config = phi4mm)) == [200010, 200011]
+    omni = types.SimpleNamespace(thinker_config = types.SimpleNamespace(
+        image_token_index = 151655, video_token_index = 151656, audio_token_index = 151646))
+    assert _media_feature_token_ids(types.SimpleNamespace(config = omni)) == [151646, 151655, 151656]
