@@ -1036,7 +1036,7 @@ def _dequant_peak(module: nn.Module | None, leaf: str, weight: torch.Tensor, siz
         return 2 * size
     bm, bn = -(-weight.shape[1] // p), -(-weight.shape[2] // q)
     try:
-        from .temporary_patches.moe_utils_fp8 import _triton_max_tensor_numel
+        from unsloth_zoo.temporary_patches.moe_utils_fp8 import _triton_max_tensor_numel
         cap = _triton_max_tensor_numel()
     except Exception:
         cap = 1 << 20
