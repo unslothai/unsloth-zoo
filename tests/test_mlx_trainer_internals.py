@@ -1269,6 +1269,40 @@ def test_decoupled_optimizers_use_hf_parity_manual_decay(optim_name):
         assert optimizer._kw["weight_decay"] == 0.0
 
 
+def test_adafactor_applies_hf_weight_decay():
+    """HF Adafactor decays p -= wd * lr * p via param groups, skipping bias and norms."""
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    class TinyModel:
+        def __init__(self):
+            self.params = {"proj": {"weight": mx.array([[10.0, 10.0]]),
+                                    "bias": mx.array([10.0])}}
+
+        def trainable_parameters(self):
+            return self.params
+
+        def update(self, updates):
+            self.params["proj"].update(updates["proj"])
+
+    lr, wd = 0.1, 0.05
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.model = TinyModel()
+    trainer.args = MLXTrainingConfig(
+        optim="adafactor", learning_rate=lr, weight_decay=wd,
+        lr_scheduler_type="constant", warmup_steps=0,
+    )
+    optimizer = trainer._build_optimizer(total_steps=4)
+    assert trainer._resolved_optimizer_name == "adafactor"
+
+    grad = {"proj": {"weight": mx.array([[1.0, 1.0]]), "bias": mx.array([1.0])}}
+    trainer._apply_manual_weight_decay(trainer.model, optimizer, grad)
+    flat = dict(tree_flatten(trainer.model.trainable_parameters()))
+    assert flat["proj.weight"].tolist()[0] == pytest.approx([10.0 * (1 - lr * wd)] * 2)
+    assert flat["proj.bias"].tolist() == pytest.approx([10.0])
+
+
 def test_sgd_weight_decay_is_coupled_not_decoupled():
     """SGD must use coupled decay (folded into the gradient before momentum)
     to match HF/PyTorch SGD, not the AdamW-style decoupled parameter shrink."""
@@ -1306,15 +1340,53 @@ def test_norm_clip_dtype_restore_keeps_lora_and_norms_promotable():
     assert not should_restore_original_dtype("vision.blocks.0.norm1.weight")
 
 
-def test_global_norm_clip_reduces_in_float32():
-    import inspect
+@pytest.mark.parametrize("mode", ["global", "leaf"])
+@pytest.mark.parametrize("size", [64, 4096])
+def test_norm_clip_preserves_fp16_scale(mode, size):
+    import mlx.core as mx
+    import numpy as np
+    from unsloth_zoo.mlx.trainer import _clip_grad_by_leaf_norm, _clip_grad_norm_fp32
 
-    from unsloth_zoo.mlx.trainer import _clip_grad_norm_fp32, _global_grad_norm_fp32
+    grad = mx.full((size,), 60000.0, dtype=mx.float16)
+    if mode == "global":
+        clipped, norm = _clip_grad_norm_fp32({"weight": grad}, max_norm=0.01)
+        assert float(norm) == pytest.approx(60000.0 * size ** 0.5)
+    else:
+        clipped = _clip_grad_by_leaf_norm({"weight": grad}, max_grad_leaf_norm=0.01)
+    actual = clipped["weight"]
+    assert actual.dtype == mx.float16
+    expected = np.full(size, 0.01 / size ** 0.5, dtype=np.float16).astype(np.float32)
+    np.testing.assert_allclose(np.array(actual.astype(mx.float32)), expected, rtol=1e-3, atol=0)
 
-    norm_source = inspect.getsource(_global_grad_norm_fp32)
-    assert "g.astype(mx.float32)" in norm_source
-    assert "tree_reduce" in norm_source
-    assert "scale.astype(g.dtype)" in inspect.getsource(_clip_grad_norm_fp32)
+
+def test_norm_clip_keeps_small_gradients():
+    import mlx.core as mx
+    import numpy as np
+    from unsloth_zoo.mlx.trainer import _clip_grad_by_leaf_norm, _clip_grad_norm_fp32
+
+    grad = {"weight": mx.array([0.0, 0.125, -0.25], dtype=mx.float16)}
+    global_clipped, _ = _clip_grad_norm_fp32(grad, max_norm=1.0)
+    leaf_clipped = _clip_grad_by_leaf_norm(grad, max_grad_leaf_norm=1.0)
+    for clipped in (global_clipped, leaf_clipped):
+        np.testing.assert_array_equal(np.array(clipped["weight"]), np.array(grad["weight"]))
+
+
+def test_global_norm_clip_reduces_across_every_leaf():
+    """Norms 5 and 12 give global norm 13: global mode scales both by 5/13, leaf mode only the 12."""
+    import mlx.core as mx
+    import numpy as np
+    from unsloth_zoo.mlx.trainer import _clip_grad_by_leaf_norm, _clip_grad_norm_fp32
+
+    grad = {"a": mx.array([3.0, 4.0]), "b": mx.array([0.0, 12.0])}
+
+    clipped, norm = _clip_grad_norm_fp32(grad, max_norm=5.0)
+    assert float(norm) == pytest.approx(13.0)
+    np.testing.assert_allclose(np.array(clipped["a"]), [15 / 13, 20 / 13], rtol=1e-5)
+    np.testing.assert_allclose(np.array(clipped["b"]), [0.0, 60 / 13], rtol=1e-5)
+
+    leaf_clipped = _clip_grad_by_leaf_norm(grad, max_grad_leaf_norm=5.0)
+    np.testing.assert_allclose(np.array(leaf_clipped["a"]), [3.0, 4.0], rtol=1e-5)
+    np.testing.assert_allclose(np.array(leaf_clipped["b"]), [0.0, 5.0], rtol=1e-5)
 
 
 @pytest.mark.parametrize(
@@ -1916,6 +1988,38 @@ def test_response_only_eval_batches_stay_a_finite_plan():
     batch = next(iter(eval_batches))
     assert batch[0][0, :4].tolist() == [110, 101, 120, 102]
     assert [label for label in batch[2][0].tolist() if label != -100] == [102]
+
+
+def test_response_only_fractional_epochs_match_transformers_step_budget():
+    # int(num_train_epochs) ran 0.5 and 1.5 epochs as one; HF: ceil(epochs * updates).
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainer, MLXTrainingConfig, _resolve_training_steps,
+        train_on_responses_only,
+    )
+
+    def run(num_train_epochs):
+        trainer = MLXTrainer(
+            _MinimalTextModel(), _StreamingTextTokenizer(),
+            [{"text": f"10 {i} 20 {i}"} for i in range(1, 6)],
+            args=MLXTrainingConfig(
+                max_steps=-1, num_train_epochs=num_train_epochs,
+                per_device_train_batch_size=2, gradient_accumulation_steps=2,
+                completion_only_loss=False, dataset_order="sequential",
+            ),
+        )
+        train_on_responses_only(trainer, instruction_part="10", response_part="20")
+        batches = trainer._batches
+        rows = sum(int(batch[1].shape[0]) for batch in batches)
+        steps = _resolve_training_steps(
+            trainer.args, batches, None,
+            includes_epochs=trainer._prepared_batches_include_epochs,
+        )
+        return rows, steps
+
+    # 5 rows at batch 2 is 3 micro-batches, so 2 updates, per pass.
+    assert run(0.5) == (4, 1)
+    assert run(1) == (5, 2)
+    assert run(1.5) == (9, 3)
 
 
 def test_length_declaring_text_stream_supports_epoch_replay():
@@ -3550,6 +3654,76 @@ def test_gemma3_training_compile_verified():
     import unsloth_zoo.mlx.compile as mc
 
     assert "gemma3" in mc._VERIFIED_TRAINING_ARCHES
+
+
+def test_gemma4_unified_training_compile_is_wired_end_to_end():
+    import unsloth_zoo.mlx.compile as mc
+
+    assert "gemma4_unified" in mc._VERIFIED_TRAINING_ARCHES
+    assert mc._TRAINING_VERIFIER_HINTS["gemma4_unified"] == "verify_gemma4_unified"
+
+    bundle = next(b for b in mc.list_compile_pattern_bundles()
+                  if b.name == "gemma4_unified_multimodal")
+    assert bundle.matcher("gemma4_unified", None)
+    assert not bundle.matcher("gemma4", None)
+    declared = {p.name for p in mc.list_compile_patch_primitives()}
+    assert set(bundle.primitive_names) <= declared
+    installers = mc._runtime_patch_primitive_installers()
+    assert "gemma4_unified_multimodal_runtime" in bundle.runtime_primitive_names
+    assert (installers["gemma4_unified_multimodal_runtime"]
+            is mc._install_gemma4_unified_compile_patches)
+
+
+@pytest.mark.parametrize("base_default", [True, False])
+def test_gemma4_unified_installer_patches_both_blockers(monkeypatch, base_default):
+    import unsloth_zoo.mlx.compile as mc
+
+    calls = []
+
+    class Model:
+        def __init__(self):
+            self._base_no_chunked_prefill = base_default
+            self.language_model = types.SimpleNamespace(
+                no_chunked_prefill=not base_default)
+            self.no_chunked_prefill = not base_default
+
+        def _update_chunked_prefill_mode(self, input_ids=None, **kwargs):
+            calls.append(input_ids)
+
+    module = types.SimpleNamespace(
+        Model=Model, _compact_prefix_rows=lambda features, valid_mask: None)
+    monkeypatch.setattr(mc, "_try_import_module", lambda name: module)
+    monkeypatch.setattr(mc, "_PATCHED_ARCHES", set())
+    monkeypatch.setattr(mc, "_PATCH_BINDINGS", set())
+    mc._install_gemma4_unified_compile_patches()
+
+    assert module._compact_prefix_rows is mc._static_shape_prefix_rows
+    assert "gemma4_unified" in mc._PATCHED_ARCHES
+
+    model = Model()
+    model.training = True
+    model._update_chunked_prefill_mode("while-training")
+    assert calls == [], "the bookkeeping must not run on the compiled training step"
+    assert model.no_chunked_prefill is base_default
+    assert model.language_model.no_chunked_prefill is base_default
+
+    model.training = False
+    model._update_chunked_prefill_mode("while-generating")
+    assert calls == ["while-generating"], "generation still needs the flag"
+
+
+def test_gemma4_unified_installer_survives_an_mlx_vlm_without_it(monkeypatch):
+    import unsloth_zoo.mlx.compile as mc
+
+    monkeypatch.setattr(mc, "_PATCHED_ARCHES", set())
+    monkeypatch.setattr(mc, "_try_import_module", lambda name: None)
+    mc._install_gemma4_unified_compile_patches()
+    assert "gemma4_unified" not in mc._PATCHED_ARCHES
+
+    module = types.SimpleNamespace(Model=type("Model", (), {}), _compact_prefix_rows=None)
+    monkeypatch.setattr(mc, "_try_import_module", lambda name: module)
+    mc._install_gemma4_unified_compile_patches()
+    assert "gemma4_unified" not in mc._PATCHED_ARCHES
 
 
 def test_compile_discovers_no_archs_under_shim():
@@ -8173,3 +8347,143 @@ def test_qwen3_prompt_rows_defer_to_the_native_deepstack_path():
     mask_only = {"inputs_embeds": mx.zeros((1, 4, 1)), "visual_pos_masks": masks}
     filled = mc._pad_qwen3_prompt_rows([mask_only, compact_row])[0]
     assert not filled[mc._QWEN3_VISUAL_STATE_KEY].any().item()
+
+
+def test_stream_width_policy_and_registry_contracts():
+    """Disarmed policy is byte-identical; registry separates every keyed axis."""
+    import numpy as np
+
+    from unsloth_zoo.mlx.shape_guard import StreamShapeGrid
+    from unsloth_zoo.mlx.trainer import (
+        _StreamSignatureRegistry, _StreamWidthPolicy, _stream_batch_signature,
+        _stream_guard_report,
+    )
+    from unsloth_zoo.mlx.utils import (
+        _stage_text_batch_from_items, _stage_tokenized_text_batch,
+    )
+
+    class _Tok:
+        pad_token_id = 0
+
+    policy = _StreamWidthPolicy(StreamShapeGrid(anchor=512))
+    rows = [([1] * 40, [2] * 40), ([1] * 55, [3] * 55)]
+    raw = [[1] * 40, [1] * 55]
+    plain = _stage_tokenized_text_batch(rows, 512, pad_id=0)
+    plain_raw = _stage_text_batch_from_items(raw, _Tok(), 512)
+    assert policy(55) is None
+    for staged, reference in (
+        (_stage_tokenized_text_batch(rows, 512, pad_id=0, width_policy=policy), plain),
+        (_stage_text_batch_from_items(raw, _Tok(), 512, width_policy=policy), plain_raw),
+    ):
+        assert np.array_equal(np.asarray(staged.ids), np.asarray(reference.ids))
+        assert np.array_equal(
+            np.asarray(staged.lengths_info), np.asarray(reference.lengths_info),
+        )
+        assert np.array_equal(
+            np.asarray(staged.labels), np.asarray(reference.labels),
+        )
+
+    policy.armed = True
+    guarded = _stage_tokenized_text_batch(
+        rows, 512, pad_id=0, width_policy=policy,
+    )
+    assert guarded.ids.shape == (2, 65)
+    assert np.array_equal(guarded.lengths_info, plain.lengths_info)
+
+    gated, counted = _StreamWidthPolicy(StreamShapeGrid(anchor=512)), _StreamSignatureRegistry(128)
+    gated.arm(counted)
+    assert (gated.armed, gated.exact_ceiling) == (True, 32)
+    assert gated.observed is counted.observed
+    gated.exact_ceiling = 2
+    rep = lambda: _stream_guard_report(gated, counted, "full_step")
+    for index in range(3):
+        assert gated(55) is None, index
+        counted.record(("k", index))
+    assert (rep().action, rep().gate_released, rep().exact_ceiling) == (
+        "stream_exact", False, 2)
+    assert gated(55) == 65 and gated.gate_released
+    gated.armed = False
+    assert gated(55) is None
+    assert rep().action == "stream_grid"
+
+    registry = _StreamSignatureRegistry(1)
+
+    def _key(width, rows=2, phase="single", execution=("gpu", "s0")):
+        batch = (np.zeros((rows, width), dtype=np.int32), None, None)
+        return _stream_batch_signature(batch, phase, execution)
+
+    registry.record(_key(33))
+    assert not registry.would_trip(_key(33))
+    assert all(registry.would_trip(other) for other in (
+        _key(65), _key(33, rows=4), _key(33, phase="tree_update"),
+        _key(33, execution=("gpu", "s1")),
+    ))
+
+
+def test_streaming_guard_admission_protocol_is_one_collective_per_fetch():
+    """One reduction per fetch; failure outranks a trip; idle microsteps participate."""
+    import numpy as np
+
+    from unsloth_zoo.mlx.shape_guard import FULL_STEP_SCOPE
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainer, _StreamSignatureRegistry, _stream_batch_signature,
+        _stream_execution_key,
+    )
+
+    trainer = object.__new__(MLXTrainer)
+    trainer._distributed_initialized = True
+    trainer._distributed_rank = 0
+    trainer.stop_requested = False
+    reductions = []
+    peer_signal = 0
+
+    def _fake_max_int(value):
+        reductions.append(value)
+        return max(value, peer_signal)
+
+    trainer._distributed_max_int = _fake_max_int
+    registry = _StreamSignatureRegistry(1)
+    batch = (np.zeros((2, 33), dtype=np.int32), None, None)
+
+    def _admit(world=2, data=batch):
+        return trainer._admit_stream_batch(
+            registry, data, FULL_STEP_SCOPE, 1, 0, world,
+        )
+
+    assert _admit() is False
+    assert reductions == [0] and len(registry.observed) == 1
+
+    wide = (np.zeros((2, 65), dtype=np.int32), None, None)
+    assert _admit(data=wide) is True
+    assert reductions[-1] == 1
+
+    peer_signal = 1
+    assert _admit() is True
+    peer_signal = 0
+
+    before = len(reductions)
+    assert _admit(data=None) is False
+    assert len(reductions) == before + 1 and reductions[-1] == 0
+
+    peer_signal = 2
+    with pytest.raises(RuntimeError, match="peer rank failed"):
+        _admit()
+    assert len(reductions) == 5
+
+    uncertifiable = {"input_ids": np.zeros((1, 33), dtype=np.int32), "m": object()}
+    for _ in range(3):
+        assert trainer._admit_stream_batch(
+            registry, uncertifiable, FULL_STEP_SCOPE, 1, 0, 1,
+        ) == "eager_batch"
+    assert registry.uncertified == 3 and registry.uncertified_family
+    assert len(registry.observed) == 1
+
+    solo = _StreamSignatureRegistry(1)
+    before = len(reductions)
+    assert trainer._admit_stream_batch(
+        solo, batch, FULL_STEP_SCOPE, 1, 0, 1,
+    ) is False
+    assert len(reductions) == before
+    assert _stream_batch_signature(
+        batch, "single", _stream_execution_key(),
+    ) in solo.observed

@@ -90,6 +90,7 @@ SKIP_QUANTIZATION_MODULES = [
     "router",                   # MoE Router
     "mlp.gate",                 # MoE Router
     "block_sparse_moe.gate",    # MoE Router
+    "moe.gate",                 # MoE Router (Step-3.7 reads its weight directly)
     'mamba',
     "audio_tower",              # Gemma3N audio encoder conformer
     "vision_tower",             # Gemma3 vision encoder (SigLIP)
@@ -100,6 +101,30 @@ SKIP_QUANTIZATION_MODULES = [
     "classifier",               # *ForTokenClassification, *ForImageClassification, BERT-family head
     "qa_outputs",               # *ForQuestionAnswering head
 ]
+
+_LINEAR_FORWARD_RETURNS_TENSOR_CACHE = {}
+
+def _linear_forward_returns_tensor(cls) -> bool:
+    """False for an nn.Linear subclass whose forward returns a tuple, which LoRA cannot add to."""
+    cached = _LINEAR_FORWARD_RETURNS_TENSOR_CACHE.get(cls)
+    if cached is not None:
+        return cached
+    result = True
+    forward = getattr(cls, "forward", None)
+    if forward is not None and forward is not torch.nn.Linear.forward:
+        try:
+            import ast, textwrap
+            tree = ast.parse(textwrap.dedent(inspect.getsource(forward)))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Return) and isinstance(node.value, ast.Tuple):
+                    result = False
+                    break
+        except Exception:
+            result = True
+    _LINEAR_FORWARD_RETURNS_TENSOR_CACHE[cls] = result
+    return result
+pass
+
 
 def get_peft_regex(
     model,
@@ -130,7 +155,10 @@ def get_peft_regex(
 
     from collections import Counter
     modules = model.named_modules()
-    linear_modules = [name for name, module in modules if isinstance(module, torch.nn.Linear)]
+    linear_modules = [
+        name for name, module in modules
+        if isinstance(module, torch.nn.Linear) and _linear_forward_returns_tensor(type(module))
+    ]
 
     # Gemma4 ClippableLinear wraps nn.Linear as .linear child -- detect and add those
     try:
@@ -526,6 +554,9 @@ def requires_grad_for_gradient_checkpointing(model):
                         break
                     elif re.search(r"for [^\s]{3,} in self\." + module_list, forward) is not None:
                         # Might have failed finding self.layers: like self.layers[...]:
+                        final_where = j
+                        break
+                    elif re.search(r"for [^\n:]+ in enumerate\(self\." + module_list + r"\b", forward) is not None:
                         final_where = j
                         break
                     pass

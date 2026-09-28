@@ -2652,3 +2652,93 @@ def test_training_refuses_batch_axis_vocabulary_mask():
     assert mx.isneginf(logits[..., 3]).all().item()
     assert mx.isneginf(logits[..., 7]).all().item()
     assert (logits[..., 2] == 0).all().item()
+
+
+def _ragged_compact_prefix_rows(features, valid_mask):
+    """mlx-vlm 0.7.1's `_compact_prefix_rows`, verbatim."""
+    rows = []
+    for batch_idx, row in enumerate(valid_mask.tolist()):
+        length = sum(bool(v) for v in row)
+        if length:
+            rows.append(features[batch_idx, :length])
+    if not rows:
+        return features.reshape(-1, features.shape[-1])[:0]
+    return mx.concatenate(rows, axis=0)
+
+
+def _padded_features(counts, width=8, dim=6):
+    mx.random.seed(0)
+    features = mx.random.normal((len(counts), width, dim))
+    valid = mx.stack([mx.arange(width) < n for n in counts])
+    return features, valid
+
+
+@metal_only
+@pytest.mark.parametrize("counts", [
+    (5,), (8,), (0,), (5, 3), (3, 5), (8, 4, 1), (1, 4, 8), (5, 0, 6), (0, 7), (7, 0), (0, 0), (8, 8),
+])
+def test_gemma4_unified_reorder_matches_the_ragged_prefix(counts):
+    from unsloth_zoo.mlx.compile import _static_shape_prefix_rows
+
+    features, valid = _padded_features(counts)
+    reference = _ragged_compact_prefix_rows(features, valid)
+    reordered = _static_shape_prefix_rows(features, valid)
+
+    n_valid = int(reference.shape[0])
+    assert n_valid == sum(counts)
+    assert reordered.shape == (features.shape[0] * features.shape[1], features.shape[-1])
+    if n_valid:
+        assert mx.array_equal(reference, reordered[:n_valid])
+
+
+@metal_only
+def test_gemma4_unified_reorder_carries_every_valid_row():
+    from unsloth_zoo.mlx.compile import _static_shape_prefix_rows
+
+    counts = (2, 7, 4)
+    features, valid = _padded_features(counts)
+    reordered = _static_shape_prefix_rows(features, valid)
+    expected = mx.concatenate(
+        [features[row, :n] for row, n in enumerate(counts)], axis=0)
+    for index in range(sum(counts)):
+        assert mx.array_equal(reordered[index], expected[index]), f"row {index}"
+
+
+@metal_only
+def test_gemma4_unified_reorder_moves_padding_past_the_prefix():
+    from unsloth_zoo.mlx.compile import _static_shape_prefix_rows
+
+    counts = (2, 7, 4)
+    features, valid = _padded_features(counts)
+    reordered = _static_shape_prefix_rows(features, valid)
+    expected = mx.concatenate(
+        [features[row, n:] for row, n in enumerate(counts)], axis=0)
+    assert mx.array_equal(reordered[sum(counts):], expected)
+
+
+@metal_only
+def test_gemma4_unified_reorder_scatters_the_same_embeddings():
+    from mlx_vlm.models.gemma4.gemma4 import masked_scatter
+    from unsloth_zoo.mlx.compile import _static_shape_prefix_rows
+
+    counts = (5, 3)
+    features, valid = _padded_features(counts)
+    total = sum(counts)
+    embeds = mx.zeros((1, total + 4, features.shape[-1]))
+    placeholder = mx.arange(total + 4) < total
+    mask = mx.broadcast_to(mx.expand_dims(mx.expand_dims(placeholder, 0), -1), embeds.shape)
+
+    reference = masked_scatter(embeds, mask, _ragged_compact_prefix_rows(features, valid))
+    reordered = masked_scatter(embeds, mask, _static_shape_prefix_rows(features, valid))
+    assert mx.array_equal(reference, reordered)
+
+
+@metal_only
+@pytest.mark.parametrize("counts", [(3, 5), (8, 0, 4), (0, 0), (8, 8)])
+def test_gemma4_unified_sort_key_never_ties(counts):
+    from unsloth_zoo.mlx.compile import _valid_first_sort_key
+
+    _, valid = _padded_features(counts)
+    rows = valid.shape[0] * valid.shape[1]
+    keys = sorted(_valid_first_sort_key(valid.reshape(rows), rows).tolist())
+    assert len(set(keys)) == rows, f"tied keys: {keys}"

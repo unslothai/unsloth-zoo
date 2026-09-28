@@ -144,6 +144,28 @@ def _new_host_buffer(numel, dtype):
         return _mark_host_buffer(torch.empty(numel, dtype = dtype, device = "cpu"))
 
 
+def _retype_gpu_buffer(device_index, use_b, dtype, numel):
+    """Replace one device's GPU reload buffer with one of `dtype`, so a checkpointed input comes back in its own dtype."""
+    global GPU_BUFFERS, GPU_BUFFERS_B
+    buffers = GPU_BUFFERS_B if use_b else GPU_BUFFERS
+    old = buffers[device_index]
+    if old.element_size() == torch.empty(0, dtype = dtype).element_size():
+        new = old.view(dtype)   # fp16 <-> bf16: reinterpret the same storage, no second buffer
+    else:
+        # Tensor.resize_(0) keeps the allocation; freeing the storage keeps the peak at one buffer.
+        size = max(numel, old.numel())
+        device = old.device
+        old.untyped_storage().resize_(0)
+        with _no_inference_mode():
+            new = torch.empty(size, dtype = dtype, device = device)
+    updated = list(buffers)
+    updated[device_index] = new
+    updated = type(buffers)(updated)
+    if use_b: GPU_BUFFERS_B = updated
+    else: GPU_BUFFERS = updated
+    return new
+
+
 def _grow_host_buffer(buffer, new_size):
     """resize_ on a pinned buffer issues a fresh, larger cudaHostAlloc, which can fail."""
     if new_size <= buffer.numel(): return _mark_host_buffer(buffer)
@@ -173,8 +195,9 @@ if Version(torch_version) < Version("2.4.0"):
     torch_amp_custom_fwd = torch.cuda.amp.custom_fwd
     torch_amp_custom_bwd = torch.cuda.amp.custom_bwd
 else:
-    torch_amp_custom_fwd = torch.amp.custom_fwd(device_type = "cuda")
-    torch_amp_custom_bwd = torch.amp.custom_bwd(device_type = "cuda")
+    _amp_device_type = "npu" if DEVICE_TYPE == "npu" else "cuda"
+    torch_amp_custom_fwd = torch.amp.custom_fwd(device_type = _amp_device_type)
+    torch_amp_custom_bwd = torch.amp.custom_bwd(device_type = _amp_device_type)
 pass
 
 
@@ -584,8 +607,7 @@ def patch_unsloth_gradient_checkpointing():
     _capture_pristine_checkpoint_once()
     torch.utils.checkpoint._old_checkpoint = torch.utils.checkpoint.checkpoint
     torch.utils.checkpoint.checkpoint = unsloth_offloaded_gradient_checkpoint
-    import transformers.modeling_utils
-    transformers.modeling_utils.checkpoint = unsloth_offloaded_gradient_checkpoint
+    _bind_transformers_checkpoint(unsloth_offloaded_gradient_checkpoint)
     os.environ["UNSLOTH_PATCHED"] = "1"
 pass
 
@@ -597,9 +619,34 @@ def patch_gradient_checkpointing():
     _capture_pristine_checkpoint_once()
     torch.utils.checkpoint._old_checkpoint = torch.utils.checkpoint.checkpoint
     torch.utils.checkpoint.checkpoint = unsloth_gradient_checkpoint
-    import transformers.modeling_utils
-    transformers.modeling_utils.checkpoint = unsloth_gradient_checkpoint
+    _bind_transformers_checkpoint(unsloth_gradient_checkpoint)
     os.environ["UNSLOTH_PATCHED"] = "1"
+pass
+
+
+def _bind_transformers_checkpoint(shim):
+    # Remember the binding transformers had immediately before, which need not be torch's
+    # function (a caller's own wrapper) and may be another Unsloth shim when patches stack.
+    # One slot, like torch.utils.checkpoint._old_checkpoint, so the two stay in step on unpatch.
+    import transformers.modeling_utils
+    current = getattr(transformers.modeling_utils, "checkpoint", None)
+    if current is not shim:
+        transformers.modeling_utils._unsloth_old_checkpoint = current
+    transformers.modeling_utils.checkpoint = shim
+pass
+
+
+def _restore_transformers_checkpoint(shim):
+    # The patch points transformers.modeling_utils.checkpoint at the shim as well, and that is
+    # the one gradient_checkpointing_enable() wraps. Left behind, a model set up for vanilla
+    # gradient checkpointing later in the process still runs the shim, including the offloaded
+    # one that allocates pinned host buffers.
+    import transformers.modeling_utils
+    if getattr(transformers.modeling_utils, "checkpoint", None) is not shim: return
+    previous = transformers.modeling_utils.__dict__.pop("_unsloth_old_checkpoint", None)
+    transformers.modeling_utils.checkpoint = (
+        previous if previous is not None else torch.utils.checkpoint.checkpoint
+    )
 pass
 
 
@@ -609,6 +656,7 @@ def unpatch_unsloth_gradient_checkpointing():
         torch.utils.checkpoint.checkpoint = torch.utils.checkpoint._old_checkpoint
         del torch.utils.checkpoint._old_checkpoint
     pass
+    _restore_transformers_checkpoint(unsloth_offloaded_gradient_checkpoint)
 pass
 
 
@@ -618,6 +666,7 @@ def unpatch_gradient_checkpointing():
         torch.utils.checkpoint.checkpoint = torch.utils.checkpoint._old_checkpoint
         del torch.utils.checkpoint._old_checkpoint
     pass
+    _restore_transformers_checkpoint(unsloth_gradient_checkpoint)
 pass
 
 
@@ -669,6 +718,8 @@ if DEVICE_TYPE in ("cuda", "hip"):
     torch_gpu_stream = torch.cuda.stream
 elif DEVICE_TYPE == "xpu":
     torch_gpu_stream = torch.xpu.stream
+elif DEVICE_TYPE == "npu":
+    torch_gpu_stream = torch.npu.stream
 
 CPU_BUFFERS = []
 CPU_INDEX = None
@@ -706,6 +757,8 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
             SUPPORTS_BFLOAT16 = torch.cuda.is_bf16_supported()
         elif DEVICE_TYPE == "xpu":
             SUPPORTS_BFLOAT16 = True
+        elif DEVICE_TYPE == "npu":
+            SUPPORTS_BFLOAT16 = torch.npu.is_bf16_supported()
         dtype = torch.bfloat16 if SUPPORTS_BFLOAT16 else torch.float16
     pass
 
@@ -722,7 +775,12 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
     pass
 
     # Allocate one buffer per GPU
-    n_gpus = torch.cuda.device_count() if DEVICE_TYPE in ("cuda", "hip") else torch.xpu.device_count()
+    if DEVICE_TYPE in ("cuda", "hip"):
+        n_gpus = torch.cuda.device_count()
+    elif DEVICE_TYPE == "npu":
+        n_gpus = torch.npu.device_count()
+    else:
+        n_gpus = torch.xpu.device_count()
     NEXT_BUFFER_SLOT = [0] * n_gpus
     try:
         with _no_inference_mode():
@@ -744,6 +802,8 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
                     event_ctor = torch.cuda.Event
                 elif DEVICE_TYPE == "xpu":
                     event_ctor = torch.xpu.Event
+                elif DEVICE_TYPE == "npu":
+                    event_ctor = torch.npu.Event
                 else:
                     raise RuntimeError(f"Double buffering unsupported on {DEVICE_TYPE}")
                 BUFFER_EVENTS_A = tuple([event_ctor() for _ in range(n_gpus)])
@@ -764,11 +824,19 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
         raise
 
     BACKWARD_PASS = True
-    EXTRA_STREAMS = tuple([torch.cuda.Stream() if DEVICE_TYPE_TORCH == "cuda" else torch.xpu.Stream() for i in range(n_gpus)])
+    # A bare Stream() lands on the current device, so create each card's side stream on that card
+    if DEVICE_TYPE == "npu":
+        EXTRA_STREAMS = tuple([torch.npu.Stream(device = i) for i in range(n_gpus)])
+    elif DEVICE_TYPE_TORCH == "cuda":
+        EXTRA_STREAMS = tuple([torch.cuda.Stream(device = torch.device(f"cuda:{i}")) for i in range(n_gpus)])
+    else:
+        EXTRA_STREAMS = tuple([torch.xpu.Stream(device = torch.device(f"xpu:{i}")) for i in range(n_gpus)])
     if DEVICE_TYPE in ("cuda", "hip"):
         MAIN_STREAMS  = tuple([torch.cuda.default_stream(torch.device(f"cuda:{i}")) for i in range(n_gpus)])
     elif DEVICE_TYPE == "xpu":
         MAIN_STREAMS  = tuple([torch.xpu.current_stream(torch.device(f"xpu:{i}")) for i in range(n_gpus)])
+    elif DEVICE_TYPE == "npu":
+        MAIN_STREAMS  = tuple([torch.npu.default_stream(i) for i in range(n_gpus)])
 
     # Minimum size to enable Unsloth GC is 2MB -> 32 layers = 64MB
     n_bytes = torch.finfo(dtype).bits // 8
@@ -872,6 +940,8 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                                         free_mem, _ = torch.cuda.mem_get_info(device_index)
                                     elif DEVICE_TYPE == "xpu":
                                         free_mem, _ = torch.xpu.mem_get_info(device_index)
+                                    elif DEVICE_TYPE == "npu":
+                                        free_mem, _ = torch.npu.mem_get_info(device_index)
                                     else:
                                         free_mem = 0
                                 except Exception as e:
@@ -893,6 +963,11 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         pass
 
                         x = CPU_BUFFERS[CPU_INDEX]
+                        if x.dtype != arg.dtype:
+                            # copy_ would convert silently, so the replay would see another dtype (forced-float32 fp16 layers, bf16 slots).
+                            with _no_inference_mode():
+                                x = _new_host_buffer(max(new_size, x.numel()), arg.dtype)
+                            CPU_BUFFERS[CPU_INDEX] = x
                         shape = arg.shape
                         if new_size > x.numel():
                             with _no_inference_mode():
@@ -1010,6 +1085,9 @@ class UnslothCheckpointFunction(torch.autograd.Function):
             host_buffer = CPU_BUFFERS[CPU_INDEX]
             host_is_pinned = getattr(host_buffer, HOST_PINNED_ATTR, False)
             x = host_buffer[:new_size].view(shape)
+            if buffer.dtype != x.dtype:
+                buffer = _retype_gpu_buffer(device_index, USE_DOUBLE_BUFFER and buffer_slot == 1, x.dtype, new_size)[:new_size].view(shape)
+                EXTRA_STREAM.wait_stream(MAIN_STREAM)
 
             # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
             if USE_DOUBLE_BUFFER:
@@ -1255,7 +1333,8 @@ def unpatch_unsloth_smart_gradient_checkpointing():
         BUFFER_EVENTS_A = None
         BUFFER_EVENTS_B = None
         NEXT_BUFFER_SLOT = None
-        torch.cuda.empty_cache()
+        if DEVICE_TYPE == "npu": torch.npu.empty_cache()
+        else: torch.cuda.empty_cache()
         gc.collect()
 
     if (torch.utils.checkpoint.checkpoint.__name__ == "unsloth_checkpoint") and \
@@ -1364,6 +1443,8 @@ def reset_unsloth_gradient_checkpointing_buffers():
                 event_ctor = torch.cuda.Event
             elif DEVICE_TYPE == "xpu":
                 event_ctor = torch.xpu.Event
+            elif DEVICE_TYPE == "npu":
+                event_ctor = torch.npu.Event
             else:
                 raise RuntimeError(f"Double buffering unsupported on {DEVICE_TYPE}")
             BUFFER_EVENTS_A = tuple([event_ctor() for _ in range(n_gpus)])
@@ -1372,7 +1453,8 @@ def reset_unsloth_gradient_checkpointing_buffers():
         except RuntimeError:
             pass
 
-    torch.cuda.empty_cache()
+    if DEVICE_TYPE == "npu": torch.npu.empty_cache()
+    else: torch.cuda.empty_cache()
     gc.collect()
 pass
 

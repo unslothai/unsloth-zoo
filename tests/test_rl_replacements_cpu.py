@@ -21,6 +21,8 @@ Covers:
   - `sanitize_logprob` (filter NaN logprob values from vLLM outputs)
   - `_warn_unsupported_grpo_options` (warn-once for ignored TRL GRPO options:
     top_entropy_quantile; use_bias_correction_kl is supported so it must not warn)
+  - the GRPO k3 KL clamp (log-ratio to [-20, 20], k3 to [-10, 10]) matches verl
+    `low_var_kl` / SkyRL `k3` in loss, mean_kl and gradient, before bias correction and beta
   - `grpo_compute_loss` with `use_bias_correction_kl=True` (KL x importance-sampling
     ratio, TRL GRPOConfig.use_bias_correction_kl) matches an inline TRL-mirror
     reference in loss, gradient and mean_kl for token and sequence IS levels
@@ -46,6 +48,75 @@ import torch
 
 from unsloth_zoo import rl_replacements as rr
 
+
+@pytest.mark.parametrize("difference", [-1e-3, -1e-4, 0.0, 1e-4, 1e-3])
+def test_grpo_small_kl_matches_second_order_limit(difference):
+    new = torch.full((1, 2), -1.0, requires_grad=True)
+    ref = new.detach() + difference
+    mask = torch.ones_like(new)
+    loss, _, mean_kl, *_ = rr.grpo_compute_loss(
+        ref, new, new.detach(), None, torch.zeros_like(new, dtype=torch.long),
+        mask, 1.0, torch.zeros(1),
+    )
+
+    # exp(delta) - delta - 1 = delta^2/2 + delta^3/6 + delta^4/24 + O(delta^5).
+    delta = ref.double() - new.detach().double()
+    expected = (delta.square() / 2 + delta.pow(3) / 6 + delta.pow(4) / 24).mean()
+    torch.testing.assert_close(loss.double(), expected, rtol=1e-3, atol=1e-12)
+    torch.testing.assert_close(mean_kl.double(), expected, rtol=1e-3, atol=1e-12)
+    loss.backward()
+    torch.testing.assert_close(new.grad.double(), -torch.expm1(delta) / new.numel(), rtol=1e-3, atol=1e-7)
+
+
+
+def _verl_low_var_kl(new, ref):
+    # verl core_algos.kl_penalty_forward "low_var_kl" / SkyRL ppo_utils.compute_approx_kl "k3".
+    kl = torch.clamp(ref - new, min=-20, max=20)
+    return torch.clamp(torch.exp(kl) - kl - 1, min=-10, max=10)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_grpo_kl_is_clamped_like_verl_low_var_kl(dtype):
+    d = torch.tensor([[0.0, 1.0, -1.0, 5.0, -5.0, 10.0, -10.0, 11.0, -11.0, 20.0, -20.0, 88.0, -88.0, 200.0, -200.0]],
+                     dtype=dtype)
+    new = torch.zeros_like(d, requires_grad=True)
+    ref = new.detach() + d
+    mask = torch.ones_like(d)
+    loss, _, mean_kl, *_ = rr.grpo_compute_loss(
+        ref, new, new.detach(), None, torch.zeros_like(d, dtype=torch.long),
+        mask, 1.0, torch.zeros(1, dtype=dtype),
+    )
+    loss.backward()
+
+    new_ref = torch.zeros_like(d, requires_grad=True)
+    expected = _verl_low_var_kl(new_ref, new_ref.detach() + d)
+    expected.mean().backward()
+    assert torch.isfinite(loss) and torch.isfinite(new.grad).all()
+    assert float(mean_kl) <= 10.0
+    torch.testing.assert_close(loss, expected.mean().detach())
+    torch.testing.assert_close(mean_kl, expected.mean().detach())
+    torch.testing.assert_close(new.grad, new_ref.grad)
+    saturated = expected.detach() >= 10.0
+    assert saturated.any() and (new.grad[saturated] == 0).all()
+
+
+@pytest.mark.parametrize("use_bias_correction_kl", [False, True])
+def test_grpo_kl_clamp_precedes_bias_correction_and_beta(use_bias_correction_kl):
+    beta = 0.04
+    new = torch.tensor([[-1.0, -2.0, -3.0]], dtype=torch.float64)
+    old = new - torch.tensor([[0.1, -0.2, 0.0]], dtype=torch.float64)
+    ref = new + torch.tensor([[15.0, -30.0, 0.5]], dtype=torch.float64)
+    mask = torch.ones_like(new)
+    loss, _, mean_kl, *_ = rr.grpo_compute_loss(
+        ref, new, old, None, torch.zeros_like(new, dtype=torch.long),
+        mask, beta, torch.zeros(1, dtype=torch.float64),
+        use_bias_correction_kl=use_bias_correction_kl,
+    )
+    kl = _verl_low_var_kl(new, ref)
+    if use_bias_correction_kl:
+        kl = kl * torch.exp(new - old)
+    torch.testing.assert_close(mean_kl, kl.mean())
+    torch.testing.assert_close(loss, beta * kl.mean())
 
 def test_calculate_pad_tokens_in_prompt_counts_left_pads():
     PAD = 0
@@ -475,6 +546,29 @@ def test_efficient_grpo_single_chunk_matches_naive(loss_type, disable_dynamo):
     ), f"{loss_type}: gradient mismatch"
 
 
+def _efficient_grpo_grad(upstream, upstream_scale=None):
+    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("grpo")
+    new = new.clone().requires_grad_(True)
+    out = rr.UnslothEfficientGRPO.apply(
+        new, old, ref, None, torch.randn(17, 8, dtype=torch.float64), input_ids, mask, advantages,
+        0.04, None, 1, kwargs, upstream_scale,
+    )
+    (out[0] * upstream).backward()
+    return new.grad
+
+
+def test_efficient_grpo_backward_ignores_grad_output_by_default(disable_dynamo):
+    """TRL <= 0.21 training_step divides the already GAS-normalized loss by GAS again."""
+    assert torch.equal(_efficient_grpo_grad(0.25), _efficient_grpo_grad(1.0))
+
+
+def test_efficient_grpo_backward_applies_deepspeed_loss_scale(disable_dynamo):
+    """DeepSpeed FP16 multiplies the loss by its scale S; dropping it leaves ZeRO unscaling g to g / S."""
+    base = _efficient_grpo_grad(1.0)
+    assert torch.allclose(_efficient_grpo_grad(128.0, 1.0), 128.0 * base, rtol=1e-12)
+    assert torch.allclose(_efficient_grpo_grad(128.0 / 4, 4.0), 128.0 * base, rtol=1e-12)
+
+
 @pytest.mark.parametrize("loss_type", ["dapo", "cispo", "vespo"])
 @pytest.mark.parametrize("items", [0.0, torch.tensor(0.0)], ids=["python", "tensor"])
 def test_grpo_generation_normalizer_survives_an_empty_batch(loss_type, items):
@@ -507,6 +601,36 @@ def test_grpo_generation_normalizer_unchanged_on_a_normal_batch(loss_type):
             **{**kwargs, "num_items_in_batch": 1.0},
         )[0],
     )
+
+
+@pytest.mark.parametrize("loss_type", ["dapo", "cispo"])
+@pytest.mark.parametrize("steps_per_generation, grad_accum", [(2, 2), (4, 2), (1, 2)])
+def test_grpo_generation_normalizer_covers_one_accumulation_window(
+    loss_type, steps_per_generation, grad_accum,
+):
+    """dapo/cispo window loss = token mean over that window (TRL #6024); 10 tokens per micro-batch."""
+    torch.manual_seed(0)
+    B, T = 3, 5
+    micro = []
+    for _ in range(max(steps_per_generation, grad_accum)):
+        mask = (torch.randperm(B * T) < 10).reshape(B, T).to(torch.float64)
+        micro.append((torch.randn(B, T, dtype = torch.float64), mask, torch.randn(B, dtype = torch.float64)))
+    window = micro[:grad_accum]
+    accumulated = 0.0
+    for i, (new, mask, advantages) in enumerate(window):
+        first = (i // steps_per_generation) * steps_per_generation
+        generation_batch = micro[first : first + steps_per_generation]
+        accumulated += rr.grpo_compute_loss(
+            None, new, None, None, torch.zeros(B, T, dtype = torch.long), mask, 0.0, advantages,
+            loss_type = loss_type, epsilon_high = 5.0, num_processes = 1,
+            num_items_in_batch = float(sum(m.sum() for _, m, _ in generation_batch)),
+            current_gradient_accumulation_steps = grad_accum,
+            steps_per_generation = steps_per_generation,
+        )[0]
+    # old is None and beta is 0, so coef_1 == 1: dapo's per-token loss is -A, cispo's -A * logp.
+    per_token = [-a[:, None] * (1 if loss_type == "dapo" else new) * m for new, m, a in window]
+    expected = sum(x.sum() for x in per_token) / sum(m.sum() for _, m, _ in window)
+    torch.testing.assert_close(accumulated, expected)
 
 
 # Per TRL _compute_loss (main @ f782735): kl_i *= the pre-clamp non-detached coef_1,
@@ -898,10 +1022,15 @@ def _eager_selective_log_softmax(hidden_states, lm_head, index, chunks,
     return out.reshape(index.shape)
 
 
+def _line_at(src, needle):
+    """Start of the line holding `needle`, so the slice dedents at any body indent."""
+    return src.rindex("\n", 0, src.index(needle)) + 1
+
+
 def _offloaded_block_source():
     import textwrap
     src = inspect.getsource(rr.grpo_accumulated_loss)
-    return textwrap.dedent(src[src.index("    def to_device"):src.index("    def efficient_log_softmax")])
+    return textwrap.dedent(src[_line_at(src, "def to_device"):_line_at(src, "def efficient_log_softmax")])
 
 
 def _exec_offloaded_block(inner_fn):
@@ -1372,3 +1501,52 @@ def test_luspo_ignores_fully_masked_columns(level, beta, disable_dynamo):
     assert torch.allclose(loss.double(), loss_padded.double(), atol=1e-12, rtol=0), (
         f"luspo {level} level, beta {beta}: padding moved the loss from {loss.item()} to {loss_padded.item()}"
     )
+
+
+class _FixedScaler:
+    def __init__(self, scale):
+        self.scale = scale
+
+    def get_scale(self):
+        return self.scale
+
+
+@pytest.mark.parametrize("scaler_scale, upstream", [(None, 1.0), (None, 128.0), (128.0, 128.0)])
+def test_efficient_grpo_backward_applies_upstream_gradient(scaler_scale, upstream, disable_dynamo):
+    new, old, ref, input_ids, mask, advantages, kwargs = _grpo_loss_fixture("grpo")
+    lm_head = torch.randn(17, 8, dtype=torch.float64)
+    new_ref = new.clone().requires_grad_(True)
+    rr.grpo_compute_loss(ref, new_ref, old, None, input_ids, mask, 0.04, advantages, **kwargs)[0].backward()
+
+    new_eff = new.clone().requires_grad_(True)
+    scaler = None if scaler_scale is None else _FixedScaler(scaler_scale)
+    out = rr.UnslothEfficientGRPO.apply(
+        new_eff, old, ref, None, lm_head, input_ids, mask, advantages, 0.04, scaler, 1, kwargs,
+        1.0 if scaler is None else None,
+    )
+    (out[0] * upstream).backward()
+    assert torch.allclose(new_eff.grad, new_ref.grad * upstream, atol=1e-8, rtol=1e-6)
+
+
+def test_warn_unsupported_grpo_options_fires_for_the_entropy_bonus(caplog):
+    trainer = _make_grpo_trainer(top_entropy_quantile=1.0, entropy_coef=0.5, use_adaptive_entropy=True)
+    with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
+        rr._warn_unsupported_grpo_options(trainer)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert len(msgs) == 1
+    assert "entropy_coef=0.5" in msgs[0] and "use_adaptive_entropy=True" in msgs[0]
+
+
+def test_warn_unsupported_grpo_options_silent_on_trl_entropy_defaults(caplog):
+    trl = pytest.importorskip("trl")
+    fields = {f.name: f.default for f in __import__("dataclasses").fields(trl.GRPOConfig)}
+    if "entropy_coef" not in fields:
+        pytest.skip("this TRL has no entropy bonus")
+    trainer = _make_grpo_trainer(
+        top_entropy_quantile=fields["top_entropy_quantile"],
+        entropy_coef=fields["entropy_coef"],
+        use_adaptive_entropy=fields.get("use_adaptive_entropy", False),
+    )
+    with caplog.at_level(logging.WARNING, logger="unsloth_zoo.log"):
+        rr._warn_unsupported_grpo_options(trainer)
+    assert caplog.records == []

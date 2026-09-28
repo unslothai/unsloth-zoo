@@ -99,9 +99,18 @@ def get_target_device(index = 0):
         return torch.device("cuda", index)
     return torch.device(DEVICE_TYPE, index)
 
+def _device_empty_cache():
+    if DEVICE_TYPE == "npu":
+        torch.npu.empty_cache()
+    else:
+        torch.cuda.empty_cache()
+pass
+
 def get_mem_info():
     if DEVICE_TYPE == "xpu":
         free_memory, total_memory = torch.xpu.mem_get_info()
+    elif DEVICE_TYPE == "npu":
+        free_memory, total_memory = torch.npu.mem_get_info()
     else:
         free_memory, total_memory = torch.cuda.mem_get_info()
     return free_memory, total_memory
@@ -660,7 +669,7 @@ def patch_vllm_enable_sleep_mode():
 
         logger.debug(f'CPU offloads {cpu_offloads} true offloads {true_offloads} total {total_offloads}')
         gc.collect()
-        torch.cuda.empty_cache()
+        _device_empty_cache()
     pass
 
     def wake_up(self, tags: Optional[List[str]] = None) -> None:
@@ -686,7 +695,7 @@ def patch_vllm_enable_sleep_mode():
     pass
 
     def delete_memory():
-        torch.cuda.empty_cache()
+        _device_empty_cache()
         gc.collect()
     pass
 
@@ -823,7 +832,7 @@ def patch_vllm_graph_capture():
             )
             for _ in range(2):
                 gc.collect()
-                torch.cuda.empty_cache()
+                _device_empty_cache()
             return result
         pass
         GPUModelRunner.capture_model = capture_model_wrapper_v1
@@ -852,12 +861,55 @@ def patch_vllm_graph_capture():
                 )
                 for _ in range(2):
                     gc.collect()
-                    torch.cuda.empty_cache()
+                    _device_empty_cache()
                 return result
             pass
             GPUModelRunnerBase.capture_model = capture_model_wrapper_v0
         except Exception as e:
             print(f"Unsloth: Could not patch vLLM V0 graph capture: {e}")
+pass
+
+
+def patch_vllm_processed_logprobs_fast_path():
+    # V1 drops FlashInfer engine-wide under processed_logprobs; V2 only on logprob steps, as here.
+    try:
+        from vllm.v1.sample.sampler import Sampler
+        from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
+    except Exception:
+        return
+    if hasattr(Sampler.forward, "_unsloth_processed_fast_path"): return
+    original_forward = Sampler.forward
+
+    @functools.wraps(original_forward)
+    def forward(self, logits, sampling_metadata, *args, **kwargs):
+        if (
+            str(getattr(self, "logprobs_mode", "")).startswith("processed_")
+            and kwargs.get("logprobs_mode_override") is None
+            and len(args) < 2
+            and getattr(sampling_metadata, "max_num_logprobs", 0) is None
+            and not getattr(sampling_metadata, "logprob_token_ids", None)
+        ):
+            fast = self.__dict__.get("_unsloth_raw_topk_topp_sampler")
+            if fast is None:
+                try:
+                    fast = TopKTopPSampler("raw_logprobs")
+                    if hasattr(self.topk_topp_sampler, "use_fp64_gumbel"):
+                        fast.use_fp64_gumbel = self.topk_topp_sampler.use_fp64_gumbel
+                except Exception:
+                    fast = False
+                self.__dict__["_unsloth_raw_topk_topp_sampler"] = fast
+            if fast is False:
+                return original_forward(self, logits, sampling_metadata, *args, **kwargs)
+            processed = self.topk_topp_sampler
+            self.topk_topp_sampler = fast
+            try:
+                return original_forward(self, logits, sampling_metadata, *args, **kwargs)
+            finally:
+                self.topk_topp_sampler = processed
+        return original_forward(self, logits, sampling_metadata, *args, **kwargs)
+
+    forward._unsloth_processed_fast_path = True
+    Sampler.forward = forward
 pass
 
 
@@ -892,6 +944,7 @@ def patch_vllm(debug = True):
         patch_vllm_enable_sleep_mode()
         patch_vllm_reset_caches_on_sleep()
     patch_vllm_graph_capture()
+    patch_vllm_processed_logprobs_fast_path()
     global LORA_REQUEST_ID
     LORA_REQUEST_ID = 1
 pass
@@ -1012,9 +1065,9 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
     state_dict = OrderedDict()
     quant_state_dict = OrderedDict()
 
-    # AMD ROCm (gfx9xx) and XPU: SM architecture (SM80/SM90) concepts don't apply.
+    # AMD ROCm (gfx9xx), XPU and NPU: SM architecture (SM80/SM90) concepts don't apply.
     # CUTLASS block FP8 and DeepGEMM are NVIDIA Hopper (SM90) only.
-    if not is_hip() and DEVICE_TYPE != "xpu":
+    if not is_hip() and DEVICE_TYPE not in ("xpu", "npu"):
         capability = torch.cuda.get_device_capability()
         sm_cap = capability[0] * 10 + capability[1]
     else:
@@ -1670,7 +1723,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     # Cleanup
     for _ in range(3):
         gc.collect()
-        torch.cuda.empty_cache()
+        _device_empty_cache()
 
     if len(skipped_layernorms) != 0:
         print(f"Unsloth: Just some info: will skip parsing {list(set(skipped_layernorms))}")
@@ -2296,8 +2349,8 @@ def _clear_flashinfer_env_on_hip():
     # Remove any forced FlashInfer selection unconditionally, even when the package
     # is not installed but the env var was inherited, so vLLM does not try to use
     # FlashInfer and falls back to the ROCm/default attention backend. Returns True
-    # on HIP so the caller skips the CUDA FlashInfer setup.
-    if not is_hip():
+    # on HIP or NPU so the caller skips the CUDA FlashInfer setup.
+    if not is_hip() and DEVICE_TYPE != "npu":
         return False
     _fi_forced = False
     for _fi_env in ("VLLM_USE_FLASHINFER_SAMPLER", "VLLM_ATTENTION_BACKEND"):
@@ -2305,7 +2358,8 @@ def _clear_flashinfer_env_on_hip():
             del os.environ[_fi_env]
             _fi_forced = True
     if _fi_forced or importlib.util.find_spec("flashinfer"):
-        logger.info("Unsloth: FlashInfer skipped on AMD ROCm (requires CUDA nvcc). Using vLLM built-in attention.")
+        _platform = "Ascend NPU" if DEVICE_TYPE == "npu" else "AMD ROCm"
+        logger.info(f"Unsloth: FlashInfer skipped on {_platform} (requires CUDA nvcc). Using vLLM built-in attention.")
     return True
 
 
@@ -2804,6 +2858,8 @@ def load_vllm(
         _dtype = torch.bfloat16
     elif DEVICE_TYPE == "xpu":
         _dtype = torch.bfloat16
+    elif DEVICE_TYPE == "npu" and torch.npu.is_bf16_supported():
+        _dtype = torch.bfloat16
     else:
         _dtype = torch.float16
     if dtype == torch.bfloat16 and _dtype == torch.float16:
@@ -3028,6 +3084,9 @@ def load_vllm(
             platform = "Intel GPU"
             gpu_eu_count = torch.xpu.get_device_properties(0).gpu_eu_count
             message = f"{platform} has eu:{gpu_eu_count}"
+        elif DEVICE_TYPE == "npu":
+            platform = "Ascend NPU"
+            message = f"{platform} {torch.npu.get_device_name(0)}"
         else:
             platform = "CUDA"
             major_version, minor_version = torch.cuda.get_device_capability()
@@ -3160,6 +3219,8 @@ def load_vllm(
             max_num_batched_tokens = max_num_batched_tokens,
             max_num_seqs           = approx_max_num_seqs, # vLLM default uses 256 -> reduce if OOM
             max_logprobs           = max_logprobs, # Disallow logprobs being returned
+            # Match TRL when reusing this engine for RL, including temperature scaling.
+            logprobs_mode          = "processed_logprobs" if training else "raw_logprobs",
             seed                   = random_state, # Default is 0
 
             # lora_extra_vocab_size = 0, # Breaks vLLM so we leave it as 256
@@ -3312,7 +3373,7 @@ def load_vllm(
                 # Cleanup
                 for _ in range(3):
                     gc.collect()
-                    torch.cuda.empty_cache()
+                    _device_empty_cache()
                 pass
                 error = str(error)
                 # `expandable_segments:True` + sleep/standby mode is a deterministic
@@ -3426,7 +3487,7 @@ def load_vllm(
     # Cleanup
     for _ in range(3):
         gc.collect()
-        torch.cuda.empty_cache()
+        _device_empty_cache()
     return llm
 pass
 
@@ -3571,7 +3632,8 @@ def load_lora_directly(model):
         if s is not None: vllm_lora_B *= s
     pass
     # Must block!
-    torch.cuda.synchronize()
+    if DEVICE_TYPE == "npu": torch.npu.synchronize()
+    else: torch.cuda.synchronize()
 pass
 
 
@@ -4112,7 +4174,7 @@ def delete_vllm(llm = None):
     with contextlib.suppress(AssertionError):
         torch.distributed.destroy_process_group()
     gc.collect()
-    torch.cuda.empty_cache()
+    _device_empty_cache()
     try:
         import ray
         ray.shutdown()
@@ -4459,7 +4521,7 @@ def _test_get_vllm_state_dict(
     # All Unsloth Zoo code licensed under LGPLv3
     # Check if model is allowed to be used in vLLM
     gc.collect()
-    torch.cuda.empty_cache()
+    _device_empty_cache()
 
     from transformers import AutoConfig
     config = AutoConfig.from_pretrained(
@@ -4664,7 +4726,7 @@ def _test_get_vllm_state_dict(
     print(f'Test passed!')
     for _ in range(3):
         gc.collect()
-        torch.cuda.empty_cache()
+        _device_empty_cache()
 pass
 
 
@@ -4692,7 +4754,7 @@ def test_get_vllm_state_dict():
 
     for i, (model_name, counts,) in enumerate(model_names):
         gc.collect()
-        torch.cuda.empty_cache()
+        _device_empty_cache()
         dtype = torch.float16 if i % 2 == 0 else bfloat16_dtype
         print(f"##### Testing {model_name} with dtype = {dtype} #####")
         if bfloat16_dtype == torch.float16:
@@ -4718,6 +4780,6 @@ def test_get_vllm_state_dict():
             error = str(error)
             raise RuntimeError(f"[{model_name}]\n{error}")
         gc.collect()
-        torch.cuda.empty_cache()
+        _device_empty_cache()
     pass
 pass
