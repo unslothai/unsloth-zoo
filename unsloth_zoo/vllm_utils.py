@@ -3061,8 +3061,12 @@ def load_vllm(
             # Each sequence carries an image (~thousands of tokens) in vLLM
             # profiling; cap seqs low for vision models.
             # TODO: vLLM V1 profiling may cap max seqs by budget; check.
-            print(f'Unsloth: Vision model detected, setting approx_max_num_seqs to 1')
-            approx_max_num_seqs = 1
+            if max_num_seqs not in (None, 256):
+                print(f'Unsloth: Vision model detected, honoring max_num_seqs = {max_num_seqs}')
+                approx_max_num_seqs = max_num_seqs
+            else:
+                print(f'Unsloth: Vision model detected, setting approx_max_num_seqs to 1')
+                approx_max_num_seqs = 1
             # One image is ~6404 tokens (Llama 3.2) / ~16Ki (qwen 2.5 VL); leave room for text.
             max_num_batched_tokens = max(8192, max_seq_length)
 

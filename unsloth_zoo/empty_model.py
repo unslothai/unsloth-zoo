@@ -379,6 +379,8 @@ def patch_gemma4_vllm_lora_support():
                 cls.embedding_modules = {}
             cls._unsloth_gemma4_class_patched = True
 
+    _patch_gemma4_vllm_expert_mapping()
+
     original_supports_lora = getattr(
         lora_model_runner_mixin, "supports_lora", vllm_model_interfaces.supports_lora
     )
@@ -406,6 +408,41 @@ def patch_gemma4_vllm_lora_support():
         vllm_lora_model_manager.create_lora_manager = patched_create_lora_manager
         vllm_lora_worker_manager.create_lora_manager = patched_create_lora_manager
 pass
+
+def _patch_gemma4_vllm_expert_mapping():
+    # Only vLLM 0.19-0.24 lacks it; on 0.25+ a top-level shim would shadow RoutedExperts.get_expert_mapping.
+    try:
+        from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
+    except Exception:
+        return
+    try:
+        from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts as experts_cls
+    except Exception:
+        try:
+            from vllm.model_executor.layers.fused_moe.layer import FusedMoE as experts_cls
+        except Exception:
+            return
+    if hasattr(experts_cls, "get_expert_mapping") or hasattr(Gemma4ForCausalLM, "get_expert_mapping"):
+        return
+    make_expert_params_mapping = getattr(experts_cls, "make_expert_params_mapping", None)
+    if make_expert_params_mapping is None:
+        return
+
+    def get_expert_mapping(self):
+        num_experts = getattr(self.config, "num_experts", None) or 0
+        if num_experts == 0:
+            return []
+        return make_expert_params_mapping(
+            self,
+            ckpt_gate_proj_name = "gate_proj",
+            ckpt_down_proj_name = "down_proj",
+            ckpt_up_proj_name = "up_proj",
+            num_experts = num_experts,
+            num_redundant_experts = getattr(self, "num_redundant_experts", 0),
+        )
+    Gemma4ForCausalLM.get_expert_mapping = get_expert_mapping
+pass
+
 
 # Prequantized BnB Gemma4 k_eq_v layers lack a synthetic v quant-state shard;
 # we duplicate K -> V at loader-side quant-state stacking time.
