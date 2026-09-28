@@ -1664,13 +1664,15 @@ class UnslothVisionDataCollator:
 
     def _load_column_images(self, images):
         # SSRF-guarded decode (Idefics2-style processors fetch URLs unguarded); unresized and EXIF-transposed like datasets' PIL.
+        # None entries (text-only rows of a mixed images column) carry no image.
         return [
             ImageOps.exif_transpose(_decode_image(img)) if isinstance(img, (str, bytes, bytearray, dict)) else img
-            for img in images
+            for img in images if img is not None
         ]
 
     def _extract_images_videos_for_example(self, example, messages):
-        if "images" in example:
+        # images=None means no column value: fall back to images embedded in the messages, as the PC path does.
+        if example.get("images") is not None:
             image = self._load_column_images(example["images"])
             video = []
             video_kwarg = None

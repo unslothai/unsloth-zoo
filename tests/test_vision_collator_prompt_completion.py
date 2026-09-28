@@ -220,3 +220,11 @@ def test_top_level_image_urls_use_guarded_fetch(monkeypatch):
     collator([{"images": ["https://example.com/a.png"], "prompt": "<img> a", "completion": "x"}])
     assert fetched == ["https://example.com/a.png"]
     assert isinstance(collator.processor.seen_images[0][0][0], Image.Image)
+
+
+def test_none_image_entries_are_dropped_in_pc_path():
+    collator = make_collator(None)
+    collator.processor = _ChatProcessor()
+    collator.assistant_single_content = False
+    collator([{"images": [None], "prompt": "a", "completion": "x"}])
+    assert collator.processor.seen_images[0] is None
