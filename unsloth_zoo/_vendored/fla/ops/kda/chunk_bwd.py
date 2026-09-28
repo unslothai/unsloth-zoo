@@ -20,7 +20,7 @@ from fla.ops.utils import chunk_local_cumsum, prepare_chunk_indices
 from fla.ops.utils.cache import fla_cache_autotune
 from fla.ops.utils.constant import RCP_LN2
 from fla.ops.utils.op import exp2
-from fla.utils import IS_NVIDIA_HOPPER, IS_NVIDIA_SM100, autotune_cache_kwargs, check_shared_mem
+from fla.utils import IS_NVIDIA_HOPPER, IS_NVIDIA_SM100, TRITON_ABOVE_3_4_0, autotune_cache_kwargs, check_shared_mem
 
 BK_LIST = [32, 64] if check_shared_mem() else [16, 32]
 BV_LIST = [64, 128] if check_shared_mem('ampere') else [16, 32]
@@ -120,7 +120,8 @@ def chunk_kda_bwd_kernel_dAv(
         if not (IS_NVIDIA_HOPPER and BK == 32 and num_warps == 4)
         # Unsloth: backported from fla PR #1109. On SM100 with Triton 3.3 the BK=32
         # configs with 4 or 8 warps hit an illegal memory access while autotuning.
-        if not (IS_NVIDIA_SM100 and BK == 32 and num_warps != 2)
+        # Narrowed by Unsloth to Triton < 3.4: B200 runs them cleanly on 3.4.0 to 3.7.1.
+        if not (IS_NVIDIA_SM100 and not TRITON_ABOVE_3_4_0 and BK == 32 and num_warps != 2)
     ],
     key=['BT', 'HV', 'STATE_V_FIRST'],
     **autotune_cache_kwargs,
