@@ -75,6 +75,9 @@ _CHILD = textwrap.dedent(
     out["gdr_file"] = gdr.__file__
     out["shared_file"] = shared.__file__
     out["pruned_file_spec"] = importlib.util.find_spec("fla.ops.common.intracard_cp") is not None
+    # fla's backend registry does this; a snapshot package must not be re-served from the install.
+    __import__("fla.ops.common", fromlist = [""])
+    out["empty_name_modules"] = sorted(n for n in sys.modules if n.startswith("fla") and n.endswith("."))
     try:
         import fla.ops.kda as kda
         out["kda_file"] = kda.__file__
@@ -116,6 +119,7 @@ def test_same_version_install_serves_ops_the_snapshot_lacks(tmp_path):
     assert "_vendored" in out["shared_file"]
     assert out["kda_shared_file"] == out["shared_file"]
     assert out["pruned_file_spec"] is False
+    assert out["empty_name_modules"] == [], out
     assert out["kda_file"] is not None and out["kda_file"].startswith(site), out
     if "glm5_next_chunk" in out:
         assert "fla.ops.kda.chunk_kda" in out["glm5_next_chunk"], out

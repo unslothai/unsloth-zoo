@@ -379,7 +379,11 @@ class _InstalledFlaFallbackFinder:
         fla_mod = sys.modules.get("fla")
         if fla_mod is None or getattr(fla_mod, _VENDORED_MARK, False) is not True:
             return None
-        base = os.path.join(self.root, *fullname.split(".")[1:])
+        parts = fullname.split(".")[1:]
+        # fla's backend registry imports with fromlist=[''], which probes "fla.ops.common.backends.".
+        if not all(part.isidentifier() for part in parts):
+            return None
+        base = os.path.join(self.root, *parts)
         init_path = os.path.join(base, "__init__.py")
         if not os.path.isfile(init_path):
             return None
