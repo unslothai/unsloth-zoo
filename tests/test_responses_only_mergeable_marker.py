@@ -14,15 +14,8 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""train_on_responses_only with a marker whose edge is plain text (CohereLabs/aya-vision).
-
-aya-vision's chat template renders <|START_RESPONSE|> / <|END_RESPONSE|>, which are not
-tokens in its vocab. A byte-level pre-tokenizer then glues the trailing "|>" to the first
-characters of the answer ("|>\\sigma" -> "|>\\", "sigma"), the response_part ids never
-appear, and the row trains on nothing (2 of 4 LaTeX_OCR rows on aya-vision-32b).
-
-CPU-only and offline: a tiny byte-level BPE is trained in memory.
-"""
+# aya-vision renders <|START_RESPONSE|> as plain text; byte-level BPE glues its "|>" onto the answer
+# ("|>\\sigma" -> "|>\\"), so the full marker never appears and the row trained on nothing.
 
 import pytest
 
@@ -76,7 +69,6 @@ def test_every_row_supervises_its_answer(answer):
     kept = [t for t, l in zip(ids, labels) if l != -100]
     text = tok.decode(kept)
     assert answer in text
-    # Nothing from the user turn leaks in.
     assert "Write the LaTeX" not in text and "<USER>" not in text
 
 
@@ -86,3 +78,11 @@ def test_special_token_markers_keep_their_core():
     ids = tok("<EOT><USER>", add_special_tokens = False).input_ids
     core, left, right = _find_common_token_ids("<EOT><USER>", tok, force_match = True)
     assert (core, left, right) == (ids, [], [])
+
+
+def test_plain_text_only_marker_keeps_its_core():
+    # No added token to anchor a shrunk core, so the unstable edge stays required.
+    from unsloth_zoo.dataset_utils import _find_common_token_ids
+    tok = _tokenizer()
+    ids = tok("<|START_RESPONSE|>", add_special_tokens = False).input_ids
+    assert _find_common_token_ids("<|START_RESPONSE|>", tok, force_match = True) == (ids, [], [])

@@ -192,13 +192,13 @@ def _find_common_token_ids(component, tokenizer, force_match = False):
         return [], [], []
     optional_left  = original[:where]
     optional_right = original[where+len(substring):]
-    # A marker whose edge is plain text, not an added token (aya-vision renders <|START_RESPONSE|>
-    # as 7 BPE pieces), can merge with the neighbouring message: ">" + "\\sigma" -> ">\\". Keep the
-    # mergeable edge pieces optional so the core still matches.
+    # Plain-text marker edges can BPE-merge with the next message (aya-vision-32b: ">" + "\\sigma" -> ">\\"),
+    # so make them optional, but only while an added token anchors the core: "Q:" -> "Q" hits user text.
     start, end = _stable_marker_edges(component, original, tokenizer)
-    if where < end and where + len(substring) > start and (start > where or end < where + len(substring)):
-        new_start, new_end = max(where, start), min(where + len(substring), end)
-        if new_end > new_start:
+    new_start, new_end = max(where, start), min(where + len(substring), end)
+    if new_end > new_start and (new_start, new_end) != (where, where + len(substring)):
+        added = getattr(tokenizer, "added_tokens_decoder", None) or {}
+        if any(str(added.get(i, "")).strip() for i in original[new_start:new_end]):
             substring      = original[new_start:new_end]
             optional_left  = original[:new_start]
             optional_right = original[new_end:]
