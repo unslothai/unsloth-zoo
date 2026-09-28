@@ -231,7 +231,6 @@ def test_none_image_entries_are_dropped_in_pc_path():
 
 
 def test_mixed_batch_keeps_one_image_slot_per_row_in_pc_path():
-    # Gemma 3/4, Idefics3 and LFM2-VL processors require len(images) == len(text).
     from PIL import Image
     collator = make_collator(None)
     collator.processor = _ChatProcessor()
