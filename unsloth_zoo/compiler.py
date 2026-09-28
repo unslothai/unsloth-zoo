@@ -1825,6 +1825,15 @@ def _verify_compiled_cache_file_collectively(
         raise error
 pass
 
+_HUB_KERNEL_WRAPPER_RE = re.compile(r"^[ \t]*@use_kernel_func_from_hub_with_fallback\b", flags = re.MULTILINE)
+
+
+def is_hub_kernel_wrapper(source):
+    # Emit bare: on torch 2.11 is_exporting() is True inside a compile trace, so the wrapper runs its torch reference (a None stub for Nemotron-H mamba2).
+    return bool(_HUB_KERNEL_WRAPPER_RE.search(source or ""))
+pass
+
+
 def create_new_function(
     name,
     new_source,
@@ -6610,6 +6619,11 @@ def unsloth_compile_transformers(
                     bad = True
                     bad_reason = "disabled keyword is in it"
                     break
+            pass
+            # DISABLE_COMPILE_FUNCTIONS names keep the stronger @torch.compiler.disable below.
+            if not bad and module not in disable_compile_functions and is_hub_kernel_wrapper(source):
+                bad = True
+                bad_reason = "it dispatches to an external kernel package"
             pass
             # Skipped for a DISABLE_COMPILE_FUNCTIONS name: `@torch.compiler.disable`
             # also stops Dynamo inlining it into a compiled caller, so downgrading it
