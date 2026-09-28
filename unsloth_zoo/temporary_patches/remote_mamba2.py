@@ -36,8 +36,10 @@ __all__ = [
 
 _MAMBA2_BAD_SUM = "states_permuted[:, :, None, ...]).sum(dim=2)"
 _MAMBA2_BAD_CLAMP = re.compile(r"torch\.clamp\(\s*dt\s*,\s*self\.time_step_min\s*\)")
+# An upper limit past the dtype max (the checkpoint's 1e30) clamps nothing and overflows fp16: drop it.
 _MAMBA2_GOOD_CLAMP = (
-    "(torch.clamp(dt, self.time_step_limit[0], self.time_step_limit[1]) "
+    "(torch.clamp(dt, min=self.time_step_limit[0], max=None if self.time_step_limit[1] >= "
+    "torch.finfo(dt.dtype).max else self.time_step_limit[1]) "
     "if getattr(self, 'time_step_limit', None) is not None else torch.clamp(dt, self.time_step_min))"
 )
 

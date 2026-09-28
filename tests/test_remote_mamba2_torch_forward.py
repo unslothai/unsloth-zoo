@@ -173,3 +173,18 @@ def test_hook_repairs_classes_reexecuted_into_the_same_module(monkeypatch):
         assert getattr(second.torch_forward, "_unsloth_mamba2_fixed", False)
     finally:
         sys.modules.pop(name, None)
+
+
+def test_repaired_fp16_with_unrepresentable_upper_limit(repaired):
+    # Nemotron-3-Nano-Omni's config sets time_step_limit = [0.0, 1e30]; 1e30 overflows fp16.
+    cls, _, changed = repaired
+    assert changed
+    torch.manual_seed(0)
+    mixer = cls().half()
+    mixer.time_step_limit = (0.0, 1e30)
+    x, B, C, dt = (t.half() for t in _inputs(mixer, 24))
+    with torch.no_grad():
+        y = mixer.torch_forward(x, B, C, dt)
+        ref = _sequential(mixer.double(), *(t.double() for t in (x, B, C, dt)), floor=False)
+    assert torch.isfinite(y).all()
+    assert torch.allclose(y.double(), ref, rtol=5e-2, atol=5e-2), float((y.double() - ref).abs().max())
