@@ -35,8 +35,7 @@ __all__ = [
 _UNRESOLVED = object()
 _MODULE = _UNRESOLVED
 _DEVICE_OK = {}
-# matmul_ogs rounds MXFP4 x bf16 in its own order: real gpt-oss-20b MoE blocks <= 6.1e-3 max rel err vs
-# fp32 exact decode (bf16 dense: <= 5.4e-3); this self-check's problem 2.7e-3. A wrong layout is O(1).
+# matmul_ogs rounds in its own order (like bf16 dense); a wrong layout is O(1).
 MATMUL_OGS_RTOL = 1e-2
 
 
@@ -65,11 +64,7 @@ def _import_top_level():
 
 
 def _import_vllm_vendored():
-    """vLLM's copy imports itself as `triton_kernels`: alias only while importing, then restore.
-
-    A lasting alias would flip patch_gpt_oss's `import triton_kernels` on the next load in this process
-    (native forward-only MXFP4 instead of the trainable path). vLLM sets its own alias when it needs one.
-    """
+    """vLLM's copy imports itself as `triton_kernels`: alias only while importing (a lasting alias flips patch_gpt_oss)."""
     try:
         if importlib.util.find_spec("vllm.third_party.triton_kernels") is None:
             return None
@@ -81,8 +76,7 @@ def _import_vllm_vendored():
     before = {name for name in sys.modules if name.startswith("triton_kernels.")}
     sys.modules["triton_kernels"] = vendored
     try:
-        # Every submodule now, under its own name: some calls import lazily (routing -> `.topk`), and
-        # those modules import `triton_kernels.*` absolutely, which fails once the alias is gone.
+        # Import every submodule now: lazy ones (routing -> `.topk`) import `triton_kernels.*` absolutely.
         for info in pkgutil.walk_packages(vendored.__path__, vendored.__name__ + "."):
             try:
                 importlib.import_module(info.name)
@@ -90,8 +84,7 @@ def _import_vllm_vendored():
                 pass  # optional extras (proton, testing); _probe decides what is required
         return _probe(vendored)
     finally:
-        # Absolute `triton_kernels.*` imports under the alias loaded second copies of those submodules;
-        # left behind, a later real top-level import would mix their classes with its own.
+        # Drop the second copies the alias loaded, or a later top-level import mixes their classes with its own.
         for name in [n for n in sys.modules if n.startswith("triton_kernels.") and n not in before]:
             sys.modules.pop(name, None)
         if previous is _UNRESOLVED:
@@ -165,7 +158,6 @@ def _self_check(device):
     routing = importlib.import_module(tk.__name__ + ".routing")
     for rows in (1, 8, 96):
         x = torch.randn(rows, K, device = device, generator = gen).to(torch.bfloat16)
-        # Every row routed to expert e by a one-hot router: the call the MoE forward makes.
         for e in range(E):
             logits = torch.full((rows, E), -1e4, device = device)
             logits[:, e] = 0

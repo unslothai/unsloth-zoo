@@ -2050,8 +2050,7 @@ def _ogs_kernels():
 
 
 def _ogs_track(param, blocks, scales):
-    """Tie the cached matmul_ogs view to `param`: dropped when the stack is rebound (copy_ swaps scales) or freed.
-    The cache holds the packed storage, so an untracked entry kept a deleted model's experts on the GPU."""
+    """Tie the cached matmul_ogs view (which holds the packed storage) to `param`: dropped on rebind or free."""
     key = (blocks.data_ptr(), scales.data_ptr(), tuple(blocks.shape))
     old = getattr(param, "_unsloth_ogs_key", None)
     if old == key:
@@ -2349,8 +2348,7 @@ def _ogs_chunk_bytes():
 
 
 def _ogs_dense_chunks(weight, precision_config, dtype):
-    """Yield (first, last, dense (E_c, K, N)) exact decodes of a matmul_ogs expert weight, a chunk
-    of experts at a time: MXFP4 scales group along K, so W^T cannot reuse the packed blocks."""
+    """Yield (first, last, dense (E_c, K, N)) exact decodes per expert chunk; scales group along K, so W^T needs a decode."""
     if isinstance(weight, torch.Tensor):
         yield 0, weight.shape[0], weight.to(dtype)
         return
@@ -2385,8 +2383,7 @@ def _ogs_expert_offsets(routing_data):
 
 
 def _matmul_ogs_for(weight):
-    """matmul_ogs from the triton_kernels copy that built `weight`: after vLLM's package-only alias, a dotted
-    `from triton_kernels.matmul_ogs import ...` loads a second copy whose Tensor classes reject this weight."""
+    """matmul_ogs from the triton_kernels copy that built `weight` (a second copy's Tensor classes reject it)."""
     import importlib
     root = type(weight).__module__.rsplit(".tensor", 1)[0]
     return importlib.import_module(root + ".matmul_ogs").matmul_ogs
@@ -2571,8 +2568,7 @@ def forward_mxfp4_gpt_oss_with_lora(
     gather_idx,
     scatter_idx,
 ) -> torch.Tensor:
-    """Native MXFP4 GPT OSS experts (triton_kernels matmul_ogs) with optional expert LoRA; trains
-    through the frozen MXFP4 weights (exact dequant in backward)."""
+    """Native MXFP4 GPT OSS experts (matmul_ogs) with optional expert LoRA; exact dequant in backward."""
     if not is_triton_kernels_available():
         raise RuntimeError(
             "triton_kernels is required for native MXFP4 GPT OSS forward pass. "

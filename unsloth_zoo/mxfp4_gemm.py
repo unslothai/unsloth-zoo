@@ -271,8 +271,7 @@ if _HAS_TRITON:
         E, R, G, stride_xm, stride_om,
         E_POW2: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, ASM: tl.constexpr,
     ):
-        # out[m] = x[m] @ P[e(m)]^T, one routed row per program on CUDA cores: at about one row per expert the
-        # tile kernel's MMA pipeline is latency bound (B200: 34 -> 17 us for gpt-oss gate_up at 4 rows).
+        # out[m] = x[m] @ P[e(m)]^T, one routed row per program: near one row per expert the MMA tiles are latency bound.
         m = tl.program_id(0)
         pid_n = tl.program_id(1)
         e_offs = tl.arange(0, E_POW2)
