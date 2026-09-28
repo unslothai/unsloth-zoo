@@ -573,7 +573,11 @@ def test_interface_route_static_answer_needs_the_unsloth_implementation(monkeypa
 def test_dense_expert_lora_route_is_traced_and_flags_only_own_gates(monkeypatch, custom_gate):
     mei, m = _interface_experts("unsloth")
     calls = []
-    backend = lambda module, h, idx, w: calls.append(module) or h
+
+    def backend(module, h, idx, w):
+        calls.append(module)
+        return h
+
     monkeypatch.setattr(mei, "_has_custom_gate", lambda module: custom_gate)
     monkeypatch.setattr(mei, "_moe_utils_module", lambda: types.SimpleNamespace(_CACHED_FORWARD_MOE_BACKEND = backend))
     monkeypatch.setattr(mei, "_unsloth_experts_dispatch", lambda *a: pytest.fail("dense expert LoRA reached the disabled dispatch"))
