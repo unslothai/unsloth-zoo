@@ -268,7 +268,12 @@ def post_patch_loss_function(model):
 pass
 
 
-current_device = torch.xpu.device if DEVICE_TYPE == "xpu" else torch.cuda.device
+if DEVICE_TYPE == "xpu":
+    current_device = torch.xpu.device
+elif DEVICE_TYPE == "npu":
+    current_device = torch.npu.device
+else:
+    current_device = torch.cuda.device
 def fused_linear_cross_entropy(
     hidden_states      : torch.Tensor,
     lm_weight          : torch.Tensor,

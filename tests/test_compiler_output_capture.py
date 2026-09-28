@@ -1,4 +1,4 @@
-# Tests for the transformers v5 output capture helpers in unsloth_zoo.compiler.
+# Tests for the output capture helpers in unsloth_zoo.compiler.
 
 import types
 
@@ -9,11 +9,14 @@ from unsloth_zoo.compiler import (
     patch_output_capture_targets,
 )
 
-output_capturing = pytest.importorskip(
-    "transformers.utils.output_capturing",
-    reason="output capture targets exist on transformers >= 5.2 only",
-)
-OutputRecorder = output_capturing.OutputRecorder
+try:
+    from transformers.utils.output_capturing import OutputRecorder
+except ImportError:
+    OutputRecorder = getattr(
+        pytest.importorskip("transformers.utils.generic"), "OutputRecorder", None
+    )
+    if OutputRecorder is None:
+        pytest.skip("this transformers has no OutputRecorder", allow_module_level = True)
 
 
 class FakeRouter:

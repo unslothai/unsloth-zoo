@@ -14,6 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+import inspect
+import os
 from typing import Optional
 
 import types
@@ -68,6 +70,10 @@ def _check_torch_scaled_grouped_mm_supported():
     # FP8 scaled_grouped_mm path to Hopper (SM 9.x) only for now.
     major, _minor = torch.cuda.get_device_capability(torch.cuda.current_device())
     if major != 9:
+        _TORCH_SCALED_GROUPED_MM_SUPPORTED = False
+        return False
+    # Opt-in until validated end to end on Hopper (the probe never passed before the rhs layout fix).
+    if os.environ.get("UNSLOTH_FP8_SCALED_GROUPED_MM", "0") != "1":
         _TORCH_SCALED_GROUPED_MM_SUPPORTED = False
         return False
 
@@ -494,7 +500,8 @@ def _dequantize_full_expert_weights(weight: torch.Tensor, quant_state, target_dt
 
 
 def _make_grouped_mm_rhs_column_major(weight: torch.Tensor) -> torch.Tensor:
-    return weight.mT.contiguous()
+    # Same (E, K, N) shape, column-major strides, as _scaled_grouped_mm requires of mat_b.
+    return weight.mT.contiguous().mT
 
 
 def _try_attach_block_size(tensor, block_size):
@@ -578,10 +585,8 @@ def _extract_scaled_grouped_mm_weight_scale(original_weight, processed_weight, q
     if scale.shape[0] != processed_weight.shape[0] or scale.shape[1] != processed_weight.shape[-1]:
         return None
 
-    scale = scale.to(torch.float32)
-    if quant_kind == "weight_scale_inv":
-        scale = scale.reciprocal()
-    return scale.contiguous()
+    # `weight_scale_inv` is already the dequant multiplier (w = q * s), like `weight_scale`.
+    return scale.to(torch.float32).contiguous()
 
 
 def _prepare_scaled_grouped_mm_weight(experts_module, param_name: str, proj_type: str, hidden_dim: int, model_type=None):
@@ -639,6 +644,9 @@ def _expand_grouped_bias(bias, num_tokens_per_expert):
 def _forward_scaled_grouped_mm_fp8(self, hidden_states, top_k_index, top_k_weights):
     if not _check_torch_scaled_grouped_mm_supported():
         return None
+    # No backward for _scaled_grouped_mm; training (incl. reentrant GC's no_grad forward) must match the dequant recompute.
+    if torch.is_grad_enabled() or self.training:
+        return None
     if not hasattr(self, "gate_up_proj") or not hasattr(self, "down_proj"):
         return None
 
@@ -693,7 +701,9 @@ def _forward_scaled_grouped_mm_fp8(self, hidden_states, top_k_index, top_k_weigh
         bias_expanded = _expand_grouped_bias(self.gate_up_proj_bias, num_tokens_per_expert)
         mm1_out = mm1_out + bias_expanded.to(mm1_out.dtype)
 
-    if "GptOssExperts" in self.__class__.__name__:
+    if getattr(self, "_unsloth_own_apply_gate", False):
+        inter = self._apply_gate(mm1_out)
+    elif "GptOssExperts" in self.__class__.__name__:
         gate = mm1_out[..., ::2]
         up = mm1_out[..., 1::2]
         limit = getattr(self, "limit", 7.0)
@@ -860,7 +870,9 @@ def _forward_native_fp8_expert_loop(self, hidden_states, top_k_index, top_k_weig
         else:
             gate_up_out = F.linear(current_state, expert_gate_up, gate_up_bias_expert)
 
-        if "GptOssExperts" in self.__class__.__name__:
+        if getattr(self, "_unsloth_own_apply_gate", False):
+            current_hidden_states = self._apply_gate(gate_up_out)
+        elif "GptOssExperts" in self.__class__.__name__:
             gate = gate_up_out[..., ::2]
             up = gate_up_out[..., 1::2]
             limit = getattr(self, "limit", 7.0)
@@ -898,6 +910,13 @@ def _forward_native_fp8_expert_loop(self, hidden_states, top_k_index, top_k_weig
     return final_hidden_states.view(original_shape)
 
 
+def _fp8_experts_own_gate(module) -> bool:
+    if not getattr(module, "has_gate", True) or "GptOss" in type(module).__name__:
+        return False
+    apply_gate = getattr(type(module), "_apply_gate", None)
+    return apply_gate is not None and getattr(apply_gate, "__name__", "") != "_default_apply_gate"
+
+
 @torch.compiler.disable
 def _refuse_fp4_with_an_unapplied_gate(module, gate_up_weight):
     """A custom `_apply_gate` (DeepSeek-V4 clamped SwiGLU) would silently become plain act_fn(gate) * up."""
@@ -923,7 +942,12 @@ def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
         forward_triton_grouped_gemm,
         forward_native_moe_loop,
         swap_moe_weights_for_call,
+        _gate_up_is_interleaved,
     )
+
+    # Every backend must call the class's own _apply_gate (clamped / custom SwiGLU), not plain SiLU.
+    if not getattr(self, "_unsloth_own_apply_gate", False) and _fp8_experts_own_gate(self):
+        self._unsloth_own_apply_gate = True
 
     backend = select_moe_backend()
 
@@ -954,7 +978,7 @@ def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
         if backend == "grouped_mm":
             _log_moe_fp8_backend_once(self, "Unsloth: MoE FP8 is using dequantize-plus-grouped_mm.")
             forward_fn = forward_native_grouped_mm
-        elif backend == "unsloth_triton":
+        elif backend == "unsloth_triton" and not _gate_up_is_interleaved(self):
             _log_moe_fp8_backend_once(self, "Unsloth: MoE FP8 is using dequantize-plus-Triton grouped GEMM.")
             forward_fn = forward_triton_grouped_gemm
         else:
@@ -1171,7 +1195,30 @@ from .common import (
 from .utils import logger
 
 
-_UNSLOTH_FP8_EXPERTS_KEYS = ("grouped_mm", "batched_mm", "deepgemm")
+def _experts_are_fp4(module) -> bool:
+    if getattr(getattr(module, "config", None), "expert_dtype", "fp8") != "fp4":
+        return False
+    return globals().get("_dequantize_full_expert_weights_fp4") is None
+
+
+def _experts_are_expert_parallel(module) -> bool:
+    state = getattr(module, "__dict__", None)
+    config = state.get("config") if state is not None else None
+    cached = state.get("_unsloth_expert_parallel") if state is not None else None
+    if cached is not None and cached[0] is config:
+        return cached[1]
+    try:
+        from .moe_experts_interface import _expert_parallel_requested
+        answer = bool(_expert_parallel_requested(module))
+    except Exception:
+        answer = False
+    if state is not None:
+        state["_unsloth_expert_parallel"] = (config, answer)
+    return answer
+
+
+# FP8Experts keeps the config's key, so the default "unsloth" must resolve here too.
+_UNSLOTH_FP8_EXPERTS_KEYS = ("grouped_mm", "batched_mm", "deepgemm", "unsloth")
 
 
 def patch_fp8_experts_interface():
@@ -1184,12 +1231,29 @@ def patch_fp8_experts_interface():
     if getattr(ALL_FP8_EXPERTS_FUNCTIONS, sentinel, False):
         return
 
-    def _unsloth_fp8_dispatch(self, hidden_states, top_k_index, top_k_weights, *args, **kwargs):
-        return forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights)
+    def _dispatch_for(original):
+        def _unsloth_fp8_dispatch(self, hidden_states, top_k_index, top_k_weights, *args, **kwargs):
+            # FP4-packed, ungated (up_proj only) and expert-parallel experts keep transformers' own path.
+            if (
+                _experts_are_fp4(self)
+                or getattr(self, "has_gate", True) is False
+                or _experts_are_expert_parallel(self)
+            ):
+                if original is not None:
+                    return original(self, hidden_states, top_k_index, top_k_weights, *args, **kwargs)
+                # replace_with_fp8_linear re-decorates FP8Experts per layer: unwrap to the eager forward.
+                eager = inspect.unwrap(type(self).forward)
+                return eager(self, hidden_states, top_k_index, top_k_weights)
+            return forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights)
+        return _unsloth_fp8_dispatch
 
     for key in _UNSLOTH_FP8_EXPERTS_KEYS:
         try:
-            ALL_FP8_EXPERTS_FUNCTIONS[key] = _unsloth_fp8_dispatch
+            original = ALL_FP8_EXPERTS_FUNCTIONS[key] if key in ALL_FP8_EXPERTS_FUNCTIONS else None
+        except Exception:
+            original = None
+        try:
+            ALL_FP8_EXPERTS_FUNCTIONS[key] = _dispatch_for(original)
         except Exception:
             pass
 

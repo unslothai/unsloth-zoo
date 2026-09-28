@@ -171,7 +171,7 @@ def test_pruned_and_kept_files():
 def test_all_vendored_python_compiles():
     import py_compile
     py_files = sorted(VENDORED.rglob("*.py"))
-    assert len(py_files) == 42, f"expected 42 vendored .py files, got {len(py_files)}"
+    assert len(py_files) == 47, f"expected 47 vendored .py files, got {len(py_files)}"
     for p in py_files:
         py_compile.compile(str(p), doraise=True)
 
@@ -504,14 +504,24 @@ _OLMO_SUBPROCESS = textwrap.dedent(
     import sys
     assert getattr(sys.modules["fla"], "_UNSLOTH_VENDORED_FLA", False) is True
 
+    from transformers.integrations import hub_kernels
+    from unsloth_zoo.temporary_patches.fla_vendor import _resolved_implementation
+    vendored_chunk = sys.modules["fla.ops.gated_delta_rule"].chunk_gated_delta_rule
+    # transformers#47630 (5.15+) drops the module globals for kernel-hub wrappers.
+    kernel_hub = hasattr(hub_kernels, "use_kernel_func_from_hub_with_fallback")
+
     # Covered model binds the vendored kernels.
     import transformers.models.qwen3_5.modeling_qwen3_5 as q
-    assert q.chunk_gated_delta_rule is not None
+    if kernel_hub:
+        assert _resolved_implementation(q.torch_chunk_gated_delta_rule) is vendored_chunk
+    else:
+        assert q.chunk_gated_delta_rule is vendored_chunk
 
-    # Uncovered model must import cleanly on its pure-torch fallback.
+    # Uncovered model must import cleanly without the unvendored ShortConvolution.
     import transformers.models.olmo_hybrid.modeling_olmo_hybrid as m
-    assert m.ShortConvolution is None
-    assert m.chunk_gated_delta_rule is None
+    assert getattr(m, "ShortConvolution", None) is None
+    if not kernel_hub:
+        assert m.chunk_gated_delta_rule is None
     print("OLMO_FALLBACK_OK")
     """
 )
@@ -1384,3 +1394,39 @@ def test_rdna1_later_kernel_hub_decorations_never_resolve_fla(monkeypatch):
     bound = decorate("chunk_gated_delta_rule", "fla")(torch_path)
     assert bound is torch_path and bound(1) == 2
     assert hub_kernels.use_kernel_func_from_hub_with_fallback.__wrapped__ is original
+
+
+def test_fp32_l2norm_keeps_float64_precision():
+    torch = pytest.importorskip("torch")
+    from unsloth_zoo.temporary_patches.fla_vendor import _fp32_l2norm
+
+    x = torch.randn(4, 8, dtype = torch.float64) * 1e-3
+    ref = x * torch.rsqrt((x * x).sum(-1, keepdim = True) + 1e-6)
+    out = _fp32_l2norm(x)
+    assert out.dtype == torch.float64
+    assert torch.equal(out, ref)
+
+
+def test_every_host_gets_the_float32_l2norm_not_only_rdna1(monkeypatch):
+    """A CPU-only or no-Triton host takes the pure-torch gated delta too. On transformers 5.5
+    its l2norm runs in float16 there, and the T4 path's Qwen3.5 and Qwen3.6 grads came back
+    non-finite in unsloth's Core zoo (HF=default) job."""
+    import types
+
+    from unsloth_zoo.temporary_patches import fla_vendor
+
+    monkeypatch.setattr(fla_vendor, "_gpu_lacks_dot_instructions", lambda torch_mod=None: False)
+    monkeypatch.setattr(fla_vendor, "_flag", lambda name: False)
+    monkeypatch.setattr(fla_vendor, "_vendored_already_injected", lambda: False)
+    monkeypatch.setattr(fla_vendor, "_should_defer_to_installed_fla", lambda: False)
+    monkeypatch.setattr(fla_vendor, "_torch_triton_cuda_supported", lambda: False)
+    fake_pkg = "unsloth_test_gated_delta_cpu"
+    mod = types.ModuleType(f"transformers.models.{fake_pkg}.modeling_{fake_pkg}")
+    mod.l2norm = _transformers_style_l2norm
+    monkeypatch.setitem(sys.modules, mod.__name__, mod)
+    monkeypatch.setattr(fla_vendor, "_GATED_DELTA_MODELING", (fake_pkg,))
+
+    fla_vendor.patch_vendor_fla()
+
+    assert mod.l2norm is fla_vendor._fp32_l2norm
+
