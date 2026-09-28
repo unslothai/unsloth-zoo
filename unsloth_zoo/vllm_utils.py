@@ -1238,7 +1238,11 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         gemma4_kv_shared_layers = set()
 
     # Embedding
-    if hasattr(vllm_internals, "model"): # Standard Language models
+    if hasattr(vllm_internals, "model") and hasattr(vllm_internals.model, "text_model"):
+        # Idefics3 nests the text model at model.text_model
+        vllm_text_model = vllm_internals.model.text_model
+        vllm_text_model_prefix = "model.text_model"
+    elif hasattr(vllm_internals, "model"): # Standard Language models
         vllm_text_model = vllm_internals.model
         vllm_text_model_prefix = "model"
     elif hasattr(vllm_internals, "language_model"):
@@ -3061,8 +3065,12 @@ def load_vllm(
             # Each sequence carries an image (~thousands of tokens) in vLLM
             # profiling; cap seqs low for vision models.
             # TODO: vLLM V1 profiling may cap max seqs by budget; check.
-            print(f'Unsloth: Vision model detected, setting approx_max_num_seqs to 1')
-            approx_max_num_seqs = 1
+            if max_num_seqs not in (None, 256):
+                print(f'Unsloth: Vision model detected, honoring max_num_seqs = {max_num_seqs}')
+                approx_max_num_seqs = max_num_seqs
+            else:
+                print(f'Unsloth: Vision model detected, setting approx_max_num_seqs to 1')
+                approx_max_num_seqs = 1
             # One image is ~6404 tokens (Llama 3.2) / ~16Ki (qwen 2.5 VL); leave room for text.
             max_num_batched_tokens = max(8192, max_seq_length)
 

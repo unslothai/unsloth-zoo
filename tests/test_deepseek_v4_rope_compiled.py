@@ -14,8 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""DeepSeek-V4's rope must stay eager in the compiled cache: Inductor with dynamic = True
-reads out of bounds in its backward (pytorch#198553), so LoRA training went NaN."""
+"""DeepSeek-V4's rope is compiled only through the `split` rewrite: the upstream trailing slice makes
+Inductor with dynamic = True read out of bounds in its backward (pytorch#198553, torch <= 2.13)."""
 
 import importlib.util
 import json
@@ -48,6 +48,7 @@ for mt in ("deepseek_v4", "llama"):
     generated = open(path, encoding = "utf-8").read()
     where = generated.find("def apply_rotary_pos_emb(")
     out[mt] = generated[:where].rsplit("\n@", 1)[-1].strip() if where != -1 else None
+    out[mt + "_split"] = "x.split([x.shape[-1] - rope_dim, rope_dim]" in generated[where:where + 2000]
     out[mt + "_path"] = path
 
 if torch.cuda.is_available() and os.environ.get("UNSLOTH_ZOO_DISABLE_GPU_INIT") != "1":
@@ -100,8 +101,20 @@ def child(tmp_path_factory):
     return _run_child(tmp_path_factory.mktemp("dsv4_rope"))
 
 
-def test_deepseek_v4_rope_is_left_eager(child):
-    assert child["deepseek_v4"] == "torch_compiler_disable_unless_decode", child
+def test_deepseek_v4_rope_is_compiled_through_the_rewrite(child):
+    assert child["deepseek_v4"].startswith("torch_compile_with_fallback("), child
+    assert child["deepseek_v4_split"], child
+
+
+def test_unmatched_rope_source_stays_disabled():
+    from unsloth_zoo.compiler import DISABLE_COMPILE_MODEL_FUNCTIONS, model_function_source_rewrites
+    import transformers.models.deepseek_v4.modeling_deepseek_v4 as modeling
+
+    assert "apply_rotary_pos_emb" in model_function_source_rewrites(modeling, "deepseek_v4")
+    changed = type("M", (), {})()
+    exec("def apply_rotary_pos_emb(x, cos, sin):\n    return x[..., -cos.shape[-1]:]\n", changed.__dict__)
+    assert model_function_source_rewrites(changed, "deepseek_v4") == {}
+    assert "apply_rotary_pos_emb" in DISABLE_COMPILE_MODEL_FUNCTIONS["deepseek_v4"]
 
 
 def test_other_models_keep_their_rope_decorator(child):
