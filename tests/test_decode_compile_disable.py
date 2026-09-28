@@ -155,3 +155,27 @@ def test_scope_compiles_under_eager_on_recompile_and_restores_it():
     finally:
         torch.compiler.set_stance("default")
     assert calls, "eager_on_recompile never compiles a new frame, so decode stayed eager"
+
+
+def _nested_frames_compiled(recursive):
+    frames = []
+    def backend(gm, example_inputs):
+        frames.append(gm)
+        return gm.forward
+
+    def inner(x):
+        return x.cos() * 3
+
+    @torch_compiler_disable_unless_decode(recursive = recursive)
+    def block(x):
+        return inner(x) + 1
+
+    torch._dynamo.reset()
+    torch.compile(lambda x: block(x * 2) - 1, backend = backend)(torch.randn(4))
+    return len(frames)
+
+
+def test_recursive_disable_keeps_the_subtree_eager_outside_decode():
+    # The Qwen MoE block relied on the default recursive disable: nothing it calls may be
+    # captured by an outer training compile.
+    assert _nested_frames_compiled(recursive = True) < _nested_frames_compiled(recursive = False)

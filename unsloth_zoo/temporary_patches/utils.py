@@ -2131,11 +2131,13 @@ def _current_stance():
         return None
 
 
-def torch_compiler_disable_unless_decode(func):
-    """`torch.compiler.disable(recursive = False)`, except while Dynamo traces a compiled decode
-    step (`UNSLOTH_DECODE_COMPILE[0]`), which would otherwise graph-break at every layer."""
+def torch_compiler_disable_unless_decode(func = None, *, recursive = False):
+    """`torch.compiler.disable(recursive = recursive)`, except while Dynamo traces a compiled
+    decode step (`UNSLOTH_DECODE_COMPILE[0]`), which would otherwise graph-break at every layer."""
+    if func is None:
+        return functools.partial(torch_compiler_disable_unless_decode, recursive = recursive)
     func = getattr(func, "_unsloth_undisabled", func)
-    disabled = torch.compiler.disable(func, recursive = False)
+    disabled = torch.compiler.disable(func, recursive = recursive)
 
     @functools.wraps(func)
     def forward(*args, **kwargs):
