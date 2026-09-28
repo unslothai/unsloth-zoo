@@ -4043,7 +4043,7 @@ def _pick_int_scheme(base, schemes, packed_shape, scale_shape, logical_shape, ha
             and tuple(scale_shape) == (out_features, groups)
             and has_zero_point == (not weights.get("symmetric", True))
         ):
-            found[(bits, strategy, bool(weights.get("symmetric", True)))] = weights
+            found[(bits, strategy, bool(weights.get("symmetric", True)), weights.get("group_size"))] = weights
     if len(found) != 1:
         raise RuntimeError(
             f"Unsloth: `{base}.weight_packed` {tuple(packed_shape)} matches "

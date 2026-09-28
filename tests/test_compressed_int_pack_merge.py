@@ -323,3 +323,17 @@ def test_the_int_decode_runs_after_the_completeness_check_and_reads_config_first
             calls.setdefault(node.func.id, []).append(node.lineno)
     assert max(calls["_check_lora_merge_is_complete"]) < min(calls["_rewrite_compressed_int_shard"])
     assert max(calls["_compressed_int_pack_schemes"]) < min(calls["_remove_quantization_config"])
+
+
+def test_group_sizes_with_equal_group_counts_are_ambiguous_not_merged():
+    # in_features 96: group 48 and group 64 both give 2 scale groups; the last scheme must not silently win.
+    import pytest
+    from unsloth_zoo.saving_utils import _pick_int_scheme
+
+    schemes = [
+        {"num_bits": 4, "strategy": "group", "group_size": 48, "symmetric": True},
+        {"num_bits": 4, "strategy": "group", "group_size": 64, "symmetric": True},
+    ]
+    with pytest.raises(RuntimeError, match = "more than one"):
+        _pick_int_scheme("layer", schemes, (8, 12), (8, 2), (8, 96), False)
+    assert _pick_int_scheme("layer", schemes[:1], (8, 12), (8, 2), (8, 96), False) is schemes[0]
