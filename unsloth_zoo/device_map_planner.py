@@ -2468,6 +2468,34 @@ def drop_no_placement_modules(model: nn.Module) -> list[str]:
     return dropped
 
 
+def unmap_dropped_modules(device_map: dict, model: nn.Module, dropped: Sequence[str]) -> dict:
+    """Split any map entry that is an ancestor of a ``dropped`` path into its other children:
+    transformers expands map keys by prefix, so ``model.layers.0: 0`` would still send the
+    dropped table to that card."""
+    out = dict(device_map)
+    for path in dropped:
+        key = max(
+            (k for k in out if k == "" or path == k or path.startswith(k + ".")),
+            key=len, default=None,
+        )
+        if key is None:
+            continue
+        device = out.pop(key)
+        if key == path:
+            continue
+        module = model.get_submodule(key) if key else model
+        prefix = key
+        for part in (path[len(key) + 1:] if key else path).split("."):
+            for name, _ in list(module.named_children()) + list(
+                module.named_parameters(recurse=False)
+            ) + list(module.named_buffers(recurse=False)):
+                if name != part:
+                    out[f"{prefix}.{name}" if prefix else name] = device
+            module = getattr(module, part)
+            prefix = f"{prefix}.{part}" if prefix else part
+    return out
+
+
 def plan_device_map_for_pretrained(
     model_name_or_path: str,
     *,
@@ -2512,8 +2540,8 @@ def plan_device_map_for_pretrained(
         model_name_or_path, config=config,
         trust_remote_code=trust_remote_code, **config_kwargs
     )
-    drop_no_placement_modules(model)
-    return plan_device_map(
+    dropped = drop_no_placement_modules(model)
+    plan = plan_device_map(
         model,
         max_memory=max_memory,
         rows_per_chunk=rows_per_chunk,
@@ -2531,3 +2559,6 @@ def plan_device_map_for_pretrained(
         prefer_head_device=prefer_head_device,
         reserve_load_transient=reserve_load_transient,
     )
+    if plan is not None and dropped:
+        plan.device_map = unmap_dropped_modules(plan.device_map, model, dropped)
+    return plan

@@ -68,8 +68,23 @@ def test_kill_switch_and_plain_models(monkeypatch):
     assert drop_no_placement_modules(plain) == []
 
 
-def test_planner_calls_it():
-    import inspect
+def test_planned_map_has_no_ancestor_of_the_table(monkeypatch):
+    # transformers expands map keys by prefix: an entry for the table's no-split layer would
+    # still place the table on that card.
+    from types import SimpleNamespace
     from unsloth_zoo import device_map_planner
-    src = inspect.getsource(device_map_planner.plan_device_map_for_pretrained)
-    assert "drop_no_placement_modules(model)" in src
+
+    with torch.device("meta"):
+        model = Model()
+    monkeypatch.setattr(device_map_planner, "_usable_devices", lambda max_memory: [0, 1])
+    monkeypatch.setattr(device_map_planner, "build_meta_model", lambda *a, **k: (model, None, None))
+    monkeypatch.setattr(
+        device_map_planner, "plan_device_map",
+        lambda m, **k: SimpleNamespace(device_map={"layers.0": 0, "layers.1": 1, "layers.2": 1}),
+    )
+    plan = device_map_planner.plan_device_map_for_pretrained("x")
+    table = "layers.1.ple.ple_embedding.ngram_embedding.weight"
+    assert not any(k == "" or table.startswith(k + ".") for k in plan.device_map)
+    assert plan.device_map == {
+        "layers.0": 0, "layers.2": 1, "layers.1.mlp": 1, "layers.1.ple.key_proj": 1,
+    }
