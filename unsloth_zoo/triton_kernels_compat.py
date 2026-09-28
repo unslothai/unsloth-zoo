@@ -180,12 +180,17 @@ def _self_check(device):
 
 def matmul_ogs_available(device = None) -> bool:
     """Self-checked once per device; any import, layout, launch or accuracy failure -> False (use exact dequant)."""
-    device = torch.device(device) if device is not None else torch.device("cuda", torch.cuda.current_device())
+    if device is None:
+        if not torch.cuda.is_available():
+            return False
+        device = torch.device("cuda", torch.cuda.current_device())
+    device = torch.device(device)
     key = str(device)
     ok = _DEVICE_OK.get(key)
     if ok is None:
+        on_cuda = torch.cuda.device(device) if device.type == "cuda" else contextlib.nullcontext()
         try:
-            with torch.no_grad(), torch.autocast(device.type, enabled = False), torch.cuda.device(device):
+            with torch.no_grad(), torch.autocast(device.type, enabled = False), on_cuda:
                 ok = bool(_self_check(device))
         except Exception:
             ok = False
