@@ -228,3 +228,30 @@ def test_none_image_entries_are_dropped_in_pc_path():
     collator.assistant_single_content = False
     collator([{"images": [None], "prompt": "a", "completion": "x"}])
     assert collator.processor.seen_images[0] is None
+
+
+def test_mixed_batch_keeps_one_image_slot_per_row_in_pc_path():
+    # Gemma 3/4, Idefics3 and LFM2-VL processors require len(images) == len(text).
+    from PIL import Image
+    collator = make_collator(None)
+    collator.processor = _ChatProcessor()
+    collator.assistant_single_content = False
+    image = Image.new("RGB", (32, 32))
+    collator([
+        {"images": [image], "prompt": "<img> a", "completion": "x"},
+        {"images": [None], "prompt": "a", "completion": "x"},
+    ])
+    assert collator.processor.seen_images[0] == [[image], []]
+
+
+def test_mixed_batch_keeps_one_image_slot_per_row_in_messages_path():
+    from PIL import Image
+    collator = make_collator(None)
+    collator.processor = _ChatProcessor()
+    collator.assistant_single_content = False
+    image = Image.new("RGB", (32, 32))
+    def msgs(with_image):
+        user = ([{"type": "image"}] if with_image else []) + [{"type": "text", "text": "a"}]
+        return [{"role": "user", "content": user}, {"role": "assistant", "content": [{"type": "text", "text": "x"}]}]
+    collator([{"images": None, "messages": msgs(False)}, {"images": [image], "messages": msgs(True)}])
+    assert collator.processor.seen_images[0] == [[], [image]]
