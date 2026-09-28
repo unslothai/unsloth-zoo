@@ -14,14 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Remote-code repairs for Nemotron-3-Nano-Omni style checkpoints (trust_remote_code).
-
-The remote module below copies the parts of nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
-that fail under training on transformers 5.x: the InternVL-style forward (in-place write into
-inputs_embeds, `pixel_values.shape` on a ragged list) and the legacy NemotronHHybridDynamicCache
-(no `get_query_offset`). It is loaded through transformers' dynamic module loader, as
-`from_pretrained(trust_remote_code = True)` does. CPU only.
-"""
+"""Remote-code repairs, on a module copying the failing parts of Nemotron-3-Nano-Omni
+loaded through transformers' dynamic module loader. CPU only."""
 
 import inspect
 import os
@@ -199,7 +193,6 @@ _MODELING = textwrap.dedent('''
 
 @pytest.fixture(scope = "module")
 def remote(tmp_path_factory):
-    # The dynamic module cache must be private to the test: set before the loader runs.
     import transformers.dynamic_module_utils as dmu
     try:
         from unsloth_zoo.temporary_patches.remote_code_vlm import patch_remote_code_vlm
@@ -234,9 +227,7 @@ def test_legacy_cache_gets_query_offset(remote):
 
 
 def test_legacy_cache_builds_causal_mask(remote):
-    # transformers 5.x mask building calls past_key_values.get_query_offset(layer_idx).
     from transformers import masking_utils
-    # Read the signature of the transformers function, not of a wrapper around it.
     original = getattr(masking_utils, "_unsloth_original_create_causal_mask", masking_utils.create_causal_mask)
     parameters = inspect.signature(original).parameters
     cfg = remote.TinyOmniConfig().llm_config
@@ -289,7 +280,6 @@ def test_same_values_as_original_forward(remote):
         old = original(model, **kwargs, labels = kwargs["input_ids"])
     assert torch.equal(new.logits, old.logits)
     assert torch.equal(new.loss, old.loss)
-    # Signature is the original's, so callers that inspect it (processor key filtering) see no change.
     assert inspect.signature(type(model).forward) == inspect.signature(original)
 
 
@@ -314,8 +304,6 @@ def test_other_remote_classes_untouched(remote):
 
 
 def test_radio_summary_idxs_restored(remote):
-    # transformers 5 meta-device loading returns a buffer missing from the checkpoint as zeros
-    # (16-bit) or uninitialized memory (4-bit, then a device-side assert when indexing).
     model = remote.RADIOModel(remote.TinyRadioConfig())
     with torch.no_grad():
         model.radio_model.summary_idxs.zero_()

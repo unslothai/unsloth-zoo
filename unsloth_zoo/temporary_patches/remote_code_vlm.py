@@ -14,31 +14,10 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Repairs for remote (trust_remote_code) modeling code that is loaded after import.
-
-Remote classes only exist once `from_pretrained` imports them, so these repairs hook
-`transformers.dynamic_module_utils.get_class_in_module`, which every remote class load
-passes through, and fix the loaded modules in place:
-
-1. Legacy hybrid caches (e.g. `NemotronHHybridDynamicCache` in Nemotron-H / Nemotron-3-Nano-Omni)
-   are plain classes, not `transformers.Cache` subclasses. transformers >= 5.x mask building
-   (`masking_utils._preprocess_mask_arguments`) calls `past_key_values.get_query_offset(layer_idx)`,
-   so every cached generation fails with AttributeError. `Cache.get_query_offset` is defined as
-   `get_seq_length(layer_idx)`; the same method is added to such classes.
-
-2. InternVL-style multimodal forwards (Nemotron-3-Nano-Omni, Nemotron Nano VL, InternVL chat)
-   merge image features with `inputs_embeds[selected] = inputs_embeds[selected] * 0.0 + vit_embeds`.
-   Under training the embedding output is a leaf that requires grad (input-require-grads hooks
-   for gradient checkpointing), so that in-place write raises "a view of a leaf Variable that
-   requires grad is being used in an in-place operation". The forward also reads
-   `pixel_values.shape` and cannot take the list of differently sized (3, H, W) tiles that
-   dynamic-resolution processors return for a batch of images of different sizes. The forward
-   is replaced by one that merges out of place (masked_scatter, the same values) and runs the
-   vision tower per tile group. Language model call and loss are the original's.
-
-3. RADIO vision towers compute the `summary_idxs` buffer in __init__; checkpoints that do not
-   store it get zeros or uninitialized memory from the meta-device load (4-bit loads then hit a
-   device-side assert). It is recomputed from the config on the first forward.
+"""Repairs for trust_remote_code classes, applied as `get_class_in_module` loads them:
+legacy hybrid caches without `get_query_offset` (transformers 5 masking calls it), InternVL-style
+forwards whose in-place image merge breaks training and ragged `pixel_values`, and RADIO
+`summary_idxs` buffers that meta-device loading leaves unset.
 """
 
 import functools
@@ -59,7 +38,7 @@ __all__ = [
 
 
 def _get_query_offset(self, layer_idx = 0):
-    # transformers.Cache.get_query_offset: equal to the cached length except for MTP caches.
+    # Same as transformers.Cache.get_query_offset (differs only for MTP caches).
     return self.get_seq_length(layer_idx)
 
 
@@ -104,11 +83,9 @@ def _is_internvl_style_forward(cls):
 
 
 def _tile_groups(pixel_values):
-    """Tensor or list of (3, H, W) / (n, 3, H, W) tensors -> list of 4D tile batches."""
     items = list(pixel_values) if isinstance(pixel_values, (list, tuple)) else [pixel_values]
     items = [x.unsqueeze(0) if x.dim() == 3 else x for x in items]
     if len(items) > 1 and all(x.shape[1:] == items[0].shape[1:] for x in items):
-        # Same tile size: one vision call, as the original forward does for a stacked tensor.
         return [torch.cat(items, dim = 0)]
     return items
 
@@ -121,7 +98,6 @@ def _image_features(self, pixel_values, image_flags, hidden_size):
         flags = image_flags.reshape(-1)
         if flags.numel() != n_tiles:
             if bool((flags == 1).all()):
-                # All-ones flags of another length carry no selection.
                 flags = None
             else:
                 raise ValueError(
@@ -140,7 +116,6 @@ def _image_features(self, pixel_values, image_flags, hidden_size):
 
 
 def repair_internvl_style_forward(cls):
-    """Replace an InternVL-style forward with an out-of-place, ragged-aware one. True if replaced."""
     if not _is_internvl_style_forward(cls):
         return False
     original = cls.__dict__["forward"]
@@ -171,9 +146,8 @@ def repair_internvl_style_forward(cls):
                 raise ValueError(
                     f"Unsloth: {n_tokens} image tokens in input_ids but only {vit_embeds.shape[0]} image features."
                 )
-            # The original keeps the first n_tokens features when there are more.
             vit_embeds = vit_embeds[:n_tokens].to(inputs_embeds.device, inputs_embeds.dtype)
-            # Out of place: same values as `x[selected] = x[selected] * 0.0 + vit_embeds`.
+            # Out of place, same values as `x[selected] = x[selected] * 0.0 + vit_embeds`.
             inputs_embeds = inputs_embeds.masked_scatter(selected.unsqueeze(-1), vit_embeds)
 
         outputs = self.language_model(
@@ -239,11 +213,8 @@ def _restore_summary_idxs(model):
 
 
 def repair_radio_summary_idxs(cls):
-    """RADIO (C-RADIO vision towers) computes the `summary_idxs` buffer in __init__ and checkpoints
-    such as Nemotron-3-Nano-Omni do not store it. transformers 5 builds the model on the meta
-    device, so the missing buffer comes back as zeros or uninitialized memory; 4-bit loads then
-    index out of range (`all_summary[:, self.summary_idxs]`, a device-side assert). Recompute it
-    from the config on the first forward. True if the forward was wrapped."""
+    # summary_idxs is built in __init__ and not stored, so meta-device loads leave garbage
+    # (4-bit: out-of-range index, device-side assert). Recompute it on the first forward.
     if getattr(cls, "__name__", "") != "RADIOModel":
         return False
     original = cls.__dict__.get("forward")
@@ -272,7 +243,6 @@ _REPAIRED_MODULES = set()
 
 
 def repair_remote_modules():
-    """Repair every loaded remote-code module once. Returns the repaired class names."""
     repaired = []
     for name, module in list(sys.modules.items()):
         if module is None or not name.startswith("transformers_modules"):
