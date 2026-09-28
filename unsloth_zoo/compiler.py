@@ -164,6 +164,9 @@ DISABLE_COMPILE_FUNCTIONS = [
     # nothing today; it is here so one that goes back to importing it by name, the
     # way transformers 5.2 does for chunk_gated_delta_rule, stays uncompiled.
     "recurrent_gated_delta_rule",
+    # KDA chunk fallback (glm5_next, kimi_linear): Inductor unrolls the per-chunk loop, 25+ min AOT compile.
+    # recurrent_kimi_delta_attention stays compiled: decode only (seq_len 1), 2x faster than eager.
+    "chunk_kimi_delta_attention",
 
     # transformers 5.9+ VL files import these; `grid_thw.tolist()` builds shapes from
     # unbacked SymInts, so fullgraph = True is a hard error on the first vision forward.
