@@ -107,3 +107,17 @@ def test_decoded_entries_are_not_resized():
     )
     assert images[0].size == (100, 100)
     assert images[0].tobytes() == source.tobytes()
+
+
+def test_bare_base64_string_decodes():
+    import base64
+    buf = io.BytesIO()
+    Image.new("RGB", (16, 16), (1, 2, 3)).save(buf, format = "PNG")
+    encoded = base64.b64encode(buf.getvalue()).decode()
+    images, _, _ = _collator()._extract_images_videos_for_example({"images": [encoded]}, [])
+    assert images[0].size == (16, 16) and images[0].getpixel((0, 0)) == (1, 2, 3)
+
+
+def test_missing_local_path_still_raises_file_not_found():
+    with pytest.raises(FileNotFoundError):
+        _collator()._extract_images_videos_for_example({"images": ["/no/such/image.png"]}, [])

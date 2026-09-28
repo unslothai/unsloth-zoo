@@ -632,8 +632,14 @@ def _decode_image(image) -> Image.Image:
                 _, base64_data = image.split("base64,", 1)
                 data = base64.b64decode(base64_data)
                 image_obj = Image.open(BytesIO(data))
-        else:
+        elif os.path.isfile(image):
             image_obj = Image.open(image)
+        else:
+            # Bare base64, as transformers.image_utils.load_image accepts; else surface the missing path.
+            try:
+                image_obj = Image.open(BytesIO(base64.b64decode(image, validate=True)))
+            except Exception:
+                image_obj = Image.open(image)
     elif isinstance(image, bytes):
         image_obj = Image.open(BytesIO(image))
     elif isinstance(image, dict):
