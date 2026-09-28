@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import json
 import os
 import re
@@ -162,13 +163,18 @@ def test_dropped_names_stop_pefts_v5_moe_conversion_doubling_the_rank():
     # Unsloth's import_fixes wraps it to skip explicit targets; plain PEFT runs the original.
     while hasattr(convert, "__wrapped__"):
         convert = convert.__wrapped__
+    # PEFT 0.19 takes the model_type string; later releases take the model and read its config.
+    # Handing 0.19 the model looks the module up as a model type, finds nothing and converts
+    # nothing, so the doubling below never shows and the test reads a missing call as a fix.
+    takes_model_type = list(inspect.signature(convert).parameters)[1:2] == ["model_type"]
 
     def converted(target_modules):
         config = LoraConfig(
             r = 2, lora_alpha = 4, target_modules = list(target_modules),
             target_parameters = ["mlp.experts.gate_up_proj", "mlp.experts.down_proj"],
         )
-        convert(config, TinyMoE())
+        model = TinyMoE()
+        convert(config, model.config.model_type if takes_model_type else model)
         return config.rank_pattern
 
     assert converted(["q_proj", "gate_proj", "up_proj"])  # the bug: rank doubled

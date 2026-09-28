@@ -42,7 +42,7 @@ from .vlm_tokens import IMAGE_TOKENS, AUDIO_TOKENS
 
 import torch
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 import base64
 import contextvars
 from io import BytesIO
@@ -613,16 +613,12 @@ def smart_resize(
     return h_bar, w_bar
 
 
-def fetch_image(
-    ele: dict,
-    size_factor: int = IMAGE_FACTOR,
-) -> Image.Image:
-    if "image" in ele:
-        image = ele["image"]
-    else:
-        image = ele["image_url"]
-        if isinstance(image, dict) and "url" in image:
-            image = image["url"]
+def _decode_image(image) -> Image.Image:
+    # datasets Image(decode=False) rows are {"bytes": None, "path": <str>}; the path may be a URL.
+    if isinstance(image, dict) and not image.get("bytes") and isinstance(image.get("path"), str):
+        image = image["path"]
+    if isinstance(image, bytearray):
+        image = bytes(image)
     image_obj = None
     if isinstance(image, Image.Image):
         image_obj = image
@@ -636,8 +632,14 @@ def fetch_image(
                 _, base64_data = image.split("base64,", 1)
                 data = base64.b64decode(base64_data)
                 image_obj = Image.open(BytesIO(data))
-        else:
+        elif os.path.isfile(image):
             image_obj = Image.open(image)
+        else:
+            # Bare base64, as transformers.image_utils.load_image accepts; else surface the missing path.
+            try:
+                image_obj = Image.open(BytesIO(base64.decodebytes(image.encode())))
+            except Exception:
+                image_obj = Image.open(image)
     elif isinstance(image, bytes):
         image_obj = Image.open(BytesIO(image))
     elif isinstance(image, dict):
@@ -651,9 +653,21 @@ def fetch_image(
     if image_obj is None:
         raise ValueError(f"Unrecognized image input. We support local path, http url, base64 and PIL.Image, bytes and dict formats. Instead we got `{type(image).__name__}`")
     if image_obj.mode != "RGB":
-        image = image_obj.convert("RGB")
+        return image_obj.convert("RGB")
+    return image_obj
+
+
+def fetch_image(
+    ele: dict,
+    size_factor: int = IMAGE_FACTOR,
+) -> Image.Image:
+    if "image" in ele:
+        image = ele["image"]
     else:
-        image = image_obj
+        image = ele["image_url"]
+        if isinstance(image, dict) and "url" in image:
+            image = image["url"]
+    image = _decode_image(image)
     ## resize
     if "resized_height" in ele and "resized_width" in ele:
         resized_height, resized_width = smart_resize(
@@ -1761,9 +1775,16 @@ class UnslothVisionDataCollator:
             prompt_messages + (completion_messages or []), tokenize=False, add_generation_prompt=add_generation_prompt, continue_final_message=continue_final_message
         )
 
+    def _load_column_images(self, images):
+        # SSRF-guarded decode (Idefics2-style processors fetch URLs unguarded); unresized and EXIF-transposed like datasets' PIL.
+        return [
+            ImageOps.exif_transpose(_decode_image(img)) if isinstance(img, (str, bytes, bytearray, dict)) else img
+            for img in images
+        ]
+
     def _extract_images_videos_for_example(self, example, messages):
         if "images" in example:
-            image = list(example["images"])
+            image = self._load_column_images(example["images"])
             video = []
             video_kwarg = None
         else:
@@ -1898,12 +1919,7 @@ class UnslothVisionDataCollator:
         try:
             msg_list = (p_msgs or []) + (c_msgs or [])
             if example.get("images"):
-                # Non-PIL entries go through fetch_image's SSRF guard; processors like Idefics2 fetch URLs unguarded.
-                imgs = [
-                    img if isinstance(img, Image.Image)
-                    else fetch_image({"image": img}, size_factor=self.patch_size*2)
-                    for img in example["images"]
-                ]
+                imgs = self._load_column_images(example["images"])
                 vids = []
             elif msg_list:
                 imgs, vids, vids_kwarg = process_vision_info(
