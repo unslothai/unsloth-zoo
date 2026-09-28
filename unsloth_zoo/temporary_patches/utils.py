@@ -16,6 +16,8 @@
 
 __all__ = [
     "patch_function",
+    "UNSLOTH_DECODE_COMPILE",
+    "torch_compiler_disable_unless_decode",
     "compile_with_eager_fallback",
     "patch_function_past_key_values",
     "process_return",
@@ -2082,6 +2084,31 @@ def _settle_abandoned_checkpoint_generator():
     _RAISED_INSIDE_CHECKPOINT = False
     _CHECKPOINT_SETTLE_ATTEMPTS = 0
     return True
+
+
+# True only while generate() runs a compiled decode step for a model that opted in. A
+# one-element list so Dynamo guards on the value and retraces when it flips.
+UNSLOTH_DECODE_COMPILE = [False]
+
+
+def torch_compiler_disable_unless_decode(func):
+    """`torch.compiler.disable(recursive = False)`, except inside a compiled decode step.
+
+    Generated modules keep large forwards out of training graphs with that decorator,
+    but it also graph-breaks HF's compiled decode step at every layer. While
+    `UNSLOTH_DECODE_COMPILE[0]` is set and Dynamo is tracing, the forward is inlined;
+    otherwise the disabled copy runs exactly as before.
+    """
+    func = getattr(func, "_unsloth_undisabled", func)
+    disabled = torch.compiler.disable(func, recursive = False)
+
+    @functools.wraps(func)
+    def forward(*args, **kwargs):
+        if UNSLOTH_DECODE_COMPILE[0] and torch.compiler.is_compiling():
+            return func(*args, **kwargs)
+        return disabled(*args, **kwargs)
+    forward._unsloth_undisabled = func
+    return forward
 
 
 def torch_compile_with_fallback(fullgraph = False, **compile_kwargs):

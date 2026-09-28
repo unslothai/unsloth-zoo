@@ -101,7 +101,7 @@ def child(tmp_path_factory):
 
 
 def test_deepseek_v4_rope_is_left_eager(child):
-    assert child["deepseek_v4"] == "torch.compiler.disable(recursive = False)", child
+    assert child["deepseek_v4"] == "torch_compiler_disable_unless_decode", child
 
 
 def test_other_models_keep_their_rope_decorator(child):

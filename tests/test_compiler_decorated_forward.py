@@ -47,6 +47,7 @@ import pytest
 import torch
 
 from unsloth_zoo import compiler
+from unsloth_zoo.temporary_patches.utils import torch_compiler_disable_unless_decode
 
 
 def _unwrap_undecorated_method(func, owner_qualname):
@@ -151,7 +152,7 @@ def test_decorated_forward_keeps_the_disable_classification(tmp_path, monkeypatc
     module = _load_fake_modeling_module(tmp_path, monkeypatch, "fake_bare_closure_disable")
 
     disabled = _generate("fake_bare_closure_disable", "FakeGatedDeltaNet", module)
-    assert "@torch.compiler.disable(recursive = False)" in disabled
+    assert "@torch_compiler_disable_unless_decode" in disabled
 
     compiled = compiler.create_standalone_class(
         "FakeGatedDeltaNet", "fake_bare_closure_disable", dir(module), disable = False,
@@ -177,6 +178,7 @@ def test_decorated_forward_runs_and_fires_the_decorator_exactly_once(tmp_path, m
         "nn": torch.nn,
         "torch_compile_options": {},
         "fake_accelerate_hooks": module.fake_accelerate_hooks,
+        "torch_compiler_disable_unless_decode": torch_compiler_disable_unless_decode,
     }
     exec(generated, namespace)
 
