@@ -2250,10 +2250,7 @@ class UnslothVisionDataCollator:
         return [input_ids, attention_mask, completion_mask] + ([token_type_ids] if token_type_ids is not None else [])
 
     def _raise_if_truncation_cut_media(self, before, after, pad_id):
-        # pixel_values / audio features are not truncated with the ids, so a cut placeholder
-        # misaligns them at model forward.
-        # Only the ids the model forward counts against features: a cut media delimiter
-        # (<|vision_end|>) alone still trains on main. Without them, every known media token.
+        # Feature slots only: a cut delimiter alone (<|vision_end|>) still aligns at forward.
         feature_ids = getattr(self, "_feature_token_ids", None)
         if feature_ids:
             media = torch.tensor(feature_ids, device = before.device)
