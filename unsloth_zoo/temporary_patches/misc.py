@@ -1439,7 +1439,7 @@ pass
 
 
 def patch_lazy_load_kernel_local_packages():
-    # transformers 5.17 dropped mamba-ssm / causal-conv1d from _HUB_KERNEL_MAPPING; lazy_load_kernel returns None for unmapped names without trying the local package.
+    # transformers 5.15 dropped mamba-ssm / causal-conv1d from _HUB_KERNEL_MAPPING; lazy_load_kernel returns None for unmapped names without trying the local package.
     if not _local_kernel_fallback_allowed():
         return
     try:
