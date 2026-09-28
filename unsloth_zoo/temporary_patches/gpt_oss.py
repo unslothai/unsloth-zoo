@@ -18,6 +18,7 @@ from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import ast
 import functools
 import os
+import stat
 import torch
 import torch.nn as nn
 import torch.nn.init as init
@@ -57,6 +58,29 @@ UNSLOTH_MXFP4_NO_DEQUANTIZE = os.environ.get("UNSLOTH_MXFP4_NO_DEQUANTIZE", "0")
 # flex_attention_with_sink, which builds its own BlockMask and ignores these masks.
 _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED = False
 _TRAINING_FLAG_ATTR = "_unsloth_gpt_oss_model_training"
+
+
+def _gpt_oss_layer_attention_type(decoder_layer, config, layer_idx):
+    # 4.x sets decoder_layer.attention_type; 5.x dropped it and stock indexes config.layer_types.
+    attention_type = getattr(decoder_layer, "attention_type", None)
+    if isinstance(attention_type, str):
+        return attention_type
+    layer_types = getattr(config, "layer_types", None)
+    if layer_types is not None and 0 <= layer_idx < len(layer_types):
+        return layer_types[layer_idx]
+    self_attn = getattr(decoder_layer, "self_attn", None)
+    return "sliding_attention" if getattr(self_attn, "sliding_window", None) is not None else "full_attention"
+
+
+def _gpt_oss_select_mask(attention_mask, attention_type):
+    # Key presence decides, never tensor truthiness: a None value is a valid causal fast path.
+    if not isinstance(attention_mask, dict):
+        return attention_mask
+    if attention_type in attention_mask:
+        return attention_mask[attention_type]
+    if "full_attention" in attention_mask:
+        return attention_mask["full_attention"]
+    return next(iter(attention_mask.values()), None)
 
 
 def _check_triton_kernels_available():
@@ -255,6 +279,26 @@ def swiglu_torch_backward(pre_act, alpha, limit, g1):
     return g1 * grad.to(g1.dtype)
 pass
 
+def _mxfp4_hub_kernel_unreachable():
+    """True when transformers loads MXFP4 kernels via the `kernels` hub and it is unusable."""
+    try:
+        import inspect
+        import transformers.integrations.mxfp4 as mxfp4_integration
+        source = inspect.getsource(mxfp4_integration.replace_with_mxfp4_linear)
+    except Exception:
+        return False
+    if "get_kernel" not in source:
+        return False
+    if hasattr(mxfp4_integration, "_replace_with_mxfp4_linear"):
+        return False
+    try:
+        from transformers.utils import is_kernels_available as _real_is_kernels_available
+        return not _real_is_kernels_available()
+    except Exception:
+        return True
+pass
+
+
 def patch_gpt_oss():
     try:
         import triton_kernels
@@ -271,7 +315,15 @@ def patch_gpt_oss():
     except Exception as e:
         return raise_error("transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer", e)
 
-    if HAS_TRITON_KERNELS:
+    if HAS_TRITON_KERNELS and _mxfp4_hub_kernel_unreachable():
+        # Claiming kernels skips the bf16 fallback, then the hub load raises ImportError (vLLM triton_kernels).
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info(
+                "Unsloth: triton_kernels is importable but transformers cannot load the MXFP4 "
+                "hub kernels, so MXFP4 GPT OSS weights will be dequantized to bf16."
+            )
+        return
+    elif HAS_TRITON_KERNELS:
         # Only override is_kernels_available when triton_kernels IS available
         try:
             def is_kernels_available(): return True
@@ -1365,10 +1417,42 @@ def patch_gpt_oss_bnb4bit():
     m.transformers_version = transformers_version
     m.Version              = Version
 
+    _rebind_gpt_oss_compiled_classes()
     return True
 
 
 pass
+
+
+def _gpt_oss_class_is_bnb4bit(cls):
+    # A BnB router (compiled or not) builds `self.linear`; stock builds `self.weight`.
+    if cls is GptOssExpertsBnb4bit:
+        return True
+    init = getattr(cls, "__init__", None)
+    return "linear" in getattr(getattr(init, "__code__", None), "co_names", ())
+
+
+def _rebind_gpt_oss_compiled_classes():
+    # The compiler runs once per process, so its module keeps the first load's flavor of these classes.
+    try:
+        import transformers.models.gpt_oss.modeling_gpt_oss as modeling
+    except Exception:
+        return
+    want_bnb = modeling.GptOssExperts is GptOssExpertsBnb4bit
+    seen = set()
+    for cls in list(vars(modeling).values()):
+        if not isinstance(cls, type):
+            continue
+        for fn in vars(cls).values():
+            g = getattr(fn, "__globals__", None)
+            if g is None or id(g) in seen:
+                continue
+            seen.add(id(g))
+            if not str(g.get("__name__", "")).startswith("unsloth_compiled_module_gpt_oss"):
+                continue
+            for name in ("GptOssExperts", "GptOssTopKRouter"):
+                if isinstance(g.get(name), type) and _gpt_oss_class_is_bnb4bit(g[name]) != want_bnb:
+                    g[name] = getattr(modeling, name)
 
 
 def restore_gpt_oss_original():
@@ -1383,6 +1467,7 @@ def restore_gpt_oss_original():
             transformers.models.gpt_oss.modeling_gpt_oss.GptOssTopKRouter = \
                 transformers.models.gpt_oss.modeling_gpt_oss._original_GptOssTopKRouter
             logger.info("Unsloth: Restored original GPT OSS classes")
+            _rebind_gpt_oss_compiled_classes()
             return True
     except Exception:
         pass
@@ -1437,16 +1522,133 @@ def _gpt_oss_cache_locations():
     return out
 
 
-def _invalidate_gpt_oss_compiled_module():
+def _gpt_oss_cache_location_is_trusted(loc):
+    """Whether this process may write the flavor marker into `loc`.
+
+    Deliberately weaker than `compile_cache._is_trusted_directory`, which gates
+    LOADING executable artifacts and so walks every ancestor and refuses any group
+    write: this only writes a flavor string through an O_NOFOLLOW descriptor, beside
+    a compiled module the library itself writes 0644 into the same directory.
+    Ownership alone is the wrong question, since a shared cache belongs to whoever
+    built it first. The real one is whether everyone who can create an entry here is
+    already trusted by the sharing group: ours, or group-write to a group we are in.
+    """
+    try:
+        directory_stat = os.lstat(loc)
+    except FileNotFoundError:
+        return True   # a location we are about to create ourselves
+    except Exception:
+        return False
+    try:
+        if not stat.S_ISDIR(directory_stat.st_mode):
+            return False
+        if os.name != "posix":
+            return True
+        if directory_stat.st_mode & 0o002:
+            return False
+        if directory_stat.st_uid == os.geteuid():
+            return True
+        # A group member can already replace the 0644 module beside the marker.
+        if not (directory_stat.st_mode & 0o020):
+            return False
+        try:
+            groups = set(os.getgroups()) | {os.getgid(), os.getegid()}
+        except Exception:
+            return False
+        return directory_stat.st_gid in groups
+    except Exception:
+        return False
+pass
+
+
+def _gpt_oss_marker_mode(loc):
+    """0664 in a cache shared with our group, 0600 in one only we can reach.
+
+    The marker records a flavor, not a secret, and in a shared cache every member has
+    to be able to read AND rewrite it. Owner-only there means the member who switched
+    flavor deletes the stale module but cannot record the new one, leaving the two
+    disagreeing.
+    """
+    try:
+        if os.name != "posix":
+            return 0o600
+        return 0o664 if (os.lstat(loc).st_mode & 0o020) else 0o600
+    except Exception:
+        return 0o600
+pass
+
+
+def _gpt_oss_replace_marker(marker_path, desired_flavor, mode = 0o600):
+    """Land the marker by replacing the name: mkstemp then os.replace.
+
+    Two things at once. A link sitting at `marker_path` is replaced rather than
+    written through, and the update needs only directory write, so a group member can
+    record a flavor into a marker file owned by whoever built the cache first.
+    """
+    import tempfile
+    directory = os.path.dirname(marker_path) or "."
+    descriptor, temporary_path = tempfile.mkstemp(
+        prefix = f".{os.path.basename(marker_path)}.", suffix = ".tmp", dir = directory,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding = "utf-8") as f:
+            descriptor = None
+            f.write(desired_flavor)
+        os.chmod(temporary_path, mode)      # mkstemp is 0600; a shared cache needs more
+        os.replace(temporary_path, marker_path)
+    except BaseException:
+        if descriptor is not None:
+            try: os.close(descriptor)
+            except OSError: pass
+        try: os.remove(temporary_path)
+        except OSError: pass
+        raise
+pass
+
+
+def _gpt_oss_write_marker(loc, desired_flavor):
+    """Write the flavor marker without following a link out of `loc`.
+
+    Same flags as `compiler._write_bytes_durably`: O_NONBLOCK because a planted FIFO
+    would otherwise block the load forever, S_ISREG because one with a reader
+    attached opens fine and would swallow the marker instead.
+    """
+    marker_path = os.path.join(loc, _GPT_OSS_FLAVOR_MARKER)
+    mode = _gpt_oss_marker_mode(loc)
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    if not no_follow or mode != 0o600:
+        # Shared: the existing marker belongs to whoever built the cache, so only a
+        # replacement can update it. Also the no-atomic-no-follow-open case, where an
+        # lstat first would be a time of check.
+        return _gpt_oss_replace_marker(marker_path, desired_flavor, mode)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    flags |= no_follow
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(marker_path, flags, mode)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError(f"Unsloth: refusing to write the gpt-oss flavor marker in `{loc}`: not a regular file.")
+        with os.fdopen(descriptor, "w", encoding = "utf-8") as f:
+            descriptor = None
+            f.write(desired_flavor)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+pass
+
+
+def _invalidate_gpt_oss_compiled_module(locations = None):
     """Drop the cached compiled gpt_oss module (sys.modules + on-disk .py/.pyc) so it is
     rebuilt against the CURRENT router/experts classes. The single per-model-type file
     hardcodes the BnB or stock layout, so a stale one survives a 4bit<->16bit switch with the
-    wrong classes. Cleans every candidate location."""
+    wrong classes. Cleans every candidate location, or only `locations` when given: a
+    location that is stale says nothing about the others, and sweeping them all let one
+    planted candidate delete a perfectly good cache on every load."""
     try:
         import sys as _sys
         import importlib, importlib.util
         _sys.modules.pop(_GPT_OSS_COMPILED_MODULE, None)
-        for loc in _gpt_oss_cache_locations():
+        for loc in (_gpt_oss_cache_locations() if locations is None else locations):
             _f = os.path.join(loc, _GPT_OSS_COMPILED_MODULE + ".py")
             if os.path.isfile(_f):
                 try:
@@ -1477,10 +1679,18 @@ def _sync_gpt_oss_compiled_flavor(desired_flavor):
     missing marker the stale module is dropped for the compiler to regenerate."""
     try:
         locations = _gpt_oss_cache_locations()
-        mismatch = False
+        # Per location, never global: marking all of them stale because one is lets
+        # anyone who can create the predictable temp candidate delete a valid primary
+        # cache on every load.
+        stale = []
         for loc in locations:
             module_path = os.path.join(loc, _GPT_OSS_COMPILED_MODULE + ".py")
             if not os.path.isfile(module_path):
+                continue
+            if not _gpt_oss_cache_location_is_trusted(loc):
+                # Any marker here is not ours, and the compiler imports the module
+                # beside it with no such gate, so do not trust what it claims.
+                stale.append(loc)
                 continue
             on_disk = None
             marker_path = os.path.join(loc, _GPT_OSS_FLAVOR_MARKER)
@@ -1491,17 +1701,19 @@ def _sync_gpt_oss_compiled_flavor(desired_flavor):
                 except Exception:
                     on_disk = None
             if on_disk != desired_flavor:
-                mismatch = True
-        if mismatch:
-            _invalidate_gpt_oss_compiled_module()
+                stale.append(loc)
+        if stale:
+            _invalidate_gpt_oss_compiled_module(stale)
         # Record this load's flavor; always at the primary location, the temp fallback only if used.
         for idx, loc in enumerate(locations):
             if idx != 0 and not os.path.isdir(loc):
                 continue
+            # Never write into a directory the sharing group does not already trust.
+            if not _gpt_oss_cache_location_is_trusted(loc):
+                continue
             try:
                 os.makedirs(loc, exist_ok = True)
-                with open(os.path.join(loc, _GPT_OSS_FLAVOR_MARKER), "w", encoding = "utf-8") as f:
-                    f.write(desired_flavor)
+                _gpt_oss_write_marker(loc, desired_flavor)
             except Exception:
                 pass
     except Exception:
@@ -1520,12 +1732,13 @@ def patch_gpt_oss_bnb4bit_auto():
         _sync_gpt_oss_compiled_flavor("bnb4bit" if _should_use_gpt_oss_bnb4bit() else "stock")
 
     if not _should_use_gpt_oss_bnb4bit():
-        # The BnB patch swaps GptOssTopKRouter/GptOssExperts globally. A stale "_load_in_4bit_"
-        # in UNSLOTH_MODEL_NAME (inherited across a save->reload subprocess) would leave the BnB
-        # classes installed when later loading a 16bit checkpoint, whose router.weight + 3D
-        # experts then mismatch ("weights not initialized"). Restore the stock classes when this
-        # load is not BnB-4bit. The compiled-module file is handled by _sync above.
-        if os.environ.get("UNSLOTH_GPT_OSS_BNB4BIT_PATCHED", "0") == "1":
+        # Check the installed class too: the env flag can be cleared or inherited independently of it.
+        try:
+            import transformers.models.gpt_oss.modeling_gpt_oss as _modeling
+            _installed = _modeling.GptOssExperts is GptOssExpertsBnb4bit
+        except Exception:
+            _installed = False
+        if _installed or os.environ.get("UNSLOTH_GPT_OSS_BNB4BIT_PATCHED", "0") == "1":
             restore_gpt_oss_original()
             os.environ["UNSLOTH_GPT_OSS_BNB4BIT_PATCHED"] = "0"
         return
@@ -2946,14 +3159,15 @@ def patch_GptOssModel():
         except:
             pass
 
-        # It may already have been prepared by e.g. `generate`
-        if not self.training and not isinstance(attention_mask, dict):
+        # flex_attention_with_sink training windows its own BlockMask; all else needs the per-type mapping.
+        _flex_sink_training = self.training and _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED
+        if not _flex_sink_training and not isinstance(attention_mask, dict):
             # Inference uses eager attention. If the config still has
             # _attn_implementation="flex_attention" (set for training), the
             # mask factory returns a BlockMask which eager cannot consume.
             # Temporarily swap to "eager" so a dense 4D float mask is built.
             _orig_attn_impl = getattr(self.config, "_attn_implementation", None)
-            _swap_attn_impl = _orig_attn_impl == "flex_attention"
+            _swap_attn_impl = (not self.training) and _orig_attn_impl == "flex_attention"
             if _swap_attn_impl:
                 self.config._attn_implementation = "eager"
             try:
@@ -2984,12 +3198,12 @@ def patch_GptOssModel():
             torch.compiler.cudagraph_mark_step_begin()
             # Initialize for common return path
             all_hidden_states = None
-            for decoder_layer in self.layers:
-                _attn_type = getattr(decoder_layer, "attention_type", None)
-                if isinstance(attention_mask, dict):
-                    mask = attention_mask.get(_attn_type) or next(iter(attention_mask.values()))
-                else:
-                    mask = attention_mask
+            all_router_logits = None
+            for layer_idx, decoder_layer in enumerate(self.layers):
+                mask = _gpt_oss_select_mask(
+                    attention_mask,
+                    _gpt_oss_layer_attention_type(decoder_layer, self.config, layer_idx),
+                )
                 hidden_states, residual = inference_forward(
                     decoder_layer,
                     hidden_states,
@@ -3030,26 +3244,43 @@ def patch_GptOssModel():
             )
             all_hidden_states = () if output_hidden_states else None
 
-            for decoder_layer in self.layers:
-                if output_hidden_states:
-                    all_hidden_states += (hidden_states,)
+            # Replaces stock @capture_outputs: without router_logits, aux_loss.to() fails (TRL >= 1.7 MoE).
+            all_router_logits = None
+            router_hooks = []
+            if kwargs.get("output_router_logits", getattr(self.config, "output_router_logits", False)):
+                all_router_logits = []
+                def _record_router_logits(module, args, output):
+                    all_router_logits.append(output[0] if isinstance(output, tuple) else output)
+                for decoder_layer in self.layers:
+                    router = getattr(getattr(decoder_layer, "mlp", None), "router", None)
+                    if router is not None:
+                        router_hooks.append(router.register_forward_hook(_record_router_logits))
 
-                _attn_type = getattr(decoder_layer, "attention_type", None)
-                if isinstance(attention_mask, dict):
-                    mask = attention_mask.get(_attn_type) or next(iter(attention_mask.values()))
-                else:
-                    mask = attention_mask
-                hidden_states = decoder_layer(
-                    hidden_states,
-                    attention_mask=mask,
-                    position_ids=position_ids,
-                    past_key_values=past_key_values,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                    **kwargs,
-                )
-            pass
+            try:
+                for layer_idx, decoder_layer in enumerate(self.layers):
+                    if output_hidden_states:
+                        all_hidden_states += (hidden_states,)
+
+                    mask = _gpt_oss_select_mask(
+                        attention_mask,
+                        _gpt_oss_layer_attention_type(decoder_layer, self.config, layer_idx),
+                    )
+                    hidden_states = decoder_layer(
+                        hidden_states,
+                        attention_mask=mask,
+                        position_ids=position_ids,
+                        past_key_values=past_key_values,
+                        use_cache=use_cache,
+                        cache_position=cache_position,
+                        position_embeddings=position_embeddings,
+                        **kwargs,
+                    )
+                pass
+            finally:
+                for hook in router_hooks:
+                    hook.remove()
+            if all_router_logits is not None:
+                all_router_logits = tuple(all_router_logits)
             hidden_states = self.norm(hidden_states)
 
             if output_hidden_states:
@@ -3061,6 +3292,7 @@ def patch_GptOssModel():
                 "last_hidden_state": hidden_states,
                 "past_key_values": past_key_values,
                 "hidden_states": all_hidden_states,
+                "router_logits": all_router_logits,
             })
 
     patch_function(transformers.models.gpt_oss.modeling_gpt_oss.GptOssModel, "forward", forward, match_level = "relaxed")
@@ -3567,6 +3799,10 @@ def patch_gpt_oss_for_grpo(phase="post_compile"):
             **kwargs,
         ):
             # This Unsloth Zoo code section is licensed under AGPL3
+
+            # Generation passes a per-type mask mapping load_balancing_loss_func cannot read, and no labels.
+            if isinstance(attention_mask, dict) and labels is None:
+                kwargs["output_router_logits"] = False
 
             RETURN_HIDDEN_STATES = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
 

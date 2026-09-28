@@ -34,6 +34,7 @@ import importlib.machinery
 import importlib.util
 import numpy as np
 import os
+import stat
 import torch
 import subprocess
 import types
@@ -148,6 +149,9 @@ DISABLED_KEYWORDS = [
     "apply_mask_to_padding_states",  # falcon h1
     "reshape_into_chunks",  # falcon h1
     "pad_tensor_by_size",  # falcon h1
+    # MLA __init__ calls these float helpers under meta init; compiled, they fail on .item()
+    "def yarn_get_mscale(",
+    "def yarn_apply_mscale(",
 ]
 
 DISABLE_COMPILE_FUNCTIONS = [
@@ -177,7 +181,22 @@ DISABLE_COMPILE_FUNCTIONS = [
     "get_vision_window_index",
     "get_vision_interpolation_indices_and_weights",
     "get_vision_bilinear_indices_and_weights",
+
+    # Locally defined grid helpers get their own compile decorators. Listing them
+    # disables helper compilation and allows graph breaks in their callers.
+    # Keep temporal_merge_index listed: it fails on supported torch 2.9.1 even
+    # though it traces on 2.10.0 and 2.13.0.
+    "get_vision_pixel_shuffle_index",   # muse_glimmer
+    "get_vision_frame_index",           # kimi_k25
+    "get_vision_temporal_merge_index",  # kimi_k25
 ]
+
+
+# Per model_type DISABLE_COMPILE_FUNCTIONS. deepseek_v4 rope: dynamic = True Inductor backward of its
+# trailing `x[..., -rope_dim:]` slice reads out of bounds, giving wrong / NaN grads (pytorch#198553).
+DISABLE_COMPILE_MODEL_FUNCTIONS = {
+    "deepseek_v4": ["apply_rotary_pos_emb"],
+}
 
 
 def calls_disable_compile_function(source, disable_compile_functions):
@@ -192,6 +211,48 @@ def calls_disable_compile_function(source, disable_compile_functions):
     )
 
 
+def function_has_tensor_inputs(source: str) -> bool:
+    """False when every parameter has a non-tensor annotation: nothing for Dynamo to trace."""
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except Exception:
+        return True
+    function = next((n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))), None)
+    if function is None:
+        return True
+    args = function.args
+    if args.vararg is not None or args.kwarg is not None:
+        return True
+    positional = list(args.posonlyargs) + list(args.args)
+    parameters = positional + list(args.kwonlyargs)
+    if len(parameters) == 0:
+        return True
+    if parameters[0].arg in ("self", "cls"):
+        return True
+    # A literal default types an unannotated parameter; anything else may be a tensor.
+    defaults = {}
+    for parameter, default in zip(positional[len(positional) - len(args.defaults):], args.defaults):
+        defaults[parameter.arg] = default
+    for parameter, default in zip(args.kwonlyargs, args.kw_defaults):
+        if default is not None:
+            defaults[parameter.arg] = default
+    scalar_names = {"int", "float", "bool", "str", "bytes", "None", "list", "tuple", "dict", "set", "Sequence", "Iterable", "Mapping", "device", "dtype"}
+    for parameter in parameters:
+        if parameter.annotation is None:
+            default = defaults.get(parameter.arg)
+            if isinstance(default, ast.Constant) and not isinstance(default.value, type(Ellipsis)):
+                continue
+            return True
+        annotation = ast.unparse(parameter.annotation)
+        names = set(re.findall(r"[A-Za-z_][A-Za-z_0-9]*", annotation))
+        if "Tensor" in annotation or "tensor" in annotation:
+            return True
+        if not names <= scalar_names | {"Optional", "Union", "List", "Tuple", "Dict", "Set", "torch", "typing"}:
+            return True
+    return False
+pass
+
+
 def calls_mask_creation_function(source):
     """`transformers.masking_utils` `create*` factories that `source` CALLS.
 
@@ -201,6 +262,31 @@ def calls_mask_creation_function(source):
     literal this replaced stopped matching the moment transformers added a kwarg.
     Names come from the installed transformers, so no version gate is needed."""
     return calls_disable_compile_function(source, get_mask_functions())
+
+
+def has_data_dependent_call(source):
+    """`.nonzero()` / `.tolist()` / `.item()`: unguardable under fullgraph = True."""
+    return (
+        ".nonzero()" in source
+        or ".tolist()" in source
+        or ".item()" in source
+    )
+
+
+def data_dependent_helpers(modeling_file, called_functions):
+    """Helpers the module forward screen misses (e.g. Qwen3-Omni chunk_and_pad_features)."""
+    found = []
+    for name in called_functions:
+        function = getattr(modeling_file, name, None)
+        if function is None or inspect.isclass(function):
+            continue
+        try:
+            source = inspect.getsource(function)
+        except Exception:
+            continue
+        if has_data_dependent_call(source):
+            found.append(name)
+    return found
 
 
 # Re-exported from .model_lists so callers can keep using
@@ -1536,11 +1622,37 @@ def _set_mode_by_descriptor(descriptor, location, mode):
 pass
 
 def _write_bytes_durably(location, new_write_bytes):
-    """Write and fsync. Buffered, so a short write is retried rather than lost."""
-    with open(location, "wb") as file:
-        file.write(new_write_bytes)
-        file.flush()
-        os.fsync(file.fileno())
+    """Write and fsync, refusing to follow a link out of the compiled cache.
+
+    The cache path and the generated module names are both predictable, so a
+    co-located user can plant a symlink at one. O_NOFOLLOW turns that into an
+    OSError, which sends the caller to _replace_compiled_cache_file, and that lands
+    on the name rather than through it; the in-place path is given up only when it is
+    unsafe. The fstat is needed too, since O_NOFOLLOW says nothing about a FIFO or a
+    device node. Where the constant does not exist (Windows) there is no atomic
+    no-follow open and an lstat first is only a time of check, so the in-place path
+    is not attempted at all.
+    """
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    if not no_follow:
+        raise OSError(f"Unsloth: no O_NOFOLLOW on this platform: replacing `{location}` instead of writing in place.")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    flags |= no_follow
+    flags |= getattr(os, "O_BINARY", 0)
+    # A FIFO planted here would otherwise block forever waiting for a reader.
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(location, flags, 0o644)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError(f"Unsloth: refusing to write `{location}`: not a regular file.")
+        with os.fdopen(descriptor, "wb") as file:
+            descriptor = None
+            file.write(new_write_bytes)
+            file.flush()
+            os.fsync(file.fileno())
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 pass
 
 def _write_compiled_cache_file(function_location, new_write_bytes):
@@ -1828,6 +1940,7 @@ def create_new_function(
             "        forward_native_grouped_mm,\n"
             "        forward_triton_grouped_gemm,\n"
             "        forward_native_moe_loop,\n"
+            "        _gate_up_is_interleaved,\n"
             "    )\n"
             "except Exception:\n"
             "    pass\n"
@@ -4308,6 +4421,26 @@ def _patch_lora_input_cast(source, force_float32 = None):
 pass
 
 
+def _patch_lora_base_layer_input_cast(source):
+    # Outside autocast, match x to a float base weight (fp32 SigLIP under fp16); never to 4-bit / FP8 storage ("Promotion for Float8 Types is not supported").
+    _base_layer_call = "result = self.base_layer(x, *args, **kwargs)"
+    _m = re.search(r'^( *)' + re.escape(_base_layer_call), source, re.MULTILINE)
+    if not _m:
+        return source
+    _ind = _m.group(1)
+    return source.replace(
+        _base_layer_call,
+        f"if not torch.is_autocast_enabled() and hasattr(self.base_layer, 'weight') "
+        f"and self.base_layer.weight is not None "
+        f"and not hasattr(self.base_layer.weight, 'quant_state') "
+        f"and self.base_layer.weight.is_floating_point() "
+        f"and self.base_layer.weight.element_size() > 1 "
+        f"and x.dtype != self.base_layer.weight.dtype:\n"
+        f"{_ind}    x = x.to(self.base_layer.weight.dtype)\n"
+        f"{_ind}{_base_layer_call}",
+    )
+
+
 def patch_lora_forwards(torch_compile_options):
     # All Unsloth Zoo code licensed under LGPLv3
     Linear_LoRA_Layers = get_lora_layer_modules()
@@ -4368,9 +4501,13 @@ def patch_lora_forwards(torch_compile_options):
 
         # Check failed upcasting
         source = _patch_lora_input_cast(source)
+        # getsource unwrapped the integer-input wrapper, so on 4-bit re-add the cast inline.
+        check_forward_args = "self._check_forward_args(x, *args, **kwargs)"
+        integer_input_inline = "4bit" in child.lower() and check_forward_args in source
         source = source.replace(
-            "self._check_forward_args(x, *args, **kwargs)",
-            "",
+            check_forward_args,
+            "if not x.is_floating_point(): x = _unsloth_lora_integer_input(self, x)"
+            if integer_input_inline else "",
         )
 
         if hash(source) != old_hash:
@@ -4397,25 +4534,8 @@ def patch_lora_forwards(torch_compile_options):
                     "    return base_layer(x, *args, **kwargs)\n"
                 )
 
-            # Fix for fp16 + non-quantized base layers (e.g. SiGLIP vision encoder):
-            # When autocast is disabled and base_layer has float32 weights,
-            # cast x to match the weight dtype to prevent dtype mismatch.
             # For 8-bit layers, the base_layer call was already replaced above.
-            # For 4-bit layers, weight.dtype is uint8 (packed quantized bytes),
-            # so we must skip the cast to avoid corrupting input values.
-            _base_layer_call = "result = self.base_layer(x, *args, **kwargs)"
-            _m = re.search(r'^( *)' + re.escape(_base_layer_call), source, re.MULTILINE)
-            if _m:
-                _ind = _m.group(1)
-                source = source.replace(
-                    _base_layer_call,
-                    f"if not torch.is_autocast_enabled() and hasattr(self.base_layer, 'weight') "
-                    f"and self.base_layer.weight is not None "
-                    f"and not hasattr(self.base_layer.weight, 'quant_state') "
-                    f"and x.dtype != self.base_layer.weight.dtype:\n"
-                    f"{_ind}    x = x.to(self.base_layer.weight.dtype)\n"
-                    f"{_ind}{_base_layer_call}",
-                )
+            source = _patch_lora_base_layer_input_cast(source)
 
             # Fix for VARIANT_KWARG_KEYS (peft >= 0.18.0) - import from canonical source
             # if used in source but not available in parent module.
@@ -4429,6 +4549,11 @@ def patch_lora_forwards(torch_compile_options):
                     "    VARIANT_KWARG_KEYS = ['alora_offsets']\n"
                 )
 
+            if integer_input_inline:
+                extra_prepend += (
+                    "\nfrom unsloth_zoo.temporary_patches.misc import "
+                    "_lora_integer_input as _unsloth_lora_integer_input\n"
+                )
             forward = create_new_function(
                 f"{child}_peft_forward",
                 compiled_lora_forward + source,
@@ -4437,10 +4562,18 @@ def patch_lora_forwards(torch_compile_options):
                 prepend=f"\n{variant_kwarg_import}torch_compile_options = {torch_compile_options}\n"
                 + extra_prepend,
             ).unsloth_forward
+            if integer_input_inline:
+                forward._unsloth_integer_input = True
             exec(f"{parent}.{child}.forward = forward", globals(), locals())
         else:
             could_not_replace_modules.append(parent)
     pass
+    try:
+        from unsloth_zoo.temporary_patches.misc import patch_peft_lora_integer_input
+
+        patch_peft_lora_integer_input()
+    except Exception:
+        pass
     if success <= 5:
         print("Unsloth: Not an error, but could not optimize some PEFT modules.")
 
@@ -4902,7 +5035,11 @@ def patch_output_capture_targets(modeling_file, replacement_classes=None):
     try:
         from transformers.utils.output_capturing import OutputRecorder
     except ImportError:
-        return set()
+        # transformers 4.5x keeps it in generic; without it replaced classes are never captured.
+        try:
+            from transformers.utils.generic import OutputRecorder
+        except ImportError:
+            return set()
 
     replacement_classes = replacement_classes or {}
     target_names = set()
@@ -5249,6 +5386,7 @@ def unsloth_compile_transformers(
     # Later `eval(model_location)` calls need `transformers` bound in globals
     exec("import transformers", globals())
     disable_compile_functions = set(DISABLE_COMPILE_FUNCTIONS)
+    disable_compile_functions.update(DISABLE_COMPILE_MODEL_FUNCTIONS.get(model_type, ()))
 
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__"):
         # Get __UNSLOTH_SUPPORTS_SDPA__
@@ -5380,8 +5518,8 @@ def unsloth_compile_transformers(
     pass
     UNSLOTH_FULLGRAPH = UNSLOTH_FULLGRAPH == "1"
 
-    # Patch PEFT lora forwards
-    if (not disable) and fast_lora_forwards:
+    # Gated on full disable only: the addmm forward needs no torch.compile, and PEFT's own runs fp32 GEMMs.
+    if (not full_disable) and fast_lora_forwards:
         print("Unsloth: Patching LoRA to make it faster")
         patch_lora_forwards(torch_compile_options)
     pass
@@ -5614,6 +5752,16 @@ def unsloth_compile_transformers(
             called_functions.append(function)
     pass
 
+    # torch_compile_with_fallback only falls back on recompile limits, so these must be disabled.
+    for function in data_dependent_helpers(modeling_file, called_functions):
+        if function not in disable_compile_functions:
+            print(
+                f"Unsloth: Will not compile function {function} since "
+                f"data-dependent operations are done."
+            )
+            disable_compile_functions.add(function)
+    pass
+
     # Check if fullgraph can be used
     torch_modules = {x: True for x in torch_modules}
     for module in torch_modules.keys():
@@ -5820,11 +5968,7 @@ def unsloth_compile_transformers(
         # Tier 2: MoE expert dispatch via torch.where + index_add
         #   1-arg torch.where returns data-dependent indices; combined with
         #   index_add this is the standard MoE routing loop pattern
-        if (
-            ".nonzero()" in source
-            or ".tolist()" in source
-            or ".item()" in source
-        ):
+        if has_data_dependent_call(source):
             print(
                 f"Unsloth: Will not compile {module} since data-dependent operations are done."
             )
@@ -6457,6 +6601,11 @@ def unsloth_compile_transformers(
                     bad_reason = (
                         f"it builds attention masks via {', '.join(mask_builders)}"
                     )
+            pass
+            if not bad and module not in disable_compile_functions:
+                if not function_has_tensor_inputs(source):
+                    bad = True
+                    bad_reason = "it takes no tensor inputs"
             pass
             if not bad:
                 # Functions defined inside an if/else come back indented

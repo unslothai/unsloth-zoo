@@ -39,6 +39,155 @@ def _skip_torch_shim():
         pytest.skip("requires real MLX runtime")
 
 
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("finalize", [False, True])
+def test_single_simd_forward_preserves_each_row(dtype, finalize):
+    _skip_torch_shim()
+    if not mx.metal.is_available():
+        pytest.skip("requires Metal kernels")
+    from unsloth_zoo.mlx.cce import runtime_cce as rt
+
+    mx.random.seed(718)
+    rows, width = 267, 2048
+    targets = mx.where(mx.arange(rows) % 5 == 0, -100, mx.arange(rows) * 17)
+    inputs = [
+        mx.random.normal((rows, width)).astype(dtype), targets,
+        mx.random.uniform(shape=(rows,)), mx.random.uniform(shape=(rows,)),
+        mx.random.normal((rows,)), mx.array([1024], mx.int32),
+        mx.array([-100], mx.int32), mx.array([0.0], mx.float32),
+    ]
+    original = (rt._build_forward_update_finalize_kernel() if finalize
+                else rt._build_forward_update_kernel())
+
+    def unreachable(**kwargs):
+        raise AssertionError("fell back from the single SIMD kernel")
+
+    optimized = rt._with_single_simd_forward(unreachable, finalize)
+    kwargs = dict(
+        inputs=inputs, output_shapes=[(rows,)] * (5 if finalize else 3),
+        output_dtypes=[mx.float32] * (5 if finalize else 3),
+        grid=(rows * 256, 1, 1), threadgroup=(256, 1, 1),
+    )
+    expected, actual = original(**kwargs), optimized(**kwargs)
+    mx.eval(expected, actual)
+    for left, right in zip(expected, actual):
+        assert mx.allclose(left, right, atol=1e-5, rtol=1e-5).item()
+
+
+@pytest.mark.parametrize("frozen,dim", [(False, 512), (False, 1024), (True, 1024)])
+def test_automatic_chunks_reduce_backward_peak(frozen, dim):
+    _skip_torch_shim()
+    if not mx.metal.is_available():
+        # Both halves need Metal: the peak assertion needs Metal memory accounting, and
+        # off-Metal the bf16 LSE accumulates at the logits dtype (the float32 cast in
+        # _forward_chunked_fused_finalize is gated on label smoothing), so the loss moves
+        # with the chunk size and the two plans do not agree.
+        pytest.skip("requires Metal memory accounting")
+    import gc
+    from unsloth_zoo.mlx.cce import _get_runtime_cce
+
+    mx.random.seed(812)
+    hidden = mx.random.normal((512, dim)).astype(mx.bfloat16)
+    weight = (mx.random.normal((16384, dim)) * 0.05).astype(mx.bfloat16)
+    targets = mx.where(mx.arange(512) % 7 == 0, -100, mx.arange(512) * 31)
+    mx.eval(hidden, weight, targets)
+    functions, plans = [], []
+    for chunk in (2048, 0):
+        runtime = _get_runtime_cce(
+            ignore_index=-100, logit_softcap=0, chunk_size=chunk, weight_is_frozen=frozen,
+        )
+        plans.append(runtime._unsloth_get_chunk_plan(hidden, weight)[0])
+        def loss(h, w, runtime=runtime):
+            return runtime(h, w, targets).sum() / 512
+        functions.append(mx.compile(mx.value_and_grad(loss, argnums=0 if frozen else (0, 1))))
+    expected, actual = [fn(hidden, weight) for fn in functions]
+    mx.eval(expected, actual)
+    assert actual[0].item() == pytest.approx(expected[0].item(), abs=2e-5)
+    pairs = [(expected[1], actual[1])] if frozen else zip(expected[1], actual[1])
+    for left, right in pairs:
+        assert mx.allclose(left, right, atol=2e-5, rtol=0.02).item()
+    del expected, actual, left, right, pairs
+    # Only a frozen head is admitted at these shapes, so for the other two the automatic
+    # arm resolves to 2048 and both arms run the identical plan. Comparing their peaks
+    # then measures allocator noise and nothing else: on a macos-15 M1 the [False-1024]
+    # pair, byte-identical work, came back 212941388 against 203504192 and failed. The
+    # numerics above are the whole of what those cells can assert.
+    assert plans[0] == 2048
+    if plans[1] == plans[0]:
+        assert not frozen
+        return
+    peaks = []
+    for fn in functions:
+        gc.collect()
+        mx.synchronize()
+        mx.clear_cache()
+        resident = mx.get_active_memory()
+        mx.reset_peak_memory()
+        result = fn(hidden, weight)
+        mx.eval(result)
+        peaks.append(mx.get_peak_memory() - resident)
+        del result
+    # Reached only when the promotion actually changed the plan, which is the frozen
+    # head. There the wider chunk is supposed to pay for itself, so require a strict
+    # drop rather than a tie.
+    assert plans[1] == 4096 and frozen
+    assert peaks[1] < peaks[0]
+
+
+def test_a_trainable_bfloat16_head_is_not_promoted_to_the_wide_chunk():
+    """The promotion rule itself, as integers.
+
+    The peak assertions above can only discriminate on hardware where the promoted
+    plan is actually worse, which so far is one runner, and they skip entirely off
+    Metal. The rule is a pure integer predicate, so pin it directly: at these shapes
+    a frozen head takes the wide chunk and a trainable bfloat16 head must not, on
+    every device.
+    """
+    _skip_torch_shim()
+    import unsloth_zoo.mlx.cce.runtime_cce as runtime_cce_module
+    from unsloth_zoo.mlx.cce import _get_runtime_cce, clear_cce_cache
+
+    hidden = mx.zeros((512, 512), dtype=mx.bfloat16)
+    weight = mx.zeros((16384, 512), dtype=mx.bfloat16)
+    saved_budget = runtime_cce_module._CHUNK_BUDGET
+    try:
+        # Every budget _get_memory_budget can return, from its 4 MB floor (smallest
+        # supported device) to its 128 MB cap. The answer must not depend on which.
+        for budget_mib in (4, 6, 12, 27, 103, 128):
+            runtime_cce_module._CHUNK_BUDGET = budget_mib * 1024 * 1024
+            clear_cce_cache()
+            plans = {}
+            for frozen in (True, False):
+                runtime = _get_runtime_cce(
+                    ignore_index=-100,
+                    logit_softcap=0.0,
+                    chunk_size=0,
+                    weight_is_frozen=frozen,
+                )
+                plans[frozen] = runtime._unsloth_get_chunk_plan(hidden, weight)[0]
+            assert plans == {True: 4096, False: 2048}, (budget_mib, plans)
+
+            # Label smoothing never promotes, at any shape the unsmoothed path would.
+            # It routes to _fallback_dlogits, whose float32 intermediates the bound
+            # underestimates by 3-4x, so a wider chunk there is unbounded in practice.
+            for frozen in (True, False):
+                for n_tokens in (256, 512, 1024):
+                    smoothed = _get_runtime_cce(
+                        ignore_index=-100,
+                        logit_softcap=0.0,
+                        chunk_size=0,
+                        weight_is_frozen=frozen,
+                        label_smoothing=0.1,
+                    )
+                    plan = smoothed._unsloth_get_chunk_plan(
+                        mx.zeros((n_tokens, 512), dtype=mx.bfloat16), weight,
+                    )[0]
+                    assert plan == 2048, (budget_mib, frozen, n_tokens, plan)
+    finally:
+        runtime_cce_module._CHUNK_BUDGET = saved_budget
+        clear_cce_cache()
+
+
 def test_runtime_cce_zero_tokens_with_non_empty_targets_raises():
     # hidden=0 with non-empty targets must raise, not silently drop labels.
     _skip_torch_shim()
@@ -506,9 +655,6 @@ def test_quantized_runtime_cce_rejects_missing_affine_biases():
 
 
 def test_label_smoothing_matches_closed_form():
-    # label_smoothing>0 disables the Metal kernels and takes the python chunk
-    # path with the HF LabelSmoother loss/gradient (eps=0 kernel-path no-op is
-    # covered by recorded validation).
     _skip_torch_shim()
     from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
 
@@ -571,3 +717,291 @@ def test_runtime_cce_backward_peak_memory(quantized, budget_mib):
     peak = mx.get_peak_memory() - resident
     assert mx.isfinite(result[0]).item()
     assert peak < budget_mib * 1024**2, f"CCE backward used {peak / 1024**2:.2f} MiB"
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+@pytest.mark.parametrize("softcap", [0.0, 5.0])
+def test_frozen_head_gradient_is_built_in_the_forward(monkeypatch, quantized, softcap):
+    _skip_torch_shim()
+    if not mx.metal.is_available():
+        # precompute_hidden_gradient is admitted only when the Metal kernels exist, so
+        # off Metal the loss-only path is returned and `calls == [1]` fails rather than
+        # skips. The silent fallback is the documented contract, not a defect.
+        pytest.skip("requires Metal kernels")
+    from unsloth_zoo.mlx.cce import runtime_cce
+
+    mx.random.seed(5)
+    hidden = mx.random.normal((67, 64)) * 0.5
+    weight = mx.random.normal((4099, 64)) * 0.3
+    # Targets in every chunk, ignored rows, and one out-of-range label.
+    targets = mx.where(mx.arange(67) % 11 == 7, -100, (mx.arange(67) * 613) % 4099)
+    targets = mx.where(mx.arange(67) == 30, 4099, targets)
+    cotangent = mx.linspace(-0.7, 0.9, 67)
+    if quantized:
+        head = mx.quantize(weight, group_size=64, bits=4)
+        weight = mx.dequantize(*head, group_size=64, bits=4)
+        loss = runtime_cce.make_chunked_cross_entropy_loss(
+            quantized=True, group_size=64, bits=4, chunk_size=1024, logit_softcap=softcap,
+            precompute_hidden_gradient=True)[0]
+    else:
+        head = (weight,)
+        loss = runtime_cce.make_chunked_cross_entropy_loss(
+            weight_is_frozen=True, chunk_size=1024, logit_softcap=softcap, precompute_hidden_gradient=True)[0]
+    reference = runtime_cce.make_chunked_cross_entropy_loss(chunk_size=1024, logit_softcap=softcap)[0]
+
+    def run(fn, h, y, g, *args):
+        return mx.value_and_grad(lambda x: (fn(x, *args, y) * g).sum())(h)
+
+    calls, forward = [], runtime_cce._forward_with_hidden_gradient
+    monkeypatch.setattr(runtime_cce, "_forward_with_hidden_gradient",
+                        lambda *args, **kwargs: (calls.append(1), forward(*args, **kwargs))[1])
+    actual = run(loss, hidden, targets, cotangent, *head)
+    mx.eval(actual)
+    assert calls == [1]
+    compiled = mx.compile(lambda *args: run(loss, *args))(hidden, targets, cotangent, *head)
+    expected = run(reference, hidden, targets, cotangent, mx.stop_gradient(weight))
+    mx.eval(compiled, expected)
+    assert mx.array_equal(loss(hidden, *head, targets), reference(hidden, weight, targets), equal_nan=True).item()
+    for got in (actual, compiled):
+        assert mx.all(mx.isnan(got[1][30])).item()
+        assert mx.allclose(got[1], expected[1], atol=2e-6, rtol=0, equal_nan=True).item()
+
+
+@pytest.mark.parametrize("frozen", [False, True])
+def test_vlm_cce_passes_a_frozen_dense_head_to_the_runtime_cce(monkeypatch, frozen):
+    """The dense VLM loss must tell the runtime whether the head is trainable.
+
+    This lives here rather than beside the other VLM tests because that file runs on
+    the torch shim, whose Module.freeze/unfreeze are `return self` no-ops
+    (tests/mlx_simulation/mlx_nn_stub.py). Under the shim trainable_parameters() still
+    reports lm_head.weight, so the freeze below cannot be read back and the frozen case
+    can never be observed. Real MLX runs the whole chain: freeze -> trainable_parameters
+    -> _is_lm_head_trainable -> _skip_weight_grad -> weight_is_frozen.
+    """
+    _skip_torch_shim()
+    from unsloth_zoo.mlx import utils as U
+
+    class _Backbone(U.nn.Module):
+        pass
+
+    class _LM(U.nn.Module):
+        def __call__(self, x):
+            return x
+
+    class _VLM(U.nn.Module):
+        def __init__(self):
+            super().__init__()
+            backbone = _Backbone()
+            backbone.embed_tokens = U.nn.Embedding(96, 32)
+            language_model = _LM()
+            language_model.model = backbone
+            language_model.lm_head = U.nn.Linear(32, 96, bias=False)
+            self.language_model = language_model
+
+        def get_input_embeddings(self):
+            return None
+
+    model = _VLM()
+    if frozen:
+        adapter = U.nn.Linear(32, 32)
+        adapter.lora_a = U.mx.zeros((4, 32))
+        adapter.lora_b = U.mx.zeros((32, 4))
+        model.language_model.model.proj = adapter
+        model.freeze()
+        adapter.unfreeze(keys=["lora_a", "lora_b"])
+    # The derivation is left real. Pinning it here would only re-assert the literal
+    # `frozen` and would stop the nested `language_model.lm_head` head-prefix
+    # resolution from being covered at all.
+    assert U._is_lm_head_trainable(model) is (not frozen)
+
+    factories = []
+    monkeypatch.setattr(U, "_get_runtime_cce", lambda **kwargs: factories.append(kwargs))
+    U.make_vlm_cce_loss_fn(model)
+    assert {kwargs.get("weight_is_frozen") for kwargs in factories} == {frozen}
+    # A frozen head also builds the training-mode runtime that precomputes the hidden
+    # gradient, which is this PR's actual optimisation. Ordered, not collapsed to a set:
+    # a bare set would still pass with the training arm deleted outright.
+    assert [kwargs.get("precompute_hidden_gradient") for kwargs in factories] == (
+        [None, True] if frozen else [None]
+    )
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+def test_saturated_softcap_stays_finite_on_the_training_path(quantized):
+    _skip_torch_shim()
+    from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
+
+    # Ratios far past the saturation branch, where fast::tanh may not saturate.
+    hidden = mx.full((64, 128), 300, dtype=mx.float16)
+    weight = mx.full((8192, 128), 300, dtype=mx.float16)
+    targets = (mx.arange(64) * 61).astype(mx.int32)
+    arguments = (hidden, weight, targets)
+    if quantized:
+        packed, scales, biases = mx.quantize(weight, group_size=64, bits=4)
+        arguments = (hidden, packed, scales, biases, targets)
+    runtime, _ = make_chunked_cross_entropy_loss(
+        ignore_index=-100, logit_softcap=9.0, chunk_size=2048,
+        quantized=quantized, group_size=64 if quantized else None,
+        bits=4 if quantized else None,
+    )
+    losses, grad = mx.value_and_grad(
+        lambda h: runtime(h, *arguments[1:]).sum()
+    )(hidden)
+    mx.eval(losses, grad)
+    assert mx.all(mx.isfinite(losses)).item()
+    assert mx.all(mx.isfinite(grad)).item()
+    # Every logit saturates to the same cap, so the loss is a uniform log V.
+    assert losses.item() == pytest.approx(64 * math.log(8192), rel=1e-3)
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+@pytest.mark.parametrize("ratio", [44.2, 60.0])
+def test_finite_logits_past_the_cap_match_the_saturated_loss(dtype, ratio):
+    _skip_torch_shim()
+    if not mx.metal.is_available():
+        pytest.skip("requires Metal kernels")
+    from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
+
+    # Finite logits: even classes at ratio * cap, odd classes at 0. Near 44 fast::tanh
+    # returns 0 (a finite, wrong loss) and past about 44.4 it returns NaN.
+    cap, rows, dim, vocab = 9.0, 64, 128, 8192
+    hidden = mx.ones((rows, dim), dtype=dtype)
+    even = (mx.arange(vocab) % 2 == 0)[:, None]
+    weight = mx.where(even, ratio * cap / dim, 0.0).astype(dtype) * mx.ones((vocab, dim), dtype=dtype)
+    targets = (mx.arange(rows) * 2).astype(mx.int32)
+    runtime, _ = make_chunked_cross_entropy_loss(
+        ignore_index=-100, logit_softcap=cap, chunk_size=2048,
+    )
+    losses, grad = mx.value_and_grad(lambda h: runtime(h, weight, targets).sum())(hidden)
+    mx.eval(losses, grad)
+    assert mx.all(mx.isfinite(grad)).item()
+    # Even classes saturate to the cap, odd ones stay at 0.
+    expected = math.log(vocab / 2 * (1.0 + math.exp(-cap)))
+    assert losses.item() == pytest.approx(rows * expected, rel=1e-4)
+
+
+@pytest.mark.parametrize("quantized, eps, softcap", [(False, 0.1, 0.0), (False, 0.1, 5.0), (False, 1.0, 5.0), (True, 0.1, 5.0)])
+def test_compiled_label_smoothing_across_chunks(quantized, eps, softcap):
+    _skip_torch_shim()
+    from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
+
+    mx.random.seed(29)
+    dtype = mx.bfloat16 if quantized else mx.float32
+    hidden = (mx.random.normal((5, 64)) + 0.2).astype(dtype)
+    weight = (mx.random.normal((32768, 64)) * 0.05 + 0.1).astype(dtype)
+    targets = mx.array([1, 32767, 8203, -100, 20000], dtype=mx.int32)
+    side = ()
+    if quantized:
+        weight, scales, biases = mx.quantize(weight, group_size=64, bits=4)
+        side = (scales, biases)
+    mx.eval(hidden, weight, targets, *side)
+    cce, _ = make_chunked_cross_entropy_loss(
+        chunk_size=2048, label_smoothing=eps, logit_softcap=softcap,
+        quantized=quantized, group_size=64 if quantized else None, bits=4 if quantized else None,
+    )
+
+    def reference(h):
+        logits = (mx.quantized_matmul(h, weight, *side, group_size=64, bits=4)
+                  if quantized else h @ weight.T)
+        if softcap:
+            cap = mx.array(softcap, dtype=mx.float32)
+            logits = cap * mx.tanh(logits / cap)
+        logits = logits.astype(mx.float32)
+        target = mx.take_along_axis(logits, mx.maximum(targets, 0)[:, None], -1).squeeze(-1)
+        losses = mx.logsumexp(logits, -1) - (1 - eps) * target - eps * logits.mean(-1)
+        return mx.where(targets != -100, losses, 0).sum()
+
+    loss, grad = mx.compile(mx.value_and_grad(lambda h: cce(h, weight, *side, targets).sum()))(hidden)
+    expected, expected_grad = mx.value_and_grad(reference)(hidden)
+    mx.eval(loss, grad, expected, expected_grad)
+    assert loss.item() == pytest.approx(expected.item(), rel=2e-5)
+    relative_error = (mx.max(mx.abs(grad - expected_grad)) /
+                      mx.maximum(mx.max(mx.abs(expected_grad)), 1e-8)).item()
+    # Quantized dH accumulates the vocabulary chunks in bf16.
+    assert relative_error < (0.05 if quantized else 2e-4)
+    assert mx.all(grad[3] == 0).item()
+
+
+def test_compiled_label_smoothing_softcap_adds_no_memory():
+    _skip_torch_shim()
+    from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
+
+    mx.random.seed(31)
+    hidden = (mx.random.normal((1024, 256)) * 0.05).astype(mx.bfloat16)
+    weight = (mx.random.normal((65536, 256)) * 0.02).astype(mx.bfloat16)
+    targets = mx.random.randint(0, 65536, (1024,))
+    mx.eval(hidden, weight, targets)
+
+    def peak(softcap):
+        cce, _ = make_chunked_cross_entropy_loss(chunk_size=4096, label_smoothing=0.1, logit_softcap=softcap)
+        step = mx.compile(mx.value_and_grad(lambda h: cce(h, weight, targets).sum()))
+        mx.eval(step(hidden))
+        mx.synchronize()
+        resident = mx.get_active_memory()
+        mx.reset_peak_memory()
+        mx.eval(step(hidden))
+        mx.synchronize()
+        return mx.get_peak_memory() - resident
+
+    assert peak(30.0) <= 1.05 * peak(0.0)
+
+
+@pytest.mark.parametrize("ratio", [44.2, 60.0])
+def test_smoothed_finite_logits_past_the_cap_match_the_saturated_loss(ratio):
+    _skip_torch_shim()
+    if not mx.metal.is_available():
+        pytest.skip("requires Metal kernels")
+    from unsloth_zoo.mlx.cce import make_chunked_cross_entropy_loss
+
+    # The smoothing kernels cap their own logits, so they need the same saturation
+    # the eps=0 kernels use: raw fast::tanh gives 576.70 here at 44.2 and NaN at 60.
+    cap, eps, rows, dim, vocab = 9.0, 0.1, 64, 128, 8192
+    hidden = mx.ones((rows, dim), dtype=mx.float32)
+    even = (mx.arange(vocab) % 2 == 0)[:, None]
+    weight = mx.where(even, ratio * cap / dim, 0.0).astype(mx.float32) * mx.ones((vocab, dim), dtype=mx.float32)
+    targets = (mx.arange(rows) * 2).astype(mx.int32)
+    runtime, _ = make_chunked_cross_entropy_loss(
+        ignore_index=-100, logit_softcap=cap, chunk_size=2048, label_smoothing=eps,
+    )
+    losses, grad = mx.value_and_grad(lambda h: runtime(h, weight, targets).sum())(hidden)
+    mx.eval(losses, grad)
+    assert mx.all(mx.isfinite(grad)).item()
+    # Even classes saturate to the cap, odd ones stay at 0; the target is a capped class.
+    lse = math.log(vocab / 2 * (1.0 + math.exp(-cap))) + cap
+    expected = rows * (lse - (1 - eps) * cap - eps * (cap / 2))
+    assert losses.item() == pytest.approx(expected, rel=1e-4)
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+def test_lora_head_backward_recomputes_logits_past_the_budget(monkeypatch, quantized):
+    _skip_torch_shim()
+    if not mx.metal.is_available():
+        pytest.skip("requires Metal kernels")
+    from unsloth_zoo.mlx.cce import runtime_cce
+
+    mx.random.seed(6)
+    hidden = (mx.random.normal((64, 64)) * 0.2).astype(mx.bfloat16)
+    weight = (mx.random.normal((4096, 64)) * 0.05).astype(mx.bfloat16)
+    lora_a = (mx.random.normal((64, 4)) * 0.05).astype(mx.bfloat16)
+    lora_b = (mx.random.normal((4, 4096)) * 0.05).astype(mx.bfloat16)
+    bias = (mx.random.normal((4096,)) * 0.05).astype(mx.bfloat16)
+    targets = mx.random.randint(0, 4096, (64,)).astype(mx.int32)
+    head = (*mx.quantize(weight, group_size=64, bits=4),) if quantized else (weight, None, None)
+    loss = runtime_cce.make_lora_head_cce(
+        chunk_size=1024, adapter_scale=2.0, logit_scale=0.5,
+        **(dict(group_size=64, bits=4) if quantized else {}))
+    slices, original = [], runtime_cce._unmerged_slice
+    monkeypatch.setattr(runtime_cce, "_unmerged_slice",
+                        lambda *args, **kwargs: (slices.append(args[1]), original(*args, **kwargs))[1])
+
+    grads = []
+    for threshold in (1 << 40, 1):
+        monkeypatch.setattr(runtime_cce, "_RECOMPUTE_LOGITS_BYTES", threshold)
+        grad = mx.compile(mx.grad(
+            lambda h, a, b, c: loss(h, *head, h @ a, b, c, targets).astype(mx.float32).sum(),
+            argnums=(0, 1, 2, 3)))
+        grads.append(grad(hidden, lora_a, lora_b, bias))
+        mx.eval(grads[-1])
+        assert sorted(set(slices)) == ([] if threshold > 1 else [0, 1024, 2048, 3072])
+    for want, got in zip(*grads):
+        assert mx.array_equal(want, got).item()

@@ -17,11 +17,13 @@ import torch
 import torch.nn.functional as F
 import contextlib
 import json
+import math
 import os
 import shutil
 import stat
 import tempfile
 import sys
+import time
 import warnings
 import importlib
 import importlib.util
@@ -358,9 +360,8 @@ def _grouped_mm_with_backward_fix(
 
     Forcing weight.contiguous() copies the frozen base stack (~805 MB for gate_up on Qwen3-30B,
     ~57% of MoE GPU time) every step. torch._grouped_mm takes the non-contiguous view directly,
-    but some CUDA builds silently miscompute it (pytorch/pytorch#186365), so we only skip the
-    copy when a one-time probe proves the view path matches the contiguous one; else we keep the
-    always-correct copy. Falls back to a per-group matmul when the device has no
+    and a one-time probe confirms the view matches the contiguous copy on this device before we
+    skip the copy; else we keep the copy. Falls back to a per-group matmul when the device has no
     torch._grouped_mm, and on the 16-byte stride error. Bit-exact vs the always-contiguous
     path in forward and backward.
     """
@@ -372,7 +373,7 @@ def _grouped_mm_with_backward_fix(
     if not _check_torch_grouped_mm_supported():
         return _manual_grouped_mm(inputs, weight, offsets)
     if not _transposed_view_grouped_mm_is_safe():
-        weight = weight.contiguous()   # #186365: view path unproven on this build -> safe copy
+        weight = weight.contiguous()   # view path unproven on this device -> safe copy
     try:
         return torch._grouped_mm(inputs, weight, offs=offsets)
     except RuntimeError as exc:
@@ -695,15 +696,73 @@ def _source_pins_large_dequant(source) -> bool:
         return False
 
 
-def _moe_recompute_enabled(source) -> bool:
+def _in_gc_recompute() -> bool:
+    try:
+        from unsloth_zoo.gradient_checkpointing import in_gradient_checkpoint_recompute
+        return bool(in_gradient_checkpoint_recompute())
+    except Exception:
+        return False
+
+
+_MOMENTARY_PIN_HEADROOM = 2.0   # free memory must cover this many copies of one layer's stack
+
+
+def _momentary_pin_fits(source, dtype = None) -> bool:
+    """Whether one layer's dequantized stack fits in free + cached-unused memory; unmeasurable means False."""
+    try:
+        param = source
+        while hasattr(param, "base_layer"):
+            param = param.base_layer
+        device = param.device
+        backend = getattr(torch, device.type, None) if device.type in ("cuda", "xpu") else None
+        if backend is None or not callable(getattr(backend, "mem_get_info", None)):
+            return False
+        shape = _logical_expert_shape(param)
+        if not shape:
+            return False
+        dtype = dtype or getattr(getattr(param, "quant_state", None), "dtype", None) or torch.bfloat16
+        need = math.prod(int(d) for d in shape) * dtype.itemsize
+        # Cached briefly: mem_get_info per source per replay costs more than the dequant it saves.
+        key = (device.type, device.index, need, _MOMENTARY_PIN_HEADROOM)
+        now = time.monotonic()
+        hit = _MOMENTARY_PIN_FITS_CACHE.get(key)
+        if hit is not None and now - hit[1] < _MOMENTARY_PIN_FITS_TTL_S:
+            return hit[0]
+        free, _ = backend.mem_get_info(device)
+        free += backend.memory_reserved(device) - backend.memory_allocated(device)
+        fits = free >= _MOMENTARY_PIN_HEADROOM * need
+        _MOMENTARY_PIN_FITS_CACHE[key] = (fits, now)
+        return fits
+    except Exception:
+        return False
+
+
+_MOMENTARY_PIN_FITS_CACHE = {}
+_MOMENTARY_PIN_FITS_TTL_S = 0.5
+
+
+def _moe_recompute_enabled(source, dtype = None) -> bool:
     """Whether to recompute the dequantized base stack in backward (True) or pin it
     for reuse (False). Only a frozen, grouped-mm-capable base can be recomputed; for
-    everything else the pinned eager path is used. A bnb 4-bit base prefers recompute
-    even under gradient checkpointing so the momentary pin never holds the full bf16
-    expert dequant (see _source_pins_large_dequant)."""
-    return _base_is_recomputable(source) and _moe_recompute_default(
-        prefer_memory = _source_pins_large_dequant(source)
-    )
+    everything else the pinned eager path is used. A bnb 4-bit base recomputes unless
+    UNSLOTH_MOE_GC_REPLAY_PIN=1 and, inside a gradient-checkpoint replay, the stack fits:
+    the pin then saves a dequant for the same layer's backward but raises peak memory."""
+    if not _base_is_recomputable(source):
+        return False
+    override = os.environ.get("UNSLOTH_MOE_RECOMPUTE")
+    if override == "1":
+        return True
+    if override == "0":
+        return False
+    if _source_pins_large_dequant(source):
+        if (
+            os.environ.get("UNSLOTH_MOE_GC_REPLAY_PIN") == "1"
+            and _in_gc_recompute()
+            and _momentary_pin_fits(source, dtype = dtype)
+        ):
+            return False
+        return True
+    return _moe_recompute_default()
 
 
 class _GroupedMMRecompute(torch.autograd.Function):
@@ -741,21 +800,39 @@ _TORCH_GROUPED_MM_AVAILABLE = hasattr(torch, "_grouped_mm")
 _TORCH_GROUPED_MM_SUPPORTED = None
 
 
+@torch.compiler.disable
+def _run_probe_eagerly(probe):
+    """Graph-break so lazy probes never run on FakeTensors, whose meta check can reject what the real
+    kernel accepts and latch the cached flag False (torch 2.14 `_grouped_mm_fp16_cublaslt_supported` needs CUDA 13.3+)."""
+    return probe()
+
+
+def _grouped_mm_probe_device():
+    # Typed device, not a bare index: an int resolves to the default accelerator, losing this branch.
+    if torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return torch.device("xpu", torch.xpu.current_device())
+    return None
+
+
 def _check_torch_grouped_mm_supported():
     """Check torch._grouped_mm support on the current GPU; a runtime probe is the only reliable check."""
     global _TORCH_GROUPED_MM_SUPPORTED
     if _TORCH_GROUPED_MM_SUPPORTED is not None: return _TORCH_GROUPED_MM_SUPPORTED
-
-    if not _TORCH_GROUPED_MM_AVAILABLE:
+    # Definitive negatives stay traceable so fullgraph traces don't break.
+    if not _TORCH_GROUPED_MM_AVAILABLE or _grouped_mm_probe_device() is None:
         _TORCH_GROUPED_MM_SUPPORTED = False
         return False
+    return _run_probe_eagerly(_probe_torch_grouped_mm_supported)
 
-    # Typed device, not a bare index: an int resolves to the default accelerator, losing this branch.
-    if torch.cuda.is_available():
-        device = torch.device("cuda", torch.cuda.current_device())
-    elif hasattr(torch, "xpu") and torch.xpu.is_available():
-        device = torch.device("xpu", torch.xpu.current_device())
-    else:
+
+def _probe_torch_grouped_mm_supported():
+    global _TORCH_GROUPED_MM_SUPPORTED
+    if _TORCH_GROUPED_MM_SUPPORTED is not None: return _TORCH_GROUPED_MM_SUPPORTED
+
+    device = _grouped_mm_probe_device() if _TORCH_GROUPED_MM_AVAILABLE else None
+    if device is None:
         _TORCH_GROUPED_MM_SUPPORTED = False
         return False
 
@@ -777,9 +854,8 @@ def _check_torch_grouped_mm_supported():
     return _TORCH_GROUPED_MM_SUPPORTED
 
 
-# Some CUDA builds silently miscompute torch._grouped_mm for a transposed bf16 view preceded by a
-# broadcast op (pytorch/pytorch#186365, Blackwell + torch 2.11/2.13). This probe checks the view
-# matches the contiguous copy so _grouped_mm_with_backward_fix can skip the copy only when safe.
+# One-time check that torch._grouped_mm on a transposed bf16 view matches the contiguous copy. Insurance
+# only: pytorch/pytorch#186365 was a usage error (offs must be cumulative group ends), no view miscompute is known.
 _TRANSPOSED_VIEW_GROUPED_MM_SAFE = None
 
 
@@ -787,15 +863,20 @@ def _transposed_view_grouped_mm_is_safe():
     global _TRANSPOSED_VIEW_GROUPED_MM_SAFE
     if _TRANSPOSED_VIEW_GROUPED_MM_SAFE is not None:
         return _TRANSPOSED_VIEW_GROUPED_MM_SAFE
+    if not _TORCH_GROUPED_MM_AVAILABLE or _grouped_mm_probe_device() is None:
+        _TRANSPOSED_VIEW_GROUPED_MM_SAFE = False
+        return False
+    return _run_probe_eagerly(_probe_transposed_view_grouped_mm_is_safe)
+
+
+def _probe_transposed_view_grouped_mm_is_safe():
+    global _TRANSPOSED_VIEW_GROUPED_MM_SAFE
+    if _TRANSPOSED_VIEW_GROUPED_MM_SAFE is not None:
+        return _TRANSPOSED_VIEW_GROUPED_MM_SAFE
 
     safe = False
     try:
-        if torch.cuda.is_available():
-            device = torch.device("cuda", torch.cuda.current_device())
-        elif hasattr(torch, "xpu") and torch.xpu.is_available():
-            device = torch.device("xpu", torch.xpu.current_device())
-        else:
-            device = None
+        device = _grouped_mm_probe_device()
         if _TORCH_GROUPED_MM_AVAILABLE and device is not None:
             E, N, K, M = 4, 64, 32, 32
             # local generator: never touch the process-wide RNG (manual_seed would shift training)
@@ -810,7 +891,7 @@ def _transposed_view_grouped_mm_is_safe():
             ok, ref = True, None
             for _ in range(6):
                 row_wise_max = A.abs().amax(dim=-1, keepdim=True)
-                _ = A / (row_wise_max / 448.0)     # the #186365 trigger (result discarded)
+                _ = A / (row_wise_max / 448.0)     # allocator churn from the #186365 report
                 r_view = torch._grouped_mm(A, w_t, offs=offs)
                 r_contig = torch._grouped_mm(A, w_tc, offs=offs)
                 if (r_view - r_contig).abs().max().item() > 1e-2:   # view disagrees with contiguous
@@ -872,6 +953,26 @@ def _check_grouped_gemm_available():
 
     global _GROUPED_GEMM_AVAILABLE
     if _GROUPED_GEMM_AVAILABLE is not None: return _GROUPED_GEMM_AVAILABLE
+
+    # The kernel asserts `X.device.type == "cuda"` on entry, so importable is not the
+    # same as usable: on a CPU box with unsloth installed this used to answer yes,
+    # select_moe_backend picked "unsloth_triton", and the first expert forward died on
+    # "X and W must be on CUDA" instead of taking the native loop. Asked here rather
+    # than at the call site, the way _check_torch_grouped_mm_supported already refuses
+    # without an accelerator.
+    if not torch.cuda.is_available():
+        _GROUPED_GEMM_AVAILABLE = False
+        return False
+
+    # Triton 3.3 (torch 2.7) lacks tl.make_tensor_descriptor, which the JIT resolves while hashing: use the native loop.
+    try:
+        import triton.language as tl
+        if not hasattr(tl, "make_tensor_descriptor"):
+            _GROUPED_GEMM_AVAILABLE = False
+            return False
+    except Exception:
+        _GROUPED_GEMM_AVAILABLE = False
+        return False
 
     try:
         from unsloth.kernels.moe.grouped_gemm.interface import grouped_gemm, supports_tma
@@ -971,7 +1072,8 @@ def forward_moe_backend(
     backend = select_moe_backend()
     if backend == "grouped_mm":
         return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
-    if backend == "unsloth_triton":
+    # Triton kernels assume split gate_up, SiLU, no bias: interleaved GPT-OSS gate_up takes the eager loop.
+    if backend == "unsloth_triton" and not _gate_up_is_interleaved(self):
         return forward_triton_grouped_gemm(self, hidden_states, top_k_index, top_k_weights)
     return forward_native_moe_loop(self, hidden_states, top_k_index, top_k_weights)
 
@@ -1528,12 +1630,19 @@ def extract_moe_lora_weights_for_grouped_mm(
     )
 
     if canonical_match and reversed_match:
-        if bool(getattr(wrapper, "_did_swap_in_out_features", False)):
-            first_weight, second_weight = _reversed_lora_weights_for_grouped_mm(
+        # Square stacks match both readings by shape, and which layouts PEFT swaps changed in 0.19.0 / 0.19.1: neither flag decides alone.
+        swapped = bool(getattr(wrapper, "_did_swap_in_out_features", False))
+        base = wrapper.get_base_layer() if hasattr(wrapper, "get_base_layer") else None
+        stored_in_out = (
+            getattr(base, "is_transposed", None) is True
+            or bool(getattr(base, "_unsloth_grouped_mm_format", False))
+        )
+        if swapped != stored_in_out:
+            first_weight, second_weight = _canonical_lora_weights_for_grouped_mm(
                 weight_A, weight_B, num_experts, rank_per_expert, dim_A, dim_B,
             )
         else:
-            first_weight, second_weight = _canonical_lora_weights_for_grouped_mm(
+            first_weight, second_weight = _reversed_lora_weights_for_grouped_mm(
                 weight_A, weight_B, num_experts, rank_per_expert, dim_A, dim_B,
             )
         return first_weight, second_weight, scaling, num_experts
@@ -1646,6 +1755,31 @@ def _extract_lora_weights(
     return result[0], result[1], result[2]
 
 
+_DEQUANTIZE_4BIT_IN_SLICES = None          # unresolved
+_DEQUANTIZE_4BIT_IN_SLICES_MISSING = False  # resolved, and there is none
+
+
+def _get_dequantize_4bit_in_slices():
+    """The sliced 4-bit read, resolved once.
+
+    Absolute, like the dispatcher above and for the same reason: this file is
+    also copied to unsloth_compiled_cache/moe_utils.py and imported as a
+    top-level module, where a relative import of a sibling raises and the
+    caller would quietly put an oversized stack back on the call that aborts.
+    Only the import is guarded; a real failure inside the helper must propagate.
+    """
+    global _DEQUANTIZE_4BIT_IN_SLICES, _DEQUANTIZE_4BIT_IN_SLICES_MISSING
+    if _DEQUANTIZE_4BIT_IN_SLICES is None and not _DEQUANTIZE_4BIT_IN_SLICES_MISSING:
+        try:
+            from unsloth_zoo.temporary_patches.moe_utils_bnb4bit import (
+                _dequantize_4bit_in_slices,
+            )
+            _DEQUANTIZE_4BIT_IN_SLICES = _dequantize_4bit_in_slices
+        except ImportError:
+            _DEQUANTIZE_4BIT_IN_SLICES_MISSING = True
+    return _DEQUANTIZE_4BIT_IN_SLICES
+
+
 def _get_base_weight(param, target_dtype=None):
     """Get base weight from a potentially wrapped parameter or module. target_dtype (recompute
     providers) restores the packed Params4bit to its logical shape and casts."""
@@ -1663,7 +1797,22 @@ def _get_base_weight(param, target_dtype=None):
                 "MoE quantizer patch did not fire for this expert. "
                 f"data.shape={tuple(param.data.shape)}, device={param.device}."
             )
-        weight = bnb.functional.dequantize_4bit(param.data, param.quant_state)
+        # Absolute import: this file is also copied into unsloth_compiled_cache and imported top-level.
+        weight = None
+        try:
+            from unsloth_zoo.temporary_patches.moe_triton_kernels import nf4_dequant_triton
+        except ImportError:
+            nf4_dequant_triton = None
+        if nf4_dequant_triton is not None:
+            weight = nf4_dequant_triton(
+                param.data, param.quant_state, getattr(param, "_original_shape", None),
+            )
+        if weight is None:
+            # >= 2**31-element stacks abort in bitsandbytes dequantize (csrc/ops.cu:93); slice like the load does.
+            slicer = _get_dequantize_4bit_in_slices()
+            weight = slicer(param) if slicer is not None else None
+        if weight is None:
+            weight = bnb.functional.dequantize_4bit(param.data, param.quant_state)
         original_shape = getattr(param, "_original_shape", None)
         if original_shape is not None and weight.shape != original_shape:
             weight = weight.reshape(original_shape)
@@ -1877,6 +2026,12 @@ def preprocess_weight(
     if needs_transpose is not None:
         return weight.transpose(-2, -1) if needs_transpose else weight
 
+    if getattr(experts_module, "_unsloth_grouped_mm_format", False):
+        return weight
+    is_transposed = getattr(experts_module, "is_transposed", None)
+    if isinstance(is_transposed, bool):
+        return weight if is_transposed else weight.transpose(-2, -1)
+
     # One sibling is always non-square and reveals the shared layout.
     if experts_module is not None:
         sibling_name = "down_proj" if proj_type == "gate_up" else "gate_up_proj"
@@ -1947,9 +2102,12 @@ def _is_gpt_oss_model(model) -> bool:
 def _set_gpt_oss_grouped_mm_format_on_experts(module) -> bool:
     if module is None:
         return False
-    if module.__class__.__name__ != "GptOssExperts":
-        return False
     if bool(getattr(module, "_unsloth_grouped_mm_format", False)):
+        return False
+    if getattr(module, "is_transposed", None) is True:
+        module._unsloth_grouped_mm_format = True
+        return True
+    if module.__class__.__name__ != "GptOssExperts":
         return False
     # Require the gpt-oss (E, in, out) weight signature: gate_up's out dim is
     # twice down's in dim. Same-named classes with other layouts stay unflagged.
@@ -3133,6 +3291,123 @@ def write_fused_expert_lora_layout(peft_model, save_directory, selected_adapters
     return written
 
 
+_LORA_INTERNAL_NAMES = frozenset((
+    "base_layer", "lora_A", "lora_B", "lora_dropout", "lora_embedding_A",
+    "lora_embedding_B", "lora_magnitude_vector",
+))
+
+
+def _lora_wrapped_module_names(base_model, adapter_name):
+    """(module names wrapped by `adapter_name`, whether it also has a fused expert parameter LoRA)."""
+    wrapped, has_param_lora = [], False
+    for name, module in base_model.named_modules():
+        # nn.Embedding LoRA lives in lora_embedding_A, its lora_A stays empty.
+        if not any(
+            hasattr(d, "keys") and adapter_name in d
+            for d in (getattr(module, "lora_A", None), getattr(module, "lora_embedding_A", None))
+        ):
+            continue
+        if getattr(module, "parameter_name", None):
+            has_param_lora = True
+            continue
+        if hasattr(module, "base_layer"):
+            wrapped.append(name)
+    return wrapped, has_param_lora
+
+
+def _target_regex_for(names, all_names):
+    """Fullmatch regex selecting exactly `names`; layer indices collapse to \\d+ only if that adds nothing."""
+    import re
+    wanted = set(names)
+    collapsed = sorted({re.sub(r"\\\.\d+(?=\\\.|$)", r"\\.\\d+", re.escape(n)) for n in wanted})
+    regex = "(?:" + "|".join(collapsed) + ")"
+    if {n for n in all_names if re.fullmatch(regex, n)} == wanted:
+        return regex
+    return "(?:" + "|".join(re.escape(n) for n in sorted(wanted)) + ")"
+
+
+def portable_lora_target_modules(peft_model, adapter_name, target_modules):
+    """`target_modules` that plain PEFT loads as Unsloth trained, or None if already fine (list form only).
+
+    Gemma 4: LoRA sits on the inner `.linear`; plain PEFT would pick the unsupported wrapper, so write a regex.
+    Fused experts: unmatched gate_proj / up_proj make PEFT's v5 MoE conversion double gate_up_proj's rank; drop them.
+    """
+    if not isinstance(target_modules, (list, tuple, set)) or not target_modules:
+        return None
+    try:
+        base_model = peft_model.get_base_model()
+    except Exception:
+        base_model = getattr(getattr(peft_model, "base_model", None), "model", None)
+    if base_model is None:
+        return None
+    wrapped, has_param_lora = _lora_wrapped_module_names(base_model, adapter_name)
+    targets = [t for t in target_modules if isinstance(t, str)]
+    if len(targets) != len(target_modules):
+        return None
+
+    def hit(key, target):
+        return key == target or key.endswith("." + target)
+
+    redirected = [
+        n for n in wrapped
+        if n.endswith(".linear") and any(hit(n[: -len(".linear")], t) for t in targets)
+    ]
+    if redirected:
+        all_names = [
+            n for n, _ in base_model.named_modules()
+            if n and not (set(n.split(".")) & _LORA_INTERNAL_NAMES)
+        ]
+        return _target_regex_for(wrapped, all_names)
+    if has_param_lora:
+        kept = [t for t in targets if any(hit(n, t) for n in wrapped)]
+        if len(kept) != len(targets):
+            return sorted(kept)
+    return None
+
+
+def _redirected_patterns(peft_model, adapter_name, patterns):
+    """Add a `(?:key)\\.linear` twin for each rank/alpha pattern key that matched a redirected
+    wrapper, since PEFT fullmatches `(.*\\.)?(key)$` against the inner `.linear` on reload."""
+    import re
+    if not isinstance(patterns, dict) or not patterns:
+        return patterns
+    wrapped, _ = _lora_wrapped_module_names(peft_model.get_base_model(), adapter_name)
+    inner = [n[: -len(".linear")] for n in wrapped if n.endswith(".linear")]
+    out = dict(patterns)
+    for key, value in patterns.items():
+        twin = f"(?:{key})\\.linear"
+        if twin not in out and any(re.match(rf"(.*\.)?({key})$", n) for n in inner):
+            out[twin] = value
+    return out
+
+
+def write_portable_target_modules(peft_model, save_directory, selected_adapters = None):
+    """Rewrite saved `target_modules` per `portable_lora_target_modules`; returns paths written."""
+    written = []
+    for adapter_name, path in _fused_expert_lora_adapter_config_paths(
+        peft_model, save_directory, selected_adapters,
+    ):
+        with open(path, "r", encoding = "utf-8") as f:
+            config = json.load(f)
+        if not isinstance(config, dict):
+            continue
+        replacement = portable_lora_target_modules(
+            peft_model, adapter_name, config.get("target_modules"),
+        )
+        if replacement is None:
+            continue
+        config["target_modules"] = replacement
+        if isinstance(replacement, str):
+            for field in ("rank_pattern", "alpha_pattern"):
+                config[field] = _redirected_patterns(peft_model, adapter_name, config.get(field))
+            # PEFT rejects layer selectors beside a str target; the regex already names only those layers.
+            config["layers_to_transform"] = None
+            config["layers_pattern"] = None
+        _atomic_write_text(path, json.dumps(config, indent = 2, sort_keys = True))
+        written.append(path)
+    return written
+
+
 def _atomic_write_text(path, text):
     """Replace `path` with `text`, or leave it exactly as it was.
 
@@ -3222,6 +3497,21 @@ def _patched_peft_model_save_pretrained(self, save_directory, *args, **kwargs):
                     f"adapter_config.json ({type(exception).__name__}: {exception}). The "
                     f"adapter itself saved correctly."
                 )
+        try:
+            write_portable_target_modules(
+                self, save_directory,
+                selected_adapters = _save_pretrained_argument(
+                    "selected_adapters", None, args, kwargs,
+                ),
+            )
+        except Exception as exception:
+            logger = _moe_utils_logger()
+            if logger is not None:
+                logger.warning(
+                    f"Unsloth: could not rewrite target_modules for plain PEFT in "
+                    f"adapter_config.json ({type(exception).__name__}: {exception}). The "
+                    f"adapter itself saved correctly."
+                )
     return result
 
 
@@ -3297,6 +3587,23 @@ def patch_param_wrapper_for_moe():
 # UNSLOTH_MOE_GATEGRAD=0 to revert to the standard <dOut, Y> path.
 
 
+_WEIGHTED_UNPERMUTE = None
+
+
+def weighted_unpermute(*args, **kwargs):
+    """Fused Triton combine, or None so the caller falls back to the eager reduction."""
+    global _WEIGHTED_UNPERMUTE
+    if _WEIGHTED_UNPERMUTE is None:
+        try:
+            from unsloth_zoo.temporary_patches.moe_triton_kernels import weighted_unpermute as _wu
+        except ImportError:
+            _wu = False
+        _WEIGHTED_UNPERMUTE = _wu
+    if _WEIGHTED_UNPERMUTE is False:
+        return None
+    return _WEIGHTED_UNPERMUTE(*args, **kwargs)
+
+
 @lru_cache(maxsize=1)
 def _moe_gategrad_enabled() -> bool:
     """Whether the MoE gate-gradient identity path is active (on by default).
@@ -3356,6 +3663,30 @@ class _MoEGateGradIdentity(torch.autograd.Function):
         return grad_inter, grad_gate
 
 
+_FLAG_MISSING = object()
+
+
+def _module_flag(module, name, default = None):
+    value = module.__dict__.get(name, _FLAG_MISSING)
+    if value is _FLAG_MISSING:
+        value = getattr(type(module), name, default)
+    return value
+
+
+def _gate_up_is_interleaved(module) -> bool:
+    if "GptOssExperts" in module.__class__.__name__:
+        return True
+    return _module_flag(module, "is_concatenated", True) is False
+
+
+def _uses_own_apply_gate(module) -> bool:
+    """Own-gate flag on the class or (FP8) instance; hot path, so no nn.Module.__getattr__."""
+    return bool(
+        module.__dict__.get("_unsloth_own_apply_gate", False)
+        or getattr(type(module), "_unsloth_own_apply_gate", False)
+    )
+
+
 def forward_native_grouped_mm(
     self,
     hidden_states: torch.Tensor,
@@ -3412,6 +3743,7 @@ def forward_native_grouped_mm(
             self.gate_up_proj, num_experts=self.num_experts, experts_module=self
         )
 
+    own_gate_up = None
     if hasattr(self, "gate_up_proj"):
         model_type = getattr(self, "_unsloth_model_type", None)
         _gate_up_src = self.gate_up_proj
@@ -3421,7 +3753,7 @@ def forward_native_grouped_mm(
         def _gate_up_provider(_src=_gate_up_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype, _mod=self):
             return preprocess_weight(_get_base_weight(_src, _dt), "gate_up", _h, _mt, experts_module=_mod)
         mm1_out = _base_grouped_mm(
-            permuted_input, offsets, _gate_up_provider, _moe_recompute_enabled(_gate_up_src),
+            permuted_input, offsets, _gate_up_provider, _moe_recompute_enabled(_gate_up_src, dtype=hidden_states.dtype),
         )
 
         # Separated LoRA: + ((X @ first) @ second) * scaling.
@@ -3481,11 +3813,12 @@ def forward_native_grouped_mm(
             )
             mm1_out = mm1_out + bias_expanded.to(mm1_out.dtype)
 
-        if "GptOssExperts" in self.__class__.__name__:
+        if _gate_up_is_interleaved(self):
             gate = mm1_out[..., ::2]
             up = mm1_out[..., 1::2]
         else:
             gate, up = mm1_out.chunk(2, dim=-1)
+        own_gate_up = mm1_out if _uses_own_apply_gate(self) else None
 
     elif hasattr(self, "w1") and hasattr(self, "w3"):
         # Separate w1/w3 weights (older models).
@@ -3527,7 +3860,9 @@ def forward_native_grouped_mm(
         raise AttributeError("MoE layer must have 'gate_up_proj' or 'w1'/'w3'.")
 
     # Activation
-    if "GptOssExperts" in self.__class__.__name__:
+    if own_gate_up is not None:
+        inter = self._apply_gate(own_gate_up)
+    elif "GptOssExperts" in self.__class__.__name__:
         # Custom GptOss activation.
         limit = getattr(self, "limit", 7.0)
         alpha = getattr(self, "alpha", 1.702)
@@ -3597,7 +3932,7 @@ def forward_native_grouped_mm(
         def _down_provider(_src=_down_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype, _mod=self):
             return preprocess_weight(_get_base_weight(_src, _dt), "down", _h, _mt, experts_module=_mod)
         mm2_out = _base_grouped_mm(
-            inter, offsets, _down_provider, _moe_recompute_enabled(_down_src),
+            inter, offsets, _down_provider, _moe_recompute_enabled(_down_src, dtype=hidden_states.dtype),
         )
 
         if down_lora is not None:
@@ -3658,24 +3993,42 @@ def forward_native_grouped_mm(
     # Apply routing weights and scatter-add (reduce).
     if _gategrad:
         # Gate grad comes from the identity; detach so the multiply does not pin Y.
-        mm2_out = mm2_out * permuted_weights.detach().unsqueeze(-1)
+        permuted_weights = permuted_weights.detach()
     else:
         flat_weights = top_k_weights.reshape(-1)
         permuted_weights = flat_weights[sorted_indices]
-        mm2_out = mm2_out * permuted_weights.unsqueeze(-1)
 
-    final_hidden_states = combine_permuted_moe_outputs(
+    final_hidden_states = weighted_unpermute(
         mm2_out,
         sorted_indices,
+        permuted_weights,
         batch_size * sequence_length,
         top_k_index.shape[-1],
         out_dtype = hidden_states.dtype,
     )
+    if final_hidden_states is None:
+        mm2_out = mm2_out * permuted_weights.unsqueeze(-1)
+        final_hidden_states = combine_permuted_moe_outputs(
+            mm2_out,
+            sorted_indices,
+            batch_size * sequence_length,
+            top_k_index.shape[-1],
+            out_dtype = hidden_states.dtype,
+        )
 
     if is_2d_input:
         return final_hidden_states
 
     return final_hidden_states.view(batch_size, sequence_length, hidden_dim)
+
+
+def _experts_are_input_major(module, name, in_dim) -> bool:
+    if bool(_module_flag(module, "_unsloth_grouped_mm_format", False)):
+        return True
+    declared = _module_flag(module, "is_transposed", None)
+    if isinstance(declared, bool):
+        return declared
+    return getattr(module, name).shape[-1] != in_dim
 
 
 def forward_triton_grouped_gemm(
@@ -3726,7 +4079,10 @@ def forward_triton_grouped_gemm(
 
     # Cache model dims and kernel configs on first call.
     if self._unsloth_moe_configs is None:
-        intermediate_dim = self.gate_up_proj.shape[1] // 2
+        if _experts_are_input_major(self, "gate_up_proj", hidden_dim):
+            intermediate_dim = self.gate_up_proj.shape[-1] // 2
+        else:
+            intermediate_dim = self.gate_up_proj.shape[1] // 2
 
         # Autotune first GEMM.
         gemm1_configs = get_or_autotune_moe_kernels(
@@ -3758,10 +4114,10 @@ def forward_triton_grouped_gemm(
     )
     offsets = torch.cumsum(token_counts_by_expert, dim=0, dtype=torch.int32)
 
-    if self.gate_up_proj.shape[-1] == hidden_dim:
-        w1 = self.gate_up_proj
-    else:
+    if _experts_are_input_major(self, "gate_up_proj", hidden_dim):
         w1 = self.gate_up_proj.transpose(-2, -1).contiguous()
+    else:
+        w1 = self.gate_up_proj
 
     # First grouped GEMM: gate_up projection.
     first_gemm_output = grouped_gemm(
@@ -3798,7 +4154,9 @@ def forward_triton_grouped_gemm(
         first_gemm_output = first_gemm_output + gate_up_lora_delta
 
     # Activation + gate*up.
-    if hasattr(self, 'act_fn') and callable(self.act_fn):
+    if _uses_own_apply_gate(self):
+        intermediate = self._apply_gate(first_gemm_output)
+    elif hasattr(self, 'act_fn') and callable(self.act_fn):
         gate, up = first_gemm_output.chunk(2, dim=-1)
         intermediate = self.act_fn(gate) * up
     else:
@@ -3816,10 +4174,10 @@ def forward_triton_grouped_gemm(
     ):
         down_lora = _extract_lora_weights(self.down_proj, num_experts=self.num_experts)
 
-    if self.down_proj.shape[-1] == intermediate.shape[-1]:
-        w2 = self.down_proj
-    else:
+    if _experts_are_input_major(self, "down_proj", intermediate.shape[-1]):
         w2 = self.down_proj.transpose(-2, -1).contiguous()
+    else:
+        w2 = self.down_proj
 
     second_gemm_output = grouped_gemm(
         X=intermediate,
@@ -3935,13 +4293,15 @@ def forward_native_moe_loop(
         expert_mask = expert_mask.permute(2, 1, 0)  # (num_experts, top_k, n_tokens)
         expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
 
-    # Some patches (Qwen3-VL-MoE) store experts in grouped_mm layout (E, in, out)
-    # rather than F.linear's (E, out, in) and set _unsloth_grouped_mm_format=True.
-    # Prefer it over the shape check, which is unsafe when intermediate_dim == hidden_dim.
-    grouped_mm_format = bool(getattr(self, "_unsloth_grouped_mm_format", False))
+    # A declared (E, in, out) layout (_unsloth_grouped_mm_format) wins over the shape test, which a square stack defeats.
+    grouped_mm_format = bool(_module_flag(self, "_unsloth_grouped_mm_format", False)) or (
+        _module_flag(self, "is_transposed", None) is True
+    )
 
-    # GPT-OSS uses interleaved gate/up, clamped swiglu, and per-expert biases.
+    # Interleaved storage is a layout flag; GPT-OSS's clamped swiglu is its own activation: keep them apart.
+    interleaved = _gate_up_is_interleaved(self)
     is_gpt_oss = "GptOssExperts" in self.__class__.__name__
+    own_apply_gate = _uses_own_apply_gate(self)
 
     for expert_idx_t in expert_hit:
         expert_idx = expert_idx_t.item()
@@ -3960,10 +4320,10 @@ def forward_native_moe_loop(
                 lora_delta = current_state @ first_weight[expert_idx]
                 lora_delta = lora_delta @ second_weight[expert_idx]
                 gate_up = gate_up + lora_delta * scaling
-            if is_gpt_oss:
-                gate_up_bias = getattr(self, "gate_up_proj_bias", None)
-                if gate_up_bias is not None:
-                    gate_up = gate_up + gate_up_bias[expert_idx].to(gate_up.dtype)
+            gate_up_bias = getattr(self, "gate_up_proj_bias", None)
+            if gate_up_bias is not None:
+                gate_up = gate_up + gate_up_bias[expert_idx].to(gate_up.dtype)
+            if interleaved:
                 gate = gate_up[..., ::2]
                 up = gate_up[..., 1::2]
             else:
@@ -3971,8 +4331,13 @@ def forward_native_moe_loop(
         else:
             gate = F.linear(current_state, self.w1[expert_idx])
             up = F.linear(current_state, self.w3[expert_idx])
+            gate_up = None
 
-        if is_gpt_oss:
+        if own_apply_gate:
+            current_hidden_states = self._apply_gate(
+                gate_up if gate_up is not None else torch.cat((gate, up), dim=-1)
+            )
+        elif is_gpt_oss:
             limit = getattr(self, "limit", 7.0)
             alpha = getattr(self, "alpha", 1.702)
             gate = gate.clamp(min=None, max=limit)
@@ -3995,10 +4360,9 @@ def forward_native_moe_loop(
                 lora_delta = current_hidden_states @ first_weight[expert_idx]
                 lora_delta = lora_delta @ second_weight[expert_idx]
                 down = down + lora_delta * scaling
-            if is_gpt_oss:
-                down_bias = getattr(self, "down_proj_bias", None)
-                if down_bias is not None:
-                    down = down + down_bias[expert_idx].to(down.dtype)
+            down_bias = getattr(self, "down_proj_bias", None)
+            if down_bias is not None:
+                down = down + down_bias[expert_idx].to(down.dtype)
             current_hidden_states = down
         else:
             current_hidden_states = F.linear(current_hidden_states, self.w2[expert_idx])

@@ -400,6 +400,97 @@ def patch_to_dict():
         setattr(PretrainedConfig, "to_dict", wrapped_to_dict)
 pass
 
+# Casts above this avoid `.to()` holding two full copies (gemma-4 E4B's embed_tokens_per_layer is 5.25 GiB).
+_FORCED_FLOAT32_STAGE_BYTES = 1 * 1024 ** 3
+_FORCED_FLOAT32_CHUNK_BYTES = 64 * 1024 ** 2
+
+
+def _storage_is_private(tensor):
+    """No alias would read in-place rewritten bytes as the old dtype. False if unknown (torch without the API)."""
+    use_count = getattr(torch._C, "_storage_Use_Count", None)
+    if use_count is None:
+        return False
+    try:
+        probe = torch.nn.Parameter(torch.empty(1, dtype = tensor.dtype, device = tensor.device))
+        baseline = use_count(probe.untyped_storage()._cdata)
+        return use_count(tensor.untyped_storage()._cdata) <= baseline
+    except Exception:
+        return False
+
+
+def _cast_in_place_same_size(param, dtype):
+    """Same element size: convert inside the storage, one chunk at a time. Each chunk is read before
+    it is overwritten, so values equal `.to(dtype)`."""
+    src = param.data.view(-1)
+    dst = src.view(dtype)
+    step = max(1, _FORCED_FLOAT32_CHUNK_BYTES // src.element_size())
+    with torch.no_grad():
+        for start in range(0, src.numel(), step):
+            dst[start : start + step].copy_(src[start : start + step].to(dtype))
+    param.data = param.data.view(dtype)
+
+
+def _cast_via_host_chunked(param, dtype):
+    """Host buffer already in the target dtype: the host peak is the new tensor plus one chunk."""
+    device = param.device
+    src = param.data
+    staged = torch.empty(src.shape, dtype = dtype, device = "cpu")
+    flat_src, flat_dst = src.reshape(-1), staged.view(-1)
+    step = max(1, _FORCED_FLOAT32_CHUNK_BYTES // max(src.element_size(), staged.element_size()))
+    for start in range(0, flat_src.numel(), step):
+        flat_dst[start : start + step].copy_(flat_src[start : start + step])
+    del flat_src, src
+    param.data = torch.empty(0, dtype = dtype, device = device)
+    param.data = staged.to(device, non_blocking = False)
+    del staged
+
+
+def _cast_large_param(param, dtype):
+    new_bytes = param.numel() * torch.empty(0, dtype = dtype).element_size()
+    try:
+        free, _ = torch.cuda.mem_get_info(param.device)
+    except Exception:
+        free = 0
+    # The host path needs no device memory, so it is the fallback when not even a chunk fits.
+    if (
+        free >= _FORCED_FLOAT32_CHUNK_BYTES
+        and param.element_size() == torch.empty(0, dtype = dtype).element_size()
+        and param.data.is_contiguous()
+        and _storage_is_private(param)
+    ):
+        return _cast_in_place_same_size(param, dtype)
+    if free >= new_bytes + _FORCED_FLOAT32_CHUNK_BYTES:
+        param.data = param.data.to(dtype)
+        return
+    return _cast_via_host_chunked(param, dtype)
+
+
+def _bounded_cast_module(module, dtype):
+    """`module.to(dtype)` without a full extra copy of any large parameter on the device or the host.
+    `.to("cpu", dtype=...)` holds both copies on the host: 10.5 GiB for gemma-4 E4B, which OOM-kills a Colab T4 VM."""
+    for param in module.parameters(recurse = False):
+        if (
+            param.dtype.is_floating_point
+            and param.dtype != dtype
+            and param.device.type == "cuda"
+            and param.numel() * param.element_size() >= _FORCED_FLOAT32_STAGE_BYTES
+        ):
+            _cast_large_param(param, dtype)
+    module.to(dtype)
+
+
+# Kept for tests/test_forced_float32_cast_peak.py.
+_stage_cast_for_test = _bounded_cast_module
+
+
+def _attach_tower_input_hooks(model):
+    try:
+        from .device_map_planner import attach_tower_input_hooks
+        attach_tower_input_hooks(model)
+    except Exception:
+        pass
+
+
 def patch_model_and_tokenizer(
     model,
     tokenizer,
@@ -411,6 +502,7 @@ def patch_model_and_tokenizer(
     # All Unsloth Zoo code licensed under LGPLv3
     assert(type(downcast_rope) is bool)
     import gc
+    _attach_tower_input_hooks(model)
 
     # Fix dtype
     m = model
@@ -451,23 +543,29 @@ def patch_model_and_tokenizer(
     # If we force float32, we first use bfloat16, then downcast to float16
     if do_forced_float32:
         correct_dtype = torch.float16
+
+        _cast_module = _bounded_cast_module
+
         for name, module in model.named_modules():
             if hasattr(module, "_pre_set_compute_dtype"):
                 setted_dtype = module._pre_set_compute_dtype
             else:
                 setted_dtype = torch.float16
             if "down_proj" in name or "up_proj" in name or "gate_proj" in name or "fc1" in name or "fc2" in name:
-                module.to(setted_dtype)
+                _cast_module(module, setted_dtype)
             if "q_proj" in name or "k_proj" in name or "v_proj" in name or "o_proj" in name or "out_proj" in name:
-                module.to(setted_dtype)
+                _cast_module(module, setted_dtype)
+            # `embed_tokens` is a substring test, so it also selects gemma-4's
+            # `embed_tokens_per_layer`. That is wanted; it is also why the one
+            # tensor here can be several GiB.
             if "lm_head" in name or "embed_tokens" in name:
-                module.to(setted_dtype)
-            if "embed_tokens" in name or "patch_embedding" in name:
-                module.to(setted_dtype)
+                _cast_module(module, setted_dtype)
+            if "patch_embedding" in name:
+                _cast_module(module, setted_dtype)
             if name.endswith("norm") and hasattr(module, "weight"):
-                module.to(setted_dtype)
+                _cast_module(module, setted_dtype)
             if "bias" in name:
-                module.to(setted_dtype)
+                _cast_module(module, setted_dtype)
         pass
         # empty_cache() used to run here once per module, and that corrupted memory on a
         # model split across GPUs: the casts above are async, and empty_cache() cudaFrees
@@ -812,6 +910,19 @@ class WrapRecursiveCall(ast.NodeTransformer):
         return node
 
 
+_BNB_SKIP_MATCH = '(key + "." in current_key_name_str) or (key == current_key_name_str)'
+# New keys only: 4.x saves packed the routers its matcher missed (`mlp.gate`), so suffix-matching those breaks reloads.
+_BNB_SUFFIX_MATCH_KEYS = frozenset(("moe.gate",))
+
+
+def _add_suffix_match_to_bnb_skip(source: str) -> str:
+    return source.replace(
+        _BNB_SKIP_MATCH,
+        _BNB_SKIP_MATCH + ' or (key in _BNB_SUFFIX_MATCH_KEYS and current_key_name_str.endswith("." + key))',
+        1,
+    )
+
+
 # Patch for dynamic 4bit quantization
 import inspect
 try:
@@ -833,6 +944,7 @@ if _transformers_bnb is not None and \
     exec(f"from transformers.integrations.bitsandbytes import ({x})", globals())
     if "current_key_name_str" not in source:
         raise RuntimeError("Unsloth: Patch for dynamic quantization failed since current_key_name_str does not exist.")
+    source = _add_suffix_match_to_bnb_skip(source)
 
     # Patch recursive calls to mark the parent class, so we can access it
     # when checking for conversion_mappings

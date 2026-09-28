@@ -24,6 +24,7 @@ class _FakeTokenizer:
     _vocab = {
         "<image>": 200,
         "<|image_pad|>": 201,
+        "<|media_pad|>": 163592,
     }
 
     def convert_tokens_to_ids(self, tokens):
@@ -204,6 +205,7 @@ def test_vlm_collate_creates_sft_labels_and_masks_special_tokens():
         [101, 10, -100, 11, -100],
         [101, 12, 13, -100, -100],
     ]
+    assert set(_get_vlm_ignore_token_ids(processor=type("_Kimi", (_FakeProcessor,), {"image_token": "<|media_pad|>"})())) == {200, 201, 163592}
 
 
 def test_vlm_response_mask_reapplies_special_token_masks():
@@ -2279,6 +2281,44 @@ def test_the_baseline_loss_backend_restores_the_gemma3n_embed_scale(
         "the rescaled embeddings went through Model.__call__, which drops them "
         "on every mlx-vlm up to the declared floor"
     )
+
+
+@pytest.mark.parametrize("model_type,forwarded", [
+    ("gemma4", True), ("gemma4_unified", False),
+])
+def test_cce_forwards_mm_token_types_where_the_model_does(model_type, forwarded):
+    """CCE loss passes `mm_token_type_ids` only where `Model.__call__` does."""
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx.utils import _vlm_cce_forward
+
+    mx_ = _utils_mx()
+    seen = {}
+
+    class _Backbone:
+        config = SimpleNamespace(model_type=f"{model_type}_text")
+
+        def __call__(self, inputs=None, inputs_embeds=None, mask=None, cache=None,
+                     mm_token_type_ids=None, token_type_ids=None):
+            seen["ids"] = mm_token_type_ids
+            return inputs_embeds
+
+    class _Model:
+        language_model = SimpleNamespace(model=_Backbone())
+        config = SimpleNamespace(model_type=model_type)
+
+        def get_input_embeddings(self, inputs, pixel_values=None, **_kwargs):
+            return SimpleNamespace(
+                inputs_embeds=mx_.zeros((*inputs.shape, 4), dtype=mx_.float32))
+
+    ids = mx_.array([[5, 6, 7, 8], [5, 6, 7, 8]], dtype=mx_.int32)
+    types = mx_.array([[0, 1, 1, 0], [0, 0, 1, 1]], dtype=mx_.int32)
+    _vlm_cce_forward(_Model(), {
+        "input_ids": ids, "attention_mask": mx_.ones_like(ids), "mm_token_type_ids": types,
+    })
+    if forwarded:
+        assert seen["ids"] is not None and seen["ids"].tolist() == types.tolist()
+    else:
+        assert seen["ids"] is None
 
 
 # --- paligemma: a prefix-LM mask, not a padding outer product ---------------
@@ -5860,3 +5900,44 @@ def test_a_hugging_face_snapshot_symlink_is_still_followed(tmp_path):
 
     _save_vlm_processor_assets(_P(), out, (str(snapshot),))
     assert (out / "config.json").read_text() == '{"model_type": "real"}'
+
+
+@pytest.mark.parametrize("legacy_render", [None, "transformed history"])
+def test_typed_role_fallback_preserves_existing_render(monkeypatch, legacy_render):
+    import unsloth_zoo.mlx.utils as utils
+
+    class Processor:
+        image_token = "<image>"
+        chat_template = "typed"
+        def apply_chat_template(self, messages, **kwargs):
+            import jinja2
+            if isinstance(messages[0].get("content"), str) and legacy_render:
+                return legacy_render
+            template = "{% for m in messages %}{{ m.role }}:{% for p in m.content %}{% if p.type == 'text' %}{{ p.text }}{% elif p.type == 'image' %}{{ image_prompt_token }}{% endif %}{% endfor %};{% endfor %}"
+            return jinja2.Environment(undefined=jinja2.StrictUndefined).from_string(template).render(messages=messages)
+
+    monkeypatch.setattr(utils, "_vlm_token_messages", lambda p, ms: utils._flatten_vlm_content_for_text_template(ms, "<image>"))
+    messages = [
+        {"role":"user", "content":[{"type":"text", "text":"first"}]},
+        {"role":"assistant", "content":[{"type":"text", "text":"second"}]},
+        {"role":"user", "content":[{"type":"image"}, {"type":"text", "text":"third"}]},
+    ]
+    assert utils._render_vlm_messages(Processor(), messages) == (legacy_render or "user:first;assistant:second;user:<image>third;")
+
+
+@pytest.mark.parametrize("remote", [False, True])
+@pytest.mark.parametrize("template", ["source template", {"tool_use": "tool template", "default": "source template"}])
+def test_missing_processor_template_recovers_legacy_json(tmp_path, remote, template):
+    import json
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx.utils import normalize_vlm_processor_chat_template
+
+    (tmp_path / "chat_template.json").write_text(json.dumps({"chat_template": template}))
+    tokenizer = SimpleNamespace(chat_template=None)
+    processor = SimpleNamespace(tokenizer=tokenizer, chat_template=None)
+    kwargs = {"model_name": "org/model", "model_path": str(tmp_path)} if remote else {"model_name": str(tmp_path)}
+    normalize_vlm_processor_chat_template(processor, **kwargs)
+    assert processor.chat_template == tokenizer.chat_template == "source template"
+    processor.chat_template = "existing template"
+    normalize_vlm_processor_chat_template(processor, model_name=str(tmp_path))
+    assert processor.chat_template == "existing template"
