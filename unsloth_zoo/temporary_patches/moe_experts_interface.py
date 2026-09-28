@@ -183,7 +183,6 @@ def _dense_experts_without_expert_lora(module) -> bool:
 
 
 def _custom_gate_with_expert_lora(module) -> bool:
-    """Dense standard-layout experts with their own _apply_gate and an Unsloth expert LoRA attached."""
     if getattr(module, "has_gate", True) is False or not _has_custom_gate(module):
         return False
     state = module.__dict__

@@ -109,5 +109,4 @@ def test_deepseek_v4_bf16_expert_lora_is_applied(tmp_path):
     r = json.loads(line[len("RESULT "):])
     assert r["n_expert_lora"] == 16  # 4 layers x (gate_up, down) x (A, B)
     assert all(g > 0 for g in r["grads"]), r["grads"]
-    # Ignoring the adapter gives ~0.5.
     assert max(r["rel"]) < 0.02, r["rel"]
