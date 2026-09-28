@@ -2654,18 +2654,18 @@ _STASH_SCAN_MAX_DEPTH = 4
 # Resolved at import, absolute: the traced wrapper cannot import, and the compiled-cache copy has no package.
 try:
     from unsloth_zoo.temporary_patches.moe_experts_interface import (
-        own_gate_route_reads_stash as _own_gate_route_reads_stash_impl,
+        interface_route_reads_stash as _interface_route_reads_stash_impl,
     )
 except Exception:
-    _own_gate_route_reads_stash_impl = None
+    _interface_route_reads_stash_impl = None
 
 
-def _own_gate_route_reads_stash(experts_module) -> bool:
+def _interface_route_reads_stash(experts_module) -> bool:
     """transformers' experts dispatch hides Unsloth's forward from the bytecode scan; ask the interface."""
-    if _own_gate_route_reads_stash_impl is None:
+    if _interface_route_reads_stash_impl is None:
         return False
     try:
-        return bool(_own_gate_route_reads_stash_impl(experts_module))
+        return bool(_interface_route_reads_stash_impl(experts_module))
     except Exception:
         return False
 
@@ -3094,7 +3094,7 @@ def _patched_param_wrapper_forward(
             # Nothing is recorded either way, so the first eager call still measures and
             # every later compile follows the real verdict.
             applies_stash = _forward_statically_reads_stash(experts_module)
-            if not applies_stash and _own_gate_route_reads_stash(experts_module):
+            if not applies_stash and _interface_route_reads_stash(experts_module):
                 applies_stash = True
             if applies_stash is False:
                 _log_moe_lora_stash_unread_once(experts_module, param_name)
@@ -3139,6 +3139,22 @@ def _patched_param_wrapper_forward(
                     delattr(experts_module, lora_attr)
 
         return result
+
+    # Stacks the separated forward does not claim (NemotronH's non-gated up_proj / down_proj): under
+    # compile PEFT's parametrization graph-breaks on `set_` and `type.__delattr__`, so fold as above.
+    if (
+        torch.compiler.is_compiling()
+        and param_name
+        and not self.disable_adapters
+        and not self.merged
+        and getattr(getattr(experts_module, param_name, None), "ndim", 0) == 3
+        and _can_fold_moe_lora_through_peft(experts_module, param_name)
+    ):
+        folded = _fold_moe_lora_without_parametrization(
+            self, immediate_base_layer, experts_module, param_name, x, args, kwargs
+        )
+        if folded is not None:
+            return folded
 
     # Non-MoE: original PEFT forward with _activate_lora.
     return _original_param_wrapper_forward(self, x, *args, **kwargs)
