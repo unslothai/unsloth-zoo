@@ -254,3 +254,23 @@ def test_mixed_batch_keeps_one_image_slot_per_row_in_messages_path():
         return [{"role": "user", "content": user}, {"role": "assistant", "content": [{"type": "text", "text": "x"}]}]
     collator([{"images": None, "messages": msgs(False)}, {"images": [image], "messages": msgs(True)}])
     assert collator.processor.seen_images[0] == [[], [image]]
+
+
+def _image_collator(max_seq_length):
+    collator = make_collator(None, max_seq_length = max_seq_length)
+    collator.processor = _ChatProcessor()
+    collator.assistant_single_content = False
+    return collator
+
+
+def test_truncation_that_cuts_an_image_placeholder_raises():
+    from PIL import Image
+    collator = _image_collator(2)
+    with pytest.raises(ValueError, match = "max_seq_length = 2 truncated 1 image / audio placeholder"):
+        collator([{"images": [Image.new("RGB", (32, 32))], "prompt": "a b <img>", "completion": "x"}])
+
+
+def test_truncation_that_keeps_every_image_placeholder_passes():
+    from PIL import Image
+    out = _image_collator(3)([{"images": [Image.new("RGB", (32, 32))], "prompt": "<img> a b", "completion": "x y"}])
+    assert out["input_ids"].tolist() == [[IMG_ID, 1, 2]]

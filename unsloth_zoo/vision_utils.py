@@ -2178,6 +2178,19 @@ class UnslothVisionDataCollator:
             token_type_ids = token_type_ids[:, sl]
         return [input_ids, attention_mask, completion_mask] + ([token_type_ids] if token_type_ids is not None else [])
 
+    def _raise_if_truncation_cut_media(self, before, after, pad_id):
+        # pixel_values / audio features are not truncated with the ids, so a cut placeholder
+        # misaligns them at model forward.
+        media = self._get_padding_token_ids_on_device(before.device)
+        media = media[media != pad_id]
+        cut = int(torch.isin(before, media).sum()) - int(torch.isin(after, media).sum())
+        if cut > 0:
+            raise ValueError(
+                f"Unsloth: max_seq_length = {self.max_seq_length} truncated {cut} image / audio placeholder "
+                "tokens out of a prompt / completion batch, so the batch no longer matches its media "
+                "features. Increase max_seq_length or shorten the prompt."
+            )
+
     def _pad_to_multiple(self, input_ids, attention_mask, completion_mask, side, pad_id, multiple, token_type_ids=None, token_type_pad_id=0):
         B, L = input_ids.shape
         L2 = ((L + multiple - 1) // multiple) * multiple
@@ -2295,6 +2308,7 @@ class UnslothVisionDataCollator:
         p_tt, c_tt = proc_prompts.get(tt_key, None), proc_completions.get(tt_key, None)
 
         input_ids = torch.cat((p_ids, c_ids), dim=1)
+        untruncated_ids = input_ids
         attention_mask = torch.cat((p_m, c_m), dim=1)
         completion_mask = torch.cat((torch.zeros_like(p_m), c_m), dim=1)
         if p_tt is not None or c_tt is not None:
@@ -2339,6 +2353,10 @@ class UnslothVisionDataCollator:
                 input_ids, attention_mask, completion_mask = self._pad_to_multiple(
                     input_ids, attention_mask, completion_mask, flush_side, pad_id, self.pad_to_multiple_of
                 )
+
+        if (pc_has_images or videos or audios) and self.max_seq_length is not None \
+            and untruncated_ids.shape[1] > self.max_seq_length:
+            self._raise_if_truncation_cut_media(untruncated_ids, input_ids, pad_id)
 
         # Labels: mask attention pads + image/pad tokens; completion-only if requested
         labels = input_ids.clone()
