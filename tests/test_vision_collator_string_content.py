@@ -181,3 +181,22 @@ def test_list_content_template_is_not_wrapped():
     _collator(processor)
     assert processor.apply_chat_template == original
     assert not getattr(processor.apply_chat_template, "_unsloth_string_content", False)
+
+
+class _PicklableStringProcessor:
+    image_token = DEFAULT_IMAGE_TOKEN
+
+    def apply_chat_template(self, conversation, tokenize = False, **kwargs):
+        return "".join(m["role"] + ":" + m["content"] + "\n" for m in conversation)
+
+
+def test_patched_processor_is_picklable():
+    # Spawn / forkserver DataLoader workers pickle the collator and its processor.
+    import pickle
+    from unsloth_zoo.vision_utils import _patch_string_content_chat_template
+    processor = _PicklableStringProcessor()
+    assert _patch_string_content_chat_template(processor)
+    clone = pickle.loads(pickle.dumps(processor))
+    msgs = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Hi"}]}]
+    assert clone.apply_chat_template(msgs) == processor.apply_chat_template(msgs) == "user:<image>\nHi\n"
+    assert not _patch_string_content_chat_template(clone)

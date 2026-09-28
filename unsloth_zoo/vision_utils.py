@@ -1322,6 +1322,31 @@ def _template_needs_string_content(processor) -> bool:
 pass
 
 
+class _StringContentChatTemplate:
+    """Module-level (not a closure) so patched processors stay picklable for spawn DataLoader workers."""
+    __slots__ = ("original", "placeholders")
+    _unsloth_string_content = True
+
+    def __init__(self, original, placeholders):
+        self.original = original
+        self.placeholders = placeholders
+
+    def __getstate__(self):
+        return (self.original, self.placeholders)
+
+    def __setstate__(self, state):
+        self.original, self.placeholders = state
+
+    def __call__(self, conversation, *args, **kwargs):
+        if isinstance(conversation, (list, tuple)) and len(conversation) and \
+            isinstance(conversation[0], (list, tuple)):
+            conversation = [_flatten_message_content(c, self.placeholders) for c in conversation]
+        elif isinstance(conversation, (list, tuple)):
+            conversation = _flatten_message_content(conversation, self.placeholders)
+        return self.original(conversation, *args, **kwargs)
+pass
+
+
 def _patch_string_content_chat_template(processor) -> bool:
     """Phi-4-reasoning-vision (phi4-siglip) and other LLaVA-style templates only take
     `'<image>\\n' + text` string content. Make this processor's apply_chat_template accept
@@ -1334,17 +1359,7 @@ def _patch_string_content_chat_template(processor) -> bool:
     if not _template_needs_string_content(processor):
         return False
     placeholders = {kind: _media_placeholder(processor, kind) for kind in _STRING_CONTENT_DEFAULTS}
-
-    def apply_chat_template(conversation, *args, **kwargs):
-        if isinstance(conversation, (list, tuple)) and len(conversation) and \
-            isinstance(conversation[0], (list, tuple)):
-            conversation = [_flatten_message_content(c, placeholders) for c in conversation]
-        elif isinstance(conversation, (list, tuple)):
-            conversation = _flatten_message_content(conversation, placeholders)
-        return original(conversation, *args, **kwargs)
-    apply_chat_template._unsloth_string_content = True
-    apply_chat_template._unsloth_placeholders = placeholders
-    processor.apply_chat_template = apply_chat_template
+    processor.apply_chat_template = _StringContentChatTemplate(original, placeholders)
     return True
 pass
 
