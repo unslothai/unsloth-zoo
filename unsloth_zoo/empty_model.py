@@ -722,7 +722,7 @@ def set_additional_modules(new_model, quant_state_dict, config):
         language_model = new_model.model.language_model
         language_model_prefix = "model.language_model"
     elif hasattr(new_model, "model") and hasattr(new_model.model, "text_model"):
-        # Idefics3, SmolVLM2: model wraps text_model/vision_model/connector
+        # Idefics3 nests the text model at model.text_model
         language_model = new_model.model.text_model
         language_model_prefix = "model.text_model"
     else:
@@ -1047,7 +1047,7 @@ def get_model_layer_config(return_non_layered=True):
             "model.layers.{kk}.per_layer_input_gate",
             "model.layers.{kk}.per_layer_projection",
 
-            # Idefics3 (granite-docling, SmolVLM2): text model under model.text_model
+            # Idefics3 text model
             "model.text_model.layers.{kk}.self_attn.q_proj",
             "model.text_model.layers.{kk}.self_attn.k_proj",
             "model.text_model.layers.{kk}.self_attn.v_proj",
@@ -1098,7 +1098,7 @@ def get_model_layer_config(return_non_layered=True):
             "model.language_model.layers.{kk}.post_per_layer_input_norm",
             "model.layers.{kk}.post_per_layer_input_norm",
 
-            # Idefics3 (granite-docling, SmolVLM2)
+            # Idefics3
             "model.text_model.layers.{kk}.input_layernorm",
             "model.text_model.layers.{kk}.post_attention_layernorm",
             "model.vision_model.encoder.layers.{kk}.layer_norm1",
@@ -1178,7 +1178,7 @@ def get_model_layer_config(return_non_layered=True):
             "model.visual.blocks.{kk}.mlp.linear_fc1",
             "model.visual.blocks.{kk}.mlp.linear_fc2",
 
-            # Idefics3 (granite-docling, SmolVLM2)
+            # Idefics3
             "model.vision_model.encoder.layers.{kk}.self_attn.q_proj",
             "model.vision_model.encoder.layers.{kk}.self_attn.k_proj",
             "model.vision_model.encoder.layers.{kk}.self_attn.v_proj",
@@ -1207,7 +1207,7 @@ def get_model_layer_config(return_non_layered=True):
             "model.visual.deepstack_merger_list.{kk}.linear_fc1",
             "model.visual.deepstack_merger_list.{kk}.linear_fc2",
 
-            # Idefics3 (granite-docling, SmolVLM2)
+            # Idefics3
             "model.connector.modality_projection.proj",
 
         },
@@ -1256,7 +1256,7 @@ def get_model_layer_config(return_non_layered=True):
             "model.language_model.per_layer_model_projection",
             "model.language_model.per_layer_projection_norm",
 
-            # Idefics3 (granite-docling, SmolVLM2)
+            # Idefics3
             "model.vision_model.embeddings.patch_embedding",
             "model.vision_model.embeddings.position_embedding",
             "model.vision_model.post_layernorm",

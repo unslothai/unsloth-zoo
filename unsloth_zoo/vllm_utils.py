@@ -1229,7 +1229,7 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
 
     # Embedding
     if hasattr(vllm_internals, "model") and hasattr(vllm_internals.model, "text_model"):
-        # Idefics3, SmolVLM2: model wraps text_model/vision_model/connector
+        # Idefics3 nests the text model at model.text_model
         vllm_text_model = vllm_internals.model.text_model
         vllm_text_model_prefix = "model.text_model"
     elif hasattr(vllm_internals, "model"): # Standard Language models
