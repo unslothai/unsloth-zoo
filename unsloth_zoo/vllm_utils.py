@@ -3052,7 +3052,6 @@ def load_vllm(
             # profiling; cap seqs low for vision models.
             # TODO: vLLM V1 profiling may cap max seqs by budget; check.
             if max_num_seqs not in (None, 256):
-                # Explicit override (e.g. text-only use of a multimodal model): keep it.
                 print(f'Unsloth: Vision model detected, honoring max_num_seqs = {max_num_seqs}')
                 approx_max_num_seqs = max_num_seqs
             else:

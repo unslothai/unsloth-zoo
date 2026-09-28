@@ -410,8 +410,7 @@ def patch_gemma4_vllm_lora_support():
 pass
 
 def _patch_gemma4_vllm_expert_mapping():
-    # vLLM 0.19-0.24 LoRA raises "'get_expert_mapping' must be implemented" on Gemma 4 MoE;
-    # 0.25+ serves it from RoutedExperts.get_expert_mapping, which a top-level shim would shadow.
+    # Only vLLM 0.19-0.24 lacks it; on 0.25+ a top-level shim would shadow RoutedExperts.get_expert_mapping.
     try:
         from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
     except Exception:
