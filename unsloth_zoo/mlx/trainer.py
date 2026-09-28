@@ -594,6 +594,7 @@ from .utils import (
     iter_mlx_lora_modules,
     apply_gradient_checkpointing,
     remove_gradient_checkpointing,
+    _get_transformer_layers,
     _is_vlm_model,
     _mlx_norm_path_part_is_norm,
     iter_mlx_norm_output_cast_classes,
@@ -888,6 +889,43 @@ def _donate_optimizer_state(optimizer):
 
     optimizer.apply_single = _apply_single
     return optimizer
+
+
+def _layer_path_prefix(model):
+    """Parameter-name prefix of the transformer layers, e.g. ``model.layers.``."""
+    layers = _get_transformer_layers(model)
+    if not layers:
+        return None
+    for name, module in model.named_modules():
+        if module is layers[0]:
+            return name.rsplit(".", 1)[0] + "."
+    return None
+
+
+def _async_eval_by_layer(tree, prefix):
+    """Schedule a parameter-shaped tree one layer at a time, last layer first.
+
+    Nothing but the step's end consumes an update or an accumulated gradient,
+    so MLX runs them after the whole backward, keeping every layer's gradient
+    and the activations behind it alive. Scheduling layers in backward order
+    frees each one as soon as the backward has passed it; the model's own
+    embeddings and norms follow one at a time. Waiting for the previous group
+    keeps the host from queueing every group before any frees.
+    """
+    parent = prefix.rsplit(".", 2)[0] + "." if prefix.count(".") > 1 else ""
+    layers, rest = {}, []
+    for name, value in tree_flatten(tree):
+        if name.startswith(prefix):
+            index = int(name[len(prefix):].split(".", 1)[0])
+            layers.setdefault(index, []).append(value)
+        elif name.startswith(parent):
+            rest.append([value])
+    previous = None
+    for group in [layers[i] for i in sorted(layers, reverse=True)] + rest[::-1]:
+        mx.async_eval(group)
+        if previous is not None:
+            mx.eval(previous)
+        previous = group
 
 
 _part_is_norm = _mlx_norm_path_part_is_norm
@@ -5919,6 +5957,12 @@ class MLXTrainer:
             model.state, optimizer.state, mx.random.state,
             *_reference_compile_state,
         ]
+        _layer_prefix = _layer_path_prefix(model)
+        # State created lazily inside the first compiled step raises that step's peak.
+        if hasattr(optimizer, "init"):
+            optimizer.init(model.trainable_parameters())
+            mx.eval(optimizer.state)
+            state[1] = optimizer.state
         # grad_accum==1 fast path: only for unclipped updates, since
         # clip_grad_norm can spike peak memory on bf16 VLM runs.
         _direct_single_step_update = (
@@ -7987,6 +8031,12 @@ class MLXTrainer:
                 eval_targets.append(grad_accum_state[1])
             if grad_norm is not None:
                 eval_targets.append(grad_norm)
+            if _layer_prefix is not None:
+                _async_eval_by_layer(
+                    model.trainable_parameters() if grad_accum_state is None
+                    else grad_accum_state[0],
+                    _layer_prefix,
+                )
             mx.eval(*eval_targets)
             global_toks = self._distributed_all_sum(supervised_toks, stream=mx.cpu)
             mx.eval(global_toks)
