@@ -4222,6 +4222,12 @@ def merge_and_overwrite_lora(
         break
     pass
 
+    # Read before Step 1 rewrites config.json: an in-place export would strip the block size.
+    _fp8_disk_block_size = (
+        _fp8_block_size_on_disk(model_name, token)
+        if base_model_is_quantized and quant_type == "fp8" and save_method == "merged_16bit" else None
+    )
+
     n_saved_modules = 0
     def upload_items(filename = None):
         extras = {"repo_id" : repo_id, "repo_type" : "model", "commit_message" : "(Trained with Unsloth)", }
@@ -4575,6 +4581,9 @@ def merge_and_overwrite_lora(
                         break
             if isinstance(_wbs, (list, tuple)) and len(_wbs) == 2:
                 _merge_weight_block_size = tuple(int(x) for x in _wbs)
+        if _merge_weight_block_size is None:
+            # A 4bit load holds a bitsandbytes config in memory.
+            _merge_weight_block_size = _fp8_disk_block_size
     # Gated archs + 16bit merge only: fold each LoRA delta onto dequant(W4) instead of W16
     # (see _merge_lora). Strict no-op for every other model/merge.
     _use_dequant_base = (
@@ -6692,6 +6701,39 @@ def _load_quant_config_or_raise(config_path, model_name_or_path):
             f"full rewrite, whatever save_method you asked for. Repair or remove "
             f"config.json (or re-download the base) and retry."
         ) from e
+pass
+
+def _fp8_block_size_on_disk(model_name_or_path, token = None):
+    """(rows, cols) fp8 block from the base config.json, else None; the scale-grid guess is wrong for ragged dims."""
+    try:
+        is_quantized, quant_type = check_model_quantization_status(model_name_or_path, token)
+    except Exception:
+        return None
+    if not is_quantized or quant_type != "fp8":
+        return None
+    config = None
+    try:
+        if os.path.isdir(str(model_name_or_path)):
+            config = _load_quant_config_or_raise(
+                os.path.join(model_name_or_path, "config.json"), model_name_or_path
+            )
+        else:
+            from huggingface_hub import hf_hub_download
+            repo_id, revision = _hub_repo_and_revision(model_name_or_path)
+            config = _load_quant_config_or_raise(
+                hf_hub_download(repo_id = repo_id, filename = "config.json", token = token, revision = revision),
+                model_name_or_path,
+            )
+    except Exception:
+        return None
+    quant = (config or {}).get("quantization_config") or {}
+    block = quant.get("weight_block_size") if isinstance(quant, dict) else None
+    if isinstance(block, (list, tuple)) and len(block) == 2:
+        try:
+            return tuple(int(x) for x in block)
+        except (TypeError, ValueError):
+            return None
+    return None
 pass
 
 def check_model_quantization_status(model_name_or_path, token=None, local_ok=True):
