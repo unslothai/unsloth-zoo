@@ -33,6 +33,7 @@ from .qwen3_next_moe import *
 from .qwen3_5_moe import *
 from .glm4_moe import *
 from .deepseek_v3_moe import *
+from .deepseek_v4 import *
 from .gemma4_moe import *
 from .lfm2_moe import *
 from .step3p7_moe import *
