@@ -1420,6 +1420,81 @@ pass
 TEMPORARY_PATCHES.append(patch_mamba_fused_split_without_causal_conv1d)
 
 
+_LOCAL_KERNEL_PACKAGES = {
+    "mamba-ssm"     : ("mamba_ssm", "ops.triton.ssd_combined"),
+    "causal-conv1d" : ("causal_conv1d", None),
+}
+
+
+def _local_kernel_fallback_allowed():
+    if os.environ.get("UNSLOTH_LOCAL_MAMBA_KERNELS", "1") == "0":
+        return False
+    if not torch.cuda.is_available() or getattr(torch.version, "hip", None) is not None:
+        return False
+    try:
+        return torch.cuda.get_device_capability() >= (8, 0)
+    except Exception:
+        return False
+pass
+
+
+def patch_lazy_load_kernel_local_packages():
+    # transformers 5.15 dropped mamba-ssm / causal-conv1d from _HUB_KERNEL_MAPPING; lazy_load_kernel returns None for unmapped names without trying the local package.
+    if not _local_kernel_fallback_allowed():
+        return
+    try:
+        from transformers.integrations import hub_kernels
+    except Exception:
+        return
+    original = getattr(hub_kernels, "lazy_load_kernel", None)
+    if original is None or getattr(original, "_unsloth_local_packages", False):
+        return
+    hub_mapping = getattr(hub_kernels, "_HUB_KERNEL_MAPPING", None)
+    if hub_mapping is None:
+        return
+
+    def _import_local(kernel_name):
+        package, submodule = _LOCAL_KERNEL_PACKAGES[kernel_name]
+        try:
+            module = importlib.import_module(package)
+            if submodule is not None:
+                # Import ssd_combined so a broken install falls back to None, not a mid-forward crash.
+                importlib.import_module(f"{package}.{submodule}")
+            return module
+        except Exception as e:
+            logger.info(f"Unsloth: local {package} unusable for kernel {kernel_name}: {e}")
+            return None
+    pass
+
+    @functools.wraps(original)
+    def lazy_load_kernel(kernel_name, *args, **kwargs):
+        mapping = args[0] if args else kwargs.get("mapping", None)
+        if mapping is None:
+            mapping = getattr(hub_kernels, "_KERNEL_MODULE_MAPPING", {})
+        if (
+            kernel_name in _LOCAL_KERNEL_PACKAGES
+            and kernel_name not in hub_mapping
+            and not isinstance(mapping.get(kernel_name, None), type(os))
+            and _local_kernel_fallback_allowed()
+        ):
+            module = _import_local(kernel_name)
+            if module is not None:
+                mapping[kernel_name] = module
+                return module
+        return original(kernel_name, *args, **kwargs)
+    lazy_load_kernel._unsloth_local_packages = True
+    lazy_load_kernel._unsloth_original = original
+    hub_kernels.lazy_load_kernel = lazy_load_kernel
+    # `from transformers.integrations import lazy_load_kernel` reads the package namespace.
+    try:
+        import transformers.integrations as integrations
+        integrations.lazy_load_kernel = lazy_load_kernel
+    except Exception:
+        pass
+pass
+TEMPORARY_PATCHES.append(patch_lazy_load_kernel_local_packages)
+
+
 def patch_datasets_map_worker_death_retry():
     """Retry `Dataset.map` single-process when a worker is killed outright.
 
