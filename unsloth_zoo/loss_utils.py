@@ -199,18 +199,21 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
     
     # Causal LM loss
     def UnslothForCausalLMLoss(
-        logits, labels, vocab_size: int, num_items_in_batch: int = None, ignore_index: int = -100, **kwargs
+        logits, labels, vocab_size: int, num_items_in_batch: int = None, ignore_index: int = -100,
+        shift_labels: Optional[torch.Tensor] = None, **kwargs
     ):
-        if labels is None: return None
-        # Flat (tokens, vocab) logits (Ling-2.6-flash MTP head): take the labels' rows, as stock shifts per label row.
+        if shift_labels is None:
+            if labels is None: return None
+            # Shift before flattening so each label row retains its own end mask.
+            shift_labels = torch.empty_like(labels)
+            shift_labels[..., :-1] = labels[..., 1:]
+            shift_labels[..., -1] = ignore_index
+        # The fast CE kernel takes (batch, sequence, vocab), including for flat
+        # logits (e.g. MTP heads). Explicit targets are already aligned to logits.
         if logits.dim() == 2:
-            labels = labels.reshape(1, -1) if labels.dim() < 2 else labels.reshape(-1, labels.shape[-1])
-            logits = logits.view(*labels.shape, logits.shape[-1])
-        shift_logits = logits
-        shift_labels = torch.empty_like(labels)
-        shift_labels[..., :-1] = labels[..., 1:]
-        shift_labels[..., -1] = ignore_index
-        loss = unsloth_fixed_cross_entropy(shift_logits, shift_labels, num_items_in_batch, ignore_index, **kwargs)
+            logits = logits.unsqueeze(0)
+        shift_labels = shift_labels.reshape(logits.shape[:-1]).to(logits.device).contiguous()
+        loss = unsloth_fixed_cross_entropy(logits, shift_labels, num_items_in_batch, ignore_index, **kwargs)
         return loss
     pass
 
