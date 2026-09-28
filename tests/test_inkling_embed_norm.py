@@ -1,10 +1,4 @@
-"""Inkling must apply embed_norm exactly once before the first decoder layer.
-
-transformers 5.17.0 norms the token embeddings in InklingModel.forward and again in
-InklingTextModel.forward (huggingface/transformers#47827, fixed on main by #48786), which breaks
-every real checkpoint: Inkling-Small wikitext PPL 1099 instead of about 31.
-temporary_patches/inkling.py removes the duplicate norm on 5.17.x only.
-"""
+"""Inkling applies embed_norm once before the first decoder layer (transformers 5.17 norms twice, #47827)."""
 import importlib
 import os
 import subprocess
@@ -19,8 +13,7 @@ os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
 modeling_inkling = pytest.importorskip("transformers.models.inkling.modeling_inkling")
 from transformers.models.inkling.configuration_inkling import InklingConfig
 
-# thinkingmachines/Inkling-Small config.json (original checkpoint layout), shrunk: same flags, same
-# local/global layer pattern and dense-then-MoE schedule, tiny widths.
+# thinkingmachines/Inkling-Small config.json shrunk: same flags and layer schedule, tiny widths
 INKLING_SMALL_SHRUNK = {
     "architectures": ["InklingForConditionalGeneration"],
     "model_type": "inkling_mm_model",
@@ -53,8 +46,7 @@ def _apply_zoo_patches():
 
 
 def _device():
-    # transformers routes the short convolutions to the causal_conv1d kernel when it is
-    # installed, and that kernel is CUDA only
+    # causal_conv1d, used when installed, is CUDA only
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -70,7 +62,6 @@ def _tiny_model(device = None, dtype = torch.float32):
 
 
 def _text_path_logits(model, input_ids):
-    # The text-only path of every transformers release (5.14 through main) norms the token embeddings once
     language_model = model.model.language_model
     raw = torch.nn.functional.embedding(input_ids, model.get_input_embeddings().weight)
     norm_weight = next(p for n, p in model.named_parameters() if n.endswith("embed_norm.weight"))
@@ -112,7 +103,6 @@ def test_inkling_embed_norm_applied_once(entry):
 
 
 def test_inkling_logits_match_single_norm_reference():
-    # Multimodal entry point == text-only entry point on the same weights (fp32)
     _apply_zoo_patches()
     model = _tiny_model()
     device = next(model.parameters()).device
@@ -126,7 +116,6 @@ def test_inkling_logits_match_single_norm_reference():
 
 
 def test_inkling_generate_matches_single_norm_reference():
-    # KV cache + conv state decode path still norms once per new token
     _apply_zoo_patches()
     model = _tiny_model()
     device = next(model.parameters()).device
@@ -153,7 +142,6 @@ def test_inkling_patch_gate():
 
 
 def test_inkling_patch_noop_when_gate_off():
-    # Outside 5.17.x the patch must leave transformers untouched
     code = textwrap.dedent("""
         import os
         os.environ["UNSLOTH_IS_PRESENT"] = "1"

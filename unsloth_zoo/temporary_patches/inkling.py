@@ -14,14 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Inkling fixes for transformers releases that load the checkpoints incorrectly.
-
-1. Inkling-Small config: its intermediate_size is the MoE width, not the dense width.
-2. transformers 5.17.0 applies embed_norm twice on the multimodal path (InklingModel norms the
-   token embeddings, then InklingTextModel norms them again). Introduced by
-   huggingface/transformers#47827, fixed by huggingface/transformers#48786, which is not in a
-   release yet. Inkling shipped in 5.14.0; 5.14, 5.15 and 5.16 norm once.
-"""
+"""Inkling fixes: Inkling-Small MoE width; embed_norm applied twice on transformers 5.17 (transformers#47827, fixed by #48786)."""
 import functools
 import inspect
 
@@ -64,7 +57,6 @@ def _identity(hidden_states):
 
 
 def _transformers_has_double_embed_norm_release(version = None):
-    # Only the 5.17 series shipped the double norm (5.17.0 is the only such release so far)
     try:
         from packaging.version import Version
         if version is None:
@@ -93,8 +85,7 @@ def patch_inkling_double_embed_norm():
         text_source = inspect.getsource(text_model.forward)
     except Exception:
         return
-    # Only the buggy layout: both forwards norm the embeddings. The upstream fix moves the norm
-    # into the embedding module, so neither string is present there and nothing is patched.
+    # #48786 moves the norm into embed_tokens, so a backport fails these checks and stays unpatched
     if "self.language_model.embed_norm(inputs_embeds)" not in mm_source:
         return
     if "self.embed_norm(inputs_embeds)" not in text_source:
@@ -107,10 +98,9 @@ def patch_inkling_double_embed_norm():
     def text_forward(self, *args, **kwargs):
         if not getattr(self, "_unsloth_inputs_embeds_normed", False):
             return original_text_forward(self, *args, **kwargs)
-        # Called from InklingModel.forward: the embeddings are already normed, skip the second norm.
         self._unsloth_inputs_embeds_normed = False
         norm = self.embed_norm
-        # Keep any instance-level forward (for example an accelerate hook) and restore it after.
+        # Restore any instance-level forward (accelerate hooks)
         had_forward = "forward" in norm.__dict__
         previous_forward = norm.__dict__.get("forward")
         norm.forward = _identity
