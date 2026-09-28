@@ -290,3 +290,13 @@ def test_cut_media_delimiter_alone_passes_when_the_model_names_its_feature_token
         collator(batch)
     collator._feature_token_ids = [IMG_ID]
     assert collator(batch)["input_ids"].tolist() == [[1, IMG_ID]]
+
+
+def test_feature_token_ids_cover_every_config_spelling():
+    import types
+    from unsloth_zoo.vision_utils import _media_feature_token_ids
+    llava_onevision = types.SimpleNamespace(image_token_index = 151646, video_token_index = 151647)
+    phi4mm = types.SimpleNamespace(vision_config = types.SimpleNamespace(image_token_id = 200010),
+                                   audio_config = types.SimpleNamespace(audio_token_id = 200011))
+    assert _media_feature_token_ids(types.SimpleNamespace(config = llava_onevision)) == [151646, 151647]
+    assert _media_feature_token_ids(types.SimpleNamespace(config = phi4mm)) == [200010, 200011]
