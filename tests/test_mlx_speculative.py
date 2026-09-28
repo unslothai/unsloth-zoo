@@ -4,6 +4,7 @@ from math import prod
 
 import pytest
 
+pytest.importorskip("mlx.core")
 from unsloth_zoo.mlx.speculative import DraftController, NgramProposer, RoundPlan, RowPlan, RowState, _Ema
 
 

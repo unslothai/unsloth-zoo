@@ -18,16 +18,24 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from typing import Literal, Sequence
+import time
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, Literal, Sequence
+
+import mlx.core as mx
+
+from .generate import SamplingParams
 
 __all__ = [
     "DraftController",
+    "EngineRow",
     "NgramProposer",
     "ReplyStats",
     "RoundPlan",
     "RowPlan",
     "RowState",
+    "SpeculativeEngine",
+    "StepOutput",
 ]
 
 
@@ -559,3 +567,328 @@ class DraftController:
             self.catch_up_cost.update(catch_up_seconds / catch_up, self.cost_alpha)
         self.steps += (sum(min(int(a), row.length) for a, row in zip(accepted, plan.rows)) + len(rows)) / len(rows)
         self._measured_at[self._identity(plan, bucket)] = self.steps
+
+
+# Speculative decoding engine over an mlx-vlm model: verify rounds and plain windows for B rows.
+
+
+_U64 = (1 << 64) - 1
+
+
+def _position_seed(seed: int, position: int) -> int:
+    # splitmix64 of (seed, position): draws for different positions of one reply are independent.
+    x = (seed + (position + 1) * 0x9E3779B97F4A7C15) & _U64
+    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & _U64
+    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & _U64
+    return x ^ (x >> 31)
+
+
+class _RowSampler:
+    """Draws the token at absolute position ``p`` from a key of (seed, p), so a draw depends only on
+    its logits and position: rejected positions consume nothing, and rounds, plain windows and
+    batch membership leave the random stream unchanged."""
+
+    def __init__(self, params: SamplingParams):
+        self.temperature = params.temperature
+        self.seed = params.seed
+        self.stages = []
+        if self.temperature == 0:
+            return
+        if self.seed is None:
+            self.seed = int(mx.random.randint(0, 1 << 31).item())
+        from mlx_lm import sample_utils
+
+        if 0 < params.top_p < 1:
+            self.stages.append(lambda x: sample_utils.apply_top_p(x, params.top_p))
+        if params.min_p:
+            self.stages.append(lambda x: sample_utils.apply_min_p(x, params.min_p, 1))
+        if params.top_k > 0:
+            self.stages.append(lambda x: sample_utils.apply_top_k(x, params.top_k))
+
+    def __call__(self, logprobs: mx.array, position: int) -> mx.array:
+        """Tokens for ``logprobs`` rows ``[n, vocab]`` at positions ``position .. position + n - 1``."""
+        if self.temperature == 0:
+            return mx.argmax(logprobs, axis = -1)
+        for stage in self.stages:
+            logprobs = stage(logprobs)
+        keys = mx.stack([mx.random.key(_position_seed(self.seed, position + i)) for i in range(logprobs.shape[0])])
+        scale = 1 / self.temperature
+        return mx.vmap(lambda row, key: mx.random.categorical(row * scale, key = key))(logprobs, keys)
+
+
+@dataclass(eq = False)
+class EngineRow:
+    """A prefilled reply joining the engine.
+
+    ``cache`` holds the prompt; ``pending`` is the last sampled token, already emitted but not yet
+    forwarded; ``emitted`` counts the tokens emitted so far, ``pending`` included, and is the
+    position of the next draw.
+    """
+
+    cache: list
+    pending: int
+    prompt: Sequence[int]
+    sampling: SamplingParams = field(default_factory = SamplingParams)
+    max_tokens: int | None = None
+    emitted: int = 1
+    stop_tokens: frozenset = frozenset()
+    processors: Sequence[Callable] = ()
+    rope_delta: int = 0
+    uid: Any = None
+
+
+@dataclass(frozen = True)
+class StepOutput:
+    """One row's tokens from a step, with its reply's running draft counters."""
+
+    uid: Any
+    tokens: list[int]
+    finished: bool
+    draft_n: int
+    draft_n_accepted: int
+
+
+class _Row:
+    def __init__(self, row: EngineRow, controller: DraftController):
+        self.uid = row.uid
+        self.pending = int(row.pending)
+        self.tokens = [int(token) for token in row.prompt] + [self.pending]
+        self.emitted = int(row.emitted)
+        self.max_tokens = row.max_tokens
+        self.stop_tokens = frozenset(row.stop_tokens)
+        self.processors = list(row.processors)
+        self.rope_delta = int(row.rope_delta)
+        self.sample = _RowSampler(row.sampling)
+        self.proposer = NgramProposer(row.prompt)
+        self.state = RowState(controller.new_reply(), can_draft = False)
+        self.finished = self.pending in self.stop_tokens or self.remaining == 0
+        self.draft_n = 0
+        self.draft_n_accepted = 0
+
+    @property
+    def remaining(self) -> int | None:
+        return None if self.max_tokens is None else max(0, self.max_tokens - self.emitted)
+
+    def logprobs(self, logits: mx.array) -> mx.array:
+        """``logits [1, vocab]`` for the next position, through this row's processors."""
+        if self.processors:
+            history = mx.array(self.tokens)
+            for processor in self.processors:
+                logits = processor(history, logits)
+        return logits - mx.logsumexp(logits, axis = -1, keepdims = True)
+
+    def take(self, tokens: Sequence[int]) -> list[int]:
+        """Emit ``tokens`` up to a stop token or the budget; the last one taken becomes pending."""
+        taken = []
+        for token in tokens:
+            if self.finished:
+                break
+            taken.append(int(token))
+            self.emitted += 1
+            self.finished = int(token) in self.stop_tokens or self.remaining == 0
+        if taken:
+            self.tokens.extend(taken)
+            self.pending = taken[-1]
+        return taken
+
+
+def _language_call(family: str):
+    try:
+        module = __import__(f"mlx_vlm.models.{family}.language", fromlist = ["LanguageModel"])
+    except ImportError:
+        return None
+    return module.LanguageModel.__call__
+
+
+class SpeculativeEngine:
+    """Decodes B rows with the controller's choice each step: a verify round at one width, each
+    row verifying its own proposal and committing its own accepted count, or a window of
+    ordinary decode steps. Rows join and leave only between steps, when every row holds exactly
+    one pending token and the caches hold everything before it."""
+
+    def __init__(self, model, controller: DraftController):
+        from mlx_vlm.speculative.common import generation_stream, verify_forward
+
+        self.lm = getattr(model, "language_model", model)
+        self.controller = controller
+        self._verify_forward = verify_forward
+        self._stream = generation_stream
+        # qwen3_5's exact verifier matches one-token decoding bitwise, alone and batched, and passing
+        # a capture list keeps the forward off the per-row paths that replace cache objects.
+        call = type(self.lm).__call__
+        self._exact = call is _language_call("qwen3_5")
+        # Families whose verify forward was measured to commit ragged acceptance correctly.
+        self._batch_rounds = self._exact or call is _language_call("gemma4")
+        self._mrope = hasattr(self.lm, "_rope_deltas")
+        self._rows: list[_Row] = []
+        self.cache: list | None = None
+        self.round_refusal: str | None = None
+
+    @property
+    def rows(self) -> list[Any]:
+        return [row.uid for row in self._rows]
+
+    def add(self, row: EngineRow) -> None:
+        if any(existing.uid == row.uid for existing in self._rows):
+            raise ValueError(f"row {row.uid!r} is already in the engine")
+        if not self._rows:
+            self.cache = list(row.cache)
+        elif len(self._rows) == 1:
+            self.cache = [type(batch).merge([batch, new]) for batch, new in zip(self.cache, row.cache)]
+        else:
+            for batch, new in zip(self.cache, row.cache):
+                batch.extend(type(new).merge([new]))
+        self._rows.append(_Row(row, self.controller))
+
+    def remove(self, uid) -> None:
+        keep = [i for i, row in enumerate(self._rows) if row.uid != uid]
+        if len(keep) == len(self._rows):
+            raise KeyError(uid)
+        self._rows = [self._rows[i] for i in keep]
+        if not keep:
+            self.cache = None
+        elif len(keep) == 1:
+            # A single-row batch cache sends some families down per-row paths that replace it.
+            self.cache = [batch.extract(keep[0]) for batch in self.cache]
+        else:
+            indices = mx.array(keep)
+            for batch in self.cache:
+                batch.filter(indices)
+
+    def step(self) -> list[StepOutput]:
+        """One round or plain window, one output per row. Finished rows leave the engine."""
+        if not self._rows:
+            return []
+        states = self._states()
+        if self._rounds_allowed():
+            plan = self.controller.plan(states)
+        else:
+            room = min((row.remaining for row in self._rows if row.remaining is not None), default = None)
+            plan = RoundPlan("plain", self.controller.max_window if room is None else min(room, self.controller.max_window))
+        emitted = self._round(plan, states) if plan.kind == "round" else None
+        if emitted is None:
+            emitted = self._plain(max(1, plan.length), states)
+        out = [StepOutput(row.uid, tokens, row.finished, row.draft_n, row.draft_n_accepted) for row, tokens in zip(self._rows, emitted)]
+        for row in [row for row in self._rows if row.finished]:
+            self.remove(row.uid)
+        return out
+
+    def _rounds_allowed(self) -> bool:
+        return self.round_refusal is None and (len(self._rows) == 1 or self._batch_rounds)
+
+    def _states(self) -> list[RowState]:
+        for row in self._rows:
+            state = row.state
+            state.remaining = row.remaining
+            state.copy_available = (
+                0 if row.processors else len(row.proposer.propose(row.tokens, self.controller.max_copy))
+            )
+        return [row.state for row in self._rows]
+
+    def _position_kwargs(self) -> dict:
+        if not self._mrope:
+            return {}
+        return {"rope_deltas": mx.array([[row.rope_delta] for row in self._rows])}
+
+    def _forward(self, inputs: mx.array) -> mx.array:
+        return self.lm(inputs, cache = self.cache, **self._position_kwargs()).logits
+
+    def _verify(self, inputs: mx.array):
+        if self._exact:
+            out = self.lm(
+                inputs, cache = self.cache, capture_layer_ids = [], speculative_verify = True, **self._position_kwargs()
+            )
+            return out.logits, out.gdn_states
+        out, transaction = self._verify_forward(self.lm, inputs, self.cache, **self._position_kwargs())
+        return out.logits, transaction
+
+    def _sample_step(self, logits: mx.array, ahead: int = 0) -> mx.array:
+        # ``ahead``: tokens already sampled for each row but not taken yet.
+        return mx.concatenate(
+            [row.sample(row.logprobs(logits[i : i + 1, -1]), row.emitted + ahead) for i, row in enumerate(self._rows)]
+        )
+
+    def _plain(self, length: int, states: list[RowState]) -> list[list[int]]:
+        rows = self._rows
+        emitted = [[] for _ in rows]
+        # Processors read the history, so a row with them needs each token before the next step.
+        pipelined = not any(row.processors for row in rows)
+        start = time.perf_counter()
+        with mx.stream(self._stream):
+            tokens = self._sample_step(self._forward(mx.array([[row.pending] for row in rows])))
+        steps = 0
+        while True:
+            steps += 1
+            last = steps >= length or all(row.finished for row in rows)
+            upcoming = None
+            if not last and pipelined:
+                with mx.stream(self._stream):
+                    upcoming = self._sample_step(self._forward(tokens[:, None]), ahead = 1)
+                mx.async_eval(upcoming)
+            for i, token in enumerate(tokens.tolist()):
+                emitted[i].extend(rows[i].take([token]))
+            if last:
+                break
+            if upcoming is None:
+                with mx.stream(self._stream):
+                    upcoming = self._sample_step(self._forward(tokens[:, None]))
+            elif self.controller.interrupts_plain(self._states()):
+                # The next step is already queued, so it becomes the window's last.
+                length = steps + 1
+            tokens = upcoming
+        self.controller.record_plain(states, steps, time.perf_counter() - start)
+        return emitted
+
+    def _round(self, plan: RoundPlan, states: list[RowState]) -> list[list[int]] | None:
+        rows, width = self._rows, plan.width
+        proposals = [
+            row.proposer.propose(row.tokens, spec.length) if spec.source == "copy" else []
+            for row, spec in zip(rows, plan.rows)
+        ]
+        inputs = mx.array(
+            [[row.pending, *proposal] + [row.pending] * (width - 1 - len(proposal)) for row, proposal in zip(rows, proposals)]
+        )
+        start = time.perf_counter()
+        entries = list(self.cache)
+        with mx.stream(self._stream):
+            logits, transaction = self._verify(inputs)
+        if any(now is not before for now, before in zip(self.cache, entries)):
+            self.cache[:] = entries
+            transaction.abort()
+            self.round_refusal = f"{type(self.lm).__name__} replaced its cache objects during a verify forward"
+            return None
+        try:
+            with mx.stream(self._stream):
+                targets = []
+                for i, (row, proposal) in enumerate(zip(rows, proposals)):
+                    if row.processors:
+                        logprobs = row.logprobs(logits[i : i + 1, 0])
+                    else:
+                        logprobs = logits[i, : len(proposal) + 1]
+                        logprobs = logprobs - mx.logsumexp(logprobs, axis = -1, keepdims = True)
+                    targets.append(row.sample(logprobs, row.emitted))
+            mx.eval(targets)
+            targets = [target.tolist() for target in targets]
+            accepted = []
+            for proposal, target in zip(proposals, targets):
+                count = 0
+                while count < len(proposal) and proposal[count] == target[count]:
+                    count += 1
+                accepted.append(count)
+            transaction.commit([count + 1 for count in accepted])
+            if len(set(accepted)) > 1:
+                # A ragged commit grows BatchKVCache.left_padding in place, but qwen3_5 memoizes decode pads by that array's identity.
+                for entry in self.cache:
+                    padding = getattr(entry, "left_padding", None)
+                    if isinstance(padding, mx.array) and not hasattr(entry, "metadata_revision"):
+                        entry.left_padding = padding + 0
+        except BaseException:
+            transaction.abort()
+            raise
+        emitted = []
+        for row, proposal, target, count in zip(rows, proposals, targets, accepted):
+            row.draft_n += len(proposal)
+            row.draft_n_accepted += count
+            emitted.append(row.take(proposal[:count] + [target[count]]))
+        self.controller.record_round(plan, states, accepted, seconds = time.perf_counter() - start)
+        return emitted
