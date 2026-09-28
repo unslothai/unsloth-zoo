@@ -91,25 +91,13 @@ def test_a_wider_activation_is_still_offloaded_exactly(offload):
 
 def test_the_byte_view_reinterprets_without_casting():
     storage = torch.empty(4096, dtype = torch.bfloat16)
-    for dtype in (torch.float16, torch.float32):
+    for dtype in (torch.bfloat16, torch.float16, torch.float32):
         values = torch.randn(1024, dtype = torch.float32).to(dtype).view(4, 256)
         nbytes = values.numel() * values.element_size()
         gc._view_bytes_as(storage, nbytes, dtype, values.shape).copy_(values)
         assert torch.equal(gc._view_bytes_as(storage, nbytes, dtype, values.shape), values)
-        assert gc._elements_for(storage, nbytes) == nbytes // storage.element_size()
     values = torch.randn(1024).to(torch.float16)
     assert not torch.equal(values.to(torch.bfloat16).to(torch.float16), values)
-
-
-def test_elements_for_rounds_up_so_an_odd_byte_count_still_fits():
-    # Floor division would silently leave the byte view short of its shape.
-    for dtype in (torch.bfloat16, torch.float16, torch.float32):
-        storage = torch.empty(8, dtype = dtype)
-        esize = storage.element_size()
-        for nbytes in (1, esize - 1 or 1, esize, esize + 1, 3 * esize - 1):
-            got = gc._elements_for(storage, nbytes)
-            assert got * esize >= nbytes, f"{dtype} buffer sized {got} cannot hold {nbytes} bytes"
-            assert (got - 1) * esize < nbytes, f"{dtype} buffer sized {got} for {nbytes} bytes is oversized"
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "initialisation allocates GPU buffers")

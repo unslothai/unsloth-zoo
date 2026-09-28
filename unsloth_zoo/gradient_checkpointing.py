@@ -157,13 +157,9 @@ def _grow_host_buffer(buffer, new_size):
         return _mark_host_buffer(torch.empty(new_size, dtype = buffer.dtype, device = "cpu"))
 
 
-def _elements_for(buffer, nbytes):
-    """How many of `buffer`'s own elements it takes to hold `nbytes`."""
-    return -(-nbytes // buffer.element_size())
-
-
 def _view_bytes_as(buffer, nbytes, dtype, shape):
     """Reinterpret raw buffer bytes, never cast: the init dtype can differ from the activation's."""
+    if buffer.dtype == dtype: return buffer[:nbytes // dtype.itemsize].view(shape)
     return buffer.view(torch.uint8)[:nbytes].view(dtype).view(shape)
 
 
@@ -909,7 +905,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
                     # The cutoff counts stored bytes, so bf16-stored float32 offloads exactly where it always did.
                     store_dtype = torch.bfloat16 if (arg.dtype == torch.float32 and not FP32_OFFLOAD_EXACT) else arg.dtype
-                    new_size = arg.numel() * torch.empty((), dtype = store_dtype).element_size()
+                    new_size = arg.numel() * store_dtype.itemsize
 
                     global MINIMUM_SIZE
                     global CPU_INDEX
@@ -956,20 +952,23 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         # Extend buffer size
                         if CPU_INDEX >= len(CPU_BUFFERS):
                             with _no_inference_mode():
-                                x = _new_host_buffer(_elements_for(GPU_BUFFER, new_size), GPU_BUFFER.dtype)
+                                x = _new_host_buffer(-(-new_size // GPU_BUFFER.element_size()), GPU_BUFFER.dtype)
                             CPU_BUFFERS.append(x)
                         pass
 
                         x = CPU_BUFFERS[CPU_INDEX]
                         shape = arg.shape
-                        if _elements_for(x, new_size) > x.numel():
+                        # Elements of each buffer's own dtype needed for new_size bytes, rounded up.
+                        host_numel = -(-new_size // x.element_size())
+                        if host_numel > x.numel():
                             with _no_inference_mode():
-                                x = _grow_host_buffer(x, _elements_for(x, new_size))
+                                x = _grow_host_buffer(x, host_numel)
                             # Backward reads this slot by index, so store the replacement back.
                             CPU_BUFFERS[CPU_INDEX] = x
-                        if _elements_for(GPU_BUFFER, new_size) > GPU_BUFFER.numel():
+                        gpu_numel = -(-new_size // GPU_BUFFER.element_size())
+                        if gpu_numel > GPU_BUFFER.numel():
                             try:
-                                GPU_BUFFER.resize_(_elements_for(GPU_BUFFER, new_size))
+                                GPU_BUFFER.resize_(gpu_numel)
                             except RuntimeError as e:
                                 if "out of memory" not in str(e).lower():
                                     raise
@@ -980,15 +979,16 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                                         GPU_BUFFERS_B[j].resize_(0)
                                     GPU_BUFFERS_B = None
                                     print("Unsloth: Disabled double buffering due to insufficient VRAM.")
-                                    GPU_BUFFER.resize_(_elements_for(GPU_BUFFER, new_size))
+                                    GPU_BUFFER.resize_(gpu_numel)
                                 else:
                                     raise
                         # Resize buffer B when double buffering; disable + free B on OOM
                         if USE_DOUBLE_BUFFER:
                             GPU_BUFFER_B = GPU_BUFFERS_B[device_index]
-                            if _elements_for(GPU_BUFFER_B, new_size) > GPU_BUFFER_B.numel():
+                            gpu_b_numel = -(-new_size // GPU_BUFFER_B.element_size())
+                            if gpu_b_numel > GPU_BUFFER_B.numel():
                                 try:
-                                    GPU_BUFFER_B.resize_(_elements_for(GPU_BUFFER_B, new_size))
+                                    GPU_BUFFER_B.resize_(gpu_b_numel)
                                 except RuntimeError as e:
                                     if "out of memory" not in str(e).lower():
                                         raise
