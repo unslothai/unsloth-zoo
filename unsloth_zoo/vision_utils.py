@@ -1663,9 +1663,7 @@ class UnslothVisionDataCollator:
         )
 
     def _load_column_images(self, images):
-        # URL/path-like entries decode through the SSRF-guarded loader; processors like Idefics2 fetch URLs unguarded.
-        # No resize here, and EXIF orientation applied as datasets' Image decode does, so they match PIL entries.
-        # PIL images, arrays and tensors pass through.
+        # SSRF-guarded decode (Idefics2-style processors fetch URLs unguarded); unresized and EXIF-transposed like datasets' PIL.
         return [
             ImageOps.exif_transpose(_decode_image(img)) if isinstance(img, (str, bytes, bytearray, dict)) else img
             for img in images

@@ -14,8 +14,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Images-column entries on the messages (non prompt-completion) path load through
-fetch_image, so URLs hit Unsloth's private-address guard instead of a processor's fetcher."""
 
 from __future__ import annotations
 
