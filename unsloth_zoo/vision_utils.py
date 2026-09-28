@@ -1257,12 +1257,8 @@ pass
 
 
 def patch_medias_processor(processor):
-    """Kimi K2.5 / K2.7 processors take `medias=[{"type": "image", "image": ...}]` and one
-    unpadded `text`, and raise on the standard `processor(text=..., images=...)` call.
-    Patch the class so that call works: images go through the media processor
-    (`pixel_values`, `grid_thws`) and texts through the tokenizer with padding. The model
-    expands each `<|media_pad|>` into its image features itself. The remote calls
-    (`messages=` or `medias=` + `text=`) are unchanged. Returns True if patched."""
+    """Let Kimi K2.5 / K2.7 `medias=` processors take `processor(text=..., images=...)`;
+    remote `messages=` / `medias=` calls are unchanged. Returns True if patched."""
     import inspect
     from transformers.feature_extraction_utils import BatchFeature
     cls = type(processor)
@@ -1297,7 +1293,6 @@ def patch_medias_processor(processor):
             raise ValueError(
                 f"Unsloth: {cls.__name__} got {len(images)} images for {n_pad} `{pad}` placeholders in the text."
             )
-        # Only tokenizer arguments; image options have no meaning for the media processor.
         tok_keys = ("padding", "truncation", "max_length", "add_special_tokens", "pad_to_multiple_of",
                     "padding_side", "return_attention_mask")
         tok_kwargs = {k: kwargs[k] for k in tok_keys if k in kwargs and kwargs[k] is not None}
@@ -1373,7 +1368,6 @@ class UnslothVisionDataCollator:
             raise TypeError("Unsloth: UnslothVisionDataCollator is only for image models!")
         self._seen_supervised = False
         self._warned_unsupervised = False
-        # Kimi K2.5 / K2.7: medias= API, see patch_medias_processor.
         patch_medias_processor(processor)
 
         self.padding_token_ids = get_padding_tokens_ids(processor)

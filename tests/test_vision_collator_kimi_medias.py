@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Kimi K2.5 / K2.7 processors take `medias=` and one unpadded `text`, not `images=`.
-The processor stub below keeps the remote KimiK25Processor.__call__ body. Hermetic CPU test."""
+"""Kimi K2.5 / K2.7 `medias=` processors through the vision collator; stub keeps the remote __call__ body."""
 
 from __future__ import annotations
 
@@ -130,7 +129,6 @@ def test_collator_calls_a_medias_processor_and_masks_the_media_tokens():
     n_patches = int(batch["grid_thws"].prod(dim = 1).sum())
     assert batch["pixel_values"].shape[0] == n_patches
     assert batch["pixel_values"].dtype == torch.bfloat16
-    # Image order follows example order.
     first = int(batch["grid_thws"][0].prod())
     assert float(batch["pixel_values"][:first].float().mean()) == 0.0
     assert float(batch["pixel_values"][first:].float().mean()) == 1.0
