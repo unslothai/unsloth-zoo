@@ -70,6 +70,8 @@ def test_grouped_mm_matches_dequantize_then_matmul(transpose_b, counts):
 def test_every_tile_config_matches(E, M_per_expert, asm, big_tiles, monkeypatch):
     import unsloth_zoo.mxfp4_gemm as mg
     from unsloth_zoo.mxfp4_gemm import mxfp4_grouped_mm
+    if big_tiles and not mg._big_tiles(torch.device("cuda", torch.cuda.current_device())):
+        pytest.skip("the B200 tile table only runs on sm_100 (256x256 overflows smaller shared memory)")
     monkeypatch.setattr(mg, "_ASM_OK", {k: asm for k in (None, 0, torch.cuda.current_device())})
     monkeypatch.setattr(mg, "_BIG_TILES", {k: big_tiles for k in (None, 0, torch.cuda.current_device())})
     R, C = (320, 192) if E < 256 else (64, 64)

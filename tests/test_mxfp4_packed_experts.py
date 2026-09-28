@@ -821,3 +821,37 @@ def test_training_step_matches_across_fused_and_dequant(monkeypatch, mode):
     assert ga.keys() == gb.keys() and "x" in ga and len(ga) > 1
     for name in ga:
         torch.testing.assert_close(gb[name], ga[name], rtol = 3e-2, atol = 3e-2 * ga[name].abs().max().item() + 1e-6)
+
+
+@needs_cuda
+@needs_triton
+def test_fused_decode_moe_sums_each_tokens_experts_in_a_fixed_order():
+    # index_add_'s atomics summed a token's top-k rows in a different order each run: greedy decode drifted.
+    from unsloth_zoo.mxfp4_gemm import mxfp4_grouped_mm_op
+    from unsloth_zoo.temporary_patches.gpt_oss import _moe_forward_inference_mxfp4_kernel
+    if mxfp4_grouped_mm_op is None:
+        pytest.skip("needs torch.library.triton_op")
+    kernel = getattr(_moe_forward_inference_mxfp4_kernel, "_torchdynamo_orig_callable", _moe_forward_inference_mxfp4_kernel)
+    E, H, I, T, k = 8, 256, 128, 96, 4
+    gu_blocks, gu_scales = _random_mxfp4(E, 2 * I, H, "cuda", seed = 1)
+    dn_blocks, dn_scales = _random_mxfp4(E, H, I, "cuda", seed = 2)
+    g = torch.Generator(device = "cuda").manual_seed(0)
+    x = torch.randn(1, T, H, dtype = torch.bfloat16, device = "cuda", generator = g)
+    top, idx = torch.randn(T, E, device = "cuda", generator = g).topk(k)
+    weights = torch.zeros(T, E, device = "cuda").scatter(1, idx, top.softmax(-1)).to(torch.bfloat16)
+    gu_bias = torch.randn(E, 2 * I, device = "cuda", generator = g) * 0.1
+    dn_bias = torch.randn(E, H, device = "cuda", generator = g) * 0.1
+    got = kernel(x, weights, idx, gu_blocks, gu_scales, gu_bias, True, dn_blocks, dn_scales, dn_bias, True, 7.0, 1.702, H)
+
+    flat = idx.sort(dim = -1).values.reshape(-1)
+    counts = torch.bincount(flat, minlength = E).to(torch.int32)
+    order = torch.argsort(flat, stable = True)
+    token, expert = order // k, flat[order]
+    gate_up = mxfp4_grouped_mm_op(x.view(T, H)[token], gu_blocks, gu_scales, counts, True) + gu_bias[expert]
+    gate, up = gate_up[..., ::2].clamp(max = 7.0), gate_up[..., 1::2].clamp(min = -7.0, max = 7.0)
+    inter = ((up + 1) * (gate * torch.sigmoid(gate.float() * 1.702).to(gate.dtype))).to(x.dtype)
+    down = mxfp4_grouped_mm_op(inter, dn_blocks, dn_scales, counts, True) + dn_bias[expert]
+    rows = torch.empty(down.shape, dtype = torch.float32, device = "cuda")
+    rows[order] = (down * weights[token, expert][:, None]).float()
+    want = rows.view(T, k, H).sum(1).to(down.dtype)
+    assert torch.equal(got.view(T, H), want)
