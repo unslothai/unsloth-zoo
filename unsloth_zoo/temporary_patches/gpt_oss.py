@@ -2049,6 +2049,19 @@ def _ogs_kernels():
     return _ogs_modules()
 
 
+def _ogs_track(param, blocks, scales):
+    """Tie the cached matmul_ogs view to `param`: dropped when the stack is rebound (copy_ swaps scales) or freed.
+    The cache holds the packed storage, so an untracked entry kept a deleted model's experts on the GPU."""
+    key = (blocks.data_ptr(), scales.data_ptr(), tuple(blocks.shape))
+    old = getattr(param, "_unsloth_ogs_key", None)
+    if old == key:
+        return
+    if old is not None:
+        _OGS_WEIGHTS.pop(old, None)
+    param._unsloth_ogs_key = key
+    weakref.finalize(param, _OGS_WEIGHTS.pop, key, None)
+
+
 def _ogs_weight(blocks, scales, in_dim):
     """Triton view of a packed (E, out, G, 16) stack; strided layouts share the packed bytes."""
     key = (blocks.data_ptr(), scales.data_ptr(), tuple(blocks.shape))
@@ -2129,6 +2142,8 @@ def _mxfp4_ogs_decode(self, hidden_states):
         return None
     gu_blocks, gu_scales, _ = _mxfp4_static_operands(gate_up, moe, "gate_up")
     dn_blocks, dn_scales, _ = _mxfp4_static_operands(down, moe, "down")
+    _ogs_track(gate_up, gu_blocks, gu_scales)
+    _ogs_track(down, dn_blocks, dn_scales)
     try:
         return _moe_forward_inference_ogs_kernel(
             hidden_states, self.router.weight, self.router.bias, self.router.top_k,
