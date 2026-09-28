@@ -2182,6 +2182,11 @@ class UnslothVisionDataCollator:
         # pixel_values / audio features are not truncated with the ids, so a cut placeholder
         # misaligns them at model forward.
         media = self._get_padding_token_ids_on_device(before.device)
+        # Processor-only placeholders (Step-3.7 `<im_patch>`) are absent from the tokenizer lists.
+        declared = [getattr(self.processor, f"{kind}_token_id", None) for kind in ("image", "video", "audio")]
+        declared = [x for x in declared if isinstance(x, int)]
+        if declared:
+            media = torch.cat((media, torch.tensor(declared, dtype = media.dtype, device = media.device)))
         media = media[media != pad_id]
         # Negative ids are processor-inserted sentinels (Phi-4-reasoning-vision -200).
         count = lambda ids: int((torch.isin(ids, media) | (ids < 0)).sum())

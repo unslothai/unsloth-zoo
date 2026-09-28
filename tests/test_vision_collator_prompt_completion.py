@@ -30,7 +30,7 @@ from unsloth_zoo.vision_utils import UnslothVisionDataCollator
 
 PAD_ID = 0
 IMG_ID = 7
-VOCAB = {"<img>": IMG_ID, "<img-200>": -200, "a": 1, "b": 2, "x": 3, "y": 4, "z": 5, "w": 6}
+VOCAB = {"<img>": IMG_ID, "<img-200>": -200, "<patch>": 8, "a": 1, "b": 2, "x": 3, "y": 4, "z": 5, "w": 6}
 
 
 class _FakeTokenizer:
@@ -263,11 +263,13 @@ def _image_collator(max_seq_length):
     return collator
 
 
-@pytest.mark.parametrize("marker", ["<img>", "<img-200>"])
+@pytest.mark.parametrize("marker", ["<img>", "<img-200>", "<patch>"])
 def test_truncation_that_cuts_an_image_placeholder_raises(marker):
-    # <img-200>: processors that write a negative sentinel into input_ids (Phi-4-reasoning-vision).
+    # <img-200>: negative sentinel in input_ids (Phi-4-reasoning-vision); <patch>: only the
+    # processor declares it, as `image_token_id` (Step-3.7 `<im_patch>`).
     from PIL import Image
     collator = _image_collator(2)
+    collator.processor.image_token_id = VOCAB["<patch>"]
     with pytest.raises(ValueError, match = "max_seq_length = 2 truncated 1 image / audio placeholder"):
         collator([{"images": [Image.new("RGB", (32, 32))], "prompt": f"a b {marker}", "completion": "x"}])
 
