@@ -4231,7 +4231,6 @@ def _one_expert_lora_delta(holder, adapter, index):
     except Exception:
         pass
     if grouped:
-        # Legacy (out, experts, rank) packing.
         weight_B = weight_B.reshape(weight_B.shape[0], num, -1)[:, index, :]
     else:
         weight_B = weight_B.reshape(weight_B.shape[0], -1, num)[:, :, index]

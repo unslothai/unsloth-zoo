@@ -99,7 +99,6 @@ def _scales(param):
 
 
 def _grouped(inputs, param, counts, ends, transpose):
-    # Fused: bytes decoded per tile inside the GEMM, only routed experts read, no 16-bit stack.
     if _fused(inputs, param):
         return mxfp4_grouped_matmul(inputs, param.data, _scales(param), counts, trans = not transpose)
     if ends is None:

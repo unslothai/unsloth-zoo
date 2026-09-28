@@ -349,7 +349,6 @@ def test_packed_experts_train_like_the_load_time_dequant(monkeypatch, grouped_mm
     dense_shapes = {n: p.shape for n, p in dense_model.named_parameters() if "lora_" in n}
     lora = {n: p.shape for n, p in packed_model.named_parameters() if "lora_" in n}
     assert lora == dense_shapes and len(lora) == 4
-    # The packed stack must take the separated LoRA path, never PEFT's own `param + delta`.
     peft_calls = []
     original = mu._original_param_wrapper_forward
     monkeypatch.setattr(mu, "_original_param_wrapper_forward", lambda *a, **k: peft_calls.append(1) or original(*a, **k))
