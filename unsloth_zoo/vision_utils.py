@@ -1505,8 +1505,8 @@ class UnslothVisionDataCollator:
             # Dataset with 2 columns messages / images
             image, video, video_kwarg = self._extract_images_videos_for_example(example, messages)
             image = self._resize_images_inplace(image)
-            if len(image) > 0:
-                images.append(image)
+            # One slot per row, empty for text-only rows: Gemma 3/4, Idefics3, LFM2-VL require len(images) == len(text).
+            images.append(image)
 
             if len(video) > 0:  # Works for list, tuple or tensor
                 videos.append(video)
@@ -1533,7 +1533,8 @@ class UnslothVisionDataCollator:
             # Safe to pass truncation kwargs top-level when no audio is involved
             proc_kwargs["truncation"] = self.truncation
             proc_kwargs["max_length"] = self.max_seq_length
-        if images:
+        has_images = any(len(x) > 0 for x in images)
+        if has_images:
             proc_kwargs["images"] = images
         if videos:
             proc_kwargs["videos"] = videos
@@ -1544,7 +1545,7 @@ class UnslothVisionDataCollator:
             proc_kwargs["audio"] = audios
         if self.pad_to_multiple_of is not None:
             proc_kwargs["pad_to_multiple_of"] = self.pad_to_multiple_of
-        batch = self._call_processor(proc_kwargs, bool(images))
+        batch = self._call_processor(proc_kwargs, has_images)
 
         # Truncate manually when audio is present (couldn't pass max_length to processor)
         if audios and self.truncation and self.max_seq_length:
@@ -1664,13 +1665,15 @@ class UnslothVisionDataCollator:
 
     def _load_column_images(self, images):
         # SSRF-guarded decode (Idefics2-style processors fetch URLs unguarded); unresized and EXIF-transposed like datasets' PIL.
+        # None entries (text-only rows of a mixed images column) carry no image.
         return [
             ImageOps.exif_transpose(_decode_image(img)) if isinstance(img, (str, bytes, bytearray, dict)) else img
-            for img in images
+            for img in images if img is not None
         ]
 
     def _extract_images_videos_for_example(self, example, messages):
-        if "images" in example:
+        # images=None means no column value: fall back to images embedded in the messages, as the PC path does.
+        if example.get("images") is not None:
             image = self._load_column_images(example["images"])
             video = []
             video_kwarg = None
@@ -2048,8 +2051,7 @@ class UnslothVisionDataCollator:
 
             prompt_texts.append(p_txt)
             completion_texts.append(c_txt)
-            if imgs:
-                images.append(imgs)
+            images.append(imgs or [])
 
             if vids:  # Works for list, tuple or tensor
                 videos.append(vids)
@@ -2077,7 +2079,8 @@ class UnslothVisionDataCollator:
             return_tensors="pt",
             add_special_tokens=False,
         )
-        if len(images) > 0:
+        pc_has_images = any(len(x) > 0 for x in images)
+        if pc_has_images:
             prompt_kwargs["images"] = images
         if len(videos) > 0:
             prompt_kwargs["videos"] = videos
@@ -2087,7 +2090,7 @@ class UnslothVisionDataCollator:
         if audios:
             prompt_kwargs["audio"] = audios
 
-        proc_prompts = self._call_processor(dict(prompt_kwargs, text = prompt_texts), len(images) > 0)
+        proc_prompts = self._call_processor(dict(prompt_kwargs, text = prompt_texts), pc_has_images)
         # Encode completions (RIGHT pad) text-only
         proc_completions = self.processor(text=completion_texts, **completion_kwargs)
 
