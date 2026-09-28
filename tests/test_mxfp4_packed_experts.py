@@ -363,7 +363,7 @@ def test_packed_experts_train_like_the_load_time_dequant(monkeypatch, grouped_mm
     packed_model, dense_model = _peft_pair(grouped_mm_device)
     dense_shapes = {n: p.shape for n, p in dense_model.named_parameters() if "lora_" in n}
     lora = {n: p.shape for n, p in packed_model.named_parameters() if "lora_" in n}
-    assert lora == dense_shapes and len(lora) == 4   # PEFT sized the adapters from the logical shape
+    assert lora == dense_shapes and len(lora) == 4
     peft_calls = []
     original = mu._original_param_wrapper_forward
     monkeypatch.setattr(mu, "_original_param_wrapper_forward", lambda *a, **k: peft_calls.append(1) or original(*a, **k))
@@ -379,7 +379,7 @@ def test_packed_experts_train_like_the_load_time_dequant(monkeypatch, grouped_mm
     experts = packed_model.base_model.model.experts
     while hasattr(experts, "base_layer"):
         experts = experts.base_layer
-    assert isinstance(experts.gate_up_proj, Mxfp4ExpertParam)   # still packed after training
+    assert isinstance(experts.gate_up_proj, Mxfp4ExpertParam)
 
 
 def test_a_4d_packed_stack_is_an_experts_module():
@@ -421,7 +421,7 @@ def test_checkpoint_recompute_reuses_its_dequant_in_backward(monkeypatch, overri
 
     monkeypatch.setattr(Mxfp4ExpertParam, "dequantize", counted)
     _train_step(packed_model, x, idx, w, checkpoint = True)
-    assert len(calls) == 2 * per_projection   # gate_up and down
+    assert len(calls) == 2 * per_projection
     assert calls.count("forward") == 2 and calls.count("recompute") == 2
     assert calls.count("backward") == 2 * (per_projection - 2)
 
@@ -440,7 +440,7 @@ def test_merge_and_unmerge(grouped_mm_device):
         assert not isinstance(getattr(base, name), Mxfp4ExpertParam)
     packed_model.base_model.unmerge_adapter()
     for name in packed:
-        assert getattr(base, name) is packed[name]   # restored exactly, no subtraction
+        assert getattr(base, name) is packed[name]
     merged = [m.merge_and_unload() for m in (packed_model, dense_model)]
     for name in packed:
         a, b = (getattr(m.experts, name) for m in merged)
@@ -505,7 +505,7 @@ def test_full_save_writes_dequantized_experts(tmp_path, explicit_state_dict):
     else:
         kwargs = {}
         if explicit_state_dict:
-            kwargs["state_dict"] = model.state_dict()   # as Trainer hands it over
+            kwargs["state_dict"] = model.state_dict()
         model.save_pretrained(tmp_path, **kwargs)
     saved = {}
     for file in os.listdir(tmp_path):
@@ -595,7 +595,7 @@ def test_decode_stacks_are_shared_and_freed_with_their_model():
     alive = weakref.ref(stack)
     del stack, first
     gc.collect()
-    assert alive() is not None   # the second model still decodes into it
+    assert alive() is not None
     del second
     gc.collect()
     assert alive() is None
@@ -744,7 +744,7 @@ def test_load_state_dict_carries_the_scales():
     b.load_state_dict(a.state_dict())
     assert b.w is target and isinstance(b.w, Mxfp4ExpertParam)
     assert torch.equal(b.w.dequantize(), a.w.dequantize())
-    assert b.w.mxfp4_scales.data_ptr() != a.w.mxfp4_scales.data_ptr()   # copied, not aliased
+    assert b.w.mxfp4_scales.data_ptr() != a.w.mxfp4_scales.data_ptr()
     c = nn.Module()
     c.w = _packed(4, 64, 64, seed = 3)
     c.load_state_dict(pickle.loads(pickle.dumps(a.state_dict())))
