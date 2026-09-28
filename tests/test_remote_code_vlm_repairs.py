@@ -2,8 +2,8 @@
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
@@ -18,7 +18,6 @@
 loaded through transformers' dynamic module loader. CPU only."""
 
 import inspect
-import os
 import textwrap
 
 import pytest
@@ -301,6 +300,21 @@ def test_other_remote_classes_untouched(remote):
     repair_remote_modules()
     assert repair_internvl_style_forward(remote.TinyOmni) is False
     assert remote.TinyOmni.forward is forward
+
+
+def test_forward_with_unhandled_parameters_untouched(tmp_path):
+    import importlib.util
+    from unsloth_zoo.temporary_patches.remote_code_vlm import repair_internvl_style_forward
+    source = _MODELING.replace("return_dict = None,\n    ):", "return_dict = None,\n            loss_weight = None,\n    ):")
+    assert source != _MODELING
+    path = tmp_path / "weighted_loss_omni.py"
+    path.write_text(source)
+    spec = importlib.util.spec_from_file_location("weighted_loss_omni", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    forward = module.TinyOmni.forward
+    assert repair_internvl_style_forward(module.TinyOmni) is False
+    assert module.TinyOmni.forward is forward
 
 
 def test_radio_summary_idxs_restored(remote):

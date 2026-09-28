@@ -2,16 +2,16 @@
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Lesser General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
+# GNU Affero General Public License for more details.
 #
-# You should have received a copy of the GNU Lesser General Public License
+# You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """Repairs for trust_remote_code classes, applied as `get_class_in_module` loads them:
@@ -62,6 +62,11 @@ _INPLACE_MERGE = re.compile(
     r"(inputs?_embeds)\[\s*selected\s*\]\s*=\s*\1\[\s*selected\s*\]\s*\*\s*0\.0\s*\+\s*vit_embeds"
 )
 _REQUIRED_PARAMETERS = ("pixel_values", "input_ids", "image_flags", "labels")
+# Everything the replacement forward reads; any other parameter (e.g. InternVL's loss_weight) declines.
+_HANDLED_PARAMETERS = frozenset(_REQUIRED_PARAMETERS + (
+    "self", "attention_mask", "position_ids", "past_key_values", "inputs_embeds", "input_embeds",
+    "use_cache", "output_attentions", "output_hidden_states", "return_dict",
+))
 
 
 def _is_internvl_style_forward(cls):
@@ -77,7 +82,7 @@ def _is_internvl_style_forward(cls):
         return False
     if any(name not in parameters for name in _REQUIRED_PARAMETERS):
         return False
-    if any(p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD) for p in parameters.values()):
+    if any(name not in _HANDLED_PARAMETERS for name in parameters):
         return False
     return _INPLACE_MERGE.search(source) is not None
 
