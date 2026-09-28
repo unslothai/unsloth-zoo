@@ -1446,6 +1446,20 @@ def patch_medias_processor(processor):
 pass
 
 
+def _media_feature_token_ids(model):
+    """Token ids a model forward matches one-to-one with media features."""
+    config = getattr(model, "config", None)
+    ids = set()
+    for cfg in (config, getattr(config, "text_config", None)):
+        for key in ("image_token_id", "image_token_index", "video_token_id", "audio_token_id",
+                    "media_placeholder_token_id"):
+            value = getattr(cfg, key, None)
+            if isinstance(value, int) and value >= 0:
+                ids.add(value)
+    return sorted(ids)
+pass
+
+
 def _tensorize_ragged_batch(batch):
     """Tensorize fields; ragged ones stay lists of tensors."""
     for key in list(batch.keys()):
@@ -1496,7 +1510,7 @@ pass
 class UnslothVisionDataCollator:
     # All Unsloth Zoo code licensed under LGPLv3
     __slots__ = (
-        "padding_token_ids", "dtype", "ignore_index",
+        "padding_token_ids", "_feature_token_ids", "dtype", "ignore_index",
         "processor", "formatting_func", "image_size",
         "max_seq_length", "truncation", "train_on_responses_only",
         "num_proc", "assistant_single_content", "patch_size",
@@ -1533,6 +1547,7 @@ class UnslothVisionDataCollator:
         patch_medias_processor(processor)
 
         self.padding_token_ids = get_padding_tokens_ids(processor)
+        self._feature_token_ids = _media_feature_token_ids(model)
         self.dtype = _get_dtype(
             dtype_from_config(model.config)
             if HAS_TORCH_DTYPE else
@@ -2181,12 +2196,18 @@ class UnslothVisionDataCollator:
     def _raise_if_truncation_cut_media(self, before, after, pad_id):
         # pixel_values / audio features are not truncated with the ids, so a cut placeholder
         # misaligns them at model forward.
-        media = self._get_padding_token_ids_on_device(before.device)
-        # Processor-only placeholders (Step-3.7 `<im_patch>`) are absent from the tokenizer lists.
-        declared = [getattr(self.processor, f"{kind}_token_id", None) for kind in ("image", "video", "audio")]
-        declared = [x for x in declared if isinstance(x, int)]
-        if declared:
-            media = torch.cat((media, torch.tensor(declared, dtype = media.dtype, device = media.device)))
+        # Only the ids the model forward counts against features: a cut media delimiter
+        # (<|vision_end|>) alone still trains on main. Without them, every known media token.
+        feature_ids = getattr(self, "_feature_token_ids", None)
+        if feature_ids:
+            media = torch.tensor(feature_ids, device = before.device)
+        else:
+            media = self._get_padding_token_ids_on_device(before.device)
+            # Processor-only placeholders (Step-3.7 `<im_patch>`) are absent from the tokenizer lists.
+            declared = [getattr(self.processor, f"{kind}_token_id", None) for kind in ("image", "video", "audio")]
+            declared = [x for x in declared if isinstance(x, int)]
+            if declared:
+                media = torch.cat((media, torch.tensor(declared, dtype = media.dtype, device = media.device)))
         media = media[media != pad_id]
         # Negative ids are processor-inserted sentinels (Phi-4-reasoning-vision -200).
         count = lambda ids: int((torch.isin(ids, media) | (ids < 0)).sum())

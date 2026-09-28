@@ -30,7 +30,7 @@ from unsloth_zoo.vision_utils import UnslothVisionDataCollator
 
 PAD_ID = 0
 IMG_ID = 7
-VOCAB = {"<img>": IMG_ID, "<img-200>": -200, "<patch>": 8, "a": 1, "b": 2, "x": 3, "y": 4, "z": 5, "w": 6}
+VOCAB = {"<img>": IMG_ID, "<img-200>": -200, "<patch>": 8, "<end>": 9, "a": 1, "b": 2, "x": 3, "y": 4, "z": 5, "w": 6}
 
 
 class _FakeTokenizer:
@@ -278,3 +278,15 @@ def test_truncation_that_keeps_every_image_placeholder_passes():
     from PIL import Image
     out = _image_collator(3)([{"images": [Image.new("RGB", (32, 32))], "prompt": "<img> a b", "completion": "x y"}])
     assert out["input_ids"].tolist() == [[IMG_ID, 1, 2]]
+
+
+def test_cut_media_delimiter_alone_passes_when_the_model_names_its_feature_tokens():
+    # <end> is a known media token but not a feature slot: the model forward still aligns.
+    from PIL import Image
+    batch = [{"images": [Image.new("RGB", (32, 32))], "prompt": "a <img> <end>", "completion": "x"}]
+    collator = _image_collator(2)
+    collator.padding_token_ids = torch.tensor([PAD_ID, IMG_ID, VOCAB["<end>"]])
+    with pytest.raises(ValueError, match = "truncated 1 image / audio placeholder"):
+        collator(batch)
+    collator._feature_token_ids = [IMG_ID]
+    assert collator(batch)["input_ids"].tolist() == [[1, IMG_ID]]
