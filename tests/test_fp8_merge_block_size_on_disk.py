@@ -14,13 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A 16bit merge of an fp8 base reads the block size from the base's own config.json.
-
-A 4bit (NF4) load of an fp8 checkpoint holds a bitsandbytes quantization_config in memory, so
-the merge found no `weight_block_size` there and inferred it from the scale grid. A ragged dim
-that the grid still divides evenly (192 rows over 2 scale rows) then dequantized with block 96
-instead of 128 plus a partial block, and the merged weights came out wrong.
-"""
+"""16bit merge of an fp8 base must read weight_block_size from the base config.json (a 4bit load holds a bnb config)."""
 
 import json
 
@@ -94,12 +88,10 @@ def test_on_disk_block_size_dequantizes_an_evenly_divided_ragged_dim(tmp_path):
         guessed, _ = saving_utils._fp8_dequantize_weight(handle, header, "layer.weight", weight_block_size = None)
     expected = _reference(quant, scale)
     assert torch.equal(got.to(torch.bfloat16), expected)
-    # What the merge produced before: 192 / 2 scale rows read as a 96-row block.
     assert not torch.equal(guessed.to(torch.bfloat16), expected)
 
 
 def _fp8_llama_base(base_dir):
-    """Tiny llama with a ragged 192-wide MLP, stored as 128x128 block fp8 like the -FP8 repos."""
     import os
     import transformers as T
     cfg = T.LlamaConfig(hidden_size = 256, intermediate_size = 192, num_hidden_layers = 1,
@@ -119,7 +111,6 @@ def _fp8_llama_base(base_dir):
     config = json.loads((base_dir / "config.json").read_text())
     config["quantization_config"] = {"quant_method": "fp8", "fmt": "e4m3", "weight_block_size": [128, 128]}
     (base_dir / "config.json").write_text(json.dumps(config))
-    # What a 4bit load of this checkpoint holds in memory: a bitsandbytes config, no block size.
     model.config.quantization_config = {"quant_method": "bitsandbytes", "load_in_4bit": True,
                                         "bnb_4bit_quant_type": "nf4"}
     model.config._name_or_path = str(base_dir)
@@ -128,8 +119,6 @@ def _fp8_llama_base(base_dir):
 
 @pytest.mark.parametrize("in_place", [False, True])
 def test_merge_of_4bit_loaded_fp8_base_dequantizes_ragged_dims_exactly(tmp_path, monkeypatch, in_place):
-    """In place, Step 1 rewrites the source config.json without quantization_config before the
-    shards are read, so the block size has to be taken from disk before that."""
     import os
     import sys
     from peft import LoraConfig, get_peft_model

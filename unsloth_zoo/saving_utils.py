@@ -4582,7 +4582,7 @@ def merge_and_overwrite_lora(
             if isinstance(_wbs, (list, tuple)) and len(_wbs) == 2:
                 _merge_weight_block_size = tuple(int(x) for x in _wbs)
         if _merge_weight_block_size is None:
-            # A 4bit load of the fp8 checkpoint holds a bitsandbytes config; the shards' config.json has it.
+            # A 4bit load holds a bitsandbytes config in memory.
             _merge_weight_block_size = _fp8_disk_block_size
     # Gated archs + 16bit merge only: fold each LoRA delta onto dequant(W4) instead of W16
     # (see _merge_lora). Strict no-op for every other model/merge.
@@ -6704,9 +6704,7 @@ def _load_quant_config_or_raise(config_path, model_name_or_path):
 pass
 
 def _fp8_block_size_on_disk(model_name_or_path, token = None):
-    """(block_rows, block_cols) from the base checkpoint's config.json, else None. Without it a
-    ragged dim that the scale grid still divides evenly (192 rows, 2 scale rows) reads as
-    block 96 instead of 128 plus a partial block, and the dequantized weights come out wrong."""
+    """(rows, cols) fp8 block from the base config.json, else None; the scale-grid guess is wrong for ragged dims."""
     try:
         is_quantized, quant_type = check_model_quantization_status(model_name_or_path, token)
     except Exception:
