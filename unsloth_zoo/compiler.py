@@ -4348,11 +4348,14 @@ torch_float16 = torch.float16
 def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
     xA = dropout(x.to(torch_float16)) @ lora_A.weight.to(torch_float16).t()
     # output = result + scaling * xA @ lora_B.weight.t()
+    # Add in result's dtype: a base layer kept in float32 (gpt-oss expert down_projs reach
+    # 66795) overflows if rounded to float16 here. Float16 results take the same kernel.
     shape = result.shape
+    result_dtype = result.dtype
     output = torch_addmm(
-        result.view(-1, shape[-1]).to(torch_float16),
-        xA.view(-1, xA.shape[-1]),
-        lora_B.weight.to(torch_float16).t(),
+        result.view(-1, shape[-1]),
+        xA.view(-1, xA.shape[-1]).to(result_dtype),
+        lora_B.weight.to(result_dtype).t(),
         alpha = scaling,
         beta = 1,
     ).view(shape)
@@ -4361,7 +4364,7 @@ def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
     if bias is not None:
         output = torch_add(
             output,
-            bias.to(torch_float16),
+            bias.to(result_dtype),
             alpha = scaling,
         )
     return output
