@@ -2651,6 +2651,25 @@ _STASH_READ_MARKERS = frozenset(("take_moe_lora_stash", "moe_lora_stash_name"))
 _STASH_SCAN_MAX_DEPTH = 4
 
 
+# Resolved at import, absolute: the traced wrapper cannot import, and the compiled-cache copy has no package.
+try:
+    from unsloth_zoo.temporary_patches.moe_experts_interface import (
+        own_gate_route_reads_stash as _own_gate_route_reads_stash_impl,
+    )
+except Exception:
+    _own_gate_route_reads_stash_impl = None
+
+
+def _own_gate_route_reads_stash(experts_module) -> bool:
+    """transformers' experts dispatch hides Unsloth's forward from the bytecode scan; ask the interface."""
+    if _own_gate_route_reads_stash_impl is None:
+        return False
+    try:
+        return bool(_own_gate_route_reads_stash_impl(experts_module))
+    except Exception:
+        return False
+
+
 def _forward_statically_reads_stash(experts_module):
     """Does this experts forward reach the stash API at all, read from its bytecode?
 
@@ -3075,6 +3094,8 @@ def _patched_param_wrapper_forward(
             # Nothing is recorded either way, so the first eager call still measures and
             # every later compile follows the real verdict.
             applies_stash = _forward_statically_reads_stash(experts_module)
+            if not applies_stash and _own_gate_route_reads_stash(experts_module):
+                applies_stash = True
             if applies_stash is False:
                 _log_moe_lora_stash_unread_once(experts_module, param_name)
         elif applies_stash is None:

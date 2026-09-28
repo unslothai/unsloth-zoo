@@ -536,3 +536,60 @@ def test_custom_gate_expert_lora_casts_under_non_cuda_autocast(monkeypatch):
         out = mei._unsloth_experts_dispatch(experts, h, torch.zeros(3, 1, dtype = torch.long), torch.ones(3, 1))
     assert seen["dtype"] == torch.bfloat16
     assert out.dtype == torch.float32
+
+
+def _own_gate_experts(implementation):
+    import unsloth_zoo.temporary_patches.moe_experts_interface as mei
+
+    class Experts(nn.Module):
+        def forward(self, h, i, w):
+            return h
+        forward.__wrapped__ = forward
+
+        def _apply_gate(self, gate_up):
+            return gate_up
+
+    m = Experts()
+    m.gate_up_proj = nn.Parameter(torch.zeros(2, 8, 4, dtype = torch.bfloat16))
+    m.down_proj = nn.Parameter(torch.zeros(2, 4, 4, dtype = torch.bfloat16))
+    m.config = types.SimpleNamespace(_experts_implementation = implementation)
+    return mei, m
+
+
+def test_own_gate_route_static_answer_needs_the_unsloth_implementation(monkeypatch):
+    mei, m = _own_gate_experts("unsloth")
+    monkeypatch.setattr(mei, "_has_custom_gate", lambda module: True)
+    assert mei.own_gate_route_reads_stash(m) is True
+    m.config._experts_implementation = "grouped_mm"
+    assert mei.own_gate_route_reads_stash(m) is False
+    m.config._experts_implementation = "unsloth"
+    m.gate_up_proj = nn.Parameter(torch.zeros(2, 8, 4, dtype = torch.uint8), requires_grad = False)
+    assert mei.own_gate_route_reads_stash(m) is False
+
+
+def test_backend_warmup_only_for_experts_interface_classes(monkeypatch):
+    import unsloth_zoo.temporary_patches.moe_experts_interface as mei
+
+    calls = []
+    fake = types.SimpleNamespace(
+        get_forward_moe_backend = lambda: (lambda *a: None),
+        _check_torch_grouped_mm_supported = lambda: calls.append("grouped_mm"),
+        _transposed_view_grouped_mm_is_safe = lambda: calls.append("view"),
+    )
+    monkeypatch.setattr(mei, "_moe_utils_module", lambda: fake)
+
+    class Dense:
+        @classmethod
+        def _can_set_experts_implementation(cls):
+            return False
+
+    class Moe(Dense):
+        @classmethod
+        def _can_set_experts_implementation(cls):
+            return True
+
+    mei._warm_moe_backend(Dense())
+    mei._warm_moe_backend(object())
+    assert calls == []
+    mei._warm_moe_backend(Moe())
+    assert calls == ["grouped_mm", "view"]
