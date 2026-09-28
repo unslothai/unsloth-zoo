@@ -2679,6 +2679,18 @@ def _nvfp4_dequantize(packed, scale, global_scale):
     """fp32 (..., rows, 2 * cols) weight from compressed-tensors NVFP4 storage (NVFP4PackedCompressor.decompress).
     Leading dims (3-D fused MoE experts) are kept; packing and 16-column groups run along the last dim."""
     lead, half = packed.shape[:-1], packed.shape[-1]
+    # Other pack-quantized formats (int32 packs) share the weight_packed name: refuse rather than misdecode.
+    expected_scale = (*lead, (half * 2) // 16)
+    if (
+        packed.dtype != torch.uint8
+        or scale.dtype != getattr(torch, "float8_e4m3fn", None)
+        or tuple(scale.shape) != expected_scale
+    ):
+        raise RuntimeError(
+            f"Unsloth: weight_packed {tuple(packed.shape)} {packed.dtype} with scale {tuple(scale.shape)} "
+            f"{scale.dtype} is not NVFP4 (uint8 codes, float8_e4m3fn scale of shape {expected_scale}). "
+            "The merged model would be corrupted."
+        )
     codes = torch.stack((packed & 0x0F, packed >> 4), dim = -1).reshape(*lead, half * 2)
     values = torch.tensor(_E2M1_VALUES, dtype = torch.float32)[(codes & 0x07).long()]
     values = torch.where((codes & 0x08).bool(), -values, values)
@@ -2698,8 +2710,7 @@ def _nvfp4_dequantize(packed, scale, global_scale):
                 f"Unsloth: NVFP4 weight of shape {tuple(packed.shape)} has {global_scale.numel()} global "
                 "scales; expected 1 or one per expert. The merged model would be corrupted."
             )
-    group = (half * 2) // group_scale.shape[-1]
-    return (values.view(*lead, -1, group) * group_scale.reshape(*lead, -1, 1)).view(*lead, half * 2)
+    return (values.view(*lead, -1, 16) * group_scale.unsqueeze(-1)).view(*lead, half * 2)
 pass
 
 def _is_nvfp4_compressed_tensors_config(quant_config):

@@ -185,3 +185,15 @@ def test_nvfp4_global_scale_count_mismatch_is_refused():
     packed, scale, _ = _nvfp4(32, 64, 0)
     with pytest.raises(RuntimeError, match="global scales"):
         _nvfp4_dequantize(packed[None].expand(3, -1, -1), scale[None].expand(3, -1, -1), torch.ones(2))
+
+
+def test_non_nvfp4_packed_weights_are_refused():
+    from unsloth_zoo.saving_utils import _nvfp4_dequantize
+
+    packed, scale, gs = _nvfp4(32, 64, 0)
+    # int4 pack-quantized: int32 packs and a bf16 group scale under the same weight_packed name.
+    with pytest.raises(RuntimeError, match="is not NVFP4"):
+        _nvfp4_dequantize(torch.zeros(32, 8, dtype=torch.int32), torch.ones(32, 1, dtype=torch.bfloat16), gs)
+    # A (N, 1) scale against a (1, N) packed row would broadcast to (1, N, 2N) instead of failing.
+    with pytest.raises(RuntimeError, match="is not NVFP4"):
+        _nvfp4_dequantize(packed[:1], scale.reshape(-1, 1), gs)
