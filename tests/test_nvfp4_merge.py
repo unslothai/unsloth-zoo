@@ -64,13 +64,15 @@ def _merge(tmp_path, shards, lora, order):
     )
     names = [p.name for p in shards]
     prerewrite = _collect_fp8_weight_keys(str(tmp_path), names)
-    total = 0
+    total, seen = 0, set()
     for name in order:
-        count, _ = _merge_and_overwrite_lora(
+        count, keys = _merge_and_overwrite_lora(
             save_directory=str(tmp_path), filename=name, lora_weights=lora, output_dtype=torch.bfloat16,
             model_class_name="Qwen3ForCausalLM", base_model_is_quantized=True, quant_type="fp8",
         )
         total += count
+        seen.update(keys)
+    _merge.seen = seen
     _drop_resolved_fp8_scales_after_rewrite(str(tmp_path), names, prerewrite)
     out = {}
     for p in shards:
@@ -111,6 +113,9 @@ def test_mixed_nvfp4_and_fp8_merge_with_lora(tmp_path):
     lora["model.layers.0.self_attn.q_proj"] = _FakeLoraStats(lora_A=A2, lora_B=B2, alpha=1.0)
     count, out = _merge(tmp_path, [shard], lora, [shard.name])
     assert count == 2
+    # The Step-7 sanity check counts LoRAs backed by the merged keys; a NVFP4 layer must count once.
+    from unsloth_zoo.saving_utils import _count_backed_lora_modules
+    assert _count_backed_lora_modules(lora, _merge.seen, "Qwen3ForCausalLM", False) == 2
     assert set(out) == {"model.layers.0.mlp.gate_proj.weight", "model.layers.0.self_attn.q_proj.weight", "model.norm.weight"}
     mlp = out["model.layers.0.mlp.gate_proj.weight"]
     assert mlp.dtype == torch.bfloat16 and mlp.shape == (64, 96)
