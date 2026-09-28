@@ -2426,7 +2426,7 @@ def test_checkpointed_kv_shared_layers_hold_what_unshared_layers_hold():
         """
         loss_and_grad = nn.value_and_grad(model, lambda m: (m(ids) ** 2).sum())
         mx.eval(loss_and_grad(model))
-        floor, grads = None, None
+        floor, grads, dropped = None, None, []
         for _ in range(repeats):
             # Drop the previous repeat's gradients BEFORE `resident` is sampled. Holding
             # them would put a tree in `resident` that the assignment below releases
@@ -2441,15 +2441,33 @@ def test_checkpointed_kv_shared_layers_hold_what_unshared_layers_hold():
             grads = loss_and_grad(model)[1]
             mx.eval(grads)
             peak = mx.get_peak_memory() - resident
+            # The gradients this repeat produced are still live when it ends, so no real
+            # peak above `resident` is smaller than they are. A reading under that is the
+            # allocator reporting nothing for the run, and a minimum keeps exactly such a
+            # reading: run 36311394738 on main took unshared 2284 bytes as its floor and
+            # failed 193222844 < 1.25 * 2284. Readings like that are dropped, not kept.
+            produced = sum(g.nbytes for _, g in tree_flatten(grads))
+            if peak < produced:
+                dropped.append((peak, produced))
+                continue
             floor = peak if floor is None else min(floor, peak)
+        return floor, grads, dropped
+
+    def floor_and_grads(model):
+        floor, grads, dropped = peak_and_grads(model)
+        assert floor is not None, (
+            f"every repeat read a peak below the gradients it produced: {dropped}"
+        )
         return floor, grads
 
     shared, unshared = build(10), build(0)
-    _, reference = peak_and_grads(shared, repeats = 1)
+    # Only the gradients of this pass are used, so its single peak reading is not
+    # checked: a dropped reading here says nothing about the claim under test.
+    _, reference, _ = peak_and_grads(shared, repeats = 1)
     mlx_utils._patch_layer_class_for_gc(DecoderLayer)
     try:
-        unshared_peak, _ = peak_and_grads(unshared)
-        shared_peak, grads = peak_and_grads(shared)
+        unshared_peak, _ = floor_and_grads(unshared)
+        shared_peak, grads = floor_and_grads(shared)
     finally:
         mlx_utils._unpatch_layer_class_gc(DecoderLayer)
     assert shared_peak < 1.25 * unshared_peak, (shared_peak, unshared_peak)
