@@ -2457,12 +2457,17 @@ def test_checkpointed_kv_shared_layers_hold_what_unshared_layers_hold():
     from mlx_vlm.models.gemma4.config import TextConfig
     from mlx_vlm.models.gemma4.language import DecoderLayer, Gemma4TextModel
 
-    run = subprocess.run(
-        [sys.executable, "-c", _KV_SHARED_PEAK_SCRIPT],
-        capture_output=True, text=True, timeout=900,
-    )
-    assert run.returncode == 0, run.stderr[-4000:]
-    readings = json.loads(run.stdout.strip().splitlines()[-1])
+    # Two interpreters: a fresh one can still read low on all five repeats (one run
+    # read unshared 160329148 throughout), and low stretches do not cross processes.
+    readings = {"shared": [], "unshared": []}
+    for _ in range(2):
+        run = subprocess.run(
+            [sys.executable, "-c", _KV_SHARED_PEAK_SCRIPT],
+            capture_output=True, text=True, timeout=900,
+        )
+        assert run.returncode == 0, run.stderr[-4000:]
+        for side, values in json.loads(run.stdout.strip().splitlines()[-1]).items():
+            readings[side] += values
 
     def ceiling(side):
         kept = [p for p, produced in readings[side] if p >= produced]
