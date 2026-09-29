@@ -14,14 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A trainable output head must get correct gradients when a chunk would hold one row.
-
-Sequence-packed GRPO full fine-tuning chunks the micro-batch's completion tokens, so any
-token count can leave a one-row chunk (49 tokens in 16 chunks: 12 of 4 rows, then 1).
-Inductor compiled that chunk's head gradient into garbage: an illegal memory access with
-a large vocabulary, silently wrong gradients with a small one. Each case runs in its own
-process because the illegal memory access poisons the CUDA context.
-"""
+"""A trainable head must get correct gradients when a chunk would hold one row (49 packed tokens in 16
+chunks: 12 of 4, then 1). Inductor mis-lowered it: illegal memory access, or silently wrong gradients
+with a small vocabulary. One process per case, since the illegal access poisons the CUDA context."""
 import json
 import subprocess
 import sys
@@ -77,5 +72,4 @@ def test_one_row_chunk_matches_eager(rows, head_grad, cap):
     )
     assert run.returncode == 0, run.stderr[-3000:]
     errors = json.loads(run.stdout.strip().splitlines()[-1])
-    # logps, hidden-state gradient, head gradient against one unchunked matmul under the same autocast.
     assert max(errors) < 1e-2, errors
