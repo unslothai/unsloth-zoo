@@ -159,7 +159,8 @@ def patch_merge_quantization_configs():
     # escapes this function and ends `import unsloth` outright. No published transformers
     # reaches it: the list is non-empty on every version from 4.49.0 to 5.17.0, 12 names on
     # 4.55.0. Kept anyway for a patched or future quantizers.auto, and cheap.
-    used = [x for x in items if x in source]
+    # No dunders: `__class__.__name__` in the source imported `__name__`, renaming this module (breaks Dynamo guards).
+    used = [x for x in items if not x.startswith("__") and x in source]
     if used:
         try:
             exec("from transformers.quantizers.auto import (" + ",".join(used) + ")", globals())
@@ -381,38 +382,45 @@ def patch_CsmForConditionalGeneration_forward():
             # Depth decoder trains on frames whose labels are not uniformly
             # ignore_index across the codebook dimension.
             train_mask = ~(labels[:, :, 1:] == -100).all(dim=-1)
-            depth_decoder_input_ids = labels[train_mask][..., : self.config.num_codebooks - 1]
-            # Position 0 placeholder, replaced later by backbone_last_hidden_state.
-            depth_decoder_input_ids = torch.nn.functional.pad(depth_decoder_input_ids, (1, 0), value=0)
+            # No depth frames (depth_decoder_labels_ratio=0) crashes the decoder; a zero-weight dummy frame
+            # keeps every rank entering it (DDP unused-param grads, FSDP / ZeRO-3 gathers).
+            if not train_mask.any():
+                dummy_outputs = self.depth_decoder(
+                    input_ids = labels.new_zeros((1, self.config.num_codebooks)),
+                    backbone_last_hidden_state = backbone_hidden_states[:1, 0],
+                    use_cache = False,
+                    return_dict = True,
+                )
+                depth_decoder_loss = dummy_outputs.logits.float().mean() * 0
+            else:
+                depth_decoder_input_ids = labels[train_mask][..., : self.config.num_codebooks - 1]
+                # Position 0 placeholder, replaced later by backbone_last_hidden_state.
+                depth_decoder_input_ids = torch.nn.functional.pad(depth_decoder_input_ids, (1, 0), value=0)
 
-            train_idxs = train_mask.nonzero(as_tuple=True)
-            backbone_last_hidden_states = backbone_hidden_states[train_idxs[0], train_idxs[1] - 1, :]
-            depth_decoder_labels = labels[train_mask]
+                train_idxs = train_mask.nonzero(as_tuple=True)
+                backbone_last_hidden_states = backbone_hidden_states[train_idxs[0], train_idxs[1] - 1, :]
+                depth_decoder_labels = labels[train_mask]
 
-            # Pass kwargs to the depth decoder so it sees num_items_in_batch.
-            depth_decoder_kwargs = kwargs.copy()
-            # Backbone num_items is the 0th codebook; depth covers the remaining
-            # 31 codebooks, so scale num_items_in_batch by 31.
-            if 'num_items_in_batch' in depth_decoder_kwargs:
-                depth_decoder_kwargs['num_items_in_batch'] = depth_decoder_kwargs['num_items_in_batch'] * 31
+                depth_decoder_kwargs = kwargs.copy()
+                # Backbone num_items counts codebook 0; depth covers the other 31.
+                if 'num_items_in_batch' in depth_decoder_kwargs:
+                    depth_decoder_kwargs['num_items_in_batch'] = depth_decoder_kwargs['num_items_in_batch'] * 31
 
-            depth_decoder_kwargs.pop('return_dict', None)
-            # Move output_attentions/output_hidden_states (transformers 4.54 deletes them)
-            depth_decoder_kwargs["output_attentions"   ] = output_attentions
-            depth_decoder_kwargs["output_hidden_states"] = output_hidden_states
+                depth_decoder_kwargs.pop('return_dict', None)
+                # Move output_attentions/output_hidden_states (transformers 4.54 deletes them)
+                depth_decoder_kwargs["output_attentions"   ] = output_attentions
+                depth_decoder_kwargs["output_hidden_states"] = output_hidden_states
 
-            depth_decoder_outputs = self.depth_decoder(
-                input_ids = depth_decoder_input_ids,
-                backbone_last_hidden_state = backbone_last_hidden_states,
-                use_cache = use_cache,
-                # output_attentions=output_attentions,
-                # output_hidden_states=output_hidden_states,
-                return_dict = True,
-                labels = depth_decoder_labels,
-                **depth_decoder_kwargs,
-            )
+                depth_decoder_outputs = self.depth_decoder(
+                    input_ids = depth_decoder_input_ids,
+                    backbone_last_hidden_state = backbone_last_hidden_states,
+                    use_cache = use_cache,
+                    return_dict = True,
+                    labels = depth_decoder_labels,
+                    **depth_decoder_kwargs,
+                )
 
-            depth_decoder_loss = depth_decoder_outputs.loss
+                depth_decoder_loss = depth_decoder_outputs.loss
             loss = backbone_loss + depth_decoder_loss
 
         return process_return(CsmOutputWithPast, {
@@ -1420,6 +1428,81 @@ pass
 TEMPORARY_PATCHES.append(patch_mamba_fused_split_without_causal_conv1d)
 
 
+_LOCAL_KERNEL_PACKAGES = {
+    "mamba-ssm"     : ("mamba_ssm", "ops.triton.ssd_combined"),
+    "causal-conv1d" : ("causal_conv1d", None),
+}
+
+
+def _local_kernel_fallback_allowed():
+    if os.environ.get("UNSLOTH_LOCAL_MAMBA_KERNELS", "1") == "0":
+        return False
+    if not torch.cuda.is_available() or getattr(torch.version, "hip", None) is not None:
+        return False
+    try:
+        return torch.cuda.get_device_capability() >= (8, 0)
+    except Exception:
+        return False
+pass
+
+
+def patch_lazy_load_kernel_local_packages():
+    # transformers 5.15 dropped mamba-ssm / causal-conv1d from _HUB_KERNEL_MAPPING; lazy_load_kernel returns None for unmapped names without trying the local package.
+    if not _local_kernel_fallback_allowed():
+        return
+    try:
+        from transformers.integrations import hub_kernels
+    except Exception:
+        return
+    original = getattr(hub_kernels, "lazy_load_kernel", None)
+    if original is None or getattr(original, "_unsloth_local_packages", False):
+        return
+    hub_mapping = getattr(hub_kernels, "_HUB_KERNEL_MAPPING", None)
+    if hub_mapping is None:
+        return
+
+    def _import_local(kernel_name):
+        package, submodule = _LOCAL_KERNEL_PACKAGES[kernel_name]
+        try:
+            module = importlib.import_module(package)
+            if submodule is not None:
+                # Import ssd_combined so a broken install falls back to None, not a mid-forward crash.
+                importlib.import_module(f"{package}.{submodule}")
+            return module
+        except Exception as e:
+            logger.info(f"Unsloth: local {package} unusable for kernel {kernel_name}: {e}")
+            return None
+    pass
+
+    @functools.wraps(original)
+    def lazy_load_kernel(kernel_name, *args, **kwargs):
+        mapping = args[0] if args else kwargs.get("mapping", None)
+        if mapping is None:
+            mapping = getattr(hub_kernels, "_KERNEL_MODULE_MAPPING", {})
+        if (
+            kernel_name in _LOCAL_KERNEL_PACKAGES
+            and kernel_name not in hub_mapping
+            and not isinstance(mapping.get(kernel_name, None), type(os))
+            and _local_kernel_fallback_allowed()
+        ):
+            module = _import_local(kernel_name)
+            if module is not None:
+                mapping[kernel_name] = module
+                return module
+        return original(kernel_name, *args, **kwargs)
+    lazy_load_kernel._unsloth_local_packages = True
+    lazy_load_kernel._unsloth_original = original
+    hub_kernels.lazy_load_kernel = lazy_load_kernel
+    # `from transformers.integrations import lazy_load_kernel` reads the package namespace.
+    try:
+        import transformers.integrations as integrations
+        integrations.lazy_load_kernel = lazy_load_kernel
+    except Exception:
+        pass
+pass
+TEMPORARY_PATCHES.append(patch_lazy_load_kernel_local_packages)
+
+
 def patch_datasets_map_worker_death_retry():
     """Retry `Dataset.map` single-process when a worker is killed outright.
 
@@ -1495,6 +1578,58 @@ def patch_datasets_map_worker_death_retry():
 
 
 TEMPORARY_PATCHES.append(patch_datasets_map_worker_death_retry)
+
+
+def _gradient_checkpointing_donor(model):
+    try:
+        from transformers.modeling_layers import GradientCheckpointingLayer
+    except Exception:
+        GradientCheckpointingLayer = None
+    from transformers import PreTrainedModel
+    # Only the unset PreTrainedModel default: an explicit False (JetMoe, Blip-2) must keep raising.
+    owner = next((k for k in type(model).__mro__ if "supports_gradient_checkpointing" in vars(k)), None)
+    if owner is not PreTrainedModel:
+        return None
+    for name, module in model.named_modules():
+        if not name or module is model:
+            continue
+        if GradientCheckpointingLayer is not None and isinstance(module, GradientCheckpointingLayer):
+            return name
+        if isinstance(module, PreTrainedModel) and getattr(type(module), "supports_gradient_checkpointing", False):
+            return name
+    return None
+pass
+
+
+def patch_gradient_checkpointing_enable_inherit():
+    # Remote-code wrappers (Nemotron-3-Nano-Omni) leave supports_gradient_checkpointing False over
+    # GradientCheckpointingLayer blocks; _set_gradient_checkpointing already walks submodules, only the gate is wrong.
+    if os.environ.get("UNSLOTH_GC_INHERIT", "1") == "0":
+        return
+    try:
+        from transformers import PreTrainedModel
+    except Exception as e:
+        return raise_error("transformers.PreTrainedModel", e)
+    original = PreTrainedModel.gradient_checkpointing_enable
+    if getattr(original, "_unsloth_gc_inherit", False):
+        return
+
+    @functools.wraps(original)
+    def gradient_checkpointing_enable(self, *args, **kwargs):
+        if not getattr(self, "supports_gradient_checkpointing", False):
+            donor = _gradient_checkpointing_donor(self)
+            if donor is not None:
+                # Instance only: the class and its other instances keep False.
+                self.supports_gradient_checkpointing = True
+                logger.info(
+                    f"Unsloth: {type(self).__name__} inherits gradient checkpointing support from {donor}."
+                )
+        return original(self, *args, **kwargs)
+    gradient_checkpointing_enable._unsloth_gc_inherit = True
+    gradient_checkpointing_enable._unsloth_original = original
+    PreTrainedModel.gradient_checkpointing_enable = gradient_checkpointing_enable
+pass
+TEMPORARY_PATCHES.append(patch_gradient_checkpointing_enable_inherit)
 
 
 def patch_GraniteMoeHybridMambaLayer_cuda_kernels_forward():
@@ -2192,6 +2327,57 @@ pass
 TEMPORARY_PATCHES.append(patch_qwen2vl_image_processor_pixel_attrs)
 
 
+def patch_idefics2_image_processor_leading_text_row():
+    # Idefics2 image processors read processed_images[0][0] for channels/device, so a batch whose
+    # first row is text-only raises IndexError. Put an image row first, then restore row order.
+    import functools
+    classes = []
+    for module, names in (
+        ("transformers.models.idefics2.image_processing_idefics2", ("Idefics2ImageProcessor",)),
+        ("transformers.models.idefics2.image_processing_pil_idefics2", ("Idefics2ImageProcessorPil",)),
+        ("transformers.models.idefics2.image_processing_idefics2_fast", ("Idefics2ImageProcessorFast",)),
+    ):
+        try:
+            mod = importlib.import_module(module)
+        except Exception:
+            continue
+        # __dict__ lookup: transformers 5.x serves old class names through a warning module __getattr__.
+        classes.extend(mod.__dict__[n] for n in names if n in mod.__dict__)
+
+    def _reorder(value, order, n):
+        if hasattr(value, "shape") and len(value.shape) > 0 and value.shape[0] == n:
+            return value[order]
+        if isinstance(value, (list, tuple)) and len(value) == n:
+            return type(value)(value[i] for i in order)
+        return value
+
+    for cls in classes:
+        original = cls.__dict__.get("preprocess")
+        if original is None or getattr(original, "_unsloth_leading_text_row", False):
+            continue
+
+        @functools.wraps(original)
+        def preprocess(self, images, *args, _original = original, **kwargs):
+            if (
+                isinstance(images, (list, tuple)) and len(images) > 1
+                and all(isinstance(row, (list, tuple)) for row in images)
+                and len(images[0]) == 0 and any(len(row) > 0 for row in images)
+            ):
+                n = len(images)
+                first = next(i for i, row in enumerate(images) if len(row) > 0)
+                perm = [first] + [i for i in range(n) if i != first]
+                inverse = [perm.index(i) for i in range(n)]
+                out = _original(self, [images[i] for i in perm], *args, **kwargs)
+                for key in list(out.keys()):
+                    out[key] = _reorder(out[key], inverse, n)
+                return out
+            return _original(self, images, *args, **kwargs)
+        preprocess._unsloth_leading_text_row = True
+        cls.preprocess = preprocess
+pass
+TEMPORARY_PATCHES.append(patch_idefics2_image_processor_leading_text_row)
+
+
 def patch_deepseek_v2_moe_alias():
     # transformers 5.x renamed DeepseekV2MoE -> DeepseekV2Moe; trust_remote_code
     # models (e.g. DeepSeek-OCR) still import the old name. Alias it back when
@@ -2847,3 +3033,73 @@ def patch_peft_lora_integer_input():
     Linear4bit.forward = forward
 pass
 TEMPORARY_PATCHES.append(patch_peft_lora_integer_input)
+
+
+def _list_main_input_numel(value):
+    if all(isinstance(v, torch.Tensor) for v in value):
+        return sum(v.numel() for v in value)
+    return None
+
+
+def patch_trainer_flops_list_main_input():
+    # Nemotron-3-Nano-Omni's main_input_name is pixel_values, a list of ragged tiles: Trainer's `.numel()` crashes.
+    try:
+        from transformers import Trainer
+    except Exception:
+        return
+    original = Trainer.__dict__.get("floating_point_ops")
+    if original is None or getattr(original, "_unsloth_list_main_input", False):
+        return
+
+    @functools.wraps(original)
+    def floating_point_ops(self, inputs):
+        model = getattr(self, "model", None)
+        main_input = getattr(model, "main_input_name", "input_ids")
+        # BatchFeature is a UserDict, not a dict.
+        value = inputs.get(main_input, None) if hasattr(inputs, "get") else None
+        if isinstance(value, (list, tuple)) and hasattr(model, "num_parameters"):
+            numel = _list_main_input_numel(value)
+            if numel is None:
+                return 0
+            return 6 * numel * model.num_parameters(exclude_embeddings = True)
+        return original(self, inputs)
+
+    floating_point_ops._unsloth_list_main_input = True
+    Trainer.floating_point_ops = floating_point_ops
+pass
+TEMPORARY_PATCHES.append(patch_trainer_flops_list_main_input)
+
+
+def patch_granitemoe_router_logits_recording():
+    # transformers 5.x dropped router_logits from Granite MoE _can_record_outputs, so output_router_logits=True
+    # (TRL >= 1.7 default) makes aux_loss an int 0 and the CausalLM forward crashes on `aux_loss.to(...)`.
+    try:
+        from transformers.utils.output_capturing import OutputRecorder
+    except Exception:
+        return  # transformers 4.x collects router logits in the decoder loop itself
+    for module_name, prefix in (
+        ("granitemoe", "GraniteMoe"),
+        ("granitemoeshared", "GraniteMoeShared"),
+        ("granitemoe_swa", "GraniteMoeSWA"),
+        ("granitemoehybrid", "GraniteMoeHybrid"),
+    ):
+        try:
+            module = importlib.import_module(f"transformers.models.{module_name}.modeling_{module_name}")
+        except Exception:
+            continue
+        pretrained = getattr(module, f"{prefix}PreTrainedModel", None)
+        # transformers <= 5.5 calls it TopKGating and returns the logits as `logits`.
+        router = getattr(module, f"{prefix}TopKRouter", None) or getattr(module, f"{prefix}TopKGating", None)
+        recorded = getattr(pretrained, "_can_record_outputs", None)
+        if pretrained is None or router is None or not isinstance(recorded, dict) or "router_logits" in recorded:
+            continue
+        # GraniteMoeSWA returns (router_logits, ...) while the others end with it: read the position off the source.
+        try:
+            returned = re.findall(r"return ([^\n]+)", inspect.getsource(router.forward))[-1]
+            names = [x.strip() for x in returned.split(",")]
+            index = names.index("router_logits") if "router_logits" in names else names.index("logits")
+        except Exception:
+            continue
+        pretrained._can_record_outputs = {**recorded, "router_logits": OutputRecorder(router, index = index)}
+pass
+TEMPORARY_PATCHES.append(patch_granitemoe_router_logits_recording)
