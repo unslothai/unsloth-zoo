@@ -209,3 +209,21 @@ def test_loss_survives_mx_compile():
     plain, compiled = run(False), run(True)
     worst = max(abs(a - b) for a, b in zip(plain, compiled))
     assert worst == 0.0, f"mx.compile changed the trajectory by {worst:.3e}"
+
+
+@pytest.mark.parametrize("with_labels", [False, True])
+def test_trains_the_same_positions_as_cross_entropy(with_labels):
+    """Labels beyond a row's length are padding, not targets."""
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx.distill import build_gkd_loss_fn
+    from unsloth_zoo.mlx.utils import make_baseline_loss_fn
+
+    _, _, ids = _fixture()
+    lengths = mx.array([[0, SEQ], [2, SEQ - 5], [4, SEQ // 2], [0, SEQ - 1]])
+    labels = mx.concatenate([mx.full((BATCH, 3), -100), ids[:, 3:]], axis=1) if with_labels else None
+    student, teacher = _new_student(), _new_student()
+    args = SimpleNamespace(gkd_chunk_size=5, max_seq_length=SEQ)
+    gkd = build_gkd_loss_fn(teacher, args, VOCAB, BATCH, 0, 1 << 40)
+    _, gkd_ntoks = gkd(student, ids, lengths, labels)
+    _, ce_ntoks = make_baseline_loss_fn()(student, ids, lengths, labels)
+    assert int(gkd_ntoks) == int(ce_ntoks)

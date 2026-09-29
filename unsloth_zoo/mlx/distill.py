@@ -22,7 +22,7 @@ scores the student's batch and the student trains on TRL's generalized JSD."""
 import mlx.core as mx
 import mlx.nn as nn
 
-from .utils import _model_logits
+from .utils import _model_logits, _normalize_cce_label_dtype
 
 __all__ = [
     "generalized_jsd_loss",
@@ -283,14 +283,14 @@ def build_gkd_loss_fn(teacher_model, args, vocab_size, batch_size,
     )
 
     def loss_fn(model, batch, lengths, labels=None):
+        # Same positions as make_baseline_loss_fn: the lengths window, further
+        # restricted by -100 labels when labels are given.
         inputs = batch[:, :-1]
-        if labels is None:
-            steps = mx.arange(1, inputs.shape[1] + 1)
-            mask = mx.logical_and(steps >= lengths[:, 0:1], steps < lengths[:, 1:])
-            shifted_labels = mx.where(mask, mx.zeros_like(inputs), mx.full(inputs.shape, -100))
-        else:
-            shifted_labels = labels[:, 1:]
-            mask = (shifted_labels != -100)
+        steps = mx.arange(1, inputs.shape[1] + 1)
+        mask = mx.logical_and(steps >= lengths[:, 0:1], steps < lengths[:, 1:])
+        if labels is not None:
+            mask = mx.logical_and(mask, _normalize_cce_label_dtype(labels[:, 1:]) != -100)
+        shifted_labels = mx.where(mask, mx.zeros_like(inputs), mx.full(inputs.shape, -100))
         student_logits = _model_logits(model(inputs))
         teacher_logits = mx.stop_gradient(_model_logits(teacher_model(inputs)))
         loss = generalized_jsd_loss(
