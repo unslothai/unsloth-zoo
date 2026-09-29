@@ -928,14 +928,12 @@ def test_compiled_update_reuses_parameter_and_moment_buffers(quantized):
         results.append(tree_flatten(state))
     for (name, left), (_, right) in zip(*results):
         assert mx.array_equal(left, right).item(), name
-    # Stock fuses the new parameter and moments into one kernel that copies all of them.
     assert peaks[0] >= 3 * leaf
     if quantized:
-        # The 8-bit moment is repacked either way; the parameter is still updated in place.
+        # 8-bit m is repacked either way; only the parameter is donated.
         assert peaks[1] <= peaks[0] - leaf
     else:
         assert peaks[1] < leaf / 8
-    # Freed by reference counting, not held with its state until a cyclic collection.
     released = weakref.ref(trainer._build_optimizer(total_steps=3))
     assert released() is None
 

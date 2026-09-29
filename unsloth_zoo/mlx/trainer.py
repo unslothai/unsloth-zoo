@@ -865,17 +865,12 @@ def _normalize_mlx_optimizer_name(name):
 
 
 def _donate_optimizer_state(optimizer):
-    """Let MLX update each parameter and its optimizer state in place.
-
-    mx.compile fuses a leaf's new parameter and moments into one multi-output
-    kernel, whose inputs MLX never donates: every step copied them all. A
-    zero-copy reshape of each new state array splits that kernel into
-    single-output kernels that reuse the old buffers, with unchanged arithmetic.
-    """
+    """Zero-copy reshape of each new state array splits mx.compile's multi-output
+    update kernel (whose inputs MLX never donates) so p, m, v update in place."""
     apply_single = getattr(type(optimizer), "apply_single", None)
-    if apply_single is None:  # no per-leaf update hook to route
+    if apply_single is None:
         return optimizer
-    # Weak, so the instance attribute does not keep the optimizer and its state alive.
+    # Weak: a strong self-reference would hold the optimizer until a cyclic GC.
     owner = weakref.ref(optimizer)
 
     def _apply_single(gradient, parameter, state):
