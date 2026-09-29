@@ -12651,7 +12651,7 @@ def _torch_randperm_order(length, seed):
 
 
 def _length_grouped_permutation(length, seed):
-    """torch.randperm (matches CUDA) when importable; stdlib fallback since unsloth_zoo[mlx] omits torch on Apple Silicon. Seed-only for DDP."""
+    """Seeded torch.randperm when importable, else stdlib (unsloth_zoo[mlx] omits torch on Apple Silicon). Seed-only, so DDP ranks agree."""
     try:
         import torch  # noqa: F401
     except Exception:
