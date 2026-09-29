@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 
 import numpy as np
 import pytest
@@ -32,6 +33,8 @@ from mlx_simulation import mlx_is_simulated  # noqa: E402
 if mlx_is_simulated():
     pytest.skip("needs real MLX: mx.fast attention and RoPE", allow_module_level = True)
 
+from mlx.nn import Embedding, LayerNorm, Linear  # noqa: E402
+from mlx.utils import tree_flatten  # noqa: E402
 from safetensors.torch import save_file  # noqa: E402
 
 from unsloth_zoo.mlx.decision import load_decision_model  # noqa: E402
@@ -117,6 +120,53 @@ def test_logits_match_the_torch_reference(checkpoint):
     batch = _batch()
     with torch.inference_mode():
         expected = reference(**{k: torch.from_numpy(v) for k, v in batch.items()}).numpy()
-    got = load_decision_model(folder, dtype = mx.float32).logits(batch)
+    got = load_decision_model(folder).logits(batch)
     np.testing.assert_allclose(got, expected, atol = 2e-5, rtol = 0)
     assert got[1, 2] == -1e4
+
+
+def test_casting_load_leaves_no_source_buffers_cached(checkpoint):
+    folder = checkpoint[1]
+    assert {v.dtype for v in mx.load(str(folder / "model.safetensors")).values()} == {mx.float32}
+    model = load_decision_model(folder, compute_dtype = mx.float16)
+    mx.synchronize()
+    assert mx.get_cache_memory() < (folder / "model.safetensors").stat().st_size // 10
+    del model
+
+
+@pytest.mark.parametrize("dtype, atol", [(mx.float16, 1e-2), (mx.bfloat16, 5e-2)])
+def test_reduced_precision_keeps_norms_in_float32(checkpoint, dtype, atol, tmp_path):
+    reference, folder = checkpoint
+    batch = _batch()
+    with torch.inference_mode():
+        expected = reference(**{k: torch.from_numpy(v) for k, v in batch.items()}).numpy()
+    # Published checkpoints store every tensor, norms included, in float16.
+    half = shutil.copytree(folder, tmp_path / "half")
+    stored = mx.load(str(folder / "model.safetensors"))
+    mx.save_safetensors(str(half / "model.safetensors"), {k: v.astype(mx.float16) for k, v in stored.items()})
+    model = load_decision_model(folder, compute_dtype = dtype)
+    for loaded in (model, load_decision_model(half, compute_dtype = dtype)):
+        for module in loaded.modules():
+            if isinstance(module, (Embedding, LayerNorm, Linear)):
+                want = mx.float32 if isinstance(module, LayerNorm) else dtype
+                assert {p.dtype for _, p in tree_flatten(module.parameters())} == {want}
+    assert mx.array_equal(model.encoder.final_norm.weight, stored["encoder.final_norm.weight"])
+    assert model.encoder.layers[0].attn.Wqkv(mx.zeros((1, 1, 128))).dtype == dtype
+    assert model.encoder.embeddings(mx.zeros((1, 2), mx.int32)).dtype == mx.float32
+    assert model.encoder.layers[1](mx.zeros((1, 2, 128)), None).dtype == mx.float32
+    np.testing.assert_allclose(model.logits(batch), expected, atol = atol, rtol = 0)
+
+
+def test_load_drains_generation_streams_before_clearing_the_cache(checkpoint, monkeypatch):
+    import sys
+    import types
+
+    stream = mx.new_stream(mx.default_device())
+    monkeypatch.setitem(sys.modules, "mlx_lm.generate", types.SimpleNamespace(generation_stream = stream))
+    calls = []
+    synchronize, clear_cache = mx.synchronize, mx.clear_cache
+    monkeypatch.setattr(mx, "synchronize", lambda *a: calls.append(("sync", a)) or synchronize(*a))
+    monkeypatch.setattr(mx, "clear_cache", lambda: calls.append(("clear", ())) or clear_cache())
+    load_decision_model(checkpoint[1])
+    clear = calls.index(("clear", ()))
+    assert ("sync", (stream,)) in calls[:clear] and ("sync", ()) in calls[:clear]

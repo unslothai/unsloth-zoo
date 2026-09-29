@@ -421,6 +421,7 @@ jobs:
         # pyc has to be dropped before every verified import.
         # test_device_map_planner_compressed_tensors: pack-quantized checkpoints planned at packed bytes.
         # test_grpo_mask_truncated_rows: truncated completions stay out of the GRPO loss; its UnslothEfficientGRPO stubs bind to the real forward.
+        # test_mlx_embedding_guards: sentence-transformers layout shim and pooling-mode map, under the torch shim.
         run: |
           python -m pytest \
             tests/test_training_utils_use_cache.py \
@@ -428,6 +429,10 @@ jobs:
             tests/test_loss_normalization_contract.py \
             tests/test_mlx_finetune_last_n_layers.py \
             tests/test_mlx_double_quant_reject.py \
+            tests/test_mlx_incomplete_config.py \
+            tests/test_mlx_incomplete_config_vlm.py \
+            tests/test_mlx_adam_epsilon.py \
+            tests/test_mlx_optimizer_torch_parity.py \
             tests/test_hf_xet_fallback.py \
             tests/test_hf_xet_fallback_blob_scoped_redownload.py \
             tests/test_llama_cpp_install_consent.py \
@@ -439,6 +444,7 @@ jobs:
             tests/test_mlx_trainer_internals.py \
             tests/test_mlx_arrays_cache_advance.py \
             tests/test_mlx_quantized_optimizer_routing.py \
+            tests/test_mlx_embedding_guards.py \
             tests/test_fp16_emulation.py \
             tests/test_check_hf_model_exists_transport_errors.py \
             tests/test_hub_transport_errors_single_segment.py \
@@ -816,6 +822,19 @@ jobs:
             --require no-skips \
             --message "real mlx is installed but the numeric tests skipped"
 
+      - name: pytest tests/test_mlx_optimizer_defaults.py (HARD GATE)
+        # rmsprop/adamax/adagrad/adadelta defaults and Adamax bias correction vs torch.optim; shim cannot answer.
+        run: >-
+          .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_optimizer_defaults.py -v -rs
+          --junitxml="$RUNNER_TEMP/mlx-reports/optimizer_defaults.xml"
+
+      - name: Fail if the optimizer defaults tests skipped
+        run: |
+          python3 scripts/pytest_junit_gate.py \
+            --report "$RUNNER_TEMP/mlx-reports/optimizer_defaults.xml" \
+            --require no-skips \
+            --message "real mlx is installed but the optimizer defaults tests skipped"
+
       - name: tests/test_mlx_neftune_quant_map.py (mlx_only half, HARD GATE)
         # Embedding identification, embed-scale resolution and probe cleanup are
         # pure logic over a synthetic module tree: real mlx, no Metal, no
@@ -913,6 +932,20 @@ jobs:
             --report "$RUNNER_TEMP/mlx-reports/gated_delta_batch_grad.xml" \
             --require one-passed \
             --message "real mlx is installed but no gated-delta gradient test ran"
+
+      # Pooling and contrastive losses need mlx core, not Metal; the real-checkpoint
+      # tests skip unless Qwen3-Embedding-0.6B is cached, hence one-passed.
+      - name: tests/test_mlx_embedding_pooling.py
+        run: >-
+          .lanes/venv-suites/bin/python -m pytest tests/test_mlx_embedding_pooling.py -v -rs
+          --junitxml="$RUNNER_TEMP/mlx-reports/embedding_pooling.xml"
+
+      - name: Fail if the embedding pooling tests skipped
+        run: |
+          python3 scripts/pytest_junit_gate.py \
+            --report "$RUNNER_TEMP/mlx-reports/embedding_pooling.xml" \
+            --require one-passed \
+            --message "real mlx is installed but no embedding pooling test ran"
   # Core (HF/TRL/peft) drift matrix. Three cells: HF=4.57.6+TRL<1, HF=latest+TRL=latest,
   # and pyproject defaults.
   #
@@ -1129,6 +1162,7 @@ jobs:
                   tests/test_disable_compile_functions_reach_imported_helpers.py \
                   tests/test_data_dependent_helpers_not_fullgraph.py \
                   tests/test_decode_compile_disable.py \
+                  tests/test_eager_decode_bypass.py \
                   tests/test_temporary_patches_exhaustive.py \
                   tests/test_patch_keeps_module_name.py \
                   tests/test_mxfp4_load_path_layout.py \

@@ -57,13 +57,23 @@ print("RESULT " + json.dumps(out))
 '''
 
 
-def test_cast_routers_compiled_and_decoder_layer_types_kept(tmp_path):
+# The router decorator follows the compile mode, so the child states its own rather than
+# inheriting the caller's: unsloth's Core zoo job exports UNSLOTH_COMPILE_DISABLE=1, under which
+# the routers are rightly left out of compile, and the default-mode assertion read that as a
+# regression. Both modes are pinned, so a router that stops following the switch fails too.
+@pytest.mark.parametrize(
+    "compile_disable, expected_prefix",
+    [(None, "torch_compile_with_fallback("), ("1", "torch_compiler_disable_unless_decode")],
+    ids = ["compiled", "compile-disabled"],
+)
+def test_cast_routers_compiled_and_decoder_layer_types_kept(tmp_path, compile_disable, expected_prefix):
     env = dict(os.environ)
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     env["PYTHONPATH"] = os.pathsep.join([repo_root] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
     env.setdefault("UNSLOTH_ZOO_DISABLE_GPU_INIT", "1")
-    # unslothai/unsloth's Core CI exports UNSLOTH_COMPILE_DISABLE=1, which disables every router.
     env.pop("UNSLOTH_COMPILE_DISABLE", None)
+    if compile_disable is not None:
+        env["UNSLOTH_COMPILE_DISABLE"] = compile_disable
     proc = subprocess.run([sys.executable, "-c", _CHILD], cwd = tmp_path, capture_output = True, text = True,
                           timeout = 900, env = env)
     line = next((ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT ")), None)
@@ -73,6 +83,6 @@ def test_cast_routers_compiled_and_decoder_layer_types_kept(tmp_path):
         pytest.skip(reason = "transformers has none of the Ernie 4.5 / Laguna routers or Jamba")
     for mt in ("ernie4_5_moe", "laguna"):
         if mt in r:
-            assert r[mt] is not None and r[mt].startswith("torch_compile_with_fallback("), (mt, r[mt])
+            assert r[mt] is not None and r[mt].startswith(expected_prefix), (mt, r[mt])
     if "jamba" in r:
         assert r["jamba"] == {"attention": "JambaAttentionDecoderLayer", "mamba": "JambaMambaDecoderLayer"}, r["jamba"]

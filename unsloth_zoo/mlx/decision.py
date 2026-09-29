@@ -46,6 +46,12 @@ def _gelu_gate(value, gate):
     return nn.gelu(value) * gate
 
 
+class _Linear(nn.Linear):
+    # Runs in the weight's dtype; residual adds and LayerNorm's float32 weights promote the stream back to float32.
+    def __call__(self, x):
+        return super().__call__(x.astype(self.weight.dtype))
+
+
 def _gather_rows(x, rows):
     return mx.take_along_axis(x, mx.broadcast_to(rows[:, :, None], (*rows.shape, x.shape[-1])), axis = 1)
 
@@ -55,8 +61,8 @@ class _EncoderAttention(nn.Module):
         super().__init__()
         self.heads = heads
         self.base = base
-        self.Wqkv = nn.Linear(dims, 3 * dims, bias = bias)
-        self.Wo = nn.Linear(dims, dims, bias = bias)
+        self.Wqkv = _Linear(dims, 3 * dims, bias = bias)
+        self.Wo = _Linear(dims, dims, bias = bias)
 
     def __call__(self, x, mask):
         B, L, D = x.shape
@@ -73,8 +79,8 @@ class _EncoderAttention(nn.Module):
 class _EncoderMLP(nn.Module):
     def __init__(self, dims, hidden, bias):
         super().__init__()
-        self.Wi = nn.Linear(dims, 2 * hidden, bias = bias)
-        self.Wo = nn.Linear(hidden, dims, bias = bias)
+        self.Wi = _Linear(dims, 2 * hidden, bias = bias)
+        self.Wo = _Linear(hidden, dims, bias = bias)
 
     def __call__(self, x):
         value, gate = mx.split(self.Wi(x), 2, axis = -1)
@@ -132,8 +138,8 @@ class _HeadAttention(nn.Module):
     def __init__(self, dims, heads):
         super().__init__()
         self.heads = heads
-        self.in_proj = nn.Linear(dims, 3 * dims)
-        self.out_proj = nn.Linear(dims, dims)
+        self.in_proj = _Linear(dims, 3 * dims)
+        self.out_proj = _Linear(dims, dims)
 
     def __call__(self, x, mask, rows = None):
         B, _, D = x.shape
@@ -152,8 +158,8 @@ class _HeadLayer(nn.Module):
         self.self_attn = _HeadAttention(dims, heads)
         self.norm1 = nn.LayerNorm(dims)
         self.norm2 = nn.LayerNorm(dims)
-        self.linear1 = nn.Linear(dims, 4 * dims)
-        self.linear2 = nn.Linear(4 * dims, dims)
+        self.linear1 = _Linear(dims, 4 * dims)
+        self.linear2 = _Linear(4 * dims, dims)
 
     def __call__(self, x, mask, rows = None):
         # `rows`: queries and feed-forward only at those rows (the scored markers); keys and values span every token.
@@ -177,7 +183,7 @@ class DecisionModel(nn.Module):
         self.encoder = _Encoder(encoder_config)
         self.head = _Head(dims, head_layers)
         self.type_emb = nn.Embedding(3, dims)
-        self.scorer = [nn.LayerNorm(dims), nn.Linear(dims, dims), nn.GELU(), nn.Linear(dims, 1)]
+        self.scorer = [nn.LayerNorm(dims), _Linear(dims, dims), nn.GELU(), _Linear(dims, 1)]
 
     def __call__(self, input_ids, attention_mask, marker_pos, marker_mask, qtype):
         keys = attention_mask.astype(mx.bool_)[:, None, None, :]
@@ -202,8 +208,8 @@ def _checkpoint_name(name):
     return name.replace(".in_proj_weight", ".in_proj.weight").replace(".in_proj_bias", ".in_proj.bias")
 
 
-def load_decision_model(folder, dtype = mx.float32):
-    """Load a Laya checkpoint folder as published. float16 drifts calibrated probabilities enough to change reported values."""
+def load_decision_model(folder, compute_dtype = mx.float32):
+    """Load a Laya checkpoint folder whose matmuls and embeddings run in `compute_dtype`; like torch autocast, norms and the residual stream stay float32."""
     folder = Path(folder)
     encoder_config = json.loads((folder / "encoder" / "config.json").read_text())
     agent_config = json.loads((folder / "rl_agent_config.json").read_text())
@@ -218,12 +224,22 @@ def load_decision_model(folder, dtype = mx.float32):
     ])
     model = DecisionModel(encoder_config, agent_config.get("head_layers", 2))
     # The act head is not served, and calibration is read from rl_agent_config.json, not this buffer.
-    weights = [
-        (_checkpoint_name(name), value.astype(dtype))
+    model.load_weights([
+        (_checkpoint_name(name), value)
         for name, value in mx.load(str(folder / "model.safetensors")).items()
         if not name.startswith("act_head.") and name != "temperature"
-    ]
-    model.load_weights(weights, strict = True)
+    ], strict = True)
+    for module in model.modules():
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            module.set_dtype(compute_dtype)
+        elif isinstance(module, nn.LayerNorm):
+            module.set_dtype(mx.float32)
     model.eval()
     mx.eval(model.parameters())
+    # eval returns before the command buffer drops the cast's source tensors; wait, then empty the process-wide cache.
+    # The cache is shared with any generation in flight, so drain its streams first, as every other clear here does.
+    from .generate import _drain_generation_streams
+
+    _drain_generation_streams(mx)
+    mx.clear_cache()
     return model
