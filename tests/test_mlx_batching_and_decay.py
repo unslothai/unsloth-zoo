@@ -203,7 +203,6 @@ def test_ordered_text_fractional_num_epochs_builds_the_partial_pass():
 
     assert len(plan_for(0.5)) == 3
     assert len(plan_for(1.5)) == 8
-    # Whole counts are unchanged.
     assert len(plan_for(2)) == 10
 
 
@@ -211,7 +210,7 @@ def test_ordered_text_fractional_epochs_match_transformers_step_budget():
     # Golden values measured by running a real transformers.Trainer on the same
     # shapes: HF quantizes a fractional num_train_epochs to whole accumulation
     # windows and re-iterates the dataloader, so 0.5 epochs of 5 rows at batch 2
-    # and accum 2 is one update over 4 rows, not a proportional 3 rows.
+    # and accum 2 is one update over 4 rows, not a proportional 3.
     _skip_if_mlx_core_was_replaced()
     from unsloth_zoo.mlx.utils import create_ordered_batches
 
@@ -395,7 +394,6 @@ def _digest_vlm_batches(batches):
                         tuple(_tuplify(item) for item in x)
                         if isinstance(x, list) else x
                     )
-                # dtype-native values: float drift must fail the oracle.
                 entry.append((
                     key, str(value.dtype), tuple(value.shape),
                     _tuplify(value.tolist()),
@@ -489,7 +487,7 @@ def test_checker_reaches_collective_without_materialization_on_fake_rank(monkeyp
 
     def spy_all_sum(value, **kwargs):
         collective_calls.append(value.tolist())
-        return value  # identity: single fake rank stands in for the sum
+        return value
 
     monkeypatch.setattr(mx_core.distributed, "all_sum", spy_all_sum)
     try:
@@ -502,7 +500,6 @@ def test_checker_reaches_collective_without_materialization_on_fake_rank(monkeyp
     assert processor.calls == calls_before_check
 
 
-    # The fake-rank collective test covers no-materialization more strictly.
 
 
 def test_vlm_family_invariant_against_live_mx_compile_traces():
@@ -556,8 +553,8 @@ def test_vlm_family_invariant_against_live_mx_compile_traces():
         if kind == "merge":
             assert same_key and fam_left == fam_right and plannable(fam_left)
         elif kind == "split":
-            # Distinct values stay ELIGIBLE while splitting: making common
-            # constants unplannable would regress ordinary batches to eager.
+            # Both stay plannable while splitting: making common constants
+            # unplannable would regress ordinary batches to eager.
             assert not same_key and fam_left != fam_right
             assert plannable(fam_left) and plannable(fam_right)
         else:
@@ -590,7 +587,7 @@ def test_per_row_audio_spans_stay_plannable():
     )
 
     cases = [
-        ([np.zeros((0, 2), np.int32)] * 2, [[], []]),         # a text-only batch
+        ([np.zeros((0, 2), np.int32)] * 2, [[], []]),
         ([np.array([[1, 3]]), np.array([[1, 3], [4, 7]])],
          [[[1, 3]], [[1, 3], [4, 7]]]),
     ]
@@ -599,7 +596,7 @@ def test_per_row_audio_spans_stay_plannable():
             "input_ids": np.zeros((2, 8), dtype=np.int32),
             "audio_bounds": spans,
         })
-        # Both halves matter here: the generic conversion also yields something
+        # Both halves matter: the generic conversion also yields something
         # plannable, by stacking equal rows and keeping only the first of ragged
         # ones, so plannability alone would not show the rows survived.
         assert [np.asarray(row).tolist() for row in batch["audio_bounds"]] == expected
@@ -650,7 +647,6 @@ def test_vlm_plan_survey_is_lazy_idempotent_per_index_and_cache_free():
     cached_batch = plan.materialize(0)
     assert processor.calls == 1 and plan._mru is not None
     descriptors = plan.ensure_descriptors()
-    # The pre-populated cache is invalidated, not consulted.
     assert processor.calls == 1 + len(plan) == 4
     assert plan._mru is None
     assert plan.ensure_descriptors() is descriptors
@@ -665,7 +661,6 @@ def test_vlm_plan_survey_is_lazy_idempotent_per_index_and_cache_free():
         assert descriptors[index] == _vlm_batch_family(
             rebuilt, symbolic_axes=axes,
         )
-    # Widths merge symbolically; the structural sidecar still splits.
     assert len(set(descriptors)) == 2
     assert plan.batch_family(1) == descriptors[1]
     assert len(descriptors) == 3
@@ -715,7 +710,6 @@ def test_vlm_plan_survey_does_not_consume_preprocessing_rng():
     unsurveyed, unsurveyed_tail = _stream(False)
     surveyed, surveyed_tail = _stream(True)
     assert surveyed == unsurveyed
-    # The survey also leaves no offset behind for anything drawing afterwards.
     assert surveyed_tail == unsurveyed_tail
 
 
@@ -839,7 +833,6 @@ def test_vlm_plan_does_not_pin_one_file_descriptor_per_row(tmp_path):
         f"row must not keep its image file open until materialization"
     )
 
-    # Releasing the descriptor has to leave a row that still materializes.
     batch = plan[0]
     assert batch["input_ids"].shape[0] == 2
 
@@ -894,7 +887,7 @@ def test_vlm_family_drift_check_fails_hard_with_location():
     reordered = dict(reversed(list(batch.items())))
     with pytest.raises(RuntimeError, match="drifted"):
         plan.check_family_drift(1, reordered)
-    # Families genuinely differ, so a checker pinned wrong cannot pass.
+    # Families genuinely differ, so the cross-index check cannot pass vacuously.
     assert plan.batch_family(0) != plan.batch_family(1)
     with pytest.raises(RuntimeError, match="batch 0 drifted"):
         plan.check_family_drift(0, batch)
@@ -988,8 +981,6 @@ def test_vlm_shape_planning_follows_the_resolved_override_mode():
         mode="best_effort", arch_overrides=((arch, "strict"),),
     )
     decision = resolve_training_compile(arch, policy=strict_override)
-    # Qualified arch: the decision is enabled, so planning runs past the
-    # should_raise and unqualified guards and reaches the failure branches.
     assert decision.enabled and decision.policy_mode == "strict"
     assert not decision.fallback_allowed and not decision.should_raise
     with pytest.raises(RuntimeError, match="not stable enough"):
@@ -1058,7 +1049,6 @@ def test_vlm_admission_covers_only_the_batches_the_loop_visits():
         _shape_plan, report, allowed, _frontier = _plan(poison_call)
         assert allowed and report.reason != "vlm_unplannable_family"
 
-    # Still enforced for a batch the loop does reach.
     with pytest.raises(RuntimeError, match="cannot plan VLM batch 3"):
         _plan(4)
 
@@ -1132,7 +1122,6 @@ def test_vlm_batches_keep_unbounded_max_seq_length_as_none():
         dataset_order="sequential",
     )
 
-    # The processor is never handed a cap, so nothing is truncated.
     assert set(processor.seen_max_length) == {"<absent>"}
     assert len(batches) == 2
     assert all(batch["input_ids"].shape == (2, 12) for batch in batches)
@@ -1147,7 +1136,6 @@ def test_vlm_batches_keep_unbounded_max_seq_length_as_none():
     )
     assert plan.max_seq_length is None
 
-    # A finite cap still coerces to int and still truncates.
     capped_processor = _ProcessorNativeLimitProcessor(native_width=12)
     capped = create_vlm_batches(
         dataset=[{"text": str(i)} for i in range(4)],
@@ -1431,7 +1419,6 @@ def test_vlm_eval_splits_each_draw_their_own_augmentation_stretch(
         processor_log=calls,
     )
 
-    # Evaluation never moves the training stream, whatever the split count.
     assert len(without_eval) == 4
     assert with_splits == without_eval
 
@@ -1443,7 +1430,6 @@ def test_vlm_eval_splits_each_draw_their_own_augmentation_stretch(
     assert sorted(per_split) == [1, 2, 3]
     assert [len(draws) for draws in per_split.values()] == [2, 2, 2]
 
-    # No split may replay a draw another split already consumed.
     eval_draws = [draw for draws in per_split.values() for draw in draws]
     assert len(set(eval_draws)) == len(eval_draws)
 
@@ -1697,12 +1683,10 @@ def test_vlm_plan_is_excluded_from_eager_fallback_refetch():
 def test_vlm_fallback_refetch_would_shift_the_augmentation_stream():
     """Why the exclusion exists: the refetch is a second processor call whose
     draws offset every later batch, and the reuse it replaces is loss-safe."""
-    # Reference: an eager-from-start run, which never surveys or materializes.
     plan = _make_plan()
     eager = [_pixels(plan[i]) for i in range(len(plan))]
     eager_tail = int(np.random.randint(0, 1 << 30))
 
-    # What the removed refetch did: materialize, then re-index the same visit.
     plan = _install_and_get()
     calls_before = plan._processor.calls
     plan.materialize(0, phase="full_step")
@@ -1717,7 +1701,6 @@ def test_vlm_fallback_refetch_would_shift_the_augmentation_stream():
     )
     assert refetch_tail != eager_tail
 
-    # What the fix does: reuse the materialized batch, drawing nothing extra.
     plan = _install_and_get()
     calls_before = plan._processor.calls
     reused = [_pixels(plan.materialize(0, phase="full_step"))]
@@ -1862,7 +1845,6 @@ def test_vlm_exact_plan_compiles_without_a_pad_token():
             for index, width in enumerate(plan.planned_event_widths())
         )
         assert endpoints == raw == (32,) * len(plan)
-        # The planned fetch the training loop makes must not need a pad id.
         batch = plan.materialize(0, phase=phase_for_microstep(
             FULL_STEP_SCOPE, 1, 0,
         ))
@@ -1954,8 +1936,6 @@ def test_vlm_planned_width_steps_above_the_surveyed_maximum_on_collision():
     assert surveyed_max == 32
     assert planned == (33,) * len(plan)
     assert all(width > surveyed_max for width in planned)
-    # One shared endpoint, and every batch reaches it: above its own prepared
-    # width and clear of every extent the pipeline does not pad.
     assert [
         int(
             plan.materialize(index, target_width=planned[index])
@@ -2027,7 +2007,7 @@ def test_vlm_drift_error_names_the_survey_for_privately_owned_draw_state():
         max_seq_length=8,
     )
     plan.ensure_descriptors()
-    assert processor.calls == 4      # one private advance per scheduled batch
+    assert processor.calls == 4
 
     rebuilt = plan._build_batch(0)
     # Training resumes the private stream past the survey, so batch 0 rebuilds
@@ -2100,11 +2080,9 @@ def test_vlm_plan_releases_the_previous_batch_before_building_the_next(
         batch_data = plan.materialize(index)
     del batch_data
 
-    # No build ever started while a previously built batch was still held.
     assert live_at_build_start == [0, 0, 0, 0]
     assert alive["peak"] == 1
 
-    # Releasing the cache early must not cost a rebuild for a repeated fetch.
     calls_before = processor.calls
     again = plan.materialize(len(plan) - 1)
     assert processor.calls == calls_before
@@ -2201,7 +2179,6 @@ def test_vlm_plan_rechecks_media_between_setup_and_the_batch_that_uses_it():
         num_batches=2,
         dataset_order="sequential",
     )
-    # Clean at setup: nothing aliases, so every batch builds.
     assert plan.materialize(0) is not None
 
     dataset.arrays[2][:] = 99
@@ -2230,7 +2207,7 @@ def test_vlm_plan_keeps_referencing_media_payloads_it_does_not_own():
         config={"image_size": 16, "image_token_id": 200},
         batch_size=1,
         max_seq_length=8,
-        num_batches=9,          # three full revisits of every row
+        num_batches=9,
         dataset_order="sequential",
     )
 
@@ -2388,8 +2365,6 @@ def test_vlm_plan_reports_an_in_place_augmentation_over_a_reused_buffer():
             num_batches=3,
             dataset_order="sequential",
         )
-    # Every read really did hand back a permutation of the previous one, so
-    # the sum and the xor were identical at every pin.
     sums = {int(np.asarray(image).sum()) for image in dataset.returned}
     assert len(dataset.returned) == 6 and len(sums) == 1
 
@@ -2427,7 +2402,6 @@ def test_vlm_plan_releases_image_handles_nested_in_a_tuple(tmp_path):
     assert isinstance(restored["images"], tuple)
     assert int(np.asarray(restored["images"][0]).reshape(-1)[0]) == 6
 
-    # A namedtuple keeps its type rather than collapsing to a plain tuple.
     holder = collections.namedtuple("holder", "left right")
     row = {"media": holder(left=Image.open(paths[0]), right="caption")}
     out = _release_vlm_row_image_handles(row)
@@ -2436,7 +2410,6 @@ def test_vlm_plan_releases_image_handles_nested_in_a_tuple(tmp_path):
     back = _restore_vlm_row_image_handles(out)
     assert int(np.asarray(back["media"].left).reshape(-1)[0]) == 1
 
-    # A tuple holding nothing releasable keeps its exact identity.
     plain = {"images": ("a", "b")}
     assert _release_vlm_row_image_handles(plain)["images"] is plain["images"]
 
@@ -2480,8 +2453,6 @@ def test_vlm_plan_reports_a_dataset_that_reuses_one_temporary_image_path(tmp_pat
             dataset_order="sequential",
         )
 
-    # Six distinct samples really did go through the one file, and the file now
-    # holds only the last of them -- which is what every row would have read.
     assert dataset.written == [1, 2, 3, 4, 5, 6]
     assert int(np.asarray(Image.open(str(shared))).reshape(-1)[0]) == 6
 
@@ -2560,3 +2531,224 @@ def test_vlm_plan_reports_an_image_file_rewritten_after_the_plan_was_built(tmp_p
     Image.fromarray(np.full((8, 8, 3), 99, dtype=np.uint8)).save(paths[2])
     with pytest.raises(ValueError, match="file backing a dataset image changed"):
         plan.materialize_all()
+
+
+def test_stream_grid_widens_vlm_batches_at_the_consumer_width_seam():
+    """VLM widens at the post-expansion width; unmaterializable targets are refused or bumped."""
+    _skip_if_mlx_core_was_replaced()
+    from unsloth_zoo.mlx.shape_guard import StreamShapeGrid
+    from unsloth_zoo.mlx.utils import _build_response_masked_vlm_batch
+
+    class _ExpandingProcessor(_ContentProcessor):
+        def __call__(self, text, **_kwargs):  # noqa: D401
+            width = 40 + 7 * max(int(item) for item in text)
+            rows = [[int(item), 200] + [2] * (width - 2) for item in text]
+            return {
+                "input_ids": np.array(rows, dtype=np.int32),
+                "attention_mask": np.array(
+                    [[1] * width for _ in rows], dtype=np.int32,
+                ),
+                "image_grid_thw": np.array([[1, 2, 2]] * len(text), np.int32),
+            }
+
+    grid = StreamShapeGrid()
+    config = {"model_type": "qwen3_5", "image_size": 16, "image_token_id": 200,
+              "video_token_id": 201, "vision_config": {"spatial_merge_size": 2}}
+    items = [{"text": "5"}]
+    plain = _build_response_masked_vlm_batch(
+        items, _ExpandingProcessor(), config, 8, 16,
+    )
+    guarded = _build_response_masked_vlm_batch(
+        items, _ExpandingProcessor(), config, 8, 16,
+        width_policy=grid.endpoint_for,
+    )
+
+    raw_width = int(plain["input_ids"].shape[1])
+    assert raw_width > 8
+    guarded_width = int(guarded["input_ids"].shape[1])
+    assert guarded_width == grid.endpoint_for(raw_width)
+    assert guarded["input_ids"][:, :raw_width].tolist() == plain["input_ids"].tolist()
+    assert guarded["attention_mask"][:, raw_width:].sum().item() == 0
+    assert int(guarded["position_ids"].shape[-1]) == guarded_width
+    assert (guarded["position_ids"][..., :raw_width].tolist()
+            == plain["position_ids"].tolist())
+
+    from unsloth_zoo.mlx.utils import _resolve_stream_vlm_target
+
+    class _NoPadTokenizer(_TinyTokenizer):
+        pad_token_id = None
+
+    class _NoPadProcessor(_ExpandingProcessor):
+        tokenizer = _NoPadTokenizer()
+
+    assert _resolve_stream_vlm_target(
+        plain, config, _NoPadProcessor(), grid.endpoint_for,
+    ) is None
+    bumped = dict(plain)
+    bumped["media_extent"] = mx.zeros((1, guarded_width), dtype=mx.int32)
+    target = _resolve_stream_vlm_target(
+        bumped, config, _ExpandingProcessor(), grid.endpoint_for,
+    )
+    assert target is not None and target > guarded_width
+
+
+@pytest.mark.parametrize("arch", ["kimi_vl", "moondream2"])
+def test_a_family_qualified_without_a_patch_still_has_to_clear_the_gate(arch):
+    """No compile patch needed: qualification alone decides."""
+    _skip_if_mlx_core_was_replaced()
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.compile import (
+        _VERIFIED_TRAINING_ARCHES,
+        MLXVLMCompilePolicy,
+        build_compile_trait_reports,
+        get_compile_trait_report,
+        resolve_training_compile,
+    )
+
+    pytest.importorskip(f"mlx_vlm.models.{arch}.{arch}")
+
+    def decide(name):
+        model = type("Model", (), {"__module__": f"mlx_vlm.models.{name}.{name}"})()
+        model.config = SimpleNamespace(model_type=name)
+        return resolve_training_compile(
+            model, policy=MLXVLMCompilePolicy(mode="best_effort"),
+        )
+
+    assert get_compile_trait_report(arch).blocker_categories
+    decision = decide(arch)
+    assert decision.enabled, decision.reason
+    assert not decision.backend_qualifications
+
+    unqualified = sorted(
+        name for name, report in build_compile_trait_reports().items()
+        if report.blocker_categories and name not in _VERIFIED_TRAINING_ARCHES
+    )
+    if not unqualified:
+        pytest.skip("every architecture the scan blocks is training-qualified")
+    refused = decide(unqualified[0])
+    assert not refused.enabled
+    assert "blockers" in refused.reason
+
+
+def test_nested_text_decoder_qualification_decides_its_parent():
+    """An unqualified `text_config` decoder keeps a qualified parent eager."""
+    _skip_if_mlx_core_was_replaced()
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.compile import (
+        _VERIFIED_TRAINING_ARCHES,
+        MLXVLMCompilePolicy,
+        discover_architectures,
+        resolve_training_compile,
+    )
+
+    pytest.importorskip("mlx_vlm.models.gemma4.gemma4")
+
+    def gemma4_over(decoder):
+        model = type("Model", (), {"__module__": "mlx_vlm.models.gemma4.gemma4"})()
+        model.config = SimpleNamespace(
+            model_type="gemma4", text_config=SimpleNamespace(model_type=decoder),
+        )
+        return model
+
+    policy = MLXVLMCompilePolicy(mode="best_effort")
+
+    decision = resolve_training_compile(gemma4_over("gemma4_text"), policy=policy)
+    assert decision.enabled, decision.reason
+    decoders = ["gemma4_text"] if "gemma4_text" in discover_architectures() else []
+    assert [q.arch for q in decision.backend_qualifications] == decoders
+    assert all(q.training_compile for q in decision.backend_qualifications)
+
+    unqualified = sorted(set(discover_architectures()) - _VERIFIED_TRAINING_ARCHES)
+    if not unqualified:
+        pytest.skip("every discovered architecture is training-qualified")
+    refused = resolve_training_compile(gemma4_over(unqualified[0]), policy=policy)
+    assert not refused.enabled
+    assert unqualified[0] in refused.reason
+
+
+def test_gemma4_loss_masks_follow_the_reference_without_a_host_read(monkeypatch):
+    """Reference overlays vision blocks on sliding layers only, within the window."""
+    _skip_if_mlx_core_was_replaced()
+    from functools import partial
+    from types import SimpleNamespace as NS
+
+    import unsloth_zoo.mlx.compile as mc
+    from unsloth_zoo.mlx.utils import _SharedKVSlot
+
+    language = pytest.importorskip("mlx_vlm.models.gemma4.language")
+    from mlx_vlm.models.cache import BatchKVCache, KVCache
+    text_model = language.Gemma4TextModel
+    if not hasattr(text_model, "_apply_blockwise_bidirectional_overlay"):
+        pytest.skip(reason="mlx-vlm < 0.6.1 has no vision overlay; the patch leaves it alone")
+    upstream = text_model._make_masks
+    monkeypatch.setattr(text_model, "_make_masks", upstream)
+    monkeypatch.setattr(mc, "_PATCHED_ARCHES", set())
+    monkeypatch.setattr(mc, "_PATCH_BINDINGS", set())
+    assert "gemma4_vision_masks_runtime" in {
+        name for bundle in mc._matching_pattern_bundles("gemma4")
+        for name in bundle.runtime_primitive_names}
+    mc._runtime_patch_primitive_installers()["gemma4_vision_masks_runtime"]()
+    patched = text_model._make_masks
+
+    def stack(bidirectional, training=True):
+        model = NS(config=NS(use_bidirectional_attention=bidirectional), window_size=2,
+                   training=training, layers=[NS(layer_type="sliding_attention"),
+                                              NS(layer_type="full_attention")])
+        for name in ("_apply_blockwise_bidirectional_overlay", "_block_sequence_ids_for_mask"):
+            setattr(model, name, partial(getattr(text_model, name), model))
+        return model
+
+    def arrays(masks):
+        return [m.tolist() if isinstance(m, mx.array) else m for m in masks]
+
+    def reference(types, window=2):
+        types = np.asarray(types)
+        vision = (types == 1) | (types == 2)
+        block = np.cumsum(vision & ~np.pad(vision, ((0, 0), (1, 0)))[:, :-1], axis=1) * vision
+        q, k = np.indices((types.shape[1],) * 2)
+        same = (block[:, :, None] == block[:, None, :]) & (block[:, :, None] > 0)
+        return (((k <= q) | same) & (abs(q - k) < window))[:, None].tolist()
+
+    h = mx.zeros((2, 6, 1))
+    ids = mx.array([[0, 1, 1, 1, 1, 0], [1, 1, 0, 2, 2, 0]])
+    text_only = mx.zeros((2, 6), dtype=mx.int32)
+    for loss_cache in ([None, None], [_SharedKVSlot(), None]):
+        for types in (ids, text_only):
+            want = [reference(types), "causal"]
+            for training in (True, False):
+                assert arrays(patched(stack("vision", training), h, loss_cache, types)) == want
+            traced = mx.compile(lambda h, t: patched(stack("vision"), h, loss_cache, t)[0])
+            assert traced(h, types).tolist() == want[0]
+    want = arrays(upstream(stack(None), h, [None, None], ids))
+    traced = mx.compile(lambda h, t: [
+        m for m in patched(stack(None), h, [None, None], t) if isinstance(m, mx.array)])
+    assert arrays(traced(h, ids)) == [m for m in want if not isinstance(m, str)]
+    prefix = KVCache()
+    prefix.update_and_fetch(mx.zeros((2, 1, 3, 1)), mx.zeros((2, 1, 3, 1)))
+    for held in ([KVCache(), None], [prefix, None], [BatchKVCache([1, 0]), None]):
+        assert arrays(patched(stack("vision"), h, held, ids)) == arrays(
+            upstream(stack("vision"), h, held, ids))
+
+
+def test_gemma4_mask_patch_leaves_pre_overlay_mlx_vlm_alone(monkeypatch):
+    """mlx-vlm < 0.6.1: two-argument `_make_masks`, no overlay; wrapping it broke every forward."""
+    from types import SimpleNamespace
+
+    import unsloth_zoo.mlx.compile as mc
+
+    class Gemma4TextModel:
+        def _make_masks(self, h, cache):
+            return ["upstream"] * len(cache)
+
+    upstream = Gemma4TextModel._make_masks
+    monkeypatch.setattr(mc, "_PATCHED_ARCHES", set())
+    monkeypatch.setattr(mc, "_PATCH_BINDINGS", set())
+    monkeypatch.setattr(
+        mc, "_try_import_module",
+        lambda name: SimpleNamespace(Gemma4TextModel=Gemma4TextModel),
+    )
+    mc._runtime_patch_primitive_installers()["gemma4_vision_masks_runtime"]()
+    assert Gemma4TextModel._make_masks is upstream
+    assert Gemma4TextModel()._make_masks(None, [None, None]) == ["upstream", "upstream"]
