@@ -198,6 +198,9 @@ _REFUSAL_CASES = [
     ("torchao-only scheme", MODEL, {}, {"lora_dropout": 0, "qat_scheme": "fp8-fp8"}, NotImplementedError),
     ("unknown scheme", MODEL, {}, {"lora_dropout": 0, "qat_scheme": "int3"}, ValueError),
     ("non-string scheme", MODEL, {}, {"lora_dropout": 0, "qat_scheme": 4}, TypeError),
+    ("dora", MODEL, {}, {"lora_dropout": 0, "qat_scheme": "auto", "use_dora": True}, NotImplementedError),
+    ("no lora targets", MODEL, {},
+     {"lora_dropout": 0, "qat_scheme": "auto", "finetune_language_layers": False}, ValueError),
 ]
 
 
