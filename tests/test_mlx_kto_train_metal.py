@@ -83,6 +83,19 @@ def test_kto_stop_requests(tmp_path):
 
 
 @metal_only
+def test_kto_minibatches_keep_their_kl_partners(tmp_path, monkeypatch):
+    # TRL pairs KL completions within fixed batches, so each minibatch must hold its partners.
+    import unsloth_zoo.mlx.trainer as T
+    seen, real = [], T._kto_batch
+    monkeypatch.setattr(T, "_kto_batch", lambda rows, pad_id: seen.append(rows) or real(rows, pad_id))
+    _trainer(tmp_path, data=_dataset(10), max_steps=6).train()
+    assert seen and all(
+        sorted(map(tuple, (c for _, c, _, _, _ in b))) == sorted(map(tuple, (k for _, _, _, k, _ in b)))
+        for b in seen if len(b) > 1
+    )
+
+
+@metal_only
 def test_kto_step_callbacks_run_on_logged_steps(tmp_path):
     seen = []
     trainer = _trainer(tmp_path, max_steps=4, logging_steps=2)

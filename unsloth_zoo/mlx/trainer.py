@@ -9886,7 +9886,7 @@ def _kto_parse_label(value):
 
 def _kto_rows(dataset, tokenizer, args):
     """Tokenized rows; each carries the previous row's completion within its batch as the KL
-    completion, assigned in dataset order before any shuffle (TRL _get_kl_dataset)."""
+    completion, assigned in dataset order (TRL _get_kl_dataset)."""
     rows = []
     for ex in dataset:
         missing = [k for k in ("prompt", "completion", "label") if k not in ex]
@@ -10015,9 +10015,12 @@ class MLXKTOTrainer(MLXTrainer):
         else:
             epochs = float(args.num_train_epochs) if args.num_train_epochs and args.num_train_epochs > 0 else 1.0
             total_steps = max(math.ceil(epochs * steps_per_epoch), 1)  # fractional epochs stop part-way
-        order_mode = "sequential" if args.preserve_dataset_order else args.dataset_order
+        # TRL's KTOConfig defaults to sequential sampling: KL completions are paired within fixed batches.
+        # An explicit torch_randperm reorders whole batches, which keeps every pairing intact.
+        permute = args.dataset_order == "torch_randperm" and not args.preserve_dataset_order
         from .utils import _normalize_seed, _torch_randperm_order
         seed = _normalize_seed(args.seed)
+        fixed_batches = [rows[j:j + bs] for j in range(0, len(rows), bs)]
         optimizer = self._build_optimizer(total_steps)
         max_grad_norm, max_grad_value, max_grad_leaf_norm, _ = _resolve_mlx_grad_clipping(args)
         if self._kto_reference is None:
@@ -10048,14 +10051,11 @@ class MLXKTOTrainer(MLXTrainer):
             windows = []
             while step < total_steps and not self.stop_requested:
                 if not windows:
-                    # TRL's sampler reshuffles rows each epoch; KL completions travel with their rows.
-                    order = list(range(len(rows)))
-                    if order_mode == "torch_randperm":
-                        order = list(_torch_randperm_order(len(rows), seed + epoch))
-                    elif order_mode != "sequential":
-                        random.Random(seed + epoch).shuffle(order)
+                    order = range(len(fixed_batches))
+                    if permute:
+                        order = _torch_randperm_order(len(fixed_batches), seed + epoch)
                     epoch += 1
-                    batches = [[rows[i] for i in order[j:j + bs]] for j in range(0, len(order), bs)]
+                    batches = [fixed_batches[i] for i in order]
                     windows = [batches[j:j + grad_accum] for j in range(0, len(batches), grad_accum)]
                 acc_grad, acc_loss, acc_kl, acc_n = None, 0.0, 0.0, 0
                 for batch in map(lambda b: _kto_batch(b, pad_id), windows.pop(0)):
