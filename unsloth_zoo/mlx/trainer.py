@@ -4317,7 +4317,6 @@ class MLXTrainer:
                 metrics[f"{prefix}loss"] = value
                 if metric_names is None:
                     metrics[f"{prefix}perplexity"] = math.exp(min(value, 100))
-                    # Token accuracy rides in stats; same name as TRL's SFTTrainer.
                     if stats is not None and total > 0:
                         metrics[f"{prefix}mean_token_accuracy"] = (
                             stats[0].item() / total
