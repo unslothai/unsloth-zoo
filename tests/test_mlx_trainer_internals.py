@@ -8394,6 +8394,7 @@ def test_new_scheduler_fields_do_not_shift_existing_positional_slots():
         "lr_scheduler_min_lr_rate",
         "lr_scheduler_num_cycles",
         "lr_scheduler_power",
+        "lr_scheduler_kwargs",
     }
 
     assert current.index("lr_scheduler_type") == _PRE_PR_LR_SCHEDULER_TYPE_INDEX
@@ -8402,6 +8403,7 @@ def test_new_scheduler_fields_do_not_shift_existing_positional_slots():
         "lr_scheduler_min_lr_rate",
         "lr_scheduler_num_cycles",
         "lr_scheduler_power",
+        "lr_scheduler_kwargs",
     ):
         assert name in _MLX_CONFIG_OPTIONAL_COPY_FIELDS
     assert tuple(current[-len(_MLX_CONFIG_OPTIONAL_COPY_FIELDS):]) == tuple(
@@ -8965,3 +8967,27 @@ def test_streaming_guard_admission_protocol_is_one_collective_per_fetch():
     assert _stream_batch_signature(
         batch, "single", _stream_execution_key(),
     ) in solo.observed
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_lr_scheduler_kwargs_is_a_constructor_argument(as_json):
+    """HF WSD windows reach the schedule through the public config, dict or JSON string."""
+    import json
+
+    optimization = pytest.importorskip("transformers.optimization")
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    kwargs = {"num_decay_steps": 20, "num_stable_steps": 10, "min_lr_ratio": 0.1}
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(
+        learning_rate=2e-4, max_steps=40, warmup_steps=5,
+        lr_scheduler_type="warmup_stable_decay",
+        lr_scheduler_kwargs=json.dumps(kwargs) if as_json else kwargs,
+    )
+    schedule = trainer._build_schedule(40)
+    for step in range(40):
+        expected = 2e-4 * optimization._get_wsd_scheduler_lambda(
+            step, num_warmup_steps=5, num_stable_steps=10, num_decay_steps=20,
+            warmup_type="linear", decay_type="cosine", min_lr_ratio=0.1, num_cycles=0.5,
+        )
+        assert float(schedule(step)) == pytest.approx(expected, rel=1e-6, abs=1e-12), step

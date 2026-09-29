@@ -1320,6 +1320,7 @@ _MLX_CONFIG_OPTIONAL_COPY_FIELDS = (
     "lr_scheduler_min_lr_rate",
     "lr_scheduler_num_cycles",
     "lr_scheduler_power",
+    "lr_scheduler_kwargs",
 )
 
 
@@ -1458,6 +1459,8 @@ class MLXTrainingConfig:
     lr_scheduler_min_lr_rate: float | None = None
     lr_scheduler_num_cycles: float | None = None
     lr_scheduler_power: float | None = None
+    # HF's TrainingArguments.lr_scheduler_kwargs (dict or JSON string); wins over the three above.
+    lr_scheduler_kwargs: dict | str | None = None
 
     def __init__(self, *args, **kwargs):
         config_fields = [field for field in fields(type(self)) if field.init]
