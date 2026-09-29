@@ -34,10 +34,13 @@ def decorator_of(generated, name):
     return None if where == -1 else generated[:where].rsplit("\n@", 1)[-1].strip()
 
 out = {}
-for mt, router in (("ernie4_5_moe", "Ernie4_5_MoeTopKRouter_forward"), ("laguna", "LagunaTopKRouter_forward"), ("jamba", None)):
+for mt, router in (("ernie4_5_moe", "Ernie4_5_MoeTopKRouter"), ("laguna", "LagunaTopKRouter"), ("jamba", None)):
     try:
-        importlib.import_module(f"transformers.models.{mt}.modeling_{mt}")
+        modeling = importlib.import_module(f"transformers.models.{mt}.modeling_{mt}")
     except Exception:
+        continue
+    # transformers 4.57 routes Ernie 4.5 inside its MoE block: no router class to check.
+    if router is not None and not hasattr(modeling, router):
         continue
     with contextlib.redirect_stdout(io.StringIO()):
         unsloth_compile_transformers(
@@ -47,9 +50,8 @@ for mt, router in (("ernie4_5_moe", "Ernie4_5_MoeTopKRouter_forward"), ("laguna"
     path = os.path.join(os.environ["UNSLOTH_COMPILE_LOCATION"], f"unsloth_compiled_module_{mt}.py")
     generated = open(path, encoding = "utf-8").read()
     if router is not None:
-        out[mt] = decorator_of(generated, router)
+        out[mt] = decorator_of(generated, router + "_forward")
     else:
-        modeling = importlib.import_module("transformers.models.jamba.modeling_jamba")
         out[mt] = {k: v.__name__ for k, v in modeling.ALL_DECODER_LAYER_TYPES.items()}
 print("RESULT " + json.dumps(out))
 '''
@@ -66,7 +68,7 @@ def test_cast_routers_compiled_and_decoder_layer_types_kept(tmp_path):
     assert line is not None, proc.stdout[-3000:] + proc.stderr[-3000:]
     r = json.loads(line[len("RESULT "):])
     if not r:
-        pytest.skip("none of ernie4_5_moe / laguna / jamba in this transformers")
+        pytest.skip("transformers has none of the Ernie 4.5 / Laguna routers or Jamba")
     for mt in ("ernie4_5_moe", "laguna"):
         if mt in r:
             assert r[mt] is not None and r[mt].startswith("torch_compile_with_fallback("), (mt, r[mt])
