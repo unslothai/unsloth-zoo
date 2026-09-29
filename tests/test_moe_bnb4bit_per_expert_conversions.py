@@ -23,6 +23,12 @@ _core_model_loading = pytest.importorskip(
     reason="requires transformers v5 core_model_loading",
 )
 
+# Six tests here import bitsandbytes in their bodies without guarding it, so on a
+# runner that has transformers v5 but no bitsandbytes they FAIL rather than skip.
+# That never showed because no job executed this file: `pytest tests/ --collect-only`
+# only imports it. Guard it the same way the module above is guarded.
+pytest.importorskip("bitsandbytes", reason="requires bitsandbytes")
+
 # On transformers < v5 the real `core_model_loading` module does not exist, but
 # unsloth injects an inert compat stub of the same name into `sys.modules` so
 # peft LoRA reloads keep working. That stub's `WeightConverter` accepts any
@@ -39,10 +45,17 @@ if not hasattr(_core_model_loading.WeightConverter, "target_patterns"):
 
 from transformers.core_model_loading import ConversionOps, WeightConverter
 
+from unsloth_zoo.device_type import DEVICE_TYPE_TORCH
 from unsloth_zoo.temporary_patches.moe_utils_bnb4bit import (
     _AUX_SUFFIXES,
     _bnb4bit_per_expert_conversions,
     _quantstate_absmax_fp32,
+)
+
+# conftest sets UNSLOTH_ALLOW_CPU=1, so DEVICE_TYPE_TORCH says "cuda" even with no GPU: probe torch.
+gpu_available = (
+    (hasattr(torch, "cuda") and torch.cuda.is_available())
+    or (hasattr(torch, "xpu") and torch.xpu.is_available())
 )
 
 
@@ -193,7 +206,7 @@ def test_fused_unquantized_falls_back_to_original_ops():
     assert out[op.base_source].shape == (3, 2, 4)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for bnb 4-bit")
+@pytest.mark.skipif(not gpu_available, reason="needs CUDA or XPU for bnb 4-bit")
 def test_fused_prequantized_builds_params4bit():
     import bitsandbytes as bnb
     import torch.nn as nn
@@ -202,7 +215,7 @@ def test_fused_prequantized_builds_params4bit():
     twin = _bnb4bit_per_expert_conversions([conv], hf_quantizer=None)[0]
     op = twin.operations[0]
 
-    w = torch.randn(2, 8, 16, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(2, 8, 16, device=DEVICE_TYPE_TORCH, dtype=torch.bfloat16)
     packed, qs = bnb.functional.quantize_4bit(w, quant_type="nf4")
     base = op.base_source
     input_dict = {base + "." + k: v for k, v in qs.as_dict(packed=True).items()}
@@ -229,7 +242,7 @@ def test_fused_prequantized_builds_params4bit():
     assert torch.allclose(deq.float(), w.float(), atol=0.5)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for bnb 4-bit")
+@pytest.mark.skipif(not gpu_available, reason="needs CUDA or XPU for bnb 4-bit")
 def test_fused_prequantized_orientation_mismatch_raises():
     """A blob quantized in the transposed (checkpoint) layout must fail loudly:
     a transpose op cannot be applied to packed 4-bit data."""
@@ -240,7 +253,7 @@ def test_fused_prequantized_orientation_mismatch_raises():
     twin = _bnb4bit_per_expert_conversions([conv], hf_quantizer=None)[0]
     op = twin.operations[0]
 
-    w = torch.randn(2, 16, 8, device="cuda", dtype=torch.bfloat16)  # transposed layout
+    w = torch.randn(2, 16, 8, device=DEVICE_TYPE_TORCH, dtype=torch.bfloat16)  # transposed layout
     packed, qs = bnb.functional.quantize_4bit(w, quant_type="nf4")
     base = op.base_source
     input_dict = {base + "." + k: v for k, v in qs.as_dict(packed=True).items()}
@@ -288,7 +301,7 @@ def _stack_input_dict(op, weights_per_src):
     return input_dict
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for bnb 4-bit")
+@pytest.mark.skipif(not gpu_available, reason="needs CUDA or XPU for bnb 4-bit")
 @pytest.mark.parametrize(
     "out_dim,in_dim,exact",
     [
@@ -306,7 +319,7 @@ def test_stack_prequantized_block_alignment(out_dim, in_dim, exact):
 
     n_experts = 2
     weights_per_src = [
-        [torch.randn(out_dim, in_dim, device="cuda", dtype=torch.bfloat16) for _ in range(n_experts)]
+        [torch.randn(out_dim, in_dim, device=DEVICE_TYPE_TORCH, dtype=torch.bfloat16) for _ in range(n_experts)]
         for _ in range(len(op.base_sources))
     ]
     input_dict = _stack_input_dict(op, weights_per_src)
@@ -327,7 +340,6 @@ def test_stack_prequantized_block_alignment(out_dim, in_dim, exact):
         target_patterns=[conv.target_patterns[0]],
     )
     new_param = out[conv.target_patterns[0]]
-    # Reference: what the per-expert quantized segments actually dequantize to.
     seg_ref = torch.stack([
         torch.cat([
             bnb.functional.dequantize_4bit(
@@ -350,7 +362,90 @@ def test_stack_prequantized_block_alignment(out_dim, in_dim, exact):
         assert err < 0.25, err
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for bnb 4-bit")
+def _convert_prequantized(op, conv, weights_per_src, n_experts):
+    """Run one twin conversion and hand back the merged Params4bit."""
+    import torch.nn as nn
+
+    input_dict = _stack_input_dict(op, weights_per_src)
+    experts = nn.Module()
+    experts.gate_up_proj = nn.Parameter(torch.empty(1), requires_grad=False)
+    mlp = nn.Module()
+    mlp.experts = experts
+    layer = nn.Module()
+    layer.mlp = mlp
+    inner = nn.Module()
+    inner.layers = nn.ModuleList([layer])
+    model = nn.Module()
+    model.model = inner
+    out = op.convert(
+        input_dict,
+        model=model,
+        full_layer_name="model.layers.0.mlp.experts.gate_up_proj",
+        target_patterns=[conv.target_patterns[0]],
+    )
+    return out[conv.target_patterns[0]]
+
+
+@pytest.mark.skipif(not gpu_available, reason="needs CUDA or XPU for bnb 4-bit")
+def test_misaligned_repack_slices_an_oversized_stack(monkeypatch):
+    """The repack branch quantizes the WHOLE stack in one call, so it reaches
+    the same 32-bit element count the load path has to slice around.
+
+    4 x 8 per segment is 32 elements, not a whole 64-block, which is what forces
+    the repack; two sources make 64 per expert, which is a whole block and so
+    can be sliced. Compared against the same conversion with the threshold left
+    alone, so the assertion is that slicing changed nothing, not merely that it
+    produced something plausible.
+    """
+    from unsloth_zoo.temporary_patches import moe_utils_bnb4bit as _M
+
+    torch.manual_seed(0)
+    n_experts, out_dim, in_dim = 2, 4, 8
+    conv = _expert_merge_converter()
+    op = _bnb4bit_per_expert_conversions([conv], hf_quantizer=None)[0].operations[0]
+    weights_per_src = [
+        [torch.randn(out_dim, in_dim, device=DEVICE_TYPE_TORCH, dtype=torch.bfloat16)
+         for _ in range(n_experts)]
+        for _ in range(len(op.base_sources))
+    ]
+    per_expert = out_dim * in_dim * len(op.base_sources)
+    assert (out_dim * in_dim) % 64 != 0, "segments would be block aligned, no repack"
+    assert per_expert % 64 == 0, "the stack could not be sliced on a block boundary"
+
+    unsliced = _convert_prequantized(op, conv, weights_per_src, n_experts)
+
+    # Just above one expert, so every slice holds exactly one and there are as
+    # many calls as experts.
+    monkeypatch.setattr(_M, "_BNB_MAX_QUANTIZE_NUMEL", per_expert + 1)
+
+    # Without this the test is vacuous: with the repack branch still on the
+    # single call, both conversions take the identical path and compare equal,
+    # so it would pass against the very code it exists to check.
+    taken = []
+    real_slicer = _M._quantize_expert_stack_in_slices
+
+    def _spy(value, **kwargs):
+        result = real_slicer(value, **kwargs)
+        taken.append(result is not None)
+        return result
+
+    monkeypatch.setattr(_M, "_quantize_expert_stack_in_slices", _spy)
+    sliced = _convert_prequantized(op, conv, weights_per_src, n_experts)
+    assert taken == [True], (
+        f"the repack branch did not route an oversized stack through the sliced "
+        f"quantizer (calls: {taken})"
+    )
+
+    assert torch.equal(sliced.data.reshape(-1), unsliced.data.reshape(-1))
+    assert torch.equal(
+        _quantstate_absmax_fp32(sliced.quant_state),
+        _quantstate_absmax_fp32(unsliced.quant_state),
+    )
+    assert tuple(sliced.quant_state.shape) == (n_experts, out_dim * len(op.base_sources), in_dim)
+    assert tuple(sliced._original_shape) == tuple(unsliced._original_shape)
+
+
+@pytest.mark.skipif(not gpu_available, reason="needs CUDA or XPU for bnb 4-bit")
 def test_plain_dequant_skips_bnb_embedding4bit():
     import bitsandbytes as bnb
     import torch.nn as nn
@@ -364,10 +459,10 @@ def test_plain_dequant_skips_bnb_embedding4bit():
 
     model = Holder()
     model.emb = bnb.nn.Embedding4bit(16, 64)
-    model.emb = model.emb.cuda()  # quantizes weight into Params4bit
+    model.emb = model.emb.to(DEVICE_TYPE_TORCH)  # quantizes weight into Params4bit
     model.plain = Holder()
     packed, qs = bnb.functional.quantize_4bit(
-        torch.randn(4, 64, device="cuda", dtype=torch.bfloat16), quant_type="nf4"
+        torch.randn(4, 64, device=DEVICE_TYPE_TORCH, dtype=torch.bfloat16), quant_type="nf4"
     )
     from bitsandbytes.nn import Params4bit
     router = torch.Tensor._make_subclass(Params4bit, packed)
@@ -377,7 +472,6 @@ def test_plain_dequant_skips_bnb_embedding4bit():
 
     _dequantize_plain_param_slots(model)
 
-    # bnb module keeps its quantized weight; the genuinely plain slot converts.
     assert type(model.emb.weight).__name__ == "Params4bit"
     assert getattr(model.emb.weight, "quant_state", None) is not None
     assert type(model.plain.weight).__name__ == "Parameter"

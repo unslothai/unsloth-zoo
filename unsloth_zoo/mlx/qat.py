@@ -70,6 +70,12 @@ TORCHAO_ONLY_QAT_SCHEMES = (
     "cactus",
 )
 
+_DORA_REFUSAL = (
+    "Unsloth: qat_scheme is not supported for DoRA on MLX yet. DoRA's fuse() "
+    "rescales the merged weight by m / ||W + BA|| before quantizing, so a "
+    "LoRA-shaped fake-quant would not match the saved weights."
+)
+
 _QAT_FLAG = "_unsloth_mlx_qat_active"
 _QAT_ORIGINAL_CLASS = "_unsloth_mlx_qat_original_class"
 
@@ -229,23 +235,19 @@ def _qat_call(self, x):
     import mlx.core as mx
 
     base = self.linear
+    group_size, bits, mode = _quantization_grid(base)
     weight = mx.dequantize(
-        base.weight,
-        base.scales,
-        base.biases,
-        group_size=base.group_size,
-        bits=base.bits,
-        mode=base.mode,
+        base.weight, base.scales, base.biases,
+        group_size=group_size, bits=bits, mode=mode,
     )
     delta = ((self.scale * self.lora_b.T) @ self.lora_a.T).astype(weight.dtype)
     merged = weight + delta
 
     packed, scales, biases = mx.quantize(
-        merged, group_size=base.group_size, bits=base.bits, mode=base.mode,
+        merged, group_size=group_size, bits=bits, mode=mode,
     )
     fake = mx.dequantize(
-        packed, scales, biases,
-        group_size=base.group_size, bits=base.bits, mode=base.mode,
+        packed, scales, biases, group_size=group_size, bits=bits, mode=mode,
     )
     # Straight-through: forward uses `fake`, backward behaves like identity.
     straight_through = merged + mx.stop_gradient(fake - merged)
@@ -318,7 +320,8 @@ def _preview(names, limit=3):
     return shown
 
 
-def validate_mlx_qat_request(model, qat_scheme="auto", *, lora_dropout=None):
+def validate_mlx_qat_request(model, qat_scheme="auto", *, lora_dropout=None,
+                             use_dora=False):
     """Reject an unsupportable QAT request *before* anything is mutated.
 
     Everything checkable without adapters lives here so ``get_peft_model`` can
@@ -352,6 +355,9 @@ def validate_mlx_qat_request(model, qat_scheme="auto", *, lora_dropout=None):
             "against save_method='merged_4bit'. Use a text-only model, or "
             "train the VLM without qat_scheme."
         )
+
+    if use_dora:
+        raise NotImplementedError(_DORA_REFUSAL)
 
     if lora_dropout is not None and float(lora_dropout) > 0.0:
         raise NotImplementedError(
@@ -395,12 +401,7 @@ def apply_mlx_qat(model, qat_scheme="auto"):
     patchable, dora, switch, lora_wrapped = _qat_targets(model)
 
     if dora:
-        raise NotImplementedError(
-            "Unsloth: qat_scheme is not supported for DoRA on MLX yet. DoRA's "
-            "fuse() rescales the merged weight by m / ||W + BA|| before "
-            "quantizing, so a LoRA-shaped fake-quant would not match the saved "
-            f"weights. Affected: {_preview(dora)}."
-        )
+        raise NotImplementedError(f"{_DORA_REFUSAL} Affected: {_preview(dora)}.")
     if switch:
         raise NotImplementedError(
             "Unsloth: qat_scheme is not supported for MoE / SwitchLinear "
