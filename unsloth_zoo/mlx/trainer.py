@@ -5947,11 +5947,14 @@ class MLXTrainer:
             *_reference_compile_state,
         ]
         _layer_prefix = _layer_path_prefix(model)
-        # State created lazily inside the first compiled step raises that step's peak.
-        if hasattr(optimizer, "init"):
+        # State created lazily inside the first compiled step raises that step's peak;
+        # init keeps resumed entries. On failure keep today's lazy init.
+        try:
             optimizer.init(model.trainable_parameters())
             mx.eval(optimizer.state)
-            state[1] = optimizer.state
+        except Exception:
+            pass
+        state[1] = optimizer.state
         # grad_accum==1 fast path: only for unclipped updates, since
         # clip_grad_norm can spike peak memory on bf16 VLM runs.
         _direct_single_step_update = (
