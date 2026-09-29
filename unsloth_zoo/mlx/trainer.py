@@ -856,6 +856,8 @@ def _normalize_mlx_optimizer_name(name):
         "adamw_apex_fused",
     ):
         opt_name = "adamw"
+    elif opt_name in ("rmsprop_bnb", "rmsprop_bnb_8bit", "rmsprop_bnb_32bit"):
+        opt_name = "rmsprop"
     if opt_name not in SUPPORTED_MLX_OPTIMIZERS:
         supported = ", ".join(SUPPORTED_MLX_OPTIMIZERS)
         raise ValueError(
@@ -863,6 +865,31 @@ def _normalize_mlx_optimizer_name(name):
             f"Supported optimizers: {supported}."
         )
     return opt_name
+
+
+def _hf_optim_args(args, allowed, unsupported):
+    """HF ``optim_args`` ("k=v,...") keys MLX can honour; ``unsupported`` keys
+    (MLX lacks them) raise unless at their no-op value. ``weight_decay`` is
+    skipped: HF param groups override it in torch too."""
+    raw = getattr(args, "optim_args", None)
+    if not raw:
+        return {}
+    parsed = dict(kv.split("=", 1) for kv in raw.replace(" ", "").split(",") if kv)
+    out = {}
+    for key, value in parsed.items():
+        if key in unsupported:
+            if key == "centered":
+                on = value.lower() in ("true", "1", "yes")
+            else:
+                on = float(value) != unsupported[key]
+            if on:
+                raise ValueError(
+                    f"Unsloth: MLX does not support optim_args {key}={value} "
+                    f"for optim={args.optim!r}."
+                )
+        elif key in allowed:
+            out[key] = float(value)
+    return out
 
 
 class _BiasCorrectedAdamax(optim.Adamax):
@@ -1201,7 +1228,7 @@ class MLXTrainingConfig:
     lr_scheduler_type: str = "linear"  # "cosine", "linear", "constant"
 
     # Optimization
-    optim: str = "adamw"  # "adafactor", "adamw", "adam", "sgd", "muon", "lion"
+    optim: str = "adamw"  # see SUPPORTED_MLX_OPTIMIZERS
     weight_decay: float = 0.001
     adam_beta1: float | None = None
     adam_beta2: float | None = None
@@ -3963,17 +3990,23 @@ class MLXTrainer:
             optimizer = optim.Lion(learning_rate=initial_lr, weight_decay=0.0)
         elif opt_name == "rmsprop":
             # Coupled L2 decay (grad += wd * param), matching torch.
+            extra = _hf_optim_args(
+                self.args, ("alpha", "eps"), {"momentum": 0.0, "centered": False}
+            )
             self._coupled_weight_decay = float(wd or 0.0)
-            optimizer = optim.RMSprop(learning_rate=initial_lr)
+            optimizer = optim.RMSprop(learning_rate=initial_lr, **extra)
         elif opt_name == "adamax":
             self._coupled_weight_decay = float(wd or 0.0)
             optimizer = _BiasCorrectedAdamax(
                 learning_rate=initial_lr, **adam_kwargs
             )
         elif opt_name == "adagrad":
+            extra = _hf_optim_args(self.args, ("eps",), {"lr_decay": 0.0})
             self._coupled_weight_decay = float(wd or 0.0)
             # HF Trainer passes no eps, so torch's 1e-10 (not MLX's 1e-8); step stays <= lr.
-            optimizer = optim.Adagrad(learning_rate=initial_lr, eps=1e-10)
+            optimizer = optim.Adagrad(
+                learning_rate=initial_lr, eps=extra.get("eps", 1e-10)
+            )
         elif opt_name == "adadelta":
             self._coupled_weight_decay = float(wd or 0.0)
             optimizer = optim.AdaDelta(learning_rate=initial_lr)

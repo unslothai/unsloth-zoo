@@ -157,21 +157,63 @@ def test_adamax_is_built_with_the_torch_first_moment_bias_correction():
     )
 
 
-def test_hf_trainer_drops_optim_args_for_rmsprop_too():
+def _build_with_optim_args(optim_name, optim_args):
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    class DummyModel:
+        def trainable_parameters(self):
+            return {}
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.model = DummyModel()
+    trainer.args = MLXTrainingConfig(optim=optim_name)
+    trainer.args.optim_args = optim_args
+    return trainer._build_optimizer(total_steps=4)
+
+
+def _hf_kwargs(optim_name, optim_args):
     transformers = pytest.importorskip("transformers")
     import tempfile
 
     with tempfile.TemporaryDirectory() as directory:
         args = transformers.TrainingArguments(
-            output_dir=directory,
-            optim="rmsprop",
-            optim_args="momentum=0.9,alpha=0.95,centered=True",
+            output_dir=directory, optim=optim_name, optim_args=optim_args,
             report_to=[],
         )
-        cls, kwargs = transformers.Trainer.get_optimizer_cls_and_kwargs(args)
+        return transformers.Trainer.get_optimizer_cls_and_kwargs(args)[1]
 
-    assert cls is __import__("torch").optim.RMSprop
-    assert set(kwargs) == {"lr"}, (
-        "HF Trainer now forwards optim_args to RMSprop; the MLX branch must "
-        f"parse and apply them instead of relying on defaults ({kwargs})"
-    )
+
+@pytest.mark.parametrize(
+    "optim_name, optim_args, key",
+    [("rmsprop", "alpha=0.95", "alpha"), ("rmsprop", "eps=1e-6", "eps"),
+     ("adagrad", "eps=1e-7", "eps")],
+)
+def test_optim_args_hf_forwards_reach_the_mlx_optimizer(optim_name, optim_args, key):
+    hf = _hf_kwargs(optim_name, optim_args)
+    optimizer = _build_with_optim_args(optim_name, optim_args)
+    expected = hf.get(key, float(optim_args.split("=")[1]))
+    assert _hyperparameter(optimizer, key) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    "optim_name, optim_args",
+    [("rmsprop", "momentum=0.9"), ("rmsprop", "centered=True"),
+     ("adagrad", "lr_decay=0.1")],
+)
+def test_optim_args_mlx_cannot_honour_raise(optim_name, optim_args):
+    with pytest.raises(ValueError, match="does not support optim_args"):
+        _build_with_optim_args(optim_name, optim_args)
+
+
+def test_optim_args_at_noop_values_are_accepted():
+    _build_with_optim_args("rmsprop", "momentum=0,centered=False")
+    _build_with_optim_args("adagrad", "lr_decay=0.0")
+
+
+@pytest.mark.parametrize(
+    "alias", ["rmsprop_bnb", "rmsprop_bnb_8bit", "rmsprop_bnb_32bit"]
+)
+def test_hf_rmsprop_bnb_aliases_route_to_rmsprop(alias):
+    from unsloth_zoo.mlx.trainer import _normalize_mlx_optimizer_name
+
+    assert _normalize_mlx_optimizer_name(alias) == "rmsprop"
