@@ -45,7 +45,7 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event.label.name == 'gemma4-probe'
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 45
     strategy:
       # "Where does it start failing" is the point, so one red must not cancel
@@ -53,20 +53,43 @@ jobs:
       fail-fast: false
       matrix:
         mlx_vlm: ['0.4.4', '0.5.0', '0.6.0', '0.6.1', '0.6.2', '0.6.3', '0.6.4']
+    env:
+      # Point HF_HOME at a directory inside the workspace, and cache that, which is how
+      # every model cache in unslothai/unsloth is arranged (studio-api-smoke.yml:114,
+      # studio-ui-smoke.yml:182 and the rest all use `${{ github.workspace }}/hf-cache`).
+      #
+      # This used to cache `~/.cache/huggingface` directly. That is huggingface_hub's
+      # DEFAULT credential home, so the token file it writes on login lives at
+      # `~/.cache/huggingface/token`, i.e. inside the cached path. Nothing here logs in
+      # and this workflow holds no secret, so nothing was ever written -- the protection
+      # was the absence of a token rather than anything about the cache. Caching a
+      # purpose-made directory instead means the cached tree is one this workflow creates
+      # and nothing else in the runner's home shares, and it is the arrangement the guard
+      # in tests/security/test_cached_paths_hold_no_credentials.py can check.
+      HF_HOME: ${{ github.workspace }}/hf-cache
     steps:
       - name: Harden runner (audit)
-        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
         with:
           egress-policy: audit
 
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: '3.12'
-          cache: 'pip'
+
+      # pyproject.toml only. The mlx-vlm pin comes from the matrix, and a changed
+      # pin simply misses on that one wheel: a pip HTTP cache cannot serve the
+      # wrong content, so it does not need to be in the key.
+      - id: pip-cache
+        uses: ./.github/actions/pip-cache-restore
+        with:
+          name: gemma4-audio
+          key-files: |
+            pyproject.toml
 
       - name: Install zoo with the pinned mlx-vlm
         # One resolution, so pip honours this package's transformers cap. torch
@@ -74,7 +97,7 @@ jobs:
         # the zoo import path still wants it.
         run: |
           python -m pip install --upgrade pip
-          pip install "torch>=2.4.0,<2.13.0"
+          pip install "torch>=2.4.0,<2.15.0"
           pip install -e .[mlx] "mlx-vlm==${{ matrix.mlx_vlm }}"
           python -c "
           import mlx_vlm, transformers
@@ -82,13 +105,21 @@ jobs:
           assert mlx_vlm.__version__ == '${{ matrix.mlx_vlm }}', mlx_vlm.__version__
           "
 
-      - name: Cache the checkpoint
+      - uses: ./.github/actions/pip-cache-save
+        with:
+          dir: ${{ steps.pip-cache.outputs.dir }}
+          key: ${{ steps.pip-cache.outputs.key }}
+          cache-hit: ${{ steps.pip-cache.outputs.cache-hit }}
+
+      - name: Restore the checkpoint
         # 3.4 GB, and every job wants the same one. Shared key on purpose: the
         # first to finish saves it, the rest log a collision and move on.
-        uses: actions/cache@v4
+        id: hf-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        continue-on-error: true
         with:
-          path: ~/.cache/huggingface
-          key: hf-gemma4-e2b-4bit-v1
+          path: hf-cache
+          key: hf-gemma4-e2b-4bit-v2
 
       - name: Probe
         # No torchvision, matching what a Mac user installing zoo[mlx] gets.
@@ -98,6 +129,30 @@ jobs:
         #
         # The checkpoint arrives through env rather than interpolation: it is
         # the one free-text value here.
+        id: probe
         env:
           MODEL: ${{ inputs.model || 'mlx-community/gemma-4-e2b-it-4bit' }}
         run: python tests/gemma4_audio_version_probe.py --model "$MODEL"
+
+      - name: Save the checkpoint
+        # Split out of the restore above, and on the default branch only, for the
+        # reason pip-cache-save carries at length: `actions/cache` saves from its
+        # own post-step on WHATEVER REF the job ran on. This one triggers on a
+        # label, so a labelled PR wrote 3.4 GB to refs/pull/N/merge that only that
+        # PR's re-runs could ever restore, seven legs racing the one key, against
+        # a 20 GiB budget the repo has already been at 99% of. The janitor could
+        # not clean it up either: the key carries no trailing hash, so generation
+        # ranking skips it and only closing the PR would have freed it.
+        #
+        # After the Probe, not before: the probe is what downloads the checkpoint,
+        # so a save placed where the restore sits would store an empty directory
+        # under the key and every later job would hit it and find nothing.
+        if: >-
+          github.ref == 'refs/heads/main'
+          && steps.hf-cache.outputs.cache-hit != 'true'
+          && steps.probe.outcome == 'success'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        continue-on-error: true
+        with:
+          path: hf-cache
+          key: hf-gemma4-e2b-4bit-v2

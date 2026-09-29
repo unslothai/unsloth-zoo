@@ -47,7 +47,6 @@ def _parse_version(value: str):
         from packaging.version import Version
         return Version(value)
     except Exception:
-        # Int tuple, orderable for same-shape versions; enough for simple bumps.
         parts = value.split("+", 1)[0].split("-", 1)[0]
         nums, _, _suffix = parts.partition("rc")
         ints = []

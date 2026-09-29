@@ -42,7 +42,6 @@ sys.path.insert(0, str(ROOT))
 SRC = (ROOT / "unsloth_zoo" / "rl_replacements.py").read_text(encoding="utf-8")
 
 
-# ---- the source ------------------------------------------------------------
 
 def _fn_source():
     import ast
@@ -86,7 +85,6 @@ def test_the_function_is_still_compiled_by_default():
     assert "_maybe_compile(dynamic = True, fullgraph = True" in preceding
 
 
-# ---- the numbers -----------------------------------------------------------
 
 def _setup():
     torch = pytest.importorskip("torch")
