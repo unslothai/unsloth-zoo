@@ -4028,10 +4028,8 @@ class MLXTrainer:
                 else min_lr_rate_kwarg
             )
 
-        # WSD's HF step counts expressed as fractions of the post-warmup window.
-        decay_window = max(total_steps - warmup, 1)
-        wsd_stable_steps = 0.0
-        wsd_decay_steps = float(decay_window)
+        # WSD in HF's step space (get_wsd_schedule): never clamp the windows to max_steps.
+        wsd_stable_steps = wsd_decay_steps = 0.0
         if sched_type == "warmup_stable_decay":
             num_decay_steps = sched_kwargs.get("num_decay_steps")
             num_stable_steps = sched_kwargs.get("num_stable_steps")
@@ -4041,15 +4039,11 @@ class MLXTrainer:
                     "Unsloth: lr_scheduler_type='warmup_stable_decay' requires "
                     "lr_scheduler_kwargs['num_decay_steps'], as in Hugging Face."
                 )
-            wsd_decay_steps = min(max(float(num_decay_steps), 0.0), float(decay_window))
-            if num_stable_steps is not None:
-                wsd_stable_steps = min(max(float(num_stable_steps), 0.0), float(decay_window))
-            else:
-                wsd_stable_steps = decay_window - wsd_decay_steps
-        wsd_stable_frac = wsd_stable_steps / decay_window
-        wsd_decay_frac = wsd_decay_steps / decay_window
-        # Compare in step space: two rounded fractions can miss the boundary by 1 ULP.
-        wsd_tail_start = float(warmup) + wsd_stable_steps + wsd_decay_steps
+            wsd_decay_steps = float(num_decay_steps)
+            wsd_stable_steps = (
+                float(num_stable_steps) if num_stable_steps is not None
+                else float(total_steps - warmup) - wsd_decay_steps
+            )
 
         if sched_type in ("constant", "constant_with_warmup") and warmup == 0:
             return lr
@@ -4093,16 +4087,16 @@ class MLXTrainer:
             elif sched_type == "inverse_sqrt":
                 decay = 1.0 / math.sqrt(max((step + shift) / timescale, 1e-8))
             elif sched_type == "warmup_stable_decay":
-                # HF get_wsd_schedule (optimization.py:490-503); num_cycles is the wave count.
-                # Past the decay window HF returns the floor flat; clipping p would re-enter the cosine.
-                if step >= wsd_tail_start:
-                    decay = 0.0
-                elif progress < wsd_stable_frac:
+                # HF _get_wsd_scheduler_lambda; num_cycles is the wave count. Past the window HF
+                # returns the floor flat, so the cosine is never re-entered.
+                decay_start = warmup + wsd_stable_steps
+                if step < decay_start:
                     decay = 1.0
-                else:
-                    local = (progress - wsd_stable_frac) / max(wsd_decay_frac, 1e-8)
-                    local = min(max(local, 0.0), 1.0)
+                elif step < decay_start + wsd_decay_steps:
+                    local = (step - decay_start) / max(1.0, wsd_decay_steps)
                     decay = 0.5 * (1.0 + math.cos(math.pi * num_cycles * 2.0 * local))
+                else:
+                    decay = 0.0
             else:  # constant / constant_with_warmup
                 decay = 1.0
             return max(decay, 0.0) * (1.0 - min_lr_rate) + min_lr_rate

@@ -9005,3 +9005,28 @@ def test_lr_scheduler_kwargs_is_a_constructor_argument(as_json):
             warmup_type="linear", decay_type="cosine", min_lr_ratio=0.1, num_cycles=0.5,
         )
         assert float(schedule(step)) == pytest.approx(expected, rel=1e-6, abs=1e-12), step
+
+
+@pytest.mark.parametrize("stable,decay", [(0, 100), (None, 100), (None, 20), (10, 20), (70, 5)])
+def test_warmup_stable_decay_keeps_hf_step_windows(stable, decay):
+    """A decay window longer than the run is followed, not rescaled to max_steps (HF parity)."""
+    optimization = pytest.importorskip("transformers.optimization")
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    total, warmup = 60, 5
+    kwargs = {"num_decay_steps": decay, "min_lr_ratio": 0.1}
+    if stable is not None:
+        kwargs["num_stable_steps"] = stable
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(
+        learning_rate=2e-4, max_steps=total, warmup_steps=warmup,
+        lr_scheduler_type="warmup_stable_decay", lr_scheduler_kwargs=kwargs,
+    )
+    schedule = trainer._build_schedule(total)
+    hf_stable = stable if stable is not None else total - warmup - decay
+    for step in range(total + 2):
+        expected = 2e-4 * optimization._get_wsd_scheduler_lambda(
+            step, num_warmup_steps=warmup, num_stable_steps=hf_stable, num_decay_steps=decay,
+            warmup_type="linear", decay_type="cosine", min_lr_ratio=0.1, num_cycles=0.5,
+        )
+        assert float(schedule(step)) == pytest.approx(expected, rel=1e-6, abs=1e-12), step
