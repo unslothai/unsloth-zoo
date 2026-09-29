@@ -1360,16 +1360,14 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             get_state_dict(f"{prefix}.w3", 1, state_dict, w13)
             get_state_dict(f"{prefix}.w2", 0, state_dict, feed_forward.w2)
         elif not hasattr(layer, "mlp") and hasattr(getattr(experts, "routed_experts", experts), "w13_weight"):
-            # LFM2-MoE: FusedMoE w13 [E, 2I, H] / w2 [E, H, I] are HF experts.gate_up_proj / down_proj.
-            # vLLM >= 0.30 keeps them on MoERunner.routed_experts.
+            # LFM2-MoE: FusedMoE w13 [E, 2I, H] / w2 [E, H, I] = HF gate_up_proj / down_proj (vLLM >= 0.30: on routed_experts)
             routed = getattr(experts, "routed_experts", experts)
             quant_method = getattr(routed, "quant_method", None)
             quant_method = getattr(quant_method, "old_quant_method", quant_method)  # FusedMoEModularMethod
             backend = getattr(quant_method, "unquantized_backend", None)
             backend = getattr(backend, "name", backend)
             w13, w2 = routed.w13_weight, routed.w2_weight
-            # Other backends reorder w13 at load (FlashInfer swaps halves, TRTLLM / AITER / CPU repack);
-            # TRTLLM is what vLLM picks for LoRA-enabled bf16 MoE on Blackwell.
+            # Other backends reorder w13 at load; TRTLLM is vLLM's pick for LoRA-enabled bf16 MoE on Blackwell.
             if backend not in (None, "TRITON", "BATCHED_TRITON") or w13.dim() != 3 or w2.dim() != 3 \
                 or w13.shape[1] != 2 * w2.shape[2] or w13.shape[2] != w2.shape[1]:
                 raise NotImplementedError(
@@ -1394,7 +1392,6 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
                 state_dict[key] = value.data
                 quant_state_dict[key] = value.data
         elif not hasattr(layer, "mlp") and feed_forward is not None:
-            # Skipping would leave this layer's weights random in the training model.
             raise NotImplementedError(
                 f"Unsloth: fast_inference cannot rebuild layer {kk}'s {type(feed_forward).__name__} from vLLM; "
                 "set fast_inference = False."
