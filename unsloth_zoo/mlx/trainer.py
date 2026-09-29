@@ -5367,7 +5367,6 @@ class MLXTrainer:
                 )
             loss_fn = None
         elif getattr(args, "teacher_model_name_or_path", None):
-            # KD replaces the loss, so branch before the CCE/baseline selection.
             import psutil as _psutil
             from .distill import (
                 _model_logits, assert_tokenizers_compatible, build_gkd_loss_fn, load_teacher,
@@ -5390,9 +5389,7 @@ class MLXTrainer:
                     _gkd_batch_size,
                     getattr(args, "per_device_eval_batch_size", None) or 0,
                 )
-            # Gradients and optimizer state are allocated later: Adam-family
-            # state is two float32 buffers per trainable parameter, and gradient
-            # accumulation holds the carried gradient beside the fresh one.
+            # Allocated later: gradients (two live under accumulation) + two fp32 Adam moments.
             _live_grads = 2 if args.gradient_accumulation_steps > 1 else 1
             _trainable_bytes = sum(
                 p.size * (_live_grads * p.itemsize + 8)

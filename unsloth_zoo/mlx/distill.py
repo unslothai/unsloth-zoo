@@ -43,10 +43,8 @@ __all__ = [
 DEFAULT_CHUNK_SIZE = 128
 _depends = getattr(mx, "depends", None)
 
-# Peak as a multiple of one batch*seq*vocab float32 logit buffer, fitted on a
-# Qwen2.5-0.5B student + Qwen2.5-3B teacher and rounded up: an oversized step
-# does not raise, it aborts with "[METAL] Command buffer execution failed" and
-# wedges the GPU context.
+# Peak per batch*seq*vocab fp32 buffer, fitted on Qwen2.5-0.5B <- 3B and rounded up: an
+# oversized step aborts with "[METAL] Command buffer execution failed" and wedges the GPU.
 NAIVE_ACTIVATION_MULTIPLIER = 16.0
 CHUNKED_ACTIVATION_MULTIPLIER = 13.0
 MEMORY_SAFETY_FRACTION = 0.85
@@ -137,8 +135,7 @@ def _chunked_jsd_sum(beta, temperature, chunk_size):
 
     @mx.custom_function
     def forward(student_logits, teacher_logits, weights):
-        # Returns (loss, d loss / d student_logits); the gradient stays lazy
-        # unless a backward pass asks for it.
+        # (loss, d loss / d student_logits); the gradient stays lazy unless backward asks.
         total, grads = mx.zeros((), dtype=mx.float32), []
         for start, end in spans(student_logits.shape[1]):
             chunk = student_logits[:, start:end]
@@ -366,8 +363,7 @@ def build_gkd_loss_fn(teacher_model, args, vocab_size, batch_size,
     chunk_size = int(getattr(args, "gkd_chunk_size", DEFAULT_CHUNK_SIZE))
     validate_gkd_config(beta, temperature, getattr(args, "gkd_lmbda", 0.0))
 
-    # The loss sees max_seq_length - 1 positions at most. A shorter batch that
-    # fits in one chunk runs unchunked, so budget whichever branch costs more.
+    # <= max_seq_length - 1 positions; a one-chunk batch runs unchunked: budget the costlier.
     sequence_length = max(1, int(getattr(args, "max_seq_length", 512)) - 1)
     chunked = _is_chunked(chunk_size, sequence_length)
     if chunked and NAIVE_ACTIVATION_MULTIPLIER * chunk_size > CHUNKED_ACTIVATION_MULTIPLIER * sequence_length:
@@ -383,8 +379,7 @@ def build_gkd_loss_fn(teacher_model, args, vocab_size, batch_size,
     )
 
     def loss_fn(model, batch, lengths, labels=None):
-        # Same positions as make_baseline_loss_fn: the lengths window, further
-        # restricted by -100 labels when labels are given.
+        # Same positions as make_baseline_loss_fn: lengths window AND labels != -100.
         inputs = batch[:, :-1]
         steps = mx.arange(1, inputs.shape[1] + 1)
         mask = mx.logical_and(steps >= lengths[:, 0:1], steps < lengths[:, 1:])
