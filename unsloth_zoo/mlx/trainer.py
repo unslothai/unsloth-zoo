@@ -1252,6 +1252,7 @@ _MLX_CONFIG_OPTIONAL_COPY_FIELDS = (
     "logging_dir",
     "run_name",
     "adam_epsilon",
+    "optim_args",
 )
 
 
@@ -1381,9 +1382,12 @@ class MLXTrainingConfig:
     logging_dir: str | None = None
     run_name: str | None = None
 
-    # Must stay last (positional binding). None keeps MLX's default (1e-8, same
-    # as HF). Adam family only: MLX Adafactor's eps is a 2-tuple.
+    # None keeps MLX's default (1e-8, same as HF). Adam family only: MLX
+    # Adafactor's eps is a 2-tuple.
     adam_epsilon: float | None = None
+    # Must stay last (positional binding). HF "k=v,..." string; rmsprop/adagrad
+    # only, as in transformers' _get_rmsprop/_get_adagrad.
+    optim_args: str | None = None
 
     def __init__(self, *args, **kwargs):
         config_fields = [field for field in fields(type(self)) if field.init]

@@ -166,8 +166,7 @@ def _build_with_optim_args(optim_name, optim_args):
 
     trainer = MLXTrainer.__new__(MLXTrainer)
     trainer.model = DummyModel()
-    trainer.args = MLXTrainingConfig(optim=optim_name)
-    trainer.args.optim_args = optim_args
+    trainer.args = MLXTrainingConfig(optim=optim_name, optim_args=optim_args)
     return trainer._build_optimizer(total_steps=4)
 
 
@@ -223,3 +222,10 @@ def test_adamax_takes_adam_betas_and_epsilon():
     _, optimizer = _build("adamax", adam_beta1=0.8, adam_beta2=0.95, adam_epsilon=1e-6)
     assert tuple(_hyperparameter(optimizer, "betas")) == pytest.approx((0.8, 0.95))
     assert _hyperparameter(optimizer, "eps") == pytest.approx(1e-6)
+
+
+def test_optim_args_is_a_public_config_field():
+    from unsloth_zoo.mlx.trainer import MLXTrainingConfig
+
+    assert MLXTrainingConfig(optim="rmsprop", optim_args="alpha=0.95").optim_args == "alpha=0.95"
+    assert MLXTrainingConfig().optim_args is None
