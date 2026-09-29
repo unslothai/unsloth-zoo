@@ -1,5 +1,4 @@
-# Tests for the transformers v5 output capture helpers in unsloth_zoo.compiler:
-# patch_output_capture_targets and calls_output_capture_target.
+# Tests for the output capture helpers in unsloth_zoo.compiler.
 
 import types
 
@@ -10,11 +9,14 @@ from unsloth_zoo.compiler import (
     patch_output_capture_targets,
 )
 
-output_capturing = pytest.importorskip(
-    "transformers.utils.output_capturing",
-    reason="output capture targets exist on transformers >= 5.2 only",
-)
-OutputRecorder = output_capturing.OutputRecorder
+try:
+    from transformers.utils.output_capturing import OutputRecorder
+except ImportError:
+    OutputRecorder = getattr(
+        pytest.importorskip("transformers.utils.generic"), "OutputRecorder", None
+    )
+    if OutputRecorder is None:
+        pytest.skip("this transformers has no OutputRecorder", allow_module_level = True)
 
 
 class FakeRouter:
@@ -80,7 +82,6 @@ def test_retargets_specs_to_replacement_classes():
     # Bare classes without a replacement stay untouched.
     assert flags["hidden_states"] is FakeDecoderLayer
 
-    # List and tuple specs keep their container type and are retargeted.
     assert isinstance(flags["attentions"], list)
     assert flags["attentions"][0].target_class is ReplacementAttention
     assert flags["attentions"][0].index == 1

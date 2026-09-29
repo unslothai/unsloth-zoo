@@ -66,7 +66,6 @@ def test_loss_mapping_other_losses_left_alone():
     lu = pytest.importorskip("transformers.loss.loss_utils")
     from unsloth_zoo import loss_utils as zoo_loss
 
-    # Keys not currently aliased to ForCausalLMLoss must survive the sweep.
     non_causal = {
         k: v for k, v in lu.LOSS_MAPPING.items()
         if getattr(v, "__name__", "") != "ForCausalLMLoss"
