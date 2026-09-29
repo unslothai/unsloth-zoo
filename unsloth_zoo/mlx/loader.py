@@ -1164,6 +1164,29 @@ def _load_mlx_lm_with_strict_fallback(
     return model, tokenizer
 
 
+def _download_missing_index_shards(model_name, local_path, revision, download):
+    """Fetch shards the index maps that mlx-lm's `model*.safetensors` default skipped.
+
+    mlx-vlm loads every shard in `weight_map` but silently drops absent ones, so a
+    subfolder shard (mlx-community/gemma-4-e2b-it-OptiQ-4bit keeps its vision tower
+    in optiq/optiq_vision.safetensors) failed as "Missing 1411 parameters".
+    """
+    if os.path.isdir(model_name):
+        return local_path
+    try:
+        with open(os.path.join(local_path, "model.safetensors.index.json")) as file:
+            weight_map = json.load(file).get("weight_map") or {}
+    except (OSError, ValueError, AttributeError):
+        return local_path
+    missing = sorted(
+        {shard for shard in weight_map.values()
+         if isinstance(shard, str) and not os.path.exists(os.path.join(local_path, shard))}
+    )
+    if not missing:
+        return local_path
+    return str(download(model_name, revision=revision, allow_patterns=missing))
+
+
 def _mlx_lm_metadata_allow_patterns():
     return [
         "*.json",
@@ -8407,6 +8430,10 @@ class FastMLXModel:
                         allow_patterns=config_allow_patterns,
                     )
                 )
+                if not distributed_requested:
+                    local_path = _download_missing_index_shards(
+                        model_name, local_path, revision, _download,
+                    )
                 original_local_path = local_path
         except Exception:
             if distributed_requested:
