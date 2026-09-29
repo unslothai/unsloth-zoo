@@ -12650,6 +12650,17 @@ def _torch_randperm_order(length, seed):
     return torch.randperm(length, generator=generator).tolist()
 
 
+def _length_grouped_permutation(length, seed):
+    """Seeded torch.randperm when importable, else stdlib (unsloth_zoo[mlx] omits torch on Apple Silicon). Seed-only, so DDP ranks agree."""
+    try:
+        import torch  # noqa: F401
+    except Exception:
+        indices = list(range(length))
+        random.Random(3407 if seed is None else int(seed)).shuffle(indices)
+        return indices
+    return _torch_randperm_order(length, seed)
+
+
 def _finite_epoch_batch_budget(cycle_length, num_epochs, grad_accum):
     """Translate fractional epochs into HF-style accumulation windows."""
     accum = max(1, int(grad_accum or 1))
@@ -12729,6 +12740,49 @@ def _finite_batch_schedule(
                 break
         epoch += 1
     return tuple(schedule), cycle_length
+
+
+def _text_row_length(row):
+    """Token count of a row, either ``ids`` or ``(ids, labels)``."""
+    if isinstance(row, (tuple, list)) and row and isinstance(row[0], (tuple, list)):
+        return len(row[0])
+    return len(row)
+
+
+def _length_grouped_order(lengths, batch_size, seed, mega_batch_mult=None):
+    """Mirrors transformers ``get_length_grouped_indices``; ``batch_size`` comes from ``_length_grouped_window``."""
+    n = len(lengths)
+    if n == 0:
+        return []
+    if mega_batch_mult is None:
+        mega_batch_mult = min(n // (batch_size * 4), 50) if batch_size > 0 else 1
+        if mega_batch_mult == 0:
+            mega_batch_mult = 1
+
+    indices = _length_grouped_permutation(n, seed)
+    megabatch_size = max(1, mega_batch_mult * batch_size)
+    megabatches = [
+        indices[i : i + megabatch_size] for i in range(0, n, megabatch_size)
+    ]
+    megabatches = [
+        sorted(megabatch, key=lambda i: lengths[i], reverse=True)
+        for megabatch in megabatches
+    ]
+
+    megabatch_maximums = [lengths[megabatch[0]] for megabatch in megabatches]
+    max_idx = megabatch_maximums.index(max(megabatch_maximums))
+    megabatches[0][0], megabatches[max_idx][0] = (
+        megabatches[max_idx][0], megabatches[0][0],
+    )
+
+    return [i for megabatch in megabatches for i in megabatch]
+
+
+def _length_grouped_window(local_batch_size, comm_group=None, grad_accum=None):
+    """Global micro-batch x grad_accum: HF's Trainer._get_train_sampler uses train_batch_size * gradient_accumulation_steps,
+    and a per-rank window would let a consumed global chunk straddle two mega-batches."""
+    global_batch_size = _distributed_global_batch_size(local_batch_size, comm_group)
+    return global_batch_size * max(1, int(grad_accum or 1))
 
 
 def _create_ordered_text_plan(
@@ -12848,6 +12902,12 @@ def _create_ordered_text_plan(
         base_seed = _normalize_seed(seed)
         if dataset_order == "torch_randperm":
             return _torch_randperm_order(len(tokenized), base_seed + epoch)
+        if dataset_order == "length_grouped":
+            return _length_grouped_order(
+                [_text_row_length(row) for row in tokenized],
+                _length_grouped_window(batch_size, comm_group, grad_accum),
+                base_seed + epoch,
+            )
         if dataset_order not in (None, "sequential"):
             raise ValueError(f"Unsupported MLX dataset_order: {dataset_order!r}")
         return list(range(len(tokenized)))

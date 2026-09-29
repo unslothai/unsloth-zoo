@@ -422,6 +422,7 @@ jobs:
         # test_device_map_planner_compressed_tensors: pack-quantized checkpoints planned at packed bytes.
         # test_grpo_mask_truncated_rows: truncated completions stay out of the GRPO loss; its UnslothEfficientGRPO stubs bind to the real forward.
         # test_mlx_embedding_guards: sentence-transformers layout shim and pooling-mode map, under the torch shim.
+        # test_mlx_group_by_length: HF-exact group_by_length order, knob conflicts, labeled/unlabeled parity. CPU-pure.
         run: |
           python -m pytest \
             tests/test_training_utils_use_cache.py \
@@ -432,6 +433,7 @@ jobs:
             tests/test_mlx_incomplete_config.py \
             tests/test_mlx_incomplete_config_vlm.py \
             tests/test_mlx_adam_epsilon.py \
+            tests/test_mlx_group_by_length.py \
             tests/test_hf_xet_fallback.py \
             tests/test_hf_xet_fallback_blob_scoped_redownload.py \
             tests/test_llama_cpp_install_consent.py \

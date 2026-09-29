@@ -1,0 +1,603 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+"""group_by_length on the MLX trainer: HF parity for the ordering helper,
+config resolution, and labeled/unlabeled plan agreement. CPU-only, simulation shim.
+"""
+
+from __future__ import annotations
+
+import random
+import sys
+
+import pytest
+
+# The MLX simulation shim runs on torch; native Apple Silicon installs ship
+# without it, and a collection error there would also stop the _metal companion.
+torch = pytest.importorskip("torch")
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _install_shim():
+    from mlx_simulation import simulate_mlx_on_torch
+
+    simulate_mlx_on_torch()
+
+
+def _helper():
+    from unsloth_zoo.mlx.utils import _length_grouped_order
+
+    return _length_grouped_order
+
+
+def _hf_reference(lengths, batch_size, generator, mega_batch_mult=None):
+    """transformers.trainer_pt_utils.get_length_grouped_indices, transcribed."""
+    if mega_batch_mult is None:
+        mega_batch_mult = min(len(lengths) // (batch_size * 4), 50)
+        if mega_batch_mult == 0:
+            mega_batch_mult = 1
+    indices = torch.randperm(len(lengths), generator=generator)
+    megabatch_size = mega_batch_mult * batch_size
+    megabatches = [
+        indices[i : i + megabatch_size].tolist()
+        for i in range(0, len(lengths), megabatch_size)
+    ]
+    megabatches = [
+        sorted(mb, key=lambda i: lengths[i], reverse=True) for mb in megabatches
+    ]
+    megabatch_maximums = [lengths[mb[0]] for mb in megabatches]
+    max_idx = torch.argmax(torch.tensor(megabatch_maximums)).item()
+    megabatches[0][0], megabatches[max_idx][0] = (
+        megabatches[max_idx][0], megabatches[0][0],
+    )
+    return [i for mb in megabatches for i in mb]
+
+
+
+
+def test_matches_hf_reference_bit_for_bit():
+    order = _helper()
+    rng = random.Random(0)
+    for _ in range(200):
+        n = rng.randint(1, 400)
+        batch_size = rng.randint(1, 16)
+        seed = rng.randint(0, 10**6)
+        lengths = [rng.randint(1, 2048) for _ in range(n)]
+
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+        expected = _hf_reference(lengths, batch_size, generator)
+
+        assert order(lengths, batch_size, seed) == expected
+
+
+def test_window_matches_hf_sampler_construction():
+    from unsloth_zoo.mlx.utils import _length_grouped_window
+
+    order = _helper()
+    rng = random.Random(1)
+    for _ in range(100):
+        n = rng.randint(1, 400)
+        batch_size = rng.randint(1, 8)
+        grad_accum = rng.randint(1, 8)
+        seed = rng.randint(0, 10**6)
+        lengths = [rng.randint(1, 2048) for _ in range(n)]
+
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+        expected = _hf_reference(lengths, batch_size * grad_accum, generator)
+
+        window = _length_grouped_window(batch_size, None, grad_accum)
+        assert order(lengths, window, seed) == expected
+
+
+def test_is_a_permutation_and_deterministic_per_seed():
+    order = _helper()
+    lengths = [random.Random(1).randint(1, 512) for _ in range(101)]
+    a = order(lengths, 4, 1234)
+    assert sorted(a) == list(range(len(lengths)))
+    assert a == order(lengths, 4, 1234)
+    assert a != order(lengths, 4, 1235)  # a different seed reshuffles
+
+
+def test_longest_row_runs_first():
+    order = _helper()
+    lengths = [10] * 60 + [9999]
+    assert order(lengths, 4, 7)[0] == 60
+
+
+def test_groups_similar_lengths_far_better_than_a_shuffle():
+    order = _helper()
+    rng = random.Random(3)
+    lengths = [rng.randint(1, 1024) for _ in range(512)]
+    batch_size = 8
+
+    def padding_cost(indices):
+        total = 0
+        for i in range(0, len(indices), batch_size):
+            batch = indices[i : i + batch_size]
+            widest = max(lengths[j] for j in batch)
+            total += sum(widest - lengths[j] for j in batch)
+        return total
+
+    from unsloth_zoo.mlx.utils import _torch_randperm_order
+
+    grouped = padding_cost(order(lengths, batch_size, 11))
+    shuffled = padding_cost(_torch_randperm_order(len(lengths), 11))
+    assert grouped < shuffled / 4
+
+
+def test_empty_and_single_row_datasets():
+    order = _helper()
+    assert order([], 4, 1) == []
+    assert order([5], 4, 1) == [0]
+
+
+def test_ordering_works_without_torch(monkeypatch):
+    from unsloth_zoo.mlx.utils import _length_grouped_order
+
+    monkeypatch.setitem(sys.modules, "torch", None)  # makes `import torch` fail
+
+    rng = random.Random(12)
+    lengths = [rng.randint(1, 1024) for _ in range(512)]
+    batch_size = 8
+    order = _length_grouped_order(lengths, batch_size, 77)
+
+    assert sorted(order) == list(range(len(lengths)))
+    assert order == _length_grouped_order(lengths, batch_size, 77)
+    assert order != _length_grouped_order(lengths, batch_size, 78)
+
+    def padding_cost(indices):
+        total = 0
+        for i in range(0, len(indices), batch_size):
+            batch = indices[i : i + batch_size]
+            widest = max(lengths[j] for j in batch)
+            total += sum(widest - lengths[j] for j in batch)
+        return total
+
+    plain = list(range(len(lengths)))
+    random.Random(77).shuffle(plain)
+    assert padding_cost(order) < padding_cost(plain) / 4
+
+
+
+
+def _args(**kw):
+    from unsloth_zoo.mlx.trainer import MLXTrainingConfig
+
+    return MLXTrainingConfig(**kw)
+
+
+def test_resolver_returns_length_grouped_only_when_requested():
+    from unsloth_zoo.mlx.trainer import _resolve_text_dataset_order
+
+    assert _resolve_text_dataset_order(_args(group_by_length=True)) == "length_grouped"
+    assert _resolve_text_dataset_order(_args()) == "default"
+    assert _resolve_text_dataset_order(
+        _args(preserve_dataset_order=True)
+    ) == "sequential"
+    assert _resolve_text_dataset_order(
+        _args(dataset_order="torch_randperm")
+    ) == "torch_randperm"
+
+
+def test_resolver_preserves_explicit_none_dataset_order():
+    from unsloth_zoo.mlx.trainer import _resolve_text_dataset_order
+
+    assert _resolve_text_dataset_order(_args(dataset_order=None)) is None
+
+
+@pytest.mark.parametrize(
+    "conflict", [
+        dict(preserve_dataset_order=True),
+        dict(dataset_order="sequential"),
+        dict(dataset_order="torch_randperm"),
+    ],
+)
+def test_conflicting_order_knobs_raise(conflict):
+    from unsloth_zoo.mlx.trainer import _resolve_text_dataset_order
+
+    with pytest.raises(ValueError, match="group_by_length"):
+        _resolve_text_dataset_order(_args(group_by_length=True, **conflict))
+
+
+def test_config_accepts_group_by_length_and_defaults_off():
+    from unsloth_zoo.mlx.trainer import MLXTrainingConfig
+
+    assert MLXTrainingConfig().group_by_length is False
+    assert MLXTrainingConfig(group_by_length=True).group_by_length is True
+
+
+def test_appended_field_keeps_the_optional_copy_suffix():
+    from dataclasses import fields as dataclass_fields
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainingConfig,
+        _MLX_CONFIG_OPTIONAL_COPY_FIELDS,
+    )
+
+    names = [f.name for f in dataclass_fields(MLXTrainingConfig) if f.init]
+    assert "group_by_length" in _MLX_CONFIG_OPTIONAL_COPY_FIELDS
+    tail = tuple(names[-len(_MLX_CONFIG_OPTIONAL_COPY_FIELDS):])
+    assert tail == _MLX_CONFIG_OPTIONAL_COPY_FIELDS
+
+
+
+
+def test_labeled_and_unlabeled_paths_produce_the_same_order():
+    from unsloth_zoo.mlx.utils import (
+        _length_grouped_order, _length_grouped_window, _normalize_seed,
+    )
+
+    rng = random.Random(5)
+    rows = [[0] * rng.randint(2, 300) for _ in range(233)]
+    labeled_items = [(ids, [1] * len(ids)) for ids in rows]
+    batch_size, grad_accum, seed = 4, 4, 4242
+
+    for epoch in range(3):
+        # exactly what _create_labeled_batches._order_indices_for_epoch does
+        labeled = _length_grouped_order(
+            [len(item[0]) for item in labeled_items],
+            _length_grouped_window(batch_size, None, grad_accum),
+            _normalize_seed(seed) + epoch,
+        )
+        # exactly what _create_ordered_text_plan.make_order does
+        from unsloth_zoo.mlx.utils import _text_row_length
+
+        unlabeled = _length_grouped_order(
+            [_text_row_length(row) for row in rows],
+            _length_grouped_window(batch_size, None, grad_accum),
+            _normalize_seed(seed) + epoch,
+        )
+        assert labeled == unlabeled
+
+
+class _SpaceTokenizer:
+
+    pad_token_id = 0
+    eos_token_id = 99
+    unk_token_id = -1
+
+    def __call__(self, texts, **_kwargs):
+        if isinstance(texts, str):
+            return {"input_ids": self.encode(texts)}
+        return {"input_ids": [self.encode(text) for text in texts]}
+
+    def encode(self, text):
+        return [int(part) for part in str(text).split()]
+
+    def convert_tokens_to_ids(self, token):
+        if isinstance(token, list):
+            return [self.convert_tokens_to_ids(t) for t in token]
+        return self.unk_token_id
+
+
+def _keep_all_labels(d):
+    return {"labels": [list(d["input_ids"][0])]}
+
+
+def _labeled_plan(
+    *, num_batches, num_epochs=None, order="length_grouped", grad_accum=None,
+):
+    from unsloth_zoo.mlx.trainer import _create_labeled_batches
+
+    return _create_labeled_batches(
+        dataset=[
+            {"text": " ".join(str(10 + j) for j in range((i % 4) + 2))}
+            for i in range(6)
+        ],
+        tokenizer=_SpaceTokenizer(),
+        mask_fn=_keep_all_labels,
+        batch_size=1,
+        max_seq_length=16,
+        seed=1234,
+        dataset_order=order,
+        num_batches=num_batches,
+        num_epochs=num_epochs,
+        grad_accum=grad_accum,
+        return_plan=True,
+    )
+
+
+def test_labeled_plan_groups_at_the_accumulation_window():
+    from unsloth_zoo.mlx.utils import (
+        _length_grouped_order, _length_grouped_window, _normalize_seed,
+    )
+
+    lengths = [3, 4, 5, 6, 3, 4]
+
+    def plan_order(grad_accum):
+        plan = _labeled_plan(
+            num_batches=None, num_epochs=1, grad_accum=grad_accum,
+        )
+        return [i for batch in plan.schedule for i in batch]
+
+    assert plan_order(4) == _length_grouped_order(
+        lengths, _length_grouped_window(1, None, 4), _normalize_seed(1234),
+    )
+    assert plan_order(4) != plan_order(1)
+
+
+def test_both_builders_stream_the_same_rows_at_the_same_window():
+    from unsloth_zoo.mlx.utils import _create_ordered_text_plan
+
+    class _PretokenizedTokenizer:
+        pad_token_id = 0
+        eos_token_id = 99
+
+    plan = _create_ordered_text_plan(
+        dataset=[{"input_ids": list(range(1, n + 1))} for n in [3, 4, 5, 6, 3, 4]],
+        tokenizer=_PretokenizedTokenizer(),
+        batch_size=1,
+        max_seq_length=16,
+        seed=1234,
+        dataset_order="length_grouped",
+        num_epochs=1,
+        grad_accum=4,
+    )
+    unlabeled = [i for batch in plan.schedule for i in batch]
+    labeled_plan = _labeled_plan(num_batches=None, num_epochs=1, grad_accum=4)
+    labeled = [i for batch in labeled_plan.schedule for i in batch]
+    assert unlabeled == labeled
+
+
+@pytest.mark.parametrize("order", ["length_grouped", "torch_randperm"])
+def test_max_steps_run_reseeds_every_pass_it_consumes(order):
+    plan = _labeled_plan(num_batches=18, order=order)
+    schedule = [list(batch) for batch in plan.schedule]
+    assert len(schedule) == 18
+    assert plan.cycle_length == 6
+
+    passes = [schedule[0:6], schedule[6:12], schedule[12:18]]
+    for one_pass in passes:
+        assert sorted(i for batch in one_pass for i in batch) == list(range(6))
+    assert passes[0] != passes[1]
+    assert passes[1] != passes[2]
+
+
+def test_max_steps_run_still_truncates_to_the_step_budget():
+    assert len(_labeled_plan(num_batches=4).schedule) == 4
+    assert len(_labeled_plan(num_batches=15).schedule) == 15
+
+
+def test_sequential_order_is_not_expanded():
+    plan = _labeled_plan(num_batches=18, order="sequential")
+    assert len(plan.schedule) == 6
+
+
+def test_row_length_handles_labeled_and_unlabeled_shapes():
+    from unsloth_zoo.mlx.utils import _text_row_length
+
+    assert _text_row_length([1, 2, 3]) == 3                 # unlabeled ids
+    assert _text_row_length(([1, 2, 3], [-100, 2, 3])) == 3  # (ids, labels)
+
+
+def test_order_reshuffles_across_epochs():
+    from unsloth_zoo.mlx.utils import _length_grouped_order, _normalize_seed
+
+    lengths = [random.Random(9).randint(1, 400) for _ in range(300)]
+    base = _normalize_seed(1234)
+    orders = [_length_grouped_order(lengths, 8, base + e) for e in range(3)]
+    assert orders[0] != orders[1] != orders[2]
+
+
+def test_eval_batches_are_never_length_grouped():
+    from unsloth_zoo.mlx.trainer import _resolve_text_dataset_order
+
+    args = _args(group_by_length=True)
+    assert _resolve_text_dataset_order(args, for_training=True) == "length_grouped"
+    assert _resolve_text_dataset_order(args, for_training=False) == "default"
+
+
+def test_eval_resolution_still_honors_the_other_order_knobs():
+    from unsloth_zoo.mlx.trainer import _resolve_text_dataset_order
+
+    assert _resolve_text_dataset_order(
+        _args(preserve_dataset_order=True), for_training=False,
+    ) == "sequential"
+    assert _resolve_text_dataset_order(
+        _args(dataset_order="torch_randperm"), for_training=False,
+    ) == "torch_randperm"
+
+
+def test_conflicts_raise_on_the_eval_path_too():
+    from unsloth_zoo.mlx.trainer import _resolve_text_dataset_order
+
+    with pytest.raises(ValueError, match="group_by_length"):
+        _resolve_text_dataset_order(
+            _args(group_by_length=True, preserve_dataset_order=True),
+            for_training=False,
+        )
+
+
+
+def test_vlm_rejects_length_grouping():
+    from unsloth_zoo.mlx.trainer import _reject_group_by_length
+
+    with pytest.raises(ValueError, match="vision-language"):
+        _reject_group_by_length("length_grouped", "vlm")
+
+
+def test_streaming_rejects_length_grouping():
+    from unsloth_zoo.mlx.trainer import _reject_group_by_length
+
+    with pytest.raises(ValueError, match="requires a sized dataset"):
+        _reject_group_by_length("length_grouped", "streaming")
+
+
+def test_preference_rejects_length_grouping():
+    from unsloth_zoo.mlx.trainer import _reject_group_by_length
+
+    with pytest.raises(ValueError, match="DPO/ORPO"):
+        _reject_group_by_length("length_grouped", "preference")
+
+
+def test_preference_configs_resolve_to_the_grouped_order():
+    from unsloth_zoo.mlx.trainer import (
+        MLXDPOConfig, MLXORPOConfig, _resolve_text_dataset_order,
+    )
+
+    for config_class in (MLXDPOConfig, MLXORPOConfig):
+        args = config_class(group_by_length=True)
+        assert _resolve_text_dataset_order(args) == "length_grouped"
+
+
+@pytest.mark.parametrize("context", ["vlm", "streaming", "preference"])
+@pytest.mark.parametrize(
+    "order", ["default", "sequential", "torch_randperm", None],
+)
+def test_existing_orders_are_untouched_by_the_guard(order, context):
+    from unsloth_zoo.mlx.trainer import _reject_group_by_length
+
+    assert _reject_group_by_length(order, context) is None
+
+
+
+class _FakeWorld:
+
+    def __init__(self, rank, size):
+        self._rank, self._size = rank, size
+
+    def rank(self):
+        return self._rank
+
+    def size(self):
+        return self._size
+
+
+def test_every_rank_derives_the_identical_global_order():
+    from unsloth_zoo.mlx.utils import _length_grouped_order
+
+    lengths = [random.Random(2).randint(1, 900) for _ in range(257)]
+    orders = [_length_grouped_order(lengths, 8, 4242) for _ in range(4)]
+    assert all(o == orders[0] for o in orders)
+
+
+def test_window_folds_world_size_and_accumulation():
+    from unsloth_zoo.mlx.utils import _length_grouped_window
+
+    assert _length_grouped_window(2, None, 4) == 8
+    assert _length_grouped_window(2, _FakeWorld(0, 4), 4) == 32
+    assert _length_grouped_window(2, _FakeWorld(3, 4), 4) == 32   # rank-invariant
+    assert _length_grouped_window(2, None, None) == 2
+    assert _length_grouped_window(2, None, 0) == 2
+
+
+def test_window_stays_a_multiple_of_the_consumed_global_batch():
+    from unsloth_zoo.mlx.utils import (
+        _distributed_global_batch_size, _length_grouped_window,
+    )
+
+    for world_size in (1, 2, 4):
+        for local_batch in (1, 2, 3, 8):
+            for grad_accum in (1, 2, 4, 16):
+                world = _FakeWorld(0, world_size)
+                global_batch = _distributed_global_batch_size(local_batch, world)
+                window = _length_grouped_window(local_batch, world, grad_accum)
+                assert window % global_batch == 0
+
+
+def test_rank_slices_are_disjoint_and_cover_the_global_batch():
+    from unsloth_zoo.mlx.utils import (
+        _length_grouped_order,
+        _rank_slice_distributed_batch,
+        _distributed_global_batch_size,
+    )
+
+    world_size, local_batch = 4, 2
+    lengths = [random.Random(4).randint(1, 500) for _ in range(128)]
+    order = _length_grouped_order(lengths, local_batch * world_size, 7)
+    global_batch = _distributed_global_batch_size(local_batch, _FakeWorld(0, world_size))
+    assert global_batch == local_batch * world_size
+
+    for start in range(0, len(order), global_batch):
+        chunk = order[start : start + global_batch]
+        slices = [
+            _rank_slice_distributed_batch(
+                chunk, local_batch, comm_group=_FakeWorld(r, world_size),
+                pad_source=order,
+            )
+            for r in range(world_size)
+        ]
+        flat = [i for s in slices for i in s]
+        assert all(len(s) == local_batch for s in slices)
+        assert set(chunk) <= set(flat)
+        if len(chunk) == global_batch:
+            assert sorted(flat) == sorted(chunk)
+
+
+def test_length_grouping_survives_rank_sharding():
+    from unsloth_zoo.mlx.utils import (
+        _length_grouped_order,
+        _rank_slice_distributed_batch,
+    )
+
+    world_size, local_batch = 2, 4
+    rng = random.Random(6)
+    lengths = [rng.randint(1, 1024) for _ in range(512)]
+    global_batch = local_batch * world_size
+    order = _length_grouped_order(lengths, global_batch, 21)
+
+    def local_padding(order_source):
+        waste = 0
+        for start in range(0, len(order_source), global_batch):
+            chunk = order_source[start : start + global_batch]
+            for r in range(world_size):
+                s = _rank_slice_distributed_batch(
+                    chunk, local_batch, comm_group=_FakeWorld(r, world_size),
+                    pad_source=order_source,
+                )
+                if not s:
+                    continue
+                widest = max(lengths[i] for i in s)
+                waste += sum(widest - lengths[i] for i in s)
+        return waste
+
+    from unsloth_zoo.mlx.utils import _torch_randperm_order
+
+    assert local_padding(order) < local_padding(
+        _torch_randperm_order(len(lengths), 21)
+    ) / 4
+
+
+def test_grouping_is_cut_at_the_global_batch_not_the_local_one():
+    from unsloth_zoo.mlx.utils import (
+        _length_grouped_order,
+        _rank_slice_distributed_batch,
+    )
+
+    world_size, local_batch = 4, 2
+    global_batch = local_batch * world_size
+    rng = random.Random(13)
+    lengths = [rng.randint(1, 1024) for _ in range(1600)]
+
+    def local_padding(order_source):
+        waste = 0
+        for start in range(0, len(order_source), global_batch):
+            chunk = order_source[start : start + global_batch]
+            for r in range(world_size):
+                s = _rank_slice_distributed_batch(
+                    chunk, local_batch, comm_group=_FakeWorld(r, world_size),
+                    pad_source=order_source,
+                )
+                if not s:
+                    continue
+                widest = max(lengths[i] for i in s)
+                waste += sum(widest - lengths[i] for i in s)
+        return waste
+
+    grouped_globally = local_padding(_length_grouped_order(lengths, global_batch, 31))
+    grouped_locally = local_padding(_length_grouped_order(lengths, local_batch, 31))
+    assert grouped_globally < grouped_locally

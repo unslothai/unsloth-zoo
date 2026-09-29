@@ -300,7 +300,8 @@ def test_a_pre_pr_positional_config_copy_still_maps(monkeypatch):
         if f.init and not f.kw_only
     ]
     original = MLXTrainingConfig(optim="adam", learning_rate=1.5e-4, run_name="old")
-    pre_pr = [getattr(original, name) for name in names if name != "adam_epsilon"]
+    # A dump from before adam_epsilon holds only the fields declared ahead of it.
+    pre_pr = [getattr(original, name) for name in names[: names.index("adam_epsilon")]]
     copied = MLXTrainingConfig(*pre_pr)
 
     assert copied.optim == "adam"
