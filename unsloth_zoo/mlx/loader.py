@@ -9789,9 +9789,9 @@ class FastMLXModel:
             model._unsloth_patch_mode = patch_mode
             model._unsloth_full_finetuning = bool(full_finetuning)
             if quant_state == "compatible":
-                # Repacked GPTQ records its source config, as native AWQ does, so an adapter reload replays it.
+                # Repacked GPTQ keeps quant_method, as native AWQ does, so an adapter reload replays it.
                 model._unsloth_quantization_config = (
-                    hf_prequant_config
+                    {**config_data["quantization"], "quant_method": hf_prequant_method}
                     if dequant_temp_dir is not None
                     else _get_existing_mlx_quantization(config_data)
                 )
