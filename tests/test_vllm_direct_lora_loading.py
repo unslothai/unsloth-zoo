@@ -35,8 +35,8 @@ import torch
 
 
 # Imported at module level on purpose: this file is a CI hard gate needing neither a GPU nor
-# vLLM (tests/conftest.py handles the device probe), so an import failure is a regression
-# and must fail the gate instead of skipping it.
+# vLLM (tests/conftest.py handles the device probe), so an import failure must fail
+# the gate instead of skipping it.
 import unsloth_zoo.vllm_utils as vllm_utils
 
 

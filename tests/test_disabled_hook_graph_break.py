@@ -42,6 +42,25 @@ sys.path.insert(0, str(ROOT))
 
 from unsloth_zoo.temporary_patches import utils as U  # noqa: E402
 
+
+@pytest.fixture(autouse = True)
+def _clear_latches():
+    """The latch is process-global and keyed by label, and every `_wrap` below
+    reuses "TestMod", so the first fallback would leak into every later test."""
+    for _s in (U._LATCHED_EAGER_LABELS, U._PENDING_EAGER_LABELS,
+               U._RECENT_EAGER_LABELS, U._COMPILED_OK_LABELS):
+        _s.discard("TestMod")
+    # Left set by an earlier test file, the give-up arms here read "a compiled
+    # pack is outstanding" and end the step instead of falling back.
+    _packed = U._PACKED_COMPILED_IN_CHECKPOINT
+    U._PACKED_COMPILED_IN_CHECKPOINT = False
+    yield
+    for _s in (U._LATCHED_EAGER_LABELS, U._PENDING_EAGER_LABELS,
+               U._RECENT_EAGER_LABELS, U._COMPILED_OK_LABELS):
+        _s.discard("TestMod")
+    U._PACKED_COMPILED_IN_CHECKPOINT = _packed
+
+
 DISABLE_MSG = (
     "Skip calling `torch.compiler.disable()`d function\n"
     "  Explanation: Skip calling function "
@@ -52,7 +71,6 @@ DISABLE_MSG = (
 )
 
 
-# ---- the matcher ----------------------------------------------------------
 
 def test_it_recognises_our_own_disabled_hook():
     assert U._is_our_own_disabled_hook(RuntimeError(DISABLE_MSG))
@@ -61,12 +79,10 @@ def test_it_recognises_our_own_disabled_hook():
 _HOOK = ("<function requires_grad_for_gradient_checkpointing.<locals>."
          "requires_grad_pre_hook at 0x7f00>")
 
-# Dynamo's refusal to trace a disabled callable, once per wording inside the
-# torch>=2.4,<2.13 pyproject declares. 2.4 to 2.6 emit the `_dynamo.disable`
-# text from `variables/functions.py` (2.4.0 L604, 2.5.1 L655, 2.6.0 L620); 2.7
-# replaced it with the structured `unimplemented_v2` block (2.7.0 L1173) and 2.8
-# added the trailing reason. Missing a wording means the run dies on that torch
-# instead of slowing down, which is exactly what this fallback exists to stop.
+# Dynamo's refusal to trace a disabled callable, one wording per torch in the
+# >=2.4,<2.13 range: 2.4-2.6 use `variables/functions.py`'s `_dynamo.disable` text
+# (2.4.0 L604, 2.5.1 L655, 2.6.0 L620), 2.7 `unimplemented_v2` (2.7.0 L1173), 2.8
+# added the trailing reason. Miss a wording and the run dies on that torch.
 _OLD_WORDING = f"call torch._dynamo.disable() wrapped function {_HOOK}"
 _NEW_WORDING = (
     "Skip calling `torch.compiler.disable()`d function\n"
@@ -105,8 +121,7 @@ def test_a_mention_of_disable_alone_is_not_enough():
     talks about torch.compiler.disable does not qualify."""
     assert not U._is_our_own_disabled_hook(
         RuntimeError("consider using torch.compiler.disable here"))
-    # Same for the pre-2.7 wording: the whole literal is required, not the
-    # decorator's name, so advice to apply it is not a disabled-hook break.
+    # Same for the pre-2.7 wording: the whole literal is required, not the name.
     assert not U._is_our_own_disabled_hook(
         RuntimeError("try torch._dynamo.disable() on this function"))
 
@@ -118,7 +133,6 @@ def test_an_unstringifiable_exception_does_not_crash():
     assert U._is_our_own_disabled_hook(Bad()) is False
 
 
-# ---- the fallback ---------------------------------------------------------
 
 def _wrap(compiled, eager=None):
     eager = eager or (lambda *a, **k: "eager")
@@ -245,15 +259,40 @@ def test_the_compiled_callable_stays_reachable():
     assert hasattr(w, "get_compiler_config")
 
 
-def test_it_degrades_to_the_compiled_function_when_torch_offers_neither():
+def test_it_degrades_to_the_compiled_function_when_torch_offers_none_of_them():
     """On a torch with no such exceptions at all, wrapping buys nothing and
-    must not add a layer."""
+    must not add a layer.
+
+    All THREE families have to be absent. The wrapper now also catches Inductor
+    codegen refusals, and `_backend_compile_errors()` is non-empty on every
+    supported torch, so mocking only the two recompile families left the third
+    live and the wrapper rightly kept its layer -- this asserted "no exceptions
+    at all" while one family was still there.
+    """
     import unittest.mock as mock
+    with mock.patch.object(U, "_recompile_limit_errors", lambda: ()), \
+         mock.patch.object(U, "_disabled_hook_graph_break_error", lambda: ()), \
+         mock.patch.object(U, "_backend_compile_errors", lambda: ()):
+        sentinel = object()
+        assert U._fall_back_to_eager_on_recompile_limit(
+            sentinel, lambda: None, "x") is sentinel
+
+
+def test_backend_errors_alone_are_enough_to_keep_the_wrapper():
+    """The other half of the contract, and the reason the test above changed.
+
+    A torch that reports no recompile-limit exception and no graph-break
+    exception can still refuse to generate code, so the layer has to stay --
+    otherwise the codegen fallback would silently not exist there.
+    """
+    import unittest.mock as mock
+    if not U._backend_compile_errors():
+        pytest.skip("this torch exposes no backend compile exception")
     with mock.patch.object(U, "_recompile_limit_errors", lambda: ()), \
          mock.patch.object(U, "_disabled_hook_graph_break_error", lambda: ()):
         sentinel = object()
         assert U._fall_back_to_eager_on_recompile_limit(
-            sentinel, lambda: None, "x") is sentinel
+            sentinel, lambda: None, "x") is not sentinel
 
 
 if __name__ == "__main__":

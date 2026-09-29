@@ -314,17 +314,8 @@ def _probe_cas_reachable_inner() -> "tuple[Optional[bool], str]":
 
         url = f"{_endpoint()}/api/models/{_PROBE_REPO}/xet-read-token/main"
         request = urllib.request.Request(url, headers = {"User-Agent": "unsloth-xet-probe"})
-        token = os.environ.get("HF_TOKEN")
-        if not token:
-            # Covers `hf auth login` and the Colab secret, which a bare HF_TOKEN lookup misses.
-            try:
-                from huggingface_hub.utils import get_token
-
-                token = get_token()
-            except Exception:
-                token = None
-        if token:
-            request.add_header("Authorization", f"Bearer {token}")
+        # No credential is attached: urllib ignores HF_HUB_DISABLE_IMPLICIT_TOKEN and keeps
+        # `Authorization` across a cross-host 3xx, which HF_ENDPOINT mirrors really do send.
         deadline = time.monotonic() + PROBE_TIMEOUT_SECONDS
         with urllib.request.urlopen(request, timeout = PROBE_TIMEOUT_SECONDS) as response:
             if response.status != 200:
@@ -347,10 +338,11 @@ def _probe_cas_reachable_inner() -> "tuple[Optional[bool], str]":
         return (True, "Xet CAS reachable")
     except urllib.error.HTTPError as e:
         # The endpoint ANSWERED, which is all this probe measures.
-        if e.code == 404 or (e.code == 401 and not token):
-            # 404: the probe repo is not hosted here (mirror / on-prem), so do not pin to HTTP for
-            # 24h. 401 with no credentials sent: reachability proven, auth never attempted, so it
-            # says nothing about Xet. 403/407 still demote -- that is how a blocking proxy answers.
+        if e.code in (404, 401, 429):
+            # 404 mirror/on-prem, 401 auth never attempted, 429 throttling: none says anything
+            # about Xet, and the anonymous /api/ quota is 500 per 5min shared PER IP against
+            # 1,000 per user (huggingface.co/docs/hub/rate-limits), so one NAT exhausts it.
+            # 403/407 still demote -- that is how a blocking proxy answers.
             return (None, "Xet probe inconclusive on this endpoint; assuming Xet")
         return (False, f"Xet token endpoint returned HTTP {e.code}")
     except Exception as e:
