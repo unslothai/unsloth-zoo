@@ -4011,132 +4011,68 @@ class MLXTrainer:
         # HF cosine_warmup_with_min_lr uses (step + 1): optimization.py:400-406.
         step_offset = 1.0 if sched_type == "cosine_warmup_with_min_lr" else 0.0
 
-        def warmup_multiplier(step):
-            if warmup <= 0:
-                return mx.array(1.0, dtype=mx.float32)
-            if warmup_lr_rate is not None:
-                return mx.array(warmup_lr_rate, dtype=mx.float32) + mx.array(
-                    1.0 - warmup_lr_rate, dtype=mx.float32
-                ) * step / mx.array(max(warmup - 1, 1), dtype=mx.float32)
-            return (
-                step + mx.array(step_offset, dtype=mx.float32)
-            ) / mx.array(max(warmup, 1), dtype=mx.float32)
+        # Plain Python per step, like HF's lambdas: an mx graph here cost 20-40 op dispatches per
+        # optimizer step for a scalar, and float64 math is what HF evaluates.
+        decay_span = max(total_steps - warmup, 1)
+        timescale = shift = None
+        if sched_type == "inverse_sqrt":
+            # HF get_inverse_sqrt_schedule: timescale defaults to warmup, or 10_000 if 0.
+            timescale = max(float(knob("timescale", None, warmup if warmup > 0 else 10000)), 1e-8)
+            shift = timescale - warmup
 
-        def decay_progress(step):
-            return (
-                step
-                - mx.array(warmup, dtype=mx.float32)
-                + mx.array(step_offset, dtype=mx.float32)
-            ) / mx.array(max(total_steps - warmup, 1), dtype=mx.float32)
-
-        def schedule(step):
-            # HF Trainer LR parity; `step` is zero-based optimizer-step index.
-            step = mx.array(step).astype(mx.float32)
-            if warmup > 0:
-                warm_factor = warmup_multiplier(step)
+        def factor(step):
+            if step < warmup:
+                if warmup_lr_rate is not None:
+                    warm = warmup_lr_rate + (1.0 - warmup_lr_rate) * step / max(warmup - 1, 1)
+                else:
+                    warm = (step + step_offset) / max(warmup, 1)
                 if sched_type == "warmup_stable_decay":
                     # HF get_wsd_schedule offsets the warmup ramp by min_lr_rate.
-                    warm_factor = warm_factor * mx.array(
-                        1.0 - min_lr_rate, dtype=mx.float32
-                    ) + mx.array(min_lr_rate, dtype=mx.float32)
-                warm = mx.array(lr, dtype=mx.float32) * warm_factor
-            else:
-                warm = mx.array(lr, dtype=mx.float32)
-
-            progress = decay_progress(step)
+                    warm = warm * (1.0 - min_lr_rate) + min_lr_rate
+                return warm
+            progress = (step - warmup + step_offset) / decay_span
             if sched_type in ("cosine", "cosine_warmup_with_min_lr"):
-                decay = mx.array(0.5, dtype=mx.float32) * (
-                    mx.array(1.0, dtype=mx.float32)
-                    + mx.cos(
-                        mx.array(math.pi)
-                        * mx.array(num_cycles * 2.0, dtype=mx.float32)
-                        * progress
-                    )
-                )
+                decay = 0.5 * (1.0 + math.cos(math.pi * num_cycles * 2.0 * progress))
             elif sched_type == "cosine_with_restarts":
-                cycle_progress = (
-                    mx.array(num_cycles, dtype=mx.float32) * progress
-                )
-                cycle_progress = cycle_progress - mx.floor(cycle_progress)
-                decay = mx.array(0.5, dtype=mx.float32) * (
-                    mx.array(1.0, dtype=mx.float32) + mx.cos(
-                        mx.array(math.pi) * cycle_progress
-                    )
-                )
                 # HF returns 0 at progress 1 (optimization.py:181); a ragged last epoch reaches it.
-                decay = mx.where(
-                    progress >= mx.array(1.0, dtype=mx.float32),
-                    mx.array(0.0, dtype=mx.float32),
-                    decay,
-                )
+                if progress >= 1.0:
+                    decay = 0.0
+                else:
+                    cycle = num_cycles * progress
+                    decay = 0.5 * (1.0 + math.cos(math.pi * (cycle - math.floor(cycle))))
             elif sched_type == "linear":
-                decay = mx.array(1.0, dtype=mx.float32) - progress
+                decay = 1.0 - progress
             elif sched_type == "polynomial":
-                base = mx.maximum(
-                    mx.array(1.0, dtype=mx.float32) - progress,
-                    mx.array(0.0, dtype=mx.float32),
-                )
-                decay = mx.power(base, mx.array(power, dtype=mx.float32))
+                decay = max(1.0 - progress, 0.0) ** power
             elif sched_type == "inverse_sqrt":
-                # HF get_inverse_sqrt_schedule: timescale defaults to warmup, or 10_000 if 0.
-                timescale = knob("timescale", None, warmup if warmup > 0 else 10000)
-                timescale = max(float(timescale), 1e-8)
-                shift = timescale - warmup
-                post = mx.array(warmup, dtype=mx.float32) + progress * mx.array(
-                    max(total_steps - warmup, 1), dtype=mx.float32
-                )
-                arg = mx.maximum(
-                    (post + mx.array(shift, dtype=mx.float32))
-                    / mx.array(timescale, dtype=mx.float32),
-                    mx.array(1e-8, dtype=mx.float32),
-                )
-                decay = mx.array(1.0, dtype=mx.float32) / mx.sqrt(arg)
+                decay = 1.0 / math.sqrt(max((step + shift) / timescale, 1e-8))
             elif sched_type == "warmup_stable_decay":
-                # HF get_wsd_schedule (optimization.py:490-503); num_cycles is the wave count, not the window.
-                decay_frac = mx.array(wsd_decay_frac, dtype=mx.float32)
-                stable_end = mx.array(wsd_stable_frac, dtype=mx.float32)
-                in_stable = progress < stable_end
-                decay_progress_local = mx.clip(
-                    (progress - stable_end) / mx.maximum(
-                        decay_frac, mx.array(1e-8, dtype=mx.float32),
-                    ),
-                    mx.array(0.0, dtype=mx.float32),
-                    mx.array(1.0, dtype=mx.float32),
-                )
-                decay_phase = mx.array(0.5, dtype=mx.float32) * (
-                    mx.array(1.0, dtype=mx.float32)
-                    + mx.cos(
-                        mx.array(math.pi)
-                        * mx.array(num_cycles * 2.0, dtype=mx.float32)
-                        * decay_progress_local
-                    )
-                )
-                decay = mx.where(
-                    in_stable,
-                    mx.array(1.0, dtype=mx.float32),
-                    decay_phase,
-                )
+                # HF get_wsd_schedule (optimization.py:490-503); num_cycles is the wave count.
                 # Past the decay window HF returns the floor flat; clipping p would re-enter the cosine.
-                decay = mx.where(
-                    step >= mx.array(wsd_tail_start, dtype=mx.float32),
-                    mx.array(0.0, dtype=mx.float32),
-                    decay,
-                )
+                if step >= wsd_tail_start:
+                    decay = 0.0
+                elif progress < wsd_stable_frac:
+                    decay = 1.0
+                else:
+                    local = (progress - wsd_stable_frac) / max(wsd_decay_frac, 1e-8)
+                    local = min(max(local, 0.0), 1.0)
+                    decay = 0.5 * (1.0 + math.cos(math.pi * num_cycles * 2.0 * local))
             else:  # constant / constant_with_warmup
-                decay = mx.array(1.0, dtype=mx.float32)
-            decay = mx.maximum(decay, mx.array(0.0, dtype=mx.float32))
-            decay = decay * mx.array(1.0 - min_lr_rate, dtype=mx.float32) + mx.array(
-                min_lr_rate, dtype=mx.float32,
-            )
-            main = mx.array(lr, dtype=mx.float32) * decay
-            return mx.where(step < warmup, warm, main)
+                decay = 1.0
+            return max(decay, 0.0) * (1.0 - min_lr_rate) + min_lr_rate
+
+        def schedule(step):
+            # `step` is the zero-based optimizer-step index (int or scalar mx.array).
+            if not isinstance(step, (int, float)):
+                step = step.item()
+            return mx.array(lr * factor(float(step)), dtype=mx.float32)
 
         return schedule
 
     @staticmethod
     def _schedule_value(schedule, step):
         if callable(schedule):
-            return schedule(mx.array(step))
+            return schedule(int(step))
         return schedule
 
     def _set_optimizer_lr_for_step(self, optimizer, step):
