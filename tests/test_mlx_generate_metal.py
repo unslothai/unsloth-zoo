@@ -248,6 +248,100 @@ def test_vlm_batched_generation_is_ordered_and_aligned():
     assert all(r.text == "" or not r.text.startswith(results[0].text + results[1].text) for r in results)  # noqa: E501
 
 
+def _own_copy(value):
+    if isinstance(value, mx.array):
+        return value + 0
+    if isinstance(value, (list, tuple)):
+        return type(value)(_own_copy(item) for item in value)
+    if hasattr(value, "__dict__") and hasattr(type(value), "state"):
+        duplicate = type(value).__new__(type(value))
+        duplicate.__dict__.update({k: _own_copy(v) for k, v in vars(value).items()})
+        return duplicate
+    return value
+
+
+class _RowCacheState:
+    def __init__(self, cache, lengths=None):
+        self.cache, self.lengths, self.kept = cache, lengths, {}
+
+    def open(self, token_ids):
+        return self.cache, self.lengths or range(1, len(token_ids) + 1)
+
+    def checkpoint(self, token_count, cache):
+        self.kept[token_count] = _own_copy(cache)
+
+
+@metal_only
+def test_vlm_stream_rows_resume_from_their_own_cache_bitwise():
+    from mlx_vlm import load
+    from mlx_vlm.models.cache import make_prompt_cache
+    from mlx_vlm.prompt_utils import apply_chat_template
+    import mlx_vlm
+    from mlx.utils import tree_flatten
+    from packaging.version import Version
+    from PIL import Image
+    from unsloth_zoo.mlx.generate import (
+        BatchRowRefused, BatchStream, GenerationDefaults, GenerationRequest,
+        row_prompt_cache_unavailable_reason,
+    )
+    model, processor = load(VLM_MODEL)
+    model._is_vlm_model = True
+    assert row_prompt_cache_unavailable_reason() is None
+    rules = " ".join(f"Rule {i}: answer tersely." for i in range(420))
+    prompt = apply_chat_template(processor, model.config, f"Name a colour. {rules}", num_images=0)
+    state = _RowCacheState
+    lm = model.language_model
+
+    def run(*requests):
+        defaults = GenerationDefaults(max_tokens=12, prefill_batch_size=1, completion_batch_size=4)
+        with BatchStream(model, processor, defaults=defaults) as stream:
+            rows = [stream.add(request) for request in requests]
+            results = {}
+            while len(results) < len(rows):
+                results.update((e.index, e.result) for e in stream.step() if e.result is not None)
+        return [results[row] for row in rows]
+
+    cold_state = state(make_prompt_cache(lm))
+    (cold,) = run(GenerationRequest(prompt=prompt, prompt_cache_state=cold_state))
+    length, kept = cold.prompt_token_count, cold_state.kept
+    # Checkpoints land only where a prefill chunk ends: the 2048 grid, and from mlx-vlm 0.7.0,
+    # which chunks a tail shorter than a step, the held-back last token.
+    held_back = [length - 1] if Version(mlx_vlm.__version__) >= Version("0.7.0") else []
+    assert sorted(kept) == [*range(2048, length - 1, 2048), *held_back]
+    # Alone, as the cold row decoded: batched decode depends on what decodes beside a row.
+    for prefix in sorted(kept):
+        warm_state = state(_own_copy(kept[prefix]))
+        (warm,) = run(GenerationRequest(prompt=prompt, prompt_cache_state=warm_state))
+        assert (warm.token_ids, warm.logprobs) == (cold.token_ids, cold.logprobs)
+        assert (warm.cached_token_count, warm.prompt_token_count) == (prefix, length)
+        assert sorted(warm_state.kept) == [n for n in sorted(kept) if n > prefix]
+    # Rows decoding together keep their own caches and checkpoint only the lengths they ask for.
+    fruit = apply_chat_template(processor, model.config, f"Name a fruit. {rules}", num_images=0)
+    run(GenerationRequest(prompt=fruit, prompt_cache_state=(alone := state(make_prompt_cache(lm), {2048}))))
+    first, second = state(_own_copy(kept[2048]), {4096}), state(make_prompt_cache(lm), {2048})
+    rows = run(GenerationRequest(prompt=prompt, prompt_cache_state=first),
+               GenerationRequest(prompt=fruit, prompt_cache_state=second))
+    assert [row.cached_token_count for row in rows] == [2048, 0]
+    assert (sorted(first.kept), sorted(second.kept)) == ([4096], [2048])
+    states = lambda cache: [v for _, v in tree_flatten([entry.state for entry in cache])]
+    for got, want in ((first.kept[4096], kept[4096]), (second.kept[2048], alone.kept[2048])):
+        assert all(mx.array_equal(a, b).item() for a, b in zip(states(got), states(want), strict=True))
+    # Rows merge by cache class and keep the receiving cache's window.
+    for cache in (None, make_prompt_cache(lm, max_kv_size=8192)):
+        other = None if cache is None else state(cache)
+        with pytest.raises(BatchRowRefused, match="laid out unlike"):
+            run(GenerationRequest(prompt=prompt, prompt_cache_state=state(make_prompt_cache(lm, max_kv_size=4096))),
+                GenerationRequest(prompt=prompt, prompt_cache_state=other))
+    # FastVLM expands its image placeholder, so its ids cannot name cache offsets.
+    image = Image.new("RGB", (64, 64), (200, 40, 40))
+    pictured = apply_chat_template(processor, model.config, f"Describe it. {rules}", num_images=1)
+    cold_state = state(make_prompt_cache(lm))
+    run(GenerationRequest(prompt=pictured, image=image, prompt_cache_state=cold_state))
+    assert cold_state.kept == {}
+    with pytest.raises(BatchRowRefused, match="expands past"):
+        run(GenerationRequest(prompt=pictured, image=image, prompt_cache_state=state(_own_copy(kept[2048]))))
+
+
 @metal_only
 def test_vlm_stop_strings_cut_generation_through_the_public_path():
     from PIL import Image

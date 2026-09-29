@@ -432,6 +432,7 @@ jobs:
             tests/test_mlx_incomplete_config.py \
             tests/test_mlx_incomplete_config_vlm.py \
             tests/test_mlx_adam_epsilon.py \
+            tests/test_mlx_optimizer_torch_parity.py \
             tests/test_hf_xet_fallback.py \
             tests/test_hf_xet_fallback_blob_scoped_redownload.py \
             tests/test_llama_cpp_install_consent.py \
@@ -822,6 +823,19 @@ jobs:
             --require no-skips \
             --message "real mlx is installed but the numeric tests skipped"
 
+      - name: pytest tests/test_mlx_optimizer_defaults.py (HARD GATE)
+        # rmsprop/adamax/adagrad/adadelta defaults and Adamax bias correction vs torch.optim; shim cannot answer.
+        run: >-
+          .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_optimizer_defaults.py -v -rs
+          --junitxml="$RUNNER_TEMP/mlx-reports/optimizer_defaults.xml"
+
+      - name: Fail if the optimizer defaults tests skipped
+        run: |
+          python3 scripts/pytest_junit_gate.py \
+            --report "$RUNNER_TEMP/mlx-reports/optimizer_defaults.xml" \
+            --require no-skips \
+            --message "real mlx is installed but the optimizer defaults tests skipped"
+
       - name: pytest tests/test_mlx_gkd_loss.py (HARD GATE)
         run: >-
           .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_gkd_loss.py -v -rs
@@ -1161,6 +1175,7 @@ jobs:
                   tests/test_disable_compile_functions_reach_imported_helpers.py \
                   tests/test_data_dependent_helpers_not_fullgraph.py \
                   tests/test_decode_compile_disable.py \
+                  tests/test_eager_decode_bypass.py \
                   tests/test_temporary_patches_exhaustive.py \
                   tests/test_patch_keeps_module_name.py \
                   tests/test_mxfp4_load_path_layout.py \

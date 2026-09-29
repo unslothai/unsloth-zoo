@@ -2494,6 +2494,12 @@ def _model_logits(output):
     return output
 
 
+def _masked_correct(logits, targets, mask):
+    """Supervised positions whose argmax is the target (eval token accuracy)."""
+    hits = mx.logical_and(mx.argmax(logits, axis=-1) == targets, mask.astype(mx.bool_))
+    return hits.astype(mx.float32).sum()
+
+
 def make_baseline_loss_fn(label_smoothing=0.0):
     """Create a standard cross-entropy loss function (full logits via LM head).
 
@@ -2517,7 +2523,7 @@ def make_baseline_loss_fn(label_smoothing=0.0):
     else:
         _token_ce = nn.losses.cross_entropy
 
-    def loss_fn(model, batch, lengths, labels=None):
+    def loss_fn(model, batch, lengths, labels=None, return_correct=False):
         if labels is None:
             # Half-open [start, end) end-exclusive mask; matches CCE/labels paths
             # (:360, :393, :439) and mlx_lm's lengths convention.
@@ -2531,6 +2537,8 @@ def make_baseline_loss_fn(label_smoothing=0.0):
             # Raw ntoks (no safe denominator) to match mlx_lm default_loss
             # byte-for-byte; the safe wrapper stays on the labels-aware path.
             ce = ce.astype(mx.float32).sum() / ntoks
+            if return_correct:
+                return ce, ntoks, _masked_correct(logits, targets, mask)
             return ce, ntoks
         # labels-aware path: train_on_responses_only style masking.
         inputs = batch[:, :-1]
@@ -2552,8 +2560,11 @@ def make_baseline_loss_fn(label_smoothing=0.0):
         ce = _token_ce(logits, safe_targets) * mask
         ntoks = mask.sum()
         loss = ce.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
+        if return_correct:
+            return loss, ntoks, _masked_correct(logits, safe_targets, mask)
         return loss, ntoks
 
+    loss_fn._unsloth_token_accuracy = True
     return loss_fn
 
 
@@ -3067,7 +3078,7 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
     )
     _assistant_token_id = assistant_token_id
 
-    def loss_fn(model, batch_dict):
+    def loss_fn(model, batch_dict, return_correct=False):
         input_ids = batch_dict["input_ids"]
         pixel_values = batch_dict.get("pixel_values")
         attention_mask = batch_dict.get("attention_mask")
@@ -3180,9 +3191,12 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
         ce = nn.losses.cross_entropy(logits, safe_targets) * mask
         ntoks = mask.sum()
         loss = ce.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
+        if return_correct:
+            return loss, ntoks, _masked_correct(logits, safe_targets, mask)
         return loss, ntoks
 
     loss_fn._unsloth_cce_backend = "baseline-ce"
+    loss_fn._unsloth_token_accuracy = True
     return loss_fn
 
 

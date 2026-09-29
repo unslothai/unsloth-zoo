@@ -489,6 +489,28 @@ def test_hf_callbacks_receive_mlx_trainer_lifecycle(tmp_path):
 
 
 @metal_only
+def test_eval_reports_mean_token_accuracy_on_metal(tmp_path):
+    from transformers import TrainerCallback
+    from unsloth_zoo.mlx.utils import make_baseline_loss_fn
+
+    class Recorder(TrainerCallback):
+        metrics = None
+
+        def on_evaluate(self, args, state, control, metrics, **_kwargs):
+            self.metrics = dict(metrics)
+
+    recorder = Recorder()
+    trainer = _callback_trainer(tmp_path, [recorder], max_steps=1)
+    trainer.train()
+    _, ntoks, correct = make_baseline_loss_fn()(
+        trainer.model, *_callback_batch(), return_correct=True,
+    )
+    expected = correct.item() / ntoks.item()
+    assert 0.0 <= expected <= 1.0
+    assert recorder.metrics["eval_mean_token_accuracy"] == pytest.approx(expected)
+
+
+@metal_only
 def test_hf_callback_on_save_only_fires_for_checkpoints(tmp_path, monkeypatch):
     from pathlib import Path
     from transformers import TrainerCallback
@@ -936,6 +958,117 @@ def test_compiled_update_reuses_parameter_and_moment_buffers(quantized):
         assert peaks[1] < leaf / 8
     released = weakref.ref(trainer._build_optimizer(total_steps=3))
     assert released() is None
+
+
+@metal_only
+def test_layer_ordered_update_frees_gradients_during_backward():
+    import gc
+    from unsloth_zoo.mlx.trainer import _async_eval_by_layer, _donate_optimizer_state
+
+    class Net(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Linear(2048, 2048, bias=False)
+            self.layers = [nn.Linear(2048, 2048, bias=False) for _ in range(16)]
+
+        def __call__(self, x):
+            x = self.embed(x)
+            for layer in self.layers:
+                def block(params, x, layer=layer):
+                    layer.update(params)
+                    return x + nn.gelu(layer(x))
+                x = mx.checkpoint(block)(layer.trainable_parameters(), x)
+            return x
+
+    results, peaks = [], []
+    for ordered in (False, True):
+        mx.random.seed(5)
+        model = Net()
+        model.set_dtype(mx.bfloat16)
+        opt = _donate_optimizer_state(optim.AdamW(learning_rate=1e-3, weight_decay=0.0))
+        opt.init(model.trainable_parameters())
+        grad_fn = nn.value_and_grad(model, lambda m, x: m(x).astype(mx.float32).square().mean())
+        state = [model.state, opt.state]
+
+        def step(x):
+            loss, grads = grad_fn(model, x)
+            opt.update(model, grads)
+            return loss
+
+        step = mx.compile(step, inputs=state, outputs=state)
+        xs = [mx.random.normal((4096, 2048)).astype(mx.bfloat16) for _ in range(3)]
+        mx.eval(state, xs)
+        for x in xs:
+            gc.collect()
+            mx.synchronize()
+            resident = mx.get_active_memory()
+            mx.reset_peak_memory()
+            loss = step(x)
+            if ordered:
+                _async_eval_by_layer(model.trainable_parameters(), "layers.")
+            mx.eval(loss, state)
+            mx.synchronize()
+        peaks.append(mx.get_peak_memory() - resident)
+        results.append(tree_flatten(state))
+    for (name, left), (_, right) in zip(*results):
+        assert mx.array_equal(left, right).item(), name
+    layer_grads = 16 * 2048 * 2048 * 2
+    assert peaks[1] <= peaks[0] - 2 * layer_grads
+
+
+@metal_only
+def test_trainer_schedules_the_update_layer_by_layer(monkeypatch, tmp_path):
+    from unsloth_zoo.mlx import trainer as trainer_module
+
+    calls, schedule = [], trainer_module._async_eval_by_layer
+
+    def spy(tree, prefix):
+        if created:  # the first step's state must already be allocated
+            before = mx.get_active_memory()
+            mx.eval(created)
+            unallocated.append(mx.get_active_memory() - before)
+            created.clear()
+        params = tree_flatten(model.trainable_parameters())
+        is_params = all(a is b for (_, a), (_, b) in zip(tree_flatten(tree), params))
+        calls.append((tree, prefix, is_params))
+        schedule(tree, prefix)
+
+    monkeypatch.setattr(trainer_module, "_async_eval_by_layer", spy)
+    in_trace, created, unallocated, build = [], [], [], MLXTrainer._build_optimizer
+
+    def build_spy(self, total_steps):
+        optimizer = build(self, total_steps)
+        init = optimizer.init
+
+        def init_spy(parameters):
+            try:
+                mx.eval(tree_flatten(parameters)[0][1])
+                in_trace.append(False)
+            except ValueError:
+                in_trace.append(True)
+            init(parameters)
+            created.extend(a for _, a in tree_flatten(optimizer.state) if a.size > 1)
+
+        optimizer.init = init_spy
+        return optimizer
+
+    monkeypatch.setattr(MLXTrainer, "_build_optimizer", build_spy)
+    model, tokenizer = FastMLXModel.from_pretrained(
+        str(_tiny_base(tmp_path / "base")), load_in_4bit=False, max_seq_length=64,
+        full_finetuning=True,
+    )
+    MLXTrainer(model=model, tokenizer=tokenizer, train_dataset=_dataset(8), args=MLXTrainingConfig(
+        per_device_train_batch_size=2, gradient_accumulation_steps=2, max_steps=2,
+        output_dir=str(tmp_path / "out"), report_to="none",
+    )).train()
+    # Optimizer state is created before, not inside, the first compiled step.
+    assert in_trace == [False] and unallocated == [0]
+    assert {prefix for _, prefix, _ in calls} == {"model.layers."}
+    # Accumulation substeps schedule the accumulated gradient, update steps the parameters.
+    assert [is_params for _, _, is_params in calls] == [False, True, False, True]
+    trainable = {name for name, _ in tree_flatten(model.trainable_parameters())}
+    for tree, _, _ in calls:
+        assert {name for name, _ in tree_flatten(tree)} == trainable
 
 
 @metal_only

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import functools
 import importlib
 import inspect
 import textwrap
@@ -229,6 +230,14 @@ class GenerationRequest:
     ``logits_processors`` are this row's own ``(tokens, logits) -> logits`` callables,
     run in order on its slice before it draws, and shown the same history on every path
     so a row answers the same batched or alone. They keep state: never share them.
+
+    ``prompt_cache_state`` (a vision ``BatchStream`` row only) owns the row's cache.
+    ``open(token_ids)`` is handed the prepared prompt and returns ``(cache,
+    checkpoint_lengths)``: the cache the row prefills into, whose ``offset`` tokens are
+    reused rather than prefilled, and the prompt lengths at which ``checkpoint(
+    token_count, cache)`` is called with the live cache. A checkpoint fires only where a
+    prefill chunk ends; no chunk is reshaped to reach one. Rows decoding together merge
+    by cache class, so every row of one batch needs a state building the same layout.
     """
 
     prompt: str | None = None
@@ -238,8 +247,14 @@ class GenerationRequest:
     max_tokens: int | None = None
     sampling: SamplingParams | None = None
     logits_processors: Sequence[Callable[[Any, Any], Any]] | None = None
+    prompt_cache_state: Any | None = None
 
     def __post_init__(self):
+        state = self.prompt_cache_state
+        if state is not None and not all(
+            callable(getattr(state, name, None)) for name in ("open", "checkpoint")
+        ):
+            raise TypeError("prompt_cache_state must provide open() and checkpoint().")
         if self.logits_processors is None:
             return
         try:
@@ -262,6 +277,7 @@ class GenerationResult:
     finish_reason: Literal["stop", "length", "stop_string"]
     stop_match: str | None = None
     prompt_token_count: int = 0
+    cached_token_count: int = 0
 
 
 def _validate_positive_int(value: Any, name: str):
@@ -340,6 +356,11 @@ def _validate_text_requests(
             raise ValueError(
                 f"requests[{index}] includes media, but text models accept "
                 "text prompts only."
+            )
+        if request.prompt_cache_state is not None:
+            raise ValueError(
+                f"requests[{index}] carries a prompt_cache_state, which only a vision "
+                "BatchStream row takes."
             )
     _validate_text_defaults(defaults)
     return validated
@@ -1374,6 +1395,7 @@ class _PendingResult:
     detokenizer: Any
     scanner: _StopStringScanner
     prompt_token_count: int = 0
+    cached_token_count: int = 0
     token_ids: list[int] = field(default_factory=list)
     logprobs: list[float] = field(default_factory=list)
     text: str = ""
@@ -1442,6 +1464,7 @@ class _PendingResult:
             finish_reason=self.finish_reason,
             stop_match=self.stop_match,
             prompt_token_count=self.prompt_token_count,
+            cached_token_count=self.cached_token_count,
         )
 
 
@@ -2102,6 +2125,156 @@ def row_logits_processors_unavailable_reason() -> str | None:
     )
 
 
+_ROW_PREFILL_KEY = "_unsloth_row_prefill"
+_ROW_PREFILL_LOCK = threading.Lock()
+_MEDIA_TOKEN_ATTRS = ("image_token_id", "image_token_index", "video_token_id", "video_token_index")
+
+
+@dataclass
+class _RowPrefill:
+    """A row's own cache and checkpoints, carried to its prompt batch in its prompt kwargs."""
+
+    cache: list
+    prefix: int
+    checkpoint: Callable[[int, list], None]
+    lengths: frozenset[int]
+
+
+def _row_prefill_batch_class(base):
+    """``base`` that prefills a row carrying ``_ROW_PREFILL_KEY`` into the row's own cache.
+
+    mlx-vlm builds every cold prompt batch through its ``PromptProcessingBatch`` override
+    seam, so this class sees all of them; one without the key is built as ``base`` builds it.
+    """
+
+    class RowPrefillBatch(base):
+        def __init__(self, *args, **kwargs):
+            prompt_kwargs = kwargs.get("prompt_kwargs") or {}
+            row = prompt_kwargs.get(_ROW_PREFILL_KEY)
+            if row is not None:
+                if len(kwargs.get("uids") or ()) != 1 or kwargs.get("warm_cache") is not None:
+                    raise RuntimeError("A row carrying its own prompt cache must prefill alone.")
+                kwargs["prompt_kwargs"] = {
+                    key: value for key, value in prompt_kwargs.items() if key != _ROW_PREFILL_KEY
+                }
+                kwargs["warm_cache"] = row.cache
+            super().__init__(*args, **kwargs)
+            self._unsloth_row = row
+            self._unsloth_done = 0 if row is None else row.prefix
+
+        def prompt_step(self):
+            processed = super().prompt_step()
+            row = self._unsloth_row
+            if processed and row is not None:
+                self._unsloth_done += processed
+                if self._unsloth_done in row.lengths:
+                    row.checkpoint(self._unsloth_done, self.prompt_cache)
+            return processed
+
+    RowPrefillBatch.__name__ = RowPrefillBatch.__qualname__ = f"RowPrefill{base.__name__}"
+    RowPrefillBatch._unsloth_row_prefill_base = base
+    return RowPrefillBatch
+
+
+def _row_prefill_seam():
+    """The public module mlx-vlm reads the prompt-batch override from, and the class it holds."""
+    public = sys.modules.get("mlx_vlm.generate")
+    return public, getattr(public, "PromptProcessingBatch", None)
+
+
+@functools.lru_cache(maxsize=None)
+def _row_prefill_surface_gap(batch_module) -> str | None:
+    version = _installed_mlx_vlm_version()
+    try:
+        params = inspect.signature(batch_module.PromptProcessingBatch.__init__).parameters
+        admission = inspect.getsource(batch_module.BatchGenerator._next)
+    except (AttributeError, TypeError, ValueError, OSError):
+        return f"{version} exposes no prompt batch a row's own cache can enter"
+    helpers = ("_is_sequence_aligned_prompt_kwarg", "_slice_sequence_aligned_prompt_kwarg")
+    if (
+        "warm_cache" not in params
+        or "_generate_module_override" not in admission
+        or not all(callable(getattr(batch_module, name, None)) for name in helpers)
+    ):
+        return f"{version} cannot prefill a batched row into a cache the caller gives it"
+    return None
+
+
+def row_prompt_cache_unavailable_reason() -> str | None:
+    """Why a batched vision row here cannot start from, or checkpoint, its own prompt cache."""
+
+    try:
+        batch_module = _resolve_vlm_batch_module()
+    except Exception as refusal:
+        return str(refusal)
+    gap = _row_prefill_surface_gap(batch_module)
+    if gap is not None:
+        return gap
+    base = batch_module.PromptProcessingBatch
+    public, current = _row_prefill_seam()
+    if public is None or (
+        current is not base and getattr(current, "_unsloth_row_prefill_base", None) is not base
+    ):
+        return "mlx_vlm.generate.PromptProcessingBatch is overridden by something else"
+    return None
+
+
+def _install_row_prefill_batch(batch_module) -> None:
+    base = batch_module.PromptProcessingBatch
+    with _ROW_PREFILL_LOCK:
+        public, current = _row_prefill_seam()
+        if getattr(current, "_unsloth_row_prefill_base", None) is base:
+            return
+        if current is not base:
+            raise BatchRowRefused(
+                "mlx_vlm.generate.PromptProcessingBatch is overridden by something else"
+            )
+        public.PromptProcessingBatch = _row_prefill_batch_class(base)
+
+
+def _cache_layout(entries) -> tuple | None:
+    """What rows merge by: None for a cache mlx-vlm builds, else each entry's class, window and
+    quantization. Rows merge one at a time, so nothing downstream compares them."""
+    if entries is None:
+        return None
+    layout = []
+    for entry in entries:
+        nested = getattr(entry, "caches", None)
+        layout.append((
+            type(entry),
+            getattr(entry, "max_size", None),
+            getattr(entry, "keep", None),
+            # A quantized cache packs its state by these; rows merge into one packing.
+            getattr(entry, "bits", None),
+            getattr(entry, "group_size", None),
+            _cache_layout(nested) if isinstance(nested, (list, tuple)) else None,
+        ))
+    return tuple(layout)
+
+
+def _cache_offset(entries) -> int | None:
+    """Prompt tokens a cache holds: the first integer ``offset`` among its entries."""
+    for entry in entries:
+        offset = getattr(entry, "offset", None)
+        if isinstance(offset, Integral) and not isinstance(offset, bool):
+            return int(offset)
+        nested = getattr(entry, "caches", None)
+        if isinstance(nested, (list, tuple)):
+            found = _cache_offset(nested)
+            if found is not None:
+                return found
+    return None
+
+
+def _media_token_ids(config) -> set[int]:
+    ids = set()
+    for attr in _MEDIA_TOKEN_ATTRS:
+        value = config.get(attr) if isinstance(config, dict) else getattr(config, attr, None)
+        if value is not None:
+            ids.add(int(value))
+    return ids
+
+
 class _VLMBatchAdapter:
     """Event-level adapter over mlx-vlm's BatchGenerator.
 
@@ -2687,6 +2860,7 @@ class _VLMBatchSession:
             make_sampler = adapter.make_sampler,
         )
         self._row_signature = None
+        self._cache_layout = None
         self._pending: dict[int, _PendingResult] = {}
         self._row_of: dict[int, int] = {}
         self._uid_of: dict[int, int] = {}
@@ -2727,14 +2901,22 @@ class _VLMBatchSession:
             # batch is being built.
             raise BatchRowRefused(str(refusal)) from refusal
         token_ids = input_ids.tolist()
-        insert_kwargs = {
-            "prompt_kwargs": adapter._split_prompt_kwargs(prompt_kwargs, 1),
-        }
+        prefill, row_ids, row_kwargs = self._resume(request, token_ids[0], prompt_kwargs)
+        layout = None if prefill is None else _cache_layout(prefill.cache)
+        if self._pending and layout != self._cache_layout:
+            raise BatchRowRefused(
+                "This request's prompt cache is laid out unlike the caches of the rows "
+                "already decoding, and rows merge by cache class."
+            )
+        row_kwargs = adapter._split_prompt_kwargs(row_kwargs, 1)
+        if prefill is not None:
+            row_kwargs[0] = {**row_kwargs[0], _ROW_PREFILL_KEY: prefill}
+        insert_kwargs = {"prompt_kwargs": row_kwargs}
         if row_processors is not None:
             insert_kwargs["logits_processors"] = row_processors
         try:
             uids = self.generator.insert(
-                token_ids,
+                [row_ids],
                 [int(request.max_tokens or defaults.max_tokens)],
                 **insert_kwargs,
             )
@@ -2753,6 +2935,7 @@ class _VLMBatchSession:
                 ),
                 scanner = _StopStringScanner(defaults.stop_strings),
                 prompt_token_count = len(token_ids[0]),
+                cached_token_count = 0 if prefill is None else prefill.prefix,
             )
         except BaseException as active_error:
             try:
@@ -2775,7 +2958,70 @@ class _VLMBatchSession:
         self.sampler.register(uid, request.sampling or defaults.sampling)
         self._row_signature = _row_signature(
             prompt_kwargs, adapter.padded_prompt_kwargs)
+        self._cache_layout = layout
         return row
+
+    def _resume(self, request: GenerationRequest, token_ids: list[int], prompt_kwargs: dict):
+        """The row's prefill state and its inputs past the prefix its own cache holds.
+
+        The prompt is prepared whole and sliced, as mlx-vlm slices its own warm rows, so
+        per-row positions and per-layer inputs line up without re-deriving them.
+        """
+        state = request.prompt_cache_state
+        if state is None:
+            return None, token_ids, prompt_kwargs
+        reason = row_prompt_cache_unavailable_reason()
+        if reason is not None:
+            raise BatchRowRefused(reason)
+        if self.adapter.defaults.prefill_batch_size != 1:
+            raise BatchRowRefused(
+                "A row's own prompt cache needs prefill_batch_size=1: rows prefilled "
+                "together share one cache."
+            )
+        cache, lengths = state.open(list(token_ids))
+        cache = list(cache)
+        prefix = _cache_offset(cache)
+        if prefix is None:
+            raise BatchRowRefused("This request's prompt cache holds no offset to resume from.")
+        embeds = prompt_kwargs.get("inputs_embeds")
+        # A cache offset counts embedding columns, which the ids name only when media did not
+        # expand past its placeholders.
+        addressed = embeds is None or embeds.shape[1] == len(token_ids)
+        if prefix and not addressed:
+            raise BatchRowRefused(
+                "This request's media expands past its prompt tokens, so its prompt cache "
+                "cannot be resumed by them."
+            )
+        if prefix >= len(token_ids):
+            raise BatchRowRefused(
+                f"This request's prompt cache holds {prefix} of its {len(token_ids)} prompt "
+                "tokens; at least the last one must be prefilled."
+            )
+        media = _media_token_ids(getattr(self.adapter.model, "config", None))
+        if prefix and any(token in media for token in token_ids[prefix:]):
+            raise BatchRowRefused(
+                "This request's prompt cache ends before its media tokens; a resumed "
+                "row prefills text only."
+            )
+        batch_module = self.adapter.batch_module
+        _install_row_prefill_batch(batch_module)
+        prefill = _RowPrefill(
+            cache = cache,
+            prefix = prefix,
+            checkpoint = state.checkpoint,
+            lengths = frozenset(int(length) for length in lengths) if addressed else frozenset(),
+        )
+        if not prefix:
+            return prefill, token_ids, prompt_kwargs
+        aligned = batch_module._is_sequence_aligned_prompt_kwarg
+        sliced = {}
+        for key, value in prompt_kwargs.items():
+            if key == "inputs_embeds":
+                value = value[:, prefix:]
+            elif hasattr(value, "shape") and aligned(key, value, len(token_ids)):
+                value = batch_module._slice_sequence_aligned_prompt_kwarg(key, value, start = prefix)
+            sliced[key] = value
+        return prefill, token_ids[prefix:], sliced
 
     def cancel(self, row: int) -> bool:
         return self._take_back(row) is not None
@@ -3263,6 +3509,11 @@ def _stream_batch(
     )
     if is_vlm and (gap := _vlm_quantized_cache_gap(model, defaults)) is not None:
         raise ValueError(gap)
+    if any(request.prompt_cache_state is not None for request in validated):
+        raise ValueError(
+            "A prompt_cache_state is taken only by a BatchStream row; batched "
+            "generation builds its own caches."
+        )
     if not validated:
         return
     if is_vlm:
@@ -3367,6 +3618,7 @@ __all__ = [
     "generate_batch",
     "generation_mode",
     "row_logits_processors_unavailable_reason",
+    "row_prompt_cache_unavailable_reason",
     "stream_batch",
     "stream_unavailable_reason",
     "vlm_batch_adds_special_tokens",
