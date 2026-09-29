@@ -14,35 +14,15 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Off-policy knowledge distillation (GKD) for the MLX trainer.
+"""Off-policy knowledge distillation (GKD) for the MLX trainer: a frozen teacher
+scores the student's batch and the student trains on TRL's generalized JSD."""
 
-A frozen teacher scores the student's own batch; the student trains against its
-distribution with TRL's generalized Jensen-Shannon divergence.
-
-Three things were established by measurement. Read before changing them.
-
-1. TEACHER AND STUDENT MUST SHARE A TOKENIZER. Matching ``vocab_size`` is NOT
-   enough: two checkpoints can share a width while encoding text differently,
-   which trains against misaligned targets with no error at all. So probe-encoded
-   ids are compared too. Verified: Qwen2.5-0.5B <- Qwen2.5-3B, Llama-3.2-1B <-
-   Llama-3.2-3B, Qwen3-0.6B <- Qwen2.5-3B (agree across generations). Llama <->
-   Qwen fails the width check.
-
-2. THE LOSS IS CHUNKED BY DEFAULT. It materializes several [batch, seq, vocab]
-   float32 tensors and vocab is ~152k for Qwen. Chunking took a measured
-   batch=2/seq=1024 step from 17.39 GB (crashes on 16 GB) to 15.29 GB. The
-   unchunked path exists only so a test can assert the two agree.
-
-3. OVERSIZED BATCHES DO NOT RAISE A CATCHABLE OOM. They abort with
-   ``[METAL] Command buffer execution failed: Impacting Interactivity`` and wedge
-   the GPU context for later runs, so ``preflight_memory`` estimates up front
-   instead. Its estimator is pure, hence testable without MLX.
-"""
-
-# Bind MLX at import, NOT inside functions: a deferred `import mlx.core` resolves
-# against sys.modules at call time, so tests/mlx_simulation's stub would win.
+# Bound at import: a deferred `import mlx.core` would resolve to the
+# tests/mlx_simulation stub once that has replaced sys.modules["mlx.core"].
 import mlx.core as mx
 import mlx.nn as nn
+
+from .utils import _model_logits
 
 __all__ = [
     "generalized_jsd_loss",
@@ -58,21 +38,16 @@ __all__ = [
     "MEMORY_SAFETY_FRACTION",
 ]
 
-# Sequence positions per chunk; larger trades memory for fewer kernel launches.
 DEFAULT_CHUNK_SIZE = 128
 
-# Peak as a multiple of one teacher-logit buffer (batch*seq*vocab*4). Fitted on a
-# Qwen2.5-0.5B student + Qwen2.5-3B teacher (vocab 151936):
-#   unchunked 1/512 -> 7.47 GB, 2/512 -> 12.05 GB, 2/1024 -> 17.39 GB
-#   chunked   2/512 -> 10.46 GB, 2/1024 -> 15.29 GB
-# Rounded UP: under-estimating lets the process wedge Metal.
+# Peak as a multiple of one batch*seq*vocab float32 logit buffer, fitted on a
+# Qwen2.5-0.5B student + Qwen2.5-3B teacher and rounded up: an oversized step
+# does not raise, it aborts with "[METAL] Command buffer execution failed" and
+# wedges the GPU context.
 NAIVE_ACTIVATION_MULTIPLIER = 16.0
 CHUNKED_ACTIVATION_MULTIPLIER = 13.0
-
-# Never plan to fill RAM. Unified memory is shared with the OS and display.
 MEMORY_SAFETY_FRACTION = 0.85
 
-# Varied probes: plain text, control tokens, whitespace-heavy code, non-ASCII.
 TOKENIZER_PROBES = (
     "The capital of France is Paris.",
     "user\nhi\nassistant\n",
@@ -88,18 +63,17 @@ def _kl_divergence_log_target(input_log_probs, target_log_probs):
 
 
 def _jsd_per_position(student_logits, teacher_logits, beta, temperature):
-    """Divergence summed over the vocab axis, one value per (batch, position)."""
-    student_log_probs = nn.log_softmax(student_logits / temperature, axis=-1)
-    teacher_log_probs = nn.log_softmax(teacher_logits / temperature, axis=-1)
+    # float32: the mixture is a logaddexp of two near-equal terms that the outer
+    # combination then subtracts, which bf16 cannot resolve.
+    student_log_probs = nn.log_softmax(student_logits.astype(mx.float32) / temperature, axis=-1)
+    teacher_log_probs = nn.log_softmax(teacher_logits.astype(mx.float32) / temperature, axis=-1)
 
     if beta == 0.0:
-        # Forward KL: classic KD.
         per_token = _kl_divergence_log_target(student_log_probs, teacher_log_probs)
     elif beta == 1.0:
-        # Reverse KL: mode-seeking; does NOT minimise forward KL.
         per_token = _kl_divergence_log_target(teacher_log_probs, student_log_probs)
     else:
-        beta_array = mx.array(beta, dtype=student_log_probs.dtype)
+        beta_array = mx.array(beta, dtype=mx.float32)
         mixture_log_probs = mx.logaddexp(
             student_log_probs + mx.log(1 - beta_array),
             teacher_log_probs + mx.log(beta_array),
@@ -119,12 +93,9 @@ def generalized_jsd_loss(
     temperature = 1.0,
     chunk_size = DEFAULT_CHUNK_SIZE,
 ):
-    """TRL's ``GKDTrainer.generalized_jsd_loss`` ported to MLX.
-
-    ``beta`` 0 is forward KL, 1 reverse KL, between interpolates via the log-space
-    mixture. -100 labels are excluded. ``chunk_size`` splits the sequence axis so
-    only ``[batch, chunk, vocab]`` is alive at once; 0 (unchunked) exists for the
-    equivalence test and costs ~2 GB more at batch=2/seq=1024."""
+    """TRL's ``GKDTrainer.generalized_jsd_loss`` in MLX: beta 0 is forward KL,
+    1 reverse KL; -100 labels are excluded; ``chunk_size`` positions at a time
+    (0 = unchunked)."""
     if labels is None:
         mask = mx.ones(student_logits.shape[:2])
     else:
@@ -132,7 +103,7 @@ def generalized_jsd_loss(
     denominator = mx.maximum(mask.sum(), 1)
 
     sequence_length = student_logits.shape[1]
-    if chunk_size is None or chunk_size <= 0 or chunk_size >= sequence_length:
+    if not _is_chunked(chunk_size, sequence_length):
         per_position = _jsd_per_position(student_logits, teacher_logits, beta, temperature)
         return (per_position * mask).sum() / denominator
 
@@ -149,12 +120,14 @@ def generalized_jsd_loss(
     return total / denominator
 
 
+def _is_chunked(chunk_size, sequence_length):
+    return chunk_size is not None and 0 < chunk_size < sequence_length
+
+
 def assert_tokenizers_compatible(student_tokenizer, teacher_tokenizer,
                                  student_vocab_size = None, teacher_vocab_size = None):
-    """Raise unless the tokenizers are interchangeable.
-
-    Width first (a mismatch surfaces as an opaque broadcast_shapes failure), then
-    probe ids, because equal widths alone still permit misaligned targets."""
+    """Raise unless the vocab widths match and both tokenizers encode the probes
+    identically: equal widths alone still permit misaligned targets."""
     if (student_vocab_size is not None and teacher_vocab_size is not None
             and student_vocab_size != teacher_vocab_size):
         raise ValueError(
@@ -164,6 +137,8 @@ def assert_tokenizers_compatible(student_tokenizer, teacher_tokenizer,
             "remapping, which is not implemented. Pick a teacher from the "
             "student's family (e.g. Qwen2.5-3B for a Qwen2.5/Qwen3 student)."
         )
+    if student_tokenizer is None or teacher_tokenizer is None:
+        return True
 
     for probe in TOKENIZER_PROBES:
         student_ids = student_tokenizer.encode(probe)
@@ -183,8 +158,6 @@ def assert_tokenizers_compatible(student_tokenizer, teacher_tokenizer,
 def estimate_distillation_peak_bytes(batch_size, sequence_length, vocab_size,
                                      resident_bytes, chunked = True,
                                      bytes_per_element = 4):
-    """Estimated peak bytes for one step: resident weights plus a multiple of one
-    teacher-logit buffer. Pure arithmetic, so testable without MLX."""
     logit_buffer = batch_size * sequence_length * vocab_size * bytes_per_element
     multiplier = CHUNKED_ACTIVATION_MULTIPLIER if chunked else NAIVE_ACTIVATION_MULTIPLIER
     return int(resident_bytes + multiplier * logit_buffer)
@@ -192,7 +165,6 @@ def estimate_distillation_peak_bytes(batch_size, sequence_length, vocab_size,
 
 def largest_tokens_that_fit(vocab_size, resident_bytes, budget_bytes,
                             chunked = True, bytes_per_element = 4):
-    """Largest batch*sequence token count that fits in ``budget_bytes``."""
     multiplier = CHUNKED_ACTIVATION_MULTIPLIER if chunked else NAIVE_ACTIVATION_MULTIPLIER
     headroom = budget_bytes - resident_bytes
     if headroom <= 0:
@@ -203,12 +175,8 @@ def largest_tokens_that_fit(vocab_size, resident_bytes, budget_bytes,
 def preflight_memory(batch_size, sequence_length, vocab_size, resident_bytes,
                      system_bytes, chunked = True, bytes_per_element = 4,
                      skip = False):
-    """Raise before the first step if this configuration cannot fit.
-
-    An oversized step does not raise a catchable OOM; it aborts with
-    ``[METAL] Command buffer execution failed`` and wedges the GPU context.
-    ``skip=True`` downgrades the refusal to a warning: the estimator is
-    conservative, so refusing with no recourse would be wrong."""
+    """Raise before the first step if this configuration cannot fit; ``skip``
+    downgrades the refusal to a warning since the estimate is conservative."""
     budget = int(system_bytes * MEMORY_SAFETY_FRACTION)
     estimate = estimate_distillation_peak_bytes(
         batch_size, sequence_length, vocab_size, resident_bytes,
@@ -249,13 +217,13 @@ def preflight_memory(batch_size, sequence_length, vocab_size, resident_bytes,
         f"  largest that fits at vocab {vocab_size}: "
         f"{max_tokens} tokens (e.g. batch_size=1 x seq_len={max_tokens})\n"
         "Reduce per_device_train_batch_size or max_seq_length, or use a smaller "
-        "teacher. Proceeding would abort the process with a Metal command-buffer "
-        "failure rather than a recoverable error."
+        "teacher, or set gkd_skip_memory_preflight=True. Proceeding would abort "
+        "the process with a Metal command-buffer failure rather than a "
+        "recoverable error."
     )
 
 
 def validate_gkd_config(gkd_beta, gkd_temperature, gkd_lmbda):
-    """Config gate. Pure, so the Linux gate can execute it."""
     if not (0.0 <= gkd_beta <= 1.0):
         raise ValueError(
             f"Unsloth: gkd_beta must be in [0, 1], got {gkd_beta}. 0 is forward KL "
@@ -277,8 +245,7 @@ def validate_gkd_config(gkd_beta, gkd_temperature, gkd_lmbda):
 
 
 def load_teacher(model_name_or_path):
-    """Load and freeze a teacher, asserting it contributes no trainable state:
-    it must stay out of trainable_parameters, optimizer state and mx.compile."""
+    """Load a teacher (mlx_lm.load returns it in eval mode) and freeze it."""
     from mlx.utils import tree_flatten
     from mlx_lm import load
 
@@ -294,29 +261,24 @@ def load_teacher(model_name_or_path):
     return teacher, teacher_tokenizer
 
 
-def build_gkd_loss_fn(student_model, teacher_model, args, is_vlm,
-                      vocab_size, resident_bytes, system_bytes):
-    """Loss fn matching the trainer's ``(model, batch, lengths, labels=None) ->
-    (loss, ntoks)`` contract. The teacher runs under ``stop_gradient``."""
+def build_gkd_loss_fn(teacher_model, args, vocab_size, batch_size,
+                      resident_bytes, system_bytes):
+    """Loss fn with the trainer's ``(model, batch, lengths, labels=None) ->
+    (loss, ntoks)`` contract; the teacher runs under ``stop_gradient``."""
     beta = float(getattr(args, "gkd_beta", 0.5))
     temperature = float(getattr(args, "gkd_temperature", 1.0))
     chunk_size = int(getattr(args, "gkd_chunk_size", DEFAULT_CHUNK_SIZE))
     validate_gkd_config(beta, temperature, getattr(args, "gkd_lmbda", 0.0))
 
-    if is_vlm:
-        raise ValueError(
-            "Unsloth: GKD distillation is text-only on MLX. The teacher would "
-            "need the student's exact image preprocessing for its logits to line "
-            "up, which is not implemented."
-        )
-
+    # max_seq_length bounds the widest padded batch, so this is an upper bound.
+    sequence_length = int(getattr(args, "max_seq_length", 512))
     preflight_memory(
-        batch_size = int(getattr(args, "per_device_train_batch_size", 1)),
-        sequence_length = int(getattr(args, "max_seq_length", 512)),
+        batch_size = batch_size,
+        sequence_length = sequence_length,
         vocab_size = vocab_size,
         resident_bytes = resident_bytes,
         system_bytes = system_bytes,
-        chunked = chunk_size > 0,
+        chunked = _is_chunked(chunk_size, sequence_length),
         skip = bool(getattr(args, "gkd_skip_memory_preflight", False)),
     )
 
@@ -329,8 +291,8 @@ def build_gkd_loss_fn(student_model, teacher_model, args, is_vlm,
         else:
             shifted_labels = labels[:, 1:]
             mask = (shifted_labels != -100)
-        student_logits = model(inputs)
-        teacher_logits = mx.stop_gradient(teacher_model(inputs))
+        student_logits = _model_logits(model(inputs))
+        teacher_logits = mx.stop_gradient(_model_logits(teacher_model(inputs)))
         loss = generalized_jsd_loss(
             student_logits, teacher_logits, shifted_labels,
             beta = beta, temperature = temperature, chunk_size = chunk_size,
@@ -339,19 +301,3 @@ def build_gkd_loss_fn(student_model, teacher_model, args, is_vlm,
 
     loss_fn._unsloth_gkd = True
     return loss_fn
-
-# Unsloth Zoo - Utilities for Unsloth
-# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Lesser General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU Lesser General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.

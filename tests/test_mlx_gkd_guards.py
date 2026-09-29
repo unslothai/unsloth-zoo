@@ -14,13 +14,8 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""GKD guards: tokenizer compatibility, config validation, memory preflight.
-
-Pure logic, so this runs under the torch shim on Linux CI instead of skipping.
-The preflight numbers are measured on a Qwen2.5-0.5B student + Qwen2.5-3B teacher
-(vocab 151936, 2.881 GB resident) on a 16 GB machine: an oversized step aborts
-with "[METAL] Command buffer execution failed" and wedges the GPU context.
-"""
+"""GKD guards under the torch shim. Preflight figures: Qwen2.5-0.5B student +
+Qwen2.5-3B teacher (vocab 151936, 2.881 GB resident) on a 16 GB Mac."""
 
 import pytest
 
@@ -50,7 +45,6 @@ class FakeTokenizer:
         return [ord(c) + self.offset for c in text]
 
 
-# --- tokenizer compatibility -------------------------------------------------
 def test_identical_tokenizers_pass():
     d = _distill()
     assert d.assert_tokenizers_compatible(FakeTokenizer(), FakeTokenizer(), VOCAB, VOCAB)
@@ -62,8 +56,14 @@ def test_width_mismatch_is_rejected():
         d.assert_tokenizers_compatible(FakeTokenizer(), FakeTokenizer(), 128256, 151936)
 
 
+def test_width_mismatch_is_rejected_without_tokenizers():
+    d = _distill()
+    with pytest.raises(ValueError, match="logit widths differ"):
+        d.assert_tokenizers_compatible(None, FakeTokenizer(), 128256, 151936)
+    assert d.assert_tokenizers_compatible(None, FakeTokenizer(), VOCAB, VOCAB)
+
+
 def test_width_matches_but_ids_differ_is_rejected():
-    """Same vocab size, different encodings: a width-only check misses this."""
     d = _distill()
     with pytest.raises(ValueError, match="encode text differently"):
         d.assert_tokenizers_compatible(FakeTokenizer(0), FakeTokenizer(1), VOCAB, VOCAB)
@@ -76,7 +76,6 @@ def test_probe_set_covers_more_than_plain_ascii():
     assert "\n" in joined and "#" in joined
 
 
-# --- config validation -------------------------------------------------------
 @pytest.mark.parametrize("beta", [0.0, 0.5, 1.0])
 def test_valid_beta_accepted(beta):
     assert _distill().validate_gkd_config(beta, 1.0, 0.0)
@@ -95,12 +94,10 @@ def test_non_positive_temperature_rejected(temperature):
 
 
 def test_on_policy_lmbda_rejected_with_reason():
-    """On-policy needs generation in the loop, which the MLX trainer lacks."""
     with pytest.raises(ValueError, match="generation inside the training loop"):
         _distill().validate_gkd_config(0.5, 1.0, 0.5)
 
 
-# --- memory preflight --------------------------------------------------------
 def test_preflight_allows_batch2_seq512():
     """Measured 10.16 GB on 16 GB: must not be rejected."""
     d = _distill()
@@ -126,10 +123,10 @@ def test_preflight_message_names_everything_needed_to_act():
         d.preflight_memory(4, 512, VOCAB, RESIDENT, SYSTEM_16GB, chunked=True)
     message = str(excinfo.value)
     assert "batch_size=4" in message and "seq_len=512" in message
-    assert "2048 tokens" in message              # requested B*L
+    assert "2048 tokens" in message
     assert "estimated peak" in message
-    assert "16.00 GB" in message                 # detected system memory
-    assert f"vocab {VOCAB}" in message           # largest that fits, at this width
+    assert "16.00 GB" in message
+    assert f"vocab {VOCAB}" in message
     assert "tokens (e.g. batch_size=1" in message
 
 
@@ -142,7 +139,6 @@ def test_chunked_is_cheaper_than_unchunked_in_the_estimate():
 
 
 def test_largest_tokens_that_fit_is_consistent_with_preflight():
-    """What the message advertises as fitting must pass preflight."""
     d = _distill()
     budget = int(SYSTEM_16GB * d.MEMORY_SAFETY_FRACTION)
     max_tokens = d.largest_tokens_that_fit(VOCAB, RESIDENT, budget, chunked=True)
@@ -153,7 +149,6 @@ def test_largest_tokens_that_fit_is_consistent_with_preflight():
 
 
 def test_skip_override_bypasses_the_raise_and_warns():
-    """The estimator is conservative, so an override must exist -- loudly."""
     d = _distill()
     with pytest.warns(UserWarning) as record:
         estimate = d.preflight_memory(
@@ -164,12 +159,11 @@ def test_skip_override_bypasses_the_raise_and_warns():
     )
     message = str(record[0].message)
     assert "gkd_skip_memory_preflight=True" in message
-    assert "Command buffer execution failed" in message   # names the wedge risk
-    assert "estimated at" in message                       # names the estimate
+    assert "Command buffer execution failed" in message
+    assert "estimated at" in message
 
 
 def test_skip_override_does_not_warn_when_it_already_fits():
-    """No warning for a config that was never going to be refused."""
     import warnings
     d = _distill()
     with warnings.catch_warnings():
@@ -190,6 +184,19 @@ def test_larger_system_memory_allows_more():
     assert d.preflight_memory(4, 512, VOCAB, RESIDENT, 64 * GB, chunked=True)
 
 
+def test_chunk_size_at_or_above_seq_len_is_budgeted_unchunked():
+    """chunk_size >= max_seq_length takes the unchunked loss branch at runtime."""
+    from types import SimpleNamespace
+    d = _distill()
+    def build(chunk):
+        args = SimpleNamespace(max_seq_length=1300, gkd_chunk_size=chunk)
+        return d.build_gkd_loss_fn(None, args, VOCAB, 1, RESIDENT, SYSTEM_16GB)
+    assert callable(build(128))
+    for chunk in (0, 1300, 4096):
+        with pytest.raises(ValueError, match="unchunked loss"):
+            build(chunk)
+
+
 def test_config_fields_exist_and_are_inert_by_default():
     import dataclasses
     from unsloth_zoo.mlx.trainer import MLXTrainingConfig, _MLX_CONFIG_OPTIONAL_COPY_FIELDS
@@ -199,10 +206,8 @@ def test_config_fields_exist_and_are_inert_by_default():
         assert field in names
         assert field in _MLX_CONFIG_OPTIONAL_COPY_FIELDS
     config = MLXTrainingConfig()
-    assert config.teacher_model_name_or_path is None   # inert unless set
-    assert config.gkd_lmbda == 0.0                     # off-policy default
-    assert config.gkd_chunk_size > 0                   # chunked by DEFAULT
-    assert config.gkd_skip_memory_preflight is False   # preflight ON by default
-    # The GKD fields must remain an exact suffix: the initializer binds
-    # positional args by field order.
+    assert config.teacher_model_name_or_path is None
+    assert config.gkd_lmbda == 0.0
+    assert config.gkd_chunk_size > 0
+    assert config.gkd_skip_memory_preflight is False
     assert names[-6:] == list(_MLX_CONFIG_OPTIONAL_COPY_FIELDS)[-6:]

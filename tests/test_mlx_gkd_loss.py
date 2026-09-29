@@ -14,18 +14,13 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Numerics for the GKD divergence: does the student actually move to the teacher?
-
-Every training assertion also reports a divergence-to-teacher number, because a
-loss can fall while the student drifts away from the target (reverse KL does
-exactly that to forward KL). Real MLX required, so this skips on Linux.
-"""
+"""GKD divergence numerics on real MLX (the mlx-cpu lane runs them on Linux)."""
 
 import pytest
 
-mx = pytest.importorskip("mlx.core", reason="MLX is only available on Apple Silicon")
-nn = pytest.importorskip("mlx.nn", reason="MLX is only available on Apple Silicon")
-optim = pytest.importorskip("mlx.optimizers", reason="MLX is only available on Apple Silicon")
+mx = pytest.importorskip("mlx.core", reason="needs real MLX")
+nn = pytest.importorskip("mlx.nn", reason="needs real MLX")
+optim = pytest.importorskip("mlx.optimizers", reason="needs real MLX")
 
 from unsloth_zoo.mlx.distill import (
     DEFAULT_CHUNK_SIZE,
@@ -93,7 +88,8 @@ def _train(student, teacher_logits, ids, labels, beta, steps=STEPS, chunk_size=D
 
 @pytest.mark.parametrize("beta,direction", [(0.0, "forward"), (0.5, "forward"), (1.0, "reverse")])
 def test_student_moves_toward_teacher(beta, direction):
-    """Loss falls AND the divergence to the teacher falls."""
+    """Loss falls AND the divergence to the teacher falls: reverse KL can lower
+    the loss while forward KL rises."""
     teacher_logits, labels, ids = _fixture()
     student = _new_student()
     before = _masked_divergence(student(ids), teacher_logits, labels, direction)
@@ -111,7 +107,6 @@ def test_student_moves_toward_teacher(beta, direction):
 
 
 def test_chunked_matches_unchunked_numerically():
-    """Chunking is the default, so it must match the naive computation."""
     teacher_logits, labels, ids = _fixture()
     student = _new_student()
     logits = student(ids)
@@ -126,7 +121,6 @@ def test_chunked_matches_unchunked_numerically():
 
 
 def test_chunked_and_unchunked_train_identically():
-    """Gradients must agree too, not just values."""
     teacher_logits, labels, ids = _fixture()
     naive = _train(_new_student(), teacher_logits, ids, labels, 0.5, chunk_size=0)
     chunked = _train(_new_student(), teacher_logits, ids, labels, 0.5, chunk_size=8)
@@ -151,6 +145,18 @@ def test_labels_mask_is_honoured():
     )
 
 
+@pytest.mark.parametrize("beta", [0.0, 0.5, 1.0])
+def test_half_precision_logits_are_reduced_in_float32(beta):
+    """bf16 log-probs made the beta=0.5 mixture loss ~9x off near convergence."""
+    teacher_logits, labels, _ = _fixture()
+    student_logits = teacher_logits + 0.05 * mx.random.normal(teacher_logits.shape, key=mx.random.key(1))
+    s16, t16 = student_logits.astype(mx.bfloat16), teacher_logits.astype(mx.bfloat16)
+    reference = generalized_jsd_loss(s16.astype(mx.float32), t16.astype(mx.float32), labels, beta=beta)
+    got = generalized_jsd_loss(s16, t16, labels, beta=beta)
+    assert got.dtype == mx.float32
+    assert abs(float(got) - float(reference)) <= 1e-3 * abs(float(reference))
+
+
 def test_identical_distributions_give_zero_loss():
     teacher_logits, labels, _ = _fixture()
     for beta in (0.0, 0.5, 1.0):
@@ -168,7 +174,6 @@ def test_temperature_is_wired():
 
 
 def test_beta_endpoints_are_asymmetric():
-    """beta=0 and beta=1 are different divergences, not the same number."""
     teacher_logits, labels, ids = _fixture()
     logits = _new_student()(ids)
     forward = float(generalized_jsd_loss(logits, teacher_logits, labels, beta=0.0))

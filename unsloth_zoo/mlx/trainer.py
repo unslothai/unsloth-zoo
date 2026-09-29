@@ -1167,7 +1167,6 @@ _MLX_CONFIG_OPTIONAL_COPY_FIELDS = (
     "streaming_prefetch_batches",
     "logging_dir",
     "run_name",
-    # Off-policy knowledge distillation (GKD); see unsloth_zoo/mlx/distill.py.
     "teacher_model_name_or_path",
     "gkd_beta",
     "gkd_temperature",
@@ -1303,14 +1302,13 @@ class MLXTrainingConfig:
     logging_dir: str | None = None
     run_name: str | None = None
 
-    # GKD. teacher_model_name_or_path switches the loss; inert while None.
-    # Appended LAST for the positional-index reason as the fields above.
+    # GKD (unsloth_zoo/mlx/distill.py), inert while teacher_model_name_or_path
+    # is None. Appended LAST for the same positional-index reason.
     teacher_model_name_or_path: str | None = None
-    gkd_beta: float = 0.5          # 0 = forward KL (classic KD), 1 = reverse KL
+    gkd_beta: float = 0.5
     gkd_temperature: float = 1.0
-    gkd_lmbda: float = 0.0         # non-zero selects on-policy KD: not supported
-    gkd_chunk_size: int = 128      # sequence positions per loss chunk; 0 = unchunked
-    # Escape hatch: the preflight is conservative and can reject a config that fits.
+    gkd_lmbda: float = 0.0
+    gkd_chunk_size: int = 128
     gkd_skip_memory_preflight: bool = False
 
     def __init__(self, *args, **kwargs):
@@ -5308,27 +5306,44 @@ class MLXTrainer:
         _vlm_ignore_token_ids = None
 
         if preference_kind:
+            if getattr(args, "teacher_model_name_or_path", None):
+                raise ValueError(
+                    "Unsloth: teacher_model_name_or_path (GKD) cannot be combined "
+                    "with a preference objective."
+                )
             loss_fn = None
         elif getattr(args, "teacher_model_name_or_path", None):
             # KD replaces the loss, so branch before the CCE/baseline selection.
             import psutil as _psutil
-            from .distill import build_gkd_loss_fn, load_teacher, assert_tokenizers_compatible
+            from .distill import (
+                _model_logits, assert_tokenizers_compatible, build_gkd_loss_fn, load_teacher,
+            )
+            if is_vlm:
+                raise ValueError(
+                    "Unsloth: GKD distillation is text-only on MLX; the teacher "
+                    "would need the student's image preprocessing."
+                )
             _teacher, _teacher_tok = load_teacher(args.teacher_model_name_or_path)
-            _student_tok = getattr(self, "processing_class", None) or getattr(self, "tokenizer", None)
             _probe = mx.zeros((1, 8), dtype=mx.int32)
-            _student_vocab = model(_probe).shape[-1]
-            _teacher_vocab = _teacher(_probe).shape[-1]
-            if _student_tok is not None:
-                assert_tokenizers_compatible(
-                    _student_tok, _teacher_tok, _student_vocab, _teacher_vocab,
+            _teacher_vocab = _model_logits(_teacher(_probe)).shape[-1]
+            assert_tokenizers_compatible(
+                self.tokenizer, _teacher_tok,
+                _model_logits(model(_probe)).shape[-1], _teacher_vocab,
+            )
+            _gkd_batch_size = args.per_device_train_batch_size
+            if self.eval_dataset is not None:
+                _gkd_batch_size = max(
+                    _gkd_batch_size,
+                    getattr(args, "per_device_eval_batch_size", None) or 0,
                 )
             loss_fn = build_gkd_loss_fn(
-                model, _teacher, args, is_vlm,
+                _teacher, args,
                 vocab_size = _teacher_vocab,
+                batch_size = _gkd_batch_size,
                 resident_bytes = mx.get_active_memory(),
                 system_bytes = _psutil.virtual_memory().total,
             )
-            self._gkd_teacher = _teacher
+            use_cce = False
             _main_print(
                 f"Unsloth: GKD off-policy distillation from "
                 f"{args.teacher_model_name_or_path} "
