@@ -70,9 +70,16 @@ def test_kto_trains_and_saves(tmp_path):
     assert output.global_step == 6 and output["total_train_steps"] == 6
     assert all(math.isfinite(k) and k >= 0.0 for k in trainer._kl_history)
     assert {"adapters.safetensors", "adapter_config.json"} <= {p.name for p in tmp_path.iterdir()}
-    trainer.stop_requested = True  # a stop from the finished run must not end the next one
     trainer.train()
-    assert len(trainer._train_loss_history) == 6, "a second run must reset its history and stop flag"
+    assert len(trainer._train_loss_history) == 6, "a second run must reset its history"
+
+
+@metal_only
+def test_kto_stop_requests(tmp_path):
+    trainer = _trainer(tmp_path, max_steps=2)
+    trainer.stop_requested = True  # a cancel raised before train() is honored
+    assert trainer.train()["train_steps"] == 0
+    assert trainer.train()["train_steps"] == 2  # that stop is stale for the next run
 
 
 @metal_only

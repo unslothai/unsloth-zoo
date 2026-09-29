@@ -9945,6 +9945,7 @@ class MLXKTOTrainer(MLXTrainer):
         self.formatting_func = None
         self._ensure_lora_frozen(model)
         self._reset_run_state()
+        self._run_generation = 0
         self.stop_requested = False
         self._batches = None
         self._step_callbacks = []
@@ -9982,8 +9983,18 @@ class MLXKTOTrainer(MLXTrainer):
 
     def train(self, resume_from_checkpoint: str | None = None):
         self._reject_unsupported(resume_from_checkpoint)
-        self.stop_requested = False  # a stop from an earlier run must not end this one
+        # As MLXTrainer.train: drop only a stop an earlier run latched, never a pre-train() cancel.
+        if self._stop_request_generation() < self._run_generation:
+            self.stop_requested = False
         args, model = self.args, self.model
+        if args.chat_template is not None:
+            config = getattr(model, "_config", {})
+            self.tokenizer = normalize_mlx_chat_template(
+                self.tokenizer, chat_template=args.chat_template,
+                model_name=getattr(model, "_hf_repo", None),
+                model_type=config.get("model_type") if isinstance(config, dict) else None,
+                is_vlm=False, strict=False,
+            )
         rows = _kto_rows(self.train_dataset, self.tokenizer, args)
         if not rows:
             raise ValueError("Unsloth: KTO needs at least 2 rows with non-empty completions.")
@@ -9997,7 +10008,9 @@ class MLXKTOTrainer(MLXTrainer):
         else:
             epochs = float(args.num_train_epochs) if args.num_train_epochs and args.num_train_epochs > 0 else 1.0
             total_steps = max(math.ceil(epochs * steps_per_epoch), 1)  # fractional epochs stop part-way
-        shuffle = not args.preserve_dataset_order and args.dataset_order != "sequential"
+        order_mode = "sequential" if args.preserve_dataset_order else args.dataset_order
+        from .utils import _normalize_seed, _torch_randperm_order
+        seed = _normalize_seed(args.seed)
         optimizer = self._build_optimizer(total_steps)
         max_grad_norm, max_grad_value, max_grad_leaf_norm, _ = _resolve_mlx_grad_clipping(args)
         if self._kto_reference is None:
@@ -10027,8 +10040,10 @@ class MLXKTOTrainer(MLXTrainer):
                 if not windows:
                     # TRL's sampler reshuffles rows each epoch; KL completions travel with their rows.
                     order = list(range(len(rows)))
-                    if shuffle:
-                        random.Random(args.seed + epoch).shuffle(order)
+                    if order_mode == "torch_randperm":
+                        order = list(_torch_randperm_order(len(rows), seed + epoch))
+                    elif order_mode != "sequential":
+                        random.Random(seed + epoch).shuffle(order)
                     epoch += 1
                     batches = [[rows[i] for i in order[j:j + bs]] for j in range(0, len(order), bs)]
                     windows = [batches[j:j + grad_accum] for j in range(0, len(batches), grad_accum)]
@@ -10067,6 +10082,7 @@ class MLXKTOTrainer(MLXTrainer):
                     print(f"Unsloth KTO: step {step}/{total_steps} "
                           f"loss={self._train_loss_history[-1]:.4f} kl={self._kl_history[-1]:.4f}")
         finally:
+            self._run_generation += 1  # a stop latched by this run is stale for the next one
             dropout.restore()
             release_mlx_training_patches()
             if args.gradient_checkpointing:
