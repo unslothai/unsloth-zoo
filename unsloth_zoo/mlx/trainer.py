@@ -5390,10 +5390,12 @@ class MLXTrainer:
                     _gkd_batch_size,
                     getattr(args, "per_device_eval_batch_size", None) or 0,
                 )
-            # Gradients and optimizer state are allocated later; Adam-family
-            # state is two float32 buffers per trainable parameter.
+            # Gradients and optimizer state are allocated later: Adam-family
+            # state is two float32 buffers per trainable parameter, and gradient
+            # accumulation holds the carried gradient beside the fresh one.
+            _live_grads = 2 if args.gradient_accumulation_steps > 1 else 1
             _trainable_bytes = sum(
-                p.size * (p.itemsize + 8)
+                p.size * (_live_grads * p.itemsize + 8)
                 for _, p in tree_flatten(model.trainable_parameters())
             )
             loss_fn = build_gkd_loss_fn(
