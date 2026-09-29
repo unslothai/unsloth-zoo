@@ -17,9 +17,9 @@
 
 DiffusionGemma is a block-diffusion model, so llama.cpp serves it through a dedicated diffusion runner
 rather than the autoregressive server. This package drives the optimized on-device visual decoder
-(llama-diffusion-gemma-visual-server) and wraps it in an OpenAI-compatible shim so Studio can serve it
+(llama-diffusion-gemma-visual-server) and wraps it in an OpenAI-compatible shim so Unsloth can serve it
 as an ordinary llama.cpp / OpenAI-compatible model. The shim streams the committed answer text and a
-self-contained ```html artifact that replays the per-step denoising canvas, which Studio auto-renders for
+self-contained ```html artifact that replays the per-step denoising canvas, which Unsloth auto-renders for
 DiffusionGemma. Autoregressive flows are untouched.
 
 The visual server tokenizes, applies the chat template and detokenizes from the GGUF's own embedded

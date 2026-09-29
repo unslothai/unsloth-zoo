@@ -62,8 +62,8 @@ def test_max_length_padding():
 
 
 def test_existing_token_type_ids_stripped_in_lockstep():
-    # Tokenizer-provided token_type_ids must be BOS-stripped too, or the row desyncs when
-    # return_mm_token_type_ids is False.
+    # Tokenizer-provided token_type_ids must be BOS-stripped too, or the row desyncs
+    # when return_mm_token_type_ids is False (True overwrites them anyway).
     text_inputs = {
         "input_ids": [[BOS, BOS, 10, 11], [BOS, BOS, 20]],
         "attention_mask": [[1, 1, 1, 1], [1, 1, 1]],
@@ -74,8 +74,7 @@ def test_existing_token_type_ids_stripped_in_lockstep():
 
 
 def test_special_tokens_mask_stripped_and_padded():
-    # any per-token field (here special_tokens_mask) must be stripped and padded, not left ragged;
-    # its pad fill is 1 (padding is a special token).
+    # Any per-token field must be stripped and padded; its pad fill is 1.
     text_inputs = {
         "input_ids": [[BOS, BOS, 10], [BOS, BOS, 20, 21]],
         "attention_mask": [[1, 1, 1], [1, 1, 1, 1]],
@@ -112,8 +111,7 @@ def test_max_length_uses_model_max_when_unset():
 
 
 def test_non_aligned_fields_untouched():
-    # overflowing_tokens is a per-example list whose rows do NOT match input_ids lengths; it must be
-    # left exactly as-is (not BOS-stripped or padded).
+    # overflowing_tokens rows do NOT match input_ids lengths, so leave it as-is.
     text_inputs = {
         "input_ids": [[BOS, BOS, 10], [BOS, BOS, 20, 21]],
         "attention_mask": [[1, 1, 1], [1, 1, 1, 1]],
