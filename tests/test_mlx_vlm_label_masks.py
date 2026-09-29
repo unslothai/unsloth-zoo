@@ -1273,8 +1273,6 @@ def _ids(tree):
 
 
 def test_a_text_only_full_finetune_trains_only_the_language_model():
-    """Towers, embedders and wrapper-level arrays text never reaches stay out of
-    the optimizer; a module the language model shares stays in it."""
     model = _loaded_wrapper(_unsloth_full_finetuning=True, _unsloth_text_only_vlm=True)
     assert _ids(model.trainable_parameters()) == _ids(model.language_model.parameters())
     assert len(_ids(model.language_model.trainable_parameters())) == 2
@@ -4323,8 +4321,6 @@ class _AudioAttention(nn.Module):
 
 
 def test_a_loaded_model_freezes_modules_built_without_init():
-    """A full fine-tune reaches no get_peft_model, so the load itself must leave
-    every module freezable before the trainer freezes the audio tower."""
     from mlx.utils import tree_flatten
     from unsloth_zoo.mlx.loader import _finish_load
     from unsloth_zoo.mlx.utils import freeze_audio_modules

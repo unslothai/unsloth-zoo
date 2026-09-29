@@ -3322,8 +3322,7 @@ def _mark_text_only_vlm(model, model_type: str) -> None:
 
 
 def _freeze_outside_language_model(model) -> None:
-    """Text batches never reach the modality towers, so a text-only full fine-tune
-    trains the language model alone, as mlx-lm does."""
+    """Text batches never reach the towers, so train only the language model, as mlx-lm does."""
     language_model = getattr(model, "language_model", None)
     if language_model is None:
         return
