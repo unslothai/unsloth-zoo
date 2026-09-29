@@ -6392,13 +6392,23 @@ def unsloth_compile_transformers(
             # MOE routing weights cast fix takes effect in v5
             new_source, new_methods = patch_moe_routing_weights_cast(module_cls, source)
             if new_source != source or len(new_methods) > 0:
+                # Disabled, the router breaks the compiled MoE block around it (Ernie 4.5, Laguna).
+                compile_router = (
+                    compile_custom_modules
+                    and module in torch_modules
+                    and module not in bad_torch_modules
+                )
                 try:
                     new_module = create_standalone_class(
                         module,
                         model_location,
                         functions,
-                        fullgraph=False,
-                        disable=True,
+                        fullgraph=(
+                            compile_router
+                            and module not in no_fullgraph_modules
+                            and torch_modules[module]
+                        ),
+                        disable=disable if compile_router else True,
                         forward_source=new_source,
                         new_methods=new_methods,
                     )
@@ -6796,10 +6806,11 @@ def unsloth_compile_transformers(
             continue
 
         for key, value in item.items():
-            value = str(value)
+            # Exact name: a substring swapped JambaAttentionDecoderLayer for JambaAttention.
+            value = getattr(value, "__name__", None) if isinstance(value, type) else None
             found = False
             for replaced_class in replaced_classes:
-                if replaced_class in value:
+                if replaced_class == value:
                     try:
                         exec(
                             f"{model_location}.{check}['{key}'] = combined_module.{replaced_class}",
