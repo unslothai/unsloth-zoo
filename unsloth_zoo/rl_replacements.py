@@ -643,13 +643,15 @@ def grpo_compute_loss(
     if loss_type in ["grpo", "sapo"]:
         loss = ((loss_i * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)).mean()
         loss = loss / current_gradient_accumulation_steps
-    elif loss_type == "bnpo":
+    elif loss_type == "bnpo" and num_items_in_batch is None:
+        # TRL < 0.22 passes no global token count: per micro-batch, so the loss depends on how the batch is split.
         loss = (loss_i * mask).sum() / mask.sum().clamp(min=1.0)
         loss = loss / current_gradient_accumulation_steps
     elif loss_type == "dr_grpo":
         loss = (loss_i * mask).sum() / (loss_i.size(0) * max_completion_length)
         loss = loss / current_gradient_accumulation_steps
-    elif loss_type in ["cispo", "dapo", "vespo"]:
+    elif loss_type in ["bnpo", "cispo", "dapo", "vespo"]:
+        # bnpo too: a per micro-batch token mean changes with the GPU / accumulation split, the global count does not.
         # Floor at 1 like TRL: a fully masked batch (mask_truncated_completions) is 0/0 = nan otherwise.
         if torch.is_tensor(num_items_in_batch):
             normalizer = num_items_in_batch.clamp(min = 1.0) / num_processes
