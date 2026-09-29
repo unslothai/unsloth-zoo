@@ -352,6 +352,7 @@ def test_adapter_removes_stop_matches_and_closes_on_failure():
     Generator.eos = True
     eos = _results(adapter.stream([GenerationRequest(prompt_token_ids=[9])]))[0]
     assert eos.token_ids == [1] and eos.finish_reason == "stop"
+    assert eos.stop_token_id == 3 and result.stop_token_id is None
     Generator.eos = False
     Generator.fail = True
     Generator.close_fail = True

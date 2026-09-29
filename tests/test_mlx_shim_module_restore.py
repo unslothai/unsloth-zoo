@@ -126,7 +126,7 @@ def test_the_shim_files_use_the_shared_restore():
     from pathlib import Path
 
     here = Path(__file__).resolve().parent
-    for filename in ("test_mlx_preference.py", "test_mlx_trainer_internals.py"):
+    for filename in ("test_mlx_preference.py", "test_mlx_trainer_internals.py", "test_mlx_grpo.py"):
         source = (here / filename).read_text(encoding = "utf-8")
         assert "restore_modules(" in source, filename
         assert "sys.modules.update(" not in source, (

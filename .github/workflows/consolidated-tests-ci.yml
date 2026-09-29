@@ -441,6 +441,7 @@ jobs:
             tests/test_get_transformers_model_type_empty.py \
             tests/test_train_on_responses_list_labels.py \
             tests/test_mlx_preference.py \
+            tests/test_mlx_grpo.py \
             tests/test_mlx_trainer_internals.py \
             tests/test_mlx_arrays_cache_advance.py \
             tests/test_mlx_quantized_optimizer_routing.py \

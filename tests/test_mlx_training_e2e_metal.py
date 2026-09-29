@@ -9,6 +9,7 @@ functions (CCE and baseline).
 
 import glob
 import json
+import math
 import os
 
 import pytest
@@ -2094,6 +2095,95 @@ def test_preference_generate_during_eval_samples_through_the_real_engine(tmp_pat
 
 
 @metal_only
+@pytest.mark.parametrize("compiled", [False, True])
+def test_grpo_trains_on_real_rollouts(tmp_path, compiled):
+    """Rollouts, rewards, the KL reference and the update run on the real engine."""
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+    from unsloth_zoo.mlx.trainer import MLXGRPOConfig, MLXGRPOTrainer
+    from unsloth_zoo.mlx.utils import iter_mlx_lora_modules
+
+    seen, scores = [], []
+
+    def digits(completions, answer, completion_ids, **kwargs):
+        seen.append(completion_ids)
+        # Distinct completions score apart, so every group carries an advantage.
+        values = [float(str(a) in text) + (sum(ids) % 97) / 97 for text, a, ids
+                  in zip(completions, answer, completion_ids)]
+        scores.append(values)
+        return values
+
+    model, tokenizer = FastMLXModel.from_pretrained(MODEL, max_seq_length=256)
+    model = FastMLXModel.get_peft_model(model, r=8, lora_alpha=16, lora_dropout=0)
+    before = {k: mx.array(v) for k, v in tree_flatten(model.trainable_parameters())}
+    rows = [
+        {"prompt": [{"role": "user", "content": f"What is {i} plus {i}?"}], "answer": 2 * i}
+        for i in range(6)
+    ]
+    trainer = MLXGRPOTrainer(
+        model, tokenizer, rows, digits,
+        args=MLXGRPOConfig(
+            per_device_train_batch_size=4, num_generations=4, gradient_accumulation_steps=2,
+            max_steps=2, warmup_steps=0, learning_rate=1e-3, logging_steps=1,
+            max_completion_length=16,
+            output_dir=str(tmp_path), report_to="none", max_seq_length=256, seed=3407,
+            beta=0.04, compile=compiled,
+        ),
+    )
+    result = trainer.train()
+
+    assert result["train_steps"] == 2
+    assert len(seen) == 4 and all(len(ids) == 4 for ids in seen)
+    assert any(len(set(group)) > 1 for group in scores), scores
+    logged = [entry for entry in trainer.state.log_history if "loss" in entry]
+    assert len(logged) == 2
+    for entry in logged:
+        assert math.isfinite(entry["loss"]) and entry["kl"] >= 0
+        assert 0 < entry["completions/mean_length"] <= 16
+    after = dict(tree_flatten(model.trainable_parameters()))
+    moved = [k for k in before if not mx.array_equal(before[k], after[k]).item()]
+    assert moved, f"no trainable tensor moved; rewards {scores}"
+    assert all(module.scale != 0.0 for _, module in iter_mlx_lora_modules(model))
+
+
+@metal_only
+@pytest.mark.parametrize("temperature", [1.0, 0.7])
+def test_grpo_cce_scores_completions_like_the_dense_head(temperature):
+    """Runtime CCE over compacted completion rows gives the dense log-probs and gradient."""
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+    from unsloth_zoo.mlx import grpo
+
+    model, tokenizer = FastMLXModel.from_pretrained(MODEL, max_seq_length=256)
+    model = FastMLXModel.get_peft_model(model, r=8, lora_alpha=16, lora_dropout=0)
+    scorer = grpo.make_grpo_scorer(model, temperature)
+    assert scorer is not None, "the SmolLM head should be CCE-eligible"
+    rows = [tokenizer.encode(text) for text in (
+        "What is 2 plus 2? It is four.", "Name a colour: blue, and also green.",
+    )]
+    lengths = [[6, len(rows[0])], [5, len(rows[1])]]
+    width = 1 + 64
+    batch = mx.array([r + [0] * (width - len(r)) for r in rows], dtype=mx.int32)
+    lengths_mx = mx.array(lengths, dtype=mx.int32)
+    mask = grpo._response_mask(batch[:, 1:], lengths_mx)
+    dense = grpo._token_logps(model, batch, temperature) * mask
+    indices = grpo.completion_indices(lengths, width)
+    compact = grpo._token_logps(model, batch, temperature, mask, scorer, indices) * mask
+    assert mx.allclose(dense, compact, atol=2e-3, rtol=2e-3).item(), mx.abs(dense - compact).max()
+
+    args = (batch, lengths_mx, mx.array([1.0, -1.0]), mx.array([1.0, 0.0]))
+    options = dict(beta=0.0, epsilon_low=0.2, epsilon_high=0.2, temperature=temperature)
+    grads = []
+    for loss_fn, extra in ((grpo.make_grpo_loss_fn(**options), ()),
+                           (grpo.make_grpo_loss_fn(scorer=scorer, **options), (indices,))):
+        _, grad = nn.value_and_grad(model, lambda m, *a: loss_fn(m, *a)[0])(model, *args, *extra)
+        grads.append(dict(tree_flatten(grad)))
+    for key, value in grads[0].items():
+        assert mx.allclose(value, grads[1][key], atol=1e-3, rtol=5e-2).item(), key
+
+
+@metal_only
 def test_neftune_noise_is_gated_out_of_the_preference_eval_forward(tmp_path):
     """Evaluation must score the model, not a noised copy of it.
 
@@ -2458,6 +2548,7 @@ def test_bitlinear_can_feed_a_downstream_head_adapter(targets, attention):
 
 _KV_SHARED_PEAK_SCRIPT = r"""
 import json
+import math
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten

@@ -1577,18 +1577,21 @@ def _make_preference_cce_scorer(model):
                                     quantized=desc.quantized, weight_is_frozen=frozen,
                                     **quantization)
 
-    def score(model, batch, supervised, indices=None, *, every_position=False):
+    def score(model, batch, supervised, indices=None, *, every_position=False, hidden_scale=None):
         """Token cross entropy and logit sums per position, as float32 grids.
 
         Cross entropy is zero outside ``supervised``. ``indices`` limits the
         kernel to those rows, which then also limits the logit sums unless
-        ``every_position``.
+        ``every_position``. ``hidden_scale`` divides uncapped logits (a sampling
+        temperature); the caller must not pass it for a softcapped head.
         """
         targets = batch[:, 1:]
         hidden = utils._forward_text_hidden_states(model, batch[:, :-1])
         hidden = hidden.reshape((-1, hidden.shape[-1]))
         if scale is not None:
             hidden = hidden * scale
+        if hidden_scale is not None:
+            hidden = hidden * hidden_scale
         labels = utils._normalize_cce_label_dtype(targets)
         labels = mx.where(supervised, labels, mx.array(-100, labels.dtype))
         rows, labels = utils._compact_cce_inputs(hidden, labels.reshape((-1,)), indices)
@@ -1612,6 +1615,7 @@ def _make_preference_cce_scorer(model):
 
     score.vocab = desc.module.weight.shape[0]
     score.compaction = score.vocab >= 8192
+    score.softcap = softcap
     return score
 
 

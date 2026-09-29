@@ -615,6 +615,13 @@ from .utils import (
     _distributed_global_batch_size,
     _rank_slice_distributed_batch,
 )
+from .grpo import (
+    build_rollout_batch,
+    make_grpo_loss_fn,
+    make_grpo_scorer,
+    rollout_prompt_indices,
+    rollout_seed,
+)
 from .preference import (
     FinitePreferenceBatchPlan,
     PreferenceRunContext,
@@ -1458,6 +1465,16 @@ class MLXTrainingConfig:
             "ref_model_sync_steps",
             "precompute_ref_log_probs",
             "precompute_ref_batch_size",
+            "num_generations",
+            "epsilon",
+            "epsilon_high",
+            "temperature",
+            "top_p",
+            "top_k",
+            "min_p",
+            "reward_weights",
+            "scale_rewards",
+            "mask_truncated_completions",
         }
         _field_names = {field.name for field in config_fields}
         copied_all_fields = (_field_names - _appended_fields) <= set(provided)
@@ -1569,6 +1586,30 @@ class MLXDPOConfig(MLXTrainingConfig):
     num_generation_prompts: int = field(default=8, kw_only=True)
     generation_max_tokens: int = field(default=128, kw_only=True)
     generation_temperature: float = field(default=0.0, kw_only=True)
+
+
+@dataclass(init=False)
+class MLXGRPOConfig(MLXTrainingConfig):
+    """Configuration owned by MLXGRPOTrainer, named as TRL's GRPOConfig.
+
+    per_device_train_batch_size counts completions: each micro-batch rolls out
+    per_device_train_batch_size // num_generations prompts (at least one).
+    """
+
+    beta: float = field(default=0.0, kw_only=True)
+    epsilon: float = field(default=0.2, kw_only=True)
+    epsilon_high: float | None = field(default=None, kw_only=True)
+    num_generations: int = field(default=8, kw_only=True)
+    max_completion_length: int = field(default=256, kw_only=True)
+    temperature: float = field(default=1.0, kw_only=True)
+    top_p: float = field(default=1.0, kw_only=True)
+    top_k: int | None = field(default=None, kw_only=True)
+    min_p: float | None = field(default=None, kw_only=True)
+    reward_weights: list[float] | None = field(default=None, kw_only=True)
+    loss_type: str = field(default="grpo", kw_only=True)
+    scale_rewards: str | bool = field(default="group", kw_only=True)
+    mask_truncated_completions: bool = field(default=False, kw_only=True)
+    disable_dropout: bool = field(default=False, kw_only=True)
 
 
 def _shape_guard_report(
@@ -2290,6 +2331,7 @@ class MLXTrainer:
 
     config_class = MLXTrainingConfig
     preference_kind = None
+    rl_kind = None
 
 
     def _preference_length_policy(self, args):
@@ -2324,6 +2366,17 @@ class MLXTrainer:
             sync_ref_model=bool(getattr(args, "sync_ref_model", False)),
         )
 
+    def _build_grpo_reference(self, model, *, resume_provenance):
+        return build_reference_policy(
+            model,
+            reference_free=False,
+            resume_provenance=resume_provenance,
+            neftune=(
+                [self._neftune_emb]
+                if getattr(self, "_neftune_emb", None) is not None else []
+            ),
+        )
+
     def __init__(
         self,
         model,
@@ -2347,7 +2400,7 @@ class MLXTrainer:
         self.eval_dataset = eval_dataset
         self.formatting_func = formatting_func
         self.args = args or self.config_class()
-        if self.preference_kind and not isinstance(self.args, self.config_class):
+        if (self.preference_kind or self.rl_kind) and not isinstance(self.args, self.config_class):
             raise TypeError(
                 f"{type(self).__name__} requires {self.config_class.__name__}."
             )
@@ -2368,9 +2421,9 @@ class MLXTrainer:
         if packing is not None:
             self.args.packing = packing
 
-        if self.preference_kind and self.args.packing:
+        if (self.preference_kind or self.rl_kind) and self.args.packing:
             raise ValueError(
-                "Unsloth MLX preference: packing is not supported."
+                f"Unsloth MLX {self.preference_kind or self.rl_kind}: packing is not supported."
             )
         if self.args.packing:
             print(
@@ -2385,6 +2438,7 @@ class MLXTrainer:
             and self.tokenizer is not None
             and self.args.streaming
             and not self.preference_kind
+            and not self.rl_kind
             and _is_mlx_lazy_text_source(self.train_dataset)
         ):
             config = getattr(self.model, "_config", {})
@@ -2411,6 +2465,7 @@ class MLXTrainer:
         elif (
             not self._is_vlm
             and not self.preference_kind
+            and not self.rl_kind
             and self.train_dataset is not None
             and self.tokenizer is not None
             and hasattr(self.train_dataset, "__getitem__")
@@ -4895,6 +4950,7 @@ class MLXTrainer:
         if (
             hasattr(self, "_batches")
             and not getattr(self, "_is_vlm", False)
+            and not self.rl_kind
             and not (
                 getattr(self.args, "streaming", False)
                 and self._batches is None
@@ -5404,14 +5460,15 @@ class MLXTrainer:
         # properties fall back).
         use_cce = args.use_cce
         preference_kind = self.preference_kind
-        if preference_kind:
+        rl_kind = self.rl_kind
+        if preference_kind or rl_kind:
             use_cce = False
-        label_smoothing = 0.0 if preference_kind else _validate_label_smoothing(
+        label_smoothing = 0.0 if (preference_kind or rl_kind) else _validate_label_smoothing(
             getattr(args, "label_smoothing_factor", 0.0), is_vlm,
         )
         _vlm_ignore_token_ids = None
 
-        if preference_kind:
+        if preference_kind or rl_kind:
             loss_fn = None
         elif is_vlm:
             processor = self._resolve_vlm_processor()
@@ -5528,7 +5585,13 @@ class MLXTrainer:
                 self._prepared_batches_include_epochs = False
             batches, batch_iter = self._prepare_data(is_vlm)
             _stream_epochs = getattr(self, "_streaming_epoch_batch_count", None)
-            if (
+            if rl_kind and args.max_steps <= 0:
+                # HF's budget: ceil(epochs * ceil(micro-batches per epoch / grad_accum)).
+                total_steps = max(1, math.ceil(
+                    float(args.num_train_epochs)
+                    * _mlx_steps_per_epoch(_stream_epochs, args.gradient_accumulation_steps)
+                ))
+            elif (
                 batches is None
                 and _stream_epochs is not None
                 and args.max_steps <= 0
@@ -5635,6 +5698,9 @@ class MLXTrainer:
                 self, "_prepared_batches_include_epochs", False,
             ),
         )
+        if _epoch_flush_microbatches is None and rl_kind:
+            # Rollout epochs may end mid-window; that tail forces its own update.
+            _epoch_flush_microbatches = self._streaming_epoch_batch_count
         self._compile_shape_guard_report = _compile_shape_guard_report
 
         if preference_kind:
@@ -5720,6 +5786,19 @@ class MLXTrainer:
                     _dpo_reference = self._build_dpo_reference(
                         model, resume_provenance=resume_provenance,
                     )
+                if rl_kind:
+                    resume_provenance = dict(ts.get("preference_reference") or {})
+                    if resume_provenance.pop("objective", None) != "grpo" or (
+                        (resume_provenance == {"kind": "grpo_no_reference"}) == bool(args.beta)
+                    ):
+                        raise ValueError(
+                            "Unsloth MLX GRPO: resume requires a checkpoint from a GRPO run "
+                            "with the same beta (zero or nonzero)."
+                        )
+                    if args.beta:
+                        _dpo_reference = self._build_grpo_reference(
+                            model, resume_provenance=resume_provenance,
+                        )
 
                 # 1. Load trained adapter weights into the model. The model
                 #    already has LoRA wrappers applied (Unsloth pipeline does
@@ -5875,6 +5954,31 @@ class MLXTrainer:
                 batches.configure_cce_compaction(
                     getattr(loss_fn, "_unsloth_cce_compaction", False), kind=preference_kind,
                 )
+        if rl_kind:
+            reference_policy, provenance = None, {"kind": "grpo_no_reference"}
+            if args.beta:
+                if _dpo_reference is None:
+                    _dpo_reference = self._build_grpo_reference(model, resume_provenance=None)
+                reference_policy, provenance = _dpo_reference
+                _sampling_reference = reference_policy
+            self._preference_reference_provenance = dict(provenance, objective="grpo")
+            epsilon_high = args.epsilon if args.epsilon_high is None else args.epsilon_high
+            loss_fn = make_grpo_loss_fn(
+                beta=float(args.beta), epsilon_low=float(args.epsilon),
+                epsilon_high=float(epsilon_high), temperature=float(args.temperature),
+                reference_policy=reference_policy,
+                scorer=make_grpo_scorer(model, float(args.temperature)) if args.use_cce else None,
+            )
+            use_cce = hasattr(loss_fn, "_unsloth_cce_backend")
+            self._rollout_cce_compaction = loss_fn._unsloth_cce_compaction
+            self._preference_run_context = PreferenceRunContext(
+                model, enabled=bool(args.disable_dropout),
+            )
+            _main_print(
+                f"Unsloth: Using GRPO loss (beta={args.beta}, "
+                f"num_generations={args.num_generations}"
+                f"{', runtime CCE' if use_cce else ''})."
+            )
         _reference_compile_state = (
             [] if _sampling_reference is None else [_sampling_reference.state]
         )
@@ -7487,7 +7591,10 @@ class MLXTrainer:
         # The seed is the same and create_batches/iterate_*_batches is
         # deterministic, so consuming N batches gives us the same data
         # ordering the killed run would have produced.
-        if _resume_step > 0 and batch_iter is not None and not _prefetch_active:
+        if rl_kind and _resume_step > 0:
+            # Rollouts are on-policy: restart at the resume position, never replay.
+            batch_iter = self._active_batch_iter = self._rollout_batches(_resume_microstep)
+        elif _resume_step > 0 and batch_iter is not None and not _prefetch_active:
             for _ in range(_resume_microstep):
                 fast_forward_error = None
                 try:
@@ -7628,7 +7735,7 @@ class MLXTrainer:
             and _epoch_stop_total_microbatches are identical on every rank) and the
             on_epoch_end path reuses the lockstep collectives, so DDP stays in step.
             """
-            nonlocal batch_idx, total_steps
+            nonlocal batch_idx, total_steps, batch_iter
             # Keep the callback-visible epoch FRACTIONAL for this truncated epoch's
             # on_epoch_end, mirroring HF: state.epoch = epoch + (step+1)/steps_in_epoch
             # is set at the last optimizer step and stays fractional when a callback
@@ -7653,6 +7760,10 @@ class MLXTrainer:
             ) * batches_per_epoch
             if batch_iter is None:
                 batch_idx += next_boundary - it_val
+            elif rl_kind:
+                # Generating the skipped rollouts only to drop them would also run the rewards.
+                batch_iter = self._active_batch_iter = self._rollout_batches(next_boundary)
+                batch_idx = next_boundary
             else:
                 # A streaming producer has no index to fast-forward, so discard
                 # the epoch's remaining micro-batches instead. The producer replays
@@ -8084,7 +8195,10 @@ class MLXTrainer:
             mx.eval(*eval_targets)
             global_toks = self._distributed_all_sum(supervised_toks, stream=mx.cpu)
             mx.eval(global_toks)
-            if int(global_toks.item()) == 0:
+            # A GRPO micro-batch whose completions were all masked is a zero step, as in TRL.
+            if int(global_toks.item()) == 0 and not getattr(
+                loss_fn, "_unsloth_allows_empty_batches", False,
+            ):
                 raise ValueError(
                     "Unsloth MLX: a training batch produced zero supervised "
                     "tokens after masking/truncation. Increase max_seq_length, "
@@ -9295,6 +9409,112 @@ class MLXDPOTrainer(MLXTrainer):
         super().__init__(*args, **kwargs)
 
 
+class MLXGRPOTrainer(MLXTrainer):
+    """GRPO following TRL's GRPOTrainer; ``reward_funcs`` take ``(prompts, completions, **columns)``."""
+
+    config_class = MLXGRPOConfig
+    rl_kind = "grpo"
+
+    def __init__(
+        self, model, tokenizer, train_dataset, reward_funcs, eval_dataset=None,
+        args=None, callbacks=None,
+    ):
+        funcs = list(reward_funcs) if isinstance(reward_funcs, (list, tuple)) else [reward_funcs]
+        if not funcs or not all(callable(func) for func in funcs):
+            raise ValueError(
+                "Unsloth MLX GRPO: reward_funcs must be one or more callables; "
+                "reward models and model ids are not supported."
+            )
+        if eval_dataset is not None:
+            raise NotImplementedError("Unsloth MLX GRPO: evaluation is not supported yet.")
+        self.reward_funcs = funcs
+        super().__init__(model, tokenizer, train_dataset, args=args, callbacks=callbacks)
+        args = self.args
+        if self._is_vlm:
+            raise ValueError("Unsloth MLX GRPO: vision-language models are not supported.")
+        weights = args.reward_weights
+        if weights is not None and len(weights) != len(funcs):
+            raise ValueError(
+                f"Unsloth MLX GRPO: {len(weights)} reward_weights for {len(funcs)} reward functions."
+            )
+        self.reward_weights = [1.0] * len(funcs) if weights is None else [float(w) for w in weights]
+        if int(args.num_generations) < 2:
+            raise ValueError("Unsloth MLX GRPO: num_generations must be at least 2.")
+        if not float(args.temperature) > 0:
+            raise ValueError(
+                "Unsloth MLX GRPO: temperature must be > 0; greedy groups are identical."
+            )
+        if args.loss_type != "grpo":
+            raise ValueError(
+                f"Unsloth MLX GRPO: loss_type={args.loss_type!r} is not supported; use 'grpo'."
+            )
+        if args.scale_rewards not in (True, "group"):
+            raise ValueError(
+                f"Unsloth MLX GRPO: scale_rewards={args.scale_rewards!r} is not supported; use 'group'."
+            )
+        batch = int(args.per_device_train_batch_size)
+        group = int(args.num_generations)
+        if batch > group and batch % group:
+            raise ValueError(
+                f"Unsloth MLX GRPO: per_device_train_batch_size={batch} must be a "
+                f"multiple of num_generations={group}."
+            )
+        self._rollout_prompts_per_batch = max(1, batch // group)
+
+    def _prepare_data(self, is_vlm, defer_vlm_checker=False):
+        args = self.args
+        if args.streaming:
+            raise NotImplementedError("Unsloth MLX GRPO: streaming datasets are not supported.")
+        config = getattr(self.model, "_config", {})
+        self.tokenizer = normalize_mlx_chat_template(
+            self.tokenizer,
+            chat_template=getattr(args, "chat_template", None),
+            model_name=getattr(self.model, "_hf_repo", None),
+            model_type=config.get("model_type") if isinstance(config, dict) else None,
+            is_vlm=False,
+            strict=False,
+        )
+        rows = list(self._train_dataset_for_batches())
+        if not rows:
+            raise ValueError("Unsloth MLX GRPO: the training dataset is empty.")
+        if any("prompt" not in row for row in rows):
+            raise ValueError("Unsloth MLX GRPO: every dataset row needs a 'prompt' column.")
+        self._rollout_rows = rows
+        self._mlx_prefetch_control = None
+        self._mlx_stream_width_policy = None
+        self._streaming_epoch_batch_count = math.ceil(
+            len(rows) / (self._rollout_prompts_per_batch * self.distributed_world_size)
+        )
+        return None, self._rollout_batches(0)
+
+    def _rollout_batches(self, position):
+        """Infinite on-policy stream; micro-batch ``position`` depends only on its index."""
+        args = self.args
+        tokenizer = self.tokenizer
+        pad_id = getattr(tokenizer, "pad_token_id", None)
+        if pad_id is None:
+            pad_id = getattr(tokenizer, "eos_token_id", None) or 0
+
+        rank, world = self.distributed_rank, self.distributed_world_size
+        group = int(args.num_generations)
+        while True:
+            indices = rollout_prompt_indices(
+                position, num_prompts=len(self._rollout_rows),
+                prompts_per_batch=self._rollout_prompts_per_batch,
+                rank=rank, world=world, seed=args.seed,
+                shuffle=not (args.preserve_dataset_order or args.dataset_order == "sequential"),
+            )
+            yield build_rollout_batch(
+                self.model, tokenizer, [self._rollout_rows[i] for i in indices],
+                args=args, reward_funcs=self.reward_funcs, reward_weights=self.reward_weights,
+                seeds=[rollout_seed(args.seed, rank, position, row)
+                       for row in range(len(indices) * group)],
+                pad_id=int(pad_id), trainer_state=self.state,
+                compact=getattr(self, "_rollout_cce_compaction", False),
+            )
+            position += 1
+
+
 def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
                             max_seq_length, formatting_func=None,
                             dataset_text_field="text", num_batches=None,
@@ -9744,6 +9964,11 @@ def train_on_responses_only(
     from unsloth_zoo.dataset_utils import (
         train_on_responses_only as _hf_train_on_responses_only,
     )
+    if not return_function and getattr(trainer, "rl_kind", None):
+        raise ValueError(
+            "Unsloth MLX GRPO: train_on_responses_only does not apply; "
+            "the loss already covers only the generated completions."
+        )
 
     _source = tokenizer
     if _source is None and trainer is not None:
@@ -9814,7 +10039,6 @@ def train_on_responses_only(
             "Pass return_function=True to get the masking closure, "
             "or provide an MLXTrainer instance."
         )
-
     if trainer._is_vlm:
         trainer._vlm_response_mask_fn = mask_fn
         print("Unsloth: train_on_responses_only enabled (VLM mode).")
