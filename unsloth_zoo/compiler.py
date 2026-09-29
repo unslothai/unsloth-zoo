@@ -289,10 +289,14 @@ def function_only_called_at_init(module_source: str, name: str) -> bool:
     except Exception:
         return False
     callers_of = {}
+    # owner = (name, is_method); nested defs keep their enclosing owner.
     def visit(node, owner):
         for child in ast.iter_child_nodes(node):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                visit(child, child.name if owner is None or isinstance(node, ast.ClassDef) else owner)
+                if isinstance(node, ast.ClassDef):
+                    visit(child, (child.name, True))
+                else:
+                    visit(child, (child.name, False) if owner is None else owner)
                 continue
             if isinstance(child, ast.Call):
                 func = child.func
@@ -312,9 +316,14 @@ def function_only_called_at_init(module_source: str, name: str) -> bool:
         for owner in owners:
             if owner is None:
                 return False  # called at module import time or from a class body
-            if owner in _INIT_ONLY_CALLERS:
-                continue
-            if not init_only(owner):
+            owner_name, is_method = owner
+            if is_method:
+                # Methods are also reached via self.<name>(...), which is not tracked
+                # (MPT's forward calls self.build_mpt_alibi_tensor).
+                if owner_name in _INIT_ONLY_CALLERS:
+                    continue
+                return False
+            if not init_only(owner_name):
                 return False
         return True
     return init_only(name)

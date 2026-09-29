@@ -77,3 +77,24 @@ def test_qwen4_exp_ngram_helpers_are_init_only():
         assert function_only_called_at_init(source, name), name
     for name in ("rotate_half", "apply_rotary_pos_emb", "l2norm", "repeat_kv"):
         assert not function_only_called_at_init(source, name), name
+
+
+def test_helper_behind_a_same_named_method_is_not_init_only():
+    from unsloth_zoo.compiler import function_only_called_at_init
+    src = '''
+def build_alibi(n):
+    return n
+
+class Model(nn.Module):
+    def build_alibi(self, n):
+        return build_alibi(n)
+
+    def forward(self, x):
+        return self.build_alibi(x)
+'''
+    assert not function_only_called_at_init(src, "build_alibi")
+    try:
+        modeling = importlib.import_module("transformers.models.mpt.modeling_mpt")
+    except Exception:
+        return
+    assert not function_only_called_at_init(inspect.getsource(modeling), "build_mpt_alibi_tensor")
