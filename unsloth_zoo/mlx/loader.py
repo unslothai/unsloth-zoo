@@ -1164,6 +1164,28 @@ def _load_mlx_lm_with_strict_fallback(
     return model, tokenizer
 
 
+def _download_missing_index_shards(model_name, local_path, revision, download):
+    """Fetch index-mapped shards mlx-lm's `model*.safetensors` default skipped; mlx-vlm drops absent ones."""
+    if os.path.isdir(model_name):
+        return local_path
+    try:
+        with open(os.path.join(local_path, "model.safetensors.index.json")) as file:
+            weight_map = json.load(file).get("weight_map") or {}
+    except (OSError, ValueError, AttributeError):
+        return local_path
+    missing = sorted(
+        {shard for shard in weight_map.values()
+         if isinstance(shard, str) and not os.path.exists(os.path.join(local_path, shard))}
+    )
+    if not missing:
+        return local_path
+    # Pin to the fetched `snapshots/<sha>`: a re-resolved branch could return only these shards.
+    snapshot = os.path.basename(os.path.normpath(local_path))
+    if re.fullmatch(r"[0-9a-f]{40}", snapshot):
+        revision = snapshot
+    return str(download(model_name, revision=revision, allow_patterns=missing))
+
+
 def _mlx_lm_metadata_allow_patterns():
     return [
         "*.json",
@@ -8417,6 +8439,10 @@ class FastMLXModel:
                         allow_patterns=config_allow_patterns,
                     )
                 )
+                if not distributed_requested:
+                    local_path = _download_missing_index_shards(
+                        model_name, local_path, revision, _download,
+                    )
                 original_local_path = local_path
         except Exception:
             if distributed_requested:
