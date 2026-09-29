@@ -38,7 +38,7 @@ dependencies = [
     # #1081, unsloth #9478), and it reached users through an unattended upgrade
     # because nothing bounded it. Bump these deliberately, after the Apple
     # Silicon lane is green on the new release.
-    "mlx==0.32.2 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
+    "mlx==0.32.3 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
     # GenerationBatch.Response and BatchGenerator.next_generated, which batched
     # generation drives, first ship in mlx-lm 0.31.2.
     "mlx-lm==0.31.3 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
@@ -50,10 +50,10 @@ dependencies = [
     # gets a 0.7.x -- which matters: the UnicodeDecodeError during generation in
     # unsloth #9466 is fixed in 0.6.9. Pinning either patch exactly would make
     # one of those two environments unresolvable or reintroduce a fixed bug.
-    # The ceiling admits 0.7.1, whose gated-delta keywords and reworked MoE
-    # switch layer this package handles, so the installer constrains rather
-    # than overrides it.
-    "mlx-vlm>=0.4.4,<=0.7.1 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
+    # The ceiling admits 0.7.4; this package handles the gated-delta keywords
+    # and reworked MoE switch layer of 0.7.1 and the separate qwen3_5_text
+    # decoders of 0.7.4, so the installer constrains rather than overrides it.
+    "mlx-vlm>=0.4.4,<=0.7.4 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
     # --- Shared deps (all platforms) ---
     "packaging>=24.1",
     # Floor is 4.52.4, not 4.51.3: peft declares no transformers floor of its own (a
@@ -120,9 +120,9 @@ exclude = ["images*", "tests*", "scripts*"]
 mlx = [
     # Keep in sync with the MLX-only dependency pins above, including the reason
     # they are pins.
-    "mlx==0.32.2",
+    "mlx==0.32.3",
     "mlx-lm==0.31.3",
-    "mlx-vlm>=0.4.4,<=0.7.1",
+    "mlx-vlm>=0.4.4,<=0.7.4",
 ]
 core = [
     "packaging>=24.1",
