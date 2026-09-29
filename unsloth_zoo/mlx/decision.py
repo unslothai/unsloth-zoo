@@ -237,6 +237,9 @@ def load_decision_model(folder, compute_dtype = mx.float32):
     model.eval()
     mx.eval(model.parameters())
     # eval returns before the command buffer drops the cast's source tensors; wait, then empty the process-wide cache.
-    mx.synchronize()
+    # The cache is shared with any generation in flight, so drain its streams first, as every other clear here does.
+    from .generate import _drain_generation_streams
+
+    _drain_generation_streams(mx)
     mx.clear_cache()
     return model

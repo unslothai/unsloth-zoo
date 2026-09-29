@@ -155,3 +155,18 @@ def test_reduced_precision_keeps_norms_in_float32(checkpoint, dtype, atol, tmp_p
     assert model.encoder.embeddings(mx.zeros((1, 2), mx.int32)).dtype == mx.float32
     assert model.encoder.layers[1](mx.zeros((1, 2, 128)), None).dtype == mx.float32
     np.testing.assert_allclose(model.logits(batch), expected, atol = atol, rtol = 0)
+
+
+def test_load_drains_generation_streams_before_clearing_the_cache(checkpoint, monkeypatch):
+    import sys
+    import types
+
+    stream = mx.new_stream(mx.default_device())
+    monkeypatch.setitem(sys.modules, "mlx_lm.generate", types.SimpleNamespace(generation_stream = stream))
+    calls = []
+    synchronize, clear_cache = mx.synchronize, mx.clear_cache
+    monkeypatch.setattr(mx, "synchronize", lambda *a: calls.append(("sync", a)) or synchronize(*a))
+    monkeypatch.setattr(mx, "clear_cache", lambda: calls.append(("clear", ())) or clear_cache())
+    load_decision_model(checkpoint[1])
+    clear = calls.index(("clear", ()))
+    assert ("sync", (stream,)) in calls[:clear] and ("sync", ()) in calls[:clear]
