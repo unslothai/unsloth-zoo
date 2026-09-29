@@ -38,23 +38,27 @@ CHILD = textwrap.dedent(
 
     rows, head_grad = int(sys.argv[1]), sys.argv[2] == "1"
     vocab, hidden = 1024, 64
+    amp = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     gen = torch.Generator().manual_seed(0)
     lm_head = (torch.randn(vocab, hidden, generator = gen) * 0.05).cuda().requires_grad_(head_grad)
-    states = torch.randn(1, rows, hidden, generator = gen).cuda().requires_grad_(True)
+    states = torch.randn(1, rows, hidden, generator = gen).cuda().to(amp).requires_grad_(True)
     index = torch.randint(0, vocab, (1, rows), generator = gen).cuda()
     weights = torch.randn(1, rows, generator = gen).cuda()
 
-    out = f(states, lm_head, index, 16)
+    # float32 head under half-precision autocast: full fine-tuning with bf16=True / fp16=True.
+    with torch.autocast("cuda", dtype = amp):
+        out = f(states, lm_head, index, 16)
     (out * weights).sum().backward()
     got = [out.detach(), states.grad.clone()] + ([lm_head.grad.clone()] if head_grad else [])
     states.grad = None
     lm_head.grad = None
 
-    logits = states.reshape(-1, hidden) @ lm_head.t()
+    with torch.autocast("cuda", dtype = amp):
+        logits = (states.reshape(-1, hidden) @ lm_head.t()).float()
     ref = (logits.gather(-1, index.reshape(-1, 1)).squeeze(-1) - logits.logsumexp(-1)).reshape(1, rows)
     (ref * weights).sum().backward()
     want = [ref.detach(), states.grad] + ([lm_head.grad] if head_grad else [])
-    print(json.dumps([float((a - b).abs().max() / b.abs().max()) for a, b in zip(got, want)]))
+    print(json.dumps([float((a.float() - b.float()).abs().max() / b.float().abs().max()) for a, b in zip(got, want)]))
     """
 )
 
@@ -69,5 +73,5 @@ def test_one_row_chunk_matches_eager(rows, head_grad):
     )
     assert run.returncode == 0, run.stderr[-3000:]
     errors = json.loads(run.stdout.strip().splitlines()[-1])
-    # logps, hidden-state gradient, head gradient: float32 against one unchunked matmul.
-    assert max(errors) < 1e-4, errors
+    # logps, hidden-state gradient, head gradient against one unchunked matmul under the same autocast.
+    assert max(errors) < 1e-2, errors
