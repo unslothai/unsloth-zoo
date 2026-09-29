@@ -30,7 +30,7 @@ from typing import Any, Callable, Literal, Sequence
 import mlx.core as mx
 import mlx.nn as nn
 
-from .generate import SamplingParams
+from .generate import BatchRowRefused, SamplingParams
 
 __all__ = [
     "AssistantDrafter",
@@ -678,10 +678,11 @@ class StepOutput:
     finished: bool
     draft_n: int
     draft_n_accepted: int
+    logprobs: list[float] | None = None
 
 
 class _Row:
-    def __init__(self, row: EngineRow, controller: DraftController):
+    def __init__(self, row: EngineRow, controller: DraftController, scored: bool = False):
         self.uid = row.uid
         self.pending = int(row.pending)
         self.tokens = [int(token) for token in row.prompt] + [self.pending]
@@ -697,6 +698,7 @@ class _Row:
         self.draft_n = 0
         self.draft_n_accepted = 0
         self.draft = None
+        self.scores: list[float] | None = [] if scored else None
 
     @property
     def remaining(self) -> int | None:
@@ -712,10 +714,15 @@ class _Row:
 
     def normalize(self, logits: mx.array) -> mx.array:
         # A greedy draw is the argmax, which normalizing leaves unchanged.
-        return logits if self.sample.temperature == 0 else logits - mx.logsumexp(logits, axis = -1, keepdims = True)
+        return logits if self.sample.temperature == 0 and self.scores is None else logits - mx.logsumexp(logits, axis = -1, keepdims = True)
 
-    def take(self, tokens: Sequence[int]) -> list[int]:
-        """Emit ``tokens`` up to a stop token or the budget; the last one taken becomes pending."""
+    def draw(self, logprobs: mx.array, position: int) -> tuple[mx.array, mx.array | None]:
+        """Tokens for ``logprobs`` from ``position`` on, with their logprobs when the row keeps them."""
+        tokens = self.sample(logprobs, position)
+        return tokens, None if self.scores is None else mx.take_along_axis(logprobs, tokens[:, None], axis = -1)[:, 0]
+
+    def take(self, tokens: Sequence[int], scores: Sequence[float] | None = None) -> list[int]:
+        """Emit ``tokens`` (with their ``scores``) up to a stop token or the budget; the last one taken becomes pending."""
         taken = []
         for token in tokens:
             if self.finished:
@@ -726,6 +733,8 @@ class _Row:
         if taken:
             self.tokens.extend(taken)
             self.pending = taken[-1]
+            if self.scores is not None:
+                self.scores.extend(scores[: len(taken)])
         return taken
 
 
@@ -777,12 +786,13 @@ class SpeculativeEngine:
     ordinary decode steps. Rows join and leave only between steps, when every row holds exactly
     one pending token and the caches hold everything before it."""
 
-    def __init__(self, model, controller: DraftController, drafter = None):
+    def __init__(self, model, controller: DraftController, drafter = None, logprobs: bool = False):
         from mlx_vlm.speculative.common import generation_stream, verify_forward
 
         self.lm = getattr(model, "language_model", model)
         self.controller = controller
         self.drafter = drafter
+        self.logprobs = logprobs
         self._verify_forward = verify_forward
         self._stream = generation_stream
         # qwen3_5's exact verifier matches one-token decoding bitwise, alone and batched, and passing
@@ -804,7 +814,7 @@ class SpeculativeEngine:
     def add(self, row: EngineRow) -> None:
         if any(existing.uid == row.uid for existing in self._rows):
             raise ValueError(f"row {row.uid!r} is already in the engine")
-        state = _Row(row, self.controller)
+        state = _Row(row, self.controller, self.logprobs)
         if self.drafter is not None:
             if state.processors:
                 draft_cache = self.drafter.new_cache()
@@ -836,7 +846,10 @@ class SpeculativeEngine:
         emitted = self._round(plan, states) if plan.kind == "round" else None
         if emitted is None:
             emitted = self._plain(max(1, plan.length), states)
-        out = [StepOutput(row.uid, tokens, row.finished, row.draft_n, row.draft_n_accepted) for row, tokens in zip(self._rows, emitted)]
+        out = [
+            StepOutput(row.uid, tokens, row.finished, row.draft_n, row.draft_n_accepted, row.scores and row.scores[len(row.scores) - len(tokens) :])
+            for row, tokens in zip(self._rows, emitted)
+        ]
         for row in [row for row in self._rows if row.finished]:
             self.remove(row.uid)
         return out
@@ -872,14 +885,13 @@ class SpeculativeEngine:
             raise RuntimeError(f"{type(self.lm).__name__} returned no hidden states for the drafter")
         return _features(self.drafter, out)
 
-    def _step(self, inputs: mx.array, ahead: int = 0) -> tuple[mx.array, mx.array | None]:
+    def _step(self, inputs: mx.array, ahead: int = 0) -> tuple[mx.array, mx.array | None, mx.array | None]:
         """Forward one token per row and sample the next; ``ahead`` counts tokens already sampled
         for each row but not taken yet."""
         out = self.lm(inputs, cache = self.cache, **self._kwargs())
-        tokens = mx.concatenate(
-            [row.sample(row.logprobs(out.logits[i : i + 1, -1]), row.emitted + ahead) for i, row in enumerate(self._rows)]
-        )
-        return tokens, self._hidden(out)
+        drawn = [row.draw(row.logprobs(out.logits[i : i + 1, -1]), row.emitted + ahead) for i, row in enumerate(self._rows)]
+        scores = mx.concatenate([score for _, score in drawn]) if self.logprobs else None
+        return mx.concatenate([token for token, _ in drawn]), scores, self._hidden(out)
 
     def _verify(self, inputs: mx.array):
         if self._exact:
@@ -895,7 +907,7 @@ class SpeculativeEngine:
         pipelined = not any(row.processors for row in rows)
         start = time.perf_counter()
         with mx.stream(self._stream):
-            tokens, hidden = self._step(mx.array([[row.pending] for row in rows]))
+            tokens, scores, hidden = self._step(mx.array([[row.pending] for row in rows]))
         steps = 0
         while True:
             steps += 1
@@ -905,8 +917,9 @@ class SpeculativeEngine:
                 with mx.stream(self._stream):
                     upcoming = self._step(tokens[:, None], ahead = 1)
                 mx.async_eval(upcoming[0])
+            scores = None if scores is None else scores.tolist()
             for i, token in enumerate(tokens.tolist()):
-                taken = rows[i].take([token])
+                taken = rows[i].take([token], scores and scores[i : i + 1])
                 emitted[i].extend(taken)
                 if taken and rows[i].draft is not None:
                     self.drafter.push(rows[i].draft, taken, hidden[i, -1:])
@@ -918,7 +931,7 @@ class SpeculativeEngine:
             elif self.controller.interrupts_plain(self._states()):
                 # The next step is already queued, so it becomes the window's last.
                 length = steps + 1
-            tokens, hidden = upcoming
+            tokens, scores, hidden = upcoming
         self.controller.record_plain(states, steps, time.perf_counter() - start)
         return emitted
 
@@ -963,15 +976,16 @@ class SpeculativeEngine:
             return None
         try:
             with mx.stream(self._stream):
-                targets = []
+                drawn = []
                 for i, (row, length) in enumerate(zip(rows, lengths)):
                     if row.processors:
                         logprobs = row.logprobs(logits[i : i + 1, 0])
                     else:
                         logprobs = row.normalize(logits[i, : length + 1])
-                    targets.append(row.sample(logprobs, row.emitted))
-            mx.eval(targets if drafts is None else [*targets, drafts])
-            targets = [target.tolist() for target in targets]
+                    drawn.append(row.draw(logprobs, row.emitted))
+            mx.eval([array for pair in drawn for array in pair if array is not None] + ([] if drafts is None else [drafts]))
+            targets = [target.tolist() for target, _ in drawn]
+            scores = [None if score is None else score.tolist() for _, score in drawn]
             if depth:
                 drafted = drafts.tolist()
                 proposals = [
@@ -1013,7 +1027,7 @@ class SpeculativeEngine:
         for i, (row, proposal, target, count) in enumerate(zip(rows, proposals, targets, accepted)):
             row.draft_n += len(proposal)
             row.draft_n_accepted += count
-            taken = row.take(proposal[:count] + [target[count]])
+            taken = row.take(proposal[:count] + [target[count]], scores[i])
             if row.draft is not None and len(taken) > kept[i]:
                 # A head that kept its accepted draft entries already holds those pairs; record the rest.
                 self.drafter.push(row.draft, taken[kept[i] :], hidden[i, kept[i] : len(taken)])
@@ -1028,12 +1042,14 @@ class SpeculativeDraft:
     """``draft_model`` for mlx-vlm's ``generate_step`` (with ``draft_kind = draft.draft_kind``): after
     ``install_speculative_seam`` the reply decodes through the engine. Call ``prepare`` before each
     generation; mlx-vlm does not pass on the prompt or sampling. Not for requests with logits processors:
-    they cannot speculate, and the seam does not see them. The controller persists."""
+    they cannot speculate, and the seam does not see them. The controller persists. ``admit`` instead
+    prefills one row for an engine shared by many."""
 
     def __init__(self, controller: DraftController, drafter = None):
         self.controller = controller
         self.drafter = drafter
         self._request = None
+        self._admitted = None
 
     @property
     def draft_kind(self) -> str:
@@ -1052,24 +1068,49 @@ class SpeculativeDraft:
     def prepare(self, prompt: Sequence[int], sampling: SamplingParams) -> None:
         self._request = (list(prompt), sampling)
 
+    def admit(self, model, row: EngineRow, input_ids: mx.array, pixel_values = None, mask = None, **kwargs) -> tuple[EngineRow, float]:
+        """Prefill ``row``'s prompt alone through ``generate_step`` (vision inputs, chunking, the drafter's
+        capture) and return it ready for ``SpeculativeEngine.add``, with its first token drawn by the
+        engine's sampler and that token's logprob. Needs ``install_speculative_seam``."""
+        import importlib
+
+        ar = importlib.import_module("mlx_vlm.generate.ar")
+        self._request = row
+        for _ in ar.generate_step(input_ids, model, pixel_values, mask, draft_model = self, draft_kind = self.draft_kind, **kwargs):
+            pass
+        admitted, self._admitted = self._admitted, None
+        return admitted
+
     def rounds(self, model, prompt_cache, input_ids, first_token, logprobs, last_outputs, *, max_tokens, **_):
         if self._request is None:
             raise RuntimeError("SpeculativeDraft.prepare() must be called before each generation")
-        (prompt, sampling), self._request = self._request, None
+        request, self._request = self._request, None
+        if getattr(last_outputs, "cross_attention_states", None) is not None or getattr(last_outputs, "encoder_outputs", None) is not None:
+            raise BatchRowRefused(f"{type(model).__name__} carries encoder state from forward to forward, which speculative decoding does not.")
+        if isinstance(request, EngineRow):
+            logits = last_outputs.logits[:, -1]
+            for processor in request.processors:
+                logits = processor(mx.array(request.prompt), logits)
+            logits = logits - mx.logsumexp(logits, axis = -1, keepdims = True)
+            first = int(_RowSampler(request.sampling)(logits, 0).item())
+            self._admitted = (self._started(model, replace(request, cache = prompt_cache, pending = first), last_outputs), logits[0, first].item())
+            return
+        prompt, sampling = request
         first = int(first_token.item())
         yield first, logprobs
+        engine = SpeculativeEngine(model, self.controller, self.drafter)
+        engine.add(self._started(model, EngineRow(prompt_cache, first, prompt, sampling, max_tokens), last_outputs))
+        while engine.rows:
+            for step in engine.step():
+                yield from ((token, None) for token in step.tokens)
+
+    def _started(self, model, row: EngineRow, last_outputs) -> EngineRow:
+        """``row`` with the prefill's rope delta and the drafter's features of the prompt."""
         deltas = getattr(getattr(model, "language_model", model), "_rope_deltas", None)
         hidden = _features(self.drafter, last_outputs) if self.drafter is not None and last_outputs.hidden_states else None
         if hidden is not None and self.prompt_tail:
             hidden = hidden[:, -self.prompt_tail :]
-        engine = SpeculativeEngine(model, self.controller, self.drafter)
-        engine.add(EngineRow(
-            cache = prompt_cache, pending = first, prompt = prompt, sampling = sampling, max_tokens = max_tokens,
-            rope_delta = 0 if deltas is None else int(mx.array(deltas).reshape(-1)[0].item()), hidden = hidden,
-        ))
-        while engine.rows:
-            for step in engine.step():
-                yield from ((token, None) for token in step.tokens)
+        return replace(row, rope_delta = 0 if deltas is None else int(mx.array(deltas).reshape(-1)[0].item()), hidden = hidden)
 
 
 def install_speculative_seam() -> None:

@@ -20,7 +20,7 @@ PAST_WINDOW = "Summarize these notes in one paragraph:\n" + "The planets orbit t
 def _load(repo, *extra):
     from mlx_vlm import load
     model, processor = load(repo)
-    tok = processor.tokenizer
+    model._processor, tok = processor, processor.tokenizer
     ids = [
         tok.encode(tok.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt = True, tokenize = False), add_special_tokens = False)
         for p in [*PROMPTS, *extra]
@@ -316,6 +316,67 @@ def test_eagle3_narrower_than_its_target_drafts_from_the_concatenated_layers_row
         out, drafted, _ = _run(model, prompts, 48, _script(*script), SamplingParams(), drafter = drafter)
         assert out == [_solo(model, prompt, 48, SamplingParams()) for prompt in prompts] and all(n for n, _ in drafted.values()) and drafter.start(prompts[0], None, 0) == (None, [])
 
+
+@pytest.mark.parametrize("companion", [None, "z-lab/Qwen3.5-4B-DFlash"])
+def test_speculative_batch_stream_rows_join_and_leave_as_if_decoded_alone(qwen, monkeypatch, companion):
+    from unsloth_zoo.mlx.generate import BatchStream, GenerationRequest, SamplingParams
+    from unsloth_zoo.mlx.speculative import ContextDrafter, SpeculativeDraft
+    (model, _), ar = qwen, __import__("mlx_vlm.generate.ar", fromlist = ["ar"])
+    monkeypatch.setattr(model, "_is_vlm_model", True, raising = False)
+    tok = model._processor.tokenizer
+    texts = [tok.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt = True, tokenize = False) for p in PROMPTS]
+    greedy = [GenerationRequest(prompt = texts[0], max_tokens = 40), GenerationRequest(prompt = texts[1], max_tokens = 200)]
+    sampled = GenerationRequest(prompt = texts[1], max_tokens = 32, sampling = SamplingParams(temperature = 0.8, top_k = 20, seed = 7))
+    reference = lambda request: list(ar.generate_step(mx.array([tok.encode(request.prompt, add_special_tokens = False)]), model, None, None,
+                                                      max_tokens = request.max_tokens, temperature = 0.0, logits_processors = request.logits_processors))
+    upstream = [reference(request) for request in greedy]
+    # History-free, so mlx-vlm applies it as the batch does: it bans the second reply's greedy opening.
+    bias = mx.zeros_like(upstream[1][0][1]).at[upstream[1][0][0]].add(-1e9)
+    greedy.append(GenerationRequest(prompt = texts[1], max_tokens = 24, logits_processors = [lambda tokens, logits: logits + bias]))
+    upstream.append(reference(greedy[2]))
+
+    def run(schedule):
+        # Rounds only: batched plain windows carry ordinary batched numerics.
+        drafter = companion and ContextDrafter(_tiny_companion(model, companion), model.language_model)
+        with BatchStream(model, None, speculative = SpeculativeDraft(_script(("draft", 3), ("copy", 4)) if drafter else _rounds_only(), drafter)) as stream:
+            rows, results, step = {}, {}, 0
+            while step <= max(schedule) or stream.rows_in_flight:
+                if step in schedule:
+                    rows[stream.add(schedule[step])] = step
+                results.update({rows[event.index]: event.result for event in stream.step() if event.result is not None})
+                step += 1
+        return results
+
+    batched, alone = run({0: greedy[0], 3: greedy[1], 6: sampled, 7: greedy[2]}), run({0: sampled})
+    for request, result, expected in zip(greedy, (batched[0], batched[3], batched[7]), upstream):
+        n = len(result.token_ids)
+        # A stop token ends the reply without joining its text.
+        assert result.token_ids == [token for token, _ in expected[:n]] and (n == request.max_tokens or expected[n][0] in tok.stopping_criteria.eos_token_ids)
+        assert result.logprobs == pytest.approx([logprobs[token].item() for token, logprobs in expected[:n]], abs = 0.02)
+    assert (batched[6].token_ids, batched[6].logprobs) == (alone[0].token_ids, alone[0].logprobs)
+    assert [batched[0].finish_reason, batched[3].finish_reason] == ["length", "stop"]
+    assert batched[0].draft_tokens >= batched[0].accepted_draft_tokens > 0
+    # Rows that join mid-flight draft from the features their own prefill captured.
+    assert not companion or all(batched[row].draft_tokens > 0 for row in (3, 6))
+
+
+
+def test_speculative_batch_stream_leaves_no_row_behind_when_admission_fails(qwen, monkeypatch):
+    from dataclasses import replace
+    from unsloth_zoo.mlx import generate
+    from unsloth_zoo.mlx.speculative import SpeculativeDraft
+    model, request = qwen[0], generate.GenerationRequest(prompt = "Name three colours.", max_tokens = 4)
+    call = type(model.language_model).__call__
+    monkeypatch.setattr(model, "_is_vlm_model", True, raising = False)
+    with generate.BatchStream(model, None, speculative = SpeculativeDraft(_rounds_only())) as stream:
+        with monkeypatch.context() as patch:
+            patch.setattr(generate, "_new_detokenizer", lambda *args, **kwargs: 1 / 0)
+            pytest.raises(ZeroDivisionError, stream.add, request)
+        with monkeypatch.context() as patch:
+            # Encoder-decoder models hand encoder state to every later forward.
+            patch.setattr(type(model.language_model), "__call__", lambda self, *args, **kwargs: replace(call(self, *args, **kwargs), encoder_outputs = mx.zeros(1)))
+            pytest.raises(generate.BatchRowRefused, stream.add, request)
+        assert (stream.rows_in_flight, stream._session.engine.rows, stream._session.usable) == (0, [], True)
 
 
 def _tiny_companion(model, repo):
