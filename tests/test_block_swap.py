@@ -257,6 +257,19 @@ def test_non_reentrant_checkpoint_forward_evicts_like_no_grad():
     assert sw._grew is False
 
 
+def test_enter_leave_are_no_ops_after_remove():
+    # The fast decode loop keeps its reference after remove(); an emptied pool must not be indexed.
+    sw = _scheduler(4, depth = 2)
+    sw.streams = {}
+    for b in sw.blocks:
+        b.params, b.host, b.devices = [], [], []
+    sw.remove()
+    for i in range(4):
+        sw.enter(i)
+        sw.leave(i)
+    sw.reset()
+
+
 def test_find_decoder_layers_through_common_wrappers():
     class Inner(nn.Module):
         def __init__(self):

@@ -309,6 +309,8 @@ class BlockSwap:
                     for p, h, d in zip(b.params, b.host, b.devices):
                         p.data = h.to(d, copy = True)
                     b.resident = True
+        # Callers holding this object (the fast decode loop) must see a no-op, not an empty pool.
+        self.blocks = []
         for dev in self.streams:
             torch.cuda.synchronize(dev)
 
