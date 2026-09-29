@@ -270,6 +270,25 @@ def test_enter_leave_are_no_ops_after_remove():
     sw.reset()
 
 
+def test_training_forward_keeps_the_blocks_recompute_needs_first():
+    class M:
+        training = True
+    sw = _scheduler(6, depth = 2)
+    with torch.no_grad():
+        for i in range(6):
+            sw._pre(i)(M, None)
+            sw._post(i)(M, None, None)
+    assert [b.resident for b in sw.blocks] == [False] * 4 + [True, True]
+    # Eval forwards still evict everything.
+    sw = _scheduler(6, depth = 2)
+    M.training = False
+    with torch.no_grad():
+        for i in range(6):
+            sw._pre(i)(M, None)
+            sw._post(i)(M, None, None)
+    assert not any(b.resident for b in sw.blocks[2:])
+
+
 def test_find_decoder_layers_through_common_wrappers():
     class Inner(nn.Module):
         def __init__(self):
@@ -365,22 +384,76 @@ def test_params4bit_round_trip_is_bitwise():
     assert all(len(l._forward_pre_hooks) == 0 for l in layers)
 
 
-def test_host_loaded_layer_is_adopted_not_copied():
+def test_host_loaded_layer_is_packed_and_its_original_released():
     if not torch.cuda.is_available():
         print("[SKIP] CUDA not available")
         return
     torch.manual_seed(0)
     lin = nn.Linear(64, 64, bias = False).requires_grad_(False)
-    host = lin.weight.data.pin_memory()
+    host = lin.weight.data.clone()
     lin.weight.data = host
     x = torch.randn(2, 64, device = "cuda")
     ref = x @ host.to("cuda").t()
     layers = nn.ModuleList([nn.Linear(64, 64).cuda(), lin])
     sw = BlockSwap(layers, 1, prefetch_depth = 1, device = "cuda")
-    assert sw.blocks[0].host[0].data_ptr() == host.data_ptr(), "an already-pinned host weight is used as is"
+    packed = sw.blocks[0].host[0]
+    assert torch.equal(packed, host) and packed.data_ptr() != host.data_ptr()
+    assert lin.weight.data_ptr() != host.data_ptr(), "the pageable original is not kept alongside the packed copy"
     with torch.no_grad():
         sw.enter(1)
         out = lin(x)
         sw.leave(1)
     assert torch.equal(ref, out)
     assert lin.weight.device.type == "cuda"
+
+
+def _linear_tail():
+    # 4.5 MiB blobs: torch's pinned allocator would hold 8 MiB for each.
+    return nn.ModuleList([nn.Linear(1536, 1536, bias = False).cuda().requires_grad_(False) for _ in range(4)])
+
+
+def test_host_copies_are_pinned_in_place_at_their_exact_size():
+    if not torch.cuda.is_available():
+        print("[SKIP] CUDA not available")
+        return
+    layers = _linear_tail()
+    x = torch.randn(2, 1536, device = "cuda")
+    with torch.no_grad():
+        ref = layers[3](x).clone()
+    sw = BlockSwap(layers, 3, prefetch_depth = 1)
+    need = sw.host_bytes()
+    assert need == 3 * 1536 * 1536 * 4
+    arena = sw._chunks[0]
+    assert arena.numel() == need and sw.pinned_bytes == need, "pinned exactly, no power-of-two rounding"
+    for b in sw.blocks:
+        assert b.host[0].is_pinned()
+        assert arena.data_ptr() <= b.host[0].data_ptr() < arena.data_ptr() + need
+    with torch.no_grad():
+        sw.enter(3)
+        out = layers[3](x)
+        sw.leave(3)
+    assert torch.equal(ref, out)
+    sw.remove()
+    assert not arena.is_pinned(), "remove() unregisters the arena"
+
+
+def test_chunked_fallback_when_registration_is_unavailable():
+    if not torch.cuda.is_available():
+        print("[SKIP] CUDA not available")
+        return
+    orig = BlockSwap._pack_registered
+    BlockSwap._pack_registered = lambda self: False
+    try:
+        sw = BlockSwap(_linear_tail(), 3, prefetch_depth = 1)
+    finally:
+        BlockSwap._pack_registered = orig
+    need = sw.host_bytes()
+    assert len(sw._chunks) == 1 and sw._chunks[0].numel() < 2 * need
+    lo = sw._chunks[0].data_ptr()
+    hi = lo + sw._chunks[0].numel()
+    for b in sw.blocks:
+        r = b.host_buf[b.devices[0]]
+        assert lo <= r.data_ptr() and r.data_ptr() + r.numel() <= hi, "every block lives inside the shared chunk"
+    sw.remove()
+
+

@@ -44,21 +44,65 @@ def _no_inference_mode():
 
 # WSL2 caps pinned memory: fall back to pageable.
 _PINNED_MEMORY_AVAILABLE = True
+# torch's pinned allocator rounds every allocation up to a power of two (a 4.5 MiB blob holds 8 MiB),
+# so blocks are packed into shared power-of-two chunks, as diffusion group offload does.
+_ALIGN = 512
+_CHUNK_BYTES = 256 << 20
+# Pin only while this much host RAM stays free: max(4 GiB, 15%); the rest stays pageable.
+_PIN_RESERVE_MIN_BYTES = 4 << 30
+_PIN_RESERVE_FRACTION = 0.15
 
 
-def _to_pinned_host(t):
-    global _PINNED_MEMORY_AVAILABLE
-    host = t.to("cpu", copy = True)
-    if not _PINNED_MEMORY_AVAILABLE or os.environ.get("UNSLOTH_DISABLE_PINNED_MEMORY", "0") == "1":
-        return host
+def _host_copy(t):
+    return t.detach().to("cpu", copy = True).contiguous()
+
+
+def _pow2_ceil(n):
+    return 1 << max(0, (int(n) - 1).bit_length())
+
+
+def _pin_budget():
     try:
-        return host.pin_memory()
-    except RuntimeError as e:
-        # Some builds report only "cudaErrorMemoryAllocation".
-        text = str(e).lower()
-        if "out of memory" not in text and "cudaerrormemoryallocation" not in text: raise
-        _PINNED_MEMORY_AVAILABLE = False
-        return host
+        import psutil
+        vm = psutil.virtual_memory()
+        return vm.available - max(_PIN_RESERVE_MIN_BYTES, int(vm.total * _PIN_RESERVE_FRACTION))
+    except Exception:
+        return 0
+
+
+class _Registered:
+    """Page-locks the first `nbytes` of pageable `buf` in place (exact size, no allocator rounding)."""
+
+    def __init__(self, buf, nbytes):
+        self.buf, self.ptr = buf, None
+        rc = torch.cuda.cudart().cudaHostRegister(buf.data_ptr(), nbytes, 0)
+        if int(rc) != 0:
+            raise RuntimeError(f"cudaHostRegister failed: {rc}")
+        self.ptr = buf.data_ptr()
+
+    def __del__(self):
+        # Before the buffer can be freed: a freed range left registered would pin whatever lands there next.
+        if self.ptr is not None:
+            try:
+                torch.cuda.cudart().cudaHostUnregister(self.ptr)
+            except Exception:
+                pass
+            self.ptr = None
+
+
+def _host_chunk(nbytes, budget):
+    """A uint8 host buffer, pinned while `budget` allows; returns (buffer, bytes pinned)."""
+    global _PINNED_MEMORY_AVAILABLE
+    if (_PINNED_MEMORY_AVAILABLE and nbytes <= budget
+            and os.environ.get("UNSLOTH_DISABLE_PINNED_MEMORY", "0") != "1"):
+        try:
+            return torch.empty(nbytes, dtype = torch.uint8, pin_memory = True), nbytes
+        except RuntimeError as e:
+            # Some builds report only "cudaErrorMemoryAllocation".
+            text = str(e).lower()
+            if "out of memory" not in text and "cudaerrormemoryallocation" not in text: raise
+            _PINNED_MEMORY_AVAILABLE = False
+    return torch.empty(nbytes, dtype = torch.uint8), 0
 
 
 _CHECKPOINT_FILE = os.path.join("torch", "utils", "checkpoint.py")
@@ -93,7 +137,8 @@ def _swappable(module):
 
 
 class _Block:
-    __slots__ = ("params", "host", "devices", "index", "streams", "events", "resident", "slot", "sig", "pending")
+    __slots__ = ("params", "host", "devices", "index", "streams", "events", "resident", "slot", "sig",
+                 "pending", "layout", "sizes", "src", "empties", "host_buf")
 
     def __init__(self, layer, streams, device):
         self.params, self.host, self.devices = [], [], []
@@ -101,29 +146,44 @@ class _Block:
         for name, p in _swappable(layer):
             index[id(p)] = len(self.params)
             self.params.append(p)
-            if p.data.device.type == "cpu":
-                self.host.append(p.data if p.data.is_pinned() else _to_pinned_host(p.data))
-                self.devices.append(device)
-            else:
-                self.host.append(_to_pinned_host(p.data))
-                self.devices.append(p.data.device)
+            self.devices.append(device if p.data.device.type == "cpu" else p.data.device)
         self.index = index
+        # Each device's weights sit back to back, so a fetch is one copy per device, not one per tensor.
+        self.layout, self.sizes = [], {}
+        for p, d in zip(self.params, self.devices):
+            off = self.sizes.get(d, 0)
+            self.layout.append(off)
+            self.sizes[d] = off + -(-p.data.nbytes // _ALIGN) * _ALIGN
         for d in self.devices:
             if d not in streams:
                 streams[d] = torch.cuda.Stream(device = d)
         self.streams = streams
-        self.events = {d: torch.cuda.Event() for d in self.devices}
+        self.events = {d: torch.cuda.Event() for d in self.sizes}
+        self.empties = [torch.empty(0, device = d, dtype = p.dtype) for p, d in zip(self.params, self.devices)]
         self.resident = True
         self.slot = None
         # Ran with grad on and autograd holds its weights until the backward hook fires.
         self.pending = False
-        self.sig = tuple((tuple(h.shape), h.dtype, d) for h, d in zip(self.host, self.devices))
+        self.src, self.host_buf = {}, {}
+        self.sig = tuple((tuple(p.shape), p.dtype, d, off) for p, d, off in zip(self.params, self.devices, self.layout))
+
+    def nbytes(self):
+        return sum(self.sizes.values())
+
+    def pack(self, regions):
+        """Copy the weights into host `regions` {device: uint8 view}; host[i] become views into them."""
+        self.host_buf = regions
+        with torch.no_grad():
+            for p, d, off in zip(self.params, self.devices, self.layout):
+                view = regions[d][off:off + p.data.nbytes].view(p.dtype).view(p.shape)
+                view.copy_(p.data)
+                self.host.append(view)
 
     def evict(self):
         if not self.resident:
             return
-        for p, d in zip(self.params, self.devices):
-            p.data = torch.empty(0, device = d, dtype = p.data.dtype)
+        for p, e in zip(self.params, self.empties):
+            p.data = e
         self.resident = False
         self.pending = False
         freed, self.slot = self.slot, None
@@ -132,25 +192,21 @@ class _Block:
     def prefetch(self, slot):
         if self.resident:
             return
+        bufs, views = slot
         for d, event in self.events.items():
             stream = self.streams[d]
             stream.wait_stream(torch.cuda.current_stream(d))
             with torch.cuda.stream(stream):
-                for dst, h, pd in zip(slot, self.host, self.devices):
-                    if pd == d:
-                        dst.copy_(h, non_blocking = True)
+                bufs[d].copy_(self.host_buf[d], non_blocking = True)
                 event.record(stream)
-        for p, dst in zip(self.params, slot):
-            p.data = dst
+        for p, v in zip(self.params, views):
+            p.data = v
         self.slot = slot
         self.resident = True
 
     def wait(self):
         for d, event in self.events.items():
             torch.cuda.current_stream(d).wait_event(event)
-
-    def nbytes(self):
-        return sum(h.numel() * h.element_size() for h in self.host)
 
 
 class BlockSwap:
@@ -162,6 +218,8 @@ class BlockSwap:
         self.streams = {}
         self.free = {}
         self._grew = False
+        self._chunks = []
+        self.pinned_bytes = 0
         self.start = len(layers)
         if n <= 0:
             return
@@ -199,8 +257,7 @@ class BlockSwap:
                 # Evicted weights are empty: state_dict must read the host copy.
                 self.handles.append(layer._register_state_dict_hook(self._state_dict(i)))
 
-            for b in self.blocks:
-                self._release(b)
+            self._pack()
 
             sigs = [b.sig for b in self.blocks]
             for sig in set(sigs):
@@ -210,6 +267,57 @@ class BlockSwap:
         except Exception:
             self.remove()
             raise
+
+    def _pack(self):
+        # Block by block, releasing each original as soon as it is packed: never two host copies of the tail.
+        if self._pack_registered():
+            return
+        left = sum(b.nbytes() for b in self.blocks)
+        chunk = max(_CHUNK_BYTES, _pow2_ceil(max(max(b.sizes.values(), default = 0) for b in self.blocks)))
+        budget = _pin_budget()
+        buf, used = None, 0
+        for b in self.blocks:
+            regions = {}
+            for d, need in b.sizes.items():
+                if buf is None or used + need > buf.numel():
+                    buf, pinned = _host_chunk(chunk if left >= chunk else _pow2_ceil(left), budget - self.pinned_bytes)
+                    self.pinned_bytes += pinned
+                    self._chunks.append(buf)
+                    used = 0
+                regions[d] = buf[used:used + need]
+                used += need
+                left -= need
+            b.pack(regions)
+            self._release(b)
+
+    def _pack_registered(self):
+        # One exact-size pageable arena, page-locked in place up to the budget (cudaHostRegister).
+        global _PINNED_MEMORY_AVAILABLE
+        if (not _PINNED_MEMORY_AVAILABLE or os.environ.get("UNSLOTH_DISABLE_PINNED_MEMORY", "0") == "1"
+                or not hasattr(torch.cuda.cudart(), "cudaHostRegister")):
+            return False
+        total = sum(b.nbytes() for b in self.blocks)
+        arena = torch.empty(total, dtype = torch.uint8)
+        used, ends = 0, []
+        for b in self.blocks:
+            regions = {}
+            for d, need in b.sizes.items():
+                regions[d] = arena[used:used + need]
+                used += need
+            b.pack(regions)
+            self._release(b)
+            ends.append(used)
+        # Pin whole blocks only: a copy from half-pinned memory is staged synchronously.
+        budget = _pin_budget()
+        pin = max([e for e in ends if e <= budget], default = 0)
+        self._chunks.append(arena)
+        if pin > 0:
+            try:
+                self._chunks.append(_Registered(arena, pin))
+                self.pinned_bytes = pin
+            except Exception:
+                _PINNED_MEMORY_AVAILABLE = False
+        return True
 
     def _release(self, block):
         freed = block.evict()
@@ -235,8 +343,15 @@ class BlockSwap:
         return free.pop() if free else None
 
     def _new_slot(self, sig):
+        sizes = {}
+        for shape, dt, dv, off in sig:
+            n = torch.Size(shape).numel() * torch.empty(0, dtype = dt).element_size()
+            sizes[dv] = max(sizes.get(dv, 0), off + -(-n // _ALIGN) * _ALIGN)
         with _no_inference_mode():
-            return [torch.empty(shape, dtype = dt, device = dv) for shape, dt, dv in sig]
+            bufs = {dv: torch.empty(n, dtype = torch.uint8, device = dv) for dv, n in sizes.items()}
+            views = [bufs[dv][off:off + torch.Size(shape).numel() * torch.empty(0, dtype = dt).element_size()]
+                     .view(dt).view(shape) for shape, dt, dv, off in sig]
+        return bufs, views
 
     def _fetch(self, block, steal = False):
         if block.resident:
@@ -268,7 +383,9 @@ class BlockSwap:
         def hook(module, args, output):
             # With grad on, backward still needs the weight; the backward hook evicts.
             if not _autograd_keeps_weights():
-                self._release(self.blocks[i])
+                # A training forward's last blocks are the first ones recompute needs: keep them.
+                if not (getattr(module, "training", False) and i >= len(self.blocks) - self.depth):
+                    self._release(self.blocks[i])
             else:
                 self.blocks[i].pending = True
             return output
@@ -323,6 +440,7 @@ class BlockSwap:
                     b.resident = True
         # Callers holding this object (the fast decode loop) must see a no-op, not an empty pool.
         self.blocks = []
+        self._chunks = []
         for dev in self.streams:
             torch.cuda.synchronize(dev)
 
@@ -332,7 +450,7 @@ class BlockSwap:
     def pool_bytes(self):
         held = [b.slot for b in self.blocks if b.slot is not None]
         free = [slot for slots in self.free.values() for slot in slots]
-        return sum(t.numel() * t.element_size() for slot in held + free for t in slot)
+        return sum(t.numel() for bufs, _ in held + free for t in bufs.values())
 
     def signatures(self):
         return len(self.free)
@@ -378,7 +496,7 @@ def build_host_layers(make_layer, first_idx, count, tensors, device, compute_dty
             stats = {k[len(key) + 1:]: tensors[k] for k in tensors if k.startswith(key + ".")}
             bias = None
             if mod.bias is not None:
-                bias = torch.nn.Parameter(_to_pinned_host(tensors[base + mname + ".bias"]().to(compute_dtype)),
+                bias = torch.nn.Parameter(_host_copy(tensors[base + mname + ".bias"]().to(compute_dtype)),
                                           requires_grad = False)
             skipped = any(s in mname.split(".") for s in skip_modules)
             if stats or (quantize_4bit and not skipped):
@@ -397,11 +515,11 @@ def build_host_layers(make_layer, first_idx, count, tensors, device, compute_dty
                 w.quant_state.dtype = compute_dtype
                 new.weight = w
                 new.quant_state = w.quant_state
-                w.data = _to_pinned_host(w.data)
+                w.data = _host_copy(w.data)
                 torch.cuda.empty_cache()
             else:
                 new = torch.nn.Linear(mod.in_features, mod.out_features, bias = bias is not None, device = "meta")
-                new.weight = torch.nn.Parameter(_to_pinned_host(tensors[key]().to(compute_dtype)),
+                new.weight = torch.nn.Parameter(_host_copy(tensors[key]().to(compute_dtype)),
                                                 requires_grad = False)
             if bias is not None:
                 new.bias = bias
@@ -415,7 +533,7 @@ def build_host_layers(make_layer, first_idx, count, tensors, device, compute_dty
                 t = t.to(compute_dtype)
             parent_name, _, child = pname.rpartition(".")
             parent = layer.get_submodule(parent_name) if parent_name else layer
-            setattr(parent, child, torch.nn.Parameter(_to_pinned_host(t), requires_grad = False))
+            setattr(parent, child, torch.nn.Parameter(_host_copy(t), requires_grad = False))
         for bname, b in layer.named_buffers():
             if b.device.type == "meta":
                 raise RuntimeError(f"block_swap: {base}{bname} is a buffer with no checkpoint value")
