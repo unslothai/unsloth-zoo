@@ -1158,9 +1158,6 @@ def _mlx_batch_input_token_count(batch_data, mode="all", pad_token_id=None):
     return int(math.prod(arr.shape))
 
 
-# Fields added after the original public MLXTrainingConfig surface. Keep them a
-# suffix of the declaration order (append new ones at the end and list them
-# here) so positional copies from older configs keep mapping correctly.
 def _reject_group_by_length(order, context):
     """Fail loudly where length grouping cannot be honored.
 
@@ -1246,6 +1243,9 @@ def _resolve_text_dataset_order(args, *, for_training=True):
     return "sequential" if preserve else dataset_order
 
 
+# Fields added after the original public MLXTrainingConfig surface. Keep them a
+# suffix of the declaration order (append new ones at the end and list them
+# here) so positional copies from older configs keep mapping correctly.
 _MLX_CONFIG_OPTIONAL_COPY_FIELDS = (
     "max_eval_batches",
     "streaming_text_length_window_batches",

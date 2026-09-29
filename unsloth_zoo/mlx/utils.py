@@ -12752,6 +12752,8 @@ def _finite_batch_schedule(
                 break
         epoch += 1
     return tuple(schedule), cycle_length
+
+
 def _text_row_length(row):
     """Token count of a text plan row, which is ``ids`` when unlabeled and
     ``(ids, labels)`` once a prompt/completion boundary is known."""
