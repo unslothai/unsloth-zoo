@@ -60,6 +60,17 @@ def _to_pinned_host(t):
         return host
 
 
+def _autograd_keeps_weights():
+    if not torch.is_grad_enabled():
+        return False
+    try:
+        hooks = torch._C._autograd._top_saved_tensors_default_hooks(False)
+    except Exception:
+        return True
+    # Non-reentrant checkpoint forward saves nothing; its recompute refetches through the hooks.
+    return hooks is None or not getattr(hooks[0], "__qualname__", "").startswith("_checkpoint_hook.")
+
+
 def _swappable(module):
     out = []
     for name, p in module.named_parameters(recurse = True):
@@ -70,7 +81,7 @@ def _swappable(module):
 
 
 class _Block:
-    __slots__ = ("params", "host", "devices", "index", "streams", "events", "resident", "slot", "sig")
+    __slots__ = ("params", "host", "devices", "index", "streams", "events", "resident", "slot", "sig", "pending")
 
     def __init__(self, layer, streams, device):
         self.params, self.host, self.devices = [], [], []
@@ -92,6 +103,8 @@ class _Block:
         self.events = {d: torch.cuda.Event() for d in self.devices}
         self.resident = True
         self.slot = None
+        # Ran with grad on and autograd holds its weights until the backward hook fires.
+        self.pending = False
         self.sig = tuple((tuple(h.shape), h.dtype, d) for h, d in zip(self.host, self.devices))
 
     def evict(self):
@@ -100,6 +113,7 @@ class _Block:
         for p, d in zip(self.params, self.devices):
             p.data = torch.empty(0, device = d, dtype = p.data.dtype)
         self.resident = False
+        self.pending = False
         freed, self.slot = self.slot, None
         return freed
 
@@ -135,6 +149,7 @@ class BlockSwap:
         self.depth = max(1, prefetch_depth)
         self.streams = {}
         self.free = {}
+        self._grew = False
         self.start = len(layers)
         if n <= 0:
             return
@@ -176,12 +191,8 @@ class BlockSwap:
                 self._release(b)
 
             sigs = [b.sig for b in self.blocks]
-            with _no_inference_mode():
-                for sig in set(sigs):
-                    self.free[sig] = [
-                        [torch.empty(shape, dtype = dt, device = dv) for shape, dt, dv in sig]
-                        for _ in range(min(self.depth + 1, sigs.count(sig)))
-                    ]
+            for sig in set(sigs):
+                self.free[sig] = [self._new_slot(sig) for _ in range(min(self.depth + 1, sigs.count(sig)))]
 
             self._arm(forward = True)
         except Exception:
@@ -197,11 +208,23 @@ class BlockSwap:
         free = self.free[block.sig]
         if not free and steal:
             # Only after an interrupted step; prefetches never steal (could evict the running block).
+            # A pending block's slot is still read by backward: reusing it corrupts gradients silently.
             for b in self.blocks:
-                if b is not block and b.sig == block.sig and b.resident and b.slot is not None:
+                if b is not block and b.sig == block.sig and b.resident and b.slot is not None and not b.pending:
                     self._release(b)
                     break
+            else:
+                # Grad-on forward order (no per-layer checkpoint, or several layers in one region).
+                if not self._grew:
+                    print("Unsloth: block_swap needs per-layer gradient checkpointing to save memory; "
+                          "growing the slot pool instead so gradients stay correct.")
+                    self._grew = True
+                return self._new_slot(block.sig)
         return free.pop() if free else None
+
+    def _new_slot(self, sig):
+        with _no_inference_mode():
+            return [torch.empty(shape, dtype = dt, device = dv) for shape, dt, dv in sig]
 
     def _fetch(self, block, steal = False):
         if block.resident:
@@ -222,8 +245,8 @@ class BlockSwap:
             b = self.blocks[i]
             self._fetch(b, steal = True)
             b.wait()
-            # grad on = recompute sweep, which walks layers in reverse.
-            nxt = i + self.depth if not torch.is_grad_enabled() else i - self.depth
+            # Weights kept for backward = recompute sweep, which walks layers in reverse.
+            nxt = i - self.depth if _autograd_keeps_weights() else i + self.depth
             if 0 <= nxt < len(self.blocks):
                 self._fetch(self.blocks[nxt])
             return None
@@ -232,8 +255,10 @@ class BlockSwap:
     def _post(self, i):
         def hook(module, args, output):
             # With grad on, backward still needs the weight; the backward hook evicts.
-            if not torch.is_grad_enabled():
+            if not _autograd_keeps_weights():
                 self._release(self.blocks[i])
+            else:
+                self.blocks[i].pending = True
             return output
         return hook
 

@@ -43,12 +43,14 @@ class _FakeBlock:
         self.sig = sig
         self.resident = True
         self.slot = None
+        self.pending = False
         self.fetches = 0
 
     def evict(self):
         if not self.resident:
             return None
         self.resident = False
+        self.pending = False
         freed, self.slot = self.slot, None
         return freed
 
@@ -72,6 +74,8 @@ def _scheduler(n, depth = 2, sigs = None, start = 0):
     sw.blocks = [_FakeBlock(s) for s in sigs]
     sw.free = {s: [object() for _ in range(depth + 1)] for s in set(sigs)}
     sw.start = start
+    sw._grew = False
+    sw._new_slot = lambda sig: object()
     for b in sw.blocks:
         sw._release(b)
     sw._arm(forward = True)
@@ -215,6 +219,42 @@ def test_interrupted_step_never_evicts_the_block_about_to_run():
             sw._pre(i)(None, None)
             assert sw.blocks[i].resident, i
             sw._post(i)(None, None, None)
+
+
+def test_grad_on_forward_order_never_reuses_a_slot_backward_still_reads():
+    # Plain forward (or several layers in one reentrant checkpoint): every block keeps its weights for backward.
+    sw = _scheduler(8, depth = 2)
+    slots = []
+    with torch.enable_grad():
+        for i in range(8):
+            sw._pre(i)(None, None)
+            assert sw.blocks[i].resident, i
+            sw._post(i)(None, None, None)
+            slots.append(sw.blocks[i].slot)
+    assert all(b.resident and b.pending for b in sw.blocks)
+    assert len({id(s) for s in slots}) == 8, "a slot was handed to two blocks autograd still reads"
+    for i in reversed(range(8)):
+        sw._bwd(i)(None, None, None)
+    assert not any(b.pending for b in sw.blocks)
+
+
+def test_non_reentrant_checkpoint_forward_evicts_like_no_grad():
+    import torch.utils.checkpoint as cp
+    sw = _scheduler(6, depth = 2)
+    x = torch.ones(1, requires_grad = True)
+
+    def run(i):
+        def f(t):
+            sw._pre(i)(None, None)
+            sw._post(i)(None, None, None)
+            return t * 2
+        return f
+
+    h = x
+    for i in range(6):
+        h = cp.checkpoint(run(i), h, use_reentrant = False)
+        assert not sw.blocks[i].resident and not sw.blocks[i].pending, i
+    assert sw._grew is False
 
 
 def test_find_decoder_layers_through_common_wrappers():
