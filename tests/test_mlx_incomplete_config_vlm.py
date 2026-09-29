@@ -62,6 +62,22 @@ def test_library_named_in_the_message():
     assert "Apple Silicon" in msg
 
 
+def test_nested_sub_config_is_named():
+    # Real mlx-vlm 0.7.4 on a qwen2_5_vl config.json with text_config dropped.
+    from unsloth_zoo.mlx.loader import _raise_if_incomplete_mlx_config
+
+    message = (
+        "TextConfig.__init__() missing 2 required positional arguments: "
+        "'hidden_size' and 'vocab_size'"
+    )
+    with pytest.raises(ValueError) as exc:
+        _raise_if_incomplete_mlx_config(
+            "unsloth/Example-VL", "qwen2_5_vl", message, TypeError(message),
+            library="mlx-vlm",
+        )
+    assert "'hidden_size', 'vocab_size' (fields of TextConfig)" in str(exc.value)
+
+
 def test_default_library_still_mlx_lm():
     from unsloth_zoo.mlx.loader import _raise_if_incomplete_mlx_config
 

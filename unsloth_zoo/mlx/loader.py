@@ -602,6 +602,10 @@ def _raise_if_incomplete_mlx_config(
         return
     listed = ", ".join(repr(key) for key in keys)
     plural = "keys" if len(keys) > 1 else "key"
+    # Nested dataclasses (mlx-vlm TextConfig / VisionConfig) name a sub-config's fields.
+    owner = re.search(r"(\w+)\.__init__\(\)", message)
+    if owner is not None and owner.group(1) not in ("ModelArgs", "ModelConfig"):
+        listed = f"{listed} (fields of {owner.group(1)})"
     raise ValueError(
         f"Unsloth: {model_name}'s config.json is missing the {plural} {listed}, "
         f"which {library}'s '{model_type or 'unknown'}' architecture requires and "
