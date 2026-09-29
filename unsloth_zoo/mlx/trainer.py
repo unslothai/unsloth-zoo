@@ -9897,9 +9897,9 @@ def _kto_rows(dataset, tokenizer, args):
     out = []
     for i in range(0, len(rows), bs):
         chunk = rows[i:i + bs]
-        if len(chunk) < 2:
-            continue  # a lone row would be scored against its own completion
-        for (p, c, label), (_, kl_c, _) in zip(chunk, chunk[-1:] + chunk[:-1]):
+        # A lone tail row borrows the previous row's completion rather than scoring its own.
+        rolled = chunk[-1:] + chunk[:-1] if len(chunk) > 1 else rows[i - 1:i]
+        for (p, c, label), (_, kl_c, _) in zip(chunk, rolled):
             # A prompt fitted to its own completion can overflow max_length with another row's.
             out.append((p, c, _kto_fit_prompt(p, kl_c, args.max_length), kl_c, label))
     return out
@@ -9968,6 +9968,7 @@ class MLXKTOTrainer(MLXTrainer):
             "streaming datasets": bool(getattr(args, "streaming", False))
                 or not hasattr(self.train_dataset, "__len__"),
             "lora_plus_ratio": float(getattr(args, "lora_plus_ratio", 0) or 0) > 0,
+            "embedding_learning_rate": float(getattr(args, "embedding_learning_rate", 0) or 0) > 0,
             "resume_from_checkpoint": resume_from_checkpoint is not None,
             "eval_dataset": self.eval_dataset is not None,
             "distributed training": self.distributed_world_size > 1,
@@ -9991,7 +9992,8 @@ class MLXKTOTrainer(MLXTrainer):
         if args.max_steps and args.max_steps > 0:
             total_steps = args.max_steps
         else:
-            total_steps = steps_per_epoch * max(int(args.num_train_epochs or 1), 1)
+            epochs = float(args.num_train_epochs) if args.num_train_epochs and args.num_train_epochs > 0 else 1.0
+            total_steps = max(math.ceil(epochs * steps_per_epoch), 1)  # fractional epochs stop part-way
         shuffle = not args.preserve_dataset_order and args.dataset_order != "sequential"
         optimizer = self._build_optimizer(total_steps)
         max_grad_norm, max_grad_value, max_grad_leaf_norm, _ = _resolve_mlx_grad_clipping(args)

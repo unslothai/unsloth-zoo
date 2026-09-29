@@ -121,8 +121,9 @@ def test_kto_rows_roll_kl_completions_and_fit_max_length():
     ]
     args = MLXKTOConfig(per_device_train_batch_size=2, max_length=24, max_prompt_length=0)
     kto_rows = _kto_rows(rows, _WordTokenizer(), args)
-    assert len(kto_rows) == 2  # the size-1 tail is dropped
-    b = _kto_batch(kto_rows, pad_id=0)
+    assert len(kto_rows) == 3
+    assert kto_rows[2][3] == kto_rows[1][1]  # the lone tail scores the previous row's completion
+    b = _kto_batch(kto_rows[:2], pad_id=0)
     assert b["desirable"].tolist() == [True, False]
     assert b["comp_ids"].shape[1] <= 24 and b["kl_ids"].shape[1] <= 24
 
@@ -175,6 +176,7 @@ _UNSUPPORTED = {
     "per_device_train_batch_size": dict(args=dict(per_device_train_batch_size=1)),
     "streaming": dict(args=dict(streaming=True)),
     "lora_plus_ratio": dict(args=dict(lora_plus_ratio=16.0)),
+    "embedding_learning_rate": dict(args=dict(embedding_learning_rate=5e-5)),
     "resume_from_checkpoint": dict(resume="ckpt"),
     "eval_dataset": dict(eval_dataset=[]),
     "callbacks": dict(kwargs=dict(callbacks=[object()])),
