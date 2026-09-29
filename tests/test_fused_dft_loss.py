@@ -119,6 +119,27 @@ def _shift_labels(labels, ignore_index=-100):
     return shifted
 
 
+def _reference_logits(
+    hidden,
+    weight,
+    bias,
+    *,
+    logit_scale_multiply=None,
+    logit_scale_divide=None,
+    logit_softcapping=None,
+):
+    logits = torch.nn.functional.linear(
+        hidden.to(dtype=weight.dtype, device=weight.device), weight, bias
+    )
+    if logit_scale_multiply not in (None, 0):
+        logits = logits * logit_scale_multiply
+    if logit_scale_divide not in (None, 0):
+        logits = logits / logit_scale_divide
+    if logit_softcapping not in (None, 0):
+        logits = torch.tanh(logits / logit_softcapping) * logit_softcapping
+    return logits.reshape(-1, logits.shape[-1]).float().contiguous()
+
+
 def _reference_dft(
     hidden,
     weight,
@@ -139,21 +160,18 @@ def _reference_dft(
     """
     if shift_labels:
         labels = _shift_labels(labels, ignore_index)
-    logits = torch.nn.functional.linear(
-        hidden.to(dtype=weight.dtype, device=weight.device),
+    logits = _reference_logits(
+        hidden,
         weight,
         bias,
+        logit_scale_multiply=logit_scale_multiply,
+        logit_scale_divide=logit_scale_divide,
+        logit_softcapping=logit_softcapping,
     )
-    if logit_scale_multiply not in (None, 0):
-        logits = logits * logit_scale_multiply
-    if logit_scale_divide not in (None, 0):
-        logits = logits / logit_scale_divide
-    if logit_softcapping not in (None, 0):
-        logits = torch.tanh(logits / logit_softcapping) * logit_softcapping
 
     flat_labels = labels.reshape(-1).to(device=weight.device)
     token_nll = torch.nn.functional.cross_entropy(
-        logits.reshape(-1, logits.shape[-1]).float().contiguous(),
+        logits,
         flat_labels,
         reduction="none",
         ignore_index=ignore_index,
@@ -181,21 +199,18 @@ def _reference_ce(
 ):
     if shift_labels:
         labels = _shift_labels(labels, ignore_index)
-    logits = torch.nn.functional.linear(
-        hidden.to(dtype=weight.dtype, device=weight.device),
+    logits = _reference_logits(
+        hidden,
         weight,
         bias,
+        logit_scale_multiply=logit_scale_multiply,
+        logit_scale_divide=logit_scale_divide,
+        logit_softcapping=logit_softcapping,
     )
-    if logit_scale_multiply not in (None, 0):
-        logits = logits * logit_scale_multiply
-    if logit_scale_divide not in (None, 0):
-        logits = logits / logit_scale_divide
-    if logit_softcapping not in (None, 0):
-        logits = torch.tanh(logits / logit_softcapping) * logit_softcapping
 
     reduction = "sum" if n_items is not None else "mean"
     loss = torch.nn.functional.cross_entropy(
-        logits.reshape(-1, logits.shape[-1]).float().contiguous(),
+        logits,
         labels.reshape(-1).to(device=weight.device).contiguous(),
         reduction=reduction,
         ignore_index=ignore_index,
@@ -208,8 +223,8 @@ def _clone_leaf(tensor):
     return tensor.detach().clone().requires_grad_(True)
 
 
-def _collect_result(loss, hidden, weight, bias):
-    loss.backward()
+def _collect_result(loss, hidden, weight, bias, *, grad_output=1.0):
+    loss.backward(torch.full_like(loss, grad_output))
     return (
         loss.detach().clone(),
         hidden.grad.detach().clone(),
@@ -218,11 +233,12 @@ def _collect_result(loss, hidden, weight, bias):
     )
 
 
-def _run_reference(hidden, weight, bias, labels, **kwargs):
+def _run_reference(hidden, weight, bias, labels, *, loss_name="dft", **kwargs):
     hidden = _clone_leaf(hidden)
     weight = _clone_leaf(weight)
     bias = _clone_leaf(bias)
-    loss = _reference_dft(hidden, weight, bias, labels.detach().clone(), **kwargs)
+    reference = _reference_ce if loss_name == "ce" else _reference_dft
+    loss = reference(hidden, weight, bias, labels.detach().clone(), **kwargs)
     return _collect_result(loss, hidden, weight, bias)
 
 
@@ -240,25 +256,28 @@ def _run_direct_ce(
         scaling=scaling,
         **kwargs,
     )
+    assert not unscaled_loss.requires_grad
     result = _collect_result(scaled_loss, hidden, weight, bias)
     return result, unscaled_loss.detach().clone()
 
 
-def _run_direct(fused_losses, hidden, weight, bias, labels, **kwargs):
+def _run_direct(fused_losses, hidden, weight, bias, labels, *, loss_name="dft", **kwargs):
     hidden = _clone_leaf(hidden)
     weight = _clone_leaf(weight)
     bias = _clone_leaf(bias)
-    loss, _ = fused_losses.compute_fused_dft_loss(
+    loss_fn = getattr(fused_losses, f"compute_fused_{loss_name}_loss")
+    loss, (auxiliary_loss,) = loss_fn(
         hidden,
         weight,
         bias,
         labels.detach().clone(),
         **kwargs,
     )
+    assert not auxiliary_loss.requires_grad
     return _collect_result(loss, hidden, weight, bias)
 
 
-def _run_wrapper(loss_fn, hidden, weight, bias, labels, **kwargs):
+def _run_wrapper(loss_fn, hidden, weight, bias, labels, *, grad_output=1.0, **kwargs):
     hidden = _clone_leaf(hidden)
     weight = _clone_leaf(weight)
     bias = _clone_leaf(bias)
@@ -270,7 +289,7 @@ def _run_wrapper(loss_fn, hidden, weight, bias, labels, **kwargs):
         labels=labels.detach().clone(),
         **kwargs,
     )
-    return _collect_result(loss, hidden, weight, bias)
+    return _collect_result(loss, hidden, weight, bias, grad_output=grad_output)
 
 
 def _assert_result_close(actual, expected, *, rtol=1e-5, atol=1e-7):
@@ -405,7 +424,8 @@ def test_fused_dft_matches_reference(fused_losses, device_name, n_chunks):
 
 
 @pytest.mark.parametrize("ignore_index", [-100, 999])
-def test_fused_dft_ignored_nonfinite_row_is_safe(fused_losses, ignore_index):
+@pytest.mark.parametrize("loss_name", ["ce", "dft"])
+def test_fused_loss_ignored_nonfinite_row_is_safe(fused_losses, ignore_index, loss_name):
     max_float = torch.finfo(torch.float32).max
     hidden = torch.tensor(
         [[[0.20, -0.10], [max_float, max_float]]],
@@ -425,6 +445,7 @@ def test_fused_dft_ignored_nonfinite_row_is_safe(fused_losses, ignore_index):
         weight,
         bias,
         labels,
+        loss_name=loss_name,
         shift_labels=False,
         ignore_index=ignore_index,
         logit_softcapping=1.0,
@@ -434,6 +455,7 @@ def test_fused_dft_ignored_nonfinite_row_is_safe(fused_losses, ignore_index):
         weight,
         bias,
         labels[:, :1],
+        loss_name=loss_name,
         shift_labels=False,
         ignore_index=ignore_index,
         logit_softcapping=1.0,
@@ -445,6 +467,13 @@ def test_fused_dft_ignored_nonfinite_row_is_safe(fused_losses, ignore_index):
     torch.testing.assert_close(actual[2], expected[2], rtol=1e-5, atol=1e-7)
     torch.testing.assert_close(actual[3], expected[3], rtol=1e-5, atol=1e-7)
     assert all(torch.isfinite(tensor).all() for tensor in actual)
+    chunked = _run_wrapper(
+        getattr(fused_losses, f"unsloth_fused_{loss_name}_loss"),
+        hidden, weight, bias, labels,
+        shift_labels=False, ignore_index=ignore_index, logit_softcapping=1.0,
+        torch_compile=False, n_chunks=2,
+    )
+    _assert_result_close(chunked, actual)
 
 
 @pytest.mark.parametrize(
@@ -474,36 +503,101 @@ def test_fused_loss_mask_applies_to_shifted_targets(fused_losses, loss_name):
     _assert_result_close(masked, explicit)
 
 
-def test_fused_dft_all_ignored_returns_connected_zero(fused_losses):
+@pytest.mark.parametrize("loss_name", ["ce", "dft"])
+@pytest.mark.parametrize(
+    "n_items", [None, 0, torch.tensor(0)], ids=["inferred", "zero", "tensor-zero"]
+)
+def test_fused_loss_all_ignored_returns_connected_zero(fused_losses, loss_name, n_items):
     torch.manual_seed(0)
     hidden = torch.randn(1, 4, 3, dtype=torch.float64)
     weight = torch.randn(6, 3, dtype=torch.float64)
     bias = torch.randn(6, dtype=torch.float64)
     labels = torch.full((1, 4), -100)
 
+    direct = _run_direct(
+        fused_losses, hidden, weight, bias, labels,
+        loss_name=loss_name, n_items=n_items, scaling=7.0,
+    )
     result = _run_wrapper(
-        fused_losses.unsloth_fused_dft_loss,
+        getattr(fused_losses, f"unsloth_fused_{loss_name}_loss"),
         hidden,
         weight,
         bias,
         labels,
         torch_compile=False,
         n_chunks=2,
+        n_items=n_items,
+        scaling=7.0,
     )
 
+    _assert_result_close(direct, result)
     assert torch.isfinite(result[0])
     assert float(result[0]) == 0.0
     assert all(torch.count_nonzero(gradient) == 0 for gradient in result[1:])
 
 
-@pytest.mark.parametrize("ce_first", [False, True], ids=["fresh-dft", "ce-first"])
-def test_fused_dft_compiled_matches_eager(fused_losses, ce_first):
+@pytest.mark.parametrize("loss_name", ["ce", "dft"])
+@pytest.mark.parametrize(
+    "n_items", [5.5, torch.tensor(5.5), torch.tensor([5.5, 99.0])],
+    ids=["scalar", "tensor", "replicated"],
+)
+def test_fused_loss_explicit_divisor_and_scaling(fused_losses, loss_name, n_items):
+    hidden, weight, bias, labels = _make_inputs(torch.device("cpu"), torch.float64)
+    expected = _run_reference(hidden, weight, bias, labels, loss_name=loss_name)
+    # Three valid shifted targets. An explicit divisor must override that count.
+    expected = tuple(value * (3.0 / 5.5) for value in expected)
+    direct = _run_direct(
+        fused_losses, hidden, weight, bias, labels,
+        loss_name=loss_name, n_items=n_items, scaling=7.0,
+    )
+    _assert_result_close(direct, tuple(value * 7.0 for value in expected))
+    chunked = _run_wrapper(
+        getattr(fused_losses, f"unsloth_fused_{loss_name}_loss"),
+        hidden, weight, bias, labels,
+        n_items=n_items, scaling=7.0, grad_output=2.5,
+        torch_compile=False, n_chunks=20,
+    )
+    _assert_result_close(chunked, (expected[0], *(value * 2.5 for value in expected[1:])))
+
+
+@pytest.mark.parametrize("loss_name", ["ce", "dft"])
+@pytest.mark.parametrize("n_chunks", [1, 20])
+def test_fused_loss_zero_divisor_with_targets_is_nonfinite(
+    fused_losses, loss_name, n_chunks
+):
+    hidden, weight, bias, labels = _make_inputs(torch.device("cpu"), torch.float64)
+    direct = _run_direct(
+        fused_losses, hidden, weight, bias, labels, loss_name=loss_name, n_items=0,
+    )
+    chunked = _run_wrapper(
+        getattr(fused_losses, f"unsloth_fused_{loss_name}_loss"),
+        hidden, weight, bias, labels,
+        n_items=torch.tensor(0), torch_compile=False, n_chunks=n_chunks,
+    )
+    assert not torch.isfinite(direct[0])
+    assert not torch.isfinite(chunked[0])
+
+
+@pytest.mark.parametrize("loss_name", ["ce", "dft"])
+def test_fused_loss_zero_scaling_still_rejects_backward(fused_losses, loss_name):
+    hidden, weight, bias, labels = _make_inputs(torch.device("cpu"), torch.float64)
+    with pytest.raises(RuntimeError, match="scaling=0 with non-zero grad_output"):
+        _run_wrapper(
+            getattr(fused_losses, f"unsloth_fused_{loss_name}_loss"),
+            hidden, weight, bias, torch.full_like(labels, -100),
+            scaling=0.0, torch_compile=False, n_chunks=2,
+        )
+
+
+@pytest.mark.parametrize(
+    "loss_names", [("dft", "ce"), ("ce", "dft")], ids=["dft-first", "ce-first"]
+)
+def test_fused_loss_compiled_matches_eager(fused_losses, loss_names):
     if os.environ.get("UNSLOTH_FUSED_CE_COMPILE_DISABLE", "0") == "1":
         pytest.skip("UNSLOTH_FUSED_CE_COMPILE_DISABLE=1 disables fused-loss compile")
     _skip_if_compile_unavailable()
 
     hidden, weight, bias, labels = _make_inputs(torch.device("cpu"), torch.float32)
-    loss_names = ("ce", "dft") if ce_first else ("dft",)
     with _compile_flag_guard(fused_losses):
         for loss_name in loss_names:
             loss_fn = getattr(fused_losses, f"unsloth_fused_{loss_name}_loss")
@@ -533,6 +627,12 @@ def test_fused_dft_compiled_matches_eager(fused_losses, ce_first):
                 in fused_losses._FUSED_CE_COMPILE_FASTPATH_PROVEN
             )
             _assert_result_close(compiled, eager)
+            empty = _run_wrapper(
+                loss_fn, hidden, weight, bias, torch.full_like(labels, -100),
+                torch_compile=True, n_chunks=2, shift_labels=False,
+            )
+            assert all(torch.count_nonzero(value) == 0 for value in empty)
+            assert fused_losses._FUSED_CE_COMPILE_SUPPORTED is True
 
 
 def test_fused_dft_rejects_label_smoothing_without_poisoning_compile(fused_losses):
