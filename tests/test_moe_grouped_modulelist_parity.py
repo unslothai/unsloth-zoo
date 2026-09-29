@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pytest
 
+from unsloth_zoo.device_type import DEVICE_TYPE_TORCH
 from unsloth_zoo.temporary_patches.moe_grouped_modulelist import (
     grouped_moe_forward,
     enable_grouped_moe,
@@ -25,10 +26,10 @@ from unsloth_zoo.temporary_patches.moe_grouped_modulelist import (
     HAS_BNB,
 )
 
-DEV = "cuda"
+DEV = DEVICE_TYPE_TORCH
 DTYPE = torch.bfloat16
 pytestmark = pytest.mark.skipif(
-    not (torch.cuda.is_available() and _grouped_mm_supported()),
+    not (DEVICE_TYPE_TORCH in ("cuda", "xpu") and _grouped_mm_supported()),
     reason="torch._grouped_mm unsupported on this device",
 )
 

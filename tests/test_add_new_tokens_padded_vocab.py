@@ -22,12 +22,13 @@ import torch
 transformers = pytest.importorskip("transformers")
 pytest.importorskip("tokenizers")
 
+from datasets import Dataset
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from transformers import LlamaConfig, LlamaForCausalLM, PreTrainedTokenizerFast
 
-from unsloth_zoo.tokenizer_utils import add_new_tokens
+from unsloth_zoo.tokenizer_utils import add_new_tokens, fix_untrained_tokens
 
 VOCAB_TOK = 100  # real tokens in the tokenizer
 PADDED = 128     # embedding rows shipped by the model (padding = [100, 128))
@@ -70,12 +71,9 @@ def test_padded_embedding_preserves_trained_rows_and_places_new_tokens():
     emb2 = model.get_input_embeddings().weight
     head2 = model.get_output_embeddings().weight
 
-    # 1. No shrink: all trained rows survive byte-identical.
     assert emb2.shape[0] == PADDED, "padded embedding must not shrink"
     assert torch.equal(emb2[:VOCAB_TOK], trained_rows), "trained rows corrupted"
 
-    # 2. New tokens land at their real tokenizer IDs, each pointing at its OWN
-    #    mean-initialised row (not a leftover padding row).
     new_len = len(tokenizer)
     for offset, tok in enumerate(new_tokens):
         tid = tokenizer.convert_tokens_to_ids(tok)
@@ -92,11 +90,9 @@ def test_padded_embedding_preserves_trained_rows_and_places_new_tokens():
     assert torch.equal(emb2[new_len:PADDED], sentinel_rows[new_len - VOCAB_TOK:]), \
         "alignment padding rows were overwritten"
 
-    # 4. Tied weights stay tied, and share storage at a new-token row.
     assert emb2.data_ptr() == head2.data_ptr(), "tie broken by resize"
     assert torch.equal(emb2[VOCAB_TOK], head2[VOCAB_TOK])
 
-    # 5. config.vocab_size tracks the matrix, so the model round-trips.
     assert model.config.vocab_size == PADDED
     with tempfile.TemporaryDirectory() as d:
         model.save_pretrained(d)
@@ -104,7 +100,6 @@ def test_padded_embedding_preserves_trained_rows_and_places_new_tokens():
     assert reloaded.get_input_embeddings().weight.shape[0] == PADDED
     assert reloaded.config.vocab_size == PADDED
 
-    # 6. Forward pass over the new IDs works.
     with torch.no_grad():
         logits = model(torch.tensor([[VOCAB_TOK, VOCAB_TOK + 1, 3, 4]])).logits
     assert logits.shape[-1] == PADDED
@@ -132,3 +127,63 @@ if __name__ == "__main__":
     test_padded_embedding_preserves_trained_rows_and_places_new_tokens()
     test_non_padded_embedding_still_grows_normally()
     print("ok")
+
+
+def test_add_new_token_keeps_negative_trained_rows_in_the_mean():
+    model, tokenizer = _build(4, 4)
+    weight = model.get_input_embeddings().weight
+    with torch.no_grad():
+        weight[0].fill_(-1)
+        weight[1].fill_(-2)
+        weight[2].fill_(-3)
+        weight[3].zero_()
+    expected = torch.full((model.config.hidden_size,), -2.0)
+    add_new_tokens(model, tokenizer, new_tokens=["<new>"])
+    new_id = tokenizer.convert_tokens_to_ids("<new>")
+    torch.testing.assert_close(model.get_input_embeddings().weight[new_id], expected)
+    loss = model(torch.tensor([[new_id, 0]]), labels=torch.tensor([[new_id, 0]])).loss
+    assert torch.isfinite(loss)
+
+
+@pytest.mark.parametrize("row_value, untrained", [(-3.0, False), (0.0, True), (1e-18, True), (-1e-18, True)])
+def test_frozen_token_validation_uses_magnitude(row_value: float, untrained: bool):
+    model, tokenizer = _build(4, 4)
+    with torch.no_grad():
+        model.get_input_embeddings().weight.fill_(1)
+        model.get_input_embeddings().weight[2].fill_(row_value)
+    model.requires_grad_(False)
+    original = model.get_input_embeddings().weight.clone()
+    dataset = Dataset.from_dict({"input_ids": [[2, 3]]})
+    if untrained:
+        with pytest.raises(ValueError, match="Untrained tokens"):
+            fix_untrained_tokens(model, tokenizer, dataset)
+    else:
+        fix_untrained_tokens(model, tokenizer, dataset)
+    torch.testing.assert_close(model.get_input_embeddings().weight, original)
+
+
+def test_interpolation_mixes_in_the_pieces_the_token_replaces():
+    model, tokenizer = _build(8, 8)
+    with torch.no_grad():
+        for i in range(8):
+            model.get_input_embeddings().weight[i].fill_(i + 1)
+    assert tokenizer("tok6 tok7", add_special_tokens=False).input_ids == [6, 7]
+    add_new_tokens(model, tokenizer, new_tokens=["tok6 tok7"],
+                   method="interpolation", interpolation=0.5)
+    new_id = tokenizer.convert_tokens_to_ids("tok6 tok7")
+    # mean(1..8) = 4.5, mean(7, 8) = 7.5, so 0.5 * 4.5 + 0.5 * 7.5 = 6.0.
+    expected = torch.full((model.config.hidden_size,), 6.0)
+    torch.testing.assert_close(model.get_input_embeddings().weight[new_id], expected)
+    torch.testing.assert_close(model.get_output_embeddings().weight[new_id], expected)
+
+
+def test_interpolation_token_with_no_pieces_gets_the_trained_mean():
+    model, tokenizer = _build(8, 8)
+    with torch.no_grad():
+        for i in range(8):
+            model.get_input_embeddings().weight[i].fill_(i + 1)
+    assert tokenizer("  ", add_special_tokens=False).input_ids == []
+    add_new_tokens(model, tokenizer, new_tokens=["  "], method="interpolation")
+    new_id = tokenizer.convert_tokens_to_ids("  ")
+    expected = torch.full((model.config.hidden_size,), 4.5)
+    torch.testing.assert_close(model.get_input_embeddings().weight[new_id], expected)
