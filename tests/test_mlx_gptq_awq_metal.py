@@ -63,6 +63,9 @@ def test_prequant_checkpoint_loads_and_answers(repo, load_in_16bit):
     )
     assert _dequant_scratch_dirs() <= before
     assert model._hf_repo == repo
+    # 4-bit keeps the checkpoint's own codes (GPTQ repacked, AWQ via mlx-lm); 16-bit is dense.
+    source = getattr(model, "_unsloth_quantized_source", None)
+    assert source in ((None, "none") if load_in_16bit else ("mlx_config",)), source
     text = _answer(model, tokenizer)
     print(f"{repo} load_in_16bit={load_in_16bit}: {text!r}")
     assert "paris" in text.lower(), text
@@ -106,3 +109,12 @@ def test_prequant_checkpoint_lora_trains(repo, tmp_path):
     assert len(hist) == 6
     assert all(loss == loss and abs(loss) < 20 for loss in hist), hist
     assert hist[-1] < hist[0], hist
+
+    import mlx.core as mx
+
+    ids = mx.array([tokenizer.encode("What is 3 plus 3?")])
+    want = model(ids).astype(mx.float32)
+    model.save_pretrained(str(tmp_path / "adapter"))
+    reloaded, _ = FastMLXModel.from_pretrained(str(tmp_path / "adapter"), max_seq_length=256)
+    got = reloaded(ids).astype(mx.float32)
+    assert mx.allclose(got, want, atol=1e-2).item(), mx.abs(got - want).max().item()

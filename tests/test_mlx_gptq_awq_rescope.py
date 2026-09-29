@@ -654,3 +654,55 @@ def test_failed_gptq_load_schedules_scratch_cleanup(monkeypatch, tmp_path):
     for fn, a in registered:
         fn(*a)
     assert not scratch.exists()
+
+
+def _mlx_affine_dequant(weight, scales, biases, gs):
+    w = np.asarray(weight).astype(np.uint64)
+    q = ((w[:, :, None] >> (4 * np.arange(8, dtype=np.uint64))) & 0xF).reshape(w.shape[0], -1)
+    s = np.repeat(np.asarray(scales, dtype=np.float32), gs, axis=1)
+    b = np.repeat(np.asarray(biases, dtype=np.float32), gs, axis=1)
+    return q.astype(np.float32) * s + b
+
+
+def test_gptq_to_mlx_affine_is_lossless():
+    import mlx.core as mx
+    import unsloth_zoo.mlx.loader as ml
+    q, zero, scales, _, ref = _make_gptq_tensors(inn=32, out=16, gs=8, seed=5)
+    weight, s, b = ml._gptq_to_mlx_affine(
+        mx.array(_pack_qweight_gptq(q)), mx.array(_pack_qzeros_gptq(zero)), mx.array(scales),
+    )
+    assert tuple(weight.shape) == (16, 4) and tuple(s.shape) == (16, 4)
+    assert np.allclose(_mlx_affine_dequant(weight, s, b, 8), ref, atol=1e-5)
+
+
+@pytest.mark.parametrize("desc_act", [False, True])
+def test_materialize_gptq_mlx_affine_only_for_contiguous_groups(desc_act):
+    import mlx.core as mx
+    import unsloth_zoo.mlx.loader as ml
+    gs = 32
+    q, zero, scales, g_idx, ref = _make_gptq_tensors(inn=64, out=8, gs=gs, seed=6, desc_act=desc_act)
+    name = "model.layers.0.self_attn.q_proj"
+    tmp = tempfile.mkdtemp(prefix="rescope_affine_")
+    mx.save_safetensors(os.path.join(tmp, "model.safetensors"), {
+        name + ".qweight": mx.array(_pack_qweight_gptq(q)),
+        name + ".qzeros": mx.array(_pack_qzeros_gptq(zero)),
+        name + ".scales": mx.array(scales),
+        name + ".g_idx": mx.array(g_idx),
+    })
+    qc = {"quant_method": "gptq", "bits": 4, "group_size": gs}
+    out_dir, cfg = ml._materialize_dequantized_hf_checkpoint(
+        tmp, {"model_type": "llama", "quantization_config": qc}, "gptq", qc, mlx_affine=True,
+    )
+    try:
+        w = mx.load(os.path.join(out_dir, "model.safetensors"))
+        if desc_act:
+            assert "quantization" not in cfg and name + ".scales" not in w
+            got = np.asarray(w[name + ".weight"]).astype(np.float32)
+        else:
+            assert cfg["quantization"] == {"group_size": gs, "bits": 4, "mode": "affine"}
+            got = _mlx_affine_dequant(w[name + ".weight"], w[name + ".scales"], w[name + ".biases"], gs)
+        assert "quantization_config" not in cfg
+        assert np.allclose(got, ref, atol=1e-2)
+    finally:
+        import shutil
+        shutil.rmtree(out_dir, ignore_errors=True)

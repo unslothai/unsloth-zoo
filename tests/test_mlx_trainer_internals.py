@@ -2885,6 +2885,16 @@ def test_native_awq_adapter_base_reloads_as_native_prequant(monkeypatch):
         adapter_mlx_quant_config={"bits": 4, "group_size": 128, "mode": "affine"},
         adapter_base_is_bnb=False,
     ) is False
+    repacked_gptq_cfg = {
+        "base_quantization_config": {"quant_method": "gptq", "bits": 4, "group_size": 128},
+        "base_quantized_source": "mlx_config",
+    }
+    assert _loader._adapter_base_prefers_native_prequant(
+        repacked_gptq_cfg,
+        adapter_requires_runtime_quant=False,
+        adapter_mlx_quant_config=None,
+        adapter_base_is_bnb=False,
+    ) is True
     assert _loader._adapter_base_prefers_native_prequant(
         native_awq_cfg,
         adapter_requires_runtime_quant=False,
