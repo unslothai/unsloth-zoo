@@ -9341,13 +9341,7 @@ class MLXDPOTrainer(MLXTrainer):
 
 
 class MLXGRPOTrainer(MLXTrainer):
-    """MLX trainer for Group Relative Policy Optimization, following TRL's GRPOTrainer.
-
-    Each micro-batch samples ``num_generations`` completions per prompt with the
-    current policy, scores them with ``reward_funcs`` (callables with TRL's
-    ``fn(prompts, completions, **columns) -> list[float]`` signature, summed
-    with ``reward_weights``) and trains on the group-relative advantages.
-    """
+    """GRPO following TRL's GRPOTrainer; ``reward_funcs`` take ``(prompts, completions, **columns)``."""
 
     config_class = MLXGRPOConfig
     rl_kind = "grpo"
@@ -9375,7 +9369,6 @@ class MLXGRPOTrainer(MLXTrainer):
                 f"Unsloth MLX GRPO: {len(weights)} reward_weights for {len(funcs)} reward functions."
             )
         self.reward_weights = [1.0] * len(funcs) if weights is None else [float(w) for w in weights]
-        # A zero-variance group has zero advantage everywhere and trains nothing.
         if int(args.num_generations) < 2:
             raise ValueError("Unsloth MLX GRPO: num_generations must be at least 2.")
         if not float(args.temperature) > 0:

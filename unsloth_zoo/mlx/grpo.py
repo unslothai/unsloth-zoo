@@ -27,18 +27,13 @@ from .generate import GenerationDefaults, GenerationRequest, SamplingParams, gen
 from .preference import _make_preference_cce_scorer, _response_mask, _supervised_tokens
 from .utils import _model_logits, _normalize_seed, encode_mlx_text
 
-# Rollout widths and CCE row counts are padded up to these multiples so the compiled
-# step sees a bounded set of shapes; padding is masked out.
+# Padding multiples that bound the compiled step's shapes; padding is masked out.
 ROLLOUT_WIDTH_MULTIPLE = 64
 CCE_ROWS_MULTIPLE = 256
 
 
 def _token_logps(model, batch, temperature, mask=None, scorer=None, indices=None):
-    """Log-probs of each next token on the tempered distribution the rollout sampled (as TRL).
-
-    With a scorer, only the completion positions run through the head (TRL's
-    logits_to_keep), and no full-vocabulary logits are materialised.
-    """
+    """Tempered next-token log-probs, as TRL; a scorer runs only completion positions through the head."""
     if scorer is not None:
         ce, _ = scorer(
             model, batch, mask > 0, indices,
@@ -71,11 +66,7 @@ def grpo_metric_layout(beta):
 def make_grpo_loss_fn(
     *, beta, epsilon_low, epsilon_high, temperature, reference_policy=None, scorer=None,
 ):
-    """TRL ``loss_type="grpo"``: per-sequence mean over completion tokens, then mean over rows.
-
-    The accumulation weight is the row count, so a window of micro-batches
-    averages rows exactly as one batch of the same rollouts would.
-    """
+    """TRL ``loss_type="grpo"``; weighted by rows so a window averages rows like one batch."""
     if beta and reference_policy is None:
         raise ValueError("Unsloth MLX GRPO: beta != 0 needs a reference policy.")
 
@@ -116,11 +107,7 @@ def make_grpo_loss_fn(
 
 
 def group_advantages(rewards, num_generations):
-    """``(r - mean) / (std + 1e-4)`` per group, with TRL's unbiased (ddof=1) std.
-
-    NaN marks an unscorable completion: TRL leaves it out of its group's mean and
-    std and gives it no advantage, as it does a group with one scorable row.
-    """
+    """TRL's ``(r - mean) / (std + 1e-4)`` per group, ddof=1; NaN (unscorable) rows are ignored and get 0."""
     grouped = np.asarray(rewards, dtype=np.float64).reshape(-1, num_generations)
     counts = (~np.isnan(grouped)).sum(axis=1, keepdims=True)
     with np.errstate(invalid="ignore", divide="ignore"):
@@ -176,10 +163,7 @@ def _reward_view(prompt, completions):
 
 
 def score_rewards(reward_funcs, reward_weights, examples, completions, completion_ids, trainer_state):
-    """Weighted sum over reward functions, one score per completion.
-
-    None is skipped, as TRL's nansum does; a completion no function scored is NaN.
-    """
+    """Weighted reward sum per completion; None is skipped (TRL's nansum), all-None gives NaN."""
     prompts, views = [], []
     for example, texts in zip(examples, completions):
         prompt, view = _reward_view(example["prompt"], texts)
@@ -215,11 +199,7 @@ def score_rewards(reward_funcs, reward_weights, examples, completions, completio
 
 
 def rollout_prompt_indices(position, *, num_prompts, prompts_per_batch, rank, world, seed, shuffle):
-    """Dataset rows micro-batch ``position`` rolls out on this rank; a pure function of ``position``.
-
-    Each epoch visits a fresh seeded permutation (TRL's shuffling sampler), and a
-    rank takes its own contiguous slice of every global micro-batch.
-    """
+    """This rank's rows for micro-batch ``position``: a fresh seeded permutation per epoch, as TRL."""
     per_step = prompts_per_batch * world
     epoch_length = math.ceil(num_prompts / per_step)
     epoch, step = divmod(position, epoch_length)
@@ -268,12 +248,7 @@ def build_rollout_batch(
     model, tokenizer, examples, *, args, reward_funcs, reward_weights,
     seeds, pad_id, trainer_state, compact=False,
 ):
-    """Generate ``num_generations`` completions per example and score them.
-
-    Returns ``(batch, lengths, advantages, rewards)``, plus the completion
-    positions for runtime CCE when ``compact``. A completion that stopped
-    on an end token keeps that token, as TRL's completion mask does.
-    """
+    """``(batch, lengths, advantages, rewards[, cce_indices])``; a stopped completion keeps its end token, as TRL."""
     group = int(args.num_generations)
     top_p = float(args.top_p)
     requests, prompt_ids = [], []
@@ -329,7 +304,6 @@ def build_rollout_batch(
         batch,
         mx.array(lengths, dtype=mx.int32),
         mx.array(group_advantages(rewards, group), dtype=mx.float32),
-        # Logged only; an unscorable completion reports 0.
         mx.array(np.nan_to_num(rewards, nan=0.0), dtype=mx.float32),
     )
     if compact:
