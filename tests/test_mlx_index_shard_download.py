@@ -83,3 +83,17 @@ def test_complete_snapshots_local_dirs_and_indexless_repos_download_nothing(tmp_
     bare.mkdir()
     assert _download_missing_index_shards("org/other", str(bare), None, download) == str(bare)
     assert calls == []
+
+
+def test_follow_up_download_pins_the_fetched_snapshot_commit(tmp_path):
+    # A branch revision re-resolved after a push would return a snapshot holding only the shard.
+    from unsloth_zoo.mlx.loader import _download_missing_index_shards
+
+    sha = "a" * 40
+    snap = tmp_path / "snapshots" / sha
+    snap.mkdir(parents=True)
+    (snap / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"v": "optiq/optiq_vision.safetensors"}}))
+    calls, download = _recorder(snap)
+    _download_missing_index_shards("org/repo", str(snap), "main", download)
+    assert calls == [("org/repo", sha, ["optiq/optiq_vision.safetensors"])]

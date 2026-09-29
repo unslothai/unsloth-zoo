@@ -1184,6 +1184,11 @@ def _download_missing_index_shards(model_name, local_path, revision, download):
     )
     if not missing:
         return local_path
+    # Pin to the commit already fetched (hub cache dir `snapshots/<sha>`): re-resolving a
+    # branch could land a newer snapshot holding only these shards.
+    snapshot = os.path.basename(os.path.normpath(local_path))
+    if re.fullmatch(r"[0-9a-f]{40}", snapshot):
+        revision = snapshot
     return str(download(model_name, revision=revision, allow_patterns=missing))
 
 
