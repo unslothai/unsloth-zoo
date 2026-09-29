@@ -21,7 +21,7 @@ No GPU deps: uses mlx-lm (text) and mlx-vlm (VLM) instead of unsloth.models
 """
 
 import ast
-import atexit
+import contextvars
 import copy
 import gc
 import hashlib
@@ -8443,6 +8443,26 @@ def _evaluate_quantized_modules(model, sources):
             mx.eval(target.parameters())
 
 
+_LOAD_SCRATCH_DIRS = contextvars.ContextVar("unsloth_mlx_load_scratch_dirs", default=None)
+
+
+def _remove_scratch_dirs_on_error(load):
+    """A failed (and caught) load must not leave its dequantized checkpoint behind until exit."""
+    @wraps(load)
+    def wrapper(*args, **kwargs):
+        dirs = []
+        token = _LOAD_SCRATCH_DIRS.set(dirs)
+        try:
+            return load(*args, **kwargs)
+        except BaseException:
+            for path in dirs:
+                shutil.rmtree(path, ignore_errors=True)
+            raise
+        finally:
+            _LOAD_SCRATCH_DIRS.reset(token)
+    return wrapper
+
+
 def _finish_load(model, tokenizer):
     """The single exit from a load, so the patch installs after the runtimes the load imports."""
     install_quantized_attention()
@@ -8472,6 +8492,7 @@ class FastMLXModel:
     """
 
     @staticmethod
+    @_remove_scratch_dirs_on_error
     def from_pretrained(
         model_name="mlx-community/Llama-3.2-1B-Instruct-4bit",
         max_seq_length=2048,
@@ -8903,8 +8924,9 @@ class FastMLXModel:
                 local_path = dequant_dir
                 model_name = dequant_dir
                 dequant_temp_dir = dequant_dir
-                # The success path removes it after materializing; this covers a failed load.
-                atexit.register(shutil.rmtree, dequant_dir, True)
+                _scratch = _LOAD_SCRATCH_DIRS.get()
+                if _scratch is not None:
+                    _scratch.append(dequant_dir)
             else:
                 print(
                     f"Unsloth: '{model_name}' is a standard "
