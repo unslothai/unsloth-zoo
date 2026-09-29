@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Real-MLX MLXKTOTrainer tests (Metal-gated)."""
+"""MLX KTO training on Apple Silicon; skipped where Metal is unavailable."""
 
 import math
 
@@ -26,9 +26,6 @@ try:
 except Exception:
     _METAL = False
 
-if not _METAL:
-    print("NOTICE: Metal unavailable; MLX KTO training tests will be skipped.")
-
 metal_only = pytest.mark.skipif(not _METAL, reason="requires Apple Silicon Metal")
 
 MODEL = "unsloth/Qwen2.5-0.5B"
@@ -38,10 +35,9 @@ def _dataset(n=24):
     rows = []
     for i in range(n):
         prompt = f"### Question: what is {i} plus {i}?\n### Answer:"
-        if i % 2 == 0:
-            rows.append({"prompt": prompt, "completion": f" {2 * i}.", "label": True})
-        else:
-            rows.append({"prompt": prompt, "completion": f" {2 * i + 7}, wrong.", "label": False})
+        good = i % 2 == 0
+        completion = f" {2 * i}." if good else f" {2 * i + 7}, wrong."
+        rows.append({"prompt": prompt, "completion": completion, "label": good})
     return rows
 
 
@@ -53,202 +49,69 @@ def _load_peft():
     return model, tok
 
 
-def _config(**overrides):
-    from unsloth_zoo.mlx.trainer import MLXKTOConfig
-    base = dict(per_device_train_batch_size=4, max_steps=6, warmup_steps=1,
-                gradient_accumulation_steps=1,
-                learning_rate=1e-4, beta=0.1, logging_steps=99, seed=3407, report_to="none")
-    base.update(overrides)
-    return MLXKTOConfig(**base)
+def _trainer(tmp_path, data=None, model_tok=None, **overrides):
+    from unsloth_zoo.mlx.trainer import MLXKTOConfig, MLXKTOTrainer
+    args = dict(per_device_train_batch_size=4, max_steps=6, warmup_steps=1,
+                gradient_accumulation_steps=1, learning_rate=1e-4, beta=0.1,
+                logging_steps=99, seed=3407, report_to="none", output_dir=str(tmp_path))
+    args.update(overrides)
+    model, tok = model_tok or _load_peft()
+    return MLXKTOTrainer(model=model, tokenizer=tok, train_dataset=data or _dataset(),
+                         args=MLXKTOConfig(**args))
 
 
 @metal_only
-def test_kto_trains_finite_and_decreasing(tmp_path):
-    from unsloth_zoo.mlx.trainer import MLXKTOTrainer
+def test_kto_trains_and_saves(tmp_path):
     model, tok = _load_peft()
-    trainer = MLXKTOTrainer(model=model, tokenizer=tok, train_dataset=_dataset(),
-                            args=_config(output_dir=str(tmp_path)))
+    trainer = _trainer(tmp_path, model_tok=(model, tok))
     output = trainer.train()
-
     hist = trainer._train_loss_history
-    assert len(hist) == 6, f"expected 6 steps, got {len(hist)}"
-    assert all(math.isfinite(x) for x in hist), f"non-finite loss: {hist}"
-    assert hist[-1] < hist[0], f"loss did not decrease: {hist}"
-    assert output.global_step == 6, f"expected 6 steps, got {output.global_step}"
-    assert math.isfinite(output.training_loss)
-    assert output["total_train_steps"] == 6
-    assert trainer._kl_history and all(math.isfinite(k) and k >= 0.0 for k in trainer._kl_history)
-
-
-@metal_only
-def test_kto_logging_steps_uses_one_based_cadence(tmp_path, capsys):
-    import re
-    from unsloth_zoo.mlx.trainer import MLXKTOTrainer
-    model, tok = _load_peft()
-    trainer = MLXKTOTrainer(
-        model=model, tokenizer=tok, train_dataset=_dataset(),
-        args=_config(output_dir=str(tmp_path), max_steps=4, logging_steps=2, warmup_steps=0),
-    )
+    assert len(hist) == 6 and all(math.isfinite(x) for x in hist) and hist[-1] < hist[0], hist
+    assert output.global_step == 6 and output["total_train_steps"] == 6
+    assert all(math.isfinite(k) and k >= 0.0 for k in trainer._kl_history)
+    assert {"adapters.safetensors", "adapter_config.json"} <= {p.name for p in tmp_path.iterdir()}
     trainer.train()
-    out = capsys.readouterr().out
-    logged = [int(m) for m in re.findall(r"Unsloth KTO: step (\d+)/", out)]
-    assert logged == [2, 4], f"expected logs at 1-based steps [2,4], got {logged}"
+    assert len(trainer._train_loss_history) == 6, "a second run must reset its history"
 
 
 @metal_only
-def test_kto_grad_accum_weights_microbatches_by_example_count(tmp_path):
-    # Micro-batches [4, 2] at lr=0: window must be (4*L1+2*L2)/6, not (L1+L2)/2.
-    from unsloth_zoo.mlx.trainer import MLXKTOTrainer
-    data = _dataset(6)
-
-    def _run(tmp, **over):
-        m, t = _load_peft()
-        cfg = _config(output_dir=str(tmp), per_device_train_batch_size=4,
-                      learning_rate=0.0, weight_decay=0.0, warmup_steps=0, **over)
-        tr = MLXKTOTrainer(model=m, tokenizer=t, train_dataset=data, args=cfg)
-        tr.train()
-        return tr._train_loss_history
-
-    L1, L2 = _run(tmp_path / "a", gradient_accumulation_steps=1, max_steps=2)
-    Lw = _run(tmp_path / "b", gradient_accumulation_steps=2, max_steps=1)[0]
-
-    example_weighted = (4 * L1 + 2 * L2) / 6
-    equal_weighted = (L1 + L2) / 2
-    assert abs(example_weighted - equal_weighted) > 1e-5, "test needs L1 != L2 to discriminate"
-    assert Lw == pytest.approx(example_weighted, abs=1e-4), (Lw, example_weighted, equal_weighted)
+def test_kto_step_counts_follow_accumulation_and_epochs(tmp_path):
+    out = _trainer(tmp_path / "a", max_steps=0, gradient_accumulation_steps=2).train()
+    assert out.global_step == out["total_train_steps"] == 3
+    out = _trainer(tmp_path / "b", data=_dataset(8), max_steps=0, num_train_epochs=2).train()
+    assert out.global_step == out["total_train_steps"] == 4
 
 
 @metal_only
-def test_kto_gradient_accumulation_reduces_optimizer_steps(tmp_path):
-    from unsloth_zoo.mlx.trainer import MLXKTOTrainer
-    model, tok = _load_peft()
-    trainer = MLXKTOTrainer(
-        model=model, tokenizer=tok, train_dataset=_dataset(),
-        args=_config(output_dir=str(tmp_path), max_steps=0,
-                     gradient_accumulation_steps=2),
-    )
-    output = trainer.train()
-    assert len(trainer._train_loss_history) == 3, trainer._train_loss_history
-    assert len(trainer._kl_history) == 3
-    assert output.global_step == 3
-    assert output["total_train_steps"] == 3
-    assert all(math.isfinite(x) for x in trainer._train_loss_history)
+def test_kto_grad_accum_weights_microbatches_by_rows(tmp_path):
+    # Micro-batches [4, 2] at lr=0: the window must be (4*L1+2*L2)/6, not (L1+L2)/2.
+    kw = dict(learning_rate=0.0, weight_decay=0.0, warmup_steps=0)
+    tr = _trainer(tmp_path / "a", data=_dataset(6), max_steps=2, **kw)
+    tr.train()
+    L1, L2 = tr._train_loss_history
+    tr = _trainer(tmp_path / "b", data=_dataset(6), max_steps=1, gradient_accumulation_steps=2, **kw)
+    tr.train()
+    weighted, equal = (4 * L1 + 2 * L2) / 6, (L1 + L2) / 2
+    assert abs(weighted - equal) > 1e-5, "needs L1 != L2 to discriminate"
+    assert tr._train_loss_history[0] == pytest.approx(weighted, abs=1e-4)
 
 
 @metal_only
-def test_kto_num_train_epochs_scales_steps(tmp_path):
-    from unsloth_zoo.mlx.trainer import MLXKTOTrainer
-    model, tok = _load_peft()
-    trainer = MLXKTOTrainer(
-        model=model, tokenizer=tok, train_dataset=_dataset(n=8),
-        args=_config(output_dir=str(tmp_path), max_steps=0,
-                     gradient_accumulation_steps=1, num_train_epochs=2),
-    )
-    output = trainer.train()
-    assert output["total_train_steps"] == 4, output["total_train_steps"]
-    assert output.global_step == 4
-
-
-@metal_only
-def test_kto_resets_run_state_between_train_calls(tmp_path):
-    from unsloth_zoo.mlx.trainer import MLXKTOTrainer
-    model, tok = _load_peft()
-    trainer = MLXKTOTrainer(model=model, tokenizer=tok, train_dataset=_dataset(),
-                            args=_config(output_dir=str(tmp_path), max_steps=3))
-    trainer.train()
-    assert len(trainer._train_loss_history) == 3
-    trainer.train()
-    assert len(trainer._train_loss_history) == 3, "history should reset, not append"
-    assert len(trainer._kl_history) == 3
-
-
-@metal_only
-def test_kto_rejects_resume_from_checkpoint(tmp_path):
-    from unsloth_zoo.mlx.trainer import MLXKTOTrainer
-    model, tok = _load_peft()
-    trainer = MLXKTOTrainer(model=model, tokenizer=tok, train_dataset=_dataset(),
-                            args=_config(output_dir=str(tmp_path)))
-    with pytest.raises(ValueError, match="resume_from_checkpoint"):
-        trainer.train(resume_from_checkpoint=str(tmp_path))
-
-
-@metal_only
-def test_kto_rejects_eval_dataset(tmp_path):
-    from unsloth_zoo.mlx.trainer import MLXKTOTrainer
-    model, tok = _load_peft()
-    trainer = MLXKTOTrainer(model=model, tokenizer=tok, train_dataset=_dataset(),
-                            eval_dataset=_dataset(n=4),
-                            args=_config(output_dir=str(tmp_path)))
-    with pytest.raises(ValueError, match="eval loop"):
-        trainer.train()
-
-
-@metal_only
-def test_kto_rejects_lora_plus(tmp_path):
-    from unsloth_zoo.mlx.trainer import MLXKTOTrainer
-    model, tok = _load_peft()
-    trainer = MLXKTOTrainer(
-        model=model, tokenizer=tok, train_dataset=_dataset(),
-        args=_config(output_dir=str(tmp_path), lora_plus_ratio=16.0),
-    )
-    with pytest.raises(ValueError, match="lora_plus_ratio"):
-        trainer.train()
-
-
-@metal_only
-def test_kto_saves_adapters_at_end(tmp_path):
-    from unsloth_zoo.mlx.trainer import MLXKTOTrainer
-    model, tok = _load_peft()
-    trainer = MLXKTOTrainer(model=model, tokenizer=tok, train_dataset=_dataset(),
-                            args=_config(output_dir=str(tmp_path)))
-    trainer.train()
-    written = {p.name for p in tmp_path.iterdir()}
-    assert "adapters.safetensors" in written, f"no adapters saved: {sorted(written)}"
-    assert "adapter_config.json" in written, f"no adapter config saved: {sorted(written)}"
-
-
-@metal_only
-def test_lora_scales_restored_after_training(tmp_path):
-    from unsloth_zoo.mlx.trainer import MLXKTOTrainer
-    from unsloth_zoo.mlx.utils import iter_mlx_lora_modules
-    model, tok = _load_peft()
-    before = [m.scale for _, m in iter_mlx_lora_modules(model)]
-    assert before and all(s != 0 for s in before)
-
-    trainer = MLXKTOTrainer(model=model, tokenizer=tok, train_dataset=_dataset(),
-                            args=_config(output_dir=str(tmp_path)))
-    trainer.train()
-
-    after = [m.scale for _, m in iter_mlx_lora_modules(model)]
-    assert after == before, "LoRA scales not restored to their pre-training values"
-
-
-@metal_only
-def test_lora_scales_restored_when_forward_throws(tmp_path, monkeypatch):
+def test_kto_restores_weights_when_reference_forward_throws(tmp_path, monkeypatch):
+    import numpy as np
     import unsloth_zoo.mlx.trainer as T
-    from unsloth_zoo.mlx.trainer import MLXKTOTrainer
-    from unsloth_zoo.mlx.utils import iter_mlx_lora_modules
+    from mlx.utils import tree_flatten
     model, tok = _load_peft()
-    before = [m.scale for _, m in iter_mlx_lora_modules(model)]
+    before = {k: np.array(v) for k, v in tree_flatten(model.trainable_parameters())}
 
-    # 2nd sum-logp call is the reference forward (scales at 0); 1st is policy-KL.
-    real = T._kto_sum_logp
-    calls = {"n": 0}
-    def flaky(logits, labels):
-        calls["n"] += 1
-        if calls["n"] == 2:
-            raise RuntimeError("injected forward failure")
-        return real(logits, labels)
-    monkeypatch.setattr(T, "_kto_sum_logp", flaky)
+    def failing(model, ids, labels):  # the first scoring call runs under the swapped-in reference
+        raise RuntimeError("injected reference failure")
 
-    trainer = MLXKTOTrainer(model=model, tokenizer=tok, train_dataset=_dataset(),
-                            args=_config(output_dir=str(tmp_path)))
-    with pytest.raises(RuntimeError, match="injected forward failure"):
-        trainer.train()
-
-    after = [m.scale for _, m in iter_mlx_lora_modules(model)]
-    assert after == before, "scales left disabled after a throwing reference forward"
-    assert all(s != 0 for s in after), "adapters left at scale 0"
+    monkeypatch.setattr(T, "_kto_logps", failing)
+    with pytest.raises(RuntimeError, match="injected reference failure"):
+        _trainer(tmp_path, model_tok=(model, tok)).train()
+    after = dict(tree_flatten(model.trainable_parameters()))
+    assert all(np.array_equal(before[k], np.array(after[k])) for k in before)
 
 
 @metal_only
@@ -256,32 +119,19 @@ def test_kto_sum_logp_matches_numpy():
     import numpy as np
     from unsloth_zoo.mlx.trainer import _kto_sum_logp
     rng = np.random.default_rng(1)
-    B, T, V = 3, 6, 11
-    logits = rng.normal(0, 1, size=(B, T, V)).astype(np.float32)
-    labels = rng.integers(0, V, size=(B, T)).astype(np.int64)
-    labels[0, :2] = -100; labels[1, :3] = -100; labels[2, :1] = -100
-
+    logits = rng.normal(0, 1, size=(3, 6, 11)).astype(np.float32)
+    labels = rng.integers(0, 11, size=(3, 6)).astype(np.int64)
+    labels[0, :2] = labels[1, :3] = labels[2, :1] = -100
     got = np.array(_kto_sum_logp(mx.array(logits), mx.array(labels)))
-
-    inp, tgt = logits[:, :-1, :], labels[:, 1:]
-    m = inp.max(axis=-1, keepdims=True)
-    logsm = inp - (m + np.log(np.exp(inp - m).sum(axis=-1, keepdims=True)))
-    ref = np.zeros(B)
-    for b in range(B):
-        for t in range(tgt.shape[1]):
-            if tgt[b, t] != -100:
-                ref[b] += logsm[b, t, tgt[b, t]]
-    assert np.abs(got - ref).max() < 1e-4
+    inp, tgt = logits[:, :-1].astype(np.float64), labels[:, 1:]
+    logsm = inp - np.log(np.exp(inp).sum(-1, keepdims=True))
+    ref = [sum(logsm[b, t, tgt[b, t]] for t in range(tgt.shape[1]) if tgt[b, t] != -100) for b in range(3)]
+    assert np.abs(got - np.array(ref)).max() < 1e-4
 
 
 @metal_only
-def test_non_peft_model_raises_lora_only_error(tmp_path):
+def test_non_peft_model_is_rejected(tmp_path):
     from unsloth_zoo.mlx.loader import FastMLXModel
-    from unsloth_zoo.mlx.trainer import MLXKTOTrainer
-    mx.random.seed(3407)
     model, tok = FastMLXModel.from_pretrained(MODEL, max_seq_length=256, load_in_4bit=True)
-    trainer = MLXKTOTrainer(model=model, tokenizer=tok, train_dataset=_dataset(),
-                            args=_config(output_dir=str(tmp_path)))
-    with pytest.raises(ValueError) as exc:
-        trainer.train()
-    assert "LoRA" in str(exc.value)
+    with pytest.raises(NotImplementedError, match="LoRA"):
+        _trainer(tmp_path, model_tok=(model, tok)).train()

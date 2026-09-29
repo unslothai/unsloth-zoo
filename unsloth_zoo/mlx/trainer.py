@@ -591,7 +591,6 @@ from .utils import (
     load_trainer_state,
     collect_mlx_lora_adapter_tensors,
     iter_mlx_lora_modules,
-    _is_base_tensor_inside_lora_module,
     apply_gradient_checkpointing,
     remove_gradient_checkpointing,
     _tokenize_mlx_prompt_completion_row,
@@ -9797,7 +9796,7 @@ def train_on_responses_only(
     return trainer
 
 
-# KTO (TRL KTOTrainer, loss_type="kto", arXiv:2402.01306 Eqn 7); reference = LoRA scale 0.
+# KTO (TRL KTOTrainer, loss_type="kto", arXiv:2402.01306 Eqn 7).
 
 
 @dataclass(init=False)
@@ -9819,32 +9818,20 @@ def _kto_sum_logp(logits, labels):
     tgt = labels[:, 1:]
     mask = (tgt != -100).astype(mx.float32)
     safe = mx.where(tgt == -100, mx.array(0, dtype=tgt.dtype), tgt)
-    per_tok = -nn.losses.cross_entropy(inp, safe)
-    return (per_tok * mask).sum(axis=1)
-
-
-def _kto_gather(vec, idx):
-    if len(idx) == 0:
-        return vec[0:0]
-    return vec[mx.array(idx, dtype=mx.int32)]
+    return (-nn.losses.cross_entropy(inp, safe) * mask).sum(axis=1)
 
 
 def _kto_kl_baseline(pol_kl, ref_kl):
-    """Detached clamp(mean(policy_KL - reference_KL), min=0), as in TRL kto_loss."""
+    """Detached clamp(mean(policy_KL - reference_KL), min=0), as in TRL."""
     return mx.stop_gradient(mx.maximum((pol_kl - ref_kl).mean(), 0.0))
 
 
-def _kto_loss(pol_ch, pol_rej, ref_ch, ref_rej, kl,
-              beta, desirable_weight, undesirable_weight):
-    """TRL kto_loss; either side may be empty. Gradient flows only through pol_ch/pol_rej."""
-    parts = []
-    if pol_ch.shape[0] > 0:
-        chosen_logratio = pol_ch - ref_ch
-        parts.append(desirable_weight * (1 - mx.sigmoid(beta * (chosen_logratio - kl))))
-    if pol_rej.shape[0] > 0:
-        rejected_logratio = pol_rej - ref_rej
-        parts.append(undesirable_weight * (1 - mx.sigmoid(beta * (kl - rejected_logratio))))
-    return mx.concatenate(parts, axis=0).mean()
+def _kto_loss(policy, reference, desirable, kl, beta, desirable_weight, undesirable_weight):
+    """TRL kto loss averaged over every row; gradient flows only through ``policy``."""
+    logratio = policy - reference
+    chosen = desirable_weight * (1 - mx.sigmoid(beta * (logratio - kl)))
+    rejected = undesirable_weight * (1 - mx.sigmoid(beta * (kl - logratio)))
+    return mx.where(desirable, chosen, rejected).mean()
 
 
 def _kto_pad(seqs, fill):
@@ -9860,180 +9847,97 @@ def _kto_fit_prompt(prompt_ids, completion_ids, max_length):
 
 
 def _kto_tokenize_row(tokenizer, prompt, completion, args):
-    # Joint encode like SFT: BOS, chat templates for conversational rows, EOS policy.
+    # Joint encode like SFT and TRL: BOS, chat template for conversational rows, EOS policy.
     encoded = _tokenize_mlx_prompt_completion_row(
-        tokenizer,
-        {"prompt": prompt, "completion": completion},
-        append_eos=bool(getattr(args, "append_eos", True)),
+        tokenizer, {"prompt": prompt, "completion": completion},
+        append_eos=bool(args.append_eos),
     )
     if encoded is None:
-        raise ValueError(
-            "Unsloth: KTO rows need a text or conversational 'prompt' and 'completion'."
-        )
+        raise ValueError("Unsloth: KTO rows need a text or conversational 'prompt' and 'completion'.")
     input_ids, labels = encoded
     split = next((i for i, lab in enumerate(labels) if lab != -100), len(labels))
     p, c = list(input_ids[:split]), list(input_ids[split:])
-    _eos = getattr(tokenizer, "eos_token_id", None)
-    _want_eos = bool(getattr(args, "append_eos", True)) and _eos is not None
-    _has_eos = bool(c) and c[-1] == _eos
-
-    def _cap_completion(seq, limit):
-        # Deliberately unlike TRL (which drops EOS on over-length): keep the trailing EOS.
-        if limit <= 0:
-            return seq[:0]
-        if _want_eos and _has_eos and len(seq) > limit:
-            return seq[:limit - 1] + [_eos]
-        return seq[:limit]
-
-    max_completion = args.max_completion_length
-    if max_completion is not None and max_completion > 0:
-        c = _cap_completion(c, max_completion)
+    caps = [x for x in (args.max_completion_length, args.max_length) if x and x > 0]
+    if caps and len(c) > min(caps):
+        # Unlike TRL, keep a trailing EOS so truncated rows still teach termination.
+        eos = getattr(tokenizer, "eos_token_id", None)
+        keep_eos = int(eos is not None and c[-1] == eos)
+        c = c[:min(caps) - keep_eos] + [eos] * keep_eos
     if args.max_prompt_length and args.max_prompt_length > 0:
         p = p[-args.max_prompt_length:]
-    if args.max_length and args.max_length > 0 and len(c) >= args.max_length:
-        c = _cap_completion(c, args.max_length)
     return _kto_fit_prompt(p, c, args.max_length), c
 
 
+_KTO_LABELS = {"true": True, "1": True, "1.0": True, "yes": True,
+               "false": False, "0": False, "0.0": False, "no": False}
+
+
 def _kto_parse_label(value):
-    """Parse labels; plain bool() is WRONG for CSV strings (bool("false") is True)."""
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
+    # bool("false") is True, so CSV string labels are parsed, never truth-tested.
+    if isinstance(value, (bool, int, float)):
         return bool(value)
-    if isinstance(value, str):
-        s = value.strip().lower()
-        if s in ("true", "1", "1.0", "yes", "y", "desirable"):
-            return True
-        if s in ("false", "0", "0.0", "no", "n", "undesirable", ""):
-            return False
-        raise ValueError(
-            f"Unsloth: KTO label {value!r} is not a recognized boolean. Use "
-            "True/False (or 1/0, 'true'/'false', 'yes'/'no')."
-        )
-    raise ValueError(
-        f"Unsloth: KTO label must be bool, int, float or str; got "
-        f"{type(value).__name__}."
-    )
+    if isinstance(value, str) and value.strip().lower() in _KTO_LABELS:
+        return _KTO_LABELS[value.strip().lower()]
+    raise ValueError(f"Unsloth: KTO label {value!r} is not a boolean (use True/False, 1/0 or 'true'/'false').")
 
 
 def _build_kto_batches(dataset, tokenizer, args):
-    """KL rows pair each prompt with the next row's completion, rolled within the batch (TRL _get_kl_dataset)."""
-    if getattr(args, "streaming", False) or (
-        hasattr(dataset, "__iter__") and not hasattr(dataset, "__len__")
-    ):
-        raise NotImplementedError(
-            "Unsloth: MLXKTOTrainer does not support streaming datasets yet. "
-            "_build_kto_batches materializes the whole dataset to form the "
-            "mismatched-pair KL batches, so a streaming / IterableDataset is fully "
-            "consumed before training instead of yielding bounded batches. Use a "
-            "finite (map-style) dataset, or disable streaming."
-        )
-    bs = int(args.per_device_train_batch_size)
-    if bs < 2:
-        raise ValueError(
-            "Unsloth: KTO requires per_device_train_batch_size >= 2. The KL "
-            "baseline is estimated from mismatched pairs by rolling completions "
-            "by +1 within the batch; with batch size 1 the roll pairs each "
-            "prompt with its own completion, so the KL term collapses to the "
-            "reward and training is invalid. Increase the batch size."
-        )
-    pad_id = tokenizer.pad_token_id
-    if pad_id is None:
-        pad_id = tokenizer.eos_token_id
-    if pad_id is None:
-        pad_id = 0
-
+    """KL rows pair each prompt with the previous row's completion in its batch (TRL _get_kl_dataset)."""
+    pad_id = next((x for x in (tokenizer.pad_token_id, tokenizer.eos_token_id) if x is not None), 0)
     rows = []
     for ex in dataset:
         missing = [k for k in ("prompt", "completion", "label") if k not in ex]
         if missing:
-            raise ValueError(
-                "Unsloth: KTO dataset rows must have 'prompt', 'completion' and "
-                f"'label' columns; missing {missing}. KTO uses unpaired data "
-                "(one completion + a binary desirable/undesirable label per row), "
-                "not chosen/rejected pairs."
-            )
+            raise ValueError(f"Unsloth: KTO rows need 'prompt', 'completion' and a binary 'label'; missing {missing}.")
         p, c = _kto_tokenize_row(tokenizer, ex["prompt"], ex["completion"], args)
-        if len(c) == 0:
-            continue
-        rows.append((p, c, _kto_parse_label(ex["label"])))
-
+        if c:
+            rows.append((p, c, _kto_parse_label(ex["label"])))
+    bs = int(args.per_device_train_batch_size)
     batches = []
-    dropped = 0
     for i in range(0, len(rows), bs):
         chunk = rows[i:i + bs]
         if len(chunk) < 2:
-            dropped += len(chunk)
-            continue  # a size-1 tail would self-pair the KL roll
-        prompts = [p for p, _, _ in chunk]
-        comps = [c for _, c, _ in chunk]
-        labels = [lab for _, _, lab in chunk]
-        rolled = [comps[-1]] + comps[:-1]  # TRL _get_kl_dataset roll (+1)
+            continue  # a lone row would be scored against its own completion
+        prompts, comps, labels = zip(*chunk)
+        rolled = comps[-1:] + comps[:-1]
         # A prompt fitted to its own completion can overflow max_length with another row's.
-        kl_prompts = [_kto_fit_prompt(p, cr, args.max_length) for p, cr in zip(prompts, rolled)]
+        kl_prompts = [_kto_fit_prompt(p, c, args.max_length) for p, c in zip(prompts, rolled)]
         batches.append(dict(
             comp_ids=_kto_pad([p + c for p, c in zip(prompts, comps)], pad_id),
-            comp_labels=_kto_pad([[-100] * len(p) + list(c) for p, c in zip(prompts, comps)], -100),
-            kl_ids=_kto_pad([p + cr for p, cr in zip(kl_prompts, rolled)], pad_id),
-            kl_labels=_kto_pad([[-100] * len(p) + list(cr) for p, cr in zip(kl_prompts, rolled)], -100),
-            label=labels,
+            comp_labels=_kto_pad([[-100] * len(p) + c for p, c in zip(prompts, comps)], -100),
+            kl_ids=_kto_pad([p + c for p, c in zip(kl_prompts, rolled)], pad_id),
+            kl_labels=_kto_pad([[-100] * len(p) + c for p, c in zip(kl_prompts, rolled)], -100),
+            desirable=mx.array(labels),
         ))
-    if dropped:
-        print(f"Unsloth: KTO dropped {dropped} trailing example(s) that could not "
-              f"form a batch of >= 2 (needed for the mismatched-pair KL term).")
     return batches
 
 
-def _kto_model_has_non_lora_trainable_params(model):
-    trainable = dict(tree_flatten(model.trainable_parameters()))
-    if not trainable:
-        return False
-    adapter_tensors = collect_mlx_lora_adapter_tensors(model)
-    lora_module_names = [name for name, _ in iter_mlx_lora_modules(model)]
-    lora_module_prefixes = tuple(f"{name}." for name in lora_module_names if name)
-    has_root_lora_module = any(name == "" for name in lora_module_names)
-    return any(
-        key not in adapter_tensors
-        and not _is_base_tensor_inside_lora_module(
-            key, lora_module_prefixes, has_root_lora_module,
-        )
-        for key in trainable
-    )
+def _kto_logps(model, ids, labels):
+    return _kto_sum_logp(model(ids), labels)
+
+
+def _kto_reference_logps(model, reference, batch):
+    """Score with the start weights, like TRL's frozen "ref" adapter copy (a fresh LoRA scores as the base)."""
+    current = tree_flatten(model.trainable_parameters())
+    model.update(tree_unflatten(reference))
+    try:
+        return (_kto_logps(model, batch["comp_ids"], batch["comp_labels"]),
+                _kto_logps(model, batch["kl_ids"], batch["kl_labels"]))
+    finally:
+        model.update(tree_unflatten(current))
 
 
 class MLXKTOTrainer(MLXTrainer):
-    """MLX KTO trainer (TRL KTOTrainer API); LoRA-only, reference = adapter-off forward."""
+    """MLX KTO trainer (TRL KTOTrainer API) for LoRA models; the reference is the policy at the start."""
 
     def __init__(self, model, tokenizer, train_dataset, args=None,
-                 eval_dataset=None, processor=None, **kwargs):
-        self.model = model
-        self.tokenizer = tokenizer
-        self.processor = processor
-        self.args = args if args is not None else MLXKTOConfig()
-        if not isinstance(self.args, MLXKTOConfig):
-            raise TypeError(
-                "Unsloth: MLXKTOTrainer requires an MLXKTOConfig (got "
-                f"{type(self.args).__name__}). Use MLXKTOConfig for beta / "
-                "desirable_weight / undesirable_weight."
-            )
-        _loss_type = getattr(self.args, "loss_type", "kto")
-        if _loss_type != "kto":
-            raise ValueError(
-                "Unsloth: MLXKTOTrainer only implements loss_type='kto' (got "
-                f"{_loss_type!r}). Other TRL KTO variants are not implemented on "
-                "the MLX KTO path. Set loss_type='kto'."
-            )
-        if kwargs.get("ref_model") is not None:
-            raise ValueError(
-                "Unsloth: MLXKTOTrainer does not take a separate ref_model. The "
-                "KTO reference is the adapter-disabled (LoRA scale=0) forward of "
-                "the policy model, so a passed ref_model would be ignored. Remove "
-                "ref_model."
-            )
+                 eval_dataset=None, processor=None, ref_model=None, **kwargs):
+        args = MLXKTOConfig() if args is None else args
+        if not isinstance(args, MLXKTOConfig):
+            raise TypeError(f"Unsloth: MLXKTOTrainer requires an MLXKTOConfig, got {type(args).__name__}.")
+        self.model, self.tokenizer, self.processor, self.args = model, tokenizer, processor, args
+        self.train_dataset, self.eval_dataset, self.ref_model = train_dataset, eval_dataset, ref_model
         self._is_vlm = False
-        self.train_dataset = train_dataset
-        self.eval_dataset = eval_dataset
         self.formatting_func = None
         self._ensure_lora_frozen(model)
         self._reset_run_state()
@@ -10042,197 +9946,104 @@ class MLXKTOTrainer(MLXTrainer):
         self._step_callbacks = []
         self._eval_callbacks = []
         self._kl_history = []
+        self._kto_reference = None
+
+    def _reject_unsupported(self, resume_from_checkpoint):
+        args, model = self.args, self.model
+        unsupported = {
+            "loss_type other than 'kto'": args.loss_type != "kto",
+            "ref_model (the reference is the policy's start weights)": self.ref_model is not None,
+            "models without LoRA adapters (call get_peft_model first)":
+                next(iter_mlx_lora_modules(model), None) is None,
+            "gated-delta models (Qwen3.5 / Qwen3-Next)": model_has_gated_delta_layers(model),
+            "vision-language models": any(
+                hasattr(x, "image_processor") for x in (self.tokenizer, self.processor)
+            ),
+            "per_device_train_batch_size < 2 (the KL rows need two rows)":
+                int(args.per_device_train_batch_size) < 2,
+            "streaming datasets": bool(getattr(args, "streaming", False))
+                or not hasattr(self.train_dataset, "__len__"),
+            "lora_plus_ratio": float(getattr(args, "lora_plus_ratio", 0) or 0) > 0,
+            "resume_from_checkpoint": resume_from_checkpoint is not None,
+            "eval_dataset": self.eval_dataset is not None,
+            "distributed training": self.distributed_world_size > 1,
+        }
+        found = [name for name, hit in unsupported.items() if hit]
+        if found:
+            raise NotImplementedError("Unsloth: MLXKTOTrainer does not support " + "; ".join(found) + ".")
 
     def train(self, resume_from_checkpoint: str | None = None):
-        args = self.args
-        model = self.model
-        lora_mods = [m for _, m in iter_mlx_lora_modules(model)]
-        if not lora_mods:
-            raise ValueError(
-                "Unsloth: MLXKTOTrainer needs a LoRA model. Call "
-                "FastMLXModel.get_peft_model(...) first; the KTO reference is the "
-                "adapter-disabled forward (there is no separate reference copy)."
-            )
-
-        if model_has_gated_delta_layers(model):
-            raise NotImplementedError(
-                "Unsloth: MLXKTOTrainer does not support gated-delta models "
-                "(e.g. Qwen3.5 / Qwen3-Next) yet: the KTO loop bypasses the base "
-                "trainer's patch_gated_delta setup, so the backward fails with a "
-                "missing custom-kernel VJP. Use a non-gated-delta model for KTO."
-            )
-        if hasattr(self.tokenizer, "image_processor"):
-            raise NotImplementedError(
-                "Unsloth: MLXKTOTrainer is text-LoRA only and does not support "
-                "vision-language models yet (the VLM processor has no pad_token_id "
-                "and the model returns structured outputs, not raw logits). Use a "
-                "text model + tokenizer for KTO."
-            )
-
-        if _kto_model_has_non_lora_trainable_params(model):
-            raise ValueError(
-                "Unsloth: MLXKTOTrainer requires ALL trainable parameters to be "
-                "LoRA adapters. A trainable non-LoRA tensor (e.g. a directly "
-                "trained lm_head/embed_tokens) would drift during training and "
-                "corrupt the adapter-off KTO reference. This is a structural limit "
-                "of KTO's reference (there is no reference_free mode), not a "
-                "togglable option -- train only LoRA adapters, e.g. via "
-                "FastMLXModel.get_peft_model(...) without unfreezing base weights."
-            )
-
-        if float(getattr(args, "lora_plus_ratio", 0.0) or 0.0) > 0:
-            raise ValueError(
-                "Unsloth: MLXKTOTrainer does not support lora_plus_ratio yet "
-                "(LoRA+ per-leaf scaling is unimplemented on the KTO path). "
-                "Set lora_plus_ratio=0 to run KTO."
-            )
-
-        if resume_from_checkpoint is not None:
-            raise ValueError(
-                "Unsloth: MLXKTOTrainer does not support resume_from_checkpoint "
-                "yet; a resumed call would restart from scratch and overwrite "
-                "the output adapters. Start a fresh run instead."
-            )
-        if self.eval_dataset is not None:
-            raise ValueError(
-                "Unsloth: MLXKTOTrainer does not run an eval loop yet, so "
-                "eval_dataset / eval_steps / load_best_model_at_end are ignored. "
-                "Remove eval_dataset to run KTO, or evaluate separately."
-            )
-        if self.distributed_world_size > 1:
-            raise ValueError(
-                "Unsloth: MLXKTOTrainer does not support MLX distributed "
-                "training yet; it neither shards KTO batches nor averages "
-                "gradients across ranks, so each rank would train independently. "
-                "Run KTO on a single process."
-            )
-
+        self._reject_unsupported(resume_from_checkpoint)
+        args, model = self.args, self.model
         batches = _build_kto_batches(self.train_dataset, self.tokenizer, args)
         if not batches:
-            raise ValueError(
-                "Unsloth: KTO produced no usable batches (need >= 2 examples with "
-                "non-empty completions per batch)."
-            )
-
+            raise ValueError("Unsloth: KTO needs at least 2 rows with non-empty completions.")
         grad_accum = max(int(args.gradient_accumulation_steps), 1)
         if args.max_steps and args.max_steps > 0:
             total_steps = args.max_steps
         else:
-            epochs = max(int(getattr(args, "num_train_epochs", 1) or 1), 1)
-            total_steps = max((len(batches) * epochs) // grad_accum, 1)
+            total_steps = max(len(batches) * max(int(args.num_train_epochs or 1), 1) // grad_accum, 1)
         optimizer = self._build_optimizer(total_steps)
-        (max_grad_norm, max_grad_value, max_grad_leaf_norm,
-         _clip_mode) = _resolve_mlx_grad_clipping(args)
+        max_grad_norm, max_grad_value, max_grad_leaf_norm, _ = _resolve_mlx_grad_clipping(args)
+        if self._kto_reference is None:
+            self._kto_reference = tree_flatten(model.trainable_parameters())
+
+        def loss_fn(model, batch, ref, kl):
+            return _kto_loss(
+                _kto_logps(model, batch["comp_ids"], batch["comp_labels"]), ref, batch["desirable"], kl,
+                args.beta, args.desirable_weight, args.undesirable_weight,
+            )
+
+        value_and_grad = nn.value_and_grad(model, loss_fn)
         start_time = time.perf_counter()
-
-        def _reference_and_kl(batch):
-            pol_kl = mx.stop_gradient(_kto_sum_logp(model(batch["kl_ids"]), batch["kl_labels"]))
-            saved = [mm.scale for mm in lora_mods]
-            try:
-                for mm in lora_mods:
-                    mm.scale = 0.0
-                ref_comp = mx.stop_gradient(_kto_sum_logp(model(batch["comp_ids"]), batch["comp_labels"]))
-                ref_kl = mx.stop_gradient(_kto_sum_logp(model(batch["kl_ids"]), batch["kl_labels"]))
-            finally:
-                for mm, s in zip(lora_mods, saved):
-                    mm.scale = s
-            kl_scalar = _kto_kl_baseline(pol_kl, ref_kl)
-            return ref_comp, kl_scalar
-
-        # Same setup and teardown as MLXTrainer.train: Metal memory guard, gradient
-        # checkpointing, and the differentiable MoE / sparse-attention training patches.
+        self._train_loss_history, self._kl_history, self._global_step = [], [], 0
+        # Same setup as MLXTrainer.train: Metal memory guard, gradient checkpointing, MLX training patches.
         self._memory_limits_applied = self._configure_memory_limits()
         if args.gradient_checkpointing:
             apply_gradient_checkpointing(model)
         acquire_mlx_training_patches()
         try:
             model.train()
-            self._train_loss_history = []
-            self._kl_history = []
-            self._global_step = 0
-
-            step = 0
-            micro = 0
-            acc_grad = None
-            acc_loss = 0.0
-            acc_kl = 0.0
-            acc_n = 0
-            stop = False
-            max_epochs = 1_000_000
-            for _epoch in range(max_epochs):
-                if stop:
-                    break
-                for batch in batches:
-                    if step >= total_steps or self.stop_requested:
-                        stop = True
-                        break
-                    labels = batch["label"]
-                    chosen_idx = [i for i, l in enumerate(labels) if l]
-                    rejected_idx = [i for i, l in enumerate(labels) if not l]
-
-                    ref_comp, kl_scalar = _reference_and_kl(batch)
-                    ref_ch = _kto_gather(ref_comp, chosen_idx)
-                    ref_rej = _kto_gather(ref_comp, rejected_idx)
-                    mx.eval(ref_ch, ref_rej, kl_scalar)
-
-                    def loss_fn(model):
-                        comp_logps = _kto_sum_logp(model(batch["comp_ids"]), batch["comp_labels"])
-                        pol_ch = _kto_gather(comp_logps, chosen_idx)
-                        pol_rej = _kto_gather(comp_logps, rejected_idx)
-                        return _kto_loss(
-                            pol_ch, pol_rej, ref_ch, ref_rej, kl_scalar,
-                            args.beta, args.desirable_weight, args.undesirable_weight,
-                        )
-
-                    loss, grad = nn.value_and_grad(model, loss_fn)(model)
-
-                    # Weight by row count: equal weighting over-weights a smaller trailing batch.
-                    n_i = len(labels)
-                    contrib = tree_map(lambda g: g * n_i, grad)
-                    if acc_grad is None:
-                        acc_grad = contrib
-                    else:
-                        acc_grad = tree_map(lambda a, g: a + g, acc_grad, contrib)
-                    acc_loss += float(loss) * n_i
-                    acc_kl += float(kl_scalar) * n_i
-                    acc_n += n_i
-                    micro += 1
-                    if micro < grad_accum:
-                        mx.eval(acc_grad)
-                        continue
-
-                    grad = tree_map(lambda g: g / acc_n, acc_grad)
-                    mean_loss = acc_loss / acc_n
-                    mean_kl = acc_kl / acc_n
-                    # LR first: _apply_manual_weight_decay reads optimizer.learning_rate.
-                    self._set_optimizer_lr_for_step(optimizer, step)
-                    if max_grad_norm > 0:
-                        grad, _ = _clip_grad_norm_fp32(grad, max_norm=max_grad_norm)
-                    if max_grad_value is not None and max_grad_value > 0:
-                        grad = _clip_grad_by_value(grad, max_grad_value)
-                    if max_grad_leaf_norm is not None and max_grad_leaf_norm > 0:
-                        grad = _clip_grad_by_leaf_norm(grad, max_grad_leaf_norm)
-                    grad = self._apply_coupled_weight_decay(model, grad)
-                    self._apply_manual_weight_decay(model, optimizer, grad)
-                    optimizer.update(model, grad)
-                    mx.eval(model.parameters(), optimizer.state)
-
-                    train_loss = mean_loss
-                    self._train_loss_history.append(train_loss)
-                    self._kl_history.append(mean_kl)
-                    self._global_step = step + 1
-                    if args.logging_steps and ((step + 1) % max(int(args.logging_steps), 1) == 0):
-                        print(
-                            f"Unsloth KTO: step {step + 1}/{total_steps} "
-                            f"loss={train_loss:.4f} kl={mean_kl:.4f} "
-                            f"(desirable={len(chosen_idx)} undesirable={len(rejected_idx)})"
-                        )
-                    step += 1
-                    acc_grad = None
-                    acc_loss = 0.0
-                    acc_kl = 0.0
-                    acc_n = 0
-                    micro = 0
+            step, index = 0, 0
+            acc_grad, acc_loss, acc_kl, acc_n = None, 0.0, 0.0, 0
+            while step < total_steps and not self.stop_requested:
+                batch = batches[index % len(batches)]
+                index += 1
+                ref, ref_kl = _kto_reference_logps(model, self._kto_reference, batch)
+                kl = _kto_kl_baseline(_kto_logps(model, batch["kl_ids"], batch["kl_labels"]), ref_kl)
+                ref = mx.stop_gradient(ref)
+                mx.eval(ref, kl)
+                loss, grad = value_and_grad(model, batch, ref, kl)
+                # Weight by rows: a smaller trailing batch must not count as much as a full one.
+                n = batch["comp_ids"].shape[0]
+                grad = tree_map(lambda g: g * n, grad)
+                acc_grad = grad if acc_grad is None else tree_map(mx.add, acc_grad, grad)
+                acc_loss += float(loss) * n
+                acc_kl += float(kl) * n
+                acc_n += n
+                if index % grad_accum:
+                    mx.eval(acc_grad)
+                    continue
+                grad = tree_map(lambda g: g / acc_n, acc_grad)
+                self._set_optimizer_lr_for_step(optimizer, step)  # decay below reads this LR
+                if max_grad_norm > 0:
+                    grad, _ = _clip_grad_norm_fp32(grad, max_norm=max_grad_norm)
+                if max_grad_value is not None and max_grad_value > 0:
+                    grad = _clip_grad_by_value(grad, max_grad_value)
+                if max_grad_leaf_norm is not None and max_grad_leaf_norm > 0:
+                    grad = _clip_grad_by_leaf_norm(grad, max_grad_leaf_norm)
+                grad = self._apply_coupled_weight_decay(model, grad)
+                self._apply_manual_weight_decay(model, optimizer, grad)
+                optimizer.update(model, grad)
+                mx.eval(model.parameters(), optimizer.state)
+                self._train_loss_history.append(acc_loss / acc_n)
+                self._kl_history.append(acc_kl / acc_n)
+                step += 1
+                self._global_step = step
+                if args.logging_steps and step % max(int(args.logging_steps), 1) == 0:
+                    print(f"Unsloth KTO: step {step}/{total_steps} "
+                          f"loss={self._train_loss_history[-1]:.4f} kl={self._kl_history[-1]:.4f}")
+                acc_grad, acc_loss, acc_kl, acc_n = None, 0.0, 0.0, 0
         finally:
             release_mlx_training_patches()
             if args.gradient_checkpointing:
@@ -10242,19 +10053,14 @@ class MLXKTOTrainer(MLXTrainer):
         if self.is_main_process:
             try:
                 self.save_model()
+                print(f"Unsloth: Saved final adapters to {args.output_dir}")
             except ValueError as e:
                 print(f"Unsloth: skipped final save ({e})")
-            else:
-                print(f"Unsloth: Saved final adapters to {args.output_dir}")
 
-        total_time = time.perf_counter() - start_time
-        avg_loss = (
-            sum(self._train_loss_history) / len(self._train_loss_history)
-            if self._train_loss_history else 0.0
-        )
+        history = self._train_loss_history
         return MLXTrainOutput({
-            "train_loss": avg_loss,
-            "train_runtime": total_time,
+            "train_loss": sum(history) / len(history) if history else 0.0,
+            "train_runtime": time.perf_counter() - start_time,
             "train_steps": self._global_step,
             "total_train_steps": total_steps,
         })
