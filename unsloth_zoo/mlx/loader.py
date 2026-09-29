@@ -577,16 +577,15 @@ def _message_matches_known_fallback(message, rule):
     return any(all(token in message for token in tokens) for tokens in token_sets)
 
 
-# Anchored on __init__: signature drift at our own call sites ("load_model() missing ...")
-# is not a config problem and must keep its traceback.
+# Only *Args / *Config __init__: load_model signature drift or an nn layer must keep its traceback.
 _MLX_MISSING_ARGS_RE = re.compile(
-    r"\w*\.?__init__\(\) missing \d+ required positional arguments?:(?P<keys>.*)"
+    r"(?<![\w.])(?:\w*(?:Args|Config)\.)?__init__\(\) "
+    r"missing \d+ required positional arguments?:(?P<keys>.*)"
 )
 
 
 def _missing_mlx_config_keys(message):
-    """Required config fields config.json omitted: mlx-lm / mlx-vlm ``from_dict`` filter to
-    declared fields, so a missing no-default field fails in ``__init__``. [] otherwise."""
+    """Required *Args / *Config fields named by an mlx-lm / mlx-vlm ``__init__`` TypeError, else []."""
     match = _MLX_MISSING_ARGS_RE.search(message)
     if match is None:
         return []
@@ -601,14 +600,10 @@ def _raise_if_incomplete_mlx_config(
     keys = _missing_mlx_config_keys(message)
     if not keys:
         return
-    # Only config dataclasses: a model / processor __init__ missing an argument is not a
-    # config.json problem. Python 3.9 omits the class name, so check the raising frame.
+    # Python 3.9 omits the class name, so check the raising frame is a config from_dict.
     owner = re.search(r"(\w+)\.__init__\(\)", message)
-    if owner is not None:
-        owner = owner.group(1)
-        if owner != "ModelArgs" and not owner.endswith("Config"):
-            return
-    else:
+    owner = owner.group(1) if owner is not None else None
+    if owner is None:
         frames = traceback.extract_tb(error.__traceback__)
         if not frames or frames[-1].name != "from_dict":
             return
@@ -1285,9 +1280,7 @@ def _load_mlx_lm_distributed(
                     model_config=model_config,
                 )
             except TypeError as error:
-                _raise_if_incomplete_mlx_config(
-                    model_name, model_type, str(error), error
-                )
+                _raise_if_incomplete_mlx_config(model_name, model_type, str(error), error)
                 raise
 
             mode = _mlx_distributed_sharding_mode(
@@ -3390,6 +3383,18 @@ def _mark_text_only_vlm(model, model_type: str) -> None:
     model._unsloth_text_only_vlm = True
 
 
+def _freeze_outside_language_model(model) -> None:
+    """Text batches never reach the towers, so train only the language model, as mlx-lm does."""
+    language_model = getattr(model, "language_model", None)
+    if language_model is None:
+        return
+    # recurse=False per module, so a module the language model shares stays trainable.
+    shared = {id(module) for module in language_model.modules()}
+    for _, module in model.named_modules():
+        if id(module) not in shared:
+            module.freeze(recurse=False)
+
+
 def _resolve_mlx_vlm_model_class(model_type):
     """Resolve the mlx_vlm ``Model`` class for a model_type (honoring remaps)."""
     if not model_type:
@@ -4809,7 +4814,6 @@ def _load_pathless_mlx_adapter(
         and _is_partial_mlx_checkpoint(model, adapter_weights_file)
     )
     if partial_full_module:
-        _fix_missing_no_grad(model)
         model.freeze()
     model = load_adapters(model, local_path)
     if partial_full_module:
@@ -8171,6 +8175,13 @@ def _evaluate_quantized_modules(model, sources):
 def _finish_load(model, tokenizer):
     """The single exit from a load, so the patch installs after the runtimes the load imports."""
     install_quantized_attention()
+    # Here rather than in get_peft_model: the trainer and callers freeze loaded models too.
+    _fix_missing_no_grad(model)
+    if (
+        getattr(model, "_unsloth_full_finetuning", False)
+        and getattr(model, "_unsloth_text_only_vlm", False)
+    ):
+        _freeze_outside_language_model(model)
     _materialize_weights(model)
     return model, tokenizer
 
@@ -8847,7 +8858,6 @@ class FastMLXModel:
                                 ) from _dora_exc
                         if _saved_lora_paths:
                             if not full_finetuning:
-                                _fix_missing_no_grad(model)
                                 model.freeze()
                             _apply_lora_at_paths(
                                 model, _saved_lora_paths, adapter_cfg,
@@ -8896,7 +8906,6 @@ class FastMLXModel:
                         from .utils import iter_mlx_lora_modules
                         _lora_modules = list(iter_mlx_lora_modules(model))
                         if _lora_modules:
-                            _fix_missing_no_grad(model)
                             model.freeze()
                             model.unfreeze(keys=["lora_a", "lora_b"], strict=False)
                             # Per module, so an unrelated base parameter named

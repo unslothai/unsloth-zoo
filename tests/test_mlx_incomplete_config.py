@@ -16,9 +16,6 @@
 
 from __future__ import annotations
 
-import sys
-import types
-
 import pytest
 
 
@@ -29,7 +26,7 @@ def _install_mlx_shim():
     simulate_mlx_on_torch()
 
 
-# mlx-lm 0.31.3 on unsloth/LFM2.5-230M (unslothai/unsloth#7306).
+# Verbatim from mlx-lm 0.31.3 on unsloth/LFM2.5-230M (unslothai/unsloth#7306).
 _LFM2_MSG = (
     "ModelArgs.__init__() missing 1 required positional argument: 'block_ff_dim'"
 )
@@ -106,21 +103,40 @@ def test_key_extraction_shapes():
     assert _missing_mlx_config_keys(
         "__init__() missing 1 required positional argument: 'block_ff_dim'"
     ) == ["block_ff_dim"]
+    assert _missing_mlx_config_keys(
+        "TextConfig.__init__() missing 1 required positional argument: 'vocab_size'"
+    ) == ["vocab_size"]
+    assert _missing_mlx_config_keys(
+        "Linear.__init__() missing 1 required positional argument: 'output_dims'"
+    ) == []
     assert _missing_mlx_config_keys("something else entirely") == []
 
 
-def test_strict_fallback_converts_the_type_error(monkeypatch):
-    from unsloth_zoo.mlx.loader import _load_mlx_lm_with_strict_fallback
+def _stub_text_load(monkeypatch, tmp_path, config, error):
+    import json
+    import mlx_lm.utils as lm_utils
 
-    def _load_model(path, **kwargs):
-        raise TypeError(_LFM2_MSG)
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    monkeypatch.setattr(lm_utils, "_download", lambda *a, **k: tmp_path)
 
-    utils = types.ModuleType("mlx_lm.utils")
-    utils._download = lambda name, revision=None: "/nonexistent"
-    utils.load_model = _load_model
-    utils.load_tokenizer = lambda *a, **k: None
-    monkeypatch.setitem(sys.modules, "mlx_lm.utils", utils)
-    with pytest.raises(ValueError) as exc:
-        _load_mlx_lm_with_strict_fallback("unsloth/LFM2.5-230M", "lfm2", None, {})
-    assert "block_ff_dim" in str(exc.value) and "mlx-lm" in str(exc.value)
-    assert isinstance(exc.value.__cause__, TypeError)
+    def load_model(*args, **kwargs):
+        raise TypeError(error)
+
+    monkeypatch.setattr(lm_utils, "load_model", load_model)
+
+
+def test_text_load_names_missing_config_key(monkeypatch, tmp_path):
+    import unsloth_zoo.mlx.loader as loader
+
+    _stub_text_load(monkeypatch, tmp_path, {"model_type": "lfm2"}, _LFM2_MSG)
+    with pytest.raises(ValueError, match="block_ff_dim"):
+        loader._load_mlx_lm_with_strict_fallback("unsloth/LFM2.5-230M", "lfm2", None, {})
+
+
+def test_text_load_keeps_non_config_init_type_error(monkeypatch, tmp_path):
+    import unsloth_zoo.mlx.loader as loader
+
+    message = "Linear.__init__() missing 1 required positional argument: 'output_dims'"
+    _stub_text_load(monkeypatch, tmp_path, {"model_type": "lfm2"}, message)
+    with pytest.raises(TypeError, match="output_dims"):
+        loader._load_mlx_lm_with_strict_fallback("unsloth/Example", "lfm2", None, {})
