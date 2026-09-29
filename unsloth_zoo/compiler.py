@@ -318,8 +318,7 @@ def function_only_called_at_init(module_source: str, name: str) -> bool:
                 return False  # called at module import time or from a class body
             owner_name, is_method = owner
             if is_method:
-                # Methods are also reached via self.<name>(...), which is not tracked
-                # (MPT's forward calls self.build_mpt_alibi_tensor).
+                # self.<name>() calls are untracked (MPT forward: self.build_mpt_alibi_tensor).
                 if owner_name in _INIT_ONLY_CALLERS:
                     continue
                 return False
