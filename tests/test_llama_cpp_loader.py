@@ -14,26 +14,38 @@ def _load_llama_cpp_module():
     return module
 
 
-def test_load_module_from_path_resolves_sibling_imports(tmp_path):
-    llama_cpp = _load_llama_cpp_module()
-    (tmp_path / "conversion.py").write_text("VALUE = 'loaded from sibling'\n")
-    script = tmp_path / "original_gguf_test.py"
-    script.write_text(
-        textwrap.dedent(
-            """
-            from conversion import VALUE
+def test_converter_is_parsed_not_imported(tmp_path):
+    """The downloaded converter is AST-parsed, so a script whose sibling
+    imports cannot resolve (and whose top level has side effects) still yields
+    its registered architectures without executing anything.
 
-            RESULT = VALUE
-            """
-        )
-    )
+    This replaces the old `_load_module_from_path` sibling-import test: that
+    helper imported the freshly downloaded llama.cpp script in-process and has
+    been removed.
+    """
+    llama_cpp = _load_llama_cpp_module()
+    marker = tmp_path / "executed"
+    source = textwrap.dedent(
+        f"""
+        from conversion import VALUE  # unresolvable sibling import
+        import pathlib
+        pathlib.Path({str(marker)!r}).write_text("executed")
+
+        class ModelBase: pass
+
+        @ModelBase.register("LlamaForCausalLM")
+        class LlamaModel(ModelBase): pass
+        """
+    ).encode()
 
     sys.modules.pop("conversion", None)
     original_path = sys.path[:]
     try:
-        module = llama_cpp._load_module_from_path(str(script), "original_gguf_test")
+        text_archs, vision_archs = llama_cpp._extract_archs_from_monolith_source(source)
 
-        assert module.RESULT == "loaded from sibling"
+        assert text_archs == {"LlamaForCausalLM"}
+        assert vision_archs == set()
+        assert not marker.exists()
         assert str(tmp_path) not in sys.path
     finally:
         sys.path[:] = original_path

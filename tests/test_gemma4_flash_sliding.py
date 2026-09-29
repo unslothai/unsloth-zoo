@@ -85,8 +85,7 @@ def test_mask_probe_rejects_packed_boundary():
 
 
 def test_float_mask_inband_bias_rejected():
-    # A finite in-band bias would be silently dropped when routing to FA2, so a
-    # float mask is only accepted when in-band entries are exactly 0.
+    # A finite in-band bias would be silently dropped when routing to FA2.
     from unsloth_zoo.temporary_patches import gemma4_flash_sliding as gf
     S, w = 256, 64
     band = _band(S, w)
@@ -97,8 +96,6 @@ def test_float_mask_inband_bias_rejected():
 
 
 def test_chunked_verification_matches_dense():
-    # Row-chunked verification must agree with a single-block scan on band,
-    # padded, and packed masks (the memory win needs no test).
     from unsloth_zoo.temporary_patches import gemma4_flash_sliding as gf
     S, w = 96, 16
     band = _band(S, w)
@@ -125,8 +122,8 @@ class Gemma4SlidingFake:
 
 
 def test_router_routes_to_fa2_and_matches_band(monkeypatch):
-    # With flash-attn present the unified wrapper must take the FA2 window branch
-    # (never the wrapped SDPA) and match full SDPA + band mask.
+    # With flash-attn present the wrapper must take the FA2 window branch, never
+    # the wrapped SDPA.
     from unsloth_zoo.temporary_patches import gemma4_flash_sliding as gf
 
     monkeypatch.setenv("UNSLOTH_GEMMA4_FLASH_SLIDING", "1")

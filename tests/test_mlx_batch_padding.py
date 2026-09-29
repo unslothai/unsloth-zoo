@@ -36,18 +36,14 @@ def _zoo_padded_len(max_len, pad_multiple=32):
 @pytest.mark.parametrize(
     "max_len, expected",
     [
-        # Inside the first 32-token bucket -> 33.
         (1, 33),
         (14, 33),  # the probe fixture's TRAIN_TEXT length
         (31, 33),
         (32, 33),
-        # Second bucket -> 65.
         (33, 65),
         (63, 65),
         (64, 65),
-        # Third bucket -> 97.
         (65, 97),
-        # Larger buckets.
         (97, 129),
         (128, 129),
         (129, 161),
