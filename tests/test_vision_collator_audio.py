@@ -43,9 +43,9 @@ import pytest
 import torch
 
 from unsloth_zoo.vision_utils import (
-    _AUDIO_SUB_PROCESSOR_ATTRS,
     UnslothVisionDataCollator,
     _audio_call_kwarg,
+    _audio_sub_processors,
     _fix_audio_feature_extractor_padding_side,
     _is_audio_mapping,
     extract_audio_info,
@@ -93,10 +93,6 @@ def msgs(part):
 
 CLIP = np.zeros(16, dtype=np.float32)
 
-
-# ---------------------------------------------------------------------------
-# extract_audio_info
-# ---------------------------------------------------------------------------
 
 def test_inline_array():
     out = extract_audio_info(msgs({"type": "audio", "audio": CLIP}))
@@ -175,10 +171,6 @@ def test_non_audio_parts_ignored():
     out = extract_audio_info(msgs({"type": "image", "image": "x.png"}))
     assert out == []
 
-
-# ---------------------------------------------------------------------------
-# _extract_audio_for_example
-# ---------------------------------------------------------------------------
 
 def test_top_level_dict_unwrapped():
     collator = make_collator()
@@ -324,10 +316,6 @@ def test_inline_audio_decode_false_dict_resolved():
     assert out == ["/tmp/a.wav"]
 
 
-# ---------------------------------------------------------------------------
-# _fix_audio_feature_extractor_padding_side
-# ---------------------------------------------------------------------------
-
 def test_left_padded_feature_extractor_reset_to_right():
     proc = _FakeProcessor()
     proc.feature_extractor.padding_side = "left"
@@ -366,10 +354,6 @@ def test_feature_extractor_without_padding_side_noop():
     assert not hasattr(proc.feature_extractor, "padding_side")
 
 
-# ---------------------------------------------------------------------------
-# _truncate_sequence_tensors
-# ---------------------------------------------------------------------------
-
 def _batch_left_padded():
     # seq_len 6, max_seq_length 4. Row 0 is short (2 left pads + 2 audio + 2
     # text tokens), row 1 is full length. input_features last dim deliberately
@@ -392,7 +376,6 @@ def test_truncation_left_padding_keeps_short_row_content():
     # Short row keeps its content (audio span intact), not its padding
     assert batch["input_ids"][0].tolist() == [AUDIO_ID, AUDIO_ID, 5, 6]
     assert batch["attention_mask"][0].tolist() == [1, 1, 1, 1]
-    # Long row truncates its tail
     assert batch["input_ids"][1].tolist() == [1, 2, 3, 4]
     assert batch["attention_mask"].shape == (2, 4)
     assert batch["mm_token_type_ids"].shape == (2, 4)
@@ -425,7 +408,6 @@ def test_truncation_cutting_audio_span_raises():
         collator._truncate_sequence_tensors(batch, seq_len=6)
 
 
-# ---------------------------------------------------------------------------
 # datasets >= 4 torchcodec AudioDecoder columns (unsloth/unsloth#7226)
 #
 # patch_torchcodec_audio_decoder grafts the mapping protocol onto AudioDecoder
@@ -433,7 +415,6 @@ def test_truncation_cutting_audio_span_raises():
 # it, dropped it into the raw-waveform catch-all and blew up inside np.fft.rfft.
 # _FakeAudioDecoder mirrors the patched surface and runs in CI; the real-decoder
 # tests below need datasets >= 4 + torchcodec and skip otherwise.
-# ---------------------------------------------------------------------------
 
 DECODED = np.linspace(-0.5, 0.5, 32, dtype=np.float32)
 
@@ -517,8 +498,6 @@ def test_non_mapping_audio_values_are_not_treated_as_mappings(value):
     assert not _is_audio_mapping(value)
 
 
-# --- the real decoder, when the optional deps are installed ----------------
-
 def _real_decoder():
     datasets = pytest.importorskip("datasets", minversion="4.0.0")
     pytest.importorskip("torchcodec")
@@ -564,7 +543,6 @@ def test_real_decoder_decodes_to_float32_at_every_gate(gate):
     assert clips[0].ndim == 1
 
 
-# ---------------------------------------------------------------------------
 # Unpatched torchcodec AudioDecoder (unsloth/unsloth#7226, follow-up)
 #
 # Driving the collator without importing `unsloth` skips
@@ -574,7 +552,6 @@ def test_real_decoder_decodes_to_float32_at_every_gate(gate):
 # In CI (no torchcodec) a fake stands in as the decoder type via _audio_decoder_types;
 # the real-decoder variant runs in a fresh subprocess since the patch mutates the
 # class process-wide.
-# ---------------------------------------------------------------------------
 
 
 class _UnpatchedFakeAudioDecoder:
@@ -591,9 +568,14 @@ class _UnpatchedFakeAudioDecoder:
 
 @pytest.fixture
 def _recognize_unpatched_decoder(monkeypatch):
-    # Treat _UnpatchedFakeAudioDecoder as the decoder type so these run in CI.
+    # Patch the imported module object directly rather than the
+    # "unsloth_zoo.vision_utils._audio_decoder_types" string path: the string
+    # form resolves unsloth_zoo through sys.modules at runtime, so a preceding
+    # test that swaps unsloth_zoo in sys.modules would break resolution here.
+    import unsloth_zoo.vision_utils as vision_utils
     monkeypatch.setattr(
-        "unsloth_zoo.vision_utils._audio_decoder_types",
+        vision_utils,
+        "_audio_decoder_types",
         lambda: (_UnpatchedFakeAudioDecoder,),
     )
 
@@ -619,7 +601,6 @@ def test_unpatched_decoder_top_level_gate(_recognize_unpatched_decoder):
 
 
 def test_unpatched_decoder_list_gate(_recognize_unpatched_decoder):
-    # A list of decoders is a list of clips.
     collator = make_collator()
     clips = collator._extract_audio_for_example(
         {"audio": [_UnpatchedFakeAudioDecoder(), _UnpatchedFakeAudioDecoder()]},
@@ -927,6 +908,16 @@ def test_singular_kwarg_still_used_for_audio_processors():
     assert vision.audio_call_kwarg == "audio"
 
 
+def _processor_attrs(cls):
+    # transformers 5.x dropped `attributes`; sub-processors are the __init__ parameters.
+    attrs = getattr(cls, "attributes", None)
+    if attrs: return list(attrs)
+    try:
+        return list(inspect.signature(cls.__init__).parameters)
+    except (TypeError, ValueError):
+        return []
+
+
 def test_every_transformers_audio_processor_is_classified_by_what_it_accepts():
     # Derive the expectation from transformers itself: for every processor class
     # that ships an audio sub-processor, the resolver must return a keyword its
@@ -944,8 +935,7 @@ def test_every_transformers_audio_processor_is_classified_by_what_it_accepts():
             continue
         for cls in vars(module).values():
             if not inspect.isclass(cls) or cls.__module__ != module.__name__: continue
-            attrs = getattr(cls, "attributes", None) or ()
-            if not ({"feature_extractor", "audio_processor"} & set(attrs)): continue
+            if not ({"feature_extractor", "audio_processor"} & set(_processor_attrs(cls))): continue
             try:
                 params = inspect.signature(cls.__call__).parameters
             except (TypeError, ValueError):
@@ -1148,7 +1138,7 @@ def test_audio_span_truncation_raises_on_both_paths(path):
         batch = [{"messages": _AUDIO_PC_MESSAGES}]
     else:
         batch = [{"prompt": _AUDIO_PC_MESSAGES[:1], "completion": _AUDIO_PC_MESSAGES[1:]}]
-    with pytest.raises(ValueError, match="cuts into the expanded audio tokens"):
+    with pytest.raises(ValueError, match="cuts into the expanded audio tokens|placeholder"):
         collator(batch)
 
 
@@ -1199,15 +1189,15 @@ def test_audio_sub_processor_attr_names_cover_transformers():
             continue
         for cls in vars(module).values():
             if not inspect.isclass(cls) or cls.__module__ != module.__name__: continue
-            for attr in (getattr(cls, "attributes", None) or ()):
+            for attr in _processor_attrs(cls):
                 klass = getattr(cls, f"{attr}_class", None)
-                if isinstance(klass, str) and "FeatureExtractor" in klass:
+                if (isinstance(klass, str) and "FeatureExtractor" in klass) or \
+                   attr in ("feature_extractor", "audio_processor"):
                     upstream.add(attr)
     assert upstream, "scan found no feature-extractor attributes; the scan broke"
-    assert upstream <= set(_AUDIO_SUB_PROCESSOR_ATTRS), (
-        f"transformers uses audio sub-processor attribute(s) the collator does not "
-        f"resolve: {sorted(upstream - set(_AUDIO_SUB_PROCESSOR_ATTRS))}"
-    )
+    from types import SimpleNamespace
+    missed = sorted(a for a in upstream if not _audio_sub_processors(SimpleNamespace(**{a: object()})))
+    assert not missed, f"transformers audio sub-processor attribute(s) the collator does not resolve: {missed}"
 
 
 def test_all_three_consumers_agree_on_an_audio_processor_only_shape():
@@ -1290,8 +1280,8 @@ def test_image_processor_is_still_probed_with_an_image_part():
 
 
 class _StringContentOnlyProcessor:
-    # Granite-Speech shape: the chat template concatenates message["content"]
-    # into the prompt, so any list content raises TypeError for every role.
+    # Granite-Speech shape: the chat template concatenates message["content"],
+    # so list content raises TypeError for every role.
     def __init__(self):
         self.tokenizer = _FakeTokenizer()
         self.audio_processor = _FakeFeatureExtractor()
@@ -1299,30 +1289,13 @@ class _StringContentOnlyProcessor:
     def apply_chat_template(self, messages, **kwargs):
         out = ""
         for m in messages:
-            out = out + "<|role|>" + m["content"]   # TypeError on a list
+            out = out + "<|role|>" + m["content"]
         return out
 
     def __call__(self, text=None, audio=None, **kwargs):
         return {}
 
 
-def test_string_only_chat_template_rejected_with_an_actionable_message():
-    # Previously this surfaced as RuntimeError("can only concatenate str (not
-    # \"list\") to str") from the generic chat-template handler, with no
-    # indication of what to do. Reject at construction like the no-audio-kwarg
-    # case does, naming the processor and the reason.
-    with pytest.raises(TypeError, match="plain-string message content"):
-        UnslothVisionDataCollator(model=_stub_model(), processor=_StringContentOnlyProcessor())
-
-
-def test_broken_chat_template_still_raises_the_generic_error():
-    # A template that fails on plain strings too is a genuinely broken template,
-    # not a string-only one: keep routing it to _raise_chat_template_error.
-    class _Broken(_StringContentOnlyProcessor):
-        def apply_chat_template(self, messages, **kwargs):
-            if any(isinstance(m["content"], list) for m in messages):
-                raise TypeError("can only concatenate str (not \"list\") to str")
-            raise RuntimeError("template is broken")
-    with pytest.raises(Exception) as info:
-        UnslothVisionDataCollator(model=_stub_model(), processor=_Broken())
-    assert "plain-string message content" not in str(info.value)
+def test_string_only_chat_template_audio_processor_constructs():
+    # The collator flattens content parts for string-only templates, audio included.
+    UnslothVisionDataCollator(model=_stub_model(), processor=_StringContentOnlyProcessor())

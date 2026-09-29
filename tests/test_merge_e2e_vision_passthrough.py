@@ -92,7 +92,6 @@ def test_vision_language_only_merge_preserves_vision(family, tmp_path):
 
     pm = get_peft_model(model, LoraConfig(
         r=8, lora_alpha=16, lora_dropout=0.0, bias="none", target_modules=_LANG_QV))
-    # no adapter may land on the vision tower
     in_vision = [n for n, m in pm.named_modules()
                  if getattr(m, "lora_A", None) is not None
                  and hasattr(m.lora_A, "__contains__") and "default" in m.lora_A
