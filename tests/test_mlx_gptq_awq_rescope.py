@@ -52,20 +52,19 @@ def _ensure_bitsandbytes_importable():
     sys.modules["bitsandbytes.functional"] = functional
 
 
-@pytest.fixture(autouse=True, scope="module")
-def _install_shim():
+@pytest.fixture(autouse=True)
+def _install_shim(monkeypatch):
     import sys
-    names = ("bitsandbytes", "bitsandbytes.nn", "bitsandbytes.functional")
-    saved = {name: sys.modules.get(name) for name in names}
+    # Per test, through monkeypatch: conftest checks these entries are restored after every test.
+    for name in ("bitsandbytes", "bitsandbytes.nn", "bitsandbytes.functional"):
+        if name in sys.modules:
+            monkeypatch.setitem(sys.modules, name, sys.modules[name])
+        else:
+            monkeypatch.setitem(sys.modules, name, None)
+            monkeypatch.delitem(sys.modules, name)
     _ensure_bitsandbytes_importable()
     from mlx_simulation import simulate_mlx_on_torch
     simulate_mlx_on_torch()
-    yield
-    for name, module in saved.items():
-        if module is None:
-            sys.modules.pop(name, None)
-        else:
-            sys.modules[name] = module
 
 
 def _pack_qweight_gptq(intmat):
