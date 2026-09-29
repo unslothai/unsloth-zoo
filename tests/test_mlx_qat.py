@@ -14,7 +14,10 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""QAT for MLX LoRA: parity with fuse(), straight-through gradients, guards."""
+"""MLX QAT: the trained forward is exactly what merged_4bit ships; refusals mutate nothing.
+
+Runs on real mlx (CPU or Metal), no downloads: a tiny mlx-lm llama is built in-process.
+"""
 
 import importlib
 import sys
@@ -23,297 +26,166 @@ import pytest
 
 
 def _real_mlx_runtime():
-    """True only on the genuine mlx stack."""
     try:
-        lora = importlib.import_module("mlx_lm.tuner.lora")
+        importlib.import_module("mlx_lm.tuner.lora")
     except Exception:
         return False
-    if not isinstance(getattr(lora, "LoRALinear", None), type):
-        return False
-    origin = getattr(sys.modules.get("mlx.core"), "__file__", "") or ""
-    return "mlx_simulation" not in origin
+    return "mlx_simulation" not in (getattr(sys.modules.get("mlx.core"), "__file__", "") or "")
 
 
 if not _real_mlx_runtime():
-    pytest.skip("needs the real mlx runtime", allow_module_level=True)
+    pytest.skip("needs the real mlx runtime (tests/mlx_simulation is active or mlx absent)",
+                allow_module_level=True)
 
 import mlx.core as mx
 import mlx.nn as nn
+import mlx.optimizers as optim
+from mlx.utils import tree_flatten, tree_map
 from mlx_lm.tuner.lora import LoRALinear
 
-from unsloth_zoo.mlx.qat import (
-    apply_mlx_qat,
-    mlx_qat_module_count,
-    remove_mlx_qat,
-)
-
-DIMS = 128
-GROUP_SIZE = 64
-BITS = 4
+from unsloth_zoo.mlx import qat
+from unsloth_zoo.mlx.loader import FastMLXModel
 
 
-class _Holder(nn.Module):
-    """Minimal container exposing named_modules() over one LoRA layer."""
-
-    def __init__(self, layer):
-        super().__init__()
-        self.layer = layer
-
-
-def _make_lora(bias=False, bits=BITS, dropout=0.0, quantized=True, seed=0):
-    mx.random.seed(seed)
-    base = nn.Linear(DIMS, DIMS, bias=bias)
-    if quantized:
-        base = nn.QuantizedLinear.from_linear(
-            base, group_size=GROUP_SIZE, bits=bits, mode="affine",
-        )
-    layer = LoRALinear.from_base(base, r=8, scale=2.0, dropout=dropout)
-    layer.lora_b = mx.random.normal(layer.lora_b.shape) * 0.05
-    mx.eval(layer.lora_b, layer.lora_a)
-    return layer
-
-
-@pytest.mark.parametrize("bias", [False, True])
-def test_qat_forward_matches_fused_module(bias):
-    """QAT's forward must equal the module `merged_4bit` writes to disk."""
-    layer = _make_lora(bias=bias)
-    fused = layer.fuse(dequantize=False)
-
-    apply_mlx_qat(_Holder(layer), "auto")
-
-    x = mx.random.normal((4, DIMS), dtype=mx.float32)
-    qat_out, fused_out = layer(x), fused(x)
-    mx.eval(qat_out, fused_out)
-
-    max_delta = float(mx.abs(qat_out - fused_out).max())
-    scale = float(mx.abs(fused_out).max())
-    assert max_delta <= 1e-4 * max(scale, 1.0), (
-        f"QAT forward diverges from fuse(): max|d|={max_delta}"
-    )
-
-
-@pytest.mark.parametrize("bias", [False, True])
-def test_qat_forward_is_bit_exact_to_fused_module_in_bf16(bias):
-    """bf16 exposes a dense GEMM vs quantized_matmul rounding gap that fp32 hides."""
+def _lora(bias, dtype, dims=128):
     mx.random.seed(1)
-    lin = nn.Linear(DIMS, DIMS, bias=bias)
-    lin.set_dtype(mx.bfloat16)
-    layer = LoRALinear.from_base(
-        nn.QuantizedLinear.from_linear(lin, GROUP_SIZE, BITS), r=8, scale=2.0,
-    )
-    layer.lora_b = (mx.random.normal(layer.lora_b.shape) * 0.05).astype(mx.bfloat16)
-    fused = layer.fuse(dequantize=False)
-    apply_mlx_qat(_Holder(layer), "auto")
-
-    x = mx.random.normal((64, DIMS)).astype(mx.bfloat16)
-    qat_out, fused_out = layer(x), fused(x)
-    mx.eval(qat_out, fused_out)
-    assert qat_out.dtype == fused_out.dtype
-    assert mx.array_equal(qat_out, fused_out).item()
-
-    grad = mx.grad(lambda b: layer.__class__.__call__(
-        _with_lora_b(layer, b), x).astype(mx.float32).sum())(layer.lora_b)
-    mx.eval(grad)
-    assert float(mx.abs(grad.astype(mx.float32)).max()) > 0.0
-
-
-def _with_lora_b(layer, lora_b):
-    layer.lora_b = lora_b
+    lin = nn.Linear(dims, dims, bias=bias)
+    lin.set_dtype(dtype)
+    layer = LoRALinear.from_base(nn.QuantizedLinear.from_linear(lin, 64, 4), r=8, scale=2.0)
+    layer.lora_b = (mx.random.normal(layer.lora_b.shape) * 0.05).astype(dtype)
+    layer.lora_a = layer.lora_a.astype(dtype)
     return layer
 
 
-def test_qat_forward_includes_base_bias():
-    """A dropped bias term still 'runs' — it must be caught explicitly."""
-    layer = _make_lora(bias=True)
-    base_bias = mx.array(layer.linear.bias)
-    assert float(mx.abs(base_bias).max()) > 0.0
-
-    apply_mlx_qat(_Holder(layer), "auto")
-    x = mx.zeros((1, DIMS), dtype=mx.float32)
-    out = layer(x)
-    mx.eval(out)
-    assert float(mx.abs(out[0] - base_bias).max()) <= 1e-5
-
-
-def test_qat_perturbs_the_forward():
-    """Sanity: QAT must actually change the forward, else parity is vacuous."""
-    layer = _make_lora()
-    x = mx.random.normal((4, DIMS), dtype=mx.float32)
-    before = layer(x)
-    mx.eval(before)
-
-    apply_mlx_qat(_Holder(layer), "auto")
-    after = layer(x)
-    mx.eval(after)
-    assert float(mx.abs(before - after).max()) > 1e-4
+def _tiny_llama(quantized=True):
+    from mlx_lm.models import llama
+    args = llama.ModelArgs(
+        model_type="llama", hidden_size=128, num_hidden_layers=2, intermediate_size=256,
+        num_attention_heads=4, num_key_value_heads=2, rms_norm_eps=1e-5, vocab_size=512,
+    )
+    mx.random.seed(0)
+    model = llama.Model(args)
+    model.update(tree_map(lambda v: v.astype(mx.bfloat16), model.parameters()))
+    if quantized:
+        nn.quantize(model, group_size=64, bits=4)
+    model._config = {**vars(args), "torch_dtype": "bfloat16"}
+    if quantized:
+        model._config["quantization"] = {"group_size": 64, "bits": 4, "mode": "affine"}
+    return model
 
 
-def test_straight_through_jacobian_is_identity():
-    """The fake-quant must be transparent to the backward pass."""
-    weight = mx.random.normal((DIMS, DIMS))
-
-    def ste_sum(w):
-        packed, scales, biases = mx.quantize(
-            w, group_size=GROUP_SIZE, bits=BITS, mode="affine")
-        fake = mx.dequantize(
-            packed, scales, biases,
-            group_size=GROUP_SIZE, bits=BITS, mode="affine")
-        return (w + mx.stop_gradient(fake - w)).sum()
-
-    grad = mx.grad(ste_sum)(weight)
-    mx.eval(grad)
-    assert float(mx.abs(grad - mx.ones_like(grad)).max()) <= 1e-6
-
-    packed, scales, biases = mx.quantize(
-        weight, group_size=GROUP_SIZE, bits=BITS, mode="affine")
-    fake = mx.dequantize(
-        packed, scales, biases,
-        group_size=GROUP_SIZE, bits=BITS, mode="affine")
-    mx.eval(fake)
-    assert float(mx.abs(fake - weight).max()) > 0.0
+def _peft(model, **kwargs):
+    kwargs = {"r": 8, "lora_alpha": 16, "lora_dropout": 0, "qat_scheme": "auto",
+              "use_gradient_checkpointing": False, **kwargs}
+    return FastMLXModel.get_peft_model(model, **kwargs)
 
 
-def test_gradients_reach_lora_parameters_under_qat():
-    layer = _make_lora()
-    apply_mlx_qat(_Holder(layer), "auto")
-    x = mx.random.normal((4, DIMS), dtype=mx.float32)
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32], ids=["bf16", "fp32"])
+@pytest.mark.parametrize("bias", [False, True], ids=["nobias", "bias"])
+def test_qat_forward_is_bit_exact_to_the_fused_module(bias, dtype):
+    # bf16 is where a dense GEMM and quantized_matmul round differently.
+    layer = _lora(bias, dtype)
+    fused = layer.fuse(dequantize=False)
+    qat.apply_mlx_qat(layer)
+    x = mx.random.normal((64, 128)).astype(dtype)
+    assert mx.array_equal(layer(x), fused(x)).item()
 
-    def loss(a, b):
+
+def test_straight_through_gradients_match_the_dense_reference():
+    layer = _lora(True, mx.float32)
+    x = mx.random.normal((3, 5, 128))
+
+    def dense_ste(a, b, xx):
+        base = layer.linear
+        w = mx.dequantize(base.weight, base.scales, base.biases, group_size=64, bits=4)
+        merged = w + (layer.scale * b.T) @ a.T
+        fake = mx.dequantize(*mx.quantize(merged, group_size=64, bits=4), group_size=64, bits=4)
+        return (xx @ (merged + mx.stop_gradient(fake - merged)).T + base.bias).square().sum()
+
+    def ours(a, b, xx):
         layer.lora_a, layer.lora_b = a, b
-        return (layer(x) ** 2).sum()
+        return layer(xx).square().sum()
 
-    ga, gb = mx.grad(loss, argnums=(0, 1))(layer.lora_a, layer.lora_b)
-    mx.eval(ga, gb)
-    assert float(mx.abs(ga).max()) > 0.0
-    assert float(mx.abs(gb).max()) > 0.0
-
-
-def test_apply_is_idempotent_and_removable():
-    layer = _make_lora()
-    holder = _Holder(layer)
-    x = mx.random.normal((4, DIMS), dtype=mx.float32)
-    stock = layer(x)
-    mx.eval(stock)
-
-    assert apply_mlx_qat(holder, "auto") == 1
-    assert apply_mlx_qat(holder, "auto") == 0      # already patched
-    assert mlx_qat_module_count(holder) == 1
-
-    assert remove_mlx_qat(holder) == 1
-    assert mlx_qat_module_count(holder) == 0
-    restored = layer(x)
-    mx.eval(restored)
-    assert float(mx.abs(stock - restored).max()) == 0.0
+    ref = mx.grad(dense_ste, argnums=(0, 1, 2))(layer.lora_a, layer.lora_b, x)
+    qat.apply_mlx_qat(layer)
+    got = mx.grad(ours, argnums=(0, 1, 2))(layer.lora_a, layer.lora_b, x)
+    for g, r in zip(got, ref):
+        assert mx.allclose(g, r, rtol=1e-4, atol=1e-4).item()
+        assert float(mx.abs(g).max()) > 0
 
 
-def test_qat_preserves_class_name():
-    """The save path keys on type(module).__name__; the stand-in must match."""
-    layer = _make_lora()
-    original_name = type(layer).__name__
-    apply_mlx_qat(_Holder(layer), "auto")
-    assert type(layer).__name__ == original_name
-    assert isinstance(layer, LoRALinear)
+def test_get_peft_model_qat_trains_compiled_and_survives_the_merged_4bit_save(tmp_path):
+    from mlx_lm.utils import load_model
+
+    from unsloth_zoo.mlx.utils import save_merged_model
+
+    model = _peft(_tiny_llama())
+    assert sum(getattr(m, qat._QAT_FLAG, False) for _, m in model.named_modules()) == 14
+
+    ids = mx.array([[3, 11, 19, 27, 35, 43, 51, 59] * 4])
+
+    def loss(m):
+        return nn.losses.cross_entropy(m(ids[:, :-1]).astype(mx.float32), ids[:, 1:]).mean()
+
+    opt = optim.Adam(learning_rate=1e-2)
+    grad_fn = nn.value_and_grad(model, loss)
+    state = [model.state, opt.state]
+
+    @mx.compile
+    def step():
+        value, grads = grad_fn(model)
+        opt.update(model, grads)
+        return value
+
+    first = None
+    for _ in range(5):
+        value = step()
+        mx.eval(state, value)
+        first = first if first is not None else float(value)
+    assert float(loss(model)) < first
+
+    logits = model(ids)
+    mx.eval(logits)
+
+    class _Tok:
+        def save_pretrained(self, path):
+            pass
+
+    save_merged_model(model, _Tok(), tmp_path, dequantize=False, quantize_unquantized=True)
+    reloaded, _ = load_model(tmp_path)
+    assert mx.array_equal(reloaded(ids), logits).item()
 
 
-@pytest.mark.parametrize(
-    "scheme", ["int8-int4", "fp8-int4", "fp8-fp8", "cactus"])
-def test_torchao_only_schemes_are_rejected(scheme):
-    layer = _make_lora()
-    with pytest.raises(NotImplementedError, match="torchao"):
-        apply_mlx_qat(_Holder(layer), scheme)
+def _set_full_finetuning(model):
+    model._unsloth_full_finetuning = True
+    return model
 
 
-def test_unknown_scheme_is_rejected():
-    layer = _make_lora()
-    with pytest.raises(ValueError, match="unsupported qat_scheme"):
-        apply_mlx_qat(_Holder(layer), "int3")
+_REFUSALS = [
+    ("torchao scheme", {"qat_scheme": "fp8-int4"}, NotImplementedError, None),
+    ("unknown scheme", {"qat_scheme": "int3"}, NotImplementedError, None),
+    ("non-string scheme", {"qat_scheme": 4}, TypeError, None),
+    ("bit mismatch", {"qat_scheme": "int8"}, ValueError, None),
+    ("lora_dropout", {"lora_dropout": 0.1}, NotImplementedError, None),
+    ("dora", {"use_dora": True}, NotImplementedError, None),
+    ("no targets", {"finetune_language_layers": False}, ValueError, None),
+    ("unquantized base", {}, ValueError, lambda: _tiny_llama(quantized=False)),
+    ("full_finetuning", {}, NotImplementedError, lambda: _set_full_finetuning(_tiny_llama())),
+]
 
 
-def test_non_string_scheme_is_rejected():
-    layer = _make_lora()
-    with pytest.raises(TypeError):
-        apply_mlx_qat(_Holder(layer), 4)
+@pytest.mark.parametrize("kwargs,error,make", [r[1:] for r in _REFUSALS], ids=[r[0] for r in _REFUSALS])
+def test_refused_requests_leave_the_model_untouched(kwargs, error, make):
+    model = make() if make else _tiny_llama()
+    before = tree_flatten(model.trainable_parameters())
+    with pytest.raises(error):
+        _peft(model, **kwargs)
+    assert not any(isinstance(m, LoRALinear) for _, m in model.named_modules())
+    assert [k for k, _ in tree_flatten(model.trainable_parameters())] == [k for k, _ in before]
 
 
-def test_scheme_bits_must_match_the_base_quantization():
-    """int8 QAT on a 4-bit base would simulate a grid fuse() never writes."""
-    layer = _make_lora(bits=4)
-    with pytest.raises(ValueError, match="8-bit"):
-        apply_mlx_qat(_Holder(layer), "int8")
-
-
-def test_matching_scheme_bits_are_accepted():
-    layer = _make_lora(bits=4)
-    assert apply_mlx_qat(_Holder(layer), "int4") == 1
-
-
-def test_unquantized_base_is_rejected():
-    layer = _make_lora(quantized=False)
-    with pytest.raises(ValueError, match="requires a quantized base"):
-        apply_mlx_qat(_Holder(layer), "auto")
-
-
-def test_lora_dropout_is_rejected():
-    layer = _make_lora(dropout=0.1)
-    with pytest.raises(NotImplementedError, match="lora_dropout=0"):
-        apply_mlx_qat(_Holder(layer), "auto")
-
-
-def test_model_without_lora_is_rejected():
-    quantized = nn.QuantizedLinear.from_linear(
-        nn.Linear(DIMS, DIMS, bias=False),
-        group_size=GROUP_SIZE, bits=BITS, mode="affine")
-    with pytest.raises(ValueError, match="no LoRA layers"):
-        apply_mlx_qat(_Holder(quantized), "auto")
-
-
-def test_mixed_quantization_grids_are_rejected():
-    class _Two(nn.Module):
-        def __init__(self, a, b):
-            super().__init__()
-            self.a, self.b = a, b
-
-    holder = _Two(_make_lora(bits=4, seed=0), _make_lora(bits=8, seed=1))
-    with pytest.raises(ValueError, match="single quantization grid"):
-        apply_mlx_qat(holder, "auto")
-
-
-def test_full_finetuning_is_rejected():
-    holder = _Holder(_make_lora())
-    holder._unsloth_full_finetuning = True
-    with pytest.raises(NotImplementedError, match="full_finetuning"):
-        apply_mlx_qat(holder, "auto")
-
-
-def test_non_affine_quantized_base_is_rejected():
-    """mxfp4/nvfp4/mxfp8 bases must be refused, not crash inside the forward."""
-    base = nn.Linear(DIMS, DIMS, bias=False)
-    quantized = nn.QuantizedLinear.from_linear(
-        base, group_size=32, bits=4, mode="mxfp4")
-    assert quantized.mode == "mxfp4"
-    assert quantized.biases is None, "mxfp4 unexpectedly produced biases"
-
-    layer = LoRALinear.from_base(quantized, r=8, scale=2.0)
-    with pytest.raises(NotImplementedError, match="mxfp4"):
-        apply_mlx_qat(_Holder(layer), "auto")
-
-
-def test_dora_is_rejected():
-    dora = pytest.importorskip("mlx_lm.tuner.dora")
-    base = nn.QuantizedLinear.from_linear(
-        nn.Linear(DIMS, DIMS, bias=False),
-        group_size=GROUP_SIZE, bits=BITS, mode="affine")
-    layer = dora.DoRALinear.from_base(base, r=8, scale=2.0)
-    with pytest.raises(NotImplementedError, match="DoRA"):
-        apply_mlx_qat(_Holder(layer), "auto")
-
-
-def test_switch_linear_moe_is_rejected():
-    switch_layers = pytest.importorskip("mlx_lm.models.switch_layers")
-    from mlx_lm.tuner.lora import LoRASwitchLinear
-
-    base = switch_layers.SwitchLinear(DIMS, DIMS, num_experts=2, bias=False)
-    base = base.to_quantized(group_size=GROUP_SIZE, bits=BITS, mode="affine")
-    layer = LoRASwitchLinear.from_base(base, r=8, scale=2.0)
-    with pytest.raises(NotImplementedError, match="MoE|SwitchLinear"):
-        apply_mlx_qat(_Holder(layer), "auto")
+def test_vlm_is_refused(monkeypatch):
+    from unsloth_zoo.mlx import utils
+    monkeypatch.setattr(utils, "_is_vlm_model", lambda model: True)
+    with pytest.raises(NotImplementedError, match="VLM"):
+        qat.validate_mlx_qat_request(_tiny_llama(), "auto")

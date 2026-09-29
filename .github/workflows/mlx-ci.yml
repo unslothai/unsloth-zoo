@@ -283,9 +283,3 @@ jobs:
 
       - name: tests/test_mlx_qat.py
         run: python -m pytest tests/test_mlx_qat.py -v -rs
-
-      - name: tests/test_mlx_qat_metal.py
-        run: python -m pytest tests/test_mlx_qat_metal.py -v -rs
-
-      - name: tests/test_mlx_qat_integration_metal.py
-        run: python -m pytest tests/test_mlx_qat_integration_metal.py -v -rs

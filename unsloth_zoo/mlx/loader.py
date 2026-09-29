@@ -381,8 +381,10 @@ def _mlx_language_layers(model):
     return layers if layers is not None else ()
 
 
-def _mlx_lora_selection(model, num_layers, config):
-    """``(root, [(layer, [(name, module)])], root_modules)`` LoRA would wrap."""
+def linear_to_lora_layers(model, num_layers, config, *, dry_run=False):
+    """Attach namespace-compatible LoRA wrappers to selected language layers."""
+    from mlx.utils import tree_unflatten
+
     layers = _mlx_language_layers(model)
     root = model
     seen = set()
@@ -392,6 +394,7 @@ def _mlx_lora_selection(model, num_layers, config):
             break
         seen.add(id(root))
         root = getattr(root, "model", None)
+    type_specs = _mlx_lora_type_specs()
     keys = set(config.get("keys") or ())
     # A generic name is attention beside a qkv and MLP beside an fc1, so the
     # union cannot be applied layer-wide; caller keys are not layer-local.
@@ -416,34 +419,32 @@ def _mlx_lora_selection(model, num_layers, config):
             wanted_by_layer[id(layer)] = set()
         wanted_by_layer[id(layer)] |= wanted
 
+    if config.get("use_dora"):
+        # Preflight so a late refusal leaves no layer converted; only the TYPE
+        # refusal is all-or-nothing. Same per-layer predicates as the
+        # conversion, not the `keys` union.
+        for layer in order:
+            for name, module in layer.named_modules():
+                if name in wanted_by_layer[id(layer)]:
+                    _mlx_dora_wrapper_type(module, name)
+        for name, module in (root.named_modules() if root is not None else ()):
+            if name in shared:
+                _mlx_dora_wrapper_type(module, name)
     selected = [(layer, [(name, module) for name, module in layer.named_modules()
                          if name in wanted_by_layer[id(layer)]])
                 for layer in order]
     root_modules = [(name, module)
                     for name, module in (root.named_modules() if root is not None else ())
                     if name in shared]
-    return root, selected, root_modules
-
-
-def mlx_lora_target_modules(model, num_layers, config):
-    """Every ``(name, module)`` ``linear_to_lora_layers`` would wrap; mutates nothing."""
-    root, selected, root_modules = _mlx_lora_selection(model, num_layers, config)
-    return [pair for _, modules in [*selected, (root, root_modules)] for pair in modules]
-
-
-def linear_to_lora_layers(model, num_layers, config, *, dry_run=False):
-    """Attach namespace-compatible LoRA wrappers to selected language layers."""
-    from mlx.utils import tree_unflatten
-
-    type_specs = _mlx_lora_type_specs()
-    root, selected, root_modules = _mlx_lora_selection(model, num_layers, config)
-    if config.get("use_dora"):
-        for _, modules in [*selected, (root, root_modules)]:
-            for name, module in modules:
-                _mlx_dora_wrapper_type(module, name)
     for _, modules in [*selected, (root, root_modules)]:
         for _, module in modules:
             _check_mlx_lora_base(module)
+    if config.get("qat_scheme") not in (None, False):
+        from .qat import validate_mlx_qat_targets
+        validate_mlx_qat_targets(
+            [pair for _, modules in [*selected, (root, root_modules)] for pair in modules],
+            config["qat_scheme"],
+        )
     if dry_run:
         return sum(len(modules) for _, modules in selected) + len(root_modules)
     attached = 0
@@ -9369,7 +9370,7 @@ class FastMLXModel:
                 "Unsloth: loftq_config is not supported for MLX LoRA yet."
             )
         qat_scheme = kwargs.pop("qat_scheme", None)
-        if qat_scheme is not None and qat_scheme is not False:
+        if qat_scheme not in (None, False):
             # Before the full_finetuning early return, else QAT is silently dropped.
             from .qat import validate_mlx_qat_request
             validate_mlx_qat_request(
@@ -9694,16 +9695,9 @@ class FastMLXModel:
                 _apply_layer_lora = finetune_language_layers and (
                     language_lora_keys is None or len(language_lora_keys) > 0
                 )
-            if qat_scheme is not None and qat_scheme is not False:
-                from .qat import validate_mlx_qat_target_modules
-                validate_mlx_qat_target_modules(
-                    mlx_lora_target_modules(
-                        model, num_layers,
-                        {**lora_config, "keys": language_lora_keys,
-                         "layer_keys": language_layer_keys},
-                    ) if _apply_layer_lora else (),
-                    qat_scheme,
-                )
+            if qat_scheme not in (None, False) and not _apply_layer_lora:
+                from .qat import validate_mlx_qat_targets
+                validate_mlx_qat_targets((), qat_scheme)
             if _apply_layer_lora:
                 # Compat patch (older mlx-lm rejects scale=/dropout= on
                 # from_base); before the seed since monkey-patching doesn't
@@ -9717,7 +9711,8 @@ class FastMLXModel:
                     model,
                     num_layers=num_layers,
                     config={**lora_config, "keys": language_lora_keys,
-                            "layer_keys": language_layer_keys},
+                            "layer_keys": language_layer_keys,
+                            "qat_scheme": qat_scheme},
                 )
                 if language_lora_count == 0:
                     _raise_no_lora_targets(target_modules)
@@ -9740,9 +9735,9 @@ class FastMLXModel:
         # Adapters are invisible to a cached weight fusion.
         _disable_fused_input_projections(model)
 
-        if qat_scheme is not None and qat_scheme is not False:
+        if qat_scheme not in (None, False):
             from .qat import apply_mlx_qat
-            apply_mlx_qat(model, qat_scheme)
+            apply_mlx_qat(model)
 
         # Gradient checkpointing: "mlx"/True -> apply; False/"none" -> skip.
         if isinstance(use_gradient_checkpointing, str):
