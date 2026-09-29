@@ -34,7 +34,6 @@ def _fast_qsa_enabled():
     return os.environ.get("UNSLOTH_QWEN4_EXP_FAST_QSA", "1") != "0"
 
 
-# Long-context reference; the compiler's generated class calls the function below.
 _reference_qsa_forward = None
 
 

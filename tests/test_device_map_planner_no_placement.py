@@ -69,8 +69,6 @@ def test_kill_switch_and_plain_models(monkeypatch):
 
 
 def test_planned_map_has_no_ancestor_of_the_table(monkeypatch):
-    # transformers expands map keys by prefix: an entry for the table's no-split layer would
-    # still place the table on that card.
     from types import SimpleNamespace
     from unsloth_zoo import device_map_planner
 

@@ -157,8 +157,7 @@ def test_patch_installed_and_kill_switch(monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for torch._grouped_mm")
 def test_grouped_mm_experts_take_fp32_input_under_autocast():
-    # Unsloth's generate runs under bf16 autocast, where Qwen4Exp's PLE sum makes the residual
-    # fp32; torch._grouped_mm is not autocast-cast and raised on the bf16 expert stacks.
+    # bf16 autocast + fp32 PLE residual used to make torch._grouped_mm raise on bf16 stacks.
     from unsloth_zoo.temporary_patches import moe_utils
     if not moe_utils._check_torch_grouped_mm_supported():
         pytest.skip("torch._grouped_mm unsupported on this device")

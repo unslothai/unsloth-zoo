@@ -46,7 +46,6 @@ _VENDORED_MARK = "_UNSLOTH_VENDORED_FLA"
 _EXPORT_SUBMODULES = ("fla.modules", "fla.ops", "fla.ops.gated_delta_rule")
 
 # Modeling modules binding fla symbols as globals at import (None when unavailable).
-# qwen4_exp reaches fla only via the kernel-hub decorator; same contract as qwen3_5.
 _REPAIR_MODELING = ("qwen3_5", "qwen3_5_moe", "qwen3_next", "qwen4_exp")
 
 # Kimi delta attention consumers; they reach fla only through kernel-hub wrappers.
@@ -827,7 +826,6 @@ def _resolved_implementation(wrapper):
 
 
 def _decorated_kernel_name(wrapper, default):
-    """The wrapper's `func_name` closure variable, else ``default``."""
     code = getattr(wrapper, "__code__", None)
     closure = getattr(wrapper, "__closure__", None) or ()
     if code is None:

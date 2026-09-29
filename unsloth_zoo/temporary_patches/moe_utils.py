@@ -3814,8 +3814,7 @@ def forward_native_grouped_mm(
         batch_size, sequence_length, hidden_dim = hidden_states.shape
 
     hidden_states = hidden_states.view(-1, hidden_dim)
-    # torch._grouped_mm is not on autocast's cast list: cast fp32 activations to a 16-bit
-    # stack as F.linear would (Qwen4Exp's PLE sum makes them fp32 under generate's autocast).
+    # torch._grouped_mm is not autocast-cast; Qwen4Exp's PLE sum yields fp32 under autocast.
     if hidden_states.dtype == torch.float32 and torch.is_autocast_enabled(hidden_states.device.type):
         _stack = self._parameters.get("gate_up_proj", self._parameters.get("gate_proj"))
         if _stack is not None and _stack.dtype in (torch.float16, torch.bfloat16):

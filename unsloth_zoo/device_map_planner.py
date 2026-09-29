@@ -2585,9 +2585,8 @@ def drop_no_placement_modules(model: nn.Module) -> list[str]:
 
 
 def unmap_dropped_modules(device_map: dict, model: nn.Module, dropped: Sequence[str]) -> dict:
-    """Split any map entry that is an ancestor of a ``dropped`` path into its other children:
-    transformers expands map keys by prefix, so ``model.layers.0: 0`` would still send the
-    dropped table to that card."""
+    """Split map entries that are ancestors of ``dropped`` paths into their other children:
+    transformers expands keys by prefix, so ``model.layers.0: 0`` would still place the table."""
     out = dict(device_map)
     for path in dropped:
         key = max(
