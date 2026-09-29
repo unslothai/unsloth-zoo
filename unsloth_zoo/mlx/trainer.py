@@ -1159,24 +1159,16 @@ def _mlx_batch_input_token_count(batch_data, mode="all", pad_token_id=None):
 
 
 def _reject_group_by_length(order, context):
-    """Fail loudly where length grouping cannot be honored.
-
-    ``context`` is ``"vlm"``, ``"streaming"`` or ``"preference"``. A no-op for
-    every other order, so the existing paths are untouched.
-    """
+    """Raise if length grouping is requested where it cannot be honored."""
     if order != "length_grouped":
         return
     if context == "vlm":
-        # A row's token length does not account for image or audio tokens, so
-        # grouping on it would not bound padding the way it does for text.
         raise ValueError(
             "Unsloth MLX: group_by_length=True is not supported for "
             "vision-language training yet; the sequence length does not "
             "account for image or audio tokens. Leave it unset."
         )
     if context == "streaming":
-        # The mega-batch permutation needs the whole dataset up front; a lazy
-        # stream has no length to permute.
         raise ValueError(
             "Unsloth MLX: group_by_length=True requires a sized dataset and "
             "is not supported with streaming=True. Use "
@@ -1184,12 +1176,7 @@ def _reject_group_by_length(order, context):
             "streaming."
         )
     if context == "preference":
-        # A preference row is a (chosen, rejected) pair with two lengths, so
-        # there is no single length to group on. CUDA rejects it too, just less
-        # helpfully: TRL leaves Trainer._get_train_sampler in place, and its
-        # LengthGroupedSampler raises "Can only automatically infer lengths for
-        # datasets whose items are dictionaries with an 'input_ids' key" on a
-        # prompt/chosen/rejected dataset.
+        # CUDA fails too: TRL's LengthGroupedSampler cannot infer lengths without input_ids.
         raise ValueError(
             "Unsloth MLX preference: group_by_length=True is not supported for "
             "DPO/ORPO; a preference row has a chosen and a rejected length, "
@@ -1199,34 +1186,16 @@ def _reject_group_by_length(order, context):
 
 
 def _resolve_text_dataset_order(args, *, for_training=True):
-    """Single source of truth for the effective sample order.
+    """Effective sample order; every plan must use it or train_on_responses_only masks a different stream.
 
-    The same three knobs were previously combined inline at every call site
-    (text plan, labeled/`train_on_responses_only` plan, VLM plan). Resolving
-    once here is what keeps those paths from drifting apart -- they must agree
-    or `train_on_responses_only` masks a different stream than it trains on.
-
-    ``for_training=False`` is the evaluation contract: eval keeps dataset
-    order. This diverges from transformers, which does length-group eval as
-    well (``Trainer._get_eval_sampler``, at ``eval_batch_size`` and without the
-    accumulation factor). The metric is unaffected either way -- ``_evaluate``
-    accumulates ``loss * ntoks`` and divides by the total, a token-weighted
-    mean that does not depend on how rows are grouped -- so grouping eval would
-    only buy padding on the eval pass, which is not what the knob is for.
-
-    Returns one of ``"sequential"``, ``"length_grouped"``, ``"torch_randperm"``
-    or the caller's ``dataset_order`` (``"default"``/``None`` meaning "no
-    explicit order requested").
+    Eval (``for_training=False``) keeps dataset order, unlike HF: the token-weighted eval loss is order-independent.
     """
     group_by_length = bool(getattr(args, "group_by_length", False))
     preserve = bool(getattr(args, "preserve_dataset_order", False))
     dataset_order = getattr(args, "dataset_order", "default")
 
     if group_by_length:
-        # Validate regardless of for_training: a contradictory config must fail
-        # the same way whichever path resolves it first.
-        # Both of these pick a concrete, conflicting order. Silently letting
-        # one win would train on an order the user did not ask for.
+        # Validate regardless of for_training so every path fails alike.
         if preserve:
             raise ValueError(
                 "Unsloth MLX: group_by_length=True conflicts with "
@@ -1382,13 +1351,7 @@ class MLXTrainingConfig:
     logging_dir: str | None = None
     run_name: str | None = None
 
-    # HF TrainingArguments.group_by_length. Batches rows of similar length to
-    # cut padding while keeping epoch-to-epoch shuffling, which the legacy
-    # length-sorted default gives up. Resolved through
-    # `_resolve_text_dataset_order`, which rejects combining it with
-    # preserve_dataset_order or an explicit dataset_order. Declared LAST and
-    # registered in _MLX_CONFIG_OPTIONAL_COPY_FIELDS for the same positional
-    # reason as the fields above.
+    # HF TrainingArguments.group_by_length; declared last for positional copies (see above).
     group_by_length: bool = False
 
     def __init__(self, *args, **kwargs):
@@ -8598,9 +8561,7 @@ class MLXTrainer:
                 raise ValueError(
                     "Unsloth MLX preference: streaming datasets are not supported."
                 )
-            # MLXDPOConfig/MLXORPOConfig inherit the field, and this branch
-            # returns before `_resolve_text_dataset_order`, so without this the
-            # knob would be accepted and silently ignored.
+            # Preference configs inherit the field; without this it is silently ignored.
             _reject_group_by_length(_resolve_text_dataset_order(args), "preference")
             # A cadence is optional -- a callback can raise should_evaluate --
             # but selecting a best model reads a metric only an evaluation makes.
@@ -9083,17 +9044,10 @@ class MLXTrainer:
                     comm_group=comm_group,
                 )
                 text_dataset_order = _resolve_text_dataset_order(args)
-                # Only the literal "default" means "no explicit order": an
-                # explicit dataset_order=None still routes to the ordered plan
-                # (where it means sequential), as it did before this refactor.
+                # Explicit dataset_order=None still routes here (means sequential).
                 if text_dataset_order != "default":
                     batch_kwargs["dataset_order"] = text_dataset_order
-                    # Unconditional: the builder quantizes a fractional epoch
-                    # count to whole accumulation windows as HF does, and
-                    # length_grouped also folds the factor into its grouping
-                    # window -- a max_steps run reaches the second use with no
-                    # num_epochs, so gating this on epochs would group it
-                    # differently from the same config run by epochs.
+                    # Unconditional: length_grouped's window uses it even for max_steps runs.
                     batch_kwargs["grad_accum"] = args.gradient_accumulation_steps
                     if (
                         args.max_steps <= 0
@@ -9400,10 +9354,7 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
             )
             return order
         if dataset_order == "length_grouped":
-            # Same helper, same per-epoch reseed and same grouping window as the
-            # unlabeled plan in `_create_ordered_text_plan`, so
-            # train_on_responses_only sees the identical stream (pinned by
-            # test_mlx_group_by_length.py).
+            # Must match `_create_ordered_text_plan` exactly (same stream for train_on_responses_only).
             from .utils import (
                 _length_grouped_order, _length_grouped_window, _normalize_seed,
             )
@@ -9422,12 +9373,7 @@ def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
     from .utils import (
         _finite_epoch_batch_budget, _finite_text_pad_width, _normalize_seed,
     )
-    # A max_steps run arrives with num_epochs=None and a num_batches horizon
-    # that can span several dataset passes, which the trainer serves by cycling
-    # this plan. For the orders that reseed, one materialized block would
-    # replay epoch 0 forever instead of reshuffling per pass -- the unlabeled
-    # `_create_ordered_text_plan` expands to num_batches, and the two paths
-    # must stream the same rows.
+    # max_steps runs: materialize reseeded passes up to num_batches (as the unlabeled plan does), not replay epoch 0.
     _expand_to_num_batches = (
         num_epochs is None
         and num_batches is not None
@@ -9690,9 +9636,6 @@ def _prepare_response_labeled_eval_batches(
                 else None
             ),
             append_eos=bool(getattr(args, "append_eos", True)),
-            # Resolved centrally so this labeled plan cannot drift from the
-            # unlabeled plan's order. for_training=False: this builds the eval
-            # batches, which HF never length-groups.
             dataset_order=_resolve_text_dataset_order(args, for_training=False),
             preserve_dataset_order=bool(
                 getattr(args, "preserve_dataset_order", False)

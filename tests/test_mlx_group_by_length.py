@@ -1,20 +1,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
-"""group_by_length on the MLX trainer (HF TrainingArguments parity).
-
-Before this, MLX forced a choice between two bad options: the legacy default
-length-sorts once (padding-efficient but the *same* order every epoch), while
-dataset_order="torch_randperm" shuffles properly but pads to whatever lengths
-happen to land together. HF's group_by_length gives both -- a fresh shuffle
-each epoch, with similar lengths grouped inside it.
-
-The ordering helper is a step-for-step port of transformers'
-``get_length_grouped_indices``; ``test_matches_hf_reference_bit_for_bit``
-transcribes that function and asserts equality over randomized inputs, so the
-port is pinned to the real algorithm rather than to my reading of it.
-
-CPU-pure: index math, the labeled plan builder under the simulation shim, and
-no weights or Metal.
+"""group_by_length on the MLX trainer: HF parity for the ordering helper,
+config resolution, and labeled/unlabeled plan agreement. CPU-only, simulation shim.
 """
 
 from __future__ import annotations
@@ -28,8 +15,6 @@ import torch
 
 @pytest.fixture(autouse=True, scope="module")
 def _install_shim():
-    # Install-only (see tests/test_mlx_double_quant_reject.py): tearing the
-    # shim down here would break later files that hold module references.
     from mlx_simulation import simulate_mlx_on_torch
 
     simulate_mlx_on_torch()
@@ -64,13 +49,9 @@ def _hf_reference(lengths, batch_size, generator, mega_batch_mult=None):
     return [i for mb in megabatches for i in mb]
 
 
-# --- the ordering algorithm ---
 
 
 def test_matches_hf_reference_bit_for_bit():
-    """Randomized equality against HF's own algorithm across dataset sizes,
-    batch sizes and seeds -- including the tiny-dataset mega_batch_mult clamp
-    and the swap-largest-first step."""
     order = _helper()
     rng = random.Random(0)
     for _ in range(200):
@@ -87,10 +68,6 @@ def test_matches_hf_reference_bit_for_bit():
 
 
 def test_window_matches_hf_sampler_construction():
-    """HF constructs the sampler with ``train_batch_size *
-    gradient_accumulation_steps`` (``Trainer._get_train_sampler``), so the
-    mega-batch spans a whole accumulation window. The config defaults to 4,
-    which means dropping the factor changes the order for stock settings."""
     from unsloth_zoo.mlx.utils import _length_grouped_window
 
     order = _helper()
@@ -120,15 +97,12 @@ def test_is_a_permutation_and_deterministic_per_seed():
 
 
 def test_longest_row_runs_first():
-    """HF puts the largest batch first so an OOM surfaces immediately."""
     order = _helper()
     lengths = [10] * 60 + [9999]
     assert order(lengths, 4, 7)[0] == 60
 
 
 def test_groups_similar_lengths_far_better_than_a_shuffle():
-    """The point of the feature: padding waste should drop sharply versus a
-    plain permutation of the same rows."""
     order = _helper()
     rng = random.Random(3)
     lengths = [rng.randint(1, 1024) for _ in range(512)]
@@ -156,10 +130,6 @@ def test_empty_and_single_row_datasets():
 
 
 def test_ordering_works_without_torch(monkeypatch):
-    """pyproject excludes torch on darwin/arm64, so a native MLX install has
-    none. group_by_length is a stock HF knob and must not be the one option
-    that needs it: the permutation falls back to the stdlib RNG, and only the
-    shuffle changes -- the grouping still has to hold."""
     from unsloth_zoo.mlx.utils import _length_grouped_order
 
     monkeypatch.setitem(sys.modules, "torch", None)  # makes `import torch` fail
@@ -186,7 +156,6 @@ def test_ordering_works_without_torch(monkeypatch):
     assert padding_cost(order) < padding_cost(plain) / 4
 
 
-# --- config resolution ---
 
 
 def _args(**kw):
@@ -209,8 +178,6 @@ def test_resolver_returns_length_grouped_only_when_requested():
 
 
 def test_resolver_preserves_explicit_none_dataset_order():
-    """dataset_order=None must stay None so it still routes to the ordered
-    plan (where it means sequential) rather than the default builder."""
     from unsloth_zoo.mlx.trainer import _resolve_text_dataset_order
 
     assert _resolve_text_dataset_order(_args(dataset_order=None)) is None
@@ -224,8 +191,6 @@ def test_resolver_preserves_explicit_none_dataset_order():
     ],
 )
 def test_conflicting_order_knobs_raise(conflict):
-    """Each of these picks a concrete, different order. Letting one silently
-    win would train on an order the caller never asked for."""
     from unsloth_zoo.mlx.trainer import _resolve_text_dataset_order
 
     with pytest.raises(ValueError, match="group_by_length"):
@@ -252,18 +217,9 @@ def test_appended_field_keeps_the_optional_copy_suffix():
     assert tail == _MLX_CONFIG_OPTIONAL_COPY_FIELDS
 
 
-# --- the two text paths must agree ---
 
 
 def test_labeled_and_unlabeled_paths_produce_the_same_order():
-    """The load-bearing invariant. `_create_labeled_batches` (the
-    train_on_responses_only path) and `_create_ordered_text_plan` (the
-    unlabeled path) order rows independently; if they disagree,
-    train_on_responses_only masks a different stream than it trains on.
-
-    Nothing pinned this before, which is how their accepted `dataset_order`
-    vocabularies were able to drift apart.
-    """
     from unsloth_zoo.mlx.utils import (
         _length_grouped_order, _length_grouped_window, _normalize_seed,
     )
@@ -292,7 +248,6 @@ def test_labeled_and_unlabeled_paths_produce_the_same_order():
 
 
 class _SpaceTokenizer:
-    """Whitespace tokenizer; the text of a row is its token ids."""
 
     pad_token_id = 0
     eos_token_id = 99
@@ -340,15 +295,10 @@ def _labeled_plan(
 
 
 def test_labeled_plan_groups_at_the_accumulation_window():
-    """The call site, not just the helper: `_create_labeled_batches` has to
-    fold gradient_accumulation_steps into the window it groups at, or
-    train_on_responses_only groups four times finer than HF for the default
-    config."""
     from unsloth_zoo.mlx.utils import (
         _length_grouped_order, _length_grouped_window, _normalize_seed,
     )
 
-    # (i % 4) + 2 tokens per row, plus the EOS `_create_labeled_batches` appends.
     lengths = [3, 4, 5, 6, 3, 4]
 
     def plan_order(grad_accum):
@@ -364,18 +314,12 @@ def test_labeled_plan_groups_at_the_accumulation_window():
 
 
 def test_both_builders_stream_the_same_rows_at_the_same_window():
-    """Builder level rather than helper level: the labeled and unlabeled plans
-    compute their order independently, so folding accumulation into one and not
-    the other would leave train_on_responses_only masking a different stream
-    than it trains on."""
     from unsloth_zoo.mlx.utils import _create_ordered_text_plan
 
     class _PretokenizedTokenizer:
         pad_token_id = 0
         eos_token_id = 99
 
-    # Same lengths the labeled dataset tokenizes to, already tokenized so this
-    # path needs no chat template.
     plan = _create_ordered_text_plan(
         dataset=[{"input_ids": list(range(1, n + 1))} for n in [3, 4, 5, 6, 3, 4]],
         tokenizer=_PretokenizedTokenizer(),
@@ -394,12 +338,6 @@ def test_both_builders_stream_the_same_rows_at_the_same_window():
 
 @pytest.mark.parametrize("order", ["length_grouped", "torch_randperm"])
 def test_max_steps_run_reseeds_every_pass_it_consumes(order):
-    """max_steps>0 gives the labeled builder num_epochs=None plus a num_batches
-    horizon spanning several passes, and the trainer serves it by cycling the
-    plan. Materializing only epoch 0 replays one order for the whole run, while
-    `_create_ordered_text_plan` expands to num_batches and reseeds -- the two
-    text paths have to stream the same rows.
-    """
     plan = _labeled_plan(num_batches=18, order=order)
     schedule = [list(batch) for batch in plan.schedule]
     assert len(schedule) == 18
@@ -413,15 +351,11 @@ def test_max_steps_run_reseeds_every_pass_it_consumes(order):
 
 
 def test_max_steps_run_still_truncates_to_the_step_budget():
-    """Expansion only fills a horizon; it must never overshoot it, nor build a
-    second pass for a run that does not reach one."""
     assert len(_labeled_plan(num_batches=4).schedule) == 4
     assert len(_labeled_plan(num_batches=15).schedule) == 15
 
 
 def test_sequential_order_is_not_expanded():
-    """Nothing to reseed: every pass would be byte-identical, so the plan stays
-    one block and the trainer cycles it exactly as before."""
     plan = _labeled_plan(num_batches=18, order="sequential")
     assert len(plan.schedule) == 6
 
@@ -434,8 +368,6 @@ def test_row_length_handles_labeled_and_unlabeled_shapes():
 
 
 def test_order_reshuffles_across_epochs():
-    """A fresh permutation per epoch is the whole difference from the legacy
-    length-sorted default, which repeats one order forever."""
     from unsloth_zoo.mlx.utils import _length_grouped_order, _normalize_seed
 
     lengths = [random.Random(9).randint(1, 400) for _ in range(300)]
@@ -445,12 +377,6 @@ def test_order_reshuffles_across_epochs():
 
 
 def test_eval_batches_are_never_length_grouped():
-    """A deliberate divergence: transformers length-groups eval too
-    (``Trainer._get_eval_sampler``). `_evaluate` accumulates ``loss * ntoks``
-    and divides by the total, so eval metrics do not depend on how rows are
-    grouped -- regrouping eval would only save padding on the eval pass, and
-    this knob is about training throughput.
-    """
     from unsloth_zoo.mlx.trainer import _resolve_text_dataset_order
 
     args = _args(group_by_length=True)
@@ -470,8 +396,6 @@ def test_eval_resolution_still_honors_the_other_order_knobs():
 
 
 def test_conflicts_raise_on_the_eval_path_too():
-    """A contradictory config must fail the same way whichever path resolves
-    it first, rather than depending on whether eval happens to run."""
     from unsloth_zoo.mlx.trainer import _resolve_text_dataset_order
 
     with pytest.raises(ValueError, match="group_by_length"):
@@ -480,12 +404,9 @@ def test_conflicts_raise_on_the_eval_path_too():
             for_training=False,
         )
 
-# --- unsupported paths must fail loudly, not silently mis-group ---
 
 
 def test_vlm_rejects_length_grouping():
-    """A VLM row's cost is dominated by image/audio tokens the text length does
-    not see, so grouping on that length would not bound padding."""
     from unsloth_zoo.mlx.trainer import _reject_group_by_length
 
     with pytest.raises(ValueError, match="vision-language"):
@@ -493,7 +414,6 @@ def test_vlm_rejects_length_grouping():
 
 
 def test_streaming_rejects_length_grouping():
-    """The mega-batch permutation needs the whole dataset up front."""
     from unsloth_zoo.mlx.trainer import _reject_group_by_length
 
     with pytest.raises(ValueError, match="requires a sized dataset"):
@@ -501,12 +421,6 @@ def test_streaming_rejects_length_grouping():
 
 
 def test_preference_rejects_length_grouping():
-    """MLXDPOConfig/MLXORPOConfig inherit the field, and the preference branch
-    of `_prepare_data` never reaches the text order resolution, so an accepted
-    group_by_length=True would train in the default preference order instead.
-    CUDA rejects it too: TRL keeps Trainer._get_train_sampler, whose
-    LengthGroupedSampler cannot infer lengths from prompt/chosen/rejected rows.
-    """
     from unsloth_zoo.mlx.trainer import _reject_group_by_length
 
     with pytest.raises(ValueError, match="DPO/ORPO"):
@@ -514,8 +428,6 @@ def test_preference_rejects_length_grouping():
 
 
 def test_preference_configs_resolve_to_the_grouped_order():
-    """The guard above only fires if the inherited field resolves; pins that
-    the preference configs carry it rather than dropping it on the copy."""
     from unsloth_zoo.mlx.trainer import (
         MLXDPOConfig, MLXORPOConfig, _resolve_text_dataset_order,
     )
@@ -530,17 +442,13 @@ def test_preference_configs_resolve_to_the_grouped_order():
     "order", ["default", "sequential", "torch_randperm", None],
 )
 def test_existing_orders_are_untouched_by_the_guard(order, context):
-    """The guard must be a no-op for every pre-existing order, so VLM and
-    streaming runs that never set group_by_length behave exactly as before."""
     from unsloth_zoo.mlx.trainer import _reject_group_by_length
 
     assert _reject_group_by_length(order, context) is None
 
-# --- distributed (DDP) interaction ---
 
 
 class _FakeWorld:
-    """Minimal comm_group: _distributed_rank_size only calls rank()/size()."""
 
     def __init__(self, rank, size):
         self._rank, self._size = rank, size
@@ -553,12 +461,6 @@ class _FakeWorld:
 
 
 def test_every_rank_derives_the_identical_global_order():
-    """DDP correctness hinges on this. Ranks do not exchange the sample order;
-    each derives it locally and slices its share. If two ranks disagreed they
-    would train on mismatched rows and the collectives would pair up the wrong
-    gradients. The order depends only on (lengths, batch_size, seed), none of
-    which is rank-dependent, and this pins that.
-    """
     from unsloth_zoo.mlx.utils import _length_grouped_order
 
     lengths = [random.Random(2).randint(1, 900) for _ in range(257)]
@@ -572,15 +474,11 @@ def test_window_folds_world_size_and_accumulation():
     assert _length_grouped_window(2, None, 4) == 8
     assert _length_grouped_window(2, _FakeWorld(0, 4), 4) == 32
     assert _length_grouped_window(2, _FakeWorld(3, 4), 4) == 32   # rank-invariant
-    # An unknown or zero accumulation factor must not collapse the window to 0.
     assert _length_grouped_window(2, None, None) == 2
     assert _length_grouped_window(2, None, 0) == 2
 
 
 def test_window_stays_a_multiple_of_the_consumed_global_batch():
-    """Folding accumulation in must not reintroduce the straddle that grouping
-    at the global batch fixed: the schedule consumes global micro-batches, so
-    the window has to stay a whole number of them."""
     from unsloth_zoo.mlx.utils import (
         _distributed_global_batch_size, _length_grouped_window,
     )
@@ -617,8 +515,6 @@ def test_rank_slices_are_disjoint_and_cover_the_global_batch():
             for r in range(world_size)
         ]
         flat = [i for s in slices for i in s]
-        # Every rank gets its own local_batch rows, and together they reconstruct
-        # the global batch (a short tail is cycle-padded, so compare as a set).
         assert all(len(s) == local_batch for s in slices)
         assert set(chunk) <= set(flat)
         if len(chunk) == global_batch:
@@ -626,8 +522,6 @@ def test_rank_slices_are_disjoint_and_cover_the_global_batch():
 
 
 def test_length_grouping_survives_rank_sharding():
-    """Grouping is only useful if it holds after DDP slices a global batch:
-    each rank should still see a length-homogeneous local batch."""
     from unsloth_zoo.mlx.utils import (
         _length_grouped_order,
         _rank_slice_distributed_batch,
@@ -662,13 +556,6 @@ def test_length_grouping_survives_rank_sharding():
 
 
 def test_grouping_is_cut_at_the_global_batch_not_the_local_one():
-    """The plan builders consume the order in chunks of the GLOBAL micro-batch
-    (`_finite_row_schedule`), so that is the size the mega-batches have to be
-    cut at. Grouped at the per-rank batch, the 50x mega-batch multiplier gives
-    100-row windows against a consumed global batch of 8, and 100 % 8 != 0 --
-    every straddling chunk pairs the shortest rows of one sorted window with
-    the longest of the next, which is the padding this option exists to avoid.
-    """
     from unsloth_zoo.mlx.utils import (
         _length_grouped_order,
         _rank_slice_distributed_batch,
@@ -677,8 +564,6 @@ def test_grouping_is_cut_at_the_global_batch_not_the_local_one():
     world_size, local_batch = 4, 2
     global_batch = local_batch * world_size
     rng = random.Random(13)
-    # Large enough that mega_batch_mult saturates at HF's 50 cap, which is
-    # where the local/global mismatch shows up.
     lengths = [rng.randint(1, 1024) for _ in range(1600)]
 
     def local_padding(order_source):
