@@ -6386,8 +6386,7 @@ def unsloth_compile_transformers(
             # MOE routing weights cast fix takes effect in v5
             new_source, new_methods = patch_moe_routing_weights_cast(module_cls, source)
             if new_source != source or len(new_methods) > 0:
-                # Compiled like any other module when it passed the module screens; disabled, the
-                # router breaks the compiled MoE block around it (Ernie 4.5, Laguna).
+                # Disabled, the router breaks the compiled MoE block around it (Ernie 4.5, Laguna).
                 compile_router = (
                     compile_custom_modules
                     and module in torch_modules

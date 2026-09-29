@@ -3140,8 +3140,7 @@ def _patched_param_wrapper_forward(
 
         return result
 
-    # Stacks the separated forward does not claim (NemotronH's non-gated up_proj / down_proj): under
-    # compile PEFT's parametrization graph-breaks on `set_` and `type.__delattr__`, so fold as above.
+    # Unclaimed stacks (NemotronH up_proj / down_proj): PEFT's parametrization graph-breaks under compile.
     if (
         torch.compiler.is_compiling()
         and param_name
