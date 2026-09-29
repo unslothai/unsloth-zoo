@@ -416,6 +416,9 @@ def test_host_copies_are_pinned_in_place_at_their_exact_size():
     if not torch.cuda.is_available():
         print("[SKIP] CUDA not available")
         return
+    if os.environ.get("UNSLOTH_DISABLE_PINNED_MEMORY", "0") == "1":
+        print("[SKIP] pinned memory disabled")
+        return
     layers = _linear_tail()
     x = torch.randn(2, 1536, device = "cuda")
     with torch.no_grad():
