@@ -14,15 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Real-MLX regression for MLXKTOTrainer on Apple Silicon.
-
-Trains a 4-bit Qwen2.5-0.5B + LoRA with KTO on a small unpaired dataset and
-checks the loss is finite and decreasing, that the LoRA-disable reference path
-restores adapter scales (including when a forward throws mid-step), and that a
-non-PEFT model raises the clear LoRA-only error.
-
-Metal-gated so Linux CI collection skips cleanly.
-"""
+"""Real-MLX MLXKTOTrainer tests (Metal-gated)."""
 
 import math
 
@@ -63,8 +55,6 @@ def _load_peft():
 
 def _config(**overrides):
     from unsloth_zoo.mlx.trainer import MLXKTOConfig
-    # gradient_accumulation_steps=1 keeps these tests at one optimizer step per
-    # batch; the accumulation path has its own test below.
     base = dict(per_device_train_batch_size=4, max_steps=6, warmup_steps=1,
                 gradient_accumulation_steps=1,
                 learning_rate=1e-4, beta=0.1, logging_steps=99, seed=3407, report_to="none")
@@ -80,8 +70,6 @@ def test_kto_trains_finite_and_decreasing(tmp_path):
                             args=_config(output_dir=str(tmp_path)))
     output = trainer.train()
 
-    # train() returns MLXTrainOutput, matching MLXTrainer; the per-step losses
-    # live on the trainer.
     hist = trainer._train_loss_history
     assert len(hist) == 6, f"expected 6 steps, got {len(hist)}"
     assert all(math.isfinite(x) for x in hist), f"non-finite loss: {hist}"
@@ -89,14 +77,11 @@ def test_kto_trains_finite_and_decreasing(tmp_path):
     assert output.global_step == 6, f"expected 6 steps, got {output.global_step}"
     assert math.isfinite(output.training_loss)
     assert output["total_train_steps"] == 6
-    # KL baseline recorded per step, finite and clamped >= 0.
     assert trainer._kl_history and all(math.isfinite(k) and k >= 0.0 for k in trainer._kl_history)
 
 
 @metal_only
 def test_kto_logging_steps_uses_one_based_cadence(tmp_path, capsys):
-    # logging_steps must gate on the 1-based step: logging_steps=2 over 4 steps
-    # logs at steps 2 and 4, not the old zero-based 1 and 3.
     import re
     from unsloth_zoo.mlx.trainer import MLXKTOTrainer
     model, tok = _load_peft()
@@ -112,10 +97,7 @@ def test_kto_logging_steps_uses_one_based_cadence(tmp_path, capsys):
 
 @metal_only
 def test_kto_grad_accum_weights_microbatches_by_example_count(tmp_path):
-    # 6 rows, batch_size=4 -> micro-batches of sizes [4, 2]. With lr=0 nothing
-    # updates, so both are scored on the same initial model. A grad-accum window
-    # over both must report the EXAMPLE-weighted mean (4*L1+2*L2)/6, not the equal
-    # mean (L1+L2)/2 -- otherwise the trailing size-2 batch is over-weighted.
+    # Micro-batches [4, 2] at lr=0: window must be (4*L1+2*L2)/6, not (L1+L2)/2.
     from unsloth_zoo.mlx.trainer import MLXKTOTrainer
     data = _dataset(6)
 
@@ -138,11 +120,6 @@ def test_kto_grad_accum_weights_microbatches_by_example_count(tmp_path):
 
 @metal_only
 def test_kto_gradient_accumulation_reduces_optimizer_steps(tmp_path):
-    # 24 examples / batch 4 = 6 micro-batches. With max_steps unset, one epoch
-    # is len(batches) // grad_accum optimizer steps: grad_accum=2 -> 3 steps,
-    # each averaging 2 micro-batches. If accumulation were ignored (one update
-    # per micro-batch) this would be 6 steps, so the history length pins that
-    # grad_accum actually groups micro-batches into optimizer steps.
     from unsloth_zoo.mlx.trainer import MLXKTOTrainer
     model, tok = _load_peft()
     trainer = MLXKTOTrainer(
@@ -160,10 +137,6 @@ def test_kto_gradient_accumulation_reduces_optimizer_steps(tmp_path):
 
 @metal_only
 def test_kto_num_train_epochs_scales_steps(tmp_path):
-    # max_steps unset + num_train_epochs=2: optimizer steps =
-    # (len(batches) * epochs) // grad_accum. 8 examples / batch 4 = 2 batches,
-    # grad_accum=1, epochs=2 -> 4 steps. One epoch would be 2, so this pins that
-    # num_train_epochs is honored instead of silently running a single pass.
     from unsloth_zoo.mlx.trainer import MLXKTOTrainer
     model, tok = _load_peft()
     trainer = MLXKTOTrainer(
@@ -178,8 +151,6 @@ def test_kto_num_train_epochs_scales_steps(tmp_path):
 
 @metal_only
 def test_kto_resets_run_state_between_train_calls(tmp_path):
-    # Re-running the same trainer must not accumulate stale loss/KL history, or
-    # the MLXTrainOutput mean would blend the two runs.
     from unsloth_zoo.mlx.trainer import MLXKTOTrainer
     model, tok = _load_peft()
     trainer = MLXKTOTrainer(model=model, tokenizer=tok, train_dataset=_dataset(),
@@ -193,8 +164,6 @@ def test_kto_resets_run_state_between_train_calls(tmp_path):
 
 @metal_only
 def test_kto_rejects_resume_from_checkpoint(tmp_path):
-    # Resume is unimplemented; a resumed call would restart and overwrite, so
-    # it must raise rather than silently restart.
     from unsloth_zoo.mlx.trainer import MLXKTOTrainer
     model, tok = _load_peft()
     trainer = MLXKTOTrainer(model=model, tokenizer=tok, train_dataset=_dataset(),
@@ -205,8 +174,6 @@ def test_kto_rejects_resume_from_checkpoint(tmp_path):
 
 @metal_only
 def test_kto_rejects_eval_dataset(tmp_path):
-    # No eval loop yet; passing eval_dataset must raise rather than silently
-    # ignore eval_steps / load_best_model_at_end.
     from unsloth_zoo.mlx.trainer import MLXKTOTrainer
     model, tok = _load_peft()
     trainer = MLXKTOTrainer(model=model, tokenizer=tok, train_dataset=_dataset(),
@@ -218,9 +185,6 @@ def test_kto_rejects_eval_dataset(tmp_path):
 
 @metal_only
 def test_kto_rejects_lora_plus(tmp_path):
-    # LoRA+ per-leaf scaling is unimplemented on the KTO path, so setting
-    # lora_plus_ratio must raise loudly rather than silently train lora_b at
-    # the wrong learning rate.
     from unsloth_zoo.mlx.trainer import MLXKTOTrainer
     model, tok = _load_peft()
     trainer = MLXKTOTrainer(
@@ -233,8 +197,6 @@ def test_kto_rejects_lora_plus(tmp_path):
 
 @metal_only
 def test_kto_saves_adapters_at_end(tmp_path):
-    # save_steps defaults to 0 (save at end); train() must leave adapters on
-    # disk, not only in memory, matching MLXTrainer.
     from unsloth_zoo.mlx.trainer import MLXKTOTrainer
     model, tok = _load_peft()
     trainer = MLXKTOTrainer(model=model, tokenizer=tok, train_dataset=_dataset(),
@@ -263,16 +225,13 @@ def test_lora_scales_restored_after_training(tmp_path):
 
 @metal_only
 def test_lora_scales_restored_when_forward_throws(tmp_path, monkeypatch):
-    """The reference forward runs with scales set to 0; if it throws, the
-    finally must restore scales so the model is not left adapter-disabled."""
     import unsloth_zoo.mlx.trainer as T
     from unsloth_zoo.mlx.trainer import MLXKTOTrainer
     from unsloth_zoo.mlx.utils import iter_mlx_lora_modules
     model, tok = _load_peft()
     before = [m.scale for _, m in iter_mlx_lora_modules(model)]
 
-    # Fail on the 2nd sum-logp call: that is the reference forward, which runs
-    # while adapter scales are 0 (policy-KL is the 1st call, scales still on).
+    # 2nd sum-logp call is the reference forward (scales at 0); 1st is policy-KL.
     real = T._kto_sum_logp
     calls = {"n": 0}
     def flaky(logits, labels):
@@ -294,14 +253,13 @@ def test_lora_scales_restored_when_forward_throws(tmp_path, monkeypatch):
 
 @metal_only
 def test_kto_sum_logp_matches_numpy():
-    """Summed-logp extractor vs a from-scratch numpy log-softmax reference."""
     import numpy as np
     from unsloth_zoo.mlx.trainer import _kto_sum_logp
     rng = np.random.default_rng(1)
     B, T, V = 3, 6, 11
     logits = rng.normal(0, 1, size=(B, T, V)).astype(np.float32)
     labels = rng.integers(0, V, size=(B, T)).astype(np.int64)
-    labels[0, :2] = -100; labels[1, :3] = -100; labels[2, :1] = -100  # masked prompt prefixes
+    labels[0, :2] = -100; labels[1, :3] = -100; labels[2, :1] = -100
 
     got = np.array(_kto_sum_logp(mx.array(logits), mx.array(labels)))
 
@@ -322,7 +280,6 @@ def test_non_peft_model_raises_lora_only_error(tmp_path):
     from unsloth_zoo.mlx.trainer import MLXKTOTrainer
     mx.random.seed(3407)
     model, tok = FastMLXModel.from_pretrained(MODEL, max_seq_length=256, load_in_4bit=True)
-    # No get_peft_model -> no LoRA adapters -> reference forward is impossible.
     trainer = MLXKTOTrainer(model=model, tokenizer=tok, train_dataset=_dataset(),
                             args=_config(output_dir=str(tmp_path)))
     with pytest.raises(ValueError) as exc:
