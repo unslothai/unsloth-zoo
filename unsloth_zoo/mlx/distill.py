@@ -148,6 +148,7 @@ def assert_tokenizers_compatible(student_tokenizer, teacher_tokenizer,
         )
         return True
 
+    _assert_vocab_mappings_match(student_tokenizer, teacher_tokenizer)
     for probe in TOKENIZER_PROBES:
         student_ids = student_tokenizer.encode(probe)
         teacher_ids = teacher_tokenizer.encode(probe)
@@ -161,6 +162,45 @@ def assert_tokenizers_compatible(student_tokenizer, teacher_tokenizer,
                 "Training would silently optimise against misaligned targets."
             )
     return True
+
+
+def _assert_vocab_mappings_match(student_tokenizer, teacher_tokenizer):
+    """Every token must map to the same id. Differences confined to added
+    tokens (Qwen3's <think> vs a Qwen2.5 teacher) warn: those ids only matter
+    when the data contains them. Tokenizers without get_vocab skip this."""
+    try:
+        student_vocab = student_tokenizer.get_vocab()
+        teacher_vocab = teacher_tokenizer.get_vocab()
+    except Exception:
+        return
+    differing = sorted(
+        token for token in student_vocab.keys() | teacher_vocab.keys()
+        if student_vocab.get(token) != teacher_vocab.get(token)
+    )
+    if not differing:
+        return
+    added = set()
+    for tokenizer in (student_tokenizer, teacher_tokenizer):
+        try:
+            added.update(tokenizer.get_added_vocab())
+        except Exception:
+            pass
+    base = [token for token in differing if token not in added]
+    if base:
+        raise ValueError(
+            "Unsloth: GKD needs the teacher and student to share a tokenizer, but "
+            f"{len(base)} vocabulary tokens map to different ids (e.g. "
+            f"{base[:5]!r}), so the teacher's distribution would not line up "
+            "with the student's tokens."
+        )
+    import warnings
+    warnings.warn(
+        f"Unsloth: GKD teacher and student disagree on {len(differing)} added "
+        f"tokens ({differing[:5]!r}); the teacher's targets at those ids are "
+        "not meaningful if your data contains them.",
+        UserWarning,
+        stacklevel = 3,
+    )
 
 
 def estimate_distillation_peak_bytes(batch_size, sequence_length, vocab_size,

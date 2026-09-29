@@ -64,6 +64,35 @@ def test_width_mismatch_is_rejected_without_tokenizers():
         assert d.assert_tokenizers_compatible(None, FakeTokenizer(), VOCAB, VOCAB)
 
 
+class VocabTokenizer(FakeTokenizer):
+
+    def __init__(self, vocab, added=()):
+        super().__init__()
+        self.vocab, self.added = vocab, {t: vocab[t] for t in added}
+
+    def get_vocab(self):
+        return dict(self.vocab)
+
+    def get_added_vocab(self):
+        return dict(self.added)
+
+
+def test_unprobed_vocabulary_difference_is_rejected():
+    d = _distill()
+    student = VocabTokenizer({"a": 0, "b": 1, "c": 2})
+    teacher = VocabTokenizer({"a": 0, "b": 2, "c": 1})
+    with pytest.raises(ValueError, match="map to different ids"):
+        d.assert_tokenizers_compatible(student, teacher, VOCAB, VOCAB)
+
+
+def test_added_token_difference_only_warns():
+    d = _distill()
+    student = VocabTokenizer({"a": 0, "b": 1, "<think>": 2}, added=["<think>"])
+    teacher = VocabTokenizer({"a": 0, "b": 1})
+    with pytest.warns(UserWarning, match="disagree on 1 added tokens"):
+        assert d.assert_tokenizers_compatible(student, teacher, VOCAB, VOCAB)
+
+
 def test_width_matches_but_ids_differ_is_rejected():
     d = _distill()
     with pytest.raises(ValueError, match="encode text differently"):
@@ -222,3 +251,29 @@ def test_config_fields_exist_and_are_inert_by_default():
     assert config.gkd_chunk_size > 0
     assert config.gkd_skip_memory_preflight is False
     assert names[-6:] == list(_MLX_CONFIG_OPTIONAL_COPY_FIELDS)[-6:]
+
+
+def test_evaluate_reports_gkd_loss_without_perplexity():
+    """exp(JSD) is not a perplexity, and GKD has no preference stats."""
+    import mlx.core as mx
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    class Model:
+        def eval(self):
+            pass
+
+        def train(self, mode=True):
+            pass
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.model = Model()
+    trainer.stop_requested = False
+
+    def loss_fn(_model, _batch, _lengths, _labels):
+        return mx.array(0.2), mx.array(4)
+    loss_fn._unsloth_gkd = True
+
+    loss, ppl = trainer._evaluate([(None, None, None)], loss_fn, is_vlm=False)
+    assert loss == pytest.approx(0.2)
+    assert ppl is None
+    assert "eval_perplexity" not in trainer._last_eval_metrics
