@@ -175,6 +175,44 @@ def _lora_layer_types():
     return LoRALinear, tuple(dora_types), tuple(switch_types)
 
 
+_STE_QMM = {}
+
+
+def _ste_quantized_matmul(group_size, bits, mode):
+    """quantized_matmul forward (bit-exact to the saved QuantizedLinear), STE backward.
+
+    A dense GEMM over the fake-quantized weight rounds differently from the
+    quantized_matmul merged_4bit ships (0.017 loss drift on Metal), and paying for
+    both matmuls in the forward doubles the cost; the custom VJP needs neither.
+    """
+    key = (group_size, bits, mode)
+    fn = _STE_QMM.get(key)
+    if fn is not None:
+        return fn
+    import mlx.core as mx
+    grid = {"group_size": group_size, "bits": bits, "mode": mode}
+
+    @mx.custom_function
+    def fn(x, merged, packed, scales, biases):
+        return mx.quantized_matmul(x, packed, scales, biases, transpose=True, **grid)
+
+    @fn.vjp
+    def fn_vjp(primals, cotangent, output):
+        x, merged, packed, scales, biases = primals
+        fake = mx.dequantize(packed, scales, biases, **grid).astype(x.dtype)
+        dx = cotangent @ fake
+        # Straight-through: the quantizer is the identity for the merged weight.
+        d_merged = (
+            cotangent.reshape(-1, cotangent.shape[-1]).T
+            @ x.reshape(-1, x.shape[-1])
+        ).astype(merged.dtype)
+        return (dx, d_merged, mx.zeros_like(packed), mx.zeros_like(scales),
+                mx.zeros_like(biases))
+
+    _STE_QMM[key] = fn
+    return fn
+
+
 def _qat_call(self, x):
     """Mirrors LoRALinear.fuse(dequantize=False); STE for the gradient."""
     import mlx.core as mx
@@ -191,21 +229,9 @@ def _qat_call(self, x):
     packed, scales, biases = mx.quantize(
         merged, group_size=group_size, bits=bits, mode=mode,
     )
-    fake = mx.dequantize(
-        packed, scales, biases, group_size=group_size, bits=bits, mode=mode,
+    y = _ste_quantized_matmul(group_size, bits, mode)(
+        x, merged, packed, scales, biases,
     )
-    straight_through = merged + mx.stop_gradient(fake - merged)
-    dense = x @ straight_through.T
-    # Forward value = the quantized_matmul the saved QuantizedLinear runs; a dense
-    # GEMM rounds differently (0.017 loss drift on Metal). Correction in fp32 so the
-    # bf16 round trip is exact; gradients still flow through `dense`.
-    shipped = mx.quantized_matmul(
-        x, packed, scales, biases, transpose=True,
-        group_size=group_size, bits=bits, mode=mode,
-    )
-    y = (dense.astype(mx.float32) + mx.stop_gradient(
-        shipped.astype(mx.float32) - dense.astype(mx.float32)
-    )).astype(shipped.dtype)
     # fuse() keeps the base bias; dropping it breaks Qwen2 q/k/v.
     if "bias" in base:
         y = y + base.bias
