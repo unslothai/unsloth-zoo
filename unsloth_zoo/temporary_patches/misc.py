@@ -382,9 +382,8 @@ def patch_CsmForConditionalGeneration_forward():
             # Depth decoder trains on frames whose labels are not uniformly
             # ignore_index across the codebook dimension.
             train_mask = ~(labels[:, :, 1:] == -100).all(dim=-1)
-            # No depth frames (CsmProcessor depth_decoder_labels_ratio=0): a zero-frame batch crashes the decoder.
-            # Still run it on one dummy frame at zero weight so every rank enters it: DDP without
-            # find_unused_parameters needs its grads, FSDP / ZeRO-3 need matching parameter gathers.
+            # No depth frames (depth_decoder_labels_ratio=0) crashes the decoder; a zero-weight dummy frame
+            # keeps every rank entering it (DDP unused-param grads, FSDP / ZeRO-3 gathers).
             if not train_mask.any():
                 dummy_outputs = self.depth_decoder(
                     input_ids = labels.new_zeros((1, self.config.num_codebooks)),
