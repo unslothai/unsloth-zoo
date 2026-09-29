@@ -21,6 +21,7 @@ The recompute sweep runs in reverse, so prefetch direction follows grad mode.
 Slots come from a fixed depth + 1 pool: per-fetch allocation leaves the peak unchanged.
 """
 import os
+import sys
 import torch
 from contextlib import contextmanager, nullcontext
 
@@ -60,15 +61,26 @@ def _to_pinned_host(t):
         return host
 
 
+_CHECKPOINT_FILE = os.path.join("torch", "utils", "checkpoint.py")
+
+
 def _autograd_keeps_weights():
     if not torch.is_grad_enabled():
         return False
+    # Non-reentrant checkpoint forward saves nothing; its recompute refetches through the hooks.
     try:
         hooks = torch._C._autograd._top_saved_tensors_default_hooks(False)
-    except Exception:
-        return True
-    # Non-reentrant checkpoint forward saves nothing; its recompute refetches through the hooks.
-    return hooks is None or not getattr(hooks[0], "__qualname__", "").startswith("_checkpoint_hook.")
+        return hooks is None or not getattr(hooks[0], "__qualname__", "").startswith("_checkpoint_hook.")
+    except (AttributeError, TypeError):
+        pass
+    # Older torch (2.6) has no hook getter: a grad-on forward inside checkpoint() is the non-reentrant one.
+    f = sys._getframe(1)
+    while f is not None:
+        code = f.f_code
+        if code.co_name == "checkpoint" and code.co_filename.endswith(_CHECKPOINT_FILE):
+            return False
+        f = f.f_back
+    return True
 
 
 def _swappable(module):
