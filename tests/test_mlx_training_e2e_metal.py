@@ -30,6 +30,7 @@ _UNTRANSPOSED = dict(k=192, rows=1, out_width=128, transpose=False, rhs_indices=
 if _METAL:
     # Module scope: leaked mlx-simulation shims must not hijack test-time imports.
     import mlx.nn as nn
+    import mlx.optimizers as optim
     from mlx.utils import tree_flatten, tree_map
     from unsloth_zoo.mlx.loader import FastMLXModel
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
@@ -887,6 +888,168 @@ def test_frozen_dense_cce_preserves_gradients_with_lower_peak(monkeypatch, compi
 
 
 @metal_only
+@pytest.mark.parametrize("quantized", [False, True])
+def test_compiled_update_reuses_parameter_and_moment_buffers(quantized):
+    import gc
+    import weakref
+    from unsloth_zoo.mlx.optimizers_quantized import QuantizedMomentAdamW
+
+    shape = (2048, 8192)
+    leaf = shape[0] * shape[1] * 2
+    results, peaks = [], []
+    for trainer_built in (False, True):
+        mx.random.seed(3)
+        params = {"w": (mx.random.normal(shape) * 0.02).astype(mx.bfloat16)}
+        grads = [(mx.random.normal(shape) * 1e-3).astype(mx.bfloat16) for _ in range(3)]
+        if trainer_built:
+            trainer = MLXTrainer.__new__(MLXTrainer)
+            trainer.args = MLXTrainingConfig(
+                optim="adamw_8bit" if quantized else "adamw", learning_rate=1e-3,
+                lr_scheduler_type="constant", warmup_steps=0, weight_decay=0.0,
+            )
+            opt = trainer._build_optimizer(total_steps=3)
+        else:
+            cls = QuantizedMomentAdamW if quantized else optim.AdamW
+            opt = cls(learning_rate=1e-3, weight_decay=0.0, bias_correction=True)
+        opt.init(params)
+        state = [params, opt.state]
+        step = mx.compile(lambda g: params.update(opt.apply_gradients({"w": g}, params)),
+                          inputs=state, outputs=state)
+        mx.eval(state, grads)
+        for g in grads:
+            gc.collect()
+            mx.synchronize()
+            resident = mx.get_active_memory()
+            mx.reset_peak_memory()
+            step(g)
+            mx.eval(state)
+            mx.synchronize()
+        peaks.append(mx.get_peak_memory() - resident)
+        results.append(tree_flatten(state))
+    for (name, left), (_, right) in zip(*results):
+        assert mx.array_equal(left, right).item(), name
+    assert peaks[0] >= 3 * leaf
+    if quantized:
+        # 8-bit m is repacked either way; only the parameter is donated.
+        assert peaks[1] <= peaks[0] - leaf
+    else:
+        assert peaks[1] < leaf / 8
+    released = weakref.ref(trainer._build_optimizer(total_steps=3))
+    assert released() is None
+
+
+@metal_only
+def test_layer_ordered_update_frees_gradients_during_backward():
+    import gc
+    from unsloth_zoo.mlx.trainer import _async_eval_by_layer, _donate_optimizer_state
+
+    class Net(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Linear(2048, 2048, bias=False)
+            self.layers = [nn.Linear(2048, 2048, bias=False) for _ in range(16)]
+
+        def __call__(self, x):
+            x = self.embed(x)
+            for layer in self.layers:
+                def block(params, x, layer=layer):
+                    layer.update(params)
+                    return x + nn.gelu(layer(x))
+                x = mx.checkpoint(block)(layer.trainable_parameters(), x)
+            return x
+
+    results, peaks = [], []
+    for ordered in (False, True):
+        mx.random.seed(5)
+        model = Net()
+        model.set_dtype(mx.bfloat16)
+        opt = _donate_optimizer_state(optim.AdamW(learning_rate=1e-3, weight_decay=0.0))
+        opt.init(model.trainable_parameters())
+        grad_fn = nn.value_and_grad(model, lambda m, x: m(x).astype(mx.float32).square().mean())
+        state = [model.state, opt.state]
+
+        def step(x):
+            loss, grads = grad_fn(model, x)
+            opt.update(model, grads)
+            return loss
+
+        step = mx.compile(step, inputs=state, outputs=state)
+        xs = [mx.random.normal((4096, 2048)).astype(mx.bfloat16) for _ in range(3)]
+        mx.eval(state, xs)
+        for x in xs:
+            gc.collect()
+            mx.synchronize()
+            resident = mx.get_active_memory()
+            mx.reset_peak_memory()
+            loss = step(x)
+            if ordered:
+                _async_eval_by_layer(model.trainable_parameters(), "layers.")
+            mx.eval(loss, state)
+            mx.synchronize()
+        peaks.append(mx.get_peak_memory() - resident)
+        results.append(tree_flatten(state))
+    for (name, left), (_, right) in zip(*results):
+        assert mx.array_equal(left, right).item(), name
+    layer_grads = 16 * 2048 * 2048 * 2
+    assert peaks[1] <= peaks[0] - 2 * layer_grads
+
+
+@metal_only
+def test_trainer_schedules_the_update_layer_by_layer(monkeypatch, tmp_path):
+    from unsloth_zoo.mlx import trainer as trainer_module
+
+    calls, schedule = [], trainer_module._async_eval_by_layer
+
+    def spy(tree, prefix):
+        if created:  # the first step's state must already be allocated
+            before = mx.get_active_memory()
+            mx.eval(created)
+            unallocated.append(mx.get_active_memory() - before)
+            created.clear()
+        params = tree_flatten(model.trainable_parameters())
+        is_params = all(a is b for (_, a), (_, b) in zip(tree_flatten(tree), params))
+        calls.append((tree, prefix, is_params))
+        schedule(tree, prefix)
+
+    monkeypatch.setattr(trainer_module, "_async_eval_by_layer", spy)
+    in_trace, created, unallocated, build = [], [], [], MLXTrainer._build_optimizer
+
+    def build_spy(self, total_steps):
+        optimizer = build(self, total_steps)
+        init = optimizer.init
+
+        def init_spy(parameters):
+            try:
+                mx.eval(tree_flatten(parameters)[0][1])
+                in_trace.append(False)
+            except ValueError:
+                in_trace.append(True)
+            init(parameters)
+            created.extend(a for _, a in tree_flatten(optimizer.state) if a.size > 1)
+
+        optimizer.init = init_spy
+        return optimizer
+
+    monkeypatch.setattr(MLXTrainer, "_build_optimizer", build_spy)
+    model, tokenizer = FastMLXModel.from_pretrained(
+        str(_tiny_base(tmp_path / "base")), load_in_4bit=False, max_seq_length=64,
+        full_finetuning=True,
+    )
+    MLXTrainer(model=model, tokenizer=tokenizer, train_dataset=_dataset(8), args=MLXTrainingConfig(
+        per_device_train_batch_size=2, gradient_accumulation_steps=2, max_steps=2,
+        output_dir=str(tmp_path / "out"), report_to="none",
+    )).train()
+    # Optimizer state is created before, not inside, the first compiled step.
+    assert in_trace == [False] and unallocated == [0]
+    assert {prefix for _, prefix, _ in calls} == {"model.layers."}
+    # Accumulation substeps schedule the accumulated gradient, update steps the parameters.
+    assert [is_params for _, _, is_params in calls] == [False, True, False, True]
+    trainable = {name for name, _ in tree_flatten(model.trainable_parameters())}
+    for tree, _, _ in calls:
+        assert {name for name, _ in tree_flatten(tree)} == trainable
+
+
+@metal_only
 def test_trainer_compiled_step_uses_lora_head_cce(monkeypatch, tmp_path):
     calls = []
     factory = mlx_utils._make_text_lora_cce_loss_fn
@@ -1533,6 +1696,22 @@ def test_preference_cce_scores_hidden_states_like_the_logits(monkeypatch, head, 
             assert mx.allclose(want, got, atol=2e-5, rtol=rtol).item()
         if reference:
             assert adapter.scale == 2.0
+
+
+@metal_only
+@pytest.mark.parametrize("frozen", [False, True])
+def test_preference_cce_declares_a_frozen_head(monkeypatch, frozen):
+    """A trainable-declared head may compute its weight gradient despite stop_gradient."""
+    from unsloth_zoo.mlx import preference as p, utils
+
+    model = _cce_text_model(2053, 64, quantized=False)
+    if frozen:
+        model.freeze()
+        model.model.unfreeze()
+    seen, build = [], utils._get_runtime_cce
+    monkeypatch.setattr(utils, "_get_runtime_cce", lambda **kw: seen.append(kw) or build(**kw))
+    assert p._make_preference_cce_scorer(model) is not None
+    assert [kw["weight_is_frozen"] for kw in seen] == [frozen]
 
 
 @metal_only

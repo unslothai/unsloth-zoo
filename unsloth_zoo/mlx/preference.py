@@ -1572,9 +1572,10 @@ def _make_preference_cce_scorer(model):
         quantization = dict(group_size=getattr(desc.module, "group_size", 64),
                             bits=getattr(desc.module, "bits", 4),
                             mode=getattr(desc.module, "mode", "affine"))
-    kernel = utils._get_runtime_cce(ignore_index=-100, logit_softcap=softcap,
-                                    quantized=desc.quantized, **quantization)
     frozen = not utils._is_lm_head_trainable(model)
+    kernel = utils._get_runtime_cce(ignore_index=-100, logit_softcap=softcap,
+                                    quantized=desc.quantized, weight_is_frozen=frozen,
+                                    **quantization)
 
     def score(model, batch, supervised, indices=None, *, every_position=False):
         """Token cross entropy and logit sums per position, as float32 grids.
