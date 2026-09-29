@@ -2035,11 +2035,15 @@ def test_grpo_trains_on_real_rollouts(tmp_path, compiled):
     from unsloth_zoo.mlx.trainer import MLXGRPOConfig, MLXGRPOTrainer
     from unsloth_zoo.mlx.utils import iter_mlx_lora_modules
 
-    seen = []
+    seen, scores = [], []
 
     def digits(completions, answer, completion_ids, **kwargs):
         seen.append(completion_ids)
-        return [float(str(a) in text) + 0.01 * len(text) for text, a in zip(completions, answer)]
+        # Distinct completions score apart, so every group carries an advantage.
+        values = [float(str(a) in text) + (sum(ids) % 97) / 97 for text, a, ids
+                  in zip(completions, answer, completion_ids)]
+        scores.append(values)
+        return values
 
     model, tokenizer = FastMLXModel.from_pretrained(MODEL, max_seq_length=256)
     model = FastMLXModel.get_peft_model(model, r=8, lora_alpha=16, lora_dropout=0)
@@ -2052,7 +2056,8 @@ def test_grpo_trains_on_real_rollouts(tmp_path, compiled):
         model, tokenizer, rows, digits,
         args=MLXGRPOConfig(
             per_device_train_batch_size=4, num_generations=4, gradient_accumulation_steps=2,
-            max_steps=2, learning_rate=1e-4, logging_steps=1, max_completion_length=16,
+            max_steps=2, warmup_steps=0, learning_rate=1e-3, logging_steps=1,
+            max_completion_length=16,
             output_dir=str(tmp_path), report_to="none", max_seq_length=256, seed=3407,
             beta=0.04, compile=compiled,
         ),
@@ -2061,13 +2066,15 @@ def test_grpo_trains_on_real_rollouts(tmp_path, compiled):
 
     assert result["train_steps"] == 2
     assert len(seen) == 4 and all(len(ids) == 4 for ids in seen)
+    assert any(len(set(group)) > 1 for group in scores), scores
     logged = [entry for entry in trainer.state.log_history if "loss" in entry]
     assert len(logged) == 2
     for entry in logged:
         assert math.isfinite(entry["loss"]) and entry["kl"] >= 0
         assert 0 < entry["completions/mean_length"] <= 16
     after = dict(tree_flatten(model.trainable_parameters()))
-    assert any(not mx.array_equal(before[k], after[k]).item() for k in before)
+    moved = [k for k in before if not mx.array_equal(before[k], after[k]).item()]
+    assert moved, f"no trainable tensor moved; rewards {scores}"
     assert all(module.scale != 0.0 for _, module in iter_mlx_lora_modules(model))
 
 

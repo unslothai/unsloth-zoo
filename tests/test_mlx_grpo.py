@@ -25,6 +25,9 @@ import types
 import numpy as np
 import pytest
 
+# The MLX simulation runs on torch; hosts with real MLX and no torch cannot build it.
+pytest.importorskip("torch")
+
 
 @pytest.fixture(autouse=True, scope="module")
 def _install_shim():
