@@ -1529,9 +1529,8 @@ def make_runtime_cce_loss_fused_finalize(
         logits_dtype = mx.result_type(hidden_compute, weight_compute)
         d_logits_bytes = (4 if dlogits_kernel is not None and logits_dtype == mx.bfloat16
                           else logits_dtype.size)
-        # The weight gradient is consumed last (tied embedding add, optimizer update), so its
-        # GEMM would keep every chunk's d_logits alive through the backward. Ordering it per
-        # chunk holds the weight gradient instead; do that when it is the smaller of the two.
+        # The weight gradient is consumed last, so its GEMM would hold every chunk's d_logits;
+        # run it per chunk when those outweigh the weight gradient it then holds instead.
         order_weight_gradient = (not weight_is_frozen and hidden_compute.shape[0] * d_logits_bytes
                                  > hidden_compute.shape[1] * weight.dtype.size)
 

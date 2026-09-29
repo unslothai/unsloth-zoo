@@ -742,8 +742,7 @@ def test_trainable_head_does_not_hold_d_logits_until_the_weight_gradient():
             h = w[ids]
             return cce(h * mx.sigmoid(h), mx.stop_gradient(w) if frozen else w, targets).mean()
 
-        # Compiled, as the trainer steps: eager peaks this small are set by in-flight
-        # command buffers and vary with the GPU's buffer limits.
+        # Compiled, as the trainer steps: eager peaks this small track in-flight command buffers.
         run = mx.compile(mx.value_and_grad(loss))
         for _ in range(2):
             mx.synchronize()
@@ -755,9 +754,7 @@ def test_trainable_head_does_not_hold_d_logits_until_the_weight_gradient():
             peaks[frozen] = mx.get_peak_memory() - resident
         grads[frozen] = result[1]
         del result
-    # The frozen run's gradient is the embedding path alone; the head adds to it.
     assert not mx.array_equal(grads[False], grads[True]).item()
-    # Every chunk's float32 d_logits together would be tokens x vocab x 4 bytes.
     overhead = peaks[False] - peaks[True]
     assert overhead < tokens * vocab * 4 // 2, f"trainable head added {overhead / 2**20:.0f} MiB"
 
