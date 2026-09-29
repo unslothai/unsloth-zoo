@@ -172,7 +172,6 @@ def test_distributed_vlm_signature_drift_still_reported(monkeypatch):
 
 
 def test_non_config_init_type_error_keeps_its_traceback():
-    # A processor / model constructor missing an argument is not a config.json problem.
     from unsloth_zoo.mlx.loader import _raise_if_incomplete_mlx_config
 
     for message in (
@@ -186,7 +185,6 @@ def test_non_config_init_type_error_keeps_its_traceback():
 
 
 def test_bare_init_form_needs_a_from_dict_frame():
-    # Python 3.9 drops the class name; only a TypeError raised in from_dict is a config gap.
     from unsloth_zoo.mlx.loader import _raise_if_incomplete_mlx_config
 
     message = "__init__() missing 1 required positional argument: 'text_config'"
