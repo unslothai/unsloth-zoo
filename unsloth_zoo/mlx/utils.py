@@ -19049,11 +19049,9 @@ _GGUF_QUANT_ALIASES = {
 
 
 def _normalize_gguf_quantization_methods(quantization_method):
-    """(ordered unique llama.cpp types, whether a list/tuple was passed); CUDA accepts both forms.
+    """(ordered unique lower-case llama.cpp types, whether a list/tuple was passed).
 
-    Names are folded to lower case because outputs are `{base}.{TYPE}.gguf`: "BF16" and "bf16" are
-    one file, and unfolded they quantized that file onto itself and then deleted it.
-    """
+    Folded because outputs are `{base}.{TYPE}.gguf`: "BF16" and "bf16" are one file."""
     is_list = isinstance(quantization_method, (list, tuple))
     methods = list(quantization_method) if is_list else [quantization_method]
     if not methods:
@@ -19165,21 +19163,18 @@ def save_pretrained_gguf(
         if len(quant_types) == 1 and quant_types[0] in _GGUF_FULL_PRECISION_TYPES:
             first_conversion = quant_types[0]
         elif "f32" in quant_types:
-            # bf16 and f16 are exact in f32; a bf16 intermediate would make F32.gguf rounded data.
-            # f16 is not promoted: it would clip a bf16 checkpoint's range.
+            # bf16/f16 are exact in f32; f16 is never promoted (it clips bf16's range).
             first_conversion = "f32"
         else:
             first_conversion = "bf16"
 
-    # A scalar full-precision request is served by the conversion alone (the pre-list contract);
-    # otherwise, as on CUDA, every target other than the intermediate gets a llama-quantize pass.
+    # A scalar full-precision request keeps the pre-list contract (no quantize pass).
     if not is_list and quant_types[0] in _GGUF_FULL_PRECISION_TYPES:
         to_quantize = []
     else:
         to_quantize = [q for q in quant_types if q != first_conversion]
 
-    # Without llama-quantize an imatrix has nothing to weight, so drop it rather than resolve an
-    # unusable one.
+    # No real quant pass means nothing for an imatrix to weight: drop it rather than resolve it.
     if imatrix_file and not any(q not in _GGUF_FULL_PRECISION_TYPES for q in to_quantize):
         warnings.warn(
             f"Unsloth: ignoring imatrix_file -- '{', '.join(quant_types)}' is written without "

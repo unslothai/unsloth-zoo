@@ -1064,8 +1064,6 @@ def _gguf_export_scaffold(
         return [str(p) for p in produced], bool(mmproj)
 
     def fake_quantize_gguf(**kwargs):
-        # "quantize_kwargs" keeps the last call (pre-existing single-quant
-        # assertions); "quantize_calls" accumulates for multi-quant exports.
         calls["quantize_kwargs"] = kwargs
         calls.setdefault("quantize_calls", []).append(kwargs)
         # llama-quantize reads shard 1 and then every sibling its split.count names,
@@ -1291,7 +1289,7 @@ def test_gguf_keeps_the_intermediates_when_quantization_fails(monkeypatch, tmp_p
     ]
 
 
-# --- Group 11b: multi-quant export (CUDA parity, unsloth/save.py:1323) ---
+# --- Group 11b: multi-quant export (list form, CUDA parity) ---
 
 
 def _export(mutils, out, quantization_method, **kwargs):
@@ -1384,7 +1382,6 @@ def test_gguf_explicit_first_conversion_still_honored_for_a_list(monkeypatch, tm
 def test_gguf_list_produces_full_precision_targets_that_are_not_the_intermediate(
     monkeypatch, tmp_path
 ):
-    """llama-quantize emits f16 too; only the intermediate itself is free."""
     mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
     out = tmp_path / "out"
     _export(mutils, out, ["f16", "q4_k_m"])
@@ -1413,9 +1410,6 @@ def test_gguf_keeps_intermediate_when_nothing_was_quantized(monkeypatch, tmp_pat
 
     assert "quantize_calls" not in calls
     assert (out / "EdgeModel.F16.gguf").exists()
-
-
-# --- Group 11c: quant-name folding (outputs are {base}.{TYPE}.gguf) ---
 
 
 def test_gguf_case_variant_target_is_the_same_artifact(monkeypatch, tmp_path):
@@ -1471,11 +1465,7 @@ def test_gguf_rejects_non_string_first_conversion_before_the_merge(
     assert "convert_count" not in calls
 
 
-# --- Group 11d: singleton list vs scalar ---
-
-
 def test_gguf_singleton_list_full_precision_is_still_emitted(monkeypatch, tmp_path):
-    """CUDA (unsloth/save.py) quantizes every listed type but the intermediate."""
     mutils, calls = _gguf_export_scaffold(monkeypatch, tmp_path)
     out = tmp_path / "out"
     _export(mutils, out, ["f16"], first_conversion="bf16")
@@ -1493,9 +1483,6 @@ def test_gguf_scalar_full_precision_keeps_its_pre_pr_behaviour(monkeypatch, tmp_
 
     assert "quantize_calls" not in calls
     assert (out / "EdgeModel.BF16.gguf").exists()
-
-
-# --- Group 11e: f32 intermediate ---
 
 
 def test_gguf_f32_request_converts_directly_to_f32(monkeypatch, tmp_path):
