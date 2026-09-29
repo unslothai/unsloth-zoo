@@ -524,3 +524,35 @@ def test_softcapped_heads_keep_the_dense_path_away_from_temperature_one(monkeypa
     monkeypatch.setattr(grpo, "_make_preference_cce_scorer", lambda model: fake)
     assert grpo.make_grpo_scorer(object(), 0.7) is None
     assert grpo.make_grpo_scorer(object(), 1.0) is fake
+
+
+def test_a_micro_batch_with_every_completion_masked_is_a_zero_step(tmp_path, monkeypatch):
+    from unsloth_zoo.mlx import grpo
+
+    monkeypatch.setattr(grpo, "generate_batch", FakeGenerator(script=[([9, 10, 11, 12], "length")]))
+    trainer = _trainer(tmp_path, mask_truncated_completions=True)
+    _stub_optimizer(trainer, monkeypatch)
+    assert trainer.train()["train_steps"] == 2
+
+
+@pytest.mark.parametrize("state,beta", [
+    ({"global_step": 1}, 0.0),
+    ({"global_step": 1, "preference_reference": {"kind": "reference_free"}}, 0.0),
+    ({"global_step": 1, "preference_reference": {"kind": "grpo_no_reference", "objective": "grpo"}}, 0.1),
+])
+def test_resume_needs_a_grpo_checkpoint_with_the_same_reference_mode(tmp_path, monkeypatch, state, beta):
+    import json
+
+    checkpoint = tmp_path / "checkpoint-1"
+    checkpoint.mkdir()
+    (checkpoint / "adapters.safetensors").touch()
+    (checkpoint / "optimizer_state.safetensors").touch()
+    (checkpoint / "trainer_state.json").write_text(json.dumps(state))
+    model = _tiny_model(lora=True)
+    loaded = []
+    model.load_weights = lambda *args, **kwargs: loaded.append(args)
+    trainer = _trainer(tmp_path, model=model, beta=beta)
+    _stub_optimizer(trainer, monkeypatch)
+    with pytest.raises(ValueError, match="GRPO run"):
+        trainer.train(resume_from_checkpoint=str(checkpoint))
+    assert loaded == []

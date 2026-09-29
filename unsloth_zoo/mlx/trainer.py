@@ -5717,10 +5717,19 @@ class MLXTrainer:
                     _dpo_reference = self._build_dpo_reference(
                         model, resume_provenance=resume_provenance,
                     )
-                if rl_kind and args.beta:
-                    _dpo_reference = self._build_grpo_reference(
-                        model, resume_provenance=ts.get("preference_reference"),
-                    )
+                if rl_kind:
+                    resume_provenance = dict(ts.get("preference_reference") or {})
+                    if resume_provenance.pop("objective", None) != "grpo" or (
+                        (resume_provenance == {"kind": "grpo_no_reference"}) == bool(args.beta)
+                    ):
+                        raise ValueError(
+                            "Unsloth MLX GRPO: resume requires a checkpoint from a GRPO run "
+                            "with the same beta (zero or nonzero)."
+                        )
+                    if args.beta:
+                        _dpo_reference = self._build_grpo_reference(
+                            model, resume_provenance=resume_provenance,
+                        )
 
                 # 1. Load trained adapter weights into the model. The model
                 #    already has LoRA wrappers applied (Unsloth pipeline does
@@ -5883,7 +5892,7 @@ class MLXTrainer:
                     _dpo_reference = self._build_grpo_reference(model, resume_provenance=None)
                 reference_policy, provenance = _dpo_reference
                 _sampling_reference = reference_policy
-            self._preference_reference_provenance = provenance
+            self._preference_reference_provenance = dict(provenance, objective="grpo")
             epsilon_high = args.epsilon if args.epsilon_high is None else args.epsilon_high
             loss_fn = make_grpo_loss_fn(
                 beta=float(args.beta), epsilon_low=float(args.epsilon),
@@ -8117,7 +8126,10 @@ class MLXTrainer:
             mx.eval(*eval_targets)
             global_toks = self._distributed_all_sum(supervised_toks, stream=mx.cpu)
             mx.eval(global_toks)
-            if int(global_toks.item()) == 0:
+            # A GRPO micro-batch whose completions were all masked is a zero step, as in TRL.
+            if int(global_toks.item()) == 0 and not getattr(
+                loss_fn, "_unsloth_allows_empty_batches", False,
+            ):
                 raise ValueError(
                     "Unsloth MLX: a training batch produced zero supervised "
                     "tokens after masking/truncation. Increase max_seq_length, "

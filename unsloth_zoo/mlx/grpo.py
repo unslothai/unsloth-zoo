@@ -108,6 +108,7 @@ def make_grpo_loss_fn(
     loss_fn._unsloth_preference_denominators = denominators
     loss_fn._unsloth_preference_stats_width = len(names) + (2 if beta else 1)
     loss_fn._unsloth_supervised_tokens = _supervised_tokens
+    loss_fn._unsloth_allows_empty_batches = True
     loss_fn._unsloth_cce_compaction = scorer is not None and scorer.compaction
     if scorer is not None:
         loss_fn._unsloth_cce_backend = "runtime-cce"
