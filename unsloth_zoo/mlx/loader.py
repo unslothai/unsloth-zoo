@@ -21,6 +21,7 @@ No GPU deps: uses mlx-lm (text) and mlx-vlm (VLM) instead of unsloth.models
 """
 
 import ast
+import atexit
 import copy
 import gc
 import hashlib
@@ -5790,8 +5791,12 @@ def _materialize_dequantized_hf_checkpoint(local_path, config_data, method, quan
         # assumes via (stored + 1) & 0xF. Dequantizing a v2 checkpoint with the v1
         # convention would be off by one quant level on every zero-point (silent
         # garbage), so reject it clearly rather than mis-decode.
-        _ckpt_fmt = str(quant_config.get("checkpoint_format", "") or "").lower()
-        if _ckpt_fmt in ("gptq_v2", "gptqv2"):
+        # GPTQModel writes the packing under "format" as well as the older "checkpoint_format".
+        _ckpt_fmts = {
+            str(quant_config.get(_key, "") or "").lower()
+            for _key in ("checkpoint_format", "format")
+        }
+        if _ckpt_fmts & {"gptq_v2", "gptqv2"}:
             raise NotImplementedError(
                 "Unsloth: GPTQ v2 checkpoints (checkpoint_format='gptq_v2') use a "
                 "different zero-point convention than AutoGPTQ v1 and are not yet "
@@ -8977,6 +8982,8 @@ class FastMLXModel:
                 local_path = dequant_dir
                 model_name = dequant_dir
                 dequant_temp_dir = dequant_dir
+                # The success path removes it after materializing; this covers a failed load.
+                atexit.register(shutil.rmtree, dequant_dir, True)
             else:
                 # mlx-lm >= 0.30.4 loads this standard AWQ (GEMM) checkpoint
                 # natively; defer to it (no pre-dequantization).
@@ -9889,7 +9896,6 @@ class FastMLXModel:
                 # The dequantized weights are now materialized in memory; the
                 # temporary fp16 checkpoint on disk is no longer referenced.
                 import mlx.core as mx
-                import shutil
 
                 mx.eval(model.parameters())
                 shutil.rmtree(dequant_temp_dir, ignore_errors=True)

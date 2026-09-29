@@ -711,3 +711,74 @@ def test_gptq_v2_checkpoint_rejected():
             "/nonexistent", {}, "gptq",
             {"bits": 4, "group_size": 128, "checkpoint_format": "gptq_v2"},
         )
+
+
+@pytest.mark.parametrize("key", ["checkpoint_format", "format"])
+def test_gptq_v2_checkpoint_rejected_under_either_key(key):
+    import unsloth_zoo.mlx.loader as ml
+    with pytest.raises(NotImplementedError, match="v2"):
+        ml._materialize_dequantized_hf_checkpoint(
+            "/nonexistent", {}, "gptq", {"bits": 4, "group_size": 128, key: "gptq_v2"},
+        )
+
+
+def test_bnb_prequant_load_still_cleans_its_scratch_dir(monkeypatch, tmp_path):
+    # A function-local `import shutil` in from_pretrained made the bnb path's
+    # `finally: shutil.rmtree(...)` raise UnboundLocalError on every bnb load.
+    import mlx_lm.utils as mlx_lm_utils
+    import unsloth_zoo.mlx.loader as loader
+    from unsloth_zoo.mlx.loader import FastMLXModel
+
+    repo = tmp_path / "bnb"
+    repo.mkdir()
+    (repo / "config.json").write_text(json.dumps({
+        "model_type": "llama",
+        "architectures": ["LlamaForCausalLM"],
+        "quantization_config": {"quant_method": "bitsandbytes", "load_in_4bit": True},
+    }))
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(mlx_lm_utils, "_download", lambda *a, **k: str(repo))
+    monkeypatch.setattr(loader, "_dequantize_bnb_to_tempdir", lambda *a, **k: str(scratch))
+
+    class _Model:
+        pass
+
+    original = FastMLXModel.from_pretrained
+    monkeypatch.setattr(
+        FastMLXModel, "from_pretrained",
+        staticmethod(lambda name, **k: (_Model(), object()) if name == str(scratch) else original(name, **k)),
+    )
+    model, _ = FastMLXModel.from_pretrained(str(repo), text_only=True)
+    assert model._src_path == str(repo)
+    assert not scratch.exists()
+
+
+def test_failed_gptq_load_schedules_scratch_cleanup(monkeypatch, tmp_path):
+    import atexit
+    import mlx_lm
+    import mlx_lm.utils as mlx_lm_utils
+    import unsloth_zoo.mlx.loader as loader
+    from unsloth_zoo.mlx.loader import FastMLXModel
+
+    repo = _write_repo(str(tmp_path / "gptq"))
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(mlx_lm_utils, "_download", lambda *a, **k: repo)
+    monkeypatch.setattr(
+        loader, "_materialize_dequantized_hf_checkpoint",
+        lambda *a, **k: (str(scratch), {"model_type": "llama"}),
+    )
+
+    def _boom(*a, **k):
+        raise RuntimeError("load failed")
+
+    monkeypatch.setattr(mlx_lm, "load", _boom)
+    registered = []
+    monkeypatch.setattr(atexit, "register", lambda fn, *a: registered.append((fn, a)))
+    with pytest.raises(Exception):
+        FastMLXModel.from_pretrained(repo, text_only=True)
+    assert any(a and a[0] == str(scratch) for _, a in registered)
+    for fn, a in registered:
+        fn(*a)
+    assert not scratch.exists()
