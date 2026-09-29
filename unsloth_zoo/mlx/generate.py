@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import copy
 import functools
 import importlib
 import inspect
@@ -2138,6 +2139,7 @@ class _RowPrefill:
     prefix: int
     checkpoint: Callable[[int, list], None]
     lengths: frozenset[int]
+    quantize: Callable[[list], None] | None = None
 
 
 def _row_prefill_batch_class(base):
@@ -2166,6 +2168,8 @@ def _row_prefill_batch_class(base):
             processed = super().prompt_step()
             row = self._unsloth_row
             if processed and row is not None:
+                if row.quantize is not None:
+                    row.quantize(self.prompt_cache)
                 self._unsloth_done += processed
                 if self._unsloth_done in row.lengths:
                     row.checkpoint(self._unsloth_done, self.prompt_cache)
@@ -2173,7 +2177,10 @@ def _row_prefill_batch_class(base):
 
         def generate(self, *args, **kwargs):
             batch = super().generate(*args, **kwargs)
-            if self._unsloth_row is not None:
+            row = self._unsloth_row
+            if row is not None:
+                if row.quantize is not None:
+                    row.quantize(batch.prompt_cache)
                 batch.prompt_cache = [_batch_row_entry(entry) for entry in batch.prompt_cache]
             return batch
 
@@ -2188,10 +2195,39 @@ def _quantized_cache_type():
     return QuantizedKVCache
 
 
+def _quantized_cache_types() -> tuple:
+    try:
+        from mlx_vlm.turboquant import TurboQuantKVCache
+    except ImportError:
+        return (_quantized_cache_type(),)
+    return (_quantized_cache_type(), TurboQuantKVCache)
+
+
+def _row_quantizer(batch_module, options: dict):
+    """How mlx-vlm's single-request decode quantizes a cache after each forward, or None."""
+    if options.get("kv_bits") is None:
+        return None
+    params = inspect.signature(batch_module.BatchGenerator.__init__).parameters
+    defaults = {
+        name: params[name].default
+        for name in ("kv_group_size", "quantized_kv_start")
+        if name in params and params[name].default is not inspect.Parameter.empty
+    }
+    return functools.partial(batch_module.maybe_quantize_kv_cache, **{**defaults, **options})
+
+
+def _decode_layout(cache: list, quantize) -> tuple | None:
+    """A row's layout as it decodes: its cache as the first forward's quantization leaves it."""
+    if quantize is not None:
+        cache = [copy.copy(entry) for entry in cache]
+        quantize(cache)
+    return _cache_layout(cache)
+
+
 def _batch_row_entry(entry):
     """A row's quantized entry as the one-row batch cache decode extends, since mlx-vlm
-    merges its other per-row entries itself but has no merge for this one."""
-    if not isinstance(entry, _quantized_cache_type()):
+    merges its other per-row entries itself but has no merge for these."""
+    if not isinstance(entry, _quantized_cache_types()):
         return entry
     merged = entry.prefix_cache_merge([entry], [entry.offset])
     if merged is None:
@@ -2278,9 +2314,8 @@ def _cache_layout(entries) -> tuple | None:
             type(entry),
             getattr(entry, "max_size", None),
             getattr(entry, "keep", None),
-            # A quantized cache packs its state by these; rows merge into one packing.
-            getattr(entry, "bits", None),
-            getattr(entry, "group_size", None),
+            # Batch extends keep the receiving row's codec, so rows must share it.
+            *(getattr(entry, name, None) for name in ("bits", "group_size", "key_bits", "value_bits", "seed")),
             _cache_layout(nested) if isinstance(nested, (list, tuple)) else None,
         ))
     return tuple(layout)
@@ -2936,7 +2971,7 @@ class _VLMBatchSession:
             raise BatchRowRefused(str(refusal)) from refusal
         token_ids = input_ids.tolist()
         prefill, row_ids, row_kwargs = self._resume(request, token_ids[0], prompt_kwargs)
-        layout = None if prefill is None else _cache_layout(prefill.cache)
+        layout = None if prefill is None else _decode_layout(prefill.cache, prefill.quantize)
         if self._pending and layout != self._cache_layout:
             raise BatchRowRefused(
                 "This request's prompt cache is laid out unlike the caches of the rows "
@@ -3014,7 +3049,10 @@ class _VLMBatchSession:
             )
         cache, lengths = state.open(list(token_ids))
         cache = list(cache)
-        quantized = any(isinstance(entry, _quantized_cache_type()) for entry in cache)
+        batch_module = self.adapter.batch_module
+        options = _batch_kv_quant_options(self.adapter.defaults)
+        quantized = options.get("kv_bits") is not None or any(
+            isinstance(entry, _quantized_cache_type()) for entry in cache)
         if quantized and (reason := row_quantized_prompt_cache_unavailable_reason()) is not None:
             raise BatchRowRefused(reason)
         prefix = _cache_offset(cache)
@@ -3040,13 +3078,19 @@ class _VLMBatchSession:
                 "This request's prompt cache ends before its media tokens; a resumed "
                 "row prefills text only."
             )
-        batch_module = self.adapter.batch_module
+        quantize = _row_quantizer(batch_module, options)
+        if quantize is not None and quantize.keywords.get("quantized_kv_start"):
+            raise BatchRowRefused(
+                "A row's own prompt cache needs quantized_kv_start=0: a later start converts rows "
+                "at different lengths, so their layouts could not be told apart on admission."
+            )
         _install_row_prefill_batch(batch_module)
         prefill = _RowPrefill(
             cache = cache,
             prefix = prefix,
             checkpoint = state.checkpoint,
             lengths = frozenset(int(length) for length in lengths) if addressed else frozenset(),
+            quantize = quantize,
         )
         if not prefix:
             return prefill, token_ids, prompt_kwargs
