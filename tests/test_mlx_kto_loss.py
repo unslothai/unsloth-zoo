@@ -107,6 +107,9 @@ def test_build_kto_batches_requires_batch_size_two():
         def __call__(self, text, add_special_tokens=False):
             return {"input_ids": [1, 2, 3]}
 
+        def encode(self, text, add_special_tokens=True):
+            return self(text)["input_ids"]
+
     dataset = [{"prompt": "a", "completion": " b", "label": True},
                {"prompt": "c", "completion": " d", "label": False}]
     with pytest.raises(ValueError) as exc:
@@ -140,6 +143,9 @@ def test_kto_string_labels_parsed_not_truthy():
         def __call__(self, text, add_special_tokens=False):
             return {"input_ids": [1, 2, 3]}
 
+        def encode(self, text, add_special_tokens=True):
+            return self(text)["input_ids"]
+
     dataset = [{"prompt": "a", "completion": " b", "label": "false"},
                {"prompt": "c", "completion": " d", "label": "0"}]
     batches = _build_kto_batches(
@@ -154,6 +160,9 @@ def test_kto_tokenize_row_caps_completion_exceeding_max_length():
     class _LenTokenizer:
         def __call__(self, text, add_special_tokens=False):
             return {"input_ids": list(range(len(text.split())))}
+
+        def encode(self, text, add_special_tokens=True):
+            return self(text)["input_ids"]
 
     args = MLXKTOConfig(max_length=8, max_completion_length=None, max_prompt_length=0)
     p, c = _kto_tokenize_row(_LenTokenizer(), "a b c", " ".join(["w"] * 20), args)
@@ -171,6 +180,9 @@ def test_kto_appends_eos_and_preserves_it_under_truncation():
         def __call__(self, text, add_special_tokens=False):
             return {"input_ids": [1 + i for i in range(len(text.split()))]}
 
+        def encode(self, text, add_special_tokens=True):
+            return self(text)["input_ids"]
+
     big = MLXKTOConfig(max_length=1024, max_completion_length=None, max_prompt_length=0)
 
     _, c = _kto_tokenize_row(_Tok(), "q", "a b c", big)
@@ -179,6 +191,9 @@ def test_kto_appends_eos_and_preserves_it_under_truncation():
     class _TokEndsEos(_Tok):
         def __call__(self, text, add_special_tokens=False):
             return {"input_ids": super().__call__(text)["input_ids"] + [EOS]}
+
+        def encode(self, text, add_special_tokens=True):
+            return self(text)["input_ids"]
     _, c = _kto_tokenize_row(_TokEndsEos(), "q", "a b", big)
     assert c[-1] == EOS and c.count(EOS) == 1
 
@@ -204,6 +219,9 @@ def test_kto_rejects_streaming_dataset():
         eos_token_id = 0
         def __call__(self, text, add_special_tokens=False):
             return {"input_ids": [1, 2, 3]}
+
+        def encode(self, text, add_special_tokens=True):
+            return self(text)["input_ids"]
 
     ds = [{"prompt": "a", "completion": " b", "label": True},
           {"prompt": "c", "completion": " d", "label": False}]
@@ -286,3 +304,40 @@ def test_kto_config_inherits_parent_init_not_a_generated_one():
     assert c.beta == 0.1 and c.loss_type == "kto"
     c2 = MLXKTOConfig(beta=0.5, desirable_weight=2.0)
     assert c2.beta == 0.5 and c2.desirable_weight == 2.0
+
+
+class _WordTokenizer:
+    """One id per word; encode() prepends BOS like an HF tokenizer."""
+    BOS, EOS = 7, 99
+    bos_token = "<s>"
+    pad_token_id = 0
+    eos_token_id = EOS
+
+    def __call__(self, text, add_special_tokens=False):
+        return {"input_ids": self.encode(text, add_special_tokens=add_special_tokens)}
+
+    def encode(self, text, add_special_tokens=True):
+        ids = [10 + len(w) for w in text.split()]
+        return [self.BOS] + ids if add_special_tokens else ids
+
+
+def test_kto_tokenize_row_keeps_bos_on_the_prompt():
+    from unsloth_zoo.mlx.trainer import _kto_tokenize_row, MLXKTOConfig
+
+    tok = _WordTokenizer()
+    p, c = _kto_tokenize_row(tok, "Question: two?", " four", MLXKTOConfig())
+    assert p[0] == tok.BOS and tok.BOS not in c
+    assert c == [14, tok.EOS]
+
+
+def test_kto_kl_rows_refit_prompt_to_max_length():
+    from unsloth_zoo.mlx.trainer import _build_kto_batches, MLXKTOConfig
+
+    rows = [
+        {"prompt": "x " * 20, "completion": " y", "label": True},
+        {"prompt": "q", "completion": " z" * 20, "label": False},
+    ]
+    args = MLXKTOConfig(per_device_train_batch_size=2, max_length=24, max_prompt_length=0)
+    batch = _build_kto_batches(rows, _WordTokenizer(), args)[0]
+    assert batch["comp_ids"].shape[1] <= 24
+    assert batch["kl_ids"].shape[1] <= 24

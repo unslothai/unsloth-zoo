@@ -594,6 +594,7 @@ from .utils import (
     _is_base_tensor_inside_lora_module,
     apply_gradient_checkpointing,
     remove_gradient_checkpointing,
+    _tokenize_mlx_prompt_completion_row,
     _is_vlm_model,
     _mlx_norm_path_part_is_norm,
     iter_mlx_norm_output_cast_classes,
@@ -9851,16 +9852,30 @@ def _kto_pad(seqs, fill):
     return mx.array([list(s) + [fill] * (length - len(s)) for s in seqs])
 
 
+def _kto_fit_prompt(prompt_ids, completion_ids, max_length):
+    if max_length and max_length > 0 and len(prompt_ids) + len(completion_ids) > max_length:
+        keep = max_length - len(completion_ids)
+        return prompt_ids[-keep:] if keep > 0 else []
+    return prompt_ids
+
+
 def _kto_tokenize_row(tokenizer, prompt, completion, args):
-    p = tokenizer(prompt, add_special_tokens=False)["input_ids"]
-    c = tokenizer(completion, add_special_tokens=False)["input_ids"]
-    # TRL add_eos_token_if_needed: add_special_tokens=False never adds EOS.
+    # Joint encode like SFT: BOS, chat templates for conversational rows, EOS policy.
+    encoded = _tokenize_mlx_prompt_completion_row(
+        tokenizer,
+        {"prompt": prompt, "completion": completion},
+        append_eos=bool(getattr(args, "append_eos", True)),
+    )
+    if encoded is None:
+        raise ValueError(
+            "Unsloth: KTO rows need a text or conversational 'prompt' and 'completion'."
+        )
+    input_ids, labels = encoded
+    split = next((i for i, lab in enumerate(labels) if lab != -100), len(labels))
+    p, c = list(input_ids[:split]), list(input_ids[split:])
     _eos = getattr(tokenizer, "eos_token_id", None)
     _want_eos = bool(getattr(args, "append_eos", True)) and _eos is not None
     _has_eos = bool(c) and c[-1] == _eos
-    if _want_eos and not _has_eos:
-        c = list(c) + [_eos]
-        _has_eos = True
 
     def _cap_completion(seq, limit):
         # Deliberately unlike TRL (which drops EOS on over-length): keep the trailing EOS.
@@ -9875,14 +9890,9 @@ def _kto_tokenize_row(tokenizer, prompt, completion, args):
         c = _cap_completion(c, max_completion)
     if args.max_prompt_length and args.max_prompt_length > 0:
         p = p[-args.max_prompt_length:]
-    if args.max_length and args.max_length > 0 and len(p) + len(c) > args.max_length:
-        keep = args.max_length - len(c)
-        if keep > 0:
-            p = p[-keep:]
-        else:
-            p = []
-            c = _cap_completion(c, args.max_length)
-    return p, c
+    if args.max_length and args.max_length > 0 and len(c) >= args.max_length:
+        c = _cap_completion(c, args.max_length)
+    return _kto_fit_prompt(p, c, args.max_length), c
 
 
 def _kto_parse_label(value):
@@ -9960,11 +9970,13 @@ def _build_kto_batches(dataset, tokenizer, args):
         comps = [c for _, c, _ in chunk]
         labels = [lab for _, _, lab in chunk]
         rolled = [comps[-1]] + comps[:-1]  # TRL _get_kl_dataset roll (+1)
+        # A prompt fitted to its own completion can overflow max_length with another row's.
+        kl_prompts = [_kto_fit_prompt(p, cr, args.max_length) for p, cr in zip(prompts, rolled)]
         batches.append(dict(
             comp_ids=_kto_pad([p + c for p, c in zip(prompts, comps)], pad_id),
             comp_labels=_kto_pad([[-100] * len(p) + list(c) for p, c in zip(prompts, comps)], -100),
-            kl_ids=_kto_pad([p + cr for p, cr in zip(prompts, rolled)], pad_id),
-            kl_labels=_kto_pad([[-100] * len(p) + list(cr) for p, cr in zip(prompts, rolled)], -100),
+            kl_ids=_kto_pad([p + cr for p, cr in zip(kl_prompts, rolled)], pad_id),
+            kl_labels=_kto_pad([[-100] * len(p) + list(cr) for p, cr in zip(kl_prompts, rolled)], -100),
             label=labels,
         ))
     if dropped:
@@ -10127,93 +10139,105 @@ class MLXKTOTrainer(MLXTrainer):
             kl_scalar = _kto_kl_baseline(pol_kl, ref_kl)
             return ref_comp, kl_scalar
 
-        model.train()
-        self._train_loss_history = []
-        self._kl_history = []
-        self._global_step = 0
+        # Same setup and teardown as MLXTrainer.train: Metal memory guard, gradient
+        # checkpointing, and the differentiable MoE / sparse-attention training patches.
+        self._memory_limits_applied = self._configure_memory_limits()
+        if args.gradient_checkpointing:
+            apply_gradient_checkpointing(model)
+        acquire_mlx_training_patches()
+        try:
+            model.train()
+            self._train_loss_history = []
+            self._kl_history = []
+            self._global_step = 0
 
-        step = 0
-        micro = 0
-        acc_grad = None
-        acc_loss = 0.0
-        acc_kl = 0.0
-        acc_n = 0
-        stop = False
-        max_epochs = 1_000_000
-        for _epoch in range(max_epochs):
-            if stop:
-                break
-            for batch in batches:
-                if step >= total_steps or self.stop_requested:
-                    stop = True
+            step = 0
+            micro = 0
+            acc_grad = None
+            acc_loss = 0.0
+            acc_kl = 0.0
+            acc_n = 0
+            stop = False
+            max_epochs = 1_000_000
+            for _epoch in range(max_epochs):
+                if stop:
                     break
-                labels = batch["label"]
-                chosen_idx = [i for i, l in enumerate(labels) if l]
-                rejected_idx = [i for i, l in enumerate(labels) if not l]
+                for batch in batches:
+                    if step >= total_steps or self.stop_requested:
+                        stop = True
+                        break
+                    labels = batch["label"]
+                    chosen_idx = [i for i, l in enumerate(labels) if l]
+                    rejected_idx = [i for i, l in enumerate(labels) if not l]
 
-                ref_comp, kl_scalar = _reference_and_kl(batch)
-                ref_ch = _kto_gather(ref_comp, chosen_idx)
-                ref_rej = _kto_gather(ref_comp, rejected_idx)
-                mx.eval(ref_ch, ref_rej, kl_scalar)
+                    ref_comp, kl_scalar = _reference_and_kl(batch)
+                    ref_ch = _kto_gather(ref_comp, chosen_idx)
+                    ref_rej = _kto_gather(ref_comp, rejected_idx)
+                    mx.eval(ref_ch, ref_rej, kl_scalar)
 
-                def loss_fn(model):
-                    comp_logps = _kto_sum_logp(model(batch["comp_ids"]), batch["comp_labels"])
-                    pol_ch = _kto_gather(comp_logps, chosen_idx)
-                    pol_rej = _kto_gather(comp_logps, rejected_idx)
-                    return _kto_loss(
-                        pol_ch, pol_rej, ref_ch, ref_rej, kl_scalar,
-                        args.beta, args.desirable_weight, args.undesirable_weight,
-                    )
+                    def loss_fn(model):
+                        comp_logps = _kto_sum_logp(model(batch["comp_ids"]), batch["comp_labels"])
+                        pol_ch = _kto_gather(comp_logps, chosen_idx)
+                        pol_rej = _kto_gather(comp_logps, rejected_idx)
+                        return _kto_loss(
+                            pol_ch, pol_rej, ref_ch, ref_rej, kl_scalar,
+                            args.beta, args.desirable_weight, args.undesirable_weight,
+                        )
 
-                loss, grad = nn.value_and_grad(model, loss_fn)(model)
+                    loss, grad = nn.value_and_grad(model, loss_fn)(model)
 
-                # Weight by row count: equal weighting over-weights a smaller trailing batch.
-                n_i = len(labels)
-                contrib = tree_map(lambda g: g * n_i, grad)
-                if acc_grad is None:
-                    acc_grad = contrib
-                else:
-                    acc_grad = tree_map(lambda a, g: a + g, acc_grad, contrib)
-                acc_loss += float(loss) * n_i
-                acc_kl += float(kl_scalar) * n_i
-                acc_n += n_i
-                micro += 1
-                if micro < grad_accum:
-                    mx.eval(acc_grad)
-                    continue
+                    # Weight by row count: equal weighting over-weights a smaller trailing batch.
+                    n_i = len(labels)
+                    contrib = tree_map(lambda g: g * n_i, grad)
+                    if acc_grad is None:
+                        acc_grad = contrib
+                    else:
+                        acc_grad = tree_map(lambda a, g: a + g, acc_grad, contrib)
+                    acc_loss += float(loss) * n_i
+                    acc_kl += float(kl_scalar) * n_i
+                    acc_n += n_i
+                    micro += 1
+                    if micro < grad_accum:
+                        mx.eval(acc_grad)
+                        continue
 
-                grad = tree_map(lambda g: g / acc_n, acc_grad)
-                mean_loss = acc_loss / acc_n
-                mean_kl = acc_kl / acc_n
-                # LR first: _apply_manual_weight_decay reads optimizer.learning_rate.
-                self._set_optimizer_lr_for_step(optimizer, step)
-                if max_grad_norm > 0:
-                    grad, _ = _clip_grad_norm_fp32(grad, max_norm=max_grad_norm)
-                if max_grad_value is not None and max_grad_value > 0:
-                    grad = _clip_grad_by_value(grad, max_grad_value)
-                if max_grad_leaf_norm is not None and max_grad_leaf_norm > 0:
-                    grad = _clip_grad_by_leaf_norm(grad, max_grad_leaf_norm)
-                grad = self._apply_coupled_weight_decay(model, grad)
-                self._apply_manual_weight_decay(model, optimizer, grad)
-                optimizer.update(model, grad)
-                mx.eval(model.parameters(), optimizer.state)
+                    grad = tree_map(lambda g: g / acc_n, acc_grad)
+                    mean_loss = acc_loss / acc_n
+                    mean_kl = acc_kl / acc_n
+                    # LR first: _apply_manual_weight_decay reads optimizer.learning_rate.
+                    self._set_optimizer_lr_for_step(optimizer, step)
+                    if max_grad_norm > 0:
+                        grad, _ = _clip_grad_norm_fp32(grad, max_norm=max_grad_norm)
+                    if max_grad_value is not None and max_grad_value > 0:
+                        grad = _clip_grad_by_value(grad, max_grad_value)
+                    if max_grad_leaf_norm is not None and max_grad_leaf_norm > 0:
+                        grad = _clip_grad_by_leaf_norm(grad, max_grad_leaf_norm)
+                    grad = self._apply_coupled_weight_decay(model, grad)
+                    self._apply_manual_weight_decay(model, optimizer, grad)
+                    optimizer.update(model, grad)
+                    mx.eval(model.parameters(), optimizer.state)
 
-                train_loss = mean_loss
-                self._train_loss_history.append(train_loss)
-                self._kl_history.append(mean_kl)
-                self._global_step = step + 1
-                if args.logging_steps and ((step + 1) % max(int(args.logging_steps), 1) == 0):
-                    print(
-                        f"Unsloth KTO: step {step + 1}/{total_steps} "
-                        f"loss={train_loss:.4f} kl={mean_kl:.4f} "
-                        f"(desirable={len(chosen_idx)} undesirable={len(rejected_idx)})"
-                    )
-                step += 1
-                acc_grad = None
-                acc_loss = 0.0
-                acc_kl = 0.0
-                acc_n = 0
-                micro = 0
+                    train_loss = mean_loss
+                    self._train_loss_history.append(train_loss)
+                    self._kl_history.append(mean_kl)
+                    self._global_step = step + 1
+                    if args.logging_steps and ((step + 1) % max(int(args.logging_steps), 1) == 0):
+                        print(
+                            f"Unsloth KTO: step {step + 1}/{total_steps} "
+                            f"loss={train_loss:.4f} kl={mean_kl:.4f} "
+                            f"(desirable={len(chosen_idx)} undesirable={len(rejected_idx)})"
+                        )
+                    step += 1
+                    acc_grad = None
+                    acc_loss = 0.0
+                    acc_kl = 0.0
+                    acc_n = 0
+                    micro = 0
+        finally:
+            release_mlx_training_patches()
+            if args.gradient_checkpointing:
+                remove_gradient_checkpointing(model)
+            self._restore_memory_limits()
 
         if self.is_main_process:
             try:
