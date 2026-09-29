@@ -38,7 +38,7 @@ CHILD = textwrap.dedent(
 
     rows, head_grad = int(sys.argv[1]), sys.argv[2] == "1"
     vocab, hidden = 1024, 64
-    amp = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    amp = torch.bfloat16 if torch.cuda.is_bf16_supported(including_emulation = False) else torch.float16
     gen = torch.Generator().manual_seed(0)
     lm_head = (torch.randn(vocab, hidden, generator = gen) * 0.05).cuda().requires_grad_(head_grad)
     states = torch.randn(1, rows, hidden, generator = gen).cuda().to(amp).requires_grad_(True)
