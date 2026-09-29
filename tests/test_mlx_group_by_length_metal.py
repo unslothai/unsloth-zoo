@@ -42,8 +42,9 @@ class _TinyTokenizer:
 
 
 def _varied_dataset(n=24):
+    # Leading token is unique per row so equal-length rows stay distinguishable.
     return [
-        {"text": " ".join(str(10 + j) for j in range((i % 6) + 2))}
+        {"text": " ".join([str(1000 + i)] + [str(10 + j) for j in range((i % 6) + 1)])}
         for i in range(n)
     ]
 
@@ -85,6 +86,7 @@ def test_plan_is_deterministic_for_a_seed():
 
 
 def test_cuts_padding_versus_torch_randperm():
+    pytest.importorskip("torch")  # the torch_randperm arm requires torch
 
     def padded_cells(order):
         return sum(
