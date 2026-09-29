@@ -120,3 +120,27 @@ def test_logits_match_the_torch_reference(checkpoint):
     got = load_decision_model(folder, dtype = mx.float32).logits(batch)
     np.testing.assert_allclose(got, expected, atol = 2e-5, rtol = 0)
     assert got[1, 2] == -1e4
+
+
+def test_casting_load_leaves_no_source_buffers_cached(checkpoint):
+    folder = checkpoint[1]
+    assert {v.dtype for v in mx.load(str(folder / "model.safetensors")).values()} == {mx.float32}
+    model = load_decision_model(folder, dtype = mx.float16)
+    mx.synchronize()
+    assert mx.get_cache_memory() < (folder / "model.safetensors").stat().st_size // 10
+    del model
+
+
+def test_load_drains_generation_streams_before_clearing_the_cache(checkpoint, monkeypatch):
+    import sys
+    import types
+
+    stream = mx.new_stream(mx.default_device())
+    monkeypatch.setitem(sys.modules, "mlx_lm.generate", types.SimpleNamespace(generation_stream = stream))
+    calls = []
+    synchronize, clear_cache = mx.synchronize, mx.clear_cache
+    monkeypatch.setattr(mx, "synchronize", lambda *a: calls.append(("sync", a)) or synchronize(*a))
+    monkeypatch.setattr(mx, "clear_cache", lambda: calls.append(("clear", ())) or clear_cache())
+    load_decision_model(checkpoint[1])
+    clear = calls.index(("clear", ()))
+    assert ("sync", (stream,)) in calls[:clear] and ("sync", ()) in calls[:clear]
