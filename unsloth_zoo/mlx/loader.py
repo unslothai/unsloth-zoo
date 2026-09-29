@@ -576,6 +576,38 @@ def _message_matches_known_fallback(message, rule):
     return any(all(token in message for token in tokens) for tokens in token_sets)
 
 
+# Only *Args / *Config __init__: load_model signature drift or an nn layer must keep its traceback.
+_MLX_MISSING_ARGS_RE = re.compile(
+    r"(?<![\w.])(?:\w*(?:Args|Config)\.)?__init__\(\) "
+    r"missing \d+ required positional arguments?:(?P<keys>.*)"
+)
+
+
+def _missing_mlx_config_keys(message):
+    """Required ModelArgs fields named by a bare mlx-lm ``__init__`` TypeError, else []."""
+    match = _MLX_MISSING_ARGS_RE.search(message)
+    if match is None:
+        return []
+    return re.findall(r"'([^']+)'", match.group("keys"))
+
+
+def _raise_if_incomplete_mlx_config(model_name, model_type, message, error):
+    """Name the config.json keys a mirrored repo lost (e.g. lfm2's block_ff_dim), not MLX."""
+    keys = _missing_mlx_config_keys(message)
+    if not keys:
+        return
+    listed = ", ".join(repr(key) for key in keys)
+    plural = "keys" if len(keys) > 1 else "key"
+    raise ValueError(
+        f"Unsloth: {model_name}'s config.json is missing the {plural} {listed}, "
+        f"which mlx-lm's '{model_type or 'unknown'}' architecture requires and "
+        f"cannot default. This is an incomplete config.json in the model repo - "
+        f"MLX and Apple Silicon support are not the problem. Compare the config "
+        f"against the upstream repo this model was mirrored from and add the "
+        f"missing {plural}."
+    ) from error
+
+
 def _raise_if_qk_norm_version_gap(model_type, message, error):
     """A strict load rejecting q_norm / k_norm means mlx-lm / mlx-vlm is too old for
     this QK-norm arch; dropping those weights breaks the model, so raise instead."""
@@ -1088,6 +1120,9 @@ def _load_mlx_lm_with_strict_fallback(
             lazy=lazy,
             model_config=model_config,
         )
+    except TypeError as error:
+        _raise_if_incomplete_mlx_config(model_name, model_type, str(error), error)
+        raise
     except ValueError as error:
         message = str(error)
         # Active-layer QK-norm weights are load-bearing: never strict=False past
@@ -1223,12 +1258,16 @@ def _load_mlx_lm_distributed(
             allow_patterns=_mlx_lm_metadata_allow_patterns(),
         )
         with _temporary_mlx_lm_snapshot_view(model_path) as metadata_model_path:
-            model, config = load_model(
-                metadata_model_path,
-                lazy=True,
-                strict=False,
-                model_config=model_config,
-            )
+            try:
+                model, config = load_model(
+                    metadata_model_path,
+                    lazy=True,
+                    strict=False,
+                    model_config=model_config,
+                )
+            except TypeError as error:
+                _raise_if_incomplete_mlx_config(model_name, model_type, str(error), error)
+                raise
 
             mode = _mlx_distributed_sharding_mode(
                 model,
