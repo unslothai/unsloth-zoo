@@ -29,6 +29,7 @@ from typing import Any, Callable, Literal, Sequence
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_flatten
 
 from .generate import BatchRowRefused, SamplingParams
 
@@ -51,6 +52,7 @@ __all__ = [
     "companion_drafter",
     "install_speculative_seam",
     "native_mtp_drafter",
+    "probe_drafter",
     "speculative_unavailable_reason",
 ]
 
@@ -774,6 +776,16 @@ def _features(drafter, out) -> mx.array:
     return out.hidden_states[-1] if features is None else features(out)
 
 
+def probe_drafter(target, drafter, length: int) -> list:
+    """The cache entries one row of ``drafter`` holds after ``length`` prompt tokens, from the features a row
+    starts from; the drafter evaluates nothing, and the target forward is as lazy as the target's own."""
+    from mlx_vlm.models.cache import make_prompt_cache
+
+    lm = getattr(target, "language_model", target)
+    out = lm(mx.zeros((1, length), mx.int32), cache = make_prompt_cache(lm), **_capture(drafter))
+    return drafter.probe(_features(drafter, out))
+
+
 def _language_call(family: str):
     try:
         module = __import__(f"mlx_vlm.models.{family}.language", fromlist = ["LanguageModel"])
@@ -1307,6 +1319,11 @@ class MTPDrafter:
                 row.tokens, row.hidden = [], []
         return sum(lengths)
 
+    def probe(self, hidden: mx.array) -> list:
+        cache, length = self.new_cache(), hidden.shape[1]
+        self._forward(cache, mx.zeros((1, length), mx.int32), hidden, mx.arange(length)[None])
+        return cache
+
     def draft(self, cache: list, rows: Sequence[DraftRow | None], depth: int, target: list) -> mx.array:
         """``[B, depth]`` greedy drafts; rows the head has not caught up get placeholders.
         Appends ``depth - 1`` entries to every row's cache, which ``settle`` trims."""
@@ -1382,6 +1399,9 @@ class AssistantDrafter:
 
     def catch_up(self, cache: list, rows: Sequence[AssistantRow | None]) -> int:
         return 0
+
+    def probe(self, hidden: mx.array) -> list:
+        return []
 
     def _shared_kv(self, target: list) -> tuple[dict, mx.array]:
         from mlx_vlm.models.cache import dynamic_roll
@@ -1480,6 +1500,12 @@ class HeadDrafter:
             replayed += len(tokens)
             row.tokens, row.hidden = [], []
         return replayed
+
+    def probe(self, hidden: mx.array) -> list:
+        head, length = copy.copy(self.model), hidden.shape[1]
+        head.reset(self.target)
+        head.accept_verified_tokens(hidden, mx.zeros((1, length - 1), mx.int32), length - 1, [0], None, greedy = True)
+        return list(head._cache)
 
     def draft(self, cache: list, rows: Sequence[HeadRow | None], depth: int, target: list) -> mx.array:
         return mx.concatenate([self._draft(row, depth) if row is not None else mx.zeros((1, depth), mx.int32) for row in rows])
@@ -1589,6 +1615,12 @@ class ContextDrafter:
     def catch_up(self, cache: list, rows: Sequence[ContextRow | None]) -> int:
         return 0
 
+    def probe(self, hidden: mx.array) -> list:
+        row = ContextRow(self.model.make_cache())
+        row.features = [hidden[0]]
+        self._block(row, 1)
+        return row.cache
+
     def _block(self, row: ContextRow, depth: int) -> mx.array:
         context, row.features = mx.concatenate(row.features)[None], []
         return self._draft(row.pending, context, row.cache, depth + 1, lambda logits: mx.argmax(logits, axis = -1), mx.int32)
@@ -1603,18 +1635,36 @@ class ContextDrafter:
         return [0] * len(rows)
 
 
-def companion_drafter(model_path: str | Path, target: nn.Module, **kwargs) -> ContextDrafter | Eagle3Drafter | AssistantDrafter:
+def _built(wrapper, model: nn.Module, target: nn.Module, **kwargs):
+    # Counted before the wrapper binds the target (a bound DFlash drafter holds its embedding and head); ``lazy``
+    # factories evaluate nothing mlx-vlm's loader leaves lazy (it converts ModelOpt/compressed-tensors exports eagerly).
+    weight_bytes = sum(value.nbytes for _, value in tree_flatten(model.parameters()))
+    drafter = wrapper(model, target, **kwargs)
+    drafter.weight_bytes = weight_bytes
+    return drafter
+
+
+def _dense_table(model: nn.Module) -> nn.Module:
+    # A Gemma assistant's clustered head gathers rows of the embedding table, which a quantized table packs.
+    table = model.model.embed_tokens
+    if model.masked_embedding is not None and isinstance(table, nn.QuantizedEmbedding):
+        model.model.embed_tokens = dense = nn.Embedding(table.num_embeddings, table.dims)
+        dense.weight = mx.dequantize(table.weight, table.scales, table.get("biases"), group_size = table.group_size, bits = table.bits, mode = table.mode)
+    return model
+
+
+def companion_drafter(model_path: str | Path, target: nn.Module, *, lazy: bool = False, **kwargs) -> ContextDrafter | Eagle3Drafter | AssistantDrafter:
     """A drafter from a separate DFlash, DFlash2, DSpark, EAGLE-3 or Gemma 4 assistant checkpoint, checked against ``target``."""
     from mlx_vlm.speculative.drafters import load_drafter, validate_drafter_compatibility
 
-    model, kind = load_drafter(str(model_path))
+    model, kind = load_drafter(str(model_path), lazy = lazy)
     if kind not in ("dflash", "eagle3", "mtp"):
         raise ValueError(f"{kind} companion drafters are not supported")
     validate_drafter_compatibility(target, model, kind)
-    return AssistantDrafter(model, target) if kind == "mtp" else {"dflash": ContextDrafter, "eagle3": Eagle3Drafter}[kind](model, target, **kwargs)
+    return _built(AssistantDrafter, _dense_table(model), target) if kind == "mtp" else _built({"dflash": ContextDrafter, "eagle3": Eagle3Drafter}[kind], model, target, **kwargs)
 
 
-def native_mtp_drafter(model_path: str | Path, target: nn.Module, **kwargs) -> MTPDrafter | HeadDrafter | ContextDrafter | None:
+def native_mtp_drafter(model_path: str | Path, target: nn.Module, *, lazy: bool = False, **kwargs) -> MTPDrafter | HeadDrafter | ContextDrafter | None:
     """A drafter for the target's own MTP head, built in memory from only the ``mtp.*`` tensors of its
     checkpoint as mlx-vlm's MTP splitter would write it; None when no splitter knows the checkpoint."""
     from mlx_vlm.fp8 import transform_fp8_weights
@@ -1659,10 +1709,11 @@ def native_mtp_drafter(model_path: str | Path, target: nn.Module, **kwargs) -> M
             ),
         )
     model.load_weights(list(weights.items()), strict = True)
-    mx.eval(model.parameters())
+    if not lazy:
+        mx.eval(model.parameters())
     from mlx_vlm.speculative.drafters import DRAFTER_KIND_BY_MODEL_TYPE
     from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
 
     if DRAFTER_KIND_BY_MODEL_TYPE.get(splitter.output_model_type) == "dflash":
-        return ContextDrafter(model, target, **kwargs)
-    return (MTPDrafter if type(model) is Qwen3_5MTPDraftModel else HeadDrafter)(model, target, **kwargs)
+        return _built(ContextDrafter, model, target, **kwargs)
+    return _built(MTPDrafter if type(model) is Qwen3_5MTPDraftModel else HeadDrafter, model, target, **kwargs)

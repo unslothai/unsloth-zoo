@@ -57,6 +57,14 @@ def _drafter(model, **kwargs):
     return drafter
 
 
+def _probe_matches_a_started_row(model, drafter, prompt, held):
+    from mlx_vlm.models.cache import make_prompt_cache
+    from unsloth_zoo.mlx.speculative import _capture, _features, probe_drafter
+    hidden = _features(drafter, (lm := getattr(model, "language_model", model))(mx.array([prompt]), cache = make_prompt_cache(lm), **_capture(drafter)))
+    shapes = lambda entries: [(type(entry), getattr(entry, "max_size", None), tuple(a.shape), a.dtype) for entry in entries for a in entry.state if a is not None]
+    return shapes(probe_drafter(model, drafter, len(prompt))) == shapes(held(drafter.start(prompt, hidden, 0))) != []
+
+
 def _prefill(lm, prompt, sampling, processors = (), drafter = None):
     from mlx_vlm.models.cache import make_prompt_cache
     from unsloth_zoo.mlx.speculative import _RowSampler, _capture, _features
@@ -220,6 +228,9 @@ def test_assistant_drafts_from_the_target_kv_alone_and_in_batches(gemma, monkeyp
     drafter.draft([], [drafter.start(ids[0], out.hidden_states[-1], 0)[0]], 3, cache)
     assert [where["position"].tolist() + where["kv_valid_len"].tolist() for _, where in bound] == [[n - 1, n]]
     assert all(mx.array_equal(bound[0][0][kind][0], keys) for kind, (keys, _) in out.shared_kv_states.items())
+    packed = pytest.importorskip("mlx_vlm.speculative.drafters").load_drafter(GEMMA_ASSISTANT)[0]
+    packed.model.embed_tokens = packed.model.embed_tokens.to_quantized(32, 4, mode = "mxfp4")
+    assert type(drafter)(pytest.importorskip("unsloth_zoo.mlx.speculative")._dense_table(packed), model).draft([], [drafter.start(ids[0], out.hidden_states[-1], 0)[0]], 3, cache).shape == (1, 3)
 
     compared, draft = [], drafter.draft
     def against_each_row(cache, rows, depth, target):
@@ -265,6 +276,17 @@ def test_generate_step_decodes_our_drafter_through_the_engine(request, monkeypat
     with pytest.raises(RuntimeError, match = "prepare"):
         generate(draft_model = draft, draft_kind = draft.draft_kind)
 
+@pytest.mark.parametrize("companion", [None, "z-lab/Qwen3.5-4B-DFlash"])
+def test_a_lazy_drafter_weighs_its_checkpoint_and_holds_a_started_row_without_allocating(request, companion):
+    from mlx_vlm.utils import get_model_path, load
+    from unsloth_zoo.mlx import speculative
+    model = request.getfixturevalue("qwen_mtp")[0] if companion is None else load("mlx-community/Qwen3.5-4B-4bit", lazy = True)[0]
+    before, lazy = mx.get_active_memory(), _drafter(model, lazy = True) if companion is None else speculative.companion_drafter(companion, model, lazy = True)
+    grown = speculative.probe_drafter(model, lazy, 40) and mx.get_active_memory() - before  # before any eager build below
+    stored = _drafter(model).weight_bytes if companion is None else sum(a.nbytes for a in mx.load(str(get_model_path(companion) / "model.safetensors")).values())
+    assert grown < lazy.weight_bytes / 100 and lazy.weight_bytes == stored > 0 and (companion or _probe_matches_a_started_row(model, _drafter(model), list(range(1, 41)), lambda started: started[1]))
+
+
 def test_rounds_the_transaction_cannot_record_replay_the_accepted_prefix(qwen, monkeypatch):
     from mlx_vlm.speculative.cache_state import SpeculativeCacheTransaction
     from unsloth_zoo.mlx.generate import SamplingParams
@@ -301,6 +323,7 @@ def test_other_mtp_heads_match_a_head_that_never_drafted_even_in_a_wrapping_wind
     _run(model, [prompt], 96, _script(("draft", 3), ("draft", 3), ("plain", 12), ("copy", 4), ("draft", 2)), SamplingParams(), drafter = drafter)
     assert len(compared) > 6 and all(compared)
     assert max(sum(len(t) for t, _ in chunk) for chunk in chunks[1:]) <= 8  # max_lag - 1 pending plus one 5-token round
+    assert _probe_matches_a_started_row(model, HeadDrafter(head, model), prompt, lambda started: started[0].head._cache)
 
 
 def test_eagle3_narrower_than_its_target_drafts_from_the_concatenated_layers_row_by_row(qwen):
@@ -415,3 +438,4 @@ def test_dflash_family_drafts_from_every_committed_feature_alone_batched_and_thr
             fed += len(context)
             assert pending == sequence[fed] and (context - reference[fed - len(context) : fed]).abs().mean().item() < 0.5
             assert mx.array_equal(got, drafter.model.draft_block(pending, context[None], fresh, got.shape[-1] + 1, lambda logits: mx.argmax(logits, axis = -1)))
+    assert _probe_matches_a_started_row(model, speculative.ContextDrafter(drafter.model, model.language_model, max_lag = 8), ids[0][:40], lambda started: started[0].cache)
