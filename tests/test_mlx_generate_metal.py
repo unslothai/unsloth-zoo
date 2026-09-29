@@ -343,6 +343,51 @@ def test_vlm_stream_rows_resume_from_their_own_cache_bitwise():
 
 
 @metal_only
+def test_vlm_stream_rows_resume_from_their_own_quantized_cache_bitwise(monkeypatch):
+    from mlx_vlm import load
+    from mlx_vlm.models.cache import QuantizedKVCache, make_prompt_cache
+    from mlx_vlm.prompt_utils import apply_chat_template
+    from unsloth_zoo.mlx.generate import BatchRowRefused, BatchStream, GenerationDefaults, GenerationRequest
+    model, processor = load(VLM_MODEL)
+    model._is_vlm_model = True
+    rules = " ".join(f"Rule {i}: answer tersely." for i in range(420))
+    prompt = apply_chat_template(processor, model.config, f"Name a colour. {rules}", num_images=0)
+    fruit = apply_chat_template(processor, model.config, "Name a fruit.", num_images=0)
+    quantized = lambda bits: [e.to_quantized(group_size=64, bits=bits) for e in make_prompt_cache(model.language_model)]
+
+    def run(*requests):
+        defaults = GenerationDefaults(max_tokens=12, prefill_batch_size=1, completion_batch_size=4)
+        with BatchStream(model, processor, defaults=defaults) as stream:
+            rows = [stream.add(request) for request in requests]
+            results = {}
+            while len(results) < len(rows):
+                results.update((e.index, e.result) for e in stream.step() if e.result is not None)
+        return [results[row] for row in rows]
+
+    # mlx-vlm before 0.7 cannot turn a quantized row into a batch cache.
+    mergeable = "prefix_cache_merge" in vars(QuantizedKVCache)
+    with monkeypatch.context() as patch:
+        patch.delattr(QuantizedKVCache, "prefix_cache_merge", raising=False)
+        with pytest.raises(BatchRowRefused, match="cannot batch a row's own quantized cache"):
+            run(GenerationRequest(prompt=fruit, prompt_cache_state=_RowCacheState(quantized(4))))
+    if not mergeable:
+        return
+    cold_state = _RowCacheState(quantized(4), {2048})
+    (cold,) = run(GenerationRequest(prompt=prompt, prompt_cache_state=cold_state))
+    warm_state = _RowCacheState(_own_copy(cold_state.kept[2048]))
+    (warm,) = run(GenerationRequest(prompt=prompt, prompt_cache_state=warm_state))
+    assert (warm.token_ids, warm.logprobs, warm.cached_token_count) == (cold.token_ids, cold.logprobs, 2048)
+    # The short row prefills while the resumed one decodes, so it joins a quantized batch.
+    rows = run(GenerationRequest(prompt=prompt, prompt_cache_state=_RowCacheState(_own_copy(cold_state.kept[2048]))),
+               GenerationRequest(prompt=fruit, prompt_cache_state=_RowCacheState(quantized(4))))
+    assert [row.cached_token_count for row in rows] == [2048, 0]
+    assert all(row.finish_reason in ("stop", "length") for row in rows)
+    with pytest.raises(BatchRowRefused, match="laid out unlike"):
+        run(GenerationRequest(prompt=fruit, prompt_cache_state=_RowCacheState(quantized(4))),
+            GenerationRequest(prompt=fruit, prompt_cache_state=_RowCacheState(quantized(8))))
+
+
+@metal_only
 def test_vlm_stop_strings_cut_generation_through_the_public_path():
     from PIL import Image
     from mlx_vlm import load

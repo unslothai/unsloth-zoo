@@ -2171,9 +2171,32 @@ def _row_prefill_batch_class(base):
                     row.checkpoint(self._unsloth_done, self.prompt_cache)
             return processed
 
+        def generate(self, *args, **kwargs):
+            batch = super().generate(*args, **kwargs)
+            if self._unsloth_row is not None:
+                batch.prompt_cache = [_batch_row_entry(entry) for entry in batch.prompt_cache]
+            return batch
+
     RowPrefillBatch.__name__ = RowPrefillBatch.__qualname__ = f"RowPrefill{base.__name__}"
     RowPrefillBatch._unsloth_row_prefill_base = base
     return RowPrefillBatch
+
+
+def _quantized_cache_type():
+    from mlx_vlm.models.cache import QuantizedKVCache
+
+    return QuantizedKVCache
+
+
+def _batch_row_entry(entry):
+    """A row's quantized entry as the one-row batch cache decode extends, since mlx-vlm
+    merges its other per-row entries itself but has no merge for this one."""
+    if not isinstance(entry, _quantized_cache_type()):
+        return entry
+    merged = entry.prefix_cache_merge([entry], [entry.offset])
+    if merged is None:
+        raise RuntimeError(f"mlx-vlm could not batch a {type(entry).__name__} row.")
+    return merged
 
 
 def _row_prefill_seam():
@@ -2216,6 +2239,17 @@ def row_prompt_cache_unavailable_reason() -> str | None:
         current is not base and getattr(current, "_unsloth_row_prefill_base", None) is not base
     ):
         return "mlx_vlm.generate.PromptProcessingBatch is overridden by something else"
+    return None
+
+
+def row_quantized_prompt_cache_unavailable_reason() -> str | None:
+    """Why a batched vision row here cannot carry its own quantized prompt cache."""
+
+    reason = row_prompt_cache_unavailable_reason()
+    if reason is not None:
+        return reason
+    if "prefix_cache_merge" not in vars(_quantized_cache_type()):
+        return f"{_installed_mlx_vlm_version()} cannot batch a row's own quantized cache"
     return None
 
 
@@ -2980,6 +3014,9 @@ class _VLMBatchSession:
             )
         cache, lengths = state.open(list(token_ids))
         cache = list(cache)
+        quantized = any(isinstance(entry, _quantized_cache_type()) for entry in cache)
+        if quantized and (reason := row_quantized_prompt_cache_unavailable_reason()) is not None:
+            raise BatchRowRefused(reason)
         prefix = _cache_offset(cache)
         if prefix is None:
             raise BatchRowRefused("This request's prompt cache holds no offset to resume from.")
@@ -3619,6 +3656,7 @@ __all__ = [
     "generation_mode",
     "row_logits_processors_unavailable_reason",
     "row_prompt_cache_unavailable_reason",
+    "row_quantized_prompt_cache_unavailable_reason",
     "stream_batch",
     "stream_unavailable_reason",
     "vlm_batch_adds_special_tokens",
