@@ -955,7 +955,8 @@ class SpeculativeEngine:
             if not last and pipelined:
                 with mx.stream(self._stream):
                     upcoming = self._step(tokens[:, None], ahead = 1)
-                mx.async_eval(upcoming[0])
+                # Scores too: read unqueued, they cost the GPU another round trip per step.
+                mx.async_eval(*(array for array in upcoming if array is not None))
             scores = None if scores is None else scores.tolist()
             for i, token in enumerate(tokens.tolist()):
                 taken = rows[i].take([token], scores and scores[i : i + 1])
