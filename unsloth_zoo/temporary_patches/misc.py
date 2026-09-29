@@ -382,38 +382,45 @@ def patch_CsmForConditionalGeneration_forward():
             # Depth decoder trains on frames whose labels are not uniformly
             # ignore_index across the codebook dimension.
             train_mask = ~(labels[:, :, 1:] == -100).all(dim=-1)
-            depth_decoder_input_ids = labels[train_mask][..., : self.config.num_codebooks - 1]
-            # Position 0 placeholder, replaced later by backbone_last_hidden_state.
-            depth_decoder_input_ids = torch.nn.functional.pad(depth_decoder_input_ids, (1, 0), value=0)
+            # No depth frames (depth_decoder_labels_ratio=0) crashes the decoder; a zero-weight dummy frame
+            # keeps every rank entering it (DDP unused-param grads, FSDP / ZeRO-3 gathers).
+            if not train_mask.any():
+                dummy_outputs = self.depth_decoder(
+                    input_ids = labels.new_zeros((1, self.config.num_codebooks)),
+                    backbone_last_hidden_state = backbone_hidden_states[:1, 0],
+                    use_cache = False,
+                    return_dict = True,
+                )
+                depth_decoder_loss = dummy_outputs.logits.float().mean() * 0
+            else:
+                depth_decoder_input_ids = labels[train_mask][..., : self.config.num_codebooks - 1]
+                # Position 0 placeholder, replaced later by backbone_last_hidden_state.
+                depth_decoder_input_ids = torch.nn.functional.pad(depth_decoder_input_ids, (1, 0), value=0)
 
-            train_idxs = train_mask.nonzero(as_tuple=True)
-            backbone_last_hidden_states = backbone_hidden_states[train_idxs[0], train_idxs[1] - 1, :]
-            depth_decoder_labels = labels[train_mask]
+                train_idxs = train_mask.nonzero(as_tuple=True)
+                backbone_last_hidden_states = backbone_hidden_states[train_idxs[0], train_idxs[1] - 1, :]
+                depth_decoder_labels = labels[train_mask]
 
-            # Pass kwargs to the depth decoder so it sees num_items_in_batch.
-            depth_decoder_kwargs = kwargs.copy()
-            # Backbone num_items is the 0th codebook; depth covers the remaining
-            # 31 codebooks, so scale num_items_in_batch by 31.
-            if 'num_items_in_batch' in depth_decoder_kwargs:
-                depth_decoder_kwargs['num_items_in_batch'] = depth_decoder_kwargs['num_items_in_batch'] * 31
+                depth_decoder_kwargs = kwargs.copy()
+                # Backbone num_items counts codebook 0; depth covers the other 31.
+                if 'num_items_in_batch' in depth_decoder_kwargs:
+                    depth_decoder_kwargs['num_items_in_batch'] = depth_decoder_kwargs['num_items_in_batch'] * 31
 
-            depth_decoder_kwargs.pop('return_dict', None)
-            # Move output_attentions/output_hidden_states (transformers 4.54 deletes them)
-            depth_decoder_kwargs["output_attentions"   ] = output_attentions
-            depth_decoder_kwargs["output_hidden_states"] = output_hidden_states
+                depth_decoder_kwargs.pop('return_dict', None)
+                # Move output_attentions/output_hidden_states (transformers 4.54 deletes them)
+                depth_decoder_kwargs["output_attentions"   ] = output_attentions
+                depth_decoder_kwargs["output_hidden_states"] = output_hidden_states
 
-            depth_decoder_outputs = self.depth_decoder(
-                input_ids = depth_decoder_input_ids,
-                backbone_last_hidden_state = backbone_last_hidden_states,
-                use_cache = use_cache,
-                # output_attentions=output_attentions,
-                # output_hidden_states=output_hidden_states,
-                return_dict = True,
-                labels = depth_decoder_labels,
-                **depth_decoder_kwargs,
-            )
+                depth_decoder_outputs = self.depth_decoder(
+                    input_ids = depth_decoder_input_ids,
+                    backbone_last_hidden_state = backbone_last_hidden_states,
+                    use_cache = use_cache,
+                    return_dict = True,
+                    labels = depth_decoder_labels,
+                    **depth_decoder_kwargs,
+                )
 
-            depth_decoder_loss = depth_decoder_outputs.loss
+                depth_decoder_loss = depth_decoder_outputs.loss
             loss = backbone_loss + depth_decoder_loss
 
         return process_return(CsmOutputWithPast, {
