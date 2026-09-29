@@ -127,7 +127,7 @@ def test_expert_lora_trains_without_graph_breaks(tmp_path, model_type):
     r = json.loads(line[len("RESULT "):])
     if r["experts"] == 0:
         # transformers 4.57 keeps per-expert ModuleLists here: the step ran, nothing stacked to check.
-        pytest.skip(f"{model_type} has no stacked experts in this transformers")
+        pytest.skip(reason = f"{model_type} has no stacked experts in this transformers")
     assert r["grads"] and all(g > 0 for g in r["grads"]), r["grads"]
     assert max(r["rel"]) < 0.02, r["rel"]
     assert r["breaks"] == [], r["breaks"]

@@ -68,7 +68,7 @@ def test_cast_routers_compiled_and_decoder_layer_types_kept(tmp_path):
     assert line is not None, proc.stdout[-3000:] + proc.stderr[-3000:]
     r = json.loads(line[len("RESULT "):])
     if not r:
-        pytest.skip("transformers has none of the Ernie 4.5 / Laguna routers or Jamba")
+        pytest.skip(reason = "transformers has none of the Ernie 4.5 / Laguna routers or Jamba")
     for mt in ("ernie4_5_moe", "laguna"):
         if mt in r:
             assert r[mt] is not None and r[mt].startswith("torch_compile_with_fallback("), (mt, r[mt])
