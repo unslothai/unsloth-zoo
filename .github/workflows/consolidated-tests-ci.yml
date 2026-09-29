@@ -432,6 +432,7 @@ jobs:
             tests/test_mlx_incomplete_config.py \
             tests/test_mlx_incomplete_config_vlm.py \
             tests/test_mlx_adam_epsilon.py \
+            tests/test_mlx_optimizer_torch_parity.py \
             tests/test_hf_xet_fallback.py \
             tests/test_hf_xet_fallback_blob_scoped_redownload.py \
             tests/test_llama_cpp_install_consent.py \
@@ -820,6 +821,19 @@ jobs:
             --report "$RUNNER_TEMP/mlx-reports/quantized_optimizer_state.xml" \
             --require no-skips \
             --message "real mlx is installed but the numeric tests skipped"
+
+      - name: pytest tests/test_mlx_optimizer_defaults.py (HARD GATE)
+        # rmsprop/adamax/adagrad/adadelta defaults and Adamax bias correction vs torch.optim; shim cannot answer.
+        run: >-
+          .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_optimizer_defaults.py -v -rs
+          --junitxml="$RUNNER_TEMP/mlx-reports/optimizer_defaults.xml"
+
+      - name: Fail if the optimizer defaults tests skipped
+        run: |
+          python3 scripts/pytest_junit_gate.py \
+            --report "$RUNNER_TEMP/mlx-reports/optimizer_defaults.xml" \
+            --require no-skips \
+            --message "real mlx is installed but the optimizer defaults tests skipped"
 
       - name: tests/test_mlx_neftune_quant_map.py (mlx_only half, HARD GATE)
         # Embedding identification, embed-scale resolution and probe cleanup are
