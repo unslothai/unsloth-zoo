@@ -208,7 +208,8 @@ def test_loss_survives_mx_compile():
 
     plain, compiled = run(False), run(True)
     worst = max(abs(a - b) for a, b in zip(plain, compiled))
-    assert worst == 0.0, f"mx.compile changed the trajectory by {worst:.3e}"
+    # Bit-identical on CPU; Metal fuses the compiled graph differently (8.9e-8 seen on macOS 26).
+    assert worst <= 1e-6 * max(abs(v) for v in plain), f"mx.compile changed the trajectory by {worst:.3e}"
 
 
 @pytest.mark.parametrize("with_labels", [False, True])
