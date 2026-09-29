@@ -98,6 +98,18 @@ def test_sentence_transformers_layout_is_detected():
     assert e.is_sentence_transformers_layout([]) is False
 
 
+@pytest.mark.parametrize("keys", [
+    ["gpt_neox.embed_in.weight", "gpt_neox.layers.0.attention.dense.weight", "embed_out.weight"],
+    ["transformer.h.0.attn.c_attn.weight", "transformer.wte.weight", "lm_head.weight"],
+    ["h.0.attn.c_attn.weight", "wte.weight"],
+])
+def test_other_hf_root_namespaces_are_left_alone(keys):
+    e = _embedding()
+    original = {k: object() for k in keys}
+    assert e.is_sentence_transformers_layout(keys) is False
+    assert e.remap_sentence_transformer_weights(original) == original
+
+
 def test_remap_restores_the_model_prefix():
     e = _embedding()
     remapped = e.remap_sentence_transformer_weights({k: object() for k in ST_KEYS})

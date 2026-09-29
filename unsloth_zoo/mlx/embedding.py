@@ -140,10 +140,12 @@ def read_pooling_mode(pooling_config, default = "mean"):
 
 
 def is_sentence_transformers_layout(weight_keys):
+    """Decoder-inner keys (``embed_tokens.``, ``layers.``) at the root; other HF roots such as
+    ``gpt_neox.`` or ``transformer.`` are not this layout and must not be prefixed."""
     keys = list(weight_keys)
-    if not keys:
+    if any(key.startswith("model.") for key in keys):
         return False
-    return not any(key.startswith("model.") for key in keys)
+    return any(key.startswith(("embed_tokens.", "layers.")) for key in keys)
 
 
 def remap_sentence_transformer_weights(weights, prefix = "model."):
