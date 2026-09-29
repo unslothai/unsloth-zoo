@@ -14,18 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""QAT efficacy on real Metal: does it actually improve the saved artifact?
-
-Everything else about QAT can pass while the feature does nothing useful. This
-trains the same model twice from one seed -- with and without QAT -- then runs
-the real `fuse(dequantize=False)` that `save_method='merged_4bit'` uses, and
-compares the losses of the two *saved* models.
-
-Measured on Qwen2.5-0.5B-Instruct-4bit / wikitext-2 (300 steps): the non-QAT
-run retained only 36% of its training gains through the save, while QAT
-retained ~100% and shipped a 0.13 nats better model. This test reproduces the
-mechanism on a synthetic stack small enough for CI.
-"""
+"""QAT efficacy on real Metal: does it actually improve the saved artifact?"""
 
 from __future__ import annotations
 
@@ -62,10 +51,7 @@ DIMS = 256
 GROUP_SIZE = 64
 BITS = 4
 N_LAYERS = 3
-# QAT's advantage widens with training (it trades a worse free-floating loss
-# for a lossless save), so a short run is genuinely marginal: at 120 steps the
-# saved-model margin was -0.00003 on one of four seeds. Measured minimum margin
-# across seeds 0-3: 120 steps -0.000030, 400 steps +0.001303, 900 +0.002600.
+# QAT's saved-model margin grows with steps; short runs are marginal.
 STEPS = 400
 
 
@@ -146,19 +132,16 @@ def test_qat_removes_post_fuse_degradation_and_improves_the_saved_model(seed):
     base_degradation = base_post - base_pre
     qat_degradation = qat_post - qat_pre
 
-    # 1. There is a problem to solve: fusing hurts the non-QAT run.
     assert base_degradation > 0, (
         "expected merged_4bit fusing to degrade a non-QAT run; got "
         f"{base_degradation:+.6f}"
     )
 
-    # 2. QAT closes the train/deploy gap -- its own fuse is near lossless.
     assert abs(qat_degradation) < base_degradation / 10, (
         f"QAT degradation {qat_degradation:+.6f} should be far below the "
         f"baseline's {base_degradation:+.6f}"
     )
 
-    # 3. The only comparison that ships: QAT's saved model is better.
     assert qat_post < base_post, (
         f"QAT post-fuse loss {qat_post:.6f} should beat baseline "
         f"{base_post:.6f}"

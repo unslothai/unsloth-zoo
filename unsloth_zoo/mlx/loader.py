@@ -438,8 +438,6 @@ def linear_to_lora_layers(model, num_layers, config, *, dry_run=False):
     type_specs = _mlx_lora_type_specs()
     root, selected, root_modules = _mlx_lora_selection(model, num_layers, config)
     if config.get("use_dora"):
-        # Preflight so a late refusal leaves no layer converted; only the TYPE
-        # refusal is all-or-nothing.
         for _, modules in [*selected, (root, root_modules)]:
             for name, module in modules:
                 _mlx_dora_wrapper_type(module, name)
@@ -9372,11 +9370,7 @@ class FastMLXModel:
             )
         qat_scheme = kwargs.pop("qat_scheme", None)
         if qat_scheme is not None and qat_scheme is not False:
-            # Validate before the full_finetuning early return below and before
-            # any LoRA is installed. full_finetuning returns from this function
-            # without ever reaching the apply hook, so a guard that only lived
-            # there would let the request be dropped silently; the other
-            # rejections would raise only after the model had been mutated.
+            # Before the full_finetuning early return, else QAT is silently dropped.
             from .qat import validate_mlx_qat_request
             validate_mlx_qat_request(
                 model, qat_scheme, lora_dropout=lora_dropout, use_dora=use_dora,
@@ -9701,9 +9695,6 @@ class FastMLXModel:
                     language_lora_keys is None or len(language_lora_keys) > 0
                 )
             if qat_scheme is not None and qat_scheme is not False:
-                # Target-dependent QAT refusals (no targets, unquantized, mixed
-                # or non-affine grid, bit mismatch) fire before anything is
-                # wrapped or frozen.
                 from .qat import validate_mlx_qat_target_modules
                 validate_mlx_qat_target_modules(
                     mlx_lora_target_modules(
@@ -9749,10 +9740,6 @@ class FastMLXModel:
         # Adapters are invisible to a cached weight fusion.
         _disable_fused_input_projections(model)
 
-        # QAT after the adapters exist, matching the CUDA ordering (QAT is
-        # applied after _get_peft_model there too). It fake-quantizes the
-        # merged weight so training sees the grid that merged_4bit's fuse()
-        # will write.
         if qat_scheme is not None and qat_scheme is not False:
             from .qat import apply_mlx_qat
             apply_mlx_qat(model, qat_scheme)

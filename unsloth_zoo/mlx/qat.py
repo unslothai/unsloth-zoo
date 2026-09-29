@@ -6,38 +6,10 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-"""Quantization-aware training (QAT) for LoRA on Apple Silicon.
-
-MLX's ``merged_4bit`` save path does not keep the base quantization untouched:
-``mlx_lm.tuner.lora.LoRALinear.fuse(dequantize=False)`` dequantizes the base,
-adds the LoRA delta, and then **requantizes** the merged result. So the weight
-that actually ships is ``quantize(dequantize(W_q) + B @ A)`` -- a grid the model
-never sees while training, because during training the LoRA delta is applied in
-full precision on top of the quantized base.
-
-This module closes that gap: it fake-quantizes the *merged* weight in the
-forward pass, at the base layer's own ``group_size`` / ``bits`` / ``mode``, so
-gradients reach the LoRA through the same quantizer that ``fuse()`` will apply
-at save time. A straight-through estimator carries the gradient.
-
-Note this differs deliberately from the CUDA/torchao ``qat_scheme`` path, which
-fake-quantizes the *frozen base* and leaves the adapter in high precision. That
-is correct for bitsandbytes, where the base stays quantized and the adapter is
-merged differently. It is the wrong target for MLX: simulating ``quantize(W)``
-while ``fuse()`` computes ``quantize(W + BA)`` would train against a quantizer
-that never runs.
-
-Expect the training loss to look *worse* with QAT enabled. That is the feature
-working, not failing -- the pre-fuse loss of a non-QAT run describes a model
-configuration that only exists in memory and is destroyed by the save. Measured
-on Qwen2.5-0.5B-Instruct-4bit / wikitext-2 over 300 steps: the non-QAT run
-improved 0.306 nats while training but kept only 0.111 of it after
-``merged_4bit``; the QAT run improved 0.241 and kept 0.241.
-
-Scope: LoRA over ``nn.QuantizedLinear`` on text models. DoRA, MoE/SwitchLinear
-experts, VLMs, unquantized bases, ``lora_dropout > 0`` and the torchao-only
-schemes are refused rather than approximated -- each merges differently, and a
-fake-quant that does not match ``fuse()`` is worse than none.
+"""MLX LoRA QAT: fake-quantize the merged W + BA at the base grid with an STE,
+matching what LoRALinear.fuse(dequantize=False) writes for merged_4bit.
+Not the CUDA/torchao base-only target: fuse() quantizes W + BA, not W.
+DoRA, MoE, VLMs, unquantized bases, dropout and torchao-only schemes are refused.
 """
 
 from __future__ import annotations
@@ -52,17 +24,14 @@ __all__ = (
     "mlx_qat_module_count",
 )
 
-# Schemes MLX's affine quantizer can actually express, mapped to weight bits.
-# ``None`` means "inherit whatever the base layer was quantized to".
+# None = inherit the base layer's bits.
 SUPPORTED_MLX_QAT_SCHEMES = {
     "auto": None,
     "int4": 4,
     "int8": 8,
 }
 
-# Accepted by the CUDA path via torchao, but not expressible with mx.quantize:
-# they quantize activations and/or use fp8 grids. Rejected explicitly rather
-# than silently approximated with the nearest affine weight-only scheme.
+# torchao-only (activation / fp8 grids): refused, never approximated.
 TORCHAO_ONLY_QAT_SCHEMES = (
     "int8-int4",
     "fp8-int4",
@@ -92,12 +61,6 @@ def _dropout_probability(module):
 
 
 def _model_has_quantized_module(model):
-    """True when anything in the tree carries MLX quantized weights.
-
-    Works before adapters exist (bare ``nn.QuantizedLinear``) and after
-    (``named_modules`` still walks into ``LoRALinear.linear``), so the same
-    check serves the pre-mutation preflight and the post-LoRA pass.
-    """
     import mlx.nn as nn
 
     quantized_types = [nn.QuantizedLinear, nn.QuantizedEmbedding]
@@ -114,11 +77,7 @@ def _model_has_quantized_module(model):
 
 
 def _quantization_grid(module):
-    """``(group_size, bits, mode)`` for a quantized base module.
-
-    ``mode`` is defaulted rather than read directly: published mlx-community
-    configs omit the key, and older quantized layers predate the attribute.
-    """
+    # mode defaults to affine: mlx-community configs and older layers omit it.
     return (
         module.group_size,
         module.bits,
@@ -127,14 +86,7 @@ def _quantization_grid(module):
 
 
 def _validate_qat_base_modules(named_bases, requested_bits):
-    """Grid rules for the modules QAT will fake-quantize.
-
-    Single source of truth, called both by the preflight (against the modules
-    LoRA is *about* to wrap) and by the post-LoRA pass (against the modules it
-    actually wrapped), so the two cannot disagree about what is acceptable.
-
-    Returns the agreed ``(group_size, bits, mode)``.
-    """
+    """Shared by preflight and post-LoRA pass so they cannot disagree."""
     import mlx.nn as nn
 
     if not named_bases:
@@ -164,10 +116,7 @@ def _validate_qat_base_modules(named_bases, requested_bits):
         )
     group_size, bits, mode = next(iter(grids))
 
-    # Only the affine grid round-trips through the three-value
-    # quantize/dequantize the QAT forward uses: mx.quantize returns just
-    # (packed, scales) for mxfp4/nvfp4/mxfp8, and those grids need different
-    # fake-quant maths anyway.
+    # mx.quantize returns no biases for mxfp4/nvfp4/mxfp8; only affine fits _qat_call.
     if mode != "affine":
         raise NotImplementedError(
             f"Unsloth: qat_scheme is not supported for {mode!r}-quantized "
@@ -186,19 +135,13 @@ def _validate_qat_base_modules(named_bases, requested_bits):
 
 
 def validate_mlx_qat_target_modules(named_bases, qat_scheme="auto"):
-    """Validate the base modules LoRA is about to wrap, before it wraps them.
-
-    ``named_bases`` must be the exact ``(name, module)`` set that
-    ``linear_to_lora_layers`` will replace, so that every rejection happens
-    while the model is still untouched.
-    """
+    """named_bases must be exactly what linear_to_lora_layers will replace."""
     return _validate_qat_base_modules(
         list(named_bases), _resolve_qat_bits(qat_scheme),
     )
 
 
 def _lora_layer_types():
-    """(LoRALinear, DoRA types, switch/MoE LoRA types) for the installed stack."""
     from mlx_lm.tuner.lora import LoRALinear, LoRASwitchLinear
 
     dora_types = []
@@ -225,13 +168,7 @@ def _lora_layer_types():
 
 
 def _qat_call(self, x):
-    """Forward using a fake-quantized *merged* weight.
-
-    Mirrors ``LoRALinear.fuse(dequantize=False)`` exactly: dequantize the base,
-    add the LoRA delta, requantize. The straight-through estimator keeps the
-    gradient flowing to ``lora_a`` / ``lora_b`` as if the quantizer were the
-    identity.
-    """
+    """Mirrors LoRALinear.fuse(dequantize=False); STE for the gradient."""
     import mlx.core as mx
 
     base = self.linear
@@ -249,19 +186,16 @@ def _qat_call(self, x):
     fake = mx.dequantize(
         packed, scales, biases, group_size=group_size, bits=bits, mode=mode,
     )
-    # Straight-through: forward uses `fake`, backward behaves like identity.
     straight_through = merged + mx.stop_gradient(fake - merged)
 
     y = x @ straight_through.T
-    # `fuse()` carries the base bias through untouched; dropping it silently
-    # corrupts every arch with biased projections (e.g. Qwen2/2.5 q/k/v).
+    # fuse() keeps the base bias; dropping it breaks Qwen2 q/k/v.
     if "bias" in base:
         y = y + base.bias
     return y
 
 
 def _resolve_qat_bits(qat_scheme):
-    """Validate ``qat_scheme`` and return the requested bit width (or None)."""
     if qat_scheme is True:
         return None
     if not isinstance(qat_scheme, str):
@@ -287,12 +221,7 @@ def _resolve_qat_bits(qat_scheme):
 
 
 def _qat_targets(model):
-    """Split LoRA modules into ``(patchable, dora, switch, lora_wrapped)``.
-
-    ``lora_wrapped`` is every plain LoRA layer regardless of whether its base
-    is quantized, so the shared grid validator can name the unquantized ones;
-    ``patchable`` is the quantized subset actually eligible for patching.
-    """
+    """lora_wrapped includes unquantized bases so the validator can name them."""
     import mlx.nn as nn
 
     lora_linear_type, dora_types, switch_types = _lora_layer_types()
@@ -322,16 +251,7 @@ def _preview(names, limit=3):
 
 def validate_mlx_qat_request(model, qat_scheme="auto", *, lora_dropout=None,
                              use_dora=False):
-    """Reject an unsupportable QAT request *before* anything is mutated.
-
-    Everything checkable without adapters lives here so ``get_peft_model`` can
-    call it up front: otherwise a rejected request either raises after LoRA has
-    already been installed and trainability changed, or -- for
-    ``full_finetuning=True``, which returns before adapters are ever created --
-    is silently ignored.
-
-    Returns the requested bit width (``None`` means "inherit the base").
-    """
+    """Pre-mutation checks; full_finetuning returns before adapters, so check here."""
     requested_bits = _resolve_qat_bits(qat_scheme)
 
     if getattr(model, "_unsloth_full_finetuning", False):
@@ -344,11 +264,7 @@ def validate_mlx_qat_request(model, qat_scheme="auto", *, lora_dropout=None,
 
     from .utils import _is_vlm_model
     if _is_vlm_model(model):
-        # The LoRA layers are the same LoRALinear-over-QuantizedLinear, and all
-        # of them (language model and vision tower) do get discovered here, so
-        # this is a coverage gate rather than a known incompatibility: the VLM
-        # train -> merged_4bit -> reload path has not been validated end to end
-        # for QAT. Refuse rather than ship an unverified numeric claim.
+        # Coverage gate, not a known incompatibility: VLM merge path unvalidated.
         raise NotImplementedError(
             "Unsloth: qat_scheme is not supported for VLMs on MLX yet — the "
             "vision-tower and projector merge paths have not been validated "
@@ -366,10 +282,7 @@ def validate_mlx_qat_request(model, qat_scheme="auto", *, lora_dropout=None,
             f"LoRA activation path for dropout to act on (got {lora_dropout})."
         )
 
-    # Cheap model-level backstop. The authoritative check is
-    # validate_mlx_qat_target_modules, run against the exact modules LoRA is
-    # about to wrap; this only catches the "nothing here is quantized at all"
-    # case for callers that never reach that path.
+    # Backstop only; validate_mlx_qat_target_modules is authoritative.
     if not _model_has_quantized_module(model):
         raise ValueError(
             "Unsloth: qat_scheme requires a quantized base model — nothing in "
@@ -383,19 +296,7 @@ def validate_mlx_qat_request(model, qat_scheme="auto", *, lora_dropout=None,
 
 
 def apply_mlx_qat(model, qat_scheme="auto"):
-    """Fake-quantize the merged LoRA weight during training.
-
-    Args:
-        model: an MLX model that already has LoRA layers attached.
-        qat_scheme: ``"auto"``/``True`` to inherit the base model's own
-            quantization, or ``"int4"`` / ``"int8"`` to additionally assert the
-            base was quantized to that width.
-
-    Returns:
-        The number of LoRA modules placed under QAT.
-    """
-    # Re-run the pre-mutation checks: apply_mlx_qat is public and may be called
-    # directly, not only through get_peft_model.
+    """Patch LoRA layers (already attached) for QAT; returns count patched."""
     requested_bits = validate_mlx_qat_request(model, qat_scheme)
 
     patchable, dora, switch, lora_wrapped = _qat_targets(model)
@@ -414,8 +315,6 @@ def apply_mlx_qat(model, qat_scheme="auto"):
             "layers. Call get_peft_model(...) with LoRA targets first."
         )
 
-    # Same rules the preflight applied to the would-be targets, now applied to
-    # what LoRA actually wrapped. Shared so the two cannot diverge.
     group_size, bits, mode = _validate_qat_base_modules(
         [(name, module.linear) for name, module in lora_wrapped],
         requested_bits,
@@ -435,9 +334,7 @@ def apply_mlx_qat(model, qat_scheme="auto"):
         if getattr(module, _QAT_FLAG, False):
             continue
         original = type(module)
-        # Subclass rather than swap the module: the save path's DoRA detection
-        # keys on type(module).__name__ and the quantization-map scan keys on
-        # isinstance, so the stand-in has to keep both the name and the MRO.
+        # Keep name + MRO: save path checks type(module).__name__ and isinstance.
         qat_class = type(
             original.__name__,
             (original,),
@@ -463,7 +360,6 @@ def apply_mlx_qat(model, qat_scheme="auto"):
 
 
 def remove_mlx_qat(model):
-    """Restore the stock LoRA forward. Returns the number of layers restored."""
     restored = 0
     for _, module in model.named_modules():
         original = getattr(type(module), _QAT_ORIGINAL_CLASS, None)
@@ -475,7 +371,6 @@ def remove_mlx_qat(model):
 
 
 def mlx_qat_module_count(model):
-    """Number of LoRA modules currently under QAT."""
     return sum(
         1 for _, module in model.named_modules()
         if getattr(module, _QAT_FLAG, False)

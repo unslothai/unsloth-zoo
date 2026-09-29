@@ -14,15 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""QAT against the real product paths: merged_4bit save/reload, MLXTrainer, CPT.
-
-tests/test_mlx_qat.py proves the QAT forward matches ``LoRALinear.fuse()``.
-That is necessary but not sufficient: the shipped path is
-``save_pretrained_merged(save_method='merged_4bit')`` -> ``_fuse_mlx_module``
--> ``save_model`` + config metadata -> reload. If anything in that chain
-differed, the fuse-level tests would still pass while the feature did nothing.
-These tests run the chain end to end on real Metal.
-"""
+"""QAT against the real product paths: merged_4bit save/reload, MLXTrainer, CPT."""
 
 from __future__ import annotations
 
@@ -40,7 +32,6 @@ from unsloth_zoo.mlx.loader import FastMLXModel
 from unsloth_zoo.mlx.qat import mlx_qat_module_count
 
 MODEL = "mlx-community/SmolLM-135M-Instruct-4bit"
-# Unquantized source, for the rejection cases that need one.
 FP_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
 
 
@@ -65,13 +56,7 @@ def _loss(model, ids):
 
 
 def _train_then_save_and_reload(qat, steps=15, save_method="merged_4bit", seed=0):
-    """Train briefly, save through the product path, reload, report losses.
-
-    Seeds before loading so the QAT and non-QAT arms start from identical LoRA
-    initialisations. Without this the two calls run sequentially in one
-    process, inheriting whatever RNG state earlier tests left behind, and
-    "QAT's saved model is better" would be a claim about random init.
-    """
+    """Train briefly, save through the product path, reload, report losses."""
     ids = _ids()
     mx.random.seed(seed)
     model, tokenizer = FastMLXModel.from_pretrained(MODEL, max_seq_length=64)
@@ -109,14 +94,10 @@ def test_qat_survives_the_merged_4bit_save_round_trip():
 
 
 def test_qat_saved_model_beats_the_non_qat_saved_model():
-    """The comparison that ships: both saved and reloaded, QAT wins.
-
-    Both arms are seeded identically so the only difference is QAT itself.
-    """
+    """The comparison that ships: both saved and reloaded, QAT wins."""
     base_before, base_after = _train_then_save_and_reload(qat=False, seed=0)
     qat_before, qat_after = _train_then_save_and_reload(qat=True, seed=0)
 
-    # The non-QAT run must actually lose something, else there is nothing to fix.
     assert base_after - base_before > 10 * (qat_after - qat_before), (
         f"expected merged_4bit to degrade the non-QAT run "
         f"({base_before:.6f} -> {base_after:.6f}) far more than the QAT run "
@@ -129,11 +110,7 @@ def test_qat_saved_model_beats_the_non_qat_saved_model():
 
 
 def test_save_method_lora_still_exports_adapters_under_qat():
-    """Adapter-only export must not be confused by the QAT subclass.
-
-    ``collect_mlx_lora_adapter_tensors`` keys on ``type(module).__name__``, so
-    the stand-in class has to keep the original name.
-    """
+    """Adapter-only export must not be confused by the QAT subclass."""
     from unsloth_zoo.mlx.utils import collect_mlx_lora_adapter_tensors
 
     model, tokenizer = FastMLXModel.from_pretrained(MODEL, max_seq_length=64)
@@ -189,19 +166,11 @@ def test_qat_runs_through_mlx_trainer():
     assert all(loss == loss and abs(loss) != float("inf") for loss in history), (
         f"non-finite losses under QAT: {history}"
     )
-    # QAT must still be installed after training: a compile path that rebuilt
-    # the modules would silently drop the fake-quant.
     assert mlx_qat_module_count(model) == patched
 
 
 def test_full_finetuning_request_is_not_silently_dropped():
-    """Every guard must be reachable through the public entry point.
-
-    get_peft_model returns at its full_finetuning branch before the QAT hook,
-    so a guard that only lived inside apply_mlx_qat was unreachable here and
-    the request was silently ignored -- the model trained with no QAT at all
-    and nothing said so.
-    """
+    """Every guard must be reachable through the public entry point."""
     from unsloth_zoo.mlx.qat import mlx_qat_module_count
 
     model, _ = FastMLXModel.from_pretrained(
@@ -220,11 +189,6 @@ def _lora_layers_installed(model):
     )
 
 
-# Every way a QAT request can be refused. The property under test is
-# structural: validation of the would-be LoRA targets happens before any of
-# them are replaced, so no rejection can leave adapters attached or
-# trainability changed. Parametrized rather than written out per case so a new
-# rejection added later without a preflight fails here.
 _REFUSAL_CASES = [
     ("bit-width mismatch", MODEL, {}, {"lora_dropout": 0, "qat_scheme": "int8"}, ValueError),
     ("lora_dropout > 0", MODEL, {}, {"lora_dropout": 0.1, "qat_scheme": "auto"}, NotImplementedError),
@@ -253,8 +217,6 @@ def test_refused_requests_leave_the_model_unmutated(
     def trainable_size():
         return sum(v.size for _, v in tree_flatten(model.trainable_parameters()))
 
-    # A freshly loaded model has everything trainable until get_peft_model
-    # freezes, so "unmutated" is unchanged-from-before, not zero.
     before = trainable_size()
     with pytest.raises(expected):
         FastMLXModel.get_peft_model(
@@ -267,13 +229,7 @@ def test_refused_requests_leave_the_model_unmutated(
 
 
 def test_vlm_is_gated_off():
-    """VLMs are refused for now: the merge path is unvalidated, not broken.
-
-    All VLM LoRA layers (196 language + 64 vision tower with train_vision=True
-    on Qwen2-VL-2B) are the same LoRALinear-over-QuantizedLinear that QAT
-    handles, so this is a coverage gate. It exists so nobody gets an unverified
-    numeric claim; lifting it needs a VLM train -> merged_4bit -> reload check.
-    """
+    """VLMs are refused for now: the merge path is unvalidated, not broken."""
     VLM = "mlx-community/Qwen2-VL-2B-Instruct-4bit"
     model, _ = FastMLXModel.from_pretrained(VLM, max_seq_length=64)
     with pytest.raises(NotImplementedError, match="VLM"):
@@ -284,17 +240,7 @@ def test_vlm_is_gated_off():
 
 
 def test_qat_and_cpt_full_modules_are_mutually_exclusive():
-    """QAT + continued-pretraining full modules cannot co-occur, by construction.
-
-    CPT trains embed_tokens / lm_head as whole modules, which unsloth already
-    rejects on a quantized base (the CCE backward zeroes the grad of a
-    quantized weight). QAT in turn requires a quantized base -- there is
-    nothing to fake-quantize otherwise. So the combination is impossible from
-    both directions, and the user must get a clear error rather than a model
-    that silently trains nothing.
-    """
-    # Direction 1: quantized base -> CPT rejects (pre-existing guard, fires
-    # before QAT is reached).
+    """QAT + continued-pretraining full modules cannot co-occur, by construction."""
     model, _ = FastMLXModel.from_pretrained(MODEL, max_seq_length=64)
     with pytest.raises(ValueError, match="quantized"):
         FastMLXModel.get_peft_model(
@@ -305,16 +251,12 @@ def test_qat_and_cpt_full_modules_are_mutually_exclusive():
             qat_scheme="auto", use_gradient_checkpointing=False,
         )
 
-    # Direction 2: an unquantized base is what CPT wants, and there QAT itself
-    # refuses, because merged_4bit would not requantize anything.
     from unsloth_zoo.mlx.qat import apply_mlx_qat
     plain, _ = FastMLXModel.from_pretrained(MODEL, max_seq_length=64)
     plain = FastMLXModel.get_peft_model(
         plain, r=8, lora_alpha=16, lora_dropout=0,
         use_gradient_checkpointing=False,
     )
-    # Strip the quantization from the LoRA bases, then confirm QAT declines
-    # rather than silently doing nothing.
     import mlx.nn as _nn
     from mlx_lm.tuner.lora import LoRALinear
     for _, module in plain.named_modules():
@@ -331,8 +273,5 @@ def test_qat_and_cpt_full_modules_are_mutually_exclusive():
                 mode=module.linear.mode,
             )
             module.linear = dq
-    # The model still holds quantized modules the LoRA targets do not cover
-    # (a quantized embedding), so the model-level backstop passes and the
-    # target-level check is what refuses -- naming the unquantized targets.
     with pytest.raises(ValueError, match="quantized LoRA targets"):
         apply_mlx_qat(plain, "auto")
