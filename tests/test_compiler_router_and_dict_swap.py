@@ -62,7 +62,7 @@ def test_cast_routers_compiled_and_decoder_layer_types_kept(tmp_path):
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     env["PYTHONPATH"] = os.pathsep.join([repo_root] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
     env.setdefault("UNSLOTH_ZOO_DISABLE_GPU_INIT", "1")
-    # What the compiler generates when compiling: CPU CI sets the kill switch, which rightly leaves every router uncompiled.
+    # CPU CI sets the kill switch, which rightly leaves routers uncompiled; this checks the compiling path.
     env.pop("UNSLOTH_COMPILE_DISABLE", None)
     proc = subprocess.run([sys.executable, "-c", _CHILD], cwd = tmp_path, capture_output = True, text = True,
                           timeout = 900, env = env)
