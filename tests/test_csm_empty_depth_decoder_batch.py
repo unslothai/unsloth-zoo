@@ -63,6 +63,8 @@ def test_no_depth_decoder_frames_trains_backbone_only():
     assert out.depth_decoder_loss.item() == 0.0
     torch.testing.assert_close(out.loss, out.backbone_loss)
     out.loss.backward()
+    # DDP without find_unused_parameters needs every trainable decoder param in the graph.
+    assert all(p.grad is not None for p in model.depth_decoder.parameters() if p.requires_grad)
 
 
 def test_depth_decoder_frames_still_train():

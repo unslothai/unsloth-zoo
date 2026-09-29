@@ -383,8 +383,12 @@ def patch_CsmForConditionalGeneration_forward():
             # ignore_index across the codebook dimension.
             train_mask = ~(labels[:, :, 1:] == -100).all(dim=-1)
             # No depth frames (CsmProcessor depth_decoder_labels_ratio=0): a zero-frame batch crashes the decoder.
+            # Zero still touches every trainable decoder param, else DDP without find_unused_parameters errors.
             if not train_mask.any():
                 depth_decoder_loss = backbone_loss.new_zeros(())
+                for param in self.depth_decoder.parameters():
+                    if param.requires_grad:
+                        depth_decoder_loss = depth_decoder_loss + param.reshape(-1)[0] * 0
             else:
                 depth_decoder_input_ids = labels[train_mask][..., : self.config.num_codebooks - 1]
                 # Position 0 placeholder, replaced later by backbone_last_hidden_state.
