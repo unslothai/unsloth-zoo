@@ -43,7 +43,6 @@ import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_map
 from mlx_lm.tuner.lora import LoRALinear
 
-from unsloth_zoo.mlx import qat
 from unsloth_zoo.mlx.loader import FastMLXModel
 
 
@@ -84,6 +83,8 @@ def _peft(model, **kwargs):
 @pytest.mark.parametrize("bias", [False, True], ids=["nobias", "bias"])
 def test_qat_forward_is_bit_exact_to_the_fused_module(bias, dtype):
     # bf16 is where a dense GEMM and quantized_matmul round differently.
+    from unsloth_zoo.mlx import qat
+
     layer = _lora(bias, dtype)
     fused = layer.fuse(dequantize=False)
     qat.apply_mlx_qat(layer)
@@ -92,6 +93,8 @@ def test_qat_forward_is_bit_exact_to_the_fused_module(bias, dtype):
 
 
 def test_straight_through_gradients_match_the_dense_reference():
+    from unsloth_zoo.mlx import qat
+
     layer = _lora(True, mx.float32)
     x = mx.random.normal((3, 5, 128))
 
@@ -120,7 +123,7 @@ def test_get_peft_model_qat_trains_compiled_and_survives_the_merged_4bit_save(tm
     from unsloth_zoo.mlx.utils import save_merged_model
 
     model = _peft(_tiny_llama())
-    assert sum(getattr(m, qat._QAT_FLAG, False) for _, m in model.named_modules()) == 14
+    assert sum(getattr(m, "_unsloth_mlx_qat_active", False) for _, m in model.named_modules()) == 14
 
     ids = mx.array([[3, 11, 19, 27, 35, 43, 51, 59] * 4])
 
@@ -188,4 +191,4 @@ def test_vlm_is_refused(monkeypatch):
     from unsloth_zoo.mlx import utils
     monkeypatch.setattr(utils, "_is_vlm_model", lambda model: True)
     with pytest.raises(NotImplementedError, match="VLM"):
-        qat.validate_mlx_qat_request(_tiny_llama(), "auto")
+        _peft(_tiny_llama())
