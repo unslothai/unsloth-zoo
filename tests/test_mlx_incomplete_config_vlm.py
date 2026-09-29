@@ -169,3 +169,40 @@ def test_distributed_vlm_signature_drift_still_reported(monkeypatch):
         loader._load_mlx_vlm_distributed(
             "unsloth/Example-VL", "qwen2_5_vl", config_override_data={"model_type": "x"}
         )
+
+
+def test_non_config_init_type_error_keeps_its_traceback():
+    # A processor / model constructor missing an argument is not a config.json problem.
+    from unsloth_zoo.mlx.loader import _raise_if_incomplete_mlx_config
+
+    for message in (
+        "Qwen2VLProcessor.__init__() missing 1 required positional argument: 'image_processor'",
+        "Model.__init__() missing 1 required positional argument: 'config'",
+    ):
+        _raise_if_incomplete_mlx_config(
+            "unsloth/Example-VL", "qwen2_5_vl", message, TypeError(message),
+            library="mlx-vlm",
+        )
+
+
+def test_bare_init_form_needs_a_from_dict_frame():
+    # Python 3.9 drops the class name; only a TypeError raised in from_dict is a config gap.
+    from unsloth_zoo.mlx.loader import _raise_if_incomplete_mlx_config
+
+    message = "__init__() missing 1 required positional argument: 'text_config'"
+
+    def from_dict():
+        raise TypeError(message)
+
+    def build_processor():
+        raise TypeError(message)
+
+    try:
+        build_processor()
+    except TypeError as error:
+        _raise_if_incomplete_mlx_config("m", "t", message, error, library="mlx-vlm")
+    with pytest.raises(ValueError, match="text_config"):
+        try:
+            from_dict()
+        except TypeError as error:
+            _raise_if_incomplete_mlx_config("m", "t", message, error, library="mlx-vlm")

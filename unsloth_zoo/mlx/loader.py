@@ -30,6 +30,7 @@ import inspect
 import io
 import math
 import os
+import traceback
 import re
 import shutil
 import sys
@@ -600,12 +601,22 @@ def _raise_if_incomplete_mlx_config(
     keys = _missing_mlx_config_keys(message)
     if not keys:
         return
+    # Only config dataclasses: a model / processor __init__ missing an argument is not a
+    # config.json problem. Python 3.9 omits the class name, so check the raising frame.
+    owner = re.search(r"(\w+)\.__init__\(\)", message)
+    if owner is not None:
+        owner = owner.group(1)
+        if owner != "ModelArgs" and not owner.endswith("Config"):
+            return
+    else:
+        frames = traceback.extract_tb(error.__traceback__)
+        if not frames or frames[-1].name != "from_dict":
+            return
     listed = ", ".join(repr(key) for key in keys)
     plural = "keys" if len(keys) > 1 else "key"
     # Nested dataclasses (mlx-vlm TextConfig / VisionConfig) name a sub-config's fields.
-    owner = re.search(r"(\w+)\.__init__\(\)", message)
-    if owner is not None and owner.group(1) not in ("ModelArgs", "ModelConfig"):
-        listed = f"{listed} (fields of {owner.group(1)})"
+    if owner is not None and owner not in ("ModelArgs", "ModelConfig"):
+        listed = f"{listed} (fields of {owner})"
     raise ValueError(
         f"Unsloth: {model_name}'s config.json is missing the {plural} {listed}, "
         f"which {library}'s '{model_type or 'unknown'}' architecture requires and "
