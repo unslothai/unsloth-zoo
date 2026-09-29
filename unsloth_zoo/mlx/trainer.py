@@ -5390,11 +5390,17 @@ class MLXTrainer:
                     _gkd_batch_size,
                     getattr(args, "per_device_eval_batch_size", None) or 0,
                 )
+            # Gradients and optimizer state are allocated later; Adam-family
+            # state is two float32 buffers per trainable parameter.
+            _trainable_bytes = sum(
+                p.size * (p.itemsize + 8)
+                for _, p in tree_flatten(model.trainable_parameters())
+            )
             loss_fn = build_gkd_loss_fn(
                 _teacher, args,
                 vocab_size = _teacher_vocab,
                 batch_size = _gkd_batch_size,
-                resident_bytes = mx.get_active_memory(),
+                resident_bytes = mx.get_active_memory() + _trainable_bytes,
                 system_bytes = _psutil.virtual_memory().total,
             )
             use_cce = False
@@ -7168,7 +7174,12 @@ class MLXTrainer:
                 self._last_eval_metrics = _metrics_before_eval
                 self.control.should_evaluate = False
                 return False
-            if ppl is None:
+            if ppl is None and getattr(loss_fn, "_unsloth_gkd", False):
+                _main_print(
+                    f"  Eval  {current_step}/{total_steps} | "
+                    f"Val Loss (GKD): {val_loss:.4f}"
+                )
+            elif ppl is None:
                 # No per-token likelihood to exponentiate.
                 _scores = self._last_eval_metrics or {}
                 _accuracy = _scores.get("eval_rewards/accuracies", float("nan"))
