@@ -16,7 +16,8 @@
 
 from __future__ import annotations
 
-import inspect
+import sys
+import types
 
 import pytest
 
@@ -117,51 +118,38 @@ def test_successful_vlm_load_is_untouched():
     ) == ("model", "processor")
 
 
-def test_retry_path_is_deliberately_not_guarded():
-    from unsloth_zoo.mlx.loader import _load_mlx_vlm_with_extra_weight_filter
-
-    source = inspect.getsource(_load_mlx_vlm_with_extra_weight_filter)
-    assert source.count("_raise_if_incomplete_mlx_config") == 1
-
-
-def test_distributed_guard_precedes_the_signature_drift_branch():
-    from unsloth_zoo.mlx.loader import _load_mlx_vlm_distributed
-
-    source = inspect.getsource(_load_mlx_vlm_distributed)
-    assert "_raise_if_incomplete_mlx_config" in source
-    guard_at = source.index("_raise_if_incomplete_mlx_config")
-    drift_at = source.index('"tensor_group" not in message')
-    assert guard_at < drift_at
-    from unsloth_zoo.mlx.loader import _missing_mlx_config_keys
-
-    assert _missing_mlx_config_keys(
-        "sharded_load() got an unexpected keyword argument 'tensor_group'"
-    ) == []
-    assert _missing_mlx_config_keys(
-        "sharded_load() missing 1 required positional argument: 'tensor_group'"
-    ) == []
-
-
-def test_runtime_quant_vlm_path_is_guarded():
+def _patch_vlm_distributed(monkeypatch, error):
     from unsloth_zoo.mlx import loader
 
-    source = inspect.getsource(loader)
-    # Window = runtime-quant VLM branch: its opening print to its QK-norm marker comment.
-    branch_start = 'via mlx-vlm (VLM, "'
-    branch_end = "Pre-quantize load bypasses the extra-weight filter"
-    assert source.count(branch_start) == 1
-    assert source.count(branch_end) == 1
-    window = source[source.index(branch_start):source.index(branch_end)]
-    assert "_raise_if_incomplete_mlx_config" in window
-    assert 'library="mlx-vlm"' in window
+    def _sharded_load(path, **kwargs):
+        raise error
+
+    utils = types.ModuleType("mlx_vlm.utils")
+    utils.get_model_path = lambda name, revision=None: "/nonexistent"
+    utils.sharded_load = _sharded_load
+    monkeypatch.setitem(sys.modules, "mlx_vlm.utils", utils)
+    monkeypatch.setattr(loader, "_mlx_active_distributed_groups", lambda p, t: (None, object()))
+    monkeypatch.setattr(loader, "_bind_mlx_vlm_processor_loader", lambda f, **k: f)
+    monkeypatch.setattr(loader, "_bind_mlx_vlm_quantized_projector_loader", lambda f: f)
+    monkeypatch.setattr(
+        loader, "_materialize_mlx_vlm_config_override", lambda path, cfg, **k: (path, None)
+    )
+    return loader
 
 
-def test_every_vlm_load_entry_point_is_guarded():
-    # 3 VLM + 2 mlx-lm call sites; a new unguarded load path should update this.
-    from unsloth_zoo.mlx import loader
+def test_distributed_vlm_converts_the_type_error(monkeypatch):
+    loader = _patch_vlm_distributed(monkeypatch, TypeError(_VLM_MSG))
+    with pytest.raises(ValueError) as exc:
+        loader._load_mlx_vlm_distributed(
+            "unsloth/Example-VL", "qwen2_5_vl", config_override_data={"model_type": "x"}
+        )
+    assert "text_config" in str(exc.value) and "mlx-vlm" in str(exc.value)
 
-    source = inspect.getsource(loader)
-    calls = source.count("_raise_if_incomplete_mlx_config(")
-    definition = source.count("def _raise_if_incomplete_mlx_config(")
-    assert calls - definition == 5
-    assert source.count('library="mlx-vlm"') == 3
+
+def test_distributed_vlm_signature_drift_still_reported(monkeypatch):
+    drift = "sharded_load() got an unexpected keyword argument 'tensor_group'"
+    loader = _patch_vlm_distributed(monkeypatch, TypeError(drift))
+    with pytest.raises(ImportError, match="newer mlx-vlm"):
+        loader._load_mlx_vlm_distributed(
+            "unsloth/Example-VL", "qwen2_5_vl", config_override_data={"model_type": "x"}
+        )

@@ -16,6 +16,9 @@
 
 from __future__ import annotations
 
+import sys
+import types
+
 import pytest
 
 
@@ -104,3 +107,20 @@ def test_key_extraction_shapes():
         "__init__() missing 1 required positional argument: 'block_ff_dim'"
     ) == ["block_ff_dim"]
     assert _missing_mlx_config_keys("something else entirely") == []
+
+
+def test_strict_fallback_converts_the_type_error(monkeypatch):
+    from unsloth_zoo.mlx.loader import _load_mlx_lm_with_strict_fallback
+
+    def _load_model(path, **kwargs):
+        raise TypeError(_LFM2_MSG)
+
+    utils = types.ModuleType("mlx_lm.utils")
+    utils._download = lambda name, revision=None: "/nonexistent"
+    utils.load_model = _load_model
+    utils.load_tokenizer = lambda *a, **k: None
+    monkeypatch.setitem(sys.modules, "mlx_lm.utils", utils)
+    with pytest.raises(ValueError) as exc:
+        _load_mlx_lm_with_strict_fallback("unsloth/LFM2.5-230M", "lfm2", None, {})
+    assert "block_ff_dim" in str(exc.value) and "mlx-lm" in str(exc.value)
+    assert isinstance(exc.value.__cause__, TypeError)
