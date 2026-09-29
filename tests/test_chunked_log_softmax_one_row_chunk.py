@@ -36,7 +36,7 @@ CHILD = textwrap.dedent(
     import torch
     from unsloth_zoo.rl_replacements import chunked_hidden_states_selective_log_softmax as f
 
-    rows, head_grad = int(sys.argv[1]), sys.argv[2] == "1"
+    rows, head_grad, cap = int(sys.argv[1]), sys.argv[2] == "1", int(sys.argv[3])
     vocab, hidden = 1024, 64
     amp = torch.bfloat16 if torch.cuda.is_bf16_supported(including_emulation = False) else torch.float16
     gen = torch.Generator().manual_seed(0)
@@ -47,7 +47,7 @@ CHILD = textwrap.dedent(
 
     # float32 head under half-precision autocast: full fine-tuning with bf16=True / fp16=True.
     with torch.autocast("cuda", dtype = amp):
-        out = f(states, lm_head, index, 16)
+        out = f(states, lm_head, index, 16, max_rows_per_chunk = cap)
     (out * weights).sum().backward()
     got = [out.detach(), states.grad.clone()] + ([lm_head.grad.clone()] if head_grad else [])
     states.grad = None
@@ -64,11 +64,15 @@ CHILD = textwrap.dedent(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "the fault is in Inductor's CUDA codegen")
-@pytest.mark.parametrize("head_grad", [True, False])
-@pytest.mark.parametrize("rows", [8, 13, 17, 24, 25, 49])
-def test_one_row_chunk_matches_eager(rows, head_grad):
+@pytest.mark.parametrize(
+    "rows, head_grad, cap",
+    [(rows, head_grad, 0) for rows in (8, 13, 17, 24, 25, 49) for head_grad in (True, False)]
+    # A row cap: the one-row tail is re-split with the chunk before it (49 / 2, 100 / 3).
+    + [(49, True, 2), (100, True, 3)],
+)
+def test_one_row_chunk_matches_eager(rows, head_grad, cap):
     run = subprocess.run(
-        [sys.executable, "-c", CHILD, str(rows), "1" if head_grad else "0"],
+        [sys.executable, "-c", CHILD, str(rows), "1" if head_grad else "0", str(cap)],
         capture_output = True, text = True, timeout = 600,
     )
     assert run.returncode == 0, run.stderr[-3000:]
