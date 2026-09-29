@@ -1567,3 +1567,16 @@ def test_the_fusion_scopes_tolerate_whatever_named_modules_yields():
         with fused_moe_gate_up(model), fused_decode_conv_silu(model), fused_residual_norm(model), \
                 fused_moe_router(model):
             pass
+
+
+def test_cache_layout_tells_quantized_packings_apart():
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.generate import _cache_layout
+
+    def cache(bits, group_size):
+        return [SimpleNamespace(offset = 0, bits = bits, group_size = group_size)]
+
+    assert _cache_layout(cache(8, 64)) == _cache_layout(cache(8, 64))
+    assert _cache_layout(cache(8, 64)) != _cache_layout(cache(4, 64))
+    assert _cache_layout(cache(8, 64)) != _cache_layout(cache(8, 32))

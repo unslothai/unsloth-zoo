@@ -2233,8 +2233,8 @@ def _install_row_prefill_batch(batch_module) -> None:
 
 
 def _cache_layout(entries) -> tuple | None:
-    """What rows merge by: None for a cache mlx-vlm builds, else each entry's class and
-    window. Rows merge one at a time, so nothing downstream compares them."""
+    """What rows merge by: None for a cache mlx-vlm builds, else each entry's class, window and
+    quantization. Rows merge one at a time, so nothing downstream compares them."""
     if entries is None:
         return None
     layout = []
@@ -2244,6 +2244,9 @@ def _cache_layout(entries) -> tuple | None:
             type(entry),
             getattr(entry, "max_size", None),
             getattr(entry, "keep", None),
+            # A quantized cache packs its state by these; rows merge into one packing.
+            getattr(entry, "bits", None),
+            getattr(entry, "group_size", None),
             _cache_layout(nested) if isinstance(nested, (list, tuple)) else None,
         ))
     return tuple(layout)
