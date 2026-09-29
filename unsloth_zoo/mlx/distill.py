@@ -19,6 +19,8 @@ scores the student's batch and the student trains on TRL's generalized JSD."""
 
 # Bound at import: a deferred `import mlx.core` would resolve to the
 # tests/mlx_simulation stub once that has replaced sys.modules["mlx.core"].
+import functools
+
 import mlx.core as mx
 import mlx.nn as nn
 
@@ -39,6 +41,7 @@ __all__ = [
 ]
 
 DEFAULT_CHUNK_SIZE = 128
+_depends = getattr(mx, "depends", None)
 
 # Peak as a multiple of one batch*seq*vocab float32 logit buffer, fitted on a
 # Qwen2.5-0.5B student + Qwen2.5-3B teacher and rounded up: an oversized step
@@ -85,6 +88,80 @@ def _jsd_per_position(student_logits, teacher_logits, beta, temperature):
     return per_token.sum(axis=-1)
 
 
+@functools.lru_cache(maxsize = None)
+def _chunked_jsd_sum(beta, temperature, chunk_size):
+    """``sum(weights * jsd_per_position)`` over the whole sequence, a chunk of
+    positions at a time, with an analytic student gradient.
+
+    Autodiff would keep every chunk's float32 log-probs alive until the backward
+    pass, and slicing the logits would add one full-size gradient per chunk;
+    this saves only the inputs, recomputes one chunk at a time and returns a
+    single gradient. With p = softmax(s/T), q = softmax(t/T), m the mixture:
+      beta = 0: dL/ds = (p - q) / T
+      else:     dL/ds = c * p * (r - sum(p * r)) / T, with r = log p - log m and
+                c = 1 - beta (beta = 1: r = log p - log q, c = 1).
+    The teacher is a constant: its gradient is zero."""
+
+    @mx.compile
+    def chunk_value_and_grad(student_logits, teacher_logits, weights):
+        student_log_probs = nn.log_softmax(student_logits.astype(mx.float32) / temperature, axis=-1)
+        teacher_log_probs = nn.log_softmax(teacher_logits.astype(mx.float32) / temperature, axis=-1)
+        p = mx.exp(student_log_probs)
+        if beta == 0.0:
+            q = mx.exp(teacher_log_probs)
+            per_token = q * (teacher_log_probs - student_log_probs)
+            grad = p - q
+        elif beta == 1.0:
+            r = student_log_probs - teacher_log_probs
+            per_token = p * r
+            grad = p * (r - (p * r).sum(axis=-1, keepdims=True))
+        else:
+            beta_array = mx.array(beta, dtype=mx.float32)
+            mixture_log_probs = mx.logaddexp(
+                student_log_probs + mx.log(1 - beta_array),
+                teacher_log_probs + mx.log(beta_array),
+            )
+            per_token = (
+                beta * _kl_divergence_log_target(mixture_log_probs, teacher_log_probs)
+                + (1 - beta) * _kl_divergence_log_target(mixture_log_probs, student_log_probs)
+            )
+            r = student_log_probs - mixture_log_probs
+            grad = (1 - beta) * p * (r - (p * r).sum(axis=-1, keepdims=True))
+        value = (per_token.sum(axis=-1) * weights).sum()
+        grad = grad * (weights.astype(mx.float32) / temperature)[..., None]
+        return value, grad.astype(student_logits.dtype)
+
+    def spans(sequence_length):
+        step = chunk_size if _is_chunked(chunk_size, sequence_length) else sequence_length
+        return [(start, min(start + step, sequence_length)) for start in range(0, sequence_length, step)]
+
+    @mx.custom_function
+    def forward(student_logits, teacher_logits, weights):
+        # Returns (loss, d loss / d student_logits); the gradient stays lazy
+        # unless a backward pass asks for it.
+        total, grads = mx.zeros((), dtype=mx.float32), []
+        for start, end in spans(student_logits.shape[1]):
+            chunk = student_logits[:, start:end]
+            if grads and _depends is not None:
+                # Serialise: independent chunks would otherwise all be live at once.
+                chunk = _depends(chunk, [total, grads[-1]])
+            value, grad = chunk_value_and_grad(chunk, teacher_logits[:, start:end], weights[:, start:end])
+            total = total + value
+            grads.append(grad)
+        return total, (grads[0] if len(grads) == 1 else mx.concatenate(grads, axis=1))
+
+    @forward.vjp
+    def backward(primals, cotangents, outputs):
+        student_logits, teacher_logits, weights = primals
+        return (
+            (outputs[1] * cotangents[0]).astype(student_logits.dtype),
+            mx.zeros_like(teacher_logits),
+            mx.zeros_like(weights),
+        )
+
+    return forward
+
+
 def generalized_jsd_loss(
     student_logits,
     teacher_logits,
@@ -95,29 +172,15 @@ def generalized_jsd_loss(
 ):
     """TRL's ``GKDTrainer.generalized_jsd_loss`` in MLX: beta 0 is forward KL,
     1 reverse KL; mean over non -100 positions (TRL's labels=None batchmean
-    divides by batch size instead); ``chunk_size`` positions at a time."""
+    divides by batch size instead); ``chunk_size`` positions at a time (0 =
+    unchunked). The teacher logits are treated as constants."""
     if labels is None:
         mask = mx.ones(student_logits.shape[:2])
     else:
         mask = (labels != -100)
-    denominator = mx.maximum(mask.sum(), 1)
-
-    sequence_length = student_logits.shape[1]
-    if not _is_chunked(chunk_size, sequence_length):
-        per_position = _jsd_per_position(student_logits, teacher_logits, beta, temperature)
-        return (per_position * mask).sum() / denominator
-
-    total = mx.zeros(())
-    for start in range(0, sequence_length, chunk_size):
-        end = min(start + chunk_size, sequence_length)
-        per_position = _jsd_per_position(
-            student_logits[:, start:end, :],
-            teacher_logits[:, start:end, :],
-            beta,
-            temperature,
-        )
-        total = total + (per_position * mask[:, start:end]).sum()
-    return total / denominator
+    weights = mask.astype(mx.float32) / mx.maximum(mask.sum(), 1)
+    loss_sum = _chunked_jsd_sum(float(beta), float(temperature), int(chunk_size or 0))
+    return loss_sum(student_logits, teacher_logits, weights)[0]
 
 
 def _is_chunked(chunk_size, sequence_length):

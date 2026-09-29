@@ -227,3 +227,28 @@ def test_trains_the_same_positions_as_cross_entropy(with_labels):
     _, gkd_ntoks = gkd(student, ids, lengths, labels)
     _, ce_ntoks = make_baseline_loss_fn()(student, ids, lengths, labels)
     assert int(gkd_ntoks) == int(ce_ntoks)
+
+
+@pytest.mark.parametrize("beta", [0.0, 0.3, 1.0])
+@pytest.mark.parametrize("temperature", [1.0, 2.0])
+@pytest.mark.parametrize("chunk", [0, 5])
+def test_analytic_gradient_matches_autodiff(beta, temperature, chunk):
+    """The loss carries a hand-written VJP; check it against autodiff of the math."""
+    from unsloth_zoo.mlx.distill import _jsd_per_position
+
+    teacher_logits, labels, _ = _fixture()
+    student_logits = mx.random.normal(teacher_logits.shape, key=mx.random.key(3)) * 2.0
+    mask = (labels != -100).astype(mx.float32)
+
+    def reference(s):
+        per = _jsd_per_position(s, teacher_logits, beta, temperature)
+        return (per * mask).sum() / mx.maximum(mask.sum(), 1)
+
+    def ours(s):
+        return generalized_jsd_loss(s, teacher_logits, labels, beta=beta,
+                                    temperature=temperature, chunk_size=chunk)
+
+    ref_value, ref_grad = mx.value_and_grad(reference)(student_logits)
+    value, grad = mx.value_and_grad(ours)(student_logits)
+    assert abs(float(value) - float(ref_value)) <= 1e-5 * max(1.0, abs(float(ref_value)))
+    assert float(mx.abs(grad - ref_grad).max()) <= 1e-6
