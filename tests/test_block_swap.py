@@ -169,15 +169,14 @@ def test_slot_returns_to_the_pool_it_came_from():
     for b in sw.blocks:
         sw._release(b)
     n_a, n_b = len(sw.free["a"]), len(sw.free["b"])
-    sw._fetch(sw.blocks[1])          # a "b" block
+    sw._fetch(sw.blocks[1])
     assert len(sw.free["b"]) == n_b - 1 and len(sw.free["a"]) == n_a
     sw._release(sw.blocks[1])
     assert len(sw.free["b"]) == n_b and len(sw.free["a"]) == n_a
 
 
 def test_enter_leave_walks_a_decode_step():
-    # The fast decode loop reads weights without calling the layer. enter/leave
-    # take indices into the full layer list; the swapped tail starts at 4 here.
+    # enter/leave take full-list indices; the swapped tail starts at 4.
     sw = _scheduler(6, depth = 2, start = 4)
     for b in sw.blocks:
         sw._release(b)
@@ -318,7 +317,7 @@ def test_host_loaded_layer_is_adopted_not_copied():
         print("[SKIP] CUDA not available")
         return
     torch.manual_seed(0)
-    lin = nn.Linear(64, 64, bias = False).requires_grad_(False)   # built on the host
+    lin = nn.Linear(64, 64, bias = False).requires_grad_(False)
     host = lin.weight.data.pin_memory()
     lin.weight.data = host
     x = torch.randn(2, 64, device = "cuda")

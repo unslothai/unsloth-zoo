@@ -37,11 +37,11 @@ def _no_inference_mode():
     try:
         leave_inference = torch.inference_mode(False)
     except (TypeError, AttributeError):
-        leave_inference = nullcontext()  # older torch lacks inference_mode(bool)
+        leave_inference = nullcontext()
     with leave_inference, torch.no_grad():
         yield
 
-# WSL2 caps pinned memory: fall back to pageable. Local since this module loads standalone.
+# WSL2 caps pinned memory: fall back to pageable.
 _PINNED_MEMORY_AVAILABLE = True
 
 
@@ -85,7 +85,6 @@ class _Block:
                 self.host.append(_to_pinned_host(p.data))
                 self.devices.append(p.data.device)
         self.index = index
-        # One stream + event per device: sharded blocks must sync every card.
         for d in self.devices:
             if d not in streams:
                 streams[d] = torch.cuda.Stream(device = d)
@@ -166,7 +165,6 @@ class BlockSwap:
 
         # Evict before building the pool (originals + pool would OOM); roll back on any failure.
         try:
-            # register_full_backward_hook can raise on legacy hooks: keep inside rollback.
             for i, layer in enumerate(layers[self.start:]):
                 self.handles.append(layer.register_forward_pre_hook(self._pre(i)))
                 self.handles.append(layer.register_forward_hook(self._post(i)))
@@ -198,8 +196,7 @@ class BlockSwap:
     def _acquire(self, block, steal):
         free = self.free[block.sig]
         if not free and steal:
-            # Only after an interrupted step (backward died, blocks left resident).
-            # Prefetches never steal: they could evict the block about to run.
+            # Only after an interrupted step; prefetches never steal (could evict the running block).
             for b in self.blocks:
                 if b is not block and b.sig == block.sig and b.resident and b.slot is not None:
                     self._release(b)
@@ -243,7 +240,6 @@ class BlockSwap:
     def _bwd(self, i):
         def hook(module, grad_input, grad_output):
             self._release(self.blocks[i])
-            # Block 0 ends the step: arm next forward's fetches behind the optimizer.
             if i == 0:
                 self._arm(forward = True)
         return hook
@@ -313,7 +309,6 @@ def find_decoder_layers(model):
             inner = getattr(m, attr, None)
             if inner is not None and hasattr(inner, "layers"):
                 return inner.layers
-            # base_model may resolve to self.
             if inner is not None and inner is not m:
                 m = inner
                 break
@@ -330,7 +325,6 @@ def build_host_layers(make_layer, first_idx, count, tensors, device, compute_dty
     `tensors` maps checkpoint keys to zero-arg loaders; quant_state stays on `device`."""
     import bitsandbytes as bnb
     device = torch.device(device)
-    # Prequantized checkpoints keep unquantized (dynamic) weights plain.
     if any(".quant_state." in k for k in tensors):
         quantize_4bit = False
     out = []
