@@ -719,6 +719,65 @@ def test_runtime_cce_backward_peak_memory(quantized, budget_mib):
     assert peak < budget_mib * 1024**2, f"CCE backward used {peak / 1024**2:.2f} MiB"
 
 
+def test_trainable_head_does_not_hold_d_logits_until_the_weight_gradient():
+    """A tied head, whose weight gradient is consumed last, must not hold every chunk's d_logits."""
+    _skip_torch_shim()
+    if not mx.metal.is_available():
+        pytest.skip("requires Metal memory accounting")
+    from unsloth_zoo.mlx.cce import _get_runtime_cce
+
+    vocab, dim, tokens = 131072, 256, 2048
+    mx.random.seed(5)
+    weight = (mx.random.normal((vocab, dim)) * 0.02).astype(mx.bfloat16)
+    ids = mx.random.randint(0, vocab, (tokens,))
+    targets = mx.random.randint(0, vocab, (tokens,))
+    mx.eval(weight, ids, targets)
+    peaks, grads = {}, {}
+    for frozen in (True, False):
+        cce = _get_runtime_cce(
+            ignore_index=-100, logit_softcap=0.0, chunk_size=8192, weight_is_frozen=frozen,
+        )
+
+        def loss(w, cce=cce, frozen=frozen):
+            h = w[ids]
+            return cce(h * mx.sigmoid(h), mx.stop_gradient(w) if frozen else w, targets).mean()
+
+        # Compiled, as the trainer steps: eager peaks this small track in-flight command buffers.
+        run = mx.compile(mx.value_and_grad(loss))
+        for _ in range(2):
+            mx.synchronize()
+            mx.clear_cache()
+            resident = mx.get_active_memory()
+            mx.reset_peak_memory()
+            result = run(weight)
+            mx.eval(result)
+            peaks[frozen] = mx.get_peak_memory() - resident
+        grads[frozen] = result[1]
+        del result
+    assert not mx.array_equal(grads[False], grads[True]).item()
+    overhead = peaks[False] - peaks[True]
+    assert overhead < tokens * vocab * 4 // 2, f"trainable head added {overhead / 2**20:.0f} MiB"
+
+
+def test_trainable_head_orders_weight_gradient_only_when_d_logits_are_larger():
+    """Short sequences keep d_logits: ordering would hold a weight gradient larger than them."""
+    _skip_torch_shim()
+    import io
+    from unsloth_zoo.mlx.cce import _get_runtime_cce
+
+    cce = _get_runtime_cce(ignore_index=-100, logit_softcap=0.0, chunk_size=1024)
+    weight = mx.random.normal((4096, 64)).astype(mx.bfloat16)
+    ordered = {}
+    for tokens in (16, 128):
+        hidden = mx.random.normal((tokens, 64)).astype(mx.bfloat16)
+        targets = mx.random.randint(0, 4096, (tokens,))
+        grad_hidden, _ = mx.grad(lambda h, w: cce(h, w, targets).sum(), argnums=(0, 1))(hidden, weight)
+        graph = io.StringIO()
+        mx.export_to_dot(graph, grad_hidden)
+        ordered[tokens] = graph.getvalue().count("Depends")
+    assert ordered == {16: 0, 128: 4}
+
+
 @pytest.mark.parametrize("quantized", [False, True])
 @pytest.mark.parametrize("softcap", [0.0, 5.0])
 def test_frozen_head_gradient_is_built_in_the_forward(monkeypatch, quantized, softcap):

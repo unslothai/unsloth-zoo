@@ -1526,6 +1526,13 @@ def make_runtime_cce_loss_fused_finalize(
             mx.array([1.0 - label_smoothing, label_smoothing / vocab_size], dtype=mx.float32)
             if label_smoothing > 0.0 else None
         )
+        logits_dtype = mx.result_type(hidden_compute, weight_compute)
+        d_logits_bytes = (4 if dlogits_kernel is not None and logits_dtype == mx.bfloat16
+                          else logits_dtype.size)
+        # The weight gradient is consumed last, so its GEMM would hold every chunk's d_logits;
+        # run it per chunk when those outweigh the weight gradient it then holds instead.
+        order_weight_gradient = (not weight_is_frozen and hidden_compute.shape[0] * d_logits_bytes
+                                 > hidden_compute.shape[1] * weight.dtype.size)
 
         for chunk_idx, v_start in enumerate(chunk_starts_int):
             v_end = min(v_start + resolved_chunk_size, vocab_size)
@@ -1582,6 +1589,8 @@ def make_runtime_cce_loss_fused_finalize(
                 # Under mx.compile the gradient sum would otherwise run as one
                 # fused chain that keeps every chunk's d_logits alive.
                 grad_hidden = mx.depends([grad_hidden], [d_logits])[0]
+            elif order_weight_gradient:
+                grad_hidden = mx.depends([grad_hidden], [grad_weight_chunk])[0]
 
         return grad_hidden.astype(hidden.dtype), grad_weight.astype(weight.dtype), mx.zeros_like(targets)
 
@@ -1611,7 +1620,8 @@ def make_chunked_cross_entropy_loss(
 ):
     """Return a standalone CCE loss and a kernel-usage flag.
 
-    Set weight_is_frozen only when classifier gradients will not be requested.
+    Set weight_is_frozen exactly when classifier gradients will not be requested: a
+    trainable head may compute its weight gradient even when wrapped in stop_gradient.
     precompute_hidden_gradient builds a frozen or quantized head's hidden gradient
     in the forward (Metal kernels, no label smoothing), which saves backward memory
     but doubles the cost of a call that is never differentiated.
