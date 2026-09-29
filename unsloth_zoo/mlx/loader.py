@@ -576,23 +576,15 @@ def _message_matches_known_fallback(message, rule):
     return any(all(token in message for token in tokens) for tokens in token_sets)
 
 
+# Only *Args / *Config __init__: load_model signature drift or an nn layer must keep its traceback.
 _MLX_MISSING_ARGS_RE = re.compile(
-    # Anchored on __init__ so mlx-lm signature drift at our own call sites
-    # (e.g. "load_model() missing 1 required positional argument: 'model_path'")
-    # is never mistaken for an incomplete config; this loader deliberately
-    # tolerates that drift and must keep its original traceback.
-    r"\w*\.?__init__\(\) missing \d+ required positional arguments?:(?P<keys>.*)"
+    r"(?<![\w.])(?:\w*(?:Args|Config)\.)?__init__\(\) "
+    r"missing \d+ required positional arguments?:(?P<keys>.*)"
 )
 
 
 def _missing_mlx_config_keys(message):
-    """Config keys mlx-lm's ModelArgs required but config.json did not supply.
-
-    mlx-lm builds ModelArgs through ``from_dict``, which filters the config down
-    to fields the dataclass declares. A field with no default that is absent
-    from config.json therefore fails in ``__init__`` with a bare TypeError that
-    names neither the model nor the file. Returns [] for any other TypeError.
-    """
+    """Required ModelArgs fields named by a bare mlx-lm ``__init__`` TypeError, else []."""
     match = _MLX_MISSING_ARGS_RE.search(message)
     if match is None:
         return []
@@ -600,12 +592,7 @@ def _missing_mlx_config_keys(message):
 
 
 def _raise_if_incomplete_mlx_config(model_name, model_type, message, error):
-    """An incomplete config.json is a model-repo problem, not an MLX one.
-
-    Mirroring a checkpoint through a transformers version that does not model
-    every field can silently drop keys the mlx-lm arch still requires (e.g.
-    lfm2's block_ff_dim). The raw TypeError reads like missing Apple Silicon
-    support, so name the actual cause."""
+    """Name the config.json keys a mirrored repo lost (e.g. lfm2's block_ff_dim), not MLX."""
     keys = _missing_mlx_config_keys(message)
     if not keys:
         return
@@ -1134,8 +1121,6 @@ def _load_mlx_lm_with_strict_fallback(
             model_config=model_config,
         )
     except TypeError as error:
-        # A required ModelArgs field absent from config.json surfaces here, not
-        # as the ValueError the strict fallback below handles.
         _raise_if_incomplete_mlx_config(model_name, model_type, str(error), error)
         raise
     except ValueError as error:
@@ -1281,11 +1266,7 @@ def _load_mlx_lm_distributed(
                     model_config=model_config,
                 )
             except TypeError as error:
-                # Same incomplete-config failure as the single-device path;
-                # strict=False does not cover a missing ModelArgs field.
-                _raise_if_incomplete_mlx_config(
-                    model_name, model_type, str(error), error
-                )
+                _raise_if_incomplete_mlx_config(model_name, model_type, str(error), error)
                 raise
 
             mode = _mlx_distributed_sharding_mode(

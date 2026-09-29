@@ -14,10 +14,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-# A required mlx-lm ModelArgs field absent from config.json raises a bare
-# TypeError naming neither the model nor the file, which reads as missing Apple
-# Silicon support; the guard must name the config as the cause instead.
-
 from __future__ import annotations
 
 import pytest
@@ -30,8 +26,7 @@ def _install_mlx_shim():
     simulate_mlx_on_torch()
 
 
-# Verbatim from mlx-lm 0.31.3 loading unsloth/LFM2.5-230M, whose mirrored
-# config.json lost upstream's "block_ff_dim": 2560 (unslothai/unsloth#7306).
+# Verbatim from mlx-lm 0.31.3 on unsloth/LFM2.5-230M (unslothai/unsloth#7306).
 _LFM2_MSG = (
     "ModelArgs.__init__() missing 1 required positional argument: 'block_ff_dim'"
 )
@@ -49,7 +44,6 @@ def test_missing_config_key_raises_actionable_error():
     assert "block_ff_dim" in msg
     assert "config.json" in msg
     assert "lfm2" in msg
-    # The whole point: stop readers concluding MLX is unsupported.
     assert "Apple Silicon" in msg
 
 
@@ -70,8 +64,6 @@ def test_multiple_missing_keys_all_named():
 
 
 def test_unrelated_type_error_falls_through():
-    # Only the missing-required-argument shape is ours; anything else must keep
-    # its original traceback rather than be relabelled a config problem.
     from unsloth_zoo.mlx.loader import _raise_if_incomplete_mlx_config
 
     for message in (
@@ -84,13 +76,6 @@ def test_unrelated_type_error_falls_through():
 
 
 def test_mlx_lm_signature_drift_is_not_a_config_problem():
-    # This loader deliberately tolerates mlx-lm changing load_model/_download's
-    # signature between releases (see the bypass comment in
-    # _load_mlx_lm_with_strict_fallback). Those failures have the same
-    # "missing N required positional arguments" wording as a genuinely
-    # incomplete config, so anchoring on __init__ is what keeps them apart:
-    # misreporting one as "config.json is missing 'model_path'" would send a
-    # reader to the wrong repo entirely.
     from unsloth_zoo.mlx.loader import (
         _missing_mlx_config_keys,
         _raise_if_incomplete_mlx_config,
@@ -115,8 +100,43 @@ def test_key_extraction_shapes():
         "ModelArgs.__init__() missing 3 required positional arguments: "
         "'a', 'b', and 'c'"
     ) == ["a", "b", "c"]
-    # Bare __init__ (no owning class in the message) still counts.
     assert _missing_mlx_config_keys(
         "__init__() missing 1 required positional argument: 'block_ff_dim'"
     ) == ["block_ff_dim"]
+    assert _missing_mlx_config_keys(
+        "TextConfig.__init__() missing 1 required positional argument: 'vocab_size'"
+    ) == ["vocab_size"]
+    assert _missing_mlx_config_keys(
+        "Linear.__init__() missing 1 required positional argument: 'output_dims'"
+    ) == []
     assert _missing_mlx_config_keys("something else entirely") == []
+
+
+def _stub_text_load(monkeypatch, tmp_path, config, error):
+    import json
+    import mlx_lm.utils as lm_utils
+
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    monkeypatch.setattr(lm_utils, "_download", lambda *a, **k: tmp_path)
+
+    def load_model(*args, **kwargs):
+        raise TypeError(error)
+
+    monkeypatch.setattr(lm_utils, "load_model", load_model)
+
+
+def test_text_load_names_missing_config_key(monkeypatch, tmp_path):
+    import unsloth_zoo.mlx.loader as loader
+
+    _stub_text_load(monkeypatch, tmp_path, {"model_type": "lfm2"}, _LFM2_MSG)
+    with pytest.raises(ValueError, match="block_ff_dim"):
+        loader._load_mlx_lm_with_strict_fallback("unsloth/LFM2.5-230M", "lfm2", None, {})
+
+
+def test_text_load_keeps_non_config_init_type_error(monkeypatch, tmp_path):
+    import unsloth_zoo.mlx.loader as loader
+
+    message = "Linear.__init__() missing 1 required positional argument: 'output_dims'"
+    _stub_text_load(monkeypatch, tmp_path, {"model_type": "lfm2"}, message)
+    with pytest.raises(TypeError, match="output_dims"):
+        loader._load_mlx_lm_with_strict_fallback("unsloth/Example", "lfm2", None, {})
