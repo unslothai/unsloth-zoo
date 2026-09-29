@@ -60,8 +60,10 @@ SUPPORTED_MLX_OPTIMIZERS = (
     "adafactor", "adamw", "adam", "sgd", "muon", "lion",
     # First moment only; see unsloth_zoo/mlx/optimizers_quantized.py.
     "adamw_8bit", "adam_8bit",
+    # Coupled (non-decoupled) L2 weight decay; see _build_optimizer.
+    "rmsprop", "adamax", "adagrad", "adadelta",
 )
-_MLX_ADAM_FAMILY_OPTIMIZERS = ("adamw", "adam", "adamw_8bit", "adam_8bit")
+_MLX_ADAM_FAMILY_OPTIMIZERS = ("adamw", "adam", "adamw_8bit", "adam_8bit", "adamax")
 SUPPORTED_MLX_LR_SCHEDULERS = ("linear", "cosine", "constant")
 
 
@@ -595,6 +597,7 @@ from .utils import (
     iter_mlx_lora_modules,
     apply_gradient_checkpointing,
     remove_gradient_checkpointing,
+    _get_transformer_layers,
     _is_vlm_model,
     _mlx_norm_path_part_is_norm,
     iter_mlx_norm_output_cast_classes,
@@ -856,6 +859,8 @@ def _normalize_mlx_optimizer_name(name):
         "adamw_apex_fused",
     ):
         opt_name = "adamw"
+    elif opt_name in ("rmsprop_bnb", "rmsprop_bnb_8bit", "rmsprop_bnb_32bit"):
+        opt_name = "rmsprop"
     if opt_name not in SUPPORTED_MLX_OPTIMIZERS:
         supported = ", ".join(SUPPORTED_MLX_OPTIMIZERS)
         raise ValueError(
@@ -886,6 +891,37 @@ def _donate_optimizer_state(optimizer):
     return optimizer
 
 
+def _layer_path_prefix(model):
+    """Parameter-name prefix of the transformer layers, e.g. ``model.layers.``."""
+    layers = _get_transformer_layers(model)
+    if not layers:
+        return None
+    for name, module in model.named_modules():
+        if module is layers[0]:
+            return name.rsplit(".", 1)[0] + "."
+    return None
+
+
+def _async_eval_by_layer(tree, prefix):
+    """Eval a parameter-shaped tree layer by layer, last first, then non-layer leaves,
+    each group behind the previous, so each layer's grad frees as the backward passes it.
+    Ascending order, leaves first, or no pacing each lose the saving."""
+    parent = prefix.rsplit(".", 2)[0] + "." if prefix.count(".") > 1 else ""
+    layers, rest = {}, []
+    for name, value in tree_flatten(tree):
+        if name.startswith(prefix):
+            index = int(name[len(prefix):].split(".", 1)[0])
+            layers.setdefault(index, []).append(value)
+        elif name.startswith(parent):
+            rest.append([value])
+    previous = None
+    for group in [layers[i] for i in sorted(layers, reverse=True)] + rest[::-1]:
+        mx.async_eval(group)
+        if previous is not None:
+            mx.eval(previous)
+        previous = group
+
+
 def _resolve_adam_epsilon(value):
     """Reject what torch.optim.Adam rejects (``not 0.0 <= eps``, incl. NaN);
     MLX adds eps to the denominator unchecked, so bad values train silently."""
@@ -902,6 +938,45 @@ def _resolve_adam_epsilon(value):
             "sign-flipped updates."
         )
     return epsilon
+
+
+def _hf_optim_args(args, allowed, unsupported):
+    """HF ``optim_args`` ("k=v,...") keys MLX can honour; ``unsupported`` keys
+    (MLX lacks them) raise unless at their no-op value. ``weight_decay`` is
+    skipped: HF param groups override it in torch too."""
+    raw = getattr(args, "optim_args", None)
+    if not raw:
+        return {}
+    parsed = dict(kv.split("=", 1) for kv in raw.replace(" ", "").split(",") if kv)
+    out = {}
+    for key, value in parsed.items():
+        if key in unsupported:
+            if key == "centered":
+                on = value.lower() in ("true", "1", "yes")
+            else:
+                on = float(value) != unsupported[key]
+            if on:
+                raise ValueError(
+                    f"Unsloth: MLX does not support optim_args {key}={value} "
+                    f"for optim={args.optim!r}."
+                )
+        elif key in allowed:
+            out[key] = float(value)
+    return out
+
+
+class _BiasCorrectedAdamax(optim.Adamax):
+    """Adamax plus torch's ``1 - beta1**t`` first-moment correction, which mlx.optimizers.Adamax hardcodes off."""
+
+    def apply_single(self, gradient, parameter, state):
+        lr = self.learning_rate.astype(gradient.dtype)
+        b1, b2 = self.betas
+        m = b1 * state["m"] + (1 - b1) * gradient
+        v = mx.maximum(b2 * state["v"], mx.abs(gradient))
+        state["m"] = m
+        state["v"] = v
+        clr = (lr / (1 - b1 ** self.step)).astype(gradient.dtype)
+        return parameter - clr * m / (v + self.eps)
 
 
 _part_is_norm = _mlx_norm_path_part_is_norm
@@ -1209,6 +1284,7 @@ _MLX_CONFIG_OPTIONAL_COPY_FIELDS = (
     "logging_dir",
     "run_name",
     "adam_epsilon",
+    "optim_args",
 )
 
 
@@ -1227,7 +1303,7 @@ class MLXTrainingConfig:
     lr_scheduler_type: str = "linear"  # "cosine", "linear", "constant"
 
     # Optimization
-    optim: str = "adamw"  # "adafactor", "adamw", "adam", "sgd", "muon", "lion"
+    optim: str = "adamw"  # see SUPPORTED_MLX_OPTIMIZERS
     weight_decay: float = 0.001
     adam_beta1: float | None = None
     adam_beta2: float | None = None
@@ -1338,9 +1414,12 @@ class MLXTrainingConfig:
     logging_dir: str | None = None
     run_name: str | None = None
 
-    # Must stay last (positional binding). None keeps MLX's default (1e-8, same
-    # as HF). Adam family only: MLX Adafactor's eps is a 2-tuple.
+    # None keeps MLX's default (1e-8, same as HF). Adam family only: MLX
+    # Adafactor's eps is a 2-tuple.
     adam_epsilon: float | None = None
+    # Must stay last (positional binding). HF "k=v,..." string; rmsprop/adagrad
+    # only, as in transformers' _get_rmsprop/_get_adagrad.
+    optim_args: str | None = None
 
     def __init__(self, *args, **kwargs):
         config_fields = [field for field in fields(type(self)) if field.init]
@@ -3997,6 +4076,28 @@ class MLXTrainer:
         elif opt_name == "lion":
             self._manual_weight_decay = float(wd or 0.0)
             optimizer = optim.Lion(learning_rate=initial_lr, weight_decay=0.0)
+        elif opt_name == "rmsprop":
+            # Coupled L2 decay (grad += wd * param), matching torch.
+            extra = _hf_optim_args(
+                self.args, ("alpha", "eps"), {"momentum": 0.0, "centered": False}
+            )
+            self._coupled_weight_decay = float(wd or 0.0)
+            optimizer = optim.RMSprop(learning_rate=initial_lr, **extra)
+        elif opt_name == "adamax":
+            self._coupled_weight_decay = float(wd or 0.0)
+            optimizer = _BiasCorrectedAdamax(
+                learning_rate=initial_lr, **adam_kwargs
+            )
+        elif opt_name == "adagrad":
+            extra = _hf_optim_args(self.args, ("eps",), {"lr_decay": 0.0})
+            self._coupled_weight_decay = float(wd or 0.0)
+            # HF Trainer passes no eps, so torch's 1e-10 (not MLX's 1e-8); step stays <= lr.
+            optimizer = optim.Adagrad(
+                learning_rate=initial_lr, eps=extra.get("eps", 1e-10)
+            )
+        elif opt_name == "adadelta":
+            self._coupled_weight_decay = float(wd or 0.0)
+            optimizer = optim.AdaDelta(learning_rate=initial_lr)
         self._resolved_optimizer_name = opt_name
         return _donate_optimizer_state(optimizer)
 
@@ -5944,6 +6045,15 @@ class MLXTrainer:
             model.state, optimizer.state, mx.random.state,
             *_reference_compile_state,
         ]
+        _layer_prefix = _layer_path_prefix(model)
+        # State created lazily inside the first compiled step raises that step's peak;
+        # init keeps resumed entries. On failure keep today's lazy init.
+        try:
+            optimizer.init(model.trainable_parameters())
+            mx.eval(optimizer.state)
+        except Exception:
+            pass
+        state[1] = optimizer.state
         # grad_accum==1 fast path: only for unclipped updates, since
         # clip_grad_norm can spike peak memory on bf16 VLM runs.
         _direct_single_step_update = (
@@ -8012,6 +8122,12 @@ class MLXTrainer:
                 eval_targets.append(grad_accum_state[1])
             if grad_norm is not None:
                 eval_targets.append(grad_norm)
+            if _layer_prefix is not None:
+                _async_eval_by_layer(
+                    model.trainable_parameters() if grad_accum_state is None
+                    else grad_accum_state[0],
+                    _layer_prefix,
+                )
             mx.eval(*eval_targets)
             global_toks = self._distributed_all_sum(supervised_toks, stream=mx.cpu)
             mx.eval(global_toks)
