@@ -2303,7 +2303,11 @@ def _fix_missing_no_grad(model):
     AudioRelativePositionEmbedding).
     """
     import mlx.nn as nn
-    for _, mod in model.named_modules():
+    # _finish_load runs this for every load, and not every loader hands back an nn.Module.
+    named_modules = getattr(model, "named_modules", None)
+    if named_modules is None:
+        return
+    for _, mod in named_modules():
         if isinstance(mod, nn.Module):
             if not hasattr(mod, "_no_grad"):
                 object.__setattr__(mod, "_no_grad", set())
@@ -3381,6 +3385,14 @@ def _mark_text_only_vlm(model, model_type: str) -> None:
     extra = _verify_text_only_wrapper(model, model_type)
     _bind_text_only_modality_arguments(model, extra)
     model._unsloth_text_only_vlm = True
+
+
+def _freeze_text_only_full_finetune(model) -> None:
+    """Freeze the towers for a text-only full fine-tune of a VLM; no-op otherwise."""
+    if getattr(model, "_unsloth_full_finetuning", False) and getattr(
+        model, "_unsloth_text_only_vlm", False
+    ):
+        _freeze_outside_language_model(model)
 
 
 def _freeze_outside_language_model(model) -> None:
@@ -8177,11 +8189,9 @@ def _finish_load(model, tokenizer):
     install_quantized_attention()
     # Here rather than in get_peft_model: the trainer and callers freeze loaded models too.
     _fix_missing_no_grad(model)
-    if (
-        getattr(model, "_unsloth_full_finetuning", False)
-        and getattr(model, "_unsloth_text_only_vlm", False)
-    ):
-        _freeze_outside_language_model(model)
+    # A call, not an if: tests/test_mlx_attention_metal.py keeps this body straight-line so the
+    # attention patch above can never sit behind a branch.
+    _freeze_text_only_full_finetune(model)
     _materialize_weights(model)
     return model, tokenizer
 
