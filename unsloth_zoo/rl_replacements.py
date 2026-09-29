@@ -643,13 +643,15 @@ def grpo_compute_loss(
     if loss_type in ["grpo", "sapo"]:
         loss = ((loss_i * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)).mean()
         loss = loss / current_gradient_accumulation_steps
-    elif loss_type == "bnpo":
+    elif loss_type == "bnpo" and num_items_in_batch is None:
+        # TRL < 0.22 passes no global token count: per micro-batch, so the loss depends on how the batch is split.
         loss = (loss_i * mask).sum() / mask.sum().clamp(min=1.0)
         loss = loss / current_gradient_accumulation_steps
     elif loss_type == "dr_grpo":
         loss = (loss_i * mask).sum() / (loss_i.size(0) * max_completion_length)
         loss = loss / current_gradient_accumulation_steps
-    elif loss_type in ["cispo", "dapo", "vespo"]:
+    elif loss_type in ["bnpo", "cispo", "dapo", "vespo"]:
+        # bnpo too: a per micro-batch token mean changes with the GPU / accumulation split, the global count does not.
         # Floor at 1 like TRL: a fully masked batch (mask_truncated_completions) is 0/0 = nan otherwise.
         if torch.is_tensor(num_items_in_batch):
             normalizer = num_items_in_batch.clamp(min = 1.0) / num_processes
@@ -1481,7 +1483,9 @@ def grpo_accumulated_loss(
         kwargs["vllm_importance_sampling_clip_max"] = kwargs["vllm_importance_sampling_cap"]
 
     if not hasattr(trainer, '_autocast_dtype'):
-        trainer._autocast_dtype = torch.float16 if os.environ.get('ACCELERATE_MIXED_PRECISION', 'fp16') == 'fp16' else torch.bfloat16
+        # "no" is float32 training (a T4 / V100 without bfloat16): autocasting it to bfloat16 raises there.
+        _mixed_precision = os.environ.get('ACCELERATE_MIXED_PRECISION', 'fp16')
+        trainer._autocast_dtype = None if _mixed_precision == 'no' else (torch.float16 if _mixed_precision == 'fp16' else torch.bfloat16)
         if os.environ.get('UNSLOTH_FORCE_FLOAT32', '0') == '1': trainer._autocast_dtype = None
     pass
     # Restored in `finally`: an OOM or interrupt below must not leave later forwards returning hidden states.
@@ -1489,7 +1493,9 @@ def grpo_accumulated_loss(
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
     try:
         lm_head = trainer.model.get_output_embeddings().weight
-        dtype_bytes = 16 if trainer._autocast_dtype in [torch.float16, torch.bfloat16] else 32
+        # Unsloth keeps _autocast_dtype set when it turns autocast off (float32 training on a GPU without bfloat16).
+        _autocast_on = trainer._autocast_dtype is not None and getattr(trainer, "_autocast_enabled", True)
+        dtype_bytes = 16 if _autocast_on and trainer._autocast_dtype in [torch.float16, torch.bfloat16] else 32
 
         total_rows = input_ids.shape[0]
         seq_len = input_ids.shape[1]
@@ -1589,7 +1595,7 @@ def grpo_accumulated_loss(
         # not the one that actually runs in production.
         from contextlib import nullcontext
 
-        if trainer._autocast_dtype is None:
+        if not _autocast_on:
             autocaster = nullcontext()
         else:
             autocaster = torch.amp.autocast(device_type = trainer.model.device.type, dtype = trainer._autocast_dtype)

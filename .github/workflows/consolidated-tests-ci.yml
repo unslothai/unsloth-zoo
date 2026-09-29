@@ -428,6 +428,7 @@ jobs:
             tests/test_loss_normalization_contract.py \
             tests/test_mlx_finetune_last_n_layers.py \
             tests/test_mlx_double_quant_reject.py \
+            tests/test_mlx_adam_epsilon.py \
             tests/test_hf_xet_fallback.py \
             tests/test_hf_xet_fallback_blob_scoped_redownload.py \
             tests/test_llama_cpp_install_consent.py \

@@ -217,3 +217,9 @@ def test_hf_rmsprop_bnb_aliases_route_to_rmsprop(alias):
     from unsloth_zoo.mlx.trainer import _normalize_mlx_optimizer_name
 
     assert _normalize_mlx_optimizer_name(alias) == "rmsprop"
+
+
+def test_adamax_takes_adam_betas_and_epsilon():
+    _, optimizer = _build("adamax", adam_beta1=0.8, adam_beta2=0.95, adam_epsilon=1e-6)
+    assert tuple(_hyperparameter(optimizer, "betas")) == pytest.approx((0.8, 0.95))
+    assert _hyperparameter(optimizer, "eps") == pytest.approx(1e-6)

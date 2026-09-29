@@ -30,6 +30,16 @@ if "mlx_simulation" in (getattr(mx, "__file__", "") or ""):
     pytest.skip(_SKIP, allow_module_level=True)
 
 
+@pytest.fixture(autouse=True)
+def _real_mlx_still_bound():
+    # A shim installed by an earlier module at run time rebinds sys.modules and the trainer's `optim`.
+    import sys
+    trainer = sys.modules.get("unsloth_zoo.mlx.trainer")
+    bound = [sys.modules.get("mlx.core"), sys.modules.get("mlx.optimizers"), getattr(trainer, "optim", None)]
+    if any("mlx_simulation" in (getattr(m, "__file__", "") or "") for m in bound if m is not None):
+        pytest.skip(_SKIP)
+
+
 def _torch_default(torch_class_name, parameter):
     import torch
 
