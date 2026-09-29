@@ -14,13 +14,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-# The mlx-vlm side of the incomplete-config diagnostic. mlx-vlm's
-# BaseModelConfig.from_dict (mlx_vlm/models/base.py) filters the config on
-# inspect.signature(cls).parameters before constructing, exactly as mlx-lm's
-# from_dict does, so a required field missing from a mirrored config.json fails
-# in ModelConfig.__init__ with a bare TypeError. Without a guard the VLM paths
-# surface that raw error, which reads as missing Apple Silicon support.
-
 from __future__ import annotations
 
 import inspect
@@ -35,10 +28,7 @@ def _install_mlx_shim():
     simulate_mlx_on_torch()
 
 
-# Verbatim from mlx-vlm 0.6.3. 43 of its architectures declare at least one
-# required (no-default) ModelConfig field -- text_config, vision_config,
-# projector_config and model_type are the common ones -- so this is the shape a
-# mirrored VLM config.json produces when transformers drops a key.
+# Verbatim from mlx-vlm 0.6.3.
 _VLM_MSG = (
     "ModelConfig.__init__() missing 1 required positional argument: 'text_config'"
 )
@@ -55,8 +45,6 @@ def test_vlm_message_shape_is_recognized():
 
 
 def test_library_named_in_the_message():
-    # A reader sent to the wrong project wastes the same time the bare
-    # TypeError did, so the VLM paths must say mlx-vlm, not mlx-lm.
     from unsloth_zoo.mlx.loader import _raise_if_incomplete_mlx_config
 
     with pytest.raises(ValueError) as exc:
@@ -74,8 +62,6 @@ def test_library_named_in_the_message():
 
 
 def test_default_library_still_mlx_lm():
-    # #1004's two text-side call sites pass no library; changing their message
-    # is out of scope for the VLM change.
     from unsloth_zoo.mlx.loader import _raise_if_incomplete_mlx_config
 
     with pytest.raises(ValueError) as exc:
@@ -89,7 +75,6 @@ def test_default_library_still_mlx_lm():
 
 
 def test_extra_weight_filter_converts_the_type_error():
-    # The real behavioural test: vlm_load is injected, so the whole path runs.
     from unsloth_zoo.mlx.loader import _load_mlx_vlm_with_extra_weight_filter
 
     def _vlm_load(model_name, **kwargs):
@@ -103,13 +88,10 @@ def test_extra_weight_filter_converts_the_type_error():
     assert "text_config" in msg
     assert "mlx-vlm" in msg
     assert "config.json" in msg
-    # The original TypeError stays reachable for anyone reading the traceback.
     assert isinstance(exc.value.__cause__, TypeError)
 
 
 def test_extra_weight_filter_passes_through_other_type_errors():
-    # mlx-vlm signature drift at our own call site must keep its traceback,
-    # exactly as on the text side.
     from unsloth_zoo.mlx.loader import _load_mlx_vlm_with_extra_weight_filter
 
     drift = "load() got an unexpected keyword argument 'lazy'"
@@ -136,10 +118,6 @@ def test_successful_vlm_load_is_untouched():
 
 
 def test_retry_path_is_deliberately_not_guarded():
-    # The retry inside the extra-weight filter runs only after a ValueError,
-    # which means ModelConfig already constructed -- a missing-key TypeError
-    # cannot originate there. Guarding it would be dead code, so assert the
-    # first load is the only guarded one.
     from unsloth_zoo.mlx.loader import _load_mlx_vlm_with_extra_weight_filter
 
     source = inspect.getsource(_load_mlx_vlm_with_extra_weight_filter)
@@ -147,10 +125,6 @@ def test_retry_path_is_deliberately_not_guarded():
 
 
 def test_distributed_guard_precedes_the_signature_drift_branch():
-    # Ordering is load-bearing in _load_mlx_vlm_distributed: it already owns a
-    # TypeError handler for sharded_load signature drift. The incomplete-config
-    # check has to run first (it is the precise, __init__-anchored test) while
-    # still leaving the drift branch reachable.
     from unsloth_zoo.mlx.loader import _load_mlx_vlm_distributed
 
     source = inspect.getsource(_load_mlx_vlm_distributed)
@@ -158,8 +132,6 @@ def test_distributed_guard_precedes_the_signature_drift_branch():
     guard_at = source.index("_raise_if_incomplete_mlx_config")
     drift_at = source.index('"tensor_group" not in message')
     assert guard_at < drift_at
-    # The drift branch must survive: an __init__-anchored pattern cannot match
-    # "sharded_load() got an unexpected keyword argument 'tensor_group'".
     from unsloth_zoo.mlx.loader import _missing_mlx_config_keys
 
     assert _missing_mlx_config_keys(
@@ -171,17 +143,10 @@ def test_distributed_guard_precedes_the_signature_drift_branch():
 
 
 def test_runtime_quant_vlm_path_is_guarded():
-    # The runtime-quant branch calls vlm_load directly and so bypasses
-    # _load_mlx_vlm_with_extra_weight_filter -- the same bypass the QK-norm
-    # guard already had to be repeated for. Without its own guard a
-    # load_in_4bit VLM load keeps the bare TypeError.
     from unsloth_zoo.mlx import loader
 
     source = inspect.getsource(loader)
-    # Bound the window semantically rather than by a character count: the
-    # runtime-quant VLM branch opens with this print and its QK-norm guard
-    # carries the marker comment, so a guard call between the two is inside
-    # that branch and nowhere else.
+    # Window = runtime-quant VLM branch: its opening print to its QK-norm marker comment.
     branch_start = 'via mlx-vlm (VLM, "'
     branch_end = "Pre-quantize load bypasses the extra-weight filter"
     assert source.count(branch_start) == 1
@@ -192,9 +157,7 @@ def test_runtime_quant_vlm_path_is_guarded():
 
 
 def test_every_vlm_load_entry_point_is_guarded():
-    # Guard against a fourth VLM load path being added later without the
-    # diagnostic. Counts the guard's call sites: three VLM ones plus the two
-    # text-side ones #1004 installed.
+    # 3 VLM + 2 mlx-lm call sites; a new unguarded load path should update this.
     from unsloth_zoo.mlx import loader
 
     source = inspect.getsource(loader)

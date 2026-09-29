@@ -576,29 +576,16 @@ def _message_matches_known_fallback(message, rule):
     return any(all(token in message for token in tokens) for tokens in token_sets)
 
 
+# Anchored on __init__: signature drift at our own call sites ("load_model() missing ...")
+# is not a config problem and must keep its traceback.
 _MLX_MISSING_ARGS_RE = re.compile(
-    # Anchored on __init__ so mlx-lm signature drift at our own call sites
-    # (e.g. "load_model() missing 1 required positional argument: 'model_path'")
-    # is never mistaken for an incomplete config; this loader deliberately
-    # tolerates that drift and must keep its original traceback.
     r"\w*\.?__init__\(\) missing \d+ required positional arguments?:(?P<keys>.*)"
 )
 
 
 def _missing_mlx_config_keys(message):
-    """Config keys the arch's config dataclass required but config.json omitted.
-
-    mlx-lm builds ModelArgs through ``from_dict``, which filters the config down
-    to fields the dataclass declares. A field with no default that is absent
-    from config.json therefore fails in ``__init__`` with a bare TypeError that
-    names neither the model nor the file. Returns [] for any other TypeError.
-
-    mlx-vlm fails the same way and is matched by the same pattern: its
-    ``BaseModelConfig.from_dict`` (mlx_vlm/models/base.py) filters on
-    ``inspect.signature(cls).parameters`` before constructing, so a missing
-    required field surfaces as e.g. "ModelConfig.__init__() missing 1 required
-    positional argument: 'text_config'".
-    """
+    """Required config fields config.json omitted: mlx-lm / mlx-vlm ``from_dict`` filter to
+    declared fields, so a missing no-default field fails in ``__init__``. [] otherwise."""
     match = _MLX_MISSING_ARGS_RE.search(message)
     if match is None:
         return []
@@ -608,16 +595,8 @@ def _missing_mlx_config_keys(message):
 def _raise_if_incomplete_mlx_config(
     model_name, model_type, message, error, library="mlx-lm",
 ):
-    """An incomplete config.json is a model-repo problem, not an MLX one.
-
-    Mirroring a checkpoint through a transformers version that does not model
-    every field can silently drop keys the arch still requires (e.g. lfm2's
-    block_ff_dim on the text side, or a VLM's text_config / vision_config). The
-    raw TypeError reads like missing Apple Silicon support, so name the actual
-    cause.
-
-    ``library`` names the loader that rejected the config ("mlx-lm" or
-    "mlx-vlm") so the message points at the right project."""
+    """Mirrored configs can drop required keys (lfm2 block_ff_dim, unsloth#7306); the raw
+    TypeError reads like missing MLX support, so name the config instead."""
     keys = _missing_mlx_config_keys(message)
     if not keys:
         return
@@ -1146,8 +1125,6 @@ def _load_mlx_lm_with_strict_fallback(
             model_config=model_config,
         )
     except TypeError as error:
-        # A required ModelArgs field absent from config.json surfaces here, not
-        # as the ValueError the strict fallback below handles.
         _raise_if_incomplete_mlx_config(model_name, model_type, str(error), error)
         raise
     except ValueError as error:
@@ -1293,8 +1270,6 @@ def _load_mlx_lm_distributed(
                     model_config=model_config,
                 )
             except TypeError as error:
-                # Same incomplete-config failure as the single-device path;
-                # strict=False does not cover a missing ModelArgs field.
                 _raise_if_incomplete_mlx_config(
                     model_name, model_type, str(error), error
                 )
@@ -1467,10 +1442,7 @@ def _load_mlx_vlm_with_extra_weight_filter(
         with _temporary_hf_token_env(hf_token):
             return vlm_load(model_name, **vlm_kwargs)
     except TypeError as error:
-        # A required config field absent from config.json fails in the arch's
-        # ModelConfig.__init__, not as the ValueError the extra-weight filter
-        # below handles. Only the first load can raise it: the retry runs after
-        # a ValueError, which means the config already constructed.
+        # The retry below runs after a ValueError, so config already built: unguarded.
         _raise_if_incomplete_mlx_config(
             model_name, model_type, str(error), error, library="mlx-vlm",
         )
@@ -1600,11 +1572,6 @@ def _load_mlx_vlm_distributed(
         ) from error
     except TypeError as error:
         message = str(error)
-        # Checked first, and it is the precise test: the incomplete-config
-        # pattern is anchored on __init__, so mlx-vlm signature drift at our own
-        # call site ("sharded_load() got an unexpected keyword argument
-        # 'tensor_group'") can never match it and still reaches the drift
-        # branch below.
         _raise_if_incomplete_mlx_config(
             model_name, model_type, message, error, library="mlx-vlm",
         )
@@ -9143,11 +9110,7 @@ class FastMLXModel:
                             **extra_kwargs,
                         )
                     except TypeError as error:
-                        # Same bypass as the ValueError below: this load does not
-                        # go through _load_mlx_vlm_with_extra_weight_filter, so
-                        # the incomplete-config diagnostic has to be repeated
-                        # here or a runtime-quant VLM load keeps the bare
-                        # TypeError.
+                        # Bypasses the extra-weight filter's guard.
                         _raise_if_incomplete_mlx_config(
                             model_name, model_type, str(error), error,
                             library="mlx-vlm",
