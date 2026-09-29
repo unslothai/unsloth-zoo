@@ -739,3 +739,23 @@ def test_materialize_shards_output_and_keeps_zero_biases_off_packed_modules(monk
     finally:
         import shutil
         shutil.rmtree(out_dir, ignore_errors=True)
+
+
+@pytest.mark.parametrize("extra", [
+    {"checkpoint_format": "marlin"}, {"format": "bitblas"}, {"is_marlin_format": True},
+])
+def test_non_v1_gptq_formats_rejected(extra):
+    import unsloth_zoo.mlx.loader as ml
+    with pytest.raises(NotImplementedError, match="format"):
+        ml._materialize_dequantized_hf_checkpoint(
+            "/nonexistent", {}, "gptq", {"bits": 4, "group_size": 128, **extra},
+        )
+
+
+@pytest.mark.parametrize("extra", [{}, {"checkpoint_format": "gptq"}, {"format": "GPTQ"}])
+def test_v1_gptq_formats_accepted(extra):
+    import unsloth_zoo.mlx.loader as ml
+    with pytest.raises(FileNotFoundError):
+        ml._materialize_dequantized_hf_checkpoint(
+            "/nonexistent", {}, "gptq", {"bits": 4, "group_size": 128, **extra},
+        )

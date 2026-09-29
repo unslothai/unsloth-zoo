@@ -5717,6 +5717,14 @@ def _materialize_dequantized_hf_checkpoint(local_path, config_data, method, quan
                 "supported for MLX runtime dequant. Convert to the v1 GPTQ format, "
                 "or use a v1 GPTQ / AWQ checkpoint."
             )
+        # Marlin / BitBLAS / IPEX / QQQ repack qweight differently; only the AutoGPTQ v1 layout decodes here.
+        _other_fmts = _ckpt_fmts - {"", "gptq"}
+        if _other_fmts or quant_config.get("is_marlin_format"):
+            raise NotImplementedError(
+                f"Unsloth: GPTQ checkpoint format {sorted(_other_fmts) or ['marlin']} is "
+                "not supported on MLX; only the standard AutoGPTQ (v1) packing can be "
+                "loaded. Use a checkpoint saved with format='gptq'."
+            )
 
     shard_paths = sorted(glob.glob(os.path.join(local_path, "*.safetensors")))
     if not shard_paths:
