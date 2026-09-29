@@ -2079,6 +2079,43 @@ def test_grpo_trains_on_real_rollouts(tmp_path, compiled):
 
 
 @metal_only
+@pytest.mark.parametrize("temperature", [1.0, 0.7])
+def test_grpo_cce_scores_completions_like_the_dense_head(temperature):
+    """Runtime CCE over compacted completion rows gives the dense log-probs and gradient."""
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+    from unsloth_zoo.mlx import grpo
+
+    model, tokenizer = FastMLXModel.from_pretrained(MODEL, max_seq_length=256)
+    model = FastMLXModel.get_peft_model(model, r=8, lora_alpha=16, lora_dropout=0)
+    scorer = grpo.make_grpo_scorer(model, temperature)
+    assert scorer is not None, "the SmolLM head should be CCE-eligible"
+    rows = [tokenizer.encode(text) for text in (
+        "What is 2 plus 2? It is four.", "Name a colour: blue, and also green.",
+    )]
+    lengths = [[6, len(rows[0])], [5, len(rows[1])]]
+    width = 1 + 64
+    batch = mx.array([r + [0] * (width - len(r)) for r in rows], dtype=mx.int32)
+    lengths_mx = mx.array(lengths, dtype=mx.int32)
+    mask = grpo._response_mask(batch[:, 1:], lengths_mx)
+    dense = grpo._token_logps(model, batch, temperature) * mask
+    indices = grpo.completion_indices(lengths, width)
+    compact = grpo._token_logps(model, batch, temperature, mask, scorer, indices) * mask
+    assert mx.allclose(dense, compact, atol=2e-3, rtol=2e-3).item(), mx.abs(dense - compact).max()
+
+    args = (batch, lengths_mx, mx.array([1.0, -1.0]), mx.array([1.0, 0.0]))
+    options = dict(beta=0.0, epsilon_low=0.2, epsilon_high=0.2, temperature=temperature)
+    grads = []
+    for loss_fn, extra in ((grpo.make_grpo_loss_fn(**options), ()),
+                           (grpo.make_grpo_loss_fn(scorer=scorer, **options), (indices,))):
+        _, grad = nn.value_and_grad(model, lambda m, *a: loss_fn(m, *a)[0])(model, *args, *extra)
+        grads.append(dict(tree_flatten(grad)))
+    for key, value in grads[0].items():
+        assert mx.allclose(value, grads[1][key], atol=1e-3, rtol=5e-2).item(), key
+
+
+@metal_only
 def test_neftune_noise_is_gated_out_of_the_preference_eval_forward(tmp_path):
     """Evaluation must score the model, not a noised copy of it.
 

@@ -614,6 +614,7 @@ from .utils import (
 from .grpo import (
     build_rollout_batch,
     make_grpo_loss_fn,
+    make_grpo_scorer,
     rollout_prompt_indices,
     rollout_seed,
 )
@@ -5836,13 +5837,17 @@ class MLXTrainer:
                 beta=float(args.beta), epsilon_low=float(args.epsilon),
                 epsilon_high=float(epsilon_high), temperature=float(args.temperature),
                 reference_policy=reference_policy,
+                scorer=make_grpo_scorer(model, float(args.temperature)) if args.use_cce else None,
             )
+            use_cce = hasattr(loss_fn, "_unsloth_cce_backend")
+            self._rollout_cce_compaction = loss_fn._unsloth_cce_compaction
             self._preference_run_context = PreferenceRunContext(
                 model, enabled=bool(args.disable_dropout),
             )
             _main_print(
                 f"Unsloth: Using GRPO loss (beta={args.beta}, "
-                f"num_generations={args.num_generations})."
+                f"num_generations={args.num_generations}"
+                f"{', runtime CCE' if use_cce else ''})."
             )
         _reference_compile_state = (
             [] if _sampling_reference is None else [_sampling_reference.state]
@@ -9364,12 +9369,6 @@ class MLXGRPOTrainer(MLXTrainer):
         if pad_id is None:
             pad_id = getattr(tokenizer, "eos_token_id", None) or 0
 
-        def encode(text):
-            # TRL tokenizes rendered prompts without adding special tokens.
-            return [int(token) for token in encode_mlx_text(
-                tokenizer, text, add_special_tokens=False,
-            )]
-
         rank, world = self.distributed_rank, self.distributed_world_size
         group = int(args.num_generations)
         while True:
@@ -9380,11 +9379,12 @@ class MLXGRPOTrainer(MLXTrainer):
                 shuffle=not (args.preserve_dataset_order or args.dataset_order == "sequential"),
             )
             yield build_rollout_batch(
-                self.model, tokenizer, encode, [self._rollout_rows[i] for i in indices],
+                self.model, tokenizer, [self._rollout_rows[i] for i in indices],
                 args=args, reward_funcs=self.reward_funcs, reward_weights=self.reward_weights,
                 seeds=[rollout_seed(args.seed, rank, position, row)
                        for row in range(len(indices) * group)],
                 pad_id=int(pad_id), trainer_state=self.state,
+                compact=getattr(self, "_rollout_cce_compaction", False),
             )
             position += 1
 

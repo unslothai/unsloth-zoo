@@ -24,21 +24,41 @@ import mlx.nn as nn
 import numpy as np
 
 from .generate import GenerationDefaults, GenerationRequest, SamplingParams, generate_batch
-from .preference import _response_mask, _supervised_tokens
-from .utils import _model_logits, _normalize_seed
+from .preference import _make_preference_cce_scorer, _response_mask, _supervised_tokens
+from .utils import _model_logits, _normalize_seed, encode_mlx_text
 
-# Rollout widths are padded up to this multiple so the compiled step sees a
-# bounded set of shapes; padding sits past every row's end and is masked out.
+# Rollout widths and CCE row counts are padded up to these multiples so the compiled
+# step sees a bounded set of shapes; padding is masked out.
 ROLLOUT_WIDTH_MULTIPLE = 64
+CCE_ROWS_MULTIPLE = 256
 
 
-def _token_logps(model, batch, temperature):
+def _token_logps(model, batch, temperature, mask=None, scorer=None, indices=None):
+    """Log-probs of each next token on the tempered distribution the rollout sampled (as TRL).
+
+    With a scorer, only the completion positions run through the head (TRL's
+    logits_to_keep), and no full-vocabulary logits are materialised.
+    """
+    if scorer is not None:
+        ce, _ = scorer(
+            model, batch, mask > 0, indices,
+            hidden_scale=None if temperature == 1.0 else 1.0 / temperature,
+        )
+        return -ce
     targets = batch[:, 1:]
     logits = _model_logits(model(batch[:, :-1]))
-    # TRL scores every log-prob on the tempered distribution the rollout sampled.
     if temperature != 1.0:
         logits = logits / temperature
     return -nn.losses.cross_entropy(logits, targets, reduction="none").reshape(targets.shape)
+
+
+def make_grpo_scorer(model, temperature):
+    """The runtime-CCE completion scorer, or None where the dense path must score."""
+    scorer = _make_preference_cce_scorer(model)
+    # A softcap is not linear in the hidden state, so a temperature cannot fold into it.
+    if scorer is None or (scorer.softcap and temperature != 1.0):
+        return None
+    return scorer
 
 
 def grpo_metric_layout(beta):
@@ -48,7 +68,9 @@ def grpo_metric_layout(beta):
     return ("reward", "completions/mean_length"), (2, 2)
 
 
-def make_grpo_loss_fn(*, beta, epsilon_low, epsilon_high, temperature, reference_policy=None):
+def make_grpo_loss_fn(
+    *, beta, epsilon_low, epsilon_high, temperature, reference_policy=None, scorer=None,
+):
     """TRL ``loss_type="grpo"``: per-sequence mean over completion tokens, then mean over rows.
 
     The accumulation weight is the row count, so a window of micro-batches
@@ -57,9 +79,9 @@ def make_grpo_loss_fn(*, beta, epsilon_low, epsilon_high, temperature, reference
     if beta and reference_policy is None:
         raise ValueError("Unsloth MLX GRPO: beta != 0 needs a reference policy.")
 
-    def loss_fn(model, batch, lengths, advantages, rewards):
+    def loss_fn(model, batch, lengths, advantages, rewards, cce_indices=None):
         mask = _response_mask(batch[:, 1:], lengths)
-        logps = _token_logps(model, batch, temperature)
+        logps = _token_logps(model, batch, temperature, mask, scorer, cce_indices)
         ratio = mx.exp(logps - mx.stop_gradient(logps))
         clipped = mx.clip(ratio, 1 - epsilon_low, 1 + epsilon_high)
         advantage = advantages[:, None]
@@ -68,7 +90,8 @@ def make_grpo_loss_fn(*, beta, epsilon_low, epsilon_high, temperature, reference
         stats = [rewards.astype(mx.float32).sum()]
         if beta:
             with reference_policy.activate(model) as reference:
-                reference_logps = mx.stop_gradient(_token_logps(reference, batch, temperature))
+                reference_logps = mx.stop_gradient(
+                    _token_logps(reference, batch, temperature, mask, scorer, cce_indices))
             delta = reference_logps - logps
             kl = mx.exp(delta) - delta - 1
             per_token = per_token + beta * kl
@@ -85,15 +108,26 @@ def make_grpo_loss_fn(*, beta, epsilon_low, epsilon_high, temperature, reference
     loss_fn._unsloth_preference_denominators = denominators
     loss_fn._unsloth_preference_stats_width = len(names) + (2 if beta else 1)
     loss_fn._unsloth_supervised_tokens = _supervised_tokens
+    loss_fn._unsloth_cce_compaction = scorer is not None and scorer.compaction
+    if scorer is not None:
+        loss_fn._unsloth_cce_backend = "runtime-cce"
     return loss_fn
 
 
 def group_advantages(rewards, num_generations):
-    """``(r - mean) / (std + 1e-4)`` per group, with TRL's unbiased (ddof=1) std."""
+    """``(r - mean) / (std + 1e-4)`` per group, with TRL's unbiased (ddof=1) std.
+
+    NaN marks an unscorable completion: TRL leaves it out of its group's mean and
+    std and gives it no advantage, as it does a group with one scorable row.
+    """
     grouped = np.asarray(rewards, dtype=np.float64).reshape(-1, num_generations)
-    mean = grouped.mean(axis=1, keepdims=True)
-    std = grouped.std(axis=1, ddof=1, keepdims=True)
-    return ((grouped - mean) / (std + 1e-4)).reshape(-1)
+    counts = (~np.isnan(grouped)).sum(axis=1, keepdims=True)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mean = np.nansum(grouped, axis=1, keepdims=True) / counts
+        std = np.sqrt(np.nansum((grouped - mean) ** 2, axis=1, keepdims=True) / (counts - 1))
+        std = np.where(counts > 1, std, np.nan)
+        advantages = (grouped - mean) / (std + 1e-4)
+    return np.nan_to_num(advantages, nan=0.0).reshape(-1)
 
 
 def _accepts(func, name):
@@ -141,7 +175,10 @@ def _reward_view(prompt, completions):
 
 
 def score_rewards(reward_funcs, reward_weights, examples, completions, completion_ids, trainer_state):
-    """Weighted sum over reward functions, one score per completion; None is skipped as TRL's nansum does."""
+    """Weighted sum over reward functions, one score per completion.
+
+    None is skipped, as TRL's nansum does; a completion no function scored is NaN.
+    """
     prompts, views = [], []
     for example, texts in zip(examples, completions):
         prompt, view = _reward_view(example["prompt"], texts)
@@ -154,6 +191,7 @@ def score_rewards(reward_funcs, reward_weights, examples, completions, completio
         for key in examples[0] if key not in ("prompt", "completion", "completion_ids")
     }
     total = np.zeros(len(views), dtype=np.float64)
+    scored = np.zeros(len(views), dtype=bool)
     for func, weight in zip(reward_funcs, reward_weights):
         kwargs = dict(columns, prompts=prompts, completions=views)
         if _accepts(func, "completion_ids"):
@@ -168,8 +206,10 @@ def score_rewards(reward_funcs, reward_weights, examples, completions, completio
                 f"scores for {len(views)} completions; it must return one per completion."
             )
         for index, value in enumerate(values):
-            if value is not None:
+            if value is not None and not math.isnan(float(value)):
                 total[index] += weight * float(value)
+                scored[index] = True
+    total[~scored] = np.nan
     return total
 
 
@@ -203,20 +243,41 @@ def _pad_width(width, max_seq_length):
     return max(width, min(padded, max_seq_length))
 
 
+def encode_prompt(tokenizer, prompt):
+    """TRL's prompt ids: a chat template carries its own specials, plain text gets the tokenizer's."""
+    rendered = render_prompt(tokenizer, prompt)
+    special = None if not _is_conversational(prompt) else False
+    return [int(token) for token in encode_mlx_text(tokenizer, rendered, add_special_tokens=special)]
+
+
+def completion_indices(lengths, width, rows_multiple=CCE_ROWS_MULTIPLE):
+    """Flat target positions of every completion token, padded with -1 to a bounded length."""
+    targets = width - 1
+    positions = [
+        row * targets + position
+        for row, (start, end) in enumerate(lengths)
+        for position in range(start - 1, end - 1)
+    ]
+    capacity = max(rows_multiple, -(-len(positions) // rows_multiple) * rows_multiple)
+    capacity = min(capacity, len(lengths) * targets)
+    return mx.array(positions + [-1] * (capacity - len(positions)), dtype=mx.int32)
+
+
 def build_rollout_batch(
-    model, tokenizer, encoder, examples, *, args, reward_funcs, reward_weights,
-    seeds, pad_id, trainer_state,
+    model, tokenizer, examples, *, args, reward_funcs, reward_weights,
+    seeds, pad_id, trainer_state, compact=False,
 ):
     """Generate ``num_generations`` completions per example and score them.
 
-    Returns ``(batch, lengths, advantages, rewards)``. A completion that stopped
+    Returns ``(batch, lengths, advantages, rewards)``, plus the completion
+    positions for runtime CCE when ``compact``. A completion that stopped
     on an end token keeps that token, as TRL's completion mask does.
     """
     group = int(args.num_generations)
     top_p = float(args.top_p)
     requests, prompt_ids = [], []
     for example in examples:
-        ids = encoder(render_prompt(tokenizer, example["prompt"]))
+        ids = encode_prompt(tokenizer, example["prompt"])
         room = int(args.max_seq_length) - len(ids)
         if room <= 0:
             raise ValueError(
@@ -263,9 +324,13 @@ def build_rollout_batch(
     )
     width = _pad_width(max(len(row) for row in rows), int(args.max_seq_length))
     batch = mx.array([row + [pad_id] * (width - len(row)) for row in rows], dtype=mx.int32)
-    return (
+    rollout = (
         batch,
         mx.array(lengths, dtype=mx.int32),
         mx.array(group_advantages(rewards, group), dtype=mx.float32),
-        mx.array(rewards, dtype=mx.float32),
+        # Logged only; an unscorable completion reports 0.
+        mx.array(np.nan_to_num(rewards, nan=0.0), dtype=mx.float32),
     )
+    if compact:
+        rollout += (completion_indices(lengths, width),)
+    return rollout

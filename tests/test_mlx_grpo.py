@@ -321,7 +321,8 @@ def test_rollout_keeps_the_stop_token_and_passes_trl_reward_kwargs(tmp_path, mon
     assert seen["open"][0] == [[7, 8, EOS], [9, 10, 11, 12]]
     assert seen["open"][1] is trainer.state
     assert seen["open"][2] == ["answer", "prompts"]
-    assert all(flag is False for flag in trainer.tokenizer.special_flags)
+    # Latest TRL tokenizes a plain-text prompt with the tokenizer's specials.
+    assert all(flag is True for flag in trainer.tokenizer.special_flags)
     assert batch.shape[1] == 32
     requests = fake.calls[0]
     assert {r.sampling.seed for r in requests} and len({r.sampling.seed for r in requests}) == 2
@@ -353,6 +354,7 @@ def test_chat_prompts_render_and_reward_as_messages(tmp_path, monkeypatch):
     batch, lengths, _, _ = next(trainer._prepare_data(False)[1])
     rendered = [3 + ord(c) % 43 for c in "<user>hi<assistant>"]
     assert batch.tolist()[0][:len(rendered)] == rendered
+    assert trainer.tokenizer.special_flags == [False]
     completions, prompts = seen[0]
     assert completions[0] == [{"role": "assistant", "content": "h"}]
     assert prompts == [chat, chat]
@@ -454,3 +456,71 @@ def test_a_resumed_stream_starts_where_the_run_stopped(tmp_path, monkeypatch):
     resumed = next(trainer._rollout_batches(3))
     for got, expected in zip(resumed, fresh[3]):
         assert got.tolist() == expected.tolist()
+
+
+def test_unscorable_completions_leave_the_baseline_and_get_no_advantage():
+    from unsloth_zoo.mlx.grpo import group_advantages, score_rewards
+
+    nan = float("nan")
+    got = group_advantages([1.0, nan, 3.0, 2.0, nan, nan], 3)
+    scored = np.array([1.0, 3.0])
+    expected = (scored - scored.mean()) / (scored.std(ddof=1) + 1e-4)
+    np.testing.assert_allclose(got[[0, 2]], expected)
+    assert got[1] == 0.0
+    np.testing.assert_array_equal(got[3:], 0.0)
+
+    def first(completions, **kwargs):
+        return [None, 1.0]
+
+    def second(completions, **kwargs):
+        return [None, None]
+
+    rows = [{"prompt": "p"}]
+    total = score_rewards([first, second], [1.0, 1.0], rows, [["a", "b"]], [[[1], [2]]], None)
+    assert np.isnan(total[0]) and total[1] == 1.0
+
+
+def test_completion_indices_cover_exactly_the_completion_targets():
+    from unsloth_zoo.mlx.grpo import completion_indices
+
+    got = completion_indices([[2, 4], [3, 3], [1, 5]], width=6, rows_multiple=8).tolist()
+    assert got == [1, 2, 10, 11, 12, 13, -1, -1]
+
+
+def test_a_scorer_scores_only_completions_on_the_tempered_head():
+    import mlx.core as mx
+    import mlx.nn as nn
+    from unsloth_zoo.mlx import grpo
+
+    model = _tiny_model()
+    calls = []
+
+    def scorer(model_, batch, supervised, indices=None, *, hidden_scale=None):
+        calls.append((supervised.tolist(), None if indices is None else indices.tolist(), hidden_scale))
+        logits = model_(batch[:, :-1]) * (1.0 if hidden_scale is None else hidden_scale)
+        ce = nn.losses.cross_entropy(logits, batch[:, 1:], reduction="none").reshape(supervised.shape)
+        return ce * supervised, None
+
+    scorer.compaction = True
+    batch = mx.array([[3, 4, 5, 6, 0], [3, 4, 7, 8, 9]], dtype=mx.int32)
+    lengths = mx.array([[2, 4], [2, 5]], dtype=mx.int32)
+    args = (batch, lengths, mx.array([0.7, -0.7]), mx.array([1.0, 0.0]))
+    options = dict(beta=0.0, epsilon_low=0.2, epsilon_high=0.2, temperature=0.5)
+    dense = grpo.make_grpo_loss_fn(**options)(model, *args)[0]
+    fn = grpo.make_grpo_loss_fn(scorer=scorer, **options)
+    indices = grpo.completion_indices(lengths.tolist(), 5, rows_multiple=8)
+    scored = fn(model, *args, indices)[0]
+    assert math.isclose(float(scored.item()), float(dense.item()), rel_tol=1e-6, abs_tol=1e-7)
+    assert fn._unsloth_cce_compaction and fn._unsloth_cce_backend == "runtime-cce"
+    supervised, got_indices, hidden_scale = calls[0]
+    assert supervised == [[False, True, True, False], [False, True, True, True]]
+    assert got_indices == [1, 2, 5, 6, 7, -1, -1, -1] and hidden_scale == 2.0
+
+
+def test_softcapped_heads_keep_the_dense_path_away_from_temperature_one(monkeypatch):
+    from unsloth_zoo.mlx import grpo
+
+    fake = types.SimpleNamespace(softcap=30.0)
+    monkeypatch.setattr(grpo, "_make_preference_cce_scorer", lambda model: fake)
+    assert grpo.make_grpo_scorer(object(), 0.7) is None
+    assert grpo.make_grpo_scorer(object(), 1.0) is fake
