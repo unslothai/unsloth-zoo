@@ -77,14 +77,13 @@ def test_kto_trains_and_saves(tmp_path):
 @metal_only
 def test_kto_stop_requests(tmp_path):
     trainer = _trainer(tmp_path, max_steps=2)
-    trainer.stop_requested = True  # a cancel raised before train() is honored
+    trainer.stop_requested = True
     assert trainer.train()["train_steps"] == 0
-    assert trainer.train()["train_steps"] == 2  # that stop is stale for the next run
+    assert trainer.train()["train_steps"] == 2
 
 
 @metal_only
 def test_kto_minibatches_keep_their_kl_partners(tmp_path, monkeypatch):
-    # TRL pairs KL completions within fixed batches, so each minibatch must hold its partners.
     import unsloth_zoo.mlx.trainer as T
     seen, real = [], T._kto_batch
     monkeypatch.setattr(T, "_kto_batch", lambda rows, pad_id: seen.append(rows) or real(rows, pad_id))
@@ -111,8 +110,7 @@ def test_kto_step_counts_follow_accumulation_and_epochs(tmp_path):
     out = _trainer(tmp_path / "b", data=_dataset(8), max_steps=0, num_train_epochs=2).train()
     assert out.global_step == out["total_train_steps"] == 4
     out = _trainer(tmp_path / "d", data=_dataset(8), max_steps=0, num_train_epochs=1.5).train()
-    assert out.global_step == out["total_train_steps"] == 3  # fractional epochs stop part-way
-    # 3 batches per epoch at accumulation 2: the partial window still steps, per epoch.
+    assert out.global_step == out["total_train_steps"] == 3
     out = _trainer(tmp_path / "c", data=_dataset(12), max_steps=0, gradient_accumulation_steps=2,
                    num_train_epochs=2).train()
     assert out.global_step == out["total_train_steps"] == 4
@@ -135,8 +133,7 @@ def test_kto_grad_accum_weights_microbatches_by_rows(tmp_path):
 @metal_only
 @pytest.mark.parametrize("disable_dropout", [True, False])
 def test_kto_dropout_disabled_for_scoring(tmp_path, disable_dropout):
-    # A trained adapter at lr=0: the policy equals its start snapshot, so without dropout
-    # the loss is exactly 0.5 and the KL exactly 0; live dropout draws separate masks.
+    # lr=0 keeps policy == start snapshot, so only live dropout can move loss off 0.5 or KL off 0.
     from unsloth_zoo.mlx.loader import FastMLXModel
     from unsloth_zoo.mlx.utils import iter_mlx_lora_modules
     model, tok = FastMLXModel.from_pretrained(MODEL, max_seq_length=256, load_in_4bit=True)

@@ -219,7 +219,7 @@ def test_kto_rejects_unsupported_options(name, monkeypatch):
     tr.args = T.MLXKTOConfig(**case.get("args", {}))
     monkeypatch.setattr(T.MLXKTOTrainer, "distributed_world_size", 1, raising=False)
     if not name:
-        tr._reject_unsupported(None)  # a supported setup must pass
+        tr._reject_unsupported(None)
         return
     with pytest.raises(NotImplementedError, match=name):
         tr._reject_unsupported(case.get("resume"))

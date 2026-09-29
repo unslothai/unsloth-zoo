@@ -10015,8 +10015,7 @@ class MLXKTOTrainer(MLXTrainer):
         else:
             epochs = float(args.num_train_epochs) if args.num_train_epochs and args.num_train_epochs > 0 else 1.0
             total_steps = max(math.ceil(epochs * steps_per_epoch), 1)  # fractional epochs stop part-way
-        # TRL's KTOConfig defaults to sequential sampling: KL completions are paired within fixed batches.
-        # An explicit torch_randperm reorders whole batches, which keeps every pairing intact.
+        # Sequential like TRL's KTOConfig: KL partners share a fixed batch; torch_randperm moves whole batches.
         permute = args.dataset_order == "torch_randperm" and not args.preserve_dataset_order
         from .utils import _normalize_seed, _torch_randperm_order
         seed = _normalize_seed(args.seed)
@@ -10037,7 +10036,6 @@ class MLXKTOTrainer(MLXTrainer):
         self._train_loss_history, self._kl_history, self._global_step = [], [], 0
         dropout, checkpointed, patched, trained_tokens = None, False, False, 0
         try:
-            # Same setup as MLXTrainer.train: Metal memory guard, gradient checkpointing, MLX training patches.
             self._memory_limits_applied = self._configure_memory_limits()
             if args.gradient_checkpointing:
                 apply_gradient_checkpointing(model)
