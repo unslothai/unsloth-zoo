@@ -195,8 +195,17 @@ def _qat_call(self, x):
         packed, scales, biases, group_size=group_size, bits=bits, mode=mode,
     )
     straight_through = merged + mx.stop_gradient(fake - merged)
-
-    y = x @ straight_through.T
+    dense = x @ straight_through.T
+    # Forward value = the quantized_matmul the saved QuantizedLinear runs; a dense
+    # GEMM rounds differently (0.017 loss drift on Metal). Correction in fp32 so the
+    # bf16 round trip is exact; gradients still flow through `dense`.
+    shipped = mx.quantized_matmul(
+        x, packed, scales, biases, transpose=True,
+        group_size=group_size, bits=bits, mode=mode,
+    )
+    y = (dense.astype(mx.float32) + mx.stop_gradient(
+        shipped.astype(mx.float32) - dense.astype(mx.float32)
+    )).astype(shipped.dtype)
     # fuse() keeps the base bias; dropping it breaks Qwen2 q/k/v.
     if "bias" in base:
         y = y + base.bias

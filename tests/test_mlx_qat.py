@@ -92,6 +92,36 @@ def test_qat_forward_matches_fused_module(bias):
     )
 
 
+@pytest.mark.parametrize("bias", [False, True])
+def test_qat_forward_is_bit_exact_to_fused_module_in_bf16(bias):
+    """bf16 exposes a dense GEMM vs quantized_matmul rounding gap that fp32 hides."""
+    mx.random.seed(1)
+    lin = nn.Linear(DIMS, DIMS, bias=bias)
+    lin.set_dtype(mx.bfloat16)
+    layer = LoRALinear.from_base(
+        nn.QuantizedLinear.from_linear(lin, GROUP_SIZE, BITS), r=8, scale=2.0,
+    )
+    layer.lora_b = (mx.random.normal(layer.lora_b.shape) * 0.05).astype(mx.bfloat16)
+    fused = layer.fuse(dequantize=False)
+    apply_mlx_qat(_Holder(layer), "auto")
+
+    x = mx.random.normal((64, DIMS)).astype(mx.bfloat16)
+    qat_out, fused_out = layer(x), fused(x)
+    mx.eval(qat_out, fused_out)
+    assert qat_out.dtype == fused_out.dtype
+    assert mx.array_equal(qat_out, fused_out).item()
+
+    grad = mx.grad(lambda b: layer.__class__.__call__(
+        _with_lora_b(layer, b), x).astype(mx.float32).sum())(layer.lora_b)
+    mx.eval(grad)
+    assert float(mx.abs(grad.astype(mx.float32)).max()) > 0.0
+
+
+def _with_lora_b(layer, lora_b):
+    layer.lora_b = lora_b
+    return layer
+
+
 def test_qat_forward_includes_base_bias():
     """A dropped bias term still 'runs' — it must be caught explicitly."""
     layer = _make_lora(bias=True)
