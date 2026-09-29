@@ -165,9 +165,9 @@ def assert_tokenizers_compatible(student_tokenizer, teacher_tokenizer,
 
 
 def _assert_vocab_mappings_match(student_tokenizer, teacher_tokenizer):
-    """Every token must map to the same id. Differences confined to added
-    tokens (Qwen3's <think> vs a Qwen2.5 teacher) warn: those ids only matter
-    when the data contains them. Tokenizers without get_vocab skip this."""
+    """Every token must map to the same id: the divergence compares every vocab
+    column, so even an added token absent from the data (Qwen3's <think> vs a
+    Qwen2.5 teacher) moves the targets. Tokenizers without get_vocab skip this."""
     try:
         student_vocab = student_tokenizer.get_vocab()
         teacher_vocab = teacher_tokenizer.get_vocab()
@@ -177,30 +177,13 @@ def _assert_vocab_mappings_match(student_tokenizer, teacher_tokenizer):
         token for token in student_vocab.keys() | teacher_vocab.keys()
         if student_vocab.get(token) != teacher_vocab.get(token)
     )
-    if not differing:
-        return
-    added = set()
-    for tokenizer in (student_tokenizer, teacher_tokenizer):
-        try:
-            added.update(tokenizer.get_added_vocab())
-        except Exception:
-            pass
-    base = [token for token in differing if token not in added]
-    if base:
+    if differing:
         raise ValueError(
             "Unsloth: GKD needs the teacher and student to share a tokenizer, but "
-            f"{len(base)} vocabulary tokens map to different ids (e.g. "
-            f"{base[:5]!r}), so the teacher's distribution would not line up "
-            "with the student's tokens."
+            f"{len(differing)} tokens map to different ids (e.g. {differing[:5]!r}). "
+            "The divergence compares every vocabulary column, so the student "
+            "would be trained toward the teacher's probability for other tokens."
         )
-    import warnings
-    warnings.warn(
-        f"Unsloth: GKD teacher and student disagree on {len(differing)} added "
-        f"tokens ({differing[:5]!r}); the teacher's targets at those ids are "
-        "not meaningful if your data contains them.",
-        UserWarning,
-        stacklevel = 3,
-    )
 
 
 def estimate_distillation_peak_bytes(batch_size, sequence_length, vocab_size,
@@ -277,9 +260,9 @@ def validate_gkd_config(gkd_beta, gkd_temperature, gkd_lmbda):
             f"Unsloth: gkd_beta must be in [0, 1], got {gkd_beta}. 0 is forward KL "
             "(classic KD), 1 is reverse KL, 0.5 is symmetric JSD."
         )
-    if gkd_temperature <= 0.0:
+    if not (0.0 < gkd_temperature < float("inf")):
         raise ValueError(
-            f"Unsloth: gkd_temperature must be > 0, got {gkd_temperature}."
+            f"Unsloth: gkd_temperature must be finite and > 0, got {gkd_temperature}."
         )
     if gkd_lmbda:
         raise ValueError(

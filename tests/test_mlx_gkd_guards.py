@@ -66,15 +66,12 @@ def test_width_mismatch_is_rejected_without_tokenizers():
 
 class VocabTokenizer(FakeTokenizer):
 
-    def __init__(self, vocab, added=()):
+    def __init__(self, vocab):
         super().__init__()
-        self.vocab, self.added = vocab, {t: vocab[t] for t in added}
+        self.vocab = vocab
 
     def get_vocab(self):
         return dict(self.vocab)
-
-    def get_added_vocab(self):
-        return dict(self.added)
 
 
 def test_unprobed_vocabulary_difference_is_rejected():
@@ -85,12 +82,13 @@ def test_unprobed_vocabulary_difference_is_rejected():
         d.assert_tokenizers_compatible(student, teacher, VOCAB, VOCAB)
 
 
-def test_added_token_difference_only_warns():
+def test_added_token_difference_is_rejected():
+    """Qwen3 student, Qwen2.5 teacher: only <think>-style added tokens differ."""
     d = _distill()
-    student = VocabTokenizer({"a": 0, "b": 1, "<think>": 2}, added=["<think>"])
+    student = VocabTokenizer({"a": 0, "b": 1, "<think>": 2})
     teacher = VocabTokenizer({"a": 0, "b": 1})
-    with pytest.warns(UserWarning, match="disagree on 1 added tokens"):
-        assert d.assert_tokenizers_compatible(student, teacher, VOCAB, VOCAB)
+    with pytest.raises(ValueError, match="1 tokens map to different ids"):
+        d.assert_tokenizers_compatible(student, teacher, VOCAB, VOCAB)
 
 
 def test_width_matches_but_ids_differ_is_rejected():
@@ -117,9 +115,9 @@ def test_out_of_range_beta_rejected(beta):
         _distill().validate_gkd_config(beta, 1.0, 0.0)
 
 
-@pytest.mark.parametrize("temperature", [0.0, -1.0])
-def test_non_positive_temperature_rejected(temperature):
-    with pytest.raises(ValueError, match="gkd_temperature must be > 0"):
+@pytest.mark.parametrize("temperature", [0.0, -1.0, float("nan"), float("inf")])
+def test_non_positive_or_non_finite_temperature_rejected(temperature):
+    with pytest.raises(ValueError, match="gkd_temperature must be finite and > 0"):
         _distill().validate_gkd_config(0.5, temperature, 0.0)
 
 
