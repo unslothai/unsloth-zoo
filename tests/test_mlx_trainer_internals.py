@@ -8705,8 +8705,22 @@ def test_unsupported_scheduler_kwargs_are_rejected_not_ignored():
     trainer.args.lr_scheduler_kwargs = {"power": 2.0}
     with pytest.raises(ValueError, match="unknown"):
         trainer._build_schedule(60)
-    trainer.args.lr_scheduler_kwargs = {"last_epoch": 3}
+    trainer.args.lr_scheduler_kwargs = {"last_epoch": 3, "num_decay_steps": 20}
     assert callable(trainer._build_schedule(60))
+
+
+@pytest.mark.parametrize("kwargs", [None, {}, {"num_stable_steps": 10}])
+def test_warmup_stable_decay_requires_num_decay_steps_like_hf(kwargs):
+    """HF get_wsd_schedule raises TypeError without num_decay_steps; never guess a window."""
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(
+        learning_rate=2e-4, max_steps=60, lr_scheduler_type="warmup_stable_decay",
+        lr_scheduler_kwargs=kwargs,
+    )
+    with pytest.raises(ValueError, match="num_decay_steps"):
+        trainer._build_schedule(60)
 
 
 def test_cosine_warmup_with_min_lr_is_not_silently_aliased():

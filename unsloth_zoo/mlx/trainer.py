@@ -4035,19 +4035,16 @@ class MLXTrainer:
         if sched_type == "warmup_stable_decay":
             num_decay_steps = sched_kwargs.get("num_decay_steps")
             num_stable_steps = sched_kwargs.get("num_stable_steps")
+            if num_decay_steps is None:
+                # HF get_wsd_schedule takes num_decay_steps as a required argument.
+                raise ValueError(
+                    "Unsloth: lr_scheduler_type='warmup_stable_decay' requires "
+                    "lr_scheduler_kwargs['num_decay_steps'], as in Hugging Face."
+                )
+            wsd_decay_steps = min(max(float(num_decay_steps), 0.0), float(decay_window))
             if num_stable_steps is not None:
-                wsd_stable_steps = min(
-                    max(float(num_stable_steps), 0.0), float(decay_window)
-                )
-                wsd_decay_steps = (
-                    min(max(float(num_decay_steps), 0.0), float(decay_window))
-                    if num_decay_steps is not None
-                    else decay_window - wsd_stable_steps
-                )
-            elif num_decay_steps is not None:
-                wsd_decay_steps = min(
-                    max(float(num_decay_steps), 0.0), float(decay_window)
-                )
+                wsd_stable_steps = min(max(float(num_stable_steps), 0.0), float(decay_window))
+            else:
                 wsd_stable_steps = decay_window - wsd_decay_steps
         wsd_stable_frac = wsd_stable_steps / decay_window
         wsd_decay_frac = wsd_decay_steps / decay_window
