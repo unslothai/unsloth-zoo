@@ -5828,6 +5828,11 @@ def _materialize_dequantized_hf_checkpoint(local_path, config_data, method, quan
 
         for filename in os.listdir(local_path):
             src = os.path.join(local_path, filename)
+            if os.path.isdir(src):
+                # Nested assets (chat_templates/, remote-code packages) by link, never copied weights.
+                if not filename.startswith("."):
+                    os.symlink(os.path.realpath(src), os.path.join(temp_dir, filename))
+                continue
             if not os.path.isfile(src):
                 continue
             if _is_dropped_dequant_sidecar(filename):

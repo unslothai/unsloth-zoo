@@ -759,3 +759,27 @@ def test_v1_gptq_formats_accepted(extra):
         ml._materialize_dequantized_hf_checkpoint(
             "/nonexistent", {}, "gptq", {"bits": 4, "group_size": 128, **extra},
         )
+
+
+def test_materialize_links_nested_asset_dirs(tmp_path):
+    import mlx.core as mx
+    import unsloth_zoo.mlx.loader as ml
+    q, zero, scales, _, _ = _make_gptq_tensors(inn=16, out=8, gs=8, seed=8)
+    name = "model.layers.0.mlp.down_proj"
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), {
+        name + ".qweight": mx.array(_pack_qweight_gptq(q)),
+        name + ".qzeros": mx.array(_pack_qzeros_gptq(zero)),
+        name + ".scales": mx.array(scales),
+    })
+    (tmp_path / "chat_templates").mkdir()
+    (tmp_path / "chat_templates" / "tool_use.jinja").write_text("{{ x }}")
+    (tmp_path / ".cache").mkdir()
+    qc = {"quant_method": "gptq", "bits": 4, "group_size": 8}
+    out_dir, _ = ml._materialize_dequantized_hf_checkpoint(str(tmp_path), {"quantization_config": qc}, "gptq", qc)
+    try:
+        assert open(os.path.join(out_dir, "chat_templates", "tool_use.jinja")).read() == "{{ x }}"
+        assert not os.path.exists(os.path.join(out_dir, ".cache"))
+    finally:
+        import shutil
+        shutil.rmtree(out_dir, ignore_errors=True)
+    assert (tmp_path / "chat_templates" / "tool_use.jinja").exists()
