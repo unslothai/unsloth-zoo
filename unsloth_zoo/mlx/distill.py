@@ -339,11 +339,13 @@ def validate_gkd_config(gkd_beta, gkd_temperature, gkd_lmbda):
 
 
 def load_teacher(model_name_or_path):
-    """Load a teacher (mlx_lm.load returns it in eval mode) and freeze it."""
+    """Load a teacher in eval mode (mlx_lm.load already sets it; explicit here
+    so dropout-bearing teachers stay deterministic) and freeze it."""
     from mlx.utils import tree_flatten
     from mlx_lm import load
 
     teacher, teacher_tokenizer = load(model_name_or_path)
+    teacher.eval()
     teacher.freeze()
     trainable = tree_flatten(teacher.trainable_parameters())
     if trainable:
