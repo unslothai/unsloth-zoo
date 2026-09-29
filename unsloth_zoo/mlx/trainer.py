@@ -1030,7 +1030,6 @@ _HF_DEFAULT_NUM_CYCLES = {
     "cosine_warmup_with_min_lr": 0.5,
 }
 
-# Unimplemented kwargs are rejected, not dropped (HF raises TypeError too).
 _MLX_SCHEDULER_SUPPORTED_KWARGS = {
     "linear": frozenset(),
     "cosine": frozenset({"num_cycles", "min_lr", "min_lr_rate"}),
@@ -1501,8 +1500,7 @@ class MLXTrainingConfig:
     # only, as in transformers' _get_rmsprop/_get_adagrad.
     optim_args: str | None = None
 
-    # Declared LAST: inserting them earlier shifts positional slots of pre-PR configs.
-    # None = HF's scheduler-specific default, resolved in _build_schedule.
+    # Declared LAST (positional binding); None = HF's per-scheduler default.
     lr_scheduler_min_lr_rate: float | None = None
     lr_scheduler_num_cycles: float | None = None
     lr_scheduler_power: float | None = None
@@ -4081,7 +4079,6 @@ class MLXTrainer:
             num_decay_steps = sched_kwargs.get("num_decay_steps")
             num_stable_steps = sched_kwargs.get("num_stable_steps")
             if num_decay_steps is None:
-                # HF get_wsd_schedule takes num_decay_steps as a required argument.
                 raise ValueError(
                     "Unsloth: lr_scheduler_type='warmup_stable_decay' requires "
                     "lr_scheduler_kwargs['num_decay_steps'], as in Hugging Face."
@@ -4098,8 +4095,7 @@ class MLXTrainer:
         # HF cosine_warmup_with_min_lr uses (step + 1): optimization.py:400-406.
         step_offset = 1.0 if sched_type == "cosine_warmup_with_min_lr" else 0.0
 
-        # Plain Python per step, like HF's lambdas: an mx graph here cost 20-40 op dispatches per
-        # optimizer step for a scalar, and float64 math is what HF evaluates.
+        # Plain Python like HF's lambdas: an mx graph cost 20-40 dispatches per step, in float32.
         decay_span = max(total_steps - warmup, 1)
         timescale = shift = None
         if sched_type == "inverse_sqrt":
@@ -4134,8 +4130,7 @@ class MLXTrainer:
             elif sched_type == "inverse_sqrt":
                 decay = 1.0 / math.sqrt(max((step + shift) / timescale, 1e-8))
             elif sched_type == "warmup_stable_decay":
-                # HF _get_wsd_scheduler_lambda; num_cycles is the wave count. Past the window HF
-                # returns the floor flat, so the cosine is never re-entered.
+                # HF _get_wsd_scheduler_lambda: floor flat past the window, never re-enter the cosine.
                 decay_start = warmup + wsd_stable_steps
                 if step < decay_start:
                     decay = 1.0
@@ -4149,7 +4144,6 @@ class MLXTrainer:
             return max(decay, 0.0) * (1.0 - min_lr_rate) + min_lr_rate
 
         def schedule(step):
-            # `step` is the zero-based optimizer-step index (int or scalar mx.array).
             if not isinstance(step, (int, float)):
                 step = step.item()
             return mx.array(lr * factor(float(step)), dtype=mx.float32)
