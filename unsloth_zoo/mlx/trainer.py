@@ -9969,6 +9969,7 @@ class MLXKTOTrainer(MLXTrainer):
                 or not hasattr(self.train_dataset, "__len__"),
             "lora_plus_ratio": float(getattr(args, "lora_plus_ratio", 0) or 0) > 0,
             "embedding_learning_rate": float(getattr(args, "embedding_learning_rate", 0) or 0) > 0,
+            "neftune_noise_alpha": float(getattr(args, "neftune_noise_alpha", 0) or 0) > 0,
             "resume_from_checkpoint": resume_from_checkpoint is not None,
             "save_steps > 0 (adapters are saved at the end)": int(args.save_steps or 0) > 0,
             "eval_dataset": self.eval_dataset is not None,
@@ -9981,6 +9982,7 @@ class MLXKTOTrainer(MLXTrainer):
 
     def train(self, resume_from_checkpoint: str | None = None):
         self._reject_unsupported(resume_from_checkpoint)
+        self.stop_requested = False  # a stop from an earlier run must not end this one
         args, model = self.args, self.model
         rows = _kto_rows(self.train_dataset, self.tokenizer, args)
         if not rows:
