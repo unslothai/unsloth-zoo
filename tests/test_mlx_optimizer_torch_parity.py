@@ -14,29 +14,9 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Hyperparameter defaults of the torch-style MLX optimizers, pinned to torch.
+"""torch-style MLX optimizer defaults, pinned to the installed torch / HF Trainer.
 
-MLX and PyTorch pick different defaults for the same optimizer, and only some of
-them agree. Exposing an optimizer name that HF Trainer also accepts is a promise
-that the same recipe trains the same way, so every default is asserted against
-the *installed* upstream rather than a literal copied out of the trainer:
-
-  * the reference value is read from ``inspect.signature(torch.optim.X)``,
-  * and, where HF Trainer has a branch for the name, from
-    ``Trainer.get_optimizer_cls_and_kwargs`` -- which is what decides whether a
-    recipe gets torch's default at all or an explicit override.
-
-A literal here would just re-encode whatever the trainer already does and would
-pass no matter which value was wrong.
-
-Name/plumbing logic only, so this runs on Linux CI too. Note that requesting the
-shim does not guarantee getting it: ``conftest`` imports ``unsloth_zoo`` during
-collection, so on a host that has real mlx the trainer's ``optim`` global is
-already bound to the genuine package and the module-scope fixture cannot rebind
-it. The assertions below are written to hold either way -- they read the pinned
-hyperparameter from the shim's recorded kwargs or from a real optimizer's
-attribute, and an unpinned value reads as absent under both. Defaults that only
-real mlx can answer live in ``test_mlx_optimizer_defaults.py``.
+Holds under the shim or real mlx (conftest may bind real mlx first); real-mlx-only checks: test_mlx_optimizer_defaults.py.
 """
 
 import inspect
@@ -50,8 +30,6 @@ def _install_shim():
     simulate_mlx_on_torch()
 
 
-# The four optimizer names this module covers, and the torch class each one is
-# the MLX counterpart of.
 _TORCH_COUNTERPART = {
     "rmsprop": "RMSprop",
     "adamax": "Adamax",
@@ -61,7 +39,6 @@ _TORCH_COUNTERPART = {
 
 
 def _torch_default(torch_class_name, parameter):
-    """The installed torch optimizer's own default for `parameter`."""
     import torch
 
     cls = getattr(torch.optim, torch_class_name)
@@ -87,12 +64,7 @@ def _build(optim_name, **config_kwargs):
 
 
 def _hyperparameter(optimizer, name):
-    """Read a hyperparameter off either a real MLX optimizer or the torch shim.
-
-    Real MLX stores it as an attribute; the shim keeps constructor kwargs in
-    ``_kw`` and only applies its own fallback when the trainer passed nothing --
-    so a missing key in ``_kw`` genuinely means "trainer did not pin this".
-    """
+    # Shim keeps passed kwargs in _kw: a missing key means the trainer did not pin it.
     kw = getattr(optimizer, "_kw", None)
     if kw is not None and name in kw:
         return kw[name]
@@ -102,12 +74,6 @@ def _hyperparameter(optimizer, name):
 
 
 def test_adagrad_epsilon_matches_the_torch_default_a_recipe_would_get():
-    """MLX Adagrad defaults eps=1e-8, torch defaults 1e-10.
-
-    Adagrad's denominator is ``sqrt(sum g^2) + eps``, so for gradient elements
-    near or below the epsilon the larger MLX value damps the step by up to two
-    orders of magnitude relative to the same recipe on the torch backend.
-    """
     expected = _torch_default("Adagrad", "eps")
 
     _, optimizer = _build("adagrad")
@@ -120,9 +86,6 @@ def test_adagrad_epsilon_matches_the_torch_default_a_recipe_would_get():
 
 
 def test_hf_trainer_leaves_adagrad_epsilon_at_the_torch_default():
-    """The reason the Adagrad epsilon above is torch's default and not
-    ``args.adam_epsilon``: HF Trainer's ADAGRAD branch sets only the class, so
-    the returned kwargs carry `lr` and nothing else."""
     transformers = pytest.importorskip("transformers")
     import tempfile
 
@@ -141,9 +104,6 @@ def test_hf_trainer_leaves_adagrad_epsilon_at_the_torch_default():
 
 @pytest.mark.parametrize("optim_name", sorted(_TORCH_COUNTERPART))
 def test_every_new_name_is_advertised_and_buildable(optim_name):
-    """Guards the whole class of surface forms a config can carry the name in,
-    not just the lowercase literal: enum-with-.value, dotted enum repr, upper
-    case and hyphenation all funnel through _normalize_mlx_optimizer_name."""
     from unsloth_zoo.mlx.trainer import (
         SUPPORTED_MLX_OPTIMIZERS,
         _normalize_mlx_optimizer_name,
@@ -173,9 +133,6 @@ def test_every_new_name_is_advertised_and_buildable(optim_name):
 
 @pytest.mark.parametrize("optim_name", sorted(_TORCH_COUNTERPART))
 def test_new_optimizers_use_coupled_decay_and_leave_adamw_path_alone(optim_name):
-    """torch folds weight decay into the gradient for all four of these, unlike
-    AdamW's decoupled shrink. Also pins that turning these on did not disturb
-    the pre-existing decoupled optimizers a saved config may still request."""
     trainer, _ = _build(optim_name, weight_decay=0.05)
     assert trainer._coupled_weight_decay == pytest.approx(0.05)
     assert trainer._manual_weight_decay == pytest.approx(0.0)
@@ -186,11 +143,6 @@ def test_new_optimizers_use_coupled_decay_and_leave_adamw_path_alone(optim_name)
 
 
 def test_adamax_is_built_with_the_torch_first_moment_bias_correction():
-    """``mlx.optimizers.Adamax`` takes no ``bias_correction`` flag and overrides
-    ``Adam.apply_single`` with the uncorrected update, so pinning it is not a
-    kwarg -- the trainer has to substitute a subclass. Numerics are checked
-    against torch in ``test_mlx_optimizer_defaults.py``; this pins the wiring,
-    which is the part the shim can see."""
     from unsloth_zoo.mlx.trainer import _BiasCorrectedAdamax
 
     _, optimizer = _build("adamax")
@@ -206,12 +158,6 @@ def test_adamax_is_built_with_the_torch_first_moment_bias_correction():
 
 
 def test_hf_trainer_drops_optim_args_for_rmsprop_too():
-    """Why the RMSprop branch takes no ``optim_args``: HF Trainer's RMSPROP
-    branch sets only ``optimizer_cls``, and ``optim_args`` is merged in by the
-    GaLore/Apollo/GrokAdamW branches alone. ``momentum``/``alpha``/``centered``
-    are dropped on the torch backend as well, and MLX RMSprop's own defaults
-    already equal torch's, so honouring them here would *introduce* a
-    divergence from the recipe rather than remove one."""
     transformers = pytest.importorskip("transformers")
     import tempfile
 

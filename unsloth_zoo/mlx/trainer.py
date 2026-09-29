@@ -866,20 +866,7 @@ def _normalize_mlx_optimizer_name(name):
 
 
 class _BiasCorrectedAdamax(optim.Adamax):
-    """Adamax with the first-moment bias correction torch applies.
-
-    ``mlx.optimizers.Adamax`` hardcodes the correction off: it overrides
-    ``Adam.apply_single`` and takes no ``bias_correction`` flag, so its first
-    update is scaled by ``1 - beta1`` -- ~10x too small at the default
-    ``beta1=0.9``, tapering off over the warmup. ``torch.optim.Adamax`` and
-    Algorithm 2 of the Adam paper both divide the step by ``1 - beta1**t``, and
-    the trainer already pins ``bias_correction=True`` on every other
-    Adam-family optimizer it builds.
-
-    Only the correction is added; the eps stays on the denominator where MLX
-    (and the paper) put it rather than inside torch's ``max``, which differs by
-    at most ``eps`` in absolute terms.
-    """
+    """Adamax plus torch's ``1 - beta1**t`` first-moment correction, which mlx.optimizers.Adamax hardcodes off."""
 
     def apply_single(self, gradient, parameter, state):
         lr = self.learning_rate.astype(gradient.dtype)
@@ -3975,8 +3962,7 @@ class MLXTrainer:
             self._manual_weight_decay = float(wd or 0.0)
             optimizer = optim.Lion(learning_rate=initial_lr, weight_decay=0.0)
         elif opt_name == "rmsprop":
-            # RMSprop/Adamax/Adagrad/Adadelta use coupled L2 weight decay
-            # (grad += wd * param) like SGD, not AdamW's decoupled shrink.
+            # Coupled L2 decay (grad += wd * param), matching torch.
             self._coupled_weight_decay = float(wd or 0.0)
             optimizer = optim.RMSprop(learning_rate=initial_lr)
         elif opt_name == "adamax":
@@ -3986,12 +3972,7 @@ class MLXTrainer:
             )
         elif opt_name == "adagrad":
             self._coupled_weight_decay = float(wd or 0.0)
-            # HF Trainer builds `optim="adagrad"` as torch.optim.Adagrad(lr=...)
-            # with no eps override, so the recipe's epsilon is torch's default
-            # 1e-10, not MLX's 1e-8. Adagrad's step is bounded by lr either way
-            # (sqrt(v) >= |g| since v accumulates g^2), so pinning the smaller
-            # torch epsilon cannot destabilize the update, it only stops small
-            # gradients from being damped ~100x harder than on the torch backend.
+            # HF Trainer passes no eps, so torch's 1e-10 (not MLX's 1e-8); step stays <= lr.
             optimizer = optim.Adagrad(learning_rate=initial_lr, eps=1e-10)
         elif opt_name == "adadelta":
             self._coupled_weight_decay = float(wd or 0.0)

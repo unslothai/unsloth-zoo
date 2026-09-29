@@ -14,18 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Real MLX optimizer defaults, checked against the installed torch.
-
-The companion file ``test_mlx_optimizer_torch_parity.py`` runs under the
-mlx-on-torch shim and can only see what the trainer *passes*. The shim's
-optimizer adapters take ``**kw`` and supply their own fallbacks, so they cannot
-answer what real MLX would have defaulted to -- and their fallbacks are torch's
-values, which is exactly how an unpinned default hides: shim tests agree with
-torch while the Apple run does not.
-
-That question is what this module exists for, so it needs the genuine mlx
-package and skips when mlx is absent or shimmed.
-"""
+"""Real-mlx optimizer defaults vs installed torch; the shim cannot answer these."""
 
 import inspect
 
@@ -36,9 +25,7 @@ _SKIP = "Requires a real mlx runtime (Apple Silicon Metal, or Linux mlx-cpu)"
 
 mx = pytest.importorskip("mlx.core", reason=_SKIP)
 optim = pytest.importorskip("mlx.optimizers", reason=_SKIP)
-# importorskip alone is not enough: another test module may have installed the
-# mlx-on-torch shim into sys.modules first, and the shim's optimizers take
-# **kw, so signature introspection would silently measure the wrong thing.
+# Another module may have installed the shim first; its **kw signatures lie.
 if "mlx_simulation" in (getattr(mx, "__file__", "") or ""):
     pytest.skip(_SKIP, allow_module_level=True)
 
@@ -73,7 +60,6 @@ def _build(optim_name, **config_kwargs):
 
 
 def test_real_mlx_adagrad_is_built_with_the_torch_epsilon():
-    """The value that actually reaches Apple's Adagrad, not just the kwarg."""
     expected = _torch_default("Adagrad", "eps")
     mlx_own_default = _mlx_default("Adagrad", "eps")
     assert mlx_own_default != expected, (
@@ -99,10 +85,6 @@ def test_real_mlx_adagrad_is_built_with_the_torch_epsilon():
 def test_remaining_defaults_still_agree_with_torch(
     optim_name, mlx_class, torch_class, parameter,
 ):
-    """These MLX defaults happen to equal torch's, so the trainer leaves them
-    alone. That is only safe while it stays true: if MLX ever retunes one, the
-    trainer would silently drift from the recipe whose name it advertises, and
-    this is what notices."""
     mlx_value = _mlx_default(mlx_class, parameter)
     torch_value = _torch_default(torch_class, parameter)
 
@@ -157,14 +139,7 @@ def _torch_adamax_trajectory(initial_weight, gradients):
 
 
 def test_adamax_tracks_torch_adamax_step_for_step():
-    """MLX Adamax omits torch's ``lr / (1 - beta1**t)`` first-moment correction.
-
-    The trainer builds ``_BiasCorrectedAdamax`` instead, so an
-    ``optim='adamax'`` run has to follow ``torch.optim.Adamax`` from step 1, not
-    merely converge to it. Tolerance is fp32 rounding plus the residual from
-    keeping eps on the denominator rather than inside torch's ``max``, which is
-    bounded by eps.
-    """
+    # Tolerance: fp32 rounding plus eps placement (denominator vs torch's max).
     from unsloth_zoo.mlx.trainer import _BiasCorrectedAdamax
 
     initial, gradients = _adamax_case()
@@ -179,9 +154,7 @@ def test_adamax_tracks_torch_adamax_step_for_step():
 
 
 def test_plain_mlx_adamax_still_needs_the_correction():
-    """Canary for the test above: it only proves something while stock MLX
-    Adamax actually disagrees with torch. If MLX adds the correction upstream,
-    ``_BiasCorrectedAdamax`` is dead weight and should be dropped."""
+    # Canary: if MLX adds the correction upstream, drop _BiasCorrectedAdamax.
     initial, gradients = _adamax_case()
     expected = _torch_adamax_trajectory(initial, gradients)
     got = _mlx_adamax_trajectory(optim.Adamax, initial, gradients)
@@ -194,15 +167,6 @@ def test_plain_mlx_adamax_still_needs_the_correction():
 
 
 def test_adagrad_step_stays_bounded_by_the_learning_rate():
-    """Why the smaller epsilon is safe rather than merely faithful.
-
-    Adagrad divides by ``sqrt(sum g^2) + eps`` and the running sum includes the
-    current gradient, so the denominator is never below ``|g|`` and the update
-    magnitude is at most ``lr`` for any epsilon. Shrinking eps cannot produce
-    the blow-up a smaller stabiliser normally risks; it only stops small
-    gradients from being damped. Exercised at gradient scales that straddle both
-    epsilons, including exact zero.
-    """
     import mlx.nn as nn
 
     lr = 1e-3
@@ -215,8 +179,7 @@ def test_adagrad_step_stays_bounded_by_the_learning_rate():
             optimizer.update(model, gradient)
             mx.eval(model.parameters(), optimizer.state)
         moved = mx.abs(model.parameters()["weight"]).max().item()
-        assert moved == moved, f"NaN at gradient scale {scale}"  # NaN != NaN
-        # 3 steps, each bounded by lr.
+        assert moved == moved, f"NaN at gradient scale {scale}"
         assert moved <= 3 * lr + 1e-12, (
             f"gradient scale {scale} moved the weight {moved} past the "
             f"{3 * lr} bound Adagrad's own denominator guarantees"
