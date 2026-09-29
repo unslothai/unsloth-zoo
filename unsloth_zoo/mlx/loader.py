@@ -5666,6 +5666,7 @@ def _is_dropped_dequant_sidecar(filename):
 
 
 _MLX_AFFINE_GROUP_SIZES = (32, 64, 128)
+_DEQUANT_SHARD_BYTES = 2 << 30
 
 
 def _gptq_to_mlx_affine(qweight, qzeros, scales):
@@ -5751,56 +5752,72 @@ def _materialize_dequantized_hf_checkpoint(local_path, config_data, method, quan
         )
     )
 
-    new_weights = {}
-    quant_related = set()
-    for name in quant_modules:
+    def _convert(name):
         qweight = weights[name + ".qweight"]
-        if affine:
-            (
-                new_weights[name + ".weight"],
-                new_weights[name + ".scales"],
-                new_weights[name + ".biases"],
-            ) = _gptq_to_mlx_affine(qweight, weights[name + ".qzeros"], weights[name + ".scales"])
-            quant_related.update(
-                name + suffix for suffix in (".qweight", ".qzeros", ".scales", ".g_idx")
-            )
-            continue
         qzeros = weights[name + ".qzeros"]
         scales = weights[name + ".scales"]
+        if affine:
+            weight, scales, biases = _gptq_to_mlx_affine(qweight, qzeros, scales)
+            return {name + ".weight": weight, name + ".scales": scales, name + ".biases": biases}
         if method == "gptq":
             g_idx = weights.get(name + ".g_idx")
             if g_idx is None:
                 # g_idx omitted (desc_act=False): rebuild arange(in) // group_size.
-                in_features = int(qweight.shape[0]) * (32 // bits)
+                in_features = int(qweight.shape[0]) * in_rows
                 if group_size and group_size > 0:
                     g_idx = mx.arange(in_features) // group_size
                 else:
                     g_idx = mx.zeros((in_features,), dtype=mx.int32)
             dense = _gptq_dequantize_weight(qweight, qzeros, scales, g_idx, bits=bits)
-            quant_related.update(
-                name + suffix
-                for suffix in (".qweight", ".qzeros", ".scales", ".g_idx")
-            )
         else:
             dense = _awq_dequantize_weight(qweight, qzeros, scales, group_size, bits=bits)
-            quant_related.update(
-                name + suffix for suffix in (".qweight", ".qzeros", ".scales")
-            )
-        new_weights[name + ".weight"] = dense.astype(mx.float16)
+        return {name + ".weight": dense.astype(mx.float16)}
 
-    for key, tensor in weights.items():
-        if key in quant_related:
-            continue
-        # Drop GPTQ QuantLinear's all-zero placeholder biases.
-        if key.endswith(".bias") and bool(mx.all(tensor == 0).item()):
-            continue
-        new_weights[key] = tensor
-
-    mx.eval(list(new_weights.values()))
-
+    packed = {name + suffix for name in quant_modules
+              for suffix in (".qweight", ".qzeros", ".scales", ".g_idx")}
+    quant_set = set(quant_modules)
     temp_dir = tempfile.mkdtemp(prefix="unsloth_mlx_dequant_")
     # BaseException: also clean up a multi-GB save interrupted by Ctrl-C.
     try:
+        # Written in bounded shards so peak memory is one shard of dense weights, not the model.
+        shard, shard_bytes, weight_map, n_shards = {}, 0, {}, 0
+
+        def _flush():
+            nonlocal shard, shard_bytes, n_shards
+            if not shard:
+                return
+            n_shards += 1
+            filename = f"model-{n_shards:05d}.safetensors"
+            mx.eval(list(shard.values()))
+            mx.save_safetensors(os.path.join(temp_dir, filename), shard)
+            weight_map.update({key: filename for key in shard})
+            shard, shard_bytes = {}, 0
+
+        items = [(name, None) for name in quant_modules] + [
+            (None, key) for key in weights if key not in packed
+        ]
+        for name, key in items:
+            if name is not None:
+                tensors = _convert(name)
+            else:
+                tensor = weights[key]
+                # Drop GPTQ QuantLinear's all-zero placeholder bias on packed modules only.
+                if (
+                    key.endswith(".bias")
+                    and key[: -len(".bias")] in quant_set
+                    and bool(mx.all(tensor == 0).item())
+                ):
+                    continue
+                tensors = {key: tensor}
+            for k, v in tensors.items():
+                shard[k] = v
+                shard_bytes += v.nbytes
+            if shard_bytes >= _DEQUANT_SHARD_BYTES:
+                _flush()
+        _flush()
+        with open(os.path.join(temp_dir, "model.safetensors.index.json"), "w") as f:
+            json.dump({"metadata": {}, "weight_map": weight_map}, f, indent=2)
+
         for filename in os.listdir(local_path):
             src = os.path.join(local_path, filename)
             if not os.path.isfile(src):
@@ -5816,8 +5833,6 @@ def _materialize_dequantized_hf_checkpoint(local_path, config_data, method, quan
             new_config_data["quantization"] = {"group_size": group_size, "bits": bits, "mode": "affine"}
         with open(os.path.join(temp_dir, "config.json"), "w") as f:
             json.dump(new_config_data, f, indent=2)
-
-        mx.save_safetensors(os.path.join(temp_dir, "model.safetensors"), new_weights)
     except BaseException:
         shutil.rmtree(temp_dir, ignore_errors=True)
         raise

@@ -54,9 +54,18 @@ def _ensure_bitsandbytes_importable():
 
 @pytest.fixture(autouse=True, scope="module")
 def _install_shim():
+    import sys
+    names = ("bitsandbytes", "bitsandbytes.nn", "bitsandbytes.functional")
+    saved = {name: sys.modules.get(name) for name in names}
     _ensure_bitsandbytes_importable()
     from mlx_simulation import simulate_mlx_on_torch
     simulate_mlx_on_torch()
+    yield
+    for name, module in saved.items():
+        if module is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = module
 
 
 def _pack_qweight_gptq(intmat):
@@ -688,7 +697,9 @@ def test_materialize_gptq_mlx_affine_only_for_contiguous_groups(desc_act):
         tmp, {"model_type": "llama", "quantization_config": qc}, "gptq", qc, mlx_affine=True,
     )
     try:
-        w = mx.load(os.path.join(out_dir, "model.safetensors"))
+        w = {}
+        for f in glob.glob(os.path.join(out_dir, "model-*.safetensors")):
+            w.update(mx.load(f))
         if desc_act:
             assert "quantization" not in cfg and name + ".scales" not in w
             got = np.asarray(w[name + ".weight"]).astype(np.float32)
@@ -697,6 +708,35 @@ def test_materialize_gptq_mlx_affine_only_for_contiguous_groups(desc_act):
             got = _mlx_affine_dequant(w[name + ".weight"], w[name + ".scales"], w[name + ".biases"], gs)
         assert "quantization_config" not in cfg
         assert np.allclose(got, ref, atol=1e-2)
+    finally:
+        import shutil
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+
+def test_materialize_shards_output_and_keeps_zero_biases_off_packed_modules(monkeypatch):
+    import mlx.core as mx
+    import unsloth_zoo.mlx.loader as ml
+    monkeypatch.setattr(ml, "_DEQUANT_SHARD_BYTES", 1)
+    q, zero, scales, g_idx, ref = _make_gptq_tensors(inn=16, out=8, gs=8, seed=7)
+    tmp = tempfile.mkdtemp(prefix="rescope_shards_")
+    packed = "model.layers.0.mlp.down_proj"
+    mx.save_safetensors(os.path.join(tmp, "model.safetensors"), {
+        packed + ".qweight": mx.array(_pack_qweight_gptq(q)),
+        packed + ".qzeros": mx.array(_pack_qzeros_gptq(zero)),
+        packed + ".scales": mx.array(scales),
+        packed + ".bias": mx.zeros((8,)),
+        "model.layers.0.input_layernorm.bias": mx.zeros((16,)),
+    })
+    qc = {"quant_method": "gptq", "bits": 4, "group_size": 8}
+    out_dir, _ = ml._materialize_dequantized_hf_checkpoint(tmp, {"quantization_config": qc}, "gptq", qc)
+    try:
+        index = json.load(open(os.path.join(out_dir, "model.safetensors.index.json")))["weight_map"]
+        assert set(index) == {packed + ".weight", "model.layers.0.input_layernorm.bias"}
+        assert len(set(index.values())) == 2
+        assert sorted(os.path.basename(f) for f in glob.glob(os.path.join(out_dir, "*.safetensors"))) == sorted(set(index.values()))
+        got = np.asarray(mx.load(os.path.join(out_dir, index[packed + ".weight"]))[packed + ".weight"])
+        assert np.allclose(got.astype(np.float32), ref, atol=1e-2)
     finally:
         import shutil
         shutil.rmtree(out_dir, ignore_errors=True)
