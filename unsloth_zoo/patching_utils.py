@@ -803,7 +803,7 @@ def patch_compiled_autograd():
 
     # Import items to make the function executable
     all_items = dir(torch._dynamo.compiled_autograd)
-    good_items = [x for x in all_items if x in source]
+    good_items = [x for x in all_items if not x.startswith("__") and x in source]
     exec("from torch._dynamo.compiled_autograd import (" + ", ".join(x for x in good_items) + ")", globals())
     exec(source, globals())
     # Defined by the exec(source, globals()) directly above.
@@ -830,7 +830,7 @@ def patch_compiled_autograd():
 
     # Import items to make the function executable
     all_items = dir(torch._dynamo.variables.misc)
-    good_items = [x for x in all_items if x in source]
+    good_items = [x for x in all_items if not x.startswith("__") and x in source]
     exec("from torch._dynamo.variables.misc import (" + ", ".join(x for x in good_items) + ")", globals())
     exec(source, globals())
     # Defined by the exec(source, globals()) directly above.
