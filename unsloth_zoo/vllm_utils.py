@@ -1353,6 +1353,7 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         feed_forward = getattr(layer, "feed_forward", None)
         w13 = getattr(feed_forward, "w13", None) or getattr(feed_forward, "w1", None)
         experts = getattr(feed_forward, "experts", None)
+        experts = getattr(experts, "base_layer", experts)  # FusedMoEWithLoRA under enable_lora
         prefix = f"{vllm_text_model_prefix}.layers.{kk}.feed_forward"
         if not hasattr(layer, "mlp") and w13 is not None:
             get_state_dict(f"{prefix}.w1", 0, state_dict, w13)
