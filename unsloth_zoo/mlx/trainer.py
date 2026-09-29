@@ -866,17 +866,12 @@ def _normalize_mlx_optimizer_name(name):
 
 
 def _donate_optimizer_state(optimizer):
-    """Let MLX update each parameter and its optimizer state in place.
-
-    mx.compile fuses a leaf's new parameter and moments into one multi-output
-    kernel, whose inputs MLX never donates: every step copied them all. A
-    zero-copy reshape of each new state array splits that kernel into
-    single-output kernels that reuse the old buffers, with unchanged arithmetic.
-    """
+    """Update params and optimizer state in place: MLX never donates inputs of the
+    fused multi-output update kernel; a zero-copy reshape splits it into donating ones."""
     apply_single = getattr(type(optimizer), "apply_single", None)
-    if apply_single is None:  # no per-leaf update hook to route
+    if apply_single is None:
         return optimizer
-    # Weak, so the instance attribute does not keep the optimizer and its state alive.
+    # Weak: a strong ref would cycle and hold the state until a gc pass.
     owner = weakref.ref(optimizer)
 
     def _apply_single(gradient, parameter, state):
@@ -903,15 +898,9 @@ def _layer_path_prefix(model):
 
 
 def _async_eval_by_layer(tree, prefix):
-    """Schedule a parameter-shaped tree one layer at a time, last layer first.
-
-    Nothing but the step's end consumes an update or an accumulated gradient,
-    so MLX runs them after the whole backward, keeping every layer's gradient
-    and the activations behind it alive. Scheduling layers in backward order
-    frees each one as soon as the backward has passed it; the model's own
-    embeddings and norms follow one at a time. Waiting for the previous group
-    keeps the host from queueing every group before any frees.
-    """
+    """Eval a parameter-shaped tree layer by layer, last first, then non-layer leaves,
+    each group behind the previous, so each layer's grad frees as the backward passes it.
+    Ascending order, leaves first, or no pacing each lose the saving."""
     parent = prefix.rsplit(".", 2)[0] + "." if prefix.count(".") > 1 else ""
     layers, rest = {}, []
     for name, value in tree_flatten(tree):
