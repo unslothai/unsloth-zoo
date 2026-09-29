@@ -24,7 +24,10 @@ import random
 import sys
 
 import pytest
-import torch
+
+# The MLX simulation shim runs on torch; native Apple Silicon installs ship
+# without it, and a collection error there would also stop the _metal companion.
+torch = pytest.importorskip("torch")
 
 
 @pytest.fixture(autouse=True, scope="module")
