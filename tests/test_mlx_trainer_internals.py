@@ -8369,7 +8369,7 @@ _MAIN_MLX_CONFIG_POSITIONAL_FIELDS = (
     "per_device_eval_batch_size", "image_size", "label_smoothing_factor",
     "report_grad_norm", "max_eval_batches",
     "streaming_text_length_window_batches", "streaming_prefetch_batches",
-    "logging_dir", "run_name",
+    "logging_dir", "run_name", "adam_epsilon",
 )
 
 _PRE_PR_LR_SCHEDULER_TYPE_INDEX = 7

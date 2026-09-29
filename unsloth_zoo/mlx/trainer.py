@@ -48,6 +48,7 @@ import random
 import socket
 import time
 import unicodedata
+import weakref
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -60,6 +61,7 @@ SUPPORTED_MLX_OPTIMIZERS = (
     # First moment only; see unsloth_zoo/mlx/optimizers_quantized.py.
     "adamw_8bit", "adam_8bit",
 )
+_MLX_ADAM_FAMILY_OPTIMIZERS = ("adamw", "adam", "adamw_8bit", "adam_8bit")
 SUPPORTED_MLX_LR_SCHEDULERS = (
     "linear",
     "cosine",
@@ -873,6 +875,45 @@ def _normalize_mlx_optimizer_name(name):
     return opt_name
 
 
+def _donate_optimizer_state(optimizer):
+    """Zero-copy reshape of each new state array splits mx.compile's multi-output
+    update kernel (whose inputs MLX never donates) so p, m, v update in place."""
+    apply_single = getattr(type(optimizer), "apply_single", None)
+    if apply_single is None:
+        return optimizer
+    # Weak: a strong self-reference would hold the optimizer until a cyclic GC.
+    owner = weakref.ref(optimizer)
+
+    def _apply_single(gradient, parameter, state):
+        before = dict(state)
+        updated = apply_single(owner(), gradient, parameter, state)
+        for key, value in state.items():
+            if isinstance(value, mx.array) and value is not before.get(key):
+                state[key] = value.reshape((1, *value.shape)).reshape(value.shape)
+        return updated
+
+    optimizer.apply_single = _apply_single
+    return optimizer
+
+
+def _resolve_adam_epsilon(value):
+    """Reject what torch.optim.Adam rejects (``not 0.0 <= eps``, incl. NaN);
+    MLX adds eps to the denominator unchecked, so bad values train silently."""
+    try:
+        epsilon = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"Unsloth: adam_epsilon must be a number, got {value!r}."
+        ) from None
+    if not 0.0 <= epsilon:
+        raise ValueError(
+            f"Unsloth: adam_epsilon must be >= 0, got {value!r}. "
+            "PyTorch rejects it too; MLX would silently produce NaN or "
+            "sign-flipped updates."
+        )
+    return epsilon
+
+
 _part_is_norm = _mlx_norm_path_part_is_norm
 _iter_norm_output_cast_classes = iter_mlx_norm_output_cast_classes
 _set_norm_output_cast_to_input_dtype = set_mlx_norm_output_cast_to_input_dtype
@@ -1275,6 +1316,7 @@ _MLX_CONFIG_OPTIONAL_COPY_FIELDS = (
     "streaming_prefetch_batches",
     "logging_dir",
     "run_name",
+    "adam_epsilon",
     "lr_scheduler_min_lr_rate",
     "lr_scheduler_num_cycles",
     "lr_scheduler_power",
@@ -1406,6 +1448,10 @@ class MLXTrainingConfig:
     # _MLX_CONFIG_OPTIONAL_COPY_FIELDS so they stay an exact suffix of it.
     logging_dir: str | None = None
     run_name: str | None = None
+
+    # Must stay last (positional binding). None keeps MLX's default (1e-8, same
+    # as HF). Adam family only: MLX Adafactor's eps is a 2-tuple.
+    adam_epsilon: float | None = None
 
     # Declared LAST: inserting them earlier shifts positional slots of pre-PR configs.
     # None = HF's scheduler-specific default, resolved in _build_schedule.
@@ -4095,15 +4141,6 @@ class MLXTrainer:
         wd = self.args.weight_decay
         self._manual_weight_decay = 0.0
         self._coupled_weight_decay = 0.0
-        adam_beta1 = getattr(self.args, "adam_beta1", None)
-        adam_beta2 = getattr(self.args, "adam_beta2", None)
-        adam_kwargs = {}
-        if adam_beta1 is not None or adam_beta2 is not None:
-            adam_kwargs["betas"] = (
-                float(0.9 if adam_beta1 is None else adam_beta1),
-                float(0.999 if adam_beta2 is None else adam_beta2),
-            )
-
         opt_name = _normalize_mlx_optimizer_name(self.args.optim)
         if opt_name == "adafactor":
             unsupported = self._adafactor_unsupported_parameters(self.model)
@@ -4119,6 +4156,21 @@ class MLXTrainer:
                     f"({preview})."
                 )
                 opt_name = "adamw"
+
+        # After the Adafactor->AdamW fallback so it carries betas/eps; ignored for
+        # non-Adam optimizers like HF (transformers/trainer.py adam_kwargs).
+        adam_kwargs = {}
+        if opt_name in _MLX_ADAM_FAMILY_OPTIMIZERS:
+            adam_beta1 = getattr(self.args, "adam_beta1", None)
+            adam_beta2 = getattr(self.args, "adam_beta2", None)
+            adam_epsilon = getattr(self.args, "adam_epsilon", None)
+            if adam_beta1 is not None or adam_beta2 is not None:
+                adam_kwargs["betas"] = (
+                    float(0.9 if adam_beta1 is None else adam_beta1),
+                    float(0.999 if adam_beta2 is None else adam_beta2),
+                )
+            if adam_epsilon is not None:
+                adam_kwargs["eps"] = _resolve_adam_epsilon(adam_epsilon)
 
         if opt_name == "adafactor":
             self._manual_weight_decay = float(wd or 0.0)
@@ -4181,7 +4233,7 @@ class MLXTrainer:
             self._manual_weight_decay = float(wd or 0.0)
             optimizer = optim.Lion(learning_rate=initial_lr, weight_decay=0.0)
         self._resolved_optimizer_name = opt_name
-        return optimizer
+        return _donate_optimizer_state(optimizer)
 
     @staticmethod
     def _should_apply_weight_decay(name, parameter=None):
