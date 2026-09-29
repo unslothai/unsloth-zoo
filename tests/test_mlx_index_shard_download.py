@@ -52,8 +52,7 @@ def _recorder(root):
 
 
 def test_subfolder_shard_named_by_the_index_is_fetched(tmp_path):
-    # mlx-community/gemma-4-e2b-it-OptiQ-4bit: 1411 vision tensors live in a subfolder shard
-    # mlx-lm's `model*.safetensors` default never downloads; mlx-vlm then drops them silently.
+    # gemma-4-e2b-it-OptiQ-4bit keeps its vision tower in optiq/optiq_vision.safetensors.
     from unsloth_zoo.mlx.loader import _download_missing_index_shards
 
     root = _snapshot(tmp_path, {"language_model.w": "model.safetensors",
@@ -86,7 +85,6 @@ def test_complete_snapshots_local_dirs_and_indexless_repos_download_nothing(tmp_
 
 
 def test_follow_up_download_pins_the_fetched_snapshot_commit(tmp_path):
-    # A branch revision re-resolved after a push would return a snapshot holding only the shard.
     from unsloth_zoo.mlx.loader import _download_missing_index_shards
 
     sha = "a" * 40

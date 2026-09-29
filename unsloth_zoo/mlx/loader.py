@@ -1165,12 +1165,7 @@ def _load_mlx_lm_with_strict_fallback(
 
 
 def _download_missing_index_shards(model_name, local_path, revision, download):
-    """Fetch shards the index maps that mlx-lm's `model*.safetensors` default skipped.
-
-    mlx-vlm loads every shard in `weight_map` but silently drops absent ones, so a
-    subfolder shard (mlx-community/gemma-4-e2b-it-OptiQ-4bit keeps its vision tower
-    in optiq/optiq_vision.safetensors) failed as "Missing 1411 parameters".
-    """
+    """Fetch index-mapped shards mlx-lm's `model*.safetensors` default skipped; mlx-vlm drops absent ones."""
     if os.path.isdir(model_name):
         return local_path
     try:
@@ -1184,8 +1179,7 @@ def _download_missing_index_shards(model_name, local_path, revision, download):
     )
     if not missing:
         return local_path
-    # Pin to the commit already fetched (hub cache dir `snapshots/<sha>`): re-resolving a
-    # branch could land a newer snapshot holding only these shards.
+    # Pin to the fetched `snapshots/<sha>`: a re-resolved branch could return only these shards.
     snapshot = os.path.basename(os.path.normpath(local_path))
     if re.fullmatch(r"[0-9a-f]{40}", snapshot):
         revision = snapshot
