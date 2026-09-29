@@ -4287,9 +4287,17 @@ class MLXTrainer:
         all_losses = mx.array(0.0)
         ntokens = mx.array(0)
         metric_names = getattr(loss_fn, "_unsloth_preference_metrics", None)
-        stats = None if not metric_names else mx.zeros((getattr(
-            loss_fn, "_unsloth_preference_stats_width", len(metric_names),
-        ),))
+        # Opt-in by attribute: CCE, preference and user loss fns take no kwarg.
+        score_kwargs = {}
+        if metric_names:
+            stats = mx.zeros((getattr(
+                loss_fn, "_unsloth_preference_stats_width", len(metric_names),
+            ),))
+        elif getattr(loss_fn, "_unsloth_token_accuracy", False):
+            score_kwargs = {"return_correct": True}
+            stats = mx.zeros((1,))
+        else:
+            stats = None
         # A stop requested before evaluation must abort before the first pull:
         # an unsized source's next row can block, so cancellation could
         # otherwise never take effect. Rank-synchronized so peers return
@@ -4322,9 +4330,9 @@ class MLXTrainer:
                             batch_data, small_capacity_limit,
                         ) or batch_data
                     if is_vlm:
-                        scored = loss_fn(self.model, batch_data)
+                        scored = loss_fn(self.model, batch_data, **score_kwargs)
                     else:
-                        scored = loss_fn(self.model, *batch_data)
+                        scored = loss_fn(self.model, *batch_data, **score_kwargs)
                     loss, ntoks = scored[0], scored[1]
                     # Zero-token eval batches (distributed_pad_mode="empty" padding
                     # rows) make loss NaN; mask them so NaN * 0 does not poison the
@@ -4462,6 +4470,10 @@ class MLXTrainer:
                 metrics[f"{prefix}loss"] = value
                 if metric_names is None:
                     metrics[f"{prefix}perplexity"] = math.exp(min(value, 100))
+                    if stats is not None and total > 0:
+                        metrics[f"{prefix}mean_token_accuracy"] = (
+                            stats[0].item() / total
+                        )
                 elif total > 0:
                     for name, metric in _preference_metric_values(
                         metric_names, metric_denominators, stats.tolist(),

@@ -2493,6 +2493,98 @@ def test_evaluate_dict_eval_datasets_records_split_metrics():
     assert trainer.model.modes == ["eval", "train"]
 
 
+def _token_accuracy_eval_trainer(all_sum=None):
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.model = types.SimpleNamespace(eval=lambda: None, train=lambda *a: None)
+    trainer.stop_requested = False
+    trainer._distributed_eval_status = lambda failed=False: (False, False)
+    trainer._distributed_should_stop = lambda: False
+    trainer._distributed_all_sum = all_sum or (lambda value, stream=None: value)
+    return trainer
+
+
+def _token_accuracy_loss_fn(correct, ntoks):
+    import mlx.core as mx
+
+    def loss_fn(_model, _batch, _lengths, _labels, return_correct=False):
+        if return_correct:
+            return mx.array(1.0), mx.array(ntoks), mx.array(correct)
+        return mx.array(1.0), mx.array(ntoks)
+
+    loss_fn._unsloth_token_accuracy = True
+    return loss_fn
+
+
+def test_evaluate_reports_token_accuracy_reduced_across_ranks():
+    import mlx.core as mx
+
+    # Peer rank adds 10 loss, 15 tokens, 4 correct: 7 / 20 only if summed before dividing.
+    peer = iter([mx.array(10.0), mx.array(15), mx.array([4.0])])
+    trainer = _token_accuracy_eval_trainer(
+        lambda value, stream=None: value + next(peer),
+    )
+    trainer._evaluate(
+        [(mx.array([[1, 2, 3]]), None, None)],
+        _token_accuracy_loss_fn(3.0, 5),
+    )
+    metrics = trainer._last_eval_metrics
+    assert metrics["eval_mean_token_accuracy"] == pytest.approx(7.0 / 20.0)
+    assert "eval_perplexity" in metrics
+
+
+def test_evaluate_reports_token_accuracy_per_split():
+    import mlx.core as mx
+
+    trainer = _token_accuracy_eval_trainer()
+    batch = [(mx.array([[1, 2, 3]]), None, None)]
+    trainer._evaluate({"a": batch, "b": batch}, _token_accuracy_loss_fn(3.0, 5))
+    metrics = trainer._last_eval_metrics
+    assert metrics["eval_a_mean_token_accuracy"] == pytest.approx(0.6)
+    assert metrics["eval_b_mean_token_accuracy"] == pytest.approx(0.6)
+    assert metrics["eval_mean_token_accuracy"] == pytest.approx(0.6)
+
+
+def test_evaluate_skips_token_accuracy_for_loss_fns_without_it():
+    import mlx.core as mx
+
+    # CCE and user loss fns take no return_correct kwarg: passing it would raise.
+    def loss_fn(_model, _batch, _lengths, _labels):
+        return mx.array(1.0), mx.array(5)
+
+    trainer = _token_accuracy_eval_trainer()
+    trainer._evaluate([(mx.array([[1, 2, 3]]), None, None)], loss_fn)
+    metrics = trainer._last_eval_metrics
+    assert metrics["eval_loss"] == pytest.approx(1.0)
+    assert "eval_mean_token_accuracy" not in metrics
+
+
+@pytest.mark.parametrize("with_labels", [False, True])
+def test_baseline_loss_fn_counts_correct_supervised_tokens(with_labels):
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.utils import make_baseline_loss_fn
+
+    vocab = 6
+    batch = mx.array([[1, 2, 3, 4, 5]])
+    preds = [0, 3, 2, 5]
+    logits = mx.array([[[10.0 if v == p else 0.0 for v in range(vocab)] for p in preds]])
+    model = lambda _inputs: logits
+    lengths = mx.array([[1, 5]])
+    labels = mx.array([[-100, -100, 3, 4, 5]]) if with_labels else None
+
+    loss_fn = make_baseline_loss_fn()
+    assert loss_fn._unsloth_token_accuracy is True
+    loss, ntoks, correct = loss_fn(model, batch, lengths, labels, return_correct=True)
+    plain_loss, plain_ntoks = loss_fn(model, batch, lengths, labels)
+    # Targets 2,3,4,5 vs preds 0,3,2,5: two hits; labels also mask position 0.
+    assert correct.item() == 2.0
+    assert ntoks.item() == (3 if with_labels else 4)
+    assert loss.item() == pytest.approx(plain_loss.item())
+    assert plain_ntoks.item() == ntoks.item()
+
+
 def test_evaluate_batch_totals_uses_single_eval_status_collective():
     import inspect
 
