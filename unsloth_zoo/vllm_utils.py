@@ -1384,7 +1384,8 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             if expert_bias is not None:
                 moe_tensors[f"{prefix}.expert_bias"] = expert_bias
             for key, value in moe_tensors.items():
-                if not value.is_floating_point():
+                # float8 also passes is_floating_point(); its scales are not carried over
+                if value.dtype not in (torch.float16, torch.bfloat16, torch.float32):
                     raise NotImplementedError(
                         f"Unsloth: fast_inference cannot rebuild quantized MoE weights ({key}); "
                         "load the model in 16-bit or set fast_inference = False."

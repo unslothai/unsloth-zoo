@@ -191,3 +191,14 @@ def test_lfm2_moe_blocked_trtllm_layout_raises(monkeypatch):
     routed.w13_weight = torch.nn.Parameter(routed.w13_weight.data.reshape(E, H // 8, two_i, 8), requires_grad = False)
     with pytest.raises(NotImplementedError, match = "w13"):
         vllm_utils._get_vllm_state_dict(llm, return_state_dict = True, config = config)
+
+
+def test_lfm2_moe_float8_experts_raise(monkeypatch):
+    from unsloth_zoo import vllm_utils
+    hf, config = _tiny_lfm2_moe(monkeypatch)
+    llm = _vllm_lfm2_from_hf(hf)
+    layers = llm.llm_engine.model_executor.driver_worker.model_runner.model.model.layers
+    routed = layers[1].feed_forward.experts.routed_experts
+    routed.w13_weight = torch.nn.Parameter(routed.w13_weight.data.to(torch.float8_e4m3fn), requires_grad = False)
+    with pytest.raises(NotImplementedError, match = "quantized MoE"):
+        vllm_utils._get_vllm_state_dict(llm, return_state_dict = True, config = config)
