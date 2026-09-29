@@ -94,14 +94,30 @@ def test_kl_baseline_clamps_negative_to_zero():
 def test_kto_tokenize_row_bos_eos_and_caps():
     from unsloth_zoo.mlx.trainer import _kto_tokenize_row, MLXKTOConfig
     tok = _WordTokenizer()
-    p, c = _kto_tokenize_row(tok, "Question: two?", " four", MLXKTOConfig())
+    p, c = _kto_tokenize_row(tok, {"prompt": "Question: two?", "completion": " four"}, MLXKTOConfig())
     assert p[0] == tok.BOS and tok.BOS not in c and c == [14, tok.EOS]
-    _, c = _kto_tokenize_row(tok, "q", " a b", MLXKTOConfig(append_eos=False))
+    _, c = _kto_tokenize_row(tok, {"prompt": "q", "completion": " a b"}, MLXKTOConfig(append_eos=False))
     assert tok.EOS not in c
-    _, c = _kto_tokenize_row(tok, "q", " w" * 20, MLXKTOConfig(max_completion_length=4, max_prompt_length=0))
+    _, c = _kto_tokenize_row(tok, {"prompt": "q", "completion": " w" * 20}, MLXKTOConfig(max_completion_length=4, max_prompt_length=0))
     assert len(c) == 4 and c[-1] == tok.EOS
-    p, c = _kto_tokenize_row(tok, "a b c", " w" * 20, MLXKTOConfig(max_length=8, max_prompt_length=0))
+    p, c = _kto_tokenize_row(tok, {"prompt": "a b c", "completion": " w" * 20}, MLXKTOConfig(max_length=8, max_prompt_length=0))
     assert p == [] and len(c) == 8 and c[-1] == tok.EOS
+
+
+def test_kto_tokenize_row_passes_tools_to_the_chat_template(monkeypatch):
+    import unsloth_zoo.mlx.trainer as T
+    seen = {}
+
+    def fake(tokenizer, item, **kwargs):
+        seen.update(item)
+        return [1, 2, 3], [-100, 2, 3]
+
+    monkeypatch.setattr(T, "_tokenize_mlx_prompt_completion_row", fake)
+    tools, kwargs = [{"type": "function"}], {"enable_thinking": False}
+    row = {"prompt": [{"role": "user", "content": "x"}], "completion": [{"role": "assistant", "content": "y"}],
+           "label": True, "tools": tools, "chat_template_kwargs": kwargs}
+    assert T._kto_tokenize_row(_WordTokenizer(), row, T.MLXKTOConfig()) == ([1], [2, 3])
+    assert seen["tools"] is tools and seen["chat_template_kwargs"] is kwargs and "label" not in seen
 
 
 def test_kto_labels_are_parsed_not_truth_tested():
@@ -178,6 +194,7 @@ _UNSUPPORTED = {
     "lora_plus_ratio": dict(args=dict(lora_plus_ratio=16.0)),
     "embedding_learning_rate": dict(args=dict(embedding_learning_rate=5e-5)),
     "resume_from_checkpoint": dict(resume="ckpt"),
+    "save_steps": dict(args=dict(save_steps=10)),
     "eval_dataset": dict(eval_dataset=[]),
     "callbacks": dict(kwargs=dict(callbacks=[object()])),
 }

@@ -9847,11 +9847,11 @@ def _kto_fit_prompt(prompt_ids, completion_ids, max_length):
     return prompt_ids
 
 
-def _kto_tokenize_row(tokenizer, prompt, completion, args):
-    # Joint encode like SFT and TRL: BOS, chat template for conversational rows, EOS policy.
+def _kto_tokenize_row(tokenizer, row, args):
+    # Joint encode like SFT and TRL: BOS, chat template (with tools) for conversational rows, EOS policy.
+    keys = ("prompt", "completion", "tools", "chat_template_kwargs")
     encoded = _tokenize_mlx_prompt_completion_row(
-        tokenizer, {"prompt": prompt, "completion": completion},
-        append_eos=bool(args.append_eos),
+        tokenizer, {k: row[k] for k in keys if k in row}, append_eos=bool(args.append_eos),
     )
     if encoded is None:
         raise ValueError("Unsloth: KTO rows need a text or conversational 'prompt' and 'completion'.")
@@ -9890,7 +9890,7 @@ def _kto_rows(dataset, tokenizer, args):
         missing = [k for k in ("prompt", "completion", "label") if k not in ex]
         if missing:
             raise ValueError(f"Unsloth: KTO rows need 'prompt', 'completion' and a binary 'label'; missing {missing}.")
-        p, c = _kto_tokenize_row(tokenizer, ex["prompt"], ex["completion"], args)
+        p, c = _kto_tokenize_row(tokenizer, ex, args)
         if c:
             rows.append((p, c, _kto_parse_label(ex["label"])))
     bs = int(args.per_device_train_batch_size)
@@ -9970,6 +9970,7 @@ class MLXKTOTrainer(MLXTrainer):
             "lora_plus_ratio": float(getattr(args, "lora_plus_ratio", 0) or 0) > 0,
             "embedding_learning_rate": float(getattr(args, "embedding_learning_rate", 0) or 0) > 0,
             "resume_from_checkpoint": resume_from_checkpoint is not None,
+            "save_steps > 0 (adapters are saved at the end)": int(args.save_steps or 0) > 0,
             "eval_dataset": self.eval_dataset is not None,
             "distributed training": self.distributed_world_size > 1,
             f"arguments {self._kto_ignored_kwargs}": bool(self._kto_ignored_kwargs),
