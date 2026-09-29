@@ -159,7 +159,7 @@ def test_the_mlx_default_epsilon_is_the_hf_default():
         assert parameter.default == pytest.approx(hf_default), constructor
         checked += 1
     if not checked:
-        pytest.skip("the simulation shim does not model MLX's default eps")
+        pytest.skip(reason="simulation shim takes **kw, so it has no default eps to compare")
 
 
 def test_epsilon_composes_with_betas(monkeypatch):

@@ -876,8 +876,8 @@ def _resolve_adam_epsilon(value):
     if not 0.0 <= epsilon:
         raise ValueError(
             f"Unsloth: adam_epsilon must be >= 0, got {value!r}. "
-            "PyTorch rejects the same values (torch/optim/adam.py:60), but MLX "
-            "would accept it and produce NaN or sign-flipped updates."
+            "PyTorch rejects it too; MLX would silently produce NaN or "
+            "sign-flipped updates."
         )
     return epsilon
 
