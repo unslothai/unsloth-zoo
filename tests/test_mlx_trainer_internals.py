@@ -8733,7 +8733,11 @@ def test_cosine_warmup_with_min_lr_matches_its_own_hf_lambda():
         warmup_steps=warmup,
         lr_scheduler_type="cosine_warmup_with_min_lr",
     )
-    hf_lambda = optimization._get_cosine_with_min_lr_schedule_with_warmup_lr_rate_lambda
+    hf_lambda = getattr(
+        optimization, "_get_cosine_with_min_lr_schedule_with_warmup_lr_rate_lambda", None
+    )
+    if hf_lambda is None:
+        pytest.skip("installed transformers predates cosine_warmup_with_min_lr")
     for kwargs in ({"min_lr_rate": 0.1}, {"min_lr": 2e-5},
                    {"min_lr_rate": 0.1, "warmup_lr_rate": 0.05},
                    {"min_lr_rate": 0.1, "num_cycles": 1.5}):
