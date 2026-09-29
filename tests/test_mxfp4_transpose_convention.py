@@ -35,16 +35,13 @@ _CPU_SENTINEL = object()
 
 
 def test_decision_matrix_patch_and_version():
-    # Unsloth patched base (its _cpu variant present) never self-transposes, in any version.
     assert _mxfp4_base_returns_transposed(_CPU_SENTINEL, "4.55.4") is False
     assert _mxfp4_base_returns_transposed(_CPU_SENTINEL, "4.57.6") is False
 
-    # Stock transformers < 4.56.0 returns the un-transposed layout -> external transpose needed.
     assert _mxfp4_base_returns_transposed(None, "4.55.2") is False
     assert _mxfp4_base_returns_transposed(None, "4.55.3") is False
     assert _mxfp4_base_returns_transposed(None, "4.55.4") is False
 
-    # Stock transformers >= 4.56.0 already self-transposes -> no external transpose.
     assert _mxfp4_base_returns_transposed(None, "4.56.0") is True
     assert _mxfp4_base_returns_transposed(None, "4.56.2") is True
     assert _mxfp4_base_returns_transposed(None, "4.57.0") is True
@@ -78,7 +75,6 @@ def test_all_conventions_produce_identical_gpt_oss_layout():
         base_returns_transposed = _mxfp4_base_returns_transposed(cpu_variant, version)
         return base_out.contiguous() if base_returns_transposed else base_out.transpose(1, 2).contiguous()
 
-    # Unsloth patched base: returns un-transposed `out`, _cpu present.
     assert torch.equal(apply(out, _CPU_SENTINEL, "4.57.6"), ground_truth)
     # Stock 4.55.x: returns un-transposed `out`, _cpu absent.
     assert torch.equal(apply(out, None, "4.55.4"), ground_truth)
@@ -99,7 +95,6 @@ def test_old_cpu_only_keying_would_corrupt_stock_4_55():
     old_W = out.contiguous() if old_base_returns_transposed else out.transpose(1, 2).contiguous()
     assert not torch.equal(old_W, ground_truth)  # confirms the old path corrupted 4.55.x
 
-    # New logic keyed on version restores correctness.
     new_returns_transposed = _mxfp4_base_returns_transposed(None, "4.55.4")
     new_W = out.contiguous() if new_returns_transposed else out.transpose(1, 2).contiguous()
     assert torch.equal(new_W, ground_truth)

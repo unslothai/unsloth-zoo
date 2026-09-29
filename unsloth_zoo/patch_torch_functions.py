@@ -20,7 +20,7 @@ __all__ = [
 ]
 
 import os
-from .temporary_patches.common import torch_compile, UNSLOTH_ENABLE_LOGGING
+from unsloth_zoo.temporary_patches.common import torch_compile, UNSLOTH_ENABLE_LOGGING
 from .log import logger
 from torch import Tensor
 import torch
@@ -34,10 +34,14 @@ from torch.nn.functional import (
     np,
 )
 from typing import Callable, List, Optional, Tuple, Union
+from torch.fx import _symbolic_trace
+
+_is_fx_symbolic_tracing = getattr(
+    _symbolic_trace, "is_fx_symbolic_tracing", _symbolic_trace.is_fx_tracing
+)
 
 
-@torch_compile
-def layer_norm(
+def _layer_norm_eager(
     input: Tensor,
     normalized_shape: List[int],
     weight: Optional[Tensor] = None,
@@ -61,6 +65,21 @@ def layer_norm(
     return torch.layer_norm(
         input, normalized_shape, weight, bias, eps, torch.backends.cudnn.enabled
     ).to(input.dtype)
+pass
+_layer_norm_compiled = torch_compile(_layer_norm_eager)
+
+
+def layer_norm(
+    input: Tensor,
+    normalized_shape: List[int],
+    weight: Optional[Tensor] = None,
+    bias: Optional[Tensor] = None,
+    eps: float = 1e-5,
+) -> Tensor:
+    # Dynamo raises when FX symbolic tracing (e.g. vLLM on Gemma 4 audio) enters a compiled fn.
+    if _is_fx_symbolic_tracing():
+        return _layer_norm_eager(input, normalized_shape, weight, bias, eps)
+    return _layer_norm_compiled(input, normalized_shape, weight, bias, eps)
 pass
 
 

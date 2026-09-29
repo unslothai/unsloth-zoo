@@ -36,7 +36,7 @@ PER_EXPERT_R   = 4
 TOTAL_RANK     = NUM_EXPERTS * PER_EXPERT_R
 
 
-class _ToyMoE(nn.Module):
+class _ToyExperts(nn.Module):
     num_experts = NUM_EXPERTS
 
     def __init__(self):
@@ -45,6 +45,25 @@ class _ToyMoE(nn.Module):
 
     def forward(self, x):
         return torch.einsum("bh,eih->bei", x, self.gate_up_proj)
+
+
+class _ToyMoE(nn.Module):
+    """Nests the fused parameter one level, as real GPT-OSS does.
+
+    PEFT 0.20.0 refuses to target an nn.Parameter on the top-level module
+    (tuners_utils.py, create_and_replace_param). Held flat, this canary raised
+    there and the wrap-failure skip below swallowed it, so it went permanently
+    vacuous on the newest supported PEFT. Real GPT-OSS has the parameter at
+    ...mlp.experts.gate_up_proj, so nesting is also the more faithful fixture.
+    """
+    num_experts = NUM_EXPERTS
+
+    def __init__(self):
+        super().__init__()
+        self.experts = _ToyExperts()
+
+    def forward(self, x):
+        return self.experts(x)
 
 
 def _peft_supports_target_parameters() -> bool:
@@ -65,14 +84,14 @@ def test_paramwrapper_lora_shape_is_one_of_two_known_layouts():
 
     cfg_kwargs = dict(r=PER_EXPERT_R, lora_alpha=PER_EXPERT_R * 2, lora_dropout=0.0, bias="none")
     try:
-        cfg = LoraConfig(target_parameters=["gate_up_proj"], **cfg_kwargs)
+        cfg = LoraConfig(target_parameters=["experts.gate_up_proj"], **cfg_kwargs)
     except TypeError:
         pytest.skip("Installed PEFT does not accept target_parameters yet")
 
-    try:
-        peft_model = get_peft_model(base, cfg)
-    except Exception as e:
-        pytest.skip(f"PEFT failed to wrap fused 3D param on this build: {e}")
+    # Not a skip. PEFT has already said it supports target_parameters, so failing
+    # to wrap a correctly nested GPT-OSS-shaped parameter is the drift this test
+    # is for. Skipping here is how it stayed silently dead on PEFT 0.20.0.
+    peft_model = get_peft_model(base, cfg)
 
     lora_A = lora_B = None
     for name, p in peft_model.named_parameters():

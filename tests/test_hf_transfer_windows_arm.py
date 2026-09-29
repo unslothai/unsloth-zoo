@@ -248,10 +248,8 @@ class TestWiring:
         assert "_offline_env" in ast.dump(enable.test)
 
     def test_no_later_statement_re_enables_the_variable(self):
-        # Executing two statements in isolation says nothing about the other few
-        # hundred. Without this, appending one os.environ[...] = "1" anywhere
-        # below leaves all of the above green while Windows on ARM is broken
-        # again: a test that passes for the wrong reason.
+        # Without this, appending one os.environ[...] = "1" anywhere below leaves
+        # every test above green while Windows on ARM is broken again.
         detect, assign, enable = _statements()
         for node in _TREE.body:
             if node in (detect, assign, enable):
