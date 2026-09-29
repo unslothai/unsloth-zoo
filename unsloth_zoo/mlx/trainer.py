@@ -1396,7 +1396,6 @@ class MLXTrainingConfig:
     # Appended fields stay in declaration order (positional binding). None keeps
     # MLX's default (1e-8, same as HF). Adam family only: MLX Adafactor's eps is a 2-tuple.
     adam_epsilon: float | None = None
-    # HF TrainingArguments.group_by_length.
     group_by_length: bool = False
 
     def __init__(self, *args, **kwargs):
