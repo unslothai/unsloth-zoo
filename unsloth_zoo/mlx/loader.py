@@ -5492,7 +5492,7 @@ def _nf4_dense_dequantize_weight(weight, group_size=64, use_double_quant=False):
     return dequantized.reshape(original_shape).astype(original_dtype)
 
 
-# GPTQ/AWQ: mlx-lm >= 0.30.4 (PR #730) loads standard AWQ; the rest is dequantized to fp16 here.
+# GPTQ/AWQ: mlx-lm >= 0.30.4 (PR #730) loads standard AWQ, contiguous-group GPTQ is repacked as MLX affine, the rest is dequantized to fp16.
 _HF_RUNTIME_DEQUANT_METHODS = frozenset({"gptq", "awq"})
 # Fail loud; else the generic MLX check misreports them as a bits/group_size mismatch.
 _HF_UNSUPPORTED_PACKED_METHODS = frozenset({
@@ -5770,7 +5770,6 @@ def _materialize_dequantized_hf_checkpoint(local_path, config_data, method, quan
         if method == "gptq":
             g_idx = weights.get(name + ".g_idx")
             if g_idx is None:
-                # g_idx omitted (desc_act=False): rebuild arange(in) // group_size.
                 in_features = int(qweight.shape[0]) * in_rows
                 if group_size and group_size > 0:
                     g_idx = mx.arange(in_features) // group_size
@@ -5787,7 +5786,7 @@ def _materialize_dequantized_hf_checkpoint(local_path, config_data, method, quan
     temp_dir = tempfile.mkdtemp(prefix="unsloth_mlx_dequant_")
     # BaseException: also clean up a multi-GB save interrupted by Ctrl-C.
     try:
-        # Written in bounded shards so peak memory is one shard of dense weights, not the model.
+        # Bounded shards: peak memory is one shard of dense weights, not the model.
         shard, shard_bytes, weight_map, n_shards = {}, 0, {}, 0
 
         def _flush():
@@ -9829,7 +9828,6 @@ class FastMLXModel:
             else:
                 model._hf_repo = model_name
                 model._src_path = original_local_path or local_path
-                # Mirror the VLM branch (no-op for text).
                 model._config_src_path = local_path or original_local_path
                 model._unsloth_base_revision = revision
                 model._unsloth_base_commit_hash = _infer_snapshot_commit(
