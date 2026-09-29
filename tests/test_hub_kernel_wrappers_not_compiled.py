@@ -130,4 +130,4 @@ def test_disable_listed_hub_wrappers_keep_compiler_disable(tmp_path):
         decs = _decorators_of(generated, name)
         if not any("use_kernel_func_from_hub_with_fallback" in d for d in decs):
             continue
-        assert any("torch.compiler.disable" in d for d in decs), (name, decs)
+        assert any("torch_compiler_disable_unless_decode" in d for d in decs), (name, decs)

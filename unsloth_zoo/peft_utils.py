@@ -497,8 +497,9 @@ def requires_grad_for_gradient_checkpointing(model):
                 raise RuntimeError(f"Unsloth: Failed to make output require gradients: {e}")
         # Dynamo rejects requires_grad_() only when it would flip the flag, so skipping the
         # no-op keeps fullgraph = True working. Skipping a real flip would break the frozen
-        # input embedding this also lands on, losing every checkpointing gradient.
-        if torch.compiler.is_compiling() and target.requires_grad: return
+        # input embedding this also lands on, losing every checkpointing gradient. Without
+        # grad (a compiled decode step) nothing is recorded, so the flip is moot there.
+        if torch.compiler.is_compiling() and (target.requires_grad or not torch.is_grad_enabled()): return
         target.requires_grad_(True)
     pass
 
