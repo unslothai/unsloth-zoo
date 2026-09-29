@@ -14,13 +14,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Sentence-transformers layout shim, pooling-mode detection, batch advisory.
-
-Pure logic, so this runs under the torch shim on Linux CI rather than skipping.
-The shim matters because Qwen3-Embedding-0.6B does not load without it: all 310
-keys arrive without the ``model.`` prefix and loading fails with
-"Received 310 parameters not in model".
-"""
+"""Sentence-transformers layout shim, pooling-mode detection, batch advisory (pure logic)."""
 
 import pytest
 
@@ -36,9 +30,7 @@ def _embedding():
     return embedding
 
 
-# --- pooling-mode detection --------------------------------------------------
 def test_pooling_map_matches_cuda_exactly():
-    """Same map as sentence_transformer.py:587-599."""
     expected = {
         "pooling_mode_cls_token": "cls",
         "pooling_mode_mean_tokens": "mean",
@@ -51,7 +43,7 @@ def test_pooling_map_matches_cuda_exactly():
 
 
 def test_qwen3_embedding_resolves_to_lasttoken():
-    """Its real 1_Pooling/config.json; defaulting to mean would be wrong."""
+    """Qwen3-Embedding is lasttoken; defaulting to mean would be wrong."""
     config = {
         "word_embedding_dimension": 1024,
         "pooling_mode_cls_token": False,
@@ -84,7 +76,6 @@ def test_missing_or_empty_config_falls_back_to_mean():
     assert e.read_pooling_mode({"pooling_mode_mean_tokens": False}) == "mean"
 
 
-# --- layout shim -------------------------------------------------------------
 ST_KEYS = [
     "embed_tokens.weight",
     "layers.0.input_layernorm.weight",
@@ -139,9 +130,7 @@ def test_remap_does_not_double_prefix():
     assert not any(k.startswith("model.model.") for k in remapped)
 
 
-# --- batch-size advisory -----------------------------------------------------
 def test_estimate_reproduces_the_measured_points():
-    """Measured: 4->4.76, 8->7.92, 16->14.24 GB."""
     e = _embedding()
     for batch, measured in ((4, 4.76), (8, 7.92), (16, 14.24)):
         assert abs(e.estimate_peak_gb(batch) - measured) < 0.6, (
@@ -150,7 +139,6 @@ def test_estimate_reproduces_the_measured_points():
 
 
 def test_estimate_extrapolates_to_the_measured_batch32_point():
-    """Measured once at 26.46 GB via swap."""
     assert abs(_embedding().estimate_peak_gb(32) - 26.46) < 1.0
 
 
@@ -170,7 +158,6 @@ def test_recommendation_grows_with_ram_and_shrinks_with_seq_len():
 
 
 def test_small_machines_get_a_warning_not_an_exception():
-    """Advisory: oversubscription degrades into swap, not breakage."""
     e = _embedding()
     batch, warning = e.recommend_batch_size(8)
     assert batch >= 1

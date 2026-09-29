@@ -16,13 +16,7 @@
 
 """Pooling correctness and contrastive-loss behaviour on MLX.
 
-The padding fixture pads with junk at 100x so a mask-ignoring mean differs by ~26;
-that difference is asserted directly, so the invariance tests cannot pass against a
-broken implementation.
-
-Each loss asserts that positive/negative SEPARATION rises, not just that the loss
-falls. The synthetic encoder starts collapsed (all pairs ~0.995 cosine), so
-"positive similarity rises" would be unreachable and the wrong assertion.
+Losses assert positive/negative SEPARATION rises: the synthetic encoder starts collapsed.
 """
 
 import pytest
@@ -31,9 +25,7 @@ mx = pytest.importorskip("mlx.core", reason="MLX is only available on Apple Sili
 nn = pytest.importorskip("mlx.nn", reason="MLX is only available on Apple Silicon")
 optim = pytest.importorskip("mlx.optimizers", reason="MLX is only available on Apple Silicon")
 
-# Hoisted to module level on purpose. Inside a test body these resolve against
-# sys.modules at CALL time, and tests/mlx_simulation replaces mlx.* session-wide,
-# so a deferred import silently yields the stub instead of real MLX.
+# Module-level on purpose: tests/mlx_simulation stubs mlx.* session-wide.
 from mlx.utils import tree_flatten
 _mlx_lm = pytest.importorskip("mlx_lm", reason="MLX is only available on Apple Silicon")
 from mlx_lm.models import qwen3 as _qwen3
@@ -52,7 +44,6 @@ BATCH, SEQ, HIDDEN, VOCAB = 8, 12, 32, 256
 STEPS = 8
 
 
-# --- pooling ---------------------------------------------------------------
 def _padded_fixture():
     mx.random.seed(0)
     rows, length, width, pad = 3, 8, 5, 4
@@ -101,13 +92,12 @@ def test_ragged_batch_mean_matches_hand_computation():
     mask = (mx.arange(8)[None, :] < lengths[:, None]).astype(mx.float32)
 
     pooled = pool(hidden, mask, "mean")
-    manual = hidden[1, :5, :].mean(axis=0)  # row 1 has 5 real tokens
+    manual = hidden[1, :5, :].mean(axis=0)
 
     assert float(mx.abs(pooled[1] - manual).max()) < 1e-5
 
 
 def test_ragged_batch_lasttoken_uses_last_real_token():
-    """Row 1 has 5 real tokens: position 4, not 7."""
     mx.random.seed(0)
     hidden = mx.random.normal((3, 8, 5))
     lengths = mx.array([8, 5, 2])
@@ -128,7 +118,6 @@ def test_unknown_pooling_mode_is_rejected():
         pool(hidden, mask, "definitely_not_a_mode")
 
 
-# --- losses ----------------------------------------------------------------
 class _Encoder(nn.Module):
     def __init__(self):
         super().__init__()
@@ -202,7 +191,6 @@ def _cosent_groups(encoder):
 
 
 def test_cosent_raises_similar_and_lowers_dissimilar():
-    """The two labelled groups move apart."""
     encoder = _new_encoder()
     similar_before, dissimilar_before = _cosent_groups(encoder)
 
@@ -241,7 +229,6 @@ def test_triplet_separates_positive_from_explicit_negative():
 
 
 def test_identical_inputs_give_no_separation():
-    """Self-similarity is 1."""
     encoder = _new_encoder()
     anchors, _, _, mask = _loss_fixture()
     embedded = l2_normalize(encoder(anchors, mask))
@@ -249,16 +236,14 @@ def test_identical_inputs_give_no_separation():
     assert abs(float(mx.diag(scores).mean()) - 1.0) < 1e-4
 
 
-# --- sentence-transformers layout, against a real checkpoint ----------------
 ST_REPO = "Qwen/Qwen3-Embedding-0.6B"
 
 
 def _cached_st_checkpoint():
-    """Resolve the cached repo WITHOUT downloading."""
     huggingface_hub = pytest.importorskip("huggingface_hub")
     try:
         path = huggingface_hub.snapshot_download(ST_REPO, local_files_only=True)
-    except Exception as exception:                # not cached on this machine
+    except Exception as exception:
         pytest.skip(f"{ST_REPO} is not in the local HF cache: {type(exception).__name__}")
     import os
     weights_path = os.path.join(path, "model.safetensors")
@@ -287,7 +272,6 @@ def test_real_st_checkpoint_needs_the_remap_and_loads_after_it():
     config = json.load(open(os.path.join(path, "config.json")))
     model = qwen3.Model(qwen3.ModelArgs.from_dict(config))
     expected = {name for name, _ in tree_flatten(model.parameters())}
-    # same count, zero overlap: the prefix problem, not a real mismatch
     assert len(weights) == len(expected)
     assert not (set(weights) & expected)
 
@@ -307,7 +291,6 @@ def test_real_st_checkpoint_needs_the_remap_and_loads_after_it():
 
 
 def test_real_st_checkpoint_declares_lasttoken_pooling():
-    """This model is not mean-pooled."""
     import json
     import os
 
