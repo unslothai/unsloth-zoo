@@ -18,6 +18,8 @@ __all__ = [
     "patch_function",
     "UNSLOTH_DECODE_COMPILE",
     "unsloth_decode_compile",
+    "UNSLOTH_EAGER_DECODE",
+    "unsloth_eager_decode",
     "torch_compiler_disable_unless_decode",
     "compile_with_eager_fallback",
     "patch_function_past_key_values",
@@ -2123,6 +2125,37 @@ def unsloth_decode_compile():
                     set_stance(stance[0], skip_guard_eval_unsafe = stance[1])
 
 
+# True while generate() runs an eager decode step (no grad, one new token per row). Compiled
+# regions then call their eager original: at one token their guard checks and wrapper cost
+# more than the fusion saves (Qwen3.5-2B, A100: 3.6 s -> 2.8 s per 64 tokens). Never set
+# while tracing or with grad on, so compiled training and checkpoint recompute are untouched.
+UNSLOTH_EAGER_DECODE = [False]
+
+
+@contextlib.contextmanager
+def unsloth_eager_decode():
+    previous = UNSLOTH_EAGER_DECODE[0]
+    UNSLOTH_EAGER_DECODE[0] = not torch.is_grad_enabled() and not torch.compiler.is_compiling()
+    try:
+        yield
+    finally:
+        UNSLOTH_EAGER_DECODE[0] = previous
+
+
+def _eager_during_decode(func, compiled):
+    """`compiled`, except inside `unsloth_eager_decode()` where `func` runs directly. Carries
+    the compiled markers so "is this compiled?" checks and `unwrap_already_compiled` behave
+    exactly as they did on `compiled`."""
+    @functools.wraps(compiled)
+    def dispatch(*args, **kwargs):
+        if UNSLOTH_EAGER_DECODE[0] and not torch.compiler.is_compiling():
+            return func(*args, **kwargs)
+        return compiled(*args, **kwargs)
+    dispatch.__wrapped__ = func
+    dispatch._unsloth_compiled_func = compiled
+    return dispatch
+
+
 def _current_stance():
     try:
         import torch._dynamo.eval_frame as eval_frame
@@ -2141,8 +2174,11 @@ def torch_compiler_disable_unless_decode(func = None, *, recursive = False):
 
     @functools.wraps(func)
     def forward(*args, **kwargs):
-        if UNSLOTH_DECODE_COMPILE[0] and torch.compiler.is_compiling():
-            return func(*args, **kwargs)
+        if torch.compiler.is_compiling():
+            if UNSLOTH_DECODE_COMPILE[0]:
+                return func(*args, **kwargs)
+        elif UNSLOTH_EAGER_DECODE[0]:
+            return func(*args, **kwargs)  # nothing is tracing: skip the disable wrapper
         return disabled(*args, **kwargs)
     forward._unsloth_undisabled = func
     return forward
@@ -2163,8 +2199,8 @@ def torch_compile_with_fallback(fullgraph = False, **compile_kwargs):
     Reproducible on any GPU by lowering `recompile_limit`; a T4 gets there
     on its own.
 
-    `fullgraph = False` is returned untouched: Dynamo already falls back by
-    itself there, so wrapping would add a layer that can never fire.
+    `fullgraph = False` skips the fallback: Dynamo already falls back by itself
+    there. Both kinds go through `_eager_during_decode`.
 
     This is a BARE decorator: `compiler.py` writes it into every generated
     `unsloth_compiled_cache` module and `rl_replacements.py` applies it directly,
@@ -2176,11 +2212,11 @@ def torch_compile_with_fallback(fullgraph = False, **compile_kwargs):
     def _decorate(func):
         func = unwrap_already_compiled(func)
         compiled = torch.compile(func, fullgraph = fullgraph, **compile_kwargs)
-        if not fullgraph:
-            return compiled
-        return _fall_back_to_eager_on_recompile_limit(
-            compiled, func, getattr(func, "__qualname__", None) or repr(func),
-        )
+        if fullgraph:
+            compiled = _fall_back_to_eager_on_recompile_limit(
+                compiled, func, getattr(func, "__qualname__", None) or repr(func),
+            )
+        return _eager_during_decode(func, compiled)
     return _decorate
 
 
