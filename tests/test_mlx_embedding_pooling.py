@@ -71,6 +71,37 @@ def test_pooling_is_invariant_to_padding(mode):
     )
 
 
+def _left_padded_fixture():
+    hidden, mask, _, _ = _padded_fixture()
+    junk = mx.random.normal((3, 4, 5)) * 100.0
+    return hidden, mask, mx.concatenate([junk, hidden], axis=1), mx.concatenate(
+        [mx.zeros((3, 4)), mx.ones((3, 8))], axis=1
+    )
+
+
+# weightedmean uses absolute slot positions (sentence-transformers), so it is not left-pad invariant.
+@pytest.mark.parametrize("mode", [m for m in POOLING_MODES if m != "weightedmean"])
+def test_pooling_is_invariant_to_left_padding(mode):
+    hidden, mask, hidden_padded, mask_padded = _left_padded_fixture()
+    worst = float(mx.abs(pool(hidden, mask, mode) - pool(hidden_padded, mask_padded, mode)).max())
+    assert worst < 1e-4, f"{mode} pooling changed by {worst:.3e} under left padding"
+
+
+def test_weightedmean_uses_absolute_slot_positions():
+    _, _, hidden_padded, mask_padded = _left_padded_fixture()
+    weights = (mx.arange(1, 13).astype(mx.float32)[None, :] * mask_padded)[..., None]
+    expected = (hidden_padded * weights).sum(1) / weights.sum(1)
+    assert float(mx.abs(pool(hidden_padded, mask_padded, "weightedmean") - expected).max()) < 1e-4
+
+
+def test_several_modes_concatenate_in_order():
+    hidden, mask, _, _ = _padded_fixture()
+    combined = pool(hidden, mask, ("cls", "max", "mean"))
+    parts = [pool(hidden, mask, m) for m in ("cls", "max", "mean")]
+    assert combined.shape == (3, 15)
+    assert bool(mx.array_equal(combined, mx.concatenate(parts, axis=-1)).item())
+
+
 def test_mask_ignoring_mean_is_measurably_wrong():
     """The fixture must be able to fail."""
     _, _, hidden_padded, mask_padded = _padded_fixture()
@@ -206,6 +237,16 @@ def test_cosent_raises_similar_and_lowers_dissimilar():
     )
     separation = (similar_after - dissimilar_after) - (similar_before - dissimilar_before)
     assert separation > 0.3, f"separation only improved by {separation:+.4f}"
+
+
+def test_cosent_without_rankable_pairs_has_finite_gradients():
+    anchors, positives, _, mask = _loss_fixture()
+    embedded = _new_encoder()(positives, mask)
+    loss, grad = mx.value_and_grad(lambda x: cosent_loss(x, embedded, mx.ones((BATCH,))))(
+        _new_encoder()(anchors, mask)
+    )
+    assert float(loss) == 0.0
+    assert bool(mx.all(mx.isfinite(grad)).item())
 
 
 def _triplet_separation(encoder):

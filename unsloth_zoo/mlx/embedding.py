@@ -38,13 +38,13 @@ __all__ = [
     "MEMORY_SAFETY_FRACTION",
 ]
 
-POOLING_MODES = ("cls", "mean", "max", "mean_sqrt_len", "weightedmean", "lasttoken")
+POOLING_MODES = ("cls", "max", "mean", "mean_sqrt_len", "weightedmean", "lasttoken")
 
-# Verbatim from sentence_transformer.py:587-599.
+# sentence-transformers Pooling legacy keys, in its concatenation order.
 SENTENCE_TRANSFORMERS_POOLING_MAP = {
     "pooling_mode_cls_token": "cls",
-    "pooling_mode_mean_tokens": "mean",
     "pooling_mode_max_tokens": "max",
+    "pooling_mode_mean_tokens": "mean",
     "pooling_mode_mean_sqrt_len_tokens": "mean_sqrt_len",
     "pooling_mode_weightedmean_tokens": "weightedmean",
     "pooling_mode_lasttoken": "lasttoken",
@@ -57,7 +57,10 @@ def l2_normalize(x, eps = 1e-12):
 
 
 def pool(hidden_states, attention_mask, mode = "mean"):
-    """Reduce ``[batch, seq, hidden]`` to ``[batch, hidden]``; must ignore padding."""
+    """Reduce ``[batch, seq, hidden]`` to ``[batch, hidden]``; must ignore left or right padding.
+    A sequence of modes is concatenated, as sentence-transformers does."""
+    if isinstance(mode, (list, tuple)):
+        return mx.concatenate([pool(hidden_states, attention_mask, m) for m in mode], axis = -1)
     if mode not in POOLING_MODES:
         raise ValueError(
             f"Unsloth: unknown pooling mode {mode!r}. Supported: {', '.join(POOLING_MODES)}."
@@ -65,7 +68,8 @@ def pool(hidden_states, attention_mask, mode = "mean"):
     weights = attention_mask.astype(hidden_states.dtype)[..., None]
 
     if mode == "cls":
-        return hidden_states[:, 0, :]
+        first_index = mx.argmax(attention_mask.astype(mx.int32), axis = 1)
+        return mx.take_along_axis(hidden_states, first_index[:, None, None], axis = 1).squeeze(1)
 
     if mode == "mean":
         return (hidden_states * weights).sum(1) / mx.maximum(weights.sum(1), 1e-9)
@@ -82,13 +86,15 @@ def pool(hidden_states, attention_mask, mode = "mean"):
         return (hidden_states * weights).sum(1) / mx.sqrt(lengths)
 
     if mode == "weightedmean":
-        positions = mx.cumsum(weights.squeeze(-1), axis = 1)[..., None] * weights
+        # Absolute slot positions, so left-padded rows match sentence-transformers.
+        slots = mx.arange(1, hidden_states.shape[1] + 1, dtype = hidden_states.dtype)
+        positions = slots[None, :, None] * weights
         return (hidden_states * positions).sum(1) / mx.maximum(positions.sum(1), 1e-9)
 
-    last_index = mx.maximum(attention_mask.astype(mx.int32).sum(1) - 1, 0)
-    gathered = mx.take_along_axis(
-        hidden_states, last_index[:, None, None].astype(mx.int32), axis = 1,
-    )
+    # Last REAL token, not sum(mask) - 1: that is wrong for left padding.
+    slot_index = mx.arange(hidden_states.shape[1], dtype = mx.int32)[None, :]
+    last_index = (slot_index * attention_mask.astype(mx.int32)).max(axis = 1)
+    gathered = mx.take_along_axis(hidden_states * weights, last_index[:, None, None], axis = 1)
     return gathered.squeeze(1)
 
 
@@ -106,10 +112,9 @@ def cosent_loss(anchors, positives, labels, scale = 20.0):
     cosine = (l2_normalize(anchors) * l2_normalize(positives)).sum(-1) * scale
     differences = cosine[None, :] - cosine[:, None]
     should_rank = (labels[:, None] > labels[None, :])
-    differences = mx.where(
-        should_rank, differences, mx.full(differences.shape, -mx.inf),
-    )
-    return mx.logaddexp(mx.zeros(()), mx.logsumexp(differences.reshape(-1)))
+    # Finite mask, not -inf: a batch with no rankable pair would give NaN gradients.
+    differences = differences - (1 - should_rank.astype(differences.dtype)) * 1e12
+    return mx.logsumexp(mx.concatenate([mx.zeros((1,), differences.dtype), differences.reshape(-1)]))
 
 
 def triplet_loss(anchors, positives, negatives, margin = 0.5):
@@ -122,13 +127,16 @@ def triplet_loss(anchors, positives, negatives, margin = 0.5):
 
 
 def read_pooling_mode(pooling_config, default = "mean"):
-    """Resolve ``1_Pooling/config.json`` to a mode (sentence_transformer.py:536-599)."""
+    """Resolve ``1_Pooling/config.json``: one mode, or a tuple when several are enabled."""
     if not pooling_config:
         return default
-    for config_key, mode in SENTENCE_TRANSFORMERS_POOLING_MAP.items():
-        if pooling_config.get(config_key):
-            return mode
-    return default
+    modes = tuple(
+        mode for config_key, mode in SENTENCE_TRANSFORMERS_POOLING_MAP.items()
+        if pooling_config.get(config_key)
+    )
+    if not modes:
+        return default
+    return modes[0] if len(modes) == 1 else modes
 
 
 def is_sentence_transformers_layout(weight_keys):

@@ -69,6 +69,11 @@ def test_every_mode_is_detectable(key, mode):
     assert _embedding().read_pooling_mode({key: True}) == mode
 
 
+def test_several_enabled_modes_are_all_kept_in_sentence_transformers_order():
+    config = {"pooling_mode_mean_tokens": True, "pooling_mode_cls_token": True, "pooling_mode_max_tokens": True}
+    assert _embedding().read_pooling_mode(config) == ("cls", "max", "mean")
+
+
 def test_missing_or_empty_config_falls_back_to_mean():
     e = _embedding()
     assert e.read_pooling_mode(None) == "mean"
