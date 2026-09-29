@@ -1489,7 +1489,9 @@ def grpo_accumulated_loss(
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
     try:
         lm_head = trainer.model.get_output_embeddings().weight
-        dtype_bytes = 16 if trainer._autocast_dtype in [torch.float16, torch.bfloat16] else 32
+        # Unsloth keeps _autocast_dtype set when it turns autocast off (float32 training on a GPU without bfloat16).
+        _autocast_on = trainer._autocast_dtype is not None and getattr(trainer, "_autocast_enabled", True)
+        dtype_bytes = 16 if _autocast_on and trainer._autocast_dtype in [torch.float16, torch.bfloat16] else 32
 
         total_rows = input_ids.shape[0]
         seq_len = input_ids.shape[1]
@@ -1589,7 +1591,7 @@ def grpo_accumulated_loss(
         # not the one that actually runs in production.
         from contextlib import nullcontext
 
-        if trainer._autocast_dtype is None:
+        if not _autocast_on:
             autocaster = nullcontext()
         else:
             autocaster = torch.amp.autocast(device_type = trainer.model.device.type, dtype = trainer._autocast_dtype)
