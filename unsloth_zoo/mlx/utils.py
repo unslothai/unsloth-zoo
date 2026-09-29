@@ -19051,6 +19051,40 @@ def _gguf_shard_family(first_file, produced_files):
     if stem is None:
         return [first_file]
     return [f for f in produced_files if shard_stem(f) == stem]
+
+
+_GGUF_FULL_PRECISION_TYPES = ("bf16", "f16", "f32")
+_GGUF_QUANT_ALIASES = {
+    "not_quantized": "bf16",
+    "fast_quantized": "q8_0",
+    "quantized": "q4_k_m",
+    None: "q8_0",
+}
+
+
+def _normalize_gguf_quantization_methods(quantization_method):
+    """(ordered unique lower-case llama.cpp types, whether a list/tuple was passed).
+
+    Folded because outputs are `{base}.{TYPE}.gguf`: "BF16" and "bf16" are one file."""
+    is_list = isinstance(quantization_method, (list, tuple))
+    methods = list(quantization_method) if is_list else [quantization_method]
+    if not methods:
+        raise ValueError("Unsloth: quantization_method was an empty list.")
+    resolved = []
+    for method in methods:
+        if method is not None:
+            if not isinstance(method, str):
+                raise TypeError(
+                    "Unsloth: quantization_method must be a string or a list/tuple of "
+                    f"strings - got {type(method).__name__}."
+                )
+            method = method.strip().lower()
+            if not method:
+                raise ValueError("Unsloth: quantization_method contained an empty name.")
+        resolved.append(_GGUF_QUANT_ALIASES.get(method, method))
+    return list(dict.fromkeys(resolved)), is_list
+
+
 def save_pretrained_gguf(
     model,
     tokenizer,
@@ -19079,10 +19113,14 @@ def save_pretrained_gguf(
             "quantized" - q4_k_m (small, fast inference)
             Or any llama.cpp quant type: q2_k, q3_k_m, q4_k_m, q5_k_m,
             q6_k, q8_0, f16, bf16, f32, etc.
+            A list/tuple, e.g. ``["q4_k_m", "q8_0"]``, emits one GGUF per
+            type from a single merge + convert.
         first_conversion: Optional override for the intermediate GGUF
             dtype produced by convert_hf_to_gguf before llama-quantize
             compresses it to ``quantization_method``. Pass ``"f32"`` /
-            ``"f16"`` / ``"bf16"`` to force a specific intermediate
+            ``"f16"`` / ``"bf16"`` to force a specific intermediate.
+            Default: a lone full-precision target directly, f32 if f32 is
+            among the targets, else bf16.
         token: HuggingFace token for reading the upstream imatrix.
         imatrix_file: None = off; a path = that file; True = download the
             upstream unsloth/<base>-GGUF imatrix. Quants that need one
@@ -19102,17 +19140,17 @@ def save_pretrained_gguf(
         internal_scripts_dir_pin,
     )
 
-    quant_map = {
-        "not_quantized": "bf16",
-        "fast_quantized": "q8_0",
-        "quantized": "q4_k_m",
-        None: "q8_0",
-    }
-    quant_type = quant_map.get(quantization_method, quantization_method)
     # Normalize once so every later comparison agrees. The direct-conversion test below and the
     # gate on llama-quantize used to normalize differently, so "Q4_K_M" lost its imatrix to a run
     # that then went ahead without it.
-    quant_type = str(quant_type).strip().lower()
+    quant_types, is_list = _normalize_gguf_quantization_methods(quantization_method)
+    if first_conversion is not None:
+        if not isinstance(first_conversion, str):
+            raise TypeError(
+                "Unsloth: first_conversion must be a string such as 'bf16' - got "
+                f"{type(first_conversion).__name__}."
+            )
+        first_conversion = first_conversion.strip().lower()
 
     # Captured before the drop guard can clear imatrix_file: the path may sit inside
     # save_directory, and must not be reported or uploaded as a file this export produced.
@@ -19121,9 +19159,10 @@ def save_pretrained_gguf(
         imatrix_source = os.path.expanduser(os.fspath(imatrix_file))
 
     # Ahead of the output directory and the merge: llama-quantize only refuses these ~10 minutes in.
-    if quant_requires_imatrix(quant_type) and not imatrix_file:
+    needs_imatrix = [q for q in quant_types if quant_requires_imatrix(q)]
+    if needs_imatrix and not imatrix_file:
         raise RuntimeError(
-            f"Unsloth: '{quant_type}' cannot be quantized without an importance matrix. "
+            f"Unsloth: '{needs_imatrix[0]}' cannot be quantized without an importance matrix. "
             "Pass imatrix_file=True to fetch the upstream Unsloth imatrix, or "
             "imatrix_file='/path/to/imatrix.(dat|gguf)' to use your own."
         )
@@ -19134,24 +19173,26 @@ def save_pretrained_gguf(
     # Apple Silicon always supports bf16
     model_dtype = "bf16"
 
-    # Determine first_conversion (intermediate GGUF format before quantizing)
     if first_conversion is None:
-        if quant_type in ("bf16", "f16", "f32"):
-            first_conversion = quant_type
+        if len(quant_types) == 1 and quant_types[0] in _GGUF_FULL_PRECISION_TYPES:
+            first_conversion = quant_types[0]
+        elif "f32" in quant_types:
+            # bf16/f16 are exact in f32; f16 is never promoted (it clips bf16's range).
+            first_conversion = "f32"
         else:
-            # k-quants and q8_0 go through a bf16 intermediate, then llama-quantize
             first_conversion = "bf16"
-    else:
-        first_conversion = str(first_conversion).strip().lower()
 
-    # llama-quantize runs only when the target differs from the direct conversion. Without it an
-    # imatrix has nothing to weight, so drop it rather than resolve an unusable one.
-    if imatrix_file and (
-        quant_type in ("bf16", "f16", "f32") or first_conversion == quant_type
-    ):
+    # A scalar full-precision request keeps the pre-list contract (no quantize pass).
+    if not is_list and quant_types[0] in _GGUF_FULL_PRECISION_TYPES:
+        to_quantize = []
+    else:
+        to_quantize = [q for q in quant_types if q != first_conversion]
+
+    # No real quant pass means nothing for an imatrix to weight: drop it rather than resolve it.
+    if imatrix_file and not any(q not in _GGUF_FULL_PRECISION_TYPES for q in to_quantize):
         warnings.warn(
-            f"Unsloth: ignoring imatrix_file -- '{quant_type}' is written by direct conversion, "
-            "so llama-quantize never runs."
+            f"Unsloth: ignoring imatrix_file -- '{', '.join(quant_types)}' is written without "
+            "quantizing, so llama-quantize never uses it."
         )
         imatrix_file = None
 
@@ -19161,7 +19202,7 @@ def save_pretrained_gguf(
     # file belongs is their call. Checked even if the drop guard cleared imatrix_file: same loss.
     if imatrix_source is not None:
         base = save_directory / (getattr(model, "_hf_repo", None) or "model").split("/")[-1]
-        for out in (f"{base}.{first_conversion.upper()}.gguf", f"{base}.{quant_type.upper()}.gguf"):
+        for out in (f"{base}.{t.upper()}.gguf" for t in dict.fromkeys([first_conversion, *quant_types])):
             if _is_same_file(imatrix_source, out):
                 raise RuntimeError(
                     f"Unsloth: imatrix_file '{imatrix_source}' is also where this export writes "
@@ -19334,8 +19375,7 @@ def save_pretrained_gguf(
                 else:
                     os.environ["PYTHONPATH"] = original_pythonpath
 
-        if quant_type not in ("bf16", "f16", "f32") and first_conversion != quant_type:
-            quantizer = quantizer_location
+        if to_quantize:
             if not produced_files:
                 raise RuntimeError(
                     "Unsloth: the GGUF converter reported no output file to quantize."
@@ -19345,23 +19385,26 @@ def save_pretrained_gguf(
             # from shard 1's split.count. The model always converts before any projector.
             base_gguf = produced_files[0]
             base_files = _gguf_shard_family(base_gguf, produced_files)
-            final_gguf = f"{output_base}.{quant_type.upper()}.gguf"
-
-            print(f"Unsloth: Quantizing to {quant_type}...")
-            quantize_gguf(
-                input_gguf=base_gguf,
-                output_gguf=final_gguf,
-                quant_type=quant_type,
-                quantizer_location=quantizer,
-                print_output=True,
-                imatrix=imatrix,
-            )
-            # Remove the intermediate, every shard of it, to save space
-            for stale in base_files:
-                if stale == final_gguf or not os.path.exists(stale):
-                    continue
-                os.remove(stale)
-                print(f"Unsloth: Removed intermediate {Path(stale).name}")
+            final_ggufs = []
+            for quant_type in to_quantize:
+                final_gguf = f"{output_base}.{quant_type.upper()}.gguf"
+                print(f"Unsloth: Quantizing to {quant_type}...")
+                quantize_gguf(
+                    input_gguf=base_gguf,
+                    output_gguf=final_gguf,
+                    quant_type=quant_type,
+                    quantizer_location=quantizer_location,
+                    print_output=True,
+                    imatrix=None if quant_type in _GGUF_FULL_PRECISION_TYPES else imatrix,
+                )
+                final_ggufs.append(final_gguf)
+            # The intermediate, every shard of it, is scratch unless it was itself requested.
+            if first_conversion not in quant_types:
+                for stale in base_files:
+                    if stale in final_ggufs or not os.path.exists(stale):
+                        continue
+                    os.remove(stale)
+                    print(f"Unsloth: Removed intermediate {Path(stale).name}")
 
     gguf_files = _exported_gguf_files(save_directory, imatrix_source)
     for f in gguf_files:
@@ -19532,7 +19575,7 @@ def push_to_hub_gguf(
         tokenizer: Tokenizer.
         save_directory: Local path for GGUF output.
         repo_id: HuggingFace repo ID.
-        quantization_method: GGUF quantization type.
+        quantization_method: GGUF quantization type, or a list/tuple of types.
         token: HuggingFace token.
         private: Whether repo should be private.
         first_conversion: Optional intermediate GGUF dtype passed through to
