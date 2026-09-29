@@ -504,6 +504,7 @@ jobs:
             tests/test_device_map_planner_compressed_tensors.py \
             tests/test_gemma3n_kv_sharing_without_cache.py \
             tests/test_gemma3n_rmsnorm_with_scale.py \
+            tests/test_mlx_gkd_guards.py \
             -v
 
       - name: pytest MLX adapter-filter gate (HARD GATE)
@@ -834,6 +835,18 @@ jobs:
             --report "$RUNNER_TEMP/mlx-reports/optimizer_defaults.xml" \
             --require no-skips \
             --message "real mlx is installed but the optimizer defaults tests skipped"
+
+      - name: pytest tests/test_mlx_gkd_loss.py (HARD GATE)
+        run: >-
+          .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_gkd_loss.py -v -rs
+          --junitxml="$RUNNER_TEMP/mlx-reports/gkd_loss.xml"
+
+      - name: Fail if the GKD numeric tests skipped
+        run: |
+          python3 scripts/pytest_junit_gate.py \
+            --report "$RUNNER_TEMP/mlx-reports/gkd_loss.xml" \
+            --require no-skips \
+            --message "real mlx is installed but the GKD numeric tests skipped"
 
       - name: tests/test_mlx_neftune_quant_map.py (mlx_only half, HARD GATE)
         # Embedding identification, embed-scale resolution and probe cleanup are

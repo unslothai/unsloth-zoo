@@ -8482,7 +8482,11 @@ def test_new_scheduler_fields_do_not_shift_existing_positional_slots():
     assert tuple(current[: len(_MAIN_MLX_CONFIG_POSITIONAL_FIELDS)]) == (
         _MAIN_MLX_CONFIG_POSITIONAL_FIELDS
     )
-    assert set(current) - set(_MAIN_MLX_CONFIG_POSITIONAL_FIELDS) == {
+    gkd = {
+        "teacher_model_name_or_path", "gkd_beta", "gkd_temperature", "gkd_lmbda",
+        "gkd_chunk_size", "gkd_skip_memory_preflight",
+    }
+    assert set(current) - set(_MAIN_MLX_CONFIG_POSITIONAL_FIELDS) - gkd == {
         "lr_scheduler_min_lr_rate",
         "lr_scheduler_num_cycles",
         "lr_scheduler_power",
