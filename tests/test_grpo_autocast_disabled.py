@@ -93,7 +93,7 @@ def test_no_dtype_means_no_autocast(monkeypatch):
     assert not _autocast_seen(monkeypatch, _autocast_dtype = None)
 
 
-@pytest.mark.parametrize("precision, expected", [("no", False), ("bf16", True), ("fp16", True)])
+@pytest.mark.parametrize("precision, expected", [("no", False), ("bf16", True), ("fp16", True), ("fp8", True)])
 def test_fallback_follows_accelerate_mixed_precision(monkeypatch, precision, expected):
     # Unsloth's compute_loss reaches grpo_accumulated_loss before it latches _autocast_dtype: the env decides.
     monkeypatch.setenv("ACCELERATE_MIXED_PRECISION", precision)

@@ -1483,7 +1483,7 @@ def grpo_accumulated_loss(
     if not hasattr(trainer, '_autocast_dtype'):
         # "no" is float32 training (a T4 / V100 without bfloat16): autocasting it to bfloat16 raises there.
         _mixed_precision = os.environ.get('ACCELERATE_MIXED_PRECISION', 'fp16')
-        trainer._autocast_dtype = {'fp16': torch.float16, 'bf16': torch.bfloat16}.get(_mixed_precision)
+        trainer._autocast_dtype = None if _mixed_precision == 'no' else (torch.float16 if _mixed_precision == 'fp16' else torch.bfloat16)
         if os.environ.get('UNSLOTH_FORCE_FLOAT32', '0') == '1': trainer._autocast_dtype = None
     pass
     # Restored in `finally`: an OOM or interrupt below must not leave later forwards returning hidden states.
