@@ -18,14 +18,29 @@
 
 from __future__ import annotations
 
+import sys
+
 import numpy as np
 import pytest
 
 
 @pytest.fixture(autouse=True, scope="module")
 def _install_shim():
-    from mlx_simulation import simulate_mlx_on_torch
+    # Same isolation as test_mlx_preference.py: fresh unsloth_zoo.mlx on the shim, originals restored.
+    from mlx_simulation import restore_modules, simulate_mlx_on_torch, snapshot_modules
+    from mlx_simulation.mlx_stub import _MLXFinder
+
+    def _owned(name):
+        return any(name == p or name.startswith(p + ".") for p in ("unsloth_zoo.mlx", "mlx", "mlx_lm", "mlx_vlm"))
+
+    real_modules = snapshot_modules(_owned)
     simulate_mlx_on_torch()
+    for name in list(sys.modules):
+        if name == "unsloth_zoo.mlx" or name.startswith("unsloth_zoo.mlx."):
+            sys.modules.pop(name, None)
+    yield
+    sys.meta_path[:] = [f for f in sys.meta_path if not isinstance(f, _MLXFinder)]
+    restore_modules(real_modules, _owned)
 
 
 class _WordTokenizer:
@@ -97,17 +112,17 @@ def test_kto_labels_are_parsed_not_truth_tested():
         _kto_parse_label("maybe")
 
 
-def test_build_kto_batches_rolls_kl_rows_and_fits_max_length():
-    from unsloth_zoo.mlx.trainer import _build_kto_batches, MLXKTOConfig
+def test_kto_rows_roll_kl_completions_and_fit_max_length():
+    from unsloth_zoo.mlx.trainer import _kto_batch, _kto_rows, MLXKTOConfig
     rows = [
         {"prompt": "x " * 20, "completion": " y", "label": True},
         {"prompt": "q", "completion": " z" * 20, "label": "false"},
         {"prompt": "lone", "completion": " tail", "label": True},
     ]
     args = MLXKTOConfig(per_device_train_batch_size=2, max_length=24, max_prompt_length=0)
-    batches = _build_kto_batches(rows, _WordTokenizer(), args)
-    assert len(batches) == 1  # the size-1 tail is dropped
-    b = batches[0]
+    kto_rows = _kto_rows(rows, _WordTokenizer(), args)
+    assert len(kto_rows) == 2  # the size-1 tail is dropped
+    b = _kto_batch(kto_rows, pad_id=0)
     assert b["desirable"].tolist() == [True, False]
     assert b["comp_ids"].shape[1] <= 24 and b["kl_ids"].shape[1] <= 24
 
@@ -162,6 +177,7 @@ _UNSUPPORTED = {
     "lora_plus_ratio": dict(args=dict(lora_plus_ratio=16.0)),
     "resume_from_checkpoint": dict(resume="ckpt"),
     "eval_dataset": dict(eval_dataset=[]),
+    "callbacks": dict(kwargs=dict(callbacks=[object()])),
 }
 
 
@@ -177,6 +193,7 @@ def test_kto_rejects_unsupported_options(name, monkeypatch):
     tr.processor = case.get("processor")
     tr.eval_dataset = case.get("eval_dataset")
     tr.ref_model = case.get("ref_model")
+    tr._kto_ignored_kwargs = sorted(case.get("kwargs", {}))
     tr.args = T.MLXKTOConfig(**case.get("args", {}))
     monkeypatch.setattr(T.MLXKTOTrainer, "distributed_world_size", 1, raising=False)
     if not name:

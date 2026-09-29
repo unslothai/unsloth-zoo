@@ -9882,9 +9882,9 @@ def _kto_parse_label(value):
     raise ValueError(f"Unsloth: KTO label {value!r} is not a boolean (use True/False, 1/0 or 'true'/'false').")
 
 
-def _build_kto_batches(dataset, tokenizer, args):
-    """KL rows pair each prompt with the previous row's completion in its batch (TRL _get_kl_dataset)."""
-    pad_id = next((x for x in (tokenizer.pad_token_id, tokenizer.eos_token_id) if x is not None), 0)
+def _kto_rows(dataset, tokenizer, args):
+    """Tokenized rows; each carries the previous row's completion within its batch as the KL
+    completion, assigned in dataset order before any shuffle (TRL _get_kl_dataset)."""
     rows = []
     for ex in dataset:
         missing = [k for k in ("prompt", "completion", "label") if k not in ex]
@@ -9894,23 +9894,25 @@ def _build_kto_batches(dataset, tokenizer, args):
         if c:
             rows.append((p, c, _kto_parse_label(ex["label"])))
     bs = int(args.per_device_train_batch_size)
-    batches = []
+    out = []
     for i in range(0, len(rows), bs):
         chunk = rows[i:i + bs]
         if len(chunk) < 2:
             continue  # a lone row would be scored against its own completion
-        prompts, comps, labels = zip(*chunk)
-        rolled = comps[-1:] + comps[:-1]
-        # A prompt fitted to its own completion can overflow max_length with another row's.
-        kl_prompts = [_kto_fit_prompt(p, c, args.max_length) for p, c in zip(prompts, rolled)]
-        batches.append(dict(
-            comp_ids=_kto_pad([p + c for p, c in zip(prompts, comps)], pad_id),
-            comp_labels=_kto_pad([[-100] * len(p) + c for p, c in zip(prompts, comps)], -100),
-            kl_ids=_kto_pad([p + c for p, c in zip(kl_prompts, rolled)], pad_id),
-            kl_labels=_kto_pad([[-100] * len(p) + c for p, c in zip(kl_prompts, rolled)], -100),
-            desirable=mx.array(labels),
-        ))
-    return batches
+        for (p, c, label), (_, kl_c, _) in zip(chunk, chunk[-1:] + chunk[:-1]):
+            # A prompt fitted to its own completion can overflow max_length with another row's.
+            out.append((p, c, _kto_fit_prompt(p, kl_c, args.max_length), kl_c, label))
+    return out
+
+
+def _kto_batch(rows, pad_id):
+    return dict(
+        comp_ids=_kto_pad([p + c for p, c, _, _, _ in rows], pad_id),
+        comp_labels=_kto_pad([[-100] * len(p) + c for p, c, _, _, _ in rows], -100),
+        kl_ids=_kto_pad([p + c for _, _, p, c, _ in rows], pad_id),
+        kl_labels=_kto_pad([[-100] * len(p) + c for _, _, p, c, _ in rows], -100),
+        desirable=mx.array([label for *_, label in rows]),
+    )
 
 
 def _kto_logps(model, ids, labels):
@@ -9933,6 +9935,7 @@ class MLXKTOTrainer(MLXTrainer):
 
     def __init__(self, model, tokenizer, train_dataset, args=None,
                  eval_dataset=None, processor=None, ref_model=None, **kwargs):
+        self._kto_ignored_kwargs = sorted(kwargs)
         args = MLXKTOConfig() if args is None else args
         if not isinstance(args, MLXKTOConfig):
             raise TypeError(f"Unsloth: MLXKTOTrainer requires an MLXKTOConfig, got {type(args).__name__}.")
@@ -9968,6 +9971,7 @@ class MLXKTOTrainer(MLXTrainer):
             "resume_from_checkpoint": resume_from_checkpoint is not None,
             "eval_dataset": self.eval_dataset is not None,
             "distributed training": self.distributed_world_size > 1,
+            f"arguments {self._kto_ignored_kwargs}": bool(self._kto_ignored_kwargs),
         }
         found = [name for name, hit in unsupported.items() if hit]
         if found:
@@ -9976,14 +9980,19 @@ class MLXKTOTrainer(MLXTrainer):
     def train(self, resume_from_checkpoint: str | None = None):
         self._reject_unsupported(resume_from_checkpoint)
         args, model = self.args, self.model
-        batches = _build_kto_batches(self.train_dataset, self.tokenizer, args)
-        if not batches:
+        rows = _kto_rows(self.train_dataset, self.tokenizer, args)
+        if not rows:
             raise ValueError("Unsloth: KTO needs at least 2 rows with non-empty completions.")
+        tok = self.tokenizer
+        pad_id = next((x for x in (tok.pad_token_id, tok.eos_token_id) if x is not None), 0)
+        bs = int(args.per_device_train_batch_size)
         grad_accum = max(int(args.gradient_accumulation_steps), 1)
+        steps_per_epoch = math.ceil(math.ceil(len(rows) / bs) / grad_accum)  # a partial window still steps
         if args.max_steps and args.max_steps > 0:
             total_steps = args.max_steps
         else:
-            total_steps = max(len(batches) * max(int(args.num_train_epochs or 1), 1) // grad_accum, 1)
+            total_steps = steps_per_epoch * max(int(args.num_train_epochs or 1), 1)
+        shuffle = not args.preserve_dataset_order and args.dataset_order != "sequential"
         optimizer = self._build_optimizer(total_steps)
         max_grad_norm, max_grad_value, max_grad_leaf_norm, _ = _resolve_mlx_grad_clipping(args)
         if self._kto_reference is None:
@@ -10007,26 +10016,32 @@ class MLXKTOTrainer(MLXTrainer):
         dropout = PreferenceRunContext(model, enabled=bool(args.disable_dropout))
         try:
             model.train()
-            step, index = 0, 0
-            acc_grad, acc_loss, acc_kl, acc_n = None, 0.0, 0.0, 0
+            step, epoch = 0, 0
+            windows = []
             while step < total_steps and not self.stop_requested:
-                batch = batches[index % len(batches)]
-                index += 1
-                ref, ref_kl = _kto_reference_logps(model, self._kto_reference, batch)
-                kl = _kto_kl_baseline(_kto_logps(model, batch["kl_ids"], batch["kl_labels"]), ref_kl)
-                ref = mx.stop_gradient(ref)
-                mx.eval(ref, kl)
-                loss, grad = value_and_grad(model, batch, ref, kl)
-                # Weight by rows: a smaller trailing batch must not count as much as a full one.
-                n = batch["comp_ids"].shape[0]
-                grad = tree_map(lambda g: g * n, grad)
-                acc_grad = grad if acc_grad is None else tree_map(mx.add, acc_grad, grad)
-                acc_loss += float(loss) * n
-                acc_kl += float(kl) * n
-                acc_n += n
-                if index % grad_accum:
+                if not windows:
+                    # TRL's sampler reshuffles rows each epoch; KL completions travel with their rows.
+                    order = list(range(len(rows)))
+                    if shuffle:
+                        random.Random(args.seed + epoch).shuffle(order)
+                    epoch += 1
+                    batches = [[rows[i] for i in order[j:j + bs]] for j in range(0, len(order), bs)]
+                    windows = [batches[j:j + grad_accum] for j in range(0, len(batches), grad_accum)]
+                acc_grad, acc_loss, acc_kl, acc_n = None, 0.0, 0.0, 0
+                for batch in map(lambda b: _kto_batch(b, pad_id), windows.pop(0)):
+                    ref, ref_kl = _kto_reference_logps(model, self._kto_reference, batch)
+                    kl = _kto_kl_baseline(_kto_logps(model, batch["kl_ids"], batch["kl_labels"]), ref_kl)
+                    ref = mx.stop_gradient(ref)
+                    mx.eval(ref, kl)
+                    loss, grad = value_and_grad(model, batch, ref, kl)
+                    # Weight by rows: a smaller trailing batch must not count as much as a full one.
+                    n = batch["comp_ids"].shape[0]
+                    grad = tree_map(lambda g: g * n, grad)
+                    acc_grad = grad if acc_grad is None else tree_map(mx.add, acc_grad, grad)
+                    acc_loss += float(loss) * n
+                    acc_kl += float(kl) * n
+                    acc_n += n
                     mx.eval(acc_grad)
-                    continue
                 grad = tree_map(lambda g: g / acc_n, acc_grad)
                 self._set_optimizer_lr_for_step(optimizer, step)  # decay below reads this LR
                 if max_grad_norm > 0:
@@ -10046,7 +10061,6 @@ class MLXKTOTrainer(MLXTrainer):
                 if args.logging_steps and step % max(int(args.logging_steps), 1) == 0:
                     print(f"Unsloth KTO: step {step}/{total_steps} "
                           f"loss={self._train_loss_history[-1]:.4f} kl={self._kl_history[-1]:.4f}")
-                acc_grad, acc_loss, acc_kl, acc_n = None, 0.0, 0.0, 0
         finally:
             dropout.restore()
             release_mlx_training_patches()

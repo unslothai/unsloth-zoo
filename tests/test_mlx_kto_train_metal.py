@@ -80,6 +80,10 @@ def test_kto_step_counts_follow_accumulation_and_epochs(tmp_path):
     assert out.global_step == out["total_train_steps"] == 3
     out = _trainer(tmp_path / "b", data=_dataset(8), max_steps=0, num_train_epochs=2).train()
     assert out.global_step == out["total_train_steps"] == 4
+    # 3 batches per epoch at accumulation 2: the partial window still steps, per epoch.
+    out = _trainer(tmp_path / "c", data=_dataset(12), max_steps=0, gradient_accumulation_steps=2,
+                   num_train_epochs=2).train()
+    assert out.global_step == out["total_train_steps"] == 4
 
 
 @metal_only
