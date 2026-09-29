@@ -105,6 +105,9 @@ _VERIFIED_TRAINING_ARCHES: set[str] = {
     "qwen2_5_vl",
     "qwen3_5",
     "qwen3_5_moe",
+    # mlx-vlm 0.7.4+ names these as qwen3_5 / qwen3_5_moe's `text_config` decoders.
+    "qwen3_5_moe_text",
+    "qwen3_5_text",
     "qwen3_vl_moe",
     "qwen3_vl",
 }
@@ -245,6 +248,8 @@ _TRAINING_VERIFIER_HINTS: dict[str, str] = {
     "qwen2_5_vl": "verify_qwen2_5_vl",
     "qwen3_5": "verify_qwen3_5",
     "qwen3_5_moe": "verify_qwen3_5_moe",
+    "qwen3_5_moe_text": "verify_qwen3_5_moe_text",
+    "qwen3_5_text": "verify_qwen3_5_text",
     "qwen3_vl_moe": "verify_qwen3_vl_moe",
     "qwen3_vl": "verify_qwen3_vl",
     "smolvlm": "verify_smolvlm",
