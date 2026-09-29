@@ -9971,6 +9971,11 @@ class MLXKTOTrainer(MLXTrainer):
             "lora_plus_ratio": float(getattr(args, "lora_plus_ratio", 0) or 0) > 0,
             "embedding_learning_rate": float(getattr(args, "embedding_learning_rate", 0) or 0) > 0,
             "neftune_noise_alpha": float(getattr(args, "neftune_noise_alpha", 0) or 0) > 0,
+            "report_to trackers (use add_step_callback)": any(
+                r not in ("none", "") for r in ([args.report_to] if isinstance(args.report_to, str) else args.report_to or [])
+            ),
+            f"dataset_order={args.dataset_order!r} (use 'default', 'sequential' or 'torch_randperm')":
+                args.dataset_order not in (None, "default", "sequential", "torch_randperm"),
             "resume_from_checkpoint": resume_from_checkpoint is not None,
             "save_steps > 0 (adapters are saved at the end)": int(args.save_steps or 0) > 0,
             "eval_dataset": self.eval_dataset is not None,
@@ -10025,14 +10030,17 @@ class MLXKTOTrainer(MLXTrainer):
         value_and_grad = nn.value_and_grad(model, loss_fn)
         start_time = time.perf_counter()
         self._train_loss_history, self._kl_history, self._global_step = [], [], 0
-        # Same setup as MLXTrainer.train: Metal memory guard, gradient checkpointing, MLX training patches.
-        self._memory_limits_applied = self._configure_memory_limits()
-        if args.gradient_checkpointing:
-            apply_gradient_checkpointing(model)
-        acquire_mlx_training_patches()
-        # As TRL's disable_dropout: policy, reference and KL forwards must not draw separate masks.
-        dropout = PreferenceRunContext(model, enabled=bool(args.disable_dropout))
+        dropout, checkpointed, patched, trained_tokens = None, False, False, 0
         try:
+            # Same setup as MLXTrainer.train: Metal memory guard, gradient checkpointing, MLX training patches.
+            self._memory_limits_applied = self._configure_memory_limits()
+            if args.gradient_checkpointing:
+                apply_gradient_checkpointing(model)
+                checkpointed = True
+            acquire_mlx_training_patches()
+            patched = True
+            # As TRL's disable_dropout: policy, reference and KL forwards must not draw separate masks.
+            dropout = PreferenceRunContext(model, enabled=bool(args.disable_dropout))
             model.train()
             step, epoch = 0, 0
             windows = []
@@ -10061,6 +10069,7 @@ class MLXKTOTrainer(MLXTrainer):
                     acc_loss += float(loss) * n
                     acc_kl += float(kl) * n
                     acc_n += n
+                    trained_tokens += int((batch["comp_labels"] != -100).sum())
                     mx.eval(acc_grad)
                 grad = tree_map(lambda g: g / acc_n, acc_grad)
                 self._set_optimizer_lr_for_step(optimizer, step)  # decay below reads this LR
@@ -10081,11 +10090,21 @@ class MLXKTOTrainer(MLXTrainer):
                 if args.logging_steps and step % max(int(args.logging_steps), 1) == 0:
                     print(f"Unsloth KTO: step {step}/{total_steps} "
                           f"loss={self._train_loss_history[-1]:.4f} kl={self._kl_history[-1]:.4f}")
+                    elapsed = time.perf_counter() - start_time
+                    for cb in self._step_callbacks if self.is_main_process else ():
+                        try:
+                            cb(step, total_steps, self._train_loss_history[-1], float(optimizer.learning_rate),
+                               trained_tokens / max(elapsed, 1e-9), mx.get_peak_memory() / 1e9, elapsed,
+                               trained_tokens, None)
+                        except Exception as e:
+                            print(f"Unsloth: step callback error: {e}")
         finally:
             self._run_generation += 1  # a stop latched by this run is stale for the next one
-            dropout.restore()
-            release_mlx_training_patches()
-            if args.gradient_checkpointing:
+            if dropout is not None:
+                dropout.restore()
+            if patched:
+                release_mlx_training_patches()
+            if checkpointed:
                 remove_gradient_checkpointing(model)
             self._restore_memory_limits()
 

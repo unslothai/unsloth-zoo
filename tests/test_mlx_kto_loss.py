@@ -194,6 +194,8 @@ _UNSUPPORTED = {
     "lora_plus_ratio": dict(args=dict(lora_plus_ratio=16.0)),
     "embedding_learning_rate": dict(args=dict(embedding_learning_rate=5e-5)),
     "neftune_noise_alpha": dict(args=dict(neftune_noise_alpha=5.0)),
+    "report_to": dict(args=dict(report_to="wandb")),
+    "dataset_order": dict(args=dict(dataset_order="sequental")),
     "resume_from_checkpoint": dict(resume="ckpt"),
     "save_steps": dict(args=dict(save_steps=10)),
     "eval_dataset": dict(eval_dataset=[]),

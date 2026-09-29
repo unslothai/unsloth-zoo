@@ -83,6 +83,15 @@ def test_kto_stop_requests(tmp_path):
 
 
 @metal_only
+def test_kto_step_callbacks_run_on_logged_steps(tmp_path):
+    seen = []
+    trainer = _trainer(tmp_path, max_steps=4, logging_steps=2)
+    trainer.add_step_callback(lambda step, total, loss, *rest: seen.append((step, total, math.isfinite(loss))))
+    trainer.train()
+    assert seen == [(2, 4, True), (4, 4, True)]
+
+
+@metal_only
 def test_kto_step_counts_follow_accumulation_and_epochs(tmp_path):
     out = _trainer(tmp_path / "a", max_steps=0, gradient_accumulation_steps=2).train()
     assert out.global_step == out["total_train_steps"] == 3
