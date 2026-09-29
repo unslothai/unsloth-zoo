@@ -1077,6 +1077,7 @@ class SpeculativeDraft:
         self.drafter = drafter
         self._request = None
         self._admitted = None
+        self.draft_n = self.draft_n_accepted = 0
 
     @property
     def draft_kind(self) -> str:
@@ -1094,6 +1095,7 @@ class SpeculativeDraft:
 
     def prepare(self, prompt: Sequence[int], sampling: SamplingParams) -> None:
         self._request = (list(prompt), sampling)
+        self.draft_n = self.draft_n_accepted = 0
 
     def admit(self, model, row: EngineRow, input_ids: mx.array, pixel_values = None, mask = None, **kwargs) -> tuple[EngineRow, float]:
         """Prefill ``row``'s prompt alone through ``generate_step`` (vision inputs, chunking, the drafter's
@@ -1129,6 +1131,7 @@ class SpeculativeDraft:
         engine.add(self._started(model, EngineRow(prompt_cache, first, prompt, sampling, max_tokens), last_outputs))
         while engine.rows:
             for step in engine.step():
+                self.draft_n, self.draft_n_accepted = step.draft_n, step.draft_n_accepted
                 yield from ((token, None) for token in step.tokens)
 
     def _started(self, model, row: EngineRow, last_outputs) -> EngineRow:
@@ -1600,16 +1603,15 @@ class ContextDrafter:
         return [0] * len(rows)
 
 
-def companion_drafter(model_path: str | Path, target: nn.Module, **kwargs) -> ContextDrafter | Eagle3Drafter:
-    """A drafter from a separate DFlash, DFlash2, DSpark or EAGLE-3 checkpoint, checked against ``target``."""
+def companion_drafter(model_path: str | Path, target: nn.Module, **kwargs) -> ContextDrafter | Eagle3Drafter | AssistantDrafter:
+    """A drafter from a separate DFlash, DFlash2, DSpark, EAGLE-3 or Gemma 4 assistant checkpoint, checked against ``target``."""
     from mlx_vlm.speculative.drafters import load_drafter, validate_drafter_compatibility
 
     model, kind = load_drafter(str(model_path))
-    wrapper = {"dflash": ContextDrafter, "eagle3": Eagle3Drafter}.get(kind)
-    if wrapper is None:
+    if kind not in ("dflash", "eagle3", "mtp"):
         raise ValueError(f"{kind} companion drafters are not supported")
     validate_drafter_compatibility(target, model, kind)
-    return wrapper(model, target, **kwargs)
+    return AssistantDrafter(model, target) if kind == "mtp" else {"dflash": ContextDrafter, "eagle3": Eagle3Drafter}[kind](model, target, **kwargs)
 
 
 def native_mtp_drafter(model_path: str | Path, target: nn.Module, **kwargs) -> MTPDrafter | HeadDrafter | ContextDrafter | None:

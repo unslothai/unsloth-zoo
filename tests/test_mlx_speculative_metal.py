@@ -40,10 +40,9 @@ def qwen_mtp():
 
 @pytest.fixture(scope = "module")
 def gemma():
-    from mlx_vlm.speculative.drafters import load_drafter
-    from unsloth_zoo.mlx.speculative import AssistantDrafter
+    from unsloth_zoo.mlx.speculative import companion_drafter
     model, ids = _load(GEMMA, PAST_WINDOW)
-    return model, ids, AssistantDrafter(load_drafter(GEMMA_ASSISTANT)[0], model)
+    return model, ids, companion_drafter(GEMMA_ASSISTANT, model)
 
 
 def _drafter(model, **kwargs):
@@ -260,7 +259,7 @@ def test_generate_step_decodes_our_drafter_through_the_engine(request, monkeypat
     for prefill_step_size in (16, None):  # unchunked, the final forward returns every prompt position's hidden
         draft.prepare(ids[0], SamplingParams())
         assert generate(draft_model = draft, draft_kind = draft.draft_kind, prefill_step_size = prefill_step_size) == plain
-    assert rounds and [hidden.shape[1] for hidden in started] == ([32, 32] if native else [])
+    assert rounds and [hidden.shape[1] for hidden in started] == ([32, 32] if native else []) and draft.draft_n >= draft.draft_n_accepted > 0
     # The same positions from six chunks as from one forward: chunking moves them ~0.07 on average, a one-position shift ~3.3.
     assert not native or (started[0] - started[1]).abs().mean().item() < 0.5
     with pytest.raises(RuntimeError, match = "prepare"):
