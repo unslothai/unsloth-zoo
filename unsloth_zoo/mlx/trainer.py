@@ -1366,6 +1366,8 @@ class MLXTrainingConfig:
             "ref_model_sync_steps",
             "precompute_ref_log_probs",
             "precompute_ref_batch_size",
+            "desirable_weight",
+            "undesirable_weight",
         }
         _field_names = {field.name for field in config_fields}
         copied_all_fields = (_field_names - _appended_fields) <= set(provided)

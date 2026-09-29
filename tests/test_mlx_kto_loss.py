@@ -231,3 +231,11 @@ def test_kto_config_inherits_parent_init():
     c = MLXKTOConfig(beta=0.5, desirable_weight=2.0)
     assert hasattr(c, "_unsloth_mlx_warmup_steps_explicit")
     assert (c.beta, c.desirable_weight, c.loss_type) == (0.5, 2.0, "kto")
+
+
+def test_kto_config_copied_from_a_base_dump_keeps_warmup_ratio():
+    from dataclasses import fields
+    from unsloth_zoo.mlx.trainer import MLXKTOConfig, MLXTrainingConfig
+    base = MLXTrainingConfig(warmup_ratio=0.1)
+    dump = {f.name: getattr(base, f.name) for f in fields(MLXTrainingConfig)}
+    assert MLXKTOConfig(**dump)._unsloth_mlx_warmup_steps_explicit is False
