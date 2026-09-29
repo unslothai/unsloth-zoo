@@ -138,6 +138,14 @@ def assert_tokenizers_compatible(student_tokenizer, teacher_tokenizer,
             "student's family (e.g. Qwen2.5-3B for a Qwen2.5/Qwen3 student)."
         )
     if student_tokenizer is None or teacher_tokenizer is None:
+        import warnings
+        warnings.warn(
+            "Unsloth: GKD could not compare the student and teacher tokenizers "
+            "(no tokenizer given); only the logit widths were checked. Token ids "
+            "must mean the same thing to both models.",
+            UserWarning,
+            stacklevel = 2,
+        )
         return True
 
     for probe in TOKENIZER_PROBES:
@@ -270,15 +278,19 @@ def build_gkd_loss_fn(teacher_model, args, vocab_size, batch_size,
     chunk_size = int(getattr(args, "gkd_chunk_size", DEFAULT_CHUNK_SIZE))
     validate_gkd_config(beta, temperature, getattr(args, "gkd_lmbda", 0.0))
 
-    # max_seq_length bounds the widest padded batch, so this is an upper bound.
-    sequence_length = int(getattr(args, "max_seq_length", 512))
+    # The loss sees max_seq_length - 1 positions at most. A shorter batch that
+    # fits in one chunk runs unchunked, so budget whichever branch costs more.
+    sequence_length = max(1, int(getattr(args, "max_seq_length", 512)) - 1)
+    chunked = _is_chunked(chunk_size, sequence_length)
+    if chunked and NAIVE_ACTIVATION_MULTIPLIER * chunk_size > CHUNKED_ACTIVATION_MULTIPLIER * sequence_length:
+        sequence_length, chunked = chunk_size, False
     preflight_memory(
         batch_size = batch_size,
         sequence_length = sequence_length,
         vocab_size = vocab_size,
         resident_bytes = resident_bytes,
         system_bytes = system_bytes,
-        chunked = _is_chunked(chunk_size, sequence_length),
+        chunked = chunked,
         skip = bool(getattr(args, "gkd_skip_memory_preflight", False)),
     )
 

@@ -60,7 +60,8 @@ def test_width_mismatch_is_rejected_without_tokenizers():
     d = _distill()
     with pytest.raises(ValueError, match="logit widths differ"):
         d.assert_tokenizers_compatible(None, FakeTokenizer(), 128256, 151936)
-    assert d.assert_tokenizers_compatible(None, FakeTokenizer(), VOCAB, VOCAB)
+    with pytest.warns(UserWarning, match="only the logit widths were checked"):
+        assert d.assert_tokenizers_compatible(None, FakeTokenizer(), VOCAB, VOCAB)
 
 
 def test_width_matches_but_ids_differ_is_rejected():
@@ -192,9 +193,19 @@ def test_chunk_size_at_or_above_seq_len_is_budgeted_unchunked():
         args = SimpleNamespace(max_seq_length=1300, gkd_chunk_size=chunk)
         return d.build_gkd_loss_fn(None, args, VOCAB, 1, RESIDENT, SYSTEM_16GB)
     assert callable(build(128))
-    for chunk in (0, 1300, 4096):
+    for chunk in (0, 1299, 1300, 4096):
         with pytest.raises(ValueError, match="unchunked loss"):
             build(chunk)
+
+
+@pytest.mark.parametrize("max_seq_length", [129, 140])
+def test_single_chunk_batches_are_budgeted_unchunked(max_seq_length):
+    """A <=128-position batch runs unchunked even when max_seq_length would chunk."""
+    from types import SimpleNamespace
+    d = _distill()
+    args = SimpleNamespace(max_seq_length=max_seq_length, gkd_chunk_size=128)
+    with pytest.raises(ValueError, match="unchunked loss"):
+        d.build_gkd_loss_fn(None, args, VOCAB, 10, RESIDENT, SYSTEM_16GB)
 
 
 def test_config_fields_exist_and_are_inert_by_default():

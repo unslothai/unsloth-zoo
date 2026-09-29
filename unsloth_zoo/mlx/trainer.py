@@ -4322,7 +4322,8 @@ class MLXTrainer:
                 total = weights.item()
                 value = (losses / weights).item() if total > 0 else 0.0
                 metrics[f"{prefix}loss"] = value
-                if metric_names is None:
+                # exp(JSD) is not a perplexity.
+                if metric_names is None and not getattr(loss_fn, "_unsloth_gkd", False):
                     metrics[f"{prefix}perplexity"] = math.exp(min(value, 100))
                 elif total > 0:
                     for name, metric in _preference_metric_values(
