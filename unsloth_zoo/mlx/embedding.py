@@ -52,7 +52,6 @@ SENTENCE_TRANSFORMERS_POOLING_MAP = {
 
 
 def l2_normalize(x, eps = 1e-12):
-    """Unit-norm along the last axis."""
     return x / mx.maximum(mx.linalg.norm(x, axis = -1, keepdims = True), eps)
 
 
@@ -99,7 +98,6 @@ def pool(hidden_states, attention_mask, mode = "mean"):
 
 
 def multiple_negatives_ranking_loss(anchors, positives, scale = 20.0):
-    """In-batch negatives: cross-entropy over the scaled cosine-similarity matrix."""
     anchors = l2_normalize(anchors)
     positives = l2_normalize(positives)
     scores = (anchors @ positives.T) * scale
@@ -140,8 +138,7 @@ def read_pooling_mode(pooling_config, default = "mean"):
 
 
 def is_sentence_transformers_layout(weight_keys):
-    """Decoder-inner keys (``embed_tokens.``, ``layers.``) at the root; other HF roots such as
-    ``gpt_neox.`` or ``transformer.`` are not this layout and must not be prefixed."""
+    # Require decoder-inner roots: other HF roots (gpt_neox., transformer.) must not be prefixed.
     keys = list(weight_keys)
     if any(key.startswith("model.") for key in keys):
         return False
