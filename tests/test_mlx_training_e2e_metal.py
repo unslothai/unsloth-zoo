@@ -30,6 +30,7 @@ _UNTRANSPOSED = dict(k=192, rows=1, out_width=128, transpose=False, rhs_indices=
 if _METAL:
     # Module scope: leaked mlx-simulation shims must not hijack test-time imports.
     import mlx.nn as nn
+    import mlx.optimizers as optim
     from mlx.utils import tree_flatten, tree_map
     from unsloth_zoo.mlx.loader import FastMLXModel
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
@@ -884,6 +885,57 @@ def test_frozen_dense_cce_preserves_gradients_with_lower_peak(monkeypatch, compi
         peaks.append(mx.get_peak_memory() - resident)
         del result
     assert peaks[1] < peaks[0]
+
+
+@metal_only
+@pytest.mark.parametrize("quantized", [False, True])
+def test_compiled_update_reuses_parameter_and_moment_buffers(quantized):
+    import gc
+    import weakref
+    from unsloth_zoo.mlx.optimizers_quantized import QuantizedMomentAdamW
+
+    shape = (2048, 8192)
+    leaf = shape[0] * shape[1] * 2
+    results, peaks = [], []
+    for trainer_built in (False, True):
+        mx.random.seed(3)
+        params = {"w": (mx.random.normal(shape) * 0.02).astype(mx.bfloat16)}
+        grads = [(mx.random.normal(shape) * 1e-3).astype(mx.bfloat16) for _ in range(3)]
+        if trainer_built:
+            trainer = MLXTrainer.__new__(MLXTrainer)
+            trainer.args = MLXTrainingConfig(
+                optim="adamw_8bit" if quantized else "adamw", learning_rate=1e-3,
+                lr_scheduler_type="constant", warmup_steps=0, weight_decay=0.0,
+            )
+            opt = trainer._build_optimizer(total_steps=3)
+        else:
+            cls = QuantizedMomentAdamW if quantized else optim.AdamW
+            opt = cls(learning_rate=1e-3, weight_decay=0.0, bias_correction=True)
+        opt.init(params)
+        state = [params, opt.state]
+        step = mx.compile(lambda g: params.update(opt.apply_gradients({"w": g}, params)),
+                          inputs=state, outputs=state)
+        mx.eval(state, grads)
+        for g in grads:
+            gc.collect()
+            mx.synchronize()
+            resident = mx.get_active_memory()
+            mx.reset_peak_memory()
+            step(g)
+            mx.eval(state)
+            mx.synchronize()
+        peaks.append(mx.get_peak_memory() - resident)
+        results.append(tree_flatten(state))
+    for (name, left), (_, right) in zip(*results):
+        assert mx.array_equal(left, right).item(), name
+    assert peaks[0] >= 3 * leaf
+    if quantized:
+        # 8-bit m is repacked either way; only the parameter is donated.
+        assert peaks[1] <= peaks[0] - leaf
+    else:
+        assert peaks[1] < leaf / 8
+    released = weakref.ref(trainer._build_optimizer(total_steps=3))
+    assert released() is None
 
 
 @metal_only

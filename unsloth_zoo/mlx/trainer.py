@@ -48,6 +48,7 @@ import random
 import socket
 import time
 import unicodedata
+import weakref
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -866,6 +867,27 @@ def _normalize_mlx_optimizer_name(name):
             f"Supported optimizers: {supported}."
         )
     return opt_name
+
+
+def _donate_optimizer_state(optimizer):
+    """Zero-copy reshape of each new state array splits mx.compile's multi-output
+    update kernel (whose inputs MLX never donates) so p, m, v update in place."""
+    apply_single = getattr(type(optimizer), "apply_single", None)
+    if apply_single is None:
+        return optimizer
+    # Weak: a strong self-reference would hold the optimizer until a cyclic GC.
+    owner = weakref.ref(optimizer)
+
+    def _apply_single(gradient, parameter, state):
+        before = dict(state)
+        updated = apply_single(owner(), gradient, parameter, state)
+        for key, value in state.items():
+            if isinstance(value, mx.array) and value is not before.get(key):
+                state[key] = value.reshape((1, *value.shape)).reshape(value.shape)
+        return updated
+
+    optimizer.apply_single = _apply_single
+    return optimizer
 
 
 def _resolve_adam_epsilon(value):
@@ -4041,7 +4063,7 @@ class MLXTrainer:
             self._coupled_weight_decay = float(wd or 0.0)
             optimizer = optim.AdaDelta(learning_rate=initial_lr)
         self._resolved_optimizer_name = opt_name
-        return optimizer
+        return _donate_optimizer_state(optimizer)
 
     @staticmethod
     def _should_apply_weight_decay(name, parameter=None):
