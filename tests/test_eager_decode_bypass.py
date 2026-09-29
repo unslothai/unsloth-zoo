@@ -40,7 +40,7 @@ def test_compiled_regions_run_eager_only_inside_eager_decode():
         import torch
         from unsloth_zoo.temporary_patches.utils import (
             torch_compile_with_fallback, torch_compiler_disable_unless_decode,
-            unsloth_eager_decode, UNSLOTH_EAGER_DECODE,
+            unsloth_eager_decode, eager_decode_active,
         )
         from unsloth_zoo.temporary_patches.common import unwrap_already_compiled
 
@@ -56,15 +56,15 @@ def test_compiled_regions_run_eager_only_inside_eager_decode():
             x = torch.ones(3)
             torch._dynamo.reset(); frames.clear()
             with torch.no_grad(), unsloth_eager_decode():
-                assert UNSLOTH_EAGER_DECODE[0]
+                assert eager_decode_active()
                 y = g(x)
-            assert not UNSLOTH_EAGER_DECODE[0]
+            assert not eager_decode_active()
             assert frames["unique_graphs"] == 0, "compiled during eager decode"
             with torch.no_grad():
                 g(x)
             assert frames["unique_graphs"] == 1, "compiled path no longer taken outside"
             with unsloth_eager_decode():  # grad on: training, never bypassed
-                assert not UNSLOTH_EAGER_DECODE[0]
+                assert not eager_decode_active()
             assert torch.equal(y, x * 2 + 1)
 
         # An outer compile traces the compiled path even inside the scope.
@@ -73,6 +73,27 @@ def test_compiled_regions_run_eager_only_inside_eager_decode():
         outer = torch.compile(lambda x: h(x) * 3, backend = "eager", fullgraph = True)
         with torch.no_grad(), unsloth_eager_decode():
             assert torch.equal(outer(torch.ones(2)), torch.zeros(2))
+
+        # Another thread never sees this thread's scope, and nested scopes restore their own.
+        import threading
+        other = []
+        with torch.no_grad(), unsloth_eager_decode():
+            t = threading.Thread(target = lambda: other.append(eager_decode_active()))
+            t.start(); t.join()
+            with unsloth_eager_decode():
+                pass
+            assert eager_decode_active()
+        assert other == [False] and not eager_decode_active()
+
+        # Dynamo never reads the flag, so entering and leaving the scope does not recompile.
+        calls = torch.compile(lambda x: h(x) + 1, backend = "eager", fullgraph = True)
+        torch._dynamo.reset(); frames.clear()
+        with torch.no_grad():
+            for _ in range(3):
+                calls(torch.ones(2))
+                with unsloth_eager_decode():
+                    calls(torch.ones(2))
+        assert frames["unique_graphs"] == 1, frames
 
         seen = []
         @torch_compiler_disable_unless_decode

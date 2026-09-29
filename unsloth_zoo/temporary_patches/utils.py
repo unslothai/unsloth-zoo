@@ -18,7 +18,7 @@ __all__ = [
     "patch_function",
     "UNSLOTH_DECODE_COMPILE",
     "unsloth_decode_compile",
-    "UNSLOTH_EAGER_DECODE",
+    "eager_decode_active",
     "unsloth_eager_decode",
     "torch_compiler_disable_unless_decode",
     "compile_with_eager_fallback",
@@ -2125,21 +2125,26 @@ def unsloth_decode_compile():
                     set_stance(stance[0], skip_guard_eval_unsafe = stance[1])
 
 
-# True while generate() runs an eager decode step (no grad, one new token per row). Compiled
-# regions then call their eager original: at one token their guard checks and wrapper cost
-# more than the fusion saves (Qwen3.5-2B, A100: 3.6 s -> 2.8 s per 64 tokens). Never set
-# while tracing or with grad on, so compiled training and checkpoint recompute are untouched.
-UNSLOTH_EAGER_DECODE = [False]
+# Set while generate() runs an eager decode step (no grad, one new token per row) on this
+# thread. Compiled regions then call their eager original: at one token their guard checks
+# and wrapper cost more than the fusion saves (Qwen3.5-2B, A100: 3.6 s -> 2.8 s per 64 tokens).
+# Thread-local, never set while tracing or with grad on, and only read outside tracing, so
+# training (including on another thread) and any outer compile keep the compiled path.
+_EAGER_DECODE_STATE = threading.local()
+
+
+def eager_decode_active():
+    return getattr(_EAGER_DECODE_STATE, "active", False)
 
 
 @contextlib.contextmanager
 def unsloth_eager_decode():
-    previous = UNSLOTH_EAGER_DECODE[0]
-    UNSLOTH_EAGER_DECODE[0] = not torch.is_grad_enabled() and not torch.compiler.is_compiling()
+    previous = eager_decode_active()
+    _EAGER_DECODE_STATE.active = not torch.is_grad_enabled() and not torch.compiler.is_compiling()
     try:
         yield
     finally:
-        UNSLOTH_EAGER_DECODE[0] = previous
+        _EAGER_DECODE_STATE.active = previous
 
 
 def _eager_during_decode(func, compiled):
@@ -2148,7 +2153,7 @@ def _eager_during_decode(func, compiled):
     exactly as they did on `compiled`."""
     @functools.wraps(compiled)
     def dispatch(*args, **kwargs):
-        if UNSLOTH_EAGER_DECODE[0] and not torch.compiler.is_compiling():
+        if not torch.compiler.is_compiling() and eager_decode_active():
             return func(*args, **kwargs)
         return compiled(*args, **kwargs)
     dispatch.__wrapped__ = func
@@ -2177,7 +2182,7 @@ def torch_compiler_disable_unless_decode(func = None, *, recursive = False):
         if torch.compiler.is_compiling():
             if UNSLOTH_DECODE_COMPILE[0]:
                 return func(*args, **kwargs)
-        elif UNSLOTH_EAGER_DECODE[0]:
+        elif eager_decode_active():
             return func(*args, **kwargs)  # nothing is tracing: skip the disable wrapper
         return disabled(*args, **kwargs)
     forward._unsloth_undisabled = func
