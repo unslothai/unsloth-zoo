@@ -83,7 +83,6 @@ _RUNNER = textwrap.dedent(
 
 def _run(mode, outfile):
     env = dict(os.environ)
-    # Force CPU-friendly behaviour; the correctness check is device-independent.
     r = subprocess.run(
         [sys.executable, "-c", _RUNNER, mode, outfile],
         capture_output=True, text=True, env=env,
