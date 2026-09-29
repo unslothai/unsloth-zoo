@@ -94,8 +94,8 @@ def generalized_jsd_loss(
     chunk_size = DEFAULT_CHUNK_SIZE,
 ):
     """TRL's ``GKDTrainer.generalized_jsd_loss`` in MLX: beta 0 is forward KL,
-    1 reverse KL; -100 labels are excluded; ``chunk_size`` positions at a time
-    (0 = unchunked)."""
+    1 reverse KL; mean over non -100 positions (TRL's labels=None batchmean
+    divides by batch size instead); ``chunk_size`` positions at a time."""
     if labels is None:
         mask = mx.ones(student_logits.shape[:2])
     else:
