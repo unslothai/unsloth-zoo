@@ -488,6 +488,28 @@ def test_hf_callbacks_receive_mlx_trainer_lifecycle(tmp_path):
 
 
 @metal_only
+def test_eval_reports_mean_token_accuracy_on_metal(tmp_path):
+    from transformers import TrainerCallback
+    from unsloth_zoo.mlx.utils import make_baseline_loss_fn
+
+    class Recorder(TrainerCallback):
+        metrics = None
+
+        def on_evaluate(self, args, state, control, metrics, **_kwargs):
+            self.metrics = dict(metrics)
+
+    recorder = Recorder()
+    trainer = _callback_trainer(tmp_path, [recorder], max_steps=1)
+    trainer.train()
+    _, ntoks, correct = make_baseline_loss_fn()(
+        trainer.model, *_callback_batch(), return_correct=True,
+    )
+    expected = correct.item() / ntoks.item()
+    assert 0.0 <= expected <= 1.0
+    assert recorder.metrics["eval_mean_token_accuracy"] == pytest.approx(expected)
+
+
+@metal_only
 def test_hf_callback_on_save_only_fires_for_checkpoints(tmp_path, monkeypatch):
     from pathlib import Path
     from transformers import TrainerCallback
