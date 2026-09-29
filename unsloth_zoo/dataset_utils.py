@@ -2644,7 +2644,12 @@ def sft_prepare_dataset(
     elif "input_ids" in column_names:
         if is_vlm and not hasattr(tokenizer, "pad"):
             raise RuntimeError(f"Unsloth: {processing_class.__class__} does not have .pad!")
-        self.data_collator = DataCollatorForLanguageModeling(tokenizer, mlm = False)
+        # TRL's collator applies these masks; the transformers one ignores them and trains on every token.
+        mask_columns = [x for x in ("completion_mask", "assistant_masks") if x in column_names]
+        if mask_columns:
+            used_column_names += mask_columns
+        else:
+            self.data_collator = DataCollatorForLanguageModeling(tokenizer, mlm = False)
         do_tokenize = False
     elif "prompt" in column_names and "completion" in column_names:
         # Prompt/completion dataset (used with completion_only_loss).
