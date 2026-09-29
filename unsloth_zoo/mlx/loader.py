@@ -30,6 +30,7 @@ import inspect
 import io
 import math
 import os
+import traceback
 import re
 import shutil
 import sys
@@ -584,23 +585,36 @@ _MLX_MISSING_ARGS_RE = re.compile(
 
 
 def _missing_mlx_config_keys(message):
-    """Required ModelArgs fields named by a bare mlx-lm ``__init__`` TypeError, else []."""
+    """Required *Args / *Config fields named by an mlx-lm / mlx-vlm ``__init__`` TypeError, else []."""
     match = _MLX_MISSING_ARGS_RE.search(message)
     if match is None:
         return []
     return re.findall(r"'([^']+)'", match.group("keys"))
 
 
-def _raise_if_incomplete_mlx_config(model_name, model_type, message, error):
-    """Name the config.json keys a mirrored repo lost (e.g. lfm2's block_ff_dim), not MLX."""
+def _raise_if_incomplete_mlx_config(
+    model_name, model_type, message, error, library="mlx-lm",
+):
+    """Mirrored configs can drop required keys (lfm2 block_ff_dim, unsloth#7306); the raw
+    TypeError reads like missing MLX support, so name the config instead."""
     keys = _missing_mlx_config_keys(message)
     if not keys:
         return
+    # Python 3.9 omits the class name, so check the raising frame is a config from_dict.
+    owner = re.search(r"(\w+)\.__init__\(\)", message)
+    owner = owner.group(1) if owner is not None else None
+    if owner is None:
+        frames = traceback.extract_tb(error.__traceback__)
+        if not frames or frames[-1].name != "from_dict":
+            return
     listed = ", ".join(repr(key) for key in keys)
     plural = "keys" if len(keys) > 1 else "key"
+    # Nested dataclasses (mlx-vlm TextConfig / VisionConfig) name a sub-config's fields.
+    if owner is not None and owner not in ("ModelArgs", "ModelConfig"):
+        listed = f"{listed} (fields of {owner})"
     raise ValueError(
         f"Unsloth: {model_name}'s config.json is missing the {plural} {listed}, "
-        f"which mlx-lm's '{model_type or 'unknown'}' architecture requires and "
+        f"which {library}'s '{model_type or 'unknown'}' architecture requires and "
         f"cannot default. This is an incomplete config.json in the model repo - "
         f"MLX and Apple Silicon support are not the problem. Compare the config "
         f"against the upstream repo this model was mirrored from and add the "
@@ -1435,6 +1449,12 @@ def _load_mlx_vlm_with_extra_weight_filter(
     try:
         with _temporary_hf_token_env(hf_token):
             return vlm_load(model_name, **vlm_kwargs)
+    except TypeError as error:
+        # The retry below runs after a ValueError, so config already built: unguarded.
+        _raise_if_incomplete_mlx_config(
+            model_name, model_type, str(error), error, library="mlx-vlm",
+        )
+        raise
     except ValueError as error:
         message = str(error)
         # QK-norm weights are load-bearing: check before the extra-weight filter.
@@ -1560,6 +1580,9 @@ def _load_mlx_vlm_distributed(
         ) from error
     except TypeError as error:
         message = str(error)
+        _raise_if_incomplete_mlx_config(
+            model_name, model_type, message, error, library="mlx-vlm",
+        )
         if "tensor_group" not in message and "pipeline_group" not in message:
             raise
         raise ImportError(
@@ -9110,6 +9133,13 @@ class FastMLXModel:
                             revision=revision,
                             **extra_kwargs,
                         )
+                    except TypeError as error:
+                        # Bypasses the extra-weight filter's guard.
+                        _raise_if_incomplete_mlx_config(
+                            model_name, model_type, str(error), error,
+                            library="mlx-vlm",
+                        )
+                        raise
                     except ValueError as error:
                         # Pre-quantize load bypasses the extra-weight filter, so
                         # surface the QK-norm version gap here too.
