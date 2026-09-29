@@ -201,7 +201,8 @@ class DraftController:
 
     Plain decoding is timed as the pipelined decode it is, so a drafter that loses to ordinary
     decoding at some batch size converges to ordinary decoding there. Unmeasured entries are
-    extrapolated; close or stale rivals are re-measured on a token clock.
+    extrapolated; close or stale rivals are re-measured on a token clock, each probe only once
+    the time it is expected to lose fits ``explore_fraction`` of the time recorded so far.
     """
 
     def __init__(
@@ -223,6 +224,7 @@ class DraftController:
         max_window: int = 256,
         probe_backoff: int = 32,
         max_probe_backoff: int = 2048,
+        explore_fraction: float = 0.02,
     ):
         self.max_depth = max(0, int(max_depth))
         self.max_copy = max(0, int(max_copy)) if can_copy else 0
@@ -242,6 +244,10 @@ class DraftController:
         self.max_window = max_window
         self._base_backoff = probe_backoff
         self._max_backoff = max_probe_backoff
+        self.explore_fraction = explore_fraction
+        self._credit = 0.0
+        # The best candidate's rate while a probe runs: the probe pays its measured shortfall.
+        self._reference: float | None = None
         self.draft_acceptance = [_Ema(self._PRIOR_ACCEPTANCE) for _ in range(self.max_depth)]
         self.copy_acceptance = _Ema(self._PRIOR_ACCEPTANCE)
         self.verify_cost: dict[int, dict[int, _Ema]] = {}
@@ -254,7 +260,8 @@ class DraftController:
         self.steps = 0.0
         self._measured_at: dict[tuple, int] = {}
         self._next_probe = probe_every
-        self._warmup = list(range(self.max_depth, 0, -1))
+        # Halving depths: the widths between are extrapolated until a split round runs them.
+        self._warmup = sorted({self.max_depth >> shift for shift in range(self.max_depth.bit_length())}, reverse = True)
         self._current: tuple | None = None
         self._window = min_window
         self._probing_sources: dict[int, str] = {}
@@ -391,7 +398,7 @@ class DraftController:
         bucket = _bucket(len(rows))
         room = min((state.remaining for state in rows if state.remaining is not None), default = 1 << 30)
         plain = RoundPlan("plain", max(1, min(self._window, room)))
-        self._probing_sources = {}
+        self._probing_sources, self._reference = {}, None
         if self._warmup:
             depth = self._warmup[0]
             warmup = tuple(
@@ -412,7 +419,9 @@ class DraftController:
         candidates = [plain] + list(rounds.values())
         chosen, probing = self._choose(candidates, rows, bucket)
         if not probing:
-            chosen = self._with_source_probes(chosen, rows)
+            probe, sources = self._source_probe(chosen, rows)
+            if sources and self._affordable(probe, chosen, rows):
+                chosen, self._probing_sources, self._reference = probe, sources, self.score(chosen, rows)
         # A probe's first round re-measures the parts; the rest run fused, as a winner would.
         starting = probing and self._probe_left == self.probe_rounds - 1
         if chosen.kind == "round" and (starting or not self._measured_parts(chosen, rows)):
@@ -442,6 +451,7 @@ class DraftController:
             probe = next((p for p in candidates if self._identity(p, bucket) == self._probe), None)
             if probe is not None:
                 self._probe_left -= 1
+                self._reference = max(self.score(plan, rows) for plan in candidates)
                 return self._shorten(probe), True
             self._probe_left = 0
         best = max(candidates, key = lambda plan: self.score(plan, rows))
@@ -461,9 +471,10 @@ class DraftController:
                 plan for plan in candidates
                 if plan is not best and (self.score(plan, rows) * self.probe_margin >= top or stale(plan))
             ]
-            if rivals:
-                probe = min(rivals, key = lambda plan: self._measured_at.get(self._identity(plan, bucket), -1))
+            probe = min(rivals, key = lambda plan: self._measured_at.get(self._identity(plan, bucket), -1), default = None)
+            if probe is not None and self._affordable(self._shorten(probe), best, rows, self.probe_rounds):
                 self._probe, self._probe_left = self._identity(probe, bucket), self.probe_rounds - 1
+                self._reference = top
                 if self.score(probe, rows) * self.probe_margin < top:
                     # A rival that keeps losing is re-measured exponentially less often.
                     gap = self._stale_gap.get(self._probe, self.stale_after)
@@ -490,7 +501,19 @@ class DraftController:
     def _due(self, state: RowState, source: str) -> bool:
         return bool(self._available(state, source)) and state.stats.tokens >= state.stats.probe_at[source]
 
-    def _with_source_probes(self, plan: RoundPlan, rows: Sequence[RowState]) -> RoundPlan:
+    def _regret(self, probe: RoundPlan, best: RoundPlan, rows: Sequence[RowState]) -> float:
+        seconds = self.round_seconds(probe, rows) if probe.kind == "round" else probe.length * self._plain_step(_bucket(len(rows)))
+        return seconds * max(0.0, 1.0 - self.score(probe, rows) / self.score(best, rows))
+
+    def _affordable(self, probe: RoundPlan, best: RoundPlan, rows: Sequence[RowState], rounds: int = 1) -> bool:
+        return self._regret(probe, best, rows) * rounds <= self._credit
+
+    def _account(self, emitted: int, seconds: float) -> None:
+        self._credit += self.explore_fraction * seconds
+        if self._reference is not None:
+            self._credit -= seconds * max(0.0, 1.0 - emitted / (seconds * self._reference))
+
+    def _source_probe(self, plan: RoundPlan, rows: Sequence[RowState]) -> tuple[RoundPlan, dict[int, str]]:
         # A source that loses gets no samples to win back with, whatever beat it, so each row
         # retries its unused sources, exponentially less often while they keep losing.
         base = list(plan.rows) if plan.kind == "round" else [RowPlan()] * len(rows)
@@ -504,19 +527,18 @@ class DraftController:
                 source = min(due, key = lambda source: state.stats.probe_at[source])
                 base[i] = RowPlan(source, self._available(state, source))
                 probing[i] = source
-        if not probing:
-            return plan
-        self._probing_sources = probing
-        return RoundPlan("round", rows = tuple(base))
+        return (RoundPlan("round", rows = tuple(base)), probing) if probing else (plan, probing)
 
     def interrupts_plain(self, rows: Sequence[RowState]) -> bool:
         """Whether copies now on offer are worth ending a plain window early for."""
-        if any(self._due(state, "copy") for state in rows):
+        plain_plan = RoundPlan("plain", 1)
+        probe, sources = self._source_probe(plain_plan, rows)
+        if "copy" in sources.values() and self._affordable(probe, plain_plan, rows):
             return True
         if not any(state.copy_available for state in rows):
             return False
         copying = [RowState(state.stats, False, state.copy_available, state.remaining) for state in rows]
-        plain = self.score(RoundPlan("plain", 1), rows)
+        plain = self.score(plain_plan, rows)
         widest = 1 + min(self.max_copy, max(state.copy_available for state in rows))
         for width in range(2, widest + 1):
             copies = self._round_at(width, copying)
@@ -533,6 +555,8 @@ class DraftController:
             state.stats.tokens += steps
         self.tokens += steps * len(rows)
         self.steps += steps
+        self._account(steps * len(rows), seconds)
+        self._reference = None
         self._measured_at[(bucket, "plain")] = self.steps
 
     def record_round(
@@ -552,6 +576,7 @@ class DraftController:
         """
         bucket = _bucket(len(rows))
         alpha = self.acceptance_alpha
+        self._account(sum(min(max(0, int(count)), row.length) + 1 for row, count in zip(plan.rows, accepted)), seconds)
         for i, (row, state, count) in enumerate(zip(plan.rows, rows, accepted)):
             count = max(0, min(int(count), row.length))
             stats = state.stats
@@ -565,14 +590,16 @@ class DraftController:
                     stats.copy.update(sample, alpha)
                     self.copy_acceptance.update(sample, alpha)
             if row.source in stats.backoff:
-                probed = i in self._probing_sources
-                backoff = stats.backoff[row.source]
-                stats.backoff[row.source] = min(backoff * 2, self._max_backoff) if probed else self._base_backoff
+                # A source resets its back-off only by winning a round, not by riding a probe.
+                if i in self._probing_sources:
+                    stats.backoff[row.source] = min(stats.backoff[row.source] * 2, self._max_backoff)
+                elif self._reference is None:
+                    stats.backoff[row.source] = self._base_backoff
             stats.tokens += count + 1
             self.tokens += count + 1
             if row.source in stats.probe_at:
                 stats.probe_at[row.source] = stats.tokens + stats.backoff[row.source]
-        self._probing_sources = {}
+        self._probing_sources, self._reference = {}, None
 
         depths = [row.length for row in plan.rows if row.source == "draft" and row.length]
         catch_up = sum(state.catch_up for row, state in zip(plan.rows, rows) if row.source == "draft")

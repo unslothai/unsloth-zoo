@@ -181,8 +181,8 @@ def test_plain_is_interrupted_only_by_a_worthwhile_copy():
     for width, seconds in ((2, 1.1), (17, 4.0)):
         controller.record_round(RoundPlan("round", rows = (RowPlan("copy", width - 1),), split = True),
                                 state, [width - 1], seconds = seconds)
-    for rate, interrupts in ((0.01, False), (0.5, True)):
-        state[0].stats.copy.value, state[0].stats.probe_at["copy"] = rate, 1 << 30
+    for rate, credit, interrupts in ((0.01, 0.0, False), (0.01, 100.0, True), (0.5, 0.0, True)):
+        state[0].stats.copy.value, state[0].stats.probe_at["copy"], controller._credit = rate, 0, credit
         assert controller.interrupts_plain(state) == interrupts
 
 
@@ -205,13 +205,13 @@ def test_drafter_recovers_after_copies_won():
     assert _run(controller, machine, [([1.0] * 4, 1.0)], rounds = 3000, copies = 2) == (("draft", 4),)
 
 
-@pytest.mark.parametrize("draft, floor", [([1.0], 0.97), ([0.5] * 16, 0.95)])
+@pytest.mark.parametrize("draft, floor", [([1.0], 0.97), ([0.5] * 16, 0.97)])
 def test_wide_batch_settles_on_plain_without_endless_probes(draft, floor):
     # Plain step 2 and a width-2 verify of 4.3 at B=16: depth 1 is a close loser, probed in
     # bursts longer than a probe interval; depth 16 leaves sixteen hopeless stale widths.
     step = 2 / 3.25
     machine, report = _Machine(step = step, draft_slope = 0.01 / step, verify_slope = 1.9 / (16 * step)), {}
-    controller = DraftController(max_depth = len(draft), can_copy = False)
+    controller = DraftController(max_depth = len(draft), can_copy = False, explore_fraction = 0.05)
     assert _run(controller, machine, [(draft, None)] * 16, rounds = 500, report = report) == "plain"
     assert report["rate"] >= floor * 16 / machine.plain(16)
 
@@ -270,3 +270,14 @@ def test_hidden_drafting_picks_the_best_set_of_unequal_drafters():
     controller.draft_cost[1], controller.catch_up_cost = _Ema(1.0), _Ema(0.2)
     controller.hidden_drafting[4] = _Ema(2.0)
     assert [row.source for row in controller._round_at(2, rows).rows] == ["none", "draft", "draft"]
+
+
+
+def test_probes_pay_their_measured_regret_within_the_budget():
+    # Plain wins and widths past 8 cost 2.5 times what narrower widths predict: probes may cost 1%.
+    machine, report = _Machine(verify_slope = 0.1), {}
+    machine.verify = lambda batch, width, verify = machine.verify: verify(batch, width) * (2.5 if width > 8 else 1.0)
+    controller = DraftController(max_depth = 16, max_copy = 12, explore_fraction = 0.01)
+    assert _run(controller, machine, [([0.3] * 16, 0.2), ([0.3] * 16, None)] * 2, rounds = 600, report = report) == "plain"
+    assert report["rate"] >= 0.987 * 4 / machine.plain(4) and DraftController(max_depth = 15)._warmup == [15, 7, 3, 1]
+
