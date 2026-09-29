@@ -16,6 +16,7 @@
 import torch
 import torch.nn.functional as F
 import contextlib
+import inspect
 import json
 import math
 import os
@@ -30,6 +31,7 @@ import importlib.util
 from typing import Optional, Tuple
 from torch.autograd import Function
 from unsloth_zoo.mlx import is_mlx_available
+from unsloth_zoo.mxfp4_dequant import is_mxfp4_expert_param
 
 UNSLOTH_COMPILE_LOCATION = os.environ.get(
     "UNSLOTH_COMPILE_LOCATION", "unsloth_compiled_cache"
@@ -634,6 +636,8 @@ def _base_is_recomputable(source) -> bool:
             if getattr(param, "quant_state", None) is None:
                 return False
             return not param.requires_grad
+        if is_mxfp4_expert_param(param):
+            return not param.requires_grad
         if isinstance(param, torch.Tensor):
             return (not param.requires_grad) and param.dtype in (
                 torch.bfloat16, torch.float16, torch.float32,
@@ -781,7 +785,8 @@ class _GroupedMMRecompute(torch.autograd.Function):
     def backward(ctx, grad_output):
         (offsets,) = ctx.saved_tensors
         with torch.no_grad():
-            weight_t = ctx.weight_provider().transpose(-2, -1).contiguous()
+            transposed = getattr(ctx.weight_provider, "transposed", None)
+            weight_t = transposed() if transposed is not None else ctx.weight_provider().transpose(-2, -1).contiguous()
             grad_input = _grouped_mm_with_backward_fix(grad_output.contiguous(), weight_t, offsets)
         return grad_input, None, None
 
@@ -791,6 +796,70 @@ def _base_grouped_mm(inputs, offsets, weight_provider, recompute):
     if recompute:
         return _GroupedMMRecompute.apply(inputs, offsets, weight_provider)
     return _grouped_mm_with_backward_fix(inputs, weight_provider(), offsets)
+
+
+def _mxfp4_expert_layout(source, proj_type, hidden_dim, model_type, experts_module):
+    """(packed param, transpose_b: weight is P^T of the packed rows) for a frozen packed MXFP4 stack, else None."""
+    param = source
+    while hasattr(param, "base_layer"):
+        param = param.base_layer
+    if not is_mxfp4_expert_param(param) or param.requires_grad:
+        return None
+    cache = experts_module.__dict__.setdefault("_unsloth_mxfp4_layout", {})
+    key = (proj_type, hidden_dim, model_type, bool(param.mxfp4_transposed), tuple(param._original_shape))
+    if key not in cache:
+        # preprocess_weight on a meta stand-in: identity or a transpose view, anything else is unsupported.
+        meta = torch.empty(tuple(param._original_shape), device = "meta")
+        try:
+            weight = preprocess_weight(meta, proj_type, hidden_dim, model_type, experts_module = experts_module)
+        except Exception:
+            weight = None
+        flipped = meta.transpose(-2, -1)
+        if weight is meta or (weight is not None and weight.shape == meta.shape and weight.stride() == meta.stride()):
+            cache[key] = bool(param.mxfp4_transposed)
+        elif weight is not None and weight.shape == flipped.shape and weight.stride() == flipped.stride():
+            cache[key] = not param.mxfp4_transposed
+        else:
+            cache[key] = None
+    transpose_b = cache[key]
+    return None if transpose_b is None else (param, transpose_b)
+
+
+def _mxfp4_fused_enabled(param, dtype, rows = None) -> bool:
+    """UNSLOTH_MXFP4_FUSED_GEMM: "auto" fused below UNSLOTH_MXFP4_FUSED_MAX_ROWS (192) rows/expert (above, dequant +
+    cuBLAS wins on B200); "1" always, "dequant" never, "0" never plus the legacy decode-slot path."""
+    if dtype != torch.bfloat16 or param.device.type != "cuda":
+        return False
+    mode = os.environ.get("UNSLOTH_MXFP4_FUSED_GEMM", "auto")
+    if mode in ("0", "dequant"):
+        return False
+    if mode != "1" and rows is not None:
+        limit = int(os.environ.get("UNSLOTH_MXFP4_FUSED_MAX_ROWS", "192"))
+        if rows >= limit * param.shape[0]:
+            return False
+    from unsloth_zoo.mxfp4_gemm import mxfp4_grouped_mm_available
+    return mxfp4_grouped_mm_available(param.device)
+
+
+def _mxfp4_base_grouped_mm(inputs, offsets, counts, weight_provider, recompute, layout):
+    """Fused decode-in-GEMM, else dequantize with a transposed decode for backward."""
+    param, transpose_b = layout
+    scales = param.mxfp4_scales
+    if scales.device != param.device:
+        scales = param.mxfp4_scales = scales.to(param.device)
+    if (
+        inputs.dtype == torch.float32 and inputs.device.type == "cuda"
+        and torch.is_autocast_enabled("cuda") and torch.get_autocast_dtype("cuda") == torch.bfloat16
+    ):
+        inputs = inputs.to(torch.bfloat16)  # what autocast does to torch._grouped_mm's operands
+    if _mxfp4_fused_enabled(param, inputs.dtype, inputs.shape[0]):
+        from unsloth_zoo.mxfp4_gemm import mxfp4_expert_grouped_mm
+        return mxfp4_expert_grouped_mm(inputs, param.data, scales, counts, transpose_b = transpose_b)
+    if recompute and os.environ.get("UNSLOTH_MXFP4_FUSED_GEMM") != "0":
+        weight_provider.transposed = lambda: param.dequantize(
+            inputs.dtype, token_counts = counts, transpose = not transpose_b,
+        )
+    return _base_grouped_mm(inputs, offsets, weight_provider, recompute)
 
 
 _GROUPED_GEMM_AVAILABLE = None
@@ -1549,6 +1618,8 @@ def _get_param_shape_from_module(module, parameter_name):
         param = param.get_param()
     elif hasattr(param, "weight"):
         param = param.weight
+    if is_mxfp4_expert_param(param):
+        return tuple(param._original_shape)
     return tuple(param.shape)
 
 
@@ -1780,13 +1851,16 @@ def _get_dequantize_4bit_in_slices():
     return _DEQUANTIZE_4BIT_IN_SLICES
 
 
-def _get_base_weight(param, target_dtype=None):
+def _get_base_weight(param, target_dtype=None, token_counts=None):
     """Get base weight from a potentially wrapped parameter or module. target_dtype (recompute
     providers) restores the packed Params4bit to its logical shape and casts."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
     while hasattr(param, "base_layer"):
         param = param.base_layer
+
+    if is_mxfp4_expert_param(param):
+        return param.dequantize(dtype = target_dtype, token_counts = token_counts)
 
     if HAS_BNB and isinstance(param, Params4bit):
         if getattr(param, "quant_state", None) is None:
@@ -1840,9 +1914,13 @@ def _get_lora_wrapper_for_param(experts_module, param_name):
     wrapper = None
     if hasattr(experts_module, f"{param_name}_lora_wrapper"):
         wrapper = getattr(experts_module, f"{param_name}_lora_wrapper")
-    elif hasattr(experts_module, param_name):
-        attr = getattr(experts_module, param_name)
-        if hasattr(attr, "lora_A"):  # ParamWrapper
+    else:
+        if isinstance(inspect.getattr_static(type(experts_module), param_name, None), property):
+            # Don't evaluate a property (packed MXFP4 decodes on read); its setter stores the wrapper.
+            attr = experts_module.__dict__.get("_" + param_name, None)
+        else:
+            attr = getattr(experts_module, param_name, None)
+        if attr is not None and hasattr(attr, "lora_A"):  # ParamWrapper
             wrapper = attr
 
     if wrapper is not None:
@@ -2209,6 +2287,8 @@ def _is_moe_experts_module(module) -> bool:
         # 4-bit params are packed into 2D tensors.
         if HAS_BNB and isinstance(param, Params4bit) and param.ndim == 2:
             return True
+        if is_mxfp4_expert_param(param):
+            return True
         # Standard MoE weights are 3D (num_experts, in, out).
         if isinstance(param, (nn.Parameter, torch.Tensor)) and param.ndim in (2, 3):
             return True
@@ -2571,6 +2651,25 @@ _STASH_READ_MARKERS = frozenset(("take_moe_lora_stash", "moe_lora_stash_name"))
 _STASH_SCAN_MAX_DEPTH = 4
 
 
+# Resolved at import, absolute: the traced wrapper cannot import, and the compiled-cache copy has no package.
+try:
+    from unsloth_zoo.temporary_patches.moe_experts_interface import (
+        interface_route_reads_stash as _interface_route_reads_stash_impl,
+    )
+except Exception:
+    _interface_route_reads_stash_impl = None
+
+
+def _interface_route_reads_stash(experts_module) -> bool:
+    """transformers' experts dispatch hides Unsloth's forward from the bytecode scan; ask the interface."""
+    if _interface_route_reads_stash_impl is None:
+        return False
+    try:
+        return bool(_interface_route_reads_stash_impl(experts_module))
+    except Exception:
+        return False
+
+
 def _forward_statically_reads_stash(experts_module):
     """Does this experts forward reach the stash API at all, read from its bytecode?
 
@@ -2599,37 +2698,21 @@ def _forward_statically_reads_stash(experts_module):
     """
     # This Unsloth Zoo code section is licensed under AGPL3
 
-    forward = getattr(experts_module, "forward", None)
+    # Not getattr(module, "forward").__func__: torch 2.14 Dynamo then raises AttributeError('__globals__').
+    try:
+        forward = experts_module.__dict__.get("forward")
+    except AttributeError:
+        forward = None
+    if forward is None:
+        forward = getattr(type(experts_module), "forward", None)
     forward = getattr(forward, "__func__", forward)
     code = getattr(forward, "__code__", None)
     if code is None:
         return None
 
-    # Keyed on the code objects themselves, never on id(). Tracing id(forward) makes
-    # Dynamo guard the expression it tracked, `experts_module.forward`, a bound method
-    # CPython reallocates on every access, so ___check_obj_id can never match again and
-    # Dynamo raises "Guard failed on the same frame it was created" under both fullgraph
-    # settings with no eager fallback. Code objects are hashable, stable and 1:1 with the
-    # functions here, so they also make the separate function set redundant.
-    # Keyed on the code objects themselves, never on id(), and remembering the SHALLOWEST
-    # depth each was reached at. A plain visited set makes the answer depend on the hash
-    # seed: a helper reachable both directly and through a chain can be popped first at
-    # the depth limit, where its own callees are not followed, and the later shallow entry
-    # is then dropped as already seen. Measured on a synthetic forward with both routes,
-    # 5 of 14 PYTHONHASHSEED values returned False for a forward that does reach the
-    # stash, which would send that compiled cold start down the failing PEFT path.
-    # A LIST keyed by `is`, not a dict and not id().
-    #
-    # Equality is wrong: two functions compiled from identical source at the same filename
-    # and name have code objects that compare and hash equal while being distinct objects
-    # with different __globals__, so a dict collapses them and the scan misses whichever
-    # route is second.
-    #
-    # id() is right but untraceable: Dynamo rejects it on a code object with
-    # "Unsupported: id() with unsupported args" on some torch versions, which is a hard
-    # compile failure in the branch that exists to keep compilation working. `is` gives
-    # the same identity semantics and traces everywhere. The list stays tiny, bounded by
-    # the depth limit, so the linear scan costs nothing.
+    # (code, shallowest depth) pairs matched by `is`: id() is untraceable on some torch versions,
+    # equality merges same-source functions with different __globals__, and a plain visited set
+    # makes a helper first reached at the depth limit hide its deeper callees (hash-seed dependent).
     seen_code = []
     pending = [(code, getattr(forward, "__globals__", {}), 0)]
 
@@ -2641,13 +2724,6 @@ def _forward_statically_reads_stash(experts_module):
 
     while pending:
         current, namespace, depth = pending.pop()
-        # Keyed by IDENTITY, not equality. Two functions compiled from identical source at
-        # the same filename and name have code objects that compare equal and hash equal
-        # while being distinct objects with different __globals__, so a dict keyed on the
-        # code objects themselves collapses them: if the first resolves its names to an
-        # unrelated helper and the second to take_moe_lora_stash, the second is skipped
-        # and the scan wrongly answers False. `alive` holds a reference to everything
-        # visited, so no id() can be recycled by the collector mid-walk.
         if _visited_at_or_above(current, depth):
             continue
         seen_code.append((current, depth))
@@ -2725,6 +2801,8 @@ def _preserved_rng_for_probe(x):
                 pass
 
 
+# Disabled, not just `is_compiling()`-guarded: fullgraph=False compiles this frame alone, so the guard never cached a verdict.
+@torch.compiler.disable
 def _measure_moe_lora_stash_read(wrapper, experts_module, parameter_name, x, args, kwargs) -> bool:
     """Run one throwaway experts forward under `no_grad` and report whether it read the stash.
 
@@ -2946,6 +3024,8 @@ def _can_fold_moe_lora_through_peft(experts_module, parameter_name: str) -> bool
         return False
     if HAS_BNB and Params4bit is not None and isinstance(param, Params4bit):
         return False
+    if is_mxfp4_expert_param(param):
+        return False
     return True
 
 
@@ -3014,6 +3094,8 @@ def _patched_param_wrapper_forward(
             # Nothing is recorded either way, so the first eager call still measures and
             # every later compile follows the real verdict.
             applies_stash = _forward_statically_reads_stash(experts_module)
+            if not applies_stash and _interface_route_reads_stash(experts_module):
+                applies_stash = True
             if applies_stash is False:
                 _log_moe_lora_stash_unread_once(experts_module, param_name)
         elif applies_stash is None:
@@ -3057,6 +3139,21 @@ def _patched_param_wrapper_forward(
                     delattr(experts_module, lora_attr)
 
         return result
+
+    # Unclaimed stacks (NemotronH up_proj / down_proj): PEFT's parametrization graph-breaks under compile.
+    if (
+        torch.compiler.is_compiling()
+        and param_name
+        and not self.disable_adapters
+        and not self.merged
+        and getattr(getattr(experts_module, param_name, None), "ndim", 0) == 3
+        and _can_fold_moe_lora_through_peft(experts_module, param_name)
+    ):
+        folded = _fold_moe_lora_without_parametrization(
+            self, immediate_base_layer, experts_module, param_name, x, args, kwargs
+        )
+        if folded is not None:
+            return folded
 
     # Non-MoE: original PEFT forward with _activate_lora.
     return _original_param_wrapper_forward(self, x, *args, **kwargs)
@@ -3750,11 +3847,18 @@ def forward_native_grouped_mm(
 
         # Provider re-derives the base weight on demand so Fix 3 can recompute it in
         # backward instead of pinning it (grouped_mm needs contiguous weights).
-        def _gate_up_provider(_src=_gate_up_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype, _mod=self):
-            return preprocess_weight(_get_base_weight(_src, _dt), "gate_up", _h, _mt, experts_module=_mod)
-        mm1_out = _base_grouped_mm(
-            permuted_input, offsets, _gate_up_provider, _moe_recompute_enabled(_gate_up_src, dtype=hidden_states.dtype),
-        )
+        def _gate_up_provider(_src=_gate_up_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype, _mod=self, _n=num_tokens_per_expert):
+            return preprocess_weight(_get_base_weight(_src, _dt, _n), "gate_up", _h, _mt, experts_module=_mod)
+        _gate_up_layout = _mxfp4_expert_layout(_gate_up_src, "gate_up", hidden_dim, model_type, self)
+        if _gate_up_layout is not None:
+            mm1_out = _mxfp4_base_grouped_mm(
+                permuted_input, offsets, num_tokens_per_expert, _gate_up_provider,
+                _moe_recompute_enabled(_gate_up_src, dtype=hidden_states.dtype), _gate_up_layout,
+            )
+        else:
+            mm1_out = _base_grouped_mm(
+                permuted_input, offsets, _gate_up_provider, _moe_recompute_enabled(_gate_up_src, dtype=hidden_states.dtype),
+            )
 
         # Separated LoRA: + ((X @ first) @ second) * scaling.
         if gate_up_lora is not None:
@@ -3929,11 +4033,18 @@ def forward_native_grouped_mm(
     if hasattr(self, "down_proj"):
         model_type = getattr(self, "_unsloth_model_type", None)
         _down_src = self.down_proj
-        def _down_provider(_src=_down_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype, _mod=self):
-            return preprocess_weight(_get_base_weight(_src, _dt), "down", _h, _mt, experts_module=_mod)
-        mm2_out = _base_grouped_mm(
-            inter, offsets, _down_provider, _moe_recompute_enabled(_down_src, dtype=hidden_states.dtype),
-        )
+        def _down_provider(_src=_down_src, _mt=model_type, _h=hidden_dim, _dt=hidden_states.dtype, _mod=self, _n=num_tokens_per_expert):
+            return preprocess_weight(_get_base_weight(_src, _dt, _n), "down", _h, _mt, experts_module=_mod)
+        _down_layout = _mxfp4_expert_layout(_down_src, "down", hidden_dim, model_type, self)
+        if _down_layout is not None:
+            mm2_out = _mxfp4_base_grouped_mm(
+                inter, offsets, num_tokens_per_expert, _down_provider,
+                _moe_recompute_enabled(_down_src, dtype=hidden_states.dtype), _down_layout,
+            )
+        else:
+            mm2_out = _base_grouped_mm(
+                inter, offsets, _down_provider, _moe_recompute_enabled(_down_src, dtype=hidden_states.dtype),
+            )
 
         if down_lora is not None:
             first_weight, second_weight, scaling = down_lora
