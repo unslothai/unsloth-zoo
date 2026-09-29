@@ -18,8 +18,18 @@ import torch
 import torch.nn as nn
 import inspect
 import importlib
+import warnings
 from collections.abc import Mapping
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
+import functools
+# Guarded because tests load this file by path rather than as
+# `unsloth_zoo.temporary_patches.misc`, where a two-level relative import
+# raises "attempted relative import beyond top-level package".
+try:
+    from unsloth_zoo.log import logger
+except (ImportError, ValueError):
+    import logging
+    logger = logging.getLogger("unsloth_zoo.log")
 from .common import TEMPORARY_PATCHES, torch_compile, _torch_compile
 from .utils import (
     patch_function,
@@ -126,7 +136,13 @@ def patch_merge_quantization_configs():
     unique_name = _get_unique_storage_name(transformers.quantizers.auto.AutoHfQuantizer, "merge_quantization_configs")
     if hasattr(transformers.quantizers.auto.AutoHfQuantizer, unique_name): return
 
-    source = inspect.getsource(f)
+    # Not every callable has readable source: one built by an earlier exec here,
+    # or shipped only as bytecode, raises OSError, which again is neither
+    # ValueError nor TypeError and so escaped into `import unsloth`.
+    try:
+        source = inspect.getsource(f)
+    except Exception as e:
+        return raise_error("merge_quantization_configs, whose source is unreadable", e)
     items = dir(transformers.quantizers.auto)
 
     # Fix as at 7th August 2025
@@ -137,7 +153,19 @@ def patch_merge_quantization_configs():
         "if quantization_config_from_args is not None and quantization_config.__class__.__name__ != quantization_config_from_args.__class__.__name__:",
     )
 
-    exec("from transformers.quantizers.auto import (" + ",".join(x for x in items if x in source) + ")", globals())
+    # `from x import ()` is a SyntaxError, and the join below is empty whenever no name in
+    # the module happens to occur in the source being rewritten. SyntaxError subclasses
+    # neither ValueError nor TypeError, the two the caller in unsloth tolerates, so it
+    # escapes this function and ends `import unsloth` outright. No published transformers
+    # reaches it: the list is non-empty on every version from 4.49.0 to 5.17.0, 12 names on
+    # 4.55.0. Kept anyway for a patched or future quantizers.auto, and cheap.
+    # No dunders: `__class__.__name__` in the source imported `__name__`, renaming this module (breaks Dynamo guards).
+    used = [x for x in items if not x.startswith("__") and x in source]
+    if used:
+        try:
+            exec("from transformers.quantizers.auto import (" + ",".join(used) + ")", globals())
+        except Exception as e:
+            return raise_error("transformers.quantizers.auto names " + ",".join(used), e)
     source = dedent(source)
     # Remove cls if classmethod
     is_classmethod = source.startswith("@classmethod")
@@ -152,7 +180,14 @@ def patch_merge_quantization_configs():
     except Exception as e:
         return raise_error("", e)
 
-    patch_function(transformers.quantizers.auto.AutoHfQuantizer, "merge_quantization_configs", merge_quantization_configs)
+    # Defined by the exec(source, globals()) in the try above. Read it out of the
+    # module globals rather than by name: a rewritten source that exec'd cleanly but
+    # defined something else raised NameError here, straight out of a patch step
+    # whose whole contract is to be silent when it cannot apply.
+    merged = globals().get("merge_quantization_configs")
+    if not callable(merged):
+        return raise_error("merge_quantization_configs, which the rewritten source did not define")
+    patch_function(transformers.quantizers.auto.AutoHfQuantizer, "merge_quantization_configs", merged)
 pass
 TEMPORARY_PATCHES.append(patch_merge_quantization_configs)
 
@@ -551,8 +586,7 @@ TEMPORARY_PATCHES.append(patch_CsmProcessor_apply_chat_template)
 
 
 def patch_transformers_masks():
-    if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1":
-        return
+    # No UNSLOTH_COMPILE_DISABLE early return: `_torch_compile` is already a no-op there, and the kwarg fixes still apply.
     try:
         import transformers.masking_utils as masking_utils
         import transformers.generation.utils as generation_utils
@@ -594,17 +628,48 @@ def patch_transformers_masks():
         masking_utils.create_sliding_window_causal_mask,
     )
 
-    compiled_create_causal_mask = _torch_compile(
-        original_create_causal_mask, fullgraph = False, dynamic = True
-    )
-    compiled_create_sliding_window_causal_mask = _torch_compile(
-        original_create_sliding_window_causal_mask, fullgraph = False, dynamic = True
-    )
+    if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1":
+        # `_torch_compile` is `noop` here, i.e. torch.compiler.disable: a fullgraph user compile would refuse it.
+        compiled_create_causal_mask = original_create_causal_mask
+        compiled_create_sliding_window_causal_mask = original_create_sliding_window_causal_mask
+    else:
+        compiled_create_causal_mask = _torch_compile(
+            original_create_causal_mask, fullgraph = False, dynamic = True
+        )
+        compiled_create_sliding_window_causal_mask = _torch_compile(
+            original_create_sliding_window_causal_mask, fullgraph = False, dynamic = True
+        )
 
-    def wrap(f):
+    def wrap(f, original, prepared_mask_shortcut = True):
+        # `input_embeds` <= 5.1 vs `inputs_embeds` 5.2+ (transformers#43916); `cache_position` gone in 5.9 (#45884): read the signature, not the version.
+        try:
+            parameters = inspect.signature(original).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        accepted = set(parameters)
+        takes_var_kwargs = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+        embeds_name = None
+        if "inputs_embeds" in accepted and "input_embeds" not in accepted:
+            embeds_name = "inputs_embeds"
+        elif "input_embeds" in accepted and "inputs_embeds" not in accepted:
+            embeds_name = "input_embeds"
+        drop = () if takes_var_kwargs or not parameters else tuple(
+            name for name in ("cache_position",) if name not in accepted
+        )
+
         def return_attention_mask(*args, **kwargs):
-            input_embeds = kwargs.get("input_embeds", None)
-            if input_embeds is not None and getattr(input_embeds, "requires_grad", False):
+            if embeds_name is not None:
+                for other in ("input_embeds", "inputs_embeds"):
+                    if other != embeds_name and other in kwargs and embeds_name not in kwargs:
+                        kwargs[embeds_name] = kwargs.pop(other)
+            for name in drop:
+                kwargs.pop(name, None)
+            input_embeds = kwargs.get("inputs_embeds", kwargs.get("input_embeds", None))
+            if (
+                prepared_mask_shortcut
+                and input_embeds is not None
+                and getattr(input_embeds, "requires_grad", False)
+            ):
                 attention_mask = kwargs.get("attention_mask", None)
                 if isinstance(attention_mask, BlockMask) or (
                     isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 4
@@ -616,9 +681,33 @@ def patch_transformers_masks():
 
     masking_utils._unsloth_original_create_causal_mask = original_create_causal_mask
     masking_utils._unsloth_original_create_sliding_window_causal_mask = original_create_sliding_window_causal_mask
-    masking_utils.create_causal_mask = wrap(compiled_create_causal_mask)
-    masking_utils.create_sliding_window_causal_mask = wrap(compiled_create_sliding_window_causal_mask)
-    masking_utils.create_masks_for_generate = wrap(masking_utils.create_masks_for_generate)
+    masking_utils.create_causal_mask = wrap(compiled_create_causal_mask, original_create_causal_mask)
+    masking_utils.create_sliding_window_causal_mask = wrap(
+        compiled_create_sliding_window_causal_mask, original_create_sliding_window_causal_mask
+    )
+    # Llama 4 (attention_chunk_size) routes here too; not every supported transformers has it.
+    if hasattr(masking_utils, "create_chunked_causal_mask"):
+        original_create_chunked_causal_mask = getattr(
+            masking_utils, "_unsloth_original_create_chunked_causal_mask",
+            masking_utils.create_chunked_causal_mask,
+        )
+        masking_utils._unsloth_original_create_chunked_causal_mask = original_create_chunked_causal_mask
+        masking_utils.create_chunked_causal_mask = wrap(
+            masking_utils.create_chunked_causal_mask, original_create_chunked_causal_mask
+        )
+    pass
+    # Stash the original: a re-apply must read its signature, not the wrapper's (*args, **kwargs).
+    original_create_masks_for_generate = getattr(
+        masking_utils, "_unsloth_original_create_masks_for_generate",
+        masking_utils.create_masks_for_generate,
+    )
+    masking_utils._unsloth_original_create_masks_for_generate = original_create_masks_for_generate
+    # No prepared-mask shortcut: hybrid configs need the per-layer-type dict this returns.
+    masking_utils.create_masks_for_generate = wrap(
+        masking_utils.create_masks_for_generate,
+        original_create_masks_for_generate,
+        prepared_mask_shortcut = False,
+    )
     generation_utils.create_masks_for_generate = masking_utils.create_masks_for_generate
     # Multi-GPU device_map flex_attention fix: offset tensors may live on a
     # different device than inner_mask runs on. Move them inside the closure
@@ -1032,6 +1121,510 @@ pass
 TEMPORARY_PATCHES.append(patch_causal_conv1d_cuda_probe)
 
 
+def patch_mamba_ssm_pre_ampere_fallback():
+    """Force the Mamba slow path on pre-Ampere GPUs.
+
+    mamba_ssm's Triton kernels need sm_80+. On a T4 the package imports fine
+    and `is_fast_path_available` is True, so transformers routes into
+    `cuda_kernels_forward` and Triton only fails once training starts, with an
+    opaque `RuntimeError: PassManager::run failed`.
+
+    `is_fast_path_available` is baked in at module import, so flip both the
+    availability predicates (for modules imported later) and the flag on
+    already-imported modules. A capability check rather than a trial launch
+    like the causal_conv1d probe above, which would pay a Triton compile at
+    every import just to watch it fail. Real NVIDIA CUDA only.
+    """
+    if not torch.cuda.is_available():
+        return
+    if getattr(torch.version, "hip", None) is not None:
+        return  # ROCm: mamba_ssm's requirements are a different question
+    try:
+        major, minor = torch.cuda.get_device_capability()
+    except Exception:
+        return
+    if (major, minor) >= (8, 0):
+        return  # Ampere or newer; the fast path is fine
+
+    import sys
+
+    # 0. transformers 5 can also fetch these kernels from the Hub, through
+    #    `lazy_load_kernel`, which needs no local wheel and never consults the
+    #    predicates below. Drop the registry entries so it returns None and the
+    #    fast path stays unavailable. Before the local-wheel check, since the
+    #    Hub path is exactly the one that reaches a pre-Ampere GPU without one.
+    try:
+        from transformers.integrations import hub_kernels as _hk
+        for _kernel in ("mamba-ssm", "falcon_mamba-ssm", "causal-conv1d"):
+            _hk._HUB_KERNEL_MAPPING.pop(_kernel, None)
+            # An already-resolved module has to go too. None is enough:
+            # lazy_load_kernel only short-circuits on a real module object.
+            _hk._KERNEL_MODULE_MAPPING[_kernel] = None
+    except Exception:
+        pass
+    pass
+
+    # 0b. Jamba and Zamba bind `self.use_fast_kernels = config.use_mamba_kernels`
+    #     (True by default) at construction and RAISE inside that branch when the
+    #     fast path is unavailable, so step 0 above and step 1 below turn their
+    #     forward into `ValueError: Fast Mamba kernels are not available` instead
+    #     of the slow path this guard promises. Wrapping the mixer is the only
+    #     thing that clears the instance flag, so it must not hang off the
+    #     module's `is_fast_path_available`:
+    #       - transformers >= 5.3 assigns that name from inside the mixer's
+    #         __init__ (`global is_fast_path_available`,
+    #         models/zamba/modeling_zamba.py:257 on 5.5.0), so it is absent from
+    #         the module dict until a mixer already exists, and 5.5's forward
+    #         recomputes it as a local (line 449) anyway.
+    #       - on 4.x it IS a module global, but step 1 has already made it False
+    #         by the time the modeling module gets imported, so a truthiness gate
+    #         never fired there either.
+    #     Before the local-wheel check: step 0 alone is enough to make the fast
+    #     path unavailable, and therefore enough to trigger the raise.
+    #     `sys.modules.get`, never a getattr scan: transformers 5 registers ~200
+    #     alias modules whose catch-all __getattr__ imports the real object.
+    #     Local, not a module global: the test extracts this function by AST and
+    #     execs it in a bare namespace.
+    _raising_mixers = {
+        "transformers.models.jamba.modeling_jamba" : "JambaMambaMixer",
+        "transformers.models.zamba.modeling_zamba" : "ZambaMambaMixer",
+    }
+    for _name, _cls_name in _raising_mixers.items():
+        _mod = sys.modules.get(_name, None)
+        if _mod is None:
+            continue
+        try:
+            _mixer = _mod.__dict__.get(_cls_name, None)
+            if _mixer is None or _mixer.__dict__.get("_unsloth_slow_only", False):
+                continue
+            def _slow_only(self, *a, __orig = _mixer.forward, **kw):
+                self.use_fast_kernels = False
+                try:
+                    # Jamba on transformers 5.5 reads `self.config.use_mamba_kernels`
+                    # rather than the instance flag, and clears exactly this on its
+                    # own fallback (models/jamba/modeling_jamba.py:470).
+                    _config = getattr(self, "config", None)
+                    if getattr(_config, "use_mamba_kernels", False):
+                        _config.use_mamba_kernels = False
+                except Exception:
+                    pass
+                return __orig(self, *a, **kw)
+            _mixer.forward = _slow_only
+            _mixer._unsloth_slow_only = True
+        except Exception:
+            pass
+        pass
+    pass
+
+    # 0c. Step 0b can only reach a modeling module that is already imported, and
+    #     on the `trust_remote_code = True` path there is never such a moment:
+    #     unsloth returns from `unsloth_compile_transformers` before the
+    #     pre_compile and post_compile phases (models/_utils.py:3277), so the
+    #     only phase that ran is "init", at `import unsloth`, and
+    #     `from_pretrained` imports modeling_zamba afterwards. Clear the flag on
+    #     the CONFIG class instead, which needs no modeling import and is
+    #     order-independent: both families bind `use_fast_kernels =
+    #     config.use_mamba_kernels` in the mixer's __init__, so a config built
+    #     after this point can no longer ask for kernels that are already gone.
+    #     Importing the two configuration modules costs ~1ms and 2 modules
+    #     inside a process that has already imported transformers, versus a
+    #     `sys.meta_path` hook, which would have to stay installed for the whole
+    #     process lifetime and tax every later import for one flag.
+    #     The marker lives on the wrapper function, not on the class: the
+    #     transformers 5 configs are strict dataclasses, and this leaves them
+    #     with no attribute of ours. Locals only, since the test extracts this
+    #     function by AST and execs it in a bare namespace.
+    import importlib
+    _raising_configs = {
+        "transformers.models.jamba.configuration_jamba" : "JambaConfig",
+        "transformers.models.zamba.configuration_zamba" : "ZambaConfig",
+    }
+    for _name, _cfg_name in _raising_configs.items():
+        try:
+            _cfg = importlib.import_module(_name).__dict__.get(_cfg_name, None)
+            if _cfg is None or getattr(_cfg.__init__, "_unsloth_slow_only", False):
+                continue
+            def _slow_only_config(self, *a, __orig = _cfg.__init__, **kw):
+                __orig(self, *a, **kw)
+                try:
+                    self.use_mamba_kernels = False
+                except Exception:
+                    pass
+            _slow_only_config._unsloth_slow_only = True
+            _cfg.__init__ = _slow_only_config
+        except Exception:
+            pass
+        pass
+    pass
+
+    try:
+        import mamba_ssm  # noqa: F401
+    except Exception:
+        return  # Not installed locally, and the Hub entries are already gone
+
+    # 1. Modules imported LATER see the package as unavailable, so their
+    #    `is_fast_path_available` evaluates to False at import time.
+    try:
+        import transformers.utils.import_utils as _iu
+        for _pred in ("is_mamba_ssm_available", "is_mamba_2_ssm_available"):
+            if hasattr(_iu, _pred):
+                setattr(_iu, _pred, lambda: False)
+    except Exception:
+        pass
+    pass
+
+    # 2. Modules ALREADY imported have baked the flag in; flip it directly.
+    #    Confined to transformers' own model modules so vLLM's independent
+    #    Triton kernels are left alone. Jamba and Zamba are handled in 0b above,
+    #    which does not depend on the flag being present or truthy.
+    _touched = False
+    for _name, _mod in list(sys.modules.items()):
+        if not _name.startswith("transformers.models.") or _mod is None:
+            continue
+        # __dict__, not getattr: transformers 5 registers ~200 alias modules
+        # named transformers.models.<m>.image_processing_<m>_fast whose
+        # catch-all __getattr__ imports the real image processor, so a getattr
+        # probe warns 200 times, drags in 3800 modules (3.8s measured) per
+        # phase, and can propagate an ImportError out of `import unsloth`.
+        if not _mod.__dict__.get("is_fast_path_available", False):
+            continue
+        try:
+            _mod.is_fast_path_available = False
+            for _sym in (
+                "selective_state_update",
+                "mamba_chunk_scan_combined",
+                "mamba_split_conv1d_scan_combined",
+            ):
+                if getattr(_mod, _sym, None) is not None:
+                    setattr(_mod, _sym, None)
+            _touched = True
+        except Exception:
+            pass
+        pass
+    pass
+
+    print(
+        f"Unsloth: mamba_ssm's Triton kernels need compute capability 8.0+ "
+        f"(this GPU is {major}.{minor}). Using the PyTorch slow path for "
+        f"Mamba models."
+    )
+    return _touched
+
+
+TEMPORARY_PATCHES.append(patch_mamba_ssm_pre_ampere_fallback)
+
+
+def _mamba_fused_split_needs_causal_conv1d_unusable():
+    """True when mamba_ssm is installed but causal_conv1d, which its fused split path calls unconditionally, is not usable."""
+    try:
+        import importlib.util
+        if importlib.util.find_spec("mamba_ssm") is None:
+            return False
+    except Exception:
+        return False
+    try:
+        import causal_conv1d
+        from causal_conv1d.cpp_functions import causal_conv1d_fwd_function
+    except Exception:
+        return True
+    if causal_conv1d_fwd_function is None:
+        return True
+    if getattr(causal_conv1d, "causal_conv1d_fn", None) is None:
+        return True
+    return False
+
+
+def patch_mamba_fused_split_without_causal_conv1d():
+    """transformers 5 binds mamba_ssm's fused split kernel whenever mamba_ssm imports; without causal_conv1d
+    it raises `'NoneType' object is not callable` on the first training step. Resolve it to transformers'
+    reference (None) so modeling code takes the split path (torch conv1d + mamba_ssm chunk scan)."""
+    if not _mamba_fused_split_needs_causal_conv1d_unusable():
+        return
+    try:
+        import transformers.integrations as _integrations
+        from transformers.integrations import hub_kernels as _hk
+    except Exception:
+        return
+    _original = getattr(_hk, "use_kernel_func_from_hub_with_fallback", None)
+    if _original is None:
+        return  # transformers < 5: gated by is_fast_path_available instead
+
+    import sys
+
+    if not getattr(_original, "_unsloth_no_causal_conv1d", False):
+        def use_kernel_func_from_hub_with_fallback(func_name, package, internal_path = None):
+            if func_name != "mamba_split_conv1d_scan_combined" or package != "mamba_ssm":
+                return _original(func_name, package, internal_path)
+            def decorator(torch_function):
+                try:
+                    return _hk.use_kernel_forward_from_hub(func_name)(torch_function)
+                except Exception:
+                    return torch_function
+            return decorator
+        use_kernel_func_from_hub_with_fallback._unsloth_no_causal_conv1d = True
+        use_kernel_func_from_hub_with_fallback.__wrapped__ = _original
+        _hk.use_kernel_func_from_hub_with_fallback = use_kernel_func_from_hub_with_fallback
+        try:
+            setattr(_integrations, "use_kernel_func_from_hub_with_fallback", use_kernel_func_from_hub_with_fallback)
+        except Exception:
+            pass
+    pass
+
+    # Rebind already imported modules; `__dict__`, not getattr: transformers 5 alias modules import on access.
+    for _module_name, _module in list(sys.modules.items()):
+        if _module is None:
+            continue
+        if not (_module_name.startswith("transformers.models.") or "unsloth_compiled_module" in _module_name):
+            continue
+        try:
+            _fn = _module.__dict__.get("mamba2_split_conv1d_scan_combined", None)
+        except Exception:
+            continue
+        if _fn is None or getattr(_fn, "_unsloth_no_causal_conv1d", False):
+            continue
+        _resolves_to_mamba_ssm = False
+        _stack, _seen = [(_fn, 0)], set()
+        while _stack and not _resolves_to_mamba_ssm:
+            _g, _depth = _stack.pop()
+            if id(_g) in _seen or _depth > 6:
+                continue
+            _seen.add(id(_g))
+            _inner = [getattr(_g, "__wrapped__", None)]
+            for _cell in (getattr(_g, "__closure__", None) or ()):
+                try:
+                    _inner.append(_cell.cell_contents)
+                except ValueError:
+                    pass
+            for _c in _inner:
+                if not callable(_c):
+                    continue
+                if str(getattr(_c, "__module__", None) or "").startswith("mamba_ssm"):
+                    _resolves_to_mamba_ssm = True
+                    break
+                _stack.append((_c, _depth + 1))
+        if not _resolves_to_mamba_ssm:
+            continue
+        _stub = functools.wraps(_fn)(lambda *a, **k: None)
+        _stub._unsloth_no_causal_conv1d = True
+        _module.mamba2_split_conv1d_scan_combined = _stub
+    pass
+
+    if not getattr(patch_mamba_fused_split_without_causal_conv1d, "_warned", False):
+        patch_mamba_fused_split_without_causal_conv1d._warned = True
+        logger.warning(
+            "Unsloth: `causal_conv1d` is not usable, so Mamba2-family models "
+            "(Falcon-H1, Nemotron-H, Granite-4 hybrid, Bamba, Zamba2) skip mamba_ssm's "
+            "fused kernel and train with a PyTorch conv1d plus the chunked scan. "
+            "Install a causal_conv1d build matching this torch for full speed."
+        )
+pass
+TEMPORARY_PATCHES.append(patch_mamba_fused_split_without_causal_conv1d)
+
+
+_LOCAL_KERNEL_PACKAGES = {
+    "mamba-ssm"     : ("mamba_ssm", "ops.triton.ssd_combined"),
+    "causal-conv1d" : ("causal_conv1d", None),
+}
+
+
+def _local_kernel_fallback_allowed():
+    if os.environ.get("UNSLOTH_LOCAL_MAMBA_KERNELS", "1") == "0":
+        return False
+    if not torch.cuda.is_available() or getattr(torch.version, "hip", None) is not None:
+        return False
+    try:
+        return torch.cuda.get_device_capability() >= (8, 0)
+    except Exception:
+        return False
+pass
+
+
+def patch_lazy_load_kernel_local_packages():
+    # transformers 5.15 dropped mamba-ssm / causal-conv1d from _HUB_KERNEL_MAPPING; lazy_load_kernel returns None for unmapped names without trying the local package.
+    if not _local_kernel_fallback_allowed():
+        return
+    try:
+        from transformers.integrations import hub_kernels
+    except Exception:
+        return
+    original = getattr(hub_kernels, "lazy_load_kernel", None)
+    if original is None or getattr(original, "_unsloth_local_packages", False):
+        return
+    hub_mapping = getattr(hub_kernels, "_HUB_KERNEL_MAPPING", None)
+    if hub_mapping is None:
+        return
+
+    def _import_local(kernel_name):
+        package, submodule = _LOCAL_KERNEL_PACKAGES[kernel_name]
+        try:
+            module = importlib.import_module(package)
+            if submodule is not None:
+                # Import ssd_combined so a broken install falls back to None, not a mid-forward crash.
+                importlib.import_module(f"{package}.{submodule}")
+            return module
+        except Exception as e:
+            logger.info(f"Unsloth: local {package} unusable for kernel {kernel_name}: {e}")
+            return None
+    pass
+
+    @functools.wraps(original)
+    def lazy_load_kernel(kernel_name, *args, **kwargs):
+        mapping = args[0] if args else kwargs.get("mapping", None)
+        if mapping is None:
+            mapping = getattr(hub_kernels, "_KERNEL_MODULE_MAPPING", {})
+        if (
+            kernel_name in _LOCAL_KERNEL_PACKAGES
+            and kernel_name not in hub_mapping
+            and not isinstance(mapping.get(kernel_name, None), type(os))
+            and _local_kernel_fallback_allowed()
+        ):
+            module = _import_local(kernel_name)
+            if module is not None:
+                mapping[kernel_name] = module
+                return module
+        return original(kernel_name, *args, **kwargs)
+    lazy_load_kernel._unsloth_local_packages = True
+    lazy_load_kernel._unsloth_original = original
+    hub_kernels.lazy_load_kernel = lazy_load_kernel
+    # `from transformers.integrations import lazy_load_kernel` reads the package namespace.
+    try:
+        import transformers.integrations as integrations
+        integrations.lazy_load_kernel = lazy_load_kernel
+    except Exception:
+        pass
+pass
+TEMPORARY_PATCHES.append(patch_lazy_load_kernel_local_packages)
+
+
+def patch_datasets_map_worker_death_retry():
+    """Retry `Dataset.map` single-process when a worker is killed outright.
+
+    Long-text corpora can have the kernel OOM-kill a `dataset_num_proc`
+    worker, which datasets turns into "One of the subprocesses has abruptly
+    died during map operation", killing the run inside SFTTrainer.__init__.
+    The map is issued deep inside TRL, so the user cannot disable
+    multiprocessing themselves.
+
+    Narrow by design: only a vanished worker (OOM-kill, segfault) matches, a
+    genuine exception from the map function is re-raised as itself and still
+    propagates, single-process maps re-raise untouched, and the retry cannot
+    recurse because num_proc is pinned to 1.
+    """
+    try:
+        from datasets import Dataset
+    except Exception:
+        return  # datasets not installed
+
+    original_map = getattr(Dataset, "map", None)
+    if original_map is None or getattr(original_map, "_unsloth_worker_death_retry", False):
+        return
+
+    import functools
+
+    @functools.wraps(original_map)
+    def map(self, *args, **kwargs):
+        try:
+            return original_map(self, *args, **kwargs)
+        except RuntimeError as exc:
+            if "abruptly died" not in str(exc):
+                raise
+            # num_proc has to end up as a keyword we can override, so a call
+            # that passed it positionally is re-expanded into keywords first.
+            call_args, call_kwargs = args, dict(kwargs)
+            num_proc = call_kwargs.get("num_proc", None)
+            if num_proc is None and args:
+                try:
+                    sig = inspect.signature(original_map)
+                    if any(p.kind is p.VAR_POSITIONAL for p in sig.parameters.values()):
+                        raise TypeError("cannot normalise *args")
+                    bound = sig.bind(self, *args, **kwargs)
+                    bound.apply_defaults()
+                    num_proc = bound.arguments.get("num_proc", None)
+                    var_kw = {}
+                    for p in sig.parameters.values():
+                        if p.kind is p.VAR_KEYWORD:
+                            var_kw = bound.arguments.pop(p.name, None) or {}
+                    bound.arguments.pop("self", None)
+                    call_args = ()
+                    call_kwargs = {**bound.arguments, **var_kw}
+                except Exception:
+                    call_args, call_kwargs = args, dict(kwargs)
+                    num_proc = None
+            if not isinstance(num_proc, int) or num_proc < 1:
+                raise
+            print(
+                f"Unsloth: a dataset worker was killed with num_proc={num_proc} "
+                f"(most likely out of system RAM). Retrying single-process; "
+                f"this is slower but survives."
+            )
+            # None, not 1: datasets >= 4.1.0 gates the pool on
+            # `num_proc is not None and num_proc >= 1` (arrow_dataset.py), so
+            # num_proc=1 still forks a worker and the kernel can kill it again.
+            call_kwargs["num_proc"] = None
+            return original_map(self, *call_args, **call_kwargs)
+        pass
+    pass
+
+    map._unsloth_worker_death_retry = True
+    Dataset.map = map
+    return True
+
+
+TEMPORARY_PATCHES.append(patch_datasets_map_worker_death_retry)
+
+
+def _gradient_checkpointing_donor(model):
+    try:
+        from transformers.modeling_layers import GradientCheckpointingLayer
+    except Exception:
+        GradientCheckpointingLayer = None
+    from transformers import PreTrainedModel
+    # Only the unset PreTrainedModel default: an explicit False (JetMoe, Blip-2) must keep raising.
+    owner = next((k for k in type(model).__mro__ if "supports_gradient_checkpointing" in vars(k)), None)
+    if owner is not PreTrainedModel:
+        return None
+    for name, module in model.named_modules():
+        if not name or module is model:
+            continue
+        if GradientCheckpointingLayer is not None and isinstance(module, GradientCheckpointingLayer):
+            return name
+        if isinstance(module, PreTrainedModel) and getattr(type(module), "supports_gradient_checkpointing", False):
+            return name
+    return None
+pass
+
+
+def patch_gradient_checkpointing_enable_inherit():
+    # Remote-code wrappers (Nemotron-3-Nano-Omni) leave supports_gradient_checkpointing False over
+    # GradientCheckpointingLayer blocks; _set_gradient_checkpointing already walks submodules, only the gate is wrong.
+    if os.environ.get("UNSLOTH_GC_INHERIT", "1") == "0":
+        return
+    try:
+        from transformers import PreTrainedModel
+    except Exception as e:
+        return raise_error("transformers.PreTrainedModel", e)
+    original = PreTrainedModel.gradient_checkpointing_enable
+    if getattr(original, "_unsloth_gc_inherit", False):
+        return
+
+    @functools.wraps(original)
+    def gradient_checkpointing_enable(self, *args, **kwargs):
+        if not getattr(self, "supports_gradient_checkpointing", False):
+            donor = _gradient_checkpointing_donor(self)
+            if donor is not None:
+                # Instance only: the class and its other instances keep False.
+                self.supports_gradient_checkpointing = True
+                logger.info(
+                    f"Unsloth: {type(self).__name__} inherits gradient checkpointing support from {donor}."
+                )
+        return original(self, *args, **kwargs)
+    gradient_checkpointing_enable._unsloth_gc_inherit = True
+    gradient_checkpointing_enable._unsloth_original = original
+    PreTrainedModel.gradient_checkpointing_enable = gradient_checkpointing_enable
+pass
+TEMPORARY_PATCHES.append(patch_gradient_checkpointing_enable_inherit)
+
+
 def patch_GraniteMoeHybridMambaLayer_cuda_kernels_forward():
     try:
         import transformers.models.granitemoehybrid.modeling_granitemoehybrid
@@ -1237,12 +1830,11 @@ def fix_mamba_ssm_float32():
         with open(ssd_chunk_scan_file, "r", encoding = "utf-8") as file: file = file.read()
     except Exception as e:
         return raise_error("mamba_ssm.ops.triton.ssd_chunk_scan", e)
+    original_file = file
 
     # Find `dst = tl.dot(a, b)` / `dst += tl.dot(a, b)`
-    matches = list(re.finditer(
-        r" ([a-zA-Z0-9\_]{1,}) (\=|\+\=) tl\.dot\(([a-zA-Z0-9\_]{1,})\, ([a-zA-Z0-9\_]{1,})\)",
-        file)
-    )
+    plain_dot = r" ([a-zA-Z0-9\_]{1,}) (\=|\+\=) tl\.dot\(([a-zA-Z0-9\_]{1,})\, ([a-zA-Z0-9\_]{1,})\)"
+    matches = list(re.finditer(plain_dot, file))
     for match in matches:
         old = match.group(0)
         dst, adder, a, b = match.groups()
@@ -1255,11 +1847,44 @@ def fix_mamba_ssm_float32():
         file = file.replace(old, new)
     pass
 
+    # File already upcast; a peer may have rewritten it after we imported, so reload unless loaded kernels are upcast.
+    if file == original_file:
+        module = mamba_ssm.ops.triton.ssd_chunk_scan
+        sources = []
+        for value in list(vars(module).values()):
+            # Triton: Autotuner / Heuristics wrap the JITFunction in `.fn`, which holds its source in `.src`.
+            for _ in range(4):
+                src = getattr(value, "src", None)
+                if isinstance(src, str):
+                    if "tl.dot" in src: sources.append(src)
+                    break
+                value = getattr(value, "fn", None)
+                if value is None: break
+        if sources and not any(re.search(plain_dot, src) for src in sources):
+            return
+        try:
+            importlib.reload(module)
+        except Exception as e:
+            return raise_error("mamba_ssm.ops.triton.ssd_chunk_scan", e)
+        return
+
+    # Atomic rename, not open("w"): truncation lets a concurrent patcher read and write back an empty module.
+    import tempfile
+    tmp_file = None
     try:
+        fd, tmp_file = tempfile.mkstemp(
+            dir = os.path.dirname(ssd_chunk_scan_file), prefix = ".ssd_chunk_scan.", suffix = ".tmp",
+        )
+        with os.fdopen(fd, "w", encoding = "utf-8") as f: f.write(file)
+        os.chmod(tmp_file, os.stat(ssd_chunk_scan_file).st_mode & 0o7777)
+        os.replace(tmp_file, ssd_chunk_scan_file)
+        tmp_file = None
         # Reload module since we editted it
-        with open(ssd_chunk_scan_file, "w", encoding = "utf-8") as f: f.write(file)
         importlib.reload(mamba_ssm.ops.triton.ssd_chunk_scan)
     except Exception as e:
+        if tmp_file is not None:
+            try: os.unlink(tmp_file)
+            except OSError: pass
         return raise_error("mamba_ssm.ops.triton.ssd_chunk_scan", e)
 pass
 TEMPORARY_PATCHES.append(fix_mamba_ssm_float32)
@@ -1335,6 +1960,50 @@ def patch_MllamaVisionEncoderLayer():
 
 pass
 TEMPORARY_PATCHES.append(patch_MllamaVisionEncoderLayer)
+
+
+def patch_GradientCheckpointingLayer_keyword_inputs():
+    # Reentrant checkpoint ignores kwargs: lift grad-requiring keyword tensors (Llama 4 / Mllama vision
+    # layers get no grad; Mllama cross-attn walks the shared vision graph twice) to positional args.
+    try:
+        from functools import partial
+        from transformers.modeling_layers import GradientCheckpointingLayer
+        from transformers.modeling_layers import logger as modeling_layers_logger
+        from unsloth_zoo.gradient_checkpointing import _KeywordArgumentCall
+    except Exception as e:
+        return raise_error("transformers.modeling_layers.GradientCheckpointingLayer", e)
+    original = GradientCheckpointingLayer.__call__
+    if getattr(original, "_unsloth_keyword_inputs", False): return
+
+    def __call__(self, *args, **kwargs):
+        if not (self.gradient_checkpointing and self.training):
+            return original(self, *args, **kwargs)
+        keys = tuple(k for k, v in kwargs.items() if torch.is_tensor(v) and v.requires_grad)
+        if not keys:
+            return original(self, *args, **kwargs)
+        message = f"Caching is incompatible with gradient checkpointing in {type(self).__name__}. Setting"
+        changed = False
+        if kwargs.get("use_cache"):
+            kwargs["use_cache"] = False
+            message += " `use_cache=False`,"
+            changed = True
+        if not getattr(self, "_can_checkpoint_with_cache", False):
+            for name in ("past_key_values", "layer_past"):
+                if kwargs.get(name) is not None:
+                    kwargs[name] = None
+                    message += f" `{name}=None`,"
+                    changed = True
+        if changed:
+            modeling_layers_logger.warning_once(message.rstrip(",") + ".")
+        constants = {k: v for k, v in kwargs.items() if k not in keys}
+        function = _KeywordArgumentCall(partial(nn.Module.__call__, self), keys, constants)
+        return self._gradient_checkpointing_func(function, *args, *(kwargs[k] for k in keys))
+    pass
+    __call__._unsloth_keyword_inputs = True
+    __call__._unsloth_original = original
+    GradientCheckpointingLayer.__call__ = __call__
+pass
+TEMPORARY_PATCHES.append(patch_GradientCheckpointingLayer_keyword_inputs)
 
 
 # Patch Siglip for forced float32 / float16 only
@@ -1651,6 +2320,57 @@ pass
 TEMPORARY_PATCHES.append(patch_qwen2vl_image_processor_pixel_attrs)
 
 
+def patch_idefics2_image_processor_leading_text_row():
+    # Idefics2 image processors read processed_images[0][0] for channels/device, so a batch whose
+    # first row is text-only raises IndexError. Put an image row first, then restore row order.
+    import functools
+    classes = []
+    for module, names in (
+        ("transformers.models.idefics2.image_processing_idefics2", ("Idefics2ImageProcessor",)),
+        ("transformers.models.idefics2.image_processing_pil_idefics2", ("Idefics2ImageProcessorPil",)),
+        ("transformers.models.idefics2.image_processing_idefics2_fast", ("Idefics2ImageProcessorFast",)),
+    ):
+        try:
+            mod = importlib.import_module(module)
+        except Exception:
+            continue
+        # __dict__ lookup: transformers 5.x serves old class names through a warning module __getattr__.
+        classes.extend(mod.__dict__[n] for n in names if n in mod.__dict__)
+
+    def _reorder(value, order, n):
+        if hasattr(value, "shape") and len(value.shape) > 0 and value.shape[0] == n:
+            return value[order]
+        if isinstance(value, (list, tuple)) and len(value) == n:
+            return type(value)(value[i] for i in order)
+        return value
+
+    for cls in classes:
+        original = cls.__dict__.get("preprocess")
+        if original is None or getattr(original, "_unsloth_leading_text_row", False):
+            continue
+
+        @functools.wraps(original)
+        def preprocess(self, images, *args, _original = original, **kwargs):
+            if (
+                isinstance(images, (list, tuple)) and len(images) > 1
+                and all(isinstance(row, (list, tuple)) for row in images)
+                and len(images[0]) == 0 and any(len(row) > 0 for row in images)
+            ):
+                n = len(images)
+                first = next(i for i, row in enumerate(images) if len(row) > 0)
+                perm = [first] + [i for i in range(n) if i != first]
+                inverse = [perm.index(i) for i in range(n)]
+                out = _original(self, [images[i] for i in perm], *args, **kwargs)
+                for key in list(out.keys()):
+                    out[key] = _reorder(out[key], inverse, n)
+                return out
+            return _original(self, images, *args, **kwargs)
+        preprocess._unsloth_leading_text_row = True
+        cls.preprocess = preprocess
+pass
+TEMPORARY_PATCHES.append(patch_idefics2_image_processor_leading_text_row)
+
+
 def patch_deepseek_v2_moe_alias():
     # transformers 5.x renamed DeepseekV2MoE -> DeepseekV2Moe; trust_remote_code
     # models (e.g. DeepSeek-OCR) still import the old name. Alias it back when
@@ -1669,3 +2389,710 @@ def patch_deepseek_v2_moe_alias():
         m.DeepseekV2MoE = m.DeepseekV2Moe
 pass
 TEMPORARY_PATCHES.append(patch_deepseek_v2_moe_alias)
+
+
+def patch_trl_entropy_from_logits():
+    """trl logs a token-entropy metric from logits Unsloth does not materialise.
+
+    `SFTTrainer.compute_loss` does, with no flag to turn it off other than
+    `use_liger_kernel`:
+
+        if not self.args.use_liger_kernel:
+            with torch.no_grad():
+                per_token_entropy = entropy_from_logits(outputs.logits)
+
+    A [batch, seq, vocab] float32 tensor is the largest allocation in an SFT
+    step and Unsloth never materialises it, so a diagnostic metric became a
+    hard training failure, in two shapes, both seen live:
+
+      Qwen3_(32B)_A100   NotImplementedError: Unsloth: Logits are empty from
+                         2024.11 onwards ... set UNSLOTH_RETURN_LOGITS=1
+      Spark_TTS_(0_5B)   TypeError: iteration over a 0-d tensor
+                         (trl/trainer/utils.py, per_token_entropies.extend)
+
+    The advice in the first cannot be taken: UNSLOTH_RETURN_LOGITS=1 buys the
+    metric back by giving up the memory saving the user came for. So the metric
+    degrades instead, reporting 0.0 and saying once why, since silently logging
+    a zero would look like a real measurement.
+
+    Patched on `trl.trainer.sft_trainer` as well as `trl.trainer.utils`, which
+    binds the name at import, so patching only the source module would be a
+    no-op for the one caller that matters.
+    """
+    try:
+        import torch
+        import trl.trainer.utils as _utils
+    except Exception:
+        return
+
+    original = getattr(_utils, "entropy_from_logits", None)
+    if original is None or getattr(original, "_unsloth_patched", False):
+        return
+
+    _warned = [False]
+
+    def _unusable(logits):
+        """Checked on the object, not the exception text. `EmptyLogits.__getattr__`
+        hands back the `raise_logits_error` function for every attribute, so what
+        blows up depends on which attribute this trl touches first: `.split(...)`
+        raises NotImplementedError, `logits.shape[:-1]` subscripts a function and
+        raises TypeError. Keying on either message fixes one trl and misses the
+        other. Matched by name because unsloth_zoo must not import unsloth.
+        """
+        if logits is None:
+            return True
+        if type(logits).__name__ == "EmptyLogits":
+            return True
+        if isinstance(logits, torch.Tensor) and (logits.numel() == 0 or logits.dim() < 2):
+            return True
+        return False
+
+    def _warn_once():
+        if _warned[0]:
+            return
+        _warned[0] = True
+        logger.warning(
+            "Unsloth: your trl version logs a token-entropy metric computed "
+            "from the full logits, which Unsloth does not materialise (that is "
+            "where the memory saving comes from). Entropy will be reported as "
+            "0.0. Set UNSLOTH_RETURN_LOGITS=1 before training if you need the "
+            "real value and can afford the memory."
+        )
+
+    def _metric_device(logits):
+        """Device trl will gather this scalar on.
+
+        trl hands the result straight to `accelerator.gather_for_metrics`, whose
+        distributed path allocates on `PartialState().device` and calls NCCL,
+        which rejects a CPU tensor ("Tensors must be CUDA and dense"). The
+        masked branch is rescued by multiplying with a device-resident
+        attention_mask, but the padding-free branch is a bare mean(), so a
+        multi-GPU run would swap one crash for another. Asked of accelerate
+        rather than guessed, and only once it is already initialised, so a
+        single-process run keeps the CPU scalar accelerate leaves alone.
+
+        A tensor's own device is only trusted when it is NOT cpu. The
+        fused-loss path returns a module-level `EMPTY_LOGITS = torch.empty(0)`
+        (fused_losses/forward_adapter.py), built at import time and therefore
+        always on cpu no matter which device the run is on, so following it
+        would hand NCCL a CPU scalar on exactly the distributed run this
+        function exists for.
+        """
+        if isinstance(logits, torch.Tensor) and logits.device.type != "cpu":
+            return logits.device
+        try:
+            from accelerate.state import PartialState
+            if PartialState._shared_state:
+                return PartialState().device
+        except Exception:
+            pass
+        return logits.device if isinstance(logits, torch.Tensor) else None
+
+    # 0-d so it broadcasts against attention_mask in both of the caller's
+    # branches: sum(0 * mask)/sum(mask) and mean(0) are both 0.0, neither raises.
+    def _no_entropy(logits = None):
+        return torch.zeros((), dtype = torch.float32, device = _metric_device(logits))
+
+    @functools.wraps(original)
+    def entropy_from_logits(logits, *args, **kwargs):
+        if _unusable(logits):
+            _warn_once()
+            return _no_entropy(logits)
+        try:
+            return original(logits, *args, **kwargs)
+        except TypeError as e:
+            # Backstop for a shape the check above did not anticipate. Narrow:
+            # anything else from inside entropy_from_logits is a real bug and
+            # must still raise, or this hides it on every single step.
+            if "iteration over a 0-d tensor" not in str(e):
+                raise
+            _warn_once()
+            return _no_entropy(logits)
+
+    entropy_from_logits._unsloth_patched = True
+    # Exposed so the SFT wrapper can mute this for its probing call. That call
+    # may be about to fail on the SECOND logits read, in which case the
+    # wrapper reports that both metrics are omitted and this message, which
+    # promises entropy as 0.0, would contradict it on the very first step.
+    entropy_from_logits._unsloth_warned = _warned
+    for _mod_name in ("trl.trainer.utils", "trl.trainer.sft_trainer"):
+        try:
+            _mod = importlib.import_module(_mod_name)
+        except Exception:
+            continue
+        if getattr(_mod, "entropy_from_logits", None) is original:
+            _mod.entropy_from_logits = entropy_from_logits
+pass
+TEMPORARY_PATCHES.append(patch_trl_entropy_from_logits)
+
+
+# trl >= 1.0 injects these into the forward kwargs when `use_liger_kernel` is
+# on, because its liger path expects a liger-patched forward to consume them
+# (trl 1.9.2 sft_trainer.py:1718-1735). An Unsloth model is not liger-patched,
+# so they must not ride along when the flag is forced on below.
+_SFT_LIGER_ONLY_FORWARD_KWARGS = frozenset((
+    "skip_logits",
+    "return_token_accuracy",
+    "use_token_scaling",
+))
+_SFT_SHIELDED_INPUT_TYPES = {}
+
+
+def _sft_shielded_inputs(inputs, contents):
+    """A copy of `contents` that silently drops the liger-only forward kwargs.
+
+    The injection happens inside `compute_loss`, on the mapping the caller
+    handed in, so the mapping is the only interception point available. Built
+    from the caller's own mapping type so a `BatchEncoding` stays one, and
+    cached per type so the class is created once rather than per step.
+    """
+    if not isinstance(inputs, Mapping):
+        return contents
+    cls = type(inputs)
+    shielded = _SFT_SHIELDED_INPUT_TYPES.get(cls, None)
+    if shielded is None:
+        def __setitem__(self, key, value, _cls = cls):
+            if key in _SFT_LIGER_ONLY_FORWARD_KWARGS: return
+            _cls.__setitem__(self, key, value)
+        try:
+            shielded = type("Unsloth" + cls.__name__, (cls,), {"__setitem__" : __setitem__})
+        except Exception:
+            return contents
+        _SFT_SHIELDED_INPUT_TYPES[cls] = shielded
+    try:
+        return shielded(contents)
+    except Exception:
+        return contents
+pass
+
+
+def _sft_logits_are_unusable(logits):
+    """Same predicate `patch_trl_entropy_from_logits` applies to its argument.
+
+    Kept separate rather than shared because that one is closed over the
+    entropy patch and matched by name: unsloth_zoo must not import unsloth, so
+    the sentinel is recognised by class name, and the fused-loss path returns a
+    real 0-element tensor (`fused_losses/forward_adapter.py: EMPTY_LOGITS =
+    torch.empty(0)`) instead.
+    """
+    if logits is None: return True
+    if type(logits).__name__ == "EmptyLogits": return True
+    if isinstance(logits, torch.Tensor) and (logits.numel() == 0 or logits.dim() < 2):
+        return True
+    return False
+pass
+
+
+def _sft_raised_on_empty_logits(exception):
+    """Decided on the object trl was holding, not on the exception message.
+
+    Which exception comes out depends on which sentinel the model returned and
+    which attribute the installed trl reaches for first:
+
+        EmptyLogits().shape[:-1]      TypeError    ('function' not subscriptable)
+        EmptyLogits()[..., :-1, :]    NotImplementedError
+        torch.empty(0)[..., :-1, :]   IndexError   (too many indices)
+        torch.empty(0).argmax(-1)     RuntimeError
+
+    so a message match fixes one build and misses the next. The failing frame
+    still holds trl's `outputs`, so the question can be asked of the logits
+    themselves: if they are real, this is somebody's genuine bug and it must
+    keep propagating.
+
+    Matched on the local rather than on the frame's name, because the raise can
+    land in a helper trl called and because the enclosing method has been
+    renamed before. The stack starts inside SFTTrainer.compute_loss either way.
+    """
+    return _sft_empty_logits_outputs(exception) is not None
+pass
+
+
+_SFT_NO_LOGITS = object()
+
+
+def _sft_empty_logits_outputs(exception):
+    """The `outputs` object trl was holding, if its logits were the sentinel.
+
+    Returned rather than just a bool so the caller can replay `aux_loss` off
+    it: that metric is not logits-derived, but it lives inside the same
+    `if not self.args.use_liger_kernel` block, so skipping the block to avoid
+    the logits would silently drop it for MoE runs.
+    """
+    tb = getattr(exception, "__traceback__", None)
+    while tb is not None:
+        frame = tb.tb_frame
+        if "outputs" in frame.f_locals:
+            outputs = frame.f_locals["outputs"]
+            try:
+                # A default of None would be indistinguishable from a model
+                # that really does set `logits = None`, and _..._are_unusable
+                # calls that unusable. An output object with no `logits` at all
+                # is somebody's broken contract, not our sentinel, and must
+                # keep raising.
+                logits = getattr(outputs, "logits", _SFT_NO_LOGITS)
+                unusable = (logits is not _SFT_NO_LOGITS
+                            and _sft_logits_are_unusable(logits))
+            except Exception:
+                unusable = False
+            if unusable: return outputs
+        tb = tb.tb_next
+    return None
+pass
+
+
+def _sft_inputs_slot(args, kwargs):
+    """Where `inputs` sits in a `compute_loss(self, model, inputs, ...)` call."""
+    if len(args) > 1: return 1, args[1]
+    if "inputs" in kwargs: return "inputs", kwargs["inputs"]
+    return None, None
+pass
+
+
+def _sft_mute_entropy_warning():
+    """Silence the entropy patch for one probing call; returns a restore token."""
+    try:
+        import trl.trainer.utils as _u
+        flag = getattr(getattr(_u, "entropy_from_logits", None), "_unsloth_warned", None)
+        if flag is None: return None
+        was, flag[0] = flag[0], True
+        return (flag, was)
+    except Exception:
+        return None
+pass
+
+
+def _sft_aux_loss_count(self):
+    """How many aux_loss values trl has logged for the current mode.
+
+    `.get`, never `[...]`: `_metrics[mode]` is a `defaultdict(list)`, so a
+    subscript CREATES the key, and this runs on every step including dense
+    ones that will never have an aux_loss. trl's `SFTTrainer.log` averages
+    every key it finds with `sum(val) / len(val)` (sft_trainer.py:1194), so
+    one empty list left behind is a ZeroDivisionError at the first log.
+    """
+    metrics = getattr(self, "_metrics", None)
+    if not isinstance(metrics, dict): return None
+    mode = "train" if getattr(getattr(self, "model", None), "training", True) else "eval"
+    bucket = metrics.get(mode)
+    if bucket is None: return None
+    try:
+        return len(bucket.get("aux_loss") or ())
+    except Exception:
+        return None
+pass
+
+
+def _sft_replay_aux_loss(self, outputs, before):
+    """Log the aux_loss the skipped block would have logged.
+
+    aux_loss is not logits-derived, but on trl 0.23.0 through 0.25.x it sits
+    INSIDE the same `if not self.args.use_liger_kernel` block as the accuracy
+    metric, so turning that flag on to dodge the logits drops it too, silently,
+    for exactly the MoE runs (`output_router_logits = True`) that want it.
+
+    Gated on the count rather than on a version, because trl 1.x moved this out
+    to `# applies to both Liger and non-Liger` (1.9.2 sft_trainer.py:1826) and
+    logs it regardless, where appending again would double-count. 0.22.2 has no
+    aux_loss in this trainer at all.
+    """
+    if outputs is None or before is None: return
+    if not getattr(self, "aux_loss_enabled", False): return
+    if (_sft_aux_loss_count(self) or 0) > before: return
+    aux = getattr(outputs, "aux_loss", None)
+    if aux is None: return
+    try:
+        metrics = self._metrics["train" if self.model.training else "eval"]
+        metrics["aux_loss"].append(
+            self.accelerator.gather_for_metrics(aux).mean().item()
+        )
+    except Exception:
+        # A lost diagnostic must never take down the step that produced it.
+        pass
+pass
+
+
+def _sft_call_without_logits_metrics(original, self, args, kwargs, contents = None):
+    """Run trl's own `compute_loss` with its logits-derived metrics turned off.
+
+    Every version in the supported range gates that section on
+    `self.args.use_liger_kernel` ("liger doesn't return logits"), which is
+    exactly the "there are no logits" condition, so the flag is trl's own off
+    switch for it. Only forced when the user had it off; a real liger run is
+    left alone. `contents` replays the mapping as it was BEFORE a failed first
+    attempt, which may have popped `labels` out of it (transformers
+    `Trainer.compute_loss` does exactly that when `compute_loss_func` or label
+    smoothing is set).
+    """
+    targs = getattr(self, "args", None)
+    previous = getattr(targs, "use_liger_kernel", None)
+    if previous is None or previous:
+        return original(self, *args, **kwargs), None
+    # Ask for the outputs only when there is an aux_loss to rescue off them, so
+    # the ordinary path keeps trl's exact call shape.
+    asked = args[2] if len(args) > 2 else kwargs.get("return_outputs", False)
+    force = bool(getattr(self, "aux_loss_enabled", False)) and not asked
+    if force:
+        # Replace the positional slot rather than adding a keyword beside it:
+        # `compute_loss(model, inputs, False, ...)` is a legal public call, and
+        # doing both would raise "got multiple values for argument".
+        if len(args) > 2:
+            args = args[:2] + (True,) + args[3:]
+        else:
+            kwargs = dict(kwargs)
+            kwargs["return_outputs"] = True
+    slot, inputs = _sft_inputs_slot(args, kwargs)
+    if slot is not None:
+        shielded = _sft_shielded_inputs(inputs, inputs if contents is None else contents)
+        if slot == "inputs":
+            kwargs = dict(kwargs)
+            kwargs["inputs"] = shielded
+        else:
+            args = args[:slot] + (shielded,) + args[slot + 1:]
+    targs.use_liger_kernel = True
+    try:
+        with warnings.catch_warnings():
+            # trl >= 1.0 tells the user to file a liger-kernel bug when the
+            # flag is on and the outputs carry no token_accuracy
+            # (sft_trainer.py:1821). There is no liger here, so that report
+            # would be sent to the wrong project.
+            warnings.filterwarnings("ignore", message = ".*token_accuracy.*")
+            result = original(self, *args, **kwargs)
+    finally:
+        targs.use_liger_kernel = previous
+    # Take the outputs whenever they are there, not only when we asked. An
+    # eval or predict step arrives with return_outputs already True
+    # (Trainer.prediction_step), so `force` is False and the side channel would
+    # otherwise be empty for exactly the batches that still want aux_loss.
+    _outputs = result[1] if isinstance(result, tuple) and len(result) == 2 else None
+    if force and _outputs is not None:
+        # We asked for these, the caller did not: hand back only the loss.
+        result = result[0]
+    return result, _outputs
+pass
+
+
+def _sft_wrap_compute_loss(original):
+    """The wrapper installed below; separated so it can be driven against a
+    stand-in for a trl version that is not the one installed."""
+
+    @functools.wraps(original)
+    def compute_loss(self, *args, **kwargs):
+        # Per trainer, not per process: two SFTTrainers can live in one process
+        # and only one of them may be running an Unsloth model.
+        if getattr(self, "_unsloth_logits_are_empty", False):
+            before = _sft_aux_loss_count(self)
+            result, outputs = _sft_call_without_logits_metrics(
+                original, self, args, kwargs)
+            _sft_replay_aux_loss(self, outputs, before)
+            return result
+        # A failed attempt leaves state behind: it advanced the token counter,
+        # appended the metrics it got as far as, and let transformers pop
+        # `labels` out of the inputs. All three are replayed to the retry as
+        # they were, so nothing is counted twice and nothing is missing.
+        counter = getattr(self, "_total_train_tokens", None)
+        metrics = getattr(self, "_metrics", None)
+        lengths = {k : {n : len(v) for n, v in d.items()} for k, d in metrics.items()} \
+            if isinstance(metrics, dict) else None
+        _, inputs = _sft_inputs_slot(args, kwargs)
+        contents = dict(inputs) if isinstance(inputs, Mapping) else None
+        aux_before = _sft_aux_loss_count(self)
+        # This first call is a probe. If it fails on the second logits read the
+        # warning below replaces the entropy patch's, which promises a 0.0 that
+        # is not going to be reported after all.
+        muted = _sft_mute_entropy_warning()
+        try:
+            result = original(self, *args, **kwargs)
+        except Exception as e:
+            outputs = _sft_empty_logits_outputs(e)
+            if outputs is None:
+                if muted is not None: muted[0][0] = muted[1]
+                raise
+            if counter is not None:
+                self._total_train_tokens = counter
+            if lengths is not None:
+                for k, d in metrics.items():
+                    seen = lengths.get(k, {})
+                    for n, v in list(d.items()):
+                        # Delete a key the probe invented rather than emptying
+                        # it. trl's log averages every key with
+                        # sum(val) / len(val), so an emptied list left in place
+                        # is a ZeroDivisionError at the first logging step.
+                        if n in seen: del v[seen[n]:]
+                        else: del d[n]
+            logger.warning(
+                "Unsloth: your trl version logs entropy and mean_token_accuracy "
+                "from the full logits, which Unsloth does not materialise (that "
+                "is where the memory saving comes from). Both will be omitted. "
+                "Set UNSLOTH_RETURN_LOGITS=1 before training if you need them "
+                "and can afford the memory."
+            )
+            retried, retry_outputs = _sft_call_without_logits_metrics(
+                original, self, args, kwargs, contents)
+            # Latched only now. If the retry raises too, the logits were wanted
+            # by something other than the metric block (trl's loss_type='dft',
+            # a custom loss), and latching would keep this trainer in the
+            # no-logits path for the rest of the process -- including a rerun
+            # with UNSLOTH_RETURN_LOGITS=1, which would then never re-probe.
+            self._unsloth_logits_are_empty = True
+            _sft_replay_aux_loss(
+                self, outputs if retry_outputs is None else retry_outputs, aux_before)
+            return retried
+        else:
+            # No failure, so the entropy message (if it wanted to fire) was
+            # accurate after all: let the next step emit it.
+            if muted is not None: muted[0][0] = muted[1]
+            return result
+    compute_loss._unsloth_patched = True
+    return compute_loss
+pass
+
+
+def patch_trl_sft_logits_metrics():
+    """The entropy rebind above is not enough: trl's SFTTrainer.compute_loss
+    touches `outputs.logits` a second time, inline, for mean_token_accuracy.
+
+        trl 0.22.2  sft_trainer.py:1080  shift_logits = outputs.logits[..., :-1, :]
+        trl 0.24.0  sft_trainer.py:1146  shift_logits = outputs.logits[..., :-1, :]
+        trl 0.25.1  sft_trainer.py:1151  shift_logits = outputs.logits[..., :-1, :]
+        trl 1.9.2   sft_trainer.py:1769  shift_logits = outputs.logits[..., :-1, :]
+
+    On trl 1.x that line runs BEFORE entropy_from_logits, so rebinding the
+    helper cannot help there at all. There is no helper to rebind for the
+    accuracy block, so the whole logits-derived metric section is skipped
+    instead -- and only after a run has actually proved its logits are empty,
+    so a non-Unsloth trl user keeps the real metrics and pays nothing but one
+    `try`.
+    """
+    try:
+        import trl.trainer.sft_trainer as _sft
+    except Exception:
+        return
+    trainer = getattr(_sft, "SFTTrainer", None)
+    original = getattr(trainer, "compute_loss", None)
+    if original is None or getattr(original, "_unsloth_patched", False):
+        return
+    trainer.compute_loss = _sft_wrap_compute_loss(original)
+pass
+TEMPORARY_PATCHES.append(patch_trl_sft_logits_metrics)
+
+def patch_longrope_impossible_attention_factor():
+    """Ignore a LongRoPE `attention_factor` that cannot be a real one.
+
+    The factor is by construction
+
+        sqrt(1 + log(factor) / log(original_max_position_embeddings))
+
+    a number near 1. transformers derives that when the key is absent, but
+    takes the config's word for it when present, and
+    unsloth/Phi-3.5-mini-instruct{,-bnb-4bit} set it equal to `factor` (32.0),
+    roughly 27x the real value. Nothing raises; the model just predicts badly
+    (4.74 vs 2.13 cross-entropy on the same text).
+
+    The signature is exact on purpose: attention_factor == factor AND
+    factor > 2. A genuine attention factor is never the extension ratio and
+    never much above 1.5. The real remedy is republishing those configs.
+    """
+    try:
+        import functools
+        import math
+        from transformers import modeling_rope_utils as _rope
+    except Exception:
+        return
+    original = getattr(_rope, "_compute_longrope_parameters", None)
+    if original is None or getattr(original, "_unsloth_patched", False):
+        return
+
+    def _sanitise(config):
+        scaling = getattr(config, "rope_scaling", None)
+        if not isinstance(scaling, dict):
+            return
+        factor = scaling.get("factor")
+        attention_factor = scaling.get("attention_factor")
+        if attention_factor is None or factor is None:
+            return
+        try:
+            if float(attention_factor) != float(factor) or float(factor) <= 2.0:
+                return
+        except (TypeError, ValueError):
+            return
+        original_max = getattr(config, "original_max_position_embeddings", None) \
+            or getattr(config, "max_position_embeddings", None)
+        try:
+            correct = math.sqrt(1 + math.log(float(factor)) / math.log(float(original_max)))
+        except (TypeError, ValueError, ZeroDivisionError):
+            correct = None
+        cleaned = dict(scaling)
+        cleaned.pop("attention_factor", None)
+        try:
+            config.rope_scaling = cleaned
+        except Exception:
+            return
+        print(
+            f"Unsloth: This model's config sets a LongRoPE attention_factor of "
+            f"{attention_factor}, which equals its extension factor and cannot be "
+            f"a real attention factor"
+            + (f" (the derived value is {correct:.4f})" if correct else "")
+            + ". Ignoring it so attention is scaled correctly."
+        )
+
+    # Everything but `config` is forwarded untouched: on transformers 5 every
+    # other parameter has a default and `_init_weights` calls the rope init as
+    # `rope_fn(module.config)`, so naming `device` here would make every
+    # LongRoPE model fail to load with a missing-argument TypeError.
+    @functools.wraps(original)
+    def _compute_longrope_parameters(config, *args, **kwargs):
+        try:
+            _sanitise(config)
+        except Exception:
+            # Never let the guard itself break a model that would have loaded.
+            pass
+        return original(config, *args, **kwargs)
+
+    _compute_longrope_parameters._unsloth_patched = True
+    try:
+        _rope._compute_longrope_parameters = _compute_longrope_parameters
+        # Models resolve the callable through this dict, not the module
+        # attribute, so patching only the attribute would be a no-op.
+        if getattr(_rope, "ROPE_INIT_FUNCTIONS", None) is not None:
+            if _rope.ROPE_INIT_FUNCTIONS.get("longrope") is original:
+                _rope.ROPE_INIT_FUNCTIONS["longrope"] = _compute_longrope_parameters
+    except Exception:
+        return
+pass
+TEMPORARY_PATCHES.append(patch_longrope_impossible_attention_factor)
+
+
+def patch_relu_squared_activation_dtype():
+    """`torch.square` autocasts to float32, breaking Nemotron-H's bf16 `index_add_`; use y * y."""
+    try:
+        import transformers.activations as activations_module
+    except Exception:
+        return
+    activation_class = getattr(activations_module, "ReLUSquaredActivation", None)
+    if activation_class is None or getattr(activation_class, "_unsloth_dtype_patched", False):
+        return
+
+    def forward(self, input):
+        relu_applied = torch.nn.functional.relu(input)
+        return relu_applied * relu_applied
+
+    activation_class.forward = forward
+    activation_class._unsloth_dtype_patched = True
+pass
+TEMPORARY_PATCHES.append(patch_relu_squared_activation_dtype)
+
+
+def _lora_integer_input(self, x):
+    """Prefer the autocast dtype: casting to compute_dtype (float32 default) promotes the output."""
+    if x.is_floating_point() or x.is_complex():
+        return x
+    dtype = None
+    try:
+        if torch.is_autocast_enabled(x.device.type):
+            dtype = torch.get_autocast_dtype(x.device.type)
+    except Exception:
+        dtype = None
+    if dtype is None:
+        dtype = getattr(self.base_layer, "compute_dtype", None)
+    if dtype is None:
+        for adapter in self.active_adapters:
+            if adapter in self.lora_A:
+                dtype = self.lora_A[adapter].weight.dtype
+                break
+    return x.to(dtype) if dtype is not None else x
+pass
+
+
+def patch_peft_lora_integer_input():
+    """Nemotron-H feeds uint8 zeros to idle 4-bit experts; PEFT LoRA under autocast then fails."""
+    try:
+        import peft.tuners.lora.bnb as peft_bnb
+        Linear4bit = getattr(peft_bnb, "Linear4bit", None)
+    except Exception:
+        return
+    if Linear4bit is None:
+        return
+    original_forward = Linear4bit.__dict__.get("forward")
+    if original_forward is None or getattr(original_forward, "_unsloth_integer_input", False):
+        return
+
+    @functools.wraps(original_forward)
+    def forward(self, x, *args, **kwargs):
+        if isinstance(x, torch.Tensor) and not x.is_floating_point():
+            x = _lora_integer_input(self, x)
+        return original_forward(self, x, *args, **kwargs)
+
+    forward._unsloth_integer_input = True
+    Linear4bit.forward = forward
+pass
+TEMPORARY_PATCHES.append(patch_peft_lora_integer_input)
+
+
+def _list_main_input_numel(value):
+    if all(isinstance(v, torch.Tensor) for v in value):
+        return sum(v.numel() for v in value)
+    return None
+
+
+def patch_trainer_flops_list_main_input():
+    # Nemotron-3-Nano-Omni's main_input_name is pixel_values, a list of ragged tiles: Trainer's `.numel()` crashes.
+    try:
+        from transformers import Trainer
+    except Exception:
+        return
+    original = Trainer.__dict__.get("floating_point_ops")
+    if original is None or getattr(original, "_unsloth_list_main_input", False):
+        return
+
+    @functools.wraps(original)
+    def floating_point_ops(self, inputs):
+        model = getattr(self, "model", None)
+        main_input = getattr(model, "main_input_name", "input_ids")
+        # BatchFeature is a UserDict, not a dict.
+        value = inputs.get(main_input, None) if hasattr(inputs, "get") else None
+        if isinstance(value, (list, tuple)) and hasattr(model, "num_parameters"):
+            numel = _list_main_input_numel(value)
+            if numel is None:
+                return 0
+            return 6 * numel * model.num_parameters(exclude_embeddings = True)
+        return original(self, inputs)
+
+    floating_point_ops._unsloth_list_main_input = True
+    Trainer.floating_point_ops = floating_point_ops
+pass
+TEMPORARY_PATCHES.append(patch_trainer_flops_list_main_input)
+
+
+def patch_granitemoe_router_logits_recording():
+    # transformers 5.x dropped router_logits from Granite MoE _can_record_outputs, so output_router_logits=True
+    # (TRL >= 1.7 default) makes aux_loss an int 0 and the CausalLM forward crashes on `aux_loss.to(...)`.
+    try:
+        from transformers.utils.output_capturing import OutputRecorder
+    except Exception:
+        return  # transformers 4.x collects router logits in the decoder loop itself
+    for module_name, prefix in (
+        ("granitemoe", "GraniteMoe"),
+        ("granitemoeshared", "GraniteMoeShared"),
+        ("granitemoe_swa", "GraniteMoeSWA"),
+        ("granitemoehybrid", "GraniteMoeHybrid"),
+    ):
+        try:
+            module = importlib.import_module(f"transformers.models.{module_name}.modeling_{module_name}")
+        except Exception:
+            continue
+        pretrained = getattr(module, f"{prefix}PreTrainedModel", None)
+        # transformers <= 5.5 calls it TopKGating and returns the logits as `logits`.
+        router = getattr(module, f"{prefix}TopKRouter", None) or getattr(module, f"{prefix}TopKGating", None)
+        recorded = getattr(pretrained, "_can_record_outputs", None)
+        if pretrained is None or router is None or not isinstance(recorded, dict) or "router_logits" in recorded:
+            continue
+        # GraniteMoeSWA returns (router_logits, ...) while the others end with it: read the position off the source.
+        try:
+            returned = re.findall(r"return ([^\n]+)", inspect.getsource(router.forward))[-1]
+            names = [x.strip() for x in returned.split(",")]
+            index = names.index("router_logits") if "router_logits" in names else names.index("logits")
+        except Exception:
+            continue
+        pretrained._can_record_outputs = {**recorded, "router_logits": OutputRecorder(router, index = index)}
+pass
+TEMPORARY_PATCHES.append(patch_granitemoe_router_logits_recording)
