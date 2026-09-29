@@ -611,7 +611,9 @@ def test_bnb_prequant_load_still_cleans_its_scratch_dir(monkeypatch, tmp_path):
     monkeypatch.setattr(mlx_lm_utils, "_download", lambda *a, **k: str(repo))
     monkeypatch.setattr(loader, "_dequantize_bnb_to_tempdir", lambda *a, **k: str(scratch))
 
-    class _Model:
+    import mlx.nn as nn
+
+    class _Model(nn.Module):
         pass
 
     original = FastMLXModel.from_pretrained
