@@ -2520,8 +2520,7 @@ def _token_accuracy_loss_fn(correct, ntoks):
 def test_evaluate_reports_token_accuracy_reduced_across_ranks():
     import mlx.core as mx
 
-    # Peer rank adds 10 loss mass, 15 tokens and 4 correct; the numerator must be
-    # rank-summed before dividing by the global token count.
+    # Peer rank adds 10 loss, 15 tokens, 4 correct: 7 / 20 only if summed before dividing.
     peer = iter([mx.array(10.0), mx.array(15), mx.array([4.0])])
     trainer = _token_accuracy_eval_trainer(
         lambda value, stream=None: value + next(peer),
@@ -2569,7 +2568,6 @@ def test_baseline_loss_fn_counts_correct_supervised_tokens(with_labels):
 
     vocab = 6
     batch = mx.array([[1, 2, 3, 4, 5]])
-    # Predict token (i % vocab) at position i; targets are batch[:, 1:] = 2,3,4,5.
     preds = [0, 3, 2, 5]
     logits = mx.array([[[10.0 if v == p else 0.0 for v in range(vocab)] for p in preds]])
     model = lambda _inputs: logits
@@ -2580,7 +2578,7 @@ def test_baseline_loss_fn_counts_correct_supervised_tokens(with_labels):
     assert loss_fn._unsloth_token_accuracy is True
     loss, ntoks, correct = loss_fn(model, batch, lengths, labels, return_correct=True)
     plain_loss, plain_ntoks = loss_fn(model, batch, lengths, labels)
-    # Hits at target positions 1 (3) and 3 (5); labels mask position 0.
+    # Targets 2,3,4,5 vs preds 0,3,2,5: two hits; labels also mask position 0.
     assert correct.item() == 2.0
     assert ntoks.item() == (3 if with_labels else 4)
     assert loss.item() == pytest.approx(plain_loss.item())
