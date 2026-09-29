@@ -1162,6 +1162,7 @@ jobs:
                   tests/test_disable_compile_functions_reach_imported_helpers.py \
                   tests/test_data_dependent_helpers_not_fullgraph.py \
                   tests/test_decode_compile_disable.py \
+                  tests/test_eager_decode_bypass.py \
                   tests/test_temporary_patches_exhaustive.py \
                   tests/test_patch_keeps_module_name.py \
                   tests/test_mxfp4_load_path_layout.py \
