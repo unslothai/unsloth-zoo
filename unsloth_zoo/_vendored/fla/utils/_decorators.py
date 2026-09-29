@@ -18,7 +18,7 @@ from typing import Any
 import torch
 from packaging import version as package_version
 
-from .. import __version__
+from unsloth_zoo._vendored.fla import __version__
 from ._config import FLA_DISABLE_TENSOR_CACHE, FLA_TENSOR_CACHE_SIZE
 from ._device import custom_device_ctx
 
