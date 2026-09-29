@@ -893,7 +893,6 @@ jobs:
       # gradient regression from #776 and the consumer-binding sweep shipped
       # ungated. They need mlx core plus mlx-lm, not Metal, so they belong here;
       # the Metal-only halves skip and stay the macOS lane's job.
-      # QAT fuse parity, save round trip and refusals: real mlx, no Metal, no downloads.
       - name: tests/test_mlx_qat.py
         run: >-
           .lanes/venv-suites/bin/python -m pytest tests/test_mlx_qat.py -v -rs

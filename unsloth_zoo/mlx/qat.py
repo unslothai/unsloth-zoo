@@ -40,7 +40,6 @@ def _requested_bits(qat_scheme):
         raise TypeError(f"Unsloth: qat_scheme must be a string or True, got {type(qat_scheme).__name__}.")
     scheme = qat_scheme.strip().lower()
     if scheme not in _SCHEME_BITS:
-        # torchao schemes (int8-int4, fp8-*, ...) quantize activations or use fp8; not expressible here.
         raise NotImplementedError(
             f"Unsloth: qat_scheme={qat_scheme!r} is not supported on MLX, whose quantizer is "
             "weight-only affine. Use 'auto' (inherit the base grid), 'int4' or 'int8'."
@@ -96,8 +95,7 @@ def _ste_quantized_matmul(group_size, bits, mode):
 
     grid = {"group_size": group_size, "bits": bits, "mode": mode}
 
-    # A dense GEMM over the dequantized weight rounds differently from quantized_matmul
-    # (0.017 loss drift across save on Metal); the custom VJP avoids a second matmul.
+    # Not a dense GEMM: it rounds differently from the saved quantized_matmul (0.017 drift on Metal).
     @mx.custom_function
     def fn(x, merged, packed, scales, biases):
         return mx.quantized_matmul(x, packed, scales, biases, transpose=True, **grid)
