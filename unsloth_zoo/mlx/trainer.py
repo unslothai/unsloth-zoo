@@ -9810,6 +9810,7 @@ class MLXKTOConfig(MLXTrainingConfig):
     max_prompt_length: int = 512
     max_completion_length: int | None = None
     loss_type: str = "kto"
+    disable_dropout: bool = True
 
 
 def _kto_sum_logp(logits, labels):
@@ -10002,6 +10003,8 @@ class MLXKTOTrainer(MLXTrainer):
         if args.gradient_checkpointing:
             apply_gradient_checkpointing(model)
         acquire_mlx_training_patches()
+        # As TRL's disable_dropout: policy, reference and KL forwards must not draw separate masks.
+        dropout = PreferenceRunContext(model, enabled=bool(args.disable_dropout))
         try:
             model.train()
             step, index = 0, 0
@@ -10045,6 +10048,7 @@ class MLXKTOTrainer(MLXTrainer):
                           f"loss={self._train_loss_history[-1]:.4f} kl={self._kl_history[-1]:.4f}")
                 acc_grad, acc_loss, acc_kl, acc_n = None, 0.0, 0.0, 0
         finally:
+            dropout.restore()
             release_mlx_training_patches()
             if args.gradient_checkpointing:
                 remove_gradient_checkpointing(model)

@@ -97,6 +97,24 @@ def test_kto_grad_accum_weights_microbatches_by_rows(tmp_path):
 
 
 @metal_only
+@pytest.mark.parametrize("disable_dropout", [True, False])
+def test_kto_dropout_disabled_for_scoring(tmp_path, disable_dropout):
+    # A trained adapter at lr=0: the policy equals its start snapshot, so without dropout
+    # the loss is exactly 0.5 and the KL exactly 0; live dropout draws separate masks.
+    from unsloth_zoo.mlx.loader import FastMLXModel
+    from unsloth_zoo.mlx.utils import iter_mlx_lora_modules
+    model, tok = FastMLXModel.from_pretrained(MODEL, max_seq_length=256, load_in_4bit=True)
+    model = FastMLXModel.get_peft_model(model, r=8, lora_alpha=16, lora_dropout=0.5, random_state=3407)
+    for _, m in iter_mlx_lora_modules(model):
+        m.lora_b = mx.random.normal(m.lora_b.shape, key=mx.random.key(0)).astype(m.lora_b.dtype) * 0.05
+    tr = _trainer(tmp_path, model_tok=(model, tok), max_steps=1, learning_rate=0.0,
+                  warmup_steps=0, disable_dropout=disable_dropout)
+    tr.train()
+    exact = tr._train_loss_history[0] == 0.5 and tr._kl_history[0] == 0.0
+    assert exact is disable_dropout, (tr._train_loss_history, tr._kl_history)
+
+
+@metal_only
 def test_kto_restores_weights_when_reference_forward_throws(tmp_path, monkeypatch):
     import numpy as np
     import unsloth_zoo.mlx.trainer as T
