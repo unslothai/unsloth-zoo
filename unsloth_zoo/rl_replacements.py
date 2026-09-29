@@ -651,8 +651,7 @@ def grpo_compute_loss(
         loss = (loss_i * mask).sum() / (loss_i.size(0) * max_completion_length)
         loss = loss / current_gradient_accumulation_steps
     elif loss_type in ["bnpo", "cispo", "dapo", "vespo"]:
-        # bnpo too: TRL's per micro-batch token mean changes with the GPU count and gradient accumulation;
-        # the global token count makes a split batch train exactly like the whole batch on one GPU.
+        # bnpo too: a per micro-batch token mean changes with the GPU / accumulation split, the global count does not.
         # Floor at 1 like TRL: a fully masked batch (mask_truncated_completions) is 0/0 = nan otherwise.
         if torch.is_tensor(num_items_in_batch):
             normalizer = num_items_in_batch.clamp(min = 1.0) / num_processes
