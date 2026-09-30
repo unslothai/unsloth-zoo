@@ -734,6 +734,14 @@ def _read_video_pyav(video_path: str, start: float = 0.0, end: Union[float, None
         stream = container.streams.video[0]
         rate = stream.average_rate or stream.guessed_rate
         video_fps = float(rate) if rate else 0.0
+        if start and stream.time_base:
+            # Jump to the keyframe at or before `start`, as torchvision does, rather than
+            # decoding and discarding everything ahead of a late segment. The filter below
+            # still drops the frames between that keyframe and `start`.
+            try:
+                container.seek(int(start / stream.time_base), stream=stream, backward=True)
+            except av.error.FFmpegError:
+                container.seek(0, stream=stream)
         for frame in container.decode(stream):
             when = frame.time
             if when is not None:

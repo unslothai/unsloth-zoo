@@ -69,3 +69,48 @@ def test_an_unrelated_type_error_still_propagates(monkeypatch, clip):
     monkeypatch.setattr(vision_utils.io, "read_video", read_video)
     with pytest.raises(TypeError, match = "PathLike"):
         vision_utils._read_video_torchvision({"video": clip})
+
+
+def test_a_late_segment_seeks_instead_of_decoding_from_the_start(monkeypatch, tmp_path):
+    path = tmp_path / "long.mp4"
+    with av.open(str(path), "w") as container:
+        stream = container.add_stream("mpeg4", rate = 10)
+        stream.width = stream.height = 32
+        stream.pix_fmt = "yuv420p"
+        stream.gop_size = 25
+        for i in range(600):
+            frame = av.VideoFrame.from_ndarray(
+                np.full((32, 32, 3), (i * 7) % 256, dtype = np.uint8), format = "rgb24"
+            )
+            for packet in stream.encode(frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+
+    decoded = []
+    real_open = av.open
+
+    class _Counting:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __enter__(self):
+            self._inner.__enter__()
+            return self
+
+        def __exit__(self, *exc):
+            return self._inner.__exit__(*exc)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def decode(self, *args, **kwargs):
+            for frame in self._inner.decode(*args, **kwargs):
+                decoded.append(frame)
+                yield frame
+
+    monkeypatch.setattr(av, "open", lambda *a, **k: _Counting(real_open(*a, **k)))
+    video, _ = vision_utils._read_video_pyav(str(path), 55.0, 56.0)
+    assert video.shape[0] == 11
+    # 60 s at 10 fps with a keyframe every 2.5 s: seeking lands within one GOP of 55 s.
+    assert len(decoded) < 60, f"decoded {len(decoded)} frames for a 1 s segment at 55 s"
