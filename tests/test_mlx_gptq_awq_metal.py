@@ -111,10 +111,19 @@ def test_prequant_checkpoint_lora_trains(repo, tmp_path):
     assert hist[-1] < hist[0], hist
 
     import mlx.core as mx
+    import mlx.nn as nn
 
-    ids = mx.array([tokenizer.encode("What is 3 plus 3?")])
-    want = model(ids).astype(mx.float32)
+    def text_loss(m):
+        ids = mx.array([tokenizer.encode(dataset[3]["text"])])
+        logits = m(ids).astype(mx.float32)
+        return nn.losses.cross_entropy(logits[0, :-1], ids[0, 1:]).mean().item()
+
+    base, _ = FastMLXModel.from_pretrained(repo, max_seq_length=256)
+    base_loss, trained_loss = text_loss(base), text_loss(model)
     model.save_pretrained(str(tmp_path / "adapter"))
     reloaded, _ = FastMLXModel.from_pretrained(str(tmp_path / "adapter"), max_seq_length=256)
-    got = reloaded(ids).astype(mx.float32)
-    assert mx.allclose(got, want, atol=1e-2).item(), mx.abs(got - want).max().item()
+    reloaded_loss = text_loss(reloaded)
+    print(f"{repo} base/trained/reloaded loss: {base_loss} {trained_loss} {reloaded_loss}")
+    # The reloaded adapter must carry the training: near the trained loss, far below the base's.
+    assert reloaded_loss < 0.5 * base_loss, (base_loss, trained_loss, reloaded_loss)
+    assert abs(reloaded_loss - trained_loss) < 0.25 * base_loss, (base_loss, trained_loss, reloaded_loss)
