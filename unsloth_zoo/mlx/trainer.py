@@ -9624,8 +9624,7 @@ class MLXTrainer:
                 for src_path in sources:
                     if src_path is None:
                         continue
-                    # A config override dir links unpatched files back to the snapshot,
-                    # so a refused link falls through to the next source.
+                    # Override dirs link back to the snapshot: a refused link falls through.
                     src_config = Path(src_path) / "config.json"
                     if src_config.exists() and _asset_link_stays_in_the_model(src_config, src_path):
                         if not dst_config.exists():

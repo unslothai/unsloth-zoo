@@ -613,7 +613,6 @@ def test_sidecars_follow_file_symlinks_and_skip_broken_ones(tmp_path):
     dst = tmp_path / "dst"
     src.mkdir()
     dst.mkdir()
-    # Links must stay inside the model; a links-only tree keeps its targets nested.
     real = src / "blobs" / "real_preprocessor.json"
     real.parent.mkdir()
     real.write_text('{"size": 224}', encoding="utf-8")

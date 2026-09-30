@@ -309,7 +309,6 @@ def test_unreplaceable_moe_utils_cache_copy_is_not_loaded(tmp_path, monkeypatch)
 
 
 def test_moe_utils_fallback_copy_does_not_write_through_a_symlink(tmp_path, monkeypatch):
-    """The non-atomic fallback must not follow a planted destination symlink."""
     location = tmp_path / "moe_cache_symlink"
     location.mkdir()
     victim = tmp_path / "victim.txt"
