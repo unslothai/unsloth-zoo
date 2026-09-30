@@ -1287,6 +1287,16 @@ def _extract_archive(archive_path, extract_dir):
             # until contents are written, which per-member extract would break.
             members = archive.getmembers()
             for member in members: _check_tar_member(member)
+            if not tar_kwargs:
+                # No filter: refuse paths through this archive's own symlinks, the
+                # only way a later member escapes a tree that passed the pass above.
+                links = {os.path.normpath(m.name) for m in members if m.issym()}
+                for member in members:
+                    for path in [member.name] + ([member.linkname] if member.islnk() else []):
+                        parts = path.split("/")
+                        for i in range(1, len(parts)):
+                            if os.path.normpath("/".join(parts[:i])) in links:
+                                raise RuntimeError(f"Unsloth: Archive member goes through a link: {path}")
             archive.extractall(extract_dir, members = members, **tar_kwargs)
 
 

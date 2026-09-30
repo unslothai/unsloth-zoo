@@ -304,9 +304,14 @@ def test_extract_rejects_symlink_escape(tmp_path):
 
 
 @pytest.mark.skipif(not IS_POSIX, reason = "symlink extraction (POSIX)")
-def test_extract_rejects_chained_symlink_escape(tmp_path):
+@pytest.mark.parametrize("data_filter", [True, False], ids = ["data_filter", "no_data_filter"])
+def test_extract_rejects_chained_symlink_escape(tmp_path, monkeypatch, data_filter):
     # Each link resolves inside when checked up front against an empty tree; only
     # once `sub -> .` exists does `sub/up -> ..` point above the extraction dir.
+    if data_filter and not hasattr(tarfile, "data_filter"):
+        pytest.skip("tarfile has no data filter on this Python")
+    if not data_filter:
+        monkeypatch.delattr(tarfile, "data_filter", raising = False)
     evil = tmp_path / "evil-chain.tar.gz"
     out = tmp_path / "stage" / "out"
     out.parent.mkdir()
@@ -314,11 +319,22 @@ def test_extract_rejects_chained_symlink_escape(tmp_path):
         _add_link(tar, "sub", ".")
         _add_link(tar, "sub/up", "..")
         _add_file(tar, "sub/up/pwned.txt", "pwned")
-    if not hasattr(tarfile, "data_filter"):
-        pytest.skip("tarfile has no data filter on this Python")
     with pytest.raises(Exception):
         llama_cpp._extract_archive(str(evil), str(out))
     assert not (out.parent / "pwned.txt").exists()
+
+
+@pytest.mark.skipif(not IS_POSIX, reason = "symlink extraction (POSIX)")
+def test_extract_without_data_filter_keeps_library_symlinks(tmp_path, monkeypatch):
+    monkeypatch.delattr(tarfile, "data_filter", raising = False)
+    archive = tmp_path / "libs.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        _add_file(tar, "build/bin/libllama.so.0.0.1", "elf")
+        _add_link(tar, "build/bin/libllama.so.0", "libllama.so.0.0.1")
+        _add_link(tar, "build/bin/libllama.so", "libllama.so.0")
+    out = tmp_path / "out"
+    llama_cpp._extract_archive(str(archive), str(out))
+    assert (out / "build" / "bin" / "libllama.so").read_text() == "elf"
 
 
 def test_extract_rejects_hardlink_escape(tmp_path):
