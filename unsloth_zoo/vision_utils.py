@@ -720,6 +720,34 @@ def smart_nframes(
     return nframes
 
 
+def _read_video_pyav(video_path: str, start: float = 0.0, end: Union[float, None] = None):
+    """Frames in [start, end] seconds as a (T, C, H, W) uint8 tensor, plus {"video_fps": fps}.
+
+    What torchvision.io.read_video(pts_unit="sec", output_format="TCHW") returns, for PyAV
+    builds that torchvision can no longer open.
+    """
+    import av
+    import numpy as np
+
+    frames = []
+    with av.open(video_path) as container:
+        stream = container.streams.video[0]
+        rate = stream.average_rate or stream.guessed_rate
+        video_fps = float(rate) if rate else 0.0
+        for frame in container.decode(stream):
+            when = frame.time
+            if when is not None:
+                if when < (start or 0.0):
+                    continue
+                if end is not None and when > end:
+                    break
+            frames.append(frame.to_ndarray(format="rgb24"))
+    if not frames:
+        return torch.empty((0, 3, 0, 0), dtype=torch.uint8), {"video_fps": video_fps}
+    video = torch.from_numpy(np.stack(frames)).permute(0, 3, 1, 2).contiguous()
+    return video, {"video_fps": video_fps}
+
+
 def _read_video_torchvision(
     ele: dict,
 ) -> tuple[torch.Tensor, float]:
@@ -733,13 +761,22 @@ def _read_video_torchvision(
         if "http://" in video_path or "https://" in video_path:
             warnings.warn("torchvision < 0.19.0 does not support http/https video path, please upgrade to 0.19.0.")
     st = time.time()
-    video, audio, info = io.read_video(
-        video_path,
-        start_pts=ele.get("video_start", 0.0),
-        end_pts=ele.get("video_end", None),
-        pts_unit="sec",
-        output_format="TCHW",
-    )
+    try:
+        video, audio, info = io.read_video(
+            video_path,
+            start_pts=ele.get("video_start", 0.0),
+            end_pts=ele.get("video_end", None),
+            pts_unit="sec",
+            output_format="TCHW",
+        )
+    except TypeError as exc:
+        # torchvision's read_video passes av.open(..., metadata_errors="ignore"), which PyAV 19
+        # removed, so every read fails before decoding. Decode the same range with PyAV directly.
+        if "metadata_errors" not in str(exc):
+            raise
+        video, info = _read_video_pyav(
+            video_path, ele.get("video_start", 0.0), ele.get("video_end", None)
+        )
     try:
         video_fps = info["video_fps"]
     except Exception as e:
