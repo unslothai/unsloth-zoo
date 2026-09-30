@@ -2411,9 +2411,11 @@ def test_a_config_symlink_out_of_the_model_is_not_recovered(tmp_path):
 
     secret = tmp_path / "docker_config.json"
     secret.write_text('{"auths": {"x": "SECRET"}}')
-    src = tmp_path / "model"; src.mkdir()
+    src = tmp_path / "model"
+    src.mkdir()
     (src / "config.json").symlink_to(secret)
-    out = tmp_path / "out"; out.mkdir()
+    out = tmp_path / "out"
+    out.mkdir()
 
     class _P:
         def save_pretrained(self, directory):
@@ -2428,13 +2430,17 @@ def test_a_config_override_dir_falls_back_to_the_snapshot_config(tmp_path):
     from unsloth_zoo.mlx.utils import _save_vlm_processor_assets
 
     repo = tmp_path / "models--org--name"
-    blobs = repo / "blobs"; blobs.mkdir(parents=True)
-    snapshot = repo / "snapshots" / "abc123"; snapshot.mkdir(parents=True)
+    blobs = repo / "blobs"
+    blobs.mkdir(parents=True)
+    snapshot = repo / "snapshots" / "abc123"
+    snapshot.mkdir(parents=True)
     (blobs / "deadbeef").write_text('{"model_type": "real"}')
     (snapshot / "config.json").symlink_to(blobs / "deadbeef")
-    override = tmp_path / "unsloth_mlx_vlm_config_x"; override.mkdir()
+    override = tmp_path / "unsloth_mlx_vlm_config_x"
+    override.mkdir()
     (override / "config.json").symlink_to(snapshot / "config.json")
-    out = tmp_path / "out"; out.mkdir()
+    out = tmp_path / "out"
+    out.mkdir()
 
     class _P:
         def save_pretrained(self, directory):
