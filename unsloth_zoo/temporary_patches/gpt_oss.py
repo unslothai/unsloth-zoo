@@ -2382,10 +2382,24 @@ def _ogs_expert_offsets(routing_data):
     return offsets
 
 
-def _matmul_ogs_for(weight):
-    """matmul_ogs from the triton_kernels copy that built `weight` (a second copy's Tensor classes reject it)."""
+def _matmul_ogs_for(weight, routing_data = None):
+    """matmul_ogs from the triton_kernels copy that built `weight` (a second copy's Tensor classes reject it).
+
+    A plain torch.Tensor weight (packed blocks decoded per call by the gate_up_proj / down_proj
+    properties) carries no copy: take the one that built `routing_data`, else the resolved one."""
     import importlib
-    root = type(weight).__module__.rsplit(".tensor", 1)[0]
+    if isinstance(weight, torch.Tensor):
+        owner = type(routing_data).__module__ if routing_data is not None else ""
+        if owner.endswith(".routing"):
+            root = owner[: -len(".routing")]
+        else:
+            from unsloth_zoo.triton_kernels_compat import get_triton_kernels
+            tk = get_triton_kernels()
+            if tk is None:
+                raise RuntimeError("Unsloth: triton_kernels is required for native MXFP4 GPT OSS training.")
+            root = tk.__name__
+    else:
+        root = type(weight).__module__.rsplit(".tensor", 1)[0]
     return importlib.import_module(root + ".matmul_ogs").matmul_ogs
 
 
@@ -2394,10 +2408,12 @@ class _OgsGateUp(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, bias, module, routing_data, gather_idx):
-        matmul_ogs = _matmul_ogs_for(module.gate_up_proj)
+        # One read: on the still-packed path each property access decodes the whole stack.
+        weight = module.gate_up_proj
+        matmul_ogs = _matmul_ogs_for(weight, routing_data)
 
         out = matmul_ogs(
-            x.to(torch.bfloat16), module.gate_up_proj, bias, routing_data,
+            x.to(torch.bfloat16), weight, bias, routing_data,
             gather_indx = gather_idx, precision_config = module.gate_up_proj_precision_config,
         )
         ctx.module, ctx.routing_data, ctx.gather_idx = module, routing_data, gather_idx
@@ -2443,10 +2459,11 @@ class _OgsDown(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, h, gammas, bias, module, routing_data, scatter_idx):
-        matmul_ogs = _matmul_ogs_for(module.down_proj)
+        weight = module.down_proj
+        matmul_ogs = _matmul_ogs_for(weight, routing_data)
 
         out = matmul_ogs(
-            h, module.down_proj, bias, routing_data, scatter_indx = scatter_idx,
+            h, weight, bias, routing_data, scatter_indx = scatter_idx,
             precision_config = module.down_proj_precision_config,
             gammas = None if gammas is None else gammas.detach(),
         )
