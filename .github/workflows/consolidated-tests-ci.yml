@@ -481,6 +481,7 @@ jobs:
             tests/test_vision_url_dns_rebinding.py \
             tests/test_merge_index_weight_map_traversal.py \
             tests/test_gguf_converter_child_env.py \
+            tests/test_responses_only_last_turn_header.py \
             tests/test_gguf_post_conversion_validation.py \
             tests/test_mtp_config_reconcile.py \
             tests/test_llama_cpp_converter_scan.py \
