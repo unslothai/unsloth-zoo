@@ -4,11 +4,6 @@ _read_video_torchvision is both a primary backend and fetch_video's last resort,
 PyAV 19 video input stopped working unless decord or torchcodec happened to succeed.
 """
 
-import os
-
-os.environ.setdefault("UNSLOTH_ZOO_DISABLE_GPU_INIT", "1")
-os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
-
 import pytest
 
 av = pytest.importorskip("av")
