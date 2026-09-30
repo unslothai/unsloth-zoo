@@ -1290,12 +1290,12 @@ def _extract_archive(archive_path, extract_dir):
             if not tar_kwargs:
                 # No filter: refuse paths through this archive's own links (a hardlink
                 # can alias a symlink), the only way a later member escapes the pass above.
-                links = {os.path.normpath(m.name.replace("\\", "/")) for m in members if m.issym() or m.islnk()}
+                links = {os.path.normpath(m.name.replace("\\", "/")).casefold() for m in members if m.issym() or m.islnk()}
                 for member in members:
                     for path in [member.name] + ([member.linkname] if member.islnk() else []):
                         parts = path.replace("\\", "/").split("/")
                         for i in range(1, len(parts)):
-                            if os.path.normpath("/".join(parts[:i])) in links:
+                            if os.path.normpath("/".join(parts[:i])).casefold() in links:
                                 raise RuntimeError(f"Unsloth: Archive member goes through a link: {path}")
             archive.extractall(extract_dir, members = members, **tar_kwargs)
 
