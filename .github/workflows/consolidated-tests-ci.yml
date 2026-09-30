@@ -461,6 +461,7 @@ jobs:
             tests/test_moe_preprocess_weight_transpose.py \
             tests/test_relative_imports_resolve.py \
             tests/test_grpo_mask_truncated_rows.py \
+            tests/test_deepseek_v41_compile_entries.py \
             tests/test_moe_weight_preprocessor_registry_shared.py \
             tests/test_moe_triton_down_lora_roworder.py \
             tests/test_moe_router_not_a_lora_target.py \

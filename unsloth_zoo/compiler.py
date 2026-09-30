@@ -199,11 +199,30 @@ DISABLE_COMPILE_FUNCTIONS = [
 # trailing `x[..., -rope_dim:]` slice reads out of bounds, giving wrong / NaN grads (pytorch#198553).
 DISABLE_COMPILE_MODEL_FUNCTIONS = {
     "deepseek_v4": ["apply_rotary_pos_emb"],
+    # Community port: V4 rope slice plus host-side helpers (dynamo cannot trace tokenizers `NFKC.__new__`).
+    "deepseek_v41": [
+        "apply_rotary_pos_emb",
+        "build_compressed_token_map",
+        "compute_hash_multipliers",
+        "_is_prime",
+        "_find_next_prime",
+        "_mesh_process_group",
+        "_tp_grad_group",
+        "_validate_attention_tp_divisibility",
+        # QAT STE autograd.Function: Dynamo raises InternalTorchDynamoError the fallback does not catch.
+        "_quantize_qat",
+    ],
 }
 
 # Matched rewrites leave DISABLE_COMPILE_MODEL_FUNCTIONS; deepseek_v4 `split` avoids the slice pytorch#198553 miscompiles.
 MODEL_FUNCTION_SOURCE_REWRITES = {
     "deepseek_v4": {
+        "apply_rotary_pos_emb": (
+            "nope, rope = x[..., :-rope_dim], x[..., -rope_dim:]",
+            "nope, rope = x.split([x.shape[-1] - rope_dim, rope_dim], dim = -1)",
+        ),
+    },
+    "deepseek_v41": {
         "apply_rotary_pos_emb": (
             "nope, rope = x[..., :-rope_dim], x[..., -rope_dim:]",
             "nope, rope = x.split([x.shape[-1] - rope_dim, rope_dim], dim = -1)",
@@ -5133,6 +5152,7 @@ DISABLE_COMPILE_MODULES = [
     # Sinkhorn-Knopp division chain overflows to inf; tiny modules, so eager is cheap.
     "DeepseekV4HyperConnection",
     "DeepseekV4HyperHead",
+    "DeepseekV41HyperConnection",
 ]
 
 FIX_GC_LAYER_CALLER_MODULES = [
