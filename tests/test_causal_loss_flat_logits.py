@@ -101,3 +101,38 @@ def test_a_custom_ignore_index_matches_the_stock_loss(patched_loss, flat):
             unsloth(logits, labels, vocab, num_items_in_batch = n, ignore_index = -1),
             stock(logits, labels, vocab, num_items_in_batch = n, ignore_index = -1),
         )
+
+
+@pytest.mark.parametrize("labels_present", [False, True])
+def test_explicit_targets_preserve_boundary_loss_and_gradient(patched_loss, labels_present):
+    stock, unsloth = patched_loss
+    labels = torch.tensor([[0, 1, 2, 3, 4, 5]]) if labels_present else None
+    targets = torch.tensor([[1, 2, -100, 4, 5, -100]])
+    logits = torch.arange(48, dtype = torch.float32).reshape(1, 6, 8) / 20
+    actual_logits = logits.clone().requires_grad_()
+    expected_logits = logits.clone().requires_grad_()
+    actual = unsloth(actual_logits, labels, 8, shift_labels = targets)
+    expected = stock(expected_logits, labels, 8, shift_labels = targets)
+    assert actual is not None
+    torch.testing.assert_close(actual, expected)
+    actual_grad, = torch.autograd.grad(actual, actual_logits)
+    expected_grad, = torch.autograd.grad(expected, expected_logits)
+    torch.testing.assert_close(actual_grad, expected_grad)
+    assert torch.count_nonzero(actual_grad[0, 2]) == 0
+    assert torch.count_nonzero(actual_grad[0, 0]) > 0
+
+
+@pytest.mark.parametrize("flat_logits", [False, True])
+@pytest.mark.parametrize("flat_targets", [False, True])
+def test_explicit_targets_keep_final_positions(patched_loss, flat_logits, flat_targets):
+    stock, unsloth = patched_loss
+    logits = torch.arange(48, dtype = torch.float32).reshape(2, 3, 8) / 20
+    targets = torch.tensor([[1, 2, 3], [4, 5, 6]])
+    if flat_logits: logits = logits.reshape(-1, 8)
+    if flat_targets: targets = targets.reshape(-1)
+    # Raw labels must not determine explicit targets' shape or end masks.
+    labels = torch.tensor([[0]])
+    torch.testing.assert_close(
+        unsloth(logits, labels, 8, shift_labels = targets),
+        stock(logits, labels, 8, shift_labels = targets),
+    )

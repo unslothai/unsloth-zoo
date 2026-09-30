@@ -507,15 +507,20 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
             # collectives below, never by breaking out: skipping accelerator.gather on
             # one rank alone would hang the others.
             degenerate = False
-            # One column leaves labels[..., 1:] empty. Only fatal when EVERY microbatch
-            # is short, since then the total is 0 and a sum/count loss divides by it. A
-            # short member of a mixed group just contributes 0, and voiding the group
-            # for it would lose GA invariance.
+            # Implicit targets drop the first column; explicit shift_labels are
+            # already aligned and can supervise even a one-column batch. Only
+            # decline when EVERY microbatch has no target positions, since an
+            # empty member of a mixed group simply contributes 0 to its divisor.
             all_short = True
             for x in batch_samples:
                 labels = x["labels"]
-                if labels.shape[-1] >= 2: all_short = False
-                token_count = (labels[..., 1:] != -100)
+                shift_labels = x.get("shift_labels")
+                # Count exactly the targets consumed by the loss. A caller's
+                # pre-shifted targets carry their own mask and must not be shifted
+                # or remasked using attention_mask / packing metadata below.
+                targets = labels[..., 1:] if shift_labels is None else shift_labels
+                if targets.shape[-1] != 0: all_short = False
+                token_count = (targets != -100)
                 if "input_ids" in x:
                     input_ids = x["input_ids"]
                     mark_static (input_ids, 0)
@@ -530,15 +535,17 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                     # Only AND a mask describing these same targets: a seq2seq mask is
                     # the encoder's, a different length from the decoder labels, which
                     # used to raise. Causal shapes always match, so nothing changes.
-                    if attention_mask.shape != labels.shape:
-                        degenerate = True
-                    else:
-                        token_count &= (attention_mask[..., 1:] != 0)
+                    if shift_labels is None:
+                        if attention_mask.shape != labels.shape:
+                            degenerate = True
+                        else:
+                            token_count &= (attention_mask[..., 1:] != 0)
                 if "token_type_ids" in x:
                     token_type_ids = x["token_type_ids"]
                     mark_static (token_type_ids, 0)
                     mark_dynamic(token_type_ids, 1)
-                seq_lengths = _normalize_packed_seq_lengths(x.get("packed_seq_lengths"))
+                seq_lengths = _normalize_packed_seq_lengths(x.get("packed_seq_lengths")) \
+                    if shift_labels is None else None
                 if seq_lengths is not None and token_count.ndim in (1, 2) and token_count.shape[-1] != 0:
                     # Packing N documents leaves N-1 internal boundaries that are
                     # not valid training positions. Zero those exact slots rather
