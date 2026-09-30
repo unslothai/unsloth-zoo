@@ -14754,6 +14754,8 @@ _HADAMARD_PACK_CONFIG_KEYS = frozenset({
 def _dense_hadamard_pack_config(config):
     config = {k: v for k, v in config.items() if k not in _HADAMARD_PACK_CONFIG_KEYS}
     config["model_type"] = "qwen3_5"
+    # The pack ships no `architectures`; GGUF conversion dispatches on it.
+    config["architectures"] = ["Qwen3_5ForConditionalGeneration"]
     return config
 
 

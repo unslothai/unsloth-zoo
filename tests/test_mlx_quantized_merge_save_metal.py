@@ -221,7 +221,8 @@ def test_merged_16bit_unpacks_hadamard_layers_to_the_dense_layers_they_compute(t
     save_merged_model(model, type("Tokenizer", (), {"save_pretrained": lambda self, path: None})(),
                       tmp_path, dequantize=True)
     assert json.loads((tmp_path / "config.json").read_text()) == {
-        "model_type": "qwen3_5", "text_config": {"hidden_size": 1024}, "image_token_id": 7}
+        "model_type": "qwen3_5", "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "text_config": {"hidden_size": 1024}, "image_token_id": 7}
     assert [type(m) for m in (model.proj, model.embed, model.adapted)] == [nn.Linear, nn.Embedding, nn.Linear]
     for expected, actual in zip(want, forward()):
         expected, actual = expected.astype(mx.float32), actual.astype(mx.float32)
