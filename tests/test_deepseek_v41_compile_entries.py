@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""DeepSeek-V4.1 (a community transformers port, `transformers.models.deepseek_v41`) keeps its host-side
-helpers and QAT fake-quant out of torch.compile and compiles its rope only through the V4 `split` rewrite."""
+"""DeepSeek-V4.1 port: host helpers and QAT stay eager; rope compiles only via the V4 `split` rewrite."""
 
 import importlib.util
 import json
@@ -49,7 +48,6 @@ _DISABLED = {
 def test_deepseek_v41_entries_registered():
     assert set(DISABLE_COMPILE_MODEL_FUNCTIONS["deepseek_v41"]) == _DISABLED
     assert "DeepseekV41HyperConnection" in DISABLE_COMPILE_MODULES
-    # Same rope as V4, so the same rewrite.
     assert (
         MODEL_FUNCTION_SOURCE_REWRITES["deepseek_v41"]["apply_rotary_pos_emb"]
         == MODEL_FUNCTION_SOURCE_REWRITES["deepseek_v4"]["apply_rotary_pos_emb"]
@@ -121,9 +119,7 @@ def test_generated_cache_keeps_helpers_eager(tmp_path):
     assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-4000:]
     line = next(l for l in result.stdout.splitlines() if l.startswith("@@@"))
     out = json.loads(line[3:])
-    # The rope is compiled, but only through the split rewrite.
     assert out.pop("rope_split"), out
     assert (out.pop("apply_rotary_pos_emb") or "").startswith("torch_compile_with_fallback("), out
-    # No helper may be emitted under a compile decorator.
     compiled = {k: v for k, v in out.items() if v is not None and "compile" in v and "disable" not in v}
     assert not compiled, compiled

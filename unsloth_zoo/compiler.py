@@ -199,9 +199,7 @@ DISABLE_COMPILE_FUNCTIONS = [
 # trailing `x[..., -rope_dim:]` slice reads out of bounds, giving wrong / NaN grads (pytorch#198553).
 DISABLE_COMPILE_MODEL_FUNCTIONS = {
     "deepseek_v4": ["apply_rotary_pos_emb"],
-    # deepseek_v41 (community port): same rope slice as deepseek_v4, plus host-side helpers the
-    # compiler picks up as compilable: the engram token-map builder runs tokenizers normalizers
-    # (dynamo cannot trace `NFKC.__new__`), the prime / multiplier / TP helpers are pure Python.
+    # Community port: V4 rope slice plus host-side helpers (dynamo cannot trace tokenizers `NFKC.__new__`).
     "deepseek_v41": [
         "apply_rotary_pos_emb",
         "build_compressed_token_map",
@@ -211,8 +209,7 @@ DISABLE_COMPILE_MODEL_FUNCTIONS = {
         "_mesh_process_group",
         "_tp_grad_group",
         "_validate_attention_tp_divisibility",
-        # Wraps a custom autograd.Function (QAT fake-quant STE); under grad Dynamo raises
-        # InternalTorchDynamoError (aliased intermediate) that the compile fallback does not catch.
+        # QAT STE autograd.Function: Dynamo raises InternalTorchDynamoError the fallback does not catch.
         "_quantize_qat",
     ],
 }
