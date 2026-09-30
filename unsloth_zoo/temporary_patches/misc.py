@@ -3103,3 +3103,46 @@ def patch_granitemoe_router_logits_recording():
         pretrained._can_record_outputs = {**recorded, "router_logits": OutputRecorder(router, index = index)}
 pass
 TEMPORARY_PATCHES.append(patch_granitemoe_router_logits_recording)
+
+
+def patch_mamba_ssm_chunk_scan_device_guard():
+    """`_chunk_scan_fwd_kernel` lacks a device guard, so on multi-GPU device_map it runs
+    on cuda:0's stream and races: zero/NaN outputs (NemotronH, Falcon-H1)."""
+    import sys
+    try:
+        if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+            return
+        if "mamba_ssm.ops.triton.ssd_chunk_scan" not in sys.modules:
+            import importlib.util
+            if importlib.util.find_spec("mamba_ssm") is None:
+                return
+        from mamba_ssm.ops.triton import ssd_chunk_scan
+    except Exception:
+        return
+    original = getattr(ssd_chunk_scan, "_chunk_scan_fwd", None)
+    if original is None:
+        return
+    if getattr(original, "_unsloth_device_guarded", False):
+        _chunk_scan_fwd = original
+    else:
+        @functools.wraps(original)
+        def _chunk_scan_fwd(cb, x, *args, **kwargs):
+            if x.is_cuda and x.device.index != torch.cuda.current_device():
+                with torch.cuda.device(x.device):
+                    return original(cb, x, *args, **kwargs)
+            return original(cb, x, *args, **kwargs)
+        _chunk_scan_fwd._unsloth_device_guarded = True
+
+    # ssd_combined (and anything else) bound the function by name at import. Match by
+    # origin, not identity: fix_mamba_ssm_float32 reloads ssd_chunk_scan, leaving stale copies.
+    for name, module in list(sys.modules.items()):
+        if not (name == "mamba_ssm" or name.startswith("mamba_ssm.")):
+            continue
+        fn = getattr(module, "_chunk_scan_fwd", None)
+        if fn is None or fn is _chunk_scan_fwd or getattr(fn, "_unsloth_device_guarded", False):
+            continue
+        if getattr(fn, "__module__", None) == ssd_chunk_scan.__name__ and \
+                getattr(fn, "__name__", None) == "_chunk_scan_fwd":
+            setattr(module, "_chunk_scan_fwd", _chunk_scan_fwd)
+pass
+TEMPORARY_PATCHES.append(patch_mamba_ssm_chunk_scan_device_guard)
