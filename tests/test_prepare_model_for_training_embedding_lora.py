@@ -99,3 +99,24 @@ def test_embedding_lora_upcast_like_linear_lora():
         assert p.dtype == lora_a.dtype == torch.float32, (n, p.dtype, lora_a.dtype)
     logits = model(input_ids = torch.randint(0, 64, (1, 8))).logits
     assert torch.isfinite(logits.float()).all()
+
+
+def test_merged_save_keeps_trained_embedding_lora():
+    # Now that embedding LoRA trains, the 16-bit merge must fold its delta too.
+    from unsloth_zoo.saving_utils import create_lora_statistics, _merge_lora
+
+    model = _tiny_lora_llama()
+    torch.manual_seed(1)
+    with torch.no_grad():
+        for p in _embedding_lora(model).values():
+            p.normal_()
+    embed = model.base_model.model.model.embed_tokens
+    W0 = embed.base_layer.weight.detach().clone()
+    with torch.no_grad():
+        expected = W0 + embed.get_delta_weight("default")
+    lora_weights, _ = create_lora_statistics(model, merge_into_original = True)
+    stats = lora_weights["model.embed_tokens"]
+    with torch.no_grad():
+        merged = _merge_lora(W0.clone(), stats, "model.embed_tokens.weight").cpu()
+    assert not torch.equal(merged, W0)
+    torch.testing.assert_close(merged, expected, rtol = 1e-5, atol = 1e-5)
