@@ -382,8 +382,7 @@ def get_chat_template_parts(tokenizer):
         except Exception:
             pass
 
-    # Last assistant header can differ from history ones (ERNIE-4.5-Thinking adds <think></think>);
-    # shrink the marker to the shared prefix so single-turn rows are not fully masked.
+    # Last assistant header may differ (ERNIE-4.5-Thinking <think></think>): use the shared prefix.
     _a_starts = starts(full, A)
     _resp_gaps = [full[e : min(s for s in _a_starts if s >= e)] for e in ends(full, U) if any(s >= e for s in _a_starts)]
     _off = resp_gap.find(response_part) if response_part else -1
