@@ -751,17 +751,13 @@ def test_collect_all_linear_target_names_finds_qkv_and_moe():
     from unsloth_zoo.mlx_loader import _collect_all_linear_target_names, _is_mlx_lora_base
     import mlx.nn as nn
 
-    # Prove the prerequisite BEFORE asserting on the output. If a plain Linear is not a
-    # LoRA base, the helper returns nothing no matter how correct it is; that is a broken
-    # environment, not dropped targeting, and it must not be reported as one.
+    # If a plain Linear is not a LoRA base the helper returns [] regardless: a broken env, not a regression.
     try:
         linear_is_base = _is_mlx_lora_base(nn.Linear(4, 4))
     except Exception as exc:  # noqa: BLE001 - mirrors the helper's own blanket catch
         pytest.skip(f"MLX LoRA base types unavailable ({exc!r}); the helper would return [] "
                     f"for a reason unrelated to all-linear targeting")
-    # A degraded-environment condition, not a regression, so it SKIPS. Failing here would
-    # redden CI for a partial or stubbed MLX that says nothing about whether all-linear
-    # targeting is correct -- which is the bug this whole guard had.
+    # Skip, not fail: a stubbed MLX says nothing about all-linear targeting (the bug this guard had).
     if not linear_is_base:
         pytest.skip("mlx.nn.Linear is not a LoRA base here; a stand-in MLX left in "
                     "sys.modules by another test cannot exercise the walk")
