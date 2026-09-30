@@ -2386,6 +2386,26 @@ def test_copy_source_sidecars_follows_hf_snapshot_blob_links(tmp_path):
     assert (dst / "chat_template.jinja").read_text(encoding="utf-8") == "template"
 
 
+def test_copy_source_sidecars_follows_shared_hf_blob_store(tmp_path):
+    # huggingface_hub >= 1.32: snapshot -> models--*/blobs/<etag> -> <cache>/blobs/<xx>/<hash>.
+    import unsloth_zoo.mlx.utils as mutils
+
+    shared = tmp_path / "blobs" / "91" / "91bf"
+    shared.parent.mkdir(parents=True)
+    shared.write_bytes(b"sentencepiece")
+    repo = tmp_path / "models--org--name"
+    (repo / "blobs").mkdir(parents=True)
+    (repo / "blobs" / "etag").symlink_to(shared)
+    snapshot = repo / "snapshots" / "sha"
+    snapshot.mkdir(parents=True)
+    (snapshot / "tokenizer.model").symlink_to(repo / "blobs" / "etag")
+    dst = tmp_path / "dst"
+    dst.mkdir()
+
+    assert mutils._copy_source_sidecars(snapshot, dst) == 1
+    assert (dst / "tokenizer.model").read_bytes() == b"sentencepiece"
+
+
 def test_copy_source_sidecars_ignores_non_directory_source(tmp_path):
     import unsloth_zoo.mlx.utils as mutils
 

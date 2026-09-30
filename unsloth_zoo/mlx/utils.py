@@ -18034,6 +18034,8 @@ def _asset_link_stays_in_the_model(file, source):
         for parent in (source, *source.parents):
             if parent.name == "snapshots":
                 roots.append(parent.parent)
+                # huggingface_hub >= 1.32 shares Xet blobs cache-wide in <cache>/blobs.
+                roots.append(parent.parent.parent / "blobs")
                 break
         target = file.resolve()
         return any(target.is_relative_to(root) for root in roots)
