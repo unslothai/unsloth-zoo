@@ -325,6 +325,21 @@ def test_extract_rejects_chained_symlink_escape(tmp_path, monkeypatch, data_filt
 
 
 @pytest.mark.skipif(not IS_POSIX, reason = "symlink extraction (POSIX)")
+def test_extract_without_data_filter_rejects_hardlink_alias_of_symlink(tmp_path, monkeypatch):
+    monkeypatch.delattr(tarfile, "data_filter", raising = False)
+    evil = tmp_path / "evil-alias.tar.gz"
+    out = tmp_path / "stage" / "out"
+    out.parent.mkdir()
+    with tarfile.open(evil, "w:gz") as tar:
+        _add_link(tar, "dir/sym", "..")
+        _add_link(tar, "alias", "dir/sym", link_type = tarfile.LNKTYPE)
+        _add_file(tar, "alias/pwned.txt", "pwned")
+    with pytest.raises(RuntimeError, match = "goes through a link"):
+        llama_cpp._extract_archive(str(evil), str(out))
+    assert not (out.parent / "pwned.txt").exists()
+
+
+@pytest.mark.skipif(not IS_POSIX, reason = "symlink extraction (POSIX)")
 def test_extract_without_data_filter_keeps_library_symlinks(tmp_path, monkeypatch):
     monkeypatch.delattr(tarfile, "data_filter", raising = False)
     archive = tmp_path / "libs.tar.gz"

@@ -1288,9 +1288,9 @@ def _extract_archive(archive_path, extract_dir):
             members = archive.getmembers()
             for member in members: _check_tar_member(member)
             if not tar_kwargs:
-                # No filter: refuse paths through this archive's own symlinks, the
-                # only way a later member escapes a tree that passed the pass above.
-                links = {os.path.normpath(m.name) for m in members if m.issym()}
+                # No filter: refuse paths through this archive's own links (a hardlink
+                # can alias a symlink), the only way a later member escapes the pass above.
+                links = {os.path.normpath(m.name) for m in members if m.issym() or m.islnk()}
                 for member in members:
                     for path in [member.name] + ([member.linkname] if member.islnk() else []):
                         parts = path.split("/")
