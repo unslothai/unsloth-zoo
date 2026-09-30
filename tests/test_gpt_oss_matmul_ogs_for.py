@@ -14,11 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""_matmul_ogs_for must resolve a triton_kernels copy for a dense torch.Tensor expert stack.
-
-The still-packed Mxfp4GptOssExperts (blocks/scales kept, gate_up_proj / down_proj decoded per
-call) hands matmul_ogs a plain torch.Tensor. Deriving the package from type(weight).__module__
-gave "torch.matmul_ogs" and every native-MXFP4 training step died in the grad path."""
+"""Dense torch.Tensor expert weights must not resolve to "torch.matmul_ogs" (broke native MXFP4 training)."""
 import sys
 import types
 
