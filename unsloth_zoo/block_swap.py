@@ -258,6 +258,12 @@ class BlockSwap:
                 self.handles.append(layer._register_state_dict_hook(self._state_dict(i)))
 
             self._pack()
+            total = self.host_bytes()
+            if self.pinned_bytes < total:
+                # Pageable copies run at a fraction of pinned bandwidth (5-7 vs 55 GB/s measured) and cannot hide.
+                print(f"Unsloth: block_swap pinned {self.pinned_bytes / 2**30:.1f} of {total / 2**30:.1f} GiB of host "
+                      "memory; the rest is copied from pageable memory, several times slower. Free host RAM "
+                      "or lower block_swap_layers for full speed.")
 
             sigs = [b.sig for b in self.blocks]
             for sig in set(sigs):

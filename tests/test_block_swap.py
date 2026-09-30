@@ -440,6 +440,21 @@ def test_host_copies_are_pinned_in_place_at_their_exact_size():
     assert not arena.is_pinned(), "remove() unregisters the arena"
 
 
+def test_partial_pinning_is_announced(capsys):
+    if not torch.cuda.is_available():
+        print("[SKIP] CUDA not available")
+        return
+    budget = _mod._pin_budget
+    _mod._pin_budget = lambda: 0
+    try:
+        sw = BlockSwap(_linear_tail(), 3, prefetch_depth = 1)
+    finally:
+        _mod._pin_budget = budget
+    assert sw.pinned_bytes == 0
+    assert "block_swap pinned 0.0 of" in capsys.readouterr().out
+    sw.remove()
+
+
 def test_chunked_fallback_when_registration_is_unavailable():
     if not torch.cuda.is_available():
         print("[SKIP] CUDA not available")
