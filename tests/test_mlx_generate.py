@@ -1580,3 +1580,22 @@ def test_cache_layout_tells_quantized_packings_apart():
     assert _cache_layout(cache(8, 64)) == _cache_layout(cache(8, 64))
     assert _cache_layout(cache(8, 64)) != _cache_layout(cache(4, 64))
     assert _cache_layout(cache(8, 64)) != _cache_layout(cache(8, 32))
+
+
+def test_row_quantizer_starts_uniform_rows_at_the_first_token():
+    from unsloth_zoo.mlx.generate import _row_quantizer
+
+    class BatchGenerator:
+        def __init__(self, model, kv_bits=None, kv_group_size=64, kv_quant_scheme="uniform", quantized_kv_start=5000):
+            pass
+
+    module = types.SimpleNamespace(
+        BatchGenerator=BatchGenerator,
+        maybe_quantize_kv_cache=lambda *a, **k: None,
+        turboquant_enabled=lambda bits, scheme=None: scheme == "turboquant" or float(bits) != int(bits),
+    )
+    assert _row_quantizer(module, {}) is None
+    uniform = _row_quantizer(module, {"kv_bits": 4})
+    assert uniform.keywords == {"kv_group_size": 64, "quantized_kv_start": 0, "kv_bits": 4}
+    turbo = _row_quantizer(module, {"kv_bits": 3.5, "kv_quant_scheme": "turboquant"})
+    assert turbo.keywords["quantized_kv_start"] == 5000
