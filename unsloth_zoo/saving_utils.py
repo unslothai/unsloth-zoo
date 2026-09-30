@@ -915,6 +915,26 @@ pass
 # it cannot drift from the table above.
 _SAFETENSORS_DTYPE_NAMES = {v : k for k, v in SAFETENSORS_DTYPES.items()}
 
+def _get_bias_overrides(biases, safetensor_keys, model_class_name):
+    if not biases: return {}
+    # Reuse module-name remapping, including when a bias and its weight live in
+    # different shards. These aliases are only for lookup, never written to disk.
+    bias_keys = [key for key in safetensor_keys if key.endswith(".bias")]
+    if not bias_keys: return {}
+    converted = _convert_lora_keys_to_safetensor_format(
+        biases, [key[:-len(".bias")] + ".weight" for key in bias_keys],
+        model_class_name = model_class_name,
+    )
+    overrides = {}
+    for key in bias_keys:
+        module_key = key[:-len(".bias")]
+        bias = converted.get(module_key)
+        if bias is None and module_key.endswith(".linear"):
+            bias = converted.get(module_key[:-len(".linear")])
+        if bias is not None: overrides[key] = bias
+    return overrides
+pass
+
 @torch.inference_mode
 def _merge_and_overwrite_lora(
     save_directory,
@@ -929,6 +949,7 @@ def _merge_and_overwrite_lora(
     tie_word_embeddings = False,
     weight_block_size = None,
     use_dequant_base = False,
+    biases = None,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Merges LoRA and overwrites the safetensors file it was merged to
@@ -939,6 +960,7 @@ def _merge_and_overwrite_lora(
         return _merge_and_overwrite_lora_mxfp4(
             save_directory, filename, lora_weights, output_dtype,
             model_class_name, base_model_is_quantized, quant_type,
+            biases = biases,
         )
     pass
 
@@ -956,6 +978,7 @@ def _merge_and_overwrite_lora(
             save_directory, filename, lora_weights, output_dtype,
             model_class_name, tie_word_embeddings = tie_word_embeddings,
             weight_block_size = weight_block_size,
+            biases = biases,
         )
     pass
 
@@ -989,6 +1012,7 @@ def _merge_and_overwrite_lora(
         with safe_open(filename_original, framework = "pt", device = "cpu") as file:
             safetensor_keys = list(file.keys())
             safetensor_keys_seen.update(safetensor_keys)
+            bias_overrides = _get_bias_overrides(biases, safetensor_keys, model_class_name)
 
             # Pre-compute number of experts per layer prefix from shard keys
             moe_num_experts = {}
@@ -1187,6 +1211,7 @@ def _merge_and_overwrite_lora(
                 # Standard 16-bit tensor
                 W = file.get_tensor(key)
                 W_original_dtype = W.dtype
+                W = bias_overrides.get(key, W)
 
                 if W is None:
                     continue
@@ -2428,7 +2453,7 @@ pass
 
 
 @torch.inference_mode
-def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, output_dtype, model_class_name, base_model_is_quantized=False, quant_type=None):
+def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, output_dtype, model_class_name, base_model_is_quantized=False, quant_type=None, biases=None):
     # All Unsloth Zoo code licensed under LGPLv3
     # Merges LoRA and overwrites the safetensors file it was merged to
     filename_original = os.path.join(save_directory, filename)  # Original file path
@@ -2450,6 +2475,7 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
     with safe_open(filename_original, framework = "pt", device = "cpu") as file: # Open original file for reading
         safetensor_keys = list(file.keys())
         safetensor_keys_seen.update(safetensor_keys)
+        bias_overrides = _get_bias_overrides(biases, safetensor_keys, model_class_name)
 
         # Update converted_lora_weights with actual safetensor keys
         converted_lora_weights = _convert_lora_keys_to_safetensor_format(
@@ -2574,6 +2600,7 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
                 W = file.get_tensor(key)
 
 
+            W = bias_overrides.get(output_key, W)
             lora_key = output_key[:-len(".weight")] if output_key.endswith(".weight") else output_key
             lora_stats = converted_lora_weights.get(lora_key, None)
             # Gemma4 ClippableLinear (.linear.weight -> .weight), mirror the standard merge loop
@@ -2932,7 +2959,7 @@ def _drop_resolved_fp8_scales_after_rewrite(save_directory, filenames, prerewrit
     return removed
 pass
 
-def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output_dtype, model_class_name, tie_word_embeddings = False, weight_block_size = None):
+def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output_dtype, model_class_name, tie_word_embeddings = False, weight_block_size = None, biases = None):
     # All Unsloth Zoo code licensed under LGPLv3
     # Dequantize FP8 to 16bit, merge LoRA, drop scales, atomically rewrite the shard.
     filename_original = os.path.join(save_directory, filename)
@@ -2944,6 +2971,7 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
     with safe_open(filename_original, framework = "pt", device = "cpu") as file:
         safetensor_keys = list(file.keys())
         safetensor_keys_seen.update(safetensor_keys)
+        bias_overrides = _get_bias_overrides(biases, safetensor_keys, model_class_name)
 
         # Read the header to skip scale companions without a tensor read. Read-only: the merge
         # writes a temp file and os.replace()s it, so no write handle is needed (and "r+b"
@@ -3065,6 +3093,7 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
             # Dequantized FP8 or LoRA-merged tensors take output_dtype; untouched non-FP8
             # buffers (int64/bool/fp32, e.g. inv_freq) keep their dtype, as the in-place path does.
             write_dtype = output_dtype if (was_fp8 or merged) else W.dtype
+            W = bias_overrides.get(output_key, W)
             tensors[output_key] = W.to(device = "cpu", dtype = write_dtype).contiguous()
             del W
             if tensors[output_key].numel() * tensors[output_key].element_size() >= _EMPTY_CACHE_BYTES_THRESHOLD:
@@ -5298,6 +5327,11 @@ def merge_and_overwrite_lora(
         if _add_keys_to_index(save_directory, _seeded_head_keys) and push_to_hub:
             upload_items("model.safetensors.index.json")
 
+    # The normalized state_dict also contains biases outside LoRA targets (bias="all").
+    biases = defaultdict(lambda: None, {
+        key[:-len(".bias")] : value for key, value in state_dict.items()
+        if key.endswith(".bias") and isinstance(value, torch.Tensor)
+    })
     for filename in ProgressBar(final_safetensors_list, desc=f'Unsloth: Merging weights into {"mxfp4" if save_method=="mxfp4" else "16bit"}'):
         if _mxfp4_rewrite is not None:
             _rewrite_compressed_mxfp4_shard(save_directory, filename, _mxfp4_rewrite, output_dtype)
@@ -5316,6 +5350,7 @@ def merge_and_overwrite_lora(
             tie_word_embeddings = _merge_tie_word_embeddings,
             weight_block_size = _merge_weight_block_size,
             use_dequant_base = _use_dequant_base,
+            biases = biases,
         )
         n_saved_modules += merged_count
         safetensor_keys_seen.update(shard_keys)
