@@ -382,6 +382,25 @@ def get_chat_template_parts(tokenizer):
         except Exception:
             pass
 
+    # Some templates give the LAST assistant turn a different header than history turns
+    # (ERNIE-4.5-Thinking: history "assistant\n<response>\n", last "assistant\n<think>\n\n</think>\n<response>\n").
+    # The gap mode is then the history header, which a single-turn row never contains, so every
+    # such row is masked away. Shorten the marker to what every turn shares, cut back to a
+    # whitespace / special-token boundary, and only if it cannot match the assistant-to-user gap.
+    _a_starts = starts(full, A)
+    _resp_gaps = [full[e : min(s for s in _a_starts if s >= e)] for e in ends(full, U) if any(s >= e for s in _a_starts)]
+    _off = resp_gap.find(response_part) if response_part else -1
+    if _resp_gaps and _off != -1 and response_part not in _resp_gaps[-1] and _resp_gaps[-1].startswith(resp_gap[:_off]):
+        a_, b_ = resp_gap[_off:], _resp_gaps[-1][_off:]
+        k = 0
+        while k < min(len(a_), len(b_)) and a_[k] == b_[k]:
+            k += 1
+        while k > 0 and not a_[k - 1].isspace() and not any(a_[:k].endswith(s) for s in specials):
+            k -= 1
+        shared = a_[:k]
+        if shared.strip() and shared not in instr_gap and all(shared in g for g in _resp_gaps):
+            response_part = shared
+
     # Only strip whitespace from header markers: do NOT strip bos here, since for some
     # tokenizers bos doubles as the turn opener (e.g. SmolLM2 bos == <|im_start|>) and
     # stripping it would leave an unanchored marker that matches inside user content.
@@ -2117,15 +2136,19 @@ def train_on_responses_only(
     if _pads_through_a_processor(getattr(trainer, "data_collator", None)):
         _refuse_packing_that_will_not_happen(trainer.data_collator, None)
 
+    # Map both splits before assigning either: a raise on eval_dataset must not leave
+    # train_dataset already masked + filtered, since a retry with other markers would
+    # intersect with those stale labels and mask everything.
+    _new_train = _new_eval = None
     if hasattr(trainer, "train_dataset") and trainer.train_dataset is not None:
         if not hasattr(trainer.train_dataset, "map"):
             raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
-        trainer.train_dataset = _maybe_tokenize_dataset(trainer.train_dataset)
-        if isinstance(trainer.train_dataset, IterableDataset):
-            trainer.train_dataset = trainer.train_dataset.map(_train_on_responses_only, batch_size = _iterable_batch_size(trainer.train_dataset), batched = True)
+        _new_train = _maybe_tokenize_dataset(trainer.train_dataset)
+        if isinstance(_new_train, IterableDataset):
+            _new_train = _new_train.map(_train_on_responses_only, batch_size = _iterable_batch_size(_new_train), batched = True)
         else:
-            trainer.train_dataset = trainer.train_dataset.map(_train_on_responses_only, batched = True, num_proc = _effective_num_proc(trainer.train_dataset))
-        trainer.train_dataset = _filter_fully_masked(trainer.train_dataset, "train_dataset")
+            _new_train = _new_train.map(_train_on_responses_only, batched = True, num_proc = _effective_num_proc(_new_train))
+        _new_train = _filter_fully_masked(_new_train, "train_dataset")
     pass
 
     if hasattr(trainer, "eval_dataset") and trainer.eval_dataset is not None:
@@ -2133,25 +2156,35 @@ def train_on_responses_only(
         # isinstance: `type(...) is dict` sent it down the single-dataset path,
         # where column_names is a dict of splits and every per-split step no-ops.
         if isinstance(trainer.eval_dataset, dict):
+            _new_eval = {}
             for key, value in trainer.eval_dataset.items():
                 if not hasattr(value, "map"):
                     raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
                 value = _maybe_tokenize_dataset(value)
                 if isinstance(value, IterableDataset):
-                    trainer.eval_dataset[key] = value.map(_train_on_responses_only, batch_size = _iterable_batch_size(value), batched = True)
+                    value = value.map(_train_on_responses_only, batch_size = _iterable_batch_size(value), batched = True)
                 else:
-                    trainer.eval_dataset[key] = value.map(_train_on_responses_only, batched = True, num_proc = _effective_num_proc(value))
-                trainer.eval_dataset[key] = _filter_fully_masked(trainer.eval_dataset[key], f"eval_dataset[{key}]")
+                    value = value.map(_train_on_responses_only, batched = True, num_proc = _effective_num_proc(value))
+                _new_eval[key] = _filter_fully_masked(value, f"eval_dataset[{key}]")
         else:
             if not hasattr(trainer.eval_dataset, "map"):
                 raise TypeError("Unsloth: train_on_responses_only does not work on lists!")
-            trainer.eval_dataset = _maybe_tokenize_dataset(trainer.eval_dataset)
-            if isinstance(trainer.eval_dataset, IterableDataset):
-                trainer.eval_dataset = trainer.eval_dataset.map(_train_on_responses_only, batch_size = _iterable_batch_size(trainer.eval_dataset), batched = True)
+            _new_eval = _maybe_tokenize_dataset(trainer.eval_dataset)
+            if isinstance(_new_eval, IterableDataset):
+                _new_eval = _new_eval.map(_train_on_responses_only, batch_size = _iterable_batch_size(_new_eval), batched = True)
             else:
-                trainer.eval_dataset = trainer.eval_dataset.map(_train_on_responses_only, batched = True, num_proc = _effective_num_proc(trainer.eval_dataset))
-            trainer.eval_dataset = _filter_fully_masked(trainer.eval_dataset, "eval_dataset")
+                _new_eval = _new_eval.map(_train_on_responses_only, batched = True, num_proc = _effective_num_proc(_new_eval))
+            _new_eval = _filter_fully_masked(_new_eval, "eval_dataset")
         pass
+    pass
+    if _new_train is not None:
+        trainer.train_dataset = _new_train
+    if _new_eval is not None:
+        if isinstance(_new_eval, dict) and isinstance(trainer.eval_dataset, dict):
+            for key, value in _new_eval.items():
+                trainer.eval_dataset[key] = value
+        else:
+            trainer.eval_dataset = _new_eval
     pass
 
     # Edit data collator to DataCollatorForSeq2Seq. Collators that rebuild labels
