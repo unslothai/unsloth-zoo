@@ -494,6 +494,38 @@ def test_vlm_stream_turboquant_rows_quantize_their_own_cache_as_a_single_decode_
 
 
 @metal_only
+def test_vlm_stream_prefills_a_short_arrival_ahead_of_a_long_prefill_bitwise():
+    from mlx_vlm import load
+    from mlx_vlm.prompt_utils import apply_chat_template
+    from unsloth_zoo.mlx.generate import BatchStream, GenerationDefaults, GenerationRequest
+    model, processor = load(VLM_MODEL)
+    model._is_vlm_model = True
+    rules = " ".join(f"Rule {i}: answer tersely." for i in range(700))
+    long = GenerationRequest(prompt=apply_chat_template(processor, model.config, f"{rules} Name a colour.", num_images=0))
+    short = GenerationRequest(prompt=apply_chat_template(processor, model.config, "Name a fruit.", num_images=0))
+    defaults = GenerationDefaults(max_tokens=4, prefill_batch_size=1, completion_batch_size=4)
+
+    def run(*requests):
+        with BatchStream(model, processor, defaults=defaults) as stream:
+            rows, results, first = [stream.add(requests[0])], {}, []
+            while len(results) < len(requests):
+                for e in stream.step():
+                    first += [e.index] if e.index not in first else []
+                    if e.result is not None:
+                        results[e.index] = e.result
+                if len(rows) < len(requests):  # after the long row's first chunk
+                    rows.append(stream.add(requests[1]))
+        return [results[row] for row in rows], [rows.index(index) for index in first]
+
+    (alone_long,), _ = run(long)
+    (alone_short,), _ = run(short)
+    (got_long, got_short), order = run(long, short)
+    assert got_long.prompt_token_count > 3 * 2048 and order == [1, 0]
+    for got, alone in ((got_long, alone_long), (got_short, alone_short)):
+        assert (got.token_ids[0], got.logprobs[0]) == (alone.token_ids[0], alone.logprobs[0])
+
+
+@metal_only
 def test_vlm_stop_strings_cut_generation_through_the_public_path():
     from PIL import Image
     from mlx_vlm import load

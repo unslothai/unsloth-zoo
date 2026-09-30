@@ -2155,6 +2155,28 @@ def _slice_row_inputs(batch_module, prompt_kwargs: dict, length: int, start: int
     return sliced
 
 
+_PREFILL_SLOTS = ("_prompt_batch", "_unprocessed_sequences", "_generation_batch", "completion_batch_size")
+
+
+def _schedules_prefill(generator, defaults) -> bool:
+    return (
+        defaults.prefill_batch_size == 1
+        and getattr(generator, "apc", None) is None
+        and all(hasattr(generator, name) for name in _PREFILL_SLOTS)
+    )
+
+
+def _prompt_tokens_left(batch) -> int | None:
+    embeds = getattr(batch, "_inputs_embeds", None)
+    return None if embeds is None else int(embeds.shape[1])
+
+
+def _queued_tokens_left(sequence) -> int:
+    # Media can expand past its placeholder ids, so count what the prefill will run.
+    embeds = (sequence[3] or {}).get("inputs_embeds")
+    return len(sequence[1]) if embeds is None else int(embeds.shape[1])
+
+
 def _row_prefill_batch_class(base):
     """``base`` that prefills a row carrying ``_ROW_PREFILL_KEY`` into the row's own cache.
 
@@ -2952,6 +2974,7 @@ class _VLMBatchSession:
         self._row_signature = None
         self._cache_layout = None
         self._banked = 0
+        self._parked: list = []
         self._pending: dict[int, _PendingResult] = {}
         self._row_of: dict[int, int] = {}
         self._uid_of: dict[int, int] = {}
@@ -2964,6 +2987,7 @@ class _VLMBatchSession:
         except BaseException:
             self._stack.close()
             raise
+        self._schedules_prefill = _schedules_prefill(self.generator, adapter.defaults)
 
     @property
     def rows_in_flight(self) -> int:
@@ -3185,6 +3209,8 @@ class _VLMBatchSession:
         if not self._pending:
             return
         try:
+            if self._schedules_prefill:
+                self._schedule_prefill()
             if not self.generator.has_work:
                 raise RuntimeError(
                     "mlx-vlm ended its event stream before every request "
@@ -3201,7 +3227,40 @@ class _VLMBatchSession:
             self.usable = False
             raise
 
+    def _schedule_prefill(self) -> None:
+        """Run the prefill with the fewest prompt tokens left, queued rows included.
+
+        mlx-vlm runs one prompt batch to its end, so a short request waits out every long
+        prefill admitted before it. A batch is parked only between steps, so each row still
+        prefills in its own chunks; one parked as often as there are slots runs to its end.
+        """
+        generator, parked = self.generator, self._parked
+        current = generator._prompt_batch
+        cap = generator.completion_batch_size
+        parks = lambda batch: getattr(batch, "_unsloth_parks", 0)
+        live = [batch for batch in (*parked, current) if batch is not None]
+        left = {id(batch): _prompt_tokens_left(batch) for batch in live}
+        if None in left.values():
+            return
+        best = min(live, key = lambda batch: (parks(batch) < cap, left[id(batch)]), default = None)
+        queued = generator._unprocessed_sequences
+        # mlx-vlm admits by the rows decoding alone, so parked rows must still fit.
+        room = cap - len(generator._generation_batch) - len(live)
+        if queued and room > 0 and (
+            best is None or (parks(best) < cap and _queued_tokens_left(queued[0]) < left[id(best)])
+        ):
+            best = None
+        if best is current:
+            return
+        if current is not None:
+            current._unsloth_parks = parks(current) + 1
+            parked.append(current)
+        if best is not None:
+            parked.remove(best)
+        generator._prompt_batch = best
+
     def close(self):
+        self._parked.clear()
         closer = getattr(self.generator, "close", None)
         try:
             if callable(closer):
@@ -3296,6 +3355,10 @@ class _VLMBatchSession:
 
     def _withdraw(self, uid: int) -> bool:
 
+        for batch in self._parked:
+            if uid in batch.uids:
+                self._parked.remove(batch)
+                return True
         if self.adapter.cancel is None:
             return False
         return self.adapter.cancel(self.generator, uid) is not False
