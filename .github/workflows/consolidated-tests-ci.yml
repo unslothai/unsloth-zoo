@@ -1194,6 +1194,7 @@ jobs:
                   tests/test_fix_untrained_tokens_composite_models.py \
                   tests/test_gemma4_dtype_drift_guards.py \
                   tests/test_gemma4_unified_forced_float32.py \
+                  tests/test_gemma3_processor_token_type_ids.py \
                   tests/test_fp16_path_tiny_models.py >> "$log" 2>&1 || trc=$?
                 echo "$trc" > ".lanes/$id.tests"
               else
