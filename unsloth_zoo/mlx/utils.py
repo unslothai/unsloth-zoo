@@ -18156,7 +18156,8 @@ def _save_vlm_processor_assets(processor, path, sources=()):
             copy_assets(source, source_only=True)
             config = source / "config.json"
             target = path / "config.json"
-            if config.is_file() and not valid_asset(target):
+            if (config.is_file() and not valid_asset(target)
+                    and _asset_link_stays_in_the_model(config, source)):
                 json.loads(config.read_text())
                 shutil.copy2(config, target)
         except Exception as error:

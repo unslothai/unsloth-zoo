@@ -2406,6 +2406,44 @@ def test_copy_source_sidecars_follows_shared_hf_blob_store(tmp_path):
     assert (dst / "tokenizer.model").read_bytes() == b"sentencepiece"
 
 
+def test_a_config_symlink_out_of_the_model_is_not_recovered(tmp_path):
+    from unsloth_zoo.mlx.utils import _save_vlm_processor_assets
+
+    secret = tmp_path / "docker_config.json"
+    secret.write_text('{"auths": {"x": "SECRET"}}')
+    src = tmp_path / "model"; src.mkdir()
+    (src / "config.json").symlink_to(secret)
+    out = tmp_path / "out"; out.mkdir()
+
+    class _P:
+        def save_pretrained(self, directory):
+            Path(directory, "tokenizer_config.json").write_text("{}")
+
+    _save_vlm_processor_assets(_P(), out, (str(src),))
+    assert not (out / "config.json").exists()
+
+
+def test_a_config_override_dir_falls_back_to_the_snapshot_config(tmp_path):
+    # The VLM config override dir links unpatched files back to the snapshot.
+    from unsloth_zoo.mlx.utils import _save_vlm_processor_assets
+
+    repo = tmp_path / "models--org--name"
+    blobs = repo / "blobs"; blobs.mkdir(parents=True)
+    snapshot = repo / "snapshots" / "abc123"; snapshot.mkdir(parents=True)
+    (blobs / "deadbeef").write_text('{"model_type": "real"}')
+    (snapshot / "config.json").symlink_to(blobs / "deadbeef")
+    override = tmp_path / "unsloth_mlx_vlm_config_x"; override.mkdir()
+    (override / "config.json").symlink_to(snapshot / "config.json")
+    out = tmp_path / "out"; out.mkdir()
+
+    class _P:
+        def save_pretrained(self, directory):
+            Path(directory, "tokenizer_config.json").write_text("{}")
+
+    _save_vlm_processor_assets(_P(), out, (str(override), str(snapshot)))
+    assert (out / "config.json").read_text() == '{"model_type": "real"}'
+
+
 def test_copy_source_sidecars_ignores_non_directory_source(tmp_path):
     import unsloth_zoo.mlx.utils as mutils
 

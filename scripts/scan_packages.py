@@ -1461,8 +1461,18 @@ _RE_INDEX_SPEC = re.compile(
     r"[\s()<>=!~*+,.A-Za-z0-9_-]*$"
 )
 _LOCAL_ARCHIVE_SUFFIXES = (
-    ".whl", ".zip", ".tar", ".gz", ".tgz", ".bz2", ".tbz",
-    ".xz", ".txz", ".lz", ".tlz", ".lzma",
+    ".whl",
+    ".zip",
+    ".tar",
+    ".tar.gz",
+    ".tgz",
+    ".tar.bz2",
+    ".tbz",
+    ".tar.xz",
+    ".txz",
+    ".tlz",
+    ".tar.lz",
+    ".tar.lzma",
 )
 
 

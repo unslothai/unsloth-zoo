@@ -9617,14 +9617,20 @@ class MLXTrainer:
                 _save_vlm_processor_assets(_processor, output_dir, sources)
             else:
                 self.tokenizer.save_pretrained(output_dir)
-                src_path = next((source for source in sources if source is not None), None)
-                if src_path is not None:
-                    import shutil
-                    from pathlib import Path
+                import shutil
+                from pathlib import Path
+                from .utils import _asset_link_stays_in_the_model
+                dst_config = Path(output_dir) / "config.json"
+                for src_path in sources:
+                    if src_path is None:
+                        continue
+                    # A config override dir links unpatched files back to the snapshot,
+                    # so a refused link falls through to the next source.
                     src_config = Path(src_path) / "config.json"
-                    dst_config = Path(output_dir) / "config.json"
-                    if src_config.exists() and not dst_config.exists():
-                        shutil.copy(str(src_config), str(dst_config))
+                    if src_config.exists() and _asset_link_stays_in_the_model(src_config, src_path):
+                        if not dst_config.exists():
+                            shutil.copy(str(src_config), str(dst_config))
+                        break
 
             print(f"Unsloth: LoRA adapters saved to {output_dir}")
         else:
