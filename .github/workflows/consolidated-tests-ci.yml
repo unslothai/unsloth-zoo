@@ -443,6 +443,7 @@ jobs:
             tests/test_mlx_preference.py \
             tests/test_mlx_trainer_internals.py \
             tests/test_mlx_arrays_cache_advance.py \
+            tests/test_prepare_model_for_training_embedding_lora.py \
             tests/test_mlx_quantized_optimizer_routing.py \
             tests/test_mlx_embedding_guards.py \
             tests/test_fp16_emulation.py \
