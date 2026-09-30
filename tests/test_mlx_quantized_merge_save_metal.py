@@ -191,7 +191,8 @@ def test_push_to_hub_merged_does_not_quantize():
     )
 
 
-def test_merged_16bit_unpacks_hadamard_layers_to_the_dense_layers_they_compute(tmp_path):
+@pytest.mark.parametrize("config_on", ["_config", "config"])
+def test_merged_16bit_unpacks_hadamard_layers_to_the_dense_layers_they_compute(tmp_path, config_on):
     pack = pytest.importorskip("mlx_vlm.models.prism_hadamard_qwen35.prism_hadamard_qwen35")
     from unsloth_zoo.mlx.utils import LoRAHadamardLinear, save_merged_model
     mx.random.seed(5)
@@ -215,9 +216,13 @@ def test_merged_16bit_unpacks_hadamard_layers_to_the_dense_layers_they_compute(t
     want = forward()
     with pytest.raises(ValueError, match="merged_16bit"):
         adapted.fuse(dequantize=False)
-    model._config = {"model_type": "prism_hadamard_qwen35", "base_model_type": "qwen3_5", "modules": [],
-                     "quantization": {"bits": 2, "group_size": 128, "mode": "affine"},
-                     "text_config": {"hidden_size": 1024}, "image_token_id": 7}
+    config = {"model_type": "prism_hadamard_qwen35", "base_model_type": "qwen3_5", "modules": [],
+              "quantization": {"bits": 2, "group_size": 128, "mode": "affine"},
+              "text_config": {"hidden_size": 1024}, "image_token_id": 7}
+    if config_on == "_config":
+        model._config = config
+    else:  # mlx_vlm.load exposes it on `model.config` only
+        model.config = type("Config", (), {"to_dict": lambda self: dict(config)})()
     save_merged_model(model, type("Tokenizer", (), {"save_pretrained": lambda self, path: None})(),
                       tmp_path, dequantize=True)
     assert json.loads((tmp_path / "config.json").read_text()) == {

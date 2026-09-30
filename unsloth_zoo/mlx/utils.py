@@ -18550,7 +18550,8 @@ def save_merged_model(model, tokenizer, path, dequantize=False,
     if dequantize:
         unpacked = _unpack_hadamard_modules(model)
         model = dequantize_model(model)
-        cfg = getattr(model, "_config", None)
+        # Rewrite what is saved: it may resolve from `model.config` or `model.args`.
+        cfg = _get_model_config(model)
         if isinstance(cfg, dict):
             model._config = _strip_mlx_quantization_metadata(cfg)
             if unpacked:
