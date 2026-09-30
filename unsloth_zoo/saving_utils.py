@@ -720,8 +720,7 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
             expand_module_keys(name, module, remove_keys)
 
         elif name.endswith((".lora_embedding_A", ".lora_embedding_B")) and "default" in module:
-            # PEFT Embedding delta is (B_e @ A_e).T = A_e.T @ B_e.T, i.e. Linear-form
-            # lora_B = A_e.T, lora_A = B_e.T. Keys are already removed via the parent LoRA layer.
+            # PEFT Embedding delta (B_e @ A_e).T == Linear form with lora_B = A_e.T, lora_A = B_e.T.
             key = name[:-len(".lora_embedding_A")]
             _embedding_lora_keys.add(key)
             if name.endswith("_A"):
@@ -806,8 +805,7 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
 
     # DoRA on a non-dense target (e.g. an Embedding / tied lm_head trained with
     # use_dora=True) captures a lora_magnitude_vector but no mergeable lora_A/lora_B
-    # (an embedding delta is read from lora_embedding_A/B above, but PEFT's embedding
-    # DoRA is not the Linear DoRA _merge_lora folds). _merge_lora only folds the magnitude onto W0+delta
+    # (embedding DoRA is not the Linear DoRA below). _merge_lora only folds the magnitude onto W0+delta
     # for a dense nn.Linear; here it would early-return the base weight and the
     # magnitude (and the embedding delta) would be silently dropped -- and since
     # assert_same_keys now ignores lora_magnitude_vector keys, that wrong merge would

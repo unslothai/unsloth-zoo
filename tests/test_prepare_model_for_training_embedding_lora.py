@@ -102,7 +102,6 @@ def test_embedding_lora_upcast_like_linear_lora():
 
 
 def test_merged_save_keeps_trained_embedding_lora():
-    # Now that embedding LoRA trains, the 16-bit merge must fold its delta too.
     from unsloth_zoo.saving_utils import create_lora_statistics, _merge_lora
 
     model = _tiny_lora_llama()
