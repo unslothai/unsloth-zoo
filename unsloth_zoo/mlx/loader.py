@@ -236,6 +236,12 @@ def _mlx_lora_type_specs(*, include_convolutions=False):
                 vlm_lora_module.LoRASwitchLinear,
             )
         )
+    from .utils import LoRAHadamardLinear, _hadamard_pack_module
+    pack = _hadamard_pack_module()
+    if pack is not None:
+        specs.append(_MLXLoRATypeSpec(
+            (pack.HadamardQuantizedLinear,), LoRAHadamardLinear,
+        ))
     if include_convolutions:
         from .utils import LoRAPointwiseConv2d
         specs.append(_MLXLoRATypeSpec((nn.Conv2d,), LoRAPointwiseConv2d))
@@ -260,12 +266,11 @@ def _check_mlx_lora_base(module):
         )
 
 
-def _mlx_lora_base_types():
-    return tuple(
-        base_type
-        for spec in _mlx_lora_type_specs()
-        for base_type in spec.base_types
-    ) + _mlx_bitlinear_types()
+def _is_mlx_lora_base(module, specs=None):
+    # BitLinear is found so that _check_mlx_lora_base can refuse it by name.
+    specs = _mlx_lora_type_specs() if specs is None else specs
+    return (_mlx_lora_spec_for_module(module, specs) is not None
+            or isinstance(module, _mlx_bitlinear_types()))
 
 
 def _mlx_quantized_switch_module_types():
@@ -483,9 +488,9 @@ def _collect_all_linear_target_names(model):
     """
     names = set()
     try:
-        linear_types = _mlx_lora_base_types()
+        specs = _mlx_lora_type_specs()
         for path, mod in model.named_modules():
-            if not isinstance(mod, linear_types):
+            if not _is_mlx_lora_base(mod, specs):
                 continue
             for token in reversed(str(path).split(".")):
                 if token and not token.isdigit():
@@ -7303,10 +7308,10 @@ def _set_child(parent, leaf, value):
 
 
 def _subtree_linears(module):
-    types = _mlx_lora_base_types()
+    specs = _mlx_lora_type_specs()
     return [
         (name, child) for name, child in module.named_modules()
-        if isinstance(child, types)
+        if _is_mlx_lora_base(child, specs)
     ]
 
 
@@ -7804,11 +7809,11 @@ def _resolve_lora_keys(model, target_modules):
     if not target_modules:
         return None
 
-    linear_types = _mlx_lora_base_types()
+    specs = _mlx_lora_type_specs()
     keys = set()
     for root in _mlx_language_layers(model):
         for name, module in root.named_modules():
-            if not isinstance(module, linear_types):
+            if not _is_mlx_lora_base(module, specs):
                 continue
             if _lora_name_matches_target(name, target_modules):
                 keys.add(name)
@@ -7872,10 +7877,9 @@ def _resolve_embedding_module(model):
 
 
 def _is_lora_capable_head(module):
-    """Whether mlx-lm's ``to_lora`` can wrap this head; it raises otherwise."""
-    import mlx.nn as nn
-    return hasattr(module, "to_lora") or isinstance(
-        module, (nn.Linear, nn.QuantizedLinear))
+    """Whether a LoRA wrapper can wrap this head; conversion raises otherwise."""
+    return hasattr(module, "to_lora") or _mlx_lora_spec_for_module(
+        module, _mlx_lora_type_specs()) is not None
 
 
 def _quantized_descendant_path(path, module):

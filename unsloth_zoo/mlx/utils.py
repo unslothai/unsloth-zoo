@@ -1913,11 +1913,17 @@ def _cce_head_ineligibility(desc):
     """Reason fused CCE must not run for this head, or None when eligible."""
     if desc.status == "unknown":
         return "unresolved output-head topology"
-    if not desc.raw:
+    if not desc.raw and not _is_hadamard_packed_linear(desc.module):
         return f"non-raw output-head wrapper ({desc.wrapper_type.__name__})"
     if desc.has_additive_bias:
         return "additive output-head bias"
     return None
+
+
+def _rotate_head_input(head, hidden):
+    if getattr(head, "block", 0) and _is_hadamard_packed_linear(head):
+        return _hadamard_pack_module().hadamard_transform(hidden, head.block, head.signs)
+    return hidden
 
 
 def _get_lm_head_layer(model):
@@ -2416,6 +2422,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
             hidden_flat, targets_flat = _compact_cce_inputs(
                 hidden_flat, targets_flat, cce_indices,
             )
+            hidden_flat = _rotate_head_input(layer, hidden_flat)
             loss = rt_cce(model)(hidden_flat, w, sc, bi, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
@@ -3955,6 +3962,7 @@ _VLM_QWEN_POSITION_MODEL_TYPES = frozenset({
     "qwen3_5",
     "qwen3_5_moe",
     "qwen4_exp",
+    "prism_hadamard_qwen35",
 })
 _VLM_POSITION_GENERATING_MODEL_TYPES = (
     _VLM_QWEN_POSITION_MODEL_TYPES | {"glm_ocr"}
@@ -4576,6 +4584,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
                 flat = indices[:, 0] * masked_targets.shape[1] + columns
                 flat = mx.where((columns >= 0) & (columns < masked_targets.shape[1]), flat, -1)
                 hidden_flat, targets_flat = _compact_cce_inputs(hidden_flat, targets_flat, flat)
+            hidden_flat = _rotate_head_input(lm_head, hidden_flat)
             loss = rt_cce(model)(hidden_flat, w, sc, bi, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
@@ -14685,6 +14694,110 @@ class LoRAPointwiseConv2d(nn.Module):
         return conv
 
 
+def _hadamard_pack_module():
+    """mlx-vlm's Hadamard-packed layer module (Ternary Bonsai 2), once loaded."""
+    module = sys.modules.get("mlx_vlm.models.prism_hadamard_qwen35.prism_hadamard_qwen35")
+    if isinstance(getattr(module, "HadamardQuantizedLinear", None), type):
+        return module
+    return None
+
+
+def _is_hadamard_packed_linear(module):
+    pack = _hadamard_pack_module()
+    # Exact type: the packed embedding subclasses the linear.
+    return pack is not None and type(module) is pack.HadamardQuantizedLinear
+
+
+def _hadamard_dense_weight(layer):
+    """The float32 dense weight a Hadamard-packed layer encodes, in the unrotated basis."""
+    weight = mx.dequantize(
+        layer.weight, layer.scales, layer.biases,
+        group_size=layer.group_size, bits=layer.bits, mode=layer.mode,
+    ).astype(mx.float32)
+    if layer.block:
+        weight = _hadamard_pack_module().hadamard_transform(
+            weight, layer.block, layer.signs, inverse=True,
+        )
+    return weight
+
+
+def _unpack_hadamard_modules(model):
+    pack = _hadamard_pack_module()
+    if pack is None:
+        return False
+    dense = []
+    for name, module in model.named_modules():
+        if not isinstance(module, pack.HadamardQuantizedLinear):
+            continue
+        weight = _hadamard_dense_weight(module).astype(module.scales.dtype)
+        rows, width = weight.shape
+        if isinstance(module, pack.HadamardQuantizedEmbedding):
+            layer = nn.Embedding(rows, width)
+        else:
+            layer = nn.Linear(width, rows, bias=False)
+        layer.weight = weight
+        dense.append((name, layer))
+    if dense:
+        model.update_modules(mlx.utils.tree_unflatten(dense))
+    return bool(dense)
+
+
+# Pack-only keys; with the layers unpacked the tree is plain mlx-vlm Qwen3.5.
+_HADAMARD_PACK_CONFIG_KEYS = frozenset({
+    "schema_version", "base_model_type", "tensor_namespace", "gdn_activation_layout",
+    "modules", "requires_runtime", "hadamard_config", "components",
+})
+
+
+def _dense_hadamard_pack_config(config):
+    config = {k: v for k, v in config.items() if k not in _HADAMARD_PACK_CONFIG_KEYS}
+    config["model_type"] = "qwen3_5"
+    # The pack ships no `architectures`; GGUF conversion dispatches on it.
+    config["architectures"] = ["Qwen3_5ForConditionalGeneration"]
+    return config
+
+
+class LoRAHadamardLinear(nn.Module):
+    """The base rotates its own input: the adapter reads the unrotated activation, fuse rotates back."""
+
+    @staticmethod
+    def supports(module):
+        return _is_hadamard_packed_linear(module)
+
+    @staticmethod
+    def from_base(linear, r=8, dropout=0.0, scale=20.0):
+        if not LoRAHadamardLinear.supports(linear):
+            raise ValueError("LoRA requires mlx-vlm's HadamardQuantizedLinear.")
+        output_dims, packed_dims = linear.weight.shape
+        input_dims = packed_dims * 32 // linear.bits
+        module = LoRAHadamardLinear()
+        module.linear = linear
+        module.dropout = nn.Dropout(p=dropout)
+        module.scale = scale
+        bound = 1 / math.sqrt(input_dims)
+        module.lora_a = mx.random.uniform(low=-bound, high=bound, shape=(input_dims, r))
+        module.lora_b = mx.zeros((r, output_dims))
+        return module
+
+    def __call__(self, x):
+        y = self.linear(x)
+        z = (self.dropout(x) @ self.lora_a) @ self.lora_b
+        return y + (self.scale * z).astype(x.dtype)
+
+    def fuse(self, dequantize=False):
+        if not dequantize:
+            raise ValueError(
+                "Unsloth: merging LoRA back into 2-bit Hadamard-packed weights discards the adapter. "
+                "Save with save_method='merged_16bit', or keep the LoRA adapter."
+            )
+        linear = self.linear
+        weight = _hadamard_dense_weight(linear) + (self.scale * self.lora_b.T) @ self.lora_a.T
+        output_dims, input_dims = weight.shape
+        fused = nn.Linear(input_dims, output_dims, bias=False)
+        fused.weight = weight.astype(linear.scales.dtype)
+        return fused
+
+
 def _extract_mlx_lora_parameters(model):
     """Extract global rank, scale, and dropout from the model's first LoRA module."""
     rank, scale, dropout = 8, 1.0, 0.0
@@ -18435,10 +18548,14 @@ def save_merged_model(model, tokenizer, path, dequantize=False,
         model.update_modules(tree_unflatten(fused_linears))
 
     if dequantize:
+        unpacked = _unpack_hadamard_modules(model)
         model = dequantize_model(model)
-        cfg = getattr(model, "_config", None)
+        # Rewrite what is saved: it may resolve from `model.config` or `model.args`.
+        cfg = _get_model_config(model)
         if isinstance(cfg, dict):
             model._config = _strip_mlx_quantization_metadata(cfg)
+            if unpacked:
+                model._config = _dense_hadamard_pack_config(model._config)
     elif quantize_unquantized and not _model_has_quantized_module(model):
         # The fuse had nothing to requantize: quantize now or say so, but
         # never write full precision in silence.
