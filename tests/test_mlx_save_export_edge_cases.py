@@ -613,7 +613,8 @@ def test_sidecars_follow_file_symlinks_and_skip_broken_ones(tmp_path):
     dst = tmp_path / "dst"
     src.mkdir()
     dst.mkdir()
-    real = tmp_path / "real_preprocessor.json"
+    real = src / "blobs" / "real_preprocessor.json"
+    real.parent.mkdir()
     real.write_text('{"size": 224}', encoding="utf-8")
     (src / "preprocessor_config.json").symlink_to(real)
     (src / "broken_link.json").symlink_to(tmp_path / "does_not_exist.json")

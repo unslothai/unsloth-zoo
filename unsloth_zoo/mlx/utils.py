@@ -18147,6 +18147,8 @@ def _asset_link_stays_in_the_model(file, source):
         for parent in (source, *source.parents):
             if parent.name == "snapshots":
                 roots.append(parent.parent)
+                # huggingface_hub >= 1.32 shares Xet blobs cache-wide in <cache>/blobs.
+                roots.append(parent.parent.parent / "blobs")
                 break
         target = file.resolve()
         return any(target.is_relative_to(root) for root in roots)
@@ -18267,7 +18269,8 @@ def _save_vlm_processor_assets(processor, path, sources=()):
             copy_assets(source, source_only=True)
             config = source / "config.json"
             target = path / "config.json"
-            if config.is_file() and not valid_asset(target):
+            if (config.is_file() and not valid_asset(target)
+                    and _asset_link_stays_in_the_model(config, source)):
                 json.loads(config.read_text())
                 shutil.copy2(config, target)
         except Exception as error:
@@ -18298,6 +18301,9 @@ def _copy_source_sidecars(src_path, path):
         if suffix in _MODEL_WEIGHT_SUFFIXES:
             continue
         if suffix not in _MODEL_SIDECAR_SUFFIXES:
+            continue
+        if not _asset_link_stays_in_the_model(source, src_path):
+            print(f"Unsloth: skipped {name}: symlink leaves the model directory")
             continue
         target = path / name
         if target.exists():
