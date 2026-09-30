@@ -3106,25 +3106,11 @@ TEMPORARY_PATCHES.append(patch_granitemoe_router_logits_recording)
 
 
 def patch_mamba_ssm_chunk_scan_device_guard():
-    """Run mamba_ssm's `_chunk_scan_fwd` on the device of its inputs.
+    """Run mamba_ssm's `_chunk_scan_fwd` on its inputs' device.
 
-    Every Triton launch in mamba_ssm/ops/triton sits inside
-    `with torch.cuda.device(x.device.index)` except `_chunk_scan_fwd_kernel`
-    in ssd_chunk_scan.py (unguarded since the Mamba-2 release, still so in
-    2.3.2 and on main). Triton launches on the CURRENT device and its current
-    stream, so when a hybrid Mamba model (NemotronH, Falcon-H1, Zamba2, Bamba,
-    GraniteMoeHybrid, Mamba2) is split over GPUs with a device_map, every
-    Mamba layer outside cuda:0 runs this kernel on cuda:0's stream through
-    peer access, unordered with the cuda:1 kernels that produce its inputs.
-    The result is a race: silently wrong, zero or NaN scan outputs, which is
-    how split NemotronH / Falcon-H1 evals turn into NaN perplexity. Single
-    GPU is unaffected, since tensor device and current device agree.
-
-    Both the forward scan and the fused split path used in training
-    (`mamba_split_conv1d_scan_combined`) reach it through
-    `_mamba_chunk_scan_combined_fwd`, so wrapping the one function covers
-    both. Only matters with more than one visible GPU, and mamba_ssm is only
-    imported here in that case.
+    `_chunk_scan_fwd_kernel` is mamba_ssm's only Triton launch without
+    `torch.cuda.device(x.device.index)`, so on a multi-GPU device_map it runs on
+    cuda:0's stream and races, giving zero/NaN outputs (NemotronH, Falcon-H1).
     """
     import sys
     try:

@@ -14,16 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""mamba_ssm `_chunk_scan_fwd` must launch on the device of its inputs.
-
-`_chunk_scan_fwd_kernel` (mamba_ssm/ops/triton/ssd_chunk_scan.py) is the one
-Triton launch in mamba_ssm without `with torch.cuda.device(x.device.index)`.
-When a hybrid Mamba model (NemotronH, Falcon-H1, ...) is split over GPUs, the
-Mamba layers on cuda:1 then run the scan on cuda:0's stream through peer
-access, racing the cuda:1 kernels around it (zeros / NaN outputs).
-`patch_mamba_ssm_chunk_scan_device_guard` wraps `_chunk_scan_fwd` in the
-input's device. Needs 2 CUDA GPUs and mamba_ssm; skipped otherwise.
-"""
+"""mamba_ssm `_chunk_scan_fwd` must launch on its inputs' device. Needs 2 GPUs."""
 import pytest
 import torch
 
@@ -88,8 +79,7 @@ def test_chunk_scan_launches_on_input_device():
     ssd_chunk_scan._chunk_scan_fwd_kernel = Spy()
     try:
         torch.cuda.set_device(0)
-        # A device_map model copies activations cuda:0 -> cuda:1, which enables
-        # peer access; without it the unguarded launch raises instead of racing.
+        # Enable peer access like a device_map model; else the bug raises instead of racing.
         torch.ones(1, device = "cuda:0").to("cuda:1")
         out = _scan(_inputs("cuda:1"))
         torch.cuda.synchronize(1)
@@ -113,5 +103,4 @@ def test_patch_is_idempotent():
     patch_mamba_ssm_chunk_scan_device_guard()
     assert ssd_chunk_scan._chunk_scan_fwd is first
     assert getattr(first, "_unsloth_device_guarded", False)
-    # ssd_combined bound the name at import; it must see the guarded function.
     assert ssd_combined._chunk_scan_fwd is first
