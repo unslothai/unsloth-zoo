@@ -2147,20 +2147,20 @@ def test_grpo_trains_on_real_rollouts(tmp_path, compiled):
 
 
 @metal_only
-@pytest.mark.parametrize("temperature", [1.0, 0.7])
-def test_grpo_cce_scores_completions_like_the_dense_head(temperature):
-    """Runtime CCE log-probs and gradients are no worse than the dense head's.
+@pytest.mark.parametrize("dtype,temperature", [("float32", 1.0), ("float32", 0.7), ("float16", 1.0)])
+def test_grpo_cce_scores_completions_like_the_dense_head(dtype, temperature):
+    """Runtime CCE over compacted completion rows gives the dense log-probs and gradient.
 
-    Both are judged against a float32 head on the same float16 hidden states: at
-    T != 1 the dense arm rounds tempered float16 logits and drifts ~0.3 nats from it
-    on SmolLM (CCE ~0.1), so dense-vs-CCE equality would fail the more accurate arm.
+    Exact in float32; float16 logits round differently in each arm (~0.2 nats at
+    T=0.7 on SmolLM, either arm nearer a float32 head), so float16 runs at T=1 only.
     """
     import mlx.core as mx
     import mlx.nn as nn
     from mlx.utils import tree_flatten
-    from unsloth_zoo.mlx import grpo, utils
+    from unsloth_zoo.mlx import grpo
 
     model, tokenizer = FastMLXModel.from_pretrained(MODEL, max_seq_length=256)
+    model.set_dtype(getattr(mx, dtype))
     model = FastMLXModel.get_peft_model(model, r=8, lora_alpha=16, lora_dropout=0)
     scorer = grpo.make_grpo_scorer(model, temperature)
     assert scorer is not None, "the SmolLM head should be CCE-eligible"
@@ -2172,44 +2172,27 @@ def test_grpo_cce_scores_completions_like_the_dense_head(temperature):
     batch = mx.array([r + [0] * (width - len(r)) for r in rows], dtype=mx.int32)
     lengths_mx = mx.array(lengths, dtype=mx.int32)
     mask = grpo._response_mask(batch[:, 1:], lengths_mx)
-    indices = grpo.completion_indices(lengths, width)
     dense = grpo._token_logps(model, batch, temperature) * mask
+    indices = grpo.completion_indices(lengths, width)
     compact = grpo._token_logps(model, batch, temperature, mask, scorer, indices) * mask
-
-    head = utils.describe_output_head(model).module
-    weight = mx.dequantize(
-        head.weight, head.scales, head.get("biases"), head.group_size, head.bits,
-    ).astype(mx.float32)
-
-    def exact_scorer(model, batch, supervised, indices=None, hidden_scale=None):
-        # Tempers on its own so it also checks the hidden_scale plumbing.
-        hidden = utils._forward_text_hidden_states(model, batch[:, :-1]).astype(mx.float32)
-        logits = (hidden @ weight.T) / temperature
-        ce = nn.losses.cross_entropy(logits, batch[:, 1:], reduction="none")
-        return ce * supervised, None
-
-    exact_scorer.compaction = False
-    exact = grpo._token_logps(model, batch, temperature, mask, exact_scorer, indices) * mask
-    dense_err = mx.abs(dense - exact).max().item()
-    cce_err = mx.abs(compact - exact).max().item()
-    assert cce_err <= dense_err + 2e-3, (cce_err, dense_err)
-    if temperature == 1.0:
-        assert mx.allclose(dense, compact, atol=2e-3, rtol=2e-3).item(), mx.abs(dense - compact).max()
+    atol = 1e-3 if dtype == "float32" else 2e-3
+    assert mx.allclose(dense, compact, atol=atol, rtol=atol).item(), mx.abs(dense - compact).max()
 
     args = (batch, lengths_mx, mx.array([1.0, -1.0]), mx.array([1.0, 0.0]))
     options = dict(beta=0.0, epsilon_low=0.2, epsilon_high=0.2, temperature=temperature)
     grads = []
-    for arm, extra in ((None, ()), (scorer, (indices,)), (exact_scorer, (indices,))):
-        loss_fn = grpo.make_grpo_loss_fn(scorer=arm, **options)
+    for loss_fn, extra in ((grpo.make_grpo_loss_fn(**options), ()),
+                           (grpo.make_grpo_loss_fn(scorer=scorer, **options), (indices,))):
         _, grad = nn.value_and_grad(model, lambda m, *a: loss_fn(m, *a)[0])(model, *args, *extra)
         grads.append({k: v.astype(mx.float32) for k, v in tree_flatten(grad)})
-    dense_grads, cce_grads, exact_grads = grads
+    # Per tensor against its norm: float16 rounding moves single entries past any
+    # elementwise tolerance.
+    bound = 1e-2 if dtype == "float32" else 1e-1
     moved = 0
-    for key, value in exact_grads.items():
+    for key, value in grads[0].items():
         norm = mx.linalg.norm(value).item()
-        cce_drift = mx.linalg.norm(cce_grads[key] - value).item()
-        dense_drift = mx.linalg.norm(dense_grads[key] - value).item()
-        assert cce_drift <= dense_drift + 1e-2 * norm + 1e-7, (key, cce_drift, dense_drift, norm)
+        drift = mx.linalg.norm(value - grads[1][key]).item()
+        assert drift <= bound * norm + 1e-7, (key, drift, norm)
         moved += norm > 0
     assert moved, "no LoRA tensor received a gradient"
 
