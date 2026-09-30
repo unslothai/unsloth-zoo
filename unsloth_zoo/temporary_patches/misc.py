@@ -3103,3 +3103,56 @@ def patch_granitemoe_router_logits_recording():
         pretrained._can_record_outputs = {**recorded, "router_logits": OutputRecorder(router, index = index)}
 pass
 TEMPORARY_PATCHES.append(patch_granitemoe_router_logits_recording)
+
+
+def patch_mamba_ssm_chunk_scan_device_guard():
+    """Run mamba_ssm's `_chunk_scan_fwd` on the device of its inputs.
+
+    Every Triton launch in mamba_ssm/ops/triton sits inside
+    `with torch.cuda.device(x.device.index)` except `_chunk_scan_fwd_kernel`
+    in ssd_chunk_scan.py (unguarded since the Mamba-2 release, still so in
+    2.3.2 and on main). Triton launches on the CURRENT device and its current
+    stream, so when a hybrid Mamba model (NemotronH, Falcon-H1, Zamba2, Bamba,
+    GraniteMoeHybrid, Mamba2) is split over GPUs with a device_map, every
+    Mamba layer outside cuda:0 runs this kernel on cuda:0's stream through
+    peer access, unordered with the cuda:1 kernels that produce its inputs.
+    The result is a race: silently wrong, zero or NaN scan outputs, which is
+    how split NemotronH / Falcon-H1 evals turn into NaN perplexity. Single
+    GPU is unaffected, since tensor device and current device agree.
+
+    Both the forward scan and the fused split path used in training
+    (`mamba_split_conv1d_scan_combined`) reach it through
+    `_mamba_chunk_scan_combined_fwd`, so wrapping the one function covers
+    both. Only matters with more than one visible GPU, and mamba_ssm is only
+    imported here in that case.
+    """
+    import sys
+    try:
+        if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+            return
+        if "mamba_ssm.ops.triton.ssd_chunk_scan" not in sys.modules:
+            import importlib.util
+            if importlib.util.find_spec("mamba_ssm") is None:
+                return
+        from mamba_ssm.ops.triton import ssd_chunk_scan
+    except Exception:
+        return
+    original = getattr(ssd_chunk_scan, "_chunk_scan_fwd", None)
+    if original is None or getattr(original, "_unsloth_device_guarded", False):
+        return
+
+    @functools.wraps(original)
+    def _chunk_scan_fwd(cb, x, *args, **kwargs):
+        if x.is_cuda and x.device.index != torch.cuda.current_device():
+            with torch.cuda.device(x.device):
+                return original(cb, x, *args, **kwargs)
+        return original(cb, x, *args, **kwargs)
+    _chunk_scan_fwd._unsloth_device_guarded = True
+
+    # ssd_combined (and anything else) bound the function by name at import.
+    for name, module in list(sys.modules.items()):
+        if (name == "mamba_ssm" or name.startswith("mamba_ssm.")) and \
+                getattr(module, "_chunk_scan_fwd", None) is original:
+            setattr(module, "_chunk_scan_fwd", _chunk_scan_fwd)
+pass
+TEMPORARY_PATCHES.append(patch_mamba_ssm_chunk_scan_device_guard)
