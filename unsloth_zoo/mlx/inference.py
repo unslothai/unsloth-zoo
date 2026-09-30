@@ -15,7 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """Scoped MLX inference fusions: quantized MoE gate and up projections,
-recurrent decode convolution and SiLU, and the MoE routing chain."""
+the recurrent decode convolution, and the MoE routing chain."""
 
 import ast
 import functools
@@ -332,13 +332,13 @@ def fused_moe_gate_up(model):
 
 
 @functools.cache
-def _decode_conv_silu_kernel():
+def _decode_conv_kernel():
     try:
         if not mx.metal.is_available():
             return None
         return mx.fast.metal_kernel(
-            name = "unsloth_decode_conv_silu",
-            input_names = ["x", "w"], output_names = ["out"],
+            name = "unsloth_decode_conv",
+            input_names = ["state", "x", "w"], output_names = ["window", "q", "k", "v"],
             ensure_row_contiguous = False,
             compile_options = {"math_mode": "safe"},
             source = """
@@ -349,16 +349,21 @@ def _decode_conv_silu_kernel():
                 if (c >= C) return;
                 float acc = 0.0f;
                 #pragma unroll
-                for (uint k = 0; k < K; ++k) {
-                    float v = float(x[b*x_strides[0] + k*x_strides[1] + c*x_strides[2]]);
-                    float weight = w[k*w_strides[0] + c*w_strides[1]];
-                    float product = v * weight;
+                for (uint tap = 0; tap < K; ++tap) {
+                    T value = tap + 1 < K
+                        ? state[b*state_strides[0] + tap*state_strides[1] + c*state_strides[2]]
+                        : x[b*x_strides[0] + c*x_strides[2]];
+                    window[(b*K + tap)*C + c] = value;
+                    float product = float(value) * w[tap*w_strides[0] + c*w_strides[1]];
                     acc = product + acc;
                 }
-                T v = T(acc);
-                auto y = 1 / (1 + metal::precise::exp(metal::abs(v)));
-                T sigmoid = (v < 0) ? y : 1 - y;
-                out[b*C + c] = v * sigmoid;
+                T conv = T(acc);
+                auto y = 1 / (1 + metal::precise::exp(metal::abs(conv)));
+                T sigmoid = (conv < 0) ? y : 1 - y;
+                T out = conv * sigmoid;
+                if (c < KEY) q[b*KEY + c] = out;
+                else if (c < 2*KEY) k[b*KEY + c - KEY] = out;
+                else v[b*(C - 2*KEY) + c - 2*KEY] = out;
             """,
         )
     except (AttributeError, TypeError):
@@ -366,13 +371,17 @@ def _decode_conv_silu_kernel():
 
 
 @mx.compile
-def _decode_conv_silu(x, weight):
-    # Preserve the native small-column reduction order and both half-precision casts.
-    return _decode_conv_silu_kernel()(
-        inputs = [x, weight], template = [("T", x.dtype), ("K", x.shape[1])],
-        grid = (x.shape[2], x.shape[0], 1), threadgroup = (256, 1, 1),
-        output_shapes = [(x.shape[0], 1, x.shape[2])], output_dtypes = [x.dtype],
-    )[0]
+def _decode_conv(state, x, weight, key_dim):
+    # The concatenated window, then the native small-column reduction order, both half-precision
+    # casts and the q/k/v split, for one decode row.
+    batch, taps, channels = x.shape[0], weight.shape[0], x.shape[2]
+    return _decode_conv_kernel()(
+        inputs = [state, x, weight], template = [("T", x.dtype), ("K", taps), ("KEY", key_dim)],
+        grid = (channels, batch, 1), threadgroup = (256, 1, 1),
+        output_shapes = [(batch, taps, channels), (batch, 1, key_dim), (batch, 1, key_dim),
+                         (batch, 1, channels - 2 * key_dim)],
+        output_dtypes = [x.dtype] * 4,
+    )
 
 
 _CONV_SILU_CONTRACT = {"mlx.nn": {"silu": "78867fdb7e42731c"}}
@@ -400,7 +409,46 @@ def _function_from_ast(original, tree):
     return result
 
 
-def _decode_conv_silu_contract(base):
+_CONCATENATE = "conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)"
+_DECODE_TEST = ("S == 1 and conv_input.shape[1] == self.conv_kernel_size"
+                " and self.conv1d.weight.dtype in (mx.bfloat16, mx.float16)")
+_DECODE_BRANCH = "conv_out = nn.silu(self._causal_conv1d_decode(conv_input))"
+_SPLIT = "mx.split(conv_out, [self.key_dim, 2 * self.key_dim], -1)"
+_PURE_TEST_NODES = (ast.expr_context, ast.boolop, ast.unaryop, ast.cmpop,
+                    ast.Name, ast.Attribute, ast.Constant, ast.Compare, ast.BoolOp, ast.UnaryOp)
+
+
+def _decode_conv_sites(outer):
+    """(concatenate index, branch chain index, tests preceding the decode branch) in the body, or None.
+
+    The fused call decides at the concatenate what the chain decides later, so the tests the decode
+    branch sits behind must be free of calls and read nothing assigned from the concatenate on.
+    """
+    body = outer.body
+    starts = [i for i, statement in enumerate(body) if _source_expression(statement) == _CONCATENATE]
+    if len(starts) != 1:
+        return None
+    start = starts[0]
+    for index in range(start + 1, len(body)):
+        node, before = body[index], []
+        while isinstance(node, ast.If):
+            if (ast.dump(node.test) == ast.dump(ast.parse(_DECODE_TEST, mode = "eval").body) and len(node.body) == 1
+                    and _source_expression(node.body[0]) == _DECODE_BRANCH):
+                between = [n for statement in body[start:index] for n in ast.walk(statement)]
+                assigned = {n.id for n in between if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
+                if "S" in assigned or any(isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Store)
+                                          for n in between):
+                    return None
+                if all(isinstance(n, _PURE_TEST_NODES) and not (isinstance(n, ast.Name) and n.id in assigned)
+                       for test in before for n in ast.walk(test)):
+                    return start, index, before
+                return None
+            before.append(node.test)
+            node = node.orelse[0] if len(node.orelse) == 1 else None
+    return None
+
+
+def _decode_conv_contract(base):
     call = getattr(base, "__call__", None)
     prepare = getattr(base, "_causal_conv1d_decode", None)
     if not isinstance(call, FunctionType) or not isinstance(prepare, FunctionType):
@@ -412,6 +460,10 @@ def _decode_conv_silu_contract(base):
                 and isinstance(target.func, ast.Name)
                 and [_source_expression(a) for a in target.args] == ["conv_input", "weight"]
                 and not target.keywords):
+            return None
+        # The fused call reads the prepared taps before any window exists.
+        if any(isinstance(n, ast.Name) and n.id == "conv_input"
+               for statement in inner.body[:-1] for n in ast.walk(statement)):
             return None
         conv = prepare.__globals__.get(target.func.id)
         if any(hasattr(f, "__wrapped__") for f in (call, prepare, conv)):
@@ -428,15 +480,14 @@ def _decode_conv_silu_contract(base):
             return None
         if call.__globals__.get("nn") is not nn or call.__globals__.get("mx") is not mx:
             return None
-        assignments = [n for n in ast.walk(outer) if isinstance(n, ast.Name)
-                       and n.id == "conv_input" and isinstance(n.ctx, ast.Store)]
-        concatenations = [n for n in ast.walk(outer) if isinstance(n, ast.Assign)
-                          and _source_expression(n) == "conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)"]
-        if len(assignments) != 1 or len(concatenations) != 1:
+        names = [n for n in ast.walk(outer) if isinstance(n, ast.Name)]
+        if (sum(n.id == "conv_input" and isinstance(n.ctx, ast.Store) for n in names) != 1
+                or sum(n.id == "conv_out" and isinstance(n.ctx, ast.Load) for n in names) != 1
+                or any(n.id == "_unsloth_qkv" for n in names)):
             return None
-        matches = [n for n in ast.walk(outer) if isinstance(n, ast.Call)
-                   and _source_expression(n) == "nn.silu(self._causal_conv1d_decode(conv_input))"]
-        if len(matches) != 1:
+        calls = [_source_expression(n) for n in ast.walk(outer) if isinstance(n, ast.Call)]
+        if (calls.count("nn.silu(self._causal_conv1d_decode(conv_input))") != 1
+                or calls.count(_SPLIT) != 1 or _decode_conv_sites(outer) is None):
             return None
         return call, prepare, conv, nn.silu
     except (OSError, TypeError, SyntaxError, AttributeError, IndexError):
@@ -444,31 +495,41 @@ def _decode_conv_silu_contract(base):
 
 
 @functools.cache
-def _fused_decode_conv_silu_class(base, call, prepare, conv, silu):
+def _fused_decode_conv_class(base, call, prepare, conv, silu):
     bindings = _resolved_bindings(_CONV_SILU_CONTRACT) or []  # this resolution's, not a later one's
     outer, inner = copy.deepcopy(_function_ast(call)), copy.deepcopy(_function_ast(prepare))
+    start, index, before = _decode_conv_sites(outer)
+    guard = " and ".join(f"not ({_source_expression(test)})" for test in before) or "True"
+    outer.body[start] = ast.parse(
+        f"conv_input, _unsloth_qkv = self._unsloth_decode_conv(conv_state, mixed_qkv, S, {guard})").body[0]
+    outer.body[index] = ast.If(test = ast.parse("_unsloth_qkv is None", mode = "eval").body,
+                               body = [outer.body[index]], orelse = [])
 
     class Rewrite(ast.NodeTransformer):
         def visit_Call(self, node):
-            if _source_expression(node) == "nn.silu(self._causal_conv1d_decode(conv_input))":
-                node = ast.Call(func = ast.Attribute(value = ast.Name(id = "self", ctx = ast.Load()),
-                    attr = "_unsloth_decode_conv_silu", ctx = ast.Load()), args = node.args[0].args, keywords = [])
+            if _source_expression(node) == _SPLIT:
+                return ast.IfExp(test = ast.parse("_unsloth_qkv is not None", mode = "eval").body,
+                                 body = ast.Name(id = "_unsloth_qkv", ctx = ast.Load()), orelse = node)
             return self.generic_visit(node)
 
     outer = Rewrite().visit(outer)
-    target = inner.body[-1].value
-    conv_name = target.func.id
-    target.func = ast.Attribute(value = ast.Name(id = "self", ctx = ast.Load()),
-                                attr = "_unsloth_apply_conv_silu", ctx = ast.Load())
-    inner.name = "_unsloth_decode_conv_silu"
+    conv_name = inner.body[-1].value.func.id
+    inner.body[-1] = ast.Return(value = ast.Name(id = "weight", ctx = ast.Load()))
+    inner.name = "_unsloth_decode_conv_weight"
     adapted_call = _function_from_ast(call, outer)
 
-    def conv_silu(self, x, weight):
-        if (x.ndim == 3 and x.shape[0] > 0 and 2 <= x.shape[1] <= 8 and x.shape[2] > 1
-                and x.dtype in (mx.bfloat16, mx.float16)
-                and weight.shape == x.shape[1:] and weight.dtype == mx.float32):
-            return _decode_conv_silu(x, weight)
-        return silu(conv(x, weight))
+    def decode_conv(self, state, x, rows, eligible):
+        if (eligible and rows == 1 and x.ndim == 3 and state.ndim == 3 and x.shape[1] == 1
+                and state.shape[0] == x.shape[0] > 0 and state.shape[2] == x.shape[2]
+                and state.shape[1] + 1 == self.conv_kernel_size
+                and self.conv1d.weight.dtype in (mx.bfloat16, mx.float16)
+                and x.dtype in (mx.bfloat16, mx.float16) and state.dtype == x.dtype):
+            weight = self._unsloth_decode_conv_weight(None)
+            if (weight.dtype == mx.float32 and weight.shape == (state.shape[1] + 1, x.shape[2])
+                    and 2 <= weight.shape[0] <= 8 and 0 < 2 * self.key_dim < x.shape[2]):
+                window, q, k, v = _decode_conv(state, x, weight, self.key_dim)
+                return window, (q, k, v)
+        return mx.concatenate([state, x], axis = 1), None
 
     def fused_call(self, *args, **kwargs):
         if (self.training or prepare.__globals__.get(conv_name) is not conv
@@ -476,16 +537,17 @@ def _fused_decode_conv_silu_class(base, call, prepare, conv, silu):
             return call(self, *args, **kwargs)
         return adapted_call(self, *args, **kwargs)
 
-    return type(f"_FusedDecodeConvSiLU{base.__name__}", (base,), {
+    return type(f"_FusedDecodeConv{base.__name__}", (base,), {
         "__call__": fused_call,
-        "_unsloth_decode_conv_silu": _function_from_ast(prepare, inner),
-        "_unsloth_apply_conv_silu": conv_silu,
+        "_unsloth_decode_conv_weight": _function_from_ast(prepare, inner),
+        "_unsloth_decode_conv": decode_conv,
     })
 
 
 @contextmanager
 def fused_decode_conv_silu(model):
-    """Fuse recurrent decode convolution and SiLU during serialized inference.
+    """Fuse the recurrent decode convolution window, convolution, SiLU and q/k/v split into one
+    launch during serialized inference.
 
     Prefill, unsupported convolution shapes, and training keep their native paths.
     Instance classes are restored when the context exits, including on cancellation.
@@ -507,7 +569,7 @@ def fused_decode_conv_silu(model):
                     continue
                 if "_causal_conv1d_decode" in module or "__call__" in module:
                     continue
-                if hasattr(base, "_unsloth_decode_conv_silu"):
+                if hasattr(base, "_unsloth_decode_conv"):
                     # Already fused by another scope. Count this one as an owner too,
                     # so that scope's exit cannot unfuse a module this scope still
                     # holds; only the last owner restores. Generation enters this
@@ -518,11 +580,11 @@ def fused_decode_conv_silu(model):
                         changed.append(module)
                     continue
                 if base not in specs:
-                    specs[base] = _decode_conv_silu_contract(base)
+                    specs[base] = _decode_conv_contract(base)
                 contract = specs[base]
-                if contract is None or _decode_conv_silu_kernel() is None:
+                if contract is None or _decode_conv_kernel() is None:
                     continue
-                patched = _fused_decode_conv_silu_class(base, *contract)
+                patched = _fused_decode_conv_class(base, *contract)
                 module.__class__ = patched
                 module._unsloth_decode_native = base
                 module._unsloth_decode_patched = patched
