@@ -408,7 +408,14 @@ def prepare_model_for_training(
         _keep_param_dtype = False
         _is_norm = _is_norm_parameter(original_name, param)
         if not full_finetuning:
-            if ".lora_A." in name or ".lora_B." in name or ".lora_magnitude_vector" in name:
+            # PEFT names LoRA on nn.Embedding lora_embedding_A / lora_embedding_B
+            # (ParameterDicts, so "...lora_embedding_A.default"); match them too, or
+            # embedding LoRA (e.g. target_modules=["embed_tokens"]) is silently frozen.
+            if (".lora_A." in name
+                    or ".lora_B." in name
+                    or ".lora_embedding_A." in name
+                    or ".lora_embedding_B." in name
+                    or ".lora_magnitude_vector" in name):
                 upcast = True
                 requires_grad = True
             elif (_is_peft_model and "bias" in name and param.requires_grad
