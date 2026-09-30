@@ -1556,7 +1556,7 @@ def test_the_fusion_scopes_tolerate_whatever_named_modules_yields():
     # entries, which only an mlx Module has, so a non-Module must be skipped rather
     # than raising TypeError out of the generation path.
     from unsloth_zoo.mlx.inference import (fused_decode_conv_silu, fused_moe_gate_up, fused_moe_router,
-                                           fused_residual_norm)
+                                           fused_residual_norm, fused_residual_norm_handoff)
     # Bare too: _snapshot_training_flags already tolerates an entry with no `training`,
     # so a scope that reads it before deciding the entry is a candidate raises instead.
     for stub in (types.SimpleNamespace(training = False), types.SimpleNamespace()):
@@ -1565,8 +1565,28 @@ def test_the_fusion_scopes_tolerate_whatever_named_modules_yields():
             named_modules = lambda: [("plain", stub)],
         )
         with fused_moe_gate_up(model), fused_decode_conv_silu(model), fused_residual_norm(model), \
-                fused_moe_router(model):
+                fused_moe_router(model), fused_residual_norm_handoff(model):
             pass
+
+
+def test_generation_paths_enter_every_inference_fusion(monkeypatch):
+    # A scope missing from generation_mode or a loader generate site silently leaves that path native.
+    import ast
+
+    from unsloth_zoo.mlx import generate as generate_module, inference, loader
+    scopes = {name for name, value in vars(inference).items()
+              if name.startswith("fused_") and getattr(value, "__module__", None) == inference.__name__}
+    entered = []
+    for name in scopes:
+        monkeypatch.setattr(inference, name, lambda model, name=name: entered.append(name) or contextlib.nullcontext(model))
+    with generate_module.generation_mode(types.SimpleNamespace(training=False, eval=lambda: None, named_modules=lambda: [])):
+        pass
+    assert sorted(entered) == sorted(scopes)
+    sites = [{item.context_expr.func.id for item in node.items
+              if isinstance(item.context_expr, ast.Call) and isinstance(item.context_expr.func, ast.Name)}
+             for node in ast.walk(ast.parse(inspect.getsource(loader))) if isinstance(node, ast.With)]
+    sites = [site for site in sites if any(name.startswith("fused_") for name in site)]
+    assert len(sites) == 2 and all(site == scopes for site in sites)
 
 
 def test_cache_layout_tells_quantized_packings_apart():

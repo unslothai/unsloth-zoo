@@ -15,7 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """Scoped MLX inference fusions: quantized MoE gate and up projections,
-recurrent decode convolution and SiLU, and the MoE routing chain."""
+recurrent decode convolution and SiLU, the MoE routing chain, and the pre-norm residual handoff."""
 
 import ast
 import functools
@@ -23,6 +23,7 @@ import copy
 import hashlib
 import inspect
 import logging
+import math
 import re
 import sys
 import textwrap
@@ -32,6 +33,7 @@ from types import FunctionType
 
 import mlx.core as mx
 import mlx.nn as nn
+
 
 
 logger = logging.getLogger(__name__)
@@ -733,6 +735,450 @@ def _residual_norm_class(base):
         "_unsloth_residual_norm_base": base, "_unsloth_residual_norm_names": tuple(names),
     })
 
+# `_fused_add_rms_norm` adds a residual and RMS-normalizes the sum in one launch, reducing each row
+# as `mx.fast.rms_norm` does.
+_HALF = (mx.bfloat16, mx.float16)
+
+
+@functools.lru_cache(maxsize = 64)
+def _scalar(value):
+    return mx.array(value, mx.int32)
+
+
+# MLX's rms_norm reads N_READS values per thread, and rows wider than RMS_LOOPED_LIMIT take its
+# looped kernel with a full 1024-thread group; the add-then-norm kernels partition rows the same way.
+_NORM_READS = 4
+_NORM_LOOPED_LIMIT = 4096
+_NORM_LOOPED_GROUP = 1024
+
+_NORM = r"""
+constant constexpr int N_READS = 4;
+constant constexpr int SIMD_SIZE = 32;
+
+template <typename T>
+using Vec = vec<T, N_READS>;
+
+template <typename T>
+inline Vec<T> load(const device T* p) {
+  return *reinterpret_cast<const device Vec<T>*>(p);
+}
+
+template <typename T>
+inline Vec<T> load(const constant T* p) {
+  return *reinterpret_cast<const constant Vec<T>*>(p);
+}
+
+template <typename T>
+inline void store(device T* p, Vec<T> v) {
+  *reinterpret_cast<device Vec<T>*>(p) = v;
+}
+
+// Rows and buffer offsets are multiples of N_READS elements, so N_READS-wide vector loads are legal.
+template <typename T, typename P>
+inline bool vector_aligned(P p) {
+  return reinterpret_cast<ulong>(p) % (N_READS * sizeof(T)) == 0;
+}
+
+// MLX zeroes local_sums behind a barrier; reading unused lanes as 0 gives simd_sum the same inputs.
+inline float inv_rms(
+    float acc,
+    uint axis_size,
+    float eps,
+    uint simd_lane_id,
+    uint simd_group_id,
+    uint simd_groups,
+    threadgroup float* local_sums,
+    threadgroup float* local_inv_mean) {
+  acc = simd_sum(acc);
+  if (simd_lane_id == 0) {
+    local_sums[simd_group_id] = acc;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_group_id == 0) {
+    acc = simd_sum(simd_lane_id < simd_groups ? local_sums[simd_lane_id] : 0.0f);
+    if (simd_lane_id == 0) {
+      local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + eps);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  return local_inv_mean[0];
+}
+
+template <typename T, bool divisible, typename X, typename R, typename W>
+METAL_FUNC void add_rms_single_row_body(
+    X x,
+    R r,
+    W w,
+    device T* h,
+    device T* out,
+    float eps,
+    uint axis,
+    uint gid,
+    uint lid,
+    uint simd_lane_id,
+    uint simd_group_id,
+    uint simd_groups,
+    threadgroup float* local_sums,
+    threadgroup float* local_inv_mean) {
+  const uint axis_size = axis;
+  const bool aligned = divisible && vector_aligned<T>(x) && vector_aligned<T>(r) && vector_aligned<T>(w);
+
+  size_t offset = gid * size_t(axis_size) + lid * N_READS;
+  x += offset;
+  r += offset;
+  h += offset;
+  out += offset;
+  w += lid * N_READS;
+
+  float acc = 0;
+  float thread_x[N_READS];
+  bool full = lid * N_READS + N_READS <= axis_size;
+  if (full && aligned) {
+    Vec<T> v = load(x) + load(r);
+    store(h, v);
+    for (int i = 0; i < N_READS; i++) {
+      thread_x[i] = v[i];
+      acc += thread_x[i] * thread_x[i];
+    }
+  } else {
+    for (int i = 0; i < N_READS; i++) {
+      if (full || lid * N_READS + i < axis_size) {
+        T v = x[i] + r[i];
+        h[i] = v;
+        thread_x[i] = v;
+      } else {
+        thread_x[i] = 0;
+      }
+      acc += thread_x[i] * thread_x[i];
+    }
+  }
+  float inv = inv_rms(
+      acc, axis_size, eps, simd_lane_id, simd_group_id, simd_groups, local_sums, local_inv_mean);
+
+  if (full && aligned) {
+    Vec<T> wv = load(w);
+    Vec<T> o;
+    for (int i = 0; i < N_READS; i++) {
+      o[i] = wv[i] * static_cast<T>(thread_x[i] * inv);
+    }
+    store(out, o);
+  } else {
+    for (int i = 0; i < N_READS; i++) {
+      if (full || lid * N_READS + i < axis_size) {
+        out[i] = w[i] * static_cast<T>(thread_x[i] * inv);
+      }
+    }
+  }
+}
+
+template <typename T, bool divisible, typename X, typename R, typename W>
+METAL_FUNC void add_rms_looped_body(
+    X x,
+    R r,
+    W w,
+    device T* h,
+    device T* out,
+    float eps,
+    uint axis,
+    uint gid,
+    uint lid,
+    uint lsize,
+    uint simd_lane_id,
+    uint simd_group_id,
+    uint simd_groups,
+    threadgroup float* local_sums,
+    threadgroup float* local_inv_mean) {
+  const uint axis_size = axis;
+  const bool aligned = divisible && vector_aligned<T>(x) && vector_aligned<T>(r) && vector_aligned<T>(w);
+
+  size_t offset = gid * size_t(axis_size) + lid * N_READS;
+  x += offset;
+  r += offset;
+  h += offset;
+  out += offset;
+  w += lid * N_READS;
+
+  float acc = 0;
+  for (uint rr = 0; rr < axis_size; rr += lsize * N_READS) {
+    bool full = rr + lid * N_READS + N_READS <= axis_size;
+    if (full && aligned) {
+      Vec<T> v = load(x + rr) + load(r + rr);
+      store(h + rr, v);
+      for (int i = 0; i < N_READS; i++) {
+        float xi = v[i];
+        acc += xi * xi;
+      }
+    } else {
+      for (int i = 0; i < N_READS; i++) {
+        if (full || rr + lid * N_READS + i < axis_size) {
+          T v = x[rr + i] + r[rr + i];
+          h[rr + i] = v;
+          float xi = v;
+          acc += xi * xi;
+        }
+      }
+    }
+  }
+  float inv = inv_rms(
+      acc, axis_size, eps, simd_lane_id, simd_group_id, simd_groups, local_sums, local_inv_mean);
+
+  for (uint rr = 0; rr < axis_size; rr += lsize * N_READS) {
+    bool full = rr + lid * N_READS + N_READS <= axis_size;
+    if (full && aligned) {
+      Vec<T> hv = load(h + rr);
+      Vec<T> wv = load(w + rr);
+      Vec<T> o;
+      for (int i = 0; i < N_READS; i++) {
+        o[i] = wv[i] * static_cast<T>(hv[i] * inv);
+      }
+      store(out + rr, o);
+    } else {
+      for (int i = 0; i < N_READS; i++) {
+        if (full || rr + lid * N_READS + i < axis_size) {
+          out[rr + i] = w[rr + i] * static_cast<T>(h[rr + i] * inv);
+        }
+      }
+    }
+  }
+}
+"""
+
+_NORM_BODIES = {
+    False: r"""
+  threadgroup float local_inv_mean[1];
+  threadgroup float local_sums[SIMD_SIZE];
+  add_rms_single_row_body<T, divisible>(
+      x, r, w, h, out, eps, axis, threadgroup_position_in_grid.x, thread_position_in_threadgroup.x,
+      thread_index_in_simdgroup, simdgroup_index_in_threadgroup, simdgroups_per_threadgroup, local_sums,
+      local_inv_mean);
+""",
+    True: r"""
+  threadgroup float local_inv_mean[1];
+  threadgroup float local_sums[SIMD_SIZE];
+  add_rms_looped_body<T, divisible>(
+      x, r, w, h, out, eps, axis, threadgroup_position_in_grid.x, thread_position_in_threadgroup.x,
+      threads_per_threadgroup.x, thread_index_in_simdgroup, simdgroup_index_in_threadgroup, simdgroups_per_threadgroup,
+      local_sums, local_inv_mean);
+""",
+}
+
+@functools.cache
+def _norm_kernel(looped):
+    try:
+        if not mx.metal.is_available():
+            return None
+        return mx.fast.metal_kernel(
+            name = f"unsloth_add_rms_{'looped' if looped else 'single_row'}",
+            input_names = ["x", "r", "w", "eps", "axis"],
+            output_names = ["h", "out"],
+            source = _NORM_BODIES[looped],
+            header = _NORM,
+        )
+    except (AttributeError, RuntimeError, TypeError):
+        return None
+
+
+@functools.lru_cache(maxsize = 64)
+def _epsilon(eps):
+    return mx.array(eps, mx.float32)
+
+
+@functools.lru_cache(maxsize = 64)
+def _add_rms_plan(shape, dtype):
+    axis = shape[-1]
+    looped = axis > _NORM_LOOPED_LIMIT
+    call = _norm_kernel(looped)
+    if call is None:
+        return None
+    group = _NORM_LOOPED_GROUP if looped else 32 * -(-axis // (32 * _NORM_READS))
+    args = dict(
+        template = [("T", dtype), ("divisible", axis % _NORM_READS == 0)],
+        grid = (math.prod(shape) // axis * group, 1, 1),
+        threadgroup = (group, 1, 1),
+        output_shapes = [shape, shape],
+        output_dtypes = [dtype, dtype],
+    )
+    width = _scalar(axis)
+    return mx.compile(lambda x, r, w, eps: tuple(call(inputs = [x, r, w, eps, width], **args)))
+
+
+def _fused_add_rms_norm(x, r, w, eps):
+    """`(h, mx.fast.rms_norm(h, w, eps))` with `h = x + r`, bitwise, or None for inputs the kernels do not take."""
+    if (x.dtype != w.dtype or r.dtype != w.dtype or x.shape != r.shape or x.ndim == 0 or w.ndim != 1
+            or x.shape[-1] != w.shape[0] or x.dtype not in (*_HALF, mx.float32) or x.size == 0):
+        return None
+    launch = _add_rms_plan(x.shape, x.dtype)
+    return None if launch is None else launch(x, r, w, _epsilon(eps))
+
+
+class _Handoff:
+    """The residual a decoder layer returns, already normalized by the next layer's input norm."""
+
+    __slots__ = ("consumer", "residual", "normed", "weight", "eps")
+
+    def __init__(self, consumer):
+        self.consumer = consumer
+        self.residual = self.normed = self.weight = self.eps = None
+
+
+_ADD_NORM_VERDICTS = {}
+
+
+def _add_norm_verified(dtype, axis):
+    verdict = _ADD_NORM_VERDICTS.get((dtype, axis))
+    if verdict is None:
+        keys = mx.random.split(mx.random.key(axis), 3)
+        x, r = ((mx.random.normal((3, axis), key = key) * 4).astype(dtype) for key in keys[:2])
+        w = mx.random.normal((axis,), key = keys[2]).astype(dtype)
+        fused = _fused_add_rms_norm(x, r, w, 1e-6)
+        h = x + r
+        verdict = fused is not None and bool(mx.array_equal(fused[0], h).item()) and bool(
+            mx.array_equal(fused[1], mx.fast.rms_norm(h, w, 1e-6), equal_nan = True).item())
+        _ADD_NORM_VERDICTS[dtype, axis] = verdict
+        if not verdict:
+            logger.warning("The fused residual RMS norm differs from mx.fast.rms_norm for %s rows of %d; "
+                           "the native ops stay in use", dtype, axis)
+    return verdict
+
+
+def _add_rms_norm(norm, a, b):
+    if (type(norm) is not nn.RMSNorm or mx.default_device() != mx.gpu
+            or not isinstance(a, mx.array) or not isinstance(b, mx.array)):
+        return None
+    out = _fused_add_rms_norm(a, b, norm.weight, norm.eps)
+    return out if out is not None and _add_norm_verified(a.dtype, a.shape[-1]) else None
+
+
+def _is_self_call(node, arg):
+    return (isinstance(node, ast.Call) and len(node.args) == 1 and not node.keywords
+            and isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "self" and isinstance(node.args[0], ast.Name) and node.args[0].id == arg)
+
+
+def _self_method(name, *args):
+    return ast.Call(func = ast.Attribute(value = ast.Name(id = "self", ctx = ast.Load()), attr = name,
+                                         ctx = ast.Load()), args = list(args), keywords = [])
+
+
+_PLAIN_NODES = (ast.Assign, ast.Return, ast.Name, ast.Attribute, ast.Call, ast.keyword, ast.BinOp,
+                ast.Constant, ast.Tuple, ast.expr_context, ast.operator)
+
+
+@functools.cache
+def _prenorm_class(base):
+    """A pre-norm decoder layer whose `h = a + b` feeds one `self.<norm>(h)` and whose output is `h + E`.
+
+    Both additions run with the RMS norm that follows them, and the output's normalization under
+    the next layer's input norm is handed to that layer, which takes it only for the exact array
+    it is called with.
+    """
+    call = getattr(base, "__call__", None)
+    if not isinstance(call, FunctionType) or call.__closure__ or hasattr(call, "__wrapped__"):
+        return None
+    try:
+        tree = copy.deepcopy(_function_ast(call))
+    except (OSError, TypeError, SyntaxError, AttributeError):
+        return None
+    params = [*tree.args.posonlyargs, *tree.args.args]
+    names = [node for node in ast.walk(tree) if isinstance(node, ast.Name)]
+    if len(params) < 2 or any(node.id == "_unsloth_normed" for node in names):
+        return None
+    stored = {node.id for node in names if isinstance(node.ctx, ast.Store)}
+    body = tree.body
+    tail = body[-1] if isinstance(body[-1], ast.Return) else None
+    if len(body) >= 2 and isinstance(body[-2], ast.Assign) and tail is not None and isinstance(tail.value, ast.Name):
+        tail = body[-2] if [_source_expression(t) for t in body[-2].targets] == [tail.value.id] else None
+    total = tail.value if tail is not None else None
+    if not (isinstance(total, ast.BinOp) and isinstance(total.op, ast.Add) and isinstance(total.left, ast.Name)):
+        return None
+    h = total.left.id
+    adds = [i for i, s in enumerate(body) if isinstance(s, ast.Assign) and len(s.targets) == 1
+            and isinstance(s.targets[0], ast.Name) and s.targets[0].id == h]
+    if len(adds) != 1:
+        return None
+    first = body[adds[0]]
+    if not (isinstance(first.value, ast.BinOp) and isinstance(first.value.op, ast.Add)
+            and isinstance(first.value.left, ast.Name) and isinstance(first.value.right, ast.Name)):
+        return None
+    # The norm moves up to the addition, so it must be the first call of the plain statement right
+    # after it (nothing there binds a name): every other call there encloses it.
+    norms = [node for s in body[adds[0] + 1:] for node in ast.walk(s) if _is_self_call(node, h)]
+    nodes = list(ast.walk(body[adds[0] + 1]))
+    calls = [node for node in nodes if isinstance(node, ast.Call)]
+    if (len(norms) != 1 or not any(call is norms[0] for call in calls)
+            or not all(isinstance(node, _PLAIN_NODES) for node in nodes)
+            or not all(any(inner is norms[0] for inner in ast.walk(call)) for call in calls)):
+        return None
+    post = norms[0].func.attr
+
+    incoming = set()
+
+    class Rewrite(ast.NodeTransformer):
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            if node is norms[0]:
+                return ast.Name(id = "_unsloth_normed", ctx = ast.Load())
+            if params[1].arg not in stored and _is_self_call(node, params[1].arg):
+                incoming.add(node.func.attr)
+                return _self_method("_unsloth_take_norm", node.func, node.args[0])
+            return node
+
+    tree = Rewrite().visit(tree)
+    if len(incoming) > 1:
+        return None
+    first.targets = [ast.Tuple(elts = [ast.Name(id = h, ctx = ast.Store()),
+                                       ast.Name(id = "_unsloth_normed", ctx = ast.Store())], ctx = ast.Store())]
+    first.value = _self_method("_unsloth_add_norm", ast.Attribute(
+        value = ast.Name(id = "self", ctx = ast.Load()), attr = post, ctx = ast.Load()),
+        first.value.left, first.value.right)
+    tail.value = _self_method("_unsloth_add_handoff", total.left, total.right)
+    fused = _function_from_ast(call, tree)
+    bindings = _resolved_bindings(_RESIDUAL_NORM_CONTRACT)
+    if bindings is None:
+        return None
+
+    def invoke(self, *args, **kwargs):
+        if self.training or base.__call__ is not call:
+            return base.__call__(self, *args, **kwargs)
+        return fused(self, *args, **kwargs)
+
+    def add_norm(self, norm, a, b):
+        out = _add_rms_norm(norm, a, b) if _bindings_intact(bindings) else None
+        if out is not None:
+            return out
+        out = a + b
+        return out, norm(out)
+
+    def add_handoff(self, h, m):
+        slot = self.__dict__.get("_unsloth_handoff_out")
+        name = getattr(type(slot.consumer), "_unsloth_handoff_norm", None) if slot is not None else None
+        if name is not None and _bindings_intact(bindings):
+            norm = getattr(slot.consumer, name, None)
+            out = _add_rms_norm(norm, h, m)
+            if out is not None:
+                slot.residual, slot.normed, slot.weight, slot.eps = *out, norm.weight, norm.eps
+                return out[0]
+        return h + m
+
+    def take_norm(self, norm, x):
+        slot = self.__dict__.get("_unsloth_handoff_in")
+        if slot is not None:
+            residual, normed, weight, eps = slot.residual, slot.normed, slot.weight, slot.eps
+            slot.residual = slot.normed = slot.weight = slot.eps = None
+            if (residual is x and type(norm) is nn.RMSNorm and norm.weight is weight and norm.eps == eps
+                    and _bindings_intact(bindings)):
+                return normed
+        return norm(x)
+
+    incoming = next(iter(incoming), None)
+    return type(f"_ResidualNorm{base.__name__}", (base,), {
+        "__call__": invoke, "_unsloth_add_norm": add_norm, "_unsloth_add_handoff": add_handoff,
+        "_unsloth_take_norm": take_norm, "_unsloth_handoff_norm": incoming,
+        "_unsloth_residual_norm_base": base,
+        "_unsloth_residual_norm_names": (post,) if incoming is None else (post, incoming),
+    })
+
+
 _RESIDUAL_NORM_LOCK = RLock()
 
 @contextmanager
@@ -761,6 +1207,51 @@ def fused_residual_norm(model):
     finally:
         with _RESIDUAL_NORM_LOCK:
             for module, base, fused in reversed(patched):
+                if type(module) is fused:
+                    module.__class__ = base
+
+
+@contextmanager
+def fused_residual_norm_handoff(model):
+    """Hand each pre-norm decoder layer's output, normalized, to the next layer during inference.
+
+    A layer whose `h = a + b` feeds one RMS norm and whose output is `h + E` adds both residuals
+    with the RMS norm that follows them in one launch each, and normalizes its output under the
+    next layer's input norm, which that layer takes only for the exact array it is called with.
+    Layers `fused_residual_norm` covers keep that scope's path; training and distributed models
+    stay native. Instance classes are restored when the context exits.
+    """
+    patched = []
+    try:
+        with _RESIDUAL_NORM_LOCK:
+            if not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None) and mx.metal.is_available():
+                for _, module in model.named_modules() if hasattr(model, "named_modules") else ():
+                    base = type(module)
+                    # Type first, as in fused_residual_norm: named_modules() may yield plain stand-ins.
+                    if not isinstance(module, dict) or module.training:
+                        continue
+                    if hasattr(base, "_unsloth_residual_norm_base") or _residual_norm_class(base) is not None:
+                        continue
+                    fused = _prenorm_class(base)
+                    if (fused is not None and all(type(getattr(module, name, None)) is nn.RMSNorm
+                                                 for name in fused._unsloth_residual_norm_names)):
+                        patched.append((module, base, fused))
+                        module.__class__ = fused
+                owned = {id(module) for module, _, _ in patched}
+                for module in (module for _, module in model.named_modules()) if owned else ():
+                    layers = module.get("layers") if isinstance(module, dict) else None
+                    if not isinstance(layers, list):
+                        continue
+                    for producer, consumer in zip(layers, layers[1:]):
+                        if (id(producer) in owned and id(consumer) in owned
+                                and getattr(type(consumer), "_unsloth_handoff_norm", None) is not None):
+                            producer.__dict__["_unsloth_handoff_out"] = consumer.__dict__["_unsloth_handoff_in"] = _Handoff(consumer)
+        yield model
+    finally:
+        with _RESIDUAL_NORM_LOCK:
+            for module, base, fused in reversed(patched):
+                for name in ("_unsloth_handoff_out", "_unsloth_handoff_in"):
+                    module.__dict__.pop(name, None)
                 if type(module) is fused:
                     module.__class__ = base
 
