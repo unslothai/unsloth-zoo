@@ -3106,12 +3106,8 @@ TEMPORARY_PATCHES.append(patch_granitemoe_router_logits_recording)
 
 
 def patch_mamba_ssm_chunk_scan_device_guard():
-    """Run mamba_ssm's `_chunk_scan_fwd` on its inputs' device.
-
-    `_chunk_scan_fwd_kernel` is mamba_ssm's only Triton launch without
-    `torch.cuda.device(x.device.index)`, so on a multi-GPU device_map it runs on
-    cuda:0's stream and races, giving zero/NaN outputs (NemotronH, Falcon-H1).
-    """
+    """`_chunk_scan_fwd_kernel` lacks a device guard, so on multi-GPU device_map it runs
+    on cuda:0's stream and races: zero/NaN outputs (NemotronH, Falcon-H1)."""
     import sys
     try:
         if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
