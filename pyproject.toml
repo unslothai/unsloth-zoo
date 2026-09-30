@@ -42,17 +42,12 @@ dependencies = [
     # GenerationBatch.Response and BatchGenerator.next_generated, which batched
     # generation drives, first ship in mlx-lm 0.31.2.
     "mlx-lm==0.31.3 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
-    # A ceiling rather than an exact pin, because the two consumers resolve
-    # different patches and both are correct. Under the darwin + arm64 half of
-    # the transformers cap below, which stays at <=5.5.0 for exactly this
-    # reason, the newest mlx-vlm that fits is 0.6.4 (0.6.5+ requires
-    # transformers>=5.14). Studio's installer overrides that requirement, so it
-    # gets a 0.7.x -- which matters: the UnicodeDecodeError during generation in
-    # unsloth #9466 is fixed in 0.6.9. Pinning either patch exactly would make
-    # one of those two environments unresolvable or reintroduce a fixed bug.
-    # The ceiling admits 0.7.4; this package handles the gated-delta keywords
-    # and reworked MoE switch layer of 0.7.1 and the separate qwen3_5_text
-    # decoders of 0.7.4, so the installer constrains rather than overrides it.
+    # A ceiling rather than an exact pin: mlx-vlm 0.6.5+ requires
+    # transformers>=5.14, so an environment holding an older transformers still
+    # resolves 0.6.4. The UnicodeDecodeError during generation in unsloth #9466
+    # is fixed in 0.6.9. The ceiling admits 0.7.4; this package handles the
+    # gated-delta keywords and reworked MoE switch layer of 0.7.1 and the
+    # separate qwen3_5_text decoders of 0.7.4.
     "mlx-vlm>=0.4.4,<=0.7.4 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
     # --- Shared deps (all platforms) ---
     "packaging>=24.1",
@@ -65,24 +60,12 @@ dependencies = [
     # 4.52.0 because 4.52.0 through 4.52.3 were already rejected by name, which is also
     # why those four `!=` entries are gone: the floor now dominates them.
     #
-    # Marker-split on purpose, and the two halves answer different questions.
-    #
-    # Everywhere except Apple Silicon the ceiling is the newest release the version
-    # matrix was run against. 5.5.0 held it until now, and 5.5.0 is exactly where
-    # prequantized bnb-4bit checkpoints lose quant_state on every Linear4bit (unsloth
-    # #9867, #10010, #10017, #10276). It also puts the Gemma 4 E4B LoRA fix one patch
-    # release out of reach, since that shipped in 5.5.2 (unsloth #5355). Every `!=` that
-    # remains is a release that was tested and rejected, so they all stay.
-    #
-    # On darwin + arm64 the ceiling stays at 5.5.0, because it is not only a transformers
-    # cap there: it is what holds the joint MLX resolution at mlx-vlm 0.6.4 (0.6.5 and up
-    # require transformers >= 5.14.0). The mlx and mlx-lm pins above are deliberate for the
-    # same reason, tests/mlx_simulation models the 0.6.4 surface, and moving that stack is
-    # a decision for the Apple Silicon lane to make on its own rather than a side effect of
-    # a CUDA-motivated bump. The CEILING gate in consolidated-tests-ci.yml holds this half
-    # at 5.5.0 and is what makes an accidental move fail loudly.
-    "transformers>=4.52.4,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.17.0 ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
-    "transformers>=4.52.4,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.5.0 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
+    # The ceiling is the newest release the version matrix was run against, on CUDA and on
+    # Apple Silicon. 5.5.0 is exactly where prequantized bnb-4bit checkpoints lose
+    # quant_state on every Linear4bit (unsloth #9867, #10010, #10017, #10276), and the
+    # Gemma 4 E4B LoRA fix shipped in 5.5.2 (unsloth #5355). Every `!=` that remains is a
+    # release that was tested and rejected, so they all stay.
+    "transformers>=4.52.4,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.17.0",
     "datasets>=3.4.1,!=4.0.*,!=4.1.0,!=4.4.*,!=4.5.0,<5.0.0",
     "sentencepiece>=0.2.0",
     "tqdm",
@@ -127,10 +110,8 @@ mlx = [
 core = [
     "packaging>=24.1",
     "tyro",
-    # Same marker split as the base dependency list above; see the comment
-    # there, including why the floor is 4.52.4.
-    "transformers>=4.52.4,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.17.0 ; (sys_platform != 'darwin' or platform_machine != 'arm64')",
-    "transformers>=4.52.4,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.5.0 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
+    # Same as the base dependency list above; see the comment there.
+    "transformers>=4.52.4,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.17.0",
     "datasets>=3.4.1,!=4.0.*,!=4.1.0,!=4.4.*,!=4.5.0,<5.0.0",
     "sentencepiece>=0.2.0",
     "tqdm",
