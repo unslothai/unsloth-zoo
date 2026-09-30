@@ -95,6 +95,27 @@ def test_cached_position_attribute_does_not_imply_multiaxis_rope():
 
 
 @metal_only
+def test_qwen3_vl_pos_embed_interpolation_with_quantized_table():
+    from types import SimpleNamespace
+    from mlx_vlm.models.qwen3_vl.vision import VisionModel
+    from unsloth_zoo.mlx import compile as mc
+
+    mc._install_qwen3_family_compile_patches()
+    assert VisionModel.fast_pos_embed_interpolate.__module__ == mc.__name__
+    table = nn.QuantizedEmbedding.from_embedding(nn.Embedding(16, 64))
+
+    class Dense:  # the same rows behind a float weight
+        weight = mx.zeros((1,))
+        __call__ = staticmethod(table)
+
+    out = [VisionModel.fast_pos_embed_interpolate(
+        SimpleNamespace(num_grid_per_side=4, pos_embed=embed, config=SimpleNamespace(spatial_merge_size=2)),
+        [(1, 6, 8)]) for embed in (table, Dense())]
+    assert table.weight.dtype == mx.uint32
+    assert mx.array_equal(out[0], out[1]).item()
+
+
+@metal_only
 @pytest.mark.parametrize("static", [False, True])
 def test_native_vlm_names_preserve_source_remaps_and_transforms(monkeypatch, static):
     import inspect
