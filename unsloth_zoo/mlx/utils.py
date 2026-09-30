@@ -1921,7 +1921,6 @@ def _cce_head_ineligibility(desc):
 
 
 def _rotate_head_input(head, hidden):
-    """Apply the input rotation a Hadamard-packed head performs before its matmul."""
     if getattr(head, "block", 0) and _is_hadamard_packed_linear(head):
         return _hadamard_pack_module().hadamard_transform(hidden, head.block, head.signs)
     return hidden
@@ -14723,7 +14722,6 @@ def _hadamard_dense_weight(layer):
 
 
 def _unpack_hadamard_modules(model):
-    """Swap every Hadamard-packed layer for the dense layer it encodes; True if any."""
     pack = _hadamard_pack_module()
     if pack is None:
         return False
@@ -14760,11 +14758,7 @@ def _dense_hadamard_pack_config(config):
 
 
 class LoRAHadamardLinear(nn.Module):
-    """LoRA for mlx-vlm's ``HadamardQuantizedLinear``.
-
-    The base rotates its own input, so the adapter reads the unrotated activation
-    and fusing has to rotate the dequantized weight back first.
-    """
+    """The base rotates its own input: the adapter reads the unrotated activation, fuse rotates back."""
 
     @staticmethod
     def supports(module):
@@ -14792,7 +14786,6 @@ class LoRAHadamardLinear(nn.Module):
 
     def fuse(self, dequantize=False):
         if not dequantize:
-            # Measured on Ternary Bonsai 2 27B: re-packing into 2 bits rounds away almost all of a trained adapter.
             raise ValueError(
                 "Unsloth: merging LoRA back into 2-bit Hadamard-packed weights discards the adapter. "
                 "Save with save_method='merged_16bit', or keep the LoRA adapter."
