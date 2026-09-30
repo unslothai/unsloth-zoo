@@ -28,8 +28,8 @@ def _processor():
     from transformers import AutoProcessor
     try:
         return AutoProcessor.from_pretrained(TINY)
-    except Exception as e:
-        pytest.skip(f"{TINY} processor unavailable: {type(e).__name__}: {e}")
+    except OSError as e:  # Hub / network unavailable only; config or API breaks must fail
+        pytest.skip(f"{TINY} not downloadable: {e}")
 
 
 @pytest.mark.parametrize("batch", [1, 2])
