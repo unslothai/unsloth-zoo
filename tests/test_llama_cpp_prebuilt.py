@@ -339,6 +339,17 @@ def test_extract_without_data_filter_rejects_hardlink_alias_of_symlink(tmp_path,
     assert not (out.parent / "pwned.txt").exists()
 
 
+def test_extract_without_data_filter_treats_backslash_as_separator(tmp_path, monkeypatch):
+    monkeypatch.delattr(tarfile, "data_filter", raising = False)
+    monkeypatch.setattr(llama_cpp.tarfile.TarFile, "extractall", lambda *a, **k: None)
+    evil = tmp_path / "evil-backslash.tar.gz"
+    with tarfile.open(evil, "w:gz") as tar:
+        _add_link(tar, "sub", ".")
+        _add_file(tar, "sub\\pwned.txt", "pwned")
+    with pytest.raises(RuntimeError, match = "goes through a link"):
+        llama_cpp._extract_archive(str(evil), str(tmp_path / "out"))
+
+
 @pytest.mark.skipif(not IS_POSIX, reason = "symlink extraction (POSIX)")
 def test_extract_without_data_filter_keeps_library_symlinks(tmp_path, monkeypatch):
     monkeypatch.delattr(tarfile, "data_filter", raising = False)
