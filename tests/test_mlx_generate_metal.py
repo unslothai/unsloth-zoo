@@ -386,6 +386,16 @@ def test_vlm_stream_rows_resume_from_their_own_quantized_cache_bitwise(monkeypat
     with pytest.raises(BatchRowRefused, match="laid out unlike"):
         run(GenerationRequest(prompt=fruit, prompt_cache_state=_RowCacheState(quantized(4))),
             GenerationRequest(prompt=fruit, prompt_cache_state=_RowCacheState(quantized(8))))
+    # A uniformly quantizing stream converts a float row from its first token, as mlx-vlm's batch does.
+    streamed = _RowCacheState(make_prompt_cache(model.language_model), {2048})
+    defaults = GenerationDefaults(max_tokens=12, prefill_batch_size=1, completion_batch_size=4, kv_bits=4)
+    with BatchStream(model, processor, defaults=defaults) as stream:
+        row = stream.add(GenerationRequest(prompt=prompt, prompt_cache_state=streamed))
+        results = {}
+        while row not in results:
+            results.update((e.index, e.result) for e in stream.step() if e.result is not None)
+    assert results[row].finish_reason in ("stop", "length")
+    assert isinstance(streamed.kept[2048][0], QuantizedKVCache)
 
 
 @metal_only

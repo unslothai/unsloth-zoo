@@ -2213,7 +2213,11 @@ def _row_quantizer(batch_module, options: dict):
         for name in ("kv_group_size", "quantized_kv_start")
         if name in params and params[name].default is not inspect.Parameter.empty
     }
-    return functools.partial(batch_module.maybe_quantize_kv_cache, **{**defaults, **options})
+    options = {**defaults, **options}
+    if not batch_module.turboquant_enabled(options["kv_bits"], options.get("kv_quant_scheme")):
+        # mlx-vlm's batch quantizes a uniform cache from the first token, whatever the start.
+        options["quantized_kv_start"] = 0
+    return functools.partial(batch_module.maybe_quantize_kv_cache, **options)
 
 
 def _decode_layout(cache: list, quantize) -> tuple | None:
