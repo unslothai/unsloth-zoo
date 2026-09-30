@@ -104,3 +104,20 @@ def test_patch_is_idempotent():
     assert ssd_chunk_scan._chunk_scan_fwd is first
     assert getattr(first, "_unsloth_device_guarded", False)
     assert ssd_combined._chunk_scan_fwd is first
+
+
+def test_patch_rebinds_stale_copy_after_reload():
+    # fix_mamba_ssm_float32 reloads ssd_chunk_scan, so ssd_combined keeps the pre-reload function.
+    pytest.importorskip("mamba_ssm.ops.triton.ssd_combined")
+    import importlib
+    from unsloth_zoo.temporary_patches.misc import patch_mamba_ssm_chunk_scan_device_guard
+    from mamba_ssm.ops.triton import ssd_chunk_scan, ssd_combined
+
+    importlib.reload(ssd_chunk_scan)
+    ssd_combined._chunk_scan_fwd = ssd_chunk_scan._chunk_scan_fwd
+    importlib.reload(ssd_chunk_scan)
+    assert ssd_combined._chunk_scan_fwd is not ssd_chunk_scan._chunk_scan_fwd
+
+    patch_mamba_ssm_chunk_scan_device_guard()
+    assert getattr(ssd_chunk_scan._chunk_scan_fwd, "_unsloth_device_guarded", False)
+    assert ssd_combined._chunk_scan_fwd is ssd_chunk_scan._chunk_scan_fwd

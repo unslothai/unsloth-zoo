@@ -3120,21 +3120,29 @@ def patch_mamba_ssm_chunk_scan_device_guard():
     except Exception:
         return
     original = getattr(ssd_chunk_scan, "_chunk_scan_fwd", None)
-    if original is None or getattr(original, "_unsloth_device_guarded", False):
+    if original is None:
         return
+    if getattr(original, "_unsloth_device_guarded", False):
+        _chunk_scan_fwd = original
+    else:
+        @functools.wraps(original)
+        def _chunk_scan_fwd(cb, x, *args, **kwargs):
+            if x.is_cuda and x.device.index != torch.cuda.current_device():
+                with torch.cuda.device(x.device):
+                    return original(cb, x, *args, **kwargs)
+            return original(cb, x, *args, **kwargs)
+        _chunk_scan_fwd._unsloth_device_guarded = True
 
-    @functools.wraps(original)
-    def _chunk_scan_fwd(cb, x, *args, **kwargs):
-        if x.is_cuda and x.device.index != torch.cuda.current_device():
-            with torch.cuda.device(x.device):
-                return original(cb, x, *args, **kwargs)
-        return original(cb, x, *args, **kwargs)
-    _chunk_scan_fwd._unsloth_device_guarded = True
-
-    # ssd_combined (and anything else) bound the function by name at import.
+    # ssd_combined (and anything else) bound the function by name at import. Match by
+    # origin, not identity: fix_mamba_ssm_float32 reloads ssd_chunk_scan, leaving stale copies.
     for name, module in list(sys.modules.items()):
-        if (name == "mamba_ssm" or name.startswith("mamba_ssm.")) and \
-                getattr(module, "_chunk_scan_fwd", None) is original:
+        if not (name == "mamba_ssm" or name.startswith("mamba_ssm.")):
+            continue
+        fn = getattr(module, "_chunk_scan_fwd", None)
+        if fn is None or fn is _chunk_scan_fwd or getattr(fn, "_unsloth_device_guarded", False):
+            continue
+        if getattr(fn, "__module__", None) == ssd_chunk_scan.__name__ and \
+                getattr(fn, "__name__", None) == "_chunk_scan_fwd":
             setattr(module, "_chunk_scan_fwd", _chunk_scan_fwd)
 pass
 TEMPORARY_PATCHES.append(patch_mamba_ssm_chunk_scan_device_guard)
