@@ -14,14 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""prepare_model_for_training must keep LoRA on nn.Embedding trainable.
-
-PEFT stores LoRA for nn.Embedding as ParameterDicts named lora_embedding_A /
-lora_embedding_B (e.g. "embed_tokens.lora_embedding_A.default"), not lora_A /
-lora_B submodules. The LoRA filter only matched ".lora_A." / ".lora_B.", so any
-embedding LoRA (target_modules including embed_tokens, or an nn.Embedding audio
-tower as in Inkling) was frozen with no warning. Pure CPU, tiny Llama.
-"""
+"""prepare_model_for_training must keep LoRA on nn.Embedding (lora_embedding_A/B) trainable."""
 import pytest
 import torch
 from transformers import LlamaConfig, LlamaForCausalLM
@@ -73,7 +66,6 @@ def test_embedding_lora_stays_trainable():
     _prepare(model)
     frozen = [n for n, p in _embedding_lora(model).items() if not p.requires_grad]
     assert not frozen, f"embedding LoRA frozen by prepare_model_for_training: {frozen}"
-    # Linear LoRA is still trainable and the base embedding is still frozen.
     params = dict(model.named_parameters())
     assert any(p.requires_grad for n, p in params.items() if ".lora_A." in n)
     base = next(n for n in params if n.endswith("embed_tokens.base_layer.weight"))
@@ -84,7 +76,6 @@ def test_embedding_lora_receives_gradient():
     model = _tiny_lora_llama()
     _prepare(model)
     input_ids = torch.randint(0, 64, (2, 8))
-    # Loss from logits, not labels=, so the test stays CPU-only.
     logits = model(input_ids = input_ids).logits.float()
     loss = torch.nn.functional.cross_entropy(
         logits.view(-1, logits.size(-1)), input_ids.view(-1))
@@ -93,15 +84,12 @@ def test_embedding_lora_receives_gradient():
     for n, p in emb.items():
         assert p.grad is not None, f"{n} got no gradient"
         assert torch.isfinite(p.grad).all(), n
-    # PEFT zero-inits lora_embedding_A (not B, unlike Linear LoRA), so on the first
-    # step only A has a non-zero gradient.
+    # PEFT zero-inits lora_embedding_A (not B), so only A has a first-step gradient.
     a = next(p for n, p in emb.items() if ".lora_embedding_A." in n)
     assert a.grad.abs().sum() > 0
 
 
 def test_embedding_lora_upcast_like_linear_lora():
-    """bf16 model: embedding LoRA is upcast to float32 like lora_A / lora_B and
-    the forward still runs."""
     model = _tiny_lora_llama(dtype = torch.bfloat16)
     _prepare(model)
     params = dict(model.named_parameters())
