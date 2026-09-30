@@ -382,11 +382,8 @@ def get_chat_template_parts(tokenizer):
         except Exception:
             pass
 
-    # Some templates give the LAST assistant turn a different header than history turns
-    # (ERNIE-4.5-Thinking: history "assistant\n<response>\n", last "assistant\n<think>\n\n</think>\n<response>\n").
-    # The gap mode is then the history header, which a single-turn row never contains, so every
-    # such row is masked away. Shorten the marker to what every turn shares, cut back to a
-    # whitespace / special-token boundary, and only if it cannot match the assistant-to-user gap.
+    # Last assistant header can differ from history ones (ERNIE-4.5-Thinking adds <think></think>);
+    # shrink the marker to the shared prefix so single-turn rows are not fully masked.
     _a_starts = starts(full, A)
     _resp_gaps = [full[e : min(s for s in _a_starts if s >= e)] for e in ends(full, U) if any(s >= e for s in _a_starts)]
     _off = resp_gap.find(response_part) if response_part else -1
@@ -2136,9 +2133,7 @@ def train_on_responses_only(
     if _pads_through_a_processor(getattr(trainer, "data_collator", None)):
         _refuse_packing_that_will_not_happen(trainer.data_collator, None)
 
-    # Map both splits before assigning either: a raise on eval_dataset must not leave
-    # train_dataset already masked + filtered, since a retry with other markers would
-    # intersect with those stale labels and mask everything.
+    # Map both splits before assigning: a raise on eval must not leave train half-masked for a retry.
     _new_train = _new_eval = None
     if hasattr(trainer, "train_dataset") and trainer.train_dataset is not None:
         if not hasattr(trainer.train_dataset, "map"):

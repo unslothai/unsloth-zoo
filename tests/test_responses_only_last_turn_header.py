@@ -14,15 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Auto-detect must pick a response marker the LAST assistant turn carries.
-
-ERNIE-4.5-Thinking renders history assistant turns as "<|im_start|>assistant\\n<response>\\n..."
-but the last one as "<|im_start|>assistant\\n<think>\\n\\n</think>\\n<response>\\n...". The gap
-mode of the 3-turn probe is the history header, which a single-turn row never contains, so
-every single-turn row was masked away ("masked every label to -100 in eval_dataset").
-Also: a raise on eval_dataset must leave train_dataset untouched, else a retry with other
-markers intersects with the stale labels and masks everything.
-"""
+"""Auto-detect must pick a response marker the LAST assistant turn carries (ERNIE-4.5-Thinking),
+and a raise on eval_dataset must leave train_dataset untouched."""
 import types
 
 import pytest
@@ -31,7 +24,6 @@ import pytest
 def _setup():
     from transformers import AutoTokenizer
     tok = None
-    # Prefer a cached tokenizer; otherwise fetch the small hf-internal-testing one.
     for repo, offline in (("hf-internal-testing/llama-tokenizer", True), ("Qwen/Qwen2.5-0.5B-Instruct", True),
                           ("hf-internal-testing/llama-tokenizer", False)):
         try:
