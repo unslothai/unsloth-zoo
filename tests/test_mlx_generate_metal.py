@@ -272,6 +272,25 @@ class _RowCacheState:
         self.kept[token_count] = _own_copy(cache)
 
 
+class _SharedPrefixState(_RowCacheState):
+    """Resumes the longest prefix any row banked into ``banked``, as a caller's store does."""
+
+    def __init__(self, banked, make_cache):
+        super().__init__(None)
+        self.banked, self.make_cache = banked, make_cache
+
+    def open(self, token_ids):
+        self.ids = tuple(token_ids)
+        hits = [ids for ids in self.banked if len(ids) < len(token_ids) and self.ids[:len(ids)] == ids]
+        best = max(hits, key=len, default=())
+        cache = _own_copy(self.banked[best]) if best else self.make_cache()
+        return cache, range(len(best) + 1, len(token_ids))
+
+    def checkpoint(self, token_count, cache):
+        super().checkpoint(token_count, cache)
+        self.banked[self.ids[:token_count]] = self.kept[token_count]
+
+
 @metal_only
 def test_vlm_stream_rows_resume_from_their_own_cache_bitwise():
     from mlx_vlm import load
@@ -327,6 +346,18 @@ def test_vlm_stream_rows_resume_from_their_own_cache_bitwise():
     states = lambda cache: [v for _, v in tree_flatten([entry.state for entry in cache])]
     for got, want in ((first.kept[4096], kept[4096]), (second.kept[2048], alone.kept[2048])):
         assert all(mx.array_equal(a, b).item() for a, b in zip(states(got), states(want), strict=True))
+    # Rows added together resume, when their prefill starts, from what the rows ahead banked.
+    ask = lambda question: apply_chat_template(processor, model.config, f"{rules} {question}", num_images=0)
+    short, long = ask("Name a colour."), ask("Name a fruit, then a vegetable.")
+    seed, make = {}, lambda: make_prompt_cache(lm)
+    (cold,) = run(GenerationRequest(prompt=long, prompt_cache_state=_SharedPrefixState(seed, make)))
+    # Both rows are added resuming 2048 tokens; the later one takes the 4096 the earlier banks.
+    banked = {ids: cache for ids, cache in seed.items() if len(ids) == 2048}
+    rows = run(*(GenerationRequest(prompt=p, prompt_cache_state=_SharedPrefixState(banked, make))
+                 for p in (long, short)))
+    assert [row.cached_token_count for row in rows] == [4096, 2048]
+    # Its prefill, which yields the first token, is the cold row's; decode depends on neighbours.
+    assert (rows[0].token_ids[0], rows[0].logprobs[0]) == (cold.token_ids[0], cold.logprobs[0])
     # Rows merge by cache class and keep the receiving cache's window.
     for cache in (None, make_prompt_cache(lm, max_kv_size=8192)):
         other = None if cache is None else state(cache)
@@ -396,6 +427,16 @@ def test_vlm_stream_rows_resume_from_their_own_quantized_cache_bitwise(monkeypat
             results.update((e.index, e.result) for e in stream.step() if e.result is not None)
     assert results[row].finish_reason in ("stop", "length")
     assert isinstance(streamed.kept[2048][0], QuantizedKVCache)
+    # Float rows added together resume, when their prefill starts, from the quantized prefix banked ahead.
+    ask = lambda question: apply_chat_template(processor, model.config, f"{rules} {question}", num_images=0)
+    banked, make = {}, lambda: make_prompt_cache(model.language_model)
+    with BatchStream(model, processor, defaults=defaults) as stream:
+        rows = [stream.add(GenerationRequest(prompt=ask(q), prompt_cache_state=_SharedPrefixState(banked, make)))
+                for q in ("Name a fruit, then a vegetable.", "Name a colour.")]
+        results = {}
+        while len(results) < len(rows):
+            results.update((e.index, e.result) for e in stream.step() if e.result is not None)
+    assert results[rows[0]].cached_token_count >= 2048 and results[rows[1]].cached_token_count == 0
 
 
 @metal_only
