@@ -303,6 +303,24 @@ def test_extract_rejects_symlink_escape(tmp_path):
     assert not (outside / "pwned.txt").exists()
 
 
+@pytest.mark.skipif(not IS_POSIX, reason = "symlink extraction (POSIX)")
+def test_extract_rejects_chained_symlink_escape(tmp_path):
+    # Each link resolves inside when checked up front against an empty tree; only
+    # once `sub -> .` exists does `sub/up -> ..` point above the extraction dir.
+    evil = tmp_path / "evil-chain.tar.gz"
+    out = tmp_path / "stage" / "out"
+    out.parent.mkdir()
+    with tarfile.open(evil, "w:gz") as tar:
+        _add_link(tar, "sub", ".")
+        _add_link(tar, "sub/up", "..")
+        _add_file(tar, "sub/up/pwned.txt", "pwned")
+    if not hasattr(tarfile, "data_filter"):
+        pytest.skip("tarfile has no data filter on this Python")
+    with pytest.raises(Exception):
+        llama_cpp._extract_archive(str(evil), str(out))
+    assert not (out.parent / "pwned.txt").exists()
+
+
 def test_extract_rejects_hardlink_escape(tmp_path):
     evil = tmp_path / "evil-hardlink.tar.gz"
     with tarfile.open(evil, "w:gz") as tar:

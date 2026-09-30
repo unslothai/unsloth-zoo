@@ -174,6 +174,9 @@ def install_to_cache(source_path, destination_filename=None):
         # up the atomicity above, so the readback below is what keeps a partial
         # copy from being used.
         try:
+            # Writing through a planted symlink would clobber whatever it targets.
+            if os.path.islink(destination):
+                raise OSError("destination is a symlink")
             shutil.copy(current_file, destination)
         except Exception as copy_error:
             _log_info(

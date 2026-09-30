@@ -2351,6 +2351,41 @@ def test_copy_source_sidecars_preserves_image_processor_metadata(tmp_path):
         assert not (dst / skipped).exists()
 
 
+def test_copy_source_sidecars_refuses_symlinks_leaving_the_model(tmp_path):
+    import unsloth_zoo.mlx.utils as mutils
+
+    secret = tmp_path / "secret.txt"
+    secret.write_text("private", encoding="utf-8")
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    dst.mkdir()
+    (src / "vocab.txt").write_text("vocab", encoding="utf-8")
+    (src / "leak.txt").symlink_to(secret)
+    (src / "inside.txt").symlink_to(src / "vocab.txt")
+
+    assert mutils._copy_source_sidecars(src, dst) == 2
+    assert not (dst / "leak.txt").exists()
+    assert (dst / "inside.txt").read_text(encoding="utf-8") == "vocab"
+
+
+def test_copy_source_sidecars_follows_hf_snapshot_blob_links(tmp_path):
+    import unsloth_zoo.mlx.utils as mutils
+
+    repo = tmp_path / "models--org--name"
+    blob = repo / "blobs" / "abc123"
+    blob.parent.mkdir(parents=True)
+    blob.write_text("template", encoding="utf-8")
+    snapshot = repo / "snapshots" / "sha"
+    snapshot.mkdir(parents=True)
+    (snapshot / "chat_template.jinja").symlink_to(blob)
+    dst = tmp_path / "dst"
+    dst.mkdir()
+
+    assert mutils._copy_source_sidecars(snapshot, dst) == 1
+    assert (dst / "chat_template.jinja").read_text(encoding="utf-8") == "template"
+
+
 def test_copy_source_sidecars_ignores_non_directory_source(tmp_path):
     import unsloth_zoo.mlx.utils as mutils
 

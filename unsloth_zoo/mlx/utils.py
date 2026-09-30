@@ -18186,6 +18186,9 @@ def _copy_source_sidecars(src_path, path):
             continue
         if suffix not in _MODEL_SIDECAR_SUFFIXES:
             continue
+        if not _asset_link_stays_in_the_model(source, src_path):
+            print(f"Unsloth: skipped {name}: symlink leaves the model directory")
+            continue
         target = path / name
         if target.exists():
             continue

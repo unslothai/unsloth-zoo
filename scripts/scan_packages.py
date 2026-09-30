@@ -1454,6 +1454,41 @@ _PIP_DOWNLOAD_PIN_FLAGS = [
 _RE_PKG_NAME_SANITIZE = re.compile(r"[^A-Za-z0-9._-]")
 
 
+# `--only-binary :all:` only filters index candidates. pip still prepares a
+# VCS, URL or local-path requirement itself, running its build backend for
+# metadata before scan_archive() sees a byte, so only name/version specs
+# resolved from the index may reach pip.
+_RE_INDEX_SPEC = re.compile(
+    r"^[A-Za-z0-9]([A-Za-z0-9._-]*[A-Za-z0-9])?\s*(\[[A-Za-z0-9._,\s-]*\])?"
+    r"[\s()<>=!~*+,.A-Za-z0-9_-]*$"
+)
+_LOCAL_ARCHIVE_SUFFIXES = (
+    ".whl", ".zip", ".tar", ".gz", ".tgz", ".bz2", ".tbz",
+    ".xz", ".txz", ".lz", ".tlz", ".lzma",
+)
+
+
+def _split_index_specs(specs: list[str], download_errors: list[str]) -> list[str]:
+    """Keep specs pip resolves from the index; record the rest as scan errors."""
+    kept = []
+    for spec in specs:
+        requirement = spec.split(";", 1)[0].strip()
+        # pip drops trailing extras before its local-archive check.
+        path_like = re.sub(r"\[[^\]]*\]\s*$", "", requirement).lower()
+        if _RE_INDEX_SPEC.match(requirement) and not path_like.endswith(
+            _LOCAL_ARCHIVE_SUFFIXES
+        ):
+            kept.append(spec)
+            continue
+        msg = (
+            f"refusing to download {spec}: VCS, URL and local-path requirements "
+            "run build code before they can be scanned; inspect it manually"
+        )
+        print(f"  [ERROR] {msg}", file = sys.stderr)
+        download_errors.append(msg)
+    return kept
+
+
 def download_packages(
     specs: list[str],
     dest: str,
@@ -1477,6 +1512,9 @@ def download_packages(
     results: list[tuple[str, str]] = []
     download_errors: list[str] = []
     env = _pip_download_env()
+    specs = _split_index_specs(specs, download_errors)
+    if not specs:
+        return results, download_errors
 
     if with_deps:
         # Single pip download call for all specs + their transitive deps.

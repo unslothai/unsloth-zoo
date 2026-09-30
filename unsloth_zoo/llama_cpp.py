@@ -1278,7 +1278,9 @@ def _extract_archive(archive_path, extract_dir):
                     raise RuntimeError(f"Unsloth: Archive contains an unsupported symlink: {member.filename}")
             archive.extractall(extract_dir)
     else:
-        tar_kwargs = {"filter": "data"} if sys.version_info >= (3, 12) else {}
+        # The data filter checks each member against what is already on disk, which
+        # the upfront pass cannot. 3.8.17 / 3.9.17 / 3.10.12 / 3.11.4 backport it.
+        tar_kwargs = {"filter": "data"} if hasattr(tarfile, "data_filter") else {}
         with tarfile.open(archive_path, "r:gz") as archive:
             # Validate every member (rejecting links whose targets escape) before
             # extracting anything, so no escaping symlink is ever written for a
