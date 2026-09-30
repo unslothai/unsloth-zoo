@@ -233,8 +233,11 @@ def test_vlm_batched_generation_is_ordered_and_aligned():
     tail = events[-1]
     body = events[:-1]
     assert results[0].token_ids == [int(event.token) for event in body]
+    # Both sides compute `logits - logsumexp` in bf16, and for this prompt the chosen logit
+    # and logsumexp are ~19, a 0.125 grid. On M1 with mlx-vlm 0.7.x batched and sequential
+    # prefill land one step apart, so one step is allowed and two are not.
     assert results[0].logprobs == pytest.approx(
-        [float(event.logprobs[event.token].item()) for event in body], abs=0.02)
+        [float(event.logprobs[event.token].item()) for event in body], abs=0.125)
     assert results[0].text == "".join(event.text for event in events)
     assert tail is not None
     assert results[0].finish_reason == ("stop" if len(body) < 4 else "length")
