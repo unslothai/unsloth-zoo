@@ -5327,10 +5327,22 @@ def merge_and_overwrite_lora(
         if _add_keys_to_index(save_directory, _seeded_head_keys) and push_to_hub:
             upload_items("model.safetensors.index.json")
 
-    # The normalized state_dict also contains biases outside LoRA targets (bias="all").
+    # Use the adapter configuration, not requires_grad: a trained adapter can be
+    # reloaded frozen for export. Preserve base-checkpoint precision for untrained biases.
+    peft_config = getattr(model, "peft_config", {})
+    bias_modes = {
+        getattr(peft_config.get(adapter), "bias", "none")
+        for adapter in getattr(model, "active_adapters", ["default"])
+    }
+    bias_modules = {
+        key for key, stats in lora_weights.items()
+        if getattr(stats.module, "modules_to_save", None) is not None
+        or ("lora_only" in bias_modes and stats.lora_A is not None)
+    }
     biases = defaultdict(lambda: None, {
         key[:-len(".bias")] : value for key, value in state_dict.items()
         if key.endswith(".bias") and isinstance(value, torch.Tensor)
+        and ("all" in bias_modes or key[:-len(".bias")] in bias_modules)
     })
     for filename in ProgressBar(final_safetensors_list, desc=f'Unsloth: Merging weights into {"mxfp4" if save_method=="mxfp4" else "16bit"}'):
         if _mxfp4_rewrite is not None:
