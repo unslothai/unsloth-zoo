@@ -33,6 +33,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from threading import RLock
 from types import FunctionType
+from typing import NamedTuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -163,11 +164,16 @@ def _moe_switch_specs():
 
 
 def _moe_gate_up_eligible(module, projection_type):
+    return (_moe_gate_up_packable(module, projection_type)
+            and not (module.training or module.gate_proj.training or module.up_proj.training))
+
+
+def _moe_gate_up_packable(module, projection_type):
+    """`_moe_gate_up_eligible` in any training mode."""
     gate, up = module.gate_proj, module.up_proj
     if type(gate) is not projection_type or type(up) is not projection_type:
         return False
-    if (module.training or gate.training or up.training
-            or gate.trainable_parameters() or up.trainable_parameters()):
+    if gate.trainable_parameters() or up.trainable_parameters():
         return False
     if (gate.group_size, gate.bits, gate.mode) != (up.group_size, up.bits, up.mode):
         return False
@@ -2670,11 +2676,10 @@ def _nax_small_m_qmm(module, x, bindings):
     return routed.reshape(*x.shape[:-1], N) if verified else None
 
 
-def _nax_int8_qmm_eligible(x, w, scales, biases, group_size, bits, mode):
-    K = x.shape[-1]
+def _nax_int8_qmm_eligible(K, dtype, w, scales, biases, group_size, bits, mode):
     return (all(isinstance(a, mx.array) for a in (w, scales, biases))
             and nax.int8_qmm_supported(w.shape[-2], K, group_size, bits, mode)
-            and x.dtype in (mx.bfloat16, mx.float16) and x.dtype == scales.dtype == biases.dtype
+            and dtype in (mx.bfloat16, mx.float16) and dtype == scales.dtype == biases.dtype
             and w.dtype == mx.uint32 and w.shape[-1] == K * bits // 32
             and scales.shape == (*w.shape[:-1], K // group_size) and biases.shape == scales.shape)
 
@@ -2743,7 +2748,8 @@ def _nax_int8_prefill_dense(module, x, bindings):
     if module.training or not _bindings_intact(bindings):
         return None
     w, scales, biases = module.get("weight"), module.get("scales"), module.get("biases")
-    if not _nax_int8_qmm_eligible(x, w, scales, biases, module.group_size, module.bits, module.mode) or w.ndim != 2:
+    if (not _nax_int8_qmm_eligible(x.shape[-1], x.dtype, w, scales, biases, module.group_size, module.bits, module.mode)
+            or w.ndim != 2):
         return None
     N, K = w.shape[0], x.shape[-1]
     routed = _nax_verified_int8_qmm(("dense", N, K, module.bits, x.dtype), x.reshape(-1, K), w, scales, biases,
@@ -2765,7 +2771,7 @@ def _nax_int8_prefill_gather(owner, x, w, scales, biases, indices, sorted_indice
     T = x.shape[0] if token_rows is None else token_rows.shape[0]
     if (not isinstance(indices, mx.array) or indices.shape != (T,)
             or indices.dtype not in (mx.uint32, mx.int32) or not isinstance(w, mx.array) or w.ndim != 3
-            or not _nax_int8_qmm_eligible(x, w, scales, biases, group_size, bits, mode)):
+            or not _nax_int8_qmm_eligible(x.shape[-1], x.dtype, w, scales, biases, group_size, bits, mode)):
         return None
     (E, N, _), K = w.shape, x.shape[-1]
     low = nax.int8_prefill_expert_min_rows(E, N, K, bits, token_rows is not None)
@@ -2847,12 +2853,72 @@ def _nax_qmm_row_range(module):
     return (low, high) if low <= high else None
 
 
-def _nax_a8_supported(module):
-    weight = module.get("weight")
-    if module.training or not isinstance(weight, mx.array) or weight.ndim not in (2, 3) or module.get("biases") is None:
-        return False
-    return nax.int8_qmm_supported(weight.shape[-2], weight.shape[-1] * 32 // module.bits, module.group_size,
-                                      module.bits, module.mode)
+def _nax_int8_prefill_packed(model, predict = False):
+    """The ids of gate and up projections packed into one call quantized per token: those packed
+    now and, with `predict`, also those `fused_moe_gate_up` packs whenever the model generates."""
+    specs = _moe_switch_specs() if predict else {}
+    packed = set()
+    for _, module in model.named_modules() if hasattr(model, "named_modules") else ():
+        pack = getattr(module, "_unsloth_moe_gate_up", None)
+        if isinstance(pack, _PackedMoEGateUp) and type(module) in _MOE_GATE_UP_CLASSES.values():
+            packed.update((id(pack.gate), id(pack.up)))
+        elif type(module) in specs and _moe_gate_up_packable(module, specs[type(module)][0]):
+            packed.update((id(module.gate_proj), id(module.up_proj)))
+    return packed
+
+
+def _nax_int8_prefill_route(module, classes, switches, packed):
+    """The fewest rows at which a quantized linear takes the int8 route, True for a routed-expert
+    projection whose calls it can take (their rows are checked per call), or 0."""
+    base = getattr(type(module), "_unsloth_nax_qmm_native", type(module))
+    dense = base is nn.QuantizedLinear and base in classes
+    if not (dense or base in switches):
+        return 0
+    w, scales, biases = module.get("weight"), module.get("scales"), module.get("biases")
+    if not isinstance(w, mx.array) or w.ndim != (2 if dense else 3):
+        return 0
+    N, K = w.shape[-2], w.shape[-1] * 32 // module.bits
+    dtype = getattr(scales, "dtype", None)
+    if not _nax_int8_qmm_eligible(K, dtype, w, scales, biases, module.group_size, module.bits, module.mode):
+        return 0
+    if dense:
+        return nax.int8_prefill_min_rows(N, K, module.bits)
+    E, bits = w.shape[0], module.bits
+    return bool(nax.int8_prefill_expert_min_rows(E, N, K, bits)
+                or id(module) in packed and nax.int8_prefill_expert_min_rows(E, 2 * N, K, bits, True))
+
+
+class Int8PrefillStatus(NamedTuple):
+    available: bool
+    # "" when available, else "nax_unavailable", "distributed", "no_eligible_projections" or "probe_failed"
+    reason: str
+    projections: int   # quantized linears and routed-expert projections that can take the int8 route
+
+    def __bool__(self):
+        return self.available
+
+
+def int8_prefill_available(model):
+    """Whether `int8_prefill=True` can route any of `model`'s projections to int8 activations
+    when it generates here through `generation_mode`.
+
+    Checks the device, the model's quantization and shapes, then, once per macOS build and MLX
+    version, that the kernels build. It ignores the flag, `UNSLOTH_MLX_INT8_PREFILL` and training
+    mode, and leaves the model unchanged.
+    """
+    if not nax.nax_available():
+        return Int8PrefillStatus(False, "nax_unavailable", 0)
+    if getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
+        return Int8PrefillStatus(False, "distributed", 0)
+    classes = _nax_qmm_classes(nn.QuantizedLinear.__call__, nn.QuantizedEmbedding.as_linear)
+    switches, packed = _nax_int8_prefill_switch_classes(), _nax_int8_prefill_packed(model, predict = True)
+    modules = {id(module): module for _, module in model.named_modules()} if hasattr(model, "named_modules") else {}
+    projections = sum(bool(_nax_int8_prefill_route(module, classes, switches, packed)) for module in modules.values())
+    if not projections:
+        return Int8PrefillStatus(False, "no_eligible_projections", 0)
+    if not nax.kernel_probe_passed(nax.INT8_QMM_PROBE_KEY, nax.__name__, "probe_int8_qmm"):
+        return Int8PrefillStatus(False, "probe_failed", projections)
+    return Int8PrefillStatus(True, "", projections)
 
 
 @contextmanager
@@ -2869,7 +2935,8 @@ def nax_quantized_linear(model, int8_prefill = None):
     `int8_prefill=True`, or `UNSLOTH_MLX_INT8_PREFILL=1` when it is None, also runs prefill-sized
     calls of affine 4- and 8-bit group-64 linears and routed experts with int8 activations
     quantized per row and group: faster, but lossy, and on precision-sensitive checkpoints it can
-    measurably raise the loss on real text. It is decided by the outermost scope.
+    measurably raise the loss on real text. It is decided by the outermost scope;
+    `int8_prefill_available(model)` says whether it takes effect for a model on this machine.
     """
     changed, tracked = [], hasattr(model, "__dict__")
     try:
@@ -2886,6 +2953,7 @@ def nax_quantized_linear(model, int8_prefill = None):
                     and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)):
                 classes = _nax_qmm_classes(nn.QuantizedLinear.__call__, nn.QuantizedEmbedding.as_linear)
                 switches = _nax_int8_prefill_switch_classes() if int8_prefill else {}
+                packed = _nax_int8_prefill_packed(model) if int8_prefill else set()
                 nested, fresh, seen = [], [], set()
                 for _, module in model.named_modules() if hasattr(model, "named_modules") else ():
                     if id(module) in seen:   # named_modules() yields a shared module once per path
@@ -2897,13 +2965,12 @@ def nax_quantized_linear(model, int8_prefill = None):
                             nested.append(module)
                     elif base in classes:
                         rows = _nax_qmm_row_range(module) if small_m else None
-                        int8_prefill_rows = 0
-                        if int8_prefill and base is nn.QuantizedLinear and _nax_a8_supported(module):
-                            N, packed = module.weight.shape
-                            int8_prefill_rows = nax.int8_prefill_min_rows(N, packed * 32 // module.bits, module.bits)
+                        int8_prefill_rows = (int8_prefill and not module.training
+                                     and _nax_int8_prefill_route(module, classes, switches, packed))
                         if rows is not None or int8_prefill_rows:
                             fresh.append((module, rows, int8_prefill_rows))
-                    elif base in switches and _nax_a8_supported(module):
+                    elif (base in switches and not module.training
+                          and _nax_int8_prefill_route(module, classes, switches, packed)):
                         fresh.append((module, None, True))
                 if any(rows is not None for _, rows, _ in fresh) and not nax.kernel_probe_passed(
                         nax.QMM_PROBE_KEY, nax.__name__, "probe_small_m_qmm"):

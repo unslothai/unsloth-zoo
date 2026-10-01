@@ -1376,6 +1376,7 @@ def test_nax_int8_prefill_probes_gate_their_own_route(monkeypatch):
     monkeypatch.setattr(nax, "_A8_ROWS_BY_GPU", {nax._gpu_generation(): _A8_EVERY_ROW})
     monkeypatch.setattr(nax, "_INT8_PREFILL_MIN_K", 0)
     monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {nax._gpu_generation(): _EVERY_ROW})
+    monkeypatch.setattr(nax, "_A8_EXPERT_ROWS_BY_GPU", {nax._gpu_generation(): ((8, 0, 0, 20, False),)})
     for failed in (nax.QMM_PROBE_KEY, nax.INT8_QMM_PROBE_KEY):
         monkeypatch.setattr(nax, "kernel_probe_passed", lambda key, *args: key != failed)
         with inference.nax_quantized_linear(model, True):
@@ -1383,6 +1384,71 @@ def test_nax_int8_prefill_probes_gate_their_own_route(monkeypatch):
             assert bool(model.proj._unsloth_nax_int8_prefill_rows) is (failed != nax.INT8_QMM_PROBE_KEY)
             assert (type(model.moe.down_proj).__name__.startswith("_NaxInt8Prefill")
                     is (failed != nax.INT8_QMM_PROBE_KEY))
+
+
+@metal_only
+def test_nax_int8_prefill_available_reports_what_the_route_takes(monkeypatch):
+    from unsloth_zoo.mlx import inference, nax
+    from unsloth_zoo.mlx.generate import generation_mode
+
+    model = _QuantizedMoE()
+    monkeypatch.setattr(nax, "nax_available", lambda: False)
+    assert inference.int8_prefill_available(model) == (False, "nax_unavailable", 0)
+    monkeypatch.setattr(nax, "nax_available", lambda: True)
+    monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: True)
+    status = inference.int8_prefill_available(model)   # too small for the measured thresholds
+    assert status == (False, "no_eligible_projections", 0) and not status
+    monkeypatch.setattr(nax, "_A8_ROWS_BY_GPU", {nax._gpu_generation(): _A8_EVERY_ROW})
+    monkeypatch.setattr(nax, "_INT8_PREFILL_MIN_K", 0)
+    monkeypatch.setattr(nax, "_A8_EXPERT_ROWS_BY_GPU", {nax._gpu_generation(): ((8, 0, 0, 20, False),)})
+
+    def routed(model):
+        with generation_mode(model, True):
+            assert inference.int8_prefill_available(model) == status
+            return sum("_unsloth_nax_int8_prefill_rows" in m.__dict__ or "_unsloth_nax_int8_prefill" in m.__dict__
+                       for _, m in model.named_modules())
+
+    model.train()   # a model loaded for training is reported as it would generate
+    status = inference.int8_prefill_available(model)
+    with inference.nax_quantized_linear(model, True):   # while a scope entered in training swaps nothing
+        assert not any("_unsloth_nax_int8_prefill_rows" in m.__dict__ or "_unsloth_nax_int8_prefill" in m.__dict__
+                       for _, m in model.named_modules())
+    model.eval()
+    assert status == (True, "", 5) and status and routed(model) == 5   # two dense linears and three experts
+    monkeypatch.setattr(nax, "kernel_probe_passed", lambda key, *args: key != nax.INT8_QMM_PROBE_KEY)
+    assert inference.int8_prefill_available(model) == (False, "probe_failed", 5)
+    monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: True)
+    # Per-token calls only, from 256 columns: the 128-wide gate and up qualify packed, at 256.
+    monkeypatch.setattr(nax, "_A8_EXPERT_ROWS_BY_GPU", {nax._gpu_generation(): ((8, 0, 256, 20, True),)})
+    status = inference.int8_prefill_available(model)
+    assert status == (True, "", 4) and routed(model) == 4
+    with inference.nax_quantized_linear(model, True):   # unpacked outside generation: no per-token credit
+        assert not any("_unsloth_nax_int8_prefill" in m.__dict__ for _, m in model.named_modules())
+    trainable = _QuantizedMoE()   # a projection with trainable parameters never packs
+    trainable.moe.gate_proj.unfreeze(keys = ["scales"], recurse = False)
+    status = inference.int8_prefill_available(trainable)
+    assert status == (True, "", 2) and routed(trainable) == 2
+    custom = _QuantizedMoE()   # nor does a custom callable projection, which must not break generation
+    gate = custom.moe.gate_proj
+    custom.moe.gate_proj = lambda x, indices, sorted_indices = False: gate(x, indices, sorted_indices)
+    custom.floats = [nn.Linear(256, 256), nn.Embedding(128, 256)]   # unquantized layers are skipped
+    status = inference.int8_prefill_available(custom)
+    assert status == (True, "", 2) and routed(custom) == 2
+    mixed = _QuantizedMoE()   # gate and up quantized differently never pack
+    up = mixed.moe.up_proj
+    w = mx.dequantize(up.weight, up.scales, up.biases, group_size = 64, bits = 8)
+    up.weight, up.scales, up.biases = mx.quantize(w, group_size = 64, bits = 4)
+    up.bits = 4
+    status = inference.int8_prefill_available(mixed)
+    assert status == (True, "", 2) and routed(mixed) == 2
+    model.proj.scales = model.proj.scales.astype(mx.float32)   # the kernel takes 16-bit scales only
+    status = inference.int8_prefill_available(model)
+    assert status == (True, "", 3) and routed(model) == 3
+    call = nn.QuantizedLinear.__call__   # a rebound linear call is left to its owner
+    monkeypatch.setattr(nn.QuantizedLinear, "__call__", lambda self, x: call(self, x))
+    assert inference.int8_prefill_available(model) == (True, "", 2)
+    model._unsloth_mlx_distributed_parallel_mode = "tensor"
+    assert inference.int8_prefill_available(model) == (False, "distributed", 0)
 
 
 def test_nax_int8_prefill_rows_follow_the_gpu_generation(monkeypatch):
