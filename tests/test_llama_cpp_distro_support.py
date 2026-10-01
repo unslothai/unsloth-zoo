@@ -122,6 +122,7 @@ def test_every_distro_has_a_manager_name_and_build_tools(llama_cpp, system_type)
         "error: target not found: curl",  # pacman
         "ERROR: unable to select packages:",  # apk
         "No provider of 'libcurl-devel' found.",  # zypper
+        "Package 'build-essential' not found.",  # zypper, by package name
         "emerge: there are no ebuilds to satisfy \"net-misc/curl\".",  # emerge
     ],
 )
@@ -140,3 +141,62 @@ def test_package_not_found_matches_each_manager(llama_cpp, line):
 )
 def test_package_not_found_ignores_ordinary_output(llama_cpp, line):
     assert not any(marker in line for marker in llama_cpp.PACKAGE_NOT_FOUND)
+
+
+@pytest.mark.parametrize(
+    "system_type, expected",
+    [("suse", "gcc gcc-c++ make"), ("rpm", "gcc gcc-c++ make"), ("arch", "base-devel"), ("alpine", "build-base")],
+)
+def test_build_requirements_mapped_without_which_binary(llama_cpp, monkeypatch, system_type, expected):
+    # Minimal Fedora / Arch / openSUSE images ship no `which`; the Debian name must not leak.
+    def no_which_binary(cmd, *args, **kwargs):
+        if cmd and cmd[0] == "which":
+            raise FileNotFoundError("which")
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(llama_cpp.subprocess, "run", no_which_binary)
+    monkeypatch.setattr(llama_cpp.shutil, "which", lambda tool: None if tool == "gcc" else f"/usr/bin/{tool}")
+    monkeypatch.setattr(llama_cpp, "check_linux_type", lambda: system_type)
+    monkeypatch.setattr(llama_cpp, "_find_lib_path", lambda name: f"/usr/lib/{name}")
+    monkeypatch.setattr(llama_cpp, "check_libcurl_dev", lambda: (True, "curl"))
+    missing, _ = llama_cpp.check_build_requirements()
+    assert missing == [expected]
+
+
+class _FakePopen:
+    def __init__(self, lines):
+        self.stdout = [line.encode() for line in lines]
+
+    def __call__(self, cmd, *args, **kwargs):
+        self.cmd = cmd
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def terminate(self):
+        pass
+
+
+@pytest.mark.parametrize(
+    "system_type, line",
+    [
+        ("suse", "Root privileges are required for refreshing system repositories.\n"),
+        ("arch", "error: you cannot perform this operation unless you are root.\n"),
+        ("alpine", "ERROR: Unable to lock database: Permission denied\n"),
+    ],
+)
+def test_do_we_need_sudo_detects_non_root_refresh(llama_cpp, monkeypatch, system_type, line):
+    calls = []
+
+    def fake_popen(cmd, *args, **kwargs):
+        calls.append(cmd)
+        return _FakePopen([line] if not cmd.startswith("sudo ") else [])(cmd)
+
+    monkeypatch.setattr(llama_cpp, "IS_WINDOWS", False)
+    monkeypatch.setattr(llama_cpp.subprocess, "Popen", fake_popen)
+    assert llama_cpp.do_we_need_sudo(system_type) is True
+    assert calls[-1].startswith("sudo ")

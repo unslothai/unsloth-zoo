@@ -101,8 +101,19 @@ PACKAGE_NOT_FOUND = (
     "No match for argument",      # dnf / yum
     "error: target not found",    # pacman
     "unable to select packages",  # apk
-    "No provider of",             # zypper
+    "No provider of",             # zypper (capability)
+    "' not found.",               # zypper: Package 'x' not found.
     "there are no ebuilds",       # emerge
+)
+
+# Lines meaning the package manager refused to run without root.
+NEEDS_ROOT = (
+    "Permission denied",
+    "not open lock file",
+    "are you root?",
+    "fatal",
+    "Root privileges are required",                       # zypper
+    "you cannot perform this operation unless you are root",  # pacman
 )
 
 PACKAGE_MANAGER_NAMES = {
@@ -668,7 +679,7 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
         for line in sp.stdout:
             line = line.decode("utf-8", errors = "replace").rstrip()
 
-            if "Permission denied" in line or "not open lock file" in line or "are you root?" in line or "fatal" in line:
+            if any(marker in line for marker in NEEDS_ROOT):
                 sp.terminate()
                 raise RuntimeError(f"[FAIL] Unsloth: Permission denied when installing package {package}\n"\
                                    "This operation requires elevated sudo/root permissions. Please manually install missing packages and retry again"
@@ -716,7 +727,7 @@ def do_we_need_sudo(system_type="debian"):
     with subprocess.Popen(update_cmd, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT) as sp:
         for line in sp.stdout:
             line = line.decode("utf-8", errors = "replace").rstrip()
-            if "Permission denied" in line or "not open lock file" in line or "are you root?" in line or "fatal" in line:
+            if any(marker in line for marker in NEEDS_ROOT):
                 sp.terminate()
                 sudo = True
                 break
@@ -741,7 +752,7 @@ def do_we_need_sudo(system_type="debian"):
     with subprocess.Popen(update_cmd_sudo, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT) as sp:
         for line in sp.stdout:
             line = line.decode("utf-8", errors = "replace").rstrip()
-            if "Permission denied" in line or "not open lock file" in line or "are you root?" in line or "fatal" in line:
+            if any(marker in line for marker in NEEDS_ROOT):
                 sp.terminate()
                 raise RuntimeError("[FAIL] Unsloth: Tried with sudo, but still failed?")
             elif "failure resolving" in line or "Err:" in line:
@@ -7475,14 +7486,9 @@ def check_build_requirements():
     system_type = check_linux_type()  # Get system type first
 
     for tool, package in required_tools.items():
-        try:
-            result = subprocess.run(['which', tool], capture_output=True, text=True)
-            if result.returncode != 0:
-                # Adjust package names for non-Debian systems
-                package = DISTRO_PACKAGES.get(system_type, {}).get(package, package)
-                missing_packages.append(package)
-        except Exception:
-            missing_packages.append(package)
+        # shutil.which, not `which`: minimal Fedora / Arch / openSUSE images lack the binary.
+        if shutil.which(tool) is None:
+            missing_packages.append(DISTRO_PACKAGES.get(system_type, {}).get(package, package))
 
     # Check for libgomp (OpenMP runtime) - needed for llama.cpp CPU backend linking
     gomp_path = _find_lib_path('libgomp.so')
