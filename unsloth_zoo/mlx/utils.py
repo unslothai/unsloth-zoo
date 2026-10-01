@@ -51,12 +51,13 @@ import tempfile
 import queue as _queue_module
 import threading
 import time
+import types
 import unicodedata
 import warnings
 import weakref
 import zlib
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache, partial, wraps
 from pathlib import Path
 from typing import NamedTuple
@@ -403,7 +404,7 @@ def set_mlx_norm_output_cast_to_input_dtype(enabled: bool, model=None) -> None:
 # MLX raises instead of returning zero when a backward pass reaches a
 # gather/scatter index, aborting every graph that derives indices from activations:
 # MoE routing, SwitchGLU's gather-sort, GLM-5.x's sparse mask. Detaching changes no
-# forward value; producers are wrapped too, since `__getitem__` hides the consumer.
+# forward value; producers, consumers and integer `__getitem__` keys are all detached.
 _MLX_INDEX_PRODUCERS = ("argpartition", "argsort", "argmax", "argmin")
 _MLX_INDEX_CONSUMERS = {  # index-argument positions, by op
     "take": (1,), "take_along_axis": (1,), "put_along_axis": (1,),
@@ -441,6 +442,8 @@ def _wrap_mlx_index_op(name, original):
 
     @wraps(original)
     def wrapper(*args, **kwargs):
+        if not mlx_training_patches_active():
+            return original(*args, **kwargs)
         if positions is None:  # producer: the result is entirely an index
             return mx.stop_gradient(original(*args, **kwargs))
         return original(
@@ -466,14 +469,143 @@ def _set_mlx_index_gradient_stop(enabled: bool) -> None:
         elif not enabled and patched:
             setattr(mx, name, current._unsloth_index_original)
 
+    current = getattr(mx.array, "__getitem__", None)
+    if current is None:
+        return
+    patched = bool(getattr(current, "_unsloth_index_stop_gradient", False))
+    if enabled and not patched:
+        @wraps(current)
+        def getitem(array, key):
+            if mlx_training_patches_active():
+                key = _detach_integer_arrays(key)
+            return current(array, key)
+
+        getitem._unsloth_index_stop_gradient = True
+        getitem._unsloth_index_original = current
+        mx.array.__getitem__ = getitem
+    elif not enabled and patched:
+        mx.array.__getitem__ = current._unsloth_index_original
+
+
+# Training SDPA runs MLX's unfused fallback, scoring every key even outside the window.
+_TRAINING_ATTENTION_BLOCK = 512
+_WINDOW_MASKS = {}
+
+
+def _register_window_mask(mask, window):
+    key = id(mask)
+
+    def forget(ref):
+        if _WINDOW_MASKS.get(key, (None,))[0] is ref:
+            del _WINDOW_MASKS[key]
+
+    _WINDOW_MASKS[key] = (weakref.ref(mask, forget), window)
+
+
+def _registered_window(mask):
+    ref, window = _WINDOW_MASKS.get(id(mask), (None, None))
+    return window if ref is not None and ref() is mask else None
+
+
+def _carry_window_masks(outer, inner):
+    """`mx.checkpoint` hands the layer new array objects for its arguments."""
+    (outer_args, outer_kwargs), (inner_args, inner_kwargs) = outer, inner
+    pairs = [*zip(outer_args, inner_args),
+             *((outer_kwargs[k], inner_kwargs.get(k)) for k in outer_kwargs)]
+    for before, after in pairs:
+        if (window := _registered_window(before)) is not None:
+            _register_window_mask(after, window)
+
+
+def _wrap_create_causal_mask(original):
+    @wraps(original)
+    def wrapper(N, offset=0, window_size=None, *args, **kwargs):
+        mask = original(N, offset, window_size, *args, **kwargs)
+        if (window_size is not None and isinstance(offset, int) and offset == 0 and not args
+                and all(v is None for v in kwargs.values())
+                and mlx_training_patches_active()):
+            _register_window_mask(mask, window_size)
+        return mask
+
+    wrapper._unsloth_original = original
+    return wrapper
+
+
+def _windowed_attention(sdpa, q, k, v, scale, window, block):
+    # Query blocks folded into the batch, each vs its own + previous key block. Not per-block
+    # slices: their full-size gradient scatters fuse past Metal's kernel argument limit.
+    B, T = q.shape[0], q.shape[-2]
+    n = -(-T // block)
+
+    def fold(t, with_previous):
+        t = mx.pad(t, [(0, 0), (0, 0), (0, n * block - T), (0, 0)])
+        t = t.reshape(B, t.shape[1], n, block, t.shape[-1])
+        if with_previous:
+            previous = mx.pad(t[:, :, :-1], [(0, 0), (0, 0), (1, 0), (0, 0), (0, 0)])
+            t = mx.concatenate([previous, t], axis=3)
+        return t.transpose(0, 2, 1, 3, 4).reshape(B * n, t.shape[1], t.shape[3], t.shape[4])
+
+    rows = mx.arange(n)[:, None, None] * block + mx.arange(block)[:, None]
+    cols = mx.arange(n)[:, None, None] * block + mx.arange(-block, block)
+    mask = (cols >= 0) & (rows >= cols) & (rows < cols + window)
+    mask = mx.broadcast_to(mask[None, :, None], (B, n, 1, block, 2 * block))
+    mask = mask.reshape(B * n, 1, block, 2 * block)
+    out = sdpa(fold(q, False), fold(k, True), fold(v, True), scale=scale, mask=mask)
+    out = out.reshape(B, n, -1, block, out.shape[-1]).transpose(0, 2, 1, 3, 4)
+    return out.reshape(B, -1, n * block, out.shape[-1])[..., :T, :]
+
+
+def _windowing_pays(q, k, block):
+    # Skipped scores vs padded, folded q/k/v copies; 2.5 measured on bf16 training attention.
+    heads, T, dim = q.shape[1], q.shape[2], q.shape[3]
+    padded = -(-T // block) * block
+    skipped = heads * (T * T - 2 * block * padded)
+    return skipped >= 2.5 * (heads + 2 * k.shape[1]) * padded * dim
+
+
+def _wrap_training_sdpa(original):
+    @wraps(original)
+    def wrapper(q, k, v, *, scale, mask=None, **kwargs):
+        T = q.shape[-2]
+        if (isinstance(mask, mx.array) and mask.shape == (T, T) and k.shape[-2] == T
+                and all(value is None for value in kwargs.values())):
+            window = _registered_window(mask)
+            if window is not None:
+                block = max(_TRAINING_ATTENTION_BLOCK, window)
+                if _windowing_pays(q, k, block):
+                    return _windowed_attention(original, q, k, v, scale, window, block)
+        return original(q, k, v, scale=scale, mask=mask, **kwargs)
+
+    wrapper._unsloth_original = original
+    return wrapper
+
+
+def _set_mlx_windowed_attention(enabled: bool) -> None:
+    targets = [(mx.fast, "scaled_dot_product_attention", _wrap_training_sdpa)]
+    for name in ("mlx_lm.models.base", "mlx_vlm.models.base"):
+        if sys.modules.get(name) is not None:
+            targets.append((sys.modules[name], "create_causal_mask", _wrap_create_causal_mask))
+    for module, attr, wrap in targets:
+        current = getattr(module, attr, None)
+        if current is None:
+            continue
+        original = getattr(current, "_unsloth_original", None)
+        if enabled and original is None:
+            setattr(module, attr, wrap(current))
+        elif not enabled and original is not None:
+            setattr(module, attr, original)
+
 
 def acquire_mlx_training_patches() -> None:
     """Reference-counted: the `mlx.core` patches are process-wide while trainer
     runs are not, so an inner run must not unpatch an outer one."""
     global _MLX_TRAINING_PATCH_DEPTH
     with _MLX_INDEX_GRADIENT_LOCK:
+        from .attention import install_sparse_attention_training
+        install_sparse_attention_training()
         if _MLX_TRAINING_PATCH_DEPTH == 0:
             _set_mlx_index_gradient_stop(True)
+            _set_mlx_windowed_attention(True)
         _MLX_TRAINING_PATCH_DEPTH += 1
     _MLX_TRAINING_ACTIVE_DEPTH.set(_MLX_TRAINING_ACTIVE_DEPTH.get() + 1)
 
@@ -486,6 +618,7 @@ def release_mlx_training_patches() -> None:
         _MLX_TRAINING_PATCH_DEPTH -= 1
         if _MLX_TRAINING_PATCH_DEPTH == 0:
             _set_mlx_index_gradient_stop(False)
+            _set_mlx_windowed_attention(False)
     _MLX_TRAINING_ACTIVE_DEPTH.set(max(0, _MLX_TRAINING_ACTIVE_DEPTH.get() - 1))
 
 
@@ -508,6 +641,7 @@ def pause_mlx_training_patches() -> bool:
             return False
         _MLX_TRAINING_PATCH_DEPTH = 0
         _set_mlx_index_gradient_stop(False)
+        _set_mlx_windowed_attention(False)
         return True
 
 
@@ -525,6 +659,7 @@ def resume_mlx_training_patches(paused: bool) -> None:
         if paused:
             if _MLX_TRAINING_PATCH_DEPTH == 0:
                 _set_mlx_index_gradient_stop(True)
+                _set_mlx_windowed_attention(True)
             _MLX_TRAINING_PATCH_DEPTH += 1
     stack = _MLX_TRAINING_PAUSE_STACK.get()
     if stack:
@@ -767,13 +902,20 @@ def apply_gather_qmm_nax_guard() -> bool:
 
 
 def _get_transformer_layers(model):
-    """Find transformer layers, unwrapping VLM wrappers if needed.
-
-    VLMs: model.language_model.model.layers; text: model.(model.)layers.
-    """
-    m = getattr(model, 'language_model', model)
-    m = getattr(m, 'model', m)
-    return getattr(m, 'layers', None)
+    pending = collections.deque([getattr(model, "language_model", model)])
+    seen = set()
+    while pending:
+        module = pending.popleft()
+        if module is None or id(module) in seen:
+            continue
+        seen.add(id(module))
+        for name in ("layers", "blocks"):
+            layers = getattr(module, name, None)
+            if isinstance(layers, (list, tuple)):
+                return layers
+        for name in ("decoder", "model", "transformer", "layers", "blocks"):
+            pending.append(getattr(module, name, None))
+    return None
 
 
 def _get_vision_encoder_layers(model):
@@ -817,6 +959,30 @@ def _detach_integer_arrays(value):
     return _detach_if_index(value)
 
 
+@mx.custom_function
+def _tie_shared_kv_cotangent(x, shared_kv):
+    return x, shared_kv
+
+
+@_tie_shared_kv_cotangent.vjp
+def _tie_shared_kv_cotangent_vjp(primals, cotangents, outputs):
+    # Only the source layer's backward consumes borrowed K/V's cotangent, and
+    # `mx.eval` defers it to there, keeping every borrowing layer's T x T
+    # attention cotangents alive; the hidden state's makes it run in place.
+    d_x, d_shared_kv = cotangents
+    return mx.depends(d_x, list(d_shared_kv)), d_shared_kv
+
+
+def _tie_to_hidden_state(args, shared_kv):
+    """Tie borrowed K/V to the layer's hidden-state input, when it has both."""
+    if (not args or not isinstance(args[0], mx.array)
+            or not isinstance(shared_kv, (tuple, list)) or not shared_kv
+            or not all(isinstance(a, mx.array) for a in shared_kv)):
+        return args, shared_kv
+    x, shared_kv = _tie_shared_kv_cotangent(args[0], tuple(shared_kv))
+    return (x, *args[1:]), shared_kv
+
+
 def _patch_layer_class_for_gc(layer_cls):
     if getattr(layer_cls, '_orig_call', None) is not None:
         return  # already patched
@@ -826,8 +992,14 @@ def _patch_layer_class_for_gc(layer_cls):
     def checkpointed_fn(self, *args, **kwargs):
         slot = next((a for a in args if isinstance(a, _SharedKVSlot)), None)
         if slot is None:
+            if "shared_kv" in kwargs:
+                args, kwargs["shared_kv"] = _tie_to_hidden_state(
+                    args, kwargs["shared_kv"])
+            outer = (args, kwargs)
+
             def inner_fn(params, *args, **kwargs):
                 self.update(params)
+                _carry_window_masks(outer, (args, kwargs))
                 args = tuple(_detach_integer_arrays(a) for a in args)
                 kwargs = {k: _detach_integer_arrays(v) for k, v in kwargs.items()}
                 return fn(self, *args, **kwargs)
@@ -836,16 +1008,20 @@ def _patch_layer_class_for_gc(layer_cls):
 
         # Shared K/V crosses the checkpoint boundary as a traced argument and a
         # traced result; read off the slot and the VJP drops the gradient.
+        outer = (args, kwargs)
+
         def inner_fn(params, borrowed, *args, **kwargs):
             self.update(params)
             slot.install(borrowed)
+            _carry_window_masks(outer, (args, kwargs))
             args = tuple(_detach_integer_arrays(a) for a in args)
             kwargs = {k: _detach_integer_arrays(v) for k, v in kwargs.items()}
             out = fn(self, *args, **kwargs)
             return out, slot.recorded()
 
+        args, borrowed = _tie_to_hidden_state(args, slot.borrow())
         out, recorded = mx.checkpoint(inner_fn)(
-            self.trainable_parameters(), slot.borrow(), *args, **kwargs)
+            self.trainable_parameters(), borrowed, *args, **kwargs)
         slot.install(recorded)
         return out
 
@@ -901,6 +1077,44 @@ def _get_text_backbone(model):
     """Get a separable hidden-state backbone when the model exposes one."""
     tm = _get_text_model(model)
     return getattr(tm, "model", None)
+
+
+def _get_encoder_decoder_backbone(model):
+    tm = _get_text_model(model)
+    backbone = getattr(model, "model", None)
+    if (getattr(tm, "_parent", None) is model
+            and callable(getattr(backbone, "encoder", None))
+            and getattr(backbone, "decoder", None) is getattr(tm, "model", None)):
+        return backbone
+    return None
+
+
+def _get_output_transform_owner(model):
+    # A non-owning decoder view omits the parent's post-projection transforms.
+    if _get_encoder_decoder_backbone(model) is not None:
+        return model
+    return _get_text_model(model)
+
+
+def _validate_output_token_mask(model):
+    tm = _get_text_model(model)
+    ids = getattr(tm, "_dummy_tokenizer_ids", None)
+    if ids is None or getattr(ids, "size", 0) == 0:
+        return
+    try:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(type(tm).__call__)))
+    except (OSError, TypeError, SyntaxError):
+        return
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Store)
+                and _self_attr_chain(node.slice) == "_dummy_tokenizer_ids"):
+            # This scatter's VJP can fault on Metal even when forward succeeds.
+            raise ValueError(
+                "Unsloth: unsafe output token mask: vocabulary token IDs index "
+                "the batch axis of [batch, sequence, vocabulary] logits. "
+                "Training is disabled to prevent a Metal address fault; the "
+                "backend must mask the final (vocabulary) axis instead."
+            )
 
 
 def _has_hidden_stack(obj):
@@ -1234,7 +1448,7 @@ def _identify_vlm_embedding_module(model):
             embed_result = model.get_input_embeddings(ids, None)
         except TypeError:
             embed_result = model.get_input_embeddings(ids)
-        merged, _ = _unpack_embed_result(embed_result, model)
+        merged, _ = _unpack_embed_result(embed_result, model, input_ids=ids)
     except Exception:
         return None
     finally:
@@ -1374,7 +1588,18 @@ def _has_direct_hidden_stack(model):
 
 def _forward_text_hidden_states(model, inputs, inputs_embeds=None, **kwargs):
     """Run a text stack up to pre-lm_head hidden states for CCE."""
+    composite = _get_encoder_decoder_backbone(model)
+    if composite is not None:
+        hidden, _ = composite(inputs, **_filter_backbone_kwargs(composite, kwargs))
+        return hidden
     tm = _get_text_model(model)
+    if (inputs_embeds is None and getattr(model, "_unsloth_text_only_vlm", False)
+            and _get_backbone_embed_kwarg(getattr(tm, "model", tm)) is not None
+            and callable(getattr(model, "get_input_embeddings", None))):
+        inputs_embeds, embed_kwargs = _unpack_embed_result(
+            model.get_input_embeddings(inputs, None), model, input_ids=inputs,
+        )
+        kwargs = {**embed_kwargs, **kwargs}
     backbone = getattr(tm, "model", None)
     if backbone is not None:
         if (
@@ -1391,6 +1616,25 @@ def _forward_text_hidden_states(model, inputs, inputs_embeds=None, **kwargs):
         if "attention_mask_4d" in kwargs and "mask" not in kwargs:
             kwargs["mask"] = kwargs.pop("attention_mask_4d")
         backbone_kwargs = _filter_backbone_kwargs(backbone, kwargs)
+        rope_args = getattr(tm, "args", getattr(backbone, "config", None))
+        rope_config = (
+            _config_get(rope_args, "rope_parameters")
+            or _config_get(rope_args, "rope_scaling")
+        )
+        if (
+            inputs_embeds is None
+            and backbone_kwargs.get("position_ids") is None
+            and backbone_kwargs.get("cache") is None
+            and hasattr(tm, "_position_ids")
+            and _config_get(rope_config, "mrope_section") is not None
+        ):
+            # Text prefill uses identical sequential positions on all mRoPE axes.
+            position_ids = mx.broadcast_to(
+                mx.arange(inputs.shape[1]), (3, inputs.shape[0], inputs.shape[1]),
+            )
+            backbone_kwargs.update(_filter_backbone_kwargs(
+                backbone, {"position_ids": position_ids},
+            ))
         if inputs_embeds is not None:
             backbone_kwargs[embed_kwarg] = inputs_embeds
         return backbone(inputs, **backbone_kwargs)
@@ -1669,11 +1913,17 @@ def _cce_head_ineligibility(desc):
     """Reason fused CCE must not run for this head, or None when eligible."""
     if desc.status == "unknown":
         return "unresolved output-head topology"
-    if not desc.raw:
+    if not desc.raw and not _is_hadamard_packed_linear(desc.module):
         return f"non-raw output-head wrapper ({desc.wrapper_type.__name__})"
     if desc.has_additive_bias:
         return "additive output-head bias"
     return None
+
+
+def _rotate_head_input(head, hidden):
+    if getattr(head, "block", 0) and _is_hadamard_packed_linear(head):
+        return _hadamard_pack_module().hadamard_transform(hidden, head.block, head.signs)
+    return hidden
 
 
 def _get_lm_head_layer(model):
@@ -1698,7 +1948,7 @@ def _is_quantized_layer(layer):
 
 def _get_logit_softcap(model):
     """Get logit softcapping value if model uses it (e.g. Gemma-2/4), else 0.0."""
-    tm = _get_text_model(model)
+    tm = _get_output_transform_owner(model)
     softcap = getattr(tm, "final_logit_softcapping", None)
     if softcap is None and hasattr(tm, "args"):
         softcap = getattr(tm.args, "final_logit_softcapping", None)
@@ -1714,7 +1964,7 @@ def _get_logit_scale(model):
     ``(scale, invalid)``: scale None when absent or 1.0; ``invalid=True`` for
     bool/non-scalar/non-finite/out-of-range values (callers must fall back).
     """
-    tm = _get_text_model(model)
+    tm = _get_output_transform_owner(model)
     # Only the verified application sites — args (cohere/cohere2/cohere2_moe)
     # then config (aya_vision); no upstream forward reads a direct attribute.
     scale = None
@@ -1811,7 +2061,7 @@ def _detect_logit_softcap(model):
     mean no cap, a positive finite real caps, anything else (or both attrs
     present) fails closed rather than dropping the cap.
     """
-    tm = _get_text_model(model)
+    tm = _get_output_transform_owner(model)
     # Presence, not value: an explicitly-None legacy attr still makes the
     # dual-attr combination unverified.
     legacy = getattr(tm, "final_logit_softcapping", _KNOB_MISSING)
@@ -1856,7 +2106,7 @@ def _detect_head_transform(model, head_status):
     no-op case; accepted scales obey the ``_get_logit_scale`` range.
     ``head_status`` selects branch-conditional transforms as the forwards do.
     """
-    tm = _get_text_model(model)
+    tm = _get_output_transform_owner(model)
     present = {}
     for name, sites in _HEAD_TRANSFORM_KNOBS.items():
         value, conflict = _knob_value(tm, name, sites)
@@ -1963,6 +2213,76 @@ def _is_lm_head_trainable(model):
     return len(trainable) == 0  # no LoRA = full fine-tuning
 
 
+def _supports_text_lora_cce(desc, label_smoothing):
+    if (desc.status == "unknown" or desc.raw or label_smoothing != 0.0
+            or not mx.metal.is_available()):
+        return False
+    from unsloth_zoo.mlx.cce.runtime_cce import supported_lora_head
+
+    head = desc.module
+    if (not supported_lora_head(head) or not 1024 <= head.lora_a.shape[0] <= 4096
+            or head.linear.weight.shape[0] < 8192):
+        return False
+    return type(head.linear) is not nn.QuantizedLinear or head.lora_a.shape[1] <= 32
+
+
+def _make_text_lora_cce_loss_fn(head_desc, logit_scale, softcap):
+    from unsloth_zoo.mlx.cce.runtime_cce import make_lora_head_cce
+
+    head = head_desc.module
+    quantized = type(head.linear) is nn.QuantizedLinear
+    kernel = make_lora_head_cce(
+        chunk_size=4096 if head.lora_a.shape[0] > 2048 else 2048,
+        adapter_scale=head.scale,
+        logit_scale=1.0 if logit_scale is None else logit_scale,
+        logit_softcap=softcap,
+        group_size=head.linear.group_size if quantized else None,
+        bits=head.linear.bits if quantized else None,
+        mode=head.linear.mode if quantized else "affine",
+    )
+    baseline = make_baseline_loss_fn()
+    vocab_size = head.linear.weight.shape[0]
+    head_path = head_desc.path
+
+    def loss_fn(model, batch, lengths, labels=None):
+        n_tokens = batch.shape[0] * max(0, batch.shape[1] - 1)
+        if n_tokens < 1024 or n_tokens * vocab_size < 16 * 1024 * 1024:
+            return baseline(model, batch, lengths, labels)
+        inputs = batch[:, :-1]
+        targets = batch[:, 1:] if labels is None else labels[:, 1:]
+        hidden = _forward_text_hidden_states(model, inputs)
+        targets = _normalize_cce_label_dtype(targets)
+        steps = mx.arange(1, targets.shape[1] + 1)
+        mask = (steps >= lengths[:, 0:1]) & (steps < lengths[:, 1:])
+        if labels is not None:
+            mask = mask & (targets != -100)
+        targets = mx.where(mask, targets, mx.array(-100, dtype=targets.dtype))
+        count = mask.sum()
+        live_head = _resolve_module_path(model, head_path)
+        base = live_head.linear
+        hidden = hidden.reshape((-1, hidden.shape[-1]))
+        rank_hidden = live_head.dropout(hidden) @ live_head.lora_a
+        losses = kernel(
+            hidden, base.weight, base.scales if quantized else None,
+            base.get("biases") if quantized else None,
+            rank_hidden, live_head.lora_b, base.get("bias"), targets.reshape((-1,)),
+        )
+        return losses.sum() / _safe_token_denominator(count), count
+
+    loss_fn._unsloth_cce_backend = "runtime-cce-lora-head"
+    return loss_fn
+
+
+def _runtime_cce_by_mode(**kwargs):
+    loss_only = _get_runtime_cce(**kwargs)
+    if not (kwargs.get("quantized") or kwargs.get("weight_is_frozen")):
+        return lambda model: loss_only
+    # Training builds a frozen head's hidden gradient in the forward, which would
+    # double the cost of evaluation, where nothing is differentiated.
+    training = _get_runtime_cce(**kwargs, precompute_hidden_gradient=True)
+    return lambda model: training if model.training else loss_only
+
+
 def make_cce_loss_fn(model, label_smoothing=0.0):
     """Create a chunked cross-entropy (CCE) loss function.
 
@@ -1987,7 +2307,8 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
         loss_fn._unsloth_cce_backend = "baseline-fallback"
         return loss_fn
     head_desc = describe_output_head(model)
-    _ineligible = _cce_head_ineligibility(head_desc)
+    _lora_cce = _supports_text_lora_cce(head_desc, label_smoothing)
+    _ineligible = None if _lora_cce else _cce_head_ineligibility(head_desc)
     if _ineligible is not None:
         print(f"Unsloth: fused CCE cannot faithfully use this model's output "
               f"head ({_ineligible}); falling back to standard cross-entropy.")
@@ -2007,6 +2328,14 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
         loss_fn = make_baseline_loss_fn(label_smoothing=label_smoothing)
         loss_fn._unsloth_cce_backend = "baseline-fallback"
         return loss_fn
+    if _lora_cce:
+        loss_fn = make_baseline_loss_fn(label_smoothing=label_smoothing)
+        loss_fn._unsloth_cce_backend = "baseline-fallback"
+        loss_fn._unsloth_compiled_loss_fn = _make_text_lora_cce_loss_fn(
+            head_desc, logit_scale, softcap,
+        )
+        return loss_fn
+
     if softcap > 0:
         print(f"Unsloth: CCE using logit_softcap={softcap} for this model.")
     if logit_scale is not None:
@@ -2048,7 +2377,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
         )
         _has_biases = hasattr(lm_layer, "biases")
 
-        rt_cce = _get_runtime_cce(
+        rt_cce = _runtime_cce_by_mode(
             ignore_index=-100,
             logit_softcap=softcap,
             quantized=True,
@@ -2058,7 +2387,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
             label_smoothing=label_smoothing,
         )
 
-        def loss_fn(model, batch, lengths, labels=None):
+        def loss_fn(model, batch, lengths, labels=None, cce_indices=None):
             if labels is None:
                 inputs, targets = batch[:, :-1], batch[:, 1:]
             else:
@@ -2090,7 +2419,11 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
                 # cached kernels stay scale-independent.
                 hidden_flat = hidden_flat * logit_scale
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
-            loss = rt_cce(hidden_flat, w, sc, bi, targets_flat)
+            hidden_flat, targets_flat = _compact_cce_inputs(
+                hidden_flat, targets_flat, cce_indices,
+            )
+            hidden_flat = _rotate_head_input(layer, hidden_flat)
+            loss = rt_cce(model)(hidden_flat, w, sc, bi, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
     else:
@@ -2098,13 +2431,14 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
         if _skip_weight_grad:
             print("Unsloth: CCE skipping weight gradient (LM head is frozen).")
 
-        rt_cce = _get_runtime_cce(
+        rt_cce = _runtime_cce_by_mode(
             ignore_index=-100,
             logit_softcap=softcap,
             label_smoothing=label_smoothing,
+            weight_is_frozen=_skip_weight_grad,
         )
 
-        def loss_fn(model, batch, lengths, labels=None):
+        def loss_fn(model, batch, lengths, labels=None, cce_indices=None):
             if labels is None:
                 inputs, targets = batch[:, :-1], batch[:, 1:]
             else:
@@ -2130,12 +2464,26 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
                 # Same pre-scaling identity as the quantized branch above.
                 hidden_flat = hidden_flat * logit_scale
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
-            loss = rt_cce(hidden_flat, w, targets_flat)
+            hidden_flat, targets_flat = _compact_cce_inputs(
+                hidden_flat, targets_flat, cce_indices,
+            )
+            loss = rt_cce(model)(hidden_flat, w, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
 
     loss_fn._unsloth_cce_backend = "runtime-cce"
+    loss_fn._unsloth_cce_compaction = lm_layer.weight.shape[0] >= 8192
     return loss_fn
+
+
+def _compact_cce_inputs(hidden, targets, indices):
+    if indices is None:
+        return hidden, targets
+    safe_indices = mx.maximum(indices, 0)
+    hidden = mx.take(hidden, safe_indices, axis=0)
+    targets = mx.take(targets, safe_indices, axis=0)
+    targets = mx.where(indices >= 0, targets, mx.array(-100, targets.dtype))
+    return hidden, targets
 
 
 def _model_logits(output):
@@ -2151,6 +2499,12 @@ def _model_logits(output):
             "None, so there is nothing to compute a loss from."
         )
     return output
+
+
+def _masked_correct(logits, targets, mask):
+    """Supervised positions whose argmax is the target (eval token accuracy)."""
+    hits = mx.logical_and(mx.argmax(logits, axis=-1) == targets, mask.astype(mx.bool_))
+    return hits.astype(mx.float32).sum()
 
 
 def make_baseline_loss_fn(label_smoothing=0.0):
@@ -2176,7 +2530,7 @@ def make_baseline_loss_fn(label_smoothing=0.0):
     else:
         _token_ce = nn.losses.cross_entropy
 
-    def loss_fn(model, batch, lengths, labels=None):
+    def loss_fn(model, batch, lengths, labels=None, return_correct=False):
         if labels is None:
             # Half-open [start, end) end-exclusive mask; matches CCE/labels paths
             # (:360, :393, :439) and mlx_lm's lengths convention.
@@ -2190,6 +2544,8 @@ def make_baseline_loss_fn(label_smoothing=0.0):
             # Raw ntoks (no safe denominator) to match mlx_lm default_loss
             # byte-for-byte; the safe wrapper stays on the labels-aware path.
             ce = ce.astype(mx.float32).sum() / ntoks
+            if return_correct:
+                return ce, ntoks, _masked_correct(logits, targets, mask)
             return ce, ntoks
         # labels-aware path: train_on_responses_only style masking.
         inputs = batch[:, :-1]
@@ -2211,14 +2567,13 @@ def make_baseline_loss_fn(label_smoothing=0.0):
         ce = _token_ce(logits, safe_targets) * mask
         ntoks = mask.sum()
         loss = ce.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
+        if return_correct:
+            return loss, ntoks, _masked_correct(logits, safe_targets, mask)
         return loss, ntoks
 
+    loss_fn._unsloth_token_accuracy = True
     return loss_fn
 
-
-# ---------------------------------------------------------------------------
-# VLM helpers
-# ---------------------------------------------------------------------------
 
 # Image/vision/audio special tokens that should never contribute to loss.
 # Single source of truth shared with the CUDA collator (unsloth_zoo/vlm_tokens.py),
@@ -2293,6 +2648,11 @@ def _get_vlm_ignore_token_ids(processor=None, config=None, model=None):
         ):
             token = getattr(tokenizer, attr, None)
             if token is not None:
+                _append_unique_int(ids, _convert_token_to_id(tokenizer, token))
+
+        for attr in ("image_token", "video_token", "audio_token"):
+            token = getattr(processor, attr, None)
+            if isinstance(token, str):
                 _append_unique_int(ids, _convert_token_to_id(tokenizer, token))
 
         for attr in (
@@ -2410,6 +2770,7 @@ def _stage_vlm_label_mask_np(inputs, ignore_token_ids=None, labels=None):
     coercion parity holds by construction. Float comparisons mirror MLX's
     effective float32 narrowing so placement matches the finalized tensors.
     """
+    generated = labels is None
     if labels is None:
         labels = inputs.get(_RAW_INPUT_IDS_FOR_LABELS)
         if labels is None:
@@ -2431,6 +2792,8 @@ def _stage_vlm_label_mask_np(inputs, ignore_token_ids=None, labels=None):
         # Same normalization finalize uses (wide unsigned ids -> int64 sentinels)
         values = _normalize_numpy_cce_labels(values)
     mask = values == -100
+    if generated and any(inputs.get(key) is not None for key in ("pixel_values", "images")):
+        mask = mask | (values < 0)
     if ignore_token_ids:
         compare = np.asarray(list(ignore_token_ids))
         if np.issubdtype(values.dtype, np.floating):
@@ -2453,6 +2816,8 @@ def _stage_vlm_label_mask_np(inputs, ignore_token_ids=None, labels=None):
         if attention_np.dtype == np.float64:
             attention_np = attention_np.astype(np.float32)
         mask = mask | (attention_np.astype(np.int32) == 0)
+    if inputs.get("_unsloth_suffix_only_loss", False):
+        mask = mask | (np.asarray(inputs["token_type_ids"]) == 0)
     return mask
 
 def _reject_mlx_valued_vlm(context):
@@ -2619,9 +2984,13 @@ def _apply_vlm_label_masks(batch_dict, labels=None, ignore_token_ids=None,
     # its own narrow, so wide/unsigned invalid ids (e.g. uint32(2**32-100))
     # must survive as out-of-vocab sentinels instead of wrapping to -100.
     # Prefer the pre-narrow raw carrier when deriving labels from input_ids.
+    generated = labels is None
     if labels is None:
         labels = batch_dict.get(_RAW_INPUT_IDS_FOR_LABELS, batch_dict["input_ids"])
     labels = _normalize_cce_label_dtype(labels)
+    if generated and batch_dict.get("pixel_values") is not None:
+        # Processor-generated negative image placeholders are not vocabulary targets.
+        labels = mx.where(labels < 0, mx.array(ignore_index, dtype=labels.dtype), labels)
     labels = _mask_label_token_ids(labels, ignore_token_ids, ignore_index)
     spans = _audio_span_positions_np(batch_dict, labels.shape)
     if spans is not None:
@@ -2633,6 +3002,9 @@ def _apply_vlm_label_masks(batch_dict, labels=None, ignore_token_ids=None,
     if attention_mask is not None:
         ignore = mx.array(ignore_index, dtype=labels.dtype)
         labels = mx.where(attention_mask == 0, ignore, labels)
+    if batch_dict.get("_unsloth_suffix_only_loss", False):
+        labels = mx.where(batch_dict["token_type_ids"] == 0,
+                          mx.array(ignore_index, dtype=labels.dtype), labels)
     return labels
 
 
@@ -2713,7 +3085,7 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
     )
     _assistant_token_id = assistant_token_id
 
-    def loss_fn(model, batch_dict):
+    def loss_fn(model, batch_dict, return_correct=False):
         input_ids = batch_dict["input_ids"]
         pixel_values = batch_dict.get("pixel_values")
         attention_mask = batch_dict.get("attention_mask")
@@ -2731,6 +3103,7 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
             and not k.startswith("_unsloth_")
             and v is not None
         }
+        _apply_static_vlm_metadata(model, batch_dict, fwd_kwargs)
         fwd_kwargs = _trim_sequence_aligned_vlm_kwargs(fwd_kwargs, inputs.shape[1])
         # Always sent: 13 families declare `mask` without a default. None lets
         # them build the mask they would use for generation.
@@ -2755,7 +3128,9 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
                 **{k: v for k, v in fwd_kwargs.items()
                    if k not in ("mask", "cache")},
             )
-            merged_embeds, embed_kwargs = _unpack_embed_result(embed_result, model)
+            merged_embeds, embed_kwargs = _unpack_embed_result(
+                embed_result, model, input_ids=inputs, attention_mask=attention_mask,
+            )
             scaled_embeds = _apply_vlm_embed_scale(model, inputs, merged_embeds)
             # per_layer_inputs and friends: the merge produced them, and
             # recomputing from ids inside the stack would redo the work.
@@ -2769,7 +3144,8 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
             # it by forwarding straight to the language model; do that here on
             # every version, which is what `_vlm_cce_forward` already does.
             output = _get_text_model(model)(
-                inputs, inputs_embeds=scaled_embeds, **fwd_kwargs
+                inputs, inputs_embeds=scaled_embeds,
+                **_drop_pair_token_type_ids(batch_dict, fwd_kwargs),
             )
         else:
             output = model(inputs, pixel_values=pixel_values, **fwd_kwargs)
@@ -2800,7 +3176,6 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
             # Vision token injection can change seq length
             logits, targets = _align_logits_with_labels(logits, targets)
 
-            # Build mask from attention_mask (shifted to match targets)
             if attention_mask is not None:
                 length_mask = attention_mask[:, 1:]
                 length_mask = length_mask[:, :targets.shape[1]]
@@ -2809,7 +3184,6 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
 
             targets = _mask_image_tokens(targets, _image_token_ids)
             targets = _mask_prompt_tokens(targets, _assistant_token_id)
-            # Exclude masked positions from length_mask
             mask = mx.where(
                 targets == -100,
                 mx.array(0, dtype=length_mask.dtype),
@@ -2824,13 +3198,47 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
         ce = nn.losses.cross_entropy(logits, safe_targets) * mask
         ntoks = mask.sum()
         loss = ce.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
+        if return_correct:
+            return loss, ntoks, _masked_correct(logits, safe_targets, mask)
         return loss, ntoks
 
     loss_fn._unsloth_cce_backend = "baseline-ce"
+    loss_fn._unsloth_token_accuracy = True
     return loss_fn
 
 
-def _unpack_embed_result(embed_result, model):
+# gemma4_unified shares the text model but its `Model.__call__` drops `mm_token_type_ids`.
+_VLM_MM_TOKEN_TYPE_FORWARDING_MODEL_TYPES = frozenset({"gemma4"})
+
+
+def _drop_pair_token_type_ids(batch_dict, kwargs):
+    """Keep suffix/prefix pair markers out of the text stack.
+
+    A suffix-supervised text-only row is encoded as a tokenizer pair, so its
+    `token_type_ids` mean "1 = suffix". Gemma3's stack reads the same key as
+    "1 = image" and makes every marked span bidirectional, which would let the
+    answer attend to its own future tokens. The model-level kwargs still carry
+    it, because PaliGemma's prefix-LM wrapper is the consumer that wants it.
+    """
+    if not batch_dict.get("_unsloth_suffix_only_loss", False):
+        return kwargs
+    return {k: v for k, v in kwargs.items() if k != "token_type_ids"}
+
+
+def _apply_static_vlm_metadata(model, batch_dict, kwargs):
+    embedder = getattr(model, "get_input_embeddings", None)
+    keys = getattr(embedder, "_unsloth_static_vlm_metadata", ())
+    if getattr(embedder, "_unsloth_static_metadata_with_positions", False) and (
+        not getattr(model, "training", False) or kwargs.get("position_ids") is None
+    ):
+        return
+    static = batch_dict.get("_unsloth_static_vlm_metadata", {})
+    for key in keys:
+        if key in static:
+            kwargs[key] = static[key]
+
+
+def _unpack_embed_result(embed_result, model, input_ids=None, attention_mask=None):
     """Unpack get_input_embeddings result into embeds + backbone kwargs.
 
     Handles plain mx.array returns and the InputEmbeddingsFeatures dataclass
@@ -2868,57 +3276,49 @@ def _unpack_embed_result(embed_result, model):
     else:
         merged_embeds = embed_result
 
-    # Qwen-VL family: some get_input_embeddings paths stash position_ids on the
-    # language model wrapper; the inner backbone needs them explicitly.
-    # Do not override position_ids explicitly returned by InputEmbeddingsFeatures
-    # (for example when the collator passed CUDA-parity mRoPE IDs through the
-    # embedder).
-    # When no position_ids were stashed (e.g. text-only samples or simple
-    # images without grid_thw), generate sequential ones so the backbone
-    # doesn't crash accessing cache.offset with cache=None.
     lm = getattr(model, "language_model", None)
     if lm is not None and "position_ids" not in backbone_kwargs:
-        _MISSING = object()
-        pos_ids = getattr(lm, "_position_ids", _MISSING)
-        if pos_ids is not _MISSING and pos_ids is not None:
+        pos_ids = getattr(lm, "_position_ids", None)
+        if pos_ids is not None:
             backbone_kwargs["position_ids"] = pos_ids
-        elif pos_ids is None:
-            # Fallback: sequential position_ids. Correct for text-only and
-            # single-image samples. For multi-image with spatial m-RoPE
-            # (Qwen VL), the per-axis positions should differ for image
-            # regions — but grid_thw metadata is unavailable here so we
-            # use sequential as an approximation.
-            seq_len = merged_embeds.shape[1]
-            pos_ids = mx.arange(seq_len).reshape(1, -1)
-            pos_ids = mx.broadcast_to(pos_ids, (merged_embeds.shape[0], seq_len))
-            # Qwen VL m-RoPE uses 3 axes: temporal, height, width
-            MROPE_AXES = 3
-            pos_ids = mx.expand_dims(pos_ids, axis=0)
-            pos_ids = mx.tile(pos_ids, (MROPE_AXES, 1, 1))
+        elif (hasattr(lm, "_position_ids") and input_ids is not None
+              and callable(getattr(lm, "get_rope_index", None))):
+            # The model owns the positional axes; a cached field alone says nothing about rank.
+            pos_ids, _ = lm.get_rope_index(input_ids, attention_mask=attention_mask)
             backbone_kwargs["position_ids"] = pos_ids
 
     return merged_embeds, backbone_kwargs
 
 
 def _get_backbone_embed_kwarg(backbone):
+    # A backbone without its own __call__ (a bare nn.Module) takes no embeddings kwarg either.
     try:
         params = inspect.signature(backbone.__call__).parameters
-    except (TypeError, ValueError):
-        return "inputs_embeds"
-    if "inputs_embeds" in params:
-        return "inputs_embeds"
-    if "input_embeddings" in params:
-        return "input_embeddings"
-    if "input_embeds" in params:
-        return "input_embeds"
-    return "inputs_embeds"
+    except (AttributeError, TypeError, ValueError):
+        return None
+    for name in ("inputs_embeds", "input_embeddings", "input_embeds"):
+        if name in params and params[name].kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY,
+        ):
+            return name
+    return None
 
 
 def _filter_backbone_kwargs(backbone, kwargs):
     try:
         params = inspect.signature(backbone.__call__).parameters
-    except (TypeError, ValueError):
+    except (AttributeError, TypeError, ValueError):
         return kwargs
+    if "image_mask" in params and "image_mask" not in kwargs:
+        kwargs = dict(kwargs)
+        kwargs["image_mask"] = kwargs.pop("visual_pos_masks", None)
+    cache = params.get("cache")
+    if (
+        cache is not None and cache.default is inspect.Parameter.empty
+        and cache.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        and "cache" not in kwargs
+    ):
+        kwargs = {**kwargs, "cache": None}
     if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
         return kwargs
     allowed = set(params)
@@ -2949,25 +3349,43 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         and not k.startswith("_unsloth_")
         and v is not None
     }
+    _apply_static_vlm_metadata(model, batch_dict, extra_kwargs)
     extra_kwargs = _trim_sequence_aligned_vlm_kwargs(extra_kwargs, inputs.shape[1])
 
-    embed_result = model.get_input_embeddings(
-        inputs,
-        pixel_values,
-        mask=fwd_attn_mask,
-        **extra_kwargs,
-    )
-    merged_embeds, backbone_kwargs = _unpack_embed_result(embed_result, model)
-    merged_embeds = _apply_vlm_embed_scale(model, inputs, merged_embeds)
+    backbone = _get_text_backbone(model)
+    if (_get_encoder_decoder_backbone(model) is not None
+            or (backbone is not None and _get_backbone_embed_kwarg(backbone) is None)):
+        merged_embeds = None
+        backbone_kwargs = dict(extra_kwargs, pixel_values=pixel_values)
+        backbone_kwargs["mask"] = (
+            fwd_attn_mask if _keeps_forwarded_mask(model) else None
+        )
+    else:
+        embed_result = model.get_input_embeddings(
+            inputs,
+            pixel_values,
+            mask=fwd_attn_mask,
+            **extra_kwargs,
+        )
+        merged_embeds, backbone_kwargs = _unpack_embed_result(
+            embed_result, model, input_ids=inputs, attention_mask=attention_mask,
+        )
+        merged_embeds = _apply_vlm_embed_scale(model, inputs, merged_embeds)
     # Prefer collator-built mRoPE IDs when present. Qwen/GLM collators build
     # CUDA-parity full-sequence positions; recomputing inside the embedder moved
     # Qwen3-VL first-step loss from ~6.45 to ~6.90 on the real-cat fixture.
     if use_collated_position_ids and "position_ids" in extra_kwargs:
         backbone_kwargs["position_ids"] = extra_kwargs["position_ids"]
-    if "token_type_ids" in extra_kwargs:
+    if "token_type_ids" in _drop_pair_token_type_ids(batch_dict, extra_kwargs):
         backbone_kwargs["token_type_ids"] = extra_kwargs["token_type_ids"]
         if attention_mask is not None:
             backbone_kwargs["attention_mask"] = attention_mask
+    if (
+        "mm_token_type_ids" in extra_kwargs
+        and _config_get(getattr(model, "config", None), "model_type")
+        in _VLM_MM_TOKEN_TYPE_FORWARDING_MODEL_TYPES
+    ):
+        backbone_kwargs["mm_token_type_ids"] = extra_kwargs["mm_token_type_ids"]
 
     shared_kv = _build_shared_kv_caches(model)
     if shared_kv is not None:
@@ -3013,7 +3431,6 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         masked_targets = mx.where(length_mask, targets, ignore)
 
         masked_targets = _mask_image_tokens(masked_targets, image_token_ids)
-        # Completion-only: mask prompt before first assistant response
         masked_targets = _mask_prompt_tokens(masked_targets, assistant_token_id)
 
         ntoks = (masked_targets != -100).sum()
@@ -3085,16 +3502,7 @@ def _normalize_grid_thw(grid_thw):
 
 
 def _mlx_vlm_canonical_model_type(model_type):
-    """The name mlx-vlm resolves this config's `model_type` to.
-
-    mlx-vlm lower-cases the value and sends it through MODEL_REMAPPING to pick the
-    module, never writing the result back, so a family set keyed on the canonical
-    spelling has to resolve the same way or an aliased checkpoint misses it. Hyphens
-    are folded too, since MODEL_REMAPPING carries only the aliases it has met.
-
-    Any failure leaves the name alone: an mlx-vlm too old to have MODEL_REMAPPING is
-    exactly the case where the raw spelling is the only spelling.
-    """
+    """Resolve exactly the module spelling mlx-vlm imports, including hyphens."""
     if not model_type:
         return ""
     name = str(model_type).lower()
@@ -3103,12 +3511,14 @@ def _mlx_vlm_canonical_model_type(model_type):
         name = MODEL_REMAPPING.get(name, name)
     except Exception:
         pass
-    return name.replace("-", "_")
+    return name
 
 
 # Families whose mlx-vlm code indexes the vision grid as an array (`.tolist()`,
-# `.prod()`, `[:, 1:]`). Everything else keeps the tuple the Qwen/Paddle compile
-# patches trace: an array becomes a tracer under mx.compile and `.tolist()` raises.
+# `.prod()`, `[:, 1:]`), so a tuple raises inside their tower. Everything else
+# keeps the tuple the Qwen/Paddle compile patches trace: an array becomes a
+# tracer under mx.compile and `.tolist()` raises there instead. Pinned by
+# tests/test_mlx_text_path_contract.py.
 _VLM_ARRAY_GRID_MODEL_TYPES = frozenset({
     "glm4v",
     "glm_ocr",
@@ -3118,26 +3528,14 @@ _VLM_ARRAY_GRID_MODEL_TYPES = frozenset({
 })
 
 
-def _grid_thw_to_mx_array(grid_thw):
-    if grid_thw is None:
-        return None
-    return mx.array(grid_thw, dtype=mx.int32)
-
-
 def _normalize_size_tuples(values):
     if values is None:
         return None
-    if isinstance(values, mx.array):
+    if hasattr(values, "tolist"):
         values = values.tolist()
-    elif hasattr(values, "tolist"):
-        values = values.tolist()
-
-    normalized = []
-    for item in values:
-        if hasattr(item, "tolist"):
-            item = item.tolist()
-        normalized.append(tuple(int(x) for x in item))
-    return tuple(normalized)
+    if isinstance(values, (list, tuple)):
+        return tuple(_normalize_size_tuples(item) for item in values)
+    return int(values)
 
 
 def _normalize_int_tuple(values):
@@ -3564,6 +3962,7 @@ _VLM_QWEN_POSITION_MODEL_TYPES = frozenset({
     "qwen3_5",
     "qwen3_5_moe",
     "qwen4_exp",
+    "prism_hadamard_qwen35",
 })
 _VLM_POSITION_GENERATING_MODEL_TYPES = (
     _VLM_QWEN_POSITION_MODEL_TYPES | {"glm_ocr"}
@@ -3790,6 +4189,7 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
         return _vlm_positions_for_compile(batch_dict, config)
     if phase != "content":
         raise ValueError(f"unknown VLM prepare phase: {phase!r}")
+    validate_legacy_image_batch(batch_dict)
     # The provenance marker is pipeline-private: processor output carrying it is a
     # forgery that would misclassify foreign position ids as regenerated.
     batch_dict.pop("_unsloth_collated_position_ids", None)
@@ -3802,25 +4202,33 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
     spatial_shapes = _normalize_size_tuples(batch_dict.get("spatial_shapes"))
     images_spatial_crop = _normalize_size_tuples(batch_dict.get("images_spatial_crop"))
     audio_embed_sizes = _normalize_int_tuple(batch_dict.get("audio_embed_sizes"))
-    # Resolved, not raw: an aliased config is routed to the canonical family's tower,
-    # so the grid form has to follow it there.
+    # Resolved, not raw: an aliased config is routed to the canonical family's
+    # tower, so the grid form has to follow it there.
     grid_as_array = (
         _mlx_vlm_canonical_model_type(model_type) in _VLM_ARRAY_GRID_MODEL_TYPES
     )
-    if image_grid_thw is not None:
-        batch_dict["image_grid_thw"] = (
-            _grid_thw_to_mx_array(image_grid_thw) if grid_as_array else image_grid_thw
-        )
-    if video_grid_thw is not None:
-        batch_dict["video_grid_thw"] = (
-            _grid_thw_to_mx_array(video_grid_thw) if grid_as_array else video_grid_thw
-        )
-    if image_sizes is not None:
-        batch_dict["image_sizes"] = image_sizes
-    if spatial_shapes is not None:
-        batch_dict["spatial_shapes"] = spatial_shapes
-    if images_spatial_crop is not None:
-        batch_dict["images_spatial_crop"] = images_spatial_crop
+    static_metadata = {}
+    for key, normalized in (
+        ("image_grid_thw", image_grid_thw),
+        ("video_grid_thw", video_grid_thw),
+        ("spatial_shapes", spatial_shapes),
+        ("image_sizes", image_sizes),
+        ("images_spatial_crop", images_spatial_crop),
+    ):
+        if normalized is not None:
+            value = batch_dict[key]
+            if isinstance(value, (mx.array, np.ndarray)):
+                pass  # Never downgrade what the processor emitted.
+            elif grid_as_array and key in ("image_grid_thw", "video_grid_thw"):
+                value = mx.array(normalized, dtype=mx.int32)
+            else:
+                value = normalized
+            batch_dict[key] = value
+            static_metadata[key] = normalized
+    # Only when there is metadata: every VLM batch goes through here, and an
+    # always-present empty dict is a new key in every text-only batch's pytree.
+    if static_metadata:
+        batch_dict["_unsloth_static_vlm_metadata"] = static_metadata
     if audio_embed_sizes is not None:
         # The model calls .item() on each entry, so hand over an array; the
         # tuple above is only for this function's span arithmetic.
@@ -4081,6 +4489,12 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
         )
         return _marked_vlm_baseline()
 
+    backbone = getattr(tm, "model", None)
+    token_ids_only = (
+        backbone is not None and _get_backbone_embed_kwarg(backbone) is None
+        and _get_encoder_decoder_backbone(model) is None
+    )
+
     head_desc = describe_output_head(model)
     _ineligible = _cce_head_ineligibility(head_desc)
     if _ineligible is not None:
@@ -4136,7 +4550,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
         bits = getattr(lm_layer, "bits", 4)
         quant_mode = getattr(lm_layer, "mode", "affine")
 
-        rt_cce = _get_runtime_cce(
+        rt_cce = _runtime_cce_by_mode(
             ignore_index=-100,
             logit_softcap=softcap,
             quantized=True,
@@ -4164,16 +4578,24 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
                 # Cohere2-MoE apply logit_scale in their forward tails).
                 hidden_flat = hidden_flat * logit_scale
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
-            loss = rt_cce(hidden_flat, w, sc, bi, targets_flat)
+            indices = batch_dict.get("_unsloth_cce_indices")
+            if indices is not None and masked_targets.shape[1] > 0:
+                columns = indices[:, 1]
+                flat = indices[:, 0] * masked_targets.shape[1] + columns
+                flat = mx.where((columns >= 0) & (columns < masked_targets.shape[1]), flat, -1)
+                hidden_flat, targets_flat = _compact_cce_inputs(hidden_flat, targets_flat, flat)
+            hidden_flat = _rotate_head_input(lm_head, hidden_flat)
+            loss = rt_cce(model)(hidden_flat, w, sc, bi, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
     else:
         if _skip_weight_grad:
             print("Unsloth: VLM CCE skipping weight gradient (LM head is frozen).")
 
-        rt_cce = _get_runtime_cce(
+        rt_cce = _runtime_cce_by_mode(
             ignore_index=-100,
             logit_softcap=softcap,
+            weight_is_frozen=_skip_weight_grad,
         )
 
         def loss_fn(model, batch_dict):
@@ -4188,11 +4610,43 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
                 # Same pre-scaling identity as the quantized branch above.
                 hidden_flat = hidden_flat * logit_scale
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
-            loss = rt_cce(hidden_flat, w, targets_flat)
+            indices = batch_dict.get("_unsloth_cce_indices")
+            if indices is not None and masked_targets.shape[1] > 0:
+                columns = indices[:, 1]
+                flat = indices[:, 0] * masked_targets.shape[1] + columns
+                flat = mx.where((columns >= 0) & (columns < masked_targets.shape[1]), flat, -1)
+                hidden_flat, targets_flat = _compact_cce_inputs(hidden_flat, targets_flat, flat)
+            loss = rt_cce(model)(hidden_flat, w, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
 
+    if token_ids_only:
+        cce_loss_fn = loss_fn
+        baseline_loss_fn = _marked_vlm_baseline()
+        noticed_media_fallback = False
+
+        def loss_fn(model, batch_dict):
+            nonlocal noticed_media_fallback
+            if (any(
+                    batch_dict.get(key) is not None
+                    for key in ("pixel_values", "pixel_values_videos")
+                ) or _vlm_batch_carries_audio(batch_dict)):
+                if not noticed_media_fallback:
+                    print("Unsloth: CCE backbone cannot accept multimodal embeddings; using standard cross-entropy for media batches.")
+                    noticed_media_fallback = True
+                return baseline_loss_fn(model, batch_dict)
+            return cce_loss_fn(model, batch_dict)
+
     loss_fn._unsloth_cce_backend = "runtime-cce"
+    loss_fn._unsloth_cce_compaction = lm_layer.weight.shape[0] >= 8192
+    if use_quantized:
+        # Absolute: a dotted relative import is unresolvable to transformers' remote-code
+        # walk. See tests/test_relative_imports_resolve.py.
+        from unsloth_zoo.mlx.cce import runtime_cce
+        budget = runtime_cce._CHUNK_BUDGET or runtime_cce._get_memory_budget()
+        base_chunk = max(2048, (lm_layer.weight.shape[0] + 15) // 16)
+        # Keep half-capacity and 256-row projections on the same vocabulary chunks.
+        loss_fn._unsloth_cce_small_capacity_limit = budget // (base_chunk * 4)
     return loss_fn
 
 
@@ -4322,6 +4776,7 @@ def normalize_mlx_chat_template(
     *,
     chat_template=None,
     model_name=None,
+    model_path=None,
     model_type=None,
     is_vlm=False,
     strict=False,
@@ -4339,8 +4794,27 @@ def normalize_mlx_chat_template(
         setattr(target, "_unsloth_model_type", model_type)
 
     tokenizer = _get_processor_tokenizer(target)
-    if is_vlm and not _has_chat_template(target) and _has_chat_template(tokenizer):
-        target.chat_template = tokenizer.chat_template
+    if is_vlm and not _has_chat_template(target):
+        if not _has_chat_template(tokenizer):
+            for source in (model_path, getattr(target, "_unsloth_model_name", None),
+                           getattr(tokenizer, "name_or_path", None)):
+                if not source or not Path(source).is_dir():
+                    continue
+                template_path = Path(source) / "chat_template.jinja"
+                if template_path.is_file():
+                    tokenizer.chat_template = template_path.read_text(encoding="utf-8")
+                    break
+                template_path = Path(source) / "chat_template.json"
+                if template_path.is_file():
+                    from .loader import _read_json_file
+                    template = _read_json_file(template_path).get("chat_template")
+                    if isinstance(template, dict):
+                        template = template.get("default")
+                    if isinstance(template, str) and template:
+                        tokenizer.chat_template = template
+                        break
+        if not _has_chat_template(target) and _has_chat_template(tokenizer):
+            target.chat_template = tokenizer.chat_template
 
     template_target = target if is_vlm else tokenizer
     if strict and not _has_chat_template(template_target):
@@ -4353,6 +4827,7 @@ def normalize_vlm_processor_chat_template(
     *,
     chat_template=None,
     model_name=None,
+    model_path=None,
     model_type=None,
     strict=False,
 ):
@@ -4366,6 +4841,7 @@ def normalize_vlm_processor_chat_template(
         processor,
         chat_template=chat_template,
         model_name=model_name,
+        model_path=model_path,
         model_type=model_type,
         is_vlm=True,
         strict=strict,
@@ -4540,6 +5016,9 @@ def _normalize_mlx_messages(messages, *, is_vlm=False):
                         parts.append({"type": "text", "text": part})
                     elif isinstance(part, dict):
                         clean = _clean_vlm_none_keys(part)
+                        for key in ("input_image", "image_url"):
+                            if key in clean:
+                                clean.setdefault("image", clean.pop(key))
                         # Gemma 3n's template renders a placeholder for
                         # "audio" alone, so a part left under an alias carries
                         # a clip with nothing behind it, and an untyped one
@@ -4551,6 +5030,8 @@ def _normalize_mlx_messages(messages, *, is_vlm=False):
                                 clean["type"] = "image"
                             elif any(alias in clean for alias in _AUDIO_PART_TYPES):
                                 clean["type"] = "audio"
+                        elif clean["type"] in ("image_url", "input_image"):
+                            clean["type"] = "image"
                         elif clean["type"] in _AUDIO_PART_TYPES:
                             clean["type"] = "audio"
                         parts.append(clean)
@@ -4590,20 +5071,28 @@ def _collapse_vlm_assistant_content(messages):
     return collapsed
 
 
-def _flatten_vlm_content_for_text_template(messages):
-    """Render list-style VLM content as text for text-only chat templates."""
-    flattened = copy.deepcopy(messages)
-    for message in flattened:
+def _flatten_vlm_content_for_text_template(messages, image_token=None):
+    """Render list-style VLM content as text for text-only chat templates.
+
+    Rebuilt shallowly rather than deep-copied: only `content` is replaced, and a
+    deepcopy would clone every PIL image on the row. This runs per training
+    sample, so that cost is the whole collator's.
+    """
+    flattened = []
+    for message in messages:
         content = message.get("content", "")
         if not isinstance(content, list):
+            flattened.append(message)
             continue
         texts = []
         for part in content:
             if isinstance(part, dict) and part.get("type") == "text":
                 texts.append(str(part.get("text", "")))
+            elif isinstance(part, dict) and part.get("type") == "image" and image_token:
+                texts.append(image_token)
             elif isinstance(part, str):
                 texts.append(part)
-        message["content"] = "".join(texts)
+        flattened.append({**message, "content": "".join(texts)})
     return flattened
 
 
@@ -4639,24 +5128,35 @@ def _count_vlm_image_parts(messages):
     return count
 
 
-def _repair_deepseek_rendered_image_tokens(processor, text, messages):
+def _vlm_image_token(processor):
+    for owner in (processor, _get_processor_tokenizer(processor)):
+        for name in ("image_token", "boi_token"):
+            token = getattr(owner, name, None)
+            if isinstance(token, str) and token:
+                return token
+    module = sys.modules.get(type(processor).__module__)
+    for name in ("DEFAULT_IMAGE_TOKEN", "IMAGE_TOKEN", "IMAGE_PLACEHOLDER"):
+        token = getattr(module, name, None)
+        if isinstance(token, str) and token:
+            return token
+    return None
+
+
+def _vlm_render_preserves_content(text, messages):
     if not isinstance(text, str) or not text.strip():
-        return text
-    marker = (
-        f"{processor.__class__.__module__}.{processor.__class__.__name__}"
-    ).lower()
-    if "deepseek" not in marker:
-        return text
-    image_count = _count_vlm_image_parts(messages)
-    if image_count <= 0:
-        return text
-    image_token = getattr(processor, "image_token", None)
-    if not image_token:
-        return text
-    missing = image_count - text.count(image_token)
-    if missing <= 0:
-        return text
-    return (image_token * missing) + text
+        return False
+    normalized = " ".join(text.split())
+    for message in messages:
+        content = message.get("content", "")
+        if isinstance(content, list):
+            if content and str(content) in text:
+                return False
+            parts = [p.get("text", "") if isinstance(p, dict) else p for p in content]
+        else:
+            parts = [content]
+        if any(" ".join(str(part).split()) not in normalized for part in parts):
+            return False
+    return True
 
 
 def _processor_accepts_assistant_list_content(processor):
@@ -4686,69 +5186,143 @@ def _processor_accepts_assistant_list_content(processor):
             return True
 
 
+def _vlm_token_messages(processor, messages):
+    model_type = getattr(processor, "_unsloth_model_type", None)
+    if not model_type:
+        return messages
+    from mlx_vlm.prompt_utils import get_message_json
+
+    rendered = []
+    image_offset = 0
+    for message in messages:
+        count = _count_vlm_image_parts([message])
+        offset = image_offset
+        image_offset += count
+        parts = message.get("content")
+        if not isinstance(parts, list) or any(
+            not isinstance(part, dict) or part.get("type") not in ("text", "image")
+            for part in parts
+        ):
+            rendered.append(message)
+            continue
+        text = "".join(str(part.get("text", "")) for part in parts
+                       if part.get("type") == "text")
+        if hasattr(processor, "_unsloth_legacy_image_spec"):
+            rendered.append({**message, "content": "".join(
+                "<image>\n" if part["type"] == "image" else str(part.get("text", "")) for part in parts)})
+            continue
+        try:
+            native = get_message_json(
+                model_type, text, role=message.get("role", "user"), num_images=count,
+            )
+        except ValueError:
+            native = None
+        content = native.get("content") if isinstance(native, dict) else None
+        if isinstance(content, str) and (not count or content != text):
+            if count and offset and content.endswith(text):
+                prefix = content[:-len(text)] if text else content
+                prefix = re.sub(r"<\|image_(\d+)\|>",
+                                lambda match: f"<|image_{int(match[1]) + offset}|>", prefix)
+                content = prefix + text
+            message = {**message, "content": content}
+        rendered.append(message)
+    return rendered
+
+
+def _mark_vlm_image_parts(messages, image_token):
+    """Replace image parts with a literal image token, sharing everything else.
+
+    Shallow by construction: the copy exists to swap one part dict, and deep
+    copying would duplicate the row's PIL images on every render.
+    """
+    if not image_token:
+        return messages
+    marked = []
+    for message in messages:
+        content = message.get("content", "")
+        if isinstance(content, list):
+            message = {**message, "content": [
+                {"type": "text", "text": image_token}
+                if isinstance(part, dict) and part.get("type") == "image" else part
+                for part in content
+            ]}
+        marked.append(message)
+    return marked
+
+
 def _render_vlm_messages(
     processor,
     messages,
     *,
     add_generation_prompt=False,
 ):
-    normalize_vlm_processor_chat_template(processor, strict=True)
     if isinstance(messages, str):
         return messages
+    messages = _normalize_vlm_messages(messages)
+    normalize_vlm_processor_chat_template(processor, strict=False)
+    tokenizer = _get_processor_tokenizer(processor)
+    renderer = processor if callable(getattr(processor, "apply_chat_template", None)) else tokenizer
+    image_token = _vlm_image_token(processor)
+    if not _has_chat_template(renderer):
+        return "\n".join(
+            message.get("content", "")
+            for message in _flatten_vlm_content_for_text_template(messages, image_token)
+        )
 
-    render_messages = messages
-    if not _processor_accepts_assistant_list_content(processor):
+    render_messages = _vlm_token_messages(processor, messages)
+    if not _processor_accepts_assistant_list_content(renderer):
         render_messages = _collapse_vlm_assistant_content(render_messages)
+    image_count = _count_vlm_image_parts(messages)
+    image_tokens = {token for token in (image_token, getattr(processor, "boi_token", None),
+                                        getattr(tokenizer, "boi_token", None)) if token}
 
-    first_error = None
-    second_error = None
-    third_error = None
+    def _candidates():
+        # Built lazily: the later shapes allocate, and the first one renders for
+        # nearly every family.
+        yield render_messages
+        marked = _mark_vlm_image_parts(render_messages, image_token)
+        yield marked
+        yield _flatten_vlm_content_for_text_template(messages, image_token)
+        yield _flatten_vlm_messages_to_content_parts(marked)
+        if rendered is None:
+            yield messages
+            yield _mark_vlm_image_parts(messages, image_token)
+            yield _collapse_vlm_assistant_content(messages)
 
-    try:
-        text = processor.apply_chat_template(
-            render_messages,
-            tokenize=False,
-            add_generation_prompt=add_generation_prompt,
-        )
-        text = _repair_deepseek_rendered_image_tokens(processor, text, messages)
-        if isinstance(text, str) and text.strip():
-            return text
-    except Exception as exc:
-        first_error = exc
-
-    try:
-        text = processor.apply_chat_template(
-            _flatten_vlm_messages_to_content_parts(messages),
-            tokenize=False,
-            add_generation_prompt=add_generation_prompt,
-        )
-        text = _repair_deepseek_rendered_image_tokens(processor, text, messages)
-        if isinstance(text, str) and text.strip():
-            return text
-    except Exception as exc:
-        second_error = exc
-
-    try:
-        text = processor.apply_chat_template(
-            _flatten_vlm_content_for_text_template(render_messages),
-            tokenize=False,
-            add_generation_prompt=add_generation_prompt,
-        )
-        text = _repair_deepseek_rendered_image_tokens(processor, text, messages)
-        if isinstance(text, str) and text.strip():
-            return text
-    except Exception as exc:
-        third_error = exc
-
-    if first_error is not None:
-        raise RuntimeError(
-            "Unsloth MLX VLM: failed to render chat messages with this "
-            "processor chat_template. Check that the dataset roles/content "
-            "schema matches the model family, or pass a formatting_func that "
-            "returns pre-rendered text."
-        ) from (third_error or second_error or first_error)
-
-    return ""
+    error = None
+    rendered = None
+    for candidate in _candidates():
+        try:
+            text = renderer.apply_chat_template(
+                candidate,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+            )
+        except Exception as exc:
+            error = exc
+            continue
+        if not isinstance(text, str) or not text.strip():
+            continue
+        if rendered is None:
+            rendered = text
+        if not all(_vlm_render_preserves_content(text, source) for source in (messages, candidate)):
+            continue
+        if image_tokens and max(text.count(token) for token in image_tokens) < image_count:
+            continue
+        return text
+    if rendered is not None:
+        # A template is allowed to transform what it renders: Qwen3/QwQ strip
+        # <think> from history, autoescaping ones rewrite `<` and `&`, others
+        # drop roles they do not model. The checks above pick the best-preserved
+        # candidate, but they cannot tell a deliberate transform from damage, so
+        # they do not get to fail a render the template itself accepted.
+        return rendered
+    raise RuntimeError(
+        "Unsloth MLX VLM: failed to render chat messages with this "
+        "processor chat_template. Check that the dataset roles/content "
+        "schema matches the model family, or pass a formatting_func that "
+        "returns pre-rendered text."
+    ) from error
 
 
 def _looks_like_mlx_chat_messages(value):
@@ -5688,6 +6262,7 @@ def _stage_tokenized_text_batch(
     pad_id=0,
     labels_expected=None,
     host_valued=None,
+    width_policy=None,
 ):
     """Host staging of one pretokenized text batch (no MLX work).
 
@@ -5703,6 +6278,11 @@ def _stage_tokenized_text_batch(
     max_length = max(lengths)
     if max_length == 0:
         max_length = min(2, max_seq_length)
+    if width_policy is not None:
+        # True lengths stay in lengths_info, so masking is unaffected.
+        endpoint = width_policy(max_length)
+        if endpoint is not None:
+            max_length = endpoint
     batch_ids = np.full((len(batch_items), max_length), int(pad_id), dtype=np.int32)
     has_labels = (
         valid_items[0][1] is not None
@@ -5842,6 +6422,7 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
         "_visit_seed",
         "_visit_epoch_cache",
         "_cycle_length",
+        "_cce_capacities",
     )
 
     def __init__(
@@ -5868,6 +6449,7 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
         self.pad_to_multiple = int(pad_to_multiple)
         self.label_dtype = np.dtype(label_dtype)
         self._shape_plan = None
+        self._cce_capacities = {}
         self._visit_policy = str(visit_policy)
         # Normalized eagerly so visits never depend on ambient RNG state and a
         # reconstructed plan (fresh-process resume) derives identical visits.
@@ -5969,6 +6551,70 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
         if getattr(shape_plan.report, "action", None) not in ("exact", "bucket"):
             raise ValueError("only exact or bucket shape plans can be installed")
         self._shape_plan = shape_plan
+
+    def configure_cce_compaction(self, enabled=True):
+        self._cce_capacities = {}
+        if not enabled:
+            return
+        # tuple.count scans in C and a schedule revisits rows, so neither the
+        # per-label compare nor the repeat visit reaches Python. Label-masked
+        # corpora put every token of every row in this window, which is what
+        # makes the difference worth having.
+        row_counts = {}
+
+        def supervised(row_index):
+            count = row_counts.get(row_index)
+            if count is None:
+                row = self._rows[row_index]
+                end = min(len(row.input_ids), self.max_seq_length)
+                start = max(1, row.offset)
+                if row.labels is None:
+                    count = max(0, end - start)
+                else:
+                    window = row.labels[start:end]
+                    count = len(window) - window.count(-100)
+                row_counts[row_index] = count
+            return count
+
+        counts = {}
+        for index, batch_indices in enumerate(self._schedule):
+            count = sum(
+                supervised(row_index)
+                for row_index in batch_indices if row_index is not None
+            )
+            family = self.batch_family(index)
+            widths = {self.batch_width(index)}
+            if self._shape_plan is not None:
+                widths.add(self._shape_plan.endpoint_for(family, min(widths)))
+            for width in widths:
+                key = (family, width)
+                counts[key] = max(counts.get(key, 0), count)
+        # A fixed capacity per admitted shape avoids extra compiled variants.
+        for (family, width), count in counts.items():
+            capacity = max(256, ((count + 255) // 256) * 256)
+            tokens = family[1][0][0] * (width - 1)
+            if capacity * 2 <= tokens:
+                self._cce_capacities[family, width] = capacity
+
+    def prepare_cce_batch(self, index, batch):
+        width = batch[0].shape[1]
+        capacity = self._cce_capacities.get((self.batch_family(index), width))
+        if capacity is None:
+            return batch
+        selected = []
+        for batch_row, row_index in enumerate(self._schedule[index]):
+            if row_index is None:
+                continue
+            row = self._rows[row_index]
+            end = min(len(row.input_ids), self.max_seq_length, width)
+            selected.extend(
+                batch_row * (width - 1) + position - 1
+                for position in range(max(1, row.offset), end)
+                if row.labels is None or row.labels[position] != -100
+            )
+        indices = np.full(capacity, -1, dtype=np.int32)
+        indices[:len(selected)] = selected
+        return (*batch, mx.array(indices))
 
     def materialize(self, index, *, phase=None):
         batch_indices = self._schedule[index]
@@ -6197,6 +6843,22 @@ def _resize_vlm_images(images, image_size):
     target = (image_size, image_size) if isinstance(image_size, int) else image_size
     resized = []
     for image in images:
+        if isinstance(image, (bytes, dict, str, os.PathLike)):
+            from io import BytesIO
+            if isinstance(image, dict):
+                image = image.get("bytes") or image.get("path") or image.get("url")
+            if isinstance(image, str) and image.startswith(("http://", "https://")):
+                from unsloth_zoo.vision_utils import fetch_remote_media_bytes
+                image = fetch_remote_media_bytes(image)
+            elif isinstance(image, str) and image.startswith("data:image"):
+                from base64 import b64decode
+                image = b64decode(image.split("base64,", 1)[1])
+            elif isinstance(image, str) and image.startswith("file://"):
+                from unsloth_zoo.vision_utils import resolve_file_uri_to_path
+                image = resolve_file_uri_to_path(image)
+            if isinstance(image, bytes):
+                image = BytesIO(image)
+            image = Image.open(image)
         if isinstance(image, Image.Image):
             image = image.convert("RGB")
             if _is_vlm_no_resize_image_size(image_size):
@@ -6273,6 +6935,10 @@ def _extract_vlm_images(
                 if isinstance(part, dict) and part.get("type") == "image":
                     image = part.get("image")
                     if image is not None:
+                        if any(key in part for key in ("resized_height", "resized_width", "min_pixels", "max_pixels")):
+                            from unsloth_zoo.vision_utils import fetch_image
+                            image = _resize_vlm_images([image], None)[0]
+                            image = fetch_image({**part, "image": image})
                         images.append(image)
 
     if (
@@ -7765,6 +8431,9 @@ _VLM_PER_ROW_MEDIA_KEYS = ("audio_bounds", "image_bound", "tgt_sizes")
 
 
 def _to_mx_vlm_batch(inputs):
+    if inputs.get("pixel_values") is None and inputs.get("images") is not None:
+        inputs = dict(inputs)
+        inputs["pixel_values"] = inputs.pop("images")
     batch = {}
     for key, value in inputs.items():
         if key == "sound_clips" and isinstance(value, (list, tuple)):
@@ -7866,12 +8535,64 @@ def _convert_vlm_processor_output(value, return_tensors):
     return value
 
 
+_VLM_COMPONENT_KWARGS = contextvars.ContextVar("vlm_component_kwargs", default={})
+
+
+def _scope_vlm_component_call(component):
+    cls = type(component)
+    original = cls.__call__
+    if getattr(original, "_unsloth_vlm_component_kwargs", False):
+        return
+
+    @wraps(original)
+    def scoped(self, *args, **kwargs):
+        options = _VLM_COMPONENT_KWARGS.get().get(id(self))
+        if options is not None:
+            excluded, defaults = options
+            kwargs = {**defaults, **kwargs}
+            kwargs = {k: v for k, v in kwargs.items() if k not in excluded}
+        return original(self, *args, **kwargs)
+
+    scoped._unsloth_vlm_component_kwargs = True
+    try:
+        cls.__call__ = scoped
+    except (TypeError, AttributeError):
+        # Native callables cannot be patched and keep their own dispatch.
+        pass
+
+
+def _invoke_vlm_processor(processor_call, args, kwargs):
+    processor = args[0] if args and hasattr(args[0], "image_processor") else processor_call
+    tokenizer = getattr(processor, "tokenizer", None)
+    image_processor = getattr(processor, "image_processor", None)
+    if not callable(tokenizer) or not callable(image_processor):
+        return processor_call(*args, **kwargs)
+    from transformers.processing_utils import ImagesKwargs, TextKwargs
+
+    text_keys = set(TextKwargs.__annotations__)
+    image_keys = set(ImagesKwargs.__annotations__)
+    _scope_vlm_component_call(tokenizer)
+    _scope_vlm_component_call(image_processor)
+    # Keep component identity/state, and isolate options from other calls/threads.
+    options = dict(_VLM_COMPONENT_KWARGS.get())
+    options[id(image_processor)] = (text_keys - image_keys, {})
+    options[id(tokenizer)] = (
+        image_keys - text_keys,
+        {"padding": kwargs["padding"]} if "padding" in kwargs else {},
+    )
+    token = _VLM_COMPONENT_KWARGS.set(options)
+    try:
+        return processor_call(*args, **kwargs)
+    finally:
+        _VLM_COMPONENT_KWARGS.reset(token)
+
+
 def _call_vlm_processor(processor_call, args, kwargs):
-    """Retry only the Transformers fast-processor PyTorch output contract."""
+    """Scope modality options and negotiate PyTorch-only processor output."""
 
     return_tensors = kwargs.get("return_tensors")
     try:
-        return processor_call(*args, **kwargs)
+        return _invoke_vlm_processor(processor_call, args, kwargs)
     except ValueError as error:
         if (
             return_tensors not in {"mlx", "np"}
@@ -7881,7 +8602,7 @@ def _call_vlm_processor(processor_call, args, kwargs):
 
     retry_kwargs = dict(kwargs)
     retry_kwargs["return_tensors"] = "pt"
-    output = processor_call(*args, **retry_kwargs)
+    output = _invoke_vlm_processor(processor_call, args, retry_kwargs)
     return _convert_vlm_processor_output(output, return_tensors)
 
 
@@ -8013,6 +8734,104 @@ def _drop_unsupported_processor_kwargs(processor, kwargs):
     return {k: v for k, v in kwargs.items() if k in params}
 
 
+_LEGACY_IMAGE_SPEC = "_unsloth_legacy_image_spec"
+
+
+def bind_legacy_image_processor(model, processor):
+    from mlx_vlm.models.base import BaseImageProcessor
+    image_processor = getattr(processor, "image_processor", None)
+    if hasattr(processor, "tokenizer") or not isinstance(image_processor, BaseImageProcessor):
+        return
+    from PIL import Image
+
+    merge_name = "_prepare_inputs_for_multimodal"
+    merge = getattr(model, merge_name, None)
+    token_id = _config_get(getattr(model, "config", None), "image_token_index")
+    if (not callable(merge) or token_id is None
+            or tuple(inspect.signature(merge).parameters) !=
+            ("image_features", "inputs_embeds", "input_ids")):
+        return
+    shapes = []
+
+    def capture(self, image_features, inputs_embeds, input_ids):
+        shapes.append(image_features.shape)
+        return inputs_embeds
+
+    namespace = vars(model)
+    existed, previous = merge_name in namespace, namespace.get(merge_name)
+    try:
+        object.__setattr__(model, merge_name, types.MethodType(capture, model))
+        with _preserved_preprocessing_rng():
+            pixels = np.stack(image_processor.preprocess([Image.new("RGB", (32, 32))]))
+            model.get_input_embeddings(mx.array([[0, token_id, 0]]), mx.array(pixels))
+    finally:
+        if existed:
+            object.__setattr__(model, merge_name, previous)
+        else:
+            object.__delattr__(model, merge_name)
+    if len(shapes) != 1 or len(shapes[0]) not in (2, 3) or math.prod(shapes[0][:-1]) < 1:
+        raise ValueError("Unsloth MLX: legacy image preprocessing requires one nonempty projected feature sequence.")
+    count = math.prod(shapes[0][:-1])
+    setattr(processor, _LEGACY_IMAGE_SPEC, (int(token_id), count, tuple(pixels.shape[1:])))
+    model._unsloth_legacy_image_token_count = count
+
+
+def legacy_image_inputs(processor, texts, all_images, max_seq_length, truncation=True):
+    from mlx_vlm.models.base import BaseImageProcessor
+    if hasattr(processor, "tokenizer") or not isinstance(getattr(processor, "image_processor", None), BaseImageProcessor) or not any(all_images):
+        return None
+    from mlx_vlm.utils import prepare_inputs
+
+    spec = getattr(processor, _LEGACY_IMAGE_SPEC, None)
+    if spec is None:
+        raise ValueError("Unsloth MLX: legacy image training requires an expanded-image merge; load with patch_mode='patched'.")
+    token_id, count, pixel_shape = spec
+    if (not all(len(images) == 1 for images in all_images)
+            or not all(text.count("<image>") == 1 for text in texts)):
+        raise ValueError("Unsloth MLX: legacy image rows require exactly one image and <image> placeholder.")
+    inputs = prepare_inputs(
+        processor, images=[images[0] for images in all_images],
+        prompts=texts, image_token_index=token_id,
+    )
+    if tuple(inputs["pixel_values"].shape[1:]) != pixel_shape:
+        raise ValueError("Unsloth MLX: variable image shapes require a processor that expands its own image tokens.")
+    ids, mask = _expand_image_token_sequences(
+        inputs["input_ids"], inputs["attention_mask"], token_id, count,
+    )
+    if truncation and max_seq_length and ids.shape[1] > max_seq_length:
+        side = getattr(processor, "truncation_side", "right")
+        columns = slice(-max_seq_length, None) if side == "left" else slice(0, max_seq_length)
+        ids, mask = ids[:, columns], mask[:, columns]
+    inputs["input_ids"], inputs["attention_mask"] = ids, mask
+    inputs[_LEGACY_IMAGE_SPEC] = (token_id, count)
+    validate_legacy_image_batch(inputs)
+    return inputs
+
+
+def validate_legacy_image_batch(batch):
+    spec = batch.get(_LEGACY_IMAGE_SPEC)
+    if spec is None:
+        return
+    token_id, count = spec
+    ids = np.asarray(batch["input_ids"])
+    retained = (ids == token_id).sum(axis=1)
+    if np.any(retained != count):
+        raise ValueError(
+            f"Unsloth MLX: truncation split or removed an image span "
+            f"({count} visual tokens required per row, retained {retained.tolist()}). "
+            "Increase max_seq_length."
+        )
+
+
+def _ensure_vlm_pad_token(processor):
+    tokenizer = _get_processor_tokenizer(processor)
+    if getattr(tokenizer, "pad_token_id", None) is None:
+        eos = getattr(tokenizer, "eos_token", None)
+        if eos is not None:
+            tokenizer.pad_token = eos
+    return tokenizer
+
+
 def _processor_vlm_inputs(
     processor,
     texts,
@@ -8023,6 +8842,15 @@ def _processor_vlm_inputs(
     padding_side=None,
     all_audio=None,
 ):
+    legacy = legacy_image_inputs(processor, texts, all_images, max_seq_length, truncation)
+    if legacy is not None:
+        return legacy
+    tokenizer = _ensure_vlm_pad_token(processor)
+    images = _format_vlm_images_for_processor(all_images, processor=processor)
+    audio = _format_vlm_audio_for_processor(all_audio, processor=processor)
+    text_only = images is None and audio is None and callable(tokenizer)
+    if text_only:
+        processor = tokenizer
     base_kwargs = dict(
         text=texts,
         padding=True,
@@ -8030,7 +8858,6 @@ def _processor_vlm_inputs(
         add_special_tokens=False,
     )
     base_kwargs = _drop_unsupported_processor_kwargs(processor, base_kwargs)
-    audio = _format_vlm_audio_for_processor(all_audio, processor=processor)
     audio_kwarg = None
     if audio is not None:
         audio_kwarg = _vlm_processor_audio_kwarg(processor)
@@ -8069,7 +8896,6 @@ def _processor_vlm_inputs(
             ))
     if padding_side is not None:
         base_kwargs["padding_side"] = padding_side
-    images = _format_vlm_images_for_processor(all_images, processor=processor)
     if images is not None:
         image_layouts = (
             ("nested", "flat")
@@ -8079,7 +8905,12 @@ def _processor_vlm_inputs(
     else:
         image_layouts = (None,)
     if suffixes is not None and any(suffix is not None for suffix in suffixes):
-        base_kwargs["suffix"] = [suffix or "" for suffix in suffixes]
+        base_kwargs["text_pair" if text_only else "suffix"] = [
+            (suffix or "") + (getattr(tokenizer, "eos_token", None) or "")
+            if text_only else (suffix or "") for suffix in suffixes
+        ]
+        if text_only:
+            base_kwargs["return_token_type_ids"] = True
     if _vlm_processor_requests_mm_token_type_ids(processor):
         base_kwargs["return_mm_token_type_ids"] = True
 
@@ -8152,7 +8983,14 @@ def _processor_vlm_inputs(
         raise first_error
 
     if audio_kwarg is None:
-        return _run_layouts()
+        inputs = _run_layouts()
+        if text_only and "text_pair" in base_kwargs:
+            inputs["labels"] = np.where(
+                np.asarray(inputs["token_type_ids"]) == 0, -100,
+                np.asarray(inputs["input_ids"]),
+            )
+            inputs["_unsloth_suffix_only_loss"] = True
+        return inputs
 
     def _run_audio_layouts():
         return _repair_audio_batch(
@@ -8807,6 +9645,7 @@ def _build_response_masked_vlm_batch(
     yield_host_staged=False,
     reject_mlx_valued=False,
     target_width=None,
+    width_policy=None,
 ):
     """Collate VLM rows and apply the CUDA response-mask closure.
 
@@ -8819,6 +9658,8 @@ def _build_response_masked_vlm_batch(
     at the width seam: the finalizer stops after its content phase, the pad lands
     after expansion and response masking so padded tails stay inert, and the
     position phase then runs at the final width.
+
+    ``width_policy`` is the streaming form, chosen from the post-expansion width.
     """
     staged, is_prompt_completion = _collate_vlm_batch(
         items, processor, max_seq_length, image_size,
@@ -8831,15 +9672,25 @@ def _build_response_masked_vlm_batch(
     staged.config = config
     # Unplanned batches keep the historical single-pass order, including its
     # failure ordering (a broken batch raises before the response-mask callback).
-    phase = None if target_width is None else "content"
+    widening = target_width is not None or (
+        width_policy is not None and getattr(width_policy, "armed", True)
+    )
+    phase = "content" if widening else None
 
     def _seal(batch_dict):
-        """Width seam: pad to the planned endpoint, then record positions."""
-        if target_width is None:
-            return batch_dict
+        """Width seam: pad to the chosen endpoint, then record positions."""
+        target = target_width
+        if target is None and widening and width_policy is not None:
+            target = _resolve_stream_vlm_target(
+                batch_dict, config, processor, width_policy,
+            )
+        if target is None:
+            return _prepare_vlm_batch_for_compile(
+                batch_dict, config, phase="positions",
+            ) if widening else batch_dict
         tokenizer = getattr(processor, "tokenizer", processor)
         batch_dict = _finalize_vlm_batch_width(
-            batch_dict, target_width,
+            batch_dict, target,
             getattr(tokenizer, "pad_token_id", None),
             disposable_keys=_vlm_pipeline_disposable_keys(config),
         )
@@ -10024,6 +10875,29 @@ def _restore_vlm_row_image_handles(item, _depth=0):
     return item
 
 
+def _compact_vlm_cce_batch(batch, small_capacity_limit=0):
+    """Attach fixed-capacity CCE indices for a VLM batch's supervised targets.
+
+    Returns None when the batch has no 2-D labels or its supervised targets
+    fill more than half of the target positions.
+    """
+    labels = batch.get("labels")
+    if labels is None or labels.ndim != 2:
+        return None
+    tokens = labels.shape[0] * (labels.shape[1] - 1)
+    capacity = tokens // 512 * 256
+    if capacity <= 0:
+        return None
+    selected = np.argwhere(np.asarray(labels)[:, 1:] != -100)
+    if len(selected) > capacity:
+        return None
+    if 256 < capacity <= small_capacity_limit and len(selected) <= 256:
+        capacity = 256
+    indices = np.full((capacity, 2), -1, dtype=np.int32)
+    indices[:len(selected)] = selected
+    return {**batch, "_unsloth_cce_indices": mx.array(indices)}
+
+
 class FiniteVLMBatchPlan(_FiniteVisitMixin):
     """CPU-backed finite VLM schedule with on-demand MLX materialization.
 
@@ -10057,6 +10931,9 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         "_shape_plan",
         "_planned_widths",
         "_cycle_length",
+        "_cce_compaction",
+        "_cce_dense_batches",
+        "_cce_small_capacity_limit",
     )
 
     def __init__(
@@ -10107,6 +10984,9 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         self._forbidden = None
         self._shape_plan = None
         self._planned_widths = None
+        self._cce_compaction = False
+        self._cce_dense_batches = set()
+        self._cce_small_capacity_limit = 0
         if self._empty_masks is not None and (
             len(self._empty_masks) != len(self._schedule)
         ):
@@ -10186,6 +11066,46 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         self._shape_plan = shape_plan
         self._planned_widths = planned_widths
         self._mru = None
+
+    def configure_cce_compaction(self, enabled=True, *, max_variants=None, small_capacity_limit=0):
+        self._cce_compaction = bool(enabled)
+        self._cce_dense_batches.clear()
+        self._cce_small_capacity_limit = small_capacity_limit if enabled else 0
+        plan = self._shape_plan
+        if plan is None:
+            return None
+        raw = frozenset(key for key in plan.raw_catalog if not key[1].endswith((":cce", ":cce256")))
+        planned = frozenset(key for key in plan.planned_catalog if not key[1].endswith((":cce", ":cce256")))
+        max_variants = plan.report.cap if max_variants is None else max_variants
+        self._cce_compaction &= 2 * len(planned) <= max_variants
+        if not self._cce_compaction or 3 * len(planned) > max_variants:
+            self._cce_small_capacity_limit = 0
+        if self._cce_compaction:
+            if self._cce_small_capacity_limit:
+                small_raw = frozenset((scope, phase + ":cce256", family, width) for scope, phase, family, width in raw)
+                small_planned = frozenset((scope, phase + ":cce256", family, width) for scope, phase, family, width in planned)
+            else:
+                small_raw = small_planned = frozenset()
+            # Processor labels can require the dense fallback on later visits.
+            raw |= frozenset((scope, phase + ":cce", family, width) for scope, phase, family, width in raw)
+            planned |= frozenset((scope, phase + ":cce", family, width) for scope, phase, family, width in planned)
+            raw |= small_raw
+            planned |= small_planned
+        cap = max(plan.report.cap, len(planned))
+        report = replace(plan.report, raw_signatures=len(raw), planned_signatures=len(planned),
+                         cap=cap, effective_cap=cap)
+        self._shape_plan = replace(plan, raw_catalog=raw, planned_catalog=planned, report=report)
+        return report
+
+    def prepare_cce_batch(self, index, batch):
+        if not self._cce_compaction or index in self._cce_dense_batches:
+            return batch
+        compacted = _compact_vlm_cce_batch(batch, self._cce_small_capacity_limit)
+        if compacted is None:
+            # Keep dense slots off the fast path, including later stochastic rebuilds.
+            self._cce_dense_batches.add(index)
+            return batch
+        return compacted
 
     def materialize(self, index, target_width=None, *, phase=None):
         """Build one batch through the complete existing VLM builder.
@@ -10748,13 +11668,60 @@ def _vlm_has_sized_index_space(dataset):
     return True
 
 
+def _resolve_stream_vlm_target(batch_dict, config, processor, width_policy):
+    """Endpoint for a streamed VLM batch, or None when widening cannot materialize."""
+    ids = batch_dict.get("input_ids")
+    shape = getattr(ids, "shape", None)
+    if shape is None or len(shape) < 2:
+        return None
+    tokenizer = getattr(processor, "tokenizer", processor)
+    if getattr(tokenizer, "pad_token_id", None) is None:
+        return None
+    if getattr(width_policy, "holding", False):
+        return None
+    width, _axes, padable, forbidden = _vlm_width_survey(
+        batch_dict, disposable_keys=_vlm_pipeline_disposable_keys(config),
+    )
+    if not padable or width is None:
+        return None
+    target = width_policy(int(width))
+    # Bump past extents an untouched array occupies.
+    seen = 0
+    while target is not None and target in forbidden and seen <= len(forbidden):
+        target = width_policy(int(target) + 1)
+        seen += 1
+    if target is None or target in forbidden:
+        return None
+    return None if int(target) <= int(width) else int(target)
+
+
+def _widen_finalized_vlm_batch(batch_dict, config, processor, width_policy):
+    """Prefetch-path widening of a finalized VLM batch, then positions."""
+    target = _resolve_stream_vlm_target(
+        batch_dict, config, processor, width_policy,
+    )
+    if target is None:
+        return _prepare_vlm_batch_for_compile(
+            batch_dict, config, phase="positions",
+        )
+    tokenizer = getattr(processor, "tokenizer", processor)
+    batch_dict = _finalize_vlm_batch_width(
+        batch_dict, target,
+        getattr(tokenizer, "pad_token_id", None),
+        disposable_keys=_vlm_pipeline_disposable_keys(config),
+    )
+    return _prepare_vlm_batch_for_compile(
+        batch_dict, config, phase="positions",
+    )
+
+
 def _iterate_lazy_vlm_training_batches(
     dataset, processor, config, batch_size, max_seq_length, *,
     response_mask_fn=None, formatting_func=None, dataset_order="default",
     completion_only_loss=None, image_size=None, comm_group=None,
     require_replayable=False, expected_rows_per_pass=None,
     ignore_token_ids=None, yield_host_staged=False, reject_mlx_valued=False,
-    should_stop=None,
+    should_stop=None, width_policy=None,
 ):
     """Unsized VLM batches under the lazy text-stream lifecycle contracts.
 
@@ -10795,6 +11762,7 @@ def _iterate_lazy_vlm_training_batches(
             completion_only_loss=completion_only_loss,
             yield_host_staged=yield_host_staged,
             reject_mlx_valued=reject_mlx_valued,
+            width_policy=None if yield_host_staged else width_policy,
         )
 
     def _filter_stream_item(item):
@@ -10988,7 +11956,8 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
                                   expected_rows_per_pass=None,
                                   prefetch_batches=0,
                                   prefetch_skip_batches=0,
-                                  prefetch_control=None):
+                                  prefetch_control=None,
+                                  width_policy=None):
     """Streaming VLM batch generator using processor directly. Yields batch
     dicts with input_ids, pixel_values, attention_mask, and optionally labels."""
     import numpy as np
@@ -11103,7 +12072,17 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
                 None,
                 prefetch_depth,
                 skip_batches=prefetch_skip_batches,
-                finalize=_finalize_vlm_batch,
+                # Select on presence, not ``armed``: this body runs (audio peek) before arming.
+                finalize=(
+                    _finalize_vlm_batch
+                    if width_policy is None
+                    else lambda staged, policy=width_policy: (
+                        _widen_finalized_vlm_batch(
+                            _finalize_vlm_batch(staged, phase="content"),
+                            staged.config, processor, policy,
+                        )
+                    )
+                ),
             )
             prefetcher._make_iterator = (
                 lambda pf=prefetcher: _iterate_lazy_vlm_training_batches(
@@ -11140,6 +12119,7 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
             require_replayable=require_replayable,
             expected_rows_per_pass=expected_rows_per_pass,
             ignore_token_ids=ignore_token_ids,
+            width_policy=width_policy,
         )
 
 
@@ -11482,7 +12462,8 @@ def _make_text_batch_from_items(batch_items, tokenizer, max_seq_length):
     )
 
 
-def _stage_text_batch_from_items(batch_items, tokenizer, max_seq_length, host_valued=True):
+def _stage_text_batch_from_items(batch_items, tokenizer, max_seq_length,
+                                 host_valued=True, width_policy=None):
     """Build a text training batch from tokenized items."""
     valid_items = [item for item in batch_items if item is not None]
     with_offsets = bool(
@@ -11515,12 +12496,15 @@ def _stage_text_batch_from_items(batch_items, tokenizer, max_seq_length, host_va
         )
     pad_id = getattr(tokenizer, "pad_token_id", None)
     pad_id = 0 if pad_id is None else int(pad_id)
-    max_length = _finite_text_pad_width(
-        max(lengths),
-        pad_to_multiple=32,
-        minimum_width=2,
-        max_seq_length=max_seq_length,
-    )
+    # The grid replaces the rounding rule; it caps at max_seq_length itself.
+    max_length = None if width_policy is None else width_policy(max(lengths))
+    if max_length is None:
+        max_length = _finite_text_pad_width(
+            max(lengths),
+            pad_to_multiple=32,
+            minimum_width=2,
+            max_seq_length=max_seq_length,
+        )
     batch_ids = []
     truncated_lengths = []
     for ids, length in zip(batch, lengths):
@@ -12460,7 +13444,6 @@ class _LazyTextPrefetcher:
         self._lifecycle_lock = threading.Lock()
         self._close_lock = threading.Lock()
 
-    # -- producer side ----------------------------------------------------
     def _run(self):
         iterator = None
         try:
@@ -12529,7 +13512,6 @@ class _LazyTextPrefetcher:
             if self._closed or self._stop.is_set():
                 raise StopIteration
 
-    # -- consumer side ----------------------------------------------------
     def __iter__(self):
         return self
 
@@ -12553,7 +13535,6 @@ class _LazyTextPrefetcher:
             raise StopIteration
         raise payload
 
-    # -- lifecycle --------------------------------------------------------
     def quiesce(self):
         """RUNNING -> PAUSE_REQUESTED -> QUIESCENT; bounded, actionable."""
         if self._thread is None or not self._thread.is_alive():
@@ -12671,6 +13652,7 @@ def _iterate_lazy_text_training_batches(
     yield_host_staged=False,
     reject_mlx_valued=False,
     should_stop=None,
+    width_policy=None,
 ):
     """Yield text batches without materializing an unsized source.
 
@@ -12748,6 +13730,7 @@ def _iterate_lazy_text_training_batches(
                     tokenizer,
                     max_seq_length,
                     host_valued=state.get("host_valued", True),
+                    width_policy=width_policy,
                 )
             return _stage_tokenized_text_batch(
                 local_items,
@@ -12755,6 +13738,7 @@ def _iterate_lazy_text_training_batches(
                 pad_id=_mlx_text_pad_id(tokenizer),
                 labels_expected=state.get("label_state"),
                 host_valued=state.get("host_valued", True),
+                width_policy=width_policy,
             )
 
         def _yield_value(local_items):
@@ -13372,7 +14356,8 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
                              length_window_batches=1,
                              prefetch_batches=0,
                              prefetch_skip_batches=0,
-                             prefetch_control=None):
+                             prefetch_control=None,
+                             width_policy=None):
     """Streaming batch generator for MLX training.
 
     Map-style datasets retain the existing mlx-lm batching behavior. Unsized
@@ -13408,6 +14393,7 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
             expected_rows_per_pass=expected_rows_per_pass,
             length_window_batches=length_window_batches,
             window_seed=seed,
+            width_policy=width_policy,
         )
         prefetch_depth = _validate_streaming_prefetch(prefetch_batches)
         if prefetch_depth and _distributed_rank_size(comm_group)[1] == 1:
@@ -13604,6 +14590,49 @@ def _save_adapter_artifacts(model, path, tensors, adapter_config=None):
             "tensors; use save_lora_adapters() or "
             "save_trainable_adapters() at the public entry point."
         )
+    _fs_map = dict(getattr(model, "_unsloth_full_state_modules", None) or {})
+    if _fs_map:
+        _by_name = dict(model.named_modules())
+        tensors = dict(tensors)
+        for _p in sorted(_fs_map):
+            _module = _by_name.get(_p)
+            if _module is None:
+                raise ValueError(
+                    f"Unsloth MLX: full-state module {_p!r} was recorded at "
+                    "adapter attach but no longer exists in the model tree; "
+                    "refusing to write an artifact that cannot restore it."
+                )
+            _prefix, _source = _p, _module
+            if hasattr(_module, "lora_a"):
+                for _inner in ("embedding", "linear"):
+                    _in = getattr(_module, _inner, None)
+                    if _in is not None and hasattr(_in, "parameters"):
+                        _prefix, _source = f"{_p}.{_inner}", _in
+                        break
+            if isinstance(_source, (nn.QuantizedLinear, nn.QuantizedEmbedding)):
+                raise ValueError(
+                    f"Unsloth MLX: full-state module {_p!r} was quantized "
+                    "after adapter attach; its packed tensors cannot be "
+                    "persisted as module state. Keep it unquantized."
+                )
+            _found = False
+            for _tname in ("weight", "bias"):
+                _live = getattr(_source, _tname, None)
+                if isinstance(_live, mx.array):
+                    if "float" not in str(_live.dtype).lower():
+                        raise ValueError(
+                            f"Unsloth MLX: full-state module {_p!r} holds "
+                            f"non-floating {_tname} ({_live.dtype}); keep it "
+                            "unquantized to persist it as module state."
+                        )
+                    tensors.setdefault(f"{_prefix}.{_tname}", _live)
+                    _found = True
+            if not _found:
+                raise ValueError(
+                    f"Unsloth MLX: full-state module {_p!r} carries no "
+                    "weight/bias arrays to persist (it may have been "
+                    "quantized after attach); refusing a partial artifact."
+                )
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
 
@@ -13625,6 +14654,148 @@ def _save_adapter_artifacts(model, path, tensors, adapter_config=None):
     if adapter_config:
         with open(path / "adapter_config.json", "w", encoding="utf-8") as f:
             json.dump(adapter_config, f, indent=2)
+
+
+class LoRAPointwiseConv2d(nn.Module):
+    """LoRA for plain, ungrouped 1x1 convolutions in channel-last layout."""
+
+    @staticmethod
+    def supports(module):
+        return (type(module) is nn.Conv2d and module.groups == 1
+                and module.weight.shape[1:3] == (1, 1))
+
+    @staticmethod
+    def from_base(base, r=8, scale=1.0, dropout=0.0):
+        if not LoRAPointwiseConv2d.supports(base):
+            raise ValueError("LoRA requires a plain, ungrouped 1x1 Conv2d.")
+        module = LoRAPointwiseConv2d()
+        module.conv = base
+        module.scale = scale
+        module.dropout = nn.Dropout(dropout)
+        width = base.weight.shape[-1]
+        bound = 1 / math.sqrt(width)
+        module.lora_a = mx.random.uniform(low=-bound, high=bound, shape=(width, r))
+        module.lora_b = mx.zeros((r, base.weight.shape[0]))
+        return module
+
+    def __call__(self, x):
+        y = self.conv(x)
+        weight = (self.lora_a @ self.lora_b).T[:, None, None, :].astype(x.dtype)
+        delta = mx.conv2d(
+            self.dropout(x), weight, self.conv.stride, self.conv.padding,
+            self.conv.dilation, self.conv.groups,
+        )
+        return y + (self.scale * delta).astype(y.dtype)
+
+    def fuse(self):
+        conv = copy.deepcopy(self.conv)
+        delta = (self.lora_a @ self.lora_b).T[:, None, None, :]
+        conv.weight = conv.weight + (self.scale * delta).astype(conv.weight.dtype)
+        return conv
+
+
+def _hadamard_pack_module():
+    """mlx-vlm's Hadamard-packed layer module (Ternary Bonsai 2), once loaded."""
+    module = sys.modules.get("mlx_vlm.models.prism_hadamard_qwen35.prism_hadamard_qwen35")
+    if isinstance(getattr(module, "HadamardQuantizedLinear", None), type):
+        return module
+    return None
+
+
+def _is_hadamard_packed_linear(module):
+    pack = _hadamard_pack_module()
+    # Exact type: the packed embedding subclasses the linear.
+    return pack is not None and type(module) is pack.HadamardQuantizedLinear
+
+
+def _hadamard_dense_weight(layer):
+    """The float32 dense weight a Hadamard-packed layer encodes, in the unrotated basis."""
+    weight = mx.dequantize(
+        layer.weight, layer.scales, layer.biases,
+        group_size=layer.group_size, bits=layer.bits, mode=layer.mode,
+    ).astype(mx.float32)
+    if layer.block:
+        weight = _hadamard_pack_module().hadamard_transform(
+            weight, layer.block, layer.signs, inverse=True,
+        )
+    return weight
+
+
+def _unpack_hadamard_modules(model):
+    pack = _hadamard_pack_module()
+    if pack is None:
+        return False
+    dense = []
+    for name, module in model.named_modules():
+        if not isinstance(module, pack.HadamardQuantizedLinear):
+            continue
+        weight = _hadamard_dense_weight(module).astype(module.scales.dtype)
+        rows, width = weight.shape
+        if isinstance(module, pack.HadamardQuantizedEmbedding):
+            layer = nn.Embedding(rows, width)
+        else:
+            layer = nn.Linear(width, rows, bias=False)
+        layer.weight = weight
+        dense.append((name, layer))
+    if dense:
+        model.update_modules(mlx.utils.tree_unflatten(dense))
+    return bool(dense)
+
+
+# Pack-only keys; with the layers unpacked the tree is plain mlx-vlm Qwen3.5.
+_HADAMARD_PACK_CONFIG_KEYS = frozenset({
+    "schema_version", "base_model_type", "tensor_namespace", "gdn_activation_layout",
+    "modules", "requires_runtime", "hadamard_config", "components",
+})
+
+
+def _dense_hadamard_pack_config(config):
+    config = {k: v for k, v in config.items() if k not in _HADAMARD_PACK_CONFIG_KEYS}
+    config["model_type"] = "qwen3_5"
+    # The pack ships no `architectures`; GGUF conversion dispatches on it.
+    config["architectures"] = ["Qwen3_5ForConditionalGeneration"]
+    return config
+
+
+class LoRAHadamardLinear(nn.Module):
+    """The base rotates its own input: the adapter reads the unrotated activation, fuse rotates back."""
+
+    @staticmethod
+    def supports(module):
+        return _is_hadamard_packed_linear(module)
+
+    @staticmethod
+    def from_base(linear, r=8, dropout=0.0, scale=20.0):
+        if not LoRAHadamardLinear.supports(linear):
+            raise ValueError("LoRA requires mlx-vlm's HadamardQuantizedLinear.")
+        output_dims, packed_dims = linear.weight.shape
+        input_dims = packed_dims * 32 // linear.bits
+        module = LoRAHadamardLinear()
+        module.linear = linear
+        module.dropout = nn.Dropout(p=dropout)
+        module.scale = scale
+        bound = 1 / math.sqrt(input_dims)
+        module.lora_a = mx.random.uniform(low=-bound, high=bound, shape=(input_dims, r))
+        module.lora_b = mx.zeros((r, output_dims))
+        return module
+
+    def __call__(self, x):
+        y = self.linear(x)
+        z = (self.dropout(x) @ self.lora_a) @ self.lora_b
+        return y + (self.scale * z).astype(x.dtype)
+
+    def fuse(self, dequantize=False):
+        if not dequantize:
+            raise ValueError(
+                "Unsloth: merging LoRA back into 2-bit Hadamard-packed weights discards the adapter. "
+                "Save with save_method='merged_16bit', or keep the LoRA adapter."
+            )
+        linear = self.linear
+        weight = _hadamard_dense_weight(linear) + (self.scale * self.lora_b.T) @ self.lora_a.T
+        output_dims, input_dims = weight.shape
+        fused = nn.Linear(input_dims, output_dims, bias=False)
+        fused.weight = weight.astype(linear.scales.dtype)
+        return fused
 
 
 def _extract_mlx_lora_parameters(model):
@@ -13662,6 +14833,11 @@ def iter_mlx_lora_modules(model):
             yield module_name, module
 
 
+def is_mlx_dora_module(module):
+    """Class-name gated: a LoRA wrapper with an unrelated ``m`` is not DoRA."""
+    return hasattr(module, "m") and type(module).__name__.startswith("DoRA")
+
+
 def collect_mlx_lora_adapter_tensors(model):
     """Collect tensors for every module exposing a complete LoRA attr pair.
 
@@ -13678,9 +14854,7 @@ def collect_mlx_lora_adapter_tensors(model):
         adapter_keys.add(f"{prefix}lora_b")
         adapter_keys.add(f"{prefix}lora_a.weight")
         adapter_keys.add(f"{prefix}lora_b.weight")
-        # Include DoRA magnitude `m`, gated on the DoRA class name so a
-        # future LoRA wrapper with an unrelated `m` attribute isn't exported.
-        if hasattr(module, "m") and type(module).__name__.startswith("DoRA"):
+        if is_mlx_dora_module(module):
             adapter_keys.add(f"{prefix}m")
     return {name: value for name, value in parameters.items() if name in adapter_keys}
 
@@ -13737,6 +14911,7 @@ def save_trainable_adapters(model, path, adapter_config=None):
     base weights INSIDE a LoRA module (reload-leaked state that would
     reintroduce the original Unsloth adapter-export bloat).
     """
+    _reject_mixed_lora_dora(model)
     trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
     adapter_tensors = collect_mlx_lora_adapter_tensors(model)
     _lora_module_names = [name for name, _ in iter_mlx_lora_modules(model)]
@@ -13891,14 +15066,125 @@ def load_trainer_state(path):
         return json.load(f)
 
 
-def save_lora_adapters(model, path, adapter_config=None):
-    """Save LoRA adapter weights (lora_a / lora_b only) to disk.
+def _reject_mixed_lora_dora(model):
+    has_dora = has_plain = False
+    for _name, _module in model.named_modules():
+        if hasattr(_module, "lora_a") and hasattr(_module, "lora_b"):
+            if type(_module).__name__.startswith("DoRA"):
+                has_dora = True
+            else:
+                has_plain = True
+    if has_dora and has_plain:
+        raise ValueError(
+            "Unsloth MLX: this model mixes plain-LoRA and DoRA wrappers; the "
+            "adapter format records one fine_tune_type, so a mixed save would "
+            "reload every module as DoRA."
+        )
+
+
+def _lora_module_types(model):
+    from mlx_lm.tuner.lora import LoRALinear
+    try:
+        from mlx_lm.tuner.dora import DoRALinear
+    except ImportError:
+        DoRALinear = None
+    wrapped = {}
+    for name, module in model.named_modules():
+        if not (hasattr(module, "lora_a") and hasattr(module, "lora_b")):
+            continue
+        base_linear = getattr(module, "linear", None)
+        if (
+            type(module) is LoRALinear
+            or (DoRALinear is not None and type(module) is DoRALinear)
+        ) and type(base_linear) in (nn.Linear, nn.QuantizedLinear):
+            wrapped[name] = "linear"
+        else:
+            _base = (
+                base_linear if base_linear is not None
+                else getattr(module, "embedding", None)
+            )
+            wrapped[name] = f"unsupported:{type(module).__name__}" + (
+                f" wrapping {type(_base).__name__}" if _base is not None else ""
+            )
+    in_stack = re.compile(r"^model\.layers\.\d+\.")
+    unsupported = {
+        n: t.split(":", 1)[1]
+        for n, t in wrapped.items() if t.startswith("unsupported:")
+    }
+    supported = {
+        n: t for n, t in wrapped.items() if not t.startswith("unsupported:")
+    }
+    mirrored_layout = supported and not unsupported and all(
+        in_stack.match(name) or name == "lm_head" for name in supported
+    )
+    if not mirrored_layout:
+        supported = {n: t for n, t in supported.items() if in_stack.match(n)}
+    return supported, unsupported
+
+
+def save_lora_adapters(model, path, adapter_config=None, adapter_format="mlx"):
+    """Save LoRA adapter weights (lora_a / lora_b, plus DoRA magnitudes) to
+    disk.
 
     Args:
         model: MLX model with LoRA-wrapped modules.
         path: Directory to save adapters.
         adapter_config: Optional dict with LoRA config metadata.
+        adapter_format: "mlx" (default: the native MLX artifact) or "peft"
+            (standard Hugging Face layout). Uniform plain-LoRA exports load in
+            transformers, PEFT, and vLLM; per-module rank/alpha patterns are
+            transformers/PEFT-only, since vLLM applies one global rank/alpha.
+            The live module tree supplies the linear-vs-embedding oracle where
+            the layout demonstrably mirrors Hugging Face.
     """
+    if adapter_format not in ("mlx", "peft"):
+        raise ValueError(
+            f"Unsloth MLX: adapter_format={adapter_format!r}; expected "
+            "'mlx' or 'peft'."
+        )
+    if adapter_format == "peft":
+        module_types, unsupported = _lora_module_types(model)
+        if unsupported:
+            preview = "; ".join(
+                f"{n} ({t})" for n, t in list(unsupported.items())[:5]
+            )
+            raise ValueError(
+                "Unsloth MLX: this model carries LoRA wrappers that plain "
+                f"PEFT format cannot represent ({preview}); PEFT export is "
+                "not possible for it."
+            )
+        from unsloth_zoo.mlx.peft_interop import _OUTPUT_HEAD_LEAF_NAMES, _leaf_in
+        _fs_map = dict(getattr(model, "_unsloth_full_state_modules", None) or {})
+        _named = dict(model.named_modules())
+        _m2s_emb = sorted(
+            p for p, o in _fs_map.items()
+            if o == "modules_to_save"
+            and (
+                isinstance(
+                    _named.get(p), (nn.Embedding, nn.QuantizedEmbedding)
+                )
+                or _leaf_in(p, _OUTPUT_HEAD_LEAF_NAMES)
+            )
+        )
+        if _m2s_emb and _model_ties_output_to_embedding(model):
+            from unsloth_zoo.mlx.peft_interop import _TIED_FULL_STATE_REASON
+            raise ValueError(
+                f"Unsloth MLX: {_m2s_emb} carry {_TIED_FULL_STATE_REASON}."
+            )
+        # PEFT has no per-module dropout.
+        _dropouts = set()
+        for _name, _module in model.named_modules():
+            if _name in module_types:
+                _dropouts.add(round(_get_mlx_dropout_probability(
+                    getattr(_module, "dropout", None)
+                ), 6))
+        if len(_dropouts) > 1:
+            raise ValueError(
+                "Unsloth MLX: modules carry different lora_dropout values "
+                f"({sorted(_dropouts)}); PEFT format has no per-module "
+                "dropout. Unify dropout before exporting."
+            )
+    _reject_mixed_lora_dora(model)
     adapter_tensors = collect_mlx_lora_adapter_tensors(model)
     if not adapter_tensors:
         raise ValueError(
@@ -13907,9 +15193,181 @@ def save_lora_adapters(model, path, adapter_config=None):
             "merged. Use save_trainable_adapters() to checkpoint non-LoRA "
             "trainable state instead."
         )
-    _save_adapter_artifacts(
-        model, path, adapter_tensors, adapter_config=adapter_config
+    if adapter_format == "mlx":
+        _save_adapter_artifacts(
+            model, path, adapter_tensors, adapter_config=adapter_config
+        )
+        return
+    import tempfile
+    from unsloth_zoo.mlx.peft_interop import convert_mlx_dir_to_peft
+    scratch = tempfile.mkdtemp(prefix="unsloth_mlx_adapter_")
+    scratch_dir = os.path.join(scratch, "mlx")
+    try:
+        _save_adapter_artifacts(
+            model, scratch_dir, adapter_tensors, adapter_config=adapter_config
+        )
+        convert_mlx_dir_to_peft(scratch_dir, path, module_types=module_types)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _model_ties_output_to_embedding(model, by_name=None):
+    flag = getattr(
+        getattr(model, "args", None), "tie_word_embeddings", None,
     )
+    if flag is None:
+        config = getattr(model, "_config", None)
+        if isinstance(config, dict):
+            text_config = config.get("text_config")
+            for scope in (
+                text_config if isinstance(text_config, dict) else {},
+                config,
+            ):
+                if "tie_word_embeddings" in scope:
+                    flag = bool(scope["tie_word_embeddings"])
+                    break
+    if flag is True:
+        return True
+    if by_name is None:
+        by_name = dict(model.named_modules())
+    # No head module => tied, even if declared False (some use as_linear).
+    # Bare "output" is root-only: nested attention projections share the name.
+    return not any(
+        name in ("lm_head", "output", "embed_out")
+        or name.endswith(".lm_head")
+        or name.endswith(".embed_out")
+        for name in by_name
+    )
+
+
+def _full_state_base_module(module):
+    if hasattr(module, "lora_a"):
+        for inner in ("embedding", "linear"):
+            candidate = getattr(module, inner, None)
+            if candidate is not None and hasattr(candidate, "parameters"):
+                return candidate
+    return module
+
+
+def _full_state_key_candidates(path):
+    keys = []
+    for prefix in (path, f"{path}.embedding", f"{path}.linear"):
+        for tname in ("weight", "bias"):
+            keys.append(f"{prefix}.{tname}")
+    return keys
+
+
+def _mark_full_state_modules(model, fs_map, adapter_weights_file,
+                             expected_shapes=None, trainable_paths=None):
+    fs_map = dict(fs_map or {})
+    if not fs_map:
+        return
+    from unsloth_zoo.mlx.peft_interop import _validate_full_state_origins
+    _validate_full_state_origins(fs_map)
+    import mlx.nn as nn
+    from unsloth_zoo.mlx.peft_interop import (
+        _OUTPUT_HEAD_LEAF_NAMES, _TIED_FULL_STATE_REASON, _leaf_in,
+    )
+    by_name = dict(model.named_modules())
+    params = dict(mlx.utils.tree_flatten(model.parameters()))
+    expected_shapes = expected_shapes or {}
+    problems = []
+    saved_shapes = {}
+    saved_dtypes = {}
+    try:
+        from safetensors import safe_open
+        with safe_open(adapter_weights_file, framework="numpy") as f:
+            keys = set(f.keys())
+            for p in fs_map:
+                for key in _full_state_key_candidates(p):
+                    if key in keys:
+                        # Metadata-only: works for dtypes numpy cannot hold (bf16).
+                        sl = f.get_slice(key)
+                        saved_shapes[key] = tuple(sl.get_shape())
+                        saved_dtypes[key] = str(sl.get_dtype())
+    except Exception as exc:
+        raise ValueError(
+            "Unsloth MLX: adapter_config lists full_state_modules but the "
+            f"weights file could not be inspected ({exc!r})."
+        ) from exc
+    tied_routing = None
+    for p, origin in sorted(fs_map.items()):
+        module = by_name.get(p)
+        if module is None:
+            problems.append(f"{p} (module missing from the live tree)")
+            continue
+        _headish = _leaf_in(p, _OUTPUT_HEAD_LEAF_NAMES)
+        if _headish or (
+            origin == "modules_to_save"
+            and isinstance(module, (nn.Embedding, nn.QuantizedEmbedding))
+        ):
+            if tied_routing is None:
+                tied_routing = _model_ties_output_to_embedding(model, by_name)
+            if tied_routing:
+                problems.append(f"{p} ({_TIED_FULL_STATE_REASON})")
+                continue
+        found = False
+        for key in _full_state_key_candidates(p):
+            if key not in saved_shapes:
+                if key in params:
+                    problems.append(f"{key} (live tensor missing from the artifact)")
+                continue
+            found = True
+            if not saved_dtypes.get(key, "").upper().startswith(("F", "BF")):
+                problems.append(
+                    f"{key} (non-floating dtype {saved_dtypes[key]}; "
+                    "quantized or corrupted full-module state cannot "
+                    "restore)"
+                )
+                continue
+            live = params.get(key)
+            live_shape = tuple(getattr(live, "shape", ()) or ())
+            if live_shape != saved_shapes[key]:
+                problems.append(
+                    f"{key} (saved {saved_shapes[key]} vs live {live_shape})"
+                )
+                continue
+            expected = expected_shapes.get(key)
+            if expected is not None and saved_shapes[key] != expected:
+                problems.append(
+                    f"{key} (saved {saved_shapes[key]} vs base "
+                    f"{expected}; resized vocabularies are not supported "
+                    "yet)"
+                )
+        if not found:
+            problems.append(f"{p} (no saved weight/bias tensors)")
+    if problems:
+        preview = "; ".join(problems[:5])
+        if len(problems) > 5:
+            preview += f"; ... (+{len(problems) - 5} more)"
+        raise ValueError(
+            f"Unsloth MLX: {len(problems)} full-state entr(ies) failed to "
+            f"restore on reload ({preview}). Refusing a partial adapter."
+        )
+    _trainable_at_save = frozenset(trainable_paths or ())
+    for p, origin in fs_map.items():
+        module = by_name[p]
+        if origin == "modules_to_save":
+            module.unfreeze()
+            continue
+        target = _full_state_base_module(module)
+        if p in _trainable_at_save:
+            target.unfreeze()
+        else:
+            target.freeze()
+    _cpt_keys = getattr(model, "_unsloth_cpt_full_module_weight_keys", None)
+    if _cpt_keys:
+        _m2s = frozenset(
+            path for path, origin in fs_map.items()
+            if origin == "modules_to_save"
+        )
+
+        from unsloth_zoo.mlx.peft_interop import _full_state_owner
+        model._unsloth_cpt_full_module_weight_keys = {
+            key for key in _cpt_keys
+            if _full_state_owner(key.rsplit(".", 1)[0], _m2s) is None
+        }
+    model._unsloth_full_state_modules = fs_map
 
 
 def _infer_snapshot_commit(path):
@@ -14222,6 +15680,31 @@ def _enrich_mlx_adapter_config(model, adapter_config):
         requires_runtime = True
     adapter_config["requires_unsloth_mlx_runtime_quantization"] = bool(requires_runtime)
 
+    _fs_map = dict(getattr(model, "_unsloth_full_state_modules", None) or {})
+    if _fs_map:
+        adapter_config["full_state_modules"] = _fs_map
+        _by_name = dict(model.named_modules())
+        _trainable_fs = []
+        for _p in sorted(_fs_map):
+            _module = _by_name.get(_p)
+            if _module is None:
+                continue
+            _base = _full_state_base_module(_module)
+            if dict(mlx.utils.tree_flatten(_base.trainable_parameters())):
+                _trainable_fs.append(_p)
+        if _trainable_fs:
+            adapter_config["full_state_trainable"] = _trainable_fs
+        else:
+            adapter_config.pop("full_state_trainable", None)
+    else:
+        adapter_config.pop("full_state_modules", None)
+        adapter_config.pop("full_state_trainable", None)
+
+    if getattr(model, "_unsloth_peft_converted", False):
+        adapter_config["unsloth_peft_converted"] = True
+    else:
+        adapter_config.pop("unsloth_peft_converted", None)
+
     # Only stamp LoRA fields when the live model has LoRA modules (or the
     # caller declared a lora/dora artifact); otherwise mlx-lm.load_adapters()
     # would inject LoRA wrappers before binding full-precision weights and
@@ -14272,6 +15755,41 @@ def _enrich_mlx_adapter_config(model, adapter_config):
             for key in ("rank", "scale", "dropout"):
                 if key in lora_parameters:
                     adapter_config[key] = lora_parameters[key]
+        if has_lora_modules:
+            _module_ranks, _module_scales = {}, {}
+            _maps_reliable = True
+            for _name, _module in iter_mlx_lora_modules(model):
+                _lora_a = getattr(_module, "lora_a", None)
+                _scale = getattr(_module, "scale", None)
+                if (
+                    _lora_a is None
+                    or getattr(_lora_a, "ndim", 0) != 2
+                    or _scale is None
+                    or not isinstance(_scale, (int, float))
+                ):
+                    _maps_reliable = False
+                    break
+                _module_ranks[_name] = int(_lora_a.shape[-1])
+                _module_scales[_name] = float(_scale)
+            if _maps_reliable and (
+                len(set(_module_ranks.values())) > 1
+                or len(set(_module_scales.values())) > 1
+            ):
+                adapter_config["unsloth_mlx_lora_module_ranks"] = _module_ranks
+                adapter_config["unsloth_mlx_lora_module_scales"] = _module_scales
+                adapter_config["unsloth_mlx_requires_unsloth_loader"] = True
+                print(
+                    "Unsloth: this adapter uses per-module ranks/scales; "
+                    "reloading it needs Unsloth (stock mlx-lm assumes one "
+                    "global rank/scale)."
+                )
+            else:
+                for _stale_key in (
+                    "unsloth_mlx_lora_module_ranks",
+                    "unsloth_mlx_lora_module_scales",
+                    "unsloth_mlx_requires_unsloth_loader",
+                ):
+                    adapter_config.pop(_stale_key, None)
         # mlx-lm.load_adapters() reads num_layers off the config.
         if "num_layers" not in adapter_config:
             try:
@@ -14292,6 +15810,8 @@ def _enrich_mlx_adapter_config(model, adapter_config):
         for _stale in (
             "peft_type", "lora_parameters", "rank", "scale", "dropout",
             "num_layers", "unsloth_mlx_lora_module_paths",
+            "unsloth_mlx_lora_module_ranks", "unsloth_mlx_lora_module_scales",
+            "unsloth_mlx_requires_unsloth_loader",
         ):
             adapter_config.pop(_stale, None)
 
@@ -14342,7 +15862,6 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                 )
                 lora_dropout = _read_mlx_lora_dropout(module)
 
-        # Auto-fill only when the caller did not supply the key.
         if lora_paths and not has_explicit_paths:
             adapter_config["unsloth_mlx_lora_module_paths"] = lora_paths
 
@@ -14475,7 +15994,6 @@ def _get_model_config(model):
     """
     import dataclasses
 
-    # Prefer the raw config dict stashed by our loader
     if hasattr(model, "_config") and isinstance(model._config, dict):
         return _config_to_plain_python(model._config)
 
@@ -14490,7 +16008,6 @@ def _get_model_config(model):
             if isinstance(config, dict):
                 return _config_to_plain_python(config)
 
-    # Reconstruct from the ModelArgs dataclass
     if hasattr(model, "args"):
         if dataclasses.is_dataclass(model.args) and not isinstance(model.args, type):
             return _config_to_plain_python(model.args)
@@ -14911,7 +16428,9 @@ def _mlx_sanitize_probe(model, weights):
     unmeasured; the caller treats that as unmeasurable, which is what the export
     did before this existed.
     """
-    return copy.copy(model).sanitize(weights)
+    probe = copy.copy(model)
+    probe._unsloth_measuring_norm_offsets = True
+    return probe.sanitize(weights)
 
 
 def _mlx_sanitizer_norm_offsets(model):
@@ -14936,38 +16455,39 @@ def _mlx_sanitizer_norm_offsets(model):
             weights.update(mx.load(str(weight_file)))
         if not weights:
             return None
-
-        zeroed = _mlx_sanitize_probe(model, _mlx_norm_offset_probe(weights, 0.0))
-        candidates = {}
-        for key, value in zeroed.items():
-            offset = _mlx_constant_1d_value(value)
-            if offset is None or abs(offset) <= _MLX_NORM_OFFSET_TOLERANCE:
-                continue
-            candidates[key] = (value, offset)
-        if not candidates:
-            # Nothing to confirm. Shifting nothing is the common case, so skip
-            # the second replay rather than pay for it on every model.
-            return {}
-
-        raised = _mlx_sanitize_probe(
-            model, _mlx_norm_offset_probe(weights, _MLX_NORM_OFFSET_PROBE)
+        return _mlx_measure_norm_offsets(
+            lambda probe: _mlx_sanitize_probe(model, probe), weights
         )
-
-        offsets = {}
-        for key, (value, offset) in candidates.items():
-            raised_value = raised.get(key)
-            if getattr(raised_value, "shape", None) != value.shape:
-                continue
-            delta = _mlx_constant_1d_value(raised_value - value)
-            if delta is None:
-                continue
-            if abs(delta - _MLX_NORM_OFFSET_PROBE) > _MLX_NORM_OFFSET_TOLERANCE:
-                continue
-            offsets[key] = offset
     except Exception as exc:
         print(f"Unsloth: Could not measure MLX norm offsets ({exc}); continuing.")
         return None
 
+
+def _mlx_measure_norm_offsets(replay, weights):
+    """The additive constants ``replay`` (a sanitizer) applies to ``weights``' 1-D floats."""
+    zeroed = replay(_mlx_norm_offset_probe(weights, 0.0))
+    candidates = {}
+    for key, value in zeroed.items():
+        offset = _mlx_constant_1d_value(value)
+        if offset is None or abs(offset) <= _MLX_NORM_OFFSET_TOLERANCE:
+            continue
+        candidates[key] = (value, offset)
+    if not candidates:
+        return {}
+
+    raised = replay(_mlx_norm_offset_probe(weights, _MLX_NORM_OFFSET_PROBE))
+
+    offsets = {}
+    for key, (value, offset) in candidates.items():
+        raised_value = raised.get(key)
+        if getattr(raised_value, "shape", None) != value.shape:
+            continue
+        delta = _mlx_constant_1d_value(raised_value - value)
+        if delta is None:
+            continue
+        if abs(delta - _MLX_NORM_OFFSET_PROBE) > _MLX_NORM_OFFSET_TOLERANCE:
+            continue
+        offsets[key] = offset
     return offsets
 
 
@@ -15165,6 +16685,25 @@ def _mlx_stacked_expert_tensor_names(model, tensor_names):
     return stacked
 
 
+@contextlib.contextmanager
+def _mlx_module_state_restored(modules):
+    """Leave these modules as they were found: an mlx `Module` is a dict of
+    parameters and children plus plain attributes, and both halves are put back.
+    State inside plain objects a module merely references is not reached."""
+    state = [(module, dict(module) if isinstance(module, dict) else None,
+              dict(vars(module))) for module in modules]
+    try:
+        yield
+    finally:
+        for module, items, attributes in state:
+            if items is not None:
+                # Through `dict`: `Module.update` reads a nested parameter tree.
+                dict.clear(module)
+                dict.update(module, items)
+            vars(module).clear()
+            vars(module).update(attributes)
+
+
 class _MlxReplayedSanitizers:
     """Sanitizers replayed in order, leaving no module of the model changed: Gemma 3
     ties its head and drops `lm_head` if handed no `lm_head.weight`."""
@@ -15174,24 +16713,13 @@ class _MlxReplayedSanitizers:
         self.held = tuple(held)
 
     def sanitize(self, weights):
-        # An mlx `Module` is a dict of parameters/children plus plain attributes.
-        state = [(module, dict(module) if isinstance(module, dict) else None,
-                  dict(vars(module))) for module in self.held]
-        try:
+        with _mlx_module_state_restored(self.held):
             for owner in self.owners:
                 weights = owner.sanitize(weights)
                 # A failed replay writes nothing: the export is then what it was without this pass.
                 if not isinstance(weights, Mapping):
                     raise TypeError("sanitize did not return a mapping")
             return weights
-        finally:
-            for module, items, attributes in state:
-                if items is not None:
-                    # Through `dict`: `Module.update` reads a nested parameter tree.
-                    dict.clear(module)
-                    dict.update(module, items)
-                vars(module).clear()
-                vars(module).update(attributes)
 
 
 def _mlx_moe_sanitizers(model):
@@ -16602,6 +18130,158 @@ _MODEL_WEIGHT_SUFFIXES = (
 _MODEL_SIDECAR_SUFFIXES = (".json", ".jinja", ".model", ".txt", ".py")
 
 
+def _asset_link_stays_in_the_model(file, source):
+    """Refuse a sidecar symlink that points outside the model it came from.
+
+    A writable model directory is otherwise enough to aim `generation_config.json`
+    at a credential file and have the save dereference it into an adapter that is
+    then published. A Hugging Face snapshot is itself a tree of symlinks into a
+    sibling `blobs/` directory, so the allowed root is the cache repo directory
+    when the source sits under `snapshots/<sha>`, not the source alone.
+    """
+    try:
+        if not file.is_symlink():
+            return True
+        source = Path(source).resolve()
+        roots = [source]
+        for parent in (source, *source.parents):
+            if parent.name == "snapshots":
+                roots.append(parent.parent)
+                # huggingface_hub >= 1.32 shares Xet blobs cache-wide in <cache>/blobs.
+                roots.append(parent.parent.parent / "blobs")
+                break
+        target = file.resolve()
+        return any(target.is_relative_to(root) for root in roots)
+    except OSError:
+        return False
+
+
+def _save_vlm_processor_assets(processor, path, sources=()):
+    path = Path(path)
+    failures = []
+    saved = set()
+    asset_names = set()
+    recovered = []
+
+    def valid_asset(file):
+        try:
+            if not file.is_file():
+                return False
+            if file.suffix == ".json":
+                json.loads(file.read_text())
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def copy_assets(source, overwrite=False, source_only=False, complete=True):
+        for file in Path(source).rglob("*"):
+            relative = file.relative_to(source)
+            if not file.is_file() or file.suffix in _MODEL_WEIGHT_SUFFIXES:
+                continue
+            if any(part.startswith(".") for part in relative.parts):
+                continue
+            if file.resolve().is_relative_to(path.resolve()):
+                continue
+            if not _asset_link_stays_in_the_model(file, source):
+                failures.append(f"{relative}: symlink leaves the model directory")
+                continue
+            if file.name in _CORE_SAVE_FILENAMES or file.name == "adapter_config.json":
+                continue
+            if file.name.startswith(("model-", "pytorch_model")):
+                continue
+            if source_only and file.suffix not in _MODEL_SIDECAR_SUFFIXES and file.name not in asset_names:
+                continue
+            if not complete and file.suffix != ".json":
+                continue
+            target = path / relative
+            if relative in saved or (
+                not overwrite and target.suffix == ".json" and valid_asset(target)
+            ):
+                continue
+            try:
+                if file.suffix == ".json":
+                    json.loads(file.read_text())
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(file, target)
+                saved.add(relative)
+                if source_only:
+                    recovered.append(str(relative))
+            except Exception as error:
+                failures.append(f"{relative}: {error}")
+
+    def save_component(component, overwrite=True):
+        vocab_files = getattr(component, "vocab_files_names", None)
+        if isinstance(vocab_files, dict):
+            asset_names.update(Path(name).name for name in vocab_files.values() if isinstance(name, str))
+        save = getattr(component, "save_pretrained", None)
+        if not callable(save):
+            return False
+        success = True
+        try:
+            with tempfile.TemporaryDirectory() as staging:
+                try:
+                    save(staging)
+                except Exception as error:
+                    failures.append(f"{type(component).__name__}: {error}")
+                    success = False
+                # Only JSON can be validated after an interrupted writer.
+                copy_assets(staging, overwrite=overwrite, complete=success)
+        except Exception as error:
+            failures.append(f"{type(component).__name__}: {error}")
+            success = False
+        return success
+
+    native_saved = save_component(processor, overwrite=True)
+    if not native_saved:
+        if not failures:
+            failures.append(f"{type(processor).__name__} has no save_pretrained")
+    # Some processors' save methods omit components or are entirely no-ops.
+    names = ("tokenizer", "image_processor", "feature_extractor")
+    names += tuple(getattr(processor, "attributes", ()) or ())
+    seen = {id(processor)}
+    for name in names:
+        component = getattr(processor, name, None)
+        if component is not None and id(component) not in seen:
+            seen.add(id(component))
+            save_component(component)
+
+    # A clean legacy save omits processor_config.json on purpose; only a failed one is rebuilt.
+    if (not native_saved and Path("processor_config.json") not in saved
+            and callable(getattr(processor, "to_dict", None))):
+        def serialize_component(value):
+            to_dict = getattr(value, "to_dict", None)
+            if callable(to_dict):
+                return to_dict()
+            raise TypeError(f"{type(value).__name__} has no JSON serialization")
+
+        try:
+            payload = json.dumps(processor.to_dict(), default=serialize_component, indent=2)
+            (path / "processor_config.json").write_text(payload, encoding="utf-8")
+            saved.add(Path("processor_config.json"))
+        except Exception as error:
+            failures.append(f"processor_config.json: {error}")
+
+    for source in sources:
+        if source is None:
+            continue
+        try:
+            source = Path(source)
+            copy_assets(source, source_only=True)
+            config = source / "config.json"
+            target = path / "config.json"
+            if (config.is_file() and not valid_asset(target)
+                    and _asset_link_stays_in_the_model(config, source)):
+                json.loads(config.read_text())
+                shutil.copy2(config, target)
+        except Exception as error:
+            failures.append(f"processor source: {error}")
+    if failures:
+        print("Unsloth: Adapter saved; processor assets recovered where available: "
+              + "; ".join(dict.fromkeys(failures)))
+        if recovered:
+            print("Unsloth: copied processor source assets: " + ", ".join(recovered))
+
+
 def _copy_source_sidecars(src_path, path):
     """Copy non-weight source sidecars that tokenizer/model saves may omit."""
     copied = 0
@@ -16621,6 +18301,9 @@ def _copy_source_sidecars(src_path, path):
         if suffix in _MODEL_WEIGHT_SUFFIXES:
             continue
         if suffix not in _MODEL_SIDECAR_SUFFIXES:
+            continue
+        if not _asset_link_stays_in_the_model(source, src_path):
+            print(f"Unsloth: skipped {name}: symlink leaves the model directory")
             continue
         target = path / name
         if target.exists():
@@ -16651,7 +18334,189 @@ def _fuse_mlx_module(module, dequantize):
         return fuse(dequantize=dequantize)
     return fuse()
 
-def save_merged_model(model, tokenizer, path, dequantize=False):
+def _model_has_quantized_module(model):
+    import mlx.nn as nn
+
+    quantized_types = [nn.QuantizedLinear, nn.QuantizedEmbedding]
+    try:
+        from mlx_lm.models.switch_layers import QuantizedSwitchLinear
+        quantized_types.append(QuantizedSwitchLinear)
+    except Exception:
+        pass
+    quantized_types = tuple(t for t in quantized_types if isinstance(t, type))
+
+    def _is_quantized(module):
+        if isinstance(module, quantized_types):
+            return True
+        # MLA's QuantizedMultiLinear and the distributed Quantized*Linear
+        # subclass none of the above; missing one writes quantized tensors
+        # with no metadata to load them by.
+        if type(module).__name__.startswith("Quantized"):
+            return True
+        # mlx.nn's QQLinear is neither: not a subclass, not Quantized*-named.
+        # Ask for a packed weight rather than just the attributes, so a module
+        # that merely carries bits/group_size cannot suppress the quantize.
+        # save_merged_model has already called .eval(), which is when QQLinear
+        # holds its weights packed.
+        if hasattr(module, "bits") and hasattr(module, "group_size"):
+            weight = getattr(module, "weight", None)
+            return weight is not None and weight.dtype == mx.uint32
+        return False
+
+    return any(_is_quantized(module) for _, module in model.named_modules())
+
+
+# The loader's runtime-quantization defaults, so save- and load-quantized models
+# land on the same grid.
+_MERGED_SAVE_QUANT_BITS = 4
+_MERGED_SAVE_QUANT_GROUP_SIZE = 64
+_MERGED_SAVE_QUANT_MODE = "affine"
+
+
+def _merged_save_cast_dtypes():
+    try:
+        from mlx_lm.convert import MODEL_CONVERSION_DTYPES
+        return tuple(MODEL_CONVERSION_DTYPES)
+    except Exception:
+        return ("float16", "bfloat16", "float32")
+
+
+def _merged_save_cast_dtype(config):
+    """The checkpoint dtype, as ``mlx_lm.convert`` resolves it.
+
+    Both spellings: mlx-lm reads only ``torch_dtype``, but transformers >= 4.56
+    writes plain ``dtype``, which would otherwise get no cast at all.
+    """
+    if not isinstance(config, dict):
+        return None
+    candidates = [config.get("torch_dtype"), config.get("dtype")]
+    for nested_key in ("text_config", "thinker_config"):
+        nested = config.get(nested_key)
+        if isinstance(nested, dict):
+            candidates += [nested.get("torch_dtype"), nested.get("dtype")]
+    allowed = _merged_save_cast_dtypes()
+    for name in candidates:
+        if isinstance(name, str) and name in allowed:
+            return getattr(mx, name, None)
+    return None
+
+
+def _cast_merged_model_to_config_dtype(model, config):
+    """Cast floating parameters to the config dtype, as ``mlx_lm.convert`` does
+    before quantizing: ``full_finetuning=True`` trains in float32, which would
+    otherwise leave float32 scales, norms and embeddings in a "4-bit" file.
+    """
+    from mlx.utils import tree_map_with_path
+
+    dtype = _merged_save_cast_dtype(config)
+    if dtype is None:
+        return model
+    cast_predicate = getattr(model, "cast_predicate", None)
+
+    def _set_dtype(key, value):
+        if cast_predicate is not None and not cast_predicate(key):
+            return value
+        if mx.issubdtype(value.dtype, mx.floating) and value.dtype != dtype:
+            return value.astype(dtype)
+        return value
+
+    model.update(tree_map_with_path(_set_dtype, model.parameters()))
+    return model
+
+
+def _quantize_merged_model_for_save(model):
+    """Quantize an unquantized merged model so ``merged_4bit`` really is 4-bit.
+
+    ``LoRALinear.fuse(dequantize=False)`` requantizes only an already-quantized
+    base, so ``load_in_16bit`` / ``full_finetuning`` used to write full precision
+    silently. Uses the loader's predicate, not a bare ``nn.quantize``, so the
+    artifact matches a model quantized at load time (embeddings / lm_head skipped).
+    """
+    from mlx_lm.utils import quantize_model
+    from .loader import _MLXQuantizationSpec, _compose_mlx_quant_predicate
+
+    spec = _MLXQuantizationSpec(
+        enabled=True,
+        bits=_MERGED_SAVE_QUANT_BITS,
+        group_size=_MERGED_SAVE_QUANT_GROUP_SIZE,
+        mode=_MERGED_SAVE_QUANT_MODE,
+        source="merged_4bit_save",
+    )
+    predicate = _compose_mlx_quant_predicate(model, spec, is_vlm=False)
+    config = _get_model_config(model) or {}
+    # Any grid here is stale. Kept, quantize_model() emits per-layer entries
+    # with no top-level group_size (reload raises KeyError), or copies a
+    # populated one verbatim over tensors that do not use it.
+    config = _strip_mlx_quantization_metadata(config)
+    model = _cast_merged_model_to_config_dtype(model, config)
+    model, updated_config = quantize_model(
+        model,
+        config,
+        group_size=_MERGED_SAVE_QUANT_GROUP_SIZE,
+        bits=_MERGED_SAVE_QUANT_BITS,
+        mode=_MERGED_SAVE_QUANT_MODE,
+        quant_predicate=predicate,
+    )
+    if not _model_has_quantized_module(model):
+        # quantize_model() writes the grid from its arguments, not from what
+        # it converted, so dimensions incompatible with the group size would
+        # label a full-precision checkpoint 4-bit.
+        model._config = _strip_mlx_quantization_metadata(updated_config)
+        print(
+            "Unsloth: save_method='merged_4bit' could not quantize any layer of "
+            "this model (no layer is compatible with "
+            f"group_size={_MERGED_SAVE_QUANT_GROUP_SIZE}), so it is saved at "
+            "full precision, without quantization metadata."
+        )
+        return model
+    model._config = updated_config
+    print(
+        f"Unsloth: quantizing the merged model to "
+        f"{_MERGED_SAVE_QUANT_BITS}-bit "
+        f"(group_size={_MERGED_SAVE_QUANT_GROUP_SIZE}, "
+        f"mode={_MERGED_SAVE_QUANT_MODE!r}) for save_method='merged_4bit'."
+    )
+    return model
+
+
+_ABSENT = object()
+
+
+def _snapshot_mlx_model_state(model):
+    """Everything needed to undo a save-time cast + quantize on a live model.
+
+    Nothing is copied, but pinning the tree holds the originals alongside the
+    cast and quantized copies, so the save peaks higher.
+    """
+    return (model.leaf_modules(), model.parameters(),
+            getattr(model, "_config", _ABSENT))
+
+
+def _restore_mlx_model_state(model, snapshot):
+    """Put the live model back the way the caller handed it over.
+
+    Otherwise a ``merged_4bit`` save leaves the session holding a 4-bit model: a
+    later ``merged_16bit`` export writes weights dequantized from 4-bit, and
+    training continues on quantized layers. The LoRA fuse is deliberate and stays.
+    """
+    leaf_modules, parameters, config = snapshot
+    model.update_modules(leaf_modules)
+    model.update(parameters)
+    if config is _ABSENT:
+        # Quantizing assigns `_config` unconditionally, so a model that had
+        # none must lose it again or the next save writes 4-bit metadata over
+        # full-precision weights. delattr: mlx Modules subclass dict.
+        try:
+            delattr(model, "_config")
+        except AttributeError:
+            pass
+    else:
+        model._config = config
+    mx.clear_cache()
+
+
+def save_merged_model(model, tokenizer, path, dequantize=False,
+                      quantize_unquantized=False):
     """Fuse LoRA weights and save the full merged model.
 
     Produces an HF-compatible directory with sharded safetensors,
@@ -16664,14 +18529,19 @@ def save_merged_model(model, tokenizer, path, dequantize=False):
         path: Directory to save merged model.
         dequantize: If True, dequantize quantized layers when fusing
             (saves as fp16/bf16 — needed for GGUF). If False, keep the
-            base quantization (smaller checkpoint, only meaningful when
-            the base was quantized).
+            base quantization.
+        quantize_unquantized: If True and nothing in the model is quantized,
+            quantize the merged weights before writing. Set only by
+            ``save_method='merged_4bit'``, never inferred from
+            ``dequantize=False`` -- that is also ``push_to_hub_merged``'s
+            default, which must keep the model's existing precision.
     """
     from mlx_lm.utils import save_model, create_model_card, dequantize_model
     from mlx.utils import tree_unflatten
 
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
+    restore_after_save = None
 
     # Fuse LoRA weights into base model (mlx-lm pattern)
     model.eval()
@@ -16684,18 +18554,53 @@ def save_merged_model(model, tokenizer, path, dequantize=False):
         model.update_modules(tree_unflatten(fused_linears))
 
     if dequantize:
+        unpacked = _unpack_hadamard_modules(model)
         model = dequantize_model(model)
-        cfg = getattr(model, "_config", None)
+        # Rewrite what is saved: it may resolve from `model.config` or `model.args`.
+        cfg = _get_model_config(model)
         if isinstance(cfg, dict):
             model._config = _strip_mlx_quantization_metadata(cfg)
+            if unpacked:
+                model._config = _dense_hadamard_pack_config(model._config)
+    elif quantize_unquantized and not _model_has_quantized_module(model):
+        # The fuse had nothing to requantize: quantize now or say so, but
+        # never write full precision in silence.
+        if _is_vlm_model(model) or _has_vision_config(_get_model_config(model)):
+            print(
+                "Unsloth: save_method='merged_4bit' on an unquantized VLM is "
+                "not supported yet — saving at full precision instead. Load "
+                "the VLM quantized (the default) to get a 4-bit merge."
+            )
+            # A surviving grid would label this full-precision artifact 4-bit.
+            # Strip what is actually saved: _get_model_config may resolve from
+            # `model.config` or `model.args`, not just `_config`.
+            cfg = _get_model_config(model)
+            if isinstance(cfg, dict):
+                model._config = _strip_mlx_quantization_metadata(cfg)
+        else:
+            # Quantizing rewrites the caller's live model; snapshot it before
+            # the try, restore even when the quantize is what fails.
+            restore_after_save = _snapshot_mlx_model_state(model)
 
-    de_lora_model = model
+    # `model` is rebound below; this is what the caller still holds.
+    caller_model = model
 
-    # Save sharded safetensors + index.json
-    save_model(path, de_lora_model, donate_model=False)
+    try:
+        if restore_after_save is not None:
+            model = _quantize_merged_model_for_save(model)
 
-    # Save config.json
-    config = _get_model_config(model)
+        de_lora_model = model
+
+        # Save sharded safetensors + index.json
+        save_model(path, de_lora_model, donate_model=False)
+
+        # Save config.json
+        config = _get_model_config(model)
+    finally:
+        if restore_after_save is not None:
+            _restore_mlx_model_state(caller_model, restore_after_save)
+            restore_after_save = None
+
     if config:
         is_vlm = _is_vlm_model(model) or _has_vision_config(config)
         _save_mlx_config(
@@ -16704,14 +18609,12 @@ def save_merged_model(model, tokenizer, path, dequantize=False):
             is_vlm=is_vlm,
         )
 
-    # Save tokenizer
     tokenizer.save_pretrained(str(path))
 
     src_path = _get_src_path(model)
     if src_path is not None:
         _copy_source_sidecars(src_path, path)
 
-    # Model card
     hf_repo = getattr(model, "_hf_repo", None)
     try:
         create_model_card(path, hf_repo)
@@ -16939,7 +18842,10 @@ def save_pretrained_merged(
             - ``"merged_16bit"``: fuse LoRA into base, dequantize, save full
               fp16/bf16 model. Needed for GGUF / llama.cpp downstream.
             - ``"merged_4bit"``: fuse LoRA into base while keeping the
-              base's 4-bit quantization. Only meaningful for QLoRA.
+              base's 4-bit quantization, or quantize the merged weights to
+              4-bit when the base was loaded unquantized (``load_in_16bit``
+              or ``full_finetuning``). Unquantized VLMs are saved at full
+              precision with a notice; quantizing those is not supported yet.
         push_to_hub: If True, upload to HuggingFace Hub after saving.
         token: HuggingFace token for pushing.
         private: Whether the HF repo should be private.
@@ -17001,6 +18907,7 @@ def save_pretrained_merged(
         save_merged_model(
             model, tokenizer, save_directory,
             dequantize=(method == "merged_16bit"),
+            quantize_unquantized=(method == "merged_4bit"),
         )
 
     if push_to_hub:
@@ -17173,7 +19080,6 @@ def _install_llama_cpp_macos(llama_cpp_folder=None):
         "llama.cpp cmake build",
     )
 
-    # Copy binaries to llama.cpp root
     bin_dir = os.path.join(build_dir, "bin")
     if os.path.exists(bin_dir):
         import glob as globmod
@@ -17268,6 +19174,40 @@ def _gguf_shard_family(first_file, produced_files):
     if stem is None:
         return [first_file]
     return [f for f in produced_files if shard_stem(f) == stem]
+
+
+_GGUF_FULL_PRECISION_TYPES = ("bf16", "f16", "f32")
+_GGUF_QUANT_ALIASES = {
+    "not_quantized": "bf16",
+    "fast_quantized": "q8_0",
+    "quantized": "q4_k_m",
+    None: "q8_0",
+}
+
+
+def _normalize_gguf_quantization_methods(quantization_method):
+    """(ordered unique lower-case llama.cpp types, whether a list/tuple was passed).
+
+    Folded because outputs are `{base}.{TYPE}.gguf`: "BF16" and "bf16" are one file."""
+    is_list = isinstance(quantization_method, (list, tuple))
+    methods = list(quantization_method) if is_list else [quantization_method]
+    if not methods:
+        raise ValueError("Unsloth: quantization_method was an empty list.")
+    resolved = []
+    for method in methods:
+        if method is not None:
+            if not isinstance(method, str):
+                raise TypeError(
+                    "Unsloth: quantization_method must be a string or a list/tuple of "
+                    f"strings - got {type(method).__name__}."
+                )
+            method = method.strip().lower()
+            if not method:
+                raise ValueError("Unsloth: quantization_method contained an empty name.")
+        resolved.append(_GGUF_QUANT_ALIASES.get(method, method))
+    return list(dict.fromkeys(resolved)), is_list
+
+
 def save_pretrained_gguf(
     model,
     tokenizer,
@@ -17296,10 +19236,14 @@ def save_pretrained_gguf(
             "quantized" - q4_k_m (small, fast inference)
             Or any llama.cpp quant type: q2_k, q3_k_m, q4_k_m, q5_k_m,
             q6_k, q8_0, f16, bf16, f32, etc.
+            A list/tuple, e.g. ``["q4_k_m", "q8_0"]``, emits one GGUF per
+            type from a single merge + convert.
         first_conversion: Optional override for the intermediate GGUF
             dtype produced by convert_hf_to_gguf before llama-quantize
             compresses it to ``quantization_method``. Pass ``"f32"`` /
-            ``"f16"`` / ``"bf16"`` to force a specific intermediate
+            ``"f16"`` / ``"bf16"`` to force a specific intermediate.
+            Default: a lone full-precision target directly, f32 if f32 is
+            among the targets, else bf16.
         token: HuggingFace token for reading the upstream imatrix.
         imatrix_file: None = off; a path = that file; True = download the
             upstream unsloth/<base>-GGUF imatrix. Quants that need one
@@ -17315,20 +19259,21 @@ def save_pretrained_gguf(
         install_llama_cpp,
         LLAMA_CPP_DEFAULT_DIR,
         _download_convert_hf_to_gguf,
+        _converter_dir_is_incomplete,
+        internal_scripts_dir_pin,
     )
 
-    # Map friendly names to llama.cpp quant types
-    quant_map = {
-        "not_quantized": "bf16",
-        "fast_quantized": "q8_0",
-        "quantized": "q4_k_m",
-        None: "q8_0",
-    }
-    quant_type = quant_map.get(quantization_method, quantization_method)
     # Normalize once so every later comparison agrees. The direct-conversion test below and the
     # gate on llama-quantize used to normalize differently, so "Q4_K_M" lost its imatrix to a run
     # that then went ahead without it.
-    quant_type = str(quant_type).strip().lower()
+    quant_types, is_list = _normalize_gguf_quantization_methods(quantization_method)
+    if first_conversion is not None:
+        if not isinstance(first_conversion, str):
+            raise TypeError(
+                "Unsloth: first_conversion must be a string such as 'bf16' - got "
+                f"{type(first_conversion).__name__}."
+            )
+        first_conversion = first_conversion.strip().lower()
 
     # Captured before the drop guard can clear imatrix_file: the path may sit inside
     # save_directory, and must not be reported or uploaded as a file this export produced.
@@ -17337,9 +19282,10 @@ def save_pretrained_gguf(
         imatrix_source = os.path.expanduser(os.fspath(imatrix_file))
 
     # Ahead of the output directory and the merge: llama-quantize only refuses these ~10 minutes in.
-    if quant_requires_imatrix(quant_type) and not imatrix_file:
+    needs_imatrix = [q for q in quant_types if quant_requires_imatrix(q)]
+    if needs_imatrix and not imatrix_file:
         raise RuntimeError(
-            f"Unsloth: '{quant_type}' cannot be quantized without an importance matrix. "
+            f"Unsloth: '{needs_imatrix[0]}' cannot be quantized without an importance matrix. "
             "Pass imatrix_file=True to fetch the upstream Unsloth imatrix, or "
             "imatrix_file='/path/to/imatrix.(dat|gguf)' to use your own."
         )
@@ -17350,24 +19296,26 @@ def save_pretrained_gguf(
     # Apple Silicon always supports bf16
     model_dtype = "bf16"
 
-    # Determine first_conversion (intermediate GGUF format before quantizing)
     if first_conversion is None:
-        if quant_type in ("bf16", "f16", "f32"):
-            first_conversion = quant_type
+        if len(quant_types) == 1 and quant_types[0] in _GGUF_FULL_PRECISION_TYPES:
+            first_conversion = quant_types[0]
+        elif "f32" in quant_types:
+            # bf16/f16 are exact in f32; f16 is never promoted (it clips bf16's range).
+            first_conversion = "f32"
         else:
-            # k-quants and q8_0 go through a bf16 intermediate, then llama-quantize
             first_conversion = "bf16"
-    else:
-        first_conversion = str(first_conversion).strip().lower()
 
-    # llama-quantize runs only when the target differs from the direct conversion. Without it an
-    # imatrix has nothing to weight, so drop it rather than resolve an unusable one.
-    if imatrix_file and (
-        quant_type in ("bf16", "f16", "f32") or first_conversion == quant_type
-    ):
+    # A scalar full-precision request keeps the pre-list contract (no quantize pass).
+    if not is_list and quant_types[0] in _GGUF_FULL_PRECISION_TYPES:
+        to_quantize = []
+    else:
+        to_quantize = [q for q in quant_types if q != first_conversion]
+
+    # No real quant pass means nothing for an imatrix to weight: drop it rather than resolve it.
+    if imatrix_file and not any(q not in _GGUF_FULL_PRECISION_TYPES for q in to_quantize):
         warnings.warn(
-            f"Unsloth: ignoring imatrix_file -- '{quant_type}' is written by direct conversion, "
-            "so llama-quantize never runs."
+            f"Unsloth: ignoring imatrix_file -- '{', '.join(quant_types)}' is written without "
+            "quantizing, so llama-quantize never uses it."
         )
         imatrix_file = None
 
@@ -17377,7 +19325,7 @@ def save_pretrained_gguf(
     # file belongs is their call. Checked even if the drop guard cleared imatrix_file: same loss.
     if imatrix_source is not None:
         base = save_directory / (getattr(model, "_hf_repo", None) or "model").split("/")[-1]
-        for out in (f"{base}.{first_conversion.upper()}.gguf", f"{base}.{quant_type.upper()}.gguf"):
+        for out in (f"{base}.{t.upper()}.gguf" for t in dict.fromkeys([first_conversion, *quant_types])):
             if _is_same_file(imatrix_source, out):
                 raise RuntimeError(
                     f"Unsloth: imatrix_file '{imatrix_source}' is also where this export writes "
@@ -17395,7 +19343,6 @@ def save_pretrained_gguf(
             "torch is only needed for GGUF export, not for training."
         )
 
-    # Step 1: Save merged model to a temp HF-format directory
     with tempfile.TemporaryDirectory() as tmp_dir:
         # Before the merge so a bad path fails in seconds, and outside save_directory so the
         # result is never mistaken for an exported model.
@@ -17435,7 +19382,6 @@ def save_pretrained_gguf(
         if _config_path.exists():
             _cfg = json.loads(_config_path.read_text())
             _changed = False
-            # Restore architectures from the original HF config
             if "architectures" not in _cfg:
                 _orig_cfg_path = getattr(tokenizer, "name_or_path", None)
                 if _orig_cfg_path:
@@ -17448,7 +19394,6 @@ def save_pretrained_gguf(
             if _changed:
                 _config_path.write_text(json.dumps(_cfg, indent=2))
 
-        # Step 2: Ensure llama.cpp is installed.
         llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR
         try:
             quantizer_location, converter_location = check_llama_cpp(llama_cpp_folder)
@@ -17486,29 +19431,33 @@ def save_pretrained_gguf(
                 quantizer_location, converter_location = check_llama_cpp(llama_cpp_folder)
         llama_cpp_folder = os.path.dirname(converter_location)
 
-        # Step 3: Download and patch convert_hf_to_gguf.py.
         # why: always go through the wrapper so UNSLOTH_LLAMA_CPP_SCRIPTS_DIR
         # is honored even when a cached converter file exists.
         converter = os.path.join(llama_cpp_folder, "unsloth_convert_hf_to_gguf.py")
         supported_text_archs = None
         supported_vision_archs = None
-        with _LLAMA_CPP_PATCHER_ENV_LOCK:
-            old_scripts_dir = os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")
-            if old_scripts_dir is None:
-                os.environ["UNSLOTH_LLAMA_CPP_SCRIPTS_DIR"] = llama_cpp_folder
-            try:
-                result = _download_convert_hf_to_gguf()
-            finally:
-                if old_scripts_dir is None:
-                    os.environ.pop("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", None)
-                else:
-                    os.environ["UNSLOTH_LLAMA_CPP_SCRIPTS_DIR"] = old_scripts_dir
+        # internal_scripts_dir_pin rather than setting the variable here: deriving
+        # trust from the variable alone made an install Unsloth had just downloaded
+        # look user-pinned, which turned UNSLOTH_CONVERTER_SCAN_STRICT off for this
+        # whole path. Pinning at all is skipped when a converter tag is set, since
+        # the pin outranks it and made that escape hatch inert, and when the install
+        # is incomplete, since pinning it is what stops the staged resolver from
+        # repairing it. A pin the USER set is left alone by the helper itself.
+        _pin_is_safe = (
+            not os.environ.get("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", "").strip()
+            and not _converter_dir_is_incomplete(llama_cpp_folder)
+        )
+        _pin = (
+            internal_scripts_dir_pin(llama_cpp_folder) if _pin_is_safe
+            else contextlib.nullcontext()
+        )
+        with _LLAMA_CPP_PATCHER_ENV_LOCK, _pin:
+            result = _download_convert_hf_to_gguf()
         if isinstance(result, tuple) and len(result) >= 3:
             converter, supported_text_archs, supported_vision_archs = result[:3]
         elif isinstance(result, str):
             converter = result
 
-        # Step 4: Get model name for output filename
         hf_repo = getattr(model, "_hf_repo", None)
         if hf_repo:
             model_name = hf_repo.split("/")[-1]
@@ -17517,7 +19466,6 @@ def save_pretrained_gguf(
 
         output_base = str(save_directory / model_name)
 
-        # Step 5: Convert HF -> GGUF
         print(f"Unsloth: Converting to GGUF format...")
         kwargs = dict(
             model_name=output_base,
@@ -17550,9 +19498,7 @@ def save_pretrained_gguf(
                 else:
                     os.environ["PYTHONPATH"] = original_pythonpath
 
-        # Step 6: Quantize if the target quant differs from first_conversion
-        if quant_type not in ("bf16", "f16", "f32") and first_conversion != quant_type:
-            quantizer = quantizer_location
+        if to_quantize:
             if not produced_files:
                 raise RuntimeError(
                     "Unsloth: the GGUF converter reported no output file to quantize."
@@ -17562,25 +19508,27 @@ def save_pretrained_gguf(
             # from shard 1's split.count. The model always converts before any projector.
             base_gguf = produced_files[0]
             base_files = _gguf_shard_family(base_gguf, produced_files)
-            final_gguf = f"{output_base}.{quant_type.upper()}.gguf"
+            final_ggufs = []
+            for quant_type in to_quantize:
+                final_gguf = f"{output_base}.{quant_type.upper()}.gguf"
+                print(f"Unsloth: Quantizing to {quant_type}...")
+                quantize_gguf(
+                    input_gguf=base_gguf,
+                    output_gguf=final_gguf,
+                    quant_type=quant_type,
+                    quantizer_location=quantizer_location,
+                    print_output=True,
+                    imatrix=None if quant_type in _GGUF_FULL_PRECISION_TYPES else imatrix,
+                )
+                final_ggufs.append(final_gguf)
+            # The intermediate, every shard of it, is scratch unless it was itself requested.
+            if first_conversion not in quant_types:
+                for stale in base_files:
+                    if stale in final_ggufs or not os.path.exists(stale):
+                        continue
+                    os.remove(stale)
+                    print(f"Unsloth: Removed intermediate {Path(stale).name}")
 
-            print(f"Unsloth: Quantizing to {quant_type}...")
-            quantize_gguf(
-                input_gguf=base_gguf,
-                output_gguf=final_gguf,
-                quant_type=quant_type,
-                quantizer_location=quantizer,
-                print_output=True,
-                imatrix=imatrix,
-            )
-            # Remove the intermediate, every shard of it, to save space
-            for stale in base_files:
-                if stale == final_gguf or not os.path.exists(stale):
-                    continue
-                os.remove(stale)
-                print(f"Unsloth: Removed intermediate {Path(stale).name}")
-
-    # List produced files
     gguf_files = _exported_gguf_files(save_directory, imatrix_source)
     for f in gguf_files:
         size_gb = f.stat().st_size / (1024**3)
@@ -17625,7 +19573,6 @@ def push_to_hub_merged(
 
     save_directory = Path(save_directory)
 
-    # Save first if not already saved
     if not (save_directory / "model.safetensors.index.json").exists():
         save_merged_model(model, tokenizer, save_directory)
 
@@ -17751,7 +19698,7 @@ def push_to_hub_gguf(
         tokenizer: Tokenizer.
         save_directory: Local path for GGUF output.
         repo_id: HuggingFace repo ID.
-        quantization_method: GGUF quantization type.
+        quantization_method: GGUF quantization type, or a list/tuple of types.
         token: HuggingFace token.
         private: Whether repo should be private.
         first_conversion: Optional intermediate GGUF dtype passed through to
@@ -17763,7 +19710,6 @@ def push_to_hub_gguf(
 
     save_directory = Path(save_directory)
 
-    # Export to GGUF
     save_pretrained_gguf(
         model,
         tokenizer,
@@ -17774,7 +19720,6 @@ def push_to_hub_gguf(
         imatrix_file=imatrix_file,
     )
 
-    # Upload GGUF files
     api = HfApi(token=token)
     # Same fail-loud private=True rule as the LoRA / merged paths so a
     # private=True request never silently leaks GGUF shards public.
@@ -17793,3 +19738,261 @@ def push_to_hub_gguf(
         )
 
     print(f"Unsloth: GGUF pushed to https://huggingface.co/{repo_id}")
+
+
+
+def detect_adapter_format(path):
+    from unsloth_zoo.mlx.peft_interop import detect_adapter_format as _impl
+    return _impl(path)
+
+
+def normalize_peft_adapter_config(cfg, adapter_dir=None):
+    from unsloth_zoo.mlx.peft_interop import normalize_peft_adapter_config as _impl
+    return _impl(cfg, adapter_dir=adapter_dir)
+
+
+def attach_and_bind_peft_adapter(model, adapter_dir, cfg):
+    """Attach PEFT LoRA onto a live MLX model; all-or-nothing, never partially applied."""
+    from unsloth_zoo.mlx.peft_interop import (
+        PEFT_WEIGHTS_FILE,
+        _EMBEDDING_LEAF_NAMES,
+        _OUTPUT_HEAD_LEAF_NAMES,
+        _TIED_FULL_STATE_REASON,
+        _effective_scale,
+        _tied_head_fold_error,
+        _leaf_in,
+        _raise_rejected,
+        _reject_dora_dropout,
+        group_peft_lora_pairs,
+    )
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx_lm.tuner.lora import LoRALinear
+
+    # Older mlx-lm from_base() rejects scale/dropout.
+    from .loader import _patch_mlx_lora_from_base_compat
+    _patch_mlx_lora_from_base_compat()
+
+    if not cfg.get("_unsloth_peft_import"):
+        from unsloth_zoo.mlx.peft_interop import normalize_peft_adapter_config
+        cfg = normalize_peft_adapter_config(dict(cfg), adapter_dir=adapter_dir)
+    _reject_dora_dropout(cfg)
+    use_dora = bool(cfg.get("use_dora"))
+    if use_dora:
+        try:
+            from mlx_lm.tuner.dora import DoRALinear
+        except ImportError as exc:
+            raise ImportError(
+                "Unsloth MLX: this adapter uses DoRA but mlx_lm.tuner.dora "
+                "is unavailable; upgrade mlx-lm."
+            ) from exc
+
+    tensors = dict(mx.load(os.path.join(adapter_dir, PEFT_WEIGHTS_FILE)))
+    pairs, full_state, rejected = group_peft_lora_pairs(tensors, cfg)
+    if rejected:
+        _raise_rejected(rejected, f"{adapter_dir!r}")
+    if not pairs:
+        raise ValueError(
+            f"Unsloth MLX: {adapter_dir!r} has no LoRA tensor pairs."
+        )
+    by_name = dict(model.named_modules())
+    linear_types = (nn.Linear, nn.QuantizedLinear)
+    dropout = float(cfg.get("lora_dropout") or 0.0)
+    unmatched = []
+    module_scales = {}
+    module_ranks = {}
+    staged = []
+    emb_types = tuple(
+        t for t in (nn.Embedding, nn.QuantizedEmbedding) if t is not None
+    )
+    tied_embeddings = _model_ties_output_to_embedding(model, by_name)
+    for path in sorted(pairs):
+        a, b = pairs[path]["A"], pairs[path]["B"]
+        rank = int(a.shape[0])
+        if int(b.shape[1]) != rank:
+            unmatched.append(f"{path} (lora_A rank {rank} != lora_B rank {int(b.shape[1])})")
+            continue
+        module = by_name.get(path)
+        # Exact types only: Linear subclasses misbehave inside LoRALinear.
+        if module is None or type(module) not in linear_types:
+            found = type(module).__name__ if module is not None else "no module"
+            unmatched.append(
+                f"{path} ({found}; the base model's MLX module tree names "
+                "this weight differently, lacks it, or wraps it in an "
+                "unsupported linear variant)"
+            )
+            continue
+        scale = _effective_scale(cfg, path, rank)
+        mag = pairs[path].get("M")
+        if use_dora and mag is None:
+            unmatched.append(f"{path} (use_dora set but magnitude missing)")
+            continue
+        if not use_dora and mag is not None:
+            unmatched.append(f"{path} (magnitude present without use_dora)")
+            continue
+        if use_dora:
+            wrapped = DoRALinear.from_base(
+                module, r=rank, dropout=dropout, scale=scale
+            )
+        else:
+            wrapped = LoRALinear.from_base(
+                module, r=rank, dropout=dropout, scale=scale
+            )
+        lora_a, lora_b = a.T, b.T
+        if wrapped.lora_a.shape != lora_a.shape:
+            unmatched.append(
+                f"{path} (adapter in-dim {lora_a.shape[0]} != module in-dim "
+                f"{wrapped.lora_a.shape[0]})"
+            )
+            continue
+        if wrapped.lora_b.shape != lora_b.shape:
+            unmatched.append(
+                f"{path} (adapter out-dim {lora_b.shape[1]} != module "
+                f"out-dim {wrapped.lora_b.shape[1]})"
+            )
+            continue
+        wrapped.lora_a = lora_a
+        wrapped.lora_b = lora_b
+        if use_dora:
+            if getattr(mag, "ndim", 0) != 1 or mag.shape != wrapped.m.shape:
+                unmatched.append(
+                    f"{path} (magnitude shape {tuple(mag.shape)} != module "
+                    f"out-dim {wrapped.m.shape[0]})"
+                )
+                continue
+            wrapped.m = mag
+        staged.append((path, wrapped))
+        module_scales[path] = scale
+        module_ranks[path] = rank
+    applied_full_state = {}
+    fs_plan = []
+    for path, entries in sorted(full_state.items()):
+        origin = entries["__origin__"]
+        module = by_name.get(path)
+        if (
+            origin == "embedding_auto"
+            and tied_embeddings
+            and _leaf_in(path, _OUTPUT_HEAD_LEAF_NAMES)
+        ):
+            emb_candidates = [
+                m for n, m in by_name.items()
+                if _leaf_in(n, _EMBEDDING_LEAF_NAMES)
+                and isinstance(m, emb_types)
+            ]
+            if len(emb_candidates) > 1:
+                unmatched.append(
+                    f"{path} (multiple embedding modules; the tied "
+                    "output-head duplicate cannot be attributed)"
+                )
+                continue
+            emb_module = emb_candidates[0] if emb_candidates else None
+            emb_weight = getattr(emb_module, "weight", None)
+            for _ep, _ev in full_state.items():
+                if _leaf_in(_ep, _EMBEDDING_LEAF_NAMES):
+                    emb_weight = _ev.get("weight", emb_weight)
+                    break
+
+            def _equal(live, snap):
+                return bool(mx.array_equal(live, snap.astype(live.dtype)))
+
+            _err = _tied_head_fold_error(path, entries, emb_weight, _equal)
+            if _err:
+                unmatched.append(_err)
+            continue
+        if module is None:
+            if tied_embeddings and _leaf_in(path, _OUTPUT_HEAD_LEAF_NAMES):
+                unmatched.append(
+                    f"{path} (this model ties its embeddings and has no "
+                    "output-head module, so peft modules_to_save on the "
+                    "head has no MLX counterpart)"
+                )
+            else:
+                unmatched.append(f"{path} (full-state target missing)")
+            continue
+        if isinstance(module, (nn.QuantizedLinear, nn.QuantizedEmbedding)):
+            unmatched.append(
+                f"{path} (a quantized base cannot verify or accept a "
+                "full-module snapshot; exclude the module from "
+                "quantization to import it)"
+            )
+            continue
+        if (
+            origin == "modules_to_save"
+            and tied_embeddings
+            and (
+                isinstance(module, emb_types)
+                or _leaf_in(path, _OUTPUT_HEAD_LEAF_NAMES)
+            )
+        ):
+            unmatched.append(f"{path} ({_TIED_FULL_STATE_REASON})")
+            continue
+        for tname, tensor in entries.items():
+            if tname == "__origin__":
+                continue
+            live = getattr(module, tname, None)
+            if live is None or tuple(live.shape) != tuple(tensor.shape):
+                unmatched.append(
+                    f"{path}.{tname} (full-state shape mismatch; resized "
+                    "vocabularies are not supported yet)"
+                )
+                continue
+            if "float" not in str(tensor.dtype).lower():
+                unmatched.append(
+                    f"{path}.{tname} (non-floating snapshot dtype "
+                    f"{tensor.dtype}; packed or quantized state cannot "
+                    "restore as module state)"
+                )
+                continue
+            if tensor.dtype != live.dtype:
+                tensor = tensor.astype(live.dtype)
+            if bool(mx.array_equal(live, tensor)):
+                continue
+            fs_plan.append((module, tname, tensor))
+            applied_full_state[path] = origin
+        if origin == "modules_to_save" and path not in applied_full_state:
+            applied_full_state[path] = origin
+    # peft replaces the ENTIRE module, so a truncated snapshot keeps base state.
+    from mlx.utils import tree_flatten as _tree_flatten
+    for _name in sorted(set(cfg.get("modules_to_save") or [])):
+        for _parent_path, _parent in by_name.items():
+            # Raw endswith, matching peft's selection (["head"] wraps lm_head).
+            if not _parent_path.endswith(_name):
+                continue
+            for _k, _v in _tree_flatten(_parent.parameters()):
+                _tname = _k.rsplit(".", 1)[-1]
+                _sub = (
+                    _parent_path if "." not in _k
+                    else f"{_parent_path}.{_k[: -len(_tname) - 1]}"
+                )
+                if _tname not in (full_state.get(_sub) or {}):
+                    unmatched.append(
+                        f"{_sub}.{_tname} (modules_to_save snapshot for "
+                        f"{_name!r} lacks this tensor; peft snapshots are "
+                        "full module state)"
+                    )
+    if unmatched:
+        preview = "; ".join(unmatched[:5])
+        if len(unmatched) > 5:
+            preview += f"; ... (+{len(unmatched) - 5} more)"
+        raise ValueError(
+            f"Unsloth MLX: {len(unmatched)} PEFT adapter entr(ies) do not "
+            f"map onto the loaded MLX model ({preview}). Refusing a "
+            "partial import."
+        )
+    model.freeze()
+    for module, tname, tensor in fs_plan:
+        setattr(module, tname, tensor)
+    from mlx.utils import tree_unflatten
+    model.update_modules(tree_unflatten(
+        [(path, wrapped) for path, wrapped in staged]
+    ))
+    model.train(bool(getattr(model, "training", False)))
+    for path, origin in applied_full_state.items():
+        if origin == "modules_to_save":
+            by_name[path].unfreeze()
+    model._unsloth_full_state_modules = dict(applied_full_state)
+    model._unsloth_peft_converted = True
+    mx.eval(model.parameters())
+    model._unsloth_lora_module_scales = dict(module_scales)
+    model._unsloth_lora_module_ranks = dict(module_ranks)
+    return len(staged)

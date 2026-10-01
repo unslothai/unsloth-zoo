@@ -62,11 +62,6 @@ def enable_env(monkeypatch):
     monkeypatch.setenv("UNSLOTH_FUSED_FORWARD", "1")
 
 
-# ---------------------------------------------------------------------------
-# AST rewriter unit tests
-# ---------------------------------------------------------------------------
-
-
 CANONICAL_KW_SRC = """
 def forward(self, input_ids=None, labels=None, logits_to_keep=0, **kwargs):
     outputs = self.model(input_ids=input_ids, **kwargs)
@@ -260,11 +255,6 @@ def test_ast_rewriter_forwards_explicit_extra_kwargs():
     assert "num_items_in_batch=" in new_src
 
 
-# ---------------------------------------------------------------------------
-# install_for_class
-# ---------------------------------------------------------------------------
-
-
 _SYNTH_COUNTER = 0
 
 
@@ -301,7 +291,6 @@ def test_install_noop_when_disabled(fresh_install, monkeypatch):
 
 
 def test_install_default_is_on(fresh_install, monkeypatch):
-    # With no env var set, the installer must be active.
     monkeypatch.delenv("UNSLOTH_FUSED_FORWARD", raising=False)
     cls = _make_synthetic_class(CANONICAL_KW_SRC)
     assert fresh_install.is_enabled() is True
@@ -406,11 +395,6 @@ def test_audit_dump(fresh_install, enable_env):
     assert cls.__qualname__ in out["patched"]
 
 
-# ---------------------------------------------------------------------------
-# Numerical equivalence on a small toy model
-# ---------------------------------------------------------------------------
-
-
 def _toy_forward_src():
     # Mirrors the canonical HF template enough to be rewriter-eligible.
     return """
@@ -430,7 +414,6 @@ def test_rewritten_forward_loss_matches_reference(fresh_install, enable_env):
 
     cls = _make_synthetic_class(_toy_forward_src(), name="ToyForCausalLM")
 
-    # Wire a config + lm_head + reference loss_function.
     B, T, H, V = 2, 8, 32, 64
 
     class _Config:
@@ -458,7 +441,6 @@ def test_rewritten_forward_loss_matches_reference(fresh_install, enable_env):
     ref_loss, _ = instance.forward(hidden, labels=labels)
     ref_loss_value = float(ref_loss.detach().cpu().item())
 
-    # Install fused forward.
     ok = fresh_install.install_for_class(cls)
     assert ok is True
 
@@ -668,11 +650,6 @@ def test_adapter_num_items_in_batch_as_int_and_tensor_equal():
     )
 
 
-# ---------------------------------------------------------------------------
-# Env-var branch: UNSLOTH_RETURN_LOGITS
-# ---------------------------------------------------------------------------
-
-
 def _install_toy_cls(fresh_install):
     cls = _make_synthetic_class(_toy_forward_src(), name="EnvVarToyForCausalLM")
     assert fresh_install.install_for_class(cls) is True
@@ -716,7 +693,6 @@ def test_rewritten_forward_returns_real_logits_when_env_set(
     hidden = torch.randn(B, T, H, device=device, dtype=torch.bfloat16)
     labels = torch.randint(0, V, (B, T), device=device)
 
-    # Count lm_head invocations to prove single-matmul on the opt-in path.
     lm_head_calls = {"n": 0}
     orig_call = inst.lm_head.__class__.__call__
     def _counting_call(self, *a, **kw):
@@ -724,8 +700,6 @@ def test_rewritten_forward_returns_real_logits_when_env_set(
         return orig_call(self, *a, **kw)
     monkeypatch.setattr(inst.lm_head.__class__, "__call__", _counting_call)
 
-    # Also count self.loss_function invocations to confirm the opt-in path
-    # routes through the model's own loss function.
     loss_fn_calls = {"n": 0}
     real_loss_fn = inst.loss_function
     def _counting_loss_fn(*a, **kw):

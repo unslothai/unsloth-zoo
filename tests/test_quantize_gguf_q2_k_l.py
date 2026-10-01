@@ -74,10 +74,8 @@ def test_q2_k_l_expands_to_q2_k_with_dynamic_recipe(monkeypatch):  # noqa: D401
 
     cmd = captured["cmd"]
     assert isinstance(cmd, str), f"command should be a shell string (existing convention); got {type(cmd)!r}"
-    # Preset name must NOT reach llama-quantize; expanded ftype must, as a token.
     assert "q2_k_l" not in cmd, f"q2_k_l leaked into llama-quantize command: {cmd!r}"
     assert " q2_k " in cmd, f"q2_k token missing: {cmd!r}"
-    # All four preset flags must appear.
     assert "--output-tensor-type Q6_K" in cmd, f"--output-tensor-type Q6_K missing: {cmd!r}"
     assert "--token-embedding-type Q4_K" in cmd, f"--token-embedding-type Q4_K missing: {cmd!r}"
     assert '--tensor-type "\\.ffn_down_exps=Q3_K"' in cmd, (
@@ -246,9 +244,6 @@ def test_q2_k_l_error_message_keeps_original_preset_name(monkeypatch):
         raise AssertionError("expected RuntimeError")
 
 
-# --- imatrix option ------------------------------------------------------------------------------
-
-
 def test_imatrix_flag_is_prepended_before_positional_args(tmp_path, monkeypatch):
     """A provided imatrix must reach llama-quantize as --imatrix in the option region."""
 
@@ -271,7 +266,6 @@ def test_imatrix_flag_is_prepended_before_positional_args(tmp_path, monkeypatch)
     cmd = captured["cmd"]
     assert "--imatrix" in cmd, f"--imatrix missing: {cmd!r}"
     assert str(imat) in cmd, f"imatrix path missing: {cmd!r}"
-    # Options must precede the positional input/output/type/threads.
     assert cmd.index("--imatrix") < cmd.index("/tmp/in.gguf"), (
         f"--imatrix must precede positional args: {cmd!r}"
     )

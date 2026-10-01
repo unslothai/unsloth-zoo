@@ -95,12 +95,50 @@ def test_a_magic_line_does_not_shift_the_reported_line_number(tmp_path):
     assert [f["line"] for f in found] == [4], found
 
 
+_REMEDIES = {
+    "new-call-site": (
+        "this branch added a dynamic-execution call the baseline does not have. If the "
+        "value really is trusted, run `python scripts/lint_exec_literals.py --update` AND "
+        "then replace the new entry's \"REVIEW ME\" reason with why"
+    ),
+    "unreviewed-entry": (
+        "a baseline entry still says \"REVIEW ME\". `--update` writes that placeholder; "
+        "it is on you to replace it with a justification"
+    ),
+    "stale-entry": (
+        "a baseline entry no longer matches any call, which usually means a refactor "
+        "REMOVED an exec. Nothing to justify: run "
+        "`python scripts/lint_exec_literals.py --update`"
+    ),
+}
+
+
 def test_the_baseline_matches_the_tree_it_was_recorded_against():
-    """A stale entry silently re-permits whatever lands on that digest next."""
+    """A stale entry silently re-permits whatever lands on that digest next.
+
+    Runs the whole gate, so read its verdict back: reported as one nameless failure, a
+    deleted `exec` sends the contributor looking for a review they do not need.
+    """
     proc = subprocess.run(
         [sys.executable, str(SCRIPT)], capture_output = True, text = True, cwd = SCRIPT.parents[1]
     )
-    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    if proc.returncode == 0:
+        return
+
+    verdict = next(
+        (
+            line.split("verdict: ", 1)[1].strip()
+            for line in reversed(proc.stdout.splitlines())
+            if line.startswith("verdict: ")
+        ),
+        None,
+    )
+    remedy = _REMEDIES.get(verdict, "")
+    raise AssertionError(
+        f"the exec-literal gate is red ({verdict or 'no verdict reported'})"
+        + (f": {remedy}" if remedy else "")
+        + f"\n\n{proc.stdout}\n{proc.stderr}"
+    )
 
 
 def test_the_gate_fails_on_a_call_the_baseline_does_not_have(tmp_path):

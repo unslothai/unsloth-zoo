@@ -94,28 +94,27 @@ def test_batched_greedy_matches_sequential_and_preserves_sampled_ids():
         GenerationRequest(prompt="Two plus two equals", max_tokens=8),
     ]
     defaults = GenerationDefaults()
-    # The cache patch must be installed before any decoding runs.
     order = []
     real_install = generate_module._install_arrays_cache_advance_fix
-    real_adapter_generate = generate_module._TextBatchAdapter.generate
+    real_adapter_stream = generate_module._TextBatchAdapter.stream
 
     def record_install():
         order.append("install")
         return real_install()
 
-    def record_generate(self, requests):
-        order.append("generate")
-        return real_adapter_generate(self, requests)
+    def record_stream(self, requests):
+        order.append("stream")
+        return real_adapter_stream(self, requests)
 
     generate_module._install_arrays_cache_advance_fix = record_install
-    generate_module._TextBatchAdapter.generate = record_generate
+    generate_module._TextBatchAdapter.stream = record_stream
     try:
         batched = generate_batch(model, tokenizer, requests, defaults=defaults)
     finally:
         generate_module._install_arrays_cache_advance_fix = real_install
-        generate_module._TextBatchAdapter.generate = real_adapter_generate
+        generate_module._TextBatchAdapter.stream = real_adapter_stream
     from mlx_lm.models.cache import ArraysCache
-    assert order == ["install", "generate"]
+    assert order == ["install", "stream"]
     assert generate_module._ARRAYS_CACHE_ADVANCE_RESOLVED
     assert isinstance(ArraysCache.left_padding, property)
     sequential = []
@@ -186,8 +185,6 @@ def test_compiled_training_state_survives_generation():
         # Sampling consumes the global RNG stream, so the same seed reproduces.
         result, repeat = [types.SimpleNamespace(token_ids=sample(11))], sample(11)
         assert result[0].token_ids and repeat == result[0].token_ids
-        # Parameters untouched, block runs in eval with the checkpoint patch
-        # installed, flags restored, and the compiled step keeps training.
         assert snapshot() == state_after_train
         assert (False, True) in model.layers[0].seen_states
         assert hasattr(_CompileBlock, "_orig_call")
@@ -223,7 +220,6 @@ def test_vlm_batched_generation_is_ordered_and_aligned():
     results = generate_batch(model, processor, requests, defaults=defaults)
     assert len(results) == 3
     for result in results:
-        # The RL contract: ids come from sampled events, logprobs align to them.
         assert result.token_ids
         assert result.logprobs is None or len(result.logprobs) == len(result.token_ids)
         assert result.finish_reason in ("stop", "length")
@@ -234,16 +230,12 @@ def test_vlm_batched_generation_is_ordered_and_aligned():
     events = [event for event in stream_generate(
         model, processor, requests[0].prompt, image=[requests[0].image],
         max_tokens=4, sampler=make_sampler(temp=0.0))]
-    # The terminal event contributes text only: its token is the stopping token,
-    # or a repeat of the last body token when the budget ran out.
     tail = events[-1]
     body = events[:-1]
     assert results[0].token_ids == [int(event.token) for event in body]
     assert results[0].logprobs == pytest.approx(
         [float(event.logprobs[event.token].item()) for event in body], abs=0.02)
     assert results[0].text == "".join(event.text for event in events)
-    # Derived from the stream, not our own rule: fewer body events than the
-    # budget means it stopped early.
     assert tail is not None
     assert results[0].finish_reason == ("stop" if len(body) < 4 else "length")
     # Chunking must not pair a prompt with an earlier chunk's embeddings.
@@ -253,8 +245,211 @@ def test_vlm_batched_generation_is_ordered_and_aligned():
     # Concurrent sequences must not share a detokenizer buffer, so text must
     # match too, not just ids.
     assert [item.text for item in chunked] == [item.text for item in results]
-    # Independent buffers: no result may carry another's decoded text appended.
     assert all(r.text == "" or not r.text.startswith(results[0].text + results[1].text) for r in results)  # noqa: E501
+
+
+def _own_copy(value):
+    if isinstance(value, mx.array):
+        return value + 0
+    if isinstance(value, (list, tuple)):
+        items = [_own_copy(item) for item in value]
+        return type(value)(*items) if hasattr(value, "_fields") else type(value)(items)
+    if hasattr(value, "__dict__") and hasattr(type(value), "state"):
+        duplicate = type(value).__new__(type(value))
+        duplicate.__dict__.update({k: _own_copy(v) for k, v in vars(value).items()})
+        return duplicate
+    return value
+
+
+class _RowCacheState:
+    def __init__(self, cache, lengths=None):
+        self.cache, self.lengths, self.kept = cache, lengths, {}
+
+    def open(self, token_ids):
+        return self.cache, self.lengths or range(1, len(token_ids) + 1)
+
+    def checkpoint(self, token_count, cache):
+        self.kept[token_count] = _own_copy(cache)
+
+
+@metal_only
+def test_vlm_stream_rows_resume_from_their_own_cache_bitwise():
+    from mlx_vlm import load
+    from mlx_vlm.models.cache import make_prompt_cache
+    from mlx_vlm.prompt_utils import apply_chat_template
+    import mlx_vlm
+    from mlx.utils import tree_flatten
+    from packaging.version import Version
+    from PIL import Image
+    from unsloth_zoo.mlx.generate import (
+        BatchRowRefused, BatchStream, GenerationDefaults, GenerationRequest,
+        row_prompt_cache_unavailable_reason,
+    )
+    model, processor = load(VLM_MODEL)
+    model._is_vlm_model = True
+    assert row_prompt_cache_unavailable_reason() is None
+    rules = " ".join(f"Rule {i}: answer tersely." for i in range(420))
+    prompt = apply_chat_template(processor, model.config, f"Name a colour. {rules}", num_images=0)
+    state = _RowCacheState
+    lm = model.language_model
+
+    def run(*requests):
+        defaults = GenerationDefaults(max_tokens=12, prefill_batch_size=1, completion_batch_size=4)
+        with BatchStream(model, processor, defaults=defaults) as stream:
+            rows = [stream.add(request) for request in requests]
+            results = {}
+            while len(results) < len(rows):
+                results.update((e.index, e.result) for e in stream.step() if e.result is not None)
+        return [results[row] for row in rows]
+
+    cold_state = state(make_prompt_cache(lm))
+    (cold,) = run(GenerationRequest(prompt=prompt, prompt_cache_state=cold_state))
+    length, kept = cold.prompt_token_count, cold_state.kept
+    # Checkpoints land only where a prefill chunk ends: the 2048 grid, and from mlx-vlm 0.7.0,
+    # which chunks a tail shorter than a step, the held-back last token.
+    held_back = [length - 1] if Version(mlx_vlm.__version__) >= Version("0.7.0") else []
+    assert sorted(kept) == [*range(2048, length - 1, 2048), *held_back]
+    # Alone, as the cold row decoded: batched decode depends on what decodes beside a row.
+    for prefix in sorted(kept):
+        warm_state = state(_own_copy(kept[prefix]))
+        (warm,) = run(GenerationRequest(prompt=prompt, prompt_cache_state=warm_state))
+        assert (warm.token_ids, warm.logprobs) == (cold.token_ids, cold.logprobs)
+        assert (warm.cached_token_count, warm.prompt_token_count) == (prefix, length)
+        assert sorted(warm_state.kept) == [n for n in sorted(kept) if n > prefix]
+    # Rows decoding together keep their own caches and checkpoint only the lengths they ask for.
+    fruit = apply_chat_template(processor, model.config, f"Name a fruit. {rules}", num_images=0)
+    run(GenerationRequest(prompt=fruit, prompt_cache_state=(alone := state(make_prompt_cache(lm), {2048}))))
+    first, second = state(_own_copy(kept[2048]), {4096}), state(make_prompt_cache(lm), {2048})
+    rows = run(GenerationRequest(prompt=prompt, prompt_cache_state=first),
+               GenerationRequest(prompt=fruit, prompt_cache_state=second))
+    assert [row.cached_token_count for row in rows] == [2048, 0]
+    assert (sorted(first.kept), sorted(second.kept)) == ([4096], [2048])
+    states = lambda cache: [v for _, v in tree_flatten([entry.state for entry in cache])]
+    for got, want in ((first.kept[4096], kept[4096]), (second.kept[2048], alone.kept[2048])):
+        assert all(mx.array_equal(a, b).item() for a, b in zip(states(got), states(want), strict=True))
+    # Rows merge by cache class and keep the receiving cache's window.
+    for cache in (None, make_prompt_cache(lm, max_kv_size=8192)):
+        other = None if cache is None else state(cache)
+        with pytest.raises(BatchRowRefused, match="laid out unlike"):
+            run(GenerationRequest(prompt=prompt, prompt_cache_state=state(make_prompt_cache(lm, max_kv_size=4096))),
+                GenerationRequest(prompt=prompt, prompt_cache_state=other))
+    # FastVLM expands its image placeholder, so its ids cannot name cache offsets.
+    image = Image.new("RGB", (64, 64), (200, 40, 40))
+    pictured = apply_chat_template(processor, model.config, f"Describe it. {rules}", num_images=1)
+    cold_state = state(make_prompt_cache(lm))
+    run(GenerationRequest(prompt=pictured, image=image, prompt_cache_state=cold_state))
+    assert cold_state.kept == {}
+    with pytest.raises(BatchRowRefused, match="expands past"):
+        run(GenerationRequest(prompt=pictured, image=image, prompt_cache_state=state(_own_copy(kept[2048]))))
+
+
+@metal_only
+def test_vlm_stream_rows_resume_from_their_own_quantized_cache_bitwise(monkeypatch):
+    from mlx_vlm import load
+    from mlx_vlm.models.cache import QuantizedKVCache, make_prompt_cache
+    from mlx_vlm.prompt_utils import apply_chat_template
+    from unsloth_zoo.mlx.generate import BatchRowRefused, BatchStream, GenerationDefaults, GenerationRequest
+    model, processor = load(VLM_MODEL)
+    model._is_vlm_model = True
+    rules = " ".join(f"Rule {i}: answer tersely." for i in range(420))
+    prompt = apply_chat_template(processor, model.config, f"Name a colour. {rules}", num_images=0)
+    fruit = apply_chat_template(processor, model.config, "Name a fruit.", num_images=0)
+    quantized = lambda bits: [e.to_quantized(group_size=64, bits=bits) for e in make_prompt_cache(model.language_model)]
+
+    def run(*requests):
+        defaults = GenerationDefaults(max_tokens=12, prefill_batch_size=1, completion_batch_size=4)
+        with BatchStream(model, processor, defaults=defaults) as stream:
+            rows = [stream.add(request) for request in requests]
+            results = {}
+            while len(results) < len(rows):
+                results.update((e.index, e.result) for e in stream.step() if e.result is not None)
+        return [results[row] for row in rows]
+
+    # mlx-vlm before 0.7 cannot turn a quantized row into a batch cache.
+    mergeable = "prefix_cache_merge" in vars(QuantizedKVCache)
+    with monkeypatch.context() as patch:
+        patch.delattr(QuantizedKVCache, "prefix_cache_merge", raising=False)
+        with pytest.raises(BatchRowRefused, match="cannot batch a row's own quantized cache"):
+            run(GenerationRequest(prompt=fruit, prompt_cache_state=_RowCacheState(quantized(4))))
+    if not mergeable:
+        return
+    cold_state = _RowCacheState(quantized(4), {2048})
+    (cold,) = run(GenerationRequest(prompt=prompt, prompt_cache_state=cold_state))
+    warm_state = _RowCacheState(_own_copy(cold_state.kept[2048]))
+    (warm,) = run(GenerationRequest(prompt=prompt, prompt_cache_state=warm_state))
+    assert (warm.token_ids, warm.logprobs, warm.cached_token_count) == (cold.token_ids, cold.logprobs, 2048)
+    # The short row prefills while the resumed one decodes, so it joins a quantized batch.
+    rows = run(GenerationRequest(prompt=prompt, prompt_cache_state=_RowCacheState(_own_copy(cold_state.kept[2048]))),
+               GenerationRequest(prompt=fruit, prompt_cache_state=_RowCacheState(quantized(4))))
+    assert [row.cached_token_count for row in rows] == [2048, 0]
+    assert all(row.finish_reason in ("stop", "length") for row in rows)
+    with pytest.raises(BatchRowRefused, match="laid out unlike"):
+        run(GenerationRequest(prompt=fruit, prompt_cache_state=_RowCacheState(quantized(4))),
+            GenerationRequest(prompt=fruit, prompt_cache_state=_RowCacheState(quantized(8))))
+    # A uniformly quantizing stream converts a float row from its first token, as mlx-vlm's batch does.
+    streamed = _RowCacheState(make_prompt_cache(model.language_model), {2048})
+    defaults = GenerationDefaults(max_tokens=12, prefill_batch_size=1, completion_batch_size=4, kv_bits=4)
+    with BatchStream(model, processor, defaults=defaults) as stream:
+        row = stream.add(GenerationRequest(prompt=prompt, prompt_cache_state=streamed))
+        results = {}
+        while row not in results:
+            results.update((e.index, e.result) for e in stream.step() if e.result is not None)
+    assert results[row].finish_reason in ("stop", "length")
+    assert isinstance(streamed.kept[2048][0], QuantizedKVCache)
+
+
+@metal_only
+def test_vlm_stream_turboquant_rows_quantize_their_own_cache_as_a_single_decode_does(monkeypatch):
+    from mlx_vlm import load
+    from mlx_vlm.models.cache import QuantizedKVCache, make_prompt_cache
+    from mlx_vlm.prompt_utils import apply_chat_template
+    from mlx_vlm.turboquant import TurboQuantKVCache
+    from unsloth_zoo.mlx.generate import BatchRowRefused, BatchStream, GenerationDefaults, GenerationRequest
+    model, processor = load(VLM_MODEL)
+    model._is_vlm_model = True
+    rules = " ".join(f"Rule {i}: answer tersely." for i in range(420))
+    prompt = apply_chat_template(processor, model.config, f"Name a colour. {rules}", num_images=0)
+    fruit = apply_chat_template(processor, model.config, "Name a fruit.", num_images=0)
+    fresh = lambda: make_prompt_cache(model.language_model)
+
+    def run(*requests, start=0):
+        defaults = GenerationDefaults(max_tokens=12, prefill_batch_size=1, completion_batch_size=4,
+                                      kv_bits=3.5, kv_quant_scheme="turboquant", quantized_kv_start=start)
+        with BatchStream(model, processor, defaults=defaults) as stream:
+            rows = [stream.add(request) for request in requests]
+            results = {}
+            while len(results) < len(rows):
+                results.update((e.index, e.result) for e in stream.step() if e.result is not None)
+        return [results[row] for row in rows]
+
+    mergeable = "prefix_cache_merge" in vars(QuantizedKVCache)
+    with monkeypatch.context() as patch:
+        patch.delattr(QuantizedKVCache, "prefix_cache_merge", raising=False)
+        with pytest.raises(BatchRowRefused, match="cannot batch a row's own quantized cache"):
+            run(GenerationRequest(prompt=fruit, prompt_cache_state=_RowCacheState(fresh())))
+    if not mergeable:
+        return
+    # A float row cache is quantized after each prefill forward, before its checkpoint.
+    cold_state = _RowCacheState(fresh(), {2048})
+    (cold,) = run(GenerationRequest(prompt=prompt, prompt_cache_state=cold_state))
+    assert isinstance(cold_state.kept[2048][0], TurboQuantKVCache)
+    (warm,) = run(GenerationRequest(prompt=prompt, prompt_cache_state=_RowCacheState(_own_copy(cold_state.kept[2048]))))
+    assert (warm.token_ids, warm.logprobs, warm.cached_token_count) == (cold.token_ids, cold.logprobs, 2048)
+    # A cold row opens float but decodes quantized, so it joins the resumed one; so does a
+    # one-token row, whose only forward is its last.
+    rows = run(GenerationRequest(prompt=prompt, prompt_cache_state=_RowCacheState(_own_copy(cold_state.kept[2048]))),
+               GenerationRequest(prompt=fruit, prompt_cache_state=_RowCacheState(fresh())),
+               GenerationRequest(prompt="Hi", prompt_cache_state=_RowCacheState(fresh())))
+    assert [row.cached_token_count for row in rows] == [2048, 0, 0] and rows[2].prompt_token_count == 1
+    assert all(row.finish_reason in ("stop", "length") for row in rows)
+    # Rows share one codec, and convert at one length.
+    seeded = fresh()
+    seeded[:-1] = [TurboQuantKVCache(bits=3.5, seed=1) for _ in seeded[:-1]]
+    with pytest.raises(BatchRowRefused, match="laid out unlike"):
+        run(GenerationRequest(prompt=fruit, prompt_cache_state=_RowCacheState(fresh())),
+            GenerationRequest(prompt=fruit, prompt_cache_state=_RowCacheState(seeded)))
+    with pytest.raises(BatchRowRefused, match="quantized_kv_start=0"):
+        run(GenerationRequest(prompt=fruit, prompt_cache_state=_RowCacheState(fresh())), start=100)
 
 
 @metal_only
@@ -274,13 +469,10 @@ def test_vlm_stop_strings_cut_generation_through_the_public_path():
     free = generate_batch(model, processor, [request],
                           defaults=GenerationDefaults(max_tokens=12))[0]
     assert len(free.text) > 1
-    # The whole public path must carry stop strings, not just the event loop.
     stop = free.text[1]
     stopped = generate_batch(model, processor, [request], defaults=GenerationDefaults(
         max_tokens=12, stop_strings=(stop,)))[0]
     assert (stopped.finish_reason, stopped.stop_match) == ("stop_string", stop)
-    # Trimming is token-aligned: whole tokens before the match survive, possibly
-    # none, and never the stop string itself.
     assert free.text.startswith(stopped.text) and stop not in stopped.text
     assert len(stopped.token_ids) < len(free.token_ids)
 
@@ -312,7 +504,6 @@ def test_arrays_cache_advance_patch_only_replaces_the_body_it_reproduces():
                 self.left_padding += N
 
     class Decrementing(Incrementing):
-        # A matcher that reached for an instance trips this instead of passing quietly.
         def __init__(self):
             raise AssertionError("candidacy must not instantiate the candidate")
 
@@ -381,7 +572,6 @@ def test_arrays_cache_advance_defers_instead_of_stranding_metal_buffers():
     assert (batch.lengths.tolist(), batch.left_padding.tolist()) == ([2], [-1])
     batch.advance(3)
     batch.prepare(lengths=[7])
-    # Re-arming a field replaces it outright, deferred count included.
     assert batch.lengths.tolist() == [7]
     batch.finalize()
     batch.advance(5)
@@ -394,7 +584,6 @@ def test_arrays_cache_advance_defers_instead_of_stranding_metal_buffers():
     legacy.advance(1)
     assert legacy.left_padding.tolist() == [1] and legacy.lengths is None
 
-    # extend() concatenates two caches carrying different deferred counts.
     left = ArraysCache(1)
     left[0] = mx.zeros((2, 4))
     left.left_padding, left.lengths = mx.array([0, 4]), mx.array([6, 9])
@@ -406,3 +595,236 @@ def test_arrays_cache_advance_defers_instead_of_stranding_metal_buffers():
     left.extend(right)
     assert left.left_padding.tolist() == [-2, 2, 2]
     assert left.lengths.tolist() == [4, 7, -2]
+
+
+@metal_only
+def test_a_penalised_row_answers_the_same_batched_and_alone():
+    """A row shown its whole prompt is penalised against text it never sees alone, and the
+    two prompts differ in length, so one offset cannot serve both rows."""
+    from mlx_lm import load, stream_generate
+    from mlx_lm.sample_utils import make_logits_processors, make_sampler
+    from unsloth_zoo.mlx.generate import (
+        GenerationDefaults, GenerationRequest, generate_batch,
+    )
+
+    model, tokenizer = load(MODEL)
+    prompts = ("red red red red red red red red. Name a colour:", "one one one. Count:")
+    penalty = dict(repetition_penalty = 1.6, repetition_context_size = 20)
+    batched = generate_batch(model, tokenizer, [
+        GenerationRequest(prompt = prompt, max_tokens = 12,
+                          logits_processors = make_logits_processors(**penalty))
+        for prompt in prompts
+    ], defaults = GenerationDefaults())
+
+    for prompt, result in zip(prompts, batched):
+        alone = [int(event.token) for event in stream_generate(
+            model, tokenizer, tokenizer.encode(prompt, add_special_tokens = False),
+            max_tokens = 12, sampler = make_sampler(temp = 0.0),
+            logits_processors = make_logits_processors(**penalty),
+        ) if event.finish_reason != "stop"]
+        assert result.token_ids == alone, prompt
+
+
+def _residual_equal(actual, expected):
+    assert bool(mx.array_equal(actual.view(mx.uint8), expected.view(mx.uint8)))
+
+
+class ResidualNormBlock(nn.Module):
+    def __init__(self, width):
+        super().__init__()
+        self.norm = nn.RMSNorm(width)
+        self.tail_norm = nn.RMSNorm(width)
+        self.layer_scalar = mx.array([0.75])
+
+    def __call__(self, h, tail = True):
+        residual = h
+        h = self.norm(h)
+        h = residual + h
+        if tail:
+            residual = h
+            gate = h * 0.5
+            gate = self.tail_norm(gate)
+            h = residual + gate
+        if self.layer_scalar is not None:
+            h = h * self.layer_scalar
+        return h, tail
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+@metal_only
+def test_generation_mode_applies_residual_norm_and_restores(cancel):
+    from contextlib import nullcontext
+    from unsloth_zoo.mlx.generate import generation_mode
+
+    models = [ResidualNormBlock(128), ResidualNormBlock(128)]
+    root = nn.Sequential(*models)
+    root.train()
+    models[1].eval()
+    flags = [module.training for module in root.modules()]
+    x = mx.random.normal((1, 1, 128))
+    expected = [model(x)[0] for model in models]
+    mx.eval(expected)
+    with pytest.raises(RuntimeError, match = "cancel") if cancel else nullcontext():
+        with generation_mode(root):
+            with generation_mode(root):
+                assert all(not module.training for module in root.modules())
+                for model, native in zip(models, expected):
+                    assert type(model) is not ResidualNormBlock
+                    _residual_equal(model(x)[0], native)
+            assert all(type(model) is not ResidualNormBlock for model in models)
+            if cancel:
+                raise RuntimeError("cancel")
+    assert all(type(model) is ResidualNormBlock for model in models)
+    assert [module.training for module in root.modules()] == flags
+
+
+@pytest.mark.parametrize("vlm", [False, True], ids = ["text", "vlm"])
+@pytest.mark.parametrize("cancel", [False, True], ids = ["complete", "cancel"])
+@metal_only
+def test_loader_generate_applies_residual_norm_and_restores(monkeypatch, vlm, cancel):
+    from contextlib import nullcontext
+    import mlx_lm
+    import mlx_vlm
+    from unsloth_zoo.mlx import loader
+
+    models = [ResidualNormBlock(128), ResidualNormBlock(128)]
+    root = nn.Sequential(*models)
+    root._tokenizer = types.SimpleNamespace(eos_token_ids = {2})
+    root._is_vlm_model = vlm
+    root.eval()
+    x = mx.random.normal((1, 1, 128))
+    expected = [model(x)[0] for model in models]
+    mx.eval(expected)
+
+    def stream(model, *args, **kwargs):
+        assert model is root
+        for index, (block, native) in enumerate(zip(models, expected)):
+            assert type(block) is not ResidualNormBlock
+            _residual_equal(block(x)[0], native)
+            yield types.SimpleNamespace(token = 7 + index)
+        if cancel:
+            raise RuntimeError("cancel")
+
+    monkeypatch.setattr(mlx_vlm if vlm else mlx_lm, "stream_generate", stream)
+    with pytest.raises(RuntimeError, match = "cancel") if cancel else nullcontext():
+        output = loader._mlx_generate(root, input_ids = [[1, 2]], max_new_tokens = 2)
+        assert output.tolist() == [[1, 2, 7, 8]]
+    assert all(type(model) is ResidualNormBlock for model in models)
+
+
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16, mx.float32])
+@metal_only
+def test_residual_norm_matches_reduction_rounding_and_scale(dtype):
+    from unsloth_zoo.mlx import inference as decode
+    for width in (63, 127, 128, 129, 1536, 4095, 4096):
+        mx.random.seed(width)
+        norm = nn.RMSNorm(width, eps = 1e-6)
+        norm.weight = mx.random.normal((width,)).astype(dtype)
+        norm.eval()
+        # The last entry spreads magnitudes within the row rather than scaling the whole
+        # row. Uniform rows agree bitwise even if the squares accumulate without fma.
+        for magnitude in (0.01, 1., 10., None):
+            spread = mx.power(10., mx.random.uniform(-4, 4, (1, 1, width)))
+            x = (mx.random.normal((1, 1, width)) * (spread if magnitude is None else magnitude)).astype(dtype)
+            residual = mx.random.normal(x.shape).astype(dtype)
+            for scale in (None, mx.array(0.7, dtype), mx.array([1.5], dtype)):
+                expected = residual + norm(x)
+                if scale is not None:
+                    expected = expected * scale
+                _residual_equal(decode._residual_norm_add(norm, x, residual, scale), expected)
+
+
+@metal_only
+def test_residual_norm_scope_mutations_and_restore(monkeypatch):
+    from unsloth_zoo.mlx import inference as decode
+    models = [ResidualNormBlock(128), ResidualNormBlock(128)]
+    root = nn.Sequential(*models)
+    root.set_dtype(mx.bfloat16)
+    root.eval()
+    x = mx.random.normal((1, 1, 128)).astype(mx.bfloat16)
+    calls = []
+    apply = decode._norm_add_apply
+    def observed(*args):
+        calls.append(None)
+        return apply(*args)
+    monkeypatch.setattr(decode, "_norm_add_apply", observed)
+    with pytest.raises(RuntimeError, match = "cancel"):
+        with decode.fused_residual_norm(root):
+            assert all(type(m) is not ResidualNormBlock for m in models)
+            with decode.fused_residual_norm(root):
+                for model in models:
+                    for factor in (2., .25):
+                        model.norm.weight = model.norm.weight * factor
+                        model.tail_norm.weight = model.tail_norm.weight / factor
+                        for tail in (False, True):
+                            calls.clear()
+                            expected = ResidualNormBlock.__call__(model, x, tail)[0]
+                            _residual_equal(model(x, tail)[0], expected)
+                            assert len(calls) == 1 + int(tail)
+            original = nn.RMSNorm.__call__
+            monkeypatch.setattr(nn.RMSNorm, "__call__", lambda self, value: original(self, value) * 0.5)
+            for model in models:
+                calls.clear()
+                _residual_equal(model(x)[0], ResidualNormBlock.__call__(model, x)[0])
+                assert not calls
+            raise RuntimeError("cancel")
+    assert all(type(m) is ResidualNormBlock for m in models)
+
+
+@metal_only
+def test_residual_norm_fallbacks(monkeypatch):
+    from unsloth_zoo.mlx import inference as decode
+    model = ResidualNormBlock(128)
+    model.eval()
+    def unexpected(*args):
+        pytest.fail("unsupported input reached residual norm kernel")
+    monkeypatch.setattr(decode, "_norm_add_apply", unexpected)
+    with decode.fused_residual_norm(model):
+        for shape in ((2, 1, 128), (1, 3, 128)):
+            x = mx.random.normal(shape)
+            _residual_equal(model(x)[0], ResidualNormBlock.__call__(model, x)[0])
+        x = mx.random.normal((1, 1, 128))
+        model.train()
+        _residual_equal(model(x)[0], ResidualNormBlock.__call__(model, x)[0])
+        model.eval()
+        model.norm.train()
+        model.tail_norm.train()
+        _residual_equal(model(x)[0], ResidualNormBlock.__call__(model, x)[0])
+    monkeypatch.setattr(decode, "_residual_norm_kernel", lambda: None)
+    with decode.fused_residual_norm(model):
+        assert type(model) is ResidualNormBlock
+
+
+@metal_only
+def test_residual_norm_respects_an_existing_native_patch(monkeypatch):
+    from unsloth_zoo.mlx import inference as decode
+    class FreshBlock(ResidualNormBlock):
+        pass
+    model = FreshBlock(128)
+    model.eval()
+    original = mx.fast.rms_norm
+    monkeypatch.setattr(mx.fast, "rms_norm", lambda *args, **kwargs: original(*args, **kwargs) * 0.5)
+    x = mx.random.normal((1, 1, 128))
+    expected = model(x)[0]
+    with decode.fused_residual_norm(model):
+        _residual_equal(model(x)[0], expected)
+
+
+def test_residual_norm_scope_tolerates_a_stand_in_without_training(monkeypatch):
+    """named_modules() yields whatever the generation API was handed, including the plain
+    stand-ins it deliberately tolerates. Reading `.training` on one raises out of generation
+    instead of skipping it, which is why the decode-fusion scope checks the type first."""
+    from unsloth_zoo.mlx import inference as decode
+
+    class _StandIn:
+        pass
+
+    class _Root:
+        def named_modules(self):
+            return [("stand_in", _StandIn())]
+
+    # Off Metal the scope returns before the loop, so give it a kernel to get past that.
+    monkeypatch.setattr(decode, "_residual_norm_kernel", lambda: object())
+    root = _Root()
+    with decode.fused_residual_norm(root) as yielded:
+        assert yielded is root

@@ -31,10 +31,15 @@ import torch
 import re
 import os
 import functools
+import inspect
 from copy import deepcopy
 from .utils import get_quant_type
 from .log import logger
 from .hf_utils import HAS_TORCH_DTYPE, dtype_from_config, set_dtype_in_config
+
+# get_model_type returns the vision name, which transformers 5 renamed to qwen3_vl_vision.
+QWEN_VL_MERGED_QKV_TYPES = ("qwen2_5_vl", "qwen3_vl", "qwen3_vl_vision", "qwen3_5")
+
 
 def _is_gemma4_config(config):
     if config is None:
@@ -374,6 +379,8 @@ def patch_gemma4_vllm_lora_support():
                 cls.embedding_modules = {}
             cls._unsloth_gemma4_class_patched = True
 
+    _patch_gemma4_vllm_expert_mapping()
+
     original_supports_lora = getattr(
         lora_model_runner_mixin, "supports_lora", vllm_model_interfaces.supports_lora
     )
@@ -401,6 +408,41 @@ def patch_gemma4_vllm_lora_support():
         vllm_lora_model_manager.create_lora_manager = patched_create_lora_manager
         vllm_lora_worker_manager.create_lora_manager = patched_create_lora_manager
 pass
+
+def _patch_gemma4_vllm_expert_mapping():
+    # Only vLLM 0.19-0.24 lacks it; on 0.25+ a top-level shim would shadow RoutedExperts.get_expert_mapping.
+    try:
+        from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
+    except Exception:
+        return
+    try:
+        from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts as experts_cls
+    except Exception:
+        try:
+            from vllm.model_executor.layers.fused_moe.layer import FusedMoE as experts_cls
+        except Exception:
+            return
+    if hasattr(experts_cls, "get_expert_mapping") or hasattr(Gemma4ForCausalLM, "get_expert_mapping"):
+        return
+    make_expert_params_mapping = getattr(experts_cls, "make_expert_params_mapping", None)
+    if make_expert_params_mapping is None:
+        return
+
+    def get_expert_mapping(self):
+        num_experts = getattr(self.config, "num_experts", None) or 0
+        if num_experts == 0:
+            return []
+        return make_expert_params_mapping(
+            self,
+            ckpt_gate_proj_name = "gate_proj",
+            ckpt_down_proj_name = "down_proj",
+            ckpt_up_proj_name = "up_proj",
+            num_experts = num_experts,
+            num_redundant_experts = getattr(self, "num_redundant_experts", 0),
+        )
+    Gemma4ForCausalLM.get_expert_mapping = get_expert_mapping
+pass
+
 
 # Prequantized BnB Gemma4 k_eq_v layers lack a synthetic v quant-state shard;
 # we duplicate K -> V at loader-side quant-state stacking time.
@@ -576,7 +618,7 @@ def create_empty_vision_model(config, dtype = torch.float16):
     text_layers = config.text_config.num_hidden_layers
     vision_layers = getattr(config.vision_config, "num_hidden_layers", None) or getattr(config.vision_config, "depth", 0)
 
-    if model_type in ("qwen2_5_vl", "qwen3_vl", "qwen3_5"):
+    if model_type in QWEN_VL_MERGED_QKV_TYPES:
         new_config.vision_config.out_hidden_size = 1
 
     num_layers = max(text_layers, vision_layers)
@@ -716,6 +758,10 @@ def set_additional_modules(new_model, quant_state_dict, config):
     elif hasattr(new_model, "model") and hasattr(new_model.model, "language_model"):
         language_model = new_model.model.language_model
         language_model_prefix = "model.language_model"
+    elif hasattr(new_model, "model") and hasattr(new_model.model, "text_model"):
+        # Idefics3 nests the text model at model.text_model
+        language_model = new_model.model.text_model
+        language_model_prefix = "model.text_model"
     else:
         language_model_prefix = "model"
         language_model = new_model.model
@@ -748,11 +794,13 @@ def set_additional_modules(new_model, quant_state_dict, config):
         # Qwen 3 VL visual embeddings
         set_embedding(new_model.model.visual.pos_embed, 'model.visual.pos_embed.weight', None, requires_grad=False)
 
-    norm_key = f"{language_model_prefix}.norm.weight"
+    # LFM2 calls its final norm embedding_norm
+    norm_name = "norm" if hasattr(language_model, "norm") else "embedding_norm"
+    norm_key = f"{language_model_prefix}.{norm_name}.weight"
     norm = quant_state_dict[norm_key]
     norm = _unwrap_tensor(norm)
     norm = torch.nn.Parameter(norm, requires_grad = False)
-    language_model.norm.weight = norm
+    getattr(language_model, norm_name).weight = norm
 
     # LM Head. For some models (e.g. Mistral3ForConditionalGeneration)
     # tie_word_embeddings can differ between config and text_config; prefer
@@ -793,7 +841,7 @@ def set_additional_modules(new_model, quant_state_dict, config):
         x for x in quant_state_dict.keys()
         if (
             any(x == n or x.startswith(n + ".") for n in exact_non_layered)
-            or not any(substr in x for substr in ("layers", "blocks", embed_tokens_key, norm_key, "lm_head", "mlp", "linear", "list"))
+            or not any(substr in x for substr in ("layers", "blocks", embed_tokens_key, norm_key, "lm_head", "mlp", "linear", "list", "connector"))
         )
     )
     print(f'Performing substitution for {additional_keys=}')
@@ -890,8 +938,23 @@ def finalize_huggingface_model(
                         f"Unsloth: skipped rotary_emb reinit for {module_name}: {rotary_reinit_error}"
                     )
             if hasattr(module, "rotary_pos_emb") and vision_config is not None:
-                head_dim = vision_config.hidden_size // vision_config.num_heads
-                module.rotary_pos_emb = module.rotary_pos_emb.__class__(head_dim//2).to(target_device)
+                # transformers 4 takes a positional dim, transformers 5 takes the vision
+                # config. Dispatch on the signature rather than guessing, since an int
+                # is silently accepted as a config. device= is deprecated in 5.18, so
+                # construct then move, and warn rather than abort on a signature we do
+                # not know.
+                rotary_class = module.rotary_pos_emb.__class__
+                try:
+                    if "config" in inspect.signature(rotary_class.__init__).parameters:
+                        new_rotary = rotary_class(vision_config)
+                    else:
+                        head_dim = vision_config.hidden_size // vision_config.num_heads
+                        new_rotary = rotary_class(head_dim//2)
+                    module.rotary_pos_emb = new_rotary.to(target_device)
+                except Exception as rotary_reinit_error:
+                    logger.warning(
+                        f"Unsloth: skipped rotary_pos_emb reinit for {module_name}: {rotary_reinit_error}"
+                    )
             if hasattr(module, "rotary_emb_local"):
                 if local_rope_config is None:
                     local_rope_config = deepcopy(text_config)
@@ -1017,11 +1080,35 @@ def get_model_layer_config(return_non_layered=True):
             "model.layers.{kk}.linear_attn.dt_bias",
             "model.layers.{kk}.linear_attn.A_log",
 
+            # LFM2
+            "model.layers.{kk}.self_attn.out_proj",
+            "model.layers.{kk}.conv.in_proj",
+            "model.layers.{kk}.conv.out_proj",
+            "model.layers.{kk}.conv.conv",
+            "model.layers.{kk}.feed_forward.w1",
+            "model.layers.{kk}.feed_forward.w2",
+            "model.layers.{kk}.feed_forward.w3",
+            "model.layers.{kk}.feed_forward.experts.gate_up_proj",
+            "model.layers.{kk}.feed_forward.experts.down_proj",
+            "model.layers.{kk}.feed_forward.gate.weight",
+            "model.layers.{kk}.feed_forward.expert_bias",
+
             # Gemma4 per-layer input modules
             "model.language_model.layers.{kk}.per_layer_input_gate",
             "model.language_model.layers.{kk}.per_layer_projection",
             "model.layers.{kk}.per_layer_input_gate",
             "model.layers.{kk}.per_layer_projection",
+
+            # Idefics3 text model
+            "model.text_model.layers.{kk}.self_attn.q_proj",
+            "model.text_model.layers.{kk}.self_attn.k_proj",
+            "model.text_model.layers.{kk}.self_attn.v_proj",
+            "model.text_model.layers.{kk}.self_attn.qkv_proj",
+            "model.text_model.layers.{kk}.self_attn.o_proj",
+            "model.text_model.layers.{kk}.mlp.gate_proj",
+            "model.text_model.layers.{kk}.mlp.up_proj",
+            "model.text_model.layers.{kk}.mlp.gate_up_proj",
+            "model.text_model.layers.{kk}.mlp.down_proj",
         },
         'layernorms': {
             "model.language_model.layers.{kk}.input_layernorm",
@@ -1059,9 +1146,21 @@ def get_model_layer_config(return_non_layered=True):
             "model.language_model.layers.{kk}.linear_attn.norm",
             "model.layers.{kk}.linear_attn.norm",
 
+            # LFM2
+            "model.layers.{kk}.operator_norm",
+            "model.layers.{kk}.ffn_norm",
+            "model.layers.{kk}.self_attn.q_layernorm",
+            "model.layers.{kk}.self_attn.k_layernorm",
+
             # Gemma4 per-layer input norm
             "model.language_model.layers.{kk}.post_per_layer_input_norm",
             "model.layers.{kk}.post_per_layer_input_norm",
+
+            # Idefics3
+            "model.text_model.layers.{kk}.input_layernorm",
+            "model.text_model.layers.{kk}.post_attention_layernorm",
+            "model.vision_model.encoder.layers.{kk}.layer_norm1",
+            "model.vision_model.encoder.layers.{kk}.layer_norm2",
         },
         'vision_layers': {
 
@@ -1137,6 +1236,15 @@ def get_model_layer_config(return_non_layered=True):
             "model.visual.blocks.{kk}.mlp.linear_fc1",
             "model.visual.blocks.{kk}.mlp.linear_fc2",
 
+            # Idefics3
+            "model.vision_model.encoder.layers.{kk}.self_attn.q_proj",
+            "model.vision_model.encoder.layers.{kk}.self_attn.k_proj",
+            "model.vision_model.encoder.layers.{kk}.self_attn.v_proj",
+            "model.vision_model.encoder.layers.{kk}.self_attn.qkv_proj",
+            "model.vision_model.encoder.layers.{kk}.self_attn.out_proj",
+            "model.vision_model.encoder.layers.{kk}.mlp.fc1",
+            "model.vision_model.encoder.layers.{kk}.mlp.fc2",
+
         },
         'additional_layers': {
             # Primarily for layers that are neither language decoder layers or vision transformer layers/blocks.
@@ -1156,6 +1264,9 @@ def get_model_layer_config(return_non_layered=True):
             # qwen 3 vl
             "model.visual.deepstack_merger_list.{kk}.linear_fc1",
             "model.visual.deepstack_merger_list.{kk}.linear_fc2",
+
+            # Idefics3
+            "model.connector.modality_projection.proj",
 
         },
         "non_layered_components":{
@@ -1202,6 +1313,11 @@ def get_model_layer_config(return_non_layered=True):
             "model.language_model.embed_tokens_per_layer",
             "model.language_model.per_layer_model_projection",
             "model.language_model.per_layer_projection_norm",
+
+            # Idefics3
+            "model.vision_model.embeddings.patch_embedding",
+            "model.vision_model.embeddings.position_embedding",
+            "model.vision_model.post_layernorm",
         }
     }
 
@@ -1219,33 +1335,41 @@ def get_model_type(config):
 def get_model_layer_counts(config):
     """Layer counts per model type (int for causal_lm, dict for VL models)."""
     model_type = get_model_type(config)
+    # get_model_type returns the vision name, so each branch matches both spellings.
+    text_config = getattr(config, "text_config", config)
+    vision_config = getattr(config, "vision_config", config)
 
-    if model_type == "mllama":
+    if model_type in ("mllama", "mllama_vision_model"):
         return {
-            "text_layers": getattr(config.text_config, "num_hidden_layers", 32),
-            "vision_layers": getattr(config.vision_config, "num_hidden_layers", 32),
-            "global_layers": getattr(config.vision_config, "num_global_layers", 8),
+            "text_layers": getattr(text_config, "num_hidden_layers", 32),
+            "vision_layers": getattr(vision_config, "num_hidden_layers", 32),
+            "global_layers": getattr(vision_config, "num_global_layers", 8),
         }
     elif model_type == "qwen2_5_vl":
         return {
             "text_layers": getattr(config, "num_hidden_layers", 32),
-            "vision_layers": getattr(config.vision_config, "depth", 32),
+            "vision_layers": getattr(vision_config, "depth", 32),
         }
-    elif model_type == "qwen3_vl":
+    elif model_type in ("qwen3_vl", "qwen3_vl_vision"):
         return {
             "text_layers": getattr(config, "num_hidden_layers", 36),
-            "vision_layers": getattr(config.vision_config, "depth", 27),
-            "deepstack_layers": getattr(config.vision_config, "deepstack_depth", 3),
+            "vision_layers": getattr(vision_config, "depth", 27),
+            "deepstack_layers": getattr(vision_config, "deepstack_depth", 3),
         }
-    elif model_type == "gemma4":
+    elif model_type in ("gemma4", "gemma4_vision", "gemma4_unified", "gemma4_unified_vision"):
         return {
-            "text_layers": getattr(config.text_config, "num_hidden_layers", 32),
-            "vision_layers": getattr(config.vision_config, "num_hidden_layers", 32),
+            "text_layers": getattr(text_config, "num_hidden_layers", 32),
+            "vision_layers": getattr(vision_config, "num_hidden_layers", 32),
         }
-    elif model_type == "gemma3":
+    elif model_type in ("gemma3", "siglip_vision_model"):
         return {
-            "text_layers": getattr(config.text_config, "num_hidden_layers", 32),
-            "vision_layers": getattr(config.vision_config, "num_hidden_layers", 32),
+            "text_layers": getattr(text_config, "num_hidden_layers", 32),
+            "vision_layers": getattr(vision_config, "num_hidden_layers", 32),
+        }
+    elif model_type in ("idefics3", "idefics3_vision"):
+        return {
+            "text_layers": getattr(text_config, "num_hidden_layers", 30),
+            "vision_layers": getattr(vision_config, "num_hidden_layers", 12),
         }
     else:
         # Standard causal LM
@@ -1467,7 +1591,7 @@ def extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_stat
 
             if layer_module is not None:
                 if "qkv" in layer_path:
-                    if model_type in ("qwen2_5_vl", "qwen3_vl", "qwen3_5"):
+                    if model_type in QWEN_VL_MERGED_QKV_TYPES:
                         # HF keeps merged qkv for these (qwen-2.5-vl, qwen-3-vl)
                         get_state_dict(layer_path, 0, state_dict, layer_module, slice_weights=False)
                     else:

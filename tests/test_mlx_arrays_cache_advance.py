@@ -302,9 +302,15 @@ def test_generate_batch_installs_before_it_generates(monkeypatch):
         def __init__(self, *args, **kwargs):
             pass
 
-        def generate(self, requests):
-            order.append("generate")
-            return []
+        def stream(self, requests):
+            order.append("stream")
+            for index in range(len(requests)):
+                yield engine.GenerationEvent(
+                    index = index,
+                    result = engine.GenerationResult(
+                        token_ids = [], text = "", logprobs = [], finish_reason = "stop",
+                    ),
+                )
 
     import contextlib
 
@@ -322,4 +328,4 @@ def test_generate_batch_installs_before_it_generates(monkeypatch):
         defaults=engine.GenerationDefaults(),
     )
 
-    assert order == ["install", "generate"]
+    assert order == ["install", "stream"]

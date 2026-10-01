@@ -109,9 +109,8 @@ def _install(monkeypatch, force_float32, patchers):
     for patcher in patchers:
         patcher()
 
-    # Guard against a vacuous run: patch_function() silently declines to patch when
-    # the upstream signature drifts, and then these tests would exercise stock
-    # transformers and pass no matter what the fix does.
+    # Guard against a vacuous run: patch_function() silently declines when the
+    # upstream signature drifts, leaving these tests on stock transformers.
     patched = {target for target in targets if target.forward is not before[target]}
     return patched
 
@@ -174,8 +173,8 @@ def test_forced_float32_mlp_float16_weights_are_bitwise_identical_to_pre_fix(for
 
     out = mlp(x)
 
-    # Pre-fix algorithm, inline: projections in fp16, upcast, act_fn and product in
-    # fp32, bare .to(torch.float16), down_proj.
+    # Pre-fix algorithm inline: fp16 projections, fp32 act_fn and product, bare
+    # .to(torch.float16), down_proj.
     gate_proj_out = mlp.gate_proj(x)
     up_proj_out = mlp.up_proj(x)
     gate_proj_fp32 = gate_proj_out.to(torch.float32)
@@ -259,8 +258,8 @@ def test_linear_boundary_dtype_reads_the_first_floating_point_projection_weight(
     bfloat16_module = _Projections(**{name: torch.nn.Linear(4, 4, bias = False, dtype = torch.bfloat16) for name in names})
     assert _linear_boundary_dtype(bfloat16_module, *names) == torch.bfloat16
 
-    # bitsandbytes 4bit keeps the base weight as a packed uint8 blob, which is not
-    # floating point: no weight answers, so leave the activation alone.
+    # bitsandbytes 4bit keeps the base weight as a packed uint8 blob: not floating
+    # point, so no weight answers and the activation is left alone.
     quantized_module = _Projections(**{name: _Projections(weight = torch.zeros(8, 1, dtype = torch.uint8)) for name in names})
     assert _linear_boundary_dtype(quantized_module, *names) is None
 
@@ -271,7 +270,6 @@ def test_linear_boundary_dtype_reads_the_first_floating_point_projection_weight(
     )
     assert _linear_boundary_dtype(mixed_module, *names) == torch.float32
 
-    # No projections at all, and projections explicitly set to None.
     assert _linear_boundary_dtype(_Projections(), *names) is None
     assert _linear_boundary_dtype(_Projections(**{name: None for name in names}), *names) is None
 
@@ -384,11 +382,10 @@ def test_to_boundary_dtype_casts_to_the_weight_dtype_and_is_identity_when_it_mat
     float32_activation = torch.randn(2, 3, dtype = torch.float32)
     float16_activation = torch.randn(2, 3, dtype = torch.float16)
 
-    # Matching dtype: exact same tensor object back, no copy, no numerics change.
+    # Matching dtype: same tensor object back, no copy.
     assert _to_boundary_dtype(float32_activation, torch.float32) is float32_activation
     assert _to_boundary_dtype(float16_activation, torch.float16) is float16_activation
 
-    # Mismatched dtype: moved onto the Linear's dtype.
     assert _to_boundary_dtype(float16_activation, torch.float32).dtype == torch.float32
     assert _to_boundary_dtype(float32_activation, torch.float16).dtype == torch.float16
     assert torch.equal(
@@ -478,16 +475,14 @@ def test_to_forced_output_dtype_defaults_to_float16_and_is_not_identity_on_none(
     """The whole distinction between the two helpers, asserted directly."""
     float32_reduction = torch.randn(2, 3, dtype = torch.float32)
 
-    # No weight answered: the forced output boundary is the old bare fp16 cast...
     assert _to_forced_output_dtype(float32_reduction, None).dtype == torch.float16
     assert torch.equal(
         _to_forced_output_dtype(float32_reduction, None),
         float32_reduction.to(torch.float16),
     )
-    # ...while the generic input helper is deliberately identity on None.
+    # The generic input helper is deliberately identity on None.
     assert _to_boundary_dtype(float32_reduction, None) is float32_reduction
 
-    # A weight that did answer still wins over the fp16 default.
     assert _to_forced_output_dtype(float32_reduction, torch.float32) is float32_reduction
     assert _to_forced_output_dtype(float32_reduction, torch.bfloat16).dtype == torch.bfloat16
 
@@ -569,8 +564,7 @@ def test_an_unquantized_weight_still_answers_and_the_skip_is_not_blanket(weight_
     assert getattr(module.q_proj.weight, "quant_state", None) is None
     assert _linear_boundary_dtype(module, *names) == weight_dtype
 
-    # A plain nn.Parameter has no `quant_state` attribute at all: getattr, not
-    # hasattr-then-read, so this stays a no-op on any non-bitsandbytes backend.
+    # A plain nn.Parameter has no `quant_state` at all: getattr, not hasattr-then-read.
     bare = _Projections(**{name: torch.nn.Parameter(torch.zeros(4, 4, dtype = weight_dtype))
                            for name in names})
     assert _linear_boundary_dtype(bare, *names) == weight_dtype

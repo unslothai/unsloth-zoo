@@ -33,13 +33,10 @@ def _install_shim():
     simulate_mlx_on_torch()
 
 
-# ---------------------------------------------------------------------------
-# 1. CCE end-to-end: forward + backward (autograd) match a numpy reference.
-# ---------------------------------------------------------------------------
 
 def _ce_reference(hidden, weight, targets, ignore_index=-100, softcap=0.0):
     """Numpy/torch reference for cross_entropy with optional logit softcap."""
-    logits = hidden @ weight.T  # (n, vocab)
+    logits = hidden @ weight.T
     if softcap > 0:
         logits = softcap * torch.tanh(logits / softcap)
     valid = targets != ignore_index
@@ -133,9 +130,6 @@ def test_cce_chunked_matches_unchunked():
                                    msg=f"mismatch at chunk_size={chunk_size}")
 
 
-# ---------------------------------------------------------------------------
-# 2. Dequantize: the affine helper round-trips correctly.
-# ---------------------------------------------------------------------------
 
 def test_dequantize_affine_roundtrip():
     """Construct a known-good packed weight and verify dequant."""
@@ -145,14 +139,14 @@ def test_dequantize_affine_roundtrip():
     # uint32, element 0 in the lowest bits.
     bits = 4
     group_size = 8
-    elements_per_word = 32 // bits  # = 8
+    elements_per_word = 32 // bits
 
     packed_value = 0
     for i, v in enumerate([0, 1, 2, 3, 4, 5, 6, 7]):
         packed_value |= v << (i * bits)
-    packed = torch.tensor([[packed_value]], dtype=torch.int32)  # shape (1, 1)
-    scales = torch.tensor([[2.0]])  # shape (1, 1) - per-group scale
-    biases = torch.tensor([[1.0]])  # shape (1, 1) - per-group bias
+    packed = torch.tensor([[packed_value]], dtype=torch.int32)
+    scales = torch.tensor([[2.0]])
+    biases = torch.tensor([[1.0]])
 
     out = dequantize_affine(packed, scales, biases, group_size=group_size, bits=bits)
     expected = torch.tensor([[0*2+1, 1*2+1, 2*2+1, 3*2+1, 4*2+1, 5*2+1, 6*2+1, 7*2+1]],
@@ -173,9 +167,6 @@ def test_dequantize_unsupported_mode_raises():
         )
 
 
-# ---------------------------------------------------------------------------
-# 3. mx.custom_function VJP cycle: forward + backward via torch.autograd.
-# ---------------------------------------------------------------------------
 
 def test_custom_function_forward_and_backward():
     """Define a simple square op with custom VJP; verify autograd traverses it."""
@@ -198,23 +189,16 @@ def test_custom_function_forward_and_backward():
     torch.testing.assert_close(x.grad, 2 * torch.tensor([1.0, 2.0, 3.0]))
 
 
-# ---------------------------------------------------------------------------
-# 4. mx.array isinstance contract that MLX trainer relies on.
-# ---------------------------------------------------------------------------
 
 def test_torch_tensor_is_mx_array():
     import mlx.core as mx
     t = torch.tensor([1.0, 2.0])
     assert isinstance(t, mx.array)
-    # Reverse contract: mx.array(...) returns torch.Tensor
     a = mx.array([1, 2, 3], dtype=mx.int32)
     assert isinstance(a, torch.Tensor)
     assert a.dtype == torch.int32
 
 
-# ---------------------------------------------------------------------------
-# 5. Tensor monkey-patches: .astype, .expand_dims, .at[].add
-# ---------------------------------------------------------------------------
 
 def test_tensor_astype():
     t = torch.tensor([1.0, 2.0])
@@ -233,7 +217,6 @@ def test_tensor_at_add_functional_update():
     t = torch.tensor([1.0, 2.0, 3.0, 4.0])
     out = t.at[1].add(10.0)
     torch.testing.assert_close(out, torch.tensor([1.0, 12.0, 3.0, 4.0]))
-    # Original unchanged
     torch.testing.assert_close(t, torch.tensor([1.0, 2.0, 3.0, 4.0]))
 
 
@@ -243,13 +226,9 @@ def test_tensor_at_set():
     torch.testing.assert_close(out, torch.tensor([99.0, 2.0, 3.0]))
 
 
-# ---------------------------------------------------------------------------
-# 6. multi-arg .transpose() = MLX permute semantics.
-# ---------------------------------------------------------------------------
 
 def test_transpose_multi_axis_is_permute():
     t = torch.zeros(2, 3, 4, 5)
-    # 4-axis transpose = full permute -> (5, 4, 3, 2)
     out = t.transpose(3, 2, 1, 0)
     assert out.shape == (5, 4, 3, 2)
 
@@ -261,7 +240,6 @@ def test_transpose_two_args_unchanged():
     assert out.shape == (3, 2, 4)
 
 
-# 7. logit_scale discovery/normalization feeding CCE loss selection.
 
 def _stub_model(where=None, value=None):
     class _Holder:
@@ -394,21 +372,17 @@ def test_dead_tie_flag_fails_closed_to_unknown():
     for src in ("flag_guarded", "flag_ref_calls_lm_head"):
         d = U.describe_output_head(_lm(nn, args_flag=True, head=head(), call_src=src))
         assert d.status == "tied" and d.path == "model.embed_tokens"
-    # False flag resolves the live head; no live head keeps the True flag tied.
     assert U.describe_output_head(
         _lm(nn, args_flag=False, head=head(), call_src="calls_lm_head")).status == "untied"
     assert U.describe_output_head(
         _lm(nn, args_flag=True, emb_name="tok_embeddings")).status == "tied"
-    # A non-bool truthy tie flag (int 1 or string "true"; from_dict does not
-    # coerce) is read by truthiness like the forward -> tied, not a fall-through
-    # to lm_head; a falsy value ("" / 0) stays untied.
+    # from_dict does not coerce, so a non-bool tie flag is read by truthiness like
+    # the forward: 1 / "true" are tied, "" stays untied, never a fall-through.
     for truthy in (1, "true"):
         assert U.describe_output_head(
             _lm(nn, args_flag=truthy, head=head(), call_src="flag_guarded")).status == "tied"
     assert U.describe_output_head(
         _lm(nn, args_flag="", head=head(), call_src="calls_lm_head")).status == "untied"
-    # A config-only truthy flag is read; with no resolvable anchor it fails
-    # closed to unknown, never falling through to a (dead) lm_head.
     cfg = _lm(nn, head=head(), call_src="calls_lm_head")
     cfg.model, cfg.config = nn.Module(), type("C", (), {"tie_word_embeddings": True})()
     assert U.describe_output_head(cfg).status == "unknown"
@@ -422,9 +396,8 @@ def test_is_lm_head_trainable_follows_descriptor_path():
     # fine-tuning: name segments used to miss it and drop the head gradient.
     assert U._is_lm_head_trainable(
         _lm(nn, tied_flag=True, emb_name="tok_embeddings")) is True
-    # Property-backed wrapper: language_model returns self, so the descriptor
-    # access path is not a registered prefix — module identity must still find
-    # the head in the parameter tree.
+    # Property-backed wrapper: language_model returns self, so the descriptor access
+    # path is not a registered prefix and module identity must find the head instead.
     class _PropWrapped(nn.Module):
         def __init__(self):
             super().__init__()
@@ -435,7 +408,6 @@ def test_is_lm_head_trainable_follows_descriptor_path():
             return self
 
     assert U._is_lm_head_trainable(_PropWrapped()) is True
-    # Unresolved head never reports trainable, even with an empty tree.
     unresolved = _lm(nn)
     unresolved.freeze()
     assert U._is_lm_head_trainable(unresolved) is False
@@ -464,8 +436,6 @@ def test_backboneless_text_model_selects_baseline_fallback(capsys):
 @pytest.mark.parametrize("case", ["no_embeddings", "no_backbone", "invalid_scale",
                                   "masked_tail_knob"])
 def test_vlm_cce_fallbacks_are_marked(case):
-    # Every VLM fallback path returns a loss fn carrying the eager marker,
-    # including the knob-table routes (invalid scale, masked-tail knob).
     from unsloth_zoo.mlx.utils import make_vlm_cce_loss_fn
 
     from unsloth_zoo.mlx import utils as U
@@ -551,7 +521,6 @@ def test_describe_output_head_evidence_ladder():
 
     nn = U.nn
     rows = [
-        # (model, status, path, candidate_path)
         (_lm(nn, head=nn.Linear(32, 96, bias=False)), "untied", "lm_head", None),
         # Helium-style dead lm_head + True flag -> tied via embedding
         (_lm(nn, args_flag=True, head=nn.Linear(32, 96, bias=False)),

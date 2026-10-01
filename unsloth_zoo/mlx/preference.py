@@ -1,15 +1,23 @@
 """MLX text preference tokenization, finite batching, and objectives."""
 
+import json
+import os
 import math
 import warnings
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.utils
 import numpy as np
 
+# Absolute, like the other cce imports in this package: transformers' remote-code walk
+# turns `from .cce.runtime_cce import x` into unsloth_zoo/mlx/cce.runtime_cce.py and dies
+# on the missing file. See tests/test_relative_imports_resolve.py.
+from unsloth_zoo.mlx.cce.runtime_cce import _apply_softcap, _chunk_matmul, _resolve_chunk_size
 from .utils import (
     _FiniteVisitMixin,
     _encode_mlx_prompt_completion,
@@ -23,6 +31,7 @@ from .utils import (
     _torch_randperm_order,
     collect_mlx_lora_adapter_tensors,
     encode_mlx_text,
+    is_mlx_dora_module,
     iter_mlx_lora_modules,
 )
 
@@ -627,7 +636,8 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
     __slots__ = (
         "_rows", "_schedule", "_normalizers", "_widths", "_cycle_length",
         "max_seq_length", "pad_id", "_shape_plan", "_visit_policy",
-        "_visit_seed", "_visit_epoch_cache",
+        "_visit_seed", "_visit_epoch_cache", "_cce_capacities", "_cce_kind",
+        "_reference",
     )
 
     def __init__(
@@ -640,9 +650,12 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
         self.max_seq_length = int(max_seq_length)
         self.pad_id = int(pad_id)
         self._shape_plan = None
+        self._cce_capacities = {}
+        self._cce_kind = "dpo"
         self._visit_policy = "identity"
         self._visit_seed = None
         self._visit_epoch_cache = None
+        self._reference = None
         self._widths = tuple(self._raw_width(batch) for batch in self._schedule)
 
     @property
@@ -661,17 +674,26 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
     def cycle_length(self):
         return self._cycle_length
 
+    @property
+    def reference_logps(self):
+        return self._reference
+
+    def set_reference_logps(self, table):
+        """Install ``(rows, 2)`` reference log probabilities, chosen then rejected."""
+        table = np.asarray(table, dtype=np.float32)
+        if table.shape != (len(self._rows), 2):
+            raise ValueError(
+                "Unsloth MLX DPO: the reference table must hold one (chosen, "
+                "rejected) pair per row."
+            )
+        self._reference = table
+
     def __len__(self):
         return len(self._schedule)
 
     def _raw_width(self, batch):
-        raw = max(
-            max(len(self._rows[index].chosen), len(self._rows[index].rejected))
-            for index in batch
-        )
-        return _finite_text_pad_width(
-            raw, pad_to_multiple=32, minimum_width=2,
-            max_seq_length=self.max_seq_length,
+        return _preference_width(
+            [self._rows[index] for index in batch], self.max_seq_length,
         )
 
     def batch_width(self, index):
@@ -691,6 +713,53 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
             raise ValueError("only exact or bucket shape plans can be installed")
         self._shape_plan = shape_plan
 
+    def configure_cce_compaction(self, enabled=True, *, kind="dpo"):
+        self._cce_capacities = {}
+        self._cce_kind = kind
+        if not enabled:
+            return
+        counts = {}
+        for index, row_indices in enumerate(self._schedule):
+            family = self.batch_family(index)
+            widths = {self.batch_width(index)}
+            if self._shape_plan is not None:
+                widths.add(self._shape_plan.endpoint_for(family, min(widths)))
+            for width in widths:
+                count = 0
+                for row_index in row_indices:
+                    row = self._rows[row_index]
+                    for branch, (values, prompt) in enumerate((
+                        (row.chosen, len(row.chosen_prompt_ids)),
+                        (row.rejected, len(row.rejected_prompt_ids)),
+                    )):
+                        start = 1 if kind == "orpo" and branch == 0 else max(1, prompt)
+                        count += max(0, min(len(values), width, self.max_seq_length) - start)
+                key = (family, width)
+                counts[key] = max(counts.get(key, 0), count)
+        for (family, width), count in counts.items():
+            capacity = max(256, ((count + 255) // 256) * 256)
+            if capacity < family[1][0][0] * (width - 1):
+                self._cce_capacities[family, width] = capacity
+
+    def prepare_cce_batch(self, index, batch):
+        width = batch[0].shape[1]
+        capacity = self._cce_capacities.get((self.batch_family(index), width))
+        if capacity is None:
+            return batch
+        selected = []
+        rows = [self._rows[i] for i in self._schedule[index]]
+        for branch in (0, 1):
+            for offset, row in enumerate(rows):
+                values, prompt = ((row.chosen, len(row.chosen_prompt_ids)) if branch == 0 else
+                                  (row.rejected, len(row.rejected_prompt_ids)))
+                end = min(len(values), width, self.max_seq_length)
+                start = 1 if self._cce_kind == "orpo" and branch == 0 else max(1, prompt)
+                selected.extend((offset + branch * len(rows)) * (width - 1) + step - 1
+                                for step in range(start, end))
+        indices = np.full(capacity, -1, dtype=np.int32)
+        indices[:len(selected)] = selected
+        return (*batch[:3], mx.array(indices), *batch[4:])
+
     def materialize(self, index, *, phase=None):
         indices = self._schedule[index]
         rows = [self._rows[item] for item in indices]
@@ -698,21 +767,16 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
         if self._shape_plan is not None and phase is not None:
             family = self.batch_family(index)
             width = self._shape_plan.endpoint_for(family, width)
-        batch = np.full((2 * len(rows), width), self.pad_id, dtype=np.int32)
-        lengths = np.zeros((2 * len(rows), 2), dtype=np.int32)
-        for offset, row in enumerate(rows):
-            for output_row, values, prompt_length in (
-                (offset, row.chosen, len(row.chosen_prompt_ids)),
-                (
-                    offset + len(rows), row.rejected,
-                    len(row.rejected_prompt_ids),
-                ),
-            ):
-                size = min(len(values), width)
-                batch[output_row, :size] = values[:size]
-                lengths[output_row] = (prompt_length, size)
-        return mx.array(batch), mx.array(lengths), mx.array(
-            self._normalizers[index], dtype=mx.int32,
+        batch, lengths = _pack_rows(rows, width, self.pad_id)
+        materialized = (
+            mx.array(batch), mx.array(lengths),
+            mx.array(self._normalizers[index], dtype=mx.int32),
+        )
+        if self._reference is None:
+            return materialized
+        held = self._reference[list(indices)]
+        return materialized + (
+            None, mx.array(np.concatenate([held[:, 0], held[:, 1]])),
         )
 
     def __getitem__(self, index):
@@ -720,6 +784,54 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
 
     def materialize_all(self):
         return [self[index] for index in range(len(self))]
+
+
+def _preference_width(rows, max_seq_length):
+    raw = max(max(len(row.chosen), len(row.rejected)) for row in rows)
+    return _finite_text_pad_width(
+        raw, pad_to_multiple=32, minimum_width=2, max_seq_length=max_seq_length,
+    )
+
+
+def _pack_rows(rows, width, pad_id):
+    batch = np.full((2 * len(rows), width), pad_id, dtype=np.int32)
+    lengths = np.zeros((2 * len(rows), 2), dtype=np.int32)
+    for offset, row in enumerate(rows):
+        for output_row, values, prompt_length in (
+            (offset, row.chosen, len(row.chosen_prompt_ids)),
+            (offset + len(rows), row.rejected, len(row.rejected_prompt_ids)),
+        ):
+            size = min(len(values), width)
+            batch[output_row, :size] = values[:size]
+            lengths[output_row] = (prompt_length, size)
+    return batch, lengths
+
+
+def precompute_reference_logps(plan, model, reference_policy, *, batch_size, scorer=None):
+    """Precompute reference logps per row of ``plan``; kernels round per chunk shape, so batch like the live forward."""
+    rows = plan.rows
+    batch_size = max(1, int(batch_size))
+    table = np.zeros((len(rows), 2), dtype=np.float32)
+    for start in range(0, len(rows), batch_size):
+        chunk = rows[start:start + batch_size]
+        batch, lengths = _pack_rows(
+            chunk, _preference_width(chunk, plan.max_seq_length), plan.pad_id,
+        )
+        batch, lengths = mx.array(batch), mx.array(lengths)
+        options = {}
+        # The live forward scores through CCE too; full logits would defeat it.
+        if scorer is not None and reference_policy.model is None:
+            mask = _response_mask(batch[:, 1:], lengths)
+            options["response_scorer"] = lambda model, batch, _lengths: -(
+                scorer(model, batch, mask > 0)[0] * mask
+            ).sum(axis=1)
+        logps = reference_policy.forward(model, batch, lengths, **options)
+        mx.eval(logps)
+        values = logps.tolist()
+        table[start:start + len(chunk), 0] = values[:len(chunk)]
+        table[start:start + len(chunk), 1] = values[len(chunk):]
+    plan.set_reference_logps(table)
+    return table
 
 
 def _window_normalizers(rows, schedule, cycle_length, grad_accum):
@@ -866,41 +978,59 @@ def _orpo_log_odds(chosen, rejected):
     return chosen_odds - rejected_odds
 
 
-def _orpo_terms(chosen, rejected):
-    return -_log_sigmoid(_orpo_log_odds(chosen, rejected))
-
-
-def make_orpo_loss_fn(beta=0.1):
-    """Create an ORPO loss with exact logical-window normalization."""
-    beta = float(beta)
-
-    def loss_fn(model, batch, lengths, normalizers):
-        targets = batch[:, 1:]
-        ce = nn.losses.cross_entropy(
-            _model_logits(model(batch[:, :-1])), targets, reduction="none",
-        ).reshape(targets.shape)
-        mask = _response_mask(targets, lengths)
-        response_logp = -(ce * mask).sum(axis=1) / mx.maximum(
-            mask.sum(axis=1), mx.array(1.0),
+def _require_kind(objective, kind):
+    if objective.kind != kind:
+        raise ValueError(
+            f"Unsloth MLX preference: the {kind.upper()} loss needs an "
+            f"objective of kind '{kind}', not '{objective.kind}'."
         )
-        pairs = batch.shape[0] // 2
-        nll_mask = (
-            mx.arange(1, targets.shape[1] + 1) < lengths[:pairs, 1:]
-        ).astype(mx.float32)
-        nll_sum = (ce[:pairs] * nll_mask).sum()
-        odds_sum = _orpo_terms(
-            response_logp[:pairs], response_logp[pairs:],
-        ).sum()
+
+
+def _require_reference(objective, reference_policy):
+    if objective.kind == "dpo" and not objective.reference_free \
+            and reference_policy is None:
+        raise ValueError(
+            "Unsloth MLX DPO: this objective scores against a reference "
+            "policy, but none was given. Pass one as reference_policy, or "
+            "build the objective with reference_free=True."
+        )
+
+
+def make_orpo_loss_fn(objective, *, _scorer=None):
+    """Create an ORPO loss with exact logical-window normalization."""
+    _require_kind(objective, "orpo")
+    beta = objective.beta
+
+    def loss_fn(model, batch, lengths, normalizers, cce_indices=None):
+        nll_sum, _batch_nll_tokens, ratio, stats = _orpo_scores(
+            model, batch, lengths, beta, scorer=_scorer, cce_indices=cce_indices,
+        )
         nll_tokens, window_pairs, window_microbatches = normalizers
         loss = window_microbatches.astype(mx.float32) * (
             nll_sum / mx.maximum(nll_tokens, mx.array(1)).astype(mx.float32)
-            + beta * odds_sum / mx.maximum(
+            - beta * ratio.sum() / mx.maximum(
                 window_pairs, mx.array(1),
             ).astype(mx.float32)
         )
-        return loss, mx.array(1, dtype=mx.int32)
+        return loss, mx.array(1, dtype=mx.int32), stats
 
     loss_fn._unsloth_supervised_tokens = _supervised_tokens
+    loss_fn._unsloth_preference_metrics = PREFERENCE_EVAL_METRICS["orpo"]
+    loss_fn._unsloth_preference_denominators = PREFERENCE_EVAL_DENOMINATORS["orpo"]
+    loss_fn._unsloth_preference_stats_width = PREFERENCE_EVAL_STATS_WIDTH["orpo"]
+    return loss_fn
+
+
+def make_orpo_cce_loss_fn(model, objective):
+    scorer = _make_preference_cce_scorer(model)
+    return _mark_cce_loss(make_orpo_loss_fn(objective, _scorer=scorer), scorer)
+
+
+def _mark_cce_loss(loss_fn, scorer):
+    if scorer is not None:
+        loss_fn._unsloth_cce_backend = "runtime-cce"
+        loss_fn._unsloth_cce_compaction = scorer.compaction
+        loss_fn._unsloth_cce_scorer = scorer
     return loss_fn
 
 
@@ -962,31 +1092,131 @@ class PreferenceRunContext:
                     setattr(module, name, value)
 
 
-class LoRAReferencePolicy:
-    """Temporarily expose the run's frozen base policy for one forward."""
+class ReferencePolicy:
+    """The policy a referenced DPO run scores against: its own model, or the policy under overrides."""
 
-    def __init__(self, modules, neftune_modules=()):
-        self.modules = tuple(modules)
+    def __init__(
+        self, *, model=None, scales=(), overrides=(), paths=(), mirrored=(),
+        neftune_modules=(),
+    ):
+        self.model = model
+        self.scales = tuple(scales)
+        self.targets = tuple((module, name) for module, name, _ in overrides)
+        self.values = [value for _, _, value in overrides]
+        # A snapshot syncs its first ``len(paths)`` values; a model syncs ``mirrored``.
+        self.paths = tuple(paths)
+        self.mirrored = tuple(mirrored)
         self.neftune_modules = tuple(neftune_modules)
+        self.released = False
 
-    def forward(self, model, batch, lengths):
-        scales = [module.scale for module in self.modules]
+    @property
+    def state(self):
+        """What a compiled step captures to read the reference afresh each call."""
+        return self.values if self.model is None else self.model.state
+
+    @contextmanager
+    def activate(self, model):
+        """Yield the module to score with; overrides sit on the owning module so they hold under a trace."""
+        if self.released:
+            raise RuntimeError(
+                "Unsloth MLX DPO: the reference was released once its log "
+                "probabilities were precomputed."
+            )
+        if self.model is not None:
+            yield self.model
+            return
+        saved_scales = [module.scale for module, _ in self.scales]
+        saved_values = [getattr(module, name) for module, name in self.targets]
         noise = [
             getattr(module, "_neftune_noise_enabled", True)
             for module in self.neftune_modules
         ]
         try:
-            for module in self.modules:
-                module.scale = 0.0
+            for module, scale in self.scales:
+                module.scale = scale
+            for (module, name), value in zip(self.targets, self.values):
+                setattr(module, name, value)
             for module in self.neftune_modules:
                 module._neftune_noise_enabled = False
-            values = _response_logps(model, batch, lengths)
-            return mx.stop_gradient(values)
+            yield model
         finally:
-            for module, scale in zip(self.modules, scales):
+            for (module, _), scale in zip(self.scales, saved_scales):
                 module.scale = scale
+            for (module, name), value in zip(self.targets, saved_values):
+                setattr(module, name, value)
             for module, enabled in zip(self.neftune_modules, noise):
                 module._neftune_noise_enabled = enabled
+
+    def forward(self, model, batch, lengths, *, response_scorer=None):
+        scorer = _response_logps if response_scorer is None else response_scorer
+        with self.activate(model) as reference:
+            return mx.stop_gradient(scorer(reference, batch, lengths))
+
+    def release(self):
+        """Drop a snapshot's arrays; a reference model is the caller's and stays."""
+        if self.model is None:
+            self.values.clear()
+            self.targets = ()
+        self.released = True
+
+    def _synced_tensor(self, index):
+        if self.model is None:
+            return self.values[index]
+        module, name = self.mirrored[index]
+        return getattr(module, name)
+
+    def _store_synced(self, index, value):
+        if self.model is None:
+            self.values[index] = value
+        else:
+            module, name = self.mirrored[index]
+            setattr(module, name, value)
+
+    def _require_synced(self):
+        if not self.paths:
+            raise RuntimeError("Unsloth MLX DPO: this reference does not sync.")
+
+    def sync(self, policy, alpha):
+        """In place ``(1 - alpha) * reference + alpha * policy``, mixed in float32."""
+        self._require_synced()
+        trainable = dict(mlx.utils.tree_flatten(policy.trainable_parameters()))
+        for index, path in enumerate(self.paths):
+            reference = self._synced_tensor(index)
+            value = (1.0 - alpha) * reference.astype(mx.float32) \
+                + alpha * trainable[path].astype(mx.float32)
+            value = value.astype(reference.dtype)
+            mx.eval(value)
+            self._store_synced(index, value)
+
+    def save(self, directory):
+        self._require_synced()
+        os.makedirs(directory, exist_ok=True)
+        mx.save_safetensors(
+            os.path.join(directory, "reference.safetensors"),
+            {path: self._synced_tensor(index) for index, path in enumerate(self.paths)},
+        )
+
+    def load(self, directory):
+        file = os.path.join(directory, "reference.safetensors")
+        if not os.path.isfile(file):
+            raise FileNotFoundError(
+                f"Unsloth MLX DPO: {directory!r} has no reference.safetensors; "
+                "a sync_ref_model run resumes its synced reference from it."
+            )
+        self._require_synced()
+        loaded = mx.load(file)
+        if set(loaded) != set(self.paths) or any(
+            tuple(loaded[path].shape) != tuple(self._synced_tensor(index).shape)
+            for index, path in enumerate(self.paths)
+        ):
+            raise ValueError(
+                "Unsloth MLX DPO: reference.safetensors does not match this "
+                "run's reference tensors."
+            )
+        for index, path in enumerate(self.paths):
+            restored = loaded[path].astype(self._synced_tensor(index).dtype)
+            mx.eval(restored)  # read now: mx.load is lazy and file-backed
+            self._store_synced(index, restored)
 
 
 def _response_logps(model, batch, lengths):
@@ -997,36 +1227,407 @@ def _response_logps(model, batch, lengths):
     return -(ce * _response_mask(targets, lengths)).sum(axis=1)
 
 
-def make_dpo_loss_fn(
-    *, beta=0.1, label_smoothing=0.0, reference_policy=None, reference_free=False,
-):
-    """Create sigmoid DPO with conservative preference-label smoothing."""
-    beta = float(beta)
-    epsilon = float(label_smoothing)
+# TRL's own warning list, narrower than the set that drops the value.
+_DPO_SMOOTHING_WARNINGS = frozenset({
+    "hinge", "ipo", "bco_pair", "sppo_hard", "nca_pair", "apo_zero", "apo_down",
+})
 
-    def loss_fn(model, batch, lengths, normalizers):
-        policy = _response_logps(model, batch, lengths)
-        pairs = batch.shape[0] // 2
-        if reference_free:
-            reference = mx.zeros(policy.shape, dtype=policy.dtype)
-        else:
-            reference = reference_policy.forward(model, batch, lengths)
-        logits = beta * (
-            (policy[:pairs] - policy[pairs:])
-            - (reference[:pairs] - reference[pairs:])
+# These rebuild from the raw reference logps, bypassing TRL's reference_free mask.
+_DPO_NEEDS_REFERENCE = frozenset({
+    "sppo_hard", "nca_pair", "aot_pair", "aot", "discopop",
+})
+
+_DPO_REFUSED = {
+    "bco_pair": (
+        "it subtracts a running mean of rewards carried across optimizer steps, "
+        "so its value would depend on micro-batch order and on what a "
+        "checkpoint happened to hold"
+    ),
+    "kto_pair": "TRL removed it from DPO training in favour of a KTO trainer",
+}
+
+
+@dataclass(frozen=True)
+class _DPOTerms:
+    """``delta`` uses TRL's subtraction grouping; regrouping shifts it in float32."""
+
+    chosen: object
+    rejected: object
+    ref_chosen: object
+    ref_rejected: object
+    chosen_ratio: object
+    rejected_ratio: object
+    delta: object
+
+
+def _dpo_smoothed_sigmoid(objective, delta):
+    scaled = objective.beta * delta
+    epsilon = objective.label_smoothing
+    return -(
+        (1.0 - epsilon) * _log_sigmoid(scaled) + epsilon * _log_sigmoid(-scaled)
+    )
+
+
+def _dpo_robust(objective, terms):
+    scaled = objective.beta * terms.delta
+    epsilon = objective.label_smoothing
+    return (
+        -_log_sigmoid(scaled) * (1.0 - epsilon) + _log_sigmoid(-scaled) * epsilon
+    ) / (1.0 - 2.0 * epsilon)
+
+
+def _dpo_exo_pair(objective, terms):
+    scaled = objective.beta * terms.delta
+    epsilon = objective.label_smoothing
+    return (
+        mx.sigmoid(scaled) * (_log_sigmoid(scaled) - math.log(1.0 - epsilon))
+        + mx.sigmoid(-scaled) * (_log_sigmoid(-scaled) - math.log(epsilon))
+    )
+
+
+def _dpo_hinge(objective, terms):
+    value = 1.0 - objective.beta * terms.delta
+    return mx.maximum(value, mx.array(0.0, dtype=value.dtype))
+
+
+def _dpo_ipo(objective, terms):
+    return (terms.delta - 1.0 / (2.0 * objective.beta)) ** 2
+
+
+def _dpo_sppo_hard(objective, terms):
+    half = 0.5 / objective.beta
+    return (terms.chosen_ratio - half) ** 2 + (terms.rejected_ratio + half) ** 2
+
+
+def _dpo_nca_pair(objective, terms):
+    chosen_rewards = terms.chosen_ratio * objective.beta
+    rejected_rewards = terms.rejected_ratio * objective.beta
+    return (
+        -_log_sigmoid(chosen_rewards)
+        - 0.5 * _log_sigmoid(-chosen_rewards)
+        - 0.5 * _log_sigmoid(-rejected_rewards)
+    )
+
+
+def _dpo_aot_pair(objective, terms):
+    return _dpo_smoothed_sigmoid(objective, (
+        mx.sort(terms.chosen_ratio, axis=0)
+        - mx.sort(terms.rejected_ratio, axis=0)
+    ))
+
+
+def _dpo_aot(objective, terms):
+    return _dpo_smoothed_sigmoid(objective, (
+        mx.sort(terms.chosen - terms.rejected, axis=0)
+        - mx.sort(terms.ref_chosen - terms.ref_rejected, axis=0)
+    ))
+
+
+def _dpo_apo_zero(objective, terms):
+    return (
+        1.0 - mx.sigmoid(objective.beta * terms.chosen_ratio)
+        + mx.sigmoid(objective.beta * terms.rejected_ratio)
+    )
+
+
+def _dpo_apo_down(objective, terms):
+    return (
+        mx.sigmoid(objective.beta * terms.chosen_ratio)
+        + 1.0 - mx.sigmoid(
+            objective.beta * (terms.chosen_ratio - terms.rejected_ratio)
         )
-        pair_loss = -(
-            (1.0 - epsilon) * _log_sigmoid(logits)
-            + epsilon * _log_sigmoid(-logits)
+    )
+
+
+def _dpo_discopop(objective, terms):
+    scaled = objective.beta * terms.delta
+    modulation = mx.sigmoid(scaled / objective.discopop_tau)
+    return (
+        -_log_sigmoid(scaled) * (1.0 - modulation)
+        + mx.exp(-scaled) * modulation
+    )
+
+
+_DPO_VARIANTS = {
+    "sigmoid": lambda objective, terms: _dpo_smoothed_sigmoid(
+        objective, terms.delta,
+    ),
+    "robust": _dpo_robust,
+    "exo_pair": _dpo_exo_pair,
+    "hinge": _dpo_hinge,
+    "ipo": _dpo_ipo,
+    "sppo_hard": _dpo_sppo_hard,
+    "nca_pair": _dpo_nca_pair,
+    "aot_pair": _dpo_aot_pair,
+    "aot": _dpo_aot,
+    "apo_zero": _dpo_apo_zero,
+    "apo_down": _dpo_apo_down,
+    "discopop": _dpo_discopop,
+}
+
+
+@dataclass(frozen=True)
+class PreferenceObjective:
+    kind: str
+    beta: float
+    label_smoothing: float = 0.0
+    loss_types: tuple = ("sigmoid",)
+    weights: tuple = (1.0,)
+    discopop_tau: float = 0.05
+    reference_free: bool = False
+
+    def __post_init__(self):
+        object.__setattr__(self, "loss_types", tuple(self.loss_types))
+        object.__setattr__(self, "weights", tuple(self.weights))
+        if self.kind not in ("dpo", "orpo"):
+            raise ValueError(
+                f"Unsloth MLX preference: unknown objective kind '{self.kind}'."
+            )
+        if not math.isfinite(self.beta) or self.beta < 0:
+            raise ValueError(
+                "Unsloth MLX preference: beta must be finite and non-negative, "
+                f"not {self.beta}."
+            )
+        if self.kind != "dpo":
+            return
+        if len(self.weights) != len(self.loss_types):
+            raise ValueError(
+                f"Unsloth MLX DPO: loss_weights has {len(self.weights)} entries "
+                f"for {len(self.loss_types)} loss types; they must be the same "
+                "length."
+            )
+        if not self.loss_types:
+            raise ValueError(
+                "Unsloth MLX DPO: loss_type must name at least one loss."
+            )
+        if not all(math.isfinite(weight) for weight in self.weights):
+            raise ValueError(
+                f"Unsloth MLX DPO: loss_weights must all be finite, not "
+                f"{list(self.weights)}."
+            )
+        for name in self.loss_types:
+            if name in _DPO_REFUSED:
+                raise ValueError(
+                    f"Unsloth MLX DPO: loss_type '{name}' is not supported "
+                    f"because {_DPO_REFUSED[name]}."
+                )
+            if name not in _DPO_VARIANTS:
+                raise ValueError(
+                    f"Unsloth MLX DPO: unknown loss_type '{name}'. Supported: "
+                    f"{', '.join(sorted(_DPO_VARIANTS))}."
+                )
+        if not 0 <= self.label_smoothing < 0.5:
+            # robust divides by 1 - 2 * it, so 0.5 is a division by zero.
+            raise ValueError(
+                "Unsloth MLX DPO: label_smoothing must be in [0, 0.5), not "
+                f"{self.label_smoothing}."
+            )
+        if self.label_smoothing == 0 and "exo_pair" in self.loss_types:
+            # exo_pair logs label_smoothing, undefined at zero. Floored here at
+            # config time; TRL mutates self.label_smoothing inside exo_pair's own
+            # branch, a state change that leaks into the other losses in the list.
+            object.__setattr__(self, "label_smoothing", 1e-3)
+        if "discopop" in self.loss_types and not 0 < self.discopop_tau < math.inf:
+            # discopop divides by it, and delta is zero at init, so 0 is NaN.
+            raise ValueError(
+                "Unsloth MLX DPO: discopop_tau must be finite and above zero, "
+                f"not {self.discopop_tau}."
+            )
+        unscorable = [
+            name for name in self.loss_types if name in _DPO_NEEDS_REFERENCE
+        ]
+        if self.reference_free and unscorable:
+            raise ValueError(
+                f"Unsloth MLX DPO: {', '.join(unscorable)} score against the "
+                "reference log probabilities themselves, which reference_free "
+                "never computes. Set reference_free=False, or pick a loss_type "
+                "that only reads the policy-minus-reference difference."
+            )
+
+    @property
+    def length_normalized(self):
+        """TRL divides before any variant runs, so ipo normalizes the whole list."""
+        return "ipo" in self.loss_types
+
+
+def resolve_preference_objective(
+    kind, *, beta, label_smoothing=0.0, loss_type="sigmoid",
+    loss_weights=None, discopop_tau=0.05, reference_free=False,
+):
+    beta = float(beta)
+    if kind == "orpo":
+        return PreferenceObjective(kind="orpo", beta=beta)
+    names = (loss_type,) if isinstance(loss_type, str) else tuple(loss_type)
+    if loss_weights is None:
+        weights = (1.0,) * len(names)
+    else:
+        weights = tuple(float(weight) for weight in loss_weights)
+    objective = PreferenceObjective(
+        kind=kind, beta=beta, label_smoothing=float(label_smoothing),
+        loss_types=names, weights=weights,
+        discopop_tau=float(discopop_tau), reference_free=bool(reference_free),
+    )
+    ignored = [name for name in names if name in _DPO_SMOOTHING_WARNINGS]
+    if float(label_smoothing) > 0 and ignored:
+        warnings.warn(
+            f"Unsloth MLX DPO: {', '.join(ignored)} ignore label_smoothing; "
+            "pass label_smoothing=0.0 to silence this.",
+            RuntimeWarning,
         )
+    return objective
+
+
+def _weighted_rewards(rewards, weights):
+    total = rewards * weights[0]
+    for weight in weights[1:]:
+        total = total + rewards * weight
+    return total
+
+
+def _dpo_pair_loss(objective, terms):
+    total = None
+    for name, weight in zip(objective.loss_types, objective.weights):
+        term = _DPO_VARIANTS[name](objective, terms) * weight
+        total = term if total is None else total + term
+    return total
+
+
+def make_dpo_loss_fn(objective, *, reference_policy=None, _scorer=None):
+    _require_kind(objective, "dpo")
+    _require_reference(objective, reference_policy)
+
+    def loss_fn(model, batch, lengths, normalizers, cce_indices=None, reference=None):
+        terms, stats = _dpo_scores(
+            model, batch, lengths, objective, reference_policy=reference_policy,
+            scorer=_scorer, cce_indices=cce_indices, reference=reference,
+        )
+        pair_loss = _dpo_pair_loss(objective, terms)
         _, window_pairs, window_microbatches = normalizers
         loss = window_microbatches.astype(mx.float32) * pair_loss.sum() / mx.maximum(
             window_pairs, mx.array(1),
         ).astype(mx.float32)
-        return loss, mx.array(1, dtype=mx.int32)
+        return loss, mx.array(1, dtype=mx.int32), stats
 
     loss_fn._unsloth_supervised_tokens = _supervised_tokens
+    loss_fn._unsloth_preference_metrics = PREFERENCE_EVAL_METRICS["dpo"]
+    loss_fn._unsloth_preference_denominators = PREFERENCE_EVAL_DENOMINATORS["dpo"]
+    loss_fn._unsloth_preference_stats_width = PREFERENCE_EVAL_STATS_WIDTH["dpo"]
     return loss_fn
+
+
+def _scatter_rows(values, indices, size):
+    values = mx.where(indices >= 0, values, mx.array(0, values.dtype))
+    return mx.zeros((size,), values.dtype).at[mx.maximum(indices, 0)].add(values)
+
+
+def _head_logit_sums(hidden, weight, scales, biases, quantization, softcap):
+    """Each row's logits summed over the vocabulary, one vocabulary chunk at a time.
+
+    Uncapped logits are linear in the head, so their sum projects onto the summed
+    weight rows; a softcap needs the logits themselves.
+    """
+    vocab = weight.shape[0]
+    # Without a softcap a chunk holds weight rows, not a row of logits per token.
+    step = _resolve_chunk_size(
+        0, hidden.shape[0] if softcap else hidden.shape[-1], vocab,
+    )
+    total = 0.0
+    for start in range(0, vocab, step):
+        chunk = [None if value is None else value[start:start + step]
+                 for value in (weight, scales, biases)]
+        if softcap:
+            logits = _chunk_matmul(hidden, chunk[0], scales=chunk[1], biases=chunk[2],
+                                   **quantization)
+            total = total + _apply_softcap(logits.astype(mx.float32), softcap).sum(axis=-1)
+        elif scales is not None:
+            total = total + mx.dequantize(*chunk, **quantization).astype(mx.float32).sum(axis=0)
+        else:
+            total = total + chunk[0].astype(mx.float32).sum(axis=0)
+    return total if softcap else hidden.astype(mx.float32) @ total
+
+
+def _make_preference_cce_scorer(model):
+    """Score preference positions from hidden states through runtime CCE.
+
+    Returns None unless the hidden states are reachable and the head is an
+    unwrapped, bias-free dense or frozen quantized projection.
+    """
+    from . import utils
+
+    tm = utils._get_text_model(model)
+    if getattr(tm, "model", None) is None and not utils._has_direct_hidden_stack(model):
+        return None
+    desc = utils.describe_output_head(model)
+    if utils._cce_head_ineligibility(desc) is not None:
+        return None
+    scale, problem = utils._detect_head_transform(model, desc.status)
+    softcap, softcap_problem = utils._detect_logit_softcap(model)
+    if problem is not None or softcap_problem is not None:
+        return None
+    quantization = {}
+    if desc.quantized:
+        # The quantized kernel returns no weight gradient.
+        if desc.module.trainable_parameters():
+            return None
+        quantization = dict(group_size=getattr(desc.module, "group_size", 64),
+                            bits=getattr(desc.module, "bits", 4),
+                            mode=getattr(desc.module, "mode", "affine"))
+    frozen = not utils._is_lm_head_trainable(model)
+    kernel = utils._get_runtime_cce(ignore_index=-100, logit_softcap=softcap,
+                                    quantized=desc.quantized, weight_is_frozen=frozen,
+                                    **quantization)
+
+    def score(model, batch, supervised, indices=None, *, every_position=False):
+        """Token cross entropy and logit sums per position, as float32 grids.
+
+        Cross entropy is zero outside ``supervised``. ``indices`` limits the
+        kernel to those rows, which then also limits the logit sums unless
+        ``every_position``.
+        """
+        targets = batch[:, 1:]
+        hidden = utils._forward_text_hidden_states(model, batch[:, :-1])
+        head = utils._resolve_module_path(model, desc.path)
+        # Before compaction: the logit sums below may read every row.
+        hidden = utils._rotate_head_input(head, hidden.reshape((-1, hidden.shape[-1])))
+        if scale is not None:
+            hidden = hidden * scale
+        labels = utils._normalize_cce_label_dtype(targets)
+        labels = mx.where(supervised, labels, mx.array(-100, labels.dtype))
+        rows, labels = utils._compact_cce_inputs(hidden, labels.reshape((-1,)), indices)
+        weight = mx.stop_gradient(head.weight) if frozen else head.weight
+        scales = biases = None
+        if desc.quantized:
+            scales, biases = head.scales, head.get("biases")
+            if biases is None and quantization["mode"] == "affine":
+                biases = mx.zeros_like(scales)
+            ce = kernel(rows, weight, scales, biases, labels)
+        else:
+            ce = kernel(rows, weight, labels)
+        summed = hidden if every_position or indices is None else rows
+        sums = _head_logit_sums(summed, weight, scales, biases, quantization, softcap)
+        if indices is not None:
+            ce = _scatter_rows(ce, indices, targets.size)
+            if summed is rows:
+                sums = _scatter_rows(sums, indices, targets.size)
+        return ce.reshape(targets.shape), mx.stop_gradient(sums.reshape(targets.shape))
+
+    score.vocab = desc.module.weight.shape[0]
+    score.compaction = score.vocab >= 8192
+    return score
+
+
+def _logit_totals(sums, mask, vocab):
+    pairs = sums.shape[0] // 2
+    sums = sums * mask
+    return (sums[:pairs].sum(), sums[pairs:].sum(),
+            mask[:pairs].sum() * vocab, mask[pairs:].sum() * vocab)
+
+
+def make_dpo_cce_loss_fn(model, objective, *, reference_policy=None):
+    scorer = _make_preference_cce_scorer(model)
+    return _mark_cce_loss(make_dpo_loss_fn(
+        objective, reference_policy=reference_policy, _scorer=scorer,
+    ), scorer)
 
 
 _SHARED_EVAL_METRICS = (
@@ -1050,39 +1651,112 @@ PREFERENCE_EVAL_METRICS = {
 }
 
 
+# An unscaled float16 vocabulary row sum overflows to inf, which the mask then
+# turns into NaN. This is the smallest normal float16, so undoing it is exact.
+_LOGIT_SUM_SCALE = 2.0 ** -14
+
+
+def _row_logit_sum(logits):
+    """Logit sum per position, accumulated in float32 by the matmul, not mx.sum."""
+    weights = mx.full(
+        (logits.shape[-1], 1), _LOGIT_SUM_SCALE, dtype = logits.dtype,
+    )
+    return (logits @ weights).astype(mx.float32).squeeze(-1) / _LOGIT_SUM_SCALE
+
+
 def _masked_logit_sum(logits, mask):
     """Logit sum over the response positions, and the count it divides by.
 
     Separate so the eval set's mean is taken over all of its positions at once.
     """
     kept = mask.sum() * logits.shape[-1]
-    # The float32 mask promotes the product, so this reduction is already exact.
-    return (logits * mask[..., None]).sum(), kept
+    return (_row_logit_sum(logits) * mask).sum(), kept
 
 
 def _orpo_logit_sum(logits):
-    """Logit sum over every position, and the count it divides by.
-
-    Cast before reducing: mx.sum accumulates in the input dtype, and a bf16
-    batch holds millions of logits, far past where an 8-bit mantissa stops
-    registering the next addend. Casting the result would already be too late.
-    """
-    return logits.astype(mx.float32).sum(), mx.array(float(math.prod(logits.shape)))
+    return _row_logit_sum(logits).sum(), mx.array(float(math.prod(logits.shape)))
 
 
-# Metric index -> index of the stats entry it is divided by. Anything absent is
-# a per-pair sum over the pair count. These are means over tokens, which no pair
-# count recovers once batches hold different numbers of them.
+_PREFERENCE_DENOMINATOR_NAMES = {
+    "dpo": ("chosen_logits", "rejected_logits", "pairs"),
+    "orpo": ("chosen_logits", "rejected_logits", "nll_tokens", "pairs"),
+}
+
+# Token means, unlike TRL, which weights per-micro-batch means equally and so
+# reports a number that moves with per_device_train_batch_size.
+_PREFERENCE_TOKEN_DENOMINATORS = {
+    "dpo": {
+        "logits/chosen": "chosen_logits",
+        "logits/rejected": "rejected_logits",
+    },
+    "orpo": {
+        "logits/chosen": "chosen_logits",
+        "logits/rejected": "rejected_logits",
+        "nll_loss": "nll_tokens",
+    },
+}
+
+
+def _preference_denominators(kind):
+    names = PREFERENCE_EVAL_METRICS[kind]
+    offsets = {
+        name: len(names) + offset
+        for offset, name in enumerate(_PREFERENCE_DENOMINATOR_NAMES[kind])
+    }
+    token_means = _PREFERENCE_TOKEN_DENOMINATORS[kind]
+    return {
+        index: offsets[token_means.get(name, "pairs")]
+        for index, name in enumerate(names)
+    }
+
+
 PREFERENCE_EVAL_DENOMINATORS = {
-    "dpo": {6: 8, 7: 9},
-    "orpo": {6: 11, 7: 12, 8: 13},
+    kind: _preference_denominators(kind) for kind in PREFERENCE_EVAL_METRICS
 }
 
 # Reported metrics, then the denominators the trainer sums alongside them.
 PREFERENCE_EVAL_STATS_WIDTH = {
-    kind: len(names) + len(PREFERENCE_EVAL_DENOMINATORS[kind])
+    kind: len(names) + len(_PREFERENCE_DENOMINATOR_NAMES[kind])
     for kind, names in PREFERENCE_EVAL_METRICS.items()
 }
+
+
+def _preference_stats(
+    kind, logits, mask, *, chosen, rejected, chosen_rewards, rejected_rewards,
+    extra=(), extra_denominators=(), logit_totals=None,
+):
+    """Numerators then denominators, all sums, so a window average is exact."""
+    pairs = chosen.shape[0]
+    # TRL is inconsistent between its trainers: DPOTrainer averages its logit
+    # metric over completion positions, ORPOTrainer over the whole sequence.
+    if logit_totals is not None:
+        chosen_logits, rejected_logits, chosen_count, rejected_count = logit_totals
+    elif kind == "orpo":
+        chosen_logits, chosen_count = _orpo_logit_sum(logits[:pairs])
+        rejected_logits, rejected_count = _orpo_logit_sum(logits[pairs:])
+    else:
+        chosen_logits, chosen_count = _masked_logit_sum(
+            logits[:pairs], mask[:pairs])
+        rejected_logits, rejected_count = _masked_logit_sum(
+            logits[pairs:], mask[pairs:])
+    values = [
+        chosen_rewards.sum(),
+        rejected_rewards.sum(),
+        (chosen_rewards > rejected_rewards).astype(mx.float32).sum(),
+        (chosen_rewards - rejected_rewards).sum(),
+        chosen.sum(),
+        rejected.sum(),
+        chosen_logits,
+        rejected_logits,
+        *extra,
+        chosen_count,
+        rejected_count,
+        *extra_denominators,
+        mx.array(float(pairs)),
+    ]
+    return mx.stop_gradient(
+        mx.stack([value.astype(mx.float32) for value in values])
+    )
 
 
 def _preference_forward(model, batch, lengths):
@@ -1095,90 +1769,125 @@ def _preference_forward(model, batch, lengths):
     return logits, ce, _response_mask(targets, lengths)
 
 
-def make_preference_eval_fn(
-    kind, *, beta=0.1, label_smoothing=0.0,
-    reference_policy=None, reference_free=False,
-):
+def _orpo_scores(model, batch, lengths, beta, *, scorer=None, cce_indices=None):
+    """Unreduced: training normalizes over its window, evaluation over the batch."""
+    pairs = batch.shape[0] // 2
+    nll_mask = (
+        mx.arange(1, batch.shape[1]) < lengths[:pairs, 1:]
+    ).astype(mx.float32)
+    logits = logit_totals = None
+    if scorer is None:
+        logits, ce, mask = _preference_forward(model, batch, lengths)
+    else:
+        mask = _response_mask(batch[:, 1:], lengths)
+        # The chosen NLL spans the whole sequence, not only the response.
+        supervised = mx.concatenate([nll_mask, mask[pairs:]]) > 0
+        ce, sums = scorer(model, batch, supervised, cce_indices, every_position=True)
+        logit_totals = _logit_totals(sums, mx.ones(sums.shape, mx.float32), scorer.vocab)
+    response_logp = -(ce * mask).sum(axis=1) / mx.maximum(
+        mask.sum(axis=1), mx.array(1.0),
+    )
+    chosen, rejected = response_logp[:pairs], response_logp[pairs:]
+    nll_tokens = nll_mask.sum()
+    nll_sum = (ce[:pairs] * nll_mask).sum()
+    log_odds = _orpo_log_odds(chosen, rejected)
+    ratio = _log_sigmoid(log_odds)
+    stats = _preference_stats(
+        "orpo", logits, mask, logit_totals=logit_totals,
+        chosen=chosen, rejected=rejected,
+        chosen_rewards=beta * chosen, rejected_rewards=beta * rejected,
+        extra=(nll_sum, ratio.sum(), log_odds.sum()),
+        extra_denominators=(nll_tokens,),
+    )
+    return nll_sum, nll_tokens, ratio, stats
+
+
+def _dpo_scores(model, batch, lengths, objective, *, reference_policy,
+                scorer=None, cce_indices=None, reference=None):
+    """Score one DPO batch; ``reference`` holds precomputed reference log probabilities."""
+    pairs = batch.shape[0] // 2
+    logits = logit_totals = None
+    if scorer is None:
+        logits, ce, mask = _preference_forward(model, batch, lengths)
+    else:
+        mask = _response_mask(batch[:, 1:], lengths)
+        ce, sums = scorer(model, batch, mask > 0, cce_indices)
+        logit_totals = _logit_totals(sums, mask, scorer.vocab)
+    logps = -(ce * mask).sum(axis=1)
+    if reference is not None:
+        reference = reference.astype(logps.dtype)
+    elif objective.reference_free:
+        reference = mx.zeros(logps.shape, dtype=logps.dtype)
+    elif scorer is not None and reference_policy.model is None:
+        def response_scorer(model, batch, _lengths):
+            return -(scorer(model, batch, mask > 0, cce_indices)[0] * mask).sum(axis=1)
+        reference = reference_policy.forward(model, batch, lengths, response_scorer=response_scorer)
+    else:
+        reference = reference_policy.forward(model, batch, lengths)
+    if objective.length_normalized:
+        counts = mx.maximum(mask.sum(axis=1), mx.array(1.0))
+        logps = logps / counts
+        reference = reference / counts
+    beta = objective.beta
+    chosen, rejected = logps[:pairs], logps[pairs:]
+    ref_chosen, ref_rejected = reference[:pairs], reference[pairs:]
+    # TRL adds the rewards once per loss entry, so a two-entry list reports twice
+    # a one-entry list; summed in its order, not scaled by the summed weights.
+    stats = _preference_stats(
+        "dpo", logits, mask, logit_totals=logit_totals,
+        chosen=chosen, rejected=rejected,
+        chosen_rewards=_weighted_rewards(
+            beta * (chosen - ref_chosen), objective.weights),
+        rejected_rewards=_weighted_rewards(
+            beta * (rejected - ref_rejected), objective.weights),
+    )
+    terms = _DPOTerms(
+        chosen=chosen, rejected=rejected,
+        ref_chosen=ref_chosen, ref_rejected=ref_rejected,
+        chosen_ratio=chosen - ref_chosen,
+        rejected_ratio=rejected - ref_rejected,
+        delta=(chosen - rejected) - (ref_chosen - ref_rejected),
+    )
+    return terms, stats
+
+
+def make_preference_eval_fn(objective, *, reference_policy=None, model=None):
     """Score one preference batch as ``(loss, pairs, stats)``.
 
     ``stats`` holds a numerator per metric in ``PREFERENCE_EVAL_METRICS[kind]``
     order, then the denominators ``PREFERENCE_EVAL_DENOMINATORS[kind]`` names.
-    Nothing is a per-batch mean: summing the vector across batches and dividing
-    each numerator by its own total averages the eval set exactly, however
-    unlike the batches are.
+    Nothing is a per-batch mean, so the eval set averages exactly.
     """
-    beta = float(beta)
-    epsilon = float(label_smoothing)
+    _require_reference(objective, reference_policy)
+    kind = objective.kind
+    beta = objective.beta
+    scorer = None if model is None else _make_preference_cce_scorer(model)
 
-    def eval_fn(model, batch, lengths, _normalizers=None):
-        logits, ce, mask = _preference_forward(model, batch, lengths)
+    def eval_fn(model, batch, lengths, _normalizers=None, cce_indices=None, reference=None):
         pairs = batch.shape[0] // 2
-        logps = -(ce * mask).sum(axis=1)
-        # TRL is not consistent between its trainers: DPOTrainer averages its
-        # logit metric over the completion positions only, ORPOTrainer over the
-        # whole sequence. Follow each, so either compares against its own run.
         if kind == "orpo":
-            chosen_logits, chosen_logit_count = _orpo_logit_sum(logits[:pairs])
-            rejected_logits, rejected_logit_count = _orpo_logit_sum(logits[pairs:])
-        else:
-            chosen_logits, chosen_logit_count = _masked_logit_sum(
-                logits[:pairs], mask[:pairs])
-            rejected_logits, rejected_logit_count = _masked_logit_sum(
-                logits[pairs:], mask[pairs:])
-        if kind == "orpo":
-            logps = logps / mx.maximum(mask.sum(axis=1), mx.array(1.0))
-        chosen, rejected = logps[:pairs], logps[pairs:]
-        if kind == "orpo":
-            nll_mask = (
-                mx.arange(1, batch.shape[1]) < lengths[:pairs, 1:]
-            ).astype(mx.float32)
-            nll_tokens = nll_mask.sum()
-            nll_sum = (ce[:pairs] * nll_mask).sum()
-            nll = nll_sum / mx.maximum(nll_tokens, mx.array(1.0))
-            log_odds = _orpo_log_odds(chosen, rejected)
-            ratio = _log_sigmoid(log_odds)
-            loss = nll - beta * ratio.mean()
-            chosen_rewards = beta * chosen
-            rejected_rewards = beta * rejected
-            extra = [nll_sum, ratio.sum(), log_odds.sum()]
-            denominators = [
-                chosen_logit_count, rejected_logit_count, nll_tokens,
-            ]
-        else:
-            if reference_free:
-                reference = mx.zeros(logps.shape, dtype=logps.dtype)
-            else:
-                reference = reference_policy.forward(model, batch, lengths)
-            margin = beta * (
-                (chosen - rejected) - (reference[:pairs] - reference[pairs:])
+            nll_sum, nll_tokens, ratio, stats = _orpo_scores(
+                model, batch, lengths, beta, scorer=scorer, cce_indices=cce_indices,
             )
-            loss = -(
-                (1.0 - epsilon) * _log_sigmoid(margin)
-                + epsilon * _log_sigmoid(-margin)
-            ).mean()
-            chosen_rewards = beta * (chosen - reference[:pairs])
-            rejected_rewards = beta * (rejected - reference[pairs:])
-            extra = []
-            denominators = [chosen_logit_count, rejected_logit_count]
-        stats = [
-            chosen_rewards.sum(),
-            rejected_rewards.sum(),
-            (chosen_rewards > rejected_rewards).astype(mx.float32).sum(),
-            (chosen_rewards - rejected_rewards).sum(),
-            chosen.sum(),
-            rejected.sum(),
-            chosen_logits,
-            rejected_logits,
-        ] + extra + denominators
-        return (
-            loss,
-            mx.array(pairs, dtype=mx.int32),
-            mx.stack([value.astype(mx.float32) for value in stats]),
-        )
+            loss = (
+                nll_sum / mx.maximum(nll_tokens, mx.array(1.0))
+                - beta * ratio.mean()
+            )
+        else:
+            terms, stats = _dpo_scores(
+                model, batch, lengths, objective,
+                reference_policy=reference_policy,
+                scorer=scorer, cce_indices=cce_indices, reference=reference,
+            )
+            loss = _dpo_pair_loss(objective, terms).mean()
+        return loss, mx.array(pairs, dtype=mx.int32), stats
 
     eval_fn._unsloth_preference_metrics = PREFERENCE_EVAL_METRICS[kind]
+    eval_fn._unsloth_cce_scorer = scorer
     eval_fn._unsloth_preference_denominators = PREFERENCE_EVAL_DENOMINATORS[kind]
     eval_fn._unsloth_preference_stats_width = PREFERENCE_EVAL_STATS_WIDTH[kind]
+    eval_fn._unsloth_cce_compaction = scorer is not None and scorer.compaction
+    eval_fn._unsloth_cce_kind = kind
     return eval_fn
 
 
@@ -1201,32 +1910,139 @@ def lora_modules_have_nonzero_delta(modules):
     )
 
 
-def build_reference_policy(model, *, reference_free, resume_provenance, neftune=()):
-    """Validate and construct the only supported referenced-DPO policy."""
+def _dora_base_magnitude(module):
+    """Base weight row norms, as set_linear / set_embedding set DoRA's magnitude."""
+    if hasattr(module, "_dequantized_weight"):
+        weight = module._dequantized_weight().astype(mx.float32)
+    elif hasattr(getattr(module, "embedding", None), "weight"):
+        weight = module.embedding.weight
+    else:
+        raise ValueError(
+            f"Unsloth MLX DPO: cannot recover the base magnitude of a "
+            f"{type(module).__name__}; its base weight is not where DoRALinear "
+            "or DoRAEmbedding keeps it."
+        )
+    return mx.linalg.norm(weight, axis=1).astype(module.m.dtype)
+
+
+def _adapter_carries_delta(modules, magnitudes):
+    return lora_modules_have_nonzero_delta(modules) or any(
+        not bool(mx.allclose(module.m, magnitude, rtol=1e-3))
+        for module, magnitude in magnitudes
+    )
+
+
+def _owner_of(by_name, parameter_path, *, of="the model"):
+    module_path, _, attribute = parameter_path.rpartition(".")
+    module = by_name.get(module_path)
+    if module is None:
+        raise ValueError(
+            f"Unsloth MLX DPO: the reference cannot stand in for "
+            f"{parameter_path!r}, which no module of {of} owns: a "
+            "parameter held in a list or dict is not supported for a "
+            "referenced run. Use reference_free=True."
+        )
+    return module, attribute
+
+
+def _reference_adapter_overrides(by_name, parameters, adapters, path, *, dora):
+    """Return a saved adapter's scale, its tensors as overrides, and their names."""
+    path = Path(path)
+    weights_file = path / "adapters.safetensors"
+    if not weights_file.is_file():
+        raise ValueError(
+            f"Unsloth MLX DPO: ref_adapter_name={str(path)!r} is not a saved "
+            "adapter directory: it has no adapters.safetensors."
+        )
+    tensors = mx.load(str(weights_file))
+    config_file = path / "adapter_config.json"
+    config = {}
+    if config_file.is_file():
+        with open(config_file, encoding="utf-8") as handle:
+            config = json.load(handle)
+    kind = config.get("fine_tune_type")
+    if kind in ("lora", "dora") and (kind == "dora") != dora:
+        raise ValueError(
+            f"Unsloth MLX DPO: the reference adapter is {kind} and this "
+            f"model's adapters are {'dora' if dora else 'lora'}; the reference "
+            "must adapt the same way."
+        )
+    lora_parameters = config.get("lora_parameters") or {}
+    # The adapter loader reads missing scale metadata as 1.0.
+    scale = float(lora_parameters.get("scale", config.get("scale", 1.0)))
+    missing = sorted(name for name in adapters if name not in tensors)
+    if missing:
+        raise ValueError(
+            f"Unsloth MLX DPO: the reference adapter lacks {len(missing)} of "
+            f"this model's {len(adapters)} adapter tensors, starting with "
+            f"{missing[0]!r}. The reference must adapt the same modules."
+        )
+    overrides = []
+    for name, value in parameters.items():
+        if name not in tensors:
+            continue
+        reference = tensors[name]
+        if tuple(reference.shape) != tuple(value.shape):
+            raise ValueError(
+                f"Unsloth MLX DPO: the reference adapter's {name!r} has shape "
+                f"{tuple(reference.shape)}, but this model's has "
+                f"{tuple(value.shape)}; its rank or layout differs."
+            )
+        module, attribute = _owner_of(by_name, name)
+        overrides.append((module, attribute, reference.astype(value.dtype)))
+    # mx.load is lazy and file-backed: read before the directory can change.
+    mx.eval(*(value for _, _, value in overrides))
+    unused = sorted(set(tensors) - set(parameters))
+    if unused:
+        warnings.warn(
+            f"Unsloth MLX DPO: the reference adapter names {len(unused)} "
+            "parameters this model does not have, and they are ignored "
+            f"(first: {unused[:3]}).",
+            RuntimeWarning, stacklevel=3,
+        )
+    return scale, overrides, set(tensors)
+
+
+def _snapshot_policy(by_name, trainable, *, neftune, synced, fixed=()):
+    """Hold every trainable tensor at the value given; ``fixed`` overrides never sync."""
+    return ReferencePolicy(
+        overrides=[
+            (*_owner_of(by_name, name), value) for name, value in trainable.items()
+        ] + list(fixed),
+        paths=list(trainable) if synced else (),
+        neftune_modules=neftune,
+    )
+
+
+def _check_provenance(resume_provenance, provenance):
+    if resume_provenance is not None and resume_provenance != provenance:
+        raise ValueError(
+            "Unsloth MLX DPO: the checkpoint reference provenance does not match "
+            "this model, adapter layout, or reference."
+        )
+
+
+def build_reference_policy(
+    model, *, reference_free, resume_provenance, neftune=(),
+    ref_adapter_name=None, model_adapter_name=None,
+    ref_model=None, force_use_ref_model=False, sync_ref_model=False,
+):
+    """Validate the reference and build its policy in TRL's order: ref_model, adapters off, start weights."""
     if reference_free:
         return None, {"kind": "reference_free"}
+    if model_adapter_name not in (None, "default"):
+        raise ValueError(
+            "Unsloth MLX DPO: model_adapter_name names one of several PEFT "
+            "adapters, and an MLX model carries a single unnamed adapter set, "
+            "which is the one trained. Leave it None; ref_adapter_name takes "
+            "the directory of the saved adapter to score against."
+        )
     named_modules = list(iter_mlx_lora_modules(model))
-    if not named_modules:
+    trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
+    if not trainable:
         raise ValueError(
-            "Unsloth MLX DPO: referenced training requires plain LoRA adapters. "
-            "Use reference_free=True for full fine-tuning."
-        )
-    if any(type(module).__name__.startswith("DoRA") for _, module in named_modules):
-        raise ValueError(
-            "Unsloth MLX DPO: referenced training does not support DoRA because "
-            "zeroing LoRA scale does not recover the initial policy."
-        )
-    adapters = sorted(collect_mlx_lora_adapter_tensors(model))
-    trainable = sorted(dict(mlx.utils.tree_flatten(model.trainable_parameters())))
-    if not trainable or not any(name in adapters for name in trainable):
-        raise ValueError(
-            "Unsloth MLX DPO: referenced training requires at least one "
-            "trainable LoRA adapter tensor."
-        )
-    if any(name not in adapters for name in trainable):
-        raise ValueError(
-            "Unsloth MLX DPO: referenced training requires LoRA-only trainable "
-            "parameters so the reference cannot drift."
+            "Unsloth MLX DPO: this model has no trainable parameters to "
+            "reference."
         )
     provenance = {
         "kind": "plain_lora_base",
@@ -1235,17 +2051,192 @@ def build_reference_policy(model, *, reference_free, resume_provenance, neftune=
         "base_commit": getattr(model, "_unsloth_base_commit_hash", None),
         "adapter_modules": [name for name, _ in named_modules],
     }
-    if resume_provenance is None:
-        if lora_modules_have_nonzero_delta([module for _, module in named_modules]):
+    if sync_ref_model:
+        # Absent from unsynced provenance, so earlier checkpoints still match.
+        provenance["synced"] = True
+        packed = [
+            name for name, value in trainable.items()
+            if not mx.issubdtype(value.dtype, mx.floating)
+        ]
+        if packed:
             raise ValueError(
-                "Unsloth MLX DPO: referenced training requires a fresh zero-delta "
-                "LoRA adapter or a checkpoint from this same run."
+                "Unsloth MLX DPO: sync_ref_model mixes each trainable tensor "
+                f"in float, and {packed[0]!r} is {trainable[packed[0]].dtype}: "
+                "a quantized weight cannot be mixed."
             )
-    elif resume_provenance != provenance:
-        raise ValueError(
-            "Unsloth MLX DPO: the checkpoint reference provenance does not match "
-            "this model and adapter layout."
+    if ref_model is not None:
+        if not hasattr(ref_model, "parameters"):
+            raise ValueError(
+                "Unsloth MLX DPO: ref_model must be a loaded MLX model, not "
+                f"{type(ref_model).__name__}; MLX DPO does not load a "
+                "reference from a model id."
+            )
+        if ref_model is model:
+            raise ValueError(
+                "Unsloth MLX DPO: model and ref_model cannot be the same "
+                "object. Load the reference separately, or pass ref_model=None."
+            )
+        if ref_adapter_name is not None:
+            raise ValueError(
+                "Unsloth MLX DPO: ref_model and ref_adapter_name each name a "
+                "reference; pass one of them."
+            )
+        if named_modules and not (force_use_ref_model or sync_ref_model):
+            warnings.warn(
+                "Unsloth MLX DPO: this model carries adapters, so its base is "
+                "already the reference and a ref_model doubles the memory. "
+                "Pass ref_model=None, or force_use_ref_model=True to score "
+                "against a different model without this warning.",
+                RuntimeWarning, stacklevel=2,
+            )
+        ref_model.eval()
+        mirrored = []
+        if sync_ref_model:
+            reference_tensors = dict(mlx.utils.tree_flatten(ref_model.parameters()))
+            ref_by_name = dict(ref_model.named_modules())
+            for name, value in trainable.items():
+                held = reference_tensors.get(name)
+                if (
+                    held is None or tuple(held.shape) != tuple(value.shape)
+                    or not mx.issubdtype(held.dtype, mx.floating)
+                ):
+                    raise ValueError(
+                        "Unsloth MLX DPO: sync_ref_model mixes each trainable "
+                        "tensor of the model into the same-named tensor of "
+                        f"ref_model, which has no floating {name!r} of shape "
+                        f"{tuple(value.shape)}. Load the reference the way the "
+                        "model is loaded, adapters included."
+                    )
+                mirrored.append(_owner_of(ref_by_name, name, of="ref_model"))
+        provenance.update(
+            kind="reference_model",
+            reference_repo=getattr(ref_model, "_hf_repo", None),
+            reference_commit=getattr(ref_model, "_unsloth_base_commit_hash", None),
         )
-    return LoRAReferencePolicy(
-        [module for _, module in named_modules], neftune,
+        _check_provenance(resume_provenance, provenance)
+        return ReferencePolicy(
+            model=ref_model, mirrored=mirrored,
+            paths=list(trainable) if sync_ref_model else (),
+        ), provenance
+    by_name = dict(model.named_modules())
+    if not named_modules:
+        if ref_adapter_name is not None:
+            raise ValueError(
+                "Unsloth MLX DPO: ref_adapter_name replaces this model's "
+                "adapter tensors, and a full fine-tune has none."
+            )
+        provenance["kind"] = "parameter_snapshot"
+        _check_provenance(resume_provenance, provenance)
+        return _snapshot_policy(
+            by_name, trainable, neftune=neftune, synced=sync_ref_model,
+        ), provenance
+    if sync_ref_model and ref_adapter_name is not None:
+        raise ValueError(
+            "Unsloth MLX DPO: sync_ref_model moves the reference toward the "
+            "policy, and a saved reference adapter is fixed. Pass ref_model "
+            "instead, as TRL's DPOTrainer requires for TR-DPO."
+        )
+    adapters = collect_mlx_lora_adapter_tensors(model)
+    if not any(name in adapters for name in trainable):
+        raise ValueError(
+            "Unsloth MLX DPO: referenced training requires at least one "
+            "trainable LoRA adapter tensor."
+        )
+    modules = [module for _, module in named_modules]
+    if ref_adapter_name is not None:
+        provenance["kind"] = "reference_adapter"
+        provenance["reference_adapter"] = os.path.normpath(str(ref_adapter_name))
+    _check_provenance(resume_provenance, provenance)
+    # Held at its start value, as PEFT restores modules_to_save.
+    extra = [name for name in trainable if name not in adapters]
+    reloaded = sorted(
+        name for name in getattr(model, "_unsloth_reloaded_parameter_keys", ())
+        if name not in adapters
+    )
+    magnitudes = [
+        (module, _dora_base_magnitude(module))
+        for module in modules if is_mlx_dora_module(module)
+    ]
+    delta = resume_provenance is None and _adapter_carries_delta(
+        modules, magnitudes,
+    )
+    trained = reloaded + (
+        [name for name in extra if name not in reloaded] if delta else []
+    )
+    if ref_adapter_name is None:
+        if sync_ref_model:
+            if delta or trained:
+                carried = (
+                    f"the loader restored trained tensors beside the adapter "
+                    f"(starting with {reloaded[0]!r})" if reloaded
+                    else "this model's adapter already carries a delta"
+                )
+                raise ValueError(
+                    "Unsloth MLX DPO: sync_ref_model starts the reference at "
+                    f"the base model, and {carried}. Pass ref_model=<a second "
+                    "load of the model, adapters included> to start the "
+                    "reference where the policy starts, as TRL's DPOTrainer "
+                    "requires for TR-DPO."
+                )
+            magnitude_paths = {
+                id(module): f"{name}.m" if name else "m"
+                for name, module in named_modules
+            }
+            base_magnitudes = {
+                magnitude_paths[id(module)]: magnitude
+                for module, magnitude in magnitudes
+                if magnitude_paths[id(module)] in trainable
+            }
+            return _snapshot_policy(
+                by_name, {**trainable, **base_magnitudes},
+                neftune=neftune, synced=True,
+                fixed=[
+                    (module, "m", magnitude)
+                    for module, magnitude in magnitudes
+                    if magnitude_paths[id(module)] not in trainable
+                ],
+            ), provenance
+        if trained:
+            raise ValueError(
+                "Unsloth MLX DPO: the model carries trained tensors no adapter "
+                f"owns (starting with {trained[0]!r}), so disabling the adapter "
+                "does not recover the base model. Pass ref_adapter_name=<a "
+                "saved copy of this adapter, such as the directory it was "
+                "loaded from> to score against the loaded policy, or "
+                "reference_free=True. A resumed run constructs the model from "
+                "its base and lets the checkpoint hydrate it."
+            )
+        scales = [(module, 0.0) for module in modules]
+        overrides = [(module, "m", magnitude) for module, magnitude in magnitudes]
+        if delta:
+            warnings.warn(
+                "Unsloth MLX DPO: the adapter already carries a delta, so the "
+                "reference is the base model with the adapter disabled, as "
+                "TRL's DPOTrainer scores it, not the policy this run starts "
+                "from. Pass ref_adapter_name=<saved adapter directory> to "
+                "score against the loaded adapter instead.",
+                RuntimeWarning, stacklevel=2,
+            )
+    else:
+        scale, overrides, named = _reference_adapter_overrides(
+            by_name, dict(mlx.utils.tree_flatten(model.parameters())),
+            adapters, ref_adapter_name,
+            dora=any(is_mlx_dora_module(module) for module in modules),
+        )
+        uncovered = [name for name in trained if name not in named]
+        if uncovered:
+            raise ValueError(
+                "Unsloth MLX DPO: the reference adapter lacks the trained "
+                f"tensors this model carries (starting with {uncovered[0]!r}), "
+                "so the reference would mix its adapter with this model's "
+                "trained weights."
+            )
+        scales = [(module, scale) for module in modules]
+    overridden = {(id(module), name) for module, name, _ in overrides}
+    for name in extra:
+        module, attribute = _owner_of(by_name, name)
+        if (id(module), attribute) not in overridden:
+            overrides.append((module, attribute, trainable[name]))
+    return ReferencePolicy(
+        scales=scales, overrides=overrides, neftune_modules=neftune,
     ), provenance
