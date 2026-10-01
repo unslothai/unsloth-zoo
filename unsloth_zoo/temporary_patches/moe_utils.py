@@ -3844,7 +3844,9 @@ def forward_native_grouped_mm(
     # bnb 4-bit) stacks runs in the half compute dtype, not float32. Only true float32 stacks stay float32.
     if hidden_states.dtype == torch.float32:
         _stack = self._parameters.get("gate_up_proj", self._parameters.get("gate_proj"))
-        if _stack is not None and _stack.dtype != torch.float32:
+        if _stack is not None and _stack.dtype in (torch.float16, torch.bfloat16):
+            hidden_states = hidden_states.to(_stack.dtype)
+        elif _stack is not None and _stack.dtype != torch.float32:
             hidden_states = hidden_states.to(moe_compute_dtype(hidden_states))
 
     # Routing: count tokens per expert, sort to group by expert, gather inputs.

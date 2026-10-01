@@ -54,7 +54,7 @@ def test_fp8_dequant_target_is_never_float32():
 def _fp8_experts(device):
     finegrained_fp8 = pytest.importorskip("transformers.integrations.finegrained_fp8")
     if not hasattr(finegrained_fp8, "FP8Experts"):
-        pytest.skip("FP8Experts is transformers 5")
+        pytest.skip(reason = "FP8Experts only exists in transformers 5")
     from transformers import PretrainedConfig
 
     config = PretrainedConfig()
@@ -115,7 +115,7 @@ def test_fp8_experts_dequantize_to_bf16_for_float32_activations_cpu(monkeypatch,
 @pytest.mark.parametrize("autocast", [True, False])
 def test_fp8_experts_use_bf16_grouped_mm_for_float32_activations(monkeypatch, autocast):
     if not moe_utils._check_torch_grouped_mm_supported():
-        pytest.skip("torch._grouped_mm unsupported on this GPU")
+        pytest.skip(reason = "torch._grouped_mm needs sm >= 8.0 and torch >= 2.8")
     calls = []
     real = torch._grouped_mm
 
@@ -205,3 +205,37 @@ def test_qwen4_exp_ple_keeps_bf16_under_cuda_autocast():
     # Training (autocast) computes PLE exactly as inference does: bf16 throughout.
     assert out.dtype == torch.bfloat16
     assert torch.equal(out, plain)
+
+
+@pytest.mark.gpu
+@needs_cuda
+def test_half_stack_float32_activation_keeps_the_stack_dtype(monkeypatch):
+    # Plain half stacks are not cast in the grouped_mm provider: a float32 activation must take the stack's
+    # dtype, even when autocast asks for the other half dtype (fp16 weights under bf16 autocast).
+    if not moe_utils._check_torch_grouped_mm_supported():
+        pytest.skip(reason = "torch._grouped_mm needs sm >= 8.0 and torch >= 2.8")
+    from transformers import Qwen3MoeConfig
+    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeExperts
+
+    config = Qwen3MoeConfig(hidden_size = FB, moe_intermediate_size = FB, num_experts = E, num_experts_per_tok = K)
+    torch.manual_seed(0)
+    experts = Qwen3MoeExperts(config).to("cuda", torch.float16)
+    with torch.no_grad():
+        for p in experts.parameters():
+            p.normal_(0, 0.05)
+    g = torch.Generator().manual_seed(1)
+    hidden = torch.randn(T, FB, generator = g).cuda()
+    top_k_index = torch.stack([torch.randperm(E, generator = g)[:K] for _ in range(T)]).cuda()
+    top_k_weights = torch.rand(T, K, generator = g).cuda()
+    calls = []
+    real = torch._grouped_mm
+
+    def spy(a, b, *args, **kwargs):
+        calls.append((a.dtype, b.dtype))
+        return real(a, b, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "_grouped_mm", spy)
+    with torch.no_grad(), torch.autocast("cuda", dtype = torch.bfloat16):
+        out = moe_utils.forward_native_grouped_mm(experts, hidden, top_k_index, top_k_weights)
+    assert calls and all(c == (torch.float16, torch.float16) for c in calls), calls
+    assert torch.isfinite(out).all()
