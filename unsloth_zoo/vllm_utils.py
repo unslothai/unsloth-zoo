@@ -1805,6 +1805,45 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
 pass
 
 
+def vllm_weights_memory_usage(config, load_in_4bit = False, load_in_8bit = False):
+    # Meta-device count, so MoE experts and vision towers are included; None if unbuildable.
+    import transformers
+    from accelerate import init_empty_weights
+    meta_model = None
+    for auto_class in ("AutoModelForImageTextToText", "AutoModelForCausalLM"):
+        auto_class = getattr(transformers, auto_class, None)
+        if auto_class is None: continue
+        try:
+            with init_empty_weights():
+                meta_model = auto_class.from_config(config)
+            break
+        except Exception:
+            continue
+    if meta_model is None: return None
+    try:
+        meta_model.tie_weights()
+    except Exception:
+        pass
+
+    quant_config = getattr(config, "quantization_config", None) or {}
+    if not isinstance(quant_config, dict): quant_config = quant_config.to_dict()
+    # Checkpoint keys say language_model.model.layers, modules model.language_model.layers.
+    def _norm(name):
+        return "." + ".".join(x for x in name.split(".") if x != "model") + "."
+    skip_modules = [_norm(x) for x in (quant_config.get("llm_int8_skip_modules", None) or [])]
+    # Same packing factors as approximate_vllm_memory_usage
+    quantized_bytes = 2 / (16/5) if load_in_4bit else 2 / (8/5) if load_in_8bit else 2
+
+    weight_bytes = 0
+    for name, param in meta_model.named_parameters():
+        quantized = param.ndim >= 2 and "embed" not in name and "lm_head" not in name \
+            and not any(module in _norm(name) for module in skip_modules)
+        weight_bytes += param.numel() * (quantized_bytes if quantized else 2)
+    del meta_model
+    return int(weight_bytes)
+pass
+
+
 def approximate_vllm_memory_usage(
     config,
     load_in_4bit = False,
@@ -1818,6 +1857,7 @@ def approximate_vllm_memory_usage(
     account_for_gradients = True,
     parallel_sequences = 64,
     cuda_graph_overhead = True,
+    weight_bytes = None,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Gets approximate max model length and max num sequences
@@ -1884,8 +1924,9 @@ def approximate_vllm_memory_usage(
     factor = 1
     if load_in_4bit: factor = 16/5
     elif load_in_8bit: factor = 8/5 # Very vague approximation. Will fix later
-    bytes_for_model = \
-        total_quantizable_elements / factor + total_float16_elements + lora_elements
+    if weight_bytes is None:
+        weight_bytes = total_quantizable_elements / factor + total_float16_elements
+    bytes_for_model = weight_bytes + lora_elements
 
     # KV cache size (float16 is 2 bytes. float8 is 1.25 bytes)
     float_bytes = 1.25 if float8_kv_cache else 2
@@ -2894,6 +2935,9 @@ def load_vllm(
         max_loras = max_loras,
         float8_kv_cache = float8_kv_cache,
         account_for_gradients = training,
+        weight_bytes = vllm_weights_memory_usage(
+            config, load_in_4bit = use_bitsandbytes, load_in_8bit = is_fp8,
+        ),
     )
 
     # Pre-flight warning: if KV cache headroom is very low with standby mode,
