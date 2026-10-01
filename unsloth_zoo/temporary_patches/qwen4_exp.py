@@ -64,9 +64,14 @@ _reference_ple_forward = None
 def qwen4_exp_ple_layer_forward(self, hidden_states, input_ids, past_key_values, conv_mask=None):
     # Compiler copies this source into its cache: use only `torch`, `self`, the arguments, the lazy import.
     from unsloth_zoo.temporary_patches.qwen4_exp import _reference_ple_forward
-    # Autocast's float32 gate `sum` would make the residual stream (and every later MoE input) float32.
+    # Autocast's float32 gate `sum` would make a half residual stream (and every later MoE input) float32.
+    # A float32 residual keeps autocast: it is what casts it for the half short convolution.
     device_type = hidden_states.device.type
-    if torch.amp.is_autocast_available(device_type) and torch.is_autocast_enabled(device_type):
+    if (
+        hidden_states.dtype in (torch.bfloat16, torch.float16)
+        and torch.amp.is_autocast_available(device_type)
+        and torch.is_autocast_enabled(device_type)
+    ):
         with torch.autocast(device_type, enabled=False):
             output = _reference_ple_forward(self, hidden_states, input_ids, past_key_values, conv_mask=conv_mask)
     else:

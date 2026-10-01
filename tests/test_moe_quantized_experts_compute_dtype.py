@@ -238,3 +238,13 @@ def test_half_stack_float32_activation_keeps_the_stack_dtype(monkeypatch):
         out = moe_utils.forward_native_grouped_mm(experts, hidden, top_k_index, top_k_weights)
     assert calls and all(c == (torch.float16, torch.float16) for c in calls), calls
     assert torch.isfinite(out).all()
+
+
+@pytest.mark.gpu
+@needs_cuda
+@needs_qwen4_exp
+def test_qwen4_exp_ple_float32_residual_keeps_autocast():
+    ple, hidden, input_ids = _ple_layer("cuda")
+    with torch.no_grad(), torch.autocast("cuda", dtype = torch.bfloat16):
+        out = ple(hidden.float(), input_ids, None)
+    assert out.dtype == torch.float32
