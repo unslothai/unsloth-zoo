@@ -67,13 +67,13 @@ class TestCapability:
 
     def test_declines_where_unsupported(self):
         if capability.is_supported():
-            pytest.skip("int8 path is supported here; the negative case cannot be shown")
+            pytest.skip(reason="int8 path is supported here; the negative case cannot be shown")
         assert capability.is_supported() is False
         assert capability.reason()  # always explains itself, whatever the layer
 
     def test_enable_is_a_noop_when_unsupported(self, make_ql):
         if capability.is_supported():
-            pytest.skip("int8 path is supported here")
+            pytest.skip(reason="int8 path is supported here")
         assert int8_prefill.enable() is False
         assert int8_prefill.is_enabled() is False
         assert mx.quantized_matmul is patch._ORIG_QMM
@@ -81,7 +81,7 @@ class TestCapability:
     def test_model_forward_bit_identical_when_unsupported(self, quantized_model):
         """The whole no-op promise in one assertion."""
         if capability.is_supported():
-            pytest.skip("int8 path is supported here")
+            pytest.skip(reason="int8 path is supported here")
         x = mx.random.normal((ROW_THRESHOLD, 1024)).astype(mx.bfloat16)
         before = quantized_model(x)
         mx.eval(before)

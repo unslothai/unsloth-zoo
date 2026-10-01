@@ -53,7 +53,7 @@ MAX_OUT = 32768
 _SUPPORTED_4BIT = {(4, 32), (4, 64), (4, 128)}
 
 # Affine 8-bit is off by default and this is not conservatism, it is arithmetic. See
-# plans/sparkling-popping-kay.md: requantizing affine-8 to symmetric int8 has zero bits
+# the scales.py docstring: requantizing affine-8 to symmetric int8 has zero bits
 # of headroom, so any channel whose inter-group range ratio exceeds ~1.2 comes out
 # strictly worse than the 8-bit weights it started from. At 4 bits the same requant has
 # roughly 16x of cushion, which is the only reason this technique works at all.

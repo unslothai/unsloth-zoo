@@ -36,7 +36,8 @@ Environment:
     UNSLOTH_MLX_INT8_BACKEND=metal_mpp|portable
     UNSLOTH_MLX_INT8_ROW_THRESHOLD=512   below this, calls keep MLX's kernels
     UNSLOTH_MLX_INT8_ALLOW_8BIT=1        affine 8-bit (off by default, see eligibility)
-    UNSLOTH_MLX_INT8_EXACT_SCALES=1      exact absmax instead of the analytic bound
+    UNSLOTH_MLX_INT8_ROTATE=0            skip the block Walsh-Hadamard rotation (on by default)
+    UNSLOTH_MLX_INT8_EXACT_SCALES=1      exact absmax instead of the analytic bound (unrotated only)
     UNSLOTH_MLX_INT8_VERIFY=1            shadow mode: log max relative error per call
 """
 

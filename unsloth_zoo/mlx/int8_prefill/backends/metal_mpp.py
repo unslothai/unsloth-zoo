@@ -27,7 +27,9 @@
 #   * the bias epilogue is gone -- patching at op level means the caller adds bias after
 #     the matmul, halving the GEMM variants we compile;
 #   * the GEMM emits int32 so callers can compare it exactly against an integer
-#     reference; scale application moved out to the caller.
+#     reference; scale application moved out to the caller;
+#   * both operands can be rotated by a block-diagonal Walsh-Hadamard matrix before they
+#     are quantized (see scales.py), which the original does not do.
 """Metal kernels for the W8A8 int8 prefill path.
 
 Only `int8_gemm` needs Metal Performance Primitives (Metal 4, and the int8 arithmetic
@@ -40,9 +42,25 @@ the likeliest place for a silent wrong-answer bug, and that Linux cannot check a
 import mlx.core as mx
 
 # Ordinary Metal. No MPP, so these compile on any Metal device.
+#
+# unsloth_i8_wht_lanes: the cross-lane stages of an unnormalized Walsh-Hadamard butterfly
+# in Sylvester order, strides 1 .. LANES/2 in lane units. The pair (a, b) at lanes
+# (l, l ^ h) becomes (a + b, a - b), so the lane holding b computes o - v. Callers keep
+# every lane of a LANES-wide block active, since a shuffle from an inactive lane is
+# undefined.
 _PLAIN_HEADER = """
 #include <metal_stdlib>
 using namespace metal;
+
+template <int LANES>
+inline float unsloth_i8_wht_lanes(float v, uint lane) {
+#pragma unroll
+    for (ushort h = 1; h < LANES; h <<= 1) {
+        float o = simd_shuffle_xor(v, h);
+        v = (lane & h) ? (o - v) : (v + o);
+    }
+    return v;
+}
 """
 
 # Metal 4 tensor ops. Compiling this at all requires macOS 26+; running it usefully
@@ -55,9 +73,16 @@ using namespace metal;
 """
 
 # One threadgroup (256 threads) per row: absmax reduce, then quantize.
+#
+# With ROT = 32, element i sits at position i % 32 = lane of its rotation block (the loop
+# stride is a multiple of 32), so one simdgroup holds exactly one block and rotates it with
+# five shuffles. K % 32 == 0 means a simdgroup is either wholly inside the row or wholly
+# past it. The rotation is recomputed in the second pass rather than staged, because a row
+# can be far larger than threadgroup memory.
 _QUANT_SRC = """
     constexpr int K = {K};
     constexpr int NTH = 256;
+    constexpr int ROT = {ROT};
 
     uint row = threadgroup_position_in_grid.x;
     uint tid = thread_position_in_threadgroup.x;
@@ -68,7 +93,9 @@ _QUANT_SRC = """
 
     float amax = 0.0f;
     for (int i = tid; i < K; i += NTH) {{
-        amax = max(amax, fabs(float(xrow[i])));
+        float v = float(xrow[i]);
+        if (ROT) v = unsloth_i8_wht_lanes<32>(v, lane);
+        amax = max(amax, fabs(v));
     }}
     amax = simd_max(amax);
 
@@ -84,7 +111,9 @@ _QUANT_SRC = """
 
     device int8_t* qrow = xq + size_t(row) * K;
     for (int i = tid; i < K; i += NTH) {{
-        qrow[i] = int8_t(clamp(rint(float(xrow[i]) * inv), -127.0f, 127.0f));
+        float v = float(xrow[i]);
+        if (ROT) v = unsloth_i8_wht_lanes<32>(v, lane);
+        qrow[i] = int8_t(clamp(rint(v * inv), -127.0f, 127.0f));
     }}
 """
 
@@ -94,15 +123,23 @@ _QUANT_SRC = """
 # VPW values per uint32 word and WPG words per group are both integral for every
 # (bits, group_size) the eligibility table admits, so a word never straddles two groups
 # and the group index is a plain division.
+#
+# With ROT = 32 a rotation block is LPB = 32 / VPW consecutive words, i.e. LPB consecutive
+# lanes (the loop stride is a multiple of LPB). Each thread runs the butterfly stages
+# inside its word, then the stages across the block's lanes. KW % LPB == 0 because
+# K % 32 == 0, so a block's lanes are all active together.
 _REQUANT_SRC = """
     constexpr int KW = {KW};     // packed words per row
     constexpr int VPW = {VPW};   // values per word (32 / bits)
     constexpr int WPG = {WPG};   // words per group (group_size / VPW)
     constexpr int BITS = {BITS};
     constexpr uint MASK = {MASK}u;
+    constexpr int ROT = {ROT};
+    constexpr int LPB = ROT ? ROT / VPW : 1;
 
     uint row = threadgroup_position_in_grid.x;
     uint tid = thread_position_in_threadgroup.x;
+    uint lane = tid % 32;
 
     const device uint* prow = packed + size_t(row) * KW;
     const device {T}* srow = scales + size_t(row) * (KW / WPG);
@@ -117,10 +154,32 @@ _REQUANT_SRC = """
         float s = float(srow[g]);
         float b = float(brow[g]);
         device int8_t* o = orow + i * VPW;
+        float v[VPW];
 #pragma unroll
         for (int j = 0; j < VPW; ++j) {{
-            float v = float((wrd >> (BITS * j)) & MASK) * s + b;
-            o[j] = int8_t(clamp(rint(v * inv), -127.0f, 127.0f));
+            v[j] = float((wrd >> (BITS * j)) & MASK) * s + b;
+        }}
+        if (ROT) {{
+#pragma unroll
+            for (int h = 1; h < VPW; h <<= 1) {{
+#pragma unroll
+                for (int j = 0; j < VPW; ++j) {{
+                    if ((j & h) == 0) {{
+                        float a = v[j];
+                        float c = v[j + h];
+                        v[j] = a + c;
+                        v[j + h] = a - c;
+                    }}
+                }}
+            }}
+#pragma unroll
+            for (int j = 0; j < VPW; ++j) {{
+                v[j] = unsloth_i8_wht_lanes<LPB>(v[j], lane);
+            }}
+        }}
+#pragma unroll
+        for (int j = 0; j < VPW; ++j) {{
+            o[j] = int8_t(clamp(rint(v[j] * inv), -127.0f, 127.0f));
         }}
     }}
 """
@@ -187,29 +246,30 @@ _requant_kernels = {}
 _gemm_kernels = {}
 
 
-def _quant_kernel(k, tname):
-    key = (k, tname)
+def _quant_kernel(k, tname, rot):
+    key = (k, tname, rot)
     if key not in _quant_kernels:
         _quant_kernels[key] = mx.fast.metal_kernel(
-            name=f"unsloth_i8_rowquant_{k}_{tname}",
+            name=f"unsloth_i8_rowquant_{k}_{tname}_r{rot}",
             input_names=["x"],
             output_names=["xq", "xs"],
             header=_PLAIN_HEADER,
-            source=_QUANT_SRC.format(K=k, T=tname),
+            source=_QUANT_SRC.format(K=k, T=tname, ROT=rot),
         )
     return _quant_kernels[key]
 
 
-def _requant_kernel(kw, vpw, wpg, bits, tname):
-    key = (kw, vpw, wpg, bits, tname)
+def _requant_kernel(kw, vpw, wpg, bits, tname, rot):
+    key = (kw, vpw, wpg, bits, tname, rot)
     if key not in _requant_kernels:
         _requant_kernels[key] = mx.fast.metal_kernel(
-            name=f"unsloth_i8_requant_{kw}_{bits}_{wpg}_{tname}",
+            name=f"unsloth_i8_requant_{kw}_{bits}_{wpg}_{tname}_r{rot}",
             input_names=["packed", "scales", "biases", "ws"],
             output_names=["out"],
             header=_PLAIN_HEADER,
             source=_REQUANT_SRC.format(
-                KW=kw, VPW=vpw, WPG=wpg, BITS=bits, MASK=(1 << bits) - 1, T=tname
+                KW=kw, VPW=vpw, WPG=wpg, BITS=bits, MASK=(1 << bits) - 1, T=tname,
+                ROT=rot,
             ),
         )
     return _requant_kernels[key]
@@ -233,10 +293,11 @@ def build_probe_kernel(N, K):
     return _gemm_kernel(N, K)
 
 
-def quantize_rows(x):
-    """Per-row symmetric int8 activation quantization. Returns (xq int8, xs float32)."""
+def quantize_rows(x, rot=0):
+    """Per-row symmetric int8 activation quantization, after the block Walsh-Hadamard
+    rotation when `rot` is nonzero. Returns (xq int8, xs float32)."""
     m, k = x.shape
-    return _quant_kernel(k, _DTYPE_NAMES[x.dtype])(
+    return _quant_kernel(k, _DTYPE_NAMES[x.dtype], rot)(
         inputs=[x],
         grid=(m * 256, 1, 1),
         threadgroup=(256, 1, 1),
@@ -245,12 +306,13 @@ def quantize_rows(x):
     )
 
 
-def requantize_weight(weight, scales, biases, ws, bits, group_size):
-    """Packed affine weights -> per-channel symmetric int8 [N, K], fused."""
+def requantize_weight(weight, scales, biases, ws, bits, group_size, rot=0):
+    """Packed affine weights -> per-channel symmetric int8 [N, K], fused, rotated like the
+    activations when `rot` is nonzero."""
     n, kw = weight.shape[-2:]
     vpw = 32 // bits
     wpg = group_size // vpw
-    kernel = _requant_kernel(kw, vpw, wpg, bits, _DTYPE_NAMES[scales.dtype])
+    kernel = _requant_kernel(kw, vpw, wpg, bits, _DTYPE_NAMES[scales.dtype], rot)
     return kernel(
         inputs=[weight, scales, biases, ws],
         grid=(n * 256, 1, 1),
@@ -277,10 +339,13 @@ def matmul(x, entry, out_dtype=mx.bfloat16):
     """Full W8A8 path for a registered weight."""
     k = x.shape[-1]
     flat = x.reshape(-1, k)
-    xq, xs = quantize_rows(flat)
+    xq, xs = quantize_rows(flat, entry.rot)
     wq = requantize_weight(
-        entry.w, entry.scales, entry.biases, entry.ws, entry.bits, entry.group_size
+        entry.w, entry.scales, entry.biases, entry.ws, entry.bits, entry.group_size,
+        entry.rot,
     )
     acc = int8_gemm_raw(xq, wq)
     out = acc.astype(mx.float32) * xs[:, None] * entry.ws[None, :]
+    if entry.rot:
+        out = out * (1.0 / entry.rot)
     return out.astype(out_dtype).reshape(*x.shape[:-1], entry.n)

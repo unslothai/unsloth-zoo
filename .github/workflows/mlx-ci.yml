@@ -321,41 +321,57 @@ jobs:
 
       - name: int8 prefill Metal kernels vs reference
         # The two MetalPerformancePrimitives-free kernels, checked against the plain-MLX
-        # implementations of the same arithmetic. A tolerance of one int8 LSB, because
-        # Metal's rint rounds halves to even while mx.round does not, so ties can differ
-        # by one and nothing else may.
+        # implementations of the same arithmetic, unrotated (rot 0) and with the block
+        # Walsh-Hadamard rotation (rot 32) whose butterflies only Metal runs. A tolerance
+        # of one int8 LSB, because Metal's rint rounds halves to even while mx.round does
+        # not, and the butterfly sums in a different order than mx.hadamard_transform, so
+        # ties can differ by one and nothing else may. The share of entries that differ at
+        # all is bounded too, so a systematic off-by-one cannot hide under the LSB bar.
         run: |
           python -c "
           import mlx.core as mx, mlx.nn as nn
           from unsloth_zoo.mlx.int8_prefill import scales
           from unsloth_zoo.mlx.int8_prefill.backends import metal_mpp, portable
 
+          def compare(tag, got, want):
+              d = mx.abs(got.astype(mx.int32) - want.astype(mx.int32))
+              diff = int(d.max().item())
+              frac = float((d > 0).astype(mx.float32).mean().item())
+              print(f'{tag}: max abs diff = {diff}, differing = {frac:.2e}')
+              return None if diff <= 1 and frac < 1e-3 else f'{tag} diff={diff} frac={frac:.2e}'
+
           failures = []
-          for bits, gs in [(4, 32), (4, 64), (4, 128)]:
-              ql = nn.QuantizedLinear.from_linear(
-                  nn.Linear(1024, 2048, bias = False), group_size = gs, bits = bits)
-              ws = scales.channel_scale_bound(ql['scales'], ql['biases'], bits)
-              mx.eval(ws)
-              got = metal_mpp.requantize_weight(
-                  ql['weight'], ql['scales'], ql['biases'], ws, bits, gs)
-              want = portable.requantize_weight(
-                  ql['weight'], ql['scales'], ql['biases'], ws, bits, gs)
-              mx.eval(got, want)
-              diff = int(mx.abs(got.astype(mx.int32) - want.astype(mx.int32)).max().item())
-              print(f'requant bits={bits} gs={gs}: max abs diff = {diff}')
-              if diff > 1:
-                  failures.append(f'requant bits={bits} gs={gs} diff={diff}')
+          for rot in (0, scales.ROTATE_BLOCK):
+              for bits, gs in [(4, 32), (4, 64), (4, 128), (8, 32), (8, 64), (8, 128)]:
+                  for dtype in (mx.bfloat16, mx.float16):
+                      lin = nn.Linear(1024, 2048, bias = False)
+                      lin.weight = lin.weight.astype(dtype)
+                      ql = nn.QuantizedLinear.from_linear(lin, group_size = gs, bits = bits)
+                      ws = scales.channel_scale(
+                          ql['weight'], ql['scales'], ql['biases'], bits, gs,
+                          exact = False, rotate = bool(rot))
+                      mx.eval(ws)
+                      got = metal_mpp.requantize_weight(
+                          ql['weight'], ql['scales'], ql['biases'], ws, bits, gs, rot)
+                      want = portable.requantize_weight(
+                          ql['weight'], ql['scales'], ql['biases'], ws, bits, gs, rot)
+                      mx.eval(got, want)
+                      failures.append(compare(
+                          f'requant rot={rot} bits={bits} gs={gs} {dtype}', got, want))
 
-          x = mx.random.normal((640, 1024)).astype(mx.bfloat16)
-          gq, gsc = metal_mpp.quantize_rows(x)
-          wq, wsc = portable.quantize_rows(x)
-          mx.eval(gq, gsc, wq, wsc)
-          qdiff = int(mx.abs(gq.astype(mx.int32) - wq.astype(mx.int32)).max().item())
-          sdiff = float(mx.abs(gsc - wsc).max().item())
-          print(f'row quant: max abs q diff = {qdiff}, max abs scale diff = {sdiff:.3e}')
-          if qdiff > 1 or sdiff > 1e-6:
-              failures.append(f'row quant qdiff={qdiff} sdiff={sdiff}')
+              for k in (1024, 1056):  # 1056 = 33 blocks: a partial last simdgroup pass
+                  x = mx.random.normal((640, k))
+                  x = x.at[:, 7].multiply(50.0).astype(mx.bfloat16)
+                  gq, gsc = metal_mpp.quantize_rows(x, rot)
+                  wq, wsc = portable.quantize_rows(x, rot)
+                  mx.eval(gq, gsc, wq, wsc)
+                  failures.append(compare(f'row quant rot={rot} K={k}', gq, wq))
+                  srel = float((mx.abs(gsc - wsc) / wsc).max().item())
+                  print(f'row quant rot={rot} K={k}: max rel scale diff = {srel:.3e}')
+                  if srel > 1e-5:
+                      failures.append(f'row quant rot={rot} K={k} srel={srel:.3e}')
 
+          failures = [f for f in failures if f]
           assert not failures, failures
           print('OK: Metal quant and requant kernels match the reference')
           "

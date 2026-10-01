@@ -41,7 +41,7 @@ import threading
 import mlx.core as mx
 
 from .eligibility import is_eligible
-from .scales import channel_scale
+from .scales import ROTATE_BLOCK, channel_scale, use_rotation
 
 logger = logging.getLogger(__name__)
 
@@ -53,13 +53,16 @@ class Entry:
     `[E, N, K]` MoE weight. Nothing populates it yet -- `mx.gather_qmm` is phase 2 -- but
     carrying it now keeps the requant kernel indexing over `E*N` rows from day one, so
     MoE support is a GEMM rather than a rework.
+
+    `rot` is the Walsh-Hadamard block size both operands are rotated by (0 = none). It is
+    fixed at registration because `ws` was computed for exactly that arithmetic.
     """
 
     __slots__ = ("w", "scales", "biases", "ws", "bits", "group_size", "n", "k",
-                 "name", "expert_dim", "fn")
+                 "name", "expert_dim", "fn", "rot")
 
     def __init__(self, w, scales, biases, ws, bits, group_size, n, k, name,
-                 expert_dim=None):
+                 expert_dim=None, rot=0):
         # Lazily filled by patch.py with the differentiable wrapper for this weight.
         self.fn = None
         self.w = w
@@ -72,6 +75,7 @@ class Entry:
         self.k = k
         self.name = name
         self.expert_dim = expert_dim
+        self.rot = rot
 
 
 _entries = {}
@@ -123,7 +127,10 @@ def register_module(module, name, exact_scales=None):
         return False, why
 
     w = module["weight"]
-    ws = channel_scale(w, module["scales"], biases, bits, group_size, exact=exact_scales)
+    rot = ROTATE_BLOCK if use_rotation() else 0
+    ws = channel_scale(
+        w, module["scales"], biases, bits, group_size, exact=exact_scales, rotate=bool(rot)
+    )
     # The one eval in the whole module. Materializing here is what keeps the hot path
     # trace-safe, and it also means a broken scale computation fails during warmup
     # rather than mid-generation.
@@ -131,7 +138,7 @@ def register_module(module, name, exact_scales=None):
 
     with _lock:
         _entries[id(w)] = Entry(
-            w, module["scales"], biases, ws, bits, group_size, n, k, name
+            w, module["scales"], biases, ws, bits, group_size, n, k, name, rot=rot
         )
     return True, None
 

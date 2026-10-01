@@ -32,7 +32,7 @@ thin tail -- 0.1% of channels, worst case 8/7 -- comes out loose, because bf16 r
 of the group scale can leave the top code unused, making the group's true maximum
 `13*s + b` rather than `15*s + b`. Measured end to end, correcting that tail moves the
 matmul's mean and max relative error by nothing (0.00875 either way), so the bound stays
-the default. `tests/mlx_int8/test_numerics.py` asserts the distribution, so if MLX ever
+the default. `tests/test_mlx_int8_prefill_numerics.py` asserts the distribution, so if MLX ever
 changes its quantizer the tests fail rather than quality degrading silently on hardware
 we cannot test on.
 
@@ -45,6 +45,19 @@ per-channel versus per-group granularity. A channel whose groups differ in range
 factor R gets an int8 step of `max_g range_g / 254` against a native `range_g / lvl`.
 At 4 bits that tolerates R up to ~17; at 8 bits it tolerates almost nothing. Exact
 absmax does not change that -- only finer int8 granularity would.
+
+**Rotation** (default on). Measured on real 4-bit checkpoints, the weight requant above is
+the small half of the error: almost all of it is the per-row activation quantization,
+because one outlier feature sets the row's scale and flattens everything else onto a few
+int8 levels. Both operands are therefore multiplied by a block-diagonal Walsh-Hadamard
+matrix H (blocks of `ROTATE_BLOCK` = 32, the SIMD width) before they are quantized. H is
+orthogonal up to a factor of 32 (`H @ H.T = 32 * I`), so `(x H)(w H)^T = 32 * x w^T`
+exactly and the GEMM is unchanged; the rotation spreads an outlier across its block,
+which shrinks the row's absmax relative to its typical entry. End to end against stock
+`mx.quantized_matmul`, this cut logits KLD about 5x (Qwen3-1.7B-4bit 3.6e-2 -> 6.7e-3,
+Llama-3.2-1B-4bit 1.3e-2 -> 2.8e-3). The rotated weight has no analytic bound, so its
+scale is always the exact absmax, computed once here. `UNSLOTH_MLX_INT8_ROTATE=0`
+restores the unrotated arithmetic.
 """
 
 import logging
@@ -57,11 +70,63 @@ logger = logging.getLogger(__name__)
 INT8_MAX = 127.0
 _EPS = 1e-8
 
+# Walsh-Hadamard block size. 32 is the Metal SIMD width, so the activation kernel rotates a
+# block with five simd_shuffle_xor stages and no threadgroup memory. 64 and 128 measured
+# marginally better on one model and no better on another, which does not pay for
+# cross-simdgroup shuffles. Eligibility already requires K % 32 == 0.
+ROTATE_BLOCK = 32
+
+# Rows of a weight rotated at once while computing its scale, to cap warmup memory at
+# a slice of one layer in float32.
+_ROTATE_CHUNK_ROWS = 4096
+
 
 def use_exact_scales() -> bool:
     return os.environ.get("UNSLOTH_MLX_INT8_EXACT_SCALES", "0").lower() in (
         "1", "true", "yes", "on",
     )
+
+
+def use_rotation() -> bool:
+    return os.environ.get("UNSLOTH_MLX_INT8_ROTATE", "1").lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def dequantize_f32(weight, scales, biases, bits, group_size):
+    """Dequantize with the metadata widened to float32 first, which is what the Metal
+    requant kernel does. Dequantizing in the metadata dtype and widening afterwards would
+    round every bf16 weight before the int8 step ever sees it."""
+    return mx.dequantize(
+        weight, scales.astype(mx.float32), biases.astype(mx.float32),
+        group_size=group_size, bits=bits, mode="affine",
+    )
+
+
+def rotate(a, block=ROTATE_BLOCK):
+    """Unnormalized block-diagonal Walsh-Hadamard along the last axis (Sylvester order,
+    the same butterfly the Metal kernels run). The 1/block it leaves behind is folded into
+    the GEMM epilogue."""
+    shape = a.shape
+    a = a.reshape(*shape[:-1], shape[-1] // block, block)
+    return mx.hadamard_transform(a, scale=1.0).reshape(shape)
+
+
+def channel_scale_rotated(weight, scales, biases, bits, group_size):
+    """Per-channel int8 scale of the rotated weight: its exact absmax, a row chunk at a
+    time so warmup never holds more than a slice of one layer in float32."""
+    n = weight.shape[0]
+    parts = []
+    for start in range(0, n, _ROTATE_CHUNK_ROWS):
+        stop = min(start + _ROTATE_CHUNK_ROWS, n)
+        dq = dequantize_f32(
+            weight[start:stop], scales[start:stop], biases[start:stop], bits, group_size
+        )
+        part = mx.abs(rotate(dq)).max(axis=-1)
+        mx.eval(part)
+        parts.append(part)
+    absmax = parts[0] if len(parts) == 1 else mx.concatenate(parts)
+    return mx.maximum(absmax, _EPS) / INT8_MAX
 
 
 def channel_scale_bound(scales, biases, bits):
@@ -85,8 +150,14 @@ def channel_scale_exact(weight, scales, biases, bits, group_size):
     return mx.maximum(mx.abs(dq).max(axis=-1).astype(mx.float32), _EPS) / INT8_MAX
 
 
-def channel_scale(weight, scales, biases, bits, group_size, exact=None):
-    """Per-channel int8 scale, `exact` defaulting to the environment."""
+def channel_scale(weight, scales, biases, bits, group_size, exact=None, rotate=None):
+    """Per-channel int8 scale for the arithmetic the entry will run: the rotated weight's
+    exact absmax when rotating (the default), else the bound or exact absmax of the plain
+    dequantized weight, `exact` defaulting to the environment."""
+    if rotate is None:
+        rotate = use_rotation()
+    if rotate:
+        return channel_scale_rotated(weight, scales, biases, bits, group_size)
     if exact is None:
         exact = use_exact_scales()
     if exact:

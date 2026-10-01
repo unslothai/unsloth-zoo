@@ -144,7 +144,7 @@ class TestPortableBackend:
             # backend, keeps the coverage everywhere the reference does build.
             if "cuGraph" not in str(exc):
                 raise
-            pytest.skip(f"stock mx.quantized_matmul cannot evaluate here: {exc}")
+            pytest.skip(reason=f"stock mx.quantized_matmul cannot evaluate here: {exc}")
 
         rel = (mx.abs(got - want).max() / mx.abs(want).max()).item()
         assert rel < 0.15, f"max relative error {rel:.4f}"
@@ -203,6 +203,84 @@ class TestPortableBackend:
         out = portable.matmul(x, entry)
         mx.eval(out)
         assert out.shape == (2, 3, 512, N)
+
+
+class TestRotation:
+    """The block Walsh-Hadamard rotation that both operands go through before they are
+    quantized. Measured end to end it is what cuts logits KLD about 5x on real 4-bit
+    checkpoints; these pin the algebra and the property it buys."""
+
+    def test_rotation_is_exact_before_quantization(self):
+        """(x H)(w H)^T / 32 == x w^T, so the rotation alone changes nothing."""
+        x = mx.random.normal((64, 1024))
+        w = mx.random.normal((256, 1024))
+        got = scales.rotate(x) @ scales.rotate(w).T * (1.0 / scales.ROTATE_BLOCK)
+        want = x @ w.T
+        mx.eval(got, want)
+        assert mx.allclose(got, want, rtol=1e-4, atol=1e-3).item()
+
+    def test_rotation_matches_dense_hadamard(self):
+        """Sylvester order, unnormalized, block-diagonal: the convention the Metal
+        butterflies implement, checked against an explicit matrix."""
+        h = scales.ROTATE_BLOCK
+        H = np.array([[1.0]])
+        while H.shape[0] < h:
+            H = np.block([[H, H], [H, -H]])
+        x = np.random.default_rng(0).standard_normal((8, 4 * h)).astype(np.float32)
+        want = np.concatenate([x[:, i:i + h] @ H for i in range(0, 4 * h, h)], axis=1)
+        got = np.array(scales.rotate(mx.array(x)))
+        assert np.allclose(got, want, atol=1e-4)
+
+    def _outlier_case(self, rotate, monkeypatch):
+        """LLM activations: most features small, a few carrying most of the magnitude."""
+        monkeypatch.setenv("UNSLOTH_MLX_INT8_ROTATE", "1" if rotate else "0")
+        mx.random.seed(0)
+        K, N, M = 1024, 2048, 640
+        ql = nn.QuantizedLinear.from_linear(nn.Linear(K, N, bias=False), group_size=64, bits=4)
+        ok, why = registry.register_module(ql, "w")
+        assert ok, why
+        entry = registry.get(ql["weight"])
+        assert entry.rot == (scales.ROTATE_BLOCK if rotate else 0)
+        x = mx.random.normal((M, K))
+        x = x.at[:, mx.array([7, 300, 801])].multiply(60.0).astype(mx.bfloat16)
+        got = portable.matmul(x, entry, out_dtype=mx.float32)
+        want = mx.quantized_matmul(
+            x, ql["weight"], ql["scales"], ql["biases"], True, 64, 4
+        ).astype(mx.float32)
+        err = mx.linalg.norm(got - want) / mx.linalg.norm(want)
+        mx.eval(err)
+        return err.item()
+
+    def test_rotation_cuts_error_on_outlier_activations(self, monkeypatch):
+        plain = self._outlier_case(False, monkeypatch)
+        rotated = self._outlier_case(True, monkeypatch)
+        # Measured on mlx 0.32.3 (CPU): 0.057 unrotated vs 0.014 rotated. A factor of 3
+        # leaves room for RNG differences across MLX versions without letting a broken
+        # rotation through (a rotation applied to one operand only is O(1) error).
+        assert rotated < plain / 3, f"rotated {rotated:.4f} vs plain {plain:.4f}"
+
+    def test_kill_switch_restores_unrotated_scales(self, monkeypatch):
+        monkeypatch.setenv("UNSLOTH_MLX_INT8_ROTATE", "0")
+        ql = nn.QuantizedLinear.from_linear(nn.Linear(1024, 2048, bias=False), group_size=64, bits=4)
+        ok, why = registry.register_module(ql, "w")
+        assert ok, why
+        entry = registry.get(ql["weight"])
+        bound = scales.channel_scale_bound(ql["scales"], ql["biases"], 4)
+        mx.eval(bound)
+        assert entry.rot == 0
+        assert mx.array_equal(entry.ws, bound).item()
+
+    def test_rotated_scale_is_exact_absmax(self):
+        """No analytic bound exists for the rotated weight, so the scale must be its
+        true absmax: never clipping, and using the full int8 range."""
+        ql = nn.QuantizedLinear.from_linear(nn.Linear(1024, 4096 + 128, bias=False), group_size=32, bits=4)
+        ws = scales.channel_scale_rotated(ql["weight"], ql["scales"], ql["biases"], 4, 32)
+        wq = portable.requantize_weight(
+            ql["weight"], ql["scales"], ql["biases"], ws, 4, 32, scales.ROTATE_BLOCK
+        )
+        row_max = mx.abs(wq.astype(mx.int32)).max(axis=-1)
+        mx.eval(row_max)
+        assert int(row_max.min().item()) == 127
 
 
 class TestGroupRangeRatio:
