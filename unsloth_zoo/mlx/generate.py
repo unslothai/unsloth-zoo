@@ -3157,8 +3157,7 @@ class _VLMBatchSession:
         self._banked += 1
 
     def _reopen(self, row: _RowPrefill, state, token_ids: list[int], banked: int, kwargs: dict) -> dict:
-        """Resume a row whose prefill is starting from what rows ahead of it banked since it was
-        added: rows added together otherwise all miss the prefix they share."""
+        """Resume a row as its prefill starts from what rows ahead banked since it was added."""
         pending = self._pending.get((kwargs.get("uids") or (None,))[0])
         if self._banked == banked or pending is None or kwargs.get("inputs_embeds") is None:
             return kwargs
@@ -3228,12 +3227,8 @@ class _VLMBatchSession:
             raise
 
     def _schedule_prefill(self) -> None:
-        """Run the prefill with the fewest prompt tokens left, queued rows included.
-
-        mlx-vlm runs one prompt batch to its end, so a short request waits out every long
-        prefill admitted before it. A batch is parked only between steps, so each row still
-        prefills in its own chunks; one parked as often as there are slots runs to its end.
-        """
+        """Run the prefill with the fewest prompt tokens left, queued rows included. Batches park
+        only between steps (chunks unchanged); one parked `cap` times runs to its end."""
         generator, parked = self.generator, self._parked
         current = generator._prompt_batch
         cap = generator.completion_batch_size

@@ -346,7 +346,6 @@ def test_vlm_stream_rows_resume_from_their_own_cache_bitwise():
     states = lambda cache: [v for _, v in tree_flatten([entry.state for entry in cache])]
     for got, want in ((first.kept[4096], kept[4096]), (second.kept[2048], alone.kept[2048])):
         assert all(mx.array_equal(a, b).item() for a, b in zip(states(got), states(want), strict=True))
-    # Rows added together resume, when their prefill starts, from what the rows ahead banked.
     ask = lambda question: apply_chat_template(processor, model.config, f"{rules} {question}", num_images=0)
     short, long = ask("Name a colour."), ask("Name a fruit, then a vegetable.")
     seed, make = {}, lambda: make_prompt_cache(lm)
@@ -427,7 +426,6 @@ def test_vlm_stream_rows_resume_from_their_own_quantized_cache_bitwise(monkeypat
             results.update((e.index, e.result) for e in stream.step() if e.result is not None)
     assert results[row].finish_reason in ("stop", "length")
     assert isinstance(streamed.kept[2048][0], QuantizedKVCache)
-    # Float rows added together resume, when their prefill starts, from the quantized prefix banked ahead.
     ask = lambda question: apply_chat_template(processor, model.config, f"{rules} {question}", num_images=0)
     banked, make = {}, lambda: make_prompt_cache(model.language_model)
     with BatchStream(model, processor, defaults=defaults) as stream:
