@@ -34,12 +34,19 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def load_patch(name, filename, **namespace):
+def load_patch(name, filename, helpers=(), **namespace):
     path = ROOT / "unsloth_zoo" / "temporary_patches" / filename
     tree = ast.parse(path.read_text())
-    node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name)
+    wanted = (name, *helpers)
+    nodes = [n for n in tree.body if (
+        (isinstance(n, ast.FunctionDef) and n.name in wanted)
+        or (isinstance(n, ast.Assign) and any(
+            isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name) and t.value.id in helpers
+            for t in n.targets
+        ))
+    )]
     scope = {"torch": torch, "inspect": inspect, "os": os, **namespace}
-    exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), scope)
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), scope)
     return scope[name]
 
 
@@ -71,7 +78,7 @@ def legacy(monkeypatch):
 
 
 def install():
-    load_patch("patch_Gemma4_token_type_ids_mask", "gemma4.py")()
+    load_patch("patch_Gemma4_token_type_ids_mask", "gemma4.py", helpers=("token_type_ids_mask_function",))()
 
 
 def test_missing_legacy_helper_is_untouched(monkeypatch):
@@ -97,6 +104,18 @@ def test_registration_is_idempotent(legacy):
     install()
     assert gemma.token_type_ids_mask_function is patched
     assert patched(None, None) is None
+
+
+def test_patched_source_survives_compiler_copy(legacy):
+    # unsloth_zoo.compiler pastes inspect.getsource of each modeling function
+    # verbatim; it must be a top-level def under the upstream name.
+    gemma, _ = legacy
+    install()
+    source = inspect.getsource(gemma.token_type_ids_mask_function)
+    assert source.startswith("def token_type_ids_mask_function(")
+    scope = {"torch": torch}
+    exec(source, scope)
+    assert callable(scope["token_type_ids_mask_function"])
 
 
 @pytest.mark.parametrize("groups", [[-1]*8, [-1,0,0,-1,1,1,-1,-1]])
@@ -155,11 +174,10 @@ def test_real_mask_builder_with_existing_unsloth_guards(legacy, monkeypatch, com
         actual = build(token_types)
         for key in expected:
             torch.testing.assert_close(actual[key], expected[key])
-        # Unsloth copies standalone function source into its generated module.
-        # The replacement must survive that without a captured original function.
-        import textwrap
+        # The compiler copies inspect.getsource verbatim (no dedent) into
+        # unsloth_compiled_module_gemma4.py; a nested def would not be top level.
         copied = {"torch": torch}
-        exec(textwrap.dedent(inspect.getsource(gemma.token_type_ids_mask_function)), copied)
+        exec(inspect.getsource(gemma.token_type_ids_mask_function), copied)
         monkeypatch.setattr(gemma, "token_type_ids_mask_function", copied["token_type_ids_mask_function"])
         for key, value in build(token_types).items():
             torch.testing.assert_close(value, expected[key])
