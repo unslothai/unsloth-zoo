@@ -1270,15 +1270,6 @@ def _resolve_processor_model_name(processor, model = None):
     return "this model"
 
 
-def _merge_chat_template_kwargs(base_kwargs, example=None):
-    merged = dict(base_kwargs or {})
-    if isinstance(example, dict):
-        example_kwargs = example.get("chat_template_kwargs")
-        if example_kwargs:
-            merged.update(example_kwargs)
-    return merged
-
-
 def _raise_chat_template_error(error, processor, model = None):
     """Turn an apply_chat_template failure into an actionable Unsloth error (usually a base
     checkpoint whose processor has no chat template)."""
@@ -1757,13 +1748,11 @@ class UnslothVisionDataCollator:
             self.padding_token_ids = self.padding_token_ids.to(device)
         return self.padding_token_ids
 
-    def _chat_template_kwargs_for(self, example=None):
-        return _merge_chat_template_kwargs(self.chat_template_kwargs, example)
-
-    def _apply_chat_template(self, messages, example=None, **kwargs):
+    def _apply_chat_template(self, messages, example = None, **kwargs):
+        # Per-row chat_template_kwargs override the collator's, as in the text path (dataset_utils).
+        row_kwargs = example.get("chat_template_kwargs") if isinstance(example, dict) else None
         return self.processor.apply_chat_template(
-            messages,
-            **{**self._chat_template_kwargs_for(example), **kwargs},
+            messages, **{**(getattr(self, "chat_template_kwargs", None) or {}), **(row_kwargs or {}), **kwargs},
         )
 
     def __call__(self, examples):
@@ -2021,11 +2010,7 @@ class UnslothVisionDataCollator:
 
     def _render_chat(self, prompt_messages, completion_messages=None, add_generation_prompt=False, continue_final_message=False, example=None):
         return self._apply_chat_template(
-            prompt_messages + (completion_messages or []),
-            example = example,
-            tokenize = False,
-            add_generation_prompt = add_generation_prompt,
-            continue_final_message = continue_final_message,
+            prompt_messages + (completion_messages or []), example=example, tokenize=False, add_generation_prompt=add_generation_prompt, continue_final_message=continue_final_message
         )
 
     def _load_column_images(self, images):
