@@ -29,8 +29,8 @@ derivative with no `x / d / d` term. Outside a compiled region it runs the trans
 eager stays bitwise identical to the stock module.
 
 The compiler swaps the transformers loop for this call through `MODULE_FORWARD_SOURCE_REWRITES`
-(`unsloth_zoo/compiler.py`) and then compiles the mixer. `UNSLOTH_DSV4_MHC_FAST=0` restores the
-stock source and the eager mixer; `UNSLOTH_DSV4_MHC_FAST=stock` compiles the stock loop instead.
+(`unsloth_zoo/compiler.py`) when `UNSLOTH_DSV4_MHC_FAST=unrolled`; the default compiles the stock
+loop (torch >= 2.13) and `UNSLOTH_DSV4_MHC_FAST=0` keeps the eager mixer. See `mhc_fast_mode`.
 """
 
 import os
@@ -45,16 +45,26 @@ __all__ = [
 ]
 
 
+def _torch_at_least(major, minor):
+    try:
+        version = tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2])
+    except Exception:
+        return False
+    return version >= (major, minor)
+
+
 def mhc_fast_mode():
-    """`UNSLOTH_DSV4_MHC_FAST`: unset / 1 = unrolled rewrite (fewest kernels, slowest to compile),
-    `stock` = compile the transformers loop as is (about 3x more mixer kernels, about 3x cheaper to
-    compile), 0 = keep the mixer eager."""
-    value = os.environ.get("UNSLOTH_DSV4_MHC_FAST", "1").strip().lower()
+    """`UNSLOTH_DSV4_MHC_FAST` for the DeepSeek-V4 / V4.1 mixer:
+    `0` keeps it eager; `stock` compiles the transformers loop as is; `unrolled` compiles it through
+    `unsloth_sinkhorn_knopp` (about 3x fewer mixer kernels than `stock`, about 3x slower to compile,
+    and not bitwise reproducible run to run unless TORCHINDUCTOR_DETERMINISTIC=1). Unset: `stock` on
+    torch >= 2.13, where the compiled stock mixer was checked finite and close to eager, else eager."""
+    value = os.environ.get("UNSLOTH_DSV4_MHC_FAST", "").strip().lower()
     if value in ("0", "false", "off", "no", "eager"):
         return None
-    if value == "stock":
-        return "stock"
-    return "unrolled"
+    if value in ("unrolled", "stock"):
+        return value
+    return "stock" if _torch_at_least(2, 13) else None
 
 
 # Exact transformers text (deepseek_v4 and the deepseek_v41 port share it); a source rewrite only

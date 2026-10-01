@@ -239,8 +239,8 @@ MODEL_FUNCTION_SOURCE_REWRITES = {
 # Per model_type module forward rewrites: {class: (old, new, mode)}. A class whose `old` text occurs exactly
 # once in its forward leaves DISABLE_COMPILE_MODULES and compiles with the rewritten forward. `mode()`
 # returns None (no rewrite, class stays as listed), "stock" (compile the unchanged forward) or anything
-# else (apply the rewrite). DeepSeek-V4 / V4.1 mHC mixers: the Sinkhorn-Knopp loop becomes
-# `unsloth_sinkhorn_knopp`; UNSLOTH_DSV4_MHC_FAST=0 keeps the eager mixer, =stock compiles the stock loop.
+# else (apply the rewrite). DeepSeek-V4 / V4.1 mHC mixers: compiled as is by default on torch >= 2.13;
+# UNSLOTH_DSV4_MHC_FAST=unrolled swaps the Sinkhorn-Knopp loop for `unsloth_sinkhorn_knopp`, =0 keeps it eager.
 MODULE_FORWARD_SOURCE_REWRITES = {
     "deepseek_v4": {
         "DeepseekV4HyperConnection": (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_mode),
@@ -5188,8 +5188,8 @@ DISABLE_COMPILE_MODULES = [
     "Gemma4VisionEncoderLayer",
     "Gemma4MultimodalEmbedder",
     # DeepSeek-V4 hyper-connection mixers. HyperConnection leaves this list when its
-    # MODULE_FORWARD_SOURCE_REWRITES entry matches (unless UNSLOTH_DSV4_MHC_FAST=0); the
-    # stock source stays eager here (#859 saw inf grads with it compiled).
+    # MODULE_FORWARD_SOURCE_REWRITES entry matches and mhc_fast_mode() allows it (torch >= 2.13 by
+    # default, UNSLOTH_DSV4_MHC_FAST=0 never). #859 saw inf grads with the compiled mixer on older stacks.
     "DeepseekV4HyperConnection",
     "DeepseekV4HyperHead",
     "DeepseekV41HyperConnection",

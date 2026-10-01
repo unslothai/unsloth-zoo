@@ -14,11 +14,11 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""DeepSeek-V4 / V4.1 mHC mixers compile through the `unsloth_sinkhorn_knopp` rewrite.
+"""DeepSeek-V4 / V4.1 mHC mixers leave DISABLE_COMPILE_MODULES.
 
-The Sinkhorn-Knopp loop of `DeepseekV4HyperConnection` (and the V4.1 port) is swapped for a call with an
-explicit backward, so the mixer leaves DISABLE_COMPILE_MODULES. `UNSLOTH_DSV4_MHC_FAST=0` restores the
-stock source and the eager mixer."""
+Default (torch >= 2.13) and `UNSLOTH_DSV4_MHC_FAST=stock` compile the transformers mixer as is;
+`=unrolled` swaps its Sinkhorn-Knopp loop for `unsloth_sinkhorn_knopp` (unrolled, explicit backward);
+`=0` keeps the eager mixer."""
 
 import json
 import os
@@ -193,7 +193,7 @@ def test_rewrite_registered_for_v4_and_v41_and_kill_switch(tmp_path, monkeypatch
         assert cls in compiler.DISABLE_COMPILE_MODULES
 
     module = _module_from_source(tmp_path, "mhc_stock_src", MHC_SINKHORN_SOURCE)
-    monkeypatch.delenv("UNSLOTH_DSV4_MHC_FAST", raising = False)
+    monkeypatch.setenv("UNSLOTH_DSV4_MHC_FAST", "unrolled")
     rewrites = compiler.module_forward_source_rewrites(module, "deepseek_v4")
     assert "comb = unsloth_sinkhorn_knopp(comb, self.hc_sinkhorn_iters, self.hc_eps)" in rewrites["DeepseekV4HyperConnection"]
     assert "for _ in range" not in rewrites["DeepseekV4HyperConnection"]
@@ -202,12 +202,21 @@ def test_rewrite_registered_for_v4_and_v41_and_kill_switch(tmp_path, monkeypatch
     assert MHC_SINKHORN_SOURCE in stock and "unsloth_sinkhorn_knopp" not in stock
     monkeypatch.setenv("UNSLOTH_DSV4_MHC_FAST", "0")
     assert compiler.module_forward_source_rewrites(module, "deepseek_v4") == {}
+    # Unset: stock on torch >= 2.13, eager below.
+    monkeypatch.delenv("UNSLOTH_DSV4_MHC_FAST", raising = False)
+    from unsloth_zoo.temporary_patches.mhc_sinkhorn import _torch_at_least
+    default = compiler.module_forward_source_rewrites(module, "deepseek_v4")
+    if _torch_at_least(2, 13):
+        assert default["DeepseekV4HyperConnection"] == stock
+    else:
+        assert default == {}
 
 
-def test_changed_upstream_source_is_not_rewritten(tmp_path, monkeypatch):
+@pytest.mark.parametrize("mode", ["unrolled", "stock"])
+def test_changed_upstream_source_is_not_rewritten(tmp_path, monkeypatch, mode):
     from unsloth_zoo import compiler
 
-    monkeypatch.delenv("UNSLOTH_DSV4_MHC_FAST", raising = False)
+    monkeypatch.setenv("UNSLOTH_DSV4_MHC_FAST", mode)
     changed = MHC_SINKHORN_SOURCE.replace("self.hc_eps)\n", "self.hc_eps * 2)\n", 1)
     module = _module_from_source(tmp_path, "mhc_changed_src", changed)
     assert compiler.module_forward_source_rewrites(module, "deepseek_v4") == {}
@@ -299,7 +308,7 @@ def _run_child(tmp_path, mode):
 
 
 def test_v4_mixer_compiles_through_the_rewrite(tmp_path):
-    child = _run_child(tmp_path, "1")
+    child = _run_child(tmp_path, "unrolled")
     assert child["DeepseekV4HyperConnection"].startswith("torch_compile_with_fallback("), child
     assert child["calls_fast"] and child["imports_fast"], child
     # HyperHead has no Sinkhorn and runs once per forward: it stays eager.
@@ -317,8 +326,13 @@ def test_kill_switch_keeps_the_stock_eager_mixer(tmp_path):
     assert max(child["rel_errs"]) == 0.0, child
 
 
-def test_stock_mode_compiles_the_unchanged_mixer(tmp_path):
-    child = _run_child(tmp_path, "stock")
+@pytest.mark.parametrize("mode", ["stock", ""])
+def test_stock_mode_compiles_the_unchanged_mixer(tmp_path, mode):
+    from unsloth_zoo.temporary_patches.mhc_sinkhorn import _torch_at_least
+
+    if mode == "" and not _torch_at_least(2, 13):
+        pytest.skip("default is eager below torch 2.13")
+    child = _run_child(tmp_path, mode)
     assert child["DeepseekV4HyperConnection"].startswith("torch_compile_with_fallback("), child
     assert not child["calls_fast"] and not child["imports_fast"], child
     assert child["DeepseekV4HyperHead"] == "torch_compiler_disable_unless_decode", child
