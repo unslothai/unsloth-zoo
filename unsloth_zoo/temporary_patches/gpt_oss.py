@@ -2383,8 +2383,7 @@ def _ogs_expert_offsets(routing_data):
 
 
 def _matmul_ogs_for(weight, routing_data = None):
-    """matmul_ogs from the triton_kernels copy that built `weight` (a second copy's Tensor classes reject it).
-    A dense torch.Tensor weight carries no copy: use `routing_data`'s, else the resolved one."""
+    """matmul_ogs from the triton_kernels copy owning `weight` (other copies reject its Tensor); dense weights use `routing_data`'s."""
     import importlib
     if isinstance(weight, torch.Tensor):
         owner = type(routing_data).__module__ if routing_data is not None else ""
