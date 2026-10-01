@@ -206,8 +206,9 @@ _QMM_BITS = (4, 8)
 _QMM_GROUP_SIZES = (32, 64, 128)
 _QMM_MAX_ROWS = 16
 # Threadgroups per call by row tile. In a chain of dependent projections one kernel runs at a time,
-# so its own grid must fill the GPU.
+# so its own grid must fill the GPU: these fill the 16-core M5 Pro, and scale with the core count.
 _QMM_THREADGROUPS = {8: 1400, 16: 700}
+_QMM_MEASURED_CORES = 16
 _QMM_THREADGROUP_MEMORY = 32768
 
 _QMM_HEADER = """
@@ -370,7 +371,9 @@ def small_m_qmm_geometry(M, N, K, group_size):
     # Each thread holds matmuls-per-fold x row_tile / 2 partials; more spills registers.
     unroll = min(256 // group_size, 64 // row_tile)
     steps = -(-(K // group_size) // unroll)
-    splits = max(1, min(_QMM_THREADGROUPS[row_tile] // (N // column_tile), steps))
+    cores = _gpu_core_count() or _QMM_MEASURED_CORES
+    threadgroups = _QMM_THREADGROUPS[row_tile] * cores // _QMM_MEASURED_CORES
+    splits = max(1, min(threadgroups // (N // column_tile), steps))
     splits = -(-steps // -(-steps // splits))   # no more splits than the longest one needs
     while row_tile * (-(-steps // splits) * unroll + column_tile) * 4 > _QMM_THREADGROUP_MEMORY:
         splits += 1
@@ -400,13 +403,14 @@ def small_m_qmm(x, w, scales, biases, group_size, bits):
 
 
 # Rows per call where the kernel beat stock by at least 1.05x in timings of chained projections,
-# per GPU class. Entries, first match wins: (bits, group size or None for any, fewest weights,
+# per GPU generation. Entries, first match wins: (bits, group size or None for any, fewest weights,
 # widest N, fewest rows, most rows). On outputs wider than 8K and up to 64K stock's qmm is close
 # at the most rows, and small layers stay on stock. No entry for heads wider than 64K starts below
 # the lowest entry for narrower outputs that matches the same quantization: a head alone gains too
-# little. A NAX class not measured keeps only the rows where every measured shape cleared 1.3x.
+# little. A NAX generation not measured keeps only the rows where every measured shape cleared 1.3x.
+# Measured on the M5 Pro; the M5 family is assumed to match it in bandwidth per GPU core.
 _QMM_ROWS_BY_GPU = {
-    "applegpu_g17s": (
+    17: (
         (4, None, 1 << 22, 8192, 6, 16), (4, None, 1 << 22, 65536, 6, 15), (4, None, 1 << 22, None, 6, 16),
         (4, None, 1 << 21, None, 6, 16), (8, 32, 1 << 23, 8192, 11, 16), (8, None, 1 << 23, 8192, 7, 16),
         (8, None, 1 << 23, 65536, 7, 14), (8, 32, 1 << 23, None, 11, 16), (8, None, 1 << 23, None, 7, 16),
@@ -422,7 +426,7 @@ _QMM_ROWS_UNMEASURED = (
 
 def small_m_qmm_row_range(N, K, group_size, bits):
     """The row counts (lowest, highest) where the kernel is measured faster than stock for `[N, K]`."""
-    for entry in _QMM_ROWS_BY_GPU.get(_gpu_architecture(), _QMM_ROWS_UNMEASURED):
+    for entry in _QMM_ROWS_BY_GPU.get(_gpu_generation(), _QMM_ROWS_UNMEASURED):
         entry_bits, entry_group_size, fewest, widest, low, high = entry
         if (bits == entry_bits and entry_group_size in (None, group_size) and N * K >= fewest
                 and (widest is None or N <= widest)):

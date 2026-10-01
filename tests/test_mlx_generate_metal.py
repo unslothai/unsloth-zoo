@@ -916,6 +916,7 @@ def test_nax_small_m_qmm_matches_native(monkeypatch, bits, N, group_size, dtype)
     from unsloth_zoo.mlx import nax
 
     monkeypatch.setattr(nax, "_QMM_THREADGROUPS", {8: 20, 16: 20})   # several uneven K steps per split
+    monkeypatch.setattr(nax, "_gpu_core_count", lambda: nax._QMM_MEASURED_CORES)
     for groups in (68, 17, 2):   # the last one runs unsplit
         K = group_size * groups
         w, scales, biases = _quantized(N, K, group_size, dtype, bits, seed = groups)
@@ -970,12 +971,26 @@ def test_nax_small_m_qmm_row_range_matches_bits_group_size_and_shape(monkeypatch
     from unsloth_zoo.mlx import nax
 
     table = ((8, 32, 1 << 20, 4096, 9, 30), (8, None, 1 << 20, 4096, 1, 12), (4, None, 1 << 20, None, 5, 16))
-    monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {nax._gpu_architecture(): table})
+    monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {nax._gpu_generation(): table})
     shapes = ((4096, 256, 32, 8), (4096, 256, 64, 8), (8192, 256, 64, 8), (4096, 128, 64, 8), (8192, 256, 64, 4))
     assert [nax.small_m_qmm_row_range(*shape) for shape in shapes] == [(9, 16), (2, 12), (0, -1), (0, -1), (5, 16)]
     monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {})
     monkeypatch.setattr(nax, "_QMM_ROWS_UNMEASURED", table[2:])
     assert nax.small_m_qmm_row_range(4096, 256, 64, 4) == (5, 16)
+
+
+def test_nax_small_m_qmm_scales_with_gpu_cores_and_keys_rows_by_generation(monkeypatch):
+    from unsloth_zoo.mlx import nax
+
+    splits = {}
+    for cores in (None, 10, 16, 40):
+        monkeypatch.setattr(nax, "_gpu_core_count", lambda: cores)
+        splits[cores] = [nax.small_m_qmm_geometry(M, 4096, 16384, 32)[2] for M in (2, 16)]
+    assert splits == {None: [32, 19], 10: [22, 13], 16: [32, 19], 40: [64, 43]}
+    for architecture, rows in (("applegpu_g17s", (6, 16)), ("applegpu_g17c", (6, 16)),
+                               ("applegpu_g18s", (11, 16)), ("", (11, 16))):
+        monkeypatch.setattr(nax, "_gpu_architecture", lambda: architecture)
+        assert nax.small_m_qmm_row_range(4096, 4096, 64, 4) == rows, architecture
 
 
 _EVERY_ROW = ((4, None, 0, None, 1, 16), (8, None, 0, None, 1, 16))
@@ -1007,7 +1022,7 @@ def test_nax_quantized_linear_scope_routes_restores_and_falls_back(monkeypatch, 
     monkeypatch.setattr(nax, "nax_available", lambda: True)
     monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: True)
     # The 8-bit projection routes up to 8 rows only, so at 12 only the 4-bit embedding does.
-    monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {nax._gpu_architecture(): (_EVERY_ROW[0], (8, None, 0, None, 1, 8))})
+    monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {nax._gpu_generation(): (_EVERY_ROW[0], (8, None, 0, None, 1, 8))})
     monkeypatch.setattr(inference, "_NAX_QMM_VERIFIED", {})
     caplog.set_level("INFO", logger = inference.__name__)
 
@@ -1053,7 +1068,7 @@ def test_nax_quantized_linear_first_use_check_rejects_a_wrong_kernel(monkeypatch
     monkeypatch.setattr(nax, "small_m_qmm", lambda *args: kernel(*args) * 1.1)
     monkeypatch.setattr(nax, "nax_available", lambda: True)
     monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: True)
-    monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {nax._gpu_architecture(): _EVERY_ROW})
+    monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {nax._gpu_generation(): _EVERY_ROW})
     monkeypatch.setattr(inference, "_NAX_QMM_VERIFIED", {})
     native = model.proj(x := mx.random.normal((3, 512), key = mx.random.key(3)).astype(mx.bfloat16))
     compiled = mx.compile(model.proj)(x)   # stock compiled and eager can differ in the last bit
@@ -1069,7 +1084,7 @@ def test_nax_quantized_linear_scope_stays_native(monkeypatch, blocker):
 
     model = _QuantizedHead()
     monkeypatch.delenv("UNSLOTH_MLX_NAX_QMM", raising = False)
-    monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {nax._gpu_architecture(): _EVERY_ROW})
+    monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {nax._gpu_generation(): _EVERY_ROW})
     monkeypatch.setattr(nax, "nax_available", lambda: blocker != "no NAX")
     monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: blocker != "probe failed")
     monkeypatch.setattr(nax, "gap_open", lambda name: blocker != "gap closed")
