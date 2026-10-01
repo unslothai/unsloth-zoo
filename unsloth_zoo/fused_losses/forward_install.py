@@ -349,6 +349,20 @@ class _ModelingLoader(importlib.abc.Loader):
     def __init__(self, inner):
         self._inner = inner
 
+    # Defined, not routed through __getattr__: hasattr and mock.patch.object
+    # look these up on the type, which skips __getattr__.
+    def get_source(self, name):
+        return self._inner.get_source(name)
+
+    def get_code(self, name):
+        return self._inner.get_code(name)
+
+    def get_filename(self, name):
+        return self._inner.get_filename(name)
+
+    def is_package(self, name):
+        return self._inner.is_package(name)
+
     def create_module(self, spec):
         if hasattr(self._inner, "create_module"):
             return self._inner.create_module(spec)

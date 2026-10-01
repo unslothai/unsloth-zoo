@@ -98,18 +98,10 @@ def _route(module, S, mask=None, is_causal=None, q=None, k=None, v=None, **kw):
         module, q, k, v, mask, dropout=0.0, scaling=D ** -0.5, is_causal=is_causal, **kw)
 
 
-# ---------------------------------------------------------------------------
-# Registration
-# ---------------------------------------------------------------------------
-
 def test_registered_in_temporary_patches():
     from unsloth_zoo.temporary_patches.common import TEMPORARY_PATCHES
     assert mg.patch_muse_glimmer_banded_sliding_attention in TEMPORARY_PATCHES
 
-
-# ---------------------------------------------------------------------------
-# The gate must defer
-# ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("S", [W, 2 * W, 3 * W - 1])
 def test_defers_below_three_windows(_clean_router, S):
@@ -186,10 +178,6 @@ def test_env_off_defers_everywhere(_clean_router, monkeypatch):
     assert out == "DEFERRED"
 
 
-# ---------------------------------------------------------------------------
-# The gate must engage, and match the reference
-# ---------------------------------------------------------------------------
-
 @pytest.mark.parametrize("with_mask", [False, True])
 def test_engages_and_matches_reference(_clean_router, with_mask):
     S = S_ON
@@ -230,10 +218,6 @@ def test_banded_engages_when_sliding_window_comes_from_kwargs(_clean_router):
     _route(module, S_ON, sliding_window=W)
     assert mg._BANDED_ENGAGED[0] == before + 1
 
-
-# ---------------------------------------------------------------------------
-# Installation is idempotent, and does not break gemma-4's re-entry guard
-# ---------------------------------------------------------------------------
 
 def _sdpa_registry():
     modeling_utils = pytest.importorskip("transformers.modeling_utils")

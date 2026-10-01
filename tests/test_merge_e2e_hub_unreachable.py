@@ -91,8 +91,6 @@ def _looks_like_a_successful_export(out_dir):
     return any(name.endswith(".safetensors") for name in os.listdir(out_dir))
 
 
-# The regression this whole branch exists to remove.
-
 def test_unreachable_hub_raises_and_writes_nothing(monkeypatch, tmp_path):
     """The bug, end to end: a base only on the Hub, a rate limited Hub and a 16bit
     merge. The old code warned, returned None and created no output directory."""
@@ -211,8 +209,6 @@ def test_an_hf_uri_is_still_addressed_as_a_repo(monkeypatch):
     assert saving_utils._is_hub_repo_id("hf://a/b/c") is False
     assert saving_utils._is_hub_repo_id("/abs/base") is False
 
-
-# The complement: an unreachable Hub must not break a merge that never needed it.
 
 def test_a_local_base_still_merges_with_the_hub_down(monkeypatch, tmp_path):
     """The base is on disk, so nothing about this merge is the Hub's to decide: it must

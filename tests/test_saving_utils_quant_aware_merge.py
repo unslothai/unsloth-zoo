@@ -144,7 +144,6 @@ def test_fp8_weight_missing_scale_records_fallback_and_skips_write():
     from unsloth_zoo import saving_utils
     from unsloth_zoo.saving_utils import _merge_moe_expert_quant_aware
 
-    # Sentinel-trigger: FP8 weight in header but NO companion scale key.
     fp8 = torch.zeros(64, 128, dtype=torch.float8_e4m3fn)
     file = _FakeFile({"layer.0.experts.0.down_proj.weight": fp8})
     hdr = _make_header_for({"layer.0.experts.0.down_proj.weight": "F8_E4M3"})
@@ -155,7 +154,6 @@ def test_fp8_weight_missing_scale_records_fallback_and_skips_write():
     def _capture_fallback(*args, **kwargs):
         fallback_log.append((args, kwargs))
 
-    # Patch in-place on the module to observe.
     original = saving_utils._record_moe_merge_fallback
     saving_utils._record_moe_merge_fallback = _capture_fallback
     try:
@@ -175,7 +173,7 @@ def test_key_missing_is_a_silent_no_op():
     from unsloth_zoo.saving_utils import _merge_moe_expert_quant_aware
 
     file = _FakeFile({})
-    hdr = {}  # key not present
+    hdr = {}
     mm = _FakeMM()
     assert _merge_moe_expert_quant_aware(
         "gate", "not_in_header.gate_proj.weight", file, hdr, _FakeLoraStats(),

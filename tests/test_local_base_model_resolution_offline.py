@@ -105,9 +105,6 @@ _OFFLINE = OfflineModeIsEnabled(
 )
 
 
-# 1. check_hf_model_exists: a string that cannot name a repo is absent, not
-#    unreachable, and must cost no network call.
-
 _NOT_REPO_IDS = [
     pytest.param("./base", id = "dot-slash-relative-path"),
     pytest.param("/home/user/models/base", id = "absolute-path"),
@@ -232,8 +229,6 @@ def test_transport_error_on_a_valid_repo_id_still_raises(monkeypatch):
         saving_utils.check_hf_model_exists("unsloth/Llama-3.2-1B-Instruct")
 
 
-# 2. determine_base_model_source: a local base model resolves with no network.
-
 @pytest.mark.parametrize("shape", ["relative", "dot-slash", "absolute"])
 def test_local_base_model_resolves_without_network(monkeypatch, tmp_path, shape):
     """The three shapes a user actually passes for a local base model."""
@@ -309,9 +304,6 @@ def test_local_mxfp4_also_outranks_the_hub_without_network(monkeypatch, tmp_path
     )
 
 
-# 3. The original bug stays fixed: no local fallback plus an unreachable Hub must still
-#    be loud.
-
 _UNREACHABLE = [
     pytest.param(_OFFLINE, id = "hf-hub-offline"),
     pytest.param(ConnectionError("Temporary failure in name resolution"), id = "dns-failure"),
@@ -353,9 +345,6 @@ def test_absent_repo_with_no_local_copy_still_reports_nothing_found(monkeypatch,
         None, False, "", False, None,
     )
 
-
-# 4. A local copy that only wins at priority 5 must NOT rescue an unreachable Hub,
-#    because the merge cannot use it for a 16bit export.
 
 def test_unreachable_hub_does_not_fall_back_to_a_priority_5_local_copy(
     monkeypatch, tmp_path,
