@@ -1863,6 +1863,7 @@ def vllm_weights_memory_usage(config, load_in_4bit = False, load_in_8bit = False
     # Parameters transformers never places on the accelerator (Qwen4Exp's n-gram
     # table), which vLLM also offloads to CPU by default (VLLM_PLE_CPU_OFFLOAD).
     no_placement = getattr(meta_model, "_no_placement_params", None) or []
+    if os.environ.get("VLLM_PLE_CPU_OFFLOAD", "1").strip() == "0": no_placement = []
 
     weight_bytes = 0
     for name, param in meta_model.named_parameters():

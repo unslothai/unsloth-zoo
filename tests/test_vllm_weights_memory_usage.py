@@ -147,3 +147,5 @@ def test_no_placement_params_are_not_charged(monkeypatch):
         Qwen3ForCausalLM, "_no_placement_params", ["model.layers.0.mlp.down_proj.weight"], raising = False,
     )
     assert full - vllm_utils.vllm_weights_memory_usage(config) == 64 * 128 * 2
+    monkeypatch.setenv("VLLM_PLE_CPU_OFFLOAD", "0")
+    assert vllm_utils.vllm_weights_memory_usage(config) == full
