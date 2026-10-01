@@ -46,7 +46,7 @@ _VENDORED_MARK = "_UNSLOTH_VENDORED_FLA"
 _EXPORT_SUBMODULES = ("fla.modules", "fla.ops", "fla.ops.gated_delta_rule")
 
 # Modeling modules binding fla symbols as globals at import (None when unavailable).
-_REPAIR_MODELING = ("qwen3_5", "qwen3_5_moe", "qwen3_next")
+_REPAIR_MODELING = ("qwen3_5", "qwen3_5_moe", "qwen3_next", "qwen4_exp")
 
 # Kimi delta attention consumers; they reach fla only through kernel-hub wrappers.
 _KDA_MODELING = ("glm5_next", "kimi_linear")
@@ -825,6 +825,22 @@ def _resolved_implementation(wrapper):
     return None
 
 
+def _decorated_kernel_name(wrapper, default):
+    code = getattr(wrapper, "__code__", None)
+    closure = getattr(wrapper, "__closure__", None) or ()
+    if code is None:
+        return default
+    for name, cell in zip(code.co_freevars, closure):
+        if name != "func_name":
+            continue
+        try:
+            value = cell.cell_contents
+        except ValueError:
+            return default
+        return value if isinstance(value, str) and value else default
+    return default
+
+
 def _live_fla_kernel(module_name, name):
     """The kernel ``name`` currently resolves to on the live fla, or None."""
     module = sys.modules.get(module_name)
@@ -851,6 +867,8 @@ def _repair_kernel_hub_closures(packages=_HUB_REPAIR_MODELING):
             original = getattr(wrapper, "__wrapped__", None)
             if original is None:
                 continue
+            # Keep the model's own name (qwen4_exp uses "fused_recurrent_gated_delta_rule").
+            kernel = _decorated_kernel_name(wrapper, kernel)
             current = _resolved_implementation(wrapper)
             live = _live_fla_kernel(kernel_module, kernel)
             if live is not None and current is live:

@@ -1352,11 +1352,50 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         # LFM2: vLLM fuses HF w1 (gate) + w3 (up) as w13 (w1 in vLLM <= 0.15)
         feed_forward = getattr(layer, "feed_forward", None)
         w13 = getattr(feed_forward, "w13", None) or getattr(feed_forward, "w1", None)
+        experts = getattr(feed_forward, "experts", None)
+        experts = getattr(experts, "base_layer", experts)  # FusedMoEWithLoRA under enable_lora
+        prefix = f"{vllm_text_model_prefix}.layers.{kk}.feed_forward"
         if not hasattr(layer, "mlp") and w13 is not None:
-            prefix = f"{vllm_text_model_prefix}.layers.{kk}.feed_forward"
             get_state_dict(f"{prefix}.w1", 0, state_dict, w13)
             get_state_dict(f"{prefix}.w3", 1, state_dict, w13)
             get_state_dict(f"{prefix}.w2", 0, state_dict, feed_forward.w2)
+        elif not hasattr(layer, "mlp") and hasattr(getattr(experts, "routed_experts", experts), "w13_weight"):
+            # LFM2-MoE: FusedMoE w13 [E, 2I, H] / w2 [E, H, I] = HF gate_up_proj / down_proj (vLLM >= 0.30: on routed_experts)
+            routed = getattr(experts, "routed_experts", experts)
+            quant_method = getattr(routed, "quant_method", None)
+            quant_method = getattr(quant_method, "old_quant_method", quant_method)  # FusedMoEModularMethod
+            backend = getattr(quant_method, "unquantized_backend", None)
+            backend = getattr(backend, "name", backend)
+            w13, w2 = routed.w13_weight, routed.w2_weight
+            # Other backends reorder w13 at load; TRTLLM is vLLM's pick for LoRA-enabled bf16 MoE on Blackwell.
+            if backend not in (None, "TRITON", "BATCHED_TRITON") or w13.dim() != 3 or w2.dim() != 3 \
+                or w13.shape[1] != 2 * w2.shape[2] or w13.shape[2] != w2.shape[1]:
+                raise NotImplementedError(
+                    f"Unsloth: fast_inference cannot rebuild MoE experts from vLLM's {backend} layout "
+                    f"(w13 {tuple(w13.shape)}, w2 {tuple(w2.shape)}); set fast_inference = False."
+                )
+            moe_tensors = {
+                f"{prefix}.experts.gate_up_proj": w13,
+                f"{prefix}.experts.down_proj": w2,
+                f"{prefix}.gate.weight": feed_forward.gate.weight,
+            }
+            expert_bias = getattr(feed_forward.gate, "e_score_correction_bias", None)
+            if expert_bias is not None:
+                moe_tensors[f"{prefix}.expert_bias"] = expert_bias
+            for key, value in moe_tensors.items():
+                # float8 also passes is_floating_point(); its scales are not carried over
+                if value.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+                    raise NotImplementedError(
+                        f"Unsloth: fast_inference cannot rebuild quantized MoE weights ({key}); "
+                        "load the model in 16-bit or set fast_inference = False."
+                    )
+                state_dict[key] = value.data
+                quant_state_dict[key] = value.data
+        elif not hasattr(layer, "mlp") and feed_forward is not None:
+            raise NotImplementedError(
+                f"Unsloth: fast_inference cannot rebuild layer {kk}'s {type(feed_forward).__name__} from vLLM; "
+                "set fast_inference = False."
+            )
         if not hasattr(layer, "mlp"):
             continue
 
@@ -1603,6 +1642,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     pass
 
     skipped_layernorms = []
+    loaded_buffers = []
     for kk in range(layer_count):
         for layer_name in layer_names:
             layer_name = layer_name.format(kk = kk)
@@ -1650,6 +1690,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 parent = eval(f"new_model.{parent_path}") if parent_path else new_model
                 if attr_name in getattr(parent, "_buffers", {}):
                     parent._buffers[attr_name] = raw_value
+                    loaded_buffers.append((parent, attr_name, raw_value))
                 else:
                     layer = torch.nn.Parameter(raw_value, requires_grad = False)
                     exec(f"new_model.{layer_name_br} = layer")
@@ -1745,6 +1786,9 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
         quantization_config = quantization_config,
         bnb_config = bnb_config,
     )
+    # finalize copies every buffer from the meta template (e.g. zeroed LFM2-MoE expert_bias)
+    for parent, attr_name, raw_value in loaded_buffers:
+        parent._buffers[attr_name] = raw_value
 
     # Must override or else Bitsandbytes will error
     new_model.to = partial(_override_to, new_model)

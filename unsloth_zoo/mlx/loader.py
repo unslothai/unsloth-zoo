@@ -236,6 +236,12 @@ def _mlx_lora_type_specs(*, include_convolutions=False):
                 vlm_lora_module.LoRASwitchLinear,
             )
         )
+    from .utils import LoRAHadamardLinear, _hadamard_pack_module
+    pack = _hadamard_pack_module()
+    if pack is not None:
+        specs.append(_MLXLoRATypeSpec(
+            (pack.HadamardQuantizedLinear,), LoRAHadamardLinear,
+        ))
     if include_convolutions:
         from .utils import LoRAPointwiseConv2d
         specs.append(_MLXLoRATypeSpec((nn.Conv2d,), LoRAPointwiseConv2d))
@@ -260,12 +266,11 @@ def _check_mlx_lora_base(module):
         )
 
 
-def _mlx_lora_base_types():
-    return tuple(
-        base_type
-        for spec in _mlx_lora_type_specs()
-        for base_type in spec.base_types
-    ) + _mlx_bitlinear_types()
+def _is_mlx_lora_base(module, specs=None):
+    # BitLinear is found so that _check_mlx_lora_base can refuse it by name.
+    specs = _mlx_lora_type_specs() if specs is None else specs
+    return (_mlx_lora_spec_for_module(module, specs) is not None
+            or isinstance(module, _mlx_bitlinear_types()))
 
 
 def _mlx_quantized_switch_module_types():
@@ -483,9 +488,9 @@ def _collect_all_linear_target_names(model):
     """
     names = set()
     try:
-        linear_types = _mlx_lora_base_types()
+        specs = _mlx_lora_type_specs()
         for path, mod in model.named_modules():
-            if not isinstance(mod, linear_types):
+            if not _is_mlx_lora_base(mod, specs):
                 continue
             for token in reversed(str(path).split(".")):
                 if token and not token.isdigit():
@@ -1162,6 +1167,28 @@ def _load_mlx_lm_with_strict_fallback(
     if want_config:
         return model, tokenizer, config
     return model, tokenizer
+
+
+def _download_missing_index_shards(model_name, local_path, revision, download):
+    """Fetch index-mapped shards mlx-lm's `model*.safetensors` default skipped; mlx-vlm drops absent ones."""
+    if os.path.isdir(model_name):
+        return local_path
+    try:
+        with open(os.path.join(local_path, "model.safetensors.index.json")) as file:
+            weight_map = json.load(file).get("weight_map") or {}
+    except (OSError, ValueError, AttributeError):
+        return local_path
+    missing = sorted(
+        {shard for shard in weight_map.values()
+         if isinstance(shard, str) and not os.path.exists(os.path.join(local_path, shard))}
+    )
+    if not missing:
+        return local_path
+    # Pin to the fetched `snapshots/<sha>`: a re-resolved branch could return only these shards.
+    snapshot = os.path.basename(os.path.normpath(local_path))
+    if re.fullmatch(r"[0-9a-f]{40}", snapshot):
+        revision = snapshot
+    return str(download(model_name, revision=revision, allow_patterns=missing))
 
 
 def _mlx_lm_metadata_allow_patterns():
@@ -2303,7 +2330,11 @@ def _fix_missing_no_grad(model):
     AudioRelativePositionEmbedding).
     """
     import mlx.nn as nn
-    for _, mod in model.named_modules():
+    # _finish_load runs this for every load, and not every loader hands back an nn.Module.
+    named_modules = getattr(model, "named_modules", None)
+    if named_modules is None:
+        return
+    for _, mod in named_modules():
         if isinstance(mod, nn.Module):
             if not hasattr(mod, "_no_grad"):
                 object.__setattr__(mod, "_no_grad", set())
@@ -3381,6 +3412,14 @@ def _mark_text_only_vlm(model, model_type: str) -> None:
     extra = _verify_text_only_wrapper(model, model_type)
     _bind_text_only_modality_arguments(model, extra)
     model._unsloth_text_only_vlm = True
+
+
+def _freeze_text_only_full_finetune(model) -> None:
+    """Freeze the towers for a text-only full fine-tune of a VLM; no-op otherwise."""
+    if getattr(model, "_unsloth_full_finetuning", False) and getattr(
+        model, "_unsloth_text_only_vlm", False
+    ):
+        _freeze_outside_language_model(model)
 
 
 def _freeze_outside_language_model(model) -> None:
@@ -7269,10 +7308,10 @@ def _set_child(parent, leaf, value):
 
 
 def _subtree_linears(module):
-    types = _mlx_lora_base_types()
+    specs = _mlx_lora_type_specs()
     return [
         (name, child) for name, child in module.named_modules()
-        if isinstance(child, types)
+        if _is_mlx_lora_base(child, specs)
     ]
 
 
@@ -7770,11 +7809,11 @@ def _resolve_lora_keys(model, target_modules):
     if not target_modules:
         return None
 
-    linear_types = _mlx_lora_base_types()
+    specs = _mlx_lora_type_specs()
     keys = set()
     for root in _mlx_language_layers(model):
         for name, module in root.named_modules():
-            if not isinstance(module, linear_types):
+            if not _is_mlx_lora_base(module, specs):
                 continue
             if _lora_name_matches_target(name, target_modules):
                 keys.add(name)
@@ -7838,10 +7877,9 @@ def _resolve_embedding_module(model):
 
 
 def _is_lora_capable_head(module):
-    """Whether mlx-lm's ``to_lora`` can wrap this head; it raises otherwise."""
-    import mlx.nn as nn
-    return hasattr(module, "to_lora") or isinstance(
-        module, (nn.Linear, nn.QuantizedLinear))
+    """Whether a LoRA wrapper can wrap this head; conversion raises otherwise."""
+    return hasattr(module, "to_lora") or _mlx_lora_spec_for_module(
+        module, _mlx_lora_type_specs()) is not None
 
 
 def _quantized_descendant_path(path, module):
@@ -8177,11 +8215,9 @@ def _finish_load(model, tokenizer):
     install_quantized_attention()
     # Here rather than in get_peft_model: the trainer and callers freeze loaded models too.
     _fix_missing_no_grad(model)
-    if (
-        getattr(model, "_unsloth_full_finetuning", False)
-        and getattr(model, "_unsloth_text_only_vlm", False)
-    ):
-        _freeze_outside_language_model(model)
+    # A call, not an if: tests/test_mlx_attention_metal.py keeps this body straight-line so the
+    # attention patch above can never sit behind a branch.
+    _freeze_text_only_full_finetune(model)
     _materialize_weights(model)
     return model, tokenizer
 
@@ -8407,6 +8443,10 @@ class FastMLXModel:
                         allow_patterns=config_allow_patterns,
                     )
                 )
+                if not distributed_requested:
+                    local_path = _download_missing_index_shards(
+                        model_name, local_path, revision, _download,
+                    )
                 original_local_path = local_path
         except Exception:
             if distributed_requested:

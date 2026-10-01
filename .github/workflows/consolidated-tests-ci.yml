@@ -432,6 +432,7 @@ jobs:
             tests/test_mlx_incomplete_config.py \
             tests/test_mlx_incomplete_config_vlm.py \
             tests/test_mlx_adam_epsilon.py \
+            tests/test_mlx_optimizer_torch_parity.py \
             tests/test_hf_xet_fallback.py \
             tests/test_hf_xet_fallback_blob_scoped_redownload.py \
             tests/test_llama_cpp_install_consent.py \
@@ -442,6 +443,7 @@ jobs:
             tests/test_mlx_preference.py \
             tests/test_mlx_trainer_internals.py \
             tests/test_mlx_arrays_cache_advance.py \
+            tests/test_prepare_model_for_training_embedding_lora.py \
             tests/test_mlx_quantized_optimizer_routing.py \
             tests/test_mlx_embedding_guards.py \
             tests/test_fp16_emulation.py \
@@ -460,6 +462,7 @@ jobs:
             tests/test_moe_preprocess_weight_transpose.py \
             tests/test_relative_imports_resolve.py \
             tests/test_grpo_mask_truncated_rows.py \
+            tests/test_deepseek_v41_compile_entries.py \
             tests/test_moe_weight_preprocessor_registry_shared.py \
             tests/test_moe_triton_down_lora_roworder.py \
             tests/test_moe_router_not_a_lora_target.py \
@@ -478,6 +481,7 @@ jobs:
             tests/test_vision_url_dns_rebinding.py \
             tests/test_merge_index_weight_map_traversal.py \
             tests/test_gguf_converter_child_env.py \
+            tests/test_responses_only_last_turn_header.py \
             tests/test_gguf_post_conversion_validation.py \
             tests/test_mtp_config_reconcile.py \
             tests/test_llama_cpp_converter_scan.py \
@@ -503,6 +507,7 @@ jobs:
             tests/test_device_map_planner_compressed_tensors.py \
             tests/test_gemma3n_kv_sharing_without_cache.py \
             tests/test_gemma3n_rmsnorm_with_scale.py \
+            tests/test_mlx_gkd_guards.py \
             -v
 
       - name: pytest MLX adapter-filter gate (HARD GATE)
@@ -634,7 +639,7 @@ jobs:
           # Both bounds are repeated here because pyproject's mlx-vlm ceiling and the
           # 5.5.0 half of its transformers cap are marker-gated to darwin + arm64 and so
           # constrain nothing on this Linux lane. The mlx-vlm bound mirrors pyproject's
-          # <=0.7.1; without it the lane resolved 0.7.0, a combination pyproject forbids.
+          # <=0.7.4; without it the lane resolved 0.7.0, a combination pyproject forbids.
           # transformers<=5.5.0 is what holds the resolution at mlx-vlm 0.6.4 (0.6.5+
           # wants transformers>=5.14.0); without it the lane follows the off-darwin cap
           # and stops measuring the Apple Silicon stack. tests/mlx_simulation models the
@@ -647,7 +652,7 @@ jobs:
               retry .lanes/venv-suites/bin/pip install --index-url https://download.pytorch.org/whl/cpu \
                 "torch>=2.4.0,<2.11.0" &&
               retry .lanes/venv-suites/bin/pip install -e .[core] "transformers<=5.5.0" \
-                "mlx>=0.22.0" mlx-cpu "mlx-lm>=0.31.2" "mlx-vlm>=0.4.4,<=0.7.1" &&
+                "mlx>=0.22.0" mlx-cpu "mlx-lm>=0.31.2" "mlx-vlm>=0.4.4,<=0.7.4" &&
               { .lanes/venv-suites/bin/pip install --no-deps \
                 "unsloth @ git+https://github.com/unslothai/unsloth@main" || true; } &&
               retry .lanes/venv-suites/bin/pip install pytest==9.0.3
@@ -820,6 +825,31 @@ jobs:
             --report "$RUNNER_TEMP/mlx-reports/quantized_optimizer_state.xml" \
             --require no-skips \
             --message "real mlx is installed but the numeric tests skipped"
+
+      - name: pytest tests/test_mlx_optimizer_defaults.py (HARD GATE)
+        # rmsprop/adamax/adagrad/adadelta defaults and Adamax bias correction vs torch.optim; shim cannot answer.
+        run: >-
+          .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_optimizer_defaults.py -v -rs
+          --junitxml="$RUNNER_TEMP/mlx-reports/optimizer_defaults.xml"
+
+      - name: Fail if the optimizer defaults tests skipped
+        run: |
+          python3 scripts/pytest_junit_gate.py \
+            --report "$RUNNER_TEMP/mlx-reports/optimizer_defaults.xml" \
+            --require no-skips \
+            --message "real mlx is installed but the optimizer defaults tests skipped"
+
+      - name: pytest tests/test_mlx_gkd_loss.py (HARD GATE)
+        run: >-
+          .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_gkd_loss.py -v -rs
+          --junitxml="$RUNNER_TEMP/mlx-reports/gkd_loss.xml"
+
+      - name: Fail if the GKD numeric tests skipped
+        run: |
+          python3 scripts/pytest_junit_gate.py \
+            --report "$RUNNER_TEMP/mlx-reports/gkd_loss.xml" \
+            --require no-skips \
+            --message "real mlx is installed but the GKD numeric tests skipped"
 
       - name: tests/test_mlx_neftune_quant_map.py (mlx_only half, HARD GATE)
         # Embedding identification, embed-scale resolution and probe cleanup are
@@ -1148,6 +1178,7 @@ jobs:
                   tests/test_disable_compile_functions_reach_imported_helpers.py \
                   tests/test_data_dependent_helpers_not_fullgraph.py \
                   tests/test_decode_compile_disable.py \
+                  tests/test_eager_decode_bypass.py \
                   tests/test_temporary_patches_exhaustive.py \
                   tests/test_patch_keeps_module_name.py \
                   tests/test_mxfp4_load_path_layout.py \
@@ -1163,6 +1194,7 @@ jobs:
                   tests/test_fix_untrained_tokens_composite_models.py \
                   tests/test_gemma4_dtype_drift_guards.py \
                   tests/test_gemma4_unified_forced_float32.py \
+                  tests/test_gemma3_processor_token_type_ids.py \
                   tests/test_fp16_path_tiny_models.py >> "$log" 2>&1 || trc=$?
                 echo "$trc" > ".lanes/$id.tests"
               else

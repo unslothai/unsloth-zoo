@@ -703,6 +703,7 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
 
     remove_keys = set()
     keep_keys   = set()
+    _embedding_lora_keys = set()
 
     inner_model = find_lora_base_model(model)
     for name, module in inner_model.named_modules():
@@ -717,6 +718,17 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
             lora_weights[name[:-len(".lora_B.default")]].lora_B = module.weight
             lora_B_count += 1
             expand_module_keys(name, module, remove_keys)
+
+        elif name.endswith((".lora_embedding_A", ".lora_embedding_B")) and "default" in module:
+            # PEFT Embedding delta (B_e @ A_e).T == Linear form with lora_B = A_e.T, lora_A = B_e.T.
+            key = name[:-len(".lora_embedding_A")]
+            _embedding_lora_keys.add(key)
+            if name.endswith("_A"):
+                lora_weights[key].lora_B = module["default"].t()
+                lora_B_count += 1
+            else:
+                lora_weights[key].lora_A = module["default"].t()
+                lora_A_count += 1
 
         elif name.endswith(".lora_magnitude_vector.default"):
             # DoRA magnitude vector m; folded onto the merged weight in _merge_lora. Register its
@@ -793,15 +805,14 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
 
     # DoRA on a non-dense target (e.g. an Embedding / tied lm_head trained with
     # use_dora=True) captures a lora_magnitude_vector but no mergeable lora_A/lora_B
-    # (PEFT stores the embedding delta as lora_embedding_A/lora_embedding_B, which
-    # this merge does not read). _merge_lora only folds the magnitude onto W0+delta
+    # (embedding DoRA is not the Linear DoRA below). _merge_lora only folds the magnitude onto W0+delta
     # for a dense nn.Linear; here it would early-return the base weight and the
     # magnitude (and the embedding delta) would be silently dropped -- and since
     # assert_same_keys now ignores lora_magnitude_vector keys, that wrong merge would
     # not even trip the key check. Fail loud instead (matches _refuse_dora_on_moe).
     for _key, _stats in lora_weights.items():
         if getattr(_stats, "magnitude", None) is not None and (
-            _stats.lora_A is None or _stats.lora_B is None
+            _stats.lora_A is None or _stats.lora_B is None or _key in _embedding_lora_keys
         ):
             raise RuntimeError(
                 f"Unsloth: DoRA (use_dora=True) merging is not yet supported for `{_key}` "

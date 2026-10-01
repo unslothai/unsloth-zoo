@@ -174,6 +174,9 @@ def install_to_cache(source_path, destination_filename=None):
         # up the atomicity above, so the readback below is what keeps a partial
         # copy from being used.
         try:
+            # Writing through a planted symlink would clobber whatever it targets.
+            if os.path.islink(destination) or os.path.isdir(destination):
+                raise OSError("destination is a symlink or directory")
             shutil.copy(current_file, destination)
         except Exception as copy_error:
             _log_info(
@@ -3814,6 +3817,11 @@ def forward_native_grouped_mm(
         batch_size, sequence_length, hidden_dim = hidden_states.shape
 
     hidden_states = hidden_states.view(-1, hidden_dim)
+    # torch._grouped_mm is not autocast-cast; Qwen4Exp's PLE sum yields fp32 under autocast.
+    if hidden_states.dtype == torch.float32 and torch.is_autocast_enabled(hidden_states.device.type):
+        _stack = self._parameters.get("gate_up_proj", self._parameters.get("gate_proj"))
+        if _stack is not None and _stack.dtype in (torch.float16, torch.bfloat16):
+            hidden_states = hidden_states.to(_stack.dtype)
 
     # Routing: count tokens per expert, sort to group by expert, gather inputs.
     flat_top_k = top_k_index.view(-1)

@@ -308,6 +308,43 @@ def test_unreplaceable_moe_utils_cache_copy_is_not_loaded(tmp_path, monkeypatch)
         sys.modules.pop("unsloth_cached_moe_utils", None)
 
 
+def test_moe_utils_fallback_copy_does_not_write_through_a_symlink(tmp_path, monkeypatch):
+    location = tmp_path / "moe_cache_symlink"
+    location.mkdir()
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep")
+    (location / "moe_utils.py").symlink_to(victim)
+    monkeypatch.setenv("UNSLOTH_COMPILE_LOCATION", str(location))
+
+    def refuse(*args, **kwargs):
+        raise OSError("no temp file here")
+    monkeypatch.setattr(moe_utils, "_replace_with_copy", refuse)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        assert moe_utils.install_to_cache(moe_utils.__file__, "moe_utils.py") is False
+    assert victim.read_text() == "keep"
+
+
+def test_moe_utils_fallback_copy_does_not_write_into_a_directory(tmp_path, monkeypatch):
+    """shutil.copy into a directory writes <dir>/moe_utils.py, which can be a link."""
+    location = tmp_path / "moe_cache_dir"
+    (location / "moe_utils.py").mkdir(parents = True)
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep")
+    (location / "moe_utils.py" / "moe_utils.py").symlink_to(victim)
+    monkeypatch.setenv("UNSLOTH_COMPILE_LOCATION", str(location))
+
+    def refuse(*args, **kwargs):
+        raise OSError("no temp file here")
+    monkeypatch.setattr(moe_utils, "_replace_with_copy", refuse)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        assert moe_utils.install_to_cache(moe_utils.__file__, "moe_utils.py") is False
+    assert victim.read_text() == "keep"
+
+
 def test_install_to_cache_survives_a_cache_it_cannot_create(tmp_path, monkeypatch):
     """A cache path that cannot exist at all reports failure without raising."""
     blocker = tmp_path / "not_a_directory"

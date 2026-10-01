@@ -214,7 +214,10 @@ def test_the_workflow_gates_use_this_script_and_do_not_re_run_pytest() -> None:
     steps = doc["jobs"]["mlx-cpu-linux"]["steps"]
 
     gates = [ s for s in steps if (s.get("name") or "").startswith("Fail if") ]
-    assert len(gates) == 5, f"expected 5 gate steps, found {len(gates)}"
+    # Counted against the reports rather than a fixed number: each new MLX suite adds
+    # one gated pytest step and one gate (#968, #819 and #965 took this from 5 to 8),
+    # and what matters is that every report has exactly one gate reading it.
+    assert gates, "no gate steps found in mlx-cpu-linux"
 
     reports_written = {
         token.split("=", 1)[1].strip('"')
@@ -222,10 +225,13 @@ def test_the_workflow_gates_use_this_script_and_do_not_re_run_pytest() -> None:
         for token in (step.get("run") or "").split()
         if token.startswith("--junitxml=")
     }
-    assert len(reports_written) == 5, (
-        f"the gated pytest steps write {len(reports_written)} distinct reports, "
-        f"expected 5: {sorted(reports_written)}"
+    assert len(reports_written) == len(gates), (
+        f"the gated pytest steps write {len(reports_written)} distinct reports but "
+        f"there are {len(gates)} gate steps: {sorted(reports_written)}"
     )
+    for written in reports_written:
+        readers = [ step["name"] for step in gates if Path(written).name in (step.get("run") or "") ]
+        assert len(readers) == 1, f"report {written} is read by {readers}, expected one gate"
 
     for step in gates:
         run = step.get("run") or ""

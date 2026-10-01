@@ -748,27 +748,19 @@ def test_collect_all_linear_target_names_finds_qkv_and_moe():
     # exists to catch, and pointing at the wrong file.
     pytest.importorskip("mlx")
     pytest.importorskip("mlx_lm")
-    from unsloth_zoo.mlx_loader import _collect_all_linear_target_names, _mlx_lora_base_types
+    from unsloth_zoo.mlx_loader import _collect_all_linear_target_names, _is_mlx_lora_base
     import mlx.nn as nn
 
-    # Prove the prerequisite BEFORE asserting on the output. An empty type tuple makes every
-    # isinstance() below false, so the helper returns nothing no matter how correct it is;
-    # that is a broken environment, not dropped targeting, and it must not be reported as one.
+    # If a plain Linear is not a LoRA base the helper returns [] regardless: a broken env, not a regression.
     try:
-        base_types = _mlx_lora_base_types()
+        linear_is_base = _is_mlx_lora_base(nn.Linear(4, 4))
     except Exception as exc:  # noqa: BLE001 - mirrors the helper's own blanket catch
         pytest.skip(f"MLX LoRA base types unavailable ({exc!r}); the helper would return [] "
                     f"for a reason unrelated to all-linear targeting")
-    # Both of these are degraded-environment conditions, not regressions, so they SKIP.
-    # Failing here would redden CI for a partial or stubbed MLX that says nothing about
-    # whether all-linear targeting is correct -- which is the bug this whole guard had.
-    if not base_types:
-        pytest.skip("_mlx_lora_base_types() resolved to an empty tuple, so nothing can match "
-                    "the isinstance walk and the helper returns [] regardless of its logic")
-    if not (isinstance(nn.Linear, type) and issubclass(nn.Linear, tuple(base_types))):
-        pytest.skip(f"mlx.nn.Linear is not among the types the helper matches on "
-                    f"({base_types}); a stand-in MLX left in sys.modules by another test "
-                    f"cannot exercise the walk")
+    # Skip, not fail: a stubbed MLX says nothing about all-linear targeting (the bug this guard had).
+    if not linear_is_base:
+        pytest.skip("mlx.nn.Linear is not a LoRA base here; a stand-in MLX left in "
+                    "sys.modules by another test cannot exercise the walk")
 
     class FakeQwen3p5:
         """Minimal model whose named_modules() exposes the leaves that

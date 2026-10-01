@@ -1088,6 +1088,10 @@ def get_model_layer_config(return_non_layered=True):
             "model.layers.{kk}.feed_forward.w1",
             "model.layers.{kk}.feed_forward.w2",
             "model.layers.{kk}.feed_forward.w3",
+            "model.layers.{kk}.feed_forward.experts.gate_up_proj",
+            "model.layers.{kk}.feed_forward.experts.down_proj",
+            "model.layers.{kk}.feed_forward.gate.weight",
+            "model.layers.{kk}.feed_forward.expert_bias",
 
             # Gemma4 per-layer input modules
             "model.language_model.layers.{kk}.per_layer_input_gate",

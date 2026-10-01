@@ -125,8 +125,20 @@ def chunked_hidden_states_selective_log_softmax(
         chunks = max(chunks, -(-n_rows // max_rows_per_chunk))
         chunks = min(chunks, max(n_rows, 1))
 
-    chunked_hidden_states = torch.chunk(flat_hidden_states, chunks=chunks, dim=0)
-    chunked_index = torch.chunk(flat_index, chunks=chunks, dim=0)
+    # A one-row chunk's head gradient is a K=1 matmul Inductor mis-lowers under dynamic shapes (illegal
+    # memory access or NaN head gradients, torch 2.13), so keep chunks at 2+ rows when the head trains.
+    lm_head_grad = torch.is_grad_enabled() and lm_head.requires_grad
+    if lm_head_grad and chunks >= flat_hidden_states.shape[0]:
+        chunks = max(flat_hidden_states.shape[0] // 2, 1)
+
+    chunked_hidden_states = list(torch.chunk(flat_hidden_states, chunks=chunks, dim=0))
+    chunked_index = list(torch.chunk(flat_index, chunks=chunks, dim=0))
+    if lm_head_grad and len(chunked_hidden_states) > 1 and chunked_hidden_states[-1].shape[0] == 1:
+        # Re-split with the previous chunk: max_rows_per_chunk then only breaks for a cap of 2 over odd rows.
+        for chunked in (chunked_hidden_states, chunked_index):
+            pair = torch.cat(chunked[-2:])
+            half = (pair.shape[0] + 1) // 2
+            chunked[-2:] = [pair[:half], pair[half:]] if pair.shape[0] >= 4 else [pair]
 
     all_per_token_logps = []
 
