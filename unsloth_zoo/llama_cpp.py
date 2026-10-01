@@ -7493,7 +7493,7 @@ def check_build_requirements():
     # Check for libgomp (OpenMP runtime) - needed for llama.cpp CPU backend linking
     gomp_path = _find_lib_path('libgomp.so')
     if gomp_path is None:
-        gomp_packages = {'debian': 'libgomp1', 'rpm': 'libgomp-devel', 'arch': 'gcc',
+        gomp_packages = {'debian': 'libgomp1', 'rpm': 'libgomp', 'arch': 'gcc',
                          'alpine': 'libgomp', 'suse': 'libgomp1', 'gentoo': 'sys-devel/gcc'}
         missing_packages.append(gomp_packages.get(system_type, 'libgomp1'))
 
