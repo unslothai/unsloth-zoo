@@ -106,7 +106,6 @@ PACKAGE_NOT_FOUND = (
     "there are no ebuilds",       # emerge
 )
 
-# Lines meaning the package manager refused to run without root.
 NEEDS_ROOT = (
     "Permission denied",
     "not open lock file",
@@ -124,7 +123,7 @@ PACKAGE_MANAGER_NAMES = {
     "gentoo": "emerge",
 }
 
-# Debian package name -> per-distro name; missing entries keep the Debian name.
+# Missing entries keep the Debian name.
 DISTRO_PACKAGES = {
     "rpm":    {"build-essential": "gcc gcc-c++ make"},
     "arch":   {"build-essential": "base-devel"},

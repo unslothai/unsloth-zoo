@@ -148,7 +148,6 @@ def test_package_not_found_ignores_ordinary_output(llama_cpp, line):
     [("suse", "gcc gcc-c++ make"), ("rpm", "gcc gcc-c++ make"), ("arch", "base-devel"), ("alpine", "build-base")],
 )
 def test_build_requirements_mapped_without_which_binary(llama_cpp, monkeypatch, system_type, expected):
-    # Minimal Fedora / Arch / openSUSE images ship no `which`; the Debian name must not leak.
     def no_which_binary(cmd, *args, **kwargs):
         if cmd and cmd[0] == "which":
             raise FileNotFoundError("which")
