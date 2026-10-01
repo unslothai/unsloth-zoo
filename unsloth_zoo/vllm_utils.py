@@ -1806,9 +1806,27 @@ pass
 
 
 def vllm_weights_memory_usage(config, load_in_4bit = False, load_in_8bit = False):
-    # Meta-device count, so MoE experts and vision towers are included; None if unbuildable.
+    # Meta-device count, so MoE experts and vision towers are included; None if unbuildable
+    # or stored in a format not sized here.
+    import fnmatch
     import transformers
     from accelerate import init_empty_weights
+
+    quant_config = getattr(config, "quantization_config", None) or {}
+    if not isinstance(quant_config, dict): quant_config = quant_config.to_dict()
+    quant_method = quant_config.get("quant_method", None)
+    # Same packing factors as approximate_vllm_memory_usage
+    if quant_method in (None, "bitsandbytes"):
+        quantized_bytes = 2 / (16/5) if load_in_4bit else 2 / (8/5) if load_in_8bit else 2
+    elif quant_method in ("fp8", "fbgemm_fp8"):
+        quantized_bytes = 2 / (8/5)
+    elif quant_method == "mxfp4":
+        quantized_bytes = 17 / 32 # 4-bit values + one 8-bit scale per 32
+    elif quant_method in ("awq", "gptq"):
+        quantized_bytes = quant_config.get("bits", 4) / 8 * 1.125
+    else:
+        return None
+
     meta_model = None
     for auto_class in ("AutoModelForImageTextToText", "AutoModelForCausalLM"):
         auto_class = getattr(transformers, auto_class, None)
@@ -1825,19 +1843,17 @@ def vllm_weights_memory_usage(config, load_in_4bit = False, load_in_8bit = False
     except Exception:
         pass
 
-    quant_config = getattr(config, "quantization_config", None) or {}
-    if not isinstance(quant_config, dict): quant_config = quant_config.to_dict()
     # Checkpoint keys say language_model.model.layers, modules model.language_model.layers.
     def _norm(name):
         return "." + ".".join(x for x in name.split(".") if x != "model") + "."
-    skip_modules = [_norm(x) for x in (quant_config.get("llm_int8_skip_modules", None) or [])]
-    # Same packing factors as approximate_vllm_memory_usage
-    quantized_bytes = 2 / (16/5) if load_in_4bit else 2 / (8/5) if load_in_8bit else 2
+    skip_modules = []
+    for key in ("llm_int8_skip_modules", "modules_to_not_convert", "ignored_layers"):
+        skip_modules += ["*" + _norm(x) + "*" for x in (quant_config.get(key, None) or [])]
 
     weight_bytes = 0
     for name, param in meta_model.named_parameters():
         quantized = param.ndim >= 2 and "embed" not in name and "lm_head" not in name \
-            and not any(module in _norm(name) for module in skip_modules)
+            and not any(fnmatch.fnmatchcase(_norm(name), module) for module in skip_modules)
         weight_bytes += param.numel() * (quantized_bytes if quantized else 2)
     del meta_model
     return int(weight_bytes)

@@ -22,7 +22,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
-from transformers import Gemma3Config, Qwen3MoeConfig, AutoModelForCausalLM
+from transformers import Gemma3Config, GptOssConfig, Qwen3Config, Qwen3MoeConfig, AutoModelForCausalLM
 
 from unsloth_zoo import vllm_utils
 
@@ -88,4 +88,41 @@ def test_unbuildable_config_falls_back(monkeypatch):
     def boom(*args, **kwargs): raise ValueError("unknown architecture")
     monkeypatch.setattr(transformers.AutoModelForCausalLM, "from_config", boom)
     monkeypatch.setattr(transformers.AutoModelForImageTextToText, "from_config", boom)
+    assert vllm_utils.vllm_weights_memory_usage(config) is None
+
+
+def _tiny_dense(**kwargs):
+    return Qwen3Config(
+        vocab_size = 512, hidden_size = 64, intermediate_size = 128,
+        num_hidden_layers = 2, num_attention_heads = 4, num_key_value_heads = 2,
+        head_dim = 16, tie_word_embeddings = False, **kwargs,
+    )
+
+
+def test_mxfp4_experts_are_sized_packed_and_globs_excluded():
+    config = GptOssConfig(
+        vocab_size = 512, hidden_size = 64, intermediate_size = 32,
+        num_local_experts = 8, num_experts_per_tok = 2, num_hidden_layers = 2,
+        num_attention_heads = 4, num_key_value_heads = 2, head_dim = 16,
+    )
+    bf16 = vllm_utils.vllm_weights_memory_usage(config)
+    config.quantization_config = {
+        "quant_method": "mxfp4",
+        "modules_to_not_convert": ["model.layers.*.self_attn", "model.layers.*.mlp.router", "model.embed_tokens", "lm_head"],
+    }
+    model = AutoModelForCausalLM.from_config(config)
+    experts = sum(p.numel() for n, p in model.named_parameters() if ".experts." in n and p.ndim >= 2)
+    assert bf16 - vllm_utils.vllm_weights_memory_usage(config) == pytest.approx(experts * (2 - 17 / 32))
+
+
+def test_fp8_modules_to_not_convert_stay_16bit():
+    config = _tiny_dense(quantization_config = {"quant_method": "fp8"})
+    quantized = vllm_utils.vllm_weights_memory_usage(config)
+    config.quantization_config = {"quant_method": "fp8", "modules_to_not_convert": ["model.layers.0.mlp"]}
+    skipped = vllm_utils.vllm_weights_memory_usage(config)
+    assert skipped - quantized == pytest.approx(3 * 64 * 128 * (2 - 2 / (8/5)))
+
+
+def test_unsized_quant_formats_fall_back():
+    config = _tiny_dense(quantization_config = {"quant_method": "compressed-tensors"})
     assert vllm_utils.vllm_weights_memory_usage(config) is None
