@@ -210,11 +210,7 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
         shift_labels = torch.empty_like(labels)
         shift_labels[..., :-1] = labels[..., 1:]
         shift_labels[..., -1] = ignore_index
-
-        # Keep the same device when multiple GPUs are used
         shift_labels = shift_labels.to(shift_logits.device, non_blocking = True)
-        if torch.is_tensor(num_items_in_batch):
-            num_items_in_batch = num_items_in_batch.to(shift_logits.device, non_blocking = True)
         loss = unsloth_fixed_cross_entropy(shift_logits, shift_labels, num_items_in_batch, ignore_index, **kwargs)
         return loss
     pass
@@ -298,7 +294,7 @@ def fused_linear_cross_entropy(
 
     with current_device(lm_weight.device):
         loss = linear_cross_entropy(
-            hidden_states.to(dtype=lm_weight.dtype, device=lm_weight.device, non_blocking = True),
+            hidden_states.to(device = lm_weight.device, dtype = lm_weight.dtype, non_blocking = True),
             lm_weight,
             targets      = labels.to(lm_weight.device, non_blocking = True),
             ignore_index = ignore_index,
