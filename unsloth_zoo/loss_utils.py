@@ -212,7 +212,7 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
             shift_labels[..., :-1] = labels[..., 1:]
             shift_labels[..., -1] = ignore_index
         else:
-            # Explicit targets are already aligned to logits; the fast CE kernel takes 3-D logits.
+            # Explicit targets are already aligned to logits.
             if logits.dim() == 2:
                 logits = logits.unsqueeze(0)
             shift_labels = shift_labels.reshape(logits.shape[:-1]).to(logits.device).contiguous()
@@ -510,17 +510,12 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
             # collectives below, never by breaking out: skipping accelerator.gather on
             # one rank alone would hang the others.
             degenerate = False
-            # Implicit targets drop the first column; explicit shift_labels are
-            # already aligned and can supervise even a one-column batch. Only
-            # decline when EVERY microbatch has no target positions, since an
-            # empty member of a mixed group simply contributes 0 to its divisor.
+            # Decline only when EVERY microbatch has no targets: an empty member of a mixed group adds 0.
             all_short = True
             for x in batch_samples:
                 labels = x["labels"]
                 shift_labels = x.get("shift_labels")
-                # Count exactly the targets consumed by the loss. A caller's
-                # pre-shifted targets carry their own mask and must not be shifted
-                # or remasked using attention_mask / packing metadata below.
+                # Pre-shifted targets carry their own mask: never re-shift or re-mask them below.
                 targets = labels[..., 1:] if shift_labels is None else shift_labels
                 if targets.shape[-1] != 0: all_short = False
                 token_count = (targets != -100)

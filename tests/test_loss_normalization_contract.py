@@ -1031,7 +1031,6 @@ def test_explicit_shift_labels_are_the_authoritative_count(metadata, width):
     targets = torch.tensor([[1, 2, -100, 4, 5, -100]])[:, :width]
     batch = {"input_ids": labels.clone(), "labels": labels, "shift_labels": targets}
     if metadata == "attention_mask":
-        # The explicit-target loss does not apply this mask a second time.
         batch[metadata] = torch.zeros_like(labels)
     elif metadata == "packed_seq_lengths":
         batch[metadata] = [3, 3]

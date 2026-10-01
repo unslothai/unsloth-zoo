@@ -130,7 +130,6 @@ def test_explicit_targets_keep_final_positions(patched_loss, flat_logits, flat_t
     targets = torch.tensor([[1, 2, 3], [4, 5, 6]])
     if flat_logits: logits = logits.reshape(-1, 8)
     if flat_targets: targets = targets.reshape(-1)
-    # Raw labels must not determine explicit targets' shape or end masks.
     labels = torch.tensor([[0]])
     torch.testing.assert_close(
         unsloth(logits, labels, 8, shift_labels = targets),
