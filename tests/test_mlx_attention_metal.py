@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import functools
 import sys
 
 import pytest
@@ -132,14 +133,14 @@ def test_the_query_count_against_the_cache_geometry_decides_the_route(HQ, HKV, D
 
 
 @pytest.mark.parametrize("D,Dv,group_size", [
-    (256, 256, 64),   # Gemma-2 and Gemma-3: no full kernel at head_dim 256
+    (256, 256, 64),   # Gemma-2 and Gemma-3: fused only for long causal or array-masked prefill
     (192, 128, 64),   # MLA-shaped: a latent wider than the values
     (160, 160, 32),   # not a supported head dim at all
     (128, 64, 64),    # values narrower than the keys
 ])
 def test_a_geometry_with_no_fused_kernel_never_leaves_the_runtime(D, Dv, group_size):
-    """Past 8 queries mlx has a full kernel only at head_dim 64/72/80/96/128 with D == Dv; anywhere
-    else it materializes the same scores, so dequantizing on top of them is strictly worse."""
+    """mlx fuses none of these calls, so it materializes the same scores and dequantizing on top of
+    them is strictly worse."""
     cache = _cache(1, 8, 512, D, 4, group_size, Dv=Dv)
     taken = []
 
@@ -155,6 +156,140 @@ def test_a_geometry_with_no_fused_kernel_never_leaves_the_runtime(D, Dv, group_s
     assert taken == [16, 1024, 65536]
     # and the guard is what declined it: on bytes alone the deepest call would have dequantized.
     assert dequantizing_is_smaller(_queries(1, 32, 65536, D), *cache, group_size) is True
+
+
+@pytest.mark.parametrize("case,expected", [
+    ({}, True),
+    ({"L": 1023}, False),
+    ({"S": 1023}, False),   # more queries than keys
+    ({"mask": None}, False),
+    ({"mask": "bool"}, True),
+    ({"mask": "additive"}, True),
+    ({"mask": "bool", "L": 1023}, False),
+    ({"Dv": 128}, False),
+    ({"nax": False}, False),
+    ({"nax": False, "L": 2048, "S": 2048}, True),
+    ({"nax": False, "L": 2048, "S": 4096}, False),
+    ({"nax": False, "L": 2048, "S": 2048, "dtype": mx.float32}, False),
+    ({"nax": False, "L": 2048, "S": 2048, "mask": "bool"}, False),
+    ({"dtype": mx.float16}, True),
+    ({"tf32": "0"}, True),
+    ({"dtype": mx.float32}, True),
+    ({"dtype": mx.float32, "tf32": "0"}, False),
+    ({"dtype": mx.float32, "qdtype": mx.bfloat16, "tf32": "0"}, False),   # the result dtype decides
+    ({"dtype": mx.float32, "tf32": None}, True),   # unset means on
+    ({"dtype": mx.float32, "tf32": " 0"}, False),
+    ({"dtype": mx.float32, "tf32": "abc"}, False),
+    ({"dtype": mx.float32, "tf32": "-1"}, True),
+    ({"D": 512, "L": 4096, "S": 4096}, True),
+    ({"D": 512, "L": 4096, "S": 4096, "nax": False}, False),
+    ({"D": 512, "L": 4096, "S": 4096, "dtype": mx.float32, "tf32": "0"}, False),
+])
+def test_wide_head_prefill_is_fused_where_mlx_fuses_it(monkeypatch, case, expected):
+    from unsloth_zoo.mlx import attention, nax
+
+    c = {"L": 1024, "S": 1024, "D": 256, "mask": "causal", "nax": True, "dtype": mx.bfloat16,
+         "tf32": "1", **case}
+    c.setdefault("Dv", c["D"])
+    monkeypatch.setattr(nax, "nax_available", lambda: c["nax"])
+    if c["tf32"] is None:
+        monkeypatch.delenv("MLX_ENABLE_TF32", raising=False)
+    else:
+        monkeypatch.setenv("MLX_ENABLE_TF32", c["tf32"])
+    cache = _cache(1, 2, c["S"], c["D"], 8, dtype=c["dtype"], Dv=c["Dv"])
+    queries = _queries(1, 8, c["L"], c["D"], dtype=c.get("qdtype", c["dtype"]))
+    mask = {"bool": mx.ones((c["L"], c["S"]), mx.bool_),
+            "additive": mx.zeros((c["L"], c["S"]), c["dtype"])}.get(c["mask"], c["mask"])
+    attention._tf32_enabled.cache_clear()
+    try:
+        assert fused_kernel_exists(queries, *cache, GS, mask) is expected
+    finally:
+        attention._tf32_enabled.cache_clear()
+
+
+def test_head_dim_256_prefill_on_nax_is_the_dequantized_kernel(monkeypatch):
+    from unsloth_zoo.mlx import nax
+
+    unfused = _runtime("mlx_lm")
+    real_nax = nax.nax_available()
+    B, HQ, HKV, S, D, bits = 1, 16, 4, 1280, 256, 8
+    cache = _cache(B, HKV, S, D, bits)
+    wrapped = quantized_sdpa_over(unfused)
+    for L, on_nax, fused in ((1023, True, False), (1024, True, True), (1024, False, False)):
+        monkeypatch.setattr(nax, "nax_available", lambda: on_nax)
+        queries = _queries(B, HQ, L, D)
+        call = dict(scale=D ** -0.5, mask="causal", group_size=GS, bits=bits)
+        expected = unfused(mx.array(queries), *cache, **call)
+        actual = wrapped(mx.array(queries), *cache, **call)
+        dequantized = dequantized_sdpa(mx.array(queries), *cache, **call)
+        mx.eval(expected, actual, dequantized)
+        assert mx.array_equal(actual, dequantized if fused else expected).item(), (L, on_nax)
+        assert _divergence(expected, actual) < MAX_DIVERGENCE, (L, on_nax)
+        if fused and real_nax:   # mlx really fuses it: no scores are materialized
+            peak = _peak(lambda: wrapped(queries, *cache, **call))
+            assert peak < B * HQ * L * S * 2, peak
+
+
+@pytest.mark.parametrize("D,Dv,HQ,L,S,mask,min_keys,expected", [
+    (512, 512, 32, 1024, 1024, "causal", None, True),
+    (512, 512, 16, 1024, 1024, "causal", None, False),
+    (512, 512, 32, 1024, 1024, "bool", None, False),
+    (512, 512, 32, 1024, 1023, "causal", None, False),
+    (512, 512, 64, 1000, 1024, "causal", None, False),
+    (512, 512, 30, 1089, 1089, "causal", None, True),   # query blocks round up
+    (512, 512, 16, 1, 1024, None, None, True),
+    (512, 512, 16, 1, 1023, None, None, False),
+    (512, 512, 8, 1, 1024, None, None, False),
+    (512, 512, 16, 2, 1024, None, None, False),
+    (512, 512, 16, 1, 1024, "bool", None, False),
+    (512, 512, 16, 1, 512, None, "512", True),
+    (512, 512, 8, 2, 16, "bool", "0", True),
+    (96, 64, 8, 16, 512, None, None, True),
+    (96, 64, 8, 1, 512, None, None, True),
+    (96, 64, 8, 32, 16, "causal", None, False),
+    (96, 64, 8, 8, 4, None, None, False),
+])
+def test_head_dim_512_and_96_64_are_fused_where_mlx_has_a_kernel(monkeypatch, D, Dv, HQ, L, S, mask,
+                                                                min_keys, expected):
+    from unsloth_zoo.mlx import nax
+
+    monkeypatch.setattr(nax, "nax_available", lambda: True)
+    if min_keys is None:
+        monkeypatch.delenv("MLX_SDPA_D512_MIN_KL", raising=False)
+    else:
+        monkeypatch.setenv("MLX_SDPA_D512_MIN_KL", min_keys)
+    mask = mx.ones((L, S), mx.bool_) if mask == "bool" else mask
+    cache = _cache(1, 2, S, D, 8, group_size=32, Dv=Dv)
+    assert fused_kernel_exists(_queries(1, HQ, L, D), *cache, 32, mask) is expected
+
+
+@pytest.mark.parametrize("D,Dv,HQ,HKV,L,S,mask", [
+    (128, 128, 8, 8, 16, 512, None), (192, 192, 8, 8, 16, 512, None), (64, 64, 8, 8, 1, 512, None),
+    (256, 256, 8, 2, 16, 512, "causal"), (256, 256, 8, 2, 1024, 1024, "causal"),
+    (256, 256, 8, 2, 1024, 1024, "bool"), (256, 256, 8, 2, 2048, 2048, "causal"),
+    (512, 512, 32, 4, 1024, 1024, "causal"), (512, 512, 16, 4, 1024, 1024, "causal"),
+    (512, 512, 16, 2, 1, 1024, None), (512, 512, 16, 2, 1, 1023, None),
+    (96, 64, 8, 8, 16, 512, None), (96, 64, 8, 8, 1, 512, None),
+    (96, 64, 8, 8, 32, 16, "causal"), (128, 128, 8, 8, 32, 16, "causal"),
+    (128, 128, 8, 8, 8, 4, None),
+])
+def test_fused_kernel_exists_matches_what_the_installed_mlx_fuses(monkeypatch, D, Dv, HQ, HKV, L, S,
+                                                                  mask):
+    """`force_fused=True` runs a fused kernel wherever one exists, and the default call is
+    bit-identical to it exactly when mlx fuses."""
+    monkeypatch.delenv("UNSLOTH_MLX_NAX", raising=False)
+    q_keys, q_values = _cache(1, HKV, S, D, 8, group_size=32, Dv=Dv)
+    queries = _queries(1, HQ, L, D)
+    keys, values = (mx.dequantize(*q, group_size=32, bits=8).astype(queries.dtype)
+                    for q in (q_keys, q_values))
+    mask = mx.random.uniform(shape=(L, S)) > 0.1 if mask == "bool" else mask
+    sdpa = functools.partial(mx.fast.scaled_dot_product_attention, queries, keys, values,
+                             scale=D ** -0.5, mask=mask)
+    try:
+        fused = mx.array_equal(sdpa(force_fused=True), sdpa()).item()
+    except ValueError:
+        fused = False
+    assert fused_kernel_exists(queries, q_keys, q_values, 32, mask) is fused
 
 
 @pytest.mark.parametrize("bits,group_size,last", [(4, 64, 82), (8, 64, 98), (2, 32, 76)])
