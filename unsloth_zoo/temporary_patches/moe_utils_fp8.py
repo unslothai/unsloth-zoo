@@ -34,7 +34,6 @@ def _is_float8_tensor(tensor: Optional[torch.Tensor]) -> bool:
 
 
 def _get_fp8_dequant_target_dtype(hidden_states: torch.Tensor) -> torch.dtype:
-    # W8A16: experts dequantize to the half compute dtype, never to a float32 activation's dtype.
     from .moe_utils import moe_compute_dtype
     return moe_compute_dtype(hidden_states)
 
@@ -998,7 +997,7 @@ def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
             top_k_index,
             top_k_weights,
         )
-        # Callers get their own dtype back, as with the eager experts' index_add_ into zeros_like(hidden_states).
+        # Caller's dtype back, as the eager experts' index_add_ into zeros_like(hidden_states).
         if isinstance(output, torch.Tensor) and output.dtype != hidden_states.dtype:
             output = output.to(hidden_states.dtype)
         return output

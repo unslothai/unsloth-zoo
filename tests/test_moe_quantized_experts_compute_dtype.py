@@ -14,12 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""FP8 / bnb 4-bit experts train as W8A16 / W4A16: never dequantized to a float32 activation's dtype.
-
-Qwen4Exp's PLE `sum` runs in float32 under autocast, which made its residual stream (and every later MoE
-input) float32. torch._grouped_mm is not autocast-cast, so dequantizing to the activation dtype sent the
-experts to its per-group float32 fallback (72% of the Qwen3.8-Flash-Next-FP8 step's device time).
-"""
+"""FP8 / bnb 4-bit experts train as W8A16 / W4A16, never in a float32 activation's dtype."""
 
 import pytest
 import torch
@@ -38,7 +33,6 @@ def test_compute_dtype_is_half():
     assert moe_utils.moe_compute_dtype(torch.empty(4, 8, device = "meta")) is torch.bfloat16
     with torch.autocast("cpu", dtype = torch.bfloat16):
         assert moe_utils.moe_compute_dtype(x32) is torch.bfloat16
-        # An activation already in half keeps its dtype: nothing moves for bf16 / fp16 models.
         assert moe_utils.moe_compute_dtype(x32.half()) is torch.float16
 
 
@@ -81,7 +75,7 @@ def _fp8_experts(device):
 
 def _run_fp8(device, monkeypatch, backend, autocast):
     monkeypatch.setenv("UNSLOTH_MOE_BACKEND", backend)
-    # select_moe_backend is lru_cached: read it under this env, and do not leave this backend for later tests.
+    # select_moe_backend is lru_cached.
     moe_utils.select_moe_backend.cache_clear()
     try:
         _run_fp8_checks(device, monkeypatch, autocast)
@@ -105,10 +99,8 @@ def _run_fp8_checks(device, monkeypatch, autocast):
         seen.clear()
         with torch.autocast(device, dtype = torch.bfloat16, enabled = autocast):
             out = moe_utils_fp8.forward_moe_backend_fp8(experts, hidden, top_k_index, top_k_weights)
-    # Experts dequantized to bf16 (not float32), output handed back in the caller's float32.
     assert set(seen) == {torch.bfloat16}, seen
     assert out.dtype == torch.float32
-    # Same bf16 math as a bf16 activation: only the final cast differs.
     torch.testing.assert_close(out, reference.float(), rtol = 0, atol = 0)
 
 
@@ -211,7 +203,6 @@ def test_qwen4_exp_ple_keeps_bf16_under_cuda_autocast():
         with torch.autocast("cuda", dtype = torch.bfloat16):
             out = ple(hidden, input_ids, None)
     assert plain.dtype == torch.bfloat16
-    # Training (autocast) computes PLE exactly as inference does: bf16 throughout.
     assert out.dtype == torch.bfloat16
     assert torch.equal(out, plain)
 
@@ -219,8 +210,7 @@ def test_qwen4_exp_ple_keeps_bf16_under_cuda_autocast():
 @pytest.mark.gpu
 @needs_cuda
 def test_half_stack_float32_activation_keeps_the_stack_dtype(monkeypatch):
-    # Plain half stacks are not cast in the grouped_mm provider: a float32 activation must take the stack's
-    # dtype, even when autocast asks for the other half dtype (fp16 weights under bf16 autocast).
+    # Plain half stacks are not cast by the provider: fp16 weights under bf16 autocast need fp16 inputs.
     if not moe_utils._check_torch_grouped_mm_supported():
         pytest.skip(reason = "torch._grouped_mm needs sm >= 8.0 and torch >= 2.8")
     from transformers import Qwen3MoeConfig

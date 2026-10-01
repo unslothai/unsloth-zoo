@@ -1086,12 +1086,7 @@ def select_moe_backend():
 
 
 def moe_compute_dtype(hidden_states):
-    """Half compute dtype for dequantized / half expert stacks: W8A16 / W4A16, never float32.
-
-    An activation already in bf16 / fp16 keeps its dtype. A float32 one (Qwen4Exp's PLE `sum` under
-    autocast, or a float32 caller) takes the autocast dtype, else bf16 (fp16 where bf16 is unsupported).
-    torch._grouped_mm is not autocast-cast, and float32 operands send it to a per-group float32 fallback.
-    """
+    """W8A16 / W4A16 compute dtype: a half activation's own, else autocast's, else bf16 (or fp16). Never float32."""
     dtype = hidden_states.dtype
     if dtype in (torch.bfloat16, torch.float16):
         return dtype
@@ -3840,8 +3835,7 @@ def forward_native_grouped_mm(
         batch_size, sequence_length, hidden_dim = hidden_states.shape
 
     hidden_states = hidden_states.view(-1, hidden_dim)
-    # torch._grouped_mm is not autocast-cast: a float32 activation into half or quantized (FP8, MXFP4,
-    # bnb 4-bit) stacks runs in the half compute dtype, not float32. Only true float32 stacks stay float32.
+    # torch._grouped_mm is not autocast-cast, and float32 operands hit its slow per-group fallback.
     if hidden_states.dtype == torch.float32:
         _stack = self._parameters.get("gate_up_proj", self._parameters.get("gate_proj"))
         if _stack is not None and _stack.dtype in (torch.float16, torch.bfloat16):

@@ -19,8 +19,6 @@
 MoE takes the Qwen3.5-MoE grouped-GEMM backend. QSA indexer: when kv_length < budget +
 compress_ratio every complete block is selected, so the mask is the visible mask and the
 per-query nonzero/topk loop (B*T host syncs) is skipped. Kill switch: UNSLOTH_QWEN4_EXP_FAST_QSA=0.
-PLE: under autocast the gate's `sum` runs in float32, and the PLE output added to the residual
-made the residual stream (and every later MoE input) float32; it is returned in the residual's dtype.
 """
 
 __all__ = ["patch_qwen4_exp"]
@@ -66,8 +64,7 @@ _reference_ple_forward = None
 def qwen4_exp_ple_layer_forward(self, hidden_states, input_ids, past_key_values, conv_mask=None):
     # Compiler copies this source into its cache: use only `torch`, `self`, the arguments, the lazy import.
     from unsloth_zoo.temporary_patches.qwen4_exp import _reference_ple_forward
-    # Autocast runs the gate `sum` in float32, and the float32 PLE output would turn the residual stream
-    # (and every later MoE input) float32. Run PLE in the model's dtype, as inference does.
+    # Autocast's float32 gate `sum` would make the residual stream (and every later MoE input) float32.
     device_type = hidden_states.device.type
     if torch.amp.is_autocast_available(device_type) and torch.is_autocast_enabled(device_type):
         with torch.autocast(device_type, enabled=False):

@@ -376,7 +376,6 @@ def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
         moe_compute_dtype,
     )
 
-    # W4A16: experts dequantize to the half compute dtype, never to a float32 activation's dtype.
     target_dtype = moe_compute_dtype(hidden_states)
 
     # Same recompute-vs-pin policy as forward_native_grouped_mm; recompute keeps the packed Params4bit.
