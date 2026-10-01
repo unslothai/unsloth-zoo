@@ -5185,8 +5185,9 @@ DISABLE_COMPILE_MODULES = [
     "Gemma4VisionEncoder",
     "Gemma4VisionEncoderLayer",
     "Gemma4MultimodalEmbedder",
-    # DeepSeek-V4 hyper-connection mixers: Inductor's fused backward of their
-    # Sinkhorn-Knopp division chain overflows to inf; tiny modules, so eager is cheap.
+    # DeepSeek-V4 hyper-connection mixers. HyperConnection leaves this list when its
+    # MODULE_FORWARD_SOURCE_REWRITES entry matches (unless UNSLOTH_DSV4_MHC_FAST=0); the
+    # stock source stays eager here (#859 saw inf grads with it compiled).
     "DeepseekV4HyperConnection",
     "DeepseekV4HyperHead",
     "DeepseekV41HyperConnection",

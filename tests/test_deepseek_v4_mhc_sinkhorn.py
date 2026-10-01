@@ -287,7 +287,6 @@ def test_v4_mixer_compiles_through_the_rewrite(tmp_path):
     assert child["DeepseekV4HyperHead"] == "torch_compiler_disable_unless_decode", child
     assert child["finite"], child
     # post / comb / collapsed / dx / dfn / dbase / dscale vs the stock eager module.
-    print(child)
     assert max(child["rel_errs"]) < 2e-2, child
 
 
