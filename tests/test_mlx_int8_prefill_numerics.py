@@ -46,8 +46,8 @@ def quantized_model():
     return make_quantized_model()
 
 
-import mlx.core as mx
-import mlx.nn as nn
+mx = pytest.importorskip("mlx.core")
+nn = pytest.importorskip("mlx.nn")
 import numpy as np
 
 from unsloth_zoo.mlx.int8_prefill import registry, scales

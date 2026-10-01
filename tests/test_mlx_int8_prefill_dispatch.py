@@ -46,8 +46,8 @@ def quantized_model():
     return make_quantized_model()
 
 
-import mlx.core as mx
-import mlx.nn as nn
+mx = pytest.importorskip("mlx.core")
+nn = pytest.importorskip("mlx.nn")
 
 from unsloth_zoo.mlx import int8_prefill
 from unsloth_zoo.mlx.int8_prefill import patch, registry
@@ -123,6 +123,43 @@ class TestFallthrough:
         other = make_ql(K, N)
         x = mx.random.normal((ROW_THRESHOLD, K)).astype(mx.bfloat16)
         self._assert_untouched(monkeypatch, lambda: other(x))
+
+    def test_width_mismatch_reaches_stock_op(self, make_ql, monkeypatch):
+        """The Metal kernels size their tensors from x; a wrong K must get MLX's shape
+        error, never a launch reading past the weight buffer."""
+        ql = make_ql(K, N)
+        w, s, b, gs, bits = _enable_with(ql)
+        x = mx.random.normal((ROW_THRESHOLD, 2 * K)).astype(mx.bfloat16)
+        seen = _hits(monkeypatch)
+        with pytest.raises(ValueError):
+            mx.eval(mx.quantized_matmul(x, w, s, b, True, gs, bits))
+        assert seen == []
+
+    def test_omitted_group_size_means_stock_default(self, monkeypatch):
+        """A group_size 32 weight called without group_size is a stock-op error (the
+        affine default is 64), not an invitation to use the registered format."""
+        from _mlx_int8_helpers import make_quantized_linear
+        ql = make_quantized_linear(K, N, group_size=32)
+        w, s, b, gs, bits = _enable_with(ql)
+        x = mx.random.normal((ROW_THRESHOLD, K)).astype(mx.bfloat16)
+        seen = _hits(monkeypatch)
+        with pytest.raises(ValueError):
+            mx.eval(mx.quantized_matmul(x, w, s, b))
+        assert seen == []
+
+    def test_output_dtype_follows_stock_promotion(self, make_ql, monkeypatch):
+        """bf16 activations against float32 metadata come back float32 from the stock
+        op, so the intercepted call must not narrow them."""
+        ql = make_ql(K, N)
+        assert ql["scales"].dtype == mx.float32
+        w, s, b, gs, bits = _enable_with(ql)
+        x = mx.random.normal((ROW_THRESHOLD, K)).astype(mx.bfloat16)
+        seen = _hits(monkeypatch)
+        out = mx.quantized_matmul(x, w, s, b, True, gs, bits)
+        want = patch._ORIG_QMM(x, w, s, b, True, gs, bits, "affine")
+        mx.eval(out, want)
+        assert seen == ["w"]
+        assert out.dtype == want.dtype == mx.float32
 
     def test_replaced_metadata(self, make_ql, monkeypatch):
         """A learned quantizer (DWQ) trains scales and biases with the packed weight

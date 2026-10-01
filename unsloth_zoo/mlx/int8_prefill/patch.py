@@ -65,7 +65,9 @@ def _make_fn(entry, backend):
 
     @mx.custom_function
     def fn(x):
-        return backend.matmul(x, entry, out_dtype=x.dtype)
+        # Same promotion as the stock op: bf16 activations against float32 metadata come
+        # back float32 there, so they must here too, whatever the row count.
+        return backend.matmul(x, entry, out_dtype=mx.result_type(x, scales))
 
     @fn.vjp
     def _(primals, cotangent, output):
@@ -92,7 +94,12 @@ def _dispatch(x, entry):
         )
         err = mx.abs(out.astype(mx.float32) - ref.astype(mx.float32)).max()
         denom = mx.maximum(mx.abs(ref.astype(mx.float32)).max(), 1e-8)
-        mx.eval(err, denom)
+        try:
+            mx.eval(err, denom)
+        except (RuntimeError, ValueError):
+            # Inside mx.compile / vmap an eval raises. Shadow mode is a debugging aid, so
+            # it logs eager calls only rather than breaking a compiled forward.
+            return out
         logger.info(
             "Unsloth: MLX int8 verify %s rows=%d max_rel_err=%.3e",
             entry.name, x.size // x.shape[-1], (err / denom).item(),
@@ -112,6 +119,12 @@ def _patched_qmm(x, w, /, *args, **kwargs):
     group_size = args[3] if n > 3 else kwargs.get("group_size")
     bits       = args[4] if n > 4 else kwargs.get("bits")
     mode       = args[5] if n > 5 else kwargs.get("mode", "affine")
+    # Omitted means the stock affine defaults, not "whatever was registered": MLX would
+    # reject a group_size 32 weight called without group_size, and so must we.
+    if group_size is None:
+        group_size = 64
+    if bits is None:
+        bits = 4
 
     if (
         not _disabled_by_selftest
@@ -130,8 +143,12 @@ def _patched_qmm(x, w, /, *args, **kwargs):
             entry is not None
             and scales is entry.scales
             and biases is entry.biases
-            and (group_size is None or group_size == entry.group_size)
-            and (bits is None or bits == entry.bits)
+            and group_size == entry.group_size
+            and bits == entry.bits
+            # The Metal kernels size their tensors from x, so a mismatched width must
+            # reach the stock op and its shape error, never a launch.
+            and x.ndim >= 1
+            and x.shape[-1] == entry.k
             and x.size // x.shape[-1] >= ROW_THRESHOLD
         ):
             return _dispatch(x, entry)
@@ -178,11 +195,14 @@ def apply():
     """Install the patch. Returns True if it was installed by this call."""
     if is_patched():
         return False
+    # Resolve the backend first: a bad UNSLOTH_MLX_INT8_BACKEND must raise before MLX is
+    # touched, not leave the op half installed.
+    backend = backends.select()
     mx.quantized_matmul = _patched_qmm
     _sweep_rebind(_ORIG_QMM, _patched_qmm)
     logger.info(
         "Unsloth: MLX int8 prefill patch applied (row threshold %d, backend %s)",
-        ROW_THRESHOLD, backends.select().__name__.rsplit(".", 1)[-1],
+        ROW_THRESHOLD, backend.__name__.rsplit(".", 1)[-1],
     )
     return True
 

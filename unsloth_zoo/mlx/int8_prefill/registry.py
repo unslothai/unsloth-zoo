@@ -96,6 +96,16 @@ def clear():
         _entries.clear()
 
 
+def unregister(weight):
+    """Drop `weight`'s entry if it has one. Returns True if one was dropped."""
+    with _lock:
+        e = _entries.get(id(weight))
+        if e is not None and e.w is weight:
+            del _entries[id(weight)]
+            return True
+    return False
+
+
 def size():
     return len(_entries)
 
@@ -155,20 +165,37 @@ def warmup(model, scope="all", exact_scales=None):
     """
     import mlx.nn as nn
 
+    # The distributed quantized linears derive from Module, not QuantizedLinear, but
+    # carry the same weight / scales / biases and reach the same op.
+    quantized_types = tuple(
+        cls for cls in (
+            nn.QuantizedLinear, nn.QuantizedEmbedding,
+            getattr(nn, "QuantizedAllToShardedLinear", None),
+            getattr(nn, "QuantizedShardedToAllLinear", None),
+        ) if cls is not None
+    )
+
     registered, skipped = 0, 0
     for name, module in model.named_modules():
-        if not isinstance(module, (nn.QuantizedLinear, nn.QuantizedEmbedding)):
+        if not isinstance(module, quantized_types):
             continue
+        # A module this warmup skips must also lose any entry an earlier, wider warmup
+        # gave it, or warmup(model) then warmup(model, scope="mlp") would keep
+        # dispatching attention.
         if scope == "mlp" and not any(
             part in name for part in ("mlp", "feed_forward", "ffn")
         ):
             skipped += 1
+            if "weight" in module:
+                unregister(module["weight"])
             continue
         ok, why = register_module(module, name, exact_scales=exact_scales)
         if ok:
             registered += 1
         else:
             skipped += 1
+            if "weight" in module:
+                unregister(module["weight"])
             logger.debug("Unsloth: MLX int8 skipping %s (%s)", name, why)
 
     logger.info(

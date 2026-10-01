@@ -47,8 +47,8 @@ def quantized_model():
     return make_quantized_model()
 
 
-import mlx.core as mx
-import mlx.nn as nn
+mx = pytest.importorskip("mlx.core")
+nn = pytest.importorskip("mlx.nn")
 import numpy as np
 
 from unsloth_zoo.mlx import int8_prefill
@@ -345,3 +345,45 @@ class TestWarmup:
         registered, _ = int8_prefill.warmup(quantized_model, scope="mlp")
         assert all("mlp" in name for name in int8_prefill.registered())
         assert registered == 2
+
+    def test_narrower_warmup_revokes_out_of_scope_entries(self, make_ql):
+        """warmup(model) then warmup(model, scope="mlp") must stop dispatching
+        attention, which is the whole point of the MLP-only scope."""
+
+        class Model(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.self_attn = make_ql(K, N)
+                self.mlp = make_ql(K, N)
+
+        model = Model()
+        int8_prefill.enable(force=True)
+        assert int8_prefill.warmup(model)[0] == 2
+        int8_prefill.warmup(model, scope="mlp")
+        assert int8_prefill.registered() == ["mlp"]
+        assert registry.get(model.self_attn["weight"]) is None
+
+
+class TestInstallation:
+    def test_bad_backend_leaves_mlx_untouched(self, monkeypatch):
+        monkeypatch.setenv("UNSLOTH_MLX_INT8_BACKEND", "typo")
+        from unsloth_zoo.mlx.int8_prefill import backends
+        backends.reset()
+        with pytest.raises(ValueError):
+            int8_prefill.enable(force=True)
+        assert not int8_prefill.is_enabled()
+        assert mx.quantized_matmul is patch._ORIG_QMM
+
+
+class TestVerifyMode:
+    def test_verify_mode_inside_compile(self, make_ql, monkeypatch):
+        """Shadow verification evaluates on the host, which raises inside a trace; it
+        must skip the log there, not break the compiled forward."""
+        monkeypatch.setenv("UNSLOTH_MLX_INT8_VERIFY", "1")
+        ql = make_ql(K, N)
+        int8_prefill.enable(force=True)
+        registry.register_module(ql, "w")
+        x = mx.random.normal((ROW_THRESHOLD, K)).astype(mx.bfloat16)
+        out = mx.compile(lambda t: ql(t))(x)
+        mx.eval(out)
+        assert out.shape == (ROW_THRESHOLD, N)
