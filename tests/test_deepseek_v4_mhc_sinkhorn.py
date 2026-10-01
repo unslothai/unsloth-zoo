@@ -99,10 +99,26 @@ def test_forward_is_bitwise_stock_and_backward_tracks_fp64(kind, device):
     assert err_new <= max(4 * err_stock, 1e-5), (err_new, err_stock)
 
 
-def test_backward_gradcheck_fp64():
+def test_unrolled_function_gradcheck_fp64_and_matches_stock():
+    # The compiled path's autograd.Function, run eagerly: exact derivative (gradcheck) and the
+    # same values as the stock loop.
+    from unsloth_zoo.temporary_patches.mhc_sinkhorn import _SinkhornKnopp
+
     x = (torch.randn(3, 4, 4, dtype = torch.float64) * 3).softmax(-1) + EPS
     x.requires_grad_(True)
-    assert torch.autograd.gradcheck(lambda t: unsloth_sinkhorn_knopp(t, ITERS, EPS), (x,), eps = 1e-7, atol = 1e-6)
+    assert torch.autograd.gradcheck(lambda t: _SinkhornKnopp.apply(t, ITERS, EPS), (x,), eps = 1e-7, atol = 1e-6)
+    for kind in KINDS:
+        logits = _logits(kind)
+        grad_out = torch.randn(logits.shape, generator = torch.Generator().manual_seed(1)) * 1e3
+        y_ref, g_ref = _grads(_stock, logits.double(), grad_out.double())
+        y_f, g_f = _grads(lambda c: _SinkhornKnopp.apply(c, ITERS, EPS), logits, grad_out)
+        _, g_e = _grads(_stock, logits, grad_out)
+        assert torch.isfinite(y_f).all() and torch.isfinite(g_f).all(), kind
+        assert (y_f.double() - y_ref).abs().max().item() < 1e-5, kind
+        scale = g_ref.abs().max().clamp_min(1e-30)
+        err_f = ((g_f.double() - g_ref).abs().max() / scale).item()
+        err_e = ((g_e.double() - g_ref).abs().max() / scale).item()
+        assert err_f <= max(4 * err_e, 1e-5), (kind, err_f, err_e)
 
 
 @pytest.mark.parametrize("iters", [0, 1, 2, 7])
