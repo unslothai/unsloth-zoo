@@ -22,6 +22,13 @@ mx = pytest.importorskip("mlx.core", reason="needs real MLX")
 nn = pytest.importorskip("mlx.nn", reason="needs real MLX")
 optim = pytest.importorskip("mlx.optimizers", reason="needs real MLX")
 
+# The torch shim installs process-wide while another module is being collected, so the
+# imports above can succeed against it; these numerics need real MLX (the mlx-cpu lane).
+from mlx_simulation import mlx_is_simulated  # noqa: E402
+
+if mlx_is_simulated():
+    pytest.skip("needs real MLX, the torch shim is installed", allow_module_level = True)
+
 from unsloth_zoo.mlx.distill import (
     DEFAULT_CHUNK_SIZE,
     generalized_jsd_loss,
