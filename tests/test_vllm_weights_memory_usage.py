@@ -76,8 +76,6 @@ def test_skip_modules_match_checkpoint_key_spelling():
         mm_tokens_per_image = 4,
     )
     quantized = vllm_utils.vllm_weights_memory_usage(config, load_in_4bit = True)
-    # bnb checkpoints list "language_model.model.layers.0.mlp"; the module is
-    # "model.language_model.layers.0.mlp".
     config.quantization_config = {"llm_int8_skip_modules": ["language_model.model.layers.0.mlp"]}
     skipped = vllm_utils.vllm_weights_memory_usage(config, load_in_4bit = True)
     mlp_elements = 3 * 64 * 128
