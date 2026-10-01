@@ -1428,7 +1428,7 @@ def test_scheduler_lr_matches_expected_optimizer_update_steps(scheduler, warmup)
         lr = trainer.args.learning_rate
         expected = [lr * (total_steps - step) / total_steps for step in range(total_steps)]
         assert values == pytest.approx(expected)
-    elif warmup > 0:
+    elif warmup > 0 and scheduler != "constant":
         assert values[0] == pytest.approx(0.0)
         assert all(value > 0.0 for value in values[1:])
     else:
@@ -8635,6 +8635,28 @@ def test_mlx_schedules_match_transformers_lr_lambdas():
         got = _mlx_lr_curve(total, learning_rate=lr, **config_kwargs)
         expected = [lr * hf_lambda(step, **hf_kwargs) for step in range(total)]
         assert got == pytest.approx(expected, abs=1e-9), config_kwargs
+
+
+def test_constant_schedule_ignores_warmup_like_hf():
+    """HF's get_scheduler("constant") never ramps; constant_with_warmup does."""
+    optimization = pytest.importorskip("transformers.optimization")
+
+    lr, total, warmup = 2e-4, 20, 5
+    expected = [lr * optimization._get_constant_lambda(step) for step in range(total)]
+    assert _mlx_lr_curve(
+        total, learning_rate=lr, lr_scheduler_type="constant", warmup_steps=warmup,
+    ) == pytest.approx(expected, abs=1e-9)
+    assert _mlx_lr_curve(
+        total, learning_rate=lr, lr_scheduler_type="constant", warmup_ratio=0.25,
+    ) == pytest.approx(expected, abs=1e-9)
+
+    ramp = optimization._get_constant_schedule_with_warmup_lr_lambda
+    assert _mlx_lr_curve(
+        total, learning_rate=lr, lr_scheduler_type="constant_with_warmup",
+        warmup_steps=warmup,
+    ) == pytest.approx(
+        [lr * ramp(step, num_warmup_steps=warmup) for step in range(total)], abs=1e-9,
+    )
 
 
 def test_wsd_num_cycles_is_the_hf_wave_count_not_the_decay_window():

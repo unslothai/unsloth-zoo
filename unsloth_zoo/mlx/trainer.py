@@ -4139,7 +4139,8 @@ class MLXTrainer:
                 else float(total_steps - warmup) - wsd_decay_steps
             )
 
-        if sched_type in ("constant", "constant_with_warmup") and warmup == 0:
+        # HF's get_constant_schedule ignores warmup; only constant_with_warmup ramps.
+        if sched_type == "constant" or (sched_type == "constant_with_warmup" and warmup == 0):
             return lr
 
         # HF cosine_warmup_with_min_lr uses (step + 1): optimization.py:400-406.
