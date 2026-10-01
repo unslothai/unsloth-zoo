@@ -421,6 +421,7 @@ jobs:
         # pyc has to be dropped before every verified import.
         # test_device_map_planner_compressed_tensors: pack-quantized checkpoints planned at packed bytes.
         # test_grpo_mask_truncated_rows: truncated completions stay out of the GRPO loss; its UnslothEfficientGRPO stubs bind to the real forward.
+        # test_mlx_embedding_guards: sentence-transformers layout shim and pooling-mode map, under the torch shim.
         run: |
           python -m pytest \
             tests/test_training_utils_use_cache.py \
@@ -428,6 +429,10 @@ jobs:
             tests/test_loss_normalization_contract.py \
             tests/test_mlx_finetune_last_n_layers.py \
             tests/test_mlx_double_quant_reject.py \
+            tests/test_mlx_incomplete_config.py \
+            tests/test_mlx_incomplete_config_vlm.py \
+            tests/test_mlx_adam_epsilon.py \
+            tests/test_mlx_optimizer_torch_parity.py \
             tests/test_hf_xet_fallback.py \
             tests/test_hf_xet_fallback_blob_scoped_redownload.py \
             tests/test_llama_cpp_install_consent.py \
@@ -438,7 +443,9 @@ jobs:
             tests/test_mlx_preference.py \
             tests/test_mlx_trainer_internals.py \
             tests/test_mlx_arrays_cache_advance.py \
+            tests/test_prepare_model_for_training_embedding_lora.py \
             tests/test_mlx_quantized_optimizer_routing.py \
+            tests/test_mlx_embedding_guards.py \
             tests/test_fp16_emulation.py \
             tests/test_check_hf_model_exists_transport_errors.py \
             tests/test_hub_transport_errors_single_segment.py \
@@ -455,6 +462,7 @@ jobs:
             tests/test_moe_preprocess_weight_transpose.py \
             tests/test_relative_imports_resolve.py \
             tests/test_grpo_mask_truncated_rows.py \
+            tests/test_deepseek_v41_compile_entries.py \
             tests/test_moe_weight_preprocessor_registry_shared.py \
             tests/test_moe_triton_down_lora_roworder.py \
             tests/test_moe_router_not_a_lora_target.py \
@@ -473,6 +481,7 @@ jobs:
             tests/test_vision_url_dns_rebinding.py \
             tests/test_merge_index_weight_map_traversal.py \
             tests/test_gguf_converter_child_env.py \
+            tests/test_responses_only_last_turn_header.py \
             tests/test_gguf_post_conversion_validation.py \
             tests/test_mtp_config_reconcile.py \
             tests/test_llama_cpp_converter_scan.py \
@@ -491,6 +500,7 @@ jobs:
             tests/test_disabled_hook_checkpoint_guard.py \
             tests/test_conftest_module_leak_gate.py \
             tests/test_compiled_cache_collective.py \
+            tests/test_gpt_oss_matmul_ogs_for.py \
             tests/test_compiled_cache_collective_gloo.py \
             tests/test_undefined_name_gate.py \
             tests/test_safe_serialization_none.py \
@@ -498,6 +508,7 @@ jobs:
             tests/test_device_map_planner_compressed_tensors.py \
             tests/test_gemma3n_kv_sharing_without_cache.py \
             tests/test_gemma3n_rmsnorm_with_scale.py \
+            tests/test_mlx_gkd_guards.py \
             -v
 
       - name: pytest MLX adapter-filter gate (HARD GATE)
@@ -599,11 +610,6 @@ jobs:
           }
 
           # numerics: minimal on purpose -- mlx core only, no mlx-lm / mlx-vlm.
-          #
-          # transformers pinned to the darwin + arm64 half of pyproject's marker-split
-          # cap: pyproject allows a newer one off darwin, so without this the MLX lanes
-          # would follow a CUDA-motivated bump and stop measuring the Apple Silicon
-          # stack. The newly allowed range is the unpinned "Repo tests (CPU)" job's.
           (
             rc=0
             {
@@ -611,7 +617,7 @@ jobs:
               retry .lanes/venv-numerics/bin/python -m pip install --upgrade pip &&
               retry .lanes/venv-numerics/bin/pip install --index-url https://download.pytorch.org/whl/cpu \
                 "torch>=2.4.0,<2.11.0" &&
-              retry .lanes/venv-numerics/bin/pip install -e .[core] "transformers<=5.5.0" &&
+              retry .lanes/venv-numerics/bin/pip install -e .[core] &&
               { .lanes/venv-numerics/bin/pip install --no-deps \
                 "unsloth @ git+https://github.com/unslothai/unsloth@main" || true; } &&
               retry .lanes/venv-numerics/bin/pip install pytest==9.0.3 "mlx>=0.22.0" mlx-cpu
@@ -619,21 +625,13 @@ jobs:
             echo "$rc" > .lanes/numerics.install
           ) < /dev/null > /dev/null 2>&1 &
 
-          # suites: the MLX packages MUST resolve in the SAME pip call as .[core].
-          # Split, pip solves them independently and mlx-vlm 0.6.9
-          # (transformers>=5.14) drags transformers past the <=5.5.0 the MLX half
-          # of the cap holds: measured 5.5.0 -> 5.14.1. Together, pip honours the
-          # cap and lands on the newest mlx-vlm that fits, which is the 0.6.4
-          # ceiling the audio gate records.
+          # suites: the MLX packages MUST resolve in the SAME pip call as .[core], so
+          # pip honours the transformers cap while picking mlx-vlm.
           #
-          # Both bounds are repeated here because pyproject's mlx-vlm ceiling and the
-          # 5.5.0 half of its transformers cap are marker-gated to darwin + arm64 and so
-          # constrain nothing on this Linux lane. The mlx-vlm bound mirrors pyproject's
-          # <=0.7.1; without it the lane resolved 0.7.0, a combination pyproject forbids.
-          # transformers<=5.5.0 is what holds the resolution at mlx-vlm 0.6.4 (0.6.5+
-          # wants transformers>=5.14.0); without it the lane follows the off-darwin cap
-          # and stops measuring the Apple Silicon stack. tests/mlx_simulation models the
-          # 0.6.4 surface.
+          # The mlx-lm pin and mlx-vlm bound are repeated here because pyproject's are
+          # marker-gated to darwin + arm64 and so constrain nothing on this Linux lane.
+          # They mirror pyproject's ==0.31.3 and <=0.7.4; without them the lane resolved
+          # mlx-lm 0.32.0 and mlx-vlm 0.7.0, combinations pyproject forbids.
           (
             rc=0
             {
@@ -641,8 +639,8 @@ jobs:
               retry .lanes/venv-suites/bin/python -m pip install --upgrade pip &&
               retry .lanes/venv-suites/bin/pip install --index-url https://download.pytorch.org/whl/cpu \
                 "torch>=2.4.0,<2.11.0" &&
-              retry .lanes/venv-suites/bin/pip install -e .[core] "transformers<=5.5.0" \
-                "mlx>=0.22.0" mlx-cpu "mlx-lm>=0.31.2" "mlx-vlm>=0.4.4,<=0.7.1" &&
+              retry .lanes/venv-suites/bin/pip install -e .[core] \
+                "mlx>=0.22.0" mlx-cpu "mlx-lm==0.31.3" "mlx-vlm>=0.4.4,<=0.7.4" &&
               { .lanes/venv-suites/bin/pip install --no-deps \
                 "unsloth @ git+https://github.com/unslothai/unsloth@main" || true; } &&
               retry .lanes/venv-suites/bin/pip install pytest==9.0.3
@@ -694,9 +692,9 @@ jobs:
           from packaging.requirements import Requirement
           from packaging.version import Version
 
-          # The cap is marker-split, so the gate has to ask which requirement line
-          # applies where rather than collapsing them. Both halves are checked here,
-          # since the Apple Silicon half is a policy a Linux runner can still read.
+          # The cap may be marker-split, so the gate asks which requirement line
+          # applies where. Both platforms are checked here, since the Apple Silicon
+          # policy is one a Linux runner can still read.
           extras = [""] + list(metadata("unsloth_zoo").get_all("Provides-Extra") or [])
           reqs = [
               req
@@ -740,24 +738,15 @@ jobs:
           )
           print("transformers", transformers, "within the pinned range", pinned)
 
-          # Two ceilings, separate decisions rather than one number written twice.
-          # Checking only "matches pyproject" would let an automated bump raise a cap and
-          # opt the project in, which is what #1144 did. Raise either one deliberately, in
-          # the same commit that changes pyproject.toml.
+          # A policy literal, not "matches pyproject": that would let an automated bump
+          # raise the cap and opt the project in, which is what #1144 did. Raise it
+          # deliberately, in the same commit that changes pyproject.toml.
           #
-          # CEILING is the newest transformers the version matrix was run against on
-          # CUDA. It moved from 5.5.0 to 5.17.0 with the sweep that unblocked the
-          # prequantized bnb-4bit quant_state failures (unsloth #9867, #10010, #10017,
-          # #10276) and Gemma 4 E4B LoRA (unsloth #5355).
-          #
-          # MLX_CEILING is a different question and did NOT move. mlx-vlm 0.6.5
-          # and up require transformers >= 5.14, tests/mlx_simulation models the
-          # 0.6.4 surface, and the mlx / mlx-lm pins above are exact. Holding
-          # darwin + arm64 at 5.5.0 is what keeps the joint MLX resolution off
-          # that jump, so a CUDA-motivated bump cannot make it for the Apple
-          # Silicon lane.
+          # CEILING is the newest transformers the version matrix was run against, on
+          # CUDA and on Apple Silicon. On darwin + arm64 it also decides the mlx-vlm the
+          # joint resolution lands on, since mlx-vlm 0.6.5 and up require
+          # transformers >= 5.14.
           CEILING = Version("5.17.0")
-          MLX_CEILING = Version("5.5.0")
           DARWIN_ARM = {"sys_platform": "darwin", "platform_machine": "arm64"}
           LINUX_X86 = {"sys_platform": "linux", "platform_machine": "x86_64"}
 
@@ -769,28 +758,15 @@ jobs:
               assert tops, f"{overrides}: the pin declares no <= ceiling: {spec}"
               return max(tops)
 
-          general = ceiling_of(**LINUX_X86)
-          apple = ceiling_of(**DARWIN_ARM)
-          assert general <= CEILING, (
-              f"pyproject.toml pins transformers <= {general} off darwin, above the "
-              f"{CEILING} ceiling this project holds on purpose. That ceiling is the "
-              f"newest release the version matrix was run against. If raising it is "
-              f"intended, raise CEILING here in the same commit and say what was run."
-          )
-          assert apple <= MLX_CEILING, (
-              f"pyproject.toml pins transformers <= {apple} on darwin + arm64, above "
-              f"the {MLX_CEILING} ceiling the MLX stack holds on purpose. mlx-vlm "
-              f">= 0.6.5 needs transformers >= 5.14 and we are not following it yet. "
-              f"If raising it is intended, raise MLX_CEILING here in the same commit, "
-              f"say why, and show the Apple Silicon lane green on the new mlx-vlm."
-          )
-          assert apple < general or MLX_CEILING == CEILING, (
-              f"the darwin + arm64 cap ({apple}) is no longer below the general one "
-              f"({general}), so the marker split is doing nothing. Either drop the "
-              f"split or restore the lower Apple Silicon cap."
-          )
-          print("declared ceilings: general", general, "<=", CEILING,
-                "| darwin arm64", apple, "<=", MLX_CEILING)
+          for where, platform in (("off darwin", LINUX_X86), ("on darwin + arm64", DARWIN_ARM)):
+              declared = ceiling_of(**platform)
+              assert declared <= CEILING, (
+                  f"pyproject.toml pins transformers <= {declared} {where}, above the "
+                  f"{CEILING} ceiling this project holds on purpose. That ceiling is the "
+                  f"newest release the version matrix was run against. If raising it is "
+                  f"intended, raise CEILING here in the same commit and say what was run."
+              )
+              print("declared ceiling", where, declared, "<=", CEILING)
           PY
 
       # The five "Fail if ... skipped" gates below used to re-run their pytest
@@ -815,6 +791,31 @@ jobs:
             --report "$RUNNER_TEMP/mlx-reports/quantized_optimizer_state.xml" \
             --require no-skips \
             --message "real mlx is installed but the numeric tests skipped"
+
+      - name: pytest tests/test_mlx_optimizer_defaults.py (HARD GATE)
+        # rmsprop/adamax/adagrad/adadelta defaults and Adamax bias correction vs torch.optim; shim cannot answer.
+        run: >-
+          .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_optimizer_defaults.py -v -rs
+          --junitxml="$RUNNER_TEMP/mlx-reports/optimizer_defaults.xml"
+
+      - name: Fail if the optimizer defaults tests skipped
+        run: |
+          python3 scripts/pytest_junit_gate.py \
+            --report "$RUNNER_TEMP/mlx-reports/optimizer_defaults.xml" \
+            --require no-skips \
+            --message "real mlx is installed but the optimizer defaults tests skipped"
+
+      - name: pytest tests/test_mlx_gkd_loss.py (HARD GATE)
+        run: >-
+          .lanes/venv-numerics/bin/python -m pytest tests/test_mlx_gkd_loss.py -v -rs
+          --junitxml="$RUNNER_TEMP/mlx-reports/gkd_loss.xml"
+
+      - name: Fail if the GKD numeric tests skipped
+        run: |
+          python3 scripts/pytest_junit_gate.py \
+            --report "$RUNNER_TEMP/mlx-reports/gkd_loss.xml" \
+            --require no-skips \
+            --message "real mlx is installed but the GKD numeric tests skipped"
 
       - name: tests/test_mlx_neftune_quant_map.py (mlx_only half, HARD GATE)
         # Embedding identification, embed-scale resolution and probe cleanup are
@@ -913,6 +914,20 @@ jobs:
             --report "$RUNNER_TEMP/mlx-reports/gated_delta_batch_grad.xml" \
             --require one-passed \
             --message "real mlx is installed but no gated-delta gradient test ran"
+
+      # Pooling and contrastive losses need mlx core, not Metal; the real-checkpoint
+      # tests skip unless Qwen3-Embedding-0.6B is cached, hence one-passed.
+      - name: tests/test_mlx_embedding_pooling.py
+        run: >-
+          .lanes/venv-suites/bin/python -m pytest tests/test_mlx_embedding_pooling.py -v -rs
+          --junitxml="$RUNNER_TEMP/mlx-reports/embedding_pooling.xml"
+
+      - name: Fail if the embedding pooling tests skipped
+        run: |
+          python3 scripts/pytest_junit_gate.py \
+            --report "$RUNNER_TEMP/mlx-reports/embedding_pooling.xml" \
+            --require one-passed \
+            --message "real mlx is installed but no embedding pooling test ran"
   # Core (HF/TRL/peft) drift matrix. Three cells: HF=4.57.6+TRL<1, HF=latest+TRL=latest,
   # and pyproject defaults.
   #
@@ -1000,12 +1015,11 @@ jobs:
               def _marker(s):
                   return s.split(";", 1)[1] if ";" in s else ""
 
-              # The transformers cap is marker-split: darwin + arm64 is held lower
-              # than everywhere else, because there it is also what holds the MLX
-              # resolution at mlx-vlm 0.6.4. This lane is Linux, so it has to take
-              # the line that applies to Linux rather than whichever one happens to
-              # come first in the file. Markers are matched as text because this
-              # step is stdlib-only by design (no packaging, no pip install yet).
+              # A requirement may be marker-split with a darwin-only line. This lane
+              # is Linux, so it has to take the line that applies to Linux rather
+              # than whichever one happens to come first in the file. Markers are
+              # matched as text because this step is stdlib-only by design (no
+              # packaging, no pip install yet).
               _darwin_only = re.compile(r"sys_platform\s*==\s*['\"]darwin['\"]")
 
               def _pick(spec, name):
@@ -1128,6 +1142,8 @@ jobs:
                   tests/test_modeling_local_vision_helpers_eager.py \
                   tests/test_disable_compile_functions_reach_imported_helpers.py \
                   tests/test_data_dependent_helpers_not_fullgraph.py \
+                  tests/test_decode_compile_disable.py \
+                  tests/test_eager_decode_bypass.py \
                   tests/test_temporary_patches_exhaustive.py \
                   tests/test_patch_keeps_module_name.py \
                   tests/test_mxfp4_load_path_layout.py \
@@ -1143,6 +1159,7 @@ jobs:
                   tests/test_fix_untrained_tokens_composite_models.py \
                   tests/test_gemma4_dtype_drift_guards.py \
                   tests/test_gemma4_unified_forced_float32.py \
+                  tests/test_gemma3_processor_token_type_ids.py \
                   tests/test_fp16_path_tiny_models.py >> "$log" 2>&1 || trc=$?
                 echo "$trc" > ".lanes/$id.tests"
               else

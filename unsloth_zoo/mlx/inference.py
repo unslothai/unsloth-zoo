@@ -356,7 +356,7 @@ def _decode_conv_silu_kernel():
                     acc = product + acc;
                 }
                 T v = T(acc);
-                auto y = 1 / (1 + metal::exp(metal::abs(v)));
+                auto y = 1 / (1 + metal::precise::exp(metal::abs(v)));
                 T sigmoid = (v < 0) ? y : 1 - y;
                 out[b*C + c] = v * sigmoid;
             """,

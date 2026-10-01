@@ -2564,6 +2564,53 @@ def _auto_class_for(config: Any, trust_remote_code: bool = False):
     return first_hit if first_hit is not None else AutoModel
 
 
+def drop_no_placement_modules(model: nn.Module) -> list[str]:
+    """Drop ``model._no_placement_params`` owners from a META model so the load keeps them on
+    CPU (e.g. Qwen4Exp's ~102 GB n-gram table). ``UNSLOTH_PLACE_NO_PLACEMENT_PARAMS=1`` opts out."""
+    names = getattr(model, "_no_placement_params", None)
+    if not names or os.environ.get("UNSLOTH_PLACE_NO_PLACEMENT_PARAMS", "0") == "1":
+        return []
+    owners = sorted({
+        name.rsplit(".", 1)[0]
+        for name, _ in list(model.named_parameters()) + list(model.named_buffers())
+        if any(name == n or name.endswith("." + n) for n in names)
+    })
+    dropped = []
+    for path in owners:
+        parent_path, _, child = path.rpartition(".")
+        parent = model.get_submodule(parent_path) if parent_path else model
+        setattr(parent, child, nn.Module())
+        dropped.append(path)
+    return dropped
+
+
+def unmap_dropped_modules(device_map: dict, model: nn.Module, dropped: Sequence[str]) -> dict:
+    """Split map entries that are ancestors of ``dropped`` paths into their other children:
+    transformers expands keys by prefix, so ``model.layers.0: 0`` would still place the table."""
+    out = dict(device_map)
+    for path in dropped:
+        key = max(
+            (k for k in out if k == "" or path == k or path.startswith(k + ".")),
+            key=len, default=None,
+        )
+        if key is None:
+            continue
+        device = out.pop(key)
+        if key == path:
+            continue
+        module = model.get_submodule(key) if key else model
+        prefix = key
+        for part in (path[len(key) + 1:] if key else path).split("."):
+            for name, _ in list(module.named_children()) + list(
+                module.named_parameters(recurse=False)
+            ) + list(module.named_buffers(recurse=False)):
+                if name != part:
+                    out[f"{prefix}.{name}" if prefix else name] = device
+            module = getattr(module, part)
+            prefix = f"{prefix}.{part}" if prefix else part
+    return out
+
+
 def plan_device_map_for_pretrained(
     model_name_or_path: str,
     *,
@@ -2608,7 +2655,8 @@ def plan_device_map_for_pretrained(
         model_name_or_path, config=config,
         trust_remote_code=trust_remote_code, **config_kwargs
     )
-    return plan_device_map(
+    dropped = drop_no_placement_modules(model)
+    plan = plan_device_map(
         model,
         max_memory=max_memory,
         rows_per_chunk=rows_per_chunk,
@@ -2626,3 +2674,6 @@ def plan_device_map_for_pretrained(
         prefer_head_device=prefer_head_device,
         reserve_load_transient=reserve_load_transient,
     )
+    if plan is not None and dropped:
+        plan.device_map = unmap_dropped_modules(plan.device_map, model, dropped)
+    return plan

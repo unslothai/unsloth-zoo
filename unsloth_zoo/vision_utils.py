@@ -720,6 +720,42 @@ def smart_nframes(
     return nframes
 
 
+def _read_video_pyav(video_path: str, start: float = 0.0, end: Union[float, None] = None):
+    """Frames in [start, end] seconds as a (T, C, H, W) uint8 tensor, plus {"video_fps": fps}.
+
+    What torchvision.io.read_video(pts_unit="sec", output_format="TCHW") returns, for PyAV
+    builds that torchvision can no longer open.
+    """
+    import av
+    import numpy as np
+
+    frames = []
+    with av.open(video_path) as container:
+        stream = container.streams.video[0]
+        rate = stream.average_rate or stream.guessed_rate
+        video_fps = float(rate) if rate else 0.0
+        if start and stream.time_base:
+            # Jump to the keyframe at or before `start`, as torchvision does, rather than
+            # decoding and discarding everything ahead of a late segment. The filter below
+            # still drops the frames between that keyframe and `start`.
+            try:
+                container.seek(int(start / stream.time_base), stream=stream, backward=True)
+            except av.error.FFmpegError:
+                container.seek(0, stream=stream)
+        for frame in container.decode(stream):
+            when = frame.time
+            if when is not None:
+                if when < (start or 0.0):
+                    continue
+                if end is not None and when > end:
+                    break
+            frames.append(frame.to_ndarray(format="rgb24"))
+    if not frames:
+        return torch.empty((0, 3, 0, 0), dtype=torch.uint8), {"video_fps": video_fps}
+    video = torch.from_numpy(np.stack(frames)).permute(0, 3, 1, 2).contiguous()
+    return video, {"video_fps": video_fps}
+
+
 def _read_video_torchvision(
     ele: dict,
 ) -> tuple[torch.Tensor, float]:
@@ -733,13 +769,22 @@ def _read_video_torchvision(
         if "http://" in video_path or "https://" in video_path:
             warnings.warn("torchvision < 0.19.0 does not support http/https video path, please upgrade to 0.19.0.")
     st = time.time()
-    video, audio, info = io.read_video(
-        video_path,
-        start_pts=ele.get("video_start", 0.0),
-        end_pts=ele.get("video_end", None),
-        pts_unit="sec",
-        output_format="TCHW",
-    )
+    try:
+        video, audio, info = io.read_video(
+            video_path,
+            start_pts=ele.get("video_start", 0.0),
+            end_pts=ele.get("video_end", None),
+            pts_unit="sec",
+            output_format="TCHW",
+        )
+    except TypeError as exc:
+        # torchvision's read_video passes av.open(..., metadata_errors="ignore"), which PyAV 19
+        # removed, so every read fails before decoding. Decode the same range with PyAV directly.
+        if "metadata_errors" not in str(exc):
+            raise
+        video, info = _read_video_pyav(
+            video_path, ele.get("video_start", 0.0), ele.get("video_end", None)
+        )
     try:
         video_fps = info["video_fps"]
     except Exception as e:
@@ -1031,9 +1076,25 @@ def _fix_audio_feature_extractor_padding_side(processor):
     # The loader's padding_side="left" (a text setting) leaks into the audio
     # feature extractor via from_pretrained. Frame-validity masks assume right
     # padding; left padding desyncs Gemma 4 audio token counts (crash on tf < 5.10).
-    feature_extractor = getattr(processor, "feature_extractor", None)
-    if feature_extractor is not None and getattr(feature_extractor, "padding_side", None) == "left":
-        feature_extractor.padding_side = "right"
+    for sub in _audio_sub_processors(processor):
+        if getattr(sub, "padding_side", None) == "left":
+            sub.padding_side = "right"
+
+
+def _audio_sub_processors(processor):
+    # Granite-Speech / Phi-4-multimodal name it `audio_processor`; most others `feature_extractor`.
+    subs = (getattr(processor, k, None) for k in ("feature_extractor", "audio_processor"))
+    return [sub for sub in subs if sub is not None]
+
+
+def _audio_call_kwarg(processor):
+    """`audio` or `audios` as named by `processor.__call__`; None if it takes no audio (Voxtral, Whisper)."""
+    import inspect
+    try:
+        params = inspect.signature(processor.__call__).parameters
+    except (AttributeError, TypeError, ValueError):
+        return "audio"
+    return next((k for k in ("audio", "audios") if k in params), None)
 
 
 @lru_cache(maxsize=1)
@@ -1102,15 +1163,17 @@ def extract_audio_info(
                 for ele in content:
                     if not (isinstance(ele, dict) and ele.get("type") == "audio"):
                         continue
-                    audio = ele.get("audio")
-                    # Feature extractors also accept local paths and URLs as strings
-                    if audio is None:
-                        audio = ele.get("url") or ele.get("path")
+                    # Qwen2-Audio's template and docs use `audio_url`. `is None`, not `or`:
+                    # truthiness raises on a numpy waveform.
+                    audio = next((
+                        v for v in (ele.get(k) for k in ("audio", "url", "path", "audio_url"))
+                        if v is not None and not (isinstance(v, str) and not v)
+                    ), None)
                     if _is_audio_mapping(audio):
                         audio = _resolve_audio_dict(audio, sampling_rate)
                     if audio is None:
                         raise ValueError(
-                            "Unsloth: an audio content part has no `audio`, `url` or `path` data, "
+                            "Unsloth: an audio content part has no `audio`, `url`, `path` or `audio_url` data, "
                             "so the clip cannot be loaded and the example would train as text only."
                         )
                     audio_inputs.append(audio)
@@ -1484,9 +1547,9 @@ def _tensorize_ragged_batch(batch):
 pass
 
 
-def _probe_assistant_single_content(processor, model = None):
+def _probe_assistant_single_content(processor, model = None, modality = "image"):
     """Any list-form failure (TypeError, repr, Apertus 1.5 Jinja TemplateError) tries a string."""
-    user = {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Hello!"}]}
+    user = {"role": "user", "content": [{"type": modality}, {"type": "text", "text": "Hello!"}]}
     try:
         rendered = processor.apply_chat_template([
             user,
@@ -1522,7 +1585,7 @@ class UnslothVisionDataCollator:
         "num_proc", "assistant_single_content", "patch_size",
         "resize_dimension", "snap_to_patch_size",
         "completion_only_loss", "pad_to_multiple_of", "size_func",
-        "_seen_supervised", "_warned_unsupervised",
+        "_seen_supervised", "_warned_unsupervised", "audio_call_kwarg",
     )
 
     def __init__(
@@ -1546,8 +1609,18 @@ class UnslothVisionDataCollator:
         snap_to_patch_size = False,
         last_response_only = False, # Train only on the last assistant turn
     ):
-        if not hasattr(processor, "image_processor") and not _processor_takes_images(processor):
-            raise TypeError("Unsloth: UnslothVisionDataCollator is only for image models!")
+        has_images = getattr(processor, "image_processor", None) is not None or _processor_takes_images(processor)
+        audio_call_kwarg = _audio_call_kwarg(processor)
+        if not has_images:
+            if not _audio_sub_processors(processor):
+                raise TypeError("Unsloth: UnslothVisionDataCollator requires an image or audio processor!")
+            if audio_call_kwarg is None:
+                raise TypeError(
+                    f"Unsloth: UnslothVisionDataCollator does not support {type(processor).__name__}: "
+                    "its __call__ takes no `audio=` argument (e.g. Voxtral needs audio to go through "
+                    "processor.apply_chat_template(..., tokenize=True, return_dict=True))."
+                )
+        self.audio_call_kwarg = audio_call_kwarg or "audio"
         self._seen_supervised = False
         self._warned_unsupervised = False
         patch_medias_processor(processor)
@@ -1662,7 +1735,9 @@ class UnslothVisionDataCollator:
 
         # Check what type for assistant VLM tokenizer allows!
         # Good for Mistral V3 and Pixtral I think
-        self.assistant_single_content = _probe_assistant_single_content(processor, model)
+        self.assistant_single_content = _probe_assistant_single_content(
+            processor, model, "image" if has_images else "audio",
+        )
         return
 
     def _get_padding_token_ids_on_device(self, device):
@@ -1754,7 +1829,7 @@ class UnslothVisionDataCollator:
             for k, v in video_kwargs.items():
                 proc_kwargs[k] = v
         if audios:
-            proc_kwargs["audio"] = audios
+            proc_kwargs[getattr(self, "audio_call_kwarg", "audio")] = audios
         if self.pad_to_multiple_of is not None:
             proc_kwargs["pad_to_multiple_of"] = self.pad_to_multiple_of
         batch = self._call_processor(proc_kwargs, has_images)
@@ -1952,8 +2027,10 @@ class UnslothVisionDataCollator:
         return image, video, video_kwarg
 
     def _extract_audio_for_example(self, example, messages):
-        feature_extractor = getattr(self.processor, "feature_extractor", None)
-        target_sr = getattr(feature_extractor, "sampling_rate", None)
+        target_sr = next((
+            sr for sr in (getattr(sub, "sampling_rate", None) for sub in _audio_sub_processors(self.processor))
+            if sr is not None
+        ), None)
         audio_val = example.get("audio")
         if audio_val is None:
             # No usable top-level audio -> fall back to inline message content
@@ -2375,7 +2452,7 @@ class UnslothVisionDataCollator:
             for k, v in video_kwargs.items():
                 prompt_kwargs[k] = v
         if audios:
-            prompt_kwargs["audio"] = audios
+            prompt_kwargs[getattr(self, "audio_call_kwarg", "audio")] = audios
 
         proc_prompts = self._call_processor(dict(prompt_kwargs, text = prompt_texts), pc_has_images)
         # Encode completions (RIGHT pad) text-only
