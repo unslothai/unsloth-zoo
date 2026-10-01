@@ -62,7 +62,7 @@ from .peft_utils import get_lora_layer_modules
 from .temporary_patches.mhc_sinkhorn import (
     MHC_SINKHORN_SOURCE,
     MHC_SINKHORN_REPLACEMENT,
-    mhc_fast_enabled,
+    mhc_fast_mode,
 )
 from importlib.metadata import version as importlib_version
 import functools
@@ -236,33 +236,35 @@ MODEL_FUNCTION_SOURCE_REWRITES = {
 }
 
 
-# Per model_type module forward rewrites: {class: (old, new, enabled)}. A class whose rewrite matches its
-# forward exactly once leaves DISABLE_COMPILE_MODULES and compiles with the rewritten forward.
-# DeepSeek-V4 / V4.1 mHC mixers: the Sinkhorn-Knopp loop becomes `unsloth_sinkhorn_knopp`, which has an
-# explicit backward; UNSLOTH_DSV4_MHC_FAST=0 keeps the stock source and the eager mixer.
+# Per model_type module forward rewrites: {class: (old, new, mode)}. A class whose `old` text occurs exactly
+# once in its forward leaves DISABLE_COMPILE_MODULES and compiles with the rewritten forward. `mode()`
+# returns None (no rewrite, class stays as listed), "stock" (compile the unchanged forward) or anything
+# else (apply the rewrite). DeepSeek-V4 / V4.1 mHC mixers: the Sinkhorn-Knopp loop becomes
+# `unsloth_sinkhorn_knopp`; UNSLOTH_DSV4_MHC_FAST=0 keeps the eager mixer, =stock compiles the stock loop.
 MODULE_FORWARD_SOURCE_REWRITES = {
     "deepseek_v4": {
-        "DeepseekV4HyperConnection": (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_enabled),
+        "DeepseekV4HyperConnection": (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_mode),
     },
     "deepseek_v41": {
-        "DeepseekV41HyperConnection": (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_enabled),
+        "DeepseekV41HyperConnection": (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_mode),
     },
 }
 
 
 def module_forward_source_rewrites(modeling_file, model_type):
-    """{class name: rewritten forward source} for the enabled rewrites that match exactly once."""
+    """{class name: forward source to compile} for the enabled rewrites whose text matches exactly once."""
     applicable = {}
-    for name, (old, new, enabled) in MODULE_FORWARD_SOURCE_REWRITES.get(model_type, {}).items():
+    for name, (old, new, mode) in MODULE_FORWARD_SOURCE_REWRITES.get(model_type, {}).items():
         try:
-            if not enabled():
+            mode = mode()
+            if not mode:
                 continue
             cls = getattr(modeling_file, name)
             source = inspect.getsource(_unwrap_undecorated_method(cls.forward, cls.__qualname__))
         except Exception:
             continue
         if source.count(old) == 1:
-            applicable[name] = source.replace(old, new)
+            applicable[name] = source if mode == "stock" else source.replace(old, new)
     return applicable
 
 

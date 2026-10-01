@@ -30,7 +30,7 @@ eager stays bitwise identical to the stock module.
 
 The compiler swaps the transformers loop for this call through `MODULE_FORWARD_SOURCE_REWRITES`
 (`unsloth_zoo/compiler.py`) and then compiles the mixer. `UNSLOTH_DSV4_MHC_FAST=0` restores the
-stock source and the eager mixer.
+stock source and the eager mixer; `UNSLOTH_DSV4_MHC_FAST=stock` compiles the stock loop instead.
 """
 
 import os
@@ -39,14 +39,22 @@ import torch
 
 __all__ = [
     "unsloth_sinkhorn_knopp",
-    "mhc_fast_enabled",
+    "mhc_fast_mode",
     "MHC_SINKHORN_SOURCE",
     "MHC_SINKHORN_REPLACEMENT",
 ]
 
 
-def mhc_fast_enabled():
-    return os.environ.get("UNSLOTH_DSV4_MHC_FAST", "1").strip().lower() not in ("0", "false", "off", "no")
+def mhc_fast_mode():
+    """`UNSLOTH_DSV4_MHC_FAST`: unset / 1 = unrolled rewrite (fewest kernels, slowest to compile),
+    `stock` = compile the transformers loop as is (about 3x more mixer kernels, about 3x cheaper to
+    compile), 0 = keep the mixer eager."""
+    value = os.environ.get("UNSLOTH_DSV4_MHC_FAST", "1").strip().lower()
+    if value in ("0", "false", "off", "no", "eager"):
+        return None
+    if value == "stock":
+        return "stock"
+    return "unrolled"
 
 
 # Exact transformers text (deepseek_v4 and the deepseek_v41 port share it); a source rewrite only

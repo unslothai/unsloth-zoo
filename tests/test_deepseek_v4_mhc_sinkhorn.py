@@ -197,6 +197,9 @@ def test_rewrite_registered_for_v4_and_v41_and_kill_switch(tmp_path, monkeypatch
     rewrites = compiler.module_forward_source_rewrites(module, "deepseek_v4")
     assert "comb = unsloth_sinkhorn_knopp(comb, self.hc_sinkhorn_iters, self.hc_eps)" in rewrites["DeepseekV4HyperConnection"]
     assert "for _ in range" not in rewrites["DeepseekV4HyperConnection"]
+    monkeypatch.setenv("UNSLOTH_DSV4_MHC_FAST", "stock")
+    stock = compiler.module_forward_source_rewrites(module, "deepseek_v4")["DeepseekV4HyperConnection"]
+    assert MHC_SINKHORN_SOURCE in stock and "unsloth_sinkhorn_knopp" not in stock
     monkeypatch.setenv("UNSLOTH_DSV4_MHC_FAST", "0")
     assert compiler.module_forward_source_rewrites(module, "deepseek_v4") == {}
 
@@ -272,7 +275,7 @@ print("@@@" + json.dumps(out))
 '''
 
 
-def _run_child(tmp_path, fast):
+def _run_child(tmp_path, mode):
     pytest.importorskip("transformers.models.deepseek_v4.modeling_deepseek_v4")
     import importlib.util
 
@@ -281,7 +284,7 @@ def _run_child(tmp_path, fast):
     env["PYTHONPATH"] = os.pathsep.join([repo_root] + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
     env.pop("UNSLOTH_COMPILE_DISABLE", None)
     env["UNSLOTH_ALLOW_CPU"] = "1"
-    env["UNSLOTH_DSV4_MHC_FAST"] = "1" if fast else "0"
+    env["UNSLOTH_DSV4_MHC_FAST"] = mode
     if importlib.util.find_spec("unsloth") is None:
         env["UNSLOTH_ZOO_DISABLE_GPU_INIT"] = "1"
     result = subprocess.run(
@@ -296,7 +299,7 @@ def _run_child(tmp_path, fast):
 
 
 def test_v4_mixer_compiles_through_the_rewrite(tmp_path):
-    child = _run_child(tmp_path, fast = True)
+    child = _run_child(tmp_path, "1")
     assert child["DeepseekV4HyperConnection"].startswith("torch_compile_with_fallback("), child
     assert child["calls_fast"] and child["imports_fast"], child
     # HyperHead has no Sinkhorn and runs once per forward: it stays eager.
@@ -307,8 +310,17 @@ def test_v4_mixer_compiles_through_the_rewrite(tmp_path):
 
 
 def test_kill_switch_keeps_the_stock_eager_mixer(tmp_path):
-    child = _run_child(tmp_path, fast = False)
+    child = _run_child(tmp_path, "0")
     assert child["DeepseekV4HyperConnection"] == "torch_compiler_disable_unless_decode", child
     assert not child["calls_fast"] and not child["imports_fast"], child
     assert child["finite"], child
     assert max(child["rel_errs"]) == 0.0, child
+
+
+def test_stock_mode_compiles_the_unchanged_mixer(tmp_path):
+    child = _run_child(tmp_path, "stock")
+    assert child["DeepseekV4HyperConnection"].startswith("torch_compile_with_fallback("), child
+    assert not child["calls_fast"] and not child["imports_fast"], child
+    assert child["DeepseekV4HyperHead"] == "torch_compiler_disable_unless_decode", child
+    assert child["finite"], child
+    assert max(child["rel_errs"]) < 2e-2, child
