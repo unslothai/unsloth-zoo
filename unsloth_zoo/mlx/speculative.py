@@ -134,13 +134,13 @@ class RoundPlan:
 
 
 class _Ema:
-    """Running mean until ``1 / alpha`` samples, then exponential; a prior counts as one sample."""
+    """Running mean until ``1 / alpha`` samples, then exponential; a prior counts as ``weight`` samples."""
 
     __slots__ = ("value", "count")
 
-    def __init__(self, prior: float | None = None):
+    def __init__(self, prior: float | None = None, weight: int = 1):
         self.value = prior
-        self.count = 0 if prior is None else 1
+        self.count = 0 if prior is None else weight
 
     def update(self, sample: float, alpha: float) -> None:
         self.count += 1
@@ -151,10 +151,10 @@ class _Ema:
 class ReplyStats:
     """One reply's acceptance, seeded from what the load has seen so far."""
 
-    def __init__(self, draft: list[_Ema], copy: _Ema, backoff: int):
-        self.draft = [_Ema(ema.value) for ema in draft]
+    def __init__(self, draft: list[_Ema], copy: _Ema, backoff: int, weight: int = 1):
+        self.draft = [_Ema(ema.value, weight) for ema in draft]
         self.draft_seen = [ema.count > 1 for ema in draft]
-        self.copy = _Ema(copy.value)
+        self.copy = _Ema(copy.value, weight)
         self.tokens = 0
         # Per source: the doubling back-off, and the token count to retry an unused source at.
         self.backoff = {"copy": backoff, "draft": backoff}
@@ -215,6 +215,8 @@ class DraftController:
         max_copy: int = 16,
         can_copy: bool = True,
         acceptance_alpha: float = 0.05,
+        load_alpha: float = 0.005,
+        seed_weight: int = 10,
         cost_alpha: float = 0.2,
         hysteresis: float = 1.03,
         probe_margin: float = 1.15,
@@ -235,6 +237,9 @@ class DraftController:
         self.max_copy = max(0, int(max_copy)) if can_copy else 0
         self.max_width = 1 + max(self.max_depth, self.max_copy)
         self.acceptance_alpha = acceptance_alpha
+        # A reply's seed: a slow load average worth several samples, so neither one reply's tail nor one unlucky round ends drafting.
+        self.load_alpha = load_alpha
+        self.seed_weight = seed_weight
         self.cost_alpha = cost_alpha
         self.hysteresis = hysteresis
         self.probe_margin = probe_margin
@@ -284,7 +289,7 @@ class DraftController:
     _EXHAUSTIVE_ROWS = 6
 
     def new_reply(self) -> ReplyStats:
-        return ReplyStats(self.draft_acceptance, self.copy_acceptance, self._base_backoff)
+        return ReplyStats(self.draft_acceptance, self.copy_acceptance, self._base_backoff, self.seed_weight)
 
     def _plain_step(self, bucket: int) -> float:
         measured = {b: ema.value for b, ema in self.plain_cost.items() if ema.value is not None}
@@ -604,10 +609,10 @@ class DraftController:
                 if row.source == "draft":
                     stats.draft[position].update(sample, alpha)
                     stats.draft_seen[position] = True
-                    self.draft_acceptance[position].update(sample, alpha)
+                    self.draft_acceptance[position].update(sample, self.load_alpha)
                 elif row.source == "copy":
                     stats.copy.update(sample, alpha)
-                    self.copy_acceptance.update(sample, alpha)
+                    self.copy_acceptance.update(sample, self.load_alpha)
             if row.source in stats.backoff:
                 # A source resets its back-off only by winning a round, not by riding a probe.
                 if i in self._probing_sources:

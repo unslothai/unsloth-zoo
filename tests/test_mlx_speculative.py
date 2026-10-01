@@ -147,7 +147,7 @@ def test_a_draft_probe_shrinks_to_the_deepest_depth_the_credit_affords():
     controller = DraftController(max_depth = 8, can_copy = False)
     _run(controller, _Machine(draft_slope = 0.3, verify_slope = 0.3, overhead = 1.7), [([0.5, 0.2] + [0.1] * 6, None)], rounds = 400)
     controller._credit = 1.5
-    assert controller.plan([RowState(controller.new_reply())]).rows == (RowPlan("draft", 3),)
+    assert controller.plan([RowState(controller.new_reply())]).rows == (RowPlan("draft", 2),)
 
 
 def test_fused_rounds_learn_how_much_drafting_they_hide():
@@ -213,6 +213,12 @@ def test_drafter_recovers_after_copies_won():
     _run(controller, machine, [([1.0, 1.0, 0.0, 0.0], 1.0)], rounds = 1000, copies = 2)
     assert _run(controller, machine, [([1.0] * 4, 1.0)], rounds = 3000, copies = 2) == (("draft", 4),)
 
+
+
+def test_unlucky_rounds_do_not_end_drafting():
+    _run(controller := DraftController(max_depth = 3, can_copy = False), machine := _Machine(draft_slope = 0.3), [([0.7] * 3, None)], rounds = 1000)
+    _run(controller, machine, [([0.0] * 3, None)], rounds = 80)  # one reply's rejected tail, then the next reply's rejected first round
+    assert _run(controller, machine, [([0.0] * 3, None)], rounds = 1, states = (states := [])) and max(controller.score(controller._round_at(width, states), states) for width in range(2, 5)) > controller.score(RoundPlan("plain", 1), states)
 
 @pytest.mark.parametrize("draft, floor", [([1.0], 0.97), ([0.5] * 16, 0.97)])
 def test_wide_batch_settles_on_plain_without_endless_probes(draft, floor):
