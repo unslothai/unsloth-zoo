@@ -1341,6 +1341,34 @@ def test_sgd_weight_decay_is_coupled_not_decoupled():
         assert optimizer._kw["weight_decay"] == 0.0
 
 
+@pytest.mark.parametrize("optim_name", ["adam", "adam_8bit"])
+def test_adam_weight_decay_is_coupled(optim_name):
+    """Adam weight decay is coupled L2 (torch.optim.Adam), never dropped."""
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    class TinyModel:
+        def trainable_parameters(self):
+            return {"proj": {"weight": mx.array([[2.0, -4.0]]),
+                             "bias": mx.array([6.0])}}
+
+    wd = 0.05
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.model = TinyModel()
+    trainer.args = MLXTrainingConfig(optim=optim_name, weight_decay=wd)
+    trainer._build_optimizer(total_steps=4)
+
+    assert trainer._coupled_weight_decay == pytest.approx(wd)
+    assert trainer._manual_weight_decay == pytest.approx(0.0)
+
+    grad = {"proj": {"weight": mx.array([[1.0, 1.0]]), "bias": mx.array([1.0])}}
+    flat = dict(tree_flatten(trainer._apply_coupled_weight_decay(trainer.model, grad)))
+    # Bias exempt, as in HF param groups.
+    assert flat["proj.weight"].tolist()[0] == pytest.approx([1.0 + wd * 2.0, 1.0 + wd * -4.0])
+    assert flat["proj.bias"].tolist() == pytest.approx([1.0])
+
+
 def test_norm_clip_dtype_restore_keeps_lora_and_norms_promotable():
     from unsloth_zoo.mlx.trainer import MLXTrainer
 
