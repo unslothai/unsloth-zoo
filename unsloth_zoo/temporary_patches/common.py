@@ -30,17 +30,31 @@ __all__ = [
     "flatten_for_elementwise_norm",
     "unwrap_norm_weight",
     "publish_to_modeling_module",
+    "RESCOPE_PATCH_FLAG",
+    "WRAPPER_INNER_ATTR",
 ]
 
 import os
 import sys
 import logging
-from ..log import logger
+from unsloth_zoo.log import logger
 import functools
 UNSLOTH_ENABLE_LOGGING  = os.environ.get("UNSLOTH_ENABLE_LOGGING",  "0") == "1"
 UNSLOTH_COMPILE_DISABLE = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") in ("1", "partial",)
 # "partial" keeps the source rewrites but turns torch.compile off, like compiler.py does.
 UNSLOTH_COMPILE_DISABLE_PARTIAL = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "partial"
+
+# Marks this package's wrapper on `transformers.conversion_mapping.get_model_conversion_mapping`.
+# Lives here rather than in the module that installs it because two modules read it:
+# `conversion_mapping_rescope.py` sets it, and `bitsandbytes.py` asks whether the repair is live
+# before its error message blames the transformers version for a load the repair already fixed.
+RESCOPE_PATCH_FLAG = "_unsloth_zoo_patched_composite_prefix_renaming"
+
+# Links a wrapper on that same function to the callable it wraps, for readers that need to walk
+# the chain. Deliberately NOT `__wrapped__`: the rescope unwraps `__wrapped__` to find the
+# function to wrap, so publishing one on a wrapper that must survive would make the rescope
+# replace it instead of sitting on top of it, silently dropping that wrapper's behaviour.
+WRAPPER_INNER_ATTR = "_unsloth_wrapper_inner"
 
 # Get only allowed options
 import inspect
@@ -52,6 +66,12 @@ def determine_compile_threads():
     # See https://github.com/pytorch/pytorch/blob/ab2294d8289a7757a2fc321cdefac88e2b378edf/torch/_inductor/config.py#L771
     # Windows thread count = 1. See https://github.com/unslothai/unsloth-zoo/pull/187
     if sys.platform == "win32": return 1
+    # get_torch_compile_options feeds this into the Inductor options dict, which outranks
+    # TORCHINDUCTOR_COMPILE_THREADS, so returning the cpu count would undo _gpu_init's forcing.
+    # Gated on our sentinel and NOT on TORCHINDUCTOR_COMPILE_THREADS: vLLM sets that to "1"
+    # unconditionally at import (vllm/env_override.py), which would drop every vLLM user to
+    # a single compile worker.
+    if os.environ.get("UNSLOTH_FORCE_SINGLE_COMPILE_WORKER", "0") == "1": return 1
     cpu_count = os.cpu_count()
     return min(32, max(4, cpu_count))
 pass

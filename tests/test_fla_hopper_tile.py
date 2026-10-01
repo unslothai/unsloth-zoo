@@ -66,11 +66,6 @@ def _load_vendored_fla():
     return chunk_o
 
 
-# ---------------------------------------------------------------------------
-# 1. Tile selection: BK must never land on 64 in the affected range
-# ---------------------------------------------------------------------------
-
-
 _KEEP = object()
 
 
@@ -189,8 +184,6 @@ def test_hopper_at_a_nonzero_device_index_still_steps_down(monkeypatch):
     )
     chunk_o._device_is_nvidia_hopper.cache_clear()
     try:
-        # hopper=False -> the module global does NOT report Hopper, exactly as on a
-        # host whose device 0 is not Hopper. The tensor's device does.
         got = _record_bk(chunk_o, K=64, V=128, hopper=False, monkeypatch=monkeypatch)
         assert got["BK"] == 32, (
             "a Hopper device that the import-time global missed still selected the "
@@ -206,11 +199,6 @@ def test_hopper_at_a_nonzero_device_index_still_steps_down(monkeypatch):
     monkeypatch.undo()
     chunk_o._device_is_nvidia_hopper.cache_clear()
     assert _record_bk(chunk_o, K=64, V=128, hopper=False, monkeypatch=monkeypatch, tensor_hopper=False)["BK"] == 64
-
-
-# ---------------------------------------------------------------------------
-# 2. The override is a tiling change, not an algebra change
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.skipif(not _cuda_available(), reason="needs CUDA")
@@ -272,11 +260,6 @@ def test_bk_override_does_not_change_gradients(monkeypatch):
         denom = a.norm().clamp_min(1e-12)
         rel = (a - b).norm() / denom
         assert rel < 5e-3, f"{name}: BK=32 diverged from BK=64 (rel L2 {rel:.3e})"
-
-
-# ---------------------------------------------------------------------------
-# 3. No fla is left bound unpatched on a suspect host (the #5276 crash path)
-# ---------------------------------------------------------------------------
 
 
 @pytest.fixture
@@ -597,7 +580,6 @@ def test_in_place_patch_is_thread_safe(monkeypatch):
         else:
             slow_inside.set()
             fast_done.wait(5)
-        # What the real kernel launcher reads, at exactly this moment.
         if chunk_o.IS_NVIDIA_HOPPER:
             raise RuntimeError(f"{tag}: blanket #640 guard fired mid-call")
         seen[tag] = 128 if chunk_o.check_shared_mem("hopper", 0) else 32
@@ -633,19 +615,25 @@ def test_in_place_patch_is_thread_safe(monkeypatch):
     # Both concurrent calls asked for K=64, so both must get the safe 32-wide tile;
     # neither may have had its override cancelled by the other's restore.
     assert seen == {"fast": 32, "slow": 32}, seen
-    # And nothing is left behind on either thread.
     assert fv._installed_fla_forcing_small_tile() is False
-
-
-# ---------------------------------------------------------------------------
-# 4. The opt-out
-# ---------------------------------------------------------------------------
 
 
 def test_opt_out_forces_pure_torch(monkeypatch, fake_gated_delta_modeling):
     """UNSLOTH_DISABLE_HOPPER_FLA_BWD=1 must make transformers take its pure-torch
     gated-delta path, which needs both a False availability probe and the module
-    global unbound (the layer reads ``chunk_gated_delta_rule or torch_...``)."""
+    global unbound (the layer reads ``chunk_gated_delta_rule or torch_...``).
+
+    Pinned to the pre-#47630 layout, because that "or torch_..." read is what the
+    pure-torch outcome is made of: after #47630 the modeling files resolve the
+    kernel through ``use_kernel_func_from_hub_with_fallback``, which freezes the
+    implementation into a closure at import time, so there is no probe to answer
+    False and no global to unbind and pure torch is simply not reachable from
+    here. Without the pin this test silently swaps which branch of
+    ``patch_vendor_fla`` it covers as soon as the installed Transformers crosses
+    that release, and fails. The post-#47630 contract -- fall through to the
+    protection path instead of returning -- is
+    ``test_optout_falls_through_to_protection_on_the_new_layout``.
+    """
     import transformers.utils.import_utils as iu
 
     from unsloth_zoo.temporary_patches import fla_vendor as fv
@@ -653,6 +641,7 @@ def test_opt_out_forces_pure_torch(monkeypatch, fake_gated_delta_modeling):
     monkeypatch.setenv("UNSLOTH_DISABLE_HOPPER_FLA_BWD", "1")
     monkeypatch.setattr(fv, "_hopper_dqkwg_suspect_here", lambda: True)
     monkeypatch.setattr(fv, "_FLA_DISABLED_REASON", None)
+    monkeypatch.setattr(fv, "_transformers_uses_availability_probe", lambda: True)
     monkeypatch.setattr(iu, "is_flash_linear_attention_available", lambda: True, raising=False)
 
     def fail_inject():
@@ -691,26 +680,66 @@ def test_opt_out_covers_models_the_vendored_tree_does_not(monkeypatch):
     assert "kimi_linear" not in _GATED_DELTA_MODELING
 
 
-def test_opt_out_outranks_the_source_preference_flags(monkeypatch, fake_gated_delta_modeling):
+@pytest.mark.parametrize("old_layout", [True, False], ids=["probe", "kernel-hub"])
+def test_opt_out_outranks_the_source_preference_flags(
+    old_layout, monkeypatch, fake_gated_delta_modeling,
+):
     """The other two flags choose *which* fla to use; this one is a correctness
-    switch, so it has to win over both."""
+    switch, so it has to win over both.
+
+    What "winning" looks like depends on the Transformers layout, so both are
+    driven explicitly rather than left to whichever version happens to be
+    installed:
+
+      * pre-#47630, the opt-out reaches pure torch, so neither flag may leave a
+        gated-delta module global bound to an fla kernel;
+      * post-#47630 it cannot (the kernel-hub decorator froze its implementation
+        at import time), so it degrades to making the fla that decorator resolves
+        a fixed one -- and neither flag may short-circuit that protection, since
+        returning early would leave an unpatched BK=64 install serving the
+        backward, i.e. setting a safety switch would make the host less safe.
+    """
     from unsloth_zoo.temporary_patches import fla_vendor as fv
 
     monkeypatch.setattr(fv, "_hopper_dqkwg_suspect_here", lambda: True)
+    monkeypatch.setattr(fv, "_transformers_uses_availability_probe", lambda: old_layout)
 
-    def fail_inject():
-        raise AssertionError("the opt-out must not inject the vendored tree")
+    reached = []
+    if old_layout:
+        def fail_inject():
+            raise AssertionError("the opt-out must not inject the vendored tree")
 
-    monkeypatch.setattr(fv, "_inject_vendored_fla", fail_inject)
+        monkeypatch.setattr(fv, "_inject_vendored_fla", fail_inject)
+    else:
+        monkeypatch.setattr(fv, "_warn_hopper_optout_degraded", lambda: None)
+        monkeypatch.setattr(fv, "_patch_is_available", lambda probe=None: True)
+        monkeypatch.setattr(fv, "_repair_already_imported_modeling", lambda **kw: None)
+        monkeypatch.setattr(fv, "_should_defer_to_installed_fla", lambda: False)
+        monkeypatch.setattr(fv, "_torch_triton_cuda_supported", lambda: True)
+        # An earlier test in this process may already have injected the vendored
+        # tree, which legitimately short-circuits the injection decision. Force the
+        # not-yet-injected state so the fall-through is what is under test.
+        monkeypatch.setattr(fv, "_vendored_already_injected", lambda: False)
+        monkeypatch.setattr(
+            fv, "_inject_vendored_fla", lambda: (reached.append(True), (True, False))[1],
+        )
 
     for other in ("UNSLOTH_DISABLE_VENDORED_FLA", "UNSLOTH_FORCE_VENDORED_FLA"):
         monkeypatch.setenv("UNSLOTH_DISABLE_HOPPER_FLA_BWD", "1")
         monkeypatch.setenv(other, "1")
         for mod in fake_gated_delta_modeling.values():
             mod.chunk_gated_delta_rule = lambda *a, **k: None
+        reached.clear()
         fv.patch_vendor_fla()
-        for pkg, mod in fake_gated_delta_modeling.items():
-            assert mod.chunk_gated_delta_rule is None, f"{other} defeated the opt-out for {pkg}"
+        if old_layout:
+            for pkg, mod in fake_gated_delta_modeling.items():
+                assert mod.chunk_gated_delta_rule is None, f"{other} defeated the opt-out for {pkg}"
+        else:
+            assert reached, (
+                f"{other} defeated the opt-out: the degraded opt-out must still "
+                "reach the protection path, not return and leave the kernel-hub "
+                "decorator resolving an unpatched fla"
+            )
         monkeypatch.delenv(other)
 
 
@@ -729,11 +758,6 @@ def test_opt_out_is_inert_off_hopper(monkeypatch, fake_gated_delta_modeling):
     assert fv.fla_unavailable_reason() is None
     for mod in fake_gated_delta_modeling.values():
         assert mod.chunk_gated_delta_rule is not None
-
-
-# ---------------------------------------------------------------------------
-# 5. End to end: a real gated-deltanet model trains on a simulated Hopper
-# ---------------------------------------------------------------------------
 
 
 def _has_qwen3_next() -> bool:
@@ -805,11 +829,6 @@ def test_qwen3_next_trains_with_simulated_hopper_tile(monkeypatch):
     grads = [p.grad for p in model.parameters() if p.grad is not None]
     assert grads, "no gradients were produced"
     assert all(torch.isfinite(g).all() for g in grads), "non-finite gradients"
-
-
-# ---------------------------------------------------------------------------
-# 6. Non-Hopper hosts are untouched
-# ---------------------------------------------------------------------------
 
 
 def test_this_blackwell_host_is_not_suspect():
@@ -1020,7 +1039,6 @@ def test_installed_patch_leaves_non_hopper_tensors_alone(monkeypatch):
         "a non-Hopper tensor must not be forced onto the narrow tile"
     )
 
-    # Same call on a device reported as Hopper does take the override.
     monkeypatch.setattr(fv, "_device_index_is_hopper", lambda index: True)
     chunk_o.chunk_bwd_dqkwg(q=k, k=k, v=k, do=k, h=None, dh=None, g=g)
     assert seen["small_tile"] is True, "a Hopper tensor at K=64 must take the override"
@@ -1045,7 +1063,6 @@ def test_vendored_guard_uses_the_tensor_device_not_device_zero(monkeypatch):
     monkeypatch.setattr(chunk_o, "_is_hopper_tensor", lambda x: False)
     assert _record_bk(chunk_o, K=64, V=128, hopper=True, monkeypatch=monkeypatch)["BK"] == 64
 
-    # Tensor on Hopper while the global says otherwise: step down.
     monkeypatch.setattr(chunk_o, "_is_hopper_tensor", lambda x: True)
     assert _record_bk(chunk_o, K=64, V=128, hopper=False, monkeypatch=monkeypatch)["BK"] == 32
 

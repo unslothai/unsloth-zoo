@@ -12,14 +12,33 @@ import triton.language as tl
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.cache import fla_cache_autotune
 from fla.ops.utils.op import exp2
-from fla.utils import IS_NVIDIA_BLACKWELL, autotune_cache_kwargs, check_shared_mem
+from fla.utils import (
+    IS_NVIDIA_BLACKWELL,
+    TRITON_ABOVE_3_6_0,
+    autotune_cache_kwargs,
+    check_shared_mem,
+)
 
 # Unsloth: backported from fla PR #1000 (issue #999). On Blackwell the autotuner
 # can pick an unstable prepare_wy_repr_bwd_kernel config, causing the gated-delta
 # backward to hang or hit a misaligned address (NCCL watchdog timeout under DDP).
 # Pin to the B200-validated config until the wider space is re-validated.
 PREPARE_WY_REPR_BWD_NUM_WARPS = [2] if IS_NVIDIA_BLACKWELL else [2, 4]
-PREPARE_WY_REPR_BWD_NUM_STAGES = [4] if IS_NVIDIA_BLACKWELL else [2, 3, 4]
+
+
+def _prepare_wy_repr_bwd_num_stages(is_blackwell, triton_above_3_6_0):
+    """Unsloth: PR #1000 pinned Blackwell to num_warps=2 AND num_stages=4, but only
+    num_warps was implicated (validated on triton 3.3.1) and num_stages=4 is the slow
+    half: on a B200 it costs 0.62 ms of a 5.31 ms chunk_gated_delta_rule fwd+bwd at
+    T=8192 H=48. Keep the warp pin, and from triton 3.6 let num_stages autotune."""
+    if is_blackwell and not triton_above_3_6_0:
+        return [4]
+    return [2, 3, 4]
+
+
+PREPARE_WY_REPR_BWD_NUM_STAGES = _prepare_wy_repr_bwd_num_stages(
+    IS_NVIDIA_BLACKWELL, TRITON_ABOVE_3_6_0,
+)
 
 
 @triton.heuristics({

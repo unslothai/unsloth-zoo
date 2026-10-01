@@ -37,6 +37,13 @@ ROUNDUP = "roundup_power2_divisions:[32:256,64:128,256:64,>:32]"
 _ALLOC_KEYS = ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF")
 _WIPE = _ALLOC_KEYS + (
     "WSL_DISTRO_NAME", "WSL_INTEROP", "UNSLOTH_VLLM_STANDBY", "UNSLOTH_DISABLE_ALLOC_FALLBACK",
+    # The switch that turns off the block under test. `__init__.py` runs the whole
+    # allocator section under `if not _SKIP_GPU_INIT`, and _SKIP_GPU_INIT is this variable
+    # (`__init__.py:179`), so a child that inherits it reports every case as "the product
+    # wrote nothing" while the product was never asked to write anything. Anything in the
+    # process that sets it -- hf_xet_fallback puts it on the PARENT around a spawn -- then
+    # reddens this file instead of itself, which is how it reached CI.
+    "UNSLOTH_ZOO_DISABLE_GPU_INIT",
 )
 
 # Repo root (.../unsloth_zoo), so the child's `import unsloth_zoo` resolves to this
@@ -127,8 +134,6 @@ def _conf(*, torch_version, wsl=False, wsl_interop=False, windows=False,
     return json.loads(lines[-1][len("RESULT:"):])
 
 
-# --- torch version boundary (Linux CUDA, no user config) -------------------
-
 class TestBoundary:
     @pytest.mark.parametrize("ver", ["2.6.0", "2.8.1", "2.9.1"])
     def test_le_2_9_uses_legacy_cuda_var(self, ver):
@@ -151,7 +156,7 @@ class TestBoundary:
         assert conf["PYTORCH_HIP_ALLOC_CONF"] is None, conf
 
 
-# --- Windows / WSL fragmentation fallback (issue #7203) --------------------
+# Windows / WSL fragmentation fallback (issue #7203)
 
 class TestWindowsWslFallback:
     def test_wsl_torch_2_9_roundup_on_legacy(self):
@@ -187,8 +192,6 @@ class TestWindowsWslFallback:
         assert "IS_WSL_OR_WINDOWS" in text
         assert "roundup_power2_divisions" in text
 
-
-# --- user precedence + promotion gap ---------------------------------------
 
 class TestUserPrecedence:
     def test_user_unified_backend_preserved_2_10(self):
@@ -232,8 +235,6 @@ class TestUserPrecedence:
         assert conf["PYTORCH_CUDA_ALLOC_CONF"] == "", conf
 
 
-# --- opt-out and vLLM standby ----------------------------------------------
-
 class TestControls:
     def test_opt_out_disables_fallback_2_10(self):
         conf = _conf(torch_version="2.10.0", wsl=True, opt_out=True)
@@ -246,8 +247,6 @@ class TestControls:
             assert "expandable_segments:True" not in (val or ""), (key, val)
             assert "roundup" not in (val or ""), (key, val)
 
-
-# --- backend isolation: AMD (hip) / Intel (xpu) never get the CUDA fallback -
 
 class TestBackendIsolation:
     def test_hip_wsl_no_roundup(self):

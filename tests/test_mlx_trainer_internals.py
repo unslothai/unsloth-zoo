@@ -35,29 +35,39 @@ import torch
 def _install_shim():
     import sys
     shim_prefixes = ("mlx", "mlx_lm", "mlx_vlm")
-    real_mlx_modules = {
-        name: module
-        for name, module in sys.modules.items()
-        if any(name == prefix or name.startswith(f"{prefix}.") for prefix in shim_prefixes)
-    }
-    from mlx_simulation import simulate_mlx_on_torch
+    def _owned(name):
+        return (
+            name == "unsloth_zoo.mlx" or name.startswith("unsloth_zoo.mlx.")
+            or any(name == prefix or name.startswith(f"{prefix}.") for prefix in shim_prefixes)
+        )
+
+    # The unsloth_zoo.mlx.* entries are saved as well as the mlx* ones, because
+    # this fixture drops them and the next importer therefore builds a NEW module
+    # object. Anything that ran earlier in this process and did
+    # `from unsloth_zoo.mlx.utils import ...` at import time keeps the OLD one, so
+    # it and the code under test end up on two copies of the same module globals:
+    # the training window one opens is invisible to the other, and a gated-delta
+    # op quietly takes the cached path instead of the VJP. Serially that never
+    # happens (alphabetical order puts this file after the pair it would break);
+    # under `-n N --dist loadfile` it depends on which worker draws which file.
+    from mlx_simulation import (
+        restore_modules,
+        simulate_mlx_on_torch,
+        snapshot_modules,
+    )
     from mlx_simulation.mlx_stub import _MLXFinder
+
+    real_mlx_modules = snapshot_modules(_owned)
     simulate_mlx_on_torch()
     for name in list(sys.modules):
         if name == "unsloth_zoo.mlx" or name.startswith("unsloth_zoo.mlx."):
             sys.modules.pop(name, None)
     yield
-    for name in list(sys.modules):
-        if (
-            name == "unsloth_zoo.mlx" or name.startswith("unsloth_zoo.mlx.")
-            or any(name == prefix or name.startswith(f"{prefix}.") for prefix in shim_prefixes)
-        ):
-            sys.modules.pop(name, None)
     sys.meta_path[:] = [
         finder for finder in sys.meta_path
         if not isinstance(finder, _MLXFinder)
     ]
-    sys.modules.update(real_mlx_modules)
+    restore_modules(real_mlx_modules, _owned)
 
 
 def test_finite_text_batch_plan_materializes_cpu_rows_on_demand():
@@ -836,10 +846,6 @@ def test_response_masked_text_batches_can_remain_a_lazy_plan():
     assert eager[2].dtype == mx.int32
 
 
-# ---------------------------------------------------------------------------
-# 1. MLXTrainingConfig: full surface check.
-# ---------------------------------------------------------------------------
-
 def test_mlx_training_config_is_dataclass_with_all_fields():
     from unsloth_zoo.mlx.trainer import MLXTrainingConfig
     assert dataclasses.is_dataclass(MLXTrainingConfig)
@@ -1108,7 +1114,6 @@ def test_distributed_text_batches_use_token_length_not_cache_itemlen(monkeypatch
         for batch in batches
         for row in batch[0].tolist()
     }
-    # Rows survived the >=2-token filter (token length, not itemlen).
     assert (5, 6) in content or (7, 8, 9) in content
 
 
@@ -1264,6 +1269,40 @@ def test_decoupled_optimizers_use_hf_parity_manual_decay(optim_name):
         assert optimizer._kw["weight_decay"] == 0.0
 
 
+def test_adafactor_applies_hf_weight_decay():
+    """HF Adafactor decays p -= wd * lr * p via param groups, skipping bias and norms."""
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    class TinyModel:
+        def __init__(self):
+            self.params = {"proj": {"weight": mx.array([[10.0, 10.0]]),
+                                    "bias": mx.array([10.0])}}
+
+        def trainable_parameters(self):
+            return self.params
+
+        def update(self, updates):
+            self.params["proj"].update(updates["proj"])
+
+    lr, wd = 0.1, 0.05
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.model = TinyModel()
+    trainer.args = MLXTrainingConfig(
+        optim="adafactor", learning_rate=lr, weight_decay=wd,
+        lr_scheduler_type="constant", warmup_steps=0,
+    )
+    optimizer = trainer._build_optimizer(total_steps=4)
+    assert trainer._resolved_optimizer_name == "adafactor"
+
+    grad = {"proj": {"weight": mx.array([[1.0, 1.0]]), "bias": mx.array([1.0])}}
+    trainer._apply_manual_weight_decay(trainer.model, optimizer, grad)
+    flat = dict(tree_flatten(trainer.model.trainable_parameters()))
+    assert flat["proj.weight"].tolist()[0] == pytest.approx([10.0 * (1 - lr * wd)] * 2)
+    assert flat["proj.bias"].tolist() == pytest.approx([10.0])
+
+
 def test_sgd_weight_decay_is_coupled_not_decoupled():
     """SGD must use coupled decay (folded into the gradient before momentum)
     to match HF/PyTorch SGD, not the AdamW-style decoupled parameter shrink."""
@@ -1301,15 +1340,53 @@ def test_norm_clip_dtype_restore_keeps_lora_and_norms_promotable():
     assert not should_restore_original_dtype("vision.blocks.0.norm1.weight")
 
 
-def test_global_norm_clip_reduces_in_float32():
-    import inspect
+@pytest.mark.parametrize("mode", ["global", "leaf"])
+@pytest.mark.parametrize("size", [64, 4096])
+def test_norm_clip_preserves_fp16_scale(mode, size):
+    import mlx.core as mx
+    import numpy as np
+    from unsloth_zoo.mlx.trainer import _clip_grad_by_leaf_norm, _clip_grad_norm_fp32
 
-    from unsloth_zoo.mlx.trainer import _clip_grad_norm_fp32, _global_grad_norm_fp32
+    grad = mx.full((size,), 60000.0, dtype=mx.float16)
+    if mode == "global":
+        clipped, norm = _clip_grad_norm_fp32({"weight": grad}, max_norm=0.01)
+        assert float(norm) == pytest.approx(60000.0 * size ** 0.5)
+    else:
+        clipped = _clip_grad_by_leaf_norm({"weight": grad}, max_grad_leaf_norm=0.01)
+    actual = clipped["weight"]
+    assert actual.dtype == mx.float16
+    expected = np.full(size, 0.01 / size ** 0.5, dtype=np.float16).astype(np.float32)
+    np.testing.assert_allclose(np.array(actual.astype(mx.float32)), expected, rtol=1e-3, atol=0)
 
-    norm_source = inspect.getsource(_global_grad_norm_fp32)
-    assert "g.astype(mx.float32)" in norm_source
-    assert "tree_reduce" in norm_source
-    assert "scale.astype(g.dtype)" in inspect.getsource(_clip_grad_norm_fp32)
+
+def test_norm_clip_keeps_small_gradients():
+    import mlx.core as mx
+    import numpy as np
+    from unsloth_zoo.mlx.trainer import _clip_grad_by_leaf_norm, _clip_grad_norm_fp32
+
+    grad = {"weight": mx.array([0.0, 0.125, -0.25], dtype=mx.float16)}
+    global_clipped, _ = _clip_grad_norm_fp32(grad, max_norm=1.0)
+    leaf_clipped = _clip_grad_by_leaf_norm(grad, max_grad_leaf_norm=1.0)
+    for clipped in (global_clipped, leaf_clipped):
+        np.testing.assert_array_equal(np.array(clipped["weight"]), np.array(grad["weight"]))
+
+
+def test_global_norm_clip_reduces_across_every_leaf():
+    """Norms 5 and 12 give global norm 13: global mode scales both by 5/13, leaf mode only the 12."""
+    import mlx.core as mx
+    import numpy as np
+    from unsloth_zoo.mlx.trainer import _clip_grad_by_leaf_norm, _clip_grad_norm_fp32
+
+    grad = {"a": mx.array([3.0, 4.0]), "b": mx.array([0.0, 12.0])}
+
+    clipped, norm = _clip_grad_norm_fp32(grad, max_norm=5.0)
+    assert float(norm) == pytest.approx(13.0)
+    np.testing.assert_allclose(np.array(clipped["a"]), [15 / 13, 20 / 13], rtol=1e-5)
+    np.testing.assert_allclose(np.array(clipped["b"]), [0.0, 60 / 13], rtol=1e-5)
+
+    leaf_clipped = _clip_grad_by_leaf_norm(grad, max_grad_leaf_norm=5.0)
+    np.testing.assert_allclose(np.array(leaf_clipped["a"]), [3.0, 4.0], rtol=1e-5)
+    np.testing.assert_allclose(np.array(leaf_clipped["b"]), [0.0, 5.0], rtol=1e-5)
 
 
 @pytest.mark.parametrize(
@@ -1888,6 +1965,63 @@ def test_sized_response_training_defers_lazy_eval_with_override_tokenizer():
     assert batch[2].tolist() == [[-100, -100, -100, 2]]
 
 
+def test_response_only_eval_batches_stay_a_finite_plan():
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainer, MLXTrainingConfig, train_on_responses_only,
+    )
+    from unsloth_zoo.mlx.utils import FiniteTextBatchPlan
+
+    trainer = MLXTrainer(
+        _MinimalTextModel(), _StreamingTextTokenizer(100),
+        [{"text": "10 1 20 2"}],
+        eval_dataset=[{"text": "10 1 20 2"}],
+        args=MLXTrainingConfig(
+            max_steps=1, completion_only_loss=False,
+            per_device_train_batch_size=1,
+        ),
+    )
+    train_on_responses_only(trainer, instruction_part="10", response_part="20")
+
+    # Evaluation compacts CCE supervision only for finite plans.
+    eval_batches = trainer._eval_batches_labeled
+    assert isinstance(eval_batches, FiniteTextBatchPlan)
+    batch = next(iter(eval_batches))
+    assert batch[0][0, :4].tolist() == [110, 101, 120, 102]
+    assert [label for label in batch[2][0].tolist() if label != -100] == [102]
+
+
+def test_response_only_fractional_epochs_match_transformers_step_budget():
+    # int(num_train_epochs) ran 0.5 and 1.5 epochs as one; HF: ceil(epochs * updates).
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainer, MLXTrainingConfig, _resolve_training_steps,
+        train_on_responses_only,
+    )
+
+    def run(num_train_epochs):
+        trainer = MLXTrainer(
+            _MinimalTextModel(), _StreamingTextTokenizer(),
+            [{"text": f"10 {i} 20 {i}"} for i in range(1, 6)],
+            args=MLXTrainingConfig(
+                max_steps=-1, num_train_epochs=num_train_epochs,
+                per_device_train_batch_size=2, gradient_accumulation_steps=2,
+                completion_only_loss=False, dataset_order="sequential",
+            ),
+        )
+        train_on_responses_only(trainer, instruction_part="10", response_part="20")
+        batches = trainer._batches
+        rows = sum(int(batch[1].shape[0]) for batch in batches)
+        steps = _resolve_training_steps(
+            trainer.args, batches, None,
+            includes_epochs=trainer._prepared_batches_include_epochs,
+        )
+        return rows, steps
+
+    # 5 rows at batch 2 is 3 micro-batches, so 2 updates, per pass.
+    assert run(0.5) == (4, 1)
+    assert run(1) == (5, 2)
+    assert run(1.5) == (9, 3)
+
+
 def test_length_declaring_text_stream_supports_epoch_replay():
     MLXTrainer, trainer = _streaming_text_trainer(
         max_steps=0, num_train_epochs=2,
@@ -2359,6 +2493,98 @@ def test_evaluate_dict_eval_datasets_records_split_metrics():
     assert trainer.model.modes == ["eval", "train"]
 
 
+def _token_accuracy_eval_trainer(all_sum=None):
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.model = types.SimpleNamespace(eval=lambda: None, train=lambda *a: None)
+    trainer.stop_requested = False
+    trainer._distributed_eval_status = lambda failed=False: (False, False)
+    trainer._distributed_should_stop = lambda: False
+    trainer._distributed_all_sum = all_sum or (lambda value, stream=None: value)
+    return trainer
+
+
+def _token_accuracy_loss_fn(correct, ntoks):
+    import mlx.core as mx
+
+    def loss_fn(_model, _batch, _lengths, _labels, return_correct=False):
+        if return_correct:
+            return mx.array(1.0), mx.array(ntoks), mx.array(correct)
+        return mx.array(1.0), mx.array(ntoks)
+
+    loss_fn._unsloth_token_accuracy = True
+    return loss_fn
+
+
+def test_evaluate_reports_token_accuracy_reduced_across_ranks():
+    import mlx.core as mx
+
+    # Peer rank adds 10 loss, 15 tokens, 4 correct: 7 / 20 only if summed before dividing.
+    peer = iter([mx.array(10.0), mx.array(15), mx.array([4.0])])
+    trainer = _token_accuracy_eval_trainer(
+        lambda value, stream=None: value + next(peer),
+    )
+    trainer._evaluate(
+        [(mx.array([[1, 2, 3]]), None, None)],
+        _token_accuracy_loss_fn(3.0, 5),
+    )
+    metrics = trainer._last_eval_metrics
+    assert metrics["eval_mean_token_accuracy"] == pytest.approx(7.0 / 20.0)
+    assert "eval_perplexity" in metrics
+
+
+def test_evaluate_reports_token_accuracy_per_split():
+    import mlx.core as mx
+
+    trainer = _token_accuracy_eval_trainer()
+    batch = [(mx.array([[1, 2, 3]]), None, None)]
+    trainer._evaluate({"a": batch, "b": batch}, _token_accuracy_loss_fn(3.0, 5))
+    metrics = trainer._last_eval_metrics
+    assert metrics["eval_a_mean_token_accuracy"] == pytest.approx(0.6)
+    assert metrics["eval_b_mean_token_accuracy"] == pytest.approx(0.6)
+    assert metrics["eval_mean_token_accuracy"] == pytest.approx(0.6)
+
+
+def test_evaluate_skips_token_accuracy_for_loss_fns_without_it():
+    import mlx.core as mx
+
+    # CCE and user loss fns take no return_correct kwarg: passing it would raise.
+    def loss_fn(_model, _batch, _lengths, _labels):
+        return mx.array(1.0), mx.array(5)
+
+    trainer = _token_accuracy_eval_trainer()
+    trainer._evaluate([(mx.array([[1, 2, 3]]), None, None)], loss_fn)
+    metrics = trainer._last_eval_metrics
+    assert metrics["eval_loss"] == pytest.approx(1.0)
+    assert "eval_mean_token_accuracy" not in metrics
+
+
+@pytest.mark.parametrize("with_labels", [False, True])
+def test_baseline_loss_fn_counts_correct_supervised_tokens(with_labels):
+    import mlx.core as mx
+
+    from unsloth_zoo.mlx.utils import make_baseline_loss_fn
+
+    vocab = 6
+    batch = mx.array([[1, 2, 3, 4, 5]])
+    preds = [0, 3, 2, 5]
+    logits = mx.array([[[10.0 if v == p else 0.0 for v in range(vocab)] for p in preds]])
+    model = lambda _inputs: logits
+    lengths = mx.array([[1, 5]])
+    labels = mx.array([[-100, -100, 3, 4, 5]]) if with_labels else None
+
+    loss_fn = make_baseline_loss_fn()
+    assert loss_fn._unsloth_token_accuracy is True
+    loss, ntoks, correct = loss_fn(model, batch, lengths, labels, return_correct=True)
+    plain_loss, plain_ntoks = loss_fn(model, batch, lengths, labels)
+    # Targets 2,3,4,5 vs preds 0,3,2,5: two hits; labels also mask position 0.
+    assert correct.item() == 2.0
+    assert ntoks.item() == (3 if with_labels else 4)
+    assert loss.item() == pytest.approx(plain_loss.item())
+    assert plain_ntoks.item() == ntoks.item()
+
+
 def test_evaluate_batch_totals_uses_single_eval_status_collective():
     import inspect
 
@@ -2532,12 +2758,9 @@ def test_num_input_tokens_seen_persisted_and_restored_across_resume():
     from unsloth_zoo.mlx.trainer import MLXTrainer
 
     ti = inspect.getsource(MLXTrainer._train_inner)
-    # Saved in the checkpoint state dict ...
     assert '"num_input_tokens_seen": int(' in ti
-    # ... and restored from it on resume into the resume attr.
     assert 'ts.get("num_input_tokens_seen"' in ti
     assert "_resume_num_input_tokens_seen = int(" in ti
-    # ... then seeded into the callback-visible TrainerState.
     ics = inspect.getsource(MLXTrainer._init_callback_state)
     assert "num_input_tokens_seen=int(" in ics
     assert "_resume_num_input_tokens_seen" in ics
@@ -2551,13 +2774,10 @@ def test_should_epoch_stop_field_reset_and_honored():
     import inspect
     from unsloth_zoo.mlx.trainer import MLXTrainer, _MLXTrainerControl
 
-    # (1) Field exists and defaults False.
     assert _MLXTrainerControl().should_epoch_stop is False
 
     src = inspect.getsource(MLXTrainer._train_inner)
-    # (2) Reset at epoch begin.
     assert "self.control.should_epoch_stop = False" in src
-    # (3) Rank-synced honoring: an all-reduced flag drives an epoch-boundary skip.
     assert "def _sync_epoch_stop" in src
     assert "_distributed_any_flag(self.control.should_epoch_stop)" in src
     assert "_sync_epoch_stop()" in src
@@ -2638,6 +2858,69 @@ def test_resolved_best_metric_name_mirrors_hf_lookup():
     ]:
         trainer.args.metric_for_best_model = value
         assert trainer._resolved_best_metric_name() == expected
+
+
+def test_best_metric_direction_is_inferred_when_it_is_not_set():
+    # A preference run selects on rewards/accuracies, where "better" is upward.
+    # An unset direction defaulting to False would keep the worst checkpoint.
+    from unsloth_zoo.mlx.trainer import _resolve_greater_is_better
+
+    class Args:
+        greater_is_better = None
+
+    args = Args()
+    for metric, expected in [
+        ("eval_loss", False),
+        ("eval_nll_loss", False),
+        ("eval_rewards/accuracies", True),
+        (None, False),
+    ]:
+        args.metric_for_best_model = metric
+        assert _resolve_greater_is_better(args) is expected
+
+    args.metric_for_best_model = "eval_rewards/accuracies"
+    for explicit in (True, False):
+        args.greater_is_better = explicit
+        assert _resolve_greater_is_better(args) is explicit
+
+
+def test_perplexity_is_inferred_as_lower_is_better():
+    # HF's rule is a bare "loss" suffix, because HF never emits perplexity. This
+    # trainer emits it for every token objective, and the field defaulted to
+    # False before the direction was inferred at all -- so reading it upward
+    # would invert best-checkpoint selection for runs that predate inference.
+    from unsloth_zoo.mlx.trainer import _resolve_greater_is_better
+
+    class Args:
+        greater_is_better = None
+
+    args = Args()
+    for metric in ("eval_perplexity", "eval_val_perplexity"):
+        args.metric_for_best_model = metric
+        assert _resolve_greater_is_better(args) is False
+
+
+def test_the_resolved_direction_is_not_written_to_the_callers_config():
+    # The direction has to be a real boolean on the arguments before any
+    # callback reads it, but `args` belongs to the caller: a config handed to
+    # two trainers, or inspected afterwards, must come back as it went in.
+    import dataclasses
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    class Model:
+        def trainable_parameters(self): return {}
+
+    args = MLXTrainingConfig(metric_for_best_model="eval_accuracy")
+    before = dataclasses.asdict(args)
+
+    first = MLXTrainer(Model(), None, [], args=args)
+    second = MLXTrainer(Model(), None, [], args=args)
+
+    assert dataclasses.asdict(args) == before
+    assert args.greater_is_better is None
+    assert first.args is not second.args
+    assert first.args.greater_is_better is True
+    assert second.args.greater_is_better is True
 
 
 def test_vlm_cce_prefers_collated_position_ids_for_cuda_parity():
@@ -3067,19 +3350,15 @@ def test_qwen3_vl_vision_block_mlp_fp32_guard_for_fp16():
 
     source = inspect.getsource(mc._install_qwen3_family_compile_patches)
 
-    # Guard is present
     assert "linear_fc1 (up-projection) overflows fp16" in source, (
         "Missing comment documenting the fp16 overflow rationale"
     )
-    # Dtype-conditional branch keys on residual_dtype (the activation dtype)
     assert "if residual_dtype == mx.float16:" in source, (
         "MLP fp32 guard must be gated on residual_dtype == mx.float16"
     )
-    # fp16 path: upcast input to fp32 before calling self.mlp
     assert "self.mlp(mlp_norm_out.astype(mx.float32))" in source, (
         "fp16 branch must upcast mlp input to fp32"
     )
-    # non-fp16 path: original (cheaper) cast-only flow preserved
     assert "self.mlp(mlp_norm_out)" in source, (
         "bf16/fp32 path must keep the original self.mlp(...) call"
     )
@@ -3090,6 +3369,14 @@ def test_qwen3_vl_training_compile_verified():
 
     assert "qwen3_vl" in mc._VERIFIED_TRAINING_ARCHES
     assert "qwen3_vl_moe" in mc._VERIFIED_TRAINING_ARCHES
+
+
+def test_hadamard_packed_qwen3_5_trains_through_the_qwen3_5_compile_and_position_paths():
+    import unsloth_zoo.mlx.compile as mc
+    from unsloth_zoo.mlx.utils import _VLM_QWEN_POSITION_MODEL_TYPES
+
+    assert "prism_hadamard_qwen35" in mc._VERIFIED_TRAINING_ARCHES
+    assert "prism_hadamard_qwen35" in _VLM_QWEN_POSITION_MODEL_TYPES
 
 
 def test_qwen3_visual_window_preserves_batched_row_ownership():
@@ -3469,10 +3756,75 @@ def test_gemma3_training_compile_verified():
     assert "gemma3" in mc._VERIFIED_TRAINING_ARCHES
 
 
-# ---------------------------------------------------------------------------
-# 2. compile module-level discovery functions return sensible defaults
-#    on a host with no real MLX architectures.
-# ---------------------------------------------------------------------------
+def test_gemma4_unified_training_compile_is_wired_end_to_end():
+    import unsloth_zoo.mlx.compile as mc
+
+    assert "gemma4_unified" in mc._VERIFIED_TRAINING_ARCHES
+    assert mc._TRAINING_VERIFIER_HINTS["gemma4_unified"] == "verify_gemma4_unified"
+
+    bundle = next(b for b in mc.list_compile_pattern_bundles()
+                  if b.name == "gemma4_unified_multimodal")
+    assert bundle.matcher("gemma4_unified", None)
+    assert not bundle.matcher("gemma4", None)
+    declared = {p.name for p in mc.list_compile_patch_primitives()}
+    assert set(bundle.primitive_names) <= declared
+    installers = mc._runtime_patch_primitive_installers()
+    assert "gemma4_unified_multimodal_runtime" in bundle.runtime_primitive_names
+    assert (installers["gemma4_unified_multimodal_runtime"]
+            is mc._install_gemma4_unified_compile_patches)
+
+
+@pytest.mark.parametrize("base_default", [True, False])
+def test_gemma4_unified_installer_patches_both_blockers(monkeypatch, base_default):
+    import unsloth_zoo.mlx.compile as mc
+
+    calls = []
+
+    class Model:
+        def __init__(self):
+            self._base_no_chunked_prefill = base_default
+            self.language_model = types.SimpleNamespace(
+                no_chunked_prefill=not base_default)
+            self.no_chunked_prefill = not base_default
+
+        def _update_chunked_prefill_mode(self, input_ids=None, **kwargs):
+            calls.append(input_ids)
+
+    module = types.SimpleNamespace(
+        Model=Model, _compact_prefix_rows=lambda features, valid_mask: None)
+    monkeypatch.setattr(mc, "_try_import_module", lambda name: module)
+    monkeypatch.setattr(mc, "_PATCHED_ARCHES", set())
+    monkeypatch.setattr(mc, "_PATCH_BINDINGS", set())
+    mc._install_gemma4_unified_compile_patches()
+
+    assert module._compact_prefix_rows is mc._static_shape_prefix_rows
+    assert "gemma4_unified" in mc._PATCHED_ARCHES
+
+    model = Model()
+    model.training = True
+    model._update_chunked_prefill_mode("while-training")
+    assert calls == [], "the bookkeeping must not run on the compiled training step"
+    assert model.no_chunked_prefill is base_default
+    assert model.language_model.no_chunked_prefill is base_default
+
+    model.training = False
+    model._update_chunked_prefill_mode("while-generating")
+    assert calls == ["while-generating"], "generation still needs the flag"
+
+
+def test_gemma4_unified_installer_survives_an_mlx_vlm_without_it(monkeypatch):
+    import unsloth_zoo.mlx.compile as mc
+
+    monkeypatch.setattr(mc, "_PATCHED_ARCHES", set())
+    monkeypatch.setattr(mc, "_try_import_module", lambda name: None)
+    mc._install_gemma4_unified_compile_patches()
+    assert "gemma4_unified" not in mc._PATCHED_ARCHES
+
+    module = types.SimpleNamespace(Model=type("Model", (), {}), _compact_prefix_rows=None)
+    monkeypatch.setattr(mc, "_try_import_module", lambda name: module)
+    mc._install_gemma4_unified_compile_patches()
+    assert "gemma4_unified" not in mc._PATCHED_ARCHES
+
 
 def test_compile_discovers_no_archs_under_shim():
     """No real mlx_vlm.models.* installed -> empty discovery, not crash."""
@@ -3544,10 +3896,6 @@ def test_compile_summarize_qualifications_returns_dict():
     assert "architectures" in s
 
 
-# ---------------------------------------------------------------------------
-# 3. CCE backward via the pure-Python fallback.
-# ---------------------------------------------------------------------------
-
 def test_cce_backward_via_torch_autograd():
     """Build a tiny CCE forward and verify torch.autograd traverses it."""
     from unsloth_zoo.mlx.cce.runtime_cce import _forward_chunked_fused_finalize
@@ -3570,10 +3918,6 @@ def test_cce_backward_via_torch_autograd():
     assert weight.grad is not None and torch.isfinite(weight.grad).all()
 
 
-# ---------------------------------------------------------------------------
-# 4. mx.dequantize cross-validation against the helper's output.
-# ---------------------------------------------------------------------------
-
 def test_mx_dequantize_with_nonzero_bias_and_scale():
     import mlx.core as mx
 
@@ -3595,10 +3939,6 @@ def test_mx_dequantize_with_nonzero_bias_and_scale():
     torch.testing.assert_close(out, expected)
 
 
-# ---------------------------------------------------------------------------
-# 5. mx.fast.scaled_dot_product_attention works for a small attention.
-# ---------------------------------------------------------------------------
-
 def test_mx_fast_sdpa_works():
     import mlx.core as mx
     B, H, T, D = 1, 2, 4, 8
@@ -3609,10 +3949,6 @@ def test_mx_fast_sdpa_works():
     assert out.shape == (B, H, T, D)
     assert torch.isfinite(out).all()
 
-
-# ---------------------------------------------------------------------------
-# 6. Tree utilities round-trip.
-# ---------------------------------------------------------------------------
 
 def test_tree_flatten_unflatten_roundtrip():
     from mlx.utils import tree_flatten, tree_unflatten
@@ -3627,10 +3963,6 @@ def test_tree_flatten_unflatten_roundtrip():
     assert set(rebuilt.keys()) == {"a", "d"}
     torch.testing.assert_close(rebuilt["d"], torch.tensor([3.0]))
 
-
-# ---------------------------------------------------------------------------
-# 7. Quantized layer __call__ works (forward through nn.QuantizedLinear).
-# ---------------------------------------------------------------------------
 
 def test_quantized_linear_forward():
     import mlx.nn as nn
@@ -5328,7 +5660,6 @@ def test_callback_num_train_epochs_mirrors_hf_arithmetic():
     # Streaming: no finite plan, no epoch events, field left alone.
     assert trainer._callback_num_train_epochs(50, None) == 0
 
-    # Epoch-count runs are unchanged.
     epochs = MLXTrainer.__new__(MLXTrainer)
     epochs.args = MLXTrainingConfig(num_train_epochs=3, max_steps=-1)
     epochs._prepared_batches_include_epochs = True
@@ -5920,8 +6251,6 @@ def test_checkpoint_includes_committed_unlogged_loss_totals(monkeypatch):
     # the final totals still cover exactly the 4 applied steps.
     assert whole._train_loss_token_total == 2 * saved["train_loss_token_total"]
 
-    # End to end: stop right after the step-2 checkpoint, resume, and the final
-    # token-weighted train loss matches the uninterrupted run's.
     interrupted = build(stop_after=2)
     interrupted.train()
     resumed = build()
@@ -5973,7 +6302,6 @@ def test_integration_callback_args_cover_stock_trackio_and_swanlab():
         for field in sorted(set(reader.findall(inspect.getsource(callback)))):
             assert hasattr(args, field), f"{name} reads args.{field}"
 
-    # A caller that configures the run keeps their value across the next run.
     args.project = "my-project"
     args.hub_private_repo = True
     trainer._ensure_callback_args_compat()
@@ -6086,7 +6414,6 @@ def test_callback_events_dispatch_on_every_rank(monkeypatch):
     rank0_lr_cb, rank0_io_cb, rank0_seen = run(0)
     rank1_lr_cb, rank1_io_cb, rank1_seen = run(1)
 
-    # The callback runs on the peer too, so both ranks step with the same LR.
     assert rank0_lr_cb.calls == 4
     assert rank1_lr_cb.calls == 4
     assert rank0_seen == [override_lr] * 4
@@ -6124,12 +6451,10 @@ def test_training_config_exposes_sanitized_dict_for_integration_callbacks():
 
     assert sanitized["train_batch_size"] == 2
     assert sanitized["eval_batch_size"] == 3
-    # Every raw field survives; only the values are coerced.
     assert set(config.to_dict()) <= set(sanitized)
     assert all(type(value) in (bool, int, float, str) for value in sanitized.values())
     # A tracker must be able to serialize the whole payload.
     json.dumps(sanitized)
-    # Non-scalars are stringified rather than dropped, and bool stays bool.
     assert sanitized["compile_arch_overrides"] == str({"a": "b"})
     assert isinstance(sanitized["packing"], bool)
 
@@ -6821,7 +7146,6 @@ def test_callback_interrupt_joins_the_ddp_failure_consensus(monkeypatch, interru
     peer_contexts, peer_outcome, _ = run(raising=False)
     raiser_contexts, raiser_outcome, raiser_stop = run(raising=True)
 
-    # The peer runs to completion and reports no failure of its own.
     assert peer_outcome is None
     # The interrupt still reaches the caller unwrapped, exactly as HF's
     # callback_handler.call_event lets it propagate (transformers
@@ -7866,7 +8190,6 @@ def test_epoch_cadence_closes_a_callback_stopped_epoch(monkeypatch):
         # skip lands the loop on the next boundary.
         assert probe["saved"][0] == 2, (with_flow, probe["saved"])
         assert probe["checkpoints"][0] == 2, (with_flow, probe["checkpoints"])
-    # And the two configurations agree exactly, which is the whole point.
     runs = [
         _run_log_save_cadence_probe(
             monkeypatch, logging_steps=10 ** 6, save_steps=10 ** 6,
@@ -8022,7 +8345,6 @@ def test_dict_eval_rebuilds_the_prediction_bar_per_split(monkeypatch):
         (3, 1), (3, 2), (3, 3),
         (4, 1), (4, 2), (4, 3), (4, 4),
     ], bar.geometry
-    # No bar ever runs past its own total.
     assert all(seen <= total for total, seen in bar.geometry), bar.geometry
     # The last split's bar is still torn down by on_evaluate, exactly as in HF.
     assert bar.closing == (4, 4), bar.closing
@@ -8125,3 +8447,690 @@ def test_qwen3_prompt_rows_defer_to_the_native_deepstack_path():
     mask_only = {"inputs_embeds": mx.zeros((1, 4, 1)), "visual_pos_masks": masks}
     filled = mc._pad_qwen3_prompt_rows([mask_only, compact_row])[0]
     assert not filled[mc._QWEN3_VISUAL_STATE_KEY].any().item()
+
+# MLXTrainingConfig positional field order on main (from git show, not the live dataclass).
+_MAIN_MLX_CONFIG_POSITIONAL_FIELDS = (
+    "per_device_train_batch_size", "gradient_accumulation_steps", "max_steps",
+    "num_train_epochs", "warmup_steps", "warmup_ratio", "learning_rate",
+    "lr_scheduler_type", "optim", "weight_decay", "adam_beta1", "adam_beta2",
+    "max_grad_norm", "max_grad_value", "max_grad_leaf_norm", "seed",
+    "lora_plus_ratio", "embedding_learning_rate", "logging_steps", "output_dir",
+    "report_to", "save_steps", "save_total_limit", "eval_steps",
+    "load_best_model_at_end", "metric_for_best_model", "greater_is_better",
+    "early_stopping_patience", "neftune_noise_alpha", "dataset_text_field",
+    "max_seq_length", "packing", "dataset_num_proc", "chat_template", "use_cce",
+    "compile", "compile_mode", "compile_max_variants", "compile_arch_overrides",
+    "compile_backend_overrides", "patch_mode", "compile_auto_tune",
+    "compile_trace", "gradient_checkpointing", "streaming", "dataset_order",
+    "preserve_dataset_order", "memory_limit_gb", "cache_limit_gb",
+    "wired_limit_gb", "disable_memory_limits", "cast_norm_output_to_input_dtype",
+    "append_eos", "train_on_completions", "completion_only_loss",
+    "assistant_only_loss", "assistant_token_id", "vlm_chat_template",
+    "per_device_eval_batch_size", "image_size", "label_smoothing_factor",
+    "report_grad_norm", "max_eval_batches",
+    "streaming_text_length_window_batches", "streaming_prefetch_batches",
+    "logging_dir", "run_name", "adam_epsilon", "optim_args",
+)
+
+_PRE_PR_LR_SCHEDULER_TYPE_INDEX = 7
+
+
+def test_new_scheduler_fields_do_not_shift_existing_positional_slots():
+    """New scheduler knobs must be append-only in MLXTrainingConfig."""
+    import dataclasses
+
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainer,
+        MLXTrainingConfig,
+        _MLX_CONFIG_OPTIONAL_COPY_FIELDS,
+    )
+
+    current = [f.name for f in dataclasses.fields(MLXTrainingConfig) if f.init]
+
+    assert tuple(current[: len(_MAIN_MLX_CONFIG_POSITIONAL_FIELDS)]) == (
+        _MAIN_MLX_CONFIG_POSITIONAL_FIELDS
+    )
+    gkd = {
+        "teacher_model_name_or_path", "gkd_beta", "gkd_temperature", "gkd_lmbda",
+        "gkd_chunk_size", "gkd_skip_memory_preflight",
+    }
+    assert set(current) - set(_MAIN_MLX_CONFIG_POSITIONAL_FIELDS) - gkd == {
+        "lr_scheduler_min_lr_rate",
+        "lr_scheduler_num_cycles",
+        "lr_scheduler_power",
+        "lr_scheduler_kwargs",
+    }
+
+    assert current.index("lr_scheduler_type") == _PRE_PR_LR_SCHEDULER_TYPE_INDEX
+
+    for name in (
+        "lr_scheduler_min_lr_rate",
+        "lr_scheduler_num_cycles",
+        "lr_scheduler_power",
+        "lr_scheduler_kwargs",
+    ):
+        assert name in _MLX_CONFIG_OPTIONAL_COPY_FIELDS
+    assert tuple(current[-len(_MLX_CONFIG_OPTIONAL_COPY_FIELDS):]) == tuple(
+        _MLX_CONFIG_OPTIONAL_COPY_FIELDS
+    )
+
+    eight = MLXTrainingConfig(2, 4, 60, -1, 5, 0.0, 3e-4, "cosine")
+    assert eight.lr_scheduler_type == "cosine"
+    assert eight.lr_scheduler_min_lr_rate is None
+
+    defaults = MLXTrainingConfig()
+    dump = [getattr(defaults, name) for name in _MAIN_MLX_CONFIG_POSITIONAL_FIELDS]
+    sentinels = {
+        "lr_scheduler_type": "cosine",
+        "learning_rate": 3e-4,
+        "image_size": (128, 256),
+        "optim": "sgd",
+        "seed": 1234,
+        "run_name": "legacy-run",
+    }
+    for name, value in sentinels.items():
+        dump[_MAIN_MLX_CONFIG_POSITIONAL_FIELDS.index(name)] = value
+    positional = MLXTrainingConfig(*dump)
+    for name, value in sentinels.items():
+        assert getattr(positional, name) == value, name
+    assert positional.lr_scheduler_num_cycles is None
+    assert positional.lr_scheduler_power is None
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = positional
+    values = [float(trainer._build_schedule(total_steps=8)(s)) for s in range(8)]
+    assert values[0] == pytest.approx(0.0)  # warmup_steps default 5
+    assert max(values) == pytest.approx(3e-4, rel=1e-6)
+
+    assert MLXTrainingConfig(
+        learning_rate=3e-4, lr_scheduler_type="cosine"
+    ).lr_scheduler_type == "cosine"
+
+
+def _mlx_lr_curve(total_steps, **config_kwargs):
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(max_steps=total_steps, **config_kwargs)
+    schedule = trainer._build_schedule(total_steps)
+    if not callable(schedule):
+        return [float(schedule)] * total_steps
+    return [float(schedule(step)) for step in range(total_steps)]
+
+
+def test_mlx_schedules_match_transformers_lr_lambdas():
+    """Every ported schedule must track HF's own lambda."""
+    optimization = pytest.importorskip("transformers.optimization")
+
+    lr, total, warmup = 2e-4, 60, 5
+    cases = [
+        (
+            dict(lr_scheduler_type="cosine", warmup_steps=warmup),
+            optimization._get_cosine_schedule_with_warmup_lr_lambda,
+            dict(num_warmup_steps=warmup, num_training_steps=total, num_cycles=0.5),
+        ),
+        (
+            dict(
+                lr_scheduler_type="cosine_with_min_lr",
+                warmup_steps=warmup,
+                lr_scheduler_min_lr_rate=0.1,
+            ),
+            optimization._get_cosine_schedule_with_warmup_lr_lambda,
+            dict(
+                num_warmup_steps=warmup,
+                num_training_steps=total,
+                num_cycles=0.5,
+                min_lr_rate=0.1,
+            ),
+        ),
+        (
+            dict(
+                lr_scheduler_type="cosine_with_restarts",
+                warmup_steps=warmup,
+                lr_scheduler_num_cycles=3,
+            ),
+            optimization._get_cosine_with_hard_restarts_schedule_with_warmup_lr_lambda,
+            dict(num_warmup_steps=warmup, num_training_steps=total, num_cycles=3),
+        ),
+        (
+            # HF defaults lr_end=1e-7, so the floor is lr_end/lr, not 0.
+            dict(lr_scheduler_type="polynomial", warmup_steps=warmup),
+            optimization._get_polynomial_decay_schedule_with_warmup_lr_lambda,
+            dict(
+                num_warmup_steps=warmup,
+                num_training_steps=total,
+                lr_end=1e-7,
+                power=1.0,
+                lr_init=lr,
+            ),
+        ),
+        (
+            dict(
+                lr_scheduler_type="polynomial",
+                warmup_steps=warmup,
+                lr_scheduler_power=2.0,
+            ),
+            optimization._get_polynomial_decay_schedule_with_warmup_lr_lambda,
+            dict(
+                num_warmup_steps=warmup,
+                num_training_steps=total,
+                lr_end=1e-7,
+                power=2.0,
+                lr_init=lr,
+            ),
+        ),
+        (
+            dict(lr_scheduler_type="inverse_sqrt", warmup_steps=0),
+            optimization._get_inverse_sqrt_schedule_lr_lambda,
+            dict(num_warmup_steps=0, timescale=10_000),
+        ),
+        (
+            dict(lr_scheduler_type="inverse_sqrt", warmup_steps=warmup),
+            optimization._get_inverse_sqrt_schedule_lr_lambda,
+            dict(num_warmup_steps=warmup, timescale=warmup),
+        ),
+    ]
+
+    for config_kwargs, hf_lambda, hf_kwargs in cases:
+        got = _mlx_lr_curve(total, learning_rate=lr, **config_kwargs)
+        expected = [lr * hf_lambda(step, **hf_kwargs) for step in range(total)]
+        assert got == pytest.approx(expected, abs=1e-9), config_kwargs
+
+
+def test_wsd_num_cycles_is_the_hf_wave_count_not_the_decay_window():
+    """WSD: num_decay_steps sizes the window, num_cycles is the wave count."""
+    optimization = pytest.importorskip("transformers.optimization")
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    lr, total, warmup, decay = 2e-4, 60, 5, 20
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(
+        learning_rate=lr,
+        max_steps=total,
+        warmup_steps=warmup,
+        lr_scheduler_type="warmup_stable_decay",
+    )
+    trainer.args.lr_scheduler_kwargs = {
+        "num_decay_steps": decay,
+        "min_lr_ratio": 0.1,
+    }
+    schedule = trainer._build_schedule(total)
+    got = [float(schedule(step)) for step in range(total)]
+    expected = [
+        lr
+        * optimization._get_wsd_scheduler_lambda(
+            step,
+            num_warmup_steps=warmup,
+            num_stable_steps=total - warmup - decay,
+            num_decay_steps=decay,
+            warmup_type="linear",
+            decay_type="cosine",
+            min_lr_ratio=0.1,
+            num_cycles=0.5,
+        )
+        for step in range(total)
+    ]
+    assert got == pytest.approx(expected, abs=1e-9)
+
+    assert got[warmup:total - decay] == pytest.approx([lr] * (total - warmup - decay))
+    trainer.args.lr_scheduler_kwargs = {"num_decay_steps": decay, "num_cycles": 0.5}
+    trainer.args.lr_scheduler_min_lr_rate = 0.1
+    assert [float(trainer._build_schedule(total)(s)) for s in range(total)] == (
+        pytest.approx(expected, abs=1e-9)
+    )
+
+
+def test_wsd_tail_holds_at_min_lr_ratio():
+    """Past warmup+stable+decay HF returns min_lr_ratio, flat."""
+    optimization = pytest.importorskip("transformers.optimization")
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    lr, total, warmup, stable, decay = 2e-4, 60, 5, 10, 20
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(
+        learning_rate=lr,
+        max_steps=total,
+        warmup_steps=warmup,
+        lr_scheduler_type="warmup_stable_decay",
+    )
+    for num_cycles in (0.5, 1.0, 1.5):
+        trainer.args.lr_scheduler_kwargs = {
+            "num_stable_steps": stable,
+            "num_decay_steps": decay,
+            "min_lr_ratio": 0.1,
+            "num_cycles": num_cycles,
+        }
+        schedule = trainer._build_schedule(total)
+        got = [float(schedule(step)) for step in range(total)]
+        expected = [
+            lr
+            * optimization._get_wsd_scheduler_lambda(
+                step,
+                num_warmup_steps=warmup,
+                num_stable_steps=stable,
+                num_decay_steps=decay,
+                warmup_type="linear",
+                decay_type="cosine",
+                min_lr_ratio=0.1,
+                num_cycles=num_cycles,
+            )
+            for step in range(total)
+        ]
+        assert got == pytest.approx(expected, abs=1e-9), num_cycles
+        tail = got[warmup + stable + decay:]
+        assert tail == pytest.approx([lr * 0.1] * len(tail), abs=1e-9), num_cycles
+
+
+def test_lr_scheduler_kwargs_json_string_must_parse():
+    """A malformed CLI JSON string must raise, not fall back to defaults."""
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    lr, total = 2e-4, 40
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(
+        learning_rate=lr,
+        max_steps=total,
+        warmup_steps=5,
+        lr_scheduler_type="cosine_with_restarts",
+    )
+
+    trainer.args.lr_scheduler_kwargs = '{"num_cycles": 3}'
+    from_string = [float(trainer._build_schedule(total)(s)) for s in range(total)]
+    trainer.args.lr_scheduler_kwargs = {"num_cycles": 3}
+    assert from_string == pytest.approx(
+        [float(trainer._build_schedule(total)(s)) for s in range(total)]
+    )
+
+    for bad in ('{"num_cycles": 3', "[1, 2]", "3"):
+        trainer.args.lr_scheduler_kwargs = bad
+        with pytest.raises(ValueError, match="lr_scheduler_kwargs"):
+            trainer._build_schedule(total)
+
+    trainer.args.lr_scheduler_kwargs = [("num_cycles", 3)]
+    with pytest.raises(ValueError, match="must be a dict"):
+        trainer._build_schedule(total)
+
+    for empty in (None, "", "   "):
+        trainer.args.lr_scheduler_kwargs = empty
+        assert callable(trainer._build_schedule(total))
+
+
+def test_build_schedule_reads_hf_lr_scheduler_kwargs():
+    """Scheduler knobs in lr_scheduler_kwargs are honored."""
+    optimization = pytest.importorskip("transformers.optimization")
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    lr, total = 2e-4, 100
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(
+        learning_rate=lr,
+        max_steps=total,
+        warmup_steps=0,
+        lr_scheduler_type="cosine_with_restarts",
+    )
+    expected = [
+        lr
+        * optimization._get_cosine_with_hard_restarts_schedule_with_warmup_lr_lambda(
+            step, num_warmup_steps=0, num_training_steps=total, num_cycles=3
+        )
+        for step in range(total)
+    ]
+
+    for kwargs in ({"num_cycles": 3}, '{"num_cycles": 3}'):
+        trainer.args.lr_scheduler_kwargs = kwargs
+        schedule = trainer._build_schedule(total)
+        got = [float(schedule(step)) for step in range(total)]
+        assert got == pytest.approx(expected, abs=1e-9), kwargs
+
+    trainer.args.lr_scheduler_num_cycles = 1
+    trainer.args.lr_scheduler_kwargs = {"num_cycles": 3}
+    got = [float(trainer._build_schedule(total)(step)) for step in range(total)]
+    assert got == pytest.approx(expected, abs=1e-9)
+
+    trainer.args.lr_scheduler_kwargs = {"num_cycles": 0}
+    flat = [float(trainer._build_schedule(total)(step)) for step in range(total)]
+    assert flat == pytest.approx([lr] * total)
+
+
+def test_unsupported_scheduler_kwargs_are_rejected_not_ignored():
+    """Silently dropping a scheduler knob is the bug class; fail loudly."""
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(
+        learning_rate=2e-4, max_steps=60, lr_scheduler_type="warmup_stable_decay"
+    )
+    trainer.args.lr_scheduler_kwargs = {"decay_type": "1-sqrt"}
+    with pytest.raises(ValueError, match="not supported"):
+        trainer._build_schedule(60)
+    trainer.args.lr_scheduler_kwargs = {"power": 2.0}
+    with pytest.raises(ValueError, match="unknown"):
+        trainer._build_schedule(60)
+    trainer.args.lr_scheduler_kwargs = {"last_epoch": 3, "num_decay_steps": 20}
+    assert callable(trainer._build_schedule(60))
+
+
+@pytest.mark.parametrize("kwargs", [None, {}, {"num_stable_steps": 10}])
+def test_warmup_stable_decay_requires_num_decay_steps_like_hf(kwargs):
+    """HF get_wsd_schedule raises TypeError without num_decay_steps; never guess a window."""
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(
+        learning_rate=2e-4, max_steps=60, lr_scheduler_type="warmup_stable_decay",
+        lr_scheduler_kwargs=kwargs,
+    )
+    with pytest.raises(ValueError, match="num_decay_steps"):
+        trainer._build_schedule(60)
+
+
+def test_cosine_warmup_with_min_lr_is_not_silently_aliased():
+    """cosine_warmup_with_min_lr must not map onto cosine."""
+    from unsloth_zoo.mlx.trainer import _normalize_mlx_scheduler_type
+
+    assert _normalize_mlx_scheduler_type("cosine_with_min_lr") == "cosine"
+    assert _normalize_mlx_scheduler_type("COSINE_WITH_MIN_LR") == "cosine"
+    assert _normalize_mlx_scheduler_type("SchedulerType.cosine_with_min_lr") == "cosine"
+    assert _normalize_mlx_scheduler_type("cosine_warmup_with_min_lr") == (
+        "cosine_warmup_with_min_lr"
+    )
+
+
+def test_cosine_warmup_with_min_lr_matches_its_own_hf_lambda():
+    """cosine_warmup_with_min_lr: off-by-one ramp and progress, warmup_lr_rate floor."""
+    optimization = pytest.importorskip("transformers.optimization")
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    lr, total, warmup = 2e-4, 60, 5
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(
+        learning_rate=lr,
+        max_steps=total,
+        warmup_steps=warmup,
+        lr_scheduler_type="cosine_warmup_with_min_lr",
+    )
+    hf_lambda = getattr(
+        optimization, "_get_cosine_with_min_lr_schedule_with_warmup_lr_rate_lambda", None
+    )
+    if hf_lambda is None:
+        pytest.skip("installed transformers predates cosine_warmup_with_min_lr")
+    for kwargs in ({"min_lr_rate": 0.1}, {"min_lr": 2e-5},
+                   {"min_lr_rate": 0.1, "warmup_lr_rate": 0.05},
+                   {"min_lr_rate": 0.1, "num_cycles": 1.5}):
+        trainer.args.lr_scheduler_kwargs = kwargs
+        schedule = trainer._build_schedule(total)
+        got = [float(schedule(step)) for step in range(total)]
+        expected = [
+            lr
+            * hf_lambda(
+                step,
+                num_warmup_steps=warmup,
+                num_training_steps=total,
+                num_cycles=kwargs.get("num_cycles", 0.5),
+                min_lr_rate=kwargs.get("min_lr_rate", kwargs.get("min_lr", 0.0) / lr),
+                warmup_lr_rate=kwargs.get("warmup_lr_rate"),
+            )
+            for step in range(total)
+        ]
+        assert got == pytest.approx(expected, abs=1e-9), kwargs
+
+    trainer.args.lr_scheduler_kwargs = {"min_lr_rate": 0.1}
+    plain = [
+        lr
+        * optimization._get_cosine_schedule_with_warmup_lr_lambda(
+            step,
+            num_warmup_steps=warmup,
+            num_training_steps=total,
+            num_cycles=0.5,
+            min_lr_rate=0.1,
+        )
+        for step in range(total)
+    ]
+    got = [float(trainer._build_schedule(total)(step)) for step in range(total)]
+    assert got != pytest.approx(plain, abs=1e-9)
+
+    trainer.args.lr_scheduler_kwargs = None
+    with pytest.raises(ValueError, match="requires one of"):
+        trainer._build_schedule(total)
+
+
+def test_cosine_with_min_lr_requires_a_floor_like_hf():
+    """HF raises when neither min_lr nor min_lr_rate is given."""
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(
+        learning_rate=2e-4, max_steps=60, lr_scheduler_type="cosine_with_min_lr",
+    )
+    with pytest.raises(ValueError, match="requires one of"):
+        trainer._build_schedule(60)
+
+    for floor in ({"min_lr_rate": 0.1}, {"min_lr": 2e-5}):
+        trainer.args.lr_scheduler_kwargs = floor
+        assert callable(trainer._build_schedule(60))
+    trainer.args.lr_scheduler_kwargs = None
+    trainer.args.lr_scheduler_min_lr_rate = 0.1
+    assert callable(trainer._build_schedule(60))
+
+    trainer.args.lr_scheduler_type = "cosine"
+    trainer.args.lr_scheduler_min_lr_rate = None
+    assert callable(trainer._build_schedule(60))
+
+
+def test_cosine_with_restarts_does_not_wrap_to_full_lr_past_the_end():
+    """cosine_with_restarts returns 0 at progress 1, not a fresh cycle."""
+    optimization = pytest.importorskip("transformers.optimization")
+
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    lr, total = 2e-4, 60
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(
+        learning_rate=lr,
+        max_steps=total,
+        warmup_steps=0,
+        lr_scheduler_type="cosine_with_restarts",
+        lr_scheduler_num_cycles=3,
+    )
+    schedule = trainer._build_schedule(total)
+    for step in (total - 1, total, total + 1, total + 30, total * 2):
+        expected = lr * (
+            optimization._get_cosine_with_hard_restarts_schedule_with_warmup_lr_lambda(
+                step, num_warmup_steps=0, num_training_steps=total, num_cycles=3
+            )
+        )
+        assert float(schedule(step)) == pytest.approx(expected, abs=1e-9), step
+    assert float(schedule(total)) == pytest.approx(0.0)
+
+
+def test_stream_width_policy_and_registry_contracts():
+    """Disarmed policy is byte-identical; registry separates every keyed axis."""
+    import numpy as np
+
+    from unsloth_zoo.mlx.shape_guard import StreamShapeGrid
+    from unsloth_zoo.mlx.trainer import (
+        _StreamSignatureRegistry, _StreamWidthPolicy, _stream_batch_signature,
+        _stream_guard_report,
+    )
+    from unsloth_zoo.mlx.utils import (
+        _stage_text_batch_from_items, _stage_tokenized_text_batch,
+    )
+
+    class _Tok:
+        pad_token_id = 0
+
+    policy = _StreamWidthPolicy(StreamShapeGrid(anchor=512))
+    rows = [([1] * 40, [2] * 40), ([1] * 55, [3] * 55)]
+    raw = [[1] * 40, [1] * 55]
+    plain = _stage_tokenized_text_batch(rows, 512, pad_id=0)
+    plain_raw = _stage_text_batch_from_items(raw, _Tok(), 512)
+    assert policy(55) is None
+    for staged, reference in (
+        (_stage_tokenized_text_batch(rows, 512, pad_id=0, width_policy=policy), plain),
+        (_stage_text_batch_from_items(raw, _Tok(), 512, width_policy=policy), plain_raw),
+    ):
+        assert np.array_equal(np.asarray(staged.ids), np.asarray(reference.ids))
+        assert np.array_equal(
+            np.asarray(staged.lengths_info), np.asarray(reference.lengths_info),
+        )
+        assert np.array_equal(
+            np.asarray(staged.labels), np.asarray(reference.labels),
+        )
+
+    policy.armed = True
+    guarded = _stage_tokenized_text_batch(
+        rows, 512, pad_id=0, width_policy=policy,
+    )
+    assert guarded.ids.shape == (2, 65)
+    assert np.array_equal(guarded.lengths_info, plain.lengths_info)
+
+    gated, counted = _StreamWidthPolicy(StreamShapeGrid(anchor=512)), _StreamSignatureRegistry(128)
+    gated.arm(counted)
+    assert (gated.armed, gated.exact_ceiling) == (True, 32)
+    assert gated.observed is counted.observed
+    gated.exact_ceiling = 2
+    rep = lambda: _stream_guard_report(gated, counted, "full_step")
+    for index in range(3):
+        assert gated(55) is None, index
+        counted.record(("k", index))
+    assert (rep().action, rep().gate_released, rep().exact_ceiling) == (
+        "stream_exact", False, 2)
+    assert gated(55) == 65 and gated.gate_released
+    gated.armed = False
+    assert gated(55) is None
+    assert rep().action == "stream_grid"
+
+    registry = _StreamSignatureRegistry(1)
+
+    def _key(width, rows=2, phase="single", execution=("gpu", "s0")):
+        batch = (np.zeros((rows, width), dtype=np.int32), None, None)
+        return _stream_batch_signature(batch, phase, execution)
+
+    registry.record(_key(33))
+    assert not registry.would_trip(_key(33))
+    assert all(registry.would_trip(other) for other in (
+        _key(65), _key(33, rows=4), _key(33, phase="tree_update"),
+        _key(33, execution=("gpu", "s1")),
+    ))
+
+
+def test_streaming_guard_admission_protocol_is_one_collective_per_fetch():
+    """One reduction per fetch; failure outranks a trip; idle microsteps participate."""
+    import numpy as np
+
+    from unsloth_zoo.mlx.shape_guard import FULL_STEP_SCOPE
+    from unsloth_zoo.mlx.trainer import (
+        MLXTrainer, _StreamSignatureRegistry, _stream_batch_signature,
+        _stream_execution_key,
+    )
+
+    trainer = object.__new__(MLXTrainer)
+    trainer._distributed_initialized = True
+    trainer._distributed_rank = 0
+    trainer.stop_requested = False
+    reductions = []
+    peer_signal = 0
+
+    def _fake_max_int(value):
+        reductions.append(value)
+        return max(value, peer_signal)
+
+    trainer._distributed_max_int = _fake_max_int
+    registry = _StreamSignatureRegistry(1)
+    batch = (np.zeros((2, 33), dtype=np.int32), None, None)
+
+    def _admit(world=2, data=batch):
+        return trainer._admit_stream_batch(
+            registry, data, FULL_STEP_SCOPE, 1, 0, world,
+        )
+
+    assert _admit() is False
+    assert reductions == [0] and len(registry.observed) == 1
+
+    wide = (np.zeros((2, 65), dtype=np.int32), None, None)
+    assert _admit(data=wide) is True
+    assert reductions[-1] == 1
+
+    peer_signal = 1
+    assert _admit() is True
+    peer_signal = 0
+
+    before = len(reductions)
+    assert _admit(data=None) is False
+    assert len(reductions) == before + 1 and reductions[-1] == 0
+
+    peer_signal = 2
+    with pytest.raises(RuntimeError, match="peer rank failed"):
+        _admit()
+    assert len(reductions) == 5
+
+    uncertifiable = {"input_ids": np.zeros((1, 33), dtype=np.int32), "m": object()}
+    for _ in range(3):
+        assert trainer._admit_stream_batch(
+            registry, uncertifiable, FULL_STEP_SCOPE, 1, 0, 1,
+        ) == "eager_batch"
+    assert registry.uncertified == 3 and registry.uncertified_family
+    assert len(registry.observed) == 1
+
+    solo = _StreamSignatureRegistry(1)
+    before = len(reductions)
+    assert trainer._admit_stream_batch(
+        solo, batch, FULL_STEP_SCOPE, 1, 0, 1,
+    ) is False
+    assert len(reductions) == before
+    assert _stream_batch_signature(
+        batch, "single", _stream_execution_key(),
+    ) in solo.observed
+
+
+@pytest.mark.parametrize("as_json", [False, True])
+def test_lr_scheduler_kwargs_is_a_constructor_argument(as_json):
+    """HF WSD windows reach the schedule through the public config, dict or JSON string."""
+    import json
+
+    optimization = pytest.importorskip("transformers.optimization")
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    kwargs = {"num_decay_steps": 20, "num_stable_steps": 10, "min_lr_ratio": 0.1}
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(
+        learning_rate=2e-4, max_steps=40, warmup_steps=5,
+        lr_scheduler_type="warmup_stable_decay",
+        lr_scheduler_kwargs=json.dumps(kwargs) if as_json else kwargs,
+    )
+    schedule = trainer._build_schedule(40)
+    for step in range(40):
+        expected = 2e-4 * optimization._get_wsd_scheduler_lambda(
+            step, num_warmup_steps=5, num_stable_steps=10, num_decay_steps=20,
+            warmup_type="linear", decay_type="cosine", min_lr_ratio=0.1, num_cycles=0.5,
+        )
+        assert float(schedule(step)) == pytest.approx(expected, rel=1e-6, abs=1e-12), step
+
+
+@pytest.mark.parametrize("stable,decay", [(0, 100), (None, 100), (None, 20), (10, 20), (70, 5)])
+def test_warmup_stable_decay_keeps_hf_step_windows(stable, decay):
+    """A decay window longer than the run is followed, not rescaled to max_steps (HF parity)."""
+    optimization = pytest.importorskip("transformers.optimization")
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    total, warmup = 60, 5
+    kwargs = {"num_decay_steps": decay, "min_lr_ratio": 0.1}
+    if stable is not None:
+        kwargs["num_stable_steps"] = stable
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(
+        learning_rate=2e-4, max_steps=total, warmup_steps=warmup,
+        lr_scheduler_type="warmup_stable_decay", lr_scheduler_kwargs=kwargs,
+    )
+    schedule = trainer._build_schedule(total)
+    hf_stable = stable if stable is not None else total - warmup - decay
+    for step in range(total + 2):
+        expected = 2e-4 * optimization._get_wsd_scheduler_lambda(
+            step, num_warmup_steps=warmup, num_stable_steps=hf_stable, num_decay_steps=decay,
+            warmup_type="linear", decay_type="cosine", min_lr_ratio=0.1, num_cycles=0.5,
+        )
+        assert float(schedule(step)) == pytest.approx(expected, rel=1e-6, abs=1e-12), step
