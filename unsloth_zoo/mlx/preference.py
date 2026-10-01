@@ -1572,9 +1572,10 @@ def _make_preference_cce_scorer(model):
         quantization = dict(group_size=getattr(desc.module, "group_size", 64),
                             bits=getattr(desc.module, "bits", 4),
                             mode=getattr(desc.module, "mode", "affine"))
-    kernel = utils._get_runtime_cce(ignore_index=-100, logit_softcap=softcap,
-                                    quantized=desc.quantized, **quantization)
     frozen = not utils._is_lm_head_trainable(model)
+    kernel = utils._get_runtime_cce(ignore_index=-100, logit_softcap=softcap,
+                                    quantized=desc.quantized, weight_is_frozen=frozen,
+                                    **quantization)
 
     def score(model, batch, supervised, indices=None, *, every_position=False):
         """Token cross entropy and logit sums per position, as float32 grids.
@@ -1585,13 +1586,14 @@ def _make_preference_cce_scorer(model):
         """
         targets = batch[:, 1:]
         hidden = utils._forward_text_hidden_states(model, batch[:, :-1])
-        hidden = hidden.reshape((-1, hidden.shape[-1]))
+        head = utils._resolve_module_path(model, desc.path)
+        # Before compaction: the logit sums below may read every row.
+        hidden = utils._rotate_head_input(head, hidden.reshape((-1, hidden.shape[-1])))
         if scale is not None:
             hidden = hidden * scale
         labels = utils._normalize_cce_label_dtype(targets)
         labels = mx.where(supervised, labels, mx.array(-100, labels.dtype))
         rows, labels = utils._compact_cce_inputs(hidden, labels.reshape((-1,)), indices)
-        head = utils._resolve_module_path(model, desc.path)
         weight = mx.stop_gradient(head.weight) if frozen else head.weight
         scales = biases = None
         if desc.quantized:

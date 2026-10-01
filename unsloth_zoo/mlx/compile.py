@@ -105,8 +105,13 @@ _VERIFIED_TRAINING_ARCHES: set[str] = {
     "qwen2_5_vl",
     "qwen3_5",
     "qwen3_5_moe",
+    # mlx-vlm 0.7.4+ names these as qwen3_5 / qwen3_5_moe's `text_config` decoders.
+    "qwen3_5_moe_text",
+    "qwen3_5_text",
     "qwen3_vl_moe",
     "qwen3_vl",
+    # Ternary Bonsai 2: Qwen3.5's Model with Hadamard-packed linears swapped in.
+    "prism_hadamard_qwen35",
 }
 _VERIFIED_GENERATION_ARCHES: set[str] = set()
 
@@ -245,6 +250,8 @@ _TRAINING_VERIFIER_HINTS: dict[str, str] = {
     "qwen2_5_vl": "verify_qwen2_5_vl",
     "qwen3_5": "verify_qwen3_5",
     "qwen3_5_moe": "verify_qwen3_5_moe",
+    "qwen3_5_moe_text": "verify_qwen3_5_moe_text",
+    "qwen3_5_text": "verify_qwen3_5_text",
     "qwen3_vl_moe": "verify_qwen3_vl_moe",
     "qwen3_vl": "verify_qwen3_vl",
     "smolvlm": "verify_smolvlm",
@@ -3617,8 +3624,10 @@ def _install_qwen3_family_compile_patches():
                 weight_list[i].extend(weights[i].tolist())
 
         idx_tensor = mx.array(idx_list, dtype=mx.int32)
-        weight_tensor = mx.array(weight_list, dtype=self.pos_embed.weight.dtype)
-        pos_embeds = self.pos_embed(idx_tensor) * weight_tensor[:, :, None]
+        # A quantized pos_embed's weight is packed uint32; interpolate in the rows' dtype.
+        pos_embeds = self.pos_embed(idx_tensor)
+        weight_tensor = mx.array(weight_list, dtype=pos_embeds.dtype)
+        pos_embeds = pos_embeds * weight_tensor[:, :, None]
         patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
 
         split_sizes = [int(h * w) for _, h, w in grid_spec]
@@ -3828,7 +3837,7 @@ def _install_qwen3_family_compile_patches():
             ),
         )
         _PATCHED_ARCHES.add("qwen3_vl_moe")
-    _PATCHED_ARCHES.update({"qwen3_vl", "qwen3_5", "qwen3_5_moe"})
+    _PATCHED_ARCHES.update({"qwen3_vl", "qwen3_5", "qwen3_5_moe", "prism_hadamard_qwen35"})
 
 
 def _install_glm_ocr_compile_patches():
@@ -5977,7 +5986,7 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
             name="qwen3_family_multimodal",
             description="Qwen3 VL family merge, deepstack, and vision patch set.",
             matcher=lambda arch, report: (
-                arch in {"qwen3_vl", "qwen3_5", "qwen3_5_moe"}
+                arch in {"qwen3_vl", "qwen3_5", "qwen3_5_moe", "prism_hadamard_qwen35"}
                 or (arch.startswith("qwen3") and "qwen3_deepstack_multimodal" in report.pattern_traits)
             ),
             primitive_names=(

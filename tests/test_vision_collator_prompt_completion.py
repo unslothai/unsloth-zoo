@@ -30,7 +30,7 @@ from unsloth_zoo.vision_utils import UnslothVisionDataCollator
 
 PAD_ID = 0
 IMG_ID = 7
-VOCAB = {"<img>": IMG_ID, "a": 1, "b": 2, "x": 3, "y": 4, "z": 5, "w": 6}
+VOCAB = {"<img>": IMG_ID, "<img-200>": -200, "<patch>": 8, "<end>": 9, "a": 1, "b": 2, "x": 3, "y": 4, "z": 5, "w": 6}
 
 
 class _FakeTokenizer:
@@ -238,3 +238,89 @@ def test_top_level_image_urls_use_guarded_fetch(monkeypatch):
     collator([{"images": ["https://example.com/a.png"], "prompt": "<img> a", "completion": "x"}])
     assert fetched == ["https://example.com/a.png"]
     assert isinstance(collator.processor.seen_images[0][0][0], Image.Image)
+
+
+def test_none_image_entries_are_dropped_in_pc_path():
+    collator = make_collator(None)
+    collator.processor = _ChatProcessor()
+    collator.assistant_single_content = False
+    collator([{"images": [None], "prompt": "a", "completion": "x"}])
+    assert collator.processor.seen_images[0] is None
+
+
+def test_mixed_batch_keeps_one_image_slot_per_row_in_pc_path():
+    from PIL import Image
+    collator = make_collator(None)
+    collator.processor = _ChatProcessor()
+    collator.assistant_single_content = False
+    image = Image.new("RGB", (32, 32))
+    collator([
+        {"images": [image], "prompt": "<img> a", "completion": "x"},
+        {"images": [None], "prompt": "a", "completion": "x"},
+    ])
+    assert collator.processor.seen_images[0] == [[image], []]
+
+
+def test_mixed_batch_keeps_one_image_slot_per_row_in_messages_path():
+    from PIL import Image
+    collator = make_collator(None)
+    collator.processor = _ChatProcessor()
+    collator.assistant_single_content = False
+    image = Image.new("RGB", (32, 32))
+    def msgs(with_image):
+        user = ([{"type": "image"}] if with_image else []) + [{"type": "text", "text": "a"}]
+        return [{"role": "user", "content": user}, {"role": "assistant", "content": [{"type": "text", "text": "x"}]}]
+    collator([{"images": None, "messages": msgs(False)}, {"images": [image], "messages": msgs(True)}])
+    assert collator.processor.seen_images[0] == [[], [image]]
+
+
+def _image_collator(max_seq_length):
+    collator = make_collator(None, max_seq_length = max_seq_length)
+    collator.processor = _ChatProcessor()
+    collator.assistant_single_content = False
+    return collator
+
+
+@pytest.mark.parametrize("marker", ["<img>", "<img-200>", "<patch>"])
+def test_truncation_that_cuts_an_image_placeholder_raises(marker):
+    # <img-200>: negative sentinel in input_ids (Phi-4-reasoning-vision); <patch>: only the
+    # processor declares it, as `image_token_id` (Step-3.7 `<im_patch>`).
+    from PIL import Image
+    collator = _image_collator(2)
+    collator.processor.image_token_id = VOCAB["<patch>"]
+    with pytest.raises(ValueError, match = "max_seq_length = 2 truncated 1 image / audio placeholder"):
+        collator([{"images": [Image.new("RGB", (32, 32))], "prompt": f"a b {marker}", "completion": "x"}])
+
+
+def test_truncation_that_keeps_every_image_placeholder_passes():
+    from PIL import Image
+    out = _image_collator(3)([{"images": [Image.new("RGB", (32, 32))], "prompt": "<img> a b", "completion": "x y"}])
+    assert out["input_ids"].tolist() == [[IMG_ID, 1, 2]]
+
+
+def test_cut_media_delimiter_alone_passes_when_the_model_names_its_feature_tokens():
+    # <end> is a known media token but not a feature slot: the model forward still aligns.
+    from PIL import Image
+    batch = [{"images": [Image.new("RGB", (32, 32))], "prompt": "a <img> <end>", "completion": "x"}]
+    collator = _image_collator(2)
+    collator.padding_token_ids = torch.tensor([PAD_ID, IMG_ID, VOCAB["<end>"]])
+    with pytest.raises(ValueError, match = "truncated 1 image / audio placeholder"):
+        collator(batch)
+    collator._feature_token_ids = [IMG_ID]
+    assert collator(batch)["input_ids"].tolist() == [[1, IMG_ID]]
+
+
+def test_feature_token_ids_cover_every_config_spelling():
+    import types
+    from unsloth_zoo.vision_utils import _media_feature_token_ids
+    llava_onevision = types.SimpleNamespace(image_token_index = 151646, video_token_index = 151647)
+    phi4mm = types.SimpleNamespace(vision_config = types.SimpleNamespace(image_token_id = 200010),
+                                   audio_config = types.SimpleNamespace(audio_token_id = 200011))
+    assert _media_feature_token_ids(types.SimpleNamespace(config = llava_onevision)) == [151646, 151647]
+    assert _media_feature_token_ids(types.SimpleNamespace(config = phi4mm)) == [200010, 200011]
+    omni = types.SimpleNamespace(thinker_config = types.SimpleNamespace(
+        image_token_index = 151655, video_token_index = 151656, audio_token_index = 151646))
+    assert _media_feature_token_ids(types.SimpleNamespace(config = omni)) == [151646, 151655, 151656]
+    internvl = types.SimpleNamespace(img_context_token_id = 92546)
+    assert _media_feature_token_ids(types.SimpleNamespace(config = internvl)) == [92546]
+    assert _media_feature_token_ids(types.SimpleNamespace(config = None, img_context_token_id = 92546)) == [92546]

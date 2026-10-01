@@ -2631,7 +2631,10 @@ def test_a_family_qualified_without_a_patch_still_has_to_clear_the_gate(arch):
     assert "blockers" in refused.reason
 
 
-def test_nested_text_decoder_qualification_decides_its_parent():
+@pytest.mark.parametrize("parent, decoder", [
+    ("gemma4", "gemma4_text"), ("qwen3_5", "qwen3_5_text"), ("qwen3_5_moe", "qwen3_5_moe_text"),
+])
+def test_nested_text_decoder_qualification_decides_its_parent(parent, decoder):
     """An unqualified `text_config` decoder keeps a qualified parent eager."""
     _skip_if_mlx_core_was_replaced()
     from types import SimpleNamespace
@@ -2643,27 +2646,27 @@ def test_nested_text_decoder_qualification_decides_its_parent():
         resolve_training_compile,
     )
 
-    pytest.importorskip("mlx_vlm.models.gemma4.gemma4")
+    pytest.importorskip(f"mlx_vlm.models.{parent}.{parent}")
 
-    def gemma4_over(decoder):
-        model = type("Model", (), {"__module__": "mlx_vlm.models.gemma4.gemma4"})()
+    def parent_over(nested):
+        model = type("Model", (), {"__module__": f"mlx_vlm.models.{parent}.{parent}"})()
         model.config = SimpleNamespace(
-            model_type="gemma4", text_config=SimpleNamespace(model_type=decoder),
+            model_type=parent, text_config=SimpleNamespace(model_type=nested),
         )
         return model
 
     policy = MLXVLMCompilePolicy(mode="best_effort")
 
-    decision = resolve_training_compile(gemma4_over("gemma4_text"), policy=policy)
+    decision = resolve_training_compile(parent_over(decoder), policy=policy)
     assert decision.enabled, decision.reason
-    decoders = ["gemma4_text"] if "gemma4_text" in discover_architectures() else []
+    decoders = [decoder] if decoder in discover_architectures() else []
     assert [q.arch for q in decision.backend_qualifications] == decoders
     assert all(q.training_compile for q in decision.backend_qualifications)
 
     unqualified = sorted(set(discover_architectures()) - _VERIFIED_TRAINING_ARCHES)
     if not unqualified:
         pytest.skip("every discovered architecture is training-qualified")
-    refused = resolve_training_compile(gemma4_over(unqualified[0]), policy=policy)
+    refused = resolve_training_compile(parent_over(unqualified[0]), policy=policy)
     assert not refused.enabled
     assert unqualified[0] in refused.reason
 

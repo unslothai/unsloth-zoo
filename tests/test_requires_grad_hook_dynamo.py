@@ -194,6 +194,25 @@ def test_post_hook_still_flips_a_frozen_output_while_compiling(monkeypatch):
     assert y.requires_grad
 
 
+def test_post_hook_no_ops_while_compiling_without_grad(monkeypatch):
+    """A compiled decode step runs under inference_mode: nothing is recorded, so the
+    flip is moot there and would only graph-break every layer."""
+    hook = _real_post_hook()
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    y = torch.randn(2, 8)
+    with torch.no_grad():
+        hook(None, None, y)
+    assert not y.requires_grad
+
+
+def test_post_hook_still_flips_eagerly_without_grad():
+    hook = _real_post_hook()
+    y = torch.randn(2, 8)
+    with torch.no_grad():
+        hook(None, None, y)
+    assert y.requires_grad
+
+
 def test_post_hook_still_raises_on_unknown_output_while_compiling(monkeypatch):
     """An unmarkable output must stay a loud error while tracing: is_compiling() is
     constant folded, so a skip is permanent and the region trains with no gradients."""

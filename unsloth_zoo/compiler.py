@@ -164,6 +164,9 @@ DISABLE_COMPILE_FUNCTIONS = [
     # nothing today; it is here so one that goes back to importing it by name, the
     # way transformers 5.2 does for chunk_gated_delta_rule, stays uncompiled.
     "recurrent_gated_delta_rule",
+    # KDA chunk fallback (glm5_next, kimi_linear): Inductor unrolls the per-chunk loop, 25+ min AOT compile.
+    # recurrent_kimi_delta_attention stays compiled: decode only (seq_len 1), 2x faster than eager.
+    "chunk_kimi_delta_attention",
 
     # transformers 5.9+ VL files import these; `grid_thw.tolist()` builds shapes from
     # unbacked SymInts, so fullgraph = True is a hard error on the first vision forward.
@@ -196,7 +199,48 @@ DISABLE_COMPILE_FUNCTIONS = [
 # trailing `x[..., -rope_dim:]` slice reads out of bounds, giving wrong / NaN grads (pytorch#198553).
 DISABLE_COMPILE_MODEL_FUNCTIONS = {
     "deepseek_v4": ["apply_rotary_pos_emb"],
+    # Community port: V4 rope slice plus host-side helpers (dynamo cannot trace tokenizers `NFKC.__new__`).
+    "deepseek_v41": [
+        "apply_rotary_pos_emb",
+        "build_compressed_token_map",
+        "compute_hash_multipliers",
+        "_is_prime",
+        "_find_next_prime",
+        "_mesh_process_group",
+        "_tp_grad_group",
+        "_validate_attention_tp_divisibility",
+        # QAT STE autograd.Function: Dynamo raises InternalTorchDynamoError the fallback does not catch.
+        "_quantize_qat",
+    ],
 }
+
+# Matched rewrites leave DISABLE_COMPILE_MODEL_FUNCTIONS; deepseek_v4 `split` avoids the slice pytorch#198553 miscompiles.
+MODEL_FUNCTION_SOURCE_REWRITES = {
+    "deepseek_v4": {
+        "apply_rotary_pos_emb": (
+            "nope, rope = x[..., :-rope_dim], x[..., -rope_dim:]",
+            "nope, rope = x.split([x.shape[-1] - rope_dim, rope_dim], dim = -1)",
+        ),
+    },
+    "deepseek_v41": {
+        "apply_rotary_pos_emb": (
+            "nope, rope = x[..., :-rope_dim], x[..., -rope_dim:]",
+            "nope, rope = x.split([x.shape[-1] - rope_dim, rope_dim], dim = -1)",
+        ),
+    },
+}
+
+
+def model_function_source_rewrites(modeling_file, model_type):
+    applicable = {}
+    for name, (old, new) in MODEL_FUNCTION_SOURCE_REWRITES.get(model_type, {}).items():
+        try:
+            source = inspect.getsource(getattr(modeling_file, name))
+        except Exception:
+            continue
+        if source.count(old) == 1:
+            applicable[name] = (old, new)
+    return applicable
 
 
 def calls_disable_compile_function(source, disable_compile_functions):
@@ -250,6 +294,57 @@ def function_has_tensor_inputs(source: str) -> bool:
         if not names <= scalar_names | {"Optional", "Union", "List", "Tuple", "Dict", "Set", "torch", "typing"}:
             return True
     return False
+pass
+
+
+_INIT_ONLY_CALLERS = frozenset(("__init__", "__post_init__", "_init_weights", "post_init"))
+
+
+def function_only_called_at_init(module_source: str, name: str) -> bool:
+    """True if ``name`` is only reached from ``__init__``-time methods (directly or via such
+    helpers): these build buffers on meta, so compiling them fails at load. False if unparseable."""
+    try:
+        tree = ast.parse(textwrap.dedent(module_source))
+    except Exception:
+        return False
+    callers_of = {}
+    # owner = (name, is_method); nested defs keep their enclosing owner.
+    def visit(node, owner):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if isinstance(node, ast.ClassDef):
+                    visit(child, (child.name, True))
+                else:
+                    visit(child, (child.name, False) if owner is None else owner)
+                continue
+            if isinstance(child, ast.Call):
+                func = child.func
+                called = func.id if isinstance(func, ast.Name) else None
+                if called is not None:
+                    callers_of.setdefault(called, set()).add(owner)
+            visit(child, owner)
+    visit(tree, None)
+    seen = set()
+    def init_only(fn):
+        if fn in seen:
+            return True
+        seen.add(fn)
+        owners = callers_of.get(fn)
+        if not owners:
+            return False
+        for owner in owners:
+            if owner is None:
+                return False  # called at module import time or from a class body
+            owner_name, is_method = owner
+            if is_method:
+                # self.<name>() calls are untracked (MPT forward: self.build_mpt_alibi_tensor).
+                if owner_name in _INIT_ONLY_CALLERS:
+                    continue
+                return False
+            if not init_only(owner_name):
+                return False
+        return True
+    return init_only(name)
 pass
 
 
@@ -354,6 +449,7 @@ except:
 pass
 
 from unsloth_zoo import DEVICE_TYPE_TORCH, DEVICE_COUNT
+from unsloth_zoo.temporary_patches.utils import UNSLOTH_DECODE_COMPILE
 """
 )
 
@@ -1822,6 +1918,15 @@ def _verify_compiled_cache_file_collectively(
         raise error
 pass
 
+_HUB_KERNEL_WRAPPER_RE = re.compile(r"^[ \t]*@use_kernel_func_from_hub_with_fallback\b", flags = re.MULTILINE)
+
+
+def is_hub_kernel_wrapper(source):
+    # Emit bare: on torch 2.11 is_exporting() is True inside a compile trace, so the wrapper runs its torch reference (a None stub for Nemotron-H mamba2).
+    return bool(_HUB_KERNEL_WRAPPER_RE.search(source or ""))
+pass
+
+
 def create_new_function(
     name,
     new_source,
@@ -1912,6 +2017,8 @@ def create_new_function(
         # Emitted in place of a bare `torch.compile(fullgraph = True)`, so the
         # name must resolve in the generated module.
         imports += "from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback\n"
+    if "torch_compiler_disable_unless_decode" in new_source:
+        imports += "from unsloth_zoo.temporary_patches.utils import torch_compiler_disable_unless_decode\n"
     if "torch_compile" in new_source:
         imports += "from unsloth_zoo.temporary_patches.common import torch_compile\n"
     if "_maybe_compile" in new_source:
@@ -2741,7 +2848,7 @@ def create_standalone_class(
         compile = (
             f"@torch_compile_with_fallback(fullgraph = {fullgraph}, dynamic = True, options = torch_compile_options)"
             if not disable
-            else "@torch.compiler.disable(recursive = False)"
+            else "@torch_compiler_disable_unless_decode"
         )
     else:
         compile = ""
@@ -2973,32 +3080,35 @@ __DYNAMO__RECOMPILING__ = """
 
     # Set compiler stance to fail on recompiles for inference
     global INFERENCE_RUNS
-    if torch_dynamo_eval_frame is not None:
-        old_stance = torch_dynamo_eval_frame._stance.stance
-    else:
-        old_stance = None
-    if old_stance is not None and INFERENCE_RUNS == 1:
-        # Skip guards and return to eager -> we still need guards!
-        torch_compiler_set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = False)
-        if UNSLOTH_ENABLE_LOGGING:
-            logger_compiler.info(
-                f"Unsloth: Removing compiler guards after 1 inference run. "\\
-                f"DYNAMO_STANCE.stance = {torch_dynamo_eval_frame._stance.stance} "\\
-                f"DYNAMO_STANCE.skip_guard_eval_unsafe = {torch_dynamo_eval_frame._stance.skip_guard_eval_unsafe}"
-            )
-    elif old_stance == "eager_on_recompile":
-        pass
-    elif old_stance == "default" and INFERENCE_RUNS > 1:
-        # Reset compiler stance
-        torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = False)
-        if UNSLOTH_ENABLE_LOGGING:
-            logger_compiler.info(
-                f"Unsloth: Reseting guards. "\\
-                f"DYNAMO_STANCE.stance = {torch_dynamo_eval_frame._stance.stance} "\\
-                f"DYNAMO_STANCE.skip_guard_eval_unsafe = {torch_dynamo_eval_frame._stance.skip_guard_eval_unsafe}"
-            )
-        INFERENCE_RUNS = 0
-    INFERENCE_RUNS += 1
+    # Skipped while tracing (set_stance raises there, and the counter would guard every step)
+    # and around a compiled decode step, which eager_on_recompile would otherwise freeze.
+    if not torch.compiler.is_compiling() and not UNSLOTH_DECODE_COMPILE[0]:
+        if torch_dynamo_eval_frame is not None:
+            old_stance = torch_dynamo_eval_frame._stance.stance
+        else:
+            old_stance = None
+        if old_stance is not None and INFERENCE_RUNS == 1:
+            # Skip guards and return to eager -> we still need guards!
+            torch_compiler_set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = False)
+            if UNSLOTH_ENABLE_LOGGING:
+                logger_compiler.info(
+                    f"Unsloth: Removing compiler guards after 1 inference run. "\\
+                    f"DYNAMO_STANCE.stance = {torch_dynamo_eval_frame._stance.stance} "\\
+                    f"DYNAMO_STANCE.skip_guard_eval_unsafe = {torch_dynamo_eval_frame._stance.skip_guard_eval_unsafe}"
+                )
+        elif old_stance == "eager_on_recompile":
+            pass
+        elif old_stance == "default" and INFERENCE_RUNS > 1:
+            # Reset compiler stance
+            torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = False)
+            if UNSLOTH_ENABLE_LOGGING:
+                logger_compiler.info(
+                    f"Unsloth: Reseting guards. "\\
+                    f"DYNAMO_STANCE.stance = {torch_dynamo_eval_frame._stance.stance} "\\
+                    f"DYNAMO_STANCE.skip_guard_eval_unsafe = {torch_dynamo_eval_frame._stance.skip_guard_eval_unsafe}"
+                )
+            INFERENCE_RUNS = 0
+        INFERENCE_RUNS += 1
 """
 
 # Replace Cross Entropy cells with fused linear lm heads
@@ -4348,11 +4458,14 @@ torch_float16 = torch.float16
 def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
     xA = dropout(x.to(torch_float16)) @ lora_A.weight.to(torch_float16).t()
     # output = result + scaling * xA @ lora_B.weight.t()
+    # Add in result's dtype: a base layer kept in float32 (gpt-oss expert down_projs reach
+    # 66795) overflows if rounded to float16 here. Float16 results take the same kernel.
     shape = result.shape
+    result_dtype = result.dtype
     output = torch_addmm(
-        result.view(-1, shape[-1]).to(torch_float16),
-        xA.view(-1, xA.shape[-1]),
-        lora_B.weight.to(torch_float16).t(),
+        result.view(-1, shape[-1]),
+        xA.view(-1, xA.shape[-1]).to(result_dtype),
+        lora_B.weight.to(result_dtype).t(),
         alpha = scaling,
         beta = 1,
     ).view(shape)
@@ -4361,7 +4474,7 @@ def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
     if bias is not None:
         output = torch_add(
             output,
-            bias.to(torch_float16),
+            bias.to(result_dtype),
             alpha = scaling,
         )
     return output
@@ -4716,6 +4829,22 @@ def patch_gradient_accumulation(modeling_file, module):
 pass
 
 
+# transformers' AyaVision forward drops the text logit_scale CohereForCausalLM applies (Command-A vision ships 1.0).
+_DROPPED_TEXT_LOGIT_SCALE = ("AyaVisionForConditionalGeneration",)
+
+
+def fixup_dropped_logit_scale(source, module = None):
+    if module not in _DROPPED_TEXT_LOGIT_SCALE or "logit_scale" in source:
+        return source
+    return re.sub(
+        r"^([ \t]+)(logits = self\.lm_head\(hidden_states[^\n]*\))[ \t]*$",
+        r"\1\2\n\1logits = logits * self.config.text_config.logit_scale",
+        source,
+        count = 1,
+        flags = re.MULTILINE,
+    )
+
+
 # Pre fix up some modules like Gemma3n
 def fixup_fused_lm_head(source):
     # Gemma 3N
@@ -5023,6 +5152,7 @@ DISABLE_COMPILE_MODULES = [
     # Sinkhorn-Knopp division chain overflows to inf; tiny modules, so eager is cheap.
     "DeepseekV4HyperConnection",
     "DeepseekV4HyperHead",
+    "DeepseekV41HyperConnection",
 ]
 
 FIX_GC_LAYER_CALLER_MODULES = [
@@ -5387,6 +5517,8 @@ def unsloth_compile_transformers(
     exec("import transformers", globals())
     disable_compile_functions = set(DISABLE_COMPILE_FUNCTIONS)
     disable_compile_functions.update(DISABLE_COMPILE_MODEL_FUNCTIONS.get(model_type, ()))
+    function_source_rewrites = model_function_source_rewrites(modeling_file, model_type)
+    disable_compile_functions.difference_update(function_source_rewrites)
 
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__"):
         # Get __UNSLOTH_SUPPORTS_SDPA__
@@ -6205,6 +6337,7 @@ def unsloth_compile_transformers(
                     continue
                 # Fix some arguments up like for Gemma 3N
                 new_source = fixup_fused_lm_head(source)
+                new_source = fixup_dropped_logit_scale(new_source, module)
                 # Apply fused LM transforms
                 new_source, supports_return_hidden_states = apply_fused_lm_head(
                     new_source, module
@@ -6330,13 +6463,23 @@ def unsloth_compile_transformers(
             # MOE routing weights cast fix takes effect in v5
             new_source, new_methods = patch_moe_routing_weights_cast(module_cls, source)
             if new_source != source or len(new_methods) > 0:
+                # Disabled, the router breaks the compiled MoE block around it (Ernie 4.5, Laguna).
+                compile_router = (
+                    compile_custom_modules
+                    and module in torch_modules
+                    and module not in bad_torch_modules
+                )
                 try:
                     new_module = create_standalone_class(
                         module,
                         model_location,
                         functions,
-                        fullgraph=False,
-                        disable=True,
+                        fullgraph=(
+                            compile_router
+                            and module not in no_fullgraph_modules
+                            and torch_modules[module]
+                        ),
+                        disable=disable if compile_router else True,
                         forward_source=new_source,
                         new_methods=new_methods,
                     )
@@ -6383,7 +6526,7 @@ def unsloth_compile_transformers(
     items_in_trainer = dir(transformers.trainer)
     good_items = []
     for item in items_in_trainer:
-        if item in inner_training_loop:
+        if not item.startswith("__") and item in inner_training_loop:
             good_items.append(item)
     pass
     exec(
@@ -6528,7 +6671,7 @@ def unsloth_compile_transformers(
             _mask_builders = calls_mask_creation_function(parameters)
             if module in disable_compile_functions:
                 parameters = (
-                    "@torch.compiler.disable(recursive = False)\n"
+                    "@torch_compiler_disable_unless_decode\n"
                     + parameters
                 )
             elif len(_mask_builders) != 0:
@@ -6563,6 +6706,8 @@ def unsloth_compile_transformers(
                     print(f"Unsloth: Cannot patch {module} with error = {str(e)}")
                     continue
             pass
+            if module in function_source_rewrites:
+                source = source.replace(*function_source_rewrites[module])
 
             if sdpa_bool_masks:
                 source = convert_attention_masks_to_bool(module, source)
@@ -6591,6 +6736,11 @@ def unsloth_compile_transformers(
                     bad_reason = "disabled keyword is in it"
                     break
             pass
+            # DISABLE_COMPILE_FUNCTIONS names keep the stronger @torch.compiler.disable below.
+            if not bad and module not in disable_compile_functions and is_hub_kernel_wrapper(source):
+                bad = True
+                bad_reason = "it dispatches to an external kernel package"
+            pass
             # Skipped for a DISABLE_COMPILE_FUNCTIONS name: `@torch.compiler.disable`
             # also stops Dynamo inlining it into a compiled caller, so downgrading it
             # to "emit bare" would be weaker. Nothing on that list builds masks today.
@@ -6606,6 +6756,9 @@ def unsloth_compile_transformers(
                 if not function_has_tensor_inputs(source):
                     bad = True
                     bad_reason = "it takes no tensor inputs"
+                elif function_only_called_at_init(full_source, module):
+                    bad = True
+                    bad_reason = "it is only called while constructing modules"
             pass
             if not bad:
                 # Functions defined inside an if/else come back indented
@@ -6616,11 +6769,11 @@ def unsloth_compile_transformers(
                 if module in disable_compile_functions:
                     source = re.sub(
                         r"@torch.compile\([^\n]*\)\n",
-                        "@torch.compiler.disable(recursive = False)\n",
+                        "@torch_compiler_disable_unless_decode\n",
                         source,
                     )
-                    if "@torch.compiler.disable(recursive = False)\n" not in source:
-                        source = "@torch.compiler.disable(recursive = False)\n" + source
+                    if "@torch_compiler_disable_unless_decode\n" not in source:
+                        source = "@torch_compiler_disable_unless_decode\n" + source
                 elif not disable:
                     _fullgraph = UNSLOTH_FULLGRAPH and not calls_disable_compile_function(
                         source, disable_compile_functions
@@ -6727,10 +6880,11 @@ def unsloth_compile_transformers(
             continue
 
         for key, value in item.items():
-            value = str(value)
+            # Exact name: a substring swapped JambaAttentionDecoderLayer for JambaAttention.
+            value = getattr(value, "__name__", None) if isinstance(value, type) else None
             found = False
             for replaced_class in replaced_classes:
-                if replaced_class in value:
+                if replaced_class == value:
                     try:
                         exec(
                             f"{model_location}.{check}['{key}'] = combined_module.{replaced_class}",

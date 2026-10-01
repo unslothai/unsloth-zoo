@@ -30,6 +30,7 @@ _UNTRANSPOSED = dict(k=192, rows=1, out_width=128, transpose=False, rhs_indices=
 if _METAL:
     # Module scope: leaked mlx-simulation shims must not hijack test-time imports.
     import mlx.nn as nn
+    import mlx.optimizers as optim
     from mlx.utils import tree_flatten, tree_map
     from unsloth_zoo.mlx.loader import FastMLXModel
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
@@ -91,6 +92,27 @@ def test_cached_position_attribute_does_not_imply_multiaxis_rope():
     expected = lm(inputs).logits
     actual = lm.lm_head(mlx_utils._forward_text_hidden_states(lm, inputs))
     assert mx.allclose(actual, expected, atol=1e-5).item()
+
+
+@metal_only
+def test_qwen3_vl_pos_embed_interpolation_with_quantized_table():
+    from types import SimpleNamespace
+    from mlx_vlm.models.qwen3_vl.vision import VisionModel
+    from unsloth_zoo.mlx import compile as mc
+
+    mc._install_qwen3_family_compile_patches()
+    assert VisionModel.fast_pos_embed_interpolate.__module__ == mc.__name__
+    table = nn.QuantizedEmbedding.from_embedding(nn.Embedding(16, 64))
+
+    class Dense:  # the same rows behind a float weight
+        weight = mx.zeros((1,))
+        __call__ = staticmethod(table)
+
+    out = [VisionModel.fast_pos_embed_interpolate(
+        SimpleNamespace(num_grid_per_side=4, pos_embed=embed, config=SimpleNamespace(spatial_merge_size=2)),
+        [(1, 6, 8)]) for embed in (table, Dense())]
+    assert table.weight.dtype == mx.uint32
+    assert mx.array_equal(out[0], out[1]).item()
 
 
 @metal_only
@@ -488,6 +510,28 @@ def test_hf_callbacks_receive_mlx_trainer_lifecycle(tmp_path):
 
 
 @metal_only
+def test_eval_reports_mean_token_accuracy_on_metal(tmp_path):
+    from transformers import TrainerCallback
+    from unsloth_zoo.mlx.utils import make_baseline_loss_fn
+
+    class Recorder(TrainerCallback):
+        metrics = None
+
+        def on_evaluate(self, args, state, control, metrics, **_kwargs):
+            self.metrics = dict(metrics)
+
+    recorder = Recorder()
+    trainer = _callback_trainer(tmp_path, [recorder], max_steps=1)
+    trainer.train()
+    _, ntoks, correct = make_baseline_loss_fn()(
+        trainer.model, *_callback_batch(), return_correct=True,
+    )
+    expected = correct.item() / ntoks.item()
+    assert 0.0 <= expected <= 1.0
+    assert recorder.metrics["eval_mean_token_accuracy"] == pytest.approx(expected)
+
+
+@metal_only
 def test_hf_callback_on_save_only_fires_for_checkpoints(tmp_path, monkeypatch):
     from pathlib import Path
     from transformers import TrainerCallback
@@ -829,6 +873,42 @@ def test_cce_compacts_finite_supervision_with_one_trace(monkeypatch, quantized):
 
 
 @metal_only
+def test_cce_rotates_hidden_states_into_a_hadamard_packed_head(monkeypatch):
+    pack = pytest.importorskip("mlx_vlm.models.prism_hadamard_qwen35.prism_hadamard_qwen35")
+    from unsloth_zoo.mlx import preference
+    mx.random.seed(611)
+    model = _cce_text_model(2053, 1024, quantized=True)
+    head = pack.HadamardQuantizedLinear(1024, 8192, 512)
+    head.signs = mx.where(mx.random.uniform(shape=(1024,)) < 0.5, -1.0, 1.0)
+    rotated = pack.hadamard_transform(mx.random.normal((8192, 1024)) * 0.05, 512, head.signs)
+    head.weight, scales, biases = mx.quantize(rotated, group_size=128, bits=2)
+    head.scales, head.biases = scales.astype(mx.float16), biases.astype(mx.float16)
+    model.lm_head = head
+    ids = mx.random.randint(0, 2053, (2, 65))
+    lengths = mx.array([[0, 65], [0, 40]], dtype=mx.int32)
+    want = nn.value_and_grad(model, make_baseline_loss_fn())(model, ids, lengths)
+    loss_fn = mlx_utils.make_cce_loss_fn(model)
+    assert loss_fn._unsloth_cce_backend == "runtime-cce"
+    got = nn.value_and_grad(model, loss_fn)(model, ids, lengths)
+    mx.eval(want, got)
+    assert got[0][0].item() == pytest.approx(want[0][0].item(), rel=1e-4)
+    for (_, expected), (_, actual) in zip(tree_flatten(want[1]), tree_flatten(got[1])):
+        assert mx.allclose(expected, actual, atol=1e-5, rtol=1e-3).item()
+    score = preference._make_preference_cce_scorer(model)
+    supervised = mx.arange(64)[None] < lengths[:, 1:] - 1
+    ce, _ = score(model, ids, supervised)
+    logits = model(ids[:, :-1]).astype(mx.float32)
+    dense = nn.losses.cross_entropy(logits, ids[:, 1:], reduction="none")
+    assert mx.allclose(ce, dense * supervised, atol=1e-4, rtol=1e-4).item()
+    model.get_input_embeddings = lambda *args, **kwargs: None
+    monkeypatch.setattr(mlx_utils, "_vlm_cce_forward", lambda m, b, **kwargs: (
+        m.model(b["input_ids"][:, :-1]), b["input_ids"][:, 1:], mx.array(b["input_ids"][:, 1:].size)))
+    vlm_loss = mlx_utils.make_vlm_cce_loss_fn(model)
+    assert vlm_loss._unsloth_cce_backend == "runtime-cce"
+    assert vlm_loss(model, {"input_ids": ids})[0].item() == pytest.approx(dense.mean().item(), rel=1e-4)
+
+
+@metal_only
 @pytest.mark.parametrize("compiled", [False, True])
 @pytest.mark.parametrize("softcap", [0.0, 7.0])
 def test_frozen_dense_cce_preserves_gradients_with_lower_peak(monkeypatch, compiled, softcap):
@@ -884,6 +964,168 @@ def test_frozen_dense_cce_preserves_gradients_with_lower_peak(monkeypatch, compi
         peaks.append(mx.get_peak_memory() - resident)
         del result
     assert peaks[1] < peaks[0]
+
+
+@metal_only
+@pytest.mark.parametrize("quantized", [False, True])
+def test_compiled_update_reuses_parameter_and_moment_buffers(quantized):
+    import gc
+    import weakref
+    from unsloth_zoo.mlx.optimizers_quantized import QuantizedMomentAdamW
+
+    shape = (2048, 8192)
+    leaf = shape[0] * shape[1] * 2
+    results, peaks = [], []
+    for trainer_built in (False, True):
+        mx.random.seed(3)
+        params = {"w": (mx.random.normal(shape) * 0.02).astype(mx.bfloat16)}
+        grads = [(mx.random.normal(shape) * 1e-3).astype(mx.bfloat16) for _ in range(3)]
+        if trainer_built:
+            trainer = MLXTrainer.__new__(MLXTrainer)
+            trainer.args = MLXTrainingConfig(
+                optim="adamw_8bit" if quantized else "adamw", learning_rate=1e-3,
+                lr_scheduler_type="constant", warmup_steps=0, weight_decay=0.0,
+            )
+            opt = trainer._build_optimizer(total_steps=3)
+        else:
+            cls = QuantizedMomentAdamW if quantized else optim.AdamW
+            opt = cls(learning_rate=1e-3, weight_decay=0.0, bias_correction=True)
+        opt.init(params)
+        state = [params, opt.state]
+        step = mx.compile(lambda g: params.update(opt.apply_gradients({"w": g}, params)),
+                          inputs=state, outputs=state)
+        mx.eval(state, grads)
+        for g in grads:
+            gc.collect()
+            mx.synchronize()
+            resident = mx.get_active_memory()
+            mx.reset_peak_memory()
+            step(g)
+            mx.eval(state)
+            mx.synchronize()
+        peaks.append(mx.get_peak_memory() - resident)
+        results.append(tree_flatten(state))
+    for (name, left), (_, right) in zip(*results):
+        assert mx.array_equal(left, right).item(), name
+    assert peaks[0] >= 3 * leaf
+    if quantized:
+        # 8-bit m is repacked either way; only the parameter is donated.
+        assert peaks[1] <= peaks[0] - leaf
+    else:
+        assert peaks[1] < leaf / 8
+    released = weakref.ref(trainer._build_optimizer(total_steps=3))
+    assert released() is None
+
+
+@metal_only
+def test_layer_ordered_update_frees_gradients_during_backward():
+    import gc
+    from unsloth_zoo.mlx.trainer import _async_eval_by_layer, _donate_optimizer_state
+
+    class Net(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Linear(2048, 2048, bias=False)
+            self.layers = [nn.Linear(2048, 2048, bias=False) for _ in range(16)]
+
+        def __call__(self, x):
+            x = self.embed(x)
+            for layer in self.layers:
+                def block(params, x, layer=layer):
+                    layer.update(params)
+                    return x + nn.gelu(layer(x))
+                x = mx.checkpoint(block)(layer.trainable_parameters(), x)
+            return x
+
+    results, peaks = [], []
+    for ordered in (False, True):
+        mx.random.seed(5)
+        model = Net()
+        model.set_dtype(mx.bfloat16)
+        opt = _donate_optimizer_state(optim.AdamW(learning_rate=1e-3, weight_decay=0.0))
+        opt.init(model.trainable_parameters())
+        grad_fn = nn.value_and_grad(model, lambda m, x: m(x).astype(mx.float32).square().mean())
+        state = [model.state, opt.state]
+
+        def step(x):
+            loss, grads = grad_fn(model, x)
+            opt.update(model, grads)
+            return loss
+
+        step = mx.compile(step, inputs=state, outputs=state)
+        xs = [mx.random.normal((4096, 2048)).astype(mx.bfloat16) for _ in range(3)]
+        mx.eval(state, xs)
+        for x in xs:
+            gc.collect()
+            mx.synchronize()
+            resident = mx.get_active_memory()
+            mx.reset_peak_memory()
+            loss = step(x)
+            if ordered:
+                _async_eval_by_layer(model.trainable_parameters(), "layers.")
+            mx.eval(loss, state)
+            mx.synchronize()
+        peaks.append(mx.get_peak_memory() - resident)
+        results.append(tree_flatten(state))
+    for (name, left), (_, right) in zip(*results):
+        assert mx.array_equal(left, right).item(), name
+    layer_grads = 16 * 2048 * 2048 * 2
+    assert peaks[1] <= peaks[0] - 2 * layer_grads
+
+
+@metal_only
+def test_trainer_schedules_the_update_layer_by_layer(monkeypatch, tmp_path):
+    from unsloth_zoo.mlx import trainer as trainer_module
+
+    calls, schedule = [], trainer_module._async_eval_by_layer
+
+    def spy(tree, prefix):
+        if created:  # the first step's state must already be allocated
+            before = mx.get_active_memory()
+            mx.eval(created)
+            unallocated.append(mx.get_active_memory() - before)
+            created.clear()
+        params = tree_flatten(model.trainable_parameters())
+        is_params = all(a is b for (_, a), (_, b) in zip(tree_flatten(tree), params))
+        calls.append((tree, prefix, is_params))
+        schedule(tree, prefix)
+
+    monkeypatch.setattr(trainer_module, "_async_eval_by_layer", spy)
+    in_trace, created, unallocated, build = [], [], [], MLXTrainer._build_optimizer
+
+    def build_spy(self, total_steps):
+        optimizer = build(self, total_steps)
+        init = optimizer.init
+
+        def init_spy(parameters):
+            try:
+                mx.eval(tree_flatten(parameters)[0][1])
+                in_trace.append(False)
+            except ValueError:
+                in_trace.append(True)
+            init(parameters)
+            created.extend(a for _, a in tree_flatten(optimizer.state) if a.size > 1)
+
+        optimizer.init = init_spy
+        return optimizer
+
+    monkeypatch.setattr(MLXTrainer, "_build_optimizer", build_spy)
+    model, tokenizer = FastMLXModel.from_pretrained(
+        str(_tiny_base(tmp_path / "base")), load_in_4bit=False, max_seq_length=64,
+        full_finetuning=True,
+    )
+    MLXTrainer(model=model, tokenizer=tokenizer, train_dataset=_dataset(8), args=MLXTrainingConfig(
+        per_device_train_batch_size=2, gradient_accumulation_steps=2, max_steps=2,
+        output_dir=str(tmp_path / "out"), report_to="none",
+    )).train()
+    # Optimizer state is created before, not inside, the first compiled step.
+    assert in_trace == [False] and unallocated == [0]
+    assert {prefix for _, prefix, _ in calls} == {"model.layers."}
+    # Accumulation substeps schedule the accumulated gradient, update steps the parameters.
+    assert [is_params for _, _, is_params in calls] == [False, True, False, True]
+    trainable = {name for name, _ in tree_flatten(model.trainable_parameters())}
+    for tree, _, _ in calls:
+        assert {name for name, _ in tree_flatten(tree)} == trainable
 
 
 @metal_only
@@ -1533,6 +1775,22 @@ def test_preference_cce_scores_hidden_states_like_the_logits(monkeypatch, head, 
             assert mx.allclose(want, got, atol=2e-5, rtol=rtol).item()
         if reference:
             assert adapter.scale == 2.0
+
+
+@metal_only
+@pytest.mark.parametrize("frozen", [False, True])
+def test_preference_cce_declares_a_frozen_head(monkeypatch, frozen):
+    """A trainable-declared head may compute its weight gradient despite stop_gradient."""
+    from unsloth_zoo.mlx import preference as p, utils
+
+    model = _cce_text_model(2053, 64, quantized=False)
+    if frozen:
+        model.freeze()
+        model.model.unfreeze()
+    seen, build = [], utils._get_runtime_cce
+    monkeypatch.setattr(utils, "_get_runtime_cce", lambda **kw: seen.append(kw) or build(**kw))
+    assert p._make_preference_cce_scorer(model) is not None
+    assert [kw["weight_is_frozen"] for kw in seen] == [frozen]
 
 
 @metal_only
@@ -2388,74 +2646,117 @@ def test_bitlinear_can_feed_a_downstream_head_adapter(targets, attention):
     assert mx.abs(grads["lm_head"]["lora_b"]).max().item() > 0
 
 
+_KV_SHARED_PEAK_SCRIPT = r"""
+import json
+import mlx.core as mx
+import mlx.nn as nn
+from mlx.utils import tree_flatten
+from mlx_vlm.models.gemma4.config import TextConfig
+from mlx_vlm.models.gemma4.language import DecoderLayer, Gemma4TextModel
+from unsloth_zoo.mlx import utils as mlx_utils
+
+seq_len = 512
+mx.random.seed(0)
+ids = mx.random.randint(0, 64, (1, seq_len))
+
+
+def build(num_kv_shared_layers):
+    mx.random.seed(0)
+    model = Gemma4TextModel(TextConfig(
+        hidden_size=64, num_hidden_layers=15, intermediate_size=128,
+        num_attention_heads=8, head_dim=16, global_head_dim=32,
+        vocab_size=64, vocab_size_per_layer_input=64,
+        hidden_size_per_layer_input=8, sliding_window=seq_len // 4,
+        num_kv_shared_layers=num_kv_shared_layers))
+    mx.eval(model.parameters())
+    return model
+
+
+def peak(model, repeats=5):
+    loss_and_grad = nn.value_and_grad(model, lambda m: (m(ids) ** 2).sum())
+    mx.eval(loss_and_grad(model))
+    readings, grads = [], None
+    for _ in range(repeats):
+        grads = None
+        mx.clear_cache()
+        resident = mx.get_active_memory()
+        mx.reset_peak_memory()
+        grads = loss_and_grad(model)[1]
+        mx.eval(grads)
+        readings.append((mx.get_peak_memory() - resident,
+                         sum(g.nbytes for _, g in tree_flatten(grads))))
+    return readings
+
+
+shared, unshared = build(10), build(0)
+mlx_utils._patch_layer_class_for_gc(DecoderLayer)
+print(json.dumps({"unshared": peak(unshared), "shared": peak(shared)}))
+"""
+
+
 @metal_only
 def test_checkpointed_kv_shared_layers_hold_what_unshared_layers_hold():
     """Borrowed K/V's cotangent is consumed by the source layer's backward; left
     to run by that consumer, each borrowing layer keeps its T x T attention
-    cotangents alive until then."""
+    cotangents alive until then.
+
+    The peaks are measured in a fresh interpreter. In this process, after the tests
+    before it, Metal's `get_peak_memory() - get_active_memory()` reads low for whole
+    stretches of a run: on repeated full-file runs the unshared peak read exactly
+    182285696 (pinned) or 183564288 (latest) when right, and 116 MB, 151 MB, 2284
+    bytes or negative when not, sometimes on every one of five repeats. Every flake
+    this test has had was such a low unshared reading (runs 35502075009, 36311394738,
+    36377153200). `mx.synchronize()` and `gc.collect()` do not remove them. No reading
+    was ever above the exact value, so each side is taken as the maximum of its
+    repeats, and a reading below the gradients that repeat produced is not kept.
+    """
+    import subprocess
+    import sys
     from mlx_vlm.models.gemma4.config import TextConfig
     from mlx_vlm.models.gemma4.language import DecoderLayer, Gemma4TextModel
 
+    # Two interpreters: a fresh one can still read low on all five repeats (one run
+    # read unshared 160329148 throughout), and low stretches do not cross processes.
+    readings = {"shared": [], "unshared": []}
+    for _ in range(2):
+        run = subprocess.run(
+            [sys.executable, "-c", _KV_SHARED_PEAK_SCRIPT],
+            capture_output=True, text=True, timeout=900,
+        )
+        assert run.returncode == 0, run.stderr[-4000:]
+        for side, values in json.loads(run.stdout.strip().splitlines()[-1]).items():
+            readings[side] += values
+
+    def ceiling(side):
+        kept = [p for p, produced in readings[side] if p >= produced]
+        assert kept, f"every {side} repeat read a peak below its gradients: {readings[side]}"
+        return max(kept)
+
+    shared_peak, unshared_peak = ceiling("shared"), ceiling("unshared")
+    assert shared_peak < 1.25 * unshared_peak, (shared_peak, unshared_peak, readings)
+
+    # Checkpointing must not change what the shared model computes.
     seq_len = 512
     ids = mx.random.randint(0, 64, (1, seq_len))
-
-    def build(num_kv_shared_layers):
-        mx.random.seed(0)
-        model = Gemma4TextModel(TextConfig(
-            hidden_size=64, num_hidden_layers=15, intermediate_size=128,
-            num_attention_heads=8, head_dim=16, global_head_dim=32,
-            vocab_size=64, vocab_size_per_layer_input=64,
-            hidden_size_per_layer_input=8, sliding_window=seq_len // 4,
-            num_kv_shared_layers=num_kv_shared_layers))
-        mx.eval(model.parameters())
-        return model
-
-    def peak_and_grads(model, repeats = 3):
-        """Peak above resident, taken as the MINIMUM over `repeats` measurements.
-
-        A peak is a maximum over a run, so noise can only push it up: allocator state
-        left by whatever ran before it, a cache the runtime had not reclaimed yet. The
-        floor is the algorithmic requirement, and the floor is what the ratio below is
-        about, so the minimum of a few readings estimates it where a single reading does
-        not. One reading is what made this flake: run 35502075009 on main reported
-        shared 197663512 against unshared 151210728, a ratio of 1.307 over the 1.25
-        bound, and the same commit with the same pins passed on re-run.
-
-        The bound itself is unchanged. This makes the measurement less noisy rather than
-        the claim weaker.
-        """
-        loss_and_grad = nn.value_and_grad(model, lambda m: (m(ids) ** 2).sum())
-        mx.eval(loss_and_grad(model))
-        floor, grads = None, None
-        for _ in range(repeats):
-            # Drop the previous repeat's gradients BEFORE `resident` is sampled. Holding
-            # them would put a tree in `resident` that the assignment below releases
-            # before the measured run, so the subtraction would remove memory that was
-            # not resident during it and the repeat would read low. A floor made of
-            # readings like that is lower than the algorithmic floor, which is the one
-            # direction this must not move in.
-            grads = None
-            mx.clear_cache()
-            resident = mx.get_active_memory()
-            mx.reset_peak_memory()
-            grads = loss_and_grad(model)[1]
-            mx.eval(grads)
-            peak = mx.get_peak_memory() - resident
-            floor = peak if floor is None else min(floor, peak)
-        return floor, grads
-
-    shared, unshared = build(10), build(0)
-    _, reference = peak_and_grads(shared, repeats = 1)
+    mx.random.seed(0)
+    shared = Gemma4TextModel(TextConfig(
+        hidden_size=64, num_hidden_layers=15, intermediate_size=128,
+        num_attention_heads=8, head_dim=16, global_head_dim=32,
+        vocab_size=64, vocab_size_per_layer_input=64,
+        hidden_size_per_layer_input=8, sliding_window=seq_len // 4,
+        num_kv_shared_layers=10))
+    mx.eval(shared.parameters())
+    loss_and_grad = nn.value_and_grad(shared, lambda m: (m(ids) ** 2).sum())
+    reference = loss_and_grad(shared)[1]
+    mx.eval(reference)
     mlx_utils._patch_layer_class_for_gc(DecoderLayer)
     try:
-        unshared_peak, _ = peak_and_grads(unshared)
-        shared_peak, grads = peak_and_grads(shared)
+        grads = loss_and_grad(shared)[1]
+        mx.eval(grads)
     finally:
         mlx_utils._unpatch_layer_class_gc(DecoderLayer)
-    assert shared_peak < 1.25 * unshared_peak, (shared_peak, unshared_peak)
     for (name, got), (_, want) in zip(tree_flatten(grads), tree_flatten(reference)):
         assert mx.allclose(got, want, rtol=1e-5, atol=1e-7).item(), name
-
 
 @metal_only
 def test_checkpointing_keeps_cacheless_kv_shared_gradients():
