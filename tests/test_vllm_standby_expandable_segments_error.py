@@ -101,8 +101,7 @@ _KV_CACHE_OOM = (
 )
 
 _REAL_OOM_ERRORS = (
-    # torch. Captured verbatim from torch 2.9.1+cu128. Note it recommends
-    # expandable segments, so classification must not key off that phrase alone.
+    # torch 2.9.1+cu128, verbatim. It recommends expandable segments itself.
     "CUDA out of memory. Tried to allocate 37252.90 GiB. GPU 0 has a total capacity of "
     "178.35 GiB of which 177.06 GiB is free. Process 597697 has 692.00 MiB memory in use. "
     "Including non-PyTorch memory, this process has 612.00 MiB memory in use. Of the "
@@ -134,9 +133,8 @@ _REAL_OOM_ERRORS = (
     ("PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF", "PYTORCH_ALLOC_CONF"),
 )
 def test_expandable_segments_assertion_is_not_an_oom(env_var):
-    # The bug: this returned True via the bare "alloc" substring (and via
-    # "memory" for the upstream wording), so a config clash was raised as
-    # MemoryError("Your GPU ran out of memory").
+    # The bug: the bare "alloc" substring (and "memory" for the upstream wording)
+    # returned True, so a config clash was raised as MemoryError.
     error = _unsloth_assertion(env_var)
     assert vllm_utils._is_expandable_segments_error(error) is True
     assert vllm_utils._is_out_of_memory_error(error) is False
@@ -167,10 +165,8 @@ def test_unrelated_errors_are_neither(error):
 
 
 def test_torch_oom_hint_about_expandable_segments_is_not_a_config_clash():
-    # torch's genuine OOM text ends with "try setting
-    # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation",
-    # so the config-clash markers must be full phrases, not a bare substring,
-    # or a real OOM would be routed to the configuration message.
+    # torch's genuine OOM text recommends PYTORCH_CUDA_ALLOC_CONF=
+    # expandable_segments:True, so the config-clash markers must be full phrases.
     torch_oom = _REAL_OOM_ERRORS[0]
     assert "expandable_segments:True" in torch_oom
     assert vllm_utils._is_out_of_memory_error(torch_oom) is True
@@ -199,11 +195,9 @@ def test_message_names_the_offending_env_var_on_every_platform(env_var):
     # Never claim the GPU ran out of memory for a config clash.
     assert "ran out of memory" not in message
     assert "NOT an out of memory error" in message
-    # The remedy that actually works must be present, the useless ones absent.
     assert "expandable_segments" in message
     assert "load_in_4bit" not in message
     assert "gpu_memory_utilization=0.6" not in message
-    # Preserve the underlying error for debugging.
     assert "Original error:" in message
     assert "Standby mode is not supported with expandable segments." in message
 
@@ -238,9 +232,8 @@ def test_profiling_race_and_kv_cache_oom_classify_differently():
 
 
 def test_free_memory_marker_still_covers_the_real_startup_shortfall():
-    # Dropping the "free memory" marker is the easy way to stop matching the
-    # profiling race, and it would silently lose this genuine shortfall, whose
-    # text never says "out of memory" (vllm/v1/worker/utils.py request_memory).
+    # Dropping the "free memory" marker would silently lose this genuine shortfall,
+    # whose text never says "out of memory" (vllm/v1/worker/utils.py request_memory).
     shortfall = (
         "Free memory on device (78.68/79.15 GiB) on startup is less than desired GPU memory "
         "utilization (0.9, 71.24 GiB). Decrease GPU memory utilization or reduce GPU memory "
@@ -261,12 +254,10 @@ def test_profiling_race_message_never_offers_the_oom_remedies(standby):
     message = vllm_utils._memory_profiling_race_message(
         _PROFILING_RACE, trials = 3, unsloth_vllm_standby = standby,
     )
-    # Name the actual cause: a shared GPU, and a transient one.
     assert "transient" in message
     assert "sharing this GPU" in message
     assert "NOT an out of memory error" in message
     assert "ran out of memory" not in message
-    # Say it can simply be retried.
     assert "Load the model again" in message
     assert "Unsloth already tried loading 3 times." in message
     # None of the three OOM remedies may be *offered*. Scope this to the list of
@@ -275,15 +266,13 @@ def test_profiling_race_message_never_offers_the_oom_remedies(standby):
     for useless in ("load_in_4bit", "smaller model", "4bit", "Lower gpu_memory_utilization"):
         assert useless not in remedies
     assert "gpu_memory_utilization" not in remedies
-    # Preserve the underlying error for debugging.
     assert "Original error:" in message
     assert _PROFILING_RACE in message
 
 
 def test_profiling_race_message_explains_why_standby_cannot_retry_in_process():
-    # Standby keeps weights in CuMemAllocator, a process wide singleton, and
-    # Unsloth runs the engine in-process (VLLM_ENABLE_V1_MULTIPROCESSING=0), so
-    # the retry has to be a fresh process. Say so instead of staying silent.
+    # CuMemAllocator is a process wide singleton and Unsloth runs the engine
+    # in-process (VLLM_ENABLE_V1_MULTIPROCESSING=0), so a retry needs a new process.
     standby = vllm_utils._memory_profiling_race_message(
         _PROFILING_RACE, trials = 1, unsloth_vllm_standby = True,
     )
@@ -299,26 +288,22 @@ def test_profiling_race_message_explains_why_standby_cannot_retry_in_process():
 
 def test_load_vllm_retries_a_profiling_race_without_shrinking_anything():
     # The generic branch below reacts to "memory" by scaling gpu_memory_utilization
-    # by 0.85 and max_num_seqs by 0.75 for the rest of the run. Nothing about
-    # either caused a profiling race, so the retry must be of the identical load.
+    # by 0.85 and max_num_seqs by 0.75, neither of which caused a profiling race.
     source = inspect.getsource(vllm_utils.load_vllm)
     race_at = source.index("_is_memory_profiling_race_error(error)")
     standby_at = source.index("if trials >= 2 or unsloth_vllm_standby:")
     shrink_at = source.index('engine_args["gpu_memory_utilization"] *= 0.85')
-    # Checked before the standby short-circuit, which would otherwise give up
-    # after a single attempt on a transient fault.
+    # Checked before the standby short-circuit, which gives up after a single
+    # attempt on a transient fault.
     assert race_at < standby_at < shrink_at
-    # And it retries rather than falling through to the shrink.
     assert "continue" in source[race_at:standby_at]
     assert "_MEMORY_PROFILING_RACE_MAX_TRIALS" in source[race_at:standby_at]
     assert vllm_utils._MEMORY_PROFILING_RACE_MAX_TRIALS >= 2
 
 
 def test_profiling_race_retries_do_not_spend_the_generic_retry_budget():
-    # A race is counted on its own `race_trials`. If it shared `trials` with the
-    # generic handler, a race on the first attempt followed by a genuine OOM on
-    # the second would hit `trials >= 2` and raise, skipping the shrink-and-retry
-    # that a first-attempt OOM gets today.
+    # A race is counted on its own `race_trials`. Sharing `trials` would make a race
+    # then a real OOM hit `trials >= 2` and raise, skipping the shrink-and-retry.
     source = inspect.getsource(vllm_utils.load_vllm)
     race_at = source.index("_is_memory_profiling_race_error(error)")
     bump_at = source.index("            trials += 1")
@@ -326,16 +311,14 @@ def test_profiling_race_retries_do_not_spend_the_generic_retry_budget():
     # The generic counter is bumped only after the race branch has passed on it.
     assert race_at < bump_at < standby_at
     assert source.count("            trials += 1") == 1
-    # The race branch uses its own counter, never the generic one.
     race_branch = source[race_at:bump_at]
     assert "race_trials += 1" in race_branch
     assert "trials <" not in race_branch.replace("race_trials <", "")
 
 
 def test_load_vllm_retry_handler_is_wired_to_the_precise_classifiers():
-    # Guards the raise site itself: the loose substring test must be gone, the
-    # config clash must be checked before the MemoryError, and the OOM branch
-    # must keep `Original error:`.
+    # Guards the raise site: the loose substring test must be gone, the config clash
+    # checked before the MemoryError, and the OOM branch keeps `Original error:`.
     source = inspect.getsource(vllm_utils.load_vllm)
     assert '"alloc" in error.lower()' not in source
     assert not re.search(r'\(\s*"memory" in error\.lower\(\)', source)

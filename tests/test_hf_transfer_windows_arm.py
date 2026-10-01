@@ -81,7 +81,9 @@ def _fake_ctypes(*, native_machine = None, call_fails = False, api_absent = Fals
     return mod
 
 
-def _resolve(*, platform_name, machine, environ, offline = False, ctypes_module = None):
+def _resolve(
+    *, platform_name, machine, environ, offline = False, ctypes_module = None, hf_transfer_installed = True,
+):
     """Execute the three statements against a fake platform and return the env."""
     detect, assign, enable = _statements()
     env = dict(environ)
@@ -90,6 +92,7 @@ def _resolve(*, platform_name, machine, environ, offline = False, ctypes_module 
         "platform": types.SimpleNamespace(machine = lambda: machine),
         "os": types.SimpleNamespace(environ = env),
         "_offline_env": offline,
+        "_hf_transfer_installed": hf_transfer_installed,
     }
     body = [detect, assign, enable]
     code = compile(ast.Module(body = body, type_ignores = []), _INIT, "exec")
@@ -248,10 +251,8 @@ class TestWiring:
         assert "_offline_env" in ast.dump(enable.test)
 
     def test_no_later_statement_re_enables_the_variable(self):
-        # Executing two statements in isolation says nothing about the other few
-        # hundred. Without this, appending one os.environ[...] = "1" anywhere
-        # below leaves all of the above green while Windows on ARM is broken
-        # again: a test that passes for the wrong reason.
+        # Without this, appending one os.environ[...] = "1" anywhere below leaves
+        # every test above green while Windows on ARM is broken again.
         detect, assign, enable = _statements()
         for node in _TREE.body:
             if node in (detect, assign, enable):
@@ -265,3 +266,39 @@ class TestWiring:
         # happily execute an assignment that really sits below its use.
         detect, assign, enable = _statements()
         assert detect.lineno < assign.lineno < enable.lineno
+
+
+class TestHfTransferNotInstalled:
+    """huggingface_hub < 1.0 refuses every download when the flag is on and the package is
+    missing, which is what failed tests/test_gemma3_processor_token_type_ids.py on the
+    transformers 4.57.6 leg. Leaving the flag off keeps the plain download path working."""
+
+    def test_missing_hf_transfer_leaves_the_flag_off(self):
+        env = _resolve(platform_name = "linux", machine = "x86_64", environ = {}, hf_transfer_installed = False)
+        assert "HF_HUB_ENABLE_HF_TRANSFER" not in env
+
+    def test_installed_hf_transfer_still_turns_it_on(self):
+        env = _resolve(platform_name = "linux", machine = "x86_64", environ = {})
+        assert env.get("HF_HUB_ENABLE_HF_TRANSFER") == "1"
+
+
+def _probe():
+    """``_hf_transfer_importable`` from __init__.py, run against the real importlib."""
+    import importlib.util
+
+    node = next(
+        n for n in _TREE.body if isinstance(n, ast.FunctionDef) and n.name == "_hf_transfer_importable"
+    )
+    namespace = {"_importlib_util": importlib.util}
+    exec(compile(ast.Module(body = [node], type_ignores = []), _INIT, "exec"), namespace)
+    return namespace["_hf_transfer_importable"]
+
+
+def test_a_spec_less_hf_transfer_stub_reads_as_not_installed(monkeypatch):
+    # find_spec raises ValueError for a sys.modules entry whose __spec__ is None; importing
+    # unsloth_zoo must not fail on a stub a harness put there.
+    stub = types.ModuleType("hf_transfer")
+    stub.__spec__ = None
+    monkeypatch.setitem(sys.modules, "hf_transfer", stub)
+    assert _probe()() is False
+

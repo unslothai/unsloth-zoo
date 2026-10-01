@@ -357,7 +357,6 @@ def check_loss(_repo):
                 {"type": "audio", "audio": clip},
                 {"type": "text", "text": "Transcribe."}]},
                 {"role": "assistant", "content": "ok"}]
-            # Collate on the host, then finalize to MLX, as the trainer does.
             staged = _collate_vlm_batch(
                 [{"messages": messages}], processor, 512, None)
             batch = _finalize_vlm_batch(staged)
@@ -403,7 +402,6 @@ def main():
           f"transformers {transformers.__version__}, {args.model} ===",
           flush=True)
 
-    # Open the gate for whatever is installed: the question is what is behind it.
     from unsloth_zoo.mlx import utils as U
     U._AUDIO_QUALIFIED_FAMILIES = dict(
         U._AUDIO_QUALIFIED_FAMILIES,
@@ -411,8 +409,6 @@ def main():
     )
     U._AUDIO_MIN_TRANSFORMERS = {}
 
-    # Stage 0 never gates. Later stages need zoo's load, so they skip rather
-    # than error when it fails.
     path = resolve(args.model)
     load_upstream(path)
     ok_zoo = load_via_zoo(path)

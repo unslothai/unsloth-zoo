@@ -38,7 +38,9 @@
 
 import os
 import ast
+import functools
 import inspect
+import importlib
 import linecache
 import sys
 import torch
@@ -263,13 +265,23 @@ pass
 TEMPORARY_PATCHES.append(patch_Gemma4PLEInputDtype)
 
 
+def _gemma4_text_variants(class_suffix = None):
+    # Unified decoder has no PLE, so the PLE patch stays separate.
+    for name, prefix in (("gemma4", "Gemma4"), ("gemma4_unified", "Gemma4Unified")):
+        try:
+            module = importlib.import_module(f"transformers.models.{name}.modeling_{name}")
+            if class_suffix is not None:
+                getattr(module, prefix + class_suffix)
+        except ImportError:
+            continue
+        except Exception as e:
+            raise_error(f"{prefix} forced-float32 patches", e)
+            continue
+        yield module, prefix
+
+
 def patch_Gemma4TextScaledWordEmbedding():
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
-    try:
-        import transformers.models.gemma4.modeling_gemma4
-        transformers.models.gemma4.modeling_gemma4.Gemma4TextScaledWordEmbedding
-    except Exception as e:
-        return raise_error("Gemma4TextScaledWordEmbedding.forward", e)
 
     def forward(self, input_ids: torch.Tensor):
         input_embeds = torch.nn.functional.embedding(
@@ -280,7 +292,8 @@ def patch_Gemma4TextScaledWordEmbedding():
         # float32 residual stream (embed_scale ~ sqrt(hidden_size))
         return input_embeds.to(torch.float32) * self.embed_scale.to(torch.float32)
     pass
-    patch_function(transformers.models.gemma4.modeling_gemma4.Gemma4TextScaledWordEmbedding, "forward", forward, fullgraph = True)
+    for module, prefix in _gemma4_text_variants("TextScaledWordEmbedding"):
+        patch_function(getattr(module, prefix + "TextScaledWordEmbedding"), "forward", forward, fullgraph = True)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma4TextScaledWordEmbedding)
 
@@ -318,19 +331,6 @@ _gemma4_rms_norm_unscaled = compile_with_eager_fallback(_gemma4_rms_norm_unscale
 
 def patch_Gemma4RMSNorm():
     if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
-    try:
-        import transformers.models.gemma4.modeling_gemma4
-        transformers.models.gemma4.modeling_gemma4.Gemma4RMSNorm
-    except Exception as e:
-        return raise_error("Gemma4RMSNorm.forward", e)
-
-    publish_to_modeling_module(
-        transformers.models.gemma4.modeling_gemma4,
-        flatten_for_elementwise_norm  = flatten_for_elementwise_norm,
-        unwrap_norm_weight            = unwrap_norm_weight,
-        _gemma4_rms_norm_scaled       = _gemma4_rms_norm_scaled,
-        _gemma4_rms_norm_unscaled     = _gemma4_rms_norm_unscaled,
-    )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor: # fp32 (residual) or fp16 (sub-layer)
         # Gemma4 scales by `weight` directly (no 1.0 + weight) and only when
@@ -347,19 +347,22 @@ def patch_Gemma4RMSNorm():
     # No `fullgraph`: the kernels are the compiled units; compiling this wrapper too
     # would put `self` back into the guards. Dynamo inlines it anyway when a caller is
     # compiled.
-    patch_function(transformers.models.gemma4.modeling_gemma4.Gemma4RMSNorm, "forward", forward, match_level = "relaxed")
+    for module, prefix in _gemma4_text_variants("RMSNorm"):
+        publish_to_modeling_module(
+            module,
+            flatten_for_elementwise_norm = flatten_for_elementwise_norm,
+            unwrap_norm_weight = unwrap_norm_weight,
+            _gemma4_rms_norm_scaled = _gemma4_rms_norm_scaled,
+            _gemma4_rms_norm_unscaled = _gemma4_rms_norm_unscaled,
+        )
+        patch_function(getattr(module, prefix + "RMSNorm"), "forward", forward, match_level = "relaxed")
 pass
 TEMPORARY_PATCHES.append(patch_Gemma4RMSNorm)
 
 
-def patch_Gemma4TextAttention():
-    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
-    try:
-        import transformers.models.gemma4.modeling_gemma4
-        transformers.models.gemma4.modeling_gemma4.Gemma4TextAttention
-        from transformers.models.gemma4.modeling_gemma4 import apply_rotary_pos_emb, ALL_ATTENTION_FUNCTIONS
-    except Exception as e:
-        return raise_error("Gemma4TextAttention.forward", e)
+def _patch_gemma4_text_attention(module, prefix):
+    apply_rotary_pos_emb = module.apply_rotary_pos_emb
+    ALL_ATTENTION_FUNCTIONS = module.ALL_ATTENTION_FUNCTIONS
     scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
     scaled_dot_product_attention = torch.compiler.disable(scaled_dot_product_attention, recursive = True)
 
@@ -499,6 +502,49 @@ def patch_Gemma4TextAttention():
     # force = True: gemma4.py's shared-KV carrier already wrapped forward as
     # (self, *args, **kwargs); a signature check would reject this replacement (capturing
     # the carrier's q/k-fp32-vs-v-fp16 SDPA mismatch). Carrier handled inline above, so safe.
-    patch_function(transformers.models.gemma4.modeling_gemma4.Gemma4TextAttention, "forward", forward, force = True, match_level = "relaxed")
+    patch_function(getattr(module, prefix + "TextAttention"), "forward", forward, force = True, match_level = "relaxed")
+pass
+
+
+def patch_Gemma4TextAttention():
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0": return
+    for module, prefix in _gemma4_text_variants("TextAttention"):
+        _patch_gemma4_text_attention(module, prefix)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma4TextAttention)
+
+
+def patch_Gemma4UnifiedVisionEmbedder():
+    if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") != "1": return
+    try:
+        module = importlib.import_module("transformers.models.gemma4_unified.modeling_gemma4_unified")
+        cls = module.Gemma4UnifiedVisionEmbedder
+    except ImportError:
+        return
+    if getattr(cls, "_unsloth_vision_fp32_patched", False): return
+    original_init = cls.__init__
+    original_forward = cls.forward
+
+    # wraps: the compiler reads inspect.getsource(cls.forward); keep it seeing upstream's.
+    @functools.wraps(original_init)
+    def __init__(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        self._unsloth_vision_fp32 = os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "1"
+        if self._unsloth_vision_fp32:
+            # OCR patches overflow fp16 before patch_ln2 normalizes them; keep this block fp32.
+            for name in ("patch_ln1", "patch_dense", "patch_ln2", "pos_norm"):
+                getattr(self, name)._pre_set_compute_dtype = torch.float32
+
+    # *args/**kwargs: newer transformers added `return_dict` to this forward.
+    @functools.wraps(original_forward)
+    def forward(self, pixel_values, *args, **kwargs):
+        if not getattr(self, "_unsloth_vision_fp32", False):
+            return original_forward(self, pixel_values, *args, **kwargs)
+        with torch.autocast(device_type = pixel_values.device.type, enabled = False):
+            return original_forward(self, pixel_values, *args, **kwargs)
+
+    cls.__init__ = __init__
+    cls.forward = forward
+    cls._unsloth_vision_fp32_patched = True
+pass
+TEMPORARY_PATCHES.append(patch_Gemma4UnifiedVisionEmbedder)

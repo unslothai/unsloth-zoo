@@ -397,6 +397,39 @@ def test_no_signature_is_taken_when_no_backward_can_run(unsupported):
         M._routing_signature = real
 
 
+def _live_tensor_count():
+    """Live tensors in the process, without tripping over somebody else's dead weakref.
+
+    ``gc.get_objects()`` returns every tracked object in the PROCESS, which includes dead
+    ``weakref.proxy`` objects other test modules leave behind; PEFT's parametrization makes
+    them. ``torch.is_tensor(o)`` is ``isinstance(o, torch.Tensor)``, and isinstance on a
+    dead weakproxy RAISES ``ReferenceError`` rather than answering False, so the walk died
+    with "weakly-referenced object no longer exists" -- a message about a weakref, raised
+    from a test about tensor retention, in a file that never creates one.
+
+    Reproduced deterministically rather than guessed: make a ``weakref.proxy``, drop its
+    referent, collect, then walk ``gc.get_objects()`` calling ``torch.is_tensor``. A single
+    dead proxy anywhere in the process is enough. That is why this only ever failed under
+    xdist, where other modules share the worker, and never when the file ran alone.
+
+    test_moe_fused_lora_merge_layout.py already clears its own proxies for this reason, and
+    that is worth keeping. It cannot be the whole answer though: it asks every producer to
+    remember, and any test in any file may leave one behind. So the consumer is made safe
+    too. Skipping the unreadable object is right -- a dead weakproxy is not a live tensor,
+    which is the only thing being counted.
+    """
+    import gc
+
+    total = 0
+    for obj in gc.get_objects():
+        try:
+            if torch.is_tensor(obj):
+                total += 1
+        except ReferenceError:
+            continue
+    return total
+
+
 def test_no_grad_decoding_retains_nothing(unsupported):
     """The stash that was here held a strong reference to each `weight`, and the PEFT
     extraction path hands over a FRESH contiguous tensor per call, so a long generation
@@ -404,13 +437,40 @@ def test_no_grad_decoding_retains_nothing(unsupported):
     import gc
 
     inputs, _, offsets = _case()
-    before = sum(1 for o in gc.get_objects() if torch.is_tensor(o))
+    before = _live_tensor_count()
     with torch.no_grad():
         for _ in range(50):
             M._grouped_mm_with_backward_fix(inputs, torch.randn(3, 8, 6), offsets)
     gc.collect()
-    after = sum(1 for o in gc.get_objects() if torch.is_tensor(o))
+    after = _live_tensor_count()
     assert after - before < 20, f"grad-off calls retained {after - before} tensors"
+
+
+def test_the_live_tensor_walk_survives_a_dead_weakproxy():
+    """The regression that sent Core zoo red, pinned so it cannot come back.
+
+    Without the guard this raises ReferenceError instead of counting, and it does so only
+    when some other module in the same worker has left a dead proxy around, which is the
+    hardest kind of failure to attribute: the traceback names neither the test that made
+    the proxy nor anything this file does.
+    """
+    import gc
+    import weakref
+
+    class _Referent:
+        pass
+
+    referent = _Referent()
+    proxy = weakref.proxy(referent)
+    del referent
+    gc.collect()
+
+    # The proxy is dead but still reachable, exactly as it is in a shared xdist worker.
+    with pytest.raises(ReferenceError):
+        isinstance(proxy, torch.Tensor)
+
+    count = _live_tensor_count()
+    assert isinstance(count, int) and count >= 0
 
 
 def test_the_signature_carries_a_term_the_projections_cannot_reach(unsupported):
@@ -464,9 +524,6 @@ def test_the_norm_does_not_materialize_fp32_copies(unsupported):
     body = inspect.getsource(M._routing_signature)
     assert "vector_norm" in body
     assert "inputs.float() * inputs.float()" not in body
-
-
-# --- the fallback's own cost -------------------------------------------------
 
 
 def _backward_matmul_out_usage(out, seed):
@@ -587,3 +644,97 @@ def test_an_ordinary_backward_still_writes_in_place(unsupported):
     assert torch.is_grad_enabled()          # the caller's mode is irrelevant
     seen = _backward_matmul_out_usage(out, torch.ones_like(out))
     assert seen and all(seen), seen
+
+
+def _stub_triton_language(monkeypatch, has_make_tensor_descriptor):
+    import sys, types
+    triton = types.ModuleType("triton")
+    language = types.ModuleType("triton.language")
+    if has_make_tensor_descriptor:
+        language.make_tensor_descriptor = lambda *a, **kw: None
+    else:
+        language._experimental_make_tensor_descriptor = lambda *a, **kw: None
+    triton.language = language
+    monkeypatch.setitem(sys.modules, "triton", triton)
+    monkeypatch.setitem(sys.modules, "triton.language", language)
+
+
+def test_the_triton_backend_is_not_offered_without_make_tensor_descriptor(monkeypatch):
+    import sys, types
+    for name in (
+        "unsloth", "unsloth.kernels", "unsloth.kernels.moe",
+        "unsloth.kernels.moe.grouped_gemm", "unsloth.kernels.moe.grouped_gemm.interface",
+    ):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    interface = sys.modules["unsloth.kernels.moe.grouped_gemm.interface"]
+    interface.grouped_gemm = lambda *a, **kw: None
+    interface.supports_tma = lambda *a, **kw: False
+    monkeypatch.setattr(M, "_init_triton_allocator", lambda *a, **kw: None, raising = False)
+    monkeypatch.setattr(M.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(M, "is_mlx_available", lambda: False)
+    monkeypatch.delenv("UNSLOTH_DISABLE_MOE_TRITON", raising = False)
+
+    _stub_triton_language(monkeypatch, has_make_tensor_descriptor = False)
+    monkeypatch.setattr(M, "_GROUPED_GEMM_AVAILABLE", None, raising = False)
+    assert M._check_grouped_gemm_available() is False
+
+    _stub_triton_language(monkeypatch, has_make_tensor_descriptor = True)
+    monkeypatch.setattr(M, "_GROUPED_GEMM_AVAILABLE", None, raising = False)
+    assert M._check_grouped_gemm_available() is True
+    monkeypatch.setattr(M, "_GROUPED_GEMM_AVAILABLE", None, raising = False)
+
+
+def test_the_triton_backend_is_not_offered_without_a_cuda_device(monkeypatch):
+    """A box without CUDA must not be told the Triton grouped GEMM is available.
+
+    `_check_grouped_gemm_available` answered purely on whether
+    `unsloth.kernels.moe.grouped_gemm.interface` imports, but the kernel opens with
+    `assert X.device.type == "cuda"`. So on a CPU machine that happens to have unsloth
+    installed the probe said yes, `select_moe_backend` chose "unsloth_triton", and the
+    first expert forward died on "X and W must be on CUDA" rather than taking the
+    native loop. Importable is not usable; the sibling probe
+    `_check_torch_grouped_mm_supported` already refuses without an accelerator.
+
+    The kernel import is STUBBED to succeed. Without that this test passes on any host
+    that cannot import unsloth at all, which is most CI boxes and was how the first
+    version of it passed with the guard deleted: the ImportError arm returned False and
+    nothing about the device was ever exercised.
+    """
+    import sys, types
+
+    for name in (
+        "unsloth", "unsloth.kernels", "unsloth.kernels.moe",
+        "unsloth.kernels.moe.grouped_gemm", "unsloth.kernels.moe.grouped_gemm.interface",
+    ):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    interface = sys.modules["unsloth.kernels.moe.grouped_gemm.interface"]
+    interface.grouped_gemm = lambda *a, **kw: None
+    interface.supports_tma = lambda *a, **kw: False
+    monkeypatch.setattr(M, "_init_triton_allocator", lambda *a, **kw: None, raising = False)
+    _stub_triton_language(monkeypatch, has_make_tensor_descriptor = True)
+    monkeypatch.setattr(M, "is_mlx_available", lambda: False)
+
+    monkeypatch.setattr(M, "_GROUPED_GEMM_AVAILABLE", None, raising = False)
+    monkeypatch.delenv("UNSLOTH_DISABLE_MOE_TRITON", raising = False)
+
+    # The stub really is importable, so a False below is about the device and nothing else.
+    monkeypatch.setattr(M.torch.cuda, "is_available", lambda: True)
+    assert M._check_grouped_gemm_available() is True
+
+    monkeypatch.setattr(M.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(M, "_GROUPED_GEMM_AVAILABLE", None, raising = False)
+    assert M._check_grouped_gemm_available() is False
+
+    # And the selector then has to land somewhere that runs on this device.
+    # select_moe_backend is lru_cached: read it cold, or this asserts on whatever an
+    # earlier test selected, and clear it on the way out, or the "native_torch" it
+    # computes under these patches outlives them and every later test in the process
+    # skips the GPU backends.
+    monkeypatch.setattr(M, "_TORCH_GROUPED_MM_SUPPORTED", False, raising = False)
+    monkeypatch.setattr(M, "_GROUPED_GEMM_AVAILABLE", None, raising = False)
+    monkeypatch.delenv("UNSLOTH_MOE_BACKEND", raising = False)
+    M.select_moe_backend.cache_clear()
+    try:
+        assert M.select_moe_backend() == "native_torch"
+    finally:
+        M.select_moe_backend.cache_clear()

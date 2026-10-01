@@ -18,7 +18,7 @@
 # is a TypeError on the 3.9 floor pyproject declares.
 from __future__ import annotations
 
-__version__ = "2026.8.13"
+__version__ = "2026.9.8"
 
 import os
 import platform
@@ -67,11 +67,28 @@ def _detect_windows_on_arm() -> bool:
 
 _windows_on_arm = _detect_windows_on_arm()
 
+# Only when hf_transfer is importable: huggingface_hub < 1.0 honours the flag and refuses every
+# download ("'hf_transfer' package is not available") when it is not, as after a --no-deps install.
+import importlib.util as _importlib_util
+
+
+def _hf_transfer_importable() -> bool:
+    try:
+        return _importlib_util.find_spec("hf_transfer") is not None
+    except (ImportError, ValueError):
+        # A stub placed in sys.modules without a __spec__ makes find_spec raise; importing
+        # unsloth_zoo must not fail on it, and a stub is not the real downloader.
+        return False
+
+
+_hf_transfer_installed = _hf_transfer_importable()
+
 # Hugging Face Hub faster downloads (skipped when offline mode is requested).
 if (
     "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ
     and not _offline_env
     and not _windows_on_arm
+    and _hf_transfer_installed
 ):
     os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
@@ -178,6 +195,13 @@ else:
     # The HF cache redirect above still runs, so the child shares the parent's cache.
     _SKIP_GPU_INIT = os.environ.get("UNSLOTH_ZOO_DISABLE_GPU_INIT", "0") == "1"
     del _is_mlx_only, is_mlx_available
+    if _SKIP_GPU_INIT:
+        # `compiler.py` does `from . import DEVICE_TYPE` at module scope, so the
+        # constants must still exist when the init that sets them is skipped.
+        DEVICE_TYPE = "cpu"
+        DEVICE_TYPE_TORCH = "cpu"
+        DEVICE_COUNT = 0
+        ALLOW_PREQUANTIZED_MODELS = False
 
 # Stub the CUDA-only imports whenever GPU init is skipped (MLX host or the opt-in
 # download child), so they resolve to a loud no-op instead of a hard ImportError. On a
@@ -274,8 +298,15 @@ if not _SKIP_GPU_INIT:
     # expandable_segments is unsupported on Windows/WSL.
     IS_WSL_OR_WINDOWS = bool(os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP")) or os.name == "nt"
 
+    # Nor on an NVIDIA Tegra board, where the CUDA VMM calls it is built on fail: a 1MiB
+    # buffer dies with `RuntimeError: CUDA driver error: out of memory` on a board with 50GB
+    # free (unslothai/unsloth#2401). Detection is filesystem only because this runs before
+    # torch is imported; see unsloth_zoo/integrated_device.py.
+    from .integrated_device import expandable_segments_unsupported
+    EXPANDABLE_SEGMENTS_UNSUPPORTED = expandable_segments_unsupported()
+
     # Reduce VRAM fragmentation and optimize memory pinning
-    if os.environ.get("UNSLOTH_VLLM_STANDBY", "0") == "0":
+    if os.environ.get("UNSLOTH_VLLM_STANDBY", "0") == "0" and not EXPANDABLE_SEGMENTS_UNSUPPORTED:
         if IS_TORCH_2_10_OR_NEWER:
             if "PYTORCH_ALLOC_CONF" not in os.environ:
                 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
@@ -350,6 +381,14 @@ if not _SKIP_GPU_INIT:
         remove_expandable_segments("PYTORCH_HIP_ALLOC_CONF")
         remove_expandable_segments("PYTORCH_ALLOC_CONF")
 
+    # IMPORTANT: same ordering rule as the ROCm cleanup below. Adds nothing back, unlike the
+    # WSL branch: a unified-memory board has no separate VRAM pool to defragment, and rounding
+    # every block up would waste the system RAM the model is competing for.
+    if EXPANDABLE_SEGMENTS_UNSUPPORTED:
+        remove_expandable_segments("PYTORCH_CUDA_ALLOC_CONF")
+        remove_expandable_segments("PYTORCH_HIP_ALLOC_CONF")
+        remove_expandable_segments("PYTORCH_ALLOC_CONF")
+
     # IMPORTANT: run ROCm cleanup before importing device_type (which imports torch).
     # HIP allocator settings can be read during torch initialization.
     if IS_TORCH_ROCM_BUILD:
@@ -390,8 +429,12 @@ if not _SKIP_GPU_INIT:
             promoted = _ORIGINAL_PYTORCH_CUDA_ALLOC_CONF
             if promoted is None:
                 promoted = _ORIGINAL_PYTORCH_HIP_ALLOC_CONF
-            # Keep standby + ROCm protections when promoting legacy values.
-            if os.environ.get("UNSLOTH_VLLM_STANDBY", "0") == "1" or IS_TORCH_ROCM_BUILD:
+            # Keep standby + ROCm + Tegra protections when promoting legacy values.
+            if (
+                os.environ.get("UNSLOTH_VLLM_STANDBY", "0") == "1"
+                or IS_TORCH_ROCM_BUILD
+                or EXPANDABLE_SEGMENTS_UNSUPPORTED
+            ):
                 promoted = clean_expandable_segments_value(promoted)
             if promoted is not None:
                 os.environ["PYTORCH_ALLOC_CONF"] = promoted
@@ -496,6 +539,7 @@ if not _SKIP_GPU_INIT:
         del _torch, _rocm_arch, _sys, _user_blas, _user_wants_lt
     del remove_expandable_segments, delete_key, IS_HIP_RUNTIME, IS_TORCH_2_10_OR_NEWER, IS_WSL_OR_WINDOWS, IS_TORCH_ROCM_BUILD, major_torch, minor_torch, torch_version, torch_version_raw, importlib_version, find_spec
     del clean_expandable_segments_value
+    del expandable_segments_unsupported, EXPANDABLE_SEGMENTS_UNSUPPORTED
     del _ORIGINAL_PYTORCH_CUDA_ALLOC_CONF, _ORIGINAL_PYTORCH_HIP_ALLOC_CONF, _HAS_ORIGINAL_PYTORCH_ALLOC_CONF
 
     if not ("UNSLOTH_IS_PRESENT" in os.environ):
@@ -543,3 +587,33 @@ if not _SKIP_GPU_INIT:
         pass
 
     del os, warnings, re
+
+
+# Device constants under UNSLOTH_ZOO_DISABLE_GPU_INIT. The MLX branch sets these
+# four eagerly and the normal path imports them from `.device_type`; the skip
+# branch did neither, so `from . import DEVICE_TYPE` (compiler.py) raised.
+#
+# Lazy, not a top-level import: `.device_type` costs ~1.4s and pulls in torch,
+# and the download-only child the flag exists for never reads a constant.
+#
+# PEP 562: __getattr__ runs only when normal lookup fails, so the MLX and normal
+# paths, where all four are real globals, are unaffected.
+#
+# No "cpu" fallback: compiler.py has cuda/hip/xpu arms only, so "cpu" would fall
+# through all three. Driverless hosts opt in with UNSLOTH_ALLOW_CPU=1, which
+# `get_device_type` honours by returning the "cuda" sentinel.
+_LAZY_DEVICE_CONSTANTS = frozenset((
+    "DEVICE_TYPE",
+    "DEVICE_TYPE_TORCH",
+    "DEVICE_COUNT",
+    "ALLOW_PREQUANTIZED_MODELS",
+))
+
+
+def __getattr__(name):
+    if name not in _LAZY_DEVICE_CONSTANTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from . import device_type as _device_type
+    value = getattr(_device_type, name)
+    globals()[name] = value # resolve once; later lookups skip __getattr__
+    return value

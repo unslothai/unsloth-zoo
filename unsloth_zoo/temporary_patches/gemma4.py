@@ -15,12 +15,13 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import ast
+import contextlib
 import inspect
 import linecache
 import sys
 
 import torch
-from .common import TEMPORARY_PATCHES, logger
+from .common import TEMPORARY_PATCHES, logger, torch_compile
 from .utils import raise_error, patch_function
 
 
@@ -73,16 +74,20 @@ class _Gemma4KVSharedSafeProxy:
     # would drop the field from serialization. #6089
 
     def __init__(self, real):
-        object.__setattr__(self, "_real", real)
+        self._real = real
 
     def __getattr__(self, name):
         # Only invoked when normal attribute lookup fails.
+        if name == "_real":
+            # Unset slot (copy/pickle skip __init__): raise, don't recurse. Lets
+            # methods use plain self._real; object.__getattribute__ breaks Dynamo graphs.
+            raise AttributeError(name)
         if name == "num_kv_shared_layers":
             raise AttributeError(
                 "num_kv_shared_layers is 0 (no KV sharing) -- hidden from "
                 "the cache constructor to avoid layer_types[:-0] == [] bug"
             )
-        return getattr(object.__getattribute__(self, "_real"), name)
+        return getattr(self._real, name)
 
     def get_text_config(self, decoder=None, encoder=None):
         # Return self so recursive get_text_config calls don't unwrap the proxy.
@@ -93,7 +98,7 @@ class _Gemma4KVSharedSafeProxy:
         # Hide num_kv_shared_layers, like __getattr__/__contains__/__getitem__:
         # validate_token_ids does `for n in cfg: getattr(cfg, n)`, so yielding it
         # would re-raise the AttributeError from __getattr__. See unslothai/unsloth#6089.
-        for name in object.__getattribute__(self, "_real"):
+        for name in self._real:
             if name == "num_kv_shared_layers":
                 continue
             yield name
@@ -105,7 +110,7 @@ class _Gemma4KVSharedSafeProxy:
     def __contains__(self, item):
         if item == "num_kv_shared_layers":
             return False
-        real = object.__getattribute__(self, "_real")
+        real = self._real
         try:
             return item in real
         except TypeError:
@@ -114,7 +119,7 @@ class _Gemma4KVSharedSafeProxy:
     def __getitem__(self, key):
         if key == "num_kv_shared_layers":
             raise KeyError(key)
-        real = object.__getattribute__(self, "_real")
+        real = self._real
         try:
             return real[key]
         except TypeError:
@@ -122,20 +127,20 @@ class _Gemma4KVSharedSafeProxy:
 
     def __eq__(self, other):
         if isinstance(other, _Gemma4KVSharedSafeProxy):
-            other = object.__getattribute__(other, "_real")
-        return object.__getattribute__(self, "_real") == other
+            other = other._real
+        return self._real == other
 
     def __hash__(self):
         try:
-            return hash(object.__getattribute__(self, "_real"))
+            return hash(self._real)
         except TypeError:
             return id(self)
 
     def __bool__(self):
-        return bool(object.__getattribute__(self, "_real"))
+        return bool(self._real)
 
     def __repr__(self):
-        return f"_Gemma4KVSharedSafeProxy({object.__getattribute__(self, '_real')!r})"
+        return f"_Gemma4KVSharedSafeProxy({self._real!r})"
 
 
 def _wrap_get_text_config_for_kv_zero(cls):
@@ -952,6 +957,12 @@ def patch_Gemma4ClippableLinear_peft_reload():
     create_and_replace._unsloth_gemma4_clippable_linear_patched = True
     create_and_replace._unsloth_original_create_and_replace = original_create_and_replace
     LoraModel._create_and_replace = create_and_replace
+    # Saved target_modules must name the inner .linear for plain PEFT; see portable_lora_target_modules.
+    try:
+        from .moe_utils import _patch_peft_save_pretrained_for_moe_layout
+        _patch_peft_save_pretrained_for_moe_layout()
+    except Exception as e:
+        logger.warning(f"Unsloth: Gemma4 adapter save hook not installed ({e}).")
 pass
 TEMPORARY_PATCHES.append(patch_Gemma4ClippableLinear_peft_reload)
 
@@ -1187,3 +1198,76 @@ def patch_Gemma4VisionPoolerFP16():
         return raise_error("Gemma4VisionPooler.forward", e)
 pass
 TEMPORARY_PATCHES.append(patch_Gemma4VisionPoolerFP16)
+
+
+# Force float32 through embedding_projection. Mirrors patch_Gemma3nMultimodalEmbedder_forward.
+
+@torch_compile
+def _Gemma4MultimodalEmbedder_RMSNorm_forward(self, x: torch.Tensor) -> torch.Tensor:
+    output = self._norm(x.float())
+    if getattr(self, "with_scale", True) and hasattr(self, "weight"):
+        output = output * self.weight.float()
+    # Stay in float32: the caller casts next, and a bfloat16 hop here costs
+    # 1.9e-3 relative on an fp32 projector.
+    return output
+
+def patch_Gemma4MultimodalEmbedder_forward():
+    """Force float32 computation for Gemma4MultimodalEmbedder to preserve spatial precision."""
+    try:
+        import transformers.models.gemma4.modeling_gemma4 as mod
+        Gemma4MultimodalEmbedder = mod.Gemma4MultimodalEmbedder
+    except (ImportError, AttributeError) as e:
+        return raise_error("Gemma4MultimodalEmbedder.forward", e)
+
+    def forward(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
+        old_dtype = inputs_embeds.dtype
+        emb_norm = _Gemma4MultimodalEmbedder_RMSNorm_forward(self.embedding_pre_projection_norm, inputs_embeds)
+        # Call the module, never `.weight`: a PEFT lora.Linear applies its delta
+        # only in forward, so reading the weight trains the adapter to no effect.
+        projection = self.embedding_projection
+        # Match the weight dtype: only a float32 projector computes in float32.
+        # Promoting a half one needs an autocast several backends refuse, or a
+        # Parameter rebuild Dynamo cannot trace.
+        weight = getattr(projection, "weight", None)
+        compute_dtype = torch.float32 if weight is None else weight.dtype
+        # An enclosing bf16 autocast downcasts even float32 operands. Guarded
+        # because autocast rejects meta and unregistered custom backends.
+        try:
+            autocast_off = torch.autocast(device_type = emb_norm.device.type, enabled = False)
+        except (RuntimeError, AssertionError):
+            autocast_off = contextlib.nullcontext()
+        with autocast_off:
+            emb_norm_proj = projection(emb_norm.to(compute_dtype))
+        return emb_norm_proj.to(old_dtype)
+    try:
+        patch_function(
+            Gemma4MultimodalEmbedder, "forward", forward, fullgraph=True,
+        )
+    except Exception as e:
+        return raise_error("Gemma4MultimodalEmbedder.forward", e)
+pass
+TEMPORARY_PATCHES.append(patch_Gemma4MultimodalEmbedder_forward)
+
+
+def patch_Gemma4_static_cache_backport(phase = "post_compile"):
+    """#6028 backport for installs whose unsloth still forces a static cache.
+
+    A static cache makes transformers skip mask materialisation at prefill, which
+    drops Gemma's bidirectional image block overlay, so image tokens attend
+    causally. Current unsloth gates this per request; older ones consult only
+    `_supports_static_cache`, so clear it on the Gemma 4 generation classes. That
+    costs text-only generation the static cache, hence the guard below.
+    """
+    if phase != "post_compile": return
+    # unsloth_zoo must not import unsloth; absent means too early to tell.
+    vision = sys.modules.get("unsloth.models.vision")
+    if vision is None or hasattr(vision, "_needs_bidirectional_multimodal_mask"): return
+    for name in ("gemma4", "gemma4_unified"):
+        module = sys.modules.get(f"transformers.models.{name}.modeling_{name}")
+        if module is None: continue
+        for obj in vars(module).values():
+            # Only overlay builders; causal VLMs keep the static path.
+            if isinstance(obj, type) and "create_masks_for_generate" in vars(obj):
+                obj._supports_static_cache = False
+pass
+TEMPORARY_PATCHES.append(patch_Gemma4_static_cache_backport)
