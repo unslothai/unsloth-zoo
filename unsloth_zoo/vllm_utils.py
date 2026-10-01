@@ -1815,6 +1815,12 @@ def vllm_weights_memory_usage(config, load_in_4bit = False, load_in_8bit = False
     quant_config = getattr(config, "quantization_config", None) or {}
     if not isinstance(quant_config, dict): quant_config = quant_config.to_dict()
     quant_method = quant_config.get("quant_method", None)
+    # A subconfig-scoped quantization_config is not sized here
+    if not quant_config and any(
+        getattr(getattr(config, key, None), "quantization_config", None)
+        for key in ("text_config", "vision_config", "audio_config")
+    ):
+        return None
     # Same packing factors as approximate_vllm_memory_usage
     if quant_method in (None, "bitsandbytes"):
         quantized_bytes = 2 / (16/5) if load_in_4bit else 2 / (8/5) if load_in_8bit else 2

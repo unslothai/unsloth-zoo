@@ -184,3 +184,9 @@ def test_gpt2_conv1d_projections_are_packed():
     packed = vllm_utils.vllm_weights_memory_usage(config, load_in_4bit = True)
     projections = 2 * (64 * 192 + 64 * 64 + 64 * 256 + 256 * 64)
     assert full - packed == pytest.approx(projections * (2 - 2 / (16/5)))
+
+
+def test_nested_quantization_config_falls_back():
+    config = _tiny_gemma3()
+    config.text_config.quantization_config = {"quant_method": "bitsandbytes", "load_in_4bit": True}
+    assert vllm_utils.vllm_weights_memory_usage(config, load_in_4bit = True) is None
