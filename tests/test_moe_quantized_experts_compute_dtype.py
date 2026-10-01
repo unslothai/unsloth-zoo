@@ -81,6 +81,15 @@ def _fp8_experts(device):
 
 def _run_fp8(device, monkeypatch, backend, autocast):
     monkeypatch.setenv("UNSLOTH_MOE_BACKEND", backend)
+    # select_moe_backend is lru_cached: read it under this env, and do not leave this backend for later tests.
+    moe_utils.select_moe_backend.cache_clear()
+    try:
+        _run_fp8_checks(device, monkeypatch, autocast)
+    finally:
+        moe_utils.select_moe_backend.cache_clear()
+
+
+def _run_fp8_checks(device, monkeypatch, autocast):
     experts, hidden, top_k_index, top_k_weights = _fp8_experts(device)
     seen = []
     real = moe_utils_fp8._dequantize_full_expert_weights
