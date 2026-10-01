@@ -42,12 +42,8 @@ dependencies = [
     # GenerationBatch.Response and BatchGenerator.next_generated, which batched
     # generation drives, first ship in mlx-lm 0.31.2.
     "mlx-lm==0.31.3 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
-    # A ceiling rather than an exact pin: mlx-vlm 0.6.5+ requires
-    # transformers>=5.14, so an environment holding an older transformers still
-    # resolves 0.6.4. The UnicodeDecodeError during generation in unsloth #9466
-    # is fixed in 0.6.9. The ceiling admits 0.7.4; this package handles the
-    # gated-delta keywords and reworked MoE switch layer of 0.7.1 and the
-    # separate qwen3_5_text decoders of 0.7.4.
+    # Ceiling, not a pin: an older transformers (unsloth's <=5.5.0) still resolves 0.6.4,
+    # since 0.6.5+ needs transformers>=5.14. unsloth #9466 is fixed in 0.6.9.
     "mlx-vlm>=0.4.4,<=0.7.4 ; (sys_platform == 'darwin' and platform_machine == 'arm64')",
     # --- Shared deps (all platforms) ---
     "packaging>=24.1",
@@ -60,11 +56,8 @@ dependencies = [
     # 4.52.0 because 4.52.0 through 4.52.3 were already rejected by name, which is also
     # why those four `!=` entries are gone: the floor now dominates them.
     #
-    # The ceiling is the newest release the version matrix was run against, on CUDA and on
-    # Apple Silicon. 5.5.0 is exactly where prequantized bnb-4bit checkpoints lose
-    # quant_state on every Linear4bit (unsloth #9867, #10010, #10017, #10276), and the
-    # Gemma 4 E4B LoRA fix shipped in 5.5.2 (unsloth #5355). Every `!=` that remains is a
-    # release that was tested and rejected, so they all stay.
+    # Ceiling = newest release the matrix ran on CUDA and Apple Silicon (CEILING gate in
+    # consolidated-tests-ci.yml). Every `!=` is a tested, rejected release.
     "transformers>=4.52.4,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.17.0",
     "datasets>=3.4.1,!=4.0.*,!=4.1.0,!=4.4.*,!=4.5.0,<5.0.0",
     "sentencepiece>=0.2.0",
@@ -110,7 +103,6 @@ mlx = [
 core = [
     "packaging>=24.1",
     "tyro",
-    # Same as the base dependency list above; see the comment there.
     "transformers>=4.52.4,!=4.53.0,!=4.54.0,!=4.55.0,!=4.55.1,!=4.57.4,!=4.57.5,!=5.0.0,!=5.1.0,<=5.17.0",
     "datasets>=3.4.1,!=4.0.*,!=4.1.0,!=4.4.*,!=4.5.0,<5.0.0",
     "sentencepiece>=0.2.0",

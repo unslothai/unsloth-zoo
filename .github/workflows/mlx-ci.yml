@@ -107,9 +107,7 @@ jobs:
         # silently remove the very check that is supposed to tell us whether the
         # next release is safe to adopt.
         #
-        # mlx-vlm is upgraded past its `<=0.7.4` ceiling too, so this leg tests the
-        # version a ceiling bump would move to. Letting transformers move with it
-        # is the point of this leg, and is why it does not gate.
+        # Also past mlx-vlm's <=0.7.4 ceiling (and transformers with it): non-gating.
         if: matrix.mlx == 'latest'
         run: |
           pip install --upgrade mlx mlx-lm mlx-vlm
