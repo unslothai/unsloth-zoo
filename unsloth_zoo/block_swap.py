@@ -29,6 +29,9 @@ __all__ = [
     "BlockSwap",
     "find_decoder_layers",
     "swap_indices",
+    "estimate_training_reserve_bytes",
+    "lora_param_count",
+    "auto_swap_indices",
     "build_host_layers",
 ]
 
@@ -139,7 +142,7 @@ def _swappable(module):
 
 class _Block:
     __slots__ = ("params", "host", "devices", "index", "streams", "events", "resident", "slot", "sig",
-                 "pending", "layout", "sizes", "src", "empties", "host_buf")
+                 "pending", "layout", "sizes", "src", "empties", "host_buf", "home")
 
     def __init__(self, layer, streams, device, shared = ()):
         self.params, self.host, self.devices = [], [], []
@@ -168,6 +171,7 @@ class _Block:
         # Ran with grad on and autograd holds its weights until the backward hook fires.
         self.pending = False
         self.src, self.host_buf = {}, {}
+        self.home = self.devices[0] if self.devices else None
         self.sig = tuple((tuple(p.shape), p.dtype, d, off) for p, d, off in zip(self.params, self.devices, self.layout))
 
     def nbytes(self):
@@ -210,6 +214,17 @@ class _Block:
     def wait(self):
         for d, event in self.events.items():
             torch.cuda.current_stream(d).wait_event(event)
+
+
+def _to_device(obj, device):
+    if isinstance(obj, torch.Tensor):
+        return obj if obj.device == device else obj.to(device, non_blocking = True)
+    if isinstance(obj, (tuple, list)):
+        moved = [_to_device(o, device) for o in obj]
+        return type(obj)(*moved) if hasattr(obj, "_fields") else type(obj)(moved)
+    if isinstance(obj, dict):
+        return {k: _to_device(v, device) for k, v in obj.items()}
+    return obj
 
 
 def swap_indices(total, n, placement = "spread"):
@@ -394,16 +409,23 @@ class BlockSwap:
             # The grad of the block's input is complete only once the block's backward has run, so its
             # hook is the release point. A tensor hook adds no autograd node, unlike a full backward hook,
             # which reorders gradient sums of tensors fed to several blocks (cross-attention states).
-            hooked = False
-            if torch.is_grad_enabled():
-                x = next((a for a in args if isinstance(a, torch.Tensor)), None)
+            x = next((a for a in args if isinstance(a, torch.Tensor)), None)
+            if x is None:
+                x = kwargs.get("hidden_states")
+            moved = None
+            if isinstance(x, torch.Tensor) and b.home is not None and x.device != b.home:
+                # A host-loaded tail fetches onto the head's card, which may not be where the last
+                # resident layer left the hidden states.
+                moved = (_to_device(args, b.home), _to_device(kwargs, b.home))
+                x = next((a for a in moved[0] if isinstance(a, torch.Tensor)), None)
                 if x is None:
-                    x = kwargs.get("hidden_states")
-                if isinstance(x, torch.Tensor) and x.requires_grad:
-                    x.register_hook(self._bwd(i))
-                    hooked = True
+                    x = moved[1].get("hidden_states")
+            hooked = False
+            if torch.is_grad_enabled() and isinstance(x, torch.Tensor) and x.requires_grad:
+                x.register_hook(self._bwd(i))
+                hooked = True
             self._input_hooked[i] = hooked
-            return None
+            return moved
         return hook
 
     def _post(self, i):
@@ -501,6 +523,93 @@ class BlockSwap:
 
     def resident_count(self):
         return sum(b.resident for b in self.blocks)
+
+
+def _text_config(config):
+    get = getattr(config, "get_text_config", None)
+    if callable(get):
+        try:
+            return get()
+        except Exception:
+            pass
+    return config
+
+
+# Llama-3.1-8B 4-bit, Unsloth checkpointing, batch 4: activations grow 0.17 MiB per token at hidden 4096
+# (42 bytes per token per hidden unit), rounded up.
+_ACTIVATION_BYTES_PER_TOKEN_HIDDEN = 48
+
+
+def estimate_training_reserve_bytes(config, seq_len, batch_size = 1, extra_bytes = 0,
+                                    logit_rows = 2048, safety_bytes = 256 << 20):
+    """VRAM a LoRA step needs beyond the weights: activations, fp32 logits for up to `logit_rows`
+    rows, plus `extra_bytes` (trainable parameters' gradients and optimizer state)."""
+    text = _text_config(config)
+    hidden = (getattr(text, "hidden_size", None) or getattr(text, "n_embd", None)
+              or getattr(text, "d_model", None) or 0)
+    vocab = getattr(text, "vocab_size", None) or 0
+    tokens = max(1, int(seq_len)) * max(1, int(batch_size))
+    activations = tokens * int(hidden) * _ACTIVATION_BYTES_PER_TOKEN_HIDDEN
+    logits = min(tokens, int(logit_rows)) * int(vocab) * 4
+    return int(activations + logits + int(extra_bytes) + int(safety_bytes))
+
+
+def lora_param_count(layers, r = 16):
+    """LoRA parameters on every linear in `layers` at rank `r`: r * (in + out) each."""
+    total = 0
+    for layer in layers:
+        for module in layer.modules():
+            i, o = getattr(module, "in_features", None), getattr(module, "out_features", None)
+            if isinstance(i, int) and isinstance(o, int) and not list(module.children()):
+                total += r * (i + o)
+    return total
+
+
+def _free_device_bytes(device):
+    free, _ = torch.cuda.mem_get_info(device)
+    # Blocks torch's caching allocator holds but does not use are free to this process.
+    return int(free + torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device))
+
+
+def _pool_bytes(sizes, depth):
+    # One pool per shape signature, depth + 1 slots each (fewer if fewer blocks share it).
+    counts = {}
+    for b in sizes:
+        counts[b] = counts.get(b, 0) + 1
+    return sum(b * min(depth + 1, c) for b, c in counts.items())
+
+
+def auto_swap_indices(layers, reserve_bytes, prefetch_depth = 2, free_bytes = None):
+    """Fewest layers to move to host RAM so each GPU keeps `reserve_bytes` free.
+
+    Per device, layers there are taken spread evenly until what they free, less the slot pool they
+    need, covers the shortfall. Returns (indices, shortfall_left): [] when every device already has
+    the room; shortfall_left > 0 when even keeping one layer per device is not enough."""
+    by_device = {}
+    for i, layer in enumerate(layers):
+        params = _swappable(layer)
+        if not params or params[0][1].device.type != "cuda":
+            continue
+        by_device.setdefault(params[0][1].device, []).append((i, sum(p.nbytes for _, p in params)))
+    chosen, left = [], 0
+    for device, items in by_device.items():
+        free = (free_bytes or {}).get(device)
+        if free is None:
+            free = _free_device_bytes(device)
+        need = int(reserve_bytes) - free
+        if need <= 0:
+            continue
+        pick = []
+        for n in range(1, len(items)):
+            pick = [items[k] for k in swap_indices(len(items), n)]
+            sizes = [b for _, b in pick]
+            if sum(sizes) - _pool_bytes(sizes, prefetch_depth) >= need:
+                break
+        else:
+            sizes = [b for _, b in pick]
+            left = max(left, need - (sum(sizes) - _pool_bytes(sizes, prefetch_depth)))
+        chosen += [i for i, _ in pick]
+    return sorted(chosen), left
 
 
 def find_decoder_layers(model):

@@ -34,6 +34,7 @@ _spec = importlib.util.spec_from_file_location(
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 BlockSwap, find_decoder_layers, swap_indices = _mod.BlockSwap, _mod.find_decoder_layers, _mod.swap_indices
+auto_swap_indices, estimate_training_reserve_bytes = _mod.auto_swap_indices, _mod.estimate_training_reserve_bytes
 
 
 class _FakeBlock:
@@ -41,6 +42,7 @@ class _FakeBlock:
 
     def __init__(self, sig = "a"):
         self.sig = sig
+        self.home = None
         self.resident = True
         self.slot = None
         self.pending = False
@@ -622,3 +624,41 @@ def test_enter_leave_follow_explicit_indices():
     assert sw.blocks[1].resident and sw.blocks[2].resident
     sw.leave(4)
     assert not sw.blocks[1].resident
+
+
+def test_reserve_estimate_scales_with_tokens():
+    from types import SimpleNamespace
+    cfg = SimpleNamespace(hidden_size = 4096, vocab_size = 128256)
+    one = estimate_training_reserve_bytes(cfg, 2048, safety_bytes = 0)
+    four = estimate_training_reserve_bytes(cfg, 2048, batch_size = 4, safety_bytes = 0)
+    # Activations scale with tokens; logits are capped at 2048 rows.
+    assert four - one == 3 * 2048 * 4096 * 48
+    assert estimate_training_reserve_bytes(cfg, 2048, extra_bytes = 7, safety_bytes = 0) == one + 7
+
+
+def test_auto_swap_indices_takes_only_the_shortfall():
+    if not torch.cuda.is_available():
+        return
+    layers = nn.ModuleList([nn.Linear(256, 256, bias = False) for _ in range(12)]).cuda().requires_grad_(False)
+    layer = 256 * 256 * 4
+    dev = layers[0].weight.device
+    assert auto_swap_indices(layers, 10 * layer, 2, free_bytes = {dev: 10 * layer}) == ([], 0)
+    # One layer short: four must go, since the pool keeps three slots on the card.
+    idx, left = auto_swap_indices(layers, 10 * layer, 2, free_bytes = {dev: 9 * layer})
+    assert len(idx) == 4 and left == 0 and idx == sorted(idx)
+    idx, left = auto_swap_indices(layers, 100 * layer, 2, free_bytes = {dev: 0})
+    assert len(idx) == 11 and left > 0
+
+
+def test_block_on_another_card_gets_its_inputs_moved():
+    if torch.cuda.device_count() < 2:
+        return
+    torch.manual_seed(0)
+    blocks = nn.ModuleList([_XBlock(64).to("cuda:0"), _XBlock(64).to("cuda:1")])
+    x = torch.randn(2, 64, device = "cuda:0", requires_grad = True)
+    enc = torch.randn(2, 64, device = "cuda:0")
+    ref = blocks[1](blocks[0](x, enc).to("cuda:1"), enc.to("cuda:1"))
+    sw = BlockSwap(blocks, [1], prefetch_depth = 1)
+    out = blocks[1](blocks[0](x, enc), enc)
+    assert out.device.index == 1 and torch.equal(out, ref)
+    sw.remove()

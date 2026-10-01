@@ -1895,3 +1895,63 @@ def test_a_config_that_hands_back_itself_terminates():
             return self
 
     assert detect_logit_transforms(_Circular())["logit_softcapping"] == 20.0
+
+
+# --------------------------------------------------------------------------- #
+# block swap sizing
+# --------------------------------------------------------------------------- #
+def _swap_sizes():
+    model = _meta(layers = 8)
+    sizes = _compute_module_sizes(model)
+    return model, sizes[""], sizes["layers.0"]
+
+
+def test_exclude_modules_leaves_layers_out_of_the_map():
+    model, total, layer = _swap_sizes()
+    plan = plan_device_map(
+        model,
+        max_memory = {0: total, 1: total},
+        headroom_bytes = 0,
+        activation_reserve_bytes = 0,
+        exclude_modules = ["layers.6", "layers.7"],
+    )
+    assert not any(k.startswith(("layers.6", "layers.7")) for k in plan.device_map)
+    assert plan.total_weight_bytes == total - 2 * layer
+    with pytest.raises(ValueError, match = "larger placement unit"):
+        plan_device_map(model, max_memory = {0: total, 1: total}, exclude_modules = ["layers.6.mlp"])
+
+
+def test_block_swap_plan_one_device_is_the_fewest_layers_that_fit():
+    from unsloth_zoo.device_map_planner import plan_block_swap
+    model, total, layer = _swap_sizes()
+    reserve = 3 * layer
+    assert plan_block_swap(model = model, max_memory = {0: total + reserve}, reserve_bytes = reserve).layers == 0
+    for short in (1, layer, 2 * layer + 1):
+        plan = plan_block_swap(model = model, max_memory = {0: total + reserve - short}, reserve_bytes = reserve)
+        n = plan.layers
+        # Swapping n layers frees n of them but the depth + 1 slot pool keeps 3 on the card.
+        assert (n - 3) * layer >= short and (n - 4) * layer < short, (short, n)
+
+
+def test_block_swap_plan_multi_gpu_charges_the_pool_to_the_head_card():
+    from unsloth_zoo.device_map_planner import plan_block_swap
+    model, total, layer = _swap_sizes()
+    embed = 512 * 64 * 4
+    budget = embed + 600 + 5 * layer  # room for ten resident layers across both cards
+    plan = plan_block_swap(model = model, max_memory = {0: budget, 1: budget}, reserve_bytes = 0,
+                           headroom_bytes = 0)
+    assert plan.layers == 0
+    budget = embed + 600 + 3 * layer  # room for six layers, three of them taken by the pool
+    plan = plan_block_swap(model = model, max_memory = {0: budget, 1: budget}, reserve_bytes = 0,
+                           headroom_bytes = 0)
+    resident = [k for k in plan.device_plan.device_map if k.startswith("layers.")]
+    assert plan.layers == 5 and len(resident) == 3
+    head = plan.device_plan.head_device
+    assert plan.device_plan.weight_bytes[head] + 3 * layer <= budget
+
+
+def test_block_swap_plan_refuses_when_one_layer_cannot_stay():
+    from unsloth_zoo.device_map_planner import plan_block_swap
+    model, total, layer = _swap_sizes()
+    with pytest.raises(DeviceMapInfeasible, match = "host RAM"):
+        plan_block_swap(model = model, max_memory = {0: layer}, reserve_bytes = 0)
