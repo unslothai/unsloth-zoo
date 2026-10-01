@@ -20,7 +20,7 @@ import logging
 import warnings
 from typing import Optional
 from dataclasses import asdict
-from unsloth_zoo.device_type import DEVICE_TYPE
+from unsloth_zoo import DEVICE_TYPE
 
 import torch
 import triton
