@@ -61,8 +61,7 @@ def _build(tmp_path, *, bias = "none", modules_to_save = None, runtime_dtype = t
 
 
 def _train_biases(peft_model):
-    """Shift every trainable bias, standing in for an optimizer step; returns the
-    expected {checkpoint key: value}."""
+    """Stand-in optimizer step; returns {checkpoint key: trained bias}."""
     expected = {}
     with torch.no_grad():
         for name, p in peft_model.named_parameters():
@@ -102,8 +101,6 @@ def test_trained_bias_is_exported(tmp_path, bias, modules_to_save, shard_size):
 
 
 def test_frozen_reloaded_adapter_still_exports_bias(tmp_path):
-    # An adapter reloaded for inference has requires_grad=False, so selection must
-    # come from the adapter config.
     base, peft_model = _build(tmp_path, bias = "lora_only")
     expected = _train_biases(peft_model)
     for p in peft_model.parameters():

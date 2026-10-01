@@ -917,8 +917,7 @@ _SAFETENSORS_DTYPE_NAMES = {v : k for k, v in SAFETENSORS_DTYPES.items()}
 
 def _get_bias_overrides(biases, safetensor_keys, model_class_name):
     if not biases: return {}
-    # Reuse module-name remapping, including when a bias and its weight live in
-    # different shards. These aliases are only for lookup, never written to disk.
+    # Lookup-only `.weight` aliases so the module-name remap also covers bias-only shards.
     bias_keys = [key for key in safetensor_keys if key.endswith(".bias")]
     if not bias_keys: return {}
     converted = _convert_lora_keys_to_safetensor_format(
@@ -5327,8 +5326,7 @@ def merge_and_overwrite_lora(
         if _add_keys_to_index(save_directory, _seeded_head_keys) and push_to_hub:
             upload_items("model.safetensors.index.json")
 
-    # Use the adapter configuration, not requires_grad: a trained adapter can be
-    # reloaded frozen for export. Preserve base-checkpoint precision for untrained biases.
+    # Select by adapter config, not requires_grad: an adapter reloaded frozen still has trained biases.
     peft_config = getattr(model, "peft_config", {})
     bias_modes = {
         getattr(peft_config.get(adapter), "bias", "none")
