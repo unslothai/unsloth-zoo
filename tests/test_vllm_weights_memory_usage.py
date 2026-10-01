@@ -175,3 +175,12 @@ def test_keep_in_fp32_modules_stay_unpacked(monkeypatch):
     monkeypatch.setattr(Qwen3ForCausalLM, "_keep_in_fp32_modules", ["down_proj"], raising = False)
     kept = vllm_utils.vllm_weights_memory_usage(config)
     assert kept - quantized == pytest.approx(2 * 64 * 128 * (2 - 2 / (8/5)))
+
+
+def test_gpt2_conv1d_projections_are_packed():
+    from transformers import GPT2Config
+    config = GPT2Config(n_embd = 64, n_layer = 2, n_head = 4, vocab_size = 512, n_positions = 64)
+    full = vllm_utils.vllm_weights_memory_usage(config)
+    packed = vllm_utils.vllm_weights_memory_usage(config, load_in_4bit = True)
+    projections = 2 * (64 * 192 + 64 * 64 + 64 * 256 + 256 * 64)
+    assert full - packed == pytest.approx(projections * (2 - 2 / (16/5)))

@@ -1872,6 +1872,8 @@ def vllm_weights_memory_usage(config, load_in_4bit = False, load_in_8bit = False
 
     # Quantizers pack Linear weights and stacked (3D) expert weights, never embeddings or convs.
     unpacked_types = (torch.nn.Embedding, torch.nn.modules.conv._ConvNd)
+    from transformers.pytorch_utils import Conv1D # GPT-2 style projections, packed by bnb
+    linear_types = (torch.nn.Linear, Conv1D)
     weight_bytes, seen = 0, set()
     for module_name, module in meta_model.named_modules():
         for param_name, param in module.named_parameters(recurse = False):
@@ -1879,7 +1881,7 @@ def vllm_weights_memory_usage(config, load_in_4bit = False, load_in_8bit = False
             seen.add(id(param))
             name = f"{module_name}.{param_name}" if module_name else param_name
             if any(name == x or name.endswith("." + x) for x in no_placement): continue
-            packable = (isinstance(module, torch.nn.Linear) and param.ndim == 2) or \
+            packable = (isinstance(module, linear_types) and param.ndim == 2) or \
                 (param.ndim == 3 and not isinstance(module, unpacked_types))
             quantized = packable and "lm_head" not in name and not _skipped(name) \
                 and not any(x in "." + name + "." for x in keep_full)
