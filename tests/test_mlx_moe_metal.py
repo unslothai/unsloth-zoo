@@ -605,7 +605,7 @@ def test_routed_experts_run_under_the_int8_prefill_scope(int8_prefill_first, mon
     monkeypatch.setattr(nax, "nax_available", lambda: True)
     monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: True)
     monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {})
-    monkeypatch.setattr(nax, "_A8_EXPERT_ROWS_BY_GPU", {nax._gpu_generation(): ((8, 0, 0, 8, False),)})
+    monkeypatch.setattr(nax, "_INT8_PREFILL_EXPERT_ROWS", {8: (8, 8)})
     gathers = _counting_gather_qmm(monkeypatch)
     scopes = [functools.partial(fusion.nax_quantized_linear, int8_prefill = True), _routed]
     with contextlib.ExitStack() as stack:

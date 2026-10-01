@@ -163,6 +163,11 @@ def _moe_switch_specs():
     return specs
 
 
+def _native_type(projection):
+    # The class a NAX scope subclass stands in for, which the MoE fusions treat as that class.
+    return getattr(type(projection), "_unsloth_nax_qmm_native", type(projection))
+
+
 def _moe_gate_up_eligible(module, projection_type):
     return (_moe_gate_up_packable(module, projection_type)
             and not (module.training or module.gate_proj.training or module.up_proj.training))
@@ -171,7 +176,7 @@ def _moe_gate_up_eligible(module, projection_type):
 def _moe_gate_up_packable(module, projection_type):
     """`_moe_gate_up_eligible` in any training mode."""
     gate, up = module.gate_proj, module.up_proj
-    if type(gate) is not projection_type or type(up) is not projection_type:
+    if _native_type(gate) is not projection_type or _native_type(up) is not projection_type:
         return False
     if gate.trainable_parameters() or up.trainable_parameters():
         return False
@@ -2285,12 +2290,6 @@ def _switch_base(cls, specs):
     return None
 
 
-def _native_type(projection):
-    # The class a NAX scope subclass stands in for. The int8 expert subclass takes only sorted calls, so
-    # the unsorted calls the routed-expert kernels serve are native ones.
-    return getattr(type(projection), "_unsloth_nax_qmm_native", type(projection))
-
-
 class _RoutedExperts:
     """A sparse block's routed experts on the decode kernels, for unsorted routes outside the short-block band."""
 
@@ -2689,13 +2688,14 @@ def _nax_int8_qmm_matches_native(x, w, scales, biases, group_size, bits, routed,
     stock's fp32 product of those rounded rows."""
     M, K = x.shape
     rows = mx.array(sorted({round(i * (M - 1) / 31) for i in range(32)}))
-    codes, step, *_ = nax._int8_quantize_activations(x[rows], bits)
+    codes, step, *_ = nax._int8_quantize_activations(x[rows], group_size, bits)
+    span = nax._int8_qmm_activation_group(group_size)
     if bits == 4:   # stored in the kernel's nibble order
         codes = codes.reshape(-1, K // 16, 2, 2, 4).swapaxes(-1, -2).reshape(-1, K)
     x32 = x[rows].astype(mx.float32)
-    rounded = (codes.reshape(-1, K // group_size, group_size) * step.T[..., None]).reshape(-1, K)
+    rounded = (codes.reshape(-1, K // span, span) * step.T[..., None]).reshape(-1, K)
     finite = mx.isfinite(step.T)[..., None]
-    error = mx.abs(rounded - x32).reshape(-1, K // group_size, group_size)
+    error = mx.abs(rounded - x32).reshape(-1, K // span, span)
     if not mx.all(~finite | (error <= step.T[..., None] * (0.5 + 2.0 ** -12))).item():
         return False
     if indices is None:
@@ -2752,8 +2752,8 @@ def _nax_int8_prefill_dense(module, x, bindings):
             or w.ndim != 2):
         return None
     N, K = w.shape[0], x.shape[-1]
-    routed = _nax_verified_int8_qmm(("dense", N, K, module.bits, x.dtype), x.reshape(-1, K), w, scales, biases,
-                         module.group_size, module.bits)
+    routed = _nax_verified_int8_qmm(("dense", N, K, module.group_size, module.bits, x.dtype), x.reshape(-1, K),
+                                    w, scales, biases, module.group_size, module.bits)
     return None if routed is None else routed.reshape(*x.shape[:-1], N)
 
 
@@ -2774,11 +2774,11 @@ def _nax_int8_prefill_gather(owner, x, w, scales, biases, indices, sorted_indice
             or not _nax_int8_qmm_eligible(x.shape[-1], x.dtype, w, scales, biases, group_size, bits, mode)):
         return None
     (E, N, _), K = w.shape, x.shape[-1]
-    low = nax.int8_prefill_expert_min_rows(E, N, K, bits, token_rows is not None)
+    low = nax.int8_prefill_expert_min_rows(E, bits, token_rows is not None)
     if not low or T < low:
         return None
-    routed = _nax_verified_int8_qmm(("gather", E, N, K, bits, x.dtype, token_rows is not None), x.reshape(-1, K),
-                                    w, scales, biases, group_size, bits, indices, token_rows)
+    routed = _nax_verified_int8_qmm(("gather", E, N, K, group_size, bits, x.dtype, token_rows is not None),
+                                    x.reshape(-1, K), w, scales, biases, group_size, bits, indices, token_rows)
     return None if routed is None else routed.reshape(T, 1, N)
 
 
@@ -2853,10 +2853,9 @@ def _nax_qmm_row_range(module):
     return (low, high) if low <= high else None
 
 
-def _nax_int8_prefill_packed(model, predict = False):
-    """The ids of gate and up projections packed into one call quantized per token: those packed
-    now and, with `predict`, also those `fused_moe_gate_up` packs whenever the model generates."""
-    specs = _moe_switch_specs() if predict else {}
+def _nax_int8_prefill_packed(model):
+    """Ids of the gate and up projections packed now or by a `fused_moe_gate_up` entered later."""
+    specs = _moe_switch_specs()
     packed = set()
     for _, module in model.named_modules() if hasattr(model, "named_modules") else ():
         pack = getattr(module, "_unsloth_moe_gate_up", None)
@@ -2870,7 +2869,7 @@ def _nax_int8_prefill_packed(model, predict = False):
 def _nax_int8_prefill_route(module, classes, switches, packed):
     """The fewest rows at which a quantized linear takes the int8 route, True for a routed-expert
     projection whose calls it can take (their rows are checked per call), or 0."""
-    base = getattr(type(module), "_unsloth_nax_qmm_native", type(module))
+    base = _native_type(module)
     dense = base is nn.QuantizedLinear and base in classes
     if not (dense or base in switches):
         return 0
@@ -2882,10 +2881,10 @@ def _nax_int8_prefill_route(module, classes, switches, packed):
     if not _nax_int8_qmm_eligible(K, dtype, w, scales, biases, module.group_size, module.bits, module.mode):
         return 0
     if dense:
-        return nax.int8_prefill_min_rows(N, K, module.bits)
+        return nax.int8_prefill_min_rows(N, K)
     E, bits = w.shape[0], module.bits
-    return bool(nax.int8_prefill_expert_min_rows(E, N, K, bits)
-                or id(module) in packed and nax.int8_prefill_expert_min_rows(E, 2 * N, K, bits, True))
+    return bool(nax.int8_prefill_expert_min_rows(E, bits)
+                or id(module) in packed and nax.int8_prefill_expert_min_rows(E, bits, True))
 
 
 class Int8PrefillStatus(NamedTuple):
@@ -2911,7 +2910,7 @@ def int8_prefill_available(model):
     if getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
         return Int8PrefillStatus(False, "distributed", 0)
     classes = _nax_qmm_classes(nn.QuantizedLinear.__call__, nn.QuantizedEmbedding.as_linear)
-    switches, packed = _nax_int8_prefill_switch_classes(), _nax_int8_prefill_packed(model, predict = True)
+    switches, packed = _nax_int8_prefill_switch_classes(), _nax_int8_prefill_packed(model)
     modules = {id(module): module for _, module in model.named_modules()} if hasattr(model, "named_modules") else {}
     projections = sum(bool(_nax_int8_prefill_route(module, classes, switches, packed)) for module in modules.values())
     if not projections:
@@ -2932,11 +2931,11 @@ def nax_quantized_linear(model, int8_prefill = None):
     training, other quantizations and devices without NAX keep the native call.
     `UNSLOTH_MLX_NAX_QMM=0` turns the route off.
 
-    `int8_prefill=True`, or `UNSLOTH_MLX_INT8_PREFILL=1` when it is None, also runs prefill-sized
-    calls of affine 4- and 8-bit group-64 linears and routed experts with int8 activations
-    quantized per row and group: faster, but lossy, and on precision-sensitive checkpoints it can
-    measurably raise the loss on real text. It is decided by the outermost scope;
-    `int8_prefill_available(model)` says whether it takes effect for a model on this machine.
+    `int8_prefill=True`, or `UNSLOTH_MLX_INT8_PREFILL=1` when it is None, also runs affine 3- to
+    8-bit linears and routed experts with int8 activations: faster, but lossy enough to raise the
+    loss of precision-sensitive checkpoints. Linears route from 17 rows, so batched decoding of 17
+    or more sequences and wider speculative verification also run int8. The outermost scope
+    decides; `int8_prefill_available(model)` says whether it takes effect here.
     """
     changed, tracked = [], hasattr(model, "__dict__")
     try:
