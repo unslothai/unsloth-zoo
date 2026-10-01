@@ -692,3 +692,21 @@ def test_every_trl_ceiling_is_reachable_under_the_datasets_window() -> None:
                 f"{where}: trl ceiling {_ceiling(trl.specifier)} needs datasets>="
                 f"{TRL_1_DATASETS_FLOOR}, which {[str(d.specifier) for d in datasets]} excludes"
             )
+
+
+def test_the_linux_mlx_lane_mirrors_the_published_mlx_lm_pin() -> None:
+    """pyproject's mlx-lm pin is darwin + arm64 only, so the Linux MLX lane repeats it.
+    Without the mirror the lane resolved mlx-lm 0.32.0 (transformers>=5.7.0) once the
+    transformers cap lifted, and tested a stack no Apple Silicon install can reach."""
+    published = {
+        str(req.specifier)
+        for req in _live(_named(_requirement_lists()["dependencies"], "mlx-lm"), DARWIN_ARM)
+    }
+    assert len(published) == 1, published
+    lanes = [
+        str(Requirement(m).specifier)
+        for name, run in _workflow_runs()
+        if name == "consolidated-tests-ci.yml" and "venv-suites/bin/pip install -e" in run
+        for m in re.findall(r'"(mlx-lm[^"]*)"', run)
+    ]
+    assert lanes and set(lanes) == published, (lanes, published)

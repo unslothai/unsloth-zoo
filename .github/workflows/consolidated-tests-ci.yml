@@ -627,10 +627,10 @@ jobs:
           # suites: the MLX packages MUST resolve in the SAME pip call as .[core], so
           # pip honours the transformers cap while picking mlx-vlm.
           #
-          # The mlx-vlm bound is repeated here because pyproject's is marker-gated to
-          # darwin + arm64 and so constrains nothing on this Linux lane. It mirrors
-          # pyproject's <=0.7.4; without it the lane resolved 0.7.0, a combination
-          # pyproject forbids.
+          # The mlx-lm pin and mlx-vlm bound are repeated here because pyproject's are
+          # marker-gated to darwin + arm64 and so constrain nothing on this Linux lane.
+          # They mirror pyproject's ==0.31.3 and <=0.7.4; without them the lane resolved
+          # mlx-lm 0.32.0 and mlx-vlm 0.7.0, combinations pyproject forbids.
           (
             rc=0
             {
@@ -639,7 +639,7 @@ jobs:
               retry .lanes/venv-suites/bin/pip install --index-url https://download.pytorch.org/whl/cpu \
                 "torch>=2.4.0,<2.11.0" &&
               retry .lanes/venv-suites/bin/pip install -e .[core] \
-                "mlx>=0.22.0" mlx-cpu "mlx-lm>=0.31.2" "mlx-vlm>=0.4.4,<=0.7.4" &&
+                "mlx>=0.22.0" mlx-cpu "mlx-lm==0.31.3" "mlx-vlm>=0.4.4,<=0.7.4" &&
               { .lanes/venv-suites/bin/pip install --no-deps \
                 "unsloth @ git+https://github.com/unslothai/unsloth@main" || true; } &&
               retry .lanes/venv-suites/bin/pip install pytest==9.0.3
