@@ -38,6 +38,156 @@ CONFIG = dict(
 )
 
 
+def _static_sanitize_family(loader):
+    """An installed mlx-vlm family whose ``sanitize`` is a staticmethod.
+
+    The flavour is what matters here, not the family: a staticmethod sanitize is the
+    second owner this test needs. It is resolved at runtime because llava_onevision
+    only exists from mlx-vlm 0.7.0, while pyproject caps mlx-vlm below that (0.6.4 is
+    the newest that fits the transformers pin), so naming it would fail the supported
+    install with ModuleNotFoundError rather than skip.
+    """
+    import importlib
+    import inspect
+    import pkgutil
+    import mlx_vlm.models
+
+    preferred = ("llava_onevision", "granite_vision", "florence2", "deepseek_vl_v2")
+    installed = sorted(name for _, name, _ in pkgutil.iter_modules(mlx_vlm.models.__path__))
+    for name in (*preferred, *(n for n in installed if n not in preferred)):
+        try:
+            importlib.import_module(f"mlx_vlm.models.{name}.{name}")
+        except Exception:
+            continue
+        # Go through the loader's own resolution, so the class this test patches is
+        # the one _ensure_native_vlm_weight_names would install the descriptor on.
+        resolved = loader._resolve_mlx_vlm_model_class(name)
+        if resolved is not None and isinstance(
+            inspect.getattr_static(resolved, "sanitize", None), staticmethod
+        ):
+            return name, resolved
+    return None, None
+
+
+@metal_only
+def test_native_name_sanitizer_preserves_vlm_expert_export(monkeypatch, tmp_path):
+    import inspect
+    from types import SimpleNamespace
+    import mlx.nn as nn
+    from mlx_vlm.models.qwen3_5_moe.qwen3_5_moe import Model
+    from unsloth_zoo.mlx import loader, utils
+
+    static_type, StaticModel = _static_sanitize_family(loader)
+    if StaticModel is None:
+        pytest.skip("no installed mlx-vlm family declares sanitize as a staticmethod")
+
+    model = Model.__new__(Model)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(text_config=SimpleNamespace(
+        tie_word_embeddings=False, num_hidden_layers=2, num_experts=2,
+    ))
+    source = {}
+    for layer in range(2):
+        prefix = f"model.language_model.layers.{layer}.mlp.experts"
+        source[f"{prefix}.gate_up_proj"] = mx.arange(48).reshape(2, 6, 4).astype(mx.float32) + layer * 100
+        source[f"{prefix}.down_proj"] = mx.arange(24).reshape(2, 4, 3).astype(mx.float32) + layer * 100
+    staged = model.sanitize(dict(source))
+    static_model = StaticModel.__new__(StaticModel)
+    owners = [model, static_model]
+    vocabulary = set(utils._mlx_sanitizer_vocabulary(owners))
+    def exported(directory):
+        directory.mkdir()
+        mx.save_safetensors(str(directory / "model.safetensors"), staged)
+        assert utils._prepare_moe_gguf_export_directory(directory, model=model) > 0
+        return mx.load(str(directory / "model.safetensors"))
+
+    expected = exported(tmp_path / "before")
+    assert any(name.endswith("experts.gate_up_proj") for name in expected)
+
+    monkeypatch.setattr(Model, "sanitize", Model.sanitize)
+    monkeypatch.setattr(StaticModel, "sanitize", inspect.getattr_static(StaticModel, "sanitize"))
+    loader._ensure_native_vlm_weight_names("qwen3_5_moe")
+    loader._ensure_native_vlm_weight_names(static_type)
+    for order in (owners, owners[::-1]):
+        assert vocabulary == set(utils._mlx_sanitizer_vocabulary(order))
+    assert utils._mlx_sanitizer_writes_in_place(utils._mlx_moe_sanitizers(model)[0])
+    actual = exported(tmp_path / "after")
+    assert actual.keys() == expected.keys()
+    for name in actual:
+        assert mx.array_equal(actual[name], expected[name]).item()
+        assert mx.array_equal(actual[name], source[name]).item()
+
+
+@pytest.mark.parametrize("source_form", ["converted", "unsanitized_layout", "extra_key"])
+def test_native_name_sanitizer_keeps_converted_norms(source_form):
+    import mlx.nn as nn
+    from mlx_simulation import mlx_is_simulated
+
+    # A sibling module can install the torch shim mid-session; it has no nn.RMSNorm.
+    if mlx_is_simulated() or "mlx_simulation" in str(getattr(nn, "__file__", "")):
+        pytest.skip("needs real MLX, the torch shim is installed")
+    from unsloth_zoo.mlx import loader
+
+    class Reshifting(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.norm = nn.RMSNorm(2)
+            self.dt_bias = mx.zeros((2,))
+            self.proj = nn.Linear(3, 2)
+            self.head = nn.Linear(2, 2, bias=False)
+
+        def sanitize(self, weights):
+            out = {}
+            for key, value in weights.items():
+                if key.startswith("mtp.") or key == "head.weight":
+                    continue
+                if key == "proj.weight" and value.shape != (2, 3):
+                    value = value.T
+                if key.endswith("norm.weight"):
+                    value += 1.0
+                if key == "dt_bias":
+                    value = value * 2.0
+                out[key] = value
+            return out
+
+    Reshifting.sanitize = loader._NativeVLMWeightSanitizer(Reshifting.__dict__["sanitize"])
+    # (w + 1) - 1 rounds away 1.0078125 in bfloat16, so only a restore is exact.
+    norm = mx.array([1.0078125, -0.5], dtype=mx.bfloat16)
+    proj = mx.arange(6, dtype=mx.float32).reshape(2, 3)
+    source = {
+        "norm.weight": norm,
+        "dt_bias": mx.array([0.5, 0.25]),
+        "proj.weight": proj.T if source_form == "unsanitized_layout" else proj,
+        "proj.bias": mx.zeros((2,)),
+        "proj.scales": mx.ones((2, 1)),
+        "head.weight": mx.ones((2, 2)),
+    }
+    if source_form == "extra_key":
+        source["mtp.0.norm.weight"] = mx.array([0.5, 0.25])
+    expected = {
+        "norm.weight": mx.array(norm) if source_form == "converted" else norm + 1.0,
+        "dt_bias": mx.array([1.0, 0.5]),
+        "proj.weight": proj,
+        "proj.bias": mx.zeros((2,)),
+        "proj.scales": mx.ones((2, 1)),
+    }
+
+    sanitized = Reshifting().sanitize(source)
+
+    assert sanitized.keys() == expected.keys()
+    for key, value in expected.items():
+        assert mx.array_equal(sanitized[key], value).item(), key
+
+    # GGUF export must still measure the shift it converts back.
+    from unsloth_zoo.mlx import utils as mlx_utils
+    model = Reshifting()
+    offsets = mlx_utils._mlx_measure_norm_offsets(
+        lambda probe: mlx_utils._mlx_sanitize_probe(model, probe),
+        {key: mx.array(value) for key, value in source.items()},
+    )
+    assert offsets == {"norm.weight": 1.0}
+
+
 def _stage_merged_moe_model(path, shards=1):
     from mlx_lm.models import qwen3_moe
 

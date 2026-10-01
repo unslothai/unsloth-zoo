@@ -85,8 +85,7 @@ def _run(*bodies, **extra_env):
     return done.stdout
 
 
-# The carrier every test starts from: a `functools.wraps` copy of a compiled
-# function, built the way the library builds it, not by hand.
+# The carrier every test starts from: a `functools.wraps` copy of a compiled function.
 _CARRIER = """
     from unsloth_zoo.temporary_patches import common as C
     from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback

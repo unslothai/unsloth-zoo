@@ -67,6 +67,7 @@ def set_qwen3_vision_norm_cast_output(enabled: bool) -> None:
 # - qwen2_5_vl: real end-to-end compiled training via train.py
 # - gemma3 / qwen3_vl / qwen3_5 / qwen3_5_moe / gemma4 / paligemma / moondream3:
 #   compiled synthetic forward+backward
+# - gemma4_unified: real compiled LoRA training on gemma-4-12B, text and image
 # SmolVLM has processor/template support, but real mlx-vlm training still hits
 # MLX primitive-less-array failures after a compiled call. Keep it patched but
 # unqualified until a real dataset compile run passes.
@@ -77,15 +78,20 @@ _VERIFIED_TRAINING_ARCHES: set[str] = {
     "gemma3",
     "gemma3n",
     "gemma4",
+    "gemma4_unified",
+    # Nested `text_config` decoder must qualify too, else gemma4 stays eager.
+    "gemma4_text",
     "glm_ocr",
     "idefics2",
     "idefics3",
+    "kimi_vl",
     "llama4",
     "llava",
     "llava_bunny",
     "llava_next",
     "mistral3",
     "mistral4",
+    "moondream2",
     "mllama",
     "moondream3",
     "multi_modality",
@@ -99,8 +105,13 @@ _VERIFIED_TRAINING_ARCHES: set[str] = {
     "qwen2_5_vl",
     "qwen3_5",
     "qwen3_5_moe",
+    # mlx-vlm 0.7.4+ names these as qwen3_5 / qwen3_5_moe's `text_config` decoders.
+    "qwen3_5_moe_text",
+    "qwen3_5_text",
     "qwen3_vl_moe",
     "qwen3_vl",
+    # Ternary Bonsai 2: Qwen3.5's Model with Hadamard-packed linears swapped in.
+    "prism_hadamard_qwen35",
 }
 _VERIFIED_GENERATION_ARCHES: set[str] = set()
 
@@ -213,15 +224,19 @@ _TRAINING_VERIFIER_HINTS: dict[str, str] = {
     "gemma3": "verify_gemma3",
     "gemma3n": "verify_gemma3n",
     "gemma4": "verify_gemma4",
+    "gemma4_unified": "verify_gemma4_unified",
+    "gemma4_text": "verify_gemma4_text",
     "glm_ocr": "verify_glm_ocr",
     "idefics2": "verify_idefics2",
     "idefics3": "verify_idefics3",
+    "kimi_vl": "verify_kimi_vl",
     "llama4": "verify_llama4",
     "llava": "verify_llava",
     "llava_bunny": "verify_llava_bunny",
     "llava_next": "verify_llava_next",
     "mistral3": "verify_mistral3",
     "mistral4": "verify_mistral4",
+    "moondream2": "verify_moondream2",
     "mllama": "verify_mllama",
     "moondream3": "verify_moondream3",
     "multi_modality": "verify_multi_modality",
@@ -235,6 +250,8 @@ _TRAINING_VERIFIER_HINTS: dict[str, str] = {
     "qwen2_5_vl": "verify_qwen2_5_vl",
     "qwen3_5": "verify_qwen3_5",
     "qwen3_5_moe": "verify_qwen3_5_moe",
+    "qwen3_5_moe_text": "verify_qwen3_5_moe_text",
+    "qwen3_5_text": "verify_qwen3_5_text",
     "qwen3_vl_moe": "verify_qwen3_vl_moe",
     "qwen3_vl": "verify_qwen3_vl",
     "smolvlm": "verify_smolvlm",
@@ -603,6 +620,18 @@ def list_compile_patch_primitives() -> tuple[CompilePatchPrimitive, ...]:
         CompilePatchPrimitive(
             name="padded_image_filtering",
             description="Replace Python-side padded image filtering with compile-safe MLX operations.",
+        ),
+        CompilePatchPrimitive(
+            name="static_shape_feature_compaction",
+            description="Reorder padded multimodal features instead of compacting them, so the shape stops depending on mask contents.",
+        ),
+        CompilePatchPrimitive(
+            name="training_prefill_mode_bypass",
+            description="Skip generation-only chunked-prefill bookkeeping while training, where it costs host syncs and mutable state but nothing reads it.",
+        ),
+        CompilePatchPrimitive(
+            name="presence_check_bypass",
+            description="Drop a host check for whether a token kind is present when its answer cannot change the result.",
         ),
     )
 
@@ -1940,7 +1969,6 @@ def _install_safe_fused_sdpa_mask_patches():
 
         out = original_fast_sdpa(q, k, v, scale=scale, mask=mask, **kwargs)
         if row_all_masked is not None:
-            # Restore zero-output for fully masked query rows.
             out = mx.where(
                 mx.expand_dims(row_all_masked, axis=-1),
                 mx.zeros_like(out),
@@ -2185,6 +2213,8 @@ def _explicit_position_embedding_adapter(original, replacement):
             return original(self, input_ids, pixel_values, **kwargs)
         return replacement(self, input_ids, pixel_values, **kwargs)
 
+    patched._unsloth_static_vlm_metadata = ("image_grid_thw", "video_grid_thw")
+    patched._unsloth_static_metadata_with_positions = True
     return patched
 
 
@@ -2870,6 +2900,10 @@ def _qwen3_batch_embedding_adapter(
                 )
         return features
 
+    patched._unsloth_static_vlm_metadata = (
+        ("image_grid_thw", "video_grid_thw") if replacement is not None else ()
+    )
+    patched._unsloth_static_metadata_with_positions = True
     patched._unsloth_qwen3_batch_visual_state = True
     patched._unsloth_qwen3_replaces_visual_inference = bool(
         replacement is not None
@@ -3590,8 +3624,10 @@ def _install_qwen3_family_compile_patches():
                 weight_list[i].extend(weights[i].tolist())
 
         idx_tensor = mx.array(idx_list, dtype=mx.int32)
-        weight_tensor = mx.array(weight_list, dtype=self.pos_embed.weight.dtype)
-        pos_embeds = self.pos_embed(idx_tensor) * weight_tensor[:, :, None]
+        # A quantized pos_embed's weight is packed uint32; interpolate in the rows' dtype.
+        pos_embeds = self.pos_embed(idx_tensor)
+        weight_tensor = mx.array(weight_list, dtype=pos_embeds.dtype)
+        pos_embeds = pos_embeds * weight_tensor[:, :, None]
         patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
 
         split_sizes = [int(h * w) for _, h, w in grid_spec]
@@ -3801,7 +3837,7 @@ def _install_qwen3_family_compile_patches():
             ),
         )
         _PATCHED_ARCHES.add("qwen3_vl_moe")
-    _PATCHED_ARCHES.update({"qwen3_vl", "qwen3_5", "qwen3_5_moe"})
+    _PATCHED_ARCHES.update({"qwen3_vl", "qwen3_5", "qwen3_5_moe", "prism_hadamard_qwen35"})
 
 
 def _install_glm_ocr_compile_patches():
@@ -4176,6 +4212,9 @@ def _install_paddleocr_vl_compile_patches():
     _patch_method(vision_module.Attention, "__call__", patched_paddle_attention)
     _patch_method(vision_module.VisionModel, "rot_pos_emb", patched_paddle_rot_pos_emb)
     _patch_method(vision_module.VisionModel, "__call__", patched_paddle_vision_call)
+    patched_paddle_get_input_embeddings._unsloth_static_vlm_metadata = (
+        "image_grid_thw", "video_grid_thw",
+    )
     _patch_method(module.Model, "get_input_embeddings", patched_paddle_get_input_embeddings)
     _PATCHED_ARCHES.add("paddleocr_vl")
 
@@ -4365,6 +4404,9 @@ def _install_llama_pixtral_mistral_compile_patches():
         llama4_module = None
 
     def patched_single_image_prepare_inputs(self, image_features, inputs_embeds, input_ids):
+        count = getattr(self, "_unsloth_legacy_image_token_count", None)
+        if count is not None and image_features.size // image_features.shape[-1] != count * input_ids.shape[0]:
+            raise ValueError("Unsloth MLX: legacy image feature count changed after token expansion.")
         return _merge_special_token_features_only(
             self.config.image_token_index,
             None,
@@ -4961,6 +5003,91 @@ def _install_gemma3n_compile_patches():
     _PATCHED_ARCHES.add("gemma3n")
 
 
+def _valid_first_sort_key(valid_flat, rows):
+    # The position term keeps keys distinct; MLX argsort is not guaranteed stable.
+    import mlx.core as mx
+
+    return (~valid_flat).astype(mx.int32) * rows + mx.arange(rows)
+
+
+def _static_shape_prefix_rows(features, valid_mask):
+    """Reorder valid rows first; `masked_scatter` never reads past them."""
+    import mlx.core as mx
+
+    rows = features.shape[0] * features.shape[1]
+    flat = features.reshape(rows, features.shape[-1])
+    order = mx.argsort(_valid_first_sort_key(valid_mask.reshape(rows), rows))
+    return mx.take(flat, order, axis=0)
+
+
+def _install_gemma4_unified_compile_patches():
+    module = _try_import_module("mlx_vlm.models.gemma4_unified.gemma4_unified")
+    if module is None:
+        return
+    if getattr(module, "_compact_prefix_rows", None) is not None:
+        setattr(module, "_compact_prefix_rows", _static_shape_prefix_rows)
+
+    model_cls = getattr(module, "Model", None)
+    original_update = getattr(model_cls, "_update_chunked_prefill_mode", None)
+    if original_update is None:
+        return
+
+    def patched_update_chunked_prefill_mode(self, input_ids=None, **kwargs):
+        # Skip `.item()` syncs; `BatchGenerator` reads the language model flag, so restore the config default.
+        if getattr(self, "training", False):
+            self.no_chunked_prefill = self._base_no_chunked_prefill
+            self.language_model.no_chunked_prefill = self._base_no_chunked_prefill
+            return
+        return original_update(self, input_ids=input_ids, **kwargs)
+
+    _patch_method(
+        model_cls,
+        "_update_chunked_prefill_mode",
+        patched_update_chunked_prefill_mode,
+    )
+    _PATCHED_ARCHES.add("gemma4_unified")
+
+
+def _install_gemma4_compile_patches():
+    """Vision overlay on sliding layers only, no host read (upstream's raises under mx.compile)."""
+
+    language_module = _try_import_module("mlx_vlm.models.gemma4.language")
+    text_model_cls = getattr(language_module, "Gemma4TextModel", None)
+    original_make_masks = getattr(text_model_cls, "_make_masks", None)
+    # mlx-vlm < 0.6.1 has no vision overlay and a two-argument `_make_masks`: nothing to fix.
+    if original_make_masks is None or not hasattr(
+        text_model_cls, "_apply_blockwise_bidirectional_overlay"
+    ):
+        return
+    from .utils import _SharedKVSlot
+
+    def patched_make_masks(self, h, cache, mm_token_type_ids=None):
+        # Only generation caches keep upstream's masks.
+        if any(c is not None and not isinstance(c, _SharedKVSlot) for c in cache):
+            return original_make_masks(self, h, cache, mm_token_type_ids)
+        masks = original_make_masks(self, h, cache, None)
+        n = h.shape[1]
+        if (
+            getattr(self.config, "use_bidirectional_attention", None) != "vision"
+            or mm_token_type_ids is None
+            or n <= 1
+        ):
+            return masks
+        positions = mx.arange(n)
+        in_window = mx.abs(positions[:, None] - positions[None]) < self.window_size
+        sliding = in_window & self._apply_blockwise_bidirectional_overlay(
+            language_module.create_causal_mask(n),
+            mm_token_type_ids,
+        )
+        return [
+            sliding if layer.layer_type == "sliding_attention" else mask
+            for layer, mask in zip(self.layers, masks)
+        ]
+
+    _patch_method(text_model_cls, "_make_masks", patched_make_masks)
+    _PATCHED_ARCHES.add("gemma4")
+
+
 def _install_deepseek_ocr_compile_patches():
     """Install DeepSeek OCR compile patches for SAM/projector/image merging."""
 
@@ -5078,7 +5205,7 @@ def _install_deepseek_ocr_compile_patches():
             seq_features = []
             patch_idx = 0
 
-            for image_idx, crop_shape in enumerate(images_spatial_crop or ()):
+            for image_idx, crop_shape in enumerate(() if images_spatial_crop is None else images_spatial_crop):
                 width_crop_num, height_crop_num = (int(crop_shape[0]), int(crop_shape[1]))
                 has_crops = width_crop_num > 1 or height_crop_num > 1
                 num_patches = width_crop_num * height_crop_num if has_crops else 0
@@ -5191,6 +5318,7 @@ def _install_deepseek_ocr_compile_patches():
 
             return InputEmbeddingsFeatures(inputs_embeds=input_embeds)
 
+        patched_deepseekocr_get_input_embeddings._unsloth_static_vlm_metadata = ("images_spatial_crop",)
         _patch_method(
             deepseekocr_module.Model,
             "get_input_embeddings",
@@ -5300,6 +5428,7 @@ def _install_deepseek_ocr_compile_patches():
 
         return InputEmbeddingsFeatures2(inputs_embeds=input_embeds)
 
+    patched_deepseekocr2_get_input_embeddings._unsloth_static_vlm_metadata = ("images_spatial_crop",)
     _patch_method(
         deepseekocr2_module.Model,
         "get_input_embeddings",
@@ -5542,6 +5671,7 @@ def _install_negative_image_placeholder_patches():
 
         return txt_embeds
 
+    patched_phi3_get_input_embeddings._unsloth_static_vlm_metadata = ("image_sizes",)
     _patch_method(phi3_module.Model, "get_input_embeddings", patched_phi3_get_input_embeddings)
     _patch_method(phi3_vision_module.VisionModel, "__call__", patched_phi3_vision_call)
     _PATCHED_ARCHES.add("phi3_v")
@@ -5689,6 +5819,7 @@ def _install_phi4_multimodal_patches():
             )
             return InputEmbeddingsFeatures(inputs_embeds=outputs)
 
+        patched_phi4_siglip_get_input_embeddings._unsloth_static_vlm_metadata = ("spatial_shapes",)
         _patch_method(
             phi4_siglip_module.Model,
             "get_input_embeddings",
@@ -5804,6 +5935,7 @@ def _install_phi4_multimodal_patches():
         return InputEmbeddingsFeatures(inputs_embeds=outputs)
 
     _patch_method(phi4mm_vision_module.VisionTower, "__call__", patched_phi4mm_vision_tower_call)
+    patched_phi4mm_get_input_embeddings._unsloth_static_vlm_metadata = ("spatial_shapes",)
     _patch_method(phi4mm_module.Model, "get_input_embeddings", patched_phi4mm_get_input_embeddings)
     _PATCHED_ARCHES.add("phi4mm")
 
@@ -5854,7 +5986,7 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
             name="qwen3_family_multimodal",
             description="Qwen3 VL family merge, deepstack, and vision patch set.",
             matcher=lambda arch, report: (
-                arch in {"qwen3_vl", "qwen3_5", "qwen3_5_moe"}
+                arch in {"qwen3_vl", "qwen3_5", "qwen3_5_moe", "prism_hadamard_qwen35"}
                 or (arch.startswith("qwen3") and "qwen3_deepstack_multimodal" in report.pattern_traits)
             ),
             primitive_names=(
@@ -5939,6 +6071,25 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
             adapter_name="ocr_projector_family",
             protocol_names=("multimodal_merge", "vision_attention", "cached_image_features"),
             runtime_primitive_names=("deepseek_ocr_multimodal_runtime",),
+        ),
+        CompilePatternBundle(
+            name="gemma4_unified_multimodal",
+            description="Gemma 4 unified padded-feature compaction and chunked-prefill bookkeeping.",
+            matcher=lambda arch, report: arch == "gemma4_unified",
+            primitive_names=(
+                "static_shape_feature_compaction",
+                "training_prefill_mode_bypass",
+            ),
+            adapter_name="gemma_vision_family",
+            protocol_names=("multimodal_merge",),
+            runtime_primitive_names=("gemma4_unified_multimodal_runtime",),
+        ),
+        CompilePatternBundle(
+            name="gemma4_vision_masks",
+            description="Gemma 4 vision attention masks for cache-free forwards, built as the reference does without a host read.",
+            matcher=lambda arch, report: arch == "gemma4",
+            primitive_names=("presence_check_bypass",),
+            runtime_primitive_names=("gemma4_vision_masks_runtime",),
         ),
         CompilePatternBundle(
             name="masked_scatter_multimodal",
@@ -6105,6 +6256,8 @@ def _runtime_patch_primitive_installers() -> dict[str, Callable[[], None]]:
         "single_image_token_merge_runtime": _install_llama_pixtral_mistral_compile_patches,
         "mistral4_attention_backend_runtime": _install_mistral4_compile_patches,
         "gemma3n_multiscale_fusion_runtime": _install_gemma3n_compile_patches,
+        "gemma4_unified_multimodal_runtime": _install_gemma4_unified_compile_patches,
+        "gemma4_vision_masks_runtime": _install_gemma4_compile_patches,
         "deepseek_ocr_multimodal_runtime": _install_deepseek_ocr_compile_patches,
         "masked_scatter_multimodal_runtime": _install_masked_scatter_multimodal_patches,
         "padded_image_filtering_runtime": _install_idefics_family_compile_patches,

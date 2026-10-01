@@ -41,8 +41,6 @@ def _build_model():
     return root
 
 
-# --- equivalence with the removed eval ---------------------------------------
-
 @pytest.mark.parametrize("path", [
     "model",
     "model.visual",
@@ -65,8 +63,6 @@ def test_empty_path_returns_the_root():
     model = _build_model()
     assert _get_module_attribute(model, "") is model
 
-
-# --- what eval could not do --------------------------------------------------
 
 @pytest.mark.parametrize("path", [
     "model.visual.blocks.0",
@@ -93,12 +89,9 @@ def test_a_path_component_is_a_name_not_an_expression(path):
     """The whole point. `eval` ran these; the walk looks each one up as an attribute
     name and fails, so no call, no subscript and no operator ever executes."""
     model = _build_model()
-    # eval would have happily executed the first three.
     with pytest.raises((AttributeError, IndexError, KeyError, TypeError, ValueError)):
         _get_module_attribute(model, path)
 
-
-# --- failure is loud ---------------------------------------------------------
 
 @pytest.mark.parametrize("path", [
     "does.not.exist",
@@ -110,8 +103,6 @@ def test_unresolvable_path_raises(path):
     with pytest.raises((AttributeError, IndexError, KeyError, TypeError, ValueError)):
         _get_module_attribute(_build_model(), path)
 
-
-# --- getter and setter agree -------------------------------------------------
 
 @pytest.mark.parametrize("path", [
     "model.norm.weight",
@@ -125,7 +116,7 @@ def test_round_trip_with_the_setter(path):
     assert _get_module_attribute(model, path) is value
 
 
-# --- bracket components, from the parallel review of PR #1108 -----------------
+# Bracket components, from the parallel review of PR #1108.
 
 def test_bracket_components_resolve_like_eval():
     """`peft_utils` rewrites `.0.` to `[0].`, and one of its two call sites can hand
@@ -153,7 +144,6 @@ def test_bracket_components_resolve_like_eval():
         oracle = eval("model." + path, {}, {"model": model})
         assert _get_module_attribute(model, path) is oracle, path
 
-    # The dotted-index spelling still works, and both spellings agree.
     assert _get_module_attribute(model, "blocks.0") is _get_module_attribute(model, "blocks[0]")
 
 

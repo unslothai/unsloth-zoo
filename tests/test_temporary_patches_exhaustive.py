@@ -194,7 +194,6 @@ def _maybe_skip_if_patched(cls, method_name: str, zoo_file: str) -> None:
     storage_key = _original_attr_name(cls, method_name)
     original = getattr(cls, storage_key, None)
     if original is not None:
-        # We have the upstream original stashed; tests use it directly.
         return
     qualname = getattr(live, "__qualname__", "") or ""
     if ".<locals>." in qualname and qualname.split(".", 1)[0].startswith("patch_"):
@@ -306,6 +305,84 @@ def _has_var_keyword(func) -> bool:
     return any(
         p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
     )
+
+
+def _is_passthrough(func) -> bool:
+    """Is this signature a bare (*args, **kwargs) that forwards everything?
+
+    Such a signature carries no arity information, so an arity probe can neither
+    confirm nor deny drift against it.
+    """
+    try:
+        sig = inspect.signature(func)
+    except Exception:
+        return False
+    kinds = [p.kind for p in sig.parameters.values()]
+    return (
+        inspect.Parameter.VAR_POSITIONAL in kinds
+        and inspect.Parameter.VAR_KEYWORD in kinds
+        and not any(
+            k in (inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                  inspect.Parameter.POSITIONAL_ONLY,
+                  inspect.Parameter.KEYWORD_ONLY)
+            for k in kinds
+        )
+    )
+
+
+def _unwrap_kernel_hub_func(obj, expected_name = None):
+    """Recover the Python function behind a kernels-hub replacement.
+
+    transformers swaps module functions for a `kernels.layer.layer.Func` nn.Module
+    whose forward is `(*args, **kwargs)` closing over the original. A closure can
+    hold several functions, so take a name match, else a single candidate.
+    """
+    found = []
+    for candidate in (obj, getattr(type(obj), "forward", None)):
+        if candidate is None:
+            continue
+        for cell in getattr(candidate, "__closure__", None) or ():
+            try:
+                inner = cell.cell_contents
+            except ValueError:
+                continue
+            if not (inspect.isfunction(inner) or inspect.isbuiltin(inner)):
+                continue
+            if expected_name is not None and getattr(inner, "__name__", None) == expected_name:
+                return inner
+            found.append(inner)
+    if len(found) == 1:
+        # Name miss (an upstream rename or decorator): a lone closed-over function
+        # is still what the wrapper forwards to.
+        return found[0]
+    return obj
+
+
+def _positional_arity_from_source(module, name):
+    """Count positionals on ``name`` as the module's own source defines it: a last
+    resort when the live attribute is an opaque passthrough."""
+    import ast
+
+    try:
+        source = inspect.getsource(module)
+        tree = ast.parse(source)
+    except Exception:
+        return None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            return len(node.args.posonlyargs) + len(node.args.args)
+    return None
+
+
+def _resolve_for_arity(func, expected_name = None):
+    """Strip functools.wraps chains and kernels-hub wrappers before an arity probe."""
+    seen = set()
+    while hasattr(func, "__wrapped__") and id(func) not in seen:
+        seen.add(id(func))
+        func = func.__wrapped__
+    if _is_passthrough(func):
+        func = _unwrap_kernel_hub_func(func, expected_name)
+    return func
 
 
 # bitsandbytes.py: patches bitsandbytes.nn.modules.Linear4bit.forward
@@ -436,7 +513,6 @@ def test_deepseek_v3_moe_forward_single_positional():
         pytest.skip(f"DeepseekV3MoE absent on transformers {_TX_VERSION}")
     fwd = _assert_method_exists(cls, "forward", "deepseek_v3_moe.py")
     params = _param_names(fwd)
-    # Drop "self".
     params = [p for p in params if p != "self"]
     required = [p for p in inspect.signature(fwd).parameters.values()
                 if p.name != "self" and p.default is inspect.Parameter.empty
@@ -477,7 +553,6 @@ def test_deepseek_v3_for_causal_lm_forward_named_params():
         zoo_file="deepseek_v3_moe.py",
         label="DeepseekV3ForCausalLM.forward",
     )
-    # output_router_logits: explicit param OR **kwargs passthrough.
     if "output_router_logits" not in _param_names(fwd) and not _has_var_keyword(fwd):
         pytest.fail(
             "DRIFT DETECTED: zoo temporary_patches/deepseek_v3_moe.py:171 "
@@ -2417,8 +2492,28 @@ def test_gpt_oss_attention_apply_rotary_pos_emb_imported_at_attention():
             "DRIFT DETECTED: zoo temporary_patches/gpt_oss.py:1875 expects "
             "modeling_gpt_oss.apply_rotary_pos_emb but it is missing"
         )
+    # With `kernels` installed (transformers needs it for gpt-oss MXFP4) this name is
+    # a Func nn.Module forwarding `(*args, **kwargs)`: probing the wrapper reports 0
+    # positionals and looks like drift that is not there.
+    resolved = _resolve_for_arity(apply, "apply_rotary_pos_emb")
+    if _is_passthrough(resolved):
+        count = _positional_arity_from_source(mod, "apply_rotary_pos_emb")
+        if count is None:
+            pytest.skip(
+                f"installed apply_rotary_pos_emb is a {type(apply).__name__} "
+                f"passthrough {inspect.signature(resolved)} whose target could "
+                "not be resolved, and the module source carries no def to read, "
+                "so positional arity says nothing about drift"
+            )
+        if count < 4:
+            pytest.fail(
+                f"DRIFT DETECTED: zoo temporary_patches/gpt_oss.py calls "
+                f"apply_rotary_pos_emb(q, k, cos, sin) -- 4 positionals -- but "
+                f"{mod.__name__} defines it with {count}"
+            )
+        return
     params = [
-        p for p in inspect.signature(apply).parameters.values()
+        p for p in inspect.signature(resolved).parameters.values()
         if p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD,
                       inspect.Parameter.POSITIONAL_ONLY)
     ]
@@ -2427,7 +2522,7 @@ def test_gpt_oss_attention_apply_rotary_pos_emb_imported_at_attention():
             f"DRIFT DETECTED: zoo temporary_patches/gpt_oss.py calls "
             f"apply_rotary_pos_emb(q, k, cos, sin) -- 4 positionals -- but "
             f"installed signature accepts only {len(params)}: "
-            f"{inspect.signature(apply)}"
+            f"{inspect.signature(resolved)}"
         )
 
 
@@ -2513,8 +2608,6 @@ def test_gemma3_processor_kwargs_class_present():
             f"{_TX_VERSION}"
         )
 
-
-# gemma3n.py additional pins.
 
 def test_gemma3n_for_conditional_generation_class_present():
     """gemma3n.py patches Gemma3nModel.get_placeholder_mask; pin
@@ -2646,8 +2739,6 @@ def test_modeling_outputs_moe_causal_lm_output_with_past_kwargs():
             )
 
 
-# Caches the patches require.
-
 def test_static_cache_class_present():
     """gemma.py:255 isinstance(past_key_values, StaticCache)."""
     cu = importlib.import_module("transformers.cache_utils")
@@ -2698,8 +2789,6 @@ def test_hybrid_cache_class_present():
     )
 
 
-# bitsandbytes.py: Linear4bit __init__ signature pin.
-
 def test_bitsandbytes_linear4bit_init_signature():
     """bitsandbytes.py:46-47 needs
     ``bitsandbytes.nn.modules.Linear4bit.__init__(input_features,
@@ -2720,8 +2809,6 @@ def test_bitsandbytes_linear4bit_init_signature():
     )
 
 
-# pixtral.py: PixtralVisionConfig.
-
 def test_pixtral_vision_config_class_present():
     """pixtral.py:36 reads self.config attrs; pin PixtralVisionConfig."""
     cls = _try_get_class(
@@ -2735,8 +2822,6 @@ def test_pixtral_vision_config_class_present():
             f"{_TX_VERSION}"
         )
 
-
-# gemma3n.py: Gemma3nTextConfig pin (AltUp.predict config typing).
 
 def test_gemma3n_text_config_class_present():
     """gemma3n.py:101-114 reads
@@ -2762,8 +2847,6 @@ def test_gemma3n_text_config_class_present():
             )
 
 
-# Auto-attention function dictionary for gemma3 patch chain.
-
 def test_gemma3_eager_attention_forward_kwargs_supported():
     """gemma.py:407-412 calls ``eager_attention_forward(...,
     dropout, scaling, sliding_window, **kwargs)``."""
@@ -2776,8 +2859,6 @@ def test_gemma3_eager_attention_forward_kwargs_supported():
             f"{inspect.signature(eager_attention_forward)}"
         )
 
-
-# Sanity: temporary_patches/ inventory.
 
 def test_temporary_patches_directory_has_expected_files():
     """Pin the floor set of patch files; new files OK, missing -> DRIFT."""
@@ -2811,10 +2892,8 @@ def test_a_broken_dependency_is_not_reported_as_upstream_drift():
     timm dropped, so eight tests announced "missing on transformers 4.57.6"
     about classes transformers 4.57.6 ships.
     """
-    # Absent module: still None, so the callers still judge it.
     assert _try_get_class("transformers.models.not_a_real_model_xyz", "Whatever") is None
 
-    # Present but raising, on a dependency of its own: skipped, not blamed.
     module_name = "_zoo_probe_broken_import"
     module = types.ModuleType(module_name)
 

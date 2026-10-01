@@ -87,8 +87,6 @@ class _CudaCallRecorder:
 
 
 def test_cpu_model_never_touches_a_gpu(monkeypatch):
-    # A rank that holds no CUDA tensors must not initialise a context anywhere,
-    # however many GPUs it can see. Faked so the claim is tested on any runner.
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 8)
 
