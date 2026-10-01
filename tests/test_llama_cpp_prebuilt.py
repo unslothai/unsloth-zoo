@@ -1,6 +1,3 @@
-# Tests for the prebuilt-first llama.cpp install path: release resolution,
-# asset selection, archive extraction/placement, fallback-to-compile contract,
-# and reuse of an existing prebuilt install without deletion.
 
 from __future__ import annotations
 
@@ -65,8 +62,6 @@ def _patch_platform(monkeypatch, system, machine):
     monkeypatch.setattr(llama_cpp.platform, "machine", lambda: machine)
 
 
-# --- asset selection ---------------------------------------------------------
-
 @pytest.mark.parametrize("system,machine,expected", [
     ("Linux",   "x86_64",  "llama-b9000-bin-ubuntu-x64.tar.gz"),
     ("Linux",   "AMD64",   "llama-b9000-bin-ubuntu-x64.tar.gz"),
@@ -100,8 +95,6 @@ def test_select_asset_missing_from_release(monkeypatch):
     assert llama_cpp._select_prebuilt_asset(tag, assets) is None
 
 
-# --- release resolution ------------------------------------------------------
-
 def test_resolve_release_env_pin_hits_tag_endpoint(monkeypatch):
     seen = {}
     class FakeResponse:
@@ -127,8 +120,6 @@ def test_resolve_release_failure_returns_none(monkeypatch):
     monkeypatch.setattr(llama_cpp, "_requests_get_with_retries", fake_get)
     assert llama_cpp._resolve_llama_cpp_release() is None
 
-
-# --- gates -------------------------------------------------------------------
 
 def test_force_compile_skips_prebuilt(monkeypatch, tmp_path):
     monkeypatch.setenv("UNSLOTH_LLAMA_FORCE_COMPILE", "1")
@@ -285,8 +276,6 @@ def test_gpu_sha256_mismatch_falls_back(monkeypatch, tmp_path):
     assert not os.path.exists(folder)
 
 
-# --- extraction and placement ------------------------------------------------
-
 def test_extract_rejects_path_traversal(tmp_path):
     evil = tmp_path / "evil.tar.gz"
     with tarfile.open(evil, "w:gz") as tar:
@@ -312,6 +301,67 @@ def test_extract_rejects_symlink_escape(tmp_path):
     with pytest.raises(RuntimeError, match = "escapes extraction dir"):
         llama_cpp._extract_archive(str(evil), str(tmp_path / "out"))
     assert not (outside / "pwned.txt").exists()
+
+
+@pytest.mark.skipif(not IS_POSIX, reason = "symlink extraction (POSIX)")
+@pytest.mark.parametrize("data_filter", [True, False], ids = ["data_filter", "no_data_filter"])
+def test_extract_rejects_chained_symlink_escape(tmp_path, monkeypatch, data_filter):
+    # Each link resolves inside when checked up front against an empty tree; only
+    # once `sub -> .` exists does `sub/up -> ..` point above the extraction dir.
+    if data_filter and not hasattr(tarfile, "data_filter"):
+        pytest.skip("tarfile has no data filter on this Python")
+    if not data_filter:
+        monkeypatch.delattr(tarfile, "data_filter", raising = False)
+    evil = tmp_path / "evil-chain.tar.gz"
+    out = tmp_path / "stage" / "out"
+    out.parent.mkdir()
+    with tarfile.open(evil, "w:gz") as tar:
+        _add_link(tar, "sub", ".")
+        _add_link(tar, "sub/up", "..")
+        _add_file(tar, "sub/up/pwned.txt", "pwned")
+    with pytest.raises(Exception):
+        llama_cpp._extract_archive(str(evil), str(out))
+    assert not (out.parent / "pwned.txt").exists()
+
+
+@pytest.mark.skipif(not IS_POSIX, reason = "symlink extraction (POSIX)")
+def test_extract_without_data_filter_rejects_hardlink_alias_of_symlink(tmp_path, monkeypatch):
+    monkeypatch.delattr(tarfile, "data_filter", raising = False)
+    evil = tmp_path / "evil-alias.tar.gz"
+    out = tmp_path / "stage" / "out"
+    out.parent.mkdir()
+    with tarfile.open(evil, "w:gz") as tar:
+        _add_link(tar, "dir/sym", "..")
+        _add_link(tar, "alias", "dir/sym", link_type = tarfile.LNKTYPE)
+        _add_file(tar, "alias/pwned.txt", "pwned")
+    with pytest.raises(RuntimeError, match = "goes through a link"):
+        llama_cpp._extract_archive(str(evil), str(out))
+    assert not (out.parent / "pwned.txt").exists()
+
+
+@pytest.mark.parametrize("name", ["sub\\pwned.txt", "SUB/pwned.txt"], ids = ["backslash", "case"])
+def test_extract_without_data_filter_canonicalizes_link_paths(tmp_path, monkeypatch, name):
+    monkeypatch.delattr(tarfile, "data_filter", raising = False)
+    monkeypatch.setattr(llama_cpp.tarfile.TarFile, "extractall", lambda *a, **k: None)
+    evil = tmp_path / "evil-backslash.tar.gz"
+    with tarfile.open(evil, "w:gz") as tar:
+        _add_link(tar, "sub", ".")
+        _add_file(tar, name, "pwned")
+    with pytest.raises(RuntimeError, match = "goes through a link"):
+        llama_cpp._extract_archive(str(evil), str(tmp_path / "out"))
+
+
+@pytest.mark.skipif(not IS_POSIX, reason = "symlink extraction (POSIX)")
+def test_extract_without_data_filter_keeps_library_symlinks(tmp_path, monkeypatch):
+    monkeypatch.delattr(tarfile, "data_filter", raising = False)
+    archive = tmp_path / "libs.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        _add_file(tar, "build/bin/libllama.so.0.0.1", "elf")
+        _add_link(tar, "build/bin/libllama.so.0", "libllama.so.0.0.1")
+        _add_link(tar, "build/bin/libllama.so", "libllama.so.0")
+    out = tmp_path / "out"
+    llama_cpp._extract_archive(str(archive), str(out))
+    assert (out / "build" / "bin" / "libllama.so").read_text() == "elf"
 
 
 def test_extract_rejects_hardlink_escape(tmp_path):
@@ -409,11 +459,8 @@ def test_extract_and_place_windows_zip(monkeypatch, tmp_path):
     assert (release / "llama-quantize.exe").is_file()
     assert (release / "llama-cli.exe").is_file()
     assert (release / "ggml.dll").is_file()
-    # On Windows nothing is placed at the flat install root.
     assert not (install / "llama-quantize.exe").exists()
 
-
-# --- full install orchestration ----------------------------------------------
 
 def _wire_fake_downloads(monkeypatch, tmp_path, tag, quantize_script = FAKE_QUANTIZE):
     """Point release resolution and downloads at local fixture archives."""
@@ -455,7 +502,6 @@ def test_full_prebuilt_install_happy_path(monkeypatch, tmp_path):
     marker = json.load(open(os.path.join(folder, llama_cpp.UNSLOTH_PREBUILT_INFO_FILENAME)))
     assert marker["tag"] == "b9000"
     assert marker["asset"] == "llama-b9000-bin-ubuntu-x64.tar.gz"
-    # Staging directories are cleaned up
     leftovers = [e for e in os.listdir(tmp_path) if e.startswith(".llama_cpp_prebuilt_")]
     assert leftovers == []
 
@@ -465,7 +511,6 @@ def test_validation_failure_falls_back(monkeypatch, tmp_path):
     _wire_fake_downloads(monkeypatch, tmp_path, "b9000", quantize_script = FAKE_QUANTIZE_BROKEN)
     folder = str(tmp_path / "llama.cpp")
     assert llama_cpp._install_llama_cpp_prebuilt(folder) is None
-    # A failed install never materializes the target folder
     assert not os.path.exists(folder)
 
 
@@ -546,14 +591,12 @@ def test_select_cpu_assets_unsupported(monkeypatch, system, machine):
 
 
 def test_select_cpu_assets_macos_missing_bundle(monkeypatch):
-    # Darwin asks for the Metal bundle by convention; absent -> no fork CPU asset.
     _patch_platform(monkeypatch, "Darwin", "arm64")
     assets = {k: v for k, v in FORK_ASSETS.items() if k != "llama-b9585-bin-macos-arm64.tar.gz"}
     assert llama_cpp._select_cpu_assets("b9585", assets, FORK_MANIFEST) == []
 
 
 def test_select_cpu_assets_linux_missing_from_release(monkeypatch):
-    # Manifest lists linux-cpu but the asset isn't in the release map -> skipped.
     _patch_platform(monkeypatch, "Linux", "x86_64")
     assets = {k: v for k, v in FORK_ASSETS.items() if k != "app-b9585-linux-x64-cpu.tar.gz"}
     assert llama_cpp._select_cpu_assets("b9585", assets, FORK_MANIFEST) == []
@@ -594,7 +637,6 @@ def test_hydrate_strips_mix_tag_when_no_fork_source(monkeypatch, tmp_path):
 
 
 def test_hydrate_plain_ggml_tag_unchanged(monkeypatch, tmp_path):
-    # A plain ggml-org tag carries no -mix- suffix, so resolution is a no-op.
     seen = _capture_hydrate_url(monkeypatch)
     with pytest.raises(RuntimeError):
         llama_cpp._hydrate_converter_sources("b9000", str(tmp_path / "install"))
@@ -616,7 +658,14 @@ def _wire_attempt_recorder(monkeypatch, *, fork_release, ggml_release, manifest 
         llama_cpp, "_fetch_release_json_asset",
         lambda assets, name: manifest if "manifest" in name else {"artifacts": {}},
     )
-    def fake_stage(folder, tag, asset_name, asset_url, expected_sha256 = None, repo = None, source_assets = None):
+    def fake_stage(
+        folder, tag, asset_name, asset_url, expected_sha256 = None, repo = None,
+        source_assets = None, checksums = None,
+    ):
+        # The checksum map has to reach here: it is what the source archive
+        # the converter is copied out of gets verified against, and a double
+        # that silently dropped it would let that plumbing rot unnoticed.
+        assert checksums is not None, "the checksum map did not reach staging"
         calls.append((repo, asset_name))
         raise RuntimeError("forced fall-through")
     monkeypatch.setattr(llama_cpp, "_stage_prebuilt_install", fake_stage)
@@ -626,7 +675,6 @@ def _wire_attempt_recorder(monkeypatch, *, fork_release, ggml_release, manifest 
 
 
 def test_attempt_order_cpu_only_linux(monkeypatch, tmp_path):
-    # gpu_support=False on Linux: fork CPU bundle first, ggml-org CPU as tertiary.
     _patch_platform(monkeypatch, "Linux", "x86_64")
     monkeypatch.delenv("UNSLOTH_LLAMA_FORCE_COMPILE", raising = False)
     ggml = _fake_release("b9000", ["llama-b9000-bin-ubuntu-x64.tar.gz"])
@@ -683,7 +731,11 @@ def test_attempt_order_darwin_fork_only_no_ggml(monkeypatch, tmp_path):
         lambda assets, name: FORK_MANIFEST if "manifest" in name else {"artifacts": {}},
     )
     calls = []
-    def fake_stage(folder, tag, asset_name, asset_url, expected_sha256 = None, repo = None, source_assets = None):
+    def fake_stage(
+        folder, tag, asset_name, asset_url, expected_sha256 = None, repo = None,
+        source_assets = None, checksums = None,
+    ):
+        assert checksums is not None, "the checksum map did not reach staging"
         calls.append((repo, asset_name))
         raise RuntimeError("forced")
     monkeypatch.setattr(llama_cpp, "_stage_prebuilt_install", fake_stage)
@@ -694,7 +746,6 @@ def test_attempt_order_darwin_fork_only_no_ggml(monkeypatch, tmp_path):
 
 
 def test_attempt_order_fork_unreachable_uses_ggml(monkeypatch, tmp_path):
-    # Fork release resolution fails -> ggml-org CPU is still tried (resilience).
     _patch_platform(monkeypatch, "Linux", "x86_64")
     monkeypatch.delenv("UNSLOTH_LLAMA_FORCE_COMPILE", raising = False)
     ggml = _fake_release("b9000", ["llama-b9000-bin-ubuntu-x64.tar.gz"])
@@ -751,15 +802,12 @@ def test_cpu_fork_full_install_happy_path(monkeypatch, tmp_path):
     marker = json.load(open(os.path.join(folder, llama_cpp.UNSLOTH_PREBUILT_INFO_FILENAME)))
     assert marker["repo"] == "unslothai/llama.cpp"
     assert marker["asset"] == asset
-    # Converter hydrated from the fork's own source asset, not ggml-org codeload.
     from urllib.parse import urlparse
     assert f"https://example.invalid/{fork_source}" in downloaded
     assert all(urlparse(u).netloc != "codeload.github.com" for u in downloaded)
 
 
 def test_force_compile_skips_prebuilt_gpu(monkeypatch, tmp_path):
-    # UNSLOTH_LLAMA_FORCE_COMPILE=1 must bypass the prebuilt path for gpu_support=True
-    # too (no release resolution, no GPU probing).
     monkeypatch.setenv("UNSLOTH_LLAMA_FORCE_COMPILE", "1")
     def boom(*a, **k):
         raise AssertionError("network must not be touched")

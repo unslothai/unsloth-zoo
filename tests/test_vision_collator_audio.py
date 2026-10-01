@@ -31,6 +31,7 @@ Hermetic CPU tests with stub processors, no model or network needed:
 
 from __future__ import annotations
 
+import inspect
 import os
 import subprocess
 import sys
@@ -43,6 +44,8 @@ import torch
 
 from unsloth_zoo.vision_utils import (
     UnslothVisionDataCollator,
+    _audio_call_kwarg,
+    _audio_sub_processors,
     _fix_audio_feature_extractor_padding_side,
     _is_audio_mapping,
     extract_audio_info,
@@ -91,10 +94,6 @@ def msgs(part):
 CLIP = np.zeros(16, dtype=np.float32)
 
 
-# ---------------------------------------------------------------------------
-# extract_audio_info
-# ---------------------------------------------------------------------------
-
 def test_inline_array():
     out = extract_audio_info(msgs({"type": "audio", "audio": CLIP}))
     assert len(out) == 1 and out[0] is CLIP
@@ -112,8 +111,42 @@ def test_inline_url_and_path_resolved():
         assert out == ["/tmp/a.wav"]
 
 
+# Qwen2AudioProcessor's chat template renders <|AUDIO|> for `audio_url` parts.
+def test_inline_qwen_audio_url_resolved():
+    url = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen2-Audio/audio/glass-breaking-151256.mp3"
+    out = extract_audio_info(msgs({"type": "audio", "audio_url": url}))
+    assert out == [url]
+
+
+def test_audio_url_does_not_shadow_the_generic_keys():
+    part = {"type": "audio", "url": "/tmp/generic.wav", "audio_url": "/tmp/qwen.wav"}
+    assert extract_audio_info(msgs(part)) == ["/tmp/generic.wav"]
+    part = {"type": "audio", "audio": CLIP, "audio_url": "/tmp/qwen.wav"}
+    assert extract_audio_info(msgs(part))[0] is CLIP
+
+
+def test_qwen_audio_url_template_parity():
+    transformers = pytest.importorskip("transformers")
+    jinja2 = pytest.importorskip("jinja2")
+    from transformers.models.qwen2_audio.processing_qwen2_audio import Qwen2AudioProcessor
+    template = Qwen2AudioProcessor.default_chat_template
+    if isinstance(template, property):
+        template = template.fget(None)
+    render = jinja2.Environment().from_string(template).render
+    for part in (
+        {"type": "audio", "audio_url": "/tmp/a.wav"},
+        {"type": "audio", "audio": "/tmp/a.wav"},
+    ):
+        conversation = msgs(part)
+        n_placeholders = render(messages=conversation).count("<|AUDIO|>")
+        assert n_placeholders == 1, part
+        assert len(extract_audio_info(conversation)) == n_placeholders, part
+
+
 def test_inline_no_payload_raises():
     with pytest.raises(ValueError, match="cannot be loaded"):
+        extract_audio_info(msgs({"type": "audio"}))
+    with pytest.raises(ValueError, match="audio_url"):
         extract_audio_info(msgs({"type": "audio"}))
 
 
@@ -128,10 +161,6 @@ def test_non_audio_parts_ignored():
     assert out == []
 
 
-# ---------------------------------------------------------------------------
-# _extract_audio_for_example
-# ---------------------------------------------------------------------------
-
 def test_top_level_dict_unwrapped():
     collator = make_collator()
     out = collator._extract_audio_for_example(
@@ -144,6 +173,25 @@ def test_top_level_dict_rate_mismatch_raises():
     with pytest.raises(ValueError, match="sampling_rate"):
         collator._extract_audio_for_example(
             {"audio": {"array": CLIP, "sampling_rate": 44100}}, [])
+
+
+class _AudioProcessorProcessor:
+    def __init__(self):
+        self.tokenizer = _FakeTokenizer()
+        self.audio_processor = _FakeFeatureExtractor()
+
+
+def test_audio_processor_sampling_rate_mismatch_raises():
+    collator = UnslothVisionDataCollator.__new__(UnslothVisionDataCollator)
+    collator.processor = _AudioProcessorProcessor()
+    collator.max_seq_length = 4
+    collator.truncation = True
+    with pytest.raises(ValueError, match="sampling_rate"):
+        collator._extract_audio_for_example(
+            {"audio": {"array": CLIP, "sampling_rate": 44100}}, [])
+    out = collator._extract_audio_for_example(
+        {"audio": {"array": CLIP, "sampling_rate": 16000}}, [])
+    assert len(out) == 1
 
 
 def test_top_level_flat_list_is_one_clip():
@@ -251,10 +299,6 @@ def test_inline_audio_decode_false_dict_resolved():
     assert out == ["/tmp/a.wav"]
 
 
-# ---------------------------------------------------------------------------
-# _fix_audio_feature_extractor_padding_side
-# ---------------------------------------------------------------------------
-
 def test_left_padded_feature_extractor_reset_to_right():
     proc = _FakeProcessor()
     proc.feature_extractor.padding_side = "left"
@@ -269,6 +313,16 @@ def test_right_padded_feature_extractor_untouched():
     assert proc.feature_extractor.padding_side == "right"
 
 
+def test_left_padded_audio_processor_reset_to_right():
+    class _AudioProcessorOnly:
+        def __init__(self):
+            self.audio_processor = _FakeFeatureExtractor()
+    proc = _AudioProcessorOnly()
+    proc.audio_processor.padding_side = "left"
+    _fix_audio_feature_extractor_padding_side(proc)
+    assert proc.audio_processor.padding_side == "right"
+
+
 def test_processor_without_feature_extractor_noop():
     class _TextOnly:
         pass
@@ -280,10 +334,6 @@ def test_feature_extractor_without_padding_side_noop():
     _fix_audio_feature_extractor_padding_side(proc)
     assert not hasattr(proc.feature_extractor, "padding_side")
 
-
-# ---------------------------------------------------------------------------
-# _truncate_sequence_tensors
-# ---------------------------------------------------------------------------
 
 def _batch_left_padded():
     # seq_len 6, max_seq_length 4. Row 0 is short (2 left pads + 2 audio + 2
@@ -307,7 +357,6 @@ def test_truncation_left_padding_keeps_short_row_content():
     # Short row keeps its content (audio span intact), not its padding
     assert batch["input_ids"][0].tolist() == [AUDIO_ID, AUDIO_ID, 5, 6]
     assert batch["attention_mask"][0].tolist() == [1, 1, 1, 1]
-    # Long row truncates its tail
     assert batch["input_ids"][1].tolist() == [1, 2, 3, 4]
     assert batch["attention_mask"].shape == (2, 4)
     assert batch["mm_token_type_ids"].shape == (2, 4)
@@ -340,7 +389,6 @@ def test_truncation_cutting_audio_span_raises():
         collator._truncate_sequence_tensors(batch, seq_len=6)
 
 
-# ---------------------------------------------------------------------------
 # datasets >= 4 torchcodec AudioDecoder columns (unsloth/unsloth#7226)
 #
 # patch_torchcodec_audio_decoder grafts the mapping protocol onto AudioDecoder
@@ -348,7 +396,6 @@ def test_truncation_cutting_audio_span_raises():
 # it, dropped it into the raw-waveform catch-all and blew up inside np.fft.rfft.
 # _FakeAudioDecoder mirrors the patched surface and runs in CI; the real-decoder
 # tests below need datasets >= 4 + torchcodec and skip otherwise.
-# ---------------------------------------------------------------------------
 
 DECODED = np.linspace(-0.5, 0.5, 32, dtype=np.float32)
 
@@ -432,8 +479,6 @@ def test_non_mapping_audio_values_are_not_treated_as_mappings(value):
     assert not _is_audio_mapping(value)
 
 
-# --- the real decoder, when the optional deps are installed ----------------
-
 def _real_decoder():
     datasets = pytest.importorskip("datasets", minversion="4.0.0")
     pytest.importorskip("torchcodec")
@@ -479,7 +524,6 @@ def test_real_decoder_decodes_to_float32_at_every_gate(gate):
     assert clips[0].ndim == 1
 
 
-# ---------------------------------------------------------------------------
 # Unpatched torchcodec AudioDecoder (unsloth/unsloth#7226, follow-up)
 #
 # Driving the collator without importing `unsloth` skips
@@ -489,7 +533,6 @@ def test_real_decoder_decodes_to_float32_at_every_gate(gate):
 # In CI (no torchcodec) a fake stands in as the decoder type via _audio_decoder_types;
 # the real-decoder variant runs in a fresh subprocess since the patch mutates the
 # class process-wide.
-# ---------------------------------------------------------------------------
 
 
 class _UnpatchedFakeAudioDecoder:
@@ -506,7 +549,6 @@ class _UnpatchedFakeAudioDecoder:
 
 @pytest.fixture
 def _recognize_unpatched_decoder(monkeypatch):
-    # Treat _UnpatchedFakeAudioDecoder as the decoder type so these run in CI.
     # Patch the imported module object directly rather than the
     # "unsloth_zoo.vision_utils._audio_decoder_types" string path: the string
     # form resolves unsloth_zoo through sys.modules at runtime, so a preceding
@@ -540,7 +582,6 @@ def test_unpatched_decoder_top_level_gate(_recognize_unpatched_decoder):
 
 
 def test_unpatched_decoder_list_gate(_recognize_unpatched_decoder):
-    # A list of decoders is a list of clips.
     collator = make_collator()
     clips = collator._extract_audio_for_example(
         {"audio": [_UnpatchedFakeAudioDecoder(), _UnpatchedFakeAudioDecoder()]},
@@ -591,6 +632,290 @@ def test_userdict_audio_payload_resolves():
     np.testing.assert_allclose(clips[0], DECODED)
 
 
+from types import SimpleNamespace
+
+
+class _ChatTemplateMixin:
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False,
+                            **kwargs):
+        out = []
+        for m in messages:
+            content = m.get("content", "")
+            if isinstance(content, str):
+                out.append(content)
+            else:
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        out.append(part.get("text", ""))
+        return " ".join(out)
+
+
+class _AudioOnlyProcessor(_ChatTemplateMixin):
+    def __init__(self):
+        self.tokenizer = _FakeTokenizer()
+        self.feature_extractor = _FakeFeatureExtractor()
+
+
+class _VisionProcessor(_ChatTemplateMixin):
+    def __init__(self):
+        self.tokenizer = _FakeTokenizer()
+        self.image_processor = object()
+
+
+class _AudioProcessorAttrProcessor(_ChatTemplateMixin):
+    def __init__(self):
+        self.tokenizer = _FakeTokenizer()
+        self.audio_processor = _FakeFeatureExtractor()
+
+
+# hasattr() is True but the value is None: must still be rejected.
+class _NoneImageProcessor(_ChatTemplateMixin):
+    def __init__(self):
+        self.tokenizer = _FakeTokenizer()
+        self.image_processor = None
+
+
+class _TextOnlyProcessor(_ChatTemplateMixin):
+    def __init__(self):
+        self.tokenizer = _FakeTokenizer()
+
+
+def _stub_model():
+    emb = SimpleNamespace(weight=torch.zeros(1, dtype=torch.float32))
+    return SimpleNamespace(
+        config=SimpleNamespace(torch_dtype="float32"),
+        get_input_embeddings=lambda: emb,
+    )
+
+
+def test_audio_only_processor_constructs():
+    collator = UnslothVisionDataCollator(model=_stub_model(), processor=_AudioOnlyProcessor())
+    assert collator.processor.__class__.__name__ == "_AudioOnlyProcessor"
+    assert AUDIO_ID in collator.padding_token_ids.tolist()
+    assert PAD_ID in collator.padding_token_ids.tolist()
+
+
+def test_audio_processor_attribute_processor_constructs():
+    collator = UnslothVisionDataCollator(
+        model=_stub_model(), processor=_AudioProcessorAttrProcessor(),
+    )
+    assert collator.processor.__class__.__name__ == "_AudioProcessorAttrProcessor"
+    assert AUDIO_ID in collator.padding_token_ids.tolist()
+
+
+def test_none_image_processor_still_rejected():
+    with pytest.raises(TypeError, match="image or audio processor"):
+        UnslothVisionDataCollator(model=_stub_model(), processor=_NoneImageProcessor())
+
+
+def test_text_only_processor_still_rejected():
+    with pytest.raises(TypeError, match="image or audio processor"):
+        UnslothVisionDataCollator(model=_stub_model(), processor=_TextOnlyProcessor())
+
+
+def test_vision_processor_still_constructs():
+    collator = UnslothVisionDataCollator(model=_stub_model(), processor=_VisionProcessor())
+    assert getattr(collator.processor, "image_processor", None) is not None
+
+
+# VoxtralProcessor.__call__ is (text, **kwargs): no audio= to batch through.
+class _VoxtralLikeProcessor(_ChatTemplateMixin):
+    def __init__(self):
+        self.tokenizer = _FakeTokenizer()
+        self.feature_extractor = _FakeFeatureExtractor()
+
+    def __call__(self, text, **kwargs):  # no audio= -> unsupported by the collator
+        raise AssertionError("collator must reject before ever calling __call__")
+
+
+class _AudioKwargProcessor(_ChatTemplateMixin):
+    def __init__(self):
+        self.tokenizer = _FakeTokenizer()
+        self.feature_extractor = _FakeFeatureExtractor()
+
+    def __call__(self, text=None, audio=None, **kwargs):
+        return {}
+
+
+def test_audio_processor_without_audio_kwarg_rejected():
+    with pytest.raises(TypeError, match="does not yet support|apply_chat_template"):
+        UnslothVisionDataCollator(model=_stub_model(), processor=_VoxtralLikeProcessor())
+
+
+def test_audio_processor_with_audio_kwarg_constructs():
+    collator = UnslothVisionDataCollator(model=_stub_model(), processor=_AudioKwargProcessor())
+    assert collator.processor.__class__.__name__ == "_AudioKwargProcessor"
+    assert AUDIO_ID in collator.padding_token_ids.tolist()
+
+
+def test_capability_check_matches_real_transformers_processors():
+    transformers = pytest.importorskip("transformers")
+    Voxtral = getattr(transformers, "VoxtralProcessor", None)
+    Qwen2Audio = getattr(transformers, "Qwen2AudioProcessor", None)
+    if Voxtral is None or Qwen2Audio is None:
+        pytest.skip("Voxtral/Qwen2Audio not present in this transformers build")
+    vox = inspect.signature(Voxtral.__call__).parameters
+    qwen = inspect.signature(Qwen2Audio.__call__).parameters
+    assert "audio" not in vox and "audios" not in vox, (
+        "VoxtralProcessor.__call__ unexpectedly grew an audio= param; revisit the guard"
+    )
+    assert "audio" in qwen or "audios" in qwen
+    assert _audio_call_kwarg(Voxtral) is None
+    assert _audio_call_kwarg(Qwen2Audio) == "audio"
+
+
+class _AudiosOnlyProcessor(_ChatTemplateMixin):
+    def __init__(self):
+        self.tokenizer = _FakeTokenizer()
+        self.feature_extractor = _FakeFeatureExtractor()
+        self.calls = []
+
+    def __call__(self, text=None, audios=None, padding=None, padding_side="right",
+                 return_tensors=None, add_special_tokens=None, **kwargs):
+        self.calls.append((audios, sorted(kwargs)))
+        n = len(text) if isinstance(text, (list, tuple)) else 1
+        return {
+            "input_ids": torch.tensor([[PAD_ID, AUDIO_ID, 5, 6]] * n),
+            "attention_mask": torch.tensor([[0, 1, 1, 1]] * n),
+            "input_features": torch.zeros(n, 128, 3000),
+        }
+
+
+AUDIO_EXAMPLE = {"messages": [
+    {"role": "user", "content": [
+        {"type": "audio", "audio": CLIP}, {"type": "text", "text": "hi"}]},
+    {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+]}
+
+
+def _assert_clips_arrived_under_plural(proc):
+    delivered = [audios for audios, _ in proc.calls if audios]
+    assert len(delivered) == 1 and len(delivered[0]) == 1, (
+        "clips were sent under a keyword this processor does not read; "
+        f"calls={proc.calls}"
+    )
+    assert all("audio" not in stray for _, stray in proc.calls), proc.calls
+
+
+def test_audios_only_processor_gets_the_plural_kwarg_in_call_path():
+    proc = _AudiosOnlyProcessor()
+    collator = UnslothVisionDataCollator(model=_stub_model(), processor=proc)
+    assert collator.audio_call_kwarg == "audios"
+    collator([AUDIO_EXAMPLE])
+    _assert_clips_arrived_under_plural(proc)
+
+
+def test_audios_only_processor_gets_the_plural_kwarg_in_prompt_completion_path():
+    proc = _AudiosOnlyProcessor()
+    collator = UnslothVisionDataCollator(model=_stub_model(), processor=proc)
+    collator([{
+        "prompt": AUDIO_EXAMPLE["messages"][:1],
+        "completion": AUDIO_EXAMPLE["messages"][1:],
+    }])
+    _assert_clips_arrived_under_plural(proc)
+
+
+def test_singular_kwarg_still_used_for_audio_processors():
+    collator = UnslothVisionDataCollator(model=_stub_model(), processor=_AudioKwargProcessor())
+    assert collator.audio_call_kwarg == "audio"
+    vision = UnslothVisionDataCollator(model=_stub_model(), processor=_VisionProcessor())
+    assert vision.audio_call_kwarg == "audio"
+
+
+def _processor_attrs(cls):
+    attrs = getattr(cls, "attributes", None)
+    if attrs: return list(attrs)
+    try:
+        return list(inspect.signature(cls.__init__).parameters)
+    except (TypeError, ValueError):
+        return []
+
+
+def test_every_transformers_audio_processor_is_classified_by_what_it_accepts():
+    pytest.importorskip("transformers")
+    import importlib, pkgutil
+    import transformers.models as models_pkg
+
+    checked = 0
+    for module_info in pkgutil.iter_modules(models_pkg.__path__):
+        name = module_info.name
+        try:
+            module = importlib.import_module(f"transformers.models.{name}.processing_{name}")
+        except Exception:
+            continue
+        for cls in vars(module).values():
+            if not inspect.isclass(cls) or cls.__module__ != module.__name__: continue
+            if not ({"feature_extractor", "audio_processor"} & set(_processor_attrs(cls))): continue
+            try:
+                params = inspect.signature(cls.__call__).parameters
+            except (TypeError, ValueError):
+                continue
+            checked += 1
+            kwarg = _audio_call_kwarg(cls)
+            if kwarg is None:
+                assert "audio" not in params and "audios" not in params, cls.__name__
+            else:
+                assert kwarg in params, f"{cls.__name__}: __call__ has no {kwarg}="
+    assert checked > 10, f"only inspected {checked} audio processors; scan broke"
+
+
+class _RoundTripAudioProcessor(_AudioOnlyProcessor):
+    def __call__(self, text=None, audio=None, padding=None, return_tensors=None,
+                 add_special_tokens=None, **kwargs):
+        input_ids = torch.tensor([[PAD_ID, AUDIO_ID, AUDIO_ID, 5, 6]])
+        return {
+            "input_ids": input_ids,
+            "attention_mask": torch.tensor([[0, 1, 1, 1, 1]]),
+            "input_features": torch.zeros(1, 128, 3000),
+            "feature_attention_mask": torch.ones(1, 3000),
+        }
+
+
+def test_audio_only_collator_masks_audio_and_pad_tokens():
+    collator = UnslothVisionDataCollator(model=_stub_model(), processor=_RoundTripAudioProcessor())
+    example = {"messages": [
+        {"role": "user", "content": [
+            {"type": "audio", "audio": CLIP}, {"type": "text", "text": "hi"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+    ]}
+    batch = collator([example])
+    assert "input_features" in batch and tuple(batch["input_features"].shape) == (1, 128, 3000)
+    labels = batch["labels"][0].tolist()
+    ids = batch["input_ids"][0].tolist()
+    for tok, lab in zip(ids, labels):
+        if tok in (AUDIO_ID, PAD_ID):
+            assert lab == -100, f"token {tok} should be masked"
+        else:
+            assert lab == tok, f"real token {tok} should be kept"
+
+
+@pytest.mark.parametrize("model_id", ["Qwen/Qwen2-Audio-7B-Instruct"])
+def test_real_audio_processor_constructs_and_round_trips(model_id):
+    transformers = pytest.importorskip("transformers")
+    try:
+        proc = transformers.AutoProcessor.from_pretrained(model_id)
+    except Exception as e:  # offline, gated, or missing deps
+        pytest.skip(f"real processor unavailable: {e}")
+    assert getattr(proc, "image_processor", None) is None
+    assert getattr(proc, "feature_extractor", None) is not None
+
+    collator = UnslothVisionDataCollator(model=_stub_model(), processor=proc, max_seq_length=512)
+    wav = np.sin(np.linspace(0, 220 * 2 * np.pi, 16000)).astype(np.float32)
+    example = {"messages": [
+        {"role": "user", "content": [
+            {"type": "audio", "audio": wav}, {"type": "text", "text": "Transcribe."}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "la la la"}]},
+    ]}
+    batch = collator([example])
+    assert "input_features" in batch
+    audio_id = proc.tokenizer.convert_tokens_to_ids("<|AUDIO|>")
+    ids, labels = batch["input_ids"], batch["labels"]
+    n_audio = int((ids == audio_id).sum())
+    assert n_audio > 0
+    assert int(((ids == audio_id) & (labels == -100)).sum()) == n_audio
+    assert int((labels != -100).sum()) > 0  # real assistant tokens survive
+
+
 def test_real_unpatched_decoder_decodes_in_fresh_process():
     # A REAL, never-patched torchcodec AudioDecoder through the collator in a clean
     # interpreter (the patch mutates the class globally, so it can't share a process
@@ -637,3 +962,195 @@ def test_real_unpatched_decoder_decodes_in_fresh_process():
     )
     assert result.returncode == 0, f"stdout={result.stdout}\nstderr={result.stderr}"
     assert result.stdout.strip().endswith("OK")
+
+
+N_EXPANDED_AUDIO = 8
+_PC_VOCAB = {"hi": 1, "ok": 2}
+
+
+class _ExpandingAudioProcessor(_ChatTemplateMixin):
+    def __init__(self):
+        self.tokenizer = _FakeTokenizer(padding_side="right")
+        self.feature_extractor = _FakeFeatureExtractor()
+
+    def apply_chat_template(self, messages, **kwargs):
+        out = []
+        for m in messages:
+            content = m.get("content", "")
+            if isinstance(content, str):
+                out.append(content)
+                continue
+            for part in content:
+                if not isinstance(part, dict): continue
+                if part.get("type") == "text": out.append(part.get("text", ""))
+                elif part.get("type") == "audio": out.append("<AUD>")
+        return " ".join(out)
+
+    def __call__(self, text=None, audio=None, padding=None, padding_side="right",
+                 return_tensors=None, add_special_tokens=None, **kwargs):
+        rows = []
+        for s in text:
+            row = []
+            for word in s.split():
+                if word == "<AUD>": row += [AUDIO_ID] * N_EXPANDED_AUDIO
+                else: row.append(_PC_VOCAB.get(word, 3))
+            rows.append(row)
+        width = max(len(r) for r in rows)
+        ids, mask = [], []
+        for r in rows:
+            pad = [PAD_ID] * (width - len(r))
+            if padding_side == "left":
+                ids.append(pad + r); mask.append([0] * len(pad) + [1] * len(r))
+            else:
+                ids.append(r + pad); mask.append([1] * len(r) + [0] * len(pad))
+        out = {"input_ids": torch.tensor(ids), "attention_mask": torch.tensor(mask)}
+        if audio is not None:
+            out["input_features"] = torch.zeros(len(rows), 128, 3000)
+        return out
+
+
+_AUDIO_PC_MESSAGES = [
+    {"role": "user", "content": [
+        {"type": "audio", "audio": CLIP}, {"type": "text", "text": "hi"}]},
+    {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+]
+
+
+@pytest.mark.parametrize("path", ["messages", "prompt_completion"])
+def test_audio_span_truncation_raises_on_both_paths(path):
+    collator = UnslothVisionDataCollator(
+        model=_stub_model(), processor=_ExpandingAudioProcessor(), max_seq_length=4,
+    )
+    if path == "messages":
+        batch = [{"messages": _AUDIO_PC_MESSAGES}]
+    else:
+        batch = [{"prompt": _AUDIO_PC_MESSAGES[:1], "completion": _AUDIO_PC_MESSAGES[1:]}]
+    with pytest.raises(ValueError, match="cuts into the expanded audio tokens|placeholder"):
+        collator(batch)
+
+
+@pytest.mark.parametrize("path", ["messages", "prompt_completion"])
+def test_audio_span_fits_is_not_rejected_on_either_path(path):
+    collator = UnslothVisionDataCollator(
+        model=_stub_model(), processor=_ExpandingAudioProcessor(), max_seq_length=64,
+    )
+    if path == "messages":
+        batch = [{"messages": _AUDIO_PC_MESSAGES}]
+    else:
+        batch = [{"prompt": _AUDIO_PC_MESSAGES[:1], "completion": _AUDIO_PC_MESSAGES[1:]}]
+    out = collator(batch)
+    assert int((out["input_ids"] == AUDIO_ID).sum()) == N_EXPANDED_AUDIO
+
+
+def test_text_only_prompt_completion_truncation_still_allowed():
+    collator = UnslothVisionDataCollator(
+        model=_stub_model(), processor=_ExpandingAudioProcessor(), max_seq_length=2,
+    )
+    out = collator([{
+        "prompt": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        "completion": [{"role": "assistant", "content": [{"type": "text", "text": "ok"}]}],
+    }])
+    assert out["input_ids"].shape[1] == 2
+
+
+def test_audio_sub_processor_attr_names_cover_transformers():
+    pytest.importorskip("transformers")
+    import importlib, pkgutil
+    import transformers.models as models_pkg
+
+    upstream = set()
+    for module_info in pkgutil.iter_modules(models_pkg.__path__):
+        name = module_info.name
+        try:
+            module = importlib.import_module(f"transformers.models.{name}.processing_{name}")
+        except Exception:
+            continue
+        for cls in vars(module).values():
+            if not inspect.isclass(cls) or cls.__module__ != module.__name__: continue
+            for attr in _processor_attrs(cls):
+                klass = getattr(cls, f"{attr}_class", None)
+                if (isinstance(klass, str) and "FeatureExtractor" in klass) or \
+                   attr in ("feature_extractor", "audio_processor"):
+                    upstream.add(attr)
+    assert upstream, "scan found no feature-extractor attributes; the scan broke"
+    from types import SimpleNamespace
+    missed = sorted(a for a in upstream if not _audio_sub_processors(SimpleNamespace(**{a: object()})))
+    assert not missed, f"transformers audio sub-processor attribute(s) the collator does not resolve: {missed}"
+
+
+def test_all_three_consumers_agree_on_an_audio_processor_only_shape():
+    proc = _AudioProcessorAttrProcessor()
+    proc.audio_processor.padding_side = "left"
+
+    collator = UnslothVisionDataCollator(model=_stub_model(), processor=proc)  # gate
+    assert proc.audio_processor.padding_side == "right"                        # padding
+    with pytest.raises(ValueError, match="sampling_rate"):                     # rate
+        collator._extract_audio_for_example(
+            {"audio": {"array": CLIP, "sampling_rate": 44100}}, [])
+
+
+@pytest.mark.parametrize("key", ["audio", "url", "path", "audio_url"])
+def test_array_payload_under_any_key_does_not_trip_numpy_truthiness(key):
+    out = extract_audio_info(msgs({"type": "audio", key: CLIP}))
+    assert len(out) == 1
+    np.testing.assert_allclose(out[0], CLIP)
+
+
+def test_empty_string_key_falls_through_to_the_next_key():
+    out = extract_audio_info(msgs({"type": "audio", "url": "", "path": "/tmp/a.wav"}))
+    assert out == ["/tmp/a.wav"]
+
+
+class _ModalityStrictProcessor:
+    def __init__(self, accepts, image=False):
+        self.tokenizer = _FakeTokenizer()
+        self.accepts = accepts
+        self.probed_types = []
+        if image: self.image_processor = object()
+        else: self.feature_extractor = _FakeFeatureExtractor()
+
+    def apply_chat_template(self, messages, **kwargs):
+        for m in messages:
+            content = m.get("content")
+            if not isinstance(content, list): continue
+            for part in content:
+                kind = part.get("type")
+                if kind == "text": continue
+                self.probed_types.append(kind)
+                if kind != self.accepts:
+                    raise ValueError(f"unsupported content type {kind!r}")
+        return "rendered"
+
+    def __call__(self, text=None, audio=None, **kwargs):
+        return {}
+
+
+def test_audio_only_processor_is_probed_with_an_audio_part():
+    proc = _ModalityStrictProcessor(accepts="audio")
+    UnslothVisionDataCollator(model=_stub_model(), processor=proc)
+    assert proc.probed_types and set(proc.probed_types) == {"audio"}, proc.probed_types
+
+
+def test_image_processor_is_still_probed_with_an_image_part():
+    proc = _ModalityStrictProcessor(accepts="image", image=True)
+    UnslothVisionDataCollator(model=_stub_model(), processor=proc)
+    assert proc.probed_types and set(proc.probed_types) == {"image"}, proc.probed_types
+
+
+class _StringContentOnlyProcessor:
+    def __init__(self):
+        self.tokenizer = _FakeTokenizer()
+        self.audio_processor = _FakeFeatureExtractor()
+
+    def apply_chat_template(self, messages, **kwargs):
+        out = ""
+        for m in messages:
+            out = out + "<|role|>" + m["content"]
+        return out
+
+    def __call__(self, text=None, audio=None, **kwargs):
+        return {}
+
+
+def test_string_only_chat_template_audio_processor_constructs():
+    UnslothVisionDataCollator(model=_stub_model(), processor=_StringContentOnlyProcessor())

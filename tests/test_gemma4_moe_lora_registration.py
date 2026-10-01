@@ -14,6 +14,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from unsloth_zoo.temporary_patches.moe_utils import moe_lora_b_expert_columns
 from unsloth_zoo.temporary_patches import gemma4_moe as g4
 from unsloth_zoo.temporary_patches.qwen3_moe import _make_qwen_moe_lora_extractor
 
@@ -61,7 +62,7 @@ def test_register_is_idempotent():
     cls = _fresh_stub_class()
     assert g4._register_gemma4_lora_extractor(cls) is True
     fn_before = cls._unsloth_lora_extractor_fn
-    # Second call short-circuits on the registered flag; identity unchanged.
+    # Second call short-circuits on _unsloth_lora_extractor_registered.
     assert g4._register_gemma4_lora_extractor(cls) is True
     assert cls._unsloth_lora_extractor_fn is fn_before
     assert cls._unsloth_model_type == "gemma4_moe"
@@ -132,7 +133,7 @@ def _drive_extractor(cls, parameter_name: str, peft_swapped: bool):
     x = torch.randn(7, in_dim)
     for e in range(E):
         Ae = weight_A[e * R : (e + 1) * R]
-        Be = weight_B[:, e * R : (e + 1) * R]
+        Be = weight_B[:, moe_lora_b_expert_columns(e, E, R)]
         if peft_swapped:
             naive = x @ Be @ Ae
         else:

@@ -105,8 +105,6 @@ def _stdlib_json_decode_error():
     return json.JSONDecodeError("Expecting value", "<html>", 0)
 
 
-# A ValueError *subclass* on a single segment name is a transport failure.
-
 _SUBCLASS_TRANSPORT_ERRORS = [
     pytest.param(_requests_json_decode_error, id = "requests-JSONDecodeError"),
     pytest.param(_stdlib_json_decode_error,   id = "stdlib-JSONDecodeError"),
@@ -148,8 +146,6 @@ def test_determine_base_model_source_propagates_single_segment_transport_error(
     with pytest.raises(RuntimeError):
         saving_utils.determine_base_model_source("gpt2")
 
-
-# The real single segment rejection still answers False.
 
 @pytest.mark.parametrize("name", ["gpt2", "bert-base-uncased", "distilgpt2"])
 def test_single_segment_rejection_still_reports_absent(monkeypatch, name):
@@ -342,8 +338,6 @@ def test_repo_types_that_cannot_be_a_base_model_stay_rejected(monkeypatch, name)
     assert saving_utils._is_hub_repo_id(name) is False
 
 
-# A root URI addresses the repository itself.
-
 @pytest.mark.parametrize("given, expected", [
     pytest.param("hf://openai-community/gpt2/",  "openai-community/gpt2", id = "root-uri"),
     pytest.param("hf://openai-community/gpt2//", "openai-community/gpt2", id = "doubled"),
@@ -488,8 +482,6 @@ def test_hf_uri_error_is_still_absent_not_transport(monkeypatch):
     assert saving_utils.check_hf_model_exists("gpt2") is False
 
 
-# No previously working input regressed: True stays True.
-
 @pytest.mark.parametrize("name", ["gpt2", "bert-base-uncased", "distilgpt2"])
 def test_listable_single_segment_id_still_returns_true(monkeypatch, name):
     """0.36.2 lists `gpt2` happily (17 entries, safetensors among them). The narrowing
@@ -513,8 +505,6 @@ def test_offline_mode_on_a_single_segment_id_raises(monkeypatch):
     with pytest.raises(RuntimeError):
         saving_utils.check_hf_model_exists("gpt2")
 
-
-# End to end over real HTTP: a proxy answering 200 with a non-JSON body.
 
 class _GarbageHandler(http.server.BaseHTTPRequestHandler):
     """200 with HTML, which is what a captive portal does to an API call."""

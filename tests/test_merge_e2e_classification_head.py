@@ -204,8 +204,6 @@ def test_a_plain_causal_lm_export_is_untouched(tmp_path):
     assert "id2label" not in data or len(data["id2label"]) == 2   # transformers' own default
 
 
-# ---- unit level -------------------------------------------------------------------
-
 def test_only_modules_to_save_is_seeded_not_an_unbacked_lora():
     """A LoRA target missing from the base has no trained tensor of its own to lose, so it
     must stay excluded; only `modules_to_save` carries weights that exist nowhere else."""

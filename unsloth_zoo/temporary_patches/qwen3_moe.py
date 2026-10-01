@@ -29,6 +29,7 @@ from .utils import (
     patch_function,
     raise_error,
     logger,
+    torch_compiler_disable_unless_decode,
 )
 
 
@@ -79,7 +80,16 @@ def _make_qwen_moe_experts_forward(module_name: Optional[str] = None):
 
 
 def _make_qwen_moe_sparse_moe_block_forward(use_shared_expert: bool, module_name: Optional[str] = None):
-    @torch.compiler.disable
+    # Kept because compiling this block is still blocked (B200, torch 2.13.0,
+    # Qwen3.5-35B-A3B): fullgraph=True dies building guards on a stale global
+    # (Qwen3_5MoeMLP_forward), and fullgraph=False leaves 8 graph breaks, all
+    # torch._C.Generator, 6 of them present with no LoRA at all. The routing counter
+    # is not the blocker: breaks are identical with bincount and with the sync-free
+    # counter. Dropping the decorator did run 1.22-1.40x faster, but PR #608 measured
+    # only 1.03-1.04x end to end and found capture incompatible with gradient
+    # checkpointing, so do not remove it without an end-to-end measurement. A compiled
+    # decode step (inference only) still traces it; training keeps the recursive disable.
+    @torch_compiler_disable_unless_decode(recursive = True)
     def sparse_moe_block_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         use_shared_expert = hasattr(self, "shared_expert") and hasattr(self, "shared_expert_gate")
         if hidden_states.dim() == 3:

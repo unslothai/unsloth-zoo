@@ -60,6 +60,10 @@ IMAGE_TOKENS = [
     "<|VIDEO|>",          # Qwen2.5-Omni
     "<|vision_bos|>",     # Qwen2.5-Omni (begin vision)
     "<|vision_eos|>",     # Qwen2.5-Omni (end vision)
+    "<|media_begin|>",    # Kimi K2.5 / K2.7 (begin media)
+    "<|media_content|>",  # Kimi K2.5 / K2.7
+    "<|media_pad|>",      # Kimi K2.5 / K2.7 (one per image, expanded by the model)
+    "<|media_end|>",      # Kimi K2.5 / K2.7 (end media)
 ]
 
 # Audio placeholder tokens.

@@ -28,9 +28,13 @@ import mlx.utils
 import ast
 import collections
 import contextlib
+import contextvars
 import copy
+import dis
 import inspect
+import itertools
 import importlib
+import importlib.util
 import json
 import math
 import numbers
@@ -39,6 +43,7 @@ import textwrap
 import numpy as np
 import os
 import random
+import re
 import sys
 import shutil
 import struct
@@ -46,11 +51,13 @@ import tempfile
 import queue as _queue_module
 import threading
 import time
+import types
+import unicodedata
 import warnings
 import weakref
 import zlib
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache, partial, wraps
 from pathlib import Path
 from typing import NamedTuple
@@ -394,14 +401,521 @@ def set_mlx_norm_output_cast_to_input_dtype(enabled: bool, model=None) -> None:
         _set_mlx_norm_output_cast_classes(enabled, norm_classes)
 
 
-def _get_transformer_layers(model):
-    """Find transformer layers, unwrapping VLM wrappers if needed.
+# MLX raises instead of returning zero when a backward pass reaches a
+# gather/scatter index, aborting every graph that derives indices from activations:
+# MoE routing, SwitchGLU's gather-sort, GLM-5.x's sparse mask. Detaching changes no
+# forward value; producers, consumers and integer `__getitem__` keys are all detached.
+_MLX_INDEX_PRODUCERS = ("argpartition", "argsort", "argmax", "argmin")
+_MLX_INDEX_CONSUMERS = {  # index-argument positions, by op
+    "take": (1,), "take_along_axis": (1,), "put_along_axis": (1,),
+    "gather_mm": (2, 3), "gather_qmm": (4, 5)}
+_MLX_INDEX_KEYWORDS = frozenset(("indices", "lhs_indices", "rhs_indices"))
+_MLX_INDEX_OP_NAMES = _MLX_INDEX_PRODUCERS + tuple(_MLX_INDEX_CONSUMERS)
+_MLX_INDEX_GRADIENT_LOCK = threading.RLock()
+# Two depths, with different scopes. Physical: how many runs still need `mlx.core`
+# wrapped. Global under the lock, since unpatching is process-wide.
+_MLX_TRAINING_PATCH_DEPTH = 0
+# Logical: is THIS context inside a training step. Context-local because a global
+# one is wrong both ways -- never cleared, a nested evaluation reads as training;
+# always cleared, one trainer's evaluation clears the flag under another that is
+# still differentiating, and a call site passing no `use_kernel` (GLM-5.x) then
+# routes its backward to the fused kernel, which has no VJP. ContextVar covers
+# threads and asyncio Tasks; `threading.local` would cover only the first.
+_MLX_TRAINING_ACTIVE_DEPTH = contextvars.ContextVar(
+    "unsloth_mlx_training_active_depth", default=0)
+# Tuple, not list: a mutable ContextVar default is shared by every context that
+# never set one, putting the stack straight back in global scope.
+_MLX_TRAINING_PAUSE_STACK = contextvars.ContextVar(
+    "unsloth_mlx_training_pause_stack", default=())
+# MLX differentiates integer arrays, so only real index positions are detached.
+_MLX_INTEGER_DTYPES = frozenset((mx.int8, mx.int16, mx.int32, mx.int64,
+                                 mx.uint8, mx.uint16, mx.uint32, mx.uint64))
 
-    VLMs: model.language_model.model.layers; text: model.(model.)layers.
+
+def _detach_if_index(value):
+    return (mx.stop_gradient(value)
+            if getattr(value, "dtype", None) in _MLX_INTEGER_DTYPES else value)
+
+
+def _wrap_mlx_index_op(name, original):
+    positions = _MLX_INDEX_CONSUMERS.get(name)
+
+    @wraps(original)
+    def wrapper(*args, **kwargs):
+        if not mlx_training_patches_active():
+            return original(*args, **kwargs)
+        if positions is None:  # producer: the result is entirely an index
+            return mx.stop_gradient(original(*args, **kwargs))
+        return original(
+            *(_detach_if_index(arg) if i in positions else arg
+              for i, arg in enumerate(args)),
+            **{key: _detach_if_index(value) if key in _MLX_INDEX_KEYWORDS
+               else value for key, value in kwargs.items()},
+        )
+
+    wrapper._unsloth_index_stop_gradient = True
+    wrapper._unsloth_index_original = original
+    return wrapper
+
+
+def _set_mlx_index_gradient_stop(enabled: bool) -> None:
+    for name in _MLX_INDEX_OP_NAMES:
+        current = getattr(mx, name, None)
+        if current is None:
+            continue
+        patched = bool(getattr(current, "_unsloth_index_stop_gradient", False))
+        if enabled and not patched:
+            setattr(mx, name, _wrap_mlx_index_op(name, current))
+        elif not enabled and patched:
+            setattr(mx, name, current._unsloth_index_original)
+
+    current = getattr(mx.array, "__getitem__", None)
+    if current is None:
+        return
+    patched = bool(getattr(current, "_unsloth_index_stop_gradient", False))
+    if enabled and not patched:
+        @wraps(current)
+        def getitem(array, key):
+            if mlx_training_patches_active():
+                key = _detach_integer_arrays(key)
+            return current(array, key)
+
+        getitem._unsloth_index_stop_gradient = True
+        getitem._unsloth_index_original = current
+        mx.array.__getitem__ = getitem
+    elif not enabled and patched:
+        mx.array.__getitem__ = current._unsloth_index_original
+
+
+# Training SDPA runs MLX's unfused fallback, scoring every key even outside the window.
+_TRAINING_ATTENTION_BLOCK = 512
+_WINDOW_MASKS = {}
+
+
+def _register_window_mask(mask, window):
+    key = id(mask)
+
+    def forget(ref):
+        if _WINDOW_MASKS.get(key, (None,))[0] is ref:
+            del _WINDOW_MASKS[key]
+
+    _WINDOW_MASKS[key] = (weakref.ref(mask, forget), window)
+
+
+def _registered_window(mask):
+    ref, window = _WINDOW_MASKS.get(id(mask), (None, None))
+    return window if ref is not None and ref() is mask else None
+
+
+def _carry_window_masks(outer, inner):
+    """`mx.checkpoint` hands the layer new array objects for its arguments."""
+    (outer_args, outer_kwargs), (inner_args, inner_kwargs) = outer, inner
+    pairs = [*zip(outer_args, inner_args),
+             *((outer_kwargs[k], inner_kwargs.get(k)) for k in outer_kwargs)]
+    for before, after in pairs:
+        if (window := _registered_window(before)) is not None:
+            _register_window_mask(after, window)
+
+
+def _wrap_create_causal_mask(original):
+    @wraps(original)
+    def wrapper(N, offset=0, window_size=None, *args, **kwargs):
+        mask = original(N, offset, window_size, *args, **kwargs)
+        if (window_size is not None and isinstance(offset, int) and offset == 0 and not args
+                and all(v is None for v in kwargs.values())
+                and mlx_training_patches_active()):
+            _register_window_mask(mask, window_size)
+        return mask
+
+    wrapper._unsloth_original = original
+    return wrapper
+
+
+def _windowed_attention(sdpa, q, k, v, scale, window, block):
+    # Query blocks folded into the batch, each vs its own + previous key block. Not per-block
+    # slices: their full-size gradient scatters fuse past Metal's kernel argument limit.
+    B, T = q.shape[0], q.shape[-2]
+    n = -(-T // block)
+
+    def fold(t, with_previous):
+        t = mx.pad(t, [(0, 0), (0, 0), (0, n * block - T), (0, 0)])
+        t = t.reshape(B, t.shape[1], n, block, t.shape[-1])
+        if with_previous:
+            previous = mx.pad(t[:, :, :-1], [(0, 0), (0, 0), (1, 0), (0, 0), (0, 0)])
+            t = mx.concatenate([previous, t], axis=3)
+        return t.transpose(0, 2, 1, 3, 4).reshape(B * n, t.shape[1], t.shape[3], t.shape[4])
+
+    rows = mx.arange(n)[:, None, None] * block + mx.arange(block)[:, None]
+    cols = mx.arange(n)[:, None, None] * block + mx.arange(-block, block)
+    mask = (cols >= 0) & (rows >= cols) & (rows < cols + window)
+    mask = mx.broadcast_to(mask[None, :, None], (B, n, 1, block, 2 * block))
+    mask = mask.reshape(B * n, 1, block, 2 * block)
+    out = sdpa(fold(q, False), fold(k, True), fold(v, True), scale=scale, mask=mask)
+    out = out.reshape(B, n, -1, block, out.shape[-1]).transpose(0, 2, 1, 3, 4)
+    return out.reshape(B, -1, n * block, out.shape[-1])[..., :T, :]
+
+
+def _windowing_pays(q, k, block):
+    # Skipped scores vs padded, folded q/k/v copies; 2.5 measured on bf16 training attention.
+    heads, T, dim = q.shape[1], q.shape[2], q.shape[3]
+    padded = -(-T // block) * block
+    skipped = heads * (T * T - 2 * block * padded)
+    return skipped >= 2.5 * (heads + 2 * k.shape[1]) * padded * dim
+
+
+def _wrap_training_sdpa(original):
+    @wraps(original)
+    def wrapper(q, k, v, *, scale, mask=None, **kwargs):
+        T = q.shape[-2]
+        if (isinstance(mask, mx.array) and mask.shape == (T, T) and k.shape[-2] == T
+                and all(value is None for value in kwargs.values())):
+            window = _registered_window(mask)
+            if window is not None:
+                block = max(_TRAINING_ATTENTION_BLOCK, window)
+                if _windowing_pays(q, k, block):
+                    return _windowed_attention(original, q, k, v, scale, window, block)
+        return original(q, k, v, scale=scale, mask=mask, **kwargs)
+
+    wrapper._unsloth_original = original
+    return wrapper
+
+
+def _set_mlx_windowed_attention(enabled: bool) -> None:
+    targets = [(mx.fast, "scaled_dot_product_attention", _wrap_training_sdpa)]
+    for name in ("mlx_lm.models.base", "mlx_vlm.models.base"):
+        if sys.modules.get(name) is not None:
+            targets.append((sys.modules[name], "create_causal_mask", _wrap_create_causal_mask))
+    for module, attr, wrap in targets:
+        current = getattr(module, attr, None)
+        if current is None:
+            continue
+        original = getattr(current, "_unsloth_original", None)
+        if enabled and original is None:
+            setattr(module, attr, wrap(current))
+        elif not enabled and original is not None:
+            setattr(module, attr, original)
+
+
+def acquire_mlx_training_patches() -> None:
+    """Reference-counted: the `mlx.core` patches are process-wide while trainer
+    runs are not, so an inner run must not unpatch an outer one."""
+    global _MLX_TRAINING_PATCH_DEPTH
+    with _MLX_INDEX_GRADIENT_LOCK:
+        from .attention import install_sparse_attention_training
+        install_sparse_attention_training()
+        if _MLX_TRAINING_PATCH_DEPTH == 0:
+            _set_mlx_index_gradient_stop(True)
+            _set_mlx_windowed_attention(True)
+        _MLX_TRAINING_PATCH_DEPTH += 1
+    _MLX_TRAINING_ACTIVE_DEPTH.set(_MLX_TRAINING_ACTIVE_DEPTH.get() + 1)
+
+
+def release_mlx_training_patches() -> None:
+    global _MLX_TRAINING_PATCH_DEPTH
+    with _MLX_INDEX_GRADIENT_LOCK:
+        if _MLX_TRAINING_PATCH_DEPTH == 0:
+            return
+        _MLX_TRAINING_PATCH_DEPTH -= 1
+        if _MLX_TRAINING_PATCH_DEPTH == 0:
+            _set_mlx_index_gradient_stop(False)
+            _set_mlx_windowed_attention(False)
+    _MLX_TRAINING_ACTIVE_DEPTH.set(max(0, _MLX_TRAINING_ACTIVE_DEPTH.get() - 1))
+
+
+def pause_mlx_training_patches() -> bool:
+    """Evaluation runs under `model.eval()` but inside the trainer's window, which
+    would otherwise route it down the training paths.
+
+    Always clears the logical flag, but only for THIS context, so a second trainer
+    on another thread keeps its own. The return value reports only whether the
+    process-wide patches came off: they stay while another run needs them, which
+    costs nothing, since they stop gradients into gather indices and evaluation
+    takes none.
     """
-    m = getattr(model, 'language_model', model)
-    m = getattr(m, 'model', m)
-    return getattr(m, 'layers', None)
+    global _MLX_TRAINING_PATCH_DEPTH
+    _MLX_TRAINING_PAUSE_STACK.set(
+        _MLX_TRAINING_PAUSE_STACK.get() + (_MLX_TRAINING_ACTIVE_DEPTH.get(),))
+    _MLX_TRAINING_ACTIVE_DEPTH.set(0)
+    with _MLX_INDEX_GRADIENT_LOCK:
+        if _MLX_TRAINING_PATCH_DEPTH != 1:
+            return False
+        _MLX_TRAINING_PATCH_DEPTH = 0
+        _set_mlx_index_gradient_stop(False)
+        _set_mlx_windowed_attention(False)
+        return True
+
+
+def resume_mlx_training_patches(paused: bool) -> None:
+    """Give back exactly what `pause_mlx_training_patches` took.
+
+    By increment, never assignment: another trainer may have acquired during the
+    pause, and assigning 1 there would drop this run's reference, so that
+    trainer's release would unpatch `mlx.core` mid-differentiation. The logical
+    depth comes off this context's own stack, so it does not count a second run
+    the way `acquire()` would.
+    """
+    global _MLX_TRAINING_PATCH_DEPTH
+    with _MLX_INDEX_GRADIENT_LOCK:
+        if paused:
+            if _MLX_TRAINING_PATCH_DEPTH == 0:
+                _set_mlx_index_gradient_stop(True)
+                _set_mlx_windowed_attention(True)
+            _MLX_TRAINING_PATCH_DEPTH += 1
+    stack = _MLX_TRAINING_PAUSE_STACK.get()
+    if stack:
+        _MLX_TRAINING_ACTIVE_DEPTH.set(stack[-1])
+        _MLX_TRAINING_PAUSE_STACK.set(stack[:-1])
+
+
+def mlx_training_patches_active() -> bool:
+    return _MLX_TRAINING_ACTIVE_DEPTH.get() > 0
+
+
+# Sorted `gather_qmm` silently corrupts its output on neural-accelerator Metal GPUs:
+# unaligned K (ml-explore/mlx#3887, open) and rows past 32768 (ml-explore/mlx#3856,
+# fixed by #3922). `sorted_indices` is only a dispatch hint, so dropping it where a
+# probe measures corruption is safe. Kill switch: UNSLOTH_MLX_GATHER_QMM_GUARD=0.
+_MLX_MAX_SORTED_ROWS = 32768
+_MLX_CANARY_ERROR_LIMIT = 1.0
+_MLX_K_REMAINDER = "k_remainder"
+_MLX_ROW_OVERFLOW = "row_overflow"
+_MLX_PROBE_ROWS = {_MLX_K_REMAINDER: 64, _MLX_ROW_OVERFLOW: _MLX_MAX_SORTED_ROWS + 1}
+_MLX_PROBE_EXPERTS = 8
+_MLX_PROBE_OUT_DIM = 64
+# Below this, nvfp4 degenerates to one group that mlx gets wrong even without a NAX.
+_MLX_MIN_PROBE_K = 96
+_MLX_GATHER_QMM_ORIGINAL = None
+_MLX_GATHER_QMM_CANARIES = {}
+_MLX_GATHER_QMM_DEFAULTS = {}
+_MLX_GATHER_QMM_UNREADABLE = False
+
+
+def _gather_qmm_probe_k(condition, group_size):
+    """Probe width, or None: a 64-multiple group size leaves no K remainder to probe."""
+    if condition == _MLX_ROW_OVERFLOW:
+        return math.lcm(group_size, 64)
+    if group_size % 64 == 0:
+        return None
+    k = group_size
+    while k < _MLX_MIN_PROBE_K or k % 64 == 0:
+        k += group_size
+    return k
+
+
+def _gather_qmm_canary_error(condition, group_size, bits, mode, device) -> float:
+    """`gather_mm` is the reference: its NAX kernel carries neither defect."""
+    with mx.stream(mx.default_stream(device)):
+        rows = _MLX_PROBE_ROWS[condition]
+        k = _gather_qmm_probe_k(condition, group_size)
+        keys = mx.random.split(mx.random.key(0x3887), 3)
+        w = mx.random.normal(
+            (_MLX_PROBE_EXPERTS, _MLX_PROBE_OUT_DIM, k), key=keys[0]).astype(mx.bfloat16)
+        quantized = mx.quantize(w, group_size=group_size, bits=bits, mode=mode)
+        wq, scales = quantized[0], quantized[1]
+        biases = quantized[2] if len(quantized) > 2 else None
+        x = (mx.random.normal((rows, 1, k), key=keys[1]) * 0.5).astype(mx.bfloat16)
+        indices = mx.sort(mx.random.randint(
+            0, _MLX_PROBE_EXPERTS, (rows,), key=keys[2]).astype(mx.uint32))
+        reference = mx.gather_mm(
+            x.astype(mx.float32),
+            mx.dequantize(wq, scales, biases, group_size=group_size, bits=bits,
+                          mode=mode).astype(mx.float32).swapaxes(-1, -2),
+            rhs_indices=indices, sorted_indices=False)
+        out = _MLX_GATHER_QMM_ORIGINAL(
+            x, wq, scales, biases, rhs_indices=indices, transpose=True,
+            group_size=group_size, bits=bits, mode=mode, sorted_indices=True)
+        return mx.abs(out.astype(mx.float32) - reference).max().item()
+
+
+def _gather_qmm_canary_defective(condition, group_size, bits, mode, device) -> bool:
+    """Keyed by device name: mlx devices hash by identity, not value."""
+    if _gather_qmm_probe_k(condition, group_size) is None:
+        return False
+    key = (condition, group_size, bits, mode, str(device))
+    cached = _MLX_GATHER_QMM_CANARIES.get(key)
+    if cached is not None:
+        return cached
+    if not mx.metal.is_available():
+        _MLX_GATHER_QMM_CANARIES[key] = False
+        return False
+    try:
+        max_error = _gather_qmm_canary_error(condition, group_size, bits, mode, device)
+    except Exception as error:
+        # Fails CLOSED, unlike the pass-through in `_gather_qmm_guarded`: an unusable
+        # probe proves nothing, and rerouting a healthy call only costs throughput
+        # where admitting a corrupt one costs gradients. Uncached, so a later call
+        # re-probes.
+        print(f"Unsloth: sorted gather_qmm {condition} probe failed ({error}); "
+              f"rerouting this call.")
+        return True
+    defective = not (max_error < _MLX_CANARY_ERROR_LIMIT)   # NaN reads as corrupt
+    _MLX_GATHER_QMM_CANARIES[key] = defective
+    if defective:
+        print(f"Unsloth: sorted gather_qmm is corrupt on this machine ({condition} "
+              f"probe, {mode}, max error {max_error:.3g}); rerouting affected calls.")
+    return defective
+
+
+def _gather_qmm_resolved_quantization(bits, mode):
+    """Asked of mlx: scales reveal the group size only for transposed weights."""
+    cached = _MLX_GATHER_QMM_DEFAULTS.get((bits, mode))
+    if cached is not None:
+        return cached
+    probe = mx.zeros((1, 256), dtype=mx.bfloat16)
+    packed, scales = mx.quantize(probe, bits=bits, mode=mode)[:2]
+    resolved = (probe.shape[-1] // scales.shape[-1],
+                bits if bits is not None else 32 * packed.shape[-1] // probe.shape[-1])
+    _MLX_GATHER_QMM_DEFAULTS[(bits, mode)] = resolved
+    return resolved
+
+
+def _gather_qmm_quantization(args, kwargs):
+    group_size = args[5] if len(args) > 5 else kwargs.get("group_size")
+    bits = args[6] if len(args) > 6 else kwargs.get("bits")
+    mode = args[7] if len(args) > 7 else kwargs.get("mode", "affine")
+    if group_size is None:
+        group_size = _gather_qmm_resolved_quantization(bits, mode)[0]
+    return group_size, bits, mode
+
+
+def _gather_qmm_target_device(kwargs):
+    """mlx takes a stream, device or device type here."""
+    stream = kwargs.get("stream")
+    if stream is None:
+        return mx.default_device()
+    device = getattr(stream, "device", stream)
+    return device if isinstance(device, mx.Device) else mx.default_stream(device).device
+
+
+def _gather_qmm_gradient_rows(x, w, lhs_indices, rhs_indices):
+    """mlx fills an absent index side in from the operand it would have indexed."""
+    left = lhs_indices.shape if lhs_indices is not None else x.shape[:-2]
+    right = rhs_indices.shape if rhs_indices is not None else w.shape[:-2]
+    batch = mx.broadcast_shapes(tuple(left), tuple(right))
+    return math.prod(batch) * x.shape[-2]
+
+
+def _gather_qmm_conditions(x, w, args, kwargs):
+    """Defects this call is exposed to, empty when it misses the kernel. Re-derived
+    per geometry: a `shapeless=True` trace would instead freeze one call's answer onto
+    every later one, since the sorted flag is baked into the traced primitive."""
+    if not kwargs.get("sorted_indices"):
+        return ()
+    if _gather_qmm_target_device(kwargs).type != mx.gpu:
+        return ()
+    lhs_indices = args[2] if len(args) > 2 else kwargs.get("lhs_indices")
+    rhs_indices = args[3] if len(args) > 3 else kwargs.get("rhs_indices")
+    transpose = args[4] if len(args) > 4 else kwargs.get("transpose", True)
+    # mlx records the sorted flag only when exactly one index side is given.
+    if (lhs_indices is None) == (rhs_indices is None):
+        return ()
+    # The kernel is dispatched at one output row per matmul; the gradient inherits it.
+    if x.shape[-2] != 1:
+        return ()
+    conditions = []
+    if transpose:
+        if rhs_indices is None:
+            return ()
+        k, rows = x.shape[-1], x.size // x.shape[-1]
+    else:
+        # The forward misses, but the VJP re-issues it transposed, rhs-indexed, sorted.
+        bits = args[6] if len(args) > 6 else kwargs.get("bits")
+        mode = args[7] if len(args) > 7 else kwargs.get("mode", "affine")
+        k = w.shape[-1] * 32 // _gather_qmm_resolved_quantization(bits, mode)[1]
+        rows = _gather_qmm_gradient_rows(x, w, lhs_indices, rhs_indices)
+    if k % 64:
+        conditions.append(_MLX_K_REMAINDER)
+    if rows > _MLX_MAX_SORTED_ROWS:
+        conditions.append(_MLX_ROW_OVERFLOW)
+    return tuple(conditions)
+
+
+def _gather_qmm_guarded(x, w, *args, **kwargs):
+    global _MLX_GATHER_QMM_UNREADABLE
+    try:
+        conditions = _gather_qmm_conditions(x, w, args, kwargs)
+        if conditions:
+            group_size, bits, mode = _gather_qmm_quantization(args, kwargs)
+            device = _gather_qmm_target_device(kwargs)
+            if any(_gather_qmm_canary_defective(condition, group_size, bits, mode,
+                                                device)
+                   for condition in conditions):
+                kwargs = dict(kwargs, sorted_indices=False)
+    except Exception as error:
+        # Failing to READ a call is not a reason to fail it: this stands on a core mlx
+        # op, and the reachable cause is an mlx predating the NAX kernels. Pass through.
+        if not _MLX_GATHER_QMM_UNREADABLE:
+            _MLX_GATHER_QMM_UNREADABLE = True
+            print(f"Unsloth: could not inspect this gather_qmm call "
+                  f"({type(error).__name__}: {error}); the sorted NAX guard is "
+                  f"inactive for this process.")
+    return _MLX_GATHER_QMM_ORIGINAL(x, w, *args, **kwargs)
+
+
+# Not `wraps`: copied __dict__ markers make the index-stop removal restore the wrong callable.
+_gather_qmm_guarded._unsloth_gather_qmm_guard = True
+
+
+def is_gather_qmm_nax_guard_applied() -> bool:
+    """True for the guard anywhere in the chain, index-stop wrapper included."""
+    current = mx.gather_qmm
+    # Bounded: the real chain is the guard under at most one index-stop wrapper, but
+    # `getattr(..., None)` only terminates for an object that can be missing an
+    # attribute. A permissive stand-in for mx (the mlx test shim, a Mock) answers every
+    # attribute with a fresh object, so an unbounded walk never reaches None and spins.
+    for _ in range(16):
+        if current is None:
+            break
+        if getattr(current, "_unsloth_gather_qmm_guard", False):
+            return True
+        current = getattr(current, "_unsloth_index_original", None)
+    return False
+
+
+def apply_gather_qmm_nax_guard() -> bool:
+    """Idempotent, thread-safe, and installed UNDER the index-stop wrapper, which
+    removes itself by inspecting `mx` and would be stranded by anything on top."""
+    global _MLX_GATHER_QMM_ORIGINAL
+    if os.environ.get("UNSLOTH_MLX_GATHER_QMM_GUARD", "1") == "0":
+        return False
+    with _MLX_INDEX_GRADIENT_LOCK:
+        if is_gather_qmm_nax_guard_applied():
+            return False
+        current = mx.gather_qmm
+        if (_MLX_GATHER_QMM_ORIGINAL is not None
+                and current is not _MLX_GATHER_QMM_ORIGINAL
+                and getattr(current, "_unsloth_index_original", None)
+                is not _MLX_GATHER_QMM_ORIGINAL):
+            # Capturing an opaque wrapper makes the guard reachable from its original.
+            print("Unsloth: mx.gather_qmm was replaced by an unrecognized wrapper; "
+                  "leaving the NAX guard as it stands.")
+            return False
+        if getattr(current, "_unsloth_index_stop_gradient", False):
+            # One assignment: removing the index stop would unwrap every index op.
+            _MLX_GATHER_QMM_ORIGINAL = current._unsloth_index_original
+            mx.gather_qmm = _wrap_mlx_index_op("gather_qmm", _gather_qmm_guarded)
+        else:
+            _MLX_GATHER_QMM_ORIGINAL = current
+            mx.gather_qmm = _gather_qmm_guarded
+        return True
+
+
+
+def _get_transformer_layers(model):
+    pending = collections.deque([getattr(model, "language_model", model)])
+    seen = set()
+    while pending:
+        module = pending.popleft()
+        if module is None or id(module) in seen:
+            continue
+        seen.add(id(module))
+        for name in ("layers", "blocks"):
+            layers = getattr(module, name, None)
+            if isinstance(layers, (list, tuple)):
+                return layers
+        for name in ("decoder", "model", "transformer", "layers", "blocks"):
+            pending.append(getattr(module, name, None))
+    return None
 
 
 def _get_vision_encoder_layers(model):
@@ -430,6 +944,45 @@ def _get_vision_encoder_layers(model):
     return None
 
 
+def _detach_integer_arrays(value):
+    """`mx.checkpoint` makes every argument a primal of the recomputed function,
+    so a layer that embeds the token ids it was handed derives a gather index."""
+    if isinstance(value, list):
+        return [_detach_integer_arrays(v) for v in value]
+    if isinstance(value, tuple):
+        detached = tuple(_detach_integer_arrays(v) for v in value)
+        # A NamedTuple is a tuple subclass; rebuilding it as a plain tuple would
+        # turn a layer's `payload.ids` into an AttributeError.
+        return type(value)(*detached) if hasattr(value, "_fields") else detached
+    if isinstance(value, dict):
+        return {k: _detach_integer_arrays(v) for k, v in value.items()}
+    return _detach_if_index(value)
+
+
+@mx.custom_function
+def _tie_shared_kv_cotangent(x, shared_kv):
+    return x, shared_kv
+
+
+@_tie_shared_kv_cotangent.vjp
+def _tie_shared_kv_cotangent_vjp(primals, cotangents, outputs):
+    # Only the source layer's backward consumes borrowed K/V's cotangent, and
+    # `mx.eval` defers it to there, keeping every borrowing layer's T x T
+    # attention cotangents alive; the hidden state's makes it run in place.
+    d_x, d_shared_kv = cotangents
+    return mx.depends(d_x, list(d_shared_kv)), d_shared_kv
+
+
+def _tie_to_hidden_state(args, shared_kv):
+    """Tie borrowed K/V to the layer's hidden-state input, when it has both."""
+    if (not args or not isinstance(args[0], mx.array)
+            or not isinstance(shared_kv, (tuple, list)) or not shared_kv
+            or not all(isinstance(a, mx.array) for a in shared_kv)):
+        return args, shared_kv
+    x, shared_kv = _tie_shared_kv_cotangent(args[0], tuple(shared_kv))
+    return (x, *args[1:]), shared_kv
+
+
 def _patch_layer_class_for_gc(layer_cls):
     if getattr(layer_cls, '_orig_call', None) is not None:
         return  # already patched
@@ -439,22 +992,36 @@ def _patch_layer_class_for_gc(layer_cls):
     def checkpointed_fn(self, *args, **kwargs):
         slot = next((a for a in args if isinstance(a, _SharedKVSlot)), None)
         if slot is None:
+            if "shared_kv" in kwargs:
+                args, kwargs["shared_kv"] = _tie_to_hidden_state(
+                    args, kwargs["shared_kv"])
+            outer = (args, kwargs)
+
             def inner_fn(params, *args, **kwargs):
                 self.update(params)
+                _carry_window_masks(outer, (args, kwargs))
+                args = tuple(_detach_integer_arrays(a) for a in args)
+                kwargs = {k: _detach_integer_arrays(v) for k, v in kwargs.items()}
                 return fn(self, *args, **kwargs)
             return mx.checkpoint(inner_fn)(
                 self.trainable_parameters(), *args, **kwargs)
 
         # Shared K/V crosses the checkpoint boundary as a traced argument and a
         # traced result; read off the slot and the VJP drops the gradient.
+        outer = (args, kwargs)
+
         def inner_fn(params, borrowed, *args, **kwargs):
             self.update(params)
             slot.install(borrowed)
+            _carry_window_masks(outer, (args, kwargs))
+            args = tuple(_detach_integer_arrays(a) for a in args)
+            kwargs = {k: _detach_integer_arrays(v) for k, v in kwargs.items()}
             out = fn(self, *args, **kwargs)
             return out, slot.recorded()
 
+        args, borrowed = _tie_to_hidden_state(args, slot.borrow())
         out, recorded = mx.checkpoint(inner_fn)(
-            self.trainable_parameters(), slot.borrow(), *args, **kwargs)
+            self.trainable_parameters(), borrowed, *args, **kwargs)
         slot.install(recorded)
         return out
 
@@ -510,6 +1077,44 @@ def _get_text_backbone(model):
     """Get a separable hidden-state backbone when the model exposes one."""
     tm = _get_text_model(model)
     return getattr(tm, "model", None)
+
+
+def _get_encoder_decoder_backbone(model):
+    tm = _get_text_model(model)
+    backbone = getattr(model, "model", None)
+    if (getattr(tm, "_parent", None) is model
+            and callable(getattr(backbone, "encoder", None))
+            and getattr(backbone, "decoder", None) is getattr(tm, "model", None)):
+        return backbone
+    return None
+
+
+def _get_output_transform_owner(model):
+    # A non-owning decoder view omits the parent's post-projection transforms.
+    if _get_encoder_decoder_backbone(model) is not None:
+        return model
+    return _get_text_model(model)
+
+
+def _validate_output_token_mask(model):
+    tm = _get_text_model(model)
+    ids = getattr(tm, "_dummy_tokenizer_ids", None)
+    if ids is None or getattr(ids, "size", 0) == 0:
+        return
+    try:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(type(tm).__call__)))
+    except (OSError, TypeError, SyntaxError):
+        return
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Store)
+                and _self_attr_chain(node.slice) == "_dummy_tokenizer_ids"):
+            # This scatter's VJP can fault on Metal even when forward succeeds.
+            raise ValueError(
+                "Unsloth: unsafe output token mask: vocabulary token IDs index "
+                "the batch axis of [batch, sequence, vocabulary] logits. "
+                "Training is disabled to prevent a Metal address fault; the "
+                "backend must mask the final (vocabulary) axis instead."
+            )
 
 
 def _has_hidden_stack(obj):
@@ -656,6 +1261,234 @@ def _apply_vlm_embed_scale(model, input_ids, merged_embeds):
     return mx.where(untouched, merged_embeds * scale, merged_embeds)
 
 
+# Families whose MLX stack multiplies the embedding by sqrt(hidden_size) after
+# the module returns, without exposing the factor as an attribute. Named by the
+# base the model type normalizes to, since a tower is reachable as either
+# `gemma3` or `gemma3_text` depending on how the wrapper exposes it.
+_MLX_SQRT_EMBED_SCALE_FAMILIES = frozenset({
+    "gemma", "gemma2", "gemma3", "gemma3n",
+})
+# Architectures transformers has always scaled inside the embedding, used when
+# the installed transformers cannot be asked because it predates them.
+# minicpm3 is deliberately absent: no transformers in the supported range has a
+# built-in one, so the reference is trust_remote_code, which multiplies by
+# scale_emb outside the embedding just as mlx-lm does. Correcting would make MLX
+# scale_emb times weaker. A later transformers adds the scaled class, and the
+# gate then reads it directly.
+_SCALED_INSIDE_WHEN_UNASKABLE = frozenset({
+    "gemma3", "gemma3n", "gemma4", "gemma4_unified",
+})
+
+
+def _model_type_base(model_type):
+    """The spelling both the family sets and the transformers lookup use."""
+    return str(model_type or "").removesuffix("_text")
+
+
+@lru_cache(maxsize=None)
+def _transformers_scales_inside_embedding(model_type):
+    """Whether the installed transformers applies this architecture's embedding
+    multiply inside the embedding module, so its NEFTune hook fires after it.
+
+    Asked, not assumed: transformers moved gemma and gemma2's multiply into the
+    module partway through the supported range, so a fixed answer would be wrong
+    at one end. None when it cannot be asked (no such architecture installed).
+
+    Read through the loader, never imported: a modeling module needs torch, which
+    is deliberately absent on macOS arm64. Source first, then compiled code, so
+    the answer survives a package shipped without its source.
+    """
+    base = _model_type_base(model_type)
+    if not base:
+        return None
+    try:
+        spec = importlib.util.find_spec(f"transformers.models.{base}.modeling_{base}")
+    except Exception:
+        return None
+    if spec is None or spec.loader is None:
+        return None
+    marker = "ScaledWordEmbedding"
+    try:
+        source = spec.loader.get_source(spec.name)
+    except Exception:
+        source = None
+    if source is not None:
+        return marker in source
+    try:
+        code = spec.loader.get_code(spec.name)
+    except Exception:
+        code = None
+    if code is None:
+        return None
+    # A module-level class binds its name, so the flat scan is enough.
+    return any(marker in name for name in code.co_names)
+
+
+def _neftune_embed_scale(model):
+    """The multiply applied after the embedding returns that NEFTune noise has
+    to be divided by, or None when nothing needs correcting.
+
+    MLX multiplies once the embedding module has returned, so noise injected
+    there rides through it; transformers adds its noise after the same multiply
+    wherever it keeps it inside the embedding.
+    """
+    text_model = _get_text_model(model)
+    backbone = getattr(text_model, "model", None)
+    # mlx-lm keeps this on `args`, mlx-vlm on `config`, at either level.
+    holders = (backbone, text_model, getattr(backbone, "args", None),
+               getattr(backbone, "config", None), getattr(text_model, "args", None),
+               getattr(text_model, "config", None))
+
+    def _first(key):
+        for holder in holders:
+            value = None if holder is None else _config_get(holder, key)
+            if value is not None:
+                return value
+        return None
+
+    def _usable(value):
+        """The value as a positive float, or None if it is not one.
+
+        Truthiness is not enough: embed_scale can be a 0-d array (fine), a
+        multi-element array or a string (neither converts), and a non-positive
+        scale would flip or blow up the noise. Anything unusable counts as
+        absent, so the next candidate is tried instead of crashing.
+        """
+        if value is None:
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(number) or number <= 0.0:
+            return None
+        return number
+
+    model_type = str(_first("model_type") or "")
+    base = _model_type_base(model_type)
+    scale = _usable(getattr(backbone, "embed_scale", None))  # gemma4, gemma4_unified
+    if scale is None:
+        scale = _usable(_first("scale_emb"))                 # a config value, not a sqrt
+    if scale is None and base in _MLX_SQRT_EMBED_SCALE_FAMILIES:
+        hidden_size = _usable(_first("hidden_size"))
+        scale = hidden_size ** 0.5 if hidden_size else None
+    if scale is None:
+        return None
+    inside = _transformers_scales_inside_embedding(model_type)
+    if inside is None:
+        inside = base in _SCALED_INSIDE_WHEN_UNASKABLE
+    return scale if inside else None
+
+
+def _vlm_compares_embedding_values(model):
+    """Whether the forward finds merged positions by comparing embedding
+    values, which noise redrawn per call invalidates. Read off the scale
+    families so the two cannot drift apart.
+
+    Matched on the normalized model type too, since `_vlm_embed_scale` compares
+    the raw spelling and would miss a tower exposing the bare family name.
+    Refusing is the conservative side: a missed refusal injects noise into that
+    comparison, a spurious one only trains un-noised.
+    """
+    if _vlm_embed_scale(model) is not None:
+        return True
+    config = getattr(getattr(_get_text_model(model), "model", None), "config", None)
+    base = _model_type_base(_config_get(config, "model_type"))
+    if not base:
+        return False
+    return any(base == _model_type_base(family)
+               for family in _VLM_EMBED_SCALE_FAMILIES)
+
+
+def _identify_vlm_embedding_module(model):
+    """The module a text-only embedding forward uses to build ``inputs_embeds``.
+
+    Observed, not looked up: wrappers disagree on attribute name and container,
+    some expose none, and an untied ``lm_head`` carries the same weight shape --
+    a quantized embedding carries no such shape at all. Of the modules producing
+    the returned shape, drop those another encloses, which picks an adapter over
+    the embedding it wraps. None means decline, never guess.
+    """
+    calls, stack, swapped, recorders = [], [], [], {}
+    def _recorder(base):
+        cls = recorders.get(base)
+        if cls is None:
+            class _Probe(base):
+                def __call__(self, *args, **kwargs):
+                    stack.append(id(self))
+                    enclosing = frozenset(stack[:-1])
+                    try:
+                        out = base.__call__(self, *args, **kwargs)
+                    finally:
+                        stack.pop()
+                    calls.append((self, getattr(out, "shape", None), enclosing))
+                    return out
+            # The save-window DoRA check reads the class name.
+            _Probe.__name__ = base.__name__
+            _Probe.__qualname__ = getattr(base, "__qualname__", base.__name__)
+            cls = recorders[base] = _Probe
+        return cls
+
+    try:
+        seen = set()
+        for _, module in model.named_modules():
+            # One module can appear under several names; wrapping it per name
+            # stacks recorders and leaves one installed.
+            if id(module) in seen:
+                continue
+            seen.add(id(module))
+            base = type(module)
+            try:
+                module.__class__ = _recorder(base)
+            except TypeError:
+                continue
+            swapped.append((module, base))
+        ids = mx.array([[0, 1, 2]], dtype=mx.int32)
+        try:
+            embed_result = model.get_input_embeddings(ids, None)
+        except TypeError:
+            embed_result = model.get_input_embeddings(ids)
+        merged, _ = _unpack_embed_result(embed_result, model, input_ids=ids)
+    except Exception:
+        return None
+    finally:
+        for module, base in swapped:
+            module.__class__ = base
+
+    shape = getattr(merged, "shape", None)
+    if shape is None:
+        return None
+    matching = [(m, enclosing) for m, s, enclosing in calls if s == shape]
+    matching_ids = {id(m) for m, _ in matching}
+    outermost = {id(m): m for m, enclosing in matching
+                 if not (enclosing & matching_ids)}
+    if len(outermost) != 1:
+        return None
+    return next(iter(outermost.values()))
+
+
+def _probe_vlm_embedding_module(model):
+    """``_identify_vlm_embedding_module`` with the random stream it consumed put
+    back.
+
+    Training mode is deliberately untouched: a quantized-activation layer
+    requantizes its weights on every flip, and shapes do not depend on the mode.
+    """
+    # Rewound through the same pair the compile fallbacks use: it reseeds from
+    # the key's own words, so it survives mlx 0.32 making mx.random.state a
+    # sentinel that refuses item assignment. None (unreadable key) leaves the
+    # probe's draws on the caller's stream rather than raising. Never restore by
+    # rebinding mx.random.state -- that shadows the sentinel mx.compile captured
+    # and stops a compiled step redrawing, turning NEFTune into a fixed offset.
+    rng_key = _mlx_rng_key()
+    try:
+        return _identify_vlm_embedding_module(model)
+    except Exception:
+        return None
+    finally:
+        _restore_mlx_rng_key(rng_key)
+
+
 def _shared_kv_slot_count(model):
     """How many cache slots this stack needs, or 0 when it shares no K/V.
 
@@ -755,7 +1588,18 @@ def _has_direct_hidden_stack(model):
 
 def _forward_text_hidden_states(model, inputs, inputs_embeds=None, **kwargs):
     """Run a text stack up to pre-lm_head hidden states for CCE."""
+    composite = _get_encoder_decoder_backbone(model)
+    if composite is not None:
+        hidden, _ = composite(inputs, **_filter_backbone_kwargs(composite, kwargs))
+        return hidden
     tm = _get_text_model(model)
+    if (inputs_embeds is None and getattr(model, "_unsloth_text_only_vlm", False)
+            and _get_backbone_embed_kwarg(getattr(tm, "model", tm)) is not None
+            and callable(getattr(model, "get_input_embeddings", None))):
+        inputs_embeds, embed_kwargs = _unpack_embed_result(
+            model.get_input_embeddings(inputs, None), model, input_ids=inputs,
+        )
+        kwargs = {**embed_kwargs, **kwargs}
     backbone = getattr(tm, "model", None)
     if backbone is not None:
         if (
@@ -772,6 +1616,25 @@ def _forward_text_hidden_states(model, inputs, inputs_embeds=None, **kwargs):
         if "attention_mask_4d" in kwargs and "mask" not in kwargs:
             kwargs["mask"] = kwargs.pop("attention_mask_4d")
         backbone_kwargs = _filter_backbone_kwargs(backbone, kwargs)
+        rope_args = getattr(tm, "args", getattr(backbone, "config", None))
+        rope_config = (
+            _config_get(rope_args, "rope_parameters")
+            or _config_get(rope_args, "rope_scaling")
+        )
+        if (
+            inputs_embeds is None
+            and backbone_kwargs.get("position_ids") is None
+            and backbone_kwargs.get("cache") is None
+            and hasattr(tm, "_position_ids")
+            and _config_get(rope_config, "mrope_section") is not None
+        ):
+            # Text prefill uses identical sequential positions on all mRoPE axes.
+            position_ids = mx.broadcast_to(
+                mx.arange(inputs.shape[1]), (3, inputs.shape[0], inputs.shape[1]),
+            )
+            backbone_kwargs.update(_filter_backbone_kwargs(
+                backbone, {"position_ids": position_ids},
+            ))
         if inputs_embeds is not None:
             backbone_kwargs[embed_kwarg] = inputs_embeds
         return backbone(inputs, **backbone_kwargs)
@@ -1050,11 +1913,17 @@ def _cce_head_ineligibility(desc):
     """Reason fused CCE must not run for this head, or None when eligible."""
     if desc.status == "unknown":
         return "unresolved output-head topology"
-    if not desc.raw:
+    if not desc.raw and not _is_hadamard_packed_linear(desc.module):
         return f"non-raw output-head wrapper ({desc.wrapper_type.__name__})"
     if desc.has_additive_bias:
         return "additive output-head bias"
     return None
+
+
+def _rotate_head_input(head, hidden):
+    if getattr(head, "block", 0) and _is_hadamard_packed_linear(head):
+        return _hadamard_pack_module().hadamard_transform(hidden, head.block, head.signs)
+    return hidden
 
 
 def _get_lm_head_layer(model):
@@ -1079,7 +1948,7 @@ def _is_quantized_layer(layer):
 
 def _get_logit_softcap(model):
     """Get logit softcapping value if model uses it (e.g. Gemma-2/4), else 0.0."""
-    tm = _get_text_model(model)
+    tm = _get_output_transform_owner(model)
     softcap = getattr(tm, "final_logit_softcapping", None)
     if softcap is None and hasattr(tm, "args"):
         softcap = getattr(tm.args, "final_logit_softcapping", None)
@@ -1095,7 +1964,7 @@ def _get_logit_scale(model):
     ``(scale, invalid)``: scale None when absent or 1.0; ``invalid=True`` for
     bool/non-scalar/non-finite/out-of-range values (callers must fall back).
     """
-    tm = _get_text_model(model)
+    tm = _get_output_transform_owner(model)
     # Only the verified application sites — args (cohere/cohere2/cohere2_moe)
     # then config (aya_vision); no upstream forward reads a direct attribute.
     scale = None
@@ -1103,6 +1972,11 @@ def _get_logit_scale(model):
         scale = getattr(tm.args, "logit_scale", None)
     if scale is None and hasattr(tm, "config"):
         scale = getattr(tm.config, "logit_scale", None)
+    return _validated_head_multiplier(scale)
+
+
+def _validated_head_multiplier(scale):
+    """Returns ``(scale, invalid)``, scale None when absent or a no-op 1.0."""
     if scale is None:
         return None, False
     if isinstance(scale, bool) or not isinstance(scale, numbers.Real):
@@ -1130,11 +2004,15 @@ _KNOB_MISSING = object()
 # config drift must fail closed); others read args (config for VLM wrappers).
 _HEAD_TRANSFORM_KNOBS = {
     "logit_scale": ("args", "config"),          # Cohere: out * logit_scale
+    "output_multiplier": ("attr", "args", "config"),  # Muse Glimmer: pre-softcap multiply
     "logits_scaling": ("attr", "args", "config"),  # Granite: out / logits_scaling
     "lm_head_multiplier": ("args", "config"),   # Falcon-H1 tied composite
     "dim_model_base": ("args", "config"),       # MiniCPM untied ratio divide
     "mup_width_multiplier": ("attr", "args", "config"),  # Phi3Small masked tail
 }
+# Where a knob is read and what values are usable, not where it sits in the forward.
+# Fused CCE pre-scales and caps after, so a row here asserts the model scales before
+# it caps. Every softcapping architecture in mlx-lm and mlx-vlm does.
 _KNOB_AUX_SITES = {
     "embedding_multiplier": ("args", "config"),
     "hidden_size": ("args", "config"),
@@ -1183,7 +2061,7 @@ def _detect_logit_softcap(model):
     mean no cap, a positive finite real caps, anything else (or both attrs
     present) fails closed rather than dropping the cap.
     """
-    tm = _get_text_model(model)
+    tm = _get_output_transform_owner(model)
     # Presence, not value: an explicitly-None legacy attr still makes the
     # dual-attr combination unverified.
     legacy = getattr(tm, "final_logit_softcapping", _KNOB_MISSING)
@@ -1228,7 +2106,7 @@ def _detect_head_transform(model, head_status):
     no-op case; accepted scales obey the ``_get_logit_scale`` range.
     ``head_status`` selects branch-conditional transforms as the forwards do.
     """
-    tm = _get_text_model(model)
+    tm = _get_output_transform_owner(model)
     present = {}
     for name, sites in _HEAD_TRANSFORM_KNOBS.items():
         value, conflict = _knob_value(tm, name, sites)
@@ -1247,14 +2125,20 @@ def _detect_head_transform(model, head_status):
         # value-guarded divide: presence alone makes the tail non-scalar.
         return None, ("mup_width_multiplier models mask logits after the "
                       "output head, which fused CCE cannot reproduce")
-    if knob == "logit_scale":
+    if knob in ("logit_scale", "output_multiplier"):
         # A present-None value is malformed live state (the forward would
         # multiply logits by None); fail closed rather than run unscaled.
         if raw is None:
-            return None, "logit_scale is present but None"
-        scale, invalid = _get_logit_scale(model)
+            return None, f"{knob} is present but None"
+        # logit_scale re-reads its own consumer sites; output_multiplier is
+        # read straight off the resolved knob, whose sites already agreed.
+        scale, invalid = (
+            _get_logit_scale(model)
+            if knob == "logit_scale"
+            else _validated_head_multiplier(raw)
+        )
         if invalid:
-            return None, ("logit_scale cannot be applied by fused CCE "
+            return None, (f"{knob} cannot be applied by fused CCE "
                           "(non-finite, non-scalar, or outside the "
                           "supported range)")
         return scale, None
@@ -1329,6 +2213,76 @@ def _is_lm_head_trainable(model):
     return len(trainable) == 0  # no LoRA = full fine-tuning
 
 
+def _supports_text_lora_cce(desc, label_smoothing):
+    if (desc.status == "unknown" or desc.raw or label_smoothing != 0.0
+            or not mx.metal.is_available()):
+        return False
+    from unsloth_zoo.mlx.cce.runtime_cce import supported_lora_head
+
+    head = desc.module
+    if (not supported_lora_head(head) or not 1024 <= head.lora_a.shape[0] <= 4096
+            or head.linear.weight.shape[0] < 8192):
+        return False
+    return type(head.linear) is not nn.QuantizedLinear or head.lora_a.shape[1] <= 32
+
+
+def _make_text_lora_cce_loss_fn(head_desc, logit_scale, softcap):
+    from unsloth_zoo.mlx.cce.runtime_cce import make_lora_head_cce
+
+    head = head_desc.module
+    quantized = type(head.linear) is nn.QuantizedLinear
+    kernel = make_lora_head_cce(
+        chunk_size=4096 if head.lora_a.shape[0] > 2048 else 2048,
+        adapter_scale=head.scale,
+        logit_scale=1.0 if logit_scale is None else logit_scale,
+        logit_softcap=softcap,
+        group_size=head.linear.group_size if quantized else None,
+        bits=head.linear.bits if quantized else None,
+        mode=head.linear.mode if quantized else "affine",
+    )
+    baseline = make_baseline_loss_fn()
+    vocab_size = head.linear.weight.shape[0]
+    head_path = head_desc.path
+
+    def loss_fn(model, batch, lengths, labels=None):
+        n_tokens = batch.shape[0] * max(0, batch.shape[1] - 1)
+        if n_tokens < 1024 or n_tokens * vocab_size < 16 * 1024 * 1024:
+            return baseline(model, batch, lengths, labels)
+        inputs = batch[:, :-1]
+        targets = batch[:, 1:] if labels is None else labels[:, 1:]
+        hidden = _forward_text_hidden_states(model, inputs)
+        targets = _normalize_cce_label_dtype(targets)
+        steps = mx.arange(1, targets.shape[1] + 1)
+        mask = (steps >= lengths[:, 0:1]) & (steps < lengths[:, 1:])
+        if labels is not None:
+            mask = mask & (targets != -100)
+        targets = mx.where(mask, targets, mx.array(-100, dtype=targets.dtype))
+        count = mask.sum()
+        live_head = _resolve_module_path(model, head_path)
+        base = live_head.linear
+        hidden = hidden.reshape((-1, hidden.shape[-1]))
+        rank_hidden = live_head.dropout(hidden) @ live_head.lora_a
+        losses = kernel(
+            hidden, base.weight, base.scales if quantized else None,
+            base.get("biases") if quantized else None,
+            rank_hidden, live_head.lora_b, base.get("bias"), targets.reshape((-1,)),
+        )
+        return losses.sum() / _safe_token_denominator(count), count
+
+    loss_fn._unsloth_cce_backend = "runtime-cce-lora-head"
+    return loss_fn
+
+
+def _runtime_cce_by_mode(**kwargs):
+    loss_only = _get_runtime_cce(**kwargs)
+    if not (kwargs.get("quantized") or kwargs.get("weight_is_frozen")):
+        return lambda model: loss_only
+    # Training builds a frozen head's hidden gradient in the forward, which would
+    # double the cost of evaluation, where nothing is differentiated.
+    training = _get_runtime_cce(**kwargs, precompute_hidden_gradient=True)
+    return lambda model: training if model.training else loss_only
+
+
 def make_cce_loss_fn(model, label_smoothing=0.0):
     """Create a chunked cross-entropy (CCE) loss function.
 
@@ -1353,7 +2307,8 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
         loss_fn._unsloth_cce_backend = "baseline-fallback"
         return loss_fn
     head_desc = describe_output_head(model)
-    _ineligible = _cce_head_ineligibility(head_desc)
+    _lora_cce = _supports_text_lora_cce(head_desc, label_smoothing)
+    _ineligible = None if _lora_cce else _cce_head_ineligibility(head_desc)
     if _ineligible is not None:
         print(f"Unsloth: fused CCE cannot faithfully use this model's output "
               f"head ({_ineligible}); falling back to standard cross-entropy.")
@@ -1373,6 +2328,14 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
         loss_fn = make_baseline_loss_fn(label_smoothing=label_smoothing)
         loss_fn._unsloth_cce_backend = "baseline-fallback"
         return loss_fn
+    if _lora_cce:
+        loss_fn = make_baseline_loss_fn(label_smoothing=label_smoothing)
+        loss_fn._unsloth_cce_backend = "baseline-fallback"
+        loss_fn._unsloth_compiled_loss_fn = _make_text_lora_cce_loss_fn(
+            head_desc, logit_scale, softcap,
+        )
+        return loss_fn
+
     if softcap > 0:
         print(f"Unsloth: CCE using logit_softcap={softcap} for this model.")
     if logit_scale is not None:
@@ -1414,7 +2377,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
         )
         _has_biases = hasattr(lm_layer, "biases")
 
-        rt_cce = _get_runtime_cce(
+        rt_cce = _runtime_cce_by_mode(
             ignore_index=-100,
             logit_softcap=softcap,
             quantized=True,
@@ -1424,7 +2387,7 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
             label_smoothing=label_smoothing,
         )
 
-        def loss_fn(model, batch, lengths, labels=None):
+        def loss_fn(model, batch, lengths, labels=None, cce_indices=None):
             if labels is None:
                 inputs, targets = batch[:, :-1], batch[:, 1:]
             else:
@@ -1456,7 +2419,11 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
                 # cached kernels stay scale-independent.
                 hidden_flat = hidden_flat * logit_scale
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
-            loss = rt_cce(hidden_flat, w, sc, bi, targets_flat)
+            hidden_flat, targets_flat = _compact_cce_inputs(
+                hidden_flat, targets_flat, cce_indices,
+            )
+            hidden_flat = _rotate_head_input(layer, hidden_flat)
+            loss = rt_cce(model)(hidden_flat, w, sc, bi, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
     else:
@@ -1464,13 +2431,14 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
         if _skip_weight_grad:
             print("Unsloth: CCE skipping weight gradient (LM head is frozen).")
 
-        rt_cce = _get_runtime_cce(
+        rt_cce = _runtime_cce_by_mode(
             ignore_index=-100,
             logit_softcap=softcap,
             label_smoothing=label_smoothing,
+            weight_is_frozen=_skip_weight_grad,
         )
 
-        def loss_fn(model, batch, lengths, labels=None):
+        def loss_fn(model, batch, lengths, labels=None, cce_indices=None):
             if labels is None:
                 inputs, targets = batch[:, :-1], batch[:, 1:]
             else:
@@ -1496,12 +2464,47 @@ def make_cce_loss_fn(model, label_smoothing=0.0):
                 # Same pre-scaling identity as the quantized branch above.
                 hidden_flat = hidden_flat * logit_scale
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
-            loss = rt_cce(hidden_flat, w, targets_flat)
+            hidden_flat, targets_flat = _compact_cce_inputs(
+                hidden_flat, targets_flat, cce_indices,
+            )
+            loss = rt_cce(model)(hidden_flat, w, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
 
     loss_fn._unsloth_cce_backend = "runtime-cce"
+    loss_fn._unsloth_cce_compaction = lm_layer.weight.shape[0] >= 8192
     return loss_fn
+
+
+def _compact_cce_inputs(hidden, targets, indices):
+    if indices is None:
+        return hidden, targets
+    safe_indices = mx.maximum(indices, 0)
+    hidden = mx.take(hidden, safe_indices, axis=0)
+    targets = mx.take(targets, safe_indices, axis=0)
+    targets = mx.where(indices >= 0, targets, mx.array(-100, targets.dtype))
+    return hidden, targets
+
+
+def _model_logits(output):
+    """mlx_lm models return the logits array; mlx-vlm wrappers wrap them."""
+    logits = getattr(output, "logits", None)
+    if logits is not None:
+        return logits
+    if hasattr(output, "logits"):
+        # Unwrapping to None instead leaves a `'NoneType' has no attribute 'ndim'`
+        # inside cross-entropy.
+        raise ValueError(
+            "Unsloth: the model returned an output wrapper whose `logits` is "
+            "None, so there is nothing to compute a loss from."
+        )
+    return output
+
+
+def _masked_correct(logits, targets, mask):
+    """Supervised positions whose argmax is the target (eval token accuracy)."""
+    hits = mx.logical_and(mx.argmax(logits, axis=-1) == targets, mask.astype(mx.bool_))
+    return hits.astype(mx.float32).sum()
 
 
 def make_baseline_loss_fn(label_smoothing=0.0):
@@ -1527,13 +2530,13 @@ def make_baseline_loss_fn(label_smoothing=0.0):
     else:
         _token_ce = nn.losses.cross_entropy
 
-    def loss_fn(model, batch, lengths, labels=None):
+    def loss_fn(model, batch, lengths, labels=None, return_correct=False):
         if labels is None:
             # Half-open [start, end) end-exclusive mask; matches CCE/labels paths
             # (:360, :393, :439) and mlx_lm's lengths convention.
             inputs = batch[:, :-1]
             targets = batch[:, 1:]
-            logits = model(inputs)
+            logits = _model_logits(model(inputs))
             steps = mx.arange(1, targets.shape[1] + 1)
             mask = mx.logical_and(steps >= lengths[:, 0:1], steps < lengths[:, 1:])
             ce = _token_ce(logits, targets) * mask
@@ -1541,13 +2544,15 @@ def make_baseline_loss_fn(label_smoothing=0.0):
             # Raw ntoks (no safe denominator) to match mlx_lm default_loss
             # byte-for-byte; the safe wrapper stays on the labels-aware path.
             ce = ce.astype(mx.float32).sum() / ntoks
+            if return_correct:
+                return ce, ntoks, _masked_correct(logits, targets, mask)
             return ce, ntoks
         # labels-aware path: train_on_responses_only style masking.
         inputs = batch[:, :-1]
         # Widen unsigned dtypes so mx.where(..., -100, ...) and the
         # `targets != -100` compare both see signed int64.
         targets = _normalize_cce_label_dtype(labels[:, 1:])
-        logits = model(inputs)
+        logits = _model_logits(model(inputs))
         steps = mx.arange(1, targets.shape[1] + 1)
         length_mask = mx.logical_and(steps >= lengths[:, 0:1], steps < lengths[:, 1:])
         if labels is None:
@@ -1562,14 +2567,13 @@ def make_baseline_loss_fn(label_smoothing=0.0):
         ce = _token_ce(logits, safe_targets) * mask
         ntoks = mask.sum()
         loss = ce.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
+        if return_correct:
+            return loss, ntoks, _masked_correct(logits, safe_targets, mask)
         return loss, ntoks
 
+    loss_fn._unsloth_token_accuracy = True
     return loss_fn
 
-
-# ---------------------------------------------------------------------------
-# VLM helpers
-# ---------------------------------------------------------------------------
 
 # Image/vision/audio special tokens that should never contribute to loss.
 # Single source of truth shared with the CUDA collator (unsloth_zoo/vlm_tokens.py),
@@ -1644,6 +2648,11 @@ def _get_vlm_ignore_token_ids(processor=None, config=None, model=None):
         ):
             token = getattr(tokenizer, attr, None)
             if token is not None:
+                _append_unique_int(ids, _convert_token_to_id(tokenizer, token))
+
+        for attr in ("image_token", "video_token", "audio_token"):
+            token = getattr(processor, attr, None)
+            if isinstance(token, str):
                 _append_unique_int(ids, _convert_token_to_id(tokenizer, token))
 
         for attr in (
@@ -1761,6 +2770,7 @@ def _stage_vlm_label_mask_np(inputs, ignore_token_ids=None, labels=None):
     coercion parity holds by construction. Float comparisons mirror MLX's
     effective float32 narrowing so placement matches the finalized tensors.
     """
+    generated = labels is None
     if labels is None:
         labels = inputs.get(_RAW_INPUT_IDS_FOR_LABELS)
         if labels is None:
@@ -1782,6 +2792,8 @@ def _stage_vlm_label_mask_np(inputs, ignore_token_ids=None, labels=None):
         # Same normalization finalize uses (wide unsigned ids -> int64 sentinels)
         values = _normalize_numpy_cce_labels(values)
     mask = values == -100
+    if generated and any(inputs.get(key) is not None for key in ("pixel_values", "images")):
+        mask = mask | (values < 0)
     if ignore_token_ids:
         compare = np.asarray(list(ignore_token_ids))
         if np.issubdtype(values.dtype, np.floating):
@@ -1804,6 +2816,8 @@ def _stage_vlm_label_mask_np(inputs, ignore_token_ids=None, labels=None):
         if attention_np.dtype == np.float64:
             attention_np = attention_np.astype(np.float32)
         mask = mask | (attention_np.astype(np.int32) == 0)
+    if inputs.get("_unsloth_suffix_only_loss", False):
+        mask = mask | (np.asarray(inputs["token_type_ids"]) == 0)
     return mask
 
 def _reject_mlx_valued_vlm(context):
@@ -1970,9 +2984,13 @@ def _apply_vlm_label_masks(batch_dict, labels=None, ignore_token_ids=None,
     # its own narrow, so wide/unsigned invalid ids (e.g. uint32(2**32-100))
     # must survive as out-of-vocab sentinels instead of wrapping to -100.
     # Prefer the pre-narrow raw carrier when deriving labels from input_ids.
+    generated = labels is None
     if labels is None:
         labels = batch_dict.get(_RAW_INPUT_IDS_FOR_LABELS, batch_dict["input_ids"])
     labels = _normalize_cce_label_dtype(labels)
+    if generated and batch_dict.get("pixel_values") is not None:
+        # Processor-generated negative image placeholders are not vocabulary targets.
+        labels = mx.where(labels < 0, mx.array(ignore_index, dtype=labels.dtype), labels)
     labels = _mask_label_token_ids(labels, ignore_token_ids, ignore_index)
     spans = _audio_span_positions_np(batch_dict, labels.shape)
     if spans is not None:
@@ -1984,6 +3002,9 @@ def _apply_vlm_label_masks(batch_dict, labels=None, ignore_token_ids=None,
     if attention_mask is not None:
         ignore = mx.array(ignore_index, dtype=labels.dtype)
         labels = mx.where(attention_mask == 0, ignore, labels)
+    if batch_dict.get("_unsloth_suffix_only_loss", False):
+        labels = mx.where(batch_dict["token_type_ids"] == 0,
+                          mx.array(ignore_index, dtype=labels.dtype), labels)
     return labels
 
 
@@ -2064,7 +3085,7 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
     )
     _assistant_token_id = assistant_token_id
 
-    def loss_fn(model, batch_dict):
+    def loss_fn(model, batch_dict, return_correct=False):
         input_ids = batch_dict["input_ids"]
         pixel_values = batch_dict.get("pixel_values")
         attention_mask = batch_dict.get("attention_mask")
@@ -2082,6 +3103,7 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
             and not k.startswith("_unsloth_")
             and v is not None
         }
+        _apply_static_vlm_metadata(model, batch_dict, fwd_kwargs)
         fwd_kwargs = _trim_sequence_aligned_vlm_kwargs(fwd_kwargs, inputs.shape[1])
         # Always sent: 13 families declare `mask` without a default. None lets
         # them build the mask they would use for generation.
@@ -2106,7 +3128,9 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
                 **{k: v for k, v in fwd_kwargs.items()
                    if k not in ("mask", "cache")},
             )
-            merged_embeds, embed_kwargs = _unpack_embed_result(embed_result, model)
+            merged_embeds, embed_kwargs = _unpack_embed_result(
+                embed_result, model, input_ids=inputs, attention_mask=attention_mask,
+            )
             scaled_embeds = _apply_vlm_embed_scale(model, inputs, merged_embeds)
             # per_layer_inputs and friends: the merge produced them, and
             # recomputing from ids inside the stack would redo the work.
@@ -2120,11 +3144,12 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
             # it by forwarding straight to the language model; do that here on
             # every version, which is what `_vlm_cce_forward` already does.
             output = _get_text_model(model)(
-                inputs, inputs_embeds=scaled_embeds, **fwd_kwargs
+                inputs, inputs_embeds=scaled_embeds,
+                **_drop_pair_token_type_ids(batch_dict, fwd_kwargs),
             )
         else:
             output = model(inputs, pixel_values=pixel_values, **fwd_kwargs)
-        logits = output.logits if hasattr(output, "logits") else output
+        logits = _model_logits(output)
         logits = logits.astype(mx.float32)
         # Drop the final position so logits predict the next token.
         logits = logits[:, :-1, :]
@@ -2151,7 +3176,6 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
             # Vision token injection can change seq length
             logits, targets = _align_logits_with_labels(logits, targets)
 
-            # Build mask from attention_mask (shifted to match targets)
             if attention_mask is not None:
                 length_mask = attention_mask[:, 1:]
                 length_mask = length_mask[:, :targets.shape[1]]
@@ -2160,7 +3184,6 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
 
             targets = _mask_image_tokens(targets, _image_token_ids)
             targets = _mask_prompt_tokens(targets, _assistant_token_id)
-            # Exclude masked positions from length_mask
             mask = mx.where(
                 targets == -100,
                 mx.array(0, dtype=length_mask.dtype),
@@ -2175,13 +3198,47 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
         ce = nn.losses.cross_entropy(logits, safe_targets) * mask
         ntoks = mask.sum()
         loss = ce.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
+        if return_correct:
+            return loss, ntoks, _masked_correct(logits, safe_targets, mask)
         return loss, ntoks
 
     loss_fn._unsloth_cce_backend = "baseline-ce"
+    loss_fn._unsloth_token_accuracy = True
     return loss_fn
 
 
-def _unpack_embed_result(embed_result, model):
+# gemma4_unified shares the text model but its `Model.__call__` drops `mm_token_type_ids`.
+_VLM_MM_TOKEN_TYPE_FORWARDING_MODEL_TYPES = frozenset({"gemma4"})
+
+
+def _drop_pair_token_type_ids(batch_dict, kwargs):
+    """Keep suffix/prefix pair markers out of the text stack.
+
+    A suffix-supervised text-only row is encoded as a tokenizer pair, so its
+    `token_type_ids` mean "1 = suffix". Gemma3's stack reads the same key as
+    "1 = image" and makes every marked span bidirectional, which would let the
+    answer attend to its own future tokens. The model-level kwargs still carry
+    it, because PaliGemma's prefix-LM wrapper is the consumer that wants it.
+    """
+    if not batch_dict.get("_unsloth_suffix_only_loss", False):
+        return kwargs
+    return {k: v for k, v in kwargs.items() if k != "token_type_ids"}
+
+
+def _apply_static_vlm_metadata(model, batch_dict, kwargs):
+    embedder = getattr(model, "get_input_embeddings", None)
+    keys = getattr(embedder, "_unsloth_static_vlm_metadata", ())
+    if getattr(embedder, "_unsloth_static_metadata_with_positions", False) and (
+        not getattr(model, "training", False) or kwargs.get("position_ids") is None
+    ):
+        return
+    static = batch_dict.get("_unsloth_static_vlm_metadata", {})
+    for key in keys:
+        if key in static:
+            kwargs[key] = static[key]
+
+
+def _unpack_embed_result(embed_result, model, input_ids=None, attention_mask=None):
     """Unpack get_input_embeddings result into embeds + backbone kwargs.
 
     Handles plain mx.array returns and the InputEmbeddingsFeatures dataclass
@@ -2219,57 +3276,49 @@ def _unpack_embed_result(embed_result, model):
     else:
         merged_embeds = embed_result
 
-    # Qwen-VL family: some get_input_embeddings paths stash position_ids on the
-    # language model wrapper; the inner backbone needs them explicitly.
-    # Do not override position_ids explicitly returned by InputEmbeddingsFeatures
-    # (for example when the collator passed CUDA-parity mRoPE IDs through the
-    # embedder).
-    # When no position_ids were stashed (e.g. text-only samples or simple
-    # images without grid_thw), generate sequential ones so the backbone
-    # doesn't crash accessing cache.offset with cache=None.
     lm = getattr(model, "language_model", None)
     if lm is not None and "position_ids" not in backbone_kwargs:
-        _MISSING = object()
-        pos_ids = getattr(lm, "_position_ids", _MISSING)
-        if pos_ids is not _MISSING and pos_ids is not None:
+        pos_ids = getattr(lm, "_position_ids", None)
+        if pos_ids is not None:
             backbone_kwargs["position_ids"] = pos_ids
-        elif pos_ids is None:
-            # Fallback: sequential position_ids. Correct for text-only and
-            # single-image samples. For multi-image with spatial m-RoPE
-            # (Qwen VL), the per-axis positions should differ for image
-            # regions — but grid_thw metadata is unavailable here so we
-            # use sequential as an approximation.
-            seq_len = merged_embeds.shape[1]
-            pos_ids = mx.arange(seq_len).reshape(1, -1)
-            pos_ids = mx.broadcast_to(pos_ids, (merged_embeds.shape[0], seq_len))
-            # Qwen VL m-RoPE uses 3 axes: temporal, height, width
-            MROPE_AXES = 3
-            pos_ids = mx.expand_dims(pos_ids, axis=0)
-            pos_ids = mx.tile(pos_ids, (MROPE_AXES, 1, 1))
+        elif (hasattr(lm, "_position_ids") and input_ids is not None
+              and callable(getattr(lm, "get_rope_index", None))):
+            # The model owns the positional axes; a cached field alone says nothing about rank.
+            pos_ids, _ = lm.get_rope_index(input_ids, attention_mask=attention_mask)
             backbone_kwargs["position_ids"] = pos_ids
 
     return merged_embeds, backbone_kwargs
 
 
 def _get_backbone_embed_kwarg(backbone):
+    # A backbone without its own __call__ (a bare nn.Module) takes no embeddings kwarg either.
     try:
         params = inspect.signature(backbone.__call__).parameters
-    except (TypeError, ValueError):
-        return "inputs_embeds"
-    if "inputs_embeds" in params:
-        return "inputs_embeds"
-    if "input_embeddings" in params:
-        return "input_embeddings"
-    if "input_embeds" in params:
-        return "input_embeds"
-    return "inputs_embeds"
+    except (AttributeError, TypeError, ValueError):
+        return None
+    for name in ("inputs_embeds", "input_embeddings", "input_embeds"):
+        if name in params and params[name].kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY,
+        ):
+            return name
+    return None
 
 
 def _filter_backbone_kwargs(backbone, kwargs):
     try:
         params = inspect.signature(backbone.__call__).parameters
-    except (TypeError, ValueError):
+    except (AttributeError, TypeError, ValueError):
         return kwargs
+    if "image_mask" in params and "image_mask" not in kwargs:
+        kwargs = dict(kwargs)
+        kwargs["image_mask"] = kwargs.pop("visual_pos_masks", None)
+    cache = params.get("cache")
+    if (
+        cache is not None and cache.default is inspect.Parameter.empty
+        and cache.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        and "cache" not in kwargs
+    ):
+        kwargs = {**kwargs, "cache": None}
     if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
         return kwargs
     allowed = set(params)
@@ -2300,25 +3349,43 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         and not k.startswith("_unsloth_")
         and v is not None
     }
+    _apply_static_vlm_metadata(model, batch_dict, extra_kwargs)
     extra_kwargs = _trim_sequence_aligned_vlm_kwargs(extra_kwargs, inputs.shape[1])
 
-    embed_result = model.get_input_embeddings(
-        inputs,
-        pixel_values,
-        mask=fwd_attn_mask,
-        **extra_kwargs,
-    )
-    merged_embeds, backbone_kwargs = _unpack_embed_result(embed_result, model)
-    merged_embeds = _apply_vlm_embed_scale(model, inputs, merged_embeds)
+    backbone = _get_text_backbone(model)
+    if (_get_encoder_decoder_backbone(model) is not None
+            or (backbone is not None and _get_backbone_embed_kwarg(backbone) is None)):
+        merged_embeds = None
+        backbone_kwargs = dict(extra_kwargs, pixel_values=pixel_values)
+        backbone_kwargs["mask"] = (
+            fwd_attn_mask if _keeps_forwarded_mask(model) else None
+        )
+    else:
+        embed_result = model.get_input_embeddings(
+            inputs,
+            pixel_values,
+            mask=fwd_attn_mask,
+            **extra_kwargs,
+        )
+        merged_embeds, backbone_kwargs = _unpack_embed_result(
+            embed_result, model, input_ids=inputs, attention_mask=attention_mask,
+        )
+        merged_embeds = _apply_vlm_embed_scale(model, inputs, merged_embeds)
     # Prefer collator-built mRoPE IDs when present. Qwen/GLM collators build
     # CUDA-parity full-sequence positions; recomputing inside the embedder moved
     # Qwen3-VL first-step loss from ~6.45 to ~6.90 on the real-cat fixture.
     if use_collated_position_ids and "position_ids" in extra_kwargs:
         backbone_kwargs["position_ids"] = extra_kwargs["position_ids"]
-    if "token_type_ids" in extra_kwargs:
+    if "token_type_ids" in _drop_pair_token_type_ids(batch_dict, extra_kwargs):
         backbone_kwargs["token_type_ids"] = extra_kwargs["token_type_ids"]
         if attention_mask is not None:
             backbone_kwargs["attention_mask"] = attention_mask
+    if (
+        "mm_token_type_ids" in extra_kwargs
+        and _config_get(getattr(model, "config", None), "model_type")
+        in _VLM_MM_TOKEN_TYPE_FORWARDING_MODEL_TYPES
+    ):
+        backbone_kwargs["mm_token_type_ids"] = extra_kwargs["mm_token_type_ids"]
 
     shared_kv = _build_shared_kv_caches(model)
     if shared_kv is not None:
@@ -2364,7 +3431,6 @@ def _vlm_cce_forward(model, batch_dict, image_token_ids=None,
         masked_targets = mx.where(length_mask, targets, ignore)
 
         masked_targets = _mask_image_tokens(masked_targets, image_token_ids)
-        # Completion-only: mask prompt before first assistant response
         masked_targets = _mask_prompt_tokens(masked_targets, assistant_token_id)
 
         ntoks = (masked_targets != -100).sum()
@@ -2435,26 +3501,41 @@ def _normalize_grid_thw(grid_thw):
     return tuple(normalized)
 
 
-def _grid_thw_to_mx_array(grid_thw):
-    if grid_thw is None:
-        return None
-    return mx.array(grid_thw, dtype=mx.int32)
+def _mlx_vlm_canonical_model_type(model_type):
+    """Resolve exactly the module spelling mlx-vlm imports, including hyphens."""
+    if not model_type:
+        return ""
+    name = str(model_type).lower()
+    try:
+        from mlx_vlm.utils import MODEL_REMAPPING
+        name = MODEL_REMAPPING.get(name, name)
+    except Exception:
+        pass
+    return name
+
+
+# Families whose mlx-vlm code indexes the vision grid as an array (`.tolist()`,
+# `.prod()`, `[:, 1:]`), so a tuple raises inside their tower. Everything else
+# keeps the tuple the Qwen/Paddle compile patches trace: an array becomes a
+# tracer under mx.compile and `.tolist()` raises there instead. Pinned by
+# tests/test_mlx_text_path_contract.py.
+_VLM_ARRAY_GRID_MODEL_TYPES = frozenset({
+    "glm4v",
+    "glm_ocr",
+    # Not compile-patched, and opens with `grid_thw.tolist()`.
+    "muse_glimmer",
+    "glm5_next",
+})
 
 
 def _normalize_size_tuples(values):
     if values is None:
         return None
-    if isinstance(values, mx.array):
+    if hasattr(values, "tolist"):
         values = values.tolist()
-    elif hasattr(values, "tolist"):
-        values = values.tolist()
-
-    normalized = []
-    for item in values:
-        if hasattr(item, "tolist"):
-            item = item.tolist()
-        normalized.append(tuple(int(x) for x in item))
-    return tuple(normalized)
+    if isinstance(values, (list, tuple)):
+        return tuple(_normalize_size_tuples(item) for item in values)
+    return int(values)
 
 
 def _normalize_int_tuple(values):
@@ -2880,6 +3961,8 @@ _VLM_QWEN_POSITION_MODEL_TYPES = frozenset({
     "qwen3_vl_moe",
     "qwen3_5",
     "qwen3_5_moe",
+    "qwen4_exp",
+    "prism_hadamard_qwen35",
 })
 _VLM_POSITION_GENERATING_MODEL_TYPES = (
     _VLM_QWEN_POSITION_MODEL_TYPES | {"glm_ocr"}
@@ -3106,6 +4189,7 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
         return _vlm_positions_for_compile(batch_dict, config)
     if phase != "content":
         raise ValueError(f"unknown VLM prepare phase: {phase!r}")
+    validate_legacy_image_batch(batch_dict)
     # The provenance marker is pipeline-private: processor output carrying it is a
     # forgery that would misclassify foreign position ids as regenerated.
     batch_dict.pop("_unsloth_collated_position_ids", None)
@@ -3118,23 +4202,33 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
     spatial_shapes = _normalize_size_tuples(batch_dict.get("spatial_shapes"))
     images_spatial_crop = _normalize_size_tuples(batch_dict.get("images_spatial_crop"))
     audio_embed_sizes = _normalize_int_tuple(batch_dict.get("audio_embed_sizes"))
-    grid_as_array = model_type in {"glm4v", "glm_ocr"}
-    if image_grid_thw is not None:
-        # GLM native mlx-vlm paths call .tolist(), .prod(), and slicing on
-        # grids; Qwen/Paddle compile patches expect Python tuples.
-        batch_dict["image_grid_thw"] = (
-            _grid_thw_to_mx_array(image_grid_thw) if grid_as_array else image_grid_thw
-        )
-    if video_grid_thw is not None:
-        batch_dict["video_grid_thw"] = (
-            _grid_thw_to_mx_array(video_grid_thw) if grid_as_array else video_grid_thw
-        )
-    if image_sizes is not None:
-        batch_dict["image_sizes"] = image_sizes
-    if spatial_shapes is not None:
-        batch_dict["spatial_shapes"] = spatial_shapes
-    if images_spatial_crop is not None:
-        batch_dict["images_spatial_crop"] = images_spatial_crop
+    # Resolved, not raw: an aliased config is routed to the canonical family's
+    # tower, so the grid form has to follow it there.
+    grid_as_array = (
+        _mlx_vlm_canonical_model_type(model_type) in _VLM_ARRAY_GRID_MODEL_TYPES
+    )
+    static_metadata = {}
+    for key, normalized in (
+        ("image_grid_thw", image_grid_thw),
+        ("video_grid_thw", video_grid_thw),
+        ("spatial_shapes", spatial_shapes),
+        ("image_sizes", image_sizes),
+        ("images_spatial_crop", images_spatial_crop),
+    ):
+        if normalized is not None:
+            value = batch_dict[key]
+            if isinstance(value, (mx.array, np.ndarray)):
+                pass  # Never downgrade what the processor emitted.
+            elif grid_as_array and key in ("image_grid_thw", "video_grid_thw"):
+                value = mx.array(normalized, dtype=mx.int32)
+            else:
+                value = normalized
+            batch_dict[key] = value
+            static_metadata[key] = normalized
+    # Only when there is metadata: every VLM batch goes through here, and an
+    # always-present empty dict is a new key in every text-only batch's pytree.
+    if static_metadata:
+        batch_dict["_unsloth_static_vlm_metadata"] = static_metadata
     if audio_embed_sizes is not None:
         # The model calls .item() on each entry, so hand over an array; the
         # tuple above is only for this function's span arithmetic.
@@ -3395,6 +4489,12 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
         )
         return _marked_vlm_baseline()
 
+    backbone = getattr(tm, "model", None)
+    token_ids_only = (
+        backbone is not None and _get_backbone_embed_kwarg(backbone) is None
+        and _get_encoder_decoder_backbone(model) is None
+    )
+
     head_desc = describe_output_head(model)
     _ineligible = _cce_head_ineligibility(head_desc)
     if _ineligible is not None:
@@ -3411,6 +4511,12 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
     if _softcap_problem is not None:
         print(f"Unsloth: {_softcap_problem}; falling back to standard cross-entropy.")
         return _marked_vlm_baseline()
+    # Every decision above prints when it declines; print when it accepts too, since
+    # a silently ignored head transform is the failure this prevents.
+    if softcap > 0:
+        print(f"Unsloth: VLM CCE using logit_softcap={softcap} for this model.")
+    if logit_scale is not None:
+        print(f"Unsloth: VLM CCE using logit_scale={logit_scale} for this model.")
     lm_layer = head_desc.module
     use_quantized = _is_quantized_layer(lm_layer)
     _head_path = head_desc.path
@@ -3444,7 +4550,7 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
         bits = getattr(lm_layer, "bits", 4)
         quant_mode = getattr(lm_layer, "mode", "affine")
 
-        rt_cce = _get_runtime_cce(
+        rt_cce = _runtime_cce_by_mode(
             ignore_index=-100,
             logit_softcap=softcap,
             quantized=True,
@@ -3472,16 +4578,24 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
                 # Cohere2-MoE apply logit_scale in their forward tails).
                 hidden_flat = hidden_flat * logit_scale
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
-            loss = rt_cce(hidden_flat, w, sc, bi, targets_flat)
+            indices = batch_dict.get("_unsloth_cce_indices")
+            if indices is not None and masked_targets.shape[1] > 0:
+                columns = indices[:, 1]
+                flat = indices[:, 0] * masked_targets.shape[1] + columns
+                flat = mx.where((columns >= 0) & (columns < masked_targets.shape[1]), flat, -1)
+                hidden_flat, targets_flat = _compact_cce_inputs(hidden_flat, targets_flat, flat)
+            hidden_flat = _rotate_head_input(lm_head, hidden_flat)
+            loss = rt_cce(model)(hidden_flat, w, sc, bi, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
     else:
         if _skip_weight_grad:
             print("Unsloth: VLM CCE skipping weight gradient (LM head is frozen).")
 
-        rt_cce = _get_runtime_cce(
+        rt_cce = _runtime_cce_by_mode(
             ignore_index=-100,
             logit_softcap=softcap,
+            weight_is_frozen=_skip_weight_grad,
         )
 
         def loss_fn(model, batch_dict):
@@ -3496,11 +4610,43 @@ def make_vlm_cce_loss_fn(model, assistant_token_id=0, ignore_token_ids=None):
                 # Same pre-scaling identity as the quantized branch above.
                 hidden_flat = hidden_flat * logit_scale
             targets_flat = masked_targets.reshape((-1,))  # runtime CCE validates dtype before narrowing
-            loss = rt_cce(hidden_flat, w, targets_flat)
+            indices = batch_dict.get("_unsloth_cce_indices")
+            if indices is not None and masked_targets.shape[1] > 0:
+                columns = indices[:, 1]
+                flat = indices[:, 0] * masked_targets.shape[1] + columns
+                flat = mx.where((columns >= 0) & (columns < masked_targets.shape[1]), flat, -1)
+                hidden_flat, targets_flat = _compact_cce_inputs(hidden_flat, targets_flat, flat)
+            loss = rt_cce(model)(hidden_flat, w, targets_flat)
             loss = loss.astype(mx.float32).sum() / _safe_token_denominator(ntoks)
             return loss, ntoks
 
+    if token_ids_only:
+        cce_loss_fn = loss_fn
+        baseline_loss_fn = _marked_vlm_baseline()
+        noticed_media_fallback = False
+
+        def loss_fn(model, batch_dict):
+            nonlocal noticed_media_fallback
+            if (any(
+                    batch_dict.get(key) is not None
+                    for key in ("pixel_values", "pixel_values_videos")
+                ) or _vlm_batch_carries_audio(batch_dict)):
+                if not noticed_media_fallback:
+                    print("Unsloth: CCE backbone cannot accept multimodal embeddings; using standard cross-entropy for media batches.")
+                    noticed_media_fallback = True
+                return baseline_loss_fn(model, batch_dict)
+            return cce_loss_fn(model, batch_dict)
+
     loss_fn._unsloth_cce_backend = "runtime-cce"
+    loss_fn._unsloth_cce_compaction = lm_layer.weight.shape[0] >= 8192
+    if use_quantized:
+        # Absolute: a dotted relative import is unresolvable to transformers' remote-code
+        # walk. See tests/test_relative_imports_resolve.py.
+        from unsloth_zoo.mlx.cce import runtime_cce
+        budget = runtime_cce._CHUNK_BUDGET or runtime_cce._get_memory_budget()
+        base_chunk = max(2048, (lm_layer.weight.shape[0] + 15) // 16)
+        # Keep half-capacity and 256-row projections on the same vocabulary chunks.
+        loss_fn._unsloth_cce_small_capacity_limit = budget // (base_chunk * 4)
     return loss_fn
 
 
@@ -3630,6 +4776,7 @@ def normalize_mlx_chat_template(
     *,
     chat_template=None,
     model_name=None,
+    model_path=None,
     model_type=None,
     is_vlm=False,
     strict=False,
@@ -3647,8 +4794,27 @@ def normalize_mlx_chat_template(
         setattr(target, "_unsloth_model_type", model_type)
 
     tokenizer = _get_processor_tokenizer(target)
-    if is_vlm and not _has_chat_template(target) and _has_chat_template(tokenizer):
-        target.chat_template = tokenizer.chat_template
+    if is_vlm and not _has_chat_template(target):
+        if not _has_chat_template(tokenizer):
+            for source in (model_path, getattr(target, "_unsloth_model_name", None),
+                           getattr(tokenizer, "name_or_path", None)):
+                if not source or not Path(source).is_dir():
+                    continue
+                template_path = Path(source) / "chat_template.jinja"
+                if template_path.is_file():
+                    tokenizer.chat_template = template_path.read_text(encoding="utf-8")
+                    break
+                template_path = Path(source) / "chat_template.json"
+                if template_path.is_file():
+                    from .loader import _read_json_file
+                    template = _read_json_file(template_path).get("chat_template")
+                    if isinstance(template, dict):
+                        template = template.get("default")
+                    if isinstance(template, str) and template:
+                        tokenizer.chat_template = template
+                        break
+        if not _has_chat_template(target) and _has_chat_template(tokenizer):
+            target.chat_template = tokenizer.chat_template
 
     template_target = target if is_vlm else tokenizer
     if strict and not _has_chat_template(template_target):
@@ -3661,6 +4827,7 @@ def normalize_vlm_processor_chat_template(
     *,
     chat_template=None,
     model_name=None,
+    model_path=None,
     model_type=None,
     strict=False,
 ):
@@ -3674,6 +4841,7 @@ def normalize_vlm_processor_chat_template(
         processor,
         chat_template=chat_template,
         model_name=model_name,
+        model_path=model_path,
         model_type=model_type,
         is_vlm=True,
         strict=strict,
@@ -3736,12 +4904,13 @@ def _guard_host_token_output(value, state, context):
     return value
 
 
-def encode_mlx_text(tokenizer, text, state=None):
+def encode_mlx_text(tokenizer, text, state=None, *, add_special_tokens=None):
     """Tokenize text while mirroring Unsloth's double-BOS guard."""
-    add_special_tokens = True
-    bos_token = getattr(tokenizer, "bos_token", None)
-    if bos_token is not None and text.startswith(bos_token):
-        add_special_tokens = False
+    if add_special_tokens is None:
+        add_special_tokens = True
+        bos_token = getattr(tokenizer, "bos_token", None)
+        if bos_token is not None and text.startswith(bos_token):
+            add_special_tokens = False
 
     try:
         encoded = tokenizer.encode(text, add_special_tokens=add_special_tokens)
@@ -3847,6 +5016,9 @@ def _normalize_mlx_messages(messages, *, is_vlm=False):
                         parts.append({"type": "text", "text": part})
                     elif isinstance(part, dict):
                         clean = _clean_vlm_none_keys(part)
+                        for key in ("input_image", "image_url"):
+                            if key in clean:
+                                clean.setdefault("image", clean.pop(key))
                         # Gemma 3n's template renders a placeholder for
                         # "audio" alone, so a part left under an alias carries
                         # a clip with nothing behind it, and an untyped one
@@ -3858,6 +5030,8 @@ def _normalize_mlx_messages(messages, *, is_vlm=False):
                                 clean["type"] = "image"
                             elif any(alias in clean for alias in _AUDIO_PART_TYPES):
                                 clean["type"] = "audio"
+                        elif clean["type"] in ("image_url", "input_image"):
+                            clean["type"] = "image"
                         elif clean["type"] in _AUDIO_PART_TYPES:
                             clean["type"] = "audio"
                         parts.append(clean)
@@ -3897,20 +5071,28 @@ def _collapse_vlm_assistant_content(messages):
     return collapsed
 
 
-def _flatten_vlm_content_for_text_template(messages):
-    """Render list-style VLM content as text for text-only chat templates."""
-    flattened = copy.deepcopy(messages)
-    for message in flattened:
+def _flatten_vlm_content_for_text_template(messages, image_token=None):
+    """Render list-style VLM content as text for text-only chat templates.
+
+    Rebuilt shallowly rather than deep-copied: only `content` is replaced, and a
+    deepcopy would clone every PIL image on the row. This runs per training
+    sample, so that cost is the whole collator's.
+    """
+    flattened = []
+    for message in messages:
         content = message.get("content", "")
         if not isinstance(content, list):
+            flattened.append(message)
             continue
         texts = []
         for part in content:
             if isinstance(part, dict) and part.get("type") == "text":
                 texts.append(str(part.get("text", "")))
+            elif isinstance(part, dict) and part.get("type") == "image" and image_token:
+                texts.append(image_token)
             elif isinstance(part, str):
                 texts.append(part)
-        message["content"] = "".join(texts)
+        flattened.append({**message, "content": "".join(texts)})
     return flattened
 
 
@@ -3946,24 +5128,35 @@ def _count_vlm_image_parts(messages):
     return count
 
 
-def _repair_deepseek_rendered_image_tokens(processor, text, messages):
+def _vlm_image_token(processor):
+    for owner in (processor, _get_processor_tokenizer(processor)):
+        for name in ("image_token", "boi_token"):
+            token = getattr(owner, name, None)
+            if isinstance(token, str) and token:
+                return token
+    module = sys.modules.get(type(processor).__module__)
+    for name in ("DEFAULT_IMAGE_TOKEN", "IMAGE_TOKEN", "IMAGE_PLACEHOLDER"):
+        token = getattr(module, name, None)
+        if isinstance(token, str) and token:
+            return token
+    return None
+
+
+def _vlm_render_preserves_content(text, messages):
     if not isinstance(text, str) or not text.strip():
-        return text
-    marker = (
-        f"{processor.__class__.__module__}.{processor.__class__.__name__}"
-    ).lower()
-    if "deepseek" not in marker:
-        return text
-    image_count = _count_vlm_image_parts(messages)
-    if image_count <= 0:
-        return text
-    image_token = getattr(processor, "image_token", None)
-    if not image_token:
-        return text
-    missing = image_count - text.count(image_token)
-    if missing <= 0:
-        return text
-    return (image_token * missing) + text
+        return False
+    normalized = " ".join(text.split())
+    for message in messages:
+        content = message.get("content", "")
+        if isinstance(content, list):
+            if content and str(content) in text:
+                return False
+            parts = [p.get("text", "") if isinstance(p, dict) else p for p in content]
+        else:
+            parts = [content]
+        if any(" ".join(str(part).split()) not in normalized for part in parts):
+            return False
+    return True
 
 
 def _processor_accepts_assistant_list_content(processor):
@@ -3993,69 +5186,143 @@ def _processor_accepts_assistant_list_content(processor):
             return True
 
 
+def _vlm_token_messages(processor, messages):
+    model_type = getattr(processor, "_unsloth_model_type", None)
+    if not model_type:
+        return messages
+    from mlx_vlm.prompt_utils import get_message_json
+
+    rendered = []
+    image_offset = 0
+    for message in messages:
+        count = _count_vlm_image_parts([message])
+        offset = image_offset
+        image_offset += count
+        parts = message.get("content")
+        if not isinstance(parts, list) or any(
+            not isinstance(part, dict) or part.get("type") not in ("text", "image")
+            for part in parts
+        ):
+            rendered.append(message)
+            continue
+        text = "".join(str(part.get("text", "")) for part in parts
+                       if part.get("type") == "text")
+        if hasattr(processor, "_unsloth_legacy_image_spec"):
+            rendered.append({**message, "content": "".join(
+                "<image>\n" if part["type"] == "image" else str(part.get("text", "")) for part in parts)})
+            continue
+        try:
+            native = get_message_json(
+                model_type, text, role=message.get("role", "user"), num_images=count,
+            )
+        except ValueError:
+            native = None
+        content = native.get("content") if isinstance(native, dict) else None
+        if isinstance(content, str) and (not count or content != text):
+            if count and offset and content.endswith(text):
+                prefix = content[:-len(text)] if text else content
+                prefix = re.sub(r"<\|image_(\d+)\|>",
+                                lambda match: f"<|image_{int(match[1]) + offset}|>", prefix)
+                content = prefix + text
+            message = {**message, "content": content}
+        rendered.append(message)
+    return rendered
+
+
+def _mark_vlm_image_parts(messages, image_token):
+    """Replace image parts with a literal image token, sharing everything else.
+
+    Shallow by construction: the copy exists to swap one part dict, and deep
+    copying would duplicate the row's PIL images on every render.
+    """
+    if not image_token:
+        return messages
+    marked = []
+    for message in messages:
+        content = message.get("content", "")
+        if isinstance(content, list):
+            message = {**message, "content": [
+                {"type": "text", "text": image_token}
+                if isinstance(part, dict) and part.get("type") == "image" else part
+                for part in content
+            ]}
+        marked.append(message)
+    return marked
+
+
 def _render_vlm_messages(
     processor,
     messages,
     *,
     add_generation_prompt=False,
 ):
-    normalize_vlm_processor_chat_template(processor, strict=True)
     if isinstance(messages, str):
         return messages
+    messages = _normalize_vlm_messages(messages)
+    normalize_vlm_processor_chat_template(processor, strict=False)
+    tokenizer = _get_processor_tokenizer(processor)
+    renderer = processor if callable(getattr(processor, "apply_chat_template", None)) else tokenizer
+    image_token = _vlm_image_token(processor)
+    if not _has_chat_template(renderer):
+        return "\n".join(
+            message.get("content", "")
+            for message in _flatten_vlm_content_for_text_template(messages, image_token)
+        )
 
-    render_messages = messages
-    if not _processor_accepts_assistant_list_content(processor):
+    render_messages = _vlm_token_messages(processor, messages)
+    if not _processor_accepts_assistant_list_content(renderer):
         render_messages = _collapse_vlm_assistant_content(render_messages)
+    image_count = _count_vlm_image_parts(messages)
+    image_tokens = {token for token in (image_token, getattr(processor, "boi_token", None),
+                                        getattr(tokenizer, "boi_token", None)) if token}
 
-    first_error = None
-    second_error = None
-    third_error = None
+    def _candidates():
+        # Built lazily: the later shapes allocate, and the first one renders for
+        # nearly every family.
+        yield render_messages
+        marked = _mark_vlm_image_parts(render_messages, image_token)
+        yield marked
+        yield _flatten_vlm_content_for_text_template(messages, image_token)
+        yield _flatten_vlm_messages_to_content_parts(marked)
+        if rendered is None:
+            yield messages
+            yield _mark_vlm_image_parts(messages, image_token)
+            yield _collapse_vlm_assistant_content(messages)
 
-    try:
-        text = processor.apply_chat_template(
-            render_messages,
-            tokenize=False,
-            add_generation_prompt=add_generation_prompt,
-        )
-        text = _repair_deepseek_rendered_image_tokens(processor, text, messages)
-        if isinstance(text, str) and text.strip():
-            return text
-    except Exception as exc:
-        first_error = exc
-
-    try:
-        text = processor.apply_chat_template(
-            _flatten_vlm_messages_to_content_parts(messages),
-            tokenize=False,
-            add_generation_prompt=add_generation_prompt,
-        )
-        text = _repair_deepseek_rendered_image_tokens(processor, text, messages)
-        if isinstance(text, str) and text.strip():
-            return text
-    except Exception as exc:
-        second_error = exc
-
-    try:
-        text = processor.apply_chat_template(
-            _flatten_vlm_content_for_text_template(render_messages),
-            tokenize=False,
-            add_generation_prompt=add_generation_prompt,
-        )
-        text = _repair_deepseek_rendered_image_tokens(processor, text, messages)
-        if isinstance(text, str) and text.strip():
-            return text
-    except Exception as exc:
-        third_error = exc
-
-    if first_error is not None:
-        raise RuntimeError(
-            "Unsloth MLX VLM: failed to render chat messages with this "
-            "processor chat_template. Check that the dataset roles/content "
-            "schema matches the model family, or pass a formatting_func that "
-            "returns pre-rendered text."
-        ) from (third_error or second_error or first_error)
-
-    return ""
+    error = None
+    rendered = None
+    for candidate in _candidates():
+        try:
+            text = renderer.apply_chat_template(
+                candidate,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+            )
+        except Exception as exc:
+            error = exc
+            continue
+        if not isinstance(text, str) or not text.strip():
+            continue
+        if rendered is None:
+            rendered = text
+        if not all(_vlm_render_preserves_content(text, source) for source in (messages, candidate)):
+            continue
+        if image_tokens and max(text.count(token) for token in image_tokens) < image_count:
+            continue
+        return text
+    if rendered is not None:
+        # A template is allowed to transform what it renders: Qwen3/QwQ strip
+        # <think> from history, autoescaping ones rewrite `<` and `&`, others
+        # drop roles they do not model. The checks above pick the best-preserved
+        # candidate, but they cannot tell a deliberate transform from damage, so
+        # they do not get to fail a render the template itself accepted.
+        return rendered
+    raise RuntimeError(
+        "Unsloth MLX VLM: failed to render chat messages with this "
+        "processor chat_template. Check that the dataset roles/content "
+        "schema matches the model family, or pass a formatting_func that "
+        "returns pre-rendered text."
+    ) from error
 
 
 def _looks_like_mlx_chat_messages(value):
@@ -4421,14 +5688,34 @@ class _MLXPromptCompletionTokens:
     prompt_length: int
 
 
-def _mlx_prompt_completion_boundary(prompt_ids, input_ids):
-    """Locate the completion after tolerating one boundary-merged token."""
+def _mlx_prompt_completion_boundary(
+    prompt_ids, input_ids, *, strict=True, step_back=False,
+):
+    """Locate the completion after tolerating one boundary-merged token.
+
+    Without ``strict`` it may fall wherever the two tokenizations stop agreeing.
+
+    ``step_back`` drops the verification rather than raising on it. That is what
+    ORPOTrainer.build_tokenized_answer does in trl/trainer/orpo_trainer.py: when
+    the prompt is not a token prefix it steps back exactly one token and never
+    checks what precedes it. Reproducing that is deliberate parity, not an
+    oversight, and only the preference path asks for it: a recovered prompt is a
+    character prefix and so lands mid-token routinely, where SFT's prompt is
+    tokenized from the same text it re-tokenizes and a mismatch is a real error.
+    """
     prompt_ids = tuple(prompt_ids)
     input_ids = tuple(input_ids)
     if input_ids[:len(prompt_ids)] == prompt_ids:
         return len(prompt_ids)
+    if not strict:
+        shared = 0
+        while shared < min(len(prompt_ids), len(input_ids)):
+            if prompt_ids[shared] != input_ids[shared]:
+                break
+            shared += 1
+        return shared
     prompt_length = min(max(0, len(prompt_ids) - 1), len(input_ids))
-    if input_ids[:prompt_length] != prompt_ids[:prompt_length]:
+    if not step_back and input_ids[:prompt_length] != prompt_ids[:prompt_length]:
         raise ValueError(
             "Unsloth MLX: tokenized prompt and prompt+completion differ before "
             "the final prompt token; only a boundary merge is supported."
@@ -4438,6 +5725,7 @@ def _mlx_prompt_completion_boundary(prompt_ids, input_ids):
 
 def _encode_mlx_prompt_completion(
     tokenizer, prompt_text, full_text, *, append_eos=True, state=None,
+    step_back=False,
 ):
     """Encode a prompt and its full text with one EOS policy."""
     prompt_ids = tuple(int(x) for x in encode_mlx_text(
@@ -4455,7 +5743,12 @@ def _encode_mlx_prompt_completion(
     return _MLXPromptCompletionTokens(
         prompt_ids,
         input_ids,
-        _mlx_prompt_completion_boundary(prompt_ids, input_ids),
+        # A template may re-render the prompt's last message once a completion
+        # follows, leaving it no longer even a text prefix.
+        _mlx_prompt_completion_boundary(
+            prompt_ids, input_ids, strict=full_text.startswith(prompt_text),
+            step_back=step_back,
+        ),
     )
 
 
@@ -4969,6 +6262,7 @@ def _stage_tokenized_text_batch(
     pad_id=0,
     labels_expected=None,
     host_valued=None,
+    width_policy=None,
 ):
     """Host staging of one pretokenized text batch (no MLX work).
 
@@ -4984,6 +6278,11 @@ def _stage_tokenized_text_batch(
     max_length = max(lengths)
     if max_length == 0:
         max_length = min(2, max_seq_length)
+    if width_policy is not None:
+        # True lengths stay in lengths_info, so masking is unaffected.
+        endpoint = width_policy(max_length)
+        if endpoint is not None:
+            max_length = endpoint
     batch_ids = np.full((len(batch_items), max_length), int(pad_id), dtype=np.int32)
     has_labels = (
         valid_items[0][1] is not None
@@ -5123,6 +6422,7 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
         "_visit_seed",
         "_visit_epoch_cache",
         "_cycle_length",
+        "_cce_capacities",
     )
 
     def __init__(
@@ -5149,6 +6449,7 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
         self.pad_to_multiple = int(pad_to_multiple)
         self.label_dtype = np.dtype(label_dtype)
         self._shape_plan = None
+        self._cce_capacities = {}
         self._visit_policy = str(visit_policy)
         # Normalized eagerly so visits never depend on ambient RNG state and a
         # reconstructed plan (fresh-process resume) derives identical visits.
@@ -5250,6 +6551,70 @@ class FiniteTextBatchPlan(_FiniteVisitMixin):
         if getattr(shape_plan.report, "action", None) not in ("exact", "bucket"):
             raise ValueError("only exact or bucket shape plans can be installed")
         self._shape_plan = shape_plan
+
+    def configure_cce_compaction(self, enabled=True):
+        self._cce_capacities = {}
+        if not enabled:
+            return
+        # tuple.count scans in C and a schedule revisits rows, so neither the
+        # per-label compare nor the repeat visit reaches Python. Label-masked
+        # corpora put every token of every row in this window, which is what
+        # makes the difference worth having.
+        row_counts = {}
+
+        def supervised(row_index):
+            count = row_counts.get(row_index)
+            if count is None:
+                row = self._rows[row_index]
+                end = min(len(row.input_ids), self.max_seq_length)
+                start = max(1, row.offset)
+                if row.labels is None:
+                    count = max(0, end - start)
+                else:
+                    window = row.labels[start:end]
+                    count = len(window) - window.count(-100)
+                row_counts[row_index] = count
+            return count
+
+        counts = {}
+        for index, batch_indices in enumerate(self._schedule):
+            count = sum(
+                supervised(row_index)
+                for row_index in batch_indices if row_index is not None
+            )
+            family = self.batch_family(index)
+            widths = {self.batch_width(index)}
+            if self._shape_plan is not None:
+                widths.add(self._shape_plan.endpoint_for(family, min(widths)))
+            for width in widths:
+                key = (family, width)
+                counts[key] = max(counts.get(key, 0), count)
+        # A fixed capacity per admitted shape avoids extra compiled variants.
+        for (family, width), count in counts.items():
+            capacity = max(256, ((count + 255) // 256) * 256)
+            tokens = family[1][0][0] * (width - 1)
+            if capacity * 2 <= tokens:
+                self._cce_capacities[family, width] = capacity
+
+    def prepare_cce_batch(self, index, batch):
+        width = batch[0].shape[1]
+        capacity = self._cce_capacities.get((self.batch_family(index), width))
+        if capacity is None:
+            return batch
+        selected = []
+        for batch_row, row_index in enumerate(self._schedule[index]):
+            if row_index is None:
+                continue
+            row = self._rows[row_index]
+            end = min(len(row.input_ids), self.max_seq_length, width)
+            selected.extend(
+                batch_row * (width - 1) + position - 1
+                for position in range(max(1, row.offset), end)
+                if row.labels is None or row.labels[position] != -100
+            )
+        indices = np.full(capacity, -1, dtype=np.int32)
+        indices[:len(selected)] = selected
+        return (*batch, mx.array(indices))
 
     def materialize(self, index, *, phase=None):
         batch_indices = self._schedule[index]
@@ -5478,6 +6843,22 @@ def _resize_vlm_images(images, image_size):
     target = (image_size, image_size) if isinstance(image_size, int) else image_size
     resized = []
     for image in images:
+        if isinstance(image, (bytes, dict, str, os.PathLike)):
+            from io import BytesIO
+            if isinstance(image, dict):
+                image = image.get("bytes") or image.get("path") or image.get("url")
+            if isinstance(image, str) and image.startswith(("http://", "https://")):
+                from unsloth_zoo.vision_utils import fetch_remote_media_bytes
+                image = fetch_remote_media_bytes(image)
+            elif isinstance(image, str) and image.startswith("data:image"):
+                from base64 import b64decode
+                image = b64decode(image.split("base64,", 1)[1])
+            elif isinstance(image, str) and image.startswith("file://"):
+                from unsloth_zoo.vision_utils import resolve_file_uri_to_path
+                image = resolve_file_uri_to_path(image)
+            if isinstance(image, bytes):
+                image = BytesIO(image)
+            image = Image.open(image)
         if isinstance(image, Image.Image):
             image = image.convert("RGB")
             if _is_vlm_no_resize_image_size(image_size):
@@ -5554,6 +6935,10 @@ def _extract_vlm_images(
                 if isinstance(part, dict) and part.get("type") == "image":
                     image = part.get("image")
                     if image is not None:
+                        if any(key in part for key in ("resized_height", "resized_width", "min_pixels", "max_pixels")):
+                            from unsloth_zoo.vision_utils import fetch_image
+                            image = _resize_vlm_images([image], None)[0]
+                            image = fetch_image({**part, "image": image})
                         images.append(image)
 
     if (
@@ -7046,6 +8431,9 @@ _VLM_PER_ROW_MEDIA_KEYS = ("audio_bounds", "image_bound", "tgt_sizes")
 
 
 def _to_mx_vlm_batch(inputs):
+    if inputs.get("pixel_values") is None and inputs.get("images") is not None:
+        inputs = dict(inputs)
+        inputs["pixel_values"] = inputs.pop("images")
     batch = {}
     for key, value in inputs.items():
         if key == "sound_clips" and isinstance(value, (list, tuple)):
@@ -7147,12 +8535,64 @@ def _convert_vlm_processor_output(value, return_tensors):
     return value
 
 
+_VLM_COMPONENT_KWARGS = contextvars.ContextVar("vlm_component_kwargs", default={})
+
+
+def _scope_vlm_component_call(component):
+    cls = type(component)
+    original = cls.__call__
+    if getattr(original, "_unsloth_vlm_component_kwargs", False):
+        return
+
+    @wraps(original)
+    def scoped(self, *args, **kwargs):
+        options = _VLM_COMPONENT_KWARGS.get().get(id(self))
+        if options is not None:
+            excluded, defaults = options
+            kwargs = {**defaults, **kwargs}
+            kwargs = {k: v for k, v in kwargs.items() if k not in excluded}
+        return original(self, *args, **kwargs)
+
+    scoped._unsloth_vlm_component_kwargs = True
+    try:
+        cls.__call__ = scoped
+    except (TypeError, AttributeError):
+        # Native callables cannot be patched and keep their own dispatch.
+        pass
+
+
+def _invoke_vlm_processor(processor_call, args, kwargs):
+    processor = args[0] if args and hasattr(args[0], "image_processor") else processor_call
+    tokenizer = getattr(processor, "tokenizer", None)
+    image_processor = getattr(processor, "image_processor", None)
+    if not callable(tokenizer) or not callable(image_processor):
+        return processor_call(*args, **kwargs)
+    from transformers.processing_utils import ImagesKwargs, TextKwargs
+
+    text_keys = set(TextKwargs.__annotations__)
+    image_keys = set(ImagesKwargs.__annotations__)
+    _scope_vlm_component_call(tokenizer)
+    _scope_vlm_component_call(image_processor)
+    # Keep component identity/state, and isolate options from other calls/threads.
+    options = dict(_VLM_COMPONENT_KWARGS.get())
+    options[id(image_processor)] = (text_keys - image_keys, {})
+    options[id(tokenizer)] = (
+        image_keys - text_keys,
+        {"padding": kwargs["padding"]} if "padding" in kwargs else {},
+    )
+    token = _VLM_COMPONENT_KWARGS.set(options)
+    try:
+        return processor_call(*args, **kwargs)
+    finally:
+        _VLM_COMPONENT_KWARGS.reset(token)
+
+
 def _call_vlm_processor(processor_call, args, kwargs):
-    """Retry only the Transformers fast-processor PyTorch output contract."""
+    """Scope modality options and negotiate PyTorch-only processor output."""
 
     return_tensors = kwargs.get("return_tensors")
     try:
-        return processor_call(*args, **kwargs)
+        return _invoke_vlm_processor(processor_call, args, kwargs)
     except ValueError as error:
         if (
             return_tensors not in {"mlx", "np"}
@@ -7162,7 +8602,7 @@ def _call_vlm_processor(processor_call, args, kwargs):
 
     retry_kwargs = dict(kwargs)
     retry_kwargs["return_tensors"] = "pt"
-    output = processor_call(*args, **retry_kwargs)
+    output = _invoke_vlm_processor(processor_call, args, retry_kwargs)
     return _convert_vlm_processor_output(output, return_tensors)
 
 
@@ -7294,6 +8734,104 @@ def _drop_unsupported_processor_kwargs(processor, kwargs):
     return {k: v for k, v in kwargs.items() if k in params}
 
 
+_LEGACY_IMAGE_SPEC = "_unsloth_legacy_image_spec"
+
+
+def bind_legacy_image_processor(model, processor):
+    from mlx_vlm.models.base import BaseImageProcessor
+    image_processor = getattr(processor, "image_processor", None)
+    if hasattr(processor, "tokenizer") or not isinstance(image_processor, BaseImageProcessor):
+        return
+    from PIL import Image
+
+    merge_name = "_prepare_inputs_for_multimodal"
+    merge = getattr(model, merge_name, None)
+    token_id = _config_get(getattr(model, "config", None), "image_token_index")
+    if (not callable(merge) or token_id is None
+            or tuple(inspect.signature(merge).parameters) !=
+            ("image_features", "inputs_embeds", "input_ids")):
+        return
+    shapes = []
+
+    def capture(self, image_features, inputs_embeds, input_ids):
+        shapes.append(image_features.shape)
+        return inputs_embeds
+
+    namespace = vars(model)
+    existed, previous = merge_name in namespace, namespace.get(merge_name)
+    try:
+        object.__setattr__(model, merge_name, types.MethodType(capture, model))
+        with _preserved_preprocessing_rng():
+            pixels = np.stack(image_processor.preprocess([Image.new("RGB", (32, 32))]))
+            model.get_input_embeddings(mx.array([[0, token_id, 0]]), mx.array(pixels))
+    finally:
+        if existed:
+            object.__setattr__(model, merge_name, previous)
+        else:
+            object.__delattr__(model, merge_name)
+    if len(shapes) != 1 or len(shapes[0]) not in (2, 3) or math.prod(shapes[0][:-1]) < 1:
+        raise ValueError("Unsloth MLX: legacy image preprocessing requires one nonempty projected feature sequence.")
+    count = math.prod(shapes[0][:-1])
+    setattr(processor, _LEGACY_IMAGE_SPEC, (int(token_id), count, tuple(pixels.shape[1:])))
+    model._unsloth_legacy_image_token_count = count
+
+
+def legacy_image_inputs(processor, texts, all_images, max_seq_length, truncation=True):
+    from mlx_vlm.models.base import BaseImageProcessor
+    if hasattr(processor, "tokenizer") or not isinstance(getattr(processor, "image_processor", None), BaseImageProcessor) or not any(all_images):
+        return None
+    from mlx_vlm.utils import prepare_inputs
+
+    spec = getattr(processor, _LEGACY_IMAGE_SPEC, None)
+    if spec is None:
+        raise ValueError("Unsloth MLX: legacy image training requires an expanded-image merge; load with patch_mode='patched'.")
+    token_id, count, pixel_shape = spec
+    if (not all(len(images) == 1 for images in all_images)
+            or not all(text.count("<image>") == 1 for text in texts)):
+        raise ValueError("Unsloth MLX: legacy image rows require exactly one image and <image> placeholder.")
+    inputs = prepare_inputs(
+        processor, images=[images[0] for images in all_images],
+        prompts=texts, image_token_index=token_id,
+    )
+    if tuple(inputs["pixel_values"].shape[1:]) != pixel_shape:
+        raise ValueError("Unsloth MLX: variable image shapes require a processor that expands its own image tokens.")
+    ids, mask = _expand_image_token_sequences(
+        inputs["input_ids"], inputs["attention_mask"], token_id, count,
+    )
+    if truncation and max_seq_length and ids.shape[1] > max_seq_length:
+        side = getattr(processor, "truncation_side", "right")
+        columns = slice(-max_seq_length, None) if side == "left" else slice(0, max_seq_length)
+        ids, mask = ids[:, columns], mask[:, columns]
+    inputs["input_ids"], inputs["attention_mask"] = ids, mask
+    inputs[_LEGACY_IMAGE_SPEC] = (token_id, count)
+    validate_legacy_image_batch(inputs)
+    return inputs
+
+
+def validate_legacy_image_batch(batch):
+    spec = batch.get(_LEGACY_IMAGE_SPEC)
+    if spec is None:
+        return
+    token_id, count = spec
+    ids = np.asarray(batch["input_ids"])
+    retained = (ids == token_id).sum(axis=1)
+    if np.any(retained != count):
+        raise ValueError(
+            f"Unsloth MLX: truncation split or removed an image span "
+            f"({count} visual tokens required per row, retained {retained.tolist()}). "
+            "Increase max_seq_length."
+        )
+
+
+def _ensure_vlm_pad_token(processor):
+    tokenizer = _get_processor_tokenizer(processor)
+    if getattr(tokenizer, "pad_token_id", None) is None:
+        eos = getattr(tokenizer, "eos_token", None)
+        if eos is not None:
+            tokenizer.pad_token = eos
+    return tokenizer
+
+
 def _processor_vlm_inputs(
     processor,
     texts,
@@ -7304,6 +8842,15 @@ def _processor_vlm_inputs(
     padding_side=None,
     all_audio=None,
 ):
+    legacy = legacy_image_inputs(processor, texts, all_images, max_seq_length, truncation)
+    if legacy is not None:
+        return legacy
+    tokenizer = _ensure_vlm_pad_token(processor)
+    images = _format_vlm_images_for_processor(all_images, processor=processor)
+    audio = _format_vlm_audio_for_processor(all_audio, processor=processor)
+    text_only = images is None and audio is None and callable(tokenizer)
+    if text_only:
+        processor = tokenizer
     base_kwargs = dict(
         text=texts,
         padding=True,
@@ -7311,7 +8858,6 @@ def _processor_vlm_inputs(
         add_special_tokens=False,
     )
     base_kwargs = _drop_unsupported_processor_kwargs(processor, base_kwargs)
-    audio = _format_vlm_audio_for_processor(all_audio, processor=processor)
     audio_kwarg = None
     if audio is not None:
         audio_kwarg = _vlm_processor_audio_kwarg(processor)
@@ -7350,7 +8896,6 @@ def _processor_vlm_inputs(
             ))
     if padding_side is not None:
         base_kwargs["padding_side"] = padding_side
-    images = _format_vlm_images_for_processor(all_images, processor=processor)
     if images is not None:
         image_layouts = (
             ("nested", "flat")
@@ -7360,7 +8905,12 @@ def _processor_vlm_inputs(
     else:
         image_layouts = (None,)
     if suffixes is not None and any(suffix is not None for suffix in suffixes):
-        base_kwargs["suffix"] = [suffix or "" for suffix in suffixes]
+        base_kwargs["text_pair" if text_only else "suffix"] = [
+            (suffix or "") + (getattr(tokenizer, "eos_token", None) or "")
+            if text_only else (suffix or "") for suffix in suffixes
+        ]
+        if text_only:
+            base_kwargs["return_token_type_ids"] = True
     if _vlm_processor_requests_mm_token_type_ids(processor):
         base_kwargs["return_mm_token_type_ids"] = True
 
@@ -7433,7 +8983,14 @@ def _processor_vlm_inputs(
         raise first_error
 
     if audio_kwarg is None:
-        return _run_layouts()
+        inputs = _run_layouts()
+        if text_only and "text_pair" in base_kwargs:
+            inputs["labels"] = np.where(
+                np.asarray(inputs["token_type_ids"]) == 0, -100,
+                np.asarray(inputs["input_ids"]),
+            )
+            inputs["_unsloth_suffix_only_loss"] = True
+        return inputs
 
     def _run_audio_layouts():
         return _repair_audio_batch(
@@ -8088,6 +9645,7 @@ def _build_response_masked_vlm_batch(
     yield_host_staged=False,
     reject_mlx_valued=False,
     target_width=None,
+    width_policy=None,
 ):
     """Collate VLM rows and apply the CUDA response-mask closure.
 
@@ -8100,6 +9658,8 @@ def _build_response_masked_vlm_batch(
     at the width seam: the finalizer stops after its content phase, the pad lands
     after expansion and response masking so padded tails stay inert, and the
     position phase then runs at the final width.
+
+    ``width_policy`` is the streaming form, chosen from the post-expansion width.
     """
     staged, is_prompt_completion = _collate_vlm_batch(
         items, processor, max_seq_length, image_size,
@@ -8112,15 +9672,25 @@ def _build_response_masked_vlm_batch(
     staged.config = config
     # Unplanned batches keep the historical single-pass order, including its
     # failure ordering (a broken batch raises before the response-mask callback).
-    phase = None if target_width is None else "content"
+    widening = target_width is not None or (
+        width_policy is not None and getattr(width_policy, "armed", True)
+    )
+    phase = "content" if widening else None
 
     def _seal(batch_dict):
-        """Width seam: pad to the planned endpoint, then record positions."""
-        if target_width is None:
-            return batch_dict
+        """Width seam: pad to the chosen endpoint, then record positions."""
+        target = target_width
+        if target is None and widening and width_policy is not None:
+            target = _resolve_stream_vlm_target(
+                batch_dict, config, processor, width_policy,
+            )
+        if target is None:
+            return _prepare_vlm_batch_for_compile(
+                batch_dict, config, phase="positions",
+            ) if widening else batch_dict
         tokenizer = getattr(processor, "tokenizer", processor)
         batch_dict = _finalize_vlm_batch_width(
-            batch_dict, target_width,
+            batch_dict, target,
             getattr(tokenizer, "pad_token_id", None),
             disposable_keys=_vlm_pipeline_disposable_keys(config),
         )
@@ -9305,6 +10875,29 @@ def _restore_vlm_row_image_handles(item, _depth=0):
     return item
 
 
+def _compact_vlm_cce_batch(batch, small_capacity_limit=0):
+    """Attach fixed-capacity CCE indices for a VLM batch's supervised targets.
+
+    Returns None when the batch has no 2-D labels or its supervised targets
+    fill more than half of the target positions.
+    """
+    labels = batch.get("labels")
+    if labels is None or labels.ndim != 2:
+        return None
+    tokens = labels.shape[0] * (labels.shape[1] - 1)
+    capacity = tokens // 512 * 256
+    if capacity <= 0:
+        return None
+    selected = np.argwhere(np.asarray(labels)[:, 1:] != -100)
+    if len(selected) > capacity:
+        return None
+    if 256 < capacity <= small_capacity_limit and len(selected) <= 256:
+        capacity = 256
+    indices = np.full((capacity, 2), -1, dtype=np.int32)
+    indices[:len(selected)] = selected
+    return {**batch, "_unsloth_cce_indices": mx.array(indices)}
+
+
 class FiniteVLMBatchPlan(_FiniteVisitMixin):
     """CPU-backed finite VLM schedule with on-demand MLX materialization.
 
@@ -9338,6 +10931,9 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         "_shape_plan",
         "_planned_widths",
         "_cycle_length",
+        "_cce_compaction",
+        "_cce_dense_batches",
+        "_cce_small_capacity_limit",
     )
 
     def __init__(
@@ -9388,6 +10984,9 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         self._forbidden = None
         self._shape_plan = None
         self._planned_widths = None
+        self._cce_compaction = False
+        self._cce_dense_batches = set()
+        self._cce_small_capacity_limit = 0
         if self._empty_masks is not None and (
             len(self._empty_masks) != len(self._schedule)
         ):
@@ -9467,6 +11066,46 @@ class FiniteVLMBatchPlan(_FiniteVisitMixin):
         self._shape_plan = shape_plan
         self._planned_widths = planned_widths
         self._mru = None
+
+    def configure_cce_compaction(self, enabled=True, *, max_variants=None, small_capacity_limit=0):
+        self._cce_compaction = bool(enabled)
+        self._cce_dense_batches.clear()
+        self._cce_small_capacity_limit = small_capacity_limit if enabled else 0
+        plan = self._shape_plan
+        if plan is None:
+            return None
+        raw = frozenset(key for key in plan.raw_catalog if not key[1].endswith((":cce", ":cce256")))
+        planned = frozenset(key for key in plan.planned_catalog if not key[1].endswith((":cce", ":cce256")))
+        max_variants = plan.report.cap if max_variants is None else max_variants
+        self._cce_compaction &= 2 * len(planned) <= max_variants
+        if not self._cce_compaction or 3 * len(planned) > max_variants:
+            self._cce_small_capacity_limit = 0
+        if self._cce_compaction:
+            if self._cce_small_capacity_limit:
+                small_raw = frozenset((scope, phase + ":cce256", family, width) for scope, phase, family, width in raw)
+                small_planned = frozenset((scope, phase + ":cce256", family, width) for scope, phase, family, width in planned)
+            else:
+                small_raw = small_planned = frozenset()
+            # Processor labels can require the dense fallback on later visits.
+            raw |= frozenset((scope, phase + ":cce", family, width) for scope, phase, family, width in raw)
+            planned |= frozenset((scope, phase + ":cce", family, width) for scope, phase, family, width in planned)
+            raw |= small_raw
+            planned |= small_planned
+        cap = max(plan.report.cap, len(planned))
+        report = replace(plan.report, raw_signatures=len(raw), planned_signatures=len(planned),
+                         cap=cap, effective_cap=cap)
+        self._shape_plan = replace(plan, raw_catalog=raw, planned_catalog=planned, report=report)
+        return report
+
+    def prepare_cce_batch(self, index, batch):
+        if not self._cce_compaction or index in self._cce_dense_batches:
+            return batch
+        compacted = _compact_vlm_cce_batch(batch, self._cce_small_capacity_limit)
+        if compacted is None:
+            # Keep dense slots off the fast path, including later stochastic rebuilds.
+            self._cce_dense_batches.add(index)
+            return batch
+        return compacted
 
     def materialize(self, index, target_width=None, *, phase=None):
         """Build one batch through the complete existing VLM builder.
@@ -10029,13 +11668,60 @@ def _vlm_has_sized_index_space(dataset):
     return True
 
 
+def _resolve_stream_vlm_target(batch_dict, config, processor, width_policy):
+    """Endpoint for a streamed VLM batch, or None when widening cannot materialize."""
+    ids = batch_dict.get("input_ids")
+    shape = getattr(ids, "shape", None)
+    if shape is None or len(shape) < 2:
+        return None
+    tokenizer = getattr(processor, "tokenizer", processor)
+    if getattr(tokenizer, "pad_token_id", None) is None:
+        return None
+    if getattr(width_policy, "holding", False):
+        return None
+    width, _axes, padable, forbidden = _vlm_width_survey(
+        batch_dict, disposable_keys=_vlm_pipeline_disposable_keys(config),
+    )
+    if not padable or width is None:
+        return None
+    target = width_policy(int(width))
+    # Bump past extents an untouched array occupies.
+    seen = 0
+    while target is not None and target in forbidden and seen <= len(forbidden):
+        target = width_policy(int(target) + 1)
+        seen += 1
+    if target is None or target in forbidden:
+        return None
+    return None if int(target) <= int(width) else int(target)
+
+
+def _widen_finalized_vlm_batch(batch_dict, config, processor, width_policy):
+    """Prefetch-path widening of a finalized VLM batch, then positions."""
+    target = _resolve_stream_vlm_target(
+        batch_dict, config, processor, width_policy,
+    )
+    if target is None:
+        return _prepare_vlm_batch_for_compile(
+            batch_dict, config, phase="positions",
+        )
+    tokenizer = getattr(processor, "tokenizer", processor)
+    batch_dict = _finalize_vlm_batch_width(
+        batch_dict, target,
+        getattr(tokenizer, "pad_token_id", None),
+        disposable_keys=_vlm_pipeline_disposable_keys(config),
+    )
+    return _prepare_vlm_batch_for_compile(
+        batch_dict, config, phase="positions",
+    )
+
+
 def _iterate_lazy_vlm_training_batches(
     dataset, processor, config, batch_size, max_seq_length, *,
     response_mask_fn=None, formatting_func=None, dataset_order="default",
     completion_only_loss=None, image_size=None, comm_group=None,
     require_replayable=False, expected_rows_per_pass=None,
     ignore_token_ids=None, yield_host_staged=False, reject_mlx_valued=False,
-    should_stop=None,
+    should_stop=None, width_policy=None,
 ):
     """Unsized VLM batches under the lazy text-stream lifecycle contracts.
 
@@ -10076,6 +11762,7 @@ def _iterate_lazy_vlm_training_batches(
             completion_only_loss=completion_only_loss,
             yield_host_staged=yield_host_staged,
             reject_mlx_valued=reject_mlx_valued,
+            width_policy=None if yield_host_staged else width_policy,
         )
 
     def _filter_stream_item(item):
@@ -10269,7 +11956,8 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
                                   expected_rows_per_pass=None,
                                   prefetch_batches=0,
                                   prefetch_skip_batches=0,
-                                  prefetch_control=None):
+                                  prefetch_control=None,
+                                  width_policy=None):
     """Streaming VLM batch generator using processor directly. Yields batch
     dicts with input_ids, pixel_values, attention_mask, and optionally labels."""
     import numpy as np
@@ -10384,7 +12072,17 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
                 None,
                 prefetch_depth,
                 skip_batches=prefetch_skip_batches,
-                finalize=_finalize_vlm_batch,
+                # Select on presence, not ``armed``: this body runs (audio peek) before arming.
+                finalize=(
+                    _finalize_vlm_batch
+                    if width_policy is None
+                    else lambda staged, policy=width_policy: (
+                        _widen_finalized_vlm_batch(
+                            _finalize_vlm_batch(staged, phase="content"),
+                            staged.config, processor, policy,
+                        )
+                    )
+                ),
             )
             prefetcher._make_iterator = (
                 lambda pf=prefetcher: _iterate_lazy_vlm_training_batches(
@@ -10421,6 +12119,7 @@ def iterate_vlm_training_batches(dataset, processor, config, batch_size,
             require_replayable=require_replayable,
             expected_rows_per_pass=expected_rows_per_pass,
             ignore_token_ids=ignore_token_ids,
+            width_policy=width_policy,
         )
 
 
@@ -10763,7 +12462,8 @@ def _make_text_batch_from_items(batch_items, tokenizer, max_seq_length):
     )
 
 
-def _stage_text_batch_from_items(batch_items, tokenizer, max_seq_length, host_valued=True):
+def _stage_text_batch_from_items(batch_items, tokenizer, max_seq_length,
+                                 host_valued=True, width_policy=None):
     """Build a text training batch from tokenized items."""
     valid_items = [item for item in batch_items if item is not None]
     with_offsets = bool(
@@ -10796,12 +12496,15 @@ def _stage_text_batch_from_items(batch_items, tokenizer, max_seq_length, host_va
         )
     pad_id = getattr(tokenizer, "pad_token_id", None)
     pad_id = 0 if pad_id is None else int(pad_id)
-    max_length = _finite_text_pad_width(
-        max(lengths),
-        pad_to_multiple=32,
-        minimum_width=2,
-        max_seq_length=max_seq_length,
-    )
+    # The grid replaces the rounding rule; it caps at max_seq_length itself.
+    max_length = None if width_policy is None else width_policy(max(lengths))
+    if max_length is None:
+        max_length = _finite_text_pad_width(
+            max(lengths),
+            pad_to_multiple=32,
+            minimum_width=2,
+            max_seq_length=max_seq_length,
+        )
     batch_ids = []
     truncated_lengths = []
     for ids, length in zip(batch, lengths):
@@ -11741,7 +13444,6 @@ class _LazyTextPrefetcher:
         self._lifecycle_lock = threading.Lock()
         self._close_lock = threading.Lock()
 
-    # -- producer side ----------------------------------------------------
     def _run(self):
         iterator = None
         try:
@@ -11810,7 +13512,6 @@ class _LazyTextPrefetcher:
             if self._closed or self._stop.is_set():
                 raise StopIteration
 
-    # -- consumer side ----------------------------------------------------
     def __iter__(self):
         return self
 
@@ -11834,7 +13535,6 @@ class _LazyTextPrefetcher:
             raise StopIteration
         raise payload
 
-    # -- lifecycle --------------------------------------------------------
     def quiesce(self):
         """RUNNING -> PAUSE_REQUESTED -> QUIESCENT; bounded, actionable."""
         if self._thread is None or not self._thread.is_alive():
@@ -11952,6 +13652,7 @@ def _iterate_lazy_text_training_batches(
     yield_host_staged=False,
     reject_mlx_valued=False,
     should_stop=None,
+    width_policy=None,
 ):
     """Yield text batches without materializing an unsized source.
 
@@ -12029,6 +13730,7 @@ def _iterate_lazy_text_training_batches(
                     tokenizer,
                     max_seq_length,
                     host_valued=state.get("host_valued", True),
+                    width_policy=width_policy,
                 )
             return _stage_tokenized_text_batch(
                 local_items,
@@ -12036,6 +13738,7 @@ def _iterate_lazy_text_training_batches(
                 pad_id=_mlx_text_pad_id(tokenizer),
                 labels_expected=state.get("label_state"),
                 host_valued=state.get("host_valued", True),
+                width_policy=width_policy,
             )
 
         def _yield_value(local_items):
@@ -12653,7 +14356,8 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
                              length_window_batches=1,
                              prefetch_batches=0,
                              prefetch_skip_batches=0,
-                             prefetch_control=None):
+                             prefetch_control=None,
+                             width_policy=None):
     """Streaming batch generator for MLX training.
 
     Map-style datasets retain the existing mlx-lm batching behavior. Unsized
@@ -12689,6 +14393,7 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
             expected_rows_per_pass=expected_rows_per_pass,
             length_window_batches=length_window_batches,
             window_seed=seed,
+            width_policy=width_policy,
         )
         prefetch_depth = _validate_streaming_prefetch(prefetch_batches)
         if prefetch_depth and _distributed_rank_size(comm_group)[1] == 1:
@@ -12885,6 +14590,49 @@ def _save_adapter_artifacts(model, path, tensors, adapter_config=None):
             "tensors; use save_lora_adapters() or "
             "save_trainable_adapters() at the public entry point."
         )
+    _fs_map = dict(getattr(model, "_unsloth_full_state_modules", None) or {})
+    if _fs_map:
+        _by_name = dict(model.named_modules())
+        tensors = dict(tensors)
+        for _p in sorted(_fs_map):
+            _module = _by_name.get(_p)
+            if _module is None:
+                raise ValueError(
+                    f"Unsloth MLX: full-state module {_p!r} was recorded at "
+                    "adapter attach but no longer exists in the model tree; "
+                    "refusing to write an artifact that cannot restore it."
+                )
+            _prefix, _source = _p, _module
+            if hasattr(_module, "lora_a"):
+                for _inner in ("embedding", "linear"):
+                    _in = getattr(_module, _inner, None)
+                    if _in is not None and hasattr(_in, "parameters"):
+                        _prefix, _source = f"{_p}.{_inner}", _in
+                        break
+            if isinstance(_source, (nn.QuantizedLinear, nn.QuantizedEmbedding)):
+                raise ValueError(
+                    f"Unsloth MLX: full-state module {_p!r} was quantized "
+                    "after adapter attach; its packed tensors cannot be "
+                    "persisted as module state. Keep it unquantized."
+                )
+            _found = False
+            for _tname in ("weight", "bias"):
+                _live = getattr(_source, _tname, None)
+                if isinstance(_live, mx.array):
+                    if "float" not in str(_live.dtype).lower():
+                        raise ValueError(
+                            f"Unsloth MLX: full-state module {_p!r} holds "
+                            f"non-floating {_tname} ({_live.dtype}); keep it "
+                            "unquantized to persist it as module state."
+                        )
+                    tensors.setdefault(f"{_prefix}.{_tname}", _live)
+                    _found = True
+            if not _found:
+                raise ValueError(
+                    f"Unsloth MLX: full-state module {_p!r} carries no "
+                    "weight/bias arrays to persist (it may have been "
+                    "quantized after attach); refusing a partial artifact."
+                )
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
 
@@ -12906,6 +14654,148 @@ def _save_adapter_artifacts(model, path, tensors, adapter_config=None):
     if adapter_config:
         with open(path / "adapter_config.json", "w", encoding="utf-8") as f:
             json.dump(adapter_config, f, indent=2)
+
+
+class LoRAPointwiseConv2d(nn.Module):
+    """LoRA for plain, ungrouped 1x1 convolutions in channel-last layout."""
+
+    @staticmethod
+    def supports(module):
+        return (type(module) is nn.Conv2d and module.groups == 1
+                and module.weight.shape[1:3] == (1, 1))
+
+    @staticmethod
+    def from_base(base, r=8, scale=1.0, dropout=0.0):
+        if not LoRAPointwiseConv2d.supports(base):
+            raise ValueError("LoRA requires a plain, ungrouped 1x1 Conv2d.")
+        module = LoRAPointwiseConv2d()
+        module.conv = base
+        module.scale = scale
+        module.dropout = nn.Dropout(dropout)
+        width = base.weight.shape[-1]
+        bound = 1 / math.sqrt(width)
+        module.lora_a = mx.random.uniform(low=-bound, high=bound, shape=(width, r))
+        module.lora_b = mx.zeros((r, base.weight.shape[0]))
+        return module
+
+    def __call__(self, x):
+        y = self.conv(x)
+        weight = (self.lora_a @ self.lora_b).T[:, None, None, :].astype(x.dtype)
+        delta = mx.conv2d(
+            self.dropout(x), weight, self.conv.stride, self.conv.padding,
+            self.conv.dilation, self.conv.groups,
+        )
+        return y + (self.scale * delta).astype(y.dtype)
+
+    def fuse(self):
+        conv = copy.deepcopy(self.conv)
+        delta = (self.lora_a @ self.lora_b).T[:, None, None, :]
+        conv.weight = conv.weight + (self.scale * delta).astype(conv.weight.dtype)
+        return conv
+
+
+def _hadamard_pack_module():
+    """mlx-vlm's Hadamard-packed layer module (Ternary Bonsai 2), once loaded."""
+    module = sys.modules.get("mlx_vlm.models.prism_hadamard_qwen35.prism_hadamard_qwen35")
+    if isinstance(getattr(module, "HadamardQuantizedLinear", None), type):
+        return module
+    return None
+
+
+def _is_hadamard_packed_linear(module):
+    pack = _hadamard_pack_module()
+    # Exact type: the packed embedding subclasses the linear.
+    return pack is not None and type(module) is pack.HadamardQuantizedLinear
+
+
+def _hadamard_dense_weight(layer):
+    """The float32 dense weight a Hadamard-packed layer encodes, in the unrotated basis."""
+    weight = mx.dequantize(
+        layer.weight, layer.scales, layer.biases,
+        group_size=layer.group_size, bits=layer.bits, mode=layer.mode,
+    ).astype(mx.float32)
+    if layer.block:
+        weight = _hadamard_pack_module().hadamard_transform(
+            weight, layer.block, layer.signs, inverse=True,
+        )
+    return weight
+
+
+def _unpack_hadamard_modules(model):
+    pack = _hadamard_pack_module()
+    if pack is None:
+        return False
+    dense = []
+    for name, module in model.named_modules():
+        if not isinstance(module, pack.HadamardQuantizedLinear):
+            continue
+        weight = _hadamard_dense_weight(module).astype(module.scales.dtype)
+        rows, width = weight.shape
+        if isinstance(module, pack.HadamardQuantizedEmbedding):
+            layer = nn.Embedding(rows, width)
+        else:
+            layer = nn.Linear(width, rows, bias=False)
+        layer.weight = weight
+        dense.append((name, layer))
+    if dense:
+        model.update_modules(mlx.utils.tree_unflatten(dense))
+    return bool(dense)
+
+
+# Pack-only keys; with the layers unpacked the tree is plain mlx-vlm Qwen3.5.
+_HADAMARD_PACK_CONFIG_KEYS = frozenset({
+    "schema_version", "base_model_type", "tensor_namespace", "gdn_activation_layout",
+    "modules", "requires_runtime", "hadamard_config", "components",
+})
+
+
+def _dense_hadamard_pack_config(config):
+    config = {k: v for k, v in config.items() if k not in _HADAMARD_PACK_CONFIG_KEYS}
+    config["model_type"] = "qwen3_5"
+    # The pack ships no `architectures`; GGUF conversion dispatches on it.
+    config["architectures"] = ["Qwen3_5ForConditionalGeneration"]
+    return config
+
+
+class LoRAHadamardLinear(nn.Module):
+    """The base rotates its own input: the adapter reads the unrotated activation, fuse rotates back."""
+
+    @staticmethod
+    def supports(module):
+        return _is_hadamard_packed_linear(module)
+
+    @staticmethod
+    def from_base(linear, r=8, dropout=0.0, scale=20.0):
+        if not LoRAHadamardLinear.supports(linear):
+            raise ValueError("LoRA requires mlx-vlm's HadamardQuantizedLinear.")
+        output_dims, packed_dims = linear.weight.shape
+        input_dims = packed_dims * 32 // linear.bits
+        module = LoRAHadamardLinear()
+        module.linear = linear
+        module.dropout = nn.Dropout(p=dropout)
+        module.scale = scale
+        bound = 1 / math.sqrt(input_dims)
+        module.lora_a = mx.random.uniform(low=-bound, high=bound, shape=(input_dims, r))
+        module.lora_b = mx.zeros((r, output_dims))
+        return module
+
+    def __call__(self, x):
+        y = self.linear(x)
+        z = (self.dropout(x) @ self.lora_a) @ self.lora_b
+        return y + (self.scale * z).astype(x.dtype)
+
+    def fuse(self, dequantize=False):
+        if not dequantize:
+            raise ValueError(
+                "Unsloth: merging LoRA back into 2-bit Hadamard-packed weights discards the adapter. "
+                "Save with save_method='merged_16bit', or keep the LoRA adapter."
+            )
+        linear = self.linear
+        weight = _hadamard_dense_weight(linear) + (self.scale * self.lora_b.T) @ self.lora_a.T
+        output_dims, input_dims = weight.shape
+        fused = nn.Linear(input_dims, output_dims, bias=False)
+        fused.weight = weight.astype(linear.scales.dtype)
+        return fused
 
 
 def _extract_mlx_lora_parameters(model):
@@ -12943,6 +14833,11 @@ def iter_mlx_lora_modules(model):
             yield module_name, module
 
 
+def is_mlx_dora_module(module):
+    """Class-name gated: a LoRA wrapper with an unrelated ``m`` is not DoRA."""
+    return hasattr(module, "m") and type(module).__name__.startswith("DoRA")
+
+
 def collect_mlx_lora_adapter_tensors(model):
     """Collect tensors for every module exposing a complete LoRA attr pair.
 
@@ -12959,9 +14854,7 @@ def collect_mlx_lora_adapter_tensors(model):
         adapter_keys.add(f"{prefix}lora_b")
         adapter_keys.add(f"{prefix}lora_a.weight")
         adapter_keys.add(f"{prefix}lora_b.weight")
-        # Include DoRA magnitude `m`, gated on the DoRA class name so a
-        # future LoRA wrapper with an unrelated `m` attribute isn't exported.
-        if hasattr(module, "m") and type(module).__name__.startswith("DoRA"):
+        if is_mlx_dora_module(module):
             adapter_keys.add(f"{prefix}m")
     return {name: value for name, value in parameters.items() if name in adapter_keys}
 
@@ -13018,6 +14911,7 @@ def save_trainable_adapters(model, path, adapter_config=None):
     base weights INSIDE a LoRA module (reload-leaked state that would
     reintroduce the original Unsloth adapter-export bloat).
     """
+    _reject_mixed_lora_dora(model)
     trainable = dict(mlx.utils.tree_flatten(model.trainable_parameters()))
     adapter_tensors = collect_mlx_lora_adapter_tensors(model)
     _lora_module_names = [name for name, _ in iter_mlx_lora_modules(model)]
@@ -13172,14 +15066,125 @@ def load_trainer_state(path):
         return json.load(f)
 
 
-def save_lora_adapters(model, path, adapter_config=None):
-    """Save LoRA adapter weights (lora_a / lora_b only) to disk.
+def _reject_mixed_lora_dora(model):
+    has_dora = has_plain = False
+    for _name, _module in model.named_modules():
+        if hasattr(_module, "lora_a") and hasattr(_module, "lora_b"):
+            if type(_module).__name__.startswith("DoRA"):
+                has_dora = True
+            else:
+                has_plain = True
+    if has_dora and has_plain:
+        raise ValueError(
+            "Unsloth MLX: this model mixes plain-LoRA and DoRA wrappers; the "
+            "adapter format records one fine_tune_type, so a mixed save would "
+            "reload every module as DoRA."
+        )
+
+
+def _lora_module_types(model):
+    from mlx_lm.tuner.lora import LoRALinear
+    try:
+        from mlx_lm.tuner.dora import DoRALinear
+    except ImportError:
+        DoRALinear = None
+    wrapped = {}
+    for name, module in model.named_modules():
+        if not (hasattr(module, "lora_a") and hasattr(module, "lora_b")):
+            continue
+        base_linear = getattr(module, "linear", None)
+        if (
+            type(module) is LoRALinear
+            or (DoRALinear is not None and type(module) is DoRALinear)
+        ) and type(base_linear) in (nn.Linear, nn.QuantizedLinear):
+            wrapped[name] = "linear"
+        else:
+            _base = (
+                base_linear if base_linear is not None
+                else getattr(module, "embedding", None)
+            )
+            wrapped[name] = f"unsupported:{type(module).__name__}" + (
+                f" wrapping {type(_base).__name__}" if _base is not None else ""
+            )
+    in_stack = re.compile(r"^model\.layers\.\d+\.")
+    unsupported = {
+        n: t.split(":", 1)[1]
+        for n, t in wrapped.items() if t.startswith("unsupported:")
+    }
+    supported = {
+        n: t for n, t in wrapped.items() if not t.startswith("unsupported:")
+    }
+    mirrored_layout = supported and not unsupported and all(
+        in_stack.match(name) or name == "lm_head" for name in supported
+    )
+    if not mirrored_layout:
+        supported = {n: t for n, t in supported.items() if in_stack.match(n)}
+    return supported, unsupported
+
+
+def save_lora_adapters(model, path, adapter_config=None, adapter_format="mlx"):
+    """Save LoRA adapter weights (lora_a / lora_b, plus DoRA magnitudes) to
+    disk.
 
     Args:
         model: MLX model with LoRA-wrapped modules.
         path: Directory to save adapters.
         adapter_config: Optional dict with LoRA config metadata.
+        adapter_format: "mlx" (default: the native MLX artifact) or "peft"
+            (standard Hugging Face layout). Uniform plain-LoRA exports load in
+            transformers, PEFT, and vLLM; per-module rank/alpha patterns are
+            transformers/PEFT-only, since vLLM applies one global rank/alpha.
+            The live module tree supplies the linear-vs-embedding oracle where
+            the layout demonstrably mirrors Hugging Face.
     """
+    if adapter_format not in ("mlx", "peft"):
+        raise ValueError(
+            f"Unsloth MLX: adapter_format={adapter_format!r}; expected "
+            "'mlx' or 'peft'."
+        )
+    if adapter_format == "peft":
+        module_types, unsupported = _lora_module_types(model)
+        if unsupported:
+            preview = "; ".join(
+                f"{n} ({t})" for n, t in list(unsupported.items())[:5]
+            )
+            raise ValueError(
+                "Unsloth MLX: this model carries LoRA wrappers that plain "
+                f"PEFT format cannot represent ({preview}); PEFT export is "
+                "not possible for it."
+            )
+        from unsloth_zoo.mlx.peft_interop import _OUTPUT_HEAD_LEAF_NAMES, _leaf_in
+        _fs_map = dict(getattr(model, "_unsloth_full_state_modules", None) or {})
+        _named = dict(model.named_modules())
+        _m2s_emb = sorted(
+            p for p, o in _fs_map.items()
+            if o == "modules_to_save"
+            and (
+                isinstance(
+                    _named.get(p), (nn.Embedding, nn.QuantizedEmbedding)
+                )
+                or _leaf_in(p, _OUTPUT_HEAD_LEAF_NAMES)
+            )
+        )
+        if _m2s_emb and _model_ties_output_to_embedding(model):
+            from unsloth_zoo.mlx.peft_interop import _TIED_FULL_STATE_REASON
+            raise ValueError(
+                f"Unsloth MLX: {_m2s_emb} carry {_TIED_FULL_STATE_REASON}."
+            )
+        # PEFT has no per-module dropout.
+        _dropouts = set()
+        for _name, _module in model.named_modules():
+            if _name in module_types:
+                _dropouts.add(round(_get_mlx_dropout_probability(
+                    getattr(_module, "dropout", None)
+                ), 6))
+        if len(_dropouts) > 1:
+            raise ValueError(
+                "Unsloth MLX: modules carry different lora_dropout values "
+                f"({sorted(_dropouts)}); PEFT format has no per-module "
+                "dropout. Unify dropout before exporting."
+            )
+    _reject_mixed_lora_dora(model)
     adapter_tensors = collect_mlx_lora_adapter_tensors(model)
     if not adapter_tensors:
         raise ValueError(
@@ -13188,9 +15193,181 @@ def save_lora_adapters(model, path, adapter_config=None):
             "merged. Use save_trainable_adapters() to checkpoint non-LoRA "
             "trainable state instead."
         )
-    _save_adapter_artifacts(
-        model, path, adapter_tensors, adapter_config=adapter_config
+    if adapter_format == "mlx":
+        _save_adapter_artifacts(
+            model, path, adapter_tensors, adapter_config=adapter_config
+        )
+        return
+    import tempfile
+    from unsloth_zoo.mlx.peft_interop import convert_mlx_dir_to_peft
+    scratch = tempfile.mkdtemp(prefix="unsloth_mlx_adapter_")
+    scratch_dir = os.path.join(scratch, "mlx")
+    try:
+        _save_adapter_artifacts(
+            model, scratch_dir, adapter_tensors, adapter_config=adapter_config
+        )
+        convert_mlx_dir_to_peft(scratch_dir, path, module_types=module_types)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _model_ties_output_to_embedding(model, by_name=None):
+    flag = getattr(
+        getattr(model, "args", None), "tie_word_embeddings", None,
     )
+    if flag is None:
+        config = getattr(model, "_config", None)
+        if isinstance(config, dict):
+            text_config = config.get("text_config")
+            for scope in (
+                text_config if isinstance(text_config, dict) else {},
+                config,
+            ):
+                if "tie_word_embeddings" in scope:
+                    flag = bool(scope["tie_word_embeddings"])
+                    break
+    if flag is True:
+        return True
+    if by_name is None:
+        by_name = dict(model.named_modules())
+    # No head module => tied, even if declared False (some use as_linear).
+    # Bare "output" is root-only: nested attention projections share the name.
+    return not any(
+        name in ("lm_head", "output", "embed_out")
+        or name.endswith(".lm_head")
+        or name.endswith(".embed_out")
+        for name in by_name
+    )
+
+
+def _full_state_base_module(module):
+    if hasattr(module, "lora_a"):
+        for inner in ("embedding", "linear"):
+            candidate = getattr(module, inner, None)
+            if candidate is not None and hasattr(candidate, "parameters"):
+                return candidate
+    return module
+
+
+def _full_state_key_candidates(path):
+    keys = []
+    for prefix in (path, f"{path}.embedding", f"{path}.linear"):
+        for tname in ("weight", "bias"):
+            keys.append(f"{prefix}.{tname}")
+    return keys
+
+
+def _mark_full_state_modules(model, fs_map, adapter_weights_file,
+                             expected_shapes=None, trainable_paths=None):
+    fs_map = dict(fs_map or {})
+    if not fs_map:
+        return
+    from unsloth_zoo.mlx.peft_interop import _validate_full_state_origins
+    _validate_full_state_origins(fs_map)
+    import mlx.nn as nn
+    from unsloth_zoo.mlx.peft_interop import (
+        _OUTPUT_HEAD_LEAF_NAMES, _TIED_FULL_STATE_REASON, _leaf_in,
+    )
+    by_name = dict(model.named_modules())
+    params = dict(mlx.utils.tree_flatten(model.parameters()))
+    expected_shapes = expected_shapes or {}
+    problems = []
+    saved_shapes = {}
+    saved_dtypes = {}
+    try:
+        from safetensors import safe_open
+        with safe_open(adapter_weights_file, framework="numpy") as f:
+            keys = set(f.keys())
+            for p in fs_map:
+                for key in _full_state_key_candidates(p):
+                    if key in keys:
+                        # Metadata-only: works for dtypes numpy cannot hold (bf16).
+                        sl = f.get_slice(key)
+                        saved_shapes[key] = tuple(sl.get_shape())
+                        saved_dtypes[key] = str(sl.get_dtype())
+    except Exception as exc:
+        raise ValueError(
+            "Unsloth MLX: adapter_config lists full_state_modules but the "
+            f"weights file could not be inspected ({exc!r})."
+        ) from exc
+    tied_routing = None
+    for p, origin in sorted(fs_map.items()):
+        module = by_name.get(p)
+        if module is None:
+            problems.append(f"{p} (module missing from the live tree)")
+            continue
+        _headish = _leaf_in(p, _OUTPUT_HEAD_LEAF_NAMES)
+        if _headish or (
+            origin == "modules_to_save"
+            and isinstance(module, (nn.Embedding, nn.QuantizedEmbedding))
+        ):
+            if tied_routing is None:
+                tied_routing = _model_ties_output_to_embedding(model, by_name)
+            if tied_routing:
+                problems.append(f"{p} ({_TIED_FULL_STATE_REASON})")
+                continue
+        found = False
+        for key in _full_state_key_candidates(p):
+            if key not in saved_shapes:
+                if key in params:
+                    problems.append(f"{key} (live tensor missing from the artifact)")
+                continue
+            found = True
+            if not saved_dtypes.get(key, "").upper().startswith(("F", "BF")):
+                problems.append(
+                    f"{key} (non-floating dtype {saved_dtypes[key]}; "
+                    "quantized or corrupted full-module state cannot "
+                    "restore)"
+                )
+                continue
+            live = params.get(key)
+            live_shape = tuple(getattr(live, "shape", ()) or ())
+            if live_shape != saved_shapes[key]:
+                problems.append(
+                    f"{key} (saved {saved_shapes[key]} vs live {live_shape})"
+                )
+                continue
+            expected = expected_shapes.get(key)
+            if expected is not None and saved_shapes[key] != expected:
+                problems.append(
+                    f"{key} (saved {saved_shapes[key]} vs base "
+                    f"{expected}; resized vocabularies are not supported "
+                    "yet)"
+                )
+        if not found:
+            problems.append(f"{p} (no saved weight/bias tensors)")
+    if problems:
+        preview = "; ".join(problems[:5])
+        if len(problems) > 5:
+            preview += f"; ... (+{len(problems) - 5} more)"
+        raise ValueError(
+            f"Unsloth MLX: {len(problems)} full-state entr(ies) failed to "
+            f"restore on reload ({preview}). Refusing a partial adapter."
+        )
+    _trainable_at_save = frozenset(trainable_paths or ())
+    for p, origin in fs_map.items():
+        module = by_name[p]
+        if origin == "modules_to_save":
+            module.unfreeze()
+            continue
+        target = _full_state_base_module(module)
+        if p in _trainable_at_save:
+            target.unfreeze()
+        else:
+            target.freeze()
+    _cpt_keys = getattr(model, "_unsloth_cpt_full_module_weight_keys", None)
+    if _cpt_keys:
+        _m2s = frozenset(
+            path for path, origin in fs_map.items()
+            if origin == "modules_to_save"
+        )
+
+        from unsloth_zoo.mlx.peft_interop import _full_state_owner
+        model._unsloth_cpt_full_module_weight_keys = {
+            key for key in _cpt_keys
+            if _full_state_owner(key.rsplit(".", 1)[0], _m2s) is None
+        }
+    model._unsloth_full_state_modules = fs_map
 
 
 def _infer_snapshot_commit(path):
@@ -13503,6 +15680,31 @@ def _enrich_mlx_adapter_config(model, adapter_config):
         requires_runtime = True
     adapter_config["requires_unsloth_mlx_runtime_quantization"] = bool(requires_runtime)
 
+    _fs_map = dict(getattr(model, "_unsloth_full_state_modules", None) or {})
+    if _fs_map:
+        adapter_config["full_state_modules"] = _fs_map
+        _by_name = dict(model.named_modules())
+        _trainable_fs = []
+        for _p in sorted(_fs_map):
+            _module = _by_name.get(_p)
+            if _module is None:
+                continue
+            _base = _full_state_base_module(_module)
+            if dict(mlx.utils.tree_flatten(_base.trainable_parameters())):
+                _trainable_fs.append(_p)
+        if _trainable_fs:
+            adapter_config["full_state_trainable"] = _trainable_fs
+        else:
+            adapter_config.pop("full_state_trainable", None)
+    else:
+        adapter_config.pop("full_state_modules", None)
+        adapter_config.pop("full_state_trainable", None)
+
+    if getattr(model, "_unsloth_peft_converted", False):
+        adapter_config["unsloth_peft_converted"] = True
+    else:
+        adapter_config.pop("unsloth_peft_converted", None)
+
     # Only stamp LoRA fields when the live model has LoRA modules (or the
     # caller declared a lora/dora artifact); otherwise mlx-lm.load_adapters()
     # would inject LoRA wrappers before binding full-precision weights and
@@ -13553,6 +15755,41 @@ def _enrich_mlx_adapter_config(model, adapter_config):
             for key in ("rank", "scale", "dropout"):
                 if key in lora_parameters:
                     adapter_config[key] = lora_parameters[key]
+        if has_lora_modules:
+            _module_ranks, _module_scales = {}, {}
+            _maps_reliable = True
+            for _name, _module in iter_mlx_lora_modules(model):
+                _lora_a = getattr(_module, "lora_a", None)
+                _scale = getattr(_module, "scale", None)
+                if (
+                    _lora_a is None
+                    or getattr(_lora_a, "ndim", 0) != 2
+                    or _scale is None
+                    or not isinstance(_scale, (int, float))
+                ):
+                    _maps_reliable = False
+                    break
+                _module_ranks[_name] = int(_lora_a.shape[-1])
+                _module_scales[_name] = float(_scale)
+            if _maps_reliable and (
+                len(set(_module_ranks.values())) > 1
+                or len(set(_module_scales.values())) > 1
+            ):
+                adapter_config["unsloth_mlx_lora_module_ranks"] = _module_ranks
+                adapter_config["unsloth_mlx_lora_module_scales"] = _module_scales
+                adapter_config["unsloth_mlx_requires_unsloth_loader"] = True
+                print(
+                    "Unsloth: this adapter uses per-module ranks/scales; "
+                    "reloading it needs Unsloth (stock mlx-lm assumes one "
+                    "global rank/scale)."
+                )
+            else:
+                for _stale_key in (
+                    "unsloth_mlx_lora_module_ranks",
+                    "unsloth_mlx_lora_module_scales",
+                    "unsloth_mlx_requires_unsloth_loader",
+                ):
+                    adapter_config.pop(_stale_key, None)
         # mlx-lm.load_adapters() reads num_layers off the config.
         if "num_layers" not in adapter_config:
             try:
@@ -13573,6 +15810,8 @@ def _enrich_mlx_adapter_config(model, adapter_config):
         for _stale in (
             "peft_type", "lora_parameters", "rank", "scale", "dropout",
             "num_layers", "unsloth_mlx_lora_module_paths",
+            "unsloth_mlx_lora_module_ranks", "unsloth_mlx_lora_module_scales",
+            "unsloth_mlx_requires_unsloth_loader",
         ):
             adapter_config.pop(_stale, None)
 
@@ -13623,7 +15862,6 @@ def _enrich_mlx_adapter_config(model, adapter_config):
                 )
                 lora_dropout = _read_mlx_lora_dropout(module)
 
-        # Auto-fill only when the caller did not supply the key.
         if lora_paths and not has_explicit_paths:
             adapter_config["unsloth_mlx_lora_module_paths"] = lora_paths
 
@@ -13756,7 +15994,6 @@ def _get_model_config(model):
     """
     import dataclasses
 
-    # Prefer the raw config dict stashed by our loader
     if hasattr(model, "_config") and isinstance(model._config, dict):
         return _config_to_plain_python(model._config)
 
@@ -13771,7 +16008,6 @@ def _get_model_config(model):
             if isinstance(config, dict):
                 return _config_to_plain_python(config)
 
-    # Reconstruct from the ModelArgs dataclass
     if hasattr(model, "args"):
         if dataclasses.is_dataclass(model.args) and not isinstance(model.args, type):
             return _config_to_plain_python(model.args)
@@ -13968,8 +16204,18 @@ def _vlm_gguf_name_candidates(name):
         if value not in candidates:
             candidates.append(value)
 
+    # An encoder MLX keeps at the top level sits under "model." in the HF layout these
+    # converters read. llama.cpp drops a tensor whose name it does not recognize, so a
+    # missed prefix costs the mmproj its projector and only fails at load time.
     if name.startswith(
-        ("audio_tower.", "vision_tower.", "embed_audio.", "embed_vision.")
+        (
+            "audio_tower.",
+            "vision_tower.",
+            "vision_adapter.",
+            "vision_projection.",
+            "embed_audio.",
+            "embed_vision.",
+        )
     ):
         add(f"model.{name}")
 
@@ -13986,24 +16232,42 @@ def _vlm_gguf_name_candidates(name):
         add(f"model.language_model.visual.{suffix}")
         add(f"vit.{suffix}")
 
+    # Pre-fold text-tower names. Key-gated sanitizers (Qwen3.5) shift only under
+    # these, so they are what lets the replay recover the shift from an
+    # already-converted MLX checkpoint, where the measurement comes back bare.
+    if name.startswith("language_model.model."):
+        suffix = name[len("language_model.model."):]
+        add(f"model.language_model.{suffix}")
+    if name.startswith("language_model.lm_head"):
+        add(name[len("language_model."):])
+
     add(name)
     return candidates
 
 
-def _vlm_gguf_tensor_candidates(name, tensor):
+def _vlm_gguf_layout_candidates(name, tensor):
+    """The candidates that only move axes, named apart so a caller can tell one won.
+
+    A permutation of equally sized axes leaves the shape alone, so a caller comparing
+    shapes cannot see it; the MoE pass reads this directory next and would move those
+    axes a second time."""
+    shape = getattr(tensor, "shape", ())
+    if len(shape) == 5:
+        return [mx.transpose(tensor, (0, 4, 1, 2, 3))]
+    if len(shape) == 4:
+        return [mx.transpose(tensor, (0, 3, 1, 2))]
+    if len(shape) == 3 and "depthwise_conv1d.weight" in name:
+        return [mx.transpose(tensor, (0, 2, 1))]
+    return []
+
+
+def _vlm_gguf_tensor_candidates(name, tensor, norm_offset=1.0):
     """Yield HF-layout tensor candidates for an MLX VLM tensor."""
-    candidates = []
+    candidates = _vlm_gguf_layout_candidates(name, tensor)
     shape = getattr(tensor, "shape", ())
 
-    if len(shape) == 5:
-        candidates.append(mx.transpose(tensor, (0, 4, 1, 2, 3)))
-    elif len(shape) == 4:
-        candidates.append(mx.transpose(tensor, (0, 3, 1, 2)))
-    elif len(shape) == 3 and "depthwise_conv1d.weight" in name:
-        candidates.append(mx.transpose(tensor, (0, 2, 1)))
-
-    if len(shape) == 1 and mx.issubdtype(tensor.dtype, mx.floating):
-        candidates.append(tensor - 1)
+    if norm_offset and len(shape) == 1 and mx.issubdtype(tensor.dtype, mx.floating):
+        candidates.append(tensor - norm_offset)
 
     candidates.append(tensor)
     return candidates
@@ -14027,6 +16291,22 @@ def _has_vlm_gguf_rewrite_candidate(name, tensor):
     if any(candidate_name != name for candidate_name in _vlm_gguf_name_candidates(name)):
         return True
     return _has_vlm_gguf_tensor_candidate(name, tensor)
+
+
+def _mlx_tensors_identical(actual, expected):
+    """Same dtype and same bits, not numeric equality."""
+    held = getattr(actual, "dtype", None)
+    wanted = getattr(expected, "dtype", None)
+    if (held is None) != (wanted is None) or (held is not None and held != wanted):
+        return False
+    if held is not None and getattr(actual, "shape", None) == getattr(expected, "shape", None):
+        try:
+            # Flattened first: a scalar cannot be viewed as another-sized type.
+            return bool(mx.all(mx.view(mx.reshape(actual, (-1,)), mx.uint8)
+                               == mx.view(mx.reshape(expected, (-1,)), mx.uint8)))
+        except Exception:
+            pass
+    return _mlx_arrays_match(actual, expected)
 
 
 def _mlx_arrays_match(actual, expected):
@@ -14060,13 +16340,15 @@ def _normalize_mlx_vlm_sanitize_pipelines(sanitize_steps):
     return sanitize_steps
 
 
-def _rewrite_mlx_vlm_tensor_for_gguf(name, tensor, sanitize_steps):
+def _rewrite_mlx_vlm_tensor_for_gguf(name, tensor, sanitize_steps, norm_offset=1.0):
     """Invert mlx-vlm sanitizers to recover HF tensor names/layouts for GGUF."""
     if not _has_vlm_gguf_rewrite_candidate(name, tensor):
         return name, tensor, False
 
     for candidate_name in _vlm_gguf_name_candidates(name):
-        for candidate_tensor in _vlm_gguf_tensor_candidates(name, tensor):
+        for candidate_tensor in _vlm_gguf_tensor_candidates(
+            name, tensor, norm_offset
+        ):
             for pipeline in _normalize_mlx_vlm_sanitize_pipelines(sanitize_steps):
                 sanitized = _apply_mlx_vlm_sanitizers(
                     pipeline,
@@ -14088,6 +16370,125 @@ def _rewrite_mlx_vlm_tensor_for_gguf(name, tensor, sanitize_steps):
                 return candidate_name, candidate_tensor, True
 
     return name, tensor, False
+
+
+# Distinct from None, which is a real measurement (source unreadable).
+_UNMEASURED = object()
+
+
+_MLX_NORM_OFFSET_TOLERANCE = 1e-6
+_MLX_NORM_OFFSET_PROBE = 1.0
+
+
+def _mlx_norm_offset_probe(weights, fill):
+    """Replace every 1-D float weight with ``fill``, passing the rest through.
+
+    Keys, shapes and dtypes survive, and every real sanitizer gate reads only
+    those, so the replay reproduces the gate while carrying a value we chose.
+    """
+    return {
+        key: (
+            mx.zeros(value.shape, dtype=value.dtype) + fill
+            if value.ndim == 1 and mx.issubdtype(value.dtype, mx.floating)
+            else value
+        )
+        for key, value in weights.items()
+    }
+
+
+def _mlx_constant_1d_value(value):
+    """Return the single value a 1-D float array holds, or None if it varies."""
+    if getattr(value, "ndim", None) != 1:
+        return None
+    if not mx.issubdtype(value.dtype, mx.floating):
+        return None
+    # mx.min refuses a zero-size reduce, and the raise would discard every
+    # offset measured alongside this one.
+    if value.shape[0] == 0:
+        return None
+    low = mx.min(value).item()
+    high = mx.max(value).item()
+    # A sanitizer dividing by a weight the probe zeroed returns inf or NaN, and
+    # NaN fails every comparison, so the spread check below would read it as
+    # constant and the export would subtract it into a real weight.
+    if not math.isfinite(low) or not math.isfinite(high):
+        return None
+    if abs(low - high) > _MLX_NORM_OFFSET_TOLERANCE:
+        return None
+    return low
+
+
+def _mlx_sanitize_probe(model, weights):
+    """Replay ``model.sanitize`` where its writes to ``self`` cannot escape.
+
+    Sanitizers are not pure: phi4mm caches its split LoRA weights on the
+    instance and gemma3_text pops the ``lm_head`` submodule for a tied
+    checkpoint, so measuring on the model itself would rebuild it out of the
+    probe halfway through an export. A model that cannot be copied is left
+    unmeasured; the caller treats that as unmeasurable, which is what the export
+    did before this existed.
+    """
+    probe = copy.copy(model)
+    probe._unsloth_measuring_norm_offsets = True
+    return probe.sanitize(weights)
+
+
+def _mlx_sanitizer_norm_offsets(model):
+    """Measure the constants a model's sanitizer ADDS to its 1-D float weights.
+
+    The MTP families shift RMSNorm weights by +1 on load, gated on the source
+    checkpoint's contents rather than the model class, so replay the real
+    sanitizer over two probes -- 1-D floats all zero, then all one -- and keep a
+    key only where the output rose by the difference. Rising is what makes the
+    constant an ADDED one, so a sanitizer that invents a 1-D tensor the source
+    never held (Inkling's expert scales) or transforms one non-additively is
+    rejected. None means unmeasurable, not unshifted.
+    """
+    src_path = _get_src_path(model)
+    sanitize = getattr(model, "sanitize", None)
+    if src_path is None or not callable(sanitize):
+        return None
+
+    try:
+        weights = {}
+        for weight_file in sorted(Path(src_path).glob("*.safetensors")):
+            weights.update(mx.load(str(weight_file)))
+        if not weights:
+            return None
+        return _mlx_measure_norm_offsets(
+            lambda probe: _mlx_sanitize_probe(model, probe), weights
+        )
+    except Exception as exc:
+        print(f"Unsloth: Could not measure MLX norm offsets ({exc}); continuing.")
+        return None
+
+
+def _mlx_measure_norm_offsets(replay, weights):
+    """The additive constants ``replay`` (a sanitizer) applies to ``weights``' 1-D floats."""
+    zeroed = replay(_mlx_norm_offset_probe(weights, 0.0))
+    candidates = {}
+    for key, value in zeroed.items():
+        offset = _mlx_constant_1d_value(value)
+        if offset is None or abs(offset) <= _MLX_NORM_OFFSET_TOLERANCE:
+            continue
+        candidates[key] = (value, offset)
+    if not candidates:
+        return {}
+
+    raised = replay(_mlx_norm_offset_probe(weights, _MLX_NORM_OFFSET_PROBE))
+
+    offsets = {}
+    for key, (value, offset) in candidates.items():
+        raised_value = raised.get(key)
+        if getattr(raised_value, "shape", None) != value.shape:
+            continue
+        delta = _mlx_constant_1d_value(raised_value - value)
+        if delta is None:
+            continue
+        if abs(delta - _MLX_NORM_OFFSET_PROBE) > _MLX_NORM_OFFSET_TOLERANCE:
+            continue
+        offsets[key] = offset
+    return offsets
 
 
 def _sync_gguf_nextn_layer_config(config, model):
@@ -14143,8 +16544,15 @@ def _sync_gguf_nextn_layer_config(config, model):
     return changed
 
 
-def _prepare_vlm_gguf_export_directory(path, model=None):
-    """Rewrite MLX-native VLM tensor names in the temporary GGUF export dir."""
+def _prepare_mlx_gguf_export_directory(
+    path, model=None, replay_sanitizers=True, norm_offsets=_UNMEASURED,
+    relaid_out=None,
+):
+    """Restore HF tensor names, layouts and norm convention in the export dir.
+
+    ``replay_sanitizers`` gates the VLM-only name/layout inversion; the norm correction
+    always runs. ``norm_offsets`` is one source measurement shared by every pass, and
+    ``relaid_out`` collects the names whose axes this pass moved, for the same reason."""
     path = Path(path)
     config_path = path / "config.json"
     if not config_path.exists():
@@ -14152,8 +16560,14 @@ def _prepare_vlm_gguf_export_directory(path, model=None):
     with open(config_path, "r") as f:
         config = json.load(f)
     config_changed = _sync_gguf_nextn_layer_config(config, model)
-    sanitize_steps = _build_mlx_vlm_sanitize_pipelines(config, model=model)
-    if not sanitize_steps:
+    sanitize_steps = (
+        _build_mlx_vlm_sanitize_pipelines(config, model=model)
+        if replay_sanitizers
+        else []
+    )
+    if norm_offsets is _UNMEASURED:
+        norm_offsets = _mlx_sanitizer_norm_offsets(model)
+    if not sanitize_steps and not norm_offsets:
         if config_changed:
             with open(config_path, "w") as f:
                 json.dump(config, f, indent=4)
@@ -14166,13 +16580,36 @@ def _prepare_vlm_gguf_export_directory(path, model=None):
         updated = {}
         file_rewritten = 0
         for name, tensor in tensors.items():
+            original_tensor = tensor
+            # An empty measurement is ambiguous: an already-converted MLX
+            # source shifts nothing at load yet still holds shifted norms.
+            offset = 1.0 if not norm_offsets else norm_offsets.get(name, 0.0)
             new_name, tensor, changed = _rewrite_mlx_vlm_tensor_for_gguf(
-                name, tensor, sanitize_steps
+                name, tensor, sanitize_steps, offset
             )
+            # The replay cannot observe a gate that spans the whole checkpoint,
+            # so a value it left alone is one the measurement has to recover.
+            if (
+                norm_offsets
+                and offset
+                and _mlx_arrays_match(tensor, original_tensor)
+            ):
+                tensor = tensor - offset
+                changed = True
             if new_name in updated:
                 raise RuntimeError(
-                    f"Unsloth: duplicate tensor name after GGUF VLM rewrite: {new_name}"
+                    f"Unsloth: duplicate tensor name after GGUF rewrite: {new_name}"
                 )
+            # Which candidate won, not what the shape says: a permutation of equally
+            # sized axes leaves the shape alone. The MoE pass reads this directory
+            # after this one, and an adjacent-axis move is its own inverse, so
+            # replaying the sanitizer over a second inversion hands back what is on
+            # disk and the confirmation accepts it, transposed off HF layout.
+            if relaid_out is not None and changed and any(
+                _mlx_arrays_match(tensor, candidate)
+                for candidate in _vlm_gguf_layout_candidates(name, original_tensor)
+            ):
+                relaid_out.add(new_name)
             updated[new_name] = tensor
             name_map[name] = new_name
             file_rewritten += int(changed)
@@ -14194,7 +16631,7 @@ def _prepare_vlm_gguf_export_directory(path, model=None):
             new_name = name_map.get(name, name)
             if new_name in weight_map:
                 raise RuntimeError(
-                    f"Unsloth: duplicate index tensor name after GGUF VLM rewrite: {new_name}"
+                    f"Unsloth: duplicate index tensor name after GGUF rewrite: {new_name}"
                 )
             weight_map[new_name] = shard
         index_data["weight_map"] = dict(sorted(weight_map.items()))
@@ -14206,6 +16643,1472 @@ def _prepare_vlm_gguf_export_directory(path, model=None):
             json.dump(config, f, indent=4)
 
     return rewritten
+
+
+# mlx-lm stacks per-expert HF tensors into one SwitchLinear name llama.cpp cannot map.
+# Legacy leaf names first, identity last: only they name tensors the converter reads.
+_MOE_EXPERT_GROUPS = ("experts", "mlp")
+_MOE_EXPERT_LEAF_ALIASES = (
+    {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"},
+    {"fc1": "up_proj", "fc2": "down_proj"},
+    {},
+)
+_MOE_EXPERT_PARAMS = ("weight", "bias")
+
+
+def _is_mlx_switch_expert_module(module):
+    num_experts = getattr(module, "num_experts", None)
+    if not isinstance(num_experts, int):
+        return False
+    shape = getattr(getattr(module, "weight", None), "shape", None)
+    return shape is not None and len(shape) == 3 and shape[0] == num_experts
+
+
+def _mlx_stacked_expert_tensor_names(model, tensor_names):
+    named_modules = getattr(model, "named_modules", None)
+    if not callable(named_modules):
+        return {}
+
+    stacked = {}
+    for path, module in named_modules():
+        if not path or not _is_mlx_switch_expert_module(module):
+            continue
+        # LoRA keeps the base SwitchLinear at ".linear", lengthening the module path.
+        while path and f"{path}.weight" not in tensor_names:
+            path = path.rsplit(".", 1)[0] if "." in path else ""
+        if not path or path.count(".") < 2:
+            continue
+        for param in _MOE_EXPERT_PARAMS:
+            name = f"{path}.{param}"
+            if name in tensor_names:
+                stacked[name] = module.num_experts
+    return stacked
+
+
+@contextlib.contextmanager
+def _mlx_module_state_restored(modules):
+    """Leave these modules as they were found: an mlx `Module` is a dict of
+    parameters and children plus plain attributes, and both halves are put back.
+    State inside plain objects a module merely references is not reached."""
+    state = [(module, dict(module) if isinstance(module, dict) else None,
+              dict(vars(module))) for module in modules]
+    try:
+        yield
+    finally:
+        for module, items, attributes in state:
+            if items is not None:
+                # Through `dict`: `Module.update` reads a nested parameter tree.
+                dict.clear(module)
+                dict.update(module, items)
+            vars(module).clear()
+            vars(module).update(attributes)
+
+
+class _MlxReplayedSanitizers:
+    """Sanitizers replayed in order, leaving no module of the model changed: Gemma 3
+    ties its head and drops `lm_head` if handed no `lm_head.weight`."""
+
+    def __init__(self, owners, held):
+        self.owners = tuple(owners)
+        self.held = tuple(held)
+
+    def sanitize(self, weights):
+        with _mlx_module_state_restored(self.held):
+            for owner in self.owners:
+                weights = owner.sanitize(weights)
+                # A failed replay writes nothing: the export is then what it was without this pass.
+                if not isinstance(weights, Mapping):
+                    raise TypeError("sanitize did not return a mapping")
+            return weights
+
+
+def _mlx_moe_sanitizers(model):
+    """Sanitizers that may own an MoE block's expert stacking, composition first."""
+    owners = []
+    for owner in (model, getattr(model, "vision_tower", None),
+                  getattr(model, "language_model", None),
+                  getattr(model, "text_model", None)):
+        if owner is None or getattr(owner, "sanitize", None) is None:
+            continue
+        if all(existing is not owner for existing in owners):
+            owners.append(owner)
+    if len(owners) < 2:
+        return [_MlxReplayedSanitizers(owners, owners)]
+    return [_MlxReplayedSanitizers(owners, owners)] + [
+        _MlxReplayedSanitizers([owner], owners) for owner in owners
+    ]
+
+
+def _mlx_moe_sanitized_probe(sanitizer, probe):
+    """Replay a probe, copying the tensors a sanitizer writing in place could reach:
+    mlx-vlm offsets a norm weight with `+=`, writing through to the caller's tensor and
+    to every later tensor sharing that shape-cached marker. 1-D only, as wider copies
+    would cost a synchronization."""
+    if _mlx_sanitizer_writes_in_place(sanitizer):
+        probe = {
+            name: mx.array(tensor) if getattr(tensor, "ndim", 0) == 1 else tensor
+            for name, tensor in probe.items()
+        }
+    return sanitizer.sanitize(dict(probe))
+
+
+def _mlx_augmented_assignment(instruction):
+    """Both spellings: 3.11 replaced `INPLACE_*` with `BINARY_OP`, and we support 3.9."""
+    return (instruction.opname.startswith("INPLACE_")
+            or (instruction.opname == "BINARY_OP"
+                and instruction.argrepr.endswith("=")))
+
+
+def _mlx_sanitizer_writes_in_place(sanitizer):
+    """Whether a sanitizer's code holds an augmented assignment, which may write
+    through. From bytecode, since measuring costs the synchronization this avoids."""
+    if getattr(sanitizer, "_writes_in_place", None) is None:
+        sanitizer._writes_in_place = any(
+            _mlx_augmented_assignment(instruction)
+            for code in _mlx_sanitizer_code([sanitizer])
+            for instruction in dis.get_instructions(code)
+        )
+    return sanitizer._writes_in_place
+
+
+def _mlx_moe_expert_names(name, num_experts, group, leaf_alias, parent=("", "")):
+    base, param = name.rsplit(".", 1)
+    prefix, _container, leaf = base.rsplit(".", 2)
+    replaced, replacement = parent
+    if replaced:
+        if replaced not in prefix:
+            return None
+        prefix = prefix.replace(replaced, replacement)
+    leaf = leaf_alias.get(leaf, leaf)
+    return [f"{prefix}.{group}.{e}.{leaf}.{param}" for e in range(num_experts)]
+
+
+_GGUF_TEXT_TOWER_NAMESPACE = "language_model.model"
+
+
+def _mlx_moe_dropped_the_gguf_namespace_in_the_tower(name, renamed):
+    """Whether this rename keeps a text tower but drops the namespace llama.cpp maps it
+    under: the converter strips `language_model.` and looks the rest up under `model.`,
+    so a rename off `language_model.model.` moves the tensor out of the tables."""
+    return (name.startswith(_GGUF_TEXT_TOWER_NAMESPACE + ".")
+            and renamed.startswith("language_model.")
+            and not renamed.startswith(_GGUF_TEXT_TOWER_NAMESPACE + "."))
+
+
+def _mlx_moe_parent_substitutions(renames):
+    """The module relocations a set of proved renames is made of."""
+    substitutions = [("", "")]
+    for name, renamed in renames.items():
+        head = len(os.path.commonprefix([name, renamed]))
+        tail = len(os.path.commonprefix([name[::-1], renamed[::-1]]))
+        replaced, replacement = name[head:len(name) - tail], renamed[head:len(renamed) - tail]
+        if replaced and (replaced, replacement) not in substitutions:
+            substitutions.append((replaced, replacement))
+    return substitutions
+
+
+def _mlx_moe_probe_tensor(shape, value):
+    """A tiny marker of the same rank as a per-expert slice."""
+    return mx.full(tuple(min(dim, 2) for dim in shape), value, dtype=mx.float32)
+
+
+def _mlx_moe_probe_is_stacked_in_order(stacked, num_experts):
+    shape = getattr(stacked, "shape", None)
+    if shape is None or len(shape) < 1 or shape[0] != num_experts:
+        return False
+    try:
+        markers = mx.reshape(stacked, (num_experts, -1))[:, 0]
+        return bool(
+            mx.array_equal(markers, mx.arange(num_experts, dtype=markers.dtype))
+        )
+    except Exception:
+        return False
+
+
+def _candidate_mlx_moe_unstack_plans(stacked, parents=(("", ""),)):
+    """Yield per-expert naming plans to try, most trustworthy first."""
+    for parent in parents:
+        for group in _MOE_EXPERT_GROUPS:
+            for leaf_alias in _MOE_EXPERT_LEAF_ALIASES:
+                plan = {
+                    name: _mlx_moe_expert_names(
+                        name, num_experts, group, leaf_alias, parent
+                    )
+                    for name, num_experts in stacked.items()
+                }
+                if all(names is not None for names in plan.values()):
+                    yield plan
+
+
+def _build_mlx_moe_expert_unstack_plan(model, stacked, staged, parents=(("", ""),)):
+    """Recover per-expert HF names, then prove them by replaying sanitize()."""
+    sanitizers = _mlx_moe_sanitizers(model)
+    # Sanitizers read non-expert weights too, so replay against the whole checkpoint.
+    others = {name: tensor for name, tensor in staged.items() if name not in stacked}
+    for plan in _candidate_mlx_moe_unstack_plans(stacked, parents):
+        probe = dict(others)
+        for name, expert_names in plan.items():
+            slice_shape = tuple(staged[name].shape)[1:]
+            for expert, expert_name in enumerate(expert_names):
+                probe[expert_name] = _mlx_moe_probe_tensor(slice_shape, expert)
+        if len(probe) != len(others) + sum(len(v) for v in plan.values()):
+            continue
+        for sanitizer in sanitizers:
+            try:
+                sanitized = _mlx_moe_sanitized_probe(sanitizer, probe)
+            except Exception:
+                continue
+            if all(
+                _mlx_moe_probe_is_stacked_in_order(sanitized.get(name), stacked[name])
+                for name in plan
+            ):
+                return plan
+    return None
+
+
+# From the sanitizer's constant pool, not a table, so unanticipated architectures work.
+_MOE_VOCABULARY_DEPTH = 5
+_MOE_VOCABULARY_UBIQUITY = 0.5
+_MOE_VOCABULARY_CALLS = 2
+
+
+def _mlx_sanitizer_own_functions(found, package, mentioned):
+    """The package's own functions one global name reaches, only those named beside a class."""
+    def owned(value):
+        return (inspect.isfunction(value)
+                and (getattr(value, "__module__", "") or "").split(".")[0] == package)
+
+    if isinstance(found, type):
+        return [value for name, value in vars(found).items()
+                if name in mentioned and owned(value)]
+    return [found] if owned(found) else []
+
+
+def _mlx_sanitizer_code(sanitizers):
+    """Every code object a sanitizer reaches inside the model's own package; a walk
+    into mlx or numpy would cost a vocabulary of everything and prove nothing."""
+    reached, walked = [], set()
+
+    def walk(function, calls):
+        code = getattr(function, "__code__", None)
+        if code is None or code in walked:
+            return
+        walked.add(code)
+        reached.append(code)
+        if calls >= _MOE_VOCABULARY_CALLS:
+            return
+        package = (getattr(function, "__module__", "") or "").split(".")[0]
+        namespace = getattr(function, "__globals__", None) or {}
+        # Descend into nested code objects: before PEP 709 (3.12) a comprehension gets
+        # its own, hiding from `co_names` the helper a rename is spelled in.
+        names, mentioned, pending = [], set(), [code]
+        while pending:
+            current = pending.pop(0)
+            for name in current.co_names:
+                if name not in mentioned:
+                    mentioned.add(name)
+                    names.append(name)
+            pending.extend(const for const in current.co_consts
+                           if hasattr(const, "co_consts"))
+        for name in names:
+            for called in _mlx_sanitizer_own_functions(
+                namespace.get(name), package, mentioned
+            ):
+                walk(called, calls + 1)
+
+    for sanitizer in sanitizers:
+        for owner in getattr(sanitizer, "owners", (sanitizer,)):
+            walk(getattr(type(owner), "sanitize", None), 0)
+    return reached
+
+
+def _mlx_sanitizer_constants(codes, keep):
+    found = []
+
+    def collect(obj, depth):
+        if depth > _MOE_VOCABULARY_DEPTH:
+            return
+        if keep(obj):
+            found.append(obj)
+        if isinstance(obj, (tuple, list, frozenset)):
+            for item in obj:
+                collect(item, depth + 1)
+        elif hasattr(obj, "co_consts"):
+            for item in obj.co_consts:
+                collect(item, depth + 1)
+
+    for code in codes:
+        collect(code, 0)
+    return found
+
+
+def _mlx_sanitizer_vocabulary(sanitizers):
+    found = _mlx_sanitizer_constants(
+        _mlx_sanitizer_code(sanitizers), lambda obj: isinstance(obj, str))
+    return sorted({f for f in found if len(f) > 1 and not f.isspace()})
+
+
+def _mlx_sanitizer_fusion_groups(sanitizers):
+    """Each tuple of names a sanitizer holds, with the fragments beside it. A fuser
+    names its inputs in one tuple in concatenation order, so the tuple is the group."""
+    def named(obj):
+        return (isinstance(obj, tuple) and 1 < len(obj) <= _MOE_SPLIT_PARTS
+                and len(set(obj)) == len(obj)
+                and all(isinstance(item, str) and len(item) > 1 for item in obj))
+
+    found = {}
+    for code in _mlx_sanitizer_code(sanitizers):
+        groups = _mlx_sanitizer_constants([code], named)
+        if not groups:
+            continue
+        fragments = {f for f in _mlx_sanitizer_constants(
+            [code], lambda obj: isinstance(obj, str))
+            if len(f) > 1 and not f.isspace()}
+        for group in groups:
+            found.setdefault(tuple(group), set()).update(fragments)
+    return [(group, sorted(fragments)) for group, fragments in sorted(found.items())]
+
+
+def _mlx_moe_rename_candidates(vocabulary, names, ubiquity=_MOE_VOCABULARY_UBIQUITY):
+    """Substitutions worth trying, as (replaced, replacement) pairs; ``ubiquity`` of 1
+    offers every fragment, right once ``names`` is already narrowed."""
+    limit = max(1, int(len(names) * ubiquity))
+    for replaced in vocabulary:
+        carried = [name for name in names if replaced in name]
+        if not carried:
+            continue
+        # A fragment on most tensors names the checkpoint's shape, not a block layout,
+        # unless every carrier starts with it: a relocated namespace, as in qwen4_exp.
+        relocation = len(carried) > limit
+        if relocation and not all(name.startswith(replaced) for name in carried):
+            continue
+        # A relocation moves a namespace, so only its own components reordered are offered.
+        components = sorted(part for part in replaced.split(".") if part)
+        for replacement in vocabulary:
+            if replacement == replaced:
+                continue
+            if relocation and sorted(
+                part for part in replacement.split(".") if part
+            ) != components:
+                continue
+            yield replaced, replacement
+        # Deletion: mlx-lm appends `.weight` to a name carried bare.
+        yield replaced, ""
+
+
+def _mlx_moe_renamed(names, replaced, replacement):
+    """Apply one substitution, keeping only the names it changes."""
+    renamed = {}
+    for name in names:
+        if replaced in name:
+            candidate = name.replace(replaced, replacement)
+            if candidate != name:
+                renamed[name] = candidate
+    return renamed if len(set(renamed.values())) == len(renamed) else {}
+
+
+# Two probes, as (base, spread): tensor n is marked base + n * spread. One cannot tell a
+# doubled 1-D tensor from an offset one; two alike could not tell a constant from a swap.
+_MOE_PROBE_MARKERS = ((3.0, 1.0), (5.0, 7.0))
+
+def _mlx_moe_replay_marker(shape, value):
+    """A marker for replay measurement: 1-D whole, since a shift along one reads as a
+    constant from a truncated corner; wider ones truncated, and counted rather than
+    filled so an axis move still shows."""
+    if len(shape) == 1:
+        return mx.full(shape, value, dtype=mx.float32)
+    shape = tuple(min(dim, 2) for dim in shape)
+    size = 1
+    for dim in shape:
+        size *= dim
+    return mx.reshape(mx.arange(size, dtype=mx.float32), shape) + value
+
+
+def _mlx_moe_constant_offset(sanitized, marker):
+    # Identity settles almost every tensor; the comparison below costs a sync each.
+    if sanitized is marker:
+        return 0.0
+    if sanitized is None or tuple(getattr(sanitized, "shape", ())) != tuple(marker.shape):
+        return None
+    try:
+        difference = mx.reshape(sanitized.astype(mx.float32) - marker, (-1,))
+        if not bool(mx.all(difference == difference[0])):
+            return None
+        constant = float(difference[0])
+        # Only a full-width probe proves a constant, so wider ones must be untouched.
+        if constant and len(marker.shape) != 1:
+            return None
+        return constant
+    except Exception:
+        return None
+
+
+# Axis pairs an mlx-lm sanitizer moves, (source, destination) HF to MLX: Kimi Linear
+# stores KDA convolutions (d_inner, d_conv, 1) for (d_inner, 1, d_conv).
+_MOE_TENSOR_LAYOUTS = ((2, 1), (1, 0), (2, 0))
+
+
+def _mlx_moe_replay_match(sanitized, marker):
+    """What a sanitizer did to one marker: a constant added and an axis moved, or None.
+    Measured with the name, since a re-laid-out tensor cannot be inverted by renaming."""
+    if sanitized is marker:
+        return 0.0, None
+    if sanitized is None:
+        return None
+    constant = _mlx_moe_constant_offset(sanitized, marker)
+    if constant is not None:
+        return constant, None
+    shape = tuple(getattr(sanitized, "shape", ()))
+    if sorted(shape) != sorted(tuple(marker.shape)):
+        return None
+    for source, destination in _MOE_TENSOR_LAYOUTS:
+        if max(source, destination) >= len(marker.shape):
+            continue
+        if _mlx_arrays_match(sanitized, mx.moveaxis(marker, source, destination)):
+            return 0.0, (source, destination)
+    return None
+
+
+def _mlx_moe_replayed_corrections(sanitizers, proposal, staged, markers=None, required=()):
+    """For each saved tensor a sanitizer still produces, how it produced it: step3p5
+    stores a norm weight one greater, Kimi Linear's KDA convolutions transposed."""
+    markers = {} if markers is None else markers
+    for sanitizer in sanitizers:
+        corrections, replays = {}, []
+        for base, spread in _MOE_PROBE_MARKERS:
+            probe = {}
+            # A distinct value per tensor, so a swap of two same-shaped ones shows.
+            for position, (name, proposed) in enumerate(proposal.items()):
+                shape, value = tuple(staged[name].shape), base + position * spread
+                if (shape, value) not in markers:
+                    markers[shape, value] = _mlx_moe_replay_marker(shape, value)
+                probe[proposed] = markers[shape, value]
+            try:
+                sanitized = _mlx_moe_sanitized_probe(sanitizer, probe)
+            except Exception:
+                replays = []
+                break
+            # Nothing below recovers a missing name, so bail on the first replay.
+            if not required <= set(sanitized):
+                replays = []
+                break
+            replays.append((probe, sanitized))
+        if not replays:
+            continue
+        for name, proposed in proposal.items():
+            found = {
+                _mlx_moe_replay_match(sanitized.get(name), probe[proposed])
+                for probe, sanitized in replays
+            }
+            if len(found) == 1 and None not in found:
+                corrections[name] = found.pop()
+        if corrections:
+            return corrections
+    return {}
+
+
+def _completed_mlx_moe_rename_candidate(candidate, corrections, unproven, vocabulary, replay):
+    """Finish a candidate with a second substitution on what it missed."""
+    for replaced, replacement in _mlx_moe_rename_candidates(
+        vocabulary, [candidate[name] for name in unproven], ubiquity=1
+    ):
+        repaired = dict(candidate)
+        fixed = _mlx_moe_renamed(
+            [candidate[name] for name in unproven], replaced, replacement
+        )
+        if not fixed:
+            continue
+        for name in unproven:
+            repaired[name] = fixed.get(candidate[name], candidate[name])
+        # Restoring a name to the one already saved proves nothing.
+        if any(repaired[name] == name for name in unproven):
+            continue
+        if len(set(repaired.values())) != len(repaired):
+            continue
+        repaired_corrections = replay(repaired, unproven)
+        if unproven <= set(repaired_corrections):
+            return repaired, repaired_corrections
+    return candidate, corrections
+
+
+# Splits reached here are in two (gate/up, or MLA key/value); DBRX's per-expert split
+# belongs to the stack family. Widening costs a factor of the vocabulary per part.
+_MOE_MERGE_PARTS = 2
+_MOE_MERGE_PROBE_WIDTHS = (2, None)
+_MOE_MERGE_ROUNDS = 4
+# A group of one is carried through under its restored name rather than merged.
+_MOE_MERGE_KEPT = ((None,), 0, False)
+
+
+def _mlx_moe_moved_shape(shape, layout):
+    """The shape a part has once the sanitizer's axis move is undone."""
+    if layout is None:
+        return tuple(shape)
+    return tuple(mx.moveaxis(mx.zeros(tuple(shape)), layout[1], layout[0]).shape)
+
+
+def _mlx_moe_group_recipe(parts, recipe):
+    """A group's recipe: the merge, or the identity for a lone part."""
+    return (parts,) + (recipe if len(parts) > 1 else _MOE_MERGE_KEPT)
+
+
+def _mlx_moe_merged(parts, recipe):
+    """Rebuild the checkpoint tensor a sanitizer split into `parts`. A share means it
+    instead fused several into one part, so what comes back is one slice of it."""
+    _, layouts, axis, flattened, *share = recipe
+    merged = mx.concatenate(
+        [
+            part if layout is None else mx.moveaxis(part, layout[1], layout[0])
+            for part, layout in zip(parts, layouts)
+        ],
+        axis=axis,
+    )
+    if flattened:
+        shape = tuple(merged.shape)
+        leading = 1
+        for dim in shape[: axis + 1]:
+            leading *= dim
+        merged = mx.reshape(merged, (leading,) + shape[axis + 1 :])
+    if share and share[0] is not None:
+        index, count = share[0]
+        merged = mx.split(merged, count, axis=axis)[index]
+    return merged
+
+
+def _mlx_moe_merge_recipes(shapes):
+    ranks = {len(shape) for shape in shapes}
+    if len(ranks) != 1:
+        return
+    rank = ranks.pop()
+    choices = [None] + [layout for layout in _MOE_TENSOR_LAYOUTS if max(layout) < rank]
+    for layouts in itertools.product(choices, repeat=len(shapes)):
+        moved = [
+            _mlx_moe_moved_shape(shape, layout)
+            for shape, layout in zip(shapes, layouts)
+        ]
+        for axis in range(rank):
+            if any(
+                shape[:axis] + shape[axis + 1 :]
+                != moved[0][:axis] + moved[0][axis + 1 :]
+                for shape in moved
+            ):
+                continue
+            # A reshape hides the difference between a merge and its flattening, so flatter first.
+            for flattened in (True, False):
+                if flattened and (axis == 0 or axis + 1 == rank):
+                    continue
+                yield layouts, axis, flattened
+
+
+def _mlx_moe_merge_groups(staged, substitutions):
+    """The staged tensors each substituted name collects, in substitution order:
+    checkpoint order would let one layer collect its parts the other way round."""
+    groups = {}
+    for name in staged:
+        for rank, (replaced, replacement) in enumerate(substitutions):
+            # First match only: `up_proj` sits inside `gate_up_proj`, splitting a group in two.
+            if replaced in name:
+                target = name.replace(replaced, replacement)
+                if target != name:
+                    groups.setdefault(target, []).append((rank, name))
+                break
+    return {
+        target: [name for _, name in sorted(parts)] for target, parts in groups.items()
+    }
+
+
+def _mlx_moe_merge_arrivals(staged, vocabulary):
+    """For each staged name, the names one substitution could restore it to."""
+    arrivals = {}
+    for replaced, replacement in _mlx_moe_rename_candidates(vocabulary, list(staged)):
+        for name, target in _mlx_moe_renamed(staged, replaced, replacement).items():
+            if target not in staged:
+                arrivals.setdefault(name, {}).setdefault(target, (replaced, replacement))
+    return arrivals
+
+
+def _proved_mlx_moe_merge_recipe(sanitizer, staged, groups, recipes, width,
+                                 native=False):
+    """The recipe under which the sanitizer reproduces every merged part, else the name
+    of a tensor it wanted and did not find."""
+    merged_parts = {part for parts in groups.values() for part in parts}
+    others, floor_probe = {}, {}
+    for position, (name, tensor) in enumerate(staged.items()):
+        dtype = getattr(tensor, "dtype", mx.float32) if native else mx.float32
+        marker = mx.full(tuple(tensor.shape), float(position), dtype=dtype)
+        floor_probe[name] = marker
+        if name not in merged_parts:
+            others[name] = marker
+    # The floor: a sanitizer can drop a sibling once the fused tensor is present.
+    try:
+        # Must go through the probe helper: `floor_probe` shares marker objects with
+        # `others`, so an in-place `+=` measures the floor one step ahead.
+        floor = _mlx_moe_sanitized_probe(sanitizer, floor_probe)
+    except Exception:
+        return
+    kept = {name: floor[name] for name in others if name in floor}
+
+    for recipe in recipes:
+        probe, expected, seed = {}, {}, 0
+        try:
+            for target, parts in groups.items():
+                markers = []
+                for part in parts:
+                    shape = tuple(staged[part].shape)
+                    if width is not None:
+                        shape = shape[:-1] + (min(shape[-1], width),)
+                    size = 1
+                    for dim in shape:
+                        size *= dim
+                    marker = mx.reshape(
+                        mx.arange(seed, seed + size, dtype=mx.float32), shape
+                    )
+                    if native:
+                        marker = marker.astype(staged[part].dtype)
+                    markers.append(marker)
+                    expected[part] = marker
+                    seed += size
+                probe[target] = _mlx_moe_merged(
+                    markers, _mlx_moe_group_recipe(parts, recipe)
+                )
+        except Exception:
+            # A truncated probe only fits recipes leaving the last axis alone.
+            continue
+        probe.update(others)
+        try:
+            sanitized = _mlx_moe_sanitized_probe(sanitizer, probe)
+        except KeyError as missing:
+            yield None, missing.args[0] if missing.args else None
+            continue
+        except Exception:
+            continue
+        if any(
+            not _mlx_arrays_match(sanitized.get(name), value)
+            for name, value in kept.items()
+        ):
+            continue
+        # A group at a time: comparing materializes both sides.
+        proved = True
+        for target, parts in groups.items():
+            for part in parts:
+                proved = proved and _mlx_arrays_match(
+                    sanitized.pop(part, None), expected.pop(part)
+                )
+            probe.pop(target, None)
+            if not proved:
+                break
+        if proved:
+            yield recipe, None
+            return
+
+
+def _proved_mlx_moe_merge_plan(sanitizers, staged, arrivals, target, substitutions,
+                               attempted):
+    """The rewrite one set of substitutions proves, completed from what it fails on."""
+    count = len(substitutions)
+    for _ in range(_MOE_MERGE_ROUNDS):
+        groups = _mlx_moe_merge_groups(staged, substitutions)
+        parts = groups.get(target)
+        if not parts or len(parts) != count or set(groups) & set(staged):
+            return None
+        shapes = [tuple(staged[part].shape) for part in parts]
+        # A recipe is an arrangement, not a size, so groups agree on rank and not extent.
+        ranks = {len(shape) for shape in shapes}
+        if any(
+            {len(staged[part].shape) for part in group} != ranks
+            for group in groups.values()
+            if len(group) > 1
+        ):
+            return None
+        # Keyed by the grouping, not the target, and only once worth replaying.
+        grouping = tuple(sorted((t, tuple(g)) for t, g in groups.items()))
+        if grouping in attempted:
+            return None
+        attempted.add(grouping)
+        wanted = None
+        for width in _MOE_MERGE_PROBE_WIDTHS:
+            for sanitizer in sanitizers:
+                for recipe, missing in _proved_mlx_moe_merge_recipe(
+                    sanitizer, staged, groups, _mlx_moe_merge_recipes(shapes), width
+                ):
+                    if recipe is None:
+                        wanted = wanted or missing
+                        continue
+                    # A float32 corner can support a recipe the tensor contradicts: confirm natively.
+                    if not any(
+                        confirmed is not None
+                        for confirmed, _ in _proved_mlx_moe_merge_recipe(
+                            sanitizer, staged, groups, [recipe], None, native=True
+                        )
+                    ):
+                        continue
+                    return {
+                        merged: _mlx_moe_group_recipe(group, recipe)
+                        for merged, group in groups.items()
+                    }
+        # A sanitizer popping a sibling throws naming what it wanted: read the companion off it.
+        claimed = {part for group in groups.values() for part in group}
+        companion = next(
+            (
+                arrivals[name][wanted]
+                for name in staged
+                if wanted in arrivals.get(name, ()) and name not in claimed
+            ),
+            None,
+        )
+        if companion is None or companion in substitutions:
+            return None
+        substitutions = substitutions + [companion]
+    return None
+
+
+def _build_mlx_moe_merge_plan(model, staged, sanitizers=None):
+    """Recover checkpoint tensors a sanitizer split into several staged ones, as
+    GraniteMoE's fused gate/up projection no rename reaches."""
+    owned = _mlx_moe_sanitizers(model)
+    vocabulary = _mlx_sanitizer_vocabulary(owned)
+    if not vocabulary:
+        return {}
+    # The vocabulary stays the model's own: a wrapped sanitizer has no fragments.
+    sanitizers = sanitizers or owned
+    arrivals = _mlx_moe_merge_arrivals(staged, vocabulary)
+    collected = {}
+    for name, targets in arrivals.items():
+        for target in targets:
+            collected.setdefault(target, []).append(name)
+
+    attempted = set()
+    for target, sources in collected.items():
+        for chosen in itertools.permutations(sources, _MOE_MERGE_PARTS):
+            if len({len(staged[name].shape) for name in chosen}) != 1:
+                continue
+            substitutions = [arrivals[name][target] for name in chosen]
+            if len({replaced for replaced, _ in substitutions}) != len(chosen):
+                continue
+            plan = _proved_mlx_moe_merge_plan(
+                sanitizers, staged, arrivals, target, substitutions, attempted
+            )
+            if plan:
+                return plan
+    return {}
+
+
+class _MlxRelabelledSanitizer:
+    """A sanitizer relabelled to spell its output the way a proved rename does."""
+
+    def __init__(self, inner, renames):
+        self.inner, self.renames = inner, renames
+        self.owners = getattr(inner, "owners", (inner,))
+
+    def sanitize(self, weights):
+        return {self.renames.get(name, name): tensor
+                for name, tensor in self.inner.sanitize(weights).items()}
+
+
+def _build_mlx_moe_renamed_merge_plan(model, staged, renames):
+    """Merges the checkpoint still needs once the renames have been proved: splitting
+    plus relocating leaves no staged name one substitution from the checkpoint's, but
+    the proved name is one away (Qwen3-VL-MoE)."""
+    if not renames:
+        return {}
+    renamed = {renames.get(name, name): tensor for name, tensor in staged.items()}
+    # Two staged tensors under one name is not a checkpoint.
+    if len(renamed) != len(staged):
+        return {}
+    merges = _build_mlx_moe_merge_plan(
+        model, renamed,
+        [_MlxRelabelledSanitizer(sanitizer, renames)
+         for sanitizer in _mlx_moe_sanitizers(model)],
+    )
+    staged_names = {proved: name for name, proved in renames.items()}
+    restored = {}
+    for target, (parts, *recipe) in merges.items():
+        parts = [staged_names.get(part, part) for part in parts]
+        # A group no rename touched was already covered by the first search.
+        if all(part not in renames for part in parts):
+            continue
+        restored[target] = (parts, *recipe)
+    return restored
+
+
+def _mlx_moe_expert_stacks(staged):
+    """Staged names alike but for one component spelling a run of experts. DBRX builds
+    each with an f-string, so no fragment stands for the index and the run identifies
+    them."""
+    runs = {}
+    for name in staged:
+        components = name.split(".")
+        for position, component in enumerate(components):
+            if component.isdigit() and str(int(component)) == component:
+                key = (".".join(components[:position]),
+                       ".".join(components[position + 1:]))
+                runs.setdefault(key, {})[int(component)] = name
+    return {key: [found[index] for index in range(len(found))]
+            for key, found in runs.items()
+            if len(found) > 1 and sorted(found) == list(range(len(found)))}
+
+
+def _mlx_moe_stack_recipes(rank, count):
+    """Every concatenation of the parts one split produced, all arranged alike: every
+    expert is split the same way, so the search stays layouts times axes rather than
+    layouts to the expert count."""
+    choices = [None] + [layout for layout in _MOE_TENSOR_LAYOUTS
+                        if max(layout) < rank]
+    for layout in choices:
+        for axis in range(rank):
+            for flattened in (True, False):
+                if flattened and (axis == 0 or axis + 1 == rank):
+                    continue
+                yield (layout,) * count, axis, flattened
+
+
+def _proved_mlx_moe_expert_stack(sanitizers, staged, heads, tail, fragment,
+                                 recipes):
+    """The rewrite one fragment proves, for every group of experts it names."""
+    stripped = fragment.strip(".")
+    if not stripped or "." in stripped:
+        return None
+    # DBRX's converter reads the fused name only without the `.weight` mlx-lm appends.
+    for trimmed in (False, True):
+        groups = {}
+        for head, parts in heads.items():
+            target = ".".join(filter(None, (head, stripped, tail)))
+            if trimmed:
+                if not target.endswith(".weight"):
+                    break
+                target = target[: -len(".weight")]
+            groups[target] = parts
+        # Short when the spelling did not apply to every head.
+        if len(groups) != len(heads):
+            continue
+        # A group cannot rebuild its own part, and the floor holds the parts out.
+        if any(target in parts for target, parts in groups.items()):
+            continue
+        for width in _MOE_MERGE_PROBE_WIDTHS:
+            for sanitizer in sanitizers:
+                for recipe, _ in _proved_mlx_moe_merge_recipe(
+                    sanitizer, staged, groups, recipes, width
+                ):
+                    if recipe is None or not any(
+                        confirmed is not None
+                        for confirmed, _ in _proved_mlx_moe_merge_recipe(
+                            sanitizer, staged, groups, [recipe], None, native=True
+                        )
+                    ):
+                        continue
+                    return {target: (parts, *recipe)
+                            for target, parts in groups.items()}
+    return None
+
+
+def _build_mlx_moe_expert_stack_plan(model, staged):
+    """Recover a checkpoint tensor a sanitizer split into one tensor per expert: DBRX's
+    parts are told apart by index, so the run of indices finds the group."""
+    sanitizers = _mlx_moe_sanitizers(model)
+    vocabulary = _mlx_sanitizer_vocabulary(sanitizers)
+    if not vocabulary:
+        return {}
+    # Grouping by the tail separates a run of expert indices from one of layer indices.
+    by_tail = {}
+    for (head, tail), parts in _mlx_moe_expert_stacks(staged).items():
+        by_tail.setdefault(tail, {})[head] = parts
+
+    plan = {}
+    for tail, heads in sorted(by_tail.items()):
+        ranks = {len(staged[part].shape) for parts in heads.values() for part in parts}
+        counts = {len(parts) for parts in heads.values()}
+        if len(ranks) != 1 or len(counts) != 1:
+            continue
+        recipes = list(_mlx_moe_stack_recipes(ranks.pop(), counts.pop()))
+        for fragment in vocabulary:
+            proved = _proved_mlx_moe_expert_stack(
+                sanitizers, staged, heads, tail, fragment, recipes
+            )
+            if proved:
+                plan.update(proved)
+                break
+    return plan
+
+
+# How many tensors one staged tensor splits back into; longer is a name table.
+_MOE_SPLIT_PARTS = 4
+
+
+def _mlx_moe_split_recipes(rank, count):
+    """Every way one staged tensor could be the concatenation of `count` parts. Both
+    directions of every axis move, unlike a merge's: a merge undoes what the sanitizer
+    did to a part it was given, a split does it to one it hands over."""
+    moves = [layout for layout in _MOE_TENSOR_LAYOUTS if max(layout) < rank]
+    # Moved layouts first, identity last: where both replay the moved one is right.
+    for layout in moves + [(after, before) for before, after in moves] + [None]:
+        for axis in range(rank):
+            yield (layout,), axis
+
+
+def _proved_mlx_moe_name_split(sanitizer, staged, source, proposals, recipes):
+    """The naming and recipe under which the sanitizer fuses parts into `source`: the
+    names are new, so what must come back is the one tensor they were built into."""
+    others = {name: mx.full(tuple(tensor.shape), float(position), dtype=mx.float32)
+              for position, (name, tensor) in enumerate(staged.items())
+              if name != source}
+    try:
+        floor = sanitizer.sanitize(dict(others))
+    except Exception:
+        return None
+    kept = {name: floor[name] for name in others if name in floor}
+
+    shape = tuple(staged[source].shape)
+    for layouts, axis in recipes:
+        for targets in proposals:
+            if shape[axis] % len(targets):
+                continue
+            part = shape[:axis] + (shape[axis] // len(targets),) + shape[axis + 1:]
+            size, seed, markers = 1, 0, []
+            for dim in part:
+                size *= dim
+            for _ in targets:
+                markers.append(mx.reshape(
+                    mx.arange(seed, seed + size, dtype=mx.float32), part))
+                seed += size
+            try:
+                expected = mx.concatenate(markers, axis=axis)
+                layout = layouts[0]
+                probe = dict(others)
+                for name, marker in zip(targets, markers):
+                    probe[name] = (marker if layout is None
+                                   else mx.moveaxis(marker, layout[0], layout[1]))
+                sanitized = sanitizer.sanitize(probe)
+            except Exception:
+                continue
+            if not _mlx_arrays_match(sanitized.get(source), expected):
+                continue
+            if any(not _mlx_arrays_match(sanitized.get(name), value)
+                   for name, value in kept.items()):
+                continue
+            return targets, layouts, axis
+    return None
+
+
+def _build_mlx_moe_name_split_plan(model, staged, claimed):
+    """Recover checkpoint tensors a sanitizer fused into one staged tensor, as glm5_next
+    does a layer's three KDA convolutions. Each part is a share of what it came from."""
+    sanitizers = _mlx_moe_sanitizers(model)
+    groups = _mlx_sanitizer_fusion_groups(sanitizers)
+    if not groups:
+        return {}
+
+    plan = {}
+    for source in sorted(staged):
+        if source in claimed or _kept_for_the_gguf_converter(source):
+            continue
+        rank = len(staged[source].shape)
+        # Names first: string work, unlike a replay.
+        proposals = []
+        for group, fragments in groups:
+            for replaced in fragments:
+                if replaced not in source or replaced in group:
+                    continue
+                targets = [source.replace(replaced, name) for name in group]
+                if len(set(targets)) != len(targets) or any(
+                    name == source or name in staged for name in targets
+                ):
+                    continue
+                if targets not in proposals:
+                    proposals.append(targets)
+        if not proposals:
+            continue
+        recipes = list(_mlx_moe_split_recipes(rank, len(proposals[0])))
+        for sanitizer in sanitizers:
+            proved = _proved_mlx_moe_name_split(
+                sanitizer, staged, source, proposals, recipes)
+            if proved is None:
+                continue
+            targets, layouts, axis = proved
+            for index, name in enumerate(targets):
+                plan[name] = ([source], layouts, axis, False, (index, len(targets)))
+            break
+    return plan
+
+
+def _mlx_moe_merge_placement(files, merges):
+    """Which shard receives each merged tensor, and which holds each part. Rewriting a
+    shard drops the parts it held, so a merge goes in the first of its parts'."""
+    owned, owner, anchors = {}, {}, {}
+    if merges:
+        consumed = {part for parts, *_ in merges.values() for part in parts}
+        for file in files:
+            for name in mx.load(str(file)):
+                if name in consumed:
+                    owner[name] = file
+        for target, recipe in merges.items():
+            anchor = min(recipe[0], key=lambda part: files.index(owner[part]))
+            owned.setdefault(owner[anchor], {})[target] = recipe
+            anchors[target] = anchor
+    return owned, owner, anchors
+
+
+def _mlx_moe_written_order(files, plan, merges, owned):
+    """Every name the rewrite writes, in the order it will be read back in. Asked, not
+    predicted: order depends on the names alone, so a file of one byte apiece answers
+    it without writing the checkpoint again."""
+    consumed = {part for parts, *_ in merges.values() for part in parts}
+    order = []
+    with tempfile.TemporaryDirectory() as directory:
+        probe = Path(directory) / "order.safetensors"
+        for file in files:
+            names = []
+            for name in mx.load(str(file)):
+                if name not in consumed:
+                    names.extend(plan.get(name) or (name,))
+            names.extend(owned.get(file, ()))
+            if not names:
+                continue
+            mx.save_safetensors(
+                str(probe), {name: mx.zeros((1,), dtype=mx.uint8) for name in names}
+            )
+            order.extend(mx.load(str(probe)))
+    return order
+
+
+def _mlx_moe_shard_merges(file, tensors, owner, owned):
+    """Every merged tensor one shard receives, built from the shards holding the parts.
+    A call, not a block, so the shards it read are released when it returns."""
+    built, loaded = {}, {}
+    for target, recipe in owned.items():
+        parts = recipe[0]
+        values = {}
+        for part_file in {owner[part] for part in parts}:
+            if part_file == file:
+                shard = tensors
+            else:
+                # Cached: one shard can anchor a merge per layer, a descriptor apiece if reopened.
+                shard = loaded.get(part_file)
+                if shard is None:
+                    shard = loaded[part_file] = mx.load(str(part_file))
+            values.update({part: shard[part] for part in parts
+                           if owner[part] == part_file})
+        built[target] = _mlx_moe_merged([values[part] for part in parts], recipe)
+    return built
+
+
+def _mlx_moe_rewritten_checkpoint(staged, plan, offsets, layouts, merges):
+    """The names and tensors the rewrite writes, or None if two collide: colliding
+    reconstructions land in different shards and the index picks by position."""
+    consumed = {part for parts, *_ in merges.values() for part in parts}
+    written = {
+        target: _mlx_moe_merged([staged[part] for part in recipe[0]], recipe)
+        for target, recipe in merges.items()
+    }
+    for name, tensor in staged.items():
+        if name in consumed:
+            continue
+        offset = offsets.get(name)
+        if offset:
+            tensor = (tensor - offset).astype(tensor.dtype)
+        layout = layouts.get(name)
+        if layout:
+            tensor = mx.moveaxis(tensor, layout[1], layout[0])
+        expert_names = plan.get(name) or (name,)
+        values = ((tensor,) if len(expert_names) == 1
+                  else [tensor[expert] for expert in range(len(expert_names))])
+        for expert_name, value in zip(expert_names, values):
+            if expert_name in written:
+                return None
+            written[expert_name] = value
+    return written
+
+
+def _confirmed_mlx_moe_rewrite(sanitizers, files, plan, offsets, layouts, merges,
+                               restored=(), owned=None):
+    """Whether replaying the whole rewrite hands the staged checkpoint back.
+
+    On the checkpoint, not markers, which bfloat16's eight bits cannot tell apart, and
+    all at once, since reconstructions proved singly need not hold together. The floor
+    is doing nothing: what the sanitizer already fails to reproduce is not the
+    rewrite's to lose, but everything the rewrite claims must come back."""
+    claimed = set(plan) | set(offsets) | set(layouts)
+    claimed.update(part for parts, *_ in merges.values() for part in parts)
+    order = _mlx_moe_written_order(files, plan, merges, owned or {})
+    for sanitizer in sanitizers:
+        floor = _mlx_moe_floor_names(sanitizer, files, claimed)
+        if floor is None:
+            continue
+        # Which written names each staged tensor accounts for, to release both early.
+        produced, required = {}, floor - set(restored)
+        for file in files:
+            for name in mx.load(str(file)):
+                produced[name] = tuple(plan.get(name) or (name,))
+        for parts, *_ in merges.values():
+            for part in parts[:-1]:
+                produced[part] = ()
+        for target, (parts, *_) in merges.items():
+            produced[parts[-1]] = (target,)
+        # Replaying reversed falsifies the assumption that sanitize reads a mapping.
+        forwards = _replayed_mlx_moe_rewrite(
+            sanitizer, files, plan, offsets, layouts, merges, produced, required,
+            order, reverse=False)
+        if forwards is _MOE_REWRITE_COLLIDES:
+            return False
+        if forwards is None:
+            continue
+        # Compared as the second replay produces it, holding one residue not both.
+        if _replayed_mlx_moe_rewrite(
+            sanitizer, files, plan, offsets, layouts, merges, produced, required,
+            order, reverse=True, mirrored=forwards
+        ) is not None:
+            return True
+    return False
+
+
+def _mlx_moe_floor_names(sanitizer, files, claimed):
+    """Every staged name the rewrite has to hand back, or None if it cannot run."""
+    required = set()
+    try:
+        floor = sanitizer.sanitize(_mlx_staged_checkpoint(files))
+        for file in files:
+            for name, tensor in mx.load(str(file)).items():
+                if name in claimed or _mlx_tensors_identical(
+                    floor.pop(name, None), tensor
+                ):
+                    required.add(name)
+                tensor = None
+    except Exception:
+        return None
+    return required
+
+
+_MOE_REWRITE_COLLIDES = object()
+
+
+def _replayed_mlx_moe_rewrite(sanitizer, files, plan, offsets, layouts, merges,
+                              produced, required, order, reverse, mirrored=None):
+    """Replay the rewritten checkpoint once, against the shards as they stand.
+
+    Answers with the residue the shards could not account for; given `mirrored` (the
+    other replay's residue), each is compared as produced. None says this replay did not
+    hand the checkpoint back, disagreed, or could not run; `_MOE_REWRITE_COLLIDES` says
+    the plan wants one name twice. Only one replay may be alive: each holds every
+    shard."""
+    try:
+        written = _mlx_moe_rewritten_checkpoint(
+            _mlx_staged_checkpoint(files), plan, offsets, layouts, merges)
+        if written is None:
+            return _MOE_REWRITE_COLLIDES
+        # Read-back order follows the rewritten names, not the staged order.
+        written = {name: written[name] for name in
+                   (reversed(order) if reverse else order) if name in written}
+        out = sanitizer.sanitize(dict(written))
+        # One at a time, dropped from every mapping holding it.
+        unaccounted = {}
+        for file in files:
+            for name, tensor in mx.load(str(file)).items():
+                replayed = out.pop(name, None)
+                if name in required:
+                    if not _mlx_tensors_identical(replayed, tensor):
+                        return None
+                elif not _kept_mlx_moe_residue(unaccounted, mirrored, name,
+                                               _mlx_tensor_held(replayed)):
+                    return None
+                tensor = replayed = None
+                for written_name in produced[name]:
+                    written.pop(written_name, None)
+        for name in list(out):
+            if not _kept_mlx_moe_residue(unaccounted, mirrored, name,
+                                         _mlx_tensor_held(out.pop(name))):
+                return None
+        # Leftovers: a name the other replay produced and this one did not.
+        if mirrored:
+            return None
+    except Exception:
+        return None
+    return unaccounted
+
+
+def _kept_mlx_moe_residue(unaccounted, mirrored, name, tensor):
+    """Hold one residue for the other replay, or hold it to what that one left. Name
+    before value: one the other replay never produced is a disagreement."""
+    if mirrored is None:
+        unaccounted[name] = tensor
+        return True
+    if name not in mirrored:
+        return False
+    return _mlx_tensors_identical(mirrored.pop(name), tensor)
+
+
+def _mlx_tensor_held(tensor):
+    """A copy owning its memory, since a replay's output can be a view of a shard."""
+    if tensor is None:
+        return None
+    held = mx.array(tensor)
+    mx.eval(held)
+    return held
+
+
+def _build_mlx_moe_rename_plan(model, staged, split_plan, exclude=()):
+    """Recover names and values a sanitizer changed, proving each by replaying it."""
+    sanitizers = _mlx_moe_sanitizers(model)
+    vocabulary = _mlx_sanitizer_vocabulary(sanitizers)
+    if not vocabulary:
+        return {}, {}, {}
+
+    # A relocated MoE block renames experts and router together.
+    claimed = {}
+    for name, expert_names in (split_plan or {}).items():
+        for expert_name in expert_names:
+            claimed[expert_name] = mx.zeros(
+                tuple(staged[name].shape)[1:], dtype=staged[name].dtype
+            )
+
+    # One cache for the whole search: every candidate re-marks the same shapes.
+    markers = {}
+
+    def replay(proposal, required=frozenset()):
+        probe = dict(proposal)
+        probe.update((name, name) for name in claimed)
+        return _mlx_moe_replayed_corrections(
+            sanitizers, probe, {**staged, **claimed}, markers, required
+        )
+
+    claimed_names = frozenset(claimed)
+
+    def produced_once(proposal):
+        """Whether every name it produces is distinct from the others and the split's:
+        two landing on one reach the replay through a single probe entry."""
+        produced = proposal.values()
+        return len(set(produced)) == len(proposal) and claimed_names.isdisjoint(produced)
+
+    # Stacked expert tensors are recovered by splitting, so hold them out here.
+    held = set(split_plan or {}) | set(exclude)
+    open_names = [name for name in staged if name not in held]
+    proposal = {name: name for name in open_names}
+    # The floor: whatever the sanitizer reproduces from the checkpoint must survive.
+    corrections = replay(proposal)
+    baseline = set(corrections)
+    for replaced, replacement in _mlx_moe_rename_candidates(vocabulary, open_names):
+        renamed = _mlx_moe_renamed(proposal.values(), replaced, replacement)
+        if not renamed:
+            continue
+        candidate = {
+            name: renamed.get(proposed, proposed)
+            for name, proposed in proposal.items()
+        }
+        recovered = {name for name, p in candidate.items() if p != name}
+        # Recovered names may be refined, never dropped: mapping one back passes by vacancy.
+        if not produced_once(candidate):
+            continue
+        if not recovered >= {name for name, p in proposal.items() if p != name}:
+            continue
+        candidate_corrections = replay(candidate, baseline - recovered)
+        # One relocation can move two ways at once (Kimi Linear), so complete on what missed.
+        unproven = (baseline | recovered) - set(candidate_corrections)
+        if unproven and unproven <= recovered:
+            candidate, candidate_corrections = _completed_mlx_moe_rename_candidate(
+                candidate, candidate_corrections, unproven, vocabulary, replay
+            )
+            if not produced_once(candidate):
+                continue
+            recovered = {name for name, p in candidate.items() if p != name}
+        # `recovered` stops a name the sanitizer drops being renamed on no evidence.
+        if set(candidate_corrections) >= baseline | recovered:
+            proposal, corrections = candidate, candidate_corrections
+    # Where several spellings replay alike, prefer the loaded checkpoint's namespace.
+    restored = {name: _GGUF_TEXT_TOWER_NAMESPACE + renamed[len("language_model"):]
+                for name, renamed in proposal.items()
+                if _mlx_moe_dropped_the_gguf_namespace_in_the_tower(name, renamed)}
+    if restored:
+        candidate = {**proposal, **restored}
+        recovered = {name for name, p in candidate.items() if p != name}
+        candidate_corrections = replay(candidate, set(corrections) - recovered)
+        # Against what the search settled on: the floor is met by construction.
+        if (produced_once(candidate)
+                and set(candidate_corrections) >= set(corrections) | recovered):
+            proposal, corrections = candidate, candidate_corrections
+    constants = {name: constant for name, (constant, _) in corrections.items() if constant}
+    layouts = {name: layout for name, (_, layout) in corrections.items() if layout}
+    renames = {name: p for name, p in proposal.items() if p != name}
+    return renames, constants, layouts
+
+
+# The per-layer projections llama.cpp maps under `model.layers.{bid}.`, as mlx-lm
+# spells them. Deliberately wider than any one architecture needs.
+_GGUF_MAPPED_LAYER_LEAVES = frozenset((
+    "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
+    "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj",
+))
+
+
+def _kept_for_the_gguf_converter(name):
+    """Whether this is a name the rewrite leaves alone.
+
+    Exactness would need llama.cpp's own per-architecture table, so this reads the HF
+    layer prefix and errs towards keeping: taking away a name the converter reads
+    breaks a working export (mlx-lm rebuilds dense Hunyuan's `mlp.gate_and_up_proj`)."""
+    parts = name.split(".")
+    return (len(parts) > 4 and parts[0] == "model" and parts[1] == "layers"
+            and parts[2].isdigit()
+            and ".".join(parts[3:-1]) in _GGUF_MAPPED_LAYER_LEAVES)
+
+
+def _mlx_staged_checkpoint(files):
+    """Every staged tensor, read afresh from the shards."""
+    staged = {}
+    for file in files:
+        staged.update(mx.load(str(file)))
+    return staged
+
+
+def _mlx_staged_tensor_stubs(files):
+    # Planning never reads a value, so stand-ins let each shard close again.
+    staged = {}
+    for file in files:
+        for name, tensor in mx.load(str(file)).items():
+            staged[name] = mx.zeros(tensor.shape, dtype=tensor.dtype)
+    return staged
+
+
+def _plan_mlx_moe_gguf_rewrite(model, files, source_norm_offsets=None,
+                               source_layouts=()):
+    staged = _mlx_staged_tensor_stubs(files)
+    stacked = _mlx_stacked_expert_tensor_names(model, staged)
+    # A block relocation shows as ordinary renames on its router and shared experts.
+    parents = _mlx_moe_parent_substitutions(
+        _build_mlx_moe_rename_plan(model, staged, None, exclude=stacked)[0]
+    )
+    # Architectures llama.cpp already maps stacked (Llama 4) have no names to recover.
+    split = (
+        _build_mlx_moe_expert_unstack_plan(model, stacked, staged, parents)
+        if stacked
+        else None
+    )
+    # Split tensors have no staged counterpart to rename: rebuild first, then exclude.
+    merges = _build_mlx_moe_expert_stack_plan(model, staged)
+    merges.update(_build_mlx_moe_merge_plan(model, staged))
+    consumed = {part for parts, *_ in merges.values() for part in parts}
+    renames, offsets, layouts = _build_mlx_moe_rename_plan(
+        model, staged, split, exclude=consumed
+    )
+    # Splitting plus relocating needs the relocation proved first.
+    late = _build_mlx_moe_renamed_merge_plan(model, staged, renames)
+    # A part enters its merge as the checkpoint holds it, so drop its own rename.
+    for parts, *_ in late.values():
+        for part in parts:
+            renames.pop(part, None)
+            offsets.pop(part, None)
+            layouts.pop(part, None)
+    merges.update(late)
+    # A fused tensor has no staged counterpart, so drop its rename: parts carry it now.
+    fused = _build_mlx_moe_name_split_plan(
+        model, staged,
+        set(merges) | {part for parts, *_ in merges.values() for part in parts}
+        | set(split or {}))
+    for parts, *_ in fused.values():
+        for part in parts:
+            renames.pop(part, None)
+            offsets.pop(part, None)
+            layouts.pop(part, None)
+    merges.update(fused)
+    plan = dict(split or {})
+    # A rename is a one-name split, so the rewrite below needs no second path.
+    plan.update((name, [renamed]) for name, renamed in renames.items())
+    # Never subtract twice from what the source measurement already covered.
+    offsets = {
+        name: constant
+        for name, constant in offsets.items()
+        if name not in (source_norm_offsets or {})
+    }
+    # Nor move an axis the pass before this one already moved back.
+    layouts = {name: layout for name, layout in layouts.items()
+               if name not in (source_layouts or ())}
+    # Never take away a name the converter already reads.
+    plan = {name: names for name, names in plan.items()
+            if not _kept_for_the_gguf_converter(name)}
+    merges = {target: recipe for target, recipe in merges.items()
+              if not any(_kept_for_the_gguf_converter(part) for part in recipe[0])}
+    return plan, offsets, layouts, merges
+
+
+def _prepare_moe_gguf_export_directory(
+    path, model=None, source_norm_offsets=_UNMEASURED, source_layouts=()
+):
+    """Restore the MoE tensor names and values llama.cpp converters read."""
+    path = Path(path)
+    files = sorted(path.glob("*.safetensors"))
+    # One shared measurement, so the two passes cannot disagree about the source.
+    if source_norm_offsets is _UNMEASURED:
+        source_norm_offsets = _mlx_sanitizer_norm_offsets(model)
+    plan, offsets, layouts, merges = _plan_mlx_moe_gguf_rewrite(
+        model, files, source_norm_offsets, source_layouts
+    )
+    if not plan and not merges and not offsets and not layouts:
+        return 0
+
+    owned, owner, anchors = _mlx_moe_merge_placement(files, merges)
+    if not _confirmed_mlx_moe_rewrite(
+        _mlx_moe_sanitizers(model), files, plan, offsets, layouts, merges,
+        source_norm_offsets or {}, owned,
+    ):
+        return 0
+
+    name_map = {}
+    consumed = {part: target for target, (parts, *_) in merges.items() for part in parts}
+    # A split's anchor collects its targets; otherwise the index loses all but one.
+    for target, anchor in sorted(anchors.items()):
+        name_map[anchor] = name_map.get(anchor, ()) + (target,)
+    for target, anchor in sorted(anchors.items()):
+        for part in merges[target][0]:
+            if part != anchor and part not in name_map:
+                name_map[part] = ()
+
+    for file in files:
+        # One shard at a time: the mx.eval below materializes all of it.
+        tensors = mx.load(str(file))
+        if file not in owned and not any(
+            name in plan or name in offsets or name in layouts or name in consumed
+            for name in tensors
+        ):
+            continue
+        updated = _mlx_moe_shard_merges(file, tensors, owner, owned.get(file, {}))
+        for name, tensor in tensors.items():
+            if name in consumed:
+                continue
+            offset = offsets.get(name)
+            if offset:
+                tensor = (tensor - offset).astype(tensor.dtype)
+            layout = layouts.get(name)
+            if layout:
+                tensor = mx.moveaxis(tensor, layout[1], layout[0])
+            expert_names = plan.get(name)
+            if expert_names is None:
+                updated[name] = tensor
+                if offset or layout:
+                    name_map[name] = (name,)
+                continue
+            if len(expert_names) == 1:
+                updated[expert_names[0]] = tensor
+            else:
+                for expert, expert_name in enumerate(expert_names):
+                    updated[expert_name] = tensor[expert]
+            name_map[name] = expert_names
+        # mx.load() arrays may be file-backed: write beside the source and replace.
+        mx.eval(*updated.values())
+        tmp_file = file.with_name(f"{file.stem}.tmp{file.suffix}")
+        mx.save_safetensors(str(tmp_file), updated, metadata={"format": "mlx"})
+        os.replace(tmp_file, file)
+        del updated, tensors
+
+    index_path = path / "model.safetensors.index.json"
+    if name_map and index_path.exists():
+        with open(index_path, "r") as f:
+            index_data = json.load(f)
+        weight_map = {}
+        for name, shard in index_data.get("weight_map", {}).items():
+            for expert_name in name_map.get(name, (name,)):
+                weight_map[expert_name] = shard
+        index_data["weight_map"] = dict(sorted(weight_map.items()))
+        with open(index_path, "w") as f:
+            json.dump(index_data, f, indent=4)
+
+    return len(name_map)
 
 
 _CORE_SAVE_FILENAMES = {
@@ -14227,6 +18130,158 @@ _MODEL_WEIGHT_SUFFIXES = (
 _MODEL_SIDECAR_SUFFIXES = (".json", ".jinja", ".model", ".txt", ".py")
 
 
+def _asset_link_stays_in_the_model(file, source):
+    """Refuse a sidecar symlink that points outside the model it came from.
+
+    A writable model directory is otherwise enough to aim `generation_config.json`
+    at a credential file and have the save dereference it into an adapter that is
+    then published. A Hugging Face snapshot is itself a tree of symlinks into a
+    sibling `blobs/` directory, so the allowed root is the cache repo directory
+    when the source sits under `snapshots/<sha>`, not the source alone.
+    """
+    try:
+        if not file.is_symlink():
+            return True
+        source = Path(source).resolve()
+        roots = [source]
+        for parent in (source, *source.parents):
+            if parent.name == "snapshots":
+                roots.append(parent.parent)
+                # huggingface_hub >= 1.32 shares Xet blobs cache-wide in <cache>/blobs.
+                roots.append(parent.parent.parent / "blobs")
+                break
+        target = file.resolve()
+        return any(target.is_relative_to(root) for root in roots)
+    except OSError:
+        return False
+
+
+def _save_vlm_processor_assets(processor, path, sources=()):
+    path = Path(path)
+    failures = []
+    saved = set()
+    asset_names = set()
+    recovered = []
+
+    def valid_asset(file):
+        try:
+            if not file.is_file():
+                return False
+            if file.suffix == ".json":
+                json.loads(file.read_text())
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def copy_assets(source, overwrite=False, source_only=False, complete=True):
+        for file in Path(source).rglob("*"):
+            relative = file.relative_to(source)
+            if not file.is_file() or file.suffix in _MODEL_WEIGHT_SUFFIXES:
+                continue
+            if any(part.startswith(".") for part in relative.parts):
+                continue
+            if file.resolve().is_relative_to(path.resolve()):
+                continue
+            if not _asset_link_stays_in_the_model(file, source):
+                failures.append(f"{relative}: symlink leaves the model directory")
+                continue
+            if file.name in _CORE_SAVE_FILENAMES or file.name == "adapter_config.json":
+                continue
+            if file.name.startswith(("model-", "pytorch_model")):
+                continue
+            if source_only and file.suffix not in _MODEL_SIDECAR_SUFFIXES and file.name not in asset_names:
+                continue
+            if not complete and file.suffix != ".json":
+                continue
+            target = path / relative
+            if relative in saved or (
+                not overwrite and target.suffix == ".json" and valid_asset(target)
+            ):
+                continue
+            try:
+                if file.suffix == ".json":
+                    json.loads(file.read_text())
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(file, target)
+                saved.add(relative)
+                if source_only:
+                    recovered.append(str(relative))
+            except Exception as error:
+                failures.append(f"{relative}: {error}")
+
+    def save_component(component, overwrite=True):
+        vocab_files = getattr(component, "vocab_files_names", None)
+        if isinstance(vocab_files, dict):
+            asset_names.update(Path(name).name for name in vocab_files.values() if isinstance(name, str))
+        save = getattr(component, "save_pretrained", None)
+        if not callable(save):
+            return False
+        success = True
+        try:
+            with tempfile.TemporaryDirectory() as staging:
+                try:
+                    save(staging)
+                except Exception as error:
+                    failures.append(f"{type(component).__name__}: {error}")
+                    success = False
+                # Only JSON can be validated after an interrupted writer.
+                copy_assets(staging, overwrite=overwrite, complete=success)
+        except Exception as error:
+            failures.append(f"{type(component).__name__}: {error}")
+            success = False
+        return success
+
+    native_saved = save_component(processor, overwrite=True)
+    if not native_saved:
+        if not failures:
+            failures.append(f"{type(processor).__name__} has no save_pretrained")
+    # Some processors' save methods omit components or are entirely no-ops.
+    names = ("tokenizer", "image_processor", "feature_extractor")
+    names += tuple(getattr(processor, "attributes", ()) or ())
+    seen = {id(processor)}
+    for name in names:
+        component = getattr(processor, name, None)
+        if component is not None and id(component) not in seen:
+            seen.add(id(component))
+            save_component(component)
+
+    # A clean legacy save omits processor_config.json on purpose; only a failed one is rebuilt.
+    if (not native_saved and Path("processor_config.json") not in saved
+            and callable(getattr(processor, "to_dict", None))):
+        def serialize_component(value):
+            to_dict = getattr(value, "to_dict", None)
+            if callable(to_dict):
+                return to_dict()
+            raise TypeError(f"{type(value).__name__} has no JSON serialization")
+
+        try:
+            payload = json.dumps(processor.to_dict(), default=serialize_component, indent=2)
+            (path / "processor_config.json").write_text(payload, encoding="utf-8")
+            saved.add(Path("processor_config.json"))
+        except Exception as error:
+            failures.append(f"processor_config.json: {error}")
+
+    for source in sources:
+        if source is None:
+            continue
+        try:
+            source = Path(source)
+            copy_assets(source, source_only=True)
+            config = source / "config.json"
+            target = path / "config.json"
+            if (config.is_file() and not valid_asset(target)
+                    and _asset_link_stays_in_the_model(config, source)):
+                json.loads(config.read_text())
+                shutil.copy2(config, target)
+        except Exception as error:
+            failures.append(f"processor source: {error}")
+    if failures:
+        print("Unsloth: Adapter saved; processor assets recovered where available: "
+              + "; ".join(dict.fromkeys(failures)))
+        if recovered:
+            print("Unsloth: copied processor source assets: " + ", ".join(recovered))
+
+
 def _copy_source_sidecars(src_path, path):
     """Copy non-weight source sidecars that tokenizer/model saves may omit."""
     copied = 0
@@ -14246,6 +18301,9 @@ def _copy_source_sidecars(src_path, path):
         if suffix in _MODEL_WEIGHT_SUFFIXES:
             continue
         if suffix not in _MODEL_SIDECAR_SUFFIXES:
+            continue
+        if not _asset_link_stays_in_the_model(source, src_path):
+            print(f"Unsloth: skipped {name}: symlink leaves the model directory")
             continue
         target = path / name
         if target.exists():
@@ -14276,7 +18334,189 @@ def _fuse_mlx_module(module, dequantize):
         return fuse(dequantize=dequantize)
     return fuse()
 
-def save_merged_model(model, tokenizer, path, dequantize=False):
+def _model_has_quantized_module(model):
+    import mlx.nn as nn
+
+    quantized_types = [nn.QuantizedLinear, nn.QuantizedEmbedding]
+    try:
+        from mlx_lm.models.switch_layers import QuantizedSwitchLinear
+        quantized_types.append(QuantizedSwitchLinear)
+    except Exception:
+        pass
+    quantized_types = tuple(t for t in quantized_types if isinstance(t, type))
+
+    def _is_quantized(module):
+        if isinstance(module, quantized_types):
+            return True
+        # MLA's QuantizedMultiLinear and the distributed Quantized*Linear
+        # subclass none of the above; missing one writes quantized tensors
+        # with no metadata to load them by.
+        if type(module).__name__.startswith("Quantized"):
+            return True
+        # mlx.nn's QQLinear is neither: not a subclass, not Quantized*-named.
+        # Ask for a packed weight rather than just the attributes, so a module
+        # that merely carries bits/group_size cannot suppress the quantize.
+        # save_merged_model has already called .eval(), which is when QQLinear
+        # holds its weights packed.
+        if hasattr(module, "bits") and hasattr(module, "group_size"):
+            weight = getattr(module, "weight", None)
+            return weight is not None and weight.dtype == mx.uint32
+        return False
+
+    return any(_is_quantized(module) for _, module in model.named_modules())
+
+
+# The loader's runtime-quantization defaults, so save- and load-quantized models
+# land on the same grid.
+_MERGED_SAVE_QUANT_BITS = 4
+_MERGED_SAVE_QUANT_GROUP_SIZE = 64
+_MERGED_SAVE_QUANT_MODE = "affine"
+
+
+def _merged_save_cast_dtypes():
+    try:
+        from mlx_lm.convert import MODEL_CONVERSION_DTYPES
+        return tuple(MODEL_CONVERSION_DTYPES)
+    except Exception:
+        return ("float16", "bfloat16", "float32")
+
+
+def _merged_save_cast_dtype(config):
+    """The checkpoint dtype, as ``mlx_lm.convert`` resolves it.
+
+    Both spellings: mlx-lm reads only ``torch_dtype``, but transformers >= 4.56
+    writes plain ``dtype``, which would otherwise get no cast at all.
+    """
+    if not isinstance(config, dict):
+        return None
+    candidates = [config.get("torch_dtype"), config.get("dtype")]
+    for nested_key in ("text_config", "thinker_config"):
+        nested = config.get(nested_key)
+        if isinstance(nested, dict):
+            candidates += [nested.get("torch_dtype"), nested.get("dtype")]
+    allowed = _merged_save_cast_dtypes()
+    for name in candidates:
+        if isinstance(name, str) and name in allowed:
+            return getattr(mx, name, None)
+    return None
+
+
+def _cast_merged_model_to_config_dtype(model, config):
+    """Cast floating parameters to the config dtype, as ``mlx_lm.convert`` does
+    before quantizing: ``full_finetuning=True`` trains in float32, which would
+    otherwise leave float32 scales, norms and embeddings in a "4-bit" file.
+    """
+    from mlx.utils import tree_map_with_path
+
+    dtype = _merged_save_cast_dtype(config)
+    if dtype is None:
+        return model
+    cast_predicate = getattr(model, "cast_predicate", None)
+
+    def _set_dtype(key, value):
+        if cast_predicate is not None and not cast_predicate(key):
+            return value
+        if mx.issubdtype(value.dtype, mx.floating) and value.dtype != dtype:
+            return value.astype(dtype)
+        return value
+
+    model.update(tree_map_with_path(_set_dtype, model.parameters()))
+    return model
+
+
+def _quantize_merged_model_for_save(model):
+    """Quantize an unquantized merged model so ``merged_4bit`` really is 4-bit.
+
+    ``LoRALinear.fuse(dequantize=False)`` requantizes only an already-quantized
+    base, so ``load_in_16bit`` / ``full_finetuning`` used to write full precision
+    silently. Uses the loader's predicate, not a bare ``nn.quantize``, so the
+    artifact matches a model quantized at load time (embeddings / lm_head skipped).
+    """
+    from mlx_lm.utils import quantize_model
+    from .loader import _MLXQuantizationSpec, _compose_mlx_quant_predicate
+
+    spec = _MLXQuantizationSpec(
+        enabled=True,
+        bits=_MERGED_SAVE_QUANT_BITS,
+        group_size=_MERGED_SAVE_QUANT_GROUP_SIZE,
+        mode=_MERGED_SAVE_QUANT_MODE,
+        source="merged_4bit_save",
+    )
+    predicate = _compose_mlx_quant_predicate(model, spec, is_vlm=False)
+    config = _get_model_config(model) or {}
+    # Any grid here is stale. Kept, quantize_model() emits per-layer entries
+    # with no top-level group_size (reload raises KeyError), or copies a
+    # populated one verbatim over tensors that do not use it.
+    config = _strip_mlx_quantization_metadata(config)
+    model = _cast_merged_model_to_config_dtype(model, config)
+    model, updated_config = quantize_model(
+        model,
+        config,
+        group_size=_MERGED_SAVE_QUANT_GROUP_SIZE,
+        bits=_MERGED_SAVE_QUANT_BITS,
+        mode=_MERGED_SAVE_QUANT_MODE,
+        quant_predicate=predicate,
+    )
+    if not _model_has_quantized_module(model):
+        # quantize_model() writes the grid from its arguments, not from what
+        # it converted, so dimensions incompatible with the group size would
+        # label a full-precision checkpoint 4-bit.
+        model._config = _strip_mlx_quantization_metadata(updated_config)
+        print(
+            "Unsloth: save_method='merged_4bit' could not quantize any layer of "
+            "this model (no layer is compatible with "
+            f"group_size={_MERGED_SAVE_QUANT_GROUP_SIZE}), so it is saved at "
+            "full precision, without quantization metadata."
+        )
+        return model
+    model._config = updated_config
+    print(
+        f"Unsloth: quantizing the merged model to "
+        f"{_MERGED_SAVE_QUANT_BITS}-bit "
+        f"(group_size={_MERGED_SAVE_QUANT_GROUP_SIZE}, "
+        f"mode={_MERGED_SAVE_QUANT_MODE!r}) for save_method='merged_4bit'."
+    )
+    return model
+
+
+_ABSENT = object()
+
+
+def _snapshot_mlx_model_state(model):
+    """Everything needed to undo a save-time cast + quantize on a live model.
+
+    Nothing is copied, but pinning the tree holds the originals alongside the
+    cast and quantized copies, so the save peaks higher.
+    """
+    return (model.leaf_modules(), model.parameters(),
+            getattr(model, "_config", _ABSENT))
+
+
+def _restore_mlx_model_state(model, snapshot):
+    """Put the live model back the way the caller handed it over.
+
+    Otherwise a ``merged_4bit`` save leaves the session holding a 4-bit model: a
+    later ``merged_16bit`` export writes weights dequantized from 4-bit, and
+    training continues on quantized layers. The LoRA fuse is deliberate and stays.
+    """
+    leaf_modules, parameters, config = snapshot
+    model.update_modules(leaf_modules)
+    model.update(parameters)
+    if config is _ABSENT:
+        # Quantizing assigns `_config` unconditionally, so a model that had
+        # none must lose it again or the next save writes 4-bit metadata over
+        # full-precision weights. delattr: mlx Modules subclass dict.
+        try:
+            delattr(model, "_config")
+        except AttributeError:
+            pass
+    else:
+        model._config = config
+    mx.clear_cache()
+
+
+def save_merged_model(model, tokenizer, path, dequantize=False,
+                      quantize_unquantized=False):
     """Fuse LoRA weights and save the full merged model.
 
     Produces an HF-compatible directory with sharded safetensors,
@@ -14289,14 +18529,19 @@ def save_merged_model(model, tokenizer, path, dequantize=False):
         path: Directory to save merged model.
         dequantize: If True, dequantize quantized layers when fusing
             (saves as fp16/bf16 — needed for GGUF). If False, keep the
-            base quantization (smaller checkpoint, only meaningful when
-            the base was quantized).
+            base quantization.
+        quantize_unquantized: If True and nothing in the model is quantized,
+            quantize the merged weights before writing. Set only by
+            ``save_method='merged_4bit'``, never inferred from
+            ``dequantize=False`` -- that is also ``push_to_hub_merged``'s
+            default, which must keep the model's existing precision.
     """
     from mlx_lm.utils import save_model, create_model_card, dequantize_model
     from mlx.utils import tree_unflatten
 
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
+    restore_after_save = None
 
     # Fuse LoRA weights into base model (mlx-lm pattern)
     model.eval()
@@ -14309,18 +18554,53 @@ def save_merged_model(model, tokenizer, path, dequantize=False):
         model.update_modules(tree_unflatten(fused_linears))
 
     if dequantize:
+        unpacked = _unpack_hadamard_modules(model)
         model = dequantize_model(model)
-        cfg = getattr(model, "_config", None)
+        # Rewrite what is saved: it may resolve from `model.config` or `model.args`.
+        cfg = _get_model_config(model)
         if isinstance(cfg, dict):
             model._config = _strip_mlx_quantization_metadata(cfg)
+            if unpacked:
+                model._config = _dense_hadamard_pack_config(model._config)
+    elif quantize_unquantized and not _model_has_quantized_module(model):
+        # The fuse had nothing to requantize: quantize now or say so, but
+        # never write full precision in silence.
+        if _is_vlm_model(model) or _has_vision_config(_get_model_config(model)):
+            print(
+                "Unsloth: save_method='merged_4bit' on an unquantized VLM is "
+                "not supported yet — saving at full precision instead. Load "
+                "the VLM quantized (the default) to get a 4-bit merge."
+            )
+            # A surviving grid would label this full-precision artifact 4-bit.
+            # Strip what is actually saved: _get_model_config may resolve from
+            # `model.config` or `model.args`, not just `_config`.
+            cfg = _get_model_config(model)
+            if isinstance(cfg, dict):
+                model._config = _strip_mlx_quantization_metadata(cfg)
+        else:
+            # Quantizing rewrites the caller's live model; snapshot it before
+            # the try, restore even when the quantize is what fails.
+            restore_after_save = _snapshot_mlx_model_state(model)
 
-    de_lora_model = model
+    # `model` is rebound below; this is what the caller still holds.
+    caller_model = model
 
-    # Save sharded safetensors + index.json
-    save_model(path, de_lora_model, donate_model=False)
+    try:
+        if restore_after_save is not None:
+            model = _quantize_merged_model_for_save(model)
 
-    # Save config.json
-    config = _get_model_config(model)
+        de_lora_model = model
+
+        # Save sharded safetensors + index.json
+        save_model(path, de_lora_model, donate_model=False)
+
+        # Save config.json
+        config = _get_model_config(model)
+    finally:
+        if restore_after_save is not None:
+            _restore_mlx_model_state(caller_model, restore_after_save)
+            restore_after_save = None
+
     if config:
         is_vlm = _is_vlm_model(model) or _has_vision_config(config)
         _save_mlx_config(
@@ -14329,14 +18609,12 @@ def save_merged_model(model, tokenizer, path, dequantize=False):
             is_vlm=is_vlm,
         )
 
-    # Save tokenizer
     tokenizer.save_pretrained(str(path))
 
     src_path = _get_src_path(model)
     if src_path is not None:
         _copy_source_sidecars(src_path, path)
 
-    # Model card
     hf_repo = getattr(model, "_hf_repo", None)
     try:
         create_model_card(path, hf_repo)
@@ -14564,7 +18842,10 @@ def save_pretrained_merged(
             - ``"merged_16bit"``: fuse LoRA into base, dequantize, save full
               fp16/bf16 model. Needed for GGUF / llama.cpp downstream.
             - ``"merged_4bit"``: fuse LoRA into base while keeping the
-              base's 4-bit quantization. Only meaningful for QLoRA.
+              base's 4-bit quantization, or quantize the merged weights to
+              4-bit when the base was loaded unquantized (``load_in_16bit``
+              or ``full_finetuning``). Unquantized VLMs are saved at full
+              precision with a notice; quantizing those is not supported yet.
         push_to_hub: If True, upload to HuggingFace Hub after saving.
         token: HuggingFace token for pushing.
         private: Whether the HF repo should be private.
@@ -14626,6 +18907,7 @@ def save_pretrained_merged(
         save_merged_model(
             model, tokenizer, save_directory,
             dequantize=(method == "merged_16bit"),
+            quantize_unquantized=(method == "merged_4bit"),
         )
 
     if push_to_hub:
@@ -14658,9 +18940,49 @@ def save_pretrained_merged(
             )
 
 
-def _install_llama_cpp_macos(llama_cpp_folder="llama.cpp"):
+def _is_trusted_local_llama_cpp_dir(llama_cpp_folder):
+    """Whether we may `pip install` a package out of this llama.cpp checkout.
+
+    Installing a local directory runs its build backend, so only a checkout we
+    manage (~/.unsloth) or one the operator named via UNSLOTH_LLAMA_CPP_PATH
+    qualifies. A CWD-relative ./llama.cpp does not: the working directory is not
+    always the operator's, and gguf is on the package index anyway.
+    """
+    from unsloth_zoo.llama_cpp import UNSLOTH_HOME
+
+    def _canonical(path):
+        # realpath so a symlinked home (or macOS' /tmp -> /private/tmp) compares
+        # equal; normcase so Windows' case-insensitive paths do too.
+        return os.path.normcase(os.path.realpath(path))
+
+    def _contains(parent, child):
+        parent = _canonical(parent)
+        # Trailing separator: "~/.unsloth-evil" is not inside "~/.unsloth".
+        # join(parent, "") keeps a root parent as "/" rather than "//".
+        return child == parent or child.startswith(os.path.join(parent, ""))
+
+    try:
+        real_folder = _canonical(llama_cpp_folder)
+        if _contains(UNSLOTH_HOME, real_folder): return True
+        # Raw and stripped: LLAMA_CPP_DEFAULT_DIR uses the variable verbatim
+        # while Studio strips it, so both spellings must read as trusted.
+        raw = os.environ.get("UNSLOTH_LLAMA_CPP_PATH") or ""
+        for operator_path in (raw, raw.strip()):
+            if operator_path and _contains(operator_path, real_folder): return True
+    except Exception:
+        # Untrusted on any error; the index fallback still installs gguf.
+        pass
+    return False
+
+
+def _install_llama_cpp_macos(llama_cpp_folder=None):
     """Install llama.cpp on macOS by cloning and building with cmake."""
     import subprocess
+    if llama_cpp_folder is None:
+        # The managed checkout, not a CWD-relative "llama.cpp", so we never build
+        # or install out of whatever sits in the working directory.
+        from unsloth_zoo.llama_cpp import LLAMA_CPP_DEFAULT_DIR
+        llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR
 
     def _clone():
         print("Unsloth: Cloning llama.cpp...")
@@ -14698,9 +19020,11 @@ def _install_llama_cpp_macos(llama_cpp_folder="llama.cpp"):
         shutil.rmtree(llama_cpp_folder, ignore_errors=True)
         _clone()
 
-    # Install deps; prefer gguf from the cloned repo to stay in sync
+    # Install deps; prefer gguf from the cloned repo to stay in sync, but only
+    # from a trusted checkout. Otherwise take the index copy, which keeps the
+    # export working without building an unvetted local package.
     gguf_py_dir = os.path.join(llama_cpp_folder, "gguf-py")
-    if os.path.exists(gguf_py_dir):
+    if os.path.exists(gguf_py_dir) and _is_trusted_local_llama_cpp_dir(llama_cpp_folder):
         subprocess.run(
             [sys.executable, "-m", "pip", "install", gguf_py_dir,
              "protobuf", "sentencepiece"],
@@ -14756,7 +19080,6 @@ def _install_llama_cpp_macos(llama_cpp_folder="llama.cpp"):
         "llama.cpp cmake build",
     )
 
-    # Copy binaries to llama.cpp root
     bin_dir = os.path.join(build_dir, "bin")
     if os.path.exists(bin_dir):
         import glob as globmod
@@ -14766,12 +19089,133 @@ def _install_llama_cpp_macos(llama_cpp_folder="llama.cpp"):
     print("Unsloth: llama.cpp installed successfully.")
 
 
+# Markers naming a repackaging, not a different model. The imatrix is published against the base,
+# so these peel one per match, repeatedly, after the verbatim name is tried: -unsloth-bnb-4bit
+# goes all the way down. \d+-?bit covers both spellings mlx-community uses (-4bit and -4-bit).
+_REPACKAGED_MODEL_SUFFIX = re.compile(
+    r"-(?:\d+-?bit|int\d+|bf16|fp16|f16|fp8|mxfp4|float16|float32|mlx|awq|gptq|hqq|bnb|unsloth)$",
+    re.IGNORECASE,
+)
+
+
+def _exported_gguf_files(save_directory, imatrix_source=None):
+    """The *.gguf files this export produced, excluding a caller-supplied imatrix.
+
+    imatrix_file may point inside save_directory. It is copied out before use, but the original
+    stays put, and both the summary and the Hub upload glob save_directory, so without this it
+    would be published as though it were an exported model.
+    """
+    files = sorted(Path(save_directory).glob("*.gguf"))
+    if imatrix_source is None:
+        return files
+    return [f for f in files if not _is_same_file(f, imatrix_source)]
+
+
+def _is_same_file(a, b):
+    """True when two paths name one file, asked of the filesystem rather than of the strings.
+
+    The on-disk spelling is the filesystem's to choose: a case-insensitive mount folds case, APFS
+    stores NFD, and a symlink defeats equality outright. The fallback covers a path already gone.
+    """
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        a, b = os.path.abspath(str(a)), os.path.abspath(str(b))
+        norm = lambda p: unicodedata.normalize("NFC", os.path.normcase(p))
+        return norm(a) == norm(b)
+
+
+def _gguf_imatrix_repo_candidates(model):
+    """unsloth/<base>-GGUF repo ids that may ship an upstream imatrix for this model."""
+    repos = []
+    sources = (
+        getattr(model, "_hf_repo", None),
+        # Text models keep their config as a dict in _config; VLMs expose an object as .config.
+        _config_get(getattr(model, "_config", None), "_name_or_path"),
+        _config_get(getattr(model, "config", None), "_name_or_path"),
+    )
+    for raw in sources:
+        name = str(raw or "").strip()
+        if not name or os.path.isdir(name):
+            continue
+        if name.endswith("-GGUF"):
+            stems = [name]
+        else:
+            stem = name.split("/")[-1]
+            stems = [stem]
+            while True:
+                stripped = _REPACKAGED_MODEL_SUFFIX.sub("", stems[-1])
+                if stripped == stems[-1] or not stripped:
+                    break
+                stems.append(stripped)
+            stems = [f"unsloth/{s}-GGUF" for s in stems]
+        for repo in stems:
+            if repo not in repos:
+                repos.append(repo)
+    return repos
+
+
+_GGUF_SHARD_SUFFIX = re.compile(r"-\d{5}-of-\d{5}\.gguf$", re.IGNORECASE)
+
+
+def _gguf_shard_family(first_file, produced_files):
+    """`first_file` plus the shards llama.cpp wrote for the same `--outfile`.
+
+    A vision projector is a separate `--outfile` and so carries a different stem.
+    Grouping by stem keeps it out without pattern-matching filenames, which would
+    misfire on a model legitimately named `example-mmproj-model`.
+    """
+    def shard_stem(path):
+        name = os.path.basename(path)
+        match = _GGUF_SHARD_SUFFIX.search(name)
+        return name[: match.start()] if match else None
+
+    stem = shard_stem(first_file)
+    if stem is None:
+        return [first_file]
+    return [f for f in produced_files if shard_stem(f) == stem]
+
+
+_GGUF_FULL_PRECISION_TYPES = ("bf16", "f16", "f32")
+_GGUF_QUANT_ALIASES = {
+    "not_quantized": "bf16",
+    "fast_quantized": "q8_0",
+    "quantized": "q4_k_m",
+    None: "q8_0",
+}
+
+
+def _normalize_gguf_quantization_methods(quantization_method):
+    """(ordered unique lower-case llama.cpp types, whether a list/tuple was passed).
+
+    Folded because outputs are `{base}.{TYPE}.gguf`: "BF16" and "bf16" are one file."""
+    is_list = isinstance(quantization_method, (list, tuple))
+    methods = list(quantization_method) if is_list else [quantization_method]
+    if not methods:
+        raise ValueError("Unsloth: quantization_method was an empty list.")
+    resolved = []
+    for method in methods:
+        if method is not None:
+            if not isinstance(method, str):
+                raise TypeError(
+                    "Unsloth: quantization_method must be a string or a list/tuple of "
+                    f"strings - got {type(method).__name__}."
+                )
+            method = method.strip().lower()
+            if not method:
+                raise ValueError("Unsloth: quantization_method contained an empty name.")
+        resolved.append(_GGUF_QUANT_ALIASES.get(method, method))
+    return list(dict.fromkeys(resolved)), is_list
+
+
 def save_pretrained_gguf(
     model,
     tokenizer,
     save_directory,
     quantization_method="fast_quantized",
     first_conversion=None,
+    token=None,
+    imatrix_file=None,
 ):
     """Save LoRA-fused model in GGUF format for llama.cpp inference.
 
@@ -14792,42 +19236,102 @@ def save_pretrained_gguf(
             "quantized" - q4_k_m (small, fast inference)
             Or any llama.cpp quant type: q2_k, q3_k_m, q4_k_m, q5_k_m,
             q6_k, q8_0, f16, bf16, f32, etc.
+            A list/tuple, e.g. ``["q4_k_m", "q8_0"]``, emits one GGUF per
+            type from a single merge + convert.
         first_conversion: Optional override for the intermediate GGUF
             dtype produced by convert_hf_to_gguf before llama-quantize
             compresses it to ``quantization_method``. Pass ``"f32"`` /
-            ``"f16"`` / ``"bf16"`` to force a specific intermediate
+            ``"f16"`` / ``"bf16"`` to force a specific intermediate.
+            Default: a lone full-precision target directly, f32 if f32 is
+            among the targets, else bf16.
+        token: HuggingFace token for reading the upstream imatrix.
+        imatrix_file: None = off; a path = that file; True = download the
+            upstream unsloth/<base>-GGUF imatrix. Quants that need one
+            whatever the model are refused up front (IMATRIX_REQUIRED_QUANTS);
+            the rest are left to llama.cpp.
     """
     from unsloth_zoo.llama_cpp import (
         convert_to_gguf,
         quantize_gguf,
+        quant_requires_imatrix,
+        resolve_imatrix_file,
         check_llama_cpp,
         install_llama_cpp,
         LLAMA_CPP_DEFAULT_DIR,
         _download_convert_hf_to_gguf,
+        _converter_dir_is_incomplete,
+        internal_scripts_dir_pin,
     )
+
+    # Normalize once so every later comparison agrees. The direct-conversion test below and the
+    # gate on llama-quantize used to normalize differently, so "Q4_K_M" lost its imatrix to a run
+    # that then went ahead without it.
+    quant_types, is_list = _normalize_gguf_quantization_methods(quantization_method)
+    if first_conversion is not None:
+        if not isinstance(first_conversion, str):
+            raise TypeError(
+                "Unsloth: first_conversion must be a string such as 'bf16' - got "
+                f"{type(first_conversion).__name__}."
+            )
+        first_conversion = first_conversion.strip().lower()
+
+    # Captured before the drop guard can clear imatrix_file: the path may sit inside
+    # save_directory, and must not be reported or uploaded as a file this export produced.
+    imatrix_source = None
+    if isinstance(imatrix_file, (str, os.PathLike)):
+        imatrix_source = os.path.expanduser(os.fspath(imatrix_file))
+
+    # Ahead of the output directory and the merge: llama-quantize only refuses these ~10 minutes in.
+    needs_imatrix = [q for q in quant_types if quant_requires_imatrix(q)]
+    if needs_imatrix and not imatrix_file:
+        raise RuntimeError(
+            f"Unsloth: '{needs_imatrix[0]}' cannot be quantized without an importance matrix. "
+            "Pass imatrix_file=True to fetch the upstream Unsloth imatrix, or "
+            "imatrix_file='/path/to/imatrix.(dat|gguf)' to use your own."
+        )
 
     save_directory = Path(save_directory)
     save_directory.mkdir(parents=True, exist_ok=True)
 
-    # Map friendly names to llama.cpp quant types
-    quant_map = {
-        "not_quantized": "bf16",
-        "fast_quantized": "q8_0",
-        "quantized": "q4_k_m",
-        None: "q8_0",
-    }
-    quant_type = quant_map.get(quantization_method, quantization_method)
-
     # Apple Silicon always supports bf16
     model_dtype = "bf16"
 
-    # Determine first_conversion (intermediate GGUF format before quantizing)
     if first_conversion is None:
-        if quant_type in ("bf16", "f16", "f32"):
-            first_conversion = quant_type
+        if len(quant_types) == 1 and quant_types[0] in _GGUF_FULL_PRECISION_TYPES:
+            first_conversion = quant_types[0]
+        elif "f32" in quant_types:
+            # bf16/f16 are exact in f32; f16 is never promoted (it clips bf16's range).
+            first_conversion = "f32"
         else:
-            # k-quants and q8_0 go through a bf16 intermediate, then llama-quantize
             first_conversion = "bf16"
+
+    # A scalar full-precision request keeps the pre-list contract (no quantize pass).
+    if not is_list and quant_types[0] in _GGUF_FULL_PRECISION_TYPES:
+        to_quantize = []
+    else:
+        to_quantize = [q for q in quant_types if q != first_conversion]
+
+    # No real quant pass means nothing for an imatrix to weight: drop it rather than resolve it.
+    if imatrix_file and not any(q not in _GGUF_FULL_PRECISION_TYPES for q in to_quantize):
+        warnings.warn(
+            f"Unsloth: ignoring imatrix_file -- '{', '.join(quant_types)}' is written without "
+            "quantizing, so llama-quantize never uses it."
+        )
+        imatrix_file = None
+
+    # An imatrix named like a file this export writes is destroyed by it: the outputs overwrite by
+    # name and the intermediate is then deleted, while resolution has already copied it out, so the
+    # export succeeds having eaten the caller's input. Refuse rather than relocate; where their
+    # file belongs is their call. Checked even if the drop guard cleared imatrix_file: same loss.
+    if imatrix_source is not None:
+        base = save_directory / (getattr(model, "_hf_repo", None) or "model").split("/")[-1]
+        for out in (f"{base}.{t.upper()}.gguf" for t in dict.fromkeys([first_conversion, *quant_types])):
+            if _is_same_file(imatrix_source, out):
+                raise RuntimeError(
+                    f"Unsloth: imatrix_file '{imatrix_source}' is also where this export writes "
+                    f"'{os.path.basename(out)}', so the export would overwrite it.\n"
+                    "Move the imatrix outside save_directory, or rename it."
+                )
 
     # GGUF conversion requires torch (used by llama.cpp's convert_hf_to_gguf.py)
     try:
@@ -14839,19 +19343,37 @@ def save_pretrained_gguf(
             "torch is only needed for GGUF export, not for training."
         )
 
-    # Step 1: Save merged model to a temp HF-format directory
     with tempfile.TemporaryDirectory() as tmp_dir:
+        # Before the merge so a bad path fails in seconds, and outside save_directory so the
+        # result is never mistaken for an exported model.
+        imatrix = resolve_imatrix_file(
+            imatrix_file,
+            dest_dir=os.path.join(tmp_dir, "imatrix"),
+            repo_candidates=_gguf_imatrix_repo_candidates(model),
+            token=token,
+        )
+
         tmp_path = Path(tmp_dir) / "merged"
         is_vlm_model = _is_vlm_model(model)
         print("Unsloth: Merging LoRA weights and saving to 16-bit...")
         save_merged_model(model, tokenizer, tmp_path, dequantize=True)
-        if is_vlm_model:
-            rewritten = _prepare_vlm_gguf_export_directory(tmp_path, model=model)
-            if rewritten:
-                print(
-                    "Unsloth: Rewrote "
-                    f"{rewritten} MLX VLM tensors for llama.cpp GGUF export."
-                )
+        # Measured once so both passes subtract against the same answer.
+        norm_offsets = _mlx_sanitizer_norm_offsets(model)
+        relaid_out = set()
+        rewritten = _prepare_mlx_gguf_export_directory(
+            tmp_path, model=model, replay_sanitizers=is_vlm_model,
+            norm_offsets=norm_offsets, relaid_out=relaid_out,
+        )
+        # Must run after the norm pass, whose offsets are keyed by the saved names.
+        rewritten += _prepare_moe_gguf_export_directory(
+            tmp_path, model=model, source_norm_offsets=norm_offsets,
+            source_layouts=relaid_out,
+        )
+        if rewritten:
+            print(
+                f"Unsloth: Rewrote {rewritten} MLX tensors "
+                "for llama.cpp GGUF export."
+            )
 
         # Restore architectures from the original HF config since mlx-vlm's
         # save_config strips that key. convert_to_gguf reconciles MTP metadata
@@ -14860,7 +19382,6 @@ def save_pretrained_gguf(
         if _config_path.exists():
             _cfg = json.loads(_config_path.read_text())
             _changed = False
-            # Restore architectures from the original HF config
             if "architectures" not in _cfg:
                 _orig_cfg_path = getattr(tokenizer, "name_or_path", None)
                 if _orig_cfg_path:
@@ -14873,7 +19394,6 @@ def save_pretrained_gguf(
             if _changed:
                 _config_path.write_text(json.dumps(_cfg, indent=2))
 
-        # Step 2: Ensure llama.cpp is installed.
         llama_cpp_folder = LLAMA_CPP_DEFAULT_DIR
         try:
             quantizer_location, converter_location = check_llama_cpp(llama_cpp_folder)
@@ -14911,29 +19431,33 @@ def save_pretrained_gguf(
                 quantizer_location, converter_location = check_llama_cpp(llama_cpp_folder)
         llama_cpp_folder = os.path.dirname(converter_location)
 
-        # Step 3: Download and patch convert_hf_to_gguf.py.
         # why: always go through the wrapper so UNSLOTH_LLAMA_CPP_SCRIPTS_DIR
         # is honored even when a cached converter file exists.
         converter = os.path.join(llama_cpp_folder, "unsloth_convert_hf_to_gguf.py")
         supported_text_archs = None
         supported_vision_archs = None
-        with _LLAMA_CPP_PATCHER_ENV_LOCK:
-            old_scripts_dir = os.environ.get("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR")
-            if old_scripts_dir is None:
-                os.environ["UNSLOTH_LLAMA_CPP_SCRIPTS_DIR"] = llama_cpp_folder
-            try:
-                result = _download_convert_hf_to_gguf()
-            finally:
-                if old_scripts_dir is None:
-                    os.environ.pop("UNSLOTH_LLAMA_CPP_SCRIPTS_DIR", None)
-                else:
-                    os.environ["UNSLOTH_LLAMA_CPP_SCRIPTS_DIR"] = old_scripts_dir
+        # internal_scripts_dir_pin rather than setting the variable here: deriving
+        # trust from the variable alone made an install Unsloth had just downloaded
+        # look user-pinned, which turned UNSLOTH_CONVERTER_SCAN_STRICT off for this
+        # whole path. Pinning at all is skipped when a converter tag is set, since
+        # the pin outranks it and made that escape hatch inert, and when the install
+        # is incomplete, since pinning it is what stops the staged resolver from
+        # repairing it. A pin the USER set is left alone by the helper itself.
+        _pin_is_safe = (
+            not os.environ.get("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", "").strip()
+            and not _converter_dir_is_incomplete(llama_cpp_folder)
+        )
+        _pin = (
+            internal_scripts_dir_pin(llama_cpp_folder) if _pin_is_safe
+            else contextlib.nullcontext()
+        )
+        with _LLAMA_CPP_PATCHER_ENV_LOCK, _pin:
+            result = _download_convert_hf_to_gguf()
         if isinstance(result, tuple) and len(result) >= 3:
             converter, supported_text_archs, supported_vision_archs = result[:3]
         elif isinstance(result, str):
             converter = result
 
-        # Step 4: Get model name for output filename
         hf_repo = getattr(model, "_hf_repo", None)
         if hf_repo:
             model_name = hf_repo.split("/")[-1]
@@ -14942,7 +19466,6 @@ def save_pretrained_gguf(
 
         output_base = str(save_directory / model_name)
 
-        # Step 5: Convert HF -> GGUF
         print(f"Unsloth: Converting to GGUF format...")
         kwargs = dict(
             model_name=output_base,
@@ -14967,7 +19490,7 @@ def save_pretrained_gguf(
                 else gguf_py_dir + os.pathsep + original_pythonpath
             )
         try:
-            convert_to_gguf(**kwargs)
+            produced_files, _ = convert_to_gguf(**kwargs)
         finally:
             if has_local_gguf:
                 if original_pythonpath is None:
@@ -14975,27 +19498,38 @@ def save_pretrained_gguf(
                 else:
                     os.environ["PYTHONPATH"] = original_pythonpath
 
-        # Step 6: Quantize if the target quant differs from first_conversion
-        if quant_type not in ("bf16", "f16", "f32") and first_conversion != quant_type:
-            quantizer = quantizer_location
-            base_gguf = f"{output_base}.{first_conversion.upper()}.gguf"
-            final_gguf = f"{output_base}.{quant_type.upper()}.gguf"
+        if to_quantize:
+            if not produced_files:
+                raise RuntimeError(
+                    "Unsloth: the GGUF converter reported no output file to quantize."
+                )
+            # What the converter reported, never the requested --outfile name: past
+            # --split-max-size it writes shards instead, and llama.cpp finds the rest
+            # from shard 1's split.count. The model always converts before any projector.
+            base_gguf = produced_files[0]
+            base_files = _gguf_shard_family(base_gguf, produced_files)
+            final_ggufs = []
+            for quant_type in to_quantize:
+                final_gguf = f"{output_base}.{quant_type.upper()}.gguf"
+                print(f"Unsloth: Quantizing to {quant_type}...")
+                quantize_gguf(
+                    input_gguf=base_gguf,
+                    output_gguf=final_gguf,
+                    quant_type=quant_type,
+                    quantizer_location=quantizer_location,
+                    print_output=True,
+                    imatrix=None if quant_type in _GGUF_FULL_PRECISION_TYPES else imatrix,
+                )
+                final_ggufs.append(final_gguf)
+            # The intermediate, every shard of it, is scratch unless it was itself requested.
+            if first_conversion not in quant_types:
+                for stale in base_files:
+                    if stale in final_ggufs or not os.path.exists(stale):
+                        continue
+                    os.remove(stale)
+                    print(f"Unsloth: Removed intermediate {Path(stale).name}")
 
-            print(f"Unsloth: Quantizing to {quant_type}...")
-            quantize_gguf(
-                input_gguf=base_gguf,
-                output_gguf=final_gguf,
-                quant_type=quant_type,
-                quantizer_location=quantizer,
-                print_output=True,
-            )
-            # Remove intermediate bf16 gguf to save space
-            if os.path.exists(base_gguf) and base_gguf != final_gguf:
-                os.remove(base_gguf)
-                print(f"Unsloth: Removed intermediate {Path(base_gguf).name}")
-
-    # List produced files
-    gguf_files = sorted(save_directory.glob("*.gguf"))
+    gguf_files = _exported_gguf_files(save_directory, imatrix_source)
     for f in gguf_files:
         size_gb = f.stat().st_size / (1024**3)
         print(f"Unsloth: Saved {f.name} ({size_gb:.2f} GB)")
@@ -15039,7 +19573,6 @@ def push_to_hub_merged(
 
     save_directory = Path(save_directory)
 
-    # Save first if not already saved
     if not (save_directory / "model.safetensors.index.json").exists():
         save_merged_model(model, tokenizer, save_directory)
 
@@ -15156,6 +19689,7 @@ def push_to_hub_gguf(
     token=None,
     private=None,
     first_conversion=None,
+    imatrix_file=None,
 ):
     """Export to GGUF and push to HuggingFace Hub.
 
@@ -15164,33 +19698,38 @@ def push_to_hub_gguf(
         tokenizer: Tokenizer.
         save_directory: Local path for GGUF output.
         repo_id: HuggingFace repo ID.
-        quantization_method: GGUF quantization type.
+        quantization_method: GGUF quantization type, or a list/tuple of types.
         token: HuggingFace token.
         private: Whether repo should be private.
         first_conversion: Optional intermediate GGUF dtype passed through to
             save_pretrained_gguf. Placed after the pre-existing arguments so
             positional callers keep their meaning.
+        imatrix_file: Importance matrix passed through to save_pretrained_gguf.
     """
     from huggingface_hub import HfApi
 
     save_directory = Path(save_directory)
 
-    # Export to GGUF
     save_pretrained_gguf(
         model,
         tokenizer,
         save_directory,
         quantization_method=quantization_method,
         first_conversion=first_conversion,
+        token=token,
+        imatrix_file=imatrix_file,
     )
 
-    # Upload GGUF files
     api = HfApi(token=token)
     # Same fail-loud private=True rule as the LoRA / merged paths so a
     # private=True request never silently leaks GGUF shards public.
     _ensure_hub_repo_visibility(api, repo_id, private)
 
-    gguf_files = list(save_directory.glob("*.gguf"))
+    gguf_files = _exported_gguf_files(
+        save_directory,
+        os.path.expanduser(os.fspath(imatrix_file))
+        if isinstance(imatrix_file, (str, os.PathLike)) else None,
+    )
     for gguf_file in gguf_files:
         api.upload_file(
             path_or_fileobj=str(gguf_file),
@@ -15199,3 +19738,261 @@ def push_to_hub_gguf(
         )
 
     print(f"Unsloth: GGUF pushed to https://huggingface.co/{repo_id}")
+
+
+
+def detect_adapter_format(path):
+    from unsloth_zoo.mlx.peft_interop import detect_adapter_format as _impl
+    return _impl(path)
+
+
+def normalize_peft_adapter_config(cfg, adapter_dir=None):
+    from unsloth_zoo.mlx.peft_interop import normalize_peft_adapter_config as _impl
+    return _impl(cfg, adapter_dir=adapter_dir)
+
+
+def attach_and_bind_peft_adapter(model, adapter_dir, cfg):
+    """Attach PEFT LoRA onto a live MLX model; all-or-nothing, never partially applied."""
+    from unsloth_zoo.mlx.peft_interop import (
+        PEFT_WEIGHTS_FILE,
+        _EMBEDDING_LEAF_NAMES,
+        _OUTPUT_HEAD_LEAF_NAMES,
+        _TIED_FULL_STATE_REASON,
+        _effective_scale,
+        _tied_head_fold_error,
+        _leaf_in,
+        _raise_rejected,
+        _reject_dora_dropout,
+        group_peft_lora_pairs,
+    )
+    import mlx.core as mx
+    import mlx.nn as nn
+    from mlx_lm.tuner.lora import LoRALinear
+
+    # Older mlx-lm from_base() rejects scale/dropout.
+    from .loader import _patch_mlx_lora_from_base_compat
+    _patch_mlx_lora_from_base_compat()
+
+    if not cfg.get("_unsloth_peft_import"):
+        from unsloth_zoo.mlx.peft_interop import normalize_peft_adapter_config
+        cfg = normalize_peft_adapter_config(dict(cfg), adapter_dir=adapter_dir)
+    _reject_dora_dropout(cfg)
+    use_dora = bool(cfg.get("use_dora"))
+    if use_dora:
+        try:
+            from mlx_lm.tuner.dora import DoRALinear
+        except ImportError as exc:
+            raise ImportError(
+                "Unsloth MLX: this adapter uses DoRA but mlx_lm.tuner.dora "
+                "is unavailable; upgrade mlx-lm."
+            ) from exc
+
+    tensors = dict(mx.load(os.path.join(adapter_dir, PEFT_WEIGHTS_FILE)))
+    pairs, full_state, rejected = group_peft_lora_pairs(tensors, cfg)
+    if rejected:
+        _raise_rejected(rejected, f"{adapter_dir!r}")
+    if not pairs:
+        raise ValueError(
+            f"Unsloth MLX: {adapter_dir!r} has no LoRA tensor pairs."
+        )
+    by_name = dict(model.named_modules())
+    linear_types = (nn.Linear, nn.QuantizedLinear)
+    dropout = float(cfg.get("lora_dropout") or 0.0)
+    unmatched = []
+    module_scales = {}
+    module_ranks = {}
+    staged = []
+    emb_types = tuple(
+        t for t in (nn.Embedding, nn.QuantizedEmbedding) if t is not None
+    )
+    tied_embeddings = _model_ties_output_to_embedding(model, by_name)
+    for path in sorted(pairs):
+        a, b = pairs[path]["A"], pairs[path]["B"]
+        rank = int(a.shape[0])
+        if int(b.shape[1]) != rank:
+            unmatched.append(f"{path} (lora_A rank {rank} != lora_B rank {int(b.shape[1])})")
+            continue
+        module = by_name.get(path)
+        # Exact types only: Linear subclasses misbehave inside LoRALinear.
+        if module is None or type(module) not in linear_types:
+            found = type(module).__name__ if module is not None else "no module"
+            unmatched.append(
+                f"{path} ({found}; the base model's MLX module tree names "
+                "this weight differently, lacks it, or wraps it in an "
+                "unsupported linear variant)"
+            )
+            continue
+        scale = _effective_scale(cfg, path, rank)
+        mag = pairs[path].get("M")
+        if use_dora and mag is None:
+            unmatched.append(f"{path} (use_dora set but magnitude missing)")
+            continue
+        if not use_dora and mag is not None:
+            unmatched.append(f"{path} (magnitude present without use_dora)")
+            continue
+        if use_dora:
+            wrapped = DoRALinear.from_base(
+                module, r=rank, dropout=dropout, scale=scale
+            )
+        else:
+            wrapped = LoRALinear.from_base(
+                module, r=rank, dropout=dropout, scale=scale
+            )
+        lora_a, lora_b = a.T, b.T
+        if wrapped.lora_a.shape != lora_a.shape:
+            unmatched.append(
+                f"{path} (adapter in-dim {lora_a.shape[0]} != module in-dim "
+                f"{wrapped.lora_a.shape[0]})"
+            )
+            continue
+        if wrapped.lora_b.shape != lora_b.shape:
+            unmatched.append(
+                f"{path} (adapter out-dim {lora_b.shape[1]} != module "
+                f"out-dim {wrapped.lora_b.shape[1]})"
+            )
+            continue
+        wrapped.lora_a = lora_a
+        wrapped.lora_b = lora_b
+        if use_dora:
+            if getattr(mag, "ndim", 0) != 1 or mag.shape != wrapped.m.shape:
+                unmatched.append(
+                    f"{path} (magnitude shape {tuple(mag.shape)} != module "
+                    f"out-dim {wrapped.m.shape[0]})"
+                )
+                continue
+            wrapped.m = mag
+        staged.append((path, wrapped))
+        module_scales[path] = scale
+        module_ranks[path] = rank
+    applied_full_state = {}
+    fs_plan = []
+    for path, entries in sorted(full_state.items()):
+        origin = entries["__origin__"]
+        module = by_name.get(path)
+        if (
+            origin == "embedding_auto"
+            and tied_embeddings
+            and _leaf_in(path, _OUTPUT_HEAD_LEAF_NAMES)
+        ):
+            emb_candidates = [
+                m for n, m in by_name.items()
+                if _leaf_in(n, _EMBEDDING_LEAF_NAMES)
+                and isinstance(m, emb_types)
+            ]
+            if len(emb_candidates) > 1:
+                unmatched.append(
+                    f"{path} (multiple embedding modules; the tied "
+                    "output-head duplicate cannot be attributed)"
+                )
+                continue
+            emb_module = emb_candidates[0] if emb_candidates else None
+            emb_weight = getattr(emb_module, "weight", None)
+            for _ep, _ev in full_state.items():
+                if _leaf_in(_ep, _EMBEDDING_LEAF_NAMES):
+                    emb_weight = _ev.get("weight", emb_weight)
+                    break
+
+            def _equal(live, snap):
+                return bool(mx.array_equal(live, snap.astype(live.dtype)))
+
+            _err = _tied_head_fold_error(path, entries, emb_weight, _equal)
+            if _err:
+                unmatched.append(_err)
+            continue
+        if module is None:
+            if tied_embeddings and _leaf_in(path, _OUTPUT_HEAD_LEAF_NAMES):
+                unmatched.append(
+                    f"{path} (this model ties its embeddings and has no "
+                    "output-head module, so peft modules_to_save on the "
+                    "head has no MLX counterpart)"
+                )
+            else:
+                unmatched.append(f"{path} (full-state target missing)")
+            continue
+        if isinstance(module, (nn.QuantizedLinear, nn.QuantizedEmbedding)):
+            unmatched.append(
+                f"{path} (a quantized base cannot verify or accept a "
+                "full-module snapshot; exclude the module from "
+                "quantization to import it)"
+            )
+            continue
+        if (
+            origin == "modules_to_save"
+            and tied_embeddings
+            and (
+                isinstance(module, emb_types)
+                or _leaf_in(path, _OUTPUT_HEAD_LEAF_NAMES)
+            )
+        ):
+            unmatched.append(f"{path} ({_TIED_FULL_STATE_REASON})")
+            continue
+        for tname, tensor in entries.items():
+            if tname == "__origin__":
+                continue
+            live = getattr(module, tname, None)
+            if live is None or tuple(live.shape) != tuple(tensor.shape):
+                unmatched.append(
+                    f"{path}.{tname} (full-state shape mismatch; resized "
+                    "vocabularies are not supported yet)"
+                )
+                continue
+            if "float" not in str(tensor.dtype).lower():
+                unmatched.append(
+                    f"{path}.{tname} (non-floating snapshot dtype "
+                    f"{tensor.dtype}; packed or quantized state cannot "
+                    "restore as module state)"
+                )
+                continue
+            if tensor.dtype != live.dtype:
+                tensor = tensor.astype(live.dtype)
+            if bool(mx.array_equal(live, tensor)):
+                continue
+            fs_plan.append((module, tname, tensor))
+            applied_full_state[path] = origin
+        if origin == "modules_to_save" and path not in applied_full_state:
+            applied_full_state[path] = origin
+    # peft replaces the ENTIRE module, so a truncated snapshot keeps base state.
+    from mlx.utils import tree_flatten as _tree_flatten
+    for _name in sorted(set(cfg.get("modules_to_save") or [])):
+        for _parent_path, _parent in by_name.items():
+            # Raw endswith, matching peft's selection (["head"] wraps lm_head).
+            if not _parent_path.endswith(_name):
+                continue
+            for _k, _v in _tree_flatten(_parent.parameters()):
+                _tname = _k.rsplit(".", 1)[-1]
+                _sub = (
+                    _parent_path if "." not in _k
+                    else f"{_parent_path}.{_k[: -len(_tname) - 1]}"
+                )
+                if _tname not in (full_state.get(_sub) or {}):
+                    unmatched.append(
+                        f"{_sub}.{_tname} (modules_to_save snapshot for "
+                        f"{_name!r} lacks this tensor; peft snapshots are "
+                        "full module state)"
+                    )
+    if unmatched:
+        preview = "; ".join(unmatched[:5])
+        if len(unmatched) > 5:
+            preview += f"; ... (+{len(unmatched) - 5} more)"
+        raise ValueError(
+            f"Unsloth MLX: {len(unmatched)} PEFT adapter entr(ies) do not "
+            f"map onto the loaded MLX model ({preview}). Refusing a "
+            "partial import."
+        )
+    model.freeze()
+    for module, tname, tensor in fs_plan:
+        setattr(module, tname, tensor)
+    from mlx.utils import tree_unflatten
+    model.update_modules(tree_unflatten(
+        [(path, wrapped) for path, wrapped in staged]
+    ))
+    model.train(bool(getattr(model, "training", False)))
+    for path, origin in applied_full_state.items():
+        if origin == "modules_to_save":
+            by_name[path].unfreeze()
+    model._unsloth_full_state_modules = dict(applied_full_state)
+    model._unsloth_peft_converted = True
+    mx.eval(model.parameters())
+    model._unsloth_lora_module_scales = dict(module_scales)
+    model._unsloth_lora_module_ranks = dict(module_ranks)
+    return len(staged)
