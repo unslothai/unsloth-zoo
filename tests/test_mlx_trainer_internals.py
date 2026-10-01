@@ -1221,7 +1221,6 @@ def test_trainer_drives_dynamic_lr_outside_optimizer_scheduler():
 
 @pytest.mark.parametrize("warmup_steps, total_steps", [(0.1, 100), (0.05, 30), (0.1, 8)])
 def test_fractional_warmup_steps_is_a_ratio_of_total_steps(warmup_steps, total_steps):
-    # HF TrainingArguments.get_warmup_steps: ceil(total_steps * warmup_steps) below 1.
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
 
     trainer = MLXTrainer.__new__(MLXTrainer)
