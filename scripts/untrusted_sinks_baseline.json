@@ -11,8 +11,10 @@
     "unsloth_zoo/mlx/loader.py::_build_vlm_image_processor_from_config::getattr(module, ...)::5eec36d923221521::f8fce5036e6394eb": 1,
     "unsloth_zoo/mlx/loader.py::_ensure_safe_text_wrapper_sanitize::importlib.import_module::a0573ba00a682ea0::3edca3e7667086fc": 1,
     "unsloth_zoo/mlx/loader.py::_get_mlx_lm_model_class::importlib.import_module::a0573ba00a682ea0::c12261211f5c8729": 1,
+    "unsloth_zoo/mlx/loader.py::_resolve_mlx_vlm_model_class::importlib.import_module::d61ab5f3581be96b::1f420a1a8b2ebf3a": 1,
     "unsloth_zoo/mlx/loader.py::_resolve_mlx_vlm_processor_class::getattr(module, ...)::e166c7a149e5a955::b8fe9db822ae3bd3": 1,
     "unsloth_zoo/mlx/loader.py::_resolve_mlx_vlm_processor_class::getattr(module, ...)::f71db1546a424efa::b8fe9db822ae3bd3": 1,
+    "unsloth_zoo/mlx/loader.py::_resolve_mlx_vlm_processor_class::importlib.import_module::59e72c01edb14c86::b8fe9db822ae3bd3": 1,
     "unsloth_zoo/mlx/utils.py::attach_and_bind_peft_adapter::getattr(module, ...)::ec4ec0a9bcbc2c32::0f08c742b3d85cad": 1,
     "unsloth_zoo/saving_utils.py::_read_export_base_config::trust_remote_code = True::1966c44746000881::1a9efc56e40bc413": 1
   }
