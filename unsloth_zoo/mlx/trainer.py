@@ -4242,9 +4242,8 @@ class MLXTrainer:
                 )
                 opt_name = "adamw"
 
-        # After the Adafactor->AdamW fallback so it carries betas/eps; ignored for
-        # non-Adam optimizers like HF (transformers/trainer.py adam_kwargs),
-        # except that HF also hands the betas to Lion.
+        # After the Adafactor->AdamW fallback so it carries betas/eps; non-Adam
+        # optimizers ignore them like HF, except Lion (trainer_optimizer.py).
         adam_kwargs = {}
         adam_beta1 = getattr(self.args, "adam_beta1", None)
         adam_beta2 = getattr(self.args, "adam_beta2", None)
@@ -4317,8 +4316,7 @@ class MLXTrainer:
             optimizer = optim.Muon(learning_rate=initial_lr, weight_decay=0.0)
         elif opt_name == "lion":
             self._manual_weight_decay = float(wd or 0.0)
-            # HF builds Lion with betas=(adam_beta1, adam_beta2); unset keeps
-            # MLX's Lion default of (0.9, 0.99).
+            # Unset betas keep MLX's Lion default (0.9, 0.99).
             lion_kwargs = {}
             if adam_beta1 is not None or adam_beta2 is not None:
                 lion_kwargs["betas"] = (
