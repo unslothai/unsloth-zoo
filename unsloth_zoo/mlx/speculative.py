@@ -205,6 +205,7 @@ class DraftController:
     decoding at some batch size converges to ordinary decoding there. Unmeasured entries are
     extrapolated; close or stale rivals are re-measured on a token clock, each probe only once
     the time it is expected to lose fits ``explore_fraction`` of the time recorded so far.
+    ``fixed_depth`` never trades drafting for plain decoding: each row drafts exactly ``max_depth`` (fewer at a reply's end) unless a copy is expected to emit more; only a step where no row can draft or copy decodes plainly.
     """
 
     def __init__(
@@ -230,7 +231,7 @@ class DraftController:
         fixed_depth: bool = False,
     ):
         self.max_depth = max(0, int(max_depth))
-        self.fixed_depth = fixed_depth
+        self.fixed_depth = fixed_depth and self.max_depth > 0
         self.max_copy = max(0, int(max_copy)) if can_copy else 0
         self.max_width = 1 + max(self.max_depth, self.max_copy)
         self.acceptance_alpha = acceptance_alpha
@@ -265,7 +266,7 @@ class DraftController:
         self._measured_at: dict[tuple, int] = {}
         self._next_probe = probe_every
         # Halving depths: the widths between are extrapolated until a split round runs them.
-        self._warmup = [self.max_depth] if fixed_depth else sorted({self.max_depth >> shift for shift in range(self.max_depth.bit_length())}, reverse = True)
+        self._warmup = sorted({self.max_depth >> shift for shift in range(self.max_depth.bit_length())}, reverse = True)
         self._current: tuple | None = None
         self._window = min_window
         self._probing_sources: dict[int, str] = {}
@@ -359,8 +360,7 @@ class DraftController:
         for i, state in enumerate(rows):
             copy = self._cap(state, min(state.copy_available, self.max_copy, width - 1))
             base.append(RowPlan("copy", copy) if copy else RowPlan())
-            depth = min(self.max_depth, width - 1)
-            depth = self._cap(state, 0 if self.fixed_depth and depth < self.max_depth else depth)
+            depth = self._cap(state, min(self.max_depth, width - 1))
             if state.can_draft and depth:
                 draft = RowPlan("draft", depth)
                 gain = state.stats.expected(draft) - state.stats.expected(base[i])
@@ -404,6 +404,9 @@ class DraftController:
         room = min((state.remaining for state in rows if state.remaining is not None), default = 1 << 30)
         plain = RoundPlan("plain", max(1, min(self._window, room)))
         self._probing_sources, self._reference = {}, None
+        if self.fixed_depth:
+            exact = tuple(self._exact_row(state) for state in rows)
+            return RoundPlan("round", rows = exact) if any(row.length for row in exact) else RoundPlan("plain", 1)
         if self._warmup:
             depth = self._warmup[0]
             warmup = tuple(
@@ -425,7 +428,7 @@ class DraftController:
         chosen, probing = self._choose(candidates, rows, bucket)
         if not probing:
             # The deepest affordable draft probe: a full-depth one may not fit the credit a reply earns.
-            for depth in ([self.max_depth] if self.fixed_depth else range(self.max_depth, 1, -1)) or [self.max_depth]:
+            for depth in range(self.max_depth, 1, -1) or [self.max_depth]:
                 probe, sources = self._source_probe(chosen, rows, depth)
                 if sources and self._affordable(probe, chosen, rows):
                     chosen, self._probing_sources, self._reference = probe, sources, self.score(chosen, rows)
@@ -437,6 +440,12 @@ class DraftController:
         if chosen.kind == "round" and (starting or not self._measured_parts(chosen, rows)):
             chosen = replace(chosen, split = True)
         return self._split_due(chosen)
+
+    def _exact_row(self, state: RowState) -> RowPlan:
+        draft = RowPlan("draft", self._cap(state, self.max_depth)) if state.can_draft else RowPlan()
+        copy = RowPlan("copy", self._cap(state, min(state.copy_available, self.max_copy)))
+        best = copy if copy.length and state.stats.expected(copy) > state.stats.expected(draft) else draft
+        return best if best.length else RowPlan()
 
     def _split_due(self, plan: RoundPlan) -> RoundPlan:
         if plan.kind == "round" and not plan.split and self._since_split + 1 >= self.split_every:

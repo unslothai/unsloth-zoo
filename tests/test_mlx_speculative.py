@@ -66,7 +66,7 @@ def _run(controller, machine, rows, *, rounds, seed = 0, states = None, report =
             emitted_total, seconds_total = emitted_total + emitted, seconds_total + seconds
         chosen.append((choice, emitted))
     if report is not None:
-        report["rate"] = emitted_total / seconds_total
+        report["rate"], report["choices"] = emitted_total / seconds_total, {choice for choice, _ in chosen}
     return sum((Counter({choice: emitted}) for choice, emitted in chosen[-200:]), Counter()).most_common(1)[0][0]
 
 
@@ -138,7 +138,8 @@ def test_controller_drafts_alone_but_not_in_a_wide_batch():
     alone = _run(controller, machine, [([0.8, 0.6, 0.4], None)], rounds = 1000)
     assert alone == (("draft", 2),)
     assert _run(controller, machine, [([0.8, 0.6, 0.4], None)] * 8, rounds = 1000, seed = 1) == "plain"
-    assert _run(fixed := DraftController(max_depth = 3, can_copy = False, fixed_depth = True), machine, [([0.8, 0.6, 0.4], None)], rounds = 1000) == (("draft", 3),) and [fixed.draft_cost[d].value for d in (1, 2)] == [None, None]
+    assert _run(fixed := DraftController(max_depth = 3, can_copy = False, fixed_depth = True), machine, [([0.8, 0.6, 0.4], None)] * 8, rounds = 1000, seed = 1, report = (report := {})) == (("draft", 3),) * 8 and "plain" not in report["choices"]
+    assert _run(DraftController(max_depth = 3, fixed_depth = True), machine, [([0.8, 0.6, 0.4], 0.95), ([0.8, 0.6, 0.4], None), ([0.8, 0.6, 0.4], 0.1)], rounds = 200) == (("copy", 12), ("draft", 3), ("draft", 3))
     assert [controller.plain_cost[b].value for b in (1, 8)] == pytest.approx([machine.plain(1), machine.plain(8)])
 
 
