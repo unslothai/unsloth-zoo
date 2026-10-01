@@ -42,6 +42,17 @@ CALLS = {
         "                **kwargs,\n"
         "            )\n"
     ),
+    "multi_line_after_upcast": (
+        "            # Upcast to float if we need to compute the loss to avoid potential precision issues\n"
+        "            logits = logits.float()\n"
+        "            # Flatten the tokens\n"
+        "            loss = self.loss_function(\n"
+        "                logits,\n"
+        "                labels,\n"
+        "                vocab_size=self.config.vocab_size,\n"
+        "                **kwargs,\n"
+        "            )\n"
+    ),
     "multi_line_no_trailing_comma": (
         "            loss = self.loss_function(\n"
         "                logits=logits,\n"
