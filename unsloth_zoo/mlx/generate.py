@@ -2140,6 +2140,41 @@ class _RowPrefill:
     checkpoint: Callable[[int, list], None]
     lengths: frozenset[int]
     quantize: Callable[[list], None] | None = None
+    reopen: Callable[[dict], dict] | None = None
+
+
+def _slice_row_inputs(batch_module, prompt_kwargs: dict, length: int, start: int) -> dict:
+    aligned = batch_module._is_sequence_aligned_prompt_kwarg
+    sliced = {}
+    for key, value in prompt_kwargs.items():
+        if key == "inputs_embeds":
+            value = value[:, start:]
+        elif hasattr(value, "shape") and aligned(key, value, length):
+            value = batch_module._slice_sequence_aligned_prompt_kwarg(key, value, start = start)
+        sliced[key] = value
+    return sliced
+
+
+_PREFILL_SLOTS = ("_prompt_batch", "_unprocessed_sequences", "_generation_batch", "completion_batch_size")
+
+
+def _schedules_prefill(generator, defaults) -> bool:
+    return (
+        defaults.prefill_batch_size == 1
+        and getattr(generator, "apc", None) is None
+        and all(hasattr(generator, name) for name in _PREFILL_SLOTS)
+    )
+
+
+def _prompt_tokens_left(batch) -> int | None:
+    embeds = getattr(batch, "_inputs_embeds", None)
+    return None if embeds is None else int(embeds.shape[1])
+
+
+def _queued_tokens_left(sequence) -> int:
+    # Media can expand past its placeholder ids, so count what the prefill will run.
+    embeds = (sequence[3] or {}).get("inputs_embeds")
+    return len(sequence[1]) if embeds is None else int(embeds.shape[1])
 
 
 def _row_prefill_batch_class(base):
@@ -2156,8 +2191,12 @@ def _row_prefill_batch_class(base):
             if row is not None:
                 if len(kwargs.get("uids") or ()) != 1 or kwargs.get("warm_cache") is not None:
                     raise RuntimeError("A row carrying its own prompt cache must prefill alone.")
+                if row.reopen is not None:
+                    kwargs = row.reopen(kwargs)
                 kwargs["prompt_kwargs"] = {
-                    key: value for key, value in prompt_kwargs.items() if key != _ROW_PREFILL_KEY
+                    key: value
+                    for key, value in kwargs["prompt_kwargs"].items()
+                    if key != _ROW_PREFILL_KEY
                 }
                 kwargs["warm_cache"] = row.cache
             super().__init__(*args, **kwargs)
@@ -2934,6 +2973,8 @@ class _VLMBatchSession:
         )
         self._row_signature = None
         self._cache_layout = None
+        self._banked = 0
+        self._parked: list = []
         self._pending: dict[int, _PendingResult] = {}
         self._row_of: dict[int, int] = {}
         self._uid_of: dict[int, int] = {}
@@ -2946,6 +2987,7 @@ class _VLMBatchSession:
         except BaseException:
             self._stack.close()
             raise
+        self._schedules_prefill = _schedules_prefill(self.generator, adapter.defaults)
 
     @property
     def rows_in_flight(self) -> int:
@@ -3051,6 +3093,24 @@ class _VLMBatchSession:
                 "A row's own prompt cache needs prefill_batch_size=1: rows prefilled "
                 "together share one cache."
             )
+        embeds = prompt_kwargs.get("inputs_embeds")
+        # A cache offset counts embedding columns, which the ids name only when media did not
+        # expand past its placeholders.
+        addressed = embeds is None or embeds.shape[1] == len(token_ids)
+        prefill = self._open_row(state, token_ids, addressed)
+        batch_module = self.adapter.batch_module
+        _install_row_prefill_batch(batch_module)
+        if addressed:
+            prefill.reopen = functools.partial(
+                self._reopen, prefill, state, list(token_ids), self._banked,
+            )
+        prefix = prefill.prefix
+        if not prefix:
+            return prefill, token_ids, prompt_kwargs
+        sliced = _slice_row_inputs(batch_module, prompt_kwargs, len(token_ids), prefix)
+        return prefill, token_ids[prefix:], sliced
+
+    def _open_row(self, state, token_ids: list[int], addressed: bool) -> _RowPrefill:
         cache, lengths = state.open(list(token_ids))
         cache = list(cache)
         batch_module = self.adapter.batch_module
@@ -3062,10 +3122,6 @@ class _VLMBatchSession:
         prefix = _cache_offset(cache)
         if prefix is None:
             raise BatchRowRefused("This request's prompt cache holds no offset to resume from.")
-        embeds = prompt_kwargs.get("inputs_embeds")
-        # A cache offset counts embedding columns, which the ids name only when media did not
-        # expand past its placeholders.
-        addressed = embeds is None or embeds.shape[1] == len(token_ids)
         if prefix and not addressed:
             raise BatchRowRefused(
                 "This request's media expands past its prompt tokens, so its prompt cache "
@@ -3088,25 +3144,43 @@ class _VLMBatchSession:
                 "A row's own prompt cache needs quantized_kv_start=0: a later start converts rows "
                 "at different lengths, so their layouts could not be told apart on admission."
             )
-        _install_row_prefill_batch(batch_module)
-        prefill = _RowPrefill(
+        return _RowPrefill(
             cache = cache,
             prefix = prefix,
-            checkpoint = state.checkpoint,
+            checkpoint = functools.partial(self._bank, state),
             lengths = frozenset(int(length) for length in lengths) if addressed else frozenset(),
             quantize = quantize,
         )
-        if not prefix:
-            return prefill, token_ids, prompt_kwargs
-        aligned = batch_module._is_sequence_aligned_prompt_kwarg
-        sliced = {}
-        for key, value in prompt_kwargs.items():
-            if key == "inputs_embeds":
-                value = value[:, prefix:]
-            elif hasattr(value, "shape") and aligned(key, value, len(token_ids)):
-                value = batch_module._slice_sequence_aligned_prompt_kwarg(key, value, start = prefix)
-            sliced[key] = value
-        return prefill, token_ids[prefix:], sliced
+
+    def _bank(self, state, token_count: int, cache: list) -> None:
+        state.checkpoint(token_count, cache)
+        self._banked += 1
+
+    def _reopen(self, row: _RowPrefill, state, token_ids: list[int], banked: int, kwargs: dict) -> dict:
+        """Resume a row as its prefill starts from what rows ahead banked since it was added."""
+        pending = self._pending.get((kwargs.get("uids") or (None,))[0])
+        if self._banked == banked or pending is None or kwargs.get("inputs_embeds") is None:
+            return kwargs
+        try:
+            fresh = self._open_row(state, token_ids, addressed = True)
+        except Exception:
+            # The row still holds the cache it was admitted with.
+            return kwargs
+        delta = fresh.prefix - row.prefix
+        if delta <= 0 or _decode_layout(fresh.cache, fresh.quantize) != _decode_layout(row.cache, row.quantize):
+            return kwargs
+        ids = kwargs["input_ids"][0]
+        kwargs = {
+            **kwargs,
+            "input_ids": [ids[delta:]],
+            "inputs_embeds": kwargs["inputs_embeds"][:, delta:],
+            "prompt_kwargs": _slice_row_inputs(
+                self.adapter.batch_module, kwargs["prompt_kwargs"], len(ids), delta,
+            ),
+        }
+        row.cache, row.prefix, row.lengths = fresh.cache, fresh.prefix, fresh.lengths
+        pending.cached_token_count = fresh.prefix
+        return kwargs
 
     def cancel(self, row: int) -> bool:
         return self._take_back(row) is not None
@@ -3134,6 +3208,8 @@ class _VLMBatchSession:
         if not self._pending:
             return
         try:
+            if self._schedules_prefill:
+                self._schedule_prefill()
             if not self.generator.has_work:
                 raise RuntimeError(
                     "mlx-vlm ended its event stream before every request "
@@ -3150,7 +3226,36 @@ class _VLMBatchSession:
             self.usable = False
             raise
 
+    def _schedule_prefill(self) -> None:
+        """Run the prefill with the fewest prompt tokens left, queued rows included. Batches park
+        only between steps (chunks unchanged); one parked `cap` times runs to its end."""
+        generator, parked = self.generator, self._parked
+        current = generator._prompt_batch
+        cap = generator.completion_batch_size
+        parks = lambda batch: getattr(batch, "_unsloth_parks", 0)
+        live = [batch for batch in (*parked, current) if batch is not None]
+        left = {id(batch): _prompt_tokens_left(batch) for batch in live}
+        if None in left.values():
+            return
+        best = min(live, key = lambda batch: (parks(batch) < cap, left[id(batch)]), default = None)
+        queued = generator._unprocessed_sequences
+        # mlx-vlm admits by the rows decoding alone, so parked rows must still fit.
+        room = cap - len(generator._generation_batch) - len(live)
+        if queued and room > 0 and (
+            best is None or (parks(best) < cap and _queued_tokens_left(queued[0]) < left[id(best)])
+        ):
+            best = None
+        if best is current:
+            return
+        if current is not None:
+            current._unsloth_parks = parks(current) + 1
+            parked.append(current)
+        if best is not None:
+            parked.remove(best)
+        generator._prompt_batch = best
+
     def close(self):
+        self._parked.clear()
         closer = getattr(self.generator, "close", None)
         try:
             if callable(closer):
@@ -3245,6 +3350,10 @@ class _VLMBatchSession:
 
     def _withdraw(self, uid: int) -> bool:
 
+        for batch in self._parked:
+            if uid in batch.uids:
+                self._parked.remove(batch)
+                return True
         if self.adapter.cancel is None:
             return False
         return self.adapter.cancel(self.generator, uid) is not False

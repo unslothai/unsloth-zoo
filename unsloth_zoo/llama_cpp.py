@@ -94,6 +94,45 @@ COMMANDS_NOT_FOUND = (
     "not found",
     "No such file or directory",
 )
+
+# Each manager's own "no such package" phrase: a bare "not found" also matches normal install output.
+PACKAGE_NOT_FOUND = (
+    "Unable to locate package",   # apt-get
+    "No match for argument",      # dnf / yum
+    "error: target not found",    # pacman
+    "unable to select packages",  # apk
+    "No provider of",             # zypper (capability)
+    "' not found.",               # zypper: Package 'x' not found.
+    "there are no ebuilds",       # emerge
+)
+
+NEEDS_ROOT = (
+    "Permission denied",
+    "not open lock file",
+    "are you root?",
+    "fatal",
+    "Root privileges are required",                       # zypper
+    "you cannot perform this operation unless you are root",  # pacman
+)
+
+PACKAGE_MANAGER_NAMES = {
+    "rpm": "yum/dnf",
+    "arch": "pacman",
+    "alpine": "apk",
+    "suse": "zypper",
+    "gentoo": "emerge",
+}
+
+# Missing entries keep the Debian name.
+DISTRO_PACKAGES = {
+    "rpm":    {"build-essential": "gcc gcc-c++ make"},
+    "arch":   {"build-essential": "base-devel"},
+    "alpine": {"build-essential": "build-base"},
+    "suse":   {"build-essential": "gcc gcc-c++ make"},
+    "gentoo": {"build-essential": "sys-devel/gcc sys-devel/make", "cmake": "dev-build/cmake",
+               "curl": "net-misc/curl", "git": "dev-vcs/git"},
+}
+
 PIP_MODULE_NOT_FOUND = (
     "no module named pip",
     "no module named 'pip'",
@@ -571,6 +610,12 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
         install_cmd = f"{'sudo ' if sudo else ''}{pkg_manager} install {package} -y"
     elif system_type == "arch":
         install_cmd = f"{'sudo ' if sudo else ''}pacman -S --noconfirm {package}"
+    elif system_type == "alpine":
+        install_cmd = f"{'sudo ' if sudo else ''}apk add {package}"
+    elif system_type == "suse":
+        install_cmd = f"{'sudo ' if sudo else ''}zypper --non-interactive install {package}"
+    elif system_type == "gentoo":
+        install_cmd = f"{'sudo ' if sudo else ''}emerge --ask=n {package}"
     else:  # Default to debian/apt-get
         install_cmd = f"{'sudo ' if sudo else ''}apt-get install {package} -y"
 
@@ -633,16 +678,16 @@ def install_package(package, sudo = False, print_output = False, print_outputs =
         for line in sp.stdout:
             line = line.decode("utf-8", errors = "replace").rstrip()
 
-            if "Permission denied" in line or "not open lock file" in line or "are you root?" in line or "fatal" in line:
+            if any(marker in line for marker in NEEDS_ROOT):
                 sp.terminate()
                 raise RuntimeError(f"[FAIL] Unsloth: Permission denied when installing package {package}\n"\
                                    "This operation requires elevated sudo/root permissions. Please manually install missing packages and retry again"
                     )
             elif line.endswith(COMMANDS_NOT_FOUND):
                 sp.terminate()
-                pkg_mgr_name = {"rpm": "yum/dnf", "arch": "pacman"}.get(system_type, "apt-get")
+                pkg_mgr_name = PACKAGE_MANAGER_NAMES.get(system_type, "apt-get")
                 raise RuntimeError(f"[FAIL] Unsloth: {pkg_mgr_name} does not exist when installing {package}? Is this NOT a Linux / Mac based computer?")
-            elif "Unable to locate package" in line:
+            elif any(marker in line for marker in PACKAGE_NOT_FOUND):
                 sp.terminate()
                 raise RuntimeError(f"[FAIL] Unsloth: Could not install package {package} since it does not exist.")
             if print_output: print(line, flush = True, end = "")
@@ -667,6 +712,13 @@ def do_we_need_sudo(system_type="debian"):
         update_cmd = f"{pkg_manager} check-update"
     elif system_type == "arch":
         update_cmd = "pacman -Sy"
+    elif system_type == "alpine":
+        update_cmd = "apk update"
+    elif system_type == "suse":
+        update_cmd = "zypper --non-interactive refresh"
+    elif system_type == "gentoo":
+        # `emerge --sync` takes minutes (trips the 180 s timeout below) and portage always needs root.
+        return os.geteuid() != 0
     else:
         update_cmd = "apt-get update -y"
 
@@ -674,13 +726,13 @@ def do_we_need_sudo(system_type="debian"):
     with subprocess.Popen(update_cmd, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT) as sp:
         for line in sp.stdout:
             line = line.decode("utf-8", errors = "replace").rstrip()
-            if "Permission denied" in line or "not open lock file" in line or "are you root?" in line or "fatal" in line:
+            if any(marker in line for marker in NEEDS_ROOT):
                 sp.terminate()
                 sudo = True
                 break
             elif line.endswith(COMMANDS_NOT_FOUND):
                 sp.terminate()
-                pkg_mgr_name = {"rpm": "yum/dnf", "arch": "pacman"}.get(system_type, "apt-get")
+                pkg_mgr_name = PACKAGE_MANAGER_NAMES.get(system_type, "apt-get")
                 raise RuntimeError(f"[FAIL] Unsloth: {pkg_mgr_name} does not exist? Is this NOT a Linux / Mac based computer?")
             elif "failure resolving" in line or "Err:" in line:
                 sp.terminate()
@@ -699,7 +751,7 @@ def do_we_need_sudo(system_type="debian"):
     with subprocess.Popen(update_cmd_sudo, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT) as sp:
         for line in sp.stdout:
             line = line.decode("utf-8", errors = "replace").rstrip()
-            if "Permission denied" in line or "not open lock file" in line or "are you root?" in line or "fatal" in line:
+            if any(marker in line for marker in NEEDS_ROOT):
                 sp.terminate()
                 raise RuntimeError("[FAIL] Unsloth: Tried with sudo, but still failed?")
             elif "failure resolving" in line or "Err:" in line:
@@ -7433,40 +7485,22 @@ def check_build_requirements():
     system_type = check_linux_type()  # Get system type first
 
     for tool, package in required_tools.items():
-        try:
-            result = subprocess.run(['which', tool], capture_output=True, text=True)
-            if result.returncode != 0:
-                # Adjust package names for non-Debian systems
-                if system_type == "rpm":
-                    distro_packages = {
-                        'build-essential': 'gcc gcc-c++ make',
-                        'cmake': 'cmake',
-                        'curl': 'curl',
-                        'git': 'git',
-                    }
-                    package = distro_packages.get(package, package)
-                elif system_type == "arch":
-                    distro_packages = {
-                        'build-essential': 'base-devel',
-                        'cmake': 'cmake',
-                        'curl': 'curl',
-                        'git': 'git',
-                    }
-                    package = distro_packages.get(package, package)
-                missing_packages.append(package)
-        except Exception:
-            missing_packages.append(package)
+        # shutil.which, not `which`: minimal Fedora / Arch / openSUSE images lack the binary.
+        if shutil.which(tool) is None:
+            missing_packages.append(DISTRO_PACKAGES.get(system_type, {}).get(package, package))
 
     # Check for libgomp (OpenMP runtime) - needed for llama.cpp CPU backend linking
     gomp_path = _find_lib_path('libgomp.so')
     if gomp_path is None:
-        gomp_packages = {'debian': 'libgomp1', 'rpm': 'libgomp-devel', 'arch': 'gcc'}
+        gomp_packages = {'debian': 'libgomp1', 'rpm': 'libgomp', 'arch': 'gcc',
+                         'alpine': 'libgomp', 'suse': 'libgomp1', 'gentoo': 'sys-devel/gcc'}
         missing_packages.append(gomp_packages.get(system_type, 'libgomp1'))
 
     # Check for libssl-dev (OpenSSL development) - needed for HTTPS support
     ssl_path = _find_lib_path('libssl.so')
     if ssl_path is None:
-        ssl_packages = {'debian': 'libssl-dev', 'rpm': 'openssl-devel', 'arch': 'openssl'}
+        ssl_packages = {'debian': 'libssl-dev', 'rpm': 'openssl-devel', 'arch': 'openssl',
+                        'alpine': 'openssl-dev', 'suse': 'libopenssl-devel', 'gentoo': 'dev-libs/openssl'}
         missing_packages.append(ssl_packages.get(system_type, 'libssl-dev'))
 
     # Check for libcurl development headers
@@ -7514,8 +7548,44 @@ def check_libcurl_dev():
         except Exception:
             return False, package_name
 
+    elif system_type == "alpine":
+        package_name = "curl-dev"
+        try:
+            result = subprocess.run(['apk', 'info', '-e', package_name], capture_output=True, text=True)
+            return result.returncode == 0, package_name
+        except Exception:
+            return False, package_name
+
+    elif system_type == "suse":
+        package_name = "libcurl-devel"
+        try:
+            result = subprocess.run(['rpm', '-q', package_name], capture_output=True, text=True)
+            return result.returncode == 0, package_name
+        except Exception:
+            return False, package_name
+
+    elif system_type == "gentoo":
+        # net-misc/curl always installs its headers, so the header is the test.
+        return os.path.exists('/usr/include/curl/curl.h'), "net-misc/curl"
+
     return False, "libcurl4-openssl-dev"
 pass
+
+
+def _os_release_ids():
+    """ID and ID_LIKE tokens from /etc/os-release, lower-cased. Empty if unreadable."""
+    ids = set()
+    try:
+        with open('/etc/os-release', encoding='utf-8', errors='replace') as f:
+            for line in f:
+                key, _, value = line.strip().partition('=')
+                if key in ('ID', 'ID_LIKE'):
+                    ids.update(value.strip().strip('"').lower().split())
+    except OSError:
+        pass
+    return ids
+pass
+
 
 def check_linux_type():
     """Determine the linux distribution type"""
@@ -7540,6 +7610,16 @@ def check_linux_type():
     # Check if it's Arch-based (Arch/Manjaro):
     elif os.path.exists('/etc/arch-release'):
         return 'arch'
+
+    elif os.path.exists('/etc/alpine-release'):
+        return 'alpine'
+
+    elif os.path.exists('/etc/gentoo-release'):
+        return 'gentoo'
+
+    # openSUSE / SLES dropped /etc/SuSE-release.
+    elif _os_release_ids() & {'suse', 'sles'}:
+        return 'suse'
 
     return 'unknown'
 pass

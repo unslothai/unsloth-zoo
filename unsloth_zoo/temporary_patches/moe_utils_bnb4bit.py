@@ -351,8 +351,15 @@ def _log_moe_bnb4bit_backend_once(experts_module, message: str):
         logger.info(message)
 
 
+def _in_caller_dtype(output, hidden_states):
+    # As with the eager experts' index_add_ into zeros_like(hidden_states).
+    if isinstance(output, torch.Tensor) and output.dtype != hidden_states.dtype and hidden_states.dtype.is_floating_point:
+        return output.to(hidden_states.dtype)
+    return output
+
+
 def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights):
-    """bnb 4-bit MoE forward: dequantize experts to the input dtype, then
+    """bnb 4-bit MoE forward: dequantize experts to the half compute dtype (W4A16), then
     dispatch to the standard MoE backend (grouped_mm / triton / native).
 
     Mirrors `forward_moe_backend_fp8`. Base weights stay in 4-bit Params4bit
@@ -366,11 +373,10 @@ def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
         swap_moe_weights_for_call,
         _gate_up_is_interleaved,
         _moe_recompute_enabled,
+        moe_compute_dtype,
     )
 
-    target_dtype = hidden_states.dtype
-    if not target_dtype.is_floating_point:
-        target_dtype = torch.bfloat16
+    target_dtype = moe_compute_dtype(hidden_states)
 
     # Same recompute-vs-pin policy as forward_native_grouped_mm; recompute keeps the packed Params4bit.
     if (
@@ -380,7 +386,8 @@ def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
         and _moe_recompute_enabled(self.gate_up_proj, dtype=target_dtype)
     ):
         _log_moe_bnb4bit_backend_once(self, "Unsloth: MoE bnb4bit grouped_mm with backward-recompute.")
-        return forward_native_grouped_mm(self, hidden_states.to(target_dtype), top_k_index, top_k_weights)
+        output = forward_native_grouped_mm(self, hidden_states.to(target_dtype), top_k_index, top_k_weights)
+        return _in_caller_dtype(output, hidden_states)
 
     gate_up_weight = _dequantize_bnb4bit_expert_weights(self.gate_up_proj, target_dtype)
     down_weight = _dequantize_bnb4bit_expert_weights(self.down_proj, target_dtype)
@@ -398,7 +405,7 @@ def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
         _log_moe_bnb4bit_backend_once(self, "Unsloth: MoE bnb4bit using dequantize-plus-native_torch loop.")
         forward_fn = forward_native_moe_loop
 
-    return swap_moe_weights_for_call(
+    output = swap_moe_weights_for_call(
         self,
         gate_up_weight,
         down_weight,
@@ -407,6 +414,7 @@ def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
         top_k_index,
         top_k_weights,
     )
+    return _in_caller_dtype(output, hidden_states)
 
 
 # ============================================================================
