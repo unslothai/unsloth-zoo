@@ -15,3 +15,12 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 from .cross_entropy_loss import *
+from .forward_adapter import EMPTY_LOGITS, unsloth_fused_lm_head_loss
+from .forward_install import (
+    install_modeling_import_hook,
+    install_for_module,
+    install_for_class,
+    register_canonical,
+    audit,
+    is_enabled,
+)
