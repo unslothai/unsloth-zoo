@@ -23,6 +23,10 @@ from unsloth_zoo.temporary_patches import moe_utils, moe_utils_bnb4bit, moe_util
 
 E, K, FB, T = 4, 2, 128, 32
 needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
+needs_cuda_bf16 = pytest.mark.skipif(
+    not (torch.cuda.is_available() and torch.cuda.is_bf16_supported(including_emulation = False)),
+    reason = "bf16 autocast needs sm >= 80",
+)
 
 
 def test_compute_dtype_is_half():
@@ -112,7 +116,7 @@ def test_fp8_experts_dequantize_to_bf16_for_float32_activations_cpu(monkeypatch,
 
 
 @pytest.mark.gpu
-@needs_cuda
+@needs_cuda_bf16
 @pytest.mark.parametrize("autocast", [True, False])
 def test_fp8_experts_use_bf16_grouped_mm_for_float32_activations(monkeypatch, autocast):
     if not moe_utils._check_torch_grouped_mm_supported():
@@ -194,7 +198,7 @@ def test_qwen4_exp_ple_returns_the_residual_dtype(monkeypatch):
 
 
 @pytest.mark.gpu
-@needs_cuda
+@needs_cuda_bf16
 @needs_qwen4_exp
 def test_qwen4_exp_ple_keeps_bf16_under_cuda_autocast():
     ple, hidden, input_ids = _ple_layer("cuda")
@@ -208,7 +212,7 @@ def test_qwen4_exp_ple_keeps_bf16_under_cuda_autocast():
 
 
 @pytest.mark.gpu
-@needs_cuda
+@needs_cuda_bf16
 def test_half_stack_float32_activation_keeps_the_stack_dtype(monkeypatch):
     # Plain half stacks are not cast by the provider: fp16 weights under bf16 autocast need fp16 inputs.
     if not moe_utils._check_torch_grouped_mm_supported():
@@ -241,10 +245,20 @@ def test_half_stack_float32_activation_keeps_the_stack_dtype(monkeypatch):
 
 
 @pytest.mark.gpu
-@needs_cuda
+@needs_cuda_bf16
 @needs_qwen4_exp
 def test_qwen4_exp_ple_float32_residual_keeps_autocast():
     ple, hidden, input_ids = _ple_layer("cuda")
     with torch.no_grad(), torch.autocast("cuda", dtype = torch.bfloat16):
         out = ple(hidden.float(), input_ids, None)
     assert out.dtype == torch.float32
+
+
+@pytest.mark.gpu
+@needs_cuda
+def test_compute_dtype_is_fp16_on_a_pre_ampere_device(monkeypatch):
+    x32 = torch.randn(4, 8, device = "cuda")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device = None: (7, 5))
+    assert moe_utils.moe_compute_dtype(x32) is (torch.bfloat16 if torch.version.hip else torch.float16)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device = None: (8, 0))
+    assert moe_utils.moe_compute_dtype(x32) is torch.bfloat16

@@ -1098,7 +1098,12 @@ def moe_compute_dtype(hidden_states):
                 return autocast_dtype
     except (AttributeError, RuntimeError, TypeError):
         pass
-    if device_type == "cuda" and not torch.cuda.is_bf16_supported():
+    # The activation's own device; is_bf16_supported() reads the current one and counts sm < 80 emulation.
+    if (
+        device_type == "cuda"
+        and torch.version.hip is None
+        and torch.cuda.get_device_capability(hidden_states.device)[0] < 8
+    ):
         return torch.float16
     return torch.bfloat16
 
