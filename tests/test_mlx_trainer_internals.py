@@ -1219,10 +1219,16 @@ def test_trainer_drives_dynamic_lr_outside_optimizer_scheduler():
     assert zero_steps_ratio_trainer._resolve_warmup_steps(total_steps=100) == 10
 
 
-@pytest.mark.parametrize("warmup_steps, total_steps", [(0.1, 100), (0.05, 30), (0.1, 8)])
+@pytest.mark.parametrize(
+    "warmup_steps, total_steps",
+    [(0.1, 100), (0.05, 30), (0.1, 8), ("np.float32", 100)],
+)
 def test_fractional_warmup_steps_is_a_ratio_of_total_steps(warmup_steps, total_steps):
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
 
+    if warmup_steps == "np.float32":
+        np = pytest.importorskip("numpy")
+        warmup_steps = np.float32(0.1)
     trainer = MLXTrainer.__new__(MLXTrainer)
     trainer.args = MLXTrainingConfig(warmup_steps=warmup_steps)
     expected = math.ceil(total_steps * warmup_steps)

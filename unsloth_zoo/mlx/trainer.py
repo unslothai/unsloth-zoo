@@ -42,6 +42,7 @@ import concurrent.futures
 import hashlib
 import json
 import math
+import numbers
 import os
 from pathlib import Path
 import random
@@ -3767,8 +3768,9 @@ class MLXTrainer:
             return max(0, int(get_warmup_steps(total_steps)))
 
         warmup_steps = getattr(self.args, "warmup_steps", 0) or 0
-        if isinstance(warmup_steps, float) and 0 < warmup_steps < 1:
+        if isinstance(warmup_steps, numbers.Real) and 0 < warmup_steps < 1:
             # HF TrainingArguments.get_warmup_steps: below 1 is a ratio of total steps.
+            # Multiply in the value's own type: float(np.float32(0.1)) * 100 ceils to 11.
             warmup_steps = math.ceil(max(0, int(total_steps)) * warmup_steps)
         warmup_steps = int(warmup_steps)
         warmup_ratio = getattr(self.args, "warmup_ratio", 0.0)
