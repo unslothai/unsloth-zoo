@@ -1806,8 +1806,7 @@ pass
 
 
 def vllm_weights_memory_usage(config, load_in_4bit = False, load_in_8bit = False):
-    # Meta-device count, so MoE experts and vision towers are included; None if unbuildable
-    # or stored in a format not sized here.
+    # Meta-device count, so MoE experts and vision towers are included; None = use the formula.
     import fnmatch
     import transformers
     from accelerate import init_empty_weights
@@ -1815,7 +1814,6 @@ def vllm_weights_memory_usage(config, load_in_4bit = False, load_in_8bit = False
     quant_config = getattr(config, "quantization_config", None) or {}
     if not isinstance(quant_config, dict): quant_config = quant_config.to_dict()
     quant_method = quant_config.get("quant_method", None)
-    # A subconfig-scoped quantization_config is not sized here
     if not quant_config and any(
         getattr(getattr(config, key, None), "quantization_config", None)
         for key in ("text_config", "vision_config", "audio_config")
@@ -1849,9 +1847,8 @@ def vllm_weights_memory_usage(config, load_in_4bit = False, load_in_8bit = False
     except Exception:
         pass
 
-    # Checkpoint keys say language_model.model.layers, modules model.language_model.layers,
-    # and vLLM aliases say model.layers. Dotted entries are anchored so a text-layer alias
-    # never matches the vision tower's layer of the same index.
+    # Skip entries spell text layers language_model.model.*, model.language_model.* or model.*;
+    # anchored, so model.layers.0 never matches vision_tower...layers.0.
     def _norm(name):
         return "." + ".".join(x for x in name.split(".") if x != "model") + "."
     skip_modules = []
@@ -1866,19 +1863,17 @@ def vllm_weights_memory_usage(config, load_in_4bit = False, load_in_8bit = False
             elif any(fnmatch.fnmatchcase(x, _norm(module) + "*") for x in names):
                 return True
         return False
-    # Parameters transformers never places on the accelerator (Qwen4Exp's n-gram
-    # table), which vLLM also offloads to CPU by default (VLLM_PLE_CPU_OFFLOAD).
+    # Qwen4Exp's n-gram table: vLLM keeps it on CPU unless VLLM_PLE_CPU_OFFLOAD=0.
     no_placement = getattr(meta_model, "_no_placement_params", None) or []
-    # Model-declared full-precision modules (relative names, e.g. DeepSeek-V4 indexers)
     keep_full = [
         "." + x + "." for key in ("_keep_in_fp32_modules", "_keep_in_fp32_modules_strict")
         for x in (getattr(meta_model, key, None) or [])
     ]
     if os.environ.get("VLLM_PLE_CPU_OFFLOAD", "1").strip() == "0": no_placement = []
 
-    # Quantizers pack Linear weights and stacked (3D) expert weights, never embeddings or convs.
+    # Quantizers pack Linear / Conv1D and stacked expert weights, never embeddings or convs.
     unpacked_types = (torch.nn.Embedding, torch.nn.modules.conv._ConvNd)
-    from transformers.pytorch_utils import Conv1D # GPT-2 style projections, packed by bnb
+    from transformers.pytorch_utils import Conv1D
     linear_types = (torch.nn.Linear, Conv1D)
     weight_bytes, seen = 0, set()
     for module_name, module in meta_model.named_modules():
