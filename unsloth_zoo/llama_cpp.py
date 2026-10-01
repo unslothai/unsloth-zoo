@@ -1125,9 +1125,18 @@ def _gpu_cmake_flags(gpu_support):
     hip_clang = os.path.join(rocm_path, "llvm", "bin", "clang")
     if os.path.exists(hip_clang):
         flags.append(f"-DCMAKE_HIP_COMPILER={hip_clang}")
-    target = _detect_gpu_target()
-    if target is not None and target[0] == "rocm":
-        flags.append(f"-DGPU_TARGETS={target[1]}")
+    # Every visible arch, not just device 0, so a mixed-arch host gets code objects for each card.
+    targets = []
+    try:
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                gfx = (getattr(torch.cuda.get_device_properties(i), "gcnArchName", "") or "").split(":")[0]
+                if gfx.startswith("gfx") and gfx not in targets:
+                    targets.append(gfx)
+    except Exception:
+        pass
+    if targets:
+        flags.append(f"-DGPU_TARGETS={';'.join(targets)}")
     print(f"Unsloth: Detected ROCm - building llama.cpp with HIP ({' '.join(flags)})")
     return flags
 
