@@ -908,6 +908,12 @@ def _probe_torch_grouped_mm_supported():
         _TORCH_GROUPED_MM_SUPPORTED = False
         return False
 
+    # Short-circuit on ROCm: torch._grouped_mm segfaults the process on some AMD hardware
+    # rather than raising a Python exception, which crashes the import eagerly.
+    if getattr(torch.version, "hip", None) is not None:
+        _TORCH_GROUPED_MM_SUPPORTED = False
+        return False
+
     try:
         # Dummy call verifies real support (symbol may exist but hardware unsupported, e.g. < H100).
         dtype = torch.float16
