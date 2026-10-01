@@ -263,6 +263,26 @@ def _isolate_xet_health_state(tmp_path_factory, monkeypatch):
         yield
 
 
+# grpo_accumulated_loss sets UNSLOTH_RETURN_HIDDEN_STATES=1 and only resets it on its way out, so
+# a test that stops it part way (test_grpo_autotune_per_step raises _Stop from inside it) leaves the
+# flag on for the rest of its xdist worker. Every patched causal LM forward then returns hidden
+# states and loss=None, and test_gpt_oss_router_logits_capture failed on
+# `'NoneType' object has no attribute 'backward'` whenever it followed one of those on a worker.
+import os as _os
+
+_HIDDEN_STATES_FLAG = "UNSLOTH_RETURN_HIDDEN_STATES"
+
+
+@_pytest.fixture(autouse = True)
+def _restore_hidden_states_flag():
+    before = _os.environ.get(_HIDDEN_STATES_FLAG)
+    yield
+    if before is None:
+        _os.environ.pop(_HIDDEN_STATES_FLAG, None)
+    else:
+        _os.environ[_HIDDEN_STATES_FLAG] = before
+
+
 # A test that swaps a module into sys.modules and does not swap it back breaks whatever
 # imports that name later IN THE SAME PROCESS. Serially that is often invisible, because
 # the victim happens to sort before the polluter and never sees it; under pytest-xdist a

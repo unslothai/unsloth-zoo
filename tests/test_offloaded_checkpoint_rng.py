@@ -142,3 +142,30 @@ def test_offloaded_stays_correct_across_repeated_steps(offload_module):
         actual   = _run(checkpoint, {"preserve_rng_state" : True}, device)
         for got, want in zip(actual, expected):
             torch.testing.assert_close(got, want, msg = lambda m, s = step: f"step {s}: {m}")
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_offloaded_replay_keeps_the_forward_dtype(offload_module, dtype):
+    """bf16 buffers used to hand an fp16 (or fp32) activation back converted, so the
+    replay ran in another dtype than the forward and hit a matmul against the
+    layer's own weights (gpt-oss fp16: "mat1 and mat2 must have the same dtype")."""
+    device = torch.device("cuda")
+    seen = []
+    weight = torch.randn(SHAPE[-1], SHAPE[-1], dtype = dtype, device = device) / 32
+
+    def block(hidden):
+        seen.append(hidden.dtype)
+        return hidden @ weight   # raises on a converted replay
+
+    torch.manual_seed(1234)
+    hidden = torch.randn(SHAPE, dtype = dtype, device = device, requires_grad = True)
+    before = offload_module.CPU_INDEX
+    output = offload_module.unsloth_offloaded_gradient_checkpoint(block, hidden, use_reentrant = True)
+    assert offload_module.CPU_INDEX > before, "activation was not offloaded"
+    output.float().sum().backward()
+    torch.cuda.synchronize()
+
+    assert seen == [dtype, dtype]
+    reference = hidden.detach().clone().requires_grad_(True)
+    (reference @ weight).float().sum().backward()
+    torch.testing.assert_close(hidden.grad, reference.grad)

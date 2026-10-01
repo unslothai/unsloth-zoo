@@ -513,6 +513,18 @@ def test_vlm_requests_reject_token_id_prompts_and_unsupported_controls():
     assert _validate_vlm_requests([GenerationRequest(prompt="a", image=pathlib.Path("/tmp/i.png"))], GenerationDefaults())[0].image == "/tmp/i.png"  # noqa: E501
 
 
+def test_a_prompt_cache_state_is_taken_only_by_a_vision_stream_row():
+    from unsloth_zoo.mlx.generate import _stream_batch, _validate_text_requests
+    with pytest.raises(TypeError, match="open\\(\\) and checkpoint\\(\\)"):
+        GenerationRequest(prompt="a", prompt_cache_state=object())
+    state = types.SimpleNamespace(open=lambda ids: ([], ()), checkpoint=lambda n, cache: None)
+    with pytest.raises(ValueError, match="only a vision BatchStream row"):
+        _validate_text_requests([GenerationRequest(prompt="a", prompt_cache_state=state)], GenerationDefaults())
+    vlm = types.SimpleNamespace(_is_vlm_model=True, language_model=None)
+    with pytest.raises(ValueError, match="taken only by a BatchStream row"):
+        list(_stream_batch(vlm, object(), [GenerationRequest(prompt="a", prompt_cache_state=state)]))
+
+
 def test_prompt_kwargs_fallback_splits_mrope_on_the_batch_axis():
     # MRoPE position_ids are [3, batch, sequence]; axis 0 would hand every row
     # the same rope section.
@@ -1539,11 +1551,12 @@ def test_a_prefill_batch_charges_each_row_its_own_prompt_and_not_the_padded_widt
 
 
 def test_the_fusion_scopes_tolerate_whatever_named_modules_yields():
-    # generation_mode enters both inference fusions for any model it is handed, and
+    # generation_mode enters every inference fusion for any model it is handed, and
     # these tests hand it plain stand-ins. The decode scope reads a module's own dict
     # entries, which only an mlx Module has, so a non-Module must be skipped rather
     # than raising TypeError out of the generation path.
-    from unsloth_zoo.mlx.inference import fused_decode_conv_silu, fused_moe_gate_up
+    from unsloth_zoo.mlx.inference import (fused_decode_conv_silu, fused_moe_gate_up, fused_moe_router,
+                                           fused_residual_norm)
     # Bare too: _snapshot_training_flags already tolerates an entry with no `training`,
     # so a scope that reads it before deciding the entry is a candidate raises instead.
     for stub in (types.SimpleNamespace(training = False), types.SimpleNamespace()):
@@ -1551,5 +1564,38 @@ def test_the_fusion_scopes_tolerate_whatever_named_modules_yields():
             training = False,
             named_modules = lambda: [("plain", stub)],
         )
-        with fused_moe_gate_up(model), fused_decode_conv_silu(model):
+        with fused_moe_gate_up(model), fused_decode_conv_silu(model), fused_residual_norm(model), \
+                fused_moe_router(model):
             pass
+
+
+def test_cache_layout_tells_quantized_packings_apart():
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.generate import _cache_layout
+
+    def cache(bits, group_size):
+        return [SimpleNamespace(offset = 0, bits = bits, group_size = group_size)]
+
+    assert _cache_layout(cache(8, 64)) == _cache_layout(cache(8, 64))
+    assert _cache_layout(cache(8, 64)) != _cache_layout(cache(4, 64))
+    assert _cache_layout(cache(8, 64)) != _cache_layout(cache(8, 32))
+
+
+def test_row_quantizer_starts_uniform_rows_at_the_first_token():
+    from unsloth_zoo.mlx.generate import _row_quantizer
+
+    class BatchGenerator:
+        def __init__(self, model, kv_bits=None, kv_group_size=64, kv_quant_scheme="uniform", quantized_kv_start=5000):
+            pass
+
+    module = types.SimpleNamespace(
+        BatchGenerator=BatchGenerator,
+        maybe_quantize_kv_cache=lambda *a, **k: None,
+        turboquant_enabled=lambda bits, scheme=None: scheme == "turboquant" or float(bits) != int(bits),
+    )
+    assert _row_quantizer(module, {}) is None
+    uniform = _row_quantizer(module, {"kv_bits": 4})
+    assert uniform.keywords == {"kv_group_size": 64, "quantized_kv_start": 0, "kv_bits": 4}
+    turbo = _row_quantizer(module, {"kv_bits": 3.5, "kv_quant_scheme": "turboquant"})
+    assert turbo.keywords["quantized_kv_start"] == 5000

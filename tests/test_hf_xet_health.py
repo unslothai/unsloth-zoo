@@ -261,6 +261,59 @@ def test_probe_404_is_inconclusive_not_a_demotion(monkeypatch):
     assert not health.health_state_path().exists(), "an inconclusive probe must persist nothing"
 
 
+def test_probe_401_is_inconclusive_not_a_demotion(monkeypatch):
+    """Nothing is sent, so a 401 only means auth was never attempted.
+
+    The 404 test cannot reach this arm: `or` short-circuits before the 401 half is evaluated.
+    `is None` below, not falsiness: the bug this guards returned False, which is falsy too.
+    """
+    import urllib.error
+    import urllib.request
+
+    _big_machine(monkeypatch)
+    monkeypatch.setattr(health, "_probe_cas_reachable", _UNSTUBBED_PROBE)
+    # Without a discoverable token this goes vacuous on any CI runner: the old code reached its
+    # inconclusive arm whenever no credential was found.
+    monkeypatch.setenv("HF_TOKEN", "hf_dummyTokenForTestsOnly000000000000")
+
+    def _raise(*args, **kwargs):
+        raise urllib.error.HTTPError("http://gated/x", 401, "Unauthorized", None, None)
+
+    monkeypatch.setattr(urllib.request, "urlopen", _raise)
+
+    ok, reason = health._probe_cas_reachable()
+    assert ok is None, reason
+
+    verdict = health.xet_health(force = True, probe = True)
+    assert verdict.use_xet is True
+    assert verdict.source == "default"
+    assert not health.health_state_path().exists(), "an inconclusive probe must persist nothing"
+
+
+def test_probe_429_is_inconclusive_not_a_demotion(monkeypatch):
+    """Throttling is not evidence that CAS is unreachable, and anonymity invites it: the /api/
+    quota is 500 per 5min shared PER IP against 1,000 per user (huggingface.co/docs/hub/rate-limits).
+    """
+    import urllib.error
+    import urllib.request
+
+    _big_machine(monkeypatch)
+    monkeypatch.setattr(health, "_probe_cas_reachable", _UNSTUBBED_PROBE)
+
+    def _raise(*args, **kwargs):
+        raise urllib.error.HTTPError("http://hf/x", 429, "Too Many Requests", None, None)
+
+    monkeypatch.setattr(urllib.request, "urlopen", _raise)
+
+    ok, reason = health._probe_cas_reachable()
+    assert ok is None, reason
+
+    verdict = health.xet_health(force = True, probe = True)
+    assert verdict.use_xet is True
+    assert verdict.source == "default"
+    assert not health.health_state_path().exists(), "a throttled probe must not persist a demotion"
+
+
 def test_probe_403_still_demotes(monkeypatch):
     """A blocking corporate proxy legitimately answers 403, and that machine should use HTTP."""
     import urllib.error

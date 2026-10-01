@@ -65,7 +65,7 @@ from unsloth_zoo.temporary_patches.common import (
     UNSLOTH_ENABLE_LOGGING,
 )
 from .log import logger
-from .device_type import DEVICE_TYPE, is_hip
+from .device_type import DEVICE_TYPE, is_hip, device_is_bf16_supported
 global LORA_REQUEST_ID
 
 # Align FlashInfer workspace with Unsloth compiled cache to avoid stale JIT paths.
@@ -99,9 +99,18 @@ def get_target_device(index = 0):
         return torch.device("cuda", index)
     return torch.device(DEVICE_TYPE, index)
 
+def _device_empty_cache():
+    if DEVICE_TYPE == "npu":
+        torch.npu.empty_cache()
+    else:
+        torch.cuda.empty_cache()
+pass
+
 def get_mem_info():
     if DEVICE_TYPE == "xpu":
         free_memory, total_memory = torch.xpu.mem_get_info()
+    elif DEVICE_TYPE == "npu":
+        free_memory, total_memory = torch.npu.mem_get_info()
     else:
         free_memory, total_memory = torch.cuda.mem_get_info()
     return free_memory, total_memory
@@ -110,6 +119,17 @@ pass
 # Whichever bitsandbytes module we resolved below, if vLLM is installed at all.
 # Defined out here because load_vllm reads it and lives outside that branch.
 _vllm_bnb = None
+
+
+def _resolve_bnb_compute_dtype(kwargs):
+    # vLLM >= 0.28 builds the plugin config with no kwargs for online quantization,
+    # so fall back to the dtype the GPU computes in.
+    dtype = os.environ.get("UNSLOTH_bnb_4bit_compute_dtype")
+    if dtype is None:
+        dtype = kwargs.get("bnb_4bit_compute_dtype")
+    if dtype is None:
+        dtype = "bfloat16" if device_is_bf16_supported() else "float16"
+    return dtype
 
 
 def _set_registered_quant_config(method, config_cls):
@@ -341,8 +361,7 @@ if importlib.util.find_spec("vllm") is not None:
     class BitsAndBytesConfig(_BitsAndBytesConfigBase):
         # All Unsloth Zoo code licensed under LGPLv3
         def __init__(self, *args, **kwargs):
-            dtype = os.environ.get("UNSLOTH_bnb_4bit_compute_dtype", kwargs["bnb_4bit_compute_dtype"])
-            kwargs["bnb_4bit_compute_dtype"] = dtype
+            kwargs["bnb_4bit_compute_dtype"] = _resolve_bnb_compute_dtype(kwargs)
             print(f"Unsloth: vLLM Bitsandbytes config using kwargs = {kwargs}")
             super().__init__(*args, **kwargs)
         pass
@@ -660,7 +679,7 @@ def patch_vllm_enable_sleep_mode():
 
         logger.debug(f'CPU offloads {cpu_offloads} true offloads {true_offloads} total {total_offloads}')
         gc.collect()
-        torch.cuda.empty_cache()
+        _device_empty_cache()
     pass
 
     def wake_up(self, tags: Optional[List[str]] = None) -> None:
@@ -686,7 +705,7 @@ def patch_vllm_enable_sleep_mode():
     pass
 
     def delete_memory():
-        torch.cuda.empty_cache()
+        _device_empty_cache()
         gc.collect()
     pass
 
@@ -823,7 +842,7 @@ def patch_vllm_graph_capture():
             )
             for _ in range(2):
                 gc.collect()
-                torch.cuda.empty_cache()
+                _device_empty_cache()
             return result
         pass
         GPUModelRunner.capture_model = capture_model_wrapper_v1
@@ -852,12 +871,55 @@ def patch_vllm_graph_capture():
                 )
                 for _ in range(2):
                     gc.collect()
-                    torch.cuda.empty_cache()
+                    _device_empty_cache()
                 return result
             pass
             GPUModelRunnerBase.capture_model = capture_model_wrapper_v0
         except Exception as e:
             print(f"Unsloth: Could not patch vLLM V0 graph capture: {e}")
+pass
+
+
+def patch_vllm_processed_logprobs_fast_path():
+    # V1 drops FlashInfer engine-wide under processed_logprobs; V2 only on logprob steps, as here.
+    try:
+        from vllm.v1.sample.sampler import Sampler
+        from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
+    except Exception:
+        return
+    if hasattr(Sampler.forward, "_unsloth_processed_fast_path"): return
+    original_forward = Sampler.forward
+
+    @functools.wraps(original_forward)
+    def forward(self, logits, sampling_metadata, *args, **kwargs):
+        if (
+            str(getattr(self, "logprobs_mode", "")).startswith("processed_")
+            and kwargs.get("logprobs_mode_override") is None
+            and len(args) < 2
+            and getattr(sampling_metadata, "max_num_logprobs", 0) is None
+            and not getattr(sampling_metadata, "logprob_token_ids", None)
+        ):
+            fast = self.__dict__.get("_unsloth_raw_topk_topp_sampler")
+            if fast is None:
+                try:
+                    fast = TopKTopPSampler("raw_logprobs")
+                    if hasattr(self.topk_topp_sampler, "use_fp64_gumbel"):
+                        fast.use_fp64_gumbel = self.topk_topp_sampler.use_fp64_gumbel
+                except Exception:
+                    fast = False
+                self.__dict__["_unsloth_raw_topk_topp_sampler"] = fast
+            if fast is False:
+                return original_forward(self, logits, sampling_metadata, *args, **kwargs)
+            processed = self.topk_topp_sampler
+            self.topk_topp_sampler = fast
+            try:
+                return original_forward(self, logits, sampling_metadata, *args, **kwargs)
+            finally:
+                self.topk_topp_sampler = processed
+        return original_forward(self, logits, sampling_metadata, *args, **kwargs)
+
+    forward._unsloth_processed_fast_path = True
+    Sampler.forward = forward
 pass
 
 
@@ -892,6 +954,7 @@ def patch_vllm(debug = True):
         patch_vllm_enable_sleep_mode()
         patch_vllm_reset_caches_on_sleep()
     patch_vllm_graph_capture()
+    patch_vllm_processed_logprobs_fast_path()
     global LORA_REQUEST_ID
     LORA_REQUEST_ID = 1
 pass
@@ -1012,9 +1075,9 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
     state_dict = OrderedDict()
     quant_state_dict = OrderedDict()
 
-    # AMD ROCm (gfx9xx) and XPU: SM architecture (SM80/SM90) concepts don't apply.
+    # AMD ROCm (gfx9xx), XPU and NPU: SM architecture (SM80/SM90) concepts don't apply.
     # CUTLASS block FP8 and DeepGEMM are NVIDIA Hopper (SM90) only.
-    if not is_hip() and DEVICE_TYPE != "xpu":
+    if not is_hip() and DEVICE_TYPE not in ("xpu", "npu"):
         capability = torch.cuda.get_device_capability()
         sm_cap = capability[0] * 10 + capability[1]
     else:
@@ -1175,7 +1238,11 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         gemma4_kv_shared_layers = set()
 
     # Embedding
-    if hasattr(vllm_internals, "model"): # Standard Language models
+    if hasattr(vllm_internals, "model") and hasattr(vllm_internals.model, "text_model"):
+        # Idefics3 nests the text model at model.text_model
+        vllm_text_model = vllm_internals.model.text_model
+        vllm_text_model_prefix = "model.text_model"
+    elif hasattr(vllm_internals, "model"): # Standard Language models
         vllm_text_model = vllm_internals.model
         vllm_text_model_prefix = "model"
     elif hasattr(vllm_internals, "language_model"):
@@ -1208,7 +1275,9 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         if hasattr(layer, "self_attn"):
             prefix = f"{vllm_text_model_prefix}.layers.{kk}.self_attn"
             qkv_proj = layer.self_attn.qkv_proj
-            o_proj = layer.self_attn.o_proj
+            # LFM2 names the attention output projection out_proj
+            o_proj_name = "o_proj" if hasattr(layer.self_attn, "o_proj") else "out_proj"
+            o_proj = getattr(layer.self_attn, o_proj_name)
 
             use_fused_qkv = _is_fused_module("qkv_proj")
             if use_fused_qkv:
@@ -1222,7 +1291,7 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
                     get_state_dict(f"{prefix}.k_proj", 1, state_dict, qkv_proj)
                 if kk not in gemma4_kv_shared_layers:
                     get_state_dict(f"{prefix}.v_proj", 2, state_dict, qkv_proj)
-            get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
+            get_state_dict(f"{prefix}.{o_proj_name}", 0, state_dict, o_proj)
         elif hasattr(layer, "cross_attn"):
             prefix = f"{vllm_text_model_prefix}.layers.{kk}.cross_attn"
             qkv_proj = layer.cross_attn.qkv_proj
@@ -1242,6 +1311,11 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
                 f"{vllm_text_model_prefix}.layers.{kk}.linear_attn",
                 state_dict, quant_state_dict, get_state_dict,
             )
+        elif hasattr(layer, "short_conv"):
+            # LFM2 conv layers: vLLM short_conv is HF conv; in_proj stays fused as in HF
+            prefix = f"{vllm_text_model_prefix}.layers.{kk}.conv"
+            for name in ("in_proj", "out_proj", "conv"):
+                get_state_dict(f"{prefix}.{name}", 0, state_dict, getattr(layer.short_conv, name), slice_weights=False)
         pass
 
         if hasattr(layer, "per_layer_input_gate"):
@@ -1275,6 +1349,53 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             state_dict[f"{vllm_text_model_prefix}.layers.{kk}.layer_scalar"] = layer.layer_scalar.data
             quant_state_dict[f"{vllm_text_model_prefix}.layers.{kk}.layer_scalar"] = layer.layer_scalar.data
 
+        # LFM2: vLLM fuses HF w1 (gate) + w3 (up) as w13 (w1 in vLLM <= 0.15)
+        feed_forward = getattr(layer, "feed_forward", None)
+        w13 = getattr(feed_forward, "w13", None) or getattr(feed_forward, "w1", None)
+        experts = getattr(feed_forward, "experts", None)
+        experts = getattr(experts, "base_layer", experts)  # FusedMoEWithLoRA under enable_lora
+        prefix = f"{vllm_text_model_prefix}.layers.{kk}.feed_forward"
+        if not hasattr(layer, "mlp") and w13 is not None:
+            get_state_dict(f"{prefix}.w1", 0, state_dict, w13)
+            get_state_dict(f"{prefix}.w3", 1, state_dict, w13)
+            get_state_dict(f"{prefix}.w2", 0, state_dict, feed_forward.w2)
+        elif not hasattr(layer, "mlp") and hasattr(getattr(experts, "routed_experts", experts), "w13_weight"):
+            # LFM2-MoE: FusedMoE w13 [E, 2I, H] / w2 [E, H, I] = HF gate_up_proj / down_proj (vLLM >= 0.30: on routed_experts)
+            routed = getattr(experts, "routed_experts", experts)
+            quant_method = getattr(routed, "quant_method", None)
+            quant_method = getattr(quant_method, "old_quant_method", quant_method)  # FusedMoEModularMethod
+            backend = getattr(quant_method, "unquantized_backend", None)
+            backend = getattr(backend, "name", backend)
+            w13, w2 = routed.w13_weight, routed.w2_weight
+            # Other backends reorder w13 at load; TRTLLM is vLLM's pick for LoRA-enabled bf16 MoE on Blackwell.
+            if backend not in (None, "TRITON", "BATCHED_TRITON") or w13.dim() != 3 or w2.dim() != 3 \
+                or w13.shape[1] != 2 * w2.shape[2] or w13.shape[2] != w2.shape[1]:
+                raise NotImplementedError(
+                    f"Unsloth: fast_inference cannot rebuild MoE experts from vLLM's {backend} layout "
+                    f"(w13 {tuple(w13.shape)}, w2 {tuple(w2.shape)}); set fast_inference = False."
+                )
+            moe_tensors = {
+                f"{prefix}.experts.gate_up_proj": w13,
+                f"{prefix}.experts.down_proj": w2,
+                f"{prefix}.gate.weight": feed_forward.gate.weight,
+            }
+            expert_bias = getattr(feed_forward.gate, "e_score_correction_bias", None)
+            if expert_bias is not None:
+                moe_tensors[f"{prefix}.expert_bias"] = expert_bias
+            for key, value in moe_tensors.items():
+                # float8 also passes is_floating_point(); its scales are not carried over
+                if value.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+                    raise NotImplementedError(
+                        f"Unsloth: fast_inference cannot rebuild quantized MoE weights ({key}); "
+                        "load the model in 16-bit or set fast_inference = False."
+                    )
+                state_dict[key] = value.data
+                quant_state_dict[key] = value.data
+        elif not hasattr(layer, "mlp") and feed_forward is not None:
+            raise NotImplementedError(
+                f"Unsloth: fast_inference cannot rebuild layer {kk}'s {type(feed_forward).__name__} from vLLM; "
+                "set fast_inference = False."
+            )
         if not hasattr(layer, "mlp"):
             continue
 
@@ -1298,9 +1419,10 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
 
     if is_vision_model:
         extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_state_dict)
-    # Norm (under model.norm for both standard and multimodal models)
-    norm_prefix = f"{vllm_text_model_prefix}.norm.weight"
-    state_dict[norm_prefix] = vllm_text_model.norm.weight.data
+    # Final norm: model.norm, or model.embedding_norm on LFM2
+    norm_name = "norm" if hasattr(vllm_text_model, "norm") else "embedding_norm"
+    norm_prefix = f"{vllm_text_model_prefix}.{norm_name}.weight"
+    state_dict[norm_prefix] = getattr(vllm_text_model, norm_name).weight.data
     quant_state_dict[norm_prefix] = state_dict[norm_prefix]
 
     # Gemma4 top-level per-layer-input modules
@@ -1520,6 +1642,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     pass
 
     skipped_layernorms = []
+    loaded_buffers = []
     for kk in range(layer_count):
         for layer_name in layer_names:
             layer_name = layer_name.format(kk = kk)
@@ -1567,6 +1690,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 parent = eval(f"new_model.{parent_path}") if parent_path else new_model
                 if attr_name in getattr(parent, "_buffers", {}):
                     parent._buffers[attr_name] = raw_value
+                    loaded_buffers.append((parent, attr_name, raw_value))
                 else:
                     layer = torch.nn.Parameter(raw_value, requires_grad = False)
                     exec(f"new_model.{layer_name_br} = layer")
@@ -1610,8 +1734,8 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 layer.to = partial(_override_to, layer)
                 layer.weight.to = partial(_override_to, layer.weight)
 
-            elif layer_name.endswith(".conv1d") and "linear_attn" in layer_name:
-                # Qwen3.5 GDN depthwise Conv1d: rebuild with real channels/kernel/groups.
+            elif (layer_name.endswith(".conv1d") and "linear_attn" in layer_name) or layer_name.endswith(".conv.conv"):
+                # Qwen3.5 GDN / LFM2 depthwise Conv1d: rebuild with real channels/kernel/groups.
                 from torch.nn import Conv1d
                 conv_weight = _unwrap_tensor(weight)
                 channels = conv_weight.shape[0]
@@ -1662,6 +1786,9 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
         quantization_config = quantization_config,
         bnb_config = bnb_config,
     )
+    # finalize copies every buffer from the meta template (e.g. zeroed LFM2-MoE expert_bias)
+    for parent, attr_name, raw_value in loaded_buffers:
+        parent._buffers[attr_name] = raw_value
 
     # Must override or else Bitsandbytes will error
     new_model.to = partial(_override_to, new_model)
@@ -1670,7 +1797,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     # Cleanup
     for _ in range(3):
         gc.collect()
-        torch.cuda.empty_cache()
+        _device_empty_cache()
 
     if len(skipped_layernorms) != 0:
         print(f"Unsloth: Just some info: will skip parsing {list(set(skipped_layernorms))}")
@@ -2296,8 +2423,8 @@ def _clear_flashinfer_env_on_hip():
     # Remove any forced FlashInfer selection unconditionally, even when the package
     # is not installed but the env var was inherited, so vLLM does not try to use
     # FlashInfer and falls back to the ROCm/default attention backend. Returns True
-    # on HIP so the caller skips the CUDA FlashInfer setup.
-    if not is_hip():
+    # on HIP or NPU so the caller skips the CUDA FlashInfer setup.
+    if not is_hip() and DEVICE_TYPE != "npu":
         return False
     _fi_forced = False
     for _fi_env in ("VLLM_USE_FLASHINFER_SAMPLER", "VLLM_ATTENTION_BACKEND"):
@@ -2305,7 +2432,8 @@ def _clear_flashinfer_env_on_hip():
             del os.environ[_fi_env]
             _fi_forced = True
     if _fi_forced or importlib.util.find_spec("flashinfer"):
-        logger.info("Unsloth: FlashInfer skipped on AMD ROCm (requires CUDA nvcc). Using vLLM built-in attention.")
+        _platform = "Ascend NPU" if DEVICE_TYPE == "npu" else "AMD ROCm"
+        logger.info(f"Unsloth: FlashInfer skipped on {_platform} (requires CUDA nvcc). Using vLLM built-in attention.")
     return True
 
 
@@ -2804,6 +2932,8 @@ def load_vllm(
         _dtype = torch.bfloat16
     elif DEVICE_TYPE == "xpu":
         _dtype = torch.bfloat16
+    elif DEVICE_TYPE == "npu" and torch.npu.is_bf16_supported():
+        _dtype = torch.bfloat16
     else:
         _dtype = torch.float16
     if dtype == torch.bfloat16 and _dtype == torch.float16:
@@ -2995,8 +3125,12 @@ def load_vllm(
             # Each sequence carries an image (~thousands of tokens) in vLLM
             # profiling; cap seqs low for vision models.
             # TODO: vLLM V1 profiling may cap max seqs by budget; check.
-            print(f'Unsloth: Vision model detected, setting approx_max_num_seqs to 1')
-            approx_max_num_seqs = 1
+            if max_num_seqs not in (None, 256):
+                print(f'Unsloth: Vision model detected, honoring max_num_seqs = {max_num_seqs}')
+                approx_max_num_seqs = max_num_seqs
+            else:
+                print(f'Unsloth: Vision model detected, setting approx_max_num_seqs to 1')
+                approx_max_num_seqs = 1
             # One image is ~6404 tokens (Llama 3.2) / ~16Ki (qwen 2.5 VL); leave room for text.
             max_num_batched_tokens = max(8192, max_seq_length)
 
@@ -3028,6 +3162,9 @@ def load_vllm(
             platform = "Intel GPU"
             gpu_eu_count = torch.xpu.get_device_properties(0).gpu_eu_count
             message = f"{platform} has eu:{gpu_eu_count}"
+        elif DEVICE_TYPE == "npu":
+            platform = "Ascend NPU"
+            message = f"{platform} {torch.npu.get_device_name(0)}"
         else:
             platform = "CUDA"
             major_version, minor_version = torch.cuda.get_device_capability()
@@ -3160,6 +3297,8 @@ def load_vllm(
             max_num_batched_tokens = max_num_batched_tokens,
             max_num_seqs           = approx_max_num_seqs, # vLLM default uses 256 -> reduce if OOM
             max_logprobs           = max_logprobs, # Disallow logprobs being returned
+            # Match TRL when reusing this engine for RL, including temperature scaling.
+            logprobs_mode          = "processed_logprobs" if training else "raw_logprobs",
             seed                   = random_state, # Default is 0
 
             # lora_extra_vocab_size = 0, # Breaks vLLM so we leave it as 256
@@ -3312,7 +3451,7 @@ def load_vllm(
                 # Cleanup
                 for _ in range(3):
                     gc.collect()
-                    torch.cuda.empty_cache()
+                    _device_empty_cache()
                 pass
                 error = str(error)
                 # `expandable_segments:True` + sleep/standby mode is a deterministic
@@ -3426,7 +3565,7 @@ def load_vllm(
     # Cleanup
     for _ in range(3):
         gc.collect()
-        torch.cuda.empty_cache()
+        _device_empty_cache()
     return llm
 pass
 
@@ -3571,7 +3710,8 @@ def load_lora_directly(model):
         if s is not None: vllm_lora_B *= s
     pass
     # Must block!
-    torch.cuda.synchronize()
+    if DEVICE_TYPE == "npu": torch.npu.synchronize()
+    else: torch.cuda.synchronize()
 pass
 
 
@@ -3628,6 +3768,358 @@ def return_lora_modules(
 pass
 
 
+# Whole dotted segments (not substrings, so Qwen MoE's dense `shared_expert` stays
+# servable). "moe" is the Gemma 4 spelling saving_utils.py remaps to ".experts".
+_MOE_EXPERT_LORA_SEGMENTS = ("experts", "moe")
+
+# Names that only mean "expert" under their parent: GraniteMoE's experts on transformers
+# 4.57 to 5.0. The same pair is a DENSE nn.Linear at shared_mlp.input_linear in
+# granitemoeshared / _swa / hybrid and in granite_speech, which must stay servable.
+_MOE_EXPERT_LORA_QUALIFIED_SEGMENTS = (
+    ("block_sparse_moe", "input_linear"),
+    ("block_sparse_moe", "output_linear"),
+)
+
+
+def _is_moe_expert_lora_key(key):
+    """True when an adapter key sits on a stacked MoE expert tensor."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    parts = key.split(".")
+    if any(part in _MOE_EXPERT_LORA_SEGMENTS for part in parts):
+        return True
+    return any(
+        (parent, child) in _MOE_EXPERT_LORA_QUALIFIED_SEGMENTS
+        for parent, child in zip(parts, parts[1:])
+    )
+
+
+def _saved_adapter_lora_keys(save_directory):
+    """Adapter key names in a saved PEFT adapter, read from the file on disk.
+
+    `load_lora`'s default is load_tensors=False, which hands vLLM a path instead of
+    tensors, so the in-memory state_dict check never sees those adapters. Read the key
+    names off the checkpoint instead. safetensors exposes them from the header alone, so
+    the common case costs no tensor IO. Returns [] when the adapter cannot be read, since
+    an unreadable adapter is vLLM's error to raise, not ours to pre-empt.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    keys = []
+    safetensors_path = os.path.join(save_directory, "adapter_model.safetensors")
+    bin_path = os.path.join(save_directory, "adapter_model.bin")
+    if os.path.isfile(safetensors_path):
+        try:
+            from safetensors import safe_open
+            with safe_open(safetensors_path, framework = "pt") as f:
+                keys = list(f.keys())
+        except Exception:
+            return []
+    elif os.path.isfile(bin_path):
+        try:
+            state_dict = torch.load(bin_path, map_location = "cpu", weights_only = True)
+            keys = list(state_dict.keys())
+        except Exception:
+            return []
+    else:
+        return []
+    return [k for k in keys if ".lora_A." in k or ".lora_B." in k]
+
+
+def _saved_adapter_expert_lora_keys(save_directory):
+    """The subset of `_saved_adapter_lora_keys` that sits on stacked MoE expert tensors."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    return [k for k in _saved_adapter_lora_keys(save_directory) if _is_moe_expert_lora_key(k)]
+
+
+def _get_vllm_model_runner(model):
+    """vLLM's model runner, or None when it cannot be reached.
+
+    Everything below is a capability check on the engine that is about to serve the
+    adapter, so a model we cannot inspect must stay conservative rather than optimistic.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    llm = getattr(model, "vllm_engine", None)
+    if llm is None: return None
+    try:
+        engine = getattr(llm, "llm_engine", getattr(llm, "engine", llm))
+        if hasattr(engine, "engine_core"):
+            engine = engine.engine_core.engine_core
+        return engine.model_executor.driver_worker.model_runner
+    except Exception:
+        return None
+pass
+
+
+def _get_vllm_lora_model(model, runner = None):
+    """The live vLLM nn.Module, or None when it cannot be reached."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if runner is None: runner = _get_vllm_model_runner(model)
+    return getattr(runner, "model", None)
+pass
+
+
+def _get_vllm_lora_manager(model, runner = None):
+    """vLLM's LoRAModelManager, whose `.modules` is exactly what activate_adapter walks."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if runner is None: runner = _get_vllm_model_runner(model)
+    try:
+        manager = runner.lora_manager._adapter_manager
+    except Exception:
+        return None
+    return manager if isinstance(getattr(manager, "modules", None), dict) else None
+pass
+
+
+def _vllm_mixed_moe_lora_enabled(model, runner = None, vllm_model = None):
+    """True when this engine forces vLLM's universal 2D expert wrapper, or None if unknown.
+
+    Read this off the LoRA stack, never off the model. `WorkerLoRAManager.__init__` always
+    stores `vllm_config.lora_config` as `self.lora_config`, and `LoRAModelManager.__init__`
+    resolves `is_moe and lora_config.enable_mixed_moe_lora_format` into
+    `_enable_mixed_moe_lora_format`, which is the exact bit `_create_merged_loras_inplace`
+    branches on. `vllm_model.vllm_config` is incidental by comparison: of the classes that
+    set `is_3d_moe_weight = True`, `Qwen3VLMoeForConditionalGeneration` and
+    `InternS1ProForConditionalGeneration` never assign it, so reading the mode there
+    answered "not mixed" for them and let a stacked adapter through into the 2D wrapper.
+    That path is silent: Unsloth's `LoRARequest` never sets `is_3d_lora_weight`, so vLLM
+    takes `_slice_moe_lora_ep` on a 3D adapter instead of `_convert_3d_to_2d_moe_lora`.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    if runner is None: runner = _get_vllm_model_runner(model)
+    resolved = getattr(_get_vllm_lora_manager(model, runner), "_enable_mixed_moe_lora_format", None)
+    if isinstance(resolved, bool): return resolved
+    if vllm_model is None: vllm_model = _get_vllm_lora_model(model, runner)
+    for lora_config in (
+        getattr(getattr(runner, "lora_manager", None), "lora_config", None),
+        getattr(getattr(vllm_model, "vllm_config", None), "lora_config", None),
+    ):
+        if lora_config is None: continue
+        return getattr(lora_config, "enable_mixed_moe_lora_format", False) is True
+    return None
+pass
+
+
+def _vllm_lora_target_names(vllm_model, manager = None):
+    """(full module names, bare embedding names) vLLM can bind a LoRA to, or None.
+
+    vLLM's own `check_unexpected_modules` compares the LAST path component only
+    (vllm-project/vllm#34186), which is why an adapter whose parent path is wrong passes
+    it and is then dropped at `activate_adapter`. Gemma 4 is the live example: vLLM's
+    module is `...layers.N.moe.experts` while the checkpoint says `...layers.N.experts`,
+    and vLLM's rename regex is `$`-anchored so it never fires on a LoRA key
+    (vllm-project/vllm#41754). Both end in `experts`, so only a full-name comparison
+    separates them.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    if vllm_model is None: return None
+    lora_types = []
+    for module_path, class_name in (
+        ("vllm.lora.layers.base", "BaseLayerWithLoRA"),
+        ("vllm.model_executor.layers.linear", "LinearBase"),
+        ("vllm.model_executor.layers.fused_moe", "MoERunner"),
+    ):
+        try:
+            lora_types.append(getattr(__import__(module_path, fromlist = [class_name]), class_name))
+        except Exception:
+            pass
+    if len(lora_types) == 0: return None
+    lora_types = tuple(lora_types)
+
+    packed = getattr(manager, "packed_modules_mapping", None)
+    if not isinstance(packed, dict):
+        try:
+            from vllm.model_executor.utils import get_packed_modules_mapping
+            packed = get_packed_modules_mapping(vllm_model)
+        except Exception:
+            packed = getattr(type(vllm_model), "packed_modules_mapping", None)
+    if not isinstance(packed, dict): packed = {}
+
+    embedding_names = set()
+    try:
+        named_modules = list(vllm_model.named_modules())
+    except Exception:
+        return None
+    for _, module in named_modules:
+        embedding_modules = getattr(module, "embedding_modules", None)
+        if isinstance(embedding_modules, dict):
+            embedding_names.update(embedding_modules.keys())
+
+    # Prefer the manager's own dict: those are the names activate_adapter looks up, so a
+    # module vLLM declined to wrap is correctly absent from it.
+    raw_names = list(getattr(manager, "modules", {}) or {})
+    if len(raw_names) == 0:
+        raw_names = [name for name, module in named_modules
+                     if name != "" and isinstance(module, lora_types)]
+
+    names = set()
+    for name in raw_names:
+        # Once LoRA is enabled the modules are wrapped, so named_modules reports the
+        # LinearBase at `<module>.base_layer` while adapters name `<module>`.
+        if name.endswith(".base_layer"): name = name[:-len(".base_layer")]
+        names.add(name)
+        # q_proj/k_proj/v_proj are one qkv_proj module in vLLM, so the adapter's own name
+        # never appears in named_modules. Expand the packed mapping back out.
+        parent, _, leaf = name.rpartition(".")
+        for sub in packed.get(leaf, ()):
+            names.add(f"{parent}.{sub}" if parent else sub)
+    if len(names) == 0: return None
+    return names, embedding_names
+pass
+
+
+def _resolve_lora_key_to_module(key, weights_mapper):
+    """The vLLM module name an adapter key binds to, or None when vLLM cannot parse it."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    try:
+        from vllm.lora.utils import parse_fine_tuned_lora_name
+        parsed = parse_fine_tuned_lora_name(key.replace(".default", ""), weights_mapper)
+    except Exception:
+        return None
+    module_name = parsed[0] if isinstance(parsed, tuple) else parsed
+    # PEFT's target_parameters layout stores the gate_up half of an expert pair under
+    # `<experts>.base_layer` and the down half under `<experts>` itself.
+    if module_name.endswith(".base_layer"): module_name = module_name[:-len(".base_layer")]
+    return module_name
+pass
+
+
+def _unmatched_lora_keys(model, keys):
+    """Adapter keys that resolve to a module the live vLLM model does not have.
+
+    None means "cannot tell" (no reachable engine, or an unrecognisable vLLM layout);
+    [] means every key resolved.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    runner = _get_vllm_model_runner(model)
+    vllm_model = _get_vllm_lora_model(model, runner)
+    targets = _vllm_lora_target_names(vllm_model, _get_vllm_lora_manager(model, runner))
+    if targets is None: return None
+    module_names, embedding_names = targets
+
+    weights_mapper = getattr(vllm_model, "hf_to_vllm_mapper", None)
+    if weights_mapper is not None:
+        from .vllm_lora_worker_manager import _drop_stacked_weight_maps
+        weights_mapper = _drop_stacked_weight_maps(weights_mapper)
+
+    unmatched = []
+    for key in keys:
+        module_name = _resolve_lora_key_to_module(key, weights_mapper)
+        # Unparseable is vLLM's error to raise with its own message, not ours to pre-empt.
+        if module_name is None: continue
+        if module_name in module_names: continue
+        if module_name.rsplit(".", 1)[-1] in embedding_names: continue
+        unmatched.append((key, module_name))
+    return unmatched
+pass
+
+
+def _peft_max_rank(peft_config):
+    """The largest rank the adapter uses, counting rank_pattern overrides."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if peft_config is None: return None
+    get = peft_config.get if isinstance(peft_config, dict) else \
+          (lambda k, d = None: getattr(peft_config, k, d))
+    r = get("r", None)
+    if not isinstance(r, int): return None
+    rank_pattern = get("rank_pattern", None)
+    if isinstance(rank_pattern, dict):
+        r = max([r] + [v for v in rank_pattern.values() if isinstance(v, int)])
+    return r
+pass
+
+
+def _is_bitsandbytes_quantized(model):
+    """True for an Unsloth 4bit/8bit (bitsandbytes) model."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if getattr(model, "is_loaded_in_4bit", False) or getattr(model, "is_loaded_in_8bit", False):
+        return True
+    quant_config = getattr(getattr(model, "config", None), "quantization_config", None)
+    if quant_config is None: return False
+    method = getattr(quant_config, "quant_method", None)
+    if method is None and isinstance(quant_config, dict):
+        method = quant_config.get("quant_method", None)
+    return str(getattr(method, "value", method)).lower() == "bitsandbytes"
+pass
+
+
+def _moe_expert_lora_refusal_reason(model, peft_config):
+    """Why vLLM cannot serve a stacked MoE expert adapter here, or None when it can.
+
+    vLLM picks `FusedMoE3DWithLoRA` (which consumes PEFT's target_parameters layout
+    directly, so Unsloth's saved tensors need no conversion) exactly when the model class
+    sets `is_3d_moe_weight` and the engine has not forced the 2D wrapper. Read that flag
+    off the live class rather than comparing vLLM versions: it is the bit vLLM itself
+    branches on, it tracks new architectures automatically, and it catches a caller who
+    patches it off.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    runner = _get_vllm_model_runner(model)
+    vllm_model = _get_vllm_lora_model(model, runner)
+    if vllm_model is None:
+        return "the vLLM model could not be inspected, so 3D MoE LoRA support cannot be confirmed"
+
+    if getattr(type(vllm_model), "is_3d_moe_weight", False) is not True:
+        return (
+            "this architecture does not set is_3d_moe_weight, so vLLM wraps its experts with "
+            "the 2D FusedMoEWithLoRA and drops Unsloth's stacked adapter (vllm-project/vllm#41754)"
+        )
+
+    if _vllm_mixed_moe_lora_enabled(model, runner, vllm_model) is True:
+        return "enable_mixed_moe_lora_format forces vLLM's 2D expert wrapper, which cannot read a stacked adapter"
+
+    if _is_bitsandbytes_quantized(model):
+        return "vLLM does not support MoE LoRA on bitsandbytes weights, so load_in_4bit is out"
+
+    r = _peft_max_rank(peft_config)
+    if r is not None and r > 128:
+        return f"r = {r} is above the max_lora_rank <= 128 that vLLM's fused MoE LoRA kernel asserts"
+
+    return None
+pass
+
+
+def _check_lora_is_servable(model, keys, source, peft_config):
+    """Refuse an adapter vLLM would accept and then silently ignore.
+
+    Two checks, in order of how specific their message can be. First: stacked MoE expert
+    keys, which vLLM serves correctly only through `FusedMoE3DWithLoRA`. Second, and the
+    one that generalises: every key must resolve to a module the live engine actually
+    wrapped. `load_lora`'s lora_tensors path reaches vLLM through `from_lora_tensors`,
+    which unlike `from_local_checkpoint` runs no `check_unexpected_modules`, and
+    `activate_adapter` then zeroes unmatched modules at debug level. So without this an
+    adapter can be handed over, accepted, and dropped in silence, and GRPO keeps sampling
+    rollouts from the base weights while the trainer updates the adapter.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    expert_keys = [k for k in keys if _is_moe_expert_lora_key(k)]
+    if len(expert_keys) != 0:
+        reason = _moe_expert_lora_refusal_reason(model, peft_config)
+        if reason is not None:
+            raise NotImplementedError(
+                "Unsloth: fast_inference=True cannot serve this LoRA on MoE expert weights "
+                f"({len(expert_keys)} adapter tensors in {source}, e.g. "
+                f"'{sorted(expert_keys)[0]}') because {reason}.\n"
+                "vLLM would generate from the base experts while training updates the "
+                "adapters, so rollouts would not match the policy.\n"
+                "Use fast_inference=False, or target only the attention and dense MLP projections."
+            )
+    pass
+
+    if os.environ.get("UNSLOTH_DISABLE_LORA_NAME_CHECK", "0") == "1": return
+    unmatched = _unmatched_lora_keys(model, keys)
+    if not unmatched: return
+    examples = "\n".join(f"  {k}  ->  {n}" for k, n in sorted(unmatched)[:5])
+    raise RuntimeError(
+        f"Unsloth: {len(unmatched)} of {len(keys)} LoRA tensors in {source} name modules "
+        "that this vLLM engine does not have, so vLLM would load the adapter and then "
+        f"silently ignore those tensors:\n{examples}\n"
+        "This is usually a checkpoint-name against vLLM-module-name mismatch for the "
+        "architecture (see vllm-project/vllm#34186 and #41754), not a problem with "
+        "training. Use fast_inference=False, or target modules vLLM serves.\n"
+        "Set UNSLOTH_DISABLE_LORA_NAME_CHECK=1 to load anyway."
+    )
+pass
+
+
 @torch.inference_mode
 def load_lora(model, save_directory, load_tensors = False, lora_request_id = None):
     # vllm_lora_already_loaded(model)
@@ -3665,6 +4157,8 @@ def load_lora(model, save_directory, load_tensors = False, lora_request_id = Non
         items = state_dict.items()
         state_dict = {k.replace(".default", ""):v for k, v in items if ".lora_A." in k or ".lora_B." in k}
 
+        _check_lora_is_servable(model, list(state_dict), "the training model", peft_config)
+
         # vllm_lora_already_loaded(model)
         lora_request = LoRARequest(str(lora_request_id), lora_request_id, lora_tensors = state_dict, lora_config = peft_config)
         # Warm up LoRA
@@ -3676,6 +4170,14 @@ def load_lora(model, save_directory, load_tensors = False, lora_request_id = Non
         # vllm_lora_already_loaded(model)
             # model.saved_vllm_lora_request = lora_request
     else:
+        # Same checks on the path branch, read off the checkpoint header.
+        _saved_keys = _saved_adapter_lora_keys(save_directory)
+        if len(_saved_keys) != 0:
+            try:
+                _saved_peft_config = get_peft_config(save_directory)
+            except Exception:
+                _saved_peft_config = None
+            _check_lora_is_servable(model, _saved_keys, save_directory, _saved_peft_config)
         lora_request = LoRARequest(str(lora_request_id), lora_request_id, save_directory)
     pass
     # vllm_lora_already_loaded(model)
@@ -3750,7 +4252,7 @@ def delete_vllm(llm = None):
     with contextlib.suppress(AssertionError):
         torch.distributed.destroy_process_group()
     gc.collect()
-    torch.cuda.empty_cache()
+    _device_empty_cache()
     try:
         import ray
         ray.shutdown()
@@ -4097,7 +4599,7 @@ def _test_get_vllm_state_dict(
     # All Unsloth Zoo code licensed under LGPLv3
     # Check if model is allowed to be used in vLLM
     gc.collect()
-    torch.cuda.empty_cache()
+    _device_empty_cache()
 
     from transformers import AutoConfig
     config = AutoConfig.from_pretrained(
@@ -4302,7 +4804,7 @@ def _test_get_vllm_state_dict(
     print(f'Test passed!')
     for _ in range(3):
         gc.collect()
-        torch.cuda.empty_cache()
+        _device_empty_cache()
 pass
 
 
@@ -4330,7 +4832,7 @@ def test_get_vllm_state_dict():
 
     for i, (model_name, counts,) in enumerate(model_names):
         gc.collect()
-        torch.cuda.empty_cache()
+        _device_empty_cache()
         dtype = torch.float16 if i % 2 == 0 else bfloat16_dtype
         print(f"##### Testing {model_name} with dtype = {dtype} #####")
         if bfloat16_dtype == torch.float16:
@@ -4356,6 +4858,6 @@ def test_get_vllm_state_dict():
             error = str(error)
             raise RuntimeError(f"[{model_name}]\n{error}")
         gc.collect()
-        torch.cuda.empty_cache()
+        _device_empty_cache()
     pass
 pass

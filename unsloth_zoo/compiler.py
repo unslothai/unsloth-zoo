@@ -24,14 +24,17 @@ __all__ = [
 
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
 import ast
+import contextlib
 import hashlib
 import io
 import inspect
 import re
 import importlib
+import importlib.machinery
 import importlib.util
 import numpy as np
 import os
+import stat
 import torch
 import subprocess
 import types
@@ -40,6 +43,7 @@ import logging
 import tempfile
 import sys
 import textwrap
+import threading
 import tokenize
 from .utils import (
     Version,
@@ -145,6 +149,9 @@ DISABLED_KEYWORDS = [
     "apply_mask_to_padding_states",  # falcon h1
     "reshape_into_chunks",  # falcon h1
     "pad_tensor_by_size",  # falcon h1
+    # MLA __init__ calls these float helpers under meta init; compiled, they fail on .item()
+    "def yarn_get_mscale(",
+    "def yarn_apply_mscale(",
 ]
 
 DISABLE_COMPILE_FUNCTIONS = [
@@ -157,6 +164,9 @@ DISABLE_COMPILE_FUNCTIONS = [
     # nothing today; it is here so one that goes back to importing it by name, the
     # way transformers 5.2 does for chunk_gated_delta_rule, stays uncompiled.
     "recurrent_gated_delta_rule",
+    # KDA chunk fallback (glm5_next, kimi_linear): Inductor unrolls the per-chunk loop, 25+ min AOT compile.
+    # recurrent_kimi_delta_attention stays compiled: decode only (seq_len 1), 2x faster than eager.
+    "chunk_kimi_delta_attention",
 
     # transformers 5.9+ VL files import these; `grid_thw.tolist()` builds shapes from
     # unbacked SymInts, so fullgraph = True is a hard error on the first vision forward.
@@ -174,7 +184,63 @@ DISABLE_COMPILE_FUNCTIONS = [
     "get_vision_window_index",
     "get_vision_interpolation_indices_and_weights",
     "get_vision_bilinear_indices_and_weights",
+
+    # Locally defined grid helpers get their own compile decorators. Listing them
+    # disables helper compilation and allows graph breaks in their callers.
+    # Keep temporal_merge_index listed: it fails on supported torch 2.9.1 even
+    # though it traces on 2.10.0 and 2.13.0.
+    "get_vision_pixel_shuffle_index",   # muse_glimmer
+    "get_vision_frame_index",           # kimi_k25
+    "get_vision_temporal_merge_index",  # kimi_k25
 ]
+
+
+# Per model_type DISABLE_COMPILE_FUNCTIONS. deepseek_v4 rope: dynamic = True Inductor backward of its
+# trailing `x[..., -rope_dim:]` slice reads out of bounds, giving wrong / NaN grads (pytorch#198553).
+DISABLE_COMPILE_MODEL_FUNCTIONS = {
+    "deepseek_v4": ["apply_rotary_pos_emb"],
+    # Community port: V4 rope slice plus host-side helpers (dynamo cannot trace tokenizers `NFKC.__new__`).
+    "deepseek_v41": [
+        "apply_rotary_pos_emb",
+        "build_compressed_token_map",
+        "compute_hash_multipliers",
+        "_is_prime",
+        "_find_next_prime",
+        "_mesh_process_group",
+        "_tp_grad_group",
+        "_validate_attention_tp_divisibility",
+        # QAT STE autograd.Function: Dynamo raises InternalTorchDynamoError the fallback does not catch.
+        "_quantize_qat",
+    ],
+}
+
+# Matched rewrites leave DISABLE_COMPILE_MODEL_FUNCTIONS; deepseek_v4 `split` avoids the slice pytorch#198553 miscompiles.
+MODEL_FUNCTION_SOURCE_REWRITES = {
+    "deepseek_v4": {
+        "apply_rotary_pos_emb": (
+            "nope, rope = x[..., :-rope_dim], x[..., -rope_dim:]",
+            "nope, rope = x.split([x.shape[-1] - rope_dim, rope_dim], dim = -1)",
+        ),
+    },
+    "deepseek_v41": {
+        "apply_rotary_pos_emb": (
+            "nope, rope = x[..., :-rope_dim], x[..., -rope_dim:]",
+            "nope, rope = x.split([x.shape[-1] - rope_dim, rope_dim], dim = -1)",
+        ),
+    },
+}
+
+
+def model_function_source_rewrites(modeling_file, model_type):
+    applicable = {}
+    for name, (old, new) in MODEL_FUNCTION_SOURCE_REWRITES.get(model_type, {}).items():
+        try:
+            source = inspect.getsource(getattr(modeling_file, name))
+        except Exception:
+            continue
+        if source.count(old) == 1:
+            applicable[name] = (old, new)
+    return applicable
 
 
 def calls_disable_compile_function(source, disable_compile_functions):
@@ -189,6 +255,99 @@ def calls_disable_compile_function(source, disable_compile_functions):
     )
 
 
+def function_has_tensor_inputs(source: str) -> bool:
+    """False when every parameter has a non-tensor annotation: nothing for Dynamo to trace."""
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except Exception:
+        return True
+    function = next((n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))), None)
+    if function is None:
+        return True
+    args = function.args
+    if args.vararg is not None or args.kwarg is not None:
+        return True
+    positional = list(args.posonlyargs) + list(args.args)
+    parameters = positional + list(args.kwonlyargs)
+    if len(parameters) == 0:
+        return True
+    if parameters[0].arg in ("self", "cls"):
+        return True
+    # A literal default types an unannotated parameter; anything else may be a tensor.
+    defaults = {}
+    for parameter, default in zip(positional[len(positional) - len(args.defaults):], args.defaults):
+        defaults[parameter.arg] = default
+    for parameter, default in zip(args.kwonlyargs, args.kw_defaults):
+        if default is not None:
+            defaults[parameter.arg] = default
+    scalar_names = {"int", "float", "bool", "str", "bytes", "None", "list", "tuple", "dict", "set", "Sequence", "Iterable", "Mapping", "device", "dtype"}
+    for parameter in parameters:
+        if parameter.annotation is None:
+            default = defaults.get(parameter.arg)
+            if isinstance(default, ast.Constant) and not isinstance(default.value, type(Ellipsis)):
+                continue
+            return True
+        annotation = ast.unparse(parameter.annotation)
+        names = set(re.findall(r"[A-Za-z_][A-Za-z_0-9]*", annotation))
+        if "Tensor" in annotation or "tensor" in annotation:
+            return True
+        if not names <= scalar_names | {"Optional", "Union", "List", "Tuple", "Dict", "Set", "torch", "typing"}:
+            return True
+    return False
+pass
+
+
+_INIT_ONLY_CALLERS = frozenset(("__init__", "__post_init__", "_init_weights", "post_init"))
+
+
+def function_only_called_at_init(module_source: str, name: str) -> bool:
+    """True if ``name`` is only reached from ``__init__``-time methods (directly or via such
+    helpers): these build buffers on meta, so compiling them fails at load. False if unparseable."""
+    try:
+        tree = ast.parse(textwrap.dedent(module_source))
+    except Exception:
+        return False
+    callers_of = {}
+    # owner = (name, is_method); nested defs keep their enclosing owner.
+    def visit(node, owner):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if isinstance(node, ast.ClassDef):
+                    visit(child, (child.name, True))
+                else:
+                    visit(child, (child.name, False) if owner is None else owner)
+                continue
+            if isinstance(child, ast.Call):
+                func = child.func
+                called = func.id if isinstance(func, ast.Name) else None
+                if called is not None:
+                    callers_of.setdefault(called, set()).add(owner)
+            visit(child, owner)
+    visit(tree, None)
+    seen = set()
+    def init_only(fn):
+        if fn in seen:
+            return True
+        seen.add(fn)
+        owners = callers_of.get(fn)
+        if not owners:
+            return False
+        for owner in owners:
+            if owner is None:
+                return False  # called at module import time or from a class body
+            owner_name, is_method = owner
+            if is_method:
+                # self.<name>() calls are untracked (MPT forward: self.build_mpt_alibi_tensor).
+                if owner_name in _INIT_ONLY_CALLERS:
+                    continue
+                return False
+            if not init_only(owner_name):
+                return False
+        return True
+    return init_only(name)
+pass
+
+
 def calls_mask_creation_function(source):
     """`transformers.masking_utils` `create*` factories that `source` CALLS.
 
@@ -198,6 +357,31 @@ def calls_mask_creation_function(source):
     literal this replaced stopped matching the moment transformers added a kwarg.
     Names come from the installed transformers, so no version gate is needed."""
     return calls_disable_compile_function(source, get_mask_functions())
+
+
+def has_data_dependent_call(source):
+    """`.nonzero()` / `.tolist()` / `.item()`: unguardable under fullgraph = True."""
+    return (
+        ".nonzero()" in source
+        or ".tolist()" in source
+        or ".item()" in source
+    )
+
+
+def data_dependent_helpers(modeling_file, called_functions):
+    """Helpers the module forward screen misses (e.g. Qwen3-Omni chunk_and_pad_features)."""
+    found = []
+    for name in called_functions:
+        function = getattr(modeling_file, name, None)
+        if function is None or inspect.isclass(function):
+            continue
+        try:
+            source = inspect.getsource(function)
+        except Exception:
+            continue
+        if has_data_dependent_call(source):
+            found.append(name)
+    return found
 
 
 # Re-exported from .model_lists so callers can keep using
@@ -265,12 +449,19 @@ except:
 pass
 
 from unsloth_zoo import DEVICE_TYPE_TORCH, DEVICE_COUNT
+from unsloth_zoo.temporary_patches.utils import UNSLOTH_DECODE_COMPILE
 """
 )
 
+# HAS_CUT_CROSS_ENTROPY travels with fused_linear_cross_entropy because the generated
+# causal-LM branch consults it. UNSLOTH_ENABLE_CCE defaults on and knows nothing about
+# whether `linear_cross_entropy` imported, so wherever that import is refused the flag
+# alone routed into fused_linear_cross_entropy and raised NameError. The elif below it
+# computes the standard loss, the documented fallback.
 _disabled_sdpa_code = f"""{_license_header}
 
 from unsloth_zoo.loss_utils import (
+    HAS_CUT_CROSS_ENTROPY,
     fused_linear_cross_entropy,
     unsloth_fused_ce_loss,
 )
@@ -1238,53 +1429,399 @@ def _bytecode_would_be_used(function_location, bytecode_location):
     return mtime == int(source.st_mtime) & 0xFFFFFFFF and size == source.st_size & 0xFFFFFFFF
 pass
 
-def _remove_compiled_cache_bytecode(function_location):
-    """Remove this rank's pyc before importing source we just rewrote.
+def _moe_utils_copy_is_importable(folder):
+    """Whether it is safe to expose `folder` to a generated module's import.
 
-    Only called when the bytes changed, the only time the pyc can be stale.
-    An unlink failure is fatal only when the pyc would really be used: on
-    Windows os.remove raises PermissionError whenever a scanner or other
-    interpreter holds the file, and raising on that forced the whole group into
-    tempfile recovery. A pyc CPython would still accept still fails over.
+    Imported lazily: moe_utils pulls in torch. Unimportable means untrusted.
+    """
+    if not folder:
+        return False
+    # A verbatim moe_utils.py does not settle it: `from moe_utils import ...`
+    # resolves BY NAME, so a planted moe_utils/ package or moe_utils.so in the
+    # same directory is what Python picks, exactly as for a generated module.
+    # Same check, same reasoning, one name over.
+    try:
+        _reject_shadowing_import_candidates(folder, "moe_utils")
+    except Exception:
+        return False
+    try:
+        # Absolute, not `.temporary_patches.moe_utils`: transformers finds
+        # relative imports with a regex and joins the raw dotted capture onto the
+        # directory, so the relative spelling makes custom_object_save try to
+        # open unsloth_zoo/temporary_patches.moe_utils.py and fail every
+        # remote-code checkpoint save. See tests/test_relative_imports_resolve.py.
+        from unsloth_zoo.temporary_patches.moe_utils import cached_copy_is_importable
+    except Exception:
+        return False
+    try:
+        return bool(cached_copy_is_importable(folder))
+    except Exception:
+        return False
+
+
+def _drop_untrusted_cache_from_sys_path(folders):
+    """Remove every sys.path entry that resolves to one of `folders`.
+
+    By entry, not by string. The cwd is never dropped however it is spelled,
+    since UNSLOTH_COMPILE_LOCATION="." would delete the user's own import path;
+    the caller's name block, not this filter, is what stops a planted helper.
+    """
+    targets = set()
+    for folder in folders:
+        try:
+            targets.add(os.path.realpath(folder))
+        except Exception:
+            continue
+    try:
+        targets.discard(os.path.realpath(os.getcwd()))
+    except Exception:
+        pass
+    if not targets:
+        return
+    kept = []
+    for entry in sys.path:
+        try:
+            resolved = os.path.realpath(entry) if isinstance(entry, str) else None
+        except Exception:
+            resolved = None
+        if resolved is None or resolved not in targets:
+            kept.append(entry)
+    sys.path[:] = kept
+
+
+_MOE_UTILS_BLOCK_LOCK = threading.Lock()
+_MOE_UTILS_BLOCK = {"depth": 0, "previous": None, "was_present": False}
+
+# Distinct from None, which is itself a meaningful binding: None in sys.modules
+# is what BLOCKS the name.
+_NO_MOE_UTILS_BINDING = object()
+
+
+def _installed_moe_utils():
+    """This package's own moe_utils module object, or None if it will not import."""
+    try:
+        from unsloth_zoo.temporary_patches import moe_utils
+    except Exception:
+        return None
+    return moe_utils
+
+
+def _verified_moe_utils_binding(folders):
+    """What `moe_utils` should resolve to while a generated module executes.
+
+    Checking the copy and then resolving the NAME off disk is a check-then-use a
+    shared-cache writer wins. A copy that passes is byte-identical to ours, so
+    binding the imported module gives the same definitions with no file opened.
+    _NO_MOE_UTILS_BINDING means no copy at all: left alone, since binding would
+    hand the generated module names it does not get today.
+    """
+    for folder in folders:
+        if not folder:
+            continue
+        try:
+            if not os.path.isfile(os.path.join(folder, "moe_utils.py")):
+                continue
+        except Exception:
+            continue
+        # A verified copy is there. Bind ours, or block the name if ours will
+        # not import: what must not happen is the file being resolved again.
+        return _installed_moe_utils()
+    return _NO_MOE_UTILS_BINDING
+
+
+@contextlib.contextmanager
+def _untrusted_cache_kept_out_of_imports(*folders):
+    """Decide what `moe_utils` resolves to while a generated module executes.
+
+    Untrusted: block the name with None. Trusted: bind the verified module.
+    sys.path alone is not enough, because every generated module's prologue
+    re-inserts UNSLOTH_COMPILE_LOCATION above its own `from moe_utils import
+    ...`; blocking the NAME closes that window. Both folders are passed because
+    a recovery makes them differ while the prologue names the persistent one.
+    """
+    untrusted = [
+        folder for folder in dict.fromkeys(folders)
+        if folder and not _moe_utils_copy_is_importable(folder)
+    ]
+    if untrusted:
+        binding = None
+        _drop_untrusted_cache_from_sys_path(untrusted)
+    else:
+        binding = _verified_moe_utils_binding(folders)
+        if binding is _NO_MOE_UTILS_BINDING:
+            yield
+            return
+    # Only the outermost guard touches sys.modules, or the inner one saves the
+    # outer's entry and restores it permanently. Mutations sit inside the try and
+    # the increment arms the restore, since a signal lands between bytecodes:
+    # depth first, name second, so an interrupt restores what was recorded.
+    entered = False
+    try:
+        with _MOE_UTILS_BLOCK_LOCK:
+            if _MOE_UTILS_BLOCK["depth"] == 0:
+                _MOE_UTILS_BLOCK["was_present"] = "moe_utils" in sys.modules
+                _MOE_UTILS_BLOCK["previous"] = sys.modules.get("moe_utils")
+            _MOE_UTILS_BLOCK["depth"] += 1
+            entered = True
+            if _MOE_UTILS_BLOCK["depth"] == 1:
+                sys.modules["moe_utils"] = binding
+        yield
+    finally:
+        if entered:
+            with _MOE_UTILS_BLOCK_LOCK:
+                _MOE_UTILS_BLOCK["depth"] -= 1
+                if _MOE_UTILS_BLOCK["depth"] == 0:
+                    if _MOE_UTILS_BLOCK["was_present"]:
+                        sys.modules["moe_utils"] = _MOE_UTILS_BLOCK["previous"]
+                    else:
+                        sys.modules.pop("moe_utils", None)
+                    _MOE_UTILS_BLOCK["previous"] = None
+                    _MOE_UTILS_BLOCK["was_present"] = False
+        _drop_untrusted_cache_from_sys_path(untrusted)
+
+
+def _reject_shadowing_import_candidates(compile_folder, name):
+    """Refuse a cache entry that would win the import over the verified file.
+
+    The digest covers `<name>.py`, but the import resolves by NAME, and a package
+    directory, an extension module and a legacy sourceless `<name>.pyc` all beat
+    it -- the last only when no source is there, which is the case this used to
+    call nothing to reject. Suffix lists come from importlib.machinery.
+    """
+    # Not a real directory: zipimport claims any sys.path entry that is a ZIP,
+    # so a zip named `unsloth_compiled_cache` passes every isfile check below and
+    # still serves `moe_utils`. See cached_copy_is_importable.
+    if os.path.exists(compile_folder) and not os.path.isdir(compile_folder):
+        raise RuntimeError(
+            f"Unsloth: Refusing to import {name} because {compile_folder} exists "
+            f"and is not a directory, so what the import system resolves there is "
+            f"not what was verified here."
+        )
+    candidate = os.path.join(compile_folder, name)
+    if os.path.isdir(candidate):
+        raise RuntimeError(
+            f"Unsloth: Refusing to import {name} because {candidate} would be "
+            f"imported instead of the verified source beside it."
+        )
+    shadowing = [
+        (suffix, "an extension module")
+        for suffix in importlib.machinery.EXTENSION_SUFFIXES
+    ] + [
+        (suffix, "sourceless bytecode")
+        for suffix in importlib.machinery.BYTECODE_SUFFIXES
+    ] + [
+        # Every SOURCE suffix but the one the digest covers. Windows registers
+        # `.pyw`, which loses to `<name>.py` but decides the import when that is
+        # absent -- the case cached_copy_is_importable() calls nothing to reject.
+        # Read from the interpreter, so this is empty on POSIX.
+        (suffix, "a source module")
+        for suffix in importlib.machinery.SOURCE_SUFFIXES if suffix != ".py"
+    ]
+    for suffix, kind in shadowing:
+        shadow = os.path.join(compile_folder, name + suffix)
+        if os.path.isfile(shadow):
+            raise RuntimeError(
+                f"Unsloth: Refusing to import {name} because {shadow} is "
+                f"{kind} and would be loaded instead of the verified "
+                f"source beside it."
+            )
+
+
+def _remove_compiled_cache_bytecode(function_location):
+    """Remove this rank's pyc before importing verified source.
+
+    Before EVERY import, not only after a rewrite: the digest covers the .py and
+    CPython runs an unchecked-hash pyc without consulting it. A surviving pyc is
+    fatal whatever its mode claims, since whoever writes it writes its header.
     """
     try:
         bytecode_location = importlib.util.cache_from_source(function_location)
     except NotImplementedError:
         return
+    if _bytecode_directory_is_redirected(bytecode_location):
+        raise RuntimeError(
+            f"Unsloth: Refusing to remove bytecode for {function_location}: "
+            f"{os.path.dirname(bytecode_location)} is a symlink, so the unlink "
+            f"would land outside the compiled cache."
+        )
     try:
         os.remove(bytecode_location)
     except FileNotFoundError:
         pass
     except OSError as error:
-        if _bytecode_would_be_used(function_location, bytecode_location):
+        if os.path.isfile(bytecode_location):
             raise RuntimeError(
-                f"Unsloth: Cannot remove stale bytecode for {function_location}: "
-                f"{error}."
+                f"Unsloth: Cannot remove bytecode for {function_location}: "
+                f"{error}. Refusing to import the source while bytecode we did "
+                f"not write survives beside it."
             ) from error
-        logger.warning_once(
-            f"Unsloth: Cannot remove bytecode for {function_location}: {error}. "
-            "Continuing, since the rewritten source no longer matches it."
-        )
 pass
 
-def _verify_cache_digest_under_lock(function_location, expected_digest):
-    """Ensure the locked file still matches the collectively verified bytes."""
-    if expected_digest is None:
-        return
+def _bytecode_directory_is_redirected(bytecode_location):
+    """Whether unlinking this pyc would delete something outside the cache.
+
+    This removal is the one step that DESTROYS rather than refuses, and
+    `__pycache__` can be a symlink. sys.pycache_prefix is exempt: that
+    redirection is the user's own, and refusing means permanent recovery.
+    """
+    if getattr(sys, "pycache_prefix", None):
+        return False
+    try:
+        return os.path.islink(os.path.dirname(bytecode_location))
+    except OSError:
+        return True
+pass
+
+def _replace_compiled_cache_file(function_location, new_write_bytes):
+    """Land the generated bytes by replacing the path, not by writing into it.
+
+    os.replace needs the directory, not the file, so it lands over a read-only
+    cache file, atomically. Windows is weaker: MoveFileEx honours the ACL, the
+    read-only attribute and open handles, so it can fail and the caller recovers
+    into temp. 0644 not 0600, since owner-only locks a group-shared cache out.
+    """
+    directory = os.path.dirname(function_location) or "."
+    descriptor, temporary_location = tempfile.mkstemp(
+        prefix = f".{os.path.basename(function_location)}.", suffix = ".tmp",
+        dir = directory,
+    )
+    try:
+        # Through the DESCRIPTOR: mkstemp settles who created the file and
+        # nothing after, so reopening the name would put the write and the mode
+        # wherever it resolves by then.
+        with os.fdopen(descriptor, "wb") as file:
+            descriptor = None
+            file.write(new_write_bytes)
+            file.flush()
+            os.fsync(file.fileno())
+            _set_mode_by_descriptor(file.fileno(), temporary_location, 0o644)
+        os.replace(temporary_location, function_location)
+    except BaseException:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        try:
+            os.remove(temporary_location)
+        except OSError:
+            pass
+        raise
+pass
+
+def _set_mode_by_descriptor(descriptor, location, mode):
+    """fchmod when there is one, else chmod by name (Windows has no os.fchmod)."""
+    if hasattr(os, "fchmod"):
+        os.fchmod(descriptor, mode)
+    else:
+        os.chmod(location, mode)
+pass
+
+def _write_bytes_durably(location, new_write_bytes):
+    """Write and fsync, refusing to follow a link out of the compiled cache.
+
+    The cache path and the generated module names are both predictable, so a
+    co-located user can plant a symlink at one. O_NOFOLLOW turns that into an
+    OSError, which sends the caller to _replace_compiled_cache_file, and that lands
+    on the name rather than through it; the in-place path is given up only when it is
+    unsafe. The fstat is needed too, since O_NOFOLLOW says nothing about a FIFO or a
+    device node. Where the constant does not exist (Windows) there is no atomic
+    no-follow open and an lstat first is only a time of check, so the in-place path
+    is not attempted at all.
+    """
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    if not no_follow:
+        raise OSError(f"Unsloth: no O_NOFOLLOW on this platform: replacing `{location}` instead of writing in place.")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    flags |= no_follow
+    flags |= getattr(os, "O_BINARY", 0)
+    # A FIFO planted here would otherwise block forever waiting for a reader.
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(location, flags, 0o644)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise OSError(f"Unsloth: refusing to write `{location}`: not a regular file.")
+        with os.fdopen(descriptor, "wb") as file:
+            descriptor = None
+            file.write(new_write_bytes)
+            file.flush()
+            os.fsync(file.fileno())
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+pass
+
+def _write_compiled_cache_file(function_location, new_write_bytes):
+    """Write the generated bytes, in place when the file allows it."""
+    try:
+        _write_bytes_durably(function_location, new_write_bytes)
+    except OSError:
+        _replace_compiled_cache_file(function_location, new_write_bytes)
+pass
+
+def _compiled_cache_file_is_foreign(function_location, new_write_bytes):
+    """Whether the cache file holds bytes other than the ones we just generated.
+
+    Not a claim about who wrote them; our own older output is equally unsafe to
+    keep. Absent is not foreign, unreadable is.
+    """
+    try:
+        with open(function_location, "rb") as file:
+            return file.read() != new_write_bytes
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+pass
+
+def _verified_cache_source(function_location, expected_digest):
+    """The bytes that passed the digest, read once, for the caller to EXECUTE.
+
+    Returning them is the point: verifying one open and letting the import
+    machinery reopen the path leaves a window the cooperative lock does not bind.
+    """
     with open(function_location, "rb") as file:
-        actual_digest = hashlib.sha256(file.read()).hexdigest()
+        source = file.read()
+    if expected_digest is None:
+        return source
+    actual_digest = hashlib.sha256(source).hexdigest()
     if actual_digest != expected_digest:
         raise RuntimeError(
             f"Unsloth: Compiled cache file {function_location} changed after "
             f"verification ({expected_digest[:12]} -> {actual_digest[:12]})."
         )
+    return source
+
+
+def _exec_verified_source(source, file_location, module_name):
+    """Build and run a module from `source`, never reopening `file_location`.
+
+    The path still reaches compile() and the spec, so tracebacks and
+    inspect.getsource read normally. Absolute, since co_filename resolves against
+    the cwd at READ time and a relative one breaks once the process chdirs.
+    """
+    try:
+        file_location = os.path.abspath(file_location)
+    except Exception:
+        pass
+    spec = importlib.util.spec_from_file_location(module_name, file_location)
+    new_module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = new_module
+    try:
+        exec(compile(source, file_location, "exec"), new_module.__dict__)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
+    return new_module
 pass
 
 def _compiled_cache_decision(function_location, write_new_source, overwrite):
-    """Rank 0's write decision, plus a digest of the bytes it will import."""
+    """Rank 0's write decision, plus a digest of the bytes it will import.
+
+    Not only cross-rank agreement: a single process re-reads the cache against
+    this digest under the import lock too.
+    """
     should_write = overwrite or not os.path.isfile(function_location)
-    if not torch_distributed_is_initialized():
-        return should_write, None
     if should_write:
         return True, hashlib.sha256(write_new_source.encode("utf-8")).hexdigest()
     # Digest the file, not write_new_source: UNSLOTH_COMPILE_OVERWRITE=0 keeps an
@@ -1381,6 +1918,15 @@ def _verify_compiled_cache_file_collectively(
         raise error
 pass
 
+_HUB_KERNEL_WRAPPER_RE = re.compile(r"^[ \t]*@use_kernel_func_from_hub_with_fallback\b", flags = re.MULTILINE)
+
+
+def is_hub_kernel_wrapper(source):
+    # Emit bare: on torch 2.11 is_exporting() is True inside a compile trace, so the wrapper runs its torch reference (a None stub for Nemotron-H mamba2).
+    return bool(_HUB_KERNEL_WRAPPER_RE.search(source or ""))
+pass
+
+
 def create_new_function(
     name,
     new_source,
@@ -1471,6 +2017,8 @@ def create_new_function(
         # Emitted in place of a bare `torch.compile(fullgraph = True)`, so the
         # name must resolve in the generated module.
         imports += "from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback\n"
+    if "torch_compiler_disable_unless_decode" in new_source:
+        imports += "from unsloth_zoo.temporary_patches.utils import torch_compiler_disable_unless_decode\n"
     if "torch_compile" in new_source:
         imports += "from unsloth_zoo.temporary_patches.common import torch_compile\n"
     if "_maybe_compile" in new_source:
@@ -1499,6 +2047,7 @@ def create_new_function(
             "        forward_native_grouped_mm,\n"
             "        forward_triton_grouped_gemm,\n"
             "        forward_native_moe_loop,\n"
+            "        _gate_up_is_interleaved,\n"
             "    )\n"
             "except Exception:\n"
             "    pass\n"
@@ -1668,12 +2217,12 @@ def create_new_function(
                         need_write = f.read() != new_write_bytes
 
                 if need_write:
-                    with open(function_location, "wb", buffering=0) as file:
-                        file.write(new_write_bytes)
-                        file.flush()
-                        os.fsync(file.fileno())
-            # Did the bytes change, which is what makes a pyc stale.
-            # overwrite=True means "you may rewrite", not "the content differs".
+                    _write_compiled_cache_file(function_location, new_write_bytes)
+            # Did the bytes change. overwrite=True means "you may rewrite", not
+            # "the content differs". This no longer decides whether the pyc is
+            # dropped -- that is unconditional now, because a planted pyc does
+            # not need our bytes to have changed -- so it is reported for the
+            # rank agreement and for callers, not as a staleness verdict.
             return need_write
         except Exception as e:
             # consider adding logging to main_process only
@@ -1682,9 +2231,12 @@ def create_new_function(
                 logger.error(
                     f"Unsloth: Failed to write file {function_location} because {str(e)}"
                 )
-            # The write may have landed partially, so assume it changed:
-            # over-invalidating costs a recompile, under-invalidating runs
-            # stale bytecode.
+            # Assume a partial write changed it: over-invalidating costs a
+            # recompile, under-invalidating runs stale bytecode. That covers
+            # bytes WE generated; anything else is failed rather than imported.
+            # Advisory, since the lock is gone by now.
+            if _compiled_cache_file_is_foreign(function_location, new_write_bytes):
+                raise
             return True
 
     pass
@@ -1750,11 +2302,11 @@ def create_new_function(
     should_write_cache_file, cache_file_digest = distributed_function(
         2, _compiled_cache_decision, function_location, write_new_source, overwrite,
     )
-    # Only a call that changes the bytes can leave a stale pyc, so only such a
-    # call removes one. Every process start walks the warm cache, where deleting
-    # the pyc forced a full recompile on each import. Tracks the WRITE, not the
-    # decision: overwrite=True is the default for unsloth_compile_transformers
-    # and patch_lora_forwards even when write_file() writes nothing.
+    # Tracks the WRITE, not the decision; the pyc drop is unconditional now, so
+    # this is carried for the rank agreement only. Cost of that, measured: no pyc
+    # is ever written or reused, so `import unsloth` spends 996 ms here against
+    # 860 ms, +136 ms per start (n=12 a side, disjoint IQRs). The new checks are
+    # ~185 us of it; the rest is the lost bytecode cache.
     rewrote_cache_file = False
     if should_write_cache_file:
         if UNSLOTH_COMPILE_USE_TEMP:
@@ -1831,19 +2383,30 @@ def create_new_function(
         old_path = None
         target_name = os.path.join(compile_folder, f"{name}.py")
         lock = get_lock(target_name)
-        # Put the verified cache first even when it already appears later.
-        if not sys.path or sys.path[0] != compile_folder:
+        # Verified cache first, but only once the moe_utils in it is ours: the
+        # generated module's `from moe_utils import ...` resolves off this entry
+        # inside `except Exception: pass`, so a foreign copy got its top level
+        # run here with the failure swallowed.
+        if _moe_utils_copy_is_importable(compile_folder) and (
+            not sys.path or sys.path[0] != compile_folder
+        ):
             old_path = list(sys.path)
             sys.path[:] = [path for path in sys.path if path != compile_folder]
             sys.path.insert(0, compile_folder)
         try:
             with lock:
-                # Try standard import
-                _verify_cache_digest_under_lock(target_name, expected_digest)
-                if rewrote_cache_file:
-                    _remove_compiled_cache_bytecode(target_name)
+                # Verify once, execute THOSE bytes: handing the name to
+                # importlib reopened the path, and this lock is cooperative, so
+                # it does not cover the window.
+                source = _verified_cache_source(target_name, expected_digest)
+                _remove_compiled_cache_bytecode(target_name)
+                # The module's OWN imports still resolve by name off compile_folder.
+                _reject_shadowing_import_candidates(compile_folder, name)
                 importlib.invalidate_caches()
-                new_module = importlib.import_module(name)
+                with _untrusted_cache_kept_out_of_imports(
+                    compile_folder, UNSLOTH_COMPILE_LOCATION,
+                ):
+                    new_module = _exec_verified_source(source, target_name, name)
                 return new_module, old_path
         except Exception as e:
             if old_path is not None:
@@ -1868,33 +2431,33 @@ def create_new_function(
         # `from moe_utils import ...`, so without this the load reports success
         # with every backend name undefined. Both folders: recovery switches to
         # node-local temp, but the helper sits next to the persistent cache.
-        search_paths = [compile_folder]
-        if UNSLOTH_COMPILE_LOCATION not in search_paths:
-            search_paths.append(UNSLOTH_COMPILE_LOCATION)
-        old_path = list(sys.path)
-        sys.path[:] = search_paths + [p for p in sys.path if p not in search_paths]
-        try:
-            return _exec_module_under_lock(
-                lock, file_location, module_name, expected_digest,
-            )
-        finally:
-            sys.path[:] = old_path
+        # On the path only if the moe_utils.py in it is ours; dropping it costs
+        # the backend names, which that bare import survives losing.
+        search_paths = [
+            folder
+            for folder in dict.fromkeys([compile_folder, UNSLOTH_COMPILE_LOCATION])
+            if _moe_utils_copy_is_importable(folder)
+        ]
+        # Outside the juggling below, so the restore cannot put a refused entry back.
+        with _untrusted_cache_kept_out_of_imports(
+            compile_folder, UNSLOTH_COMPILE_LOCATION,
+        ):
+            old_path = list(sys.path)
+            sys.path[:] = search_paths + [p for p in sys.path if p not in search_paths]
+            try:
+                return _exec_module_under_lock(
+                    lock, file_location, module_name, expected_digest,
+                )
+            finally:
+                sys.path[:] = old_path
 
     pass
 
     def _exec_module_under_lock(lock, file_location, module_name, expected_digest):
         with lock:
-            _verify_cache_digest_under_lock(file_location, expected_digest)
-            if rewrote_cache_file:
-                _remove_compiled_cache_bytecode(file_location)
-            spec = importlib.util.spec_from_file_location(module_name, file_location)
-            new_module = importlib.util.module_from_spec(spec)
-            sys.modules[module_name] = new_module
-            try:
-                spec.loader.exec_module(new_module)
-            except Exception:
-                sys.modules.pop(module_name, None)
-                raise
+            source = _verified_cache_source(file_location, expected_digest)
+            _remove_compiled_cache_bytecode(file_location)
+            new_module = _exec_verified_source(source, file_location, module_name)
         return new_module
 
     pass
@@ -1975,6 +2538,13 @@ def create_new_function(
         # Restore original sys.path if we modified it
         if old_path is not None:
             sys.path[:] = old_path
+        # The snapshot predates this call and can carry an entry an earlier
+        # prologue left behind, so re-check rather than trust it.
+        _drop_untrusted_cache_from_sys_path([
+            folder
+            for folder in dict.fromkeys([compile_folder, UNSLOTH_COMPILE_LOCATION])
+            if folder and not _moe_utils_copy_is_importable(folder)
+        ])
 
     if new_module is None:
         raise ImportError(
@@ -2278,7 +2848,7 @@ def create_standalone_class(
         compile = (
             f"@torch_compile_with_fallback(fullgraph = {fullgraph}, dynamic = True, options = torch_compile_options)"
             if not disable
-            else "@torch.compiler.disable(recursive = False)"
+            else "@torch_compiler_disable_unless_decode"
         )
     else:
         compile = ""
@@ -2460,7 +3030,18 @@ def raise_logits_error(*args, **kwargs): raise NotImplementedError(LOGITS_ERROR_
 def return_none(*args, **kwargs): return None
 class EmptyLogits:
     def __init__(self): return
-    def raise_getattr_error(self, attr): return return_none if attr == "to" else raise_logits_error
+    def raise_getattr_error(self, attr):
+        if attr == "to": return return_none
+        # A catch-all __getattr__ makes hasattr() true for every name, dunders included, so the
+        # sentinel answers yes to protocol probes it cannot honour. torch.distributed's output cast
+        # tests `hasattr(x, "__dataclass_fields__")` and then calls `dataclasses.replace(x)` on
+        # whatever said yes, so with FSDP2 mixed precision every step died in
+        # `TypeError: replace() should be called on dataclass instances` (unsloth#409, reached
+        # through `_fsdp_state._cast_output_dtype`). Protocol probes get an honest AttributeError;
+        # ordinary attribute access still gets the callable that explains UNSLOTH_RETURN_LOGITS.
+        if len(attr) > 4 and attr.startswith("__") and attr.endswith("__"):
+            raise AttributeError(f"{type(self).__name__!r} object has no attribute {attr!r}")
+        return raise_logits_error
     __getitem__ = raise_logits_error
     __getattr__ = raise_getattr_error
     def __repr__(self): return LOGITS_ERROR_STRING
@@ -2499,32 +3080,35 @@ __DYNAMO__RECOMPILING__ = """
 
     # Set compiler stance to fail on recompiles for inference
     global INFERENCE_RUNS
-    if torch_dynamo_eval_frame is not None:
-        old_stance = torch_dynamo_eval_frame._stance.stance
-    else:
-        old_stance = None
-    if old_stance is not None and INFERENCE_RUNS == 1:
-        # Skip guards and return to eager -> we still need guards!
-        torch_compiler_set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = False)
-        if UNSLOTH_ENABLE_LOGGING:
-            logger_compiler.info(
-                f"Unsloth: Removing compiler guards after 1 inference run. "\\
-                f"DYNAMO_STANCE.stance = {torch_dynamo_eval_frame._stance.stance} "\\
-                f"DYNAMO_STANCE.skip_guard_eval_unsafe = {torch_dynamo_eval_frame._stance.skip_guard_eval_unsafe}"
-            )
-    elif old_stance == "eager_on_recompile":
-        pass
-    elif old_stance == "default" and INFERENCE_RUNS > 1:
-        # Reset compiler stance
-        torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = False)
-        if UNSLOTH_ENABLE_LOGGING:
-            logger_compiler.info(
-                f"Unsloth: Reseting guards. "\\
-                f"DYNAMO_STANCE.stance = {torch_dynamo_eval_frame._stance.stance} "\\
-                f"DYNAMO_STANCE.skip_guard_eval_unsafe = {torch_dynamo_eval_frame._stance.skip_guard_eval_unsafe}"
-            )
-        INFERENCE_RUNS = 0
-    INFERENCE_RUNS += 1
+    # Skipped while tracing (set_stance raises there, and the counter would guard every step)
+    # and around a compiled decode step, which eager_on_recompile would otherwise freeze.
+    if not torch.compiler.is_compiling() and not UNSLOTH_DECODE_COMPILE[0]:
+        if torch_dynamo_eval_frame is not None:
+            old_stance = torch_dynamo_eval_frame._stance.stance
+        else:
+            old_stance = None
+        if old_stance is not None and INFERENCE_RUNS == 1:
+            # Skip guards and return to eager -> we still need guards!
+            torch_compiler_set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = False)
+            if UNSLOTH_ENABLE_LOGGING:
+                logger_compiler.info(
+                    f"Unsloth: Removing compiler guards after 1 inference run. "\\
+                    f"DYNAMO_STANCE.stance = {torch_dynamo_eval_frame._stance.stance} "\\
+                    f"DYNAMO_STANCE.skip_guard_eval_unsafe = {torch_dynamo_eval_frame._stance.skip_guard_eval_unsafe}"
+                )
+        elif old_stance == "eager_on_recompile":
+            pass
+        elif old_stance == "default" and INFERENCE_RUNS > 1:
+            # Reset compiler stance
+            torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = False)
+            if UNSLOTH_ENABLE_LOGGING:
+                logger_compiler.info(
+                    f"Unsloth: Reseting guards. "\\
+                    f"DYNAMO_STANCE.stance = {torch_dynamo_eval_frame._stance.stance} "\\
+                    f"DYNAMO_STANCE.skip_guard_eval_unsafe = {torch_dynamo_eval_frame._stance.skip_guard_eval_unsafe}"
+                )
+            INFERENCE_RUNS = 0
+        INFERENCE_RUNS += 1
 """
 
 # Replace Cross Entropy cells with fused linear lm heads
@@ -2593,7 +3177,7 @@ elif labels is None:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
+elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
         lm_weight          = self.lm_head.weight,
@@ -2685,7 +3269,7 @@ elif labels is None:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
+elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
         lm_weight          = self.lm_head.weight,
@@ -3874,11 +4458,14 @@ torch_float16 = torch.float16
 def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
     xA = dropout(x.to(torch_float16)) @ lora_A.weight.to(torch_float16).t()
     # output = result + scaling * xA @ lora_B.weight.t()
+    # Add in result's dtype: a base layer kept in float32 (gpt-oss expert down_projs reach
+    # 66795) overflows if rounded to float16 here. Float16 results take the same kernel.
     shape = result.shape
+    result_dtype = result.dtype
     output = torch_addmm(
-        result.view(-1, shape[-1]).to(torch_float16),
-        xA.view(-1, xA.shape[-1]),
-        lora_B.weight.to(torch_float16).t(),
+        result.view(-1, shape[-1]),
+        xA.view(-1, xA.shape[-1]).to(result_dtype),
+        lora_B.weight.to(result_dtype).t(),
         alpha = scaling,
         beta = 1,
     ).view(shape)
@@ -3887,13 +4474,84 @@ def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
     if bias is not None:
         output = torch_add(
             output,
-            bias.to(torch_float16),
+            bias.to(result_dtype),
             alpha = scaling,
         )
     return output
 pass
 
 """
+
+
+# Both spellings PEFT uses for the LoRA input cast, as (statement, expression).
+# A rename of both no-ops every replacement, leaving PEFT's own cast, which is the safe
+# direction; test_lora_input_cast_rewrite.py fails loudly on that drift.
+_LORA_INPUT_CASTS = (
+    (
+        "x = self._cast_input_dtype(x, lora_A.weight.dtype)",
+        "self._cast_input_dtype(x, lora_A.weight.dtype)",
+    ),
+    (
+        "x = x.to(lora_A.weight.dtype)",
+        "x.to(lora_A.weight.dtype)",
+    ),
+)
+
+
+def _patch_lora_input_cast(source, force_float32 = None):
+    # All Unsloth Zoo code licensed under LGPLv3
+    """Rewrites PEFT's LoRA input cast inside the active-adapter loop.
+
+    Without UNSLOTH_FORCE_FLOAT32: cast `result` and `x` when autocast is off, leaving a
+    forward that branches on autocast itself alone. With it: the vanilla branch becomes
+    the self-casting `lora_forward`, but variants keep PEFT's branch and take `x` directly,
+    so deleting the cast left float16 meeting float32 LoRA weights (unsloth#4127). Hence
+    the variant-gated cast, with `getattr` for layers that have no variant branch.
+    """
+    if force_float32 is None:
+        force_float32 = os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") != "0"
+
+    if not force_float32:
+        if "torch.is_autocast_enabled()" in source:
+            return source
+        new = (
+            "if not torch.is_autocast_enabled(): "
+            "result, x = "
+            "result.to(lora_A.weight.dtype), "
+            "x.to(lora_A.weight.dtype)"
+        )
+        for statement, _ in _LORA_INPUT_CASTS:
+            source = source.replace(statement, new)
+        return source
+
+    for statement, expression in _LORA_INPUT_CASTS:
+        guarded = (
+            f"x = ({expression}) if active_adapter in "
+            'getattr(self, "lora_variant", {}) else x'
+        )
+        source = source.replace(statement, guarded)
+    return source
+pass
+
+
+def _patch_lora_base_layer_input_cast(source):
+    # Outside autocast, match x to a float base weight (fp32 SigLIP under fp16); never to 4-bit / FP8 storage ("Promotion for Float8 Types is not supported").
+    _base_layer_call = "result = self.base_layer(x, *args, **kwargs)"
+    _m = re.search(r'^( *)' + re.escape(_base_layer_call), source, re.MULTILINE)
+    if not _m:
+        return source
+    _ind = _m.group(1)
+    return source.replace(
+        _base_layer_call,
+        f"if not torch.is_autocast_enabled() and hasattr(self.base_layer, 'weight') "
+        f"and self.base_layer.weight is not None "
+        f"and not hasattr(self.base_layer.weight, 'quant_state') "
+        f"and self.base_layer.weight.is_floating_point() "
+        f"and self.base_layer.weight.element_size() > 1 "
+        f"and x.dtype != self.base_layer.weight.dtype:\n"
+        f"{_ind}    x = x.to(self.base_layer.weight.dtype)\n"
+        f"{_ind}{_base_layer_call}",
+    )
 
 
 def patch_lora_forwards(torch_compile_options):
@@ -3955,27 +4613,14 @@ def patch_lora_forwards(torch_compile_options):
         #     source = source.replace(source[variant_found : variant_end], "")
 
         # Check failed upcasting
-        replacements = [
-            "x = x.to(lora_A.weight.dtype)",
-            "x = self._cast_input_dtype(x, lora_A.weight.dtype)",
-        ]
-        if os.environ.get("UNSLOTH_FORCE_FLOAT32", "0") == "0":
-            if "torch.is_autocast_enabled()" not in source:
-                new = (
-                    "if not torch.is_autocast_enabled(): "
-                    "result, x = "
-                    "result.to(lora_A.weight.dtype), "
-                    "x.to(lora_A.weight.dtype)"
-                )
-                for replace in replacements:
-                    source = source.replace(replace, new)
-        else:
-            for replace in replacements:
-                source = source.replace(replace, "")
-        pass
+        source = _patch_lora_input_cast(source)
+        # getsource unwrapped the integer-input wrapper, so on 4-bit re-add the cast inline.
+        check_forward_args = "self._check_forward_args(x, *args, **kwargs)"
+        integer_input_inline = "4bit" in child.lower() and check_forward_args in source
         source = source.replace(
-            "self._check_forward_args(x, *args, **kwargs)",
-            "",
+            check_forward_args,
+            "if not x.is_floating_point(): x = _unsloth_lora_integer_input(self, x)"
+            if integer_input_inline else "",
         )
 
         if hash(source) != old_hash:
@@ -4002,25 +4647,8 @@ def patch_lora_forwards(torch_compile_options):
                     "    return base_layer(x, *args, **kwargs)\n"
                 )
 
-            # Fix for fp16 + non-quantized base layers (e.g. SiGLIP vision encoder):
-            # When autocast is disabled and base_layer has float32 weights,
-            # cast x to match the weight dtype to prevent dtype mismatch.
             # For 8-bit layers, the base_layer call was already replaced above.
-            # For 4-bit layers, weight.dtype is uint8 (packed quantized bytes),
-            # so we must skip the cast to avoid corrupting input values.
-            _base_layer_call = "result = self.base_layer(x, *args, **kwargs)"
-            _m = re.search(r'^( *)' + re.escape(_base_layer_call), source, re.MULTILINE)
-            if _m:
-                _ind = _m.group(1)
-                source = source.replace(
-                    _base_layer_call,
-                    f"if not torch.is_autocast_enabled() and hasattr(self.base_layer, 'weight') "
-                    f"and self.base_layer.weight is not None "
-                    f"and not hasattr(self.base_layer.weight, 'quant_state') "
-                    f"and x.dtype != self.base_layer.weight.dtype:\n"
-                    f"{_ind}    x = x.to(self.base_layer.weight.dtype)\n"
-                    f"{_ind}{_base_layer_call}",
-                )
+            source = _patch_lora_base_layer_input_cast(source)
 
             # Fix for VARIANT_KWARG_KEYS (peft >= 0.18.0) - import from canonical source
             # if used in source but not available in parent module.
@@ -4034,6 +4662,11 @@ def patch_lora_forwards(torch_compile_options):
                     "    VARIANT_KWARG_KEYS = ['alora_offsets']\n"
                 )
 
+            if integer_input_inline:
+                extra_prepend += (
+                    "\nfrom unsloth_zoo.temporary_patches.misc import "
+                    "_lora_integer_input as _unsloth_lora_integer_input\n"
+                )
             forward = create_new_function(
                 f"{child}_peft_forward",
                 compiled_lora_forward + source,
@@ -4042,10 +4675,18 @@ def patch_lora_forwards(torch_compile_options):
                 prepend=f"\n{variant_kwarg_import}torch_compile_options = {torch_compile_options}\n"
                 + extra_prepend,
             ).unsloth_forward
+            if integer_input_inline:
+                forward._unsloth_integer_input = True
             exec(f"{parent}.{child}.forward = forward", globals(), locals())
         else:
             could_not_replace_modules.append(parent)
     pass
+    try:
+        from unsloth_zoo.temporary_patches.misc import patch_peft_lora_integer_input
+
+        patch_peft_lora_integer_input()
+    except Exception:
+        pass
     if success <= 5:
         print("Unsloth: Not an error, but could not optimize some PEFT modules.")
 
@@ -4186,6 +4827,22 @@ def patch_gradient_accumulation(modeling_file, module):
 
 
 pass
+
+
+# transformers' AyaVision forward drops the text logit_scale CohereForCausalLM applies (Command-A vision ships 1.0).
+_DROPPED_TEXT_LOGIT_SCALE = ("AyaVisionForConditionalGeneration",)
+
+
+def fixup_dropped_logit_scale(source, module = None):
+    if module not in _DROPPED_TEXT_LOGIT_SCALE or "logit_scale" in source:
+        return source
+    return re.sub(
+        r"^([ \t]+)(logits = self\.lm_head\(hidden_states[^\n]*\))[ \t]*$",
+        r"\1\2\n\1logits = logits * self.config.text_config.logit_scale",
+        source,
+        count = 1,
+        flags = re.MULTILINE,
+    )
 
 
 # Pre fix up some modules like Gemma3n
@@ -4495,6 +5152,7 @@ DISABLE_COMPILE_MODULES = [
     # Sinkhorn-Knopp division chain overflows to inf; tiny modules, so eager is cheap.
     "DeepseekV4HyperConnection",
     "DeepseekV4HyperHead",
+    "DeepseekV41HyperConnection",
 ]
 
 FIX_GC_LAYER_CALLER_MODULES = [
@@ -4507,7 +5165,11 @@ def patch_output_capture_targets(modeling_file, replacement_classes=None):
     try:
         from transformers.utils.output_capturing import OutputRecorder
     except ImportError:
-        return set()
+        # transformers 4.5x keeps it in generic; without it replaced classes are never captured.
+        try:
+            from transformers.utils.generic import OutputRecorder
+        except ImportError:
+            return set()
 
     replacement_classes = replacement_classes or {}
     target_names = set()
@@ -4854,6 +5516,9 @@ def unsloth_compile_transformers(
     # Later `eval(model_location)` calls need `transformers` bound in globals
     exec("import transformers", globals())
     disable_compile_functions = set(DISABLE_COMPILE_FUNCTIONS)
+    disable_compile_functions.update(DISABLE_COMPILE_MODEL_FUNCTIONS.get(model_type, ()))
+    function_source_rewrites = model_function_source_rewrites(modeling_file, model_type)
+    disable_compile_functions.difference_update(function_source_rewrites)
 
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__"):
         # Get __UNSLOTH_SUPPORTS_SDPA__
@@ -4985,8 +5650,8 @@ def unsloth_compile_transformers(
     pass
     UNSLOTH_FULLGRAPH = UNSLOTH_FULLGRAPH == "1"
 
-    # Patch PEFT lora forwards
-    if (not disable) and fast_lora_forwards:
+    # Gated on full disable only: the addmm forward needs no torch.compile, and PEFT's own runs fp32 GEMMs.
+    if (not full_disable) and fast_lora_forwards:
         print("Unsloth: Patching LoRA to make it faster")
         patch_lora_forwards(torch_compile_options)
     pass
@@ -5219,6 +5884,16 @@ def unsloth_compile_transformers(
             called_functions.append(function)
     pass
 
+    # torch_compile_with_fallback only falls back on recompile limits, so these must be disabled.
+    for function in data_dependent_helpers(modeling_file, called_functions):
+        if function not in disable_compile_functions:
+            print(
+                f"Unsloth: Will not compile function {function} since "
+                f"data-dependent operations are done."
+            )
+            disable_compile_functions.add(function)
+    pass
+
     # Check if fullgraph can be used
     torch_modules = {x: True for x in torch_modules}
     for module in torch_modules.keys():
@@ -5425,11 +6100,7 @@ def unsloth_compile_transformers(
         # Tier 2: MoE expert dispatch via torch.where + index_add
         #   1-arg torch.where returns data-dependent indices; combined with
         #   index_add this is the standard MoE routing loop pattern
-        if (
-            ".nonzero()" in source
-            or ".tolist()" in source
-            or ".item()" in source
-        ):
+        if has_data_dependent_call(source):
             print(
                 f"Unsloth: Will not compile {module} since data-dependent operations are done."
             )
@@ -5666,6 +6337,7 @@ def unsloth_compile_transformers(
                     continue
                 # Fix some arguments up like for Gemma 3N
                 new_source = fixup_fused_lm_head(source)
+                new_source = fixup_dropped_logit_scale(new_source, module)
                 # Apply fused LM transforms
                 new_source, supports_return_hidden_states = apply_fused_lm_head(
                     new_source, module
@@ -5791,13 +6463,23 @@ def unsloth_compile_transformers(
             # MOE routing weights cast fix takes effect in v5
             new_source, new_methods = patch_moe_routing_weights_cast(module_cls, source)
             if new_source != source or len(new_methods) > 0:
+                # Disabled, the router breaks the compiled MoE block around it (Ernie 4.5, Laguna).
+                compile_router = (
+                    compile_custom_modules
+                    and module in torch_modules
+                    and module not in bad_torch_modules
+                )
                 try:
                     new_module = create_standalone_class(
                         module,
                         model_location,
                         functions,
-                        fullgraph=False,
-                        disable=True,
+                        fullgraph=(
+                            compile_router
+                            and module not in no_fullgraph_modules
+                            and torch_modules[module]
+                        ),
+                        disable=disable if compile_router else True,
                         forward_source=new_source,
                         new_methods=new_methods,
                     )
@@ -5844,7 +6526,7 @@ def unsloth_compile_transformers(
     items_in_trainer = dir(transformers.trainer)
     good_items = []
     for item in items_in_trainer:
-        if item in inner_training_loop:
+        if not item.startswith("__") and item in inner_training_loop:
             good_items.append(item)
     pass
     exec(
@@ -5989,7 +6671,7 @@ def unsloth_compile_transformers(
             _mask_builders = calls_mask_creation_function(parameters)
             if module in disable_compile_functions:
                 parameters = (
-                    "@torch.compiler.disable(recursive = False)\n"
+                    "@torch_compiler_disable_unless_decode\n"
                     + parameters
                 )
             elif len(_mask_builders) != 0:
@@ -6024,6 +6706,8 @@ def unsloth_compile_transformers(
                     print(f"Unsloth: Cannot patch {module} with error = {str(e)}")
                     continue
             pass
+            if module in function_source_rewrites:
+                source = source.replace(*function_source_rewrites[module])
 
             if sdpa_bool_masks:
                 source = convert_attention_masks_to_bool(module, source)
@@ -6052,6 +6736,11 @@ def unsloth_compile_transformers(
                     bad_reason = "disabled keyword is in it"
                     break
             pass
+            # DISABLE_COMPILE_FUNCTIONS names keep the stronger @torch.compiler.disable below.
+            if not bad and module not in disable_compile_functions and is_hub_kernel_wrapper(source):
+                bad = True
+                bad_reason = "it dispatches to an external kernel package"
+            pass
             # Skipped for a DISABLE_COMPILE_FUNCTIONS name: `@torch.compiler.disable`
             # also stops Dynamo inlining it into a compiled caller, so downgrading it
             # to "emit bare" would be weaker. Nothing on that list builds masks today.
@@ -6063,6 +6752,14 @@ def unsloth_compile_transformers(
                         f"it builds attention masks via {', '.join(mask_builders)}"
                     )
             pass
+            if not bad and module not in disable_compile_functions:
+                if not function_has_tensor_inputs(source):
+                    bad = True
+                    bad_reason = "it takes no tensor inputs"
+                elif function_only_called_at_init(full_source, module):
+                    bad = True
+                    bad_reason = "it is only called while constructing modules"
+            pass
             if not bad:
                 # Functions defined inside an if/else come back indented
                 # from inspect.getsource; dedent before prepending the
@@ -6072,11 +6769,11 @@ def unsloth_compile_transformers(
                 if module in disable_compile_functions:
                     source = re.sub(
                         r"@torch.compile\([^\n]*\)\n",
-                        "@torch.compiler.disable(recursive = False)\n",
+                        "@torch_compiler_disable_unless_decode\n",
                         source,
                     )
-                    if "@torch.compiler.disable(recursive = False)\n" not in source:
-                        source = "@torch.compiler.disable(recursive = False)\n" + source
+                    if "@torch_compiler_disable_unless_decode\n" not in source:
+                        source = "@torch_compiler_disable_unless_decode\n" + source
                 elif not disable:
                     _fullgraph = UNSLOTH_FULLGRAPH and not calls_disable_compile_function(
                         source, disable_compile_functions
@@ -6183,10 +6880,11 @@ def unsloth_compile_transformers(
             continue
 
         for key, value in item.items():
-            value = str(value)
+            # Exact name: a substring swapped JambaAttentionDecoderLayer for JambaAttention.
+            value = getattr(value, "__name__", None) if isinstance(value, type) else None
             found = False
             for replaced_class in replaced_classes:
-                if replaced_class in value:
+                if replaced_class == value:
                     try:
                         exec(
                             f"{model_location}.{check}['{key}'] = combined_module.{replaced_class}",

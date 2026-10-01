@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+from unsloth_zoo.temporary_patches.moe_utils import moe_lora_b_expert_columns
 from unsloth_zoo.temporary_patches.qwen3_moe import _make_qwen_moe_lora_extractor
 
 
@@ -35,7 +36,7 @@ def _assert_layout_equivalence(layout, first, second, weight_A, weight_B, E, R, 
     x = torch.randn(6, in_dim)
     for e in range(E):
         Ae = weight_A[e * R : (e + 1) * R]
-        Be = weight_B[:, e * R : (e + 1) * R]
+        Be = weight_B[:, moe_lora_b_expert_columns(e, E, R)]
         if layout == "canonical":
             naive = x @ Ae.T @ Be.T
         else:
@@ -102,7 +103,7 @@ def test_extractor_fallback_numerical_equivalence_per_expert():
     x = torch.randn(6, in_dim)
     for e in range(E):
         Ae = wA[e * R : (e + 1) * R]
-        Be = wB[:, e * R : (e + 1) * R]
+        Be = wB[:, moe_lora_b_expert_columns(e, E, R)]
         naive = x @ Ae.T @ Be.T
         via = (x @ first[e]) @ second[e]
         torch.testing.assert_close(via, naive, atol=1e-4, rtol=1e-4)
@@ -191,16 +192,15 @@ def test_extractor_disambiguates_square_dims_via_did_swap(did_swap):
     assert first.shape == (E, dim, R)
     assert second.shape == (E, R, dim)
 
-    # Reference: under PEFT 0.18 the reshape is the canonical permutation;
-    # under PEFT 0.19 swapped, weight_A and weight_B roles are flipped.
+    # PEFT 0.19+ adds B @ A per expert; PEFT 0.18 adds (B @ A).T.
     x = torch.randn(5, dim)
     for e in range(E):
         Ae = wA[e * R : (e + 1) * R]
-        Be = wB[:, e * R : (e + 1) * R]
+        Be = wB[:, moe_lora_b_expert_columns(e, E, R)]
         if did_swap:
-            naive = x @ Be @ Ae   # PEFT 0.19 reversed
+            naive = x @ Ae.T @ Be.T
         else:
-            naive = x @ Ae.T @ Be.T  # PEFT 0.18 canonical
+            naive = x @ Be @ Ae
         via = (x @ first[e]) @ second[e]
         torch.testing.assert_close(via, naive, atol=1e-4, rtol=1e-4)
 

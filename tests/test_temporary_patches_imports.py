@@ -26,6 +26,12 @@ import os
 
 import pytest
 
+# Every `temporary_patches` submodule imports torch, so on a runner without it this whole
+# suite is a precondition failure, not a finding: 37 of its 40 cases go red on merge base
+# too. The macOS staging runner is one, because pyproject declares no torch on darwin/arm64.
+# The two sibling suites in the same CI step already guard this way.
+pytest.importorskip("torch")
+
 
 # The switch `__init__.py:179` reads into _SKIP_GPU_INIT, which the device-capacity tests
 # below are entirely about: with it on, the import skips device detection and DEVICE_TYPE
@@ -53,10 +59,15 @@ def _child_env(**overrides: str) -> dict:
 TEMPORARY_PATCHES_SUBMODULES = [
     "unsloth_zoo.temporary_patches.common",
     "unsloth_zoo.temporary_patches.bitsandbytes",
+    "unsloth_zoo.temporary_patches.bitsandbytes_large_tensors",
+    "unsloth_zoo.temporary_patches.compiled_model_identity",
+    "unsloth_zoo.temporary_patches.conversion_mapping_rescope",
     "unsloth_zoo.temporary_patches.deepseek_v3_moe",
+    "unsloth_zoo.temporary_patches.deepseek_v4",
     "unsloth_zoo.temporary_patches.ernie4_5_moe",
     "unsloth_zoo.temporary_patches.fla_vendor",
     "unsloth_zoo.temporary_patches.flex_attention_bwd",
+    "unsloth_zoo.temporary_patches.remote_code_vlm",
     "unsloth_zoo.temporary_patches.gemma",
     "unsloth_zoo.temporary_patches.gemma3n",
     "unsloth_zoo.temporary_patches.gemma4",
@@ -66,14 +77,20 @@ TEMPORARY_PATCHES_SUBMODULES = [
     "unsloth_zoo.temporary_patches.gemma4_moe",
     "unsloth_zoo.temporary_patches.glm4_moe",
     "unsloth_zoo.temporary_patches.gpt_oss",
+    "unsloth_zoo.temporary_patches.granitemoehybrid",
+    "unsloth_zoo.temporary_patches.inkling",
     "unsloth_zoo.temporary_patches.lfm2_moe",
+    "unsloth_zoo.temporary_patches.llama4_moe",
     "unsloth_zoo.temporary_patches.ministral",
     "unsloth_zoo.temporary_patches.amd_aiter",
+    "unsloth_zoo.temporary_patches.fp8_uncontained_weights",
     "unsloth_zoo.temporary_patches.misc",
     "unsloth_zoo.temporary_patches.muse_glimmer_banded_attention",
     "unsloth_zoo.temporary_patches.mixtral_moe",
     "unsloth_zoo.temporary_patches.moe_bnb",
+    "unsloth_zoo.temporary_patches.moe_experts_interface",
     "unsloth_zoo.temporary_patches.moe_grouped_modulelist",
+    "unsloth_zoo.temporary_patches.moe_triton_kernels",
     "unsloth_zoo.temporary_patches.moe_utils",
     "unsloth_zoo.temporary_patches.moe_utils_bnb4bit",
     "unsloth_zoo.temporary_patches.moe_utils_fp8",
@@ -84,6 +101,9 @@ TEMPORARY_PATCHES_SUBMODULES = [
     "unsloth_zoo.temporary_patches.qwen3_moe_float32",
     "unsloth_zoo.temporary_patches.qwen3_next_moe",
     "unsloth_zoo.temporary_patches.qwen3_vl_moe",
+    "unsloth_zoo.temporary_patches.qwen4_exp",
+    "unsloth_zoo.temporary_patches.remote_mamba2",
+    "unsloth_zoo.temporary_patches.step3p7_moe",
     "unsloth_zoo.temporary_patches.utils",
 ]
 

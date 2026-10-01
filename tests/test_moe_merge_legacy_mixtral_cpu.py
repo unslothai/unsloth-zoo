@@ -77,15 +77,24 @@ def _make_lora_weights(num_layers, num_experts, rank_per, hidden, intermediate, 
 
 
 def _delta(A, B, alpha, expert_idx, num_experts):
+    """One expert's delta from a fused PEFT-0.19 adapter, spelled out as PEFT packs it.
+
+    "Legacy" in this file is about the on-disk key format: transformers v5 fuses Mixtral
+    experts in memory but still writes unfused `w1`/`w2`/`w3`. The adapter itself is a current
+    fused PEFT one (see `_make_lora_weights`), so it is read with PEFT's packing, not with any
+    older Unsloth convention: `lora_A` is expert-slowest, a contiguous row block per expert,
+    while `lora_B` is expert-FASTEST, `reshape(out, rank, num_experts)` exactly as
+    `ParamWrapper.get_delta_factors` does, so expert `e` is plane `e` of that reshape. Written
+    out rather than imported so the expectation stays independent of the merge code.
+    """
     r = A.shape[0] // num_experts
-    s, e = expert_idx * r, (expert_idx + 1) * r
-    a = A[s:e].to(torch.float64)
-    b = B[:, s:e].to(torch.float64)
+    a = A[expert_idx * r:(expert_idx + 1) * r].to(torch.float64)
+    b = B.reshape(B.shape[0], r, num_experts)[:, :, expert_idx].to(torch.float64)
     return alpha * (b @ a)  # standard layout: (out, H)
 
 
 def test_legacy_mixtral_w1w2w3_experts_are_merged(tmp_path):
-    num_layers, num_experts, rank_per = 2, 4, 4
+    num_layers, num_experts, rank_per = 2, 4, 3
     # 2*intermediate != hidden keeps gate_up_proj shape-distinct.
     hidden, intermediate = 12, 8
     alpha = 2.0
@@ -138,7 +147,7 @@ def test_legacy_mixtral_w1w2w3_experts_are_merged(tmp_path):
 
 def test_legacy_mixtral_gate_up_proj_keyed_adapter_is_merged(tmp_path):
     """gate_up LoRA keyed on .gate_up_proj (no .base_layer wrapper) is still found by the legacy w1/w3 path."""
-    num_layers, num_experts, rank_per = 2, 4, 4
+    num_layers, num_experts, rank_per = 2, 4, 3
     # 2*intermediate != hidden keeps gate_up_proj shape-distinct.
     hidden, intermediate = 12, 8
     alpha = 2.0
@@ -200,7 +209,7 @@ def test_legacy_mixtral_gate_up_proj_keyed_adapter_is_merged(tmp_path):
 
 def test_legacy_mixtral_down_proj_keyed_adapter_is_merged(tmp_path):
     """down LoRA keyed on .down_proj (PEFT target_parameters for 3D MoE) is still found by the legacy w2 path."""
-    num_layers, num_experts, rank_per = 2, 4, 4
+    num_layers, num_experts, rank_per = 2, 4, 3
     hidden, intermediate = 12, 8
     alpha = 2.0
     path = str(tmp_path / "model.safetensors")
@@ -263,7 +272,7 @@ def test_legacy_mixtral_both_fused_keys_resolve_num_experts(tmp_path):
     """gate_up on .gate_up_proj AND down on .down_proj, with no .base_layer / bare .experts
     key. Neither matches the #5410 num_experts override, so num_experts must come from the
     wrapped module (lora_stats), not the shard key scan, or the fused rank slices are wrong."""
-    num_layers, num_experts, rank_per = 1, 4, 4
+    num_layers, num_experts, rank_per = 1, 4, 3
     hidden, intermediate = 12, 8
     alpha = 2.0
     path = str(tmp_path / "model.safetensors")

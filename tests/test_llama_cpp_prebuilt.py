@@ -303,6 +303,67 @@ def test_extract_rejects_symlink_escape(tmp_path):
     assert not (outside / "pwned.txt").exists()
 
 
+@pytest.mark.skipif(not IS_POSIX, reason = "symlink extraction (POSIX)")
+@pytest.mark.parametrize("data_filter", [True, False], ids = ["data_filter", "no_data_filter"])
+def test_extract_rejects_chained_symlink_escape(tmp_path, monkeypatch, data_filter):
+    # Each link resolves inside when checked up front against an empty tree; only
+    # once `sub -> .` exists does `sub/up -> ..` point above the extraction dir.
+    if data_filter and not hasattr(tarfile, "data_filter"):
+        pytest.skip("tarfile has no data filter on this Python")
+    if not data_filter:
+        monkeypatch.delattr(tarfile, "data_filter", raising = False)
+    evil = tmp_path / "evil-chain.tar.gz"
+    out = tmp_path / "stage" / "out"
+    out.parent.mkdir()
+    with tarfile.open(evil, "w:gz") as tar:
+        _add_link(tar, "sub", ".")
+        _add_link(tar, "sub/up", "..")
+        _add_file(tar, "sub/up/pwned.txt", "pwned")
+    with pytest.raises(Exception):
+        llama_cpp._extract_archive(str(evil), str(out))
+    assert not (out.parent / "pwned.txt").exists()
+
+
+@pytest.mark.skipif(not IS_POSIX, reason = "symlink extraction (POSIX)")
+def test_extract_without_data_filter_rejects_hardlink_alias_of_symlink(tmp_path, monkeypatch):
+    monkeypatch.delattr(tarfile, "data_filter", raising = False)
+    evil = tmp_path / "evil-alias.tar.gz"
+    out = tmp_path / "stage" / "out"
+    out.parent.mkdir()
+    with tarfile.open(evil, "w:gz") as tar:
+        _add_link(tar, "dir/sym", "..")
+        _add_link(tar, "alias", "dir/sym", link_type = tarfile.LNKTYPE)
+        _add_file(tar, "alias/pwned.txt", "pwned")
+    with pytest.raises(RuntimeError, match = "goes through a link"):
+        llama_cpp._extract_archive(str(evil), str(out))
+    assert not (out.parent / "pwned.txt").exists()
+
+
+@pytest.mark.parametrize("name", ["sub\\pwned.txt", "SUB/pwned.txt"], ids = ["backslash", "case"])
+def test_extract_without_data_filter_canonicalizes_link_paths(tmp_path, monkeypatch, name):
+    monkeypatch.delattr(tarfile, "data_filter", raising = False)
+    monkeypatch.setattr(llama_cpp.tarfile.TarFile, "extractall", lambda *a, **k: None)
+    evil = tmp_path / "evil-backslash.tar.gz"
+    with tarfile.open(evil, "w:gz") as tar:
+        _add_link(tar, "sub", ".")
+        _add_file(tar, name, "pwned")
+    with pytest.raises(RuntimeError, match = "goes through a link"):
+        llama_cpp._extract_archive(str(evil), str(tmp_path / "out"))
+
+
+@pytest.mark.skipif(not IS_POSIX, reason = "symlink extraction (POSIX)")
+def test_extract_without_data_filter_keeps_library_symlinks(tmp_path, monkeypatch):
+    monkeypatch.delattr(tarfile, "data_filter", raising = False)
+    archive = tmp_path / "libs.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        _add_file(tar, "build/bin/libllama.so.0.0.1", "elf")
+        _add_link(tar, "build/bin/libllama.so.0", "libllama.so.0.0.1")
+        _add_link(tar, "build/bin/libllama.so", "libllama.so.0")
+    out = tmp_path / "out"
+    llama_cpp._extract_archive(str(archive), str(out))
+    assert (out / "build" / "bin" / "libllama.so").read_text() == "elf"
+
+
 def test_extract_rejects_hardlink_escape(tmp_path):
     evil = tmp_path / "evil-hardlink.tar.gz"
     with tarfile.open(evil, "w:gz") as tar:
@@ -597,7 +658,14 @@ def _wire_attempt_recorder(monkeypatch, *, fork_release, ggml_release, manifest 
         llama_cpp, "_fetch_release_json_asset",
         lambda assets, name: manifest if "manifest" in name else {"artifacts": {}},
     )
-    def fake_stage(folder, tag, asset_name, asset_url, expected_sha256 = None, repo = None, source_assets = None):
+    def fake_stage(
+        folder, tag, asset_name, asset_url, expected_sha256 = None, repo = None,
+        source_assets = None, checksums = None,
+    ):
+        # The checksum map has to reach here: it is what the source archive
+        # the converter is copied out of gets verified against, and a double
+        # that silently dropped it would let that plumbing rot unnoticed.
+        assert checksums is not None, "the checksum map did not reach staging"
         calls.append((repo, asset_name))
         raise RuntimeError("forced fall-through")
     monkeypatch.setattr(llama_cpp, "_stage_prebuilt_install", fake_stage)
@@ -663,7 +731,11 @@ def test_attempt_order_darwin_fork_only_no_ggml(monkeypatch, tmp_path):
         lambda assets, name: FORK_MANIFEST if "manifest" in name else {"artifacts": {}},
     )
     calls = []
-    def fake_stage(folder, tag, asset_name, asset_url, expected_sha256 = None, repo = None, source_assets = None):
+    def fake_stage(
+        folder, tag, asset_name, asset_url, expected_sha256 = None, repo = None,
+        source_assets = None, checksums = None,
+    ):
+        assert checksums is not None, "the checksum map did not reach staging"
         calls.append((repo, asset_name))
         raise RuntimeError("forced")
     monkeypatch.setattr(llama_cpp, "_stage_prebuilt_install", fake_stage)

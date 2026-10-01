@@ -75,6 +75,63 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse = True)
+def _an_unspent_recompile_budget():
+    """Every wrapper in the process borrows from ONE budget, so these tests share state.
+
+    `_bump_recompile_limits` raises `torch._dynamo.config` itself and counts the borrow in the
+    module-global `_GLOBAL_BUMPS`, capped at `_MAX_TOTAL_RECOMPILE_LIMIT_BUMPS` for the whole
+    process; the count is only handed back when every borrower has settled to eager. A test
+    whose wrapper is still pending when it ends therefore leaves the budget spent, and the
+    NEXT test's retry silently declines -- one compiled attempt instead of two, which is an
+    assertion failure in a test that has nothing to do with the leak and changes with the
+    order the suite happens to run in. Each test gets the budget back here instead.
+    """
+    utils = sys.modules["unsloth_zoo.temporary_patches.utils"]
+    config = torch._dynamo.config
+    # Every name the bump path writes, not only this torch's pair: `_reset_bump_state` puts
+    # `_PRISTINE_LIMITS` back across all of them, and a fixture that saved a narrower set left
+    # the two views of "the real budget" disagreeing.
+    limits = {key: getattr(config, key) for key in _PRISTINE_LIMITS}
+    saved = (
+        utils._GLOBAL_BUMPS,
+        dict(utils._ORIGINAL_RECOMPILE_LIMITS),
+        dict(utils._BUMPED_RECOMPILE_LIMITS),
+        set(utils._LATCHED_EAGER_LABELS),
+        set(utils._PENDING_EAGER_LABELS),
+        set(utils._RECENT_EAGER_LABELS),
+    )
+    utils._GLOBAL_BUMPS = 0
+    utils._ORIGINAL_RECOMPILE_LIMITS.clear()
+    utils._BUMPED_RECOMPILE_LIMITS.clear()
+    # The budget itself, not only the bookkeeping. `_reset_bump_state` restores the limits to
+    # `_PRISTINE_LIMITS`, so a test that enters on some OTHER value -- an earlier file in the
+    # same worker raised or lowered it, which is exactly the leak this fixture exists for --
+    # saw the helper hand back a number it never started from. Handing the pristine budget out
+    # here makes the two agree, and the outer value is still put back at teardown.
+    for key, value in _PRISTINE_LIMITS.items():
+        setattr(config, key, value)
+    try:
+        yield
+    finally:
+        for key, value in limits.items():
+            setattr(config, key, value)
+        utils._GLOBAL_BUMPS = saved[0]
+        for table, restored in (
+            (utils._ORIGINAL_RECOMPILE_LIMITS, saved[1]),
+            (utils._BUMPED_RECOMPILE_LIMITS, saved[2]),
+        ):
+            table.clear()
+            table.update(restored)
+        for labels, restored in (
+            (utils._LATCHED_EAGER_LABELS, saved[3]),
+            (utils._PENDING_EAGER_LABELS, saved[4]),
+            (utils._RECENT_EAGER_LABELS, saved[5]),
+        ):
+            labels.clear()
+            labels.update(restored)
+
+
 def _pair(compiled_raises = None, calls = None):
     calls = calls if calls is not None else {"c": 0, "e": 0}
 

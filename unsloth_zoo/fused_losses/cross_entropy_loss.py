@@ -141,17 +141,39 @@ pass
 # 4 counted the logits alone.
 _CE_BYTES_PER_LOGIT = 16.0
 
+# Cap per-chunk target: on very large GPUs half the free pool rounds to a single chunk,
+# materializing full float32 logits and dominating peak memory.
+_CE_TARGET_GB_CAP = 4.0
+
+
+def _free_target_gb():
+    """Half the memory actually available to this backend, capped.
+
+    `_default_target_gb` already answers this for every backend the zoo supports, and it
+    answers it for the reason this needed: it checks `is_available()` before asking a device
+    how much memory it has, and budgets CPU, MPS and other unified-memory backends from host
+    RAM. `DEVICE_TYPE` is legitimately "cpu" or "mlx", and on a torch built without CUDA
+    `mem_get_info` does not return a number, it raises "Torch not compiled with CUDA enabled".
+    That query sat under the ordinary forward, so a CPU or Apple Silicon run died inside a
+    memory lookup rather than on anything it was computing.
+
+    Reused rather than reimplemented: a second copy that measured something different would be
+    the same bug again, one module over.
+    """
+
+    # Absolute, not `from ..tiled_mlp`: transformers' dynamic_module_utils builds the path by
+    # joining the raw regex capture onto this directory, so the relative spelling sends it looking
+    # for fused_losses/.tiled_mlp.py and every remote-code save walking this graph fails.
+    from unsloth_zoo.tiled_mlp import _default_target_gb  # noqa: PLC0415  (avoids an import cycle)
+
+    return min(_default_target_gb(), _CE_TARGET_GB_CAP)
+
+
 @functools.cache
 def _get_chunk_multiplier(vocab_size, target_gb = None, fixed_gb = 0.0):
     """Chunk multiplier sized to fit target max memory usage."""
     if target_gb is None:
-        # Find current VRAM left in the GPU, and use 50% or less of it
-        free, total = torch.xpu.mem_get_info(0) if DEVICE_TYPE == "xpu" else torch.cuda.mem_get_info(0)
-        free_gb = free / 1024 / 1024 / 1024
-        free_gb = free_gb * 0.5
-        # Cap per-chunk target: on very large GPUs half the free pool rounds to a
-        # single chunk, materializing full float32 logits and dominating peak memory.
-        target_gb = min(free_gb, 4.0)
+        target_gb = _free_target_gb()
     pass
 
     # Prevent ZeroDivisionError when GPU memory is exhausted
@@ -553,6 +575,17 @@ class UnslothFusedLoss(torch.autograd.Function):
     pass
 pass
 
+# Resolved once here, not per call: under torch.compile dynamo ignores functools.cache, traces
+# inspect.signature and graph-breaks (it cannot key a dict on, or getattr, an autograd.Function).
+_FUSED_LOSS_PARAMETERS, _FUSED_LOSS_DEFAULTS = _get_mapping(UnslothFusedLoss)
+
+# torch 2.11 alone traces UnslothFusedLoss into a graph that saves zero gradients (right loss, nothing trains).
+_FUSED_LOSS_OPAQUE = torch.__version__.split("+")[0].split(".")[:2] == ["2", "11"]
+
+@torch.compiler.disable
+def _fused_loss_opaque(*args):
+    return UnslothFusedLoss.apply(*args)
+
 def unsloth_fused_ce_loss(
     trainer,
     hidden_states  : torch.Tensor,
@@ -595,7 +628,7 @@ def unsloth_fused_ce_loss(
     if hidden_states.device != device:
         hidden_states = hidden_states.to(device = device)
 
-    return apply_autograd_function(UnslothFusedLoss, dict(
+    mapping = dict(
         loss_function = compute_fused_ce_loss,
         hidden_states = hidden_states,
         lm_head_weight = lm_head_weight,
@@ -609,6 +642,11 @@ def unsloth_fused_ce_loss(
         torch_compile = torch_compile,
         overwrite = overwrite,
         extra_kwargs = kwargs,
+    )
+    apply = _fused_loss_opaque if _FUSED_LOSS_OPAQUE else UnslothFusedLoss.apply
+    return apply(*(
+        mapping.get(key, default) \
+        for key, default in zip(_FUSED_LOSS_PARAMETERS, _FUSED_LOSS_DEFAULTS)
     ))
 pass
 
