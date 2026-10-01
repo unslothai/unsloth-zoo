@@ -74,7 +74,18 @@ BASELINE_PATH = Path(__file__).resolve().parent / "untrusted_sinks_baseline.json
 # Scanned by default. `studio/backend` is also an import root in its own right: its
 # modules import each other as `utils.models.model_config`, not as a subpackage of
 # anything, so it is added to the module index separately below.
-DEFAULT_TARGETS = ("unsloth", "unsloth_zoo", "studio", "scripts")
+# `unsloth_cli` and the two top-level entry points are here because they ship: the CI
+# invocation uses these defaults, so a package left out of this tuple is a production
+# execution surface the gate never looks at.
+DEFAULT_TARGETS = (
+    "unsloth",
+    "unsloth_zoo",
+    "unsloth_cli",
+    "studio",
+    "scripts",
+    "cli.py",
+    "unsloth-cli.py",
+)
 
 EXCLUDED_PARTS = frozenset(
     {
@@ -210,7 +221,10 @@ SINKS: dict[str, tuple[tuple[int, ...], frozenset[str]]] = {
     "pydoc.locate": ((0,), frozenset()),
     # Resolving a dotted path out of a string, in both libraries that offer it.
     "import_from_string": ((0,), frozenset()),
-    "get_class_from_dynamic_module": ((0, 1), frozenset({"class_reference", "pretrained_model_name_or_path"})),
+    "get_class_from_dynamic_module": (
+        (0, 1),
+        frozenset({"class_reference", "pretrained_model_name_or_path"}),
+    ),
     "import_module_class": ((0,), frozenset()),
     # Import path injection: after this, a plain `import` statement is the sink.
     "sys.path.insert": ((1,), frozenset()),
@@ -242,9 +256,7 @@ SINKS: dict[str, tuple[tuple[int, ...], frozenset[str]]] = {
 
 # Sinks already gated by lint_exec_literals.py / lint_dynamic_exec.py. Reported here for
 # a single view of the surface, never the reason this script exits non-zero.
-SINKS_GATED_ELSEWHERE = frozenset(
-    {"exec", "eval", "compile", "builtins.exec", "builtins.eval"}
-)
+SINKS_GATED_ELSEWHERE = frozenset({"exec", "eval", "compile", "builtins.exec", "builtins.eval"})
 
 # `getattr(x, tainted)` is only a finding when `x` is plausibly a module or a class
 # namespace: `getattr(config, field)` is a dict-ish read and is everywhere.
@@ -443,6 +455,23 @@ class _FileFacts:
             base = base + node.module.split(".")
         return ".".join(base)
 
+    def canonical(self, name: str) -> str:
+        """Rewrite a callee through this file's imports, so the tables see one spelling.
+
+        Suffix matching alone cannot do this, and claiming it could was wrong: after
+        `import json as js`, `js.load` has no suffix in the table, and after
+        `from yaml import safe_load` the call is the bare name `safe_load`. Both are
+        deserialisers of attacker bytes that produced no taint at all, so a dynamic
+        import or a subprocess immediately downstream was silently accepted.
+        """
+        if not name:
+            return name
+        head, separator, tail = name.partition(".")
+        dotted = self.imports.get(head)
+        if dotted is None:
+            return name
+        return f"{dotted}.{tail}" if separator else dotted
+
     def target_of(self, callee: ast.AST) -> tuple[Path, str] | None:
         """Resolve a call target to a first-party (file, qualname), or None.
 
@@ -564,7 +593,7 @@ class _TaintPass(ast.NodeVisitor):
         return None
 
     def _tainted_call(self, node: ast.Call) -> str | None:
-        name = _call_name(node.func)
+        name = self.facts.canonical(_call_name(node.func))
         source = _matches(name, UNTRUSTED_CALLS)
         if source:
             return f"{source}()"
@@ -596,9 +625,22 @@ class _TaintPass(ast.NodeVisitor):
             return None
         # `os.path.join(tainted, "Spark-TTS")` is still attacker-influenced, and that is
         # the whole basename-collision shape: a fixed name under a controlled parent.
-        if _matches(name, {"os.path.join", "path.join", "os.path.dirname", "path.dirname",
-                           "os.path.abspath", "os.path.realpath", "os.fspath", "str",
-                           "Path", "os.path.basename", "os.path.normpath"}):
+        if _matches(
+            name,
+            {
+                "os.path.join",
+                "path.join",
+                "os.path.dirname",
+                "path.dirname",
+                "os.path.abspath",
+                "os.path.realpath",
+                "os.fspath",
+                "str",
+                "Path",
+                "os.path.basename",
+                "os.path.normpath",
+            },
+        ):
             for argument in node.args:
                 reason = self.tainted(argument)
                 if reason:
@@ -670,9 +712,7 @@ class _TaintPass(ast.NodeVisitor):
     def visit_Return(self, node: ast.Return) -> None:
         if node.value is not None:
             reason = self.tainted(node.value)
-            if reason and (
-                not self.returns_tainted or self.returns_tainted == NAMED_PARAM_REASON
-            ):
+            if reason and (not self.returns_tainted or self.returns_tainted == NAMED_PARAM_REASON):
                 self.returns_tainted = reason
         self.generic_visit(node)
 
@@ -701,7 +741,9 @@ class _TaintPass(ast.NodeVisitor):
         if not params:
             return
         bound = self.state.pending_params.setdefault(target, {})
-        offset = 1 if self.state.is_method.get(target) and isinstance(node.func, ast.Attribute) else 0
+        offset = (
+            1 if self.state.is_method.get(target) and isinstance(node.func, ast.Attribute) else 0
+        )
         for position, argument in enumerate(node.args):
             reason = self.tainted(argument)
             if not reason:
@@ -717,7 +759,7 @@ class _TaintPass(ast.NodeVisitor):
                 bound[keyword.arg] = reason
 
     def _check_sink(self, node: ast.Call) -> None:
-        name = _call_name(node.func)
+        name = self.facts.canonical(_call_name(node.func))
         sink = _matches(name, SINKS)
         if sink is None:
             self._check_getattr(node)
@@ -744,7 +786,10 @@ class _TaintPass(ast.NodeVisitor):
         holder_name = _call_name(holder).split(".")[0] if not isinstance(holder, ast.Call) else ""
         is_module_ish = holder_name in MODULE_ISH_NAMES or (
             isinstance(holder, ast.Call)
-            and _matches(_call_name(holder.func), {"importlib.import_module", "import_module"})
+            and _matches(
+                self.facts.canonical(_call_name(holder.func)),
+                {"importlib.import_module", "import_module"},
+            )
         )
         if not is_module_ish:
             return
@@ -754,7 +799,7 @@ class _TaintPass(ast.NodeVisitor):
 
     def _check_remote_code(self, node: ast.Call) -> None:
         """`trust_remote_code = True` written at a loader, or forwarded as a constant."""
-        name = _call_name(node.func)
+        name = self.facts.canonical(_call_name(node.func))
         if not any(marker in name for marker in REMOTE_CODE_LOADERS):
             return
         for keyword in node.keywords:
@@ -769,7 +814,14 @@ class _TaintPass(ast.NodeVisitor):
                     tier = "A",
                 )
 
-    def _record(self, node: ast.Call, sink: str, reason: str, argument: str, tier: str = "") -> None:
+    def _record(
+        self,
+        node: ast.Call,
+        sink: str,
+        reason: str,
+        argument: str,
+        tier: str = "",
+    ) -> None:
         if not tier:
             tier = "B" if reason == NAMED_PARAM_REASON else "A"
         self.findings.append(
@@ -812,7 +864,9 @@ class _State:
                     for name, reason in names.items()
                 ),
                 "attrs": sorted(f"{key}={reason}" for key, reason in self.tainted_attrs.items()),
-                "globals": sorted(f"{key}={reason}" for key, reason in self.tainted_globals.items()),
+                "globals": sorted(
+                    f"{key}={reason}" for key, reason in self.tainted_globals.items()
+                ),
                 "returns": sorted(
                     f"{path}::{qualname}={reason}"
                     for (path, qualname), reason in self.returns_tainted.items()
@@ -856,7 +910,9 @@ def _remote_code_defaults(facts: _FileFacts) -> list[dict]:
     for qualname, node in sorted(facts.functions.items()):
         arguments = node.args
         positional = list(arguments.posonlyargs) + list(arguments.args)
-        pairs = list(zip(positional[len(positional) - len(arguments.defaults) :], arguments.defaults))
+        pairs = list(
+            zip(positional[len(positional) - len(arguments.defaults) :], arguments.defaults)
+        )
         pairs += [
             (argument, default)
             for argument, default in zip(arguments.kwonlyargs, arguments.kw_defaults)
@@ -912,7 +968,7 @@ def _unpinned_code_fetches(facts: _FileFacts) -> list[dict]:
         for child in ast.walk(node):
             if not isinstance(child, ast.Call):
                 continue
-            name = _call_name(child.func)
+            name = facts.canonical(_call_name(child.func))
             if _matches(name, {"snapshot_download", "hf_hub_download"}):
                 if not any(keyword.arg == "revision" for keyword in child.keywords):
                     fetches.append(child)
@@ -947,6 +1003,30 @@ def _unpinned_code_fetches(facts: _FileFacts) -> list[dict]:
                 }
             )
     return findings
+
+
+def _collect(facts: _FileFacts, qualname: str, body, state: "_State") -> list[dict]:
+    """Findings for one body, after its own local taint has settled.
+
+    One ordered traversal is not enough even for a flow-insensitive result, because
+    `local_reasons` is built as the walk proceeds: a sink visited before a later tainted
+    assignment to the same name would never be reconsidered. A loop that consumes `name`
+    and then rebinds it from `json.loads` for the next iteration is a real executable
+    flow, and it was being missed. So the body is walked until its local taint stops
+    growing, and only the last walk's findings are kept.
+    """
+    nodes = list(body)
+    reasons: dict[str, str] = {}
+    visitor = None
+    for _ in range(8):
+        visitor = _TaintPass(facts, qualname, state)
+        visitor.local_reasons.update(reasons)
+        for child in nodes:
+            visitor.visit(child)
+        if visitor.local_reasons == reasons:
+            break
+        reasons = dict(visitor.local_reasons)
+    return visitor.findings if visitor is not None else []
 
 
 def _python_files(targets: list[Path]) -> list[Path]:
@@ -1005,11 +1085,7 @@ def scan(targets: list[Path], roots: list[Path] | None = None) -> list[dict]:
                 "cls",
             )
             # Tier B seeding: a parameter whose name says it carries untrusted data.
-            seeded = {
-                name
-                for name in facts.params[qualname]
-                if name in UNTRUSTED_PARAM_NAMES
-            }
+            seeded = {name for name in facts.params[qualname] if name in UNTRUSTED_PARAM_NAMES}
             if seeded:
                 state.named_params[key] = seeded
 
@@ -1046,16 +1122,13 @@ def scan(targets: list[Path], roots: list[Path] | None = None) -> list[dict]:
     findings: list[dict] = []
     for path, facts in sorted(facts_by_path.items()):
         for qualname, node in sorted(facts.functions.items()):
-            visitor = _TaintPass(facts, qualname, state)
-            for child in ast.iter_child_nodes(node):
-                visitor.visit(child)
-            findings.extend(visitor.findings)
-        module_visitor = _TaintPass(facts, "<module>", state)
-        for child in ast.iter_child_nodes(facts.tree):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                continue
-            module_visitor.visit(child)
-        findings.extend(module_visitor.findings)
+            findings.extend(_collect(facts, qualname, ast.iter_child_nodes(node), state))
+        body = [
+            child
+            for child in ast.iter_child_nodes(facts.tree)
+            if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        ]
+        findings.extend(_collect(facts, "<module>", body, state))
         findings.extend(_remote_code_defaults(facts))
         findings.extend(_unpinned_code_fetches(facts))
 
@@ -1097,7 +1170,7 @@ def _write_baseline(findings: list[dict]) -> None:
 # The two real holes, written out. The taint starts at a download rather than at a bare
 # parameter so that both findings have to come out tier A: a parameter name alone is
 # tier B by construction and would let a broken fixpoint pass this test.
-SELF_TEST_BAD = '''
+SELF_TEST_BAD = """
 import importlib, json, os, sys
 from huggingface_hub import snapshot_download
 
@@ -1111,9 +1184,9 @@ def load(repo):
     module = importlib.import_module("transformers.models." + model_type)
     sys.path.insert(0, os.path.join(os.path.dirname(local), "Spark-TTS"))
     return module
-'''
+"""
 
-SELF_TEST_GOOD = '''
+SELF_TEST_GOOD = """
 import importlib, json, os, re
 
 def read_type(path):
@@ -1125,7 +1198,7 @@ def read_type(path):
 
 def load():
     return importlib.import_module("transformers.models.llama")
-'''
+"""
 
 
 def _self_test() -> int:
