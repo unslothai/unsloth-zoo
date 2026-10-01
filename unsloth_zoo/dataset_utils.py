@@ -2566,8 +2566,7 @@ except:
 
 _TRL_COLLATOR_APPLIES_MASKS = None
 def trl_collator_applies_masks():
-    # TRL >= 1.7 turns completion_mask / assistant_masks into a labels column while preparing the
-    # dataset and its collator ignores them. Probe the behaviour; on failure keep the old path.
+    # TRL >= 1.7 builds labels from the mask columns in _prepare_dataset; its collator ignores them.
     global _TRL_COLLATOR_APPLIES_MASKS
     if _TRL_COLLATOR_APPLIES_MASKS is None:
         try:
@@ -2660,7 +2659,6 @@ def sft_prepare_dataset(
     elif "input_ids" in column_names:
         if is_vlm and not hasattr(tokenizer, "pad"):
             raise RuntimeError(f"Unsloth: {processing_class.__class__} does not have .pad!")
-        # TRL's collator applies these masks; the transformers one ignores them and trains on every token.
         mask_columns = [x for x in ("completion_mask", "assistant_masks") if x in column_names]
         if mask_columns:
             used_column_names += mask_columns
@@ -2835,7 +2833,6 @@ def sft_prepare_dataset(
         if not completion_only_loss and "completion_mask" in mask_columns:
             mask_columns.remove("completion_mask")
         if mask_columns:
-            # Same labels as TRL's _prepare_dataset: a token is trained only if every mask keeps it.
             def _build_labels(example):
                 masks = [example[x] for x in mask_columns]
                 return {"labels": [t if all(m) else -100 for t, *m in zip(example["input_ids"], *masks)]}

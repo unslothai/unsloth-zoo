@@ -14,13 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Pretokenized rows carrying completion_mask / assistant_masks train only the masked tokens.
-
-TRL < 1.7 applies the masks in its collator; TRL >= 1.7 turns them into a labels column
-while preparing the dataset. sft_prepare_dataset replaces that step, so either the columns
-must reach the collator (also through packing) or the labels must be built here.
-CPU-only and offline.
-"""
+"""Pretokenized completion_mask / assistant_masks rows train only the masked tokens, on TRL < 1.7
+(collator applies masks) and >= 1.7 (_prepare_dataset builds labels). CPU-only, offline."""
 
 import pytest
 from datasets import Dataset
