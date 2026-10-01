@@ -1069,7 +1069,8 @@ def _gpu_cmake_flags(gpu_support):
         return [f"-DGGML_CUDA={gpu_support}"]
     if torch is None or not getattr(torch.version, "hip", None):
         return ["-DGGML_CUDA=ON"]
-    flags = ["-DGGML_HIP=ON"]
+    # Static libggml-hip.a is not PIC unless BUILD_SHARED_LIBS, so the PIE link fails on gfx1151.
+    flags = ["-DGGML_HIP=ON", "-DCMAKE_POSITION_INDEPENDENT_CODE=ON"]
     rocm_path = os.environ.get("ROCM_PATH") or "/opt/rocm"
     hip_clang = os.path.join(rocm_path, "llvm", "bin", "clang")
     if os.path.exists(hip_clang):

@@ -94,6 +94,7 @@ def test_rocm_source_build_uses_hip(monkeypatch, tmp_path):
     clang.write_text("")
     cmd = _source_build(monkeypatch, tmp_path, _fake_torch(hip = "7.1"), gpu_support = True)
     assert "-DGGML_HIP=ON" in cmd
+    assert "-DCMAKE_POSITION_INDEPENDENT_CODE=ON" in cmd
     assert "-DGPU_TARGETS=gfx1100" in cmd
     assert f"-DCMAKE_HIP_COMPILER={clang}" in cmd
     assert "GGML_CUDA" not in cmd
