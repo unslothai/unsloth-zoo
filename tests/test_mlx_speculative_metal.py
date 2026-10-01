@@ -217,6 +217,12 @@ def test_native_mtp_head_is_built_in_memory_from_mtp_tensors_only(qwen_mtp, monk
     assert loaded and all(key.startswith("mtp.") for key in loaded)
 
 
+def test_a_separate_mtp_head_checkpoint_is_wrapped_as_the_built_in_head(qwen_mtp, tmp_path):
+    from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter, get_model_path
+    from unsloth_zoo.mlx.speculative import MTPDrafter, companion_drafter
+    assert detect_mtp_splitter(source := get_model_path(MTP_MODEL)).split(str(source), str(tmp_path)) and type(companion_drafter(tmp_path, qwen_mtp[0])) is MTPDrafter
+
+
 
 def test_assistant_drafts_from_the_target_kv_alone_and_in_batches(gemma, monkeypatch):
     from unsloth_zoo.mlx.generate import SamplingParams

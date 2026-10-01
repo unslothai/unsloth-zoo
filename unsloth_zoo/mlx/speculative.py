@@ -1645,6 +1645,12 @@ def _built(wrapper, model: nn.Module, target: nn.Module, **kwargs):
     return drafter
 
 
+def _head_drafter(model: nn.Module, target: nn.Module, **kwargs) -> MTPDrafter | HeadDrafter:
+    from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
+
+    return _built(MTPDrafter if type(model) is Qwen3_5MTPDraftModel else HeadDrafter, model, target, **kwargs)
+
+
 def _dense_table(model: nn.Module) -> nn.Module:
     # A Gemma assistant's clustered head gathers rows of the embedding table, which a quantized table packs.
     table = model.model.embed_tokens
@@ -1654,15 +1660,18 @@ def _dense_table(model: nn.Module) -> nn.Module:
     return model
 
 
-def companion_drafter(model_path: str | Path, target: nn.Module, *, lazy: bool = False, **kwargs) -> ContextDrafter | Eagle3Drafter | AssistantDrafter:
-    """A drafter from a separate DFlash, DFlash2, DSpark, EAGLE-3 or Gemma 4 assistant checkpoint, checked against ``target``."""
+def companion_drafter(model_path: str | Path, target: nn.Module, *, lazy: bool = False, **kwargs) -> ContextDrafter | Eagle3Drafter | AssistantDrafter | MTPDrafter | HeadDrafter:
+    """A drafter from a separate DFlash, DFlash2, DSpark, EAGLE-3, Gemma 4 assistant or MTP head checkpoint, checked against ``target``."""
     from mlx_vlm.speculative.drafters import load_drafter, validate_drafter_compatibility
 
     model, kind = load_drafter(str(model_path), lazy = lazy)
     if kind not in ("dflash", "eagle3", "mtp"):
         raise ValueError(f"{kind} companion drafters are not supported")
     validate_drafter_compatibility(target, model, kind)
-    return _built(AssistantDrafter, _dense_table(model), target) if kind == "mtp" else _built({"dflash": ContextDrafter, "eagle3": Eagle3Drafter}[kind], model, target, **kwargs)
+    if kind == "mtp":
+        assistant = str(getattr(model.config, "model_type", "")).endswith("_assistant")
+        return _built(AssistantDrafter, _dense_table(model), target) if assistant else _head_drafter(model, target, **kwargs)
+    return _built({"dflash": ContextDrafter, "eagle3": Eagle3Drafter}[kind], model, target, **kwargs)
 
 
 def native_mtp_drafter(model_path: str | Path, target: nn.Module, *, lazy: bool = False, **kwargs) -> MTPDrafter | HeadDrafter | ContextDrafter | None:
@@ -1713,8 +1722,7 @@ def native_mtp_drafter(model_path: str | Path, target: nn.Module, *, lazy: bool 
     if not lazy:
         mx.eval(model.parameters())
     from mlx_vlm.speculative.drafters import DRAFTER_KIND_BY_MODEL_TYPE
-    from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
 
     if DRAFTER_KIND_BY_MODEL_TYPE.get(splitter.output_model_type) == "dflash":
         return _built(ContextDrafter, model, target, **kwargs)
-    return _built(MTPDrafter if type(model) is Qwen3_5MTPDraftModel else HeadDrafter, model, target, **kwargs)
+    return _head_drafter(model, target, **kwargs)
