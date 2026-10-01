@@ -1085,6 +1085,29 @@ def select_moe_backend():
     return "native_torch"
 
 
+def moe_compute_dtype(hidden_states):
+    """Half compute dtype for dequantized / half expert stacks: W8A16 / W4A16, never float32.
+
+    An activation already in bf16 / fp16 keeps its dtype. A float32 one (Qwen4Exp's PLE `sum` under
+    autocast, or a float32 caller) takes the autocast dtype, else bf16 (fp16 where bf16 is unsupported).
+    torch._grouped_mm is not autocast-cast, and float32 operands send it to a per-group float32 fallback.
+    """
+    dtype = hidden_states.dtype
+    if dtype in (torch.bfloat16, torch.float16):
+        return dtype
+    device_type = hidden_states.device.type
+    try:
+        if device_type != "meta" and torch.amp.is_autocast_available(device_type) and torch.is_autocast_enabled(device_type):
+            autocast_dtype = torch.get_autocast_dtype(device_type)
+            if autocast_dtype in (torch.bfloat16, torch.float16):
+                return autocast_dtype
+    except (AttributeError, RuntimeError, TypeError):
+        pass
+    if device_type == "cuda" and not torch.cuda.is_bf16_supported():
+        return torch.float16
+    return torch.bfloat16
+
+
 def swap_moe_weights_for_call(experts_module, gate_up_proj, down_proj, forward_fn, *args):
     """Temporarily install dequantized weights for one forward call, then restore.
 
@@ -3817,11 +3840,12 @@ def forward_native_grouped_mm(
         batch_size, sequence_length, hidden_dim = hidden_states.shape
 
     hidden_states = hidden_states.view(-1, hidden_dim)
-    # torch._grouped_mm is not autocast-cast; Qwen4Exp's PLE sum yields fp32 under autocast.
-    if hidden_states.dtype == torch.float32 and torch.is_autocast_enabled(hidden_states.device.type):
+    # torch._grouped_mm is not autocast-cast: a float32 activation into half or quantized (FP8, MXFP4,
+    # bnb 4-bit) stacks runs in the half compute dtype, not float32. Only true float32 stacks stay float32.
+    if hidden_states.dtype == torch.float32:
         _stack = self._parameters.get("gate_up_proj", self._parameters.get("gate_proj"))
-        if _stack is not None and _stack.dtype in (torch.float16, torch.bfloat16):
-            hidden_states = hidden_states.to(_stack.dtype)
+        if _stack is not None and _stack.dtype != torch.float32:
+            hidden_states = hidden_states.to(moe_compute_dtype(hidden_states))
 
     # Routing: count tokens per expert, sort to group by expert, gather inputs.
     flat_top_k = top_k_index.view(-1)
