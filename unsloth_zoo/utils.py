@@ -17,14 +17,19 @@
 __all__ = [
     "Version",
     "_get_dtype",
+    "device_guard",
     "is_main_process",
     "is_distributed",
+    "current_rank",
     "distributed_function",
+    "distributed_any",
     "torch_distributed_get_rank",
 ]
 
 from packaging.version import Version as TrueVersion
+from importlib.metadata import version as importlib_version, PackageNotFoundError
 import torch
+import torch.distributed as dist
 import os
 import time
 import contextlib
@@ -36,13 +41,55 @@ from filelock import FileLock
 def Version(version):
     # All Unsloth Zoo code licensed under LGPLv3
     try:
-        new_version = str(version)
-        new_version = re.match(r"[0-9\.]{1,}", new_version)
-        if new_version is None:
-            raise Exception(str(e))
-        new_version = new_version.group(0).rstrip(".")
-        if new_version != version:
-            new_version += ".1" # Add .1 for dev / alpha / beta / rc
+        if isinstance(version, TrueVersion):
+            return version
+
+        raw = None
+        package_name = None
+
+        if isinstance(version, str):
+            # Treat as a package name (e.g. "trl") if it matches the pattern,
+            # else as a literal version string.
+            if re.match(r'^[A-Za-z](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$', version):
+                try:
+                    raw = importlib_version(version)
+                    package_name = version
+                except PackageNotFoundError:
+                    raw = version  # Fall back to treating as version string
+            else:
+                raw = version
+        else:
+            package_name = getattr(version, "__name__", None) or getattr(version, "__package__", None)
+            raw = getattr(version, "__version__", None)
+            if raw in (None, "", "unknown") and package_name:
+                try:
+                    raw = importlib_version(package_name)
+                except PackageNotFoundError:
+                    raw = None
+
+        if raw in (None, ""):
+            raw = str(version)
+
+        raw = str(raw)
+
+        if raw == "unknown" and package_name:
+            try:
+                raw = importlib_version(package_name)
+            except PackageNotFoundError:
+                pass
+
+        # First try matching from the start, then search anywhere in the string.
+        match = re.match(r"[0-9]+(?:\.[0-9]+)*", raw)
+        match_at_start = match is not None
+        if match is None:
+            match = re.search(r"[0-9]+(?:\.[0-9]+)*", raw)
+            match_at_start = False
+        if match is None:
+            raise ValueError(f"Invalid version format: {raw}")
+
+        new_version = match.group(0).rstrip(".")
+        if match_at_start and new_version != raw:
+            new_version += ".1" # for dev / alpha / beta / rc
         return TrueVersion(new_version)
     except:
         from inspect import getframeinfo, stack
@@ -76,17 +123,37 @@ def _get_dtype(dtype):
 pass
 
 
+def device_guard(tensor):
+    """Make tensor's device current: torch.ldexp (>= 2.12) launches on the current device."""
+    device = tensor.device
+    backend = getattr(torch, device.type, None) if device.type in ("cuda", "xpu") else None
+    guard = getattr(backend, "device", None)
+    if guard is None or device.index is None:
+        return contextlib.nullcontext()
+    return guard(device)
+pass
+
+
 import functools
-torch_distributed_is_initialized = torch.distributed.is_initialized
-torch_distributed_is_torchelastic_launched = torch.distributed.is_torchelastic_launched
-torch_distributed_get_rank = torch.distributed.get_rank
+# ROCm on Windows ships a stubbed torch.distributed missing these attributes
+# entirely (https://github.com/ROCm/TheRock/issues/3284). Bind the real
+# functions directly when present; only the stub hits the AttributeError path.
+# Avoids per-name getattr and the throwaway lambdas it builds on every other
+# platform.
+try:
+    torch_distributed_is_initialized = dist.is_initialized
+    torch_distributed_is_torchelastic_launched = dist.is_torchelastic_launched
+    torch_distributed_get_rank = dist.get_rank
+except AttributeError:
+    torch_distributed_is_initialized = lambda *args, **kwargs: False
+    torch_distributed_is_torchelastic_launched = lambda *args, **kwargs: False
+    torch_distributed_get_rank = lambda *args, **kwargs: 0
 
 def is_main_process():
     if torch_distributed_is_initialized():
-        # torch.distributed.init_process_group was run, so get_rank works
         return torch_distributed_get_rank() == 0
     elif torch_distributed_is_torchelastic_launched():
-        # accelerate launch for example calls init_process_group later
+        # accelerate launch calls init_process_group later
         return os.environ.get("RANK", "0") == "0"
     return True
 pass
@@ -95,33 +162,50 @@ def is_distributed():
     return torch_distributed_is_initialized() or torch_distributed_is_torchelastic_launched()
 pass
 
+def current_rank():
+    """Best effort rank, for diagnostics only. RANK is unset outside a launcher."""
+    if torch_distributed_is_initialized():
+        return torch_distributed_get_rank()
+    return os.environ.get("RANK", "0")
+pass
+
 def distributed_function(n = 1, function = None, *args, **kwargs):
-    if is_distributed():
-        if is_main_process():
-            object_list = function(*args, **kwargs)
-            if n == 1: object_list = [object_list]
-        else:
-            object_list = [None for _ in range(n)]
-        # broadcast_object_list auto blocks so no need for barrier
-        if not torch_distributed_is_initialized():
-            # But check if the function even works!
-            # This happens when torch_distributed_is_torchelastic_launched()==True but
-            # torch_distributed_is_initialized()==False
-            # Trick is to just add a 0.01+0.01*RANK second sleep and print with flush
-            time.sleep(0.01 + 0.01*int(os.environ.get("RANK", "0")))
-            with contextlib.redirect_stdout(None):
-                print("", flush = True)
-            object_list = function(*args, **kwargs)
-            if n == 1: object_list = [object_list]
-        else:
-            torch.distributed.broadcast_object_list(object_list, src = 0)
-        if n == 1:
-            result = object_list[0]
-        else:
-            result = object_list
+    assert function is not None
+
+    # Run independently when the process group isn't initialized: not
+    # distributed, or torchrun launched but init_process_group() not yet
+    # called (e.g. during module imports).
+    # Ref: https://github.com/unslothai/unsloth/issues/3703
+    if not torch_distributed_is_initialized():
+        out = function(*args, **kwargs)
+        return out if n == 1 else out
+
+    # Multi-process: only main executes the function
+    if is_main_process():
+        out = function(*args, **kwargs)
+        obj_list = [out] if n == 1 else list(out)
     else:
-        result = function(*args, **kwargs)
-    return result
+        obj_list = [None for _ in range(n)]
+
+    if torch_distributed_is_initialized():
+        dist.broadcast_object_list(obj_list, src = 0)
+        dist.barrier()  # wait until main is done
+
+    return obj_list[0] if n == 1 else obj_list
+pass
+
+def distributed_any(value):
+    """True when `value` is truthy on any rank. Every rank has to call this.
+
+    distributed_function() only mirrors rank 0, which is wrong when the condition
+    is rank-local and guards a collective.
+    """
+    if not torch_distributed_is_initialized():
+        return bool(value)
+
+    flags = [None for _ in range(dist.get_world_size())]
+    dist.all_gather_object(flags, bool(value))
+    return any(flags)
 pass
 
 def _lock_path_for(target: str) -> str:
@@ -131,22 +215,16 @@ def _lock_path_for(target: str) -> str:
     return str(locks_dir / f".lock.{pathlib.Path(target).name}")
 
 def get_lock(target: str, timeout: Optional[int] = None) -> FileLock:
-    """
-    Get a lock for a target file.
-    target: str, the path to the file to lock
-    timeout: int, the timeout in seconds for the lock
-    If timeout is not provided, it will use the value of
-    the environment variable UNSLOTH_LOCK_TIMEOUT, otherwise 10 seconds.
+    """Get a FileLock for `target`.
 
-    Returns:
-        FileLock, the lock for the target file
+    timeout defaults to env UNSLOTH_LOCK_TIMEOUT, otherwise 10 seconds.
     """
     lock_path = _lock_path_for(target)
     if timeout is None:
         timeout = int(os.environ.get("UNSLOTH_LOCK_TIMEOUT", "10"))
     return FileLock(lock_path, timeout=timeout)
 
-  
+
 def get_quant_type(config):
     quant_config = getattr(config, 'quantization_config', None)
     if quant_config:
@@ -156,7 +234,7 @@ def get_quant_type(config):
         elif isinstance(quant_config, AutoQuantizationConfig):
             return getattr(quant_config, 'quant_method', None)
     return None
-  
+
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #

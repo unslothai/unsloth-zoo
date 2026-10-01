@@ -16,6 +16,7 @@
 
 __all__ = [
     "check_python_modules",
+    "check_signal_escape_patterns",
     "create_locked_down_function",
     "execute_with_time_limit",
     "Benchmarker",
@@ -24,21 +25,23 @@ __all__ = [
 ]
 
 import ast
+import inspect
 import sys
 import sysconfig
 from pathlib import Path
 import functools
+import importlib
 import types
 import __future__
 import builtins as _py_builtins
 import os, gc, time, statistics
+import collections
 import numpy as np
 import signal
 from contextlib import contextmanager
 from functools import wraps
 import threading
 import errno
-import time
 from typing import Callable, TypeVar, Any, Tuple
 T = TypeVar("T")
 
@@ -120,6 +123,270 @@ def check_python_modules(code: str):
         "stdlib": stdlib_found,
         "non_stdlib": non_stdlib,
         "relative_imports": relative_count,
+    }
+pass
+
+
+def check_signal_escape_patterns(code: str):
+    """
+    Check if code contains patterns that could escape signal-based timeouts.
+
+    This performs static analysis (no execution) to detect code patterns that
+    could bypass SIGALRM-based timeout enforcement. Use this to decide whether
+    to use backend="process" instead of backend="signal".
+
+    Returns (safe: bool, details: dict)
+
+    safe == True  -> no escape patterns detected (signal backend should work).
+    safe == False -> escape patterns found (recommend backend="process").
+
+    details includes:
+      - signal_tampering: list of signal manipulation patterns found
+      - exception_catching: list of exception catching patterns found
+      - warnings: list of warning messages
+
+    Signal Tampering Patterns (code can disable/ignore the timeout signal):
+    -----------------------------------------------------------------------
+    1. signal.signal(SIGALRM, SIG_IGN) - Ignores the alarm signal entirely
+       Example that escapes:
+           import signal
+           signal.signal(signal.SIGALRM, signal.SIG_IGN)
+           while True: pass  # Runs forever, timeout never fires
+
+    2. signal.setitimer(ITIMER_REAL, 0) - Disables the timer completely
+       Example that escapes:
+           import signal
+           signal.setitimer(signal.ITIMER_REAL, 0)
+           while True: pass  # Timer disabled, runs forever
+
+    3. signal.alarm(0) - Cancels any pending alarm
+       Example that escapes:
+           import signal
+           signal.alarm(0)
+           while True: pass  # Alarm cancelled, runs forever
+
+    4. signal.pthread_sigmask(SIG_BLOCK, [SIGALRM]) - Blocks signal delivery
+       Example that escapes:
+           import signal
+           signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGALRM])
+           while True: pass  # Signal blocked, runs forever
+
+    Exception Catching Patterns (only dangerous INSIDE A LOOP):
+    -----------------------------------------------------------
+    The signal backend raises TimeoutError when time expires. If code catches
+    this exception INSIDE A LOOP, it can suppress the timeout and continue.
+
+    NOTE: Exception catching OUTSIDE a loop is safe because control returns
+    to the caller after the handler. These patterns are only flagged when
+    detected inside a while/for loop.
+
+    5. except TimeoutError in loop - Catches and continues looping
+       ESCAPES (inside loop):
+           while True:
+               try:
+                   do_work()
+               except TimeoutError:
+                   pass  # Caught! Loop continues, runs forever
+
+       SAFE (outside loop):
+           try:
+               do_work()
+           except TimeoutError:
+               return "default"  # Returns to caller, does NOT escape
+
+    6. except Exception in loop - Catches TimeoutError (inherits from Exception)
+       ESCAPES (inside loop):
+           while True:
+               try:
+                   do_work()
+               except Exception:
+                   pass  # TimeoutError caught, runs forever
+
+    7. except BaseException in loop - Catches everything including TimeoutError
+
+    8. Bare except: in loop - Catches all exceptions
+       ESCAPES (inside loop):
+           while True:
+               try:
+                   do_work()
+               except:
+                   pass  # All exceptions caught, runs forever
+
+    Why use backend="process" instead:
+    ----------------------------------
+    The process backend runs code in a subprocess and uses SIGKILL to terminate
+    it on timeout. SIGKILL cannot be caught, ignored, or blocked by any code,
+    making it immune to all escape patterns above.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        return False, {
+            "error": f"SyntaxError: {e}",
+            "signal_tampering": [],
+            "exception_catching": [],
+            "warnings": [],
+        }
+
+    signal_tampering = []
+    exception_catching = []
+    warnings = []
+
+    class SignalEscapeVisitor(ast.NodeVisitor):
+        def __init__(self):
+            self.imports_signal = False
+            self.signal_aliases = {"signal"}
+            self.loop_depth = 0  # Track if we're inside a loop
+
+        def visit_Import(self, node: ast.Import):
+            for alias in node.names:
+                if alias.name == "signal":
+                    self.imports_signal = True
+                    if alias.asname:
+                        self.signal_aliases.add(alias.asname)
+            self.generic_visit(node)
+
+        def visit_ImportFrom(self, node: ast.ImportFrom):
+            if node.module == "signal":
+                self.imports_signal = True
+                for alias in node.names:
+                    if alias.name in ("signal", "SIGALRM", "SIG_IGN", "setitimer",
+                                      "ITIMER_REAL", "pthread_sigmask", "SIG_BLOCK", "alarm"):
+                        self.signal_aliases.add(alias.asname or alias.name)
+            self.generic_visit(node)
+
+        def visit_While(self, node: ast.While):
+            self.loop_depth += 1
+            self.generic_visit(node)
+            self.loop_depth -= 1
+
+        def visit_For(self, node: ast.For):
+            self.loop_depth += 1
+            self.generic_visit(node)
+            self.loop_depth -= 1
+
+        def visit_Call(self, node: ast.Call):
+            func = node.func
+            func_name = None
+
+            # Get the function name for pattern matching
+            if isinstance(func, ast.Attribute):
+                # signal.signal(...), signal.setitimer(...), etc.
+                if isinstance(func.value, ast.Name):
+                    if func.value.id in self.signal_aliases:
+                        func_name = f"signal.{func.attr}"
+                elif isinstance(func.value, ast.Attribute):
+                    # Handle chained attributes
+                    pass
+            elif isinstance(func, ast.Name):
+                # Direct call like setitimer(...) after from signal import setitimer
+                if func.id in ("signal", "setitimer", "alarm", "pthread_sigmask"):
+                    func_name = func.id
+
+            # Check for signal tampering patterns
+            if func_name:
+                if func_name in ("signal.signal", "signal"):
+                    # Check if setting SIGALRM handler
+                    if len(node.args) >= 1:
+                        arg0 = node.args[0]
+                        if _ast_name_matches(arg0, ("SIGALRM", "signal.SIGALRM")):
+                            signal_tampering.append({
+                                "type": "signal_handler_override",
+                                "line": node.lineno,
+                                "description": "Overrides SIGALRM handler",
+                            })
+
+                elif func_name in ("signal.setitimer", "setitimer"):
+                    # Check if disabling ITIMER_REAL
+                    if len(node.args) >= 1:
+                        arg0 = node.args[0]
+                        if _ast_name_matches(arg0, ("ITIMER_REAL", "signal.ITIMER_REAL")):
+                            signal_tampering.append({
+                                "type": "timer_manipulation",
+                                "line": node.lineno,
+                                "description": "Manipulates ITIMER_REAL timer",
+                            })
+
+                elif func_name in ("signal.alarm", "alarm"):
+                    signal_tampering.append({
+                        "type": "alarm_manipulation",
+                        "line": node.lineno,
+                        "description": "Manipulates alarm timer",
+                    })
+
+                elif func_name in ("signal.pthread_sigmask", "pthread_sigmask"):
+                    signal_tampering.append({
+                        "type": "signal_mask",
+                        "line": node.lineno,
+                        "description": "Modifies signal mask (may block SIGALRM)",
+                    })
+
+            self.generic_visit(node)
+
+        def visit_ExceptHandler(self, node: ast.ExceptHandler):
+            # Only flag exception catching if inside a loop (where it can suppress timeout)
+            # Exception catching outside loops will naturally propagate after the handler
+            if self.loop_depth == 0:
+                self.generic_visit(node)
+                return
+
+            # Check for bare except or catching TimeoutError/BaseException inside a loop
+            if node.type is None:
+                # Bare except:
+                exception_catching.append({
+                    "type": "bare_except_in_loop",
+                    "line": node.lineno,
+                    "description": "Bare except in loop catches TimeoutError and continues looping",
+                })
+            elif isinstance(node.type, ast.Name):
+                if node.type.id in ("TimeoutError", "BaseException", "Exception"):
+                    exception_catching.append({
+                        "type": f"catches_{node.type.id}_in_loop",
+                        "line": node.lineno,
+                        "description": f"Catches {node.type.id} in loop - may suppress timeout and continue",
+                    })
+            elif isinstance(node.type, ast.Tuple):
+                # except (TimeoutError, ValueError):
+                for elt in node.type.elts:
+                    if isinstance(elt, ast.Name):
+                        if elt.id in ("TimeoutError", "BaseException", "Exception"):
+                            exception_catching.append({
+                                "type": f"catches_{elt.id}_in_loop",
+                                "line": node.lineno,
+                                "description": f"Catches {elt.id} in loop - may suppress timeout and continue",
+                            })
+            self.generic_visit(node)
+
+    def _ast_name_matches(node, names):
+        """Check if an AST node matches any of the given names."""
+        if isinstance(node, ast.Name):
+            return node.id in names
+        elif isinstance(node, ast.Attribute):
+            full_name = []
+            current = node
+            while isinstance(current, ast.Attribute):
+                full_name.append(current.attr)
+                current = current.value
+            if isinstance(current, ast.Name):
+                full_name.append(current.id)
+            full_name = ".".join(reversed(full_name))
+            return full_name in names
+        return False
+
+    visitor = SignalEscapeVisitor()
+    visitor.visit(tree)
+
+    # Add warning if signal is imported but no specific tampering found
+    if visitor.imports_signal and not signal_tampering:
+        warnings.append("Code imports 'signal' module - review manually for safety")
+
+    # Determine if code is safe
+    is_safe = len(signal_tampering) == 0 and len(exception_catching) == 0
+
+    return is_safe, {
+        "signal_tampering": signal_tampering,
+        "exception_catching": exception_catching,
+        "warnings": warnings,
     }
 pass
 
@@ -218,6 +485,228 @@ def validate_single_function_source(
 pass
 
 
+# Importable by generated code. Excludes anything reaching the filesystem,
+# network or another process (os, subprocess, socket, ctypes, ...), plus two
+# whose whole module has to go:
+#   string -- Formatter.get_field resolves a dotted runtime string and returns
+#     the object, reaching the real builtins with nothing in the source to
+#     match. str.format resolves the same way but only returns text, never the
+#     object, so it is not an execution path and stays.
+#   dataclasses -- resolves annotations via sys.modules[cls.__module__], which
+#     cannot work for synthetic globals.
+_SAFE_IMPORT_MODULES = frozenset({
+    "abc", "array", "bisect", "cmath", "collections", "collections.abc", "copy",
+    "decimal", "enum", "fractions", "functools", "heapq", "itertools", "math",
+    "numbers", "operator", "random", "re", "statistics", "textwrap", "time",
+    "typing", "unicodedata",
+})
+
+# Members denied individually, where the module itself is worth keeping.
+# Three reasons, all of them invisible to the AST check:
+#   string-to-object resolvers -- operator.attrgetter walks dunders from a
+#     dotted string (itemgetter takes an index and stays); functools
+#     update_wrapper/wraps copy whatever `assigned` names, so ("__globals__",)
+#     plus a custom __setattr__ yields a real globals dict to index.
+#   evaluators -- typing.get_type_hints runs string annotations, and
+#     ForwardRef/evaluate_forward_ref are the same evaluator made public in
+#     3.14. Denied on every version; 3.13 reaches it only via private
+#     _evaluate, which the private-attribute rule already covers.
+#   mutators -- time.clock_settime(_ns) sets the host clock given the
+#     privilege a root container has. Read-only clocks stay.
+_DENIED_MODULE_ATTRS = frozenset({
+    "functools.update_wrapper",
+    "functools.wraps",
+    "time.clock_settime",
+    "time.clock_settime_ns",
+    "operator.attrgetter",
+    "operator.methodcaller",
+    "typing.ForwardRef",
+    "typing.evaluate_forward_ref",
+    "typing.get_type_hints",
+})
+
+# Attributes that walk the interpreter's own object graph. None of these start
+# with an underscore, and none of them go through a module, so neither the
+# private-attribute rule nor the import allowlist can see them: a running
+# generator reaches gi_frame.f_back.f_back.f_builtins, which is the trusted
+# caller's real builtins, and indexing "__import__" out of it restores
+# everything. Frames, generators, coroutines, async generators and tracebacks
+# all expose the same walk.
+_DENIED_ATTR_NAMES = frozenset({
+    "ag_await", "ag_code", "ag_frame",
+    "cr_await", "cr_code", "cr_frame", "cr_origin",
+    "f_back", "f_builtins", "f_code", "f_globals", "f_lasti", "f_lineno",
+    "f_locals", "f_trace",
+    "gi_code", "gi_frame", "gi_running", "gi_yieldfrom",
+    "tb_frame", "tb_lasti", "tb_lineno", "tb_next",
+})
+
+# Dunder methods a generated helper class may define. A method name is
+# FunctionDef.name, not a Name or Attribute node, so the walk below cannot see
+# it; without this, generated code defines __setattr__ or __getattr__ and hooks
+# the attribute machinery that copy helpers drive. __init__ and the comparison
+# and arithmetic protocol are ordinary in helper classes, so they stay.
+_ALLOWED_DUNDER_DEFS = frozenset({
+    "__abs__", "__add__", "__bool__", "__call__", "__contains__", "__enter__",
+    "__eq__", "__exit__", "__float__", "__floordiv__", "__ge__", "__getitem__",
+    "__gt__", "__hash__", "__index__", "__init__", "__int__", "__iter__",
+    "__le__", "__len__", "__lt__", "__mod__", "__mul__", "__ne__", "__neg__",
+    "__next__", "__pos__", "__pow__", "__repr__", "__round__", "__setitem__",
+    "__str__", "__sub__", "__truediv__",
+})
+
+
+class _SafeModule:
+    """
+    Facade over an allowlisted module.
+
+    Returning the real module is not enough: modules re-export other modules,
+    and `random._os` / `typing.sys` lead straight back to the capabilities the
+    allowlist removes. Denies private names, and nested modules unless their
+    dotted name is allowlisted too.
+    """
+    __slots__ = ("_module", "_name")
+
+    def __init__(self, module, name):
+        object.__setattr__(self, "_module", module)
+        object.__setattr__(self, "_name", name)
+
+    def __getattr__(self, attr):
+        if attr.startswith("_"):
+            raise AttributeError(
+                f"Access to '{self._name}.{attr}' is not allowed in generated code."
+            )
+        if f"{self._name}.{attr}" in _DENIED_MODULE_ATTRS:
+            raise AttributeError(
+                f"Access to '{self._name}.{attr}' is not allowed in generated code."
+            )
+        value = getattr(self._module, attr)
+        if isinstance(value, types.ModuleType):
+            dotted = f"{self._name}.{attr}"
+            if dotted not in _SAFE_IMPORT_MODULES:
+                raise AttributeError(
+                    f"Access to module '{dotted}' is not allowed in generated code."
+                )
+            return _SafeModule(value, dotted)
+        return value
+
+    def __repr__(self):
+        return f"<safe module '{self._name}'>"
+pass
+
+
+def _safe_import(name, globals = None, locals = None, fromlist = (), level = 0):
+    """
+    __import__ replacement for generated code: only _SAFE_IMPORT_MODULES
+    resolve, and always behind a _SafeModule facade.
+
+    Dotted names reach here in full (`import collections.abc` passes
+    "collections.abc"), so allowlist membership is checked on the whole name.
+    """
+    if level != 0:
+        raise ImportError("Relative imports are not allowed in generated code.")
+    if name not in _SAFE_IMPORT_MODULES:
+        raise ImportError(f"Import of '{name}' is not allowed in generated code.")
+    if fromlist:
+        return _SafeModule(importlib.import_module(name), name)
+    # A bare `import a.b` binds `a`, so hand back the root; the facade re-checks
+    # `a.b` when the attribute is reached.
+    root = name.split(".")[0]
+    importlib.import_module(name)
+    return _SafeModule(importlib.import_module(root), root)
+pass
+
+
+def _allowlist_builtins():
+    """
+    Safe builtins for generated code: enough for the list/numeric/sorting work
+    the RL prompts ask for, minus every capability primitive (open, eval, exec,
+    compile, input, getattr, globals, vars, breakpoint, and __import__ except
+    the shim above).
+    """
+    names = (
+        "abs", "all", "any", "ascii", "bin", "bool", "bytes", "callable", "chr",
+        "complex", "dict", "divmod", "enumerate", "filter", "float", "format",
+        "frozenset", "hash", "hex", "id", "int", "isinstance", "issubclass",
+        "iter", "len", "list", "map", "max", "min", "next", "oct", "ord", "pow",
+        "print", "range", "repr", "reversed", "round", "set", "slice", "sorted",
+        "str", "sum", "tuple", "type", "zip",
+        # Class machinery: generated helpers are occasionally written as a
+        # small class. hasattr only ever answers yes or no, and object/super
+        # hand back nothing that is not already reachable, since getting
+        # anywhere from them needs a dunder the AST check rejects.
+        "bytearray", "classmethod", "hasattr", "object", "property",
+        "staticmethod", "super",
+        # Generated code routinely uses try/except.
+        "ArithmeticError", "AssertionError", "AttributeError", "BaseException",
+        "Exception", "FloatingPointError", "IndexError", "KeyError",
+        "MemoryError", "NotImplementedError", "OverflowError", "RecursionError",
+        "RuntimeError", "StopIteration", "TypeError", "ValueError",
+        "ZeroDivisionError",
+    )
+    exposed = {name: getattr(_py_builtins, name) for name in names}
+    # The comparison and arithmetic dunders allowed below are expected to
+    # return NotImplemented for operands they do not handle, so the singleton
+    # has to be reachable. It is a value, not a capability.
+    exposed["NotImplemented"] = _py_builtins.NotImplemented
+    # Required for `class` statements.
+    exposed["__build_class__"] = _py_builtins.__build_class__
+    exposed["__name__"] = "__user_code__"
+    exposed["__import__"] = _safe_import
+    return exposed
+pass
+
+
+# ast.Match* is 3.10+, this module imports on 3.9; an empty tuple makes the
+# isinstance below false.
+_MATCH_CLASS_NODES = tuple(
+    node for node in (getattr(ast, "MatchClass", None),) if node is not None
+)
+
+
+def _reject_dunder_access(tree):
+    """
+    Restricted builtins alone do not stop `().__class__.__bases__[0].__subclasses__()`,
+    which walks from any literal to already-imported classes (subprocess.Popen
+    included) using only attribute access. Generated code has no reason to touch
+    dunders, so refuse them outright.
+    """
+    for node in ast.walk(tree):
+        # Definition names are strings on the node, invisible to the Name and
+        # Attribute checks below, so they get their own fail-closed rule.
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name.startswith("__") and node.name not in _ALLOWED_DUNDER_DEFS:
+                raise RuntimeError(
+                    f"Defining '{node.name}' is not allowed in generated code."
+                )
+        # One underscore for attributes: private ones reach modules and
+        # internals just as well (random._os, ABCMeta._abc_impl).
+        if isinstance(node, ast.Attribute) and node.attr.startswith("_"):
+            raise RuntimeError(
+                f"Attribute '{node.attr}' is not allowed in generated code."
+            )
+        if isinstance(node, ast.Attribute) and node.attr in _DENIED_ATTR_NAMES:
+            raise RuntimeError(
+                f"Attribute '{node.attr}' is not allowed in generated code."
+            )
+        # Two for names: a bare `_` or `_total` local is ordinary and reaches
+        # nothing on its own.
+        if isinstance(node, ast.Name) and node.id.startswith("__"):
+            raise RuntimeError(
+                f"Name '{node.id}' is not allowed in generated code."
+            )
+        # `case object(__class__=x)` is a getattr with no Attribute node anywhere.
+        # kwd_attrs is the only identifier-as-string field that READS an attribute;
+        # every other one merely binds, and the Name rule above refuses the read.
+        if _MATCH_CLASS_NODES and isinstance(node, _MATCH_CLASS_NODES):
+            for attr in (node.kwd_attrs or []):
+                if attr.startswith("_") or attr in _DENIED_ATTR_NAMES:
+                    raise RuntimeError(
+                        f"Attribute '{attr}' is not allowed in generated code."
+                    )
+pass
+
+
 def load_single_function(
     source: str,
     *,
@@ -243,28 +732,9 @@ def load_single_function(
     if builtins_policy == "full":
         exposed_builtins = _py_builtins.__dict__
     elif builtins_policy == "allowlist":
-        exposed_builtins = {
-            "abs": _py_builtins.abs,
-            "all": _py_builtins.all,
-            "any": _py_builtins.any,
-            "bool": _py_builtins.bool,
-            "dict": _py_builtins.dict,
-            "enumerate": _py_builtins.enumerate,
-            "float": _py_builtins.float,
-            "int": _py_builtins.int,
-            "len": _py_builtins.len,
-            "list": _py_builtins.list,
-            "max": _py_builtins.max,
-            "min": _py_builtins.min,
-            "pow": _py_builtins.pow,
-            "range": _py_builtins.range,
-            "reversed": _py_builtins.reversed,
-            "round": _py_builtins.round,
-            "str": _py_builtins.str,
-            "sum": _py_builtins.sum,
-            "tuple": _py_builtins.tuple,
-            "zip": _py_builtins.zip,
-        }
+        exposed_builtins = _allowlist_builtins()
+        # Only meaningful alongside the restricted builtins above.
+        _reject_dunder_access(tree)
     else:
         raise ValueError("builtins_policy must be 'full' or 'allowlist'")
 
@@ -289,16 +759,37 @@ def load_single_function(
     return fn
 pass
 
-def create_locked_down_function(function):
+def create_locked_down_function(function, *, builtins_policy: str = "allowlist"):
     """
-    Creates a singular Python function which disallows the following:
-    1. No globals or
+    Creates a singular Python function which disallows globals.
+
+    Defaults to builtins_policy = "allowlist": generated code cannot reach
+    __import__ / open / eval / exec / compile, import outside
+    _SAFE_IMPORT_MODULES, or walk dunder attributes. Pass "full" for the old
+    permissive behaviour.
+
+    Defence in depth, not a real sandbox. It does not bound CPU, memory or
+    recursion. Run genuinely untrusted code in a container.
     """
-    output_function = {}
-    f = load_single_function(function)
-    # Locks down function so it can see global variables of nothingness
-    f = types.FunctionType(f.__code__, {})
-    return f
+    f = load_single_function(function, builtins_policy = builtins_policy)
+    # Binding to an empty dict is not enough: CPython injects the real builtins
+    # module into any globals mapping without a __builtins__ key, handing back
+    # everything the policy just removed.
+    exposed_builtins = (
+        _py_builtins.__dict__ if builtins_policy == "full" else _allowlist_builtins()
+    )
+    locked = types.FunctionType(
+        f.__code__,
+        {"__builtins__": exposed_builtins},
+        f.__name__,
+        f.__defaults__,
+        f.__closure__,
+    )
+    # Assigned rather than passed: the constructor only grew a kwdefaults
+    # parameter recently, but the attribute is writable on every version we
+    # support. Without it `def f(x, *, k = 1)` loses k and raises TypeError.
+    locked.__kwdefaults__ = f.__kwdefaults__
+    return locked
 pass
 
 
@@ -454,11 +945,13 @@ def _run_in_subprocess(func, seconds, args, kwargs, *, start_method="spawn", kil
             pass
 pass
 
+_VALID_START_METHODS = frozenset({"fork", "spawn", "forkserver"})
+
 def execute_with_time_limit(
     seconds: float,
     *,
     backend: str = "signal",
-    start_method: str = "process",
+    start_method: str = "fork",
     kill_grace: float = 1.0,
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """
@@ -467,21 +960,50 @@ def execute_with_time_limit(
     backend:
       - "signal": uses SIGALRM (fast, in-process; only cooperative C code).
       - "process": runs function in a child and kills it on timeout (robust).
+      - "auto": uses signal backend if function source is safe, otherwise process.
+
+    If backend="signal" but the function contains patterns that could escape
+    signal-based timeouts (detected via check_signal_escape_patterns), or if
+    the function source cannot be inspected, automatically falls back to
+    the process backend.
+
+    start_method (only used when backend="process" or auto fallback):
+      - "fork": copies parent process memory (fast, works in notebooks/Colab).
+      - "spawn": starts fresh Python interpreter (slower, safer for CUDA).
+      - "forkserver": reuses a server process for forking (balance of both).
     """
     if seconds <= 0:
         raise ValueError("seconds must be > 0")
+    if start_method not in _VALID_START_METHODS:
+        raise ValueError(
+            f"Unsloth: start_method must be one of {sorted(_VALID_START_METHODS)}, got {start_method!r}"
+        )
 
     def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        # Determine effective backend based on function safety
+        effective_backend = backend
+        if backend in ("signal", "auto"):
+            try:
+                source = inspect.getsource(func)
+                safe, _ = check_signal_escape_patterns(source)
+                if not safe:
+                    effective_backend = "process"
+                elif backend == "auto":
+                    effective_backend = "signal"
+            except (OSError, TypeError):
+                # Cannot inspect source (built-in, lambda, etc.) - use process
+                effective_backend = "process"
+
         @wraps(func)
         def wrapper(*args, **kwargs) -> T:
-            if backend == "signal":
+            if effective_backend == "signal":
                 with time_limit(seconds):
                     return func(*args, **kwargs)
-            elif backend == "process":
+            elif effective_backend == "process":
                 return _run_in_subprocess(func, seconds, args, kwargs,
                                           start_method=start_method, kill_grace=kill_grace)
             else:
-                raise ValueError("backend must be 'signal' or 'process'")
+                raise ValueError("backend must be 'signal', 'process', or 'auto'")
         return wrapper
     return decorator
 pass
@@ -537,26 +1059,293 @@ pass
 ####################
 import socket
 import requests
-import time
 import random
-import sys
 import subprocess
 
 def is_port_open(host, port):
-    """ Check if the port like localhost:8000 is open or closed """
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    """ Check if the port like localhost:8000 is open or closed
+
+    Family comes from getaddrinfo, not AF_INET, and every candidate is tried: an
+    IPv6 host is unreachable over AF_INET, and a dual-stack `localhost` resolves
+    to both families with the listener on only one.
+    """
     try:
-        sock.settimeout(1)  # Set a timeout for the connection attempt
-        result = sock.connect_ex((host, port))
-        if result == 0:
-            return True  # Port is open
-        else:
-            return False # Port is closed or connection failed
+        candidates = socket.getaddrinfo(host, port, type = socket.SOCK_STREAM)
     except socket.error as e:
         print(f"Socket error: {e}")
         return False
-    finally:
-        sock.close()
+    for family, socktype, proto, _, sockaddr in candidates:
+        # In the try: AF_INET6 without IPv6 raises EAFNOSUPPORT, and raising would
+        # skip a reachable candidate behind it.
+        sock = None
+        try:
+            sock = socket.socket(family, socktype, proto)
+            sock.settimeout(1)  # Set a timeout for the connection attempt
+            # Unmodified: rebuilding (host, port) would drop an AF_INET6 scope_id.
+            if sock.connect_ex(sockaddr) == 0:
+                return True  # Port is open
+        except socket.error as e:
+            print(f"Socket error: {e}")
+        finally:
+            if sock is not None: sock.close()
+    return False # Port is closed or connection failed
+pass
+
+
+def _get_openenv_pythonpath(working_directory: str) -> str:
+    """
+    Auto-detect OpenEnv version and return correct PYTHONPATH.
+
+    OpenEnv structure changed at commit 83dda10 ("move envs to root"):
+    - New structure (commit 151+): envs/ at root, openenv in src/
+    - Old structure (commits 514-152): envs/ in src/
+    """
+    root_client = os.path.join(working_directory, "envs", "openspiel_env", "client.py")
+    src_client = os.path.join(working_directory, "src", "envs", "openspiel_env", "client.py")
+    src_path = os.path.join(working_directory, "src")
+
+    if os.path.exists(root_client):
+        # New structure: envs at root + openenv in src
+        return f"{working_directory}{os.pathsep}{src_path}"
+    elif os.path.exists(src_client):
+        # Old structure: everything in src
+        return src_path
+    else:
+        # Fallback: try both paths
+        return f"{working_directory}{os.pathsep}{src_path}"
+
+
+# Endpoint -> the Popen we spawned on it. /health says "something is listening",
+# never "mine is". Keyed on (host, port): two children can hold one port on
+# different addresses.
+_OPENENV_CHILDREN = {}
+
+# Held for every registry access: poll() calls waitpid, which releases the GIL, so
+# iteration can be resized under us and get-poll-pop is check-then-mutate
+# (python/cpython#87664). WNOHANG does not block, so holding it across poll() is cheap.
+_OPENENV_CHILDREN_LOCK = threading.Lock()
+
+# Endpoints claimed but not yet spawned onto. The lock makes each operation atomic,
+# not check-then-spawn-then-register: without a claim two launches both find a port
+# closed, both spawn, and the later registration orphans the earlier child.
+_OPENENV_RESERVED = set()
+
+
+def _reinit_openenv_lock_after_fork():
+    """ Replace the registry lock in a forked child.
+
+    fork copies the lock but not the thread owning it, so one held at fork time is
+    inherited locked forever and the child's first registry call blocks (CPython
+    bpo-6721). The notebook path forks per move, so this is reachable.
+    """
+    global _OPENENV_CHILDREN_LOCK
+    _OPENENV_CHILDREN_LOCK = threading.Lock()
+pass
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child = _reinit_openenv_lock_after_fork)
+pass
+
+
+def _reserve_openenv_endpoint(client_host, port):
+    """ Claim this endpoint for the caller, or report that someone already has. """
+    with _OPENENV_CHILDREN_LOCK:
+        key = (client_host, port)
+        if key in _OPENENV_RESERVED or key in _OPENENV_CHILDREN:
+            return False
+        _OPENENV_RESERVED.add(key)
+        return True
+pass
+
+
+def _register_openenv_child(client_host, port, child):
+    """ Hand the endpoint over from the reservation to the child now holding it.
+
+    The spawning pid is recorded because poll() only means anything in the process
+    that started the child; see _openenv_child_alive.
+    """
+    with _OPENENV_CHILDREN_LOCK:
+        _OPENENV_CHILDREN[(client_host, port)] = (child, os.getpid())
+        _OPENENV_RESERVED.discard((client_host, port))
+pass
+
+
+def _openenv_pid_is_alive(pid):
+    """ Does this pid still exist, without signalling or reaping it?
+
+    Windows needs the Win32 API instead: CPython maps every signal except
+    CTRL_C_EVENT and CTRL_BREAK_EVENT onto TerminateProcess(handle, sig), so
+    os.kill(pid, 0) there kills the server it was asked about.
+    """
+    if os.name == "nt":
+        import ctypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        ERROR_INVALID_PARAMETER = 87
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error = True)
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            # 87 alone means no such pid; access denied and friends mean it exists.
+            return ctypes.get_last_error() != ERROR_INVALID_PARAMETER
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True
+            return code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0) # Signal 0 asks without delivering or reaping
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True          # exists, just not ours to signal
+    except OSError:
+        return True          # unanswerable, so do not call a live server dead
+    return not _openenv_pid_is_zombie(pid)
+pass
+
+
+def _openenv_pid_is_zombie(pid):
+    """ Has this pid exited without being reaped?
+
+    A zombie still answers os.kill(pid, 0) while its listening socket is long
+    gone, so pid existence alone re-opens the squatter hole a port away.
+    Windows has no such state, and would pay a `ps` process to learn that.
+    """
+    if os.name == "nt": return False
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as file:
+            # comm sits in parentheses and may contain spaces, so split after the last ')'.
+            return file.read().rsplit(b")", 1)[-1].split()[:1] == [b"Z"]
+    except OSError:
+        pass # No procfs: macOS and the BSDs answer through ps instead
+    try:
+        state = subprocess.run(
+            ["ps", "-o", "state=", "-p", str(pid)],
+            capture_output = True, text = True, timeout = 10,
+        ).stdout.strip()
+    except Exception:
+        return False         # unanswerable, so do not call a live server dead
+    return state[:1] == "Z"  # multi-letter on BSD ('Z+'), so read the first only
+pass
+
+
+def _release_openenv_endpoint(client_host, port, child = None):
+    """ Give the endpoint up, removing the child record only if it is still `child`.
+
+    Compare-and-delete: an unconditional pop removes whatever is stored, which
+    after a lost spawn race is another launch's live child.
+    """
+    with _OPENENV_CHILDREN_LOCK:
+        key = (client_host, port)
+        _OPENENV_RESERVED.discard(key)
+        entry = _OPENENV_CHILDREN.get(key, None)
+        if child is not None and entry is not None and entry[0] is child:
+            _OPENENV_CHILDREN.pop(key, None)
+pass
+
+
+# An open port plus a live child is not proof the child opened it: a process taking
+# the endpoint before uvicorn binds satisfies both, and uvicorn does not exit the
+# instant it loses a bind. The child's own announcement is the proof.
+_UVICORN_BOUND = ("Uvicorn running on",)
+_UVICORN_BIND_FAILED = ("address already in use", "error while attempting to bind")
+# Trials to wait for that announcement on an already-open port before falling back.
+# Only a reworded startup log gets here, and failing a legitimate launch to close a
+# race is the worse trade.
+_UVICORN_BOUND_GRACE_TRIALS = 300
+
+
+def _watch_openenv_child_output(child):
+    """ Collect the child's stderr in a thread, returning the growing line list.
+
+    Draining matters on its own: stderr is a pipe nobody reads, so a chatty
+    uvicorn would eventually block on a full one.
+    """
+    return _OpenEnvChildOutput(child)
+
+
+class _OpenEnvChildOutput:
+    """ Drain the child's stderr for its whole life, keeping only a bounded tail.
+
+    Draining stops a chatty uvicorn blocking on a full pipe, but the reader
+    outlives launch_openenv, so retaining every line would trade that bounded
+    backpressure for an OOM. The verdict is latched as each line arrives rather
+    than re-scanned, so a flood cannot evict the announcement before it is read.
+    """
+    def __init__(self, child, keep_lines = 50):
+        self.bound = False
+        self.bind_failed = False
+        self.tail = collections.deque(maxlen = keep_lines)
+        thread = threading.Thread(target = self._read, args = (child,), daemon = True)
+        thread.start()
+
+    def _read(self, child):
+        # A child with no stderr pipe is not an error; a raise here would be unhandled.
+        stream = getattr(child, "stderr", None)
+        if stream is None: return
+        try:
+            for line in stream:
+                self.tail.append(line)
+                if not self.bound and any(m in line for m in _UVICORN_BOUND):
+                    self.bound = True
+                if not self.bind_failed:
+                    lowered = line.lower()
+                    if any(m in lowered for m in _UVICORN_BIND_FAILED):
+                        self.bind_failed = True
+        except Exception:
+            pass
+pass
+
+
+def _reap_exited_openenv_children():
+    """ Drop and reap every registered child that has already exited.
+
+    poll() is what reaps, and an entry is otherwise only polled if its own
+    endpoint comes up again, which usually never happens. Holding the Popen also
+    suppresses the interpreter's own reaping, so an unswept registry leaves zombies.
+    """
+    with _OPENENV_CHILDREN_LOCK:
+        for key, (child, owner_pid) in list(_OPENENV_CHILDREN.items()):
+            # Only the spawning process can poll, and so only it can reap.
+            if owner_pid != os.getpid(): continue
+            if child.poll() is not None:
+                _OPENENV_CHILDREN.pop(key, None)
+pass
+
+
+def _openenv_url(client_host, port):
+    """ http://host:port, bracketing an IPv6 literal as RFC 3986 3.2.2 requires
+
+    Unbracketed, `http://::1:9000` reads as host `` with the rest as the port.
+    A colon cannot appear in a DNS name, so it identifies the literal.
+    """
+    if ":" in client_host: client_host = f"[{client_host}]"
+    return f"http://{client_host}:{port}"
+pass
+
+
+def _openenv_child_alive(client_host, port):
+    """ Is the child we spawned on this endpoint still the process holding it?
+
+    A forked worker inherits this registry but is not the parent of anything in
+    it, so poll() there calls waitpid on a process that is not its child, gets
+    ECHILD, and CPython caches returncode 0 -- reporting a live server as dead.
+    The RL notebooks reach this on every move, because execute_with_time_limit
+    falls back to a forked process for a strategy with a bare except in a loop.
+    So off-process the question is put to the OS instead, and nothing is reaped
+    or removed, since neither is this process's to do.
+    """
+    with _OPENENV_CHILDREN_LOCK:
+        entry = _OPENENV_CHILDREN.get((client_host, port), None)
+        if entry is None: return False
+        child, owner_pid = entry
+        if owner_pid != os.getpid():
+            return _openenv_pid_is_alive(child.pid)
+        if child.poll() is not None:
+            _OPENENV_CHILDREN.pop((client_host, port), None)
+            return False
+        return True
 pass
 
 
@@ -567,18 +1356,49 @@ def launch_openenv(
     server : str = "envs.openspiel_env.server.app:app",
     environment = {},
     openenv_class = None,
+    host : str = "127.0.0.1",
 ):
-    """ Finds a new port or checks if the old open port actually works """
+    """ Finds a new port or checks if the old open port actually works
+
+    `host` is the interface the server binds, defaulting to loopback because the
+    OpenEnv app authenticates nobody, so a wider bind publishes the training run's
+    environment to every network the host is on. Pass it if a remote worker must
+    reach the server.
+
+    `openenv_process` is reused ONLY when this process spawned the child holding
+    `port`. An externally managed server is therefore not adopted even when it is
+    healthy and yours: a second uvicorn is spawned and the passed client dropped.
+    /health cannot distinguish it from a process that took the port.
+    """
     # Check if OpenEnv is working first
     assert type(environment) is dict
     assert type(port) is int and port >= 0 and port <= (65535-1)
     assert type(working_directory) is str
     assert openenv_class is not None
     assert type(server) is str
-    localhost = f"http://localhost:{port}"
+    assert type(host) is str and host != ""
+
+    # Auto-fix PYTHONPATH for OpenEnv compatibility
+    correct_pythonpath = _get_openenv_pythonpath(working_directory)
+    if environment.get("PYTHONPATH") != correct_pythonpath:
+        environment = dict(environment)  # Don't mutate original
+        environment["PYTHONPATH"] = correct_pythonpath
+
+    # Same family, and never `localhost`: asyncio's create_server sets IPV6_V6ONLY
+    # unconditionally, so a `::` server answers on ::1 and not 127.0.0.1 even on a
+    # dual stack host, and which family `localhost` resolves to is not ours to pick.
+    client_host = {"0.0.0.0" : "127.0.0.1", "::" : "::1"}.get(host, host)
+    localhost = _openenv_url(client_host, port)
+    _reap_exited_openenv_children()
 
     def check_openenv_works(process):
         if process is not None:
+            # Adopting a stranger hands it the training loop's rewards.
+            if not _openenv_child_alive(client_host, port):
+                if hasattr(process, "close"):
+                    try: process.close()
+                    except: pass
+                return None
             try:
                 request = requests.get(f"{localhost}/health", timeout = 0.1).content
                 if b"healthy" not in request and hasattr(process, "close"):
@@ -598,19 +1418,45 @@ def launch_openenv(
     while openenv_process is None:
         # Port ID must be less than uint16_MAX
         port = random.randint(9000, 65535-1)
-        localhost = f"http://localhost:{port}"
+        localhost = _openenv_url(client_host, port)
+        # Held already: uvicorn could not bind and we would talk to the holder.
+        if is_port_open(client_host, port):
+            trials += 1
+            if trials == 30:
+                raise TimeoutError("Unsloth: We tried launching a new OpenEnv process 30 times, but we still failed :(")
+            continue
+        # A closed port says nothing about another launch of ours heading there.
+        if not _reserve_openenv_endpoint(client_host, port):
+            trials += 1
+            if trials == 30:
+                raise TimeoutError("Unsloth: We tried launching a new OpenEnv process 30 times, but we still failed :(")
+            continue
         print(f"Unsloth: Creating new OpenEnv process at port = {port}", end = "")
-        openenv_process = subprocess.Popen(
-            [sys.executable, "-m", "uvicorn", server, "--host", "0.0.0.0", "--port", str(port)],
-            env = environment,
-            stdout = subprocess.PIPE,
-            stderr = subprocess.PIPE,
-            text = True,
-            cwd = working_directory,
-        )
-        # Wait until port is open
+        try:
+            openenv_child = subprocess.Popen(
+                [sys.executable, "-m", "uvicorn", server, "--host", host, "--port", str(port)],
+                env = environment,
+                stdout = subprocess.PIPE,
+                stderr = subprocess.PIPE,
+                text = True,
+                cwd = working_directory,
+            )
+        except BaseException:
+            # Else the claim outlives the call and blocks the endpoint forever.
+            _release_openenv_endpoint(client_host, port)
+            raise
+        _register_openenv_child(client_host, port, openenv_child)
+        child_output = _watch_openenv_child_output(openenv_child)
         wait_trials = 0
-        while not is_port_open("localhost", port):
+        while True:
+            if child_output.bound: break
+            # A dead child, or one that reported losing the bind, never will.
+            if child_output.bind_failed or openenv_child.poll() is not None:
+                _release_openenv_endpoint(client_host, port, openenv_child)
+                break
+            if is_port_open(client_host, port) and wait_trials >= _UVICORN_BOUND_GRACE_TRIALS:
+                # Unrecognised startup log: accept the open port as before.
+                break
             time.sleep(0.01)
             if wait_trials % 10 == 0:
                 print(".", end = "")
@@ -618,6 +1464,14 @@ def launch_openenv(
             if wait_trials == 6000:
                 raise TimeoutError("Unsloth: We tried launching a new OpenEnv Localhost for 60 seconds, but we still failed :(")
         print()
+        with _OPENENV_CHILDREN_LOCK:
+            entry = _OPENENV_CHILDREN.get((client_host, port), None)
+            ours = entry is not None and entry[0] is openenv_child
+        if not ours:
+            trials += 1
+            if trials == 30:
+                raise TimeoutError("Unsloth: We tried launching a new OpenEnv process 30 times, but we still failed :(")
+            continue
         openenv_process = openenv_class(base_url = localhost)
         openenv_process = check_openenv_works(openenv_process)
         if openenv_process is not None: break
