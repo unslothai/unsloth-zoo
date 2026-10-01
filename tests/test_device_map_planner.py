@@ -1955,3 +1955,32 @@ def test_block_swap_plan_refuses_when_one_layer_cannot_stay():
     model, total, layer = _swap_sizes()
     with pytest.raises(DeviceMapInfeasible, match = "host RAM"):
         plan_block_swap(model = model, max_memory = {0: layer}, reserve_bytes = 0)
+
+
+def test_block_swap_plan_moves_the_embedding_before_any_layer():
+    from unsloth_zoo.device_map_planner import plan_block_swap
+    model, total, layer = _swap_sizes()
+    embed = 512 * 64 * 4
+    reserve = embed
+    # Short by less than the embedding: moving it is enough, no layer swaps.
+    plan = plan_block_swap(model = model, max_memory = {0: total + reserve - embed // 2},
+                           reserve_bytes = reserve, offload_embedding = True)
+    assert plan.offload_embedding and plan.layers == 0 and plan.embedding_bytes == embed
+    # Not allowed: layers have to go instead.
+    plan = plan_block_swap(model = model, max_memory = {0: total + reserve - embed // 2},
+                           reserve_bytes = reserve)
+    assert not plan.offload_embedding and plan.layers > 0
+    # Short by more: the embedding moves and only the rest is swapped.
+    short = embed + 2 * layer
+    plan = plan_block_swap(model = model, max_memory = {0: total + reserve - short},
+                           reserve_bytes = reserve, offload_embedding = True)
+    assert plan.offload_embedding and (plan.layers - 3) * layer >= 2 * layer > (plan.layers - 4) * layer
+
+
+def test_block_swap_plan_keeps_a_tied_embedding():
+    from unsloth_zoo.device_map_planner import plan_block_swap
+    model = _meta(layers = 8, tie = True)
+    sizes = _compute_module_sizes(model)
+    plan = plan_block_swap(model = model, max_memory = {0: sizes[""] + 100 - 1}, reserve_bytes = 100,
+                           offload_embedding = True)
+    assert not plan.offload_embedding and plan.layers > 0

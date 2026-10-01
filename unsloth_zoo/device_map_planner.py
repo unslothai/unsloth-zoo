@@ -1909,14 +1909,21 @@ class BlockSwapPlan:
     budgets: dict[int, int]
     device_plan: DeviceMapPlan | None = None
     """Multi-GPU placement of the resident layers; None on one device."""
+    offload_embedding: bool = False
+    """Move the input embedding to host RAM after the load (tried before any layer)."""
+    embedding_bytes: int = 0
     notes: list[str] = field(default_factory=list)
 
     def describe(self) -> str:
-        if not self.layers:
+        moved = []
+        if self.offload_embedding:
+            moved.append(f"the input embedding ({self.embedding_bytes / _GiB:.2f} GiB)")
+        if self.layers:
+            moved.append(f"{self.layers} of {self.total_layers} decoder layers ({self.swapped_bytes / _GiB:.2f} GiB)")
+        if not moved:
             head = f"block swap: not needed, the model fits keeping {self.reserve_bytes / _GiB:.2f} GiB free for training"
         else:
-            head = (f"block swap: {self.layers} of {self.total_layers} decoder layers "
-                    f"({self.swapped_bytes / _GiB:.2f} GiB) stay in host RAM so "
+            head = (f"block swap: {' and '.join(moved)} stay in host RAM so "
                     f"{self.reserve_bytes / _GiB:.2f} GiB stays free for training")
         lines = [head]
         if self.device_plan is not None:
@@ -1942,6 +1949,7 @@ def plan_block_swap(
     safety_bytes: int = 256 * 1024 ** 2,
     free_space_policy: str = "balanced",
     no_split_module_classes: Sequence[str] | None = None,
+    offload_embedding: bool = False,
     trust_remote_code: bool = False,
     **config_kwargs: Any,
 ) -> BlockSwapPlan:
@@ -1954,6 +1962,11 @@ def plan_block_swap(
     so its slot pool is charged to each). ``reserve_bytes`` defaults to
     :func:`unsloth_zoo.block_swap.estimate_training_reserve_bytes` for
     ``seq_len * batch_size`` tokens and rank ``lora_rank`` LoRA on every linear.
+
+    ``offload_embedding`` (one GPU, untied embeddings): the input embedding may
+    move to host RAM after the load, tried before any layer since only the looked
+    up rows cross PCIe. The load itself still holds it on the card, so the
+    resident weights alone must fit the budget too.
 
     Raises :class:`DeviceMapInfeasible` when even one resident layer does not fit.
     """
@@ -1998,12 +2011,25 @@ def plan_block_swap(
     def swapped(n):
         return [layer_bytes[i] for i in range(L - n, L)]
 
+    embedding = 0
+    if offload_embedding and len(devices) == 1:
+        head_name, head_mod = resolve_output_head(model)
+        getter = getattr(model, "get_input_embeddings", None)
+        inp = getter() if callable(getter) else None
+        name = _name_of_module(model, inp) if inp is not None else None
+        if name is not None and not head_is_tied(model, head_mod):
+            embedding = sizes.get(name, 0)
+    use_embedding = False
+
     def fits(n):
         out = swapped(n)
         pool = _pool_bytes(out, prefetch_depth) if n else 0
         if len(devices) == 1:
-            need = total - sum(out) + pool + reserve_bytes
-            return need <= budgets[devices[0]], None
+            resident = total - sum(out)
+            off = embedding if use_embedding else 0
+            # Training needs the reserve; the load holds the embedding before it moves.
+            ok = resident - off + pool + reserve_bytes <= budgets[devices[0]] and resident <= budgets[devices[0]]
+            return ok, None
         excluded = [names[i] for i in range(L - n, L)]
         # The host tail fetches onto the output head's card (its inputs move there), so that card
         # pays for the slot pool: accept a plan only if it put the head on the card charged.
@@ -2031,6 +2057,9 @@ def plan_block_swap(
 
     ok, plan = fits(0)
     n = 0
+    if not ok and embedding:
+        use_embedding = True
+        ok, plan = fits(0)
     if not ok:
         # Feasibility only improves as layers leave the cards, so bisect on the count.
         lo, hi = 1, L - 1
@@ -2057,5 +2086,7 @@ def plan_block_swap(
         reserve_bytes = reserve_bytes,
         budgets = budgets,
         device_plan = plan,
+        offload_embedding = use_embedding,
+        embedding_bytes = embedding if use_embedding else 0,
         notes = notes,
     )
