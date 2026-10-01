@@ -95,9 +95,7 @@ COMMANDS_NOT_FOUND = (
     "No such file or directory",
 )
 
-# What each package manager prints when a package does not exist. Matching the
-# manager's own phrase (rather than any "not found") keeps ordinary installer
-# output from aborting a working install.
+# Each manager's own "no such package" phrase: a bare "not found" also matches normal install output.
 PACKAGE_NOT_FOUND = (
     "Unable to locate package",   # apt-get
     "No match for argument",      # dnf / yum
@@ -115,8 +113,7 @@ PACKAGE_MANAGER_NAMES = {
     "gentoo": "emerge",
 }
 
-# Debian package name -> what the same tool is called elsewhere. Missing
-# entries keep the Debian name.
+# Debian package name -> per-distro name; missing entries keep the Debian name.
 DISTRO_PACKAGES = {
     "rpm":    {"build-essential": "gcc gcc-c++ make"},
     "arch":   {"build-essential": "base-devel"},
@@ -710,8 +707,7 @@ def do_we_need_sudo(system_type="debian"):
     elif system_type == "suse":
         update_cmd = "zypper --non-interactive refresh"
     elif system_type == "gentoo":
-        # `emerge --sync` takes minutes and would trip the 180 s no-internet check
-        # below; portage always needs root, so answer from the effective uid.
+        # `emerge --sync` takes minutes (trips the 180 s timeout below) and portage always needs root.
         return os.geteuid() != 0
     else:
         update_cmd = "apt-get update -y"
@@ -7616,8 +7612,7 @@ def check_linux_type():
     elif os.path.exists('/etc/gentoo-release'):
         return 'gentoo'
 
-    # openSUSE and SLES no longer ship /etc/SuSE-release; both put "suse" in
-    # ID or ID_LIKE of /etc/os-release.
+    # openSUSE / SLES dropped /etc/SuSE-release.
     elif _os_release_ids() & {'suse', 'sles'}:
         return 'suse'
 

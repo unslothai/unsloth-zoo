@@ -1,10 +1,4 @@
-"""Distro detection and package-manager mapping in llama_cpp.py.
-
-Covers the Alpine / openSUSE / Gentoo additions: `check_linux_type` picks them
-up from their release files or /etc/os-release, the per-distro package maps
-have an entry for each, and the package-not-found detection matches each
-manager's own phrase without matching an ordinary "not found" line.
-"""
+"""Alpine / openSUSE / Gentoo detection and package-manager mapping in llama_cpp.py."""
 
 from __future__ import annotations
 
