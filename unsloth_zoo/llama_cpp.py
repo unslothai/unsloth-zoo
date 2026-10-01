@@ -1061,6 +1061,26 @@ def _rocm_gfx_family(gfx):
     return None
 
 
+def _gpu_cmake_flags(gpu_support):
+    """cmake GPU backend flags for a source build, one argv item each. ROCm
+    torch on Linux builds HIP per llama.cpp docs/build.md; Windows HIP needs a
+    Ninja + HIP SDK clang toolchain, so it keeps the CUDA flag."""
+    if gpu_support != "ON" or IS_WINDOWS:
+        return [f"-DGGML_CUDA={gpu_support}"]
+    if torch is None or not getattr(torch.version, "hip", None):
+        return ["-DGGML_CUDA=ON"]
+    flags = ["-DGGML_HIP=ON"]
+    rocm_path = os.environ.get("ROCM_PATH") or "/opt/rocm"
+    hip_clang = os.path.join(rocm_path, "llvm", "bin", "clang")
+    if os.path.exists(hip_clang):
+        flags.append(f"-DCMAKE_HIP_COMPILER={hip_clang}")
+    target = _detect_gpu_target()
+    if target is not None and target[0] == "rocm":
+        flags.append(f"-DGPU_TARGETS={target[1]}")
+    print(f"Unsloth: Detected ROCm - building llama.cpp with HIP ({' '.join(flags)})")
+    return flags
+
+
 def _select_gpu_assets(tag, assets, manifest, target = None):
     """Ordered download attempts [(asset_name, url), ...] of unslothai/llama.cpp
     GPU bundles for this host: narrowest CUDA coverage for the torch runtime
@@ -2197,7 +2217,7 @@ def install_llama_cpp(
                 "-G", cmake_generator,
                 "-Wno-dev",
                 "-DBUILD_SHARED_LIBS=OFF",
-                f"-DGGML_CUDA={gpu_support}",
+                *_gpu_cmake_flags(gpu_support),
             ]
             if vs_install_path:
                 cmake_args.append(f"-DCMAKE_GENERATOR_INSTANCE={vs_install_path}")
@@ -2274,7 +2294,8 @@ def install_llama_cpp(
                 cmake_configure = (
                     f"cmake . -B build "
                     f"-DCMAKE_BUILD_TYPE=Release "
-                    f"-DBUILD_SHARED_LIBS=OFF -DGGML_CUDA={gpu_support}"
+                    f"-DBUILD_SHARED_LIBS=OFF "
+                    + " ".join(shlex.quote(f) for f in _gpu_cmake_flags(gpu_support))
                 )
 
                 # Detect OpenMP library path (fixes GOMP linker errors)
