@@ -59,7 +59,7 @@ from .log import logger
 import triton
 import regex
 from .peft_utils import get_lora_layer_modules
-from .temporary_patches.mhc_sinkhorn import (
+from unsloth_zoo.temporary_patches.mhc_sinkhorn import (
     MHC_SINKHORN_SOURCE,
     MHC_SINKHORN_REPLACEMENT,
     mhc_fast_mode,
