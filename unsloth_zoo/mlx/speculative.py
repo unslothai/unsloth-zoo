@@ -222,7 +222,7 @@ class DraftController:
         probe_margin: float = 1.15,
         probe_every: int = 64,
         probe_rounds: int = 3,
-        split_every: int = 8,
+        split_every: int = 32,
         stale_after: int = 1024,
         max_stale_after: int = 16384,
         min_window: int = 8,
