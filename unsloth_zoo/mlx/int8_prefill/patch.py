@@ -106,6 +106,7 @@ def _patched_qmm(x, w, /, *args, **kwargs):
     # does `mx.quantized_matmul(queries, *q_keys, transpose=..., ...)` -- so bind by hand
     # rather than assuming keywords.
     n = len(args)
+    scales     = args[0] if n > 0 else kwargs.get("scales")
     biases     = args[1] if n > 1 else kwargs.get("biases")
     transpose  = args[2] if n > 2 else kwargs.get("transpose", True)
     group_size = args[3] if n > 3 else kwargs.get("group_size")
@@ -122,8 +123,13 @@ def _patched_qmm(x, w, /, *args, **kwargs):
         and x.dtype in _ACT_DTYPES
     ):
         entry = registry.get(w)
+        # The caller's metadata must be the registered arrays too. A learned quantizer
+        # (mlx_lm/quant/dwq.py) trains scales and biases with the packed weight fixed, so
+        # the weight alone would match while `ws` and the stored metadata had gone stale.
         if (
             entry is not None
+            and scales is entry.scales
+            and biases is entry.biases
             and (group_size is None or group_size == entry.group_size)
             and (bits is None or bits == entry.bits)
             and x.size // x.shape[-1] >= ROW_THRESHOLD

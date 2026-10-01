@@ -124,6 +124,23 @@ class TestFallthrough:
         x = mx.random.normal((ROW_THRESHOLD, K)).astype(mx.bfloat16)
         self._assert_untouched(monkeypatch, lambda: other(x))
 
+    def test_replaced_metadata(self, make_ql, monkeypatch):
+        """A learned quantizer (DWQ) trains scales and biases with the packed weight
+        fixed. The registered `ws` is then stale, so the call must reach MLX's op with
+        the caller's new metadata rather than the registered one."""
+        ql = make_ql(K, N)
+        _enable_with(ql)
+        ql["scales"] = ql["scales"] * 1.5
+        ql["biases"] = ql["biases"] - 0.01
+        x = mx.random.normal((ROW_THRESHOLD, K)).astype(mx.bfloat16)
+        got = self._assert_untouched(monkeypatch, lambda: ql(x))
+        want = patch._ORIG_QMM(
+            x, ql["weight"], ql["scales"], ql["biases"], True, ql.group_size, ql.bits,
+            "affine",
+        )
+        mx.eval(want)
+        assert mx.array_equal(got, want).item()
+
     def test_transpose_false(self, make_ql, monkeypatch):
         ql = make_ql(K, N)
         w, s, b, gs, bits = _enable_with(ql)
@@ -148,7 +165,7 @@ class TestFallthrough:
         try:
             mxfp4 = nn.QuantizedLinear.from_linear(nn.Linear(K, N, bias=False), mode="mxfp4")
         except Exception:
-            pytest.skip("mxfp4 unsupported in this MLX build")
+            pytest.skip(reason="mxfp4 unsupported in this MLX build")
         x = mx.random.normal((ROW_THRESHOLD, K)).astype(mx.bfloat16)
         self._assert_untouched(monkeypatch, lambda: mxfp4(x))
 
