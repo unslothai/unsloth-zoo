@@ -18,11 +18,12 @@
 
 The mixers project a [..., hc, hc] matrix onto the doubly-stochastic manifold with a chain of
 `x / (x.sum(dim) + eps)` normalisations (one column step, then `iters - 1` row + column pairs).
-They used to run eager (`DISABLE_COMPILE_MODULES`), which costs ~200 tiny fp32 launches per call.
+They used to run eager (`DISABLE_COMPILE_MODULES`), which costs ~230 tiny fp32 launches per call.
 
 Compiled as written, Inductor emits one reduction kernel per normalisation (~40 forward, ~40
 backward per call). `unsloth_sinkhorn_knopp` instead treats each token's n x n matrix as n * n
-pointwise tensors, so the chain is pointwise and fuses into one forward and one backward kernel.
+pointwise tensors, so the chain is pointwise and fuses into a few pointwise kernels (about 30 per
+mixer call forward + backward on M07, against about 90 compiled as written).
 Its backward is explicit: the iterates are recomputed from the saved input and each normalisation
 `y = x / d`, `d = sum(x) + eps` is differentiated as `gx = (gy - sum(gy * y)) / d`, the exact
 derivative with no `x / d / d` term. Outside a compiled region it runs the transformers loop, so
