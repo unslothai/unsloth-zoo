@@ -2292,10 +2292,10 @@ def install_llama_cpp(
                 # step's `--config Release` is ignored, so without this the
                 # binaries are built unoptimized.
                 cmake_configure = (
-                    f"cmake . -B build "
-                    f"-DCMAKE_BUILD_TYPE=Release "
-                    f"-DBUILD_SHARED_LIBS=OFF "
-                    + " ".join(shlex.quote(f) for f in _gpu_cmake_flags(gpu_support))
+                    "cmake . -B build "
+                    "-DCMAKE_BUILD_TYPE=Release "
+                    "-DBUILD_SHARED_LIBS=OFF "
+                    + " ".join(shlex.quote(flag) for flag in _gpu_cmake_flags(gpu_support))
                 )
 
                 # Detect OpenMP library path (fixes GOMP linker errors)

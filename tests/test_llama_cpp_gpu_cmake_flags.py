@@ -15,7 +15,6 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import importlib.util
-import os
 import sys
 import types
 from pathlib import Path
