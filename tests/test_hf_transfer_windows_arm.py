@@ -281,3 +281,24 @@ class TestHfTransferNotInstalled:
         env = _resolve(platform_name = "linux", machine = "x86_64", environ = {})
         assert env.get("HF_HUB_ENABLE_HF_TRANSFER") == "1"
 
+
+def _probe():
+    """``_hf_transfer_importable`` from __init__.py, run against the real importlib."""
+    import importlib.util
+
+    node = next(
+        n for n in _TREE.body if isinstance(n, ast.FunctionDef) and n.name == "_hf_transfer_importable"
+    )
+    namespace = {"_importlib_util": importlib.util}
+    exec(compile(ast.Module(body = [node], type_ignores = []), _INIT, "exec"), namespace)
+    return namespace["_hf_transfer_importable"]
+
+
+def test_a_spec_less_hf_transfer_stub_reads_as_not_installed(monkeypatch):
+    # find_spec raises ValueError for a sys.modules entry whose __spec__ is None; importing
+    # unsloth_zoo must not fail on a stub a harness put there.
+    stub = types.ModuleType("hf_transfer")
+    stub.__spec__ = None
+    monkeypatch.setitem(sys.modules, "hf_transfer", stub)
+    assert _probe()() is False
+
