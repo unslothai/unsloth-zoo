@@ -1,21 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""`grouped_gemm(gather_indices = None)` must survive when nothing permutes.
-
-The signature defaults `gather_indices` to None and the wrapper only asserts it
-is present when `permute_x` or `permute_y` is set, but it then normalised it
-with an unconditional `gather_indices.view(-1)`, so the documented default died
-with `AttributeError: 'NoneType' object has no attribute 'view'` (#8627). The
-same unconditional dereference sat in `grouped_gemm_dX`, which reads
-`gather_indices.shape[0]` to size dX, so the backward pass failed identically
-once the forward was fixed.
-
-Calling the kernel on activations that are already in expert-contiguous order is
-a documented use of `permute_x = False`, and none of the three Triton kernels
-touch `gather_indices_ptr` outside their `PERMUTE_X or PERMUTE_Y` branches, so
-the caller should not have to pass a `torch.arange` the kernel never reads.
-"""
+"""`grouped_gemm(gather_indices = None)` must work when nothing permutes (unsloth#8627): forward and dX both dereferenced it."""
 
 import sys
 from pathlib import Path
@@ -52,7 +38,6 @@ def _operands(device, requires_grad = False):
     return X.requires_grad_(requires_grad), W.requires_grad_(requires_grad), m_sizes
 
 
-# ---- the contract, without a GPU ----------------------------------------
 
 
 def test_the_default_survives_the_wrapper_when_nothing_permutes():
@@ -88,7 +73,6 @@ def test_permuting_without_indices_still_fails_with_the_explicit_message(permute
         )
 
 
-# ---- the numerics, on a real device --------------------------------------
 
 
 @requires_cuda

@@ -73,7 +73,6 @@ def load_cached_config(cache_key: str) -> Optional[Dict[str, Any]]:
         with open(cache_file, "r", encoding = "utf-8") as f:
             cached_data = json.load(f)
 
-        # Invalidate if device capability changed.
         current_device_capability = torch.cuda.get_device_capability()
         if cached_data.get("device_capability") != current_device_capability:
             logger.info("Device capability changed, invalidating cache")
@@ -157,7 +156,6 @@ def get_or_autotune_moe_kernels(
         seq_len,
     )
 
-    # Env override to disable autotuning
     if os.environ.get("UNSLOTH_MOE_DISABLE_AUTOTUNE", "0") == "1":
         logger.info(
             f"UNSLOTH_MOE_DISABLE_AUTOTUNE=1: Using Heuristic (Safe) MoE kernel configs for SM{device_capability[0]}{device_capability[1]}"
@@ -254,10 +252,8 @@ def _run_moe_autotuning(
         num_experts, hidden_dim, intermediate_dim, device = device, dtype = dtype
     )
 
-    # Dummy routing data
     m_sizes = torch.randint(1, total_tokens // num_experts + 1, (num_experts,), device = device)
     m_sizes = m_sizes * (total_tokens // m_sizes.sum().item())
-    # Adjust to exact total
     diff = total_tokens - m_sizes.sum().item()
     if diff != 0:
         m_sizes[0] += diff
@@ -265,7 +261,6 @@ def _run_moe_autotuning(
     gather_indices = torch.arange(total_tokens, device = device)
     torch.randperm(total_tokens, out = gather_indices)
 
-    # Autotune via the interface function with autotune=True (lets triton tune)
     from .grouped_gemm.interface import (
         grouped_gemm_forward,
         grouped_gemm_dX,
@@ -320,7 +315,6 @@ def _run_moe_autotuning(
     )
     triton_config_bwd_dx = _autotuned_grouped_gemm_dX_kernel.best_config
 
-    # Safe Backward Configs: 64x64x256
     config_bwd_dx = KernelConfigBackward_dX(
         BLOCK_SIZE_M = triton_config_bwd_dx.kwargs["BLOCK_SIZE_M"],
         BLOCK_SIZE_N = triton_config_bwd_dx.kwargs["BLOCK_SIZE_N"],
@@ -355,8 +349,6 @@ def _run_moe_autotuning(
         use_tma_load_x = triton_config_bwd_dw.kwargs.get("USE_TMA_LOAD_X", False),
         use_tma_store = triton_config_bwd_dw.kwargs.get("USE_TMA_STORE", False),
     )
-
-    return config_fwd, config_bwd_dx, config_bwd_dw
 
     return config_fwd, config_bwd_dx, config_bwd_dw
 

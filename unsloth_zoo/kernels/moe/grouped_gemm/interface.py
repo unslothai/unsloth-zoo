@@ -122,9 +122,7 @@ def _grouped_gemm_forward_impl(
     permute_x: bool = False,
     permute_y: bool = False,
     fuse_mul_post: bool = False,
-    # Autotuning -- overrides manual kernel params when True
     autotune: bool = False,
-    # Kernel tuning params: must be tuned, else poor performance.
     BLOCK_SIZE_M: int = 32,
     BLOCK_SIZE_N: int = 32,
     BLOCK_SIZE_K: int = 32,
@@ -133,7 +131,6 @@ def _grouped_gemm_forward_impl(
     use_tma_load_w: bool = False,
     use_tma_load_x: bool = False,
     use_tma_store: bool = False,
-    # Software pipelining; no effect until the loop is re-written.
     flatten: bool = True,
     debug: bool = False,
 ) -> torch.Tensor:
@@ -602,7 +599,7 @@ def _make_op(name, impl, fake):
         return torch._dynamo.disable(impl)
     existing = getattr(getattr(torch.ops, "unsloth", None), name, None)
     if existing is not None:
-        # grouped_gemm is also importable as a top-level package (glm4_moe, tests): reuse the registration.
+        # A second copy of these kernels (unsloth.kernels.moe) may have registered the op already.
         return existing
     params = [
         p.replace(

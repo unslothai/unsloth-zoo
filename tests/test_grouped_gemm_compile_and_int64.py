@@ -1,14 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""The Triton MoE grouped GEMM must run under torch.compile and index weights past 2^31 elements.
-
-1. The kernels were marked `allow_in_graph`, so AOT traced their Python bodies on fake
-   tensors: the graph kept the `torch.empty` output and dropped the Triton launch, and the
-   compiled forward / backward returned uninitialised memory. They are now custom ops.
-2. Weight offsets (`expert_idx * N * K`) were int32, so an (E, N, K) weight holding more
-   than 2^31 elements read and wrote the wrong experts (Step-3.7 at 288 experts).
-"""
+"""The Triton MoE grouped GEMM runs under torch.compile (custom ops, not allow_in_graph, which
+dropped the launch) and indexes weights past 2^31 elements (int64 expert offsets)."""
 
 import sys
 from pathlib import Path
