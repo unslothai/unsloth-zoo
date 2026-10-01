@@ -515,7 +515,8 @@ _INT8_ACTIVATION_QUANTIZE_SOURCE = """
 # operands in the same register layout: an fp32 operand would change it. Rows past the tile's valid
 # range load its last valid row and are never stored. GATHER: `w` holds one matrix per expert and
 # the rows are sorted by expert; `starts` gives each expert's first row and `tiles` its first tile,
-# so every tile belongs to one expert.
+# so every tile belongs to one expert. MAP: row i's activations are row `rmap[i]` of the quantized x,
+# which holds one row per token however many experts it is routed to.
 _INT8_QMM_SOURCE = """
     static_assert(sizeof(T) == 2, "16-bit activations, scales and biases only");
     constexpr int GS = 64;
@@ -570,6 +571,9 @@ _INT8_QMM_SOURCE = """
     int rows[4];
     _Pragma("clang loop unroll(full)")
     for (int i = 0; i < 4; ++i) rows[i] = min(row_base + i * 8, row_hi - 1);   // rows +0, +8, +16, +24
+    int arow[4];   // where each row's activations were quantized
+    _Pragma("clang loop unroll(full)")
+    for (int i = 0; i < 4; ++i) arow[i] = MAP ? int(rmap[rows[i]]) : rows[i];
     float out[2][16];
     _Pragma("clang loop unroll(full)")
     for (int h = 0; h < 2; ++h)
@@ -583,7 +587,7 @@ _INT8_QMM_SOURCE = """
         for (int j = 0; j < 8; ++j)   // columns fn + (j & 3) + (j >> 2) * 16
             s[j] = float(slane[((j & 3) + (j >> 2) * 16) * G + g]);
         _Pragma("clang loop unroll(full)")
-        for (int i = 0; i < 4; ++i) scale[i] = sa[ulong(g) * M + rows[i]];
+        for (int i = 0; i < 4; ++i) scale[i] = sa[ulong(g) * M + arow[i]];
     };
 
     for (int g = 0; g < G; ++g) {
@@ -609,7 +613,7 @@ _INT8_QMM_SOURCE = """
             for (int h = 0; h < 2; ++h) {
                 _Pragma("clang loop unroll(full)")
                 for (int r = 0; r < 2; ++r) {
-                    const char4 c = as_type<char4>(*(const device uint*)(qa + ulong(rows[h * 2 + r]) * K
+                    const char4 c = as_type<char4>(*(const device uint*)(qa + ulong(arow[h * 2 + r]) * K
                                                                         + g * GS + cx * 16 + t * 4));
                     ct_a[r * 4] = c.x; ct_a[r * 4 + 1] = c.y; ct_a[r * 4 + 2] = c.z; ct_a[r * 4 + 3] = c.w;
                 }
@@ -656,7 +660,7 @@ _INT8_QMM_SOURCE = """
                 for (int h = 0; h < 2; ++h) {
                     _Pragma("clang loop unroll(full)")
                     for (int r = 0; r < 2; ++r) {
-                        const device bfloat* ur = (part ? ul : uh) + ulong(rows[h * 2 + r]) * GP + k;
+                        const device bfloat* ur = (part ? ul : uh) + ulong(arow[h * 2 + r]) * GP + k;
                         _Pragma("clang loop unroll(full)")
                         for (int i = 0; i < 4; ++i) bt_a[r * 4 + i] = ur[i];
                     }
@@ -687,7 +691,8 @@ def _int8_qmm_kernels():
     return (mx.fast.metal_kernel(name = "unsloth_nax_int8_activation_quantize", input_names = ["x"],
                                  output_names = ["qa", "sa", "uh", "ul"], source = _INT8_ACTIVATION_QUANTIZE_SOURCE),
             mx.fast.metal_kernel(name = "unsloth_nax_int8_qmm",
-                                 input_names = ["qa", "sa", "uh", "ul", "w", "scales", "biases", "starts", "tiles"],
+                                 input_names = ["qa", "sa", "uh", "ul", "w", "scales", "biases", "starts", "tiles",
+                                                "rmap"],
                                  output_names = ["y"], header = _INT8_QMM_HEADER, source = _INT8_QMM_SOURCE))
 
 
@@ -708,8 +713,9 @@ def _int8_quantize_activations(x, bits):
         output_dtypes = [mx.int8, mx.float32, mx.bfloat16, mx.bfloat16])
 
 
-def _int8_qmm(x, w, scales, biases, bits, simdgroups, starts = None, tiles = None, row_tiles = None):
-    M, K = x.shape
+def _int8_qmm(x, w, scales, biases, bits, simdgroups, starts = None, tiles = None, row_tiles = None,
+             token_rows = None):
+    M, K = x.shape if token_rows is None else (token_rows.shape[0], x.shape[1])
     N = w.shape[-2]
     rows_per_simdgroup, columns = simdgroups
     qa, sa, uh, ul = _int8_quantize_activations(x, bits)
@@ -717,10 +723,11 @@ def _int8_qmm(x, w, scales, biases, bits, simdgroups, starts = None, tiles = Non
     if not gather:
         starts = tiles = mx.zeros((1,), mx.int32)
         row_tiles = -(-M // (32 * rows_per_simdgroup))
+    mapped = token_rows is not None
     return _int8_qmm_kernels()[1](
-        inputs = [qa, sa, uh, ul, w, scales, biases, starts, tiles],
+        inputs = [qa, sa, uh, ul, w, scales, biases, starts, tiles, token_rows if mapped else starts],
         template = [("T", x.dtype), ("K", K), ("BITS", bits), ("WM", rows_per_simdgroup), ("WN", columns),
-                    ("GATHER", gather)],
+                    ("GATHER", gather), ("MAP", mapped)],
         grid = (N // (32 * columns) * 32 * rows_per_simdgroup * columns, row_tiles, 1),
         threadgroup = (32 * rows_per_simdgroup * columns, 1, 1),
         output_shapes = [(M, N)], output_dtypes = [x.dtype])[0]
@@ -736,16 +743,17 @@ _INT8_GATHER_QMM_SIMDGROUPS = {4: (1, 2), 8: (1, 2)}
 def _differentiable_int8_qmm(bits, gather):
     """The kernel call with the stock op's vjp for x, scales and biases (Metal kernels have none); packed
     weights and indices, which stock cannot differentiate, get zeros."""
-    def stock(x, w, scales, biases, *indices):
+    def stock(x, w, scales, biases, indices = None, token_rows = None):
         if gather:
-            return mx.gather_qmm(x[:, None], w, scales, biases, rhs_indices = indices[0], transpose = True,
+            x = x if token_rows is None else x[token_rows]
+            return mx.gather_qmm(x[:, None], w, scales, biases, rhs_indices = indices, transpose = True,
                                  group_size = _A8_GROUP_SIZE, bits = bits, sorted_indices = True)[:, 0]
         return mx.quantized_matmul(x, w, scales, biases, transpose = True, group_size = _A8_GROUP_SIZE, bits = bits)
 
     @mx.custom_function
     def routed(x, w, scales, biases, *indices):
         if gather:
-            return _int8_gather_qmm(x, w, scales, biases, indices[0], bits)
+            return _int8_gather_qmm(x, w, scales, biases, bits, *indices)
         return _int8_qmm(x, w, scales, biases, bits, _INT8_QMM_SIMDGROUPS[bits])
 
     @routed.vjp
@@ -763,22 +771,26 @@ def int8_qmm(x, w, scales, biases, bits):
     return _differentiable_int8_qmm(bits, False)(x, w, scales, biases)
 
 
-def int8_gather_qmm(x, w, scales, biases, indices, bits):
+def int8_gather_qmm(x, w, scales, biases, indices, bits, token_rows = None):
     """`gather_qmm(x, w, ..., rhs_indices=indices, transpose=True, sorted_indices=True)` for x of
     shape [T, K] and sorted expert indices [T], with int8 activations; returns [T, N]. x, scales and
-    biases must be float16 or bfloat16."""
-    return _differentiable_int8_qmm(bits, True)(x, w, scales, biases, indices)
+    biases must be float16 or bfloat16. With `token_rows`, row i reads `x[token_rows[i]]`, so each
+    row of x is quantized once however many experts it is routed to."""
+    if token_rows is None:
+        return _differentiable_int8_qmm(bits, True)(x, w, scales, biases, indices)
+    return _differentiable_int8_qmm(bits, True)(x, w, scales, biases, indices, token_rows)
 
 
-def _int8_gather_qmm(x, w, scales, biases, indices, bits):
+def _int8_gather_qmm(x, w, scales, biases, bits, indices, token_rows = None):
     E = w.shape[0]
     rows = 32 * _INT8_GATHER_QMM_SIMDGROUPS[bits][0]
     starts = (indices[None, :] < mx.arange(E + 1, dtype = indices.dtype)[:, None]).sum(axis = 1).astype(mx.int32)
     counts = starts[1:] - starts[:-1]
     tiles = mx.concatenate([mx.zeros((1,), mx.int32), mx.cumsum((counts + rows - 1) // rows)])
     # Each expert adds at most one partial tile; threadgroups past the last tile return at once.
-    row_tiles = x.shape[0] // rows + min(E, x.shape[0])
-    return _int8_qmm(x, w, scales, biases, bits, _INT8_GATHER_QMM_SIMDGROUPS[bits], starts, tiles, row_tiles)
+    row_tiles = indices.shape[0] // rows + min(E, indices.shape[0])
+    return _int8_qmm(x, w, scales, biases, bits, _INT8_GATHER_QMM_SIMDGROUPS[bits], starts, tiles, row_tiles,
+                     token_rows)
 
 
 # Fewest rows per call where the int8 route, its quantize pass included, beat stock by at least
@@ -794,9 +806,13 @@ _A8_ROWS_BY_GPU = {
 }
 _A8_ROWS_UNMEASURED = ((4, 1 << 23, 4096, 128), (8, 1 << 23, 4096, 128))
 # The same for routed experts, by weights, columns and rows per expert, with no input-width floor:
-# their 512-deep down projections still gain.
+# their 512-deep down projections still gain. Entries ending in True apply only to calls that quantize
+# each token once for all its experts, which skips most of the quantize pass and the gathered copy;
+# they precede the entries for the same bits that apply to every call.
+# 4-bit experts route only the per-token calls: their down projections are faster too, but on
+# DeepSeek-V2-Lite they cost a top-1 point.
 _A8_EXPERT_ROWS_BY_GPU = {
-    17: ((8, 1 << 20, 1024, 32),),
+    17: ((4, 1 << 20, 1024, 8, True), (8, 1 << 20, 1024, 16, True), (8, 1 << 20, 1024, 32, False)),
 }
 _A8_EXPERT_ROWS_UNMEASURED = ()
 
@@ -810,27 +826,33 @@ def int8_prefill_min_rows(N, K, bits):
     return 0
 
 
-def int8_prefill_expert_min_rows(E, N, K, bits):
-    """The fewest sorted rows per call at which the gathered int8 route is measured faster, or 0."""
+def int8_prefill_expert_min_rows(E, N, K, bits, per_token = False):
+    """The fewest sorted rows per call at which the gathered int8 route is measured faster, or 0;
+    `per_token` for a call whose rows read one quantized copy of each token."""
     table = _A8_EXPERT_ROWS_BY_GPU.get(_gpu_generation(), _A8_EXPERT_ROWS_UNMEASURED)
-    for entry_bits, fewest, narrowest, rows in table:
-        if bits == entry_bits and N * K >= fewest and N >= narrowest:
+    for entry_bits, fewest, narrowest, rows, entry_per_token in table:
+        if bits == entry_bits and N * K >= fewest and N >= narrowest and (per_token or not entry_per_token):
             return rows * E
     return 0
 
 
 def probe_int8_qmm():
-    """Subprocess probe for the int8 kernels: both bit widths, dense and gathered, bf16 and fp16."""
+    """Subprocess probe for the int8 kernels: both bit widths, dense, gathered and gathered through
+    a token map, bf16 and fp16."""
     for dtype, bits in itertools.product((mx.bfloat16, mx.float16), _INT8_QMM_BITS):
         w = mx.random.normal((4, 128, 256), key = mx.random.key(bits)) * 0.05
         w, scales, biases = mx.quantize(w.astype(dtype), group_size = _A8_GROUP_SIZE, bits = bits)
         x = mx.random.normal((70, 256), key = mx.random.key(1)).astype(dtype)
         indices = mx.sort(mx.random.randint(0, 4, (70,), key = mx.random.key(2)).astype(mx.uint32))
+        tokens = mx.random.randint(0, 70, (70,), key = mx.random.key(3)).astype(mx.uint32)
         for got, native in (
                 (int8_qmm(x, w[0], scales[0], biases[0], bits),
                  mx.quantized_matmul(x, w[0], scales[0], biases[0], transpose = True, bits = bits)),
                 (int8_gather_qmm(x, w, scales, biases, indices, bits),
                  mx.gather_qmm(x[:, None], w, scales, biases, rhs_indices = indices, transpose = True,
+                               bits = bits, sorted_indices = True)[:, 0]),
+                (int8_gather_qmm(x, w, scales, biases, indices, bits, tokens),
+                 mx.gather_qmm(x[tokens][:, None], w, scales, biases, rhs_indices = indices, transpose = True,
                                bits = bits, sorted_indices = True)[:, 0])):
             error = mx.abs(got.astype(mx.float32) - native.astype(mx.float32)).max().item()
             assert error <= 0.05 * mx.abs(native.astype(mx.float32)).max().item(), (bits, dtype, error)

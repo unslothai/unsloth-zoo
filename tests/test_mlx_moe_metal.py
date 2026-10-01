@@ -129,7 +129,7 @@ def test_each_contract_resolution_gets_its_own_bindings():
     # one list shared between resolutions would vouch for helpers a cached fused class never captured
     first, second = fusion._moe_switch_specs(), fusion._moe_switch_specs()
     assert first[lm.SwitchGLU][-1] is not second[lm.SwitchGLU][-1]
-    fused = [fusion._fused_moe_gate_up_class(lm.SwitchGLU, kind, None, None, 0, []) for kind in
+    fused = [fusion._fused_moe_gate_up_class(lm.SwitchGLU, kind, None, 0, []) for kind in
              (lm.QuantizedSwitchLinear, type("Other", (lm.QuantizedSwitchLinear,), {}))]
     assert fused[0] is not fused[1]  # one class cached across projection types would guard the wrong one
 
@@ -605,7 +605,7 @@ def test_routed_experts_run_under_the_int8_prefill_scope(int8_prefill_first, mon
     monkeypatch.setattr(nax, "nax_available", lambda: True)
     monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: True)
     monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {})
-    monkeypatch.setattr(nax, "_A8_EXPERT_ROWS_BY_GPU", {nax._gpu_generation(): ((8, 0, 0, 8),)})
+    monkeypatch.setattr(nax, "_A8_EXPERT_ROWS_BY_GPU", {nax._gpu_generation(): ((8, 0, 0, 8, False),)})
     gathers = _counting_gather_qmm(monkeypatch)
     scopes = [functools.partial(fusion.nax_quantized_linear, int8_prefill = True), _routed]
     with contextlib.ExitStack() as stack:

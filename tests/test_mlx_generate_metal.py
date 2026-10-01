@@ -1162,9 +1162,10 @@ def test_nax_int8_prefill_partial_is_exact(bits):
     import numpy as np
     from unsloth_zoo.mlx import nax
 
-    # Integer activations peaking at 127 per group quantize to themselves; zero weights under the three
-    # peaks and four +-1 entries per row keep every integer output (at most 4 * 510) exact in float16.
-    # Code sums of 377 to 385 need both bfloat16 halves, and 17 groups span a full and a partial block.
+    # Integer activations peaking at 127 per group quantize to themselves, scaled by 1 or 2 per row; zero
+    # weights under the three peaks and four +-1 entries per row keep every output (at most 2 * 4 * 510,
+    # even past 2048) exact in float16. Code sums of 377 to 385 need both bfloat16 halves, and 17 groups
+    # span a full and a partial block.
     rng = np.random.default_rng(bits)
     E, N, K = 3, 320, 17 * 64
     peaks = (np.arange(0, K, 64)[:, None] + [0, 21, 42]).ravel()
@@ -1177,6 +1178,7 @@ def test_nax_int8_prefill_partial_is_exact(bits):
     off_peak = np.setdiff1d(np.arange(K), peaks)
     for row in a:
         row[rng.choice(off_peak, 4, replace = False)] = rng.choice([-1, 1], 4)
+    a *= rng.choice([1, 2], (131, 1))
     W = codes * np.repeat(s, 64, -1) + np.repeat(b, 64, -1)
     exact = np.einsum("mk,enk->emn", a.astype(np.float64), W.astype(np.float64))
     a, s, b = (mx.array(v).astype(mx.float16) for v in (a, s, b))
@@ -1186,6 +1188,9 @@ def test_nax_int8_prefill_partial_is_exact(bits):
     experts = np.repeat([0, 2], [60, 71]).astype(np.uint32)   # a ragged segment and an empty expert
     gathered = nax.int8_gather_qmm(a, w, s, b, mx.array(experts), bits)
     assert np.array_equal(np.array(gathered.astype(mx.float32)), exact[experts, np.arange(131)])
+    experts, tokens = np.repeat([0, 2], [400, 648]).astype(np.uint32), rng.integers(0, 131, 1048).astype(np.uint32)
+    gathered = nax.int8_gather_qmm(a, w, s, b, mx.array(experts), bits, mx.array(tokens))
+    assert np.array_equal(np.array(gathered.astype(mx.float32)), exact[experts, tokens])
     x = mx.where(mx.arange(131)[:, None] == 70, mx.nan, a).astype(mx.bfloat16)
     y = nax.int8_qmm(x, w[0], *(v[0].astype(mx.bfloat16) for v in (s, b)), bits)
     rows = mx.isnan(y).any(axis = 1)
@@ -1226,7 +1231,8 @@ def test_nax_int8_prefill_routes_dense_and_expert_prefill_only(monkeypatch):
     monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: True)
     monkeypatch.setattr(nax, "_A8_ROWS_BY_GPU", {nax._gpu_generation(): _A8_EVERY_ROW})
     monkeypatch.setattr(nax, "_INT8_PREFILL_MIN_K", 0)
-    monkeypatch.setattr(nax, "_A8_EXPERT_ROWS_BY_GPU", {nax._gpu_generation(): ((8, 0, 0, 20),)})
+    monkeypatch.setattr(nax, "_A8_EXPERT_ROWS_BY_GPU",
+                        {nax._gpu_generation(): ((8, 0, 0, 20, True), (8, 0, 0, 30, False))})
     monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {})
     monkeypatch.setattr(inference, "_NAX_INT8_QMM_VERIFIED", {})
 
@@ -1236,7 +1242,7 @@ def test_nax_int8_prefill_routes_dense_and_expert_prefill_only(monkeypatch):
         indices = mx.random.randint(0, 8, (1, rows, top), key = mx.random.key(rows + 1)).astype(mx.uint32)
         return model(x, indices)
 
-    natives = {rows: run(rows) for rows in (1, 20, 64, 100)}
+    natives = {rows: run(rows) for rows in (1, 20, 64, 100, 128)}
     monkeypatch.delenv("UNSLOTH_MLX_INT8_PREFILL", raising = False)
     with generation_mode(model):   # off by default: bitwise stock
         assert all(mx.array_equal(a, b).item() for a, b in zip(run(100), natives[100])) and not calls
@@ -1252,11 +1258,13 @@ def test_nax_int8_prefill_routes_dense_and_expert_prefill_only(monkeypatch):
             assert (type(model.moe).__name__ != "SwitchGLU") is packed
             for rows, native in natives.items():
                 routed = run(rows)
-                # Dense projections route from 64 rows; the 2 * rows expert routes sort from 32 and route
-                # from 20 per expert (160).
+                # Dense projections route from 64 rows; the 2 * rows expert rows sort from 32 and route from
+                # 30 per expert (240), or 20 (160) where the packed gate and up quantize each token once.
                 T = 2 * rows
-                experts = [("gather", T, 256)] * 2 if packed else [("gather", T, 128)] * 2 + [("gather", T, 256)]
-                assert calls == [("dense", rows, 320), ("dense", rows, 256)] * (rows >= 64) + experts * (T >= 160)
+                down = [("gather", T, 256)] * (T >= 240)
+                unpacked = [("gather", T, 128)] * 2 * (T >= 240)
+                experts = ([("gather", rows, 256)] * (T >= 160) if packed else unpacked) + down
+                assert calls == [("dense", rows, 320), ("dense", rows, 256)] * (rows >= 64) + experts
                 for a, b in zip(routed, native):
                     assert mx.allclose(a, b, rtol = 5e-2, atol = 5e-2).item()
             model.train()
@@ -1325,7 +1333,7 @@ def test_nax_int8_prefill_differentiates_through_the_stock_op(monkeypatch):
     monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: True)
     monkeypatch.setattr(nax, "_A8_ROWS_BY_GPU", {nax._gpu_generation(): _A8_EVERY_ROW})
     monkeypatch.setattr(nax, "_INT8_PREFILL_MIN_K", 0)
-    monkeypatch.setattr(nax, "_A8_EXPERT_ROWS_BY_GPU", {nax._gpu_generation(): ((8, 0, 0, 20),)})
+    monkeypatch.setattr(nax, "_A8_EXPERT_ROWS_BY_GPU", {nax._gpu_generation(): ((8, 0, 0, 20, False),)})
     monkeypatch.setattr(inference, "_NAX_INT8_QMM_VERIFIED", {})
     x = mx.random.normal((1, 100, 256), key = mx.random.key(5)).astype(mx.bfloat16)
     indices = mx.random.randint(0, 8, (1, 100, 2), key = mx.random.key(6)).astype(mx.uint32)
@@ -1346,6 +1354,14 @@ def test_nax_int8_prefill_differentiates_through_the_stock_op(monkeypatch):
     assert sorted(routed_dense) == sorted(native_dense) == ["biases", "scales", "x"]
     assert all(mx.array_equal(routed_dense[k], native_dense[k]).item() for k in native_dense)
     assert mx.allclose(routed_moe, native_moe, rtol = 5e-2, atol = 5e-2).item()
+    w, s, b = (model.moe.up_proj[name] for name in ("weight", "scales", "biases"))
+    rows = mx.sort(indices.reshape(-1))
+    tokens = mx.random.randint(0, 100, (200,), key = mx.random.key(8)).astype(mx.uint32)
+    token_loss = lambda f: mx.grad(lambda x: (f(x).astype(mx.float32) * mx.arange(128)).sum())(x[0])
+    mapped = token_loss(lambda x: nax.int8_gather_qmm(x, w, s, b, rows, 8, tokens))
+    stock = token_loss(lambda x: mx.gather_qmm(x[tokens][:, None], w, s, b, rhs_indices = rows, transpose = True,
+                                               bits = 8, sorted_indices = True)[:, 0])
+    assert mx.allclose(mapped, stock, rtol = 1e-2, atol = 1.0).item()   # bf16 scatter-adds in either order
     after = tree_flatten(model.parameters())
     assert [k for k, _ in after] == [k for k, _ in state]
     assert all(mx.array_equal(a, b).item() for (_, a), (_, b) in zip(after, state))
@@ -1372,10 +1388,13 @@ def test_nax_int8_prefill_probes_gate_their_own_route(monkeypatch):
 def test_nax_int8_prefill_rows_follow_the_gpu_generation(monkeypatch):
     from unsloth_zoo.mlx import nax
 
-    for architecture, rows in (("applegpu_g17s", (128, 0, 256, 0, 128)), ("applegpu_g17c", (128, 0, 256, 0, 128)),
-                               ("applegpu_g18s", (0, 0, 0, 0, 128)), ("", (0, 0, 0, 0, 128))):
+    for architecture, rows in (("applegpu_g17s", (128, 0, 256, 0, 128, 128, 0, 64)),
+                               ("applegpu_g17c", (128, 0, 256, 0, 128, 128, 0, 64)),
+                               ("applegpu_g18s", (0, 0, 0, 0, 128, 0, 0, 0)), ("", (0, 0, 0, 0, 128, 0, 0, 0))):
         monkeypatch.setattr(nax, "_gpu_architecture", lambda: architecture)
         got = (nax.int8_prefill_min_rows(2048, 2048, 4), nax.int8_prefill_min_rows(8192, 512, 4),
                nax.int8_prefill_expert_min_rows(8, 1024, 1024, 8), nax.int8_prefill_expert_min_rows(8, 512, 2048, 8),
-               nax.int8_prefill_min_rows(4096, 2048, 8))
+               nax.int8_prefill_min_rows(4096, 2048, 8), nax.int8_prefill_expert_min_rows(8, 1024, 1024, 8, True),
+               nax.int8_prefill_expert_min_rows(8, 1024, 1024, 4),
+               nax.int8_prefill_expert_min_rows(8, 1024, 1024, 4, True))
         assert got == rows, architecture

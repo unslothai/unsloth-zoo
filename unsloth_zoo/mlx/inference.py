@@ -155,7 +155,7 @@ def _moe_switch_specs():
         bindings = _resolved_bindings({path: contract})
         if bindings is not None:  # one drifted package still leaves the other
             specs[native.SwitchGLU] = (
-                native.QuantizedSwitchLinear, native._gather_sort, native._scatter_unsort,
+                native.QuantizedSwitchLinear, native._scatter_unsort,
                 # 0 where upstream has no short-sequence decode path, making the guard inert.
                 getattr(native, "DECODE_BLOCK_SIZE", 0), bindings,
             )
@@ -234,13 +234,15 @@ class _PackedMoEGateUp:
                 return False
         return True
 
-    def project(self, x, indices, sorted_indices):
+    def project(self, x, indices, sorted_indices, token_rows = None):
+        """`x` holds one row per token when `token_rows` maps each sorted row to its token."""
         group_size, bits, mode = self.metadata
         result = _nax_int8_prefill_gather(self.gate, x, self.arrays["weight"], self.arrays["scales"],
-                                  self.arrays.get("biases"), indices, sorted_indices, group_size, bits, mode, None)
+                                  self.arrays.get("biases"), indices, sorted_indices, group_size, bits, mode, None,
+                                  token_rows)
         if result is None:
             result = mx.gather_qmm(
-                x,
+                x if token_rows is None else x[token_rows],
                 self.arrays["weight"],
                 self.arrays["scales"],
                 self.arrays.get("biases"),
@@ -256,9 +258,8 @@ class _PackedMoEGateUp:
         return mx.split(result, 2, axis = -1)
 
 
-def _fused_moe_gate_up_class(original_class, projection_type, gather_sort, scatter_unsort,
-                             decode_block, bindings):
-    key = (original_class, projection_type, gather_sort, scatter_unsort, decode_block)  # each class guards its own resolution
+def _fused_moe_gate_up_class(original_class, projection_type, scatter_unsort, decode_block, bindings):
+    key = (original_class, projection_type, scatter_unsort, decode_block)  # each class guards its own resolution
     if key not in _MOE_GATE_UP_CLASSES:
 
         def fused_call(self, x, indices, *args, **kwargs):
@@ -272,10 +273,12 @@ def _fused_moe_gate_up_class(original_class, projection_type, gather_sort, scatt
             x = mx.expand_dims(x, (-2, -3))
             do_sort = indices.size >= 64
             idx = indices
-            inv_order = None
-            if do_sort:
-                x, idx, inv_order = gather_sort(x, indices)
-            x_gate, x_up = packed.project(x, idx, do_sort)
+            inv_order = token_rows = None
+            if do_sort:   # `_gather_sort` inlined: projections read the token rows through `token_rows`
+                order = mx.argsort(indices.flatten())
+                inv_order = mx.argsort(order)
+                x, idx, token_rows = x.flatten(0, -3), indices.flatten()[order], order // indices.shape[-1]
+            x_gate, x_up = packed.project(x, idx, do_sort, token_rows)
             x = self.down_proj(self.activation(x_up, x_gate), idx, sorted_indices = do_sort)
             if do_sort:
                 x = scatter_unsort(x, inv_order, indices.shape)
@@ -2366,7 +2369,7 @@ def _moe_routed_experts(block):
     base = _switch_base(type(mlp), specs)
     if base is None:
         return None
-    projection_type, _, _, decode_block, bindings = specs[base]
+    projection_type, _, decode_block, bindings = specs[base]
     if any(_native_type(getattr(mlp, name, None)) is not projection_type
            for name in ("gate_proj", "up_proj", "down_proj")):
         return None
@@ -2709,17 +2712,18 @@ def _nax_int8_qmm_matches_native(x, w, scales, biases, group_size, bits, routed,
     return bool(mx.all(agree).item())
 
 
-def _nax_verified_int8_qmm(key, flat, w, scales, biases, group_size, bits, indices = None):
+def _nax_verified_int8_qmm(key, flat, w, scales, biases, group_size, bits, indices = None, token_rows = None):
     verified = _NAX_INT8_QMM_VERIFIED.get(key)
     if verified is False:
         return None
     if indices is None:
         routed = nax.int8_qmm(flat, w, scales, biases, bits)
     else:
-        routed = nax.int8_gather_qmm(flat, w, scales, biases, indices, bits)
+        routed = nax.int8_gather_qmm(flat, w, scales, biases, indices, bits, token_rows)
     if verified is None:
+        rows = flat if token_rows is None else flat[token_rows]
         try:
-            verified = _nax_int8_qmm_matches_native(flat, w, scales, biases, group_size, bits, routed, indices)
+            verified = _nax_int8_qmm_matches_native(rows, w, scales, biases, group_size, bits, routed, indices)
         except (RuntimeError, ValueError):
             return None  # inside a function transformation, which cannot evaluate; checked later
         if verified and not any(_NAX_INT8_QMM_VERIFIED.values()):
@@ -2747,26 +2751,28 @@ def _nax_int8_prefill_dense(module, x, bindings):
     return None if routed is None else routed.reshape(*x.shape[:-1], N)
 
 
-def _nax_int8_prefill_gather(owner, x, w, scales, biases, indices, sorted_indices, group_size, bits, mode, bindings):
-    """The gathered int8 kernel's result for an expert call on rows sorted by expert, x of shape
-    [T, 1, K], or None when it takes the native call. `owner` is the expert projection whose
-    scope enabled the route; its arrays may be `w`, or `w` a pack of several projections."""
+def _nax_int8_prefill_gather(owner, x, w, scales, biases, indices, sorted_indices, group_size, bits, mode, bindings,
+                     token_rows = None):
+    """The gathered int8 kernel's result for x of shape [T, 1, K] sorted by expert, or None for the
+    native call. `owner` enabled the route; `w` may pack several projections. With `token_rows`, x
+    holds one row per token and sorted row i is `x[token_rows[i]]`."""
     if not sorted_indices or not isinstance(x, mx.array) or x.ndim != 3 or x.shape[1] != 1:
         return None
     if not getattr(owner, "_unsloth_nax_int8_prefill", False) or owner.training:
         return None
     if bindings is not None and not _bindings_intact(bindings):
         return None
-    if (not isinstance(indices, mx.array) or indices.shape != x.shape[:1]
+    T = x.shape[0] if token_rows is None else token_rows.shape[0]
+    if (not isinstance(indices, mx.array) or indices.shape != (T,)
             or indices.dtype not in (mx.uint32, mx.int32) or not isinstance(w, mx.array) or w.ndim != 3
             or not _nax_int8_qmm_eligible(x, w, scales, biases, group_size, bits, mode)):
         return None
-    (E, N, _), (T, _, K) = w.shape, x.shape
-    low = nax.int8_prefill_expert_min_rows(E, N, K, bits)
+    (E, N, _), K = w.shape, x.shape[-1]
+    low = nax.int8_prefill_expert_min_rows(E, N, K, bits, token_rows is not None)
     if not low or T < low:
         return None
-    routed = _nax_verified_int8_qmm(("gather", E, N, K, bits, x.dtype), x.reshape(T, K), w, scales, biases, group_size,
-                         bits, indices)
+    routed = _nax_verified_int8_qmm(("gather", E, N, K, bits, x.dtype, token_rows is not None), x.reshape(-1, K),
+                                    w, scales, biases, group_size, bits, indices, token_rows)
     return None if routed is None else routed.reshape(T, 1, N)
 
 
