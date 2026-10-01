@@ -359,7 +359,7 @@ def _in_caller_dtype(output, hidden_states):
 
 
 def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights):
-    """bnb 4-bit MoE forward: dequantize experts to the input dtype, then
+    """bnb 4-bit MoE forward: dequantize experts to the half compute dtype (W4A16), then
     dispatch to the standard MoE backend (grouped_mm / triton / native).
 
     Mirrors `forward_moe_backend_fp8`. Base weights stay in 4-bit Params4bit
