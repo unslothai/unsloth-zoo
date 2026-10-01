@@ -3112,7 +3112,11 @@ def patch_GptOssModel():
             torch.compiler.cudagraph_mark_step_begin()
             # Initialize for common return path
             all_hidden_states = None
-            for decoder_layer in self.layers:
+            # This loop calls the layer's parts directly, so the block swapper's forward hooks never fire.
+            block_swap = getattr(self.layers, "_unsloth_block_swap", None)
+            for idx, decoder_layer in enumerate(self.layers):
+                if block_swap is not None:
+                    block_swap.enter(idx)
                 _attn_type = getattr(decoder_layer, "attention_type", None)
                 if isinstance(attention_mask, dict):
                     mask = attention_mask.get(_attn_type) or next(iter(attention_mask.values()))
@@ -3143,6 +3147,8 @@ def patch_GptOssModel():
                 else:
                     hidden_states = moe_forward_inference_bf16(decoder_layer.mlp, hidden_states)
                 hidden_states += residual
+                if block_swap is not None:
+                    block_swap.leave(idx)
             pass
             hidden_states = rms_layernorm_forward(self.norm, hidden_states)
         else:

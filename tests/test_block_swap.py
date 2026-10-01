@@ -33,7 +33,7 @@ _spec = importlib.util.spec_from_file_location(
     "block_swap_under_test", os.path.join(_HERE, "unsloth_zoo", "block_swap.py"))
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
-BlockSwap, find_decoder_layers = _mod.BlockSwap, _mod.find_decoder_layers
+BlockSwap, find_decoder_layers, swap_indices = _mod.BlockSwap, _mod.find_decoder_layers, _mod.swap_indices
 
 
 class _FakeBlock:
@@ -74,6 +74,9 @@ def _scheduler(n, depth = 2, sigs = None, start = 0):
     sw.blocks = [_FakeBlock(s) for s in sigs]
     sw.free = {s: [object() for _ in range(depth + 1)] for s in set(sigs)}
     sw.start = start
+    sw.indices = list(range(start, start + n))
+    sw.pos = {li: k for k, li in enumerate(sw.indices)}
+    sw._input_hooked = [False] * n
     sw._grew = False
     sw._new_slot = lambda sig: object()
     for b in sw.blocks:
@@ -103,10 +106,11 @@ def test_pool_never_exceeds_depth_plus_one_live():
     sw = _scheduler(8, depth = 2)
     with torch.no_grad():
         for i in range(8):
-            sw._pre(i)(None, None)
+            sw._pre(i)(None, (), {})
             assert _live(sw) <= sw.depth + 1, f"step {i}: {_live(sw)} live"
             sw._post(i)(None, None, None)
-    assert _live(sw) == 0
+    # The last block's eviction starts fetching the next inference forward's first blocks.
+    assert [b.resident for b in sw.blocks] == [True] * sw.depth + [False] * (len(sw.blocks) - sw.depth)
 
 
 def test_prefetch_direction_flips_with_grad_mode():
@@ -115,13 +119,13 @@ def test_prefetch_direction_flips_with_grad_mode():
         sw._release(b)
     # grad off: entering block 3 looks ahead to 5.
     with torch.no_grad():
-        sw._pre(3)(None, None)
+        sw._pre(3)(None, (), {})
     assert sw.blocks[3].resident and sw.blocks[5].resident and not sw.blocks[1].resident
     for b in sw.blocks:
         sw._release(b)
     # grad on: the recompute sweep runs in reverse, so entering 3 looks back to 1.
     with torch.enable_grad():
-        sw._pre(3)(None, None)
+        sw._pre(3)(None, (), {})
     assert sw.blocks[3].resident and sw.blocks[1].resident and not sw.blocks[5].resident
 
 
@@ -131,18 +135,19 @@ def test_post_hook_evicts_only_under_no_grad():
     for b in sw.blocks:
         sw._release(b)
     with torch.no_grad():
-        sw._pre(2)(None, None)
+        sw._pre(2)(None, (), {})
         assert sw.blocks[2].resident
         sw._post(2)(None, None, None)
     assert not sw.blocks[2].resident, "under no_grad the post hook evicts"
     for b in sw.blocks:
         sw._release(b)
     with torch.enable_grad():
-        sw._pre(2)(None, None)
+        x = torch.ones(1, requires_grad = True)
+        sw._pre(2)(None, (x,), {})
         assert sw.blocks[2].resident
-        sw._post(2)(None, None, None)
+        sw._post(2)(None, None, x * 2)
     assert sw.blocks[2].resident, "with grad on, eviction waits for the backward hook"
-    sw._bwd(2)(None, None, None)
+    sw._bwd(2)(None)
     assert not sw.blocks[2].resident
 
 
@@ -151,9 +156,9 @@ def test_backward_hook_on_block_zero_arms_next_step():
     for b in sw.blocks:
         sw._release(b)
     assert _live(sw) == 0
-    sw._bwd(3)(None, None, None)
+    sw._bwd(3)(None)
     assert _live(sw) == 0, "only block 0's backward marks the step boundary"
-    sw._bwd(0)(None, None, None)
+    sw._bwd(0)(None)
     assert [b.resident for b in sw.blocks[:2]] == [True, True]
 
 
@@ -163,7 +168,7 @@ def test_each_signature_gets_its_own_pool():
     assert set(sw.free) == {"a", "b"}
     with torch.no_grad():
         for i in range(6):
-            sw._pre(i)(None, None)
+            sw._pre(i)(None, (), {})
             assert _live(sw, "a") <= 2 and _live(sw, "b") <= 2
             sw._post(i)(None, None, None)
 
@@ -207,18 +212,19 @@ def test_interrupted_step_never_evicts_the_block_about_to_run():
     sw = _scheduler(8, depth = 2)
     for i in range(8):
         with torch.no_grad():
-            sw._pre(i)(None, None)
+            sw._pre(i)(None, (), {})
             sw._post(i)(None, None, None)
     # Recompute of the top blocks starts, then backward dies: their slots stay held.
     with torch.enable_grad():
-        sw._pre(7)(None, None)
-        sw._pre(6)(None, None)
+        sw._pre(7)(None, (), {})
+        sw._pre(6)(None, (), {})
     assert not sw.free["a"]
     with torch.no_grad():
         for i in range(8):
-            sw._pre(i)(None, None)
+            x = torch.ones(1, requires_grad = True)
+            sw._pre(i)(None, (x,), {})
             assert sw.blocks[i].resident, i
-            sw._post(i)(None, None, None)
+            sw._post(i)(None, None, x * 2)
 
 
 def test_grad_on_forward_order_never_reuses_a_slot_backward_still_reads():
@@ -227,14 +233,15 @@ def test_grad_on_forward_order_never_reuses_a_slot_backward_still_reads():
     slots = []
     with torch.enable_grad():
         for i in range(8):
-            sw._pre(i)(None, None)
+            x = torch.ones(1, requires_grad = True)
+            sw._pre(i)(None, (x,), {})
             assert sw.blocks[i].resident, i
-            sw._post(i)(None, None, None)
+            sw._post(i)(None, None, x * 2)
             slots.append(sw.blocks[i].slot)
     assert all(b.resident and b.pending for b in sw.blocks)
     assert len({id(s) for s in slots}) == 8, "a slot was handed to two blocks autograd still reads"
     for i in reversed(range(8)):
-        sw._bwd(i)(None, None, None)
+        sw._bwd(i)(None)
     assert not any(b.pending for b in sw.blocks)
 
 
@@ -245,7 +252,7 @@ def test_non_reentrant_checkpoint_forward_evicts_like_no_grad():
 
     def run(i):
         def f(t):
-            sw._pre(i)(None, None)
+            sw._pre(i)(None, (), {})
             sw._post(i)(None, None, None)
             return t * 2
         return f
@@ -276,7 +283,7 @@ def test_training_forward_keeps_the_blocks_recompute_needs_first():
     sw = _scheduler(6, depth = 2)
     with torch.no_grad():
         for i in range(6):
-            sw._pre(i)(M, None)
+            sw._pre(i)(M, (), {})
             sw._post(i)(M, None, None)
     assert [b.resident for b in sw.blocks] == [False] * 4 + [True, True]
     # Eval forwards still evict everything.
@@ -284,7 +291,7 @@ def test_training_forward_keeps_the_blocks_recompute_needs_first():
     M.training = False
     with torch.no_grad():
         for i in range(6):
-            sw._pre(i)(M, None)
+            sw._pre(i)(M, (), {})
             sw._post(i)(M, None, None)
     assert not any(b.resident for b in sw.blocks[2:])
 
@@ -475,3 +482,143 @@ def test_chunked_fallback_when_registration_is_unavailable():
     sw.remove()
 
 
+
+
+def test_swap_indices_spread_and_tail():
+    assert swap_indices(8, 3, "tail") == [5, 6, 7]
+    assert swap_indices(32, 8) == [3, 7, 11, 15, 19, 23, 27, 31]
+    assert swap_indices(5, 5) == [0, 1, 2, 3, 4]
+    assert swap_indices(5, 0) == [] and swap_indices(5, 9) == [0, 1, 2, 3, 4]
+    for total in range(1, 40):
+        for n in range(total + 1):
+            idx = swap_indices(total, n)
+            assert len(set(idx)) == n and all(0 <= i < total for i in idx) and idx == sorted(idx)
+
+
+def test_find_decoder_layers_without_a_layers_attribute():
+    class Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc = nn.Linear(16, 16)
+
+    class GPT2Like(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.transformer = nn.Module()
+            self.transformer.h = nn.ModuleList([Block() for _ in range(4)])
+            self.transformer.heads = nn.ModuleList([nn.Linear(16, 2) for _ in range(2)])
+
+    m = GPT2Like()
+    assert find_decoder_layers(m) is m.transformer.h
+
+    class Seq2Seq(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = nn.Module()
+            self.encoder.block = nn.ModuleList([Block() for _ in range(2)])
+            self.decoder = nn.Module()
+            self.decoder.block = nn.ModuleList([Block() for _ in range(3)])
+
+    m = Seq2Seq()
+    assert find_decoder_layers(m) is m.decoder.block
+
+
+class _XBlock(nn.Module):
+    """Self + cross term: `enc` reaches every block, like cross-attention states."""
+
+    def __init__(self, d):
+        super().__init__()
+        self.w = nn.Linear(d, d, bias = False).requires_grad_(False)
+        self.c = nn.Linear(d, d, bias = False).requires_grad_(False)
+        self.lora = nn.Parameter(torch.randn(d, d) * 0.01)
+
+    def forward(self, x, enc):
+        return x + torch.tanh(self.w(x) + x @ self.lora + self.c(enc))
+
+
+def _xrun(blocks, mode, swap, idx = None):
+    import torch.utils.checkpoint as cp
+    torch.manual_seed(0)
+    x = torch.randn(4, 256, device = "cuda", requires_grad = True)
+    enc = torch.randn(4, 256, device = "cuda", requires_grad = True)
+    sw = BlockSwap(blocks, idx if idx is not None else 6, prefetch_depth = 1, device = "cuda") if swap else None
+    for b in blocks:
+        b.lora.grad = None
+    h = x
+    for b in blocks:
+        if mode == "none":
+            h = b(h, enc)
+        else:
+            h = cp.checkpoint(b, h, enc, use_reentrant = mode == "reentrant")
+    h.square().sum().backward()
+    torch.cuda.synchronize()
+    out = [x.grad.clone(), enc.grad.clone()] + [b.lora.grad.clone() for b in blocks]
+    live = sum(blk.resident for blk in sw.blocks) if sw is not None else None
+    if sw is not None:
+        sw.remove()
+    return out, live
+
+
+def test_cross_fed_tensor_grads_are_bitwise_with_swap():
+    # Spread and tail placements, every checkpoint mode: bitwise grads, and backward releases every block.
+    if not torch.cuda.is_available():
+        return
+    torch.manual_seed(0)
+    blocks = nn.ModuleList([_XBlock(256) for _ in range(8)]).cuda()
+    for mode in ("reentrant", "non_reentrant", "none"):
+        ref, _ = _xrun(blocks, mode, False)
+        for idx in (None, [1, 3, 5, 7], [0, 2, 4, 6]):
+            got, live = _xrun(blocks, mode, True, idx)
+            assert all(torch.equal(a, b) for a, b in zip(ref, got)), (mode, idx)
+            # Released after backward except the next step's first blocks.
+            assert live == 1, (mode, idx, live)
+
+
+def test_block_without_grad_input_is_released_after_backward():
+    if not torch.cuda.is_available():
+        return
+    torch.manual_seed(0)
+    blocks = nn.ModuleList([_XBlock(256) for _ in range(4)]).cuda()
+    sw = BlockSwap(blocks, 4, prefetch_depth = 1, device = "cuda")
+    x = torch.randn(4, 256, device = "cuda")  # no grad: block 0's input hook cannot fire
+    enc = torch.randn(4, 256, device = "cuda")
+    h = x
+    for b in blocks:
+        h = b(h, enc)
+    assert sw.blocks[0].pending
+    h.sum().backward()
+    torch.cuda.synchronize()
+    assert not any(b.pending for b in sw.blocks)
+    assert blocks[0].lora.grad is not None
+    sw.remove()
+
+
+def test_shared_parameter_stays_on_the_card():
+    if not torch.cuda.is_available():
+        return
+    shared = nn.Linear(64, 64, bias = False).cuda().requires_grad_(False)
+    layers = nn.ModuleList([nn.Sequential(nn.Linear(64, 64, bias = False), shared) for _ in range(3)])
+    layers = layers.cuda().requires_grad_(False)
+    x = torch.randn(2, 64, device = "cuda")
+    with torch.no_grad():
+        ref = [layer(x) for layer in layers]
+    sw = BlockSwap(layers, 2, prefetch_depth = 1, device = "cuda")
+    assert shared.weight.device.type == "cuda" and shared.weight.numel() == 64 * 64
+    assert all(id(shared.weight) not in b.index for b in sw.blocks)
+    with torch.no_grad():
+        for _ in range(2):
+            assert all(torch.equal(layer(x), r) for layer, r in zip(layers, ref))
+    sw.remove()
+
+
+def test_enter_leave_follow_explicit_indices():
+    sw = _scheduler(3, depth = 1)
+    sw.indices, sw.pos = [1, 4, 7], {1: 0, 4: 1, 7: 2}
+    for b in sw.blocks:
+        sw._release(b)
+    sw.enter(0)
+    assert not any(b.resident for b in sw.blocks)
+    sw.enter(4)
+    assert sw.blocks[1].resident and sw.blocks[2].resident
+    sw.leave(4)
+    assert not sw.blocks[1].resident

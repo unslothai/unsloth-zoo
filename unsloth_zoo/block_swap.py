@@ -28,6 +28,7 @@ from contextlib import contextmanager, nullcontext
 __all__ = [
     "BlockSwap",
     "find_decoder_layers",
+    "swap_indices",
     "build_host_layers",
 ]
 
@@ -140,10 +141,12 @@ class _Block:
     __slots__ = ("params", "host", "devices", "index", "streams", "events", "resident", "slot", "sig",
                  "pending", "layout", "sizes", "src", "empties", "host_buf")
 
-    def __init__(self, layer, streams, device):
+    def __init__(self, layer, streams, device, shared = ()):
         self.params, self.host, self.devices = [], [], []
         index = {}
         for name, p in _swappable(layer):
+            if id(p) in shared:
+                continue
             index[id(p)] = len(self.params)
             self.params.append(p)
             self.devices.append(device if p.data.device.type == "cpu" else p.data.device)
@@ -209,10 +212,19 @@ class _Block:
             torch.cuda.current_stream(d).wait_event(event)
 
 
-class BlockSwap:
-    """Install on a decoder-layer list; the tail `n` of them live on the host."""
+def swap_indices(total, n, placement = "spread"):
+    """Which of `total` layers to swap. "spread" spaces them evenly (ending at the last layer), so each
+    copy hides behind total / n layers of compute instead of one; "tail" takes the last n."""
+    n = max(0, min(int(n), total))
+    if placement == "tail":
+        return list(range(total - n, total))
+    return [(k + 1) * total // n - 1 for k in range(n)]
 
-    def __init__(self, layers, n, prefetch_depth = 2, device = None):
+
+class BlockSwap:
+    """Install on a layer list; layers at `n` (a count or explicit indices) live on the host."""
+
+    def __init__(self, layers, n, prefetch_depth = 2, device = None, placement = "tail"):
         self.blocks, self.handles = [], []
         self.depth = max(1, prefetch_depth)
         self.streams = {}
@@ -220,40 +232,37 @@ class BlockSwap:
         self._grew = False
         self._chunks = []
         self.pinned_bytes = 0
-        self.start = len(layers)
-        if n <= 0:
+        if isinstance(n, int):
+            self.indices = swap_indices(len(layers), n, placement)
+        else:
+            self.indices = sorted({int(i) % len(layers) for i in n})
+        self.pos = {li: k for k, li in enumerate(self.indices)}
+        self.start = self.indices[0] if self.indices else len(layers)
+        self._input_hooked = [False] * len(self.indices)
+        if not self.indices:
             return
-        n = min(n, len(layers))
-        self.start = len(layers) - n
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
         self.device = torch.device(device)
-        self.blocks = [_Block(l, self.streams, self.device) for l in layers[self.start:]]
-        for layer in layers[self.start:]:
-            for name, p in layer.named_parameters():
-                if (p.requires_grad or "lora_" in name) and p.device.type == "cpu":
-                    p.data = p.data.to(self.device)
-
-        # A param shared with any other layer (swapped or not) gets evicted under it.
-        unswapped = set()
-        for layer in layers[:self.start]:
+        swapped = [layers[i] for i in self.indices]
+        # A param reachable from two layers (tied / shared blocks) stays on the card: evicting it
+        # under one layer would empty it for the other.
+        owners = {}
+        for li, layer in enumerate(layers):
             for _, p in _swappable(layer):
-                unswapped.add(id(p))
-        seen = set()
-        for b in self.blocks:
-            for p in b.params:
-                if id(p) in seen or id(p) in unswapped:
-                    raise ValueError(
-                        "block_swap: a Parameter is shared with another decoder "
-                        "layer; exclude the shared layer or reduce the swap depth.")
-                seen.add(id(p))
+                owners.setdefault(id(p), set()).add(li)
+        shared = {pid for pid, o in owners.items() if len(o) > 1}
+        self.blocks = [_Block(layer, self.streams, self.device, shared) for layer in swapped]
+        for layer in swapped:
+            for name, p in layer.named_parameters():
+                if (p.device.type == "cpu") and (p.requires_grad or "lora_" in name or id(p) in shared):
+                    p.data = p.data.to(self.device)
 
         # Evict before building the pool (originals + pool would OOM); roll back on any failure.
         try:
-            for i, layer in enumerate(layers[self.start:]):
-                self.handles.append(layer.register_forward_pre_hook(self._pre(i)))
+            for i, layer in enumerate(swapped):
+                self.handles.append(layer.register_forward_pre_hook(self._pre(i), with_kwargs = True))
                 self.handles.append(layer.register_forward_hook(self._post(i)))
-                self.handles.append(layer.register_full_backward_hook(self._bwd(i)))
                 # Evicted weights are empty: state_dict must read the host copy.
                 self.handles.append(layer._register_state_dict_hook(self._state_dict(i)))
 
@@ -374,7 +383,7 @@ class BlockSwap:
                 self._fetch(self.blocks[i])
 
     def _pre(self, i):
-        def hook(module, args):
+        def hook(module, args, kwargs):
             b = self.blocks[i]
             self._fetch(b, steal = True)
             b.wait()
@@ -382,23 +391,48 @@ class BlockSwap:
             nxt = i - self.depth if _autograd_keeps_weights() else i + self.depth
             if 0 <= nxt < len(self.blocks):
                 self._fetch(self.blocks[nxt])
+            # The grad of the block's input is complete only once the block's backward has run, so its
+            # hook is the release point. A tensor hook adds no autograd node, unlike a full backward hook,
+            # which reorders gradient sums of tensors fed to several blocks (cross-attention states).
+            hooked = False
+            if torch.is_grad_enabled():
+                x = next((a for a in args if isinstance(a, torch.Tensor)), None)
+                if x is None:
+                    x = kwargs.get("hidden_states")
+                if isinstance(x, torch.Tensor) and x.requires_grad:
+                    x.register_hook(self._bwd(i))
+                    hooked = True
+            self._input_hooked[i] = hooked
             return None
         return hook
 
     def _post(self, i):
         def hook(module, args, output):
-            # With grad on, backward still needs the weight; the backward hook evicts.
+            training = getattr(module, "training", False)
             if not _autograd_keeps_weights():
                 # A training forward's last blocks are the first ones recompute needs: keep them.
-                if not (getattr(module, "training", False) and i >= len(self.blocks) - self.depth):
+                if not (training and i >= len(self.blocks) - self.depth):
                     self._release(self.blocks[i])
-            else:
-                self.blocks[i].pending = True
+                # Inference: the next forward starts at the first block, so start fetching it now.
+                if not training and i == len(self.blocks) - 1:
+                    self._arm(forward = True)
+                return output
+            out = output[0] if isinstance(output, (tuple, list)) else output
+            if not (isinstance(out, torch.Tensor) and out.requires_grad):
+                # Nothing will backpropagate through this call.
+                self._release(self.blocks[i])
+                return output
+            self.blocks[i].pending = True
+            if not self._input_hooked[i]:
+                # No grad-requiring input to hook: release once the whole backward finishes.
+                release = self._bwd(i)
+                out.register_hook(
+                    lambda g: torch.autograd.Variable._execution_engine.queue_callback(lambda: release(None)))
             return output
         return hook
 
     def _bwd(self, i):
-        def hook(module, grad_input, grad_output):
+        def hook(grad):
             self._release(self.blocks[i])
             if i == 0:
                 self._arm(forward = True)
@@ -416,12 +450,16 @@ class BlockSwap:
 
     def enter(self, idx):
         """Make layer `idx` resident for code that bypasses the forward hooks (fast decode)."""
-        i = idx - self.start
+        i = self.pos.get(idx, -1)
         if 0 <= i < len(self.blocks):
-            self._pre(i)(None, None)
+            b = self.blocks[i]
+            self._fetch(b, steal = True)
+            b.wait()
+            if i + self.depth < len(self.blocks):
+                self._fetch(self.blocks[i + self.depth])
 
     def leave(self, idx):
-        i = idx - self.start
+        i = self.pos.get(idx, -1)
         if 0 <= i < len(self.blocks):
             self._release(self.blocks[i])
             if i == len(self.blocks) - 1:
@@ -479,6 +517,16 @@ def find_decoder_layers(model):
             break
     if hasattr(m, "layers"):
         return m.layers
+    # Other layouts (`transformer.h`, `decoder.block`, `decoder.layers`): the list of blocks holding the
+    # most weight. Classes may differ (Mllama interleaves cross-attention layers).
+    best, best_bytes = None, 0
+    for mod in model.modules():
+        if isinstance(mod, torch.nn.ModuleList) and len(mod) >= 2:
+            sizes = [sum(p.nbytes for n, p in c.named_parameters() if "lora_" not in n) for c in mod]
+            if min(sizes) > 0 and sum(sizes) > best_bytes:
+                best, best_bytes = mod, sum(sizes)
+    if best is not None:
+        return best
     raise RuntimeError("could not locate decoder layers")
 
 
