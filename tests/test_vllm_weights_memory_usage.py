@@ -128,8 +128,12 @@ def test_fp8_modules_to_not_convert_stay_16bit():
     assert skipped - quantized == pytest.approx(3 * 64 * 128 * (2 - 2 / (8/5)))
 
 
-def test_unsized_quant_formats_fall_back():
-    config = _tiny_dense(quantization_config = {"quant_method": "compressed-tensors"})
+@pytest.mark.parametrize("quant_config", [
+    {"quant_method": "compressed-tensors"},
+    {"quant_method": "gptq", "bits": 4, "modules_in_block_to_quantize": [["self_attn.q_proj"]]},
+])
+def test_unsized_quant_formats_fall_back(quant_config):
+    config = _tiny_dense(quantization_config = quant_config)
     assert vllm_utils.vllm_weights_memory_usage(config) is None
 
 

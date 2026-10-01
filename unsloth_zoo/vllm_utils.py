@@ -1822,7 +1822,7 @@ def vllm_weights_memory_usage(config, load_in_4bit = False, load_in_8bit = False
         quantized_bytes = 2 / (8/5)
     elif quant_method == "mxfp4":
         quantized_bytes = 17 / 32 # 4-bit values + one 8-bit scale per 32
-    elif quant_method in ("awq", "gptq"):
+    elif quant_method in ("awq", "gptq") and not quant_config.get("modules_in_block_to_quantize", None):
         quantized_bytes = quant_config.get("bits", 4) / 8 * 1.125
     else:
         return None
