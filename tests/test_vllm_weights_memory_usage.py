@@ -167,3 +167,11 @@ def test_embeddings_stay_16bit_whatever_their_name(monkeypatch):
     monkeypatch.setattr(torch.nn.Module, "named_modules", renamed)
     assert vllm_utils.vllm_weights_memory_usage(config, load_in_4bit = True) == quantized
     assert quantized > 512 * 64 * 2
+
+
+def test_keep_in_fp32_modules_stay_unpacked(monkeypatch):
+    config = _tiny_dense(quantization_config = {"quant_method": "fp8"})
+    quantized = vllm_utils.vllm_weights_memory_usage(config)
+    monkeypatch.setattr(Qwen3ForCausalLM, "_keep_in_fp32_modules", ["down_proj"], raising = False)
+    kept = vllm_utils.vllm_weights_memory_usage(config)
+    assert kept - quantized == pytest.approx(2 * 64 * 128 * (2 - 2 / (8/5)))

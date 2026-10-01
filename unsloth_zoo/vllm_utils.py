@@ -1863,6 +1863,11 @@ def vllm_weights_memory_usage(config, load_in_4bit = False, load_in_8bit = False
     # Parameters transformers never places on the accelerator (Qwen4Exp's n-gram
     # table), which vLLM also offloads to CPU by default (VLLM_PLE_CPU_OFFLOAD).
     no_placement = getattr(meta_model, "_no_placement_params", None) or []
+    # Model-declared full-precision modules (relative names, e.g. DeepSeek-V4 indexers)
+    keep_full = [
+        "." + x + "." for key in ("_keep_in_fp32_modules", "_keep_in_fp32_modules_strict")
+        for x in (getattr(meta_model, key, None) or [])
+    ]
     if os.environ.get("VLLM_PLE_CPU_OFFLOAD", "1").strip() == "0": no_placement = []
 
     # Quantizers pack Linear weights and stacked (3D) expert weights, never embeddings or convs.
@@ -1876,7 +1881,8 @@ def vllm_weights_memory_usage(config, load_in_4bit = False, load_in_8bit = False
             if any(name == x or name.endswith("." + x) for x in no_placement): continue
             packable = (isinstance(module, torch.nn.Linear) and param.ndim == 2) or \
                 (param.ndim == 3 and not isinstance(module, unpacked_types))
-            quantized = packable and "lm_head" not in name and not _skipped(name)
+            quantized = packable and "lm_head" not in name and not _skipped(name) \
+                and not any(x in "." + name + "." for x in keep_full)
             weight_bytes += param.numel() * (quantized_bytes if quantized else 2)
     del meta_model
     return int(weight_bytes)
