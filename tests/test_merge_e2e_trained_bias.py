@@ -118,3 +118,49 @@ def test_untrained_fp32_bias_survives_bf16_runtime(tmp_path):
         if key.endswith(".bias"):
             assert saved[key].dtype == torch.float32
             assert torch.equal(saved[key], value), key
+
+
+@pytest.mark.parametrize("quant_type", ["fp8", "mxfp4"])
+@pytest.mark.parametrize("split", [False, True])
+def test_rewrite_writers_apply_trained_bias(tmp_path, quant_type, split):
+    from collections import defaultdict
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+    from unsloth_zoo.saving_utils import _merge_and_overwrite_lora
+
+    if quant_type == "fp8" and not hasattr(torch, "float8_e4m3fn"):
+        pytest.skip("float8_e4m3fn unavailable")
+    H.set_offline_cpu_env()
+    torch.manual_seed(H.SEED)
+    W = torch.randn(32, 48) * 0.1
+    prefix = "model.layers.0.self_attn.q_proj"
+    if quant_type == "fp8":
+        scale = W.abs().amax(dim = 1, keepdim = True) / 448.0
+        shard = {prefix + ".weight": (W / scale).to(torch.float8_e4m3fn),
+                 prefix + ".weight_scale": scale.to(torch.bfloat16)}
+    else:
+        shard = {prefix + ".weight": W.to(torch.bfloat16)}
+    untrained = torch.randn(8)
+    shard["model.layers.0.mlp.up_proj.bias"] = untrained
+    bias_shard = {prefix + ".bias": torch.randn(32)}
+    shards = {"a.safetensors": shard, "b.safetensors": bias_shard} if split \
+        else {"a.safetensors": {**shard, **bias_shard}}
+    for name, tensors in shards.items():
+        save_file(tensors, str(tmp_path / name), metadata = {"format": "pt"})
+
+    trained = (bias_shard[prefix + ".bias"] + 0.5).to(torch.bfloat16)
+    biases = defaultdict(lambda: None, {prefix: trained})
+    for name in shards:
+        _merge_and_overwrite_lora(
+            save_directory = str(tmp_path), filename = name,
+            lora_weights = defaultdict(lambda: None), output_dtype = torch.bfloat16,
+            model_class_name = "LlamaForCausalLM", base_model_is_quantized = True,
+            quant_type = quant_type, biases = biases,
+        )
+    saved = {}
+    for name in shards:
+        with safe_open(str(tmp_path / name), framework = "pt", device = "cpu") as f:
+            saved.update({k: f.get_tensor(k) for k in f.keys()})
+    assert torch.equal(saved[prefix + ".bias"].float(), trained.float())
+    assert torch.equal(saved["model.layers.0.mlp.up_proj.bias"].float(),
+                       untrained.to(saved["model.layers.0.mlp.up_proj.bias"].dtype).float())
