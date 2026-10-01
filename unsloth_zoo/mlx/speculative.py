@@ -227,8 +227,10 @@ class DraftController:
         probe_backoff: int = 32,
         max_probe_backoff: int = 2048,
         explore_fraction: float = 0.02,
+        fixed_depth: bool = False,
     ):
         self.max_depth = max(0, int(max_depth))
+        self.fixed_depth = fixed_depth
         self.max_copy = max(0, int(max_copy)) if can_copy else 0
         self.max_width = 1 + max(self.max_depth, self.max_copy)
         self.acceptance_alpha = acceptance_alpha
@@ -263,7 +265,7 @@ class DraftController:
         self._measured_at: dict[tuple, int] = {}
         self._next_probe = probe_every
         # Halving depths: the widths between are extrapolated until a split round runs them.
-        self._warmup = sorted({self.max_depth >> shift for shift in range(self.max_depth.bit_length())}, reverse = True)
+        self._warmup = [self.max_depth] if fixed_depth else sorted({self.max_depth >> shift for shift in range(self.max_depth.bit_length())}, reverse = True)
         self._current: tuple | None = None
         self._window = min_window
         self._probing_sources: dict[int, str] = {}
@@ -357,7 +359,8 @@ class DraftController:
         for i, state in enumerate(rows):
             copy = self._cap(state, min(state.copy_available, self.max_copy, width - 1))
             base.append(RowPlan("copy", copy) if copy else RowPlan())
-            depth = self._cap(state, min(self.max_depth, width - 1))
+            depth = min(self.max_depth, width - 1)
+            depth = self._cap(state, 0 if self.fixed_depth and depth < self.max_depth else depth)
             if state.can_draft and depth:
                 draft = RowPlan("draft", depth)
                 gain = state.stats.expected(draft) - state.stats.expected(base[i])

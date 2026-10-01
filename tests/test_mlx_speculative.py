@@ -136,8 +136,9 @@ def test_controller_drafts_alone_but_not_in_a_wide_batch():
     machine = _Machine(draft_slope = 0.1, verify_slope = 0.12)
     controller = DraftController(max_depth = 3, can_copy = False)
     alone = _run(controller, machine, [([0.8, 0.6, 0.4], None)], rounds = 1000)
-    assert alone != "plain" and alone[0][0] == "draft"
+    assert alone == (("draft", 2),)
     assert _run(controller, machine, [([0.8, 0.6, 0.4], None)] * 8, rounds = 1000, seed = 1) == "plain"
+    assert _run(fixed := DraftController(max_depth = 3, can_copy = False, fixed_depth = True), machine, [([0.8, 0.6, 0.4], None)], rounds = 1000) == (("draft", 3),) and [fixed.draft_cost[d].value for d in (1, 2)] == [None, None]
     assert [controller.plain_cost[b].value for b in (1, 8)] == pytest.approx([machine.plain(1), machine.plain(8)])
 
 
