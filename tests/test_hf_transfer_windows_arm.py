@@ -81,7 +81,9 @@ def _fake_ctypes(*, native_machine = None, call_fails = False, api_absent = Fals
     return mod
 
 
-def _resolve(*, platform_name, machine, environ, offline = False, ctypes_module = None):
+def _resolve(
+    *, platform_name, machine, environ, offline = False, ctypes_module = None, hf_transfer_installed = True,
+):
     """Execute the three statements against a fake platform and return the env."""
     detect, assign, enable = _statements()
     env = dict(environ)
@@ -90,6 +92,7 @@ def _resolve(*, platform_name, machine, environ, offline = False, ctypes_module 
         "platform": types.SimpleNamespace(machine = lambda: machine),
         "os": types.SimpleNamespace(environ = env),
         "_offline_env": offline,
+        "_hf_transfer_installed": hf_transfer_installed,
     }
     body = [detect, assign, enable]
     code = compile(ast.Module(body = body, type_ignores = []), _INIT, "exec")
@@ -263,3 +266,18 @@ class TestWiring:
         # happily execute an assignment that really sits below its use.
         detect, assign, enable = _statements()
         assert detect.lineno < assign.lineno < enable.lineno
+
+
+class TestHfTransferNotInstalled:
+    """huggingface_hub < 1.0 refuses every download when the flag is on and the package is
+    missing, which is what failed tests/test_gemma3_processor_token_type_ids.py on the
+    transformers 4.57.6 leg. Leaving the flag off keeps the plain download path working."""
+
+    def test_missing_hf_transfer_leaves_the_flag_off(self):
+        env = _resolve(platform_name = "linux", machine = "x86_64", environ = {}, hf_transfer_installed = False)
+        assert "HF_HUB_ENABLE_HF_TRANSFER" not in env
+
+    def test_installed_hf_transfer_still_turns_it_on(self):
+        env = _resolve(platform_name = "linux", machine = "x86_64", environ = {})
+        assert env.get("HF_HUB_ENABLE_HF_TRANSFER") == "1"
+

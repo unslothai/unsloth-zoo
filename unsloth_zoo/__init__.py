@@ -67,11 +67,17 @@ def _detect_windows_on_arm() -> bool:
 
 _windows_on_arm = _detect_windows_on_arm()
 
+# Only when hf_transfer is importable: huggingface_hub < 1.0 honours the flag and refuses every
+# download ("'hf_transfer' package is not available") when it is not, as after a --no-deps install.
+import importlib.util as _importlib_util
+_hf_transfer_installed = _importlib_util.find_spec("hf_transfer") is not None
+
 # Hugging Face Hub faster downloads (skipped when offline mode is requested).
 if (
     "HF_HUB_ENABLE_HF_TRANSFER" not in os.environ
     and not _offline_env
     and not _windows_on_arm
+    and _hf_transfer_installed
 ):
     os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 
