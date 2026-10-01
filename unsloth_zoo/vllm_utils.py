@@ -1865,12 +1865,19 @@ def vllm_weights_memory_usage(config, load_in_4bit = False, load_in_8bit = False
     no_placement = getattr(meta_model, "_no_placement_params", None) or []
     if os.environ.get("VLLM_PLE_CPU_OFFLOAD", "1").strip() == "0": no_placement = []
 
-    weight_bytes = 0
-    for name, param in meta_model.named_parameters():
-        if any(name == x or name.endswith("." + x) for x in no_placement): continue
-        quantized = param.ndim >= 2 and "embed" not in name and "lm_head" not in name \
-            and not _skipped(name)
-        weight_bytes += param.numel() * (quantized_bytes if quantized else 2)
+    # Quantizers pack Linear weights and stacked (3D) expert weights, never embeddings or convs.
+    unpacked_types = (torch.nn.Embedding, torch.nn.modules.conv._ConvNd)
+    weight_bytes, seen = 0, set()
+    for module_name, module in meta_model.named_modules():
+        for param_name, param in module.named_parameters(recurse = False):
+            if id(param) in seen: continue
+            seen.add(id(param))
+            name = f"{module_name}.{param_name}" if module_name else param_name
+            if any(name == x or name.endswith("." + x) for x in no_placement): continue
+            packable = (isinstance(module, torch.nn.Linear) and param.ndim == 2) or \
+                (param.ndim == 3 and not isinstance(module, unpacked_types))
+            quantized = packable and "lm_head" not in name and not _skipped(name)
+            weight_bytes += param.numel() * (quantized_bytes if quantized else 2)
     del meta_model
     return int(weight_bytes)
 pass

@@ -22,6 +22,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
+import torch
 from transformers import Gemma3Config, GptOssConfig, Qwen3Config, Qwen3ForCausalLM, Qwen3MoeConfig, AutoModelForCausalLM
 
 from unsloth_zoo import vllm_utils
@@ -115,7 +116,7 @@ def test_mxfp4_experts_are_sized_packed_and_globs_excluded():
         "modules_to_not_convert": ["model.layers.*.self_attn", "model.layers.*.mlp.router", "model.embed_tokens", "lm_head"],
     }
     model = AutoModelForCausalLM.from_config(config)
-    experts = sum(p.numel() for n, p in model.named_parameters() if ".experts." in n and p.ndim >= 2)
+    experts = sum(p.numel() for n, p in model.named_parameters() if ".experts." in n and p.ndim == 3)
     assert bf16 - vllm_utils.vllm_weights_memory_usage(config) == pytest.approx(experts * (2 - 17 / 32))
 
 
@@ -149,3 +150,16 @@ def test_no_placement_params_are_not_charged(monkeypatch):
     assert full - vllm_utils.vllm_weights_memory_usage(config) == 64 * 128 * 2
     monkeypatch.setenv("VLLM_PLE_CPU_OFFLOAD", "0")
     assert vllm_utils.vllm_weights_memory_usage(config) == full
+
+
+def test_embeddings_stay_16bit_whatever_their_name(monkeypatch):
+    config = _tiny_dense()
+    quantized = vllm_utils.vllm_weights_memory_usage(config, load_in_4bit = True)
+    # MPT / DBRX name the token embedding transformer.wte
+    real_named_modules = torch.nn.Module.named_modules
+    def renamed(self, *args, **kwargs):
+        for name, module in real_named_modules(self, *args, **kwargs):
+            yield name.replace("embed_tokens", "wte"), module
+    monkeypatch.setattr(torch.nn.Module, "named_modules", renamed)
+    assert vllm_utils.vllm_weights_memory_usage(config, load_in_4bit = True) == quantized
+    assert quantized > 512 * 64 * 2
