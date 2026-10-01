@@ -22,7 +22,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
-from transformers import Gemma3Config, GptOssConfig, Qwen3Config, Qwen3MoeConfig, AutoModelForCausalLM
+from transformers import Gemma3Config, GptOssConfig, Qwen3Config, Qwen3ForCausalLM, Qwen3MoeConfig, AutoModelForCausalLM
 
 from unsloth_zoo import vllm_utils
 
@@ -62,8 +62,8 @@ def test_moe_experts_change_the_kv_estimate(monkeypatch):
     assert counted[3] == pytest.approx(free / 2**30)
 
 
-def test_skip_modules_match_checkpoint_key_spelling():
-    config = Gemma3Config(
+def _tiny_gemma3():
+    return Gemma3Config(
         text_config = dict(
             vocab_size = 512, hidden_size = 64, intermediate_size = 128,
             num_hidden_layers = 2, num_attention_heads = 4, num_key_value_heads = 2,
@@ -75,6 +75,10 @@ def test_skip_modules_match_checkpoint_key_spelling():
         ),
         mm_tokens_per_image = 4,
     )
+
+
+def test_skip_modules_match_checkpoint_key_spelling():
+    config = _tiny_gemma3()
     quantized = vllm_utils.vllm_weights_memory_usage(config, load_in_4bit = True)
     config.quantization_config = {"llm_int8_skip_modules": ["language_model.model.layers.0.mlp"]}
     skipped = vllm_utils.vllm_weights_memory_usage(config, load_in_4bit = True)
@@ -126,3 +130,20 @@ def test_fp8_modules_to_not_convert_stay_16bit():
 def test_unsized_quant_formats_fall_back():
     config = _tiny_dense(quantization_config = {"quant_method": "compressed-tensors"})
     assert vllm_utils.vllm_weights_memory_usage(config) is None
+
+
+def test_text_layer_alias_does_not_skip_vision_layer():
+    config = _tiny_gemma3()
+    quantized = vllm_utils.vllm_weights_memory_usage(config, load_in_4bit = True)
+    config.quantization_config = {"llm_int8_skip_modules": ["model.layers.0.mlp"]}
+    skipped = vllm_utils.vllm_weights_memory_usage(config, load_in_4bit = True)
+    assert skipped - quantized == pytest.approx(3 * 64 * 128 * (2 - 2 / (16/5)))
+
+
+def test_no_placement_params_are_not_charged(monkeypatch):
+    config = _tiny_dense()
+    full = vllm_utils.vllm_weights_memory_usage(config)
+    monkeypatch.setattr(
+        Qwen3ForCausalLM, "_no_placement_params", ["model.layers.0.mlp.down_proj.weight"], raising = False,
+    )
+    assert full - vllm_utils.vllm_weights_memory_usage(config) == 64 * 128 * 2

@@ -1843,17 +1843,32 @@ def vllm_weights_memory_usage(config, load_in_4bit = False, load_in_8bit = False
     except Exception:
         pass
 
-    # Checkpoint keys say language_model.model.layers, modules model.language_model.layers.
+    # Checkpoint keys say language_model.model.layers, modules model.language_model.layers,
+    # and vLLM aliases say model.layers. Dotted entries are anchored so a text-layer alias
+    # never matches the vision tower's layer of the same index.
     def _norm(name):
         return "." + ".".join(x for x in name.split(".") if x != "model") + "."
     skip_modules = []
     for key in ("llm_int8_skip_modules", "modules_to_not_convert", "ignored_layers"):
-        skip_modules += ["*" + _norm(x) + "*" for x in (quant_config.get(key, None) or [])]
+        skip_modules += quant_config.get(key, None) or []
+    def _skipped(name):
+        name = _norm(name)
+        names = (name, name[len(".language_model"):]) if name.startswith(".language_model.") else (name,)
+        for module in skip_modules:
+            if "." not in module:
+                if fnmatch.fnmatchcase(name, "*." + module + ".*"): return True
+            elif any(fnmatch.fnmatchcase(x, _norm(module) + "*") for x in names):
+                return True
+        return False
+    # Parameters transformers never places on the accelerator (Qwen4Exp's n-gram
+    # table), which vLLM also offloads to CPU by default (VLLM_PLE_CPU_OFFLOAD).
+    no_placement = getattr(meta_model, "_no_placement_params", None) or []
 
     weight_bytes = 0
     for name, param in meta_model.named_parameters():
+        if any(name == x or name.endswith("." + x) for x in no_placement): continue
         quantized = param.ndim >= 2 and "embed" not in name and "lm_head" not in name \
-            and not any(fnmatch.fnmatchcase(_norm(name), module) for module in skip_modules)
+            and not _skipped(name)
         weight_bytes += param.numel() * (quantized_bytes if quantized else 2)
     del meta_model
     return int(weight_bytes)
