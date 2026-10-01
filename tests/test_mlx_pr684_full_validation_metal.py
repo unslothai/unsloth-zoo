@@ -178,8 +178,7 @@ def test_sgd_coupled_weight_decay_e2e(tmp_path):
 @metal_only
 @pytest.mark.parametrize("optim_name", ["adam", "adam_8bit"])
 def test_adam_weight_decay_moves_weights_e2e(tmp_path, optim_name):
-    """Adam's weight_decay must reach the update: wd > 0 diverges from wd = 0 by
-    far more than a repeated wd = 0 run (the Metal noise floor)."""
+    """wd > 0 must move LoRA weights well past a repeated wd = 0 run (noise floor)."""
     import mlx.core as mx
     from mlx.utils import tree_flatten
 

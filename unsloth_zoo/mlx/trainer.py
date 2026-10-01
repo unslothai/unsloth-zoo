@@ -3904,8 +3904,7 @@ class MLXTrainer:
                 **adam_kwargs,
             )
         elif opt_name == "adam":
-            # torch.optim.Adam applies weight decay as L2 (grad += wd * param),
-            # and MLX Adam has no weight_decay, so use the SGD coupled path.
+            # torch Adam's weight_decay is coupled L2; MLX Adam has none.
             self._coupled_weight_decay = float(wd or 0.0)
             optimizer = optim.Adam(
                 learning_rate=initial_lr,

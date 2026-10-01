@@ -1326,8 +1326,7 @@ def test_sgd_weight_decay_is_coupled_not_decoupled():
 
 @pytest.mark.parametrize("optim_name", ["adam", "adam_8bit"])
 def test_adam_weight_decay_is_coupled(optim_name):
-    """torch.optim.Adam folds weight decay into the gradient (L2), so Adam must
-    route it through coupled decay instead of silently dropping it."""
+    """Adam weight decay is coupled L2 (torch.optim.Adam), never dropped."""
     import mlx.core as mx
     from mlx.utils import tree_flatten
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
@@ -1348,7 +1347,7 @@ def test_adam_weight_decay_is_coupled(optim_name):
 
     grad = {"proj": {"weight": mx.array([[1.0, 1.0]]), "bias": mx.array([1.0])}}
     flat = dict(tree_flatten(trainer._apply_coupled_weight_decay(trainer.model, grad)))
-    # g + wd * p on the weight; bias stays exempt as in HF param groups.
+    # Bias exempt, as in HF param groups.
     assert flat["proj.weight"].tolist()[0] == pytest.approx([1.0 + wd * 2.0, 1.0 + wd * -4.0])
     assert flat["proj.bias"].tolist() == pytest.approx([1.0])
 
