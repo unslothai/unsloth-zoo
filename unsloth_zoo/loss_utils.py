@@ -207,10 +207,9 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
             labels = labels.reshape(1, -1) if labels.dim() < 2 else labels.reshape(-1, labels.shape[-1])
             logits = logits.view(*labels.shape, logits.shape[-1])
         shift_logits = logits
-        shift_labels = torch.empty_like(labels)
+        shift_labels = torch.empty_like(labels, device = shift_logits.device)
         shift_labels[..., :-1] = labels[..., 1:]
         shift_labels[..., -1] = ignore_index
-        shift_labels = shift_labels.to(shift_logits.device, non_blocking = True)
         loss = unsloth_fixed_cross_entropy(shift_logits, shift_labels, num_items_in_batch, ignore_index, **kwargs)
         return loss
     pass
