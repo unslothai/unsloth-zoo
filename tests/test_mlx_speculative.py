@@ -142,6 +142,13 @@ def test_controller_drafts_alone_but_not_in_a_wide_batch():
     assert [controller.plain_cost[b].value for b in (1, 8)] == pytest.approx([machine.plain(1), machine.plain(8)])
 
 
+def test_a_draft_probe_shrinks_to_the_deepest_depth_the_credit_affords():
+    controller = DraftController(max_depth = 8, can_copy = False)
+    _run(controller, _Machine(draft_slope = 0.3, verify_slope = 0.3, overhead = 1.7), [([0.5, 0.2] + [0.1] * 6, None)], rounds = 400)
+    controller._credit = 1.5
+    assert controller.plan([RowState(controller.new_reply())]).rows == (RowPlan("draft", 3),)
+
+
 def test_fused_rounds_learn_how_much_drafting_they_hide():
     controller = DraftController(max_depth = 2, can_copy = False, split_every = 4)
     state = [RowState(controller.new_reply())]

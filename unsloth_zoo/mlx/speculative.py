@@ -424,9 +424,14 @@ class DraftController:
         candidates = [plain] + list(rounds.values())
         chosen, probing = self._choose(candidates, rows, bucket)
         if not probing:
-            probe, sources = self._source_probe(chosen, rows)
-            if sources and self._affordable(probe, chosen, rows):
-                chosen, self._probing_sources, self._reference = probe, sources, self.score(chosen, rows)
+            # The deepest affordable draft probe: a full-depth one may not fit the credit a reply earns.
+            for depth in ([self.max_depth] if self.fixed_depth else range(self.max_depth, 1, -1)) or [self.max_depth]:
+                probe, sources = self._source_probe(chosen, rows, depth)
+                if sources and self._affordable(probe, chosen, rows):
+                    chosen, self._probing_sources, self._reference = probe, sources, self.score(chosen, rows)
+                    break
+                if "draft" not in sources.values():
+                    break
         # A probe's first round re-measures the parts; the rest run fused, as a winner would.
         starting = probing and self._probe_left == self.probe_rounds - 1
         if chosen.kind == "round" and (starting or not self._measured_parts(chosen, rows)):
@@ -497,11 +502,11 @@ class DraftController:
     def _shorten(self, plan: RoundPlan) -> RoundPlan:
         return RoundPlan("plain", min(self.min_window, plan.length)) if plan.kind == "plain" else plan
 
-    def _available(self, state: RowState, source: str) -> int:
+    def _available(self, state: RowState, source: str, depth: int | None = None) -> int:
         if source == "copy":
             return self._cap(state, min(state.copy_available, self.max_copy, self._COPY_PROBE))
-        # Full depth: a shallower probe never re-measures the deeper positions.
-        return self._cap(state, self.max_depth) if state.can_draft else 0
+        # Full depth by default: a shallower probe never re-measures the deeper positions.
+        return self._cap(state, depth or self.max_depth) if state.can_draft else 0
 
     def _due(self, state: RowState, source: str) -> bool:
         return bool(self._available(state, source)) and state.stats.tokens >= state.stats.probe_at[source]
@@ -518,7 +523,7 @@ class DraftController:
         if self._reference is not None:
             self._credit -= seconds * max(0.0, 1.0 - emitted / (seconds * self._reference))
 
-    def _source_probe(self, plan: RoundPlan, rows: Sequence[RowState]) -> tuple[RoundPlan, dict[int, str]]:
+    def _source_probe(self, plan: RoundPlan, rows: Sequence[RowState], depth: int | None = None) -> tuple[RoundPlan, dict[int, str]]:
         # A source that loses gets no samples to win back with, whatever beat it, so each row
         # retries its unused sources, exponentially less often while they keep losing.
         base = list(plan.rows) if plan.kind == "round" else [RowPlan()] * len(rows)
@@ -530,7 +535,7 @@ class DraftController:
             ]
             if due:
                 source = min(due, key = lambda source: state.stats.probe_at[source])
-                base[i] = RowPlan(source, self._available(state, source))
+                base[i] = RowPlan(source, self._available(state, source, depth))
                 probing[i] = source
         return (RoundPlan("round", rows = tuple(base)), probing) if probing else (plan, probing)
 
