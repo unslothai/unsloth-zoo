@@ -3216,7 +3216,9 @@ $LOGITSCALINGMULTIPLY$
 $LOGITSCALINGDIVISION$
 $LOGITSOFTCAPPING$
 loss = None
-if labels is not None:$SPACES$loss = self.loss_function($NEWLINES$$LOGITS$,$NEWLINES$$LABELS$,$NEWLINES$$VOCABSIZE$$KWARGS$,?$NEWLINES$)
+if labels is not None:$SPACES$
+$LOGITSUPCAST$
+loss = self.loss_function($NEWLINES$$LOGITS$,$NEWLINES$$LABELS$,$NEWLINES$$VOCABSIZE$$KWARGS$,?$NEWLINES$)
 """
 
 cross_entropy_replacement_2 = """
