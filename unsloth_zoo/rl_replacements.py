@@ -2026,8 +2026,7 @@ def grpo_accumulated_loss(
                 detached_hidden_states = hidden_states.detach().contiguous()
                 ctx.device = hidden_states.device
                 ctx.copy_event = None
-                # Recompute the head matmul under the same autocast state as
-                # forward, even when backward runs outside that context.
+                # Backward runs outside autocast; recompute must match forward (torch.utils.checkpoint does the same).
                 ctx.autocast_kwargs = dict(
                     device_type = lm_head.device.type,
                     enabled = torch.is_autocast_enabled(lm_head.device.type),

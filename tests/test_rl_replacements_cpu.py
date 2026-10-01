@@ -1195,8 +1195,7 @@ def test_offloaded_log_softmax_preserves_preexisting_head_grad():
 
 @pytest.mark.parametrize("lm_requires_grad", [False, True])
 def test_offloaded_log_softmax_recompute_restores_forward_autocast(lm_requires_grad):
-    # GRPO runs forward under autocast and backward outside it; an fp32 head
-    # recomputed without autocast gives fp32 gradients that differ from forward.
+    # Forward under autocast, backward outside it: an fp32 head must not recompute in fp32.
     Fn = _extract_offloaded_log_softmax(_eager_selective_log_softmax)
     args = (4, 0.0, 0.0, 0.0, 1.0)
 
