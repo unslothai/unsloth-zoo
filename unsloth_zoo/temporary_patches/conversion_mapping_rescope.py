@@ -33,9 +33,8 @@ Upstream fixed it in 5.6.0 (PR #45567) by scoping each transform instead of rewr
 patterns; this re-scopes the leaked renaming the same way for 5.4.0 and 5.5.0 through 5.5.4.
 
 It lives here rather than only in `unsloth/import_fixes.py` because this package owns the
-`Linear4bit` patch that reports the failure, is importable without `unsloth`, and caps
-transformers at 5.5.0 on Apple Silicon in its own `pyproject.toml`, putting every Mac install
-inside the window by construction. `unsloth`'s copy defers to this one when present.
+`Linear4bit` patch that reports the failure and is importable without `unsloth`.
+`unsloth`'s copy defers to this one when present.
 
 Neither gate is a version number. The install gate asks whether this transformers has any of
 the shapes upstream has used for per-submodule scoping; the call gate only touches a renaming
