@@ -94,6 +94,18 @@ jobs:
         # scripts/dynamic_exec_allowlist.json.
         run: python scripts/lint_dynamic_exec.py
 
+      - name: Untrusted-sink gate self-test
+        run: python scripts/lint_untrusted_sinks.py --self-test
+
+      - name: No new untrusted value reaching an execution sink
+        # The two gates above ask whether exec/eval/compile got a literal. This one asks
+        # a different question, about sinks that are meant to take a computed argument:
+        # dynamic import, sys.path, getattr on a module, trust_remote_code, and code
+        # fetched with no revision. It taints a value read out of a downloaded artefact
+        # and follows it across functions and files. Reviewed sites live in
+        # scripts/untrusted_sinks_baseline.json.
+        run: python scripts/lint_untrusted_sinks.py
+
       - name: Workflow triggers (pull_request_target / cache-poisoning)
         # Also a job in security-audit.yml, but that workflow's pull_request paths do not
         # list .github/workflows/**, so the one change this most needs to see -- a workflow
