@@ -1232,8 +1232,11 @@ def nax_quantized_linear(model):
                     and nax.gap_open("small_m_qmm")
                     and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)):
                 classes = _nax_qmm_classes(nn.QuantizedLinear.__call__, nn.QuantizedEmbedding.as_linear)
-                candidates = []
+                candidates, seen = [], set()
                 for _, module in model.named_modules() if hasattr(model, "named_modules") else ():
+                    if id(module) in seen:   # named_modules() yields a shared module once per path
+                        continue
+                    seen.add(id(module))
                     base = type(module)
                     if base in classes.values():
                         if getattr(module, "_unsloth_nax_qmm_scopes", 0):

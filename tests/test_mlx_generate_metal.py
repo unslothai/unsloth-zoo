@@ -1108,6 +1108,20 @@ def test_nax_quantized_linear_scope_stays_native(monkeypatch, blocker):
         assert (type(model.proj) is nn.QuantizedLinear) is (blocker is not None)
 
 
+def test_nax_quantized_linear_scope_swaps_a_shared_module_once(monkeypatch):
+    from unsloth_zoo.mlx import inference, nax
+
+    model = _QuantizedHead()
+    model.alias = model.proj   # reachable under two paths, as tied or shared modules are
+    monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {nax._gpu_generation(): _EVERY_ROW})
+    monkeypatch.setattr(nax, "nax_available", lambda: True)
+    monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: True)
+    with inference.nax_quantized_linear(model):
+        assert type(model.alias).__name__ == "_NaxSmallMQuantizedLinear"
+        assert model.proj._unsloth_nax_qmm_scopes == 1
+    assert type(model.proj) is nn.QuantizedLinear and "_unsloth_nax_qmm_rows" not in model.proj
+
+
 @pytest.mark.parametrize("vlm", [False, True], ids = ["text", "vlm"])
 def test_loader_generate_enters_the_nax_scope(monkeypatch, vlm):
     from contextlib import contextmanager
