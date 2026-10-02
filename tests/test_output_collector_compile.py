@@ -16,6 +16,7 @@
 
 
 """A capture hook inside a compiled submodule reads the eagerly set collector without a graph break."""
+import contextvars
 import subprocess
 import sys
 import textwrap
@@ -129,3 +130,18 @@ def test_overlapping_threads_never_read_each_others_collector(monkeypatch):
     assert seen["overlap"] is False
     assert seen["after_a_reset"] == (True, True)
     assert var._unsloth_eager_single and _compiled_get(var, monkeypatch) is None
+
+
+def test_overlapping_same_thread_contexts_never_read_each_others_collector(monkeypatch):
+    # asyncio tasks or greenlets share one thread but each runs in its own context.
+    var = _patched_var("contexts")
+    a, b = {"k": []}, {"k": []}
+    ctx_a, ctx_b = contextvars.copy_context(), contextvars.copy_context()
+    token_a = ctx_a.run(var.set, a)
+    token_b = ctx_b.run(var.set, b)
+    assert var._unsloth_eager_single is False
+    assert ctx_a.run(_compiled_get, var, monkeypatch) is a
+    ctx_a.run(var.reset, token_a)
+    assert var._unsloth_eager_single and _compiled_get(var, monkeypatch) is b
+    ctx_b.run(var.reset, token_b)
+    assert _compiled_get(var, monkeypatch) is None

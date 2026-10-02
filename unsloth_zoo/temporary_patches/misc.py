@@ -3165,8 +3165,10 @@ def patch_output_collector_for_compiled_submodules():
     lock = threading.Lock()
 
     def refresh(self, active):
-        # Mirror only while every active context is on one thread; overlapping threads read their own ContextVar.
-        if len({tid for _, tid, _ in active}) <= 1:
+        # Mirror only while the active sets form one nested chain on one thread (each set saw the previous
+        # value as its old value). Overlapping threads, asyncio tasks or greenlets read their own ContextVar.
+        nested = all(active[i][0].old_value is active[i - 1][2] for i in range(1, len(active)))
+        if nested and len({tid for _, tid, _ in active}) <= 1:
             self._unsloth_eager_value = active[-1][2] if active else None
             self._unsloth_eager_single = True
         else:
