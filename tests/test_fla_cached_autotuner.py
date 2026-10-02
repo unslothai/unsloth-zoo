@@ -21,9 +21,13 @@ import pathlib
 from unittest.mock import patch
 
 import pytest
+from packaging import version
 
 pytest.importorskip("torch")
 triton = pytest.importorskip("triton")
+# fla_vendor._MIN_TRITON: older triton never loads the vendored fla.
+if version.parse(triton.__version__.split("+")[0]) < version.parse("3.3"):
+    pytest.skip("vendored fla needs triton>=3.3", allow_module_level=True)
 tl = triton.language
 Autotuner = triton.runtime.autotuner.Autotuner
 
@@ -45,7 +49,10 @@ def tuner(cache_mod):
         pass
 
     configs = [triton.Config({}, num_warps=w) for w in (1, 2)]
-    return cache_mod.fla_cache_autotune(configs=configs, key=["N"])(kernel)
+    try:
+        return cache_mod.fla_cache_autotune(configs=configs, key=["N"])(kernel)
+    except RuntimeError as e:  # older triton (3.3) needs an active GPU driver to build an Autotuner
+        pytest.skip(f"no triton driver: {e}")
 
 
 @pytest.mark.parametrize(
