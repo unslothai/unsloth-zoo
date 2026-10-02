@@ -2,8 +2,8 @@
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
 # This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
 # This program is distributed in the hope that it will be useful,
@@ -94,7 +94,7 @@ def test_named_only_adapter_matches_peft(tmp_path):
     assert weight_err < 1e-5 and logit_err < 1e-4, (weight_err, logit_err)
 
 
-def test_partial_targets_and_missing_saved_module(tmp_path):
+def test_partial_targets_and_missing_saved_module(tmp_path, capsys):
     # `task` targets only q_proj and saves no lm_head: k_proj and lm_head must stay base.
     adapters = [
         ("default", ["q_proj", "k_proj"], 2, 4, ["lm_head"]),
@@ -102,6 +102,7 @@ def test_partial_targets_and_missing_saved_module(tmp_path):
     ]
     weight_err, logit_err = _merge_and_compare(tmp_path, adapters, "task")
     assert weight_err < 1e-5 and logit_err < 1e-4, (weight_err, logit_err)
+    assert "LoRA count mismatch" not in capsys.readouterr().out
 
 
 def test_default_adapter_unchanged(tmp_path):

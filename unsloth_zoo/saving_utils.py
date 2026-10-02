@@ -530,6 +530,17 @@ def _get_active_adapter(module):
 pass
 
 
+def _has_active_adapter(module):
+    adapter = _get_active_adapter(module)
+    for attr in ("lora_A", "lora_embedding_A"):
+        try:
+            if adapter in getattr(module, attr): return True
+        except Exception:
+            continue
+    return False
+pass
+
+
 def _get_modules_to_save_weight(module, attr = "weight"):
     modules_to_save = getattr(module, "modules_to_save", None)
     if modules_to_save is None:
@@ -713,6 +724,7 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
     remove_keys = set()
     keep_keys   = set()
     _embedding_lora_keys = set()
+    _untargeted_keys = set()
 
     inner_model = find_lora_base_model(model)
     for name, module in inner_model.named_modules():
@@ -750,6 +762,7 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
             lora_weights[name].parameter_name = getattr(module, "parameter_name", None)
             scaling_count += 1
             expand_module_keys(name, module, remove_keys)
+            if not _has_active_adapter(module): _untargeted_keys.add(name)
 
         # LoRA wrappers (MoE/quant/older peft) not subclassing Linear_LoRA_Layers:
         # capture alpha so counts align. Require lora_A/lora_B so a non-LoRA module
@@ -761,6 +774,7 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
             lora_weights[name].parameter_name = getattr(module, "parameter_name", None)
             scaling_count += 1
             expand_module_keys(name, module, remove_keys)
+            if not _has_active_adapter(module): _untargeted_keys.add(name)
 
         elif name.endswith(".base_layer"):
             lora_weights[name[:-len(".base_layer")]].module = module
@@ -830,6 +844,13 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
                 "dropped). Fine-tune such layers without DoRA, or open an issue at "
                 "https://github.com/unslothai/unsloth/issues."
             )
+
+    # Layers the active adapter does not target merge as their base weight; keep them out of the count check.
+    for _key in _untargeted_keys:
+        _stats = lora_weights[_key]
+        if _stats.lora_A is None and _stats.lora_B is None:
+            scaling_count -= 1
+            if _stats.module is not None: module_count -= 1
 
     if not (module_count == lora_A_count == lora_B_count == scaling_count):
         print(
