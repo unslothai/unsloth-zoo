@@ -59,6 +59,11 @@ from .log import logger
 import triton
 import regex
 from .peft_utils import get_lora_layer_modules
+from unsloth_zoo.temporary_patches.mhc_sinkhorn import (
+    MHC_SINKHORN_SOURCE,
+    MHC_SINKHORN_REPLACEMENT,
+    mhc_fast_mode,
+)
 from importlib.metadata import version as importlib_version
 import functools
 from .compiler_replacements import compiler_replacements
@@ -229,6 +234,34 @@ MODEL_FUNCTION_SOURCE_REWRITES = {
         ),
     },
 }
+
+
+# {model_type: {class: (old, new, mode)}}: a class whose forward contains `old` exactly once leaves
+# DISABLE_COMPILE_MODULES. mode() -> None (stay listed), "stock" (compile unchanged), else apply old -> new.
+MODULE_FORWARD_SOURCE_REWRITES = {
+    "deepseek_v4": {
+        "DeepseekV4HyperConnection": (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_mode),
+    },
+    "deepseek_v41": {
+        "DeepseekV41HyperConnection": (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_mode),
+    },
+}
+
+
+def module_forward_source_rewrites(modeling_file, model_type):
+    applicable = {}
+    for name, (old, new, mode) in MODULE_FORWARD_SOURCE_REWRITES.get(model_type, {}).items():
+        try:
+            mode = mode()
+            if not mode:
+                continue
+            cls = getattr(modeling_file, name)
+            source = inspect.getsource(_unwrap_undecorated_method(cls.forward, cls.__qualname__))
+        except Exception:
+            continue
+        if source.count(old) == 1:
+            applicable[name] = source if mode == "stock" else source.replace(old, new)
+    return applicable
 
 
 def model_function_source_rewrites(modeling_file, model_type):
@@ -2019,6 +2052,8 @@ def create_new_function(
         imports += "from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback\n"
     if "torch_compiler_disable_unless_decode" in new_source:
         imports += "from unsloth_zoo.temporary_patches.utils import torch_compiler_disable_unless_decode\n"
+    if "unsloth_sinkhorn_knopp" in new_source:
+        imports += "from unsloth_zoo.temporary_patches.mhc_sinkhorn import unsloth_sinkhorn_knopp\n"
     if "torch_compile" in new_source:
         imports += "from unsloth_zoo.temporary_patches.common import torch_compile\n"
     if "_maybe_compile" in new_source:
@@ -5148,8 +5183,7 @@ DISABLE_COMPILE_MODULES = [
     "Gemma4VisionEncoder",
     "Gemma4VisionEncoderLayer",
     "Gemma4MultimodalEmbedder",
-    # DeepSeek-V4 hyper-connection mixers: Inductor's fused backward of their
-    # Sinkhorn-Knopp division chain overflows to inf; tiny modules, so eager is cheap.
+    # DeepSeek-V4 mixers: HyperConnection leaves via MODULE_FORWARD_SOURCE_REWRITES (#859 saw inf grads compiled).
     "DeepseekV4HyperConnection",
     "DeepseekV4HyperHead",
     "DeepseekV41HyperConnection",
@@ -5519,6 +5553,7 @@ def unsloth_compile_transformers(
     disable_compile_functions.update(DISABLE_COMPILE_MODEL_FUNCTIONS.get(model_type, ()))
     function_source_rewrites = model_function_source_rewrites(modeling_file, model_type)
     disable_compile_functions.difference_update(function_source_rewrites)
+    module_forward_rewrites = module_forward_source_rewrites(modeling_file, model_type)
 
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__"):
         # Get __UNSLOTH_SUPPORTS_SDPA__
@@ -6154,7 +6189,9 @@ def unsloth_compile_transformers(
         pass
 
         # if more modules need to be disabled consider adding to a global list
-        if any([module.endswith(x) for x in DISABLE_COMPILE_MODULES]):
+        if module not in module_forward_rewrites and any(
+            [module.endswith(x) for x in DISABLE_COMPILE_MODULES]
+        ):
             print(
                 f"Unsloth: Disabling compile for {module} since it's marked for disabling."
             )
@@ -6191,7 +6228,9 @@ def unsloth_compile_transformers(
 
     if len(pretrained_modules) > 0:
         for module in pretrained_modules:
-            if any([module.endswith(x) for x in DISABLE_COMPILE_MODULES]):
+            if module not in module_forward_rewrites and any(
+                [module.endswith(x) for x in DISABLE_COMPILE_MODULES]
+            ):
                 print(
                     f"Unsloth: Disabling compile for {module} since it's marked for disabling."
                 )
@@ -6228,6 +6267,7 @@ def unsloth_compile_transformers(
                     functions,
                     fullgraph=False if module in no_fullgraph_modules else fullgraph,
                     disable=disable,
+                    forward_source=module_forward_rewrites.get(module),
                 )
                 print(f"Unsloth: Compiled module {module}.")
                 all_standalone_classes[module] = new_module

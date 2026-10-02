@@ -84,6 +84,7 @@ TEMPORARY_PATCHES_SUBMODULES = [
     "unsloth_zoo.temporary_patches.ministral",
     "unsloth_zoo.temporary_patches.amd_aiter",
     "unsloth_zoo.temporary_patches.fp8_uncontained_weights",
+    "unsloth_zoo.temporary_patches.mhc_sinkhorn",
     "unsloth_zoo.temporary_patches.misc",
     "unsloth_zoo.temporary_patches.muse_glimmer_banded_attention",
     "unsloth_zoo.temporary_patches.mixtral_moe",
