@@ -3168,7 +3168,7 @@ def patch_output_collector_for_compiled_submodules():
         # Mirror only while the active sets form one nested chain on one thread (each set saw the previous
         # value as its old value). Overlapping threads, asyncio tasks or greenlets read their own ContextVar.
         nested = all(active[i][0].old_value is active[i - 1][2] for i in range(1, len(active)))
-        if nested and len({tid for _, tid, _ in active}) <= 1:
+        if nested and len({tid for _, tid, _ in active}) <= 1 and not self.__dict__.get("_unsloth_eager_unordered"):
             self._unsloth_eager_value = active[-1][2] if active else None
             self._unsloth_eager_single = True
         else:
@@ -3200,6 +3200,10 @@ def patch_output_collector_for_compiled_submodules():
                 active = self.__dict__.get("_unsloth_eager_active") or []
                 for i in range(len(active) - 1, -1, -1):
                     if active[i][0] is token:
+                        # An out-of-order reset of one chain leaves a value the stack cannot describe
+                        # (ContextVar restores token.old_value): fall back to the ContextVar for good.
+                        if i != len(active) - 1 and self.__dict__.get("_unsloth_eager_single", True):
+                            self._unsloth_eager_unordered = True
                         del active[i]
                         break
                 refresh(self, active)

@@ -145,3 +145,16 @@ def test_overlapping_same_thread_contexts_never_read_each_others_collector(monke
     assert var._unsloth_eager_single and _compiled_get(var, monkeypatch) is b
     ctx_b.run(var.reset, token_b)
     assert _compiled_get(var, monkeypatch) is None
+
+
+def test_out_of_order_reset_falls_back_to_the_context_var(monkeypatch):
+    var = _patched_var("unordered")
+    a, b = {"k": []}, {"k": []}
+    t1 = var.set(a)
+    t2 = var.set(b)
+    var.reset(t1)
+    assert var.get() is None and _compiled_get(var, monkeypatch) is None
+    var.reset(t2)
+    assert var.get() is a and _compiled_get(var, monkeypatch) is a
+    var.set(b)
+    assert var._unsloth_eager_single is False
