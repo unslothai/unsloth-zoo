@@ -1984,3 +1984,20 @@ def test_block_swap_plan_keeps_a_tied_embedding():
     plan = plan_block_swap(model = model, max_memory = {0: sizes[""] + 100 - 1}, reserve_bytes = 100,
                            offload_embedding = True)
     assert not plan.offload_embedding and plan.layers > 0
+
+
+def test_block_swap_plan_streams_extra_token_tables_of_a_tied_model(monkeypatch):
+    # Gemma 3n / 4: the input embedding is tied, but the per-layer table is not and moves to host
+    # during the load, so it counts against neither the load nor training.
+    from unsloth_zoo import block_swap
+    from unsloth_zoo.device_map_planner import plan_block_swap
+    model = _meta(layers = 8, tie = True)
+    model.per_layer = nn.Embedding(512, 64, device = "meta")
+    extra = 512 * 64 * 4
+    monkeypatch.setattr(block_swap, "EXTRA_EMBEDDING_MIN_BYTES", extra)
+    total = _compute_module_sizes(model)[""]
+    budget = total + 100 - extra // 2
+    plan = plan_block_swap(model = model, max_memory = {0: budget}, reserve_bytes = 100, offload_embedding = True)
+    assert plan.offload_embedding and plan.layers == 0 and plan.embedding_bytes == extra
+    plan = plan_block_swap(model = model, max_memory = {0: budget}, reserve_bytes = 100)
+    assert not plan.offload_embedding and plan.layers > 0

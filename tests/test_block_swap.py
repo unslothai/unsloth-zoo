@@ -629,11 +629,12 @@ def test_enter_leave_follow_explicit_indices():
 def test_reserve_estimate_scales_with_tokens():
     from types import SimpleNamespace
     cfg = SimpleNamespace(hidden_size = 4096, vocab_size = 128256)
-    one = estimate_training_reserve_bytes(cfg, 2048, safety_bytes = 0)
-    four = estimate_training_reserve_bytes(cfg, 2048, batch_size = 4, safety_bytes = 0)
+    one = estimate_training_reserve_bytes(cfg, 2048, safety_bytes = 0, fragmentation = 0)
+    four = estimate_training_reserve_bytes(cfg, 2048, batch_size = 4, safety_bytes = 0, fragmentation = 0)
     # Activations scale with tokens; logits are capped at 2048 rows.
     assert four - one == 3 * 2048 * 4096 * 48
-    assert estimate_training_reserve_bytes(cfg, 2048, extra_bytes = 7, safety_bytes = 0) == one + 7
+    assert estimate_training_reserve_bytes(cfg, 2048, extra_bytes = 7, safety_bytes = 0, fragmentation = 0) == one + 7
+    assert estimate_training_reserve_bytes(cfg, 2048, safety_bytes = 0) == one + one // 16
 
 
 def test_auto_swap_indices_takes_only_the_shortfall():
@@ -661,4 +662,102 @@ def test_block_on_another_card_gets_its_inputs_moved():
     sw = BlockSwap(blocks, [1], prefetch_depth = 1)
     out = blocks[1](blocks[0](x, enc), enc)
     assert out.device.index == 1 and torch.equal(out, ref)
+    sw.remove()
+
+
+def test_hooks_are_opaque_to_torch_compile():
+    # Stream copies and `.data` swaps cannot be traced: a compiled caller must break around them.
+    layers = nn.ModuleList([nn.Linear(4, 4) for _ in range(3)])
+    sw = _scheduler(3)
+    for hook in (sw._pre(0), sw._post(0), sw._bwd(0), BlockSwap.enter, BlockSwap.leave):
+        assert getattr(hook, "_torchdynamo_disable", False) or hasattr(hook, "__wrapped__")
+
+
+def test_compiled_layers_match_eager_with_swap():
+    if not torch.cuda.is_available():
+        return
+    from torch import _dynamo
+    torch.manual_seed(0)
+    blocks = nn.ModuleList([_XBlock(64) for _ in range(4)]).cuda()
+    for p in blocks.parameters():
+        p.requires_grad_(False)
+    x = torch.randn(2, 64, device = "cuda")
+    enc = torch.randn(2, 64, device = "cuda")
+    with torch.no_grad():
+        ref = x
+        for b in blocks:
+            ref = b(ref, enc)
+    _dynamo.reset()
+    sw = BlockSwap(blocks, [1, 3], prefetch_depth = 1)
+    for b in blocks:
+        b.compile()
+    with torch.no_grad():
+        for _ in range(3):
+            out = x
+            for b in blocks:
+                out = b(out, enc)
+            assert torch.equal(out, ref)
+    sw.remove()
+    _dynamo.reset()
+
+
+class _Stack(nn.Module):
+    def __init__(self, n):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList([nn.Sequential(nn.Linear(4, 4), nn.LayerNorm(4)) for _ in range(n)])
+
+
+def test_host_load_moves_a_layer_only_once_all_its_weights_landed():
+    with torch.device("meta"):
+        model = _Stack(4)
+    state = _mod._HostLoad(2, "tail")
+    layer = model.model.layers[3]
+    names = [f"model.layers.3.{n}" for n, _ in layer.named_parameters()]
+    for k, (n, p) in enumerate(list(layer.named_parameters())):
+        mod_name, _, attr = n.rpartition(".")
+        setattr(layer.get_submodule(mod_name), attr, nn.Parameter(torch.ones(p.shape)))
+        state.on_param(model, names[k])
+        assert (3 in state.done) == (k == len(names) - 1)
+    assert state.indices == [2, 3] and 2 not in state.done
+    assert not any(p.requires_grad for p in layer.parameters())
+    # A weight outside the swapped layers never triggers a move.
+    state.on_param(model, "model.layers.1.0.weight")
+    assert state.done == {3}
+
+
+def test_load_layers_to_host_restores_what_it_patched():
+    core = importlib.import_module("transformers.core_model_loading") \
+        if importlib.util.find_spec("transformers.core_model_loading") else None
+    mu = importlib.import_module("transformers.modeling_utils")
+    before = (getattr(core, "set_param_for_module", None), getattr(mu, "caching_allocator_warmup", None),
+              os.environ.get("HF_DEACTIVATE_ASYNC_LOAD"))
+    with _mod.load_layers_to_host(1):
+        assert os.environ.get("HF_DEACTIVATE_ASYNC_LOAD") == "1"
+    after = (getattr(core, "set_param_for_module", None), getattr(mu, "caching_allocator_warmup", None),
+             os.environ.get("HF_DEACTIVATE_ASYNC_LOAD"))
+    assert before == after
+
+
+def test_load_layers_to_host_matches_a_normal_load(tmp_path):
+    if not torch.cuda.is_available():
+        return
+    from transformers import LlamaConfig, LlamaForCausalLM
+    torch.manual_seed(0)
+    cfg = LlamaConfig(hidden_size = 64, intermediate_size = 128, num_hidden_layers = 6, num_attention_heads = 4,
+                      num_key_value_heads = 2, vocab_size = 256, max_position_embeddings = 64)
+    LlamaForCausalLM(cfg).save_pretrained(tmp_path)
+    ids = torch.randint(0, 256, (1, 16), device = "cuda")
+    ref = LlamaForCausalLM.from_pretrained(tmp_path, device_map = {"": 0})
+    with torch.no_grad():
+        want = ref(input_ids = ids).logits
+    with _mod.load_layers_to_host(3) as state:
+        model = LlamaForCausalLM.from_pretrained(tmp_path, device_map = {"": 0})
+    assert state.indices == [1, 3, 5]
+    for i, layer in enumerate(model.model.layers):
+        devices = {p.device.type for p in layer.parameters()}
+        assert devices == ({"cpu"} if i in state.indices else {"cuda"})
+    sw = BlockSwap(state.layers, state.indices)
+    with torch.no_grad():
+        assert torch.equal(model(input_ids = ids).logits, want)
     sw.remove()

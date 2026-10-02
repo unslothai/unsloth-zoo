@@ -24,6 +24,9 @@ import os
 import sys
 import torch
 from contextlib import contextmanager, nullcontext
+import functools
+import gc
+import importlib
 
 __all__ = [
     "BlockSwap",
@@ -33,6 +36,9 @@ __all__ = [
     "lora_param_count",
     "auto_swap_indices",
     "build_host_layers",
+    "load_layers_to_host",
+    "extra_input_embeddings",
+    "usable_device_bytes",
 ]
 
 
@@ -225,6 +231,13 @@ def _to_device(obj, device):
     if isinstance(obj, dict):
         return {k: _to_device(v, device) for k, v in obj.items()}
     return obj
+
+
+def _opaque(hook):
+    # Stream copies, event waits and `.data` swaps cannot be traced; a compiled caller breaks around
+    # the hook instead.
+    disable = getattr(getattr(torch, "compiler", None), "disable", None)
+    return disable(hook) if disable is not None else hook
 
 
 def swap_indices(total, n, placement = "spread"):
@@ -426,7 +439,7 @@ class BlockSwap:
                 hooked = True
             self._input_hooked[i] = hooked
             return moved
-        return hook
+        return _opaque(hook)
 
     def _post(self, i):
         def hook(module, args, output):
@@ -451,14 +464,14 @@ class BlockSwap:
                 out.register_hook(
                     lambda g: torch.autograd.Variable._execution_engine.queue_callback(lambda: release(None)))
             return output
-        return hook
+        return _opaque(hook)
 
     def _bwd(self, i):
         def hook(grad):
             self._release(self.blocks[i])
             if i == 0:
                 self._arm(forward = True)
-        return hook
+        return _opaque(hook)
 
     def _state_dict(self, i):
         def hook(module, state_dict, prefix, local_metadata):
@@ -470,6 +483,7 @@ class BlockSwap:
                     state_dict[prefix + name] = b.host[idx]
         return hook
 
+    @_opaque
     def enter(self, idx):
         """Make layer `idx` resident for code that bypasses the forward hooks (fast decode)."""
         i = self.pos.get(idx, -1)
@@ -480,6 +494,7 @@ class BlockSwap:
             if i + self.depth < len(self.blocks):
                 self._fetch(self.blocks[i + self.depth])
 
+    @_opaque
     def leave(self, idx):
         i = self.pos.get(idx, -1)
         if 0 <= i < len(self.blocks):
@@ -541,9 +556,11 @@ _ACTIVATION_BYTES_PER_TOKEN_HIDDEN = 48
 
 
 def estimate_training_reserve_bytes(config, seq_len, batch_size = 1, extra_bytes = 0,
-                                    logit_rows = 2048, safety_bytes = 256 << 20):
+                                    logit_rows = 2048, safety_bytes = 256 << 20, fragmentation = 1 / 16):
     """VRAM a LoRA step needs beyond the weights: activations, fp32 logits for up to `logit_rows`
-    rows, plus `extra_bytes` (trainable parameters' gradients and optimizer state)."""
+    rows, plus `extra_bytes` (trainable parameters' gradients and optimizer state), plus
+    `fragmentation` of that for the caching allocator's split blocks (a Qwen3.5-35B-A3B MoE LoRA
+    step ran out of memory at the plain sum)."""
     text = _text_config(config)
     hidden = (getattr(text, "hidden_size", None) or getattr(text, "n_embd", None)
               or getattr(text, "d_model", None) or 0)
@@ -551,24 +568,45 @@ def estimate_training_reserve_bytes(config, seq_len, batch_size = 1, extra_bytes
     tokens = max(1, int(seq_len)) * max(1, int(batch_size))
     activations = tokens * int(hidden) * _ACTIVATION_BYTES_PER_TOKEN_HIDDEN
     logits = min(tokens, int(logit_rows)) * int(vocab) * 4
-    return int(activations + logits + int(extra_bytes) + int(safety_bytes))
+    base = activations + logits + int(extra_bytes)
+    return int(base + base * fragmentation + int(safety_bytes))
 
 
 def lora_param_count(layers, r = 16):
-    """LoRA parameters on every linear in `layers` at rank `r`: r * (in + out) each."""
+    """LoRA parameters on every linear in `layers` at rank `r`: r * (in + out) each, and per expert
+    on fused [experts, in, out] weights (MoE LoRA targets those too)."""
     total = 0
     for layer in layers:
         for module in layer.modules():
             i, o = getattr(module, "in_features", None), getattr(module, "out_features", None)
             if isinstance(i, int) and isinstance(o, int) and not list(module.children()):
                 total += r * (i + o)
+                continue
+            for name, p in module.named_parameters(recurse = False):
+                if p.dim() == 3 and "lora_" not in name:
+                    total += r * p.shape[0] * (p.shape[1] + p.shape[2])
     return total
 
 
+def usable_device_bytes(device):
+    """Bytes this process can still allocate on `device`."""
+    return _free_device_bytes(device)
+
+
 def _free_device_bytes(device):
-    free, _ = torch.cuda.mem_get_info(device)
+    free, total = torch.cuda.mem_get_info(device)
+    allocated = torch.cuda.memory_allocated(device)
     # Blocks torch's caching allocator holds but does not use are free to this process.
-    return int(free + torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device))
+    usable = free + torch.cuda.memory_reserved(device) - allocated
+    # torch.cuda.set_per_process_memory_fraction caps this process below what the card has free.
+    get_fraction = getattr(torch.cuda, "get_per_process_memory_fraction", None)
+    try:
+        fraction = get_fraction(device) if get_fraction is not None else 1.0
+    except Exception:
+        fraction = 1.0
+    if fraction < 1.0:
+        usable = min(usable, int(total * fraction) - allocated)
+    return max(0, int(usable))
 
 
 def _pool_bytes(sizes, depth):
@@ -702,3 +740,153 @@ def build_host_layers(make_layer, first_idx, count, tensors, device, compute_dty
                 raise RuntimeError(f"block_swap: {base}{bname} is a buffer with no checkpoint value")
         out.append(layer)
     return out
+
+
+# Token tables besides the input embedding worth keeping in host RAM (Gemma 3n / 4 per-layer
+# embeddings: 5.25 GB on gemma-4-E4B); small position tables stay.
+EXTRA_EMBEDDING_MIN_BYTES = 256 << 20
+
+
+def extra_input_embeddings(model):
+    """(name, module) of every large nn.Embedding other than the input embedding. lm_head only ever
+    ties to the input embedding, so these are never shared with it."""
+    try:
+        main = model.get_input_embeddings()
+    except Exception:
+        main = None
+    out = []
+    for name, module in model.named_modules():
+        weight = getattr(module, "weight", None)
+        if module is main or not isinstance(module, torch.nn.Embedding) or weight is None:
+            continue
+        if weight.numel() * weight.element_size() >= EXTRA_EMBEDDING_MIN_BYTES:
+            out.append((name, module))
+    return out
+
+
+class _HostLoad:
+    """What `load_layers_to_host` moved: the layer list and the indices living in host RAM."""
+
+    def __init__(self, n, placement, embeddings = False):
+        self.n, self.placement, self.want_embeddings = n, placement, embeddings
+        self.layers, self.indices, self.prefixes = None, [], {}
+        self.done = set()
+        self.embedding_prefixes, self.embeddings = {}, []
+
+    def bind(self, model):
+        if self.layers is not None:
+            return
+        layers = find_decoder_layers(model)
+        name = next((k for k, m in model.named_modules() if m is layers), None)
+        self.layers = layers
+        self.indices = swap_indices(len(layers), self.n, self.placement) if isinstance(self.n, int) \
+            else sorted({int(i) % len(layers) for i in self.n})
+        if name is not None:
+            self.prefixes = {f"{name}.{i}.": i for i in self.indices}
+        if self.want_embeddings:
+            self.embedding_prefixes = {f"{n}.": m for n, m in extra_input_embeddings(model)}
+
+    def evict_embedding(self, module):
+        weight = getattr(module, "weight", None)
+        if module in self.embeddings or weight is None or weight.device.type == "meta":
+            return
+        with torch.no_grad():
+            weight.requires_grad_(False)
+            if weight.device.type != "cpu":
+                weight.data = weight.data.to("cpu")
+        self.embeddings.append(module)
+
+    def evict(self, i, force = False):
+        if i in self.done:
+            return
+        layer = self.layers[i]
+        params = list(layer.parameters())
+        if not force and any(p.device.type == "meta" for p in params):
+            return
+        with torch.no_grad():
+            for p in params:
+                if p.is_floating_point():
+                    p.requires_grad_(False)
+                if p.device.type not in ("cpu", "meta"):
+                    p.data = p.data.to("cpu")
+        self.done.add(i)
+
+    def on_param(self, model, target_name):
+        self.bind(model)
+        for prefix, i in self.prefixes.items():
+            if target_name.startswith(prefix):
+                self.evict(i)
+                return
+        for prefix, module in self.embedding_prefixes.items():
+            if target_name.startswith(prefix):
+                self.evict_embedding(module)
+                return
+
+
+@contextmanager
+def load_layers_to_host(n, placement = "spread", embeddings = False):
+    """Wrap a transformers `from_pretrained`: each chosen decoder layer (`n` of them, or explicit
+    indices) moves to host RAM as soon as its last weight lands, so a model larger than the card
+    loads on any architecture. Quantization runs on the card as usual first. Install `BlockSwap` with
+    the yielded `.layers` / `.indices` after the load. `embeddings` also streams the
+    `extra_input_embeddings` (yielded as `.embeddings`; the caller hooks their lookups)."""
+    state = _HostLoad(n, placement, embeddings)
+    patched = []
+    try:
+        core = importlib.import_module("transformers.core_model_loading")
+        original = getattr(core, "set_param_for_module", None)
+    except ImportError:
+        core, original = None, None
+    if original is not None:
+        # transformers 5: the one sink every loaded parameter goes through.
+        @functools.wraps(original)
+        def set_param_for_module(*args, **kwargs):
+            out = original(*args, **kwargs)
+            model = kwargs.get("model", args[0] if args else None)
+            name = kwargs.get("target_name", args[1] if len(args) > 1 else None)
+            if model is not None and isinstance(name, str):
+                state.on_param(model, name)
+            return out
+        core.set_param_for_module = set_param_for_module
+        patched.append((core, "set_param_for_module", original))
+    else:
+        # transformers 4: weights load shard by shard; sweep after each shard.
+        mu = importlib.import_module("transformers.modeling_utils")
+        original = mu._load_state_dict_into_meta_model
+
+        @functools.wraps(original)
+        def _load_state_dict_into_meta_model(model, *args, **kwargs):
+            out = original(model, *args, **kwargs)
+            state.bind(model)
+            for i in state.indices:
+                state.evict(i)
+            return out
+        mu._load_state_dict_into_meta_model = _load_state_dict_into_meta_model
+        patched.append((mu, "_load_state_dict_into_meta_model", original))
+    # The allocator warmup reserves the whole model's bytes on the card before loading: skip it.
+    mu = importlib.import_module("transformers.modeling_utils")
+    warmup = getattr(mu, "caching_allocator_warmup", None)
+    if warmup is not None:
+        mu.caching_allocator_warmup = lambda *args, **kwargs: None
+        patched.append((mu, "caching_allocator_warmup", warmup))
+    # The async loader materializes every tensor on the card up front; load one at a time.
+    old_env = os.environ.get("HF_DEACTIVATE_ASYNC_LOAD")
+    os.environ["HF_DEACTIVATE_ASYNC_LOAD"] = "1"
+    try:
+        yield state
+    finally:
+        for module, attr, fn in patched:
+            setattr(module, attr, fn)
+        if old_env is None:
+            os.environ.pop("HF_DEACTIVATE_ASYNC_LOAD", None)
+        else:
+            os.environ["HF_DEACTIVATE_ASYNC_LOAD"] = old_env
+    # Layers with weights the checkpoint lacked finished only once missing keys were initialized.
+    if state.layers is not None:
+        for i in state.indices:
+            state.evict(i, force = True)
+        for module in state.embedding_prefixes.values():
+            state.evict_embedding(module)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()

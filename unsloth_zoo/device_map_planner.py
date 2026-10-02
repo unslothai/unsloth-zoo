@@ -1950,6 +1950,7 @@ def plan_block_swap(
     free_space_policy: str = "balanced",
     no_split_module_classes: Sequence[str] | None = None,
     offload_embedding: bool = False,
+    placement: str = "tail",
     trust_remote_code: bool = False,
     **config_kwargs: Any,
 ) -> BlockSwapPlan:
@@ -1966,12 +1967,16 @@ def plan_block_swap(
     ``offload_embedding`` (one GPU, untied embeddings): the input embedding may
     move to host RAM after the load, tried before any layer since only the looked
     up rows cross PCIe. The load itself still holds it on the card, so the
-    resident weights alone must fit the budget too.
+    resident weights alone must fit the budget too. Other large token tables
+    (``extra_input_embeddings``) move with it, streamed to host during the load.
+
+    ``placement``: which layers the count names (``block_swap.swap_indices``).
 
     Raises :class:`DeviceMapInfeasible` when even one resident layer does not fit.
     """
     from .block_swap import (
         find_decoder_layers, estimate_training_reserve_bytes, lora_param_count, _pool_bytes,
+        extra_input_embeddings, swap_indices,
     )
 
     config = None
@@ -2001,17 +2006,20 @@ def plan_block_swap(
     L = len(layers)
 
     if reserve_bytes is None:
-        # LoRA weights, their gradients and AdamW's two moments, all fp32.
-        lora_bytes = lora_param_count(layers, lora_rank) * 16
+        # LoRA weights, their gradients and AdamW's two moments, all fp32, plus the foreach
+        # step's fp32 temporary (sqrt of the second moment).
+        lora_bytes = lora_param_count(layers, lora_rank) * 20
         reserve_bytes = estimate_training_reserve_bytes(
             config, seq_len, batch_size, extra_bytes = lora_bytes
         )
     reserve_bytes = int(reserve_bytes)
 
     def swapped(n):
-        return [layer_bytes[i] for i in range(L - n, L)]
+        return [layer_bytes[i] for i in swap_indices(L, n, placement)]
 
-    embedding = 0
+    # `embedding`: the input embedding, held on the card during the load and moved after it;
+    # `streamed`: other large token tables, moved to host as they load (never tied to the head).
+    embedding = streamed = 0
     if offload_embedding and len(devices) == 1:
         head_name, head_mod = resolve_output_head(model)
         getter = getattr(model, "get_input_embeddings", None)
@@ -2019,18 +2027,19 @@ def plan_block_swap(
         name = _name_of_module(model, inp) if inp is not None else None
         if name is not None and not head_is_tied(model, head_mod):
             embedding = sizes.get(name, 0)
+        streamed = sum(sizes.get(n, 0) for n, _ in extra_input_embeddings(model))
     use_embedding = False
 
     def fits(n):
         out = swapped(n)
         pool = _pool_bytes(out, prefetch_depth) if n else 0
         if len(devices) == 1:
-            resident = total - sum(out)
+            resident = total - sum(out) - (streamed if use_embedding else 0)
             off = embedding if use_embedding else 0
             # Training needs the reserve; the load holds the embedding before it moves.
             ok = resident - off + pool + reserve_bytes <= budgets[devices[0]] and resident <= budgets[devices[0]]
             return ok, None
-        excluded = [names[i] for i in range(L - n, L)]
+        excluded = [names[i] for i in swap_indices(L, n, placement)]
         # The host tail fetches onto the output head's card (its inputs move there), so that card
         # pays for the slot pool: accept a plan only if it put the head on the card charged.
         for pool_device in (reversed(devices) if n else devices[:1]):
@@ -2057,7 +2066,7 @@ def plan_block_swap(
 
     ok, plan = fits(0)
     n = 0
-    if not ok and embedding:
+    if not ok and (embedding or streamed):
         use_embedding = True
         ok, plan = fits(0)
     if not ok:
@@ -2087,6 +2096,6 @@ def plan_block_swap(
         budgets = budgets,
         device_plan = plan,
         offload_embedding = use_embedding,
-        embedding_bytes = embedding if use_embedding else 0,
+        embedding_bytes = embedding + streamed if use_embedding else 0,
         notes = notes,
     )
