@@ -124,8 +124,6 @@ def test_mm_token_type_ids_truncation_stays_aligned():
 
 @pytest.mark.parametrize("padding_side", ["left", "right"])
 def test_truncation_keeps_the_prompt_start_on_either_padding_side(padding_side):
-    # TRL keeps input_ids[:, :max_length]; a left-padded tokenizer must not drop
-    # the prompt's image token instead of the completion's tail.
     collator = make_collator("mm_token_type_ids", max_seq_length=4)
     collator.processor.tokenizer.padding_side = padding_side
     out = collator([

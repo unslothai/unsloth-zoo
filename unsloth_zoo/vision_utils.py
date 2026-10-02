@@ -2314,8 +2314,7 @@ class UnslothVisionDataCollator:
 
     @staticmethod
     def _left_truncation_index(lengths, L, max_len):
-        # Keep each row's first max_len tokens like the right side does; a plain
-        # [-max_len:] cut the start of the prompt (and its image tokens) instead.
+        # Keep each row's start like TRL; [-max_len:] cut the prompt and its image tokens.
         starts = L - lengths.clamp(min=max_len)
         return starts.unsqueeze(1) + torch.arange(max_len, device=lengths.device)
 
