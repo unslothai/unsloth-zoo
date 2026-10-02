@@ -210,3 +210,12 @@ def test_unmatched_source_is_returned_byte_identical():
     src = textwrap.indent(src, "    ")
     out, ok = compiler.apply_fused_lm_head(src, "X")
     assert not ok and out == src
+
+
+def test_installer_leaves_composite_head_forward_alone():
+    roberta = pytest.importorskip("transformers.models.roberta.modeling_roberta")
+    from unsloth_zoo.fused_losses import forward_install
+
+    forward_install.install_for_class(roberta.RobertaForCausalLM)
+    assert "RobertaForCausalLM" not in forward_install.audit()["patched"]
+    assert "unsloth_fused_lm_head_loss" not in roberta.RobertaForCausalLM.forward.__code__.co_names
