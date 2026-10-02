@@ -848,13 +848,7 @@ class _FileFacts:
                     found.append(target)
         return found
 
-    def _resolve_name(
-        self,
-        name: str,
-        class_name: str,
-        scope: str,
-        instances: dict | None,
-    ) -> list:
+    def _resolve_name(self, name: str, class_name: str, scope: str, instances: dict | None) -> list:
         """One spelling, resolved. Split out so an alias bound twice resolves both."""
         head, _, tail = name.partition(".")
         # Bare call to a function defined in this file, nested helpers included.
