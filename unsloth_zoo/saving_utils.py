@@ -850,9 +850,7 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
                 "https://github.com/unslothai/unsloth/issues."
             )
 
-    # Layers the active adapter does not target keep their base weight. Their stats (module, no
-    # factors) look like a modules_to_save entry to the shard writers, which would then write the
-    # live (possibly 4-bit packed) base_layer weight, so they are dropped from lora_weights below.
+    # Untargeted layers keep the downloaded weight; writers would treat (module, no factors) as modules_to_save and write the live, possibly 4-bit packed, weight.
     _untargeted_keys = {k for k in _untargeted_keys if lora_weights[k].lora_A is None and lora_weights[k].lora_B is None}
     for _key in _untargeted_keys:
         scaling_count -= 1
