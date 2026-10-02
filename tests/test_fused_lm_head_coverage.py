@@ -24,7 +24,6 @@ import torch
 
 from unsloth_zoo import compiler
 from unsloth_zoo.fused_losses.ast_rewriter import rewrite_forward_source
-from unsloth_zoo.fused_losses.forward_install import _head_built_as_linear
 
 # transformers 4.57 GPT-Neo: casts around the loss call in the labels branch.
 CAST_WRAPPED = """
@@ -144,6 +143,8 @@ class _InheritedLinearHead(_LinearHeadModel):
 
 
 def test_head_kind_from_init_source():
+    from unsloth_zoo.fused_losses.forward_install import _head_built_as_linear
+
     assert not _head_built_as_linear(_CompositeHeadModel, "lm_head")
     assert _head_built_as_linear(_LinearHeadModel, "lm_head")
     assert _head_built_as_linear(_InheritedLinearHead, "lm_head")
@@ -151,6 +152,8 @@ def test_head_kind_from_init_source():
 
 
 def test_roberta_style_heads_are_not_fused():
+    from unsloth_zoo.fused_losses.forward_install import _head_built_as_linear
+
     roberta = pytest.importorskip("transformers.models.roberta.modeling_roberta")
     llama = pytest.importorskip("transformers.models.llama.modeling_llama")
     assert not _head_built_as_linear(roberta.RobertaForCausalLM, "lm_head")
@@ -179,7 +182,8 @@ def test_lm_logits_name_is_fused_by_regex():
 
 def test_lm_logits_rename_skipped_when_logits_name_is_taken():
     src = LM_LOGITS_REGEX_FORWARD.replace("return (loss, lm_logits)", "logits = lm_logits\n        return (loss, logits)")
-    assert compiler._normalize_lm_head_source(src) == src
+    out, ok = compiler.apply_fused_lm_head(src, "CTRLLMHeadModel")
+    assert not ok and "lm_logits" in out
 
 
 def test_inline_head_scale_is_fused_with_scale():
