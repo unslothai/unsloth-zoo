@@ -8,6 +8,14 @@ try:
 except Exception:  # module-level nn.Module subclasses below need mlx to exist
     pytest.skip("requires mlx", allow_module_level=True)
 metal_only = pytest.mark.skipif(not _METAL, reason="requires Apple Silicon Metal")
+# Importable is not real: a sibling module installs the mlx simulation process-wide while it is
+# collected, so these can import mlx against the shim (see tests/test_mlx_attention_metal.py).
+from mlx_simulation import mlx_is_simulated  # noqa: E402
+
+_HAS_REAL_MLX = not mlx_is_simulated()
+real_mlx_only = pytest.mark.skipif(
+    not _HAS_REAL_MLX, reason="needs real mlx.nn; the simulation has no set_dtype or Sequential"
+)
 
 
 def _nax_available():
@@ -1090,6 +1098,7 @@ def test_nax_quantized_linear_first_use_check_rejects_a_wrong_kernel(monkeypatch
     assert list(inference._NAX_QMM_VERIFIED.values()) == [False]
 
 
+@real_mlx_only
 @pytest.mark.parametrize("blocker", [None, "kill switch", "no NAX", "gap closed", "distributed", "probe failed"])
 def test_nax_quantized_linear_scope_stays_native(monkeypatch, blocker):
     from unsloth_zoo.mlx import inference, nax
@@ -1108,6 +1117,7 @@ def test_nax_quantized_linear_scope_stays_native(monkeypatch, blocker):
         assert (type(model.proj) is nn.QuantizedLinear) is (blocker is not None)
 
 
+@real_mlx_only
 def test_nax_quantized_linear_scope_swaps_a_shared_module_once(monkeypatch):
     from unsloth_zoo.mlx import inference, nax
 
@@ -1122,6 +1132,7 @@ def test_nax_quantized_linear_scope_swaps_a_shared_module_once(monkeypatch):
     assert type(model.proj) is nn.QuantizedLinear and "_unsloth_nax_qmm_rows" not in model.proj
 
 
+@real_mlx_only
 @pytest.mark.parametrize("vlm", [False, True], ids = ["text", "vlm"])
 def test_loader_generate_enters_the_nax_scope(monkeypatch, vlm):
     from contextlib import contextmanager
