@@ -20,7 +20,10 @@
     "unsloth_zoo/mlx/loader.py::_resolve_mlx_vlm_processor_class::getattr(module, ...)::f71db1546a424efa::b8fe9db822ae3bd3": 1,
     "unsloth_zoo/mlx/loader.py::_resolve_mlx_vlm_processor_class::importlib.import_module::59e72c01edb14c86::b8fe9db822ae3bd3": 1,
     "unsloth_zoo/mlx/preference.py::ReferencePolicy.activate::getattr(module, ...)::e84f8ad946b634c1::fbb38e5bb500312f": 1,
+    "unsloth_zoo/mlx/utils.py::_merged_save_cast_dtype::getattr(module, ...)::e741a584f82ccf15::353099e08453bc1d": 1,
     "unsloth_zoo/mlx/utils.py::attach_and_bind_peft_adapter::getattr(module, ...)::ec4ec0a9bcbc2c32::0f08c742b3d85cad": 1,
-    "unsloth_zoo/saving_utils.py::_read_export_base_config::trust_remote_code = True::1966c44746000881::1a9efc56e40bc413": 1
+    "unsloth_zoo/saving_utils.py::_read_export_base_config::trust_remote_code = True::1966c44746000881::1a9efc56e40bc413": 1,
+    "unsloth_zoo/vllm_utils.py::from_dict::getattr(module, ...)::1a014717bdfe7bff::b38c8591958d35ca": 1,
+    "unsloth_zoo/vllm_utils.py::from_dict::getattr(module, ...)::9462f1a8eff3b647::b38c8591958d35ca": 1
   }
 }
