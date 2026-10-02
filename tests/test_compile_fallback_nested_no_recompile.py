@@ -36,8 +36,6 @@ def _run(body):
 
 
 def test_enclosing_compile_does_not_recompile_on_the_fallback_state():
-    # Outer compiled region inlining an inner fallback wrapper (RMSNorm / rope in a
-    # compiled decoder layer) must not guard on the inner wrapper's state.
     out = _run("""
         import torch
         from torch._dynamo.testing import CompileCounter
