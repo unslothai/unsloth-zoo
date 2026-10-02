@@ -520,12 +520,12 @@ pass
 
 def _get_active_adapter(module):
     adapters = getattr(module, "active_adapters", None)
-    if not adapters:
+    if adapters is None:
         adapters = getattr(module, "active_adapter", "default")
     if isinstance(adapters, (list, tuple)):
         if len(adapters) > 1:
             raise ValueError("Unsloth: Merged export requires a single active adapter.")
-        return adapters[0] if adapters else "default"
+        return adapters[0] if adapters else None
     return adapters
 pass
 
@@ -534,9 +534,6 @@ def _get_modules_to_save_weight(module, attr = "weight"):
     modules_to_save = getattr(module, "modules_to_save", None)
     if modules_to_save is None:
         return None
-
-    if getattr(module, "disable_adapters", False):
-        return getattr(getattr(module, "original_module", None), attr, None)
 
     # A head's weight and bias must come from the same active adapter as the LoRA factors.
     for key in (_get_active_adapter(module),):
