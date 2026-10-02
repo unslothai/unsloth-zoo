@@ -449,3 +449,437 @@ def probe_small_m_qmm():
                     error = mx.abs(got - native).max().item()
                     assert error <= 0.02 * mx.abs(native).max().item(), (bits, group_size, M, error)
 
+
+
+# Prefill `x @ W^T` with int8 activations (oMLX's QxA8 design), reading the stock packed codes,
+# scales and biases in place. Each row's activation group of x (the quant group, at most 64 wide)
+# becomes int8 codes a with an fp32 scale sa and code sum Ra; each is one exact int8 x int8 -> int32
+# matmul P against the codes, folded in fp32 as `acc += sa * s * P`. The bias term, the sum over
+# groups of sa * Ra * b', is then one matmul of U (sa * Ra summed over each quant group), stored as
+# bf16 high and low halves, against b'. Codes under 8 bits enter as they are with b' = b; 8-bit codes are
+# centred (q - 128) and b' = b + 128 * s, applied as two matmuls so b' is never rounded.
+_INT8_QMM_GROUP_SIZES = (32, 64, 128)
+_INT8_QMM_BITS = (3, 4, 5, 6, 8)
+
+
+def _int8_qmm_activation_group(group_size):
+    return min(group_size, 64)
+
+
+_INT8_QMM_HEADER = """
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace metal;
+"""
+
+# One threadgroup per row, a simdgroup per quant group. The GEMM's lanes each read a quarter of an
+# activation group (16 codes, or 8 for 32-wide groups), 4 codes per matmul step; for 4-bit each word's
+# even and odd nibbles are separate steps, so the codes of a step are k, k+2, k+4, k+6 and the
+# activations are stored in that order. A group with a non-finite value gets a NaN scale, so the output
+# keeps the NaN.
+_INT8_ACTIVATION_QUANTIZE_SOURCE = """
+    constexpr int GW = K / GS;
+    constexpr int GP = (GW + 15) / 16 * 16;
+    const uint simd = simdgroup_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+    const uint row = threadgroup_position_in_grid.x;
+    const uint M = x_shape[0];
+    const device T* xr = x + ulong(row) * K;
+    device int8_t* qr = qa + ulong(row) * K;
+    auto slot = [](uint k) {
+        if (BITS != 4) return k;
+        const uint r = k & 15;
+        return (k & ~15u) | (((r >> 3) * 2 + (r & 1)) * 4 + ((r & 7) >> 1));
+    };
+    for (uint gw = simd; gw < GW; gw += 8) {
+        float u = 0.0f;
+        for (uint g = gw * (GS / AG); g < (gw + 1) * (GS / AG); ++g) {
+            float v[AG / 32];
+            float amax = 0.0f;
+            bool finite = true;
+            _Pragma("clang loop unroll(full)")
+            for (int i = 0; i < AG / 32; ++i) {
+                v[i] = float(xr[g * AG + lane + 32 * i]);
+                amax = max(amax, abs(v[i]));
+                finite = finite && isfinite(v[i]);
+            }
+            amax = simd_max(amax);
+            finite = !simd_any(!finite);
+            const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+            int sum = 0;
+            _Pragma("clang loop unroll(full)")
+            for (int i = 0; i < AG / 32; ++i) {
+                const int q = int(clamp(rint(v[i] * inv), -127.0f, 127.0f));
+                qr[g * AG + slot(lane + 32 * i)] = int8_t(q);
+                sum += q;
+            }
+            const float scale = finite ? amax / 127.0f : NAN;
+            u += scale * float(simd_sum(sum));
+            if (lane == 0) sa[ulong(g) * M + row] = scale;
+        }
+        if (lane == 0) {
+            uh[ulong(row) * GP + gw] = bfloat(u);
+            ul[ulong(row) * GP + gw] = bfloat(u - float(bfloat(u)));
+        }
+    }
+    if (simd == 0 && lane < GP - GW) {
+        uh[ulong(row) * GP + GW + lane] = bfloat(0.0f);
+        ul[ulong(row) * GP + GW + lane] = bfloat(0.0f);
+    }
+"""
+
+# A simdgroup computes 2 x 16 rows by 32 columns with single-simdgroup 16x32x16 int8 matmuls whose
+# operands are filled from registers; a threadgroup is WM x WN simdgroups. The bias matmul uses bf16 x T
+# operands in the same register layout: an fp32 operand would change it. Rows past the tile's valid
+# range load its last valid row and are never stored. GATHER: `w` holds one matrix per expert and
+# the rows are sorted by expert; `starts` gives each expert's first row and `tiles` its first tile,
+# so every tile belongs to one expert. MAP: row i's activations are row `rmap[i]` of the quantized x,
+# which holds one row per token however many experts it is routed to.
+_INT8_QMM_SOURCE = """
+    static_assert(sizeof(T) == 2, "16-bit activations, scales and biases only");
+    constexpr int G = K / AG;
+    constexpr int GW = K / GS;
+    constexpr int WORDS = AG * BITS / 32;
+    constexpr int RUN = WORDS / 4;   // words of a lane's run, at 4 and 8 bits
+    constexpr bool STREAM = BITS != 4 && BITS != 8;
+    constexpr int RUN_BITS = AG / 4 * BITS;
+    constexpr int BM = 32 * WM;
+    constexpr int BN = 32 * WN;
+    const int M = qa_shape[0];
+    const int N = GATHER ? w_shape[1] : w_shape[0];
+    const uint simd = simdgroup_index_in_threadgroup;
+    const ushort lane = thread_index_in_simdgroup;
+    const int tile = int(threadgroup_position_in_grid.y);
+
+    int row_lo = tile * BM, row_hi = min(row_lo + BM, M);
+    const device uint* wp = w;
+    const device T* sp = scales;
+    const device T* bp = biases;
+    if (GATHER) {
+        const int E = w_shape[0];
+        if (tile >= tiles[E]) return;
+        int lo = 0, hi = E;   // tiles[lo] <= tile < tiles[hi]
+        while (hi - lo > 1) {
+            const int mid = (lo + hi) / 2;
+            if (tiles[mid] <= tile) lo = mid; else hi = mid;
+        }
+        row_lo = starts[lo] + (tile - tiles[lo]) * BM;
+        row_hi = min(row_lo + BM, starts[lo + 1]);
+        wp += ulong(lo) * N * (G * WORDS);
+        sp += ulong(lo) * N * GW;
+        bp += ulong(lo) * N * GW;
+    }
+
+    // The matmul fragments' lane layout.
+    const short qid = lane >> 2;
+    const short fm = (qid & 4) | ((lane >> 1) & 3);
+    const short fn = ((qid & 2) | (lane & 1)) * 4;
+    const int cx = fn >> 2;
+    const int row_base = row_lo + int(simd % WM) * 32 + fm;
+    const int col_base = int(threadgroup_position_in_grid.x) * BN + int(simd / WM) * 32;
+
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, 32, 16, false, true, false,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+    constexpr auto desc_set = mpp::tensor_ops::matmul2d_descriptor(16, 32, 16, false, true, false,
+        mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+    mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+    mpp::tensor_ops::matmul2d<desc_set, metal::execution_simdgroup> op_set;
+    auto ct_a = op.template get_left_input_cooperative_tensor<int8_t, int8_t, int32_t>();
+    auto ct_b = op.template get_right_input_cooperative_tensor<int8_t, int8_t, int32_t>();
+    auto acc0 = op.template get_destination_cooperative_tensor<decltype(ct_a), decltype(ct_b), int32_t>();
+    auto acc1 = op.template get_destination_cooperative_tensor<decltype(ct_a), decltype(ct_b), int32_t>();
+
+    int rows[4];
+    _Pragma("clang loop unroll(full)")
+    for (int i = 0; i < 4; ++i) rows[i] = min(row_base + i * 8, row_hi - 1);   // rows +0, +8, +16, +24
+    int arow[4];   // where each row's activations were quantized
+    _Pragma("clang loop unroll(full)")
+    for (int i = 0; i < 4; ++i) arow[i] = MAP ? int(rmap[rows[i]]) : rows[i];
+    float out[2][16];
+    _Pragma("clang loop unroll(full)")
+    for (int h = 0; h < 2; ++h)
+        _Pragma("clang loop unroll(full)")
+        for (int e = 0; e < 16; ++e) out[h][e] = 0.0f;
+    const device uint* wlane = wp + ulong(col_base + fm) * (G * WORDS);
+    const device T* slane = sp + ulong(col_base + fn) * GW;
+    float s[8], scale[4];
+    auto load_scales = [&](int g) {
+        _Pragma("clang loop unroll(full)")
+        for (int j = 0; j < 8; ++j)   // columns fn + (j & 3) + (j >> 2) * 16
+            s[j] = float(slane[((j & 3) + (j >> 2) * 16) * GW + g / (GS / AG)]);
+        _Pragma("clang loop unroll(full)")
+        for (int i = 0; i < 4; ++i) scale[i] = sa[ulong(g) * M + arow[i]];
+    };
+
+    for (int g = 0; g < G; ++g) {
+        constexpr bool EARLY = BITS == 4 || BITS == 6;   // scales before the matmuls or after them: measured
+        if (EARLY) load_scales(g);
+        uint4 wv[4];
+        _Pragma("clang loop unroll(full)")
+        for (int q = 0; q < 4; ++q) {   // columns +0, +8, +16, +24
+            const device uint* wr = wlane + ulong((q & 1) * 8 + (q >> 1) * 16) * (G * WORDS) + g * WORDS;
+            wv[q] = uint4(0u);
+            if (STREAM) {   // 3-, 5- and 6-bit codes: the words holding the run, realigned to its first bit
+                const device uint* p = wr + (cx * RUN_BITS >> 5);
+                const uint s0 = cx * RUN_BITS & 31;
+                wv[q].x = p[0];
+                if (s0 + RUN_BITS > 32) wv[q].y = p[1];
+                if (s0 + RUN_BITS > 64) wv[q].z = p[2];
+                if (s0) wv[q] = uint4((wv[q].x >> s0) | (wv[q].y << (32 - s0)),
+                                      (wv[q].y >> s0) | (wv[q].z << (32 - s0)), wv[q].z >> s0, 0u);
+            }
+            else if (RUN == 4) wv[q] = ((const device uint4*)wr)[cx];
+            else if (RUN == 2) wv[q].xy = ((const device uint2*)wr)[cx];
+            else wv[q].x = wr[cx];
+            if (BITS == 8) wv[q] ^= uint4(0x80808080u);
+        }
+        _Pragma("clang loop unroll(full)")
+        for (int t = 0; t < AG / 16; ++t) {
+            _Pragma("clang loop unroll(full)")
+            for (int q = 0; q < 4; ++q) {
+                const int base = (q >> 1) * 8 + (q & 1) * 4;
+                char4 c;
+                if (STREAM) {
+                    const int o = t * 4 * BITS, i = o >> 5, sh = o & 31;
+                    const uint f = sh ? (wv[q][i] >> sh) | (wv[q][i + 1] << (32 - sh)) : wv[q][i];
+                    constexpr uint m = (1u << BITS) - 1;
+                    c = as_type<char4>((f & m) | ((f << (8 - BITS)) & (m << 8))
+                                       | ((f << (16 - 2 * BITS)) & (m << 16)) | ((f << (24 - 3 * BITS)) & (m << 24)));
+                }
+                else c = BITS == 8 ? as_type<char4>(wv[q][t])
+                                   : as_type<char4>(((t & 1) ? wv[q][t >> 1] >> 4 : wv[q][t >> 1]) & 0x0f0f0f0fu);
+                ct_b[base] = c.x; ct_b[base + 1] = c.y; ct_b[base + 2] = c.z; ct_b[base + 3] = c.w;
+            }
+            _Pragma("clang loop unroll(full)")
+            for (int h = 0; h < 2; ++h) {
+                _Pragma("clang loop unroll(full)")
+                for (int r = 0; r < 2; ++r) {
+                    const char4 c = as_type<char4>(*(const device uint*)(qa + ulong(arow[h * 2 + r]) * K
+                                                                        + g * AG + cx * (AG / 4) + t * 4));
+                    ct_a[r * 4] = c.x; ct_a[r * 4 + 1] = c.y; ct_a[r * 4 + 2] = c.z; ct_a[r * 4 + 3] = c.w;
+                }
+                if (t == 0) { if (h == 0) op_set.run(ct_a, ct_b, acc0); else op_set.run(ct_a, ct_b, acc1); }
+                else if (h == 0) op.run(ct_a, ct_b, acc0);
+                else op.run(ct_a, ct_b, acc1);
+            }
+        }
+        if (!EARLY) load_scales(g);
+        _Pragma("clang loop unroll(full)")
+        for (int e = 0; e < 16; ++e) {
+            const int j = (e & 3) + (e >> 3) * 4, r = (e >> 2) & 1;
+            out[0][e] = metal::fma(scale[r], s[j] * float(acc0[e]), out[0][e]);
+            out[1][e] = metal::fma(scale[2 + r], s[j] * float(acc1[e]), out[1][e]);
+        }
+    }
+    {
+        constexpr int GP = (GW + 15) / 16 * 16;
+        constexpr auto bdesc = mpp::tensor_ops::matmul2d_descriptor(16, 32, 16, false, true, false,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+        mpp::tensor_ops::matmul2d<bdesc, metal::execution_simdgroup> bop;
+        auto bt_a = bop.template get_left_input_cooperative_tensor<bfloat, T, float>();
+        auto bt_b = bop.template get_right_input_cooperative_tensor<bfloat, T, float>();
+        auto bt_s = bop.template get_right_input_cooperative_tensor<bfloat, T, float>();
+        auto bo0 = bop.template get_destination_cooperative_tensor<decltype(bt_a), decltype(bt_b), float>();
+        auto bo1 = bop.template get_destination_cooperative_tensor<decltype(bt_a), decltype(bt_b), float>();
+        _Pragma("clang loop unroll(full)")
+        for (int e = 0; e < 16; ++e) { bo0[e] = out[0][e]; bo1[e] = out[1][e]; }
+        for (int g0 = 0; g0 < GP; g0 += 16) {
+            const int k = g0 + cx * 4;
+            _Pragma("clang loop unroll(full)")
+            for (int q = 0; q < 4; ++q) {
+                const int base = (q >> 1) * 8 + (q & 1) * 4;
+                const ulong at = ulong(col_base + fm + (q & 1) * 8 + (q >> 1) * 16) * GW + k;
+                _Pragma("clang loop unroll(full)")
+                for (int i = 0; i < 4; ++i) {
+                    bt_b[base + i] = k + i < GW ? bp[at + i] : T(0);
+                    if (BITS == 8) bt_s[base + i] = k + i < GW ? T(128) * sp[at + i] : T(0);
+                }
+            }
+            _Pragma("clang loop unroll(full)")
+            for (int part = 0; part < 2; ++part) {
+                _Pragma("clang loop unroll(full)")
+                for (int h = 0; h < 2; ++h) {
+                    _Pragma("clang loop unroll(full)")
+                    for (int r = 0; r < 2; ++r) {
+                        const device bfloat* ur = (part ? ul : uh) + ulong(arow[h * 2 + r]) * GP + k;
+                        _Pragma("clang loop unroll(full)")
+                        for (int i = 0; i < 4; ++i) bt_a[r * 4 + i] = ur[i];
+                    }
+                    if (h == 0) bop.run(bt_a, bt_b, bo0); else bop.run(bt_a, bt_b, bo1);
+                    if (BITS == 8) { if (h == 0) bop.run(bt_a, bt_s, bo0); else bop.run(bt_a, bt_s, bo1); }
+                }
+            }
+        }
+        _Pragma("clang loop unroll(full)")
+        for (int e = 0; e < 16; ++e) { out[0][e] = bo0[e]; out[1][e] = bo1[e]; }
+    }
+    _Pragma("clang loop unroll(full)")
+    for (int h = 0; h < 2; ++h) {
+        _Pragma("clang loop unroll(full)")
+        for (int e = 0; e < 16; ++e) {
+            const int m = row_base + h * 16 + ((e >> 2) & 1) * 8;
+            if (m < row_hi) y[ulong(m) * N + col_base + (e >> 3) * 16 + fn + (e & 3)] = T(out[h][e]);
+        }
+    }
+"""
+
+INT8_QMM_PROBE_KEY = "int8_qmm:" + hashlib.sha256(
+    (_INT8_QMM_HEADER + _INT8_ACTIVATION_QUANTIZE_SOURCE + _INT8_QMM_SOURCE).encode()).hexdigest()[:12]
+
+
+@functools.cache
+def _int8_qmm_kernels():
+    return (mx.fast.metal_kernel(name = "unsloth_nax_int8_activation_quantize", input_names = ["x"],
+                                 output_names = ["qa", "sa", "uh", "ul"], source = _INT8_ACTIVATION_QUANTIZE_SOURCE),
+            mx.fast.metal_kernel(name = "unsloth_nax_int8_qmm",
+                                 input_names = ["qa", "sa", "uh", "ul", "w", "scales", "biases", "starts", "tiles",
+                                                "rmap"],
+                                 output_names = ["y"], header = _INT8_QMM_HEADER, source = _INT8_QMM_SOURCE))
+
+
+def int8_qmm_supported(N, K, group_size, bits, mode):
+    """Whether the int8-activation kernel covers an `[N, K]` weight quantized this way."""
+    return (mode == "affine" and bits in _INT8_QMM_BITS and group_size in _INT8_QMM_GROUP_SIZES
+            and N > 0 and N % 64 == 0 and K > 0 and K % group_size == 0)
+
+
+def _int8_quantize_activations(x, group_size, bits):
+    M, K = x.shape
+    span, padded = _int8_qmm_activation_group(group_size), -(-(K // group_size) // 16) * 16
+    return _int8_qmm_kernels()[0](
+        inputs = [x], template = [("T", x.dtype), ("K", K), ("BITS", bits), ("GS", group_size), ("AG", span)],
+        grid = (M * 256, 1, 1), threadgroup = (256, 1, 1),
+        output_shapes = [(M, K), (K // span, M), (M, padded), (M, padded)],
+        output_dtypes = [mx.int8, mx.float32, mx.bfloat16, mx.bfloat16])
+
+
+def _int8_qmm(x, w, scales, biases, group_size, bits, simdgroups, starts = None, tiles = None, row_tiles = None,
+             token_rows = None):
+    M, K = x.shape if token_rows is None else (token_rows.shape[0], x.shape[1])
+    N = w.shape[-2]
+    rows_per_simdgroup, columns = simdgroups
+    qa, sa, uh, ul = _int8_quantize_activations(x, group_size, bits)
+    gather = starts is not None
+    if not gather:
+        starts = tiles = mx.zeros((1,), mx.int32)
+        row_tiles = -(-M // (32 * rows_per_simdgroup))
+    mapped = token_rows is not None
+    return _int8_qmm_kernels()[1](
+        inputs = [qa, sa, uh, ul, w, scales, biases, starts, tiles, token_rows if mapped else starts],
+        template = [("T", x.dtype), ("K", K), ("BITS", bits), ("GS", group_size),
+                    ("AG", _int8_qmm_activation_group(group_size)), ("WM", rows_per_simdgroup), ("WN", columns),
+                    ("GATHER", gather), ("MAP", mapped)],
+        grid = (N // (32 * columns) * 32 * rows_per_simdgroup * columns, row_tiles, 1),
+        threadgroup = (32 * rows_per_simdgroup * columns, 1, 1),
+        output_shapes = [(M, N)], output_dtypes = [x.dtype])[0]
+
+
+# (row, column) simdgroups per threadgroup: 32 x 64 tiles under 8 bits, 64 x 64 for 8-bit; experts
+# use 32-row tiles, which waste fewer rows on short expert segments.
+_INT8_QMM_SIMDGROUPS = {3: (1, 2), 4: (1, 2), 5: (1, 2), 6: (1, 2), 8: (2, 2)}
+_INT8_GATHER_QMM_SIMDGROUPS = {bits: (1, 2) for bits in _INT8_QMM_BITS}
+
+
+@functools.cache
+def _differentiable_int8_qmm(group_size, bits, gather):
+    """The kernel call with the stock op's vjp for x, scales and biases (Metal kernels have none); packed
+    weights and indices, which stock cannot differentiate, get zeros."""
+    def stock(x, w, scales, biases, indices = None, token_rows = None):
+        if gather:
+            x = x if token_rows is None else x[token_rows]
+            return mx.gather_qmm(x[:, None], w, scales, biases, rhs_indices = indices, transpose = True,
+                                 group_size = group_size, bits = bits, sorted_indices = True)[:, 0]
+        return mx.quantized_matmul(x, w, scales, biases, transpose = True, group_size = group_size, bits = bits)
+
+    @mx.custom_function
+    def routed(x, w, scales, biases, *indices):
+        if gather:
+            return _int8_gather_qmm(x, w, scales, biases, group_size, bits, *indices)
+        return _int8_qmm(x, w, scales, biases, group_size, bits, _INT8_QMM_SIMDGROUPS[bits])
+
+    @routed.vjp
+    def routed_vjp(primals, cotangent, output):
+        x, w, scales, biases, *indices = primals
+        _, (dx, ds, db) = mx.vjp(lambda x, s, b: stock(x, w, s, b, *indices), (x, scales, biases), (cotangent,))
+        return (dx, mx.zeros_like(w), ds, db, *map(mx.zeros_like, indices))
+
+    return routed
+
+
+def int8_qmm(x, w, scales, biases, bits):
+    """`quantized_matmul(x, w, scales, biases, transpose=True)` for a 2-D x, with int8 activations and
+    the group size the scales imply; x, scales and biases must be float16 or bfloat16."""
+    return _differentiable_int8_qmm(x.shape[-1] // scales.shape[-1], bits, False)(x, w, scales, biases)
+
+
+def int8_gather_qmm(x, w, scales, biases, indices, bits, token_rows = None):
+    """`gather_qmm(x, w, ..., rhs_indices=indices, transpose=True, sorted_indices=True)` for x of
+    shape [T, K] and sorted expert indices [T], with int8 activations; returns [T, N]. x, scales and
+    biases must be float16 or bfloat16. With `token_rows`, row i reads `x[token_rows[i]]`, so each
+    row of x is quantized once however many experts it is routed to."""
+    routed = _differentiable_int8_qmm(x.shape[-1] // scales.shape[-1], bits, True)
+    if token_rows is None:
+        return routed(x, w, scales, biases, indices)
+    return routed(x, w, scales, biases, indices, token_rows)
+
+
+def _int8_gather_qmm(x, w, scales, biases, group_size, bits, indices, token_rows = None):
+    E = w.shape[0]
+    rows = 32 * _INT8_GATHER_QMM_SIMDGROUPS[bits][0]
+    starts = (indices[None, :] < mx.arange(E + 1, dtype = indices.dtype)[:, None]).sum(axis = 1).astype(mx.int32)
+    counts = starts[1:] - starts[:-1]
+    tiles = mx.concatenate([mx.zeros((1,), mx.int32), mx.cumsum((counts + rows - 1) // rows)])
+    # Each expert adds at most one partial tile; threadgroups past the last tile return at once.
+    row_tiles = indices.shape[0] // rows + min(E, indices.shape[0])
+    return _int8_qmm(x, w, scales, biases, group_size, bits, _INT8_GATHER_QMM_SIMDGROUPS[bits], starts, tiles,
+                     row_tiles, token_rows)
+
+
+# Measured on the M5 Pro and used on every NAX GPU, as the route is opt-in: every width beats stock end to
+# end from the first row count the small-row kernel leaves to stock. Weights under 1024 wide or deep gain
+# too little; heads over 64K wide are evaluated at one position in prefill.
+_INT8_PREFILL_MIN_ROWS = _QMM_MAX_ROWS + 1
+_INT8_PREFILL_MIN_N = _INT8_PREFILL_MIN_K = 1024
+_INT8_PREFILL_MAX_N = 65536
+# Rows per routed expert by bits: (calls that quantize each token once for all its experts, every other
+# call). Down projections lose at 12 rows per expert except at 4 bits.
+_INT8_PREFILL_EXPERT_ROWS = {3: (8, 32), 4: (8, 8), 5: (8, 32), 6: (8, 32), 8: (16, 32)}
+
+
+def int8_prefill_min_rows(N, K):
+    """The fewest rows at which the int8 route speeds up prefill for an `[N, K]` weight, or 0."""
+    return _INT8_PREFILL_MIN_ROWS if _INT8_PREFILL_MIN_N <= N <= _INT8_PREFILL_MAX_N and K >= _INT8_PREFILL_MIN_K else 0
+
+
+def int8_prefill_expert_min_rows(E, bits, per_token = False):
+    """The fewest sorted rows per call at which the gathered int8 route is measured faster, or 0;
+    `per_token` for a call whose rows read one quantized copy of each token."""
+    return _INT8_PREFILL_EXPERT_ROWS.get(bits, (0, 0))[not per_token] * E
+
+
+def probe_int8_qmm():
+    """Subprocess probe for the int8 kernels: at each bit width, full and ragged row tiles (per expert
+    when gathered, with empty experts), two column tile counts, every group size, dense, gathered and
+    gathered through a token map, bf16 and fp16."""
+    for dtype in (mx.bfloat16, mx.float16):
+        for bits in _INT8_QMM_BITS:
+            for (N, K), group_size in itertools.product(((384, 512), (320, 256)), _INT8_QMM_GROUP_SIZES):
+                w = mx.random.normal((4, N, K), key = mx.random.key(group_size)) * 0.05
+                w, scales, biases = mx.quantize(w.astype(dtype), group_size = group_size, bits = bits)
+                for M in (64, 70):
+                    x = mx.random.normal((M, K), key = mx.random.key(M)).astype(dtype)
+                    indices = mx.array([0] * (M - 6) + [2] * 6, mx.uint32)
+                    tokens = mx.random.randint(0, M, (M,), key = mx.random.key(3)).astype(mx.uint32)
+                    for got, native in (
+                            (int8_qmm(x, w[0], scales[0], biases[0], bits),
+                             mx.quantized_matmul(x, w[0], scales[0], biases[0], transpose = True,
+                                                 group_size = group_size, bits = bits)),
+                            (int8_gather_qmm(x, w, scales, biases, indices, bits),
+                             mx.gather_qmm(x[:, None], w, scales, biases, rhs_indices = indices, transpose = True,
+                                           group_size = group_size, bits = bits, sorted_indices = True)[:, 0]),
+                            (int8_gather_qmm(x, w, scales, biases, indices, bits, tokens),
+                             mx.gather_qmm(x[tokens][:, None], w, scales, biases, rhs_indices = indices,
+                                           transpose = True, group_size = group_size, bits = bits,
+                                           sorted_indices = True)[:, 0])):
+                        native = native.astype(mx.float32)
+                        error = mx.abs(got.astype(mx.float32) - native).max().item()
+                        assert error <= 0.05 * mx.abs(native).max().item(), (bits, group_size, M, error)

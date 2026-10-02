@@ -1629,7 +1629,7 @@ def test_generation_paths_enter_every_inference_fusion(monkeypatch):
               if name.startswith(("fused_", "nax_")) and getattr(value, "__module__", None) == inference.__name__}
     entered = []
     for name in scopes:
-        monkeypatch.setattr(inference, name, lambda model, name=name: entered.append(name) or contextlib.nullcontext(model))
+        monkeypatch.setattr(inference, name, lambda model, *args, name=name: entered.append(name) or contextlib.nullcontext(model))
     with generate_module.generation_mode(types.SimpleNamespace(training=False, eval=lambda: None, named_modules=lambda: [])):
         pass
     assert sorted(entered) == sorted(scopes)
