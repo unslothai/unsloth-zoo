@@ -857,23 +857,29 @@ def int8_prefill_expert_min_rows(E, bits, per_token = False):
 
 
 def probe_int8_qmm():
-    """Subprocess probe for the int8 kernels: every bit width and group size, dense, gathered and
+    """Subprocess probe for the int8 kernels: at each bit width, full and ragged row tiles (per expert
+    when gathered, with empty experts), two column tile counts, every group size, dense, gathered and
     gathered through a token map, bf16 and fp16."""
-    for dtype, bits, group_size in itertools.product((mx.bfloat16, mx.float16), _INT8_QMM_BITS, _INT8_QMM_GROUP_SIZES):
-        w = mx.random.normal((4, 128, 256), key = mx.random.key(bits)) * 0.05
-        w, scales, biases = mx.quantize(w.astype(dtype), group_size = group_size, bits = bits)
-        x = mx.random.normal((70, 256), key = mx.random.key(1)).astype(dtype)
-        indices = mx.sort(mx.random.randint(0, 4, (70,), key = mx.random.key(2)).astype(mx.uint32))
-        tokens = mx.random.randint(0, 70, (70,), key = mx.random.key(3)).astype(mx.uint32)
-        for got, native in (
-                (int8_qmm(x, w[0], scales[0], biases[0], bits),
-                 mx.quantized_matmul(x, w[0], scales[0], biases[0], transpose = True, group_size = group_size,
-                                     bits = bits)),
-                (int8_gather_qmm(x, w, scales, biases, indices, bits),
-                 mx.gather_qmm(x[:, None], w, scales, biases, rhs_indices = indices, transpose = True,
-                               group_size = group_size, bits = bits, sorted_indices = True)[:, 0]),
-                (int8_gather_qmm(x, w, scales, biases, indices, bits, tokens),
-                 mx.gather_qmm(x[tokens][:, None], w, scales, biases, rhs_indices = indices, transpose = True,
-                               group_size = group_size, bits = bits, sorted_indices = True)[:, 0])):
-            error = mx.abs(got.astype(mx.float32) - native.astype(mx.float32)).max().item()
-            assert error <= 0.05 * mx.abs(native.astype(mx.float32)).max().item(), (bits, group_size, dtype, error)
+    for dtype in (mx.bfloat16, mx.float16):
+        for bits in _INT8_QMM_BITS:
+            for (N, K), group_size in itertools.product(((384, 512), (320, 256)), _INT8_QMM_GROUP_SIZES):
+                w = mx.random.normal((4, N, K), key = mx.random.key(group_size)) * 0.05
+                w, scales, biases = mx.quantize(w.astype(dtype), group_size = group_size, bits = bits)
+                for M in (64, 70):
+                    x = mx.random.normal((M, K), key = mx.random.key(M)).astype(dtype)
+                    indices = mx.array([0] * (M - 6) + [2] * 6, mx.uint32)
+                    tokens = mx.random.randint(0, M, (M,), key = mx.random.key(3)).astype(mx.uint32)
+                    for got, native in (
+                            (int8_qmm(x, w[0], scales[0], biases[0], bits),
+                             mx.quantized_matmul(x, w[0], scales[0], biases[0], transpose = True,
+                                                 group_size = group_size, bits = bits)),
+                            (int8_gather_qmm(x, w, scales, biases, indices, bits),
+                             mx.gather_qmm(x[:, None], w, scales, biases, rhs_indices = indices, transpose = True,
+                                           group_size = group_size, bits = bits, sorted_indices = True)[:, 0]),
+                            (int8_gather_qmm(x, w, scales, biases, indices, bits, tokens),
+                             mx.gather_qmm(x[tokens][:, None], w, scales, biases, rhs_indices = indices,
+                                           transpose = True, group_size = group_size, bits = bits,
+                                           sorted_indices = True)[:, 0])):
+                        native = native.astype(mx.float32)
+                        error = mx.abs(got.astype(mx.float32) - native).max().item()
+                        assert error <= 0.05 * mx.abs(native).max().item(), (bits, group_size, M, error)
