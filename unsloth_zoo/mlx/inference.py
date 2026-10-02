@@ -15,7 +15,8 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """Scoped MLX inference fusions: quantized MoE gate and up projections,
-the recurrent decode convolution, the MoE routing chain, and the pre-norm residual handoff."""
+the recurrent decode convolution, the MoE routing chain, Qwen MoE routed experts, and the pre-norm
+residual handoff."""
 
 import ast
 import functools
@@ -24,15 +25,18 @@ import hashlib
 import inspect
 import logging
 import math
+import os
 import re
 import sys
 import textwrap
 from contextlib import contextmanager
+from pathlib import Path
 from threading import RLock
 from types import FunctionType
 
 import mlx.core as mx
 import mlx.nn as nn
+
 
 
 logger = logging.getLogger(__name__)
@@ -94,7 +98,9 @@ def _resolved_bindings(contract):
             except (OSError, TypeError, SyntaxError, AttributeError):
                 matches = False
             if matches:
-                found[id(holder), name] = (vars(holder), name, target)
+                # A static method's class entry is its descriptor, which is what a rebinding replaces.
+                raw = vars(holder).get(name)
+                found[id(holder), name] = (vars(holder), name, raw if isinstance(raw, staticmethod) else target)
                 for alias, mod in (_ALIASES if expected is not None else ()):
                     if alias in target.__globals__:
                         found[id(target.__globals__), alias] = (target.__globals__, alias, mod)
@@ -1339,15 +1345,28 @@ _QWEN_ROUTING, _GEMMA_ROUTING = 0, 1  # kernel MODE
 
 # The kernel emulates the chain's rounding: softmax partials and reciprocal, stable tie order,
 # sequential bf16 sum over <= 8 values. `_moe_router_verified` checks that at first use.
+# unary_ops.h's Sigmoid, as mx.sigmoid evaluates the shared-expert gate.
+_MOE_ROUTER_SIGMOID = """
+    template <typename T>
+    METAL_FUNC T unsloth_sigmoid(T x) {
+      auto y = 1 / (1 + metal::precise::exp(metal::abs(x)));
+      return (x < 0) ? y : 1 - y;
+    }
+"""
+
+
 @functools.cache
-def _moe_router_kernel():
+def _moe_router_kernel(shared = False):
+    """The routing kernel; `shared` also writes the sigmoid of each row's shared-expert gate logit."""
     try:
         if not mx.metal.is_available():
             return None
         return mx.fast.metal_kernel(
-            name = "unsloth_moe_router",
-            input_names = ["logits", "scale"], output_names = ["inds", "weights"],
+            name = "unsloth_moe_router_shared" if shared else "unsloth_moe_router",
+            input_names = ["logits", "scale"] + (["shared_logit"] if shared else []),
+            output_names = ["inds", "weights"] + (["shared"] if shared else []),
             compile_options = {"math_mode": "safe"},
+            header = _MOE_ROUTER_SIGMOID if shared else "",
             source = """
                 #pragma clang fp contract(off) reassociate(off)
                 // One simdgroup per row. Register r of lane l holds element
@@ -1409,6 +1428,7 @@ def _moe_router_kernel():
                 }
 
                 if (lane != 0) return;
+                SHARED_SCALE
                 device uint* oi = inds + row * K;
                 device OUT_T* ow = weights + row * K;
                 for (int k = 0; k < K; ++k) oi[k] = sel_idx[k];
@@ -1432,7 +1452,7 @@ def _moe_router_kernel():
                         ow[k] = OUT_T(float(T(e[k] * recip)) * float(scale[sel_idx[k]]));
                     }
                 }
-            """,
+            """.replace("SHARED_SCALE", "shared[row] = unsloth_sigmoid(shared_logit[row]);" if shared else ""),
         )
     except (AttributeError, TypeError):
         return None
@@ -1447,17 +1467,21 @@ def _moe_router_shape_ok(experts, top_k, mode):
     return experts % 32 == 0 and experts <= (256 if mode == _QWEN_ROUTING else 1024) and 1 <= top_k <= 8
 
 
-def _run_moe_router(logits, scale, top_k, mode, normalize, out_dtype):
+def _run_moe_router(logits, scale, top_k, mode, normalize, out_dtype, shared_logit = None):
     experts = logits.shape[-1]
     rows = logits.size // experts
-    inds, weights = _moe_router_kernel()(
-        inputs = [logits.reshape(rows, experts), scale],
+    shared = shared_logit is not None
+    outputs = _moe_router_kernel(shared)(
+        inputs = [logits.reshape(rows, experts), scale] + ([shared_logit.reshape(rows)] if shared else []),
         template = [("T", logits.dtype), ("OUT_T", out_dtype), ("E", experts), ("K", top_k),
                     ("MODE", mode), ("NORM", int(normalize))],
         grid = ((rows + 7) // 8 * 256, 1, 1), threadgroup = (256, 1, 1),
-        output_shapes = [(rows, top_k), (rows, top_k)], output_dtypes = [mx.uint32, out_dtype],
+        output_shapes = [(rows, top_k), (rows, top_k)] + ([(rows,)] if shared else []),
+        output_dtypes = [mx.uint32, out_dtype] + ([logits.dtype] if shared else []),
     )
-    return inds.reshape(*logits.shape[:-1], top_k), weights.reshape(*logits.shape[:-1], top_k)
+    lead = logits.shape[:-1]
+    routed = (outputs[0].reshape(*lead, top_k), outputs[1].reshape(*lead, top_k))
+    return routed + (outputs[2].reshape(shared_logit.shape),) if shared else routed
 
 
 def _native_moe_router(logits, scale, top_k, mode, normalize):
@@ -1501,16 +1525,56 @@ def _moe_router_verified(dtype, scale_dtype, experts, top_k, mode, normalize):
     return True
 
 
-def _fused_moe_router(logits, scale, top_k, mode, normalize):
-    """The fused routing, or None when this call has to take the native chain."""
+def _fused_moe_router(logits, scale, top_k, mode, normalize, run = True):
+    """The fused routing, or None when this call has to take the native chain; `run=False` only checks."""
     # A 1-D input normalizes with a sum that rounds differently.
     if (logits.dtype not in _MOE_ROUTER_DTYPES or logits.size == 0 or logits.ndim < 2
             or not _moe_router_shape_ok(logits.shape[-1], top_k, mode)
             or not _moe_router_verified(logits.dtype, scale.dtype, logits.shape[-1], top_k,
                                         mode, normalize)):
         return None
+    if not run:
+        return ()
     return _run_moe_router(logits, scale, top_k, mode, normalize,
                            _moe_router_out_dtype(logits, scale, mode))
+
+
+@functools.cache
+def _moe_router_shared_verified(dtype, experts, top_k, normalize):
+    for rows in (1, 9):
+        logits = (mx.random.normal((rows, experts), key = mx.random.key(rows)) * 3).astype(dtype)
+        gate = (mx.random.normal((rows, 1), key = mx.random.key(rows + 1)) * 8).astype(dtype)
+        native = _native_moe_router(logits, _MOE_ROUTER_NO_SCALE, top_k, _QWEN_ROUTING, normalize)
+        fused = _run_moe_router(logits, _MOE_ROUTER_NO_SCALE, top_k, _QWEN_ROUTING, normalize, dtype, gate)
+        if not all(a.dtype == b.dtype and mx.array_equal(a, b) for a, b in zip(native + (mx.sigmoid(gate),), fused)):
+            logger.warning("the fused MoE router does not reproduce this MLX build's sigmoid for %s; "
+                           "the shared-expert gate stays a separate sigmoid", dtype)
+            return False
+    return True
+
+
+def _fused_moe_router_shared(logits, gate, top_k, normalize):
+    """The Qwen routing and `mx.sigmoid(gate)` from one launch, or None for the separate sigmoid."""
+    if (gate.dtype != logits.dtype or gate.shape != (*logits.shape[:-1], 1)
+            or _fused_moe_router(logits, _MOE_ROUTER_NO_SCALE, top_k, _QWEN_ROUTING, normalize, run = False) is None
+            or not _moe_router_shared_verified(logits.dtype, logits.shape[-1], top_k, normalize)):
+        return None
+    return _run_moe_router(logits, _MOE_ROUTER_NO_SCALE, top_k, _QWEN_ROUTING, normalize, logits.dtype, gate)
+
+
+# mlx_vlm 0.7.1+ `_shared_expert_scale`: `mx.sigmoid(self.shared_expert_gate(x))`. qwen4_exp overrides it.
+_STOCK_SHARED_EXPERT_SCALE = "6399d93293b7fedd"
+
+
+@functools.cache
+def _stock_shared_expert_scale(function):
+    if not isinstance(function, FunctionType) or hasattr(function, "__wrapped__") or function.__closure__:
+        return False
+    try:
+        return (_ast_fingerprint(function) == _STOCK_SHARED_EXPERT_SCALE
+                and function.__globals__.get("mx") is mx)
+    except (OSError, TypeError, SyntaxError):
+        return False
 
 
 def _drifted_call(self, native):
@@ -1519,6 +1583,791 @@ def _drifted_call(self, native):
     if current is native and native.__globals__.get("mx") is mx:
         return None
     return current
+
+
+# Bitwise copies of MLX's unsorted one-row gather (qmv_fast / fp_qmv_fast), compiled SwiGLU and the block's
+# combine. Headers are trimmed from the installed MLX since `metal_kernel` hashes its whole source per launch.
+_INCLUDE = re.compile(r'#include "([^"]+)"')
+# (header, first declaration kept, first declaration dropped); None is the header's start or end.
+_SIGMOID = ("unary_ops.h", "Sigmoid", "Sign")
+_FAMILIES = {
+    True: (("quantized.h", None, "qdot"), _SIGMOID),
+    False: (("fp_quantized.h", None, "qdot"), _SIGMOID),
+}
+
+_HALF = (mx.bfloat16, mx.float16)
+_INDS = (mx.uint32, mx.int32)
+# Stock sums fewer than 32 slots with col_reduce_small, whose order the kernel reproduces.
+_MAX_SLOTS = 31
+_MAX_SIMDS = 16
+_GATE_UP_ROWS = 2
+_DOWN_ROWS = 4
+_INPUTS = {
+    "gate_up": ("wg", "sg", "bg", "wu", "su", "bu", "x", "inds", "k", "n", "top_k"),
+    "down": ("w", "ws", "wb", "x", "inds", "scores", "shared", "s", "k", "n", "top_k"),
+}
+
+_QDOT = r"""
+#define UNROLL _Pragma("clang loop unroll(full)")
+
+#ifdef UNSLOTH_AFFINE
+template <typename T, int bits>
+struct Lane {
+  typedef T scale_t;
+  static constexpr constant int packs = bits == 2 ? 1 : 2;
+  static constexpr constant int pack_factor = get_pack_factor<bits, 32>();
+  static constexpr constant int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+};
+
+template <typename U, int values_per_thread, int bits>
+struct Terms;
+
+template <typename U, int values_per_thread>
+struct Terms<U, values_per_thread, 2> {
+  U t[values_per_thread];
+  void load(const device uint8_t* w) {
+    UNROLL for (int i = 0; i < values_per_thread / 4; i++) {
+      t[4 * i] = w[i] & 0x03;
+      t[4 * i + 1] = w[i] & 0x0c;
+      t[4 * i + 2] = w[i] & 0x30;
+      t[4 * i + 3] = w[i] & 0xc0;
+    }
+  }
+  U dot(const thread U* x) {
+    U accum = 0;
+    UNROLL for (int i = 0; i < values_per_thread / 4; i++) {
+      accum += (x[4 * i] * t[4 * i] + x[4 * i + 1] * t[4 * i + 1] + x[4 * i + 2] * t[4 * i + 2] + x[4 * i + 3] * t[4 * i + 3]);
+    }
+    return accum;
+  }
+};
+
+template <typename U, int values_per_thread>
+struct Terms<U, values_per_thread, 3> {
+  U t[values_per_thread / 8 * 10];
+  void load(const device uint8_t* w) {
+    UNROLL for (int i = 0; i < values_per_thread / 8; i++) {
+      t[10 * i] = w[3 * i] & 0x07;
+      t[10 * i + 1] = w[3 * i] & 0x38;
+      t[10 * i + 2] = w[3 * i] & 0xc0;
+      t[10 * i + 3] = w[3 * i + 1] & 0x01;
+      t[10 * i + 4] = w[3 * i + 1] & 0x0e;
+      t[10 * i + 5] = w[3 * i + 1] & 0x70;
+      t[10 * i + 6] = w[3 * i + 1] & 0x80;
+      t[10 * i + 7] = w[3 * i + 2] & 0x03;
+      t[10 * i + 8] = w[3 * i + 2] & 0x1c;
+      t[10 * i + 9] = w[3 * i + 2] & 0xe0;
+    }
+  }
+  U dot(const thread U* x) {
+    U accum = 0;
+    UNROLL for (int i = 0; i < values_per_thread / 8; i++) {
+      accum += t[10 * i] * x[8 * i];
+      accum += t[10 * i + 1] * x[8 * i + 1];
+      accum += t[10 * i + 2] * x[8 * i + 2];
+      accum += t[10 * i + 3] * (x[8 * i + 2] * 256.0f);
+      accum += t[10 * i + 4] * x[8 * i + 3];
+      accum += t[10 * i + 5] * x[8 * i + 4];
+      accum += t[10 * i + 6] * x[8 * i + 5];
+      accum += t[10 * i + 7] * (x[8 * i + 5] * 256.0f);
+      accum += t[10 * i + 8] * x[8 * i + 6];
+      accum += t[10 * i + 9] * x[8 * i + 7];
+    }
+    return accum;
+  }
+};
+
+template <typename U, int values_per_thread>
+struct Terms<U, values_per_thread, 4> {
+  U t[values_per_thread];
+  void load(const device uint8_t* w) {
+    const device uint16_t* ws = (const device uint16_t*)w;
+    UNROLL for (int i = 0; i < values_per_thread / 4; i++) {
+      t[4 * i] = ws[i] & 0x000f;
+      t[4 * i + 1] = ws[i] & 0x00f0;
+      t[4 * i + 2] = ws[i] & 0x0f00;
+      t[4 * i + 3] = ws[i] & 0xf000;
+    }
+  }
+  U dot(const thread U* x) {
+    U accum = 0;
+    UNROLL for (int i = 0; i < values_per_thread / 4; i++) {
+      accum += (x[4 * i] * t[4 * i] + x[4 * i + 1] * t[4 * i + 1] + x[4 * i + 2] * t[4 * i + 2] + x[4 * i + 3] * t[4 * i + 3]);
+    }
+    return accum;
+  }
+};
+
+template <typename U, int values_per_thread>
+struct Terms<U, values_per_thread, 5> {
+  U t[values_per_thread / 8 * 12];
+  void load(const device uint8_t* w) {
+    UNROLL for (int i = 0; i < values_per_thread / 8; i++) {
+      t[12 * i] = w[5 * i] & 0x1f;
+      t[12 * i + 1] = w[5 * i] & 0xe0;
+      t[12 * i + 2] = w[5 * i + 1] & 0x3;
+      t[12 * i + 3] = w[5 * i + 1] & 0x7c;
+      t[12 * i + 4] = w[5 * i + 1] & 0x80;
+      t[12 * i + 5] = w[5 * i + 2] & 0xf;
+      t[12 * i + 6] = w[5 * i + 2] & 0xf0;
+      t[12 * i + 7] = w[5 * i + 3] & 0x1;
+      t[12 * i + 8] = w[5 * i + 3] & 0x3e;
+      t[12 * i + 9] = w[5 * i + 3] & 0xc0;
+      t[12 * i + 10] = w[5 * i + 4] & 0x7;
+      t[12 * i + 11] = w[5 * i + 4] & 0xf8;
+    }
+  }
+  U dot(const thread U* x) {
+    U accum = 0;
+    UNROLL for (int i = 0; i < values_per_thread / 8; i++) {
+      accum += t[12 * i] * x[8 * i];
+      accum += t[12 * i + 1] * x[8 * i + 1];
+      accum += t[12 * i + 2] * (x[8 * i + 1] * 256.0f);
+      accum += t[12 * i + 3] * x[8 * i + 2];
+      accum += t[12 * i + 4] * x[8 * i + 3];
+      accum += t[12 * i + 5] * (x[8 * i + 3] * 256.0f);
+      accum += t[12 * i + 6] * x[8 * i + 4];
+      accum += t[12 * i + 7] * (x[8 * i + 4] * 256.0f);
+      accum += t[12 * i + 8] * x[8 * i + 5];
+      accum += t[12 * i + 9] * x[8 * i + 6];
+      accum += t[12 * i + 10] * (x[8 * i + 6] * 256.0f);
+      accum += t[12 * i + 11] * x[8 * i + 7];
+    }
+    return accum;
+  }
+};
+
+template <typename U, int values_per_thread>
+struct Terms<U, values_per_thread, 6> {
+  U t[values_per_thread / 4 * 6];
+  void load(const device uint8_t* w) {
+    UNROLL for (int i = 0; i < values_per_thread / 4; i++) {
+      t[6 * i] = w[3 * i] & 0x3f;
+      t[6 * i + 1] = w[3 * i] & 0xc0;
+      t[6 * i + 2] = w[3 * i + 1] & 0x0f;
+      t[6 * i + 3] = w[3 * i + 1] & 0xf0;
+      t[6 * i + 4] = w[3 * i + 2] & 0x03;
+      t[6 * i + 5] = w[3 * i + 2] & 0xfc;
+    }
+  }
+  U dot(const thread U* x) {
+    U accum = 0;
+    UNROLL for (int i = 0; i < values_per_thread / 4; i++) {
+      accum += t[6 * i] * x[4 * i];
+      accum += t[6 * i + 1] * x[4 * i + 1];
+      accum += t[6 * i + 2] * (x[4 * i + 1] * 256.0f);
+      accum += t[6 * i + 3] * x[4 * i + 2];
+      accum += t[6 * i + 4] * (x[4 * i + 2] * 256.0f);
+      accum += t[6 * i + 5] * x[4 * i + 3];
+    }
+    return accum;
+  }
+};
+
+template <typename U, int values_per_thread>
+struct Terms<U, values_per_thread, 8> {
+  U t[values_per_thread];
+  void load(const device uint8_t* w) {
+    UNROLL for (int i = 0; i < values_per_thread; i++) {
+      t[i] = w[i];
+    }
+  }
+  U dot(const thread U* x) {
+    U accum = 0;
+    UNROLL for (int i = 0; i < values_per_thread; i++) {
+      accum += x[i] * t[i];
+    }
+    return accum;
+  }
+};
+#else
+template <typename T, int bits>
+struct Lane {
+  typedef uint8_t scale_t;
+  static constexpr constant int packs = 2;
+  static constexpr constant int pack_factor = get_pack_factor<32, bits>();
+  static constexpr constant int bytes_per_pack = get_bytes_per_pack<32>();
+};
+
+template <typename U, int values_per_thread, int bits>
+struct Terms {
+  U t[values_per_thread];
+  void load(const device uint8_t* w) {
+    if constexpr (bits == 4) {
+      const device uint16_t* ws = (const device uint16_t*)w;
+      UNROLL for (int i = 0; i < values_per_thread / 4; i++) {
+        t[4 * i] = Dequantize<4>{}(ws[i]);
+        t[4 * i + 1] = Dequantize<4>{}(ws[i] >> 4);
+        t[4 * i + 2] = Dequantize<4>{}(ws[i] >> 8);
+        t[4 * i + 3] = Dequantize<4>{}(ws[i] >> 12);
+      }
+    } else {
+      UNROLL for (int i = 0; i < values_per_thread; i++) {
+        t[i] = Dequantize<8>{}(w[i]);
+      }
+    }
+  }
+  U dot(const thread U* x) {
+    U accum = 0;
+    if constexpr (bits == 4) {
+      UNROLL for (int i = 0; i < values_per_thread / 4; i++) {
+        accum += (x[4 * i] * t[4 * i] + x[4 * i + 1] * t[4 * i + 1] + x[4 * i + 2] * t[4 * i + 2] + x[4 * i + 3] * t[4 * i + 3]);
+      }
+    } else {
+      UNROLL for (int i = 0; i < values_per_thread; i++) {
+        accum += x[i] * t[i];
+      }
+    }
+    return accum;
+  }
+};
+#endif
+"""
+
+_SLOTS = r"""
+// Stock's `(y * scores[..., None]).sum(axis=-2)` over k < 32 products `stride` apart: MLX's col_reduce_small, whose
+// min(8, k) row groups each sum from T(0), then fold into the first; a single product is copied as it is.
+template <typename T, typename Products>
+T slot_sum(Products p, int stride, int k) {
+  if (k == 1) {
+    return p[0];
+  }
+  const int groups = min(k, 8);
+  T acc;
+  for (int j = 0; j < groups; j++) {
+    T total = T(0);
+    for (int i = j; i < k; i += groups) {
+      total = p[i * stride] + total;
+    }
+    acc = j == 0 ? total : total + acc;
+  }
+  return acc;
+}
+
+template <typename T>
+T shared_add(T acc, T shared, T s) {
+  T scaled = shared * s;
+  return acc + scaled;
+}
+"""
+
+_ROUTED = r"""
+struct ExpertParams {
+  int K;
+  int N;
+  int top_k;
+  int64_t w[2][3]; // per-expert byte strides of (weight, scales, biases) per projection
+};
+
+template <typename T, int group_size, int bits, int out>
+struct Dots {
+  typedef float U;
+  typedef Lane<T, bits> lane;
+  static constexpr constant int values_per_thread = lane::pack_factor * lane::packs;
+  static constexpr constant int block_size = values_per_thread * SIMD_SIZE;
+  static constexpr constant int scale_step = group_size / values_per_thread;
+  struct Proj {
+    const device uint8_t* w;
+    const device typename lane::scale_t* s;
+    const device T* b;
+  };
+
+  static Proj proj(const device uint8_t* w, const device uint8_t* s, const device uint8_t* b, int K, int n0, int lane_id) {
+    const int K_w = K * lane::bytes_per_pack / lane::pack_factor;
+    const int K_g = K / group_size;
+    return Proj{
+        w + n0 * K_w + lane_id * lane::packs * lane::bytes_per_pack,
+        (const device typename lane::scale_t*)s + n0 * K_g + lane_id / scale_step,
+        (const device T*)b + n0 * K_g + lane_id / scale_step};
+  }
+
+  static void rows(Proj p, int K, thread Terms<U, values_per_thread, bits>& terms, const thread U* xt, U sum, thread U* result) {
+    const int K_w = K * lane::bytes_per_pack / lane::pack_factor;
+    const int K_g = K / group_size;
+    UNROLL for (int o = 0; o < out; o++) {
+      terms.load(p.w + o * K_w);
+#ifdef UNSLOTH_AFFINE
+      U s = p.s[o * K_g];
+      U b = p.b[o * K_g];
+      result[o] += s * terms.dot(xt) + sum * b;
+#else
+      U s = dequantize_scale<U, group_size>(p.s[o * K_g]);
+      result[o] += s * terms.dot(xt);
+#endif
+    }
+  }
+
+  template <int P>
+  static void run(thread Proj* p, const device T* x, int K, int lane_id, thread U* result) {
+    thread U xt[values_per_thread];
+    U sum = 0;
+    Terms<U, values_per_thread, bits> terms;
+    x += lane_id * values_per_thread;
+    for (int k = 0; k < K; k += block_size) {
+#ifdef UNSLOTH_AFFINE
+      sum = load_vector<T, U, values_per_thread, bits>(x, xt);
+#else
+      load_vector<T, U, values_per_thread>(x, xt);
+#endif
+      UNROLL for (int j = 0; j < P; j++) {
+        rows(p[j], K, terms, xt, sum, result + j * out);
+      }
+      UNROLL for (int j = 0; j < P; j++) {
+        p[j].w += block_size * lane::bytes_per_pack / lane::pack_factor;
+        p[j].s += block_size / group_size;
+        p[j].b += block_size / group_size;
+      }
+      x += block_size;
+    }
+    UNROLL for (int i = 0; i < P * out; i++) {
+      result[i] = simd_sum(result[i]);
+    }
+  }
+};
+
+template <typename T, int group_size, int bits, int out, typename Inds>
+METAL_FUNC void gate_up_rows(
+    const device uint8_t* wg,
+    const device uint8_t* sg,
+    const device uint8_t* bg,
+    const device uint8_t* wu,
+    const device uint8_t* su,
+    const device uint8_t* bu,
+    const device T* x,
+    Inds inds,
+    device T* y,
+    ExpertParams p,
+    uint3 tid,
+    uint3 lid) {
+  typedef Dots<T, group_size, bits, out> dots;
+  const int lane = lid.x;
+  const int n0 = tid.x * (2 * out) + lid.y * out;
+  const int64_t e = inds[tid.y];
+  x += size_t(tid.y / p.top_k) * p.K;
+  y += size_t(tid.y) * p.N + n0;
+  thread typename dots::U result[2 * out] = {};
+  thread typename dots::Proj proj[2] = {
+      dots::proj(wg + e * p.w[0][0], sg + e * p.w[0][1], bg + e * p.w[0][2], p.K, n0, lane),
+      dots::proj(wu + e * p.w[1][0], su + e * p.w[1][1], bu + e * p.w[1][2], p.K, n0, lane)};
+  dots::template run<2>(proj, x, p.K, lane, result);
+  // Lane o finishes activation o.
+  UNROLL for (int o = 0; o < out; o++) {
+    if (lane == o) {
+      T gate = static_cast<T>(result[o]);
+      T up = static_cast<T>(result[out + o]);
+      T s = Sigmoid{}(gate);
+      T a = gate * s;
+      y[o] = a * up;
+    }
+  }
+}
+
+template <typename T, int group_size, int bits, int out, typename Inds, typename Scores, typename Shared, typename S>
+METAL_FUNC void down_rows(
+    const device uint8_t* w,
+    const device uint8_t* ws,
+    const device uint8_t* wb,
+    const device T* x,
+    Inds inds,
+    Scores scores,
+    Shared shared,
+    S s,
+    device T* y,
+    ExpertParams p,
+    threadgroup T* products,
+    uint3 tid,
+    uint3 lid,
+    uint3 lsize) {
+  typedef Dots<T, group_size, bits, out> dots;
+  const int lane = lid.x;
+  const int n0 = tid.x * out;
+  const size_t route = size_t(tid.y) * p.top_k;
+  for (int slot = lid.y; slot < p.top_k; slot += lsize.y) {
+    const int64_t e = inds[route + slot];
+    thread typename dots::U result[out] = {};
+    thread typename dots::Proj proj = dots::proj(w + e * p.w[0][0], ws + e * p.w[0][1], wb + e * p.w[0][2], p.K, n0, lane);
+    dots::template run<1>(&proj, x + (route + slot) * p.K, p.K, lane, result);
+    const T score = scores[route + slot];
+    UNROLL for (int o = 0; o < out; o++) {
+      if (lane == o) {
+        products[slot * out + o] = static_cast<T>(result[o]) * score;
+      }
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (lid.y == 0 && lane < out) {
+    const size_t i = size_t(tid.y) * p.N + n0 + lane;
+    y[i] = shared_add(slot_sum<T>(products + lane, out, p.top_k), shared[tid.y], s[i]);
+  }
+}
+"""
+
+_BODIES = {
+    "gate_up": r"""
+  const ExpertParams p{k, n, top_k, {
+      {wg_strides[0] * int64_t(sizeof(*wg)), sg_strides[0] * int64_t(sizeof(*sg)), bg_strides[0] * int64_t(sizeof(*bg))},
+      {wu_strides[0] * int64_t(sizeof(*wu)), su_strides[0] * int64_t(sizeof(*su)), bu_strides[0] * int64_t(sizeof(*bu))}}};
+  gate_up_rows<T, group_size, bits, out>(
+      (const device uint8_t*)wg, (const device uint8_t*)sg, (const device uint8_t*)bg,
+      (const device uint8_t*)wu, (const device uint8_t*)su, (const device uint8_t*)bu,
+      x, inds, y, p, threadgroup_position_in_grid, thread_position_in_threadgroup);
+""",
+    "down": r"""
+  threadgroup T products[31 * out];
+  const ExpertParams p{k, n, top_k, {{w_strides[0] * int64_t(sizeof(*w)), ws_strides[0] * int64_t(sizeof(*ws)), wb_strides[0] * int64_t(sizeof(*wb))}, {}}};
+  down_rows<T, group_size, bits, out>(
+      (const device uint8_t*)w, (const device uint8_t*)ws, (const device uint8_t*)wb, x, inds, scores, shared, s, y, p,
+      products, threadgroup_position_in_grid, thread_position_in_threadgroup, threads_per_threadgroup);
+""",
+}
+
+
+def _boundary(text, name):
+    # Start of the top-level declaration of `name`: the line after the previous closing brace.
+    match = re.search(rf"^\w.*\b{name}\s*[({{]", text, re.M)
+    if match is None:
+        raise RuntimeError(f"the installed MLX headers no longer declare {name}")
+    at = match.start()
+    return text.index("\n", text.rfind("\n}", 0, at) + 1) + 1
+
+
+def _inline(path, seen, first = None, stop = None):
+    if path in seen:
+        return ""
+    seen.add(path)
+    text = (Path(mx.__file__).parent / "include" / path).read_text()
+    text = text[_boundary(text, first) if first else 0 : _boundary(text, stop) if stop else len(text)]
+    return _INCLUDE.sub(lambda m: _inline(m.group(1), seen), text).replace("#pragma once", "")
+
+
+def _mlx_headers(affine):
+    # utils.h and what it includes are already in metal_kernel's preamble.
+    seen = set()
+    _inline("mlx/backend/metal/kernels/utils.h", seen)
+    return "".join(
+        _inline(f"mlx/backend/metal/kernels/{name}", seen, first, stop)
+        for name, first, stop in _FAMILIES[affine]
+    )
+
+
+@functools.cache
+def _kernel(name, affine):
+    try:
+        if not mx.metal.is_available():
+            return None
+        header = _mlx_headers(affine) + ("#define UNSLOTH_AFFINE 1\n" if affine else "")
+        return mx.fast.metal_kernel(
+            name = f"unsloth_moe_{name}_{'affine' if affine else 'fp'}",
+            input_names = list(_INPUTS[name]),
+            output_names = ["y"],
+            source = _BODIES[name],
+            header = header + _QDOT + _SLOTS + _ROUTED,
+            ensure_row_contiguous = False,
+        )
+    except (AttributeError, OSError, RuntimeError, TypeError):
+        return None
+
+
+@functools.lru_cache(maxsize = 64)
+def _scalar(value):
+    return mx.array(value, mx.int32)
+
+
+def _values_per_thread(mode, bits):
+    if mode != "affine":
+        return 2 * 32 // bits
+    pack_factor = 8 if bits in (3, 5) else 4 if bits == 6 else 32 // bits
+    return pack_factor * (1 if bits == 2 else 2)
+
+
+def _trailing(a, dtype, rows, cols):
+    return a.dtype == dtype and a.ndim >= 2 and a.shape[-2:] == (rows, cols)
+
+
+def _one_row_fast(mode, group_size, bits, dtype, k, n, w, scales, biases):
+    """Whether MLX's one-row gather kernel for (K, N) is qmv_fast / fp_qmv_fast for these weights."""
+    affine = mode == "affine"
+    known = (
+        (affine and 2 <= bits <= 8 and bits != 7 and group_size in (32, 64, 128))
+        or (mode == "mxfp4" and bits == 4 and group_size == 32)
+        or (mode == "mxfp8" and bits == 8 and group_size == 32)
+        or (mode == "nvfp4" and bits == 4 and group_size == 16)
+    )
+    if not known or scales is None or affine != (biases is not None):
+        return False
+    per_thread = _values_per_thread(mode, bits)
+    if n % 8 != 0 or n < 16 or k % (per_thread * 32) != 0 or group_size < per_thread:
+        return False
+    return (
+        _trailing(w, mx.uint32, n, k * bits // 32)
+        and _trailing(scales, dtype if affine else mx.uint8, n, k // group_size)
+        and (not affine or _trailing(biases, dtype, n, k // group_size))
+    )
+
+
+def _key(a):
+    return None if a is None else (a.shape, a.dtype)
+
+
+class _Spec:
+    __slots__ = ("shape", "dtype", "ndim")
+
+    def __init__(self, key):
+        self.shape, self.dtype = key
+        self.ndim = len(self.shape)
+
+
+def _specs(keys):
+    return [None if k is None else _Spec(k) for k in keys]
+
+
+def _projection(t, mode, group_size, bits, dtype, k):
+    """N of one projection's (weight, scales[, biases]) with one fast-kernel weight per expert, else -1."""
+    if len(t) != (3 if mode == "affine" else 2) or any(a.ndim != 3 or a.shape[0] != t[0].shape[0] for a in t):
+        return -1
+    n = t[0].shape[-2]
+    scales, biases = (list(t[1:]) + [None])[:2]
+    return n if _one_row_fast(mode, group_size, bits, dtype, k, n, t[0], scales, biases) else -1
+
+
+def _launch(name, affine, dtype, quant, out_rows, per, projections, experts, shape, grid, threadgroup, k, n, top_k, routes):
+    call = _kernel(name, affine)
+    if call is None:
+        return None
+    scalars = [_scalar(k), _scalar(n), _scalar(top_k)]
+    args = dict(
+        template = [("T", dtype), ("group_size", quant[0]), ("bits", quant[1]), ("out", out_rows)],
+        grid = grid,
+        threadgroup = threadgroup,
+        output_shapes = [shape],
+        output_dtypes = [dtype],
+    )
+
+    def run(*arrays):
+        weights, activations = arrays[: projections * per], arrays[projections * per :]
+        bound = []
+        for j in range(projections):
+            t = weights[j * per : (j + 1) * per]
+            # The fp kernel never reads the biases stand-in; slicing to reachable experts bounds the command buffer size.
+            bound += [t[min(i, per - 1)][: min(routes, experts)] for i in range(3)]
+        return call(inputs = [*bound, *map(mx.contiguous, activations), *scalars], **args)[0]
+
+    return mx.compile(run)
+
+
+@functools.lru_cache(maxsize = 1024)
+def _gate_up_plan(x, inds, gate, up, group_size, bits, mode):
+    x, inds = _specs((x, inds))
+    gate, up = _specs(gate), _specs(up)
+    if (
+        x.ndim == 0
+        or x.dtype not in _HALF
+        or inds.ndim != x.ndim
+        or inds.dtype not in _INDS
+        or inds.shape[-1] < 1
+        or x.shape[:-1] != inds.shape[:-1]
+    ):
+        return None
+    k = x.shape[-1]
+    n = _projection(gate, mode, group_size, bits, x.dtype, k)
+    if (n < 0 or n % (2 * _GATE_UP_ROWS) != 0
+            or _projection(up, mode, group_size, bits, x.dtype, k) != n
+            or gate[0].shape[0] != up[0].shape[0]):
+        return None
+    shape, routes = (*inds.shape, n), math.prod(inds.shape)
+    if routes == 0:
+        return shape, x.dtype
+    return _launch(
+        "gate_up", mode == "affine", x.dtype, (group_size, bits), _GATE_UP_ROWS, len(gate), 2,
+        gate[0].shape[0], shape, grid = (32 * n // (2 * _GATE_UP_ROWS), 2 * routes, 1),
+        threadgroup = (32, 2, 1), k = k, n = n, top_k = inds.shape[-1], routes = routes,
+    )
+
+
+def _combinable(x, scores, shared, s, n):
+    t = x.dtype
+    if t not in _HALF or any(a.dtype != t for a in (scores, shared, s)) or x.ndim < 2 or scores.ndim != x.ndim - 1:
+        return False
+    if shared.ndim != scores.ndim or s.ndim != scores.ndim:
+        return False
+    lead = scores.shape[:-1]
+    return (
+        1 <= scores.shape[-1] <= _MAX_SLOTS
+        and x.shape[: scores.ndim] == scores.shape
+        and shared.shape == (*lead, 1)
+        and s.shape == (*lead, n)
+    )
+
+
+@functools.lru_cache(maxsize = 1024)
+def _down_plan(x, inds, scores, shared, s, w, group_size, bits, mode):
+    x, inds, scores, shared, s = _specs((x, inds, scores, shared, s))
+    w = _specs(w)
+    if x.ndim < 2 or inds.dtype not in _INDS or inds.shape != scores.shape:
+        return None
+    n = _projection(w, mode, group_size, bits, x.dtype, x.shape[-1])
+    if n < 0 or n % _DOWN_ROWS != 0 or not _combinable(x, scores, shared, s, n):
+        return None
+    routes, top_k = math.prod(inds.shape), scores.shape[-1]
+    if math.prod(s.shape) == 0:
+        return s.shape, x.dtype
+    simds = min(top_k, _MAX_SIMDS)
+    return _launch(
+        "down", mode == "affine", x.dtype, (group_size, bits), _DOWN_ROWS, len(w), 1, w[0].shape[0],
+        s.shape, grid = (32 * n // _DOWN_ROWS, simds * (routes // top_k), 1),
+        threadgroup = (32, simds, 1), k = x.shape[-1], n = n, top_k = top_k, routes = routes,
+    )
+
+
+def _run(launch, weights, activations):
+    if launch is None:
+        return None
+    if not callable(launch):
+        return mx.zeros(*launch)
+    return launch(*weights, *activations)
+
+
+def _routed_gate_up(x, inds, gate, up, group_size, bits, mode):
+    """SwiGLU(gate, up) of experts `inds` (..., top_k) on x (..., K): (..., top_k, N), or None.
+
+    `gate` and `up` are a projection's (weight, scales[, biases]) shaped (E, N, ...), read with their
+    own expert stride, so row-slice views of a packed weight serve as they are.
+    """
+    launch = _gate_up_plan(_key(x), _key(inds), tuple(map(_key, gate)), tuple(map(_key, up)), group_size, bits, mode)
+    return _run(launch, [*gate, *up], [x, inds])
+
+
+def _routed_down(x, inds, scores, shared, s, w, group_size, bits, mode):
+    """`(y * scores[..., None]).sum(-2) + shared * s` for y the down projections of x (..., top_k, K)
+    by experts `inds`, or None."""
+    launch = _down_plan(*map(_key, (x, inds, scores, shared, s)), tuple(map(_key, w)), group_size, bits, mode)
+    return _run(launch, list(w), [x, inds, scores, shared, s])
+
+
+_MOE_UNSORTED_ROUTES = 64
+# The switch layer bodies the routed-expert kernels reimplement besides the gate/up contract's.
+_MOE_ROUTED_FUNCTIONS = {"SwiGLU.__call__": "b6e81906a2a7d4c9", "swiglu": "bc9e3d24f39fe8b1"}
+_MOE_ROUTED_VERDICTS = {}
+
+
+def _projection_tensors(linear):
+    return tuple(linear[name] for name in ("weight", "scales", "biases") if name in linear)
+
+
+def _expert_rows_packed(tensor):
+    # The kernels take only the expert stride from the array; gate/up pack row-slice views keep the rest packed.
+    try:
+        strides = memoryview(tensor).strides
+    except (TypeError, ValueError, BufferError):
+        return False
+    return tensor.ndim == 3 and strides[1:] == (tensor.shape[2] * tensor.itemsize, tensor.itemsize)
+
+
+def _switch_base(cls, specs):
+    """The native switch class `cls` dispatches to unchanged: itself, or the one the gate/up pack wraps."""
+    if cls in specs:
+        return cls
+    if cls in _MOE_GATE_UP_CLASSES.values() and cls.__bases__[0] in specs:
+        return cls.__bases__[0]
+    return None
+
+
+class _RoutedExperts:
+    """A sparse block's routed experts on the decode kernels, for unsorted routes outside the short-block band."""
+
+    def __init__(self, mlp, base, projection_type, activation_type, decode_block, bindings):
+        self.mlp, self.base, self.classes = mlp, base, {base}
+        self.projection_type, self.activation_type = projection_type, activation_type
+        self.decode_block, self.bindings = decode_block, bindings
+        self.verdicts = {}
+        self.layout = (None, False)
+
+    def __call__(self, block, x, inds, scores, shared, s):
+        mlp = block.switch_mlp
+        if (mlp is not self.mlp or mlp.training or (x.ndim == 3 and 1 < x.shape[1] <= self.decode_block)
+                or not _bindings_intact(self.bindings)):
+            return None
+        if type(mlp) not in self.classes:
+            if _switch_base(type(mlp), {self.base: None}) is not self.base:
+                return None
+            self.classes.add(type(mlp))
+        projections = (mlp.gate_proj, mlp.up_proj, mlp.down_proj)
+        if (type(mlp.activation) is not self.activation_type or "_combine" in mlp.__dict__
+                or any(type(p) is not self.projection_type or "bias" in p for p in projections)):
+            return None
+        tensors = tuple(map(_projection_tensors, projections))
+        key = tuple(id(t) for group in tensors for t in group)
+        if self.layout[0] != key:
+            self.layout = (key, all(_expert_rows_packed(t) for group in tensors for t in group))
+        if not self.layout[1]:
+            return None
+        verdict = self.verdicts.get(x.dtype)
+        if verdict is None:
+            verdict = self.verdicts[x.dtype] = self._verified(x.dtype, inds.shape[-1])
+        if not verdict:
+            return None
+        return self._run(tensors, x, inds, scores, shared, s)
+
+    def _run(self, tensors, x, inds, scores, shared, s):
+        gate, up, down = self.mlp.gate_proj, self.mlp.up_proj, self.mlp.down_proj
+        activations = _routed_gate_up(x, inds, tensors[0], tensors[1], gate.group_size, gate.bits, gate.mode)
+        if activations is None:
+            return None
+        return _routed_down(activations, inds, scores, shared, s, tensors[2],
+                                   down.group_size, down.bits, down.mode)
+
+    def _verified(self, dtype, top_k):
+        mlp = self.mlp
+        signature = (dtype, top_k, self.base) + tuple(
+            (p.group_size, p.bits, p.mode, p.weight.shape, p.weight.dtype)
+            for p in (mlp.gate_proj, mlp.up_proj, mlp.down_proj))
+        if signature not in _MOE_ROUTED_VERDICTS:
+            _MOE_ROUTED_VERDICTS[signature] = self._probe(dtype, top_k)
+            if not _MOE_ROUTED_VERDICTS[signature]:
+                logger.warning("the routed-expert decode kernels do not reproduce this MLX build's "
+                               "native experts for %s; the native experts stay in use", signature[3:])
+        return _MOE_ROUTED_VERDICTS[signature]
+
+    def _probe(self, dtype, top_k):
+        mlp = self.mlp
+        tensors = tuple(map(_projection_tensors, (mlp.gate_proj, mlp.up_proj, mlp.down_proj)))
+        experts, hidden = mlp.gate_proj.weight.shape[0], mlp.down_proj.weight.shape[1]
+        width = mlp.gate_proj.scales.shape[-1] * mlp.gate_proj.group_size
+        for rows in (1, max(2, (_MOE_UNSORTED_ROUTES - 1) // top_k)):
+            kx, ki, kw, kg, ks = mx.random.split(mx.random.key(rows), 5)
+            x = mx.random.normal((rows, 1, width), key = kx).astype(dtype)
+            inds = mx.random.randint(0, experts, (rows, 1, top_k), key = ki).astype(mx.uint32)
+            scores = mx.softmax(mx.random.normal((rows, 1, top_k), key = kw), axis = -1).astype(dtype)
+            shared = mx.sigmoid(mx.random.normal((rows, 1, 1), key = kg)).astype(dtype)
+            s = mx.random.normal((rows, 1, hidden), key = ks).astype(dtype)
+            fused = self._run(tensors, x, inds, scores, shared, s)
+            y = self.base.__call__(mlp, x, inds)
+            native = (y * scores[..., None]).sum(axis = -2) + shared * s
+            if fused is None or fused.dtype != native.dtype or not mx.array_equal(fused, native, equal_nan = True):
+                return False
+        return True
+
+
+def _moe_routed_experts(block):
+    mlp = getattr(block, "switch_mlp", None)
+    if not isinstance(mlp, dict) or mlp.training:
+        return None
+    specs = _moe_switch_specs()
+    base = _switch_base(type(mlp), specs)
+    if base is None:
+        return None
+    projection_type, _, _, decode_block, bindings = specs[base]
+    if any(type(getattr(mlp, name, None)) is not projection_type
+           for name in ("gate_proj", "up_proj", "down_proj")):
+        return None
+    functions = dict(_MOE_ROUTED_FUNCTIONS)
+    if "_combine" in vars(base):  # mlx-vlm's SwitchGLU returns through this static helper
+        functions[f"{base.__name__}._combine"] = "fe6e29351fdc9b1e"
+    routed_bindings = _resolved_bindings({base.__module__: functions, **_CONV_SILU_CONTRACT})
+    native = sys.modules[base.__module__]
+    if routed_bindings is None or type(getattr(mlp, "activation", None)) is not native.SwiGLU:
+        return None
+    return _RoutedExperts(mlp, base, projection_type, native.SwiGLU, decode_block, bindings + routed_bindings)
 
 
 def _qwen3_5_moe_call(native, scaled_shared, top_k_norm):
@@ -1531,18 +2380,33 @@ def _qwen3_5_moe_call(native, scaled_shared, top_k_norm):
         if target_verify or self.training or getattr(self, "sharding_group", None) is not None:
             return native(self, x, target_verify) if target_verify else native(self, x)
         normalize = bool(self.norm_topk_prob) if top_k_norm else True
-        routed = _fused_moe_router(self.gate(x), _MOE_ROUTER_NO_SCALE, self.top_k, _QWEN_ROUTING, normalize)
+        logits = self.gate(x)
+        experts = getattr(self, "_unsloth_moe_routed", None)
+        # Fold the shared-gate sigmoid into the routing launch only where the routed kernel consumes it.
+        gate = None
+        if (experts is not None and x.size // x.shape[-1] * self.top_k < _MOE_UNSORTED_ROUTES
+                and (not scaled_shared or ("_shared_expert_scale" not in self.__dict__
+                                           and _stock_shared_expert_scale(type(self)._shared_expert_scale)))):
+            gate = self.shared_expert_gate(x)
+        routed = None if gate is None else _fused_moe_router_shared(logits, gate, self.top_k, normalize)
         if routed is None:
-            return native(self, x)
-        inds, scores = routed
+            routed = _fused_moe_router(logits, _MOE_ROUTER_NO_SCALE, self.top_k, _QWEN_ROUTING, normalize)
+            if routed is None:
+                return native(self, x)
+            routed += (None,)
+        inds, scores, shared_scale = routed
+        shared_y = self.shared_expert(x)
+        if gate is not None and shared_scale is None:
+            shared_scale = mx.sigmoid(gate)
+        elif shared_scale is None:
+            shared_scale = self._shared_expert_scale(x) if scaled_shared else mx.sigmoid(self.shared_expert_gate(x))
+        if experts is not None and inds.size < _MOE_UNSORTED_ROUTES:
+            out = experts(self, x, inds, scores, shared_scale, shared_y)
+            if out is not None:
+                return out
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis = -2)
-        shared_y = self.shared_expert(x)
-        if scaled_shared:
-            shared_y = self._shared_expert_scale(x) * shared_y
-        else:
-            shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
-        return y + shared_y
+        return y + shared_scale * shared_y
 
     return fused_call
 
@@ -1669,5 +2533,53 @@ def fused_moe_router(model):
                 native = getattr(type(module), "_unsloth_router_native", None)
                 if native is not None:
                     module.__class__ = native
-                module.__dict__.pop("_unsloth_router_scopes", None)
-                module.__dict__.pop("_unsloth_router_norm", None)
+                for name in ("_unsloth_router_scopes", "_unsloth_router_norm"):
+                    module.__dict__.pop(name, None)
+
+
+@contextmanager
+def fused_moe_routed_experts(model):
+    """Run Qwen sparse MoE blocks' routed experts on two decode kernels during serialized inference.
+
+    Gate/up with SwiGLU, and down with the routing-weight combine and shared-expert add, serve
+    calls whose routes MLX gathers unsorted, each checked bitwise against the native experts at
+    first use; where they serve a call, the routing launch also writes the shared-expert gate's
+    sigmoid. The kernels run from `fused_moe_router`'s fused call, so without that scope the
+    blocks stay native. Training and distributed models keep the native experts, and so does
+    every model while UNSLOTH_MLX_ROUTED_EXPERTS=0.
+    """
+    changed = []
+    try:
+        with _MOE_ROUTER_LOCK:
+            modules = model.named_modules() if hasattr(model, "named_modules") else ()
+            if (os.environ.get("UNSLOTH_MLX_ROUTED_EXPERTS", "1") != "0"
+                    and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)
+                    and _moe_router_kernel() is not None):
+                for _, module in modules:
+                    # Type before `training`: named_modules() may yield plain stand-ins.
+                    if not isinstance(module, dict) or module.training or "__call__" in module:
+                        continue
+                    if getattr(module, "_unsloth_moe_routed_scopes", 0):
+                        module._unsloth_moe_routed_scopes += 1
+                        changed.append(module)
+                        continue
+                    base = getattr(type(module), "_unsloth_router_native", None) or type(module)
+                    spec = _moe_router_class(base)
+                    if spec is None or spec[1] != _QWEN_ROUTING:
+                        continue
+                    experts = _moe_routed_experts(module)
+                    if experts is None:
+                        continue
+                    module._unsloth_moe_routed = experts
+                    module._unsloth_moe_routed_scopes = 1
+                    changed.append(module)
+        yield model
+    finally:
+        with _MOE_ROUTER_LOCK:
+            for module in reversed(changed):
+                scopes = module._unsloth_moe_routed_scopes
+                if scopes > 1:
+                    module._unsloth_moe_routed_scopes = scopes - 1
+                    continue
+                for name in ("_unsloth_moe_routed_scopes", "_unsloth_moe_routed"):
+                    module.__dict__.pop(name, None)

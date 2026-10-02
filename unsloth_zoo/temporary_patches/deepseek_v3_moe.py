@@ -178,7 +178,6 @@ def patch_deepseek_v3():
                 past_key_values=outputs.past_key_values,
                 hidden_states=outputs.hidden_states,
                 attentions=outputs.attentions,
-                router_logits=outputs.router_logits,
             )
 
         # Preserve __qualname__ so _unsloth_get_batch_samples can detect
