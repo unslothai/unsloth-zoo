@@ -18,6 +18,7 @@
 
 import importlib
 import inspect
+import re
 
 import pytest
 
@@ -71,6 +72,9 @@ def test_loss_function_call_layouts_are_fused(name):
     assert "logit_scale_divide   = (self.config.logits_scaling)" in out
     kwargs = "lm_kwargs" if "lm_kwargs" in CALLS[name] else "kwargs"
     assert f"if ({kwargs}) != () and type({kwargs}) is dict:" in out
+    # A consumed upcast is replayed before both unfused loss_function calls (UNSLOTH_RETURN_LOGITS=1, fallback).
+    upcasts = len(re.findall(r"logits = logits\.float\(\)\n\s*loss = self\.loss_function\(", out))
+    assert upcasts == (2 if "logits.float()" in CALLS[name] else 0)
 
 
 @pytest.mark.parametrize(
