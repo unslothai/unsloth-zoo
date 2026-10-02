@@ -1013,13 +1013,8 @@ def _drifted_call(self, native):
     return current
 
 
-# SwitchGLU sorts the routes from this many on; below it every route is a one-row gather.
-# `_routed_gate_up` and `_routed_down` run the experts' one-row quantized products without sorting
-# or gathering the routes, each value bitwise what MLX computes for the same call: its unsorted
-# one-row gather kernel (qmv_fast / fp_qmv_fast), mlx's compiled SwiGLU, and the routing-weight
-# combine and shared-expert add of the MoE block. The declarations they build on are read from the
-# installed MLX's Metal headers and trimmed to what the kernels use, since `metal_kernel` hashes
-# its whole source on every launch.
+# Bitwise copies of MLX's unsorted one-row gather (qmv_fast / fp_qmv_fast), compiled SwiGLU and the block's
+# combine. Headers are trimmed from the installed MLX since `metal_kernel` hashes its whole source per launch.
 _INCLUDE = re.compile(r'#include "([^"]+)"')
 # (header, first declaration kept, first declaration dropped); None is the header's start or end.
 _SIGMOID = ("unary_ops.h", "Sigmoid", "Sign")
@@ -1581,8 +1576,7 @@ def _launch(name, affine, dtype, quant, out_rows, per, projections, experts, sha
         bound = []
         for j in range(projections):
             t = weights[j * per : (j + 1) * per]
-            # A missing biases slot takes a stand-in the fp kernel never reads. Only the experts a
-            # call can reach count toward the command buffer's size; the rest stay readable.
+            # The fp kernel never reads the biases stand-in; slicing to reachable experts bounds the command buffer size.
             bound += [t[min(i, per - 1)][: min(routes, experts)] for i in range(3)]
         return call(inputs = [*bound, *map(mx.contiguous, activations), *scalars], **args)[0]
 
@@ -1689,8 +1683,7 @@ def _projection_tensors(linear):
 
 
 def _expert_rows_packed(tensor):
-    # The kernels read each expert's rows back to back and only take the expert stride from the
-    # array, which a gate/up pack's row-slice views keep; other views MLX copies natively.
+    # The kernels take only the expert stride from the array; gate/up pack row-slice views keep the rest packed.
     try:
         strides = memoryview(tensor).strides
     except (TypeError, ValueError, BufferError):
@@ -1817,8 +1810,7 @@ def _qwen3_5_moe_call(native, scaled_shared, top_k_norm):
         normalize = bool(self.norm_topk_prob) if top_k_norm else True
         logits = self.gate(x)
         experts = getattr(self, "_unsloth_moe_routed", None)
-        # Where the routed-experts kernel takes the shared-expert scale, its sigmoid rides on the
-        # routing launch; elsewhere computing it first would put the gate on the routing chain.
+        # Fold the shared-gate sigmoid into the routing launch only where the routed kernel consumes it.
         gate = None
         if (experts is not None and x.size // x.shape[-1] * self.top_k < _MOE_UNSORTED_ROUTES
                 and (not scaled_shared or ("_shared_expert_scale" not in self.__dict__
