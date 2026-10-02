@@ -543,8 +543,7 @@ def _fused_decode_conv_class(base, call, prepare, conv, silu):
 
 @contextmanager
 def fused_decode_conv_silu(model):
-    """Fuse the recurrent decode convolution window, convolution, SiLU and q/k/v split into one
-    launch during serialized inference.
+    """Fuse the recurrent decode conv window, convolution, SiLU and q/k/v split into one launch during serialized inference.
 
     Prefill, unsupported convolution shapes, and training keep their native paths.
     Instance classes are restored when the context exits, including on cancellation.
