@@ -422,6 +422,7 @@ jobs:
         # test_device_map_planner_compressed_tensors: pack-quantized checkpoints planned at packed bytes.
         # test_grpo_mask_truncated_rows: truncated completions stay out of the GRPO loss; its UnslothEfficientGRPO stubs bind to the real forward.
         # test_mlx_embedding_guards: sentence-transformers layout shim and pooling-mode map, under the torch shim.
+        # test_output_collector_compile: the capture_outputs collector mirror compiles fullgraph and stays per thread / context.
         run: |
           python -m pytest \
             tests/test_training_utils_use_cache.py \
@@ -509,6 +510,7 @@ jobs:
             tests/test_gemma3n_kv_sharing_without_cache.py \
             tests/test_gemma3n_rmsnorm_with_scale.py \
             tests/test_mlx_gkd_guards.py \
+            tests/test_output_collector_compile.py \
             -v
 
       - name: pytest MLX adapter-filter gate (HARD GATE)
