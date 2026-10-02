@@ -3437,7 +3437,32 @@ ce_finders = [
 ]
 
 
+def _normalize_lm_head_source(forward):
+    # `logits = self.lm_head(x) * self.s` on one line (HyperCLOVAX vision) -> two lines.
+    forward = re.sub(
+        r"^([ \t]+)logits = (self\.lm_head\([^\n]+\)) ([\*/]) (self\.[\w\.]+)[ \t]*$",
+        r"\1logits = \2\n\1logits = logits \3 \4",
+        forward,
+        flags = re.MULTILINE,
+    )
+    # transformers 4.x CTRL / OpenAI GPT name it `lm_logits`; rename only if `logits` is unused.
+    if re.search(r"^[ \t]+lm_logits = self\.lm_head\(", forward, flags = re.MULTILINE) \
+            and not re.search(r"(?<![\w.])logits(?![\w=])", forward):
+        forward = re.sub(r"\blm_logits\b", "logits", forward)
+    return forward
+
+
 def apply_fused_lm_head(forward, module=None):
+    # Normalised copies are kept only if they fuse, so unmatched sources come back byte-identical.
+    normalized = _normalize_lm_head_source(forward)
+    if normalized != forward:
+        new_forward, fused = _apply_fused_lm_head(normalized, module)
+        if fused:
+            return new_forward, fused
+    return _apply_fused_lm_head(forward, module)
+
+
+def _apply_fused_lm_head(forward, module=None):
     # All Unsloth Zoo code licensed under LGPLv3
     UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
     for jj, (cross_entropy_find, cross_entropy_replacement) in enumerate(ce_finders):
@@ -6338,10 +6363,15 @@ def unsloth_compile_transformers(
                 # Fix some arguments up like for Gemma 3N
                 new_source = fixup_fused_lm_head(source)
                 new_source = fixup_dropped_logit_scale(new_source, module)
-                # Apply fused LM transforms
-                new_source, supports_return_hidden_states = apply_fused_lm_head(
-                    new_source, module
-                )
+                # Apply fused LM transforms; the kernel reads lm_head.weight, which composite
+                # Roberta-style heads lack.
+                from .fused_losses.forward_install import _head_built_as_linear
+                if _head_built_as_linear(module_class, "lm_head"):
+                    new_source, supports_return_hidden_states = apply_fused_lm_head(
+                        new_source, module
+                    )
+                else:
+                    supports_return_hidden_states = False
                 # print(new_source)
                 new_source = apply_mask_attention_mask_out(new_source)
                 if new_source != source:

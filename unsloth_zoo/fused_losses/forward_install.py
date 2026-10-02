@@ -179,6 +179,24 @@ def _is_eligible_class(cls) -> bool:
     return True
 
 
+def _head_built_as_linear(cls, head_attr) -> bool:
+    """False when the nearest __init__ builds `self.<head_attr>` from a non-Linear class: Roberta-style
+    `RobertaLMHead` (dense + norm + decoder) has no .weight, so the fused adapter crashed. Unknown: True."""
+    for klass in cls.__mro__:
+        init = klass.__dict__.get("__init__")
+        if init is None:
+            continue
+        try:
+            tree = ast.parse(textwrap.dedent(inspect.getsource(init)))
+        except (OSError, TypeError, SyntaxError):
+            continue
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
+                    and any(ast.unparse(t) == f"self.{head_attr}" for t in node.targets)):
+                return "Linear" in ast.unparse(node.value.func).rsplit(".", 1)[-1]
+    return True
+
+
 def install_for_class(cls) -> bool:
     """Try to install the fused forward on `cls`. Returns True on success."""
     if not is_enabled():
@@ -229,7 +247,7 @@ def install_for_class(cls) -> bool:
         return False
     # Composite heads (e.g. BigBird's BigBirdOnlyMLMHead via self.cls) lack
     # .weight/.bias and would crash inside the adapter.
-    if cap.head_attr not in _LINEAR_HEAD_ATTRS:
+    if cap.head_attr not in _LINEAR_HEAD_ATTRS or not _head_built_as_linear(cls, cap.head_attr):
         with _REGISTRY_LOCK:
             _UNMATCHED[qn] = f"non-linear-head: {cap.head_attr}"
         return False
