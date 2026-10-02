@@ -3251,7 +3251,9 @@ $LOGITSCALINGMULTIPLY$
 $LOGITSCALINGDIVISION$
 $LOGITSOFTCAPPING$
 loss = None
-if labels is not None:$SPACES$loss = self.loss_function($NEWLINES$$LOGITS$, $LABELS$, $VOCABSIZE$$KWARGS$$NEWLINES$)
+if labels is not None:$SPACES$
+$LOGITSUPCAST$
+loss = self.loss_function($NEWLINES$$LOGITS$,$NEWLINES$$LABELS$,$NEWLINES$$VOCABSIZE$$KWARGS$,?$NEWLINES$)
 """
 
 cross_entropy_replacement_2 = """
@@ -3470,7 +3472,32 @@ ce_finders = [
 ]
 
 
+def _normalize_lm_head_source(forward):
+    # `logits = self.lm_head(x) * self.s` on one line (HyperCLOVAX vision) -> two lines.
+    forward = re.sub(
+        r"^([ \t]+)logits = (self\.lm_head\([^\n]+\)) ([\*/]) (self\.[\w\.]+)[ \t]*$",
+        r"\1logits = \2\n\1logits = logits \3 \4",
+        forward,
+        flags = re.MULTILINE,
+    )
+    # transformers 4.x CTRL / OpenAI GPT name it `lm_logits`; rename only if `logits` is unused.
+    if re.search(r"^[ \t]+lm_logits = self\.lm_head\(", forward, flags = re.MULTILINE) \
+            and not re.search(r"(?<![\w.])logits(?![\w=])", forward):
+        forward = re.sub(r"\blm_logits\b", "logits", forward)
+    return forward
+
+
 def apply_fused_lm_head(forward, module=None):
+    # Kept only if it fuses, so unmatched sources come back byte-identical.
+    normalized = _normalize_lm_head_source(forward)
+    if normalized != forward:
+        new_forward, fused = _apply_fused_lm_head(normalized, module)
+        if fused:
+            return new_forward, fused
+    return _apply_fused_lm_head(forward, module)
+
+
+def _apply_fused_lm_head(forward, module=None):
     # All Unsloth Zoo code licensed under LGPLv3
     UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
     for jj, (cross_entropy_find, cross_entropy_replacement) in enumerate(ce_finders):
@@ -3511,13 +3538,8 @@ def apply_fused_lm_head(forward, module=None):
                 r"self\.config\.get_text_config\(\)\.vocab_size"
                 ")",
             )
-            # Any identifier, not a list of the two names we had seen. transformers
-            # 5.17 renamed gemma3's to `lm_kwargs`, and because a finder that does
-            # not match is a silent no-op, the only symptom was Gemma 3 quietly
-            # losing fused linear cross entropy. One capture group either way, and
-            # the replacements splice the captured NAME in, so a new spelling
-            # works without being enumerated here.
-            .replace("$KWARGS$", r"(?:, \*\*([A-Za-z_]\w*))?")
+            # Any kwargs name (transformers 5.17 renamed gemma3's to `lm_kwargs`); may sit on its own line.
+            .replace("$KWARGS$", r"(?:,[\s\n]{0,}\*\*([A-Za-z_]\w*))?")
             .replace("$LOGITSUPCAST$", r"(?:logits = logits\.float\(\))?")
             .replace("$LABELSDEVICE$", r"(?:labels = labels\.to\([^\)]{1,}\))?")
             .replace(
@@ -3670,6 +3692,19 @@ def apply_fused_lm_head(forward, module=None):
             spaces = finder[0][3]
         replacement = cross_entropy_replacement.strip().split("\n")
         replacement = "\n".join((len(spaces) - 4) * " " + x for x in replacement)
+        # A consumed `logits = logits.float()` (transformers 4.x Granite MoE) must still reach the
+        # unfused loss_function calls, which also return those logits.
+        if r"loss\_function" in cross_entropy_find:
+            matched = regex.search(
+                cross_entropy_find, forward, flags = regex.DOTALL | regex.MULTILINE, timeout = 1,
+            )
+            if matched is not None and "logits = logits.float()" in matched.group(0):
+                replacement = re.sub(
+                    r"^([ \t]*)(loss = self\.loss_function\()",
+                    r"\1logits = logits.float()\n\1\2",
+                    replacement,
+                    flags = re.MULTILINE,
+                )
         if "slice_indices" in forward:
             replacement = (
                 "logits = self.lm_head(hidden_states[:, slice_indices, :]) if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1' else EMPTY_LOGITS\n"
@@ -3736,6 +3771,9 @@ def test_apply_fused_lm_head():
     from transformers.models.granite.modeling_granite import GraniteForCausalLM
 
     forwards.append(GraniteForCausalLM)
+    from transformers.models.granitemoehybrid.modeling_granitemoehybrid import GraniteMoeHybridForCausalLM
+
+    forwards.append(GraniteMoeHybridForCausalLM)
     from transformers.models.gemma2.modeling_gemma2 import Gemma2ForCausalLM
 
     forwards.append(Gemma2ForCausalLM)
@@ -6378,10 +6416,14 @@ def unsloth_compile_transformers(
                 # Fix some arguments up like for Gemma 3N
                 new_source = fixup_fused_lm_head(source)
                 new_source = fixup_dropped_logit_scale(new_source, module)
-                # Apply fused LM transforms
-                new_source, supports_return_hidden_states = apply_fused_lm_head(
-                    new_source, module
-                )
+                # Fused CE reads lm_head.weight, which Roberta-style composite heads lack.
+                from unsloth_zoo.fused_losses.forward_install import _head_built_as_linear
+                if _head_built_as_linear(module_class, "lm_head"):
+                    new_source, supports_return_hidden_states = apply_fused_lm_head(
+                        new_source, module
+                    )
+                else:
+                    supports_return_hidden_states = False
                 # print(new_source)
                 new_source = apply_mask_attention_mask_out(new_source)
                 if new_source != source:
