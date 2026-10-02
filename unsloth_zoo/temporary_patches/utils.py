@@ -1919,6 +1919,13 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     def wrapper(*args, **kwargs):
         if state["eager"]:
             return eager_func(*args, **kwargs)
+        if torch.compiler.is_compiling():
+            # Traced from inside an enclosing compiled region, which inlines this
+            # body into its own graph: none of the bookkeeping below is about that
+            # graph. Reading `state["compiler_off"]` here also guarded the enclosing
+            # graph on `is None`, which its first real call made False, so every
+            # caller (Gemma / DeepSeek RMSNorm, rope, ...) compiled twice per device.
+            return compiled_func(*args, **kwargs)
         if state["compiler_off"] is None:
             state["compiler_off"] = dynamo_tracing_disabled()
         if state["compiler_off"]:
