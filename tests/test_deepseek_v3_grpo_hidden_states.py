@@ -15,8 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
-"""The patched DeepseekV3ForCausalLM.forward must hand GRPO the hidden states: DeepseekV3Model returns
-BaseModelOutputWithPast and the head returns CausalLMOutputWithPast, neither of which has router_logits."""
+"""The patched DeepseekV3ForCausalLM.forward hands GRPO the hidden states (no router_logits on these outputs)."""
 import pytest
 import torch
 
