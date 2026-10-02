@@ -56,8 +56,8 @@ class TripletCapture:
     loss_init_idx: int | None # index of the `loss = None` stmt that we delete (may be None)
     # [(name, ast.AST)] post-head scaling; fused call only. Defaulted + last for existing callers.
     scale_kws: list = field(default_factory = list)
-    pre_stmts: list = field(default_factory = list)   # casts before the loss call in the labels branch
-    post_stmts: list = field(default_factory = list)  # casts after it
+    pre_stmts: list = field(default_factory = list)
+    post_stmts: list = field(default_factory = list)
     softcap_idx: int | None = None
     softcap_stmt: ast.stmt | None = None
     softcap_expr: ast.AST | None = None
@@ -147,7 +147,6 @@ def _is_loss_function_assign(stmt: ast.stmt) -> bool:
 
 
 def _is_cast(stmt: ast.stmt, names) -> bool:
-    """`x = x.float()` / `x = x.to(...)` / `x = x.contiguous()` for x in names."""
     if not (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
             and isinstance(stmt.targets[0], ast.Name) and stmt.targets[0].id in names):
         return False
@@ -245,8 +244,7 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> TripletCapture | Non
                 break
     if logits_name is None:
         return None
-    # transformers 4.x wraps the call in casts (`labels.to(logits.device)`, `logits.float()`,
-    # `loss.to(hidden_states.dtype)`); any other statement would be dropped by the rewrite.
+    # transformers 4.x casts around the call; anything else would be dropped by the rewrite.
     pre_stmts = if_node.body[:loss_k]
     post_stmts = if_node.body[loss_k + 1:]
     if not all(_is_cast(s, ("labels", logits_name)) for s in pre_stmts):
@@ -338,8 +336,7 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> TripletCapture | Non
     # Bail if any statement between lm_head and the labels-if touches logits
     # (e.g. Gemma3 final_logit_softcapping): it would run on EMPTY_LOGITS in
     # the labels branch, so fused loss would see un-softcapped logits.
-    # The one exception is a single `logits = tanh(logits / cap) * cap` (RecurrentGemma), which the
-    # kernel reapplies as logit_softcapping.
+    # Except one `logits = tanh(logits / cap) * cap` (RecurrentGemma): the kernel reapplies it.
     softcap_idx = None
     softcap_expr = None
     for j in range(lm_head_assign_idx + 1, if_idx):
@@ -419,8 +416,7 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
         """).strip()
         return ast.parse(template).body
 
-    # Unfused branches replay the original statements verbatim; the fused one keeps only loss casts
-    # (the kernel moves labels to the head's device and accumulates in fp32 itself).
+    # Fused branch keeps only loss casts: the kernel moves labels and accumulates in fp32 itself.
     softcap = [ast.unparse(cap.softcap_stmt)] if cap.softcap_stmt is not None else []
     pre = [ast.unparse(s) for s in cap.pre_stmts]
     post = [ast.unparse(s) for s in cap.post_stmts]

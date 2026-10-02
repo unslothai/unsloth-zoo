@@ -3453,7 +3453,7 @@ def _normalize_lm_head_source(forward):
 
 
 def apply_fused_lm_head(forward, module=None):
-    # Normalised copies are kept only if they fuse, so unmatched sources come back byte-identical.
+    # Kept only if it fuses, so unmatched sources come back byte-identical.
     normalized = _normalize_lm_head_source(forward)
     if normalized != forward:
         new_forward, fused = _apply_fused_lm_head(normalized, module)
@@ -6363,8 +6363,7 @@ def unsloth_compile_transformers(
                 # Fix some arguments up like for Gemma 3N
                 new_source = fixup_fused_lm_head(source)
                 new_source = fixup_dropped_logit_scale(new_source, module)
-                # Apply fused LM transforms; the kernel reads lm_head.weight, which composite
-                # Roberta-style heads lack.
+                # Fused CE reads lm_head.weight, which Roberta-style composite heads lack.
                 from .fused_losses.forward_install import _head_built_as_linear
                 if _head_built_as_linear(module_class, "lm_head"):
                     new_source, supports_return_hidden_states = apply_fused_lm_head(

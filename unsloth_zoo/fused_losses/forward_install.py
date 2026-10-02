@@ -180,8 +180,7 @@ def _is_eligible_class(cls) -> bool:
 
 
 def _head_built_as_linear(cls, head_attr) -> bool:
-    """False when the nearest __init__ builds `self.<head_attr>` from a non-Linear class: Roberta-style
-    `RobertaLMHead` (dense + norm + decoder) has no .weight, so the fused adapter crashed. Unknown: True."""
+    """False if __init__ builds the head from a non-Linear class (RobertaLMHead has no .weight)."""
     for klass in cls.__mro__:
         init = klass.__dict__.get("__init__")
         if init is None:
