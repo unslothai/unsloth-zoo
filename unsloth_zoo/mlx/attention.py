@@ -50,7 +50,6 @@ def dequantizing_is_smaller(queries, q_keys, q_values, group_size):
 # Elsewhere mlx builds the scores anyway, so the copy would cost extra rather than instead.
 _FUSED_FULL_HEAD_DIMS = frozenset((64, 72, 80, 96, 128))
 _FUSED_VECTOR_HEAD_DIMS = frozenset((64, 96, 128, 256))
-# NAX head-dim-split kernels: prefill of at least this many queries at head_dim 256 (and 512).
 _SPLIT_MIN_QUERIES = 1024
 _D512_MIN_QUERY_BLOCKS = 1024
 # mlx also fuses square causal head_dim 256 prefill this long; on NAX the split covers it.
@@ -75,7 +74,6 @@ def _full_kernel_exists(queries, q_keys, head_dim, value_dim, dtype, mask):
     S = q_keys[0].shape[-2]
     causal = isinstance(mask, str) and mask == "causal"
     if causal and L > S:
-        # A causal kernel needs no more queries than keys.
         return False
     split = L >= _SPLIT_MIN_QUERIES and (_tf32_enabled() or dtype != mx.float32) and nax_available()
     if head_dim == value_dim == 256:

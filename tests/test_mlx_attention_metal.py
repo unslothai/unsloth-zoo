@@ -139,8 +139,7 @@ def test_the_query_count_against_the_cache_geometry_decides_the_route(HQ, HKV, D
     (128, 64, 64),    # values narrower than the keys
 ])
 def test_a_geometry_with_no_fused_kernel_never_leaves_the_runtime(D, Dv, group_size):
-    """mlx fuses none of these calls, so it materializes the same scores and dequantizing on top of
-    them is strictly worse."""
+    """mlx fuses none of these, so dequantizing on top of its scores is strictly worse."""
     cache = _cache(1, 8, 512, D, 4, group_size, Dv=Dv)
     taken = []
 
@@ -275,8 +274,7 @@ def test_head_dim_512_and_96_64_are_fused_where_mlx_has_a_kernel(monkeypatch, D,
 ])
 def test_fused_kernel_exists_matches_what_the_installed_mlx_fuses(monkeypatch, D, Dv, HQ, HKV, L, S,
                                                                   mask):
-    """`force_fused=True` runs a fused kernel wherever one exists, and the default call is
-    bit-identical to it exactly when mlx fuses."""
+    """The default call is bit-identical to `force_fused=True` exactly when mlx fuses."""
     monkeypatch.delenv("UNSLOTH_MLX_NAX", raising=False)
     q_keys, q_values = _cache(1, HKV, S, D, 8, group_size=32, Dv=Dv)
     queries = _queries(1, HQ, L, D)

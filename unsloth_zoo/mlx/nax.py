@@ -34,8 +34,7 @@ import mlx.core as mx
 logger = logging.getLogger(__name__)
 
 
-# MLX's `is_nax_available`, which Python cannot call: macOS 26.2 and a generation-17 GPU,
-# 18 for the `p` class.
+# Mirrors MLX's `is_nax_available`, which Python cannot call.
 _MIN_MACOS = (26, 2)
 _GPU_ARCHITECTURE_PATTERN = re.compile(r"applegpu_g(\d+)([a-z])")
 
@@ -100,8 +99,7 @@ class Gap(NamedTuple):
     closed_on_main: bool
 
 
-# A release missing from `open_in` keeps a gap only while MLX main has not closed it, so both
-# the first release with the upstream fix and older unmeasured releases turn the route off.
+# A release missing from `open_in` keeps the gap only while MLX main has not closed it.
 _GAPS = {}
 
 
