@@ -147,7 +147,7 @@ def test_gpu_core_count_reads_the_ioregistry(monkeypatch):
     from unittest import mock
     from unsloth_zoo.mlx import nax
 
-    # Paravirtual GPUs (`air64_*`, CI runners) publish no core count.
+    # Paravirtual GPUs (CI VMs, `air64_*`) publish no core count.
     assert nax._gpu_generation() is None or nax._gpu_core_count() > 0
     ioreg = lambda code, out = '"gpu-core-count" = 12': subprocess.CompletedProcess([], code, out, "")
     for result, cores in ((ioreg(0), 12), (ioreg(1), None), (ioreg(0, '"gpu-core-count" = <0c>'), None),
