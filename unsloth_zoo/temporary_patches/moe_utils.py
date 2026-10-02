@@ -908,6 +908,25 @@ def _probe_torch_grouped_mm_supported():
         _TORCH_GROUPED_MM_SUPPORTED = False
         return False
 
+    # Short-circuit on ROCm: torch._grouped_mm segfaults the process on some AMD hardware
+    # (e.g., gfx1030) rather than raising a Python exception, which crashes the import eagerly.
+    if getattr(torch.version, "hip", None) is not None:
+        import multiprocessing as mp
+        def _rocm_probe(device_id):
+            import torch
+            device = torch.device("cuda", device_id)
+            x = torch.ones((1, 8), device=device, dtype=torch.float16)
+            w = torch.ones((1, 8, 8), device=device, dtype=torch.float16)
+            offs = torch.tensor([1], device=device, dtype=torch.int32)
+            torch._grouped_mm(x, w, offs=offs)
+
+        ctx = mp.get_context("spawn")
+        p = ctx.Process(target=_rocm_probe, args=(device.index if device.index is not None else 0,))
+        p.start()
+        p.join()
+        _TORCH_GROUPED_MM_SUPPORTED = (p.exitcode == 0)
+        return _TORCH_GROUPED_MM_SUPPORTED
+
     try:
         # Dummy call verifies real support (symbol may exist but hardware unsupported, e.g. < H100).
         dtype = torch.float16
