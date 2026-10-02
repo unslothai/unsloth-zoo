@@ -1,9 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Stash scan of a forward whose globals hold an lru_cache wrapper: no graph break, no fullgraph failure.
-
-torch 2.11 graph-breaks on `hasattr(<lru_cache wrapper>, "__func__")` while tracing the scan, and later
-versions raise under fullgraph. Unsloth's MoE forwards live in moe_utils, whose globals hold two.
-"""
+"""Stash scan of a forward whose globals hold an lru_cache wrapper (as moe_utils' do) compiles without breaks."""
 import functools
 
 import pytest
