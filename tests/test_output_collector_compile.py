@@ -89,11 +89,9 @@ def _patched_var(name):
 
 
 def _compiled_get(var, monkeypatch):
-    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
-    try:
+    with monkeypatch.context() as m:
+        m.setattr(torch.compiler, "is_compiling", lambda: True)
         return var.get()
-    finally:
-        monkeypatch.undo()
 
 
 def test_eager_reads_stay_per_thread_and_nesting_restores(monkeypatch):
@@ -179,3 +177,34 @@ def test_a_failed_reset_leaves_the_mirror_alone(monkeypatch):
         var.reset(token)
     assert var.get() is var2
     var.reset(own)
+
+
+def test_a_thread_without_a_set_never_reads_the_mirror(monkeypatch):
+    var = _patched_var("reader")
+    owner = {"k": []}
+    token = var.set(owner)
+    seen = []
+    thread = threading.Thread(target = lambda: seen.append(_compiled_get(var, monkeypatch)))
+    thread.start(); thread.join()
+    assert seen == [None] and _compiled_get(var, monkeypatch) is owner
+    var.reset(token)
+
+
+def test_compiled_reader_on_another_thread_gets_its_own_value():
+    var = _patched_var("compiled_reader")
+
+    # Not fullgraph: the other thread falls back to ContextVar.get, which breaks the graph before torch 2.14.
+    @torch.compile(backend = "eager")
+    def hook(x):
+        return x + (1.0 if var.get() is not None else 0.0)
+
+    torch._dynamo.reset()
+    token = var.set({"k": []})
+    try:
+        assert torch.equal(hook(torch.zeros(2)), torch.ones(2))
+        out = []
+        thread = threading.Thread(target = lambda: out.append(hook(torch.zeros(2))))
+        thread.start(); thread.join()
+    finally:
+        var.reset(token)
+    assert torch.equal(out[0], torch.zeros(2))

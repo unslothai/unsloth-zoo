@@ -3179,13 +3179,21 @@ def patch_output_collector_for_compiled_submodules():
         if getattr(self, "compiling", False):
             return self.global_var
         if torch.compiler.is_compiling() and self.__dict__.get("_unsloth_eager_single", True):
-            return self.__dict__.get("_unsloth_eager_value")
+            value = self.__dict__.get("_unsloth_eager_value")
+            # Nothing set anywhere reads None on every thread; otherwise only the owning thread (one with an
+            # active set, read through a threading.local, which Dynamo traces) may take the mirror.
+            if value is None or getattr(self.__dict__.get("_unsloth_eager_tls"), "depth", 0) > 0:
+                return value
         return self.context_var.get()
 
     @functools.wraps(original_set)
     def set(self, value):
         token = original_set(self, value)
         if token is not None:
+            tls = self.__dict__.get("_unsloth_eager_tls")
+            if tls is None:
+                tls = self.__dict__.setdefault("_unsloth_eager_tls", threading.local())
+            tls.depth = getattr(tls, "depth", 0) + 1
             with lock:
                 active = self.__dict__.setdefault("_unsloth_eager_active", [])
                 active.append((token, threading.get_ident(), value))
@@ -3197,6 +3205,9 @@ def patch_output_collector_for_compiled_submodules():
         # Reset first: a token from another Context raises here and must leave the mirror untouched.
         result = original_reset(self, token)
         if token is not None:
+            tls = self.__dict__.get("_unsloth_eager_tls")
+            if tls is not None and getattr(tls, "depth", 0) > 0:
+                tls.depth -= 1
             with lock:
                 # Tokens are unhashable: match by identity.
                 active = self.__dict__.get("_unsloth_eager_active") or []
