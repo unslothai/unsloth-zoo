@@ -6364,7 +6364,7 @@ def unsloth_compile_transformers(
                 new_source = fixup_fused_lm_head(source)
                 new_source = fixup_dropped_logit_scale(new_source, module)
                 # Fused CE reads lm_head.weight, which Roberta-style composite heads lack.
-                from .fused_losses.forward_install import _head_built_as_linear
+                from unsloth_zoo.fused_losses.forward_install import _head_built_as_linear
                 if _head_built_as_linear(module_class, "lm_head"):
                     new_source, supports_return_hidden_states = apply_fused_lm_head(
                         new_source, module
