@@ -8,6 +8,18 @@ try:
 except Exception:  # module-level nn.Module subclasses below need mlx to exist
     pytest.skip("requires mlx", allow_module_level=True)
 metal_only = pytest.mark.skipif(not _METAL, reason="requires Apple Silicon Metal")
+
+
+def _nax_available():
+    if not _METAL:
+        return False
+    from unsloth_zoo.mlx import nax
+    return nax.nax_available()
+
+
+# The NAX kernels need MetalPerformancePrimitives tensor ops: macOS 15 cannot build them and
+# paravirtual or pre-M5 GPUs cannot load them, so they run only where the product would route.
+nax_only = pytest.mark.skipif(not _nax_available(), reason="requires an Apple GPU with neural accelerators")
 MODEL = "mlx-community/SmolLM-135M-Instruct-4bit"
 VLM_MODEL = "mlx-community/FastVLM-0.5B-bf16"
 
@@ -900,3 +912,237 @@ def test_residual_norm_scope_tolerates_a_stand_in_without_training(monkeypatch):
     root = _Root()
     with decode.fused_residual_norm(root) as yielded:
         assert yielded is root
+
+
+def _quantized(N, K, group_size, dtype, bits = 4, seed = 0):
+    w = mx.random.normal((N, K), key = mx.random.key(seed)) * 0.05
+    return mx.quantize(w.astype(dtype), group_size = group_size, bits = bits)
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("group_size", [32, 64, 128])
+@pytest.mark.parametrize("N", [384, 320])   # 128- and 64-column tiles
+@pytest.mark.parametrize("bits", [4, 8])
+@nax_only
+def test_nax_small_m_qmm_matches_native(monkeypatch, bits, N, group_size, dtype):
+    from unsloth_zoo.mlx import nax
+
+    monkeypatch.setattr(nax, "_QMM_THREADGROUPS", {8: 20, 16: 20})   # several uneven K steps per split
+    monkeypatch.setattr(nax, "_gpu_core_count", lambda: nax._QMM_MEASURED_CORES)
+    for groups in (68, 17, 2):   # the last one runs unsplit
+        K = group_size * groups
+        w, scales, biases = _quantized(N, K, group_size, dtype, bits, seed = groups)
+        for M in (2, 3, 8, 9, 16):
+            # Rows differ in scale and the rows after M are NaN, so a row mix-up or a read past M shows.
+            padded = mx.random.normal((M + 16, K), key = mx.random.key(M)) * (1 + mx.arange(M + 16)[:, None])
+            x = mx.where(mx.arange(M + 16)[:, None] < M, padded, mx.nan).astype(dtype)[:M]
+            got = nax.small_m_qmm(x, w, scales, biases, group_size, bits).astype(mx.float32)
+            with mx.stream(mx.cpu):
+                weight = mx.dequantize(w, scales.astype(mx.float32), biases.astype(mx.float32),
+                                       group_size = group_size, bits = bits)
+                exact = x.astype(mx.float32) @ weight.T
+                terms = mx.abs(x.astype(mx.float32)) @ mx.abs(weight).T
+                # Rounded once to dtype after an fp32 sum that only reorders the K products.
+                bound = mx.finfo(dtype).eps * mx.abs(exact) + K * 2.0 ** -23 * terms
+                mx.eval(exact, bound)
+            assert mx.all(mx.abs(got - exact) <= bound).item(), (groups, M)
+
+
+def test_nax_small_m_qmm_rejects_what_it_does_not_cover():
+    from unsloth_zoo.mlx import nax
+
+    for args in ((384, 512, 64, 4, "affine"), (320, 512, 32, 8, "affine")):
+        assert nax.small_m_qmm_supported(*args)
+    for args in ((352, 512, 64, 4, "affine"), (384, 480, 64, 4, "affine"), (384, 512, 16, 4, "affine"),
+                 (384, 512, 64, 6, "affine"), (384, 512, 32, 4, "mxfp4")):
+        assert not nax.small_m_qmm_supported(*args)
+
+
+def test_nax_small_m_qmm_geometry_covers_k_within_threadgroup_memory():
+    import itertools
+    from unsloth_zoo.mlx import nax
+
+    for M, N, K, group_size in itertools.product((2, 8, 9, 16), (320, 4096, 262144), (256, 2112, 5376, 16384),
+                                                 (32, 64, 128)):
+        if K % group_size:
+            continue
+        row_tile, column_tile, splits, unroll = nax.small_m_qmm_geometry(M, N, K, group_size)
+        assert unroll in (2, 4, 8)
+        groups, steps = K // group_size, -(-(K // group_size) // unroll)
+        split_groups = -(-steps // splits) * unroll
+        starts = [s * steps // splits * unroll for s in range(splits)] + [groups]   # the kernel's g0 per split
+        assert starts[0] == 0 and starts == sorted(starts) and starts[-2] < groups
+        assert max(b - a for a, b in zip(starts, starts[1:])) <= split_groups
+        assert splits == 1 or -(-steps // (splits - 1)) > -(-steps // splits)   # every split shortens the longest
+        assert row_tile * (split_groups + column_tile) * 4 <= nax._QMM_THREADGROUP_MEMORY
+    # A vocabulary-wide head at large K needs more splits than the threadgroup target gives.
+    assert nax.small_m_qmm_geometry(16, 262144, 16384, 32)[2] == 2
+
+
+def test_nax_small_m_qmm_row_range_matches_bits_group_size_and_shape(monkeypatch):
+    from unsloth_zoo.mlx import nax
+
+    table = ((8, 32, 1 << 20, 4096, 9, 30), (8, None, 1 << 20, 4096, 1, 12), (4, None, 1 << 20, None, 5, 16))
+    monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {nax._gpu_generation(): table})
+    shapes = ((4096, 256, 32, 8), (4096, 256, 64, 8), (8192, 256, 64, 8), (4096, 128, 64, 8), (8192, 256, 64, 4))
+    assert [nax.small_m_qmm_row_range(*shape) for shape in shapes] == [(9, 16), (2, 12), (0, -1), (0, -1), (5, 16)]
+    monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {})
+    monkeypatch.setattr(nax, "_QMM_ROWS_UNMEASURED", table[2:])
+    assert nax.small_m_qmm_row_range(4096, 256, 64, 4) == (5, 16)
+
+
+def test_nax_small_m_qmm_scales_with_gpu_cores_and_keys_rows_by_generation(monkeypatch):
+    from unsloth_zoo.mlx import nax
+
+    splits = {}
+    for cores in (None, 10, 16, 40):
+        monkeypatch.setattr(nax, "_gpu_core_count", lambda: cores)
+        splits[cores] = [nax.small_m_qmm_geometry(M, 4096, 16384, 32)[2] for M in (2, 16)]
+    assert splits == {None: [32, 19], 10: [22, 13], 16: [32, 19], 40: [64, 43]}
+    for architecture, rows in (("applegpu_g17s", (6, 16)), ("applegpu_g17c", (6, 16)),
+                               ("applegpu_g18s", (11, 16)), ("", (11, 16))):
+        monkeypatch.setattr(nax, "_gpu_architecture", lambda: architecture)
+        assert nax.small_m_qmm_row_range(4096, 4096, 64, 4) == rows, architecture
+
+
+_EVERY_ROW = ((4, None, 0, None, 1, 16), (8, None, 0, None, 1, 16))
+
+
+class _QuantizedHead(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embed = nn.QuantizedEmbedding(512, 512, group_size = 64, bits = 4)
+        self.proj = nn.QuantizedLinear(512, 512, bias = True, group_size = 64, bits = 8)
+        self.odd = nn.QuantizedLinear(512, 352, bias = False, group_size = 64, bits = 4)
+        self.set_dtype(mx.bfloat16)
+        self.eval()
+
+    def __call__(self, x):
+        return self.embed.as_linear(self.proj(x)), self.odd(x)
+
+
+@nax_only
+def test_nax_quantized_linear_scope_routes_restores_and_falls_back(monkeypatch, caplog):
+    import functools
+    from unsloth_zoo.mlx import inference, nax
+    from unsloth_zoo.mlx.generate import generation_mode
+
+    model = _QuantizedHead()
+    calls = []
+    kernel = nax.small_m_qmm
+    monkeypatch.setattr(nax, "small_m_qmm", lambda *args: calls.append((len(args[0]), args[5])) or kernel(*args))
+    monkeypatch.setattr(nax, "nax_available", lambda: True)
+    monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: True)
+    # The 8-bit projection routes up to 8 rows only, so at 12 only the 4-bit embedding does.
+    monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {nax._gpu_generation(): (_EVERY_ROW[0], (8, None, 0, None, 1, 8))})
+    monkeypatch.setattr(inference, "_NAX_QMM_VERIFIED", {})
+    caplog.set_level("INFO", logger = inference.__name__)
+
+    def run(rows):
+        calls.clear()
+        return model(mx.random.normal((1, rows, 512), key = mx.random.key(rows)).astype(mx.bfloat16))
+
+    natives = {rows: run(rows) for rows in (1, 4, 8, 12)}   # 8 fills the row tile: its own verified key
+    linear_call = nn.QuantizedLinear.__call__
+    with monkeypatch.context() as patch:   # a transient wrapper, e.g. training patches during eval sampling
+        patch.setattr(nn.QuantizedLinear, "__call__", functools.wraps(linear_call)(lambda *a: linear_call(*a)))
+        with inference.nax_quantized_linear(model):
+            assert type(model.proj) is nn.QuantizedLinear
+    with generation_mode(model):
+        with inference.nax_quantized_linear(model):
+            assert [type(m).__name__ for m in (model.embed, model.proj, model.odd)] == [
+                "_NaxSmallMQuantizedEmbedding", "_NaxSmallMQuantizedLinear", "QuantizedLinear"]
+        assert type(model.proj) is not nn.QuantizedLinear   # the outer scope still owns it
+        for rows, native in natives.items():
+            routed = run(rows)
+            assert calls == {1: [], 4: [(4, 8), (4, 4)], 8: [(8, 8), (8, 4)], 12: [(12, 4)]}[rows]   # (rows, bits)
+            for a, b in zip(routed, native):
+                assert mx.allclose(a, b, rtol = 2e-2, atol = 2e-2).item()
+        assert len(inference._NAX_QMM_VERIFIED) == 5 and all(inference._NAX_QMM_VERIFIED.values())
+        assert sum("NAX kernel" in r.getMessage() for r in caplog.records) == 1
+        model.train()
+        run(4)
+        assert not calls   # training stays native
+        model.eval()
+        monkeypatch.setattr(nn.QuantizedLinear, "__call__", lambda self, x: linear_call(self, x) * 0)
+        assert not any(mx.any(out).item() for out in run(4)) and not calls   # drifted: native, new body
+        monkeypatch.undo()
+    assert (type(model.embed), type(model.proj)) == (nn.QuantizedEmbedding, nn.QuantizedLinear)
+    assert "_unsloth_nax_qmm_rows" not in model.proj
+
+
+@nax_only
+def test_nax_quantized_linear_first_use_check_rejects_a_wrong_kernel(monkeypatch):
+    from unsloth_zoo.mlx import inference, nax
+
+    model = _QuantizedHead()
+    kernel = nax.small_m_qmm
+    monkeypatch.setattr(nax, "small_m_qmm", lambda *args: kernel(*args) * 1.1)
+    monkeypatch.setattr(nax, "nax_available", lambda: True)
+    monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: True)
+    monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {nax._gpu_generation(): _EVERY_ROW})
+    monkeypatch.setattr(inference, "_NAX_QMM_VERIFIED", {})
+    native = model.proj(x := mx.random.normal((3, 512), key = mx.random.key(3)).astype(mx.bfloat16))
+    compiled = mx.compile(model.proj)(x)   # stock compiled and eager can differ in the last bit
+    with inference.nax_quantized_linear(model):
+        assert mx.array_equal(mx.compile(model.proj)(x), compiled).item()   # unverifiable in a transform
+        assert mx.array_equal(model.proj(x), native).item()
+    assert list(inference._NAX_QMM_VERIFIED.values()) == [False]
+
+
+@pytest.mark.parametrize("blocker", [None, "kill switch", "no NAX", "gap closed", "distributed", "probe failed"])
+def test_nax_quantized_linear_scope_stays_native(monkeypatch, blocker):
+    from unsloth_zoo.mlx import inference, nax
+
+    model = _QuantizedHead()
+    monkeypatch.delenv("UNSLOTH_MLX_NAX_QMM", raising = False)
+    monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {nax._gpu_generation(): _EVERY_ROW})
+    monkeypatch.setattr(nax, "nax_available", lambda: blocker != "no NAX")
+    monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: blocker != "probe failed")
+    monkeypatch.setattr(nax, "gap_open", lambda name: blocker != "gap closed")
+    if blocker == "kill switch":
+        monkeypatch.setenv("UNSLOTH_MLX_NAX_QMM", "0")
+    if blocker == "distributed":
+        model._unsloth_mlx_distributed_parallel_mode = "tensor"
+    with inference.nax_quantized_linear(model):
+        assert (type(model.proj) is nn.QuantizedLinear) is (blocker is not None)
+
+
+def test_nax_quantized_linear_scope_swaps_a_shared_module_once(monkeypatch):
+    from unsloth_zoo.mlx import inference, nax
+
+    model = _QuantizedHead()
+    model.alias = model.proj   # reachable under two paths, as tied or shared modules are
+    monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {nax._gpu_generation(): _EVERY_ROW})
+    monkeypatch.setattr(nax, "nax_available", lambda: True)
+    monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: True)
+    with inference.nax_quantized_linear(model):
+        assert type(model.alias).__name__ == "_NaxSmallMQuantizedLinear"
+        assert model.proj._unsloth_nax_qmm_scopes == 1
+    assert type(model.proj) is nn.QuantizedLinear and "_unsloth_nax_qmm_rows" not in model.proj
+
+
+@pytest.mark.parametrize("vlm", [False, True], ids = ["text", "vlm"])
+def test_loader_generate_enters_the_nax_scope(monkeypatch, vlm):
+    from contextlib import contextmanager
+    import mlx_lm
+    import mlx_vlm
+    from unsloth_zoo.mlx import loader
+
+    root = nn.Sequential(nn.Linear(4, 4))
+    root._tokenizer = types.SimpleNamespace(eos_token_ids = {2})
+    root._is_vlm_model = vlm
+    entered = []
+
+    @contextmanager
+    def scope(model):
+        entered.append(model)
+        yield model
+
+    def stream(model, *args, **kwargs):
+        assert entered == [root]
+        yield types.SimpleNamespace(token = 7)
+
+    monkeypatch.setattr(loader, "nax_quantized_linear", scope)
+    monkeypatch.setattr(mlx_vlm if vlm else mlx_lm, "stream_generate", stream)
+    assert loader._mlx_generate(root, input_ids = [[1, 2]], max_new_tokens = 1).tolist() == [[1, 2, 7]]

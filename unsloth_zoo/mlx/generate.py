@@ -955,9 +955,9 @@ def generation_mode(model):
         _GENERATION_MODE_DEPTH += 1
         entered = True
         from .inference import (fused_decode_conv_silu, fused_moe_gate_up, fused_moe_routed_experts,
-                                fused_moe_router, fused_residual_norm)
-        with fused_moe_gate_up(model), fused_decode_conv_silu(model), \
-                fused_residual_norm(model), fused_moe_router(model), fused_moe_routed_experts(model):
+                                fused_moe_router, fused_residual_norm, nax_quantized_linear)
+        with fused_moe_gate_up(model), fused_decode_conv_silu(model), fused_residual_norm(model), \
+                fused_moe_router(model), fused_moe_routed_experts(model), nax_quantized_linear(model):
             yield model
     except BaseException as exc:
         active_error = exc
