@@ -1062,7 +1062,7 @@ def _rocm_gfx_family(gfx):
 
 
 def _gpu_cmake_flags(gpu_support):
-    """One argv item per flag. Windows keeps CUDA: HIP there needs Ninja + the HIP SDK clang (llama.cpp docs/build.md)."""
+    """Windows keeps CUDA: HIP there needs Ninja + the HIP SDK clang (llama.cpp docs/build.md)."""
     if gpu_support != "ON" or IS_WINDOWS:
         return [f"-DGGML_CUDA={gpu_support}"]
     if torch is None or not getattr(torch.version, "hip", None):
