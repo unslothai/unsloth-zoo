@@ -1225,7 +1225,9 @@ def _prenorm_class(base):
 
     def take_norm(self, norm, x):
         slot = self.__dict__.get("_unsloth_handoff_in")
-        value, slot.value = (slot.value, None) if slot is not None else (None, None)
+        value = None
+        if slot is not None:
+            value, slot.value = slot.value, None
         if value is not None:
             residual, normed, weight, eps = value
             if (residual is x and type(norm) is nn.RMSNorm and norm.weight is weight and norm.eps == eps
