@@ -372,8 +372,7 @@ def _decode_conv_kernel():
 
 @mx.compile
 def _decode_conv(state, x, weight, key_dim):
-    # The concatenated window, then the native small-column reduction order, both half-precision
-    # casts and the q/k/v split, for one decode row.
+    # Native small-column reduction order and both half-precision casts, plus the window and q/k/v split.
     batch, taps, channels = x.shape[0], weight.shape[0], x.shape[2]
     return _decode_conv_kernel()(
         inputs = [state, x, weight], template = [("T", x.dtype), ("K", taps), ("KEY", key_dim)],
@@ -419,11 +418,9 @@ _PURE_TEST_NODES = (ast.expr_context, ast.boolop, ast.unaryop, ast.cmpop,
 
 
 def _decode_conv_sites(outer):
-    """(concatenate index, branch chain index, tests preceding the decode branch) in the body, or None.
+    """(concatenate index, branch chain index, tests ahead of the decode branch), or None.
 
-    The fused call decides at the concatenate what the chain decides later, so the tests the decode
-    branch sits behind must be free of calls and read nothing assigned from the concatenate on.
-    """
+    The fused call decides at the concatenate, so those tests must be call-free and read nothing assigned after it."""
     body = outer.body
     starts = [i for i, statement in enumerate(body) if _source_expression(statement) == _CONCATENATE]
     if len(starts) != 1:
