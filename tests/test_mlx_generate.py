@@ -1438,6 +1438,57 @@ def test_a_model_keeping_state_is_seen_to_keep_it_however_it_says_so():
         assert _keeps_what_it_prepared(model()) is (model in keeping), model.__name__
 
 
+def test_a_vision_stream_runs_the_prefill_with_the_fewest_tokens_left():
+    from unsloth_zoo.mlx.generate import _schedules_prefill
+
+    def prompt(uid, left):
+        return types.SimpleNamespace(uids = [uid], _inputs_embeds = types.SimpleNamespace(shape = (1, left, 4)))
+
+    def queued(uid, ids, columns = None):
+        embeds = None if columns is None else types.SimpleNamespace(shape = (1, columns, 4))
+        return (uid, [1] * ids, 5, {"inputs_embeds": embeds} if embeds else {})
+
+    session = _vlm_session(prefill_batch_size = 1)
+    long, short = prompt(0, 6000), prompt(1, 100)
+    gen = session.generator = types.SimpleNamespace(
+        _prompt_batch = long, _unprocessed_sequences = [queued(1, 100)], _generation_batch = [],
+        completion_batch_size = 4, apc = None)
+    assert _schedules_prefill(gen, session.adapter.defaults)
+    assert not _schedules_prefill(gen, GenerationDefaults(prefill_batch_size = 2))
+    session._schedule_prefill()
+    assert (gen._prompt_batch, session._parked) == (None, [long])  # mlx-vlm admits the short row
+    gen._prompt_batch, gen._unprocessed_sequences = short, []
+    session._schedule_prefill()
+    assert gen._prompt_batch is short
+    gen._prompt_batch, gen._generation_batch = None, [1]
+    session._schedule_prefill()
+    assert (gen._prompt_batch, session._parked) == (long, [])
+    # A row's media can expand past its ids; it is ranked by the columns it will prefill.
+    gen._prompt_batch, gen._unprocessed_sequences = prompt(2, 100), [queued(3, 20, columns = 276)]
+    session._schedule_prefill()
+    assert gen._prompt_batch.uids == [2]
+    gen._prompt_batch, gen._unprocessed_sequences = long, [queued(1, 100)]
+    # Parked rows hold completion slots that mlx-vlm's admission does not count.
+    gen.completion_batch_size = 2
+    session._schedule_prefill()
+    assert gen._prompt_batch is long
+    # One parked as often as there are slots runs to its end, before any queued row.
+    gen._generation_batch, gen.completion_batch_size = [], 4
+    for _ in range(3):
+        session._schedule_prefill()
+        assert (gen._prompt_batch, session._parked) == (None, [long])
+        gen._unprocessed_sequences = []  # admitted and prefilled
+        session._schedule_prefill()
+        assert gen._prompt_batch is long
+        gen._unprocessed_sequences = [queued(1, 100)]
+    session._schedule_prefill()
+    assert gen._prompt_batch is long
+    gen._prompt_batch, session._parked = short, [long]
+    session._schedule_prefill()
+    assert (gen._prompt_batch, session._parked) == (long, [short])
+    assert session._withdraw(1) and session._parked == []
+
+
 def test_a_vision_request_preparing_unlike_the_batch_s_others_cannot_join():
     """A key only some rows carry cannot be merged into a batch-wide keyword."""
     session = _vlm_session()

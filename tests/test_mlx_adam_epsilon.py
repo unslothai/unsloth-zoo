@@ -170,6 +170,39 @@ def test_epsilon_composes_with_betas(monkeypatch):
     assert kwargs["betas"] == (pytest.approx(0.85), pytest.approx(0.95))
 
 
+def test_lion_receives_the_betas(monkeypatch):
+    """HF builds Lion with betas=(adam_beta1, adam_beta2), no eps."""
+    name, kwargs = _forwarded(
+        monkeypatch, "lion", adam_beta1=0.95, adam_beta2=0.98, adam_epsilon=1e-6,
+    )
+    assert name == "Lion"
+    assert kwargs["betas"] == (pytest.approx(0.95), pytest.approx(0.98))
+    assert "eps" not in kwargs
+
+
+def test_lion_fills_an_unset_beta_with_its_own_default(monkeypatch):
+    _name, kwargs = _forwarded(monkeypatch, "lion", adam_beta2=0.98)
+    assert kwargs["betas"] == (pytest.approx(0.9), pytest.approx(0.98))
+    _name, kwargs = _forwarded(monkeypatch, "lion", adam_beta1=0.95)
+    assert kwargs["betas"] == (pytest.approx(0.95), pytest.approx(0.99))
+
+
+def test_unset_betas_keep_the_lion_default(monkeypatch):
+    _name, kwargs = _forwarded(monkeypatch, "lion")
+    assert "betas" not in kwargs
+
+
+def test_the_lion_optimizer_keeps_the_betas_it_is_given():
+    """Build the real optimizer so a kwarg MLX rejects fails here."""
+    optimizer = _trainer(
+        optim="lion", adam_beta1=0.95, adam_beta2=0.98,
+    )._build_optimizer(total_steps=4)
+    stored = getattr(optimizer, "betas", None)
+    if stored is None:
+        stored = optimizer._kw["betas"]
+    assert tuple(stored) == (pytest.approx(0.95), pytest.approx(0.98))
+
+
 @pytest.mark.parametrize("optim_name", ["sgd", "muon", "lion"])
 def test_epsilon_is_not_forwarded_to_epsilon_free_optimizers(monkeypatch, optim_name):
     _name, kwargs = _forwarded(monkeypatch, optim_name, adam_epsilon=1e-6)

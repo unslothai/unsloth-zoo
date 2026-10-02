@@ -1586,6 +1586,7 @@ class UnslothVisionDataCollator:
         "resize_dimension", "snap_to_patch_size",
         "completion_only_loss", "pad_to_multiple_of", "size_func",
         "_seen_supervised", "_warned_unsupervised", "audio_call_kwarg",
+        "chat_template_kwargs",
     )
 
     def __init__(
@@ -1608,6 +1609,7 @@ class UnslothVisionDataCollator:
         resize_dimension = 0, # can be 0, 1, 'max' or 'min' (max resizes based on the max of height width, min the min size, 0 the first dim, etc)
         snap_to_patch_size = False,
         last_response_only = False, # Train only on the last assistant turn
+        chat_template_kwargs = None,
     ):
         has_images = getattr(processor, "image_processor", None) is not None or _processor_takes_images(processor)
         audio_call_kwarg = _audio_call_kwarg(processor)
@@ -1634,6 +1636,7 @@ class UnslothVisionDataCollator:
         )
         self.ignore_index = ignore_index
         self.processor = processor
+        self.chat_template_kwargs = dict(chat_template_kwargs or {})
         _fix_audio_feature_extractor_padding_side(processor)
         self.formatting_func = formatting_func
         self.completion_only_loss = completion_only_loss
@@ -1745,6 +1748,13 @@ class UnslothVisionDataCollator:
             self.padding_token_ids = self.padding_token_ids.to(device)
         return self.padding_token_ids
 
+    def _apply_chat_template(self, messages, example = None, **kwargs):
+        # Per-row chat_template_kwargs override the collator's, as in the text path (dataset_utils).
+        row_kwargs = example.get("chat_template_kwargs") if isinstance(example, dict) else None
+        return self.processor.apply_chat_template(
+            messages, **{**(getattr(self, "chat_template_kwargs", None) or {}), **(row_kwargs or {}), **kwargs},
+        )
+
     def __call__(self, examples):
         batch = self._collate(examples)
         response_masker = getattr(self, "train_on_responses_only", None)
@@ -1783,8 +1793,9 @@ class UnslothVisionDataCollator:
                     messages = self._collapse_assistant_content(messages)
                 messages = self._clean_none_keys(messages)
 
-            message = self.processor.apply_chat_template(
+            message = self._apply_chat_template(
                 messages,
+                example = example,
                 tokenize = False,
                 add_generation_prompt = False,
             )
@@ -1997,9 +2008,9 @@ class UnslothVisionDataCollator:
                         message["content"] = content[0]["text"]
         return messages
 
-    def _render_chat(self, prompt_messages, completion_messages=None, add_generation_prompt=False, continue_final_message=False):
-        return self.processor.apply_chat_template(
-            prompt_messages + (completion_messages or []), tokenize=False, add_generation_prompt=add_generation_prompt, continue_final_message=continue_final_message
+    def _render_chat(self, prompt_messages, completion_messages=None, add_generation_prompt=False, continue_final_message=False, example=None):
+        return self._apply_chat_template(
+            prompt_messages + (completion_messages or []), example=example, tokenize=False, add_generation_prompt=add_generation_prompt, continue_final_message=continue_final_message
         )
 
     def _load_column_images(self, images):
@@ -2312,18 +2323,28 @@ class UnslothVisionDataCollator:
 
         return new_attn, new_ids, tuple(new_extras)
 
+    @staticmethod
+    def _left_truncation_index(lengths, L, max_len):
+        # Keep each row's start like TRL; [-max_len:] cut the prompt and its image tokens.
+        starts = L - lengths.clamp(min=max_len)
+        return starts.unsqueeze(1) + torch.arange(max_len, device=lengths.device)
+
     def _truncate_by_side(self, input_ids, attention_mask, completion_mask, side, max_len, token_type_ids=None):
         _, L = input_ids.shape
         if L <= max_len:
             return [input_ids, attention_mask, completion_mask] + ([token_type_ids] if token_type_ids is not None else [])
-        sl = slice(-max_len, None) if side == "left" else slice(0, max_len)
+        if side == "left":
+            idx = self._left_truncation_index(attention_mask.sum(-1), L, max_len)
+            take = lambda t: torch.gather(t, 1, idx)
+        else:
+            take = lambda t: t[:, :max_len]
 
-        input_ids       = input_ids[:, sl]
-        attention_mask  = attention_mask[:, sl]
-        completion_mask = completion_mask[:, sl]
+        input_ids       = take(input_ids)
+        attention_mask  = take(attention_mask)
+        completion_mask = take(completion_mask)
 
         if token_type_ids is not None:
-            token_type_ids = token_type_ids[:, sl]
+            token_type_ids = take(token_type_ids)
         return [input_ids, attention_mask, completion_mask] + ([token_type_ids] if token_type_ids is not None else [])
 
     def _raise_if_truncation_cut_media(self, before, after, pad_id):
@@ -2393,7 +2414,7 @@ class UnslothVisionDataCollator:
                 if self.assistant_single_content:
                     self._collapse_assistant_content(p)
                 p = self._clean_none_keys(p)
-                p_txt = self._render_chat(p, add_generation_prompt=True, continue_final_message=False)
+                p_txt = self._render_chat(p, add_generation_prompt=True, continue_final_message=False, example=ex)
             else:
                 p_txt = str(p)
 
@@ -2402,7 +2423,7 @@ class UnslothVisionDataCollator:
                 if self.assistant_single_content:
                     self._collapse_assistant_content(c)
                 c = self._clean_none_keys(c)
-                pc_txt = self._render_chat(prompt_messages=p, completion_messages=c)
+                pc_txt = self._render_chat(prompt_messages=p, completion_messages=c, example=ex)
                 # some models append common template items so this removes them.
                 # see trl/data_utils.py
                 p_txt = "".join(x for x, _ in takewhile(lambda x: x[0] == x[1], zip(p_txt, pc_txt)))
@@ -2518,9 +2539,15 @@ class UnslothVisionDataCollator:
         if cross_mask is not None:
             cross_mask = torch.cat((cross_mask, cross_mask[:, -1:].expand(-1, c_ids.shape[1], *cross_mask.shape[2:])), dim=1)
             _, _, (cross_mask,) = self._flush_to_side(*pre_flush, flush_side, pad_id, (cross_mask,))
-            if cross_mask.shape[1] > input_ids.shape[1]:
-                cross_mask = cross_mask[:, -input_ids.shape[1]:] if flush_side == "left" else cross_mask[:, :input_ids.shape[1]]
-            elif cross_mask.shape[1] < input_ids.shape[1]:
+            max_len = self.max_seq_length
+            if max_len is not None and cross_mask.shape[1] > max_len:
+                # Same rows as _truncate_by_side, or the mask shifts against input_ids.
+                if flush_side == "left":
+                    idx = self._left_truncation_index(pre_flush[0].sum(-1), cross_mask.shape[1], max_len)
+                    cross_mask = cross_mask[torch.arange(cross_mask.shape[0], device = idx.device).unsqueeze(1), idx]
+                else:
+                    cross_mask = cross_mask[:, :max_len]
+            if cross_mask.shape[1] < input_ids.shape[1]:
                 fill = cross_mask.new_zeros((cross_mask.shape[0], input_ids.shape[1] - cross_mask.shape[1], *cross_mask.shape[2:]))
                 cross_mask = torch.cat((fill, cross_mask) if flush_side == "left" else (cross_mask, fill), dim=1)
 
