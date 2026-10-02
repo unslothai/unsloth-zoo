@@ -2992,6 +2992,83 @@ def test_mlx_train_result_reports_base_quantization():
     assert '"base_quantized_source"' in source
 
 
+def test_native_awq_adapter_base_reloads_as_native_prequant(monkeypatch):
+    from unsloth_zoo.mlx import loader as _loader
+
+    monkeypatch.setattr(_loader, "_mlx_lm_supports_native_prequant", lambda: True)
+
+    native_awq_cfg = {
+        "base_quantization_config": {
+            "quant_method": "awq", "bits": 4, "group_size": 128,
+        },
+        "base_quantized_source": "mlx_config",
+    }
+    assert _loader._adapter_base_prefers_native_prequant(
+        native_awq_cfg,
+        adapter_requires_runtime_quant=False,
+        adapter_mlx_quant_config=None,
+        adapter_base_is_bnb=False,
+    ) is True
+
+    gptq_cfg = {
+        "base_quantization_config": {
+            "quant_method": "gptq", "bits": 4, "group_size": 128,
+        },
+        "base_quantized_source": "runtime",
+    }
+    assert _loader._adapter_base_prefers_native_prequant(
+        gptq_cfg,
+        adapter_requires_runtime_quant=True,
+        adapter_mlx_quant_config={"bits": 4, "group_size": 128, "mode": "affine"},
+        adapter_base_is_bnb=False,
+    ) is False
+    repacked_gptq_cfg = {
+        "base_quantization_config": {"quant_method": "gptq", "bits": 4, "group_size": 128},
+        "base_quantized_source": "mlx_config",
+    }
+    assert _loader._adapter_base_prefers_native_prequant(
+        repacked_gptq_cfg,
+        adapter_requires_runtime_quant=False,
+        adapter_mlx_quant_config=None,
+        adapter_base_is_bnb=False,
+    ) is True
+    assert _loader._adapter_base_prefers_native_prequant(
+        native_awq_cfg,
+        adapter_requires_runtime_quant=False,
+        adapter_mlx_quant_config={"bits": 4, "group_size": 128, "mode": "affine"},
+        adapter_base_is_bnb=False,
+    ) is False
+    assert _loader._adapter_base_prefers_native_prequant(
+        {"base_quantization_config": {"load_in_4bit": True}},
+        adapter_requires_runtime_quant=False,
+        adapter_mlx_quant_config={"bits": 4, "group_size": 64, "mode": "affine"},
+        adapter_base_is_bnb=True,
+    ) is False
+    assert _loader._adapter_base_prefers_native_prequant(
+        {},
+        adapter_requires_runtime_quant=False,
+        adapter_mlx_quant_config=None,
+        adapter_base_is_bnb=False,
+    ) is False
+
+    monkeypatch.setattr(_loader, "_mlx_lm_supports_native_prequant", lambda: False)
+    assert _loader._adapter_base_prefers_native_prequant(
+        native_awq_cfg,
+        adapter_requires_runtime_quant=False,
+        adapter_mlx_quant_config=None,
+        adapter_base_is_bnb=False,
+    ) is False
+
+
+def test_native_awq_adapter_reload_wires_preserve_flag_into_base_load():
+    import inspect
+    from unsloth_zoo.mlx.loader import FastMLXModel
+
+    source = inspect.getsource(FastMLXModel.from_pretrained)
+    assert "_adapter_base_prefers_native_prequant(" in source
+    assert "\"load_in_4bit\": _reload_base_load_in_4bit," in source
+
+
 def test_mlx_loader_exposes_dense_nf4_diagnostic_mode():
     import mlx.core as mx
     from unsloth_zoo.mlx.loader import (
