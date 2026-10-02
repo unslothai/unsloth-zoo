@@ -1,0 +1,210 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+
+"""A capture hook inside a compiled submodule reads the eagerly set collector without a graph break."""
+import contextvars
+import subprocess
+import sys
+import textwrap
+import threading
+
+import pytest
+import torch
+
+output_capturing = pytest.importorskip("transformers.utils.output_capturing")
+if not hasattr(output_capturing, "CompileableContextVar"):
+    pytest.skip("this transformers has no CompileableContextVar", allow_module_level = True)
+
+_PROBE = textwrap.dedent("""
+    import torch
+    from transformers.utils.output_capturing import CompileableContextVar
+    var = CompileableContextVar("probe")
+
+    @torch.compile(fullgraph = True, backend = "eager")
+    def hook(x):
+        collected = var.get()
+        collected["k"].append(x * 2)
+        return x + 1
+
+    collected = {{"k": []}}
+    token = var.set(collected)
+    try:
+        hook(torch.ones(2))
+    finally:
+        var.reset(token)
+    assert len(collected["k"]) == 1 and torch.equal(collected["k"][0], torch.full((2,), 2.0))
+    print("FULLGRAPH_OK")
+""")
+
+
+def _run():
+    code = _PROBE.format()
+    return subprocess.run([sys.executable, "-c", code], capture_output = True, text = True, timeout = 600)
+
+
+def test_compiled_reader_sees_the_eager_collector_without_a_graph_break():
+    # In process, so the zoo import goes through conftest (no separate unsloth install needed).
+    var = _patched_var("probe")
+
+    @torch.compile(fullgraph = True, backend = "eager")
+    def hook(x):
+        var.get()["k"].append(x * 2)
+        return x + 1
+
+    torch._dynamo.reset()
+    collected = {"k": []}
+    token = var.set(collected)
+    try:
+        hook(torch.ones(2))
+    finally:
+        var.reset(token)
+    assert len(collected["k"]) == 1 and torch.equal(collected["k"][0], torch.full((2,), 2.0))
+
+
+def test_unpatched_reader_breaks_the_graph():
+    out = _run()
+    if "FULLGRAPH_OK" in out.stdout:
+        pytest.skip(f"torch {torch.__version__} traces ContextVar.get, so there is no graph break to remove")
+    assert "ContextVar" in out.stderr, out.stderr[-3000:]
+
+
+def _patched_var(name):
+    from unsloth_zoo.temporary_patches.misc import patch_output_collector_for_compiled_submodules
+    patch_output_collector_for_compiled_submodules()
+    return output_capturing.CompileableContextVar(name)
+
+
+def _compiled_get(var, monkeypatch):
+    with monkeypatch.context() as m:
+        m.setattr(torch.compiler, "is_compiling", lambda: True)
+        return var.get()
+
+
+def test_eager_reads_stay_per_thread_and_nesting_restores(monkeypatch):
+    var = _patched_var("eager")
+    outer, inner = {"k": []}, {"k": []}
+    t_outer = var.set(outer)
+    seen = []
+    thread = threading.Thread(target = lambda: seen.append(var.get()))
+    thread.start(); thread.join()
+    assert seen == [None] and var.get() is outer
+    t_inner = var.set(inner)
+    assert var.get() is inner and _compiled_get(var, monkeypatch) is inner
+    var.reset(t_inner)
+    assert var.get() is outer and _compiled_get(var, monkeypatch) is outer
+    var.reset(t_outer)
+    assert var.get() is None and _compiled_get(var, monkeypatch) is None
+
+
+def test_overlapping_threads_never_read_each_others_collector(monkeypatch):
+    var = _patched_var("threads")
+    a, b = {"k": []}, {"k": []}
+    steps = {name: threading.Event() for name in ("a_set", "b_set", "a_reset", "b_done")}
+    seen = {}
+
+    def thread_a():
+        token = var.set(a)
+        steps["a_set"].set(); steps["b_set"].wait()
+        var.reset(token)
+        steps["a_reset"].set()
+
+    def thread_b():
+        steps["a_set"].wait()
+        token = var.set(b)
+        seen["overlap"] = var._unsloth_eager_single
+        steps["b_set"].set(); steps["a_reset"].wait()
+        seen["after_a_reset"] = (var._unsloth_eager_single, var._unsloth_eager_value is b)
+        var.reset(token)
+        steps["b_done"].set()
+
+    threads = [threading.Thread(target = thread_a), threading.Thread(target = thread_b)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    assert seen["overlap"] is False
+    assert seen["after_a_reset"] == (True, True)
+    assert var._unsloth_eager_single and _compiled_get(var, monkeypatch) is None
+
+
+def test_overlapping_same_thread_contexts_never_read_each_others_collector(monkeypatch):
+    # asyncio tasks or greenlets share one thread but each runs in its own context.
+    var = _patched_var("contexts")
+    a, b = {"k": []}, {"k": []}
+    ctx_a, ctx_b = contextvars.copy_context(), contextvars.copy_context()
+    token_a = ctx_a.run(var.set, a)
+    token_b = ctx_b.run(var.set, b)
+    assert var._unsloth_eager_single is False
+    assert ctx_a.run(_compiled_get, var, monkeypatch) is a
+    ctx_a.run(var.reset, token_a)
+    assert var._unsloth_eager_single and _compiled_get(var, monkeypatch) is b
+    ctx_b.run(var.reset, token_b)
+    assert _compiled_get(var, monkeypatch) is None
+
+
+def test_out_of_order_reset_falls_back_to_the_context_var(monkeypatch):
+    var = _patched_var("unordered")
+    a, b = {"k": []}, {"k": []}
+    t1 = var.set(a)
+    t2 = var.set(b)
+    var.reset(t1)
+    assert var.get() is None and _compiled_get(var, monkeypatch) is None
+    var.reset(t2)
+    assert var.get() is a and _compiled_get(var, monkeypatch) is a
+    var.set(b)
+    assert var._unsloth_eager_single is False
+
+
+def test_a_failed_reset_leaves_the_mirror_alone(monkeypatch):
+    var = _patched_var("foreign")
+    a = {"k": []}
+    token = contextvars.copy_context().run(var.set, a)
+    var2 = {"k": []}
+    own = var.set(var2)
+    with pytest.raises(ValueError):
+        var.reset(token)
+    assert var.get() is var2
+    var.reset(own)
+
+
+def test_a_thread_without_a_set_never_reads_the_mirror(monkeypatch):
+    var = _patched_var("reader")
+    owner = {"k": []}
+    token = var.set(owner)
+    seen = []
+    thread = threading.Thread(target = lambda: seen.append(_compiled_get(var, monkeypatch)))
+    thread.start(); thread.join()
+    assert seen == [None] and _compiled_get(var, monkeypatch) is owner
+    var.reset(token)
+
+
+def test_compiled_reader_on_another_thread_gets_its_own_value():
+    var = _patched_var("compiled_reader")
+
+    # Not fullgraph: the other thread falls back to ContextVar.get, which breaks the graph before torch 2.14.
+    @torch.compile(backend = "eager")
+    def hook(x):
+        return x + (1.0 if var.get() is not None else 0.0)
+
+    torch._dynamo.reset()
+    token = var.set({"k": []})
+    try:
+        assert torch.equal(hook(torch.zeros(2)), torch.ones(2))
+        out = []
+        thread = threading.Thread(target = lambda: out.append(hook(torch.zeros(2))))
+        thread.start(); thread.join()
+    finally:
+        var.reset(token)
+    assert torch.equal(out[0], torch.zeros(2))

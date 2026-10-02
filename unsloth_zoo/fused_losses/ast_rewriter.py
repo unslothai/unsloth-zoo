@@ -56,6 +56,11 @@ class TripletCapture:
     loss_init_idx: int | None # index of the `loss = None` stmt that we delete (may be None)
     # [(name, ast.AST)] post-head scaling; fused call only. Defaulted + last for existing callers.
     scale_kws: list = field(default_factory = list)
+    pre_stmts: list = field(default_factory = list)
+    post_stmts: list = field(default_factory = list)
+    softcap_idx: int | None = None
+    softcap_stmt: ast.stmt | None = None
+    softcap_expr: ast.AST | None = None
 
 
 def _is_self_attr_call(node: ast.AST) -> bool:
@@ -128,6 +133,58 @@ def _find_loss_function_call(if_block: ast.If) -> ast.Call | None:
     return None
 
 
+def _is_loss_function_assign(stmt: ast.stmt) -> bool:
+    return (
+        isinstance(stmt, ast.Assign)
+        and len(stmt.targets) == 1
+        and isinstance(stmt.targets[0], ast.Name)
+        and isinstance(stmt.value, ast.Call)
+        and isinstance(stmt.value.func, ast.Attribute)
+        and isinstance(stmt.value.func.value, ast.Name)
+        and stmt.value.func.value.id == "self"
+        and stmt.value.func.attr == "loss_function"
+    )
+
+
+def _is_cast(stmt: ast.stmt, names) -> bool:
+    if not (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name) and stmt.targets[0].id in names):
+        return False
+    v = stmt.value
+    return (
+        isinstance(v, ast.Call)
+        and isinstance(v.func, ast.Attribute)
+        and v.func.attr in _TRANSPARENT_METHODS
+        and isinstance(v.func.value, ast.Name)
+        and v.func.value.id == stmt.targets[0].id
+    )
+
+
+_TANH_SPELLINGS = frozenset(("torch.tanh", "nn.functional.tanh", "torch.nn.functional.tanh", "F.tanh"))
+
+
+def _softcap_cap(stmt: ast.stmt, logits_name: str):
+    """The `cap` of `logits = tanh(logits / cap) * cap`, else None."""
+    if not (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name) and stmt.targets[0].id == logits_name):
+        return None
+    v = stmt.value
+    if not (isinstance(v, ast.BinOp) and isinstance(v.op, ast.Mult)
+            and isinstance(v.left, ast.Call) and len(v.left.args) == 1 and not v.left.keywords
+            and ast.unparse(v.left.func) in _TANH_SPELLINGS):
+        return None
+    inner = v.left.args[0]
+    if not (isinstance(inner, ast.BinOp) and isinstance(inner.op, ast.Div)
+            and isinstance(inner.left, ast.Name) and inner.left.id == logits_name):
+        return None
+    cap = inner.right
+    if ast.dump(cap) != ast.dump(v.right):
+        return None
+    if any(isinstance(n, ast.Name) and n.id == logits_name for n in ast.walk(cap)):
+        return None
+    return cap
+
+
 def _find_loss_assign_target(if_block: ast.If, call: ast.Call) -> str | None:
     for stmt in if_block.body:
         if isinstance(stmt, ast.Assign) and stmt.value is call and len(stmt.targets) == 1:
@@ -166,19 +223,12 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> TripletCapture | Non
     # CSM auxiliary depth-decoder loss).
     if if_node.orelse:
         return None
-    if len(if_node.body) != 1:
+    loss_positions = [k for k, s in enumerate(if_node.body) if _is_loss_function_assign(s)]
+    if len(loss_positions) != 1:
         return None
-    loss_assign = if_node.body[0]
-    if not (isinstance(loss_assign, ast.Assign) and len(loss_assign.targets) == 1
-            and isinstance(loss_assign.targets[0], ast.Name)):
-        return None
+    loss_k = loss_positions[0]
+    loss_assign = if_node.body[loss_k]
     loss_call = loss_assign.value
-    if not (isinstance(loss_call, ast.Call)
-            and isinstance(loss_call.func, ast.Attribute)
-            and isinstance(loss_call.func.value, ast.Name)
-            and loss_call.func.value.id == "self"
-            and loss_call.func.attr == "loss_function"):
-        return None
     loss_name = loss_assign.targets[0].id
 
     # Locate logits-bearing arg: first positional or `logits=` kw.
@@ -193,6 +243,13 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> TripletCapture | Non
                 logits_name = kw.value.id
                 break
     if logits_name is None:
+        return None
+    # transformers 4.x casts around the call; anything else would be dropped by the rewrite.
+    pre_stmts = if_node.body[:loss_k]
+    post_stmts = if_node.body[loss_k + 1:]
+    if not all(_is_cast(s, ("labels", logits_name)) for s in pre_stmts):
+        return None
+    if not all(_is_cast(s, (loss_name, logits_name)) for s in post_stmts):
         return None
 
     # Labels arg must be literally the plain `labels` name; aliased labels
@@ -237,12 +294,16 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> TripletCapture | Non
     logits_rhs_src = None
     lm_head_assign_idx = None
     scale_kws: list = []
+    skipped_softcap = False
     for j in range(if_idx - 1, -1, -1):
         stmt = body[j]
         if not (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1):
             continue
         tgt = stmt.targets[0]
         if not (isinstance(tgt, ast.Name) and tgt.id == logits_name):
+            continue
+        if not skipped_softcap and _softcap_cap(stmt, logits_name) is not None:
+            skipped_softcap = True
             continue
         unwrapped = _unwrap_logits_rhs(stmt.value)
         if unwrapped is None:
@@ -275,9 +336,17 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> TripletCapture | Non
     # Bail if any statement between lm_head and the labels-if touches logits
     # (e.g. Gemma3 final_logit_softcapping): it would run on EMPTY_LOGITS in
     # the labels branch, so fused loss would see un-softcapped logits.
+    # Except one `logits = tanh(logits / cap) * cap` (RecurrentGemma): the kernel reapplies it.
+    softcap_idx = None
+    softcap_expr = None
     for j in range(lm_head_assign_idx + 1, if_idx):
         if j == loss_init_idx:
             continue
+        if softcap_idx is None:
+            softcap_expr = _softcap_cap(body[j], logits_name)
+            if softcap_expr is not None:
+                softcap_idx = j
+                continue
         for n in ast.walk(body[j]):
             if isinstance(n, ast.Name) and n.id == logits_name:
                 return None
@@ -295,6 +364,11 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> TripletCapture | Non
         lm_head_assign_idx=lm_head_assign_idx,
         if_block_idx=if_idx,
         loss_init_idx=loss_init_idx,
+        pre_stmts=pre_stmts,
+        post_stmts=post_stmts,
+        softcap_idx=softcap_idx,
+        softcap_stmt=body[softcap_idx] if softcap_idx is not None else None,
+        softcap_expr=softcap_expr,
     )
 
 
@@ -322,21 +396,52 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
     # matmul). UNSLOTH_RETURN_LOGITS=1: run the full lm_head matmul once and
     # route loss through self.loss_function on those logits (avoids the double
     # matmul of fused-kernel + separate logits_rhs).
-    template = textwrap.dedent(f"""
-        if labels is not None:
-            if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1':
-                {logits} = {logits_rhs}
-                {loss} = self.loss_function({logits}, labels, vocab_size={vocab}{extra}{kwargs_unpack})
+    if cap.softcap_expr is not None and "logit_softcapping" not in already:
+        scale_extra += f", logit_softcapping={ast.unparse(cap.softcap_expr)}"
+    if not (cap.pre_stmts or cap.post_stmts or cap.softcap_expr is not None):
+        template = textwrap.dedent(f"""
+            if labels is not None:
+                if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1':
+                    {logits} = {logits_rhs}
+                    {loss} = self.loss_function({logits}, labels, vocab_size={vocab}{extra}{kwargs_unpack})
+                else:
+                    {loss} = unsloth_fused_lm_head_loss(
+                        {hidden_src}, self.{head_attr}, labels,
+                        vocab_size={vocab}{extra}{scale_extra}{kwargs_unpack},
+                    )
+                    {logits} = EMPTY_LOGITS
             else:
-                {loss} = unsloth_fused_lm_head_loss(
-                    {hidden_src}, self.{head_attr}, labels,
-                    vocab_size={vocab}{extra}{scale_extra}{kwargs_unpack},
-                )
-                {logits} = EMPTY_LOGITS
-        else:
-            {logits} = {logits_rhs}
-            {loss} = None
-    """).strip()
+                {logits} = {logits_rhs}
+                {loss} = None
+        """).strip()
+        return ast.parse(template).body
+
+    # Fused branch keeps only loss casts: the kernel moves labels and accumulates in fp32 itself.
+    softcap = [ast.unparse(cap.softcap_stmt)] if cap.softcap_stmt is not None else []
+    pre = [ast.unparse(s) for s in cap.pre_stmts]
+    post = [ast.unparse(s) for s in cap.post_stmts]
+    loss_casts = [ast.unparse(s) for s in cap.post_stmts if s.targets[0].id == loss]
+    unfused = [
+        f"{logits} = {logits_rhs}", *softcap, *pre,
+        f"{loss} = self.loss_function({logits}, labels, vocab_size={vocab}{extra}{kwargs_unpack})",
+        *post,
+    ]
+    fused = [
+        f"{loss} = unsloth_fused_lm_head_loss({hidden_src}, self.{head_attr}, labels, "
+        f"vocab_size={vocab}{extra}{scale_extra}{kwargs_unpack})",
+        *loss_casts,
+        f"{logits} = EMPTY_LOGITS",
+    ]
+    def ind(lines, n):
+        return "\n".join(" " * n + x for x in lines)
+
+    template = (
+        "if labels is not None:\n"
+        "    if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1':\n"
+        f"{ind(unfused, 8)}\n"
+        f"    else:\n{ind(fused, 8)}\n"
+        f"else:\n{ind([f'{logits} = {logits_rhs}', *softcap, f'{loss} = None'], 4)}"
+    )
     return ast.parse(template).body
 
 
@@ -362,13 +467,16 @@ def rewrite_forward_source(source: str) -> tuple[str | None, TripletCapture | No
     delete_indices = {cap.lm_head_assign_idx, cap.if_block_idx}
     if cap.loss_init_idx is not None:
         delete_indices.add(cap.loss_init_idx)
+    # A softcap may read names bound after the head (`cap = self.config...`): insert at the if.
+    insert_at = min(delete_indices)
+    if cap.softcap_idx is not None:
+        delete_indices.add(cap.softcap_idx)
+        insert_at = cap.if_block_idx
     new_body = []
-    inserted = False
     for i, stmt in enumerate(body):
+        if i == insert_at:
+            new_body.extend(new_block)
         if i in delete_indices:
-            if not inserted:
-                new_body.extend(new_block)
-                inserted = True
             continue
         new_body.append(stmt)
     fn.body = new_body

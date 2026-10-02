@@ -3146,3 +3146,79 @@ def patch_mamba_ssm_chunk_scan_device_guard():
             setattr(module, "_chunk_scan_fwd", _chunk_scan_fwd)
 pass
 TEMPORARY_PATCHES.append(patch_mamba_ssm_chunk_scan_device_guard)
+
+
+def patch_output_collector_for_compiled_submodules():
+    # capture_outputs sets the collector eagerly and ContextVar.get graph-breaks compiled hooks: compiled code reads a mirror.
+    try:
+        from transformers.utils import output_capturing
+    except Exception:
+        return
+    cls = getattr(output_capturing, "CompileableContextVar", None)
+    if cls is None or getattr(cls, "_unsloth_eager_mirror", False):
+        return
+    if not all(hasattr(cls, name) for name in ("get", "set", "reset")):
+        return
+    original_set, original_reset = cls.set, cls.reset
+    import threading
+    lock = threading.Lock()
+
+    def refresh(self, active):
+        # Mirror only one nested chain on one thread (each set's old_value is the previous value).
+        nested = all(active[i][0].old_value is active[i - 1][2] for i in range(1, len(active)))
+        if nested and len({tid for _, tid, _ in active}) <= 1 and not self.__dict__.get("_unsloth_eager_unordered"):
+            self._unsloth_eager_value = active[-1][2] if active else None
+            self._unsloth_eager_single = True
+        else:
+            self._unsloth_eager_single = False
+
+    @functools.wraps(cls.get)
+    def get(self):
+        if getattr(self, "compiling", False):
+            return self.global_var
+        if torch.compiler.is_compiling() and self.__dict__.get("_unsloth_eager_single", True):
+            value = self.__dict__.get("_unsloth_eager_value")
+            # Nothing set: None everywhere. Else only a thread with an active set (threading.local traces).
+            if value is None or getattr(self.__dict__.get("_unsloth_eager_tls"), "depth", 0) > 0:
+                return value
+        return self.context_var.get()
+
+    @functools.wraps(original_set)
+    def set(self, value):
+        token = original_set(self, value)
+        if token is not None:
+            tls = self.__dict__.get("_unsloth_eager_tls")
+            if tls is None:
+                tls = self.__dict__.setdefault("_unsloth_eager_tls", threading.local())
+            tls.depth = getattr(tls, "depth", 0) + 1
+            with lock:
+                active = self.__dict__.setdefault("_unsloth_eager_active", [])
+                active.append((token, threading.get_ident(), value))
+                refresh(self, active)
+        return token
+
+    @functools.wraps(original_reset)
+    def reset(self, token):
+        # Reset first: a token from another Context raises here and must leave the mirror untouched.
+        result = original_reset(self, token)
+        if token is not None:
+            tls = self.__dict__.get("_unsloth_eager_tls")
+            if tls is not None and getattr(tls, "depth", 0) > 0:
+                tls.depth -= 1
+            with lock:
+                # Tokens are unhashable: match by identity.
+                active = self.__dict__.get("_unsloth_eager_active") or []
+                for i in range(len(active) - 1, -1, -1):
+                    if active[i][0] is token:
+                        # Out of order: ContextVar restores token.old_value, which the stack cannot track.
+                        if i != len(active) - 1 and self.__dict__.get("_unsloth_eager_single", True):
+                            self._unsloth_eager_unordered = True
+                        del active[i]
+                        break
+                refresh(self, active)
+        return result
+
+    cls.get, cls.set, cls.reset = get, set, reset
+    cls._unsloth_eager_mirror = True
+pass
+TEMPORARY_PATCHES.append(patch_output_collector_for_compiled_submodules)
