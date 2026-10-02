@@ -464,7 +464,8 @@ def main():
     args = ap.parse_args()
 
     _STATE["host"] = args.host
-    _STATE["player"] = open(_PLAYER_TEMPLATE).read()
+    with open(_PLAYER_TEMPLATE, encoding="utf-8") as player_template:
+        _STATE["player"] = player_template.read()
     print(f"loading {args.gguf} on GPU {args.gpu} (optimized visual decoder) ...", flush=True)
     _STATE["server"] = V.VisualServer(args.gguf, gpu=args.gpu, maxtok=args.maxtok, ngl=args.ngl)
     print(f"gpu layers (NGL) = {_STATE['server'].ngl}", flush=True)
