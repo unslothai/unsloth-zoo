@@ -26,7 +26,10 @@ jobs:
   source-lint:
     name: Source lint (Python + YAML + JSON)
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # The untrusted-sink gate alone takes about three minutes on a hosted runner, so
+    # five left under two minutes for checkout, setup and every other lint here, and a
+    # slow runner would be cancelled with no verdict rather than failed with one.
+    timeout-minutes: 15
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
@@ -104,6 +107,7 @@ jobs:
         # fetched with no revision. It taints a value read out of a downloaded artefact
         # and follows it across functions and files. Reviewed sites live in
         # scripts/untrusted_sinks_baseline.json.
+        timeout-minutes: 10
         run: python scripts/lint_untrusted_sinks.py
 
       - name: Workflow triggers (pull_request_target / cache-poisoning)
