@@ -297,7 +297,7 @@ def test_prenorm_layers_hand_the_normalized_residual_on_bitwise(vlm, hidden, mon
             _equal(actual, native_out)
         # Per forward: every layer's residual add and all but the last layer's output handoff.
         assert len(launches) == 4 * (2 * len(layers) - 1)
-        assert all(layer._unsloth_handoff_in.residual is None for layer in layers[1:])
+        assert all(layer._unsloth_handoff_in.value is None for layer in layers[1:])
     assert all(type(layer) is base for layer in layers)
     assert not any(key.startswith("_unsloth_handoff") for layer in layers for key in vars(layer))
 
@@ -310,8 +310,8 @@ def test_prenorm_handoff_is_taken_only_for_the_residual_it_normalized(change, mo
     x = mx.random.normal((1, 2, 256)).astype(mx.bfloat16)
     with decode.fused_residual_norm_handoff(model):
         out = first(x)
-        normed = second._unsloth_handoff_in.normed
-        assert second._unsloth_handoff_in.residual is out
+        residual, normed, _, _ = second._unsloth_handoff_in.value
+        assert residual is out
         if change == "none":
             assert second._unsloth_take_norm(second.input_layernorm, out) is normed
             return
@@ -325,6 +325,26 @@ def test_prenorm_handoff_is_taken_only_for_the_residual_it_normalized(change, mo
             original = nn.RMSNorm.__call__
             monkeypatch.setattr(nn.RMSNorm, "__call__", lambda self, value: original(self, value) * 0.5)
         _equal(second(out), base.__call__(second, out))
+
+
+def test_overlapping_handoff_scopes_keep_the_layers_fused_until_the_last_exit():
+    # model.generate enters the scope outside generation_mode's lock, so two calls can exit out of order.
+    outer = _text_model(False)
+    model = outer.model
+    layers, base = model.layers, type(model.layers[0])
+    tokens = mx.random.randint(0, 64, (1, 3))
+    expected = outer(tokens)
+    first, second = decode.fused_residual_norm_handoff(model), decode.fused_residual_norm_handoff(model)
+    first.__enter__()
+    fused = type(layers[0])
+    second.__enter__()
+    first.__exit__(None, None, None)
+    assert all(type(layer) is fused for layer in layers)
+    assert all("_unsloth_handoff_in" in vars(layer) for layer in layers[1:])
+    _equal(outer(tokens), expected)
+    second.__exit__(None, None, None)
+    assert all(type(layer) is base for layer in layers)
+    assert not any(key.startswith("_unsloth_handoff") for layer in layers for key in vars(layer))
 
 
 class _NormLayer(nn.Module):

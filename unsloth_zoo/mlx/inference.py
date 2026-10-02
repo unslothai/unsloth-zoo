@@ -1075,11 +1075,13 @@ def _fused_add_rms_norm(x, r, w, eps):
 class _Handoff:
     """The residual a decoder layer returns, already normalized by the next layer's input norm."""
 
-    __slots__ = ("consumer", "residual", "normed", "weight", "eps")
+    # One (residual, normed, weight, eps) tuple, swapped whole: overlapping generate calls share the
+    # slot, and a field-by-field read could pair one call's residual with another's normed output.
+    __slots__ = ("consumer", "value")
 
     def __init__(self, consumer):
         self.consumer = consumer
-        self.residual = self.normed = self.weight = self.eps = None
+        self.value = None
 
 
 _ADD_NORM_VERDICTS = {}
@@ -1217,15 +1219,15 @@ def _prenorm_class(base):
             norm = getattr(slot.consumer, name, None)
             out = _add_rms_norm(norm, h, m)
             if out is not None:
-                slot.residual, slot.normed, slot.weight, slot.eps = *out, norm.weight, norm.eps
+                slot.value = (*out, norm.weight, norm.eps)
                 return out[0]
         return h + m
 
     def take_norm(self, norm, x):
         slot = self.__dict__.get("_unsloth_handoff_in")
-        if slot is not None:
-            residual, normed, weight, eps = slot.residual, slot.normed, slot.weight, slot.eps
-            slot.residual = slot.normed = slot.weight = slot.eps = None
+        value, slot.value = (slot.value, None) if slot is not None else (None, None)
+        if value is not None:
+            residual, normed, weight, eps = value
             if (residual is x and type(norm) is nn.RMSNorm and norm.weight is weight and norm.eps == eps
                     and _bindings_intact(bindings)):
                 return normed
@@ -1291,6 +1293,12 @@ def fused_residual_norm_handoff(model):
                     # Type first, as in fused_residual_norm: named_modules() may yield plain stand-ins.
                     if not isinstance(module, dict) or module.training:
                         continue
+                    # model.generate enters this without generation_mode's lock, so scopes can
+                    # overlap: count owners, as fused_decode_conv_silu does, and let the last restore.
+                    if module.__dict__.get("_unsloth_handoff_scopes", 0):
+                        module._unsloth_handoff_scopes += 1
+                        patched.append((module, None, None))
+                        continue
                     if hasattr(base, "_unsloth_residual_norm_base") or _residual_norm_class(base) is not None:
                         continue
                     fused = _prenorm_class(base)
@@ -1298,7 +1306,8 @@ def fused_residual_norm_handoff(model):
                                                  for name in fused._unsloth_residual_norm_names)):
                         patched.append((module, base, fused))
                         module.__class__ = fused
-                owned = {id(module) for module, _, _ in patched}
+                        module._unsloth_handoff_scopes = 1
+                owned = {id(module) for module, _, fused in patched if fused is not None}
                 for module in (module for _, module in model.named_modules()) if owned else ():
                     layers = module.get("layers") if isinstance(module, dict) else None
                     if not isinstance(layers, list):
@@ -1311,9 +1320,13 @@ def fused_residual_norm_handoff(model):
     finally:
         with _RESIDUAL_NORM_LOCK:
             for module, base, fused in reversed(patched):
-                for name in ("_unsloth_handoff_out", "_unsloth_handoff_in"):
+                scopes = module.__dict__.get("_unsloth_handoff_scopes", 0)
+                if scopes > 1:
+                    module._unsloth_handoff_scopes = scopes - 1
+                    continue
+                for name in ("_unsloth_handoff_out", "_unsloth_handoff_in", "_unsloth_handoff_scopes"):
                     module.__dict__.pop(name, None)
-                if type(module) is fused:
+                if fused is not None and type(module) is fused:
                     module.__class__ = base
 
 _QWEN_ROUTING, _GEMMA_ROUTING = 0, 1  # kernel MODE
