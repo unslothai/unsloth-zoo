@@ -2732,10 +2732,21 @@ def _forward_statically_reads_stash(experts_module):
     if forward is None:
         forward = getattr(type(experts_module), "forward", None)
     forward = getattr(forward, "__func__", forward)
-    code = getattr(forward, "__code__", None)
-    if code is None:
+    if getattr(forward, "__code__", None) is None:
         return None
+    return _code_reaches_stash(forward)
 
+
+# Dynamo calls this eagerly and bakes in the bool: tracing the scan itself graph-breaks (torch 2.11) or
+# raises under fullgraph once a forward's globals hold an lru_cache wrapper Dynamo cannot getattr through.
+_assume_constant_result = getattr(torch.compiler, "assume_constant_result", None) or \
+    getattr(torch._dynamo, "assume_constant_result", lambda fn: fn)
+
+
+@_assume_constant_result
+def _code_reaches_stash(forward):
+    # This Unsloth Zoo code section is licensed under AGPL3
+    code = forward.__code__
     # (code, shallowest depth) pairs matched by `is`: id() is untraceable on some torch versions,
     # equality merges same-source functions with different __globals__, and a plain visited set
     # makes a helper first reached at the depth limit hide its deeper callees (hash-seed dependent).
