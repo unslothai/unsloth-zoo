@@ -3149,8 +3149,7 @@ TEMPORARY_PATCHES.append(patch_mamba_ssm_chunk_scan_device_guard)
 
 
 def patch_output_collector_for_compiled_submodules():
-    # capture_outputs sets its collector eagerly; a hook inside a compiled MoE block reading it via
-    # ContextVar.get breaks the graph. Compiled code reads a mirrored attribute, eager code the ContextVar.
+    # capture_outputs sets the collector eagerly and ContextVar.get graph-breaks compiled hooks: compiled code reads a mirror.
     try:
         from transformers.utils import output_capturing
     except Exception:
@@ -3165,8 +3164,7 @@ def patch_output_collector_for_compiled_submodules():
     lock = threading.Lock()
 
     def refresh(self, active):
-        # Mirror only while the active sets form one nested chain on one thread (each set saw the previous
-        # value as its old value). Overlapping threads, asyncio tasks or greenlets read their own ContextVar.
+        # Mirror only one nested chain on one thread (each set's old_value is the previous value).
         nested = all(active[i][0].old_value is active[i - 1][2] for i in range(1, len(active)))
         if nested and len({tid for _, tid, _ in active}) <= 1 and not self.__dict__.get("_unsloth_eager_unordered"):
             self._unsloth_eager_value = active[-1][2] if active else None
@@ -3180,8 +3178,7 @@ def patch_output_collector_for_compiled_submodules():
             return self.global_var
         if torch.compiler.is_compiling() and self.__dict__.get("_unsloth_eager_single", True):
             value = self.__dict__.get("_unsloth_eager_value")
-            # Nothing set anywhere reads None on every thread; otherwise only the owning thread (one with an
-            # active set, read through a threading.local, which Dynamo traces) may take the mirror.
+            # Nothing set: None everywhere. Else only a thread with an active set (threading.local traces).
             if value is None or getattr(self.__dict__.get("_unsloth_eager_tls"), "depth", 0) > 0:
                 return value
         return self.context_var.get()
@@ -3213,8 +3210,7 @@ def patch_output_collector_for_compiled_submodules():
                 active = self.__dict__.get("_unsloth_eager_active") or []
                 for i in range(len(active) - 1, -1, -1):
                     if active[i][0] is token:
-                        # An out-of-order reset of one chain leaves a value the stack cannot describe
-                        # (ContextVar restores token.old_value): fall back to the ContextVar for good.
+                        # Out of order: ContextVar restores token.old_value, which the stack cannot track.
                         if i != len(active) - 1 and self.__dict__.get("_unsloth_eager_single", True):
                             self._unsloth_eager_unordered = True
                         del active[i]
