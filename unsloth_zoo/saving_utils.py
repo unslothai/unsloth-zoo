@@ -518,14 +518,36 @@ def _merge_lora(W, lora_stats, name, use_dequant_base = False):
 pass
 
 
+def _get_active_adapter(module):
+    adapters = getattr(module, "active_adapters", None)
+    if adapters is None:
+        adapters = getattr(module, "active_adapter", "default")
+    if isinstance(adapters, (list, tuple)):
+        if len(adapters) > 1:
+            raise ValueError("Unsloth: Merged export requires a single active adapter.")
+        return adapters[0] if adapters else None
+    return adapters
+pass
+
+
+def _has_active_adapter(module):
+    adapter = _get_active_adapter(module)
+    for attr in ("lora_A", "lora_embedding_A"):
+        try:
+            if adapter in getattr(module, attr): return True
+        except Exception:
+            continue
+    return False
+pass
+
+
 def _get_modules_to_save_weight(module, attr = "weight"):
     modules_to_save = getattr(module, "modules_to_save", None)
     if modules_to_save is None:
         return None
 
-    # `attr` so a head's bias travels with its weight; defaulted for existing callers.
-    # Prefer the default adapter, else first entry with a weight
-    for key in ("default",):
+    # A head's weight and bias must come from the same active adapter as the LoRA factors.
+    for key in (_get_active_adapter(module),):
         try:
             candidate = modules_to_save[key]
             if hasattr(candidate, attr):
@@ -533,6 +555,10 @@ def _get_modules_to_save_weight(module, attr = "weight"):
         except Exception:
             continue
 
+    if hasattr(module, "active_adapters") or hasattr(module, "active_adapter"):
+        return getattr(getattr(module, "original_module", None), attr, None)
+
+    # Legacy wrappers without an active-adapter API.
     for _, candidate in modules_to_save.items():
         if hasattr(candidate, attr):
             return getattr(candidate, attr)
@@ -674,15 +700,8 @@ pass
 
 def _get_lora_scaling(module):
     # All Unsloth Zoo code licensed under LGPLv3
-    # Resolve plural active_adapters or older singular active_adapter (may be a list);
     # 0.0 if unresolved so counts align. (#2966)
-    active_adapters = getattr(module, "active_adapters", None)
-    if active_adapters:
-        active_adapter = active_adapters[0]
-    else:
-        active_adapter = getattr(module, "active_adapter", "default")
-        if isinstance(active_adapter, (list, tuple)):
-            active_adapter = active_adapter[0] if active_adapter else "default"
+    active_adapter = _get_active_adapter(module)
     try:
         return module.scaling[active_adapter]
     except Exception:
@@ -704,43 +723,46 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
     remove_keys = set()
     keep_keys   = set()
     _embedding_lora_keys = set()
+    _untargeted_keys = set()
+    _keep_downloaded_keys = set()
 
     inner_model = find_lora_base_model(model)
     for name, module in inner_model.named_modules():
         if name == "": continue
+        adapter_path, _, adapter = name.rpartition(".")
 
-        elif name.endswith(".lora_A.default"):
-            lora_weights[name[:-len(".lora_A.default")]].lora_A = module.weight
-            lora_A_count += 1
+        if adapter_path.endswith((".lora_A", ".lora_B", ".lora_magnitude_vector")):
+            key, _, kind = adapter_path.rpartition(".")
             expand_module_keys(name, module, remove_keys)
-
-        elif name.endswith(".lora_B.default"):
-            lora_weights[name[:-len(".lora_B.default")]].lora_B = module.weight
-            lora_B_count += 1
-            expand_module_keys(name, module, remove_keys)
-
-        elif name.endswith((".lora_embedding_A", ".lora_embedding_B")) and "default" in module:
-            # PEFT Embedding delta (B_e @ A_e).T == Linear form with lora_B = A_e.T, lora_A = B_e.T.
-            key = name[:-len(".lora_embedding_A")]
-            _embedding_lora_keys.add(key)
-            if name.endswith("_A"):
-                lora_weights[key].lora_B = module["default"].t()
+            if adapter != _get_active_adapter(inner_model.get_submodule(key)): continue
+            if kind == "lora_A":
+                lora_weights[key].lora_A = module.weight
+                lora_A_count += 1
+            elif kind == "lora_B":
+                lora_weights[key].lora_B = module.weight
                 lora_B_count += 1
             else:
-                lora_weights[key].lora_A = module["default"].t()
-                lora_A_count += 1
+                lora_weights[key].magnitude = module.weight
 
-        elif name.endswith(".lora_magnitude_vector.default"):
-            # DoRA magnitude vector m; folded onto the merged weight in _merge_lora. Register its
-            # key so the key-consistency check does not flag it (the merged model omits it).
-            lora_weights[name[:-len(".lora_magnitude_vector.default")]].magnitude = module.weight
-            expand_module_keys(name, module, remove_keys)
+        elif name.endswith((".lora_embedding_A", ".lora_embedding_B")):
+            # PEFT Embedding delta (B_e @ A_e).T == Linear form with lora_B = A_e.T, lora_A = B_e.T.
+            key = name[:-len(".lora_embedding_A")]
+            adapter = _get_active_adapter(inner_model.get_submodule(key))
+            if adapter not in module: continue
+            _embedding_lora_keys.add(key)
+            if name.endswith("_A"):
+                lora_weights[key].lora_B = module[adapter].t()
+                lora_B_count += 1
+            else:
+                lora_weights[key].lora_A = module[adapter].t()
+                lora_A_count += 1
 
         elif isinstance(module, Linear_LoRA_Layers):
             lora_weights[name].alpha = _get_lora_scaling(module)
             lora_weights[name].parameter_name = getattr(module, "parameter_name", None)
             scaling_count += 1
             expand_module_keys(name, module, remove_keys)
+            if not _has_active_adapter(module): _untargeted_keys.add(name)
 
         # LoRA wrappers (MoE/quant/older peft) not subclassing Linear_LoRA_Layers:
         # capture alpha so counts align. Require lora_A/lora_B so a non-LoRA module
@@ -752,6 +774,7 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
             lora_weights[name].parameter_name = getattr(module, "parameter_name", None)
             scaling_count += 1
             expand_module_keys(name, module, remove_keys)
+            if not _has_active_adapter(module): _untargeted_keys.add(name)
 
         elif name.endswith(".base_layer"):
             lora_weights[name[:-len(".base_layer")]].module = module
@@ -765,6 +788,11 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
                 lora_weights[name].module = module
                 expand_module_keys(name, module, remove_keys)
                 remove_keys.add(name)
+                # No saved copy for the active adapter and a quantized original: keep the downloaded tensor.
+                original = getattr(module, "original_module", None)
+                if original is not None and saved_weight is getattr(original, "weight", None) \
+                    and check_if_quantized(original):
+                    _keep_downloaded_keys.add(name)
             else:
                 new_keys = expand_module_keys(name, module, set())
                 remove_keys.update(new_keys)
@@ -822,6 +850,12 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
                 "https://github.com/unslothai/unsloth/issues."
             )
 
+    # Untargeted layers keep the downloaded weight; writers would treat (module, no factors) as modules_to_save and write the live, possibly 4-bit packed, weight.
+    _untargeted_keys = {k for k in _untargeted_keys if lora_weights[k].lora_A is None and lora_weights[k].lora_B is None}
+    for _key in _untargeted_keys:
+        scaling_count -= 1
+        if lora_weights[_key].module is not None: module_count -= 1
+
     if not (module_count == lora_A_count == lora_B_count == scaling_count):
         print(
             f"[Unsloth merge debug] LoRA count mismatch: modules={module_count}, "
@@ -851,8 +885,8 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
             # so the key matches lora_weights entries created by the branch above.
             # Only strip .weight variant; the lora_weights branch adds both
             # .weight and .bias from the module so we don't need a separate bias entry.
-            elif name.endswith(".modules_to_save.default.weight"):
-                name = name[:-len(".modules_to_save.default.weight")]
+            elif re.search(r"\.modules_to_save\.[^.]+\.weight$", name):
+                name = name.rsplit(".modules_to_save.", 1)[0]
 
             if name in lora_weights:
                 state_dict[name + ".weight"]   = lora_weights[name]
@@ -876,6 +910,7 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
     pass
 
     if return_state_dict: assert_same_keys(model, state_dict)
+    for _key in _untargeted_keys | _keep_downloaded_keys: lora_weights.pop(_key, None)
     return lora_weights, state_dict
 pass
 
