@@ -32,7 +32,6 @@ if not hasattr(output_capturing, "CompileableContextVar"):
 _PROBE = textwrap.dedent("""
     import torch
     from transformers.utils.output_capturing import CompileableContextVar
-    {patch}
     var = CompileableContextVar("probe")
 
     @torch.compile(fullgraph = True, backend = "eager")
@@ -52,22 +51,32 @@ _PROBE = textwrap.dedent("""
 """)
 
 
-def _run(patch):
-    code = _PROBE.format(patch = patch)
+def _run():
+    code = _PROBE.format()
     return subprocess.run([sys.executable, "-c", code], capture_output = True, text = True, timeout = 600)
 
 
 def test_compiled_reader_sees_the_eager_collector_without_a_graph_break():
-    patch = (
-        "from unsloth_zoo.temporary_patches.misc import patch_output_collector_for_compiled_submodules\n"
-        "patch_output_collector_for_compiled_submodules()"
-    )
-    out = _run(patch)
-    assert "FULLGRAPH_OK" in out.stdout, out.stderr[-3000:]
+    # In process, so the zoo import goes through conftest (no separate unsloth install needed).
+    var = _patched_var("probe")
+
+    @torch.compile(fullgraph = True, backend = "eager")
+    def hook(x):
+        var.get()["k"].append(x * 2)
+        return x + 1
+
+    torch._dynamo.reset()
+    collected = {"k": []}
+    token = var.set(collected)
+    try:
+        hook(torch.ones(2))
+    finally:
+        var.reset(token)
+    assert len(collected["k"]) == 1 and torch.equal(collected["k"][0], torch.full((2,), 2.0))
 
 
 def test_unpatched_reader_breaks_the_graph():
-    out = _run("")
+    out = _run()
     if "FULLGRAPH_OK" in out.stdout:
         pytest.skip(f"torch {torch.__version__} traces ContextVar.get, so there is no graph break to remove")
     assert "ContextVar" in out.stderr, out.stderr[-3000:]
@@ -158,3 +167,15 @@ def test_out_of_order_reset_falls_back_to_the_context_var(monkeypatch):
     assert var.get() is a and _compiled_get(var, monkeypatch) is a
     var.set(b)
     assert var._unsloth_eager_single is False
+
+
+def test_a_failed_reset_leaves_the_mirror_alone(monkeypatch):
+    var = _patched_var("foreign")
+    a = {"k": []}
+    token = contextvars.copy_context().run(var.set, a)
+    var2 = {"k": []}
+    own = var.set(var2)
+    with pytest.raises(ValueError):
+        var.reset(token)
+    assert var.get() is var2
+    var.reset(own)

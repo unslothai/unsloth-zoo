@@ -3194,6 +3194,8 @@ def patch_output_collector_for_compiled_submodules():
 
     @functools.wraps(original_reset)
     def reset(self, token):
+        # Reset first: a token from another Context raises here and must leave the mirror untouched.
+        result = original_reset(self, token)
         if token is not None:
             with lock:
                 # Tokens are unhashable: match by identity.
@@ -3207,7 +3209,7 @@ def patch_output_collector_for_compiled_submodules():
                         del active[i]
                         break
                 refresh(self, active)
-        return original_reset(self, token)
+        return result
 
     cls.get, cls.set, cls.reset = get, set, reset
     cls._unsloth_eager_mirror = True
