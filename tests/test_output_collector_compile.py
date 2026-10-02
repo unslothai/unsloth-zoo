@@ -15,8 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
-"""A capture hook inside a compiled submodule must read the collector capture_outputs set eagerly
-without a graph break (TRL >= 1 captures MoE router logits for its aux loss)."""
+"""A capture hook inside a compiled submodule reads the eagerly set collector without a graph break."""
 import subprocess
 import sys
 import textwrap

@@ -3149,11 +3149,8 @@ TEMPORARY_PATCHES.append(patch_mamba_ssm_chunk_scan_device_guard)
 
 
 def patch_output_collector_for_compiled_submodules():
-    # transformers' capture_outputs sets its collector eagerly in the outer forward. A capture hook
-    # inside a region Unsloth compiles (e.g. the router of a compiled MoE block, which TRL >= 1
-    # captures for its router aux loss) then reads it via ContextVar.get, which Dynamo cannot trace:
-    # one graph break per hooked call. Mirror the eager value into a plain attribute that only
-    # compiled code reads; eager code keeps the thread-safe ContextVar.
+    # capture_outputs sets its collector eagerly; a hook inside a compiled MoE block reading it via
+    # ContextVar.get breaks the graph. Compiled code reads a mirrored attribute, eager code the ContextVar.
     try:
         from transformers.utils import output_capturing
     except Exception:
