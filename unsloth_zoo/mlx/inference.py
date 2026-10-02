@@ -35,7 +35,6 @@ import mlx.core as mx
 import mlx.nn as nn
 
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -799,8 +798,6 @@ def _residual_norm_class(base):
         "_unsloth_residual_norm_base": base, "_unsloth_residual_norm_names": tuple(names),
     })
 
-# `_fused_add_rms_norm` adds a residual and RMS-normalizes the sum in one launch, reducing each row
-# as `mx.fast.rms_norm` does.
 _HALF = (mx.bfloat16, mx.float16)
 
 
