@@ -154,10 +154,12 @@ def _store_probe(entry, passed):
 
 
 def _run_probe(module, function):
-    code = f"import importlib; getattr(importlib.import_module({module!r}), {function!r})()"
-    env = dict(os.environ, PYTHONPATH = os.pathsep.join(path for path in sys.path if path))
+    # `-I` keeps the working directory off the child's path: it imports only what this process can.
+    paths = [os.path.abspath(path) for path in sys.path if path]
+    code = (f"import sys; sys.path[:] = {paths!r}; import importlib; "
+            f"getattr(importlib.import_module({module!r}), {function!r})()")
     try:
-        result = subprocess.run([sys.executable, "-c", code], env = env, capture_output = True,
+        result = subprocess.run([sys.executable, "-I", "-c", code], capture_output = True,
                                 text = True, timeout = _PROBE_TIMEOUT)
     except subprocess.TimeoutExpired:
         return None

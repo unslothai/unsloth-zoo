@@ -133,6 +133,16 @@ def test_kernel_probe_runs_once_per_build_and_survives_a_bad_cache(monkeypatch, 
     assert nax.kernel_probe_passed("broken", "unsloth_probe_target", "good") is False
 
 
+def test_kernel_probe_does_not_import_from_the_working_directory(monkeypatch, tmp_path):
+    from unsloth_zoo.mlx import nax
+
+    (tmp_path / "unsloth_planted_probe.py").write_text("def good():\n    pass\n")
+    monkeypatch.chdir(tmp_path)
+    assert nax._run_probe("unsloth_planted_probe", "good") != ""
+    monkeypatch.syspath_prepend(str(tmp_path))   # on this process's own path it is importable
+    assert nax._run_probe("unsloth_planted_probe", "good") == ""
+
+
 def test_gpu_core_count_reads_the_ioregistry(monkeypatch):
     from unittest import mock
     from unsloth_zoo.mlx import nax
