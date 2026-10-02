@@ -1062,14 +1062,12 @@ def _rocm_gfx_family(gfx):
 
 
 def _gpu_cmake_flags(gpu_support):
-    """cmake GPU backend flags for a source build, one argv item each. ROCm
-    torch on Linux builds HIP per llama.cpp docs/build.md; Windows HIP needs a
-    Ninja + HIP SDK clang toolchain, so it keeps the CUDA flag."""
+    """One argv item per flag. Windows keeps CUDA: HIP there needs Ninja + the HIP SDK clang (llama.cpp docs/build.md)."""
     if gpu_support != "ON" or IS_WINDOWS:
         return [f"-DGGML_CUDA={gpu_support}"]
     if torch is None or not getattr(torch.version, "hip", None):
         return ["-DGGML_CUDA=ON"]
-    # Static libggml-hip.a is not PIC unless BUILD_SHARED_LIBS, so the PIE link fails on gfx1151.
+    # Static libggml-hip.a is non-PIC (llama.cpp sets PIC only for BUILD_SHARED_LIBS): PIE link fails without this.
     flags = ["-DGGML_HIP=ON", "-DCMAKE_POSITION_INDEPENDENT_CODE=ON"]
     rocm_path = os.environ.get("ROCM_PATH") or "/opt/rocm"
     hip_clang = os.path.join(rocm_path, "llvm", "bin", "clang")

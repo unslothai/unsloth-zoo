@@ -46,7 +46,6 @@ def _fake_torch(hip, gfx = "gfx1100:sramecc+:xnack-", cuda_available = True):
 
 
 def _source_build(monkeypatch, tmp_path, torch_stub, gpu_support, windows = False):
-    """Drive install_llama_cpp through the source build; return the cmake configure call."""
     folder = tmp_path / "llama.cpp"
     for d in ("src", "ggml", "common"):
         (folder / d).mkdir(parents = True)
@@ -81,7 +80,7 @@ def _source_build(monkeypatch, tmp_path, torch_stub, gpu_support, windows = Fals
     try:
         llama_cpp.install_llama_cpp(llama_cpp_folder = str(folder), gpu_support = gpu_support)
     except RuntimeError:
-        pass  # the Windows stub fails the configure step after recording it
+        pass  # Windows stub fails configure after recording it
     configure = [c for c in commands if (c[0] if isinstance(c, list) else c.split()[0]) == "cmake"
                  and "--build" not in c]
     assert configure, commands
