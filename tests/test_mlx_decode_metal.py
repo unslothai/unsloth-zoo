@@ -1,4 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
+import ast
+import importlib
+import inspect
+import textwrap
 from types import FunctionType, SimpleNamespace
 
 import numpy as np
@@ -33,13 +37,17 @@ def _model(kernel = 4):
 
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-def test_kernel_preserves_native_reduction_and_rounding(dtype):
-    for width in range(2, 9):
-        for channels in (2, 31, 128):
-            mx.random.seed(width + channels)
-            x = (mx.random.normal((2, width, channels)) * 10).astype(dtype)
-            weight = mx.random.normal((channels, width)).T
-            _equal(decode._decode_conv_silu(x, weight), nn.silu(native._qwen3_5_decode_depthwise_conv(x, weight)))
+def test_kernel_preserves_native_window_reduction_rounding_and_split(dtype):
+    for width, channels, key_dim, batch in [(2, 3, 1, 1), (4, 96, 32, 3), (4, 8192, 2048, 1), (8, 131, 40, 2)]:
+        spread = lambda shape: mx.random.normal(shape) * mx.exp(3 * mx.random.normal(shape))  # reaches exp rounding
+        state = spread((batch, width - 1, channels)).astype(dtype)
+        x = spread((batch, 1, 2 * channels)).astype(dtype)[..., channels:]  # strided, like a projection slice
+        weight = mx.random.normal((channels, width)).T
+        window = mx.concatenate([state, x], axis = 1)
+        out = nn.silu(native._qwen3_5_decode_depthwise_conv(window, weight))
+        for actual, expected in zip(decode._decode_conv(state, x, weight, key_dim),
+                                    [window, *mx.split(out, [key_dim, 2 * key_dim], -1)]):
+            _equal(actual, expected)
 
 
 def test_scope_preserves_native_method_weights_and_restores(monkeypatch):
@@ -53,12 +61,12 @@ def test_scope_preserves_native_method_weights_and_restores(monkeypatch):
             assert all(c is not native.Qwen3_5GatedDeltaNet for c in classes)
             with decode.fused_decode_conv_silu(root):
                 assert [type(m) for m in models] == classes
+            step = mx.random.normal((2, 1, 32)).astype(mx.bfloat16)
             for model in models:
                 for factor in (2, .25):
                     model.conv1d.weight = model.conv1d.weight * factor
-                    expected = model._causal_conv1d_decode(x)
                     assert type(model)._causal_conv1d_decode is native.Qwen3_5GatedDeltaNet._causal_conv1d_decode
-                    _equal(model._unsloth_decode_conv_silu(x), nn.silu(expected))
+                    _equal(model(step), native.Qwen3_5GatedDeltaNet.__call__(model, step))
             raise RuntimeError("cancel")
     assert all(type(m) is native.Qwen3_5GatedDeltaNet for m in models)
 
@@ -73,12 +81,12 @@ def test_decode_and_prefill_preserve_outputs_and_cache(monkeypatch):
         mx.eval(out, cache.state)
         expected.append((out, list(cache.state)))
     cache = native.ArraysCache(size = 2)
-    fused = decode._decode_conv_silu
+    fused = decode._decode_conv
     calls = []
     def observed(*args):
         calls.append(None)
         return fused(*args)
-    monkeypatch.setattr(decode, "_decode_conv_silu", observed)
+    monkeypatch.setattr(decode, "_decode_conv", observed)
     with decode.fused_decode_conv_silu(model):
         for x, (out, states) in zip(samples, expected):
             calls.clear()
@@ -89,15 +97,15 @@ def test_decode_and_prefill_preserve_outputs_and_cache(monkeypatch):
 
 
 def test_unsupported_geometry_uses_native(monkeypatch):
-    model = _model(9)
-    def unexpected(*args):
-        pytest.fail("unsupported reduction reached Metal fusion")
-    monkeypatch.setattr(decode, "_decode_conv_silu", unexpected)
-    with decode.fused_decode_conv_silu(model):
-        for shape, dtype in [((2, 9, 128), mx.bfloat16), ((2, 4, 1), mx.float16), ((2, 4, 128), mx.float32)]:
-            x = mx.random.normal(shape).astype(dtype)
-            weight = mx.random.normal(shape[1:])
-            _equal(model._unsloth_apply_conv_silu(x, weight), nn.silu(native._qwen3_5_decode_depthwise_conv(x, weight)))
+    monkeypatch.setattr(decode, "_decode_conv", lambda *args: pytest.fail("unsupported window reached Metal fusion"))
+    wide, model = _model(9), _model()
+    with decode.fused_decode_conv_silu(nn.Sequential(wide, model)):
+        state, step = mx.zeros((2, 3, 128), mx.bfloat16), mx.random.normal((2, 1, 128)).astype(mx.bfloat16)
+        _equal(wide(step[..., :32]), native.Qwen3_5GatedDeltaNet.__call__(wide, step[..., :32]))
+        for args in [(state, step, 1, False), (state, step.astype(mx.float16), 1, True), (state[:, 1:], step, 1, True)]:
+            window, qkv = model._unsloth_decode_conv(*args)
+            assert qkv is None
+            _equal(window, mx.concatenate(args[:2], axis = 1))
 
 
 def test_training_and_missing_kernel_keep_native(monkeypatch):
@@ -106,7 +114,7 @@ def test_training_and_missing_kernel_keep_native(monkeypatch):
     with decode.fused_decode_conv_silu(model):
         assert type(model) is native.Qwen3_5GatedDeltaNet
     model.eval()
-    monkeypatch.setattr(decode, "_decode_conv_silu_kernel", lambda: None)
+    monkeypatch.setattr(decode, "_decode_conv_kernel", lambda: None)
     with decode.fused_decode_conv_silu(model):
         assert type(model) is native.Qwen3_5GatedDeltaNet
 
@@ -197,3 +205,36 @@ def test_overlapping_scopes_keep_the_module_fused_until_the_last_exit():
     leftover = [key for key in (*model.__dict__, *dict.keys(model))
                 if key.startswith("_unsloth_decode")]
     assert leftover == []
+
+
+def test_tests_ahead_of_the_decode_branch_still_decide(monkeypatch, tmp_path):
+    # mlx-vlm 0.6.0-0.6.15 reach the decode branch through an elif behind a verify sink.
+    source = textwrap.dedent(inspect.getsource(native.Qwen3_5GatedDeltaNet.__call__)).replace(
+        "cache: Optional[Any] = None,", "cache: Optional[Any] = None, sink = None,", 1)
+    keyword = "if" if "    if (\n        S == 1" in source else "elif"  # 0.6.0-0.6.15 already sit behind gdn_sink
+    source = source.replace(f"    {keyword} (\n        S == 1", f"    {keyword} sink is not None:\n        conv_out = "
+                            "nn.silu(self.conv1d(conv_input))\n    elif (\n        S == 1", 1)
+    assert "if sink is not None:" in source
+    (tmp_path / "guarded_decode.py").write_text(
+        f"import {native.__name__} as base\nglobals().update((k, v) for k, v in vars(base).items() if k[:2] != '__')"
+        f"\nclass Guarded(Qwen3_5GatedDeltaNet):\n{textwrap.indent(source, '    ')}")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    model, calls, fused = _model(), [], decode._decode_conv
+    model.__class__ = guarded = importlib.import_module("guarded_decode").Guarded
+    monkeypatch.setattr(decode, "_decode_conv", lambda *args: calls.append(None) or fused(*args))
+    x = mx.random.normal((2, 1, 32)).astype(mx.bfloat16)
+    with decode.fused_decode_conv_silu(model):
+        for sink, launches_so_far in ((None, 1), ([], 1)):
+            _equal(model(x, sink = sink), guarded.__call__(model, x, sink = sink))
+            assert len(calls) == launches_so_far
+
+
+@pytest.mark.parametrize("anchor, inserted", [
+    ("    conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)\n", "    conv_input[:, :, 0] = 0\n"),
+    ("    q, k, v = [", "    self.key_dim = 1\n"),
+])
+def test_statements_the_fused_call_would_skip_keep_native(anchor, inserted):
+    source = textwrap.dedent(inspect.getsource(native.Qwen3_5GatedDeltaNet.__call__))
+    assert decode._decode_conv_sites(ast.parse(source).body[0]) is not None
+    edited = source.replace(anchor, anchor + inserted if anchor.endswith("\n") else inserted + anchor, 1)
+    assert edited != source and decode._decode_conv_sites(ast.parse(edited).body[0]) is None
