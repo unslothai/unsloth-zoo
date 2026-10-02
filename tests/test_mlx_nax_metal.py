@@ -42,6 +42,8 @@ if mlx_is_simulated():
 def test_nax_detection_mirrors_mlx(monkeypatch, architecture, release, expected):
     from unsloth_zoo.mlx import nax
 
+    monkeypatch.setattr(nax.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(nax.mx.metal, "is_available", lambda: True)
     monkeypatch.setattr(nax.platform, "mac_ver", lambda: (release, ("", "", ""), ""))
     monkeypatch.setattr(nax.mx, "device_info", lambda: {"architecture": architecture})
     nax._nax_gpu.cache_clear()
@@ -135,7 +137,8 @@ def test_gpu_core_count_reads_the_ioregistry(monkeypatch):
     from unittest import mock
     from unsloth_zoo.mlx import nax
 
-    assert not mx.metal.is_available() or nax._gpu_core_count() > 0
+    # Paravirtual GPUs (`air64_*`, CI runners) publish no core count.
+    assert nax._gpu_generation() is None or nax._gpu_core_count() > 0
     ioreg = lambda code, out = '"gpu-core-count" = 12': subprocess.CompletedProcess([], code, out, "")
     for result, cores in ((ioreg(0), 12), (ioreg(1), None), (ioreg(0, '"gpu-core-count" = <0c>'), None),
                           (FileNotFoundError("ioreg"), None)):

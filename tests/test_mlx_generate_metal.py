@@ -8,6 +8,18 @@ try:
 except Exception:  # module-level nn.Module subclasses below need mlx to exist
     pytest.skip("requires mlx", allow_module_level=True)
 metal_only = pytest.mark.skipif(not _METAL, reason="requires Apple Silicon Metal")
+
+
+def _nax_available():
+    if not _METAL:
+        return False
+    from unsloth_zoo.mlx import nax
+    return nax.nax_available()
+
+
+# The NAX kernels need MetalPerformancePrimitives tensor ops: macOS 15 cannot build them and
+# paravirtual or pre-M5 GPUs cannot load them, so they run only where the product would route.
+nax_only = pytest.mark.skipif(not _nax_available(), reason="requires an Apple GPU with neural accelerators")
 MODEL = "mlx-community/SmolLM-135M-Instruct-4bit"
 VLM_MODEL = "mlx-community/FastVLM-0.5B-bf16"
 
@@ -911,7 +923,7 @@ def _quantized(N, K, group_size, dtype, bits = 4, seed = 0):
 @pytest.mark.parametrize("group_size", [32, 64, 128])
 @pytest.mark.parametrize("N", [384, 320])   # 128- and 64-column tiles
 @pytest.mark.parametrize("bits", [4, 8])
-@metal_only
+@nax_only
 def test_nax_small_m_qmm_matches_native(monkeypatch, bits, N, group_size, dtype):
     from unsloth_zoo.mlx import nax
 
@@ -1009,7 +1021,7 @@ class _QuantizedHead(nn.Module):
         return self.embed.as_linear(self.proj(x)), self.odd(x)
 
 
-@metal_only
+@nax_only
 def test_nax_quantized_linear_scope_routes_restores_and_falls_back(monkeypatch, caplog):
     import functools
     from unsloth_zoo.mlx import inference, nax
@@ -1059,7 +1071,7 @@ def test_nax_quantized_linear_scope_routes_restores_and_falls_back(monkeypatch, 
     assert "_unsloth_nax_qmm_rows" not in model.proj
 
 
-@metal_only
+@nax_only
 def test_nax_quantized_linear_first_use_check_rejects_a_wrong_kernel(monkeypatch):
     from unsloth_zoo.mlx import inference, nax
 
