@@ -724,6 +724,7 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
     keep_keys   = set()
     _embedding_lora_keys = set()
     _untargeted_keys = set()
+    _keep_downloaded_keys = set()
 
     inner_model = find_lora_base_model(model)
     for name, module in inner_model.named_modules():
@@ -787,6 +788,11 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
                 lora_weights[name].module = module
                 expand_module_keys(name, module, remove_keys)
                 remove_keys.add(name)
+                # No saved copy for the active adapter and a quantized original: keep the downloaded tensor.
+                original = getattr(module, "original_module", None)
+                if original is not None and saved_weight is getattr(original, "weight", None) \
+                    and check_if_quantized(original):
+                    _keep_downloaded_keys.add(name)
             else:
                 new_keys = expand_module_keys(name, module, set())
                 remove_keys.update(new_keys)
@@ -906,7 +912,7 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
     pass
 
     if return_state_dict: assert_same_keys(model, state_dict)
-    for _key in _untargeted_keys: lora_weights.pop(_key, None)
+    for _key in _untargeted_keys | _keep_downloaded_keys: lora_weights.pop(_key, None)
     return lora_weights, state_dict
 pass
 

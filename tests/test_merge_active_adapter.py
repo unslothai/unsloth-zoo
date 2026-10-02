@@ -152,3 +152,25 @@ def test_untargeted_layer_keeps_downloaded_weight(tmp_path):
     saved = read_safetensors_dir(out_dir)
     keys = [k for k in saved if k.endswith("k_proj.weight")]
     assert keys and all(torch.equal(saved[k], disk[k]) for k in keys)
+
+
+def test_inactive_quantized_saved_module_keeps_downloaded_weight(tmp_path, monkeypatch):
+    # `task` saves no lm_head, so PEFT runs the original module. When that module is quantized its live
+    # weight is packed; the export must keep the downloaded tensor instead.
+    import unsloth_zoo.saving_utils as saving_utils
+    set_offline_cpu_env()
+    base_dir, out_dir = str(tmp_path / "base"), str(tmp_path / "merged")
+    adapters = [
+        ("default", ["q_proj"], 2, 4, ["lm_head"]),
+        ("task", ["q_proj"], 3, 9, None),
+    ]
+    peft_model = _peft(_base(base_dir), adapters, "task")
+    disk = read_safetensors_dir(base_dir)
+    original = peft_model.base_model.model.lm_head.original_module
+    with torch.no_grad():
+        original.weight.mul_(2)
+    is_quantized = saving_utils.check_if_quantized
+    monkeypatch.setattr(saving_utils, "check_if_quantized", lambda m: m is original or is_quantized(m))
+    run_merge(peft_model, base_dir, out_dir, save_dtype = torch.float32)
+    saved = read_safetensors_dir(out_dir)
+    assert torch.equal(saved["lm_head.weight"], disk["lm_head.weight"])
