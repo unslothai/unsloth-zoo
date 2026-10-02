@@ -402,13 +402,10 @@ def small_m_qmm(x, w, scales, biases, group_size, bits):
                   output_shapes = [(M, N)], output_dtypes = [x.dtype])[0]
 
 
-# Rows per call where the kernel beat stock by at least 1.05x in timings of chained projections,
-# per GPU generation. Entries, first match wins: (bits, group size or None for any, fewest weights,
-# widest N, fewest rows, most rows). On outputs wider than 8K and up to 64K stock's qmm is close
-# at the most rows, and small layers stay on stock. No entry for heads wider than 64K starts below
-# the lowest entry for narrower outputs that matches the same quantization: a head alone gains too
-# little. A NAX generation not measured keeps only the rows where every measured shape cleared 1.3x.
-# Measured on the M5 Pro; the M5 family is assumed to match it in bandwidth per GPU core.
+# Rows per call where the kernel beat stock by >= 1.05x on chained projections (M5 Pro; the M5
+# family is assumed to match its bandwidth per core). First match wins: (bits, group size or None,
+# fewest weights, widest N, fewest rows, most rows). Heads wider than 64K never start below the
+# narrower outputs' entry: a head alone gains too little. Unmeasured generations keep >= 1.3x rows.
 _QMM_ROWS_BY_GPU = {
     17: (
         (4, None, 1 << 22, 8192, 6, 16), (4, None, 1 << 22, 65536, 6, 15), (4, None, 1 << 22, None, 6, 16),

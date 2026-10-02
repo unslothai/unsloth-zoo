@@ -1136,7 +1136,6 @@ def _nax_qmm_matches_native(x, w, scales, biases, group_size, bits, routed):
 
 def _nax_small_m_qmm(module, x, bindings):
     """The small-row kernel's result for this call, or None when it takes the native call."""
-    # Most calls are single-row decode steps, so the row count is checked first.
     low, high = module._unsloth_nax_qmm_rows
     if not isinstance(x, mx.array) or x.ndim < 2 or not x.shape[-1] or not low <= x.size // x.shape[-1] <= high:
         return None
