@@ -2323,18 +2323,28 @@ class UnslothVisionDataCollator:
 
         return new_attn, new_ids, tuple(new_extras)
 
+    @staticmethod
+    def _left_truncation_index(lengths, L, max_len):
+        # Keep each row's start like TRL; [-max_len:] cut the prompt and its image tokens.
+        starts = L - lengths.clamp(min=max_len)
+        return starts.unsqueeze(1) + torch.arange(max_len, device=lengths.device)
+
     def _truncate_by_side(self, input_ids, attention_mask, completion_mask, side, max_len, token_type_ids=None):
         _, L = input_ids.shape
         if L <= max_len:
             return [input_ids, attention_mask, completion_mask] + ([token_type_ids] if token_type_ids is not None else [])
-        sl = slice(-max_len, None) if side == "left" else slice(0, max_len)
+        if side == "left":
+            idx = self._left_truncation_index(attention_mask.sum(-1), L, max_len)
+            take = lambda t: torch.gather(t, 1, idx)
+        else:
+            take = lambda t: t[:, :max_len]
 
-        input_ids       = input_ids[:, sl]
-        attention_mask  = attention_mask[:, sl]
-        completion_mask = completion_mask[:, sl]
+        input_ids       = take(input_ids)
+        attention_mask  = take(attention_mask)
+        completion_mask = take(completion_mask)
 
         if token_type_ids is not None:
-            token_type_ids = token_type_ids[:, sl]
+            token_type_ids = take(token_type_ids)
         return [input_ids, attention_mask, completion_mask] + ([token_type_ids] if token_type_ids is not None else [])
 
     def _raise_if_truncation_cut_media(self, before, after, pad_id):
@@ -2529,9 +2539,15 @@ class UnslothVisionDataCollator:
         if cross_mask is not None:
             cross_mask = torch.cat((cross_mask, cross_mask[:, -1:].expand(-1, c_ids.shape[1], *cross_mask.shape[2:])), dim=1)
             _, _, (cross_mask,) = self._flush_to_side(*pre_flush, flush_side, pad_id, (cross_mask,))
-            if cross_mask.shape[1] > input_ids.shape[1]:
-                cross_mask = cross_mask[:, -input_ids.shape[1]:] if flush_side == "left" else cross_mask[:, :input_ids.shape[1]]
-            elif cross_mask.shape[1] < input_ids.shape[1]:
+            max_len = self.max_seq_length
+            if max_len is not None and cross_mask.shape[1] > max_len:
+                # Same rows as _truncate_by_side, or the mask shifts against input_ids.
+                if flush_side == "left":
+                    idx = self._left_truncation_index(pre_flush[0].sum(-1), cross_mask.shape[1], max_len)
+                    cross_mask = cross_mask[torch.arange(cross_mask.shape[0], device = idx.device).unsqueeze(1), idx]
+                else:
+                    cross_mask = cross_mask[:, :max_len]
+            if cross_mask.shape[1] < input_ids.shape[1]:
                 fill = cross_mask.new_zeros((cross_mask.shape[0], input_ids.shape[1] - cross_mask.shape[1], *cross_mask.shape[2:]))
                 cross_mask = torch.cat((fill, cross_mask) if flush_side == "left" else (cross_mask, fill), dim=1)
 
