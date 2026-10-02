@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
+import ast
 import importlib
 import inspect
 import textwrap
@@ -209,9 +210,11 @@ def test_overlapping_scopes_keep_the_module_fused_until_the_last_exit():
 def test_tests_ahead_of_the_decode_branch_still_decide(monkeypatch, tmp_path):
     # mlx-vlm 0.6.0-0.6.15 reach the decode branch through an elif behind a verify sink.
     source = textwrap.dedent(inspect.getsource(native.Qwen3_5GatedDeltaNet.__call__)).replace(
-        "cache: Optional[Any] = None,", "cache: Optional[Any] = None, sink = None,", 1).replace(
-        "    if (\n        S == 1", "    if sink is not None:\n        conv_out = nn.silu(self.conv1d(conv_input))"
-        "\n    elif (\n        S == 1", 1)
+        "cache: Optional[Any] = None,", "cache: Optional[Any] = None, sink = None,", 1)
+    keyword = "if" if "    if (\n        S == 1" in source else "elif"  # 0.6.0-0.6.15 already sit behind gdn_sink
+    source = source.replace(f"    {keyword} (\n        S == 1", f"    {keyword} sink is not None:\n        conv_out = "
+                            "nn.silu(self.conv1d(conv_input))\n    elif (\n        S == 1", 1)
+    assert "if sink is not None:" in source
     (tmp_path / "guarded_decode.py").write_text(
         f"import {native.__name__} as base\nglobals().update((k, v) for k, v in vars(base).items() if k[:2] != '__')"
         f"\nclass Guarded(Qwen3_5GatedDeltaNet):\n{textwrap.indent(source, '    ')}")
@@ -224,3 +227,14 @@ def test_tests_ahead_of_the_decode_branch_still_decide(monkeypatch, tmp_path):
         for sink, launches_so_far in ((None, 1), ([], 1)):
             _equal(model(x, sink = sink), guarded.__call__(model, x, sink = sink))
             assert len(calls) == launches_so_far
+
+
+@pytest.mark.parametrize("anchor, inserted", [
+    ("    conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)\n", "    conv_input[:, :, 0] = 0\n"),
+    ("    q, k, v = [", "    self.key_dim = 1\n"),
+])
+def test_statements_the_fused_call_would_skip_keep_native(anchor, inserted):
+    source = textwrap.dedent(inspect.getsource(native.Qwen3_5GatedDeltaNet.__call__))
+    assert decode._decode_conv_sites(ast.parse(source).body[0]) is not None
+    edited = source.replace(anchor, anchor + inserted if anchor.endswith("\n") else inserted + anchor, 1)
+    assert edited != source and decode._decode_conv_sites(ast.parse(edited).body[0]) is None

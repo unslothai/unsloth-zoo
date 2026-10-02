@@ -433,8 +433,14 @@ def _decode_conv_sites(outer):
                     and _source_expression(node.body[0]) == _DECODE_BRANCH):
                 between = [n for statement in body[start:index] for n in ast.walk(statement)]
                 assigned = {n.id for n in between if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store)}
-                if "S" in assigned or any(isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Store)
+                # A window write would land after the fused call already read it; cache slots are native.
+                if "S" in assigned or any(isinstance(n, (ast.Attribute, ast.Subscript)) and isinstance(n.ctx, ast.Store)
+                                          and not (isinstance(n, ast.Subscript) and _source_expression(n.value) == "cache")
                                           for n in between):
+                    return None
+                # The split reads conv_out and key_dim, which the fused call also fixes at the concatenate.
+                if index + 1 == len(body) or _SPLIT not in [
+                        _source_expression(n) for n in ast.walk(body[index + 1]) if isinstance(n, ast.Call)]:
                     return None
                 if all(isinstance(n, _PURE_TEST_NODES) and not (isinstance(n, ast.Name) and n.id in assigned)
                        for test in before for n in ast.walk(test)):
