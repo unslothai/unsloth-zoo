@@ -286,6 +286,7 @@ class DraftController:
     _DRAFT_SLOPE = 0.25
     _CATCH_UP = 0.1
     _COPY_PROBE = 4
+    _STALL_RATIO = 2.0
     _EXHAUSTIVE_ROWS = 6
 
     def new_reply(self) -> ReplyStats:
@@ -532,10 +533,11 @@ class DraftController:
     def _affordable(self, probe: RoundPlan, best: RoundPlan, rows: Sequence[RowState], rounds: int = 1) -> bool:
         return self._regret(probe, best, rows) * rounds <= self._credit
 
-    def _account(self, emitted: int, seconds: float) -> None:
+    def _account(self, emitted: int, seconds: float, charged: float | None = None) -> None:
         self._credit += self.explore_fraction * seconds
         if self._reference is not None:
-            self._credit -= seconds * max(0.0, 1.0 - emitted / (seconds * self._reference))
+            charged = seconds if charged is None else charged
+            self._credit -= charged * max(0.0, 1.0 - emitted / (charged * self._reference))
 
     def _source_probe(self, plan: RoundPlan, rows: Sequence[RowState], depth: int | None = None) -> tuple[RoundPlan, dict[int, str]]:
         # A source that loses gets no samples to win back with, whatever beat it, so each row
@@ -600,7 +602,8 @@ class DraftController:
         """
         bucket = _bucket(len(rows))
         alpha = self.acceptance_alpha
-        self._account(sum(min(max(0, int(count)), row.length) + 1 for row, count in zip(plan.rows, accepted)), seconds)
+        stall_free = None if self._reference is None else min(seconds, self._STALL_RATIO * self.round_seconds(plan, rows))
+        self._account(sum(min(max(0, int(count)), row.length) + 1 for row, count in zip(plan.rows, accepted)), seconds, stall_free)
         for i, (row, state, count) in enumerate(zip(plan.rows, rows, accepted)):
             count = max(0, min(int(count), row.length))
             stats = state.stats
