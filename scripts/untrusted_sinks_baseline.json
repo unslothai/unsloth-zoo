@@ -11,6 +11,7 @@
     "unsloth_zoo/llama_cpp.py::convert_to_gguf::subprocess.run::685b2ca16d10cc99::9ca618defa6c249b": 1,
     "unsloth_zoo/llama_cpp.py::quantize_gguf::subprocess.run::8f7aef771a2f802b::d0ba3ac199313842": 1,
     "unsloth_zoo/llama_cpp.py::quantize_gguf::subprocess.run::a9dfe4ede7db1133::d0ba3ac199313842": 1,
+    "unsloth_zoo/mlx/loader.py::FastMLXModel.from_pretrained::getattr(module, ...)::0f881c710b1c87b2::7a2cd0f4453a37d2": 1,
     "unsloth_zoo/mlx/loader.py::_build_vlm_image_processor_from_config::getattr(module, ...)::5eec36d923221521::f8fce5036e6394eb": 1,
     "unsloth_zoo/mlx/loader.py::_ensure_safe_text_wrapper_sanitize::importlib.import_module::a0573ba00a682ea0::3edca3e7667086fc": 1,
     "unsloth_zoo/mlx/loader.py::_get_mlx_lm_model_class::importlib.import_module::a0573ba00a682ea0::c12261211f5c8729": 1,
