@@ -176,6 +176,36 @@ def test_sgd_coupled_weight_decay_e2e(tmp_path):
 
 
 @metal_only
+@pytest.mark.parametrize("optim_name", ["adam", "adam_8bit"])
+def test_adam_weight_decay_moves_weights_e2e(tmp_path, optim_name):
+    """wd > 0 must move LoRA weights well past a repeated wd = 0 run (noise floor)."""
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+
+    def _final_lora(subdir, wd):
+        trainer = _make_text_trainer(
+            tmp_path / subdir, _chat_dataset(), max_steps=4,
+            optim=optim_name, weight_decay=wd, learning_rate=1e-3,
+        )
+        trainer.train()
+        _assert_finite(trainer._train_loss_history)
+        return {
+            k: v.astype(mx.float32)
+            for k, v in tree_flatten(trainer.model.trainable_parameters())
+            if "lora" in k
+        }
+
+    def _max_diff(a, b):
+        return max(mx.abs(a[k] - b[k]).max().item() for k in a)
+
+    base = _final_lora("wd0", 0.0)
+    noise = _max_diff(base, _final_lora("wd0_again", 0.0))
+    decayed = _max_diff(base, _final_lora("wd", 0.1))
+    assert base, "no LoRA parameters were trained"
+    assert decayed > max(10 * noise, 1e-6), (optim_name, decayed, noise)
+
+
+@metal_only
 def test_vlm_lora_training_e2e(tmp_path):
     """Real VLM LoRA fit: collation, label masking, CCE, save."""
     from PIL import Image

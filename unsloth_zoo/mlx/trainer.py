@@ -42,6 +42,7 @@ import concurrent.futures
 import hashlib
 import json
 import math
+import numbers
 import os
 from pathlib import Path
 import random
@@ -4027,7 +4028,12 @@ class MLXTrainer:
         if callable(get_warmup_steps):
             return max(0, int(get_warmup_steps(total_steps)))
 
-        warmup_steps = int(getattr(self.args, "warmup_steps", 0) or 0)
+        warmup_steps = getattr(self.args, "warmup_steps", 0) or 0
+        if isinstance(warmup_steps, numbers.Real) and 0 < warmup_steps < 1:
+            # HF TrainingArguments.get_warmup_steps: below 1 is a ratio of total steps.
+            # Multiply in the value's own type: float(np.float32(0.1)) * 100 ceils to 11.
+            warmup_steps = math.ceil(max(0, int(total_steps)) * warmup_steps)
+        warmup_steps = int(warmup_steps)
         warmup_ratio = getattr(self.args, "warmup_ratio", 0.0)
         if warmup_ratio is None:
             return max(0, warmup_steps)
@@ -4139,7 +4145,8 @@ class MLXTrainer:
                 else float(total_steps - warmup) - wsd_decay_steps
             )
 
-        if sched_type in ("constant", "constant_with_warmup") and warmup == 0:
+        # HF's get_constant_schedule ignores warmup; only constant_with_warmup ramps.
+        if sched_type == "constant" or (sched_type == "constant_with_warmup" and warmup == 0):
             return lr
 
         # HF cosine_warmup_with_min_lr uses (step + 1): optimization.py:400-406.
@@ -4242,12 +4249,12 @@ class MLXTrainer:
                 )
                 opt_name = "adamw"
 
-        # After the Adafactor->AdamW fallback so it carries betas/eps; ignored for
-        # non-Adam optimizers like HF (transformers/trainer.py adam_kwargs).
+        # After the Adafactor->AdamW fallback so it carries betas/eps; non-Adam
+        # optimizers ignore them like HF, except Lion (trainer_optimizer.py).
         adam_kwargs = {}
+        adam_beta1 = getattr(self.args, "adam_beta1", None)
+        adam_beta2 = getattr(self.args, "adam_beta2", None)
         if opt_name in _MLX_ADAM_FAMILY_OPTIMIZERS:
-            adam_beta1 = getattr(self.args, "adam_beta1", None)
-            adam_beta2 = getattr(self.args, "adam_beta2", None)
             adam_epsilon = getattr(self.args, "adam_epsilon", None)
             if adam_beta1 is not None or adam_beta2 is not None:
                 adam_kwargs["betas"] = (
@@ -4276,6 +4283,8 @@ class MLXTrainer:
                 **adam_kwargs,
             )
         elif opt_name == "adam":
+            # torch Adam's weight_decay is coupled L2; MLX Adam has none.
+            self._coupled_weight_decay = float(wd or 0.0)
             optimizer = optim.Adam(
                 learning_rate=initial_lr,
                 bias_correction=True,
@@ -4299,6 +4308,7 @@ class MLXTrainer:
                     **adam_kwargs,
                 )
             else:
+                self._coupled_weight_decay = float(wd or 0.0)
                 optimizer = QuantizedMomentAdam(
                     learning_rate=initial_lr,
                     bias_correction=True,
@@ -4316,7 +4326,16 @@ class MLXTrainer:
             optimizer = optim.Muon(learning_rate=initial_lr, weight_decay=0.0)
         elif opt_name == "lion":
             self._manual_weight_decay = float(wd or 0.0)
-            optimizer = optim.Lion(learning_rate=initial_lr, weight_decay=0.0)
+            # Unset betas keep MLX's Lion default (0.9, 0.99).
+            lion_kwargs = {}
+            if adam_beta1 is not None or adam_beta2 is not None:
+                lion_kwargs["betas"] = (
+                    float(0.9 if adam_beta1 is None else adam_beta1),
+                    float(0.99 if adam_beta2 is None else adam_beta2),
+                )
+            optimizer = optim.Lion(
+                learning_rate=initial_lr, weight_decay=0.0, **lion_kwargs,
+            )
         elif opt_name == "rmsprop":
             # Coupled L2 decay (grad += wd * param), matching torch.
             extra = _hf_optim_args(
@@ -4374,8 +4393,8 @@ class MLXTrainer:
         """Decoupled HF-parity decay on trainable non-bias/non-norm leaves.
 
         AdamW, Adafactor, Muon and Lion are built with ``weight_decay=0.0`` so
-        this owns the decay term, as HF does via ``param_groups``. SGD uses
-        coupled decay instead (``_apply_coupled_weight_decay``).
+        this owns the decay term, as HF does via ``param_groups``. SGD and Adam
+        use coupled decay instead (``_apply_coupled_weight_decay``).
         """
         wd = float(getattr(self, "_manual_weight_decay", 0.0) or 0.0)
         if wd <= 0:
