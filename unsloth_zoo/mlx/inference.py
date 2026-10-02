@@ -23,10 +23,12 @@ import functools
 import copy
 import hashlib
 import inspect
+import json
 import logging
 import math
 import os
 import re
+import struct
 import sys
 import textwrap
 from contextlib import contextmanager
@@ -2889,9 +2891,10 @@ def _nax_int8_prefill_route(module, classes, switches, packed):
 
 class Int8PrefillStatus(NamedTuple):
     available: bool
-    # "" when available, else "nax_unavailable", "distributed", "no_eligible_projections" or "probe_failed"
+    # "" when available, else "nax_unavailable", "distributed", "not_downloaded", "no_eligible_projections"
+    # or "probe_failed"
     reason: str
-    projections: int   # quantized linears and routed-expert projections that can take the int8 route
+    projections: int   # linears and routed-expert projections the int8 route can take; approximate before load
 
     def __bool__(self):
         return self.available
@@ -2912,7 +2915,51 @@ def int8_prefill_available(model):
     classes = _nax_qmm_classes(nn.QuantizedLinear.__call__, nn.QuantizedEmbedding.as_linear)
     switches, packed = _nax_int8_prefill_switch_classes(), _nax_int8_prefill_packed(model)
     modules = {id(module): module for _, module in model.named_modules()} if hasattr(model, "named_modules") else {}
-    projections = sum(bool(_nax_int8_prefill_route(module, classes, switches, packed)) for module in modules.values())
+    return _int8_prefill_status(sum(bool(_nax_int8_prefill_route(module, classes, switches, packed))
+                                    for module in modules.values()))
+
+
+def int8_prefill_checkpoint_available(model_dir):
+    """`int8_prefill_available` for the directory of a downloaded MLX checkpoint, judged from its
+    config.json and safetensors headers without loading it: reason "not_downloaded" when either is
+    missing. Headers cannot tell an embedding from a linear, and an expert projection counts when
+    either its packed or its other calls can route, so `projections` is approximate."""
+    if not nax.nax_available():
+        return Int8PrefillStatus(False, "nax_unavailable", 0)
+    model_dir = Path(model_dir)
+    shards = list(model_dir.glob("*.safetensors"))
+    if not (model_dir / "config.json").is_file() or not shards:
+        return Int8PrefillStatus(False, "not_downloaded", 0)
+    quantization = json.loads((model_dir / "config.json").read_text()).get("quantization") or {}
+    tensors = {}
+    for shard in shards:
+        with open(shard, "rb") as file:
+            tensors.update(json.loads(file.read(struct.unpack("<Q", file.read(8))[0])))
+    projections = 0
+    for name, scales in tensors.items():
+        if not name.endswith(".scales"):
+            continue
+        prefix = name.removesuffix(".scales")
+        weight = tensors.get(f"{prefix}.weight")
+        # Per-layer settings are keyed by module path, which mlx-vlm also matches without "language_model.",
+        # and what they leave out takes MLX's defaults rather than the checkpoint-wide setting.
+        layer = next((quantization[key] for key in (prefix, prefix.removeprefix("language_model."))
+                      if key in quantization), quantization)
+        if weight is None or not isinstance(layer, dict) or scales["dtype"] not in ("BF16", "F16"):
+            continue
+        bits, shape = layer.get("bits", 4), weight["shape"]
+        N, K = shape[-2], shape[-1] * 32 // bits
+        if not nax.int8_qmm_supported(N, K, layer.get("group_size", 64), bits, layer.get("mode", "affine")):
+            continue
+        if len(shape) == 2:
+            projections += bool(nax.int8_prefill_min_rows(N, K))
+        else:
+            projections += bool(nax.int8_prefill_expert_min_rows(shape[0], bits)
+                                or nax.int8_prefill_expert_min_rows(shape[0], bits, True))
+    return _int8_prefill_status(projections)
+
+
+def _int8_prefill_status(projections):
     if not projections:
         return Int8PrefillStatus(False, "no_eligible_projections", 0)
     if not nax.kernel_probe_passed(nax.INT8_QMM_PROBE_KEY, nax.__name__, "probe_int8_qmm"):

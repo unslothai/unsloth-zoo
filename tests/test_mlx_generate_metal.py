@@ -1521,6 +1521,27 @@ def test_nax_int8_prefill_available_reports_what_the_route_takes(monkeypatch):
     assert inference.int8_prefill_available(model) == (False, "distributed", 0)
 
 
+@metal_only
+def test_nax_int8_prefill_checkpoint_available_reads_the_headers_alone(monkeypatch, tmp_path):
+    import json
+    from unsloth_zoo.mlx import inference, nax
+    model = _QuantizedMoE()
+    model.save_weights(str(tmp_path / "model.safetensors"))
+    for name, value in (("nax_available", lambda: True), ("kernel_probe_passed", lambda *args: True),
+                        ("_INT8_PREFILL_EXPERT_ROWS", {8: (20, 30)}), ("_INT8_PREFILL_MIN_N", 0),
+                        ("_INT8_PREFILL_MIN_K", 0)):
+        monkeypatch.setattr(nax, name, value)
+    def available(**layers):
+        layers = {"group_size": 64, "bits": 8, "small": {"group_size": 128}, "odd": {"mode": "mxfp8"}, **layers}
+        (tmp_path / "config.json").write_text(json.dumps({"quantization": layers}))
+        return tuple(inference.int8_prefill_checkpoint_available(str(tmp_path)))
+
+    assert available() == tuple(inference.int8_prefill_available(model)) == (True, "", 5)
+    assert available(small = False) == available(small = {"mode": "mxfp4"}) == (True, "", 4)
+    (tmp_path / "model.safetensors").unlink()
+    assert available() == (False, "not_downloaded", 0)
+
+
 def test_nax_int8_prefill_row_thresholds():
     from unsloth_zoo.mlx import nax
 
