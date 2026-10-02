@@ -1805,6 +1805,93 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
 pass
 
 
+def vllm_weights_memory_usage(config, load_in_4bit = False, load_in_8bit = False):
+    # Meta-device count, so MoE experts and vision towers are included; None = use the formula.
+    import fnmatch
+    import transformers
+    from accelerate import init_empty_weights
+
+    quant_config = getattr(config, "quantization_config", None) or {}
+    if not isinstance(quant_config, dict): quant_config = quant_config.to_dict()
+    quant_method = quant_config.get("quant_method", None)
+    if not quant_config and any(
+        getattr(getattr(config, key, None), "quantization_config", None)
+        for key in ("text_config", "vision_config", "audio_config")
+    ):
+        return None
+    # Same packing factors as approximate_vllm_memory_usage
+    if quant_method in (None, "bitsandbytes"):
+        quantized_bytes = 2 / (16/5) if load_in_4bit else 2 / (8/5) if load_in_8bit else 2
+    elif quant_method in ("fp8", "fbgemm_fp8"):
+        quantized_bytes = 2 / (8/5)
+    elif quant_method == "mxfp4":
+        quantized_bytes = 17 / 32 # 4-bit values + one 8-bit scale per 32
+    elif quant_method in ("awq", "gptq") and not quant_config.get("modules_in_block_to_quantize", None):
+        quantized_bytes = quant_config.get("bits", 4) / 8 * 1.125
+    else:
+        return None
+
+    meta_model = None
+    for auto_class in ("AutoModelForImageTextToText", "AutoModelForCausalLM"):
+        auto_class = getattr(transformers, auto_class, None)
+        if auto_class is None: continue
+        try:
+            with init_empty_weights():
+                meta_model = auto_class.from_config(config)
+            break
+        except Exception:
+            continue
+    if meta_model is None: return None
+    try:
+        meta_model.tie_weights()
+    except Exception:
+        pass
+
+    # Skip entries spell text layers language_model.model.*, model.language_model.* or model.*;
+    # anchored, so model.layers.0 never matches vision_tower...layers.0.
+    def _norm(name):
+        return "." + ".".join(x for x in name.split(".") if x != "model") + "."
+    skip_modules = []
+    for key in ("llm_int8_skip_modules", "modules_to_not_convert", "ignored_layers"):
+        skip_modules += quant_config.get(key, None) or []
+    def _skipped(name):
+        name = _norm(name)
+        names = (name, name[len(".language_model"):]) if name.startswith(".language_model.") else (name,)
+        for module in skip_modules:
+            if "." not in module:
+                if fnmatch.fnmatchcase(name, "*." + module + ".*"): return True
+            elif any(fnmatch.fnmatchcase(x, _norm(module) + "*") for x in names):
+                return True
+        return False
+    # Qwen4Exp's n-gram table: vLLM keeps it on CPU unless VLLM_PLE_CPU_OFFLOAD=0.
+    no_placement = getattr(meta_model, "_no_placement_params", None) or []
+    keep_full = [
+        "." + x + "." for key in ("_keep_in_fp32_modules", "_keep_in_fp32_modules_strict")
+        for x in (getattr(meta_model, key, None) or [])
+    ]
+    if os.environ.get("VLLM_PLE_CPU_OFFLOAD", "1").strip() == "0": no_placement = []
+
+    # Quantizers pack Linear / Conv1D and stacked expert weights, never embeddings or convs.
+    unpacked_types = (torch.nn.Embedding, torch.nn.modules.conv._ConvNd)
+    from transformers.pytorch_utils import Conv1D
+    linear_types = (torch.nn.Linear, Conv1D)
+    weight_bytes, seen = 0, set()
+    for module_name, module in meta_model.named_modules():
+        for param_name, param in module.named_parameters(recurse = False):
+            if id(param) in seen: continue
+            seen.add(id(param))
+            name = f"{module_name}.{param_name}" if module_name else param_name
+            if any(name == x or name.endswith("." + x) for x in no_placement): continue
+            packable = (isinstance(module, linear_types) and param.ndim == 2) or \
+                (param.ndim == 3 and not isinstance(module, unpacked_types))
+            quantized = packable and "lm_head" not in name and not _skipped(name) \
+                and not any(x in "." + name + "." for x in keep_full)
+            weight_bytes += param.numel() * (quantized_bytes if quantized else 2)
+    del meta_model
+    return int(weight_bytes)
+pass
+
+
 def approximate_vllm_memory_usage(
     config,
     load_in_4bit = False,
@@ -1818,6 +1905,7 @@ def approximate_vllm_memory_usage(
     account_for_gradients = True,
     parallel_sequences = 64,
     cuda_graph_overhead = True,
+    weight_bytes = None,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Gets approximate max model length and max num sequences
@@ -1884,8 +1972,9 @@ def approximate_vllm_memory_usage(
     factor = 1
     if load_in_4bit: factor = 16/5
     elif load_in_8bit: factor = 8/5 # Very vague approximation. Will fix later
-    bytes_for_model = \
-        total_quantizable_elements / factor + total_float16_elements + lora_elements
+    if weight_bytes is None:
+        weight_bytes = total_quantizable_elements / factor + total_float16_elements
+    bytes_for_model = weight_bytes + lora_elements
 
     # KV cache size (float16 is 2 bytes. float8 is 1.25 bytes)
     float_bytes = 1.25 if float8_kv_cache else 2
@@ -2894,6 +2983,9 @@ def load_vllm(
         max_loras = max_loras,
         float8_kv_cache = float8_kv_cache,
         account_for_gradients = training,
+        weight_bytes = vllm_weights_memory_usage(
+            config, load_in_4bit = use_bitsandbytes, load_in_8bit = is_fp8,
+        ),
     )
 
     # Pre-flight warning: if KV cache headroom is very low with standby mode,
