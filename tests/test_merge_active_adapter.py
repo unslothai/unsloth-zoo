@@ -131,3 +131,24 @@ def test_multiple_active_adapters_refused(tmp_path):
             module.set_adapter(["default", "task"])
     with pytest.raises(ValueError, match = "single active adapter"):
         create_lora_statistics(peft_model)
+
+
+def test_untargeted_layer_keeps_downloaded_weight(tmp_path):
+    # The live base_layer weight can differ from the checkpoint (4-bit packed for QLoRA); a layer the
+    # active adapter does not target must keep the downloaded tensor, not the live one.
+    set_offline_cpu_env()
+    base_dir, out_dir = str(tmp_path / "base"), str(tmp_path / "merged")
+    adapters = [
+        ("default", ["q_proj", "k_proj"], 2, 4, None),
+        ("task", ["q_proj"], 3, 9, None),
+    ]
+    peft_model = _peft(_base(base_dir), adapters, "task")
+    disk = read_safetensors_dir(base_dir)
+    with torch.no_grad():
+        for name, module in peft_model.named_modules():
+            if name.endswith("k_proj.base_layer"):
+                module.weight.mul_(2)
+    run_merge(peft_model, base_dir, out_dir, save_dtype = torch.float32)
+    saved = read_safetensors_dir(out_dir)
+    keys = [k for k in saved if k.endswith("k_proj.weight")]
+    assert keys and all(torch.equal(saved[k], disk[k]) for k in keys)

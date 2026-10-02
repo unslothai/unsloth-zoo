@@ -844,12 +844,13 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
                 "https://github.com/unslothai/unsloth/issues."
             )
 
-    # Layers the active adapter does not target merge as their base weight; keep them out of the count check.
+    # Layers the active adapter does not target keep their base weight. Their stats (module, no
+    # factors) look like a modules_to_save entry to the shard writers, which would then write the
+    # live (possibly 4-bit packed) base_layer weight, so they are dropped from lora_weights below.
+    _untargeted_keys = {k for k in _untargeted_keys if lora_weights[k].lora_A is None and lora_weights[k].lora_B is None}
     for _key in _untargeted_keys:
-        _stats = lora_weights[_key]
-        if _stats.lora_A is None and _stats.lora_B is None:
-            scaling_count -= 1
-            if _stats.module is not None: module_count -= 1
+        scaling_count -= 1
+        if lora_weights[_key].module is not None: module_count -= 1
 
     if not (module_count == lora_A_count == lora_B_count == scaling_count):
         print(
@@ -905,6 +906,7 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
     pass
 
     if return_state_dict: assert_same_keys(model, state_dict)
+    for _key in _untargeted_keys: lora_weights.pop(_key, None)
     return lora_weights, state_dict
 pass
 
