@@ -3161,12 +3161,22 @@ def patch_output_collector_for_compiled_submodules():
     if not all(hasattr(cls, name) for name in ("get", "set", "reset")):
         return
     original_set, original_reset = cls.set, cls.reset
+    import threading
+    lock = threading.Lock()
+
+    def refresh(self, active):
+        # Mirror only while every active context is on one thread; overlapping threads read their own ContextVar.
+        if len({tid for _, tid, _ in active}) <= 1:
+            self._unsloth_eager_value = active[-1][2] if active else None
+            self._unsloth_eager_single = True
+        else:
+            self._unsloth_eager_single = False
 
     @functools.wraps(cls.get)
     def get(self):
         if getattr(self, "compiling", False):
             return self.global_var
-        if torch.compiler.is_compiling():
+        if torch.compiler.is_compiling() and self.__dict__.get("_unsloth_eager_single", True):
             return self.__dict__.get("_unsloth_eager_value")
         return self.context_var.get()
 
@@ -3174,20 +3184,23 @@ def patch_output_collector_for_compiled_submodules():
     def set(self, value):
         token = original_set(self, value)
         if token is not None:
-            # Tokens are unhashable: keep (token, previous value) pairs, matched by identity.
-            self.__dict__.setdefault("_unsloth_eager_previous", []).append(
-                (token, self.__dict__.get("_unsloth_eager_value"))
-            )
-            self._unsloth_eager_value = value
+            with lock:
+                active = self.__dict__.setdefault("_unsloth_eager_active", [])
+                active.append((token, threading.get_ident(), value))
+                refresh(self, active)
         return token
 
     @functools.wraps(original_reset)
     def reset(self, token):
-        previous = self.__dict__.get("_unsloth_eager_previous") or []
-        for i in range(len(previous) - 1, -1, -1):
-            if previous[i][0] is token:
-                self._unsloth_eager_value = previous.pop(i)[1]
-                break
+        if token is not None:
+            with lock:
+                # Tokens are unhashable: match by identity.
+                active = self.__dict__.get("_unsloth_eager_active") or []
+                for i in range(len(active) - 1, -1, -1):
+                    if active[i][0] is token:
+                        del active[i]
+                        break
+                refresh(self, active)
         return original_reset(self, token)
 
     cls.get, cls.set, cls.reset = get, set, reset

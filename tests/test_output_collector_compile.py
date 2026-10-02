@@ -67,14 +67,27 @@ def test_compiled_reader_sees_the_eager_collector_without_a_graph_break():
 
 def test_unpatched_reader_breaks_the_graph():
     out = _run("")
-    assert "FULLGRAPH_OK" not in out.stdout
+    if "FULLGRAPH_OK" in out.stdout:
+        pytest.skip(f"torch {torch.__version__} traces ContextVar.get, so there is no graph break to remove")
     assert "ContextVar" in out.stderr, out.stderr[-3000:]
 
 
-def test_eager_reads_stay_per_thread_and_nesting_restores():
+def _patched_var(name):
     from unsloth_zoo.temporary_patches.misc import patch_output_collector_for_compiled_submodules
     patch_output_collector_for_compiled_submodules()
-    var = output_capturing.CompileableContextVar("eager")
+    return output_capturing.CompileableContextVar(name)
+
+
+def _compiled_get(var, monkeypatch):
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    try:
+        return var.get()
+    finally:
+        monkeypatch.undo()
+
+
+def test_eager_reads_stay_per_thread_and_nesting_restores(monkeypatch):
+    var = _patched_var("eager")
     outer, inner = {"k": []}, {"k": []}
     t_outer = var.set(outer)
     seen = []
@@ -82,8 +95,37 @@ def test_eager_reads_stay_per_thread_and_nesting_restores():
     thread.start(); thread.join()
     assert seen == [None] and var.get() is outer
     t_inner = var.set(inner)
-    assert var.get() is inner and var._unsloth_eager_value is inner
+    assert var.get() is inner and _compiled_get(var, monkeypatch) is inner
     var.reset(t_inner)
-    assert var.get() is outer and var._unsloth_eager_value is outer
+    assert var.get() is outer and _compiled_get(var, monkeypatch) is outer
     var.reset(t_outer)
-    assert var.get() is None and var._unsloth_eager_value is None
+    assert var.get() is None and _compiled_get(var, monkeypatch) is None
+
+
+def test_overlapping_threads_never_read_each_others_collector(monkeypatch):
+    var = _patched_var("threads")
+    a, b = {"k": []}, {"k": []}
+    steps = {name: threading.Event() for name in ("a_set", "b_set", "a_reset", "b_done")}
+    seen = {}
+
+    def thread_a():
+        token = var.set(a)
+        steps["a_set"].set(); steps["b_set"].wait()
+        var.reset(token)
+        steps["a_reset"].set()
+
+    def thread_b():
+        steps["a_set"].wait()
+        token = var.set(b)
+        seen["overlap"] = var._unsloth_eager_single
+        steps["b_set"].set(); steps["a_reset"].wait()
+        seen["after_a_reset"] = (var._unsloth_eager_single, var._unsloth_eager_value is b)
+        var.reset(token)
+        steps["b_done"].set()
+
+    threads = [threading.Thread(target = thread_a), threading.Thread(target = thread_b)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    assert seen["overlap"] is False
+    assert seen["after_a_reset"] == (True, True)
+    assert var._unsloth_eager_single and _compiled_get(var, monkeypatch) is None
