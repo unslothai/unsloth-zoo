@@ -3532,12 +3532,9 @@ def test_trusted_dir_handles_a_root_trusted_path(monkeypatch, tmp_path):
     # a bare parent + os.sep would produce and never match.
     home = tmp_path / ".unsloth"
     folder = tmp_path / "anywhere"
-    if os.name == "nt":
-        # os.sep alone is "\\" without a drive letter, so it cannot contain C:\...
-        trusted_root = os.path.splitdrive(os.path.abspath(str(folder)))[0] + os.sep
-    else:
-        trusted_root = os.sep
-    assert _trusted(monkeypatch, folder, home, env_value=trusted_root) is True
+    # Drive-qualified on Windows: a bare "\\" never contains C:\...
+    root = os.path.splitdrive(str(folder))[0] + os.sep
+    assert _trusted(monkeypatch, folder, home, env_value=root) is True
 
 
 def test_trusted_dir_is_case_insensitive_on_windows_style_paths(monkeypatch):
@@ -4651,15 +4648,20 @@ def test_mlx_lm_tokenizer_loader_forwards_trust(monkeypatch, tmp_path, trust):
 
 @pytest.mark.parametrize("trust", [False, True])
 def test_image_processor_builder_forwards_trust(monkeypatch, tmp_path, trust):
+    import transformers
     import unsloth_zoo.mlx.loader as loader
 
     processor, calls = object(), []
 
-    def record(path, *, trust_remote_code=False, **kwargs):
-        calls.append(trust_remote_code)
+    def record(path, **kwargs):
+        calls.append(kwargs["trust_remote_code"])
         return processor
 
-    monkeypatch.setattr(loader, "_auto_image_processor_from_pretrained", record)
+    class FakeAutoImageProcessor:
+        from_pretrained = staticmethod(record)
+
+    # The real class is a gated placeholder when torchvision is absent.
+    monkeypatch.setattr(transformers, "AutoImageProcessor", FakeAutoImageProcessor)
     assert loader._build_vlm_image_processor_from_config(
         tmp_path, {}, {}, trust_remote_code=trust,
     ) is processor
