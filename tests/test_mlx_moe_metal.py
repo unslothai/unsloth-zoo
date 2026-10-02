@@ -583,6 +583,19 @@ def test_routed_experts_run_on_the_decode_kernels_bitwise(native, dtype, quantiz
         assert "_unsloth_moe_routed" not in block.__dict__
 
 
+def test_routed_experts_kill_switch_keeps_native(monkeypatch):
+    block = _expert_block(vlm_qwen, (8, "affine", 64), mx.bfloat16)
+    x = mx.random.normal((2, 1, 512)).astype(mx.bfloat16)
+    expected = block(x)
+    gathers = _counting_gather_qmm(monkeypatch)
+    monkeypatch.setenv("UNSLOTH_MLX_ROUTED_EXPERTS", "0")
+    with _routed(block):
+        assert "_unsloth_moe_routed" not in block.__dict__
+        gathers.clear()
+        _identical(block(x), expected)
+        assert gathers
+
+
 class _Doubled(vlm.SwitchGLU):
     def __call__(self, x, indices):
         return super().__call__(x, indices) * 2

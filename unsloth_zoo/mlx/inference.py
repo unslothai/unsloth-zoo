@@ -24,6 +24,7 @@ import hashlib
 import inspect
 import logging
 import math
+import os
 import re
 import sys
 import textwrap
@@ -1973,13 +1974,15 @@ def fused_moe_routed_experts(model):
     calls whose routes MLX gathers unsorted, each checked bitwise against the native experts at
     first use; where they serve a call, the routing launch also writes the shared-expert gate's
     sigmoid. The kernels run from `fused_moe_router`'s fused call, so without that scope the
-    blocks stay native. Training and distributed models keep the native experts.
+    blocks stay native. Training and distributed models keep the native experts, and so does
+    every model while UNSLOTH_MLX_ROUTED_EXPERTS=0.
     """
     changed = []
     try:
         with _MOE_ROUTER_LOCK:
             modules = model.named_modules() if hasattr(model, "named_modules") else ()
-            if (not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)
+            if (os.environ.get("UNSLOTH_MLX_ROUTED_EXPERTS", "1") != "0"
+                    and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)
                     and _moe_router_kernel() is not None):
                 for _, module in modules:
                     # Type before `training`: named_modules() may yield plain stand-ins.
