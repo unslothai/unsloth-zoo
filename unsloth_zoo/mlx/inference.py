@@ -1284,7 +1284,7 @@ def fused_residual_norm_handoff(model):
     Layers `fused_residual_norm` covers keep that scope's path; training and distributed models
     stay native. Instance classes are restored when the context exits.
     """
-    patched = []
+    patched, fresh = [], set()
     try:
         with _RESIDUAL_NORM_LOCK:
             if not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None) and mx.metal.is_available():
@@ -1297,36 +1297,40 @@ def fused_residual_norm_handoff(model):
                     # overlap: count owners, as fused_decode_conv_silu does, and let the last restore.
                     if module.__dict__.get("_unsloth_handoff_scopes", 0):
                         module._unsloth_handoff_scopes += 1
-                        patched.append((module, None, None))
+                        patched.append(module)
                         continue
                     if hasattr(base, "_unsloth_residual_norm_base") or _residual_norm_class(base) is not None:
                         continue
                     fused = _prenorm_class(base)
                     if (fused is not None and all(type(getattr(module, name, None)) is nn.RMSNorm
                                                  for name in fused._unsloth_residual_norm_names)):
-                        patched.append((module, base, fused))
+                        patched.append(module)
                         module.__class__ = fused
+                        # The last owner to exit restores, whichever scope patched the module.
+                        module._unsloth_handoff_native = base
                         module._unsloth_handoff_scopes = 1
-                owned = {id(module) for module, _, fused in patched if fused is not None}
-                for module in (module for _, module in model.named_modules()) if owned else ():
+                        fresh.add(id(module))
+                for module in (module for _, module in model.named_modules()) if fresh else ():
                     layers = module.get("layers") if isinstance(module, dict) else None
                     if not isinstance(layers, list):
                         continue
                     for producer, consumer in zip(layers, layers[1:]):
-                        if (id(producer) in owned and id(consumer) in owned
+                        if (id(producer) in fresh and id(consumer) in fresh
                                 and getattr(type(consumer), "_unsloth_handoff_norm", None) is not None):
                             producer.__dict__["_unsloth_handoff_out"] = consumer.__dict__["_unsloth_handoff_in"] = _Handoff(consumer)
         yield model
     finally:
         with _RESIDUAL_NORM_LOCK:
-            for module, base, fused in reversed(patched):
+            for module in reversed(patched):
                 scopes = module.__dict__.get("_unsloth_handoff_scopes", 0)
                 if scopes > 1:
                     module._unsloth_handoff_scopes = scopes - 1
                     continue
-                for name in ("_unsloth_handoff_out", "_unsloth_handoff_in", "_unsloth_handoff_scopes"):
+                base = module.__dict__.get("_unsloth_handoff_native")
+                for name in ("_unsloth_handoff_out", "_unsloth_handoff_in", "_unsloth_handoff_scopes",
+                             "_unsloth_handoff_native"):
                     module.__dict__.pop(name, None)
-                if fused is not None and type(module) is fused:
+                if base is not None and getattr(type(module), "_unsloth_residual_norm_base", None) is base:
                     module.__class__ = base
 
 _QWEN_ROUTING, _GEMMA_ROUTING = 0, 1  # kernel MODE
