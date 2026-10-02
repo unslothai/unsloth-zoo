@@ -91,3 +91,18 @@ def test_experts_routing_call_forms(monkeypatch, positional):
 
     with pytest.raises(TypeError):
         gpt_oss._mxfp4_experts_routing(None, hidden, None, None, None, idx, None)
+
+
+@pytest.mark.parametrize("n_tokens, n_experts, top_k", [(1, 32, 4), (5, 32, 4), (37, 32, 4), (2048, 32, 4), (300, 128, 4)])
+def test_expt_data_matches_compute_expt_data_torch(n_tokens, n_experts, top_k):
+    routing = pytest.importorskip("triton_kernels.routing")
+    logits = torch.randn(n_tokens, n_experts, generator=torch.Generator().manual_seed(n_tokens))
+    scores, idx = _hf_router(logits, top_k, dense=True)
+    hist = topk_to_routing_tensors(idx, scores, n_experts)[1]
+    want = routing.compute_expt_data_torch(hist, n_experts, n_tokens * top_k)
+    block_ms = sorted(want.token_offs_pad)
+    raw, pad, pid = gpt_oss.expt_data_from_hist(hist, n_experts, n_tokens * top_k, block_ms)
+    assert torch.equal(raw, want.token_offs_raw)
+    for b in block_ms:
+        assert torch.equal(pad[b], want.token_offs_pad[b]), b
+        assert torch.equal(pid[b], want.block_pid_map[b]), b

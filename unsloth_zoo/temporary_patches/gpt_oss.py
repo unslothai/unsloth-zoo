@@ -420,32 +420,74 @@ def topk_to_routing_tensors(router_indices, routing_weights, n_expts_tot):
     expt_indx = expt_indx.reshape(-1)
     combine_indx = torch.argsort(expt_indx, stable = True)
     dispatch_indx = torch.argsort(combine_indx, stable = True)
-    expt_hist = torch.bincount(expt_indx, minlength = n_expts_tot).to(torch.int32)
+    # scatter_add, not bincount: CUDA bincount syncs to size its output.
+    expt_hist = torch.zeros(n_expts_tot, dtype = torch.int32, device = expt_indx.device).scatter_add_(
+        0, expt_indx, torch.ones_like(expt_indx, dtype = torch.int32),
+    )
     return expt_scal[combine_indx], expt_hist, combine_indx.to(torch.int32), dispatch_indx.to(torch.int32)
+pass
+
+
+def _triton_kernels_root(module):
+    # Same triton_kernels copy as the weights (other copies reject its Tensor), else the resolved one.
+    weight = module.__dict__.get("_gate_up_proj", module.__dict__.get("gate_up_proj"))
+    if weight is not None and not isinstance(weight, torch.Tensor):
+        return type(weight).__module__.rsplit(".tensor", 1)[0]
+    from unsloth_zoo.triton_kernels_compat import get_triton_kernels
+    tk = get_triton_kernels()
+    return tk.__name__ if tk is not None else "triton_kernels"
+pass
+
+
+def expt_data_from_hist(hist, n_expts_tot, n_gates, block_ms):
+    """triton_kernels.routing.compute_expt_data_torch, batched over block_ms and sync-free.
+
+    Returns (token_offs_raw, {block_m: token_offs_pad}, {block_m: block_pid_map}).
+    """
+    device = hist.device
+    zero = torch.zeros(1, dtype = torch.int32, device = device)
+    token_offs_raw = torch.cat((zero, torch.cumsum(hist, 0, dtype = torch.int32)))
+    if n_gates <= n_expts_tot:
+        max_n_tiles = n_gates
+    else:
+        max_n_tiles = n_expts_tot - 1 - ((n_expts_tot - n_gates - 1) // min(block_ms))
+    bm = torch.tensor(block_ms, dtype = torch.int32, device = device)[:, None]
+    n_tiles = (hist[None, :] + bm - 1) // bm
+    token_offs_pad = torch.cat((zero.expand(len(block_ms), 1), torch.cumsum(n_tiles, 1, dtype = torch.int32)), 1)
+    col = torch.arange(max_n_tiles, dtype = torch.int32, device = device)
+    vals = torch.arange(n_expts_tot, dtype = torch.int32, device = device)[:, None] + (col << 16)[None, :]
+    # Tiles past each expert's count land in a spare trailing slot instead of a boolean-mask gather (host sync).
+    idxs = torch.where(
+        col[None, None, :] < n_tiles[:, :, None],
+        token_offs_pad[:, :-1, None] + col[None, None, :],
+        max_n_tiles,
+    ) + torch.arange(len(block_ms), dtype = torch.int32, device = device)[:, None, None] * (max_n_tiles + 1)
+    block_pid_map = torch.full((len(block_ms) * (max_n_tiles + 1),), -1, dtype = torch.int32, device = device)
+    block_pid_map.scatter_(0, idxs.reshape(-1).long(), vals.expand(len(block_ms), -1, -1).reshape(-1))
+    block_pid_map = block_pid_map.view(len(block_ms), max_n_tiles + 1)[:, :max_n_tiles]
+    return (
+        token_offs_raw,
+        {b: token_offs_pad[i] for i, b in enumerate(block_ms)},
+        {b: block_pid_map[i] for i, b in enumerate(block_ms)},
+    )
 pass
 
 
 @torch.compiler.disable
 def _mxfp4_routing_from_topk(module, router_indices, routing_weights):
     import importlib
-    # Same triton_kernels copy as the weights (other copies reject its Tensor), else the resolved one.
-    weight = module.__dict__.get("_gate_up_proj", module.__dict__.get("gate_up_proj"))
-    if weight is not None and not isinstance(weight, torch.Tensor):
-        root = type(weight).__module__.rsplit(".tensor", 1)[0]
-    else:
-        from unsloth_zoo.triton_kernels_compat import get_triton_kernels
-        tk = get_triton_kernels()
-        root = tk.__name__ if tk is not None else "triton_kernels"
-    tk_routing = importlib.import_module(root + ".routing")
+    tk_routing = importlib.import_module(_triton_kernels_root(module) + ".routing")
     n_expts_tot = module.num_experts
     with torch_cuda_device(router_indices.device):
         gate_scal, expt_hist, combine_indx, dispatch_indx = topk_to_routing_tensors(
             router_indices, routing_weights, n_expts_tot,
         )
-        compute_expt_data_torch = getattr(tk_routing, "compute_expt_data_torch", None)
         expt_data = None
-        if compute_expt_data_torch is not None:
-            expt_data = compute_expt_data_torch(expt_hist, n_expts_tot, router_indices.numel())
+        if hasattr(tk_routing, "ExptData"):
+            block_ms = [16, 32, 64, 128] + ([256] if getattr(tk_routing, "is_hip", lambda: False)() else [])
+            expt_data = tk_routing.ExptData(
+                expt_hist, *expt_data_from_hist(expt_hist, n_expts_tot, router_indices.numel(), block_ms),
+            )
     return (
         tk_routing.RoutingData(gate_scal, expt_hist, n_expts_tot, router_indices.shape[1], expt_data),
         tk_routing.GatherIndx(src_indx = combine_indx, dst_indx = dispatch_indx),
