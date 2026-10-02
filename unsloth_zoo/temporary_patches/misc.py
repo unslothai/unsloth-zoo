@@ -3146,3 +3146,54 @@ def patch_mamba_ssm_chunk_scan_device_guard():
             setattr(module, "_chunk_scan_fwd", _chunk_scan_fwd)
 pass
 TEMPORARY_PATCHES.append(patch_mamba_ssm_chunk_scan_device_guard)
+
+
+def patch_output_collector_for_compiled_submodules():
+    # transformers' capture_outputs sets its collector eagerly in the outer forward. A capture hook
+    # inside a region Unsloth compiles (e.g. the router of a compiled MoE block, which TRL >= 1
+    # captures for its router aux loss) then reads it via ContextVar.get, which Dynamo cannot trace:
+    # one graph break per hooked call. Mirror the eager value into a plain attribute that only
+    # compiled code reads; eager code keeps the thread-safe ContextVar.
+    try:
+        from transformers.utils import output_capturing
+    except Exception:
+        return
+    cls = getattr(output_capturing, "CompileableContextVar", None)
+    if cls is None or getattr(cls, "_unsloth_eager_mirror", False):
+        return
+    if not all(hasattr(cls, name) for name in ("get", "set", "reset")):
+        return
+    original_set, original_reset = cls.set, cls.reset
+
+    @functools.wraps(cls.get)
+    def get(self):
+        if getattr(self, "compiling", False):
+            return self.global_var
+        if torch.compiler.is_compiling():
+            return self.__dict__.get("_unsloth_eager_value")
+        return self.context_var.get()
+
+    @functools.wraps(original_set)
+    def set(self, value):
+        token = original_set(self, value)
+        if token is not None:
+            # Tokens are unhashable: keep (token, previous value) pairs, matched by identity.
+            self.__dict__.setdefault("_unsloth_eager_previous", []).append(
+                (token, self.__dict__.get("_unsloth_eager_value"))
+            )
+            self._unsloth_eager_value = value
+        return token
+
+    @functools.wraps(original_reset)
+    def reset(self, token):
+        previous = self.__dict__.get("_unsloth_eager_previous") or []
+        for i in range(len(previous) - 1, -1, -1):
+            if previous[i][0] is token:
+                self._unsloth_eager_value = previous.pop(i)[1]
+                break
+        return original_reset(self, token)
+
+    cls.get, cls.set, cls.reset = get, set, reset
+    cls._unsloth_eager_mirror = True
+pass
+TEMPORARY_PATCHES.append(patch_output_collector_for_compiled_submodules)
