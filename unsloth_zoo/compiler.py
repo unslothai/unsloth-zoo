@@ -236,11 +236,8 @@ MODEL_FUNCTION_SOURCE_REWRITES = {
 }
 
 
-# Per model_type module forward rewrites: {class: (old, new, mode)}. A class whose `old` text occurs exactly
-# once in its forward leaves DISABLE_COMPILE_MODULES and compiles with the rewritten forward. `mode()`
-# returns None (no rewrite, class stays as listed), "stock" (compile the unchanged forward) or anything
-# else (apply the rewrite). DeepSeek-V4 / V4.1 mHC mixers: compiled as is by default on torch >= 2.13;
-# UNSLOTH_DSV4_MHC_FAST=unrolled swaps the Sinkhorn-Knopp loop for `unsloth_sinkhorn_knopp`, =0 keeps it eager.
+# {model_type: {class: (old, new, mode)}}: a class whose forward contains `old` exactly once leaves
+# DISABLE_COMPILE_MODULES. mode() -> None (stay listed), "stock" (compile unchanged), else apply old -> new.
 MODULE_FORWARD_SOURCE_REWRITES = {
     "deepseek_v4": {
         "DeepseekV4HyperConnection": (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_mode),
@@ -252,7 +249,6 @@ MODULE_FORWARD_SOURCE_REWRITES = {
 
 
 def module_forward_source_rewrites(modeling_file, model_type):
-    """{class name: forward source to compile} for the enabled rewrites whose text matches exactly once."""
     applicable = {}
     for name, (old, new, mode) in MODULE_FORWARD_SOURCE_REWRITES.get(model_type, {}).items():
         try:
@@ -5187,9 +5183,7 @@ DISABLE_COMPILE_MODULES = [
     "Gemma4VisionEncoder",
     "Gemma4VisionEncoderLayer",
     "Gemma4MultimodalEmbedder",
-    # DeepSeek-V4 hyper-connection mixers. HyperConnection leaves this list when its
-    # MODULE_FORWARD_SOURCE_REWRITES entry matches and mhc_fast_mode() allows it (torch >= 2.13 by
-    # default, UNSLOTH_DSV4_MHC_FAST=0 never). #859 saw inf grads with the compiled mixer on older stacks.
+    # DeepSeek-V4 mixers: HyperConnection leaves via MODULE_FORWARD_SOURCE_REWRITES (#859 saw inf grads compiled).
     "DeepseekV4HyperConnection",
     "DeepseekV4HyperHead",
     "DeepseekV41HyperConnection",

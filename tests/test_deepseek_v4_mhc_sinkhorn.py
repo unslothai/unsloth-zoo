@@ -14,11 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""DeepSeek-V4 / V4.1 mHC mixers leave DISABLE_COMPILE_MODULES.
-
-Default (torch >= 2.13) and `UNSLOTH_DSV4_MHC_FAST=stock` compile the transformers mixer as is;
-`=unrolled` swaps its Sinkhorn-Knopp loop for `unsloth_sinkhorn_knopp` (unrolled, explicit backward);
-`=0` keeps the eager mixer."""
+"""DeepSeek-V4 / V4.1 mHC mixer compile modes (`UNSLOTH_DSV4_MHC_FAST`)."""
 
 import json
 import os
