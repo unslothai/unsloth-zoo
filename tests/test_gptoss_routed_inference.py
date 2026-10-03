@@ -14,21 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""gpt-oss bnb-4bit experts: eager inference runs only the routed experts.
-
-torch_native_forward's eval branch used to run every expert for every token and
-zero the unrouted ones through routing_weights: num_experts / top_k times the
-work, and 2 * num_experts expert launches per layer (64 for gpt-oss-20b), which
-left eager decode launch bound. Eager inference now runs only the experts the
-router picked; a compiled forward keeps the dense, sync-free branch.
-
-Checked on CPU with plain nn.Linear experts:
-  * only the routed experts are called in eager decode-sized calls, all of them for large
-    calls, while compiling, during a CUDA graph capture, or with UNSLOTH_GPTOSS_ROUTED_INFERENCE=0,
-  * the routed result matches an fp64 reference at least as well as the dense one,
-    in bfloat16 and float16, for decode (q_len 1) and prefill shapes,
-  * output shape and dtype are unchanged.
-"""
+"""gpt-oss bnb-4bit experts: eager decode-sized calls run only the routed experts;
+large calls, compiling, CUDA graph capture and UNSLOTH_GPTOSS_ROUTED_INFERENCE=0 stay dense."""
 import os
 from types import SimpleNamespace
 
@@ -46,8 +33,7 @@ NUM_EXPERTS, TOP_K, HIDDEN, INTER = 8, 2, 32, 16
 
 
 class _Counted(torch.nn.Linear):
-    """Counts calls; like bitsandbytes Linear4bit, computes in the weight dtype and
-    returns the input dtype."""
+    """Counts calls; like Linear4bit, returns the input dtype."""
     calls = 0
 
     def forward(self, x):
@@ -140,7 +126,6 @@ def test_dense_branch_kept_for_capture_and_kill_switch(monkeypatch):
 
 
 def test_large_calls_keep_the_dense_branch(monkeypatch):
-    # num_tokens * top_k > 4 * num_experts: most experts are active, the host sync costs more.
     batch, q_len = 4, 5
     m = _experts(torch.bfloat16)
     x = torch.randn(batch * q_len, HIDDEN).to(torch.bfloat16)

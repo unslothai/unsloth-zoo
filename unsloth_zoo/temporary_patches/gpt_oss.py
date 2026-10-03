@@ -2932,13 +2932,8 @@ def torch_native_forward(
         and not torch.compiler.is_compiling()
         and not (hidden_states.is_cuda and torch.cuda.is_current_stream_capturing())
     ):
-        # Eager decode: run only the routed experts. The dense branch below runs every expert
-        # for every token, num_experts / top_k times the work and 2 * num_experts Linear4bit
-        # launches per layer (64 for gpt-oss-20b), which leaves eager decode launch bound.
-        # This costs one host sync per layer, which stops the CPU queueing ahead; once most
-        # experts are active (prefill, more than 32 tokens on gpt-oss-20b) that costs more than
-        # it saves, so larger calls, a compiled forward and a CUDA graph capture keep the dense,
-        # sync-free branch. UNSLOTH_GPTOSS_ROUTED_INFERENCE=0 also does.
+        # Eager decode: run only the routed experts (dense runs all, launch bound). Costs one host
+        # sync per layer, so prefill, compile and CUDA graph capture keep the sync-free dense branch.
         dtype = torch.float32 if hidden_states.dtype != torch.bfloat16 else hidden_states.dtype
         with torch.no_grad():
             flat_experts = router_indices.flatten()
