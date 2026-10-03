@@ -126,6 +126,14 @@
       "reason": "Known residual: the converter tracks llama.cpp master so new architectures convert. converter_scan.py screens the download; pinning it is a separate change."
     },
     {
+      "file": "unsloth_zoo/llama_cpp.py",
+      "rule": "unpinned-code-fetch",
+      "sink": "git-clone-unpinned",
+      "digest": "b3b928b51dbb2b1e",
+      "count": 1,
+      "reason": "Known residual: install_llama_cpp source-builds from upstream llama.cpp master, the same upstream trust as installing it; pinning is a separate change."
+    },
+    {
       "file": "unsloth_zoo/mlx/compile.py",
       "rule": "dynamic-import",
       "sink": "import_module",
