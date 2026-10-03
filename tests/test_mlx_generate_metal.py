@@ -1566,3 +1566,39 @@ def test_nax_int8_prefill_row_thresholds():
         (expert, (8, 6, True), 64), (expert, (8, 6), 256), (expert, (8, 8, True), 128), (expert, (8, 8), 256),
         (expert, (16, 8), 512), (expert, (16, 4, True), 128))
     assert [lookup(*args) for lookup, args, _ in cases] == [rows for _, _, rows in cases]
+
+
+
+@real_mlx_only
+@metal_only
+def test_generation_mode_discovers_fusion_modules_once_per_entry(monkeypatch):
+    from unsloth_zoo.mlx.generate import generation_mode
+
+    root = nn.Sequential(ResidualNormBlock(128), ResidualNormBlock(128))
+    named_modules = type(root).named_modules
+    walks = []
+
+    def counted(model):
+        walks.append(model)
+        return named_modules(model)
+
+    monkeypatch.setattr(type(root), "named_modules", counted)
+    x = mx.random.normal((1, 1, 128))
+    for _ in range(2):
+        root.train()
+        root.layers[1].eval()
+        flags = [module.training for module in root.modules()]
+        expected = [layer(x)[0] for layer in root.layers]
+        mx.eval(expected)
+        before = len(walks)
+        with generation_mode(root):
+            assert len(walks) - before == 2  # Training flags, then post-eval fusion discovery.
+            with generation_mode(root):
+                assert len(walks) - before == 4
+                for layer, native in zip(root.layers, expected):
+                    assert type(layer) is not ResidualNormBlock
+                    _residual_equal(layer(x)[0], native)
+            assert all(type(layer) is not ResidualNormBlock for layer in root.layers)
+        assert all(type(layer) is ResidualNormBlock for layer in root.layers)
+        assert [module.training for module in root.modules()] == flags
+        root.layers[1] = ResidualNormBlock(128)

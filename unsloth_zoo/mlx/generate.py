@@ -954,12 +954,15 @@ def generation_mode(model, int8_prefill = None):
         _require_evaluable(model)()
         _GENERATION_MODE_DEPTH += 1
         entered = True
-        from .inference import (fused_decode_conv_silu, fused_moe_gate_up, fused_moe_routed_experts,
+        from .inference import (_fusion_modules, fused_decode_conv_silu, fused_moe_gate_up, fused_moe_routed_experts,
                                 fused_moe_router, fused_residual_norm, fused_residual_norm_handoff,
                                 nax_quantized_linear)
-        with fused_moe_gate_up(model), fused_decode_conv_silu(model), fused_residual_norm(model), \
-                fused_moe_router(model), fused_moe_routed_experts(model), nax_quantized_linear(model, int8_prefill), \
-                fused_residual_norm_handoff(model):
+        # The scopes replace classes and weight arrays, not the module graph.
+        modules = tuple(_fusion_modules(model, None))
+        with fused_moe_gate_up(model, _modules = modules), fused_decode_conv_silu(model, _modules = modules), \
+                fused_residual_norm(model, _modules = modules), fused_moe_router(model, _modules = modules), \
+                fused_moe_routed_experts(model, _modules = modules), nax_quantized_linear(model, int8_prefill, _modules = modules), \
+                fused_residual_norm_handoff(model, _modules = modules):
             yield model
     except BaseException as exc:
         active_error = exc
