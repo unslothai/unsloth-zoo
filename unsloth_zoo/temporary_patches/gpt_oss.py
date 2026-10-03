@@ -2926,11 +2926,16 @@ def torch_native_forward(
             offset += count
         next_states = next_states.view(batch_size, -1, self.hidden_size)
         return next_states.to(torch.float32)
-    elif not torch.compiler.is_compiling():
+    elif (
+        os.environ.get("UNSLOTH_GPTOSS_ROUTED_INFERENCE", "1") != "0"
+        and not torch.compiler.is_compiling()
+        and not (hidden_states.is_cuda and torch.cuda.is_current_stream_capturing())
+    ):
         # Eager inference: run only the routed experts. The dense branch below runs every
         # expert for every token, num_experts / top_k times the work and 2 * num_experts
         # Linear4bit launches per layer (64 for gpt-oss-20b), which leaves eager decode launch
-        # bound. This costs one host sync per layer; a compiled decode keeps the dense branch.
+        # bound. This costs one host sync per layer, so a compiled forward or a CUDA graph
+        # capture keeps the dense, sync-free branch. UNSLOTH_GPTOSS_ROUTED_INFERENCE=0 also does.
         dtype = torch.float32 if hidden_states.dtype != torch.bfloat16 else hidden_states.dtype
         with torch.no_grad():
             flat_experts = router_indices.flatten()

@@ -8,6 +8,7 @@ router picked; a compiled forward keeps the dense, sync-free branch.
 
 Checked on CPU with plain nn.Linear experts:
   * only the routed experts are called in eager inference, all of them while compiling,
+    during a CUDA graph capture, or with UNSLOTH_GPTOSS_ROUTED_INFERENCE=0,
   * the routed result matches an fp64 reference at least as well as the dense one,
     in bfloat16 and float16, for decode (q_len 1) and prefill shapes,
   * output shape and dtype are unchanged.
@@ -93,3 +94,30 @@ def test_eager_inference_runs_only_routed_experts(dtype, batch, q_len, monkeypat
     err_dense = (dense.double() - ref).abs().max().item()
     # fp32 accumulation over the routed experts only: never worse than the dense sum.
     assert err_routed <= err_dense + torch.finfo(dtype).eps * ref.abs().max().item()
+
+
+def test_dense_branch_kept_for_capture_and_kill_switch(monkeypatch):
+    m = _experts(torch.bfloat16)
+    x = torch.randn(4, HIDDEN).to(torch.bfloat16)
+    idx, w = _routing(4, torch.bfloat16)
+    monkeypatch.setenv("UNSLOTH_GPTOSS_ROUTED_INFERENCE", "0")
+    _, calls = _run(m, x, idx, w, 4, False, monkeypatch)
+    assert calls == 2 * NUM_EXPERTS
+    monkeypatch.delenv("UNSLOTH_GPTOSS_ROUTED_INFERENCE")
+    if torch.cuda.is_available():
+        # A real CUDA graph capture: the routed branch's host sync would make it fail.
+        m = SimpleNamespace(**{**vars(m), "gate_up_projs": [l.cuda() for l in m.gate_up_projs],
+                               "down_projs": [l.cuda() for l in m.down_projs]})
+        xc, ic, wc = x.cuda().view(4, -1, HIDDEN), idx.cuda(), w.cuda()
+        monkeypatch.setenv("UNSLOTH_GPTOSS_ROUTED_INFERENCE", "0")
+        torch_native_forward(m, xc, ic, wc)  # warm up the dense branch outside the capture
+        monkeypatch.delenv("UNSLOTH_GPTOSS_ROUTED_INFERENCE")
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        _Counted.calls = 0
+        with torch.cuda.graph(graph):
+            captured = torch_native_forward(m, xc, ic, wc)
+        assert _Counted.calls == 2 * NUM_EXPERTS
+        graph.replay(); torch.cuda.synchronize()
+        monkeypatch.setenv("UNSLOTH_GPTOSS_ROUTED_INFERENCE", "0")
+        assert torch.equal(captured, torch_native_forward(m, xc, ic, wc))
