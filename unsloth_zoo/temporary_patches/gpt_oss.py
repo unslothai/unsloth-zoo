@@ -3729,7 +3729,11 @@ def patch_GptOssModel():
             # Initialize for common return path
             all_hidden_states = None
             all_router_logits = None
+            # This loop calls the layer's parts directly, so the block swapper's forward hooks never fire.
+            block_swap = getattr(self.layers, "_unsloth_block_swap", None)
             for layer_idx, decoder_layer in enumerate(self.layers):
+                if block_swap is not None:
+                    block_swap.enter(layer_idx)
                 mask = _gpt_oss_select_mask(
                     attention_mask,
                     _gpt_oss_layer_attention_type(decoder_layer, self.config, layer_idx),
@@ -3759,6 +3763,8 @@ def patch_GptOssModel():
                 else:
                     hidden_states = moe_forward_inference_bf16(decoder_layer.mlp, hidden_states)
                 hidden_states += residual
+                if block_swap is not None:
+                    block_swap.leave(layer_idx)
             pass
             hidden_states = rms_layernorm_forward(self.norm, hidden_states)
         else:
