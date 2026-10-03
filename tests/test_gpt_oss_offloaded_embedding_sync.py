@@ -14,10 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-# Guards: with embed_tokens offloaded to CPU, the patched GptOssModel.forward copied
-# input_ids to the CPU with non_blocking=True, so the embedding could read them before
-# the copy landed. generate() on transformers 5 does not sync between steps, so each
-# step embedded stale ids (the previous token) and gpt-oss-20b printed garbage.
+# Guards: a non_blocking input_ids copy to the CPU-offloaded embedding raced generate()
+# on transformers 5 (no per-step sync), embedding the previous token: garbage output.
 from __future__ import annotations
 
 import json
