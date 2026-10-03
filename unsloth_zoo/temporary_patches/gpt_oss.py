@@ -3669,7 +3669,11 @@ def patch_GptOssModel():
         if inputs_embeds is None:
             # Account for CPU offloaded embed_tokens
             embed_device = self.embed_tokens.weight.device
-            inputs_embeds = self.embed_tokens(input_ids.to(embed_device, non_blocking=True)).to(input_ids.device)
+            # Never non_blocking into the CPU: the lookup can read the ids before the copy lands
+            # (generate does not sync between steps, so it embedded the previous token).
+            inputs_embeds = self.embed_tokens(
+                input_ids.to(embed_device, non_blocking = embed_device.type != "cpu")
+            ).to(input_ids.device)
         if not self.training:
             inputs_embeds.requires_grad_(False)
 
