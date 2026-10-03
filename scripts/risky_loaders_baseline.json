@@ -129,7 +129,7 @@
       "file": "unsloth_zoo/llama_cpp.py",
       "rule": "unpinned-code-fetch",
       "sink": "git-clone-unpinned",
-      "digest": "b3b928b51dbb2b1e",
+      "digest": "a5ae4361307c747b",
       "count": 1,
       "reason": "Known residual: install_llama_cpp source-builds from upstream llama.cpp master, the same upstream trust as installing it; pinning is a separate change."
     },
@@ -233,7 +233,7 @@
       "file": "unsloth_zoo/mlx/utils.py",
       "rule": "unpinned-code-fetch",
       "sink": "git-clone-unpinned",
-      "digest": "919963bec3d307b5",
+      "digest": "a565552d9206c779",
       "count": 1,
       "reason": "Known residual: the macOS source build clones llama.cpp master, the same upstream trust as installing it; pinning is a separate change."
     },
