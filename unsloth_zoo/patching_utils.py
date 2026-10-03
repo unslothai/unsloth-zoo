@@ -281,6 +281,9 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
     pass
     import torch._dynamo.config as config
     for _try_dynamo_argument in torch_dynamo_arguments:
+        # Torch 2.13 deprecates inline_inbuilt_nn_modules (always True) and warns on every write.
+        _key = _try_dynamo_argument.split("=", 1)[0].strip()[len("config."):]
+        if getattr(getattr(config, "_config", {}).get(_key), "deprecated", False): continue
         try:    exec(_try_dynamo_argument)
         except: pass
     pass
