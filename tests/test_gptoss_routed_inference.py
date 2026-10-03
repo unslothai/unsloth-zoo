@@ -23,8 +23,8 @@ left eager decode launch bound. Eager inference now runs only the experts the
 router picked; a compiled forward keeps the dense, sync-free branch.
 
 Checked on CPU with plain nn.Linear experts:
-  * only the routed experts are called in eager inference, all of them while compiling,
-    during a CUDA graph capture, or with UNSLOTH_GPTOSS_ROUTED_INFERENCE=0,
+  * only the routed experts are called in eager decode-sized calls, all of them for large
+    calls, while compiling, during a CUDA graph capture, or with UNSLOTH_GPTOSS_ROUTED_INFERENCE=0,
   * the routed result matches an fp64 reference at least as well as the dense one,
     in bfloat16 and float16, for decode (q_len 1) and prefill shapes,
   * output shape and dtype are unchanged.
@@ -137,3 +137,14 @@ def test_dense_branch_kept_for_capture_and_kill_switch(monkeypatch):
         graph.replay(); torch.cuda.synchronize()
         monkeypatch.setenv("UNSLOTH_GPTOSS_ROUTED_INFERENCE", "0")
         assert torch.equal(captured, torch_native_forward(m, xc, ic, wc))
+
+
+def test_large_calls_keep_the_dense_branch(monkeypatch):
+    # num_tokens * top_k > 4 * num_experts: most experts are active, the host sync costs more.
+    batch, q_len = 4, 5
+    m = _experts(torch.bfloat16)
+    x = torch.randn(batch * q_len, HIDDEN).to(torch.bfloat16)
+    idx, w = _routing(batch * q_len, torch.bfloat16)
+    assert batch * q_len * TOP_K > 4 * NUM_EXPERTS
+    _, calls = _run(m, x, idx, w, batch, False, monkeypatch)
+    assert calls == 2 * NUM_EXPERTS
