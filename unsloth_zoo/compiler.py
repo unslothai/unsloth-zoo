@@ -59,6 +59,11 @@ from .log import logger
 import triton
 import regex
 from .peft_utils import get_lora_layer_modules
+from unsloth_zoo.temporary_patches.mhc_sinkhorn import (
+    MHC_SINKHORN_SOURCE,
+    MHC_SINKHORN_REPLACEMENT,
+    mhc_fast_mode,
+)
 from importlib.metadata import version as importlib_version
 import functools
 from .compiler_replacements import compiler_replacements
@@ -149,6 +154,9 @@ DISABLED_KEYWORDS = [
     "apply_mask_to_padding_states",  # falcon h1
     "reshape_into_chunks",  # falcon h1
     "pad_tensor_by_size",  # falcon h1
+    # MLA __init__ calls these float helpers under meta init; compiled, they fail on .item()
+    "def yarn_get_mscale(",
+    "def yarn_apply_mscale(",
 ]
 
 DISABLE_COMPILE_FUNCTIONS = [
@@ -161,6 +169,9 @@ DISABLE_COMPILE_FUNCTIONS = [
     # nothing today; it is here so one that goes back to importing it by name, the
     # way transformers 5.2 does for chunk_gated_delta_rule, stays uncompiled.
     "recurrent_gated_delta_rule",
+    # KDA chunk fallback (glm5_next, kimi_linear): Inductor unrolls the per-chunk loop, 25+ min AOT compile.
+    # recurrent_kimi_delta_attention stays compiled: decode only (seq_len 1), 2x faster than eager.
+    "chunk_kimi_delta_attention",
 
     # transformers 5.9+ VL files import these; `grid_thw.tolist()` builds shapes from
     # unbacked SymInts, so fullgraph = True is a hard error on the first vision forward.
@@ -189,6 +200,82 @@ DISABLE_COMPILE_FUNCTIONS = [
 ]
 
 
+# Per model_type DISABLE_COMPILE_FUNCTIONS. deepseek_v4 rope: dynamic = True Inductor backward of its
+# trailing `x[..., -rope_dim:]` slice reads out of bounds, giving wrong / NaN grads (pytorch#198553).
+DISABLE_COMPILE_MODEL_FUNCTIONS = {
+    "deepseek_v4": ["apply_rotary_pos_emb"],
+    # Community port: V4 rope slice plus host-side helpers (dynamo cannot trace tokenizers `NFKC.__new__`).
+    "deepseek_v41": [
+        "apply_rotary_pos_emb",
+        "build_compressed_token_map",
+        "compute_hash_multipliers",
+        "_is_prime",
+        "_find_next_prime",
+        "_mesh_process_group",
+        "_tp_grad_group",
+        "_validate_attention_tp_divisibility",
+        # QAT STE autograd.Function: Dynamo raises InternalTorchDynamoError the fallback does not catch.
+        "_quantize_qat",
+    ],
+}
+
+# Matched rewrites leave DISABLE_COMPILE_MODEL_FUNCTIONS; deepseek_v4 `split` avoids the slice pytorch#198553 miscompiles.
+MODEL_FUNCTION_SOURCE_REWRITES = {
+    "deepseek_v4": {
+        "apply_rotary_pos_emb": (
+            "nope, rope = x[..., :-rope_dim], x[..., -rope_dim:]",
+            "nope, rope = x.split([x.shape[-1] - rope_dim, rope_dim], dim = -1)",
+        ),
+    },
+    "deepseek_v41": {
+        "apply_rotary_pos_emb": (
+            "nope, rope = x[..., :-rope_dim], x[..., -rope_dim:]",
+            "nope, rope = x.split([x.shape[-1] - rope_dim, rope_dim], dim = -1)",
+        ),
+    },
+}
+
+
+# {model_type: {class: (old, new, mode)}}: a class whose forward contains `old` exactly once leaves
+# DISABLE_COMPILE_MODULES. mode() -> None (stay listed), "stock" (compile unchanged), else apply old -> new.
+MODULE_FORWARD_SOURCE_REWRITES = {
+    "deepseek_v4": {
+        "DeepseekV4HyperConnection": (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_mode),
+    },
+    "deepseek_v41": {
+        "DeepseekV41HyperConnection": (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_mode),
+    },
+}
+
+
+def module_forward_source_rewrites(modeling_file, model_type):
+    applicable = {}
+    for name, (old, new, mode) in MODULE_FORWARD_SOURCE_REWRITES.get(model_type, {}).items():
+        try:
+            mode = mode()
+            if not mode:
+                continue
+            cls = getattr(modeling_file, name)
+            source = inspect.getsource(_unwrap_undecorated_method(cls.forward, cls.__qualname__))
+        except Exception:
+            continue
+        if source.count(old) == 1:
+            applicable[name] = source if mode == "stock" else source.replace(old, new)
+    return applicable
+
+
+def model_function_source_rewrites(modeling_file, model_type):
+    applicable = {}
+    for name, (old, new) in MODEL_FUNCTION_SOURCE_REWRITES.get(model_type, {}).items():
+        try:
+            source = inspect.getsource(getattr(modeling_file, name))
+        except Exception:
+            continue
+        if source.count(old) == 1:
+            applicable[name] = (old, new)
+    return applicable
+
+
 def calls_disable_compile_function(source, disable_compile_functions):
     """Names from `DISABLE_COMPILE_FUNCTIONS` that `source` CALLS: a superset of the
     `called_functions` test above, which also wants `def <name>` locally and so misses
@@ -201,6 +288,99 @@ def calls_disable_compile_function(source, disable_compile_functions):
     )
 
 
+def function_has_tensor_inputs(source: str) -> bool:
+    """False when every parameter has a non-tensor annotation: nothing for Dynamo to trace."""
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except Exception:
+        return True
+    function = next((n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))), None)
+    if function is None:
+        return True
+    args = function.args
+    if args.vararg is not None or args.kwarg is not None:
+        return True
+    positional = list(args.posonlyargs) + list(args.args)
+    parameters = positional + list(args.kwonlyargs)
+    if len(parameters) == 0:
+        return True
+    if parameters[0].arg in ("self", "cls"):
+        return True
+    # A literal default types an unannotated parameter; anything else may be a tensor.
+    defaults = {}
+    for parameter, default in zip(positional[len(positional) - len(args.defaults):], args.defaults):
+        defaults[parameter.arg] = default
+    for parameter, default in zip(args.kwonlyargs, args.kw_defaults):
+        if default is not None:
+            defaults[parameter.arg] = default
+    scalar_names = {"int", "float", "bool", "str", "bytes", "None", "list", "tuple", "dict", "set", "Sequence", "Iterable", "Mapping", "device", "dtype"}
+    for parameter in parameters:
+        if parameter.annotation is None:
+            default = defaults.get(parameter.arg)
+            if isinstance(default, ast.Constant) and not isinstance(default.value, type(Ellipsis)):
+                continue
+            return True
+        annotation = ast.unparse(parameter.annotation)
+        names = set(re.findall(r"[A-Za-z_][A-Za-z_0-9]*", annotation))
+        if "Tensor" in annotation or "tensor" in annotation:
+            return True
+        if not names <= scalar_names | {"Optional", "Union", "List", "Tuple", "Dict", "Set", "torch", "typing"}:
+            return True
+    return False
+pass
+
+
+_INIT_ONLY_CALLERS = frozenset(("__init__", "__post_init__", "_init_weights", "post_init"))
+
+
+def function_only_called_at_init(module_source: str, name: str) -> bool:
+    """True if ``name`` is only reached from ``__init__``-time methods (directly or via such
+    helpers): these build buffers on meta, so compiling them fails at load. False if unparseable."""
+    try:
+        tree = ast.parse(textwrap.dedent(module_source))
+    except Exception:
+        return False
+    callers_of = {}
+    # owner = (name, is_method); nested defs keep their enclosing owner.
+    def visit(node, owner):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if isinstance(node, ast.ClassDef):
+                    visit(child, (child.name, True))
+                else:
+                    visit(child, (child.name, False) if owner is None else owner)
+                continue
+            if isinstance(child, ast.Call):
+                func = child.func
+                called = func.id if isinstance(func, ast.Name) else None
+                if called is not None:
+                    callers_of.setdefault(called, set()).add(owner)
+            visit(child, owner)
+    visit(tree, None)
+    seen = set()
+    def init_only(fn):
+        if fn in seen:
+            return True
+        seen.add(fn)
+        owners = callers_of.get(fn)
+        if not owners:
+            return False
+        for owner in owners:
+            if owner is None:
+                return False  # called at module import time or from a class body
+            owner_name, is_method = owner
+            if is_method:
+                # self.<name>() calls are untracked (MPT forward: self.build_mpt_alibi_tensor).
+                if owner_name in _INIT_ONLY_CALLERS:
+                    continue
+                return False
+            if not init_only(owner_name):
+                return False
+        return True
+    return init_only(name)
+pass
+
+
 def calls_mask_creation_function(source):
     """`transformers.masking_utils` `create*` factories that `source` CALLS.
 
@@ -210,6 +390,31 @@ def calls_mask_creation_function(source):
     literal this replaced stopped matching the moment transformers added a kwarg.
     Names come from the installed transformers, so no version gate is needed."""
     return calls_disable_compile_function(source, get_mask_functions())
+
+
+def has_data_dependent_call(source):
+    """`.nonzero()` / `.tolist()` / `.item()`: unguardable under fullgraph = True."""
+    return (
+        ".nonzero()" in source
+        or ".tolist()" in source
+        or ".item()" in source
+    )
+
+
+def data_dependent_helpers(modeling_file, called_functions):
+    """Helpers the module forward screen misses (e.g. Qwen3-Omni chunk_and_pad_features)."""
+    found = []
+    for name in called_functions:
+        function = getattr(modeling_file, name, None)
+        if function is None or inspect.isclass(function):
+            continue
+        try:
+            source = inspect.getsource(function)
+        except Exception:
+            continue
+        if has_data_dependent_call(source):
+            found.append(name)
+    return found
 
 
 # Re-exported from .model_lists so callers can keep using
@@ -277,6 +482,7 @@ except:
 pass
 
 from unsloth_zoo import DEVICE_TYPE_TORCH, DEVICE_COUNT
+from unsloth_zoo.temporary_patches.utils import UNSLOTH_DECODE_COMPILE
 """
 )
 
@@ -1745,6 +1951,15 @@ def _verify_compiled_cache_file_collectively(
         raise error
 pass
 
+_HUB_KERNEL_WRAPPER_RE = re.compile(r"^[ \t]*@use_kernel_func_from_hub_with_fallback\b", flags = re.MULTILINE)
+
+
+def is_hub_kernel_wrapper(source):
+    # Emit bare: on torch 2.11 is_exporting() is True inside a compile trace, so the wrapper runs its torch reference (a None stub for Nemotron-H mamba2).
+    return bool(_HUB_KERNEL_WRAPPER_RE.search(source or ""))
+pass
+
+
 def create_new_function(
     name,
     new_source,
@@ -1835,6 +2050,10 @@ def create_new_function(
         # Emitted in place of a bare `torch.compile(fullgraph = True)`, so the
         # name must resolve in the generated module.
         imports += "from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback\n"
+    if "torch_compiler_disable_unless_decode" in new_source:
+        imports += "from unsloth_zoo.temporary_patches.utils import torch_compiler_disable_unless_decode\n"
+    if "unsloth_sinkhorn_knopp" in new_source:
+        imports += "from unsloth_zoo.temporary_patches.mhc_sinkhorn import unsloth_sinkhorn_knopp\n"
     if "torch_compile" in new_source:
         imports += "from unsloth_zoo.temporary_patches.common import torch_compile\n"
     if "_maybe_compile" in new_source:
@@ -1863,6 +2082,7 @@ def create_new_function(
             "        forward_native_grouped_mm,\n"
             "        forward_triton_grouped_gemm,\n"
             "        forward_native_moe_loop,\n"
+            "        _gate_up_is_interleaved,\n"
             "    )\n"
             "except Exception:\n"
             "    pass\n"
@@ -2663,7 +2883,7 @@ def create_standalone_class(
         compile = (
             f"@torch_compile_with_fallback(fullgraph = {fullgraph}, dynamic = True, options = torch_compile_options)"
             if not disable
-            else "@torch.compiler.disable(recursive = False)"
+            else "@torch_compiler_disable_unless_decode"
         )
     else:
         compile = ""
@@ -2895,32 +3115,35 @@ __DYNAMO__RECOMPILING__ = """
 
     # Set compiler stance to fail on recompiles for inference
     global INFERENCE_RUNS
-    if torch_dynamo_eval_frame is not None:
-        old_stance = torch_dynamo_eval_frame._stance.stance
-    else:
-        old_stance = None
-    if old_stance is not None and INFERENCE_RUNS == 1:
-        # Skip guards and return to eager -> we still need guards!
-        torch_compiler_set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = False)
-        if UNSLOTH_ENABLE_LOGGING:
-            logger_compiler.info(
-                f"Unsloth: Removing compiler guards after 1 inference run. "\\
-                f"DYNAMO_STANCE.stance = {torch_dynamo_eval_frame._stance.stance} "\\
-                f"DYNAMO_STANCE.skip_guard_eval_unsafe = {torch_dynamo_eval_frame._stance.skip_guard_eval_unsafe}"
-            )
-    elif old_stance == "eager_on_recompile":
-        pass
-    elif old_stance == "default" and INFERENCE_RUNS > 1:
-        # Reset compiler stance
-        torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = False)
-        if UNSLOTH_ENABLE_LOGGING:
-            logger_compiler.info(
-                f"Unsloth: Reseting guards. "\\
-                f"DYNAMO_STANCE.stance = {torch_dynamo_eval_frame._stance.stance} "\\
-                f"DYNAMO_STANCE.skip_guard_eval_unsafe = {torch_dynamo_eval_frame._stance.skip_guard_eval_unsafe}"
-            )
-        INFERENCE_RUNS = 0
-    INFERENCE_RUNS += 1
+    # Skipped while tracing (set_stance raises there, and the counter would guard every step)
+    # and around a compiled decode step, which eager_on_recompile would otherwise freeze.
+    if not torch.compiler.is_compiling() and not UNSLOTH_DECODE_COMPILE[0]:
+        if torch_dynamo_eval_frame is not None:
+            old_stance = torch_dynamo_eval_frame._stance.stance
+        else:
+            old_stance = None
+        if old_stance is not None and INFERENCE_RUNS == 1:
+            # Skip guards and return to eager -> we still need guards!
+            torch_compiler_set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = False)
+            if UNSLOTH_ENABLE_LOGGING:
+                logger_compiler.info(
+                    f"Unsloth: Removing compiler guards after 1 inference run. "\\
+                    f"DYNAMO_STANCE.stance = {torch_dynamo_eval_frame._stance.stance} "\\
+                    f"DYNAMO_STANCE.skip_guard_eval_unsafe = {torch_dynamo_eval_frame._stance.skip_guard_eval_unsafe}"
+                )
+        elif old_stance == "eager_on_recompile":
+            pass
+        elif old_stance == "default" and INFERENCE_RUNS > 1:
+            # Reset compiler stance
+            torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = False)
+            if UNSLOTH_ENABLE_LOGGING:
+                logger_compiler.info(
+                    f"Unsloth: Reseting guards. "\\
+                    f"DYNAMO_STANCE.stance = {torch_dynamo_eval_frame._stance.stance} "\\
+                    f"DYNAMO_STANCE.skip_guard_eval_unsafe = {torch_dynamo_eval_frame._stance.skip_guard_eval_unsafe}"
+                )
+            INFERENCE_RUNS = 0
+        INFERENCE_RUNS += 1
 """
 
 # Replace Cross Entropy cells with fused linear lm heads
@@ -3028,7 +3251,9 @@ $LOGITSCALINGMULTIPLY$
 $LOGITSCALINGDIVISION$
 $LOGITSOFTCAPPING$
 loss = None
-if labels is not None:$SPACES$loss = self.loss_function($NEWLINES$$LOGITS$, $LABELS$, $VOCABSIZE$$KWARGS$$NEWLINES$)
+if labels is not None:$SPACES$
+$LOGITSUPCAST$
+loss = self.loss_function($NEWLINES$$LOGITS$,$NEWLINES$$LABELS$,$NEWLINES$$VOCABSIZE$$KWARGS$,?$NEWLINES$)
 """
 
 cross_entropy_replacement_2 = """
@@ -3247,7 +3472,32 @@ ce_finders = [
 ]
 
 
+def _normalize_lm_head_source(forward):
+    # `logits = self.lm_head(x) * self.s` on one line (HyperCLOVAX vision) -> two lines.
+    forward = re.sub(
+        r"^([ \t]+)logits = (self\.lm_head\([^\n]+\)) ([\*/]) (self\.[\w\.]+)[ \t]*$",
+        r"\1logits = \2\n\1logits = logits \3 \4",
+        forward,
+        flags = re.MULTILINE,
+    )
+    # transformers 4.x CTRL / OpenAI GPT name it `lm_logits`; rename only if `logits` is unused.
+    if re.search(r"^[ \t]+lm_logits = self\.lm_head\(", forward, flags = re.MULTILINE) \
+            and not re.search(r"(?<![\w.])logits(?![\w=])", forward):
+        forward = re.sub(r"\blm_logits\b", "logits", forward)
+    return forward
+
+
 def apply_fused_lm_head(forward, module=None):
+    # Kept only if it fuses, so unmatched sources come back byte-identical.
+    normalized = _normalize_lm_head_source(forward)
+    if normalized != forward:
+        new_forward, fused = _apply_fused_lm_head(normalized, module)
+        if fused:
+            return new_forward, fused
+    return _apply_fused_lm_head(forward, module)
+
+
+def _apply_fused_lm_head(forward, module=None):
     # All Unsloth Zoo code licensed under LGPLv3
     UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
     for jj, (cross_entropy_find, cross_entropy_replacement) in enumerate(ce_finders):
@@ -3288,13 +3538,8 @@ def apply_fused_lm_head(forward, module=None):
                 r"self\.config\.get_text_config\(\)\.vocab_size"
                 ")",
             )
-            # Any identifier, not a list of the two names we had seen. transformers
-            # 5.17 renamed gemma3's to `lm_kwargs`, and because a finder that does
-            # not match is a silent no-op, the only symptom was Gemma 3 quietly
-            # losing fused linear cross entropy. One capture group either way, and
-            # the replacements splice the captured NAME in, so a new spelling
-            # works without being enumerated here.
-            .replace("$KWARGS$", r"(?:, \*\*([A-Za-z_]\w*))?")
+            # Any kwargs name (transformers 5.17 renamed gemma3's to `lm_kwargs`); may sit on its own line.
+            .replace("$KWARGS$", r"(?:,[\s\n]{0,}\*\*([A-Za-z_]\w*))?")
             .replace("$LOGITSUPCAST$", r"(?:logits = logits\.float\(\))?")
             .replace("$LABELSDEVICE$", r"(?:labels = labels\.to\([^\)]{1,}\))?")
             .replace(
@@ -3447,6 +3692,19 @@ def apply_fused_lm_head(forward, module=None):
             spaces = finder[0][3]
         replacement = cross_entropy_replacement.strip().split("\n")
         replacement = "\n".join((len(spaces) - 4) * " " + x for x in replacement)
+        # A consumed `logits = logits.float()` (transformers 4.x Granite MoE) must still reach the
+        # unfused loss_function calls, which also return those logits.
+        if r"loss\_function" in cross_entropy_find:
+            matched = regex.search(
+                cross_entropy_find, forward, flags = regex.DOTALL | regex.MULTILINE, timeout = 1,
+            )
+            if matched is not None and "logits = logits.float()" in matched.group(0):
+                replacement = re.sub(
+                    r"^([ \t]*)(loss = self\.loss_function\()",
+                    r"\1logits = logits.float()\n\1\2",
+                    replacement,
+                    flags = re.MULTILINE,
+                )
         if "slice_indices" in forward:
             replacement = (
                 "logits = self.lm_head(hidden_states[:, slice_indices, :]) if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1' else EMPTY_LOGITS\n"
@@ -3513,6 +3771,9 @@ def test_apply_fused_lm_head():
     from transformers.models.granite.modeling_granite import GraniteForCausalLM
 
     forwards.append(GraniteForCausalLM)
+    from transformers.models.granitemoehybrid.modeling_granitemoehybrid import GraniteMoeHybridForCausalLM
+
+    forwards.append(GraniteMoeHybridForCausalLM)
     from transformers.models.gemma2.modeling_gemma2 import Gemma2ForCausalLM
 
     forwards.append(Gemma2ForCausalLM)
@@ -4270,11 +4531,14 @@ torch_float16 = torch.float16
 def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
     xA = dropout(x.to(torch_float16)) @ lora_A.weight.to(torch_float16).t()
     # output = result + scaling * xA @ lora_B.weight.t()
+    # Add in result's dtype: a base layer kept in float32 (gpt-oss expert down_projs reach
+    # 66795) overflows if rounded to float16 here. Float16 results take the same kernel.
     shape = result.shape
+    result_dtype = result.dtype
     output = torch_addmm(
-        result.view(-1, shape[-1]).to(torch_float16),
-        xA.view(-1, xA.shape[-1]),
-        lora_B.weight.to(torch_float16).t(),
+        result.view(-1, shape[-1]),
+        xA.view(-1, xA.shape[-1]).to(result_dtype),
+        lora_B.weight.to(result_dtype).t(),
         alpha = scaling,
         beta = 1,
     ).view(shape)
@@ -4283,7 +4547,7 @@ def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
     if bias is not None:
         output = torch_add(
             output,
-            bias.to(torch_float16),
+            bias.to(result_dtype),
             alpha = scaling,
         )
     return output
@@ -4341,6 +4605,26 @@ def _patch_lora_input_cast(source, force_float32 = None):
         source = source.replace(statement, guarded)
     return source
 pass
+
+
+def _patch_lora_base_layer_input_cast(source):
+    # Outside autocast, match x to a float base weight (fp32 SigLIP under fp16); never to 4-bit / FP8 storage ("Promotion for Float8 Types is not supported").
+    _base_layer_call = "result = self.base_layer(x, *args, **kwargs)"
+    _m = re.search(r'^( *)' + re.escape(_base_layer_call), source, re.MULTILINE)
+    if not _m:
+        return source
+    _ind = _m.group(1)
+    return source.replace(
+        _base_layer_call,
+        f"if not torch.is_autocast_enabled() and hasattr(self.base_layer, 'weight') "
+        f"and self.base_layer.weight is not None "
+        f"and not hasattr(self.base_layer.weight, 'quant_state') "
+        f"and self.base_layer.weight.is_floating_point() "
+        f"and self.base_layer.weight.element_size() > 1 "
+        f"and x.dtype != self.base_layer.weight.dtype:\n"
+        f"{_ind}    x = x.to(self.base_layer.weight.dtype)\n"
+        f"{_ind}{_base_layer_call}",
+    )
 
 
 def patch_lora_forwards(torch_compile_options):
@@ -4403,9 +4687,13 @@ def patch_lora_forwards(torch_compile_options):
 
         # Check failed upcasting
         source = _patch_lora_input_cast(source)
+        # getsource unwrapped the integer-input wrapper, so on 4-bit re-add the cast inline.
+        check_forward_args = "self._check_forward_args(x, *args, **kwargs)"
+        integer_input_inline = "4bit" in child.lower() and check_forward_args in source
         source = source.replace(
-            "self._check_forward_args(x, *args, **kwargs)",
-            "",
+            check_forward_args,
+            "if not x.is_floating_point(): x = _unsloth_lora_integer_input(self, x)"
+            if integer_input_inline else "",
         )
 
         if hash(source) != old_hash:
@@ -4432,25 +4720,8 @@ def patch_lora_forwards(torch_compile_options):
                     "    return base_layer(x, *args, **kwargs)\n"
                 )
 
-            # Fix for fp16 + non-quantized base layers (e.g. SiGLIP vision encoder):
-            # When autocast is disabled and base_layer has float32 weights,
-            # cast x to match the weight dtype to prevent dtype mismatch.
             # For 8-bit layers, the base_layer call was already replaced above.
-            # For 4-bit layers, weight.dtype is uint8 (packed quantized bytes),
-            # so we must skip the cast to avoid corrupting input values.
-            _base_layer_call = "result = self.base_layer(x, *args, **kwargs)"
-            _m = re.search(r'^( *)' + re.escape(_base_layer_call), source, re.MULTILINE)
-            if _m:
-                _ind = _m.group(1)
-                source = source.replace(
-                    _base_layer_call,
-                    f"if not torch.is_autocast_enabled() and hasattr(self.base_layer, 'weight') "
-                    f"and self.base_layer.weight is not None "
-                    f"and not hasattr(self.base_layer.weight, 'quant_state') "
-                    f"and x.dtype != self.base_layer.weight.dtype:\n"
-                    f"{_ind}    x = x.to(self.base_layer.weight.dtype)\n"
-                    f"{_ind}{_base_layer_call}",
-                )
+            source = _patch_lora_base_layer_input_cast(source)
 
             # Fix for VARIANT_KWARG_KEYS (peft >= 0.18.0) - import from canonical source
             # if used in source but not available in parent module.
@@ -4464,6 +4735,11 @@ def patch_lora_forwards(torch_compile_options):
                     "    VARIANT_KWARG_KEYS = ['alora_offsets']\n"
                 )
 
+            if integer_input_inline:
+                extra_prepend += (
+                    "\nfrom unsloth_zoo.temporary_patches.misc import "
+                    "_lora_integer_input as _unsloth_lora_integer_input\n"
+                )
             forward = create_new_function(
                 f"{child}_peft_forward",
                 compiled_lora_forward + source,
@@ -4472,10 +4748,18 @@ def patch_lora_forwards(torch_compile_options):
                 prepend=f"\n{variant_kwarg_import}torch_compile_options = {torch_compile_options}\n"
                 + extra_prepend,
             ).unsloth_forward
+            if integer_input_inline:
+                forward._unsloth_integer_input = True
             exec(f"{parent}.{child}.forward = forward", globals(), locals())
         else:
             could_not_replace_modules.append(parent)
     pass
+    try:
+        from unsloth_zoo.temporary_patches.misc import patch_peft_lora_integer_input
+
+        patch_peft_lora_integer_input()
+    except Exception:
+        pass
     if success <= 5:
         print("Unsloth: Not an error, but could not optimize some PEFT modules.")
 
@@ -4616,6 +4900,22 @@ def patch_gradient_accumulation(modeling_file, module):
 
 
 pass
+
+
+# transformers' AyaVision forward drops the text logit_scale CohereForCausalLM applies (Command-A vision ships 1.0).
+_DROPPED_TEXT_LOGIT_SCALE = ("AyaVisionForConditionalGeneration",)
+
+
+def fixup_dropped_logit_scale(source, module = None):
+    if module not in _DROPPED_TEXT_LOGIT_SCALE or "logit_scale" in source:
+        return source
+    return re.sub(
+        r"^([ \t]+)(logits = self\.lm_head\(hidden_states[^\n]*\))[ \t]*$",
+        r"\1\2\n\1logits = logits * self.config.text_config.logit_scale",
+        source,
+        count = 1,
+        flags = re.MULTILINE,
+    )
 
 
 # Pre fix up some modules like Gemma3n
@@ -4921,10 +5221,10 @@ DISABLE_COMPILE_MODULES = [
     "Gemma4VisionEncoder",
     "Gemma4VisionEncoderLayer",
     "Gemma4MultimodalEmbedder",
-    # DeepSeek-V4 hyper-connection mixers: Inductor's fused backward of their
-    # Sinkhorn-Knopp division chain overflows to inf; tiny modules, so eager is cheap.
+    # DeepSeek-V4 mixers: HyperConnection leaves via MODULE_FORWARD_SOURCE_REWRITES (#859 saw inf grads compiled).
     "DeepseekV4HyperConnection",
     "DeepseekV4HyperHead",
+    "DeepseekV41HyperConnection",
 ]
 
 FIX_GC_LAYER_CALLER_MODULES = [
@@ -4937,7 +5237,11 @@ def patch_output_capture_targets(modeling_file, replacement_classes=None):
     try:
         from transformers.utils.output_capturing import OutputRecorder
     except ImportError:
-        return set()
+        # transformers 4.5x keeps it in generic; without it replaced classes are never captured.
+        try:
+            from transformers.utils.generic import OutputRecorder
+        except ImportError:
+            return set()
 
     replacement_classes = replacement_classes or {}
     target_names = set()
@@ -5284,6 +5588,10 @@ def unsloth_compile_transformers(
     # Later `eval(model_location)` calls need `transformers` bound in globals
     exec("import transformers", globals())
     disable_compile_functions = set(DISABLE_COMPILE_FUNCTIONS)
+    disable_compile_functions.update(DISABLE_COMPILE_MODEL_FUNCTIONS.get(model_type, ()))
+    function_source_rewrites = model_function_source_rewrites(modeling_file, model_type)
+    disable_compile_functions.difference_update(function_source_rewrites)
+    module_forward_rewrites = module_forward_source_rewrites(modeling_file, model_type)
 
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__"):
         # Get __UNSLOTH_SUPPORTS_SDPA__
@@ -5415,8 +5723,8 @@ def unsloth_compile_transformers(
     pass
     UNSLOTH_FULLGRAPH = UNSLOTH_FULLGRAPH == "1"
 
-    # Patch PEFT lora forwards
-    if (not disable) and fast_lora_forwards:
+    # Gated on full disable only: the addmm forward needs no torch.compile, and PEFT's own runs fp32 GEMMs.
+    if (not full_disable) and fast_lora_forwards:
         print("Unsloth: Patching LoRA to make it faster")
         patch_lora_forwards(torch_compile_options)
     pass
@@ -5649,6 +5957,16 @@ def unsloth_compile_transformers(
             called_functions.append(function)
     pass
 
+    # torch_compile_with_fallback only falls back on recompile limits, so these must be disabled.
+    for function in data_dependent_helpers(modeling_file, called_functions):
+        if function not in disable_compile_functions:
+            print(
+                f"Unsloth: Will not compile function {function} since "
+                f"data-dependent operations are done."
+            )
+            disable_compile_functions.add(function)
+    pass
+
     # Check if fullgraph can be used
     torch_modules = {x: True for x in torch_modules}
     for module in torch_modules.keys():
@@ -5855,11 +6173,7 @@ def unsloth_compile_transformers(
         # Tier 2: MoE expert dispatch via torch.where + index_add
         #   1-arg torch.where returns data-dependent indices; combined with
         #   index_add this is the standard MoE routing loop pattern
-        if (
-            ".nonzero()" in source
-            or ".tolist()" in source
-            or ".item()" in source
-        ):
+        if has_data_dependent_call(source):
             print(
                 f"Unsloth: Will not compile {module} since data-dependent operations are done."
             )
@@ -5913,7 +6227,9 @@ def unsloth_compile_transformers(
         pass
 
         # if more modules need to be disabled consider adding to a global list
-        if any([module.endswith(x) for x in DISABLE_COMPILE_MODULES]):
+        if module not in module_forward_rewrites and any(
+            [module.endswith(x) for x in DISABLE_COMPILE_MODULES]
+        ):
             print(
                 f"Unsloth: Disabling compile for {module} since it's marked for disabling."
             )
@@ -5950,7 +6266,9 @@ def unsloth_compile_transformers(
 
     if len(pretrained_modules) > 0:
         for module in pretrained_modules:
-            if any([module.endswith(x) for x in DISABLE_COMPILE_MODULES]):
+            if module not in module_forward_rewrites and any(
+                [module.endswith(x) for x in DISABLE_COMPILE_MODULES]
+            ):
                 print(
                     f"Unsloth: Disabling compile for {module} since it's marked for disabling."
                 )
@@ -5987,6 +6305,7 @@ def unsloth_compile_transformers(
                     functions,
                     fullgraph=False if module in no_fullgraph_modules else fullgraph,
                     disable=disable,
+                    forward_source=module_forward_rewrites.get(module),
                 )
                 print(f"Unsloth: Compiled module {module}.")
                 all_standalone_classes[module] = new_module
@@ -6096,10 +6415,15 @@ def unsloth_compile_transformers(
                     continue
                 # Fix some arguments up like for Gemma 3N
                 new_source = fixup_fused_lm_head(source)
-                # Apply fused LM transforms
-                new_source, supports_return_hidden_states = apply_fused_lm_head(
-                    new_source, module
-                )
+                new_source = fixup_dropped_logit_scale(new_source, module)
+                # Fused CE reads lm_head.weight, which Roberta-style composite heads lack.
+                from unsloth_zoo.fused_losses.forward_install import _head_built_as_linear
+                if _head_built_as_linear(module_class, "lm_head"):
+                    new_source, supports_return_hidden_states = apply_fused_lm_head(
+                        new_source, module
+                    )
+                else:
+                    supports_return_hidden_states = False
                 # print(new_source)
                 new_source = apply_mask_attention_mask_out(new_source)
                 if new_source != source:
@@ -6221,13 +6545,23 @@ def unsloth_compile_transformers(
             # MOE routing weights cast fix takes effect in v5
             new_source, new_methods = patch_moe_routing_weights_cast(module_cls, source)
             if new_source != source or len(new_methods) > 0:
+                # Disabled, the router breaks the compiled MoE block around it (Ernie 4.5, Laguna).
+                compile_router = (
+                    compile_custom_modules
+                    and module in torch_modules
+                    and module not in bad_torch_modules
+                )
                 try:
                     new_module = create_standalone_class(
                         module,
                         model_location,
                         functions,
-                        fullgraph=False,
-                        disable=True,
+                        fullgraph=(
+                            compile_router
+                            and module not in no_fullgraph_modules
+                            and torch_modules[module]
+                        ),
+                        disable=disable if compile_router else True,
                         forward_source=new_source,
                         new_methods=new_methods,
                     )
@@ -6274,7 +6608,7 @@ def unsloth_compile_transformers(
     items_in_trainer = dir(transformers.trainer)
     good_items = []
     for item in items_in_trainer:
-        if item in inner_training_loop:
+        if not item.startswith("__") and item in inner_training_loop:
             good_items.append(item)
     pass
     exec(
@@ -6419,7 +6753,7 @@ def unsloth_compile_transformers(
             _mask_builders = calls_mask_creation_function(parameters)
             if module in disable_compile_functions:
                 parameters = (
-                    "@torch.compiler.disable(recursive = False)\n"
+                    "@torch_compiler_disable_unless_decode\n"
                     + parameters
                 )
             elif len(_mask_builders) != 0:
@@ -6454,6 +6788,8 @@ def unsloth_compile_transformers(
                     print(f"Unsloth: Cannot patch {module} with error = {str(e)}")
                     continue
             pass
+            if module in function_source_rewrites:
+                source = source.replace(*function_source_rewrites[module])
 
             if sdpa_bool_masks:
                 source = convert_attention_masks_to_bool(module, source)
@@ -6482,6 +6818,11 @@ def unsloth_compile_transformers(
                     bad_reason = "disabled keyword is in it"
                     break
             pass
+            # DISABLE_COMPILE_FUNCTIONS names keep the stronger @torch.compiler.disable below.
+            if not bad and module not in disable_compile_functions and is_hub_kernel_wrapper(source):
+                bad = True
+                bad_reason = "it dispatches to an external kernel package"
+            pass
             # Skipped for a DISABLE_COMPILE_FUNCTIONS name: `@torch.compiler.disable`
             # also stops Dynamo inlining it into a compiled caller, so downgrading it
             # to "emit bare" would be weaker. Nothing on that list builds masks today.
@@ -6493,6 +6834,14 @@ def unsloth_compile_transformers(
                         f"it builds attention masks via {', '.join(mask_builders)}"
                     )
             pass
+            if not bad and module not in disable_compile_functions:
+                if not function_has_tensor_inputs(source):
+                    bad = True
+                    bad_reason = "it takes no tensor inputs"
+                elif function_only_called_at_init(full_source, module):
+                    bad = True
+                    bad_reason = "it is only called while constructing modules"
+            pass
             if not bad:
                 # Functions defined inside an if/else come back indented
                 # from inspect.getsource; dedent before prepending the
@@ -6502,11 +6851,11 @@ def unsloth_compile_transformers(
                 if module in disable_compile_functions:
                     source = re.sub(
                         r"@torch.compile\([^\n]*\)\n",
-                        "@torch.compiler.disable(recursive = False)\n",
+                        "@torch_compiler_disable_unless_decode\n",
                         source,
                     )
-                    if "@torch.compiler.disable(recursive = False)\n" not in source:
-                        source = "@torch.compiler.disable(recursive = False)\n" + source
+                    if "@torch_compiler_disable_unless_decode\n" not in source:
+                        source = "@torch_compiler_disable_unless_decode\n" + source
                 elif not disable:
                     _fullgraph = UNSLOTH_FULLGRAPH and not calls_disable_compile_function(
                         source, disable_compile_functions
@@ -6613,10 +6962,11 @@ def unsloth_compile_transformers(
             continue
 
         for key, value in item.items():
-            value = str(value)
+            # Exact name: a substring swapped JambaAttentionDecoderLayer for JambaAttention.
+            value = getattr(value, "__name__", None) if isinstance(value, type) else None
             found = False
             for replaced_class in replaced_classes:
-                if replaced_class in value:
+                if replaced_class == value:
                     try:
                         exec(
                             f"{model_location}.{check}['{key}'] = combined_module.{replaced_class}",

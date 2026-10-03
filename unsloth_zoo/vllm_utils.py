@@ -65,7 +65,7 @@ from unsloth_zoo.temporary_patches.common import (
     UNSLOTH_ENABLE_LOGGING,
 )
 from .log import logger
-from .device_type import DEVICE_TYPE, is_hip
+from .device_type import DEVICE_TYPE, is_hip, device_is_bf16_supported
 global LORA_REQUEST_ID
 
 # Align FlashInfer workspace with Unsloth compiled cache to avoid stale JIT paths.
@@ -99,9 +99,18 @@ def get_target_device(index = 0):
         return torch.device("cuda", index)
     return torch.device(DEVICE_TYPE, index)
 
+def _device_empty_cache():
+    if DEVICE_TYPE == "npu":
+        torch.npu.empty_cache()
+    else:
+        torch.cuda.empty_cache()
+pass
+
 def get_mem_info():
     if DEVICE_TYPE == "xpu":
         free_memory, total_memory = torch.xpu.mem_get_info()
+    elif DEVICE_TYPE == "npu":
+        free_memory, total_memory = torch.npu.mem_get_info()
     else:
         free_memory, total_memory = torch.cuda.mem_get_info()
     return free_memory, total_memory
@@ -110,6 +119,17 @@ pass
 # Whichever bitsandbytes module we resolved below, if vLLM is installed at all.
 # Defined out here because load_vllm reads it and lives outside that branch.
 _vllm_bnb = None
+
+
+def _resolve_bnb_compute_dtype(kwargs):
+    # vLLM >= 0.28 builds the plugin config with no kwargs for online quantization,
+    # so fall back to the dtype the GPU computes in.
+    dtype = os.environ.get("UNSLOTH_bnb_4bit_compute_dtype")
+    if dtype is None:
+        dtype = kwargs.get("bnb_4bit_compute_dtype")
+    if dtype is None:
+        dtype = "bfloat16" if device_is_bf16_supported() else "float16"
+    return dtype
 
 
 def _set_registered_quant_config(method, config_cls):
@@ -341,8 +361,7 @@ if importlib.util.find_spec("vllm") is not None:
     class BitsAndBytesConfig(_BitsAndBytesConfigBase):
         # All Unsloth Zoo code licensed under LGPLv3
         def __init__(self, *args, **kwargs):
-            dtype = os.environ.get("UNSLOTH_bnb_4bit_compute_dtype", kwargs["bnb_4bit_compute_dtype"])
-            kwargs["bnb_4bit_compute_dtype"] = dtype
+            kwargs["bnb_4bit_compute_dtype"] = _resolve_bnb_compute_dtype(kwargs)
             print(f"Unsloth: vLLM Bitsandbytes config using kwargs = {kwargs}")
             super().__init__(*args, **kwargs)
         pass
@@ -660,7 +679,7 @@ def patch_vllm_enable_sleep_mode():
 
         logger.debug(f'CPU offloads {cpu_offloads} true offloads {true_offloads} total {total_offloads}')
         gc.collect()
-        torch.cuda.empty_cache()
+        _device_empty_cache()
     pass
 
     def wake_up(self, tags: Optional[List[str]] = None) -> None:
@@ -686,7 +705,7 @@ def patch_vllm_enable_sleep_mode():
     pass
 
     def delete_memory():
-        torch.cuda.empty_cache()
+        _device_empty_cache()
         gc.collect()
     pass
 
@@ -823,7 +842,7 @@ def patch_vllm_graph_capture():
             )
             for _ in range(2):
                 gc.collect()
-                torch.cuda.empty_cache()
+                _device_empty_cache()
             return result
         pass
         GPUModelRunner.capture_model = capture_model_wrapper_v1
@@ -852,12 +871,55 @@ def patch_vllm_graph_capture():
                 )
                 for _ in range(2):
                     gc.collect()
-                    torch.cuda.empty_cache()
+                    _device_empty_cache()
                 return result
             pass
             GPUModelRunnerBase.capture_model = capture_model_wrapper_v0
         except Exception as e:
             print(f"Unsloth: Could not patch vLLM V0 graph capture: {e}")
+pass
+
+
+def patch_vllm_processed_logprobs_fast_path():
+    # V1 drops FlashInfer engine-wide under processed_logprobs; V2 only on logprob steps, as here.
+    try:
+        from vllm.v1.sample.sampler import Sampler
+        from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
+    except Exception:
+        return
+    if hasattr(Sampler.forward, "_unsloth_processed_fast_path"): return
+    original_forward = Sampler.forward
+
+    @functools.wraps(original_forward)
+    def forward(self, logits, sampling_metadata, *args, **kwargs):
+        if (
+            str(getattr(self, "logprobs_mode", "")).startswith("processed_")
+            and kwargs.get("logprobs_mode_override") is None
+            and len(args) < 2
+            and getattr(sampling_metadata, "max_num_logprobs", 0) is None
+            and not getattr(sampling_metadata, "logprob_token_ids", None)
+        ):
+            fast = self.__dict__.get("_unsloth_raw_topk_topp_sampler")
+            if fast is None:
+                try:
+                    fast = TopKTopPSampler("raw_logprobs")
+                    if hasattr(self.topk_topp_sampler, "use_fp64_gumbel"):
+                        fast.use_fp64_gumbel = self.topk_topp_sampler.use_fp64_gumbel
+                except Exception:
+                    fast = False
+                self.__dict__["_unsloth_raw_topk_topp_sampler"] = fast
+            if fast is False:
+                return original_forward(self, logits, sampling_metadata, *args, **kwargs)
+            processed = self.topk_topp_sampler
+            self.topk_topp_sampler = fast
+            try:
+                return original_forward(self, logits, sampling_metadata, *args, **kwargs)
+            finally:
+                self.topk_topp_sampler = processed
+        return original_forward(self, logits, sampling_metadata, *args, **kwargs)
+
+    forward._unsloth_processed_fast_path = True
+    Sampler.forward = forward
 pass
 
 
@@ -892,6 +954,7 @@ def patch_vllm(debug = True):
         patch_vllm_enable_sleep_mode()
         patch_vllm_reset_caches_on_sleep()
     patch_vllm_graph_capture()
+    patch_vllm_processed_logprobs_fast_path()
     global LORA_REQUEST_ID
     LORA_REQUEST_ID = 1
 pass
@@ -1012,9 +1075,9 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
     state_dict = OrderedDict()
     quant_state_dict = OrderedDict()
 
-    # AMD ROCm (gfx9xx) and XPU: SM architecture (SM80/SM90) concepts don't apply.
+    # AMD ROCm (gfx9xx), XPU and NPU: SM architecture (SM80/SM90) concepts don't apply.
     # CUTLASS block FP8 and DeepGEMM are NVIDIA Hopper (SM90) only.
-    if not is_hip() and DEVICE_TYPE != "xpu":
+    if not is_hip() and DEVICE_TYPE not in ("xpu", "npu"):
         capability = torch.cuda.get_device_capability()
         sm_cap = capability[0] * 10 + capability[1]
     else:
@@ -1175,7 +1238,11 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         gemma4_kv_shared_layers = set()
 
     # Embedding
-    if hasattr(vllm_internals, "model"): # Standard Language models
+    if hasattr(vllm_internals, "model") and hasattr(vllm_internals.model, "text_model"):
+        # Idefics3 nests the text model at model.text_model
+        vllm_text_model = vllm_internals.model.text_model
+        vllm_text_model_prefix = "model.text_model"
+    elif hasattr(vllm_internals, "model"): # Standard Language models
         vllm_text_model = vllm_internals.model
         vllm_text_model_prefix = "model"
     elif hasattr(vllm_internals, "language_model"):
@@ -1208,7 +1275,9 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         if hasattr(layer, "self_attn"):
             prefix = f"{vllm_text_model_prefix}.layers.{kk}.self_attn"
             qkv_proj = layer.self_attn.qkv_proj
-            o_proj = layer.self_attn.o_proj
+            # LFM2 names the attention output projection out_proj
+            o_proj_name = "o_proj" if hasattr(layer.self_attn, "o_proj") else "out_proj"
+            o_proj = getattr(layer.self_attn, o_proj_name)
 
             use_fused_qkv = _is_fused_module("qkv_proj")
             if use_fused_qkv:
@@ -1222,7 +1291,7 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
                     get_state_dict(f"{prefix}.k_proj", 1, state_dict, qkv_proj)
                 if kk not in gemma4_kv_shared_layers:
                     get_state_dict(f"{prefix}.v_proj", 2, state_dict, qkv_proj)
-            get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
+            get_state_dict(f"{prefix}.{o_proj_name}", 0, state_dict, o_proj)
         elif hasattr(layer, "cross_attn"):
             prefix = f"{vllm_text_model_prefix}.layers.{kk}.cross_attn"
             qkv_proj = layer.cross_attn.qkv_proj
@@ -1242,6 +1311,11 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
                 f"{vllm_text_model_prefix}.layers.{kk}.linear_attn",
                 state_dict, quant_state_dict, get_state_dict,
             )
+        elif hasattr(layer, "short_conv"):
+            # LFM2 conv layers: vLLM short_conv is HF conv; in_proj stays fused as in HF
+            prefix = f"{vllm_text_model_prefix}.layers.{kk}.conv"
+            for name in ("in_proj", "out_proj", "conv"):
+                get_state_dict(f"{prefix}.{name}", 0, state_dict, getattr(layer.short_conv, name), slice_weights=False)
         pass
 
         if hasattr(layer, "per_layer_input_gate"):
@@ -1275,6 +1349,53 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             state_dict[f"{vllm_text_model_prefix}.layers.{kk}.layer_scalar"] = layer.layer_scalar.data
             quant_state_dict[f"{vllm_text_model_prefix}.layers.{kk}.layer_scalar"] = layer.layer_scalar.data
 
+        # LFM2: vLLM fuses HF w1 (gate) + w3 (up) as w13 (w1 in vLLM <= 0.15)
+        feed_forward = getattr(layer, "feed_forward", None)
+        w13 = getattr(feed_forward, "w13", None) or getattr(feed_forward, "w1", None)
+        experts = getattr(feed_forward, "experts", None)
+        experts = getattr(experts, "base_layer", experts)  # FusedMoEWithLoRA under enable_lora
+        prefix = f"{vllm_text_model_prefix}.layers.{kk}.feed_forward"
+        if not hasattr(layer, "mlp") and w13 is not None:
+            get_state_dict(f"{prefix}.w1", 0, state_dict, w13)
+            get_state_dict(f"{prefix}.w3", 1, state_dict, w13)
+            get_state_dict(f"{prefix}.w2", 0, state_dict, feed_forward.w2)
+        elif not hasattr(layer, "mlp") and hasattr(getattr(experts, "routed_experts", experts), "w13_weight"):
+            # LFM2-MoE: FusedMoE w13 [E, 2I, H] / w2 [E, H, I] = HF gate_up_proj / down_proj (vLLM >= 0.30: on routed_experts)
+            routed = getattr(experts, "routed_experts", experts)
+            quant_method = getattr(routed, "quant_method", None)
+            quant_method = getattr(quant_method, "old_quant_method", quant_method)  # FusedMoEModularMethod
+            backend = getattr(quant_method, "unquantized_backend", None)
+            backend = getattr(backend, "name", backend)
+            w13, w2 = routed.w13_weight, routed.w2_weight
+            # Other backends reorder w13 at load; TRTLLM is vLLM's pick for LoRA-enabled bf16 MoE on Blackwell.
+            if backend not in (None, "TRITON", "BATCHED_TRITON") or w13.dim() != 3 or w2.dim() != 3 \
+                or w13.shape[1] != 2 * w2.shape[2] or w13.shape[2] != w2.shape[1]:
+                raise NotImplementedError(
+                    f"Unsloth: fast_inference cannot rebuild MoE experts from vLLM's {backend} layout "
+                    f"(w13 {tuple(w13.shape)}, w2 {tuple(w2.shape)}); set fast_inference = False."
+                )
+            moe_tensors = {
+                f"{prefix}.experts.gate_up_proj": w13,
+                f"{prefix}.experts.down_proj": w2,
+                f"{prefix}.gate.weight": feed_forward.gate.weight,
+            }
+            expert_bias = getattr(feed_forward.gate, "e_score_correction_bias", None)
+            if expert_bias is not None:
+                moe_tensors[f"{prefix}.expert_bias"] = expert_bias
+            for key, value in moe_tensors.items():
+                # float8 also passes is_floating_point(); its scales are not carried over
+                if value.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+                    raise NotImplementedError(
+                        f"Unsloth: fast_inference cannot rebuild quantized MoE weights ({key}); "
+                        "load the model in 16-bit or set fast_inference = False."
+                    )
+                state_dict[key] = value.data
+                quant_state_dict[key] = value.data
+        elif not hasattr(layer, "mlp") and feed_forward is not None:
+            raise NotImplementedError(
+                f"Unsloth: fast_inference cannot rebuild layer {kk}'s {type(feed_forward).__name__} from vLLM; "
+                "set fast_inference = False."
+            )
         if not hasattr(layer, "mlp"):
             continue
 
@@ -1298,9 +1419,10 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
 
     if is_vision_model:
         extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_state_dict)
-    # Norm (under model.norm for both standard and multimodal models)
-    norm_prefix = f"{vllm_text_model_prefix}.norm.weight"
-    state_dict[norm_prefix] = vllm_text_model.norm.weight.data
+    # Final norm: model.norm, or model.embedding_norm on LFM2
+    norm_name = "norm" if hasattr(vllm_text_model, "norm") else "embedding_norm"
+    norm_prefix = f"{vllm_text_model_prefix}.{norm_name}.weight"
+    state_dict[norm_prefix] = getattr(vllm_text_model, norm_name).weight.data
     quant_state_dict[norm_prefix] = state_dict[norm_prefix]
 
     # Gemma4 top-level per-layer-input modules
@@ -1520,6 +1642,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     pass
 
     skipped_layernorms = []
+    loaded_buffers = []
     for kk in range(layer_count):
         for layer_name in layer_names:
             layer_name = layer_name.format(kk = kk)
@@ -1567,6 +1690,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 parent = eval(f"new_model.{parent_path}") if parent_path else new_model
                 if attr_name in getattr(parent, "_buffers", {}):
                     parent._buffers[attr_name] = raw_value
+                    loaded_buffers.append((parent, attr_name, raw_value))
                 else:
                     layer = torch.nn.Parameter(raw_value, requires_grad = False)
                     exec(f"new_model.{layer_name_br} = layer")
@@ -1610,8 +1734,8 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 layer.to = partial(_override_to, layer)
                 layer.weight.to = partial(_override_to, layer.weight)
 
-            elif layer_name.endswith(".conv1d") and "linear_attn" in layer_name:
-                # Qwen3.5 GDN depthwise Conv1d: rebuild with real channels/kernel/groups.
+            elif (layer_name.endswith(".conv1d") and "linear_attn" in layer_name) or layer_name.endswith(".conv.conv"):
+                # Qwen3.5 GDN / LFM2 depthwise Conv1d: rebuild with real channels/kernel/groups.
                 from torch.nn import Conv1d
                 conv_weight = _unwrap_tensor(weight)
                 channels = conv_weight.shape[0]
@@ -1662,6 +1786,9 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
         quantization_config = quantization_config,
         bnb_config = bnb_config,
     )
+    # finalize copies every buffer from the meta template (e.g. zeroed LFM2-MoE expert_bias)
+    for parent, attr_name, raw_value in loaded_buffers:
+        parent._buffers[attr_name] = raw_value
 
     # Must override or else Bitsandbytes will error
     new_model.to = partial(_override_to, new_model)
@@ -1670,11 +1797,98 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     # Cleanup
     for _ in range(3):
         gc.collect()
-        torch.cuda.empty_cache()
+        _device_empty_cache()
 
     if len(skipped_layernorms) != 0:
         print(f"Unsloth: Just some info: will skip parsing {list(set(skipped_layernorms))}")
     return new_model
+pass
+
+
+def vllm_weights_memory_usage(config, load_in_4bit = False, load_in_8bit = False):
+    # Meta-device count, so MoE experts and vision towers are included; None = use the formula.
+    import fnmatch
+    import transformers
+    from accelerate import init_empty_weights
+
+    quant_config = getattr(config, "quantization_config", None) or {}
+    if not isinstance(quant_config, dict): quant_config = quant_config.to_dict()
+    quant_method = quant_config.get("quant_method", None)
+    if not quant_config and any(
+        getattr(getattr(config, key, None), "quantization_config", None)
+        for key in ("text_config", "vision_config", "audio_config")
+    ):
+        return None
+    # Same packing factors as approximate_vllm_memory_usage
+    if quant_method in (None, "bitsandbytes"):
+        quantized_bytes = 2 / (16/5) if load_in_4bit else 2 / (8/5) if load_in_8bit else 2
+    elif quant_method in ("fp8", "fbgemm_fp8"):
+        quantized_bytes = 2 / (8/5)
+    elif quant_method == "mxfp4":
+        quantized_bytes = 17 / 32 # 4-bit values + one 8-bit scale per 32
+    elif quant_method in ("awq", "gptq") and not quant_config.get("modules_in_block_to_quantize", None):
+        quantized_bytes = quant_config.get("bits", 4) / 8 * 1.125
+    else:
+        return None
+
+    meta_model = None
+    for auto_class in ("AutoModelForImageTextToText", "AutoModelForCausalLM"):
+        auto_class = getattr(transformers, auto_class, None)
+        if auto_class is None: continue
+        try:
+            with init_empty_weights():
+                meta_model = auto_class.from_config(config)
+            break
+        except Exception:
+            continue
+    if meta_model is None: return None
+    try:
+        meta_model.tie_weights()
+    except Exception:
+        pass
+
+    # Skip entries spell text layers language_model.model.*, model.language_model.* or model.*;
+    # anchored, so model.layers.0 never matches vision_tower...layers.0.
+    def _norm(name):
+        return "." + ".".join(x for x in name.split(".") if x != "model") + "."
+    skip_modules = []
+    for key in ("llm_int8_skip_modules", "modules_to_not_convert", "ignored_layers"):
+        skip_modules += quant_config.get(key, None) or []
+    def _skipped(name):
+        name = _norm(name)
+        names = (name, name[len(".language_model"):]) if name.startswith(".language_model.") else (name,)
+        for module in skip_modules:
+            if "." not in module:
+                if fnmatch.fnmatchcase(name, "*." + module + ".*"): return True
+            elif any(fnmatch.fnmatchcase(x, _norm(module) + "*") for x in names):
+                return True
+        return False
+    # Qwen4Exp's n-gram table: vLLM keeps it on CPU unless VLLM_PLE_CPU_OFFLOAD=0.
+    no_placement = getattr(meta_model, "_no_placement_params", None) or []
+    keep_full = [
+        "." + x + "." for key in ("_keep_in_fp32_modules", "_keep_in_fp32_modules_strict")
+        for x in (getattr(meta_model, key, None) or [])
+    ]
+    if os.environ.get("VLLM_PLE_CPU_OFFLOAD", "1").strip() == "0": no_placement = []
+
+    # Quantizers pack Linear / Conv1D and stacked expert weights, never embeddings or convs.
+    unpacked_types = (torch.nn.Embedding, torch.nn.modules.conv._ConvNd)
+    from transformers.pytorch_utils import Conv1D
+    linear_types = (torch.nn.Linear, Conv1D)
+    weight_bytes, seen = 0, set()
+    for module_name, module in meta_model.named_modules():
+        for param_name, param in module.named_parameters(recurse = False):
+            if id(param) in seen: continue
+            seen.add(id(param))
+            name = f"{module_name}.{param_name}" if module_name else param_name
+            if any(name == x or name.endswith("." + x) for x in no_placement): continue
+            packable = (isinstance(module, linear_types) and param.ndim == 2) or \
+                (param.ndim == 3 and not isinstance(module, unpacked_types))
+            quantized = packable and "lm_head" not in name and not _skipped(name) \
+                and not any(x in "." + name + "." for x in keep_full)
+            weight_bytes += param.numel() * (quantized_bytes if quantized else 2)
+    del meta_model
+    return int(weight_bytes)
 pass
 
 
@@ -1691,6 +1905,7 @@ def approximate_vllm_memory_usage(
     account_for_gradients = True,
     parallel_sequences = 64,
     cuda_graph_overhead = True,
+    weight_bytes = None,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Gets approximate max model length and max num sequences
@@ -1757,8 +1972,9 @@ def approximate_vllm_memory_usage(
     factor = 1
     if load_in_4bit: factor = 16/5
     elif load_in_8bit: factor = 8/5 # Very vague approximation. Will fix later
-    bytes_for_model = \
-        total_quantizable_elements / factor + total_float16_elements + lora_elements
+    if weight_bytes is None:
+        weight_bytes = total_quantizable_elements / factor + total_float16_elements
+    bytes_for_model = weight_bytes + lora_elements
 
     # KV cache size (float16 is 2 bytes. float8 is 1.25 bytes)
     float_bytes = 1.25 if float8_kv_cache else 2
@@ -2296,8 +2512,8 @@ def _clear_flashinfer_env_on_hip():
     # Remove any forced FlashInfer selection unconditionally, even when the package
     # is not installed but the env var was inherited, so vLLM does not try to use
     # FlashInfer and falls back to the ROCm/default attention backend. Returns True
-    # on HIP so the caller skips the CUDA FlashInfer setup.
-    if not is_hip():
+    # on HIP or NPU so the caller skips the CUDA FlashInfer setup.
+    if not is_hip() and DEVICE_TYPE != "npu":
         return False
     _fi_forced = False
     for _fi_env in ("VLLM_USE_FLASHINFER_SAMPLER", "VLLM_ATTENTION_BACKEND"):
@@ -2305,7 +2521,8 @@ def _clear_flashinfer_env_on_hip():
             del os.environ[_fi_env]
             _fi_forced = True
     if _fi_forced or importlib.util.find_spec("flashinfer"):
-        logger.info("Unsloth: FlashInfer skipped on AMD ROCm (requires CUDA nvcc). Using vLLM built-in attention.")
+        _platform = "Ascend NPU" if DEVICE_TYPE == "npu" else "AMD ROCm"
+        logger.info(f"Unsloth: FlashInfer skipped on {_platform} (requires CUDA nvcc). Using vLLM built-in attention.")
     return True
 
 
@@ -2766,6 +2983,9 @@ def load_vllm(
         max_loras = max_loras,
         float8_kv_cache = float8_kv_cache,
         account_for_gradients = training,
+        weight_bytes = vllm_weights_memory_usage(
+            config, load_in_4bit = use_bitsandbytes, load_in_8bit = is_fp8,
+        ),
     )
 
     # Pre-flight warning: if KV cache headroom is very low with standby mode,
@@ -2803,6 +3023,8 @@ def load_vllm(
     elif DEVICE_TYPE == "hip":
         _dtype = torch.bfloat16
     elif DEVICE_TYPE == "xpu":
+        _dtype = torch.bfloat16
+    elif DEVICE_TYPE == "npu" and torch.npu.is_bf16_supported():
         _dtype = torch.bfloat16
     else:
         _dtype = torch.float16
@@ -2995,8 +3217,12 @@ def load_vllm(
             # Each sequence carries an image (~thousands of tokens) in vLLM
             # profiling; cap seqs low for vision models.
             # TODO: vLLM V1 profiling may cap max seqs by budget; check.
-            print(f'Unsloth: Vision model detected, setting approx_max_num_seqs to 1')
-            approx_max_num_seqs = 1
+            if max_num_seqs not in (None, 256):
+                print(f'Unsloth: Vision model detected, honoring max_num_seqs = {max_num_seqs}')
+                approx_max_num_seqs = max_num_seqs
+            else:
+                print(f'Unsloth: Vision model detected, setting approx_max_num_seqs to 1')
+                approx_max_num_seqs = 1
             # One image is ~6404 tokens (Llama 3.2) / ~16Ki (qwen 2.5 VL); leave room for text.
             max_num_batched_tokens = max(8192, max_seq_length)
 
@@ -3028,6 +3254,9 @@ def load_vllm(
             platform = "Intel GPU"
             gpu_eu_count = torch.xpu.get_device_properties(0).gpu_eu_count
             message = f"{platform} has eu:{gpu_eu_count}"
+        elif DEVICE_TYPE == "npu":
+            platform = "Ascend NPU"
+            message = f"{platform} {torch.npu.get_device_name(0)}"
         else:
             platform = "CUDA"
             major_version, minor_version = torch.cuda.get_device_capability()
@@ -3160,6 +3389,8 @@ def load_vllm(
             max_num_batched_tokens = max_num_batched_tokens,
             max_num_seqs           = approx_max_num_seqs, # vLLM default uses 256 -> reduce if OOM
             max_logprobs           = max_logprobs, # Disallow logprobs being returned
+            # Match TRL when reusing this engine for RL, including temperature scaling.
+            logprobs_mode          = "processed_logprobs" if training else "raw_logprobs",
             seed                   = random_state, # Default is 0
 
             # lora_extra_vocab_size = 0, # Breaks vLLM so we leave it as 256
@@ -3312,7 +3543,7 @@ def load_vllm(
                 # Cleanup
                 for _ in range(3):
                     gc.collect()
-                    torch.cuda.empty_cache()
+                    _device_empty_cache()
                 pass
                 error = str(error)
                 # `expandable_segments:True` + sleep/standby mode is a deterministic
@@ -3426,7 +3657,7 @@ def load_vllm(
     # Cleanup
     for _ in range(3):
         gc.collect()
-        torch.cuda.empty_cache()
+        _device_empty_cache()
     return llm
 pass
 
@@ -3571,7 +3802,8 @@ def load_lora_directly(model):
         if s is not None: vllm_lora_B *= s
     pass
     # Must block!
-    torch.cuda.synchronize()
+    if DEVICE_TYPE == "npu": torch.npu.synchronize()
+    else: torch.cuda.synchronize()
 pass
 
 
@@ -4112,7 +4344,7 @@ def delete_vllm(llm = None):
     with contextlib.suppress(AssertionError):
         torch.distributed.destroy_process_group()
     gc.collect()
-    torch.cuda.empty_cache()
+    _device_empty_cache()
     try:
         import ray
         ray.shutdown()
@@ -4459,7 +4691,7 @@ def _test_get_vllm_state_dict(
     # All Unsloth Zoo code licensed under LGPLv3
     # Check if model is allowed to be used in vLLM
     gc.collect()
-    torch.cuda.empty_cache()
+    _device_empty_cache()
 
     from transformers import AutoConfig
     config = AutoConfig.from_pretrained(
@@ -4664,7 +4896,7 @@ def _test_get_vllm_state_dict(
     print(f'Test passed!')
     for _ in range(3):
         gc.collect()
-        torch.cuda.empty_cache()
+        _device_empty_cache()
 pass
 
 
@@ -4692,7 +4924,7 @@ def test_get_vllm_state_dict():
 
     for i, (model_name, counts,) in enumerate(model_names):
         gc.collect()
-        torch.cuda.empty_cache()
+        _device_empty_cache()
         dtype = torch.float16 if i % 2 == 0 else bfloat16_dtype
         print(f"##### Testing {model_name} with dtype = {dtype} #####")
         if bfloat16_dtype == torch.float16:
@@ -4718,6 +4950,6 @@ def test_get_vllm_state_dict():
             error = str(error)
             raise RuntimeError(f"[{model_name}]\n{error}")
         gc.collect()
-        torch.cuda.empty_cache()
+        _device_empty_cache()
     pass
 pass

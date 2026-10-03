@@ -182,9 +182,10 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
             )
         else:
             reduction = "sum" if num_items_in_batch is not None else "mean"
+            # F.cross_entropy reads dim 1 of 3-D logits as the classes.
             loss = torch_nn_functional_cross_entropy(
-                source,
-                target,
+                source.reshape(-1, source.shape[-1]),
+                target.reshape(-1),
                 ignore_index = ignore_index,
                 reduction    = reduction,
             )
@@ -201,8 +202,12 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
         logits, labels, vocab_size: int, num_items_in_batch: int = None, ignore_index: int = -100, **kwargs
     ):
         if labels is None: return None
+        # Flat (tokens, vocab) logits (Ling-2.6-flash MTP head): take the labels' rows, as stock shifts per label row.
+        if logits.dim() == 2:
+            labels = labels.reshape(1, -1) if labels.dim() < 2 else labels.reshape(-1, labels.shape[-1])
+            logits = logits.view(*labels.shape, logits.shape[-1])
         shift_logits = logits
-        shift_labels = torch.empty_like(labels)
+        shift_labels = torch.empty_like(labels, device = shift_logits.device)
         shift_labels[..., :-1] = labels[..., 1:]
         shift_labels[..., -1] = ignore_index
         loss = unsloth_fixed_cross_entropy(shift_logits, shift_labels, num_items_in_batch, ignore_index, **kwargs)
@@ -263,7 +268,12 @@ def post_patch_loss_function(model):
 pass
 
 
-current_device = torch.xpu.device if DEVICE_TYPE == "xpu" else torch.cuda.device
+if DEVICE_TYPE == "xpu":
+    current_device = torch.xpu.device
+elif DEVICE_TYPE == "npu":
+    current_device = torch.npu.device
+else:
+    current_device = torch.cuda.device
 def fused_linear_cross_entropy(
     hidden_states      : torch.Tensor,
     lm_weight          : torch.Tensor,
@@ -276,16 +286,16 @@ def fused_linear_cross_entropy(
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     if num_items_in_batch is not None and torch.is_tensor(num_items_in_batch):
-        num_items_in_batch = num_items_in_batch.to(hidden_states.device, non_blocking = True)
+        num_items_in_batch = num_items_in_batch.to(lm_weight.device, non_blocking = True)
 
     reduction = "sum" if num_items_in_batch is not None else "mean"
     if logit_softcapping == 0: logit_softcapping = None
 
     with current_device(lm_weight.device):
         loss = linear_cross_entropy(
-            hidden_states.to(lm_weight.dtype),
+            hidden_states.to(device = lm_weight.device, dtype = lm_weight.dtype, non_blocking = True),
             lm_weight,
-            targets      = labels,
+            targets      = labels.to(lm_weight.device, non_blocking = True),
             ignore_index = ignore_index,
             softcap      = logit_softcapping,
             reduction    = reduction,

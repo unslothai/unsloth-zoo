@@ -15,6 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import os
+import sys
 import math
 from collections import OrderedDict
 from types import MethodType
@@ -77,6 +78,11 @@ def _default_target_gb():
         # bounded default: host RAM would overshoot VRAM and still OOM the tiler.
         try:
             return torch.xpu.mem_get_info(0)[0] / 1024 / 1024 / 1024 * 0.5
+        except Exception:
+            return 4.0
+    if DEVICE_TYPE == "npu" and hasattr(torch, "npu"):
+        try:
+            return torch.npu.mem_get_info(0)[0] / 1024 / 1024 / 1024 * 0.5
         except Exception:
             return 4.0
     # CPU / MPS / unified-memory backends: activations live in host RAM, budget from it.
@@ -220,6 +226,20 @@ class TiledMLP(torch.autograd.Function):
 
         return None, None, x_gradients, None, None, None
 
+def _mxfp4_instance_forward(mlp_module):
+    # transformers binds mxfp4.mlp_forward on each MXFP4 GptOssMLP; the class forward skips it (unsloth-zoo#385).
+    mxfp4 = sys.modules.get("transformers.integrations.mxfp4")
+    mlp_forward = getattr(mxfp4, "mlp_forward", None)
+    if mlp_forward is None:
+        return None
+    for name in ("forward", "_original_forward"):
+        bound = mlp_module.__dict__.get(name)
+        func = getattr(bound, "__func__", bound)
+        if func is mlp_forward:
+            return func
+    return None
+
+
 def patch_mlp(mlp_module, target_arctic = True, target_gb = None, padded_length = 128):
     preserve_rng_state = False
     for n, m in mlp_module.named_modules():
@@ -228,9 +248,10 @@ def patch_mlp(mlp_module, target_arctic = True, target_gb = None, padded_length 
             break
 
     # unbound
-    mlp_module._original_forward = mlp_module.__class__.forward
+    forward = _mxfp4_instance_forward(mlp_module) or mlp_module.__class__.forward
+    mlp_module._original_forward = forward
     # second is what llama style patch uses
-    mlp_module._unsloth_forward = mlp_module.__class__.forward
+    mlp_module._unsloth_forward = forward
 
 
     def tiled_forward_target_gb(self, x):

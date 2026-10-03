@@ -31,6 +31,10 @@ import tempfile
 import pytest
 
 pytest.importorskip("mlx.core")
+from mlx_simulation import mlx_is_simulated
+
+if mlx_is_simulated():
+    pytest.skip("Requires native MLX", allow_module_level = True)
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -185,3 +189,46 @@ def test_push_to_hub_merged_does_not_quantize():
     assert quantization is None, (
         f"push_to_hub_merged's save path quantized unexpectedly: {quantization}"
     )
+
+
+@pytest.mark.parametrize("config_on", ["_config", "config"])
+def test_merged_16bit_unpacks_hadamard_layers_to_the_dense_layers_they_compute(tmp_path, config_on):
+    pack = pytest.importorskip("mlx_vlm.models.prism_hadamard_qwen35.prism_hadamard_qwen35")
+    from unsloth_zoo.mlx.utils import LoRAHadamardLinear, save_merged_model
+    mx.random.seed(5)
+
+    def packed(cls, rows):
+        layer = cls(1024, rows, 512)
+        layer.signs = mx.where(mx.random.uniform(shape=(1024,)) < 0.5, -1.0, 1.0)
+        rotated = pack.hadamard_transform(mx.random.normal((rows, 1024)) * 0.05, 512, layer.signs)
+        layer.weight, scales, biases = mx.quantize(rotated, group_size=128, bits=2)
+        layer.scales, layer.biases = scales.astype(mx.float16), biases.astype(mx.float16)
+        return layer
+
+    model = nn.Module()
+    model.proj = packed(pack.HadamardQuantizedLinear, 256)
+    model.embed = packed(pack.HadamardQuantizedEmbedding, 300)
+    adapted = LoRAHadamardLinear.from_base(packed(pack.HadamardQuantizedLinear, 128), r=4, scale=2.0)
+    adapted.lora_b = mx.random.normal(adapted.lora_b.shape) * 0.05
+    model.adapted = adapted
+    x, ids = mx.random.normal((3, 1024)), mx.array([0, 17, 299])
+    forward = lambda: [model.proj(x), model.embed(ids), model.embed.as_linear(x), model.adapted(x)]
+    want = forward()
+    with pytest.raises(ValueError, match="merged_16bit"):
+        adapted.fuse(dequantize=False)
+    config = {"model_type": "prism_hadamard_qwen35", "base_model_type": "qwen3_5", "modules": [],
+              "quantization": {"bits": 2, "group_size": 128, "mode": "affine"},
+              "text_config": {"hidden_size": 1024}, "image_token_id": 7}
+    if config_on == "_config":
+        model._config = config
+    else:  # mlx_vlm.load exposes it on `model.config` only
+        model.config = type("Config", (), {"to_dict": lambda self: dict(config)})()
+    save_merged_model(model, type("Tokenizer", (), {"save_pretrained": lambda self, path: None})(),
+                      tmp_path, dequantize=True)
+    assert json.loads((tmp_path / "config.json").read_text()) == {
+        "model_type": "qwen3_5", "architectures": ["Qwen3_5ForConditionalGeneration"],
+        "text_config": {"hidden_size": 1024}, "image_token_id": 7}
+    assert [type(m) for m in (model.proj, model.embed, model.adapted)] == [nn.Linear, nn.Embedding, nn.Linear]
+    for expected, actual in zip(want, forward()):
+        expected, actual = expected.astype(mx.float32), actual.astype(mx.float32)
+        assert (mx.abs(actual - expected).max() / mx.abs(expected).max()).item() < 2e-3

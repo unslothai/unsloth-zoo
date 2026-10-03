@@ -24,6 +24,7 @@ class _FakeTokenizer:
     _vocab = {
         "<image>": 200,
         "<|image_pad|>": 201,
+        "<|media_pad|>": 163592,
     }
 
     def convert_tokens_to_ids(self, tokens):
@@ -204,6 +205,7 @@ def test_vlm_collate_creates_sft_labels_and_masks_special_tokens():
         [101, 10, -100, 11, -100],
         [101, 12, 13, -100, -100],
     ]
+    assert set(_get_vlm_ignore_token_ids(processor=type("_Kimi", (_FakeProcessor,), {"image_token": "<|media_pad|>"})())) == {200, 201, 163592}
 
 
 def test_vlm_response_mask_reapplies_special_token_masks():
@@ -1246,6 +1248,45 @@ def test_the_check_leaves_no_state_behind_for_the_first_training_batch():
     assert model.language_model.weight is weight
 
 
+def _loaded_wrapper(**flags):
+    from unsloth_zoo.mlx.loader import _finish_load
+
+    model = nn.Module()
+    model.language_model = nn.Module()
+    model.language_model.embed = nn.Linear(2, 2)
+    model.vision_tower = nn.Linear(2, 2)
+    model.audio_tower = _AudioAttention()
+    model.embed_audio = nn.Module()
+    model.embed_audio.proj = nn.Linear(2, 2)
+    model.embed_audio.tied = model.language_model.embed
+    model.image_newline = mx.zeros((2,))
+    for name, value in flags.items():
+        setattr(model, name, value)
+    _finish_load(model, None)
+    return model
+
+
+def _ids(tree):
+    from mlx.utils import tree_flatten
+
+    return {id(value) for _, value in tree_flatten(tree)}
+
+
+def test_a_text_only_full_finetune_trains_only_the_language_model():
+    model = _loaded_wrapper(_unsloth_full_finetuning=True, _unsloth_text_only_vlm=True)
+    assert _ids(model.trainable_parameters()) == _ids(model.language_model.parameters())
+    assert len(_ids(model.language_model.trainable_parameters())) == 2
+
+
+@pytest.mark.parametrize("flags", [
+    {"_unsloth_full_finetuning": False, "_unsloth_text_only_vlm": True},
+    {"_unsloth_full_finetuning": True, "_unsloth_text_only_vlm": False},
+])
+def test_other_loads_keep_every_parameter_trainable(flags):
+    model = _loaded_wrapper(**flags)
+    assert _ids(model.trainable_parameters()) == _ids(model.parameters())
+
+
 @pytest.mark.parametrize("model_type", ["lfm2-vl", "lille-130m", "nemotron-nas"])
 def test_a_hyphenated_model_type_keeps_its_hyphens(model_type):
     """mlx_lm names these modules after the raw config spelling.
@@ -2279,6 +2320,44 @@ def test_the_baseline_loss_backend_restores_the_gemma3n_embed_scale(
         "the rescaled embeddings went through Model.__call__, which drops them "
         "on every mlx-vlm up to the declared floor"
     )
+
+
+@pytest.mark.parametrize("model_type,forwarded", [
+    ("gemma4", True), ("gemma4_unified", False),
+])
+def test_cce_forwards_mm_token_types_where_the_model_does(model_type, forwarded):
+    """CCE loss passes `mm_token_type_ids` only where `Model.__call__` does."""
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx.utils import _vlm_cce_forward
+
+    mx_ = _utils_mx()
+    seen = {}
+
+    class _Backbone:
+        config = SimpleNamespace(model_type=f"{model_type}_text")
+
+        def __call__(self, inputs=None, inputs_embeds=None, mask=None, cache=None,
+                     mm_token_type_ids=None, token_type_ids=None):
+            seen["ids"] = mm_token_type_ids
+            return inputs_embeds
+
+    class _Model:
+        language_model = SimpleNamespace(model=_Backbone())
+        config = SimpleNamespace(model_type=model_type)
+
+        def get_input_embeddings(self, inputs, pixel_values=None, **_kwargs):
+            return SimpleNamespace(
+                inputs_embeds=mx_.zeros((*inputs.shape, 4), dtype=mx_.float32))
+
+    ids = mx_.array([[5, 6, 7, 8], [5, 6, 7, 8]], dtype=mx_.int32)
+    types = mx_.array([[0, 1, 1, 0], [0, 0, 1, 1]], dtype=mx_.int32)
+    _vlm_cce_forward(_Model(), {
+        "input_ids": ids, "attention_mask": mx_.ones_like(ids), "mm_token_type_ids": types,
+    })
+    if forwarded:
+        assert seen["ids"] is not None and seen["ids"].tolist() == types.tolist()
+    else:
+        assert seen["ids"] is None
 
 
 # --- paligemma: a prefix-LM mask, not a padding outer product ---------------
@@ -4227,6 +4306,36 @@ def test_a_module_shared_by_two_owners_is_frozen_once():
     assert shared.frozen
 
 
+class _RelativePosition(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+
+class _AudioAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.relative_k_proj = nn.Linear(2, 2)
+        # As mlx-vlm's Gemma 4 audio attention builds it: no Module.__init__.
+        self._rel_pos = _RelativePosition.__new__(_RelativePosition)
+        self._rel_pos.pos_proj = self.relative_k_proj
+
+
+def test_a_loaded_model_freezes_modules_built_without_init():
+    from mlx.utils import tree_flatten
+    from unsloth_zoo.mlx.loader import _finish_load
+    from unsloth_zoo.mlx.utils import freeze_audio_modules
+
+    model = nn.Module()
+    model.language_model = nn.Linear(2, 2)
+    model.audio_tower = _AudioAttention()
+    _finish_load(model, None)
+
+    assert freeze_audio_modules(model) == ["audio_tower"]
+    assert {name for name, _ in tree_flatten(model.trainable_parameters())} == {
+        "language_model.weight", "language_model.bias",
+    }
+
+
 def test_nemotron_floor_clears_the_unconditional_sound_conv_sanitize():
     """Below 0.6.10, `sanitize_audio_weights` double-transposes a pre-converted
     sound conv ((128,3,3,1) -> (128,3,1,3)) and the checkpoint cannot load."""
@@ -5860,3 +5969,44 @@ def test_a_hugging_face_snapshot_symlink_is_still_followed(tmp_path):
 
     _save_vlm_processor_assets(_P(), out, (str(snapshot),))
     assert (out / "config.json").read_text() == '{"model_type": "real"}'
+
+
+@pytest.mark.parametrize("legacy_render", [None, "transformed history"])
+def test_typed_role_fallback_preserves_existing_render(monkeypatch, legacy_render):
+    import unsloth_zoo.mlx.utils as utils
+
+    class Processor:
+        image_token = "<image>"
+        chat_template = "typed"
+        def apply_chat_template(self, messages, **kwargs):
+            import jinja2
+            if isinstance(messages[0].get("content"), str) and legacy_render:
+                return legacy_render
+            template = "{% for m in messages %}{{ m.role }}:{% for p in m.content %}{% if p.type == 'text' %}{{ p.text }}{% elif p.type == 'image' %}{{ image_prompt_token }}{% endif %}{% endfor %};{% endfor %}"
+            return jinja2.Environment(undefined=jinja2.StrictUndefined).from_string(template).render(messages=messages)
+
+    monkeypatch.setattr(utils, "_vlm_token_messages", lambda p, ms: utils._flatten_vlm_content_for_text_template(ms, "<image>"))
+    messages = [
+        {"role":"user", "content":[{"type":"text", "text":"first"}]},
+        {"role":"assistant", "content":[{"type":"text", "text":"second"}]},
+        {"role":"user", "content":[{"type":"image"}, {"type":"text", "text":"third"}]},
+    ]
+    assert utils._render_vlm_messages(Processor(), messages) == (legacy_render or "user:first;assistant:second;user:<image>third;")
+
+
+@pytest.mark.parametrize("remote", [False, True])
+@pytest.mark.parametrize("template", ["source template", {"tool_use": "tool template", "default": "source template"}])
+def test_missing_processor_template_recovers_legacy_json(tmp_path, remote, template):
+    import json
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx.utils import normalize_vlm_processor_chat_template
+
+    (tmp_path / "chat_template.json").write_text(json.dumps({"chat_template": template}))
+    tokenizer = SimpleNamespace(chat_template=None)
+    processor = SimpleNamespace(tokenizer=tokenizer, chat_template=None)
+    kwargs = {"model_name": "org/model", "model_path": str(tmp_path)} if remote else {"model_name": str(tmp_path)}
+    normalize_vlm_processor_chat_template(processor, **kwargs)
+    assert processor.chat_template == tokenizer.chat_template == "source template"
+    processor.chat_template = "existing template"
+    normalize_vlm_processor_chat_template(processor, model_name=str(tmp_path))
+    assert processor.chat_template == "existing template"

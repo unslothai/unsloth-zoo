@@ -107,14 +107,7 @@ jobs:
         # silently remove the very check that is supposed to tell us whether the
         # next release is safe to adopt.
         #
-        # mlx-vlm is upgraded past its `<=0.7.1` ceiling too. The ceiling exists
-        # because the current mlx-vlm wants transformers>=5.14.0 against the
-        # darwin + arm64 half of this repo's transformers cap, which stays at
-        # <=5.5.0 for exactly that reason while the other half is now <=5.17.0.
-        # Leaving it out would mean the one lane that could ever justify lifting
-        # the MLX half never tests the version it would be lifted to. Letting
-        # transformers move with it is the point of this leg, and is why it does
-        # not gate.
+        # Also past mlx-vlm's <=0.7.4 ceiling (and transformers with it): non-gating.
         if: matrix.mlx == 'latest'
         run: |
           pip install --upgrade mlx mlx-lm mlx-vlm
@@ -276,3 +269,7 @@ jobs:
         # model, plus the paths that must not change (already-quantized base,
         # merged_16bit, push_to_hub_merged).
         run: python -m pytest tests/test_mlx_quantized_merge_save_metal.py -v -rs
+
+      - name: tests/test_mlx_decision_metal.py
+        # Typed-decision model logits against a torch reference of laya's DecisionModel.
+        run: python -m pytest tests/test_mlx_decision_metal.py -v -rs

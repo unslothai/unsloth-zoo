@@ -22,19 +22,14 @@ consolidated-tests-ci.yml that fails the build when pyproject moves past it. The
 was one line plus three workflow `pip install` mirrors. A site left behind after the window
 moves does not go red: the lane runs, passes, and measures a range users no longer get.
 
-The transformers cap is now marker-split, and the two halves are different decisions:
+The transformers ceiling is the newest release the version matrix was run against. Off
+darwin that is a CUDA question (unsloth #9867 / #10010 / #10017 / #10276, #5355); on
+darwin + arm64 it is also an MLX one, because mlx-vlm 0.6.5 and up require transformers
+>= 5.14.0, so the cap decides which mlx-vlm the joint resolution lands on.
 
-* off darwin it is the newest release the version matrix was run against. 5.5.0 held it
-  until the sweep behind unsloth #9867 / #10010 / #10017 / #10276 (prequantized bnb-4bit
-  checkpoints losing `quant_state` on every `Linear4bit`) and #5355, whose Gemma 4 E4B LoRA
-  fix shipped in transformers 5.5.2, one patch release above the old cap.
-* on darwin + arm64 it stays at 5.5.0, because there it is what holds the joint MLX
-  resolution at mlx-vlm 0.6.4. mlx-vlm 0.6.5 and up require transformers >= 5.14.0,
-  tests/mlx_simulation models the 0.6.4 surface, and mlx / mlx-lm are pinned exactly. A
-  CUDA-motivated bump must not make that decision for the Apple Silicon lane.
-
-So the assertions are that the split exists, that each half is where it is supposed to be,
-that the exclusions survived the rewrite, and that nothing mirroring either cap drifted.
+So the assertions are that each platform gets one line, that its ceiling is where it is
+supposed to be, that the exclusions survived the rewrite, and that nothing mirroring the
+cap drifted.
 Reads files only: no network, no torch, no transformers install.
 """
 
@@ -57,17 +52,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
 
-# Newest transformers the version matrix was run against off darwin.
+# Newest transformers the version matrix was run against.
 TESTED_CEILING = Version("5.17.0")
-# What the MLX stack holds, and why: the first mlx-vlm that wants more.
-MLX_CEILING = Version("5.5.0")
-MLX_VLM_0_6_5_TRANSFORMERS_FLOOR = Version("5.14.0")
 
 # Newest torch the matrix was run against, and the exclusive bound that admits it.
 TESTED_TORCH = Version("2.14.0")
 TORCH_BOUND = "<2.15.0"
 
-# The transformers floor both halves must declare. peft declares no transformers floor of
+# The transformers floor every transformers line must declare. peft declares no transformers floor of
 # its own, and peft 0.18.0 imports `GradientCheckpointingLayer` from
 # `transformers.modeling_layers` at peft/tuners/lora/model.py:26, which first exists in
 # 4.52.0; at 4.51.3 `import unsloth_zoo.saving_utils` raised ModuleNotFoundError after a
@@ -185,7 +177,7 @@ def _transformers_lists() -> dict[str, list[Requirement]]:
     }
 
 
-def test_every_list_that_names_transformers_carries_both_halves() -> None:
+def test_every_list_that_names_transformers_applies_one_line_per_platform() -> None:
     lists = _transformers_lists()
     assert lists, "pyproject.toml declares no transformers requirement at all"
     for where, reqs in lists.items():
@@ -193,54 +185,27 @@ def test_every_list_that_names_transformers_carries_both_halves() -> None:
         apple = _live(reqs, DARWIN_ARM)
         assert len(general) == 1, f"{where}: {len(general)} transformers lines apply off darwin"
         assert len(apple) == 1, f"{where}: {len(apple)} transformers lines apply on darwin + arm64"
-        assert general[0].specifier != apple[0].specifier, (
-            f"{where}: darwin + arm64 and everything else resolve the same transformers "
-            f"window ({general[0].specifier}), so the marker split is doing nothing. Either "
-            f"drop it or restore the lower Apple Silicon cap."
-        )
 
 
-def test_the_two_halves_are_where_they_are_supposed_to_be() -> None:
+def test_each_platform_caps_transformers_at_the_tested_ceiling() -> None:
     for where, reqs in _transformers_lists().items():
-        general_spec = _live(reqs, LINUX_X86)[0].specifier
-        apple_spec = _live(reqs, DARWIN_ARM)[0].specifier
-        general = _ceiling(general_spec)
-        apple = _ceiling(apple_spec)
-        # Admission as well as the ceiling number, because a second upper bound, or an
-        # exclusion naming the tested release, can shut it out while the ceiling still
-        # reads right.
-        assert TESTED_CEILING in general_spec, (
-            f"{where} declares {general_spec} off darwin, which does not admit the "
-            f"{TESTED_CEILING} the matrix was run against."
-        )
-        assert MLX_CEILING in apple_spec, (
-            f"{where} declares {apple_spec} on darwin + arm64, which does not admit the "
-            f"{MLX_CEILING} the MLX stack holds."
-        )
-        assert general == TESTED_CEILING, (
-            f"{where} caps transformers at {general} off darwin; the matrix was run "
-            f"against {TESTED_CEILING}. Moving the cap means running the sweep first and "
-            f"moving TESTED_CEILING here in the same commit."
-        )
-        assert apple == MLX_CEILING, (
-            f"{where} caps transformers at {apple} on darwin + arm64, not the "
-            f"{MLX_CEILING} the MLX stack holds. See the comment on the mlx-vlm pin."
-        )
+        for platform, environment in (("off darwin", LINUX_X86), ("on darwin + arm64", DARWIN_ARM)):
+            spec = _live(reqs, environment)[0].specifier
+            # Admission as well as the ceiling number, because a second upper bound, or an
+            # exclusion naming the tested release, can shut it out while the ceiling still
+            # reads right.
+            assert TESTED_CEILING in spec, (
+                f"{where} declares {spec} {platform}, which does not admit the "
+                f"{TESTED_CEILING} the matrix was run against."
+            )
+            assert _ceiling(spec) == TESTED_CEILING, (
+                f"{where} caps transformers at {_ceiling(spec)} {platform}; the matrix was "
+                f"run against {TESTED_CEILING}. Moving the cap means running the sweep first "
+                f"and moving TESTED_CEILING here in the same commit."
+            )
 
 
-def test_the_apple_cap_is_what_holds_mlx_vlm_at_0_6_4() -> None:
-    """The reason the Apple half is lower, asserted rather than only written down."""
-    for where, reqs in _transformers_lists().items():
-        apple = _ceiling(_live(reqs, DARWIN_ARM)[0].specifier)
-        assert apple < MLX_VLM_0_6_5_TRANSFORMERS_FLOOR, (
-            f"{where}: the darwin + arm64 cap ({apple}) now admits the "
-            f"transformers >= {MLX_VLM_0_6_5_TRANSFORMERS_FLOOR} that mlx-vlm 0.6.5 and up "
-            f"require, so the joint MLX resolution is free to leave 0.6.4 and "
-            f"tests/mlx_simulation stops modelling what gets installed."
-        )
-
-
-def test_both_halves_keep_every_rejected_release_rejected() -> None:
+def test_every_transformers_line_keeps_every_rejected_release_rejected() -> None:
     for where, reqs in _transformers_lists().items():
         for req in reqs:
             readmitted = [v for v in REJECTED if v in req.specifier]
@@ -250,8 +215,9 @@ def test_both_halves_keep_every_rejected_release_rejected() -> None:
             )
 
 
-def test_the_two_halves_differ_only_in_their_ceiling() -> None:
-    """Otherwise one half quietly grows an exclusion or a floor the other does not have."""
+def test_the_transformers_lines_differ_only_in_their_ceiling() -> None:
+    """If the cap is marker-split again, one line must not quietly grow an exclusion or a
+    floor the other does not have."""
     for where, reqs in _transformers_lists().items():
         shapes = set()
         for req in reqs:
@@ -353,15 +319,12 @@ def test_no_workflow_mirror_of_the_torch_bound_drifted() -> None:
 
 
 def _gate_constants() -> dict[str, Version]:
-    """The two policy literals in the MLX job's inline gate."""
+    """The policy literal in the MLX job's inline gate."""
     found = {}
     for name, run in _workflow_runs():
-        if "MLX_CEILING" not in run:
-            continue
-        for key in ("CEILING", "MLX_CEILING"):
-            match = re.search(rf"^\s*{key} = Version\(\"([^\"]+)\"\)", run, re.MULTILINE)
-            if match:
-                found[key] = Version(match.group(1))
+        match = re.search(r"^\s*CEILING = Version\(\"([^\"]+)\"\)", run, re.MULTILINE)
+        if match:
+            found[name] = Version(match.group(1))
     return found
 
 
@@ -370,17 +333,13 @@ def test_the_ci_policy_gate_agrees_with_pyproject() -> None:
     the gate's literal. That is deliberate, and it means the two have to move together or
     the MLX job reds on every commit."""
     constants = _gate_constants()
-    assert set(constants) == {"CEILING", "MLX_CEILING"}, (
-        f"the inline policy gate no longer declares both ceilings (found {sorted(constants)}); "
+    assert set(constants) == {"consolidated-tests-ci.yml"}, (
+        f"the inline policy gate is not where this test expects it (found {sorted(constants)}); "
         f"retarget this test or restore the gate"
     )
-    assert constants["CEILING"] == TESTED_CEILING, (
-        f"the CI gate holds transformers at {constants['CEILING']} while this test and "
-        f"pyproject say {TESTED_CEILING}; the MLX job would red on every commit"
-    )
-    assert constants["MLX_CEILING"] == MLX_CEILING, (
-        f"the CI gate holds the Apple Silicon cap at {constants['MLX_CEILING']} while "
-        f"pyproject says {MLX_CEILING}"
+    assert constants["consolidated-tests-ci.yml"] == TESTED_CEILING, (
+        f"the CI gate holds transformers at {constants['consolidated-tests-ci.yml']} while "
+        f"this test and pyproject say {TESTED_CEILING}; the MLX job would red on every commit"
     )
 
 
@@ -486,19 +445,33 @@ def test_the_sentinel_resolver_runs_on_a_python_that_has_tomllib() -> None:
             )
 
 
-@requires_tomllib
-def test_the_ci_sentinel_resolves_to_the_off_darwin_half(tmp_path) -> None:
-    """The core-drift lane is Linux, so it has to install the Linux half of the cap.
+def _with_second_transformers_line(text: str, marker: str) -> str:
+    """pyproject text with an extra transformers line, capped lower, under `marker`."""
+    line = re.search(r'^(\s*)"(transformers[^"]*)",$', text, re.MULTILINE)
+    assert line, "the transformers requirement is not spelled the way this test assumed"
+    indent, spec = line.groups()
+    second = spec.split(";", 1)[0].strip().replace(f"<={TESTED_CEILING}", "<=5.5.0")
+    assert second != spec, "the transformers requirement does not carry the tested ceiling"
+    return text.replace(line.group(0), f'{line.group(0)}\n{indent}"{second} ; {marker}",', 1)
 
-    Before the split there was one transformers line and any of them was the right one.
-    With two, a resolver that takes whichever comes first in the file installs the 5.5.0
-    Apple Silicon cap on a Linux runner and the lane silently measures the wrong range,
-    which is the exact failure this whole file exists to prevent. Nothing else in the repo
-    executes this step, so it is executed here.
+
+@requires_tomllib
+@pytest.mark.parametrize("darwin_only_line", [False, True])
+def test_the_ci_sentinel_resolves_to_the_off_darwin_line(tmp_path, darwin_only_line) -> None:
+    """The core-drift lane is Linux, so it has to install the Linux line of the cap.
+
+    If the cap is marker-split again, a resolver that takes whichever line comes first in
+    the file installs the Apple Silicon cap on a Linux runner and the lane silently measures
+    the wrong range, which is the exact failure this whole file exists to prevent. Nothing
+    else in the repo executes this step, so it is executed here, on pyproject as it is and
+    with a darwin-only line added.
     """
-    transformers_spec, trl_spec, peft_spec = _resolve_sentinel(
-        PYPROJECT.read_text(encoding = "utf-8"), tmp_path
-    )
+    text = PYPROJECT.read_text(encoding = "utf-8")
+    if darwin_only_line:
+        text = _with_second_transformers_line(
+            text, "sys_platform == 'darwin' and platform_machine == 'arm64'"
+        )
+    transformers_spec, trl_spec, peft_spec = _resolve_sentinel(text, tmp_path)
     assert Requirement(transformers_spec).name.lower() == "transformers"
     assert ";" not in transformers_spec, (
         f"the resolver left an environment marker on {transformers_spec!r}; pip install "
@@ -511,8 +484,8 @@ def test_the_ci_sentinel_resolves_to_the_off_darwin_half(tmp_path) -> None:
     )
     assert ceiling == TESTED_CEILING, (
         f"the Linux core-drift lane would install transformers {transformers_spec!r}, whose "
-        f"ceiling is {ceiling}, not the {TESTED_CEILING} that half of the cap declares. A "
-        f"lane pinned to the Apple Silicon half tests a range Linux users do not get."
+        f"ceiling is {ceiling}, not the {TESTED_CEILING} the Linux line declares. A lane "
+        f"pinned to an Apple Silicon line tests a range Linux users do not get."
     )
     for spec, name in ((trl_spec, "trl"), (peft_spec, "peft")):
         assert Requirement(spec).name.lower() == name
@@ -523,15 +496,12 @@ def test_the_ci_sentinel_resolves_to_the_off_darwin_half(tmp_path) -> None:
 def test_the_ci_sentinel_refuses_two_different_off_darwin_specs(tmp_path) -> None:
     """Negative control, so the test above cannot pass by the resolver doing nothing.
 
-    Widening the Apple Silicon half to a DIFFERENT off-darwin ceiling leaves the lane with
-    two candidates and no rule for choosing, and it has to say so rather than pick one.
+    A second off-darwin transformers line with a DIFFERENT ceiling leaves the lane with two
+    candidates and no rule for choosing, and it has to say so rather than pick one.
     """
-    text = PYPROJECT.read_text(encoding = "utf-8")
-    widened = text.replace(
-        "sys_platform == 'darwin' and platform_machine == 'arm64'",
-        "sys_platform != 'darwin' or platform_machine != 'arm64'",
+    widened = _with_second_transformers_line(
+        PYPROJECT.read_text(encoding = "utf-8"), "sys_platform != 'darwin'"
     )
-    assert widened != text, "the marker split is not spelled the way this test assumed"
     with pytest.raises(AssertionError) as raised:
         _resolve_sentinel(widened, tmp_path)
     assert "different off-darwin specs" in str(raised.value), str(raised.value)
@@ -610,15 +580,15 @@ def test_a_widened_torch_bound_is_rejected_even_though_it_admits_the_tested_rele
     assert Version("2.15.0") not in SpecifierSet("<2.15.0")
 
 
-def test_both_halves_declare_the_floor_that_peft_needs() -> None:
+def test_every_transformers_line_declares_the_floor_that_peft_needs() -> None:
     """The ceiling is pinned by several assertions above; the floor was pinned by none.
 
     That asymmetry is not hypothetical. This branch was cut before the floor moved and
     carried `>=4.51.3` onto a main that had already gone to 4.52.4, so the marker split
     would have shipped a REGRESSION of the floor while every ceiling assertion stayed
-    green. `test_the_two_halves_differ_only_in_their_ceiling` does not catch it either: it
-    only requires the two halves to agree with EACH OTHER, and a stale floor is equally
-    stale on both.
+    green. `test_the_transformers_lines_differ_only_in_their_ceiling` does not catch it
+    either: it only requires the lines to agree with EACH OTHER, and a stale floor is
+    equally stale on all of them.
     """
     lists = _transformers_lists()
     assert lists, "no requirement list names transformers"
@@ -638,3 +608,105 @@ def test_both_halves_declare_the_floor_that_peft_needs() -> None:
         f"peft 0.18.0 needs: {wrong}. A floor below 4.52.0 resolves cleanly and then "
         f"fails at import with ModuleNotFoundError: transformers.modeling_layers."
     )
+
+
+# unsloth's patch_datasets raises at import on 4.4.0 <= v <= 4.5.0.
+UNSLOTH_REFUSED_DATASETS = ("4.4.0", "4.4.1", "4.4.2", "4.5.0")
+
+
+def _datasets_lists() -> dict[str, list[Requirement]]:
+    return {
+        where: reqs
+        for where, raws in _requirement_lists().items()
+        if (reqs := _named(raws, "datasets"))
+    }
+
+
+def _refused_admitted_by(specifier: SpecifierSet) -> list[str]:
+    return [r for r in UNSLOTH_REFUSED_DATASETS if r in specifier]
+
+
+# Named, not discovered: a list that drops datasets vanishes from _datasets_lists.
+DATASETS_LOCATIONS = ("dependencies", "optional-dependencies.core")
+
+
+def test_every_list_declares_the_same_datasets_window() -> None:
+    lists = _datasets_lists()
+    missing = [where for where in DATASETS_LOCATIONS if where not in lists]
+    assert not missing, (
+        f"{missing} no longer declares datasets, so pip would take the window from the other "
+        f"list alone. Removing it on purpose means removing it from DATASETS_LOCATIONS too."
+    )
+    windows = {str(req.specifier) for reqs in lists.values() for req in reqs}
+    assert len(windows) == 1, (
+        f"pyproject.toml declares {len(windows)} different datasets windows across its "
+        f"requirement lists: {sorted(windows)}"
+    )
+
+
+def test_the_datasets_window_excludes_what_unsloth_refuses_at_import() -> None:
+    lists = _datasets_lists()
+    assert lists, "pyproject.toml declares no datasets requirement at all"
+    admitted = sorted(
+        {
+            r
+            for reqs in lists.values()
+            for req in reqs
+            for r in _refused_admitted_by(req.specifier)
+        }
+    )
+    assert not admitted, (
+        f"the declared datasets window admits {admitted}, which unsloth's "
+        f"patch_datasets refuses at import, so pip can resolve a release that cannot run"
+    )
+
+
+def test_the_datasets_checker_rejects_the_window_that_would_ship_the_defect() -> None:
+    assert _refused_admitted_by(SpecifierSet(">=3.4.1,<5.0.0")) == list(
+        UNSLOTH_REFUSED_DATASETS
+    )
+    assert _refused_admitted_by(SpecifierSet(">=3.4.1,!=4.4.*,<5.0.0")) == ["4.5.0"]
+
+
+# Every trl 1.x declares datasets>=4.7.0 (PyPI metadata).
+TRL_1_DATASETS_FLOOR = Version("4.7.0")
+DATASETS_RELEASES = (
+    "4.3.0", "4.4.0", "4.4.1", "4.4.2", "4.5.0", "4.6.0", "4.6.1", "4.7.0", "4.8.0", "4.8.5",
+)
+
+
+def test_every_trl_ceiling_is_reachable_under_the_datasets_window() -> None:
+    """pip silently backtracks to trl 0.x rather than erroring on an unreachable ceiling."""
+    for where, raws in _requirement_lists().items():
+        datasets = _named(raws, "datasets")
+        for trl in _named(raws, "trl"):
+            if _ceiling(trl.specifier) < Version("1.0.0"):
+                continue
+            usable = [
+                v
+                for v in DATASETS_RELEASES
+                if Version(v) >= TRL_1_DATASETS_FLOOR
+                and all(v in d.specifier for d in datasets)
+            ]
+            assert usable, (
+                f"{where}: trl ceiling {_ceiling(trl.specifier)} needs datasets>="
+                f"{TRL_1_DATASETS_FLOOR}, which {[str(d.specifier) for d in datasets]} excludes"
+            )
+
+
+def test_the_linux_mlx_lane_mirrors_the_published_mlx_lm_pin() -> None:
+    """pyproject's mlx-lm pin is darwin + arm64 only, so the Linux MLX lane repeats it.
+    Without the mirror the lane resolved mlx-lm 0.32.0 (transformers>=5.7.0) once the
+    transformers cap lifted, and tested a stack no Apple Silicon install can reach."""
+    published = {
+        str(req.specifier)
+        for req in _live(_named(_requirement_lists()["dependencies"], "mlx-lm"), DARWIN_ARM)
+    }
+    assert len(published) == 1, published
+    lanes = [
+        str(Requirement(m).specifier)
+        for name, run in _workflow_runs()
+        if name == "consolidated-tests-ci.yml" and "venv-suites/bin/pip install -e" in run
+        for m in re.findall(r'"(mlx-lm[^"]*)"', run)
+    ]
+    assert lanes and set(lanes) == published, (lanes, published)

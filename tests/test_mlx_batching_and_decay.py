@@ -2531,3 +2531,227 @@ def test_vlm_plan_reports_an_image_file_rewritten_after_the_plan_was_built(tmp_p
     Image.fromarray(np.full((8, 8, 3), 99, dtype=np.uint8)).save(paths[2])
     with pytest.raises(ValueError, match="file backing a dataset image changed"):
         plan.materialize_all()
+
+
+def test_stream_grid_widens_vlm_batches_at_the_consumer_width_seam():
+    """VLM widens at the post-expansion width; unmaterializable targets are refused or bumped."""
+    _skip_if_mlx_core_was_replaced()
+    from unsloth_zoo.mlx.shape_guard import StreamShapeGrid
+    from unsloth_zoo.mlx.utils import _build_response_masked_vlm_batch
+
+    class _ExpandingProcessor(_ContentProcessor):
+        def __call__(self, text, **_kwargs):  # noqa: D401
+            width = 40 + 7 * max(int(item) for item in text)
+            rows = [[int(item), 200] + [2] * (width - 2) for item in text]
+            return {
+                "input_ids": np.array(rows, dtype=np.int32),
+                "attention_mask": np.array(
+                    [[1] * width for _ in rows], dtype=np.int32,
+                ),
+                "image_grid_thw": np.array([[1, 2, 2]] * len(text), np.int32),
+            }
+
+    grid = StreamShapeGrid()
+    config = {"model_type": "qwen3_5", "image_size": 16, "image_token_id": 200,
+              "video_token_id": 201, "vision_config": {"spatial_merge_size": 2}}
+    items = [{"text": "5"}]
+    plain = _build_response_masked_vlm_batch(
+        items, _ExpandingProcessor(), config, 8, 16,
+    )
+    guarded = _build_response_masked_vlm_batch(
+        items, _ExpandingProcessor(), config, 8, 16,
+        width_policy=grid.endpoint_for,
+    )
+
+    raw_width = int(plain["input_ids"].shape[1])
+    assert raw_width > 8
+    guarded_width = int(guarded["input_ids"].shape[1])
+    assert guarded_width == grid.endpoint_for(raw_width)
+    assert guarded["input_ids"][:, :raw_width].tolist() == plain["input_ids"].tolist()
+    assert guarded["attention_mask"][:, raw_width:].sum().item() == 0
+    assert int(guarded["position_ids"].shape[-1]) == guarded_width
+    assert (guarded["position_ids"][..., :raw_width].tolist()
+            == plain["position_ids"].tolist())
+
+    from unsloth_zoo.mlx.utils import _resolve_stream_vlm_target
+
+    class _NoPadTokenizer(_TinyTokenizer):
+        pad_token_id = None
+
+    class _NoPadProcessor(_ExpandingProcessor):
+        tokenizer = _NoPadTokenizer()
+
+    assert _resolve_stream_vlm_target(
+        plain, config, _NoPadProcessor(), grid.endpoint_for,
+    ) is None
+    bumped = dict(plain)
+    bumped["media_extent"] = mx.zeros((1, guarded_width), dtype=mx.int32)
+    target = _resolve_stream_vlm_target(
+        bumped, config, _ExpandingProcessor(), grid.endpoint_for,
+    )
+    assert target is not None and target > guarded_width
+
+
+@pytest.mark.parametrize("arch", ["kimi_vl", "moondream2"])
+def test_a_family_qualified_without_a_patch_still_has_to_clear_the_gate(arch):
+    """No compile patch needed: qualification alone decides."""
+    _skip_if_mlx_core_was_replaced()
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.compile import (
+        _VERIFIED_TRAINING_ARCHES,
+        MLXVLMCompilePolicy,
+        build_compile_trait_reports,
+        get_compile_trait_report,
+        resolve_training_compile,
+    )
+
+    pytest.importorskip(f"mlx_vlm.models.{arch}.{arch}")
+
+    def decide(name):
+        model = type("Model", (), {"__module__": f"mlx_vlm.models.{name}.{name}"})()
+        model.config = SimpleNamespace(model_type=name)
+        return resolve_training_compile(
+            model, policy=MLXVLMCompilePolicy(mode="best_effort"),
+        )
+
+    assert get_compile_trait_report(arch).blocker_categories
+    decision = decide(arch)
+    assert decision.enabled, decision.reason
+    assert not decision.backend_qualifications
+
+    unqualified = sorted(
+        name for name, report in build_compile_trait_reports().items()
+        if report.blocker_categories and name not in _VERIFIED_TRAINING_ARCHES
+    )
+    if not unqualified:
+        pytest.skip("every architecture the scan blocks is training-qualified")
+    refused = decide(unqualified[0])
+    assert not refused.enabled
+    assert "blockers" in refused.reason
+
+
+@pytest.mark.parametrize("parent, decoder", [
+    ("gemma4", "gemma4_text"), ("qwen3_5", "qwen3_5_text"), ("qwen3_5_moe", "qwen3_5_moe_text"),
+])
+def test_nested_text_decoder_qualification_decides_its_parent(parent, decoder):
+    """An unqualified `text_config` decoder keeps a qualified parent eager."""
+    _skip_if_mlx_core_was_replaced()
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.compile import (
+        _VERIFIED_TRAINING_ARCHES,
+        MLXVLMCompilePolicy,
+        discover_architectures,
+        resolve_training_compile,
+    )
+
+    pytest.importorskip(f"mlx_vlm.models.{parent}.{parent}")
+
+    def parent_over(nested):
+        model = type("Model", (), {"__module__": f"mlx_vlm.models.{parent}.{parent}"})()
+        model.config = SimpleNamespace(
+            model_type=parent, text_config=SimpleNamespace(model_type=nested),
+        )
+        return model
+
+    policy = MLXVLMCompilePolicy(mode="best_effort")
+
+    decision = resolve_training_compile(parent_over(decoder), policy=policy)
+    assert decision.enabled, decision.reason
+    decoders = [decoder] if decoder in discover_architectures() else []
+    assert [q.arch for q in decision.backend_qualifications] == decoders
+    assert all(q.training_compile for q in decision.backend_qualifications)
+
+    unqualified = sorted(set(discover_architectures()) - _VERIFIED_TRAINING_ARCHES)
+    if not unqualified:
+        pytest.skip("every discovered architecture is training-qualified")
+    refused = resolve_training_compile(parent_over(unqualified[0]), policy=policy)
+    assert not refused.enabled
+    assert unqualified[0] in refused.reason
+
+
+def test_gemma4_loss_masks_follow_the_reference_without_a_host_read(monkeypatch):
+    """Reference overlays vision blocks on sliding layers only, within the window."""
+    _skip_if_mlx_core_was_replaced()
+    from functools import partial
+    from types import SimpleNamespace as NS
+
+    import unsloth_zoo.mlx.compile as mc
+    from unsloth_zoo.mlx.utils import _SharedKVSlot
+
+    language = pytest.importorskip("mlx_vlm.models.gemma4.language")
+    from mlx_vlm.models.cache import BatchKVCache, KVCache
+    text_model = language.Gemma4TextModel
+    if not hasattr(text_model, "_apply_blockwise_bidirectional_overlay"):
+        pytest.skip(reason="mlx-vlm < 0.6.1 has no vision overlay; the patch leaves it alone")
+    upstream = text_model._make_masks
+    monkeypatch.setattr(text_model, "_make_masks", upstream)
+    monkeypatch.setattr(mc, "_PATCHED_ARCHES", set())
+    monkeypatch.setattr(mc, "_PATCH_BINDINGS", set())
+    assert "gemma4_vision_masks_runtime" in {
+        name for bundle in mc._matching_pattern_bundles("gemma4")
+        for name in bundle.runtime_primitive_names}
+    mc._runtime_patch_primitive_installers()["gemma4_vision_masks_runtime"]()
+    patched = text_model._make_masks
+
+    def stack(bidirectional, training=True):
+        model = NS(config=NS(use_bidirectional_attention=bidirectional), window_size=2,
+                   training=training, layers=[NS(layer_type="sliding_attention"),
+                                              NS(layer_type="full_attention")])
+        for name in ("_apply_blockwise_bidirectional_overlay", "_block_sequence_ids_for_mask"):
+            setattr(model, name, partial(getattr(text_model, name), model))
+        return model
+
+    def arrays(masks):
+        return [m.tolist() if isinstance(m, mx.array) else m for m in masks]
+
+    def reference(types, window=2):
+        types = np.asarray(types)
+        vision = (types == 1) | (types == 2)
+        block = np.cumsum(vision & ~np.pad(vision, ((0, 0), (1, 0)))[:, :-1], axis=1) * vision
+        q, k = np.indices((types.shape[1],) * 2)
+        same = (block[:, :, None] == block[:, None, :]) & (block[:, :, None] > 0)
+        return (((k <= q) | same) & (abs(q - k) < window))[:, None].tolist()
+
+    h = mx.zeros((2, 6, 1))
+    ids = mx.array([[0, 1, 1, 1, 1, 0], [1, 1, 0, 2, 2, 0]])
+    text_only = mx.zeros((2, 6), dtype=mx.int32)
+    for loss_cache in ([None, None], [_SharedKVSlot(), None]):
+        for types in (ids, text_only):
+            want = [reference(types), "causal"]
+            for training in (True, False):
+                assert arrays(patched(stack("vision", training), h, loss_cache, types)) == want
+            traced = mx.compile(lambda h, t: patched(stack("vision"), h, loss_cache, t)[0])
+            assert traced(h, types).tolist() == want[0]
+    want = arrays(upstream(stack(None), h, [None, None], ids))
+    traced = mx.compile(lambda h, t: [
+        m for m in patched(stack(None), h, [None, None], t) if isinstance(m, mx.array)])
+    assert arrays(traced(h, ids)) == [m for m in want if not isinstance(m, str)]
+    prefix = KVCache()
+    prefix.update_and_fetch(mx.zeros((2, 1, 3, 1)), mx.zeros((2, 1, 3, 1)))
+    for held in ([KVCache(), None], [prefix, None], [BatchKVCache([1, 0]), None]):
+        assert arrays(patched(stack("vision"), h, held, ids)) == arrays(
+            upstream(stack("vision"), h, held, ids))
+
+
+def test_gemma4_mask_patch_leaves_pre_overlay_mlx_vlm_alone(monkeypatch):
+    """mlx-vlm < 0.6.1: two-argument `_make_masks`, no overlay; wrapping it broke every forward."""
+    from types import SimpleNamespace
+
+    import unsloth_zoo.mlx.compile as mc
+
+    class Gemma4TextModel:
+        def _make_masks(self, h, cache):
+            return ["upstream"] * len(cache)
+
+    upstream = Gemma4TextModel._make_masks
+    monkeypatch.setattr(mc, "_PATCHED_ARCHES", set())
+    monkeypatch.setattr(mc, "_PATCH_BINDINGS", set())
+    monkeypatch.setattr(
+        mc, "_try_import_module",
+        lambda name: SimpleNamespace(Gemma4TextModel=Gemma4TextModel),
+    )
+    mc._runtime_patch_primitive_installers()["gemma4_vision_masks_runtime"]()
+    assert Gemma4TextModel._make_masks is upstream
+    assert Gemma4TextModel()._make_masks(None, [None, None]) == ["upstream", "upstream"]

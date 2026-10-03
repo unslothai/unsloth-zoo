@@ -8,6 +8,26 @@ try:
 except Exception:  # module-level nn.Module subclasses below need mlx to exist
     pytest.skip("requires mlx", allow_module_level=True)
 metal_only = pytest.mark.skipif(not _METAL, reason="requires Apple Silicon Metal")
+# Importable is not real: a sibling module installs the mlx simulation process-wide while it is
+# collected, so these can import mlx against the shim (see tests/test_mlx_attention_metal.py).
+from mlx_simulation import mlx_is_simulated  # noqa: E402
+
+_HAS_REAL_MLX = not mlx_is_simulated()
+real_mlx_only = pytest.mark.skipif(
+    not _HAS_REAL_MLX, reason="needs real mlx.nn; the simulation has no set_dtype or Sequential"
+)
+
+
+def _nax_available():
+    if not _METAL:
+        return False
+    from unsloth_zoo.mlx import nax
+    return nax.nax_available()
+
+
+# The NAX kernels need MetalPerformancePrimitives tensor ops: macOS 15 cannot build them and
+# paravirtual or pre-M5 GPUs cannot load them, so they run only where the product would route.
+nax_only = pytest.mark.skipif(not _nax_available(), reason="requires an Apple GPU with neural accelerators")
 MODEL = "mlx-community/SmolLM-135M-Instruct-4bit"
 VLM_MODEL = "mlx-community/FastVLM-0.5B-bf16"
 
@@ -233,8 +253,9 @@ def test_vlm_batched_generation_is_ordered_and_aligned():
     tail = events[-1]
     body = events[:-1]
     assert results[0].token_ids == [int(event.token) for event in body]
+    # bf16 logprobs near 19 sit on a 0.125 grid; M1 + mlx-vlm 0.7.x lands one step apart.
     assert results[0].logprobs == pytest.approx(
-        [float(event.logprobs[event.token].item()) for event in body], abs=0.02)
+        [float(event.logprobs[event.token].item()) for event in body], abs=0.125)
     assert results[0].text == "".join(event.text for event in events)
     assert tail is not None
     assert results[0].finish_reason == ("stop" if len(body) < 4 else "length")
@@ -246,6 +267,281 @@ def test_vlm_batched_generation_is_ordered_and_aligned():
     # match too, not just ids.
     assert [item.text for item in chunked] == [item.text for item in results]
     assert all(r.text == "" or not r.text.startswith(results[0].text + results[1].text) for r in results)  # noqa: E501
+
+
+def _own_copy(value):
+    if isinstance(value, mx.array):
+        return value + 0
+    if isinstance(value, (list, tuple)):
+        items = [_own_copy(item) for item in value]
+        return type(value)(*items) if hasattr(value, "_fields") else type(value)(items)
+    if hasattr(value, "__dict__") and hasattr(type(value), "state"):
+        duplicate = type(value).__new__(type(value))
+        duplicate.__dict__.update({k: _own_copy(v) for k, v in vars(value).items()})
+        return duplicate
+    return value
+
+
+class _RowCacheState:
+    def __init__(self, cache, lengths=None):
+        self.cache, self.lengths, self.kept = cache, lengths, {}
+
+    def open(self, token_ids):
+        return self.cache, self.lengths or range(1, len(token_ids) + 1)
+
+    def checkpoint(self, token_count, cache):
+        self.kept[token_count] = _own_copy(cache)
+
+
+class _SharedPrefixState(_RowCacheState):
+    """Resumes the longest prefix any row banked into ``banked``, as a caller's store does."""
+
+    def __init__(self, banked, make_cache):
+        super().__init__(None)
+        self.banked, self.make_cache = banked, make_cache
+
+    def open(self, token_ids):
+        self.ids = tuple(token_ids)
+        hits = [ids for ids in self.banked if len(ids) < len(token_ids) and self.ids[:len(ids)] == ids]
+        best = max(hits, key=len, default=())
+        cache = _own_copy(self.banked[best]) if best else self.make_cache()
+        return cache, range(len(best) + 1, len(token_ids))
+
+    def checkpoint(self, token_count, cache):
+        super().checkpoint(token_count, cache)
+        self.banked[self.ids[:token_count]] = self.kept[token_count]
+
+
+@metal_only
+def test_vlm_stream_rows_resume_from_their_own_cache_bitwise():
+    from mlx_vlm import load
+    from mlx_vlm.models.cache import make_prompt_cache
+    from mlx_vlm.prompt_utils import apply_chat_template
+    import mlx_vlm
+    from mlx.utils import tree_flatten
+    from packaging.version import Version
+    from PIL import Image
+    from unsloth_zoo.mlx.generate import (
+        BatchRowRefused, BatchStream, GenerationDefaults, GenerationRequest,
+        row_prompt_cache_unavailable_reason,
+    )
+    model, processor = load(VLM_MODEL)
+    model._is_vlm_model = True
+    assert row_prompt_cache_unavailable_reason() is None
+    rules = " ".join(f"Rule {i}: answer tersely." for i in range(420))
+    prompt = apply_chat_template(processor, model.config, f"Name a colour. {rules}", num_images=0)
+    state = _RowCacheState
+    lm = model.language_model
+
+    def run(*requests):
+        defaults = GenerationDefaults(max_tokens=12, prefill_batch_size=1, completion_batch_size=4)
+        with BatchStream(model, processor, defaults=defaults) as stream:
+            rows = [stream.add(request) for request in requests]
+            results = {}
+            while len(results) < len(rows):
+                results.update((e.index, e.result) for e in stream.step() if e.result is not None)
+        return [results[row] for row in rows]
+
+    cold_state = state(make_prompt_cache(lm))
+    (cold,) = run(GenerationRequest(prompt=prompt, prompt_cache_state=cold_state))
+    length, kept = cold.prompt_token_count, cold_state.kept
+    # Checkpoints land only where a prefill chunk ends: the 2048 grid, and from mlx-vlm 0.7.0,
+    # which chunks a tail shorter than a step, the held-back last token.
+    held_back = [length - 1] if Version(mlx_vlm.__version__) >= Version("0.7.0") else []
+    assert sorted(kept) == [*range(2048, length - 1, 2048), *held_back]
+    # Alone, as the cold row decoded: batched decode depends on what decodes beside a row.
+    for prefix in sorted(kept):
+        warm_state = state(_own_copy(kept[prefix]))
+        (warm,) = run(GenerationRequest(prompt=prompt, prompt_cache_state=warm_state))
+        assert (warm.token_ids, warm.logprobs) == (cold.token_ids, cold.logprobs)
+        assert (warm.cached_token_count, warm.prompt_token_count) == (prefix, length)
+        assert sorted(warm_state.kept) == [n for n in sorted(kept) if n > prefix]
+    # Rows decoding together keep their own caches and checkpoint only the lengths they ask for.
+    fruit = apply_chat_template(processor, model.config, f"Name a fruit. {rules}", num_images=0)
+    run(GenerationRequest(prompt=fruit, prompt_cache_state=(alone := state(make_prompt_cache(lm), {2048}))))
+    first, second = state(_own_copy(kept[2048]), {4096}), state(make_prompt_cache(lm), {2048})
+    rows = run(GenerationRequest(prompt=prompt, prompt_cache_state=first),
+               GenerationRequest(prompt=fruit, prompt_cache_state=second))
+    assert [row.cached_token_count for row in rows] == [2048, 0]
+    assert (sorted(first.kept), sorted(second.kept)) == ([4096], [2048])
+    states = lambda cache: [v for _, v in tree_flatten([entry.state for entry in cache])]
+    for got, want in ((first.kept[4096], kept[4096]), (second.kept[2048], alone.kept[2048])):
+        assert all(mx.array_equal(a, b).item() for a, b in zip(states(got), states(want), strict=True))
+    ask = lambda question: apply_chat_template(processor, model.config, f"{rules} {question}", num_images=0)
+    short, long = ask("Name a colour."), ask("Name a fruit, then a vegetable.")
+    seed, make = {}, lambda: make_prompt_cache(lm)
+    (cold,) = run(GenerationRequest(prompt=long, prompt_cache_state=_SharedPrefixState(seed, make)))
+    # Both rows are added resuming 2048 tokens; the later one takes the 4096 the earlier banks.
+    banked = {ids: cache for ids, cache in seed.items() if len(ids) == 2048}
+    rows = run(*(GenerationRequest(prompt=p, prompt_cache_state=_SharedPrefixState(banked, make))
+                 for p in (long, short)))
+    assert [row.cached_token_count for row in rows] == [4096, 2048]
+    # Its prefill, which yields the first token, is the cold row's; decode depends on neighbours.
+    assert (rows[0].token_ids[0], rows[0].logprobs[0]) == (cold.token_ids[0], cold.logprobs[0])
+    # Rows merge by cache class and keep the receiving cache's window.
+    for cache in (None, make_prompt_cache(lm, max_kv_size=8192)):
+        other = None if cache is None else state(cache)
+        with pytest.raises(BatchRowRefused, match="laid out unlike"):
+            run(GenerationRequest(prompt=prompt, prompt_cache_state=state(make_prompt_cache(lm, max_kv_size=4096))),
+                GenerationRequest(prompt=prompt, prompt_cache_state=other))
+    # FastVLM expands its image placeholder, so its ids cannot name cache offsets.
+    image = Image.new("RGB", (64, 64), (200, 40, 40))
+    pictured = apply_chat_template(processor, model.config, f"Describe it. {rules}", num_images=1)
+    cold_state = state(make_prompt_cache(lm))
+    run(GenerationRequest(prompt=pictured, image=image, prompt_cache_state=cold_state))
+    assert cold_state.kept == {}
+    with pytest.raises(BatchRowRefused, match="expands past"):
+        run(GenerationRequest(prompt=pictured, image=image, prompt_cache_state=state(_own_copy(kept[2048]))))
+
+
+@metal_only
+def test_vlm_stream_rows_resume_from_their_own_quantized_cache_bitwise(monkeypatch):
+    from mlx_vlm import load
+    from mlx_vlm.models.cache import QuantizedKVCache, make_prompt_cache
+    from mlx_vlm.prompt_utils import apply_chat_template
+    from unsloth_zoo.mlx.generate import BatchRowRefused, BatchStream, GenerationDefaults, GenerationRequest
+    model, processor = load(VLM_MODEL)
+    model._is_vlm_model = True
+    rules = " ".join(f"Rule {i}: answer tersely." for i in range(420))
+    prompt = apply_chat_template(processor, model.config, f"Name a colour. {rules}", num_images=0)
+    fruit = apply_chat_template(processor, model.config, "Name a fruit.", num_images=0)
+    quantized = lambda bits: [e.to_quantized(group_size=64, bits=bits) for e in make_prompt_cache(model.language_model)]
+
+    def run(*requests):
+        defaults = GenerationDefaults(max_tokens=12, prefill_batch_size=1, completion_batch_size=4)
+        with BatchStream(model, processor, defaults=defaults) as stream:
+            rows = [stream.add(request) for request in requests]
+            results = {}
+            while len(results) < len(rows):
+                results.update((e.index, e.result) for e in stream.step() if e.result is not None)
+        return [results[row] for row in rows]
+
+    # mlx-vlm before 0.7 cannot turn a quantized row into a batch cache.
+    mergeable = "prefix_cache_merge" in vars(QuantizedKVCache)
+    with monkeypatch.context() as patch:
+        patch.delattr(QuantizedKVCache, "prefix_cache_merge", raising=False)
+        with pytest.raises(BatchRowRefused, match="cannot batch a row's own quantized cache"):
+            run(GenerationRequest(prompt=fruit, prompt_cache_state=_RowCacheState(quantized(4))))
+    if not mergeable:
+        return
+    cold_state = _RowCacheState(quantized(4), {2048})
+    (cold,) = run(GenerationRequest(prompt=prompt, prompt_cache_state=cold_state))
+    warm_state = _RowCacheState(_own_copy(cold_state.kept[2048]))
+    (warm,) = run(GenerationRequest(prompt=prompt, prompt_cache_state=warm_state))
+    assert (warm.token_ids, warm.logprobs, warm.cached_token_count) == (cold.token_ids, cold.logprobs, 2048)
+    # The short row prefills while the resumed one decodes, so it joins a quantized batch.
+    rows = run(GenerationRequest(prompt=prompt, prompt_cache_state=_RowCacheState(_own_copy(cold_state.kept[2048]))),
+               GenerationRequest(prompt=fruit, prompt_cache_state=_RowCacheState(quantized(4))))
+    assert [row.cached_token_count for row in rows] == [2048, 0]
+    assert all(row.finish_reason in ("stop", "length") for row in rows)
+    with pytest.raises(BatchRowRefused, match="laid out unlike"):
+        run(GenerationRequest(prompt=fruit, prompt_cache_state=_RowCacheState(quantized(4))),
+            GenerationRequest(prompt=fruit, prompt_cache_state=_RowCacheState(quantized(8))))
+    # A uniformly quantizing stream converts a float row from its first token, as mlx-vlm's batch does.
+    streamed = _RowCacheState(make_prompt_cache(model.language_model), {2048})
+    defaults = GenerationDefaults(max_tokens=12, prefill_batch_size=1, completion_batch_size=4, kv_bits=4)
+    with BatchStream(model, processor, defaults=defaults) as stream:
+        row = stream.add(GenerationRequest(prompt=prompt, prompt_cache_state=streamed))
+        results = {}
+        while row not in results:
+            results.update((e.index, e.result) for e in stream.step() if e.result is not None)
+    assert results[row].finish_reason in ("stop", "length")
+    assert isinstance(streamed.kept[2048][0], QuantizedKVCache)
+    ask = lambda question: apply_chat_template(processor, model.config, f"{rules} {question}", num_images=0)
+    banked, make = {}, lambda: make_prompt_cache(model.language_model)
+    with BatchStream(model, processor, defaults=defaults) as stream:
+        rows = [stream.add(GenerationRequest(prompt=ask(q), prompt_cache_state=_SharedPrefixState(banked, make)))
+                for q in ("Name a fruit, then a vegetable.", "Name a colour.")]
+        results = {}
+        while len(results) < len(rows):
+            results.update((e.index, e.result) for e in stream.step() if e.result is not None)
+    assert results[rows[0]].cached_token_count >= 2048 and results[rows[1]].cached_token_count == 0
+
+
+@metal_only
+def test_vlm_stream_turboquant_rows_quantize_their_own_cache_as_a_single_decode_does(monkeypatch):
+    from mlx_vlm import load
+    from mlx_vlm.models.cache import QuantizedKVCache, make_prompt_cache
+    from mlx_vlm.prompt_utils import apply_chat_template
+    from mlx_vlm.turboquant import TurboQuantKVCache
+    from unsloth_zoo.mlx.generate import BatchRowRefused, BatchStream, GenerationDefaults, GenerationRequest
+    model, processor = load(VLM_MODEL)
+    model._is_vlm_model = True
+    rules = " ".join(f"Rule {i}: answer tersely." for i in range(420))
+    prompt = apply_chat_template(processor, model.config, f"Name a colour. {rules}", num_images=0)
+    fruit = apply_chat_template(processor, model.config, "Name a fruit.", num_images=0)
+    fresh = lambda: make_prompt_cache(model.language_model)
+
+    def run(*requests, start=0):
+        defaults = GenerationDefaults(max_tokens=12, prefill_batch_size=1, completion_batch_size=4,
+                                      kv_bits=3.5, kv_quant_scheme="turboquant", quantized_kv_start=start)
+        with BatchStream(model, processor, defaults=defaults) as stream:
+            rows = [stream.add(request) for request in requests]
+            results = {}
+            while len(results) < len(rows):
+                results.update((e.index, e.result) for e in stream.step() if e.result is not None)
+        return [results[row] for row in rows]
+
+    mergeable = "prefix_cache_merge" in vars(QuantizedKVCache)
+    with monkeypatch.context() as patch:
+        patch.delattr(QuantizedKVCache, "prefix_cache_merge", raising=False)
+        with pytest.raises(BatchRowRefused, match="cannot batch a row's own quantized cache"):
+            run(GenerationRequest(prompt=fruit, prompt_cache_state=_RowCacheState(fresh())))
+    if not mergeable:
+        return
+    # A float row cache is quantized after each prefill forward, before its checkpoint.
+    cold_state = _RowCacheState(fresh(), {2048})
+    (cold,) = run(GenerationRequest(prompt=prompt, prompt_cache_state=cold_state))
+    assert isinstance(cold_state.kept[2048][0], TurboQuantKVCache)
+    (warm,) = run(GenerationRequest(prompt=prompt, prompt_cache_state=_RowCacheState(_own_copy(cold_state.kept[2048]))))
+    assert (warm.token_ids, warm.logprobs, warm.cached_token_count) == (cold.token_ids, cold.logprobs, 2048)
+    # A cold row opens float but decodes quantized, so it joins the resumed one; so does a
+    # one-token row, whose only forward is its last.
+    rows = run(GenerationRequest(prompt=prompt, prompt_cache_state=_RowCacheState(_own_copy(cold_state.kept[2048]))),
+               GenerationRequest(prompt=fruit, prompt_cache_state=_RowCacheState(fresh())),
+               GenerationRequest(prompt="Hi", prompt_cache_state=_RowCacheState(fresh())))
+    assert [row.cached_token_count for row in rows] == [2048, 0, 0] and rows[2].prompt_token_count == 1
+    assert all(row.finish_reason in ("stop", "length") for row in rows)
+    # Rows share one codec, and convert at one length.
+    seeded = fresh()
+    seeded[:-1] = [TurboQuantKVCache(bits=3.5, seed=1) for _ in seeded[:-1]]
+    with pytest.raises(BatchRowRefused, match="laid out unlike"):
+        run(GenerationRequest(prompt=fruit, prompt_cache_state=_RowCacheState(fresh())),
+            GenerationRequest(prompt=fruit, prompt_cache_state=_RowCacheState(seeded)))
+    with pytest.raises(BatchRowRefused, match="quantized_kv_start=0"):
+        run(GenerationRequest(prompt=fruit, prompt_cache_state=_RowCacheState(fresh())), start=100)
+
+
+@metal_only
+def test_vlm_stream_prefills_a_short_arrival_ahead_of_a_long_prefill_bitwise():
+    from mlx_vlm import load
+    from mlx_vlm.prompt_utils import apply_chat_template
+    from unsloth_zoo.mlx.generate import BatchStream, GenerationDefaults, GenerationRequest
+    model, processor = load(VLM_MODEL)
+    model._is_vlm_model = True
+    rules = " ".join(f"Rule {i}: answer tersely." for i in range(700))
+    long = GenerationRequest(prompt=apply_chat_template(processor, model.config, f"{rules} Name a colour.", num_images=0))
+    short = GenerationRequest(prompt=apply_chat_template(processor, model.config, "Name a fruit.", num_images=0))
+    defaults = GenerationDefaults(max_tokens=4, prefill_batch_size=1, completion_batch_size=4)
+
+    def run(*requests):
+        with BatchStream(model, processor, defaults=defaults) as stream:
+            rows, results, first = [stream.add(requests[0])], {}, []
+            while len(results) < len(requests):
+                for e in stream.step():
+                    first += [e.index] if e.index not in first else []
+                    if e.result is not None:
+                        results[e.index] = e.result
+                if len(rows) < len(requests):  # after the long row's first chunk
+                    rows.append(stream.add(requests[1]))
+        return [results[row] for row in rows], [rows.index(index) for index in first]
+
+    (alone_long,), _ = run(long)
+    (alone_short,), _ = run(short)
+    (got_long, got_short), order = run(long, short)
+    assert got_long.prompt_token_count > 3 * 2048 and order == [1, 0]
+    for got, alone in ((got_long, alone_long), (got_short, alone_short)):
+        assert (got.token_ids[0], got.logprobs[0]) == (alone.token_ids[0], alone.logprobs[0])
 
 
 @metal_only
@@ -624,3 +920,240 @@ def test_residual_norm_scope_tolerates_a_stand_in_without_training(monkeypatch):
     root = _Root()
     with decode.fused_residual_norm(root) as yielded:
         assert yielded is root
+
+
+def _quantized(N, K, group_size, dtype, bits = 4, seed = 0):
+    w = mx.random.normal((N, K), key = mx.random.key(seed)) * 0.05
+    return mx.quantize(w.astype(dtype), group_size = group_size, bits = bits)
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("group_size", [32, 64, 128])
+@pytest.mark.parametrize("N", [384, 320])   # 128- and 64-column tiles
+@pytest.mark.parametrize("bits", [4, 8])
+@nax_only
+def test_nax_small_m_qmm_matches_native(monkeypatch, bits, N, group_size, dtype):
+    from unsloth_zoo.mlx import nax
+
+    monkeypatch.setattr(nax, "_QMM_THREADGROUPS", {8: 20, 16: 20})   # several uneven K steps per split
+    monkeypatch.setattr(nax, "_gpu_core_count", lambda: nax._QMM_MEASURED_CORES)
+    for groups in (68, 17, 2):   # the last one runs unsplit
+        K = group_size * groups
+        w, scales, biases = _quantized(N, K, group_size, dtype, bits, seed = groups)
+        for M in (2, 3, 8, 9, 16):
+            # Rows differ in scale and the rows after M are NaN, so a row mix-up or a read past M shows.
+            padded = mx.random.normal((M + 16, K), key = mx.random.key(M)) * (1 + mx.arange(M + 16)[:, None])
+            x = mx.where(mx.arange(M + 16)[:, None] < M, padded, mx.nan).astype(dtype)[:M]
+            got = nax.small_m_qmm(x, w, scales, biases, group_size, bits).astype(mx.float32)
+            with mx.stream(mx.cpu):
+                weight = mx.dequantize(w, scales.astype(mx.float32), biases.astype(mx.float32),
+                                       group_size = group_size, bits = bits)
+                exact = x.astype(mx.float32) @ weight.T
+                terms = mx.abs(x.astype(mx.float32)) @ mx.abs(weight).T
+                # Rounded once to dtype after an fp32 sum that only reorders the K products.
+                bound = mx.finfo(dtype).eps * mx.abs(exact) + K * 2.0 ** -23 * terms
+                mx.eval(exact, bound)
+            assert mx.all(mx.abs(got - exact) <= bound).item(), (groups, M)
+
+
+def test_nax_small_m_qmm_rejects_what_it_does_not_cover():
+    from unsloth_zoo.mlx import nax
+
+    for args in ((384, 512, 64, 4, "affine"), (320, 512, 32, 8, "affine")):
+        assert nax.small_m_qmm_supported(*args)
+    for args in ((352, 512, 64, 4, "affine"), (384, 480, 64, 4, "affine"), (384, 512, 16, 4, "affine"),
+                 (384, 512, 64, 6, "affine"), (384, 512, 32, 4, "mxfp4")):
+        assert not nax.small_m_qmm_supported(*args)
+
+
+def test_nax_small_m_qmm_geometry_covers_k_within_threadgroup_memory():
+    import itertools
+    from unsloth_zoo.mlx import nax
+
+    for M, N, K, group_size in itertools.product((2, 8, 9, 16), (320, 4096, 262144), (256, 2112, 5376, 16384),
+                                                 (32, 64, 128)):
+        if K % group_size:
+            continue
+        row_tile, column_tile, splits, unroll = nax.small_m_qmm_geometry(M, N, K, group_size)
+        assert unroll in (2, 4, 8)
+        groups, steps = K // group_size, -(-(K // group_size) // unroll)
+        split_groups = -(-steps // splits) * unroll
+        starts = [s * steps // splits * unroll for s in range(splits)] + [groups]   # the kernel's g0 per split
+        assert starts[0] == 0 and starts == sorted(starts) and starts[-2] < groups
+        assert max(b - a for a, b in zip(starts, starts[1:])) <= split_groups
+        assert splits == 1 or -(-steps // (splits - 1)) > -(-steps // splits)   # every split shortens the longest
+        assert row_tile * (split_groups + column_tile) * 4 <= nax._QMM_THREADGROUP_MEMORY
+    # A vocabulary-wide head at large K needs more splits than the threadgroup target gives.
+    assert nax.small_m_qmm_geometry(16, 262144, 16384, 32)[2] == 2
+
+
+def test_nax_small_m_qmm_row_range_matches_bits_group_size_and_shape(monkeypatch):
+    from unsloth_zoo.mlx import nax
+
+    table = ((8, 32, 1 << 20, 4096, 9, 30), (8, None, 1 << 20, 4096, 1, 12), (4, None, 1 << 20, None, 5, 16))
+    monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {nax._gpu_generation(): table})
+    shapes = ((4096, 256, 32, 8), (4096, 256, 64, 8), (8192, 256, 64, 8), (4096, 128, 64, 8), (8192, 256, 64, 4))
+    assert [nax.small_m_qmm_row_range(*shape) for shape in shapes] == [(9, 16), (2, 12), (0, -1), (0, -1), (5, 16)]
+    monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {})
+    monkeypatch.setattr(nax, "_QMM_ROWS_UNMEASURED", table[2:])
+    assert nax.small_m_qmm_row_range(4096, 256, 64, 4) == (5, 16)
+
+
+def test_nax_small_m_qmm_scales_with_gpu_cores_and_keys_rows_by_generation(monkeypatch):
+    from unsloth_zoo.mlx import nax
+
+    splits = {}
+    for cores in (None, 10, 16, 40):
+        monkeypatch.setattr(nax, "_gpu_core_count", lambda: cores)
+        splits[cores] = [nax.small_m_qmm_geometry(M, 4096, 16384, 32)[2] for M in (2, 16)]
+    assert splits == {None: [32, 19], 10: [22, 13], 16: [32, 19], 40: [64, 43]}
+    for architecture, rows in (("applegpu_g17s", (6, 16)), ("applegpu_g17c", (6, 16)),
+                               ("applegpu_g18s", (11, 16)), ("", (11, 16))):
+        monkeypatch.setattr(nax, "_gpu_architecture", lambda: architecture)
+        assert nax.small_m_qmm_row_range(4096, 4096, 64, 4) == rows, architecture
+
+
+_EVERY_ROW = ((4, None, 0, None, 1, 16), (8, None, 0, None, 1, 16))
+
+
+class _QuantizedHead(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embed = nn.QuantizedEmbedding(512, 512, group_size = 64, bits = 4)
+        self.proj = nn.QuantizedLinear(512, 512, bias = True, group_size = 64, bits = 8)
+        self.odd = nn.QuantizedLinear(512, 352, bias = False, group_size = 64, bits = 4)
+        self.set_dtype(mx.bfloat16)
+        self.eval()
+
+    def __call__(self, x):
+        return self.embed.as_linear(self.proj(x)), self.odd(x)
+
+
+@nax_only
+def test_nax_quantized_linear_scope_routes_restores_and_falls_back(monkeypatch, caplog):
+    import functools
+    from unsloth_zoo.mlx import inference, nax
+    from unsloth_zoo.mlx.generate import generation_mode
+
+    model = _QuantizedHead()
+    calls = []
+    kernel = nax.small_m_qmm
+    monkeypatch.setattr(nax, "small_m_qmm", lambda *args: calls.append((len(args[0]), args[5])) or kernel(*args))
+    monkeypatch.setattr(nax, "nax_available", lambda: True)
+    monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: True)
+    # The 8-bit projection routes up to 8 rows only, so at 12 only the 4-bit embedding does.
+    monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {nax._gpu_generation(): (_EVERY_ROW[0], (8, None, 0, None, 1, 8))})
+    monkeypatch.setattr(inference, "_NAX_QMM_VERIFIED", {})
+    caplog.set_level("INFO", logger = inference.__name__)
+
+    def run(rows):
+        calls.clear()
+        return model(mx.random.normal((1, rows, 512), key = mx.random.key(rows)).astype(mx.bfloat16))
+
+    natives = {rows: run(rows) for rows in (1, 4, 8, 12)}   # 8 fills the row tile: its own verified key
+    linear_call = nn.QuantizedLinear.__call__
+    with monkeypatch.context() as patch:   # a transient wrapper, e.g. training patches during eval sampling
+        patch.setattr(nn.QuantizedLinear, "__call__", functools.wraps(linear_call)(lambda *a: linear_call(*a)))
+        with inference.nax_quantized_linear(model):
+            assert type(model.proj) is nn.QuantizedLinear
+    with generation_mode(model):
+        with inference.nax_quantized_linear(model):
+            assert [type(m).__name__ for m in (model.embed, model.proj, model.odd)] == [
+                "_NaxSmallMQuantizedEmbedding", "_NaxSmallMQuantizedLinear", "QuantizedLinear"]
+        assert type(model.proj) is not nn.QuantizedLinear   # the outer scope still owns it
+        for rows, native in natives.items():
+            routed = run(rows)
+            assert calls == {1: [], 4: [(4, 8), (4, 4)], 8: [(8, 8), (8, 4)], 12: [(12, 4)]}[rows]   # (rows, bits)
+            for a, b in zip(routed, native):
+                assert mx.allclose(a, b, rtol = 2e-2, atol = 2e-2).item()
+        assert len(inference._NAX_QMM_VERIFIED) == 5 and all(inference._NAX_QMM_VERIFIED.values())
+        assert sum("NAX kernel" in r.getMessage() for r in caplog.records) == 1
+        model.train()
+        run(4)
+        assert not calls   # training stays native
+        model.eval()
+        monkeypatch.setattr(nn.QuantizedLinear, "__call__", lambda self, x: linear_call(self, x) * 0)
+        assert not any(mx.any(out).item() for out in run(4)) and not calls   # drifted: native, new body
+        monkeypatch.undo()
+    assert (type(model.embed), type(model.proj)) == (nn.QuantizedEmbedding, nn.QuantizedLinear)
+    assert "_unsloth_nax_qmm_rows" not in model.proj
+
+
+@nax_only
+def test_nax_quantized_linear_first_use_check_rejects_a_wrong_kernel(monkeypatch):
+    from unsloth_zoo.mlx import inference, nax
+
+    model = _QuantizedHead()
+    kernel = nax.small_m_qmm
+    monkeypatch.setattr(nax, "small_m_qmm", lambda *args: kernel(*args) * 1.1)
+    monkeypatch.setattr(nax, "nax_available", lambda: True)
+    monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: True)
+    monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {nax._gpu_generation(): _EVERY_ROW})
+    monkeypatch.setattr(inference, "_NAX_QMM_VERIFIED", {})
+    native = model.proj(x := mx.random.normal((3, 512), key = mx.random.key(3)).astype(mx.bfloat16))
+    compiled = mx.compile(model.proj)(x)   # stock compiled and eager can differ in the last bit
+    with inference.nax_quantized_linear(model):
+        assert mx.array_equal(mx.compile(model.proj)(x), compiled).item()   # unverifiable in a transform
+        assert mx.array_equal(model.proj(x), native).item()
+    assert list(inference._NAX_QMM_VERIFIED.values()) == [False]
+
+
+@real_mlx_only
+@pytest.mark.parametrize("blocker", [None, "kill switch", "no NAX", "gap closed", "distributed", "probe failed"])
+def test_nax_quantized_linear_scope_stays_native(monkeypatch, blocker):
+    from unsloth_zoo.mlx import inference, nax
+
+    model = _QuantizedHead()
+    monkeypatch.delenv("UNSLOTH_MLX_NAX_QMM", raising = False)
+    monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {nax._gpu_generation(): _EVERY_ROW})
+    monkeypatch.setattr(nax, "nax_available", lambda: blocker != "no NAX")
+    monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: blocker != "probe failed")
+    monkeypatch.setattr(nax, "gap_open", lambda name: blocker != "gap closed")
+    if blocker == "kill switch":
+        monkeypatch.setenv("UNSLOTH_MLX_NAX_QMM", "0")
+    if blocker == "distributed":
+        model._unsloth_mlx_distributed_parallel_mode = "tensor"
+    with inference.nax_quantized_linear(model):
+        assert (type(model.proj) is nn.QuantizedLinear) is (blocker is not None)
+
+
+@real_mlx_only
+def test_nax_quantized_linear_scope_swaps_a_shared_module_once(monkeypatch):
+    from unsloth_zoo.mlx import inference, nax
+
+    model = _QuantizedHead()
+    model.alias = model.proj   # reachable under two paths, as tied or shared modules are
+    monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {nax._gpu_generation(): _EVERY_ROW})
+    monkeypatch.setattr(nax, "nax_available", lambda: True)
+    monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: True)
+    with inference.nax_quantized_linear(model):
+        assert type(model.alias).__name__ == "_NaxSmallMQuantizedLinear"
+        assert model.proj._unsloth_nax_qmm_scopes == 1
+    assert type(model.proj) is nn.QuantizedLinear and "_unsloth_nax_qmm_rows" not in model.proj
+
+
+@real_mlx_only
+@pytest.mark.parametrize("vlm", [False, True], ids = ["text", "vlm"])
+def test_loader_generate_enters_the_nax_scope(monkeypatch, vlm):
+    from contextlib import contextmanager
+    import mlx_lm
+    import mlx_vlm
+    from unsloth_zoo.mlx import loader
+
+    root = nn.Sequential(nn.Linear(4, 4))
+    root._tokenizer = types.SimpleNamespace(eos_token_ids = {2})
+    root._is_vlm_model = vlm
+    entered = []
+
+    @contextmanager
+    def scope(model):
+        entered.append(model)
+        yield model
+
+    def stream(model, *args, **kwargs):
+        assert entered == [root]
+        yield types.SimpleNamespace(token = 7)
+
+    monkeypatch.setattr(loader, "nax_quantized_linear", scope)
+    monkeypatch.setattr(mlx_vlm if vlm else mlx_lm, "stream_generate", stream)
+    assert loader._mlx_generate(root, input_ids = [[1, 2]], max_new_tokens = 1).tolist() == [[1, 2, 7]]
