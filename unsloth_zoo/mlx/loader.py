@@ -21,6 +21,7 @@ No GPU deps: uses mlx-lm (text) and mlx-vlm (VLM) instead of unsloth.models
 """
 
 import ast
+import contextvars
 import copy
 import gc
 import hashlib
@@ -5593,6 +5594,365 @@ def _nf4_dense_dequantize_weight(weight, group_size=64, use_double_quant=False):
     return dequantized.reshape(original_shape).astype(original_dtype)
 
 
+# GPTQ/AWQ: mlx-lm >= 0.30.4 (PR #730) loads standard AWQ, contiguous-group GPTQ is repacked as MLX affine, the rest is dequantized to fp16.
+_HF_RUNTIME_DEQUANT_METHODS = frozenset({"gptq", "awq"})
+# Fail loud; else the generic MLX check misreports them as a bits/group_size mismatch.
+_HF_UNSUPPORTED_PACKED_METHODS = frozenset({
+    "compressed-tensors", "compressed_tensors", "aqlm",
+    "quip", "quip_sharp", "eetq", "hqq", "vptq", "fp_quant",
+})
+_AWQ_REVERSE_ORDER = (0, 4, 1, 5, 2, 6, 3, 7)
+
+
+def _mlx_reinterpret_uint32(arr):
+    # Widen to int64 so top-nibble shifts don't sign-extend.
+    import mlx.core as mx
+
+    a = arr.astype(mx.int64)
+    return mx.where(a < 0, a + (1 << 32), a)
+
+
+def _gptq_dequantize_weight(qweight, qzeros, scales, g_idx, bits=4):
+    """AutoGPTQ v1 4-bit -> dense [out, in]; g_idx may be an act-order permutation."""
+    import mlx.core as mx
+
+    qw = _mlx_reinterpret_uint32(qweight)               # [in//8, out]
+    qz = _mlx_reinterpret_uint32(qzeros)                # [groups, out//8]
+    scales = scales.astype(mx.float32)                  # [groups, out]
+    shifts = mx.arange(0, 32, bits).astype(mx.int64)    # [8]
+    w = (mx.right_shift(qw[:, None, :], shifts[None, :, None]) & 0xF)
+    w = w.reshape(-1, qw.shape[1]).astype(mx.float32)   # [in, out]
+    z = (mx.right_shift(qz[:, :, None], shifts[None, None, :]) & 0xF)
+    # Mask AFTER the +1: stored 15 encodes zero-point 0 (AutoGPTQ: (zeros + 1) & 0xF).
+    z = ((z.reshape(qz.shape[0], -1) + 1) & 0xF).astype(mx.float32)   # [groups, out]
+    g = g_idx.astype(mx.int32)                          # [in]
+    eff = (w - z[g]) * scales[g]                        # [in, out]
+    return mx.transpose(eff)                            # [out, in]
+
+
+def _awq_dequantize_weight(qweight, qzeros, scales, group_size, bits=4):
+    """AutoAWQ GEMM 4-bit -> dense [out, in] (the AWQ smoothed weight)."""
+    import mlx.core as mx
+
+    qw = _mlx_reinterpret_uint32(qweight)               # [in, out//8]
+    qz = _mlx_reinterpret_uint32(qzeros)                # [groups, out//8]
+    scales = scales.astype(mx.float32)                  # [groups, out]
+    shifts = mx.arange(0, 32, bits).astype(mx.int64)
+    pack = 32 // bits                                   # 8
+    reorder = mx.array(
+        [b * pack + o for b in range(scales.shape[1] // pack) for o in _AWQ_REVERSE_ORDER]
+    )
+
+    def _unpack(x):
+        y = (mx.right_shift(x[:, :, None], shifts[None, None, :]) & 0xF).reshape(x.shape[0], -1)
+        return y[:, reorder]
+
+    w = _unpack(qw).astype(mx.float32)                  # [in, out]
+    z = _unpack(qz).astype(mx.float32)                  # [groups, out]
+    if group_size and group_size > 0:
+        g = (mx.arange(w.shape[0]) // group_size).astype(mx.int32)   # [in]
+    else:
+        # Full-group (group_size <= 0): arange // -1 would give negative indices.
+        g = mx.zeros((w.shape[0],), dtype=mx.int32)     # [in]
+    eff = (w - z[g]) * scales[g]                        # [in, out]
+    return mx.transpose(eff)                            # [out, in]
+
+
+def _detect_hf_prequant_method(config_data):
+    """Return (method, quant_config_dict) for a GPTQ/AWQ repo, else (None, None)."""
+    if not isinstance(config_data, dict):
+        return None, None
+    quant_config = config_data.get("quantization_config", None)
+    if not isinstance(quant_config, dict):
+        return None, None
+    method = str(quant_config.get("quant_method", "")).lower()
+    if method in _HF_RUNTIME_DEQUANT_METHODS:
+        return method, quant_config
+    return None, None
+
+
+# Only the GEMM layout (blank version = default) matches mlx-lm's and our AWQ unpacking.
+_AWQ_NATIVE_GEMM_VERSIONS = frozenset({"", "gemm"})
+
+
+def _awq_quant_config_is_gemm(quant_config):
+    """Non-GEMM AWQ variants would silently decode to wrong weights."""
+    if not isinstance(quant_config, dict):
+        return True
+    version = str(quant_config.get("version", "") or "").strip().lower()
+    return version in _AWQ_NATIVE_GEMM_VERSIONS
+
+
+def _awq_group_size_is_full(quant_config):
+    """q_group_size <= 0 (per-column); mlx-lm passes it to nn.quantize, which rejects it."""
+    if not isinstance(quant_config, dict):
+        return False
+    raw = quant_config.get("group_size", quant_config.get("q_group_size"))
+    if raw is None:
+        return False
+    try:
+        return int(raw) <= 0
+    except (TypeError, ValueError):
+        return False
+
+
+_MLX_LM_NATIVE_PREQUANT_MIN = (0, 30, 4)
+
+
+def _mlx_lm_supports_native_prequant():
+    """mlx-lm >= 0.30.4 (PR #730); unknown version = unsupported."""
+    try:
+        from importlib.metadata import version as _dist_version
+
+        raw = _dist_version("mlx-lm")
+    except Exception:
+        return False
+    parts = []
+    for chunk in str(raw).split(".")[:3]:
+        digits = ""
+        for ch in chunk:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        parts.append(int(digits) if digits else 0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts) >= _MLX_LM_NATIVE_PREQUANT_MIN
+
+
+def _mlx_lm_would_reject_prequant(local_path, method, quant_config):
+    """GPTQ always (mlx-lm decodes it with the AWQ layout and raises on g_idx), full-group AWQ, or mlx-lm < 0.30.4."""
+    if not _mlx_lm_supports_native_prequant():
+        return True
+    if method == "gptq":
+        return True
+    if method == "awq" and _awq_group_size_is_full(quant_config):
+        return True
+    return False
+
+
+def _adapter_base_prefers_native_prequant(
+    adapter_cfg,
+    *,
+    adapter_requires_runtime_quant,
+    adapter_mlx_quant_config,
+    adapter_base_is_bnb,
+):
+    """Native AWQ and repacked GPTQ bases must reload 4-bit; load_in_4bit=False would dequantize and fail base validation."""
+    if adapter_requires_runtime_quant:
+        return False
+    if adapter_mlx_quant_config is not None:
+        return False
+    if adapter_base_is_bnb:
+        return False
+    base_quant_cfg = adapter_cfg.get("base_quantization_config")
+    if not isinstance(base_quant_cfg, dict):
+        return False
+    method = str(base_quant_cfg.get("quant_method", "")).lower()
+    if method == "gptq":
+        return True
+    if method != "awq":
+        return False
+    return _mlx_lm_supports_native_prequant()
+
+
+_DEQUANT_DROP_SIDECARS = ("quantize_config.json", "quant_config.json")
+
+
+def _is_dropped_dequant_sidecar(filename):
+    """Packed weights and GPTQ/AWQ sidecars, which would make the dense copy look packed."""
+    if filename.endswith(".safetensors") or filename.endswith(".safetensors.index.json"):
+        return True
+    return filename in _DEQUANT_DROP_SIDECARS
+
+
+_MLX_AFFINE_GROUP_SIZES = (32, 64, 128)
+_DEQUANT_SHARD_BYTES = 2 << 30
+
+
+def _gptq_to_mlx_affine(qweight, qzeros, scales):
+    """AutoGPTQ v1 4-bit -> MLX affine (weight, scales, biases), lossless: w = s*(q - z) = s*q - s*z.
+    qweight [in//8, out] packs input rows low nibble first, which is MLX's [out, in//8] layout transposed."""
+    import mlx.core as mx
+
+    shifts = mx.arange(0, 32, 4).astype(mx.int64)
+    qz = _mlx_reinterpret_uint32(qzeros)
+    z = ((mx.right_shift(qz[:, :, None], shifts[None, None, :]) & 0xF).reshape(qz.shape[0], -1) + 1) & 0xF
+    weight = mx.contiguous(_mlx_reinterpret_uint32(qweight).astype(mx.uint32).T)
+    biases = -(z.astype(mx.float32) * scales.astype(mx.float32))
+    return weight, mx.contiguous(scales.T), mx.contiguous(biases.T.astype(scales.dtype))
+
+
+def _materialize_dequantized_hf_checkpoint(local_path, config_data, method, quant_config, mlx_affine=False):
+    """Returns (temp_dir, config_data without HF quantization metadata).
+
+    mlx_affine=True converts a contiguous-group 4-bit GPTQ checkpoint straight to MLX affine
+    (config gains "quantization"); dequantizing and re-quantizing it would round every weight twice.
+    Falls back to dense fp16 when g_idx is permuted (act-order) or the group size has no MLX kernel."""
+    import glob
+    import shutil
+    import mlx.core as mx
+
+    bits = int(quant_config.get("bits", 4) or 4)
+    # Keep group_size <= 0 (full-group); defaulting it to 128 gathers wrong scale rows.
+    if method == "awq":
+        raw_group_size = quant_config.get("q_group_size", quant_config.get("group_size"))
+    else:
+        raw_group_size = quant_config.get("group_size")
+    group_size = int(raw_group_size) if raw_group_size is not None else 128
+    if bits != 4:
+        raise NotImplementedError(
+            f"Unsloth: {method.upper()} runtime dequant on MLX currently supports "
+            f"4-bit checkpoints only (got bits={bits})."
+        )
+    if method == "gptq":
+        # gptq_v2 stores raw zero-points (no -1 offset); v1 decoding would be off by one.
+        _ckpt_fmts = {
+            str(quant_config.get(_key, "") or "").lower()
+            for _key in ("checkpoint_format", "format")
+        }
+        if _ckpt_fmts & {"gptq_v2", "gptqv2"}:
+            raise NotImplementedError(
+                "Unsloth: GPTQ v2 checkpoints (checkpoint_format='gptq_v2') use a "
+                "different zero-point convention than AutoGPTQ v1 and are not yet "
+                "supported for MLX runtime dequant. Convert to the v1 GPTQ format, "
+                "or use a v1 GPTQ / AWQ checkpoint."
+            )
+        # Marlin / BitBLAS / IPEX / QQQ repack qweight differently; only the AutoGPTQ v1 layout decodes here.
+        _other_fmts = _ckpt_fmts - {"", "gptq"}
+        if _other_fmts or quant_config.get("is_marlin_format"):
+            raise NotImplementedError(
+                f"Unsloth: GPTQ checkpoint format {sorted(_other_fmts) or ['marlin']} is "
+                "not supported on MLX; only the standard AutoGPTQ (v1) packing can be "
+                "loaded. Use a checkpoint saved with format='gptq'."
+            )
+
+    shard_paths = sorted(glob.glob(os.path.join(local_path, "*.safetensors")))
+    if not shard_paths:
+        raise FileNotFoundError(
+            f"Unsloth: no .safetensors weights found in '{local_path}' for "
+            f"{method.upper()} dequantization."
+        )
+    weights = {}
+    for shard in shard_paths:
+        weights.update(mx.load(shard))
+
+    quant_modules = sorted(
+        {k[: -len(".qweight")] for k in weights if k.endswith(".qweight")}
+    )
+    if not quant_modules:
+        raise ValueError(
+            f"Unsloth: '{local_path}' is declared {method.upper()} but no packed "
+            "'.qweight' tensors were found."
+        )
+
+    in_rows = 32 // bits
+    affine = (
+        mlx_affine
+        and method == "gptq"
+        and group_size in _MLX_AFFINE_GROUP_SIZES
+        and all(
+            name + ".g_idx" not in weights
+            or bool(mx.array_equal(
+                weights[name + ".g_idx"].astype(mx.int32),
+                mx.arange(weights[name + ".qweight"].shape[0] * in_rows) // group_size,
+            ))
+            for name in quant_modules
+        )
+    )
+
+    def _convert(name):
+        qweight = weights[name + ".qweight"]
+        qzeros = weights[name + ".qzeros"]
+        scales = weights[name + ".scales"]
+        if affine:
+            weight, scales, biases = _gptq_to_mlx_affine(qweight, qzeros, scales)
+            return {name + ".weight": weight, name + ".scales": scales, name + ".biases": biases}
+        if method == "gptq":
+            g_idx = weights.get(name + ".g_idx")
+            if g_idx is None:
+                in_features = int(qweight.shape[0]) * in_rows
+                if group_size and group_size > 0:
+                    g_idx = mx.arange(in_features) // group_size
+                else:
+                    g_idx = mx.zeros((in_features,), dtype=mx.int32)
+            dense = _gptq_dequantize_weight(qweight, qzeros, scales, g_idx, bits=bits)
+        else:
+            dense = _awq_dequantize_weight(qweight, qzeros, scales, group_size, bits=bits)
+        return {name + ".weight": dense.astype(mx.float16)}
+
+    packed = {name + suffix for name in quant_modules
+              for suffix in (".qweight", ".qzeros", ".scales", ".g_idx")}
+    quant_set = set(quant_modules)
+    temp_dir = tempfile.mkdtemp(prefix="unsloth_mlx_dequant_")
+    # BaseException: also clean up a multi-GB save interrupted by Ctrl-C.
+    try:
+        # Bounded shards: peak memory is one shard of dense weights, not the model.
+        shard, shard_bytes, weight_map, n_shards = {}, 0, {}, 0
+
+        def _flush():
+            nonlocal shard, shard_bytes, n_shards
+            if not shard:
+                return
+            n_shards += 1
+            filename = f"model-{n_shards:05d}.safetensors"
+            mx.eval(list(shard.values()))
+            mx.save_safetensors(os.path.join(temp_dir, filename), shard)
+            weight_map.update({key: filename for key in shard})
+            shard, shard_bytes = {}, 0
+
+        items = [(name, None) for name in quant_modules] + [
+            (None, key) for key in weights if key not in packed
+        ]
+        for name, key in items:
+            if name is not None:
+                tensors = _convert(name)
+            else:
+                tensor = weights[key]
+                # Drop GPTQ QuantLinear's all-zero placeholder bias on packed modules only.
+                if (
+                    key.endswith(".bias")
+                    and key[: -len(".bias")] in quant_set
+                    and bool(mx.all(tensor == 0).item())
+                ):
+                    continue
+                tensors = {key: tensor}
+            for k, v in tensors.items():
+                shard[k] = v
+                shard_bytes += v.nbytes
+            if shard_bytes >= _DEQUANT_SHARD_BYTES:
+                _flush()
+        _flush()
+        with open(os.path.join(temp_dir, "model.safetensors.index.json"), "w") as f:
+            json.dump({"metadata": {}, "weight_map": weight_map}, f, indent=2)
+
+        for filename in os.listdir(local_path):
+            src = os.path.join(local_path, filename)
+            if os.path.isdir(src):
+                # Nested assets (chat_templates/, remote-code packages) by link, never copied weights.
+                if not filename.startswith("."):
+                    os.symlink(os.path.realpath(src), os.path.join(temp_dir, filename))
+                continue
+            if not os.path.isfile(src):
+                continue
+            if _is_dropped_dequant_sidecar(filename):
+                continue
+            shutil.copy(src, os.path.join(temp_dir, filename))
+
+        new_config_data = dict(config_data)
+        new_config_data.pop("quantization_config", None)
+        new_config_data.pop("quantization", None)
+        if affine:
+            new_config_data["quantization"] = {"group_size": group_size, "bits": bits, "mode": "affine"}
+        with open(os.path.join(temp_dir, "config.json"), "w") as f:
+            json.dump(new_config_data, f, indent=2)
+    except BaseException:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+    return temp_dir, new_config_data
+
+
 def _apply_dense_nf4_quantization(model, config, spec: _MLXQuantizationSpec, predicate):
     import mlx.core as mx
 
@@ -8215,6 +8575,26 @@ def _evaluate_quantized_modules(model, sources):
             mx.eval(target.parameters())
 
 
+_LOAD_SCRATCH_DIRS = contextvars.ContextVar("unsloth_mlx_load_scratch_dirs", default=None)
+
+
+def _remove_scratch_dirs_on_error(load):
+    """A failed (and caught) load must not leave its dequantized checkpoint behind until exit."""
+    @wraps(load)
+    def wrapper(*args, **kwargs):
+        dirs = []
+        token = _LOAD_SCRATCH_DIRS.set(dirs)
+        try:
+            return load(*args, **kwargs)
+        except BaseException:
+            for path in dirs:
+                shutil.rmtree(path, ignore_errors=True)
+            raise
+        finally:
+            _LOAD_SCRATCH_DIRS.reset(token)
+    return wrapper
+
+
 def _finish_load(model, tokenizer):
     """The single exit from a load, so the patch installs after the runtimes the load imports."""
     install_quantized_attention()
@@ -8242,6 +8622,7 @@ class FastMLXModel:
     """
 
     @staticmethod
+    @_remove_scratch_dirs_on_error
     def from_pretrained(
         model_name="mlx-community/Llama-3.2-1B-Instruct-4bit",
         max_seq_length=2048,
@@ -8595,6 +8976,113 @@ class FastMLXModel:
             model._unsloth_base_commit_hash = _infer_snapshot_commit(local_path)
             return _finish_load(model, tokenizer)
 
+        dequant_temp_dir = None
+        # Original identity when the load is rerouted through a dequant temp dir.
+        _prequant_src_path = None
+        _prequant_model_name = None
+        hf_prequant_method, hf_prequant_config = _detect_hf_prequant_method(config_data)
+        # Adapter dirs carry the base config.json but no packed weights.
+        if hf_prequant_method is not None and not _is_adapter_dir:
+            if local_path is None:
+                raise FileNotFoundError(
+                    f"Unsloth: could not resolve local files for "
+                    f"{hf_prequant_method.upper()} model '{model_name}'."
+                )
+            if _is_vlm(config_data):
+                raise NotImplementedError(
+                    f"Unsloth: {hf_prequant_method.upper()} runtime dequant is not "
+                    "yet supported for vision models on MLX. Load an unquantized "
+                    "VLM base for LoRA instead."
+                )
+            if hf_prequant_method == "awq" and not _awq_quant_config_is_gemm(
+                hf_prequant_config
+            ):
+                _awq_version = str(
+                    (hf_prequant_config or {}).get("version", "")
+                ).strip()
+                raise NotImplementedError(
+                    f"Unsloth: '{model_name}' is an AWQ checkpoint packed with the "
+                    f"'{_awq_version or 'unknown'}' layout, which is not supported "
+                    "on the MLX path. Only the standard AutoAWQ GEMM layout can be "
+                    "loaded (mlx-lm's native loader and the local dequant both "
+                    "assume the GEMM packing). Re-quantize with version=\"GEMM\" or "
+                    "load an unquantized base for LoRA."
+                )
+            # Dense / full-finetuning needs trainable fp16 weights, not mlx-lm's quantized base.
+            _force_dense_dequant = not quantization_spec.enabled
+            if _force_dense_dequant or _mlx_lm_would_reject_prequant(
+                local_path, hf_prequant_method, hf_prequant_config
+            ):
+                if distributed_requested:
+                    raise NotImplementedError(
+                        f"Unsloth: distributed MLX loading of the "
+                        f"{hf_prequant_method.upper()} checkpoint '{model_name}' "
+                        "is not supported: it must be dequantized to fp16 first "
+                        "and the metadata-only distributed snapshot ships no "
+                        "packed weights. Convert it with mlx_lm.convert to an MLX "
+                        "checkpoint before distributed loading."
+                    )
+                # A plain 4-bit request keeps GPTQ's own 4-bit codes (lossless MLX affine repack).
+                _gptq_affine = (
+                    hf_prequant_method == "gptq"
+                    and quantization_spec.source == "load_in_4bit"
+                    and quantization_spec.mode == "affine"
+                    and quantization_spec.quantize_modules is None
+                    and not quantization_spec.has_callable_predicate
+                    and not quantization_spec.force_requantize
+                )
+                _prequant_src_path = local_path
+                _prequant_model_name = model_name
+                dequant_dir, config_data = _materialize_dequantized_hf_checkpoint(
+                    _prequant_src_path, config_data, hf_prequant_method, hf_prequant_config,
+                    mlx_affine=_gptq_affine,
+                )
+                if "quantization" in config_data:
+                    print(
+                        f"Unsloth: '{model_name}' is a GPTQ checkpoint; repacked its "
+                        "4-bit weights losslessly as MLX affine."
+                    )
+                else:
+                    _reason = (
+                        "a dense / 16-bit / full-finetuning load was requested"
+                        if _force_dense_dequant
+                        else "mlx-lm cannot load it natively (act-order g_idx, "
+                             "full-group AWQ, or mlx-lm < 0.30.4)"
+                    )
+                    warnings.warn(
+                        f"Unsloth: '{model_name}' is a {hf_prequant_method.upper()} "
+                        f"pre-quantized checkpoint and {_reason}; dequantized it to "
+                        "fp16 for MLX (a LoRA base is re-quantized to MLX affine).",
+                        stacklevel=2,
+                    )
+                local_path = dequant_dir
+                model_name = dequant_dir
+                dequant_temp_dir = dequant_dir
+                _scratch = _LOAD_SCRATCH_DIRS.get()
+                if _scratch is not None:
+                    _scratch.append(dequant_dir)
+            else:
+                print(
+                    f"Unsloth: '{model_name}' is a standard "
+                    f"{hf_prequant_method.upper()} checkpoint; loading natively "
+                    "via mlx-lm."
+                )
+        else:
+            _other_quant = (
+                config_data.get("quantization_config")
+                if isinstance(config_data, dict) else None
+            )
+            if isinstance(_other_quant, dict):
+                _other_method = str(_other_quant.get("quant_method", "")).lower()
+                if _other_method in _HF_UNSUPPORTED_PACKED_METHODS:
+                    raise NotImplementedError(
+                        f"Unsloth: '{model_name}' uses '{_other_method}' "
+                        "quantization, which is not supported on the MLX path. "
+                        "Supported pre-quantized formats are GPTQ and AWQ "
+                        "(dequantized to MLX affine for LoRA); otherwise load an "
+                        "unquantized or MLX-quantized checkpoint."
+                    )
+
         # Reject full_finetuning on a pre-quantized repo: int4/int8 weights
         # aren't trainable (our CCE backward zeros the quantized weight grad),
         # so full FT would silently update only LayerNorms/biases.
@@ -8764,6 +9252,12 @@ class FastMLXModel:
                             "group_size": _MLX_QUANT_MODE_DEFAULTS["affine"][0],
                             "mode": "affine",
                         }
+                    _reload_base_load_in_4bit = _adapter_base_prefers_native_prequant(
+                        adapter_cfg,
+                        adapter_requires_runtime_quant=adapter_requires_runtime_quant,
+                        adapter_mlx_quant_config=adapter_mlx_quant_config,
+                        adapter_base_is_bnb=_adapter_base_bnb is not None,
+                    )
                     # Reload the base via FastMLXModel.from_pretrained (text +
                     # VLM); the old mlx_lm.load fallback broke VLM adapters
                     # (mlx-lm load is text-only).
@@ -8792,7 +9286,7 @@ class FastMLXModel:
                         }
                         if adapter_cfg.get("_unsloth_peft_import")
                         else {
-                            "load_in_4bit": False,
+                            "load_in_4bit": _reload_base_load_in_4bit,
                             "load_in_8bit": False,
                             "load_in_16bit": False,
                             "load_in_fp8": False,
@@ -9436,25 +9930,44 @@ class FastMLXModel:
             model._is_vlm_model = False
 
             model._config = config
-            model._hf_repo = model_name
-            model._src_path = original_local_path or local_path
-            # Mirror the VLM branch: sidecar-saving uses the patched dir when one
-            # was materialized (no-op for text, where local_path == original).
-            model._config_src_path = local_path or original_local_path
-            model._unsloth_base_revision = revision
-            model._unsloth_base_commit_hash = _infer_snapshot_commit(
-                original_local_path or local_path
-            )
+            if dequant_temp_dir is not None:
+                # Point save/reload at the real repo, not the deleted temp dir.
+                model._hf_repo = _prequant_model_name
+                model._src_path = _prequant_src_path
+                model._config_src_path = _prequant_src_path
+                model._unsloth_base_revision = revision
+                model._unsloth_base_commit_hash = _infer_snapshot_commit(
+                    _prequant_src_path
+                )
+            else:
+                model._hf_repo = model_name
+                model._src_path = original_local_path or local_path
+                model._config_src_path = local_path or original_local_path
+                model._unsloth_base_revision = revision
+                model._unsloth_base_commit_hash = _infer_snapshot_commit(
+                    original_local_path or local_path
+                )
             model.max_seq_length = max_seq_length
             model._unsloth_patch_mode = patch_mode
             model._unsloth_full_finetuning = bool(full_finetuning)
             if quant_state == "compatible":
-                model._unsloth_quantization_config = _get_existing_mlx_quantization(config_data)
+                # Repacked GPTQ keeps quant_method, as native AWQ does, so an adapter reload replays it.
+                model._unsloth_quantization_config = (
+                    {**config_data["quantization"], "quant_method": hf_prequant_method}
+                    if dequant_temp_dir is not None
+                    else _get_existing_mlx_quantization(config_data)
+                )
                 model._unsloth_quantization_policy = quantization_spec.to_metadata()
                 model._unsloth_quantized_source = "mlx_config"
             _patch_mixed_precision_set_dtype(model)
 
             _patch_mlx_saving(model, tokenizer)
+
+            if dequant_temp_dir is not None:
+                import mlx.core as mx
+
+                mx.eval(model.parameters())
+                shutil.rmtree(dequant_temp_dir, ignore_errors=True)
             return _finish_load(model, tokenizer)
 
     @staticmethod

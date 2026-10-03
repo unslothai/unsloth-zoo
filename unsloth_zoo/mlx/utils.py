@@ -18128,6 +18128,8 @@ _MODEL_WEIGHT_SUFFIXES = (
     ".pth",
 )
 _MODEL_SIDECAR_SUFFIXES = (".json", ".jinja", ".model", ".txt", ".py")
+# Merged saves emit MLX weights, so a copied GPTQ/AWQ descriptor would mis-detect the export as packed.
+_PACKED_QUANT_SIDECARS = frozenset({"quantize_config.json", "quant_config.json"})
 
 
 def _asset_link_stays_in_the_model(file, source):
@@ -18294,6 +18296,8 @@ def _copy_source_sidecars(src_path, path):
             continue
         name = source.name
         if name in _CORE_SAVE_FILENAMES:
+            continue
+        if name in _PACKED_QUANT_SIDECARS:
             continue
         if name.startswith("model-") or name.startswith("pytorch_model"):
             continue
