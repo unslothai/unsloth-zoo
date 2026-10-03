@@ -14,12 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""patch_torch_compile must not write dynamo config keys torch marks deprecated.
-
-torch 2.13 marks torch._dynamo.config.inline_inbuilt_nn_modules deprecated (it is
-always True) and emits a FutureWarning on every write, so `import unsloth` printed
-one. Older torches carry no `deprecated` flag on the entry and still get the write.
-"""
+"""patch_torch_compile must not write dynamo config keys torch marks deprecated (torch 2.13 warns on each write)."""
 
 import pytest
 
@@ -30,8 +25,6 @@ from unsloth_zoo.patching_utils import patch_torch_compile
 
 
 class _DeprecatedEntry:
-    """A real config entry that reports itself deprecated, like torch 2.13's."""
-
     deprecated = True
 
     def __init__(self, entry):
@@ -51,6 +44,5 @@ def test_deprecated_dynamo_key_is_not_written(monkeypatch):
     patch_torch_compile(debug = False, O3 = False, ignore_errors = True)
 
     assert getattr(dynamo_config, key) == "float64"
-    # Keys that are not deprecated are still applied.
     assert dynamo_config.recompile_limit == 1024
 
