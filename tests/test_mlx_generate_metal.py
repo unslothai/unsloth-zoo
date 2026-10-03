@@ -1132,6 +1132,135 @@ def test_nax_quantized_linear_scope_swaps_a_shared_module_once(monkeypatch):
     assert type(model.proj) is nn.QuantizedLinear and "_unsloth_nax_qmm_rows" not in model.proj
 
 
+@metal_only
+def test_vlm_cache_materialization_finishes_the_previous_snapshot(monkeypatch):
+    from unsloth_zoo.mlx.generate import _VLMCacheMaterializer
+
+    states = [mx.array([0.0]), mx.array([10.0])]
+    generator = types.SimpleNamespace(
+        _cache_eval_interval=2, _steps_counter=0, stream=mx.new_stream(mx.gpu),
+        _generation_batch=types.SimpleNamespace(cache_states=lambda: [states], prompt_cache=[]),
+    )
+    def advance():
+        with mx.stream(generator.stream):
+            states[0] = states[0] + 1
+            states[1][:] = states[1] - 3
+            generator._steps_counter += 1
+        return generator._steps_counter
+    generator.next = advance
+    evaluations, submissions = [], []
+    real_eval, real_async = mx.eval, mx.async_eval
+    monkeypatch.setattr(mx, "eval", lambda *xs: (evaluations.append(tuple(xs)), real_eval(*xs))[-1])
+    monkeypatch.setattr(mx, "async_eval", lambda *xs: (submissions.append(tuple(xs)), real_async(*xs))[-1])
+    materializer = _VLMCacheMaterializer(generator)
+    try:
+        assert generator._cache_eval_interval == 0
+        assert materializer.next() == 1
+        assert not submissions and not evaluations
+        assert materializer.next() == 2
+        snapshot = submissions[0]
+        assert len(submissions) == 1 and len(snapshot) == 2 and not evaluations
+        assert materializer.next() == 3
+        assert len(evaluations) == 1 and len(evaluations[0]) == 2
+        assert all(a is b for a, b in zip(evaluations[0], snapshot))
+        assert [x.item() for x in snapshot] == [2, 4]
+        assert [x.item() for x in states] == [3, 1]
+        assert materializer.next() == 4
+        final = submissions[-1]
+    finally:
+        materializer.close()
+    assert len(evaluations) == 2 and len(evaluations[1]) == 2
+    assert all(a is b for a, b in zip(evaluations[1], final))
+    assert [x.item() for x in final] == [4, -2]
+    assert generator._cache_eval_interval == 2 and not materializer.pending
+    assert materializer.generator is None
+    materializer.close()
+
+
+@metal_only
+@pytest.mark.parametrize("interval", [0, None, 2, "missing"])
+def test_vlm_cache_materialization_preserves_unknown_or_disabled_generators(interval):
+    from unsloth_zoo.mlx.generate import _VLMCacheMaterializer
+
+    generator = types.SimpleNamespace(
+        _cache_eval_interval=interval, _steps_counter=0, stream=mx.new_stream(mx.gpu),
+        _generation_batch=types.SimpleNamespace(prompt_cache=[]), next=lambda: "unchanged",
+    )
+    if interval == 2:
+        del generator.stream
+    elif interval == "missing":
+        del generator._cache_eval_interval
+    materializer = _VLMCacheMaterializer(generator)
+    assert materializer.next() == "unchanged"
+    materializer.close()
+    assert getattr(generator, "_cache_eval_interval", "missing") == interval
+
+
+@metal_only
+def test_vlm_cache_materialization_drains_before_a_failed_step(monkeypatch):
+    from unsloth_zoo.mlx.generate import _VLMCacheMaterializer
+
+    state = mx.array([4.0, -3.0]) * 2
+    generator = types.SimpleNamespace(
+        _cache_eval_interval=1, _steps_counter=0, stream=mx.new_stream(mx.gpu),
+        _generation_batch=types.SimpleNamespace(prompt_cache=[types.SimpleNamespace(state=[state])]),
+    )
+    def advance():
+        if generator._steps_counter:
+            raise RuntimeError("decode failed")
+        generator._steps_counter += 1
+        return 1
+    generator.next = advance
+    materializer = _VLMCacheMaterializer(generator)
+    assert materializer.next() == 1
+    pending = materializer.pending[0]
+    assert pending is not state
+    evaluations = []
+    real_eval = mx.eval
+    monkeypatch.setattr(mx, "eval", lambda *xs: (evaluations.append(tuple(xs)), real_eval(*xs))[-1])
+    with pytest.raises(RuntimeError, match="decode failed"):
+        materializer.next()
+    assert len(evaluations) == 1 and evaluations[0][0] is pending
+    materializer.close()
+    assert len(evaluations) == 1 and evaluations[0][0] is pending
+    assert not materializer.pending and state.tolist() == [8, -6]
+    assert generator._cache_eval_interval == 1
+
+
+@metal_only
+def test_vlm_cache_materialization_reuses_cache_buffers():
+    from unsloth_zoo.mlx.generate import _VLMCacheMaterializer
+
+    states = [mx.ones((1024, 1024)), mx.full((1024, 1024), 2.0)]
+    mx.eval(states)
+    generator = types.SimpleNamespace(
+        _cache_eval_interval=1, _steps_counter=0, stream=mx.new_stream(mx.gpu),
+        _generation_batch=types.SimpleNamespace(cache_states=lambda: [states], prompt_cache=[]),
+    )
+    def advance():
+        with mx.stream(generator.stream):
+            generator._steps_counter += 1
+            for index, state in enumerate(states):
+                state[index, index + 1] = generator._steps_counter * (1 if index else -1)
+            mx.eval(states)
+        return generator._steps_counter
+    generator.next = advance
+    materializer = _VLMCacheMaterializer(generator)
+    try:
+        initial = mx.get_active_memory()
+        materializer.next()
+        mx.eval(materializer.pending)
+        assert mx.get_active_memory() - initial < 1024 * 1024
+        mx.reset_peak_memory()
+        initial = mx.get_active_memory()
+        materializer.next()
+        mx.eval(materializer.pending)
+        assert mx.get_peak_memory() - initial < 1024 * 1024
+        assert [state[index, index + 1].item() for index, state in enumerate(states)] == [-2, 2]
+    finally:
+        materializer.close()
+
+
 @real_mlx_only
 @pytest.mark.parametrize("vlm", [False, True], ids = ["text", "vlm"])
 def test_loader_generate_enters_the_nax_scope(monkeypatch, vlm):
