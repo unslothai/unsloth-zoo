@@ -2926,6 +2926,32 @@ def torch_native_forward(
             offset += count
         next_states = next_states.view(batch_size, -1, self.hidden_size)
         return next_states.to(torch.float32)
+    elif not torch.compiler.is_compiling():
+        # Eager inference: run only the routed experts. The dense branch below runs every
+        # expert for every token, num_experts / top_k times the work and 2 * num_experts
+        # Linear4bit launches per layer (64 for gpt-oss-20b), which leaves eager decode launch
+        # bound. This costs one host sync per layer; a compiled decode keeps the dense branch.
+        dtype = torch.float32 if hidden_states.dtype != torch.bfloat16 else hidden_states.dtype
+        with torch.no_grad():
+            flat_experts = router_indices.flatten()
+            token_ids = torch.arange(num_tokens, device=hidden_states.device).repeat_interleave(top_k)
+            sorted_idx = flat_experts.argsort(stable=True)
+            sorted_tokens = token_ids[sorted_idx]
+            counts = torch.bincount(flat_experts, minlength=num_experts).tolist()
+        next_states = torch.zeros(num_tokens, self.hidden_size, dtype=torch.float32, device=hidden_states.device)
+        device_type = hidden_states.device.type if isinstance(hidden_states.device.type, str) and hidden_states.device.type != "mps" else "cpu"
+        offset = 0
+        for expert_idx, count in enumerate(counts):
+            if count == 0:
+                continue
+            token_idx = sorted_tokens[offset:offset + count]
+            gate_up = self.gate_up_projs[expert_idx](hidden_states[token_idx])
+            fused = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = dtype)
+            with torch.autocast(device_type=device_type, enabled=False):
+                out = self.down_projs[expert_idx](fused.to(dtype))
+            next_states.index_add_(0, token_idx, out.to(torch.float32) * routing_weights[token_idx, expert_idx, None].to(torch.float32))
+            offset += count
+        return next_states.view(batch_size, -1, self.hidden_size).to(hidden_states.dtype)
     else:
         X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
         gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
