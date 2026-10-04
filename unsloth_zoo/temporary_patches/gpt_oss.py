@@ -40,6 +40,7 @@ from .common import (
 from importlib.metadata import version as importlib_version
 from unsloth_zoo.utils import Version
 from unsloth_zoo.mxfp4_dequant import is_mxfp4_expert_param
+from .gpt_oss_routed import ROUTED_MAX_SLOTS, routed_experts_forward, routed_mlp_forward
 transformers_version = Version(importlib_version("transformers"))
 has_static_cache = transformers_version >= Version("4.56.0.dev0")
 from .utils import (
@@ -2285,11 +2286,27 @@ def _mxfp4_ogs_decode(self, hidden_states):
         return None
 
 
+def _has_active_expert_lora(experts):
+    """True when a PEFT adapter on the expert parameters would change the output."""
+    m = experts
+    while hasattr(m, "base_layer"):
+        if hasattr(m, "lora_A") and len(m.lora_A) and not getattr(m, "merged", False) \
+                and not getattr(m, "disable_adapters", False):
+            return True
+        m = m.base_layer
+    return False
+
+
 def moe_forward_inference_bf16(self, hidden_states):
     """Wrapper that extracts weights from ParameterModule before calling the compiled kernel."""
     out = _mxfp4_ogs_decode(self, hidden_states)
     if out is not None:
         return out
+    if _has_active_expert_lora(self.experts):
+        # The fused kernel below reads the unwrapped base expert weights, so it would
+        # silently drop expert LoRA; the module forward applies it.
+        out = self(hidden_states)
+        return out[0] if isinstance(out, tuple) else out
     router_scores, router_indices = moe_router_forward(self.router, hidden_states)
     routing_weights = router_scores
 
@@ -2927,34 +2944,11 @@ def torch_native_forward(
         next_states = next_states.view(batch_size, -1, self.hidden_size)
         return next_states.to(torch.float32)
     elif (
-        num_tokens * top_k <= 4 * num_experts
-        and os.environ.get("UNSLOTH_GPTOSS_ROUTED_INFERENCE", "1") != "0"
-        and not torch.compiler.is_compiling()
-        and not (hidden_states.is_cuda and torch.cuda.is_current_stream_capturing())
+        num_tokens * top_k <= ROUTED_MAX_SLOTS
+        and (routed := routed_experts_forward(self, hidden_states, router_indices, routing_weights)) is not None
     ):
-        # Eager decode: run only the routed experts (dense runs all, launch bound). Costs one host
-        # sync per layer, so prefill, compile and CUDA graph capture keep the sync-free dense branch.
-        dtype = torch.float32 if hidden_states.dtype != torch.bfloat16 else hidden_states.dtype
-        with torch.no_grad():
-            flat_experts = router_indices.flatten()
-            token_ids = torch.arange(num_tokens, device=hidden_states.device).repeat_interleave(top_k)
-            sorted_idx = flat_experts.argsort(stable=True)
-            sorted_tokens = token_ids[sorted_idx]
-            counts = torch.bincount(flat_experts, minlength=num_experts).tolist()
-        next_states = torch.zeros(num_tokens, self.hidden_size, dtype=torch.float32, device=hidden_states.device)
-        device_type = hidden_states.device.type if isinstance(hidden_states.device.type, str) and hidden_states.device.type != "mps" else "cpu"
-        offset = 0
-        for expert_idx, count in enumerate(counts):
-            if count == 0:
-                continue
-            token_idx = sorted_tokens[offset:offset + count]
-            gate_up = self.gate_up_projs[expert_idx](hidden_states[token_idx])
-            fused = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = dtype)
-            with torch.autocast(device_type=device_type, enabled=False):
-                out = self.down_projs[expert_idx](fused.to(dtype))
-            next_states.index_add_(0, token_idx, out.to(torch.float32) * routing_weights[token_idx, expert_idx, None].to(torch.float32))
-            offset += count
-        return next_states.view(batch_size, -1, self.hidden_size).to(hidden_states.dtype)
+        # Decode-sized eval calls read only the routed experts, with no host sync.
+        return routed.view(batch_size, -1, self.hidden_size)
     else:
         X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
         gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
@@ -3779,7 +3773,10 @@ def patch_GptOssModel():
                     **kwargs,
                 )
                 _actual_experts = _unwrap_peft_experts(decoder_layer.mlp.experts)
-                if hasattr(_actual_experts, "gate_up_projs"):
+                routed = routed_mlp_forward(decoder_layer.mlp, hidden_states)
+                if routed is not None:
+                    hidden_states = routed
+                elif hasattr(_actual_experts, "gate_up_projs"):
                     hidden_states = moe_forward_inference(
                         decoder_layer.mlp, hidden_states
                     )
