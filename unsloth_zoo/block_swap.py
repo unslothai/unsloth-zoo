@@ -84,7 +84,8 @@ class _Registered:
 
     def __init__(self, buf, nbytes):
         self.buf, self.ptr = buf, None
-        rc = torch.cuda.cudart().cudaHostRegister(buf.data_ptr(), nbytes, 0)
+        # cudaHostRegisterPortable: pinned for every device's context, since blocks may fetch onto several cards.
+        rc = torch.cuda.cudart().cudaHostRegister(buf.data_ptr(), nbytes, 1)
         if int(rc) != 0:
             raise RuntimeError(f"cudaHostRegister failed: {rc}")
         self.ptr = buf.data_ptr()

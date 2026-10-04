@@ -854,3 +854,15 @@ def test_lora_count_includes_gpt2_conv1d_projections():
     block.c_attn = Conv1D(3 * 64, 64)
     block.c_proj = Conv1D(64, 64)
     assert _mod.lora_param_count([block], r = 16) == 16 * ((64 + 192) + (64 + 64))
+
+
+def test_host_arena_is_registered_portable(monkeypatch):
+    # Blocks may fetch onto several cards: the arena must count as pinned in every device's context.
+    import types
+    calls = []
+    fake = types.SimpleNamespace(cudaHostRegister = lambda ptr, n, flags: calls.append(flags) or 0,
+                                 cudaHostUnregister = lambda ptr: 0)
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: fake)
+    reg = _mod._Registered(torch.empty(1024, dtype = torch.uint8), 1024)
+    assert calls == [1]  # cudaHostRegisterPortable
+    del reg
