@@ -39,6 +39,8 @@ from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 import transformers.models.gpt_oss.modeling_gpt_oss as M
 from unsloth_zoo.temporary_patches import gpt_oss as G
 G.patch_GptOssModel()
+if 'patch_GptOssModel' not in getattr(M.GptOssModel.forward, '__qualname__', ''):
+    print('SKIP patched GptOssModel.forward not installed on this transformers'); raise SystemExit(0)
 
 L, T = 2, 8
 c = GptOssConfig(
@@ -79,6 +81,9 @@ print('RESULT', json.dumps({'unsafe_copies': rec.unsafe, 'max_diff': (out - ref)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA for an asynchronous device -> host copy")
 def test_offloaded_embedding_reads_finished_input_ids():
     proc = subprocess.run([sys.executable, "-c", _RUNTIME], capture_output = True, text = True, timeout = 600)
+    skip = [l for l in proc.stdout.splitlines() if l.startswith("SKIP ")]
+    if skip:
+        pytest.skip(skip[0][len("SKIP "):])
     lines = [l for l in proc.stdout.splitlines() if l.startswith("RESULT ")]
     assert proc.returncode == 0 and lines, proc.stdout[-2000:] + proc.stderr[-4000:]
     res = json.loads(lines[-1][len("RESULT "):])

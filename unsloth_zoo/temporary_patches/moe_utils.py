@@ -3070,6 +3070,28 @@ def _can_fold_moe_lora_through_peft(experts_module, parameter_name: str) -> bool
 _original_param_wrapper_forward = None
 
 
+
+def _gpt_oss_routed_wrapper_forward(wrapper, experts_module, x, args, kwargs):
+    """gpt-oss eval decode through the outermost expert ParamWrapper: only the routed experts,
+    with every adapter in the chain applied. None for anything else (callers run as before)."""
+    if torch.is_grad_enabled() or type(experts_module).__name__ != "GptOssExperts":
+        return None
+    if getattr(wrapper, "_unsloth_inner_expert_wrapper", False):
+        return None
+    inner = wrapper.base_layer
+    while hasattr(inner, "base_layer"):
+        # An inner wrapper sees only part of the adapter chain, so it must never route.
+        inner._unsloth_inner_expert_wrapper = True
+        inner = inner.base_layer
+    router_indices = kwargs.get("router_indices", args[0] if len(args) > 0 else None)
+    routing_weights = kwargs.get("routing_weights", args[1] if len(args) > 1 else None)
+    if router_indices is None or routing_weights is None:
+        return None
+    from unsloth_zoo.temporary_patches.gpt_oss_routed import ROUTED_MAX_SLOTS, routed_bf16_eligible, routed_bf16_forward
+    if router_indices.numel() > ROUTED_MAX_SLOTS or not routed_bf16_eligible(wrapper, x):
+        return None
+    return routed_bf16_forward(wrapper, x, router_indices, routing_weights)
+
 def _patched_param_wrapper_forward(
     self, x: torch.Tensor, *args, **kwargs
 ) -> torch.Tensor:
@@ -3089,6 +3111,10 @@ def _patched_param_wrapper_forward(
     experts_module = self.get_base_layer()
 
     param_name = getattr(self, "parameter_name", None)
+
+    routed = _gpt_oss_routed_wrapper_forward(self, experts_module, x, args, kwargs)
+    if routed is not None:
+        return routed
 
     if _wrapper_uses_separated_moe_lora(self, experts_module):
         # MoE experts: bypass PEFT's _activate_lora, use separated computation.

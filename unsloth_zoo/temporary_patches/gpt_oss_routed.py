@@ -635,10 +635,13 @@ def routed_bf16_forward(experts, hidden_states, router_indices, routing_weights)
     shape = hidden_states.shape
     H = base.hidden_size if hasattr(base, "hidden_size") else shape[-1]
     x = hidden_states.reshape(-1, H)
-    T, top_k = router_indices.shape[0], router_indices.shape[-1]
+    top_k = router_indices.shape[-1]
+    T = router_indices.numel() // top_k
     idx = router_indices.reshape(T, top_k)
+    # Dense [.., E] (zero off the picked experts) or top-k [.., top_k], any leading dims.
+    routing_weights = routing_weights.reshape(T, -1)
     if routing_weights.shape[-1] != top_k:
-        routing_weights = routing_weights.reshape(T, -1).gather(1, idx)
+        routing_weights = routing_weights.gather(1, idx)
     flat = idx.reshape(-1)
     w_gu = _expert_weight_3d(base.gate_up_proj)
     w_dn = _expert_weight_3d(base.down_proj)
