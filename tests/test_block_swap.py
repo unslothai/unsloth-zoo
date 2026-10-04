@@ -769,9 +769,18 @@ def test_host_load_moves_a_layer_only_once_all_its_weights_landed():
     assert state.done == {3}
 
 
+def _core_model_loading_or_none():
+    # Same lookup load_layers_to_host does. Not find_spec: on transformers 4 unsloth registers a
+    # stand-in transformers.core_model_loading with __spec__ None, and find_spec raises ValueError
+    # on it, which failed this test on the HF 4.57 leg while the code under test was fine.
+    try:
+        return importlib.import_module("transformers.core_model_loading")
+    except ImportError:
+        return None
+
+
 def test_load_layers_to_host_restores_what_it_patched():
-    core = importlib.import_module("transformers.core_model_loading") \
-        if importlib.util.find_spec("transformers.core_model_loading") else None
+    core = _core_model_loading_or_none()
     mu = importlib.import_module("transformers.modeling_utils")
     before = (getattr(core, "set_param_for_module", None), getattr(mu, "caching_allocator_warmup", None),
               os.environ.get("HF_DEACTIVATE_ASYNC_LOAD"))
