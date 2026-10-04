@@ -3723,7 +3723,7 @@ def patch_GptOssModel():
         # is_decoding = is_flex_attention_decoding(self.layers[0].self_attn, hidden_states)
         bsz, qlen, hd = hidden_states.shape
         block_swap = getattr(self.layers, "_unsloth_block_swap", None)
-        # Swapped blocks fetch onto the head's card; across cards (embedding included) only the hooked path moves inputs.
+        # Across cards (embedding included) only the swapper's hooks move inputs: take the hooked path.
         _swap_device = getattr(block_swap, "layer_device", None)
         _cross_card = getattr(block_swap, "spans_devices", False) or (
             _swap_device is not None and hidden_states.device != _swap_device

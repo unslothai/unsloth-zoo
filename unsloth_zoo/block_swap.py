@@ -621,8 +621,7 @@ def _layer_signature(params):
 
 
 def _pool_bytes(sizes, depth, sigs = None):
-    # One pool per shape signature, depth + 1 slots each (fewer if fewer blocks share it); BlockSwap keys
-    # pools on layout, so equal-size blocks with different shapes need a pool each.
+    # One pool per shape signature (as BlockSwap keys them), depth + 1 slots each, fewer if fewer blocks share it.
     depth = max(1, depth)  # as BlockSwap
     counts = {}
     for i, b in enumerate(sizes):

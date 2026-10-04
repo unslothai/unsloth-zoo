@@ -2801,8 +2801,7 @@ def plan_block_swap(
     layers = find_decoder_layers(model)
     names = [_name_of_module(model, layer) for layer in layers]
     sizes = _compute_module_sizes(model, hf_quantizer)
-    # BlockSwap moves parameters only: buffers (rotary / mask caches) stay resident.
-    # Params shared across layers (or a block listed twice) stay on the card under BlockSwap: no savings.
+    # BlockSwap moves unshared parameters only: buffers and tensors shared across layers stay on the card.
     owners = {}
     for i, layer in enumerate(layers):
         for p in layer.parameters():
@@ -2857,8 +2856,7 @@ def plan_block_swap(
         if len(devices) == 1:
             resident = total - sum(out) - (streamed if use_embedding else 0)
             off = embedding if use_embedding else 0
-            # Training needs the reserve; the slot pool is allocated while the embedding is still on the card,
-            # and each streamed table lands on the card whole before it moves.
+            # Peaks: training (reserve), attach (pool beside the embedding), load (a whole streamed table in flight).
             in_flight = largest_table if use_embedding else 0
             ok = (
                 resident - off + pool + reserve_bytes <= budgets[devices[0]]
