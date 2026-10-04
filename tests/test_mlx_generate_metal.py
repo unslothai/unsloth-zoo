@@ -1136,6 +1136,7 @@ def test_nax_quantized_linear_scope_swaps_a_shared_module_once(monkeypatch):
 def test_vlm_cache_materialization_finishes_the_previous_snapshot(monkeypatch):
     from unsloth_zoo.mlx.generate import _VLMCacheMaterializer
 
+    monkeypatch.setenv("MLX_VLM_BATCH_CACHE_EVAL_INTERVAL", "2")
     states = [mx.array([0.0]), mx.array([10.0])]
     generator = types.SimpleNamespace(
         _cache_eval_interval=2, _steps_counter=0, stream=mx.new_stream(mx.gpu),
@@ -1200,6 +1201,7 @@ def test_vlm_cache_materialization_preserves_unknown_or_disabled_generators(inte
 def test_vlm_cache_materialization_drains_before_a_failed_step(monkeypatch):
     from unsloth_zoo.mlx.generate import _VLMCacheMaterializer
 
+    monkeypatch.setenv("MLX_VLM_BATCH_CACHE_EVAL_INTERVAL", "1")
     state = mx.array([4.0, -3.0]) * 2
     generator = types.SimpleNamespace(
         _cache_eval_interval=1, _steps_counter=0, stream=mx.new_stream(mx.gpu),
@@ -1228,9 +1230,38 @@ def test_vlm_cache_materialization_drains_before_a_failed_step(monkeypatch):
 
 
 @metal_only
-def test_vlm_cache_materialization_reuses_cache_buffers():
+@pytest.mark.parametrize("configured, upstream, steps", [(None, 50, 256), ("50", 50, 50), (None, 300, 300)])
+def test_vlm_cache_materialization_spaces_out_the_default_interval(monkeypatch, configured, upstream, steps):
     from unsloth_zoo.mlx.generate import _VLMCacheMaterializer
 
+    if configured is None:
+        monkeypatch.delenv("MLX_VLM_BATCH_CACHE_EVAL_INTERVAL", raising=False)
+    else:
+        monkeypatch.setenv("MLX_VLM_BATCH_CACHE_EVAL_INTERVAL", configured)
+    state = mx.array([1.0])
+    generator = types.SimpleNamespace(
+        _cache_eval_interval=upstream, _steps_counter=0, stream=mx.new_stream(mx.gpu),
+        _generation_batch=types.SimpleNamespace(cache_states=lambda: [state], prompt_cache=[]),
+    )
+    def advance():
+        generator._steps_counter += 1
+    generator.next = advance
+    materializer = _VLMCacheMaterializer(generator)
+    flushed = []
+    for _ in range(600):
+        materializer.next()
+        if materializer.pending:
+            flushed.append(generator._steps_counter)
+    materializer.close()
+    assert flushed[0] == steps and len(flushed) == 600 // steps
+    assert generator._cache_eval_interval == upstream
+
+
+@metal_only
+def test_vlm_cache_materialization_reuses_cache_buffers(monkeypatch):
+    from unsloth_zoo.mlx.generate import _VLMCacheMaterializer
+
+    monkeypatch.setenv("MLX_VLM_BATCH_CACHE_EVAL_INTERVAL", "1")
     states = [mx.ones((1024, 1024)), mx.full((1024, 1024), 2.0)]
     mx.eval(states)
     generator = types.SimpleNamespace(

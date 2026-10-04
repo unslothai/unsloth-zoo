@@ -2962,12 +2962,16 @@ def generate_batch(
     return results
 
 
+# mlx-vlm flushes cache states every 50 steps and each flush idles the GPU for about a step; mlx-lm uses 256.
+_VLM_CACHE_EVAL_INTERVAL = 256
+
+
 class _VLMCacheMaterializer:
 
     def __init__(self, generator):
         self.generator = generator
         self.pending = []
-        self.interval = getattr(generator, "_cache_eval_interval", 0)
+        self.interval = self.restore = getattr(generator, "_cache_eval_interval", 0)
         self.stream = getattr(generator, "stream", None)
         if not (
             isinstance(self.interval, int) and self.interval > 0
@@ -2978,6 +2982,8 @@ class _VLMCacheMaterializer:
             self.interval = 0
         if self.interval:
             generator._cache_eval_interval = 0
+            if "MLX_VLM_BATCH_CACHE_EVAL_INTERVAL" not in os.environ:
+                self.interval = max(self.interval, _VLM_CACHE_EVAL_INTERVAL)
 
     def next(self):
         if not self.interval:
@@ -3015,7 +3021,7 @@ class _VLMCacheMaterializer:
         finally:
             self.pending = []
             if self.interval:
-                self.generator._cache_eval_interval = self.interval
+                self.generator._cache_eval_interval = self.restore
             self.generator = None
             self.interval = 0
 
