@@ -2839,7 +2839,7 @@ def plan_block_swap(
         return [layer_bytes[i] for i in swap_indices(L, n, placement)]
 
     # `embedding` sits on the card during the load and moves after it; `streamed` tables move as they load.
-    embedding = streamed = 0
+    embedding = streamed = largest_table = 0
     if offload_embedding and len(devices) == 1:
         head_name, head_mod = resolve_output_head(model)
         getter = getattr(model, "get_input_embeddings", None)
@@ -2847,7 +2847,8 @@ def plan_block_swap(
         name = _name_of_module(model, inp) if inp is not None else None
         if name is not None and not head_is_tied(model, head_mod):
             embedding = sizes.get(name, 0)
-        streamed = sum(sizes.get(n, 0) for n, _ in extra_input_embeddings(model))
+        tables = [sizes.get(n, 0) for n, _ in extra_input_embeddings(model)]
+        streamed, largest_table = sum(tables), max(tables, default = 0)
     use_embedding = False
 
     def fits(n):
@@ -2856,8 +2857,13 @@ def plan_block_swap(
         if len(devices) == 1:
             resident = total - sum(out) - (streamed if use_embedding else 0)
             off = embedding if use_embedding else 0
-            # Training needs the reserve; the slot pool is allocated while the embedding is still on the card.
-            ok = resident - off + pool + reserve_bytes <= budgets[devices[0]] and resident + pool <= budgets[devices[0]]
+            # Training needs the reserve; the slot pool is allocated while the embedding is still on the card,
+            # and each streamed table lands on the card whole before it moves.
+            in_flight = largest_table if use_embedding else 0
+            ok = (
+                resident - off + pool + reserve_bytes <= budgets[devices[0]]
+                and resident + max(pool, in_flight) <= budgets[devices[0]]
+            )
             return ok, None
         excluded = [names[i] for i in swap_indices(L, n, placement)]
         # The slot pool lives on the head's card: accept a plan only if the head landed on the card charged.
