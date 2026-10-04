@@ -29,9 +29,11 @@ import pytest
 
 @pytest.fixture(autouse=True, scope="module")
 def _install_mlx_shim():
-    from mlx_simulation import simulate_mlx_on_torch
+    # Real MLX (Apple Silicon) needs no shim; the shim itself needs torch.
+    if importlib.util.find_spec("mlx") is None:
+        from mlx_simulation import simulate_mlx_on_torch
 
-    simulate_mlx_on_torch()
+        simulate_mlx_on_torch()
 
 
 def _exec_model_file(model_path, model_file):
