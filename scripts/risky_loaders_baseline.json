@@ -194,8 +194,8 @@
       "rule": "dynamic-import",
       "sink": "import_module",
       "digest": "59e72c01edb14c86",
-      "count": 1,
-      "reason": "Prefix-bounded to the installed mlx_lm / mlx_vlm package: a model's model_type can only select one of that package's own modules (#1083 removed the unbounded form)."
+      "count": 2,
+      "reason": "Prefix-bounded to the installed mlx_lm / mlx_vlm package: a model's model_type can only select one of that package's own modules (#1083 removed the unbounded form). The model_file guard's site iterates the fixed names mlx_lm.utils / mlx_vlm.utils."
     },
     {
       "file": "unsloth_zoo/mlx/loader.py",
