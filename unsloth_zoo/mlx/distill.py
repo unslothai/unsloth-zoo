@@ -341,6 +341,10 @@ def load_teacher(model_name_or_path):
     from mlx.utils import tree_flatten
     from mlx_lm import load
 
+    from .loader import _install_mlx_model_file_guard
+
+    # Teachers never opt into repository code: refuse a config.json model_file.
+    _install_mlx_model_file_guard()
     teacher, teacher_tokenizer = load(model_name_or_path)
     teacher.eval()
     teacher.freeze()
