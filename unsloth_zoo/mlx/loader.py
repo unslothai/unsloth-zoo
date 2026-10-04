@@ -8334,9 +8334,11 @@ def _finish_load(model, tokenizer):
 
 
 def _warn_block_swap(kwargs):
-    if kwargs.pop("block_swap_layers", 0):
-        print("Unsloth: block_swap_layers has no effect on Apple Silicon; "
-              "unified memory has no separate RAM to swap to.")
+    # block_swap_layers is the original name of offload_layers; drop both.
+    requested = [kwargs.pop("offload_layers", 0), kwargs.pop("block_swap_layers", 0)]
+    if any(requested):
+        print("Unsloth: offload_layers has no effect on Apple Silicon; "
+              "unified memory has no separate RAM to offload to.")
 
 
 class FastMLXModel:
