@@ -196,3 +196,22 @@ def test_decode_path_applies_expert_lora():
         got = moe_forward_inference_bf16(mlp, x).float()
     assert (ref - off).abs().max() > 1e-2
     torch.testing.assert_close(got.reshape(ref.shape), ref, atol = 2e-2, rtol = 2e-2)
+
+
+def test_param_wrapper_hook_routes_only_at_the_outermost_wrapper():
+    from unsloth_zoo.temporary_patches.moe_utils import _gpt_oss_routed_wrapper_forward
+    _, mlp = _toy(lora = True)
+    outer = mlp.experts
+    assert hasattr(outer, "base_layer") and hasattr(outer.base_layer, "base_layer")
+    base = outer.get_base_layer()
+    x = torch.randn(3, H, device = "cuda", dtype = torch.bfloat16)
+    idx, weights = _routes(3, seed = 5)
+    with torch.no_grad():
+        got = _gpt_oss_routed_wrapper_forward(outer, base, x, (), {"router_indices": idx, "routing_weights": weights})
+        # An inner wrapper sees only part of the adapter chain, so it must decline.
+        assert _gpt_oss_routed_wrapper_forward(outer.base_layer, base, x, (), {"router_indices": idx, "routing_weights": weights}) is None
+    assert got is not None
+    ref = _reference(outer, x, idx, weights)
+    assert (got.float().reshape_as(ref) - ref).abs().max().item() < 2e-2 * max(1.0, ref.abs().max().item())
+    # Grad-enabled calls keep the module forward.
+    assert _gpt_oss_routed_wrapper_forward(outer, base, x, (), {"router_indices": idx, "routing_weights": weights}) is None
