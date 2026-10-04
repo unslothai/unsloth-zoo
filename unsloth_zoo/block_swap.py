@@ -541,13 +541,19 @@ class BlockSwap:
 
 
 def _text_config(config):
+    candidates = []
     get = getattr(config, "get_text_config", None)
     if callable(get):
         try:
-            return get()
+            candidates.append(get())
         except Exception:
             pass
-    return config
+    # T5Gemma on transformers 4.56 returns the outer config, which has no width: try the sub-configs.
+    candidates += [getattr(config, "text_config", None), getattr(config, "decoder", None), config]
+    for c in candidates:
+        if c is not None and any(getattr(c, k, None) for k in ("hidden_size", "n_embd", "d_model")):
+            return c
+    return next(c for c in candidates if c is not None)
 
 
 # Measured 42 on Llama-3.1-8B 4-bit with Unsloth checkpointing, rounded up.

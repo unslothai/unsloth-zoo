@@ -836,3 +836,13 @@ def test_transformers_4_load_streams_tables_shard_by_shard(monkeypatch):
     with _mod.load_layers_to_host(1, embeddings = True) as state:
         mu._load_state_dict_into_meta_model(model)
         assert state.embeddings == [model.per_layer]
+
+
+def test_reserve_reads_the_decoder_width_when_the_text_config_is_the_outer_one():
+    import types
+    decoder = types.SimpleNamespace(hidden_size = 64, vocab_size = 100)
+    # T5Gemma on transformers 4.56: get_text_config() hands back the outer config, which has no width.
+    outer = types.SimpleNamespace(decoder = decoder, vocab_size = 100)
+    outer.get_text_config = lambda: outer
+    got = estimate_training_reserve_bytes(outer, 128, safety_bytes = 0, fragmentation = 0)
+    assert got == estimate_training_reserve_bytes(decoder, 128, safety_bytes = 0, fragmentation = 0) > 0
