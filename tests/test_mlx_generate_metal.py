@@ -1158,7 +1158,7 @@ def _packed_codes(codes, bits):   # MLX's layout: a little-endian bitstream of `
 
 @pytest.mark.parametrize("group_size", [32, 64, 128])
 @pytest.mark.parametrize("bits", [3, 4, 5, 6, 8])
-@metal_only
+@nax_only
 def test_nax_int8_prefill_partial_is_exact(bits, group_size):
     import numpy as np
     from unsloth_zoo.mlx import nax
@@ -1220,7 +1220,7 @@ class _QuantizedMoE(nn.Module):
         return self.proj(x), self.small(x) + self.odd(x), self.moe(x, indices)
 
 
-@metal_only
+@nax_only
 def test_nax_int8_prefill_routes_dense_and_expert_calls_from_their_row_minimum(monkeypatch):
     from unsloth_zoo.mlx import inference, nax
     from unsloth_zoo.mlx.generate import generation_mode
@@ -1281,7 +1281,7 @@ def test_nax_int8_prefill_routes_dense_and_expert_calls_from_their_row_minimum(m
     assert all(inference._NAX_INT8_QMM_VERIFIED.values())
 
 
-@metal_only
+@nax_only
 def test_nax_int8_prefill_packs_moe_gate_and_up_in_either_scope_order(monkeypatch):
     import contextlib
     from unsloth_zoo.mlx import inference, nax
@@ -1318,7 +1318,7 @@ def test_nax_int8_prefill_packs_moe_gate_and_up_in_either_scope_order(monkeypatc
     assert mx.array_equal(*outputs).item()
 
 
-@metal_only
+@nax_only
 def test_nax_int8_prefill_checks_each_group_size_apart(monkeypatch):
     from mlx_lm.models.switch_layers import SwitchGLU
     from unsloth_zoo.mlx import inference, nax
@@ -1353,7 +1353,7 @@ def test_nax_int8_prefill_checks_each_group_size_apart(monkeypatch):
     assert all(inference._NAX_INT8_QMM_VERIFIED.values())
 
 
-@metal_only
+@nax_only
 def test_nax_int8_prefill_first_use_check_rejects_a_wrong_kernel(monkeypatch):
     from unsloth_zoo.mlx import inference, nax
 
@@ -1371,7 +1371,7 @@ def test_nax_int8_prefill_first_use_check_rejects_a_wrong_kernel(monkeypatch):
     assert list(inference._NAX_INT8_QMM_VERIFIED.values()) == [False]
 
 
-@metal_only
+@nax_only
 def test_nax_int8_prefill_first_use_check_accepts_all_zero_rows():
     import itertools
     from unsloth_zoo.mlx import inference, nax
@@ -1394,7 +1394,7 @@ def test_nax_int8_prefill_first_use_check_accepts_all_zero_rows():
     assert not inference._nax_int8_qmm_matches_native(x, wq, s, b, 64, 8, routed * 1.05, None)
 
 
-@metal_only
+@nax_only
 def test_nax_int8_prefill_differentiates_through_the_stock_op(monkeypatch):
     from unsloth_zoo.mlx import inference, nax
     from mlx.utils import tree_flatten
