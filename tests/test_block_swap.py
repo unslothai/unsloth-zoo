@@ -846,3 +846,11 @@ def test_reserve_reads_the_decoder_width_when_the_text_config_is_the_outer_one()
     outer.get_text_config = lambda: outer
     got = estimate_training_reserve_bytes(outer, 128, safety_bytes = 0, fragmentation = 0)
     assert got == estimate_training_reserve_bytes(decoder, 128, safety_bytes = 0, fragmentation = 0) > 0
+
+
+def test_lora_count_includes_gpt2_conv1d_projections():
+    from transformers.pytorch_utils import Conv1D
+    block = nn.Module()
+    block.c_attn = Conv1D(3 * 64, 64)
+    block.c_proj = Conv1D(64, 64)
+    assert _mod.lora_param_count([block], r = 16) == 16 * ((64 + 192) + (64 + 64))

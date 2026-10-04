@@ -583,6 +583,11 @@ def lora_param_count(layers, r = 16):
             if isinstance(i, int) and isinstance(o, int) and not list(module.children()):
                 total += r * (i + o)
                 continue
+            weight = getattr(module, "weight", None)
+            # transformers Conv1D (GPT-2 family): `nf` outputs, weight stored [in, out].
+            if isinstance(getattr(module, "nf", None), int) and weight is not None and weight.dim() == 2:
+                total += r * (weight.shape[0] + weight.shape[1])
+                continue
             for name, p in module.named_parameters(recurse = False):
                 if p.dim() == 3 and "lora_" not in name:
                     total += r * p.shape[0] * (p.shape[1] + p.shape[2])
