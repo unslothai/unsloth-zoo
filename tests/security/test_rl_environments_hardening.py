@@ -134,6 +134,9 @@ DEFERRED_EVALUATION = [
     ("string_local", 'def strategy(board):\n    move: "str" = "W"\n    return move\n'),
     ("rebound_literal", 'def strategy(board):\n    Literal = list\n    move: Literal["int"] = "W"\n    return move\n'),
     ("aliased_literal", 'def strategy(board):\n    from typing import List as Literal\n    move: Literal["int"] = "W"\n    return move\n'),
+    ("module_name_forward_ref", 'def strategy(board: "sys"):\n    return "W"\n'),
+    ("private_forward_ref", 'def strategy(board: "_x"):\n    return "W"\n'),
+    ("builtin_named_forward_ref", "def strategy(board):\n    class open:\n        pass\n    def g(x: 'open'):\n        return 1\n    return 'W'\n"),
     ("custom_class_positional", "def strategy(board):\n    class K:\n        pass\n    match board:\n        case K(a):\n            return a\n    return 'W'\n"),
 ]
 
@@ -159,6 +162,48 @@ def test_ordinary_annotations_and_literals_still_work():
         "    return best or 'S'\n"
     )
     assert create_locked_down_function(source)([[2, 0], [0, 2]]) == "A"
+
+
+def test_forward_reference_to_own_class_still_works():
+    """Model-written helper classes annotate with their own quoted name."""
+    source = (
+        "def matmul(A, B):\n"
+        "    class Matrix:\n"
+        "        def __init__(self, rows):\n"
+        "            self.rows = rows\n"
+        "        def __mul__(self, other: 'Matrix') -> 'Matrix':\n"
+        "            cols = list(zip(*other.rows))\n"
+        "            return Matrix([[sum(a * b for a, b in zip(r, c)) for c in cols] for r in self.rows])\n"
+        "    return (Matrix(A) * Matrix(B)).rows\n"
+    )
+    assert create_locked_down_function(source)([[1, 2]], [[3], [4]]) == [[11]]
+    # A quoted name the code never defines is a NameError at most, never code.
+    assert create_locked_down_function(
+        "def matmul(A: 'Matrix', B) -> 'Matrix':\n    return A\n"
+    )([[1]], [[2]]) == [[1]]
+
+
+def test_forward_ref_evaluate_is_denied_where_it_exists():
+    # 3.14 ForwardRef.evaluate runs its string with the real builtins.
+    escape = (
+        "def strategy(board):\n"
+        "    import typing\n"
+        "    return typing.get_args(typing.List['1 + 1'])[0].evaluate()\n"
+    )
+    own_method = (
+        "def strategy(board):\n"
+        "    class Board:\n"
+        "        def evaluate(self):\n"
+        "            return 'W'\n"
+        "    return Board().evaluate()\n"
+    )
+    if sys.version_info >= (3, 14):
+        with pytest.raises(RuntimeError, match = "evaluate"):
+            create_locked_down_function(escape)([[2]])
+    else:
+        with pytest.raises(AttributeError):
+            create_locked_down_function(escape)([[2]])
+        assert create_locked_down_function(own_method)([[2]]) == "W"
 
 
 def test_literal_through_typing_aliases_still_works():

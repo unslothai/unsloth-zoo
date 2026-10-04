@@ -552,6 +552,12 @@ _DENIED_ATTR_NAMES = frozenset({
     "gi_code", "gi_frame", "gi_running", "gi_yieldfrom",
     "tb_frame", "tb_lasti", "tb_lineno", "tb_next",
 })
+# 3.14 made ForwardRef.evaluate public, and it runs its string with the real
+# builtins. ForwardRefs come out of any generic (typing.get_args(List["..."]))
+# or TypeVar.evaluate_bound, so the sink is denied, only where it exists:
+# a model's own `board.evaluate()` keeps working on earlier versions.
+if sys.version_info >= (3, 14):
+    _DENIED_ATTR_NAMES = _DENIED_ATTR_NAMES | {"evaluate"}
 
 # Dunder methods a generated helper class may define. A method name is
 # FunctionDef.name, not a Name or Attribute node, so the walk below cannot see
@@ -735,9 +741,29 @@ def _bound_names(tree):
     return bound, literal_names - bound, typing_names - bound
 
 
+# Names a bare quoted annotation must not be: evaluated against the real builtins
+# or a library module's globals, these resolve to something the code could not
+# reach by writing the name itself.
+_UNSAFE_FORWARD_REFS = frozenset(dir(_py_builtins)) | frozenset(
+    getattr(sys, "stdlib_module_names", ())
+) | frozenset(sys.builtin_module_names) | frozenset(
+    name.partition(".")[0] for name in list(sys.modules)
+)
+
+
+def _is_plain_forward_ref(value):
+    # "Matrix" / "Node": one name lookup, never code. Private names, builtins and
+    # module names stay refused.
+    return (
+        value.isidentifier() and not value.startswith("_")
+        and value not in _UNSAFE_FORWARD_REFS
+    )
+
+
 def _annotation_strings(annotation, literal_names, typing_names):
     # Literal["W", "A"] arguments are values, never evaluated as code, so they
-    # stay allowed; every other string in an annotation is a forward reference.
+    # stay allowed, as does a plain forward reference ("Matrix"); every other
+    # string in an annotation is evaluated as code.
     stack = [annotation]
     while stack:
         sub = stack.pop()
@@ -748,7 +774,10 @@ def _annotation_strings(annotation, literal_names, typing_names):
                 and sub.value.value.id in typing_names)
         ):
             continue
-        if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+        if (
+            isinstance(sub, ast.Constant) and isinstance(sub.value, str)
+            and not _is_plain_forward_ref(sub.value)
+        ):
             yield sub
         stack.extend(ast.iter_child_nodes(sub))
 
