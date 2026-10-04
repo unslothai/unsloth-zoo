@@ -2022,6 +2022,16 @@ def test_block_swap_plan_counts_no_savings_for_a_block_listed_twice():
         plan_block_swap(model = model, max_memory = {0: total - 1}, reserve_bytes = 0)
 
 
+def test_block_swap_plan_skips_a_card_too_small_for_the_pool():
+    from unsloth_zoo.device_map_planner import plan_block_swap
+    model, total, layer = _swap_sizes()
+    # Three cards; the last (tried first for the pool) cannot hold three slots, so the next one takes it.
+    half = (total - layer) // 2
+    plan = plan_block_swap(model = model, max_memory = {0: half, 1: half, 2: 2 * layer - 1},
+                           reserve_bytes = 0, headroom_bytes = 0)
+    assert plan.layers == 4 and plan.device_plan.head_device == 1
+
+
 def test_block_swap_plan_refuses_when_one_layer_cannot_stay():
     from unsloth_zoo.device_map_planner import plan_block_swap
     model, total, layer = _swap_sizes()

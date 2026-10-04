@@ -2868,15 +2868,17 @@ def plan_block_swap(
         excluded = [names[i] for i in swap_indices(L, n, placement)]
         # The slot pool lives on the head's card: accept a plan only if the head landed on the card charged.
         for pool_device in (reversed(devices) if n else devices[:1]):
+            # plan_device_map applies the quantizer's haircut itself: hand it the raw budgets, the pool scaled to survive it.
+            max_memory = {
+                d: raw_budgets[d] - (pool * raw_budgets[d] // max(budgets[d], 1) if d == pool_device else 0)
+                for d in devices
+            }
+            if max_memory[pool_device] <= 0:
+                continue  # this card cannot hold the pool; try the next
             try:
                 plan = plan_device_map(
                     model,
-                    # plan_device_map applies the quantizer's haircut itself: hand it the raw budgets, the pool scaled to survive it.
-                    max_memory = {
-                        d: raw_budgets[d]
-                        - (pool * raw_budgets[d] // max(budgets[d], 1) if d == pool_device else 0)
-                        for d in devices
-                    },
+                    max_memory = max_memory,
                     rows_per_chunk = rows_per_chunk,
                     retained_rows = retained_rows,
                     headroom_bytes = headroom_bytes,
