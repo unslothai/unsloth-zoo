@@ -524,15 +524,12 @@ _DENIED_MODULE_ATTRS = frozenset({
     "typing.ForwardRef",
     "typing.evaluate_forward_ref",
     "typing.get_type_hints",
-    # Callers of get_type_hints: register() evaluates the function's string
-    # annotations, which the AST walk never sees.
+    # register() runs get_type_hints on string annotations.
     "functools.singledispatch",
     "functools.singledispatchmethod",
 })
 
-# Builtins whose positional class pattern binds the subject itself
-# (`case int(x)`). Any other positional pattern is a getattr of whatever
-# __match_args__ names, a string the AST walk never sees.
+# `case int(x)` binds the subject; other positional patterns getattr __match_args__ names.
 _SELF_MATCHING_TYPES = frozenset({
     "bool", "bytearray", "bytes", "dict", "float", "frozenset", "int", "list",
     "set", "str", "tuple",
@@ -553,10 +550,7 @@ _DENIED_ATTR_NAMES = frozenset({
     "gi_code", "gi_frame", "gi_running", "gi_yieldfrom",
     "tb_frame", "tb_lasti", "tb_lineno", "tb_next",
 })
-# 3.14 made ForwardRef.evaluate public, and it runs its string with the real
-# builtins. ForwardRefs come out of any generic (typing.get_args(List["..."]))
-# or TypeVar.evaluate_bound, so the sink is denied, only where it exists:
-# a model's own `board.evaluate()` keeps working on earlier versions.
+# 3.14 ForwardRef.evaluate runs its string with the real builtins; denied only where it exists.
 if sys.version_info >= (3, 14):
     _DENIED_ATTR_NAMES = _DENIED_ATTR_NAMES | {"evaluate"}
 
@@ -698,8 +692,7 @@ def _annotation_nodes(node):
 _TYPING_MODULES = frozenset({"typing", "typing_extensions"})
 
 
-# Binding nodes that only exist on newer Pythons (match is 3.10+, PEP 695 type
-# parameters 3.12+); an empty tuple makes the isinstance checks below false on 3.9.
+# Missing on older Pythons (match 3.10+, PEP 695 3.12+): an empty tuple matches nothing.
 def _ast_nodes(*names):
     return tuple(node for node in (getattr(ast, name, None) for name in names) if node is not None)
 
@@ -709,8 +702,7 @@ _MATCH_MAPPING_NODES = _ast_nodes("MatchMapping")
 
 
 def _bound_names(tree):
-    # Every name the code binds, plus the names that can only mean the real typing
-    # `Literal` / typing modules: bound by nothing except imports from the typing modules.
+    # Bound names, plus the Literal / typing names only real typing imports bind.
     bound, literal_names, typing_names = set(), {"Literal"}, set(_TYPING_MODULES)
     for node in ast.walk(tree):
         if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
@@ -742,9 +734,7 @@ def _bound_names(tree):
     return bound, literal_names - bound, typing_names - bound
 
 
-# Names a bare quoted annotation must not be: evaluated against the real builtins
-# or a library module's globals, these resolve to something the code could not
-# reach by writing the name itself.
+# Quoted names that resolve to a real builtin or module the code could not name itself.
 _UNSAFE_FORWARD_REFS = frozenset(dir(_py_builtins)) | frozenset(
     getattr(sys, "stdlib_module_names", ())
 ) | frozenset(sys.builtin_module_names) | frozenset(
@@ -753,8 +743,7 @@ _UNSAFE_FORWARD_REFS = frozenset(dir(_py_builtins)) | frozenset(
 
 
 def _is_plain_forward_ref(value):
-    # "Matrix" / "Node": one name lookup, never code. Private names, builtins and
-    # module names stay refused; NFKC first, as the compiler folds "ｅｖａｌ" to "eval".
+    # One name lookup, never code; NFKC first, as the compiler folds "ｅｖａｌ" to "eval".
     value = unicodedata.normalize("NFKC", value)
     return (
         value.isidentifier() and not value.startswith("_")
@@ -763,9 +752,7 @@ def _is_plain_forward_ref(value):
 
 
 def _annotation_strings(annotation, literal_names, typing_names):
-    # Literal["W", "A"] arguments are values, never evaluated as code, so they
-    # stay allowed, as does a plain forward reference ("Matrix"); every other
-    # string in an annotation is evaluated as code.
+    # Literal["W"] values and plain forward refs ("Matrix") are never run as code.
     stack = [annotation]
     while stack:
         sub = stack.pop()
@@ -810,9 +797,7 @@ def _reject_dunder_access(tree):
             raise RuntimeError(
                 f"Attribute '{node.attr}' is not allowed in generated code."
             )
-        # Annotations compile to strings here, and anything that later evaluates
-        # them (get_type_hints and its callers) runs text the walk only saw as a
-        # literal. Annotations written as code are walked like any other node.
+        # Annotations are strings here; anything evaluating them runs text the walk saw as a literal.
         for annotation in _annotation_nodes(node):
             if bindings is None:
                 bindings = _bound_names(tree)

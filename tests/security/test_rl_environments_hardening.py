@@ -120,10 +120,7 @@ def test_binding_a_dunder_name_is_not_itself_refused(name, source, args, expecte
     assert create_locked_down_function(source)(*args) == expected
 
 
-# --- deferred annotation evaluation and __match_args__ lookups ----------------
-# Annotations compile to strings, so anything that later evaluates them runs text
-# the AST walk only saw as a literal. A positional class pattern is a getattr of
-# whatever __match_args__ names. Both are refused before the code ever runs.
+# Deferred annotation evaluation and __match_args__ lookups, refused before the code runs.
 
 DEFERRED_EVALUATION = [
     ("singledispatch", "def strategy(board):\n    import functools\n    return functools.singledispatch\n"),
