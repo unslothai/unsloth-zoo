@@ -1132,9 +1132,134 @@ def test_nax_quantized_linear_scope_swaps_a_shared_module_once(monkeypatch):
     assert type(model.proj) is nn.QuantizedLinear and "_unsloth_nax_qmm_rows" not in model.proj
 
 
+class _PrefillProjections(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.wide = nn.QuantizedLinear(512, 2048, bias = True, group_size = 64, bits = 8)
+        self.small = nn.QuantizedLinear(512, 32, bias = False, group_size = 64, bits = 4)  # too few output tiles
+        self.wide.bias = mx.random.normal((2048,), key = mx.random.key(5))
+        self.set_dtype(mx.bfloat16)
+        self.eval()
+
+    def __call__(self, x):
+        return self.wide(x), self.small(x)
+
+
+def _same_bits(outputs, natives):
+    return all(mx.array_equal(a.view(mx.uint16), b.view(mx.uint16)).item() for a, b in zip(outputs, natives))
+
+
+@real_mlx_only
+@metal_only
+def test_dense_prefill_linear_matches_native_and_restores(monkeypatch):
+    from unsloth_zoo.mlx import inference
+    from unsloth_zoo.mlx.generate import generation_mode
+
+    model = _PrefillProjections()
+    # below the row floor, ragged, two tile-aligned row counts, and a batch whose row count MLX decides
+    xs = [mx.random.normal(shape, key = mx.random.key(shape[1])).astype(mx.bfloat16)
+          for shape in ((1, 1023, 512), (1, 1025, 512), (1, 2048, 512), (1, 1088, 512), (2, 1100, 512))]
+    natives = [model(x) for x in xs]
+    mx.eval(natives)
+    dequantized, dequantize = [], mx.dequantize
+    monkeypatch.setattr(mx, "dequantize", lambda *a, **k: dequantized.append(None) or dequantize(*a, **k))
+    monkeypatch.setattr(inference, "_DENSE_QMM_VERIFIED", {})
+    with generation_mode(model):
+        with inference.dense_prefill_linear(model):
+            pass
+        assert type(model.wide) is type(model.small) is not nn.QuantizedLinear  # until the outer scope exits
+        for x in xs[1:]:
+            mx.eval(model(x))  # the first call of each row count is compared with the native matmul
+        for x, native, dense in zip(xs, natives, (0, 1, 1, 1, 0)):
+            dequantized.clear()
+            assert _same_bits(model(x), native)
+            assert len(dequantized) == dense
+        model.train()
+        dequantized.clear()
+        mx.eval(model(xs[2]))
+        assert not dequantized
+        model.eval()
+        linear_call = nn.QuantizedLinear.__call__
+        with monkeypatch.context() as patch:  # a wrapper installed after the scope resolved the native body
+            patch.setattr(nn.QuantizedLinear, "__call__", lambda self, x: linear_call(self, x) + 1)
+            assert _same_bits(model(xs[2]), [native + 1 for native in natives[2]])
+            assert not dequantized
+        with monkeypatch.context() as patch:
+            patch.setattr(inference, "_DENSE_QMM_MAX_WEIGHTS", 2048 * 512 - 1)
+            mx.eval(model(xs[2]))
+            assert not dequantized
+        model.wide.biases = model.wide.biases.astype(mx.float32)  # the native result is float32 now
+        assert model(xs[2])[0].dtype == mx.float32
+    assert type(model.wide) is type(model.small) is nn.QuantizedLinear
+    assert "_unsloth_dense_qmm_scopes" not in model.wide.__dict__
+    assert sorted(inference._DENSE_QMM_VERIFIED.values()) == [False, False, True, True, True]
+    monkeypatch.setenv("UNSLOTH_MLX_DENSE_PREFILL", "0")
+    with inference.dense_prefill_linear(model):
+        assert type(model.wide) is nn.QuantizedLinear
+
+
+@real_mlx_only
+@metal_only
+def test_dense_prefill_linear_composes_with_the_nax_scope(monkeypatch):
+    from unsloth_zoo.mlx import inference, nax
+    from unsloth_zoo.mlx.generate import generation_mode
+
+    model = _PrefillProjections()
+    x = mx.random.normal((1, 2048, 512), key = mx.random.key(2)).astype(mx.bfloat16)
+    few = mx.random.normal((1, 8, 512), key = mx.random.key(3)).astype(mx.bfloat16)
+    native = model(x)
+    mx.eval(native)
+    monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {nax._gpu_generation(): _EVERY_ROW})
+    monkeypatch.setattr(nax, "nax_available", lambda: True)
+    monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: True)
+    small_rows, small = [], inference._nax_small_m_qmm
+    monkeypatch.setattr(inference, "_nax_small_m_qmm", lambda module, x, bindings: small_rows.append(x.shape[-2]) or None)
+    dequantized, dequantize = [], mx.dequantize
+    monkeypatch.setattr(mx, "dequantize", lambda *a, **k: dequantized.append(None) or dequantize(*a, **k))
+    monkeypatch.setattr(inference, "_DENSE_QMM_VERIFIED", {})
+    with inference.nax_quantized_linear(model):
+        assert type(model.wide).__name__ == "_NaxSmallMQuantizedLinear"
+        mx.eval(model(x))
+        assert not dequantized   # outside the dense scope the NAX-routed linear falls back to the native call
+        with generation_mode(model):
+            assert type(model.wide).__name__ == "_NaxSmallMQuantizedLinear"
+            mx.eval(model(x))
+            dequantized.clear()
+            assert _same_bits(model(x), native) and len(dequantized) == 1
+            small_rows.clear()
+            mx.eval(model(few))   # the NAX route is still asked first, and small calls never dequantize
+            assert small_rows and len(dequantized) == 1
+        assert type(model.wide).__name__ == "_NaxSmallMQuantizedLinear"
+        assert "_unsloth_dense_qmm_scopes" not in model.wide.__dict__
+        dequantized.clear()
+        mx.eval(model(x))
+        assert not dequantized
+    assert type(model.wide) is nn.QuantizedLinear
+
+
+@real_mlx_only
+@metal_only
+def test_dense_prefill_linear_first_use_check_rejects_a_different_result(monkeypatch, caplog):
+    from unsloth_zoo.mlx import inference
+
+    model = _PrefillProjections()
+    x = mx.random.normal((1, 2048, 512)).astype(mx.bfloat16)
+    native = model(x)
+    mx.eval(native)
+    dequantize = mx.dequantize
+    monkeypatch.setattr(mx, "dequantize", lambda *a, **k: dequantize(*a, **k) * 1.5)
+    monkeypatch.setattr(inference, "_DENSE_QMM_VERIFIED", {})
+    with inference.dense_prefill_linear(model):
+        for rows in (2048, 2048, 1536):   # the differing shape is not tried again at another row count
+            assert _same_bits(model(x[:, :rows]), [out[:, :rows] for out in native])
+    assert list(inference._DENSE_QMM_VERIFIED.values()) == [False, False]
+    assert "the native call stays in use" in caplog.text
+
+
 @real_mlx_only
 @pytest.mark.parametrize("vlm", [False, True], ids = ["text", "vlm"])
-def test_loader_generate_enters_the_nax_scope(monkeypatch, vlm):
+@pytest.mark.parametrize("scope_name", ["nax_quantized_linear", "dense_prefill_linear"])
+def test_loader_generate_enters_the_quantized_linear_scopes(monkeypatch, vlm, scope_name):
     from contextlib import contextmanager
     import mlx_lm
     import mlx_vlm
@@ -1146,15 +1271,16 @@ def test_loader_generate_enters_the_nax_scope(monkeypatch, vlm):
     entered = []
 
     @contextmanager
-    def scope(model, int8_prefill):
-        entered.append((model, int8_prefill))
+    def scope(model, *args):
+        entered.append((model, *args))
         yield model
 
     def stream(model, *args, **kwargs):
-        assert entered == [(root, vlm)] and "int8_prefill" not in kwargs
+        assert entered == [(root, vlm) if scope_name == "nax_quantized_linear" else (root,)]
+        assert "int8_prefill" not in kwargs
         yield types.SimpleNamespace(token = 7)
 
-    monkeypatch.setattr(loader, "nax_quantized_linear", scope)
+    monkeypatch.setattr(loader, scope_name, scope)
     monkeypatch.setattr(mlx_vlm if vlm else mlx_lm, "stream_generate", stream)
     generated = loader._mlx_generate(root, input_ids = [[1, 2]], max_new_tokens = 1, int8_prefill = vlm)
     assert generated.tolist() == [[1, 2, 7]]
@@ -1266,7 +1392,7 @@ def test_nax_int8_prefill_routes_dense_and_expert_calls_from_their_row_minimum(m
     monkeypatch.delenv("UNSLOTH_MLX_INT8_PREFILL")
     for scope, packed in ((inference.nax_quantized_linear, False), (generation_mode, True)):
         with scope(model, True):   # alone, and with the gate and up projections packed into one gathered call
-            assert type(model.odd) is nn.QuantizedLinear
+            assert not type(model.odd).__name__.startswith("_NaxInt8Prefill")
             assert type(model.moe.down_proj).__name__.startswith("_NaxInt8Prefill")
             assert (type(model.moe).__name__ != "SwitchGLU") is packed
             for rows, native in natives.items():
