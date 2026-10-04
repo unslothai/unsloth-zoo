@@ -40,7 +40,7 @@ from .common import (
 from importlib.metadata import version as importlib_version
 from unsloth_zoo.utils import Version
 from unsloth_zoo.mxfp4_dequant import is_mxfp4_expert_param
-from .gpt_oss_routed import ROUTED_MAX_SLOTS, routed_experts_forward, routed_mlp_forward
+from .gpt_oss_routed import ROUTED_MAX_SLOTS, prepare_routed_experts, routed_experts_forward, routed_mlp_forward
 transformers_version = Version(importlib_version("transformers"))
 has_static_cache = transformers_version >= Version("4.56.0.dev0")
 from .utils import (
@@ -2950,6 +2950,9 @@ def torch_native_forward(
         # Decode-sized eval calls read only the routed experts, with no host sync.
         return routed.view(batch_size, -1, self.hidden_size)
     else:
+        if not torch.is_grad_enabled() and not torch.compiler.is_compiling():
+            # Eager prefill builds the routed tables a compiled decode step then reads.
+            prepare_routed_experts(self)
         X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
         gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
         gate_up = torch.stack(gate_up_list, dim=0)
@@ -3103,10 +3106,16 @@ def patch_GptOssAttention():
 
         bsz, n_heads, qlen, _  = query.shape
         bsz, n_heads, kvlen, _ = key_states.shape
-        out_dtype = torch.result_type(query, key_states)
+        # promote_types, not result_type: result_type returns a dtype, which graph-breaks Dynamo.
+        out_dtype = torch.promote_types(query.dtype, key_states.dtype)
         combined_logits = key_states.new_empty((bsz, n_heads, qlen, kvlen + 1), dtype=out_dtype)
 
-        attn_weights = matmul(query, key_states.transpose(2, 3), out = combined_logits[:,:,:,:kvlen])
+        if torch.compiler.is_compiling():
+            # Dynamo cannot trace out= into a non-contiguous slice; Inductor fuses the copy.
+            combined_logits[:, :, :, :kvlen] = matmul(query, key_states.transpose(2, 3))
+            attn_weights = combined_logits[:, :, :, :kvlen]
+        else:
+            attn_weights = matmul(query, key_states.transpose(2, 3), out = combined_logits[:,:,:,:kvlen])
         attn_weights *= scaling
         if attention_mask is not None:
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
@@ -3697,8 +3706,10 @@ def patch_GptOssModel():
             inputs_embeds = self.embed_tokens(
                 input_ids.to(embed_device, non_blocking = embed_device.type != "cpu")
             ).to(input_ids.device)
-        if not self.training:
-            inputs_embeds.requires_grad_(False)
+        if not self.training and inputs_embeds.requires_grad:
+            # detach, not requires_grad_(False): the embeddings are a non-leaf when an input
+            # requires-grad hook or an offloaded copy produced them, and that raises.
+            inputs_embeds = inputs_embeds.detach()
 
         cache_position = kwargs.pop("cache_position", None)
         if cache_position is None:
@@ -3709,12 +3720,15 @@ def patch_GptOssModel():
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        try:
-            torch._dynamo.mark_static (hidden_states, 0)
-            torch._dynamo.mark_dynamic(hidden_states, 1)
-            torch._dynamo.mark_static (hidden_states, 2)
-        except:
-            pass
+        # Shape hints for the compiled callees; they cannot be traced, so skip them when this
+        # whole forward is being compiled.
+        if not torch.compiler.is_compiling():
+            try:
+                torch._dynamo.mark_static (hidden_states, 0)
+                torch._dynamo.mark_dynamic(hidden_states, 1)
+                torch._dynamo.mark_static (hidden_states, 2)
+            except:
+                pass
 
         # flex_attention_with_sink training windows its own BlockMask; all else needs the per-type mapping.
         _flex_sink_training = self.training and _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED
@@ -3752,7 +3766,8 @@ def patch_GptOssModel():
         if not self.training and qlen == 1 and isinstance(attention_mask, dict):
             # Add hack since residuals need to clone outside of the torch.compile region??
             # This forces it to free past residuals
-            torch.compiler.cudagraph_mark_step_begin()
+            if not torch.compiler.is_compiling():
+                torch.compiler.cudagraph_mark_step_begin()
             # Initialize for common return path
             all_hidden_states = None
             all_router_logits = None
