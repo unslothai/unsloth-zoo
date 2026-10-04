@@ -523,6 +523,18 @@ _DENIED_MODULE_ATTRS = frozenset({
     "typing.ForwardRef",
     "typing.evaluate_forward_ref",
     "typing.get_type_hints",
+    # Callers of get_type_hints: register() evaluates the function's string
+    # annotations, which the AST walk never sees.
+    "functools.singledispatch",
+    "functools.singledispatchmethod",
+})
+
+# Builtins whose positional class pattern binds the subject itself
+# (`case int(x)`). Any other positional pattern is a getattr of whatever
+# __match_args__ names, a string the AST walk never sees.
+_SELF_MATCHING_TYPES = frozenset({
+    "bool", "bytearray", "bytes", "dict", "float", "frozenset", "int", "list",
+    "set", "str", "tuple",
 })
 
 # Attributes that walk the interpreter's own object graph. None of these start
@@ -664,6 +676,71 @@ _MATCH_CLASS_NODES = tuple(
 )
 
 
+def _annotation_nodes(node):
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        arguments = node.args
+        params = [*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs,
+                  arguments.vararg, arguments.kwarg]
+        yield from (p.annotation for p in params if p is not None and p.annotation is not None)
+        if node.returns is not None:
+            yield node.returns
+    elif isinstance(node, ast.AnnAssign):
+        yield node.annotation
+
+
+_TYPING_MODULES = frozenset({"typing", "typing_extensions"})
+
+
+def _typing_names_are_real(tree):
+    # True when `Literal`, `typing` and `typing_extensions` can only mean the real
+    # typing objects: bound by nothing except imports from the typing modules.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            names = {node.id}
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names = {node.name}
+        elif isinstance(node, ast.arg):
+            names = {node.arg}
+        elif isinstance(node, ast.Import):
+            if any((a.asname or a.name) in ("Literal", *_TYPING_MODULES)
+                   and a.name not in _TYPING_MODULES for a in node.names):
+                return False
+            continue
+        elif isinstance(node, ast.ImportFrom):
+            if any((a.asname or a.name) in ("Literal", *_TYPING_MODULES)
+                   and not (node.module in _TYPING_MODULES and a.name == "Literal"
+                            and (a.asname or a.name) == "Literal") for a in node.names):
+                return False
+            continue
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar, ast.ExceptHandler)):
+            names = {node.name}
+        elif isinstance(node, ast.MatchMapping):
+            names = {node.rest}
+        else:
+            continue
+        if names & {"Literal", *_TYPING_MODULES}:
+            return False
+    return True
+
+
+def _annotation_strings(annotation, allow_literal):
+    # Literal["W", "A"] arguments are values, never evaluated as code, so they
+    # stay allowed; every other string in an annotation is a forward reference.
+    stack = [annotation]
+    while stack:
+        sub = stack.pop()
+        if allow_literal and isinstance(sub, ast.Subscript) and (
+            (isinstance(sub.value, ast.Name) and sub.value.id == "Literal")
+            or (isinstance(sub.value, ast.Attribute) and sub.value.attr == "Literal"
+                and isinstance(sub.value.value, ast.Name)
+                and sub.value.value.id in _TYPING_MODULES)
+        ):
+            continue
+        if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+            yield sub
+        stack.extend(ast.iter_child_nodes(sub))
+
+
 def _reject_dunder_access(tree):
     """
     Restricted builtins alone do not stop `().__class__.__bases__[0].__subclasses__()`,
@@ -671,6 +748,7 @@ def _reject_dunder_access(tree):
     included) using only attribute access. Generated code has no reason to touch
     dunders, so refuse them outright.
     """
+    allow_literal = None
     for node in ast.walk(tree):
         # Definition names are strings on the node, invisible to the Name and
         # Attribute checks below, so they get their own fail-closed rule.
@@ -689,6 +767,16 @@ def _reject_dunder_access(tree):
             raise RuntimeError(
                 f"Attribute '{node.attr}' is not allowed in generated code."
             )
+        # Annotations compile to strings here, and anything that later evaluates
+        # them (get_type_hints and its callers) runs text the walk only saw as a
+        # literal. Annotations written as code are walked like any other node.
+        for annotation in _annotation_nodes(node):
+            if allow_literal is None:
+                allow_literal = _typing_names_are_real(tree)
+            for _ in _annotation_strings(annotation, allow_literal):
+                raise RuntimeError(
+                    "String annotations are not allowed in generated code."
+                )
         # Two for names: a bare `_` or `_total` local is ordinary and reaches
         # nothing on its own.
         if isinstance(node, ast.Name) and node.id.startswith("__"):
@@ -699,6 +787,12 @@ def _reject_dunder_access(tree):
         # kwd_attrs is the only identifier-as-string field that READS an attribute;
         # every other one merely binds, and the Name rule above refuses the read.
         if _MATCH_CLASS_NODES and isinstance(node, _MATCH_CLASS_NODES):
+            if node.patterns and not (
+                isinstance(node.cls, ast.Name) and node.cls.id in _SELF_MATCHING_TYPES
+            ):
+                raise RuntimeError(
+                    "Positional class patterns are only allowed on builtin types in generated code."
+                )
             for attr in (node.kwd_attrs or []):
                 if attr.startswith("_") or attr in _DENIED_ATTR_NAMES:
                     raise RuntimeError(

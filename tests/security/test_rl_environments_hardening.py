@@ -120,6 +120,47 @@ def test_binding_a_dunder_name_is_not_itself_refused(name, source, args, expecte
     assert create_locked_down_function(source)(*args) == expected
 
 
+# --- deferred annotation evaluation and __match_args__ lookups ----------------
+# Annotations compile to strings, so anything that later evaluates them runs text
+# the AST walk only saw as a literal. A positional class pattern is a getattr of
+# whatever __match_args__ names. Both are refused before the code ever runs.
+
+DEFERRED_EVALUATION = [
+    ("singledispatch", "def strategy(board):\n    import functools\n    return functools.singledispatch\n"),
+    ("singledispatchmethod", "def strategy(board):\n    from functools import singledispatchmethod\n    return singledispatchmethod\n"),
+    ("string_param", 'def strategy(board: "list") -> str:\n    return "W"\n'),
+    ("string_return", 'def strategy(board) -> "str":\n    return "W"\n'),
+    ("string_in_generic", 'def strategy(board: list["int"]):\n    return "W"\n'),
+    ("string_local", 'def strategy(board):\n    move: "str" = "W"\n    return move\n'),
+    ("rebound_literal", 'def strategy(board):\n    Literal = list\n    move: Literal["int"] = "W"\n    return move\n'),
+    ("aliased_literal", 'def strategy(board):\n    from typing import List as Literal\n    move: Literal["int"] = "W"\n    return move\n'),
+    ("custom_class_positional", "def strategy(board):\n    class K:\n        pass\n    match board:\n        case K(a):\n            return a\n    return 'W'\n"),
+]
+
+
+@pytest.mark.parametrize("name,source", DEFERRED_EVALUATION, ids = [n for n, _ in DEFERRED_EVALUATION])
+def test_deferred_evaluation_primitives_rejected(name, source):
+    with pytest.raises((AttributeError, ImportError, RuntimeError)):
+        create_locked_down_function(source)([[2, 0], [0, 2]])
+
+
+def test_ordinary_annotations_and_literals_still_work():
+    """Type hints a 2048 or sudoku strategy writes keep working, Literal included."""
+    source = (
+        "def strategy(board: list[list[int]]) -> Literal['W', 'A', 'S', 'D']:\n"
+        "    from typing import Literal, Optional\n"
+        "    import typing\n"
+        "    best: Optional[str] = None\n"
+        "    moves: list[typing.Literal['W', 'A']] = ['W', 'A']\n"
+        "    for move in moves:\n"
+        "        match board:\n"
+        "            case list(rows) if rows:\n"
+        "                best = move\n"
+        "    return best or 'S'\n"
+    )
+    assert create_locked_down_function(source)([[2, 0], [0, 2]]) == "A"
+
+
 # --- none of the hardening may cost ordinary generated code ------------------
 
 def test_ordinary_match_statements_still_work():
