@@ -34,6 +34,7 @@ import importlib
 import types
 import __future__
 import builtins as _py_builtins
+import unicodedata
 import os, gc, time, statistics
 import collections
 import numpy as np
@@ -753,7 +754,8 @@ _UNSAFE_FORWARD_REFS = frozenset(dir(_py_builtins)) | frozenset(
 
 def _is_plain_forward_ref(value):
     # "Matrix" / "Node": one name lookup, never code. Private names, builtins and
-    # module names stay refused.
+    # module names stay refused; NFKC first, as the compiler folds "ｅｖａｌ" to "eval".
+    value = unicodedata.normalize("NFKC", value)
     return (
         value.isidentifier() and not value.startswith("_")
         and value not in _UNSAFE_FORWARD_REFS
