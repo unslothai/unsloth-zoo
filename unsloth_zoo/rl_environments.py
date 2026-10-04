@@ -762,6 +762,11 @@ def _annotation_strings(annotation, literal_names, typing_names):
                 and isinstance(sub.value.value, ast.Name)
                 and sub.value.value.id in typing_names)
         ):
+            # Only the Literal's own string values are exempt; anything nested is still scanned.
+            values = sub.slice.elts if isinstance(sub.slice, ast.Tuple) else [sub.slice]
+            stack.extend(
+                v for v in values if not (isinstance(v, ast.Constant) and isinstance(v.value, str))
+            )
             continue
         if (
             isinstance(sub, ast.Constant) and isinstance(sub.value, str)

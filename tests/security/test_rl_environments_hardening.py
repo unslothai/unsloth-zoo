@@ -131,6 +131,7 @@ DEFERRED_EVALUATION = [
     ("string_local", 'def strategy(board):\n    move: "str" = "W"\n    return move\n'),
     ("rebound_literal", 'def strategy(board):\n    Literal = list\n    move: Literal["int"] = "W"\n    return move\n'),
     ("aliased_literal", 'def strategy(board):\n    from typing import List as Literal\n    move: Literal["int"] = "W"\n    return move\n'),
+    ("string_nested_in_literal", 'def strategy(board):\n    from typing import Literal\n    move: Literal[list["int"]] = "W"\n    return move\n'),
     ("module_name_forward_ref", 'def strategy(board: "sys"):\n    return "W"\n'),
     ("private_forward_ref", 'def strategy(board: "_x"):\n    return "W"\n'),
     ("fullwidth_builtin_forward_ref", 'def strategy(board: "\uff45\uff56\uff41\uff4c"):\n    return "W"\n'),
