@@ -343,8 +343,7 @@ def load_teacher(model_name_or_path):
 
     from .loader import _MLX_MODEL_FILE_TRUST, _install_mlx_model_file_guard
 
-    # Teachers never opt into repository code: refuse a config.json model_file, even when the
-    # surrounding student load was trusted.
+    # Teachers never opt into repository code, even inside a trusted student load.
     _install_mlx_model_file_guard()
     token = _MLX_MODEL_FILE_TRUST.set(False)
     try:

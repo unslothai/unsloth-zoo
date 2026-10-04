@@ -1005,9 +1005,7 @@ def _raise_mlx_remote_code_refusal(model_path, error, *, tokenizer_only=False):
             ) from error
 
 
-# mlx-lm < 0.32 and mlx-vlm exec_module the checkpoint's config.json `model_file` with no
-# trust check. FastMLXModel.from_pretrained scopes its trust_remote_code here so the guarded
-# loaders can refuse repository code the caller did not opt into.
+# mlx-lm < 0.32 and mlx-vlm exec a config.json `model_file` unchecked; trust is scoped here.
 _MLX_MODEL_FILE_TRUST = contextvars.ContextVar("unsloth_mlx_model_file_trust", default=False)
 
 
@@ -1036,8 +1034,7 @@ def _model_file_inside(model_path, model_file):
         return False
     if os.path.isabs(model_file):
         return False
-    # Lexical check, not realpath: a Hugging Face snapshot (and Unsloth's own config views)
-    # symlink each file to a blob outside the snapshot folder, yet it is still the repo's file.
+    # Lexical, not realpath: Hub snapshot files are symlinks into blobs/.
     root = os.path.normpath(os.path.abspath(str(model_path)))
     target = os.path.normpath(os.path.join(root, model_file))
     return os.path.commonpath([root, target]) == root
@@ -1062,8 +1059,7 @@ def _guard_mlx_model_file_loader(module, name, declared_model_file, required_par
         except TypeError:
             return original(*args, **kwargs)
         model_path, model_file = declared_model_file(arguments)
-        # Even a trusted repo may only run a .py inside its own folder: that is the code Studio's
-        # consent scan fingerprints, and nothing legitimate points elsewhere.
+        # Even trusted, only a .py inside the folder (what Studio's consent scan fingerprints).
         if model_file and not _model_file_inside(model_path, model_file):
             raise ValueError(
                 f"Unsloth: The model at {model_path} names a model_file ({model_file!r}) outside "
