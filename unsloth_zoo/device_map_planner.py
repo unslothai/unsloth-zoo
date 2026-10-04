@@ -2774,7 +2774,7 @@ def plan_block_swap(
     Raises :class:`DeviceMapInfeasible` when even one resident layer does not fit.
     """
     from .block_swap import (
-        find_decoder_layers, estimate_training_reserve_bytes, lora_param_count, _pool_bytes,
+        find_decoder_layers, estimate_training_reserve_bytes, lora_param_count, _pool_bytes, _layer_signature,
         extra_input_embeddings, swap_indices,
     )
 
@@ -2812,6 +2812,12 @@ def plan_block_swap(
         )
     reserve_bytes = int(reserve_bytes)
 
+    # Every non-LoRA weight: nothing is frozen yet on the meta model.
+    layer_sigs = [
+        _layer_signature([(k, p) for k, p in layer.named_parameters() if "lora_" not in k])
+        for layer in layers
+    ]
+
     def swapped(n):
         return [layer_bytes[i] for i in swap_indices(L, n, placement)]
 
@@ -2829,7 +2835,7 @@ def plan_block_swap(
 
     def fits(n):
         out = swapped(n)
-        pool = _pool_bytes(out, prefetch_depth) if n else 0
+        pool = _pool_bytes(out, prefetch_depth, [layer_sigs[i] for i in swap_indices(L, n, placement)]) if n else 0
         if len(devices) == 1:
             resident = total - sum(out) - (streamed if use_embedding else 0)
             off = embedding if use_embedding else 0
@@ -2866,7 +2872,7 @@ def plan_block_swap(
         use_embedding = True
         ok, plan = fits(0)
     if not ok:
-        # Feasibility only improves as layers leave the cards, so bisect on the count.
+        # Identical layers: feasibility only improves as more leave the cards, so bisect on the count.
         lo, hi = 1, L - 1
         ok_hi, plan_hi = fits(hi)
         if not ok_hi:
@@ -2877,13 +2883,21 @@ def plan_block_swap(
                 + ". Lower max_seq_length or the batch size, or add a GPU."
             )
         n, plan = hi, plan_hi
-        while lo < n:
-            mid = (lo + n) // 2
-            ok_mid, plan_mid = fits(mid)
-            if ok_mid:
-                n, plan = mid, plan_mid
-            else:
-                lo = mid + 1
+        if len(set(layer_sigs)) == 1:
+            while lo < n:
+                mid = (lo + n) // 2
+                ok_mid, plan_mid = fits(mid)
+                if ok_mid:
+                    n, plan = mid, plan_mid
+                else:
+                    lo = mid + 1
+        else:
+            # Spread picks for n and n + 1 are not nested: mixed layers can fit at n but not at n + 1.
+            for m in range(lo, hi):
+                ok_m, plan_m = fits(m)
+                if ok_m:
+                    n, plan = m, plan_m
+                    break
     return BlockSwapPlan(
         layers = n,
         total_layers = L,

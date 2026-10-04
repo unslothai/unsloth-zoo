@@ -635,6 +635,15 @@ def test_reserve_estimate_scales_with_tokens():
     assert estimate_training_reserve_bytes(cfg, 2048, safety_bytes = 0) == one + one // 16
 
 
+def test_pool_bytes_gives_equal_size_blocks_of_different_shapes_a_pool_each():
+    a = [((64, 64), torch.bfloat16)]
+    b = [((32, 128), torch.bfloat16)]
+    sigs = [_mod._layer_signature([("w", torch.empty(s, dtype = d, device = "meta"))]) for (s, d), in (a, b, a, b)]
+    assert sigs[0] != sigs[1]
+    assert _mod._pool_bytes([10] * 4, 2, sigs) == 4 * 10
+    assert _mod._pool_bytes([10] * 4, 2, [sigs[0]] * 4) == 3 * 10
+
+
 def test_auto_swap_indices_takes_only_the_shortfall():
     if not torch.cuda.is_available():
         return
@@ -658,9 +667,21 @@ def test_block_on_another_card_gets_its_inputs_moved():
     enc = torch.randn(2, 64, device = "cuda:0")
     ref = blocks[1](blocks[0](x, enc).to("cuda:1"), enc.to("cuda:1"))
     sw = BlockSwap(blocks, [1], prefetch_depth = 1)
+    # Fast decode loops skip the pre-hook, so they must see that inputs need moving.
+    assert sw.spans_devices
     out = blocks[1](blocks[0](x, enc), enc)
     assert out.device.index == 1 and torch.equal(out, ref)
     sw.remove()
+
+
+def test_one_card_swap_keeps_fast_decode():
+    if not torch.cuda.is_available():
+        return
+    blocks = nn.ModuleList([_XBlock(64) for _ in range(4)]).cuda().requires_grad_(False)
+    sw = BlockSwap(blocks, [1, 3], prefetch_depth = 1)
+    assert not sw.spans_devices
+    sw.remove()
+    assert not BlockSwap(blocks, [], prefetch_depth = 1).spans_devices
 
 
 def test_hooks_are_opaque_to_torch_compile():

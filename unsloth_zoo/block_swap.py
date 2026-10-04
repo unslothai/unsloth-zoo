@@ -264,6 +264,7 @@ class BlockSwap:
         self.pos = {li: k for k, li in enumerate(self.indices)}
         self.start = self.indices[0] if self.indices else len(layers)
         self._input_hooked = [False] * len(self.indices)
+        self.spans_devices = False
         if not self.indices:
             return
         if device is None:
@@ -277,6 +278,12 @@ class BlockSwap:
                 owners.setdefault(id(p), set()).add(li)
         shared = {pid for pid, o in owners.items() if len(o) > 1}
         self.blocks = [_Block(layer, self.streams, self.device, shared) for layer in swapped]
+        homes = {b.home for b in self.blocks if b.home is not None}
+        for li, layer in enumerate(layers):
+            if li not in self.pos:
+                homes.update(p.device for _, p in _swappable(layer) if p.device.type == "cuda")
+        # Code that bypasses the pre-hook (fast decode loops) must check this: only the hook moves inputs across cards.
+        self.spans_devices = len(homes) > 1
         for layer in swapped:
             for name, p in layer.named_parameters():
                 if (p.device.type == "cpu") and (p.requires_grad or "lora_" in name or id(p) in shared):
@@ -596,12 +603,19 @@ def _free_device_bytes(device):
     return max(0, int(usable))
 
 
-def _pool_bytes(sizes, depth):
-    # One pool per shape signature, depth + 1 slots each (fewer if fewer blocks share it).
+def _layer_signature(params):
+    return tuple((tuple(p.shape), p.dtype) for _, p in params)
+
+
+def _pool_bytes(sizes, depth, sigs = None):
+    # One pool per shape signature, depth + 1 slots each (fewer if fewer blocks share it); BlockSwap keys
+    # pools on layout, so equal-size blocks with different shapes need a pool each.
     counts = {}
-    for b in sizes:
-        counts[b] = counts.get(b, 0) + 1
-    return sum(b * min(depth + 1, c) for b, c in counts.items())
+    for i, b in enumerate(sizes):
+        key = sigs[i] if sigs is not None else b
+        size, count = counts.get(key, (b, 0))
+        counts[key] = (max(size, b), count + 1)
+    return sum(b * min(depth + 1, c) for b, c in counts.values())
 
 
 def auto_swap_indices(layers, reserve_bytes, prefetch_depth = 2, free_bytes = None):
@@ -613,7 +627,9 @@ def auto_swap_indices(layers, reserve_bytes, prefetch_depth = 2, free_bytes = No
         params = _swappable(layer)
         if not params or params[0][1].device.type != "cuda":
             continue
-        by_device.setdefault(params[0][1].device, []).append((i, sum(p.nbytes for _, p in params)))
+        by_device.setdefault(params[0][1].device, []).append(
+            (i, sum(p.nbytes for _, p in params), _layer_signature(params))
+        )
     chosen, left = [], 0
     for device, items in by_device.items():
         free = (free_bytes or {}).get(device)
@@ -625,13 +641,13 @@ def auto_swap_indices(layers, reserve_bytes, prefetch_depth = 2, free_bytes = No
         pick = []
         for n in range(1, len(items)):
             pick = [items[k] for k in swap_indices(len(items), n)]
-            sizes = [b for _, b in pick]
-            if sum(sizes) - _pool_bytes(sizes, prefetch_depth) >= need:
+            sizes, sigs = [b for _, b, _ in pick], [g for _, _, g in pick]
+            if sum(sizes) - _pool_bytes(sizes, prefetch_depth, sigs) >= need:
                 break
         else:
-            sizes = [b for _, b in pick]
-            left = max(left, need - (sum(sizes) - _pool_bytes(sizes, prefetch_depth)))
-        chosen += [i for i, _ in pick]
+            sizes, sigs = [b for _, b, _ in pick], [g for _, _, g in pick]
+            left = max(left, need - (sum(sizes) - _pool_bytes(sizes, prefetch_depth, sigs)))
+        chosen += [i for i, _, _ in pick]
     return sorted(chosen), left
 
 

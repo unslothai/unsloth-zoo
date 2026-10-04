@@ -3722,7 +3722,9 @@ def patch_GptOssModel():
 
         # is_decoding = is_flex_attention_decoding(self.layers[0].self_attn, hidden_states)
         bsz, qlen, hd = hidden_states.shape
-        if not self.training and qlen == 1 and isinstance(attention_mask, dict):
+        block_swap = getattr(self.layers, "_unsloth_block_swap", None)
+        # Swapped blocks fetch onto the head's card; across cards only the hooked path moves the inputs to them.
+        if not self.training and qlen == 1 and isinstance(attention_mask, dict) and not getattr(block_swap, "spans_devices", False):
             # Add hack since residuals need to clone outside of the torch.compile region??
             # This forces it to free past residuals
             torch.compiler.cudagraph_mark_step_begin()
@@ -3730,7 +3732,6 @@ def patch_GptOssModel():
             all_hidden_states = None
             all_router_logits = None
             # This loop calls the layer's parts directly, so the block swapper's forward hooks never fire.
-            block_swap = getattr(self.layers, "_unsloth_block_swap", None)
             for layer_idx, decoder_layer in enumerate(self.layers):
                 if block_swap is not None:
                     block_swap.enter(layer_idx)

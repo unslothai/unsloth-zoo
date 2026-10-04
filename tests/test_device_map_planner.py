@@ -1973,6 +1973,25 @@ def test_block_swap_plan_multi_gpu_charges_the_pool_to_the_head_card():
     assert plan.device_plan.weight_bytes[head] + 3 * layer <= budget
 
 
+class _NarrowBlock(nn.Module):
+    def __init__(self, hidden):
+        super().__init__()
+        self.mlp = nn.Linear(hidden, hidden // 2, bias = False)
+
+
+def test_block_swap_plan_mixed_layers_finds_the_fewest_count():
+    # Spread picks are not nested: these 7 alternating layers free a pool's worth at 4 swapped, nothing at 5.
+    from unsloth_zoo.device_map_planner import plan_block_swap
+    model = _meta(layers = 7)
+    with torch.device("meta"):
+        for i in range(1, 7, 2):
+            model.layers[i] = _NarrowBlock(64)
+    total = _compute_module_sizes(model)[""]
+    plan = plan_block_swap(model = model, max_memory = {0: total + 100 - 1}, reserve_bytes = 100,
+                           placement = "spread")
+    assert plan.layers == 4
+
+
 def test_block_swap_plan_refuses_when_one_layer_cannot_stay():
     from unsloth_zoo.device_map_planner import plan_block_swap
     model, total, layer = _swap_sizes()
