@@ -151,6 +151,8 @@ __all__ = [
     "plan_device_map",
     "plan_device_map_for_pretrained",
     "build_meta_model",
+    "BlockSwapPlan",
+    "plan_block_swap",
 ]
 
 _GiB = 1024 ** 3
@@ -1357,6 +1359,7 @@ def plan_device_map(
     hf_quantizer: Any = None,
     no_split_module_classes: Sequence[str] | None = None,
     prefer_head_device: int | None = None,
+    exclude_modules: Sequence[str] = (),
     reserve_load_transient: bool = True,
     _colocate: Sequence[tuple[str, Sequence[str]]] | None = None,
 ) -> DeviceMapPlan | None:
@@ -1403,6 +1406,8 @@ def plan_device_map(
             children; ``None`` (default) detects the classes from the model and
             keeps sub-model towers on one card when a plan fits.
         prefer_head_device: force the head onto this device index.
+        exclude_modules: modules left out of the plan and the map, e.g. decoder
+            layers that block swap keeps in host RAM and the load never builds.
         reserve_load_transient: keep room on each card for tensors transformers 5
             merges while loading (expert stacks). When no placement keeps it the
             plan is returned without it and says so in ``notes``.
@@ -1477,6 +1482,15 @@ def plan_device_map(
         {} if activation_reserve_bytes is not None else _moe_dequant_transient_by_unit(model, units)
     )
     total = sizes.get("", sum(s for _, s in units))
+    left_out = tuple(exclude_modules)
+    def _left_out(name):
+        return any(name == e or name.startswith(e + ".") for e in left_out)
+    if left_out:
+        for e in left_out:
+            if any(e.startswith(u + ".") for u, _ in units):
+                raise ValueError(f"cannot exclude {e}: it is part of a larger placement unit")
+        total -= sum(size for u, size in units if _left_out(u))
+        units = [(u, size) for u, size in units if not _left_out(u)]
 
     head_name, head_mod = resolve_output_head(model)
     width = int(vocab_size) if vocab_size else resolve_head_width(model, head_mod)
@@ -2244,6 +2258,8 @@ def plan_device_map(
     uncovered = []
     for pname, _ in list(model.named_parameters(remove_duplicate=False)) + \
                     list(model.named_buffers(remove_duplicate=False)):
+        if left_out and _left_out(pname):
+            continue
         if not any(pname == k or pname.startswith(k + ".") for k in assign):
             uncovered.append(pname)
     if uncovered:
@@ -2677,3 +2693,247 @@ def plan_device_map_for_pretrained(
     if plan is not None and dropped:
         plan.device_map = unmap_dropped_modules(plan.device_map, model, dropped)
     return plan
+
+
+@dataclass
+class BlockSwapPlan:
+    """Result of :func:`plan_block_swap`."""
+
+    layers: int
+    """Decoder layers to keep in host RAM, the last ones; 0 = everything fits."""
+    total_layers: int
+    swapped_bytes: int
+    reserve_bytes: int
+    """VRAM kept free per device for training (activations, logits, LoRA state)."""
+    budgets: dict[int, int]
+    device_plan: DeviceMapPlan | None = None
+    """Multi-GPU placement of the resident layers; None on one device."""
+    offload_embedding: bool = False
+    """Move the input embedding to host RAM after the load (tried before any layer)."""
+    embedding_bytes: int = 0
+    notes: list[str] = field(default_factory=list)
+
+    def describe(self) -> str:
+        moved = []
+        if self.offload_embedding:
+            moved.append(f"the input embedding ({self.embedding_bytes / _GiB:.2f} GiB)")
+        if self.layers:
+            moved.append(f"{self.layers} of {self.total_layers} decoder layers ({self.swapped_bytes / _GiB:.2f} GiB)")
+        if not moved:
+            head = f"block swap: not needed, the model fits keeping {self.reserve_bytes / _GiB:.2f} GiB free for training"
+        else:
+            head = (f"block swap: {' and '.join(moved)} stay in host RAM so "
+                    f"{self.reserve_bytes / _GiB:.2f} GiB stays free for training")
+        lines = [head]
+        if self.device_plan is not None:
+            lines.append(self.device_plan.describe())
+        lines.extend(f"note: {n}" for n in self.notes)
+        return "\n".join(lines)
+
+
+def plan_block_swap(
+    model_name_or_path: str | None = None,
+    *,
+    model: nn.Module | None = None,
+    hf_quantizer: Any = None,
+    max_memory: Mapping[Any, Any] | None = None,
+    seq_len: int = 2048,
+    batch_size: int = 1,
+    lora_rank: int = 16,
+    reserve_bytes: int | None = None,
+    prefetch_depth: int = 2,
+    rows_per_chunk: int = 128,
+    retained_rows: int = 0,
+    headroom_bytes: int | None = None,
+    safety_bytes: int = 256 * 1024 ** 2,
+    free_space_policy: str = "balanced",
+    no_split_module_classes: Sequence[str] | None = None,
+    offload_embedding: bool = False,
+    placement: str = "tail",
+    trust_remote_code: bool = False,
+    **config_kwargs: Any,
+) -> BlockSwapPlan:
+    """How many trailing decoder layers to keep in host RAM so training fits.
+
+    Sized on the meta device, before anything loads. One GPU: the resident
+    weights, the slot pool and ``reserve_bytes`` must fit its free memory. Two
+    or more: :func:`plan_device_map` must place the resident model keeping
+    ``reserve_bytes`` free on every card (the swapped tail fetches onto one card,
+    so its slot pool is charged to each). ``reserve_bytes`` defaults to
+    :func:`unsloth_zoo.block_swap.estimate_training_reserve_bytes` for
+    ``seq_len * batch_size`` tokens and rank ``lora_rank`` LoRA on every linear.
+
+    ``offload_embedding`` (one GPU, untied embeddings): the input embedding may
+    move to host RAM after the load, tried before any layer since only the looked
+    up rows cross PCIe. The load itself still holds it on the card, so the
+    resident weights alone must fit the budget too. Other large token tables
+    (``extra_input_embeddings``) move with it, streamed to host during the load.
+
+    ``placement``: which layers the count names (``block_swap.swap_indices``).
+
+    Raises :class:`DeviceMapInfeasible` when even one resident layer does not fit.
+    """
+    from .block_swap import (
+        find_decoder_layers, estimate_training_reserve_bytes, lora_param_count, _pool_bytes, _layer_signature,
+        extra_input_embeddings, swap_indices,
+    )
+
+    config = None
+    if model is None:
+        model, hf_quantizer, config = build_meta_model(
+            model_name_or_path, trust_remote_code=trust_remote_code, **config_kwargs
+        )
+    config = config if config is not None else getattr(model, "config", None)
+
+    devices = _usable_devices(max_memory)
+    if not devices:
+        raise DeviceMapInfeasible("block swap needs at least one usable CUDA device")
+    budgets = {}
+    for d in devices:
+        if max_memory is not None:
+            budgets[d] = _parse_size(max_memory[d] if d in max_memory else max_memory[str(d)])
+        else:
+            budgets[d] = int(torch.cuda.mem_get_info(d)[0])
+    raw_budgets = dict(budgets)
+    budgets, quantizer_note = _adjust_budgets_for_quantizer(budgets, hf_quantizer)
+    notes = [quantizer_note] if quantizer_note else []
+
+    layers = find_decoder_layers(model)
+    names = [_name_of_module(model, layer) for layer in layers]
+    sizes = _compute_module_sizes(model, hf_quantizer)
+    # BlockSwap moves unshared parameters only: buffers and tensors shared across layers stay on the card.
+    owners = {}
+    for i, layer in enumerate(layers):
+        for p in layer.parameters():
+            owners.setdefault(id(p), set()).add(i)
+    # Module sizes count each shared tensor once, under its first name: take it off only where it was counted.
+    first_name = {}
+    for k, p in model.named_parameters():
+        first_name.setdefault(id(p), k)
+    layer_bytes = [
+        max(0, sizes.get(n, 0)
+            - sum(b.numel() * b.element_size() for b in layer.buffers())
+            - sum(p.numel() * p.element_size() for p in layer.parameters()
+                  if len(owners[id(p)]) > 1 and first_name.get(id(p), "").startswith(n + ".")))
+        for n, layer in zip(names, layers)
+    ]
+    total = sizes.get("", sum(layer_bytes))
+    L = len(layers)
+
+    if reserve_bytes is None:
+        # fp32 LoRA weights, grads, AdamW's two moments and the foreach step's temporary.
+        lora_bytes = lora_param_count(layers, lora_rank) * 20
+        reserve_bytes = estimate_training_reserve_bytes(
+            config, seq_len, batch_size, extra_bytes = lora_bytes
+        )
+    reserve_bytes = int(reserve_bytes)
+
+    # Every non-LoRA weight: nothing is frozen yet on the meta model.
+    layer_sigs = [
+        _layer_signature([(k, p) for k, p in layer.named_parameters() if "lora_" not in k])
+        for layer in layers
+    ]
+
+    def swapped(n):
+        return [layer_bytes[i] for i in swap_indices(L, n, placement)]
+
+    # `embedding` sits on the card during the load and moves after it; `streamed` tables move as they load.
+    embedding = streamed = largest_table = 0
+    if offload_embedding and len(devices) == 1:
+        head_name, head_mod = resolve_output_head(model)
+        getter = getattr(model, "get_input_embeddings", None)
+        inp = getter() if callable(getter) else None
+        name = _name_of_module(model, inp) if inp is not None else None
+        if name is not None and not head_is_tied(model, head_mod):
+            embedding = sizes.get(name, 0)
+        tables = [sizes.get(n, 0) for n, _ in extra_input_embeddings(model)]
+        streamed, largest_table = sum(tables), max(tables, default = 0)
+    use_embedding = False
+
+    def fits(n):
+        out = swapped(n)
+        pool = _pool_bytes(out, prefetch_depth, [layer_sigs[i] for i in swap_indices(L, n, placement)]) if n else 0
+        if len(devices) == 1:
+            resident = total - sum(out) - (streamed if use_embedding else 0)
+            off = embedding if use_embedding else 0
+            # Peaks: training (reserve), attach (pool beside the embedding), load (a whole streamed table in flight).
+            in_flight = largest_table if use_embedding else 0
+            ok = (
+                resident - off + pool + reserve_bytes <= budgets[devices[0]]
+                and resident + max(pool, in_flight) <= budgets[devices[0]]
+            )
+            return ok, None
+        excluded = [names[i] for i in swap_indices(L, n, placement)]
+        # The slot pool lives on the head's card: accept a plan only if the head landed on the card charged.
+        for pool_device in (reversed(devices) if n else devices[:1]):
+            # plan_device_map applies the quantizer's haircut itself: hand it the raw budgets, the pool scaled to survive it.
+            max_memory = {
+                d: raw_budgets[d] - (pool * raw_budgets[d] // max(budgets[d], 1) if d == pool_device else 0)
+                for d in devices
+            }
+            if max_memory[pool_device] <= 0:
+                continue  # this card cannot hold the pool; try the next
+            try:
+                plan = plan_device_map(
+                    model,
+                    max_memory = max_memory,
+                    rows_per_chunk = rows_per_chunk,
+                    retained_rows = retained_rows,
+                    headroom_bytes = headroom_bytes,
+                    safety_bytes = safety_bytes,
+                    activation_reserve_bytes = reserve_bytes,
+                    free_space_policy = free_space_policy,
+                    hf_quantizer = hf_quantizer,
+                    no_split_module_classes = no_split_module_classes,
+                    prefer_head_device = pool_device if n else None,
+                    exclude_modules = excluded,
+                )
+            except DeviceMapInfeasible:
+                continue
+            if plan is not None:
+                return True, plan
+        return False, None
+
+    ok, plan = fits(0)
+    n = 0
+    if not ok and (embedding or streamed):
+        use_embedding = True
+        ok, plan = fits(0)
+    if not ok:
+        # Identical layers: feasibility only improves as more leave the cards, so bisect on the count.
+        lo, hi = 1, L - 1
+        ok_hi, plan_hi = fits(hi)
+        if not ok_hi:
+            raise DeviceMapInfeasible(
+                f"Even with {hi} of {L} decoder layers in host RAM the model does not fit while "
+                f"keeping {reserve_bytes / _GiB:.2f} GiB free for training on "
+                + ", ".join(f"cuda:{d} ({budgets[d] / _GiB:.2f} GiB free)" for d in devices)
+                + ". Lower max_seq_length or the batch size, or add a GPU."
+            )
+        n, plan = hi, plan_hi
+        if len(set(layer_sigs)) == 1:
+            while lo < n:
+                mid = (lo + n) // 2
+                ok_mid, plan_mid = fits(mid)
+                if ok_mid:
+                    n, plan = mid, plan_mid
+                else:
+                    lo = mid + 1
+        else:
+            # Spread picks for n and n + 1 are not nested: mixed layers can fit at n but not at n + 1.
+            for m in range(lo, hi):
+                ok_m, plan_m = fits(m)
+                if ok_m:
+                    n, plan = m, plan_m
+                    break
+    return BlockSwapPlan(
+        layers = n,
+        total_layers = L,
+        swapped_bytes = sum(swapped(n)),
+        reserve_bytes = reserve_bytes,
+        budgets = budgets,
+        device_plan = plan,
+        offload_embedding = use_embedding,
+        embedding_bytes = embedding + streamed if use_embedding else 0,
+        notes = notes,
+    )

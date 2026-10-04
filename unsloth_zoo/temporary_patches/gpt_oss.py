@@ -3755,14 +3755,23 @@ def patch_GptOssModel():
 
         # is_decoding = is_flex_attention_decoding(self.layers[0].self_attn, hidden_states)
         bsz, qlen, hd = hidden_states.shape
-        if not self.training and qlen == 1 and isinstance(attention_mask, dict):
+        block_swap = getattr(self.layers, "_unsloth_block_swap", None)
+        # Across cards (embedding included) only the swapper's hooks move inputs: take the hooked path.
+        _swap_device = getattr(block_swap, "layer_device", None)
+        _cross_card = getattr(block_swap, "spans_devices", False) or (
+            _swap_device is not None and hidden_states.device != _swap_device
+        )
+        if not self.training and qlen == 1 and isinstance(attention_mask, dict) and not _cross_card:
             # Add hack since residuals need to clone outside of the torch.compile region??
             # This forces it to free past residuals
             torch.compiler.cudagraph_mark_step_begin()
             # Initialize for common return path
             all_hidden_states = None
             all_router_logits = None
+            # This loop calls the layer's parts directly, so the block swapper's forward hooks never fire.
             for layer_idx, decoder_layer in enumerate(self.layers):
+                if block_swap is not None:
+                    block_swap.enter(layer_idx)
                 mask = _gpt_oss_select_mask(
                     attention_mask,
                     _gpt_oss_layer_attention_type(decoder_layer, self.config, layer_idx),
@@ -3792,6 +3801,8 @@ def patch_GptOssModel():
                 else:
                     hidden_states = moe_forward_inference_bf16(decoder_layer.mlp, hidden_states)
                 hidden_states += residual
+                if block_swap is not None:
+                    block_swap.leave(layer_idx)
             pass
             hidden_states = rms_layernorm_forward(self.norm, hidden_states)
         else:
