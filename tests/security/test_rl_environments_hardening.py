@@ -161,6 +161,43 @@ def test_ordinary_annotations_and_literals_still_work():
     assert create_locked_down_function(source)([[2, 0], [0, 2]]) == "A"
 
 
+def test_literal_through_typing_aliases_still_works():
+    source = (
+        "def strategy(board):\n"
+        "    import typing as t\n"
+        "    from typing import Literal as L\n"
+        "    a: t.Literal['W', 'A'] = 'W'\n"
+        "    b: L['S', 'D'] = 'S'\n"
+        "    return a\n"
+    )
+    assert create_locked_down_function(source)([[2]]) == "W"
+
+
+@pytest.mark.parametrize("rebind", ["int = object", "import os as int", "def int(): pass"])
+def test_rebound_builtin_gets_no_positional_pattern_exemption(rebind):
+    source = (
+        "def strategy(board):\n"
+        f"    {rebind}\n"
+        "    match board:\n"
+        "        case int(x):\n"
+        "            return x\n"
+        "    return 'W'\n"
+    )
+    with pytest.raises((ImportError, RuntimeError)):
+        create_locked_down_function(source)([[2]])
+
+
+def test_checker_only_uses_ast_nodes_present_on_this_python(monkeypatch):
+    """Python 3.9 has no match or type-parameter nodes; the binding scan must not assume them."""
+    for name in ("MatchAs", "MatchStar", "MatchMapping", "MatchClass", "TypeVar", "ParamSpec", "TypeVarTuple"):
+        monkeypatch.delattr(rl_env.ast, name, raising=False)
+    monkeypatch.setattr(rl_env, "_NAMED_BINDING_NODES", rl_env._ast_nodes("MatchAs", "MatchStar", "TypeVar"))
+    monkeypatch.setattr(rl_env, "_MATCH_MAPPING_NODES", rl_env._ast_nodes("MatchMapping"))
+    tree = rl_env.ast.parse("def strategy(board: list) -> str:\n    x: int = 1\n    return 'W'\n")
+    bound, literal_names, typing_names = rl_env._bound_names(tree)
+    assert {"strategy", "board", "x"} <= bound and "Literal" in literal_names and "typing" in typing_names
+
+
 # --- none of the hardening may cost ordinary generated code ------------------
 
 def test_ordinary_match_statements_still_work():

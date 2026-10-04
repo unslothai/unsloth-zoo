@@ -691,49 +691,61 @@ def _annotation_nodes(node):
 _TYPING_MODULES = frozenset({"typing", "typing_extensions"})
 
 
-def _typing_names_are_real(tree):
-    # True when `Literal`, `typing` and `typing_extensions` can only mean the real
-    # typing objects: bound by nothing except imports from the typing modules.
+# Binding nodes that only exist on newer Pythons (match is 3.10+, PEP 695 type
+# parameters 3.12+); an empty tuple makes the isinstance checks below false on 3.9.
+def _ast_nodes(*names):
+    return tuple(node for node in (getattr(ast, name, None) for name in names) if node is not None)
+
+
+_NAMED_BINDING_NODES = _ast_nodes("MatchAs", "MatchStar", "TypeVar", "ParamSpec", "TypeVarTuple")
+_MATCH_MAPPING_NODES = _ast_nodes("MatchMapping")
+
+
+def _bound_names(tree):
+    # Every name the code binds, plus the names that can only mean the real typing
+    # `Literal` / typing modules: bound by nothing except imports from the typing modules.
+    bound, literal_names, typing_names = set(), {"Literal"}, set(_TYPING_MODULES)
     for node in ast.walk(tree):
         if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
-            names = {node.id}
+            bound.add(node.id)
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            names = {node.name}
+            bound.add(node.name)
         elif isinstance(node, ast.arg):
-            names = {node.arg}
+            bound.add(node.arg)
+        elif isinstance(node, ast.ExceptHandler) or (
+            _NAMED_BINDING_NODES and isinstance(node, _NAMED_BINDING_NODES)
+        ):
+            if node.name:
+                bound.add(node.name)
+        elif _MATCH_MAPPING_NODES and isinstance(node, _MATCH_MAPPING_NODES):
+            if node.rest:
+                bound.add(node.rest)
         elif isinstance(node, ast.Import):
-            if any((a.asname or a.name) in ("Literal", *_TYPING_MODULES)
-                   and a.name not in _TYPING_MODULES for a in node.names):
-                return False
-            continue
+            for alias in node.names:
+                if alias.name in _TYPING_MODULES:
+                    typing_names.add(alias.asname or alias.name)
+                else:
+                    bound.add(alias.asname or alias.name.partition(".")[0])
         elif isinstance(node, ast.ImportFrom):
-            if any((a.asname or a.name) in ("Literal", *_TYPING_MODULES)
-                   and not (node.module in _TYPING_MODULES and a.name == "Literal"
-                            and (a.asname or a.name) == "Literal") for a in node.names):
-                return False
-            continue
-        elif isinstance(node, (ast.MatchAs, ast.MatchStar, ast.ExceptHandler)):
-            names = {node.name}
-        elif isinstance(node, ast.MatchMapping):
-            names = {node.rest}
-        else:
-            continue
-        if names & {"Literal", *_TYPING_MODULES}:
-            return False
-    return True
+            for alias in node.names:
+                if node.module in _TYPING_MODULES and alias.name == "Literal":
+                    literal_names.add(alias.asname or alias.name)
+                else:
+                    bound.add(alias.asname or alias.name)
+    return bound, literal_names - bound, typing_names - bound
 
 
-def _annotation_strings(annotation, allow_literal):
+def _annotation_strings(annotation, literal_names, typing_names):
     # Literal["W", "A"] arguments are values, never evaluated as code, so they
     # stay allowed; every other string in an annotation is a forward reference.
     stack = [annotation]
     while stack:
         sub = stack.pop()
-        if allow_literal and isinstance(sub, ast.Subscript) and (
-            (isinstance(sub.value, ast.Name) and sub.value.id == "Literal")
+        if isinstance(sub, ast.Subscript) and (
+            (isinstance(sub.value, ast.Name) and sub.value.id in literal_names)
             or (isinstance(sub.value, ast.Attribute) and sub.value.attr == "Literal"
                 and isinstance(sub.value.value, ast.Name)
-                and sub.value.value.id in _TYPING_MODULES)
+                and sub.value.value.id in typing_names)
         ):
             continue
         if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
@@ -748,7 +760,7 @@ def _reject_dunder_access(tree):
     included) using only attribute access. Generated code has no reason to touch
     dunders, so refuse them outright.
     """
-    allow_literal = None
+    bindings = None
     for node in ast.walk(tree):
         # Definition names are strings on the node, invisible to the Name and
         # Attribute checks below, so they get their own fail-closed rule.
@@ -771,9 +783,9 @@ def _reject_dunder_access(tree):
         # them (get_type_hints and its callers) runs text the walk only saw as a
         # literal. Annotations written as code are walked like any other node.
         for annotation in _annotation_nodes(node):
-            if allow_literal is None:
-                allow_literal = _typing_names_are_real(tree)
-            for _ in _annotation_strings(annotation, allow_literal):
+            if bindings is None:
+                bindings = _bound_names(tree)
+            for _ in _annotation_strings(annotation, *bindings[1:]):
                 raise RuntimeError(
                     "String annotations are not allowed in generated code."
                 )
@@ -787,8 +799,12 @@ def _reject_dunder_access(tree):
         # kwd_attrs is the only identifier-as-string field that READS an attribute;
         # every other one merely binds, and the Name rule above refuses the read.
         if _MATCH_CLASS_NODES and isinstance(node, _MATCH_CLASS_NODES):
+            if node.patterns and bindings is None:
+                bindings = _bound_names(tree)
+            # A rebound `int = K` is no longer the builtin, so it gets no exemption.
             if node.patterns and not (
                 isinstance(node.cls, ast.Name) and node.cls.id in _SELF_MATCHING_TYPES
+                and node.cls.id not in bindings[0]
             ):
                 raise RuntimeError(
                     "Positional class patterns are only allowed on builtin types in generated code."
