@@ -264,7 +264,7 @@ class BlockSwap:
         self.pos = {li: k for k, li in enumerate(self.indices)}
         self.start = self.indices[0] if self.indices else len(layers)
         self._input_hooked = [False] * len(self.indices)
-        self.spans_devices = False
+        self.spans_devices, self.layer_device = False, None
         if not self.indices:
             return
         if device is None:
@@ -284,6 +284,7 @@ class BlockSwap:
                 homes.update(p.device for _, p in _swappable(layer) if p.device.type == "cuda")
         # Code that bypasses the pre-hook (fast decode loops) must check this: only the hook moves inputs across cards.
         self.spans_devices = len(homes) > 1
+        self.layer_device = next(iter(homes)) if len(homes) == 1 else None
         for layer in swapped:
             for name, p in layer.named_parameters():
                 if (p.device.type == "cpu") and (p.requires_grad or "lora_" in name or id(p) in shared):

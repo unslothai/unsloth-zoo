@@ -703,6 +703,8 @@ def test_one_card_swap_keeps_fast_decode():
     blocks = nn.ModuleList([_XBlock(64) for _ in range(4)]).cuda().requires_grad_(False)
     sw = BlockSwap(blocks, [1, 3], prefetch_depth = 1)
     assert not sw.spans_devices
+    # An embedding on another card shows up as hidden states off this device.
+    assert sw.layer_device == blocks[0].w.weight.device
     sw.remove()
     assert not BlockSwap(blocks, [], prefetch_depth = 1).spans_devices
 
@@ -802,3 +804,11 @@ def test_load_layers_to_host_matches_a_normal_load(tmp_path):
     with torch.no_grad():
         assert torch.equal(model(input_ids = ids).logits, want)
     sw.remove()
+
+
+def test_gpt_oss_fast_decode_checks_where_hidden_states_arrive():
+    # The fast loop skips the pre-hook: an embedding on another card must send decode down the hooked path.
+    src = open(os.path.join(_HERE, "unsloth_zoo", "temporary_patches", "gpt_oss.py"), encoding = "utf-8").read()
+    gate = src[src.index('block_swap = getattr(self.layers, "_unsloth_block_swap", None)'):]
+    gate = gate[:gate.index("torch.compiler.cudagraph_mark_step_begin()")]
+    assert "layer_device" in gate and "hidden_states.device" in gate and "spans_devices" in gate
