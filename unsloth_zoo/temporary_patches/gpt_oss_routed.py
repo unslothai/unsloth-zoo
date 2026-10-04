@@ -34,6 +34,7 @@ __all__ = [
     "routed_mlp_forward",
 ]
 
+import functools
 import os
 from typing import Optional
 
@@ -608,6 +609,12 @@ def _lora_delta(x_slots, idx, terms):
     return delta
 
 
+@functools.lru_cache(maxsize = None)
+def _bf16_supported(device_index):
+    major, _ = torch.cuda.get_device_capability(device_index)
+    return major >= 8
+
+
 def routed_bf16_eligible(experts, hidden_states):
     """True when routed_bf16_forward can run this call exactly."""
     if triton is None or not hidden_states.is_cuda or torch.is_grad_enabled():
@@ -623,7 +630,7 @@ def routed_bf16_eligible(experts, hidden_states):
         # fp32 weights would hit tl.dot's TF32 path; bf16 needs hardware support (not T4).
         if not isinstance(w, torch.Tensor) or w.dim() != 3 or w.dtype not in (torch.bfloat16, torch.float16):
             return False
-        if w.dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        if w.dtype == torch.bfloat16 and not _bf16_supported(w.device.index or 0):
             return False
     return True
 
@@ -667,12 +674,19 @@ def routed_mlp_forward(mlp, hidden_states, max_slots = ROUTED_MAX_SLOTS):
     if os.environ.get("UNSLOTH_GPTOSS_ROUTED_KERNEL", "1") == "0":
         return None
     experts = mlp.experts
+    nf4 = False
+    if hasattr(experts, "gate_up_projs"):
+        # Pointer tables are built eagerly (data_ptr is not traceable), also on calls too large to
+        # route, so a compiled decode step that follows an eager prefill finds them ready.
+        state = getattr(experts, "_unsloth_routed_nf4", None) if torch.compiler.is_compiling() else prepare_routed_experts(experts)
+        nf4 = bool(state)
     if hidden_states.numel() // hidden_states.shape[-1] * getattr(mlp.router, "top_k", 4) > max_slots:
         return None
-    nf4 = hasattr(experts, "gate_up_projs") and prepare_routed_experts(experts) is not None
     if not nf4 and not routed_bf16_eligible(experts, hidden_states):
         return None
-    router_out = mlp.router(hidden_states)
+    # The router takes [tokens, hidden]: transformers 5 normalizes the top-k scores with
+    # softmax(dim=1), which on a [batch, seq, k] input would run over the sequence instead.
+    router_out = mlp.router(hidden_states.reshape(-1, hidden_states.shape[-1]))
     scores, indices = router_out[-2], router_out[-1]
     if nf4:
         out = routed_experts_forward(experts, hidden_states, indices, scores)

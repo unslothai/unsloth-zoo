@@ -215,3 +215,20 @@ def test_param_wrapper_hook_routes_only_at_the_outermost_wrapper():
     assert (got.float().reshape_as(ref) - ref).abs().max().item() < 2e-2 * max(1.0, ref.abs().max().item())
     # Grad-enabled calls keep the module forward.
     assert _gpt_oss_routed_wrapper_forward(outer, base, x, (), {"router_indices": idx, "routing_weights": weights}) is None
+
+
+@pytest.mark.parametrize("lora", [False, True])
+@pytest.mark.parametrize("B", [1, 3])
+def test_routed_mlp_forward_matches_module_on_batched_decode(monkeypatch, lora, B):
+    """routed_mlp_forward gets [B, 1, H] decode states. The transformers 5 router normalizes its
+    top-k scores with softmax(dim=1), so it has to see [tokens, H], else every pick weighs 1."""
+    from unsloth_zoo.temporary_patches.gpt_oss_routed import routed_mlp_forward
+    model, mlp = _toy(lora)
+    x = torch.randn(B, 1, H, device = "cuda").bfloat16()
+    with torch.no_grad():
+        got = routed_mlp_forward(mlp, x)
+        monkeypatch.setenv("UNSLOTH_GPTOSS_ROUTED_KERNEL", "0")
+        ref = mlp(x)
+        ref = (ref[0] if isinstance(ref, tuple) else ref).float()
+    assert got is not None
+    torch.testing.assert_close(got.float().reshape(ref.shape), ref, atol = 2e-2, rtol = 2e-2)
