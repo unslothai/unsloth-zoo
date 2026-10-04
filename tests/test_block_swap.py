@@ -658,6 +658,29 @@ def test_auto_swap_indices_takes_only_the_shortfall():
     assert len(idx) == 11 and left > 0
 
 
+def test_pool_bytes_rounds_depth_up_like_the_runtime():
+    assert _mod._pool_bytes([10] * 4, 0) == _mod._pool_bytes([10] * 4, 1) == 2 * 10
+
+
+class _SharedBlock(nn.Module):
+    def __init__(self, shared):
+        super().__init__()
+        self.own = nn.Linear(256, 256, bias = False)
+        self.shared = shared
+
+
+def test_auto_swap_indices_counts_no_savings_for_shared_weights():
+    if not torch.cuda.is_available():
+        return
+    shared = nn.Linear(256, 2048, bias = False)
+    layers = nn.ModuleList([_SharedBlock(shared) for _ in range(12)]).cuda().requires_grad_(False)
+    own = 256 * 256 * 4
+    dev = layers[0].own.weight.device
+    # Two own-layers short: five go (three stay as the pool); the shared table frees nothing.
+    idx, left = auto_swap_indices(layers, 10 * own, 2, free_bytes = {dev: 8 * own})
+    assert len(idx) == 5 and left == 0
+
+
 def test_block_on_another_card_gets_its_inputs_moved():
     if torch.cuda.device_count() < 2:
         return

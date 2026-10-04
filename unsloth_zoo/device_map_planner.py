@@ -2800,7 +2800,11 @@ def plan_block_swap(
     layers = find_decoder_layers(model)
     names = [_name_of_module(model, layer) for layer in layers]
     sizes = _compute_module_sizes(model, hf_quantizer)
-    layer_bytes = [sizes.get(n, 0) for n in names]
+    # BlockSwap moves parameters only: buffers (rotary / mask caches) stay resident.
+    layer_bytes = [
+        max(0, sizes.get(n, 0) - sum(b.numel() * b.element_size() for b in layer.buffers()))
+        for n, layer in zip(names, layers)
+    ]
     total = sizes.get("", sum(layer_bytes))
     L = len(layers)
 

@@ -2031,6 +2031,27 @@ def test_block_swap_plan_fits_the_pool_before_the_embedding_moves():
     assert total - plan.layers * layer + 3 * layer <= budget
 
 
+class _CachedBlock(nn.Module):
+    def __init__(self, hidden):
+        super().__init__()
+        self.mlp = nn.Linear(hidden, hidden, bias = False)
+        self.register_buffer("cache", torch.zeros(4 * hidden, hidden), persistent = False)
+
+
+def test_block_swap_plan_leaves_layer_buffers_resident():
+    from unsloth_zoo.device_map_planner import plan_block_swap
+    model = _meta(layers = 16)
+    with torch.device("meta"):
+        for i in range(16):
+            model.layers[i] = _CachedBlock(64)
+    sizes = _compute_module_sizes(model)
+    total, weight = sizes[""], sizes["layers.0.mlp"]
+    budget = total - 2 * weight
+    plan = plan_block_swap(model = model, max_memory = {0: budget}, reserve_bytes = 0)
+    # Only weights leave the card: two freed beyond the three-slot pool.
+    assert plan.layers == 5
+
+
 def test_block_swap_plan_keeps_a_tied_embedding():
     from unsloth_zoo.device_map_planner import plan_block_swap
     model = _meta(layers = 8, tie = True)

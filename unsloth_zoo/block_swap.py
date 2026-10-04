@@ -610,6 +610,7 @@ def _layer_signature(params):
 def _pool_bytes(sizes, depth, sigs = None):
     # One pool per shape signature, depth + 1 slots each (fewer if fewer blocks share it); BlockSwap keys
     # pools on layout, so equal-size blocks with different shapes need a pool each.
+    depth = max(1, depth)  # as BlockSwap
     counts = {}
     for i, b in enumerate(sizes):
         key = sigs[i] if sigs is not None else b
@@ -622,9 +623,14 @@ def auto_swap_indices(layers, reserve_bytes, prefetch_depth = 2, free_bytes = No
     """Fewest layers to move to host RAM so each GPU keeps `reserve_bytes` free, net of the slot pool.
 
     Returns (indices, shortfall_left); shortfall_left > 0 when one layer per device must stay and it is not enough."""
+    # Params shared across layers stay on the card under BlockSwap, so they free nothing.
+    owners = {}
+    for i, layer in enumerate(layers):
+        for _, p in _swappable(layer):
+            owners.setdefault(id(p), set()).add(i)
     by_device = {}
     for i, layer in enumerate(layers):
-        params = _swappable(layer)
+        params = [(k, p) for k, p in _swappable(layer) if len(owners[id(p)]) == 1]
         if not params or params[0][1].device.type != "cuda":
             continue
         by_device.setdefault(params[0][1].device, []).append(
