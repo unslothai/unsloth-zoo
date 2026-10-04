@@ -1271,7 +1271,7 @@ def test_nax_int8_prefill_routes_dense_and_expert_calls_from_their_row_minimum(m
                     assert mx.allclose(a, b, rtol = 5e-2, atol = 5e-2).item()
             model.train()
             run(100)
-            assert not calls   # training stays native
+            assert not calls
             model.eval()
     assert type(model.moe.down_proj).__name__ == "QuantizedSwitchLinear" and type(model.proj) is nn.QuantizedLinear
     assert "_unsloth_nax_int8_prefill_rows" not in model.proj.__dict__
@@ -1422,7 +1422,7 @@ def test_nax_int8_prefill_differentiates_through_the_stock_op(monkeypatch):
         calls.clear()
         routed_dense = dense(x)
         routed_moe = mx.compile(moe, inputs = model.state, outputs = model.state)(x)
-    assert 2 in calls and 3 in calls   # both routes were taken
+    assert 2 in calls and 3 in calls
     # The dense gradients never read the forward output, so they match stock bitwise.
     assert sorted(routed_dense) == sorted(native_dense) == ["biases", "scales", "x"]
     assert all(mx.array_equal(routed_dense[k], native_dense[k]).item() for k in native_dense)

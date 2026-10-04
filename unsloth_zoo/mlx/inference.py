@@ -166,7 +166,6 @@ def _moe_switch_specs():
 
 
 def _native_type(projection):
-    # The class a NAX scope subclass stands in for, which the MoE fusions treat as that class.
     return getattr(type(projection), "_unsloth_nax_qmm_native", type(projection))
 
 
@@ -2714,7 +2713,6 @@ def _nax_int8_qmm_matches_native(x, w, scales, biases, group_size, bits, routed,
     bound = mx.finfo(x.dtype).eps * mx.abs(reference) + K * 2.0 ** -22 * magnitude
     if bits == 8:   # centred codes against b + 128 * s cancel only to rounding, even where stock gives exactly 0
         bound += 2.0 ** -15 * product(mx.abs(rounded), mx.abs(scales32), mx.abs(biases32) + 256 * mx.abs(scales32))
-    # A group holding a non-finite value gives NaN.
     agree = (mx.abs(got - reference) <= bound) | (mx.isnan(got) & mx.isnan(reference))
     return bool(mx.all(agree).item())
 
@@ -2891,8 +2889,7 @@ def _nax_int8_prefill_route(module, classes, switches, packed):
 
 class Int8PrefillStatus(NamedTuple):
     available: bool
-    # "" when available, else "nax_unavailable", "distributed", "not_downloaded", "no_eligible_projections"
-    # or "probe_failed"
+    # "", nax_unavailable, distributed, not_downloaded, no_eligible_projections or probe_failed
     reason: str
     projections: int   # linears and routed-expert projections the int8 route can take; approximate before load
 

@@ -834,9 +834,7 @@ def _int8_gather_qmm(x, w, scales, biases, group_size, bits, indices, token_rows
                      row_tiles, token_rows)
 
 
-# Measured on the M5 Pro and used on every NAX GPU, as the route is opt-in: every width beats stock end to
-# end from the first row count the small-row kernel leaves to stock. Weights under 1024 wide or deep gain
-# too little; heads over 64K wide are evaluated at one position in prefill.
+# M5 Pro thresholds, used on every NAX GPU since the route is opt-in; heads over 64K wide run at one prefill position.
 _INT8_PREFILL_MIN_ROWS = _QMM_MAX_ROWS + 1
 _INT8_PREFILL_MIN_N = _INT8_PREFILL_MIN_K = 1024
 _INT8_PREFILL_MAX_N = 65536
