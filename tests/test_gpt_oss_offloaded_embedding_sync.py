@@ -89,3 +89,34 @@ def test_offloaded_embedding_reads_finished_input_ids():
     res = json.loads(lines[-1][len("RESULT "):])
     assert res["unsafe_copies"] == [], res
     assert res["max_diff"] == 0.0, res
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
+def test_offloaded_embedding_op_under_cuda_graphs():
+    """The offloaded lookup op used inside a compiled, CUDA graphed step: fullgraph, and the same
+    rows as eager while the ids change every step. (The race it removes, a CPU lookup reading ids
+    a graph partition had not copied back yet, showed on a whole gpt-oss decode step at batch 4;
+    this small graph does not reproduce it.)"""
+    from unsloth_zoo.temporary_patches.gpt_oss import _offloaded_embedding
+    if _offloaded_embedding is None:
+        pytest.skip("torch.library.custom_op unavailable")
+    torch.manual_seed(0)
+    V, H = 50021, 64
+    weight = torch.randn(V, H, dtype = torch.bfloat16)
+    proj = torch.randn(H, V, device = "cuda", dtype = torch.bfloat16)
+
+    def step(logits):
+        # Next ids come from a GPU op, as in generate, then go through the CPU table.
+        ids = logits.argmax(-1, keepdim = True)
+        emb = _offloaded_embedding(ids, weight)
+        return (emb[:, 0].float() @ proj.float()).to(torch.bfloat16)
+
+    compiled = torch.compile(step, fullgraph = True, mode = "reduce-overhead")
+    logits = torch.randn(4, V, device = "cuda", dtype = torch.bfloat16)
+    ref = logits.clone()
+    with torch.no_grad():
+        for _ in range(12):
+            torch.compiler.cudagraph_mark_step_begin()
+            logits = compiled(logits).clone()
+            ref = step(ref)
+            torch.testing.assert_close(logits, ref)

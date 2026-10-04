@@ -3333,6 +3333,33 @@ pass
 TEMPORARY_PATCHES.append(patch_GptOssAttention)
 
 
+def _offloaded_embedding_impl(input_ids: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    # Blocking copies both ways: a non_blocking copy into the CPU can be read before it lands.
+    ids = input_ids.to(weight.device)
+    return torch.nn.functional.embedding(ids, weight).to(input_ids.device)
+
+
+try:
+    # cudagraph_unsafe makes Inductor's graph partitioning run the lookup outside the CUDA graph,
+    # in order with the rest of the step; inlined, the CPU kernel read token ids the graph had
+    # not copied back yet.
+    _offloaded_embedding = torch.library.custom_op(
+        "unsloth_zoo::gpt_oss_offloaded_embedding", mutates_args = (),
+        tags = (torch._C.Tag.cudagraph_unsafe,),
+    )(_offloaded_embedding_impl)
+except Exception:
+    try:
+        _offloaded_embedding = torch.library.custom_op(
+            "unsloth_zoo::gpt_oss_offloaded_embedding", mutates_args = (),
+        )(_offloaded_embedding_impl)
+    except Exception:
+        _offloaded_embedding = None
+if _offloaded_embedding is not None:
+    @_offloaded_embedding.register_fake
+    def _(input_ids, weight):
+        return input_ids.new_empty((*input_ids.shape, weight.shape[-1]), dtype = weight.dtype)
+
+
 def patch_GptOssModel():
     if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0": return
     if UNSLOTH_COMPILE_DISABLE: return
@@ -3703,9 +3730,17 @@ def patch_GptOssModel():
             embed_device = self.embed_tokens.weight.device
             # Never non_blocking into the CPU: the lookup can read the ids before the copy lands
             # (generate does not sync between steps, so it embedded the previous token).
-            inputs_embeds = self.embed_tokens(
-                input_ids.to(embed_device, non_blocking = embed_device.type != "cpu")
-            ).to(input_ids.device)
+            if (
+                torch.compiler.is_compiling()
+                and _offloaded_embedding is not None
+                and embed_device != input_ids.device
+                and type(self.embed_tokens) is nn.Embedding
+            ):
+                inputs_embeds = _offloaded_embedding(input_ids, self.embed_tokens.weight)
+            else:
+                inputs_embeds = self.embed_tokens(
+                    input_ids.to(embed_device, non_blocking = embed_device.type != "cpu")
+                ).to(input_ids.device)
         if not self.training and inputs_embeds.requires_grad:
             # detach, not requires_grad_(False): the embeddings are a non-leaf when an input
             # requires-grad hook or an offloaded copy produced them, and that raises.
