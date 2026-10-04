@@ -227,3 +227,20 @@ def test_teacher_load_does_not_inherit_student_trust(fake_loaders, tmp_path, mon
     finally:
         _MLX_MODEL_FILE_TRUST.reset(token)
     assert not marker.exists()
+
+
+@pytest.mark.parametrize("model_file", ["../outside.py", "/tmp/elsewhere.py", "sub/../../up.py", "custom_arch.txt"])
+def test_model_file_outside_the_model_folder_refused_even_when_trusted(fake_loaders, tmp_path, model_file):
+    from unsloth_zoo.mlx.loader import _MLX_MODEL_FILE_TRUST, _install_mlx_model_file_guard
+
+    lm_utils, _ = fake_loaders
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(json.dumps({"model_type": "llama", "model_file": model_file}))
+    _install_mlx_model_file_guard()
+    token = _MLX_MODEL_FILE_TRUST.set(True)
+    try:
+        with pytest.raises(ValueError, match="outside its own folder"):
+            lm_utils.load_model(model_path)
+    finally:
+        _MLX_MODEL_FILE_TRUST.reset(token)

@@ -1031,6 +1031,16 @@ def _mlx_vlm_declared_model_file(arguments):
     return model_path, config.get("model_file")
 
 
+def _model_file_inside(model_path, model_file):
+    if model_path is None or not isinstance(model_file, str) or not model_file.endswith(".py"):
+        return False
+    if os.path.isabs(model_file):
+        return False
+    root = os.path.realpath(str(model_path))
+    target = os.path.realpath(os.path.join(root, model_file))
+    return os.path.commonpath([root, target]) == root
+
+
 def _guard_mlx_model_file_loader(module, name, declared_model_file, required_parameter):
     original = getattr(module, name, None)
     if original is None or getattr(original, "_unsloth_model_file_guard", False):
@@ -1050,6 +1060,13 @@ def _guard_mlx_model_file_loader(module, name, declared_model_file, required_par
         except TypeError:
             return original(*args, **kwargs)
         model_path, model_file = declared_model_file(arguments)
+        # Even a trusted repo may only run a .py inside its own folder: that is the code Studio's
+        # consent scan fingerprints, and nothing legitimate points elsewhere.
+        if model_file and not _model_file_inside(model_path, model_file):
+            raise ValueError(
+                f"Unsloth: The model at {model_path} names a model_file ({model_file!r}) outside "
+                "its own folder. Refusing to run it."
+            )
         if model_file and not _MLX_MODEL_FILE_TRUST.get():
             raise ValueError(
                 f"Unsloth: The model at {model_path} requires importing and running a custom "
