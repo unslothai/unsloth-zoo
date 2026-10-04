@@ -2839,8 +2839,8 @@ def plan_block_swap(
         if len(devices) == 1:
             resident = total - sum(out) - (streamed if use_embedding else 0)
             off = embedding if use_embedding else 0
-            # Training needs the reserve; the load holds the embedding before it moves.
-            ok = resident - off + pool + reserve_bytes <= budgets[devices[0]] and resident <= budgets[devices[0]]
+            # Training needs the reserve; the slot pool is allocated while the embedding is still on the card.
+            ok = resident - off + pool + reserve_bytes <= budgets[devices[0]] and resident + pool <= budgets[devices[0]]
             return ok, None
         excluded = [names[i] for i in swap_indices(L, n, placement)]
         # The slot pool lives on the head's card: accept a plan only if the head landed on the card charged.

@@ -2019,6 +2019,18 @@ def test_block_swap_plan_moves_the_embedding_before_any_layer():
     assert plan.offload_embedding and (plan.layers - 3) * layer >= 2 * layer > (plan.layers - 4) * layer
 
 
+def test_block_swap_plan_fits_the_pool_before_the_embedding_moves():
+    # Short sequences: the embedding outweighs the reserve, so attach (pool + embedding on the card) is the peak.
+    from unsloth_zoo.device_map_planner import plan_block_swap
+    model = _meta(layers = 16, vocab = 64)
+    sizes = _compute_module_sizes(model)
+    total, layer, embed = sizes[""], sizes["layers.0"], sizes["embed_tokens"]
+    budget = total - embed - 2 * layer
+    plan = plan_block_swap(model = model, max_memory = {0: budget}, reserve_bytes = 0, offload_embedding = True)
+    assert plan.offload_embedding
+    assert total - plan.layers * layer + 3 * layer <= budget
+
+
 def test_block_swap_plan_keeps_a_tied_embedding():
     from unsloth_zoo.device_map_planner import plan_block_swap
     model = _meta(layers = 8, tie = True)
