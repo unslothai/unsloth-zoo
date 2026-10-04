@@ -21,6 +21,7 @@ No GPU deps: uses mlx-lm (text) and mlx-vlm (VLM) instead of unsloth.models
 """
 
 import ast
+import contextvars
 import copy
 import gc
 import hashlib
@@ -1002,6 +1003,109 @@ def _raise_mlx_remote_code_refusal(model_path, error, *, tokenizer_only=False):
                 f"(declared in {filename}). Pass trust_remote_code=True "
                 "to allow this repository's custom code."
             ) from error
+
+
+# mlx-lm < 0.32 and mlx-vlm exec a config.json `model_file` unchecked; trust is scoped here.
+_MLX_MODEL_FILE_TRUST = contextvars.ContextVar("unsloth_mlx_model_file_trust", default=False)
+
+
+def _mlx_lm_declared_model_file(arguments):
+    model_config = arguments.get("model_config") or {}
+    model_path = arguments.get("model_path")
+    # mlx-lm applies model_config over config.json, so an explicit model_file (even None) wins.
+    if isinstance(model_config, Mapping) and "model_file" in model_config:
+        return model_path, model_config["model_file"]
+    model_file = None
+    if model_path is not None:
+        model_file = _read_json_file(os.path.join(str(model_path), "config.json")).get("model_file")
+    return model_path, model_file
+
+
+def _mlx_vlm_declared_model_file(arguments):
+    config = arguments.get("config")
+    model_path = arguments.get("model_path")
+    if model_path is None or not isinstance(config, Mapping):
+        return model_path, None
+    return model_path, config.get("model_file")
+
+
+def _model_file_inside(model_path, model_file):
+    if model_path is None or not isinstance(model_file, str) or not model_file.endswith(".py"):
+        return False
+    if os.path.isabs(model_file):
+        return False
+    # Lexical, not realpath: Hub snapshot files are symlinks into blobs/.
+    root = os.path.normpath(os.path.abspath(str(model_path)))
+    target = os.path.normpath(os.path.join(root, model_file))
+    return os.path.commonpath([root, target]) == root
+
+
+def _guard_mlx_model_file_loader(module, name, declared_model_file, required_parameter):
+    original = getattr(module, name, None)
+    if original is None or getattr(original, "_unsloth_model_file_guard", False):
+        return
+    try:
+        signature = inspect.signature(original)
+    except (TypeError, ValueError):
+        return
+    # Newer releases gate model_file on their own trust_remote_code; older ones never exec it.
+    if "trust_remote_code" in signature.parameters or required_parameter not in signature.parameters:
+        return
+
+    @wraps(original)
+    def guarded(*args, **kwargs):
+        try:
+            arguments = signature.bind(*args, **kwargs).arguments
+        except TypeError:
+            return original(*args, **kwargs)
+        model_path, model_file = declared_model_file(arguments)
+        # Even trusted, only a .py inside the folder (what Studio's consent scan fingerprints).
+        if model_file and not _model_file_inside(model_path, model_file):
+            raise ValueError(
+                f"Unsloth: The model at {model_path} names a model_file ({model_file!r}) outside "
+                "its own folder. Refusing to run it."
+            )
+        if model_file and not _MLX_MODEL_FILE_TRUST.get():
+            raise ValueError(
+                f"Unsloth: The model at {model_path} requires importing and running a custom "
+                f"module ({model_file!r}) to build its architecture. This is disabled by "
+                "default. Pass trust_remote_code=True if you trust this model."
+            )
+        return original(*args, **kwargs)
+
+    guarded._unsloth_model_file_guard = True
+    setattr(module, name, guarded)
+
+
+def _install_mlx_model_file_guard():
+    for module_name, name, declared_model_file, required_parameter in (
+        ("mlx_lm.utils", "load_model", _mlx_lm_declared_model_file, "model_path"),
+        ("mlx_vlm.utils", "get_model_and_args", _mlx_vlm_declared_model_file, "model_path"),
+    ):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            continue
+        _guard_mlx_model_file_loader(module, name, declared_model_file, required_parameter)
+
+
+def _scoped_mlx_model_file_trust(from_pretrained):
+    signature = inspect.signature(from_pretrained)
+
+    @wraps(from_pretrained)
+    def wrapper(*args, **kwargs):
+        _install_mlx_model_file_guard()
+        try:
+            trust = signature.bind(*args, **kwargs).arguments.get("trust_remote_code", False)
+        except TypeError:
+            trust = kwargs.get("trust_remote_code", False)
+        token = _MLX_MODEL_FILE_TRUST.set(bool(trust))
+        try:
+            return from_pretrained(*args, **kwargs)
+        finally:
+            _MLX_MODEL_FILE_TRUST.reset(token)
+
+    return wrapper
 
 
 def _tokenizer_class_for_model_type(model_path):
@@ -8242,6 +8346,7 @@ class FastMLXModel:
     """
 
     @staticmethod
+    @_scoped_mlx_model_file_trust
     def from_pretrained(
         model_name="mlx-community/Llama-3.2-1B-Instruct-4bit",
         max_seq_length=2048,
