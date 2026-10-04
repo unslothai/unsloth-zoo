@@ -1013,9 +1013,12 @@ _MLX_MODEL_FILE_TRUST = contextvars.ContextVar("unsloth_mlx_model_file_trust", d
 
 def _mlx_lm_declared_model_file(arguments):
     model_config = arguments.get("model_config") or {}
-    model_file = model_config.get("model_file") if isinstance(model_config, Mapping) else None
     model_path = arguments.get("model_path")
-    if model_file is None and model_path is not None:
+    # mlx-lm applies model_config over config.json, so an explicit model_file (even None) wins.
+    if isinstance(model_config, Mapping) and "model_file" in model_config:
+        return model_path, model_config["model_file"]
+    model_file = None
+    if model_path is not None:
         model_file = _read_json_file(os.path.join(str(model_path), "config.json")).get("model_file")
     return model_path, model_file
 

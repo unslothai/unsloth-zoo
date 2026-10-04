@@ -341,11 +341,16 @@ def load_teacher(model_name_or_path):
     from mlx.utils import tree_flatten
     from mlx_lm import load
 
-    from .loader import _install_mlx_model_file_guard
+    from .loader import _MLX_MODEL_FILE_TRUST, _install_mlx_model_file_guard
 
-    # Teachers never opt into repository code: refuse a config.json model_file.
+    # Teachers never opt into repository code: refuse a config.json model_file, even when the
+    # surrounding student load was trusted.
     _install_mlx_model_file_guard()
-    teacher, teacher_tokenizer = load(model_name_or_path)
+    token = _MLX_MODEL_FILE_TRUST.set(False)
+    try:
+        teacher, teacher_tokenizer = load(model_name_or_path)
+    finally:
+        _MLX_MODEL_FILE_TRUST.reset(token)
     teacher.eval()
     teacher.freeze()
     trainable = tree_flatten(teacher.trainable_parameters())

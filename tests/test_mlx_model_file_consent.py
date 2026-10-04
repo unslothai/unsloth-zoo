@@ -197,3 +197,33 @@ def test_from_pretrained_is_scoped():
     import inspect
 
     assert inspect.signature(FastMLXModel.from_pretrained).parameters["trust_remote_code"].default is False
+
+
+def test_explicit_model_file_none_override_loads(fake_loaders, tmp_path):
+    # mlx-lm applies model_config over config.json, so model_file=None means nothing is executed.
+    from unsloth_zoo.mlx.loader import _install_mlx_model_file_guard
+
+    lm_utils, _ = fake_loaders
+    model_path, marker = _model_dir(tmp_path, model_file=True)
+    _install_mlx_model_file_guard()
+    model, config = lm_utils.load_model(model_path, model_config={"model_file": None})
+    assert model == "model" and config["model_file"] is None
+    assert not marker.exists()
+
+
+def test_teacher_load_does_not_inherit_student_trust(fake_loaders, tmp_path, monkeypatch):
+    from unsloth_zoo.mlx import distill
+    from unsloth_zoo.mlx.loader import _MLX_MODEL_FILE_TRUST
+
+    lm_utils, _ = fake_loaders
+    model_path, marker = _model_dir(tmp_path, model_file=True)
+    fake_mlx_lm = types.ModuleType("mlx_lm")
+    fake_mlx_lm.load = lambda path: lm_utils.load(path)
+    monkeypatch.setitem(sys.modules, "mlx_lm", fake_mlx_lm)
+    token = _MLX_MODEL_FILE_TRUST.set(True)
+    try:
+        with pytest.raises(ValueError, match="trust_remote_code=True"):
+            distill.load_teacher(str(model_path))
+    finally:
+        _MLX_MODEL_FILE_TRUST.reset(token)
+    assert not marker.exists()
