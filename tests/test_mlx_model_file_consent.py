@@ -246,3 +246,33 @@ def test_model_file_outside_the_model_folder_refused_even_when_trusted(fake_load
             lm_utils.load_model(model_path)
     finally:
         _MLX_MODEL_FILE_TRUST.reset(token)
+
+
+def test_trusted_model_file_symlinked_like_a_hub_snapshot_loads(fake_loaders, tmp_path):
+    # The Hugging Face cache stores snapshots/<rev>/custom_arch.py as a symlink into blobs/.
+    from unsloth_zoo.mlx.loader import _MLX_MODEL_FILE_TRUST, _install_mlx_model_file_guard
+
+    lm_utils, _ = fake_loaders
+    marker = tmp_path / "ran.marker"
+    blobs = tmp_path / "blobs"
+    blobs.mkdir()
+    (blobs / "abc123").write_text(f"open({str(marker)!r}, 'w').write('ran')\n")
+    snapshot = tmp_path / "snapshots" / "rev"
+    snapshot.mkdir(parents=True)
+    try:
+        (snapshot / "custom_arch.py").symlink_to(blobs / "abc123")
+    except OSError:
+        pytest.skip("symlinks need extra privileges on this Windows runner")
+    (snapshot / "config.json").write_text(
+        json.dumps({"model_type": "llama", "model_file": "custom_arch.py"})
+    )
+    _install_mlx_model_file_guard()
+    with pytest.raises(ValueError, match="trust_remote_code=True"):
+        lm_utils.load_model(snapshot)
+    assert not marker.exists()
+    token = _MLX_MODEL_FILE_TRUST.set(True)
+    try:
+        lm_utils.load_model(snapshot)
+    finally:
+        _MLX_MODEL_FILE_TRUST.reset(token)
+    assert marker.exists()

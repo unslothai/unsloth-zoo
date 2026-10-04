@@ -1036,8 +1036,10 @@ def _model_file_inside(model_path, model_file):
         return False
     if os.path.isabs(model_file):
         return False
-    root = os.path.realpath(str(model_path))
-    target = os.path.realpath(os.path.join(root, model_file))
+    # Lexical check, not realpath: a Hugging Face snapshot (and Unsloth's own config views)
+    # symlink each file to a blob outside the snapshot folder, yet it is still the repo's file.
+    root = os.path.normpath(os.path.abspath(str(model_path)))
+    target = os.path.normpath(os.path.join(root, model_file))
     return os.path.commonpath([root, target]) == root
 
 
