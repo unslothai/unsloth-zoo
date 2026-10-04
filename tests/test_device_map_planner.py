@@ -1992,6 +1992,36 @@ def test_block_swap_plan_mixed_layers_finds_the_fewest_count():
     assert plan.layers == 4
 
 
+class _HalvingQuantizer:
+    def adjust_max_memory(self, max_memory):
+        return {k: v // 2 for k, v in max_memory.items()}
+
+
+def test_block_swap_plan_applies_the_quantizer_haircut_once(monkeypatch):
+    from unsloth_zoo import device_map_planner as dmp
+    model, total, layer = _swap_sizes()
+    sizes = dmp._compute_module_sizes(model)
+    # Size the model the same with and without the quantizer: only the budget haircut differs.
+    monkeypatch.setattr(dmp, "_compute_module_sizes", lambda model, hf_quantizer = None: sizes)
+    budget = 512 * 64 * 4 + 600 + 3 * layer
+    kw = dict(model = model, reserve_bytes = 0, headroom_bytes = 0)
+    plain = dmp.plan_block_swap(max_memory = {0: budget, 1: budget}, **kw)
+    halved = dmp.plan_block_swap(max_memory = {0: 2 * budget, 1: 2 * budget}, hf_quantizer = _HalvingQuantizer(), **kw)
+    assert plain.layers > 0 and halved.layers == plain.layers
+
+
+def test_block_swap_plan_counts_no_savings_for_a_block_listed_twice():
+    # One block object at every index: swapping any of them frees nothing, so no count fits.
+    from unsloth_zoo.device_map_planner import plan_block_swap
+    with torch.device("meta"):
+        model = _Tiny(layers = 1)
+        block = model.layers[0]
+        model.layers = nn.ModuleList([block] * 16)
+    total = _compute_module_sizes(model)[""]
+    with pytest.raises(DeviceMapInfeasible):
+        plan_block_swap(model = model, max_memory = {0: total - 1}, reserve_bytes = 0)
+
+
 def test_block_swap_plan_refuses_when_one_layer_cannot_stay():
     from unsloth_zoo.device_map_planner import plan_block_swap
     model, total, layer = _swap_sizes()

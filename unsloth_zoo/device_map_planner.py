@@ -2794,6 +2794,7 @@ def plan_block_swap(
             budgets[d] = _parse_size(max_memory[d] if d in max_memory else max_memory[str(d)])
         else:
             budgets[d] = int(torch.cuda.mem_get_info(d)[0])
+    raw_budgets = dict(budgets)
     budgets, quantizer_note = _adjust_budgets_for_quantizer(budgets, hf_quantizer)
     notes = [quantizer_note] if quantizer_note else []
 
@@ -2801,8 +2802,20 @@ def plan_block_swap(
     names = [_name_of_module(model, layer) for layer in layers]
     sizes = _compute_module_sizes(model, hf_quantizer)
     # BlockSwap moves parameters only: buffers (rotary / mask caches) stay resident.
+    # Params shared across layers (or a block listed twice) stay on the card under BlockSwap: no savings.
+    owners = {}
+    for i, layer in enumerate(layers):
+        for p in layer.parameters():
+            owners.setdefault(id(p), set()).add(i)
+    # Module sizes count each shared tensor once, under its first name: take it off only where it was counted.
+    first_name = {}
+    for k, p in model.named_parameters():
+        first_name.setdefault(id(p), k)
     layer_bytes = [
-        max(0, sizes.get(n, 0) - sum(b.numel() * b.element_size() for b in layer.buffers()))
+        max(0, sizes.get(n, 0)
+            - sum(b.numel() * b.element_size() for b in layer.buffers())
+            - sum(p.numel() * p.element_size() for p in layer.parameters()
+                  if len(owners[id(p)]) > 1 and first_name.get(id(p), "").startswith(n + ".")))
         for n, layer in zip(names, layers)
     ]
     total = sizes.get("", sum(layer_bytes))
@@ -2852,7 +2865,12 @@ def plan_block_swap(
             try:
                 plan = plan_device_map(
                     model,
-                    max_memory = {d: budgets[d] - (pool if d == pool_device else 0) for d in devices},
+                    # plan_device_map applies the quantizer's haircut itself: hand it the raw budgets, the pool scaled to survive it.
+                    max_memory = {
+                        d: raw_budgets[d]
+                        - (pool * raw_budgets[d] // max(budgets[d], 1) if d == pool_device else 0)
+                        for d in devices
+                    },
                     rows_per_chunk = rows_per_chunk,
                     retained_rows = retained_rows,
                     headroom_bytes = headroom_bytes,
