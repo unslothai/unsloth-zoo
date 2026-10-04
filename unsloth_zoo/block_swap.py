@@ -54,8 +54,7 @@ def _no_inference_mode():
 
 # WSL2 caps pinned memory: fall back to pageable.
 _PINNED_MEMORY_AVAILABLE = True
-# torch's pinned allocator rounds every allocation up to a power of two (a 4.5 MiB blob holds 8 MiB),
-# so blocks are packed into shared power-of-two chunks, as diffusion group offload does.
+# torch's pinned allocator rounds each allocation up to a power of two, so blocks share packed chunks.
 _ALIGN = 512
 _CHUNK_BYTES = 256 << 20
 # Pin only while this much host RAM stays free: max(4 GiB, 15%); the rest stays pageable.
@@ -234,15 +233,13 @@ def _to_device(obj, device):
 
 
 def _opaque(hook):
-    # Stream copies, event waits and `.data` swaps cannot be traced; a compiled caller breaks around
-    # the hook instead.
+    # Stream copies, event waits and `.data` swaps cannot be traced; compiled callers break around hooks.
     disable = getattr(getattr(torch, "compiler", None), "disable", None)
     return disable(hook) if disable is not None else hook
 
 
 def swap_indices(total, n, placement = "spread"):
-    """Which of `total` layers to swap. "spread" spaces them evenly (ending at the last layer), so each
-    copy hides behind total / n layers of compute instead of one; "tail" takes the last n."""
+    """"spread": evenly spaced, ending at the last layer (each copy hides behind total / n layers); "tail": last n."""
     n = max(0, min(int(n), total))
     if placement == "tail":
         return list(range(total - n, total))
@@ -273,8 +270,7 @@ class BlockSwap:
             device = torch.device("cuda", torch.cuda.current_device())
         self.device = torch.device(device)
         swapped = [layers[i] for i in self.indices]
-        # A param reachable from two layers (tied / shared blocks) stays on the card: evicting it
-        # under one layer would empty it for the other.
+        # A param shared by two layers stays on the card: evicting it under one empties it for the other.
         owners = {}
         for li, layer in enumerate(layers):
             for _, p in _swappable(layer):
@@ -297,7 +293,7 @@ class BlockSwap:
             self._pack()
             total = self.host_bytes()
             if self.pinned_bytes < total:
-                # Pageable copies run at a fraction of pinned bandwidth (5-7 vs 55 GB/s measured) and cannot hide.
+                # Pageable copies are several times slower than pinned ones and cannot hide behind compute.
                 print(f"Unsloth: block_swap pinned {self.pinned_bytes / 2**30:.1f} of {total / 2**30:.1f} GiB of host "
                       "memory; the rest is copied from pageable memory, several times slower. Free host RAM "
                       "or lower block_swap_layers for full speed.")
@@ -419,16 +415,13 @@ class BlockSwap:
             nxt = i - self.depth if _autograd_keeps_weights() else i + self.depth
             if 0 <= nxt < len(self.blocks):
                 self._fetch(self.blocks[nxt])
-            # The grad of the block's input is complete only once the block's backward has run, so its
-            # hook is the release point. A tensor hook adds no autograd node, unlike a full backward hook,
-            # which reorders gradient sums of tensors fed to several blocks (cross-attention states).
+            # Release on the input-grad hook: a full backward hook adds a node that reorders grad sums of shared inputs.
             x = next((a for a in args if isinstance(a, torch.Tensor)), None)
             if x is None:
                 x = kwargs.get("hidden_states")
             moved = None
             if isinstance(x, torch.Tensor) and b.home is not None and x.device != b.home:
-                # A host-loaded tail fetches onto the head's card, which may not be where the last
-                # resident layer left the hidden states.
+                # A host-loaded tail fetches onto the head's card, not necessarily where the hidden states are.
                 moved = (_to_device(args, b.home), _to_device(kwargs, b.home))
                 x = next((a for a in moved[0] if isinstance(a, torch.Tensor)), None)
                 if x is None:
@@ -454,7 +447,6 @@ class BlockSwap:
                 return output
             out = output[0] if isinstance(output, (tuple, list)) else output
             if not (isinstance(out, torch.Tensor) and out.requires_grad):
-                # Nothing will backpropagate through this call.
                 self._release(self.blocks[i])
                 return output
             self.blocks[i].pending = True
@@ -550,17 +542,13 @@ def _text_config(config):
     return config
 
 
-# Llama-3.1-8B 4-bit, Unsloth checkpointing, batch 4: activations grow 0.17 MiB per token at hidden 4096
-# (42 bytes per token per hidden unit), rounded up.
+# Measured 42 on Llama-3.1-8B 4-bit with Unsloth checkpointing, rounded up.
 _ACTIVATION_BYTES_PER_TOKEN_HIDDEN = 48
 
 
 def estimate_training_reserve_bytes(config, seq_len, batch_size = 1, extra_bytes = 0,
                                     logit_rows = 2048, safety_bytes = 256 << 20, fragmentation = 1 / 16):
-    """VRAM a LoRA step needs beyond the weights: activations, fp32 logits for up to `logit_rows`
-    rows, plus `extra_bytes` (trainable parameters' gradients and optimizer state), plus
-    `fragmentation` of that for the caching allocator's split blocks (a Qwen3.5-35B-A3B MoE LoRA
-    step ran out of memory at the plain sum)."""
+    """Activations + fp32 logits (`logit_rows` rows) + `extra_bytes`, plus `fragmentation` for split allocator blocks."""
     text = _text_config(config)
     hidden = (getattr(text, "hidden_size", None) or getattr(text, "n_embd", None)
               or getattr(text, "d_model", None) or 0)
@@ -573,8 +561,7 @@ def estimate_training_reserve_bytes(config, seq_len, batch_size = 1, extra_bytes
 
 
 def lora_param_count(layers, r = 16):
-    """LoRA parameters on every linear in `layers` at rank `r`: r * (in + out) each, and per expert
-    on fused [experts, in, out] weights (MoE LoRA targets those too)."""
+    """r * (in + out) per linear in `layers`, per expert on fused [experts, in, out] weights."""
     total = 0
     for layer in layers:
         for module in layer.modules():
@@ -618,11 +605,9 @@ def _pool_bytes(sizes, depth):
 
 
 def auto_swap_indices(layers, reserve_bytes, prefetch_depth = 2, free_bytes = None):
-    """Fewest layers to move to host RAM so each GPU keeps `reserve_bytes` free.
+    """Fewest layers to move to host RAM so each GPU keeps `reserve_bytes` free, net of the slot pool.
 
-    Per device, layers there are taken spread evenly until what they free, less the slot pool they
-    need, covers the shortfall. Returns (indices, shortfall_left): [] when every device already has
-    the room; shortfall_left > 0 when even keeping one layer per device is not enough."""
+    Returns (indices, shortfall_left); shortfall_left > 0 when one layer per device must stay and it is not enough."""
     by_device = {}
     for i, layer in enumerate(layers):
         params = _swappable(layer)
@@ -664,8 +649,7 @@ def find_decoder_layers(model):
             break
     if hasattr(m, "layers"):
         return m.layers
-    # Other layouts (`transformer.h`, `decoder.block`, `decoder.layers`): the list of blocks holding the
-    # most weight. Classes may differ (Mllama interleaves cross-attention layers).
+    # Other layouts (`transformer.h`, `decoder.block`): the heaviest block list; classes may differ (Mllama).
     best, best_bytes = None, 0
     for mod in model.modules():
         if isinstance(mod, torch.nn.ModuleList) and len(mod) >= 2:
@@ -679,8 +663,7 @@ def find_decoder_layers(model):
 
 def build_host_layers(make_layer, first_idx, count, tensors, device, compute_dtype,
                       quantize_4bit = False, skip_modules = (), prefix = "model.layers."):
-    """Build layers [first_idx, first_idx + count) with frozen weights in pinned host RAM.
-    `tensors` maps checkpoint keys to zero-arg loaders; quant_state stays on `device`."""
+    """Build layers [first_idx, first_idx + count) with frozen weights in pinned host RAM; quant_state stays on `device`."""
     import bitsandbytes as bnb
     device = torch.device(device)
     if any(".quant_state." in k for k in tensors):
@@ -742,14 +725,12 @@ def build_host_layers(make_layer, first_idx, count, tensors, device, compute_dty
     return out
 
 
-# Token tables besides the input embedding worth keeping in host RAM (Gemma 3n / 4 per-layer
-# embeddings: 5.25 GB on gemma-4-E4B); small position tables stay.
+# Extra token tables (Gemma 3n / 4 per-layer embeddings) worth host RAM; small position tables stay.
 EXTRA_EMBEDDING_MIN_BYTES = 256 << 20
 
 
 def extra_input_embeddings(model):
-    """(name, module) of every large nn.Embedding other than the input embedding. lm_head only ever
-    ties to the input embedding, so these are never shared with it."""
+    """Large nn.Embeddings besides the input embedding; lm_head only ties to the input one, so never shared."""
     try:
         main = model.get_input_embeddings()
     except Exception:
@@ -825,11 +806,10 @@ class _HostLoad:
 
 @contextmanager
 def load_layers_to_host(n, placement = "spread", embeddings = False):
-    """Wrap a transformers `from_pretrained`: each chosen decoder layer (`n` of them, or explicit
-    indices) moves to host RAM as soon as its last weight lands, so a model larger than the card
-    loads on any architecture. Quantization runs on the card as usual first. Install `BlockSwap` with
-    the yielded `.layers` / `.indices` after the load. `embeddings` also streams the
-    `extra_input_embeddings` (yielded as `.embeddings`; the caller hooks their lookups)."""
+    """Wrap `from_pretrained`: each chosen layer moves to host RAM once its last (quantized) weight lands.
+
+    Install `BlockSwap` on the yielded `.layers` / `.indices` afterwards; `embeddings` also streams
+    `extra_input_embeddings` (`.embeddings`, the caller hooks their lookups)."""
     state = _HostLoad(n, placement, embeddings)
     patched = []
     try:

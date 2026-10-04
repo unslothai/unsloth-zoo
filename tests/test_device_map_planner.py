@@ -1923,9 +1923,6 @@ def test_declared_classes_outside_a_module_list_are_kept_as_declared():
     assert resolve_no_split_classes(model) == ["LayerNorm"]
 
 
-# --------------------------------------------------------------------------- #
-# block swap sizing
-# --------------------------------------------------------------------------- #
 def _swap_sizes():
     model = _meta(layers = 8)
     sizes = _compute_module_sizes(model)
@@ -2013,8 +2010,7 @@ def test_block_swap_plan_keeps_a_tied_embedding():
 
 
 def test_block_swap_plan_streams_extra_token_tables_of_a_tied_model(monkeypatch):
-    # Gemma 3n / 4: the input embedding is tied, but the per-layer table is not and moves to host
-    # during the load, so it counts against neither the load nor training.
+    # Gemma 3n / 4: tied input embedding, but the per-layer table streams to host and costs the card nothing.
     from unsloth_zoo import block_swap
     from unsloth_zoo.device_map_planner import plan_block_swap
     model = _meta(layers = 8, tie = True)

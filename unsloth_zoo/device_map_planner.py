@@ -2695,9 +2695,6 @@ def plan_device_map_for_pretrained(
     return plan
 
 
-# --------------------------------------------------------------------------- #
-# block swap: decoder layers the GPUs cannot hold stay in host RAM
-# --------------------------------------------------------------------------- #
 @dataclass
 class BlockSwapPlan:
     """Result of :func:`plan_block_swap`."""
@@ -2808,8 +2805,7 @@ def plan_block_swap(
     L = len(layers)
 
     if reserve_bytes is None:
-        # LoRA weights, their gradients and AdamW's two moments, all fp32, plus the foreach
-        # step's fp32 temporary (sqrt of the second moment).
+        # fp32 LoRA weights, grads, AdamW's two moments and the foreach step's temporary.
         lora_bytes = lora_param_count(layers, lora_rank) * 20
         reserve_bytes = estimate_training_reserve_bytes(
             config, seq_len, batch_size, extra_bytes = lora_bytes
@@ -2819,8 +2815,7 @@ def plan_block_swap(
     def swapped(n):
         return [layer_bytes[i] for i in swap_indices(L, n, placement)]
 
-    # `embedding`: the input embedding, held on the card during the load and moved after it;
-    # `streamed`: other large token tables, moved to host as they load (never tied to the head).
+    # `embedding` sits on the card during the load and moves after it; `streamed` tables move as they load.
     embedding = streamed = 0
     if offload_embedding and len(devices) == 1:
         head_name, head_mod = resolve_output_head(model)
@@ -2842,8 +2837,7 @@ def plan_block_swap(
             ok = resident - off + pool + reserve_bytes <= budgets[devices[0]] and resident <= budgets[devices[0]]
             return ok, None
         excluded = [names[i] for i in swap_indices(L, n, placement)]
-        # The host tail fetches onto the output head's card (its inputs move there), so that card
-        # pays for the slot pool: accept a plan only if it put the head on the card charged.
+        # The slot pool lives on the head's card: accept a plan only if the head landed on the card charged.
         for pool_device in (reversed(devices) if n else devices[:1]):
             try:
                 plan = plan_device_map(

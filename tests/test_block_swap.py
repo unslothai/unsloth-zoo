@@ -288,7 +288,6 @@ def test_training_forward_keeps_the_blocks_recompute_needs_first():
             sw._pre(i)(M, (), {})
             sw._post(i)(M, None, None)
     assert [b.resident for b in sw.blocks] == [False] * 4 + [True, True]
-    # Eval forwards still evict everything.
     sw = _scheduler(6, depth = 2)
     M.training = False
     with torch.no_grad():
@@ -562,7 +561,6 @@ def _xrun(blocks, mode, swap, idx = None):
 
 
 def test_cross_fed_tensor_grads_are_bitwise_with_swap():
-    # Spread and tail placements, every checkpoint mode: bitwise grads, and backward releases every block.
     if not torch.cuda.is_available():
         return
     torch.manual_seed(0)
@@ -721,7 +719,6 @@ def test_host_load_moves_a_layer_only_once_all_its_weights_landed():
         assert (3 in state.done) == (k == len(names) - 1)
     assert state.indices == [2, 3] and 2 not in state.done
     assert not any(p.requires_grad for p in layer.parameters())
-    # A weight outside the swapped layers never triggers a move.
     state.on_param(model, "model.layers.1.0.weight")
     assert state.done == {3}
 
