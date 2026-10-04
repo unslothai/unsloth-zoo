@@ -863,6 +863,9 @@ def load_layers_to_host(n, placement = "spread", embeddings = False):
             state.bind(model)
             for i in state.indices:
                 state.evict(i)
+            # The plan counted streamed tables off the card during the load, so they leave per shard too.
+            for module in state.embedding_prefixes.values():
+                state.evict_embedding(module)
             return out
         mu._load_state_dict_into_meta_model = _load_state_dict_into_meta_model
         patched.append((mu, "_load_state_dict_into_meta_model", original))

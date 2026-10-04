@@ -812,3 +812,27 @@ def test_gpt_oss_fast_decode_checks_where_hidden_states_arrive():
     gate = src[src.index('block_swap = getattr(self.layers, "_unsloth_block_swap", None)'):]
     gate = gate[:gate.index("torch.compiler.cudagraph_mark_step_begin()")]
     assert "layer_device" in gate and "hidden_states.device" in gate and "spans_devices" in gate
+
+
+class _PerLayerTableModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = nn.ModuleList([nn.Linear(4, 4) for _ in range(4)])
+        self.embed_tokens = nn.Embedding(8, 4)
+        self.per_layer = nn.Embedding(64, 16)
+
+    def get_input_embeddings(self):
+        return self.embed_tokens
+
+
+def test_transformers_4_load_streams_tables_shard_by_shard(monkeypatch):
+    # No core_model_loading: the per-shard path runs, and the plan counted the tables off the card already.
+    import sys
+    monkeypatch.setitem(sys.modules, "transformers.core_model_loading", None)
+    monkeypatch.setattr(_mod, "EXTRA_EMBEDDING_MIN_BYTES", 64 * 16 * 4)
+    mu = importlib.import_module("transformers.modeling_utils")
+    model = _PerLayerTableModel()
+    monkeypatch.setattr(mu, "_load_state_dict_into_meta_model", lambda model, *a, **k: None, raising = False)
+    with _mod.load_layers_to_host(1, embeddings = True) as state:
+        mu._load_state_dict_into_meta_model(model)
+        assert state.embeddings == [model.per_layer]
