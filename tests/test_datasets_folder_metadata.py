@@ -168,3 +168,13 @@ def test_dictionary_encoded_parquet_metadata_is_refused(tmp_path):
     pq.write_table(table, data_dir / "train" / "metadata.parquet")
     with pytest.raises(ValueError, match = "Invalid metadata"):
         datasets.load_dataset("imagefolder", data_dir = str(data_dir), cache_dir = str(tmp_path / "cache"))
+
+
+def test_list_under_a_singular_key_is_plain_metadata(tmp_path):
+    rows = [
+        {"file_name": "ok.png", "source_file_name": ["../archive/raw.png"], "tags_file_names": "/not/a/list"},
+        {"file_name": "sub/nested.png", "source_file_name": ["/abs/raw.png"], "tags_file_names": "../x"},
+    ]
+    ds = _load(tmp_path, rows)["train"]
+    assert ds.num_rows == 2
+    assert ds["source_file_name"] == [["../archive/raw.png"], ["/abs/raw.png"]]

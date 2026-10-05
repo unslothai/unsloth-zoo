@@ -51,11 +51,17 @@ def _file_name_escapes(value):
     )
 
 
-def _is_path_key(name):
-    return name in ("file_name", "file_names") or name.endswith(("_file_name", "_file_names"))
+def _is_path_key(name, list_depth):
+    # Only the shapes datasets resolves: a singular key holding a string, a plural key
+    # holding a list of strings. A list under "*_file_name" stays ordinary metadata.
+    if list_depth == 0:
+        return name == "file_name" or name.endswith("_file_name")
+    if list_depth == 1:
+        return name == "file_names" or name.endswith("_file_names")
+    return False
 
 
-def _file_name_arrays(name, array):
+def _file_name_arrays(name, array, list_depth = 0):
     # Folder builders resolve these keys at any depth, and Parquet metadata can wrap them in
     # dictionary encoding or any list flavour, so unwrap by type rather than by layout.
     import pyarrow as pa
@@ -65,13 +71,13 @@ def _file_name_arrays(name, array):
 
     kind = array.type
     if is_any(kind, "is_dictionary"):
-        yield from _file_name_arrays(name, array.dictionary_decode())
+        yield from _file_name_arrays(name, array.dictionary_decode(), list_depth)
     elif is_any(kind, "is_struct"):
         for field, child in zip(kind, array.flatten()):
             yield from _file_name_arrays(field.name, child)
     elif is_any(kind, "is_list", "is_large_list", "is_fixed_size_list", "is_list_view", "is_large_list_view"):
-        yield from _file_name_arrays(name, array.flatten())
-    elif _is_path_key(name) and is_any(kind, "is_string", "is_large_string", "is_string_view"):
+        yield from _file_name_arrays(name, array.flatten(), list_depth + 1)
+    elif _is_path_key(name, list_depth) and is_any(kind, "is_string", "is_large_string", "is_string_view"):
         yield name, array
 
 
