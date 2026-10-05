@@ -154,11 +154,37 @@ def stop_compiling_weak_dictionary_writes():
     return marked
 
 
+def patch_dynamo_cleanup_hook_shutdown():
+    # CleanupHook.__call__ reads the global _cleanup_owners from a weakref callback, which at
+    # interpreter exit can run after module globals became None ("'NoneType' ... 'pop'").
+    try:
+        import torch._dynamo.utils as dynamo_utils
+    except Exception:
+        return
+    hook_class = getattr(dynamo_utils, "CleanupHook", None)
+    if hook_class is None or not hasattr(dynamo_utils, "_cleanup_owners"):
+        return
+    original_call = hook_class.__call__
+    if getattr(original_call, "_unsloth_shutdown_safe", False):
+        return
+    # Bind the module dict itself: it outlives the wipe of its values.
+    dynamo_globals = dynamo_utils.__dict__
+
+    def __call__(self, *args, _original_call = original_call, _globals = dynamo_globals):
+        if _globals.get("_cleanup_owners") is None:
+            return None
+        return _original_call(self, *args)
+    __call__._unsloth_shutdown_safe = True
+    hook_class.__call__ = __call__
+pass
+
+
 def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
     # All Unsloth Zoo code licensed under LGPLv3
     assert(type(debug) is bool)
     assert(type(O3)    is bool)
     import os, logging
+    patch_dynamo_cleanup_hook_shutdown()
 
     if debug:
         DEBUGGING = " with debugging"
