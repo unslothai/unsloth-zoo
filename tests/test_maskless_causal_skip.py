@@ -393,9 +393,16 @@ def test_a_model_local_flex_override_keeps_the_mask(patched, monkeypatch):
     _register_flex(monkeypatch, reroutes = True)
     assert patched.create_causal_mask(**kwargs) is None
 
-    interface = AttentionInterface()
-    interface._local_mapping = {"flex_attention": lambda *args, **kw: None}
-    module = types.ModuleType("transformers.models.fake_local_flex.modeling_fake_local_flex")
-    module.ALL_ATTENTION_FUNCTIONS = interface
-    monkeypatch.setitem(sys.modules, module.__name__, module)
-    assert patched.create_causal_mask(**kwargs) is not None
+    # transformers.models.*, and trust_remote_code's transformers_modules.* under any name.
+    for name, attribute in (
+        ("transformers.models.fake_local_flex.modeling_fake_local_flex", "ALL_ATTENTION_FUNCTIONS"),
+        ("transformers_modules.someone.fake_remote.modeling_fake_remote", "MY_ATTENTION"),
+    ):
+        interface = AttentionInterface()
+        interface._local_mapping = {"flex_attention": lambda *args, **kw: None}
+        module = types.ModuleType(name)
+        setattr(module, attribute, interface)
+        with monkeypatch.context() as scoped:
+            scoped.setitem(sys.modules, name, module)
+            assert patched.create_causal_mask(**kwargs) is not None, name
+        assert patched.create_causal_mask(**kwargs) is None

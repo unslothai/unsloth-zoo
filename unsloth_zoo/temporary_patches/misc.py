@@ -616,20 +616,30 @@ _LOCAL_FLEX_OVERRIDE_CACHE = [None, False]  # [len(sys.modules) when scanned, ov
 
 
 def _a_model_overrides_flex_locally():
-    # A modeling module's own AttentionInterface wins at dispatch over the global registry, so a
-    # local "flex_attention" that is not unsloth's wrapper would read None as bidirectional.
+    # A model's own AttentionInterface wins at dispatch over the global registry, so a local
+    # "flex_attention" that is not unsloth's wrapper would read None as bidirectional. Look at
+    # every loaded module (transformers.models.*, trust_remote_code's transformers_modules.*,
+    # user code), under any attribute name.
     import sys
     if _LOCAL_FLEX_OVERRIDE_CACHE[0] == len(sys.modules):
         return _LOCAL_FLEX_OVERRIDE_CACHE[1]
+    try:
+        from transformers.modeling_utils import AttentionInterface
+    except Exception:
+        return True
     found = False
-    for name, module in list(sys.modules.items()):
-        if not name.startswith("transformers.models.") or module is None: continue
+    for module in list(sys.modules.values()):
         # __dict__, not getattr: a getattr on a lazy transformers module imports its submodules.
-        local = getattr(getattr(module, "__dict__", {}).get("ALL_ATTENTION_FUNCTIONS", None), "_local_mapping", None)
-        if isinstance(local, dict) and "flex_attention" in local and \
-            getattr(local["flex_attention"], "_unsloth_maskless_causal_sdpa", False) is not True:
-            found = True
-            break
+        namespace = getattr(module, "__dict__", None)
+        if not isinstance(namespace, dict): continue
+        for value in list(namespace.values()):
+            if not isinstance(value, AttentionInterface): continue
+            local = getattr(value, "_local_mapping", None)
+            if isinstance(local, dict) and "flex_attention" in local and \
+                getattr(local["flex_attention"], "_unsloth_maskless_causal_sdpa", False) is not True:
+                found = True
+                break
+        if found: break
     _LOCAL_FLEX_OVERRIDE_CACHE[:] = [len(sys.modules), found]
     return found
 
