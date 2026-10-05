@@ -30,6 +30,9 @@ Constexpr axes:
            Linear4bit buffers (gpt-oss ModuleList experts).
   ACT:     gpt-oss clamp-swiglu, silu, gelu (tanh) or gelu (erf), gate * up.
   INTERLEAVED: gate / up rows alternate, else [gate; up] halves.
+  LORA_KIND: expert LoRA B as one [E, N, r] tensor (the ParamWrapper stash), or a table of
+           pointers to each expert's live lora_B weight (gpt-oss per-expert Linear4bit LoRA;
+           H = A @ x from the matching lora_A table), so optimizer steps are never stale.
 BF16 / FP16 3D experts reuse the expert-major kernel (each active expert's tile read once).
 """
 
@@ -47,6 +50,8 @@ __all__ = [
     "routed_down",
     "routed_bf16_gemm",
     "routed_bf16_moe",
+    "routed_lora_h",
+    "lora_pointer_table",
     "routed_moe_forward",
     "prepare_stacked_nf4",
     "nf4_select_dequant",
@@ -55,7 +60,7 @@ __all__ = [
 
 import functools
 import os
-from typing import Optional
+from typing import List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -167,12 +172,28 @@ if triton is not None:
         return W, A, A2, C2, offset
 
     @triton.jit
+    def _lora_ptr(PTRS, e, LORA_KIND: tl.constexpr):
+        # Expert e's own adapter weight from an int64 table of pointers (1 / 2 / 3: fp32 / bf16 / fp16).
+        if LORA_KIND == 2:
+            return tl.load(PTRS + e).to(tl.pointer_type(tl.bfloat16))
+        elif LORA_KIND == 3:
+            return tl.load(PTRS + e).to(tl.pointer_type(tl.float16))
+        else:
+            return tl.load(PTRS + e).to(tl.pointer_type(tl.float32))
+
+    @triton.jit
     def _lora_b(acc, LORA_B, LORA_H, e, s, rows64, rmask, scaling, stride_be, stride_bn, stride_br,
-                R: tl.constexpr, R_PAD: tl.constexpr):
-        # acc += scaling * B[e][rows] @ H[s], H = A[e] @ x precomputed per slot; B is [E, N, r].
+                R: tl.constexpr, R_PAD: tl.constexpr, LORA_KIND: tl.constexpr):
+        # acc += scaling * B[e][rows] @ H[s], H = A[e] @ x precomputed per slot. LORA_KIND 0: B is
+        # one [E, N, r] tensor (any strides); else a table of pointers to each expert's live
+        # [N, r] weight, so in-place optimizer steps are seen with nothing restacked.
         j = tl.arange(0, R_PAD)
         jmask = j < R
-        b = tl.load(LORA_B + e * stride_be + rows64[:, None] * stride_bn + j[None, :] * stride_br,
+        if LORA_KIND == 0:
+            Be = LORA_B + e * stride_be
+        else:
+            Be = _lora_ptr(LORA_B, e, LORA_KIND)
+        b = tl.load(Be + rows64[:, None] * stride_bn + j[None, :] * stride_br,
                     mask = rmask[:, None] & jmask[None, :], other = 0.0)
         h = tl.load(LORA_H + s * R + j, mask = jmask, other = 0.0)
         return acc + tl.sum(b.to(tl.float32) * h.to(tl.float32)[None, :], axis = 1) * scaling
@@ -216,7 +237,7 @@ if triton is not None:
         TOP_K: tl.constexpr, BLOCKSIZE: tl.constexpr, BLOCKSIZE2: tl.constexpr, NESTED: tl.constexpr,
         STACKED: tl.constexpr, ACT: tl.constexpr, INTERLEAVED: tl.constexpr,
         BIAS_KIND: tl.constexpr, HAS_LORA: tl.constexpr, R: tl.constexpr, R_PAD: tl.constexpr,
-        BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+        LORA_KIND: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     ):
         # gu = dequant(W[IDX[p]]) @ X[p // TOP_K] + BIAS[IDX[p]] (+ LoRA), then the gated
         # activation: OUT[p] is the [N // 2] fp32 expert intermediate. Each program owns
@@ -249,7 +270,7 @@ if triton is not None:
             acc += _expert_bias(BIAS, e, N, rows64, rmask, BIAS_KIND)
         if HAS_LORA:
             acc = _lora_b(acc, LORA_B, LORA_H, e, p.to(tl.int64), rows64, rmask, scaling,
-                          stride_be, stride_bn, stride_br, R, R_PAD)
+                          stride_be, stride_bn, stride_br, R, R_PAD, LORA_KIND)
         gate, up = tl.split(tl.reshape(acc, (BLOCK_N // 2, 2)))
         inter = _gated_act(gate, up, alpha, limit, ACT)
         half = tl.program_id(1) * (BLOCK_N // 2) + tl.arange(0, BLOCK_N // 2)
@@ -261,7 +282,8 @@ if triton is not None:
         RW_STRIDE, scaling, stride_be, stride_bn, stride_br,
         TOP_K: tl.constexpr, DENSE_RW: tl.constexpr, BLOCKSIZE: tl.constexpr, BLOCKSIZE2: tl.constexpr,
         NESTED: tl.constexpr, STACKED: tl.constexpr, BIAS_KIND: tl.constexpr, HAS_LORA: tl.constexpr,
-        R: tl.constexpr, R_PAD: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+        R: tl.constexpr, R_PAD: tl.constexpr, LORA_KIND: tl.constexpr, BLOCK_N: tl.constexpr,
+        BLOCK_K: tl.constexpr,
     ):
         # OUT[t] = sum_k rw[t, k] * (dequant(W[e_k]) @ X[t * TOP_K + k] + BIAS[e_k] (+ LoRA)),
         # fp32 accumulation, one store in the output dtype: no atomics, deterministic.
@@ -292,9 +314,28 @@ if triton is not None:
                 acc += _expert_bias(BIAS, e, N, rows64, rmask, BIAS_KIND)
             if HAS_LORA:
                 acc = _lora_b(acc, LORA_B, LORA_H, e, s, rows64, rmask, scaling,
-                              stride_be, stride_bn, stride_br, R, R_PAD)
+                              stride_be, stride_bn, stride_br, R, R_PAD, LORA_KIND)
             out += rw * acc
         tl.store(OUT + t.to(tl.int64) * N + rows, out.to(OUT.dtype.element_ty), mask = rmask)
+
+    @triton.jit
+    def _lora_h_kernel(X, IDX, A_PTRS, OUT, K, ROW_DIV, R: tl.constexpr, LORA_KIND: tl.constexpr,
+                       BLOCK_K: tl.constexpr):
+        # OUT[p, j] = A[IDX[p]][j] @ X[p // ROW_DIV], fp32; A through the pointer table, each
+        # expert's live [R, K] weight (row major). One program per (slot, rank row).
+        p = tl.program_id(0)
+        j = tl.program_id(1)
+        e = tl.load(IDX + p).to(tl.int64)
+        a_row = _lora_ptr(A_PTRS, e, LORA_KIND) + j.to(tl.int64) * K
+        x_row = X + (p // ROW_DIV).to(tl.int64) * K
+        ks = tl.arange(0, BLOCK_K)
+        acc = tl.zeros([BLOCK_K], dtype = tl.float32)
+        for k0 in range(0, K, BLOCK_K):
+            kmask = (k0 + ks) < K
+            x = tl.load(x_row + k0 + ks, mask = kmask, other = 0.0).to(tl.float32)
+            a = tl.load(a_row + k0 + ks, mask = kmask, other = 0.0).to(tl.float32)
+            acc += a * x
+        tl.store(OUT + p.to(tl.int64) * R + j, tl.sum(acc, axis = 0))
 
     @triton.jit
     def _nf4_select_dequant_kernel(
@@ -384,15 +425,22 @@ def _block_k(K, blocksize):
 
 
 def _lora_args(lora, dummy):
-    # (B [E, N, r] any strides, H [P, r] fp32, scaling, r, strides) or dummies.
+    # (B, H [P, r] fp32, scaling, r, strides, LORA_KIND) or dummies. B: one [E, N, r] tensor (any
+    # strides), or a list of each expert's [N, r] weight, read in place through a pointer table.
     if lora is None:
-        return dummy, dummy, 0.0, 1, (0, 0, 0)
-    B, H, scaling = lora
-    return B, H, float(scaling), B.shape[-1], (B.stride(0), B.stride(1), B.stride(2))
+        return dummy, dummy, 0.0, 1, (0, 0, 0), 0
+    B, H, scaling = lora[:3]
+    if isinstance(B, (list, tuple)):
+        got = lora_pointer_table(B)
+        if got is not None:
+            r = H.shape[-1]
+            return got[0], H, float(scaling), r, (0, r, 1), got[1]
+        B = torch.stack(B)
+    return B, H, float(scaling), B.shape[-1], (B.stride(0), B.stride(1), B.stride(2)), 0
 
 
 def _gate_up(x, idx, tb, top_k, lora, alpha, limit, out, act = ACT_GPTOSS, interleaved = True):
-    B, H, scaling, r, bs = _lora_args(lora, tb["lut"])
+    B, H, scaling, r, bs, kind = _lora_args(lora, tb["lut"])
     # Triton launches on the current device, not the tensors' (multi-GPU device_map).
     with torch.cuda.device(x.device):
         _routed_gate_up_kernel[(idx.numel(), triton.cdiv(tb["N"], 4))](
@@ -402,13 +450,13 @@ def _gate_up(x, idx, tb, top_k, lora, alpha, limit, out, act = ACT_GPTOSS, inter
             TOP_K = top_k, BLOCKSIZE = tb["blocksize"], BLOCKSIZE2 = tb["blocksize2"], NESTED = tb["nested"],
             STACKED = tb.get("stacked", False), ACT = act, INTERLEAVED = interleaved,
             BIAS_KIND = tb["bias_kind"], HAS_LORA = lora is not None, R = r, R_PAD = triton.next_power_of_2(r),
-            BLOCK_N = 4, BLOCK_K = _block_k(tb["K"], tb["blocksize"]), num_warps = 4,
+            LORA_KIND = kind, BLOCK_N = 4, BLOCK_K = _block_k(tb["K"], tb["blocksize"]), num_warps = 4,
         )
     return out
 
 
 def _down(x, idx, rw, dense_rw, tb, top_k, lora, out):
-    B, H, scaling, r, bs = _lora_args(lora, tb["lut"])
+    B, H, scaling, r, bs, kind = _lora_args(lora, tb["lut"])
     with torch.cuda.device(x.device):
         _routed_down_kernel[(out.shape[0], triton.cdiv(tb["N"], 4))](
             x, idx, rw, tb["w"], tb["a"], tb["a2"], tb["c2"], tb["off"], tb["lut"],
@@ -416,7 +464,7 @@ def _down(x, idx, rw, dense_rw, tb, top_k, lora, out):
             rw.stride(0), scaling, bs[0], bs[1], bs[2],
             TOP_K = top_k, DENSE_RW = dense_rw, BLOCKSIZE = tb["blocksize"], BLOCKSIZE2 = tb["blocksize2"],
             NESTED = tb["nested"], STACKED = tb.get("stacked", False), BIAS_KIND = tb["bias_kind"],
-            HAS_LORA = lora is not None, R = r, R_PAD = triton.next_power_of_2(r),
+            HAS_LORA = lora is not None, R = r, R_PAD = triton.next_power_of_2(r), LORA_KIND = kind,
             BLOCK_N = 4, BLOCK_K = _block_k(tb["K"], tb["blocksize"]), num_warps = 4,
         )
     return out
@@ -438,17 +486,18 @@ if triton is not None:
         x: torch.Tensor, idx: torch.Tensor, w: torch.Tensor, a: torch.Tensor, a2: torch.Tensor,
         c2: torch.Tensor, off: torch.Tensor, lut: torch.Tensor, bias: Optional[torch.Tensor],
         N: int, K: int, blocksize: int, blocksize2: int, nested: bool, bias_kind: int, stacked: bool,
-        top_k: int, lora_b: Optional[torch.Tensor], lora_h: Optional[torch.Tensor], scaling: float,
-        alpha: float, limit: float, act: int, interleaved: bool,
+        top_k: int, lora_b: Optional[torch.Tensor], lora_b_list: List[torch.Tensor],
+        lora_h: Optional[torch.Tensor], scaling: float, alpha: float, limit: float, act: int, interleaved: bool,
     ) -> torch.Tensor:
         tb = _tb(w, a, a2, c2, off, lut, bias, N, K, blocksize, blocksize2, nested, bias_kind, stacked)
-        lora = None if lora_b is None else (lora_b, lora_h, scaling)
+        lora = _op_lora(lora_b, lora_b_list, lora_h, scaling)
         out = torch.empty((idx.numel(), N // 2), dtype = torch.float32, device = x.device)
         return _gate_up(x, idx, tb, top_k, lora, alpha, limit, out, act, interleaved)
 
     @_gate_up_op.register_fake
     def _routed_nf4_gate_up_fake(x, idx, w, a, a2, c2, off, lut, bias, N, K, blocksize, blocksize2, nested,
-                                 bias_kind, stacked, top_k, lora_b, lora_h, scaling, alpha, limit, act, interleaved):
+                                 bias_kind, stacked, top_k, lora_b, lora_b_list, lora_h, scaling, alpha, limit,
+                                 act, interleaved):
         return x.new_empty((idx.numel(), N // 2), dtype = torch.float32)
 
     @torch.library.custom_op("unsloth_zoo::routed_nf4_down", mutates_args = ())
@@ -457,16 +506,17 @@ if triton is not None:
         a: torch.Tensor, a2: torch.Tensor, c2: torch.Tensor, off: torch.Tensor, lut: torch.Tensor,
         bias: Optional[torch.Tensor], N: int, K: int, blocksize: int, blocksize2: int, nested: bool,
         bias_kind: int, stacked: bool, top_k: int, lora_b: Optional[torch.Tensor],
-        lora_h: Optional[torch.Tensor], scaling: float, out_dtype: torch.dtype,
+        lora_b_list: List[torch.Tensor], lora_h: Optional[torch.Tensor], scaling: float,
+        out_dtype: torch.dtype,
     ) -> torch.Tensor:
         tb = _tb(w, a, a2, c2, off, lut, bias, N, K, blocksize, blocksize2, nested, bias_kind, stacked)
-        lora = None if lora_b is None else (lora_b, lora_h, scaling)
+        lora = _op_lora(lora_b, lora_b_list, lora_h, scaling)
         out = torch.empty((idx.numel() // top_k, N), dtype = out_dtype, device = x.device)
         return _down(x, idx, rw, dense_rw, tb, top_k, lora, out)
 
     @_down_op.register_fake
     def _routed_nf4_down_fake(x, idx, rw, dense_rw, w, a, a2, c2, off, lut, bias, N, K, blocksize, blocksize2,
-                              nested, bias_kind, stacked, top_k, lora_b, lora_h, scaling, out_dtype):
+                              nested, bias_kind, stacked, top_k, lora_b, lora_b_list, lora_h, scaling, out_dtype):
         return x.new_empty((idx.numel() // top_k, N), dtype = out_dtype)
 
 
@@ -476,13 +526,29 @@ def _table_args(tb):
             tb.get("stacked", False))
 
 
+def _op_lora(lora_b, lora_b_list, lora_h, scaling):
+    if lora_b is None and not lora_b_list:
+        return None
+    return (lora_b if lora_b is not None else list(lora_b_list), lora_h, scaling)
+
+
+def _lora_op_args(lora):
+    # (lora_b, lora_b_list, lora_h, scaling) for the custom ops.
+    if lora is None:
+        return None, [], None, 0.0
+    B = lora[0]
+    if isinstance(B, (list, tuple)):
+        return None, list(B), lora[1], float(lora[2])
+    return B, [], lora[1], float(lora[2])
+
+
 def routed_gate_up(x, idx, tb, top_k, alpha, limit, lora = None, act = ACT_GPTOSS, interleaved = True):
     """[T * top_k, N // 2] fp32: act(dequant(W[idx[p]]) @ x[p // top_k] + bias[idx[p]] (+ LoRA)).
-    lora: (B [E, N, r] any strides, H [P, r] fp32, scaling) or None."""
+    lora: (B, H [P, r] fp32, scaling) or None; B is one [E, N, r] tensor (any strides) or a list of
+    each expert's [N, r] weight, which the kernels read in place (lora_pointer_table)."""
     if torch.compiler.is_compiling():
-        b, h, scaling = lora if lora is not None else (None, None, 0.0)
         return torch.ops.unsloth_zoo.routed_nf4_gate_up(
-            x, idx, *_table_args(tb), top_k, b, h, float(scaling), float(alpha), float(limit),
+            x, idx, *_table_args(tb), top_k, *_lora_op_args(lora), float(alpha), float(limit),
             int(act), bool(interleaved))
     # Eager launches directly: the dispatcher costs tens of us per call at decode sizes.
     out = torch.empty((idx.numel(), tb["N"] // 2), dtype = torch.float32, device = x.device)
@@ -492,11 +558,82 @@ def routed_gate_up(x, idx, tb, top_k, alpha, limit, lora = None, act = ACT_GPTOS
 def routed_down(x, idx, rw, dense_rw, tb, top_k, out_dtype, lora = None):
     """[T, N]: sum over the top-k slots of rw * (dequant(W[e]) @ x[slot] + bias[e] (+ LoRA))."""
     if torch.compiler.is_compiling():
-        b, h, scaling = lora if lora is not None else (None, None, 0.0)
         return torch.ops.unsloth_zoo.routed_nf4_down(
-            x, idx, rw, dense_rw, *_table_args(tb), top_k, b, h, float(scaling), out_dtype)
+            x, idx, rw, dense_rw, *_table_args(tb), top_k, *_lora_op_args(lora), out_dtype)
     out = torch.empty((idx.numel() // top_k, tb["N"]), dtype = out_dtype, device = x.device)
     return _down(x, idx, rw, dense_rw, tb, top_k, lora, out)
+
+
+LORA_KINDS = {torch.float32: 1, torch.bfloat16: 2, torch.float16: 3}
+# (device, dtype, shape, addresses) -> int64 table. Kept for the process: a captured CUDA graph
+# may still read a table, and a new entry needs a new allocation (a .to() / cast / reload).
+_LORA_TABLES = {}
+
+
+def lora_pointer_table(weights):
+    """(int64 [E] table of the weights' addresses, LORA_KIND), or None unless every weight is a
+    contiguous CUDA tensor of one shape, dtype and device in LORA_KINDS.
+
+    Resolved on every call from the weights passed in (inside the custom ops when compiled), so
+    the kernels always read each expert's live adapter: in-place optimizer steps need nothing,
+    and a moved, recast or reloaded weight gets its own table. Only a lookup once built."""
+    w0 = weights[0]
+    kind = LORA_KINDS.get(w0.dtype)
+    if kind is None or not w0.is_cuda:
+        return None
+    ptrs = tuple(w.data_ptr() for w in weights)
+    key = (w0.device, w0.dtype, tuple(w0.shape), ptrs)
+    table = _LORA_TABLES.get(key)
+    if table is None:
+        for w in weights:
+            if w.dtype != w0.dtype or w.device != w0.device or w.shape != w0.shape or not w.is_contiguous():
+                return None
+        if torch.cuda.is_current_stream_capturing():
+            return None  # no host copy inside a capture: the stacked path runs instead
+        with torch.inference_mode(False):
+            table = torch.tensor(ptrs, dtype = torch.int64, device = w0.device)
+        _LORA_TABLES[key] = table
+    return table, kind
+
+
+def _lora_h_launch(x, idx, a_ptrs, kind, r, row_div, out):
+    K = x.shape[-1]
+    with torch.cuda.device(x.device):
+        _lora_h_kernel[(idx.numel(), r)](
+            x, idx, a_ptrs, out, K, row_div, R = r, LORA_KIND = kind,
+            BLOCK_K = max(16, min(1024, triton.next_power_of_2(K))), num_warps = 4,
+        )
+    return out
+
+
+def _lora_h_eager(x, idx, a_list, row_div):
+    got = lora_pointer_table(a_list)
+    r = a_list[0].shape[0]
+    if got is None:
+        x_slots = x[torch.arange(idx.numel(), device = x.device) // row_div] if row_div > 1 else x
+        A = torch.stack(a_list)
+        return torch.bmm(A[idx].float(), x_slots.float().unsqueeze(-1)).squeeze(-1)
+    out = torch.empty((idx.numel(), r), dtype = torch.float32, device = x.device)
+    return _lora_h_launch(x, idx, got[0], got[1], r, row_div, out)
+
+
+if triton is not None:
+
+    @torch.library.custom_op("unsloth_zoo::routed_lora_h", mutates_args = ())
+    def _lora_h_op(x: torch.Tensor, idx: torch.Tensor, a_list: List[torch.Tensor], row_div: int) -> torch.Tensor:
+        return _lora_h_eager(x, idx, list(a_list), row_div)
+
+    @_lora_h_op.register_fake
+    def _routed_lora_h_fake(x, idx, a_list, row_div):
+        return x.new_empty((idx.numel(), a_list[0].shape[0]), dtype = torch.float32)
+
+
+def routed_lora_h(x, idx, a_list, row_div = 1):
+    """fp32 [P, r]: row p = A[idx[p]] @ x[p // row_div] for a list of per-expert [r, K] weights,
+    read in place through lora_pointer_table. x: [R, K] contiguous."""
+    if torch.compiler.is_compiling():
+        return torch.ops.unsloth_zoo.routed_lora_h(x, idx, list(a_list), int(row_div))
+    return _lora_h_eager(x, idx, a_list, row_div)
 
 
 # ---------------------------------------------------------------------------------------

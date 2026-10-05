@@ -45,6 +45,7 @@ from .moe_routed import (
     routed_bf16_moe,
     routed_down,
     routed_gate_up,
+    routed_lora_h,
     routed_mode,
     triton,
 )
@@ -172,8 +173,11 @@ def prepare_routed_experts(experts):
 
 
 def _lora(projs):
-    """(A [E, r, in], B [E, out, r], scaling) of the single active adapter; None without LoRA
-    (or adapters disabled); False for a LoRA setup this path does not cover."""
+    """(A list, B list, scaling) of the single active adapter: every expert's live lora_A [r, in]
+    and lora_B [out, r], which the kernels read in place through pointer tables resolved on each
+    call (moe_routed.lora_pointer_table), so optimizer steps, casts and moves are always seen,
+    eager, compiled or in a CUDA graph. None without LoRA (or adapters disabled); False for a
+    LoRA setup this path does not cover."""
     first = projs[0]
     if not hasattr(first, "lora_A"):
         return None
@@ -188,7 +192,10 @@ def _lora(projs):
     if first.merged or (first.training and getattr(first.lora_dropout[name], "p", 0) > 0):
         return False
     cache = getattr(projs, "_unsloth_routed_lora", None)
-    if cache is None or cache["name"] != name or cache["first"] is not first.lora_A[name].weight:
+    if (
+        cache is None or cache["name"] != name or cache["A"][0] is not first.lora_A[name].weight
+        or cache["B"][-1] is not projs[-1].lora_B[name].weight
+    ):
         for proj in projs:
             if (
                 name not in proj.lora_A or proj.scaling[name] != first.scaling[name]
@@ -197,59 +204,12 @@ def _lora(projs):
                 or getattr(proj.lora_B[name], "bias", None) is not None
             ):
                 return False
-        cache = {"name": name, "first": first.lora_A[name].weight, "versions": None,
+        cache = {"name": name,
                  "A": [proj.lora_A[name].weight for proj in projs],
                  "B": [proj.lora_B[name].weight for proj in projs]}
-        projs._unsloth_routed_lora = cache
-    if torch.compiler.is_compiling():
-        # The persistent buffers an eager call filled: a compiled step reads them instead of
-        # restacking every expert's A / B (E x r x (in + out) per layer per call).
-        stacked = cache.get("stacked")
-        if stacked is None:
-            return torch.stack(cache["A"]), torch.stack(cache["B"]), first.scaling[name]
-        return stacked[0], stacked[1], first.scaling[name]
-    _restack(cache)
-    return cache["stacked"][0], cache["stacked"][1], first.scaling[name]
-
-
-def _restack(cache):
-    """Eager: refill the persistent stacked A / B buffers in place after an optimizer step (or
-    any in-place edit) bumps a version counter, or a `.data` swap moves a buffer; compiled
-    steps and captured CUDA graphs keep reading the same tensors."""
-    A, B = cache["A"], cache["B"]
-    # In-place edits bump _version; a .to() move / cast swaps .data without bumping it, so each
-    # storage pointer is checked too.
-    key = tuple((p._version, p.data_ptr()) for p in A) + tuple((p._version, p.data_ptr()) for p in B)
-    if key == cache["versions"]:
-        return
-    stacked = cache.get("stacked")
-    with torch.no_grad():
-        if (
-            stacked is None or stacked[0].dtype != A[0].dtype or stacked[0].device != A[0].device
-            or stacked[0].shape[1:] != A[0].shape or stacked[1].shape[1:] != B[0].shape
-        ):
-            # Normal tensors even when first built under inference_mode: later refills write them.
-            with torch.inference_mode(False):
-                cache["stacked"] = (torch.stack(A), torch.stack(B))
-        else:
-            torch.stack(A, out = stacked[0])
-            torch.stack(B, out = stacked[1])
-    cache["versions"] = key
-
-
-def refresh_routed_lora(experts):
-    """Eager calls the routed kernels do not take (prefill, the dense path) still refresh the
-    stacked adapters, so a compiled decode step that follows reads current weights."""
-    if torch.compiler.is_compiling():
-        return
-    for projs in (getattr(experts, "gate_up_projs", None), getattr(experts, "down_projs", None)):
-        if projs is not None and len(projs) and hasattr(projs[0], "lora_A"):
-            _lora(projs)
-
-
-def _lora_h(A, idx, x_slots):
-    # H[p] = A[idx[p]] @ x_slots[p], [P, r] fp32.
-    return torch.bmm(A[idx].float(), x_slots.float().unsqueeze(-1)).squeeze(-1)
+        if not torch.compiler.is_compiling():
+            projs._unsloth_routed_lora = cache
+    return cache["A"], cache["B"], first.scaling[name]
 
 
 def routed_experts_forward(experts, hidden_states, router_indices, routing_weights):
@@ -280,11 +240,11 @@ def routed_experts_forward(experts, hidden_states, router_indices, routing_weigh
 
     if gu_lora is not None:
         A, B, scaling = gu_lora
-        gu_lora = (B, _lora_h(A, idx, x.repeat_interleave(top_k, 0)), scaling)
+        gu_lora = (B, routed_lora_h(x, idx, A, top_k), scaling)
     inter = routed_gate_up(x, idx, state["gate_up"], top_k, experts.alpha, experts.limit, gu_lora)
     if dn_lora is not None:
         A, B, scaling = dn_lora
-        dn_lora = (B, _lora_h(A, idx, inter), scaling)
+        dn_lora = (B, routed_lora_h(inter, idx, A, 1), scaling)
     out = routed_down(inter, idx, rw, dense_rw, state["down"], top_k, hidden_states.dtype, dn_lora)
     return out.view(shape[:-1] + (out.shape[-1],))
 
@@ -385,8 +345,6 @@ def routed_mlp_forward(mlp, hidden_states, max_slots = ROUTED_MAX_SLOTS):
         # route, so a compiled decode step that follows an eager prefill finds them ready.
         state = getattr(experts, "_unsloth_routed_nf4", None) if torch.compiler.is_compiling() else prepare_routed_experts(experts)
         nf4 = isinstance(state, dict)
-        if nf4:
-            refresh_routed_lora(experts)
     if hidden_states.numel() // hidden_states.shape[-1] * getattr(mlp.router, "top_k", 4) > max_slots:
         return None
     if not nf4 and not routed_bf16_eligible(experts, hidden_states):

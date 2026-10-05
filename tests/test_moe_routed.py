@@ -682,16 +682,37 @@ def test_nf4_slot_limit_scales_with_the_expert_count(monkeypatch):
         assert MR.routed_moe_forward(_make("silu", e = 16), x, idx, w) is None
 
 
-def test_gpt_oss_compiled_decode_reads_persistent_lora_stacks_and_follows_a_train_step():
+def _gpt_oss_lora_mlp():
     pytest.importorskip("peft")
     pytest.importorskip("transformers.models.gpt_oss.modeling_gpt_oss")
     from test_gpt_oss_routed_guards import _NF4MLP
-    from test_gpt_oss_routed_nf4 import H as GH, _Experts, _lora_wrap, _routing
-    from unsloth_zoo.temporary_patches import gpt_oss_routed as GR
+    from test_gpt_oss_routed_nf4 import _Experts, _lora_wrap
     torch.manual_seed(0)
-    mlp = _NF4MLP(_lora_wrap(_Experts(True)).eval()).eval()
+    return _NF4MLP(_lora_wrap(_Experts(True)).eval()).eval()
+
+
+def _train_step(mlp, lr = 5.0):
+    # One optimizer step on the adapters through the dense path (grad on: the routed path stays out).
+    from test_gpt_oss_routed_nf4 import H as GH, _routing
+    params = [p for n, p in mlp.named_parameters() if "lora_" in n]
+    opt = torch.optim.SGD(params, lr = lr)
+    idx, w = _routing(4, seed = 9)
+    x = torch.randn(1, 4, GH, device = DEV, dtype = torch.float32)
+    mlp.experts.dense(x, idx, w).float().pow(2).mean().backward()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in params)
+    opt.step()
+    opt.zero_grad(set_to_none = True)
+
+
+@pytest.mark.parametrize("replay", ["compiled", "cuda_graph"])
+def test_gpt_oss_compiled_decode_follows_an_optimizer_step(replay):
+    # A compiled decode step (or a CUDA graph captured from it) right after an optimizer step, with
+    # no eager call in between, must read the updated adapter: the kernels read each expert's live
+    # lora_A / lora_B through pointer tables, so nothing restacked or cached can go stale.
+    from test_gpt_oss_routed_nf4 import H as GH
+    from unsloth_zoo.temporary_patches import gpt_oss_routed as GR
+    mlp = _gpt_oss_lora_mlp()
     decode = torch.randn(2, 1, GH, device = DEV, dtype = torch.float32)
-    prefill = torch.randn(1, 64, GH, device = DEV, dtype = torch.float32)  # > ROUTED_MAX_SLOTS
     graphs = []
 
     def backend(gm, example_inputs):
@@ -699,32 +720,93 @@ def test_gpt_oss_compiled_decode_reads_persistent_lora_stacks_and_follows_a_trai
         return gm.forward
     with torch.no_grad():
         before = GR.routed_mlp_forward(mlp, decode)
-        cache = mlp.experts.gate_up_projs._unsloth_routed_lora
-        ptrs = tuple(t.data_ptr() for t in cache["stacked"])
         torch._dynamo.reset()
         compiled = torch.compile(lambda h: GR.routed_mlp_forward(mlp, h), backend = backend, fullgraph = True)
         torch.testing.assert_close(compiled(decode), before, rtol = 1e-5, atol = 1e-5)
+        if replay == "cuda_graph":
+            static = decode.clone()
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                compiled(static)
+            torch.cuda.current_stream().wait_stream(s)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = compiled(static)
     assert graphs and not any("torch.stack(" in code or "aten.stack" in code for code in graphs), "compiled step restacks the adapters"
 
-    # One training step on the adapters (dense path, grad on: the routed path stays out of it).
-    params = [p for n, p in mlp.named_parameters() if "lora_" in n]
-    opt = torch.optim.SGD(params, lr = 5.0)
-    idx, w = _routing(4, seed = 9)
-    x = torch.randn(1, 4, GH, device = DEV, dtype = torch.float32)
-    mlp.experts.dense(x, idx, w).float().pow(2).mean().backward()
-    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in params)
-    opt.step()
+    _train_step(mlp)
 
     with torch.no_grad():
-        # The eager prefill (too large to route) refreshes the stacks in place ...
-        assert GR.routed_mlp_forward(mlp, prefill) is None
-        assert tuple(t.data_ptr() for t in cache["stacked"]) == ptrs
-        # ... so the compiled decode step (no recompile) follows the new adapter.
-        got = compiled(decode)
+        if replay == "cuda_graph":
+            graph.replay()
+            got = captured.clone()
+        else:
+            got = compiled(decode)
         want = GR.routed_mlp_forward(mlp, decode)
     assert len(graphs) == 1
     assert not torch.allclose(want, before, rtol = 1e-3, atol = 1e-3)
     torch.testing.assert_close(got, want, rtol = 1e-5, atol = 1e-5)
+
+
+def test_gpt_oss_compiled_decode_after_an_adapter_cast_reads_the_new_weights():
+    # A cast swaps every adapter's storage (new addresses, new dtype) without any eager call: the
+    # compiled step resolves the pointer tables from the live weights inside the op, so it reads
+    # the new storage, never the freed one (torch 2.11 does not recompile on the dtype change).
+    from test_gpt_oss_routed_nf4 import H as GH
+    from unsloth_zoo.temporary_patches import gpt_oss_routed as GR
+    mlp = _gpt_oss_lora_mlp()
+    decode = torch.randn(2, 1, GH, device = DEV, dtype = torch.float32)
+    with torch.no_grad():
+        GR.routed_mlp_forward(mlp, decode)
+        torch._dynamo.reset()
+        compiled = torch.compile(lambda h: GR.routed_mlp_forward(mlp, h), backend = "eager", fullgraph = True)
+        compiled(decode)
+        lora = [p for n, p in mlp.named_parameters() if "lora_" in n]
+        for p in lora:
+            p.data = (p.data * 3).to(torch.float16)
+        got = compiled(decode)
+        want = GR.routed_mlp_forward(mlp, decode)
+    torch.testing.assert_close(got, want, rtol = 1e-4, atol = 1e-4)
+    with torch.no_grad():
+        torch.testing.assert_close(compiled(decode), want, rtol = 1e-5, atol = 1e-5)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("r", [1, 4, 24])
+@pytest.mark.parametrize("row_div", [1, 4])
+def test_lora_pointer_table_h_matches_fp64(dtype, r, row_div):
+    if dtype == torch.bfloat16 and not MR._bf16_supported(torch.device(DEV)):
+        pytest.skip("bf16 needs sm80+")
+    torch._dynamo.reset()
+    g = torch.Generator().manual_seed(r)
+    K, e = 200, 6  # K not a power of two: masked tail
+    A = [(torch.randn(r, K, generator = g) * 0.1).to(dtype).to(DEV) for _ in range(e)]
+    table, kind = MR.lora_pointer_table(A)
+    assert table.dtype == torch.int64 and table.numel() == e and kind == MR.LORA_KINDS[dtype]
+    assert MR.lora_pointer_table(A)[0] is table  # a lookup once built
+    idx = torch.tensor([5, 0, 3, 3, 1, 2, 4, 0], device = DEV)
+    x = torch.randn(idx.numel() // row_div, K, generator = g).to(DEV)
+    got = MR.routed_lora_h(x, idx, A, row_div)
+    ref = torch.stack([A[i].double() @ x[p // row_div].double() for p, i in enumerate(idx.tolist())])
+    # fp32 accumulation over K = 200 products of exactly representable inputs.
+    assert (got.double() - ref).abs().max().item() <= 1e-5 * max(1.0, ref.abs().max().item())
+    with torch.no_grad():
+        compiled = torch.compile(MR.routed_lora_h, fullgraph = True)
+        assert torch.equal(compiled(x, idx, A, row_div), got)
+        # In place: the same table, the new values, in eager and compiled calls.
+        for a in A:
+            a.mul_(2)
+        assert MR.lora_pointer_table(A)[0] is table
+        torch.testing.assert_close(MR.routed_lora_h(x, idx, A, row_div), got * 2, rtol = 1e-6, atol = 1e-6)
+        assert torch.equal(compiled(x, idx, A, row_div), MR.routed_lora_h(x, idx, A, row_div))
+    # Unsupported tables (mixed dtype, non-contiguous): the stacked fallback, same values.
+    mixed = [A[0], A[1].float() if dtype != torch.float32 else A[1].half()]
+    assert MR.lora_pointer_table(mixed) is None
+    assert MR.lora_pointer_table([torch.randn(K, 3, device = DEV).t()]) is None
+    got2 = MR.routed_lora_h(x[: 2 // row_div or 1], torch.tensor([1, 0], device = DEV), mixed, row_div)
+    want = torch.stack([mixed[i].double() @ x[p // row_div].double() for p, i in enumerate([1, 0])])
+    assert (got2.double() - want).abs().max().item() <= 1e-2 * max(1.0, want.abs().max().item())
 
 
 @pytest.mark.parametrize("mode", ["1", "grouped"])
@@ -760,3 +842,64 @@ def test_stacked_biases_are_read_live(mode, monkeypatch):
     ex.down_proj_bias = nn.Parameter(ex.down_proj_bias.detach().clone() * 2, requires_grad = False)
     check()
     assert ex.__dict__["_unsloth_routed_moe"] is not state
+
+
+@pytest.mark.parametrize("quant", [True, False])
+def test_stash_lora_compiled_decode_follows_an_adapter_update(quant, monkeypatch):
+    # Generic 3D experts: PEFT target_parameters adapters reach the routed kernels through the
+    # ParamWrapper stash, extracted from the live lora_A / lora_B on every call (in the graph
+    # when compiled), so an in-place adapter update is seen by the next compiled call.
+    peft = pytest.importorskip("peft")
+    from unsloth_zoo.temporary_patches.moe_utils import patch_param_wrapper_for_moe
+    monkeypatch.setenv("UNSLOTH_MOE_ROUTED_KERNEL", "1")
+    try:
+        model, experts, _, _ = _tiny_model("qwen3_moe")
+    except (ImportError, LookupError, TypeError) as exc:  # pragma: no cover - older transformers
+        pytest.skip(f"qwen3_moe: {exc}")
+    if not quant:
+        for ex in experts:
+            ex.gate_up_proj = nn.Parameter(_dense(ex.gate_up_proj).to(DT), requires_grad = False)
+            ex.down_proj = nn.Parameter(_dense(ex.down_proj).to(DT), requires_grad = False)
+    try:
+        cfg = peft.LoraConfig(r = 4, lora_alpha = 8, target_parameters = ["mlp.experts.gate_up_proj", "mlp.experts.down_proj"])
+    except TypeError:
+        pytest.skip("PEFT without target_parameters")
+    patch_param_wrapper_for_moe()
+    try:
+        model = peft.get_peft_model(model, cfg).eval()
+    except Exception as exc:
+        pytest.skip(f"PEFT cannot wrap these experts: {type(exc).__name__}: {exc}")
+    g = torch.Generator().manual_seed(11)
+    lora = [p for n, p in model.named_parameters() if "lora_" in n]
+    with torch.no_grad():
+        for p in lora:
+            p.copy_(torch.randn(p.shape, generator = g) * 0.05)
+    wrapped = model.base_model.model.model.layers[0].mlp.experts
+    assert hasattr(wrapped, "lora_A")
+    calls = []
+    real = MR.routed_moe_forward
+
+    def spy(*a, **k):
+        out = real(*a, **k)
+        calls.append(out is not None)
+        return out
+    monkeypatch.setattr(MR, "routed_moe_forward", spy)
+    x, idx, w = _route(1, top_k = 4, e = 16, h = 256)
+    graphs = []
+
+    def backend(gm, example_inputs):
+        graphs.append(gm.code)
+        return gm.forward
+    with torch.no_grad():
+        before = wrapped(x, idx, w)
+        assert calls and all(calls)
+        torch._dynamo.reset()
+        compiled = torch.compile(lambda a, b, c: wrapped(a, b, c), backend = backend)
+        torch.testing.assert_close(compiled(x, idx, w), before, rtol = 1e-5, atol = 1e-5)
+        assert any("unsloth_zoo.routed" in code for code in graphs), "compiled call did not route"
+        for p in lora:
+            p.add_(torch.randn(p.shape, generator = g).to(p.device, p.dtype) * 0.05)
+        got = compiled(x, idx, w)
+        want = wrapped(x, idx, w)
+    assert not torch.allclose(want, before, rtol = 1e-3, atol = 1e-3)
+    torch.testing.assert_close(got, want, rtol = 1e-5, atol = 1e-5)
