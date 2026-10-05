@@ -32,6 +32,14 @@ from unsloth_zoo.fused_losses.ast_rewriter import (
 )
 from unsloth_zoo.fused_losses.forward_adapter import EMPTY_LOGITS, unsloth_fused_lm_head_loss
 
+
+@pytest.fixture(autouse = True, scope = "module")
+def _reset_dynamo():
+    # The kernel's compiled chunk specializes per bias / shift; keep those entries
+    # from counting toward the recompile limit of later test modules.
+    yield
+    torch._dynamo.reset()
+
 # transformers 5.18 BartForConditionalGeneration (also Bart, BigBirdPegasus, Blenderbot* 5.4+).
 BART = """
     def forward(self, outputs=None, labels=None, **kwargs):
