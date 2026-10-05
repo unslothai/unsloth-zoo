@@ -303,9 +303,9 @@ class BlockSwap:
             total = self.host_bytes()
             if self.pinned_bytes < total:
                 # Pageable copies are several times slower than pinned ones and cannot hide behind compute.
-                print(f"Unsloth: block_swap pinned {self.pinned_bytes / 2**30:.1f} of {total / 2**30:.1f} GiB of host "
+                print(f"Unsloth: offload_layers pinned {self.pinned_bytes / 2**30:.1f} of {total / 2**30:.1f} GiB of host "
                       "memory; the rest is copied from pageable memory, several times slower. Free host RAM "
-                      "or lower block_swap_layers for full speed.")
+                      "or lower offload_layers for full speed.")
 
             sigs = [b.sig for b in self.blocks]
             for sig in set(sigs):

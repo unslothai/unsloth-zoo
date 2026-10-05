@@ -335,7 +335,7 @@ def test_state_dict_substitutes_host_copies_for_evicted_blocks():
 
 
 def test_state_dict_follows_weights_renamed_after_install():
-    # from_pretrained(block_swap_layers = N) installs before PEFT wraps each Linear in a base_layer.
+    # from_pretrained(offload_layers = N) installs before PEFT wraps each Linear in a base_layer.
     if not torch.cuda.is_available():
         print("[SKIP] CUDA not available")
         return
@@ -459,7 +459,7 @@ def test_partial_pinning_is_announced(capsys):
     finally:
         _mod._pin_budget = budget
     assert sw.pinned_bytes == 0
-    assert "block_swap pinned 0.0 of" in capsys.readouterr().out
+    assert "offload_layers pinned 0.0 of" in capsys.readouterr().out
     sw.remove()
 
 
