@@ -707,7 +707,9 @@ class EngineRow:
     ``cache`` holds the prompt; ``pending`` is the last sampled token, already emitted but not yet
     forwarded; ``emitted`` counts the tokens emitted so far, ``pending`` included, and is the
     position of the next draw. ``hidden`` is the target's last-layer hidden ``[1, N, H]`` at the
-    last N prompt positions, which a drafter starts from.
+    last N prompt positions, which a drafter starts from. A row speculates only if each of its
+    ``processors`` sets ``history_only = True``: after its first call its output depends only on
+    the ``(tokens, logits)`` it is given, so it can be asked about positions that are then rejected.
     """
 
     cache: list
@@ -744,6 +746,8 @@ class _Row:
         self.max_tokens = row.max_tokens
         self.stop_tokens = frozenset(row.stop_tokens)
         self.processors = list(row.processors)
+        self.speculates = all(getattr(processor, "history_only", False) for processor in self.processors)
+        self.history = mx.array(self.tokens) if self.processors else None
         self.rope_delta = int(row.rope_delta)
         self.sample = _RowSampler(row.sampling)
         self.proposer = NgramProposer(row.prompt)
@@ -758,12 +762,18 @@ class _Row:
     def remaining(self) -> int | None:
         return None if self.max_tokens is None else max(0, self.max_tokens - self.emitted)
 
-    def logprobs(self, logits: mx.array) -> mx.array:
-        """``logits [1, vocab]`` for the next position, through this row's processors."""
+    def logprobs(self, logits: mx.array, unseen: mx.array | None = None, ahead: int = 0) -> mx.array:
+        """``logits [n, vocab]`` for the next n positions, through this row's processors: position j
+        is shown the history and then ``unseen[: ahead + j]``, the tokens proposed before it."""
         if self.processors:
-            history = mx.array(self.tokens)
-            for processor in self.processors:
-                logits = processor(history, logits)
+            shown = []
+            for j in range(ahead, ahead + logits.shape[0]):
+                history = mx.concatenate([self.history, unseen[:j].astype(self.history.dtype)]) if j else self.history
+                position = logits[j - ahead : j - ahead + 1]
+                for processor in self.processors:
+                    position = processor(history, position)
+                shown.append(position)
+            logits = mx.concatenate(shown)
         return self.normalize(logits)
 
     def normalize(self, logits: mx.array) -> mx.array:
@@ -787,6 +797,8 @@ class _Row:
         if taken:
             self.tokens.extend(taken)
             self.pending = taken[-1]
+            if self.history is not None:
+                self.history = mx.concatenate([self.history, mx.array(taken)])
             if self.scores is not None:
                 self.scores.extend(scores[: len(taken)])
         return taken
@@ -880,7 +892,7 @@ class SpeculativeEngine:
             raise ValueError(f"row {row.uid!r} is already in the engine")
         state = _Row(row, self.controller, self.logprobs)
         if self.drafter is not None:
-            if state.processors:
+            if not state.speculates:
                 draft_cache = self.drafter.new_cache()
             else:
                 state.draft, draft_cache = self.drafter.start(row.prompt, row.hidden, state.pending)
@@ -926,7 +938,7 @@ class SpeculativeEngine:
             state = row.state
             state.remaining = row.remaining
             state.copy_available = (
-                0 if row.processors else len(row.proposer.propose(row.tokens, self.controller.max_copy))
+                len(row.proposer.propose(row.tokens, self.controller.max_copy)) if row.speculates else 0
             )
             state.can_draft = row.draft is not None and row.draft.ready
         return [row.state for row in self._rows]
@@ -953,7 +965,7 @@ class SpeculativeEngine:
         """Forward one token per row and sample the next; ``ahead`` counts tokens already sampled
         for each row but not taken yet."""
         out = self.lm(inputs, cache = self.cache, **self._kwargs())
-        drawn = [row.draw(row.logprobs(out.logits[i : i + 1, -1]), row.emitted + ahead) for i, row in enumerate(self._rows)]
+        drawn = [row.draw(row.logprobs(out.logits[i : i + 1, -1], inputs[i], ahead), row.emitted + ahead) for i, row in enumerate(self._rows)]
         scores = mx.concatenate([score for _, score in drawn]) if self.logprobs else None
         return mx.concatenate([token for token, _ in drawn]), scores, self._hidden(out)
 
@@ -967,8 +979,8 @@ class SpeculativeEngine:
     def _plain(self, length: int, states: list[RowState]) -> list[list[int]]:
         rows = self._rows
         emitted = [[] for _ in rows]
-        # Processors read the history, so a row with them needs each token before the next step.
-        pipelined = not any(row.processors for row in rows)
+        # A processor that reads more than the history needs each token taken before the next step.
+        pipelined = all(row.speculates for row in rows)
         start = time.perf_counter()
         with mx.stream(self._stream):
             tokens, scores, hidden = self._step(mx.array([[row.pending] for row in rows]))
@@ -1043,11 +1055,7 @@ class SpeculativeEngine:
             with mx.stream(self._stream):
                 drawn = []
                 for i, (row, length) in enumerate(zip(rows, lengths)):
-                    if row.processors:
-                        logprobs = row.logprobs(logits[i : i + 1, 0])
-                    else:
-                        logprobs = row.normalize(logits[i, : length + 1])
-                    drawn.append(row.draw(logprobs, row.emitted))
+                    drawn.append(row.draw(row.logprobs(logits[i, : length + 1], inputs[i, 1:]), row.emitted))
             mx.eval([array for pair in drawn for array in pair if array is not None] + ([] if drafts is None else [drafts]))
             targets = [target.tolist() for target, _ in drawn]
             scores = [None if score is None else score.tolist() for _, score in drawn]
@@ -1103,11 +1111,19 @@ class SpeculativeEngine:
         return emitted
 
 
+def _shown_from(processor: Callable, start: int) -> Callable:
+    def shown(tokens, logits):
+        return processor(tokens[start:], logits)
+
+    shown.history_only = getattr(processor, "history_only", False)
+    return shown
+
+
 class SpeculativeDraft:
     """``draft_model`` for mlx-vlm's ``generate_step`` (with ``draft_kind = draft.draft_kind``): after
     ``install_speculative_seam`` the reply decodes through the engine. Call ``prepare`` before each
-    generation; mlx-vlm does not pass on the prompt or sampling. Not for requests with logits processors:
-    they cannot speculate, and the seam does not see them. The controller persists. ``admit`` instead
+    generation; mlx-vlm does not pass on the prompt, sampling or logits processors, which must also
+    be given to ``generate_step`` for the first token. The controller persists. ``admit`` instead
     prefills one row for an engine shared by many."""
 
     def __init__(self, controller: DraftController, drafter = None):
@@ -1131,8 +1147,8 @@ class SpeculativeDraft:
         """How many of the prompt's last hidden states an MTP drafter starts from; other kinds take the whole prompt."""
         return getattr(self.drafter, "max_lag", 1) if self.drafter is not None and self.draft_kind == "mtp" else 0
 
-    def prepare(self, prompt: Sequence[int], sampling: SamplingParams) -> None:
-        self._request = (list(prompt), sampling)
+    def prepare(self, prompt: Sequence[int], sampling: SamplingParams, processors: Sequence[Callable] = ()) -> None:
+        self._request = (list(prompt), sampling, list(processors))
         self.draft_n = self.draft_n_accepted = 0
 
     def admit(self, model, row: EngineRow, input_ids: mx.array, pixel_values = None, mask = None, **kwargs) -> tuple[EngineRow, float]:
@@ -1162,11 +1178,14 @@ class SpeculativeDraft:
             first = int(_RowSampler(request.sampling)(logits, 0).item())
             self._admitted = (self._started(model, replace(request, cache = prompt_cache, pending = first), last_outputs), logits[0, first].item())
             return
-        prompt, sampling = request
+        prompt, sampling, processors = request
         first = int(first_token.item())
         yield first, logprobs
+        # mlx-vlm's first step showed the processors the last prefilled chunk alone.
+        start = max(0, len(prompt) - int(input_ids.size))
+        processors = [_shown_from(processor, start) for processor in processors]
         engine = SpeculativeEngine(model, self.controller, self.drafter)
-        engine.add(self._started(model, EngineRow(prompt_cache, first, prompt, sampling, max_tokens), last_outputs))
+        engine.add(self._started(model, EngineRow(prompt_cache, first, prompt, sampling, max_tokens, processors = processors), last_outputs))
         while engine.rows:
             for step in engine.step():
                 self.draft_n, self.draft_n_accepted = step.draft_n, step.draft_n_accepted

@@ -90,6 +90,15 @@ def _solo(model, prompt, n, sampling, processors = ()):
     return out
 
 
+def _presence():
+    """History-only: charges the reply's tokens, counted from its first call, and favours half the vocabulary by the last token's parity."""
+    def penalty(tokens, logits):
+        start, ids = penalty.__dict__.setdefault("start", tokens.shape[0]), mx.arange(logits.shape[-1])
+        return logits - 3 * (ids[:, None] == tokens[start:]).any(-1) + 2 * ((ids + tokens[-1]) % 2 == 0)
+    penalty.history_only = True
+    return penalty
+
+
 def _head_in_step(engine):
     offset = mx.array(engine.draft_cache[0].offset).reshape(-1).tolist()
     for i, row in enumerate(engine._rows):
@@ -157,9 +166,9 @@ def test_ragged_rounds_match_each_row_decoded_alone(qwen):
     from unsloth_zoo.mlx.generate import SamplingParams
     model, ids = qwen
     ban = lambda history, logits: logits + mx.where(mx.arange(logits.shape[-1]) == 13, -1e9, 0)
-    out, drafted, _ = _run(model, [ids[0], ids[1], ids[0]], 128, _rounds_only(), SamplingParams(), processors = {2: [ban]})
-    assert drafted[0][0] > 0 and drafted[2][0] == 0
-    assert out == [_solo(model, ids[0], 128, SamplingParams()), _solo(model, ids[1], 128, SamplingParams()), _solo(model, ids[0], 128, SamplingParams(), [ban])]
+    out, drafted, _ = _run(model, [ids[0], ids[1], ids[0], ids[0]], 128, _rounds_only(), SamplingParams(), processors = {2: [ban], 3: [_presence()]})
+    assert drafted[0][0] > 0 and drafted[2][0] == 0 and drafted[3][1] > 0
+    assert out == [_solo(model, ids[0], 128, SamplingParams()), _solo(model, ids[1], 128, SamplingParams()), *(_solo(model, ids[0], 128, SamplingParams(), [fn]) for fn in (ban, _presence()))]
 
 
 def test_verify_that_replaces_caches_is_refused_and_decoding_continues(qwen):
@@ -266,19 +275,21 @@ def test_generate_step_decodes_our_drafter_through_the_engine(request, monkeypat
     with monkeypatch.context() as patch:
         patch.setattr("unsloth_zoo.mlx.speculative.speculative_unavailable_reason", lambda: "too old") or pytest.raises(RuntimeError, install_speculative_seam)
     assert list(ar.run_speculative_rounds(model, object(), max_tokens = 1)) == [("upstream", None)]
-    draft, rounds, started = SpeculativeDraft(_script(("draft", 3)) if native else _rounds_only(), _drafter(model, max_lag = 32) if native else None), [], []
+    draft, rounds, started = SpeculativeDraft(_script(("draft", 3)) if native else _script(("copy", 4), ("plain", 3)), _drafter(model, max_lag = 32) if native else None), [], []
     monkeypatch.setattr(draft.controller, "record_round", lambda plan, *args, **kwargs: rounds.append(plan))
     if native:
         start = draft.drafter.start
         monkeypatch.setattr(draft.drafter, "start", lambda prompt, hidden, pending: started.append(hidden) or start(prompt, hidden, pending))
     generate = lambda **kwargs: [int(token) for token, _ in ar.generate_step(mx.array([ids[0]]), model, None, None, max_tokens = 96, temperature = 0.0, **kwargs)]
-    plain = generate()
+    plain, penalized = generate(), _solo(model, ids[0], 96, SamplingParams(), [_presence()])
     for prefill_step_size in (16, None):  # unchunked, the final forward returns every prompt position's hidden
         draft.prepare(ids[0], SamplingParams())
         assert generate(draft_model = draft, draft_kind = draft.draft_kind, prefill_step_size = prefill_step_size) == plain
-    assert rounds and [hidden.shape[1] for hidden in started] == ([32, 32] if native else []) and draft.draft_n >= draft.draft_n_accepted > 0
+        draft.prepare(ids[0], SamplingParams(), [penalty := _presence()])
+        assert generate(draft_model = draft, draft_kind = draft.draft_kind, prefill_step_size = prefill_step_size, logits_processors = [penalty]) == penalized != plain
+    assert rounds and [hidden.shape[1] for hidden in started] == ([32] * 4 if native else []) and draft.draft_n >= draft.draft_n_accepted > 0
     # The same positions from six chunks as from one forward: chunking moves them ~0.07 on average, a one-position shift ~3.3.
-    assert not native or (started[0] - started[1]).abs().mean().item() < 0.5
+    assert not native or (started[0] - started[2]).abs().mean().item() < 0.5
     with pytest.raises(RuntimeError, match = "prepare"):
         generate(draft_model = draft, draft_kind = draft.draft_kind)
 

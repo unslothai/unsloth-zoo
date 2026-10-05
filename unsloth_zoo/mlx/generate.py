@@ -741,6 +741,7 @@ def _sequential_history(processor):
             state["offset"] = max(int(tokens.shape[0]) - 1, 0)
         return processor(tokens[state["offset"] :], logits)
 
+    _shown.history_only = getattr(processor, "history_only", False)
     return _shown
 
 
