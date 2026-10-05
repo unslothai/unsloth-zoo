@@ -498,6 +498,7 @@ from unsloth_zoo.loss_utils import (
     fused_linear_cross_entropy,
     unsloth_fused_ce_loss,
 )
+from unsloth_zoo.fused_losses.forward_adapter import unsloth_fused_lm_head_loss
 
 scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
 @torch.compiler.disable(recursive = False)
@@ -4906,6 +4907,29 @@ pass
 _DROPPED_TEXT_LOGIT_SCALE = ("AyaVisionForConditionalGeneration",)
 
 
+def _ast_fused_lm_head_fallback(source, module = None, module_class = None):
+    """Spliced AST rewrite of a forward the regex patterns did not fuse, else None."""
+    if "unsloth_fused_lm_head_loss" in source or "EMPTY_LOGITS" in source:
+        return None  # already rewritten by the import hook
+    try:
+        from unsloth_zoo.fused_losses.ast_rewriter import rewrite_forward_source_spliced
+        new_source, cap = rewrite_forward_source_spliced(source)
+    except Exception as e:
+        if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
+            print(f"Unsloth: AST fused lm_head fallback failed for {module}: {e}")
+        return None
+    # The fused loss reads `.weight` / `.bias`: same head rule as the import hook.
+    from unsloth_zoo.fused_losses.forward_install import _LINEAR_HEAD_ATTRS, _head_built_as_linear
+    if new_source is None or cap.head_attr not in _LINEAR_HEAD_ATTRS:
+        return None
+    # Other head names only where the hook itself would take them (audio / codec heads stay out).
+    if cap.head_attr != "lm_head" and not str(module).endswith("ForCausalLM"):
+        return None
+    if module_class is not None and not _head_built_as_linear(module_class, cap.head_attr):
+        return None
+    return new_source
+
+
 def fixup_dropped_logit_scale(source, module = None):
     if module not in _DROPPED_TEXT_LOGIT_SCALE or "logit_scale" in source:
         return source
@@ -6419,9 +6443,16 @@ def unsloth_compile_transformers(
                 # Fused CE reads lm_head.weight, which Roberta-style composite heads lack.
                 from unsloth_zoo.fused_losses.forward_install import _head_built_as_linear
                 if _head_built_as_linear(module_class, "lm_head"):
-                    new_source, supports_return_hidden_states = apply_fused_lm_head(
+                    fused_source, supports_return_hidden_states = apply_fused_lm_head(
                         new_source, module
                     )
+                    if not supports_return_hidden_states:
+                        # Regex shapes missed: drop the lm_head matmul via the AST rewriter instead.
+                        # No UNSLOTH_RETURN_HIDDEN_STATES branch there, so GRPO keeps its own wrapper.
+                        ast_source = _ast_fused_lm_head_fallback(new_source, module, module_class)
+                        if ast_source is not None:
+                            fused_source = ast_source
+                    new_source = fused_source
                 else:
                     supports_return_hidden_states = False
                 # print(new_source)
