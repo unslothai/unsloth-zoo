@@ -39,6 +39,8 @@ from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 import transformers.models.gpt_oss.modeling_gpt_oss as M
 from unsloth_zoo.temporary_patches import gpt_oss as G
 G.patch_GptOssModel()
+if 'patch_GptOssModel' not in getattr(M.GptOssModel.forward, '__qualname__', ''):
+    print('SKIP patched GptOssModel.forward not installed on this transformers'); raise SystemExit(0)
 
 L, T = 2, 8
 c = GptOssConfig(
@@ -79,8 +81,111 @@ print('RESULT', json.dumps({'unsafe_copies': rec.unsafe, 'max_diff': (out - ref)
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA for an asynchronous device -> host copy")
 def test_offloaded_embedding_reads_finished_input_ids():
     proc = subprocess.run([sys.executable, "-c", _RUNTIME], capture_output = True, text = True, timeout = 600)
+    skip = [l for l in proc.stdout.splitlines() if l.startswith("SKIP ")]
+    if skip:
+        pytest.skip(skip[0][len("SKIP "):])
     lines = [l for l in proc.stdout.splitlines() if l.startswith("RESULT ")]
     assert proc.returncode == 0 and lines, proc.stdout[-2000:] + proc.stderr[-4000:]
     res = json.loads(lines[-1][len("RESULT "):])
     assert res["unsafe_copies"] == [], res
     assert res["max_diff"] == 0.0, res
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
+@pytest.mark.parametrize("ids_in_graph", [True, False], ids = ["ids_from_graph", "ids_as_input"])
+def test_offloaded_embedding_op_under_cuda_graphs(ids_in_graph):
+    """The offloaded lookup op used inside a compiled, CUDA graphed step: fullgraph, and the same
+    rows as eager while the ids change every step. (The race it removes, a CPU lookup reading ids
+    a graph partition had not copied back yet, showed on a whole gpt-oss decode step at batch 4;
+    this small graph does not reproduce it.)
+
+    Inductor config is pinned: importing unsloth sets memory_planning = True globally, and with
+    it Inductor (2.13 and 2.14 alike) places a partition output (the argmax ids) and a later
+    buffer of the same partition at one pool offset, so the ids are overwritten before the op
+    runs, whatever the op does. ids_from_graph therefore runs without memory planning;
+    ids_as_input is the production shape (GptOssModel.forward receives input_ids as a graph
+    input) and runs under Unsloth's memory planning settings."""
+    from unsloth_zoo.temporary_patches.gpt_oss import _offloaded_embedding
+    if _offloaded_embedding is None:
+        pytest.skip("torch.library.custom_op unavailable")
+    import torch._inductor.config as inductor_config
+    torch.manual_seed(0)
+    V, H = 50021, 64
+    weight = torch.randn(V, H, dtype = torch.bfloat16)
+    proj = torch.randn(H, V, device = "cuda", dtype = torch.bfloat16)
+
+    def lookup(ids):
+        emb = _offloaded_embedding(ids, weight)
+        return (emb[:, 0].float() @ proj.float()).to(torch.bfloat16)
+
+    def step(logits):
+        # Next ids come from a GPU op, as in generate, then go through the CPU table.
+        return lookup(logits.argmax(-1, keepdim = True))
+
+    if ids_in_graph:
+        compiled, prep, config = step, (lambda x: x), dict(memory_planning = False)
+    else:
+        compiled, prep, config = lookup, (lambda x: x.argmax(-1, keepdim = True)), \
+            dict(memory_planning = True, memory_pool = "none")
+    compiled = torch.compile(compiled, fullgraph = True, mode = "reduce-overhead")
+    logits = torch.randn(4, V, device = "cuda", dtype = torch.bfloat16)
+    ref = logits.clone()
+    with torch.no_grad(), inductor_config.patch(config):
+        for _ in range(12):
+            torch.compiler.cudagraph_mark_step_begin()
+            logits = compiled(prep(logits)).clone()
+            ref = step(ref)
+            torch.testing.assert_close(logits, ref)
+
+
+
+_TRAIN_RUNTIME = _RUNTIME.split("from torch.overrides import")[0].replace(
+    "def _id_compile(model=None, *a, **k):\n    return (lambda fn: fn) if model is None else model\ntorch.compile = _id_compile\n", ""
+) + r"""
+calls = []
+op = G._offloaded_embedding
+def counting(input_ids, weight):
+    calls.append(1)
+    return op(input_ids, weight)
+G._offloaded_embedding = counting
+model.train()
+model.embed_tokens.weight.requires_grad_(True)
+torch._dynamo.reset()
+out = torch.compile(model, backend = "aot_eager")(input_ids = ids, attention_mask = mask, use_cache = False).last_hidden_state
+out.float().sum().backward()
+g = model.embed_tokens.weight.grad
+train_calls = len(calls)
+# Frozen embedding + enable_input_require_grads-style hook: the hook must still run. Dynamo does
+# not convert this training forward on every stack, so trace-time branching is forced instead.
+model.embed_tokens.weight.requires_grad_(False)
+hooked = []
+h = model.embed_tokens.register_forward_hook(lambda m, i, o: hooked.append(1) or o.requires_grad_(True))
+is_compiling = torch.compiler.is_compiling
+torch.compiler.is_compiling = lambda: True
+try:
+    model(input_ids = ids, attention_mask = mask, use_cache = False)
+finally:
+    torch.compiler.is_compiling = is_compiling
+    h.remove()
+frozen_calls = len(calls) - train_calls
+train_calls += frozen_calls
+model.eval()
+torch._dynamo.reset()
+with torch.no_grad():
+    torch.compile(model, backend = "aot_eager")(input_ids = ids, attention_mask = mask, use_cache = False)
+print("RESULT", json.dumps({"grad": g is not None and bool(g.abs().sum() > 0), "train_calls": train_calls, "frozen_hooked": len(hooked), "infer_calls": len(calls) - train_calls}))
+"""
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
+def test_compiled_training_keeps_offloaded_embedding_differentiable():
+    proc = subprocess.run([sys.executable, "-c", _TRAIN_RUNTIME], capture_output = True, text = True, timeout = 600)
+    skip = [l for l in proc.stdout.splitlines() if l.startswith("SKIP ")]
+    if skip:
+        pytest.skip(skip[0][len("SKIP "):])
+    lines = [l for l in proc.stdout.splitlines() if l.startswith("RESULT ")]
+    assert proc.returncode == 0 and lines, proc.stdout[-2000:] + proc.stderr[-4000:]
+    res = json.loads(lines[-1][len("RESULT "):])
+    # The lookup op has no backward: compiled training must keep nn.Embedding, inference uses the op.
+    # Frozen-embedding training keeps nn.Embedding too, so enable_input_require_grads' hook runs.
+    assert res["grad"] and res["train_calls"] == 0 and res["frozen_hooked"] > 0 and res["infer_calls"] > 0, res

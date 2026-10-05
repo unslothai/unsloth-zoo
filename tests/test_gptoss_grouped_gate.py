@@ -33,6 +33,9 @@ except Exception as e:  # pragma: no cover - unsloth_zoo import needs an acceler
     pytest.skip(f"cannot import unsloth_zoo gpt_oss patches: {e}", allow_module_level=True)
 
 
+_NF4_CODE = torch.linspace(-1, 1, 16)
+
+
 def _fake_expert_linear():
     """A LoRA-free bnb Linear4bit-like expert whose readiness checks all pass.
 
@@ -44,7 +47,16 @@ def _fake_expert_linear():
         requires_grad=False,
         quant_type="nf4",
     )
-    w.quant_state = SimpleNamespace(blocksize=64, shape=torch.Size([4, 32, 64]))
+    # Every field a real QuantState carries that the readiness format check reads.
+    w.quant_state = SimpleNamespace(
+        blocksize=64,
+        shape=torch.Size([4, 32, 64]),
+        quant_type="nf4",
+        dtype=torch.bfloat16,
+        nested=False,
+        code=_NF4_CODE,
+        absmax=torch.ones(4 * 32, dtype=torch.float32),
+    )
     return SimpleNamespace(weight=w, bias=torch.zeros(4, dtype=torch.bfloat16))
 
 
