@@ -229,7 +229,8 @@ def grpo_terms(objective, new, advantages, mask, *, old=None, ref=None):
     capped = coef_1 if objective.delta is None else mx.minimum(coef_1, mx.array(objective.delta, mx.float32))
     per_token = -mx.minimum(capped * advantages, coef_2 * advantages)
     if objective.beta != 0.0:
-        kl = mx.exp(ref - new) - (ref - new) - 1.0
+        log_ratio = mx.clip(ref - new, -20.0, 20.0)
+        kl = mx.clip(mx.expm1(log_ratio) - log_ratio, -10.0, 10.0)
         per_token = per_token + objective.beta * kl
     else:
         kl = mx.zeros((new.shape[0], 1) if coef_1.shape[1] == 1 else new.shape, mx.float32)
@@ -237,27 +238,25 @@ def grpo_terms(objective, new, advantages, mask, *, old=None, ref=None):
 
 
 def _reduce(objective, per_token, mask, normalizers):
-    """``k`` times TRL's micro-step loss, ``k`` the window's micro-step count: the
-    trainer averages micro-step gradients, TRL sums them."""
-    window_microbatches, generation_tokens = normalizers[0], normalizers[1]
+    """``k`` times Unsloth's micro-step loss, ``k`` the window's micro-step count (it cancels):
+    the trainer averages micro-step gradients, TRL sums them."""
+    steps_per_generation, generation_tokens = normalizers[0], normalizers[1]
     masked = per_token * mask
     if objective.loss_type == "grpo":
         return (masked.sum(-1) / mx.maximum(mask.sum(-1), mx.array(1.0))).mean()
-    if objective.loss_type == "bnpo":
-        return masked.sum() / mx.maximum(mask.sum(), mx.array(1.0))
     if objective.loss_type == "dr_grpo":
         return masked.sum() / (per_token.shape[0] * objective.max_completion_length)
-    return window_microbatches * masked.sum() / generation_tokens
+    return steps_per_generation * masked.sum() / mx.maximum(generation_tokens, mx.array(1.0))
 
 
-def grpo_stats(objective, kl, coef_1, advantages, response_mask):
-    """Metric values measured as Unsloth does: over each completion's tokens,
-    truncated or not."""
-    rows = response_mask.sum(-1)
+def grpo_stats(objective, kl, coef_1, advantages, mask):
+    """Metric values over the loss's own mask: a truncated row TRL masked counts no tokens."""
+    rows = mask.sum(-1)
     if kl.shape[1] == 1:
         mean_kl = kl.mean()
     else:
-        mean_kl = ((kl * response_mask).sum(-1) / mx.maximum(rows, mx.array(1.0))).mean()
+        row_kl = (kl * mask).sum(-1) / mx.maximum(rows, mx.array(1.0))
+        mean_kl = row_kl.sum() / mx.maximum((rows > 0).sum(), mx.array(1))
     advantages = advantages[:, None]
     low = mx.logical_and(coef_1 < 1 - objective.epsilon, advantages < 0).astype(mx.float32)
     high = mx.logical_and(coef_1 > 1 + objective.epsilon_high, advantages > 0).astype(mx.float32)
@@ -265,9 +264,9 @@ def grpo_stats(objective, kl, coef_1, advantages, response_mask):
     values = [
         mean_kl,
         rows.mean(),
-        _masked_mean(low, response_mask),
-        _masked_mean(high, response_mask),
-        _masked_mean(region, response_mask),
+        _masked_mean(low, mask),
+        _masked_mean(high, mask),
+        _masked_mean(region, mask),
         mx.array(1.0, mx.float32),
     ]
     return mx.stop_gradient(mx.stack([value.astype(mx.float32) for value in values]))
@@ -289,15 +288,10 @@ def make_grpo_loss_fn(objective, *, scorer=None):
 
     def loss_fn(model, batch, lengths, normalizers, advantages, kept, old=None, ref=None):
         new = logps(model, batch, lengths)
-        response_mask = _response_mask(batch[:, 1:], lengths)
-        per_token, kl, coef_1 = grpo_terms(
-            objective, new, advantages, response_mask, old=old, ref=ref,
-        )
-        mask = response_mask * kept[:, None].astype(mx.float32)
+        mask = _response_mask(batch[:, 1:], lengths) * kept[:, None].astype(mx.float32)
+        per_token, kl, coef_1 = grpo_terms(objective, new, advantages, mask, old=old, ref=ref)
         loss = _reduce(objective, per_token, mask, normalizers)
-        return loss, mx.array(1, dtype=mx.int32), grpo_stats(
-            objective, kl, coef_1, advantages, response_mask,
-        )
+        return loss, mx.array(1, dtype=mx.int32), grpo_stats(objective, kl, coef_1, advantages, mask)
 
     loss_fn._unsloth_supervised_tokens = _supervised_tokens
     loss_fn._unsloth_preference_metrics = GRPO_LOSS_METRICS
@@ -500,7 +494,7 @@ class GRPOBatchPlan:
 
     def __init__(
         self, dataset, tokenizer, prompt_ids, max_tokens, schedule, *, cycle_length,
-        num_generations, batch_size, steps_per_generation, num_iterations, grad_accum,
+        num_generations, batch_size, steps_per_generation, num_iterations,
         sampling, score_temperature, scale_rewards, mask_truncated_completions,
         with_old_logps, with_reference, max_seq_length, seed, counts_tokens=True,
     ):
@@ -514,7 +508,6 @@ class GRPOBatchPlan:
         self.batch_size = batch_size
         self.steps_per_generation = steps_per_generation
         self._repeats = steps_per_generation * num_iterations
-        self._grad_accum = grad_accum
         self.sampling = sampling
         self.score_temperature = score_temperature
         self.scale_rewards = scale_rewards
@@ -735,12 +728,6 @@ class GRPOBatchPlan:
         for name, value in reward_stats.items():
             self._record(name, value)
 
-    def _window_microbatches(self, index):
-        epoch_start = (index // self._cycle_length) * self._cycle_length
-        epoch_end = min(epoch_start + self._cycle_length, len(self._schedule))
-        start = epoch_start + ((index - epoch_start) // self._grad_accum) * self._grad_accum
-        return min(start + self._grad_accum, epoch_end) - start
-
     def batch_family(self, index):
         rows = self.batch_size
         held = ((rows, "sequence-1"), "float32")
@@ -787,7 +774,7 @@ class GRPOBatchPlan:
 
         return (
             mx.array(batch), mx.array(lengths),
-            mx.array([self._window_microbatches(index), generation.generation_tokens], dtype=mx.float32),
+            mx.array([self.steps_per_generation, generation.generation_tokens], dtype=mx.float32),
             mx.array(generation.advantages[position:position + self.batch_size]),
             mx.array(generation.kept[position:position + self.batch_size]),
             held(generation.old), held(generation.ref),
@@ -887,7 +874,7 @@ def create_grpo_batch_plan(
         dataset, tokenizer, prompt_ids, max_tokens, schedule,
         cycle_length=cycle_length, num_generations=num_generations,
         batch_size=batch_size, steps_per_generation=steps_per_generation,
-        num_iterations=num_iterations, grad_accum=grad_accum, sampling=sampling,
+        num_iterations=num_iterations, sampling=sampling,
         score_temperature=sampling.temperature if score_temperature is None else score_temperature,
         scale_rewards=scale_rewards,
         mask_truncated_completions=mask_truncated_completions,
@@ -915,7 +902,7 @@ def create_grpo_eval_plan(
     return GRPOBatchPlan(
         dataset, tokenizer, prompt_ids, max_tokens, schedule,
         cycle_length=len(schedule), num_generations=num_generations,
-        batch_size=batch_size, steps_per_generation=1, num_iterations=1, grad_accum=1,
+        batch_size=batch_size, steps_per_generation=1, num_iterations=1,
         sampling=sampling,
         score_temperature=sampling.temperature if score_temperature is None else score_temperature,
         scale_rewards=scale_rewards, mask_truncated_completions=mask_truncated_completions,

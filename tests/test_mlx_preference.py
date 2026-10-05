@@ -3295,19 +3295,20 @@ def test_grpo_loss_gradient_and_metrics_match_unsloth_cuda(loss_type, level, bet
     from unsloth_zoo.mlx.grpo import GRPOObjective, _reduce, grpo_stats, grpo_terms
 
     g = torch.Generator().manual_seed(0)
-    rows, width, k, items = 4, 6, 2, 17.0
+    rows, width, k, spg, items = 4, 6, 2, 3, 17.0
     new = torch.randn(rows, width, generator=g) * 0.3 - 2
     old = new + 0.5 * torch.randn(rows, width, generator=g)
     ref = new + 0.3 * torch.randn(rows, width, generator=g)
+    ref[1, 0], ref[0, 0] = new[1, 0] + 100, new[0, 0] + 4  # past the log-ratio clamp, and past the k3 clamp only
     mask = (torch.rand(rows, width, generator=g) > 0.3).float()
-    mask[:, 0] = 1
+    mask[:, 0], mask[2] = 1, 0  # row 2 is a truncated row TRL masked
     adv = torch.randn(rows, generator=g)
     leaf = new.clone().requires_grad_()
     loss, length, kl, _, _, cuda_coef, _ = grpo_compute_loss(
         ref, leaf, old if with_old else None, None, torch.zeros(rows, width, dtype=torch.long),
         mask, beta, adv, loss_type=loss_type, epsilon_low=0.2, epsilon_high=0.28, delta=delta,
         importance_sampling_level=level, max_completion_length=8, num_items_in_batch=items,
-        current_gradient_accumulation_steps=k,
+        current_gradient_accumulation_steps=k, steps_per_generation=spg,
     )
     loss.backward()
     objective = GRPOObjective(loss_type, beta, 0.2, 0.28, delta, level, max_completion_length=8)
@@ -3316,7 +3317,7 @@ def test_grpo_loss_gradient_and_metrics_match_unsloth_cuda(loss_type, level, bet
 
     def scaled(values):
         per_token, _, _ = grpo_terms(objective, values, A, M, old=O, ref=R)
-        return _reduce(objective, per_token, M, mx.array([float(k), items]))
+        return _reduce(objective, per_token, M, mx.array([float(spg), items]))
 
     assert scaled(as_mx(new)).item() == pytest.approx(k * loss.item(), rel=1e-5)
     grad = np.array(mx.grad(scaled)(as_mx(new)))
@@ -3328,7 +3329,7 @@ def test_grpo_loss_gradient_and_metrics_match_unsloth_cuda(loss_type, level, bet
     assert stats[:5] == pytest.approx([kl.item(), length.item(), *clip], rel=1e-5, abs=1e-7)
 
 
-def test_grpo_loss_masks_truncated_rows_but_measures_them():
+def test_grpo_loss_and_metrics_leave_out_truncated_rows():
     import numpy as np
     import mlx.core as mx
     from unsloth_zoo.mlx.grpo import GRPOObjective, completion_logps, grpo_metric_values, make_grpo_loss_fn
@@ -3345,7 +3346,7 @@ def test_grpo_loss_masks_truncated_rows_but_measures_them():
     first = loss_fn(Model(), batch, lengths, normalizers, advantages, mx.array([1, 0]))
     assert both[0].item() == pytest.approx(0.0, abs=1e-6)  # on-policy: -(A * 1) summed over +1/-1 rows
     assert first[0].item() == pytest.approx(2 * -2 / 5)
-    assert grpo_metric_values(both[2].tolist())["completion_length"] == grpo_metric_values(first[2].tolist())["completion_length"] == 2.0  # noqa: E501
+    assert [grpo_metric_values(out[2].tolist())["completion_length"] for out in (both, first)] == [2.0, 1.0]
     assert loss_fn._unsloth_supervised_tokens((batch, lengths)).item() == 4
     logits = np.array(Model()(batch[:, :-1])) / 0.7
     expected = logits - np.log(np.exp(logits).sum(-1, keepdims=True))
@@ -3433,9 +3434,7 @@ def test_grpo_plan_order_follows_trl_repeat_sampler(bsz, spg, iterations, shuffl
     expected = [index for _ in range(2) for index in sampler][::2]
     visits = [prompt for entry in plan.schedule for prompt in entry]
     assert visits == expected and plan.cycle_length * 2 == len(plan.schedule)
-    cycle = plan.cycle_length
     assert plan.with_old_logps == (2 % (spg * iterations) != 0)
-    assert [plan._window_microbatches(i) for i in range(2 * cycle)] == [min(2, cycle - i % cycle // 2 * 2) for i in range(2 * cycle)]  # noqa: E501
 
 
 def test_grpo_prompts_render_as_trl_and_unsloth_pass_them(monkeypatch):
@@ -3503,7 +3502,7 @@ def test_grpo_plan_generates_scores_and_replays_each_generation(monkeypatch):
     with pytest.warns(UserWarning, match="1 prompt"):
         plan = create_grpo_batch_plan(
             dataset, DecodingTokenizer(), num_generations=2, batch_size=2, steps_per_generation=2,
-            num_iterations=2, grad_accum=2, sampling=GRPOSampling(max_tokens=3, temperature=0.5), score_temperature=0.7,
+            num_iterations=2, grad_accum=1, sampling=GRPOSampling(max_tokens=3, temperature=0.5), score_temperature=0.7,
             max_seq_length=6, mask_truncated_completions=True, with_reference=True,
             shuffle=False, num_batches=8,
         )
