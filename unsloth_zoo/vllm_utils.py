@@ -2052,9 +2052,17 @@ def approximate_vllm_memory_usage(
     mlp_B  = max_lora_rank * (mlp_size + mlp_size) + max_lora_rank * hd
     if is_moe:
         # Expert adapters are stacked over experts, so they scale with the expert count,
-        # which at 256 experts dwarfs the dense terms rather than matching them.
+        # which at 256 experts dwarfs the dense terms rather than matching them. Ordinary
+        # MLP Linears also get adapters: Qwen3.5 MoE's shared expert, Gemma-4's dense MLP.
         mlp_A = n_experts * (hd * max_lora_rank * 2 + moe_size * max_lora_rank)
         mlp_B = n_experts * (max_lora_rank * (moe_size + moe_size) + max_lora_rank * hd)
+        dense_sizes = [shared_size]
+        if _config_get(config, "enable_moe_block", False):
+            dense_sizes.append(_config_get(config, "intermediate_size") or 0)
+        for size in dense_sizes:
+            if not size: continue
+            mlp_A += hd * max_lora_rank * 2 + size * max_lora_rank
+            mlp_B += max_lora_rank * (size + size) + max_lora_rank * hd
     lora_elements = qkvo_A + qkvo_B + mlp_A + mlp_B
     lora_elements = lora_elements * max_loras
     # 2 bytes = float16 for LoRA

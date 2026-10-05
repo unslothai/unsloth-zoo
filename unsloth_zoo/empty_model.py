@@ -318,7 +318,9 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     })
 
     # Set attention module head_dim
-    head_dim = getattr(causal_config, "head_dim", causal_config.hidden_size // causal_config.num_attention_heads)
+    head_dim = _global_config_value(
+        causal_config, "head_dim", causal_config.hidden_size // causal_config.num_attention_heads,
+    )
     new_config.update({"head_dim" : head_dim})
 
     # "eager" not "sdpa": from_config enforces _supports_sdpa and raises ValueError
@@ -329,6 +331,23 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     )
 
     return new_model, original_meta_model, causal_config.num_hidden_layers
+
+def _global_config_value(config_obj, attr, default):
+    """`getattr(config_obj, attr, default)` that also works on a heterogeneous config.
+
+    Gemma-4 overrides head_dim / num_key_value_heads on its full-attention layers, and
+    transformers raises AmbiguousGlobalPerLayerAttributeError for a plain global read of
+    such a field. The global value is still the default every layer without an override
+    uses, and the per-layer overrides survive on the copied config, so read it unvalidated.
+    """
+    try:
+        return getattr(config_obj, attr, default)
+    except Exception:
+        unvalidated = getattr(config_obj, "_getattr_without_heterogeneous_validation", None)
+        if unvalidated is None: raise
+        value = unvalidated(attr)
+        return default if value is None else value
+pass
 
 def _set_config_attrs(config_obj, attrs_to_set):
     """Helper to set multiple attributes on a config object if they exist.

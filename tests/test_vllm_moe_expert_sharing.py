@@ -317,3 +317,41 @@ def test_a_router_rebuilt_without_the_meta_model_gets_its_real_hidden_dim():
     plain = torch.nn.Module(); plain.hidden_dim = 1
     vu._refresh_placeholder_dims(plain, "weight", real)
     assert plain.hidden_dim == 1
+
+
+def test_text_only_gemma4_config_builds_an_empty_causal_lm():
+    # Gemma-4 overrides head_dim on its full-attention layers, so a plain global read raises
+    # AmbiguousGlobalPerLayerAttributeError and text_only reconstruction never started.
+    transformers = pytest.importorskip("transformers")
+    Gemma4TextConfig = getattr(transformers, "Gemma4TextConfig", None)
+    if Gemma4TextConfig is None: pytest.skip("transformers has no Gemma 4")
+    from unsloth_zoo.empty_model import _global_config_value, create_empty_causal_lm
+    config = Gemma4TextConfig(
+        num_hidden_layers = 2, hidden_size = 16, intermediate_size = 32, num_attention_heads = 2,
+        num_key_value_heads = 1, head_dim = 8, global_head_dim = 16, vocab_size = 32,
+        layer_types = ["sliding_attention", "full_attention"],
+    )
+    if not getattr(config, "is_heterogeneous", False): pytest.skip("this transformers has no per-layer configs")
+    assert _global_config_value(config, "head_dim", None) == 8
+    new_model, _, layers = create_empty_causal_lm(config, torch.float32)
+    assert layers == 2 and type(new_model).__name__ == "Gemma4ForCausalLM"
+
+
+def test_memory_estimate_counts_shared_and_dense_mlp_adapters_on_moe(monkeypatch):
+    import unsloth_zoo.vllm_utils as vu
+    monkeypatch.setattr(vu, "get_mem_info", lambda: (80 * 1024**3, 80 * 1024**3))
+
+    def lora_gb(**extra):
+        config = types.SimpleNamespace(
+            vocab_size = 1000, hidden_size = 64, max_position_embeddings = 4096, num_hidden_layers = 2,
+            num_key_value_heads = 2, num_attention_heads = 4, num_experts = 8, moe_intermediate_size = 16,
+            tie_word_embeddings = True, **extra,
+        )
+        kv = lambda lora: vu.approximate_vllm_memory_usage(config, max_seq_length = 512, enable_lora = lora)[3]
+        return kv(False) - kv(True)
+
+    experts_only = lora_gb()
+    assert lora_gb(shared_expert_intermediate_size = 32) > experts_only  # Qwen3.5 MoE shared expert
+    assert lora_gb(enable_moe_block = True, intermediate_size = 32) > experts_only  # Gemma-4 dense MLP
+    # Qwen3-MoE's leftover dense intermediate_size builds no MLP, so it adds no adapter.
+    assert lora_gb(intermediate_size = 32) == experts_only
