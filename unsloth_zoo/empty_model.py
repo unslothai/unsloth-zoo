@@ -40,7 +40,9 @@ from .log import logger
 from .hf_utils import HAS_TORCH_DTYPE, dtype_from_config, set_dtype_in_config
 
 # get_model_type returns the vision name, which transformers 5 renamed to qwen3_vl_vision.
-QWEN_VL_MERGED_QKV_TYPES = ("qwen2_5_vl", "qwen3_vl", "qwen3_vl_vision", "qwen3_5")
+# Qwen3.5 / 3.6 MoE checkpoints report qwen3_5_moe for their vision tower too, which keeps the
+# same merged attn.qkv; splitting it stores q, then k, then v under the one HF name.
+QWEN_VL_MERGED_QKV_TYPES = ("qwen2_5_vl", "qwen3_vl", "qwen3_vl_vision", "qwen3_5", "qwen3_5_moe")
 
 
 def _is_gemma4_config(config):

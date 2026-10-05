@@ -194,3 +194,10 @@ def test_gemma4_config_proxy_forwards_writes():
     proxy.tie_word_embeddings = False
     assert real.tie_word_embeddings is False
     assert not hasattr(proxy, "num_kv_shared_layers")
+
+
+def test_qwen3_5_moe_vision_qkv_stays_merged():
+    # HF Qwen3.5 MoE keeps model.visual.blocks.N.attn.qkv fused (3 * hidden rows); splitting it
+    # left only the v rows in the training model's vision tower.
+    from unsloth_zoo.empty_model import QWEN_VL_MERGED_QKV_TYPES
+    assert "qwen3_5_moe" in QWEN_VL_MERGED_QKV_TYPES
