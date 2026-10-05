@@ -133,6 +133,9 @@ def test_installed_forwards_are_fused(module, cls):
     source = compiler.fixup_fused_lm_head(inspect.getsource(klass.forward))
     if "loss = loss_fct(\n" not in source:
         pytest.skip(f"{cls} does not use the multi-line call in this transformers")
+    if "self.lm_head(" not in source:
+        # transformers 4.x takes the logits from the inner language model: nothing local to fuse.
+        pytest.skip(f"{cls} has no local lm_head in this transformers")
     _, fused = _fused(source, cls)
     assert fused
 
