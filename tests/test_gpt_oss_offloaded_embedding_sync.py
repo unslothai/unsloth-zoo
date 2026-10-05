@@ -136,3 +136,41 @@ def test_offloaded_embedding_op_under_cuda_graphs(ids_in_graph):
             logits = compiled(prep(logits)).clone()
             ref = step(ref)
             torch.testing.assert_close(logits, ref)
+
+
+
+_TRAIN_RUNTIME = _RUNTIME.split("from torch.overrides import")[0].replace(
+    "def _id_compile(model=None, *a, **k):\n    return (lambda fn: fn) if model is None else model\ntorch.compile = _id_compile\n", ""
+) + r"""
+calls = []
+op = G._offloaded_embedding
+def counting(input_ids, weight):
+    calls.append(1)
+    return op(input_ids, weight)
+G._offloaded_embedding = counting
+model.train()
+model.embed_tokens.weight.requires_grad_(True)
+torch._dynamo.reset()
+out = torch.compile(model, backend = "aot_eager")(input_ids = ids, attention_mask = mask, use_cache = False).last_hidden_state
+out.float().sum().backward()
+g = model.embed_tokens.weight.grad
+train_calls = len(calls)
+model.eval()
+torch._dynamo.reset()
+with torch.no_grad():
+    torch.compile(model, backend = "aot_eager")(input_ids = ids, attention_mask = mask, use_cache = False)
+print("RESULT", json.dumps({"grad": g is not None and bool(g.abs().sum() > 0), "train_calls": train_calls, "infer_calls": len(calls) - train_calls}))
+"""
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
+def test_compiled_training_keeps_offloaded_embedding_differentiable():
+    proc = subprocess.run([sys.executable, "-c", _TRAIN_RUNTIME], capture_output = True, text = True, timeout = 600)
+    skip = [l for l in proc.stdout.splitlines() if l.startswith("SKIP ")]
+    if skip:
+        pytest.skip(skip[0][len("SKIP "):])
+    lines = [l for l in proc.stdout.splitlines() if l.startswith("RESULT ")]
+    assert proc.returncode == 0 and lines, proc.stdout[-2000:] + proc.stderr[-4000:]
+    res = json.loads(lines[-1][len("RESULT "):])
+    # The lookup op has no backward: compiled training must keep nn.Embedding, inference uses the op.
+    assert res["grad"] and res["train_calls"] == 0 and res["infer_calls"] > 0, res
