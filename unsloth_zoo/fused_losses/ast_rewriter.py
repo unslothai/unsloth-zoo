@@ -317,8 +317,7 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef, extended: bool = False)
         if not all(_is_cast(s, (loss_name, logits_name)) for s in post_stmts):
             return None
 
-        # Labels arg must be literally the plain `labels` name; aliased labels
-        # (e.g. CSM `labels=backbone_labels`) need bespoke handling.
+        # Plain `labels` only: aliases (CSM `labels=backbone_labels`) need bespoke handling.
         labels_arg = None
         labels_src = "labels"
         if len(loss_call.args) >= 2:
@@ -482,7 +481,6 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
     # route loss through self.loss_function on those logits (avoids the double
     # matmul of fused-kernel + separate logits_rhs).
     if cap.guarded_scale_expr is not None and "logit_scale_multiply" not in already:
-        # None (unset) and 0 both mean "no scale" to the kernel.
         scale_extra += f", logit_scale_multiply={ast.unparse(cap.guarded_scale_expr)}"
     if cap.softcap_expr is not None and "logit_softcapping" not in already:
         scale_extra += f", logit_softcapping={ast.unparse(cap.softcap_expr)}"

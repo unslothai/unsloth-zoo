@@ -6447,8 +6447,7 @@ def unsloth_compile_transformers(
                         new_source, module
                     )
                     if not supports_return_hidden_states:
-                        # Regex shapes missed: drop the lm_head matmul via the AST rewriter instead.
-                        # No UNSLOTH_RETURN_HIDDEN_STATES branch there, so GRPO keeps its own wrapper.
+                        # AST fallback has no UNSLOTH_RETURN_HIDDEN_STATES branch: GRPO keeps its wrapper.
                         ast_source = _ast_fused_lm_head_fallback(new_source, module, module_class)
                         if ast_source is not None:
                             fused_source = ast_source

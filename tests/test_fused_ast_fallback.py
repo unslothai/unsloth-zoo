@@ -241,12 +241,10 @@ def test_fused_matches_original(name, logit_scale, monkeypatch):
     torch.testing.assert_close(out[2], ref[2], rtol = 1e-4, atol = 1e-6)
     torch.testing.assert_close(out[3], ref[3], rtol = 1e-4, atol = 1e-6)
 
-    # Generation path: real logits with every post-head transform.
     _, logits_ref, _, _ = _run(original, model, None, hidden)
     _, logits_new, _, _ = _run(fused, model, None, hidden)
     torch.testing.assert_close(logits_new, logits_ref)
 
-    # UNSLOTH_RETURN_LOGITS=1 replays the original statements.
     monkeypatch.setenv("UNSLOTH_RETURN_LOGITS", "1")
     out = _run(fused, model, labels, hidden)
     torch.testing.assert_close(out[1], ref[1])
@@ -283,10 +281,8 @@ def test_explicit_shift_labels_are_not_shifted_again(monkeypatch):
 
 def test_compiler_fallback_only_for_unfused_lm_head_sources():
     assert compiler._ast_fused_lm_head_fallback(OPT_455, "OPTForCausalLM") is not None
-    # Already rewritten by the import hook.
     hooked, _ = rewrite_forward_source(textwrap.dedent(OPT_455))
     assert compiler._ast_fused_lm_head_fallback(hooked, "OPTForCausalLM") is None
-    # Same head rule as the import hook: a listed attribute built as a Linear.
     embed_out = OPT_455.replace("self.lm_head(", "self.embed_out(")
     assert compiler._ast_fused_lm_head_fallback(embed_out, "GPTNeoXForCausalLM") is not None
     assert compiler._ast_fused_lm_head_fallback(embed_out, "MoonshineForConditionalGeneration") is None
