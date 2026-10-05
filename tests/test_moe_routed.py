@@ -427,6 +427,36 @@ def test_compiled_decode_reads_replaced_quant_state(what, mode, monkeypatch):
     torch.testing.assert_close(got, fresh)
 
 
+def test_nested_blocksize_is_part_of_the_stacked_key():
+    ex = _make("silu")
+    old = MR.prepare_stacked_nf4(ex)
+    assert old is not None and MR.prepare_stacked_nf4(ex) is old
+    ex.down_proj.quant_state.state2.blocksize *= 2
+    assert MR.prepare_stacked_nf4(ex) is not old
+
+
+@pytest.mark.parametrize("change", ["fp32", "bf16_new"])
+def test_compiled_bf16_retrace_rechecks_the_plan(change, monkeypatch):
+    # A retrace after a recast must not route FP32 weights through the bf16 / fp16 kernels.
+    monkeypatch.setenv("UNSLOTH_MOE_ROUTED_KERNEL", "1")
+    ex = _make("silu", quant = False)
+    x, idx, w = _route(2)
+    torch._dynamo.reset()
+    fn = torch.compile(lambda a, b, c: MR.routed_moe_forward(ex, a, b, c), fullgraph = True)
+    with torch.no_grad():
+        assert MR.routed_moe_forward(ex, x, idx, w) is not None
+        assert fn(x, idx, w) is not None
+        for n in ("gate_up_proj", "down_proj"):
+            p = getattr(ex, n)
+            t = p.float() if change == "fp32" else p * 1.0
+            setattr(ex, n, nn.Parameter(t, requires_grad = False))
+        got = fn(x, idx, w)
+    if change == "fp32":
+        assert got is None
+    else:
+        assert got is not None
+
+
 @pytest.mark.parametrize("use_lora", [False, True])
 @pytest.mark.parametrize("mode", ["1", "grouped", "bf16"])
 def test_fullgraph_compile_and_cuda_graph_replay(use_lora, mode, monkeypatch):
@@ -448,8 +478,9 @@ def test_fullgraph_compile_and_cuda_graph_replay(use_lora, mode, monkeypatch):
         assert eager is not None
         compiled = torch.compile(f, fullgraph = True)(x, idx, w)
     assert sum(counters["graph_break"].values()) == 0
-    assert compiled is not None
-    if use_lora:
+    if mode != "bf16" and not MR._LIVE_QUANT:
+        assert compiled is None  # compiled NF4 keeps the current path before torch 2.10
+    elif use_lora:
         torch.testing.assert_close(compiled, eager, rtol = 2e-2, atol = 2e-3)
     else:
         assert torch.equal(compiled, eager)

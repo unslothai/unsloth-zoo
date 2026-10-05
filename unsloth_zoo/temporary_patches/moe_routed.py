@@ -907,7 +907,9 @@ def _stacked_key(experts):
     for qs in (gu.quant_state, dn.quant_state):
         # Version counters catch in-place edits of buffers the tables copy (offset, code, state2).
         key += [(t.data_ptr(), t._version) for t in _stacked_sources(qs)]
-        key += [qs.blocksize, bool(qs.nested), None if not qs.nested or isinstance(qs.offset, torch.Tensor) else float(qs.offset)]
+        key += [qs.blocksize, bool(qs.nested)]
+        if qs.nested:
+            key += [qs.state2.blocksize, None if isinstance(qs.offset, torch.Tensor) else float(qs.offset)]
     return tuple(key) + biases
 
 
@@ -992,7 +994,8 @@ def _build_stacked_nf4(experts, hidden_dim):
     }
 
 
-# Dynamo before torch 2.10 traces Params4bit as a plain object (no .detach / .view).
+# Dynamo before torch 2.10 traces Params4bit as a plain object (no .detach / .view), so compiled
+# NF4 calls keep the current path there.
 _LIVE_QUANT = tuple(int(v) for v in torch.__version__.split("+")[0].split(".")[:2]) >= (2, 10)
 
 
@@ -1161,13 +1164,14 @@ def _bf16_views(experts, hidden_dim):
     if not isinstance(gu, torch.Tensor) or not isinstance(dn, torch.Tensor):
         return None
     cache = experts.__dict__.get("_unsloth_routed_bf16")
+    meta = (gu.dtype, dn.dtype, gu.device, dn.device, tuple(gu.shape), tuple(dn.shape), hidden_dim)
     if torch.compiler.is_compiling():
-        # Built on an eager call first; Dynamo guards on the weights themselves.
-        if cache is None:
+        # Built on an eager call first; a retrace after a recast or reshape must not reuse its verdict.
+        if cache is None or cache[0][2:] != meta:
             return None
         plan = cache[1]
     else:
-        key = (gu.data_ptr(), dn.data_ptr(), gu.dtype, tuple(gu.shape), tuple(dn.shape), hidden_dim)
+        key = (gu.data_ptr(), dn.data_ptr()) + meta
         if cache is not None and cache[0] == key:
             plan = cache[1]
         else:
@@ -1195,9 +1199,9 @@ def routed_moe_forward(experts, hidden_states, top_k_index, top_k_weights):
     if nf4:
         # Built eagerly (data_ptr is not traceable), even on calls too large to route.
         if torch.compiler.is_compiling():
+            # Without a live read (torch < 2.10) a compiled call cannot see a requantize: fall back.
             state = experts.__dict__.get("_unsloth_routed_moe")
-            if isinstance(state, dict) and _LIVE_QUANT:
-                state = _live_quant(experts, state)
+            state = _live_quant(experts, state) if isinstance(state, dict) and _LIVE_QUANT else None
         else:
             state = prepare_stacked_nf4(experts, hidden_dim)
         if not isinstance(state, dict) or top_k_index.numel() > nf4_slot_limit(state["E"]):
