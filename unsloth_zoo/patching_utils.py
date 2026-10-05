@@ -155,12 +155,8 @@ def stop_compiling_weak_dictionary_writes():
 
 
 def patch_dynamo_cleanup_hook_shutdown():
-    # torch._dynamo.utils.CleanupHook.__call__ (recent torch) reads the module
-    # global _cleanup_owners. Hooks fire from weakref callbacks when a compiled
-    # code object dies; at interpreter exit that can happen after the module
-    # globals were set to None, printing "Exception ignored ... 'NoneType'
-    # object has no attribute 'pop'". Its CleanupManager None check already
-    # means "shutting down"; extend that to _cleanup_owners.
+    # CleanupHook.__call__ reads the global _cleanup_owners from a weakref callback, which at
+    # interpreter exit can run after module globals became None ("'NoneType' ... 'pop'").
     try:
         import torch._dynamo.utils as dynamo_utils
     except Exception:
