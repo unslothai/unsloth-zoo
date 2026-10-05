@@ -167,7 +167,6 @@ def _granite_loss(source, attention_mask):
 
 @pytest.mark.parametrize("prefix", [0, 3])
 def test_granite_speech_mask_longer_than_labels(prefix, monkeypatch):
-    # PEFT prefix tuning prepends virtual tokens to the mask only.
     monkeypatch.setenv("UNSLOTH_RETURN_LOGITS", "0")
     new, fused = _fused(GRANITE_SPEECH, "GraniteSpeechForConditionalGeneration")
     assert fused

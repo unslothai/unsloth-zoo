@@ -3496,8 +3496,7 @@ def _normalize_lm_head_source(forward):
     if re.search(r"^[ \t]+lm_logits = self\.lm_head\(", forward, flags = re.MULTILINE) \
             and not re.search(r"(?<![\w.])logits(?![\w=])", forward):
         forward = re.sub(r"\blm_logits\b", "logits", forward)
-    # Multi-line masked-shift CE (Qwen2-Audio, Granite Speech) -> pattern 3's shape. Needs a local
-    # head call: pattern 3 reads `hidden_states`, unbound with `logits = outputs.logits`.
+    # Multi-line masked-shift CE (Qwen2-Audio, Granite Speech) -> pattern 3; needs a local head call.
     if "self.lm_head(" not in forward:
         return forward
     forward = re.sub(
