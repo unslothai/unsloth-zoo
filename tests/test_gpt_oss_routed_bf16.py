@@ -232,3 +232,11 @@ def test_routed_mlp_forward_matches_module_on_batched_decode(monkeypatch, lora, 
         ref = (ref[0] if isinstance(ref, tuple) else ref).float()
     assert got is not None
     torch.testing.assert_close(got.float().reshape(ref.shape), ref, atol = 2e-2, rtol = 2e-2)
+
+
+@pytest.mark.parametrize("env", ["UNSLOTH_GPTOSS_ROUTED_KERNEL", "UNSLOTH_GPTOSS_ROUTED_INFERENCE"])
+def test_both_kill_switch_names_turn_routing_off(monkeypatch, env):
+    _, mlp = _toy(False)
+    x = torch.randn(1, 1, H, device = "cuda").bfloat16()
+    monkeypatch.setenv(env, "0")
+    assert not routed_bf16_eligible(mlp.experts, x)

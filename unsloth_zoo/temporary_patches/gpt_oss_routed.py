@@ -170,6 +170,14 @@ if triton is not None:
         tl.store(OUT + t.to(tl.int64) * N + rows, out.to(OUT.dtype.element_ty), mask = rmask)
 
 
+def _routed_disabled():
+    # UNSLOTH_GPTOSS_ROUTED_INFERENCE is the earlier name of the same switch.
+    return "0" in (
+        os.environ.get("UNSLOTH_GPTOSS_ROUTED_KERNEL", "1"),
+        os.environ.get("UNSLOTH_GPTOSS_ROUTED_INFERENCE", "1"),
+    )
+
+
 def _block_k(K, blocksize):
     return max(blocksize, min(1024, triton.next_power_of_2(K)))
 
@@ -414,7 +422,7 @@ def routed_experts_forward(experts, hidden_states, router_indices, routing_weigh
     """Routed eval forward for a ModuleList NF4 gpt-oss experts module, or None if ineligible.
 
     routing_weights is dense [T, E] (zeros off the picked experts) or already [T, top_k]."""
-    if os.environ.get("UNSLOTH_GPTOSS_ROUTED_KERNEL", "1") == "0":
+    if _routed_disabled():
         return None
     if torch.is_grad_enabled() or experts.training or not hidden_states.is_cuda:
         return None
@@ -619,7 +627,7 @@ def routed_bf16_eligible(experts, hidden_states):
     """True when routed_bf16_forward can run this call exactly."""
     if triton is None or not hidden_states.is_cuda or torch.is_grad_enabled():
         return False
-    if os.environ.get("UNSLOTH_GPTOSS_ROUTED_KERNEL", "1") == "0":
+    if _routed_disabled():
         return False
     got = _lora_terms(experts)
     if got is None:
@@ -671,7 +679,7 @@ def routed_mlp_forward(mlp, hidden_states, max_slots = ROUTED_MAX_SLOTS):
     than max_slots (token, expert) pairs or experts this path does not cover."""
     if triton is None or torch.is_grad_enabled() or not hidden_states.is_cuda:
         return None
-    if os.environ.get("UNSLOTH_GPTOSS_ROUTED_KERNEL", "1") == "0":
+    if _routed_disabled():
         return None
     experts = mlp.experts
     nf4 = False
