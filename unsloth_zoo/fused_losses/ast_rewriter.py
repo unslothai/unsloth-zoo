@@ -386,7 +386,6 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef, extended: bool = False)
         kw_unpack = next((k.value.id for k in loss_call.keywords
                           if k.arg is None and isinstance(k.value, ast.Name)), None)
         if extended:
-            # `shift_labels = kwargs.pop("shift_labels", labels)` feeding `shift_labels=shift_labels`.
             fused_pre = [s for s in pre_stmts if _is_shift_labels_pop(s, kw_unpack)]
             if fused_pre and not (
                 len(fused_pre) == 1
