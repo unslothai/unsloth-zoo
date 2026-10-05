@@ -355,3 +355,23 @@ def test_memory_estimate_counts_shared_and_dense_mlp_adapters_on_moe(monkeypatch
     assert lora_gb(enable_moe_block = True, intermediate_size = 32) > experts_only  # Gemma-4 dense MLP
     # Qwen3-MoE's leftover dense intermediate_size builds no MLP, so it adds no adapter.
     assert lora_gb(intermediate_size = 32) == experts_only
+
+
+def test_memory_estimate_counts_stacked_expert_lora_at_its_saved_shapes(monkeypatch):
+    # A real gemma-4-26B-A4B r=8 adapter saves per layer: gate_up A (E*r, H), B (2I, E*r);
+    # down A (E*r, I), B (H, E*r). So the experts add E*r*(2H + 3I) elements per layer.
+    import unsloth_zoo.vllm_utils as vu
+    monkeypatch.setattr(vu, "get_mem_info", lambda: (80 * 1024**3, 80 * 1024**3))
+    E_, H_, I_, r, layers = 8, 64, 16, 4, 2
+    config = types.SimpleNamespace(
+        vocab_size = 1000, hidden_size = H_, max_position_embeddings = 4096, num_hidden_layers = layers,
+        num_key_value_heads = 4, num_attention_heads = 4, num_experts = E_, moe_intermediate_size = I_,
+        tie_word_embeddings = True,
+    )
+    kv = lambda lora: vu.approximate_vllm_memory_usage(
+        config, max_seq_length = 512, enable_lora = lora, max_lora_rank = r,
+    )[3] * 1024**3
+    qkvo = H_ * r * 4 + r * (H_ * 4)  # kv_size == hidden here
+    experts = E_ * r * (2 * H_ + 3 * I_)
+    expected = (qkvo + experts) * layers * 2  # 2 bytes per element
+    assert abs((kv(False) - kv(True)) - expected) < 1e-3 * expected

@@ -2054,8 +2054,9 @@ def approximate_vllm_memory_usage(
         # Expert adapters are stacked over experts, so they scale with the expert count,
         # which at 256 experts dwarfs the dense terms rather than matching them. Ordinary
         # MLP Linears also get adapters: Qwen3.5 MoE's shared expert, Gemma-4's dense MLP.
-        mlp_A = n_experts * (hd * max_lora_rank * 2 + moe_size * max_lora_rank)
-        mlp_B = n_experts * (max_lora_rank * (moe_size + moe_size) + max_lora_rank * hd)
+        # One A per stacked tensor: gate_up (E*r, H) and down (E*r, I); B is (2I, E*r) and (H, E*r).
+        mlp_A = n_experts * max_lora_rank * (hd + moe_size)
+        mlp_B = n_experts * max_lora_rank * (moe_size + moe_size + hd)
         dense_sizes = [shared_size]
         if _config_get(config, "enable_moe_block", False):
             dense_sizes.append(_config_get(config, "intermediate_size") or 0)
