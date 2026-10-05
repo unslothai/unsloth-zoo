@@ -14,13 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""create_causal_mask returns None (SDPA `is_causal=True`) only for a plain causal call.
-
-Every case that needs the materialised mask must keep it: eager / flex / flash attention,
-any cache, a single query, padding, packed position_ids, a 4D or BlockMask mask, mask
-overlays (Gemma 3 token_type_ids, block_sequence_ids), non-causal configs, sliding windows,
-tracing, and the kill switch.
-"""
+"""create_causal_mask returns None (SDPA `is_causal=True`) only for a plain causal call; every other case keeps the mask."""
 import inspect
 
 import pytest
@@ -96,7 +90,6 @@ def _causal(length):
     return torch.ones(length, length, dtype = torch.bool).tril()
 
 
-# ---------------------------------------------------------------- the case that skips
 
 
 def test_plain_unpadded_sdpa_call_returns_none_and_is_counted(patched):
@@ -131,7 +124,6 @@ def test_sdpa_turns_none_into_the_same_causal_attention(patched):
     torch.testing.assert_close(maskless, masked, rtol = 1e-5, atol = 1e-6)
 
 
-# ---------------------------------------------------------------- attention implementations
 
 
 @pytest.mark.parametrize("attn", ["eager", "flex_attention", "flash_attention_2", "flash_attention_3", None])
@@ -155,7 +147,6 @@ def test_non_causal_config_keeps_its_mask(patched):
     assert _decide(patched, **_kwargs(patched, config = config)) is None
 
 
-# ---------------------------------------------------------------- caches and query length
 
 
 def test_any_cache_keeps_the_mask(patched):
@@ -174,12 +165,10 @@ def test_single_query_keeps_the_mask(patched):
 
 
 def test_mask_longer_than_the_queries_keeps_the_mask(patched):
-    # Prefix tuning / a mask covering past tokens: kv_length != q_length.
     kwargs = _kwargs(patched, length = 6, attention_mask = torch.ones(2, 9, dtype = torch.long))
     assert _decide(patched, **kwargs) is None
 
 
-# ---------------------------------------------------------------- padding and packing
 
 
 @pytest.mark.parametrize("side", ["right", "left"])
@@ -229,7 +218,6 @@ def test_multi_stream_position_ids_keep_the_mask(patched):
     assert _decide(patched, **_kwargs(patched, position_ids = position_ids)) is None
 
 
-# ---------------------------------------------------------------- prepared and overlaid masks
 
 
 def test_a_prepared_4d_mask_is_returned_untouched(patched):
@@ -249,7 +237,6 @@ def test_a_block_mask_keeps_the_mask(patched):
 
 @pytest.mark.parametrize("name", ["or_mask_function", "and_mask_function", "block_sequence_ids", "encoder_hidden_states"])
 def test_overlays_keep_the_mask(patched, name):
-    # Gemma 3 / PaliGemma make image tokens bidirectional through or_mask_function.
     params = _signature(patched).parameters
     if name not in params and not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
         pytest.skip(f"this transformers has no {name}")
@@ -273,7 +260,6 @@ def test_allow_is_causal_skip_false_keeps_the_mask(patched):
     assert _decide(patched, **_kwargs(patched, allow_is_causal_skip = False)) is None
 
 
-# ---------------------------------------------------------------- sliding window, tracing, kill switch
 
 
 def test_sliding_window_builder_is_untouched(patched):
@@ -284,7 +270,7 @@ def test_sliding_window_builder_is_untouched(patched):
     mask = patched.create_sliding_window_causal_mask(**kwargs)
     assert misc.CAUSAL_MASK_SKIP_STATS["skipped"] == before
     assert isinstance(mask, torch.Tensor)
-    assert not bool(mask[0, 0, 5, 0])  # outside the window
+    assert not bool(mask[0, 0, 5, 0])
 
 
 def test_tracing_keeps_the_compiled_path(patched, monkeypatch):
@@ -302,7 +288,6 @@ def test_kill_switch(patched, monkeypatch):
 
 
 def test_the_registered_sdpa_mask_interface_still_decides(patched, monkeypatch):
-    # The skip only builds eagerly; the mask interface for "sdpa" still chooses None or a mask.
     sentinel = _causal(6).expand(2, 1, 6, 6).clone()
     mapping = patched.ALL_MASK_ATTENTION_FUNCTIONS._global_mapping
     monkeypatch.setitem(mapping, "sdpa", lambda *args, **kwargs: sentinel)
@@ -322,7 +307,6 @@ def test_positional_call_binds(patched):
     assert misc._maskless_causal_arguments(_signature(patched), tuple(args), kwargs) is not None
 
 
-# ---------------------------------------------------------------- end to end on a tiny model
 
 
 def _tiny_model(attn):
@@ -353,7 +337,6 @@ def test_tiny_model_matches_the_masked_path_and_stays_causal(patched, monkeypatc
     monkeypatch.delenv("UNSLOTH_SKIP_CAUSAL_MASK")
     torch.testing.assert_close(head, base, rtol = 1e-5, atol = 1e-5)
 
-    # Changing the last token must not move any earlier position's logits.
     future = ids.clone()
     future[:, -1] = (future[:, -1] + 1) % 64
     with torch.no_grad():

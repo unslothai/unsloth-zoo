@@ -592,15 +592,11 @@ pass
 TEMPORARY_PATCHES.append(patch_CsmProcessor_apply_chat_template)
 
 
-# create_causal_mask is compiled below, and under compile transformers' `_ignore_causal_mask_sdpa`
-# always refuses, so an unpadded batch still gets a dense 4D mask and SDPA loses its flash /
-# cuDNN `is_causal` kernels (head_dim 256, T=8192, B200: 63.1 ms masked vs 6.8 ms maskless).
-# When the call is a plain causal one, build it eagerly and let transformers decide.
-# UNSLOTH_SKIP_CAUSAL_MASK=0 keeps the compiled builder for every call.
+# Compiled, `_ignore_causal_mask_sdpa` always refuses, so SDPA loses its `is_causal` kernels
+# (B200 T=8192: 63.1 ms vs 6.8 ms). Plain causal calls run eagerly instead; UNSLOTH_SKIP_CAUSAL_MASK=0 disables.
 CAUSAL_MASK_SKIP_STATS = {"skipped": 0}
 _SKIP_CAUSAL_MASK_ENV = "UNSLOTH_SKIP_CAUSAL_MASK"
-# The only arguments a plain causal call carries. Anything else that is set (or_mask_function,
-# and_mask_function, block_sequence_ids, encoder_hidden_states, a new overlay) keeps the mask.
+# Any other non-None argument (or/and_mask_function, encoder_hidden_states, ...) keeps the mask.
 _PLAIN_CAUSAL_MASK_ARGUMENTS = frozenset((
     "config", "inputs_embeds", "input_embeds", "attention_mask", "cache_position",
     "past_key_values", "position_ids", "layer_idx", "allow_is_causal_skip",
@@ -619,11 +615,9 @@ def _is_tracing_masks():
 def _maskless_causal_arguments(signature, args, kwargs):
     """Arguments for an eager create_causal_mask call that may return None, else None.
 
-    A None mask only means causal where the attention function turns it into `is_causal=True`:
-    SDPA does, eager applies no mask at all and flex expects a BlockMask. `is_causal` is
-    top-left aligned, so it is the right mask only when queries and keys line up, i.e. no cache.
-    Padding and packed (reset) position_ids need the mask. A 2D mask of all ones and position_ids
-    without a reset carry no information beyond causal, so they are dropped before the call.
+    None means causal only under SDPA (eager applies no mask, flex wants a BlockMask).
+    `is_causal` is top-left aligned, so any cache disqualifies. Padding and packed (reset)
+    position_ids need the mask; all-ones masks and unreset position_ids are dropped.
     """
     # Tracing first: a fullgraph user compile must not reach anything below.
     if _is_tracing_masks():
@@ -680,7 +674,6 @@ def _maskless_causal_arguments(signature, args, kwargs):
             or position_ids.shape[-1] != q_length
         ):
             return None
-    # One host sync each, the same `.all()` transformers itself runs when it is not compiled.
     if attention_mask is not None and not bool(attention_mask.all()):
         return None
     if position_ids is not None and not bool((position_ids.diff(dim = -1) == 1).all()):
@@ -786,7 +779,6 @@ def patch_transformers_masks():
             if maskless_causal and signature is not None:
                 arguments = _maskless_causal_arguments(signature, args, kwargs)
                 if arguments is not None:
-                    # Eager, so transformers' own `is_causal` skip is reachable; it still decides.
                     mask = original(**arguments)
                     if mask is None:
                         CAUSAL_MASK_SKIP_STATS["skipped"] += 1
