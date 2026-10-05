@@ -98,11 +98,22 @@ if triton is not None:
         return acc + tl.sum(b.to(tl.float32) * h.to(tl.float32)[None, :], axis = 1) * scaling
 
     @triton.jit
+    def _expert_bias(BIAS_PTRS, e, rows, rmask, BIAS_KIND: tl.constexpr):
+        # Read through each expert's own bias tensor, so in-place updates are never stale.
+        if BIAS_KIND == 2:
+            B = tl.load(BIAS_PTRS + e).to(tl.pointer_type(tl.bfloat16))
+        elif BIAS_KIND == 3:
+            B = tl.load(BIAS_PTRS + e).to(tl.pointer_type(tl.float16))
+        else:
+            B = tl.load(BIAS_PTRS + e).to(tl.pointer_type(tl.float32))
+        return tl.load(B + rows, mask = rmask, other = 0.0).to(tl.float32)
+
+    @triton.jit
     def _routed_gate_up_kernel(
         X, IDX, W_PTRS, A_PTRS, A2_PTRS, C2_PTRS, OFFSETS, LUT, BIAS, LORA_B, LORA_H, OUT, N, K,
         alpha, limit, scaling,
         TOP_K: tl.constexpr, BLOCKSIZE: tl.constexpr, BLOCKSIZE2: tl.constexpr, NESTED: tl.constexpr,
-        HAS_BIAS: tl.constexpr, HAS_LORA: tl.constexpr, R: tl.constexpr, R_PAD: tl.constexpr,
+        BIAS_KIND: tl.constexpr, HAS_LORA: tl.constexpr, R: tl.constexpr, R_PAD: tl.constexpr,
         BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     ):
         # gu = dequant(W[IDX[p]]) @ X[p // TOP_K] + BIAS[IDX[p]] (+ LoRA), then gpt-oss swiglu over
@@ -122,8 +133,8 @@ if triton is not None:
             x = tl.load(x_row + k0 + ks, mask = (k0 + ks) < K, other = 0.0).to(tl.float32)
             acc += _nf4_dot(W, A, A2, C2, offset, LUT, rows64, rmask, x, k0, K,
                             BLOCKSIZE, BLOCKSIZE2, NESTED, BLOCK_N, BLOCK_K)
-        if HAS_BIAS:
-            acc += tl.load(BIAS + e * N + rows, mask = rmask, other = 0.0).to(tl.float32)
+        if BIAS_KIND != 0:
+            acc += _expert_bias(BIAS, e, rows, rmask, BIAS_KIND)
         if HAS_LORA:
             acc = _lora_b(acc, LORA_B, LORA_H, e, p.to(tl.int64), rows64, rmask, N, scaling, R, R_PAD)
         gate, up = tl.split(tl.reshape(acc, (BLOCK_N // 2, 2)))
@@ -138,7 +149,7 @@ if triton is not None:
         X, IDX, RW, W_PTRS, A_PTRS, A2_PTRS, C2_PTRS, OFFSETS, LUT, BIAS, LORA_B, LORA_H, OUT, N, K,
         RW_STRIDE, scaling,
         TOP_K: tl.constexpr, DENSE_RW: tl.constexpr, BLOCKSIZE: tl.constexpr, BLOCKSIZE2: tl.constexpr,
-        NESTED: tl.constexpr, HAS_BIAS: tl.constexpr, HAS_LORA: tl.constexpr, R: tl.constexpr,
+        NESTED: tl.constexpr, BIAS_KIND: tl.constexpr, HAS_LORA: tl.constexpr, R: tl.constexpr,
         R_PAD: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     ):
         # OUT[t] = sum_k rw[t, k] * (dequant(W[e_k]) @ X[t * TOP_K + k] + BIAS[e_k] (+ LoRA)),
@@ -162,8 +173,8 @@ if triton is not None:
                 x = tl.load(X + s * K + k0 + ks, mask = (k0 + ks) < K, other = 0.0).to(tl.float32)
                 acc += _nf4_dot(W, A, A2, C2, offset, LUT, rows64, rmask, x, k0, K,
                                 BLOCKSIZE, BLOCKSIZE2, NESTED, BLOCK_N, BLOCK_K)
-            if HAS_BIAS:
-                acc += tl.load(BIAS + e * N + rows, mask = rmask, other = 0.0).to(tl.float32)
+            if BIAS_KIND != 0:
+                acc += _expert_bias(BIAS, e, rows, rmask, BIAS_KIND)
             if HAS_LORA:
                 acc = _lora_b(acc, LORA_B, LORA_H, e, s, rows64, rmask, N, scaling, R, R_PAD)
             out += rw * acc
@@ -210,7 +221,7 @@ def _gate_up_launch(kernel, x, idx, tb, top_k, B, H, scaling, r, lora, alpha, li
         tb["bias"] if tb["bias"] is not None else tb["lut"], B, H, out, tb["N"], tb["K"],
         float(alpha), float(limit), scaling,
         TOP_K = top_k, BLOCKSIZE = tb["blocksize"], BLOCKSIZE2 = tb["blocksize2"], NESTED = tb["nested"],
-        HAS_BIAS = tb["bias"] is not None, HAS_LORA = lora is not None, R = r, R_PAD = triton.next_power_of_2(r),
+        BIAS_KIND = tb["bias_kind"], HAS_LORA = lora is not None, R = r, R_PAD = triton.next_power_of_2(r),
         BLOCK_N = 4, BLOCK_K = _block_k(tb["K"], tb["blocksize"]), num_warps = 4,
     )
     return out
@@ -229,16 +240,16 @@ def _down_launch(kernel, x, idx, rw, dense_rw, tb, top_k, B, H, scaling, r, lora
         tb["bias"] if tb["bias"] is not None else tb["lut"], B, H, out, tb["N"], tb["K"],
         rw.stride(0), scaling,
         TOP_K = top_k, DENSE_RW = dense_rw, BLOCKSIZE = tb["blocksize"], BLOCKSIZE2 = tb["blocksize2"],
-        NESTED = tb["nested"], HAS_BIAS = tb["bias"] is not None, HAS_LORA = lora is not None, R = r,
+        NESTED = tb["nested"], BIAS_KIND = tb["bias_kind"], HAS_LORA = lora is not None, R = r,
         R_PAD = triton.next_power_of_2(r), BLOCK_N = 4, BLOCK_K = _block_k(tb["K"], tb["blocksize"]),
         num_warps = 4,
     )
     return out
 
 
-def _tb(w, a, a2, c2, off, lut, bias, N, K, blocksize, blocksize2, nested):
+def _tb(w, a, a2, c2, off, lut, bias, N, K, blocksize, blocksize2, nested, bias_kind):
     return dict(w = w, a = a, a2 = a2, c2 = c2, off = off, lut = lut, bias = bias, N = N, K = K,
-                blocksize = blocksize, blocksize2 = blocksize2, nested = nested)
+                blocksize = blocksize, blocksize2 = blocksize2, nested = nested, bias_kind = bias_kind)
 
 
 if triton is not None:
@@ -249,17 +260,17 @@ if triton is not None:
     def _gate_up_op(
         x: torch.Tensor, idx: torch.Tensor, w: torch.Tensor, a: torch.Tensor, a2: torch.Tensor,
         c2: torch.Tensor, off: torch.Tensor, lut: torch.Tensor, bias: Optional[torch.Tensor],
-        N: int, K: int, blocksize: int, blocksize2: int, nested: bool, top_k: int,
+        N: int, K: int, blocksize: int, blocksize2: int, nested: bool, bias_kind: int, top_k: int,
         lora_b: Optional[torch.Tensor], lora_h: Optional[torch.Tensor], scaling: float,
         alpha: float, limit: float,
     ) -> torch.Tensor:
-        tb = _tb(w, a, a2, c2, off, lut, bias, N, K, blocksize, blocksize2, nested)
+        tb = _tb(w, a, a2, c2, off, lut, bias, N, K, blocksize, blocksize2, nested, bias_kind)
         lora = None if lora_b is None else (lora_b, lora_h, scaling)
         out = torch.empty((idx.numel(), N // 2), dtype = torch.float32, device = x.device)
         return _gate_up(_routed_gate_up_kernel, x, idx, tb, top_k, lora, alpha, limit, out)
 
     @_gate_up_op.register_fake
-    def _(x, idx, w, a, a2, c2, off, lut, bias, N, K, blocksize, blocksize2, nested, top_k,
+    def _(x, idx, w, a, a2, c2, off, lut, bias, N, K, blocksize, blocksize2, nested, bias_kind, top_k,
           lora_b, lora_h, scaling, alpha, limit):
         return x.new_empty((idx.numel(), N // 2), dtype = torch.float32)
 
@@ -268,23 +279,23 @@ if triton is not None:
         x: torch.Tensor, idx: torch.Tensor, rw: torch.Tensor, dense_rw: bool, w: torch.Tensor,
         a: torch.Tensor, a2: torch.Tensor, c2: torch.Tensor, off: torch.Tensor, lut: torch.Tensor,
         bias: Optional[torch.Tensor], N: int, K: int, blocksize: int, blocksize2: int, nested: bool,
-        top_k: int, lora_b: Optional[torch.Tensor], lora_h: Optional[torch.Tensor], scaling: float,
+        bias_kind: int, top_k: int, lora_b: Optional[torch.Tensor], lora_h: Optional[torch.Tensor], scaling: float,
         out_dtype: torch.dtype,
     ) -> torch.Tensor:
-        tb = _tb(w, a, a2, c2, off, lut, bias, N, K, blocksize, blocksize2, nested)
+        tb = _tb(w, a, a2, c2, off, lut, bias, N, K, blocksize, blocksize2, nested, bias_kind)
         lora = None if lora_b is None else (lora_b, lora_h, scaling)
         out = torch.empty((idx.numel() // top_k, N), dtype = out_dtype, device = x.device)
         return _down(_routed_down_kernel, x, idx, rw, dense_rw, tb, top_k, lora, out)
 
     @_down_op.register_fake
     def _(x, idx, rw, dense_rw, w, a, a2, c2, off, lut, bias, N, K, blocksize, blocksize2, nested,
-          top_k, lora_b, lora_h, scaling, out_dtype):
+          bias_kind, top_k, lora_b, lora_h, scaling, out_dtype):
         return x.new_empty((idx.numel() // top_k, N), dtype = out_dtype)
 
 
 def _table_args(tb):
     return (tb["w"], tb["a"], tb["a2"], tb["c2"], tb["off"], tb["lut"], tb["bias"],
-            tb["N"], tb["K"], tb["blocksize"], tb["blocksize2"], tb["nested"])
+            tb["N"], tb["K"], tb["blocksize"], tb["blocksize2"], tb["nested"], tb["bias_kind"])
 
 
 def routed_gate_up(x, idx, tb, top_k, alpha, limit, lora = None):
@@ -315,6 +326,9 @@ def _base_linear4bit(module):
     if weight is None or getattr(weight, "quant_state", None) is None:
         return None
     return base
+
+
+_BIAS_KINDS = {torch.float32: 1, torch.bfloat16: 2, torch.float16: 3}
 
 
 def _build_table(projs, device):
@@ -353,19 +367,23 @@ def _build_table(projs, device):
             return None
     if K % q0.blocksize != 0 or q0.blocksize not in (32, 64, 128, 256, 512, 1024):
         return None
-    if all(b is None for b in biases):
-        bias = None
-    elif any(b is None or b.requires_grad for b in biases):
-        # The stacked bias is a one-time copy; a trainable bias would go stale.
-        return None
-    else:
-        bias = torch.stack([b.detach() for b in biases]).contiguous()
     as_i64 = lambda v: torch.tensor(v, dtype = torch.int64, device = device)
+    bias, bias_kind = None, 0
+    if any(b is not None for b in biases):
+        b0 = biases[0]
+        if any(
+            b is None or b.dtype != b0.dtype or b.device != device or b.shape != (N,) or not b.is_contiguous()
+            for b in biases
+        ) or b0.dtype not in _BIAS_KINDS:
+            return None
+        # Pointers to each expert's live bias, not a stacked copy: load_state_dict and other
+        # in-place updates are seen without a rebuild.
+        bias, bias_kind = as_i64([b.data_ptr() for b in biases]), _BIAS_KINDS[b0.dtype]
     return {
         "w": as_i64(w), "a": as_i64(a), "a2": as_i64(a2), "c2": as_i64(c2),
         "off": torch.tensor(off, dtype = torch.float32, device = device),
         "lut": q0.code.to(device = device, dtype = torch.float32).contiguous(),
-        "bias": bias, "N": N, "K": K, "blocksize": int(q0.blocksize),
+        "bias": bias, "bias_kind": bias_kind, "N": N, "K": K, "blocksize": int(q0.blocksize),
         "blocksize2": int(q0.state2.blocksize) if nested else 1, "nested": nested,
     }
 
@@ -373,7 +391,9 @@ def _build_table(projs, device):
 def _key(projs):
     # A moved, reloaded or replaced expert changes its packed buffer's address. Checking the
     # first and last of each list keeps the per-call cost to a few us.
-    return tuple(_base_linear4bit(p).weight.data_ptr() for p in (projs[0], projs[-1]))
+    ends = [_base_linear4bit(p) for p in (projs[0], projs[-1])]
+    return tuple(b.weight.data_ptr() for b in ends) + tuple(
+        b.bias.data_ptr() if b.bias is not None else 0 for b in ends)
 
 
 def prepare_routed_experts(experts):

@@ -214,6 +214,22 @@ def test_lora_update_is_not_stale():
     torch.testing.assert_close(after.double(), ref, rtol = 1e-4, atol = 1e-4)
 
 
+def test_inplace_bias_update_is_not_stale():
+    # load_state_dict copies into frozen expert biases in place; the next routed call must see it.
+    ex = _Experts(True).eval()
+    x = torch.randn(1, 2, H, device = "cuda", dtype = torch.float32)
+    idx, w = _routing(2, seed = 5)
+    with torch.no_grad():
+        before = routed_experts_forward(ex, x, idx, w)
+        for name, p in ex.named_parameters():
+            if name.endswith("bias"):
+                p.add_(0.25)
+        after = routed_experts_forward(ex, x, idx, w)
+        ref = _reference(ex, x, idx, w)
+    assert not torch.allclose(before, after)
+    torch.testing.assert_close(after.double(), ref, rtol = 1e-4, atol = 1e-4)
+
+
 def test_lora_storage_swap_is_not_stale():
     # Module.to() swaps .data without bumping _version; the cached stacks must follow it.
     ex = _lora_wrap(_Experts(True)).eval()

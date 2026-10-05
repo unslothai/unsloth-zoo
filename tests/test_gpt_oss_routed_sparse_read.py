@@ -131,11 +131,10 @@ def test_nf4_reads_only_routed_experts(compiled, nested, lora):
                     qs.state2.absmax.fill_(float("nan"))
                 else:
                     qs.absmax.fill_(float("nan"))
+                base.bias.fill_(float("nan"))
                 if lora:
                     proj.lora_A["default"].weight.fill_(float("nan"))
                     proj.lora_B["default"].weight.fill_(float("nan"))
-        state["gate_up"]["bias"][un] = float("nan")
-        state["down"]["bias"][un] = float("nan")
         assert R.prepare_routed_experts(ex) is state  # same buffers: the tables stay valid
         after = fn(x, idx, dense)
         assert torch.isfinite(before).all()
