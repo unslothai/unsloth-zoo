@@ -46,6 +46,12 @@ from . import nax
 logger = logging.getLogger(__name__)
 
 
+def _fusion_modules(model, modules):
+    return modules if modules is not None else (
+        model.named_modules() if hasattr(model, "named_modules") else ()
+    )
+
+
 # Pin the upstream function bodies the fusions read, rewrite or reimplement, since a fusion
 # mirroring an upstream body would compute the old arithmetic once that body changes.
 _ALIASES = (("mx", mx), ("nn", nn))
@@ -327,7 +333,7 @@ def _uncached_allocations():
 
 
 @contextmanager
-def fused_moe_gate_up(model):
+def fused_moe_gate_up(model, *, _modules = None):
     """Fuse quantized MoE gate and up projections while their weights stay fixed.
 
     Repacking at entry makes weight edits between scopes visible. Overlapping scopes
@@ -338,7 +344,7 @@ def fused_moe_gate_up(model):
         with _MOE_GATE_UP_LOCK, _uncached_allocations():
             if not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
                 specs = _moe_switch_specs()
-                modules = model.named_modules() if hasattr(model, "named_modules") else ()
+                modules = _fusion_modules(model, _modules)
                 for _, module in modules:
                     packed = getattr(module, "_unsloth_moe_gate_up", None)
                     if (isinstance(packed, _PackedMoEGateUp)
@@ -587,7 +593,7 @@ def _fused_decode_conv_class(base, call, prepare, conv, silu):
 
 
 @contextmanager
-def fused_decode_conv_silu(model):
+def fused_decode_conv_silu(model, *, _modules = None):
     """Fuse the recurrent decode conv window, convolution, SiLU and q/k/v split into one launch during serialized inference.
 
     Prefill, unsupported convolution shapes, and training keep their native paths.
@@ -596,7 +602,7 @@ def fused_decode_conv_silu(model):
     changed = []
     specs = {}
     try:
-        modules = model.named_modules() if hasattr(model, "named_modules") else ()
+        modules = _fusion_modules(model, _modules)
         if not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
             for _, module in modules:
                 base = type(module)
@@ -1285,13 +1291,13 @@ def _prenorm_class(base):
 _RESIDUAL_NORM_LOCK = RLock()
 
 @contextmanager
-def fused_residual_norm(model):
+def fused_residual_norm(model, *, _modules = None):
     """Fuse eligible single-row RMS normalization and residual additions during inference."""
     patched = []
     try:
         with _RESIDUAL_NORM_LOCK:
             if not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None) and _residual_norm_kernel() is not None:
-                for _, module in model.named_modules() if hasattr(model, "named_modules") else ():
+                for _, module in _fusion_modules(model, _modules):
                     base = type(module)
                     # Type first, for the reason fused_decode_conv_silu gives: generation enters
                     # this scope for whatever named_modules() yields, including plain stand-ins
@@ -1315,7 +1321,7 @@ def fused_residual_norm(model):
 
 
 @contextmanager
-def fused_residual_norm_handoff(model):
+def fused_residual_norm_handoff(model, *, _modules = None):
     """Hand each pre-norm decoder layer's output, normalized, to the next layer during inference.
 
     A layer whose `h = a + b` feeds one RMS norm and whose output is `h + E` adds both residuals
@@ -1328,7 +1334,7 @@ def fused_residual_norm_handoff(model):
     try:
         with _RESIDUAL_NORM_LOCK:
             if not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None) and mx.metal.is_available():
-                for _, module in model.named_modules() if hasattr(model, "named_modules") else ():
+                for _, module in _fusion_modules(model, _modules):
                     base = type(module)
                     # Type first, as in fused_residual_norm: named_modules() may yield plain stand-ins.
                     if not isinstance(module, dict) or module.training:
@@ -1350,7 +1356,7 @@ def fused_residual_norm_handoff(model):
                         module._unsloth_handoff_native = base
                         module._unsloth_handoff_scopes = 1
                         fresh.add(id(module))
-                for module in (module for _, module in model.named_modules()) if fresh else ():
+                for module in (module for _, module in _fusion_modules(model, _modules)) if fresh else ():
                     layers = module.get("layers") if isinstance(module, dict) else None
                     if not isinstance(layers, list):
                         continue
@@ -2576,7 +2582,7 @@ def _moe_router_class(base):
 _MOE_ROUTER_LOCK = RLock()
 
 @contextmanager
-def fused_moe_router(model):
+def fused_moe_router(model, *, _modules = None):
     """Fuse the MoE routing chain into one Metal dispatch during serialized inference.
 
     Modules whose routing body, expert count, or top-k the kernel does not cover keep
@@ -2595,7 +2601,7 @@ def fused_moe_router(model):
     changed = []
     try:
         with _MOE_ROUTER_LOCK:
-            modules = model.named_modules() if hasattr(model, "named_modules") else ()
+            modules = _fusion_modules(model, _modules)
             if (not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)
                     and _moe_router_kernel() is not None):
                 for _, module in modules:
@@ -2638,7 +2644,7 @@ def fused_moe_router(model):
 
 
 @contextmanager
-def fused_moe_routed_experts(model):
+def fused_moe_routed_experts(model, *, _modules = None):
     """Run Qwen sparse MoE blocks' routed experts on two decode kernels during serialized inference.
 
     Gate/up with SwiGLU, and down with the routing-weight combine and shared-expert add, serve
@@ -2651,7 +2657,7 @@ def fused_moe_routed_experts(model):
     changed = []
     try:
         with _MOE_ROUTER_LOCK:
-            modules = model.named_modules() if hasattr(model, "named_modules") else ()
+            modules = _fusion_modules(model, _modules)
             if (os.environ.get("UNSLOTH_MLX_ROUTED_EXPERTS", "1") != "0"
                     and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)
                     and _moe_router_kernel() is not None):
@@ -3046,7 +3052,7 @@ def _int8_prefill_status(projections):
 
 
 @contextmanager
-def nax_quantized_linear(model, int8_prefill = None):
+def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
     """Run affine quantized projections on the M5 neural accelerators where measured faster.
 
     Quantized linears and tied quantized embedding heads called with the row counts measured
@@ -3079,7 +3085,7 @@ def nax_quantized_linear(model, int8_prefill = None):
                 switches = _nax_int8_prefill_switch_classes() if int8_prefill else {}
                 packed = _nax_int8_prefill_packed(model) if int8_prefill else set()
                 nested, fresh, seen = [], [], set()
-                for _, module in model.named_modules() if hasattr(model, "named_modules") else ():
+                for _, module in _fusion_modules(model, _modules):
                     if id(module) in seen:   # named_modules() yields a shared module once per path
                         continue
                     seen.add(id(module))
