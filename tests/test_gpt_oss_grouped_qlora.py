@@ -347,7 +347,7 @@ def test_fallback_sees_replaced_nested_absmax(monkeypatch):
 
 @needs_grouped_mm
 @pytest.mark.parametrize("kernel", ["1", "0"])
-@pytest.mark.parametrize("edit", ["absmax", "state2_absmax", "offset"])
+@pytest.mark.parametrize("edit", ["absmax", "state2_absmax", "offset", "code"])
 def test_in_place_quant_edit_is_not_stale(kernel, edit, monkeypatch):
     monkeypatch.setenv("UNSLOTH_MOE_TRITON_KERNELS", kernel)
     ex = _Experts(True).train()
@@ -361,11 +361,14 @@ def test_in_place_quant_edit_is_not_stale(kernel, edit, monkeypatch):
             qs.absmax.add_(1)   # nested: the uint8 codes index state2.code
         elif edit == "state2_absmax":
             qs.state2.absmax.mul_(1.5)
-        else:
+        elif edit == "offset":
             qs.offset.add_(0.05)
+        else:
+            qs.code = qs.code.flip(0)
     out, _, delta = _run(ex, x, idx, w, True, monkeypatch)
     ref, _, _ = _run(ex, x, idx, w, False, monkeypatch)
-    assert delta["forward"] == 1 and _rel(out, ref) < 2e-2
+    # A codebook differing from the other experts' must send the layer back to the loop.
+    assert delta["forward"] == (0 if edit == "code" else 1) and _rel(out, ref) < 2e-2
 
 
 @needs_grouped_mm

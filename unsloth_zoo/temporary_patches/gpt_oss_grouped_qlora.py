@@ -248,6 +248,8 @@ def ready_signature(experts):
                 out.append(len(projs))
                 for p in projs:
                     _proj_signature(p, out)
+                    # Readiness validates the quant format, so quant edits must re-run it too.
+                    out.append(_quant_key(getattr(p, "base_layer", p).weight))
     except Exception:
         return None
     return tuple(out)
@@ -280,7 +282,7 @@ def _tensor_key(t):
 
 def _quant_key(weight):
     qs = weight.quant_state
-    key = (weight.data_ptr(), _tensor_key(qs.absmax))
+    key = (weight.data_ptr(), _tensor_key(qs.absmax), _tensor_key(qs.code))
     if getattr(qs, "nested", False):
         key += (_tensor_key(qs.state2.absmax), _tensor_key(qs.state2.code), _tensor_key(qs.offset))
     return key
