@@ -210,6 +210,8 @@ def _load_lora_from_disk(monkeypatch, tmp_path, names):
         "base_model.model.model.language_model.layers.0.experts.base_layer.lora_A.weight": torch.ones(2, 3),
         "base_model.model.model.language_model.layers.0.experts.lora_B.weight": torch.full((4, 2), 2.0),
         "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_A.weight": torch.full((2, 3), 3.0),
+        "base_model.model.model.language_model.embed_tokens.lora_embedding_A": torch.full((2, 5), 4.0),
+        "base_model.model.model.language_model.embed_tokens.lora_embedding_B": torch.full((3, 2), 5.0),
     }, str(tmp_path / "adapter_model.safetensors"))
     checked = {}
     monkeypatch.setattr(vu, "_check_lora_is_servable",
@@ -235,6 +237,9 @@ def test_a_saved_gemma4_adapter_is_remapped_on_the_default_path(monkeypatch, tmp
         "base_model.model.model.language_model.layers.0.moe.experts.base_layer.lora_A.weight",
         "base_model.model.model.language_model.layers.0.moe.experts.lora_B.weight",
         "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_A.weight",
+        # Embedding LoRA is not renamed, but must not be dropped from the request either.
+        "base_model.model.model.language_model.embed_tokens.lora_embedding_A",
+        "base_model.model.model.language_model.embed_tokens.lora_embedding_B",
     }
     assert request.path is None and request.lora_config == "PEFT_CONFIG"
     assert set(request.lora_tensors) == expected

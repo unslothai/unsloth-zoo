@@ -4034,7 +4034,7 @@ def _saved_adapter_lora_keys(save_directory):
 
 
 def _saved_adapter_lora_tensors(save_directory):
-    """The LoRA tensors of a saved PEFT adapter, keyed as on disk.
+    """The tensors of a saved PEFT adapter, keyed as on disk.
 
     Only read when `load_lora`'s path branch must rename keys before vLLM sees them, so the
     common path-loaded adapter still costs no tensor IO.
@@ -4047,7 +4047,8 @@ def _saved_adapter_lora_tensors(save_directory):
     else:
         bin_path = os.path.join(save_directory, "adapter_model.bin")
         state_dict = torch.load(bin_path, map_location = "cpu", weights_only = True)
-    return {k: v for k, v in state_dict.items() if ".lora_A." in k or ".lora_B." in k}
+    # Everything, as vLLM's from_local_checkpoint passes it: lora_embedding_A / _B included.
+    return state_dict
 
 
 def _saved_adapter_expert_lora_keys(save_directory):
