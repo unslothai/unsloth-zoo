@@ -19,7 +19,9 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import json
+import random
 import shutil
 from types import SimpleNamespace
 
@@ -35,12 +37,23 @@ from mlx_simulation import mlx_is_simulated  # noqa: E402
 if mlx_is_simulated():
     pytest.skip("needs real MLX: mx.fast attention and RoPE", allow_module_level = True)
 
-from mlx.nn import Embedding, LayerNorm, Linear, quantize  # noqa: E402
+from mlx.nn import Dropout, Embedding, LayerNorm, Linear, quantize  # noqa: E402
 from mlx.utils import tree_flatten, tree_map  # noqa: E402
 from safetensors.torch import load_file, save_file  # noqa: E402
 
 from unsloth_zoo.mlx.decision import _KevModel, _LabelModel, _merge_lora, load_decision_model, save_decision_model  # noqa: E402
+from unsloth_zoo.mlx.decision_trainer import (  # noqa: E402
+    MLXDecisionTrainer,
+    _LayerwiseStep,
+    _length_grouped_batches,
+    _planned_lengths,
+    _soft_cross_entropy,
+    add_lora_adapters,
+    collate_decisions,
+    load_trainable_decision_model,
+)
 from unsloth_zoo.mlx.generate import generation_mode  # noqa: E402
+from unsloth_zoo.mlx.trainer import MLXTrainingConfig  # noqa: E402
 from unsloth_zoo.mlx.utils import _forward_text_hidden_states  # noqa: E402
 
 
@@ -459,3 +472,200 @@ def test_save_refuses_weights_float16_cannot_hold(checkpoint, tmp_path, bad):
     with pytest.raises(ValueError, match = "type_emb.weight"):
         save_decision_model(model, tmp_path, checkpoint[1])
     assert not (tmp_path / "rl_agent_config.json").exists()
+
+
+def _items():
+    rng = np.random.default_rng(1)
+    rows = [(30, [3, 17, 26], 0), (11, [2, 9], 2), (20, [4, 12, 18], 1), (25, [5, 21], 2), (16, [3, 8, 14], 0), (28, [6, 19], 1)]
+    return [
+        {"input_ids": rng.integers(1, 97, length).tolist(), "markers": markers, "qtype": qtype, "target": rng.dirichlet(np.ones(len(markers))).tolist()}
+        for length, markers, qtype in rows
+    ]
+
+
+def _config(**kwargs):
+    defaults = dict(per_device_train_batch_size = 2, gradient_accumulation_steps = 2, num_train_epochs = 2, max_steps = 0, learning_rate = 1e-3, weight_decay = 0.1, lr_scheduler_type = "constant", warmup_steps = 0, max_grad_norm = 1.0)
+    return MLXTrainingConfig(**{**defaults, **kwargs})
+
+
+def _without_dropout(model):
+    for module in model.modules():
+        if isinstance(module, Dropout):
+            module._p_1 = 1.0
+    return model
+
+
+def _parameters(model):
+    return {name: np.array(value) for name, value in tree_flatten(model.parameters())}
+
+
+def test_training_forward_matches_eval_until_dropout_applies(checkpoint):
+    model = load_trainable_decision_model(checkpoint[1], full_finetuning = True)
+    batch = collate_decisions(_items(), 0)
+    batch.pop("target")
+    model.eval()
+    want = np.array(model(**batch))
+    model.train()
+    dropped = np.array(model(**batch))
+    np.testing.assert_allclose(np.array(_without_dropout(model)(**batch)), want, atol = 1e-4)
+    if model.head.layers:
+        assert np.abs(dropped - want)[np.array(batch["marker_mask"])].min() > 1e-4
+
+
+@pytest.mark.parametrize("gradient_checkpointing", [True, False])
+def test_two_training_steps_match_torch_adamw(checkpoint, gradient_checkpointing):
+    reference, folder = checkpoint
+    # One epoch of three pairs at accumulation 2: a full step, then a step from the odd micro-batch alone.
+    items = _items()
+    order = _length_grouped_batches([len(item["input_ids"]) for item in items], 2, random.Random(3407))
+    torch_model = copy.deepcopy(reference).train()
+    torch_model.encoder.config.reference_compile = False
+    norms = {f"{n}.{p}" for n, m in torch_model.named_modules() if isinstance(m, torch.nn.LayerNorm) for p, _ in m.named_parameters()}
+    groups = {}
+    for name, param in torch_model.named_parameters():
+        groups.setdefault((name.startswith("encoder."), name not in norms and "bias" not in name), []).append(param)
+    optimizer = torch.optim.AdamW(
+        [{"params": params, "lr": 1e-3 if encoder else 3e-4, "weight_decay": 0.1 if decay else 0.0} for (encoder, decay), params in groups.items()],
+        betas = (0.8, 0.95), eps = 1e-6,
+    )
+    steps = []
+    for rows in (order[0] + order[1], order[2]):
+        batch = {k: torch.from_numpy(np.array(v)) for k, v in collate_decisions([items[i] for i in rows], 0).items()}
+        target = batch.pop("target")
+        optimizer.zero_grad()
+        loss = -(target * torch.log_softmax(torch_model(**batch), -1)).sum(-1).mean()
+        loss.backward()
+        steps.append((loss.item(), torch.nn.utils.clip_grad_norm_(torch_model.parameters(), 1.0).item()))
+        optimizer.step()
+
+    model = _without_dropout(load_trainable_decision_model(folder, full_finetuning = True, gradient_checkpointing = gradient_checkpointing))
+    recorder = _Recorder()
+    args = _config(num_train_epochs = 1, adam_beta1 = 0.8, adam_beta2 = 0.95, adam_epsilon = 1e-6)
+    MLXDecisionTrainer(model, args, items, head_learning_rate = 3e-4, callbacks = [recorder]).train()
+    np.testing.assert_allclose([(log["loss"], log["grad_norm"]) for log in recorder.logs[:2]], steps, rtol = 2e-3)
+    got, want = _parameters(model), torch_model.state_dict()
+    for name in ("encoder.layers.1.attn.Wqkv.weight", "encoder.layers.1.mlp_norm.weight", "scorer.0.weight", "scorer.1.weight", "scorer.1.bias", "type_emb.weight"):
+        # Adam's first steps are about one learning rate per element whatever the gradient's size.
+        assert (np.abs(got[name] - want[name].numpy()) > 3e-5).mean() < 0.01, name
+
+
+def test_lora_adapters_target_encoder_linears_and_merge_on_save(checkpoint, tmp_path):
+    _, folder = checkpoint
+    model = add_lora_adapters(load_trainable_decision_model(folder), r = 4, lora_alpha = 8, target_modules = ["Wqkv", "mlp.Wo"])
+    trainable = {name for name, _ in tree_flatten(model.trainable_parameters())}
+    adapters = {f"encoder.layers.{i}.{path}.{half}" for i in range(4) for path in ("attn.Wqkv", "mlp.Wo") for half in ("lora_a", "lora_b")}
+    assert trainable == adapters | {name for name in _parameters(model) if not name.startswith("encoder.")}
+    with pytest.raises(RuntimeError, match = "already"):
+        add_lora_adapters(model)
+    with pytest.raises(ValueError, match = "matches no"):
+        add_lora_adapters(load_trainable_decision_model(folder), target_modules = ["Wxyz"])
+
+    for module in model.modules():
+        if "lora_b" in module:
+            module.lora_b = mx.random.normal(module.lora_b.shape) * 0.1
+    adapter = model.encoder.layers[3].mlp.Wo
+    merged = np.array(adapter.linear.weight).astype(np.float32) + 2.0 * (np.array(adapter.lora_b).T @ np.array(adapter.lora_a).T)
+    save_decision_model(model, tmp_path, folder)
+    saved = load_file(tmp_path / "model.safetensors")
+    np.testing.assert_allclose(saved["encoder.layers.3.mlp.Wo.weight"].float().numpy(), merged, atol = 2e-3)
+    assert saved.keys() == load_file(folder / "model.safetensors").keys()
+    assert {name for name, _ in tree_flatten(model.trainable_parameters())} == trainable
+    model.eval()
+    np.testing.assert_allclose(load_decision_model(tmp_path, compute_dtype = mx.float16).logits(_batch()), model.logits(_batch()), atol = 5e-2)
+
+
+@pytest.mark.parametrize("target_modules", ["all-linear", r"layers\.0\.attn\.Wqkv"])
+def test_layerwise_gradients_match_one_graph_under_dropout(checkpoint, target_modules):
+    import mlx.nn as nn
+
+    # With one early adapter, the frozen layers after it must still pass the gradient down.
+    model = add_lora_adapters(load_trainable_decision_model(checkpoint[1]), r = 4, lora_dropout = 0.3, target_modules = target_modules)
+    batch = collate_decisions(_items(), 0)
+    mx.random.seed(7)
+    want_loss, want = nn.value_and_grad(model, _soft_cross_entropy)(model, batch)
+    key = mx.random.state[0].tolist()
+    for compile in (False, True):
+        mx.random.seed(7)
+        loss, got = _LayerwiseStep(model, compile)(batch)
+        assert abs(loss.item() - want_loss.item()) < 1e-3 and mx.random.state[0].tolist() == key
+        want_flat = dict(tree_flatten(want))
+        assert {name for name, _ in tree_flatten(got)} == set(want_flat)
+        for name, value in tree_flatten(got):
+            # float16 noise flips the odd ReLU unit; other dropout masks would change most elements.
+            reference = np.array(want_flat[name])
+            assert (np.abs(np.array(value) - reference) > 1e-3 + 0.05 * np.abs(reference)).mean() < 0.05, name
+
+
+def test_planned_lengths_merge_nearby_widths():
+    shapes = [(8, width) for width in range(100, 500, 3)] + [(3, 77)]
+    length = _planned_lengths(shapes)
+    padded = {(rows, length(rows, width)) for rows, width in shapes}
+    assert all(length(rows, width) >= width for rows, width in shapes) and (3, 77) in padded
+    assert len(padded) <= 33 and length(8, 499) == 499
+
+
+class _Recorder:
+    def __init__(self, stop_at = None):
+        self.logs, self.events, self.stop_at = [], [], stop_at
+
+    def on_log(self, args, state, control, logs = None, **kwargs):
+        self.logs.append(logs)
+
+    def on_step_end(self, args, state, control, **kwargs):
+        control.should_training_stop = state.global_step == self.stop_at
+
+    def on_train_end(self, args, state, control, **kwargs):
+        self.events.append("end")
+
+
+@pytest.mark.parametrize("encoder_lr, head_lr", [(1e-2, 0.0), (0.0, 1e-2)])
+def test_trainer_steps_logs_and_separates_learning_rates(checkpoint, encoder_lr, head_lr):
+    model = add_lora_adapters(load_trainable_decision_model(checkpoint[1]), r = 4)
+    before, recorder = _parameters(model), _Recorder()
+    args = _config(learning_rate = encoder_lr, lr_scheduler_type = "linear")
+    trainer = MLXDecisionTrainer(model, args, _items(), _items()[:3], head_learning_rate = head_lr, callbacks = [recorder])
+    trainer.train()
+    # Six items in pairs is three micro-batches: an epoch is one full step and one step for the odd micro-batch.
+    assert trainer.state.global_step == 4 and recorder.events == ["end"]
+    steps = [log for log in recorder.logs if "loss" in log]
+    np.testing.assert_allclose([log["learning_rate"] for log in steps], [encoder_lr * (1 - i / 4) for i in range(4)], rtol = 1e-5)
+    evals = [log["eval_loss"] for log in recorder.logs if "eval_loss" in log]
+    model.eval()
+    assert len(evals) == 2 and abs(evals[-1] - _soft_cross_entropy(model, collate_decisions(_items()[:3], 0)).item()) < 1e-3
+    changed = {name for name, value in _parameters(model).items() if not np.array_equal(value, before[name])}
+    assert changed == {name for name, _ in tree_flatten(model.trainable_parameters()) if name.startswith("encoder.") == (encoder_lr > 0)}
+
+
+def test_trainer_takes_datasets_and_fractional_intervals(checkpoint):
+    from datasets import Dataset
+
+    recorder = _Recorder()
+    args = _config(eval_steps = 0.5, logging_steps = 0.5)
+    data = Dataset.from_list(_items())
+    MLXDecisionTrainer(load_trainable_decision_model(checkpoint[1]), args, data, data.select(range(3)), callbacks = [recorder]).train()
+    assert [("eval_loss" in log, round(log["epoch"], 2)) for log in recorder.logs[:4]] == [(False, 1.0), (True, 1.0), (False, 2.0), (True, 2.0)]
+
+
+def test_trainer_stops_on_request_and_refuses_other_optimizers(checkpoint):
+    model = load_trainable_decision_model(checkpoint[1])
+    recorder = _Recorder(stop_at = 1)
+    trainer = MLXDecisionTrainer(model, _config(), _items(), callbacks = [recorder])
+    limit = mx.set_cache_limit(123 << 20)
+    trainer.train()
+    assert mx.set_cache_limit(limit) == 123 << 20
+    assert trainer.state.global_step == 1 and recorder.events == ["end"]
+    seen = []
+    trainer = MLXDecisionTrainer(model, _config(cache_limit_gb = 0), _items())
+    trainer._event = lambda *args, **kwargs: seen.append(mx.set_cache_limit(123 << 20))
+    limit = mx.set_cache_limit(123 << 20)
+    trainer.train()
+    assert {*seen, mx.set_cache_limit(limit)} == {123 << 20}
+    with pytest.raises(NotImplementedError, match = "sgd"):
+        MLXDecisionTrainer(model, _config(optim = "sgd"), _items()).train()
+
+
+def test_length_grouped_batches_cover_every_item_longest_first():
+    lengths = [5, 40, 12, 33, 7, 21, 9, 18, 3]
+    batches = _length_grouped_batches(lengths, 2, random.Random(0))
+    assert sorted(i for batch in batches for i in batch) == list(range(9))
+    assert 1 in batches[0] and [len(batch) for batch in batches] == [2, 2, 2, 2, 1]

@@ -142,10 +142,13 @@ class _Encoder(nn.Module):
             config["hidden_size"], eps = config.get("norm_eps", 1e-5), bias = config.get("norm_bias", False)
         )
 
-    def __call__(self, input_ids, keys):
-        positions = mx.arange(input_ids.shape[1])
+    def masks(self, keys):
+        positions = mx.arange(keys.shape[-1])
         near = mx.abs(positions[:, None] - positions[None, :]) <= self.window
-        masks = {"full_attention": keys, "sliding_attention": keys & near}
+        return {"full_attention": keys, "sliding_attention": keys & near}
+
+    def __call__(self, input_ids, keys):
+        masks = self.masks(keys)
         x = self.embeddings(input_ids)
         for layer in self.layers:
             x = layer(x, masks[layer.layer_type])
@@ -153,11 +156,12 @@ class _Encoder(nn.Module):
 
 
 class _HeadAttention(nn.Module):
-    def __init__(self, dims, heads):
+    def __init__(self, dims, heads, dropout):
         super().__init__()
         self.heads = heads
         self.in_proj = _Linear(dims, 3 * dims)
         self.out_proj = _Linear(dims, dims)
+        self.dropout = nn.Dropout(dropout)
 
     def __call__(self, x, mask, rows = None):
         B, _, D = x.shape
@@ -165,15 +169,22 @@ class _HeadAttention(nn.Module):
         if rows is not None:
             q = _gather_rows(q, rows)
         q, k, v = (t.reshape(B, t.shape[1], self.heads, -1).transpose(0, 2, 1, 3) for t in (q, k, v))
-        out = mx.fast.scaled_dot_product_attention(q, k, v, scale = q.shape[-1]**-0.5, mask = mask)
+        scale = q.shape[-1]**-0.5
+        if self.training:
+            # The fused attention cannot drop attention weights, which torch does in training.
+            weights = mx.softmax(mx.where(mask, (q * scale) @ k.swapaxes(-1, -2), -mx.inf), axis = -1)
+            out = self.dropout(weights) @ v
+        else:
+            out = mx.fast.scaled_dot_product_attention(q, k, v, scale = scale, mask = mask)
         return self.out_proj(out.transpose(0, 2, 1, 3).reshape(B, -1, D))
 
 
 class _HeadLayer(nn.Module):
     # torch.nn.TransformerEncoderLayer(norm_first = True) with its default ReLU feed-forward.
-    def __init__(self, dims, heads):
+    def __init__(self, dims, heads, dropout):
         super().__init__()
-        self.self_attn = _HeadAttention(dims, heads)
+        self.self_attn = _HeadAttention(dims, heads, dropout)
+        self.dropout = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(dims)
         self.norm2 = nn.LayerNorm(dims)
         self.linear1 = _Linear(dims, 4 * dims)
@@ -181,31 +192,35 @@ class _HeadLayer(nn.Module):
 
     def __call__(self, x, mask, rows = None):
         # `rows`: queries and feed-forward only at those rows (the scored markers); keys and values span every token.
-        attended = self.self_attn(self.norm1(x), mask, rows)
+        attended = self.dropout(self.self_attn(self.norm1(x), mask, rows))
         x = (x if rows is None else _gather_rows(x, rows)) + attended
-        return x + self.linear2(nn.relu(self.linear1(self.norm2(x))))
+        return x + self.dropout(self.linear2(self.dropout(nn.relu(self.linear1(self.norm2(x))))))
 
 
 class _Head(nn.Module):
-    def __init__(self, dims, count):
+    def __init__(self, dims, count, dropout):
         super().__init__()
-        self.layers = [_HeadLayer(dims, max(1, dims // 64)) for _ in range(count)]
+        self.layers = [_HeadLayer(dims, max(1, dims // 64), dropout) for _ in range(count)]
 
 
 class DecisionModel(nn.Module):
-    """Upstream `DecisionModel` without the act head. Parameter names follow the checkpoint."""
+    """Upstream `DecisionModel` without the act head. Parameter names follow the checkpoint; `dropout` is the head's and applies only in training."""
 
-    def __init__(self, encoder_config, head_layers):
+    def __init__(self, encoder_config, head_layers, dropout = 0.1):
         super().__init__()
         dims = encoder_config["hidden_size"]
         self.encoder = _Encoder(encoder_config)
-        self.head = _Head(dims, head_layers)
+        self.head = _Head(dims, head_layers, dropout)
         self.type_emb = nn.Embedding(3, dims)
         self.scorer = [nn.LayerNorm(dims), _Linear(dims, dims), nn.GELU(), _Linear(dims, 1)]
 
     def __call__(self, input_ids, attention_mask, marker_pos, marker_mask, qtype):
         keys = attention_mask.astype(mx.bool_)[:, None, None, :]
-        h = self.encoder(input_ids, keys) + self.type_emb(qtype)[:, None, :]
+        return self.decide(self.encoder(input_ids, keys), keys, marker_pos, marker_mask, qtype)
+
+    def decide(self, hidden, keys, marker_pos, marker_mask, qtype):
+        """Decision logits from the encoder's output."""
+        h = hidden + self.type_emb(qtype)[:, None, :]
         layers = self.head.layers
         for layer in layers[:-1]:
             h = layer(h, keys)
@@ -1232,8 +1247,21 @@ def _state_name(name):
     return name.replace(".in_proj.weight", ".in_proj_weight").replace(".in_proj.bias", ".in_proj_bias")
 
 
+def _merged_parameters(model):
+    params = dict(tree_flatten(model.parameters()))
+    for path, module in model.named_modules():
+        if "lora_a" in module:
+            delta = (module.scale * module.lora_b.T) @ module.lora_a.T
+            for name in ("weight", "bias"):
+                if f"{path}.linear.{name}" in params:
+                    params[f"{path}.{name}"] = params.pop(f"{path}.linear.{name}")
+            params[f"{path}.weight"] = params[f"{path}.weight"].astype(mx.float32) + delta
+            del params[f"{path}.lora_a"], params[f"{path}.lora_b"]
+    return params
+
+
 def save_decision_model(model, folder, source, agent_config = None):
-    """Write `model` as a float16 Laya checkpoint in `folder`.
+    """Write `model` as a float16 Laya checkpoint in `folder`, with any LoRA adapters merged into the saved weights.
 
     `source` is the checkpoint `model` was loaded from: it supplies the encoder config, the tokenizer and
     the tensors the MLX model does not hold. `agent_config` replaces its `rl_agent_config.json`.
@@ -1246,7 +1274,7 @@ def save_decision_model(model, folder, source, agent_config = None):
         for name, value in mx.load(str(source / "model.safetensors")).items()
         if name.startswith("act_head.") or name == "temperature"
     }
-    weights.update((_state_name(name), value) for name, value in tree_flatten(model.parameters()))
+    weights.update((_state_name(name), value) for name, value in _merged_parameters(model).items())
     weights = {name: value.astype(mx.float16) for name, value in weights.items()}
     for name, value in weights.items():
         if not mx.isfinite(value).all().item():
