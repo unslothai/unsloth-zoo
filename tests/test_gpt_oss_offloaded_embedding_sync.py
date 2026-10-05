@@ -155,11 +155,25 @@ out = torch.compile(model, backend = "aot_eager")(input_ids = ids, attention_mas
 out.float().sum().backward()
 g = model.embed_tokens.weight.grad
 train_calls = len(calls)
+# Frozen embedding + enable_input_require_grads-style hook: the hook must still run. Dynamo does
+# not convert this training forward on every stack, so trace-time branching is forced instead.
+model.embed_tokens.weight.requires_grad_(False)
+hooked = []
+h = model.embed_tokens.register_forward_hook(lambda m, i, o: hooked.append(1) or o.requires_grad_(True))
+is_compiling = torch.compiler.is_compiling
+torch.compiler.is_compiling = lambda: True
+try:
+    model(input_ids = ids, attention_mask = mask, use_cache = False)
+finally:
+    torch.compiler.is_compiling = is_compiling
+    h.remove()
+frozen_calls = len(calls) - train_calls
+train_calls += frozen_calls
 model.eval()
 torch._dynamo.reset()
 with torch.no_grad():
     torch.compile(model, backend = "aot_eager")(input_ids = ids, attention_mask = mask, use_cache = False)
-print("RESULT", json.dumps({"grad": g is not None and bool(g.abs().sum() > 0), "train_calls": train_calls, "infer_calls": len(calls) - train_calls}))
+print("RESULT", json.dumps({"grad": g is not None and bool(g.abs().sum() > 0), "train_calls": train_calls, "frozen_hooked": len(hooked), "infer_calls": len(calls) - train_calls}))
 """
 
 
@@ -173,4 +187,5 @@ def test_compiled_training_keeps_offloaded_embedding_differentiable():
     assert proc.returncode == 0 and lines, proc.stdout[-2000:] + proc.stderr[-4000:]
     res = json.loads(lines[-1][len("RESULT "):])
     # The lookup op has no backward: compiled training must keep nn.Embedding, inference uses the op.
-    assert res["grad"] and res["train_calls"] == 0 and res["infer_calls"] > 0, res
+    # Frozen-embedding training keeps nn.Embedding too, so enable_input_require_grads' hook runs.
+    assert res["grad"] and res["train_calls"] == 0 and res["frozen_hooked"] > 0 and res["infer_calls"] > 0, res

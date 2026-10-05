@@ -3735,8 +3735,9 @@ def patch_GptOssModel():
                 and _offloaded_embedding is not None
                 and embed_device != input_ids.device
                 and type(self.embed_tokens) is nn.Embedding
-                # The op has no backward: trainable embeddings keep the autograd path.
-                and not (torch.is_grad_enabled() and self.embed_tokens.weight.requires_grad)
+                # Inference only: the op has no backward, and it would skip embed_tokens' forward
+                # hooks (enable_input_require_grads) that frozen-embedding training relies on.
+                and not torch.is_grad_enabled()
             ):
                 inputs_embeds = _offloaded_embedding(input_ids, self.embed_tokens.weight)
             else:
