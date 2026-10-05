@@ -45,8 +45,7 @@ from unsloth_zoo.temporary_patches.moe_utils import _check_torch_grouped_mm_supp
 DT = torch.bfloat16
 E, TOP_K, H, I = 8, 4, 256, 192
 
-# The stacked Triton dequant is CUDA-only (HIP has no libdevice mul_rn); elsewhere the grouped
-# path dequantizes through bitsandbytes, so the counters below expect that instead.
+# The stacked Triton dequant is CUDA-only; elsewhere the grouped path uses bitsandbytes.
 STACKED = gq.stacked_dequant_available(torch.device("cuda", torch.cuda.current_device()))
 needs_stacked = pytest.mark.skipif(not STACKED, reason = "stacked NF4 dequant kernel is CUDA-only")
 
@@ -221,7 +220,6 @@ def test_one_expert_lora_b_moves_output(monkeypatch):
     out1, _, _ = _run(ex, x, idx, w, True, monkeypatch)
     touched = (idx == e).any(-1)
     diff = (out1 - out0).abs().view(T, H).amax(-1)
-    # Untouched tokens move only by fp32 index_add_ atomic-order noise.
     assert bool((diff[touched] > 1e-3).all())
     assert bool((diff[~touched] < 1e-5).all())
 
@@ -380,8 +378,7 @@ def test_checkpoint_control_flow_is_not_swallowed(forward, monkeypatch):
     monkeypatch.delenv("UNSLOTH_COMPILE_DISABLE", raising = False)
     ex = _Experts(True).train()
     if forward == "class":
-        # The module later sets GptOssExpertsBnb4bit.forward = torch_native_forward; the class
-        # body's own forward is what the compiled cache emits, so load it from the source.
+        # The class attribute is later replaced; load the class body's forward from source.
         import ast, inspect
         from unsloth_zoo.temporary_patches import gpt_oss
         src = inspect.getsource(gpt_oss)
@@ -410,8 +407,7 @@ def test_checkpoint_control_flow_is_not_swallowed(forward, monkeypatch):
 
 @needs_grouped_mm
 def test_grouped_forward_is_run_to_run_deterministic(monkeypatch):
-    # Every token appears top_k times in the combine: an index_add_ there is atomic and its
-    # order varies between identical calls.
+    # An index_add_ combine over repeated tokens is atomic and not reproducible.
     ex = _Experts(True).train()
     T = 4096
     x = torch.randn(1, T, H, device = "cuda", dtype = DT)

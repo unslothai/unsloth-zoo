@@ -1243,10 +1243,7 @@ class GptOssExpertsBnb4bit(nn.Module):
                     if w.requires_grad:
                         return _fail("expert weight requires_grad")
                     qs = w.quant_state
-                    # The grouped dequant concatenates packed bytes + absmax across
-                    # experts, which is exact only when every expert tiles into whole
-                    # blocks of one shared blocksize; a trailing partial block would
-                    # shift scaling onto the next expert.
+                    # Concatenating experts is exact only with whole blocks of one shared blocksize.
                     numel = 1
                     for s in qs.shape:
                         numel *= int(s)
@@ -1265,8 +1262,7 @@ class GptOssExpertsBnb4bit(nn.Module):
                     ):
                         return _fail("mixed quantization formats across experts")
                     b = getattr(lin, "bias", None)
-                    # Grouped path stacks per-expert biases, so a missing bias would
-                    # break torch.stack; require all present and fall back otherwise.
+                    # The grouped path stacks per-expert biases.
                     if b is None:
                         return _fail("expert bias is None")
                     if b.requires_grad:

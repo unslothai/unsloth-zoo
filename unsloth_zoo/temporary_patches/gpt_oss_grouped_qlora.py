@@ -215,8 +215,7 @@ def expert_lora_state(experts):
 
 
 def _proj_signature(proj, out):
-    # Read through __dict__ / _modules / _parameters: nn.Module.__getattr__ and Params4bit's
-    # __torch_function__ would dominate the cost.
+    # Read through __dict__ / _modules / _parameters: __getattr__ / __torch_function__ dominate otherwise.
     d = proj.__dict__
     mods = d["_modules"]
     base = mods.get("base_layer", proj)
@@ -328,8 +327,7 @@ def _tables(experts, dtype):
     """Pointer tables for both projections, or None for the bnb fallback."""
     try:
         from unsloth_zoo.temporary_patches.gpt_oss_routed import prepare_routed_experts
-        # prepare_routed_experts only re-checks the end experts; a replaced middle expert
-        # would leave the kernel reading a freed buffer, so check every expert here.
+        # prepare_routed_experts only re-checks the end experts: check every expert here.
         key = _storage_key(experts)
         state = getattr(experts, "_unsloth_routed_nf4", None)
         if isinstance(state, dict) and state.get("storage_key") != key:
