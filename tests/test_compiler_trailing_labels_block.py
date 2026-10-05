@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Statements after the loss call inside `if labels is not None:` (Bamba's z-loss) must
-not be dropped by the fused branches (CPU, source + routing)."""
+"""Labels-block statements after the loss call (Bamba's z-loss) survive the fused branches."""
 
 import inspect
 import os

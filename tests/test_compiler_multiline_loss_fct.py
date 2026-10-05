@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Masked-shift CE written as a multi-line `loss_fct(...)` call (Qwen2-Audio, Granite Speech,
-transformers 5.4+) must get the pattern 3 fused CE (CPU, source only)."""
+"""Multi-line masked-shift `loss_fct(...)` (Qwen2-Audio, Granite Speech) gets pattern 3 fused CE."""
 
 import importlib
 import inspect
@@ -135,8 +134,7 @@ def test_installed_forwards_are_fused(module, cls):
 
 
 def test_inner_model_logits_are_not_fused():
-    # transformers 5.4 - 5.9 Qwen2-Audio takes logits from the inner language model: there is no
-    # local `hidden_states` for the fused branch to read.
+    # Qwen2-Audio 5.4 - 5.9 takes logits from the inner model: no local `hidden_states` to fuse.
     source = QWEN2_AUDIO.replace(
         "        hidden_states = outputs.last_hidden_state\n        logits = self.lm_head(hidden_states)\n",
         "        logits = outputs.logits\n",

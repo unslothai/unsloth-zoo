@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Compiler source rewrites must not hang, must not change sources they do not
-fuse, and must not route a biased lm_head to the bias-less CCE kernel (CPU)."""
+"""Compiler rewrites: no hangs, unfused sources unchanged, biased heads off the CCE kernel."""
 
 import multiprocessing
 import os
@@ -28,8 +27,7 @@ import torch
 
 from unsloth_zoo import compiler
 
-# transformers >= 5.10.1 DeepseekOcr2SamVisionSdpaAttention.forward (trimmed): an
-# `if output_attentions:` guard with no `return super().forward(...)` after it.
+# DeepseekOcr2SamVisionSdpaAttention.forward (5.10.1+, trimmed): guard without a super() return.
 DEEPSEEK_OCR2_SDPA = '''
     def forward(self, hidden_states: torch.Tensor, output_attentions=False) -> torch.Tensor:
         if output_attentions:
@@ -110,8 +108,7 @@ def test_gqa_rewrite_legacy_shapes_unchanged(source):
         )
 
 
-# Mamba / FalconMamba / xLSTM (transformers <= 5.16.1) and Clvp: a non-VLM whose shifted CE
-# line the Idefics normaliser rewrites, but which no pattern fuses.
+# Mamba / FalconMamba / xLSTM (<= 5.16.1), Clvp: normalised by the Idefics rewrite, never fused.
 UNFUSED_ONE_LINE_CE = '''
     def forward(self, input_ids=None, labels=None, **kwargs):
         hidden_states = self.backbone(input_ids)[0]
@@ -154,8 +151,7 @@ def test_one_line_shifted_ce_still_fuses():
     assert "text_config" not in out
 
 
-# GraniteSpeech (transformers >= 5.10): the CE call spans lines, so patterns 1 and 3 cannot
-# match; their regex used to run until its 1 s timeout on every compile.
+# Unshifted multi-line CE (Bart-style): patterns 1 and 3 must not even run their regex.
 MULTILINE_ALIGNED_CE = '''
     def forward(self, input_ids=None, decoder_input_ids=None, labels=None, **kwargs):
         outputs = self.model(input_ids, decoder_input_ids=decoder_input_ids)

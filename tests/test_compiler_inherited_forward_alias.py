@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""create_standalone_class on a subclass that inherits its forward (deprecated aliases such as
-Ernie4_5_VL_MoeForConditionalGeneration) must emit a working override (CPU, source only)."""
+"""create_standalone_class emits a working forward for subclasses that inherit it (Ernie VL alias)."""
 
 import ast
 import importlib.util

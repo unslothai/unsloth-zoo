@@ -644,8 +644,7 @@ def replace_with_grouped_query_attention(module, source):
     # a `return super().forward(...)` separated by an arbitrary body
     # (logger warning, raise, etc.). Matches the legacy shape with a
     # looser anchor; still no-ops on 4.50+ where the guard is gone.
-    # Body lines are `[ \t][^\n]+`, not `[ \t]+[^\n]+`: the same lines, but the
-    # ambiguous split backtracks exponentially when no return follows (DeepseekOcr2).
+    # `[ \t][^\n]+`, not `[ \t]+[^\n]+`: that split backtracks exponentially (DeepseekOcr2).
     rewritten, n_loose = re.subn(
         r"if[ \t]+output_attentions[ \t]*:[^\n]*\n(?:[ \t][^\n]+\n)*?[ \t]+return[ \t]+super\(\)\.forward\([^)]*\)",
         "if output_attentions: raise RuntimeError('Unsloth: Not supported')",
@@ -2945,8 +2944,7 @@ def create_standalone_class(
     # Use patched function name if forward was replaced by temporary patch
     forward_func_name = patched_forward_info[0] if patched_forward_info else f"{module}_forward"
     if add_loss_kwargs and patched_forward_info is None and full_class.find(definition) == -1:
-        # Inherited forward (deprecated aliases such as Ernie4_5_VL_MoeForConditionalGeneration):
-        # nothing to replace in the class body, so the fused CE class gets an override.
+        # Inherited forward (deprecated aliases): nothing to replace, so append an override.
         body_indent = re.search(r"([ \t]*)def\s", definition).group(1) + "    "
         new_forward = definition.lstrip("\n") + "\n" + body_indent + \
             f"return {forward_func_name}({parameters})\n"
@@ -3494,10 +3492,8 @@ def _normalize_lm_head_source(forward):
     if re.search(r"^[ \t]+lm_logits = self\.lm_head\(", forward, flags = re.MULTILINE) \
             and not re.search(r"(?<![\w.])logits(?![\w=])", forward):
         forward = re.sub(r"\blm_logits\b", "logits", forward)
-    # Qwen2-Audio / Granite Speech wrap the masked-shift CE call over lines; split it into the
-    # four statements pattern 3 expects, keeping the original vocab expression. Only with a local
-    # head call: pattern 3's fused branch reads `hidden_states`, which `logits = outputs.logits`
-    # forwards (Qwen2-Audio 5.4 - 5.9) never bind.
+    # Multi-line masked-shift CE (Qwen2-Audio, Granite Speech) -> pattern 3's shape. Needs a local
+    # head call: pattern 3 reads `hidden_states`, unbound with `logits = outputs.logits`.
     if "self.lm_head(" not in forward:
         return forward
     forward = re.sub(
@@ -3516,9 +3512,7 @@ def _normalize_lm_head_source(forward):
 
 
 def _hoist_head_to_loss_preamble(forward):
-    """Move single-line assignments between `logits = self.lm_head(...)` and `loss = None` that
-    neither read logits nor feed the head above the head call (Qwen2-Audio rebinds
-    attention_mask and labels from the backbone output there)."""
+    """Hoist head-independent rebinds between the head call and `loss = None` (Qwen2-Audio)."""
     lines = forward.split("\n")
     for i, line in enumerate(lines):
         head = re.match(r"^([ \t]+)logits = self\.lm_head\((.*)\)[ \t]*$", line)
@@ -3556,15 +3550,13 @@ def apply_fused_lm_head(forward, module=None):
     return _apply_fused_lm_head(forward, module)
 
 
-# Tails patterns 1 and 3 cannot match without; skips their regex, which backtracks for seconds
-# on long multi-line CE blocks (Qwen2Audio, GraniteSpeech).
+# Patterns 1 and 3 need these tails; their regex otherwise backtracks for seconds.
 _CE_TAIL_VIEW = re.compile(r"(?:shift|flat)_logits = (?:shift|flat)_logits\.view\(-1,")
 _CE_TAIL_CALL = re.compile(r"loss = loss_fct\((?:shift|flat)_logits, (?:shift|flat)_labels\)")
 
 
 def _labels_block_tail(forward, end, indent):
-    """Source still inside the `if labels is not None:` body after the matched loss
-    call (Bamba's z-loss), "" if none, None if code shares the loss call's line."""
+    """Labels-block source after the matched loss call; None if code shares its line."""
     rest = forward[end:]
     newline = rest.find("\n")
     if newline == -1:
@@ -3580,8 +3572,7 @@ def _labels_block_tail(forward, end, indent):
 
 
 def _tail_guard(tail):
-    """(condition, dedented block) for a tail that is one `if COND:` block, ("", "")
-    for no statements, None for anything the fused branches cannot replay."""
+    """(COND, block) for one `if COND:` tail, ("", "") for none, None if not replayable."""
     if not tail.strip():
         return ("", "")
     block = textwrap.dedent(tail)
@@ -3597,8 +3588,7 @@ def _tail_guard(tail):
 
 
 def _guard_loss_function_replacement(replacement, condition, block):
-    """Fused branches skip `condition`, whose block reads the real logits; the
-    RETURN_LOGITS branch replays it and leaves the rest to the unfused `else`."""
+    """Fused branches skip `condition` (its block reads real logits); RETURN_LOGITS replays it."""
     condition = condition.replace("\\", "\\\\")
     block = block.replace("\\", "\\\\")
     lines = []
@@ -3835,8 +3825,7 @@ def _apply_fused_lm_head(forward, module=None):
             continue
         if matched is None:
             continue
-        # Statements after the matched loss call inside the labels block otherwise only
-        # reach the final unfused branch (Bamba's z-loss reads the real logits).
+        # Labels-block statements after the loss call only reach the unfused `else` (Bamba z-loss).
         guard = _labels_block_tail(forward, matched.end(), len(spaces))
         guard = None if guard is None else _tail_guard(guard)
         if guard is None or (guard[0] and r"loss\_function" not in cross_entropy_find):
