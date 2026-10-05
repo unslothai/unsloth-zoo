@@ -247,6 +247,33 @@ def test_lora_storage_swap_is_not_stale():
     torch.testing.assert_close(after.double(), ref, rtol = 1e-4, atol = 1e-4)
 
 
+@pytest.mark.parametrize("which", ["lora_A", "lora_B"])
+@pytest.mark.parametrize("compiled", [False, True])
+def test_replaced_middle_expert_adapter_is_not_stale(which, compiled):
+    # Replacing one middle expert's adapter Parameter (not an in-place edit) must reach the kernels.
+    ex = _lora_wrap(_Experts(True)).eval()
+    x = torch.randn(1, 2, H, device = "cuda", dtype = torch.float32)
+    idx, w = _routing(2, seed = 6)
+    e = idx[0, 1].item()
+    assert 0 < e < E - 1 or idx[0, 0].item() not in (0, E - 1)
+    e = e if 0 < e < E - 1 else idx[0, 0].item()
+    assert prepare_routed_experts(ex)
+    fn = routed_experts_forward
+    if compiled:
+        torch._dynamo.reset()
+        fn = torch.compile(lambda a, b, c: routed_experts_forward(ex, a, b, c), fullgraph = True)
+    call = (lambda: fn(x, idx, w)) if compiled else (lambda: fn(ex, x, idx, w))
+    with torch.no_grad():
+        before = call()
+        for projs in (ex.gate_up_projs, ex.down_projs):
+            lin = getattr(projs[e], which)["default"]
+            lin.weight = torch.nn.Parameter(lin.weight + 0.05, requires_grad = False)
+        after = call()
+        ref = _reference(ex, x, idx, w)
+    assert not torch.allclose(before, after)
+    torch.testing.assert_close(after.double(), ref, rtol = 1e-4, atol = 1e-4)
+
+
 def test_mixed_adapter_batch_is_left_to_peft():
     # PEFT's adapter_names pre-hook marks a mixed-adapter batch the routed kernels cannot honour.
     from functools import partial

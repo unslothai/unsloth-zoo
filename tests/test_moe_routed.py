@@ -393,6 +393,40 @@ def test_replaced_quant_state_buffers_rebuild_the_tables(proj, what):
     assert torch.equal(got, fresh)
 
 
+@pytest.mark.parametrize("what", ["requantize", "absmax", "nested_absmax", "offset"])
+@pytest.mark.parametrize("mode", ["1", "grouped"])
+def test_compiled_decode_reads_replaced_quant_state(what, mode, monkeypatch):
+    # No eager call between the swap and the compiled call: the compiled path must not reuse old tables.
+    if mode == "grouped" and (DT != torch.bfloat16 or not MU._check_torch_grouped_mm_supported()):
+        pytest.skip("torch._grouped_mm takes bf16 only")
+    if not MR._LIVE_QUANT:
+        pytest.skip("Dynamo before torch 2.10 cannot trace Params4bit; the next eager call rebuilds")
+    monkeypatch.setenv("UNSLOTH_MOE_ROUTED_KERNEL", mode)
+    ex = _make("silu")
+    x, idx, w = _route(2)
+    torch._dynamo.reset()
+    fn = torch.compile(lambda a, b, c: MR.routed_moe_forward(ex, a, b, c), fullgraph = True)
+    with torch.no_grad():
+        assert MR.prepare_stacked_nf4(ex) is not None
+        before = fn(x, idx, w)
+        assert before is not None
+        p = ex.down_proj
+        if what == "requantize":
+            new = _q4(_weights(11)[1])
+            p.data, p.quant_state = new.data, new.quant_state
+        elif what == "absmax":
+            p.quant_state.absmax = p.quant_state.absmax.flip(0).contiguous()
+        elif what == "nested_absmax":
+            p.quant_state.state2.absmax = p.quant_state.state2.absmax * 1.5
+        else:
+            p.quant_state.offset = p.quant_state.offset + 0.05
+        got = fn(x, idx, w)
+        ex.__dict__.pop("_unsloth_routed_moe")
+        fresh = MR.routed_moe_forward(ex, x, idx, w)
+    assert got is not None and not torch.allclose(before, fresh)
+    torch.testing.assert_close(got, fresh)
+
+
 @pytest.mark.parametrize("use_lora", [False, True])
 @pytest.mark.parametrize("mode", ["1", "grouped", "bf16"])
 def test_fullgraph_compile_and_cuda_graph_replay(use_lora, mode, monkeypatch):

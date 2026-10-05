@@ -293,9 +293,15 @@ def _lora(projs):
     if first.merged or (first.training and getattr(first.lora_dropout[name], "p", 0) > 0):
         return False
     cache = getattr(projs, "_unsloth_routed_lora", None)
+    try:
+        # Every expert's live A / B (plain dict lookups: this runs once per layer call).
+        A = [proj._modules["lora_A"]._modules[name]._parameters["weight"] for proj in projs]
+        B = [proj._modules["lora_B"]._modules[name]._parameters["weight"] for proj in projs]
+    except (KeyError, AttributeError):
+        return False
     if (
-        cache is None or cache["name"] != name or cache["A"][0] is not first.lora_A[name].weight
-        or cache["B"][-1] is not projs[-1].lora_B[name].weight
+        cache is None or cache["name"] != name
+        or not all(map(is_, cache["A"], A)) or not all(map(is_, cache["B"], B))
     ):
         for proj in projs:
             if (
@@ -305,9 +311,7 @@ def _lora(projs):
                 or getattr(proj.lora_B[name], "bias", None) is not None
             ):
                 return False
-        cache = {"name": name,
-                 "A": [proj.lora_A[name].weight for proj in projs],
-                 "B": [proj.lora_B[name].weight for proj in projs]}
+        cache = {"name": name, "A": A, "B": B}
         if not torch.compiler.is_compiling():
             projs._unsloth_routed_lora = cache
     return cache["A"], cache["B"], first.scaling[name]

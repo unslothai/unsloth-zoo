@@ -992,6 +992,36 @@ def _build_stacked_nf4(experts, hidden_dim):
     }
 
 
+# Dynamo before torch 2.10 traces Params4bit as a plain object (no .detach / .view).
+_LIVE_QUANT = tuple(int(v) for v in torch.__version__.split("+")[0].split(".")[:2]) >= (2, 10)
+
+
+def _live_quant(experts, state):
+    """Compiled calls skip the eager key check, so read the quant tensors from the module (graph
+    inputs, guarded by Dynamo); None (current path) if they no longer fit the cached layout."""
+    out = dict(state)
+    for name, key in (("gate_up_proj", "gate_up"), ("down_proj", "down")):
+        p, tb = getattr(experts, name), state[key]
+        qs = getattr(p, "quant_state", None)
+        if qs is None or bool(qs.nested) != tb["nested"] or int(qs.blocksize) != tb["blocksize"]:
+            return None
+        live = {"w": p.detach().view(torch.uint8).reshape(-1), "a": qs.absmax, "lut": qs.code}
+        if tb["nested"]:
+            if not isinstance(qs.offset, torch.Tensor):
+                return None
+            live.update(a2 = qs.state2.absmax, c2 = qs.state2.code, off = qs.offset.reshape(1))
+            if int(qs.state2.blocksize) != tb["blocksize2"]:
+                return None
+        for k, t in live.items():
+            ref = tb[k]
+            if t.dtype != ref.dtype or t.shape != ref.shape or t.device != ref.device or not t.is_contiguous():
+                return None
+        if not tb["nested"]:
+            live.update(a2 = live["a"], c2 = live["a"], off = live["a"])
+        out[key] = dict(tb, **live)
+    return out
+
+
 def _live_biases(experts, state):
     """The state with each stacked [E, N] bias re-read from the module; None if it no longer fits."""
     out = state
@@ -1166,6 +1196,8 @@ def routed_moe_forward(experts, hidden_states, top_k_index, top_k_weights):
         # Built eagerly (data_ptr is not traceable), even on calls too large to route.
         if torch.compiler.is_compiling():
             state = experts.__dict__.get("_unsloth_routed_moe")
+            if isinstance(state, dict) and _LIVE_QUANT:
+                state = _live_quant(experts, state)
         else:
             state = prepare_stacked_nf4(experts, hidden_dim)
         if not isinstance(state, dict) or top_k_index.numel() > nf4_slot_limit(state["E"]):
