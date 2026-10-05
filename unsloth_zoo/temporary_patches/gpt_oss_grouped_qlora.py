@@ -356,7 +356,7 @@ def grouped_qlora_forward(experts, hidden_states, router_indices, routing_weight
     Returns fp32 [batch, seq, hidden], as the per-expert training loop does, or None when
     the experts do not compute in bf16 (the caller keeps the loop)."""
     from unsloth_zoo.temporary_patches.moe_utils import (
-        _base_grouped_mm, _moe_recompute_default, count_tokens_per_expert,
+        _base_grouped_mm, _moe_recompute_default, combine_permuted_moe_outputs, count_tokens_per_expert,
     )
     from unsloth_zoo.temporary_patches.gpt_oss import swiglu_torch_forward
 
@@ -411,6 +411,6 @@ def grouped_qlora_forward(experts, hidden_states, router_indices, routing_weight
         out = out + _lora_delta(gated, offsets, dn_projs, lora["down"], dtype).float()
 
     weighted = out.to(torch.float32) * routing_weights[sorted_tokens, expert_ids, None].to(torch.float32)
-    next_states = torch.zeros(num_tokens, experts.hidden_size, dtype = torch.float32, device = device)
-    next_states.index_add_(0, sorted_tokens, weighted)
+    # Fixed-order top_k sum (an index_add_ over repeated tokens is atomic, so not reproducible).
+    next_states = combine_permuted_moe_outputs(weighted, sorted_idx, num_tokens, top_k, out_dtype = torch.float32)
     return next_states.view(batch_size, -1, experts.hidden_size)

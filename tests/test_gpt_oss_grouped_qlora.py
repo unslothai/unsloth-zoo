@@ -409,6 +409,21 @@ def test_checkpoint_control_flow_is_not_swallowed(forward, monkeypatch):
 
 
 @needs_grouped_mm
+def test_grouped_forward_is_run_to_run_deterministic(monkeypatch):
+    # Every token appears top_k times in the combine: an index_add_ there is atomic and its
+    # order varies between identical calls.
+    ex = _Experts(True).train()
+    T = 4096
+    x = torch.randn(1, T, H, device = "cuda", dtype = DT)
+    idx, w = _routing(T)
+    outs = [_run(ex, x, idx, w, True, monkeypatch) for _ in range(6)]
+    assert all(o[2]["forward"] == 1 for o in outs)
+    for out, grads, _ in outs[1:]:
+        assert torch.equal(out, outs[0][0])
+        assert all(torch.equal(grads[k], outs[0][1][k]) for k in grads)
+
+
+@needs_grouped_mm
 def test_mixed_quant_formats_keep_loop(monkeypatch):
     ex = _Experts(True).train()
     fp4 = bnb.nn.Linear4bit(I, H, bias = True, compute_dtype = DT, quant_type = "fp4", quant_storage = torch.uint8)
