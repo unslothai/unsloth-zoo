@@ -3494,6 +3494,55 @@ def _normalize_lm_head_source(forward):
     if re.search(r"^[ \t]+lm_logits = self\.lm_head\(", forward, flags = re.MULTILINE) \
             and not re.search(r"(?<![\w.])logits(?![\w=])", forward):
         forward = re.sub(r"\blm_logits\b", "logits", forward)
+    # Qwen2-Audio / Granite Speech wrap the masked-shift CE call over lines; split it into the
+    # four statements pattern 3 expects, keeping the original vocab expression. Only with a local
+    # head call: pattern 3's fused branch reads `hidden_states`, which `logits = outputs.logits`
+    # forwards (Qwen2-Audio 5.4 - 5.9) never bind.
+    if "self.lm_head(" not in forward:
+        return forward
+    forward = re.sub(
+        r"^([ \t]+)loss = loss_fct\(\s*\n\s*shift_logits\.view\(-1, shift_logits\.size\(-1\)\),\s*"
+        r"shift_labels\.view\(-1\)(?:\.to\(([^()\n]*)\))?,?\s*\n\s*\)[ \t]*$",
+        lambda m: (
+            f"{m.group(1)}shift_logits = shift_logits.view(-1, shift_logits.size(-1))\n"
+            f"{m.group(1)}shift_labels = shift_labels.view(-1)\n"
+            f"{m.group(1)}shift_labels = shift_labels.to({m.group(2) or 'shift_logits.device'})\n"
+            f"{m.group(1)}loss = loss_fct(shift_logits, shift_labels)"
+        ),
+        forward,
+        flags = re.MULTILINE,
+    )
+    return _hoist_head_to_loss_preamble(forward)
+
+
+def _hoist_head_to_loss_preamble(forward):
+    """Move single-line assignments between `logits = self.lm_head(...)` and `loss = None` that
+    neither read logits nor feed the head above the head call (Qwen2-Audio rebinds
+    attention_mask and labels from the backbone output there)."""
+    lines = forward.split("\n")
+    for i, line in enumerate(lines):
+        head = re.match(r"^([ \t]+)logits = self\.lm_head\((.*)\)[ \t]*$", line)
+        if head is None:
+            continue
+        indent, head_names = head.group(1), set(re.findall(r"\b\w+\b", head.group(2)))
+        moved, j = [], i + 1
+        while j < len(lines):
+            current = lines[j]
+            if current.strip() == "":
+                j += 1
+                continue
+            if current == f"{indent}loss = None":
+                break
+            assign = re.match(rf"^{indent}(\w+) = (?!.*\blogits\b)[^\n]+$", current)
+            if assign is None or assign.group(1) in head_names or assign.group(1) == "logits":
+                moved = None
+                break
+            moved.append(current)
+            j += 1
+        if not moved or j == len(lines):
+            continue
+        rest = [x for x in lines[i + 1:j] if x not in moved]
+        return "\n".join(lines[:i] + moved + [line] + rest + lines[j:])
     return forward
 
 
