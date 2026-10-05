@@ -3541,10 +3541,10 @@ def test_grpo_plan_generates_scores_and_replays_each_generation(monkeypatch):
 
 
 @pytest.mark.parametrize("overrides,expected,warns", [
-    ({}, dict(loss_type="bnpo", beta=0.001, scale_rewards="group", per_device_train_batch_size=2,
-              steps_per_generation=4, generation_batch_size=8), None),
-    ({"loss_type": "DAPO", "beta": 0.0}, dict(loss_type="dapo", mask_truncated_completions=True,
-                                              epsilon_high=0.28), "dapo' sets mask_truncated"),
+    ({}, dict(loss_type="dapo", beta=0.0, mask_truncated_completions=False, epsilon_high=None, scale_rewards="group", per_device_train_batch_size=2, steps_per_generation=4, generation_batch_size=8), None),  # noqa: E501
+    ({"beta": 0.04}, dict(loss_type="dapo", beta=0.04, mask_truncated_completions=False, epsilon_high=None), None), ({"loss_type": "bnpo"}, dict(beta=0.001, mask_truncated_completions=False, epsilon_high=None), None),  # noqa: E501
+    ({"loss_type": "DAPO"}, dict(loss_type="dapo", beta=0.0, mask_truncated_completions=True, epsilon_high=0.28), "dapo' sets mask_truncated"), ({"loss_type": "dr_grpo"}, dict(scale_rewards="none", beta=0.0), "does not scale"),  # noqa: E501
+    ({"loss_type": "dapo", "mask_truncated_completions": False, "epsilon_high": 0.3, "beta": 0.01}, dict(mask_truncated_completions=False, epsilon_high=0.3), "keeps its KL term"),  # noqa: E501
     ({"loss_type": "dr_grpo", "scale_rewards": True}, dict(scale_rewards="none"), "does not scale"),
     ({"loss_type": "dr_grpo", "scale_rewards": None}, dict(scale_rewards="group"), None),
     ({"num_generations": 3}, dict(per_device_train_batch_size=3, generation_batch_size=12), "set to 3"),
@@ -3559,8 +3559,11 @@ def test_grpo_config_resolves_as_cuda_unsloth(overrides, expected, warns):
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         config = MLXGRPOConfig(**overrides)
+    notice = [w for w in caught if "defaults to TRL's 'dapo'" in str(w.message)]
+    assert len(notice) == ("loss_type" not in overrides and "beta" not in overrides)
+    caught = [w for w in caught if w not in notice]
     assert [str(w.message) for w in caught if warns and warns in str(w.message)] or not warns
-    assert not caught or warns
+    assert not caught or warns and not [w for w in caught for name in overrides if f"sets {name}=" in str(w.message)]
     assert {name: getattr(config, name) for name in expected} == expected
     config = MLXGRPOConfig(temperature=0.7, generation_kwargs={"max_new_tokens": 5, "top_k": 3})
     assert (grpo_sampling(config).max_tokens, grpo_sampling(config).top_k,
@@ -3592,6 +3595,7 @@ def _grpo_config(tmp_path, **overrides):
     from unsloth_zoo.mlx.trainer import MLXGRPOConfig
 
     common = _generation_common(tmp_path, max_steps=2, num_generations=2, max_completion_length=4)
+    common.update(loss_type="bnpo", beta=0.001)
     for name in ("generate_during_eval", "num_generation_prompts", "generation_max_tokens",
                  "eval_steps", "generation_temperature"):
         common.pop(name)

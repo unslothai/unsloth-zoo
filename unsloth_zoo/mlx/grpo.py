@@ -45,7 +45,7 @@ GRPO_STATS_WIDTH = len(GRPO_LOSS_METRICS) + 1
 
 @dataclass(frozen=True)
 class GRPOObjective:
-    loss_type: str = "bnpo"
+    loss_type: str = "dapo"
     beta: float = 0.001
     epsilon: float = 0.2
     epsilon_high: float | None = None
@@ -966,21 +966,33 @@ def resolve_grpo_config(config):
         raise ValueError("Unsloth MLX GRPO: use_vllm needs vLLM; MLX samples with its own engine.")
     if config.use_liger_loss:
         raise ValueError("Unsloth MLX GRPO: use_liger_loss selects a CUDA kernel.")
+    default_loss_type = config.loss_type is None
+    if default_loss_type:
+        config.loss_type = "dapo"
+        if config.beta is None:
+            warnings.warn(
+                "Unsloth MLX GRPO: loss_type defaults to TRL's 'dapo' with beta=0.0, as on "
+                "CUDA Unsloth. Set loss_type='bnpo', beta=0.001 for the previous default.",
+                stacklevel=3,
+            )
     if isinstance(config.loss_type, str) and config.loss_type.lower() in ("dr_grpo", "dapo"):
         config.loss_type = config.loss_type.lower()
+    if config.beta is None:
+        config.beta = 0.0 if config.loss_type in ("dapo", "dr_grpo") else 0.001
     if config.loss_type == "dr_grpo":
         if config.scale_rewards is None:
             config.scale_rewards = True
-        elif config.scale_rewards is True:
+        elif config.scale_rewards is True or config.scale_rewards == "group":
             warnings.warn(
                 "Unsloth MLX GRPO: loss_type='dr_grpo' does not scale rewards, so "
-                "scale_rewards=True is set to False, as on CUDA Unsloth.",
+                "scale_rewards is set to False, as on CUDA Unsloth. Set it to None to keep scaling.",
                 stacklevel=3,
             )
             config.scale_rewards = False
-    if config.loss_type == "dapo":
+    # The default keeps TRL's settings: masking truncated rows zeroes an all-truncated update.
+    elif config.loss_type == "dapo" and not default_loss_type:
         for name, value in (("mask_truncated_completions", True), ("epsilon_high", 0.28)):
-            if getattr(config, name) != value:
+            if getattr(config, name) is None:
                 warnings.warn(
                     f"Unsloth MLX GRPO: loss_type='dapo' sets {name}={value}, as on "
                     "CUDA Unsloth.",
@@ -993,6 +1005,8 @@ def resolve_grpo_config(config):
                 f"beta={config.beta} keeps its KL term.",
                 stacklevel=3,
             )
+    if config.mask_truncated_completions is None:
+        config.mask_truncated_completions = False
     if not 0 < config.temperature < 10:
         raise ValueError(
             f"Unsloth MLX GRPO: temperature={config.temperature} must lie between 0 "
