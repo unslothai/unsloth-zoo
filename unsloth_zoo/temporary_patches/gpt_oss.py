@@ -40,6 +40,7 @@ from .common import (
 from importlib.metadata import version as importlib_version
 from unsloth_zoo.utils import Version
 from unsloth_zoo.mxfp4_dequant import is_mxfp4_expert_param
+from .gpt_oss_routed import ROUTED_MAX_SLOTS, prepare_routed_experts, routed_experts_forward, routed_mlp_forward
 transformers_version = Version(importlib_version("transformers"))
 has_static_cache = transformers_version >= Version("4.56.0.dev0")
 from .utils import (
@@ -2285,11 +2286,27 @@ def _mxfp4_ogs_decode(self, hidden_states):
         return None
 
 
+def _has_active_expert_lora(experts):
+    """True when a PEFT adapter on the expert parameters would change the output."""
+    m = experts
+    while hasattr(m, "base_layer"):
+        if hasattr(m, "lora_A") and len(m.lora_A) and not getattr(m, "merged", False) \
+                and not getattr(m, "disable_adapters", False):
+            return True
+        m = m.base_layer
+    return False
+
+
 def moe_forward_inference_bf16(self, hidden_states):
     """Wrapper that extracts weights from ParameterModule before calling the compiled kernel."""
     out = _mxfp4_ogs_decode(self, hidden_states)
     if out is not None:
         return out
+    if _has_active_expert_lora(self.experts):
+        # The fused kernel below reads the unwrapped base expert weights, so it would
+        # silently drop expert LoRA; the module forward applies it.
+        out = self(hidden_states)
+        return out[0] if isinstance(out, tuple) else out
     router_scores, router_indices = moe_router_forward(self.router, hidden_states)
     routing_weights = router_scores
 
@@ -2927,35 +2944,15 @@ def torch_native_forward(
         next_states = next_states.view(batch_size, -1, self.hidden_size)
         return next_states.to(torch.float32)
     elif (
-        num_tokens * top_k <= 4 * num_experts
-        and os.environ.get("UNSLOTH_GPTOSS_ROUTED_INFERENCE", "1") != "0"
-        and not torch.compiler.is_compiling()
-        and not (hidden_states.is_cuda and torch.cuda.is_current_stream_capturing())
+        num_tokens * top_k <= ROUTED_MAX_SLOTS
+        and (routed := routed_experts_forward(self, hidden_states, router_indices, routing_weights)) is not None
     ):
-        # Eager decode: run only the routed experts (dense runs all, launch bound). Costs one host
-        # sync per layer, so prefill, compile and CUDA graph capture keep the sync-free dense branch.
-        dtype = torch.float32 if hidden_states.dtype != torch.bfloat16 else hidden_states.dtype
-        with torch.no_grad():
-            flat_experts = router_indices.flatten()
-            token_ids = torch.arange(num_tokens, device=hidden_states.device).repeat_interleave(top_k)
-            sorted_idx = flat_experts.argsort(stable=True)
-            sorted_tokens = token_ids[sorted_idx]
-            counts = torch.bincount(flat_experts, minlength=num_experts).tolist()
-        next_states = torch.zeros(num_tokens, self.hidden_size, dtype=torch.float32, device=hidden_states.device)
-        device_type = hidden_states.device.type if isinstance(hidden_states.device.type, str) and hidden_states.device.type != "mps" else "cpu"
-        offset = 0
-        for expert_idx, count in enumerate(counts):
-            if count == 0:
-                continue
-            token_idx = sorted_tokens[offset:offset + count]
-            gate_up = self.gate_up_projs[expert_idx](hidden_states[token_idx])
-            fused = swiglu_torch_forward(gate_up, self.alpha, self.limit, dtype = dtype)
-            with torch.autocast(device_type=device_type, enabled=False):
-                out = self.down_projs[expert_idx](fused.to(dtype))
-            next_states.index_add_(0, token_idx, out.to(torch.float32) * routing_weights[token_idx, expert_idx, None].to(torch.float32))
-            offset += count
-        return next_states.view(batch_size, -1, self.hidden_size).to(hidden_states.dtype)
+        # Decode-sized eval calls read only the routed experts, with no host sync.
+        return routed.view(batch_size, -1, self.hidden_size)
     else:
+        if not torch.is_grad_enabled() and not torch.compiler.is_compiling():
+            # Eager prefill builds the routed tables a compiled decode step then reads.
+            prepare_routed_experts(self)
         X_rep = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
         gate_up_list = [up_l(X_rep[e]) for e, up_l in enumerate(self.gate_up_projs)]
         gate_up = torch.stack(gate_up_list, dim=0)
@@ -3109,10 +3106,16 @@ def patch_GptOssAttention():
 
         bsz, n_heads, qlen, _  = query.shape
         bsz, n_heads, kvlen, _ = key_states.shape
-        out_dtype = torch.result_type(query, key_states)
+        # promote_types, not result_type: result_type returns a dtype, which graph-breaks Dynamo.
+        out_dtype = torch.promote_types(query.dtype, key_states.dtype)
         combined_logits = key_states.new_empty((bsz, n_heads, qlen, kvlen + 1), dtype=out_dtype)
 
-        attn_weights = matmul(query, key_states.transpose(2, 3), out = combined_logits[:,:,:,:kvlen])
+        if torch.compiler.is_compiling():
+            # Dynamo cannot trace out= into a non-contiguous slice; Inductor fuses the copy.
+            combined_logits[:, :, :, :kvlen] = matmul(query, key_states.transpose(2, 3))
+            attn_weights = combined_logits[:, :, :, :kvlen]
+        else:
+            attn_weights = matmul(query, key_states.transpose(2, 3), out = combined_logits[:,:,:,:kvlen])
         attn_weights *= scaling
         if attention_mask is not None:
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
@@ -3328,6 +3331,33 @@ def patch_GptOssAttention():
     os.environ["UNSLOTH_ENABLE_FLEX_ATTENTION"] = "1"
 pass
 TEMPORARY_PATCHES.append(patch_GptOssAttention)
+
+
+def _offloaded_embedding_impl(input_ids: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    # Blocking copies both ways: a non_blocking copy into the CPU can be read before it lands.
+    ids = input_ids.to(weight.device)
+    return torch.nn.functional.embedding(ids, weight).to(input_ids.device)
+
+
+try:
+    # cudagraph_unsafe makes Inductor's graph partitioning run the lookup outside the CUDA graph,
+    # in order with the rest of the step; inlined, the CPU kernel read token ids the graph had
+    # not copied back yet.
+    _offloaded_embedding = torch.library.custom_op(
+        "unsloth_zoo::gpt_oss_offloaded_embedding", mutates_args = (),
+        tags = (torch._C.Tag.cudagraph_unsafe,),
+    )(_offloaded_embedding_impl)
+except Exception:
+    try:
+        _offloaded_embedding = torch.library.custom_op(
+            "unsloth_zoo::gpt_oss_offloaded_embedding", mutates_args = (),
+        )(_offloaded_embedding_impl)
+    except Exception:
+        _offloaded_embedding = None
+if _offloaded_embedding is not None:
+    @_offloaded_embedding.register_fake
+    def _(input_ids, weight):
+        return input_ids.new_empty((*input_ids.shape, weight.shape[-1]), dtype = weight.dtype)
 
 
 def patch_GptOssModel():
@@ -3700,11 +3730,24 @@ def patch_GptOssModel():
             embed_device = self.embed_tokens.weight.device
             # Never non_blocking into the CPU: the lookup can read the ids before the copy lands
             # (generate does not sync between steps, so it embedded the previous token).
-            inputs_embeds = self.embed_tokens(
-                input_ids.to(embed_device, non_blocking = embed_device.type != "cpu")
-            ).to(input_ids.device)
-        if not self.training:
-            inputs_embeds.requires_grad_(False)
+            if (
+                torch.compiler.is_compiling()
+                and _offloaded_embedding is not None
+                and embed_device != input_ids.device
+                and type(self.embed_tokens) is nn.Embedding
+                # Inference only: the op has no backward, and it would skip embed_tokens' forward
+                # hooks (enable_input_require_grads) that frozen-embedding training relies on.
+                and not torch.is_grad_enabled()
+            ):
+                inputs_embeds = _offloaded_embedding(input_ids, self.embed_tokens.weight)
+            else:
+                inputs_embeds = self.embed_tokens(
+                    input_ids.to(embed_device, non_blocking = embed_device.type != "cpu")
+                ).to(input_ids.device)
+        if not self.training and inputs_embeds.requires_grad:
+            # detach, not requires_grad_(False): the embeddings are a non-leaf when an input
+            # requires-grad hook or an offloaded copy produced them, and that raises.
+            inputs_embeds = inputs_embeds.detach()
 
         cache_position = kwargs.pop("cache_position", None)
         if cache_position is None:
@@ -3715,12 +3758,15 @@ def patch_GptOssModel():
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        try:
-            torch._dynamo.mark_static (hidden_states, 0)
-            torch._dynamo.mark_dynamic(hidden_states, 1)
-            torch._dynamo.mark_static (hidden_states, 2)
-        except:
-            pass
+        # Shape hints for the compiled callees; they cannot be traced, so skip them when this
+        # whole forward is being compiled.
+        if not torch.compiler.is_compiling():
+            try:
+                torch._dynamo.mark_static (hidden_states, 0)
+                torch._dynamo.mark_dynamic(hidden_states, 1)
+                torch._dynamo.mark_static (hidden_states, 2)
+            except:
+                pass
 
         # flex_attention_with_sink training windows its own BlockMask; all else needs the per-type mapping.
         _flex_sink_training = self.training and _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED
@@ -3764,7 +3810,8 @@ def patch_GptOssModel():
         if not self.training and qlen == 1 and isinstance(attention_mask, dict) and not _cross_card:
             # Add hack since residuals need to clone outside of the torch.compile region??
             # This forces it to free past residuals
-            torch.compiler.cudagraph_mark_step_begin()
+            if not torch.compiler.is_compiling():
+                torch.compiler.cudagraph_mark_step_begin()
             # Initialize for common return path
             all_hidden_states = None
             all_router_logits = None
@@ -3788,7 +3835,10 @@ def patch_GptOssModel():
                     **kwargs,
                 )
                 _actual_experts = _unwrap_peft_experts(decoder_layer.mlp.experts)
-                if hasattr(_actual_experts, "gate_up_projs"):
+                routed = routed_mlp_forward(decoder_layer.mlp, hidden_states)
+                if routed is not None:
+                    hidden_states = routed
+                elif hasattr(_actual_experts, "gate_up_projs"):
                     hidden_states = moe_forward_inference(
                         decoder_layer.mlp, hidden_states
                     )
