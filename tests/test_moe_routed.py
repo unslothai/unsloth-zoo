@@ -457,6 +457,56 @@ def test_compiled_bf16_retrace_rechecks_the_plan(change, monkeypatch):
         assert got is not None
 
 
+@pytest.mark.parametrize("quant", [True, False])
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("change", ["act_fn", "layout"])
+def test_changed_expert_semantics_are_not_cached(quant, compiled, change, monkeypatch):
+    # Same weights, different activation or gate layout: the routed result must follow the module.
+    if compiled and quant and not MR._LIVE_QUANT:
+        pytest.skip("compiled NF4 keeps the current path before torch 2.10")
+    monkeypatch.setenv("UNSLOTH_MOE_ROUTED_KERNEL", "1")
+    ex = _make("silu", quant = quant)
+    x, idx, w = _route(2)
+    torch._dynamo.reset()
+    f = lambda a, b, c: MR.routed_moe_forward(ex, a, b, c)
+    fn = torch.compile(f, fullgraph = True) if compiled else f
+    with torch.no_grad():
+        assert f(x, idx, w) is not None
+        before = fn(x, idx, w)
+        if change == "act_fn":
+            ex.act_fn = nn.GELU()
+        else:
+            ex.is_concatenated = not getattr(ex, "is_concatenated", True)
+        got = fn(x, idx, w)
+        for k in ("_unsloth_routed_moe", "_unsloth_routed_bf16"):
+            ex.__dict__.pop(k, None)
+        fresh = f(x, idx, w)
+    assert before is not None and fresh is not None and not torch.equal(before, fresh)
+    assert got is None or torch.equal(got, fresh)
+    if not compiled:
+        assert got is not None
+
+
+def test_bias_attached_after_compiled_warmup_is_not_dropped(monkeypatch):
+    if not MR._LIVE_QUANT:
+        pytest.skip("compiled NF4 keeps the current path before torch 2.10")
+    monkeypatch.setenv("UNSLOTH_MOE_ROUTED_KERNEL", "1")
+    ex = _make("silu")
+    x, idx, w = _route(2)
+    torch._dynamo.reset()
+    fn = torch.compile(lambda a, b, c: MR.routed_moe_forward(ex, a, b, c), fullgraph = True)
+    with torch.no_grad():
+        assert MR.routed_moe_forward(ex, x, idx, w) is not None
+        before = fn(x, idx, w)
+        assert before is not None
+        ex.down_proj_bias = nn.Parameter(torch.full((E, H), 0.5, dtype = DT, device = DEV), requires_grad = False)
+        got = fn(x, idx, w)
+        ex.__dict__.pop("_unsloth_routed_moe")
+        fresh = MR.routed_moe_forward(ex, x, idx, w)
+    assert fresh is not None and not torch.equal(before, fresh)
+    assert got is None or torch.equal(got, fresh)
+
+
 @pytest.mark.parametrize("use_lora", [False, True])
 @pytest.mark.parametrize("mode", ["1", "grouped", "bf16"])
 def test_fullgraph_compile_and_cuda_graph_replay(use_lora, mode, monkeypatch):

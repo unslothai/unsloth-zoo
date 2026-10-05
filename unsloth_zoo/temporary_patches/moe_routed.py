@@ -800,6 +800,28 @@ def routed_bf16_moe(x, idx, routing_weights, w_gu, w_dn, b_gu, b_dn, act, interl
 # Generic experts modules (transformers v5 3D experts: Qwen3 / Qwen3.5 MoE, Gemma 4, Mixtral, ...)
 # ---------------------------------------------------------------------------------------
 
+def _semantics(experts):
+    """Everything besides the weights that _act_code / the plans read; compared on every reuse."""
+    from .moe_utils import _uses_own_apply_gate, _gate_up_is_interleaved
+    d, cls = experts.__dict__, type(experts)
+    # Instance dict / submodules / class, as nn.Module.__getattr__ would find them, without its cost.
+    get = lambda n, default: d.get(n, d["_modules"].get(n, d["_parameters"].get(n, getattr(cls, n, default))))
+    return (
+        get("act_fn", None), bool(_gate_up_is_interleaved(experts)), bool(_uses_own_apply_gate(experts)),
+        bool(get("is_transposed", False)), bool(get("has_gate", True)), get("alpha", None), get("limit", None),
+    )
+
+
+def _same_semantics(a, b):
+    # Objects (act_fn, tensor alpha / limit) by identity, plain numbers and flags by value.
+    for x, y in zip(a, b):
+        if x is y:
+            continue
+        if not (isinstance(x, (bool, int, float)) and isinstance(y, (bool, int, float)) and x == y):
+            return False
+    return True
+
+
 def _act_code(experts):
     """ACT constexpr for this experts module, or None when its activation is not one the
     kernels implement. Probed by value, not class name (ACT2FN has many spellings)."""
@@ -923,13 +945,13 @@ def prepare_stacked_nf4(experts, hidden_dim = None):
         key = _stacked_key(experts)
     except Exception:
         return None
-    if state is not None and state["key"] == key:
+    if state is not None and state["key"] == key and _same_semantics(state["sem"], _semantics(experts)):
         return state
     state = _build_stacked_nf4(experts, hidden_dim)
     if state is None:
         experts.__dict__["_unsloth_routed_moe"] = False
         return None
-    state["key"] = key
+    state["key"], state["sem"] = key, _semantics(experts)
     state["held"] = [_stacked_sources(p.quant_state) for p in (experts.gate_up_proj, experts.down_proj)]
     experts.__dict__["_unsloth_routed_moe"] = state
     return state
@@ -1029,9 +1051,11 @@ def _live_biases(experts, state):
     """The state with each stacked [E, N] bias re-read from the module; None if it no longer fits."""
     out = state
     for name, key in (("gate_up_proj_bias", "gate_up"), ("down_proj_bias", "down")):
-        if state[key]["bias"] is None:
-            continue
         bias = getattr(experts, name, None)
+        if state[key]["bias"] is None:
+            if bias is not None:
+                return None  # attached after the tables were built
+            continue
         tb = state[key]
         if (
             not isinstance(bias, torch.Tensor) or tuple(bias.shape) != (state["E"], tb["N"])
@@ -1167,16 +1191,17 @@ def _bf16_views(experts, hidden_dim):
     meta = (gu.dtype, dn.dtype, gu.device, dn.device, tuple(gu.shape), tuple(dn.shape), hidden_dim)
     if torch.compiler.is_compiling():
         # Built on an eager call first; a retrace after a recast or reshape must not reuse its verdict.
-        if cache is None or cache[0][2:] != meta:
+        if cache is None or cache[0][2:] != meta or not _same_semantics(cache[2], _semantics(experts)):
             return None
         plan = cache[1]
     else:
         key = (gu.data_ptr(), dn.data_ptr()) + meta
-        if cache is not None and cache[0] == key:
+        sem = _semantics(experts)
+        if cache is not None and cache[0] == key and _same_semantics(cache[2], sem):
             plan = cache[1]
         else:
             plan = _bf16_plan(experts, gu, dn, hidden_dim)
-            experts.__dict__["_unsloth_routed_bf16"] = (key, plan)
+            experts.__dict__["_unsloth_routed_bf16"] = (key, plan, sem)
     if plan is None:
         return None
     gu_in, dn_in, act, interleaved = plan
@@ -1201,7 +1226,8 @@ def routed_moe_forward(experts, hidden_states, top_k_index, top_k_weights):
         if torch.compiler.is_compiling():
             # Without a live read (torch < 2.10) a compiled call cannot see a requantize: fall back.
             state = experts.__dict__.get("_unsloth_routed_moe")
-            state = _live_quant(experts, state) if isinstance(state, dict) and _LIVE_QUANT else None
+            ok = isinstance(state, dict) and _LIVE_QUANT and _same_semantics(state["sem"], _semantics(experts))
+            state = _live_quant(experts, state) if ok else None
         else:
             state = prepare_stacked_nf4(experts, hidden_dim)
         if not isinstance(state, dict) or top_k_index.numel() > nf4_slot_limit(state["E"]):
