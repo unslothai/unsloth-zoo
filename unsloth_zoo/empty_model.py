@@ -22,6 +22,7 @@ __all__ = [
     "patch_gemma4_vllm_k_eq_v_support",
     "extract_gdn_layers",
     "extract_moe_layers",
+    "vllm_moe_expert_weights",
     "extract_vision_layers",
     "get_model_layer_config",
     "compare_attributes",
@@ -405,11 +406,25 @@ def patch_gemma4_vllm_lora_support():
 
     gemma4_lora_classes = set(gemma4_lora_classes)
 
+    # Unsloth's expert adapters are PEFT target_parameters tensors stacked over experts,
+    # which only vLLM's FusedMoE3DWithLoRA reads. vLLM picks that wrapper from the model
+    # class's is_3d_moe_weight, which Gemma 4 does not set, so the 2D wrapper would take
+    # the adapter and the experts would be served without it. HF stores Gemma 4's experts
+    # exactly as Qwen3.5 MoE does ((E, 2*inter, hidden) / (E, hidden, inter)), which is the
+    # layout the 3D wrapper assumes. Older vLLM without the 3D wrapper keeps the refusal.
+    try:
+        from vllm.lora.layers.fused_moe import FusedMoE3DWithLoRA  # noqa: F401
+        has_3d_moe_lora = True
+    except Exception:
+        has_3d_moe_lora = False
+
     for cls in classes_to_patch:
         if not getattr(cls, "_unsloth_gemma4_class_patched", False):
             cls.supports_lora = True
             if not hasattr(cls, "embedding_modules"):
                 cls.embedding_modules = {}
+            if has_3d_moe_lora and not getattr(cls, "is_3d_moe_weight", False):
+                cls.is_3d_moe_weight = True
             cls._unsloth_gemma4_class_patched = True
 
     _patch_gemma4_vllm_expert_mapping()
@@ -1182,6 +1197,9 @@ def get_model_layer_config(return_non_layered=True):
             "model.language_model.layers.{kk}.post_attention_layernorm",
             "model.language_model.layers.{kk}.pre_feedforward_layernorm",
             "model.language_model.layers.{kk}.post_feedforward_layernorm",
+            "model.language_model.layers.{kk}.pre_feedforward_layernorm_2",
+            "model.language_model.layers.{kk}.post_feedforward_layernorm_1",
+            "model.language_model.layers.{kk}.post_feedforward_layernorm_2",
             "model.language_model.layers.{kk}.self_attn.q_norm",
             "model.language_model.layers.{kk}.self_attn.k_norm",
             "model.language_model.layers.{kk}.cross_attn.q_norm",
@@ -1190,6 +1208,9 @@ def get_model_layer_config(return_non_layered=True):
             "model.layers.{kk}.post_attention_layernorm",
             "model.layers.{kk}.pre_feedforward_layernorm",
             "model.layers.{kk}.post_feedforward_layernorm",
+            "model.layers.{kk}.pre_feedforward_layernorm_2",
+            "model.layers.{kk}.post_feedforward_layernorm_1",
+            "model.layers.{kk}.post_feedforward_layernorm_2",
             "model.layers.{kk}.self_attn.q_norm",
             "model.layers.{kk}.self_attn.k_norm",
             "model.visual.blocks.{kk}.norm1",
@@ -1460,8 +1481,69 @@ def _get_nested_attr(obj, attr_path: str):
     return None
 
 
+def vllm_moe_expert_weights(experts, where, config = None):
+    """A vLLM FusedMoE's (w13, w2) when they are exactly HF's stacked expert tensors.
+
+    HF holds gate_up_proj as (E, 2*inter, hidden) and down_proj as (E, hidden, inter), and
+    vLLM's TRITON / BATCHED_TRITON backends keep w13_weight / w2_weight in that same plain
+    layout, so the training model can alias them with no copy. Every other backend
+    rewrites the experts at load: FlashInfer TRT-LLM (vLLM's pick for LoRA-enabled bf16 MoE
+    on Blackwell) tiles them into a 4-D block layout, and others reorder w13's halves while
+    keeping the shape. Aliasing those would silently train on wrong weights, and copying
+    them would keep a second full set of experts, so refuse instead. Quantized experts are
+    refused too: bitsandbytes packs them into a uint8 blob that is still 3-D, and float8
+    passes is_floating_point(), and neither carries its quant state across.
+
+    Some rewrites keep both the 3-D shape and the 2:1 ratio (TRT-LLM padding the
+    intermediate dim on vLLM 0.31, ROCm AITER shuffling on vLLM < 0.15, which predates
+    unquantized_backend), so the backend is checked by name, the pre-0.15 flags are read
+    directly, and the shape is compared with the config when one is given.
+    """
+    experts = getattr(experts, "base_layer", experts)  # FusedMoEWithLoRA under enable_lora
+    routed = getattr(experts, "routed_experts", experts)  # vLLM >= 0.24: MoERunner.routed_experts
+    w13 = getattr(routed, "w13_weight", None)
+    w2  = getattr(routed, "w2_weight",  None)
+    if w13 is None or w2 is None:
+        raise NotImplementedError(
+            f"Unsloth: fast_inference cannot find stacked MoE expert weights (w13_weight / w2_weight) "
+            f"for {where}; set fast_inference = False."
+        )
+    quant_method = getattr(routed, "quant_method", None)
+    quant_method = getattr(quant_method, "old_quant_method", quant_method)  # FusedMoEModularMethod
+    backend = getattr(quant_method, "unquantized_backend", None)
+    backend = getattr(backend, "name", backend)
+    if backend is None:
+        # vLLM < 0.15 has no backend field; these flags are what rewrote the experts there.
+        if getattr(quant_method, "rocm_aiter_moe_enabled", False): backend = "AITER"
+        elif getattr(quant_method, "flashinfer_cutlass_moe_enabled", False): backend = "FLASHINFER_CUTLASS"
+    expected = None
+    if config is not None:
+        n_experts = getattr(config, "num_experts", None) or getattr(config, "num_local_experts", None)
+        inter = getattr(config, "moe_intermediate_size", None)
+        hidden = getattr(config, "hidden_size", None)
+        if isinstance(n_experts, int) and isinstance(inter, int) and isinstance(hidden, int):
+            expected = (n_experts, 2 * inter, hidden)
+    if backend not in (None, "TRITON", "BATCHED_TRITON") or w13.dim() != 3 or w2.dim() != 3 \
+        or w13.shape[0] != w2.shape[0] \
+        or w13.shape[1] != 2 * w2.shape[2] or w13.shape[2] != w2.shape[1] \
+        or (expected is not None and tuple(w13.shape) != expected):
+        raise NotImplementedError(
+            f"Unsloth: fast_inference cannot rebuild MoE experts from vLLM's {backend} layout "
+            f"(w13 {tuple(w13.shape)}, w2 {tuple(w2.shape)}); set fast_inference = False."
+        )
+    for name, value in (("w13", w13), ("w2", w2)):
+        if value.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            raise NotImplementedError(
+                f"Unsloth: fast_inference cannot rebuild quantized MoE weights ({where} {name} is "
+                f"{value.dtype}); load the model in 16-bit (load_in_4bit = False) or set "
+                "fast_inference = False."
+            )
+    return w13, w2
+pass
+
+
 def extract_moe_layers(
-    moe_block, prefix, state_dict, quant_state_dict, get_state_dict, router = None,
+    moe_block, prefix, state_dict, quant_state_dict, get_state_dict, router = None, config = None,
 ):
     """Alias a vLLM sparse MoE block's weights onto their HF names.
 
@@ -1470,15 +1552,14 @@ def extract_moe_layers(
     and (E, hidden, inter), which is exactly what the HF checkpoint holds, so both alias
     with no reshape and no copy.
 
-    That equivalence only holds for the untiled MoE backends. FlashInfer TRT-LLM rewrites
-    the experts into a (E, hidden/64, 2*inter, 64) block layout, which is a permute of the
-    above and therefore cannot be viewed back; the ndim check below refuses it rather than
-    silently materialising a second copy of the expert weights.
+    That equivalence only holds for the untiled MoE backends; vllm_moe_expert_weights
+    refuses every other layout rather than silently materialising a second copy.
 
     Two block shapes reach here. Qwen3.5 / 3.6 replace the dense MLP with the MoE block, so
     prefix is "...layers.N.mlp" and the router is the block's own .gate. Gemma-4 instead
-    runs the MoE block ALONGSIDE a dense MLP, as layer.moe with a separate layer.router, so
-    prefix is the bare "...layers.N" and router is passed in. Pass whichever the model has.
+    runs the MoE block ALONGSIDE a dense MLP, as layer.moe with a separate layer.router
+    (vLLM 0.19 - 0.30) or with the experts directly on the layer (vLLM >= 0.31), so prefix
+    is the bare "...layers.N" and router is passed in. Pass whichever the model has.
     """
     def store(name, value):
         state_dict[name] = value
@@ -1527,35 +1608,7 @@ def extract_moe_layers(
 
     experts = getattr(moe_block, "experts", None)
     if experts is None: return
-    experts = getattr(experts, "base_layer", experts)
-    experts = getattr(experts, "routed_experts", experts)
-
-    w13 = getattr(experts, "w13_weight", None)
-    w2  = getattr(experts, "w2_weight",  None)
-    if w13 is None or w2 is None:
-        raise RuntimeError(
-            f"Unsloth: could not find stacked expert weights (w13_weight / w2_weight) for {prefix}. "
-            f"vLLM exposed: {[n for n, _ in experts.named_parameters()]}"
-        )
-    if w13.ndim != 3 or w2.ndim != 3:
-        raise RuntimeError(
-            f"Unsloth: vLLM stored the MoE experts for {prefix} in a {w13.ndim}-D kernel layout "
-            f"({tuple(w13.shape)}), which is a permute of the HF layout and cannot be aliased. "
-            "Weight sharing needs an untiled MoE backend."
-        )
-    # Quantized experts cannot be aliased. The dense path handles this via get_state_dict's
-    # bnb branch (qweight.bnb_quant_state / bnb_shard_offsets), but the routed experts skip
-    # get_state_dict entirely, so there is nowhere for a quant state to go. bitsandbytes
-    # stores them as a packed uint8 blob that is still 3-D, so the ndim check above passes
-    # and the blob would be stored under the HF float name with its quant state discarded:
-    # wrong weights, no error, first noticed at some later training step. Refuse loudly.
-    if w13.dtype != w2.dtype or w13.dtype not in (torch.bfloat16, torch.float16, torch.float32):
-        raise RuntimeError(
-            f"Unsloth: vLLM stored the MoE experts for {prefix} as {w13.dtype} / {w2.dtype}, "
-            "which is a quantized layout that cannot be shared with the training model. "
-            "Sparse MoE + fast_inference needs unquantized experts: use load_in_4bit = False "
-            "(16-bit LoRA). Upstream vLLM also does not support bitsandbytes MoE LoRA."
-        )
+    w13, w2 = vllm_moe_expert_weights(experts, prefix, config)
     w13.requires_grad_(False)
     w2 .requires_grad_(False)
     # HF holds these as bare Parameters, so unlike every Linear above there is no ".weight".

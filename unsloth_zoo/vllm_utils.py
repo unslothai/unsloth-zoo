@@ -1394,20 +1394,8 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             get_state_dict(f"{prefix}.w3", 1, state_dict, w13)
             get_state_dict(f"{prefix}.w2", 0, state_dict, feed_forward.w2)
         elif not hasattr(layer, "mlp") and hasattr(getattr(experts, "routed_experts", experts), "w13_weight"):
-            # LFM2-MoE: FusedMoE w13 [E, 2I, H] / w2 [E, H, I] = HF gate_up_proj / down_proj (vLLM >= 0.30: on routed_experts)
-            routed = getattr(experts, "routed_experts", experts)
-            quant_method = getattr(routed, "quant_method", None)
-            quant_method = getattr(quant_method, "old_quant_method", quant_method)  # FusedMoEModularMethod
-            backend = getattr(quant_method, "unquantized_backend", None)
-            backend = getattr(backend, "name", backend)
-            w13, w2 = routed.w13_weight, routed.w2_weight
-            # Other backends reorder w13 at load; TRTLLM is vLLM's pick for LoRA-enabled bf16 MoE on Blackwell.
-            if backend not in (None, "TRITON", "BATCHED_TRITON") or w13.dim() != 3 or w2.dim() != 3 \
-                or w13.shape[1] != 2 * w2.shape[2] or w13.shape[2] != w2.shape[1]:
-                raise NotImplementedError(
-                    f"Unsloth: fast_inference cannot rebuild MoE experts from vLLM's {backend} layout "
-                    f"(w13 {tuple(w13.shape)}, w2 {tuple(w2.shape)}); set fast_inference = False."
-                )
+            # LFM2-MoE: FusedMoE w13 [E, 2I, H] / w2 [E, H, I] = HF gate_up_proj / down_proj (vLLM >= 0.24: on routed_experts)
+            w13, w2 = vllm_moe_expert_weights(experts, f"layer {kk}", text_config)
             moe_tensors = {
                 f"{prefix}.experts.gate_up_proj": w13,
                 f"{prefix}.experts.down_proj": w2,
@@ -1434,12 +1422,15 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         # Gemma-4 keeps a dense MLP and adds a MoE block beside it (layer.moe + layer.router)
         # rather than replacing it, so this runs in addition to, not instead of, the MLP
         # extraction below. Its HF names hang off the layer, with no .mlp. segment.
+        # vLLM 0.31 dropped the layer.moe wrapper and hangs the experts off the layer itself.
         moe_block = getattr(layer, "moe", None)
+        if moe_block is None and hasattr(layer, "experts") and hasattr(layer, "router"):
+            moe_block = layer
         if moe_block is not None and hasattr(moe_block, "experts"):
             extract_moe_layers(
                 moe_block, f"{vllm_text_model_prefix}.layers.{kk}",
                 state_dict, quant_state_dict, get_state_dict,
-                router = getattr(layer, "router", None),
+                router = getattr(layer, "router", None), config = text_config,
             )
 
         if not hasattr(layer, "mlp"):
@@ -1450,6 +1441,7 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             # Sparse MoE block: routed experts are stacked Parameters, not Linears.
             extract_moe_layers(
                 layer.mlp, mlp_prefix, state_dict, quant_state_dict, get_state_dict,
+                config = text_config,
             )
             continue
 
@@ -4296,6 +4288,43 @@ def _moe_expert_lora_refusal_reason(model, peft_config):
 pass
 
 
+def _remap_moe_expert_lora_keys(model, state_dict):
+    """Rename stacked expert adapter keys onto the vLLM module that holds those experts.
+
+    Gemma 4 keeps its experts at `...layers.N.experts` in HF (so in the PEFT adapter), but
+    vLLM nests them one level down at `...layers.N.moe.experts`. vLLM's own rename regex is
+    `$`-anchored, so it fires on the base weight name and never on a LoRA key
+    (vllm-project/vllm#41754), which is why `_check_lora_is_servable` would refuse the
+    adapter. Only a key whose module vLLM does not have, and whose `.moe.experts` sibling
+    it does have, is renamed; everything else passes through untouched.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    if not any(_is_moe_expert_lora_key(k) for k in state_dict): return state_dict
+    runner = _get_vllm_model_runner(model)
+    vllm_model = _get_vllm_lora_model(model, runner)
+    targets = _vllm_lora_target_names(vllm_model, _get_vllm_lora_manager(model, runner))
+    if targets is None: return state_dict
+    module_names = targets[0]
+    weights_mapper = getattr(vllm_model, "hf_to_vllm_mapper", None)
+    if weights_mapper is not None:
+        from .vllm_lora_worker_manager import _drop_stacked_weight_maps
+        weights_mapper = _drop_stacked_weight_maps(weights_mapper)
+
+    remapped = {}
+    for key, value in state_dict.items():
+        if _is_moe_expert_lora_key(key):
+            module_name = _resolve_lora_key_to_module(key, weights_mapper)
+            if module_name is not None and module_name not in module_names \
+                and module_name.endswith(".experts") \
+                and module_name[:-len(".experts")] + ".moe.experts" in module_names:
+                new_key = re.sub(r"(?<!\.moe)\.experts\.", ".moe.experts.", key, count = 1)
+                if _resolve_lora_key_to_module(new_key, weights_mapper) in module_names:
+                    key = new_key
+        remapped[key] = value
+    return remapped
+pass
+
+
 def _check_lora_is_servable(model, keys, source, peft_config):
     """Refuse an adapter vLLM would accept and then silently ignore.
 
@@ -4376,6 +4405,7 @@ def load_lora(model, save_directory, load_tensors = False, lora_request_id = Non
         items = state_dict.items()
         state_dict = {k.replace(".default", ""):v for k, v in items if ".lora_A." in k or ".lora_B." in k}
 
+        state_dict = _remap_moe_expert_lora_keys(model, state_dict)
         _check_lora_is_servable(model, list(state_dict), "the training model", peft_config)
 
         # vllm_lora_already_loaded(model)
