@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 
 try:
@@ -358,12 +360,18 @@ def test_eagle3_narrower_than_its_target_drafts_from_the_concatenated_layers_row
 
 @pytest.mark.parametrize("companion", [None, "z-lab/Qwen3.5-4B-DFlash"])
 def test_speculative_batch_stream_rows_join_and_leave_as_if_decoded_alone(qwen, monkeypatch, companion):
+    from copy import deepcopy
+    from mlx_vlm.models.cache import make_prompt_cache
     from unsloth_zoo.mlx.generate import BatchStream, GenerationRequest, SamplingParams
     from unsloth_zoo.mlx.speculative import ContextDrafter, SpeculativeDraft
     (model, _), ar = qwen, __import__("mlx_vlm.generate.ar", fromlist = ["ar"])
     monkeypatch.setattr(model, "_is_vlm_model", True, raising = False)
     tok = model._processor.tokenizer
     texts = [tok.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt = True, tokenize = False) for p in PROMPTS]
+    banked, size = {}, len(tok.encode(texts[0], add_special_tokens = False))
+    state = SimpleNamespace(checkpoint = lambda count, cache: banked.update({count: deepcopy(cache)}))
+    state.open = lambda prompt: (deepcopy(banked[max(banked)]) if banked else make_prompt_cache(model.language_model), [size - 9, size - 1])
+    resumed = GenerationRequest(prompt = texts[0], max_tokens = 24, prompt_cache_state = state)
     greedy = [GenerationRequest(prompt = texts[0], max_tokens = 40), GenerationRequest(prompt = texts[1], max_tokens = 200)]
     sampled = GenerationRequest(prompt = texts[1], max_tokens = 32, sampling = SamplingParams(temperature = 0.8, top_k = 20, seed = 7))
     reference = lambda request: list(ar.generate_step(mx.array([tok.encode(request.prompt, add_special_tokens = False)]), model, None, None,
@@ -386,7 +394,7 @@ def test_speculative_batch_stream_rows_join_and_leave_as_if_decoded_alone(qwen, 
                 step += 1
         return results
 
-    batched, alone = run({0: greedy[0], 3: greedy[1], 6: sampled, 7: greedy[2]}), run({0: sampled})
+    batched, alone = run({0: greedy[0], 3: greedy[1], 6: sampled, 7: greedy[2], 8: resumed}), run({0: sampled})
     for request, result, expected in zip(greedy, (batched[0], batched[3], batched[7]), upstream):
         n = len(result.token_ids)
         # A stop token ends the reply without joining its text.
@@ -395,6 +403,10 @@ def test_speculative_batch_stream_rows_join_and_leave_as_if_decoded_alone(qwen, 
     assert (batched[6].token_ids, batched[6].logprobs) == (alone[0].token_ids, alone[0].logprobs)
     assert [batched[0].finish_reason, batched[3].finish_reason] == ["length", "stop"]
     assert batched[0].draft_tokens >= batched[0].accepted_draft_tokens > 0
+    assert (batched[8].cached_token_count, sorted(banked)) == (0, [size - 9, size - 1])
+    del banked[size - 1]
+    warm = run({0: resumed})[0]
+    assert (warm.cached_token_count, sorted(banked), warm.token_ids) == (size - 9, [size - 9, size - 1], batched[8].token_ids) and warm.draft_tokens > 0
     # Rows that join mid-flight draft from the features their own prefill captured.
     assert not companion or all(batched[row].draft_tokens > 0 for row in (3, 6))
 

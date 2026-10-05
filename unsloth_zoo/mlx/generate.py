@@ -3525,7 +3525,7 @@ class _SpeculativeBatchSession:
             add_special_tokens = adapter._add_special_tokens(),
             pad_to_uniform_size = False,
         )
-        input_ids = inputs["input_ids"]
+        input_ids, mask = inputs["input_ids"], inputs.get("attention_mask")
         extra = {key: value for key, value in inputs.items() if key not in ("input_ids", "pixel_values", "attention_mask")}
         row = self._next_row
         pending = EngineRow(
@@ -3533,12 +3533,16 @@ class _SpeculativeBatchSession:
             max_tokens = int(request.max_tokens or adapter.defaults.max_tokens), stop_tokens = self.stop_tokens,
             processors = _row_processors(request), uid = row,
         )
+        prefix = self._resume(request.prompt_cache_state, pending.prompt, input_ids, mask, extra)
         state = _PendingResult(
             detokenizer = _new_detokenizer(self.tokenizer, require_independent = True),
             scanner = _StopStringScanner(adapter.defaults.stop_strings),
             prompt_token_count = len(pending.prompt),
+            cached_token_count = prefix,
         )
-        admitted, logprob = self.speculative.admit(adapter.model, pending, input_ids, inputs.get("pixel_values"), inputs.get("attention_mask"), **extra)
+        # The engine row keeps the whole prompt, for copies and the drafter; only the forward starts past the prefix.
+        with self._embedded(len(pending.prompt) - prefix):
+            admitted, logprob = self.speculative.admit(adapter.model, pending, input_ids[:, prefix:], None if prefix else inputs.get("pixel_values"), mask, **extra)
         finished = admitted.pending in self.stop_tokens or admitted.max_tokens == 1
         if not finished:
             try:
@@ -3550,6 +3554,60 @@ class _SpeculativeBatchSession:
         self._pending[row] = state
         self._drawn[row] = ([admitted.pending], [logprob], finished)
         return row
+
+    def _resume(self, state, prompt: list[int], input_ids, mask, extra: dict) -> int:
+        """Open the row's own prompt cache into ``extra`` as ``generate_step`` takes it, and return
+        the prefix it already holds. Position metadata is derived from the whole prompt first, as
+        mlx-vlm does before it trims a cached prefix."""
+        if state is None:
+            return 0
+        cache, lengths = state.open(list(prompt))
+        cache = list(cache)
+        if any(isinstance(entry, _quantized_cache_types()) for entry in cache):
+            raise BatchRowRefused("This request's prompt cache is quantized; speculative batches run on full-precision KV caches.")
+        prefix = _cache_offset(cache)
+        if prefix is None:
+            raise BatchRowRefused("This request's prompt cache holds no offset to resume from.")
+        if prefix >= len(prompt):
+            raise BatchRowRefused(
+                f"This request's prompt cache holds {prefix} of its {len(prompt)} prompt tokens; at least the last one must be prefilled."
+            )
+        media = _media_token_ids(getattr(self.adapter.model, "config", None))
+        if prefix:
+            if any(token in media for token in prompt[prefix:]):
+                raise BatchRowRefused("This request's prompt cache ends before its media tokens; a resumed row prefills text only.")
+            from mlx_vlm.generate.dispatch import _prime_cached_prefix_rope_state
+
+            if not _prime_cached_prefix_rope_state(self.adapter.model, input_ids, mask, extra):
+                raise BatchRowRefused("This request's positions past its cached prefix could not be derived.")
+        extra.update(
+            prompt_cache = cache,
+            # A checkpoint counts embedding columns, which the tokens name only while media stays within its placeholders.
+            prompt_cache_checkpoint = lambda done, entries: self._addressed and state.checkpoint(prefix + done, entries),
+            prompt_cache_checkpoint_lengths = [length - prefix for length in lengths],
+        )
+        return prefix
+
+    @contextmanager
+    def _embedded(self, tokens: int):
+        """Note whether the prompt ``generate_step`` embeds has one column per token."""
+        model = self.adapter.model
+        embed, own = model.get_input_embeddings, vars(model).get("get_input_embeddings")
+
+        def counted(*args, **kwargs):
+            out = embed(*args, **kwargs)
+            self._addressed = out.inputs_embeds.shape[1] == tokens
+            return out
+
+        model.get_input_embeddings = counted
+        try:
+            yield
+        finally:
+            # An instance override that was already there (the audio merge patch) goes back.
+            if own is None:
+                del model.get_input_embeddings
+            else:
+                model.get_input_embeddings = own
 
     def cancel(self, row: int) -> bool:
         return self._take_back(row) is not None
