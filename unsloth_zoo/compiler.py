@@ -2942,13 +2942,21 @@ def create_standalone_class(
     pass
 
     source = f"{compile}\n{source}\n"
-    left = re.match(r"[\s\n]{4,}", leftover).span()[1]
     # Use patched function name if forward was replaced by temporary patch
     forward_func_name = patched_forward_info[0] if patched_forward_info else f"{module}_forward"
-    new_forward = definition + leftover[:left] + \
-        f"return {forward_func_name}({parameters})\n"
-    source_to_replace = patched_forward_info[1] if patched_forward_info else old_source
-    full_class = full_class.replace(source_to_replace, new_forward)
+    if add_loss_kwargs and patched_forward_info is None and full_class.find(definition) == -1:
+        # Inherited forward (deprecated aliases such as Ernie4_5_VL_MoeForConditionalGeneration):
+        # nothing to replace in the class body, so the fused CE class gets an override.
+        body_indent = re.search(r"([ \t]*)def\s", definition).group(1) + "    "
+        new_forward = definition.lstrip("\n") + "\n" + body_indent + \
+            f"return {forward_func_name}({parameters})\n"
+        full_class = full_class.rstrip() + "\n\n" + new_forward
+    else:
+        left = re.match(r"[\s\n]{4,}", leftover).span()[1]
+        new_forward = definition + leftover[:left] + \
+            f"return {forward_func_name}({parameters})\n"
+        source_to_replace = patched_forward_info[1] if patched_forward_info else old_source
+        full_class = full_class.replace(source_to_replace, new_forward)
 
     # New init as well
     if new_init is not None:
