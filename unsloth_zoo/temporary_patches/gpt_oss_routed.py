@@ -223,8 +223,10 @@ def _tb(w, a, a2, c2, off, lut, bias, N, K, blocksize, blocksize2, nested):
 
 
 if triton is not None:
+    # custom_op, not triton_op: Inductor before torch 2.12 dropped the gate_up kernel from the
+    # graph (its output reached down uninitialized). Opaque calls stay fullgraph and graph safe.
 
-    @torch.library.triton_op("unsloth_zoo::routed_nf4_gate_up", mutates_args = ())
+    @torch.library.custom_op("unsloth_zoo::routed_nf4_gate_up", mutates_args = ())
     def _gate_up_op(
         x: torch.Tensor, idx: torch.Tensor, w: torch.Tensor, a: torch.Tensor, a2: torch.Tensor,
         c2: torch.Tensor, off: torch.Tensor, lut: torch.Tensor, bias: Optional[torch.Tensor],
@@ -235,10 +237,14 @@ if triton is not None:
         tb = _tb(w, a, a2, c2, off, lut, bias, N, K, blocksize, blocksize2, nested)
         lora = None if lora_b is None else (lora_b, lora_h, scaling)
         out = torch.empty((idx.numel(), N // 2), dtype = torch.float32, device = x.device)
-        return _gate_up(torch.library.wrap_triton(_routed_gate_up_kernel), x, idx, tb, top_k, lora,
-                        alpha, limit, out)
+        return _gate_up(_routed_gate_up_kernel, x, idx, tb, top_k, lora, alpha, limit, out)
 
-    @torch.library.triton_op("unsloth_zoo::routed_nf4_down", mutates_args = ())
+    @_gate_up_op.register_fake
+    def _(x, idx, w, a, a2, c2, off, lut, bias, N, K, blocksize, blocksize2, nested, top_k,
+          lora_b, lora_h, scaling, alpha, limit):
+        return x.new_empty((idx.numel(), N // 2), dtype = torch.float32)
+
+    @torch.library.custom_op("unsloth_zoo::routed_nf4_down", mutates_args = ())
     def _down_op(
         x: torch.Tensor, idx: torch.Tensor, rw: torch.Tensor, dense_rw: bool, w: torch.Tensor,
         a: torch.Tensor, a2: torch.Tensor, c2: torch.Tensor, off: torch.Tensor, lut: torch.Tensor,
@@ -249,8 +255,12 @@ if triton is not None:
         tb = _tb(w, a, a2, c2, off, lut, bias, N, K, blocksize, blocksize2, nested)
         lora = None if lora_b is None else (lora_b, lora_h, scaling)
         out = torch.empty((idx.numel() // top_k, N), dtype = out_dtype, device = x.device)
-        return _down(torch.library.wrap_triton(_routed_down_kernel), x, idx, rw, dense_rw, tb, top_k,
-                     lora, out)
+        return _down(_routed_down_kernel, x, idx, rw, dense_rw, tb, top_k, lora, out)
+
+    @_down_op.register_fake
+    def _(x, idx, rw, dense_rw, w, a, a2, c2, off, lut, bias, N, K, blocksize, blocksize2, nested,
+          top_k, lora_b, lora_h, scaling, out_dtype):
+        return x.new_empty((idx.numel() // top_k, N), dtype = out_dtype)
 
 
 def _table_args(tb):
