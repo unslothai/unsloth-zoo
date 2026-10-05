@@ -592,6 +592,105 @@ pass
 TEMPORARY_PATCHES.append(patch_CsmProcessor_apply_chat_template)
 
 
+# create_causal_mask is compiled below, and under compile transformers' `_ignore_causal_mask_sdpa`
+# always refuses, so an unpadded batch still gets a dense 4D mask and SDPA loses its flash /
+# cuDNN `is_causal` kernels (head_dim 256, T=8192, B200: 63.1 ms masked vs 6.8 ms maskless).
+# When the call is a plain causal one, build it eagerly and let transformers decide.
+# UNSLOTH_SKIP_CAUSAL_MASK=0 keeps the compiled builder for every call.
+CAUSAL_MASK_SKIP_STATS = {"skipped": 0}
+_SKIP_CAUSAL_MASK_ENV = "UNSLOTH_SKIP_CAUSAL_MASK"
+# The only arguments a plain causal call carries. Anything else that is set (or_mask_function,
+# and_mask_function, block_sequence_ids, encoder_hidden_states, a new overlay) keeps the mask.
+_PLAIN_CAUSAL_MASK_ARGUMENTS = frozenset((
+    "config", "inputs_embeds", "input_embeds", "attention_mask", "cache_position",
+    "past_key_values", "position_ids", "layer_idx", "allow_is_causal_skip",
+))
+
+
+def _is_tracing_masks():
+    try:
+        if torch.compiler.is_compiling():
+            return True
+    except Exception:
+        pass
+    return torch.jit.is_tracing()
+
+
+def _maskless_causal_arguments(signature, args, kwargs):
+    """Arguments for an eager create_causal_mask call that may return None, else None.
+
+    A None mask only means causal where the attention function turns it into `is_causal=True`:
+    SDPA does, eager applies no mask at all and flex expects a BlockMask. `is_causal` is
+    top-left aligned, so it is the right mask only when queries and keys line up, i.e. no cache.
+    Padding and packed (reset) position_ids need the mask. A 2D mask of all ones and position_ids
+    without a reset carry no information beyond causal, so they are dropped before the call.
+    """
+    # Tracing first: a fullgraph user compile must not reach anything below.
+    if _is_tracing_masks():
+        return None
+    if os.environ.get(_SKIP_CAUSAL_MASK_ENV, "1") == "0":
+        return None
+    try:
+        bound = signature.bind(*args, **kwargs)
+    except TypeError:
+        return None
+    arguments = dict(bound.arguments)
+    for name, parameter in signature.parameters.items():
+        if name not in arguments:
+            continue
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            arguments.update(arguments.pop(name))
+        elif parameter.kind is inspect.Parameter.VAR_POSITIONAL:
+            if arguments.pop(name):
+                return None
+    for name, value in arguments.items():
+        if value is not None and name not in _PLAIN_CAUSAL_MASK_ARGUMENTS:
+            return None
+    if arguments.get("allow_is_causal_skip", True) is not True:
+        return None
+
+    config = arguments.get("config", None)
+    if getattr(config, "_attn_implementation", None) != "sdpa":
+        return None
+    if getattr(config, "is_causal", True) is not True:
+        return None
+    if arguments.get("past_key_values", None) is not None:
+        return None
+    embeds = arguments.get("inputs_embeds", arguments.get("input_embeds", None))
+    if not isinstance(embeds, torch.Tensor) or embeds.ndim != 3:
+        return None
+    batch_size, q_length = embeds.shape[0], embeds.shape[1]
+    if q_length < 2:
+        return None
+
+    attention_mask = arguments.get("attention_mask", None)
+    if attention_mask is not None:
+        if (
+            not isinstance(attention_mask, torch.Tensor)
+            or attention_mask.ndim != 2
+            or attention_mask.is_floating_point()
+            or tuple(attention_mask.shape) != (batch_size, q_length)
+        ):
+            return None
+    position_ids = arguments.get("position_ids", None)
+    if position_ids is not None:
+        if (
+            not isinstance(position_ids, torch.Tensor)
+            or position_ids.ndim != 2
+            or position_ids.shape[-1] != q_length
+        ):
+            return None
+    # One host sync each, the same `.all()` transformers itself runs when it is not compiled.
+    if attention_mask is not None and not bool(attention_mask.all()):
+        return None
+    if position_ids is not None and not bool((position_ids.diff(dim = -1) == 1).all()):
+        return None
+    for name in ("attention_mask", "position_ids"):
+        if name in arguments:
+            arguments[name] = None
+    return arguments
+
+
 def patch_transformers_masks():
     # No UNSLOTH_COMPILE_DISABLE early return: `_torch_compile` is already a no-op there, and the kwarg fixes still apply.
     try:
@@ -647,11 +746,13 @@ def patch_transformers_masks():
             original_create_sliding_window_causal_mask, fullgraph = False, dynamic = True
         )
 
-    def wrap(f, original, prepared_mask_shortcut = True):
+    def wrap(f, original, prepared_mask_shortcut = True, maskless_causal = False):
         # `input_embeds` <= 5.1 vs `inputs_embeds` 5.2+ (transformers#43916); `cache_position` gone in 5.9 (#45884): read the signature, not the version.
         try:
-            parameters = inspect.signature(original).parameters
+            signature = inspect.signature(original)
+            parameters = signature.parameters
         except (TypeError, ValueError):
+            signature = None
             parameters = {}
         accepted = set(parameters)
         takes_var_kwargs = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
@@ -682,13 +783,23 @@ def patch_transformers_masks():
                     isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 4
                 ):
                     return attention_mask
+            if maskless_causal and signature is not None:
+                arguments = _maskless_causal_arguments(signature, args, kwargs)
+                if arguments is not None:
+                    # Eager, so transformers' own `is_causal` skip is reachable; it still decides.
+                    mask = original(**arguments)
+                    if mask is None:
+                        CAUSAL_MASK_SKIP_STATS["skipped"] += 1
+                    return mask
             return f(*args, **kwargs)
         return return_attention_mask
     pass
 
     masking_utils._unsloth_original_create_causal_mask = original_create_causal_mask
     masking_utils._unsloth_original_create_sliding_window_causal_mask = original_create_sliding_window_causal_mask
-    masking_utils.create_causal_mask = wrap(compiled_create_causal_mask, original_create_causal_mask)
+    masking_utils.create_causal_mask = wrap(
+        compiled_create_causal_mask, original_create_causal_mask, maskless_causal = True,
+    )
     masking_utils.create_sliding_window_causal_mask = wrap(
         compiled_create_sliding_window_causal_mask, original_create_sliding_window_causal_mask
     )
