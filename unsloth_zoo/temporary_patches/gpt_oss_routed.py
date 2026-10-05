@@ -116,7 +116,6 @@ def _build_table(projs, device):
             for b in biases
         ) or b0.dtype not in _BIAS_KINDS:
             return None
-        # Live biases; the launch resolves their pointer table (moe_routed._bias_args).
         bias, bias_kind = list(biases), _BIAS_KINDS[b0.dtype]
     return {
         "w": as_i64(w), "a": as_i64(a), "a2": as_i64(a2), "c2": as_i64(c2),
@@ -172,8 +171,7 @@ def _ptrs(tensors):
 
 
 def _snapshot(experts):
-    """What the tables were built from, for every expert of both projections. Holds every
-    buffer the tables point at, so a replaced one stays allocated until the next rebuild."""
+    """What the tables were built from; holds their buffers so a replaced one outlives them."""
     mods = (tuple(experts.gate_up_projs._modules.values()), tuple(experts.down_projs._modules.values()))
     projs = [p for group in mods for p in group]
     wrappers = [p._modules for p in projs if "base_layer" in p._modules]
@@ -213,8 +211,7 @@ def _snapshot_current(experts, snap):
     if not _same(quant_states, snap["quant_states"]) or not _same(list(map(_get_bias, snap["params"])), snap["biases"]):
         return False
     try:
-        # Identity first; a replaced tensor falls to Tensor.__eq__, which raises unless it is
-        # one element of equal value (safe: the tables hold that same value).
+        # Identity first: Tensor.__eq__ raises unless one element of equal value (which the tables hold).
         if _quant_fields(quant_states, snap["nested"]) != snap["fields"]:
             return False
         if _copied(quant_states, snap["nested"]) != snap["copied"]:
@@ -261,13 +258,11 @@ def prepare_routed_experts(experts):
     try:
         if isinstance(state, dict) and _snapshot_current(experts, state["snapshot"]):
             return state
-        # Declined before (a CPU or unsupported layout): stays declined only while the weights are
-        # the same. Kept as ids and addresses, not references, so a moved model frees its old copy.
+        # Declined keyed by ids/addresses, not references, so a moved model frees its old copy.
         if isinstance(state, tuple) and state == _decline_key(experts):
             return None
         snap = _snapshot(experts)
     except Exception:
-        # No longer an all-NF4 layout (e.g. an expert was swapped): drop any old tables.
         if state is not None:
             experts._unsloth_routed_nf4 = None
         return None
@@ -288,8 +283,7 @@ def prepare_routed_experts(experts):
 
 
 def _lora(projs):
-    """(A list, B list, scaling) of the single active adapter: each expert's live lora_A [r, in]
-    and lora_B [out, r]. None without LoRA; False for a LoRA setup this path does not cover."""
+    """(A list, B list, scaling) of the active adapter; None without LoRA, False if unsupported."""
     first = projs[0]
     if not hasattr(first, "lora_A"):
         return None
@@ -305,7 +299,6 @@ def _lora(projs):
         return False
     cache = getattr(projs, "_unsloth_routed_lora", None)
     try:
-        # Every expert's live A / B (plain dict lookups: this runs once per layer call).
         A = [proj._modules["lora_A"]._modules[name]._parameters["weight"] for proj in projs]
         B = [proj._modules["lora_B"]._modules[name]._parameters["weight"] for proj in projs]
     except (KeyError, AttributeError):
@@ -329,8 +322,7 @@ def _lora(projs):
 
 
 def routed_experts_forward(experts, hidden_states, router_indices, routing_weights, _state = None):
-    """Routed eval forward for a ModuleList NF4 gpt-oss experts module, or None if ineligible.
-    routing_weights: dense [T, E] or [T, top_k]. _state: tables already validated this call."""
+    """Routed eval forward for NF4 gpt-oss experts, or None. routing_weights: [T, E] or [T, top_k]."""
     if _routed_disabled():
         return None
     if torch.is_grad_enabled() or experts.training or not hidden_states.is_cuda:

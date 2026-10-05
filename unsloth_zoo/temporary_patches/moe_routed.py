@@ -14,21 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Routed MoE expert inference: only the experts the router picked are read.
-
-Decode-sized no-grad calls skip dequantize-all + grouped_mm; no host sync, fixed grid.
-
-NF4 (bitsandbytes), two launches per layer, dequantized inside the GEMV:
-  gate_up: one GEMV per (token, slot) -> [P, I] fp32 activation (bias, LoRA B, gated act fused).
-  down:    per token, GEMV per slot, bias, LoRA B, routing weight and the top-k sum in a fixed
-           order, written once in the output dtype (fp32 accumulation, no atomics).
-Constexpr axes:
-  STACKED: one stacked Params4bit [E, N, K], or a pointer table of per-expert Linear4bit.
-  ACT:     gpt-oss clamp-swiglu, silu, gelu (tanh) or gelu (erf), gate * up.
-  INTERLEAVED: gate / up rows alternate, else [gate; up] halves.
-  LORA_KIND: LoRA B as one [E, N, r] tensor, or a pointer table to each live lora_B.
-BF16 / FP16 3D experts use the expert-major kernel.
-"""
+"""Routed MoE expert inference for decode-sized no-grad calls: only the routed experts are read."""
 
 __all__ = [
     "ROUTED_MAX_SLOTS",
@@ -77,11 +63,8 @@ def _env_int(name, default):
 
 
 # Above this many (token, expert) slots the routed kernels lose to dequant + grouped_mm.
-# gpt-oss (gpt_oss_routed.py, top-4):
 ROUTED_MAX_SLOTS = _env_int("UNSLOTH_MOE_ROUTED_MAX_SLOTS", 64)
-# Generic 3D experts: routed NF4 cost grows with slots P, dequantize-all with E. On B200,
-# routed / current time is ~0.67 at P = E and ~1.2 at 2E across E 32-256, so route while P <= E.
-# BF16 routed wins only up to 32 slots. UNSLOTH_MOE_ROUTED_MAX_SLOTS sets an absolute limit.
+# B200: routed NF4 / current is ~0.67 at P = E, ~1.2 at 2E (E 32-256), so route while P <= E; BF16 wins up to 32.
 NF4_MAX_SLOTS = _env_int("UNSLOTH_MOE_ROUTED_MAX_SLOTS", -1)
 NF4_MAX_SLOTS = None if NF4_MAX_SLOTS < 0 else NF4_MAX_SLOTS
 NF4_SLOTS_PER_EXPERT = 1.0
@@ -96,9 +79,7 @@ def nf4_slot_limit(num_experts):
 
 
 def routed_mode():
-    """UNSLOTH_MOE_ROUTED_KERNEL: "1" (default, fused routed kernels), "0" (off, the
-    dequantize-all + grouped_mm path) or "grouped" (selective dequant of the routed experts
-    into a scratch + torch._grouped_mm; comparator arm)."""
+    """UNSLOTH_MOE_ROUTED_KERNEL: "1" (default), "0" (off) or "grouped" (selective dequant comparator)."""
     mode = os.environ.get("UNSLOTH_MOE_ROUTED_KERNEL", "1").strip().lower()
     if mode in ("0", "false", "off", "no"):
         return "0"
@@ -113,8 +94,7 @@ if triton is not None:
     def _nf4_dot(W, A, A2, C2, offset, LUT, rows64, rmask, x_chunk, k0, K,
                  BLOCKSIZE: tl.constexpr, BLOCKSIZE2: tl.constexpr, NESTED: tl.constexpr,
                  BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
-        # sum_k dequant(W[rows, k0:k0 + BLOCK_K]) * x_chunk, as bitsandbytes dequantizes.
-        # rows64 index the (flat) buffer's rows: absmax / state2 blocks are global indices.
+        # rows64 index the flat buffer's rows: absmax / state2 blocks are global indices.
         HALF_K: tl.constexpr = BLOCK_K // 2
         NB: tl.constexpr = BLOCK_K // BLOCKSIZE
         half_k = tl.arange(0, HALF_K)
@@ -137,7 +117,6 @@ if triton is not None:
     @triton.jit
     def _expert_tables(e, W_PTRS, A_PTRS, A2_PTRS, C2_PTRS, OFFSETS, NESTED: tl.constexpr, STACKED: tl.constexpr):
         if STACKED:
-            # One stacked buffer per tensor: the expert offset goes into the row index.
             W = W_PTRS
             A = A_PTRS
             A2 = A2_PTRS
@@ -173,7 +152,6 @@ if triton is not None:
     @triton.jit
     def _lora_b(acc, LORA_B, LORA_H, e, s, rows64, rmask, scaling, stride_be, stride_bn, stride_br,
                 R: tl.constexpr, R_PAD: tl.constexpr, LORA_KIND: tl.constexpr):
-        # acc += scaling * B[e][rows] @ H[s], H = A[e] @ x precomputed per slot.
         j = tl.arange(0, R_PAD)
         jmask = j < R
         if LORA_KIND == 0:
@@ -187,7 +165,7 @@ if triton is not None:
 
     @triton.jit
     def _expert_bias(BIAS, e, N, rows64, rmask, BIAS_KIND: tl.constexpr):
-        # Live bias, never a copy. 1 / 2 / 3: pointer table (fp32 / bf16 / fp16), 4: stacked [E, N].
+        # 1 / 2 / 3: pointer table (fp32 / bf16 / fp16), 4: stacked [E, N].
         if BIAS_KIND == 4:
             B = BIAS + e * N
         elif BIAS_KIND == 2:
@@ -268,8 +246,7 @@ if triton is not None:
         R: tl.constexpr, R_PAD: tl.constexpr, LORA_KIND: tl.constexpr, BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
     ):
-        # OUT[t] = sum_k rw[t, k] * (dequant(W[e_k]) @ X[t * TOP_K + k] + BIAS[e_k] (+ LoRA)),
-        # fp32 accumulation, one store in the output dtype: no atomics, deterministic.
+        # Fixed-order top-k sum, one store: no atomics, deterministic.
         t = tl.program_id(0)
         rows = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
         rmask = rows < N
@@ -304,7 +281,6 @@ if triton is not None:
     @triton.jit
     def _lora_h_kernel(X, IDX, A_PTRS, OUT, K, ROW_DIV, R: tl.constexpr, LORA_KIND: tl.constexpr,
                        BLOCK_K: tl.constexpr):
-        # OUT[p, j] = A[IDX[p]][j] @ X[p // ROW_DIV], fp32. One program per (slot, rank row).
         p = tl.program_id(0)
         j = tl.program_id(1)
         e = tl.load(IDX + p).to(tl.int64)
@@ -324,8 +300,7 @@ if triton is not None:
         Q, OUT, UNIQ, LUT, ABSMAX, CODE2, ABSMAX2, OFFSET, BYTES_PER_EXPERT,
         BLOCKSIZE: tl.constexpr, BLOCKSIZE2: tl.constexpr, NESTED: tl.constexpr, BLOCK: tl.constexpr,
     ):
-        # OUT[g] = dequant(expert UNIQ[g]) in OUT's dtype, bit-identical to bitsandbytes
-        # (launched with fp fusion off: product, then add, two roundings); UNIQ[g] < 0 skips.
+        # Bit-identical to bitsandbytes only with fp fusion off (product, then add, two roundings).
         g = tl.program_id(0)
         e = tl.load(UNIQ + g).to(tl.int64)
         if e < 0:
@@ -347,7 +322,6 @@ if triton is not None:
         offs2 = tl.program_id(1).to(tl.int64) * (2 * BLOCK) + tl.arange(0, 2 * BLOCK).to(tl.int64)
         tl.store(OUT + g.to(tl.int64) * (2 * BYTES_PER_EXPERT) + offs2, w, mask = offs2 < 2 * BYTES_PER_EXPERT)
 
-    # BF16 / FP16 experts: 3D [E, K, N] weights, one program per (expert, N block, K split).
     @triton.jit
     def _routed_bf16_expert_kernel(
         X, IDX, W, BIAS, OUT,
@@ -362,7 +336,6 @@ if triton is not None:
         BLOCK_K: tl.constexpr,
         SPLIT_K: tl.constexpr,
     ):
-        # Reads the expert's weight tile once for every slot routed to it (masked dot over P).
         e = tl.program_id(0)
         nb = tl.program_id(1)
         sk = tl.program_id(2)
@@ -396,17 +369,13 @@ if triton is not None:
         tl.store(out_ptr, acc.to(OUT.dtype.element_ty), mask = hit[:, None] & nmask[None, :])
 
 
-# ---------------------------------------------------------------------------------------
-# NF4 launches. A table `tb` is a dict: w / a / a2 / c2 / off (pointer tables, or the stacked
-# tensors themselves), lut, bias, N, K, blocksize, blocksize2, nested, stacked.
-# ---------------------------------------------------------------------------------------
+# NF4 table `tb`: dict of w / a / a2 / c2 / off, lut, bias, N, K, blocksize(2), nested, stacked.
 
 def _block_k(K, blocksize):
     return max(blocksize, min(1024, triton.next_power_of_2(K)))
 
 
 def _lora_args(lora, dummy):
-    # (B, H [P, r] fp32, scaling, r, strides, LORA_KIND) or dummies.
     if lora is None:
         return dummy, dummy, 0.0, 1, (0, 0, 0), 0
     B, H, scaling = lora[:3]
@@ -420,8 +389,7 @@ def _lora_args(lora, dummy):
 
 
 def _bias_args(tb):
-    # Per-expert bias tables are resolved on every launch: bitsandbytes recasts Linear4bit.bias
-    # into new storage whenever the input dtype differs.
+    # Resolved per launch: bitsandbytes recasts Linear4bit.bias into new storage on dtype change.
     bias = tb["bias"]
     if isinstance(bias, (list, tuple)):
         got = lora_pointer_table(bias)
@@ -544,8 +512,7 @@ def _lora_op_args(lora):
 
 
 def routed_gate_up(x, idx, tb, top_k, alpha, limit, lora = None, act = ACT_GPTOSS, interleaved = True):
-    """[T * top_k, N // 2] fp32: act(dequant(W[idx[p]]) @ x[p // top_k] + bias[idx[p]] (+ LoRA)).
-    lora: (B, H [P, r] fp32, scaling) or None; B: [E, N, r] or a list of per-expert [N, r]."""
+    """[T * top_k, N // 2] fp32 gated activation of the routed gate_up GEMVs."""
     if torch.compiler.is_compiling():
         return torch.ops.unsloth_zoo.routed_nf4_gate_up(
             x, idx, *_table_args(tb), top_k, *_lora_op_args(lora), float(alpha), float(limit),
@@ -556,7 +523,7 @@ def routed_gate_up(x, idx, tb, top_k, alpha, limit, lora = None, act = ACT_GPTOS
 
 
 def routed_down(x, idx, rw, dense_rw, tb, top_k, out_dtype, lora = None):
-    """[T, N]: sum over the top-k slots of rw * (dequant(W[e]) @ x[slot] + bias[e] (+ LoRA))."""
+    """[T, N]: routing-weighted top-k sum of the routed down GEMVs."""
     if torch.compiler.is_compiling():
         return torch.ops.unsloth_zoo.routed_nf4_down(
             x, idx, rw, dense_rw, *_table_args(tb), top_k, *_lora_op_args(lora), out_dtype, _bias_list(tb))
@@ -565,16 +532,13 @@ def routed_down(x, idx, rw, dense_rw, tb, top_k, out_dtype, lora = None):
 
 
 LORA_KINDS = {torch.float32: 1, torch.bfloat16: 2, torch.float16: 3}
-# (device, dtype, shape, addresses) -> int64 table. Kept (a captured CUDA graph may still read a
-# table); a new entry needs new storage (a .to() / cast / reload, or bitsandbytes recasting a bias).
+# Never evicted: a captured CUDA graph may still read a table.
 _PTR_TABLES = {}
 _PTR_TABLES_MAX = 1 << 16
 
 
 def lora_pointer_table(weights):
-    """(int64 [E] table of the weights' addresses, LORA_KIND), or None unless every weight is a
-    contiguous CUDA tensor of one shape, dtype and device in LORA_KINDS. Resolved per call, so
-    the kernels always read each expert's live adapter."""
+    """(int64 [E] address table, LORA_KIND) for uniform contiguous CUDA weights, else None."""
     w0 = weights[0]
     kind = LORA_KINDS.get(w0.dtype)
     if kind is None or not w0.is_cuda:
@@ -629,16 +593,12 @@ if triton is not None:
 
 
 def routed_lora_h(x, idx, a_list, row_div = 1):
-    """fp32 [P, r]: row p = A[idx[p]] @ x[p // row_div] for a list of per-expert [r, K] weights,
-    read in place through lora_pointer_table. x: [R, K] contiguous."""
+    """fp32 [P, r]: row p = A[idx[p]] @ x[p // row_div], read in place via lora_pointer_table."""
     if torch.compiler.is_compiling():
         return torch.ops.unsloth_zoo.routed_lora_h(x, idx, list(a_list), int(row_div))
     return _lora_h_eager(x, idx, a_list, row_div)
 
 
-# ---------------------------------------------------------------------------------------
-# Selective NF4 dequant (comparator arm): only the experts in `uniq`, sync-free.
-# ---------------------------------------------------------------------------------------
 
 def _select_dequant_launch(tb, uniq, out):
     E_n = out.shape[0]
@@ -671,8 +631,7 @@ if triton is not None:
 
 
 def nf4_select_dequant(tb, uniq, dtype):
-    """[len(uniq), N, K] in dtype: rows g hold expert uniq[g] of a stacked NF4 table, bit-exact
-    to bitsandbytes; entries with uniq[g] < 0 are left unwritten."""
+    """[len(uniq), N, K]: expert uniq[g] dequantized bit-exact; uniq[g] < 0 left unwritten."""
     if torch.compiler.is_compiling():
         return torch.ops.unsloth_zoo.nf4_select_dequant(
             tb["w"], tb["a"], tb["a2"], tb["c2"], tb["off"], tb["lut"], uniq,
@@ -681,9 +640,6 @@ def nf4_select_dequant(tb, uniq, dtype):
     return _select_dequant_launch(tb, uniq, out)
 
 
-# ---------------------------------------------------------------------------------------
-# BF16 / FP16 expert-major GEMM.
-# ---------------------------------------------------------------------------------------
 
 _EXPERT_CONFIG = None  # tests / sweeps may force one config
 
@@ -735,9 +691,7 @@ if triton is not None:
 
 
 def routed_bf16_gemm(x, idx, weight, bias = None, row_div = 1):
-    """fp32 [P, N]: row p = x[p // row_div] @ weight[idx[p]] + bias[idx[p]].
-    x: [R, K]; idx: [P] expert ids (on device); weight: [E, K, N] (any strides); bias: [E, N] or None.
-    Each active expert's weights are read once; no host sync, so it compiles and captures."""
+    """fp32 [P, N]: row p = x[p // row_div] @ weight[idx[p]] + bias[idx[p]]; no host sync."""
     idx = idx.reshape(-1)
     if x.stride(-1) != 1:
         x = x.contiguous()
@@ -768,8 +722,7 @@ def _act_torch(gate_up, act, interleaved, alpha = 1.702, limit = 7.0):
 
 
 def _lora_delta(x_slots, idx, terms):
-    """sum over terms of (x_slots @ first[idx] @ second[idx]) * scaling, fp32 [P, out].
-    first: [E, in, r]; second: [E, r, out]."""
+    """fp32 [P, out]: sum of (x_slots @ first[idx] @ second[idx]) * scaling over terms."""
     delta = None
     for first, second, scaling in terms:
         h = torch.bmm(x_slots.to(first.dtype)[:, None, :], first[idx])
@@ -780,9 +733,7 @@ def _lora_delta(x_slots, idx, terms):
 
 def routed_bf16_moe(x, idx, routing_weights, w_gu, w_dn, b_gu, b_dn, act, interleaved,
                     gu_lora = (), dn_lora = (), alpha = 1.702, limit = 7.0, out_dtype = None):
-    """MoE output from only the routed BF16 / FP16 experts.
-    x: [T, H]; idx: [T, top_k]; routing_weights: [T, top_k]; w_gu: [E, H, 2I] and w_dn: [E, I, H]
-    (any strides); gu_lora / dn_lora: [(first, second, scaling), ...]. Returns [T, H]."""
+    """[T, H] MoE output from only the routed BF16 / FP16 experts."""
     T, top_k = idx.shape
     flat = idx.reshape(-1)
     gate_up = routed_bf16_gemm(x.to(w_gu.dtype), flat, w_gu, b_gu, row_div = top_k)
@@ -796,15 +747,12 @@ def routed_bf16_moe(x, idx, routing_weights, w_gu, w_dn, b_gu, b_dn, act, interl
     return out.to(out_dtype if out_dtype is not None else x.dtype)
 
 
-# ---------------------------------------------------------------------------------------
-# Generic experts modules (transformers v5 3D experts: Qwen3 / Qwen3.5 MoE, Gemma 4, Mixtral, ...)
-# ---------------------------------------------------------------------------------------
+# Generic transformers v5 3D experts modules (Qwen3 MoE, Gemma 4, Mixtral, ...).
 
 def _semantics(experts):
     """Everything besides the weights that _act_code / the plans read; compared on every reuse."""
     from .moe_utils import _uses_own_apply_gate, _gate_up_is_interleaved
     d, cls = experts.__dict__, type(experts)
-    # Instance dict / submodules / class, as nn.Module.__getattr__ would find them, without its cost.
     get = lambda n, default: d.get(n, d["_modules"].get(n, d["_parameters"].get(n, getattr(cls, n, default))))
     return (
         get("act_fn", None), bool(_gate_up_is_interleaved(experts)), bool(_uses_own_apply_gate(experts)),
@@ -823,8 +771,7 @@ def _same_semantics(a, b):
 
 
 def _act_code(experts):
-    """ACT constexpr for this experts module, or None when its activation is not one the
-    kernels implement. Probed by value, not class name (ACT2FN has many spellings)."""
+    """ACT constexpr or None; probed by value, not class name (ACT2FN has many spellings)."""
     from .moe_utils import _uses_own_apply_gate
     if "GptOssExperts" in type(experts).__name__:
         return ACT_GPTOSS
@@ -849,8 +796,7 @@ def _act_code(experts):
 
 
 def _is_input_major(experts, name, shape, hidden_dim):
-    """True / False as the grouped_mm path would orient this weight ([E, in, out] / [E, out, in]),
-    None when it would reshape it some other way (a registered preprocessor)."""
+    """Whether grouped_mm treats this weight as [E, in, out]; None for a registered preprocessor."""
     from .moe_utils import preprocess_weight
     meta = torch.empty(shape, device = "meta")
     got = preprocess_weight(meta, "gate_up" if name == "gate_up_proj" else "down", hidden_dim,
@@ -927,7 +873,6 @@ def _stacked_key(experts):
         for b in (getattr(experts, "gate_up_proj_bias", None), getattr(experts, "down_proj_bias", None)))
     key = [gu.data_ptr(), dn.data_ptr()]
     for qs in (gu.quant_state, dn.quant_state):
-        # Version counters catch in-place edits of buffers the tables copy (offset, code, state2).
         key += [(t.data_ptr(), t._version) for t in _stacked_sources(qs)]
         key += [qs.blocksize, bool(qs.nested)]
         if qs.nested:
@@ -936,8 +881,7 @@ def _stacked_key(experts):
 
 
 def prepare_stacked_nf4(experts, hidden_dim = None):
-    """Tables for an experts module holding one stacked NF4 Params4bit per projection,
-    built (or revalidated against the buffers' addresses) eagerly; None when unsupported."""
+    """Eagerly built or revalidated tables for stacked NF4 experts; None when unsupported."""
     state = experts.__dict__.get("_unsloth_routed_moe")
     try:
         key = _stacked_key(experts)
@@ -945,7 +889,6 @@ def prepare_stacked_nf4(experts, hidden_dim = None):
         return None
     sem = _semantics(experts)
     if isinstance(state, tuple):
-        # Declined before: stays declined only while the weights and semantics are unchanged.
         if state[0] == (key, hidden_dim) and _same_semantics(state[1], sem):
             return None
     elif state is not None and state["key"] == key and _same_semantics(state["sem"], sem):
@@ -1010,7 +953,6 @@ def _build_stacked_nf4(experts, hidden_dim):
             or not bias.is_contiguous() or bias.dtype not in (torch.float32, torch.bfloat16, torch.float16)
         ):
             return _decline(experts, f"{name} not a contiguous [E, N] float tensor")
-        # The live [E, N] tensor; a swapped one changes the table key (_stacked_key).
         tb["bias"], tb["bias_kind"] = bias.detach(), 4
     return {
         "gate_up": gu, "down": dn, "E": E, "act": act,
@@ -1025,8 +967,7 @@ _LIVE_QUANT = tuple(int(v) for v in torch.__version__.split("+")[0].split(".")[:
 
 
 def _live_quant(experts, state):
-    """Compiled calls skip the eager key check, so read the quant tensors from the module (graph
-    inputs, guarded by Dynamo); None (current path) if they no longer fit the cached layout."""
+    """Compiled calls skip the eager check: re-read quant tensors as graph inputs; None if changed."""
     out = dict(state)
     for name, key in (("gate_up_proj", "gate_up"), ("down_proj", "down")):
         p, tb = getattr(experts, name), state[key]
@@ -1072,8 +1013,7 @@ def _live_biases(experts, state):
 
 
 def _stash_lora(experts):
-    """(gate_up terms, down terms) from the ParamWrapper stash; False when an adapter is attached
-    some other way (a param-level wrapper the stash does not carry)."""
+    """(gate_up terms, down terms) from the ParamWrapper stash; False for other adapter setups."""
     from .moe_utils import take_moe_lora_stash, _has_lora_adapters
     gu = take_moe_lora_stash(experts, "gate_up_proj")
     dn = take_moe_lora_stash(experts, "down_proj")
@@ -1091,7 +1031,6 @@ def _stash_lora(experts):
 
 
 def _lora_h(first, idx, x_slots):
-    # H[p] = x_slots[p] @ first[idx[p]], [P, r] fp32; first: [E, in, r].
     return torch.bmm(x_slots.float()[:, None, :], first[idx].float())[:, 0]
 
 
@@ -1101,7 +1040,6 @@ def _nf4_routed(state, x, idx, rw, top_k, gu_lora, dn_lora, out_dtype):
     lora = None
     if gu_lora is not None:
         first, second, scaling = gu_lora[:3]
-        # second [E, r, 2I] -> B [E, 2I, r] view; H from x per slot.
         lora = (second.transpose(1, 2), _lora_h(first, flat, x.repeat_interleave(top_k, 0)), scaling)
     inter = routed_gate_up(x, flat, gu_tb, top_k, state["alpha"], state["limit"], lora,
                            state["act"], state["interleaved"])
@@ -1113,8 +1051,7 @@ def _nf4_routed(state, x, idx, rw, top_k, gu_lora, dn_lora, out_dtype):
 
 
 def _nf4_grouped(state, x, idx, rw, top_k, gu_lora, dn_lora, out_dtype):
-    """Comparator: dequantize only the routed experts (sync-free, bit-exact to bitsandbytes)
-    into a [min(P, E), N, K] scratch, then torch._grouped_mm."""
+    """Comparator: selective dequant into a scratch, then torch._grouped_mm."""
     gu_tb, dn_tb = state["gate_up"], state["down"]
     flat = idx.reshape(-1)
     P = flat.numel()
@@ -1158,8 +1095,6 @@ def _bf16_supported(device):
 
 
 def _bf16_plan(experts, gu, dn, hidden_dim):
-    """(gate_up input-major, down input-major, ACT, interleaved) for 3D BF16 / FP16 expert
-    weights, or None. Pure metadata: cached per module by _bf16_views."""
     if gu.dim() != 3 or dn.dim() != 3:
         return None
     if getattr(gu, "quant_state", None) is not None or gu.dtype not in (torch.bfloat16, torch.float16) or dn.dtype != gu.dtype:
@@ -1183,8 +1118,7 @@ def _bf16_plan(experts, gu, dn, hidden_dim):
 
 
 def _bf16_views(experts, hidden_dim):
-    """([E, H, 2I], [E, I, H]) views of 3D BF16 / FP16 expert weights plus (ACT, interleaved),
-    or None. Cached per module, keyed on the tensors' identity."""
+    """([E, H, 2I], [E, I, H]) views plus (ACT, interleaved), or None; cached on tensor identity."""
     gu, dn = experts.__dict__.get("_parameters", {}).get("gate_up_proj"), experts.__dict__.get("_parameters", {}).get("down_proj")
     if gu is None or dn is None:
         gu, dn = getattr(experts, "gate_up_proj", None), getattr(experts, "down_proj", None)
@@ -1214,10 +1148,8 @@ def _bf16_views(experts, hidden_dim):
 
 
 def routed_moe_forward(experts, hidden_states, top_k_index, top_k_weights):
-    """Experts output from only the routed experts for a decode-sized no-grad call, or None
-    (callers then run their usual path). top_k_index / top_k_weights: [T, top_k]."""
-    # training: reentrant checkpointing runs the forward under no_grad and replays it with grad,
-    # which would recompute through the other path.
+    """Experts output from only the routed experts, or None (callers run their usual path)."""
+    # Reentrant checkpointing replays under grad through the other path, so skip in training.
     if triton is None or torch.is_grad_enabled() or experts.training or not hidden_states.is_cuda:
         return None
     mode = routed_mode()
@@ -1243,7 +1175,6 @@ def routed_moe_forward(experts, hidden_states, top_k_index, top_k_weights):
             if moe_compute_dtype(hidden_states) != torch.bfloat16 or not _check_torch_grouped_mm_supported():
                 return None
     else:
-        # BF16 / FP16: nothing to dequantize, so the "grouped" comparator is the current path.
         if mode == "grouped":
             return None
         views = _bf16_views(experts, hidden_dim)

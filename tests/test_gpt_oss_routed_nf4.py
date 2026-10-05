@@ -334,9 +334,7 @@ def _routes_through(e, T):
     "what", ["module", "weight", "requantize", "absmax", "nested_absmax", "nested_code", "offset", "offset_inplace"]
 )
 def test_replaced_middle_expert_rebuilds_tables(proj, what):
-    # The tables point at every expert's packed bytes / absmax: replacing a middle expert (a new
-    # module, a new Params4bit, a requantized quant_state, or a new absmax / nested absmax
-    # tensor) must rebuild them, not leave the kernels on the freed buffers. Eager and compiled.
+    # Replacing any expert buffer must rebuild the tables, not leave kernels on freed memory.
     ex = _Experts(True).eval()
     T = 4
     x = torch.randn(1, T, H, device = "cuda", dtype = DT)
@@ -355,7 +353,6 @@ def test_replaced_middle_expert_rebuilds_tables(proj, what):
     elif what == "weight":
         projs[mid].weight = new.weight
     elif what == "requantize":
-        # In place on the same Params4bit: new packed bytes and a new quant_state.
         projs[mid].weight.data = new.weight.data
         projs[mid].weight.quant_state = new.weight.quant_state
     elif what == "absmax":
@@ -384,12 +381,10 @@ def test_replaced_middle_expert_rebuilds_tables(proj, what):
     del junk
     tol = 2 ** -8 * ref.abs().max().item() + 1e-3
     assert got is not None and (got.double() - ref).abs().max().item() <= tol
-    # Compiled: a weight swap retraces onto the dense fallback (None) until an eager call
-    # rebuilds the tables; swaps below the weight keep its identity, so eager calls catch them.
+    # Compiled: a weight swap falls back densely until an eager call rebuilds the tables.
     if what in ("module", "weight"):
         assert got_c is None or (got_c.double() - ref).abs().max().item() <= tol
-    # Once an eager call rebuilt them, a compiled call reads the new tables. torch 2.7's Dynamo
-    # keeps the dense-fallback graph for a weight swap (no aliasing guard): correct, not routed.
+    # torch 2.7 Dynamo keeps the dense-fallback graph after a weight swap: correct, not routed.
     if got_c2 is None:
         assert what in ("module", "weight") and _TORCH < (2, 10), "compiled call did not route after the rebuild"
     else:

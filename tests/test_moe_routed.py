@@ -31,8 +31,6 @@ E, H, I = 8, 256, 192
 
 @pytest.fixture(autouse = True)
 def _slot_limit(monkeypatch):
-    # The toys route up to 8 slots per expert so small E still covers T = 4 at top-k 4 / 8; the
-    # production limit (P <= E) has its own test.
     monkeypatch.setattr(MR, "NF4_MAX_SLOTS", None)
     monkeypatch.setattr(MR, "NF4_SLOTS_PER_EXPERT", 8.0)
 
@@ -48,7 +46,6 @@ def _q4(w, blocksize = 64, nested = True, quant_type = "nf4"):
 
 def _weights(seed, h = H, i = I, e = E):
     g = torch.Generator().manual_seed(seed)
-    # Unit-scale entries times a per-expert scale spanning 2^6: distinct absmax / state2 per expert.
     scale = (2.0 ** torch.linspace(-4, 2, e)).view(e, 1, 1)
     gu = torch.randn(e, 2 * i, h, generator = g) * scale * 0.05
     dn = torch.randn(e, h, i, generator = g) * scale.flip(0) * 0.05
@@ -187,16 +184,12 @@ SEEDS = (1, 2, 3, 4)
 
 
 def _check_vs_current(got, cur, ref, max_factor = 1.5):
-    # Lists are pooled over route seeds: a single T=1 seed has only H outputs, and measured
-    # single-seed routed / current mean-error ratios reach 1.24 by luck (fp16 gelu_tanh) while
-    # the 12-seed mean is below 1 in every act x T x LoRA x dtype cell.
+    # Pooled over seeds: single-seed error ratios reach 1.24 by luck; the 12-seed mean stays below 1.
     if isinstance(got, (list, tuple)):
         got, cur, ref = (torch.cat([t.reshape(-1) for t in v]) for v in (got, cur, ref))
     g_max, g_mean = _err(got, ref)
     c_max, c_mean = _err(cur, ref)
-    # The routed path keeps fp32 between the two GEMVs; the current one rounds gate_up, the
-    # activation and down to the compute dtype, so it must be no worse on average. The output
-    # scaled by (1 + 2**-7) must fail both bounds (test_bounds_reject_a_one_ulp_scale_error).
+    # Routed keeps fp32 between GEMVs, so it must be no worse on average than the current path.
     assert g_mean <= 1.05 * c_mean, (g_mean, c_mean)
     assert g_max <= max_factor * c_max, (g_max, c_max)
 
@@ -222,12 +215,10 @@ def test_stacked_nf4_matches_reference(act, use_lora, T, mode, monkeypatch):
             got = MR.routed_moe_forward(ex, x, idx, w)
             assert got is not None
             assert got.shape == x.shape and got.dtype == x.dtype
-            # The hook in forward_moe_backend_bnb4bit takes the routed path.
             assert torch.equal(forward_moe_backend_bnb4bit(ex, x, idx, w), got)
             curs.append(_current(ex, x, idx, w, monkeypatch))
         gots.append(got)
-    # The grouped comparator rounds gate_up and down to the compute dtype like the current path,
-    # in a different order, so its worst element may land a rounding step further.
+    # Grouped rounds in a different order, so its worst element may be a rounding step further.
     _check_vs_current(gots, curs, refs, 2.0 if mode == "grouped" else 1.5)
 
 
@@ -308,7 +299,6 @@ def test_kill_switch_and_grad_fallback(monkeypatch):
     with torch.no_grad():
         on = forward_moe_backend_bnb4bit(ex, x, idx, w)
     assert calls == [1] and not torch.equal(on, off)
-    # Grad enabled (training): the routed path never runs.
     with torch.enable_grad():
         assert MR.routed_moe_forward(ex, x, idx, w) is None
         assert torch.equal(forward_moe_backend_bnb4bit(ex, x, idx, w), off)
@@ -317,21 +307,17 @@ def test_kill_switch_and_grad_fallback(monkeypatch):
 
 def test_ineligible_calls_fall_back(monkeypatch):
     with torch.no_grad():
-        # Too many slots for a decode call.
         ex = _make("silu")
         x, idx, w = _route(MR.nf4_slot_limit(E) // 4 + 1)
         assert MR.routed_moe_forward(ex, x, idx, w) is None
         x, idx, w = _route(2)
         assert MR.routed_moe_forward(ex, x.cpu(), idx.cpu(), w.cpu()) is None
-        # FP4 (not NF4) storage.
         ex = _make("silu")
         ex.gate_up_proj = _q4(_weights(0)[0], quant_type = "fp4")
         assert MR.routed_moe_forward(ex, x, idx, w) is None
-        # Rows not a whole number of absmax blocks.
         ex = _make("silu", h = 96, i = 64)
         x96, idx96, w96 = _route(2, h = 96)
         assert MR.routed_moe_forward(ex, x96, idx96, w96) is None
-        # An activation the kernels do not implement, an own _apply_gate, a transposed layout.
         ex = _make("silu")
         ex.act_fn = nn.ReLU()
         assert MR.routed_moe_forward(ex, x, idx, w) is None
@@ -345,7 +331,6 @@ def test_ineligible_calls_fall_back(monkeypatch):
         ex = _make("silu")
         ex.is_transposed = True
         assert MR.routed_moe_forward(ex, x, idx, w) is None
-        # The fallback still computes the experts output.
         assert forward_moe_backend_bnb4bit(_make("silu"), x, idx, w) is not None
 
 
@@ -570,9 +555,7 @@ def test_fullgraph_compile_and_cuda_graph_replay(use_lora, mode, monkeypatch):
     else:
         assert torch.equal(compiled, eager)
 
-    # CUDA graph: capture once, replay with new tokens and new routes. Off sm90 / sm100,
-    # torch._grouped_mm copies its offsets to the host (L4, A100, RTX PRO 6000 on torch 2.11), so
-    # the opt-in "grouped" comparator is not capturable there.
+    # Off sm90 / sm100 torch._grouped_mm copies offsets to the host, so "grouped" is not capturable.
     if mode == "grouped" and torch.cuda.get_device_capability()[0] not in (9, 10):
         return
     sx, sidx, sw = x.clone(), idx.clone(), w.clone()
@@ -675,8 +658,6 @@ def test_real_experts_classes(kind, quant, B, monkeypatch):
     _check_vs_current(gots, curs, refs)
 
 
-# Whole tiny causal LMs (real transformers classes, kernel-friendly shrunk configs, random init),
-# experts stored as the bitsandbytes loader stores them: one stacked NF4 Params4bit per projection.
 def _tiny_config(kind):
     common = dict(vocab_size = 512, hidden_size = 256, moe_intermediate_size = 192, num_hidden_layers = 2,
                   num_attention_heads = 4, num_key_value_heads = 2, head_dim = 64, num_experts = 16,
@@ -705,14 +686,11 @@ def _tiny_model(kind):
     cfg._experts_implementation = "unsloth"
     torch.manual_seed(0)
     model = AutoModelForCausalLM.from_config(cfg, dtype = DT).to(DEV).eval()
-    # Random-init routers are near uniform, so a last-bit difference in one layer's output flips a
-    # near-tie top-k pick in the next and the comparison would measure route flips, not kernels.
-    # Decisive routers ([num_experts, hidden] weights scaled up) keep both arms on the same routes.
+    # Near-uniform random routers flip near-tie picks on last-bit diffs; decisive ones keep routes equal.
     with torch.no_grad():
         for p in model.parameters():
             if p.dim() == 2 and tuple(p.shape) == (16, cfg.hidden_size):
                 p.mul_(30)
-    # fp32 twin: same weights, experts as dense fp32 stacks of the NF4 weights' bnb dequant.
     import copy
     ref = copy.deepcopy(model).float()
     experts, ref_experts = [], []
@@ -783,24 +761,16 @@ def test_tiny_causal_lm_decode_routed_vs_current(kind, use_lora, B, monkeypatch)
         assert n2 == {"routed": 0, "grouped": want}, n2
         modes.append(("grouped", grp))
     ref, _ = run("0", ref_model)
-    # Model level, a gross-error tripwire: switching the expert kernels moves the logits about as
-    # much as two bf16 runs as accurate as the current one can differ, |a - c| <= |a - ref| +
-    # |c - ref|. Routes are identical across arms here, but the decisive routers' softmax turns a
-    # last-bit hidden-state change into a visible routing-weight change in the next layer
-    # (measured max 2.2x on one cell), so the max gets headroom; the call-level check below is
-    # the strict accuracy gate.
+    # Model level is a gross-error tripwire (routing-weight drift measured 2.2x); call level is the strict gate.
     e_cur = (cur - ref).abs()
     for mode, logits in modes:
         assert (logits - cur).abs().max() <= 3 * e_cur.max(), mode
         assert (logits - cur).abs().mean() <= 2 * e_cur.mean(), mode
-        # About as close to the fp32 twin as the current path, row by row (tripwire: rows swing by
-        # up to 2.3e-3 either way between equally accurate arms).
+        # Rows swing up to 2.3e-3 either way between equally accurate arms.
         cos = F.cosine_similarity(logits.flatten(1), ref.flatten(1), dim = -1)
         cos_cur = F.cosine_similarity(cur.flatten(1), ref.flatten(1), dim = -1)
         assert (cos >= cos_cur - 5e-3).all(), (mode, cos.tolist(), cos_cur.tolist())
 
-    # Call level: every decode-step experts call the model made, replayed against the fp64
-    # reference: the routed kernels are no less accurate than the path they replace.
     seen = []
     real_fwd = MR.routed_moe_forward
 
@@ -890,7 +860,6 @@ def _biases(mlp):
 
 
 def _train_step(mlp, lr = 5.0):
-    # One optimizer step on the adapters through the dense path (grad on: the routed path stays out).
     params = [p for n, p in mlp.named_parameters() if "lora_" in n]
     opt = torch.optim.SGD(params, lr = lr)
     _dense_loss(mlp).backward()
@@ -901,17 +870,13 @@ def _train_step(mlp, lr = 5.0):
 
 @pytest.mark.parametrize("replay", ["compiled", "cuda_graph"])
 def test_gpt_oss_compiled_decode_follows_an_optimizer_step(replay):
-    # A compiled decode step (or a CUDA graph captured from it) right after an optimizer step, with
-    # no eager call in between, must read the updated adapter: the kernels read each expert's live
-    # lora_A / lora_B through pointer tables, so nothing restacked or cached can go stale.
+    # A compiled step or CUDA graph right after an optimizer step must read the updated adapter.
     from test_gpt_oss_routed_nf4 import H as GH
     from unsloth_zoo.temporary_patches import gpt_oss_routed as GR
     mlp = _gpt_oss_lora_mlp()
     decode = torch.randn(2, 1, GH, device = DEV, dtype = torch.float32)
     graphs = []
-    # A dense forward first, as training does: bitsandbytes recasts Linear4bit.bias to the dense
-    # path's dtype once (new storage, which no CUDA graph captured before it survives; the eager /
-    # compiled case is test_gpt_oss_compiled_decode_after_a_bias_recast_reads_the_new_biases).
+    # Dense forward first: bitsandbytes recasts Linear4bit.bias into new storage a prior graph would miss.
     _dense_loss(mlp)  # grad on, the same path the training step takes
     biases = _biases(mlp)
 
@@ -950,9 +915,7 @@ def test_gpt_oss_compiled_decode_follows_an_optimizer_step(replay):
 
 
 def test_gpt_oss_compiled_decode_after_an_adapter_cast_reads_the_new_weights():
-    # A cast swaps every adapter's storage (new addresses, new dtype) without any eager call: the
-    # compiled step resolves the pointer tables from the live weights inside the op, so it reads
-    # the new storage, never the freed one (torch 2.11 does not recompile on the dtype change).
+    # torch 2.11 does not recompile on the adapter dtype change: the op must resolve live pointers.
     from test_gpt_oss_routed_nf4 import H as GH
     from unsloth_zoo.temporary_patches import gpt_oss_routed as GR
     mlp = _gpt_oss_lora_mlp()
@@ -974,9 +937,7 @@ def test_gpt_oss_compiled_decode_after_an_adapter_cast_reads_the_new_weights():
 
 @pytest.mark.parametrize("lora", [False, True])
 def test_gpt_oss_compiled_decode_after_a_bias_recast_reads_the_new_biases(lora):
-    # bitsandbytes' Linear4bit.forward recasts its bias to the input dtype by swapping in new
-    # storage (a dense fp32 training step on bf16 biases does it). A compiled decode step with no
-    # eager call in between must read the new biases, not the freed buffers.
+    # Linear4bit.forward swaps in new bias storage on recast; compiled calls must not read the freed one.
     from test_gpt_oss_routed_guards import _NF4MLP
     from test_gpt_oss_routed_nf4 import H as GH, _Experts
     from unsloth_zoo.temporary_patches import gpt_oss_routed as GR
@@ -1019,7 +980,6 @@ def test_lora_pointer_table_h_matches_fp64(dtype, r, row_div):
     with torch.no_grad():
         compiled = torch.compile(MR.routed_lora_h, fullgraph = True)
         assert torch.equal(compiled(x, idx, A, row_div), got)
-        # In place: the same table, the new values, in eager and compiled calls.
         for a in A:
             a.mul_(2)
         assert MR.lora_pointer_table(A)[0] is table
@@ -1036,8 +996,6 @@ def test_lora_pointer_table_h_matches_fp64(dtype, r, row_div):
 
 @pytest.mark.parametrize("mode", ["1", "grouped"])
 def test_stacked_biases_are_read_live(mode, monkeypatch):
-    # The stacked layout reads the live [E, N] bias tensors (no copy): in-place updates and
-    # load_state_dict are seen without a rebuild, and a swapped tensor rebuilds the table.
     if mode == "grouped" and (DT != torch.bfloat16 or not MU._check_torch_grouped_mm_supported()):
         pytest.skip("torch._grouped_mm: bf16 on a supported GPU only")
     monkeypatch.setenv("UNSLOTH_MOE_ROUTED_KERNEL", mode)
@@ -1070,11 +1028,7 @@ def test_stacked_biases_are_read_live(mode, monkeypatch):
 
 
 def test_stash_lora_compiled_decode_follows_an_adapter_update(monkeypatch):
-    # Generic 3D experts: PEFT target_parameters adapters reach the routed kernels through the
-    # ParamWrapper stash, extracted from the live lora_A / lora_B on every call (in the graph
-    # when compiled), so an in-place adapter update is seen by the next compiled call. BF16
-    # experts: PEFT wraps a raw stacked Params4bit as one flattened expert (num_experts 1), which
-    # the routed path declines; the stash code is the same for NF4 (real-model NF4 runs cover it).
+    # BF16 here: PEFT flattens a raw stacked Params4bit to one expert, which the routed path declines.
     peft = pytest.importorskip("peft")
     from unsloth_zoo.temporary_patches.moe_utils import patch_param_wrapper_for_moe
     monkeypatch.setenv("UNSLOTH_MOE_ROUTED_KERNEL", "1")
@@ -1131,8 +1085,7 @@ def test_stash_lora_compiled_decode_follows_an_adapter_update(monkeypatch):
 
 
 def test_non_per_expert_stash_keeps_the_current_path():
-    # A wrapper that saw one flattened expert stashes 2D factors (and a wrong expert count would
-    # index out of range): the routed path declines instead of indexing them.
+    # 2D factors from a flattened-expert wrapper must be declined, not indexed out of range.
     ex = _make("silu")
     x, idx, w = _route(2)
     gu, dn = _lora(ex)
