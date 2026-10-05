@@ -13,28 +13,11 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Grouped QLoRA training for gpt-oss bnb NF4 experts (ModuleList of Linear4bit).
-
-The per-expert training loop calls every expert's Linear4bit (+ PEFT LoRA) one by one
-after a .tolist() host sync. Here each projection instead:
-
-  * dequantizes all E experts' NF4 weights into one stacked [E, out, in] buffer with a
-    single Triton launch that reads every expert's own packed bytes through an int64
-    pointer table (no torch.cat copy), bit-identical to bitsandbytes.dequantize_4bit;
-  * runs the frozen base through moe_utils._base_grouped_mm (rebuilt in backward per
-    _moe_recompute_default instead of pinned across the whole backward);
-  * runs the single active LoRA adapter as two torch._grouped_mm calls over
-    torch.stack of the per-expert A / B weights, so every expert's parameters get
-    their own gradient through the stack (exact zeros for an expert routed no tokens,
-    as a stacked 3D LoRA parameter gets; the loop leaves those None, which would need a
-    host sync to know).
-
-No host sync in this module; torch._grouped_mm itself is sync-free on sm90 / sm100 (on
-other GPUs ATen's fallback copies the group offsets to the host once per call).
-Unsupported LoRA setups (dropout > 0, DoRA, lora_bias, several or no active adapters,
-merged or disabled adapters, mixed-adapter batches, non-bf16) return a reason string and
-the caller keeps the per-expert loop.
-"""
+"""Grouped QLoRA training for gpt-oss bnb NF4 experts (ModuleList of Linear4bit): one
+bnb-exact Triton dequant of all experts per projection, base via _base_grouped_mm, LoRA via
+torch._grouped_mm over stacked per-expert A / B. No host sync, so an expert routed no tokens
+gets zero LoRA grads (the loop leaves None). Unsupported setups return a reason string and
+the caller keeps the per-expert loop."""
 
 __all__ = [
     "nf4_dequant_expert_stack",
@@ -55,7 +38,6 @@ except Exception:  # pragma: no cover - no Triton / libdevice, no stacked dequan
     triton = None
 
 _DISABLED_REASON = None
-# Engagement counters (cheap ints) so tests and censuses can prove which path ran.
 CALLS = {"forward": 0, "forward_lora": 0, "stacked_dequant": 0, "bnb_fallback_dequant": 0}
 
 
@@ -67,7 +49,6 @@ if triton is not None:
         n_bytes,
         BLOCKSIZE: tl.constexpr, BLOCKSIZE2: tl.constexpr, NESTED: tl.constexpr, BLOCK: tl.constexpr,
     ):
-        # Program (pid, e): bytes [pid * BLOCK, (pid + 1) * BLOCK) of expert e, written to OUT[e].
         pid = tl.program_id(0).to(tl.int64)
         e = tl.program_id(1).to(tl.int64)
         W = tl.load(W_PTRS + e).to(tl.pointer_type(tl.uint8))
@@ -86,9 +67,7 @@ if triton is not None:
         else:
             A = tl.load(A_PTRS + e).to(tl.pointer_type(tl.float32))
             am = tl.load(A + blk, mask = mask, other = 0.0)
-        # High nibble is the earlier element; lut * absmax in fp32, then rounded to the output dtype.
-        # libdevice mul_rn is mul.rn.ftz.f32: never contracted into an FMA, and it flushes
-        # subnormal inputs / products to signed zero as bitsandbytes' fast-math build does.
+        # mul_rn (mul.rn.ftz.f32): no FMA contraction, subnormals flushed as bitsandbytes does.
         vh = libdevice.mul_rn(tl.load(LUT + (qw >> 4).to(tl.int32)), am).to(OUT.dtype.element_ty)
         vl = libdevice.mul_rn(tl.load(LUT + (qw & 15).to(tl.int32)), am).to(OUT.dtype.element_ty)
         w = tl.reshape(tl.join(vh, vl), (2 * BLOCK,))
@@ -236,11 +215,8 @@ def expert_lora_state(experts):
 
 
 def _proj_signature(proj, out):
-    # Appends what _grouped_bnb4bit_ready / expert_lora_state read about one expert, ~2 us.
-    # Modules go in as themselves (nn.Module compares by identity), mutable containers as
-    # copies, and everything is read through __dict__ / _modules / _parameters, since
-    # nn.Module.__getattr__ and Params4bit's __torch_function__ dominate the cost otherwise.
-    # Readiness does not depend on the packed storage address; the pointer tables re-check it.
+    # Read through __dict__ / _modules / _parameters: nn.Module.__getattr__ and Params4bit's
+    # __torch_function__ would dominate the cost.
     d = proj.__dict__
     mods = d["_modules"]
     base = mods.get("base_layer", proj)
@@ -267,7 +243,6 @@ def ready_signature(experts):
     None when it cannot be built (no caching)."""
     out = []
     try:
-        # Params4bit is a tensor subclass: skip its __torch_function__ for .requires_grad.
         with torch._C.DisableTorchFunctionSubclass():
             for projs in (experts.gate_up_projs, experts.down_projs):
                 out.append(len(projs))
@@ -346,9 +321,7 @@ def _tables(experts, dtype):
     return state
 
 
-# Opaque to Dynamo: the routing tables are keyed on data_ptr and the stacked dequant is a
-# raw Triton launch, so a compiled decoder layer (incl. its gradient-checkpoint replay)
-# calls this eagerly behind one graph break, as GptOssMLP_forward already does.
+# Opaque to Dynamo (data_ptr-keyed tables, raw Triton launch): one graph break per call.
 @torch.compiler.disable
 def grouped_qlora_forward(experts, hidden_states, router_indices, routing_weights,
                           batch_size, num_tokens, num_experts, top_k, lora = None):
@@ -361,10 +334,7 @@ def grouped_qlora_forward(experts, hidden_states, router_indices, routing_weight
     from unsloth_zoo.temporary_patches.gpt_oss import swiglu_torch_forward
 
     device = hidden_states.device
-    # Linear4bit computes in its compute_dtype whatever the input dtype (the residual stream
-    # is fp32 after the first MoE layer); torch._grouped_mm needs bf16 for its backward.
-    # The forced-float32 rule (_pre_set_compute_dtype) and an unset compute dtype (bnb then
-    # computes in the input dtype) keep the loop.
+    # Linear4bit computes in compute_dtype whatever the input dtype; _grouped_mm backward needs bf16.
     for proj in (experts.gate_up_projs[0], experts.down_projs[0]):
         base = getattr(proj, "base_layer", proj)
         if (
@@ -376,9 +346,7 @@ def grouped_qlora_forward(experts, hidden_states, router_indices, routing_weight
     dtype = torch.bfloat16
     if hidden_states.dtype not in (torch.bfloat16, torch.float32):
         return None
-    # Accumulate as the per-expert loop does: Linear4bit returns its input dtype and the
-    # LoRA delta is added in it, so gate_up stays in the input dtype (fp32 after the first
-    # MoE layer); swiglu and the down projection's sum are fp32 (the loop's fp32 gated input).
+    # The loop's dtypes: gate_up in the input dtype, swiglu and the down sum in fp32.
     acc_dtype = hidden_states.dtype
     hidden_states = hidden_states.to(dtype)
     CALLS["forward"] += 1
@@ -396,7 +364,7 @@ def grouped_qlora_forward(experts, hidden_states, router_indices, routing_weight
     recompute = _moe_recompute_default()
     state = _tables(experts, dtype)
     gu_projs, dn_projs = experts.gate_up_projs, experts.down_projs
-    # Biases are read live every call (a small stack), so in-place edits are never stale.
+    # Read live every call, so in-place bias edits are never stale.
     gu_bias = torch.stack([getattr(p, "base_layer", p).bias for p in gu_projs]).detach()
     dn_bias = torch.stack([getattr(p, "base_layer", p).bias for p in dn_projs]).detach()
     gu_tb = state["gate_up"] if state is not None else None

@@ -1204,8 +1204,7 @@ class GptOssExpertsBnb4bit(nn.Module):
         # eager per-expert loop, so honor that and fall back.
         if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1":
             return False
-        # The full check costs ~0.6 ms per layer with LoRA; a verdict is reused while every
-        # expert's weights and adapter state (ready_signature, ~1 us per expert) are unchanged.
+        # The full check costs ~0.6 ms per layer; reuse it while ready_signature is unchanged.
         from unsloth_zoo.temporary_patches.gpt_oss_grouped_qlora import ready_signature
         sig = ready_signature(self)
         cached = getattr(self, "_unsloth_grouped_ready", None)
@@ -2831,8 +2830,7 @@ def _try_grouped_bnb4bit(self, hidden_states, router_indices, routing_weights,
             batch_size, num_tokens, num_experts, top_k,
         )
     except Exception as exc:
-        # Checkpoint early-stop / metadata errors are control flow, and an OOM in the
-        # grouped stacks should surface rather than retry the slower loop.
+        # Checkpoint early-stop is control flow; an OOM should surface, not retry the loop.
         from torch.utils import checkpoint as _ckpt
         control = tuple(
             c for c in (getattr(_ckpt, "_StopRecomputationError", None), getattr(_ckpt, "CheckpointError", None))

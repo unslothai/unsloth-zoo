@@ -93,7 +93,6 @@ def _lora_wrap(ex, r = 16, seed = 7, **kwargs):
     return model
 
 
-# ---------------------------------------------------------------- stacked dequant
 @pytest.mark.parametrize("nested", [True, False])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("blocksize", [64, 128])
@@ -129,7 +128,6 @@ def test_stacked_dequant_negative_control():
     assert not torch.equal(out[0], ref)
 
 
-# ---------------------------------------------------------------- grouped forward / backward
 def _run(ex, x, idx, w, grouped, monkeypatch):
     monkeypatch.setenv("UNSLOTH_GPTOSS_GROUPED", "1" if grouped else "0")
     monkeypatch.delenv("UNSLOTH_COMPILE_DISABLE", raising = False)
@@ -319,8 +317,7 @@ def test_in_place_bias_edit_is_not_stale(monkeypatch):
 @needs_grouped_mm
 @pytest.mark.parametrize("change", ["dropout", "dropout_p", "merge", "disable", "dora_flag", "unwrap"])
 def test_ready_cache_sees_a_middle_expert(change, monkeypatch):
-    # PEFT's model-level APIs touch every expert, but a direct edit of one middle expert
-    # must also re-run the check: the cache is keyed on every expert, not just the ends.
+    # A direct edit of one middle expert must re-run the check.
     monkeypatch.delenv("UNSLOTH_GPTOSS_GROUPED", raising = False)
     monkeypatch.delenv("UNSLOTH_COMPILE_DISABLE", raising = False)
     ex = _lora_wrap(_Experts(True)).train()
@@ -350,9 +347,7 @@ def test_ready_cache_sees_a_middle_expert(change, monkeypatch):
 
 @needs_grouped_mm
 def test_unrouted_expert_gets_zero_lora_grads(monkeypatch):
-    # Knowing which experts got no tokens needs a host sync, so the grouped path gives them
-    # exact zero gradients (as one stacked 3D LoRA parameter does in the bf16 / grouped_mm
-    # MoE paths) where the per-expert loop leaves them None.
+    # No host sync, so unrouted experts get exact zeros where the loop leaves None.
     ex = _lora_wrap(_Experts(True)).train()
     T = 64
     g = torch.Generator().manual_seed(1)
