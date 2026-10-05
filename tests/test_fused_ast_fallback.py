@@ -253,6 +253,20 @@ def test_fused_matches_original(name, logit_scale, monkeypatch):
     torch.testing.assert_close(out[0], ref[0])
 
 
+def test_zero_guarded_scale_keeps_original_loss(monkeypatch):
+    monkeypatch.delenv("UNSLOTH_RETURN_LOGITS", raising = False)
+    original = _compile(COHERE_COMPASS)
+    fused = _compile(rewrite_forward_source_spliced(COHERE_COMPASS)[0])
+    model = _model(0.0)
+    torch.manual_seed(1)
+    hidden = torch.randn(2, 9, H)
+    labels = torch.randint(0, V, (2, 9))
+    ref = _run(original, model, labels, hidden)
+    out = _run(fused, model, labels, hidden)
+    torch.testing.assert_close(out[0], ref[0])
+    torch.testing.assert_close(out[1], ref[1])
+
+
 def test_explicit_shift_labels_are_not_shifted_again(monkeypatch):
     monkeypatch.delenv("UNSLOTH_RETURN_LOGITS", raising = False)
     original = _compile(PP_FORMULANET)

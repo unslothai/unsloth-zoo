@@ -529,9 +529,14 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
     def ind(lines, n):
         return "\n".join(textwrap.indent(x, " " * n) for x in lines)
 
+    # The kernel reads a zero multiplier as "no scale": a guarded zero scale takes the exact path.
+    zero_scale = ""
+    if cap.guarded_scale_expr is not None:
+        scale_src = ast.unparse(cap.guarded_scale_expr)
+        zero_scale = f" or ({scale_src} is not None and {scale_src} == 0)"
     template = (
         "if labels is not None:\n"
-        "    if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1':\n"
+        f"    if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1'{zero_scale}:\n"
         f"{ind(unfused, 8)}\n"
         f"    else:\n{ind(fused, 8)}\n"
         f"else:\n{ind([f'{logits} = {logits_rhs}', *softcap, f'{loss} = None'], 4)}"
