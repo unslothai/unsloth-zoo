@@ -375,6 +375,12 @@ def forward_moe_backend_bnb4bit(self, hidden_states, top_k_index, top_k_weights)
         _moe_recompute_enabled,
         moe_compute_dtype,
     )
+    from .moe_routed import routed_moe_forward
+
+    # Decode-sized no-grad calls: only the routed experts (moe_routed.py).
+    routed = routed_moe_forward(self, hidden_states, top_k_index, top_k_weights)
+    if routed is not None:
+        return routed
 
     target_dtype = moe_compute_dtype(hidden_states)
 

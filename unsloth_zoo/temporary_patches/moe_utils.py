@@ -1164,6 +1164,17 @@ def forward_moe_backend(
     if _moe_uses_fp8_expert_weights is not None and _moe_uses_fp8_expert_weights(self):
         return forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights)
 
+    # BF16 / FP16 decode-sized no-grad calls: only the routed experts (moe_routed.py).
+    routed_moe_forward = None
+    try:
+        from unsloth_zoo.temporary_patches.moe_routed import routed_moe_forward
+    except ImportError:
+        pass
+    if routed_moe_forward is not None:
+        result = routed_moe_forward(self, hidden_states, top_k_index, top_k_weights)
+        if result is not None:
+            return result
+
     backend = select_moe_backend()
     if backend == "grouped_mm":
         return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
