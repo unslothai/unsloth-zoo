@@ -51,24 +51,27 @@ def _file_name_escapes(value):
     )
 
 
+def _is_path_key(name):
+    return name in ("file_name", "file_names") or name.endswith(("_file_name", "_file_names"))
+
+
 def _file_name_arrays(name, array):
-    # Folder builders resolve these keys at any depth (structs, lists of structs), so walk
-    # the whole type, not just the top-level columns.
+    # Folder builders resolve these keys at any depth, and Parquet metadata can wrap them in
+    # dictionary encoding or any list flavour, so unwrap by type rather than by layout.
     import pyarrow as pa
 
-    def is_text(t):
-        return pa.types.is_string(t) or pa.types.is_large_string(t)
+    def is_any(kind, *checks):
+        return any(getattr(pa.types, check, lambda _: False)(kind) for check in checks)
 
     kind = array.type
-    if pa.types.is_struct(kind):
+    if is_any(kind, "is_dictionary"):
+        yield from _file_name_arrays(name, array.dictionary_decode())
+    elif is_any(kind, "is_struct"):
         for field, child in zip(kind, array.flatten()):
             yield from _file_name_arrays(field.name, child)
-    elif pa.types.is_list(kind) or pa.types.is_large_list(kind):
-        if not is_text(kind.value_type):
-            yield from _file_name_arrays(name, array.flatten())
-        elif name == "file_names" or name.endswith("_file_names"):
-            yield name, array.flatten()
-    elif is_text(kind) and (name == "file_name" or name.endswith("_file_name")):
+    elif is_any(kind, "is_list", "is_large_list", "is_fixed_size_list", "is_list_view", "is_large_list_view"):
+        yield from _file_name_arrays(name, array.flatten())
+    elif _is_path_key(name) and is_any(kind, "is_string", "is_large_string", "is_string_view"):
         yield name, array
 
 

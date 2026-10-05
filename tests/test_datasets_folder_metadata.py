@@ -130,3 +130,41 @@ def test_file_name_escapes(value, escapes):
 @pytest.mark.parametrize("value", ["C:x.png", "C:\\x.png", "\\x.png", "\\\\server\\share\\x.png"])
 def test_windows_roots_escape(value):
     assert _file_name_escapes(value) is True
+
+
+def _arrow_cases():
+    import pyarrow as pa
+
+    bad = ["ok.png", "../../secret.txt"]
+    structs = pa.array([{"file_name": v} for v in bad])
+    cases = {
+        "dictionary": pa.table({"file_name": pa.array(bad).dictionary_encode()}),
+        "fixed_size_list": pa.table({"items": pa.FixedSizeListArray.from_arrays(structs, 1)}),
+        "large_list": pa.table({"file_names": pa.array([[v] for v in bad], type = pa.large_list(pa.string()))}),
+        "large_string": pa.table({"file_name": pa.array(bad, type = pa.large_string())}),
+        "dictionary_in_struct": pa.table({"nested": pa.StructArray.from_arrays([pa.array(bad).dictionary_encode()], ["image_file_name"])}),
+    }
+    if hasattr(pa, "string_view"):
+        cases["string_view"] = pa.table({"file_name": pa.array(bad, type = pa.string_view())})
+    return cases
+
+
+@pytest.mark.parametrize("case", sorted(_arrow_cases()))
+def test_arrow_encodings_are_unwrapped(case):
+    from unsloth_zoo.temporary_patches.datasets_folder_metadata import _check_metadata_table
+
+    with pytest.raises(ValueError, match = "Invalid metadata"):
+        _check_metadata_table(_arrow_cases()[case])
+
+
+def test_dictionary_encoded_parquet_metadata_is_refused(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    patch_datasets_folder_metadata_file_name()
+    data_dir = _folder(tmp_path, [{"file_name": "ok.png"}])
+    (data_dir / "train" / "metadata.jsonl").unlink()
+    table = pa.table({"file_name": pa.array(["ok.png", "../../secret.txt"]).dictionary_encode()})
+    pq.write_table(table, data_dir / "train" / "metadata.parquet")
+    with pytest.raises(ValueError, match = "Invalid metadata"):
+        datasets.load_dataset("imagefolder", data_dir = str(data_dir), cache_dir = str(tmp_path / "cache"))
