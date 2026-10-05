@@ -156,28 +156,20 @@ def test_one_line_shifted_ce_still_fuses():
 
 # GraniteSpeech (transformers >= 5.10): the CE call spans lines, so patterns 1 and 3 cannot
 # match; their regex used to run until its 1 s timeout on every compile.
-MULTILINE_MASKED_CE = '''
-    def forward(self, input_ids=None, attention_mask=None, labels=None, logits_to_keep=0, **kwargs):
-        hidden_states = self.language_model(input_ids)[0]
-        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
+MULTILINE_ALIGNED_CE = '''
+    def forward(self, input_ids=None, decoder_input_ids=None, labels=None, **kwargs):
+        outputs = self.model(input_ids, decoder_input_ids=decoder_input_ids)
+        lm_logits = self.lm_head(outputs[0])
+        lm_logits = lm_logits + self.final_logits_bias.to(lm_logits.device)
 
-        loss = None
+        masked_lm_loss = None
         if labels is not None:
-            # Shift so that tokens < n predict n
-            if attention_mask is not None:
-                shift_attention_mask = attention_mask[:, -(logits.shape[1] - 1) :].to(logits.device)
-                shift_logits = logits[..., :-1, :][shift_attention_mask.to(logits.device) != 0].contiguous()
-                shift_labels = labels[..., 1:][shift_attention_mask.to(labels.device) != 0].contiguous()
-            else:
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
-            loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(
-                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1).to(shift_logits.device)
+            labels = labels.to(lm_logits.device)
+            loss_fct = CrossEntropyLoss()
+            masked_lm_loss = loss_fct(
+                lm_logits.view(-1, self.config.vocab_size), labels.view(-1)
             )
-        return (loss, logits)
+        return (masked_lm_loss, lm_logits)
 '''
 
 
@@ -190,9 +182,9 @@ def test_ce_patterns_skip_regex_without_required_tail(monkeypatch):
         return findall(pattern, *args, **kwargs)
 
     monkeypatch.setattr(compiler.regex, "findall", counting_findall)
-    out, fused = compiler.apply_fused_lm_head(MULTILINE_MASKED_CE, "GraniteSpeechForConditionalGeneration")
+    out, fused = compiler.apply_fused_lm_head(MULTILINE_ALIGNED_CE, "BartForConditionalGeneration")
     assert not fused
-    assert out == MULTILINE_MASKED_CE
+    assert out == MULTILINE_ALIGNED_CE
     assert calls == []
 
 
