@@ -438,8 +438,9 @@ def _lora(projs):
         projs._unsloth_routed_lora = cache
     if torch.compiler.is_compiling():
         return torch.stack(cache["A"]), torch.stack(cache["B"]), first.scaling[name]
-    # Restack only after an optimizer step (or any in-place edit) bumps a version counter.
-    versions = tuple(p._version for p in cache["A"]) + tuple(p._version for p in cache["B"])
+    # Restack after an optimizer step (in-place edits bump _version) or a .to() move / cast
+    # (which swaps .data without bumping it, so the storage pointer is checked too).
+    versions = tuple((p._version, p.data_ptr()) for p in cache["A"]) + tuple((p._version, p.data_ptr()) for p in cache["B"])
     if versions != cache["versions"]:
         cache["stacked"] = (torch.stack(cache["A"]).contiguous(), torch.stack(cache["B"]).contiguous())
         cache["versions"] = versions

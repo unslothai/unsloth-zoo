@@ -214,6 +214,22 @@ def test_lora_update_is_not_stale():
     torch.testing.assert_close(after.double(), ref, rtol = 1e-4, atol = 1e-4)
 
 
+def test_lora_storage_swap_is_not_stale():
+    # Module.to() swaps .data without bumping _version; the cached stacks must follow it.
+    ex = _lora_wrap(_Experts(True)).eval()
+    x = torch.randn(1, 2, H, device = "cuda", dtype = torch.float32)
+    idx, w = _routing(2, seed = 4)
+    with torch.no_grad():
+        before = routed_experts_forward(ex, x, idx, w)
+        for name, p in ex.named_parameters():
+            if "lora_B" in name:
+                p.data = p.data + 0.05
+        after = routed_experts_forward(ex, x, idx, w)
+        ref = _reference(ex, x, idx, w)
+    assert not torch.allclose(before, after)
+    torch.testing.assert_close(after.double(), ref, rtol = 1e-4, atol = 1e-4)
+
+
 def test_mixed_adapter_batch_is_left_to_peft():
     # PEFT's adapter_names pre-hook marks a mixed-adapter batch the routed kernels cannot honour.
     from functools import partial
