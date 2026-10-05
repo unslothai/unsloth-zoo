@@ -1602,6 +1602,23 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
 pass
 
 @torch.inference_mode
+def _refresh_placeholder_dims(parent, attr_name, weight):
+    """Give a module whose 2-D .weight was just replaced the sizes of the real weight.
+
+    A Linear keeps in_features / out_features of 1. A top-k router (Qwen3_5MoeTopKRouter and
+    the other HF TopKRouters) reshapes its input to `hidden_dim` in forward, and only
+    copy_attributes would restore it, which is skipped when the original meta model could
+    not be built.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    if attr_name != "weight" or weight.ndim != 2: return
+    if isinstance(parent, torch.nn.Linear):
+        parent.out_features, parent.in_features = weight.shape
+    elif isinstance(getattr(parent, "hidden_dim", None), int) and isinstance(getattr(parent, "num_experts", None), int):
+        parent.num_experts, parent.hidden_dim = weight.shape
+pass
+
+
 def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16, bnb_config = None, is_vision_model = False):
     # All Unsloth Zoo code licensed under LGPLv3
     # Unmerges vLLM modules into an HF-compatible model
@@ -1739,12 +1756,10 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                     layer = torch.nn.Parameter(raw_value, requires_grad = False)
                     exec(f"new_model.{layer_name_br} = layer")
                     # Assigning .weight in place keeps the parent module's CLASS, which is the
-                    # point for routers like Qwen3_5MoeTopKRouter that carry top_k. But when
-                    # the parent is a plain Linear it also keeps create_empty_model's
-                    # placeholder in_features / out_features of 1, so refresh them from the
+                    # point for routers like Qwen3_5MoeTopKRouter that carry top_k. But it also
+                    # keeps create_empty_model's placeholder sizes of 1, so refresh them from the
                     # real weight rather than leaving the module self-describing as 1x1.
-                    if attr_name == "weight" and isinstance(parent, Linear) and raw_value.ndim == 2:
-                        parent.out_features, parent.in_features = raw_value.shape
+                    _refresh_placeholder_dims(parent, attr_name, raw_value)
                 continue
             elif fp8_weight_scale is not None:
                 if fp8_weight_scale.ndim == 1:

@@ -286,3 +286,34 @@ def test_the_untiled_moe_patch_is_unconditional():
     ]
     assert len(calls) == 1
     assert "UNSLOTH_VLLM_TILED_MOE" not in inspect.getsource(vu.patch_vllm)
+
+
+def test_a_router_rebuilt_without_the_meta_model_gets_its_real_hidden_dim():
+    # create_empty_model builds with hidden_size = 1; copy_attributes would restore hidden_dim,
+    # but it is skipped when the original meta model cannot be built.
+    import torch.nn.functional as F
+    import unsloth_zoo.vllm_utils as vu
+
+    class TopKRouter(torch.nn.Module):
+        def __init__(self, num_experts, hidden_dim):
+            super().__init__()
+            self.num_experts, self.hidden_dim = num_experts, hidden_dim
+            self.weight = torch.nn.Parameter(torch.zeros(num_experts, hidden_dim))
+
+        def forward(self, x):
+            return F.linear(x.reshape(-1, self.hidden_dim), self.weight)
+
+    router = TopKRouter(E, 1)
+    real = torch.randn(E, H)
+    router.weight = torch.nn.Parameter(real, requires_grad = False)
+    vu._refresh_placeholder_dims(router, "weight", real)
+    assert (router.num_experts, router.hidden_dim) == (E, H)
+    assert router(torch.randn(2, 3, H)).shape == (6, E)
+
+    linear = torch.nn.Linear(1, 1, bias = False)
+    vu._refresh_placeholder_dims(linear, "weight", torch.randn(4, 5))
+    assert (linear.out_features, linear.in_features) == (4, 5)
+    # Other parameters and modules without router sizes are left alone.
+    plain = torch.nn.Module(); plain.hidden_dim = 1
+    vu._refresh_placeholder_dims(plain, "weight", real)
+    assert plain.hidden_dim == 1
