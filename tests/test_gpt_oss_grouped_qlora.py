@@ -315,6 +315,22 @@ def test_in_place_bias_edit_is_not_stale(monkeypatch):
 
 
 @needs_grouped_mm
+@pytest.mark.parametrize("proj", ["gate_up_projs", "down_projs"])
+def test_replaced_middle_expert_rebuilds_tables(proj, monkeypatch):
+    ex = _Experts(True).train()
+    T = 64
+    x = torch.randn(1, T, H, device = "cuda", dtype = DT)
+    idx, w = _routing(T)
+    _run(ex, x, idx, w, True, monkeypatch)
+    shape = (H, 2 * I) if proj == "gate_up_projs" else (I, H)
+    getattr(ex, proj)[E // 2] = _linear4bit(*shape, True, 999)
+    torch.cuda.empty_cache()
+    out, _, delta = _run(ex, x, idx, w, True, monkeypatch)
+    ref, _, _ = _run(ex, x, idx, w, False, monkeypatch)
+    assert sum(delta.values()) > 0 and _rel(out, ref) < 2e-2
+
+
+@needs_grouped_mm
 @pytest.mark.parametrize("change", ["dropout", "dropout_p", "merge", "disable", "dora_flag", "unwrap"])
 def test_ready_cache_sees_a_middle_expert(change, monkeypatch):
     # A direct edit of one middle expert must re-run the check.

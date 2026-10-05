@@ -304,15 +304,35 @@ def _bnb_fallback_stack(projs, dtype):
     return bnb.functional.dequantize_4bit(data, cache).to(dtype)
 
 
+def _storage_key(experts):
+    out = []
+    for projs in (experts.gate_up_projs, experts.down_projs):
+        for p in projs:
+            weight = getattr(p, "base_layer", p).weight
+            qs = weight.quant_state
+            out.append(weight.data_ptr())
+            out.append(qs.absmax.data_ptr())
+            if getattr(qs, "nested", False):
+                out.append(qs.state2.absmax.data_ptr())
+    return tuple(out)
+
+
 def _tables(experts, dtype):
-    """Pointer tables for both projections (validated on data_ptr per call), or None for the bnb fallback."""
+    """Pointer tables for both projections, or None for the bnb fallback."""
     try:
         from unsloth_zoo.temporary_patches.gpt_oss_routed import prepare_routed_experts
+        # prepare_routed_experts only re-checks the end experts; a replaced middle expert
+        # would leave the kernel reading a freed buffer, so check every expert here.
+        key = _storage_key(experts)
+        state = getattr(experts, "_unsloth_routed_nf4", None)
+        if isinstance(state, dict) and state.get("storage_key") != key:
+            experts._unsloth_routed_nf4 = None
         state = prepare_routed_experts(experts)
     except Exception:
         return None
     if not isinstance(state, dict):
         return None
+    state["storage_key"] = key
     for key in ("gate_up", "down"):
         tb = state[key]
         if "dtype" not in tb:
