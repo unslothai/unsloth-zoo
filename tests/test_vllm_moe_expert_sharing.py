@@ -266,3 +266,18 @@ def test_qwen3_5_moe_vision_qkv_stays_merged():
     # left only the v rows in the training model's vision tower.
     from unsloth_zoo.empty_model import QWEN_VL_MERGED_QKV_TYPES
     assert "qwen3_5_moe" in QWEN_VL_MERGED_QKV_TYPES
+
+
+def test_the_untiled_moe_patch_is_unconditional():
+    # vllm_moe_expert_weights refuses the tiled TRT-LLM layout, so an opt-out would only abort fast_inference.
+    import ast, inspect
+    import unsloth_zoo.vllm_utils as vu
+    tree = ast.parse(inspect.getsource(vu.patch_vllm))
+    function = tree.body[0]
+    calls = [
+        node for node in function.body
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+        and getattr(node.value.func, "id", None) == "patch_vllm_untiled_moe_experts"
+    ]
+    assert len(calls) == 1
+    assert "UNSLOTH_VLLM_TILED_MOE" not in inspect.getsource(vu.patch_vllm)

@@ -962,11 +962,9 @@ def patch_vllm(debug = True):
     patch_vllm_bitsandbytes()
     patch_vllm_lora_tokenizer()
     patch_vllm_lora_load_tensors()
-    # Weight sharing is the whole point of fast_inference, and the tiled TRT-LLM expert
-    # layout defeats it, so decline it by default. Opt back in to trade a second copy of
-    # the expert weights for the faster rollout kernel.
-    if os.getenv("UNSLOTH_VLLM_TILED_MOE", "0") == "0":
-        patch_vllm_untiled_moe_experts()
+    # Always: the training model is rebuilt from vLLM's weights, and vllm_moe_expert_weights
+    # refuses the tiled TRT-LLM expert layout, so allowing it would only make fast_inference fail.
+    patch_vllm_untiled_moe_experts()
     # Match load_vllm's standby check (!= "0") so any truthy value also installs
     # the sleep + cache-reset patches, not just "1".
     if os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0":
