@@ -875,3 +875,96 @@ def test_host_arena_is_registered_portable(monkeypatch):
     reg = _mod._Registered(torch.empty(1024, dtype = torch.uint8), 1024)
     assert calls == [1]  # cudaHostRegisterPortable
     del reg
+
+
+def test_stats_reports_placement_and_timings_after_a_step():
+    if not torch.cuda.is_available():
+        return
+    import torch.utils.checkpoint as cp
+    torch.manual_seed(0)
+    blocks = nn.ModuleList([_XBlock(256) for _ in range(8)]).cuda()
+    sw = BlockSwap(blocks, [1, 3, 5, 7], prefetch_depth = 1, device = "cuda")
+    x = torch.randn(4, 256, device = "cuda", requires_grad = True)
+    enc = torch.randn(4, 256, device = "cuda", requires_grad = True)
+    h = x
+    for b in blocks:
+        h = cp.checkpoint(b, h, enc, use_reentrant = False)
+    h.square().sum().backward()
+    torch.cuda.synchronize()
+    s = sw.stats()
+    assert s["total_layers"] == 8 and s["swapped"] == [1, 3, 5, 7]
+    assert set(s["state"]) == {1, 3, 5, 7} and set(s["state"].values()) <= {"gpu", "host", "copying", "held"}
+    # After backward only the next step's first block is armed.
+    assert list(s["state"].values()).count("host") == 3
+    assert s["copies"] > 0 and s["copy_ms"] > 0 and s["compute_ms"] > 0 and s["layers"] > 0
+    assert s["copy_bytes"] == s["copies"] * sw.blocks[0].nbytes()
+    # The window resets: nothing ran since.
+    assert sw.stats()["copies"] == 0
+    sw.remove()
+
+
+def _auto(n = 8, depth = 1):
+    sw = _scheduler(n, depth = depth)
+    sw._auto, sw._settled, sw._steps = True, False, 0
+    sw._tot = dict.fromkeys(_mod._STAT_KEYS, 0.0)
+    sw._seen, sw._adapt_seen = dict(sw._tot), dict(sw._tot)
+    sw._harvest = lambda: None
+    sw._grow_pool = lambda: True
+    return sw
+
+
+def _step(sw, copy_ms, compute_ms, stall_ms, layers = 8):
+    for k, v in (("copies", layers), ("copy_ms", copy_ms * layers), ("compute_ms", compute_ms * layers),
+                 ("stall_ms", stall_ms * layers), ("layers", layers)):
+        sw._tot[k] += v
+    sw._adapt_depth()
+
+
+def test_auto_depth_deepens_while_a_hideable_copy_stalls():
+    sw = _auto()
+    _step(sw, 5, 9, 2)  # step 1 is warmup
+    assert sw.depth == 1 and not sw._settled
+    _step(sw, 5, 9, 2)
+    _step(sw, 5, 9, 1)
+    assert sw.depth == 3 and not sw._settled
+    _step(sw, 5, 9, 0)
+    assert sw.depth == 3 and sw._settled
+
+
+def test_auto_depth_stays_shallow_when_the_bus_is_slower_than_compute():
+    sw = _auto()
+    _step(sw, 20, 9, 11)
+    _step(sw, 20, 9, 11)
+    # No depth hides a copy longer than a layer's compute; more slots would only cost VRAM.
+    assert sw.depth == 1 and sw._settled
+
+
+def test_auto_depth_stops_when_the_card_has_no_room_for_a_slot():
+    sw = _auto()
+    sw._grow_pool = lambda: False
+    _step(sw, 5, 9, 2)
+    _step(sw, 5, 9, 2)
+    assert sw.depth == 1 and sw._settled
+
+
+def test_auto_depth_starts_at_one_and_settles_with_its_pool():
+    if not torch.cuda.is_available():
+        return
+    blocks = nn.ModuleList([_XBlock(256) for _ in range(8)]).cuda()
+    sw = BlockSwap(blocks, 6, prefetch_depth = "auto", device = "cuda")
+    assert sw.depth == 1 and sw._auto and not sw._settled
+    assert sum(len(v) for v in sw.free.values()) + sw.resident_count() == 2
+    sw.remove()
+
+
+def test_grow_pool_adds_a_slot_only_with_room_for_the_next_step(monkeypatch):
+    if not torch.cuda.is_available():
+        return
+    blocks = nn.ModuleList([_XBlock(256) for _ in range(8)]).cuda()
+    sw = BlockSwap(blocks, 6, prefetch_depth = "auto", device = "cuda")
+    slots = lambda: sum(len(v) for v in sw.free.values()) + sum(b.slot is not None for b in sw.blocks)
+    before = slots()
+    assert sw._grow_pool() and slots() == before + 1
+    monkeypatch.setattr(_mod, "_free_device_bytes", lambda dv: 0)
+    assert not sw._grow_pool() and slots() == before + 1
+    sw.remove()

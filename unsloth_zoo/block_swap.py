@@ -60,6 +60,12 @@ _CHUNK_BYTES = 256 << 20
 # Pin only while this much host RAM stays free: max(4 GiB, 15%); the rest stays pageable.
 _PIN_RESERVE_MIN_BYTES = 4 << 30
 _PIN_RESERVE_FRACTION = 0.15
+# Copy, stall and compute timings for stats(); UNSLOTH_OFFLOAD_STATS=0 skips the timing events.
+_TIMING = os.environ.get("UNSLOTH_OFFLOAD_STATS", "1") != "0"
+# prefetch_depth = "auto": deepest pool it grows to, and the steps it watches before settling.
+_AUTO_MAX_DEPTH = 4
+_AUTO_STEPS = 8
+_AUTO_STALL = 0.01
 
 
 def _host_copy(t):
@@ -148,7 +154,8 @@ def _swappable(module):
 
 class _Block:
     __slots__ = ("params", "host", "devices", "index", "streams", "events", "resident", "slot", "sig",
-                 "pending", "layout", "sizes", "src", "empties", "host_buf", "home")
+                 "pending", "layout", "sizes", "src", "empties", "host_buf", "home",
+                 "t_copy", "copy_open", "marks", "mark_open")
 
     def __init__(self, layer, streams, device, shared = ()):
         self.params, self.host, self.devices = [], [], []
@@ -170,7 +177,12 @@ class _Block:
             if d not in streams:
                 streams[d] = torch.cuda.Stream(device = d)
         self.streams = streams
-        self.events = {d: torch.cuda.Event() for d in self.sizes}
+        self.events = {d: torch.cuda.Event(enable_timing = _TIMING) for d in self.sizes}
+        self.t_copy = {d: torch.cuda.Event(enable_timing = True) for d in self.sizes} if _TIMING else None
+        self.copy_open = False
+        # Compute-stream marks: before the wait, after it, after the layer ran.
+        self.marks = tuple(torch.cuda.Event(enable_timing = True) for _ in range(3)) if _TIMING else None
+        self.mark_open = 0
         self.empties = [torch.empty(0, device = d, dtype = p.dtype) for p, d in zip(self.params, self.devices)]
         self.resident = True
         self.slot = None
@@ -210,8 +222,11 @@ class _Block:
             stream = self.streams[d]
             stream.wait_stream(torch.cuda.current_stream(d))
             with torch.cuda.stream(stream):
+                if self.t_copy is not None:
+                    self.t_copy[d].record(stream)
                 bufs[d].copy_(self.host_buf[d], non_blocking = True)
                 event.record(stream)
+        self.copy_open = self.t_copy is not None
         for p, v in zip(self.params, views):
             p.data = v
         self.slot = slot
@@ -248,11 +263,28 @@ def swap_indices(total, n, placement = "spread"):
 
 
 class BlockSwap:
-    """Install on a layer list; layers at `n` (a count or explicit indices) live on the host."""
+    """Install on a layer list; layers at `n` (a count or explicit indices) live on the host.
+    `prefetch_depth = "auto"` starts at 1 and deepens while copies stall a step that could hide them."""
+
+    # Defaults for instances built without __init__ (the scheduler tests).
+    total = 0
+    current = None
+    _auto = False
+    _settled = True
+    _steps = 0
+    _tot = None
+    _seen = None
+    _adapt_seen = None
 
     def __init__(self, layers, n, prefetch_depth = 2, device = None, placement = "tail"):
         self.blocks, self.handles = [], []
-        self.depth = max(1, prefetch_depth)
+        self._auto = prefetch_depth == "auto"
+        self._settled = not self._auto
+        self.depth = 1 if self._auto else max(1, int(prefetch_depth))
+        self.total = len(layers)
+        self._tot = dict.fromkeys(_STAT_KEYS, 0.0)
+        self._seen = dict(self._tot)
+        self._adapt_seen = dict(self._tot)
         self.streams = {}
         self.free = {}
         self._grew = False
@@ -404,6 +436,8 @@ class BlockSwap:
     def _fetch(self, block, steal = False):
         if block.resident:
             return
+        if getattr(block, "copy_open", False):
+            self._harvest_copy(block)
         slot = self._acquire(block, steal)
         if slot is not None:
             block.prefetch(slot)
@@ -418,8 +452,18 @@ class BlockSwap:
     def _pre(self, i):
         def hook(module, args, kwargs):
             b = self.blocks[i]
+            self.current = self.indices[i]
             self._fetch(b, steal = True)
-            b.wait()
+            marks = getattr(b, "marks", None)
+            if marks is not None:
+                self._harvest_marks(b)
+                stream = torch.cuda.current_stream(b.home)
+                marks[0].record(stream)
+                b.wait()
+                marks[1].record(stream)
+                b.mark_open = 1
+            else:
+                b.wait()
             # Weights kept for backward = recompute sweep, which walks layers in reverse.
             nxt = i - self.depth if _autograd_keeps_weights() else i + self.depth
             if 0 <= nxt < len(self.blocks):
@@ -445,6 +489,10 @@ class BlockSwap:
 
     def _post(self, i):
         def hook(module, args, output):
+            b = self.blocks[i]
+            if getattr(b, "mark_open", 0) == 1:
+                b.marks[2].record(torch.cuda.current_stream(b.home))
+                b.mark_open = 2
             training = getattr(module, "training", False)
             if not _autograd_keeps_weights():
                 # A training forward's last blocks are the first ones recompute needs: keep them.
@@ -471,6 +519,8 @@ class BlockSwap:
         def hook(grad):
             self._release(self.blocks[i])
             if i == 0:
+                if not self._settled:
+                    self._adapt_depth()
                 self._arm(forward = True)
         return _opaque(hook)
 
@@ -539,6 +589,112 @@ class BlockSwap:
 
     def resident_count(self):
         return sum(b.resident for b in self.blocks)
+
+    def _harvest_copy(self, b):
+        # Only finished copies are read: query() never blocks the host.
+        if not all(e.query() for e in b.events.values()):
+            return
+        self._tot["copy_ms"] += sum(b.t_copy[d].elapsed_time(e) for d, e in b.events.items())
+        self._tot["copies"] += 1
+        self._tot["copy_bytes"] += b.nbytes()
+        b.copy_open = False
+
+    def _harvest_marks(self, b):
+        if b.mark_open == 2 and b.marks[2].query():
+            self._tot["stall_ms"] += b.marks[0].elapsed_time(b.marks[1])
+            self._tot["compute_ms"] += b.marks[1].elapsed_time(b.marks[2])
+            self._tot["layers"] += 1
+        b.mark_open = 0
+
+    def _harvest(self):
+        for b in self.blocks:
+            if getattr(b, "copy_open", False):
+                self._harvest_copy(b)
+            if getattr(b, "mark_open", 0) == 2 and b.marks[2].query():
+                self._harvest_marks(b)
+
+    def _since(self, seen):
+        return {k: self._tot[k] - seen[k] for k in _STAT_KEYS}
+
+    def _adapt_depth(self):
+        # Between steps only: the "keep the last depth blocks" rule in _post must not change mid-sweep.
+        self._harvest()
+        d = self._since(self._adapt_seen)
+        self._adapt_seen = dict(self._tot)
+        self._steps += 1
+        # Step 1 starts from blocks armed before timing began; judge from step 2 on.
+        if self._steps < 2 or d["layers"] == 0 or d["copies"] == 0:
+            return
+        busy = d["compute_ms"] + d["stall_ms"]
+        stall = d["stall_ms"] / busy if busy > 0 else 0.0
+        # A deeper pool hides a copy only when it is shorter than a layer's compute; past that it only costs VRAM.
+        hideable = d["copy_ms"] / d["copies"] <= d["compute_ms"] / d["layers"]
+        if stall > _AUTO_STALL and hideable and self.depth < _AUTO_MAX_DEPTH and self._grow_pool():
+            self.depth += 1
+        else:
+            self._settled = True
+        if self._steps >= _AUTO_STEPS:
+            self._settled = True
+        if self._settled:
+            print(f"Unsloth: offload_layers prefetch_depth = 'auto' settled on {self.depth} "
+                  f"(copies stalled {100 * stall:.1f}% of the swapped layers' time).")
+
+    def _grow_pool(self):
+        """One more slot for every pool that can use one, if each card still has room for it."""
+        sigs = [b.sig for b in self.blocks]
+        want = [s for s in self.free if sigs.count(s) > self.depth + 1]
+        if not want:
+            return False
+        need = {}
+        for s in want:
+            size = {}
+            for shape, dt, dv, off in s:
+                n = torch.Size(shape).numel() * torch.empty(0, dtype = dt).element_size()
+                size[dv] = max(size.get(dv, 0), off + -(-n // _ALIGN) * _ALIGN)
+            for dv, n in size.items():
+                need[dv] = need.get(dv, 0) + n
+        for dv, n in need.items():
+            # Between steps the activations are gone; keep room for the next step's peak.
+            transient = torch.cuda.max_memory_allocated(dv) - torch.cuda.memory_allocated(dv)
+            if _free_device_bytes(dv) - transient < 2 * n:
+                return False
+        for s in want:
+            self.free[s].append(self._new_slot(s))
+        return True
+
+    def stats(self, reset = True):
+        """Where each swapped layer is, plus copy / stall / compute totals since the last call."""
+        self._harvest()
+        window = self._since(self._seen)
+        if reset:
+            self._seen = dict(self._tot)
+        state = {}
+        for li, b in zip(self.indices, self.blocks):
+            if not b.resident:
+                state[li] = "host"
+            elif b.pending:
+                state[li] = "held"
+            elif not all(e.query() for e in b.events.values()):
+                state[li] = "copying"
+            else:
+                state[li] = "gpu"
+        return {
+            "total_layers": self.total,
+            "swapped": list(self.indices),
+            "state": state,
+            "current": self.current,
+            "prefetch_depth": self.depth,
+            "auto_depth": self._auto,
+            "depth_settled": self._settled,
+            "host_bytes": self.host_bytes(),
+            "pinned_bytes": self.pinned_bytes,
+            "pool_bytes": self.pool_bytes(),
+            "timing": _TIMING,
+            **window,
+        }
+
+
+_STAT_KEYS = ("copies", "copy_ms", "copy_bytes", "stall_ms", "compute_ms", "layers")
 
 
 def _text_config(config):
