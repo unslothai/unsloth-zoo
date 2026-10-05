@@ -14,10 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Compiler fallback to the AST rewriter for forwards the regex patterns miss (CPU).
-
-Loss regions are verbatim from the transformers release named on each fixture; the
-backbone call is replaced by a `hidden_states` argument."""
+"""Compiler AST fallback for forwards the regex patterns miss; fixtures are verbatim upstream loss regions."""
 
 import os
 import textwrap

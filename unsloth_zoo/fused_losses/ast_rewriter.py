@@ -220,8 +220,7 @@ _LEGACY_CE_BODY = (
 
 
 def _legacy_ce_logits(if_block: ast.If) -> str | None:
-    """Logits name of the exact mean-reduced shifted `CrossEntropyLoss()` block
-    (Mamba / FalconMamba <= transformers 5.16.1, Clvp), else None."""
+    """Logits name of the exact legacy shifted `CrossEntropyLoss()` block (Mamba, Clvp), else None."""
     body = [ast.unparse(s) for s in if_block.body]
     if body and body[0].startswith("labels = labels.to(") and _is_cast(if_block.body[0], ("labels",)):
         body = body[1:]
@@ -249,8 +248,7 @@ def _find_loss_assign_target(if_block: ast.If, call: ast.Call) -> str | None:
 
 
 def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef, extended: bool = False) -> TripletCapture | None:
-    """`extended` (compiler fallback only) also accepts a guarded logit scale, `labels=None`
-    with an explicit `shift_labels=`, and the legacy shifted `CrossEntropyLoss()` block."""
+    """`extended` (compiler fallback) adds logit scale, explicit `shift_labels=` and legacy CE shapes."""
     body = fn.body
 
     if_idx = None
@@ -600,9 +598,7 @@ def rewrite_forward_source(source: str) -> tuple[str | None, TripletCapture | No
 
 
 def rewrite_forward_source_spliced(source: str) -> tuple[str | None, TripletCapture | None]:
-    """Compiler fallback: the same rewrite (plus the `extended` shapes) spliced into the original
-    text by statement line spans, so the decorators, signature and formatting that
-    `create_standalone_class` parses with regexes stay byte-identical."""
+    """Extended rewrite spliced by line span, so text `create_standalone_class` regex-parses is kept."""
     plan = _plan(source, extended = True)
     if plan is None:
         return (None, None)
