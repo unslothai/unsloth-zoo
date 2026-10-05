@@ -67,3 +67,4 @@ from .utils import (
     force_eager_fallback,
     apply_pending_eager_fallbacks,
 )
+from .datasets_folder_metadata import *
