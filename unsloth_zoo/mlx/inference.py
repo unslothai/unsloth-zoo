@@ -3062,7 +3062,6 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
                 module.pop("_unsloth_nax_qmm_rows", None)   # a tuple is stored in the module mapping
 
 
-# The body the dense prefill route stands in for.
 _DENSE_QMM_CONTRACT = {"mlx.nn.layers.quantized": {"QuantizedLinear.__call__": "ca5cafb6d038d955"}}
 _DENSE_QMM_LOCK = RLock()
 _DENSE_QMM_VERIFIED = {}
@@ -3150,7 +3149,7 @@ def dense_prefill_linear(model, *, _modules = None):
     """Run prefill-sized quantized projections as one dequantize and a dense matmul.
 
     Calls of 1024 or more rows on a large enough output dequantize the weight once and multiply
-    densely, which is 5-7% faster than the quantized matmul and bit-identical to it; smaller calls,
+    densely, bit-identical to the quantized matmul; smaller calls,
     training, and any shape that fails its first-use comparison keep the native call. A linear the
     NAX scope already routes keeps its small-row and int8 routes and takes this one for the rest.
     `UNSLOTH_MLX_DENSE_PREFILL=0` turns the route off.
