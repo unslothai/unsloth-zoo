@@ -1213,7 +1213,9 @@ def _bf16_views(experts, hidden_dim):
 def routed_moe_forward(experts, hidden_states, top_k_index, top_k_weights):
     """Experts output from only the routed experts for a decode-sized no-grad call, or None
     (callers then run their usual path). top_k_index / top_k_weights: [T, top_k]."""
-    if triton is None or torch.is_grad_enabled() or not hidden_states.is_cuda:
+    # training: reentrant checkpointing runs the forward under no_grad and replays it with grad,
+    # which would recompute through the other path.
+    if triton is None or torch.is_grad_enabled() or experts.training or not hidden_states.is_cuda:
         return None
     mode = routed_mode()
     if mode == "0" or top_k_index.dim() != 2:
@@ -1272,9 +1274,13 @@ def routed_moe_forward(experts, hidden_states, top_k_index, top_k_weights):
         out = fn(state, x, top_k_index, rw, top_k, gu_lora, dn_lora, out_dtype)
     else:
         w_gu, w_dn, act, interleaved = views
+        biases = (getattr(experts, "gate_up_proj_bias", None), getattr(experts, "down_proj_bias", None))
+        for b, n in zip(biases, (I2, hidden_dim)):
+            # The kernel reads bias[e] + n: rows of a contiguous [E, N] tensor only.
+            if b is not None and (not isinstance(b, torch.Tensor) or tuple(b.shape) != (E, n) or b.stride(-1) != 1):
+                return None
         out = routed_bf16_moe(
-            x, top_k_index, rw, w_gu, w_dn,
-            getattr(experts, "gate_up_proj_bias", None), getattr(experts, "down_proj_bias", None),
+            x, top_k_index, rw, w_gu, w_dn, *biases,
             act, interleaved,
             [gu_lora[:3]] if gu_lora is not None else (), [dn_lora[:3]] if dn_lora is not None else (),
             float(getattr(experts, "alpha", 1.702)), float(getattr(experts, "limit", 7.0)),

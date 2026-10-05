@@ -507,6 +507,32 @@ def test_bias_attached_after_compiled_warmup_is_not_dropped(monkeypatch):
     assert got is None or torch.equal(got, fresh)
 
 
+@pytest.mark.parametrize("quant", [True, False])
+def test_training_mode_keeps_the_current_path(quant):
+    # Reentrant checkpointing runs the forward under no_grad and replays it with grad.
+    ex = _make("silu", quant = quant)
+    x, idx, w = _route(2)
+    with torch.no_grad():
+        assert MR.routed_moe_forward(ex, x, idx, w) is not None
+        ex.train()
+        assert MR.routed_moe_forward(ex, x, idx, w) is None
+
+
+def test_strided_bf16_bias_is_not_misread():
+    ex = _make("gptoss", quant = False)
+    x, idx, w = _route(2)
+    for n in ("gate_up_proj_bias", "down_proj_bias"):
+        b = getattr(ex, n)
+        wide = torch.zeros(b.shape[0], 2 * b.shape[1], dtype = b.dtype, device = b.device)
+        wide[:, ::2] = b
+        setattr(ex, n, nn.Parameter(wide[:, ::2], requires_grad = False))
+    assert ex.down_proj_bias.stride(-1) == 2
+    ref = _ref(ex, "gptoss", x, idx, w)
+    with torch.no_grad():
+        got = MR.routed_moe_forward(ex, x, idx, w)
+    assert got is None or torch.allclose(got.double(), ref, rtol = 2e-2, atol = 2e-2)
+
+
 @pytest.mark.parametrize("use_lora", [False, True])
 @pytest.mark.parametrize("mode", ["1", "grouped", "bf16"])
 def test_fullgraph_compile_and_cuda_graph_replay(use_lora, mode, monkeypatch):
