@@ -1962,17 +1962,10 @@ def native_moe_grouped_mm(
 
 
 def _pad_lora_rank_for_grouped_mm(first_weight, second_weight):
-    """Zero-pad the LoRA rank to a 16-byte multiple: (E, in, R) and (E, R, out).
-
-    torch._grouped_mm needs every operand stride 16-byte aligned. A rank of 4 or 6 in
-    bf16 gives (E, in, R) and the (T, R) intermediate an 8 or 12 byte row, so eager
-    raised "strides should be multiple of 16 bytes" on every LoRA matmul and dropped to
-    the per-expert host-synced loop, and under torch.compile the fake-tensor check
-    ("Expected mat_b stride along 1 dim to be multiple of 16 bytes") aborted the trace.
-    Zero columns of first meet zero rows of second, so the product is unchanged and
-    the padded entries get no gradient back through F.pad. At least 8 even for fp32:
-    autocast lowers grouped_mm operands to bf16, halving the row in bytes.
-    """
+    """Zero-pad the LoRA rank of (E, in, R) / (E, R, out) so torch._grouped_mm gets 16-byte
+    aligned rows (bf16 rank 4 or 6 fell back to the per-expert loop, and aborted compile).
+    Zero columns meet zero rows, so the product is exact. Minimum 8 even for fp32: autocast
+    lowers grouped_mm operands to bf16."""
     align = max(8, 16 // first_weight.element_size())
     rank = first_weight.shape[-1]
     pad = (-rank) % align
