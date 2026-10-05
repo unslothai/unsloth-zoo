@@ -612,6 +612,15 @@ def _is_tracing_masks():
     return torch.jit.is_tracing()
 
 
+def _flex_routes_maskless_to_sdpa():
+    try:
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+        function = ALL_ATTENTION_FUNCTIONS["flex_attention"]
+    except Exception:
+        return False
+    return getattr(function, "_unsloth_maskless_causal_sdpa", False) is True
+
+
 def _maskless_causal_arguments(signature, args, kwargs):
     """Arguments for an eager create_causal_mask call that may return None, else None.
 
@@ -644,7 +653,13 @@ def _maskless_causal_arguments(signature, args, kwargs):
         return None
 
     config = arguments.get("config", None)
-    if getattr(config, "_attn_implementation", None) != "sdpa":
+    attn_implementation = getattr(config, "_attn_implementation", None)
+    if attn_implementation == "flex_attention":
+        # Only when the registered flex function sends a None mask to SDPA is_causal (unsloth's
+        # wrapper); stock flex would read None as full bidirectional attention.
+        if not _flex_routes_maskless_to_sdpa():
+            return None
+    elif attn_implementation != "sdpa":
         return None
     if getattr(config, "is_causal", True) is not True:
         return None
@@ -779,6 +794,11 @@ def patch_transformers_masks():
             if maskless_causal and signature is not None:
                 arguments = _maskless_causal_arguments(signature, args, kwargs)
                 if arguments is not None:
+                    config = arguments.get("config", None)
+                    if getattr(config, "_attn_implementation", None) == "flex_attention":
+                        # Flex always builds a BlockMask; the SDPA reroute needs None.
+                        CAUSAL_MASK_SKIP_STATS["skipped"] += 1
+                        return None
                     mask = original(**arguments)
                     if mask is None:
                         CAUSAL_MASK_SKIP_STATS["skipped"] += 1
