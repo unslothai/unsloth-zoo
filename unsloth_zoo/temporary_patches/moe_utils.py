@@ -1164,6 +1164,17 @@ def forward_moe_backend(
     if _moe_uses_fp8_expert_weights is not None and _moe_uses_fp8_expert_weights(self):
         return forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights)
 
+    # BF16 / FP16 decode-sized no-grad calls: only the routed experts (moe_routed.py).
+    routed_moe_forward = None
+    try:
+        from unsloth_zoo.temporary_patches.moe_routed import routed_moe_forward
+    except ImportError:
+        pass
+    if routed_moe_forward is not None:
+        result = routed_moe_forward(self, hidden_states, top_k_index, top_k_weights)
+        if result is not None:
+            return result
+
     backend = select_moe_backend()
     if backend == "grouped_mm":
         return forward_native_grouped_mm(self, hidden_states, top_k_index, top_k_weights)
@@ -1961,6 +1972,21 @@ def native_moe_grouped_mm(
     return _grouped_mm_with_backward_fix(inputs, weight, offsets)
 
 
+def _pad_lora_rank_for_grouped_mm(first_weight, second_weight):
+    """Zero-pad the LoRA rank of (E, in, R) / (E, R, out) so torch._grouped_mm gets 16-byte
+    aligned rows (bf16 rank 4 or 6 fell back to the per-expert loop, and aborted compile).
+    Zero columns meet zero rows, so the product is exact. Minimum 8 even for fp32: autocast
+    lowers grouped_mm operands to bf16."""
+    align = max(8, 16 // first_weight.element_size())
+    rank = first_weight.shape[-1]
+    pad = (-rank) % align
+    if pad == 0:
+        return first_weight, second_weight
+    first_weight = F.pad(first_weight, (0, pad))
+    second_weight = F.pad(second_weight, (0, 0, 0, pad))
+    return first_weight, second_weight
+
+
 def _apply_lora_grouped_mm(
     inputs: torch.Tensor,
     lora_B: torch.Tensor,
@@ -1975,6 +2001,7 @@ def _apply_lora_grouped_mm(
     """
     # This Unsloth Zoo code section is licensed under AGPL3
 
+    lora_B, lora_A = _pad_lora_rank_for_grouped_mm(lora_B, lora_A)
     # X @ B then result @ A; both already in native (E, ...) layout, no transpose.
     lora_intermediate = grouped_mm_func(inputs, lora_B.contiguous(), offsets)
     lora_delta = grouped_mm_func(lora_intermediate, lora_A.contiguous(), offsets)
@@ -3070,6 +3097,30 @@ def _can_fold_moe_lora_through_peft(experts_module, parameter_name: str) -> bool
 _original_param_wrapper_forward = None
 
 
+
+def _gpt_oss_routed_wrapper_forward(wrapper, experts_module, x, args, kwargs):
+    """gpt-oss eval decode through the outermost expert ParamWrapper: only the routed experts,
+    with every adapter in the chain applied. None for anything else (callers run as before)."""
+    if torch.is_grad_enabled() or type(experts_module).__name__ != "GptOssExperts":
+        return None
+    if "adapter_names" in kwargs:  # mixed-adapter batch: PEFT's own forward handles or rejects it
+        return None
+    if getattr(wrapper, "_unsloth_inner_expert_wrapper", False):
+        return None
+    inner = wrapper.base_layer
+    while hasattr(inner, "base_layer"):
+        # An inner wrapper sees only part of the adapter chain, so it must never route.
+        inner._unsloth_inner_expert_wrapper = True
+        inner = inner.base_layer
+    router_indices = kwargs.get("router_indices", args[0] if len(args) > 0 else None)
+    routing_weights = kwargs.get("routing_weights", args[1] if len(args) > 1 else None)
+    if router_indices is None or routing_weights is None:
+        return None
+    from unsloth_zoo.temporary_patches.gpt_oss_routed import ROUTED_MAX_SLOTS, routed_bf16_eligible, routed_bf16_forward
+    if router_indices.numel() > ROUTED_MAX_SLOTS or not routed_bf16_eligible(wrapper, x):
+        return None
+    return routed_bf16_forward(wrapper, x, router_indices, routing_weights)
+
 def _patched_param_wrapper_forward(
     self, x: torch.Tensor, *args, **kwargs
 ) -> torch.Tensor:
@@ -3089,6 +3140,10 @@ def _patched_param_wrapper_forward(
     experts_module = self.get_base_layer()
 
     param_name = getattr(self, "parameter_name", None)
+
+    routed = _gpt_oss_routed_wrapper_forward(self, experts_module, x, args, kwargs)
+    if routed is not None:
+        return routed
 
     if _wrapper_uses_separated_moe_lora(self, experts_module):
         # MoE experts: bypass PEFT's _activate_lora, use separated computation.
@@ -3911,6 +3966,7 @@ def forward_native_grouped_mm(
             # Cast to input dtype (LoRA is float32) and make contiguous for grouped_mm.
             first_weight = first_weight.to(permuted_input.dtype).contiguous()
             second_weight = second_weight.to(permuted_input.dtype).contiguous()
+            first_weight, second_weight = _pad_lora_rank_for_grouped_mm(first_weight, second_weight)
 
             try:
                 lora_out = _grouped_mm_with_backward_fix(permuted_input, first_weight, offsets)
@@ -3985,11 +4041,12 @@ def forward_native_grouped_mm(
                 w1_lora = _extract_lora_weights(self.w1, experts_module=self)
                 if w1_lora is not None:
                     lora_A, lora_B, scaling = w1_lora
-                    lora_A_t = lora_A.transpose(-2, -1)
+                    lora_A_t, lora_B_t = _pad_lora_rank_for_grouped_mm(
+                        lora_A.transpose(-2, -1), lora_B.transpose(-2, -1)
+                    )
                     lora_A_out = _grouped_mm_with_backward_fix(
                         permuted_input, lora_A_t, offsets
                     )
-                    lora_B_t = lora_B.transpose(-2, -1)
                     lora_B_out = _grouped_mm_with_backward_fix(lora_A_out, lora_B_t, offsets)
                     gate = gate + lora_B_out * scaling
 
@@ -3997,11 +4054,12 @@ def forward_native_grouped_mm(
                 w3_lora = _extract_lora_weights(self.w3, experts_module=self)
                 if w3_lora is not None:
                     lora_A, lora_B, scaling = w3_lora
-                    lora_A_t = lora_A.transpose(-2, -1)
+                    lora_A_t, lora_B_t = _pad_lora_rank_for_grouped_mm(
+                        lora_A.transpose(-2, -1), lora_B.transpose(-2, -1)
+                    )
                     lora_A_out = _grouped_mm_with_backward_fix(
                         permuted_input, lora_A_t, offsets
                     )
-                    lora_B_t = lora_B.transpose(-2, -1)
                     lora_B_out = _grouped_mm_with_backward_fix(lora_A_out, lora_B_t, offsets)
                     up = up + lora_B_out * scaling
     else:
@@ -4096,6 +4154,7 @@ def forward_native_grouped_mm(
             # Cast to input dtype (LoRA is float32) and make contiguous for grouped_mm.
             first_weight = first_weight.to(inter.dtype).contiguous()
             second_weight = second_weight.to(inter.dtype).contiguous()
+            first_weight, second_weight = _pad_lora_rank_for_grouped_mm(first_weight, second_weight)
 
             lora_out = _grouped_mm_with_backward_fix(inter, first_weight, offsets)
             lora_out = lora_out.contiguous()
@@ -4137,9 +4196,11 @@ def forward_native_grouped_mm(
             w2_lora = _extract_lora_weights(self.w2, experts_module=self)
             if w2_lora is not None:
                 lora_A, lora_B, scaling = w2_lora
-                lora_A_t = lora_A.transpose(-2, -1).contiguous()
-                lora_A_out = _grouped_mm_with_backward_fix(inter, lora_A_t, offsets)
-                lora_B_t = lora_B.transpose(-2, -1).contiguous()
+                lora_A_t, lora_B_t = _pad_lora_rank_for_grouped_mm(
+                    lora_A.transpose(-2, -1), lora_B.transpose(-2, -1)
+                )
+                lora_A_out = _grouped_mm_with_backward_fix(inter, lora_A_t.contiguous(), offsets)
+                lora_B_t = lora_B_t.contiguous()
                 lora_B_out = _grouped_mm_with_backward_fix(lora_A_out, lora_B_t, offsets)
                 mm2_out = mm2_out + lora_B_out * scaling
     else:

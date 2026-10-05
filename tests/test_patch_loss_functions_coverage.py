@@ -109,3 +109,33 @@ def test_loss_mapping_sweep_idempotent():
             )
     finally:
         _restore(lu.LOSS_MAPPING, saved)
+
+
+@pytest.mark.parametrize("torch_compile", [False, True])
+def test_patched_loss_fuses_but_custom_wraps_does_not(torch_compile):
+    import functools
+
+    lu = pytest.importorskip("transformers.loss.loss_utils")
+    from unsloth_zoo import loss_utils as zoo_loss
+    from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss
+
+    saved = dict(lu.LOSS_MAPPING)
+    try:
+        def fast_ce(*args, **kwargs):
+            raise AssertionError("checking fusion eligibility must not execute the loss")
+
+        zoo_loss.patch_loss_functions(fast_ce, torch_compile = torch_compile)
+        patched = lu.LOSS_MAPPING["ForCausalLM"]
+        assert _can_fuse_loss(lu.ForCausalLMLoss)
+        assert _can_fuse_loss(patched)
+
+        @functools.wraps(patched)
+        def custom(*args, **kwargs):
+            return 3 * patched(*args, **kwargs)
+
+        assert not _can_fuse_loss(custom)
+        zoo_loss.patch_loss_functions(fast_ce, torch_compile = torch_compile)
+        assert lu.LOSS_MAPPING["ForCausalLM"] is patched
+        assert _can_fuse_loss(patched)
+    finally:
+        _restore(lu.LOSS_MAPPING, saved)

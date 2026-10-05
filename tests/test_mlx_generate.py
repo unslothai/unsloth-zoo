@@ -1626,17 +1626,17 @@ def test_generation_paths_enter_every_inference_fusion(monkeypatch):
 
     from unsloth_zoo.mlx import generate as generate_module, inference, loader
     scopes = {name for name, value in vars(inference).items()
-              if name.startswith(("fused_", "nax_")) and getattr(value, "__module__", None) == inference.__name__}
+              if name.startswith(("fused_", "nax_", "dense_")) and getattr(value, "__module__", None) == inference.__name__}
     entered = []
     for name in scopes:
-        monkeypatch.setattr(inference, name, lambda model, name=name: entered.append(name) or contextlib.nullcontext(model))
+        monkeypatch.setattr(inference, name, lambda model, *args, name=name, **kwargs: entered.append(name) or contextlib.nullcontext(model))
     with generate_module.generation_mode(types.SimpleNamespace(training=False, eval=lambda: None, named_modules=lambda: [])):
         pass
     assert sorted(entered) == sorted(scopes)
     sites = [{item.context_expr.func.id for item in node.items
               if isinstance(item.context_expr, ast.Call) and isinstance(item.context_expr.func, ast.Name)}
              for node in ast.walk(ast.parse(inspect.getsource(loader))) if isinstance(node, ast.With)]
-    sites = [site for site in sites if any(name.startswith(("fused_", "nax_")) for name in site)]
+    sites = [site for site in sites if any(name.startswith(("fused_", "nax_", "dense_")) for name in site)]
     assert len(sites) == 2 and all(site == scopes for site in sites)
 
 

@@ -1,0 +1,513 @@
+{
+  "_comment": "Call sites that predate the gate, each with why it is safe. New ones fail; see scripts/lint_risky_loaders.py.",
+  "targets": [
+    "unsloth_zoo",
+    "scripts"
+  ],
+  "entries": [
+    {
+      "file": "unsloth_zoo/__init__.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "52e9a0e89a8e084e",
+      "count": 1,
+      "reason": "Lazy alias over the fixed _LEGACY_TO_NEW table of this package's own modules."
+    },
+    {
+      "file": "unsloth_zoo/_vendored/fla/ops/backends/__init__.py",
+      "rule": "dynamic-import",
+      "sink": "__import__",
+      "digest": "5b39b71ad4d89660",
+      "count": 1,
+      "reason": "Vendored fla backend registry: module paths are fixed strings inside the vendored package."
+    },
+    {
+      "file": "unsloth_zoo/compiler.py",
+      "rule": "dynamic-import",
+      "sink": "__import__",
+      "digest": "dfadd575e046a613",
+      "count": 1,
+      "reason": "model_location is the transformers / TRL module the compiler is rewriting, built from the validated model_type, not raw config text."
+    },
+    {
+      "file": "unsloth_zoo/compiler.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "885dc7a9d18c2d47",
+      "count": 1,
+      "reason": "model_type is checked against [a-z0-9_]+ first, and the import is prefix-bounded to transformers.models.<type>.modeling_<type>."
+    },
+    {
+      "file": "unsloth_zoo/compiler.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "fea2047581ef8e72",
+      "count": 1,
+      "reason": "Module name comes from a fixed tuple or table in this file, not from a model, request or download."
+    },
+    {
+      "file": "unsloth_zoo/compiler.py",
+      "rule": "dynamic-import",
+      "sink": "spec_from_file_location",
+      "digest": "3b5d271a7507f295",
+      "count": 1,
+      "reason": "Loads the module this process just generated into its own compile cache folder."
+    },
+    {
+      "file": "unsloth_zoo/dataset_num_proc.py",
+      "rule": "dynamic-import",
+      "sink": "__import__",
+      "digest": "fd6171fa78fd5a1e",
+      "count": 1,
+      "reason": "Called with the stdlib multiprocessing module names only, to read their start method."
+    },
+    {
+      "file": "unsloth_zoo/device_map_planner.py",
+      "rule": "dynamic-import",
+      "sink": "__import__",
+      "digest": "f738a27d776491d1",
+      "count": 1,
+      "reason": "Iterates two fixed accelerate / transformers module paths."
+    },
+    {
+      "file": "unsloth_zoo/device_map_planner.py",
+      "rule": "dynamic-import",
+      "sink": "get_class_from_dynamic_module",
+      "digest": "bdf46c7f7d666b72",
+      "count": 1,
+      "reason": "_from_config_remote_aware is only called when the caller passed trust_remote_code."
+    },
+    {
+      "file": "unsloth_zoo/device_map_planner.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "fb006801d5482946",
+      "count": 1,
+      "reason": "Module of an already constructed config class (type(config).__module__), so nothing new is imported."
+    },
+    {
+      "file": "unsloth_zoo/device_map_planner.py",
+      "rule": "trust-remote-code",
+      "sink": "keyword",
+      "digest": "4b081c1eac3e5359",
+      "count": 1,
+      "reason": "_from_config_remote_aware is only called when the caller passed trust_remote_code."
+    },
+    {
+      "file": "unsloth_zoo/hf_xet_fallback.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "59e72c01edb14c86",
+      "count": 1,
+      "reason": "Iterates two fixed huggingface_hub module names."
+    },
+    {
+      "file": "unsloth_zoo/llama_cpp.py",
+      "rule": "dynamic-import",
+      "sink": "spec_from_file_location",
+      "digest": "0295c8cb9d8dc786",
+      "count": 1,
+      "reason": "Loads this package's own disk utils module, located via __file__."
+    },
+    {
+      "file": "unsloth_zoo/llama_cpp.py",
+      "rule": "dynamic-import",
+      "sink": "spec_from_file_location",
+      "digest": "56c48cea0f50e1a9",
+      "count": 1,
+      "reason": "Loads this package's own converter_scan.py, located via __file__."
+    },
+    {
+      "file": "unsloth_zoo/llama_cpp.py",
+      "rule": "unpinned-code-fetch",
+      "sink": "branch-head-url",
+      "digest": "ea797cf7bba56742",
+      "count": 1,
+      "reason": "Known residual: the converter tracks llama.cpp master so new architectures convert. converter_scan.py screens the download; pinning it is a separate change."
+    },
+    {
+      "file": "unsloth_zoo/llama_cpp.py",
+      "rule": "unpinned-code-fetch",
+      "sink": "git-clone-unpinned",
+      "digest": "a5ae4361307c747b",
+      "count": 1,
+      "reason": "Known residual: install_llama_cpp source-builds from upstream llama.cpp master, the same upstream trust as installing it; pinning is a separate change."
+    },
+    {
+      "file": "unsloth_zoo/mlx/compile.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "59e72c01edb14c86",
+      "count": 2,
+      "reason": "Fixed mlx_vlm module names, or mlx_vlm.models.<arch>.<arch> prefix-bounded to the installed package."
+    },
+    {
+      "file": "unsloth_zoo/mlx/compile.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "cf854aa86fc73674",
+      "count": 1,
+      "reason": "Iterates the fixed (mlx_vlm.generate, mlx_vlm.generate.ar) pair."
+    },
+    {
+      "file": "unsloth_zoo/mlx/compile.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "fea2047581ef8e72",
+      "count": 3,
+      "reason": "Module name comes from a fixed tuple or table in this file, not from a model, request or download."
+    },
+    {
+      "file": "unsloth_zoo/mlx/generate.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "8a43c55c018acccf",
+      "count": 1,
+      "reason": "Iterates fixed mlx generate module candidates."
+    },
+    {
+      "file": "unsloth_zoo/mlx/generate.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "917eea753d9aec8c",
+      "count": 1,
+      "reason": "Defining module of an already imported mlx BatchGenerator class (its __module__)."
+    },
+    {
+      "file": "unsloth_zoo/mlx/loader.py",
+      "rule": "dynamic-import",
+      "sink": "__import__",
+      "digest": "6a41e8f101f60025",
+      "count": 1,
+      "reason": "Iterates fixed mlx_lm.tuner module names."
+    },
+    {
+      "file": "unsloth_zoo/mlx/loader.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "0970017c63eaedce",
+      "count": 1,
+      "reason": "Module of a processor class that already resolved inside mlx_vlm / transformers (its __module__)."
+    },
+    {
+      "file": "unsloth_zoo/mlx/loader.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "59e72c01edb14c86",
+      "count": 2,
+      "reason": "Prefix-bounded to the installed mlx_lm / mlx_vlm package: a model's model_type can only select one of that package's own modules (#1083 removed the unbounded form). The model_file guard's site iterates the fixed names mlx_lm.utils / mlx_vlm.utils."
+    },
+    {
+      "file": "unsloth_zoo/mlx/loader.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "a0573ba00a682ea0",
+      "count": 2,
+      "reason": "Prefix-bounded to the installed mlx_lm / mlx_vlm package: a model's model_type can only select one of that package's own modules (#1083 removed the unbounded form)."
+    },
+    {
+      "file": "unsloth_zoo/mlx/loader.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "d61ab5f3581be96b",
+      "count": 1,
+      "reason": "Prefix-bounded to the installed mlx_lm / mlx_vlm package: a model's model_type can only select one of that package's own modules (#1083 removed the unbounded form)."
+    },
+    {
+      "file": "unsloth_zoo/mlx/loader.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "fea2047581ef8e72",
+      "count": 1,
+      "reason": "Module name comes from a fixed tuple or table in this file, not from a model, request or download."
+    },
+    {
+      "file": "unsloth_zoo/mlx/utils.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "4f5deb88e57ce7b2",
+      "count": 1,
+      "reason": "Prefix-bounded to the installed mlx_lm / mlx_vlm package: a model's model_type can only select one of that package's own modules (#1083 removed the unbounded form)."
+    },
+    {
+      "file": "unsloth_zoo/mlx/utils.py",
+      "rule": "unpinned-code-fetch",
+      "sink": "git-clone-unpinned",
+      "digest": "a565552d9206c779",
+      "count": 1,
+      "reason": "Known residual: the macOS source build clones llama.cpp master, the same upstream trust as installing it; pinning is a separate change."
+    },
+    {
+      "file": "unsloth_zoo/patching_utils.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "d612c30d3491939a",
+      "count": 1,
+      "reason": "Iterates a fixed bitsandbytes / peft module list."
+    },
+    {
+      "file": "unsloth_zoo/rl_environments.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "8a43c55c018acccf",
+      "count": 2,
+      "reason": "Only names in the _SAFE_IMPORT_MODULES allowlist reach here (checked first), always behind _SafeModule."
+    },
+    {
+      "file": "unsloth_zoo/rl_environments.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "ca551df69c498e93",
+      "count": 1,
+      "reason": "Only names in the _SAFE_IMPORT_MODULES allowlist reach here (checked first), always behind _SafeModule."
+    },
+    {
+      "file": "unsloth_zoo/saving_utils.py",
+      "rule": "trust-remote-code",
+      "sink": "keyword",
+      "digest": "1966c44746000881",
+      "count": 1,
+      "reason": "Second attempt only: the source is the loaded repo, the model was loaded with trust_remote_code, and code is pinned to the trusted commit."
+    },
+    {
+      "file": "unsloth_zoo/saving_utils.py",
+      "rule": "unsafe-deserialize",
+      "sink": "torch.load",
+      "digest": "2050c7fdd98e6c78",
+      "count": 1,
+      "reason": "Reads back a .pt file this function just wrote with torch.save into a temporary location; never a downloaded file."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/ernie4_5_moe.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "d78c0ba207ccee5a",
+      "count": 1,
+      "reason": "Module name comes from a fixed tuple or table in this file, not from a model, request or download."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/fla_vendor.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "37f520ba5b9ea0dc",
+      "count": 1,
+      "reason": "Iterates the fixed _EXPORT_SUBMODULES of the vendored fla package."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/fla_vendor.py",
+      "rule": "dynamic-import",
+      "sink": "spec_from_file_location",
+      "digest": "992d2ddf3e2ecc8d",
+      "count": 1,
+      "reason": "Loads the fla package vendored inside unsloth_zoo."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/gemma4_float32.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "a072c3d759ca6b1b",
+      "count": 1,
+      "reason": "Prefix-bounded to transformers.models.<name>.modeling_<name> over fixed Gemma 4 names."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/gpt_oss.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "2f91b677a1b74416",
+      "count": 1,
+      "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/gpt_oss.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "8e22e34e9699eeda",
+      "count": 1,
+      "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/gpt_oss.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "93f179a26cb6dc1f",
+      "count": 1,
+      "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/misc.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "3bc930c482122edb",
+      "count": 1,
+      "reason": "Iterates fixed mamba_ssm config module names."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/misc.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "533e7d733e4f9f67",
+      "count": 1,
+      "reason": "Package and submodule come from the fixed _LOCAL_KERNEL_PACKAGES table."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/misc.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "53dcce229b4b2dc3",
+      "count": 1,
+      "reason": "Package comes from the fixed _LOCAL_KERNEL_PACKAGES table."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/misc.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "7ff41ce8b4bc8d80",
+      "count": 1,
+      "reason": "Iterates a fixed table of transformers image processor modules."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/misc.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "d7fd2f8a030afd79",
+      "count": 1,
+      "reason": "Iterates two fixed TRL module names."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/misc.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "e0884049feeeed7d",
+      "count": 1,
+      "reason": "Prefix-bounded to transformers.models.<name>.modeling_<name> over a fixed list of model names."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/moe_utils.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "59e72c01edb14c86",
+      "count": 1,
+      "reason": "Iterates two fixed peft mapping module names."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/moe_utils.py",
+      "rule": "dynamic-import",
+      "sink": "spec_from_file_location",
+      "digest": "d6d84a54ce61c9f3",
+      "count": 1,
+      "reason": "Loads moe_utils.py from this process's own compile cache folder."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/moe_utils_fp8.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "59e72c01edb14c86",
+      "count": 1,
+      "reason": "Iterates fixed triton module names to read TRITON_MAX_TENSOR_NUMEL."
+    },
+    {
+      "file": "unsloth_zoo/triton_kernels_compat.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "06e20c9053bfc084",
+      "count": 1,
+      "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
+    },
+    {
+      "file": "unsloth_zoo/triton_kernels_compat.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "0d1075b5ac184ad0",
+      "count": 1,
+      "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
+    },
+    {
+      "file": "unsloth_zoo/triton_kernels_compat.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "1dd442e1dba33e11",
+      "count": 2,
+      "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
+    },
+    {
+      "file": "unsloth_zoo/triton_kernels_compat.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "212ce6ec4b2f9035",
+      "count": 1,
+      "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
+    },
+    {
+      "file": "unsloth_zoo/triton_kernels_compat.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "4439cea57cfbfdbc",
+      "count": 1,
+      "reason": "Submodules found by walking the installed triton_kernels package (pkgutil)."
+    },
+    {
+      "file": "unsloth_zoo/triton_kernels_compat.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "44661647c0554b57",
+      "count": 1,
+      "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
+    },
+    {
+      "file": "unsloth_zoo/triton_kernels_compat.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "99148a97541087f5",
+      "count": 1,
+      "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
+    },
+    {
+      "file": "unsloth_zoo/triton_kernels_compat.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "b456c7ad818ecd08",
+      "count": 1,
+      "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
+    },
+    {
+      "file": "unsloth_zoo/triton_kernels_compat.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "bb260743bb896b2c",
+      "count": 1,
+      "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
+    },
+    {
+      "file": "unsloth_zoo/triton_kernels_compat.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "c4171f1b5f078ec9",
+      "count": 1,
+      "reason": "Submodule of the installed triton_kernels package (its own __name__ plus a fixed suffix)."
+    },
+    {
+      "file": "unsloth_zoo/vllm_utils.py",
+      "rule": "dynamic-import",
+      "sink": "__import__",
+      "digest": "1514c70a7a2bd102",
+      "count": 1,
+      "reason": "Iterates a fixed table of vLLM LoRA layer classes."
+    },
+    {
+      "file": "unsloth_zoo/vllm_utils.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "54cfcec6d18cb37d",
+      "count": 1,
+      "reason": "Fixed vLLM bitsandbytes module path held in a local."
+    },
+    {
+      "file": "unsloth_zoo/vllm_utils.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "5e3c38bbbb4cb386",
+      "count": 1,
+      "reason": "Fixed vLLM loader module path held in a local."
+    }
+  ]
+}
