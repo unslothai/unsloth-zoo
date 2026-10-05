@@ -273,15 +273,22 @@ def _lora_delta(x, offsets, projs, lora, dtype):
     return _grouped_mm_with_backward_fix(h, B, offsets) * scaling
 
 
+def _fallback_key(weight):
+    qs = weight.quant_state
+    key = (weight.data_ptr(), qs.absmax.data_ptr())
+    if getattr(qs, "nested", False):
+        offset = qs.offset
+        offset = offset.data_ptr() if isinstance(offset, torch.Tensor) else offset
+        key += (qs.state2.absmax.data_ptr(), qs.state2.code.data_ptr(), offset)
+    return key
+
+
 def _bnb_fallback_stack(projs, dtype):
     """Concat-and-dequant through bitsandbytes (the pre-existing grouped path)."""
     import bitsandbytes as bnb
     from bitsandbytes.functional import QuantState
-    # Keyed on every expert's packed / absmax storage, so a reload or requantize rebuilds it.
-    key = tuple(
-        (getattr(p, "base_layer", p).weight.data_ptr(), getattr(p, "base_layer", p).weight.quant_state.absmax.data_ptr())
-        for p in projs
-    )
+    # Keyed on every expert's packed and (nested) absmax storage, so a reload or requantize rebuilds it.
+    key = tuple(_fallback_key(getattr(p, "base_layer", p).weight) for p in projs)
     cached = getattr(projs, "_unsloth_grouped_cat_qs", None)
     cache = cached[1] if cached is not None and cached[0] == key else None
     if cache is None:

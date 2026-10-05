@@ -331,6 +331,36 @@ def test_in_place_bias_edit_is_not_stale(monkeypatch):
 
 
 @needs_grouped_mm
+def test_fallback_sees_replaced_nested_absmax(monkeypatch):
+    monkeypatch.setenv("UNSLOTH_MOE_TRITON_KERNELS", "0")
+    ex = _Experts(True).train()
+    T = 64
+    x = torch.randn(1, T, H, device = "cuda", dtype = DT)
+    idx, w = _routing(T)
+    _run(ex, x, idx, w, True, monkeypatch)
+    qs = ex.down_projs[E // 2].weight.quant_state
+    qs.state2.absmax = qs.state2.absmax * 1.5
+    out, _, delta = _run(ex, x, idx, w, True, monkeypatch)
+    ref, _, _ = _run(ex, x, idx, w, False, monkeypatch)
+    assert delta["bnb_fallback_dequant"] > 0 and _rel(out, ref) < 2e-2
+
+
+@needs_grouped_mm
+def test_mixed_quant_formats_keep_loop(monkeypatch):
+    ex = _Experts(True).train()
+    fp4 = bnb.nn.Linear4bit(I, H, bias = True, compute_dtype = DT, quant_type = "fp4", quant_storage = torch.uint8)
+    fp4.weight = bnb.nn.Params4bit(torch.randn(H, I).to(DT) * 0.02, requires_grad = False, quant_type = "fp4",
+                                   compress_statistics = True, blocksize = 64)
+    fp4.bias = torch.nn.Parameter(torch.zeros(H, dtype = DT), requires_grad = False)
+    ex.down_projs[E // 2] = fp4.cuda()
+    T = 64
+    x = torch.randn(1, T, H, device = "cuda", dtype = DT)
+    idx, w = _routing(T)
+    _, _, delta = _run(ex, x, idx, w, True, monkeypatch)
+    assert delta["forward"] == 0
+
+
+@needs_grouped_mm
 @pytest.mark.parametrize("field", ["compute_dtype", "_pre_set_compute_dtype"])
 def test_fp32_middle_expert_keeps_loop(field, monkeypatch):
     ex = _Experts(True).train()

@@ -1234,7 +1234,7 @@ class GptOssExpertsBnb4bit(nn.Module):
                 lora = expert_lora_state(self)
                 if isinstance(lora, str):
                     return _fail(f"LoRA-wrapped experts: {lora}")
-                blocksize = None
+                blocksize = fmt = None
                 for lin in list(self.gate_up_projs) + list(self.down_projs):
                     lin = getattr(lin, "base_layer", lin)
                     w = getattr(lin, "weight", None)
@@ -1253,9 +1253,17 @@ class GptOssExpertsBnb4bit(nn.Module):
                     if not qs.blocksize or numel % int(qs.blocksize) != 0:
                         return _fail(f"expert numel {numel} not a multiple of blocksize {qs.blocksize}")
                     if blocksize is None:
-                        blocksize = int(qs.blocksize)
+                        blocksize, fmt = int(qs.blocksize), qs
                     elif int(qs.blocksize) != blocksize:
                         return _fail(f"mixed blocksizes {blocksize} vs {qs.blocksize}")
+                    # The bitsandbytes fallback decodes every expert with the first one's format.
+                    elif (
+                        qs.quant_type != fmt.quant_type
+                        or qs.dtype != fmt.dtype
+                        or bool(getattr(qs, "nested", False)) != bool(getattr(fmt, "nested", False))
+                        or not (qs.code is fmt.code or torch.equal(qs.code, fmt.code))
+                    ):
+                        return _fail("mixed quantization formats across experts")
                     b = getattr(lin, "bias", None)
                     # Grouped path stacks per-expert biases, so a missing bias would
                     # break torch.stack; require all present and fall back otherwise.
