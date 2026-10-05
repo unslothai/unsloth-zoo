@@ -56,6 +56,10 @@ def _declared() -> set[str]:
 
 
 def _module_level_imports() -> dict[str, list[str]]:
+    # sys.stdlib_module_names is 3.10+; on the 3.9 floor this check is left to the newer lanes.
+    stdlib = getattr(sys, "stdlib_module_names", None)
+    if stdlib is None:
+        pytest.skip("needs sys.stdlib_module_names (Python 3.10+)")
     found: dict[str, list[str]] = {}
     for path in sorted((ROOT / "unsloth_zoo").glob("*.py")):
         for node in ast.parse(path.read_text(encoding = "utf-8")).body:
@@ -66,7 +70,7 @@ def _module_level_imports() -> dict[str, list[str]]:
             else:
                 continue
             for name in names:
-                if name in sys.stdlib_module_names or name == "unsloth_zoo":
+                if name in stdlib or name == "unsloth_zoo":
                     continue
                 found.setdefault(name, []).append(path.name)
     return found
