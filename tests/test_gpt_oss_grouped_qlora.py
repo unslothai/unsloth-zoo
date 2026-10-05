@@ -315,6 +315,18 @@ def test_in_place_bias_edit_is_not_stale(monkeypatch):
 
 
 @needs_grouped_mm
+@pytest.mark.parametrize("field", ["compute_dtype", "_pre_set_compute_dtype"])
+def test_fp32_middle_expert_keeps_loop(field, monkeypatch):
+    ex = _Experts(True).train()
+    T = 64
+    x = torch.randn(1, T, H, device = "cuda", dtype = DT)
+    idx, w = _routing(T)
+    setattr(ex.down_projs[E // 2], field, torch.float32)
+    _, _, delta = _run(ex, x, idx, w, True, monkeypatch)
+    assert delta["forward"] == 0
+
+
+@needs_grouped_mm
 @pytest.mark.parametrize("proj", ["gate_up_projs", "down_projs"])
 def test_replaced_middle_expert_rebuilds_tables(proj, monkeypatch):
     ex = _Experts(True).train()

@@ -355,7 +355,7 @@ def grouped_qlora_forward(experts, hidden_states, router_indices, routing_weight
 
     device = hidden_states.device
     # Linear4bit computes in compute_dtype whatever the input dtype; _grouped_mm backward needs bf16.
-    for proj in (experts.gate_up_projs[0], experts.down_projs[0]):
+    for proj in (*experts.gate_up_projs, *experts.down_projs):
         base = getattr(proj, "base_layer", proj)
         if (
             getattr(base, "compute_dtype", None) is not torch.bfloat16
