@@ -3333,31 +3333,9 @@ pass
 TEMPORARY_PATCHES.append(patch_GptOssAttention)
 
 
-def _offloaded_embedding_impl(input_ids: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    # Blocking copies both ways: a non_blocking copy into the CPU can be read before it lands.
-    ids = input_ids.to(weight.device)
-    return torch.nn.functional.embedding(ids, weight).to(input_ids.device)
-
-
-try:
-    # cudagraph_unsafe makes Inductor's graph partitioning run the lookup outside the CUDA graph,
-    # in order with the rest of the step; inlined, the CPU kernel read token ids the graph had
-    # not copied back yet.
-    _offloaded_embedding = torch.library.custom_op(
-        "unsloth_zoo::gpt_oss_offloaded_embedding", mutates_args = (),
-        tags = (torch._C.Tag.cudagraph_unsafe,),
-    )(_offloaded_embedding_impl)
-except Exception:
-    try:
-        _offloaded_embedding = torch.library.custom_op(
-            "unsloth_zoo::gpt_oss_offloaded_embedding", mutates_args = (),
-        )(_offloaded_embedding_impl)
-    except Exception:
-        _offloaded_embedding = None
-if _offloaded_embedding is not None:
-    @_offloaded_embedding.register_fake
-    def _(input_ids, weight):
-        return input_ids.new_empty((*input_ids.shape, weight.shape[-1]), dtype = weight.dtype)
+# Shared with every model (unsloth's offloaded-embedding installer): a CPU table looked up as
+# one opaque, CUDA-graph-safe op. A module global so tests can wrap it.
+from unsloth_zoo.offloaded_embedding import offloaded_embedding as _offloaded_embedding
 
 
 def patch_GptOssModel():
