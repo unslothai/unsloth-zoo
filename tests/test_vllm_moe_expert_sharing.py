@@ -187,6 +187,71 @@ def test_gemma4_lora_keys_are_renamed_onto_moe_experts(monkeypatch):
     assert vu._remap_moe_expert_lora_keys(object(), sd) == sd
 
 
+def _fake_vllm_targets(monkeypatch, vu, names):
+    monkeypatch.setattr(vu, "_get_vllm_model_runner", lambda model: None)
+    monkeypatch.setattr(vu, "_get_vllm_lora_model", lambda model, runner = None: types.SimpleNamespace())
+    monkeypatch.setattr(vu, "_get_vllm_lora_manager", lambda model, runner = None: None)
+    monkeypatch.setattr(vu, "_vllm_lora_target_names", lambda vllm_model, manager = None: (names, set()))
+
+    def resolve(key, mapper):
+        key = key.replace("base_model.model.model.language_model.", "language_model.model.")
+        module = key.rsplit(".lora_", 1)[0]
+        return module[:-len(".base_layer")] if module.endswith(".base_layer") else module
+    monkeypatch.setattr(vu, "_resolve_lora_key_to_module", resolve)
+
+
+def _load_lora_from_disk(monkeypatch, tmp_path, names):
+    """Call load_lora's default path branch on a real safetensors adapter, capturing the
+    LoRARequest it builds and the keys the servability check saw."""
+    import unsloth_zoo.vllm_utils as vu
+    from safetensors.torch import save_file
+    _fake_vllm_targets(monkeypatch, vu, names)
+    save_file({
+        "base_model.model.model.language_model.layers.0.experts.base_layer.lora_A.weight": torch.ones(2, 3),
+        "base_model.model.model.language_model.layers.0.experts.lora_B.weight": torch.full((4, 2), 2.0),
+        "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_A.weight": torch.full((2, 3), 3.0),
+    }, str(tmp_path / "adapter_model.safetensors"))
+    checked = {}
+    monkeypatch.setattr(vu, "_check_lora_is_servable",
+                        lambda model, keys, source, peft_config: checked.setdefault("keys", list(keys)))
+    monkeypatch.setattr(vu, "get_peft_config", lambda save_directory: "PEFT_CONFIG")
+
+    class FakeLoRARequest:
+        def __init__(self, name, int_id, path = None, lora_tensors = None, lora_config = None):
+            self.path, self.lora_tensors, self.lora_config = path, lora_tensors, lora_config
+    fake = types.ModuleType("vllm.lora.request")
+    fake.LoRARequest = FakeLoRARequest
+    monkeypatch.setitem(sys.modules, "vllm.lora.request", fake)
+    monkeypatch.setattr(vu, "LORA_REQUEST_ID", 7, raising = False)  # created on first load_lora
+    return vu.load_lora(object(), str(tmp_path)), checked["keys"]
+
+
+def test_a_saved_gemma4_adapter_is_remapped_on_the_default_path(monkeypatch, tmp_path):
+    # load_lora defaults to load_tensors = False, which is what `model.load_lora(dir)` after
+    # `model.save_lora(dir)` uses. vLLM would read the path with HF's `layers.N.experts` names.
+    names = {"language_model.model.layers.0.moe.experts", "language_model.model.layers.0.self_attn.q_proj"}
+    request, checked = _load_lora_from_disk(monkeypatch, tmp_path, names)
+    expected = {
+        "base_model.model.model.language_model.layers.0.moe.experts.base_layer.lora_A.weight",
+        "base_model.model.model.language_model.layers.0.moe.experts.lora_B.weight",
+        "base_model.model.model.language_model.layers.0.self_attn.q_proj.lora_A.weight",
+    }
+    assert request.path is None and request.lora_config == "PEFT_CONFIG"
+    assert set(request.lora_tensors) == expected
+    assert set(checked) == expected
+    assert torch.equal(
+        request.lora_tensors["base_model.model.model.language_model.layers.0.moe.experts.lora_B.weight"],
+        torch.full((4, 2), 2.0),
+    )
+
+
+def test_an_adapter_needing_no_rename_still_goes_by_path(monkeypatch, tmp_path):
+    names = {"language_model.model.layers.0.experts", "language_model.model.layers.0.self_attn.q_proj"}
+    request, checked = _load_lora_from_disk(monkeypatch, tmp_path, names)
+    assert request.path == str(tmp_path) and request.lora_tensors is None
+    assert all(".moe.experts" not in k for k in checked)
+
+
 def test_gemma4_config_proxy_forwards_writes():
     from unsloth_zoo.temporary_patches.gemma4 import _Gemma4KVSharedSafeProxy
     real = types.SimpleNamespace(tie_word_embeddings = True, num_kv_shared_layers = 0)

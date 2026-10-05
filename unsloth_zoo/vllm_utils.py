@@ -4035,6 +4035,23 @@ def _saved_adapter_lora_keys(save_directory):
     return [k for k in keys if ".lora_A." in k or ".lora_B." in k]
 
 
+def _saved_adapter_lora_tensors(save_directory):
+    """The LoRA tensors of a saved PEFT adapter, keyed as on disk.
+
+    Only read when `load_lora`'s path branch must rename keys before vLLM sees them, so the
+    common path-loaded adapter still costs no tensor IO.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    safetensors_path = os.path.join(save_directory, "adapter_model.safetensors")
+    if os.path.isfile(safetensors_path):
+        from safetensors.torch import load_file
+        state_dict = load_file(safetensors_path, device = "cpu")
+    else:
+        bin_path = os.path.join(save_directory, "adapter_model.bin")
+        state_dict = torch.load(bin_path, map_location = "cpu", weights_only = True)
+    return {k: v for k, v in state_dict.items() if ".lora_A." in k or ".lora_B." in k}
+
+
 def _saved_adapter_expert_lora_keys(save_directory):
     """The subset of `_saved_adapter_lora_keys` that sits on stacked MoE expert tensors."""
     # All Unsloth Zoo code licensed under LGPLv3
@@ -4421,13 +4438,28 @@ def load_lora(model, save_directory, load_tensors = False, lora_request_id = Non
     else:
         # Same checks on the path branch, read off the checkpoint header.
         _saved_keys = _saved_adapter_lora_keys(save_directory)
+        _saved_peft_config = None
         if len(_saved_keys) != 0:
             try:
                 _saved_peft_config = get_peft_config(save_directory)
             except Exception:
                 _saved_peft_config = None
-            _check_lora_is_servable(model, _saved_keys, save_directory, _saved_peft_config)
-        lora_request = LoRARequest(str(lora_request_id), lora_request_id, save_directory)
+        # A saved Gemma-4 adapter names its experts `layers.N.experts`, where vLLM has
+        # `layers.N.moe.experts`. vLLM reading the path would never see the rename, so when
+        # the remap changes any key, serve the remapped tensors instead of the path. The
+        # saved directory is left untouched, and adapters that need no rename still go by path.
+        _remapped_keys = list(_remap_moe_expert_lora_keys(model, dict.fromkeys(_saved_keys)))
+        if _saved_peft_config is not None and _remapped_keys != _saved_keys:
+            state_dict = _remap_moe_expert_lora_keys(model, _saved_adapter_lora_tensors(save_directory))
+            _check_lora_is_servable(model, list(state_dict), save_directory, _saved_peft_config)
+            lora_request = LoRARequest(
+                str(lora_request_id), lora_request_id,
+                lora_tensors = state_dict, lora_config = _saved_peft_config,
+            )
+        else:
+            if len(_saved_keys) != 0:
+                _check_lora_is_servable(model, _saved_keys, save_directory, _saved_peft_config)
+            lora_request = LoRARequest(str(lora_request_id), lora_request_id, save_directory)
     pass
     # vllm_lora_already_loaded(model)
 
