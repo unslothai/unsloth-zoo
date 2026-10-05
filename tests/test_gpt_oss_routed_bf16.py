@@ -23,6 +23,10 @@ import os
 import pytest
 import torch
 
+# T4 (sm75) has no bf16: run the same checks in fp16 there. UNSLOTH_TEST_DTYPE=float16 simulates it.
+DT = getattr(torch, os.environ.get("UNSLOTH_TEST_DTYPE", "")) if os.environ.get("UNSLOTH_TEST_DTYPE") else (
+    torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16)
+
 os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason = "Triton kernels need CUDA")
 
@@ -55,7 +59,7 @@ def _toy(lora, seed = 0):
     with torch.no_grad():
         for p in t.parameters():
             p.normal_(0, 0.05)
-    t = t.cuda().bfloat16()
+    t = t.cuda().to(DT)
     if lora:
         t = peft.get_peft_model(t, peft.LoraConfig(
             r = 4, lora_alpha = 8, target_modules = [],
@@ -112,9 +116,9 @@ from unsloth_zoo.temporary_patches.gpt_oss_routed import (
 @pytest.mark.parametrize("T", [1, 3, 8, 20])
 def test_routed_gemm_matches_reference(T):
     torch.manual_seed(T)
-    w = (torch.randn(E, H, 2 * I, device = "cuda") * 0.05).bfloat16()
-    b = (torch.randn(E, 2 * I, device = "cuda") * 0.05).bfloat16()
-    x = torch.randn(T, H, device = "cuda").bfloat16()
+    w = (torch.randn(E, H, 2 * I, device = "cuda") * 0.05).to(DT)
+    b = (torch.randn(E, 2 * I, device = "cuda") * 0.05).to(DT)
+    x = torch.randn(T, H, device = "cuda").to(DT)
     idx, _ = _routes(T, T)
     flat = idx.reshape(-1)
     ref = torch.einsum("pk,pkn->pn", x.float().repeat_interleave(TOP_K, 0), w.float()[flat]) + b.float()[flat]
@@ -129,7 +133,7 @@ def test_routed_gemm_matches_reference(T):
 @pytest.mark.parametrize("T", [1, 5])
 def test_routed_forward_matches_effective_weights(lora, T):
     model, mlp = _toy(lora)
-    x = torch.randn(1, T, H, device = "cuda").bfloat16()
+    x = torch.randn(1, T, H, device = "cuda").to(DT)
     idx, wts = _routes(T, 7)
     with torch.no_grad():
         assert routed_bf16_eligible(mlp.experts, x)
@@ -148,11 +152,11 @@ def test_routed_forward_matches_effective_weights(lora, T):
 
 def test_grad_enabled_fp32_and_kill_switch_are_not_eligible(monkeypatch):
     _, mlp = _toy(False)
-    x = torch.randn(1, 1, H, device = "cuda").bfloat16()
+    x = torch.randn(1, 1, H, device = "cuda").to(DT)
     assert not routed_bf16_eligible(mlp.experts, x)  # grad enabled
     with torch.no_grad():
         assert not routed_bf16_eligible(mlp.float().experts, x.float())  # tl.dot would use TF32
-        mlp.bfloat16()
+        mlp.to(DT)
         assert routed_bf16_eligible(mlp.experts, x)
         monkeypatch.setenv("UNSLOTH_GPTOSS_ROUTED_KERNEL", "0")
         assert not routed_bf16_eligible(mlp.experts, x)
@@ -162,7 +166,7 @@ def test_grad_enabled_fp32_and_kill_switch_are_not_eligible(monkeypatch):
 def test_fullgraph_compile_and_cuda_graph_replay_with_changed_routes(lora):
     torch._dynamo.reset()
     _, mlp = _toy(lora)
-    x = torch.randn(1, 2, H, device = "cuda").bfloat16()
+    x = torch.randn(1, 2, H, device = "cuda").to(DT)
     idx, wts = _routes(2, 1)
     with torch.no_grad():
         eager = routed_bf16_forward(mlp.experts, x, idx, wts)
@@ -186,7 +190,7 @@ def test_decode_path_applies_expert_lora():
     read the base expert weights, so generation ignored expert LoRA that training applied."""
     from unsloth_zoo.temporary_patches.gpt_oss import moe_forward_inference_bf16
     model, mlp = _toy(True)
-    x = torch.randn(1, 1, H, device = "cuda").bfloat16()
+    x = torch.randn(1, 1, H, device = "cuda").to(DT)
     with torch.no_grad():
         ref = mlp(x)
         ref = (ref[0] if isinstance(ref, tuple) else ref).float()
@@ -204,7 +208,7 @@ def test_param_wrapper_hook_routes_only_at_the_outermost_wrapper():
     outer = mlp.experts
     assert hasattr(outer, "base_layer") and hasattr(outer.base_layer, "base_layer")
     base = outer.get_base_layer()
-    x = torch.randn(3, H, device = "cuda", dtype = torch.bfloat16)
+    x = torch.randn(3, H, device = "cuda", dtype = DT)
     idx, weights = _routes(3, seed = 5)
     with torch.no_grad():
         got = _gpt_oss_routed_wrapper_forward(outer, base, x, (), {"router_indices": idx, "routing_weights": weights})
@@ -224,7 +228,7 @@ def test_routed_mlp_forward_matches_module_on_batched_decode(monkeypatch, lora, 
     top-k scores with softmax(dim=1), so it has to see [tokens, H], else every pick weighs 1."""
     from unsloth_zoo.temporary_patches.gpt_oss_routed import routed_mlp_forward
     model, mlp = _toy(lora)
-    x = torch.randn(B, 1, H, device = "cuda").bfloat16()
+    x = torch.randn(B, 1, H, device = "cuda").to(DT)
     with torch.no_grad():
         got = routed_mlp_forward(mlp, x)
         monkeypatch.setenv("UNSLOTH_GPTOSS_ROUTED_KERNEL", "0")
@@ -237,7 +241,7 @@ def test_routed_mlp_forward_matches_module_on_batched_decode(monkeypatch, lora, 
 @pytest.mark.parametrize("env", ["UNSLOTH_GPTOSS_ROUTED_KERNEL", "UNSLOTH_GPTOSS_ROUTED_INFERENCE"])
 def test_both_kill_switch_names_turn_routing_off(monkeypatch, env):
     _, mlp = _toy(False)
-    x = torch.randn(1, 1, H, device = "cuda").bfloat16()
+    x = torch.randn(1, 1, H, device = "cuda").to(DT)
     monkeypatch.setenv(env, "0")
     assert not routed_bf16_eligible(mlp.experts, x)
 
@@ -245,8 +249,8 @@ def test_both_kill_switch_names_turn_routing_off(monkeypatch, env):
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason = "needs two GPUs")
 def test_routed_kernels_launch_on_the_tensors_device():
     # A multi-GPU device_map puts layers on a non-current GPU; the launch must follow the tensors.
-    x = torch.randn(3, H, device = "cuda:1").bfloat16()
-    w = torch.randn(E, H, I, device = "cuda:1").bfloat16()
+    x = torch.randn(3, H, device = "cuda:1").to(DT)
+    w = torch.randn(E, H, I, device = "cuda:1").to(DT)
     idx = torch.tensor([0, 3, 5], device = "cuda:1")
     with torch.cuda.device(0):
         out = routed_bf16_gemm(x, idx, w)
@@ -258,7 +262,7 @@ def test_mixed_adapter_batch_is_left_to_peft():
     from functools import partial
     from peft.tuners.lora.model import _adapter_names_pre_forward_hook
     _, mlp = _toy(True)
-    x = torch.randn(1, 1, H, device = "cuda").bfloat16()
+    x = torch.randn(1, 1, H, device = "cuda").to(DT)
     handles = []
     try:
         with torch.no_grad():

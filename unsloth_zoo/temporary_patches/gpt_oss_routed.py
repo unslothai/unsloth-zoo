@@ -463,7 +463,8 @@ def routed_experts_forward(experts, hidden_states, router_indices, routing_weigh
         state = getattr(experts, "_unsloth_routed_nf4", None)
     else:
         state = prepare_routed_experts(experts)
-    if not state:
+    # isinstance, not truthiness: Dynamo before torch 2.12 cannot trace bool() of a dict.
+    if not isinstance(state, dict):
         return None
     gu_lora, dn_lora = _lora(experts.gate_up_projs), _lora(experts.down_projs)
     if gu_lora is False or dn_lora is False:
@@ -733,7 +734,7 @@ def routed_mlp_forward(mlp, hidden_states, max_slots = ROUTED_MAX_SLOTS):
         # Pointer tables are built eagerly (data_ptr is not traceable), also on calls too large to
         # route, so a compiled decode step that follows an eager prefill finds them ready.
         state = getattr(experts, "_unsloth_routed_nf4", None) if torch.compiler.is_compiling() else prepare_routed_experts(experts)
-        nf4 = bool(state)
+        nf4 = isinstance(state, dict)
     if hidden_states.numel() // hidden_states.shape[-1] * getattr(mlp.router, "top_k", 4) > max_slots:
         return None
     if not nf4 and not routed_bf16_eligible(experts, hidden_states):

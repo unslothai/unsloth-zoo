@@ -23,6 +23,10 @@ import os
 import pytest
 import torch
 
+# T4 (sm75) has no bf16: run the same checks in fp16 there. UNSLOTH_TEST_DTYPE=float16 simulates it.
+DT = getattr(torch, os.environ.get("UNSLOTH_TEST_DTYPE", "")) if os.environ.get("UNSLOTH_TEST_DTYPE") else (
+    torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16)
+
 os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
 
 if not torch.cuda.is_available():
@@ -41,7 +45,7 @@ E, TOP_K, H, I = 8, 4, 256, 192
 
 def _linear4bit(i, o, nested, seed):
     g = torch.Generator().manual_seed(seed)
-    lin = bnb.nn.Linear4bit(i, o, bias = True, compute_dtype = torch.bfloat16, quant_type = "nf4",
+    lin = bnb.nn.Linear4bit(i, o, bias = True, compute_dtype = DT, quant_type = "nf4",
                             compress_statistics = nested)
     scale = 0.02 * (1 + seed % 5)  # distinct absmax / offsets per expert
     lin.weight = bnb.nn.Params4bit(torch.randn(o, i, generator = g) * scale, requires_grad = False,
@@ -66,7 +70,7 @@ def _routing(T, seed = 0):
     logits = torch.randn(T, E, generator = g)
     vals, idx = logits.topk(TOP_K, dim = -1)
     dense = torch.zeros(T, E).scatter_(1, idx, vals.softmax(-1))
-    return idx.cuda(), dense.cuda().to(torch.bfloat16)
+    return idx.cuda(), dense.cuda().to(DT)
 
 
 @pytest.mark.parametrize("nested", [True, False])
@@ -74,7 +78,7 @@ def test_kernel_matches_bnb_dequant(nested):
     ex = _Experts(nested).eval()
     state = prepare_routed_experts(ex)
     assert state
-    x = torch.randn(5, H, device = "cuda", dtype = torch.bfloat16)
+    x = torch.randn(5, H, device = "cuda", dtype = DT)
     idx, _ = _routing(5)
     inter = routed_gate_up(x, idx.reshape(-1), state["gate_up"], TOP_K, 1.702, 7.0)
     for p in range(idx.numel()):
@@ -124,7 +128,7 @@ def test_routed_forward_matches_reference(lora, T):
     if lora:
         ex = _lora_wrap(ex).eval()
     g = torch.Generator(device = "cuda").manual_seed(T)
-    x = torch.randn(1, T, H, device = "cuda", generator = g).to(torch.bfloat16)
+    x = torch.randn(1, T, H, device = "cuda", generator = g).to(DT)
     idx, w = _routing(T, seed = T)
     with torch.no_grad():
         routed = routed_experts_forward(ex, x, idx, w)
@@ -147,7 +151,7 @@ def test_routed_forward_matches_reference(lora, T):
 
 def test_ineligible_returns_none():
     ex = _Experts(True).eval()
-    x = torch.randn(1, 1, H, device = "cuda", dtype = torch.bfloat16)
+    x = torch.randn(1, 1, H, device = "cuda", dtype = DT)
     idx, w = _routing(1)
     assert routed_experts_forward(ex, x, idx, w) is None  # grad enabled
     os.environ["UNSLOTH_GPTOSS_ROUTED_KERNEL"] = "0"
