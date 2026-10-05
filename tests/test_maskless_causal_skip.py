@@ -356,3 +356,31 @@ def test_tiny_model_generate_is_unchanged(patched, monkeypatch):
     monkeypatch.setenv("UNSLOTH_SKIP_CAUSAL_MASK", "0")
     base = model.generate(input_ids = ids, attention_mask = attention_mask, max_new_tokens = 6, do_sample = False)
     assert torch.equal(head, base)
+
+
+def _register_flex(monkeypatch, reroutes):
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+    def flex_attention_forward(*args, **kwargs):
+        raise AssertionError("not called")
+    if reroutes:
+        flex_attention_forward._unsloth_maskless_causal_sdpa = True
+    mapping = getattr(ALL_ATTENTION_FUNCTIONS, "_global_mapping", None)
+    target = mapping if mapping is not None else ALL_ATTENTION_FUNCTIONS
+    monkeypatch.setitem(target, "flex_attention", flex_attention_forward)
+
+
+def test_flex_drops_the_mask_only_when_unsloth_reroutes_it_to_sdpa(patched, monkeypatch):
+    # Stock flex reads a None mask as full bidirectional attention.
+    kwargs = _kwargs(patched, config = _config("flex_attention"))
+    _register_flex(monkeypatch, reroutes = False)
+    assert _decide(patched, **kwargs) is None
+    assert patched.create_causal_mask(**kwargs) is not None
+
+    _register_flex(monkeypatch, reroutes = True)
+    before = misc.CAUSAL_MASK_SKIP_STATS["skipped"]
+    assert patched.create_causal_mask(**kwargs) is None
+    assert misc.CAUSAL_MASK_SKIP_STATS["skipped"] == before + 1
+    # Padding still gets its BlockMask under the rerouting wrapper.
+    padded = _kwargs(patched, config = _config("flex_attention"),
+                     attention_mask = torch.tensor([[1, 1, 1, 1, 1, 1], [0, 1, 1, 1, 1, 1]]))
+    assert patched.create_causal_mask(**padded) is not None
