@@ -170,6 +170,12 @@ if triton is not None:
         tl.store(OUT + t.to(tl.int64) * N + rows, out.to(OUT.dtype.element_ty), mask = rmask)
 
 
+def _mixed_adapter_batch(module):
+    # PEFT mixed-adapter batches inject adapter_names through a pre-hook on each LoRA layer;
+    # the routed kernels never call those layers, so they must leave such batches alone.
+    return any("adapter_names" in getattr(h, "keywords", ()) for h in getattr(module, "_forward_pre_hooks", {}).values())
+
+
 def _routed_disabled():
     # UNSLOTH_GPTOSS_ROUTED_INFERENCE is the earlier name of the same switch.
     return "0" in (
@@ -406,6 +412,8 @@ def _lora(projs):
     first = projs[0]
     if not hasattr(first, "lora_A"):
         return None
+    if _mixed_adapter_batch(first):
+        return False
     if first.disable_adapters:
         return None
     active = first.active_adapters
@@ -623,6 +631,8 @@ def _lora_terms(experts):
     terms = {}
     m = experts
     while hasattr(m, "base_layer"):
+        if _mixed_adapter_batch(m):
+            return None
         name = getattr(m, "parameter_name", None)
         if hasattr(m, "lora_A") and name is not None:
             if getattr(m, "disable_adapters", False):

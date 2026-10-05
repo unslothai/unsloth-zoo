@@ -3076,6 +3076,8 @@ def _gpt_oss_routed_wrapper_forward(wrapper, experts_module, x, args, kwargs):
     with every adapter in the chain applied. None for anything else (callers run as before)."""
     if torch.is_grad_enabled() or type(experts_module).__name__ != "GptOssExperts":
         return None
+    if "adapter_names" in kwargs:  # mixed-adapter batch: PEFT's own forward handles or rejects it
+        return None
     if getattr(wrapper, "_unsloth_inner_expert_wrapper", False):
         return None
     inner = wrapper.base_layer

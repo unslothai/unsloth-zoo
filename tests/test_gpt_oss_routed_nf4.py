@@ -208,3 +208,21 @@ def test_lora_update_is_not_stale():
         ref = _reference(ex, x, idx, w)
     assert not torch.allclose(before, after)
     torch.testing.assert_close(after.double(), ref, rtol = 1e-4, atol = 1e-4)
+
+
+def test_mixed_adapter_batch_is_left_to_peft():
+    # PEFT's adapter_names pre-hook marks a mixed-adapter batch the routed kernels cannot honour.
+    from functools import partial
+    from peft.tuners.lora.model import _adapter_names_pre_forward_hook
+    ex = _lora_wrap(_Experts(True)).eval()
+    x = torch.randn(1, 1, H, device = "cuda", dtype = torch.float32)
+    idx, w = _routing(1)
+    with torch.no_grad():
+        assert routed_experts_forward(ex, x, idx, w) is not None
+        handles = [m.register_forward_pre_hook(partial(_adapter_names_pre_forward_hook, adapter_names = ["default"]), with_kwargs = True)
+                   for m in ex.modules() if hasattr(m, "lora_A")]
+        try:
+            assert routed_experts_forward(ex, x, idx, w) is None
+        finally:
+            for h in handles:
+                h.remove()

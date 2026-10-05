@@ -252,3 +252,20 @@ def test_routed_kernels_launch_on_the_tensors_device():
         out = routed_bf16_gemm(x, idx, w)
     ref = torch.stack([x[p].float() @ w[idx[p]].float() for p in range(3)])
     torch.testing.assert_close(out, ref, atol = 2e-2, rtol = 2e-2)
+
+
+def test_mixed_adapter_batch_is_left_to_peft():
+    from functools import partial
+    from peft.tuners.lora.model import _adapter_names_pre_forward_hook
+    _, mlp = _toy(True)
+    x = torch.randn(1, 1, H, device = "cuda").bfloat16()
+    handles = []
+    try:
+        with torch.no_grad():
+            assert routed_bf16_eligible(mlp.experts, x)
+            handles = [m.register_forward_pre_hook(partial(_adapter_names_pre_forward_hook, adapter_names = ["default"]), with_kwargs = True)
+                       for m in mlp.modules() if hasattr(m, "lora_A")]
+            assert not routed_bf16_eligible(mlp.experts, x)
+    finally:
+        for h in handles:
+            h.remove()
