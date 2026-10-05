@@ -40,6 +40,15 @@ def test_rows_match_nn_embedding_on_cpu(padding_idx):
     assert out.device == ids.device and out.dtype == emb.weight.dtype
 
 
+def test_scale_matches_scaled_word_embedding():
+    # transformers' ScaledWordEmbedding: rows * embed_scale.to(weight.dtype), on the table's device.
+    emb = _table(padding_idx = 0)
+    scale = torch.tensor(32 ** 0.5)
+    ids = torch.randint(0, 1000, (3, 6))
+    out = offloaded_embedding(ids, emb.weight, 0, scale)
+    assert torch.equal(out, emb(ids) * scale.to(emb.weight.dtype))
+
+
 def test_fullgraph_compile_has_no_graph_break():
     from torch._dynamo.utils import counters
     emb = _table()

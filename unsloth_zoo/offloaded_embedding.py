@@ -16,7 +16,9 @@
 
 """Embedding lookup against a table offloaded to host RAM, as one opaque op a compiled (and CUDA
 graphed) region can call: the ids go to the table's device, the rows come back to the ids' device.
-Inference only (no autograd formula): callers keep nn.Embedding when the table needs a gradient."""
+An optional `scale` multiplies the rows as transformers' `ScaledWordEmbedding` does. Inference only
+(no autograd formula, and it skips the module's forward hooks): callers keep the module whenever
+grad is enabled."""
 
 from typing import Optional
 
@@ -28,12 +30,20 @@ _OP_NAME = "unsloth_zoo::offloaded_embedding"
 
 
 def _offloaded_embedding_impl(
-    input_ids: torch.Tensor, weight: torch.Tensor, padding_idx: Optional[int] = None
+    input_ids: torch.Tensor,
+    weight: torch.Tensor,
+    padding_idx: Optional[int] = None,
+    scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     # Blocking copies both ways: a non_blocking copy into the CPU can be read before it lands.
     # padding_idx only changes the gradient of F.embedding, so the rows are the same either way.
     ids = input_ids.to(weight.device)
-    return torch.nn.functional.embedding(ids, weight, padding_idx).to(input_ids.device)
+    rows = torch.nn.functional.embedding(ids, weight, padding_idx)
+    if scale is not None:
+        # The transformers `ScaledWordEmbedding` product, on the table's device in its dtype as the
+        # module computes it, so the rows match it bit for bit.
+        rows = rows * scale.to(device = weight.device, dtype = weight.dtype)
+    return rows.to(input_ids.device)
 
 
 def _register():
@@ -58,7 +68,7 @@ def _register():
             return None
 
     @op.register_fake
-    def _(input_ids, weight, padding_idx = None):
+    def _(input_ids, weight, padding_idx = None, scale = None):
         return input_ids.new_empty((*input_ids.shape, weight.shape[-1]), dtype = weight.dtype)
 
     return op
