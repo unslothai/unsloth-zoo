@@ -40,8 +40,7 @@ from .log import logger
 from .hf_utils import HAS_TORCH_DTYPE, dtype_from_config, set_dtype_in_config
 
 # get_model_type returns the vision name, which transformers 5 renamed to qwen3_vl_vision.
-# Qwen3.5 / 3.6 MoE checkpoints report qwen3_5_moe for their vision tower too, which keeps the
-# same merged attn.qkv; splitting it stores q, then k, then v under the one HF name.
+# qwen3_5_moe vision towers keep a merged attn.qkv: q, k, v are stored under one HF name.
 QWEN_VL_MERGED_QKV_TYPES = ("qwen2_5_vl", "qwen3_vl", "qwen3_vl_vision", "qwen3_5", "qwen3_5_moe")
 
 
@@ -333,13 +332,8 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     return new_model, original_meta_model, causal_config.num_hidden_layers
 
 def _global_config_value(config_obj, attr, default):
-    """`getattr(config_obj, attr, default)` that also works on a heterogeneous config.
-
-    Gemma-4 overrides head_dim / num_key_value_heads on its full-attention layers, and
-    transformers raises AmbiguousGlobalPerLayerAttributeError for a plain global read of
-    such a field. The global value is still the default every layer without an override
-    uses, and the per-layer overrides survive on the copied config, so read it unvalidated.
-    """
+    """getattr that tolerates heterogeneous configs (Gemma-4 per-layer head_dim / KV heads):
+    transformers raises AmbiguousGlobalPerLayerAttributeError, so read the global unvalidated."""
     try:
         return getattr(config_obj, attr, default)
     except Exception:
@@ -350,19 +344,10 @@ def _global_config_value(config_obj, attr, default):
 pass
 
 def _set_config_attrs(config_obj, attrs_to_set):
-    """Helper to set multiple attributes on a config object if they exist.
-
-    A heterogeneous config (Gemma-4, whose sliding and full-attention layers differ in
-    head_dim and KV head count) raises AmbiguousGlobalPerLayerAttributeError rather than
-    returning, and hasattr only swallows AttributeError, so the plain check propagates it.
-    Such an attribute IS present, just per-layer, so set it on the per-layer configs too:
-    this helper exists to shrink every dimension to 1 for the placeholder model, and
-    shrinking only the global value would leave the per-layer ones at full size.
-    """
+    """Set attributes that exist. Heterogeneous configs (Gemma-4) raise
+    AmbiguousGlobalPerLayerAttributeError on hasattr; those are set per-layer too."""
     def _per_layer_configs():
-        # Never test this for truthiness: the per-layer container's __len__ reads
-        # num_hidden_layers off its parent, which Qwen3.5's vision config does not have,
-        # so `or []` turns a missing attribute into an AttributeError for every caller.
+        # No truthiness test: __len__ needs num_hidden_layers, absent on Qwen3.5 vision config.
         try:
             per_layer = getattr(config_obj, "per_layer_config", None)
             return list(per_layer) if per_layer is not None else []
@@ -373,8 +358,7 @@ def _set_config_attrs(config_obj, attrs_to_set):
         try:
             present = hasattr(config_obj, attr)
         except Exception:
-            # Present, but per-layer rather than global. Shrink the per-layer copies too,
-            # otherwise the placeholder model is built at full size on those dimensions.
+            # Per-layer attribute: shrink per-layer copies too or the placeholder stays full size.
             present = True
             for layer_config in _per_layer_configs():
                 try:
@@ -427,12 +411,8 @@ def patch_gemma4_vllm_lora_support():
 
     gemma4_lora_classes = set(gemma4_lora_classes)
 
-    # Unsloth's expert adapters are PEFT target_parameters tensors stacked over experts,
-    # which only vLLM's FusedMoE3DWithLoRA reads. vLLM picks that wrapper from the model
-    # class's is_3d_moe_weight, which Gemma 4 does not set, so the 2D wrapper would take
-    # the adapter and the experts would be served without it. HF stores Gemma 4's experts
-    # exactly as Qwen3.5 MoE does ((E, 2*inter, hidden) / (E, hidden, inter)), which is the
-    # layout the 3D wrapper assumes. Older vLLM without the 3D wrapper keeps the refusal.
+    # Stacked expert adapters need FusedMoE3DWithLoRA, chosen via is_3d_moe_weight, which Gemma 4
+    # lacks (else experts are served without the adapter). Older vLLM without it keeps the refusal.
     try:
         from vllm.lora.layers.fused_moe import FusedMoE3DWithLoRA  # noqa: F401
         has_3d_moe_lora = True
@@ -1162,9 +1142,7 @@ def get_model_layer_config(return_non_layered=True):
             "model.layers.{kk}.feed_forward.gate.weight",
             "model.layers.{kk}.feed_forward.expert_bias",
 
-            # Sparse MoE blocks. experts.{gate_up,down}_proj are bare stacked Parameters
-            # rather than Linears, which the assignment loop handles via its
-            # "layer_name in quant_state_dict" branch (no ".weight" suffix).
+            # Sparse MoE: experts.{gate_up,down}_proj are bare Parameters (no ".weight").
             "model.language_model.layers.{kk}.mlp.gate.weight",
             "model.language_model.layers.{kk}.mlp.shared_expert_gate",
             "model.language_model.layers.{kk}.mlp.shared_expert.gate_proj",
@@ -1181,9 +1159,7 @@ def get_model_layer_config(return_non_layered=True):
             "model.layers.{kk}.mlp.experts.gate_up_proj",
             "model.layers.{kk}.mlp.experts.down_proj",
 
-            # Gemma-4 runs its MoE block alongside the dense MLP rather than in place of
-            # it, so the experts and the router are siblings of mlp, not children. Without
-            # these the assignment loop silently leaves every expert a 1-wide placeholder.
+            # Gemma-4: experts and router are siblings of mlp, else left as 1-wide placeholders.
             "model.language_model.layers.{kk}.experts.gate_up_proj",
             "model.language_model.layers.{kk}.experts.down_proj",
             "model.language_model.layers.{kk}.router.proj",
@@ -1505,20 +1481,10 @@ def _get_nested_attr(obj, attr_path: str):
 def vllm_moe_expert_weights(experts, where, config = None):
     """A vLLM FusedMoE's (w13, w2) when they are exactly HF's stacked expert tensors.
 
-    HF holds gate_up_proj as (E, 2*inter, hidden) and down_proj as (E, hidden, inter), and
-    vLLM's TRITON / BATCHED_TRITON backends keep w13_weight / w2_weight in that same plain
-    layout, so the training model can alias them with no copy. Every other backend
-    rewrites the experts at load: FlashInfer TRT-LLM (vLLM's pick for LoRA-enabled bf16 MoE
-    on Blackwell) tiles them into a 4-D block layout, and others reorder w13's halves while
-    keeping the shape. Aliasing those would silently train on wrong weights, and copying
-    them would keep a second full set of experts, so refuse instead. Quantized experts are
-    refused too: bitsandbytes packs them into a uint8 blob that is still 3-D, and float8
-    passes is_floating_point(), and neither carries its quant state across.
-
-    Some rewrites keep both the 3-D shape and the 2:1 ratio (TRT-LLM padding the
-    intermediate dim on vLLM 0.31, ROCm AITER shuffling on vLLM < 0.15, which predates
-    unquantized_backend), so the backend is checked by name, the pre-0.15 flags are read
-    directly, and the shape is compared with the config when one is given.
+    Only TRITON / BATCHED_TRITON keep HF's plain layout. Other backends tile or reorder the
+    experts (aliasing would train on wrong weights, copying doubles memory), and quantized
+    experts lose their quant state, so all are refused. Some rewrites keep shape and 2:1 ratio
+    (TRT-LLM padding on vLLM 0.31, AITER on < 0.15), hence the backend name and config checks.
     """
     experts = getattr(experts, "base_layer", experts)  # FusedMoEWithLoRA under enable_lora
     routed = getattr(experts, "routed_experts", experts)  # vLLM >= 0.24: MoERunner.routed_experts
@@ -1566,33 +1532,17 @@ pass
 def extract_moe_layers(
     moe_block, prefix, state_dict, quant_state_dict, get_state_dict, router = None, config = None,
 ):
-    """Alias a vLLM sparse MoE block's weights onto their HF names.
+    """Alias a vLLM sparse MoE block's weights onto their HF names (no copy).
 
-    The routed experts are stacked 3-D Parameters rather than Linears, so get_state_dict,
-    which reads proj.weight, cannot reach them. vLLM stores them as (E, 2*inter, hidden)
-    and (E, hidden, inter), which is exactly what the HF checkpoint holds, so both alias
-    with no reshape and no copy.
-
-    That equivalence only holds for the untiled MoE backends; vllm_moe_expert_weights
-    refuses every other layout rather than silently materialising a second copy.
-
-    Two block shapes reach here. Qwen3.5 / 3.6 replace the dense MLP with the MoE block, so
-    prefix is "...layers.N.mlp" and the router is the block's own .gate. Gemma-4 instead
-    runs the MoE block ALONGSIDE a dense MLP, as layer.moe with a separate layer.router
-    (vLLM 0.19 - 0.30) or with the experts directly on the layer (vLLM >= 0.31), so prefix
-    is the bare "...layers.N" and router is passed in. Pass whichever the model has.
+    Qwen3.5 / 3.6: prefix "...layers.N.mlp", router is the block's .gate. Gemma-4: prefix
+    "...layers.N", router passed in (MoE runs alongside the dense MLP).
     """
     def store(name, value):
         state_dict[name] = value
         quant_state_dict[name] = value
 
-    # The router is a plain Linear on vLLM's side, but NOT on HF's: Qwen3.5 / 3.6 make it a
-    # Qwen3_5MoeTopKRouter, an nn.Module holding a bare weight Parameter, which also carries
-    # top_k and performs the top-k renormalisation. Storing it under the bare name
-    # "...mlp.gate" makes the assignment loop rebuild it as an nn.Linear and overwrite the
-    # router, and the patched block forward then silently falls back to top_k = 2 (against
-    # num_experts_per_tok = 8) with no renormalisation. Store the WEIGHT instead, so the
-    # loop assigns it in place and the router class survives.
+    # Store the router WEIGHT, not "...mlp.gate": a bare name rebuilds HF's TopKRouter as a
+    # Linear, silently dropping top_k and renormalisation.
     gate = getattr(moe_block, "gate", None)
     if gate is not None:
         gate_weight = getattr(getattr(gate, "base_layer", gate), "weight", None)
@@ -1603,10 +1553,7 @@ def extract_moe_layers(
     if shared_expert_gate is not None:
         get_state_dict(f"{prefix}.shared_expert_gate", 0, state_dict, shared_expert_gate, slice_weights = False)
 
-    # Gemma-4's router is a sibling module, and vLLM splits it across two parents: the
-    # projection and its input scale stay on layer.router, but per_expert_scale is moved
-    # onto the MoE block so the fused routing kernel can read it. HF keeps all three under
-    # router, so per_expert_scale has to be picked up from the block, not from the router.
+    # vLLM moves Gemma-4's per_expert_scale onto the MoE block; HF keeps it under router.
     if router is not None:
         if hasattr(router, "proj"):
             get_state_dict(f"{prefix}.router.proj", 0, state_dict, router.proj, slice_weights = False)
@@ -1619,8 +1566,7 @@ def extract_moe_layers(
         if per_expert_scale is not None:
             store(f"{prefix}.router.per_expert_scale", per_expert_scale.data)
 
-    # The shared expert is dense. vLLM fuses gate+up into one tensor while HF keeps them
-    # separate, so the two HF tensors are slice views of the single vLLM one.
+    # Shared expert: HF gate/up are slice views of vLLM's fused gate_up.
     shared_expert = getattr(moe_block, "shared_expert", None)
     if shared_expert is not None and hasattr(shared_expert, "gate_up_proj"):
         get_state_dict(f"{prefix}.shared_expert.gate_proj", 0, state_dict, shared_expert.gate_up_proj)
@@ -1632,7 +1578,6 @@ def extract_moe_layers(
     w13, w2 = vllm_moe_expert_weights(experts, prefix, config)
     w13.requires_grad_(False)
     w2 .requires_grad_(False)
-    # HF holds these as bare Parameters, so unlike every Linear above there is no ".weight".
     store(f"{prefix}.experts.gate_up_proj", w13.data)
     store(f"{prefix}.experts.down_proj",    w2 .data)
 pass

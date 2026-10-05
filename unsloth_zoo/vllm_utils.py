@@ -602,22 +602,11 @@ else:
 pass
 
 def patch_vllm_untiled_moe_experts():
-    """Keep vLLM's routed expert weights in a layout Unsloth can alias.
-
-    With LoRA enabled, vLLM's unquantized MoE oracle returns FlashInfer TRT-LLM before it
-    ever consults the user's --moe-backend, and that backend rewrites the experts into a
-    (E, hidden/64, 2*inter, 64) block layout. That is a permute of the HF layout, so it
-    cannot be viewed back, and weight sharing would degrade into a second full copy of the
-    expert weights, which for a 35B-A3B model is the entire cost we are trying to avoid.
-
-    Declining the TRT-LLM LoRA path drops the oracle to Triton, whose weights are plain
-    contiguous (E, 2*inter, hidden) / (E, hidden, inter), matching HF exactly. The trade is
-    a slower rollout MoE kernel for one shared copy of the expert weights.
-    """
+    """Decline vLLM's TRT-LLM LoRA MoE path: its tiled (E, H/64, 2I, 64) layout cannot be
+    aliased to HF's, so fall back to Triton whose layout matches HF (slower, one shared copy)."""
     try:
         from vllm.model_executor.layers.fused_moe.oracle import unquantized as _unquantized
     except Exception as e:
-        # Older vLLM has no such oracle, and therefore no tiled LoRA path to decline.
         logger.info(f"Unsloth: no unquantized MoE oracle to patch: {e}")
         return False
     if not hasattr(_unquantized, "_trtllm_bf16_lora_supported"):
@@ -962,8 +951,7 @@ def patch_vllm(debug = True):
     patch_vllm_bitsandbytes()
     patch_vllm_lora_tokenizer()
     patch_vllm_lora_load_tensors()
-    # Always: the training model is rebuilt from vLLM's weights, and vllm_moe_expert_weights
-    # refuses the tiled TRT-LLM expert layout, so allowing it would only make fast_inference fail.
+    # Always: vllm_moe_expert_weights refuses the tiled TRT-LLM layout the rebuild needs.
     patch_vllm_untiled_moe_experts()
     # Match load_vllm's standby check (!= "0") so any truthy value also installs
     # the sleep + cache-reset patches, not just "1".
@@ -1348,8 +1336,7 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
                 get_state_dict(f"{prefix}.{name}", 0, state_dict, getattr(layer.short_conv, name), slice_weights=False)
         pass
 
-        # Gemma-4 declares these attributes and assigns None when hidden_size_per_layer_input
-        # is 0, so hasattr is True while the module does not exist. Test the value.
+        # Gemma-4 sets these to None when hidden_size_per_layer_input is 0.
         if getattr(layer, "per_layer_input_gate", None) is not None:
             get_state_dict(
                 f"{vllm_text_model_prefix}.layers.{kk}.per_layer_input_gate",
@@ -1417,10 +1404,7 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
                 "set fast_inference = False."
             )
 
-        # Gemma-4 keeps a dense MLP and adds a MoE block beside it (layer.moe + layer.router)
-        # rather than replacing it, so this runs in addition to, not instead of, the MLP
-        # extraction below. Its HF names hang off the layer, with no .mlp. segment.
-        # vLLM 0.31 dropped the layer.moe wrapper and hangs the experts off the layer itself.
+        # Gemma-4 MoE runs beside the dense MLP (no .mlp. in HF names); vLLM 0.31 drops layer.moe.
         moe_block = getattr(layer, "moe", None)
         if moe_block is None and hasattr(layer, "experts") and hasattr(layer, "router"):
             moe_block = layer
@@ -1436,7 +1420,6 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
 
         mlp_prefix = f"{vllm_text_model_prefix}.layers.{kk}.mlp"
         if not hasattr(layer.mlp, "gate_up_proj") and hasattr(layer.mlp, "experts"):
-            # Sparse MoE block: routed experts are stacked Parameters, not Linears.
             extract_moe_layers(
                 layer.mlp, mlp_prefix, state_dict, quant_state_dict, get_state_dict,
                 config = text_config,
@@ -1603,13 +1586,7 @@ pass
 
 @torch.inference_mode
 def _refresh_placeholder_dims(parent, attr_name, weight):
-    """Give a module whose 2-D .weight was just replaced the sizes of the real weight.
-
-    A Linear keeps in_features / out_features of 1. A top-k router (Qwen3_5MoeTopKRouter and
-    the other HF TopKRouters) reshapes its input to `hidden_dim` in forward, and only
-    copy_attributes would restore it, which is skipped when the original meta model could
-    not be built.
-    """
+    """Replace placeholder sizes of 1 on a Linear / TopKRouter from its real 2-D weight."""
     # All Unsloth Zoo code licensed under LGPLv3
     if attr_name != "weight" or weight.ndim != 2: return
     if isinstance(parent, torch.nn.Linear):
@@ -1755,10 +1732,6 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 else:
                     layer = torch.nn.Parameter(raw_value, requires_grad = False)
                     exec(f"new_model.{layer_name_br} = layer")
-                    # Assigning .weight in place keeps the parent module's CLASS, which is the
-                    # point for routers like Qwen3_5MoeTopKRouter that carry top_k. But it also
-                    # keeps create_empty_model's placeholder sizes of 1, so refresh them from the
-                    # real weight rather than leaving the module self-describing as 1x1.
                     _refresh_placeholder_dims(parent, attr_name, raw_value)
                 continue
             elif fp8_weight_scale is not None:
@@ -1959,16 +1932,8 @@ pass
 
 
 def _config_get(config, name, default = None):
-    """getattr for configs that may be heterogeneous across layers.
-
-    Transformers raises AmbiguousGlobalPerLayerAttributeError, which is NOT an
-    AttributeError, for any attribute that varies per layer, so a plain getattr with a
-    default does not protect against it. Gemma-4 hits this on num_key_value_heads, because
-    its full-attention layers use a different KV head count from its sliding ones.
-
-    For a memory estimate the safe resolution is the largest value any layer uses, so this
-    takes the max over per_layer_config rather than guessing a single global.
-    """
+    """getattr for heterogeneous configs (Gemma-4 per-layer KV heads raise
+    AmbiguousGlobalPerLayerAttributeError, not AttributeError): max over per_layer_config."""
     try:
         value = getattr(config, name)
     except AttributeError:
@@ -2010,8 +1975,7 @@ def approximate_vllm_memory_usage(
     vocab_size = config.vocab_size
     hd = config.hidden_size
     context_length = config.max_position_embeddings
-    # Sparse MoE configs (Qwen3.5 / 3.6 MoE, Qwen3-Next) carry no dense intermediate_size at
-    # all, so reading it unguarded is an AttributeError before we ever reach the estimate.
+    # Sparse MoE configs (Qwen3.5 / 3.6, Qwen3-Next) have no dense intermediate_size.
     n_experts   = _config_get(config, "num_experts") or _config_get(config, "num_local_experts") or 0
     moe_size    = _config_get(config, "moe_intermediate_size")
     shared_size = _config_get(config, "shared_expert_intermediate_size") or 0
@@ -2029,13 +1993,9 @@ def approximate_vllm_memory_usage(
     qkvo = hd + kv_size + kv_size + hd
     qkvo = qkvo * hd
     if is_moe:
-        # gate_up (2) + down (1) per routed expert, plus the dense shared expert and router.
         mlp = n_experts * (hd * moe_size) * 3 + (hd * shared_size) * 3 + hd * n_experts
-        # Gemma-4 runs a full dense MLP in parallel with the MoE block rather than in place
-        # of it, so its intermediate_size is real and additive. Key this on enable_moe_block,
-        # which is the flag that adds the second FFN: Qwen3-MoE also carries a leftover dense
-        # intermediate_size in its config but never builds the dense MLP, so keying on the
-        # field's mere presence would double count it.
+        # Gemma-4's dense MLP is additive; key on enable_moe_block, since Qwen3-MoE's leftover
+        # intermediate_size builds no dense MLP and would double count.
         dense_size = _config_get(config, "intermediate_size")
         if _config_get(config, "enable_moe_block", False) and dense_size is not None:
             mlp += (hd * dense_size) * 3
@@ -2051,10 +2011,8 @@ def approximate_vllm_memory_usage(
     mlp_A  = hd * max_lora_rank * 2 + mlp_size * max_lora_rank
     mlp_B  = max_lora_rank * (mlp_size + mlp_size) + max_lora_rank * hd
     if is_moe:
-        # Expert adapters are stacked over experts, so they scale with the expert count,
-        # which at 256 experts dwarfs the dense terms rather than matching them. Ordinary
-        # MLP Linears also get adapters: Qwen3.5 MoE's shared expert, Gemma-4's dense MLP.
-        # One A per stacked tensor: gate_up (E*r, H) and down (E*r, I); B is (2I, E*r) and (H, E*r).
+        # Stacked expert LoRA scales with E: A gate_up (E*r, H), down (E*r, I); B (2I, E*r), (H, E*r).
+        # Dense MLP Linears (Qwen3.5 shared expert, Gemma-4 MLP) get adapters too.
         mlp_A = n_experts * max_lora_rank * (hd + moe_size)
         mlp_B = n_experts * max_lora_rank * (moe_size + moe_size + hd)
         dense_sizes = [shared_size]
@@ -3365,13 +3323,8 @@ def load_vllm(
         approx_max_num_seqs = int(approx_max_num_seqs * conservativeness)
         approx_max_num_seqs = max(approx_max_num_seqs, 1)
 
-        # A prefill budget larger than max_num_seqs * max_model_len is unreachable: vLLM warns
-        # "max_num_batched_tokens (N) exceeds max_num_seqs * max_model_len (M)", then warms up
-        # on dummy batches sized to the budget rather than to anything the engine can schedule.
-        # On Gemma-4 / B200 that warmup dies with an illegal memory access inside the compiled
-        # graph, reproducible on plain vLLM with no Unsloth present by setting these three
-        # values alone. The vision branch above is how we get there: it pins seqs at 1 and
-        # raises the budget to 8192 in the same breath.
+        # Cap the budget at max_num_seqs * max_model_len: larger warmup batches crash Gemma-4 on
+        # B200 with an illegal memory access (plain vLLM too); the vision branch above triggers it.
         reachable_tokens = approx_max_num_seqs * max_seq_length
         if max_num_batched_tokens > reachable_tokens:
             max_num_batched_tokens = reachable_tokens
@@ -3584,9 +3537,7 @@ def load_vllm(
             # Affects any model with head_dim>=256 (gemma, gemma2, gemma3, qwen3_next, etc).
             if major_version >= 10:
                 _text_config = getattr(config, "text_config", config)
-                # Gemma-4 varies head_dim per layer (256 sliding, 512 global), so a plain
-                # getattr raises instead of returning. The largest head_dim decides whether
-                # the FlashInfer assertion can fire, which is what _config_get returns.
+                # Gemma-4 head_dim is per-layer (256/512); the max decides the FlashInfer assert.
                 _head_dim = _config_get(_text_config, "head_dim")
                 if _head_dim is not None and _head_dim >= 256:
                     engine_args["block_size"] = 32
@@ -4058,11 +4009,7 @@ def _saved_adapter_lora_keys(save_directory):
 
 
 def _saved_adapter_lora_tensors(save_directory):
-    """The tensors of a saved PEFT adapter, keyed as on disk.
-
-    Only read when `load_lora`'s path branch must rename keys before vLLM sees them, so the
-    common path-loaded adapter still costs no tensor IO.
-    """
+    """A saved PEFT adapter's tensors, read only when load_lora must rename keys."""
     # All Unsloth Zoo code licensed under LGPLv3
     safetensors_path = os.path.join(save_directory, "adapter_model.safetensors")
     if os.path.isfile(safetensors_path):
@@ -4071,7 +4018,7 @@ def _saved_adapter_lora_tensors(save_directory):
     else:
         bin_path = os.path.join(save_directory, "adapter_model.bin")
         state_dict = torch.load(bin_path, map_location = "cpu", weights_only = True)
-    # Everything, as vLLM's from_local_checkpoint passes it: lora_embedding_A / _B included.
+    # Pass everything through, like vLLM's from_local_checkpoint (incl. lora_embedding_A/B).
     return state_dict
 
 
@@ -4329,14 +4276,10 @@ pass
 
 
 def _remap_moe_expert_lora_keys(model, state_dict):
-    """Rename stacked expert adapter keys onto the vLLM module that holds those experts.
+    """Rename Gemma 4 `layers.N.experts` adapter keys to vLLM's `layers.N.moe.experts`.
 
-    Gemma 4 keeps its experts at `...layers.N.experts` in HF (so in the PEFT adapter), but
-    vLLM nests them one level down at `...layers.N.moe.experts`. vLLM's own rename regex is
-    `$`-anchored, so it fires on the base weight name and never on a LoRA key
-    (vllm-project/vllm#41754), which is why `_check_lora_is_servable` would refuse the
-    adapter. Only a key whose module vLLM does not have, and whose `.moe.experts` sibling
-    it does have, is renamed; everything else passes through untouched.
+    vLLM's rename regex is `$`-anchored so never hits LoRA keys (vllm-project/vllm#41754).
+    Only keys whose module is missing but whose `.moe.experts` sibling exists are renamed.
     """
     # All Unsloth Zoo code licensed under LGPLv3
     if not any(_is_moe_expert_lora_key(k) for k in state_dict): return state_dict
@@ -4467,10 +4410,8 @@ def load_lora(model, save_directory, load_tensors = False, lora_request_id = Non
                 _saved_peft_config = get_peft_config(save_directory)
             except Exception:
                 _saved_peft_config = None
-        # A saved Gemma-4 adapter names its experts `layers.N.experts`, where vLLM has
-        # `layers.N.moe.experts`. vLLM reading the path would never see the rename, so when
-        # the remap changes any key, serve the remapped tensors instead of the path. The
-        # saved directory is left untouched, and adapters that need no rename still go by path.
+        # vLLM reading the path skips the Gemma-4 expert rename: serve remapped tensors only
+        # when a key changed; otherwise load by path (no tensor IO).
         _remapped_keys = list(_remap_moe_expert_lora_keys(model, dict.fromkeys(_saved_keys)))
         if _saved_peft_config is not None and _remapped_keys != _saved_keys:
             state_dict = _remap_moe_expert_lora_keys(model, _saved_adapter_lora_tensors(save_directory))
