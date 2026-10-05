@@ -3505,6 +3505,61 @@ _CE_TAIL_VIEW = re.compile(r"(?:shift|flat)_logits = (?:shift|flat)_logits\.view
 _CE_TAIL_CALL = re.compile(r"loss = loss_fct\((?:shift|flat)_logits, (?:shift|flat)_labels\)")
 
 
+def _labels_block_tail(forward, end, indent):
+    """Source still inside the `if labels is not None:` body after the matched loss
+    call (Bamba's z-loss), "" if none, None if code shares the loss call's line."""
+    rest = forward[end:]
+    newline = rest.find("\n")
+    if newline == -1:
+        return ""
+    if rest[:newline].strip():
+        return None
+    tail = []
+    for line in rest[newline + 1:].split("\n"):
+        if line.strip() and len(line) - len(line.lstrip()) < indent:
+            break
+        tail.append(line)
+    return "\n".join(tail).strip("\n")
+
+
+def _tail_guard(tail):
+    """(condition, dedented block) for a tail that is one `if COND:` block, ("", "")
+    for no statements, None for anything the fused branches cannot replay."""
+    if not tail.strip():
+        return ("", "")
+    block = textwrap.dedent(tail)
+    try:
+        body = ast.parse(block).body
+    except SyntaxError:
+        return None
+    if not body:
+        return ("", "")
+    if len(body) == 1 and isinstance(body[0], ast.If) and not body[0].orelse:
+        return (ast.unparse(body[0].test), block)
+    return None
+
+
+def _guard_loss_function_replacement(replacement, condition, block):
+    """Fused branches skip `condition`, whose block reads the real logits; the
+    RETURN_LOGITS branch replays it and leaves the rest to the unfused `else`."""
+    condition = condition.replace("\\", "\\\\")
+    block = block.replace("\\", "\\\\")
+    lines = []
+    for line in replacement.split("\n"):
+        stripped = line.strip()
+        indent = line[: len(line) - len(line.lstrip())]
+        if stripped.startswith("elif ") and stripped.endswith(
+            ("and not requires_grad_:", 'getattr(self.lm_head, "bias", None) is None:', "and NOT_RETURN_LOGITS:")
+        ):
+            line = f"{line[:-1]} and not ({condition}):"
+        elif stripped == 'elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None:':
+            line = f"{line[:-1]} and not NOT_RETURN_LOGITS:"
+        lines.append(line)
+        if stripped.startswith("loss = self.loss_function(logits, labels.to("):
+            lines.extend(indent + x if x.strip() else x for x in block.rstrip("\n").split("\n"))
+    return "\n".join(lines)
+
+
 def _apply_fused_lm_head(forward, module=None):
     # All Unsloth Zoo code licensed under LGPLv3
     UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
@@ -3715,11 +3770,24 @@ def _apply_fused_lm_head(forward, module=None):
         replacement = "\n".join((len(spaces) - 4) * " " + x for x in replacement)
         # A consumed `logits = logits.float()` (transformers 4.x Granite MoE) must still reach the
         # unfused loss_function calls, which also return those logits.
-        if r"loss\_function" in cross_entropy_find:
+        try:
             matched = regex.search(
                 cross_entropy_find, forward, flags = regex.DOTALL | regex.MULTILINE, timeout = 1,
             )
-            if matched is not None and "logits = logits.float()" in matched.group(0):
+        except Exception:
+            continue
+        if matched is None:
+            continue
+        # Statements after the matched loss call inside the labels block otherwise only
+        # reach the final unfused branch (Bamba's z-loss reads the real logits).
+        guard = _labels_block_tail(forward, matched.end(), len(spaces))
+        guard = None if guard is None else _tail_guard(guard)
+        if guard is None or (guard[0] and r"loss\_function" not in cross_entropy_find):
+            continue
+        if guard[0]:
+            replacement = _guard_loss_function_replacement(replacement, *guard)
+        if r"loss\_function" in cross_entropy_find:
+            if "logits = logits.float()" in matched.group(0):
                 replacement = re.sub(
                     r"^([ \t]*)(loss = self\.loss_function\()",
                     r"\1logits = logits.float()\n\1\2",
