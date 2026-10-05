@@ -3333,8 +3333,7 @@ pass
 TEMPORARY_PATCHES.append(patch_GptOssAttention)
 
 
-# Shared with every model (unsloth's offloaded-embedding installer): a CPU table looked up as
-# one opaque, CUDA-graph-safe op. A module global so tests can wrap it.
+# A module global so tests can wrap it.
 from unsloth_zoo.offloaded_embedding import offloaded_embedding as _offloaded_embedding
 
 

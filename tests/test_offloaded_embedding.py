@@ -14,8 +14,6 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-# Guards the shared offloaded-embedding op: same rows as nn.Embedding, traceable without a graph
-# break, and the one gpt-oss uses (a second copy would drift from the generic installer).
 import pytest
 import torch
 
@@ -43,7 +41,6 @@ def test_rows_match_nn_embedding_on_cpu(padding_idx):
 
 @needs_op
 def test_scale_matches_scaled_word_embedding():
-    # transformers' ScaledWordEmbedding: rows * embed_scale.to(weight.dtype), on the table's device.
     emb = _table(padding_idx = 0)
     scale = torch.tensor(32 ** 0.5)
     ids = torch.randint(0, 1000, (3, 6))

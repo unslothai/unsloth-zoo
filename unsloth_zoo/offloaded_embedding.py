@@ -14,11 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Embedding lookup against a table offloaded to host RAM, as one opaque op a compiled (and CUDA
-graphed) region can call: the ids go to the table's device, the rows come back to the ids' device.
-An optional `scale` multiplies the rows as transformers' `ScaledWordEmbedding` does. Inference only
-(no autograd formula, and it skips the module's forward hooks): callers keep the module whenever
-grad is enabled."""
+"""Lookup in a host-RAM embedding table as one opaque op a compiled, CUDA graphed region can call.
+Inference only: no autograd formula, and it skips the module's forward hooks."""
 
 from typing import Optional
 
@@ -35,13 +32,11 @@ def _offloaded_embedding_impl(
     padding_idx: Optional[int] = None,
     scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    # Blocking copies both ways: a non_blocking copy into the CPU can be read before it lands.
-    # padding_idx only changes the gradient of F.embedding, so the rows are the same either way.
+    # Blocking copies: a non_blocking copy into the CPU can be read before it lands.
     ids = input_ids.to(weight.device)
     rows = torch.nn.functional.embedding(ids, weight, padding_idx)
     if scale is not None:
-        # The transformers `ScaledWordEmbedding` product, on the table's device in its dtype as the
-        # module computes it, so the rows match it bit for bit.
+        # transformers' ScaledWordEmbedding product, in the table's dtype, so rows match bit for bit.
         rows = rows * scale.to(device = weight.device, dtype = weight.dtype)
     return rows.to(input_ids.device)
 
@@ -50,9 +45,7 @@ def _register():
     custom_op = getattr(getattr(torch, "library", None), "custom_op", None)
     if custom_op is None:
         return None
-    # cudagraph_unsafe makes Inductor's graph partitioning run the lookup outside the CUDA graph,
-    # in order with the rest of the step; inlined, the CPU kernel read token ids the graph had
-    # not copied back yet.
+    # cudagraph_unsafe runs the lookup outside the CUDA graph; inlined, it read ids not yet copied back.
     tag = getattr(torch._C.Tag, "cudagraph_unsafe", None)
     # torch before 2.8 has no `tags` keyword at all: the last attempt omits it.
     attempts = ([dict(tags = (tag,))] if tag is not None else []) + [dict()]
@@ -63,7 +56,6 @@ def _register():
         except Exception:
             continue
     else:
-        # Already defined in this process (a module reload): reuse the registered op.
         try:
             return torch.ops.unsloth_zoo.offloaded_embedding
         except Exception:
