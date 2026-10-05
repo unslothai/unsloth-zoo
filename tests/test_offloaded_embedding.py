@@ -21,7 +21,7 @@ import torch
 
 from unsloth_zoo.offloaded_embedding import offloaded_embedding
 
-pytestmark = pytest.mark.skipif(offloaded_embedding is None, reason = "torch.library.custom_op unavailable")
+needs_op = pytest.mark.skipif(offloaded_embedding is None, reason = "torch.library.custom_op unavailable")
 
 
 def _table(V = 1000, H = 32, padding_idx = None):
@@ -30,6 +30,7 @@ def _table(V = 1000, H = 32, padding_idx = None):
     return torch.nn.Embedding(V, H, padding_idx = padding_idx, dtype = torch.bfloat16).requires_grad_(False)
 
 
+@needs_op
 @pytest.mark.parametrize("padding_idx", [None, 3])
 def test_rows_match_nn_embedding_on_cpu(padding_idx):
     emb = _table(padding_idx = padding_idx)
@@ -40,6 +41,7 @@ def test_rows_match_nn_embedding_on_cpu(padding_idx):
     assert out.device == ids.device and out.dtype == emb.weight.dtype
 
 
+@needs_op
 def test_scale_matches_scaled_word_embedding():
     # transformers' ScaledWordEmbedding: rows * embed_scale.to(weight.dtype), on the table's device.
     emb = _table(padding_idx = 0)
@@ -49,6 +51,7 @@ def test_scale_matches_scaled_word_embedding():
     assert torch.equal(out, emb(ids) * scale.to(emb.weight.dtype))
 
 
+@needs_op
 def test_fullgraph_compile_has_no_graph_break():
     from torch._dynamo.utils import counters
     emb = _table()
@@ -65,6 +68,13 @@ def test_fullgraph_compile_has_no_graph_break():
     assert torch.equal(out, emb(ids) * scale)
 
 
+def test_op_registers_wherever_custom_op_exists():
+    # torch 2.4 to 2.7 have custom_op but no `tags` keyword; registration must not depend on it.
+    if getattr(torch.library, "custom_op", None) is not None:
+        assert offloaded_embedding is not None
+
+
+@needs_op
 def test_gpt_oss_uses_the_shared_op():
     try:
         from unsloth_zoo.temporary_patches import gpt_oss
@@ -73,6 +83,7 @@ def test_gpt_oss_uses_the_shared_op():
     assert gpt_oss._offloaded_embedding is offloaded_embedding
 
 
+@needs_op
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
 def test_cpu_table_cuda_ids_under_cuda_graphs():
     emb = _table(V = 50021, H = 64)

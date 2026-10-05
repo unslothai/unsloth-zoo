@@ -54,9 +54,11 @@ def _register():
     # in order with the rest of the step; inlined, the CPU kernel read token ids the graph had
     # not copied back yet.
     tag = getattr(torch._C.Tag, "cudagraph_unsafe", None)
-    for tags in (((tag,),) if tag is not None else ()) + ((),):
+    # torch before 2.8 has no `tags` keyword at all: the last attempt omits it.
+    attempts = ([dict(tags = (tag,))] if tag is not None else []) + [dict()]
+    for kwargs in attempts:
         try:
-            op = custom_op(_OP_NAME, mutates_args = (), tags = tags)(_offloaded_embedding_impl)
+            op = custom_op(_OP_NAME, mutates_args = (), **kwargs)(_offloaded_embedding_impl)
             break
         except Exception:
             continue
