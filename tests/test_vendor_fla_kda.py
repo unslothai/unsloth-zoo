@@ -4,6 +4,7 @@
 """Vendored fla serves fla.ops.kda, which glm5_next (GLM-5.3-Flash) and kimi_linear resolve through
 their kernel-hub wrappers, so they train on the Triton kernels without fla installed."""
 
+import importlib
 import importlib.util
 import os
 import pathlib
@@ -66,8 +67,13 @@ def test_kernel_hub_table_covers_kda():
 
 
 def test_rdna1_forces_kda_wrappers_to_torch(monkeypatch):
+    # transformers 4.57 ships hub_kernels without the fallback decorator, and so never wraps
+    # the KDA kernels; _force_kernel_hub_fallback correctly forces nothing there.
     if importlib.util.find_spec("transformers.integrations.hub_kernels") is None:
         pytest.skip("transformers without kernel-hub wrappers")
+    hub_kernels = importlib.import_module("transformers.integrations.hub_kernels")
+    if not hasattr(hub_kernels, "use_kernel_func_from_hub_with_fallback"):
+        pytest.skip("transformers without kernel-hub fallback wrappers")
 
     def torch_chunk(*args, **kwargs):
         return "torch"

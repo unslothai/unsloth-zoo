@@ -16,6 +16,7 @@
 
 """Route transformers @use_experts_implementation experts through Unsloth's MoE forward; tell the 4-bit quantizer which it may pack."""
 import contextlib
+import sys
 import functools
 import weakref
 
@@ -91,6 +92,16 @@ def _moe_utils_module():
         from . import moe_utils as module
         _LAZY["moe_utils"] = module
     return module
+
+
+def _experts_layout_is_standard_or_none():
+    if "layout_is_standard" not in _LAZY:
+        try:
+            from .moe_utils_bnb4bit import _experts_layout_is_standard
+        except Exception:
+            _experts_layout_is_standard = None
+        _LAZY["layout_is_standard"] = _experts_layout_is_standard
+    return _LAZY["layout_is_standard"]
 
 
 def _has_custom_gate(module) -> bool:
@@ -174,7 +185,8 @@ def _dense_experts_without_expert_lora(module) -> bool:
         param = params.get(name)
         if param is None:
             continue
-        if type(param) is not nn.Parameter or param.dtype not in _DENSE_STACK_DTYPES:
+        # A plain tensor is a stack folded as W + delta for this call (_fold_moe_lora_without_parametrization).
+        if type(param) not in (nn.Parameter, torch.Tensor) or param.dtype not in _DENSE_STACK_DTYPES:
             return False
         if state.get("_unsloth_lora_" + name) is not None:
             return False
@@ -182,11 +194,8 @@ def _dense_experts_without_expert_lora(module) -> bool:
     return found
 
 
-def _custom_gate_with_expert_lora(module) -> bool:
-    if getattr(module, "has_gate", True) is False or not _has_custom_gate(module):
-        return False
-    state = module.__dict__
-    if not any(state.get("_unsloth_lora_" + name) is not None for name in _EXPERT_STACK_NAMES):
+def _dense_standard_experts(module) -> bool:
+    if getattr(module, "has_gate", True) is False:
         return False
     params = module._parameters
     if any(
@@ -194,11 +203,46 @@ def _custom_gate_with_expert_lora(module) -> bool:
         for name in _EXPERT_STACK_NAMES
     ):
         return False
+    layout_is_standard = _experts_layout_is_standard_or_none()
     try:
-        from .moe_utils_bnb4bit import _experts_layout_is_standard
-        return bool(_experts_layout_is_standard(module))
+        return layout_is_standard is not None and bool(layout_is_standard(module))
     except Exception:
         return False
+
+
+def _dense_standard_with_expert_lora(module) -> bool:
+    state = module.__dict__
+    if not any(state.get("_unsloth_lora_" + name) is not None for name in _EXPERT_STACK_NAMES):
+        return False
+    return _dense_standard_experts(module)
+
+
+def interface_route_reads_stash(module) -> bool:
+    if not hasattr(getattr(type(module), "forward", None), "__wrapped__"):
+        return False
+    config = getattr(module, "config", None)
+    if getattr(config, "_experts_implementation", None) != UNSLOTH_EXPERTS_IMPLEMENTATION:
+        return False
+    return _dense_standard_experts(module)
+
+
+def _forward_dense_with_expert_lora(self, hidden_states, top_k_index, top_k_weights):
+    # Traced, unlike _unsloth_experts_dispatch: dense stacks have nothing dequantized for AOT autograd to save.
+    if not self.__dict__.get("_unsloth_own_apply_gate", False) and _has_custom_gate(self):
+        self.__dict__["_unsloth_own_apply_gate"] = True
+    moe_utils = _moe_utils_module()
+    # The resolved backend, not get_forward_moe_backend(): its cache-file lookup (os.path) breaks the graph.
+    backend = getattr(moe_utils, "_CACHED_FORWARD_MOE_BACKEND", None) or moe_utils.get_forward_moe_backend()
+    stack = self._parameters.get("gate_up_proj")
+    device_type = hidden_states.device.type
+    if (
+        stack is not None and hidden_states.dtype != stack.dtype
+        and device_type != "meta" and torch.is_autocast_enabled(device_type)
+    ):
+        # torch._grouped_mm rejects float32 activations that eager experts accept under autocast.
+        out = backend(self, hidden_states.to(stack.dtype), top_k_index, top_k_weights)
+        return out.to(hidden_states.dtype)
+    return backend(self, hidden_states, top_k_index, top_k_weights)
 
 
 def unsloth_experts_forward(
@@ -215,6 +259,9 @@ def unsloth_experts_forward(
         if _DECODING_DEPTH and _TRANSFORMERS_BATCHED_MM is not None and not torch.is_grad_enabled():
             return _TRANSFORMERS_BATCHED_MM(self, hidden_states, top_k_index, top_k_weights)
         return _TRANSFORMERS_GROUPED_MM(self, hidden_states, top_k_index, top_k_weights)
+    if _dense_standard_with_expert_lora(self):
+        # transformers' grouped_mm ignores the expert LoRA stash; the moe_utils backends apply it (with any own gate).
+        return _forward_dense_with_expert_lora(self, hidden_states, top_k_index, top_k_weights)
     return _unsloth_experts_dispatch(self, hidden_states, top_k_index, top_k_weights)
 
 
@@ -234,20 +281,8 @@ def _unsloth_experts_dispatch(
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
 ) -> torch.Tensor:
-    if _custom_gate_with_expert_lora(self):
-        # transformers' grouped_mm ignores the expert LoRA stash; the moe_utils backends apply it with the own gate.
-        self.__dict__["_unsloth_own_apply_gate"] = True
-        backend = _moe_utils_module().get_forward_moe_backend()
-        stack = self._parameters.get("gate_up_proj")
-        device_type = hidden_states.device.type
-        if (
-            stack is not None and hidden_states.dtype != stack.dtype
-            and device_type != "meta" and torch.is_autocast_enabled(device_type)
-        ):
-            # torch._grouped_mm rejects float32 activations that eager experts accept under autocast.
-            out = backend(self, hidden_states.to(stack.dtype), top_k_index, top_k_weights)
-            return out.to(hidden_states.dtype)
-        return backend(self, hidden_states, top_k_index, top_k_weights)
+    if _dense_standard_with_expert_lora(self):
+        return _forward_dense_with_expert_lora(self, hidden_states, top_k_index, top_k_weights)
     if getattr(self, "has_gate", True) is False or _has_custom_gate(self):
         interface = _experts_interface()
         fallback = interface["grouped_mm"] if interface is not None and "grouped_mm" in interface else None
@@ -268,6 +303,28 @@ def _implementation_values(model):
     except Exception:
         implementation = getattr(getattr(model, "config", None), "_experts_implementation", None)
     return list(implementation.values()) if isinstance(implementation, dict) else [implementation]
+
+
+def _warm_moe_backend(model) -> None:
+    """Resolve the MoE backend and run its grouped_mm probes eagerly: first reached inside a trace they break the graph."""
+    if torch.compiler.is_compiling():
+        return
+    can_set = getattr(type(model), "_can_set_experts_implementation", None)
+    try:
+        if can_set is None or not can_set():
+            return
+        moe_utils = _moe_utils_module()
+        backend = moe_utils.get_forward_moe_backend()
+        backend_module = sys.modules.get(getattr(backend, "__module__", None) or "", moe_utils)
+    except Exception:
+        return
+    # The package module and the compiled-cache copy each cache their own probe results.
+    for module in (moe_utils,) if backend_module is moe_utils else (moe_utils, backend_module):
+        for probe in ("_check_torch_grouped_mm_supported", "_transposed_view_grouped_mm_is_safe"):
+            try:
+                getattr(module, probe)()
+            except Exception:
+                pass
 
 
 def _patch_decode_switch():
@@ -338,9 +395,11 @@ def patch_experts_interface():
                 requested_experts = None
             return original(self, requested_experts)
         if requested_experts is None and not _packs_fp4_experts(self):
+            _warm_moe_backend(self)
             return UNSLOTH_EXPERTS_IMPLEMENTATION
         if requested_experts == UNSLOTH_EXPERTS_IMPLEMENTATION:
             # transformers 5.0 to 5.6 validate nested re-checks against a fixed name list, not the registry.
+            _warm_moe_backend(self)
             return UNSLOTH_EXPERTS_IMPLEMENTATION
         if requested_experts not in (None, UNSLOTH_EXPERTS_IMPLEMENTATION) and _holds_packed_4bit_experts(self):
             # After a 4-bit load the experts are already packed; only a load-time choice leaves them unpacked.

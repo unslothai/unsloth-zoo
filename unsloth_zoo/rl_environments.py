@@ -34,6 +34,7 @@ import importlib
 import types
 import __future__
 import builtins as _py_builtins
+import unicodedata
 import os, gc, time, statistics
 import collections
 import numpy as np
@@ -523,6 +524,15 @@ _DENIED_MODULE_ATTRS = frozenset({
     "typing.ForwardRef",
     "typing.evaluate_forward_ref",
     "typing.get_type_hints",
+    # register() runs get_type_hints on string annotations.
+    "functools.singledispatch",
+    "functools.singledispatchmethod",
+})
+
+# `case int(x)` binds the subject; other positional patterns getattr __match_args__ names.
+_SELF_MATCHING_TYPES = frozenset({
+    "bool", "bytearray", "bytes", "dict", "float", "frozenset", "int", "list",
+    "set", "str", "tuple",
 })
 
 # Attributes that walk the interpreter's own object graph. None of these start
@@ -540,6 +550,9 @@ _DENIED_ATTR_NAMES = frozenset({
     "gi_code", "gi_frame", "gi_running", "gi_yieldfrom",
     "tb_frame", "tb_lasti", "tb_lineno", "tb_next",
 })
+# 3.14 ForwardRef.evaluate runs its string with the real builtins; denied only where it exists.
+if sys.version_info >= (3, 14):
+    _DENIED_ATTR_NAMES = _DENIED_ATTR_NAMES | {"evaluate"}
 
 # Dunder methods a generated helper class may define. A method name is
 # FunctionDef.name, not a Name or Attribute node, so the walk below cannot see
@@ -664,6 +677,105 @@ _MATCH_CLASS_NODES = tuple(
 )
 
 
+def _annotation_nodes(node):
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        arguments = node.args
+        params = [*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs,
+                  arguments.vararg, arguments.kwarg]
+        yield from (p.annotation for p in params if p is not None and p.annotation is not None)
+        if node.returns is not None:
+            yield node.returns
+    elif isinstance(node, ast.AnnAssign):
+        yield node.annotation
+
+
+_TYPING_MODULES = frozenset({"typing", "typing_extensions"})
+
+
+# Missing on older Pythons (match 3.10+, PEP 695 3.12+): an empty tuple matches nothing.
+def _ast_nodes(*names):
+    return tuple(node for node in (getattr(ast, name, None) for name in names) if node is not None)
+
+
+_NAMED_BINDING_NODES = _ast_nodes("MatchAs", "MatchStar", "TypeVar", "ParamSpec", "TypeVarTuple")
+_MATCH_MAPPING_NODES = _ast_nodes("MatchMapping")
+
+
+def _bound_names(tree):
+    # Bound names, plus the Literal / typing names only real typing imports bind.
+    bound, literal_names, typing_names = set(), {"Literal"}, set(_TYPING_MODULES)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            bound.add(node.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+        elif isinstance(node, ast.arg):
+            bound.add(node.arg)
+        elif isinstance(node, ast.ExceptHandler) or (
+            _NAMED_BINDING_NODES and isinstance(node, _NAMED_BINDING_NODES)
+        ):
+            if node.name:
+                bound.add(node.name)
+        elif _MATCH_MAPPING_NODES and isinstance(node, _MATCH_MAPPING_NODES):
+            if node.rest:
+                bound.add(node.rest)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in _TYPING_MODULES:
+                    typing_names.add(alias.asname or alias.name)
+                else:
+                    bound.add(alias.asname or alias.name.partition(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if node.module in _TYPING_MODULES and alias.name == "Literal":
+                    literal_names.add(alias.asname or alias.name)
+                else:
+                    bound.add(alias.asname or alias.name)
+    return bound, literal_names - bound, typing_names - bound
+
+
+# Quoted names that resolve to a real builtin or module the code could not name itself.
+_UNSAFE_FORWARD_REFS = frozenset(dir(_py_builtins)) | frozenset(
+    getattr(sys, "stdlib_module_names", ())
+) | frozenset(sys.builtin_module_names) | frozenset(
+    name.partition(".")[0] for name in list(sys.modules)
+)
+
+
+def _is_plain_forward_ref(value):
+    # One name lookup, never code; NFKC first, as the compiler folds "ｅｖａｌ" to "eval".
+    value = unicodedata.normalize("NFKC", value)
+    return (
+        value.isidentifier() and not value.startswith("_")
+        and value not in _UNSAFE_FORWARD_REFS
+    )
+
+
+def _annotation_strings(annotation, literal_names, typing_names):
+    # Literal["W"] values and plain forward refs ("Matrix") are never run as code.
+    stack = [annotation]
+    while stack:
+        sub = stack.pop()
+        if isinstance(sub, ast.Subscript) and (
+            (isinstance(sub.value, ast.Name) and sub.value.id in literal_names)
+            or (isinstance(sub.value, ast.Attribute) and sub.value.attr == "Literal"
+                and isinstance(sub.value.value, ast.Name)
+                and sub.value.value.id in typing_names)
+        ):
+            # Only the Literal's own string values are exempt; anything nested is still scanned.
+            values = sub.slice.elts if isinstance(sub.slice, ast.Tuple) else [sub.slice]
+            stack.extend(
+                v for v in values if not (isinstance(v, ast.Constant) and isinstance(v.value, str))
+            )
+            continue
+        if (
+            isinstance(sub, ast.Constant) and isinstance(sub.value, str)
+            and not _is_plain_forward_ref(sub.value)
+        ):
+            yield sub
+        stack.extend(ast.iter_child_nodes(sub))
+
+
 def _reject_dunder_access(tree):
     """
     Restricted builtins alone do not stop `().__class__.__bases__[0].__subclasses__()`,
@@ -671,6 +783,7 @@ def _reject_dunder_access(tree):
     included) using only attribute access. Generated code has no reason to touch
     dunders, so refuse them outright.
     """
+    bindings = None
     for node in ast.walk(tree):
         # Definition names are strings on the node, invisible to the Name and
         # Attribute checks below, so they get their own fail-closed rule.
@@ -689,6 +802,14 @@ def _reject_dunder_access(tree):
             raise RuntimeError(
                 f"Attribute '{node.attr}' is not allowed in generated code."
             )
+        # Annotations are strings here; anything evaluating them runs text the walk saw as a literal.
+        for annotation in _annotation_nodes(node):
+            if bindings is None:
+                bindings = _bound_names(tree)
+            for _ in _annotation_strings(annotation, *bindings[1:]):
+                raise RuntimeError(
+                    "String annotations are not allowed in generated code."
+                )
         # Two for names: a bare `_` or `_total` local is ordinary and reaches
         # nothing on its own.
         if isinstance(node, ast.Name) and node.id.startswith("__"):
@@ -699,6 +820,16 @@ def _reject_dunder_access(tree):
         # kwd_attrs is the only identifier-as-string field that READS an attribute;
         # every other one merely binds, and the Name rule above refuses the read.
         if _MATCH_CLASS_NODES and isinstance(node, _MATCH_CLASS_NODES):
+            if node.patterns and bindings is None:
+                bindings = _bound_names(tree)
+            # A rebound `int = K` is no longer the builtin, so it gets no exemption.
+            if node.patterns and not (
+                isinstance(node.cls, ast.Name) and node.cls.id in _SELF_MATCHING_TYPES
+                and node.cls.id not in bindings[0]
+            ):
+                raise RuntimeError(
+                    "Positional class patterns are only allowed on builtin types in generated code."
+                )
             for attr in (node.kwd_attrs or []):
                 if attr.startswith("_") or attr in _DENIED_ATTR_NAMES:
                     raise RuntimeError(

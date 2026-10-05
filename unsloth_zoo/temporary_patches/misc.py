@@ -382,38 +382,45 @@ def patch_CsmForConditionalGeneration_forward():
             # Depth decoder trains on frames whose labels are not uniformly
             # ignore_index across the codebook dimension.
             train_mask = ~(labels[:, :, 1:] == -100).all(dim=-1)
-            depth_decoder_input_ids = labels[train_mask][..., : self.config.num_codebooks - 1]
-            # Position 0 placeholder, replaced later by backbone_last_hidden_state.
-            depth_decoder_input_ids = torch.nn.functional.pad(depth_decoder_input_ids, (1, 0), value=0)
+            # No depth frames (depth_decoder_labels_ratio=0) crashes the decoder; a zero-weight dummy frame
+            # keeps every rank entering it (DDP unused-param grads, FSDP / ZeRO-3 gathers).
+            if not train_mask.any():
+                dummy_outputs = self.depth_decoder(
+                    input_ids = labels.new_zeros((1, self.config.num_codebooks)),
+                    backbone_last_hidden_state = backbone_hidden_states[:1, 0],
+                    use_cache = False,
+                    return_dict = True,
+                )
+                depth_decoder_loss = dummy_outputs.logits.float().mean() * 0
+            else:
+                depth_decoder_input_ids = labels[train_mask][..., : self.config.num_codebooks - 1]
+                # Position 0 placeholder, replaced later by backbone_last_hidden_state.
+                depth_decoder_input_ids = torch.nn.functional.pad(depth_decoder_input_ids, (1, 0), value=0)
 
-            train_idxs = train_mask.nonzero(as_tuple=True)
-            backbone_last_hidden_states = backbone_hidden_states[train_idxs[0], train_idxs[1] - 1, :]
-            depth_decoder_labels = labels[train_mask]
+                train_idxs = train_mask.nonzero(as_tuple=True)
+                backbone_last_hidden_states = backbone_hidden_states[train_idxs[0], train_idxs[1] - 1, :]
+                depth_decoder_labels = labels[train_mask]
 
-            # Pass kwargs to the depth decoder so it sees num_items_in_batch.
-            depth_decoder_kwargs = kwargs.copy()
-            # Backbone num_items is the 0th codebook; depth covers the remaining
-            # 31 codebooks, so scale num_items_in_batch by 31.
-            if 'num_items_in_batch' in depth_decoder_kwargs:
-                depth_decoder_kwargs['num_items_in_batch'] = depth_decoder_kwargs['num_items_in_batch'] * 31
+                depth_decoder_kwargs = kwargs.copy()
+                # Backbone num_items counts codebook 0; depth covers the other 31.
+                if 'num_items_in_batch' in depth_decoder_kwargs:
+                    depth_decoder_kwargs['num_items_in_batch'] = depth_decoder_kwargs['num_items_in_batch'] * 31
 
-            depth_decoder_kwargs.pop('return_dict', None)
-            # Move output_attentions/output_hidden_states (transformers 4.54 deletes them)
-            depth_decoder_kwargs["output_attentions"   ] = output_attentions
-            depth_decoder_kwargs["output_hidden_states"] = output_hidden_states
+                depth_decoder_kwargs.pop('return_dict', None)
+                # Move output_attentions/output_hidden_states (transformers 4.54 deletes them)
+                depth_decoder_kwargs["output_attentions"   ] = output_attentions
+                depth_decoder_kwargs["output_hidden_states"] = output_hidden_states
 
-            depth_decoder_outputs = self.depth_decoder(
-                input_ids = depth_decoder_input_ids,
-                backbone_last_hidden_state = backbone_last_hidden_states,
-                use_cache = use_cache,
-                # output_attentions=output_attentions,
-                # output_hidden_states=output_hidden_states,
-                return_dict = True,
-                labels = depth_decoder_labels,
-                **depth_decoder_kwargs,
-            )
+                depth_decoder_outputs = self.depth_decoder(
+                    input_ids = depth_decoder_input_ids,
+                    backbone_last_hidden_state = backbone_last_hidden_states,
+                    use_cache = use_cache,
+                    return_dict = True,
+                    labels = depth_decoder_labels,
+                    **depth_decoder_kwargs,
+                )
 
-            depth_decoder_loss = depth_decoder_outputs.loss
+                depth_decoder_loss = depth_decoder_outputs.loss
             loss = backbone_loss + depth_decoder_loss
 
         return process_return(CsmOutputWithPast, {
@@ -3096,3 +3103,122 @@ def patch_granitemoe_router_logits_recording():
         pretrained._can_record_outputs = {**recorded, "router_logits": OutputRecorder(router, index = index)}
 pass
 TEMPORARY_PATCHES.append(patch_granitemoe_router_logits_recording)
+
+
+def patch_mamba_ssm_chunk_scan_device_guard():
+    """`_chunk_scan_fwd_kernel` lacks a device guard, so on multi-GPU device_map it runs
+    on cuda:0's stream and races: zero/NaN outputs (NemotronH, Falcon-H1)."""
+    import sys
+    try:
+        if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+            return
+        if "mamba_ssm.ops.triton.ssd_chunk_scan" not in sys.modules:
+            import importlib.util
+            if importlib.util.find_spec("mamba_ssm") is None:
+                return
+        from mamba_ssm.ops.triton import ssd_chunk_scan
+    except Exception:
+        return
+    original = getattr(ssd_chunk_scan, "_chunk_scan_fwd", None)
+    if original is None:
+        return
+    if getattr(original, "_unsloth_device_guarded", False):
+        _chunk_scan_fwd = original
+    else:
+        @functools.wraps(original)
+        def _chunk_scan_fwd(cb, x, *args, **kwargs):
+            if x.is_cuda and x.device.index != torch.cuda.current_device():
+                with torch.cuda.device(x.device):
+                    return original(cb, x, *args, **kwargs)
+            return original(cb, x, *args, **kwargs)
+        _chunk_scan_fwd._unsloth_device_guarded = True
+
+    # ssd_combined (and anything else) bound the function by name at import. Match by
+    # origin, not identity: fix_mamba_ssm_float32 reloads ssd_chunk_scan, leaving stale copies.
+    for name, module in list(sys.modules.items()):
+        if not (name == "mamba_ssm" or name.startswith("mamba_ssm.")):
+            continue
+        fn = getattr(module, "_chunk_scan_fwd", None)
+        if fn is None or fn is _chunk_scan_fwd or getattr(fn, "_unsloth_device_guarded", False):
+            continue
+        if getattr(fn, "__module__", None) == ssd_chunk_scan.__name__ and \
+                getattr(fn, "__name__", None) == "_chunk_scan_fwd":
+            setattr(module, "_chunk_scan_fwd", _chunk_scan_fwd)
+pass
+TEMPORARY_PATCHES.append(patch_mamba_ssm_chunk_scan_device_guard)
+
+
+def patch_output_collector_for_compiled_submodules():
+    # capture_outputs sets the collector eagerly and ContextVar.get graph-breaks compiled hooks: compiled code reads a mirror.
+    try:
+        from transformers.utils import output_capturing
+    except Exception:
+        return
+    cls = getattr(output_capturing, "CompileableContextVar", None)
+    if cls is None or getattr(cls, "_unsloth_eager_mirror", False):
+        return
+    if not all(hasattr(cls, name) for name in ("get", "set", "reset")):
+        return
+    original_set, original_reset = cls.set, cls.reset
+    import threading
+    lock = threading.Lock()
+
+    def refresh(self, active):
+        # Mirror only one nested chain on one thread (each set's old_value is the previous value).
+        nested = all(active[i][0].old_value is active[i - 1][2] for i in range(1, len(active)))
+        if nested and len({tid for _, tid, _ in active}) <= 1 and not self.__dict__.get("_unsloth_eager_unordered"):
+            self._unsloth_eager_value = active[-1][2] if active else None
+            self._unsloth_eager_single = True
+        else:
+            self._unsloth_eager_single = False
+
+    @functools.wraps(cls.get)
+    def get(self):
+        if getattr(self, "compiling", False):
+            return self.global_var
+        if torch.compiler.is_compiling() and self.__dict__.get("_unsloth_eager_single", True):
+            value = self.__dict__.get("_unsloth_eager_value")
+            # Nothing set: None everywhere. Else only a thread with an active set (threading.local traces).
+            if value is None or getattr(self.__dict__.get("_unsloth_eager_tls"), "depth", 0) > 0:
+                return value
+        return self.context_var.get()
+
+    @functools.wraps(original_set)
+    def set(self, value):
+        token = original_set(self, value)
+        if token is not None:
+            tls = self.__dict__.get("_unsloth_eager_tls")
+            if tls is None:
+                tls = self.__dict__.setdefault("_unsloth_eager_tls", threading.local())
+            tls.depth = getattr(tls, "depth", 0) + 1
+            with lock:
+                active = self.__dict__.setdefault("_unsloth_eager_active", [])
+                active.append((token, threading.get_ident(), value))
+                refresh(self, active)
+        return token
+
+    @functools.wraps(original_reset)
+    def reset(self, token):
+        # Reset first: a token from another Context raises here and must leave the mirror untouched.
+        result = original_reset(self, token)
+        if token is not None:
+            tls = self.__dict__.get("_unsloth_eager_tls")
+            if tls is not None and getattr(tls, "depth", 0) > 0:
+                tls.depth -= 1
+            with lock:
+                # Tokens are unhashable: match by identity.
+                active = self.__dict__.get("_unsloth_eager_active") or []
+                for i in range(len(active) - 1, -1, -1):
+                    if active[i][0] is token:
+                        # Out of order: ContextVar restores token.old_value, which the stack cannot track.
+                        if i != len(active) - 1 and self.__dict__.get("_unsloth_eager_single", True):
+                            self._unsloth_eager_unordered = True
+                        del active[i]
+                        break
+                refresh(self, active)
+        return result
+
+    cls.get, cls.set, cls.reset = get, set, reset
+    cls._unsloth_eager_mirror = True
+pass
+TEMPORARY_PATCHES.append(patch_output_collector_for_compiled_submodules)

@@ -513,6 +513,18 @@ def test_vlm_requests_reject_token_id_prompts_and_unsupported_controls():
     assert _validate_vlm_requests([GenerationRequest(prompt="a", image=pathlib.Path("/tmp/i.png"))], GenerationDefaults())[0].image == "/tmp/i.png"  # noqa: E501
 
 
+def test_a_prompt_cache_state_is_taken_only_by_a_vision_stream_row():
+    from unsloth_zoo.mlx.generate import _stream_batch, _validate_text_requests
+    with pytest.raises(TypeError, match="open\\(\\) and checkpoint\\(\\)"):
+        GenerationRequest(prompt="a", prompt_cache_state=object())
+    state = types.SimpleNamespace(open=lambda ids: ([], ()), checkpoint=lambda n, cache: None)
+    with pytest.raises(ValueError, match="only a vision BatchStream row"):
+        _validate_text_requests([GenerationRequest(prompt="a", prompt_cache_state=state)], GenerationDefaults())
+    vlm = types.SimpleNamespace(_is_vlm_model=True, language_model=None)
+    with pytest.raises(ValueError, match="taken only by a BatchStream row"):
+        list(_stream_batch(vlm, object(), [GenerationRequest(prompt="a", prompt_cache_state=state)]))
+
+
 def test_prompt_kwargs_fallback_splits_mrope_on_the_batch_axis():
     # MRoPE position_ids are [3, batch, sequence]; axis 0 would hand every row
     # the same rope section.
@@ -1426,6 +1438,57 @@ def test_a_model_keeping_state_is_seen_to_keep_it_however_it_says_so():
         assert _keeps_what_it_prepared(model()) is (model in keeping), model.__name__
 
 
+def test_a_vision_stream_runs_the_prefill_with_the_fewest_tokens_left():
+    from unsloth_zoo.mlx.generate import _schedules_prefill
+
+    def prompt(uid, left):
+        return types.SimpleNamespace(uids = [uid], _inputs_embeds = types.SimpleNamespace(shape = (1, left, 4)))
+
+    def queued(uid, ids, columns = None):
+        embeds = None if columns is None else types.SimpleNamespace(shape = (1, columns, 4))
+        return (uid, [1] * ids, 5, {"inputs_embeds": embeds} if embeds else {})
+
+    session = _vlm_session(prefill_batch_size = 1)
+    long, short = prompt(0, 6000), prompt(1, 100)
+    gen = session.generator = types.SimpleNamespace(
+        _prompt_batch = long, _unprocessed_sequences = [queued(1, 100)], _generation_batch = [],
+        completion_batch_size = 4, apc = None)
+    assert _schedules_prefill(gen, session.adapter.defaults)
+    assert not _schedules_prefill(gen, GenerationDefaults(prefill_batch_size = 2))
+    session._schedule_prefill()
+    assert (gen._prompt_batch, session._parked) == (None, [long])  # mlx-vlm admits the short row
+    gen._prompt_batch, gen._unprocessed_sequences = short, []
+    session._schedule_prefill()
+    assert gen._prompt_batch is short
+    gen._prompt_batch, gen._generation_batch = None, [1]
+    session._schedule_prefill()
+    assert (gen._prompt_batch, session._parked) == (long, [])
+    # A row's media can expand past its ids; it is ranked by the columns it will prefill.
+    gen._prompt_batch, gen._unprocessed_sequences = prompt(2, 100), [queued(3, 20, columns = 276)]
+    session._schedule_prefill()
+    assert gen._prompt_batch.uids == [2]
+    gen._prompt_batch, gen._unprocessed_sequences = long, [queued(1, 100)]
+    # Parked rows hold completion slots that mlx-vlm's admission does not count.
+    gen.completion_batch_size = 2
+    session._schedule_prefill()
+    assert gen._prompt_batch is long
+    # One parked as often as there are slots runs to its end, before any queued row.
+    gen._generation_batch, gen.completion_batch_size = [], 4
+    for _ in range(3):
+        session._schedule_prefill()
+        assert (gen._prompt_batch, session._parked) == (None, [long])
+        gen._unprocessed_sequences = []  # admitted and prefilled
+        session._schedule_prefill()
+        assert gen._prompt_batch is long
+        gen._unprocessed_sequences = [queued(1, 100)]
+    session._schedule_prefill()
+    assert gen._prompt_batch is long
+    gen._prompt_batch, session._parked = short, [long]
+    session._schedule_prefill()
+    assert (gen._prompt_batch, session._parked) == (long, [short])
+    assert session._withdraw(1) and session._parked == []
+
+
 def test_a_vision_request_preparing_unlike_the_batch_s_others_cannot_join():
     """A key only some rows carry cannot be merged into a batch-wide keyword."""
     session = _vlm_session()
@@ -1543,8 +1606,8 @@ def test_the_fusion_scopes_tolerate_whatever_named_modules_yields():
     # these tests hand it plain stand-ins. The decode scope reads a module's own dict
     # entries, which only an mlx Module has, so a non-Module must be skipped rather
     # than raising TypeError out of the generation path.
-    from unsloth_zoo.mlx.inference import (fused_decode_conv_silu, fused_moe_gate_up, fused_moe_router,
-                                           fused_residual_norm)
+    from unsloth_zoo.mlx.inference import (fused_decode_conv_silu, fused_moe_gate_up, fused_moe_routed_experts,
+                                           fused_moe_router, fused_residual_norm, fused_residual_norm_handoff)
     # Bare too: _snapshot_training_flags already tolerates an entry with no `training`,
     # so a scope that reads it before deciding the entry is a candidate raises instead.
     for stub in (types.SimpleNamespace(training = False), types.SimpleNamespace()):
@@ -1553,5 +1616,57 @@ def test_the_fusion_scopes_tolerate_whatever_named_modules_yields():
             named_modules = lambda: [("plain", stub)],
         )
         with fused_moe_gate_up(model), fused_decode_conv_silu(model), fused_residual_norm(model), \
-                fused_moe_router(model):
+                fused_moe_router(model), fused_moe_routed_experts(model), fused_residual_norm_handoff(model):
             pass
+
+
+def test_generation_paths_enter_every_inference_fusion(monkeypatch):
+    # A scope missing from generation_mode or a loader generate site silently leaves that path native.
+    import ast
+
+    from unsloth_zoo.mlx import generate as generate_module, inference, loader
+    scopes = {name for name, value in vars(inference).items()
+              if name.startswith(("fused_", "nax_", "dense_")) and getattr(value, "__module__", None) == inference.__name__}
+    entered = []
+    for name in scopes:
+        monkeypatch.setattr(inference, name, lambda model, *args, name=name, **kwargs: entered.append(name) or contextlib.nullcontext(model))
+    with generate_module.generation_mode(types.SimpleNamespace(training=False, eval=lambda: None, named_modules=lambda: [])):
+        pass
+    assert sorted(entered) == sorted(scopes)
+    sites = [{item.context_expr.func.id for item in node.items
+              if isinstance(item.context_expr, ast.Call) and isinstance(item.context_expr.func, ast.Name)}
+             for node in ast.walk(ast.parse(inspect.getsource(loader))) if isinstance(node, ast.With)]
+    sites = [site for site in sites if any(name.startswith(("fused_", "nax_", "dense_")) for name in site)]
+    assert len(sites) == 2 and all(site == scopes for site in sites)
+
+
+def test_cache_layout_tells_quantized_packings_apart():
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.generate import _cache_layout
+
+    def cache(bits, group_size):
+        return [SimpleNamespace(offset = 0, bits = bits, group_size = group_size)]
+
+    assert _cache_layout(cache(8, 64)) == _cache_layout(cache(8, 64))
+    assert _cache_layout(cache(8, 64)) != _cache_layout(cache(4, 64))
+    assert _cache_layout(cache(8, 64)) != _cache_layout(cache(8, 32))
+
+
+def test_row_quantizer_starts_uniform_rows_at_the_first_token():
+    from unsloth_zoo.mlx.generate import _row_quantizer
+
+    class BatchGenerator:
+        def __init__(self, model, kv_bits=None, kv_group_size=64, kv_quant_scheme="uniform", quantized_kv_start=5000):
+            pass
+
+    module = types.SimpleNamespace(
+        BatchGenerator=BatchGenerator,
+        maybe_quantize_kv_cache=lambda *a, **k: None,
+        turboquant_enabled=lambda bits, scheme=None: scheme == "turboquant" or float(bits) != int(bits),
+    )
+    assert _row_quantizer(module, {}) is None
+    uniform = _row_quantizer(module, {"kv_bits": 4})
+    assert uniform.keywords == {"kv_group_size": 64, "quantized_kv_start": 0, "kv_bits": 4}
+    turbo = _row_quantizer(module, {"kv_bits": 3.5, "kv_quant_scheme": "turboquant"})
+    assert turbo.keywords["quantized_kv_start"] == 5000

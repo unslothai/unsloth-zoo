@@ -56,7 +56,8 @@ def test_typing_get_type_hints_is_denied():
         '        x: "__import__(chr(111)+chr(115)).system(chr(88))"\n'
         "    return typing.get_type_hints(C)\n"
     )
-    with pytest.raises(AttributeError):
+    # Refused at compile time now, before get_type_hints would raise AttributeError.
+    with pytest.raises((AttributeError, RuntimeError)):
         create_locked_down_function(source)([], [])
 
 

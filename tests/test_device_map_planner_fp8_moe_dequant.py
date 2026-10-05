@@ -114,7 +114,9 @@ def test_a_real_fine_grained_fp8_mixtral_is_detected(monkeypatch, tmp_path):
     config.quantization_config = {"quant_method": "fp8", "activation_scheme": "dynamic", "weight_block_size": [128, 128]}
     config.save_pretrained(tmp_path)
     model, quantizer, _ = build_meta_model(str(tmp_path))
-    if not any(p.dtype == torch.float8_e4m3fn for p in model.parameters()):
+    # transformers 4.x builds per-expert FP8Linear modules, which dequantize one expert at a
+    # time and hold no fused stack; only a 3D FP8 stack is what the planner budgets for.
+    if not any(p.dim() == 3 and p.dtype == torch.float8_e4m3fn for p in model.parameters()):
         pytest.skip("this transformers does not build FP8 fused experts")
     units = _split_units(model, resolve_no_split_classes(model), _compute_module_sizes(model, quantizer))
     need = _moe_dequant_transient_by_unit(model, units)

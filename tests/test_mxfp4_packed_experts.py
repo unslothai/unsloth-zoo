@@ -2,9 +2,6 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""GPT-OSS MXFP4 experts kept packed: bit-exact dequant, identical forward / grads / LoRA vs the
-load-time dequant, checkpoint reuse, and merge / save never writing packed bytes."""
-
 import copy
 import os
 import pickle
@@ -37,7 +34,6 @@ _FP4 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3
 
 
 def _reference(blocks, scales, dtype = torch.bfloat16):
-    """transformers' LUT + ldexp dequant, then the GPT-OSS (E, in, out) transpose."""
     blocks, scales = blocks.cpu(), scales.cpu()
     lut = torch.tensor(_FP4, dtype = dtype)
     *prefix, G, _ = blocks.shape
@@ -62,8 +58,6 @@ def _packed(E, N, K, device = "cpu", seed = 0):
 
 def _bits(t):
     return t.contiguous().view(torch.uint8).cpu()
-
-
 
 
 def test_torch_reference_matches_transformers():
@@ -184,8 +178,6 @@ def test_no_triton_imports_and_falls_back(monkeypatch):
     assert mx.keep_mxfp4_experts_packed() is TRANSFORMERS_5
 
 
-
-
 def test_packed_param_survives_module_casts_and_copies():
     blocks, scales = _random_mxfp4(2, 64, 32)
     param = Mxfp4ExpertParam(blocks, mxfp4_scales = scales)
@@ -219,7 +211,7 @@ def test_keep_packed_switch(monkeypatch):
     _gate_env(monkeypatch)
     assert mx.keep_mxfp4_experts_packed() is TRANSFORMERS_5
     if not TRANSFORMERS_5:
-        return   # 4.x runs the stock per-expert forward, which indexes the stack directly
+        return
     monkeypatch.setenv("UNSLOTH_MXFP4_KEEP_PACKED", "0")
     assert mx.keep_mxfp4_experts_packed() is False
     monkeypatch.delenv("UNSLOTH_MXFP4_KEEP_PACKED")
@@ -228,10 +220,10 @@ def test_keep_packed_switch(monkeypatch):
         assert mx.keep_mxfp4_experts_packed() is False
     monkeypatch.setenv("UNSLOTH_MODEL_NAME", "unsloth/gpt-oss-20b")
     monkeypatch.setenv("UNSLOTH_ENABLE_FULL_FINETUNING", "1")
-    assert mx.keep_mxfp4_experts_packed() is False   # full finetuning trains the experts in 16 bit
+    assert mx.keep_mxfp4_experts_packed() is False
     monkeypatch.delenv("UNSLOTH_ENABLE_FULL_FINETUNING")
     monkeypatch.setattr(mu, "select_moe_backend", lambda: "native_torch")
-    assert mx.keep_mxfp4_experts_packed() is False   # the loop backend indexes the stack directly
+    assert mx.keep_mxfp4_experts_packed() is False
     monkeypatch.setattr(mu, "select_moe_backend", lambda: "grouped_mm")
     monkeypatch.setattr(mx, "mxfp4_kernel_available", lambda *a, **k: False)
     assert mx.keep_mxfp4_experts_packed() is True
@@ -260,11 +252,8 @@ def test_dequantize_convertops_keeps_or_dequantizes(monkeypatch):
     assert torch.equal(_bits(packed.dequantize()), _bits(dense))
 
 
-
-
 @pytest.fixture
 def grouped_mm_device(monkeypatch):
-    """CUDA with its probe, else CPU where this torch has a CPU torch._grouped_mm."""
     if torch.cuda.is_available() and mu._check_torch_grouped_mm_supported():
         return "cuda"
     try:
@@ -276,8 +265,6 @@ def grouped_mm_device(monkeypatch):
 
 
 class _GptOssExperts(nn.Module):
-
-
     def __init__(self, gate_up, down, E, hidden, inter):
         super().__init__()
         g = torch.Generator().manual_seed(3)
@@ -309,7 +296,6 @@ class _Block(nn.Module):
 
 
 def _peft_pair(device, E = 4, hidden = 128, inter = 64, rank = 4):
-
     peft = pytest.importorskip("peft")
     mx.patch_peft_param_wrapper_mxfp4()
     assert mu.patch_param_wrapper_for_moe()
@@ -339,7 +325,6 @@ def _peft_pair(device, E = 4, hidden = 128, inter = 64, rank = 4):
 def _route(device, tokens = 48, E = 4, top_k = 2, hidden = 128, seed = 7):
     g = torch.Generator().manual_seed(seed)
     x = torch.randn(tokens, hidden, generator = g).to(torch.bfloat16)
-    # Expert E - 1 gets no tokens, so the routed-only dequant skips it.
     idx = torch.stack([torch.randperm(E - 1, generator = g)[:top_k] for _ in range(tokens)])
     w = torch.softmax(torch.randn(tokens, top_k, generator = g), dim = -1).to(torch.bfloat16)
     return x.to(device), idx.to(device), w.to(device)
@@ -389,7 +374,7 @@ def test_packed_experts_train_like_the_load_time_dequant(monkeypatch, grouped_mm
 
 
 def test_a_4d_packed_stack_is_an_experts_module():
-    # Regression: PEFT's `_activate_lora` once added a bf16 delta to the packed blocks.
+    # Regression: a 4-D uint8 stack made PEFT's ParamWrapper add a bf16 delta to the packed blocks.
     blocks, scales = _random_mxfp4(4, 128, 64)
     experts = _GptOssExperts(Mxfp4ExpertParam(blocks, mxfp4_scales = scales), _packed(4, 64, 64), 4, 64, 64)
     assert mu._is_moe_experts_module(experts)
@@ -401,7 +386,7 @@ def test_a_4d_packed_stack_is_an_experts_module():
 @needs_cuda
 @pytest.mark.parametrize("override, per_projection", [(None, 2), ("1", 3)])
 def test_checkpoint_recompute_reuses_its_dequant_in_backward(monkeypatch, override, per_projection):
-    """One dequant in forward, one in recompute, none in backward (UNSLOTH_MOE_RECOMPUTE=1: in backward)."""
+    """The backward reuses the recompute's dequant; UNSLOTH_MOE_RECOMPUTE=1 rebuilds it instead."""
     if not mu._check_torch_grouped_mm_supported():
         pytest.skip("no torch._grouped_mm on this device")
     if override is None:
@@ -412,7 +397,7 @@ def test_checkpoint_recompute_reuses_its_dequant_in_backward(monkeypatch, overri
     from unsloth_zoo.gradient_checkpointing import in_gradient_checkpoint_recompute
     packed_model, _ = _peft_pair("cuda")
     x, idx, w = _route("cuda")
-    _train_step(packed_model, x, idx, w, checkpoint = True)   # the first call also probes the LoRA stash
+    _train_step(packed_model, x, idx, w, checkpoint = True)
     calls = []
     original = Mxfp4ExpertParam.dequantize
 
@@ -430,8 +415,6 @@ def test_checkpoint_recompute_reuses_its_dequant_in_backward(monkeypatch, overri
     assert len(calls) == 2 * per_projection
     assert calls.count("forward") == 2 and calls.count("recompute") == 2
     assert calls.count("backward") == 2 * (per_projection - 2)
-
-
 
 
 def test_merge_and_unmerge(grouped_mm_device):
@@ -571,7 +554,6 @@ def test_adapter_save_never_dequantizes(tmp_path, monkeypatch):
 
 @needs_cuda
 def test_bf16_inference_path_dequantizes_packed_experts(monkeypatch):
-    """One static stack per shape, only routed experts rewritten; still matches the dense stack."""
     from unsloth_zoo.temporary_patches import gpt_oss
     # The decode-slot path; the fused kernels are not bit-exact and are covered in test_mxfp4_gemm.py.
     monkeypatch.setenv("UNSLOTH_MXFP4_FUSED_GEMM", "dequant")
@@ -738,7 +720,7 @@ def test_a_later_load_without_a_device_map_clears_the_offload_flag(monkeypatch):
 
     monkeypatch.setattr(Mxfp4HfQuantizer, "validate_environment", lambda self, *a, **k: None)
     mx.patch_mxfp4_offload_guard()
-    monkeypatch.setattr(mx, "_LOAD_OFFLOADS", [True])   # left by an earlier offloaded load
+    monkeypatch.setattr(mx, "_LOAD_OFFLOADS", [True])
     Mxfp4HfQuantizer.validate_environment(object.__new__(Mxfp4HfQuantizer), device_map = None)
     assert mx._LOAD_OFFLOADS[0] is False
 

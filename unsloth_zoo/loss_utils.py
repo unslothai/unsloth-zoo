@@ -208,7 +208,7 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
             if logits.dim() == 2:
                 labels = labels.reshape(1, -1) if labels.dim() < 2 else labels.reshape(-1, labels.shape[-1])
                 logits = logits.view(*labels.shape, logits.shape[-1])
-            shift_labels = torch.empty_like(labels)
+            shift_labels = torch.empty_like(labels, device = logits.device)
             shift_labels[..., :-1] = labels[..., 1:]
             shift_labels[..., -1] = ignore_index
         else:
@@ -292,16 +292,16 @@ def fused_linear_cross_entropy(
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     if num_items_in_batch is not None and torch.is_tensor(num_items_in_batch):
-        num_items_in_batch = num_items_in_batch.to(hidden_states.device, non_blocking = True)
+        num_items_in_batch = num_items_in_batch.to(lm_weight.device, non_blocking = True)
 
     reduction = "sum" if num_items_in_batch is not None else "mean"
     if logit_softcapping == 0: logit_softcapping = None
 
     with current_device(lm_weight.device):
         loss = linear_cross_entropy(
-            hidden_states.to(lm_weight.dtype),
+            hidden_states.to(device = lm_weight.device, dtype = lm_weight.dtype, non_blocking = True),
             lm_weight,
-            targets      = labels,
+            targets      = labels.to(lm_weight.device, non_blocking = True),
             ignore_index = ignore_index,
             softcap      = logit_softcapping,
             reduction    = reduction,

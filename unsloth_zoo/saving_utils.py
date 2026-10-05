@@ -518,14 +518,36 @@ def _merge_lora(W, lora_stats, name, use_dequant_base = False):
 pass
 
 
+def _get_active_adapter(module):
+    adapters = getattr(module, "active_adapters", None)
+    if adapters is None:
+        adapters = getattr(module, "active_adapter", "default")
+    if isinstance(adapters, (list, tuple)):
+        if len(adapters) > 1:
+            raise ValueError("Unsloth: Merged export requires a single active adapter.")
+        return adapters[0] if adapters else None
+    return adapters
+pass
+
+
+def _has_active_adapter(module):
+    adapter = _get_active_adapter(module)
+    for attr in ("lora_A", "lora_embedding_A"):
+        try:
+            if adapter in getattr(module, attr): return True
+        except Exception:
+            continue
+    return False
+pass
+
+
 def _get_modules_to_save_weight(module, attr = "weight"):
     modules_to_save = getattr(module, "modules_to_save", None)
     if modules_to_save is None:
         return None
 
-    # `attr` so a head's bias travels with its weight; defaulted for existing callers.
-    # Prefer the default adapter, else first entry with a weight
-    for key in ("default",):
+    # A head's weight and bias must come from the same active adapter as the LoRA factors.
+    for key in (_get_active_adapter(module),):
         try:
             candidate = modules_to_save[key]
             if hasattr(candidate, attr):
@@ -533,6 +555,10 @@ def _get_modules_to_save_weight(module, attr = "weight"):
         except Exception:
             continue
 
+    if hasattr(module, "active_adapters") or hasattr(module, "active_adapter"):
+        return getattr(getattr(module, "original_module", None), attr, None)
+
+    # Legacy wrappers without an active-adapter API.
     for _, candidate in modules_to_save.items():
         if hasattr(candidate, attr):
             return getattr(candidate, attr)
@@ -674,15 +700,8 @@ pass
 
 def _get_lora_scaling(module):
     # All Unsloth Zoo code licensed under LGPLv3
-    # Resolve plural active_adapters or older singular active_adapter (may be a list);
     # 0.0 if unresolved so counts align. (#2966)
-    active_adapters = getattr(module, "active_adapters", None)
-    if active_adapters:
-        active_adapter = active_adapters[0]
-    else:
-        active_adapter = getattr(module, "active_adapter", "default")
-        if isinstance(active_adapter, (list, tuple)):
-            active_adapter = active_adapter[0] if active_adapter else "default"
+    active_adapter = _get_active_adapter(module)
     try:
         return module.scaling[active_adapter]
     except Exception:
@@ -703,32 +722,47 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
 
     remove_keys = set()
     keep_keys   = set()
+    _embedding_lora_keys = set()
+    _untargeted_keys = set()
+    _keep_downloaded_keys = set()
 
     inner_model = find_lora_base_model(model)
     for name, module in inner_model.named_modules():
         if name == "": continue
+        adapter_path, _, adapter = name.rpartition(".")
 
-        elif name.endswith(".lora_A.default"):
-            lora_weights[name[:-len(".lora_A.default")]].lora_A = module.weight
-            lora_A_count += 1
+        if adapter_path.endswith((".lora_A", ".lora_B", ".lora_magnitude_vector")):
+            key, _, kind = adapter_path.rpartition(".")
             expand_module_keys(name, module, remove_keys)
+            if adapter != _get_active_adapter(inner_model.get_submodule(key)): continue
+            if kind == "lora_A":
+                lora_weights[key].lora_A = module.weight
+                lora_A_count += 1
+            elif kind == "lora_B":
+                lora_weights[key].lora_B = module.weight
+                lora_B_count += 1
+            else:
+                lora_weights[key].magnitude = module.weight
 
-        elif name.endswith(".lora_B.default"):
-            lora_weights[name[:-len(".lora_B.default")]].lora_B = module.weight
-            lora_B_count += 1
-            expand_module_keys(name, module, remove_keys)
-
-        elif name.endswith(".lora_magnitude_vector.default"):
-            # DoRA magnitude vector m; folded onto the merged weight in _merge_lora. Register its
-            # key so the key-consistency check does not flag it (the merged model omits it).
-            lora_weights[name[:-len(".lora_magnitude_vector.default")]].magnitude = module.weight
-            expand_module_keys(name, module, remove_keys)
+        elif name.endswith((".lora_embedding_A", ".lora_embedding_B")):
+            # PEFT Embedding delta (B_e @ A_e).T == Linear form with lora_B = A_e.T, lora_A = B_e.T.
+            key = name[:-len(".lora_embedding_A")]
+            adapter = _get_active_adapter(inner_model.get_submodule(key))
+            if adapter not in module: continue
+            _embedding_lora_keys.add(key)
+            if name.endswith("_A"):
+                lora_weights[key].lora_B = module[adapter].t()
+                lora_B_count += 1
+            else:
+                lora_weights[key].lora_A = module[adapter].t()
+                lora_A_count += 1
 
         elif isinstance(module, Linear_LoRA_Layers):
             lora_weights[name].alpha = _get_lora_scaling(module)
             lora_weights[name].parameter_name = getattr(module, "parameter_name", None)
             scaling_count += 1
             expand_module_keys(name, module, remove_keys)
+            if not _has_active_adapter(module): _untargeted_keys.add(name)
 
         # LoRA wrappers (MoE/quant/older peft) not subclassing Linear_LoRA_Layers:
         # capture alpha so counts align. Require lora_A/lora_B so a non-LoRA module
@@ -740,6 +774,7 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
             lora_weights[name].parameter_name = getattr(module, "parameter_name", None)
             scaling_count += 1
             expand_module_keys(name, module, remove_keys)
+            if not _has_active_adapter(module): _untargeted_keys.add(name)
 
         elif name.endswith(".base_layer"):
             lora_weights[name[:-len(".base_layer")]].module = module
@@ -753,6 +788,11 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
                 lora_weights[name].module = module
                 expand_module_keys(name, module, remove_keys)
                 remove_keys.add(name)
+                # No saved copy for the active adapter and a quantized original: keep the downloaded tensor.
+                original = getattr(module, "original_module", None)
+                if original is not None and saved_weight is getattr(original, "weight", None) \
+                    and check_if_quantized(original):
+                    _keep_downloaded_keys.add(name)
             else:
                 new_keys = expand_module_keys(name, module, set())
                 remove_keys.update(new_keys)
@@ -793,15 +833,14 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
 
     # DoRA on a non-dense target (e.g. an Embedding / tied lm_head trained with
     # use_dora=True) captures a lora_magnitude_vector but no mergeable lora_A/lora_B
-    # (PEFT stores the embedding delta as lora_embedding_A/lora_embedding_B, which
-    # this merge does not read). _merge_lora only folds the magnitude onto W0+delta
+    # (embedding DoRA is not the Linear DoRA below). _merge_lora only folds the magnitude onto W0+delta
     # for a dense nn.Linear; here it would early-return the base weight and the
     # magnitude (and the embedding delta) would be silently dropped -- and since
     # assert_same_keys now ignores lora_magnitude_vector keys, that wrong merge would
     # not even trip the key check. Fail loud instead (matches _refuse_dora_on_moe).
     for _key, _stats in lora_weights.items():
         if getattr(_stats, "magnitude", None) is not None and (
-            _stats.lora_A is None or _stats.lora_B is None
+            _stats.lora_A is None or _stats.lora_B is None or _key in _embedding_lora_keys
         ):
             raise RuntimeError(
                 f"Unsloth: DoRA (use_dora=True) merging is not yet supported for `{_key}` "
@@ -810,6 +849,12 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
                 "dropped). Fine-tune such layers without DoRA, or open an issue at "
                 "https://github.com/unslothai/unsloth/issues."
             )
+
+    # Untargeted layers keep the downloaded weight; writers would treat (module, no factors) as modules_to_save and write the live, possibly 4-bit packed, weight.
+    _untargeted_keys = {k for k in _untargeted_keys if lora_weights[k].lora_A is None and lora_weights[k].lora_B is None}
+    for _key in _untargeted_keys:
+        scaling_count -= 1
+        if lora_weights[_key].module is not None: module_count -= 1
 
     if not (module_count == lora_A_count == lora_B_count == scaling_count):
         print(
@@ -840,8 +885,8 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
             # so the key matches lora_weights entries created by the branch above.
             # Only strip .weight variant; the lora_weights branch adds both
             # .weight and .bias from the module so we don't need a separate bias entry.
-            elif name.endswith(".modules_to_save.default.weight"):
-                name = name[:-len(".modules_to_save.default.weight")]
+            elif re.search(r"\.modules_to_save\.[^.]+\.weight$", name):
+                name = name.rsplit(".modules_to_save.", 1)[0]
 
             if name in lora_weights:
                 state_dict[name + ".weight"]   = lora_weights[name]
@@ -865,6 +910,7 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
     pass
 
     if return_state_dict: assert_same_keys(model, state_dict)
+    for _key in _untargeted_keys | _keep_downloaded_keys: lora_weights.pop(_key, None)
     return lora_weights, state_dict
 pass
 
@@ -904,6 +950,25 @@ pass
 # it cannot drift from the table above.
 _SAFETENSORS_DTYPE_NAMES = {v : k for k, v in SAFETENSORS_DTYPES.items()}
 
+def _get_bias_overrides(biases, safetensor_keys, model_class_name):
+    if not biases: return {}
+    # Lookup-only `.weight` aliases so the module-name remap also covers bias-only shards.
+    bias_keys = [key for key in safetensor_keys if key.endswith(".bias")]
+    if not bias_keys: return {}
+    converted = _convert_lora_keys_to_safetensor_format(
+        biases, [key[:-len(".bias")] + ".weight" for key in bias_keys],
+        model_class_name = model_class_name,
+    )
+    overrides = {}
+    for key in bias_keys:
+        module_key = key[:-len(".bias")]
+        bias = converted.get(module_key)
+        if bias is None and module_key.endswith(".linear"):
+            bias = converted.get(module_key[:-len(".linear")])
+        if bias is not None: overrides[key] = bias
+    return overrides
+pass
+
 @torch.inference_mode
 def _merge_and_overwrite_lora(
     save_directory,
@@ -918,6 +983,7 @@ def _merge_and_overwrite_lora(
     tie_word_embeddings = False,
     weight_block_size = None,
     use_dequant_base = False,
+    biases = None,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Merges LoRA and overwrites the safetensors file it was merged to
@@ -928,6 +994,7 @@ def _merge_and_overwrite_lora(
         return _merge_and_overwrite_lora_mxfp4(
             save_directory, filename, lora_weights, output_dtype,
             model_class_name, base_model_is_quantized, quant_type,
+            biases = biases,
         )
     pass
 
@@ -945,6 +1012,7 @@ def _merge_and_overwrite_lora(
             save_directory, filename, lora_weights, output_dtype,
             model_class_name, tie_word_embeddings = tie_word_embeddings,
             weight_block_size = weight_block_size,
+            biases = biases,
         )
     pass
 
@@ -978,6 +1046,7 @@ def _merge_and_overwrite_lora(
         with safe_open(filename_original, framework = "pt", device = "cpu") as file:
             safetensor_keys = list(file.keys())
             safetensor_keys_seen.update(safetensor_keys)
+            bias_overrides = _get_bias_overrides(biases, safetensor_keys, model_class_name)
 
             # Pre-compute number of experts per layer prefix from shard keys
             moe_num_experts = {}
@@ -1176,6 +1245,7 @@ def _merge_and_overwrite_lora(
                 # Standard 16-bit tensor
                 W = file.get_tensor(key)
                 W_original_dtype = W.dtype
+                W = bias_overrides.get(key, W)
 
                 if W is None:
                     continue
@@ -2417,7 +2487,7 @@ pass
 
 
 @torch.inference_mode
-def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, output_dtype, model_class_name, base_model_is_quantized=False, quant_type=None):
+def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, output_dtype, model_class_name, base_model_is_quantized=False, quant_type=None, biases=None):
     # All Unsloth Zoo code licensed under LGPLv3
     # Merges LoRA and overwrites the safetensors file it was merged to
     filename_original = os.path.join(save_directory, filename)  # Original file path
@@ -2439,6 +2509,7 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
     with safe_open(filename_original, framework = "pt", device = "cpu") as file: # Open original file for reading
         safetensor_keys = list(file.keys())
         safetensor_keys_seen.update(safetensor_keys)
+        bias_overrides = _get_bias_overrides(biases, safetensor_keys, model_class_name)
 
         # Update converted_lora_weights with actual safetensor keys
         converted_lora_weights = _convert_lora_keys_to_safetensor_format(
@@ -2563,6 +2634,7 @@ def _merge_and_overwrite_lora_mxfp4(save_directory, filename, lora_weights, outp
                 W = file.get_tensor(key)
 
 
+            W = bias_overrides.get(output_key, W)
             lora_key = output_key[:-len(".weight")] if output_key.endswith(".weight") else output_key
             lora_stats = converted_lora_weights.get(lora_key, None)
             # Gemma4 ClippableLinear (.linear.weight -> .weight), mirror the standard merge loop
@@ -2667,6 +2739,71 @@ _FP8_SCALE_SUFFIXES = (".weight_scale_inv", ".weight_scale", ".input_scale", ".a
                        "_input_scale", "_activation_scale", "_scale_inv", "_scale")
 # safetensors header dtype tags for FP8 weights (used to find genuine scale companions).
 _FP8_HEADER_DTYPES = ("F8_E4M3", "F8_E5M2")
+
+# compressed-tensors nvfp4-pack-quantized: <base>.weight_packed (uint8, two E2M1 codes per byte, low nibble first)
+# + <base>.weight_scale (FP8, one per 16 columns) + <base>.weight_global_scale. A 16bit merge writes <base>.weight.
+_NVFP4_PACKED_SUFFIX = ".weight_packed"
+_NVFP4_COMPANION_SUFFIXES = (".weight_scale", ".weight_global_scale", ".input_global_scale",
+                             ".input_scale", ".weight_zero_point")
+_E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+def _nvfp4_dequantize(packed, scale, global_scale):
+    """fp32 (..., rows, 2 * cols) weight from compressed-tensors NVFP4 storage (NVFP4PackedCompressor.decompress).
+    Leading dims (3-D fused MoE experts) are kept; packing and 16-column groups run along the last dim."""
+    lead, half = packed.shape[:-1], packed.shape[-1]
+    # Other pack-quantized formats (int32 packs) share the weight_packed name: refuse rather than misdecode.
+    expected_scale = (*lead, (half * 2) // 16)
+    if (
+        packed.dtype != torch.uint8
+        or scale.dtype != getattr(torch, "float8_e4m3fn", None)
+        or tuple(scale.shape) != expected_scale
+    ):
+        raise RuntimeError(
+            f"Unsloth: weight_packed {tuple(packed.shape)} {packed.dtype} with scale {tuple(scale.shape)} "
+            f"{scale.dtype} is not NVFP4 (uint8 codes, float8_e4m3fn scale of shape {expected_scale}). "
+            "The merged model would be corrupted."
+        )
+    codes = torch.stack((packed & 0x0F, packed >> 4), dim = -1).reshape(*lead, half * 2)
+    values = torch.tensor(_E2M1_VALUES, dtype = torch.float32)[(codes & 0x07).long()]
+    values = torch.where((codes & 0x08).bool(), -values, values)
+    if global_scale is None:
+        raise RuntimeError(
+            f"Unsloth: NVFP4 weight of shape {tuple(packed.shape)} has no weight_global_scale; "
+            "cannot dequantize to 16bit. The merged model would be corrupted."
+        )
+    group_scale = scale.to(torch.float32)
+    global_scale = global_scale.to(torch.float32)
+    experts = 1
+    for dim in lead[:-1]:
+        experts *= dim
+    if global_scale.numel() == 1:
+        group_scale = group_scale / global_scale.reshape(())
+    elif global_scale.numel() == experts:
+        # Fused MoE experts: one global scale per expert, broadcast over its rows and groups.
+        group_scale = group_scale / global_scale.reshape(*lead[:-1], 1, 1)
+    else:
+        raise RuntimeError(
+            f"Unsloth: NVFP4 weight of shape {tuple(packed.shape)} has {global_scale.numel()} global "
+            "scales; expected 1 or one per expert. The merged model would be corrupted."
+        )
+    return (values.view(*lead, -1, 16) * group_scale.unsqueeze(-1)).view(*lead, half * 2)
+pass
+
+def _is_nvfp4_compressed_tensors_config(quant_config):
+    """compressed-tensors checkpoint with an nvfp4-pack-quantized group: a 16bit merge must dequantize it."""
+    if not isinstance(quant_config, dict) or str(quant_config.get("quant_method", "")).lower() != "compressed-tensors":
+        return False
+    if "nvfp4" in str(quant_config.get("format", "")).lower():
+        return True
+    return any(
+        isinstance(group, dict) and "nvfp4" in str(group.get("format", "")).lower()
+        for group in (quant_config.get("config_groups") or {}).values()
+    )
+pass
+
+def _nvfp4_bases(keys):
+    return {k[: -len(_NVFP4_PACKED_SUFFIX)] for k in keys if isinstance(k, str) and k.endswith(_NVFP4_PACKED_SUFFIX)}
+pass
 
 def _fp8_dequantize_weight(file, header_metadata, weight_key, weight_block_size = None, extra_scale_lookup = None):
     """Dequantize one FP8 weight; return (W_real, [scale_keys to drop]).
@@ -2773,6 +2910,9 @@ pass
 def _fp8_scale_key_weight_bases(scale_key):
     """Candidate FP8 weight keys a companion scale belongs to (most specific suffix wins),
     used to drop a scale whose dequantized weight lives in another shard."""
+    for suffix in (".weight_global_scale", ".input_global_scale", ".weight_zero_point"):
+        if scale_key.endswith(suffix):
+            return (scale_key[: -len(suffix)] + ".weight",)
     for suffix in _FP8_SCALE_SUFFIXES:
         if scale_key.endswith(suffix):
             base = scale_key[: -len(suffix)]
@@ -2799,6 +2939,8 @@ def _collect_fp8_weight_keys(save_directory, filenames):
         for key, meta in header.items():
             if key != "__metadata__" and isinstance(meta, dict) and meta.get("dtype") in _FP8_HEADER_DTYPES:
                 fp8_keys.add(key)
+        # NVFP4: the dequantized <base>.weight anchors <base>.weight_scale / _global_scale.
+        fp8_keys.update(base + ".weight" for base in _nvfp4_bases(header))
     return fp8_keys
 pass
 
@@ -2851,7 +2993,7 @@ def _drop_resolved_fp8_scales_after_rewrite(save_directory, filenames, prerewrit
     return removed
 pass
 
-def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output_dtype, model_class_name, tie_word_embeddings = False, weight_block_size = None):
+def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output_dtype, model_class_name, tie_word_embeddings = False, weight_block_size = None, biases = None):
     # All Unsloth Zoo code licensed under LGPLv3
     # Dequantize FP8 to 16bit, merge LoRA, drop scales, atomically rewrite the shard.
     filename_original = os.path.join(save_directory, filename)
@@ -2863,6 +3005,7 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
     with safe_open(filename_original, framework = "pt", device = "cpu") as file:
         safetensor_keys = list(file.keys())
         safetensor_keys_seen.update(safetensor_keys)
+        bias_overrides = _get_bias_overrides(biases, safetensor_keys, model_class_name)
 
         # Read the header to skip scale companions without a tensor read. Read-only: the merge
         # writes a temp file and os.replace()s it, so no write handle is needed (and "r+b"
@@ -2874,8 +3017,12 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
         finally:
             raw_pointer.close()
 
+        # NVFP4 layers are named by their dequantized <base>.weight so LoRA keys match.
+        nvfp4_bases = _nvfp4_bases(safetensor_keys)
         converted_lora_weights = _convert_lora_keys_to_safetensor_format(
-            lora_weights, safetensor_keys, model_class_name = model_class_name,
+            lora_weights,
+            [k[: -len("_packed")] if k.endswith(_NVFP4_PACKED_SUFFIX) else k for k in safetensor_keys],
+            model_class_name = model_class_name,
         )
 
         # Dense path has no MoE fusion; refuse a fused-expert LoRA rather than drop it.
@@ -2901,7 +3048,21 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
         # suffix, so unrelated `*_scale` / `*_scale_inv` tensors (logit_scale, router
         # per_expert_scale, ...) are not silently lost.
         scale_keys_to_drop = set()
+        # Companions of a same-shard NVFP4 weight; one whose weight is in another shard stays until the post-rewrite cleanup.
+        nvfp4_companions = {b + s for b in nvfp4_bases for s in _NVFP4_COMPANION_SUFFIXES if b + s in header_metadata}
+        # NVFP4 scales (FP8-typed) whose packed weight is in another shard, possibly already rewritten to <base>.weight.
+        other_nvfp4_companions = {
+            key for key in safetensor_keys
+            if any(key.endswith(sfx) and key[: -len(sfx)] not in nvfp4_bases
+                   and key[: -len(sfx)] + ".weight" not in header_metadata
+                   and (key[: -len(sfx)] + _NVFP4_PACKED_SUFFIX in cross_shard or key[: -len(sfx)] + ".weight" in cross_shard)
+                   for sfx in _NVFP4_COMPANION_SUFFIXES[:3])
+            and (header_metadata.get(key, {}).get("dtype") in _FP8_HEADER_DTYPES or not key.endswith(".weight_scale"))
+        }
+        scale_keys_to_drop.update(nvfp4_companions)
         for key in safetensor_keys:
+            if key in nvfp4_companions or key in other_nvfp4_companions:
+                continue
             if header_metadata.get(key, {}).get("dtype") not in _FP8_HEADER_DTYPES:
                 continue
             base = key[: -len(".weight")] if key.endswith(".weight") else key
@@ -2914,11 +3075,28 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
             if key in scale_keys_to_drop:
                 continue
 
-            was_fp8 = header_metadata.get(key, {}).get("dtype") in _FP8_HEADER_DTYPES
-            merged = False
-            W, _scale_keys = _fp8_dequantize_weight(file, header_metadata, key, weight_block_size = weight_block_size, extra_scale_lookup = _load_cross_shard_scale)
-
             output_key = key
+            if key in other_nvfp4_companions:
+                tensors[key] = file.get_tensor(key)
+                continue
+            if key.endswith(_NVFP4_PACKED_SUFFIX):
+                base = key[: -len(_NVFP4_PACKED_SUFFIX)]
+                def _companion(name):
+                    return file.get_tensor(name) if name in header_metadata else _load_cross_shard_scale(name)
+                scale = _companion(base + ".weight_scale")
+                if scale is None:
+                    raise RuntimeError(
+                        f"Unsloth: NVFP4 weight '{key}' has no companion weight_scale; cannot "
+                        "dequantize to 16bit. The merged model would be corrupted."
+                    )
+                W = _nvfp4_dequantize(file.get_tensor(key), scale, _companion(base + ".weight_global_scale"))
+                output_key = base + ".weight"
+                was_fp8 = True
+            else:
+                was_fp8 = header_metadata.get(key, {}).get("dtype") in _FP8_HEADER_DTYPES
+                W, _scale_keys = _fp8_dequantize_weight(file, header_metadata, key, weight_block_size = weight_block_size, extra_scale_lookup = _load_cross_shard_scale)
+            merged = False
+
             lora_key = output_key[:-len(".weight")] if output_key.endswith(".weight") else output_key
             lora_stats = converted_lora_weights.get(lora_key, None)
             if lora_stats is None and lora_key.endswith(".linear"):
@@ -2949,6 +3127,7 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
             # Dequantized FP8 or LoRA-merged tensors take output_dtype; untouched non-FP8
             # buffers (int64/bool/fp32, e.g. inv_freq) keep their dtype, as the in-place path does.
             write_dtype = output_dtype if (was_fp8 or merged) else W.dtype
+            W = bias_overrides.get(output_key, W)
             tensors[output_key] = W.to(device = "cpu", dtype = write_dtype).contiguous()
             del W
             if tensors[output_key].numel() * tensors[output_key].element_size() >= _EMPTY_CACHE_BYTES_THRESHOLD:
@@ -2960,6 +3139,10 @@ def _merge_and_overwrite_lora_fp8(save_directory, filename, lora_weights, output
         for k in list(safetensor_keys):
             if k in scale_keys_to_drop:
                 safetensor_keys_seen.discard(k)
+        # The shard now holds <base>.weight for each NVFP4 <base>.weight_packed; the Step-7 LoRA count keys on it.
+        for base in nvfp4_bases:
+            safetensor_keys_seen.discard(base + _NVFP4_PACKED_SUFFIX)
+            safetensor_keys_seen.add(base + ".weight")
 
     if os.name == 'nt':
         gc.collect()
@@ -3934,6 +4117,491 @@ def _export_index_atomically(source_path, destination, payload, mode_from = None
 pass
 
 
+# merged_16bit drops the quantization config: MXFP4 / INT packed weights are decoded to 16-bit, other packed formats refuse.
+
+def _find_quantization_config(config):
+    if not isinstance(config, dict):
+        return None
+    quant = config.get("quantization_config")
+    if isinstance(quant, dict):
+        return quant
+    for value in config.values():
+        found = _find_quantization_config(value)
+        if found is not None:
+            return found
+    return None
+pass
+
+
+def _compressed_tensors_quantization_config(model_name, token = None):
+    config = None
+    try:
+        if os.path.isdir(str(model_name)):
+            path = os.path.join(str(model_name), "config.json")
+        else:
+            from huggingface_hub import hf_hub_download
+            repo_id, revision = _hub_repo_and_revision(model_name)
+            path = hf_hub_download(repo_id = repo_id, filename = "config.json", token = token, revision = revision)
+        with open(path, "r", encoding = "utf-8") as f:
+            config = json.load(f)
+    except Exception:
+        return None
+    quant = _find_quantization_config(config)
+    if quant is None:
+        return None
+    # Legacy llm-compressor checkpoints nest the real config one level down.
+    inner = quant.get("quantization_config")
+    if isinstance(inner, dict) and "config_groups" in inner:
+        quant = dict(inner, quant_method = quant.get("quant_method"))
+    if str(quant.get("quant_method", "")).lower().replace("_", "-") not in ("compressed-tensors", "sparseml"):
+        return None
+    return quant
+pass
+
+
+def _compressed_packed_format(model_name, token = None):
+    """``"mxfp4-pack-quantized"`` if every packed group is MXFP4, else the formats found; None if unpacked."""
+    quant = _compressed_tensors_quantization_config(model_name, token)
+    if quant is None:
+        return None
+    top = quant.get("format")
+    groups = [g for g in (quant.get("config_groups") or {}).values() if isinstance(g, dict)]
+    formats = {str(g.get("format") or top) for g in groups} or {str(top)}
+    if not any(f.endswith("pack-quantized") for f in formats):
+        return None
+    return "mxfp4-pack-quantized" if formats == {"mxfp4-pack-quantized"} else ",".join(sorted(formats))
+pass
+
+
+_INT_PACKED_SUFFIXES = ("weight_packed", "weight_scale", "weight_shape", "weight_zero_point", "weight_g_idx")
+
+
+def _compressed_int_pack_schemes(model_name, token = None):
+    """Weight args of every group of an all-``pack-quantized`` checkpoint; RuntimeError if not exactly decodable."""
+    quant = _compressed_tensors_quantization_config(model_name, token) or {}
+    refuse = lambda why: RuntimeError(  # noqa: E731
+        f"Unsloth: `{model_name}` stores its weights compressed-tensors packed (pack-quantized) "
+        f"and {why}, so a merged_16bit export of it is not supported. Nothing was written. Save "
+        "the adapter with `model.save_pretrained(...)` instead."
+    )
+    sparsity = quant.get("sparsity_config")
+    if isinstance(sparsity, dict) and str(sparsity.get("format") or "dense") != "dense":
+        raise refuse(f"is also sparsity-compressed ({sparsity.get('format')})")
+    if quant.get("kv_cache_scheme"):
+        raise refuse("also quantizes its KV cache")
+    schemes = []
+    for name, group in (quant.get("config_groups") or {}).items():
+        weights = group.get("weights") if isinstance(group, dict) else None
+        if not isinstance(weights, dict):
+            raise refuse(f"group `{name}` has no weight quantization")
+        if group.get("input_activations") or group.get("output_activations"):
+            raise refuse(f"group `{name}` also quantizes activations")
+        strategy = str(weights.get("strategy") or "")
+        if (
+            str(weights.get("type") or "int") != "int"
+            or weights.get("num_bits") not in (4, 8)
+            or strategy not in ("group", "channel")
+            or weights.get("block_structure")
+        ):
+            raise refuse(
+                f"group `{name}` is {weights.get('type')} {weights.get('num_bits')}-bit {strategy} "
+                "(only int 4 / 8-bit group or channel weights decode)"
+            )
+        schemes.append(dict(weights))
+    if not schemes:
+        raise refuse("has no config_groups")
+    return schemes
+pass
+
+
+def _pick_int_scheme(base, schemes, packed_shape, scale_shape, logical_shape, has_zero_point):
+    """The one config group whose args this tensor's layout agrees with; a tie or none refuses."""
+    out_features, in_features = logical_shape
+    found = {}
+    for weights in schemes:
+        bits, strategy = weights["num_bits"], weights["strategy"]
+        groups = 1 if strategy == "channel" else -(-in_features // int(weights.get("group_size") or in_features))
+        if (
+            tuple(packed_shape) == (out_features, -(-in_features // (32 // bits)))
+            and tuple(scale_shape) == (out_features, groups)
+            and has_zero_point == (not weights.get("symmetric", True))
+        ):
+            found[(bits, strategy, bool(weights.get("symmetric", True)), weights.get("group_size"))] = weights
+    if len(found) != 1:
+        raise RuntimeError(
+            f"Unsloth: `{base}.weight_packed` {tuple(packed_shape)} matches "
+            f"{'none' if not found else 'more than one'} of the checkpoint's pack-quantized groups, "
+            "so the merged_16bit export cannot decode it. Nothing was merged."
+        )
+    return next(iter(found.values()))
+pass
+
+
+def _plan_compressed_int_rewrite(save_directory, filenames, schemes):
+    """All refusals happen here, before any shard is touched; companions in other shards are read up front."""
+    locations, shapes, stored_shapes = {}, {}, {}
+    for filename in filenames:
+        with safe_open(os.path.join(save_directory, filename), framework = "pt", device = "cpu") as f:
+            for key in f.keys():
+                locations[key] = filename
+                if key.endswith(("_packed", ".weight_scale", ".weight_zero_point")):
+                    shapes[key] = tuple(f.get_slice(key).get_shape())
+                elif key.endswith(".weight_shape"):
+                    stored_shapes[key] = tuple(int(x) for x in f.get_tensor(key).tolist())
+
+    def read(key):
+        with safe_open(os.path.join(save_directory, locations[key]), framework = "pt", device = "cpu") as f:
+            return f.get_tensor(key)
+
+    bases, logical, elsewhere = {}, {}, {}
+    for key in sorted(k for k in locations if k.endswith("_packed")):
+        base = key[: -len(".weight_packed")]
+        if not key.endswith(".weight_packed") or len(shapes[key]) != 2 or base + ".weight_scale" not in locations:
+            raise RuntimeError(
+                f"Unsloth: `{key}` is not a 2D pack-quantized Linear weight with a `weight_scale`, so "
+                "the merged_16bit export cannot decode it. Nothing was merged."
+            )
+        if base + ".weight_shape" in stored_shapes:
+            shape = stored_shapes[base + ".weight_shape"]
+        else:
+            bits = {w["num_bits"] for w in schemes}
+            if len(bits) != 1:
+                raise RuntimeError(f"Unsloth: `{base}` has no `weight_shape`. Nothing was merged.")
+            shape = (shapes[key][0], shapes[key][1] * (32 // bits.pop()))
+        logical[base] = shape
+        bases[base] = _pick_int_scheme(
+            base, schemes, shapes[key], shapes[base + ".weight_scale"], shape,
+            base + ".weight_zero_point" in locations,
+        )
+        for suffix in _INT_PACKED_SUFFIXES[1:]:
+            companion = base + "." + suffix
+            if companion in locations and locations[companion] != locations[key]:
+                elsewhere[companion] = read(companion)
+    return dict(bases = bases, logical = logical, elsewhere = elsewhere)
+pass
+
+
+def _compressed_int_disk_view(save_directory, filenames, plan):
+    keys, shapes = _disk_module_shapes(save_directory, filenames)
+    for base, shape in plan["logical"].items():
+        for suffix in _INT_PACKED_SUFFIXES:
+            keys.discard(base + "." + suffix)
+        keys.add(base + ".weight")
+        shapes[base] = shape
+    return keys, shapes
+pass
+
+
+def _decompress_int_packed(state, weights):
+    """compressed-tensors' own decompressor, so the decoded weight is exactly what it loads."""
+    from compressed_tensors.compressors import BaseCompressor
+    from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
+
+    # Only these reach the decode; `actorder = "group"` fails validation on newer releases.
+    args = QuantizationArgs.model_validate(
+        {k: weights[k] for k in ("num_bits", "type", "symmetric", "strategy", "group_size") if k in weights}
+    )
+    compressor = BaseCompressor.get_value_from_registry("pack-quantized")
+    if hasattr(compressor, "decompress_weight"):  # compressed-tensors < 0.13
+        return BaseCompressor.load_from_registry("pack-quantized").decompress_weight(
+            compressed_data = state, quantization_args = args,
+        )
+    return compressor.decompress(state, QuantizationScheme(targets = ["Linear"], weights = args))["weight"]
+pass
+
+
+def _rewrite_compressed_int_shard(save_directory, filename, plan, output_dtype = None):
+    dtype = output_dtype or torch.bfloat16
+    device = _active_merge_device()
+    bases, elsewhere = plan["bases"], plan["elsewhere"]
+
+    def split(key):
+        base, _, suffix = key.rpartition(".")
+        return (base, suffix) if base in bases and suffix in _INT_PACKED_SUFFIXES else (None, None)
+
+    path = os.path.join(save_directory, filename)
+    with safe_open(path, framework = "pt", device = "cpu") as f:
+        keys = list(f.keys())
+    if not any(split(k)[0] is not None for k in keys):
+        return
+    tensors = {}
+    with safe_open(path, framework = "pt", device = "cpu") as f:
+        metadata = f.metadata() or {"format": "pt"}
+        for key in keys:
+            base, suffix = split(key)
+            if base is None:
+                tensors[key] = f.get_tensor(key)
+                continue
+            if suffix != "weight_packed":
+                continue
+            state = {}
+            for companion in _INT_PACKED_SUFFIXES:
+                name = base + "." + companion
+                if name in elsewhere:
+                    state[companion] = elsewhere[name]
+                elif name in keys:
+                    state[companion] = f.get_tensor(name)
+            state["weight_shape"] = torch.tensor(plan["logical"][base])
+            state = {k: v.to(device) for k, v in state.items()}
+            weight = _decompress_int_packed(state, bases[base])
+            tensors[base + ".weight"] = weight.to(dtype).cpu().contiguous()
+    save_file(tensors, path + ".unsloth_tmp", metadata = metadata)
+    os.replace(path + ".unsloth_tmp", path)
+pass
+
+
+def _packed_expert_stacks(model):
+    """Merged-in-memory adapters count too: the export rebuilds the weights from the checkpoint."""
+    inner = find_lora_base_model(model)
+    stacks = {}
+    for name, module in inner.named_modules():
+        if not getattr(type(module), "_unsloth_mxfp4_stacked_experts", False):
+            continue
+        path = name
+        while path.endswith(".base_layer"):
+            path = path[: -len(".base_layer")]
+        loras, wrappers, holder, holder_name = [], [], inner.get_submodule(path), path
+        while holder is not module:
+            parameter = getattr(holder, "parameter_name", None)
+            if parameter is not None and hasattr(holder, "lora_A"):
+                wrappers.append(holder_name)
+                adapters = list(getattr(holder, "active_adapters", None) or [])
+                adapters += list(getattr(holder, "merged_adapters", None) or [])
+                adapters = [a for a in dict.fromkeys(adapters) if a in holder.lora_A]
+                if adapters:
+                    loras.append((holder, parameter, adapters))
+            holder, holder_name = holder.base_layer, holder_name + ".base_layer"
+        stacks[path] = (module, loras, wrappers)
+    return stacks
+pass
+
+
+def _expert_target(base_key, stacks):
+    match = re.match(r"^(.*\.experts)\.(\d+)\.(w[123])$", base_key)
+    if match is None:
+        return None
+    prefix = match.group(1)
+    for path in stacks:
+        if path == prefix or path.endswith("." + prefix) or prefix.endswith("." + path):
+            return path, int(match.group(2)), match.group(3)
+    return None
+pass
+
+
+def _stack_parameter(proj):
+    return "down_proj" if proj == "w2" else "gate_up_proj"
+pass
+
+
+def _one_expert_lora_delta(holder, adapter, index):
+    """``get_delta_weight(adapter)[index]`` in fp32 from one expert's factor slice; the full delta is too big."""
+    num = int(getattr(holder, "num_experts", 1) or 1)
+    if num <= 1:
+        return holder.get_delta_weight(adapter).detach().float()[index]
+    weight_A = holder.lora_A[adapter].weight.detach()
+    weight_B = holder.lora_B[adapter].weight.detach()
+    # PEFT's layout: lora_A (experts, rank, in), lora_B (out, rank, experts).
+    weight_A = weight_A.reshape(num, -1, weight_A.shape[-1])[index]
+    grouped = False
+    from unsloth_zoo.temporary_patches.moe_utils import _cast_delta_weight_like_param
+    try:
+        from unsloth_zoo.temporary_patches.moe_utils import (
+            LORA_B_LAYOUT_GROUPED_BY_EXPERT, _legacy_lora_b_layout_requested, moe_lora_b_layout_for_wrapper,
+        )
+        grouped = _legacy_lora_b_layout_requested() and (
+            moe_lora_b_layout_for_wrapper(holder, adapter) == LORA_B_LAYOUT_GROUPED_BY_EXPERT
+        )
+    except Exception:
+        pass
+    if grouped:
+        weight_B = weight_B.reshape(weight_B.shape[0], num, -1)[:, index, :]
+    else:
+        weight_B = weight_B.reshape(weight_B.shape[0], -1, num)[:, :, index]
+    if getattr(holder, "_did_swap_in_out_features", False):
+        delta = torch.einsum("o r, r i -> o i", weight_B, weight_A)
+    else:
+        delta = torch.einsum("o r, r i -> i o", weight_B, weight_A)
+    return _cast_delta_weight_like_param(delta * holder.scaling[adapter], holder.get_param()).float()
+pass
+
+
+def _expert_lora_delta(loras, parameter, index):
+    total = None
+    for holder, name, adapters in loras:
+        if name != parameter:
+            continue
+        for adapter in adapters:
+            delta = _one_expert_lora_delta(holder, adapter, index)
+            total = delta if total is None else total + delta
+    return total
+pass
+
+
+def _expert_slice(delta, stack, index, proj):
+    if proj == "w2":
+        return delta[index].t()
+    inter = stack.intermediate_size
+    return (delta[index, :, :inter] if proj == "w1" else delta[index, :, inter:]).t()
+pass
+
+
+@torch.inference_mode()
+def _plan_compressed_mxfp4_rewrite(save_directory, filenames, model):
+    """All refusals happen here, before any shard is touched; cross-shard scales are read up front."""
+    stacks = _packed_expert_stacks(model)
+    locations, shapes, dtypes, keys_of = {}, {}, {}, {}
+    for filename in filenames:
+        with safe_open(os.path.join(save_directory, filename), framework = "pt", device = "cpu") as f:
+            keys_of[filename] = list(f.keys())
+            for key in keys_of[filename]:
+                locations[key] = filename
+                if key.endswith((".weight_packed", ".weight_scale")):
+                    view = f.get_slice(key)
+                    shapes[key], dtypes[key] = tuple(view.get_shape()), view.get_dtype()
+    packed_bases = {k[: -len(".weight_packed")] for k in locations if k.endswith(".weight_packed")}
+
+    targets = {}
+    for base in sorted(packed_bases):
+        packed_shape, scale_key = shapes[base + ".weight_packed"], base + ".weight_scale"
+        if (
+            scale_key not in locations
+            or dtypes[base + ".weight_packed"] != "U8" or dtypes[scale_key] != "U8"
+            or len(packed_shape) != 2 or shapes[scale_key] != (packed_shape[0], packed_shape[1] // 16)
+        ):
+            raise RuntimeError(
+                f"Unsloth: `{base}.weight_packed` is not an MXFP4 weight (uint8 [out, in / 2] with a "
+                "uint8 [out, in / 32] scale), so the merged_16bit export cannot decode it. Nothing "
+                "was merged."
+            )
+        target = _expert_target(base, stacks)
+        if target is not None:
+            targets[base] = target
+    needed = {
+        (path, index, proj)
+        for path, (stack, loras, _) in stacks.items()
+        for parameter in {name for _, name, _ in loras}
+        for proj in (("w2",) if parameter == "down_proj" else ("w1", "w3"))
+        for index in range(stack.num_experts)
+    }
+    unplaced = sorted({path for path, _, _ in needed - set(targets.values())})
+    if unplaced:
+        raise RuntimeError(
+            f"Unsloth: the expert LoRA of {unplaced} has no matching `experts.<i>.w1 / w2 / w3` "
+            "weights in the base checkpoint, so the merged export would drop it. Nothing was merged."
+        )
+    for base, (path, index, proj) in targets.items():
+        stack = stacks[path][0]
+        want = (stack.intermediate_size, stack.hidden_size)
+        want = want[::-1] if proj == "w2" else want
+        packed_shape = shapes[base + ".weight_packed"]
+        if (path, index, proj) in needed and (packed_shape[0], packed_shape[1] * 2) != want:
+            raise RuntimeError(
+                f"Unsloth: the expert LoRA for `{base}` is {want} but the checkpoint weight is "
+                f"{(packed_shape[0], packed_shape[1] * 2)}. Nothing was merged."
+            )
+
+    def read(key):
+        with safe_open(os.path.join(save_directory, locations[key]), framework = "pt", device = "cpu") as f:
+            return f.get_tensor(key)
+
+    elsewhere = {
+        base + ".weight_scale": read(base + ".weight_scale")
+        for base in packed_bases
+        if locations[base + ".weight_scale"] != locations[base + ".weight_packed"]
+    }
+    return dict(
+        stacks = stacks, keys_of = keys_of, shapes = shapes, packed_bases = packed_bases,
+        targets = targets, elsewhere = elsewhere, deltas = {},
+        wrappers = {wrapper for _, (_, _, paths) in stacks.items() for wrapper in paths},
+    )
+pass
+
+
+def _compressed_mxfp4_disk_view(save_directory, filenames, plan):
+    keys, shapes = _disk_module_shapes(save_directory, filenames)
+    for base in plan["packed_bases"]:
+        for suffix in (".weight_packed", ".weight_scale", ".weight_shape"):
+            keys.discard(base + suffix)
+        keys.add(base + ".weight")
+        packed_shape = plan["shapes"][base + ".weight_packed"]
+        shapes[base] = (packed_shape[0], packed_shape[1] * 2)
+    return keys, shapes
+pass
+
+
+def _rewrite_compressed_mxfp4_shard(save_directory, filename, plan, output_dtype = None):
+    from .mxfp4_dequant import mxfp4_dequantize_torch
+
+    dtype = output_dtype or torch.bfloat16
+    device = _active_merge_device()
+    stacks, targets, deltas = plan["stacks"], plan["targets"], plan["deltas"]
+    packed_bases, elsewhere = plan["packed_bases"], plan["elsewhere"]
+
+    def dropped(key):
+        base, _, suffix = key.rpartition(".")
+        return base in packed_bases and suffix in ("weight_scale", "weight_shape")
+
+    path = os.path.join(save_directory, filename)
+    # Read now, not at planning: a trained head may have been seeded into this shard since.
+    with safe_open(path, framework = "pt", device = "cpu") as f:
+        keys = list(f.keys())
+    if not any(k.endswith(".weight_packed") or dropped(k) for k in keys):
+        return
+    tensors = {}
+    with safe_open(path, framework = "pt", device = "cpu") as f:
+        metadata = f.metadata() or {"format": "pt"}
+        for key in keys:
+            base, _, suffix = key.rpartition(".")
+            if dropped(key):
+                continue
+            if suffix != "weight_packed":
+                tensors[key] = f.get_tensor(key)
+                continue
+            packed = f.get_tensor(key)
+            scale_key = base + ".weight_scale"
+            scale = elsewhere[scale_key] if scale_key in elsewhere else f.get_tensor(scale_key)
+            out_features = packed.shape[0]
+            weight = mxfp4_dequantize_torch(
+                packed.to(device).view(out_features, -1, 16), scale.to(device), dtype = torch.float32,
+            ).reshape(out_features, -1)
+            target = targets.get(base)
+            if target is not None:
+                stack_path, index, proj = target
+                cache_key = (stack_path, _stack_parameter(proj), index)
+                if cache_key not in deltas:
+                    deltas.clear()
+                    deltas[cache_key] = _expert_lora_delta(stacks[stack_path][1], cache_key[1], index)
+                if deltas[cache_key] is not None:
+                    delta = _expert_slice(deltas[cache_key][None], stacks[stack_path][0], 0, proj)
+                    weight = weight + delta.to(weight.device)
+            tensors[base + ".weight"] = weight.to(dtype).cpu().contiguous()
+    save_file(tensors, path + ".unsloth_tmp", metadata = metadata)
+    os.replace(path + ".unsloth_tmp", path)
+pass
+
+
+def _dequantize_compressed_mxfp4_shards(save_directory, filenames, lora_weights, model, output_dtype = None):
+    plan = _plan_compressed_mxfp4_rewrite(save_directory, filenames, model)
+    for filename in filenames:
+        _rewrite_compressed_mxfp4_shard(save_directory, filename, plan, output_dtype)
+    for wrapper in plan["wrappers"]:
+        lora_weights.pop(wrapper, None)
+pass
+
+
+def _save_remote_code_files(model, save_directory):
+    """The config only writes its own file; ``trust_remote_code`` reload needs the modeling files too."""
+    base = find_lora_base_model(model)
+    if getattr(base, "_auto_class", None) is None:
+        return
+    try:
+        from transformers.dynamic_module_utils import custom_object_save
+        custom_object_save(base, save_directory)
+    except Exception as error:
+        warnings.warn(f"Unsloth: could not copy the model's remote code files ({error}).")
+pass
+
+
 @torch.inference_mode
 def merge_and_overwrite_lora(
     get_model_name,
@@ -4304,6 +4972,16 @@ def merge_and_overwrite_lora(
     pass
 
     # Default handle 16 bit merge and save/push
+    # Before Step 1: an in-place export overwrites the source config.json without its quantization config.
+    _ct_packed_format = _compressed_packed_format(model_name, token) if save_method == "merged_16bit" else None
+    if _ct_packed_format is not None and _ct_packed_format not in ("mxfp4-pack-quantized", "pack-quantized"):
+        raise RuntimeError(
+            f"Unsloth: `{model_name}` stores its weights compressed-tensors packed "
+            f"({_ct_packed_format}); a merged_16bit export of it is not supported, since the "
+            "packed tensors would be written unmerged. Nothing was written. Save the adapter "
+            "with `model.save_pretrained(...)` instead."
+        )
+    _ct_int_schemes = _compressed_int_pack_schemes(model_name, token) if _ct_packed_format == "pack-quantized" else None
     # Step 1: Save base model config/architecture (no weights needed here)
     if save_method == "merged_16bit":
         # `config` is `model.config`, already the nested text config under `text_only = True`,
@@ -4329,6 +5007,7 @@ def merge_and_overwrite_lora(
             _copy_export_remote_code(model_name, save_directory, token, model)
         _remove_quantization_config(config_path = Path(save_directory) / "config.json")
         _remove_transformers_version(config_path = Path(save_directory) / "config.json")
+        _save_remote_code_files(model, save_directory)
         # #5410: keep trained eos / sampling defaults on reload.
         try:
             gen_cfg = getattr(model, "generation_config", None)
@@ -4368,12 +5047,15 @@ def merge_and_overwrite_lora(
     _has_nested_shard = any(_has_directory_component(_f) for _f in safetensors_list)
     safe_tensor_index_files = ["model.safetensors.index.json"] if (len(safetensors_list) > 1 or is_hf_sharded or _has_nested_shard) else []
 
+    _ct_mxfp4_dequant = _ct_packed_format == "mxfp4-pack-quantized"
+    _ct_dequant = _ct_mxfp4_dequant or _ct_int_schemes is not None
+
     # The original index lists scale keys, so it goes stale on MXFP4/FP8 dequant; skip
     # copying it (regenerated below). FP8 only dequantizes on a merged_16bit save, so an
     # FP8 base saved another way keeps its scales and must reuse the original index.
     _is_quant_dequant = (
         base_model_is_quantized and quant_type == "mxfp4" and save_method != "mxfp4"
-    ) or (base_model_is_quantized and quant_type == "fp8" and save_method == "merged_16bit")
+    ) or (base_model_is_quantized and quant_type == "fp8" and save_method == "merged_16bit") or _ct_dequant
     # Before any branch decides whether to copy it: filtering the in-memory list is not
     # enough, since a later from_pretrained joins the raw weight_map values itself.
     # Outside the branch below, which a dequant or splitting export skips. Scoped to
@@ -4540,7 +5222,7 @@ def merge_and_overwrite_lora(
     # so a non-dequantizing FP8 save keeps a correct index instead of none.
     _quant_dequant_index = (
         base_model_is_quantized and quant_type == "mxfp4" and save_method != "mxfp4"
-    ) or (base_model_is_quantized and quant_type == "fp8" and save_method == "merged_16bit")
+    ) or (base_model_is_quantized and quant_type == "fp8" and save_method == "merged_16bit") or _ct_dequant
     # A dequant or splitting export skips the index-copy block, so regeneration is the
     # only thing that can leave an index behind, and from_pretrained looks for exactly
     # `model.safetensors` then the index at the ROOT, which a nested singleton is neither.
@@ -4603,6 +5285,17 @@ def merge_and_overwrite_lora(
     # which clears quant_type; same value either way, the two branches are mutually exclusive.
     _count_packed_mxfp4 = not (base_model_is_quantized and quant_type == "mxfp4" and save_method == "mxfp4")
 
+    # Decoded per shard in the merge loop (low-disk upload still streams), folding in stack LoRAs.
+    _mxfp4_rewrite = _int_rewrite = _disk_view = None
+    if _ct_int_schemes is not None:
+        _int_rewrite = _plan_compressed_int_rewrite(save_directory, final_safetensors_list, _ct_int_schemes)
+        _disk_view = _compressed_int_disk_view(save_directory, final_safetensors_list, _int_rewrite)
+    if _ct_mxfp4_dequant:
+        _mxfp4_rewrite = _plan_compressed_mxfp4_rewrite(save_directory, final_safetensors_list, model)
+        _disk_view = _compressed_mxfp4_disk_view(save_directory, final_safetensors_list, _mxfp4_rewrite)
+        for _wrapper in _mxfp4_rewrite["wrappers"]:
+            lora_weights.pop(_wrapper, None)
+
     # Refuse a silently partial merge before any staged shard is mutated: the FP8 pre-rewrite
     # below dequantizes EVERY shard, so refusing after it rewrites the whole checkpoint first.
     # It cannot precede Step 2's `upload_items()` though, so a refusal here leaves config.json
@@ -4611,6 +5304,7 @@ def merge_and_overwrite_lora(
         save_directory, final_safetensors_list, lora_weights, _merge_model_class_name,
         tie_word_embeddings = _merge_tie_word_embeddings,
         count_packed_mxfp4 = _count_packed_mxfp4,
+        disk = _disk_view,
     )
 
     # FP8 MoE-expert LoRA + merged_16bit: the dense FP8 rewrite cannot fuse per-expert
@@ -4667,7 +5361,27 @@ def merge_and_overwrite_lora(
         if _add_keys_to_index(save_directory, _seeded_head_keys) and push_to_hub:
             upload_items("model.safetensors.index.json")
 
+    # Select by adapter config, not requires_grad: an adapter reloaded frozen still has trained biases.
+    peft_config = getattr(model, "peft_config", {})
+    bias_modes = {
+        getattr(peft_config.get(adapter), "bias", "none")
+        for adapter in getattr(model, "active_adapters", ["default"])
+    }
+    bias_modules = {
+        key for key, stats in lora_weights.items()
+        if getattr(stats.module, "modules_to_save", None) is not None
+        or ("lora_only" in bias_modes and stats.lora_A is not None)
+    }
+    biases = defaultdict(lambda: None, {
+        key[:-len(".bias")] : value for key, value in state_dict.items()
+        if key.endswith(".bias") and isinstance(value, torch.Tensor)
+        and ("all" in bias_modes or key[:-len(".bias")] in bias_modules)
+    })
     for filename in ProgressBar(final_safetensors_list, desc=f'Unsloth: Merging weights into {"mxfp4" if save_method=="mxfp4" else "16bit"}'):
+        if _mxfp4_rewrite is not None:
+            _rewrite_compressed_mxfp4_shard(save_directory, filename, _mxfp4_rewrite, output_dtype)
+        if _int_rewrite is not None:
+            _rewrite_compressed_int_shard(save_directory, filename, _int_rewrite, output_dtype)
         merged_count, shard_keys = _merge_and_overwrite_lora(
             save_directory = save_directory,
             filename = filename,
@@ -4681,6 +5395,7 @@ def merge_and_overwrite_lora(
             tie_word_embeddings = _merge_tie_word_embeddings,
             weight_block_size = _merge_weight_block_size,
             use_dequant_base = _use_dequant_base,
+            biases = biases,
         )
         n_saved_modules += merged_count
         safetensor_keys_seen.update(shard_keys)
@@ -6008,14 +6723,14 @@ pass
 
 def _check_lora_merge_is_complete(save_directory, safetensors_list, lora_weights,
                                   model_class_name, tie_word_embeddings = False,
-                                  count_packed_mxfp4 = True):
+                                  count_packed_mxfp4 = True, disk = None):
     """Refuse a silently partial merge before any staged shard is touched, returning what it
     found (empty means every LoRA-bearing module can be placed).
 
     NOT ahead of everything: on a push, Step 2 has already uploaded config.json and the
     tokenizer, since `final_safetensors_list` is built after that upload.
     """
-    disk_keys, disk_module_shapes = _disk_module_shapes(save_directory, safetensors_list)
+    disk_keys, disk_module_shapes = disk or _disk_module_shapes(save_directory, safetensors_list)
     unresolved = _unresolved_lora_targets(
         lora_weights,
         disk_keys,
@@ -6065,6 +6780,10 @@ def _unbacked_trained_tensors(lora_weights, shard_keys, model_class_name,
     a tied or prefix-bridged `lm_head` reaches the base through `embed_tokens`, and seeding
     a bare `lm_head.weight` for it puts an unexpected key in the export.
     """
+    # An NVFP4 <base>.weight_packed is rewritten to <base>.weight, so it backs that module too.
+    shard_keys = set(shard_keys) | {
+        k[: -len(_NVFP4_PACKED_SUFFIX)] + ".weight" for k in shard_keys if k.endswith(_NVFP4_PACKED_SUFFIX)
+    }
     converted = _convert_lora_keys_to_safetensor_format(
         lora_weights, shard_keys, model_class_name = model_class_name,
     )
@@ -6832,6 +7551,10 @@ def check_model_quantization_status(model_name_or_path, token=None, local_ok=Tru
 
         # Case 3: FP8 (merged-16bit dequantizes instead of writing raw FP8).
         elif isinstance(quant_config, dict) and _is_fp8_quant_config(quant_config):
+            return (True, "fp8")
+
+        # NVFP4 compressed-tensors takes the same dequantize-on-merge rewrite, which unpacks weight_packed.
+        elif _is_nvfp4_compressed_tensors_config(quant_config):
             return (True, "fp8")
 
         # Case 1: Fallback to existing logic for bitsandbytes
