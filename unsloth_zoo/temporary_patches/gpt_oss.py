@@ -1255,13 +1255,10 @@ class GptOssExpertsBnb4bit(nn.Module):
                         return _fail(f"mixed blocksizes {blocksize} vs {qs.blocksize}")
                     # The bitsandbytes fallback decodes every expert with the first one's format.
                     elif (
-                        getattr(qs, "quant_type", None) != getattr(fmt, "quant_type", None)
-                        or getattr(qs, "dtype", None) != getattr(fmt, "dtype", None)
+                        qs.quant_type != fmt.quant_type
+                        or qs.dtype != fmt.dtype
                         or bool(getattr(qs, "nested", False)) != bool(getattr(fmt, "nested", False))
-                        or not (
-                            getattr(qs, "code", None) is getattr(fmt, "code", None)
-                            or torch.equal(qs.code, fmt.code)
-                        )
+                        or not (qs.code is fmt.code or torch.equal(qs.code, fmt.code))
                     ):
                         return _fail("mixed quantization formats across experts")
                     b = getattr(lin, "bias", None)
