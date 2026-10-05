@@ -27,6 +27,7 @@ import json
 import math
 import os
 import re
+import shutil
 import tempfile
 from dataclasses import dataclass
 from functools import partial
@@ -35,6 +36,7 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from mlx.utils import tree_flatten
 
 __all__ = [
     "DecisionModel",
@@ -42,6 +44,7 @@ __all__ = [
     "DecisionRequestError",
     "DecisionUnsupportedError",
     "load_decision_model",
+    "save_decision_model",
 ]
 
 
@@ -1223,3 +1226,42 @@ def load_decision_model(folder, compute_dtype = None, *, family = None, subfolde
     if isinstance(compute_dtype, str):
         compute_dtype = getattr(mx, compute_dtype)
     return FAMILIES[family](folder, compute_dtype, base_model, token)
+
+
+def _state_name(name):
+    return name.replace(".in_proj.weight", ".in_proj_weight").replace(".in_proj.bias", ".in_proj_bias")
+
+
+def save_decision_model(model, folder, source, agent_config = None):
+    """Write `model` as a float16 Laya checkpoint in `folder`.
+
+    `source` is the checkpoint `model` was loaded from: it supplies the encoder config, the tokenizer and
+    the tensors the MLX model does not hold. `agent_config` replaces its `rl_agent_config.json`.
+    """
+    folder, source = Path(folder), Path(source)
+    if agent_config is None:
+        agent_config = json.loads((source / "rl_agent_config.json").read_text(encoding = "utf-8"))
+    weights = {
+        name: value
+        for name, value in mx.load(str(source / "model.safetensors")).items()
+        if name.startswith("act_head.") or name == "temperature"
+    }
+    weights.update((_state_name(name), value) for name, value in tree_flatten(model.parameters()))
+    weights = {name: value.astype(mx.float16) for name, value in weights.items()}
+    for name, value in weights.items():
+        if not mx.isfinite(value).all().item():
+            raise ValueError(f"Unsloth: {name} has NaN or values too large for float16, so the model cannot be saved.")
+
+    folder.mkdir(parents = True, exist_ok = True)
+    (folder / "rl_agent_config.json").unlink(missing_ok = True)
+    # Replaced, not written in place: in a Hugging Face cache the file is a link to a blob other revisions share.
+    partial = folder / "model.partial.safetensors"
+    mx.save_safetensors(str(partial), weights)
+    os.replace(partial, folder / "model.safetensors")
+    if folder.resolve() != source.resolve():
+        for name in ("encoder", "tokenizer"):
+            shutil.copytree(source / name, folder / name, dirs_exist_ok = True)
+    # Written last: a folder with rl_agent_config.json is a complete checkpoint.
+    partial = folder / "rl_agent_config.json.tmp"
+    partial.write_text(json.dumps(agent_config, indent = 2), encoding = "utf-8")
+    os.replace(partial, folder / "rl_agent_config.json")

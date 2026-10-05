@@ -36,10 +36,10 @@ if mlx_is_simulated():
     pytest.skip("needs real MLX: mx.fast attention and RoPE", allow_module_level = True)
 
 from mlx.nn import Embedding, LayerNorm, Linear, quantize  # noqa: E402
-from mlx.utils import tree_flatten  # noqa: E402
-from safetensors.torch import save_file  # noqa: E402
+from mlx.utils import tree_flatten, tree_map  # noqa: E402
+from safetensors.torch import load_file, save_file  # noqa: E402
 
-from unsloth_zoo.mlx.decision import _KevModel, _LabelModel, _merge_lora, load_decision_model  # noqa: E402
+from unsloth_zoo.mlx.decision import _KevModel, _LabelModel, _merge_lora, load_decision_model, save_decision_model  # noqa: E402
 from unsloth_zoo.mlx.generate import generation_mode  # noqa: E402
 from unsloth_zoo.mlx.utils import _forward_text_hidden_states  # noqa: E402
 
@@ -97,6 +97,8 @@ def checkpoint(request, tmp_path_factory):
         p.data.add_(0.1 * torch.randn_like(p))
     folder = tmp_path_factory.mktemp("laya")
     (folder / "encoder").mkdir()
+    (folder / "tokenizer").mkdir()
+    (folder / "tokenizer" / "vocab.txt").write_text("a")
     config.save_pretrained(folder / "encoder")
     (folder / "rl_agent_config.json").write_text(json.dumps({"head_layers": request.param}))
     save_file({k: v.contiguous() for k, v in reference.state_dict().items()}, folder / "model.safetensors")
@@ -408,3 +410,52 @@ def test_prompts_of_a_request_run_their_shared_prefix_once(monkeypatch):
     assert [kwargs["position_ids"][:, 0].tolist() for _, kwargs in continued[1:]] == [[list(range(39, len(ids)))] * 3 for ids in prompts]
     for a, b in zip(got, want):
         assert a.shape == b.shape and mx.abs(a.astype(mx.float32) - b.astype(mx.float32)).max().item() <= 2**-4 * mx.abs(b.astype(mx.float32)).max().item()
+
+
+def test_saved_checkpoint_matches_the_torch_state_dict(checkpoint, tmp_path):
+    reference, folder = checkpoint
+    model = load_decision_model(folder)
+    model.update(tree_map(lambda v: v + 0.25, model.parameters()))
+    save_decision_model(model, tmp_path, folder, {"head_layers": len(model.head.layers), "fine_tuned": True})
+
+    saved = load_file(tmp_path / "model.safetensors")
+    assert {v.dtype for v in saved.values()} == {torch.float16}
+    # The MLX model holds neither the act head nor the temperature buffer; they are carried over.
+    expected = {
+        k: (v if k.startswith("act_head.") or k == "temperature" else v + 0.25).half()
+        for k, v in reference.state_dict().items()
+    }
+    assert saved.keys() == expected.keys()
+    for name, value in expected.items():
+        assert torch.equal(saved[name], value), name
+    assert json.loads((tmp_path / "rl_agent_config.json").read_text())["fine_tuned"] is True
+    assert (tmp_path / "encoder" / "config.json").is_file() and (tmp_path / "tokenizer" / "vocab.txt").is_file()
+    np.testing.assert_array_equal(load_decision_model(tmp_path).logits(_batch()), _half(model).logits(_batch()))
+
+
+def _half(model):
+    # What a float16 round trip of the weights leaves, back in float32.
+    model.update(tree_map(lambda v: v.astype(mx.float16).astype(mx.float32), model.parameters()))
+    return model
+
+
+def test_save_replaces_a_linked_weights_file(checkpoint, tmp_path):
+    _, folder = checkpoint
+    shutil.copytree(folder, tmp_path / "snapshot")
+    blob = tmp_path / "blob"
+    (tmp_path / "snapshot" / "model.safetensors").rename(blob)
+    (tmp_path / "snapshot" / "model.safetensors").symlink_to(blob)
+    before = blob.read_bytes()
+    save_decision_model(load_decision_model(tmp_path / "snapshot"), tmp_path / "snapshot", tmp_path / "snapshot")
+    assert blob.read_bytes() == before
+    assert not (tmp_path / "snapshot" / "model.safetensors").is_symlink()
+    assert sorted(p.name for p in (tmp_path / "snapshot").iterdir()) == sorted(p.name for p in folder.iterdir())
+
+
+@pytest.mark.parametrize("bad", [1e6, float("nan")])
+def test_save_refuses_weights_float16_cannot_hold(checkpoint, tmp_path, bad):
+    model = load_decision_model(checkpoint[1])
+    model.type_emb.weight = model.type_emb.weight * bad
+    with pytest.raises(ValueError, match = "type_emb.weight"):
+        save_decision_model(model, tmp_path, checkpoint[1])
+    assert not (tmp_path / "rl_agent_config.json").exists()
