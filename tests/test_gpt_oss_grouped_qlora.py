@@ -372,6 +372,43 @@ def test_in_place_quant_edit_is_not_stale(kernel, edit, monkeypatch):
 
 
 @needs_grouped_mm
+@pytest.mark.parametrize("forward", ["class", "module"])
+def test_checkpoint_control_flow_is_not_swallowed(forward, monkeypatch):
+    # The compiled cache emits the class forward standalone, so both entry points must re-raise.
+    from torch.utils import checkpoint as ckpt
+    monkeypatch.delenv("UNSLOTH_GPTOSS_GROUPED", raising = False)
+    monkeypatch.delenv("UNSLOTH_COMPILE_DISABLE", raising = False)
+    ex = _Experts(True).train()
+    if forward == "class":
+        # The module later sets GptOssExpertsBnb4bit.forward = torch_native_forward; the class
+        # body's own forward is what the compiled cache emits, so load it from the source.
+        import ast, inspect
+        from unsloth_zoo.temporary_patches import gpt_oss
+        src = inspect.getsource(gpt_oss)
+        cls = next(n for n in ast.parse(src).body if isinstance(n, ast.ClassDef) and n.name == "GptOssExpertsBnb4bit")
+        fn = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "forward")
+        ns = dict(vars(gpt_oss))
+        exec(compile(ast.Module([fn], []), gpt_oss.__file__, "exec"), ns)
+        ex.forward = ns["forward"].__get__(ex)
+    T = 64
+    x = torch.randn(1, T, H, device = "cuda", dtype = DT)
+    idx, w = _routing(T)
+
+    def stop(*args, **kwargs):
+        raise ckpt._StopRecomputationError()
+
+    monkeypatch.setattr(ex, "_forward_grouped_bnb4bit", stop)
+    with pytest.raises(ckpt._StopRecomputationError):
+        ex(x, idx, w)
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("grouped path failed")
+
+    monkeypatch.setattr(ex, "_forward_grouped_bnb4bit", broken)
+    assert ex(x, idx, w).shape[-1] == H   # other errors fall back to the per-expert loop
+
+
+@needs_grouped_mm
 def test_mixed_quant_formats_keep_loop(monkeypatch):
     ex = _Experts(True).train()
     fp4 = bnb.nn.Linear4bit(I, H, bias = True, compute_dtype = DT, quant_type = "fp4", quant_storage = torch.uint8)

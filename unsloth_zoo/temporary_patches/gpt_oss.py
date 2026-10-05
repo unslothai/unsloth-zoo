@@ -1321,7 +1321,15 @@ class GptOssExpertsBnb4bit(nn.Module):
                 )
                 if grouped is not None:
                     return grouped
-            except Exception:
+            except Exception as exc:
+                # Checkpoint early-stop is control flow; an OOM should surface, not retry the loop.
+                from torch.utils import checkpoint as _ckpt
+                control = tuple(
+                    c for c in (getattr(_ckpt, "_StopRecomputationError", None), getattr(_ckpt, "CheckpointError", None))
+                    if c is not None
+                )
+                if isinstance(exc, control) or isinstance(exc, torch.OutOfMemoryError):
+                    raise
                 import os as _os
                 if _os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
                     import traceback; traceback.print_exc()
