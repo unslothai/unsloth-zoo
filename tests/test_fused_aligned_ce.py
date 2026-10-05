@@ -276,12 +276,10 @@ def test_fused_matches_original(name, monkeypatch):
     for g, r in zip(out[3], ref[3]):
         torch.testing.assert_close(g, r, rtol = 1e-4, atol = 1e-6)
 
-    # Generation path: the original logits, bias included.
     _, logits_ref, _, _ = _run(original, model, name, None)
     _, logits_new, _, _ = _run(fused, model, name, None)
     torch.testing.assert_close(logits_new, logits_ref)
 
-    # UNSLOTH_RETURN_LOGITS=1 replays the original statements.
     monkeypatch.setenv("UNSLOTH_RETURN_LOGITS", "1")
     out = _run(fused, model, name, labels)
     torch.testing.assert_close(out[1], ref[1])
@@ -318,8 +316,7 @@ def test_dropped_bias_is_detected(name, monkeypatch):
 
 @pytest.mark.parametrize("name", BIASED)
 def test_bias_promotion_under_bf16_autocast(name, monkeypatch):
-    # Stock adds the fp32 buffer to bf16 logits (-> fp32); the kernel must do the same, not fold
-    # the bias into the bf16 matmul.
+    # Stock adds the fp32 buffer to bf16 logits (-> fp32); folding it into the bf16 matmul differs.
     monkeypatch.delenv("UNSLOTH_RETURN_LOGITS", raising = False)
     src = FIXTURES[name][0]
     original, fused = _compile(src), _compile(rewrite_forward_source_spliced(src)[0])
