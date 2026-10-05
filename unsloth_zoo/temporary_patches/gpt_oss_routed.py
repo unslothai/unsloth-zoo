@@ -428,6 +428,8 @@ def _lora(projs):
             if (
                 name not in proj.lora_A or proj.scaling[name] != first.scaling[name]
                 or proj.use_dora.get(name, False) or getattr(proj, "lora_variant", {}).get(name) is not None
+                # lora_bias=True: the kernels add only B @ A @ x, not lora_B's bias.
+                or getattr(proj.lora_B[name], "bias", None) is not None
             ):
                 return False
         cache = {"name": name, "first": first.lora_A[name].weight, "versions": None,

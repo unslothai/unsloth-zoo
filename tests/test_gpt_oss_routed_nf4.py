@@ -85,10 +85,10 @@ def test_kernel_matches_bnb_dequant(nested):
         torch.testing.assert_close(inter[p], (up + 1) * gate * torch.sigmoid(1.702 * gate), rtol = 1e-5, atol = 1e-5)
 
 
-def _lora_wrap(ex):
+def _lora_wrap(ex, **kwargs):
     peft = pytest.importorskip("peft")
     cfg = peft.LoraConfig(r = 4, lora_alpha = 8, lora_dropout = 0.0,
-                          target_modules = r".*(gate_up_projs|down_projs)\.\d+")
+                          target_modules = r".*(gate_up_projs|down_projs)\.\d+", **kwargs)
     model = peft.inject_adapter_in_model(cfg, ex)
     g = torch.Generator().manual_seed(7)
     for name, p in model.named_parameters():
@@ -226,3 +226,15 @@ def test_mixed_adapter_batch_is_left_to_peft():
         finally:
             for h in handles:
                 h.remove()
+
+
+def test_lora_bias_is_left_to_peft():
+    # lora_bias=True adds lora_B's bias, which the routed kernels do not apply.
+    ex = _lora_wrap(_Experts(True), lora_bias = True).eval()
+    for name, p in ex.named_parameters():
+        if "lora_B" in name and name.endswith("bias"):
+            p.data.fill_(0.5)
+    x = torch.randn(1, 1, H, device = "cuda", dtype = torch.float32)
+    idx, w = _routing(1)
+    with torch.no_grad():
+        assert routed_experts_forward(ex, x, idx, w) is None
