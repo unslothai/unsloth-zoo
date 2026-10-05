@@ -2882,6 +2882,8 @@ def _nax_qmm_classes(*cache_key):
         if routed is None:
             routed = _nax_int8_prefill_dense(self, x, bindings)
         if routed is None:
+            routed = _dense_prefill_in_scope(self, x)
+        if routed is None:
             return nn.QuantizedLinear.__call__(self, x)
         return routed + self["bias"] if "bias" in self else routed
 
@@ -3139,3 +3141,132 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
                 for name in ("_unsloth_nax_qmm_scopes", "_unsloth_nax_int8_prefill_rows", "_unsloth_nax_int8_prefill"):
                     module.__dict__.pop(name, None)
                 module.pop("_unsloth_nax_qmm_rows", None)   # a tuple is stored in the module mapping
+
+
+_DENSE_QMM_CONTRACT = {"mlx.nn.layers.quantized": {"QuantizedLinear.__call__": "ca5cafb6d038d955"}}
+_DENSE_QMM_LOCK = RLock()
+_DENSE_QMM_VERIFIED = {}
+_DENSE_QMM_MIN_ROWS = 1024
+# MLX's quantized and dense matmuls each split the sum over K for small outputs, by different rules,
+# and then round differently; at or below this many 16x16 output tiles the comparison would mostly fail.
+_DENSE_QMM_MIN_TILES = 4096
+# The dequantized weight is a transient the size of the float layer; a vocabulary head would be gigabytes.
+_DENSE_QMM_MAX_WEIGHTS = 1 << 28
+
+
+def _dense_prefill_qmm(module, x, bindings):
+    """`x` times the dequantized weight for a prefill-sized call, or None when it takes the native call.
+
+    MLX's quantized matmul dequantizes inside every tile; dequantizing once is the same arithmetic.
+    Each (shape, quantization, dtypes) is compared bit for bit on its first use; the row count is part of
+    the shape because MLX picks its kernels by it.
+    """
+    if not isinstance(x, mx.array) or x.ndim < 2 or x.dtype not in (mx.bfloat16, mx.float16) or not x.shape[-1]:
+        return None
+    w, scales, biases = module.get("weight"), module.get("scales"), module.get("biases")
+    if not isinstance(w, mx.array) or w.ndim != 2 or not isinstance(scales, mx.array):
+        return None
+    N, K, M = w.shape[0], x.shape[-1], x.shape[-2]
+    if x.size != M * K:  # MLX reads the row count of a batch from its memory layout
+        return None
+    if (M < _DENSE_QMM_MIN_ROWS or -(-M // 16) * -(-N // 16) <= _DENSE_QMM_MIN_TILES
+            or N * K > _DENSE_QMM_MAX_WEIGHTS or module.training or not _bindings_intact(bindings)):
+        return None
+    group_size, bits, mode = module.group_size, module.bits, module.mode
+    family = (N, K, bits, group_size, mode, x.dtype, w.dtype, scales.dtype, getattr(biases, "dtype", None))
+    key = (x.shape, *family)
+    verified = _DENSE_QMM_VERIFIED.get(key)
+    if verified is False or family in _DENSE_QMM_VERIFIED:   # one differing row count retires the projection shape
+        return None
+    weight = mx.dequantize(w, scales, biases, group_size = group_size, bits = bits, mode = mode).astype(x.dtype)
+    dense = x @ weight.T
+    if verified is None:
+        native = mx.quantized_matmul(x, w, scales = scales, biases = biases, transpose = True,
+                                     group_size = group_size, bits = bits, mode = mode)
+        try:
+            verified = native.dtype == dense.dtype and bool(
+                mx.array_equal(native.view(mx.uint16), dense.view(mx.uint16)).item())
+        except (RuntimeError, ValueError):
+            return None  # inside a function transformation, which cannot evaluate; checked later
+        _DENSE_QMM_VERIFIED[key] = verified
+        if not verified:
+            _DENSE_QMM_VERIFIED[family] = False
+            logger.warning("the dense prefill matmul differs from the quantized one for N=%d K=%d %d-bit "
+                           "%s group %d %s at %d rows; the native call stays in use",
+                           N, K, bits, mode, group_size, x.dtype, M)
+    return dense if verified else None
+
+
+@functools.cache
+def _dense_qmm_bindings(*cache_key):
+    return _resolved_bindings(_DENSE_QMM_CONTRACT)
+
+
+def _dense_prefill_in_scope(module, x):
+    """The dense result for a NAX-routed linear inside a `dense_prefill_linear` scope, else None."""
+    if not module.__dict__.get("_unsloth_dense_qmm_scopes"):
+        return None
+    bindings = _dense_qmm_bindings(nn.QuantizedLinear.__call__)
+    return None if bindings is None else _dense_prefill_qmm(module, x, bindings)
+
+
+@functools.cache
+def _dense_qmm_class(*cache_key):
+    bindings = _dense_qmm_bindings(*cache_key)
+    if bindings is None:
+        return None
+
+    def linear(self, x):
+        routed = _dense_prefill_qmm(self, x, bindings)
+        if routed is None:
+            return nn.QuantizedLinear.__call__(self, x)
+        return routed + self["bias"] if "bias" in self else routed
+
+    return type("_DensePrefillQuantizedLinear", (nn.QuantizedLinear,), {"__call__": linear})
+
+
+@contextmanager
+def dense_prefill_linear(model, *, _modules = None):
+    """Run prefill-sized quantized projections as one dequantize and a dense matmul.
+
+    Calls of 1024 or more rows on a large enough output dequantize the weight once and multiply
+    densely, bit-identical to the quantized matmul; smaller calls,
+    training, and any shape that fails its first-use comparison keep the native call. A linear the
+    NAX scope already routes keeps its small-row and int8 routes and takes this one for the rest.
+    `UNSLOTH_MLX_DENSE_PREFILL=0` turns the route off.
+    """
+    changed = []
+    try:
+        with _DENSE_QMM_LOCK:
+            fused = None
+            if (os.environ.get("UNSLOTH_MLX_DENSE_PREFILL", "1") != "0"
+                    and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)):
+                fused = _dense_qmm_class(nn.QuantizedLinear.__call__)
+            if fused is not None:
+                seen = set()
+                for _, module in _fusion_modules(model, _modules):
+                    if id(module) in seen:   # named_modules() yields a shared module once per path
+                        continue
+                    seen.add(id(module))
+                    if (type(module) not in (fused, nn.QuantizedLinear)
+                            and getattr(type(module), "_unsloth_nax_qmm_native", None) is not nn.QuantizedLinear):
+                        continue
+                    if module.__dict__.get("_unsloth_dense_qmm_scopes"):
+                        module._unsloth_dense_qmm_scopes += 1
+                    elif module.training or type(module) is fused:
+                        continue
+                    else:
+                        if type(module) is nn.QuantizedLinear:
+                            module.__class__ = fused
+                        module._unsloth_dense_qmm_scopes = 1
+                    changed.append((module, fused))
+        yield model
+    finally:
+        with _DENSE_QMM_LOCK:
+            for module, fused in reversed(changed):
+                module._unsloth_dense_qmm_scopes -= 1
+                if not module._unsloth_dense_qmm_scopes:
+                    if type(module) is fused:   # a NAX-routed linear keeps the NAX scope's class
+                        module.__class__ = nn.QuantizedLinear
+                    module.__dict__.pop("_unsloth_dense_qmm_scopes", None)
+
