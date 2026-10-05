@@ -45,6 +45,19 @@ from unsloth_zoo.temporary_patches.moe_utils import _check_torch_grouped_mm_supp
 DT = torch.bfloat16
 E, TOP_K, H, I = 8, 4, 256, 192
 
+# The stacked Triton dequant is CUDA-only (HIP has no libdevice mul_rn); elsewhere the grouped
+# path dequantizes through bitsandbytes, so the counters below expect that instead.
+STACKED = gq.stacked_dequant_available(torch.device("cuda", torch.cuda.current_device()))
+needs_stacked = pytest.mark.skipif(not STACKED, reason = "stacked NF4 dequant kernel is CUDA-only")
+
+
+def _assert_dequant_path(calls, n):
+    if STACKED:
+        assert calls["stacked_dequant"] >= n and calls["bnb_fallback_dequant"] == 0
+    else:
+        assert calls["stacked_dequant"] == 0 and calls["bnb_fallback_dequant"] >= n
+
+
 needs_grouped_mm = pytest.mark.skipif(
     not torch.cuda.is_bf16_supported() or not _check_torch_grouped_mm_supported(),
     reason = "torch._grouped_mm / bf16 unavailable",
@@ -93,6 +106,7 @@ def _lora_wrap(ex, r = 16, seed = 7, **kwargs):
     return model
 
 
+@needs_stacked
 @pytest.mark.parametrize("nested", [True, False])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("blocksize", [64, 128])
@@ -119,6 +133,7 @@ def test_stacked_dequant_bit_exact(nested, dtype, blocksize, subnormal):
         assert torch.equal(out[e], ref), f"expert {e}: {(out[e].float() - ref.float()).abs().max()}"
 
 
+@needs_stacked
 def test_stacked_dequant_negative_control():
     # A scale off by one bf16 ulp must be caught by the torch.equal comparison above.
     projs = torch.nn.ModuleList([_linear4bit(H, 2 * I, True, e) for e in range(E)])
@@ -160,7 +175,7 @@ def test_grouped_lora_matches_per_expert_loop(r, nested, x_dtype, monkeypatch):
     out, g, calls = _run(ex, x, idx, w, True, monkeypatch)
     assert ref_calls["forward"] == 0
     assert calls["forward"] == 1 and calls["forward_lora"] == 1
-    assert calls["stacked_dequant"] >= 4 and calls["bnb_fallback_dequant"] == 0   # fwd 2 + bwd recompute 2
+    _assert_dequant_path(calls, 4)   # fwd 2 + bwd recompute 2
     assert out.dtype == ref_out.dtype
     assert _rel(out, ref_out) < 2e-2
     lora_names = [n for n in ref_g if "lora_" in n]
@@ -254,11 +269,12 @@ def test_lora_free_grouped_uses_stacked_dequant(monkeypatch):
     ref_out, _, _ = _run(ex, x, idx, w, False, monkeypatch)
     out, g, calls = _run(ex, x, idx, w, True, monkeypatch)
     assert calls["forward"] == 1 and calls["forward_lora"] == 0
-    assert calls["stacked_dequant"] >= 2 and calls["bnb_fallback_dequant"] == 0
+    _assert_dequant_path(calls, 2)
     assert _rel(out, ref_out) < 2e-2
 
 
 @needs_grouped_mm
+@needs_stacked   # without the kernel both arms are bnb and the comparison is vacuous
 def test_kill_switch_triton_falls_back_to_bnb(monkeypatch):
     ex = _lora_wrap(_Experts(True)).train()
     T = 64
