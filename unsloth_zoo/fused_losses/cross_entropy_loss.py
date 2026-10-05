@@ -108,7 +108,9 @@ def compute_fused_ce_loss(
     # Extra vocab bias added after the head (Bart `final_logits_bias`), with the stock dtype promotion.
     logits_bias = kwargs.get("logits_bias", None)
     if logits_bias is not None:
-        logits = logits + logits_bias.to(device = device)
+        # Promote before the add: torch 2.7 inductor folds a bare add into a mixed dtype addmm under autocast.
+        logits_bias = logits_bias.to(device = device)
+        logits = logits.to(torch.promote_types(logits.dtype, logits_bias.dtype)) + logits_bias
     vocab_size = lm_head_weight.shape[0]
 
     # Apply softcapping and other functions
