@@ -69,11 +69,15 @@ def _load(tmp_path, rows):
         [{"file_name": "ok.png"}, {"file_name": "file://../../secret.txt"}],
         [{"file_names": ["ok.png"]}, {"file_names": ["ok.png", "../../secret.txt"]}],
         [{"file_name": "ok.png", "image_file_name": "ok.png"}, {"file_name": "ok.png", "image_file_name": "../../secret.txt"}],
+        [{"file_name": "ok.png"}, {"file_name": "sub\\..\\..\\..\\secret.txt"}],
+        [{"nested": {"file_name": "ok.png"}}, {"nested": {"file_name": "../../secret.txt"}}],
+        [{"items": [{"file_name": "ok.png"}]}, {"items": [{"file_name": "../../secret.txt"}]}],
     ],
-    ids=["relative", "absolute", "scheme", "file_names_list", "prefixed_key"],
+    ids=["relative", "absolute", "scheme", "file_names_list", "prefixed_key", "backslash", "nested", "nested_list"],
 )
 def test_escaping_file_name_is_refused(tmp_path, rows):
-    rows = json.loads(json.dumps(rows).replace("ABSOLUTE", str((tmp_path / "secret.txt").resolve())))
+    secret = str((tmp_path / "secret.txt").resolve())
+    rows = [{k: (secret if v == "ABSOLUTE" else v) for k, v in row.items()} for row in rows]
     with pytest.raises(ValueError, match="Invalid metadata"):
         ds = _load(tmp_path, rows)
         ds.save_to_disk(str(tmp_path / "saved"))
@@ -110,6 +114,8 @@ def test_patch_is_idempotent():
         ("..", True),
         ("../x.png", True),
         ("sub/../../x.png", True),
+        ("sub\\..\\..\\x.png", True),
+        ("\\x.png", True),
         ("..\\..\\x.png", True),
         ("/etc/passwd", True),
         ("file://x", True),

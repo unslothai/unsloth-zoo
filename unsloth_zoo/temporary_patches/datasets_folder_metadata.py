@@ -18,11 +18,12 @@
 # metadata `file_name` to the dataset directory unchecked, so "../../x" or an absolute
 # path makes imagefolder/audiofolder read any local file, and save_to_disk/push_to_hub
 # then embed its bytes. Same refusal as the upstream fix (huggingface/datasets f989ef9),
-# applied to the metadata tables before any path is built.
+# applied to the metadata tables before any path is built. Installed on 5.0.1+ too: the
+# upstream check runs before "\" becomes "/", so "sub\..\..\x" still escapes there.
 
 import functools
-import inspect
 import os
+import posixpath
 
 from .common import TEMPORARY_PATCHES
 
@@ -36,12 +37,13 @@ _CANDIDATE_REGEX = r"://|\.\.|^[/\\]|^[A-Za-z]:"
 def _file_name_escapes(value):
     if "://" in value:
         return True
-    relpath = os.path.normpath(value).replace("\\", "/")
+    # Backslashes first: datasets turns them into "/" before joining, so a POSIX normpath
+    # of the raw value would miss "sub\..\..\x" written with backslash separators.
+    relpath = posixpath.normpath(value.replace("\\", "/"))
     # Windows: Python 3.13 isabs() no longer counts "/x", and "C:x" is drive-relative,
     # yet os.path.join(dir, either) leaves dir, so check the root and drive directly.
     return (
         os.path.isabs(value)
-        or os.path.isabs(relpath)
         or relpath.startswith("/")
         or bool(os.path.splitdrive(value)[0])
         or relpath == ".."
@@ -49,53 +51,48 @@ def _file_name_escapes(value):
     )
 
 
-def _file_name_columns(table):
+def _file_name_arrays(name, array):
+    # Folder builders resolve these keys at any depth (structs, lists of structs), so walk
+    # the whole type, not just the top-level columns.
     import pyarrow as pa
 
     def is_text(t):
         return pa.types.is_string(t) or pa.types.is_large_string(t)
 
+    kind = array.type
+    if pa.types.is_struct(kind):
+        for field, child in zip(kind, array.flatten()):
+            yield from _file_name_arrays(field.name, child)
+    elif pa.types.is_list(kind) or pa.types.is_large_list(kind):
+        if not is_text(kind.value_type):
+            yield from _file_name_arrays(name, array.flatten())
+        elif name == "file_names" or name.endswith("_file_names"):
+            yield name, array.flatten()
+    elif is_text(kind) and (name == "file_name" or name.endswith("_file_name")):
+        yield name, array
+
+
+def _file_name_columns(table):
     for field in table.schema:
-        name = field.name
-        if (name == "file_name" or name.endswith("_file_name")) and is_text(field.type):
-            yield name, table.column(name).chunks
-        elif (name == "file_names" or name.endswith("_file_names")) and (
-            (pa.types.is_list(field.type) or pa.types.is_large_list(field.type))
-            and is_text(field.type.value_type)
-        ):
-            yield name, [chunk.flatten() for chunk in table.column(name).chunks]
+        for chunk in table.column(field.name).chunks:
+            yield from _file_name_arrays(field.name, chunk)
 
 
 def _check_metadata_table(table):
     import pyarrow.compute as pc
 
-    for name, chunks in _file_name_columns(table):
-        for chunk in chunks:
-            try:
-                values = chunk.filter(pc.match_substring_regex(chunk, _CANDIDATE_REGEX)).to_pylist()
-            except Exception:
-                values = chunk.to_pylist()
-            for value in values:
-                if value is not None and _file_name_escapes(value):
-                    raise ValueError(
-                        f"Invalid metadata {name} '{value}': `{name}` must be a relative path "
-                        f"pointing inside the directory containing the metadata file. Absolute paths, "
-                        f"URL schemes and parent-directory ('..') traversal are not allowed."
-                    )
-
-
-def _datasets_has_upstream_fix(module):
-    try:
-        return "Invalid metadata file_name" in inspect.getsource(module)
-    except Exception:
-        pass
-    try:
-        import datasets
-        from packaging.version import Version
-
-        return Version(datasets.__version__) >= Version("5.0.1")
-    except Exception:
-        return False
+    for name, chunk in _file_name_columns(table):
+        try:
+            values = chunk.filter(pc.match_substring_regex(chunk, _CANDIDATE_REGEX)).to_pylist()
+        except Exception:
+            values = chunk.to_pylist()
+        for value in values:
+            if value is not None and _file_name_escapes(value):
+                raise ValueError(
+                    f"Invalid metadata {name} '{value}': `{name}` must be a relative path "
+                    f"pointing inside the directory containing the metadata file. Absolute paths, "
+                    f"URL schemes and parent-directory ('..') traversal are not allowed."
+                )
 
 
 def patch_datasets_folder_metadata_file_name():
@@ -106,8 +103,6 @@ def patch_datasets_folder_metadata_file_name():
     builder = getattr(folder_based_builder, "FolderBasedBuilder", None)
     read_metadata = getattr(builder, "_read_metadata", None)
     if read_metadata is None or getattr(read_metadata, _GUARD_FLAG, False):
-        return
-    if _datasets_has_upstream_fix(folder_based_builder):
         return
 
     @functools.wraps(read_metadata)
