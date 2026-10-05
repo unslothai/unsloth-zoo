@@ -228,6 +228,11 @@ def _weights(experts):
     return tuple(getattr(p, "base_layer", p).weight for projs in (experts.gate_up_projs, experts.down_projs) for p in projs)
 
 
+def _decline_key(experts):
+    weights = _weights(experts)
+    return tuple(map(id, weights)), tuple(_ptrs(weights)), tuple(id(w.quant_state) for w in weights)
+
+
 def _compiled_state(experts):
     """The tables an eager call built, or None when an expert's weight was swapped since."""
     state = getattr(experts, "_unsloth_routed_nf4", None)
@@ -256,6 +261,10 @@ def prepare_routed_experts(experts):
     try:
         if isinstance(state, dict) and _snapshot_current(experts, state["snapshot"]):
             return state
+        # Declined before (a CPU or unsupported layout): stays declined only while the weights are
+        # the same. Kept as ids and addresses, not references, so a moved model frees its old copy.
+        if isinstance(state, tuple) and state == _decline_key(experts):
+            return None
         snap = _snapshot(experts)
     except Exception:
         # No longer an all-NF4 layout (e.g. an expert was swapped): drop any old tables.
@@ -263,12 +272,14 @@ def prepare_routed_experts(experts):
             experts._unsloth_routed_nf4 = None
         return None
     device = _base_linear4bit(gate_up_projs[0]).weight.device
-    if triton is None or device.type != "cuda":
+    if triton is None:
         experts._unsloth_routed_nf4 = False
         return None
-    gate_up, down = _build_table(gate_up_projs, device), _build_table(down_projs, device)
+    gate_up = down = None
+    if device.type == "cuda":
+        gate_up, down = _build_table(gate_up_projs, device), _build_table(down_projs, device)
     if gate_up is None or down is None or down["K"] * 2 != gate_up["N"] or gate_up["K"] != down["N"]:
-        experts._unsloth_routed_nf4 = False
+        experts._unsloth_routed_nf4 = _decline_key(experts)
         return None
     state = {"gate_up": gate_up, "down": down, "key": tuple(snap["ptrs"]), "snapshot": snap,
              "weights": tuple(snap["weights"])}

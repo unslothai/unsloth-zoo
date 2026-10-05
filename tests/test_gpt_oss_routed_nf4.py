@@ -274,6 +274,20 @@ def test_replaced_middle_expert_adapter_is_not_stale(which, compiled):
     torch.testing.assert_close(after.double(), ref, rtol = 1e-4, atol = 1e-4)
 
 
+def test_a_module_declined_on_cpu_routes_after_moving_to_cuda():
+    ex = _Experts(True).eval().cpu()
+    assert prepare_routed_experts(ex) is None
+    assert prepare_routed_experts(ex) is None
+    ex.cuda()
+    state = prepare_routed_experts(ex)
+    assert isinstance(state, dict)
+    x = torch.randn(1, 2, H, device = "cuda", dtype = torch.float32)
+    idx, w = _routing(2, seed = 8)
+    with torch.no_grad():
+        got = routed_experts_forward(ex, x, idx, w)
+    torch.testing.assert_close(got.double(), _reference(ex, x, idx, w), rtol = 1e-4, atol = 1e-4)
+
+
 def test_mixed_adapter_batch_is_left_to_peft():
     # PEFT's adapter_names pre-hook marks a mixed-adapter batch the routed kernels cannot honour.
     from functools import partial

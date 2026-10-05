@@ -939,19 +939,22 @@ def prepare_stacked_nf4(experts, hidden_dim = None):
     """Tables for an experts module holding one stacked NF4 Params4bit per projection,
     built (or revalidated against the buffers' addresses) eagerly; None when unsupported."""
     state = experts.__dict__.get("_unsloth_routed_moe")
-    if state is False:
-        return None
     try:
         key = _stacked_key(experts)
     except Exception:
         return None
-    if state is not None and state["key"] == key and _same_semantics(state["sem"], _semantics(experts)):
+    sem = _semantics(experts)
+    if isinstance(state, tuple):
+        # Declined before: stays declined only while the weights and semantics are unchanged.
+        if state[0] == (key, hidden_dim) and _same_semantics(state[1], sem):
+            return None
+    elif state is not None and state["key"] == key and _same_semantics(state["sem"], sem):
         return state
     state = _build_stacked_nf4(experts, hidden_dim)
     if state is None:
-        experts.__dict__["_unsloth_routed_moe"] = False
+        experts.__dict__["_unsloth_routed_moe"] = ((key, hidden_dim), sem)
         return None
-    state["key"], state["sem"] = key, _semantics(experts)
+    state["key"], state["sem"] = key, sem
     state["held"] = [_stacked_sources(p.quant_state) for p in (experts.gate_up_proj, experts.down_proj)]
     experts.__dict__["_unsloth_routed_moe"] = state
     return state

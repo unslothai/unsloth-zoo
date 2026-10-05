@@ -533,6 +533,15 @@ def test_strided_bf16_bias_is_not_misread():
     assert got is None or torch.allclose(got.double(), ref, rtol = 2e-2, atol = 2e-2)
 
 
+def test_a_declined_module_is_rechecked_once_it_changes():
+    ex = _make("silu")
+    ex.act_fn = nn.Tanh()
+    assert MR.prepare_stacked_nf4(ex, H) is None
+    assert MR.prepare_stacked_nf4(ex, H) is None
+    ex.act_fn = nn.SiLU()
+    assert MR.prepare_stacked_nf4(ex, H) is not None
+
+
 @pytest.mark.parametrize("use_lora", [False, True])
 @pytest.mark.parametrize("mode", ["1", "grouped", "bf16"])
 def test_fullgraph_compile_and_cuda_graph_replay(use_lora, mode, monkeypatch):
