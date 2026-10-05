@@ -302,8 +302,21 @@ def _fused_moe_gate_up_class(original_class, projection_type, scatter_unsort, de
                 x = scatter_unsort(x, inv_order, indices.shape)
             return x.squeeze(-2)
 
+        def sorted_experts(self, x, indices):
+            """Expert outputs in expert-sorted route order and the inverse order, or None for the native call."""
+            packed = self._unsloth_moe_gate_up
+            if (self.training or not packed.matches(self) or not _bindings_intact(bindings)
+                    or x.ndim != 3 or x.shape[1] <= max(decode_block, 1) or indices.size < 64):
+                return None
+            order = mx.argsort(indices.flatten())
+            x, idx, token_rows = mx.expand_dims(x, (-2, -3)).flatten(0, -3), indices.flatten()[order], order // indices.shape[-1]
+            x_gate, x_up = packed.project(x, idx, True, token_rows)
+            inv_order = mx.argsort(order)
+            return self.down_proj(self.activation(x_up, x_gate), idx, sorted_indices = True), inv_order
+
         _MOE_GATE_UP_CLASSES[key] = type(
-            f"_FusedMoEGateUp{original_class.__name__}", (original_class,), {"__call__": fused_call}
+            f"_FusedMoEGateUp{original_class.__name__}", (original_class,),
+            {"__call__": fused_call, "sorted_experts": sorted_experts},
         )
     return _MOE_GATE_UP_CLASSES[key]
 
@@ -2395,6 +2408,73 @@ def _moe_routed_experts(block):
     return _RoutedExperts(mlp, base, projection_type, native.SwiGLU, decode_block, bindings + routed_bindings)
 
 
+# MLX multiplies and sums in the array dtype, in route order; the kernel rounds at the same two places.
+# Single precision is left native: its sum does not round like a sequential one.
+_MOE_COMBINE_DTYPES = (mx.bfloat16, mx.float16)
+_MOE_COMBINE_MAX_ELEMENTS = 1 << 32
+_MOE_COMBINE_SOURCE = """
+    uint token = thread_position_in_grid.y;
+    uint d = thread_position_in_grid.x;
+    T acc = T(0);
+    for (uint k = 0; k < K; ++k) {
+        uint route = token * K + k;
+        acc = T(float(acc) + float(T(float(y[rows[route] * D + d]) * float(scores[route]))));
+    }
+    out[token * D + d] = acc;
+"""
+
+
+@functools.cache
+def _moe_combine_kernel():
+    return mx.fast.metal_kernel(name = "unsloth_moe_combine", input_names = ["y", "rows", "scores"],
+                                output_names = ["out"], source = _MOE_COMBINE_SOURCE)
+
+
+def _run_moe_combine(y, inv_order, scores):
+    top_k, width = scores.shape[-1], y.shape[-1]
+    tokens = scores.size // top_k
+    return _moe_combine_kernel()(
+        inputs = [y, inv_order.astype(mx.uint32), scores],
+        template = [("T", y.dtype), ("K", top_k), ("D", width)],
+        grid = (width, tokens, 1), threadgroup = (min(width, 64), 1, 1),
+        output_shapes = [(*scores.shape[:-1], width)], output_dtypes = [y.dtype],
+    )[0]
+
+
+@functools.cache
+def _moe_combine_verified(dtype, top_k, width):
+    for tokens in (1, 67):
+        routes = tokens * top_k
+        y = (mx.random.normal((routes, 1, width), key = mx.random.key(tokens)) * 3).astype(dtype)
+        y[..., 0] = -0.0  # a single route keeps the sign a sum from zero drops
+        scores = mx.softmax(mx.random.normal((1, tokens, top_k), key = mx.random.key(tokens + 1)) * 2,
+                            axis = -1).astype(dtype)
+        inv_order = mx.random.permutation(routes, key = mx.random.key(tokens + 2)).astype(mx.uint32)
+        native = (y[inv_order].reshape(1, tokens, top_k, width) * scores[..., None]).sum(axis = -2)
+        fused = _run_moe_combine(y, inv_order, scores)
+        if native.dtype != fused.dtype or not mx.array_equal(native.view(mx.uint16), fused.view(mx.uint16)):
+            logger.warning("the fused MoE combine does not reproduce this MLX build's native rounding "
+                           "for %s top-%d; the native chain stays in use", dtype, top_k)
+            return False
+    return True
+
+
+def _fused_moe_combine(switch_mlp, x, inds, scores):
+    """The routed experts' weighted sum read from their sorted rows, or None for the native chain."""
+    if (not callable(getattr(type(switch_mlp), "sorted_experts", None))
+            or scores.dtype not in _MOE_COMBINE_DTYPES or scores.shape != inds.shape):
+        return None
+    routed = switch_mlp.sorted_experts(x, inds)
+    if routed is None:
+        return None
+    y, inv_order = routed
+    # The kernel indexes in 32 bits; MLX's own ops switch to 64-bit indexing past that.
+    if (y.size > _MOE_COMBINE_MAX_ELEMENTS or y.dtype != scores.dtype
+            or not _moe_combine_verified(y.dtype, scores.shape[-1], y.shape[-1])):
+        return None
+    return _run_moe_combine(y, inv_order, scores)
+
+
 def _qwen3_5_moe_call(native, scaled_shared, top_k_norm):
     # 0.7.1 scales the shared expert by `_shared_expert_scale`, earlier bodies gate it
     # by a sigmoid. mlx_lm honours `norm_topk_prob`; mlx_vlm always normalizes.
@@ -2429,8 +2509,9 @@ def _qwen3_5_moe_call(native, scaled_shared, top_k_norm):
             out = experts(self, x, inds, scores, shared_scale, shared_y)
             if out is not None:
                 return out
-        y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis = -2)
+        y = _fused_moe_combine(self.switch_mlp, x, inds, scores)
+        if y is None:
+            y = (self.switch_mlp(x, inds) * scores[..., None]).sum(axis = -2)
         return y + shared_scale * shared_y
 
     return fused_call
