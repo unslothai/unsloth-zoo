@@ -3447,13 +3447,17 @@ else:
     torch._dynamo.mark_dynamic(labels, 1)
     if attention_mask is not None:
         torch._dynamo.mark_dynamic(attention_mask, 1)
+    # Prefix tuning makes the mask longer than the labels; the stock forward keeps its tail.
+    _mask = \\6
+    if _mask is not None and _mask.shape[-1] > labels.shape[-1]:
+        _mask = _mask[..., -labels.shape[-1]:]
     loss = unsloth_fused_ce_loss(
         trainer              = None,
         hidden_states        = _hidden_states,
         lm_head_weight       = lm_head_weight,
         lm_head_bias         = lm_head_bias,
         labels               = labels,
-        mask                 = \\6,
+        mask                 = _mask,
         n_items              = n_items,
         scaling              = getattr(self, "accelerator_scaler", None),
         target_gb            = None,

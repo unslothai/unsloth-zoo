@@ -18,9 +18,13 @@
 
 import importlib
 import inspect
+import os
+import textwrap
 import time
+import types
 
 import pytest
+import torch
 
 from unsloth_zoo import compiler
 
@@ -96,7 +100,7 @@ def test_multiline_masked_shift_ce_is_fused(name):
     new, fused = _fused(SOURCES[name], name)
     assert fused
     assert "unsloth_fused_ce_loss(" in new
-    assert "mask                 = attention_mask," in new
+    assert "_mask = attention_mask\n" in new
     assert "text_config" not in new
 
 
@@ -140,3 +144,33 @@ def test_inner_model_logits_are_not_fused():
         "        logits = outputs.logits\n",
     )
     assert compiler.apply_fused_lm_head(source, "Qwen2AudioForConditionalGeneration")[1] is False
+
+
+def _granite_loss(source, attention_mask):
+    from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_fused_ce_loss
+    ns = dict(
+        torch = torch, nn = torch.nn, os = os, EMPTY_LOGITS = torch.empty(0), UNSLOTH_ENABLE_CCE = False,
+        HAS_CUT_CROSS_ENTROPY = False, UNSLOTH_COMPILE_DISABLE = True,
+        unsloth_fused_ce_loss = unsloth_fused_ce_loss, __DYNAMO__RECOMPILING__ = None,
+    )
+    exec(textwrap.dedent(source), ns)
+    torch.manual_seed(0)
+    hidden = torch.randn(2, 6, 8)
+    model = types.SimpleNamespace(
+        lm_head = torch.nn.Linear(8, 16, bias = False),
+        language_model = lambda **kwargs: types.SimpleNamespace(last_hidden_state = hidden),
+        config = types.SimpleNamespace(vocab_size = 16, text_config = types.SimpleNamespace(vocab_size = 16)),
+    )
+    labels = torch.randint(0, 16, (2, 6))
+    return ns["forward"](model, attention_mask = attention_mask, labels = labels)[0]
+
+
+@pytest.mark.parametrize("prefix", [0, 3])
+def test_granite_speech_mask_longer_than_labels(prefix, monkeypatch):
+    # PEFT prefix tuning prepends virtual tokens to the mask only.
+    monkeypatch.setenv("UNSLOTH_RETURN_LOGITS", "0")
+    new, fused = _fused(GRANITE_SPEECH, "GraniteSpeechForConditionalGeneration")
+    assert fused
+    mask = torch.ones(2, prefix + 6, dtype = torch.long)
+    mask[0, -2:] = 0
+    torch.testing.assert_close(_granite_loss(new, mask), _granite_loss(GRANITE_SPEECH, mask))
