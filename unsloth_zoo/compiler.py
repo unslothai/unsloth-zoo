@@ -6585,7 +6585,10 @@ def unsloth_compile_transformers(
                     fused_source, supports_return_hidden_states = apply_fused_lm_head(
                         new_source, module
                     )
-                    if not supports_return_hidden_states:
+                    # Only classes defined here: an imported one (4.x Blenderbot's BlenderbotSmall
+                    # redirect) would be emitted without its base classes.
+                    if not supports_return_hidden_states and \
+                            getattr(module_class, "__module__", None) == modeling_file.__name__:
                         # AST fallback has no UNSLOTH_RETURN_HIDDEN_STATES branch: GRPO keeps its wrapper.
                         ast_source = _ast_fused_lm_head_fallback(new_source, module, module_class)
                         if ast_source is not None:
