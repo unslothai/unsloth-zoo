@@ -346,6 +346,29 @@ def test_fallback_sees_replaced_nested_absmax(monkeypatch):
 
 
 @needs_grouped_mm
+@pytest.mark.parametrize("kernel", ["1", "0"])
+@pytest.mark.parametrize("edit", ["absmax", "state2_absmax", "offset"])
+def test_in_place_quant_edit_is_not_stale(kernel, edit, monkeypatch):
+    monkeypatch.setenv("UNSLOTH_MOE_TRITON_KERNELS", kernel)
+    ex = _Experts(True).train()
+    T = 64
+    x = torch.randn(1, T, H, device = "cuda", dtype = DT)
+    idx, w = _routing(T)
+    _run(ex, x, idx, w, True, monkeypatch)
+    qs = ex.down_projs[E // 2].weight.quant_state
+    with torch.no_grad():
+        if edit == "absmax":
+            qs.absmax.add_(1)   # nested: the uint8 codes index state2.code
+        elif edit == "state2_absmax":
+            qs.state2.absmax.mul_(1.5)
+        else:
+            qs.offset.add_(0.05)
+    out, _, delta = _run(ex, x, idx, w, True, monkeypatch)
+    ref, _, _ = _run(ex, x, idx, w, False, monkeypatch)
+    assert delta["forward"] == 1 and _rel(out, ref) < 2e-2
+
+
+@needs_grouped_mm
 def test_mixed_quant_formats_keep_loop(monkeypatch):
     ex = _Experts(True).train()
     fp4 = bnb.nn.Linear4bit(I, H, bias = True, compute_dtype = DT, quant_type = "fp4", quant_storage = torch.uint8)

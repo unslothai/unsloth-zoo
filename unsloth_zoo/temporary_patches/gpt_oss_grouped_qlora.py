@@ -273,13 +273,16 @@ def _lora_delta(x, offsets, projs, lora, dtype):
     return _grouped_mm_with_backward_fix(h, B, offsets) * scaling
 
 
-def _fallback_key(weight):
+def _tensor_key(t):
+    # Storage and version: a replaced tensor or an in-place edit both change it.
+    return (t.data_ptr(), t._version) if isinstance(t, torch.Tensor) else t
+
+
+def _quant_key(weight):
     qs = weight.quant_state
-    key = (weight.data_ptr(), qs.absmax.data_ptr())
+    key = (weight.data_ptr(), _tensor_key(qs.absmax))
     if getattr(qs, "nested", False):
-        offset = qs.offset
-        offset = offset.data_ptr() if isinstance(offset, torch.Tensor) else offset
-        key += (qs.state2.absmax.data_ptr(), qs.state2.code.data_ptr(), offset)
+        key += (_tensor_key(qs.state2.absmax), _tensor_key(qs.state2.code), _tensor_key(qs.offset))
     return key
 
 
@@ -287,8 +290,8 @@ def _bnb_fallback_stack(projs, dtype):
     """Concat-and-dequant through bitsandbytes (the pre-existing grouped path)."""
     import bitsandbytes as bnb
     from bitsandbytes.functional import QuantState
-    # Keyed on every expert's packed and (nested) absmax storage, so a reload or requantize rebuilds it.
-    key = tuple(_fallback_key(getattr(p, "base_layer", p).weight) for p in projs)
+    # Keyed on every expert's quant tensors (storage and version), so any requantize or edit rebuilds it.
+    key = tuple(_quant_key(getattr(p, "base_layer", p).weight) for p in projs)
     cached = getattr(projs, "_unsloth_grouped_cat_qs", None)
     cache = cached[1] if cached is not None and cached[0] == key else None
     if cache is None:
@@ -312,16 +315,11 @@ def _bnb_fallback_stack(projs, dtype):
 
 
 def _storage_key(experts):
-    out = []
-    for projs in (experts.gate_up_projs, experts.down_projs):
-        for p in projs:
-            weight = getattr(p, "base_layer", p).weight
-            qs = weight.quant_state
-            out.append(weight.data_ptr())
-            out.append(qs.absmax.data_ptr())
-            if getattr(qs, "nested", False):
-                out.append(qs.state2.absmax.data_ptr())
-    return tuple(out)
+    return tuple(
+        _quant_key(getattr(p, "base_layer", p).weight)
+        for projs in (experts.gate_up_projs, experts.down_projs)
+        for p in projs
+    )
 
 
 def _tables(experts, dtype):
