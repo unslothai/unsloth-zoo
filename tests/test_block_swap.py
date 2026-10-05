@@ -884,12 +884,14 @@ def test_stats_reports_placement_and_timings_after_a_step():
     torch.manual_seed(0)
     blocks = nn.ModuleList([_XBlock(256) for _ in range(8)]).cuda()
     sw = BlockSwap(blocks, [1, 3, 5, 7], prefetch_depth = 1, device = "cuda")
-    x = torch.randn(4, 256, device = "cuda", requires_grad = True)
-    enc = torch.randn(4, 256, device = "cuda", requires_grad = True)
-    h = x
-    for b in blocks:
-        h = cp.checkpoint(b, h, enc, use_reentrant = False)
-    h.square().sum().backward()
+    # Step 1 is warmup and stays out of the window, so run two.
+    for _ in range(2):
+        x = torch.randn(4, 256, device = "cuda", requires_grad = True)
+        enc = torch.randn(4, 256, device = "cuda", requires_grad = True)
+        h = x
+        for b in blocks:
+            h = cp.checkpoint(b, h, enc, use_reentrant = False)
+        h.square().sum().backward()
     torch.cuda.synchronize()
     s = sw.stats()
     assert s["total_layers"] == 8 and s["swapped"] == [1, 3, 5, 7]
@@ -903,13 +905,15 @@ def test_stats_reports_placement_and_timings_after_a_step():
     sw.remove()
 
 
-def _auto(n = 8, depth = 1):
+def _auto(n = 8, depth = 1, sample = 1):
+    _mod._AUTO_SAMPLE = sample
     sw = _scheduler(n, depth = depth)
-    sw._auto, sw._settled, sw._steps = True, False, 0
+    sw._auto, sw._settled, sw._steps, sw._last_stall = True, False, 1, None
     sw._tot = dict.fromkeys(_mod._STAT_KEYS, 0.0)
     sw._seen, sw._adapt_seen = dict(sw._tot), dict(sw._tot)
     sw._harvest = lambda: None
     sw._grow_pool = lambda: True
+    sw._shrink_pool = lambda: None
     return sw
 
 
@@ -917,32 +921,51 @@ def _step(sw, copy_ms, compute_ms, stall_ms, layers = 8):
     for k, v in (("copies", layers), ("copy_ms", copy_ms * layers), ("compute_ms", compute_ms * layers),
                  ("stall_ms", stall_ms * layers), ("layers", layers)):
         sw._tot[k] += v
+    sw._steps += 1
     sw._adapt_depth()
 
 
-def test_auto_depth_deepens_while_a_hideable_copy_stalls():
+def test_auto_depth_deepens_while_each_slot_cuts_the_stall():
     sw = _auto()
-    _step(sw, 5, 9, 2)  # step 1 is warmup
-    assert sw.depth == 1 and not sw._settled
     _step(sw, 5, 9, 2)
+    assert sw.depth == 2 and not sw._settled
     _step(sw, 5, 9, 1)
     assert sw.depth == 3 and not sw._settled
     _step(sw, 5, 9, 0)
     assert sw.depth == 3 and sw._settled
 
 
-def test_auto_depth_stays_shallow_when_the_bus_is_slower_than_compute():
+def test_auto_depth_gives_back_a_slot_that_did_not_help():
     sw = _auto()
+    shrunk = []
+    sw._shrink_pool = lambda: shrunk.append(sw.depth)
+    _step(sw, 5, 9, 2)
+    _step(sw, 5, 9, 2)
+    assert sw.depth == 1 and sw._settled and shrunk == [2]
+
+
+def test_auto_depth_tries_one_slot_on_a_slow_bus_and_gives_it_back():
+    sw = _auto()
+    shrunk = []
+    sw._shrink_pool = lambda: shrunk.append(sw.depth)
     _step(sw, 20, 9, 11)
     _step(sw, 20, 9, 11)
-    # No depth hides a copy longer than a layer's compute; more slots would only cost VRAM.
-    assert sw.depth == 1 and sw._settled
+    # No depth hides a copy longer than a layer's compute, so the stall stays and the slot goes back.
+    assert sw.depth == 1 and sw._settled and shrunk == [2]
+
+
+def test_auto_depth_judges_each_depth_over_several_steps():
+    sw = _auto(sample = 2)
+    _step(sw, 5, 9, 11)  # one step alone decides nothing
+    assert sw.depth == 1 and not sw._settled
+    _step(sw, 1, 9, 0.5)
+    assert sw.depth == 2 and not sw._settled
+    _mod._AUTO_SAMPLE = 2
 
 
 def test_auto_depth_stops_when_the_card_has_no_room_for_a_slot():
     sw = _auto()
     sw._grow_pool = lambda: False
-    _step(sw, 5, 9, 2)
     _step(sw, 5, 9, 2)
     assert sw.depth == 1 and sw._settled
 

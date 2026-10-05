@@ -64,8 +64,10 @@ _PIN_RESERVE_FRACTION = 0.15
 _TIMING = os.environ.get("UNSLOTH_OFFLOAD_STATS", "1") != "0"
 # prefetch_depth = "auto": deepest pool it grows to, and the steps it watches before settling.
 _AUTO_MAX_DEPTH = 4
-_AUTO_STEPS = 8
-_AUTO_STALL = 0.01
+_AUTO_STEPS = 12
+# Steps judged per depth: a single step's copy timings are too noisy to decide on.
+_AUTO_SAMPLE = 2
+_AUTO_STALL = 0.02
 
 
 def _host_copy(t):
@@ -272,6 +274,8 @@ class BlockSwap:
     _auto = False
     _settled = True
     _steps = 0
+    _last_stall = None
+    _sampled = 0
     _tot = None
     _seen = None
     _adapt_seen = None
@@ -519,7 +523,12 @@ class BlockSwap:
         def hook(grad):
             self._release(self.blocks[i])
             if i == 0:
-                if not self._settled:
+                self._steps += 1
+                if self._steps == 1 and self._tot is not None:
+                    # Step 1 includes copies armed at install and warmup: windows start after it.
+                    self._harvest()
+                    self._seen, self._adapt_seen = dict(self._tot), dict(self._tot)
+                elif not self._settled:
                     self._adapt_depth()
                 self._arm(forward = True)
         return _opaque(hook)
@@ -594,15 +603,16 @@ class BlockSwap:
         # Only finished copies are read: query() never blocks the host.
         if not all(e.query() for e in b.events.values()):
             return
-        self._tot["copy_ms"] += sum(b.t_copy[d].elapsed_time(e) for d, e in b.events.items())
+        # max(0, ...): HIP can order timestamps of events recorded while a stream sat idle backwards.
+        self._tot["copy_ms"] += sum(max(0.0, b.t_copy[d].elapsed_time(e)) for d, e in b.events.items())
         self._tot["copies"] += 1
         self._tot["copy_bytes"] += b.nbytes()
         b.copy_open = False
 
     def _harvest_marks(self, b):
         if b.mark_open == 2 and b.marks[2].query():
-            self._tot["stall_ms"] += b.marks[0].elapsed_time(b.marks[1])
-            self._tot["compute_ms"] += b.marks[1].elapsed_time(b.marks[2])
+            self._tot["stall_ms"] += max(0.0, b.marks[0].elapsed_time(b.marks[1]))
+            self._tot["compute_ms"] += max(0.0, b.marks[1].elapsed_time(b.marks[2]))
             self._tot["layers"] += 1
         b.mark_open = 0
 
@@ -620,17 +630,24 @@ class BlockSwap:
         # Between steps only: the "keep the last depth blocks" rule in _post must not change mid-sweep.
         self._harvest()
         d = self._since(self._adapt_seen)
-        self._adapt_seen = dict(self._tot)
-        self._steps += 1
-        # Step 1 starts from blocks armed before timing began; judge from step 2 on.
-        if self._steps < 2 or d["layers"] == 0 or d["copies"] == 0:
+        if d["layers"] == 0 or d["copies"] == 0:
             return
+        self._sampled += 1
+        if self._sampled < _AUTO_SAMPLE and self._steps < _AUTO_STEPS:
+            return
+        self._sampled = 0
+        self._adapt_seen = dict(self._tot)
         busy = d["compute_ms"] + d["stall_ms"]
         stall = d["stall_ms"] / busy if busy > 0 else 0.0
-        # A deeper pool hides a copy only when it is shorter than a layer's compute; past that it only costs VRAM.
-        hideable = d["copy_ms"] / d["copies"] <= d["compute_ms"] / d["layers"]
-        if stall > _AUTO_STALL and hideable and self.depth < _AUTO_MAX_DEPTH and self._grow_pool():
+        # Measured, not predicted: a slot that does not cut the stall (a bus slower than compute, or noise)
+        # is given back, so a slow bus costs one slot for a couple of steps.
+        if self._last_stall is not None and stall > 0.75 * self._last_stall:
+            self._shrink_pool()
+            self.depth -= 1
+            self._settled = True
+        elif stall > _AUTO_STALL and self.depth < _AUTO_MAX_DEPTH and self._grow_pool():
             self.depth += 1
+            self._last_stall = stall
         else:
             self._settled = True
         if self._steps >= _AUTO_STEPS:
@@ -661,6 +678,13 @@ class BlockSwap:
         for s in want:
             self.free[s].append(self._new_slot(s))
         return True
+
+    def _shrink_pool(self):
+        sigs = [b.sig for b in self.blocks]
+        for s, free in self.free.items():
+            held = sum(b.sig == s and b.slot is not None for b in self.blocks)
+            if free and held + len(free) > min(self.depth, sigs.count(s)):
+                free.pop()
 
     def stats(self, reset = True):
         """Where each swapped layer is, plus copy / stall / compute totals since the last call."""
