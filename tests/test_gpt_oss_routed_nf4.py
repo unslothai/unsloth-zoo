@@ -41,6 +41,7 @@ from unsloth_zoo.temporary_patches.gpt_oss_routed import (
 )
 
 E, TOP_K, H, I = 8, 4, 256, 192
+_TORCH = tuple(int(v) for v in torch.__version__.split("+")[0].split(".")[:2])
 
 
 def _linear4bit(i, o, nested, seed):
@@ -274,3 +275,81 @@ def test_lora_bias_is_left_to_peft():
     idx, w = _routing(1)
     with torch.no_grad():
         assert routed_experts_forward(ex, x, idx, w) is None
+
+
+def _routes_through(e, T):
+    # Every token picks expert e first, then three others: the replaced expert is always read.
+    idx, w = _routing(T, seed = 5)
+    idx = idx.clone()
+    for t in range(T):
+        others = [j for j in idx[t].tolist() if j != e][: TOP_K - 1]
+        idx[t] = torch.tensor([e] + others + [j for j in range(E) if j != e and j not in others][: TOP_K - 1 - len(others)])
+    dense = torch.zeros(T, E, device = "cuda", dtype = w.dtype).scatter_(1, idx, torch.softmax(torch.randn(T, TOP_K, device = "cuda"), -1).to(w.dtype))
+    return idx, dense
+
+
+@pytest.mark.parametrize("proj", ["gate_up_projs", "down_projs"])
+@pytest.mark.parametrize(
+    "what", ["module", "weight", "requantize", "absmax", "nested_absmax", "nested_code", "offset", "offset_inplace"]
+)
+def test_replaced_middle_expert_rebuilds_tables(proj, what):
+    # The tables point at every expert's packed bytes / absmax: replacing a middle expert (a new
+    # module, a new Params4bit, a requantized quant_state, or a new absmax / nested absmax
+    # tensor) must rebuild them, not leave the kernels on the freed buffers. Eager and compiled.
+    ex = _Experts(True).eval()
+    T = 4
+    x = torch.randn(1, T, H, device = "cuda", dtype = DT)
+    mid = E // 2
+    idx, w = _routes_through(mid, T)
+    with torch.no_grad():
+        assert routed_experts_forward(ex, x, idx, w) is not None
+        compiled = torch.compile(lambda a, b, c: routed_experts_forward(ex, a, b, c), backend = "eager", fullgraph = True)
+        torch._dynamo.reset()
+        compiled(x, idx, w)
+    shape = (H, 2 * I) if proj == "gate_up_projs" else (I, H)
+    new = _linear4bit(*shape, True, 999)
+    projs = getattr(ex, proj)
+    if what == "module":
+        projs[mid] = new
+    elif what == "weight":
+        projs[mid].weight = new.weight
+    elif what == "requantize":
+        # In place on the same Params4bit: new packed bytes and a new quant_state.
+        projs[mid].weight.data = new.weight.data
+        projs[mid].weight.quant_state = new.weight.quant_state
+    elif what == "absmax":
+        qs = projs[mid].weight.quant_state
+        qs.absmax = new.weight.quant_state.absmax  # same packed bytes, other scales
+    elif what == "nested_absmax":
+        qs = projs[mid].weight.quant_state
+        qs.state2.absmax = qs.state2.absmax * 3
+    elif what == "nested_code":
+        qs = projs[mid].weight.quant_state
+        qs.state2.code = qs.state2.code * 1.5
+    elif what == "offset":
+        qs = projs[mid].weight.quant_state
+        qs.offset = qs.offset + 0.05
+    else:
+        with torch.no_grad():
+            projs[mid].weight.quant_state.offset.add_(0.05)
+    del new
+    torch.cuda.empty_cache()
+    junk = torch.full((1 << 22,), float("nan"), device = "cuda")  # reuse the freed blocks
+    ref = _reference(ex, x, idx, w)
+    with torch.no_grad():
+        got_c = compiled(x, idx, w)  # no eager call since the swap
+        got = routed_experts_forward(ex, x, idx, w)
+        got_c2 = compiled(x, idx, w)
+    del junk
+    tol = 2 ** -8 * ref.abs().max().item() + 1e-3
+    assert got is not None and (got.double() - ref).abs().max().item() <= tol
+    # Compiled: a weight swap retraces onto the dense fallback (None) until an eager call
+    # rebuilds the tables; swaps below the weight keep its identity, so eager calls catch them.
+    if what in ("module", "weight"):
+        assert got_c is None or (got_c.double() - ref).abs().max().item() <= tol
+    # Once an eager call rebuilt them, a compiled call reads the new tables. torch 2.7's Dynamo
+    # keeps the dense-fallback graph for a weight swap (no aliasing guard): correct, not routed.
+    if got_c2 is None:
+        assert what in ("module", "weight") and _TORCH < (2, 10), "compiled call did not route after the rebuild"
+    else:
+        assert (got_c2.double() - ref).abs().max().item() <= tol

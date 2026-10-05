@@ -33,6 +33,7 @@ __all__ = [
 ]
 
 import os
+from operator import attrgetter, is_, itemgetter, methodcaller
 
 import torch
 
@@ -135,12 +136,134 @@ def _build_table(projs, device):
     }
 
 
-def _key(projs):
-    # A moved, reloaded or replaced expert changes its packed buffer's address. Checking the
-    # first and last of each list keeps the per-call cost to a few us.
-    ends = [_base_linear4bit(p) for p in (projs[0], projs[-1])]
-    return tuple(b.weight.data_ptr() for b in ends) + tuple(
-        b.bias.data_ptr() if b.bias is not None else 0 for b in ends)
+_get_weight = itemgetter("weight")
+_get_bias = methodcaller("get", "bias")
+_get_base = itemgetter("base_layer")
+_get_quant_state = attrgetter("quant_state")
+_get_absmax = attrgetter("absmax")
+_get_nested_absmax = attrgetter("absmax", "state2.absmax")
+_PTRS_EQUAL = getattr(torch._C, "_tensors_data_ptrs_at_indices_equal", None)
+
+
+def _same(a, b):
+    """a and b (lists) hold the very same objects, in order."""
+    return len(a) == len(b) and all(map(is_, a, b))
+
+
+def _quant_fields(quant_states, nested):
+    """The scale tensors the kernels read per expert: absmax, and state2.absmax when nested."""
+    if nested:
+        return list(map(_get_nested_absmax, quant_states))
+    return list(map(_get_absmax, quant_states)) + [qs.state2.absmax for qs in quant_states if qs.nested]
+
+
+_get_copied = attrgetter("code", "offset")
+_get_nested_copied = attrgetter("code", "offset", "state2.code")
+_get_version = attrgetter("_version")
+
+
+def _copied(quant_states, nested):
+    """Per expert, what the tables copy (code into "lut", offset into "off") and the nested code
+    the kernels read: replaced or edited in place, the tables need a rebuild."""
+    if nested:
+        return list(map(_get_nested_copied, quant_states))
+    return list(map(_get_copied, quant_states)) + [qs.state2.code for qs in quant_states if qs.nested]
+
+
+def _tensors_in(items):
+    out = []
+    for item in items:
+        out += [t for t in (item if isinstance(item, tuple) else (item,)) if isinstance(t, torch.Tensor)]
+    return out
+
+
+def _ptrs(tensors):
+    # Tensor.data_ptr on a Params4bit goes through its __torch_function__ (about 1.5 us each).
+    return [torch._C.TensorBase.data_ptr(t) for t in tensors]
+
+
+def _snapshot(experts):
+    """What the tables were built from, for every expert of both projections: the expert
+    modules, their Linear4bit bases, the weight / quant_state / absmax / code / offset / bias
+    objects and the packed weights' addresses. Holds every buffer the tables point at, so one replaced under
+    them stays allocated until the next check rebuilds them. Raises on a layout without NF4
+    quant states."""
+    mods = (tuple(experts.gate_up_projs._modules.values()), tuple(experts.down_projs._modules.values()))
+    projs = [p for group in mods for p in group]
+    wrappers = [p._modules for p in projs if "base_layer" in p._modules]
+    params = [getattr(p, "base_layer", p)._parameters for p in projs]
+    weights = list(map(_get_weight, params))
+    quant_states = list(map(_get_quant_state, weights))
+    nested = all(qs.nested for qs in quant_states)
+    copied = _copied(quant_states, nested)
+    versioned = _tensors_in(copied)
+    return {
+        "mods": mods, "wrappers": wrappers, "wrapped": list(map(_get_base, wrappers)),
+        "params": params, "weights": weights, "ptrs": _ptrs(weights), "idx": list(range(len(weights))),
+        "quant_states": quant_states, "nested": nested, "fields": _quant_fields(quant_states, nested),
+        "copied": copied, "versioned": versioned, "versions": list(map(_get_version, versioned)),
+        "biases": list(map(_get_bias, params)),
+    }
+
+
+def _snapshot_current(experts, snap):
+    """True while nothing the tables depend on was replaced, in any expert: object identity
+    through C-level getters (no nn.Module attribute lookups) plus one C++ check of the packed
+    weights' addresses (Module._apply and `.data =` swap a Parameter's storage in place), and
+    version counters of what the tables copy (code, offset): about 30 us for gpt-oss-20b's
+    2 x 32 experts, once per layer call. Moving, requantizing or reloading bitsandbytes weights
+    replaces the quant state or its tensors, which identity sees; in-place edits of the buffers
+    the kernels read (packed weight, absmax, nested absmax and code) need no rebuild."""
+    mods = snap["mods"]
+    if (
+        tuple(experts.gate_up_projs._modules.values()) != mods[0]
+        or tuple(experts.down_projs._modules.values()) != mods[1]
+        or not _same(list(map(_get_base, snap["wrappers"])), snap["wrapped"])
+    ):
+        return False
+    weights = list(map(_get_weight, snap["params"]))
+    if not _same(weights, snap["weights"]):
+        return False
+    if _PTRS_EQUAL is not None:
+        if not _PTRS_EQUAL(weights, snap["ptrs"], snap["idx"]):
+            return False
+    elif _ptrs(weights) != snap["ptrs"]:
+        return False
+    quant_states = list(map(_get_quant_state, weights))
+    if not _same(quant_states, snap["quant_states"]) or not _same(list(map(_get_bias, snap["params"])), snap["biases"]):
+        return False
+    try:
+        # Tuple equality tries identity first, all in C. A replaced tensor falls through to
+        # Tensor.__eq__, which raises on bool() of a multi-element result (or on shape / device);
+        # a replaced one-element tensor of equal value (a nested offset) passes: the tables hold
+        # that same value, and the snapshot keeps the old tensor alive.
+        if _quant_fields(quant_states, snap["nested"]) != snap["fields"]:
+            return False
+        if _copied(quant_states, snap["nested"]) != snap["copied"]:
+            return False
+    except Exception:
+        return False
+    # Same objects as the snapshot's, so their version counters catch in-place edits.
+    return list(map(_get_version, snap["versioned"])) == snap["versions"]
+
+
+def _weights(experts):
+    return tuple(getattr(p, "base_layer", p).weight for projs in (experts.gate_up_projs, experts.down_projs) for p in projs)
+
+
+def _compiled_state(experts):
+    """The tables an eager call built, for a compiled call, or None when an expert's weight was
+    swapped since (identity: a trace-time check Dynamo guards on, so a swap retraces)."""
+    state = getattr(experts, "_unsloth_routed_nf4", None)
+    if not isinstance(state, dict):
+        return None
+    weights = state["weights"]
+    if len(weights) != len(experts.gate_up_projs) + len(experts.down_projs):
+        return None
+    for w, live in zip(weights, _weights(experts)):
+        if w is not live:
+            return None
+    return state
 
 
 def prepare_routed_experts(experts):
@@ -155,11 +278,14 @@ def prepare_routed_experts(experts):
     if state is False:
         return None
     try:
-        key = (_key(gate_up_projs), _key(down_projs))
+        if isinstance(state, dict) and _snapshot_current(experts, state["snapshot"]):
+            return state
+        snap = _snapshot(experts)
     except Exception:
+        # No longer an all-NF4 layout (e.g. an expert was swapped): drop any old tables.
+        if state is not None:
+            experts._unsloth_routed_nf4 = None
         return None
-    if state is not None and state["key"] == key:
-        return state
     device = _base_linear4bit(gate_up_projs[0]).weight.device
     if triton is None or device.type != "cuda":
         experts._unsloth_routed_nf4 = False
@@ -168,7 +294,8 @@ def prepare_routed_experts(experts):
     if gate_up is None or down is None or down["K"] * 2 != gate_up["N"] or gate_up["K"] != down["N"]:
         experts._unsloth_routed_nf4 = False
         return None
-    state = {"gate_up": gate_up, "down": down, "key": key}
+    state = {"gate_up": gate_up, "down": down, "key": tuple(snap["ptrs"]), "snapshot": snap,
+             "weights": tuple(snap["weights"])}
     experts._unsloth_routed_nf4 = state
     return state
 
@@ -213,16 +340,19 @@ def _lora(projs):
     return cache["A"], cache["B"], first.scaling[name]
 
 
-def routed_experts_forward(experts, hidden_states, router_indices, routing_weights):
+def routed_experts_forward(experts, hidden_states, router_indices, routing_weights, _state = None):
     """Routed eval forward for a ModuleList NF4 gpt-oss experts module, or None if ineligible.
 
-    routing_weights is dense [T, E] (zeros off the picked experts) or already [T, top_k]."""
+    routing_weights is dense [T, E] (zeros off the picked experts) or already [T, top_k].
+    _state: the tables routed_mlp_forward just validated for this call (one check per layer)."""
     if _routed_disabled():
         return None
     if torch.is_grad_enabled() or experts.training or not hidden_states.is_cuda:
         return None
-    if torch.compiler.is_compiling():
-        state = getattr(experts, "_unsloth_routed_nf4", None)
+    if _state is not None:
+        state = _state
+    elif torch.compiler.is_compiling():
+        state = _compiled_state(experts)
     else:
         state = prepare_routed_experts(experts)
     # isinstance, not truthiness: Dynamo before torch 2.12 cannot trace bool() of a dict.
@@ -344,7 +474,7 @@ def routed_mlp_forward(mlp, hidden_states, max_slots = ROUTED_MAX_SLOTS):
     if hasattr(experts, "gate_up_projs"):
         # Pointer tables are built eagerly (data_ptr is not traceable), also on calls too large to
         # route, so a compiled decode step that follows an eager prefill finds them ready.
-        state = getattr(experts, "_unsloth_routed_nf4", None) if torch.compiler.is_compiling() else prepare_routed_experts(experts)
+        state = _compiled_state(experts) if torch.compiler.is_compiling() else prepare_routed_experts(experts)
         nf4 = isinstance(state, dict)
     if hidden_states.numel() // hidden_states.shape[-1] * getattr(mlp.router, "top_k", 4) > max_slots:
         return None
@@ -355,7 +485,7 @@ def routed_mlp_forward(mlp, hidden_states, max_slots = ROUTED_MAX_SLOTS):
     router_out = mlp.router(hidden_states.reshape(-1, hidden_states.shape[-1]))
     scores, indices = router_out[-2], router_out[-1]
     if nf4:
-        out = routed_experts_forward(experts, hidden_states, indices, scores)
+        out = routed_experts_forward(experts, hidden_states, indices, scores, _state = state)
         # An adapter setup the NF4 kernels do not cover: the module forward, same router output.
         return out if out is not None else experts(hidden_states, router_indices = indices, routing_weights = scores)
     return routed_bf16_forward(experts, hidden_states, indices, scores)
