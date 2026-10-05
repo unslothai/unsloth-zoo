@@ -644,8 +644,10 @@ def replace_with_grouped_query_attention(module, source):
     # a `return super().forward(...)` separated by an arbitrary body
     # (logger warning, raise, etc.). Matches the legacy shape with a
     # looser anchor; still no-ops on 4.50+ where the guard is gone.
+    # Body lines are `[ \t][^\n]+`, not `[ \t]+[^\n]+`: the same lines, but the
+    # ambiguous split backtracks exponentially when no return follows (DeepseekOcr2).
     rewritten, n_loose = re.subn(
-        r"if[ \t]+output_attentions[ \t]*:[^\n]*\n(?:[ \t]+[^\n]+\n)*?[ \t]+return[ \t]+super\(\)\.forward\([^)]*\)",
+        r"if[ \t]+output_attentions[ \t]*:[^\n]*\n(?:[ \t][^\n]+\n)*?[ \t]+return[ \t]+super\(\)\.forward\([^)]*\)",
         "if output_attentions: raise RuntimeError('Unsloth: Not supported')",
         source,
         flags=re.MULTILINE,
@@ -3212,7 +3214,7 @@ elif labels is None:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
+elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_ and getattr(self.lm_head, "bias", None) is None:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
         lm_weight          = self.lm_head.weight,
@@ -3306,7 +3308,7 @@ elif labels is None:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
+elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_ and getattr(self.lm_head, "bias", None) is None:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
         lm_weight          = self.lm_head.weight,
@@ -3497,9 +3499,17 @@ def apply_fused_lm_head(forward, module=None):
     return _apply_fused_lm_head(forward, module)
 
 
+# Tails patterns 1 and 3 cannot match without; skips their regex, which backtracks for seconds
+# on long multi-line CE blocks (Qwen2Audio, GraniteSpeech).
+_CE_TAIL_VIEW = re.compile(r"(?:shift|flat)_logits = (?:shift|flat)_logits\.view\(-1,")
+_CE_TAIL_CALL = re.compile(r"loss = loss_fct\((?:shift|flat)_logits, (?:shift|flat)_labels\)")
+
+
 def _apply_fused_lm_head(forward, module=None):
     # All Unsloth Zoo code licensed under LGPLv3
     UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
+    # Rewrites below run on a working copy; an unmatched source must come back unchanged.
+    original_forward = forward
     for jj, (cross_entropy_find, cross_entropy_replacement) in enumerate(ce_finders):
         cross_entropy_find = (
             cross_entropy_find.strip()
@@ -3535,7 +3545,8 @@ def _apply_fused_lm_head(forward, module=None):
                 r"self\.vocab_size|"
                 r"self\.config\.vocab_size|"
                 r"self\.config\.text_config\.vocab_size|"
-                r"self\.config\.get_text_config\(\)\.vocab_size"
+                r"self\.config\.get_text_config\(\)\.vocab_size|"
+                r"shift\_logits\.size\(\-1\)"
                 ")",
             )
             # Any kwargs name (transformers 5.17 renamed gemma3's to `lm_kwargs`); may sit on its own line.
@@ -3625,7 +3636,7 @@ def _apply_fused_lm_head(forward, module=None):
             r"shift_logits\.view\(-1, shift_logits\.size\(-1\)\), "
             r"shift_labels\.view\(-1\)\)$",
             lambda m: (
-                f"{m.group(1)}shift_logits = shift_logits.view(-1, self.config.text_config.vocab_size)\n"
+                f"{m.group(1)}shift_logits = shift_logits.view(-1, shift_logits.size(-1))\n"
                 f"{m.group(1)}shift_labels = shift_labels.view(-1)\n"
                 f"{m.group(1)}shift_labels = shift_labels.to(shift_logits.device)\n"
                 f"{m.group(1)}loss = loss_fct(shift_logits, shift_labels)"
@@ -3665,6 +3676,10 @@ def _apply_fused_lm_head(forward, module=None):
                     f"(4) Unsloth skipping patching fast linear cross entropy for {module}"
                 )
             continue
+        if "CrossEntropyLoss" in cross_entropy_find and not (
+            _CE_TAIL_VIEW.search(forward) and _CE_TAIL_CALL.search(forward)
+        ):
+            continue
         try:
             finder = regex.findall(
                 cross_entropy_find,
@@ -3672,6 +3687,12 @@ def _apply_fused_lm_head(forward, module=None):
                 flags=regex.DOTALL | regex.MULTILINE,
                 timeout=1,
             )
+        except TimeoutError:
+            if UNSLOTH_ENABLE_LOGGING:
+                print(
+                    f"Unsloth: fast linear cross entropy pattern {jj + 1}/3 timed out for {module}"
+                )
+            continue
         except Exception as e:
             if UNSLOTH_ENABLE_LOGGING:
                 print(
@@ -3753,7 +3774,7 @@ def _apply_fused_lm_head(forward, module=None):
         # print(forward)
         return forward, True
     pass
-    return forward, False
+    return original_forward, False
 
 
 pass
