@@ -50,6 +50,7 @@ from unsloth_zoo.mlx.decision_trainer import (  # noqa: E402
     _soft_cross_entropy,
     add_lora_adapters,
     collate_decisions,
+    decision_logits,
     load_trainable_decision_model,
 )
 from unsloth_zoo.mlx.generate import generation_mode  # noqa: E402
@@ -594,6 +595,19 @@ def test_layerwise_gradients_match_one_graph_under_dropout(checkpoint, target_mo
             # float16 noise flips the odd ReLU unit; other dropout masks would change most elements.
             reference = np.array(want_flat[name])
             assert (np.abs(np.array(value) - reference) > 1e-3 + 0.05 * np.abs(reference)).mean() < 0.05, name
+
+
+def test_decision_logits_match_the_forward_item_by_item(checkpoint):
+    model, items = load_trainable_decision_model(checkpoint[1]), _items()
+    with pytest.raises(KeyError):
+        decision_logits(model, [{"input_ids": [1]}], 0)
+    got = decision_logits(model, items, 0, batch_size = 4)
+    assert model.training
+    model.eval()
+    for item, row in zip(items, got, strict = True):
+        want = np.array(model(**{k: v for k, v in collate_decisions([item], 0).items() if k != "target"}))[0]
+        np.testing.assert_allclose(row, want, atol = 2e-2)
+        assert row.shape == (len(item["markers"]),)
 
 
 def test_planned_lengths_merge_nearby_widths():

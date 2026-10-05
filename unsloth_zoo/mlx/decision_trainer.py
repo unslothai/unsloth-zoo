@@ -37,6 +37,7 @@ __all__ = [
     "MLXDecisionTrainer",
     "add_lora_adapters",
     "collate_decisions",
+    "decision_logits",
     "load_trainable_decision_model",
 ]
 
@@ -226,6 +227,30 @@ class _LayerwiseStep:
         return loss, grads
 
 
+def _staged_logits(step, batch):
+    model = step.model
+    keys = batch["attention_mask"].astype(mx.bool_)[:, None, None, :]
+    hidden = model.encoder.final_norm(step.encode(batch)[0])
+    return model.decide(hidden, keys, batch["marker_pos"], batch["marker_mask"], batch["qtype"])
+
+
+def decision_logits(model, items, pad_token_id, batch_size = 16):
+    """Eval-mode logits of tokenized decisions: one float32 numpy row per item, as long as its options."""
+    step, out = _LayerwiseStep(model), [None] * len(items)
+    order = sorted(range(len(items)), key = lambda i: -len(items[i]["input_ids"]))
+    was_training = model.training
+    model.eval()
+    try:
+        for start in range(0, len(order), batch_size):
+            chunk = order[start : start + batch_size]
+            logits = np.array(_staged_logits(step, collate_decisions([items[i] for i in chunk], pad_token_id)))
+            for row, i in enumerate(chunk):
+                out[i] = logits[row, : len(items[i]["markers"])]
+    finally:
+        model.train(was_training)
+    return out
+
+
 def _planned_lengths(shapes):
     """Map a batch's (rows, longest row) to its padded length, merging nearby lengths so a run sees few distinct shapes."""
     from .shape_guard import FULL_STEP_SCOPE, TextShapeEvent, plan_text_shape_padding_budget
@@ -363,13 +388,13 @@ class MLXDecisionTrainer:
         was_training = model.training
         model.eval()
         total = 0.0
-        for batch in self._eval_batches():
-            arrays = self._collate(items, batch)
-            keys = arrays["attention_mask"].astype(mx.bool_)[:, None, None, :]
-            hidden = model.encoder.final_norm(step.encode(arrays)[0])
-            logits = model.decide(hidden, keys, arrays["marker_pos"], arrays["marker_mask"], arrays["qtype"])
-            total += -(arrays["target"] * nn.log_softmax(logits, axis = -1)).sum(-1).sum().item()
-        model.train(was_training)
+        try:
+            for batch in self._eval_batches():
+                arrays = self._collate(items, batch)
+                logits = _staged_logits(step, arrays)
+                total += -(arrays["target"] * nn.log_softmax(logits, axis = -1)).sum(-1).sum().item()
+        finally:
+            model.train(was_training)
         metrics = {"eval_loss": total / len(items), "epoch": self.state.epoch}
         self._log(metrics)
         self._event("on_evaluate", metrics = metrics)
