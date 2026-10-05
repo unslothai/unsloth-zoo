@@ -578,6 +578,10 @@ def test_prefill_combines_sorted_expert_rows_under_the_gate_up_pack(native, veri
             assert bool(combines) is verified
             combines.clear()
             _identical(block(decode), expected[1])
+            with monkeypatch.context() as capped:  # past 32-bit indexing the native chain runs
+                capped.setattr(fusion, "_MOE_COMBINE_MAX_ELEMENTS", 2 * 70 * 8 * 64 - 1)
+                _identical(block(prefill), expected[0])
+                assert not combines
             switch = vlm if native is vlm_qwen else lm
             sort = switch._gather_sort
             with monkeypatch.context() as rebound:  # a pinned helper replaced after the scope resolved it

@@ -2405,6 +2405,7 @@ def _moe_routed_experts(block):
 # MLX multiplies and sums in the array dtype, in route order; the kernel rounds at the same two places.
 # Single precision is left native: its sum does not round like a sequential one.
 _MOE_COMBINE_DTYPES = (mx.bfloat16, mx.float16)
+_MOE_COMBINE_MAX_ELEMENTS = 1 << 32
 _MOE_COMBINE_SOURCE = """
     uint token = thread_position_in_grid.y;
     uint d = thread_position_in_grid.x;
@@ -2461,7 +2462,9 @@ def _fused_moe_combine(switch_mlp, x, inds, scores):
     if routed is None:
         return None
     y, inv_order = routed
-    if y.dtype != scores.dtype or not _moe_combine_verified(y.dtype, scores.shape[-1], y.shape[-1]):
+    # The kernel indexes in 32 bits; MLX's own ops switch to 64-bit indexing past that.
+    if (y.size > _MOE_COMBINE_MAX_ELEMENTS or y.dtype != scores.dtype
+            or not _moe_combine_verified(y.dtype, scores.shape[-1], y.shape[-1])):
         return None
     return _run_moe_combine(y, inv_order, scores)
 
