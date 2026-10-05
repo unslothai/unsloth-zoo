@@ -5060,8 +5060,8 @@ def _ast_fused_lm_head_fallback(source, module = None, module_class = None):
     from unsloth_zoo.fused_losses.forward_install import _LINEAR_HEAD_ATTRS, _head_built_as_linear
     if new_source is None or cap.head_attr not in _LINEAR_HEAD_ATTRS:
         return None
-    # Other head names only where the hook itself would take them (audio / codec heads stay out).
-    if cap.head_attr != "lm_head" and not str(module).endswith("ForCausalLM"):
+    # Other head names only where the hook takes them or with a proven aligned token CE (Whisper, TrOCR).
+    if cap.head_attr != "lm_head" and not str(module).endswith("ForCausalLM") and not cap.aligned_target:
         return None
     if module_class is not None and not _head_built_as_linear(module_class, cap.head_attr):
         return None
@@ -6584,7 +6584,9 @@ def unsloth_compile_transformers(
                     fused_source, supports_return_hidden_states = apply_fused_lm_head(
                         new_source, module
                     )
-                    if not supports_return_hidden_states:
+                    # Only classes defined here: an imported one (4.x Blenderbot) lacks its base classes.
+                    if not supports_return_hidden_states and \
+                            getattr(module_class, "__module__", None) == modeling_file.__name__:
                         # AST fallback has no UNSLOTH_RETURN_HIDDEN_STATES branch: GRPO keeps its wrapper.
                         ast_source = _ast_fused_lm_head_fallback(new_source, module, module_class)
                         if ast_source is not None:
