@@ -931,7 +931,7 @@ def _require_evaluable(model):
 
 
 @contextmanager
-def generation_mode(model):
+def generation_mode(model, int8_prefill = None):
     """Temporarily switch a model to eval mode and steward global MLX limits.
 
     The outermost context snapshots the process-global memory, cache, and wired
@@ -958,7 +958,7 @@ def generation_mode(model):
                                 fused_moe_router, fused_residual_norm, fused_residual_norm_handoff,
                                 nax_quantized_linear)
         with fused_moe_gate_up(model), fused_decode_conv_silu(model), fused_residual_norm(model), \
-                fused_moe_router(model), fused_moe_routed_experts(model), nax_quantized_linear(model), \
+                fused_moe_router(model), fused_moe_routed_experts(model), nax_quantized_linear(model, int8_prefill), \
                 fused_residual_norm_handoff(model):
             yield model
     except BaseException as exc:
