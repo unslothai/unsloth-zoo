@@ -5060,8 +5060,9 @@ def _ast_fused_lm_head_fallback(source, module = None, module_class = None):
     from unsloth_zoo.fused_losses.forward_install import _LINEAR_HEAD_ATTRS, _head_built_as_linear
     if new_source is None or cap.head_attr not in _LINEAR_HEAD_ATTRS:
         return None
-    # Other head names only where the hook itself would take them (audio / codec heads stay out).
-    if cap.head_attr != "lm_head" and not str(module).endswith("ForCausalLM"):
+    # Other head names only where the hook would take them, or with a proven position-aligned token
+    # CE (Whisper, TrOCR); other audio / codec heads stay out.
+    if cap.head_attr != "lm_head" and not str(module).endswith("ForCausalLM") and not cap.aligned_target:
         return None
     if module_class is not None and not _head_built_as_linear(module_class, cap.head_attr):
         return None
