@@ -383,3 +383,19 @@ def test_flex_drops_the_mask_only_when_unsloth_reroutes_it_to_sdpa(patched, monk
     padded = _kwargs(patched, config = _config("flex_attention"),
                      attention_mask = torch.tensor([[1, 1, 1, 1, 1, 1], [0, 1, 1, 1, 1, 1]]))
     assert patched.create_causal_mask(**padded) is not None
+
+
+def test_a_model_local_flex_override_keeps_the_mask(patched, monkeypatch):
+    # A modeling module's own AttentionInterface beats the global registry at dispatch.
+    import sys, types
+    from transformers.modeling_utils import AttentionInterface
+    kwargs = _kwargs(patched, config = _config("flex_attention"))
+    _register_flex(monkeypatch, reroutes = True)
+    assert patched.create_causal_mask(**kwargs) is None
+
+    interface = AttentionInterface()
+    interface._local_mapping = {"flex_attention": lambda *args, **kw: None}
+    module = types.ModuleType("transformers.models.fake_local_flex.modeling_fake_local_flex")
+    module.ALL_ATTENTION_FUNCTIONS = interface
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    assert patched.create_causal_mask(**kwargs) is not None
