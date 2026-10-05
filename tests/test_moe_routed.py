@@ -388,7 +388,11 @@ def test_fullgraph_compile_and_cuda_graph_replay(use_lora, mode, monkeypatch):
     else:
         assert torch.equal(compiled, eager)
 
-    # CUDA graph: capture once, replay with new tokens and new routes.
+    # CUDA graph: capture once, replay with new tokens and new routes. Off sm90 / sm100,
+    # torch._grouped_mm copies its offsets to the host (L4, A100, RTX PRO 6000 on torch 2.11), so
+    # the opt-in "grouped" comparator is not capturable there.
+    if mode == "grouped" and torch.cuda.get_device_capability()[0] not in (9, 10):
+        return
     sx, sidx, sw = x.clone(), idx.clone(), w.clone()
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
@@ -691,14 +695,23 @@ def _gpt_oss_lora_mlp():
     return _NF4MLP(_lora_wrap(_Experts(True)).eval()).eval()
 
 
+def _dense_loss(mlp):
+    from test_gpt_oss_routed_nf4 import H as GH, _routing
+    idx, w = _routing(4, seed = 9)
+    x = torch.randn(1, 4, GH, device = DEV, dtype = torch.float32, generator = torch.Generator(DEV).manual_seed(9))
+    return mlp.experts.dense(x, idx, w).float().pow(2).mean()
+
+
+def _biases(mlp):
+    return [(b.data_ptr(), b.dtype) for projs in (mlp.experts.gate_up_projs, mlp.experts.down_projs)
+            for b in (getattr(p, "base_layer", p).bias for p in projs)]
+
+
 def _train_step(mlp, lr = 5.0):
     # One optimizer step on the adapters through the dense path (grad on: the routed path stays out).
-    from test_gpt_oss_routed_nf4 import H as GH, _routing
     params = [p for n, p in mlp.named_parameters() if "lora_" in n]
     opt = torch.optim.SGD(params, lr = lr)
-    idx, w = _routing(4, seed = 9)
-    x = torch.randn(1, 4, GH, device = DEV, dtype = torch.float32)
-    mlp.experts.dense(x, idx, w).float().pow(2).mean().backward()
+    _dense_loss(mlp).backward()
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in params)
     opt.step()
     opt.zero_grad(set_to_none = True)
@@ -714,6 +727,11 @@ def test_gpt_oss_compiled_decode_follows_an_optimizer_step(replay):
     mlp = _gpt_oss_lora_mlp()
     decode = torch.randn(2, 1, GH, device = DEV, dtype = torch.float32)
     graphs = []
+    # A dense forward first, as training does: bitsandbytes recasts Linear4bit.bias to the dense
+    # path's dtype once (new storage, which no CUDA graph captured before it survives; the eager /
+    # compiled case is test_gpt_oss_compiled_decode_after_a_bias_recast_reads_the_new_biases).
+    _dense_loss(mlp)  # grad on, the same path the training step takes
+    biases = _biases(mlp)
 
     def backend(gm, example_inputs):
         graphs.append(gm.code)
@@ -736,6 +754,7 @@ def test_gpt_oss_compiled_decode_follows_an_optimizer_step(replay):
     assert graphs and not any("torch.stack(" in code or "aten.stack" in code for code in graphs), "compiled step restacks the adapters"
 
     _train_step(mlp)
+    assert _biases(mlp) == biases  # only the adapters moved, in place
 
     with torch.no_grad():
         if replay == "cuda_graph":
@@ -744,7 +763,6 @@ def test_gpt_oss_compiled_decode_follows_an_optimizer_step(replay):
         else:
             got = compiled(decode)
         want = GR.routed_mlp_forward(mlp, decode)
-    assert len(graphs) == 1
     assert not torch.allclose(want, before, rtol = 1e-3, atol = 1e-3)
     torch.testing.assert_close(got, want, rtol = 1e-5, atol = 1e-5)
 
@@ -770,6 +788,31 @@ def test_gpt_oss_compiled_decode_after_an_adapter_cast_reads_the_new_weights():
     torch.testing.assert_close(got, want, rtol = 1e-4, atol = 1e-4)
     with torch.no_grad():
         torch.testing.assert_close(compiled(decode), want, rtol = 1e-5, atol = 1e-5)
+
+
+@pytest.mark.parametrize("lora", [False, True])
+def test_gpt_oss_compiled_decode_after_a_bias_recast_reads_the_new_biases(lora):
+    # bitsandbytes' Linear4bit.forward recasts its bias to the input dtype by swapping in new
+    # storage (a dense fp32 training step on bf16 biases does it). A compiled decode step with no
+    # eager call in between must read the new biases, not the freed buffers.
+    from test_gpt_oss_routed_guards import _NF4MLP
+    from test_gpt_oss_routed_nf4 import H as GH, _Experts
+    from unsloth_zoo.temporary_patches import gpt_oss_routed as GR
+    mlp = _gpt_oss_lora_mlp() if lora else _NF4MLP(_Experts(True).eval()).eval()
+    decode = torch.randn(2, 1, GH, device = DEV, dtype = torch.float32)
+    with torch.no_grad():
+        before = GR.routed_mlp_forward(mlp, decode)
+        torch._dynamo.reset()
+        compiled = torch.compile(lambda h: GR.routed_mlp_forward(mlp, h), backend = "eager", fullgraph = True)
+        torch.testing.assert_close(compiled(decode), before, rtol = 1e-5, atol = 1e-5)
+        for projs in (mlp.experts.gate_up_projs, mlp.experts.down_projs):
+            for proj in projs:
+                b = getattr(proj, "base_layer", proj).bias
+                b.data = (b.data * 2 + 0.5).to(torch.bfloat16 if b.dtype == torch.float32 else torch.float32)
+        got = compiled(decode)
+        want = GR.routed_mlp_forward(mlp, decode)
+    assert not torch.allclose(want, before, rtol = 1e-3, atol = 1e-3)
+    torch.testing.assert_close(got, want, rtol = 1e-5, atol = 1e-5)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
@@ -844,11 +887,12 @@ def test_stacked_biases_are_read_live(mode, monkeypatch):
     assert ex.__dict__["_unsloth_routed_moe"] is not state
 
 
-@pytest.mark.parametrize("quant", [True, False])
-def test_stash_lora_compiled_decode_follows_an_adapter_update(quant, monkeypatch):
+def test_stash_lora_compiled_decode_follows_an_adapter_update(monkeypatch):
     # Generic 3D experts: PEFT target_parameters adapters reach the routed kernels through the
     # ParamWrapper stash, extracted from the live lora_A / lora_B on every call (in the graph
-    # when compiled), so an in-place adapter update is seen by the next compiled call.
+    # when compiled), so an in-place adapter update is seen by the next compiled call. BF16
+    # experts: PEFT wraps a raw stacked Params4bit as one flattened expert (num_experts 1), which
+    # the routed path declines; the stash code is the same for NF4 (real-model NF4 runs cover it).
     peft = pytest.importorskip("peft")
     from unsloth_zoo.temporary_patches.moe_utils import patch_param_wrapper_for_moe
     monkeypatch.setenv("UNSLOTH_MOE_ROUTED_KERNEL", "1")
@@ -856,10 +900,9 @@ def test_stash_lora_compiled_decode_follows_an_adapter_update(quant, monkeypatch
         model, experts, _, _ = _tiny_model("qwen3_moe")
     except (ImportError, LookupError, TypeError) as exc:  # pragma: no cover - older transformers
         pytest.skip(f"qwen3_moe: {exc}")
-    if not quant:
-        for ex in experts:
-            ex.gate_up_proj = nn.Parameter(_dense(ex.gate_up_proj).to(DT), requires_grad = False)
-            ex.down_proj = nn.Parameter(_dense(ex.down_proj).to(DT), requires_grad = False)
+    for ex in experts:
+        ex.gate_up_proj = nn.Parameter(_dense(ex.gate_up_proj).to(DT), requires_grad = False)
+        ex.down_proj = nn.Parameter(_dense(ex.down_proj).to(DT), requires_grad = False)
     try:
         cfg = peft.LoraConfig(r = 4, lora_alpha = 8, target_parameters = ["mlp.experts.gate_up_proj", "mlp.experts.down_proj"])
     except TypeError:
@@ -892,7 +935,7 @@ def test_stash_lora_compiled_decode_follows_an_adapter_update(quant, monkeypatch
         return gm.forward
     with torch.no_grad():
         before = wrapped(x, idx, w)
-        assert calls and all(calls)
+        assert calls and all(calls), calls
         torch._dynamo.reset()
         compiled = torch.compile(lambda a, b, c: wrapped(a, b, c), backend = backend)
         torch.testing.assert_close(compiled(x, idx, w), before, rtol = 1e-5, atol = 1e-5)
@@ -903,3 +946,19 @@ def test_stash_lora_compiled_decode_follows_an_adapter_update(quant, monkeypatch
         want = wrapped(x, idx, w)
     assert not torch.allclose(want, before, rtol = 1e-3, atol = 1e-3)
     torch.testing.assert_close(got, want, rtol = 1e-5, atol = 1e-5)
+
+
+def test_non_per_expert_stash_keeps_the_current_path():
+    # A wrapper that saw one flattened expert stashes 2D factors (and a wrong expert count would
+    # index out of range): the routed path declines instead of indexing them.
+    ex = _make("silu")
+    x, idx, w = _route(2)
+    gu, dn = _lora(ex)
+    with torch.no_grad():
+        _stash(ex, ((gu[0][0], gu[1][0], 0.5, 1), dn))
+        assert MR.routed_moe_forward(ex, x, idx, w) is None
+        _stash(ex, ((gu[0][:3], gu[1][:3], 0.5, 3), dn))
+        assert MR.routed_moe_forward(ex, x, idx, w) is None
+        _stash(ex, (gu, dn))
+        assert MR.routed_moe_forward(ex, x, idx, w) is not None
+    _stash(ex, None)

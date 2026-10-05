@@ -122,9 +122,10 @@ def _build_table(projs, device):
             for b in biases
         ) or b0.dtype not in _BIAS_KINDS:
             return None
-        # Pointers to each expert's live bias, not a stacked copy: load_state_dict and other
-        # in-place updates are seen without a rebuild.
-        bias, bias_kind = as_i64([b.data_ptr() for b in biases]), _BIAS_KINDS[b0.dtype]
+        # Each expert's live bias, read through a pointer table the launch resolves from these
+        # tensors (moe_routed._bias_args): in-place updates, load_state_dict and bitsandbytes
+        # recasting Linear4bit.bias to the input dtype (new storage) are all seen.
+        bias, bias_kind = list(biases), _BIAS_KINDS[b0.dtype]
     return {
         "w": as_i64(w), "a": as_i64(a), "a2": as_i64(a2), "c2": as_i64(c2),
         "off": torch.tensor(off, dtype = torch.float32, device = device),

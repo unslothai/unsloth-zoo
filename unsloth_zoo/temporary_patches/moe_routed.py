@@ -439,17 +439,31 @@ def _lora_args(lora, dummy):
     return B, H, float(scaling), B.shape[-1], (B.stride(0), B.stride(1), B.stride(2)), 0
 
 
+def _bias_args(tb):
+    # (BIAS, BIAS_KIND). A list of per-expert [N] biases (gpt-oss Linear4bit experts) is read
+    # through a pointer table resolved here, on every launch, from the live tensors: bitsandbytes
+    # recasts Linear4bit.bias in place of a new storage whenever the input dtype differs.
+    bias = tb["bias"]
+    if isinstance(bias, (list, tuple)):
+        got = lora_pointer_table(bias)
+        if got is not None:
+            return got
+        return torch.stack([b.float() for b in bias]), 4
+    return bias, tb["bias_kind"]
+
+
 def _gate_up(x, idx, tb, top_k, lora, alpha, limit, out, act = ACT_GPTOSS, interleaved = True):
     B, H, scaling, r, bs, kind = _lora_args(lora, tb["lut"])
+    bias, bias_kind = _bias_args(tb)
     # Triton launches on the current device, not the tensors' (multi-GPU device_map).
     with torch.cuda.device(x.device):
         _routed_gate_up_kernel[(idx.numel(), triton.cdiv(tb["N"], 4))](
             x, idx, tb["w"], tb["a"], tb["a2"], tb["c2"], tb["off"], tb["lut"],
-            tb["bias"] if tb["bias"] is not None else tb["lut"], B, H, out, tb["N"], tb["K"],
+            bias if bias is not None else tb["lut"], B, H, out, tb["N"], tb["K"],
             float(alpha), float(limit), scaling, bs[0], bs[1], bs[2],
             TOP_K = top_k, BLOCKSIZE = tb["blocksize"], BLOCKSIZE2 = tb["blocksize2"], NESTED = tb["nested"],
             STACKED = tb.get("stacked", False), ACT = act, INTERLEAVED = interleaved,
-            BIAS_KIND = tb["bias_kind"], HAS_LORA = lora is not None, R = r, R_PAD = triton.next_power_of_2(r),
+            BIAS_KIND = bias_kind, HAS_LORA = lora is not None, R = r, R_PAD = triton.next_power_of_2(r),
             LORA_KIND = kind, BLOCK_N = 4, BLOCK_K = _block_k(tb["K"], tb["blocksize"]), num_warps = 4,
         )
     return out
@@ -457,13 +471,14 @@ def _gate_up(x, idx, tb, top_k, lora, alpha, limit, out, act = ACT_GPTOSS, inter
 
 def _down(x, idx, rw, dense_rw, tb, top_k, lora, out):
     B, H, scaling, r, bs, kind = _lora_args(lora, tb["lut"])
+    bias, bias_kind = _bias_args(tb)
     with torch.cuda.device(x.device):
         _routed_down_kernel[(out.shape[0], triton.cdiv(tb["N"], 4))](
             x, idx, rw, tb["w"], tb["a"], tb["a2"], tb["c2"], tb["off"], tb["lut"],
-            tb["bias"] if tb["bias"] is not None else tb["lut"], B, H, out, tb["N"], tb["K"],
+            bias if bias is not None else tb["lut"], B, H, out, tb["N"], tb["K"],
             rw.stride(0), scaling, bs[0], bs[1], bs[2],
             TOP_K = top_k, DENSE_RW = dense_rw, BLOCKSIZE = tb["blocksize"], BLOCKSIZE2 = tb["blocksize2"],
-            NESTED = tb["nested"], STACKED = tb.get("stacked", False), BIAS_KIND = tb["bias_kind"],
+            NESTED = tb["nested"], STACKED = tb.get("stacked", False), BIAS_KIND = bias_kind,
             HAS_LORA = lora is not None, R = r, R_PAD = triton.next_power_of_2(r), LORA_KIND = kind,
             BLOCK_N = 4, BLOCK_K = _block_k(tb["K"], tb["blocksize"]), num_warps = 4,
         )
@@ -488,8 +503,10 @@ if triton is not None:
         N: int, K: int, blocksize: int, blocksize2: int, nested: bool, bias_kind: int, stacked: bool,
         top_k: int, lora_b: Optional[torch.Tensor], lora_b_list: List[torch.Tensor],
         lora_h: Optional[torch.Tensor], scaling: float, alpha: float, limit: float, act: int, interleaved: bool,
+        bias_list: List[torch.Tensor],
     ) -> torch.Tensor:
-        tb = _tb(w, a, a2, c2, off, lut, bias, N, K, blocksize, blocksize2, nested, bias_kind, stacked)
+        tb = _tb(w, a, a2, c2, off, lut, list(bias_list) if bias_list else bias, N, K, blocksize, blocksize2,
+                 nested, bias_kind, stacked)
         lora = _op_lora(lora_b, lora_b_list, lora_h, scaling)
         out = torch.empty((idx.numel(), N // 2), dtype = torch.float32, device = x.device)
         return _gate_up(x, idx, tb, top_k, lora, alpha, limit, out, act, interleaved)
@@ -497,7 +514,7 @@ if triton is not None:
     @_gate_up_op.register_fake
     def _routed_nf4_gate_up_fake(x, idx, w, a, a2, c2, off, lut, bias, N, K, blocksize, blocksize2, nested,
                                  bias_kind, stacked, top_k, lora_b, lora_b_list, lora_h, scaling, alpha, limit,
-                                 act, interleaved):
+                                 act, interleaved, bias_list):
         return x.new_empty((idx.numel(), N // 2), dtype = torch.float32)
 
     @torch.library.custom_op("unsloth_zoo::routed_nf4_down", mutates_args = ())
@@ -507,23 +524,31 @@ if triton is not None:
         bias: Optional[torch.Tensor], N: int, K: int, blocksize: int, blocksize2: int, nested: bool,
         bias_kind: int, stacked: bool, top_k: int, lora_b: Optional[torch.Tensor],
         lora_b_list: List[torch.Tensor], lora_h: Optional[torch.Tensor], scaling: float,
-        out_dtype: torch.dtype,
+        out_dtype: torch.dtype, bias_list: List[torch.Tensor],
     ) -> torch.Tensor:
-        tb = _tb(w, a, a2, c2, off, lut, bias, N, K, blocksize, blocksize2, nested, bias_kind, stacked)
+        tb = _tb(w, a, a2, c2, off, lut, list(bias_list) if bias_list else bias, N, K, blocksize, blocksize2,
+                 nested, bias_kind, stacked)
         lora = _op_lora(lora_b, lora_b_list, lora_h, scaling)
         out = torch.empty((idx.numel() // top_k, N), dtype = out_dtype, device = x.device)
         return _down(x, idx, rw, dense_rw, tb, top_k, lora, out)
 
     @_down_op.register_fake
     def _routed_nf4_down_fake(x, idx, rw, dense_rw, w, a, a2, c2, off, lut, bias, N, K, blocksize, blocksize2,
-                              nested, bias_kind, stacked, top_k, lora_b, lora_b_list, lora_h, scaling, out_dtype):
+                              nested, bias_kind, stacked, top_k, lora_b, lora_b_list, lora_h, scaling, out_dtype,
+                              bias_list):
         return x.new_empty((idx.numel() // top_k, N), dtype = out_dtype)
 
 
 def _table_args(tb):
-    return (tb["w"], tb["a"], tb["a2"], tb["c2"], tb["off"], tb["lut"], tb["bias"],
+    bias = tb["bias"]
+    return (tb["w"], tb["a"], tb["a2"], tb["c2"], tb["off"], tb["lut"], None if isinstance(bias, (list, tuple)) else bias,
             tb["N"], tb["K"], tb["blocksize"], tb["blocksize2"], tb["nested"], tb["bias_kind"],
             tb.get("stacked", False))
+
+
+def _bias_list(tb):
+    bias = tb["bias"]
+    return list(bias) if isinstance(bias, (list, tuple)) else []
 
 
 def _op_lora(lora_b, lora_b_list, lora_h, scaling):
@@ -549,7 +574,7 @@ def routed_gate_up(x, idx, tb, top_k, alpha, limit, lora = None, act = ACT_GPTOS
     if torch.compiler.is_compiling():
         return torch.ops.unsloth_zoo.routed_nf4_gate_up(
             x, idx, *_table_args(tb), top_k, *_lora_op_args(lora), float(alpha), float(limit),
-            int(act), bool(interleaved))
+            int(act), bool(interleaved), _bias_list(tb))
     # Eager launches directly: the dispatcher costs tens of us per call at decode sizes.
     out = torch.empty((idx.numel(), tb["N"] // 2), dtype = torch.float32, device = x.device)
     return _gate_up(x, idx, tb, top_k, lora, alpha, limit, out, act, interleaved)
@@ -559,15 +584,16 @@ def routed_down(x, idx, rw, dense_rw, tb, top_k, out_dtype, lora = None):
     """[T, N]: sum over the top-k slots of rw * (dequant(W[e]) @ x[slot] + bias[e] (+ LoRA))."""
     if torch.compiler.is_compiling():
         return torch.ops.unsloth_zoo.routed_nf4_down(
-            x, idx, rw, dense_rw, *_table_args(tb), top_k, *_lora_op_args(lora), out_dtype)
+            x, idx, rw, dense_rw, *_table_args(tb), top_k, *_lora_op_args(lora), out_dtype, _bias_list(tb))
     out = torch.empty((idx.numel() // top_k, tb["N"]), dtype = out_dtype, device = x.device)
     return _down(x, idx, rw, dense_rw, tb, top_k, lora, out)
 
 
 LORA_KINDS = {torch.float32: 1, torch.bfloat16: 2, torch.float16: 3}
-# (device, dtype, shape, addresses) -> int64 table. Kept for the process: a captured CUDA graph
-# may still read a table, and a new entry needs a new allocation (a .to() / cast / reload).
-_LORA_TABLES = {}
+# (device, dtype, shape, addresses) -> int64 table. Kept (a captured CUDA graph may still read a
+# table); a new entry needs new storage (a .to() / cast / reload, or bitsandbytes recasting a bias).
+_PTR_TABLES = {}
+_PTR_TABLES_MAX = 1 << 16
 
 
 def lora_pointer_table(weights):
@@ -583,7 +609,7 @@ def lora_pointer_table(weights):
         return None
     ptrs = tuple(w.data_ptr() for w in weights)
     key = (w0.device, w0.dtype, tuple(w0.shape), ptrs)
-    table = _LORA_TABLES.get(key)
+    table = _PTR_TABLES.get(key)
     if table is None:
         for w in weights:
             if w.dtype != w0.dtype or w.device != w0.device or w.shape != w0.shape or not w.is_contiguous():
@@ -592,7 +618,9 @@ def lora_pointer_table(weights):
             return None  # no host copy inside a capture: the stacked path runs instead
         with torch.inference_mode(False):
             table = torch.tensor(ptrs, dtype = torch.int64, device = w0.device)
-        _LORA_TABLES[key] = table
+        if len(_PTR_TABLES) >= _PTR_TABLES_MAX:
+            _PTR_TABLES.pop(next(iter(_PTR_TABLES)))
+        _PTR_TABLES[key] = table
     return table, kind
 
 
@@ -980,6 +1008,26 @@ def _build_stacked_nf4(experts, hidden_dim):
     }
 
 
+def _live_biases(experts, state):
+    """The state with each stacked [E, N] bias read from the module now, not the tensor the tables
+    were built with, so a compiled call sees a replaced bias too; None if it no longer fits."""
+    out = state
+    for name, key in (("gate_up_proj_bias", "gate_up"), ("down_proj_bias", "down")):
+        if state[key]["bias"] is None:
+            continue
+        bias = getattr(experts, name, None)
+        tb = state[key]
+        if (
+            not isinstance(bias, torch.Tensor) or tuple(bias.shape) != (state["E"], tb["N"])
+            or not bias.is_contiguous() or bias.dtype not in (torch.float32, torch.bfloat16, torch.float16)
+        ):
+            return None
+        if out is state:
+            out = dict(state)
+        out[key] = dict(tb, bias = bias.detach())
+    return out
+
+
 def _stash_lora(experts):
     """(gate_up terms, down terms) from the ParamWrapper stash; False when an adapter is attached
     some other way (a param-level wrapper the stash does not carry)."""
@@ -988,6 +1036,15 @@ def _stash_lora(experts):
     dn = take_moe_lora_stash(experts, "down_proj")
     if (gu is None and _has_lora_adapters(experts.gate_up_proj)) or (dn is None and _has_lora_adapters(experts.down_proj)):
         return False
+    for got in (gu, dn):
+        # (first [E, in, r], second [E, r, out], scaling, ...): anything else (a wrapper that saw
+        # one flattened expert, num_experts 1) is not per-expert LoRA the kernels can index.
+        if got is not None and (
+            len(got) < 3 or not isinstance(got[0], torch.Tensor) or not isinstance(got[1], torch.Tensor)
+            or got[0].dim() != 3 or got[1].dim() != 3 or got[0].shape[0] != got[1].shape[0]
+            or got[0].shape[2] != got[1].shape[1]
+        ):
+            return False
     return gu, dn
 
 
@@ -1151,6 +1208,14 @@ def routed_moe_forward(experts, hidden_states, top_k_index, top_k_weights):
     if lora is False:
         return None
     gu_lora, dn_lora = lora
+    if nf4:
+        E, I2 = state["E"], state["gate_up"]["N"]
+    else:
+        E, I2 = views[0].shape[0], views[0].shape[2]
+    # Each term must index this module's experts: first [E, in, r], second [E, r, out].
+    for got, n_in, n_out in ((gu_lora, hidden_dim, I2), (dn_lora, I2 // 2, hidden_dim)):
+        if got is not None and (tuple(got[0].shape[:2]) != (E, n_in) or got[1].shape[0] != E or got[1].shape[2] != n_out):
+            return None
     from .moe_utils import moe_compute_dtype
     T, top_k = top_k_index.shape
     x = hidden_states.reshape(T, hidden_dim)
@@ -1161,6 +1226,9 @@ def routed_moe_forward(experts, hidden_states, top_k_index, top_k_weights):
         x = x.to(moe_compute_dtype(hidden_states)).contiguous()
         out_dtype = hidden_states.dtype if hidden_states.dtype.is_floating_point else x.dtype
         fn = _nf4_grouped if mode == "grouped" else _nf4_routed
+        state = _live_biases(experts, state)
+        if state is None:
+            return None
         out = fn(state, x, top_k_index, rw, top_k, gu_lora, dn_lora, out_dtype)
     else:
         w_gu, w_dn, act, interleaved = views
