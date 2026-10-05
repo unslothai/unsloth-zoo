@@ -33,6 +33,7 @@ from __future__ import annotations
 
 __all__ = [
     "rewrite_forward_source",
+    "rewrite_forward_source_spliced",
     "TripletCapture",
 ]
 
@@ -61,6 +62,12 @@ class TripletCapture:
     softcap_idx: int | None = None
     softcap_stmt: ast.stmt | None = None
     softcap_expr: ast.AST | None = None
+    # Compiler fallback only (extended=True); defaults keep the hook's output unchanged.
+    labels_src: str = "labels"
+    guarded_scale_idx: int | None = None
+    guarded_scale_stmt: ast.stmt | None = None
+    guarded_scale_expr: ast.AST | None = None
+    legacy_body: list = field(default_factory = list)
 
 
 def _is_self_attr_call(node: ast.AST) -> bool:
@@ -185,6 +192,52 @@ def _softcap_cap(stmt: ast.stmt, logits_name: str):
     return cap
 
 
+def _guarded_scale(stmt: ast.stmt, logits_name: str):
+    """The `X` of `if X is not None: logits = logits * X` (CohereCompass), else None."""
+    if not (isinstance(stmt, ast.If) and not stmt.orelse and len(stmt.body) == 1):
+        return None
+    t = stmt.test
+    if not (isinstance(t, ast.Compare) and len(t.ops) == 1 and isinstance(t.ops[0], ast.IsNot)
+            and isinstance(t.comparators[0], ast.Constant) and t.comparators[0].value is None):
+        return None
+    a = stmt.body[0]
+    if not (isinstance(a, ast.Assign) and len(a.targets) == 1 and isinstance(a.targets[0], ast.Name)
+            and a.targets[0].id == logits_name and isinstance(a.value, ast.BinOp)
+            and isinstance(a.value.op, ast.Mult) and isinstance(a.value.left, ast.Name)
+            and a.value.left.id == logits_name and ast.dump(a.value.right) == ast.dump(t.left)):
+        return None
+    if any(isinstance(n, ast.Name) and n.id == logits_name for n in ast.walk(t.left)):
+        return None
+    return t.left
+
+
+_LEGACY_CE_BODY = (
+    "shift_logits = {logits}[..., :-1, :].contiguous()",
+    "shift_labels = labels[..., 1:].contiguous()",
+    "loss_fct = CrossEntropyLoss()",
+    "loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))",
+)
+
+
+def _legacy_ce_logits(if_block: ast.If) -> str | None:
+    """Logits name of the exact legacy shifted `CrossEntropyLoss()` block (Mamba, Clvp), else None."""
+    body = [ast.unparse(s) for s in if_block.body]
+    if body and body[0].startswith("labels = labels.to(") and _is_cast(if_block.body[0], ("labels",)):
+        body = body[1:]
+    if len(body) != len(_LEGACY_CE_BODY) or if_block.orelse:
+        return None
+    first = if_block.body[len(if_block.body) - len(body)]
+    if not (isinstance(first, ast.Assign) and isinstance(first.value, ast.Call)
+            and isinstance(first.value.func, ast.Attribute)
+            and isinstance(first.value.func.value, ast.Subscript)
+            and isinstance(first.value.func.value.value, ast.Name)):
+        return None
+    logits = first.value.func.value.value.id
+    if body != [line.format(logits = logits) for line in _LEGACY_CE_BODY]:
+        return None
+    return logits
+
+
 def _find_loss_assign_target(if_block: ast.If, call: ast.Call) -> str | None:
     for stmt in if_block.body:
         if isinstance(stmt, ast.Assign) and stmt.value is call and len(stmt.targets) == 1:
@@ -194,7 +247,8 @@ def _find_loss_assign_target(if_block: ast.If, call: ast.Call) -> str | None:
     return None
 
 
-def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> TripletCapture | None:
+def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef, extended: bool = False) -> TripletCapture | None:
+    """`extended` (compiler fallback) adds logit scale, explicit `shift_labels=` and legacy CE shapes."""
     body = fn.body
 
     if_idx = None
@@ -210,7 +264,7 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> TripletCapture | Non
                 and t.comparators[0].value is None):
             continue
         # Must contain a self.loss_function call
-        if _find_loss_function_call(stmt) is None:
+        if _find_loss_function_call(stmt) is None and not (extended and _legacy_ce_logits(stmt)):
             continue
         if_idx = i
         if_node = stmt
@@ -223,70 +277,85 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> TripletCapture | Non
     # CSM auxiliary depth-decoder loss).
     if if_node.orelse:
         return None
-    loss_positions = [k for k, s in enumerate(if_node.body) if _is_loss_function_assign(s)]
-    if len(loss_positions) != 1:
-        return None
-    loss_k = loss_positions[0]
-    loss_assign = if_node.body[loss_k]
-    loss_call = loss_assign.value
-    loss_name = loss_assign.targets[0].id
+    legacy_logits = None
+    if extended and _find_loss_function_call(if_node) is None:
+        legacy_logits = _legacy_ce_logits(if_node)
+    if legacy_logits is not None:
+        # Stock reduces by mean over non-ignored tokens and ignores num_items_in_batch.
+        loss_name, logits_name, labels_src = "loss", legacy_logits, "labels"
+        pre_stmts, post_stmts, extra_loss_kws = [], [], []
+        vocab_expr, kwargs_name = None, None
+        legacy_body = list(if_node.body)
+    else:
+        legacy_body = []
+        loss_positions = [k for k, s in enumerate(if_node.body) if _is_loss_function_assign(s)]
+        if len(loss_positions) != 1:
+            return None
+        loss_k = loss_positions[0]
+        loss_assign = if_node.body[loss_k]
+        loss_call = loss_assign.value
+        loss_name = loss_assign.targets[0].id
 
-    # Locate logits-bearing arg: first positional or `logits=` kw.
-    logits_name = None
-    if loss_call.args:
-        a0 = loss_call.args[0]
-        if isinstance(a0, ast.Name):
-            logits_name = a0.id
-    if logits_name is None:
+        # Locate logits-bearing arg: first positional or `logits=` kw.
+        logits_name = None
+        if loss_call.args:
+            a0 = loss_call.args[0]
+            if isinstance(a0, ast.Name):
+                logits_name = a0.id
+        if logits_name is None:
+            for kw in loss_call.keywords:
+                if kw.arg == "logits" and isinstance(kw.value, ast.Name):
+                    logits_name = kw.value.id
+                    break
+        if logits_name is None:
+            return None
+        # transformers 4.x casts around the call; anything else would be dropped by the rewrite.
+        pre_stmts = if_node.body[:loss_k]
+        post_stmts = if_node.body[loss_k + 1:]
+        if not all(_is_cast(s, ("labels", logits_name)) for s in pre_stmts):
+            return None
+        if not all(_is_cast(s, (loss_name, logits_name)) for s in post_stmts):
+            return None
+
+        # Plain `labels` only: aliases (CSM `labels=backbone_labels`) need bespoke handling.
+        labels_arg = None
+        labels_src = "labels"
+        if len(loss_call.args) >= 2:
+            if isinstance(loss_call.args[1], ast.Name):
+                labels_arg = loss_call.args[1].id
         for kw in loss_call.keywords:
-            if kw.arg == "logits" and isinstance(kw.value, ast.Name):
-                logits_name = kw.value.id
+            if kw.arg == "labels":
+                if isinstance(kw.value, ast.Name):
+                    labels_arg = kw.value.id
+                elif (extended and isinstance(kw.value, ast.Constant) and kw.value.value is None
+                      and any(k.arg == "shift_labels" for k in loss_call.keywords)):
+                    # PPFormulaNet: aligned targets go in `shift_labels`; the adapter takes them as is.
+                    labels_arg, labels_src = "labels", "None"
+                else:
+                    return None
+        if labels_arg != "labels":
+            return None
+
+        # vocab_size: keyword preferred, else 3rd positional.
+        vocab_expr = None
+        for kw in loss_call.keywords:
+            if kw.arg == "vocab_size":
+                vocab_expr = kw.value
                 break
-    if logits_name is None:
-        return None
-    # transformers 4.x casts around the call; anything else would be dropped by the rewrite.
-    pre_stmts = if_node.body[:loss_k]
-    post_stmts = if_node.body[loss_k + 1:]
-    if not all(_is_cast(s, ("labels", logits_name)) for s in pre_stmts):
-        return None
-    if not all(_is_cast(s, (loss_name, logits_name)) for s in post_stmts):
-        return None
+        if vocab_expr is None and len(loss_call.args) >= 3:
+            vocab_expr = loss_call.args[2]
 
-    # Labels arg must be literally the plain `labels` name; aliased labels
-    # (e.g. CSM `labels=backbone_labels`) need bespoke handling.
-    labels_arg = None
-    if len(loss_call.args) >= 2:
-        if isinstance(loss_call.args[1], ast.Name):
-            labels_arg = loss_call.args[1].id
-    for kw in loss_call.keywords:
-        if kw.arg == "labels":
-            if isinstance(kw.value, ast.Name):
-                labels_arg = kw.value.id
-            else:
-                return None
-    if labels_arg != "labels":
-        return None
-
-    # vocab_size: keyword preferred, else 3rd positional.
-    vocab_expr = None
-    for kw in loss_call.keywords:
-        if kw.arg == "vocab_size":
-            vocab_expr = kw.value
-            break
-    if vocab_expr is None and len(loss_call.args) >= 3:
-        vocab_expr = loss_call.args[2]
-
-    # **kwargs unpack + any explicit kwargs beyond {logits, labels, vocab_size}.
-    kwargs_name = None
-    extra_loss_kws: list = []
-    for kw in loss_call.keywords:
-        if kw.arg is None:
-            if isinstance(kw.value, ast.Name):
-                kwargs_name = kw.value.id
-            continue
-        if kw.arg in ("logits", "labels", "vocab_size"):
-            continue
-        extra_loss_kws.append((kw.arg, kw.value))
+        # **kwargs unpack + any explicit kwargs beyond {logits, labels, vocab_size}.
+        kwargs_name = None
+        extra_loss_kws: list = []
+        for kw in loss_call.keywords:
+            if kw.arg is None:
+                if isinstance(kw.value, ast.Name):
+                    kwargs_name = kw.value.id
+                continue
+            if kw.arg in ("logits", "labels", "vocab_size"):
+                continue
+            extra_loss_kws.append((kw.arg, kw.value))
 
     # Find the lm_head assignment for logits_name (walking upward from if_idx).
     head_attr = None
@@ -339,6 +408,8 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> TripletCapture | Non
     # Except one `logits = tanh(logits / cap) * cap` (RecurrentGemma): the kernel reapplies it.
     softcap_idx = None
     softcap_expr = None
+    guarded_idx = None
+    guarded_expr = None
     for j in range(lm_head_assign_idx + 1, if_idx):
         if j == loss_init_idx:
             continue
@@ -347,6 +418,14 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> TripletCapture | Non
             if softcap_expr is not None:
                 softcap_idx = j
                 continue
+            # Kernel order is multiply, divide, softcap: only a scale ahead of any softcap.
+            if extended and guarded_idx is None:
+                guarded_expr = _guarded_scale(body[j], logits_name)
+                if guarded_expr is not None:
+                    if any(name == "logit_scale_multiply" for name, _ in scale_kws + extra_loss_kws):
+                        return None
+                    guarded_idx = j
+                    continue
         for n in ast.walk(body[j]):
             if isinstance(n, ast.Name) and n.id == logits_name:
                 return None
@@ -369,6 +448,11 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> TripletCapture | Non
         softcap_idx=softcap_idx,
         softcap_stmt=body[softcap_idx] if softcap_idx is not None else None,
         softcap_expr=softcap_expr,
+        labels_src=labels_src,
+        guarded_scale_idx=guarded_idx,
+        guarded_scale_stmt=body[guarded_idx] if guarded_idx is not None else None,
+        guarded_scale_expr=guarded_expr,
+        legacy_body=legacy_body,
     )
 
 
@@ -396,9 +480,12 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
     # matmul). UNSLOTH_RETURN_LOGITS=1: run the full lm_head matmul once and
     # route loss through self.loss_function on those logits (avoids the double
     # matmul of fused-kernel + separate logits_rhs).
+    if cap.guarded_scale_expr is not None and "logit_scale_multiply" not in already:
+        scale_extra += f", logit_scale_multiply={ast.unparse(cap.guarded_scale_expr)}"
     if cap.softcap_expr is not None and "logit_softcapping" not in already:
         scale_extra += f", logit_softcapping={ast.unparse(cap.softcap_expr)}"
-    if not (cap.pre_stmts or cap.post_stmts or cap.softcap_expr is not None):
+    if not (cap.pre_stmts or cap.post_stmts or cap.softcap_expr is not None
+            or cap.guarded_scale_expr is not None or cap.legacy_body or cap.labels_src != "labels"):
         template = textwrap.dedent(f"""
             if labels is not None:
                 if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1':
@@ -417,32 +504,65 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
         return ast.parse(template).body
 
     # Fused branch keeps only loss casts: the kernel moves labels and accumulates in fp32 itself.
-    softcap = [ast.unparse(cap.softcap_stmt)] if cap.softcap_stmt is not None else []
+    softcap = [
+        ast.unparse(s) for s in (cap.guarded_scale_stmt, cap.softcap_stmt) if s is not None
+    ]
     pre = [ast.unparse(s) for s in cap.pre_stmts]
     post = [ast.unparse(s) for s in cap.post_stmts]
     loss_casts = [ast.unparse(s) for s in cap.post_stmts if s.targets[0].id == loss]
-    unfused = [
-        f"{logits} = {logits_rhs}", *softcap, *pre,
-        f"{loss} = self.loss_function({logits}, labels, vocab_size={vocab}{extra}{kwargs_unpack})",
-        *post,
-    ]
-    fused = [
-        f"{loss} = unsloth_fused_lm_head_loss({hidden_src}, self.{head_attr}, labels, "
-        f"vocab_size={vocab}{extra}{scale_extra}{kwargs_unpack})",
-        *loss_casts,
-        f"{logits} = EMPTY_LOGITS",
-    ]
+    if cap.legacy_body:
+        unfused = [f"{logits} = {logits_rhs}", *softcap, *(ast.unparse(s) for s in cap.legacy_body)]
+        fused_call = f"{loss} = unsloth_fused_lm_head_loss({hidden_src}, self.{head_attr}, labels{scale_extra})"
+    else:
+        unfused = [
+            f"{logits} = {logits_rhs}", *softcap, *pre,
+            f"{loss} = self.loss_function({logits}, {cap.labels_src}, vocab_size={vocab}{extra}{kwargs_unpack})",
+            *post,
+        ]
+        fused_call = (
+            f"{loss} = unsloth_fused_lm_head_loss({hidden_src}, self.{head_attr}, labels, "
+            f"vocab_size={vocab}{extra}{scale_extra}{kwargs_unpack})"
+        )
+    fused = [fused_call, *loss_casts, f"{logits} = EMPTY_LOGITS"]
     def ind(lines, n):
-        return "\n".join(" " * n + x for x in lines)
+        return "\n".join(textwrap.indent(x, " " * n) for x in lines)
 
+    # The kernel reads a zero multiplier as "no scale": a guarded zero scale takes the exact path.
+    zero_scale = ""
+    if cap.guarded_scale_expr is not None:
+        scale_src = ast.unparse(cap.guarded_scale_expr)
+        zero_scale = f" or ({scale_src} is not None and {scale_src} == 0)"
     template = (
         "if labels is not None:\n"
-        "    if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1':\n"
+        f"    if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1'{zero_scale}:\n"
         f"{ind(unfused, 8)}\n"
         f"    else:\n{ind(fused, 8)}\n"
         f"else:\n{ind([f'{logits} = {logits_rhs}', *softcap, f'{loss} = None'], 4)}"
     )
     return ast.parse(template).body
+
+
+def _plan(source: str, extended: bool):
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except SyntaxError:
+        return None
+    if not tree.body or not isinstance(tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return None
+    fn = tree.body[0]
+    cap = _capture(fn, extended = extended)
+    if cap is None:
+        return None
+    delete_indices = {cap.lm_head_assign_idx, cap.if_block_idx}
+    if cap.loss_init_idx is not None:
+        delete_indices.add(cap.loss_init_idx)
+    # A softcap may read names bound after the head (`cap = self.config...`): insert at the if.
+    insert_at = min(delete_indices)
+    for idx in (cap.softcap_idx, cap.guarded_scale_idx):
+        if idx is not None:
+            delete_indices.add(idx)
+            insert_at = cap.if_block_idx
+    return tree, fn, cap, _build_replacement(cap), delete_indices, insert_at
 
 
 def rewrite_forward_source(source: str) -> tuple[str | None, TripletCapture | None]:
@@ -451,27 +571,11 @@ def rewrite_forward_source(source: str) -> tuple[str | None, TripletCapture | No
     Returns (new_source, capture) on success, (None, None) if the canonical
     triplet wasn't found (and the caller should leave the class alone).
     """
-    try:
-        tree = ast.parse(textwrap.dedent(source))
-    except SyntaxError:
+    plan = _plan(source, extended = False)
+    if plan is None:
         return (None, None)
-    if not tree.body or not isinstance(tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef)):
-        return (None, None)
-    fn = tree.body[0]
-    cap = _capture(fn)
-    if cap is None:
-        return (None, None)
-
-    new_block = _build_replacement(cap)
+    tree, fn, cap, new_block, delete_indices, insert_at = plan
     body = fn.body
-    delete_indices = {cap.lm_head_assign_idx, cap.if_block_idx}
-    if cap.loss_init_idx is not None:
-        delete_indices.add(cap.loss_init_idx)
-    # A softcap may read names bound after the head (`cap = self.config...`): insert at the if.
-    insert_at = min(delete_indices)
-    if cap.softcap_idx is not None:
-        delete_indices.add(cap.softcap_idx)
-        insert_at = cap.if_block_idx
     new_body = []
     for i, stmt in enumerate(body):
         if i == insert_at:
@@ -494,6 +598,35 @@ def rewrite_forward_source(source: str) -> tuple[str | None, TripletCapture | No
     ]
     ast.fix_missing_locations(tree)
     return (ast.unparse(tree), cap)
+
+
+def rewrite_forward_source_spliced(source: str) -> tuple[str | None, TripletCapture | None]:
+    """Extended rewrite spliced by line span, so text `create_standalone_class` regex-parses is kept."""
+    plan = _plan(source, extended = True)
+    if plan is None:
+        return (None, None)
+    tree, fn, cap, new_block, delete_indices, insert_at = plan
+    lines = source.splitlines(keepends = True)
+    first = next(line for line in lines if line.strip())
+    prefix = first[: len(first) - len(first.lstrip())]
+    body = fn.body
+    indent = prefix + " " * body[insert_at].col_offset
+    block = "".join(textwrap.indent(ast.unparse(s), indent) + "\n" for s in new_block)
+    drop = set()
+    for i in delete_indices:
+        drop.update(range(body[i].lineno - 1, body[i].end_lineno))
+    out = []
+    for k, line in enumerate(lines):
+        if k == body[insert_at].lineno - 1:
+            out.append(block)
+        if k not in drop:
+            out.append(line)
+    new_source = "".join(out)
+    try:
+        ast.parse(textwrap.dedent(new_source))
+    except SyntaxError:
+        return (None, None)
+    return (new_source, cap)
 
 
 def _decorator_name(node: ast.AST) -> str | None:
