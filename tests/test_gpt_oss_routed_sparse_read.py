@@ -55,7 +55,6 @@ def _maybe_compile(fn, compiled):
     return torch.compile(fn, fullgraph = True)
 
 
-@pytest.mark.skipif(torch.cuda.get_device_capability()[0] < 8, reason = "bf16 kernels need sm80+")
 @pytest.mark.parametrize("compiled", [False, True])
 @pytest.mark.parametrize("T", [1, 3])
 def test_bf16_reads_only_routed_experts(compiled, T):
