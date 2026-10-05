@@ -888,12 +888,27 @@ def _nf4_table(param, device):
     }
 
 
+def _stacked_sources(qs):
+    # Every quant-state tensor _nf4_table reads; held by the state so a replaced one gets a new address.
+    ts = [qs.absmax, qs.code]
+    if qs.nested:
+        ts += [qs.state2.absmax, qs.state2.code]
+        if isinstance(qs.offset, torch.Tensor):
+            ts.append(qs.offset)
+    return ts
+
+
 def _stacked_key(experts):
     gu, dn = experts.gate_up_proj, experts.down_proj
     biases = tuple(
         b.data_ptr() if isinstance(b, torch.Tensor) else 0
         for b in (getattr(experts, "gate_up_proj_bias", None), getattr(experts, "down_proj_bias", None)))
-    return (gu.data_ptr(), gu.quant_state.absmax.data_ptr(), dn.data_ptr(), dn.quant_state.absmax.data_ptr()) + biases
+    key = [gu.data_ptr(), dn.data_ptr()]
+    for qs in (gu.quant_state, dn.quant_state):
+        # Version counters catch in-place edits of buffers the tables copy (offset, code, state2).
+        key += [(t.data_ptr(), t._version) for t in _stacked_sources(qs)]
+        key += [qs.blocksize, bool(qs.nested), None if not qs.nested or isinstance(qs.offset, torch.Tensor) else float(qs.offset)]
+    return tuple(key) + biases
 
 
 def prepare_stacked_nf4(experts, hidden_dim = None):
@@ -913,6 +928,7 @@ def prepare_stacked_nf4(experts, hidden_dim = None):
         experts.__dict__["_unsloth_routed_moe"] = False
         return None
     state["key"] = key
+    state["held"] = [_stacked_sources(p.quant_state) for p in (experts.gate_up_proj, experts.down_proj)]
     experts.__dict__["_unsloth_routed_moe"] = state
     return state
 

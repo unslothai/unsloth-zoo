@@ -361,6 +361,38 @@ def test_moved_weights_rebuild_the_tables():
     assert not torch.equal(a, b) and torch.equal(b, c)
 
 
+@pytest.mark.parametrize("proj", ["gate_up_proj", "down_proj"])
+@pytest.mark.parametrize("what", ["absmax", "nested_absmax", "nested_code", "offset", "offset_inplace", "nested_code_inplace"])
+def test_replaced_quant_state_buffers_rebuild_the_tables(proj, what):
+    ex = _make("silu")
+    x, idx, w = _route(2)
+    qs = getattr(ex, proj).quant_state
+    with torch.no_grad():
+        before = MR.routed_moe_forward(ex, x, idx, w)
+        if what == "absmax":
+            qs.absmax = qs.absmax.flip(0).contiguous()
+        elif what == "nested_absmax":
+            qs.state2.absmax = qs.state2.absmax * 1.5
+        elif what == "nested_code":
+            qs.state2.code = qs.state2.code * 1.5
+        elif what == "offset":
+            qs.offset = qs.offset + 0.05
+        elif what == "offset_inplace":
+            if qs.offset.dtype != torch.float32:
+                qs.offset = qs.offset.float()
+                MR.routed_moe_forward(ex, x, idx, w)
+            qs.offset.add_(0.05)
+        else:
+            if qs.state2.code.dtype != torch.float32:
+                pytest.skip("the tables read the nested code in place")
+            qs.state2.code.mul_(1.5)
+        got = MR.routed_moe_forward(ex, x, idx, w)
+        ex.__dict__.pop("_unsloth_routed_moe")
+        fresh = MR.routed_moe_forward(ex, x, idx, w)
+    assert not torch.equal(before, fresh)
+    assert torch.equal(got, fresh)
+
+
 @pytest.mark.parametrize("use_lora", [False, True])
 @pytest.mark.parametrize("mode", ["1", "grouped", "bf16"])
 def test_fullgraph_compile_and_cuda_graph_replay(use_lora, mode, monkeypatch):
@@ -419,7 +451,7 @@ def test_fullgraph_compile_and_cuda_graph_replay(use_lora, mode, monkeypatch):
 @pytest.mark.parametrize("mode", ["1", "grouped"])
 def test_launches_on_the_tensors_device(quant, mode, monkeypatch):
     # A multi-GPU device_map puts layers on a non-current GPU; every launch must follow the tensors.
-    if mode == "grouped" and (not quant or DT != torch.bfloat16):
+    if mode == "grouped" and (not quant or DT != torch.bfloat16 or not MU._check_torch_grouped_mm_supported()):
         pytest.skip("grouped comparator: NF4 experts and bf16 (torch._grouped_mm) only")
     ex = _make("silu", quant = quant)
     for name in ("gate_up_proj", "down_proj"):
