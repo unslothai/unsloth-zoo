@@ -134,7 +134,12 @@ def test_installed_forwards_are_fused(module, cls):
     if "loss = loss_fct(\n" not in source:
         pytest.skip(f"{cls} does not use the multi-line call in this transformers")
     _, fused = _fused(source, cls)
-    assert fused
+    if "self.lm_head(" not in source:
+        # transformers 4.57 (and Qwen2-Audio 5.4 - 5.9) take `logits = outputs[0]` from the inner
+        # language model: there is no local hidden state to fuse, so the rewriter must decline.
+        assert not fused, f"{cls} has no local lm_head call, yet its forward was rewritten"
+    else:
+        assert fused
 
 
 def test_inner_model_logits_are_not_fused():
