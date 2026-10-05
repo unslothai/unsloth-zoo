@@ -16,24 +16,18 @@
 
 """Routed MoE expert inference: only the experts the router picked are read.
 
-Decode-sized calls (at most *_MAX_SLOTS (token, expert) slots, no grad) skip the
-dequantize-every-expert + grouped_mm path. No host sync and a fixed grid for a given shape,
-so the calls compile fullgraph (opaque custom ops) and capture in CUDA graphs.
+Decode-sized no-grad calls skip dequantize-all + grouped_mm; no host sync, fixed grid.
 
 NF4 (bitsandbytes), two launches per layer, dequantized inside the GEMV:
   gate_up: one GEMV per (token, slot) -> [P, I] fp32 activation (bias, LoRA B, gated act fused).
   down:    per token, GEMV per slot, bias, LoRA B, routing weight and the top-k sum in a fixed
            order, written once in the output dtype (fp32 accumulation, no atomics).
 Constexpr axes:
-  STACKED: one stacked Params4bit [E, N, K] (expert e's rows start at row e * N of the flat
-           buffer; absmax / state2 indices are global) or a pointer table of per-expert
-           Linear4bit buffers (gpt-oss ModuleList experts).
+  STACKED: one stacked Params4bit [E, N, K], or a pointer table of per-expert Linear4bit.
   ACT:     gpt-oss clamp-swiglu, silu, gelu (tanh) or gelu (erf), gate * up.
   INTERLEAVED: gate / up rows alternate, else [gate; up] halves.
-  LORA_KIND: expert LoRA B as one [E, N, r] tensor (the ParamWrapper stash), or a table of
-           pointers to each expert's live lora_B weight (gpt-oss per-expert Linear4bit LoRA;
-           H = A @ x from the matching lora_A table), so optimizer steps are never stale.
-BF16 / FP16 3D experts reuse the expert-major kernel (each active expert's tile read once).
+  LORA_KIND: LoRA B as one [E, N, r] tensor, or a pointer table to each live lora_B.
+BF16 / FP16 3D experts use the expert-major kernel.
 """
 
 __all__ = [
@@ -85,14 +79,9 @@ def _env_int(name, default):
 # Above this many (token, expert) slots the routed kernels lose to dequant + grouped_mm.
 # gpt-oss (gpt_oss_routed.py, top-4):
 ROUTED_MAX_SLOTS = _env_int("UNSLOTH_MOE_ROUTED_MAX_SLOTS", 64)
-# Generic 3D experts (routed_moe_forward). The NF4 GEMV reads each slot's expert once, so its
-# cost grows with slots P while dequantize-all + grouped_mm reads every expert once: the limit
-# scales with the expert count E. Measured on B200 per layer call (CUDA graphs) against
-# dequantize-all + grouped_mm, routed / current GPU time at P = 0.5E, E, 2E: Qwen3.5-35B-A3B
-# shape (E 256) 0.40 / 0.67 / 1.19, gemma-4-26B-A4B (E 128) 0.47 / 0.82 / 1.43, gpt-oss-20b dims
-# (E 32) 0.39 / 0.67 / 1.20; tiny (E 4-8, H 256) still 0.29 at 8E. Route while P <= E.
-# BF16 routed wins only up to 32 slots (expert-major kernel, each active tile read once).
-# UNSLOTH_MOE_ROUTED_MAX_SLOTS sets an absolute slot limit instead.
+# Generic 3D experts: routed NF4 cost grows with slots P, dequantize-all with E. On B200,
+# routed / current time is ~0.67 at P = E and ~1.2 at 2E across E 32-256, so route while P <= E.
+# BF16 routed wins only up to 32 slots. UNSLOTH_MOE_ROUTED_MAX_SLOTS sets an absolute limit.
 NF4_MAX_SLOTS = _env_int("UNSLOTH_MOE_ROUTED_MAX_SLOTS", -1)
 NF4_MAX_SLOTS = None if NF4_MAX_SLOTS < 0 else NF4_MAX_SLOTS
 NF4_SLOTS_PER_EXPERT = 1.0
@@ -184,9 +173,7 @@ if triton is not None:
     @triton.jit
     def _lora_b(acc, LORA_B, LORA_H, e, s, rows64, rmask, scaling, stride_be, stride_bn, stride_br,
                 R: tl.constexpr, R_PAD: tl.constexpr, LORA_KIND: tl.constexpr):
-        # acc += scaling * B[e][rows] @ H[s], H = A[e] @ x precomputed per slot. LORA_KIND 0: B is
-        # one [E, N, r] tensor (any strides); else a table of pointers to each expert's live
-        # [N, r] weight, so in-place optimizer steps are seen with nothing restacked.
+        # acc += scaling * B[e][rows] @ H[s], H = A[e] @ x precomputed per slot.
         j = tl.arange(0, R_PAD)
         jmask = j < R
         if LORA_KIND == 0:
@@ -200,9 +187,7 @@ if triton is not None:
 
     @triton.jit
     def _expert_bias(BIAS, e, N, rows64, rmask, BIAS_KIND: tl.constexpr):
-        # Each expert's live bias, never a copy, so load_state_dict / in-place updates are seen.
-        # 1 / 2 / 3: int64 table of per-expert pointers (fp32 / bf16 / fp16), 4: the stacked
-        # layout's own contiguous [E, N] tensor.
+        # Live bias, never a copy. 1 / 2 / 3: pointer table (fp32 / bf16 / fp16), 4: stacked [E, N].
         if BIAS_KIND == 4:
             B = BIAS + e * N
         elif BIAS_KIND == 2:
@@ -239,9 +224,7 @@ if triton is not None:
         BIAS_KIND: tl.constexpr, HAS_LORA: tl.constexpr, R: tl.constexpr, R_PAD: tl.constexpr,
         LORA_KIND: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     ):
-        # gu = dequant(W[IDX[p]]) @ X[p // TOP_K] + BIAS[IDX[p]] (+ LoRA), then the gated
-        # activation: OUT[p] is the [N // 2] fp32 expert intermediate. Each program owns
-        # BLOCK_N // 2 intermediate columns; its rows alternate gate, up.
+        # Each program owns BLOCK_N // 2 intermediate columns; its rows alternate gate, up.
         alpha = alpha.to(tl.float32)
         limit = limit.to(tl.float32)
         p = tl.program_id(0)
@@ -321,8 +304,7 @@ if triton is not None:
     @triton.jit
     def _lora_h_kernel(X, IDX, A_PTRS, OUT, K, ROW_DIV, R: tl.constexpr, LORA_KIND: tl.constexpr,
                        BLOCK_K: tl.constexpr):
-        # OUT[p, j] = A[IDX[p]][j] @ X[p // ROW_DIV], fp32; A through the pointer table, each
-        # expert's live [R, K] weight (row major). One program per (slot, rank row).
+        # OUT[p, j] = A[IDX[p]][j] @ X[p // ROW_DIV], fp32. One program per (slot, rank row).
         p = tl.program_id(0)
         j = tl.program_id(1)
         e = tl.load(IDX + p).to(tl.int64)
@@ -380,8 +362,7 @@ if triton is not None:
         BLOCK_K: tl.constexpr,
         SPLIT_K: tl.constexpr,
     ):
-        # One program per (expert, n block, k split): reads the expert's weight tile once and
-        # multiplies it with every slot routed to that expert (masked dot over all P slots).
+        # Reads the expert's weight tile once for every slot routed to it (masked dot over P).
         e = tl.program_id(0)
         nb = tl.program_id(1)
         sk = tl.program_id(2)
@@ -425,8 +406,7 @@ def _block_k(K, blocksize):
 
 
 def _lora_args(lora, dummy):
-    # (B, H [P, r] fp32, scaling, r, strides, LORA_KIND) or dummies. B: one [E, N, r] tensor (any
-    # strides), or a list of each expert's [N, r] weight, read in place through a pointer table.
+    # (B, H [P, r] fp32, scaling, r, strides, LORA_KIND) or dummies.
     if lora is None:
         return dummy, dummy, 0.0, 1, (0, 0, 0), 0
     B, H, scaling = lora[:3]
@@ -440,9 +420,8 @@ def _lora_args(lora, dummy):
 
 
 def _bias_args(tb):
-    # (BIAS, BIAS_KIND). A list of per-expert [N] biases (gpt-oss Linear4bit experts) is read
-    # through a pointer table resolved here, on every launch, from the live tensors: bitsandbytes
-    # recasts Linear4bit.bias in place of a new storage whenever the input dtype differs.
+    # Per-expert bias tables are resolved on every launch: bitsandbytes recasts Linear4bit.bias
+    # into new storage whenever the input dtype differs.
     bias = tb["bias"]
     if isinstance(bias, (list, tuple)):
         got = lora_pointer_table(bias)
@@ -492,9 +471,7 @@ def _tb(w, a, a2, c2, off, lut, bias, N, K, blocksize, blocksize2, nested, bias_
 
 
 if triton is not None:
-    # custom_op (torch >= 2.4), not triton_op: Inductor before torch 2.12 dropped the gate_up
-    # kernel from the graph (its output reached down uninitialized). Opaque calls stay
-    # fullgraph and CUDA-graph safe.
+    # custom_op, not triton_op: Inductor before torch 2.12 dropped the gate_up kernel from the graph.
 
     @torch.library.custom_op("unsloth_zoo::routed_nf4_gate_up", mutates_args = ())
     def _gate_up_op(
@@ -558,7 +535,6 @@ def _op_lora(lora_b, lora_b_list, lora_h, scaling):
 
 
 def _lora_op_args(lora):
-    # (lora_b, lora_b_list, lora_h, scaling) for the custom ops.
     if lora is None:
         return None, [], None, 0.0
     B = lora[0]
@@ -569,8 +545,7 @@ def _lora_op_args(lora):
 
 def routed_gate_up(x, idx, tb, top_k, alpha, limit, lora = None, act = ACT_GPTOSS, interleaved = True):
     """[T * top_k, N // 2] fp32: act(dequant(W[idx[p]]) @ x[p // top_k] + bias[idx[p]] (+ LoRA)).
-    lora: (B, H [P, r] fp32, scaling) or None; B is one [E, N, r] tensor (any strides) or a list of
-    each expert's [N, r] weight, which the kernels read in place (lora_pointer_table)."""
+    lora: (B, H [P, r] fp32, scaling) or None; B: [E, N, r] or a list of per-expert [N, r]."""
     if torch.compiler.is_compiling():
         return torch.ops.unsloth_zoo.routed_nf4_gate_up(
             x, idx, *_table_args(tb), top_k, *_lora_op_args(lora), float(alpha), float(limit),
@@ -598,11 +573,8 @@ _PTR_TABLES_MAX = 1 << 16
 
 def lora_pointer_table(weights):
     """(int64 [E] table of the weights' addresses, LORA_KIND), or None unless every weight is a
-    contiguous CUDA tensor of one shape, dtype and device in LORA_KINDS.
-
-    Resolved on every call from the weights passed in (inside the custom ops when compiled), so
-    the kernels always read each expert's live adapter: in-place optimizer steps need nothing,
-    and a moved, recast or reloaded weight gets its own table. Only a lookup once built."""
+    contiguous CUDA tensor of one shape, dtype and device in LORA_KINDS. Resolved per call, so
+    the kernels always read each expert's live adapter."""
     w0 = weights[0]
     kind = LORA_KINDS.get(w0.dtype)
     if kind is None or not w0.is_cuda:
@@ -830,9 +802,7 @@ def routed_bf16_moe(x, idx, routing_weights, w_gu, w_dn, b_gu, b_dn, act, interl
 
 def _act_code(experts):
     """ACT constexpr for this experts module, or None when its activation is not one the
-    kernels implement (an own _apply_gate, an unknown act_fn). Probed by value, not class name
-    (ACT2FN has many spellings, and one class can carry different parameters); called only when
-    a module's tables / plan are built, which cache the verdict per module."""
+    kernels implement. Probed by value, not class name (ACT2FN has many spellings)."""
     from .moe_utils import _uses_own_apply_gate
     if "GptOssExperts" in type(experts).__name__:
         return ACT_GPTOSS
@@ -951,8 +921,7 @@ _DECLINED = set()
 
 
 def _decline(experts, reason):
-    """None, logging once per (experts class, reason) under UNSLOTH_ENABLE_LOGGING=1: the
-    census of MoE families that reach the hook but keep the dequantize-all path."""
+    """None, logging once per (experts class, reason) under UNSLOTH_ENABLE_LOGGING=1."""
     key = (type(experts).__name__, reason)
     if key not in _DECLINED:
         _DECLINED.add(key)
@@ -998,8 +967,7 @@ def _build_stacked_nf4(experts, hidden_dim):
             or not bias.is_contiguous() or bias.dtype not in (torch.float32, torch.bfloat16, torch.float16)
         ):
             return _decline(experts, f"{name} not a contiguous [E, N] float tensor")
-        # The live [E, N] tensor, read with its own row stride: in-place updates and
-        # load_state_dict are seen; a swapped tensor changes the table key (_stacked_key).
+        # The live [E, N] tensor; a swapped one changes the table key (_stacked_key).
         tb["bias"], tb["bias_kind"] = bias.detach(), 4
     return {
         "gate_up": gu, "down": dn, "E": E, "act": act,
@@ -1009,8 +977,7 @@ def _build_stacked_nf4(experts, hidden_dim):
 
 
 def _live_biases(experts, state):
-    """The state with each stacked [E, N] bias read from the module now, not the tensor the tables
-    were built with, so a compiled call sees a replaced bias too; None if it no longer fits."""
+    """The state with each stacked [E, N] bias re-read from the module; None if it no longer fits."""
     out = state
     for name, key in (("gate_up_proj_bias", "gate_up"), ("down_proj_bias", "down")):
         if state[key]["bias"] is None:
@@ -1037,8 +1004,7 @@ def _stash_lora(experts):
     if (gu is None and _has_lora_adapters(experts.gate_up_proj)) or (dn is None and _has_lora_adapters(experts.down_proj)):
         return False
     for got in (gu, dn):
-        # (first [E, in, r], second [E, r, out], scaling, ...): anything else (a wrapper that saw
-        # one flattened expert, num_experts 1) is not per-expert LoRA the kernels can index.
+        # Anything but (first [E, in, r], second [E, r, out], scaling, ...) is not per-expert LoRA.
         if got is not None and (
             len(got) < 3 or not isinstance(got[0], torch.Tensor) or not isinstance(got[1], torch.Tensor)
             or got[0].dim() != 3 or got[1].dim() != 3 or got[0].shape[0] != got[1].shape[0]
@@ -1142,8 +1108,7 @@ def _bf16_plan(experts, gu, dn, hidden_dim):
 
 def _bf16_views(experts, hidden_dim):
     """([E, H, 2I], [E, I, H]) views of 3D BF16 / FP16 expert weights plus (ACT, interleaved),
-    or None. The layout verdict is cached per module, keyed on the tensors' identity, so the
-    per-call cost is a dict lookup (and nothing to trace under torch.compile)."""
+    or None. Cached per module, keyed on the tensors' identity."""
     gu, dn = experts.__dict__.get("_parameters", {}).get("gate_up_proj"), experts.__dict__.get("_parameters", {}).get("down_proj")
     if gu is None or dn is None:
         gu, dn = getattr(experts, "gate_up_proj", None), getattr(experts, "down_proj", None)
@@ -1172,9 +1137,7 @@ def _bf16_views(experts, hidden_dim):
 
 def routed_moe_forward(experts, hidden_states, top_k_index, top_k_weights):
     """Experts output from only the routed experts for a decode-sized no-grad call, or None
-    (callers then run their usual path). Covers transformers v5 3D experts modules holding one
-    stacked NF4 Params4bit per projection, or 3D BF16 / FP16 weights; expert LoRA comes from
-    the ParamWrapper stash. top_k_index / top_k_weights: [T, top_k]."""
+    (callers then run their usual path). top_k_index / top_k_weights: [T, top_k]."""
     if triton is None or torch.is_grad_enabled() or not hidden_states.is_cuda:
         return None
     mode = routed_mode()
@@ -1184,8 +1147,7 @@ def routed_moe_forward(experts, hidden_states, top_k_index, top_k_weights):
     gu_param = getattr(experts, "gate_up_proj", None)
     nf4 = getattr(gu_param, "quant_state", None) is not None
     if nf4:
-        # Tables are built eagerly (data_ptr is not traceable), also on calls too large to
-        # route, so a compiled decode step after an eager prefill finds them ready.
+        # Built eagerly (data_ptr is not traceable), even on calls too large to route.
         if torch.compiler.is_compiling():
             state = experts.__dict__.get("_unsloth_routed_moe")
         else:

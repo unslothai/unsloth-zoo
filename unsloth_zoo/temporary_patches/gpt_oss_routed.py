@@ -15,13 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
-"""Routed gpt-oss expert inference: the gpt-oss adapter over moe_routed's kernels.
-
-NF4 experts are a ModuleList of bitsandbytes Linear4bit, read in place through per-layer
-pointer tables to each expert's packed bytes (moe_routed's pointer-table layout): no host
-sync, no stacked or dequantized copy, a fixed grid for a given shape, so it compiles
-fullgraph and captures in CUDA graphs. BF16 / FP16 experts use the expert-major kernel.
-"""
+"""Routed gpt-oss expert inference over moe_routed's kernels (NF4 pointer tables, BF16 / FP16)."""
 
 __all__ = [
     "routed_experts_forward",
@@ -59,7 +53,6 @@ def _mixed_adapter_batch(module):
 
 
 def _routed_disabled():
-    # UNSLOTH_GPTOSS_ROUTED_INFERENCE is the earlier name of the same switch.
     return "0" in (
         os.environ.get("UNSLOTH_GPTOSS_ROUTED_KERNEL", "1"),
         os.environ.get("UNSLOTH_GPTOSS_ROUTED_INFERENCE", "1"),
@@ -123,9 +116,7 @@ def _build_table(projs, device):
             for b in biases
         ) or b0.dtype not in _BIAS_KINDS:
             return None
-        # Each expert's live bias, read through a pointer table the launch resolves from these
-        # tensors (moe_routed._bias_args): in-place updates, load_state_dict and bitsandbytes
-        # recasting Linear4bit.bias to the input dtype (new storage) are all seen.
+        # Live biases; the launch resolves their pointer table (moe_routed._bias_args).
         bias, bias_kind = list(biases), _BIAS_KINDS[b0.dtype]
     return {
         "w": as_i64(w), "a": as_i64(a), "a2": as_i64(a2), "c2": as_i64(c2),
@@ -146,7 +137,6 @@ _PTRS_EQUAL = getattr(torch._C, "_tensors_data_ptrs_at_indices_equal", None)
 
 
 def _same(a, b):
-    """a and b (lists) hold the very same objects, in order."""
     return len(a) == len(b) and all(map(is_, a, b))
 
 
@@ -163,8 +153,7 @@ _get_version = attrgetter("_version")
 
 
 def _copied(quant_states, nested):
-    """Per expert, what the tables copy (code into "lut", offset into "off") and the nested code
-    the kernels read: replaced or edited in place, the tables need a rebuild."""
+    """Per expert, what the tables copy (code, offset) and the nested code: changes need a rebuild."""
     if nested:
         return list(map(_get_nested_copied, quant_states))
     return list(map(_get_copied, quant_states)) + [qs.state2.code for qs in quant_states if qs.nested]
@@ -183,11 +172,8 @@ def _ptrs(tensors):
 
 
 def _snapshot(experts):
-    """What the tables were built from, for every expert of both projections: the expert
-    modules, their Linear4bit bases, the weight / quant_state / absmax / code / offset / bias
-    objects and the packed weights' addresses. Holds every buffer the tables point at, so one replaced under
-    them stays allocated until the next check rebuilds them. Raises on a layout without NF4
-    quant states."""
+    """What the tables were built from, for every expert of both projections. Holds every
+    buffer the tables point at, so a replaced one stays allocated until the next rebuild."""
     mods = (tuple(experts.gate_up_projs._modules.values()), tuple(experts.down_projs._modules.values()))
     projs = [p for group in mods for p in group]
     wrappers = [p._modules for p in projs if "base_layer" in p._modules]
@@ -207,13 +193,7 @@ def _snapshot(experts):
 
 
 def _snapshot_current(experts, snap):
-    """True while nothing the tables depend on was replaced, in any expert: object identity
-    through C-level getters (no nn.Module attribute lookups) plus one C++ check of the packed
-    weights' addresses (Module._apply and `.data =` swap a Parameter's storage in place), and
-    version counters of what the tables copy (code, offset): about 30 us for gpt-oss-20b's
-    2 x 32 experts, once per layer call. Moving, requantizing or reloading bitsandbytes weights
-    replaces the quant state or its tensors, which identity sees; in-place edits of the buffers
-    the kernels read (packed weight, absmax, nested absmax and code) need no rebuild."""
+    """True while nothing the tables depend on was replaced (identity, addresses, versions)."""
     mods = snap["mods"]
     if (
         tuple(experts.gate_up_projs._modules.values()) != mods[0]
@@ -233,17 +213,14 @@ def _snapshot_current(experts, snap):
     if not _same(quant_states, snap["quant_states"]) or not _same(list(map(_get_bias, snap["params"])), snap["biases"]):
         return False
     try:
-        # Tuple equality tries identity first, all in C. A replaced tensor falls through to
-        # Tensor.__eq__, which raises on bool() of a multi-element result (or on shape / device);
-        # a replaced one-element tensor of equal value (a nested offset) passes: the tables hold
-        # that same value, and the snapshot keeps the old tensor alive.
+        # Identity first; a replaced tensor falls to Tensor.__eq__, which raises unless it is
+        # one element of equal value (safe: the tables hold that same value).
         if _quant_fields(quant_states, snap["nested"]) != snap["fields"]:
             return False
         if _copied(quant_states, snap["nested"]) != snap["copied"]:
             return False
     except Exception:
         return False
-    # Same objects as the snapshot's, so their version counters catch in-place edits.
     return list(map(_get_version, snap["versioned"])) == snap["versions"]
 
 
@@ -252,8 +229,7 @@ def _weights(experts):
 
 
 def _compiled_state(experts):
-    """The tables an eager call built, for a compiled call, or None when an expert's weight was
-    swapped since (identity: a trace-time check Dynamo guards on, so a swap retraces)."""
+    """The tables an eager call built, or None when an expert's weight was swapped since."""
     state = getattr(experts, "_unsloth_routed_nf4", None)
     if not isinstance(state, dict):
         return None
@@ -301,11 +277,8 @@ def prepare_routed_experts(experts):
 
 
 def _lora(projs):
-    """(A list, B list, scaling) of the single active adapter: every expert's live lora_A [r, in]
-    and lora_B [out, r], which the kernels read in place through pointer tables resolved on each
-    call (moe_routed.lora_pointer_table), so optimizer steps, casts and moves are always seen,
-    eager, compiled or in a CUDA graph. None without LoRA (or adapters disabled); False for a
-    LoRA setup this path does not cover."""
+    """(A list, B list, scaling) of the single active adapter: each expert's live lora_A [r, in]
+    and lora_B [out, r]. None without LoRA; False for a LoRA setup this path does not cover."""
     first = projs[0]
     if not hasattr(first, "lora_A"):
         return None
@@ -342,9 +315,7 @@ def _lora(projs):
 
 def routed_experts_forward(experts, hidden_states, router_indices, routing_weights, _state = None):
     """Routed eval forward for a ModuleList NF4 gpt-oss experts module, or None if ineligible.
-
-    routing_weights is dense [T, E] (zeros off the picked experts) or already [T, top_k].
-    _state: the tables routed_mlp_forward just validated for this call (one check per layer)."""
+    routing_weights: dense [T, E] or [T, top_k]. _state: tables already validated this call."""
     if _routed_disabled():
         return None
     if torch.is_grad_enabled() or experts.training or not hidden_states.is_cuda:
@@ -472,8 +443,7 @@ def routed_mlp_forward(mlp, hidden_states, max_slots = ROUTED_MAX_SLOTS):
     experts = mlp.experts
     nf4 = False
     if hasattr(experts, "gate_up_projs"):
-        # Pointer tables are built eagerly (data_ptr is not traceable), also on calls too large to
-        # route, so a compiled decode step that follows an eager prefill finds them ready.
+        # Built eagerly (data_ptr is not traceable), even on calls too large to route.
         state = _compiled_state(experts) if torch.compiler.is_compiling() else prepare_routed_experts(experts)
         nf4 = isinstance(state, dict)
     if hidden_states.numel() // hidden_states.shape[-1] * getattr(mlp.router, "top_k", 4) > max_slots:
