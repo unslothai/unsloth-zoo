@@ -380,7 +380,6 @@ def test_flex_drops_the_mask_only_when_unsloth_reroutes_it_to_sdpa(patched, monk
     before = misc.CAUSAL_MASK_SKIP_STATS["skipped"]
     assert patched.create_causal_mask(**kwargs) is None
     assert misc.CAUSAL_MASK_SKIP_STATS["skipped"] == before + 1
-    # Padding still gets its BlockMask under the rerouting wrapper.
     padded = _kwargs(patched, config = _config("flex_attention"),
                      attention_mask = torch.tensor([[1, 1, 1, 1, 1, 1], [0, 1, 1, 1, 1, 1]]))
     assert patched.create_causal_mask(**padded) is not None

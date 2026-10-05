@@ -655,8 +655,7 @@ def _maskless_causal_arguments(signature, args, kwargs):
     config = arguments.get("config", None)
     attn_implementation = getattr(config, "_attn_implementation", None)
     if attn_implementation == "flex_attention":
-        # Only when the registered flex function sends a None mask to SDPA is_causal (unsloth's
-        # wrapper); stock flex would read None as full bidirectional attention.
+        # Stock flex reads None as bidirectional; only unsloth's wrapper reroutes it to SDPA is_causal.
         if not _flex_routes_maskless_to_sdpa():
             return None
     elif attn_implementation != "sdpa":
