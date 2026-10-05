@@ -192,6 +192,13 @@ def _lora_args(lora, dummy):
 
 def _gate_up(kernel, x, idx, tb, top_k, lora, alpha, limit, out):
     B, H, scaling, r = _lora_args(lora, tb["lut"])
+    # Triton launches on the current device, not the tensors' (multi-GPU device_map).
+    with torch.cuda.device(x.device):
+        _gate_up_launch(kernel, x, idx, tb, top_k, B, H, scaling, r, lora, alpha, limit, out)
+    return out
+
+
+def _gate_up_launch(kernel, x, idx, tb, top_k, B, H, scaling, r, lora, alpha, limit, out):
     kernel[(idx.numel(), triton.cdiv(tb["N"], 4))](
         x, idx, tb["w"], tb["a"], tb["a2"], tb["c2"], tb["off"], tb["lut"],
         tb["bias"] if tb["bias"] is not None else tb["lut"], B, H, out, tb["N"], tb["K"],
@@ -205,6 +212,12 @@ def _gate_up(kernel, x, idx, tb, top_k, lora, alpha, limit, out):
 
 def _down(kernel, x, idx, rw, dense_rw, tb, top_k, lora, out):
     B, H, scaling, r = _lora_args(lora, tb["lut"])
+    with torch.cuda.device(x.device):
+        _down_launch(kernel, x, idx, rw, dense_rw, tb, top_k, B, H, scaling, r, lora, out)
+    return out
+
+
+def _down_launch(kernel, x, idx, rw, dense_rw, tb, top_k, B, H, scaling, r, lora, out):
     kernel[(out.shape[0], triton.cdiv(tb["N"], 4))](
         x, idx, rw, tb["w"], tb["a"], tb["a2"], tb["c2"], tb["off"], tb["lut"],
         tb["bias"] if tb["bias"] is not None else tb["lut"], B, H, out, tb["N"], tb["K"],
@@ -535,6 +548,12 @@ def _launch_expert(kernel, x, idx, weight, bias, out, row_div):
     E, K = weight.shape[0], weight.shape[1]
     c = _expert_config(P)
     grid = (E, triton.cdiv(N, c["BLOCK_N"]), S)
+    with torch.cuda.device(x.device):
+        _expert_launch(kernel, grid, c, x, idx, weight, bias, out, P, N, K, S, row_div)
+    return out
+
+
+def _expert_launch(kernel, grid, c, x, idx, weight, bias, out, P, N, K, S, row_div):
     kernel[grid](
         x, idx, weight, bias if bias is not None else weight, out,
         P, N, K, row_div,
@@ -551,12 +570,17 @@ def _launch_expert(kernel, x, idx, weight, bias, out, row_div):
 
 if triton is not None:
 
-    @torch.library.triton_op("unsloth_zoo::routed_bf16_gemm", mutates_args = ())
+    # custom_op (torch >= 2.4), as for NF4; triton_op only exists from torch 2.6.
+    @torch.library.custom_op("unsloth_zoo::routed_bf16_gemm", mutates_args = ())
     def _routed_bf16_gemm_op(
         x: torch.Tensor, idx: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, row_div: int,
     ) -> torch.Tensor:
         part = torch.empty(_expert_config(idx.numel())["SPLIT_K"], idx.numel(), weight.shape[2], dtype = torch.float32, device = x.device)
-        return _launch_expert(torch.library.wrap_triton(_routed_bf16_expert_kernel), x, idx, weight, bias, part, row_div)
+        return _launch_expert(_routed_bf16_expert_kernel, x, idx, weight, bias, part, row_div)
+
+    @_routed_bf16_gemm_op.register_fake
+    def _(x, idx, weight, bias, row_div):
+        return x.new_empty((_expert_config(idx.numel())["SPLIT_K"], idx.numel(), weight.shape[2]), dtype = torch.float32)
 
 
 def routed_bf16_gemm(x, idx, weight, bias = None, row_div = 1):

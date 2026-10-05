@@ -240,3 +240,15 @@ def test_both_kill_switch_names_turn_routing_off(monkeypatch, env):
     x = torch.randn(1, 1, H, device = "cuda").bfloat16()
     monkeypatch.setenv(env, "0")
     assert not routed_bf16_eligible(mlp.experts, x)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason = "needs two GPUs")
+def test_routed_kernels_launch_on_the_tensors_device():
+    # A multi-GPU device_map puts layers on a non-current GPU; the launch must follow the tensors.
+    x = torch.randn(3, H, device = "cuda:1").bfloat16()
+    w = torch.randn(E, H, I, device = "cuda:1").bfloat16()
+    idx = torch.tensor([0, 3, 5], device = "cuda:1")
+    with torch.cuda.device(0):
+        out = routed_bf16_gemm(x, idx, w)
+    ref = torch.stack([x[p].float() @ w[idx[p]].float() for p in range(3)])
+    torch.testing.assert_close(out, ref, atol = 2e-2, rtol = 2e-2)
