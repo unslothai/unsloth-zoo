@@ -4,7 +4,7 @@
 # Pure-Python supply-chain audit for unsloth_zoo. Mirrors unslothai/unsloth's
 # security-audit.yml with npm/Cargo/Unsloth jobs stripped (zoo is pure Python).
 # Jobs: advisory-audit (pip-audit + trufflehog), pip-scan-packages (transitive
-# closure pattern scan), workflow-trigger-lint, tests-security (HARD GATE).
+# closure pattern scan), tests-security (regressions + workflow-trigger lint).
 
 name: Security audit
 
@@ -175,40 +175,6 @@ jobs:
         # pattern-scanned WITHOUT installing -- malicious wheels cannot execute.
         run: python3 scripts/scan_packages.py --requirements audit-reqs/zoo-deps.txt --with-deps
 
-  # workflow-trigger-lint: refuses pull_request_target with PR-head checkout,
-  # restricted workflow_run without justification, and cache-key collisions.
-  workflow-trigger-lint:
-    name: workflow-trigger lint (pull_request_target / cache-poisoning)
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Harden runner (egress block)
-        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
-        with:
-          egress-policy: block
-          disable-sudo: true
-          allowed-endpoints: >
-            api.github.com:443
-            github.com:443
-            codeload.github.com:443
-            objects.githubusercontent.com:443
-            pypi.org:443
-            files.pythonhosted.org:443
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          persist-credentials: false
-
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
-        with:
-          python-version: '3.12'
-
-      - name: Install PyYAML
-        run: pip install pyyaml==6.0.2
-
-      - name: Run workflow-trigger lint
-        run: python3 scripts/lint_workflow_triggers.py
-
   # HARD GATE: regression tests for scanner + lint scripts. Drift in IOC tables
   # or scanner exit semantics fails this PR at review time.
   tests-security:
@@ -253,6 +219,13 @@ jobs:
         # pyyaml the lint script exits 2.)
         run: pip install pytest==9.0.3 pyyaml==6.0.2
 
+      - name: Run workflow-trigger lint
+        id: trigger-lint
+        # Share checkout, Python and PyYAML with the regression suite. Delay
+        # gating until the end so a lint failure does not skip those tests.
+        continue-on-error: true
+        run: python3 scripts/lint_workflow_triggers.py
+
       - name: Install unsloth_zoo so tests/security can import what it guards
         # tests/security was dependency-free until #1083 added
         # test_model_type_import_guard.py, which imports unsloth_zoo.hf_utils to
@@ -284,3 +257,9 @@ jobs:
           # touches what that init sets up.
           UNSLOTH_ZOO_DISABLE_GPU_INIT: "1"
         run: python3 -m pytest tests/security -v
+
+      - name: Enforce workflow-trigger lint result
+        if: ${{ !cancelled() && steps.trigger-lint.outcome != 'success' }}
+        run: |
+          echo "::error::Workflow-trigger lint did not pass"
+          exit 1
