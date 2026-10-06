@@ -601,6 +601,21 @@ else:
     pass
 pass
 
+def patch_vllm_untiled_moe_experts():
+    """Decline vLLM's TRT-LLM LoRA MoE path: its tiled (E, H/64, 2I, 64) layout cannot alias HF's; Triton's can."""
+    try:
+        from vllm.model_executor.layers.fused_moe.oracle import unquantized as _unquantized
+    except Exception as e:
+        logger.info(f"Unsloth: no unquantized MoE oracle to patch: {e}")
+        return False
+    if not hasattr(_unquantized, "_trtllm_bf16_lora_supported"):
+        return False
+    _unquantized._trtllm_bf16_lora_supported = lambda moe_config: False
+    logger.info("Unsloth: Forcing an untiled MoE backend so expert weights stay shareable.")
+    return True
+pass
+
+
 def patch_vllm_enable_sleep_mode():
     from vllm.device_allocator.cumem import CuMemAllocator, libcudart, unmap_and_release, create_and_map, AllocationData
     try:
@@ -935,6 +950,7 @@ def patch_vllm(debug = True):
     patch_vllm_bitsandbytes()
     patch_vllm_lora_tokenizer()
     patch_vllm_lora_load_tensors()
+    patch_vllm_untiled_moe_experts()
     # Match load_vllm's standby check (!= "0") so any truthy value also installs
     # the sleep + cache-reset patches, not just "1".
     if os.getenv("UNSLOTH_VLLM_STANDBY", "0") != "0":
@@ -1318,12 +1334,12 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
                 get_state_dict(f"{prefix}.{name}", 0, state_dict, getattr(layer.short_conv, name), slice_weights=False)
         pass
 
-        if hasattr(layer, "per_layer_input_gate"):
+        if getattr(layer, "per_layer_input_gate", None) is not None:
             get_state_dict(
                 f"{vllm_text_model_prefix}.layers.{kk}.per_layer_input_gate",
                 0, state_dict, layer.per_layer_input_gate,
             )
-        if hasattr(layer, "per_layer_projection"):
+        if getattr(layer, "per_layer_projection", None) is not None:
             get_state_dict(
                 f"{vllm_text_model_prefix}.layers.{kk}.per_layer_projection",
                 0, state_dict, layer.per_layer_projection,
@@ -1360,20 +1376,8 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             get_state_dict(f"{prefix}.w3", 1, state_dict, w13)
             get_state_dict(f"{prefix}.w2", 0, state_dict, feed_forward.w2)
         elif not hasattr(layer, "mlp") and hasattr(getattr(experts, "routed_experts", experts), "w13_weight"):
-            # LFM2-MoE: FusedMoE w13 [E, 2I, H] / w2 [E, H, I] = HF gate_up_proj / down_proj (vLLM >= 0.30: on routed_experts)
-            routed = getattr(experts, "routed_experts", experts)
-            quant_method = getattr(routed, "quant_method", None)
-            quant_method = getattr(quant_method, "old_quant_method", quant_method)  # FusedMoEModularMethod
-            backend = getattr(quant_method, "unquantized_backend", None)
-            backend = getattr(backend, "name", backend)
-            w13, w2 = routed.w13_weight, routed.w2_weight
-            # Other backends reorder w13 at load; TRTLLM is vLLM's pick for LoRA-enabled bf16 MoE on Blackwell.
-            if backend not in (None, "TRITON", "BATCHED_TRITON") or w13.dim() != 3 or w2.dim() != 3 \
-                or w13.shape[1] != 2 * w2.shape[2] or w13.shape[2] != w2.shape[1]:
-                raise NotImplementedError(
-                    f"Unsloth: fast_inference cannot rebuild MoE experts from vLLM's {backend} layout "
-                    f"(w13 {tuple(w13.shape)}, w2 {tuple(w2.shape)}); set fast_inference = False."
-                )
+            # LFM2-MoE: FusedMoE w13 [E, 2I, H] / w2 [E, H, I] = HF gate_up_proj / down_proj (vLLM >= 0.24: on routed_experts)
+            w13, w2 = vllm_moe_expert_weights(experts, f"layer {kk}", text_config)
             moe_tensors = {
                 f"{prefix}.experts.gate_up_proj": w13,
                 f"{prefix}.experts.down_proj": w2,
@@ -1396,7 +1400,27 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
                 f"Unsloth: fast_inference cannot rebuild layer {kk}'s {type(feed_forward).__name__} from vLLM; "
                 "set fast_inference = False."
             )
+
+        # Gemma-4 MoE runs beside the dense MLP (no .mlp. in HF names); vLLM 0.31 drops layer.moe.
+        moe_block = getattr(layer, "moe", None)
+        if moe_block is None and hasattr(layer, "experts") and hasattr(layer, "router"):
+            moe_block = layer
+        if moe_block is not None and hasattr(moe_block, "experts"):
+            extract_moe_layers(
+                moe_block, f"{vllm_text_model_prefix}.layers.{kk}",
+                state_dict, quant_state_dict, get_state_dict,
+                router = getattr(layer, "router", None), config = text_config,
+            )
+
         if not hasattr(layer, "mlp"):
+            continue
+
+        mlp_prefix = f"{vllm_text_model_prefix}.layers.{kk}.mlp"
+        if not hasattr(layer.mlp, "gate_up_proj") and hasattr(layer.mlp, "experts"):
+            extract_moe_layers(
+                layer.mlp, mlp_prefix, state_dict, quant_state_dict, get_state_dict,
+                config = text_config,
+            )
             continue
 
         proj = layer.mlp.gate_up_proj
@@ -1557,6 +1581,16 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
     pass
 pass
 
+def _refresh_placeholder_dims(parent, attr_name, weight):
+    # All Unsloth Zoo code licensed under LGPLv3
+    if attr_name != "weight" or weight.ndim != 2: return
+    if isinstance(parent, torch.nn.Linear):
+        parent.out_features, parent.in_features = weight.shape
+    elif isinstance(getattr(parent, "hidden_dim", None), int) and isinstance(getattr(parent, "num_experts", None), int):
+        parent.num_experts, parent.hidden_dim = weight.shape
+pass
+
+
 @torch.inference_mode
 def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16, bnb_config = None, is_vision_model = False):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -1694,6 +1728,7 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
                 else:
                     layer = torch.nn.Parameter(raw_value, requires_grad = False)
                     exec(f"new_model.{layer_name_br} = layer")
+                    _refresh_placeholder_dims(parent, attr_name, raw_value)
                 continue
             elif fp8_weight_scale is not None:
                 if fp8_weight_scale.ndim == 1:
@@ -1892,6 +1927,24 @@ def vllm_weights_memory_usage(config, load_in_4bit = False, load_in_8bit = False
 pass
 
 
+def _config_get(config, name, default = None):
+    """getattr; a per-layer (Gemma-4) attribute raising AmbiguousGlobalPerLayerAttributeError gives its max."""
+    try:
+        value = getattr(config, name)
+    except AttributeError:
+        return default
+    except Exception:
+        try:
+            per_layer = getattr(config, "per_layer_config", None)
+            per_layer = list(per_layer) if per_layer is not None else []
+            values = [v for v in (getattr(layer, name, None) for layer in per_layer) if v is not None]
+        except Exception:
+            values = []
+        return max(values) if values else default
+    return default if value is None else value
+pass
+
+
 def approximate_vllm_memory_usage(
     config,
     load_in_4bit = False,
@@ -1917,17 +1970,31 @@ def approximate_vllm_memory_usage(
     vocab_size = config.vocab_size
     hd = config.hidden_size
     context_length = config.max_position_embeddings
-    mlp_size = config.intermediate_size
+    n_experts   = _config_get(config, "num_experts") or _config_get(config, "num_local_experts") or 0
+    # Early Gemma-4 configs name it expert_intermediate_size (vLLM reads both).
+    moe_size    = _config_get(config, "moe_intermediate_size") or _config_get(config, "expert_intermediate_size")
+    shared_size = _config_get(config, "shared_expert_intermediate_size") or 0
+    is_moe      = bool(n_experts) and moe_size is not None
+
+    mlp_size = _config_get(config, "intermediate_size")
+    if mlp_size is None: mlp_size = moe_size if moe_size is not None else hd
     n_layers = config.num_hidden_layers
-    n_kv_heads = getattr(config, "num_key_value_heads", 1)
-    n_heads    = getattr(config, "num_attention_heads", 1)
+    n_kv_heads = _config_get(config, "num_key_value_heads", 1)
+    n_heads    = _config_get(config, "num_attention_heads", 1)
     # Group Query Attention
     kv_size = hd // n_heads * n_kv_heads
 
     # Modules
     qkvo = hd + kv_size + kv_size + hd
     qkvo = qkvo * hd
-    mlp  = (hd * mlp_size) * 3
+    if is_moe:
+        mlp = n_experts * (hd * moe_size) * 3 + (hd * shared_size) * 3 + hd * n_experts
+        # enable_moe_block, not intermediate_size: Qwen3-MoE's leftover one builds no dense MLP.
+        dense_size = _config_get(config, "intermediate_size")
+        if _config_get(config, "enable_moe_block", False) and dense_size is not None:
+            mlp += (hd * dense_size) * 3
+    else:
+        mlp  = (hd * mlp_size) * 3
     layernorms = 2 * hd
     embed_tokens = vocab_size * hd
     lm_head = 0 if getattr(config, "tie_word_embeddings", True) else vocab_size * hd
@@ -1937,6 +2004,17 @@ def approximate_vllm_memory_usage(
     qkvo_B = max_lora_rank * (hd + kv_size + kv_size + hd)
     mlp_A  = hd * max_lora_rank * 2 + mlp_size * max_lora_rank
     mlp_B  = max_lora_rank * (mlp_size + mlp_size) + max_lora_rank * hd
+    if is_moe:
+        # Stacked expert LoRA: A gate_up (E*r, H), down (E*r, I); B (2I, E*r), (H, E*r).
+        mlp_A = n_experts * max_lora_rank * (hd + moe_size)
+        mlp_B = n_experts * max_lora_rank * (moe_size + moe_size + hd)
+        dense_sizes = [shared_size]
+        if _config_get(config, "enable_moe_block", False):
+            dense_sizes.append(_config_get(config, "intermediate_size") or 0)
+        for size in dense_sizes:
+            if not size: continue
+            mlp_A += hd * max_lora_rank * 2 + size * max_lora_rank
+            mlp_B += max_lora_rank * (size + size) + max_lora_rank * hd
     lora_elements = qkvo_A + qkvo_B + mlp_A + mlp_B
     lora_elements = lora_elements * max_loras
     # 2 bytes = float16 for LoRA
@@ -3238,6 +3316,11 @@ def load_vllm(
         approx_max_num_seqs = int(approx_max_num_seqs * conservativeness)
         approx_max_num_seqs = max(approx_max_num_seqs, 1)
 
+        # Larger warmup batches crash Gemma-4 on B200 (illegal memory access, plain vLLM too).
+        reachable_tokens = approx_max_num_seqs * max_seq_length
+        if max_num_batched_tokens > reachable_tokens:
+            max_num_batched_tokens = reachable_tokens
+
         # Check max RAM usage for vLLM (swap space) default is 4GB
         memory = psutil.virtual_memory()
         RAM_GB = memory.available / 1024 / 1024 / 1024
@@ -3446,7 +3529,7 @@ def load_vllm(
             # Affects any model with head_dim>=256 (gemma, gemma2, gemma3, qwen3_next, etc).
             if major_version >= 10:
                 _text_config = getattr(config, "text_config", config)
-                _head_dim = getattr(_text_config, "head_dim", None)
+                _head_dim = _config_get(_text_config, "head_dim")
                 if _head_dim is not None and _head_dim >= 256:
                     engine_args["block_size"] = 32
                     logger.info(f"Unsloth: Setting vLLM block_size=32 for head_dim={_head_dim} to avoid FlashInfer bug on Blackwell.")
@@ -3916,6 +3999,18 @@ def _saved_adapter_lora_keys(save_directory):
     return [k for k in keys if ".lora_A." in k or ".lora_B." in k]
 
 
+def _saved_adapter_lora_tensors(save_directory):
+    # All Unsloth Zoo code licensed under LGPLv3
+    safetensors_path = os.path.join(save_directory, "adapter_model.safetensors")
+    if os.path.isfile(safetensors_path):
+        from safetensors.torch import load_file
+        state_dict = load_file(safetensors_path, device = "cpu")
+    else:
+        bin_path = os.path.join(save_directory, "adapter_model.bin")
+        state_dict = torch.load(bin_path, map_location = "cpu", weights_only = True)
+    return state_dict
+
+
 def _saved_adapter_expert_lora_keys(save_directory):
     """The subset of `_saved_adapter_lora_keys` that sits on stacked MoE expert tensors."""
     # All Unsloth Zoo code licensed under LGPLv3
@@ -4169,6 +4264,38 @@ def _moe_expert_lora_refusal_reason(model, peft_config):
 pass
 
 
+def _remap_moe_expert_lora_keys(model, state_dict):
+    """Rename Gemma 4 `layers.N.experts` adapter keys to vLLM's `layers.N.moe.experts` when only that exists.
+
+    vLLM's own rename regex is `$`-anchored, so it never hits LoRA keys (vllm-project/vllm#41754).
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    if not any(_is_moe_expert_lora_key(k) for k in state_dict): return state_dict
+    runner = _get_vllm_model_runner(model)
+    vllm_model = _get_vllm_lora_model(model, runner)
+    targets = _vllm_lora_target_names(vllm_model, _get_vllm_lora_manager(model, runner))
+    if targets is None: return state_dict
+    module_names = targets[0]
+    weights_mapper = getattr(vllm_model, "hf_to_vllm_mapper", None)
+    if weights_mapper is not None:
+        from .vllm_lora_worker_manager import _drop_stacked_weight_maps
+        weights_mapper = _drop_stacked_weight_maps(weights_mapper)
+
+    remapped = {}
+    for key, value in state_dict.items():
+        if _is_moe_expert_lora_key(key):
+            module_name = _resolve_lora_key_to_module(key, weights_mapper)
+            if module_name is not None and module_name not in module_names \
+                and module_name.endswith(".experts") \
+                and module_name[:-len(".experts")] + ".moe.experts" in module_names:
+                new_key = re.sub(r"(?<!\.moe)\.experts\.", ".moe.experts.", key, count = 1)
+                if _resolve_lora_key_to_module(new_key, weights_mapper) in module_names:
+                    key = new_key
+        remapped[key] = value
+    return remapped
+pass
+
+
 def _check_lora_is_servable(model, keys, source, peft_config):
     """Refuse an adapter vLLM would accept and then silently ignore.
 
@@ -4249,6 +4376,7 @@ def load_lora(model, save_directory, load_tensors = False, lora_request_id = Non
         items = state_dict.items()
         state_dict = {k.replace(".default", ""):v for k, v in items if ".lora_A." in k or ".lora_B." in k}
 
+        state_dict = _remap_moe_expert_lora_keys(model, state_dict)
         _check_lora_is_servable(model, list(state_dict), "the training model", peft_config)
 
         # vllm_lora_already_loaded(model)
@@ -4264,13 +4392,25 @@ def load_lora(model, save_directory, load_tensors = False, lora_request_id = Non
     else:
         # Same checks on the path branch, read off the checkpoint header.
         _saved_keys = _saved_adapter_lora_keys(save_directory)
+        _saved_peft_config = None
         if len(_saved_keys) != 0:
             try:
                 _saved_peft_config = get_peft_config(save_directory)
             except Exception:
                 _saved_peft_config = None
-            _check_lora_is_servable(model, _saved_keys, save_directory, _saved_peft_config)
-        lora_request = LoRARequest(str(lora_request_id), lora_request_id, save_directory)
+        # Loading by path skips the Gemma-4 expert rename, so pass tensors only when a key changed.
+        _remapped_keys = list(_remap_moe_expert_lora_keys(model, dict.fromkeys(_saved_keys)))
+        if _saved_peft_config is not None and _remapped_keys != _saved_keys:
+            state_dict = _remap_moe_expert_lora_keys(model, _saved_adapter_lora_tensors(save_directory))
+            _check_lora_is_servable(model, list(state_dict), save_directory, _saved_peft_config)
+            lora_request = LoRARequest(
+                str(lora_request_id), lora_request_id,
+                lora_tensors = state_dict, lora_config = _saved_peft_config,
+            )
+        else:
+            if len(_saved_keys) != 0:
+                _check_lora_is_servable(model, _saved_keys, save_directory, _saved_peft_config)
+            lora_request = LoRARequest(str(lora_request_id), lora_request_id, save_directory)
     pass
     # vllm_lora_already_loaded(model)
 
