@@ -127,7 +127,6 @@ def test_logits_match_the_torch_reference(checkpoint):
     model = load_decision_model(folder)
     got = model.logits(batch)
     np.testing.assert_allclose(got, expected, atol = 2e-5, rtol = 0)
-    # The network is also callable on the loaded model, as before.
     np.testing.assert_array_equal(np.array(model(**{k: mx.array(v) for k, v in batch.items()}).astype(mx.float32)), got)
     assert got[1, 2] == -1e4
 

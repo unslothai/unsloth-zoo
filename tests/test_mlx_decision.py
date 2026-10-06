@@ -106,7 +106,6 @@ def test_images_are_validated_then_refused_as_unsupported():
     for malformed in ({}, "", 0, False):
         with pytest.raises(DecisionRequestError, match = "must be an array"):
             model.answer("s", question, images = malformed)
-    # A malformed image is a malformed request, whether or not the model could have used it.
     broken = [None, "https://example.com/a.png", "data:text/plain;base64,AA==", "data:image/png;base64", "data:image/png,AA==", image + ",AA=="]
     for state, images in [("s", [url]) for url in broken] + [(chat(None), None), (chat({"url": 3}), None)]:
         with pytest.raises(DecisionRequestError, match = "must be data URLs"):
