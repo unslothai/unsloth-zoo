@@ -370,6 +370,17 @@ def _grouped_mm_with_backward_fix(
     torch._grouped_mm, and on the 16-byte stride error. Bit-exact vs the always-contiguous
     path in forward and backward.
     """
+    if (
+        inputs.dtype == torch.float16
+        and weight.dtype == torch.float16
+        and _GROUPED_MM_FP16_OP is not None
+        and torch.compiler.is_compiling()
+    ):
+        return _GROUPED_MM_FP16_OP(inputs, weight, offsets)
+    return _grouped_mm_eager(inputs, weight, offsets)
+
+
+def _grouped_mm_eager(inputs, weight, offsets):
     inputs = inputs.contiguous()
     # The Triton backend is picked precisely when the probe says no, yet its separated
     # LoRA delta still routed here. torch 2.8 hard-raises unless `dprops->major == 9`
@@ -391,6 +402,75 @@ def _grouped_mm_with_backward_fix(
         if "strides should be multiple of 16 bytes" not in str(exc):
             raise
         return _manual_grouped_mm(inputs, weight, offsets)
+
+
+def _grouped_mm_fp16_wgrad_eager(inputs, grad_output, offsets):
+    """dW[g] = inputs[g]^T @ grad_output[g] per group, as [G, K, N]; empty groups are zero."""
+    try:
+        if _check_torch_grouped_mm_supported():
+            return torch._grouped_mm(inputs.transpose(-2, -1), grad_output, offs = offsets).contiguous()
+    except RuntimeError:
+        pass
+    out = inputs.new_zeros((offsets.shape[0], inputs.shape[1], grad_output.shape[1]))
+    start = 0
+    for g, end in enumerate(offsets.tolist()):
+        if end > start:
+            out[g] = inputs[start:end].transpose(0, 1) @ grad_output[start:end]
+        start = end
+    return out
+
+
+def _register_grouped_mm_fp16_op():
+    """torch._grouped_mm on float16 as an opaque op for compiled callers. The eager kernel takes float16
+    (torch 2.10 - 2.14), but its meta/fake impl rejects it (2.14 accepts only with cuBLASLt grouped GEMM,
+    CUDA 13.3+), so a compiled float16 MoE frame failed to trace and, under suppress_errors, silently ran
+    eagerly. Eager calls and bf16 never reach this op. Registered once per process: the compiled-cache copy of
+    this file reuses the first registration."""
+    if not hasattr(torch, "library") or not hasattr(torch.library, "custom_op"):
+        return None
+    try:
+        return torch.ops.unsloth_zoo.grouped_mm_fp16.default
+    except (AttributeError, RuntimeError):
+        pass
+    try:
+        @torch.library.custom_op("unsloth_zoo::grouped_mm_fp16", mutates_args = ())
+        def grouped_mm_fp16(inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+            # contiguous: the real kernel pads the row stride to 16 bytes, the fake below does not.
+            return _grouped_mm_eager(inputs, weight, offsets).contiguous()
+
+        @grouped_mm_fp16.register_fake
+        def _(inputs, weight, offsets):
+            return inputs.new_empty((inputs.shape[0], weight.shape[-1]))
+
+        @torch.library.custom_op("unsloth_zoo::grouped_mm_fp16_wgrad", mutates_args = ())
+        def grouped_mm_fp16_wgrad(inputs: torch.Tensor, grad_output: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+            return _grouped_mm_fp16_wgrad_eager(inputs, grad_output, offsets)
+
+        @grouped_mm_fp16_wgrad.register_fake
+        def _(inputs, grad_output, offsets):
+            return inputs.new_empty((offsets.shape[0], inputs.shape[1], grad_output.shape[1]))
+
+        def _setup_context(ctx, inputs, output):
+            x, w, offs = inputs
+            ctx.save_for_backward(x, w, offs)
+
+        def _backward(ctx, grad):
+            x, w, offs = ctx.saved_tensors
+            grad = grad.contiguous()
+            gx = gw = None
+            if ctx.needs_input_grad[0]:
+                gx = torch.ops.unsloth_zoo.grouped_mm_fp16(grad, w.transpose(-2, -1), offs)
+            if ctx.needs_input_grad[1]:
+                gw = torch.ops.unsloth_zoo.grouped_mm_fp16_wgrad(x.contiguous(), grad, offs)
+            return gx, gw, None
+
+        grouped_mm_fp16.register_autograd(_backward, setup_context = _setup_context)
+        return torch.ops.unsloth_zoo.grouped_mm_fp16.default
+    except Exception:
+        return None
+
+
+_GROUPED_MM_FP16_OP = _register_grouped_mm_fp16_op()
 
 
 def _grouped_matmul_loop(inputs, weight, offsets, bounds = None):
@@ -1163,6 +1243,17 @@ def forward_moe_backend(
         pass
     if _moe_uses_fp8_expert_weights is not None and _moe_uses_fp8_expert_weights(self):
         return forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights)
+
+    # BF16 / FP16 decode-sized no-grad calls: only the routed experts (moe_routed.py).
+    routed_moe_forward = None
+    try:
+        from unsloth_zoo.temporary_patches.moe_routed import routed_moe_forward
+    except ImportError:
+        pass
+    if routed_moe_forward is not None:
+        result = routed_moe_forward(self, hidden_states, top_k_index, top_k_weights)
+        if result is not None:
+            return result
 
     backend = select_moe_backend()
     if backend == "grouped_mm":

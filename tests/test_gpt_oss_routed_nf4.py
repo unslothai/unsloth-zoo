@@ -41,6 +41,7 @@ from unsloth_zoo.temporary_patches.gpt_oss_routed import (
 )
 
 E, TOP_K, H, I = 8, 4, 256, 192
+_TORCH = tuple(int(v) for v in torch.__version__.split("+")[0].split(".")[:2])
 
 
 def _linear4bit(i, o, nested, seed):
@@ -246,6 +247,47 @@ def test_lora_storage_swap_is_not_stale():
     torch.testing.assert_close(after.double(), ref, rtol = 1e-4, atol = 1e-4)
 
 
+@pytest.mark.parametrize("which", ["lora_A", "lora_B"])
+@pytest.mark.parametrize("compiled", [False, True])
+def test_replaced_middle_expert_adapter_is_not_stale(which, compiled):
+    # Replacing one middle expert's adapter Parameter (not an in-place edit) must reach the kernels.
+    ex = _lora_wrap(_Experts(True)).eval()
+    x = torch.randn(1, 2, H, device = "cuda", dtype = torch.float32)
+    idx, w = _routing(2, seed = 6)
+    e = idx[0, 1].item()
+    assert 0 < e < E - 1 or idx[0, 0].item() not in (0, E - 1)
+    e = e if 0 < e < E - 1 else idx[0, 0].item()
+    assert prepare_routed_experts(ex)
+    fn = routed_experts_forward
+    if compiled:
+        torch._dynamo.reset()
+        fn = torch.compile(lambda a, b, c: routed_experts_forward(ex, a, b, c), fullgraph = True)
+    call = (lambda: fn(x, idx, w)) if compiled else (lambda: fn(ex, x, idx, w))
+    with torch.no_grad():
+        before = call()
+        for projs in (ex.gate_up_projs, ex.down_projs):
+            lin = getattr(projs[e], which)["default"]
+            lin.weight = torch.nn.Parameter(lin.weight + 0.05, requires_grad = False)
+        after = call()
+        ref = _reference(ex, x, idx, w)
+    assert not torch.allclose(before, after)
+    torch.testing.assert_close(after.double(), ref, rtol = 1e-4, atol = 1e-4)
+
+
+def test_a_module_declined_on_cpu_routes_after_moving_to_cuda():
+    ex = _Experts(True).eval().cpu()
+    assert prepare_routed_experts(ex) is None
+    assert prepare_routed_experts(ex) is None
+    ex.cuda()
+    state = prepare_routed_experts(ex)
+    assert isinstance(state, dict)
+    x = torch.randn(1, 2, H, device = "cuda", dtype = torch.float32)
+    idx, w = _routing(2, seed = 8)
+    with torch.no_grad():
+        got = routed_experts_forward(ex, x, idx, w)
+    torch.testing.assert_close(got.double(), _reference(ex, x, idx, w), rtol = 1e-4, atol = 1e-4)
+
+
 def test_mixed_adapter_batch_is_left_to_peft():
     # PEFT's adapter_names pre-hook marks a mixed-adapter batch the routed kernels cannot honour.
     from functools import partial
@@ -274,3 +316,76 @@ def test_lora_bias_is_left_to_peft():
     idx, w = _routing(1)
     with torch.no_grad():
         assert routed_experts_forward(ex, x, idx, w) is None
+
+
+def _routes_through(e, T):
+    # Every token picks expert e first, then three others: the replaced expert is always read.
+    idx, w = _routing(T, seed = 5)
+    idx = idx.clone()
+    for t in range(T):
+        others = [j for j in idx[t].tolist() if j != e][: TOP_K - 1]
+        idx[t] = torch.tensor([e] + others + [j for j in range(E) if j != e and j not in others][: TOP_K - 1 - len(others)])
+    dense = torch.zeros(T, E, device = "cuda", dtype = w.dtype).scatter_(1, idx, torch.softmax(torch.randn(T, TOP_K, device = "cuda"), -1).to(w.dtype))
+    return idx, dense
+
+
+@pytest.mark.parametrize("proj", ["gate_up_projs", "down_projs"])
+@pytest.mark.parametrize(
+    "what", ["module", "weight", "requantize", "absmax", "nested_absmax", "nested_code", "offset", "offset_inplace"]
+)
+def test_replaced_middle_expert_rebuilds_tables(proj, what):
+    # Replacing any expert buffer must rebuild the tables, not leave kernels on freed memory.
+    ex = _Experts(True).eval()
+    T = 4
+    x = torch.randn(1, T, H, device = "cuda", dtype = DT)
+    mid = E // 2
+    idx, w = _routes_through(mid, T)
+    with torch.no_grad():
+        assert routed_experts_forward(ex, x, idx, w) is not None
+        compiled = torch.compile(lambda a, b, c: routed_experts_forward(ex, a, b, c), backend = "eager", fullgraph = True)
+        torch._dynamo.reset()
+        compiled(x, idx, w)
+    shape = (H, 2 * I) if proj == "gate_up_projs" else (I, H)
+    new = _linear4bit(*shape, True, 999)
+    projs = getattr(ex, proj)
+    if what == "module":
+        projs[mid] = new
+    elif what == "weight":
+        projs[mid].weight = new.weight
+    elif what == "requantize":
+        projs[mid].weight.data = new.weight.data
+        projs[mid].weight.quant_state = new.weight.quant_state
+    elif what == "absmax":
+        qs = projs[mid].weight.quant_state
+        qs.absmax = new.weight.quant_state.absmax  # same packed bytes, other scales
+    elif what == "nested_absmax":
+        qs = projs[mid].weight.quant_state
+        qs.state2.absmax = qs.state2.absmax * 3
+    elif what == "nested_code":
+        qs = projs[mid].weight.quant_state
+        qs.state2.code = qs.state2.code * 1.5
+    elif what == "offset":
+        qs = projs[mid].weight.quant_state
+        qs.offset = qs.offset + 0.05
+    else:
+        with torch.no_grad():
+            projs[mid].weight.quant_state.offset.add_(0.05)
+    del new
+    torch.cuda.empty_cache()
+    junk = torch.full((1 << 22,), float("nan"), device = "cuda")  # reuse the freed blocks
+    ref = _reference(ex, x, idx, w)
+    with torch.no_grad():
+        got_c = compiled(x, idx, w)  # no eager call since the swap
+        got = routed_experts_forward(ex, x, idx, w)
+        got_c2 = compiled(x, idx, w)
+    del junk
+    tol = 2 ** -8 * ref.abs().max().item() + 1e-3
+    assert got is not None and (got.double() - ref).abs().max().item() <= tol
+    # Compiled: a weight swap falls back densely until an eager call rebuilds the tables.
+    if what in ("module", "weight"):
+        assert got_c is None or (got_c.double() - ref).abs().max().item() <= tol
+    # torch 2.7 Dynamo keeps the dense-fallback graph after a weight swap: correct, not routed.
+    if got_c2 is None:
+        assert what in ("module", "weight") and _TORCH < (2, 10), "compiled call did not route after the rebuild"
+    else:
+        assert (got_c2.double() - ref).abs().max().item() <= tol

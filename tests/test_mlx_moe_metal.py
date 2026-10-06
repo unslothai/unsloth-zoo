@@ -539,6 +539,61 @@ def test_unnormalized_top_k_and_subclass_bodies_are_fused(monkeypatch):
             assert not partitions
 
 
+def _native_combine(y, inv_order, scores):
+    return (y[inv_order].reshape(*scores.shape, y.shape[-1]) * scores[..., None]).sum(axis = -2)
+
+
+@pytest.mark.parametrize("dtype", fusion._MOE_COMBINE_DTYPES)
+@pytest.mark.parametrize("top_k, width", [(8, 2048), (3, 96)])
+def test_combine_kernel_reproduces_the_native_weighted_sum(dtype, top_k, width):
+    for tokens in (1, 300):
+        mx.random.seed(tokens + top_k)
+        y = (mx.random.normal((tokens * top_k, 1, width)) * 3).astype(dtype)
+        scores = mx.softmax(mx.random.normal((1, tokens, top_k)) * 2, axis = -1).astype(dtype)
+        y[..., 0] = -0.0
+        inv_order = mx.random.permutation(tokens * top_k)
+        _identical(fusion._run_moe_combine(y, inv_order, scores), _native_combine(y, inv_order, scores))
+    assert not fusion._moe_combine_verified(dtype, 1, width)  # one route is not summed, so its zero keeps its sign
+    fusion._moe_combine_verified.cache_clear()
+
+
+@pytest.mark.parametrize("native", [vlm_qwen, lm_qwen])
+@pytest.mark.parametrize("verified", [True, False])
+def test_prefill_combines_sorted_expert_rows_under_the_gate_up_pack(native, verified, monkeypatch):
+    _skip_unless_gate_up_resolves(native)
+    block = _block(native)
+    prefill, decode = (mx.random.normal(shape).astype(mx.bfloat16) for shape in ((2, 70, 64), (9, 1, 64)))
+    expected = block(prefill), block(decode)
+    combines, run = [], fusion._run_moe_combine
+    monkeypatch.setattr(fusion, "_run_moe_combine",
+                        lambda *a: combines.append(None) or run(*a) + (0 if verified else 1))
+    fusion._moe_combine_verified.cache_clear()
+    with fusion.fused_moe_router(block):
+        _identical(block(prefill), expected[0])
+        assert not combines  # without the pack the experts are not reachable in sorted order
+        with fusion.fused_moe_gate_up(block):
+            mx.eval(block(prefill))  # the first call verifies the kernel against the native chain
+            combines.clear()
+            _identical(block(prefill), expected[0])
+            assert bool(combines) is verified
+            combines.clear()
+            _identical(block(decode), expected[1])
+            with monkeypatch.context() as capped:  # past 32-bit indexing the native chain runs
+                capped.setattr(fusion, "_MOE_COMBINE_MAX_ELEMENTS", 2 * 70 * 8 * 64 - 1)
+                _identical(block(prefill), expected[0])
+                assert not combines
+            switch = vlm if native is vlm_qwen else lm
+            sort = switch._gather_sort
+            with monkeypatch.context() as rebound:  # a pinned helper replaced after the scope resolved it
+                rebound.setattr(switch, "_gather_sort", lambda *a: sort(*a))
+                _identical(block(prefill), expected[0])
+            block.switch_mlp.gate_proj.scales = block.switch_mlp.gate_proj.scales * 1.25  # the pack is now stale
+            stale = block(prefill)
+            assert not combines
+    _identical(stale, block(prefill))
+    fusion._moe_combine_verified.cache_clear()
+
+
 @contextlib.contextmanager
 def _routed(block):
     with fusion.fused_moe_router(block), fusion.fused_moe_routed_experts(block):
