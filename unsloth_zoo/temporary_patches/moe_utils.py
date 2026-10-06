@@ -2525,8 +2525,7 @@ def moe_lora_b_layout_for_wrapper(wrapper, adapter_name = None) -> str:
     if _wrapper_uses_separated_moe_lora(wrapper):
         verdict = _wrapper_forward_applies_stash(wrapper)
         if verdict is None:
-            # A compiled-only run never reaches the eager probe; the compiled branch's
-            # static answer is then what decided the packing.
+            # A compiled-only run never reaches the eager probe.
             verdict = _wrapper_forward_applies_stash(wrapper, _MOE_LORA_COMPILED_VERDICT_ATTR)
         if verdict is False:
             # The structural test says the separated forward claims this wrapper, but the
@@ -3198,10 +3197,8 @@ def _patched_param_wrapper_forward(
             # every output and gradient on a family that ignores the stash, silently and
             # for the life of the captured graph. The bytecode says which family this is.
             #
-            # Nothing is recorded as the verdict, so the first eager call still measures and
-            # every later compile follows the real verdict. The static answer is kept
-            # apart, because it decides which packing this call trains and the saved lora_B
-            # layout marker has to follow the forward that ran.
+            # Not recorded as the verdict, so the first eager call still measures; kept apart
+            # for the saved lora_B layout marker, which must follow the forward that ran.
             applies_stash = _forward_statically_reads_stash(experts_module)
             if not applies_stash and _interface_route_reads_stash(experts_module):
                 applies_stash = True
