@@ -119,10 +119,17 @@ def _patch_deepseek_v3_causal_lm_forward():
     # Patch DeepseekV3ForCausalLM.forward for GRPO: return hidden_states instead
     # of logits when UNSLOTH_RETURN_HIDDEN_STATES=1.
     try:
-        from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
-            DeepseekV3ForCausalLM,
-            CausalLMOutputWithPast,
+        from transformers.models.deepseek_v3 import modeling_deepseek_v3
+        from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3ForCausalLM
+
+        # transformers 5.19 returns MoeCausalLMOutputWithPast and no longer imports
+        # CausalLMOutputWithPast into this module; earlier versions only have the latter.
+        _output_class = getattr(modeling_deepseek_v3, "MoeCausalLMOutputWithPast", None) or getattr(
+            modeling_deepseek_v3, "CausalLMOutputWithPast", None
         )
+        if _output_class is None:
+            from transformers.modeling_outputs import CausalLMOutputWithPast as _output_class
+        _output_has_router_logits = "router_logits" in getattr(_output_class, "__dataclass_fields__", {})
 
         _original_causal_lm_forward = DeepseekV3ForCausalLM.forward
         # Temporary patches run at init, pre_compile and post_compile: wrap each class once.
@@ -183,12 +190,16 @@ def _patch_deepseek_v3_causal_lm_forward():
                 hidden_states = hidden_states[:, slice_indices, :]
 
             # Return hidden_states as "logits" for GRPO
-            return CausalLMOutputWithPast(
+            extra = {}
+            if _output_has_router_logits:
+                extra["router_logits"] = getattr(outputs, "router_logits", None)
+            return _output_class(
                 loss=None,
                 logits=hidden_states,
                 past_key_values=outputs.past_key_values,
                 hidden_states=outputs.hidden_states,
                 attentions=outputs.attentions,
+                **extra,
             )
 
         # Preserve __qualname__ so _unsloth_get_batch_samples can detect
