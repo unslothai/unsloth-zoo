@@ -13,12 +13,7 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""TiledMLP's autocast decorators need a device string torch knows.
-
-`DEVICE_TYPE` is "hip" on ROCm and "mlx" on Apple silicon with mlx installed; torch's amp
-rejects both on the first decorated call, so every tiled forward died. The test re-imports
-`tiled_mlp` under each label and runs a real tiled forward + backward on CPU tensors.
-"""
+"""torch amp rejects DEVICE_TYPE "hip" / "mlx": run a tiled forward + backward under each label."""
 
 import importlib
 

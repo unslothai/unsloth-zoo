@@ -38,9 +38,7 @@ FIRST_PASS = True
 UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
 UNSLOTH_ENABLE_TILED_LOGGING = UNSLOTH_ENABLE_LOGGING and os.environ.get("UNSLOTH_ENABLE_TILED_LOGGING", "0") == "1"
 
-# torch's amp wants a device string torch itself knows. DEVICE_TYPE is ours and carries two
-# values torch does not accept the same way, which is what DEVICE_TYPE_TORCH exists to translate:
-# "mlx" (Apple silicon with mlx installed) and "hip".
+# amp rejects DEVICE_TYPE "hip" / "mlx"; DEVICE_TYPE_TORCH is the spelling torch accepts.
 torch_amp_custom_fwd = torch.amp.custom_fwd(device_type = DEVICE_TYPE_TORCH)
 torch_amp_custom_bwd = torch.amp.custom_bwd(device_type = DEVICE_TYPE_TORCH)
 
