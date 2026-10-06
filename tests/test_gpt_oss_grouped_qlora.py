@@ -640,8 +640,12 @@ def _run_up(ex, x, idx, w, grouped, monkeypatch, upstream):
 @pytest.mark.parametrize("rule", [True, False])
 @pytest.mark.parametrize("grad_scale", [1.0, 1e-6])
 @pytest.mark.parametrize("gemm", ["triton", "cublas"])
-def test_fp16_grouped_matches_loop_and_oracle(r, x_dtype, rule, grad_scale, gemm, monkeypatch):
+@pytest.mark.parametrize("down_operand", ["fp16", "fp32"])
+def test_fp16_grouped_matches_loop_and_oracle(r, x_dtype, rule, grad_scale, gemm, down_operand, monkeypatch):
+    if down_operand == "fp32" and not rule:
+        pytest.skip("fp32 operands apply to the loader's fp32 down only")
     monkeypatch.setenv("UNSLOTH_GPTOSS_FP16_GEMM", gemm)
+    monkeypatch.setenv("UNSLOTH_GPTOSS_FP16_DOWN_OPERAND", down_operand)
     ex = _fp16_lora(_fp16_experts(rule = rule), r = r)
     T = 96
     g = torch.Generator(device = "cuda").manual_seed(3)
@@ -790,3 +794,32 @@ def test_fp16_grouped_no_host_sync(monkeypatch):
         out.float().sum().backward()
     finally:
         torch.cuda.set_sync_debug_mode("default")
+
+
+@needs_fp16_grouped
+@pytest.mark.parametrize("gemm", ["triton", "cublas"])
+def test_fp32_down_operands_match_the_loop_down_exactly_enough(gemm, monkeypatch):
+    # fp32 operand mode = the loop's fp32 down math: fp32 dequant stack (bit-exact bnb), fp32 x,
+    # fp32 dY, IEEE accumulate. Against per-expert fp32 matmuls only summation order differs.
+    from unsloth_zoo.temporary_patches.moe_grouped_fp16 import Groups, grouped_frozen_linear
+    monkeypatch.setenv("UNSLOTH_GPTOSS_FP16_GEMM", gemm)
+    ex = _fp16_experts()
+    state = gq._tables(ex, F16)
+    p32 = gq._Fp16StackProvider(state["down"], ex.down_projs, True, torch.float32)
+    T = 300
+    counts = torch.tensor([T // E] * (E - 1) + [T - (T // E) * (E - 1)], dtype = torch.int32, device = "cuda")
+    counts[2] = 0
+    counts[-1] += T // E
+    x = (torch.randn(T, I, device = "cuda") * 10).requires_grad_(True)
+    bias = torch.stack([p.bias for p in ex.down_projs]).detach()
+    y = grouped_frozen_linear(x, Groups(counts), p32, bias = bias, out_dtype = torch.float32)
+    g = torch.randn_like(y) * 1e-7
+    y.backward(g)
+    ref, dref, s0 = torch.empty_like(y), torch.empty_like(x), 0
+    for e, c in enumerate(counts.tolist()):
+        W = bnb.functional.dequantize_4bit(ex.down_projs[e].weight.data, ex.down_projs[e].weight.quant_state)
+        assert W.dtype == torch.float32
+        ref[s0:s0 + c] = x.detach()[s0:s0 + c] @ W.T + bias[e]
+        dref[s0:s0 + c] = g[s0:s0 + c] @ W
+        s0 += c
+    assert _rel(y.detach(), ref) < 1e-6 and _rel(x.grad, dref) < 1e-6, (_rel(y.detach(), ref), _rel(x.grad, dref))

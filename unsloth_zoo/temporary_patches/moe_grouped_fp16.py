@@ -194,6 +194,12 @@ def _pow2(n):
     return 1 << max(int(n) - 1, 0).bit_length()
 
 
+# fp32 gpt-oss down GEMM operands per backend when UNSLOTH_GPTOSS_FP16_DOWN_OPERAND=auto.
+# "fp32" is the loop's exact math (IEEE fp32, fp32 dequant stack); "fp16" rounds x / W / dY to fp16
+# (dY per-row power-of-two scaled) with an fp32 accumulate and output. Placeholder, set from benches.
+DOWN_OPERAND_AUTO = {"triton": "fp16", "cublas": "fp16"}
+
+
 def use_cublas(device) -> bool:
     mode = os.environ.get("UNSLOTH_GPTOSS_FP16_GEMM", "auto")
     if mode in ("cublas", "triton"):

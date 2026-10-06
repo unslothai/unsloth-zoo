@@ -478,18 +478,18 @@ class _Fp16StackProvider:
 
     __slots__ = ("tb", "projs", "N", "K", "num_experts", "dtype", "chunk", "pin")
 
-    def __init__(self, tb, projs, recompute):
+    def __init__(self, tb, projs, recompute, dtype = torch.float16):
         qs = getattr(projs[0], "base_layer", projs[0]).weight.quant_state
         self.tb, self.projs = tb, projs
         self.N, self.K = int(qs.shape[0]), int(qs.shape[1])
         self.num_experts = len(projs)
-        self.dtype = torch.float16
+        self.dtype = dtype
         device = qs.absmax.device
         from unsloth_zoo.temporary_patches.moe_grouped_fp16 import use_cublas
         # Per-expert cuBLAS GEMMs gain nothing from a whole stack: keep its transient small
         # (a T4 running 20B sits at ~95% of its memory with a 1 GiB gate_up stack).
         cap = int(os.environ.get("UNSLOTH_GPTOSS_FP16_CUBLAS_STACK_MB", "256")) << 20 if use_cublas(device) else None
-        self.chunk = _expert_window(self.num_experts, self.N * self.K * 2, device, cap)
+        self.chunk = _expert_window(self.num_experts, self.N * self.K * dtype.itemsize, device, cap)
         # Pin (skip the backward rebuild) only when asked to and the whole stack fits.
         self.pin = (not recompute) and self.chunk >= self.num_experts
 
@@ -499,18 +499,20 @@ class _Fp16StackProvider:
 
     def __call__(self, lo, hi):
         tb = self.tb
-        if tb is not None and tb.get("dtype") in (torch.float16, torch.float32):
+        # fp16 from an fp16 or fp32 quant state (one rounding); fp32 only from an fp32 one (exact).
+        ok = (torch.float16, torch.float32) if self.dtype is torch.float16 else (torch.float32,)
+        if tb is not None and tb.get("dtype") in ok:
             if (lo, hi) != (0, self.num_experts):
                 tb = dict(tb)
                 for k in ("w", "a", "a2", "c2", "off"):
                     tb[k] = tb[k][lo:hi]
-            w = nf4_dequant_expert_stack(tb, torch.float16)
+            w = nf4_dequant_expert_stack(tb, self.dtype)
             if w is not None:
                 return w
         import bitsandbytes as bnb
         CALLS["bnb_fallback_dequant"] += 1
         return torch.stack([
-            bnb.functional.dequantize_4bit(b.weight.data, b.weight.quant_state).to(torch.float16)
+            bnb.functional.dequantize_4bit(b.weight.data, b.weight.quant_state).to(self.dtype)
             for b in (getattr(p, "base_layer", p) for p in self.projs[lo:hi])
         ])
 
@@ -550,6 +552,16 @@ def _lora_delta_fp16(x, counts, projs, lora, res_dtype):
     return grouped_linear(xa.to(res_dtype), B, counts) * scaling
 
 
+def down_operand_dtype(device):
+    """Operand dtype of the fp32 down GEMM. UNSLOTH_GPTOSS_FP16_DOWN_OPERAND = fp16 | fp32 | auto;
+    auto picks from the measured speed per backend (see moe_grouped_fp16.DOWN_OPERAND_AUTO)."""
+    from unsloth_zoo.temporary_patches.moe_grouped_fp16 import DOWN_OPERAND_AUTO, use_cublas
+    mode = os.environ.get("UNSLOTH_GPTOSS_FP16_DOWN_OPERAND", "auto")
+    if mode not in ("fp16", "fp32"):
+        mode = DOWN_OPERAND_AUTO["cublas" if use_cublas(device) else "triton"]
+    return torch.float32 if mode == "fp32" else torch.float16
+
+
 def _grouped_qlora_forward_fp16(experts, hidden_states, router_indices, routing_weights,
                                 batch_size, num_tokens, num_experts, top_k, lora, down_fp32):
     """The per-expert loop's dtypes on float16 GPUs: gate_up in fp16 (returned in the input's
@@ -571,6 +583,9 @@ def _grouped_qlora_forward_fp16(experts, hidden_states, router_indices, routing_
     dn_out_dtype = torch.float32 if down_fp32 else f16
     x_mode = os.environ.get("UNSLOTH_GPTOSS_FP16_X_MODE", "cast")
     dy_mode = os.environ.get("UNSLOTH_GPTOSS_FP16_DY_MODE", "scale")
+    # fp32 down (loader rule): fp32 operands reproduce the loop's fp32 GEMM (IEEE, no TF32, no
+    # narrowing of x or dY); fp16 operands with an fp32 output are the speed option.
+    dn_operand = down_operand_dtype(device) if down_fp32 else f16
     CALLS["forward_fp16"] += 1
     if lora is not None:
         CALLS["forward_fp16_lora"] += 1
@@ -590,7 +605,7 @@ def _grouped_qlora_forward_fp16(experts, hidden_states, router_indices, routing_
     gu_bias = torch.stack([getattr(p, "base_layer", p).bias for p in gu_projs]).detach()
     dn_bias = torch.stack([getattr(p, "base_layer", p).bias for p in dn_projs]).detach()
     gu_w = _Fp16StackProvider(state["gate_up"] if state is not None else None, gu_projs, recompute)
-    dn_w = _Fp16StackProvider(state["down"] if state is not None else None, dn_projs, recompute)
+    dn_w = _Fp16StackProvider(state["down"] if state is not None else None, dn_projs, recompute, dn_operand)
 
     xs = hidden_states[sorted_tokens]
     # Linear4bit: x.to(compute dtype), bias in the epilogue, output back in the input's dtype.

@@ -85,13 +85,16 @@ SHAPES = [(8, 2880, 2880, 300), (8, 53, 37, 97), (32, 2880, 64, 2048), (5, 16, 1
 
 
 @pytest.mark.parametrize("E,N,K,M", SHAPES)
-@pytest.mark.parametrize("case", ["f16", "f32x_cast", "f32x_split", "f32"])
+@pytest.mark.parametrize("case", ["f16", "bf16", "f32x_cast", "f32x_split", "f32"])
 def test_forward_matches_fp64(E, N, K, M, case):
     g = torch.Generator(device = DEV).manual_seed(0)
     counts = _counts(E, M, 1, empty = (1,) if E > 2 else ())
     x = torch.randn(M, K, device = DEV, generator = g)
     w = torch.randn(E, N, K, device = DEV, generator = g) / K ** 0.5
-    xd, wd, od, mode = {"f16": (F16, F16, F16, None), "f32x_cast": (F32, F16, F32, mg.A_CAST),
+    if case == "bf16" and not torch.cuda.is_bf16_supported(including_emulation = False):
+        pytest.skip("no bf16")
+    xd, wd, od, mode = {"f16": (F16, F16, F16, None), "bf16": (torch.bfloat16, torch.bfloat16, F32, None),
+                        "f32x_cast": (F32, F16, F32, mg.A_CAST),
                         "f32x_split": (F32, F16, F32, mg.A_SPLIT), "f32": (F32, F32, F32, None)}[case]
     xq, wq = x.to(xd), w.to(wd)
     y = mg.grouped_gemm(xq, wq, counts, od, b_trans = True, a_mode = mode)
@@ -107,6 +110,30 @@ def test_forward_matches_fp64(E, N, K, M, case):
         assert _rel(y, _oracle(x, wq, counts)) < 1e-5
     if case == "f32x_cast":
         assert _rel(y, _oracle(x, wq, counts)) < 2e-3
+
+
+@pytest.mark.parametrize("tf32_flags", [False, True])
+def test_fp32_operands_are_ieee_not_tf32(tf32_flags, backend, monkeypatch):
+    # fp32 x fp32 is the exact-parity mode against the loop's fp32 down: K = 2880 under TF32
+    # (10-bit mantissa) is ~1e-3 off, IEEE fp32 ~1e-6. Triton passes input_precision="ieee", so it
+    # stays IEEE even with TF32 allowed globally; cuBLAS follows torch's flag, as the loop's own
+    # fp32 matmul does (so parity holds either way).
+    if tf32_flags and backend == "cublas":
+        pytest.skip("cuBLAS follows torch.backends.cuda.matmul.allow_tf32, like the per-expert loop")
+    E, N, K, M = 8, 512, 2880, 600
+    counts = _counts(E, M, 9)
+    x = torch.randn(M, K, device = DEV)
+    w = torch.randn(E, N, K, device = DEV) / K ** 0.5
+    ref = _oracle(x, w, counts)
+    old = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = tf32_flags
+    try:
+        y = mg.grouped_gemm(x, w, counts, F32, b_trans = True)
+        dx = mg._bwd_dx(torch.randn(M, N, device = DEV) * 1e-7, w, counts, F32, "scale")
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old
+    assert _rel(y, ref) < 1e-5, _rel(y, ref)
+    assert dx.dtype == F32 and bool(torch.isfinite(dx).all())
 
 
 def test_wrong_transpose_is_caught():
