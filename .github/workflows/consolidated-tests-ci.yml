@@ -1128,10 +1128,8 @@ jobs:
                 # to a composite model's on-disk weights is a class attribute in
                 # transformers 4 and a registry in 5, and losing it merges nothing
                 # silently, so one pinned version cannot show the merge finds it.
-                # test_fused_ce_coverage is here because a model that stops matching
-                # the fused lm_head + CE rewrite still trains, only with the full
-                # logits tensor; the baseline covers 4.55.0 to 5.18.0, so each pin
-                # checks its own release's fused classes.
+                # test_fused_ce_coverage: a model that loses fused CE still trains (full
+                # logits), so each pin is checked against its release in the baseline.
                 "$venv/bin/python" -m pytest -v --tb=short -rs \
                   tests/test_upstream_pinned_symbols_transformers.py \
                   tests/test_torchvision_video_removed_message.py \
