@@ -191,7 +191,7 @@ def test_marker_prompt_layout_calibration_and_head_budget(marker_checkpoint):
 
 @pytest.fixture
 def decoder_family(monkeypatch):
-    from unsloth_zoo.mlx import loader
+    from unsloth_zoo.mlx import generate, loader
 
     loads, prompts = [], []
     # Characters are tokens, so of the two-letter label codes only the two listed here are single tokens.
@@ -199,7 +199,7 @@ def decoder_family(monkeypatch):
     load = lambda source, **options: loads.append((source, options)) or (types.SimpleNamespace(eval = lambda: None), types.SimpleNamespace(tokenizer = types.SimpleNamespace(encode = encode)))
     monkeypatch.setattr(loader.FastMLXModel, "from_pretrained", load)
     monkeypatch.setattr(decision, "_merge_lora", lambda model, folder: loads.append(folder))
-    monkeypatch.setattr("unsloth_zoo.mlx.generate.generation_mode", lambda model: contextlib.nullcontext())
+    monkeypatch.setattr(generate, "generation_mode", lambda model: contextlib.nullcontext())
     monkeypatch.setattr(decision._QwenModel, "_hidden_states", lambda self, prompts: iter(prompts))
     monkeypatch.setattr(decision._LabelModel, "_read", lambda self, question, ids, hidden: [float(i * i) for i in range(self._label_count(question))])
     return loads, prompts
