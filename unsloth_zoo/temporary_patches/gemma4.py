@@ -58,7 +58,7 @@ from .utils import raise_error, patch_function
 
 
 class _Gemma4KVSharedSafeProxy:
-    """Proxy around Gemma4TextConfig hiding num_kv_shared_layers when 0.
+    """Proxy around Gemma4TextConfig hiding num_kv_shared_layers when 0; writes reach the real config.
 
     Makes `hasattr(proxy, "num_kv_shared_layers")` False so upstream's
     `layer_types[:-0]` slice is skipped; all other lookups forward to the real
@@ -90,7 +90,7 @@ class _Gemma4KVSharedSafeProxy:
         return getattr(self._real, name)
 
     def __setattr__(self, name, value):
-        # vLLM writes through get_text_config().
+        # TRL and vLLM write through get_text_config().
         if name == "_real":
             object.__setattr__(self, name, value)
         else:

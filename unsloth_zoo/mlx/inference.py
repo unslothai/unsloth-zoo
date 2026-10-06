@@ -46,6 +46,12 @@ from . import nax
 logger = logging.getLogger(__name__)
 
 
+def _fusion_modules(model, modules):
+    return modules if modules is not None else (
+        model.named_modules() if hasattr(model, "named_modules") else ()
+    )
+
+
 # Pin the upstream function bodies the fusions read, rewrite or reimplement, since a fusion
 # mirroring an upstream body would compute the old arithmetic once that body changes.
 _ALIASES = (("mx", mx), ("nn", nn))
@@ -296,8 +302,21 @@ def _fused_moe_gate_up_class(original_class, projection_type, scatter_unsort, de
                 x = scatter_unsort(x, inv_order, indices.shape)
             return x.squeeze(-2)
 
+        def sorted_experts(self, x, indices):
+            """Expert outputs in expert-sorted route order and the inverse order, or None for the native call."""
+            packed = self._unsloth_moe_gate_up
+            if (self.training or not packed.matches(self) or not _bindings_intact(bindings)
+                    or x.ndim != 3 or x.shape[1] <= max(decode_block, 1) or indices.size < 64):
+                return None
+            order = mx.argsort(indices.flatten())
+            x, idx, token_rows = mx.expand_dims(x, (-2, -3)).flatten(0, -3), indices.flatten()[order], order // indices.shape[-1]
+            x_gate, x_up = packed.project(x, idx, True, token_rows)
+            inv_order = mx.argsort(order)
+            return self.down_proj(self.activation(x_up, x_gate), idx, sorted_indices = True), inv_order
+
         _MOE_GATE_UP_CLASSES[key] = type(
-            f"_FusedMoEGateUp{original_class.__name__}", (original_class,), {"__call__": fused_call}
+            f"_FusedMoEGateUp{original_class.__name__}", (original_class,),
+            {"__call__": fused_call, "sorted_experts": sorted_experts},
         )
     return _MOE_GATE_UP_CLASSES[key]
 
@@ -314,7 +333,7 @@ def _uncached_allocations():
 
 
 @contextmanager
-def fused_moe_gate_up(model):
+def fused_moe_gate_up(model, *, _modules = None):
     """Fuse quantized MoE gate and up projections while their weights stay fixed.
 
     Repacking at entry makes weight edits between scopes visible. Overlapping scopes
@@ -325,7 +344,7 @@ def fused_moe_gate_up(model):
         with _MOE_GATE_UP_LOCK, _uncached_allocations():
             if not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
                 specs = _moe_switch_specs()
-                modules = model.named_modules() if hasattr(model, "named_modules") else ()
+                modules = _fusion_modules(model, _modules)
                 for _, module in modules:
                     packed = getattr(module, "_unsloth_moe_gate_up", None)
                     if (isinstance(packed, _PackedMoEGateUp)
@@ -574,7 +593,7 @@ def _fused_decode_conv_class(base, call, prepare, conv, silu):
 
 
 @contextmanager
-def fused_decode_conv_silu(model):
+def fused_decode_conv_silu(model, *, _modules = None):
     """Fuse the recurrent decode conv window, convolution, SiLU and q/k/v split into one launch during serialized inference.
 
     Prefill, unsupported convolution shapes, and training keep their native paths.
@@ -583,7 +602,7 @@ def fused_decode_conv_silu(model):
     changed = []
     specs = {}
     try:
-        modules = model.named_modules() if hasattr(model, "named_modules") else ()
+        modules = _fusion_modules(model, _modules)
         if not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
             for _, module in modules:
                 base = type(module)
@@ -1272,13 +1291,13 @@ def _prenorm_class(base):
 _RESIDUAL_NORM_LOCK = RLock()
 
 @contextmanager
-def fused_residual_norm(model):
+def fused_residual_norm(model, *, _modules = None):
     """Fuse eligible single-row RMS normalization and residual additions during inference."""
     patched = []
     try:
         with _RESIDUAL_NORM_LOCK:
             if not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None) and _residual_norm_kernel() is not None:
-                for _, module in model.named_modules() if hasattr(model, "named_modules") else ():
+                for _, module in _fusion_modules(model, _modules):
                     base = type(module)
                     # Type first, for the reason fused_decode_conv_silu gives: generation enters
                     # this scope for whatever named_modules() yields, including plain stand-ins
@@ -1302,7 +1321,7 @@ def fused_residual_norm(model):
 
 
 @contextmanager
-def fused_residual_norm_handoff(model):
+def fused_residual_norm_handoff(model, *, _modules = None):
     """Hand each pre-norm decoder layer's output, normalized, to the next layer during inference.
 
     A layer whose `h = a + b` feeds one RMS norm and whose output is `h + E` adds both residuals
@@ -1315,7 +1334,7 @@ def fused_residual_norm_handoff(model):
     try:
         with _RESIDUAL_NORM_LOCK:
             if not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None) and mx.metal.is_available():
-                for _, module in model.named_modules() if hasattr(model, "named_modules") else ():
+                for _, module in _fusion_modules(model, _modules):
                     base = type(module)
                     # Type first, as in fused_residual_norm: named_modules() may yield plain stand-ins.
                     if not isinstance(module, dict) or module.training:
@@ -1337,7 +1356,7 @@ def fused_residual_norm_handoff(model):
                         module._unsloth_handoff_native = base
                         module._unsloth_handoff_scopes = 1
                         fresh.add(id(module))
-                for module in (module for _, module in model.named_modules()) if fresh else ():
+                for module in (module for _, module in _fusion_modules(model, _modules)) if fresh else ():
                     layers = module.get("layers") if isinstance(module, dict) else None
                     if not isinstance(layers, list):
                         continue
@@ -2389,6 +2408,73 @@ def _moe_routed_experts(block):
     return _RoutedExperts(mlp, base, projection_type, native.SwiGLU, decode_block, bindings + routed_bindings)
 
 
+# MLX multiplies and sums in the array dtype, in route order; the kernel rounds at the same two places.
+# Single precision is left native: its sum does not round like a sequential one.
+_MOE_COMBINE_DTYPES = (mx.bfloat16, mx.float16)
+_MOE_COMBINE_MAX_ELEMENTS = 1 << 32
+_MOE_COMBINE_SOURCE = """
+    uint token = thread_position_in_grid.y;
+    uint d = thread_position_in_grid.x;
+    T acc = T(0);
+    for (uint k = 0; k < K; ++k) {
+        uint route = token * K + k;
+        acc = T(float(acc) + float(T(float(y[rows[route] * D + d]) * float(scores[route]))));
+    }
+    out[token * D + d] = acc;
+"""
+
+
+@functools.cache
+def _moe_combine_kernel():
+    return mx.fast.metal_kernel(name = "unsloth_moe_combine", input_names = ["y", "rows", "scores"],
+                                output_names = ["out"], source = _MOE_COMBINE_SOURCE)
+
+
+def _run_moe_combine(y, inv_order, scores):
+    top_k, width = scores.shape[-1], y.shape[-1]
+    tokens = scores.size // top_k
+    return _moe_combine_kernel()(
+        inputs = [y, inv_order.astype(mx.uint32), scores],
+        template = [("T", y.dtype), ("K", top_k), ("D", width)],
+        grid = (width, tokens, 1), threadgroup = (min(width, 64), 1, 1),
+        output_shapes = [(*scores.shape[:-1], width)], output_dtypes = [y.dtype],
+    )[0]
+
+
+@functools.cache
+def _moe_combine_verified(dtype, top_k, width):
+    for tokens in (1, 67):
+        routes = tokens * top_k
+        y = (mx.random.normal((routes, 1, width), key = mx.random.key(tokens)) * 3).astype(dtype)
+        y[..., 0] = -0.0  # a single route keeps the sign a sum from zero drops
+        scores = mx.softmax(mx.random.normal((1, tokens, top_k), key = mx.random.key(tokens + 1)) * 2,
+                            axis = -1).astype(dtype)
+        inv_order = mx.random.permutation(routes, key = mx.random.key(tokens + 2)).astype(mx.uint32)
+        native = (y[inv_order].reshape(1, tokens, top_k, width) * scores[..., None]).sum(axis = -2)
+        fused = _run_moe_combine(y, inv_order, scores)
+        if native.dtype != fused.dtype or not mx.array_equal(native.view(mx.uint16), fused.view(mx.uint16)):
+            logger.warning("the fused MoE combine does not reproduce this MLX build's native rounding "
+                           "for %s top-%d; the native chain stays in use", dtype, top_k)
+            return False
+    return True
+
+
+def _fused_moe_combine(switch_mlp, x, inds, scores):
+    """The routed experts' weighted sum read from their sorted rows, or None for the native chain."""
+    if (not callable(getattr(type(switch_mlp), "sorted_experts", None))
+            or scores.dtype not in _MOE_COMBINE_DTYPES or scores.shape != inds.shape):
+        return None
+    routed = switch_mlp.sorted_experts(x, inds)
+    if routed is None:
+        return None
+    y, inv_order = routed
+    # The kernel indexes in 32 bits; MLX's own ops switch to 64-bit indexing past that.
+    if (y.size > _MOE_COMBINE_MAX_ELEMENTS or y.dtype != scores.dtype
+            or not _moe_combine_verified(y.dtype, scores.shape[-1], y.shape[-1])):
+        return None
+    return _run_moe_combine(y, inv_order, scores)
+
+
 def _qwen3_5_moe_call(native, scaled_shared, top_k_norm):
     # 0.7.1 scales the shared expert by `_shared_expert_scale`, earlier bodies gate it
     # by a sigmoid. mlx_lm honours `norm_topk_prob`; mlx_vlm always normalizes.
@@ -2423,8 +2509,9 @@ def _qwen3_5_moe_call(native, scaled_shared, top_k_norm):
             out = experts(self, x, inds, scores, shared_scale, shared_y)
             if out is not None:
                 return out
-        y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis = -2)
+        y = _fused_moe_combine(self.switch_mlp, x, inds, scores)
+        if y is None:
+            y = (self.switch_mlp(x, inds) * scores[..., None]).sum(axis = -2)
         return y + shared_scale * shared_y
 
     return fused_call
@@ -2495,7 +2582,7 @@ def _moe_router_class(base):
 _MOE_ROUTER_LOCK = RLock()
 
 @contextmanager
-def fused_moe_router(model):
+def fused_moe_router(model, *, _modules = None):
     """Fuse the MoE routing chain into one Metal dispatch during serialized inference.
 
     Modules whose routing body, expert count, or top-k the kernel does not cover keep
@@ -2514,7 +2601,7 @@ def fused_moe_router(model):
     changed = []
     try:
         with _MOE_ROUTER_LOCK:
-            modules = model.named_modules() if hasattr(model, "named_modules") else ()
+            modules = _fusion_modules(model, _modules)
             if (not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)
                     and _moe_router_kernel() is not None):
                 for _, module in modules:
@@ -2557,7 +2644,7 @@ def fused_moe_router(model):
 
 
 @contextmanager
-def fused_moe_routed_experts(model):
+def fused_moe_routed_experts(model, *, _modules = None):
     """Run Qwen sparse MoE blocks' routed experts on two decode kernels during serialized inference.
 
     Gate/up with SwiGLU, and down with the routing-weight combine and shared-expert add, serve
@@ -2570,7 +2657,7 @@ def fused_moe_routed_experts(model):
     changed = []
     try:
         with _MOE_ROUTER_LOCK:
-            modules = model.named_modules() if hasattr(model, "named_modules") else ()
+            modules = _fusion_modules(model, _modules)
             if (os.environ.get("UNSLOTH_MLX_ROUTED_EXPERTS", "1") != "0"
                     and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)
                     and _moe_router_kernel() is not None):
@@ -2795,6 +2882,8 @@ def _nax_qmm_classes(*cache_key):
         if routed is None:
             routed = _nax_int8_prefill_dense(self, x, bindings)
         if routed is None:
+            routed = _dense_prefill_in_scope(self, x)
+        if routed is None:
             return nn.QuantizedLinear.__call__(self, x)
         return routed + self["bias"] if "bias" in self else routed
 
@@ -2965,7 +3054,7 @@ def _int8_prefill_status(projections):
 
 
 @contextmanager
-def nax_quantized_linear(model, int8_prefill = None):
+def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
     """Run affine quantized projections on the M5 neural accelerators where measured faster.
 
     Quantized linears and tied quantized embedding heads called with the row counts measured
@@ -2998,7 +3087,7 @@ def nax_quantized_linear(model, int8_prefill = None):
                 switches = _nax_int8_prefill_switch_classes() if int8_prefill else {}
                 packed = _nax_int8_prefill_packed(model) if int8_prefill else set()
                 nested, fresh, seen = [], [], set()
-                for _, module in model.named_modules() if hasattr(model, "named_modules") else ():
+                for _, module in _fusion_modules(model, _modules):
                     if id(module) in seen:   # named_modules() yields a shared module once per path
                         continue
                     seen.add(id(module))
@@ -3052,3 +3141,132 @@ def nax_quantized_linear(model, int8_prefill = None):
                 for name in ("_unsloth_nax_qmm_scopes", "_unsloth_nax_int8_prefill_rows", "_unsloth_nax_int8_prefill"):
                     module.__dict__.pop(name, None)
                 module.pop("_unsloth_nax_qmm_rows", None)   # a tuple is stored in the module mapping
+
+
+_DENSE_QMM_CONTRACT = {"mlx.nn.layers.quantized": {"QuantizedLinear.__call__": "ca5cafb6d038d955"}}
+_DENSE_QMM_LOCK = RLock()
+_DENSE_QMM_VERIFIED = {}
+_DENSE_QMM_MIN_ROWS = 1024
+# MLX's quantized and dense matmuls each split the sum over K for small outputs, by different rules,
+# and then round differently; at or below this many 16x16 output tiles the comparison would mostly fail.
+_DENSE_QMM_MIN_TILES = 4096
+# The dequantized weight is a transient the size of the float layer; a vocabulary head would be gigabytes.
+_DENSE_QMM_MAX_WEIGHTS = 1 << 28
+
+
+def _dense_prefill_qmm(module, x, bindings):
+    """`x` times the dequantized weight for a prefill-sized call, or None when it takes the native call.
+
+    MLX's quantized matmul dequantizes inside every tile; dequantizing once is the same arithmetic.
+    Each (shape, quantization, dtypes) is compared bit for bit on its first use; the row count is part of
+    the shape because MLX picks its kernels by it.
+    """
+    if not isinstance(x, mx.array) or x.ndim < 2 or x.dtype not in (mx.bfloat16, mx.float16) or not x.shape[-1]:
+        return None
+    w, scales, biases = module.get("weight"), module.get("scales"), module.get("biases")
+    if not isinstance(w, mx.array) or w.ndim != 2 or not isinstance(scales, mx.array):
+        return None
+    N, K, M = w.shape[0], x.shape[-1], x.shape[-2]
+    if x.size != M * K:  # MLX reads the row count of a batch from its memory layout
+        return None
+    if (M < _DENSE_QMM_MIN_ROWS or -(-M // 16) * -(-N // 16) <= _DENSE_QMM_MIN_TILES
+            or N * K > _DENSE_QMM_MAX_WEIGHTS or module.training or not _bindings_intact(bindings)):
+        return None
+    group_size, bits, mode = module.group_size, module.bits, module.mode
+    family = (N, K, bits, group_size, mode, x.dtype, w.dtype, scales.dtype, getattr(biases, "dtype", None))
+    key = (x.shape, *family)
+    verified = _DENSE_QMM_VERIFIED.get(key)
+    if verified is False or family in _DENSE_QMM_VERIFIED:   # one differing row count retires the projection shape
+        return None
+    weight = mx.dequantize(w, scales, biases, group_size = group_size, bits = bits, mode = mode).astype(x.dtype)
+    dense = x @ weight.T
+    if verified is None:
+        native = mx.quantized_matmul(x, w, scales = scales, biases = biases, transpose = True,
+                                     group_size = group_size, bits = bits, mode = mode)
+        try:
+            verified = native.dtype == dense.dtype and bool(
+                mx.array_equal(native.view(mx.uint16), dense.view(mx.uint16)).item())
+        except (RuntimeError, ValueError):
+            return None  # inside a function transformation, which cannot evaluate; checked later
+        _DENSE_QMM_VERIFIED[key] = verified
+        if not verified:
+            _DENSE_QMM_VERIFIED[family] = False
+            logger.warning("the dense prefill matmul differs from the quantized one for N=%d K=%d %d-bit "
+                           "%s group %d %s at %d rows; the native call stays in use",
+                           N, K, bits, mode, group_size, x.dtype, M)
+    return dense if verified else None
+
+
+@functools.cache
+def _dense_qmm_bindings(*cache_key):
+    return _resolved_bindings(_DENSE_QMM_CONTRACT)
+
+
+def _dense_prefill_in_scope(module, x):
+    """The dense result for a NAX-routed linear inside a `dense_prefill_linear` scope, else None."""
+    if not module.__dict__.get("_unsloth_dense_qmm_scopes"):
+        return None
+    bindings = _dense_qmm_bindings(nn.QuantizedLinear.__call__)
+    return None if bindings is None else _dense_prefill_qmm(module, x, bindings)
+
+
+@functools.cache
+def _dense_qmm_class(*cache_key):
+    bindings = _dense_qmm_bindings(*cache_key)
+    if bindings is None:
+        return None
+
+    def linear(self, x):
+        routed = _dense_prefill_qmm(self, x, bindings)
+        if routed is None:
+            return nn.QuantizedLinear.__call__(self, x)
+        return routed + self["bias"] if "bias" in self else routed
+
+    return type("_DensePrefillQuantizedLinear", (nn.QuantizedLinear,), {"__call__": linear})
+
+
+@contextmanager
+def dense_prefill_linear(model, *, _modules = None):
+    """Run prefill-sized quantized projections as one dequantize and a dense matmul.
+
+    Calls of 1024 or more rows on a large enough output dequantize the weight once and multiply
+    densely, bit-identical to the quantized matmul; smaller calls,
+    training, and any shape that fails its first-use comparison keep the native call. A linear the
+    NAX scope already routes keeps its small-row and int8 routes and takes this one for the rest.
+    `UNSLOTH_MLX_DENSE_PREFILL=0` turns the route off.
+    """
+    changed = []
+    try:
+        with _DENSE_QMM_LOCK:
+            fused = None
+            if (os.environ.get("UNSLOTH_MLX_DENSE_PREFILL", "1") != "0"
+                    and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)):
+                fused = _dense_qmm_class(nn.QuantizedLinear.__call__)
+            if fused is not None:
+                seen = set()
+                for _, module in _fusion_modules(model, _modules):
+                    if id(module) in seen:   # named_modules() yields a shared module once per path
+                        continue
+                    seen.add(id(module))
+                    if (type(module) not in (fused, nn.QuantizedLinear)
+                            and getattr(type(module), "_unsloth_nax_qmm_native", None) is not nn.QuantizedLinear):
+                        continue
+                    if module.__dict__.get("_unsloth_dense_qmm_scopes"):
+                        module._unsloth_dense_qmm_scopes += 1
+                    elif module.training or type(module) is fused:
+                        continue
+                    else:
+                        if type(module) is nn.QuantizedLinear:
+                            module.__class__ = fused
+                        module._unsloth_dense_qmm_scopes = 1
+                    changed.append((module, fused))
+        yield model
+    finally:
+        with _DENSE_QMM_LOCK:
+            for module, fused in reversed(changed):
+                module._unsloth_dense_qmm_scopes -= 1
+                if not module._unsloth_dense_qmm_scopes:
+                    if type(module) is fused:   # a NAX-routed linear keeps the NAX scope's class
+                        module.__class__ = nn.QuantizedLinear
+                    module.__dict__.pop("_unsloth_dense_qmm_scopes", None)
+

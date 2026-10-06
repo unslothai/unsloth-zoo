@@ -285,7 +285,8 @@ def patch_mlp(mlp_module, target_arctic = True, target_gb = None, padded_length 
     def tiled_forward_arctic_size(self, x):
         B, S, H = x.shape
         chunk_size = max(1, H)
-        n_shards, remainder = divmod(S, chunk_size)
+        # Count over B*S, the axis TiledMLP splits: counting over S puts (B-1)*S rows in the last shard.
+        n_shards, remainder = divmod(B*S, chunk_size)
         n_shards = max(1, n_shards)
         # remainder gets added to the last shard in the forward pass
 

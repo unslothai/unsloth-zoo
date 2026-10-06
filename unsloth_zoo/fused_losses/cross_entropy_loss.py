@@ -87,6 +87,7 @@ def compute_fused_ce_loss(
     3) logit_softcapping    (X = tanh(X / logit_softcapping) * logit_softcapping)
     4) ignore_index         (passed to F.cross_entropy; defaults to -100)
     5) label_smoothing      (passed to F.cross_entropy; defaults to 0.0)
+    6) logits_bias          (X = X + logits_bias, right after the head; no gradient)
     """
     ignore_index = int(kwargs.get("ignore_index", -100))
     label_smoothing = float(kwargs.get("label_smoothing", 0.0))
@@ -104,6 +105,12 @@ def compute_fused_ce_loss(
         lm_head_weight,
         lm_head_bias,
     )
+    # Extra vocab bias added after the head (Bart `final_logits_bias`), with the stock dtype promotion.
+    logits_bias = kwargs.get("logits_bias", None)
+    if logits_bias is not None:
+        # Promote before the add: torch 2.7 inductor folds a bare add into a mixed dtype addmm under autocast.
+        logits_bias = logits_bias.to(device = device)
+        logits = logits.to(torch.promote_types(logits.dtype, logits_bias.dtype)) + logits_bias
     vocab_size = lm_head_weight.shape[0]
 
     # Apply softcapping and other functions
