@@ -28,7 +28,7 @@ from torch.utils.checkpoint import (
     get_device_states,
 )
 from unsloth_zoo.gradient_checkpointing import set_device_states
-from unsloth_zoo.device_type import DEVICE_TYPE
+from unsloth_zoo.device_type import DEVICE_TYPE, DEVICE_TYPE_TORCH
 
 __all__ = [
     "patch_tiled_mlp",
@@ -39,8 +39,17 @@ FIRST_PASS = True
 UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
 UNSLOTH_ENABLE_TILED_LOGGING = UNSLOTH_ENABLE_LOGGING and os.environ.get("UNSLOTH_ENABLE_TILED_LOGGING", "0") == "1"
 
-torch_amp_custom_fwd = torch.amp.custom_fwd(device_type = DEVICE_TYPE)
-torch_amp_custom_bwd = torch.amp.custom_bwd(device_type = DEVICE_TYPE)
+# amp rejects DEVICE_TYPE "hip" / "mlx"; torch < 2.5 also lacks mps autocast, hence the cpu fallback.
+def _amp_device_type():
+    try:
+        torch.get_autocast_dtype(DEVICE_TYPE_TORCH)
+        return DEVICE_TYPE_TORCH
+    except Exception:
+        return "cpu"
+pass
+_AMP_DEVICE_TYPE = _amp_device_type()
+torch_amp_custom_fwd = torch.amp.custom_fwd(device_type = _AMP_DEVICE_TYPE)
+torch_amp_custom_bwd = torch.amp.custom_bwd(device_type = _AMP_DEVICE_TYPE)
 
 @functools.cache
 def get_max_flat_qlen(
