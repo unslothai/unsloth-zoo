@@ -659,13 +659,20 @@ def _a_model_overrides_flex_locally():
     return found
 
 
-def _flex_routes_maskless_to_sdpa():
+def _flex_routes_maskless_to_sdpa(config):
     try:
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
         function = ALL_ATTENTION_FUNCTIONS["flex_attention"]
     except Exception:
         return False
     if getattr(function, "_unsloth_maskless_causal_sdpa", False) is not True:
+        return False
+    # The wrapper vetoes models with a layer it would keep on flex (head_dim > 256, softcap, SDPA-disabled).
+    accepts = getattr(function, "_unsloth_maskless_causal_sdpa_accepts", None)
+    try:
+        if not callable(accepts) or accepts(config) is not True:
+            return False
+    except Exception:
         return False
     return not _a_model_overrides_flex_locally()
 
@@ -704,7 +711,7 @@ def _maskless_causal_arguments(signature, args, kwargs):
     config = arguments.get("config", None)
     attn_implementation = getattr(config, "_attn_implementation", None)
     if attn_implementation == "flex_attention":
-        if not _flex_routes_maskless_to_sdpa():
+        if not _flex_routes_maskless_to_sdpa(config):
             return None
     elif attn_implementation != "sdpa":
         return None

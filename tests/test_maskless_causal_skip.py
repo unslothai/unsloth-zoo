@@ -366,6 +366,7 @@ def _register_flex(monkeypatch, reroutes):
         raise AssertionError("not called")
     if reroutes:
         flex_attention_forward._unsloth_maskless_causal_sdpa = True
+        flex_attention_forward._unsloth_maskless_causal_sdpa_accepts = lambda config: True
     mapping = getattr(ALL_ATTENTION_FUNCTIONS, "_global_mapping", None)
     target = mapping if mapping is not None else ALL_ATTENTION_FUNCTIONS
     monkeypatch.setitem(target, "flex_attention", flex_attention_forward)
@@ -389,6 +390,17 @@ def test_flex_drops_the_mask_only_when_unsloth_reroutes_it_to_sdpa(patched, monk
     padded = _kwargs(patched, config = _config("flex_attention"),
                      attention_mask = torch.tensor([[1, 1, 1, 1, 1, 1], [0, 1, 1, 1, 1, 1]]))
     assert patched.create_causal_mask(**padded) is not None
+
+
+def test_flex_keeps_the_mask_when_the_wrapper_vetoes_the_config(patched, monkeypatch):
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+    kwargs = _kwargs(patched, config = _config("flex_attention"))
+    _register_flex(monkeypatch, reroutes = True)
+    function = ALL_ATTENTION_FUNCTIONS["flex_attention"]
+    monkeypatch.setattr(function, "_unsloth_maskless_causal_sdpa_accepts", lambda config: False)
+    assert patched.create_causal_mask(**kwargs) is not None
+    monkeypatch.delattr(function, "_unsloth_maskless_causal_sdpa_accepts")
+    assert patched.create_causal_mask(**kwargs) is not None
 
 
 def test_a_model_local_flex_override_keeps_the_mask(patched, monkeypatch):
