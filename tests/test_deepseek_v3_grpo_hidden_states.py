@@ -26,6 +26,7 @@ modeling = pytest.importorskip("transformers.models.deepseek_v3.modeling_deepsee
 def test_return_hidden_states_gives_hidden_states(monkeypatch):
     from unsloth_zoo.temporary_patches.deepseek_v3_moe import patch_deepseek_v3
     patch_deepseek_v3()
+    assert modeling.DeepseekV3ForCausalLM.__UNSLOTH_SUPPORTS_RETURN_HIDDEN_STATES__ is True
     config = modeling.DeepseekV3Config(
         vocab_size = 64, hidden_size = 16, intermediate_size = 32, moe_intermediate_size = 8,
         num_hidden_layers = 2, num_attention_heads = 2, num_key_value_heads = 2, first_k_dense_replace = 0,

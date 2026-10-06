@@ -198,6 +198,8 @@ def _patch_deepseek_v3_causal_lm_forward():
         _patched_causal_lm_forward.__wrapped__ = _original_causal_lm_forward
         _patched_causal_lm_forward._unsloth_hidden_states_wrapper = True
         DeepseekV3ForCausalLM.forward = _patched_causal_lm_forward
+        # unsloth's GRPO reads this marker and skips its output_hidden_states fallback, which keeps every layer's hidden states.
+        DeepseekV3ForCausalLM.__UNSLOTH_SUPPORTS_RETURN_HIDDEN_STATES__ = True
         patch_function(DeepseekV3ForCausalLM, "forward", _patched_causal_lm_forward)
 
         if UNSLOTH_ENABLE_LOGGING:
