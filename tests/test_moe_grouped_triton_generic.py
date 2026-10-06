@@ -167,6 +167,10 @@ def test_gate_rows_threshold_and_operands(monkeypatch):
     assert not MU._triton_grouped_mm_wanted(torch.empty(8, K, dtype = torch.bfloat16), w.cpu())  # CPU
     assert not MU._triton_grouped_mm_wanted(torch.empty(2, 8, K, device = "cuda", dtype = torch.bfloat16), w)
     assert not at(8, torch.bfloat16, torch.empty(0, K, N, device = "cuda", dtype = torch.bfloat16))  # no experts
+    class _Sub(torch.Tensor):
+        pass
+    assert not at(8, torch.bfloat16, w.as_subclass(_Sub))           # tensor subclass (DTensor, float8, ...)
+    assert at(8, torch.bfloat16, torch.nn.Parameter(w.detach().contiguous(), requires_grad = False))
     monkeypatch.setenv("UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS", "16")
     assert at(16 * E) and not at(16 * E + 1)
     monkeypatch.setenv("UNSLOTH_MOE_GROUPED_TRITON", "0")

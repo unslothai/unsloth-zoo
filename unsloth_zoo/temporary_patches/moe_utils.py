@@ -540,6 +540,9 @@ def _triton_grouped_mm_policy(index, mode, disabled, override):
     return limit
 
 
+_PLAIN_TENSOR_TYPES = (torch.Tensor, torch.nn.Parameter)
+
+
 def _triton_grouped_mm_wanted(inputs, weight) -> bool:
     """Static gate (shapes, dtypes, device, cached policy; never the offsets' values): torch._grouped_mm(inputs
     [M, K], weight [E, K, N]) runs as unsloth_zoo::grouped_mm_triton when M <= limit * E."""
@@ -551,6 +554,9 @@ def _triton_grouped_mm_wanted(inputs, weight) -> bool:
         return False
     dtype = inputs.dtype
     if weight.dtype != dtype or (dtype != torch.bfloat16 and dtype != torch.float16):
+        return False
+    # Tensor subclasses (DTensor, float8 / quantized wrappers) keep torch._grouped_mm's own dispatch.
+    if type(inputs) not in _PLAIN_TENSOR_TYPES or type(weight) not in _PLAIN_TENSOR_TYPES:
         return False
     E = weight.shape[0]
     if E == 0 or inputs.shape[1] != weight.shape[1] or weight.shape[2] == 0:
