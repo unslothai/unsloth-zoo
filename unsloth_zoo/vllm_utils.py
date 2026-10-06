@@ -2884,14 +2884,17 @@ def _memory_profiling_race_message(error, trials = 0, unsloth_vllm_standby = Fal
 def _dynamo_engine_registries():
     # Both pin a compiled vLLM model; vLLM never removes them when engine startup fails.
     registries = []
-    for module_name, attr in (("torch._dynamo.eval_frame", "cached_backends"),
-                              ("torch._dynamo.convert_frame", "_bytecode_hooks")):
-        try:
-            registry = getattr(importlib.import_module(module_name), attr)
-        except Exception:
-            continue
-        if isinstance(registry, dict): registries.append(registry)
-    return registries
+    try:
+        from torch._dynamo import eval_frame
+        registries.append(eval_frame.cached_backends)
+    except Exception:
+        pass
+    try:
+        from torch._dynamo import convert_frame
+        registries.append(convert_frame._bytecode_hooks)
+    except Exception:
+        pass
+    return [registry for registry in registries if isinstance(registry, dict)]
 pass
 
 
@@ -2900,11 +2903,23 @@ def _snapshot_dynamo_engine_registries():
 pass
 
 
+def _is_vllm_registry_entry(value):
+    # Only vLLM's own entries: another thread may compile while the engine starts.
+    value = getattr(value, "_torchdynamo_orig_backend", value)
+    owner = getattr(value, "__self__", value)
+    return type(owner).__module__.split(".", 1)[0] == "vllm"
+pass
+
+
 def _release_failed_vllm_engine(snapshot):
     # Call outside the except block: the live traceback still holds the engine's frames.
     for registry, keys_before in snapshot:
         for key in list(registry.keys()):
-            if key not in keys_before: registry.pop(key, None)
+            if key in keys_before: continue
+            try:
+                if _is_vllm_registry_entry(registry[key]): registry.pop(key, None)
+            except Exception:
+                pass
     for _ in range(3):
         gc.collect()
         _device_empty_cache()

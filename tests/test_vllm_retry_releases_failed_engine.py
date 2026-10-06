@@ -34,6 +34,7 @@ eval_frame = pytest.importorskip("torch._dynamo.eval_frame")
 
 
 class _FakeCompiledModel:
+    __module__ = "vllm.model_executor.fake"
 
     def __init__(self):
         self.weights = bytearray(1 << 20)
@@ -48,17 +49,23 @@ class _FakeCompiledModel:
         return None
 
 
-def _failing_engine_build(created):
+class _OtherCompiledModel(_FakeCompiledModel):
+    """A torch.compile from another thread while the engine starts."""
+    __module__ = "user_code"
+
+
+def _failing_engine_build(created, concurrent = None):
     model = _FakeCompiledModel()
     created.append(weakref.ref(model))
+    if concurrent is not None: concurrent.append(_OtherCompiledModel())
     raise ValueError("No available memory for the cache blocks.")
 
 
-def _failed_attempt(release):
+def _failed_attempt(release, concurrent = None):
     created = []
     snapshot = vllm_utils._snapshot_dynamo_engine_registries()
     try:
-        _failing_engine_build(created)
+        _failing_engine_build(created, concurrent)
     except Exception as error:
         error = str(error)
     if release:
@@ -97,6 +104,15 @@ def test_release_keeps_entries_that_existed_before_the_attempt():
     assert set(convert_frame._bytecode_hooks.keys()) == hook_keys
     assert set(eval_frame.cached_backends.keys()) == backend_keys
     assert eval_frame.cached_backends[id(keep)] is keep
+
+
+def test_release_keeps_entries_another_compilation_added_meanwhile():
+    concurrent = []
+    model_ref = _failed_attempt(release = True, concurrent = concurrent)
+    assert model_ref() is None
+    other = concurrent[0]
+    assert eval_frame.cached_backends.get(id(other)) is other
+    assert any(getattr(hook, "__self__", None) is other for hook in convert_frame._bytecode_hooks.values())
 
 
 def test_load_vllm_releases_before_each_retry_outside_the_except_block():
