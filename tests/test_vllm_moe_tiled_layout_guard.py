@@ -13,12 +13,7 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""Shared MoE experts must never be vLLM's TRT-LLM tiled layout, even when the shape stays 3-D.
-
-vLLM >= 0.31 converts to the TRT-LLM layout in place without changing the shape, so if the
-override that keeps vLLM on Triton ever stops matching, only the class in use or the bytes
-themselves can tell.
-"""
+"""Shared MoE experts must never be vLLM's TRT-LLM tiled layout (vLLM >= 0.31 tiles in place, shape unchanged)."""
 import sys, os, types
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -90,8 +85,7 @@ TrtLlmBf16ExpertsMonolithic = type("TrtLlmBf16ExpertsMonolithic", (), {})
 @pytest.mark.parametrize("cls", [TrtLlmGenExperts, TrtLlmBf16LoRAExperts, TrtLlmBf16ExpertsMonolithic])
 def test_a_trtllm_experts_class_is_refused_even_without_a_backend_field(holder, cls):
     w13, w2 = _reference()
-    # No unquantized_backend anywhere: only the class in use can reveal the TRT-LLM path.
-    if holder == "moe_kernel":  # FusedMoEModularMethod under LoRA
+    if holder == "moe_kernel":
         qm = types.SimpleNamespace(moe_kernel = types.SimpleNamespace(fused_experts = cls()))
     elif holder == "experts_cls":
         qm = types.SimpleNamespace(experts_cls = cls)
@@ -125,11 +119,10 @@ def test_the_correct_layout_passes_the_content_check(tmp_path):
 @pytest.mark.parametrize("which", ["w13", "w2"])
 def test_in_place_tiled_bytes_with_the_hf_shape_are_refused(tmp_path, which):
     w13, w2 = _reference()
-    # vLLM >= 0.31: TRT-LLM bytes written back into the original 3-D tensor.
     v13 = tile_w13(w13).reshape(w13.shape).contiguous() if which == "w13" else w13.clone()
     v2 = tile_w2(w2).reshape(w2.shape).contiguous() if which == "w2" else w2.clone()
     assert v13.shape == w13.shape and v2.shape == w2.shape
-    qsd = _extract(_routed(v13, v2))  # shape, dtype and backend checks all pass
+    qsd = _extract(_routed(v13, v2))
     from unsloth_zoo.empty_model import verify_vllm_moe_experts_match_checkpoint
     with pytest.raises(RuntimeError, match = "do not match the checkpoint"):
         verify_vllm_moe_experts_match_checkpoint(qsd, _checkpoint(tmp_path, w13, w2))

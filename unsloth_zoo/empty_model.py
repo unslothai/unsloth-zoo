@@ -1537,11 +1537,7 @@ pass
 
 
 def _find_trtllm_moe_kernel(*roots, max_depth = 4, max_visits = 512):
-    """Name of a TRT-LLM MoE experts class reachable from the FusedMoE layer, else None.
-
-    vLLM 0.11 TrtLlmGenExperts, 0.29+ TrtLlm*Experts* (TrtLlmBf16LoRAExperts under LoRA); walked by
-    attribute so a moved holder (quant_method, moe_kernel, fused_experts, experts_cls) is still seen.
-    """
+    """Name of a TRT-LLM experts class reachable by attribute walk (holders move across vLLM versions), else None."""
     seen, frontier = set(), [(r, 0) for r in roots if r is not None]
     while frontier and len(seen) < max_visits:
         obj, depth = frontier.pop(0)
@@ -1608,12 +1604,8 @@ pass
 
 
 def verify_vllm_moe_experts_match_checkpoint(state_dict, model_path, revision = None, cache_dir = None):
-    """Compare a few rows of one shared expert against the checkpoint before training aliases it.
-
-    Independent of vLLM internals: a backend that rewrites the experts in place (vLLM >= 0.31's
-    TRT-LLM conversion keeps the 3-D shape) passes every shape / pointer check but not this one.
-    Returns True when verified, None when no comparable checkpoint tensor is available.
-    """
+    """Compare a few expert rows to the checkpoint; catches in-place shape-preserving rewrites (vLLM >= 0.31 TRT-LLM).
+    True = verified, None = no comparable checkpoint tensor."""
     w13_key = next((k for k in state_dict if k.endswith(".experts.gate_up_proj")), None)
     if w13_key is None: return None
     w2_key = w13_key[: -len("gate_up_proj")] + "down_proj"
