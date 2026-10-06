@@ -406,3 +406,20 @@ def test_a_model_local_flex_override_keeps_the_mask(patched, monkeypatch):
             scoped.setitem(sys.modules, name, module)
             assert patched.create_causal_mask(**kwargs) is not None, name
         assert patched.create_causal_mask(**kwargs) is None
+
+
+def test_a_local_flex_registered_after_the_scan_keeps_the_mask(patched, monkeypatch):
+    # The scan is cached; registering a local flex on an already-loaded interface must invalidate it.
+    import sys, types
+    from transformers.modeling_utils import AttentionInterface
+    kwargs = _kwargs(patched, config = _config("flex_attention"))
+    _register_flex(monkeypatch, reroutes = True)
+    interface = AttentionInterface()
+    module = types.ModuleType("transformers_modules.someone.late_flex.modeling_late_flex")
+    module.ATTENTION = interface
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    assert patched.create_causal_mask(**kwargs) is None  # scanned and cached: nothing local yet
+    interface["flex_attention"] = lambda *args, **kw: None
+    assert patched.create_causal_mask(**kwargs) is not None
+    del interface["flex_attention"]
+    assert patched.create_causal_mask(**kwargs) is None

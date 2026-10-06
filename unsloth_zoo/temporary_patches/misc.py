@@ -612,7 +612,23 @@ def _is_tracing_masks():
     return torch.jit.is_tracing()
 
 
-_LOCAL_FLEX_OVERRIDE_CACHE = [None, False]  # [len(sys.modules) when scanned, override found]
+_LOCAL_FLEX_OVERRIDE_CACHE = [None, False]  # [(len(sys.modules), local edits) when scanned, found]
+_LOCAL_ATTENTION_EDITS = [0]
+
+
+def _track_local_attention_edits(AttentionInterface):
+    # Count every local registration, so an interface edited after the last scan forces a rescan.
+    if AttentionInterface.__dict__.get("_unsloth_tracks_local_edits", False): return
+    set_item, del_item = AttentionInterface.__setitem__, AttentionInterface.__delitem__
+    def __setitem__(self, key, value):
+        _LOCAL_ATTENTION_EDITS[0] += 1
+        return set_item(self, key, value)
+    def __delitem__(self, key):
+        _LOCAL_ATTENTION_EDITS[0] += 1
+        return del_item(self, key)
+    AttentionInterface.__setitem__ = __setitem__
+    AttentionInterface.__delitem__ = __delitem__
+    AttentionInterface._unsloth_tracks_local_edits = True
 
 
 def _a_model_overrides_flex_locally():
@@ -621,12 +637,14 @@ def _a_model_overrides_flex_locally():
     # every loaded module (transformers.models.*, trust_remote_code's transformers_modules.*,
     # user code), under any attribute name.
     import sys
-    if _LOCAL_FLEX_OVERRIDE_CACHE[0] == len(sys.modules):
-        return _LOCAL_FLEX_OVERRIDE_CACHE[1]
     try:
         from transformers.modeling_utils import AttentionInterface
     except Exception:
         return True
+    _track_local_attention_edits(AttentionInterface)
+    state = (len(sys.modules), _LOCAL_ATTENTION_EDITS[0])
+    if _LOCAL_FLEX_OVERRIDE_CACHE[0] == state:
+        return _LOCAL_FLEX_OVERRIDE_CACHE[1]
     found = False
     for module in list(sys.modules.values()):
         # __dict__, not getattr: a getattr on a lazy transformers module imports its submodules.
@@ -640,7 +658,7 @@ def _a_model_overrides_flex_locally():
                 found = True
                 break
         if found: break
-    _LOCAL_FLEX_OVERRIDE_CACHE[:] = [len(sys.modules), found]
+    _LOCAL_FLEX_OVERRIDE_CACHE[:] = [state, found]
     return found
 
 
