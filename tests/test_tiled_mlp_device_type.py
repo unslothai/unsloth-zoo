@@ -51,6 +51,10 @@ def reload_tiled_mlp():
 # (DEVICE_TYPE, DEVICE_TYPE_TORCH) as unsloth_zoo.device_type translates them.
 @pytest.mark.parametrize("label, torch_label", [("hip", "cuda"), ("mlx", "mps"), ("cuda", "cuda")])
 def test_tiled_forward_and_backward_on_every_device_label(reload_tiled_mlp, label, torch_label):
+    try:
+        torch.get_autocast_dtype(torch_label)
+    except RuntimeError:
+        pytest.skip(f"this torch has no {torch_label} autocast (mps needs torch >= 2.5)")
     module = reload_tiled_mlp(label, torch_label)
     torch.manual_seed(0)
     reference = _MLP()
