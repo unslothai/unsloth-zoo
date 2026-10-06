@@ -15,33 +15,63 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """TiledMLP's autocast decorators need a device string torch knows.
 
-`torch.amp.custom_fwd` parses its `device_type` as a torch device on the first decorated call.
-`DEVICE_TYPE` is the zoo's own label and is "mlx" on Apple silicon with mlx installed, which
-torch rejects with "Expected one of cpu, cuda, ... at start of device string: mlx", so every
-tiled forward died inside the decorator. `DEVICE_TYPE_TORCH` is the translated spelling
-("mlx" -> "mps", "hip" -> "cuda") and is what torch APIs take everywhere else in the package.
+`DEVICE_TYPE` is "hip" on ROCm and "mlx" on Apple silicon with mlx installed; torch's amp
+rejects both on the first decorated call, so every tiled forward died. The test re-imports
+`tiled_mlp` under each label and runs a real tiled forward + backward on CPU tensors.
 """
 
+import importlib
+
+import pytest
 import torch
 
+import unsloth_zoo.device_type as device_type
 from unsloth_zoo import tiled_mlp
 
 
-def test_amp_decorators_take_a_torch_device_type():
-    for name in ("torch_amp_custom_fwd", "torch_amp_custom_bwd"):
-        decorator = getattr(tiled_mlp, name)
-        device_type = decorator.keywords["device_type"]
-        # The parse torch itself performs, so a label torch does not know fails here first.
-        torch.device(device_type)
-pass
+class _MLP(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.up = torch.nn.Linear(16, 64)
+        self.down = torch.nn.Linear(64, 16)
+
+    def forward(self, x):
+        return self.down(torch.nn.functional.silu(self.up(x)))
 
 
-def test_module_uses_the_translated_device_type():
-    """The source must read DEVICE_TYPE_TORCH, so an mlx or hip host is covered off-machine too."""
-    source = (tiled_mlp.__file__).replace(".pyc", ".py")
-    with open(source, encoding = "utf-8") as handle:
-        text = handle.read()
-    for call in ("torch.amp.custom_fwd(device_type = DEVICE_TYPE_TORCH)",
-                 "torch.amp.custom_bwd(device_type = DEVICE_TYPE_TORCH)"):
-        assert call in text, f"{call} missing; an mlx or hip DEVICE_TYPE would reach torch unchanged"
+@pytest.fixture
+def reload_tiled_mlp():
+    saved = (device_type.DEVICE_TYPE, device_type.DEVICE_TYPE_TORCH)
+
+    def _reload(label, torch_label):
+        device_type.DEVICE_TYPE = label
+        device_type.DEVICE_TYPE_TORCH = torch_label
+        return importlib.reload(tiled_mlp)
+
+    yield _reload
+    device_type.DEVICE_TYPE, device_type.DEVICE_TYPE_TORCH = saved
+    importlib.reload(tiled_mlp)
+
+
+# (DEVICE_TYPE, DEVICE_TYPE_TORCH) as unsloth_zoo.device_type translates them.
+@pytest.mark.parametrize("label, torch_label", [("hip", "cuda"), ("mlx", "mps"), ("cuda", "cuda")])
+def test_tiled_forward_and_backward_on_every_device_label(reload_tiled_mlp, label, torch_label):
+    module = reload_tiled_mlp(label, torch_label)
+    torch.manual_seed(0)
+    reference = _MLP()
+    tiled = _MLP()
+    tiled.load_state_dict(reference.state_dict())
+    module.patch_mlp(tiled, target_arctic = True)
+
+    x = torch.randn(2, 40, 16, requires_grad = True)
+    x_ref = x.detach().clone().requires_grad_()
+    out = tiled(x)
+    out_ref = reference(x_ref)
+    out.pow(2).sum().backward()
+    out_ref.pow(2).sum().backward()
+
+    torch.testing.assert_close(out, out_ref)
+    torch.testing.assert_close(x.grad, x_ref.grad)
+    for p, q in zip(tiled.parameters(), reference.parameters()):
+        torch.testing.assert_close(p.grad, q.grad)
 pass
