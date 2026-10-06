@@ -8860,7 +8860,7 @@ def _row_has_images(item):
         return False
     if item.get("type") in ("image", "image_url", "input_image"):
         return True
-    for key in ("image", "images", "image_url", "pixel_values"):
+    for key in ("image", "images", "image_url", "input_image", "pixel_values"):
         value = item.get(key)
         if value is not None and not (isinstance(value, (list, tuple)) and not value):
             return True

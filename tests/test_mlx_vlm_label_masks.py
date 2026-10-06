@@ -6066,6 +6066,7 @@ def test_text_wrapper_rejects_image_generation_in_every_row(image_first):
     {"text": "caption", "images": [object()]},
     {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": "x"}]}]},
     {"prompt": [{"role": "user", "content": [{"type": "input_image"}]}], "completion": "x"},
+    {"messages": [{"role": "user", "content": [{"input_image": "x"}]}]},
 ])
 def test_text_wrapper_rejects_image_training_before_formatting(row):
     from types import SimpleNamespace
