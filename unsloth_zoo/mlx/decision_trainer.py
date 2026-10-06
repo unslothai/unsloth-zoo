@@ -21,7 +21,6 @@ import math
 import random
 import re
 import time
-from collections import Counter
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -108,14 +107,11 @@ def add_lora_adapters(
     return model
 
 
-def collate_decisions(items, pad_token_id, length = None, options = None):
-    """Pad tokenized decisions (`input_ids`, `markers`, `qtype`, `target`) into one batch of MLX arrays.
-
-    `length` and `options` pad further than the batch needs, which keeps the number of distinct batch shapes down.
-    """
+def collate_decisions(items, pad_token_id):
+    """Pad tokenized decisions (`input_ids`, `markers`, `qtype`, `target`) into one batch of MLX arrays."""
     rows = len(items)
-    length = length or max(len(item["input_ids"]) for item in items)
-    options = options or max(len(item["markers"]) for item in items)
+    length = max(len(item["input_ids"]) for item in items)
+    options = max(len(item["markers"]) for item in items)
     batch = {
         "input_ids": np.full((rows, length), pad_token_id, np.int64),
         "attention_mask": np.zeros((rows, length), np.int64),
@@ -251,15 +247,6 @@ def decision_logits(model, items, pad_token_id, batch_size = 16):
     return out
 
 
-def _planned_lengths(shapes):
-    """Map a batch's (rows, longest row) to its padded length, merging nearby lengths so a run sees few distinct shapes."""
-    from .shape_guard import FULL_STEP_SCOPE, TextShapeEvent, plan_text_shape_padding_budget
-
-    events = [TextShapeEvent((rows,), width, "single", count, rows) for (rows, width), count in Counter(shapes).items()]
-    plan = plan_text_shape_padding_budget(events, compile_scope = FULL_STEP_SCOPE)
-    return lambda rows, width: plan.endpoint_for((rows,), width)
-
-
 def _length_grouped_batches(lengths, batch_size, rng):
     # Similar-length micro-batches, shuffled so a step mixes lengths; the longest first so an out-of-memory shows early.
     order = list(range(len(lengths)))
@@ -312,7 +299,6 @@ class MLXDecisionTrainer:
         self.state = _MLXTrainerState()
         self.control = _MLXTrainerControl()
         self.callback_handler = _MLXCallbackHandler(callbacks or [], model, processing_class, None, None)
-        self._length = self._options = None
 
     def _resolve_warmup_steps(self, total_steps):
         from .trainer import MLXTrainer
@@ -371,9 +357,7 @@ class MLXDecisionTrainer:
         self._event("on_log", logs = logs)
 
     def _collate(self, items, batch):
-        chunk = [items[i] for i in batch]
-        length = self._length(len(chunk), max(len(item["input_ids"]) for item in chunk)) if self._length else None
-        return collate_decisions(chunk, self.pad_token_id, length, self._options)
+        return collate_decisions([items[i] for i in batch], self.pad_token_id)
 
     def _eval_batches(self):
         size = self.args.per_device_eval_batch_size or self.args.per_device_train_batch_size
@@ -401,9 +385,9 @@ class MLXDecisionTrainer:
         return metrics
 
     def train(self):
-        # Planned shapes and layer-wise steps bound what the buffer cache can hold, but to a working set per shape,
-        # which is still tens of gigabytes. With args.cache_limit_gb unset the cache may hold what a step has needed
-        # so far, which is all the next step can reuse; a value <= 0 leaves the limit alone.
+        # MLX caches freed buffers by size, so every distinct batch shape leaves its working set in the cache: tens of
+        # gigabytes over a run. With args.cache_limit_gb unset the cache may hold what a step has needed so far,
+        # which is all the next step can reuse; a value <= 0 leaves the limit alone.
         limit = getattr(self.args, "cache_limit_gb", None)
         self._cache_follows_peak = limit is None
         prior = None
@@ -412,7 +396,6 @@ class MLXDecisionTrainer:
         try:
             return self._train()
         finally:
-            self._length = self._options = None
             if prior is not None:
                 mx.set_cache_limit(prior)
 
@@ -438,15 +421,6 @@ class MLXDecisionTrainer:
         logging_steps, eval_steps = (_resolve_interval_steps(value, max_steps) for value in (args.logging_steps, args.eval_steps))
         # MLXTrainingConfig has no eval_strategy: a positive eval_steps evaluates on steps, otherwise once per epoch.
         eval_strategy = "no" if not self.eval_dataset else "steps" if eval_steps else "epoch"
-        # MLX caches freed buffers by size, so every distinct batch shape leaves its working set in the cache.
-        schedule = [self._epoch_batches(epoch) for epoch in range(math.ceil(max_steps / steps_per_epoch))]
-        planned = [(items, batch) for batches in schedule for batch in batches]
-        if self.eval_dataset:
-            planned += [(self.eval_dataset, batch) for batch in self._eval_batches()]
-        self._options = max(len(item["markers"]) for source in (items, self.eval_dataset or ()) for item in source)
-        self._length = _planned_lengths(
-            (len(batch), max(len(source[i]["input_ids"]) for i in batch)) for source, batch in planned
-        )
 
         compiled = getattr(args, "compile", True) and getattr(args, "compile_mode", None) != "eager"
         if getattr(model, "gradient_checkpointing", False):
@@ -466,7 +440,7 @@ class MLXDecisionTrainer:
         self._event("on_train_begin")
         epoch = 0
         while state.global_step < max_steps and not self.control.should_training_stop:
-            batches = schedule[epoch]
+            batches = self._epoch_batches(epoch)
             self._event("on_epoch_begin")
             accumulated, losses = None, []
             for index, batch in enumerate(batches):

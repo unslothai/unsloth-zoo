@@ -46,7 +46,6 @@ from unsloth_zoo.mlx.decision_trainer import (  # noqa: E402
     MLXDecisionTrainer,
     _LayerwiseStep,
     _length_grouped_batches,
-    _planned_lengths,
     _soft_cross_entropy,
     add_lora_adapters,
     collate_decisions,
@@ -608,14 +607,6 @@ def test_decision_logits_match_the_forward_item_by_item(checkpoint):
         want = np.array(model(**{k: v for k, v in collate_decisions([item], 0).items() if k != "target"}))[0]
         np.testing.assert_allclose(row, want, atol = 2e-2)
         assert row.shape == (len(item["markers"]),)
-
-
-def test_planned_lengths_merge_nearby_widths():
-    shapes = [(8, width) for width in range(100, 500, 3)] + [(3, 77)]
-    length = _planned_lengths(shapes)
-    padded = {(rows, length(rows, width)) for rows, width in shapes}
-    assert all(length(rows, width) >= width for rows, width in shapes) and (3, 77) in padded
-    assert len(padded) <= 33 and length(8, 499) == 499
 
 
 class _Recorder:
