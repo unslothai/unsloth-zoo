@@ -324,3 +324,9 @@ def test_other_weight_formats_are_refused_by_name(tmp_path):
         load_decision_model(tmp_path, family = "openjev")
     (tmp_path / "config.json").write_text(json.dumps({"quantization_config": {"bits": 4}, "quantization": {"bits": 4}}))
     assert decision._foreign_format(tmp_path) is None
+
+
+def test_folder_keyword_still_loads(tmp_path):
+    # Callers written against the Laya-only loader pass the checkpoint as folder=.
+    with pytest.raises(ValueError, match = "not a decision model"):
+        load_decision_model(folder = tmp_path)

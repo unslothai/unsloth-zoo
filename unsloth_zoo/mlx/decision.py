@@ -1198,18 +1198,18 @@ def detect_family(folder):
     return name
 
 
-def load_decision_model(path, compute_dtype = None, *, family = None, subfolder = None, base_model = None, token = None):
+def load_decision_model(folder, compute_dtype = None, *, family = None, subfolder = None, base_model = None, token = None):
     """Load a decision model from its source repo: a local folder, or a Hugging Face repo id that is downloaded.
 
     `compute_dtype` is an MLX dtype or its name (default: float32 for the encoder models, the base model's own for the
     others); `family` names the model family when the files that identify it are missing; `subfolder` selects one checkpoint
     of a repo that ships several; `base_model` replaces the base an adapter names (a folder or repo id).
     """
-    folder = Path(path)
+    source, folder = folder, Path(folder)
     if not folder.is_dir():
         from huggingface_hub import snapshot_download
 
-        folder = Path(snapshot_download(str(path), token = token, allow_patterns = f"{subfolder}/*" if subfolder else None))
+        folder = Path(snapshot_download(str(source), token = token, allow_patterns = f"{subfolder}/*" if subfolder else None))
     if subfolder:
         folder = folder / subfolder
     family = family or detect_family(folder)
