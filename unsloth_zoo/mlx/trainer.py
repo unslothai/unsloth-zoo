@@ -8958,7 +8958,16 @@ class MLXTrainer:
             strict=False,
         )
         from .utils import _ensure_vlm_pad_token
+        from .loader import _verify_text_only_wrapper
         _ensure_vlm_pad_token(processor)
+        processor._unsloth_supports_images = getattr(self.model, "_unsloth_supports_images", None)
+        processor._unsloth_modality_model_type = model_type
+        try:
+            _verify_text_only_wrapper(self.model, model_type, check_causality=False)
+        except ValueError as exc:
+            processor._unsloth_text_training_error = str(exc)
+        else:
+            processor._unsloth_text_training_error = None
         self.processor = processor
         return processor
 
@@ -8987,6 +8996,9 @@ class MLXTrainer:
                 is_vlm=False,
                 strict=False,
             )
+            if self.tokenizer is not None:
+                self.tokenizer._unsloth_supports_images = getattr(self.model, "_unsloth_supports_images", None)
+                self.tokenizer._unsloth_modality_model_type = model_type
 
         if self.preference_kind:
             if self.distributed_world_size > 1:

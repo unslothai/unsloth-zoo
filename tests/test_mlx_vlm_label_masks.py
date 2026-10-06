@@ -1773,14 +1773,18 @@ def test_vlm_host_label_authority_and_staged_finalize():
 
 
 def _vlm_trainer_shell_for(dataset, world_size=1, prefetch=0):
-    import types as _types
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
     trainer = MLXTrainer.__new__(MLXTrainer)
     trainer.args = MLXTrainingConfig(
         per_device_train_batch_size=1, max_seq_length=8, streaming=True,
         streaming_prefetch_batches=prefetch,
     )
-    trainer.model = _types.SimpleNamespace(_config={})
+    class Model(nn.Module):
+        def __call__(self, ids):
+            return ids[..., None].astype(mx.float32)
+
+    trainer.model = Model()
+    trainer.model._config = {}
     trainer.tokenizer = _FakeProcessor()
     trainer.processor = trainer.tokenizer
     trainer.train_dataset = dataset
@@ -6114,3 +6118,235 @@ def test_image_rescue_is_sized_by_the_affected_rows(opaque, left_padded):
     assert ids.shape[1] == 8
     assert ids[1].tolist().count(200) == 4
     assert ids[0].tolist() == [200, 200] + list(range(20, 26))
+
+
+@pytest.mark.parametrize("eos", [None, "[EOS]"])
+@pytest.mark.parametrize("texts", [["a b", "b"], ["a", "a b"]])
+def test_forwarding_image_processor_uses_its_text_tokenizer(eos, texts):
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+    from unsloth_zoo.mlx.utils import _processor_vlm_inputs
+
+    backend = Tokenizer(models.WordLevel({"[UNK]": 0, "[EOS]": 1, "a": 2, "b": 3}))
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend, eos_token=eos, unk_token="[UNK]",
+        model_input_names=["input_ids", "attention_mask"],
+    )
+
+    class Processor:
+        def __init__(self):
+            self.tokenizer = tokenizer
+        def __getattr__(self, name):
+            return getattr(self.tokenizer, name)
+        def __call__(self, text, images, **kwargs):
+            raise AssertionError("image processor received text")
+
+    batch = _processor_vlm_inputs(Processor(), texts, [[], []], 8)
+    pad = 0 if eos is None else 1
+    expected = [[2, 3], [3, pad]] if len(texts[0]) > 1 else [[2, pad], [2, 3]]
+    mask = [[1, 1], [1, 0]] if len(texts[0]) > 1 else [[1, 0], [1, 1]]
+    assert batch["input_ids"].tolist() == expected
+    assert batch["attention_mask"].tolist() == mask
+    assert tokenizer.pad_token_id == pad
+    assert len(tokenizer) == 4
+
+
+@pytest.mark.parametrize("image_first", [False, True])
+def test_text_wrapper_rejects_image_generation_in_every_row(image_first):
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx.generate import GenerationRequest, generate_batch
+
+    model = SimpleNamespace(_is_vlm_model=True, _unsloth_supports_images=False,
+                            _unsloth_modality_model_type="text_wrapper")
+    rows = [GenerationRequest(prompt="a"), GenerationRequest(prompt="b", image=object())]
+    if image_first:
+        rows.reverse()
+    with pytest.raises(ValueError, match="`text_wrapper` has no vision path"):
+        generate_batch(model, None, rows)
+
+
+@pytest.mark.parametrize("row", [
+    {"text": "caption", "images": [object()]},
+    {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": "x"}]}]},
+    {"prompt": [{"role": "user", "content": [{"type": "input_image"}]}], "completion": "x"},
+    {"messages": [{"role": "user", "content": [{"input_image": "x"}]}]},
+])
+def test_text_wrapper_rejects_image_training_before_formatting(row):
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx.utils import _format_vlm_row_gating_audio, render_mlx_chat_example
+
+    target = SimpleNamespace(_unsloth_supports_images=False,
+                             _unsloth_modality_model_type="text_wrapper")
+    with pytest.raises(ValueError, match="`text_wrapper` has no vision path"):
+        _format_vlm_row_gating_audio(row, lambda _: "hidden", target)
+    with pytest.raises(ValueError, match="`text_wrapper` has no vision path"):
+        render_mlx_chat_example(target, row)
+    assert render_mlx_chat_example(target, {"text": "plain"}) == "plain"
+
+
+def test_default_vlm_training_probes_text_before_building_batches():
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx.trainer import MLXTrainer
+    from unsloth_zoo.mlx.utils import _create_vlm_batch_plan
+
+    class Model(nn.Module):
+        def __call__(self, ids, pixel_values=None):
+            if pixel_values is None:
+                raise ValueError("You have to specify pixel_values")
+
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = SimpleNamespace()
+    trainer.model = Model()
+    trainer.model._config = {"model_type": "needs_pixels"}
+    trainer.tokenizer = _FakeTokenizer()
+    trainer.processor = _FakeProcessor()
+    processor = trainer._resolve_vlm_processor()
+    with pytest.raises(ValueError, match="`needs_pixels` cannot be fine-tuned on text alone"):
+        _create_vlm_batch_plan([{"text": "plain"}], processor, {}, 1, 16)
+    image_row = {"text": "caption", "image": Image.new("RGB", (2, 2))}
+    assert _create_vlm_batch_plan([image_row], processor, {}, 1, 16) is not None
+
+
+def test_all_linear_error_reports_unsupported_projection_types():
+    from unsloth_zoo.mlx.loader import FastMLXModel
+
+    class SparseLinear(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = mx.ones((2, 2))
+
+    model = nn.Module()
+    model.layers = [nn.Module(), nn.Module()]
+    for layer in model.layers:
+        layer.q_proj = SparseLinear()
+    with pytest.raises(ValueError) as exc:
+        FastMLXModel.get_peft_model(model, target_modules="all-linear")
+    message = str(exc.value)
+    assert "target_modules='all-linear'" in message
+    assert "Found module types:" in message and "SparseLinear" in message
+    assert "SparseLinear is not supported" in message
+    assert "or use" not in message
+
+
+@pytest.mark.parametrize("path", ["model.encoder.vision_tower", "language_model.model.img_projector"])
+def test_image_capability_includes_nested_encoders_and_pixel_projections(path):
+    from unsloth_zoo.mlx.loader import _model_supports_images
+
+    root = nn.Module()
+    root.language_model = nn.Module()
+    root.language_model.layers = [nn.Linear(2, 2)]
+    assert _model_supports_images(root) is False
+    owner = root
+    for segment in path.split(".")[:-1]:
+        if not hasattr(owner, segment):
+            setattr(owner, segment, nn.Module())
+        owner = getattr(owner, segment)
+    setattr(owner, path.split(".")[-1], nn.Linear(3, 2))
+    assert _model_supports_images(root) is True
+
+
+def test_text_training_checks_model_capability_with_a_replacement_tokenizer(tmp_path):
+    from tokenizers import Tokenizer, models
+    from transformers import PreTrainedTokenizerFast
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    model = nn.Linear(2, 2)
+    model._unsloth_supports_images = False
+    model._config = {"model_type": "text_wrapper"}
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=Tokenizer(models.WordLevel({"a": 0})))
+    trainer = MLXTrainer(
+        model=model, tokenizer=tokenizer,
+        train_dataset=[{"input_ids": [0, 0], "image": Image.new("RGB", (2, 2))}],
+        args=MLXTrainingConfig(max_steps=1, output_dir=str(tmp_path), report_to="none"),
+    )
+    with pytest.raises(ValueError, match="`text_wrapper` has no vision path"):
+        trainer._prepare_data(False)
+
+
+def test_text_forwarding_probe_leaves_dropout_rng_and_mode_untouched():
+    from unsloth_zoo.mlx.loader import _verify_text_only_wrapper
+
+    class Wrapper(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(512, 8)
+            self.drop = nn.Dropout(0.5)
+            self.head = nn.Linear(8, 512)
+
+        def __call__(self, ids):
+            return self.head(self.drop(self.embed(ids)))
+
+    model = Wrapper()
+    model.train()
+    mx.random.seed(7)
+    _verify_text_only_wrapper(model, "wrapper", check_causality=False)
+    probed = mx.random.uniform(shape=(4,))
+    mx.random.seed(7)
+    assert mx.array_equal(probed, mx.random.uniform(shape=(4,))).item()
+    assert model.training and model.drop.training
+
+
+@pytest.mark.parametrize("row", [
+    {"input_ids": [1, 2, 3], "pixel_values_videos": np.ones((2, 3), dtype=np.float32)},
+    {"messages": [{"role": "user", "content": [{"type": "video", "video": "clip.mp4"}]}]},
+    {"text": [{"role": "user", "content": [{"type": "image", "image": "cat.png"}]}]},
+])
+def test_text_wrapper_rejects_video_rows(row):
+    from unsloth_zoo.mlx import utils as u
+
+    tokenizer = _FakeTokenizer()
+    tokenizer._unsloth_supports_images = False
+    tokenizer._unsloth_modality_model_type = "text_wrapper"
+    with pytest.raises(ValueError, match="`text_wrapper` has no vision path"):
+        u._prepare_pretokenized_text_dataset([row], tokenizer=tokenizer)
+
+
+def test_text_wrapper_rejects_images_added_by_a_streaming_formatter():
+    from unsloth_zoo.mlx import utils as u
+
+    tokenizer = _FakeTokenizer()
+    tokenizer._unsloth_supports_images = False
+    tokenizer._unsloth_modality_model_type = "text_wrapper"
+    rows = u._iter_lazy_tokenized_text_rows(
+        [{"image_path": "cat.png"}], tokenizer,
+        formatting_func=lambda row: {"input_ids": [1, 2, 3], "image": row["image_path"]},
+    )
+    with pytest.raises(ValueError, match="`text_wrapper` has no vision path"):
+        list(rows)
+
+
+@pytest.mark.parametrize("media", [{"images": []}, {"videos": ()}, {"images": ["cat.png"]}])
+def test_text_wrapper_generate_ignores_empty_media_containers(media):
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx import loader
+
+    class _ReachedGeneration(Exception):
+        pass
+
+    def fake_stream_generate(*args, **kwargs):
+        raise _ReachedGeneration
+
+    model = SimpleNamespace(_processor="processor", _tokenizer="tokenizer", _is_vlm_model=True,
+                            _unsloth_supports_images=False,
+                            _unsloth_modality_model_type="text_wrapper")
+    expected = (_ReachedGeneration, Exception) if not any(media.values()) else ValueError
+    with mock.patch.dict("sys.modules",
+                         {"mlx_vlm": SimpleNamespace(stream_generate=fake_stream_generate)}):
+        with pytest.raises(expected) as raised:
+            loader._mlx_generate_vlm(model, input_ids=[[1, 2]], **media)
+    assert ("no vision path" in str(raised.value)) == bool(any(media.values()))
+
+
+def test_text_wrapper_rejects_images_added_by_an_eager_formatter():
+    from unsloth_zoo.mlx import utils as u
+
+    tokenizer = _FakeTokenizer()
+    tokenizer._unsloth_supports_images = False
+    tokenizer._unsloth_modality_model_type = "text_wrapper"
+    with pytest.raises(ValueError, match="`text_wrapper` has no vision path"):
+        u._prepare_labeled_text_dataset(
+            [{"image_path": "cat.png"}], tokenizer,
+            formatting_func=lambda row: {"prompt": "p", "completion": "c",
+                                         "images": [row["image_path"]]},
+        )

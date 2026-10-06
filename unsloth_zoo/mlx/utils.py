@@ -4723,6 +4723,9 @@ def _has_chat_template(obj):
 def _get_processor_tokenizer(processor):
     if processor is None:
         return None
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is not processor and callable(tokenizer):
+        return tokenizer
     # HF fast tokenizers expose the public API directly while their _tokenizer
     # is the low-level Rust backend (no convert_tokens_to_ids / chat_template /
     # apply_chat_template). Only unwrap _tokenizer for wrappers that do not
@@ -5382,6 +5385,7 @@ def render_mlx_chat_example(
     allow_raw_text=True,
 ):
     """Render one text/chat training example for MLX text or VLM pipelines."""
+    _validate_mlx_training_row(target, item)
     if item is None:
         return None
     if isinstance(item, str):
@@ -5902,6 +5906,7 @@ def _prepare_labeled_text_dataset(
             isinstance(source, list) and not _looks_like_mlx_chat_messages(source)
         ) else [source]
         for row in sources:
+            _validate_mlx_image_input(tokenizer, _row_has_images(row))
             tokenized = _tokenize_mlx_prompt_completion_row(
                 tokenizer,
                 row,
@@ -6050,6 +6055,7 @@ def _tokenize_mlx_pretokenized_row(
 def _prepare_pretokenized_text_dataset(
     dataset,
     *,
+    tokenizer=None,
     completion_only_loss=None,
     assistant_only_loss=False,
 ):
@@ -6063,6 +6069,7 @@ def _prepare_pretokenized_text_dataset(
     saw_other = False
     label_states = []
     for item in dataset:
+        _validate_mlx_image_input(tokenizer, _row_has_images(item))
         sources = item if (
             isinstance(item, list) and not _looks_like_mlx_chat_messages(item)
         ) else [item]
@@ -7782,11 +7789,13 @@ def _format_vlm_row_gating_audio(row, formatting_func, processor):
     Callers that format here go on to collate with no formatter, so the
     collation gate would have nothing left to refuse.
     """
-    if formatting_func is None:
-        return row
-    if _raw_row_has_audio(row):
-        _check_audio_family_gate(processor)
-    return formatting_func(row)
+    _validate_mlx_image_input(processor, _row_has_images(row))
+    if formatting_func is not None:
+        if _raw_row_has_audio(row):
+            _check_audio_family_gate(processor)
+        row = formatting_func(row)
+    _validate_mlx_training_row(processor, row)
+    return row
 
 
 def _extract_vlm_audio(item, messages, processor):
@@ -8854,7 +8863,46 @@ def _ensure_vlm_pad_token(processor):
         eos = getattr(tokenizer, "eos_token", None)
         if eos is not None:
             tokenizer.pad_token = eos
+        elif callable(getattr(tokenizer, "convert_ids_to_tokens", None)):
+            # Reuse an in-vocabulary id; masks distinguish padding from real tokens.
+            token = tokenizer.convert_ids_to_tokens(0)
+            if token is not None:
+                tokenizer.pad_token = token
     return tokenizer
+
+
+def _validate_mlx_image_input(target, has_images):
+    if has_images and getattr(target, "_unsloth_supports_images", None) is False:
+        name = getattr(target, "_unsloth_modality_model_type", type(target).__name__)
+        raise ValueError(
+            f"Unsloth MLX: `{name}` has no vision path; image and video inputs are not supported."
+        )
+
+
+def _row_has_images(item):
+    if isinstance(item, (list, tuple)):
+        return any(_row_has_images(part) for part in item)
+    if not isinstance(item, dict):
+        return False
+    if item.get("type") in ("image", "image_url", "input_image",
+                            "video", "video_url", "input_video"):
+        return True
+    for key in ("image", "images", "image_url", "input_image", "pixel_values",
+                "video", "videos", "video_url", "input_video", "pixel_values_videos"):
+        value = item.get(key)
+        if value is not None and not (isinstance(value, (list, tuple)) and not value):
+            return True
+    return any(_row_has_images(item.get(key)) for key in (
+        "messages", "conversations", "content", "prompt", "completion", "text",
+    ))
+
+
+def _validate_mlx_training_row(target, item):
+    has_images = _row_has_images(item)
+    _validate_mlx_image_input(target, has_images)
+    error = getattr(target, "_unsloth_text_training_error", None)
+    if error and not has_images and not _raw_row_has_audio(item):
+        raise ValueError(error)
 
 
 def _processor_vlm_inputs(
@@ -8868,6 +8916,7 @@ def _processor_vlm_inputs(
     all_audio=None,
     image_context_limit=None,
 ):
+    _validate_mlx_image_input(processor, any(all_images))
     legacy = legacy_image_inputs(
         processor, texts, all_images, max_seq_length, truncation, image_context_limit,
     )
@@ -9586,12 +9635,14 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
                 break
     formatted_items = []
     for item in items:
+        _validate_mlx_image_input(processor, _row_has_images(item))
         if formatting_func is not None:
             formatted = formatting_func(item)
             if reject_mlx_valued and _contains_mlx_values(formatted):
                 # Formatters can introduce MLX values after the row scan.
                 _reject_mlx_valued_vlm("the formatting function")
             item = formatted
+        _validate_mlx_training_row(processor, item)
         formatted_items.append(item)
 
     if (
@@ -11916,8 +11967,7 @@ def _iterate_lazy_vlm_training_batches(
                 "streaming_prefetch_batches=0 for response-masked VLM "
                 "streams."
             )
-        if formatting_func is not None:
-            item = formatting_func(item)
+        item = _format_vlm_row_gating_audio(item, formatting_func, processor)
         batch_dict, is_prompt_completion = _build_response_masked_vlm_batch(
             [item], processor, config, max_seq_length, image_size,
             response_mask_fn=response_mask_fn,
@@ -12297,6 +12347,7 @@ def _prepare_dataset(dataset, tokenizer, dataset_text_field="text",
     for item in dataset:
         if formatting_func is not None:
             result = formatting_func(item)
+            _validate_mlx_image_input(tokenizer, _row_has_images(result))
             texts = collect_mlx_texts(
                 tokenizer, result, dataset_text_field=dataset_text_field,
                 is_vlm=False,
@@ -12415,6 +12466,7 @@ def _create_text_batch_plan(dataset, tokenizer, batch_size, max_seq_length,
     dataset = _ensure_reiterable_text_dataset(dataset)
     tokenized, saw_pretokenized = _prepare_pretokenized_text_dataset(
         dataset,
+        tokenizer=tokenizer,
         completion_only_loss=completion_only_loss,
         assistant_only_loss=assistant_only_loss,
     )
@@ -12926,6 +12978,7 @@ def _create_ordered_text_plan(
     dataset = _ensure_reiterable_text_dataset(dataset)
     tokenized_pairs, saw_pretokenized = _prepare_pretokenized_text_dataset(
         dataset,
+        tokenizer=tokenizer,
         completion_only_loss=completion_only_loss,
         assistant_only_loss=assistant_only_loss,
     )
@@ -13078,6 +13131,7 @@ def _iter_tokenized_text_rows(dataset, tokenizer, dataset_text_field="text",
     for item in dataset:
         if formatting_func is not None:
             item = formatting_func(item)
+            _validate_mlx_image_input(tokenizer, _row_has_images(item))
         texts = collect_mlx_texts(
             tokenizer,
             item,
@@ -13230,6 +13284,7 @@ def _iter_lazy_tokenized_text_rows(
         return () if label_owned else None
 
     for item in dataset:
+        _validate_mlx_image_input(tokenizer, _row_has_images(item))
         if reject_rows and _contains_mlx_values(item):
             # Reject before any parse, truthiness probe, or formatter call.
             _reject_mlx_valued_text("the dataset row")
@@ -13265,6 +13320,7 @@ def _iter_lazy_tokenized_text_rows(
             if reject_rows and _contains_mlx_values(formatted):
                 # Formatters can introduce MLX values after the row scan.
                 _reject_mlx_valued_text("the formatting function")
+            _validate_mlx_image_input(tokenizer, _row_has_images(formatted))
             formatter_applied = True
             formatter_needs_completion_boundary = (
                 completion_only_loss is None
@@ -14580,6 +14636,7 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
     dataset = _ensure_reiterable_text_dataset(dataset)
     tokenized, saw_pretokenized = _prepare_pretokenized_text_dataset(
         dataset,
+        tokenizer=tokenizer,
         completion_only_loss=completion_only_loss,
         assistant_only_loss=assistant_only_loss,
     )
