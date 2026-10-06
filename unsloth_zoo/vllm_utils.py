@@ -2881,6 +2881,40 @@ def _memory_profiling_race_message(error, trials = 0, unsloth_vllm_standby = Fal
     )
 
 
+def _dynamo_engine_registries():
+    # Process wide Dynamo registries that pin every compiled vLLM model: each
+    # torch.compile backend (cached_backends) and vLLM's bound `bytecode_hook`
+    # (_bytecode_hooks). vLLM never removes either for an engine that failed to start.
+    registries = []
+    for module_name, attr in (("torch._dynamo.eval_frame", "cached_backends"),
+                              ("torch._dynamo.convert_frame", "_bytecode_hooks")):
+        try:
+            registry = getattr(importlib.import_module(module_name), attr)
+        except Exception:
+            continue
+        if isinstance(registry, dict): registries.append(registry)
+    return registries
+pass
+
+
+def _snapshot_dynamo_engine_registries():
+    return [(registry, set(registry.keys())) for registry in _dynamo_engine_registries()]
+pass
+
+
+def _release_failed_vllm_engine(snapshot):
+    # A failed in-process engine stays reachable through the entries its attempt
+    # added, so the retry would stack a second copy of the weights on top of it.
+    # Run this outside the except block so the traceback's frames are gone too.
+    for registry, keys_before in snapshot:
+        for key in list(registry.keys()):
+            if key not in keys_before: registry.pop(key, None)
+    for _ in range(3):
+        gc.collect()
+        _device_empty_cache()
+pass
+
+
 def load_vllm(
     model_name             : str   = "unsloth/Llama-3.2-3B-Instruct-unsloth-bnb-4bit",
     config                 = None,
@@ -3612,7 +3646,11 @@ def load_vllm(
         # Keep trying until success (2 times)
         trials = 0
         race_trials = 0
+        registries_before = None
         while True:
+            if registries_before is not None:
+                _release_failed_vllm_engine(registries_before)
+            registries_before = _snapshot_dynamo_engine_registries()
             try:
                 if use_async:
                     llm = AsyncLLMEngine.from_engine_args(AsyncEngineArgs(**engine_args))
@@ -3623,11 +3661,6 @@ def load_vllm(
                 pass
                 break
             except Exception as error:
-                # Cleanup
-                for _ in range(3):
-                    gc.collect()
-                    _device_empty_cache()
-                pass
                 error = str(error)
                 # `expandable_segments:True` + sleep/standby mode is a deterministic
                 # config clash raised by CuMemAllocator.__init__, not an OOM, and
