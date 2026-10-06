@@ -30,7 +30,13 @@ __all__ = [
     "routed_down",
     "routed_bf16_gemm",
     "routed_bf16_moe",
+    "routed_bf16_gate_up_act",
+    "routed_bf16_down_sum",
+    "routed_fused_enabled",
     "routed_lora_h",
+    "routed_lora_a",
+    "routed_lora_b",
+    "routed_lora_add",
     "lora_pointer_table",
     "routed_moe_forward",
     "prepare_stacked_nf4",
@@ -296,6 +302,52 @@ if triton is not None:
         tl.store(OUT + p.to(tl.int64) * R + j, tl.sum(acc, axis = 0))
 
     @triton.jit
+    def _routed_lora_a_kernel(
+        X, IDX, A, OUT, K, ROW_DIV, stride_x, stride_ae, stride_ak, stride_ar,
+        R: tl.constexpr, BLOCK_R: tl.constexpr, BLOCK_K: tl.constexpr,
+    ):
+        # One program per (slot, rank block): decode is latency bound, fan-out beats coalescing.
+        p = tl.program_id(0)
+        Ae = A + tl.load(IDX + p).to(tl.int64) * stride_ae
+        x_row = X + (p // ROW_DIV).to(tl.int64) * stride_x
+        j = tl.program_id(1) * BLOCK_R + tl.arange(0, BLOCK_R)
+        jmask = j < R
+        a_cols = Ae + j.to(tl.int64) * stride_ar
+        ks = tl.arange(0, BLOCK_K)
+        acc = tl.zeros([BLOCK_K, BLOCK_R], dtype = tl.float32)
+        for k0 in range(0, K, BLOCK_K):
+            k = k0 + ks
+            kmask = k < K
+            x = tl.load(x_row + k, mask = kmask, other = 0.0).to(tl.float32)
+            a = tl.load(a_cols[None, :] + (k * stride_ak)[:, None],
+                        mask = kmask[:, None] & jmask[None, :], other = 0.0).to(tl.float32)
+            acc += a * x[:, None]
+        tl.store(OUT + p.to(tl.int64) * R + j, tl.sum(acc, axis = 0), mask = jmask)
+
+    @triton.jit
+    def _routed_lora_b_kernel(
+        BASE, PREV, H, IDX, B, OUT, N, scaling, stride_base, stride_be, stride_br, stride_bn,
+        HAS_BASE: tl.constexpr, HAS_PREV: tl.constexpr, R: tl.constexpr, R_PAD: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        # PREV deltas are summed before BASE, as one (x @ A @ B) delta would be.
+        p = tl.program_id(0)
+        n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+        nmask = n < N
+        e = tl.load(IDX + p).to(tl.int64)
+        j = tl.arange(0, R_PAD)
+        jmask = j < R
+        h = tl.load(H + p.to(tl.int64) * R + j, mask = jmask, other = 0.0)
+        b = tl.load(B + e * stride_be + j[:, None] * stride_br + n.to(tl.int64)[None, :] * stride_bn,
+                    mask = jmask[:, None] & nmask[None, :], other = 0.0).to(tl.float32)
+        out = tl.sum(b * h[:, None], axis = 0) * scaling
+        if HAS_PREV:
+            out += tl.load(PREV + p.to(tl.int64) * N + n, mask = nmask, other = 0.0)
+        if HAS_BASE:
+            out += tl.load(BASE + p.to(tl.int64) * stride_base + n, mask = nmask, other = 0.0).to(tl.float32)
+        tl.store(OUT + p.to(tl.int64) * N + n, out, mask = nmask)
+
+    @triton.jit
     def _nf4_select_dequant_kernel(
         Q, OUT, UNIQ, LUT, ABSMAX, CODE2, ABSMAX2, OFFSET, BYTES_PER_EXPERT,
         BLOCKSIZE: tl.constexpr, BLOCKSIZE2: tl.constexpr, NESTED: tl.constexpr, BLOCK: tl.constexpr,
@@ -335,6 +387,8 @@ if triton is not None:
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
         SPLIT_K: tl.constexpr,
+        LORA_A = None, H_OUT = None, stride_lae = 0, stride_lak = 0, stride_lar = 0,
+        HAS_LORA_A: tl.constexpr = False, R: tl.constexpr = 1, R_PAD: tl.constexpr = 16,
     ):
         e = tl.program_id(0)
         nb = tl.program_id(1)
@@ -345,13 +399,34 @@ if triton is not None:
         if tl.sum(hit.to(tl.int32), axis = 0) == 0:
             return
         rows = (slots // ROW_DIV).to(tl.int64)
-        n = nb * BLOCK_N + tl.arange(0, BLOCK_N)
-        nmask = n < N
         ks = tl.arange(0, BLOCK_K)
-        w_base = W + e.to(tl.int64) * stride_we
-        acc = tl.zeros([P_PAD, BLOCK_N], dtype = tl.float32)
         k_per = tl.cdiv(tl.cdiv(K, SPLIT_K), BLOCK_K) * BLOCK_K
         k_lo = sk * k_per
+        if HAS_LORA_A:
+            if nb == tl.cdiv(N, BLOCK_N):
+                # One extra program per (expert, split) computes the LoRA A partial H = x @ A[e].
+                j = tl.arange(0, R_PAD)
+                jmask = j < R
+                a_base = LORA_A + e.to(tl.int64) * stride_lae
+                h_acc = tl.zeros([P_PAD, R_PAD], dtype = tl.float32)
+                for k0 in range(k_lo, tl.minimum(k_lo + k_per, K), BLOCK_K):
+                    k = k0 + ks
+                    kmask = k < K
+                    x = tl.load(X + rows[:, None] * stride_xr + k[None, :], mask = hit[:, None] & kmask[None, :],
+                                other = 0.0)
+                    a = tl.load(a_base + k[:, None] * stride_lak + j[None, :] * stride_lar,
+                                mask = kmask[:, None] & jmask[None, :], other = 0.0)
+                    if a.dtype == tl.float32:
+                        h_acc = tl.dot(x.to(tl.float32), a, h_acc, input_precision = "ieee")
+                    else:
+                        h_acc = tl.dot(x.to(a.dtype), a, h_acc)
+                h_ptr = H_OUT + (sk * P + slots.to(tl.int64))[:, None] * R + j[None, :]
+                tl.store(h_ptr, h_acc, mask = hit[:, None] & jmask[None, :])
+                return
+        n = nb * BLOCK_N + tl.arange(0, BLOCK_N)
+        nmask = n < N
+        w_base = W + e.to(tl.int64) * stride_we
+        acc = tl.zeros([P_PAD, BLOCK_N], dtype = tl.float32)
         for k0 in range(k_lo, tl.minimum(k_lo + k_per, K), BLOCK_K):
             k = k0 + ks
             kmask = k < K
@@ -599,6 +674,109 @@ def routed_lora_h(x, idx, a_list, row_div = 1):
     return _lora_h_eager(x, idx, a_list, row_div)
 
 
+_LORA_A_CONFIG = None  # tests / sweeps may force (BLOCK_K, BLOCK_R, num_warps)
+
+
+def _lora_a_config(P, K, r):
+    if _LORA_A_CONFIG is not None:
+        return _LORA_A_CONFIG
+    # B200 sweep (E 32-256, in 512-2880, r 7-64): ~128 programs is best.
+    block_k = max(16, min(1024, triton.next_power_of_2(K)))
+    block_r = max(1, min(16, triton.next_power_of_2(P * r) // 128))
+    return block_k, block_r, 8 if block_k * block_r >= 8192 else 4
+
+
+def _lora_a_launch(x, idx, a, row_div):
+    P, K, r = idx.numel(), x.shape[-1], a.shape[2]
+    block_k, block_r, warps = _lora_a_config(P, K, r)
+    block_r = min(block_r, triton.next_power_of_2(r))
+    out = torch.empty((P, r), dtype = torch.float32, device = x.device)
+    with torch.cuda.device(x.device):
+        _routed_lora_a_kernel[(P, triton.cdiv(r, block_r))](
+            x, idx, a, out, K, row_div, x.stride(0), a.stride(0), a.stride(1), a.stride(2),
+            R = r, BLOCK_R = block_r, BLOCK_K = block_k, num_warps = warps,
+        )
+    return out
+
+
+_LORA_B_CONFIG = None  # tests / sweeps may force (BLOCK_N, num_warps)
+
+
+def _lora_b_launch(base, prev, h, idx, b, scaling):
+    P, r = h.shape
+    N = b.shape[2]
+    r_pad = triton.next_power_of_2(r)
+    # B200: 64-column blocks on one warp beat wider tiles by 1.5-2.3x (latency-bound read).
+    block_n, warps = _LORA_B_CONFIG or (64, max(1, min(4, r_pad // 16)))
+    out = torch.empty((P, N), dtype = torch.float32, device = h.device)
+    with torch.cuda.device(h.device):
+        _routed_lora_b_kernel[(P, triton.cdiv(N, block_n))](
+            base if base is not None else out, prev if prev is not None else out, h, idx, b, out, N,
+            float(scaling), base.stride(0) if base is not None else 0, b.stride(0), b.stride(1), b.stride(2),
+            HAS_BASE = base is not None, HAS_PREV = prev is not None, R = r, R_PAD = r_pad, BLOCK_N = block_n,
+            num_warps = warps,
+        )
+    return out
+
+
+if triton is not None:
+
+    @torch.library.custom_op("unsloth_zoo::routed_lora_a", mutates_args = ())
+    def _lora_a_op(x: torch.Tensor, idx: torch.Tensor, a: torch.Tensor, row_div: int) -> torch.Tensor:
+        return _lora_a_launch(x, idx, a, row_div)
+
+    @_lora_a_op.register_fake
+    def _routed_lora_a_fake(x, idx, a, row_div):
+        return x.new_empty((idx.numel(), a.shape[2]), dtype = torch.float32)
+
+    @torch.library.custom_op("unsloth_zoo::routed_lora_b", mutates_args = ())
+    def _lora_b_op(
+        base: Optional[torch.Tensor], prev: Optional[torch.Tensor], h: torch.Tensor, idx: torch.Tensor,
+        b: torch.Tensor, scaling: float,
+    ) -> torch.Tensor:
+        return _lora_b_launch(base, prev, h, idx, b, scaling)
+
+    @_lora_b_op.register_fake
+    def _routed_lora_b_fake(base, prev, h, idx, b, scaling):
+        return h.new_empty((h.shape[0], b.shape[2]), dtype = torch.float32)
+
+
+def _lora_x(x):
+    return x if x.stride(-1) == 1 else x.contiguous()
+
+
+def routed_lora_a(x, idx, a, row_div = 1):
+    """fp32 [P, r]: row p = x[p // row_div] @ a[idx[p]] for a stacked [E, in, r] a, read in place."""
+    x, idx = _lora_x(x), idx.reshape(-1)
+    if torch.compiler.is_compiling():
+        return torch.ops.unsloth_zoo.routed_lora_a(x, idx, a, int(row_div))
+    return _lora_a_launch(x, idx, a, row_div)
+
+
+def routed_lora_b(base, h, idx, b, scaling, prev = None):
+    """fp32 [P, out]: base + (prev + scaling * h[p] @ b[idx[p]]) for a stacked [E, r, out] b.
+
+    base (any float dtype, unit last stride) and prev (fp32 [P, out], an earlier term) may be None."""
+    idx, h = idx.reshape(-1), h.contiguous()
+    prev = prev.contiguous() if prev is not None else None
+    if base is not None and base.stride(-1) != 1:
+        base = base.contiguous()
+    if torch.compiler.is_compiling():
+        return torch.ops.unsloth_zoo.routed_lora_b(base, prev, h, idx, b, float(scaling))
+    return _lora_b_launch(base, prev, h, idx, b, scaling)
+
+
+def routed_lora_add(base, x, idx, terms, row_div = 1):
+    """fp32 base + sum over (first [E, in, r], second [E, r, out], scaling) terms of the routed LoRA delta."""
+    terms = list(terms)
+    delta = None
+    for i, (first, second, scaling) in enumerate(terms):
+        last = i == len(terms) - 1
+        delta = routed_lora_b(base if last else None, routed_lora_a(x, idx, first, row_div), idx, second,
+                              scaling, prev = delta)
+    return delta if terms else base
+
+
 
 def _select_dequant_launch(tb, uniq, out):
     E_n = out.shape[0]
@@ -655,11 +833,18 @@ def _expert_config(P):
     return {"BLOCK_N": 128, "BLOCK_K": 64, "SPLIT_K": 1, "num_warps": 4, "num_stages": 3}
 
 
-def _launch_expert(x, idx, weight, bias, out, row_div):
+def _launch_expert(x, idx, weight, bias, out, row_div, lora_a = None, h_out = None):
     S, P, N = out.shape
     E, K = weight.shape[0], weight.shape[1]
     c = _expert_config(P)
-    grid = (E, triton.cdiv(N, c["BLOCK_N"]), S)
+    grid = (E, triton.cdiv(N, c["BLOCK_N"]) + (lora_a is not None), S)
+    kw = {}
+    if lora_a is not None:
+        # h_out [S, P, r] fp32 split-K partials of x @ lora_a[idx]; lora_a [E, K, r], any strides.
+        r = lora_a.shape[2]
+        kw = dict(LORA_A = lora_a, H_OUT = h_out, stride_lae = lora_a.stride(0), stride_lak = lora_a.stride(1),
+                  stride_lar = lora_a.stride(2), HAS_LORA_A = True, R = r,
+                  R_PAD = max(16, triton.next_power_of_2(r)))
     with torch.cuda.device(x.device):
         _routed_bf16_expert_kernel[grid](
             x, idx, weight, bias if bias is not None else weight, out,
@@ -670,7 +855,7 @@ def _launch_expert(x, idx, weight, bias, out, row_div):
             HAS_BIAS = bias is not None,
             P_PAD = max(16, triton.next_power_of_2(P)),
             BLOCK_N = c["BLOCK_N"], BLOCK_K = c["BLOCK_K"], SPLIT_K = S,
-            num_warps = c["num_warps"], num_stages = c["num_stages"],
+            num_warps = c["num_warps"], num_stages = c["num_stages"], **kw,
         )
     return out
 
@@ -731,23 +916,258 @@ def _lora_delta(x_slots, idx, terms):
     return delta
 
 
+if triton is not None:
+
+    @triton.jit
+    def _lora_h_row(LORA_H, p, P, SPLIT_H: tl.constexpr, R: tl.constexpr, R_PAD: tl.constexpr):
+        # H[p] as the fixed-order sum of [SPLIT_H, P, R] fp32 partials.
+        j = tl.arange(0, R_PAD)
+        h = tl.zeros([R_PAD], dtype = tl.float32)
+        for sk in tl.static_range(SPLIT_H):
+            h += tl.load(LORA_H + (sk * P + p) * R + j, mask = j < R, other = 0.0)
+        return h
+
+    @triton.jit
+    def _lora_b_cols(LORA_B, h, e, cols, cmask, stride_lbe, stride_lbr, stride_lbn,
+                     R: tl.constexpr, R_PAD: tl.constexpr):
+        # sum_j h[j] * B[e, j, cols] in fp32; B any float dtype and strides.
+        j = tl.arange(0, R_PAD)
+        b = tl.load(LORA_B + e * stride_lbe + j[:, None] * stride_lbr + cols[None, :] * stride_lbn,
+                    mask = (j < R)[:, None] & cmask[None, :], other = 0.0)
+        return tl.sum(b.to(tl.float32) * h[:, None], axis = 0)
+
+    @triton.jit
+    def _bf16_gate_up_finalize_kernel(
+        PART, IDX, LORA_B, LORA_H, OUT,
+        P, I, alpha, limit, scaling,
+        stride_lbe, stride_lbr, stride_lbn,
+        SPLIT_K: tl.constexpr, ACT: tl.constexpr, INTERLEAVED: tl.constexpr, HAS_LORA: tl.constexpr,
+        SPLIT_H: tl.constexpr, R: tl.constexpr, R_PAD: tl.constexpr, BLOCK: tl.constexpr,
+    ):
+        # Epilogue after the full K reduction (bias is in split 0): fixed-order split-K sum, LoRA B once, act.
+        alpha = alpha.to(tl.float32)
+        limit = limit.to(tl.float32)
+        p = tl.program_id(0).to(tl.int64)
+        j = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        jmask = j < I
+        N = 2 * I
+        if INTERLEAVED:
+            # Gate / up pairs are adjacent: one contiguous [2 * BLOCK] load, then split.
+            c = tl.program_id(1) * (2 * BLOCK) + tl.arange(0, 2 * BLOCK)
+            cmask = c < N
+            gu = tl.zeros([2 * BLOCK], dtype = tl.float32)
+            for sk in tl.static_range(SPLIT_K):
+                gu += tl.load(PART + (sk * P + p) * N + c, mask = cmask, other = 0.0)
+            if HAS_LORA:
+                e = tl.load(IDX + p).to(tl.int64)
+                h = _lora_h_row(LORA_H, p, P, SPLIT_H, R, R_PAD)
+                gu += _lora_b_cols(LORA_B, h, e, c, cmask, stride_lbe, stride_lbr, stride_lbn, R, R_PAD) * scaling
+            gate, up = tl.split(tl.reshape(gu, (BLOCK, 2)))
+        else:
+            gate = tl.zeros([BLOCK], dtype = tl.float32)
+            up = tl.zeros([BLOCK], dtype = tl.float32)
+            for sk in tl.static_range(SPLIT_K):
+                row = PART + (sk * P + p) * N
+                gate += tl.load(row + j, mask = jmask, other = 0.0)
+                up += tl.load(row + I + j, mask = jmask, other = 0.0)
+            if HAS_LORA:
+                e = tl.load(IDX + p).to(tl.int64)
+                h = _lora_h_row(LORA_H, p, P, SPLIT_H, R, R_PAD)
+                gate += _lora_b_cols(LORA_B, h, e, j, jmask, stride_lbe, stride_lbr, stride_lbn, R, R_PAD) * scaling
+                up += _lora_b_cols(LORA_B, h, e, I + j, jmask, stride_lbe, stride_lbr, stride_lbn, R, R_PAD) * scaling
+        inter = _gated_act(gate, up, alpha, limit, ACT)
+        tl.store(OUT + p * I + j, inter.to(OUT.dtype.element_ty), mask = jmask)
+
+    @triton.jit
+    def _bf16_down_finalize_kernel(
+        PART, IDX, RW, LORA_B, LORA_H, OUT,
+        P, N, RW_STRIDE, scaling,
+        stride_lbe, stride_lbr, stride_lbn,
+        TOP_K: tl.constexpr, TOP_K_PAD: tl.constexpr, SPLIT_K: tl.constexpr, HAS_LORA: tl.constexpr,
+        SPLIT_H: tl.constexpr, R: tl.constexpr, R_PAD: tl.constexpr, BLOCK: tl.constexpr,
+    ):
+        # Fixed-order fp32 sum, one store: no atomics, deterministic.
+        t = tl.program_id(0).to(tl.int64)
+        n = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        nmask = n < N
+        kk = tl.arange(0, TOP_K_PAD)
+        kmask = kk < TOP_K
+        s = t * TOP_K + kk
+        m2 = kmask[:, None] & nmask[None, :]
+        acc = tl.zeros([TOP_K_PAD, BLOCK], dtype = tl.float32)
+        for sk in tl.static_range(SPLIT_K):
+            acc += tl.load(PART + (sk * P + s)[:, None] * N + n[None, :], mask = m2, other = 0.0)
+        if HAS_LORA:
+            e = tl.load(IDX + s, mask = kmask, other = 0).to(tl.int64)
+            j = tl.arange(0, R_PAD)
+            hm = kmask[:, None] & (j < R)[None, :]
+            h = tl.zeros([TOP_K_PAD, R_PAD], dtype = tl.float32)
+            for sk in tl.static_range(SPLIT_H):
+                h += tl.load(LORA_H + (sk * P + s)[:, None] * R + j[None, :], mask = hm, other = 0.0)
+            b = tl.load(LORA_B + e[:, None, None] * stride_lbe + j[None, :, None] * stride_lbr
+                        + n[None, None, :] * stride_lbn, mask = hm[:, :, None] & nmask[None, None, :], other = 0.0)
+            acc += tl.sum(b.to(tl.float32) * h[:, :, None], axis = 1) * scaling
+        rw = tl.load(RW + t * RW_STRIDE + kk, mask = kmask, other = 0.0).to(tl.float32)
+        out = tl.sum(acc * rw[:, None], axis = 0)
+        tl.store(OUT + t * N + n, out.to(OUT.dtype.element_ty), mask = nmask)
+
+
+def _finalize_block(rows, n, programs):
+    # B200 sweep: about `programs` programs in flight is best, one warp below 256 columns.
+    block = max(16, min(256, triton.next_power_of_2(max(1, rows * n // programs))))
+    return block, 4 if block >= 256 else 1
+
+
+def _expert_gemm_lora(x, idx, weight, bias, row_div, lora_a, lora_h):
+    """(fp32 [S, P, N] split-K partials with bias[e] in split 0, fp32 [S_h, P, r] LoRA A partials or lora_h)."""
+    P, N = idx.numel(), weight.shape[2]
+    S = _expert_config(P)["SPLIT_K"]
+    part = torch.empty((S, P, N), dtype = torch.float32, device = x.device)
+    h = None
+    if lora_a is not None and lora_h is None:
+        h = torch.empty((S, P, lora_a.shape[2]), dtype = torch.float32, device = x.device)
+        _launch_expert(x, idx, weight, bias, part, row_div, lora_a, h)
+    else:
+        _launch_expert(x, idx, weight, bias, part, row_div)
+        h = lora_h.view(-1, P, lora_h.shape[-1]) if lora_h is not None else None
+    return part, h
+
+
+def _lora_b_args(lora_b, h, dummy):
+    if lora_b is None:
+        return dummy, dummy, 1, 1, (0, 0, 0)
+    return lora_b, h, h.shape[0], lora_b.shape[1], (lora_b.stride(0), lora_b.stride(1), lora_b.stride(2))
+
+
+def _gate_up_act_launch(x, idx, weight, bias, lora_a, lora_b, lora_h, scaling, top_k, act, interleaved, alpha, limit,
+                        out_dtype):
+    part, h = _expert_gemm_lora(x, idx, weight, bias, top_k, lora_a, lora_h if lora_b is not None else None)
+    S, P, N = part.shape
+    out = torch.empty((P, N // 2), dtype = out_dtype, device = x.device)
+    B, Hm, SH, r, bs = _lora_b_args(lora_b, h, part)
+    BLOCK, warps = _finalize_block(P, N // 2, 512)
+    with torch.cuda.device(x.device):
+        _bf16_gate_up_finalize_kernel[(P, triton.cdiv(N // 2, BLOCK))](
+            part, idx, B, Hm, out,
+            P, N // 2, float(alpha), float(limit), float(scaling), bs[0], bs[1], bs[2],
+            SPLIT_K = S, ACT = act, INTERLEAVED = interleaved, HAS_LORA = lora_b is not None, SPLIT_H = SH,
+            R = r, R_PAD = max(2, triton.next_power_of_2(r)), BLOCK = BLOCK, num_warps = warps,
+        )
+    return out
+
+
+def _down_sum_launch(x, idx, rw, weight, bias, lora_a, lora_b, lora_h, scaling, top_k, out_dtype):
+    part, h = _expert_gemm_lora(x, idx, weight, bias, 1, lora_a, lora_h if lora_b is not None else None)
+    S, P, N = part.shape
+    out = torch.empty((P // top_k, N), dtype = out_dtype, device = x.device)
+    B, Hm, SH, r, bs = _lora_b_args(lora_b, h, part)
+    BLOCK, warps = _finalize_block(P // top_k, N, 1024)
+    with torch.cuda.device(x.device):
+        _bf16_down_finalize_kernel[(P // top_k, triton.cdiv(N, BLOCK))](
+            part, idx, rw, B, Hm, out,
+            P, N, rw.stride(0), float(scaling), bs[0], bs[1], bs[2],
+            TOP_K = top_k, TOP_K_PAD = triton.next_power_of_2(top_k), SPLIT_K = S, HAS_LORA = lora_b is not None,
+            SPLIT_H = SH, R = r, R_PAD = max(2, triton.next_power_of_2(r)), BLOCK = BLOCK, num_warps = warps,
+        )
+    return out
+
+
+if triton is not None:
+
+    @torch.library.custom_op("unsloth_zoo::routed_bf16_gate_up_act", mutates_args = ())
+    def _gate_up_act_op(
+        x: torch.Tensor, idx: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor],
+        lora_a: Optional[torch.Tensor], lora_b: Optional[torch.Tensor], lora_h: Optional[torch.Tensor],
+        scaling: float, top_k: int, act: int, interleaved: bool, alpha: float, limit: float, out_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        return _gate_up_act_launch(x, idx, weight, bias, lora_a, lora_b, lora_h, scaling, top_k, act, interleaved,
+                                   alpha, limit, out_dtype)
+
+    @_gate_up_act_op.register_fake
+    def _routed_bf16_gate_up_act_fake(x, idx, weight, bias, lora_a, lora_b, lora_h, scaling, top_k, act,
+                                      interleaved, alpha, limit, out_dtype):
+        return x.new_empty((idx.numel(), weight.shape[2] // 2), dtype = out_dtype)
+
+    @torch.library.custom_op("unsloth_zoo::routed_bf16_down_sum", mutates_args = ())
+    def _down_sum_op(
+        x: torch.Tensor, idx: torch.Tensor, rw: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor],
+        lora_a: Optional[torch.Tensor], lora_b: Optional[torch.Tensor], lora_h: Optional[torch.Tensor],
+        scaling: float, top_k: int, out_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        return _down_sum_launch(x, idx, rw, weight, bias, lora_a, lora_b, lora_h, scaling, top_k, out_dtype)
+
+    @_down_sum_op.register_fake
+    def _routed_bf16_down_sum_fake(x, idx, rw, weight, bias, lora_a, lora_b, lora_h, scaling, top_k, out_dtype):
+        return x.new_empty((idx.numel() // top_k, weight.shape[2]), dtype = out_dtype)
+
+
+def routed_fused_enabled():
+    """UNSLOTH_MOE_ROUTED_FUSED=0 keeps the torch epilogues (split-K sum, act, LoRA, top-k sum)."""
+    return os.environ.get("UNSLOTH_MOE_ROUTED_FUSED", "1").strip().lower() not in ("0", "false", "off", "no")
+
+
+def routed_bf16_gate_up_act(x, idx, w_gu, b_gu = None, lora_a = None, lora_b = None, lora_h = None, scaling = 0.0,
+                            top_k = 1, act = ACT_SILU, interleaved = False, alpha = 1.702, limit = 7.0,
+                            out_dtype = torch.float32):
+    """[P, I] gated activation of x[p // top_k] @ w_gu[idx[p]] + b_gu + scaling * (x @ A) @ B, computed in
+    fp32 and stored as out_dtype.
+
+    lora_a [E, H, r] / lora_b [E, r, 2I], any strides. lora_h ([P, r] or [S, P, r] fp32 partials)
+    replaces the in-kernel A product when given."""
+    if torch.compiler.is_compiling():
+        return torch.ops.unsloth_zoo.routed_bf16_gate_up_act(
+            x, idx, w_gu, b_gu, lora_a, lora_b, lora_h, float(scaling), int(top_k), int(act), bool(interleaved),
+            float(alpha), float(limit), out_dtype)
+    return _gate_up_act_launch(x, idx, w_gu, b_gu, lora_a, lora_b, lora_h, scaling, top_k, act, interleaved,
+                               alpha, limit, out_dtype)
+
+
+def routed_bf16_down_sum(inter, idx, rw, w_dn, b_dn = None, lora_a = None, lora_b = None, lora_h = None,
+                         scaling = 0.0, top_k = 1, out_dtype = torch.bfloat16):
+    """[T, H] fixed-order sum over top-k of rw[t, k] * (inter[s] @ w_dn[e] + b_dn[e] + LoRA), s = t * top_k + k."""
+    if torch.compiler.is_compiling():
+        return torch.ops.unsloth_zoo.routed_bf16_down_sum(
+            inter, idx, rw, w_dn, b_dn, lora_a, lora_b, lora_h, float(scaling), int(top_k), out_dtype)
+    return _down_sum_launch(inter, idx, rw, w_dn, b_dn, lora_a, lora_b, lora_h, scaling, top_k, out_dtype)
+
+
+def _routed_bf16_moe_fused(x, flat, rw, w_gu, w_dn, b_gu, b_dn, act, interleaved, gu_lora, dn_lora,
+                           alpha, limit, out_dtype, top_k):
+    if x.stride(-1) != 1:
+        x = x.contiguous()
+    if rw.stride(-1) != 1:
+        rw = rw.contiguous()
+    gu = gu_lora[0][:3] if gu_lora else (None, None, 0.0)
+    dn = dn_lora[0][:3] if dn_lora else (None, None, 0.0)
+    # The down GEMM reads w_dn.dtype (the glue casts too); an fp32 down LoRA A keeps the fp32 activation.
+    act_dtype = torch.float32 if dn[0] is not None and dn[0].dtype != w_dn.dtype else w_dn.dtype
+    inter = routed_bf16_gate_up_act(x, flat, w_gu, b_gu, gu[0], gu[1], None, gu[2], top_k, act, interleaved,
+                                    alpha, limit, act_dtype)
+    return routed_bf16_down_sum(inter, flat, rw, w_dn, b_dn, dn[0], dn[1], None, dn[2], top_k, out_dtype)
+
+
 def routed_bf16_moe(x, idx, routing_weights, w_gu, w_dn, b_gu, b_dn, act, interleaved,
                     gu_lora = (), dn_lora = (), alpha = 1.702, limit = 7.0, out_dtype = None):
     """[T, H] MoE output from only the routed BF16 / FP16 experts."""
     T, top_k = idx.shape
+    # Compiled without LoRA, Inductor's fused glue was 0-3% faster on B200; fused kernels win elsewhere.
+    glue = torch.compiler.is_compiling() and not gu_lora and not dn_lora
+    if len(gu_lora) <= 1 and len(dn_lora) <= 1 and not glue and routed_fused_enabled():
+        return _routed_bf16_moe_fused(
+            x, idx.reshape(-1), routing_weights, w_gu, w_dn, b_gu, b_dn, act, interleaved, gu_lora, dn_lora,
+            alpha, limit, out_dtype if out_dtype is not None else x.dtype, top_k)
     flat = idx.reshape(-1)
     gate_up = routed_bf16_gemm(x.to(w_gu.dtype), flat, w_gu, b_gu, row_div = top_k)
     if gu_lora:
-        gate_up = gate_up + _lora_delta(x.repeat_interleave(top_k, 0), flat, gu_lora)
+        gate_up = routed_lora_add(gate_up, x, flat, gu_lora, row_div = top_k)
     inter = _act_torch(gate_up, act, interleaved, alpha, limit)
     down = routed_bf16_gemm(inter.to(w_dn.dtype), flat, w_dn, b_dn, row_div = 1)
     if dn_lora:
-        down = down + _lora_delta(inter, flat, dn_lora)
+        down = routed_lora_add(down, inter, flat, dn_lora)
     out = (down.view(T, top_k, -1) * routing_weights.float()[..., None]).sum(1)
     return out.to(out_dtype if out_dtype is not None else x.dtype)
 
 
-# Generic transformers v5 3D experts modules (Qwen3 MoE, Gemma 4, Mixtral, ...).
 
 def _semantics(experts):
     """Everything besides the weights that _act_code / the plans read; compared on every reuse."""
@@ -817,8 +1237,7 @@ def _nf4_table(param, device):
         return None
     E, N, K = (int(s) for s in shape)
     blocksize = int(qs.blocksize)
-    # Blocks must not straddle a row, and expert e's rows start at row e * N of the flat buffer:
-    # packed bytes e*N*K/2, absmax e*N*K/blocksize, state2 absmax (e*N*K/blocksize)/blocksize2.
+    # Blocks must not straddle a row; expert e's rows start at row e * N of the flat buffer.
     if blocksize not in (32, 64, 128, 256, 512, 1024) or K % blocksize != 0 or N % 2 != 0:
         return None
     packed = param.data
@@ -961,8 +1380,7 @@ def _build_stacked_nf4(experts, hidden_dim):
     }
 
 
-# Dynamo before torch 2.10 traces Params4bit as a plain object (no .detach / .view), so compiled
-# NF4 calls keep the current path there.
+# Dynamo before torch 2.10 cannot trace Params4bit, so compiled NF4 keeps the current path there.
 _LIVE_QUANT = tuple(int(v) for v in torch.__version__.split("+")[0].split(".")[:2]) >= (2, 10)
 
 
@@ -1030,23 +1448,19 @@ def _stash_lora(experts):
     return gu, dn
 
 
-def _lora_h(first, idx, x_slots):
-    return torch.bmm(x_slots.float()[:, None, :], first[idx].float())[:, 0]
-
-
 def _nf4_routed(state, x, idx, rw, top_k, gu_lora, dn_lora, out_dtype):
     gu_tb, dn_tb = state["gate_up"], state["down"]
     flat = idx.reshape(-1)
     lora = None
     if gu_lora is not None:
         first, second, scaling = gu_lora[:3]
-        lora = (second.transpose(1, 2), _lora_h(first, flat, x.repeat_interleave(top_k, 0)), scaling)
+        lora = (second.transpose(1, 2), routed_lora_a(x, flat, first, top_k), scaling)
     inter = routed_gate_up(x, flat, gu_tb, top_k, state["alpha"], state["limit"], lora,
                            state["act"], state["interleaved"])
     lora = None
     if dn_lora is not None:
         first, second, scaling = dn_lora[:3]
-        lora = (second.transpose(1, 2), _lora_h(first, flat, inter), scaling)
+        lora = (second.transpose(1, 2), routed_lora_a(inter, flat, first), scaling)
     return routed_down(inter, flat, rw, False, dn_tb, top_k, out_dtype, lora)
 
 
