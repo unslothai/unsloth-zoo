@@ -612,6 +612,71 @@ def _is_tracing_masks():
     return torch.jit.is_tracing()
 
 
+_LOCAL_FLEX_OVERRIDE_CACHE = [None, False]  # [(len(sys.modules), local edits) when scanned, found]
+_LOCAL_ATTENTION_EDITS = [0]
+
+
+def _track_local_attention_edits(AttentionInterface):
+    # Count every local registration, so an interface edited after the last scan forces a rescan.
+    if AttentionInterface.__dict__.get("_unsloth_tracks_local_edits", False): return
+    set_item, del_item = AttentionInterface.__setitem__, AttentionInterface.__delitem__
+    def __setitem__(self, key, value):
+        _LOCAL_ATTENTION_EDITS[0] += 1
+        return set_item(self, key, value)
+    def __delitem__(self, key):
+        _LOCAL_ATTENTION_EDITS[0] += 1
+        return del_item(self, key)
+    AttentionInterface.__setitem__ = __setitem__
+    AttentionInterface.__delitem__ = __delitem__
+    AttentionInterface._unsloth_tracks_local_edits = True
+
+
+def _a_model_overrides_flex_locally():
+    # A module's own AttentionInterface beats the global registry at dispatch; remote code included.
+    import sys
+    try:
+        from transformers.modeling_utils import AttentionInterface
+    except Exception:
+        return True
+    _track_local_attention_edits(AttentionInterface)
+    state = (len(sys.modules), _LOCAL_ATTENTION_EDITS[0])
+    if _LOCAL_FLEX_OVERRIDE_CACHE[0] == state:
+        return _LOCAL_FLEX_OVERRIDE_CACHE[1]
+    found = False
+    for module in list(sys.modules.values()):
+        # __dict__, not getattr: a getattr on a lazy transformers module imports its submodules.
+        namespace = getattr(module, "__dict__", None)
+        if not isinstance(namespace, dict): continue
+        for value in list(namespace.values()):
+            if not isinstance(value, AttentionInterface): continue
+            local = getattr(value, "_local_mapping", None)
+            if isinstance(local, dict) and "flex_attention" in local and \
+                getattr(local["flex_attention"], "_unsloth_maskless_causal_sdpa", False) is not True:
+                found = True
+                break
+        if found: break
+    _LOCAL_FLEX_OVERRIDE_CACHE[:] = [state, found]
+    return found
+
+
+def _flex_routes_maskless_to_sdpa(config):
+    try:
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+        function = ALL_ATTENTION_FUNCTIONS["flex_attention"]
+    except Exception:
+        return False
+    if getattr(function, "_unsloth_maskless_causal_sdpa", False) is not True:
+        return False
+    # The wrapper vetoes models with a layer it would keep on flex (head_dim > 256, softcap, SDPA-disabled).
+    accepts = getattr(function, "_unsloth_maskless_causal_sdpa_accepts", None)
+    try:
+        if not callable(accepts) or accepts(config) is not True:
+            return False
+    except Exception:
+        return False
+    return not _a_model_overrides_flex_locally()
+
+
 def _maskless_causal_arguments(signature, args, kwargs):
     """Arguments for an eager create_causal_mask call that may return None, else None.
 
@@ -644,7 +709,11 @@ def _maskless_causal_arguments(signature, args, kwargs):
         return None
 
     config = arguments.get("config", None)
-    if getattr(config, "_attn_implementation", None) != "sdpa":
+    attn_implementation = getattr(config, "_attn_implementation", None)
+    if attn_implementation == "flex_attention":
+        if not _flex_routes_maskless_to_sdpa(config):
+            return None
+    elif attn_implementation != "sdpa":
         return None
     if getattr(config, "is_causal", True) is not True:
         return None
@@ -779,6 +848,11 @@ def patch_transformers_masks():
             if maskless_causal and signature is not None:
                 arguments = _maskless_causal_arguments(signature, args, kwargs)
                 if arguments is not None:
+                    config = arguments.get("config", None)
+                    if getattr(config, "_attn_implementation", None) == "flex_attention":
+                        # Flex always builds a BlockMask; the SDPA reroute needs None.
+                        CAUSAL_MASK_SKIP_STATS["skipped"] += 1
+                        return None
                     mask = original(**arguments)
                     if mask is None:
                         CAUSAL_MASK_SKIP_STATS["skipped"] += 1

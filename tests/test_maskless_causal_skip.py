@@ -127,8 +127,10 @@ def test_sdpa_turns_none_into_the_same_causal_attention(patched):
 
 
 @pytest.mark.parametrize("attn", ["eager", "flex_attention", "flash_attention_2", "flash_attention_3", None])
-def test_only_sdpa_consumes_none_as_causal(patched, attn):
+def test_only_sdpa_consumes_none_as_causal(patched, attn, monkeypatch):
     # Eager applies no mask at all to None, so returning None there trains on future tokens.
+    if attn == "flex_attention":
+        _register_flex(monkeypatch, reroutes = False)  # stock flex; an imported unsloth reroutes
     kwargs = _kwargs(patched, config = _config(attn))
     assert _decide(patched, **kwargs) is None
 
@@ -356,3 +358,86 @@ def test_tiny_model_generate_is_unchanged(patched, monkeypatch):
     monkeypatch.setenv("UNSLOTH_SKIP_CAUSAL_MASK", "0")
     base = model.generate(input_ids = ids, attention_mask = attention_mask, max_new_tokens = 6, do_sample = False)
     assert torch.equal(head, base)
+
+
+def _register_flex(monkeypatch, reroutes):
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+    def flex_attention_forward(*args, **kwargs):
+        raise AssertionError("not called")
+    if reroutes:
+        flex_attention_forward._unsloth_maskless_causal_sdpa = True
+        flex_attention_forward._unsloth_maskless_causal_sdpa_accepts = lambda config: True
+    mapping = getattr(ALL_ATTENTION_FUNCTIONS, "_global_mapping", None)
+    target = mapping if mapping is not None else ALL_ATTENTION_FUNCTIONS
+    monkeypatch.setitem(target, "flex_attention", flex_attention_forward)
+    # Dispatch reads the local mapping first; an imported unsloth registers its flex wrapper there.
+    local = getattr(ALL_ATTENTION_FUNCTIONS, "_local_mapping", None)
+    if isinstance(local, dict) and "flex_attention" in local:
+        monkeypatch.setitem(local, "flex_attention", flex_attention_forward)
+
+
+def test_flex_drops_the_mask_only_when_unsloth_reroutes_it_to_sdpa(patched, monkeypatch):
+    # Stock flex reads a None mask as full bidirectional attention.
+    kwargs = _kwargs(patched, config = _config("flex_attention"))
+    _register_flex(monkeypatch, reroutes = False)
+    assert _decide(patched, **kwargs) is None
+    assert patched.create_causal_mask(**kwargs) is not None
+
+    _register_flex(monkeypatch, reroutes = True)
+    before = misc.CAUSAL_MASK_SKIP_STATS["skipped"]
+    assert patched.create_causal_mask(**kwargs) is None
+    assert misc.CAUSAL_MASK_SKIP_STATS["skipped"] == before + 1
+    padded = _kwargs(patched, config = _config("flex_attention"),
+                     attention_mask = torch.tensor([[1, 1, 1, 1, 1, 1], [0, 1, 1, 1, 1, 1]]))
+    assert patched.create_causal_mask(**padded) is not None
+
+
+def test_flex_keeps_the_mask_when_the_wrapper_vetoes_the_config(patched, monkeypatch):
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+    kwargs = _kwargs(patched, config = _config("flex_attention"))
+    _register_flex(monkeypatch, reroutes = True)
+    function = ALL_ATTENTION_FUNCTIONS["flex_attention"]
+    monkeypatch.setattr(function, "_unsloth_maskless_causal_sdpa_accepts", lambda config: False)
+    assert patched.create_causal_mask(**kwargs) is not None
+    monkeypatch.delattr(function, "_unsloth_maskless_causal_sdpa_accepts")
+    assert patched.create_causal_mask(**kwargs) is not None
+
+
+def test_a_model_local_flex_override_keeps_the_mask(patched, monkeypatch):
+    # A modeling module's own AttentionInterface beats the global registry at dispatch.
+    import sys, types
+    from transformers.modeling_utils import AttentionInterface
+    kwargs = _kwargs(patched, config = _config("flex_attention"))
+    _register_flex(monkeypatch, reroutes = True)
+    assert patched.create_causal_mask(**kwargs) is None
+
+    # transformers.models.*, and trust_remote_code's transformers_modules.* under any name.
+    for name, attribute in (
+        ("transformers.models.fake_local_flex.modeling_fake_local_flex", "ALL_ATTENTION_FUNCTIONS"),
+        ("transformers_modules.someone.fake_remote.modeling_fake_remote", "MY_ATTENTION"),
+    ):
+        interface = AttentionInterface()
+        interface._local_mapping = {"flex_attention": lambda *args, **kw: None}
+        module = types.ModuleType(name)
+        setattr(module, attribute, interface)
+        with monkeypatch.context() as scoped:
+            scoped.setitem(sys.modules, name, module)
+            assert patched.create_causal_mask(**kwargs) is not None, name
+        assert patched.create_causal_mask(**kwargs) is None
+
+
+def test_a_local_flex_registered_after_the_scan_keeps_the_mask(patched, monkeypatch):
+    # The scan is cached; registering a local flex on an already-loaded interface must invalidate it.
+    import sys, types
+    from transformers.modeling_utils import AttentionInterface
+    kwargs = _kwargs(patched, config = _config("flex_attention"))
+    _register_flex(monkeypatch, reroutes = True)
+    interface = AttentionInterface()
+    module = types.ModuleType("transformers_modules.someone.late_flex.modeling_late_flex")
+    module.ATTENTION = interface
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    assert patched.create_causal_mask(**kwargs) is None  # scanned and cached: nothing local yet
+    interface["flex_attention"] = lambda *args, **kw: None
+    assert patched.create_causal_mask(**kwargs) is not None
+    del interface["flex_attention"]
+    assert patched.create_causal_mask(**kwargs) is None
