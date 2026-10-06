@@ -1130,6 +1130,8 @@ jobs:
                 # silently, so one pinned version cannot show the merge finds it.
                 # test_fused_ce_coverage: a model that loses fused CE still trains (full
                 # logits), so each pin is checked against its release in the baseline.
+                # test_deepseek_v3_grpo_hidden_states: the GRPO wrapper must install on 4.x
+                # and >= 5.13 too, where DeepseekV3NaiveMoe does not exist.
                 "$venv/bin/python" -m pytest -v --tb=short -rs \
                   tests/test_upstream_pinned_symbols_transformers.py \
                   tests/test_torchvision_video_removed_message.py \
@@ -1145,6 +1147,7 @@ jobs:
                   tests/test_compiler_dynamic_exec.py \
                   tests/test_compiler_getsource_tokenerror.py \
                   tests/test_fused_ce_coverage.py \
+                  tests/test_deepseek_v3_grpo_hidden_states.py \
                   tests/test_aya_vision_logit_scale.py \
                   tests/test_vision_utils_grid_helpers_eager.py \
                   tests/test_modeling_local_vision_helpers_eager.py \
