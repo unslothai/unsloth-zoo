@@ -58,7 +58,7 @@ from .utils import raise_error, patch_function
 
 
 class _Gemma4KVSharedSafeProxy:
-    """Read-only proxy around Gemma4TextConfig hiding num_kv_shared_layers when 0.
+    """Proxy around Gemma4TextConfig hiding num_kv_shared_layers when 0; writes reach the real config.
 
     Makes `hasattr(proxy, "num_kv_shared_layers")` False so upstream's
     `layer_types[:-0]` slice is skipped; all other lookups forward to the real
@@ -88,6 +88,16 @@ class _Gemma4KVSharedSafeProxy:
                 "the cache constructor to avoid layer_types[:-0] == [] bug"
             )
         return getattr(self._real, name)
+
+    def __setattr__(self, name, value):
+        # TRL writes pad_token_id / eos_token_id through get_text_config().
+        if name == "_real":
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._real, name, value)
+
+    def __delattr__(self, name):
+        delattr(self._real, name)
 
     def get_text_config(self, decoder=None, encoder=None):
         # Return self so recursive get_text_config calls don't unwrap the proxy.
