@@ -113,28 +113,66 @@ def _calls():
 # ---------------------------------------------------------------- gate table (capability mocked) ----------------
 
 
-@pytest.mark.parametrize("cap, auto, forced", [
-    ((7, 5), 0, 0), ((8, 0), 256, -1), ((8, 6), 0, -1), ((8, 7), 0, -1), ((8, 9), 128, -1),
-    ((9, 0), 0, -1), ((10, 0), 0, -1), ((12, 0), 256, -1), ((12, 1), 0, -1),
-])
-def test_gate_table(monkeypatch, cap, auto, forced):
+_KINDS = ("lora", "many", "few", "dw")
+_AUTO = {
+    (8, 0): {"lora": -1, "many": 2048, "few": 256, "dw": 128},
+    (12, 0): {"lora": -1, "many": 2048, "few": 256, "dw": 64},
+    (8, 9): {"lora": -1, "many": 32, "few": 32, "dw": 0},
+}
+
+
+@pytest.mark.parametrize("cap", [(7, 5), (8, 0), (8, 6), (8, 7), (8, 9), (9, 0), (10, 0), (12, 0), (12, 1)])
+@pytest.mark.parametrize("kind", _KINDS)
+def test_gate_table(monkeypatch, cap, kind):
     if MG.triton is None or MU._GROUPED_MM_TRITON_OP is None or torch.version.hip is not None:
         pytest.skip("gate is off without Triton / custom_op / on HIP")
     _mock_cap(cap)
-    assert MU._triton_grouped_mm_max_rows(0) == auto
+    auto = _AUTO.get(cap, {}).get(kind, 0)
+    forced = -1 if cap >= (8, 0) else 0
+    assert MU._triton_grouped_mm_max_rows(0, kind) == auto
     monkeypatch.setenv("UNSLOTH_MOE_GROUPED_TRITON", "auto")
-    assert MU._triton_grouped_mm_max_rows(0) == auto
+    assert MU._triton_grouped_mm_max_rows(0, kind) == auto
     monkeypatch.setenv("UNSLOTH_MOE_GROUPED_TRITON", "1")
-    assert MU._triton_grouped_mm_max_rows(0) == forced
+    assert MU._triton_grouped_mm_max_rows(0, kind) == forced
     monkeypatch.setenv("UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS", "64")
-    assert MU._triton_grouped_mm_max_rows(0) == (64 if forced else 0)
+    assert MU._triton_grouped_mm_max_rows(0, kind) == (64 if forced else 0)
     monkeypatch.setenv("UNSLOTH_MOE_GROUPED_TRITON", "auto")
-    assert MU._triton_grouped_mm_max_rows(0) == (64 if auto else 0)
+    assert MU._triton_grouped_mm_max_rows(0, kind) == (64 if auto else 0)
     monkeypatch.setenv("UNSLOTH_MOE_GROUPED_TRITON", "0")
-    assert MU._triton_grouped_mm_max_rows(0) == 0
+    assert MU._triton_grouped_mm_max_rows(0, kind) == 0
     monkeypatch.setenv("UNSLOTH_MOE_GROUPED_TRITON", "1")
     monkeypatch.setenv("UNSLOTH_DISABLE_MOE_TRITON", "1")
-    assert MU._triton_grouped_mm_max_rows(0) == 0
+    assert MU._triton_grouped_mm_max_rows(0, kind) == 0
+
+
+def test_gate_kind():
+    assert MU._triton_grouped_mm_kind(2048, 16, 128) == "lora"     # LoRA A
+    assert MU._triton_grouped_mm_kind(16, 1536, 128) == "lora"     # LoRA B
+    assert MU._triton_grouped_mm_kind(2048, 1536, 128) == "many"   # Qwen3 gate_up
+    assert MU._triton_grouped_mm_kind(2048, 1536, 64) == "many"
+    assert MU._triton_grouped_mm_kind(4096, 28672, 8) == "few"     # Mixtral
+    assert MU._triton_grouped_mm_kind(2880, 5760, 32) == "few"     # gpt-oss
+    assert MU._triton_grouped_mm_kind(64, 2048, 128) == "many"     # LoRA r=64: base limits
+
+
+@needs_cuda
+@pytest.mark.parametrize("rows_per_expert, triton_dw", [(100, True), (200, False)])
+def test_base_dw_above_limit_uses_torch(rows_per_expert, triton_dw):
+    """A trainable base stack's dW (full finetuning) above the "dw" limit goes to torch._grouped_mm while
+    forward and dX stay on Triton; both give the fp64 answer."""
+    if MU._GROUPED_MM_TRITON_OP is None or MG.triton is None or not MU._check_torch_grouped_mm_supported():
+        pytest.skip("no custom_op / Triton / torch._grouped_mm")
+    index = torch.cuda.current_device()
+    _mock_cap((8, 0), index)                                     # few: 256 rows, dw: 128 rows
+    E, K, N = 4, 64, 96
+    x, param, dy, offs, counts = _problem([rows_per_expert] * E, K, N, torch.bfloat16)
+    before = _calls()
+    y, dx, dw = _run(MU._grouped_mm_with_backward_fix, x, param, dy, offs, True)
+    after = _calls()
+    assert after["gemm"] - before["gemm"] == 2                   # forward + dX on Triton
+    assert after["wgrad"] - before["wgrad"] == (1 if triton_dw else 0)
+    ref_y, ref_dx, ref_dw = _fp64(x, param, dy, counts, True)
+    assert _rel(y, ref_y) < 1e-2 and _rel(dx, ref_dx) < 1e-2 and _rel(dw, ref_dw) < 1e-2
 
 
 def test_gate_off_on_hip(monkeypatch):
@@ -151,13 +189,18 @@ def test_gate_rows_threshold_and_operands(monkeypatch):
         pytest.skip("no custom_op / Triton")
     index = torch.cuda.current_device()
     _mock_cap((8, 0), index)
-    E, K, N = 4, 32, 48
+    E, K, N = 4, 40, 48                                          # "few" (< 64 experts, both dims > 32)
     w = torch.empty(E, N, K, device = "cuda", dtype = torch.bfloat16).transpose(-2, -1)
     at = lambda m, dtype = torch.bfloat16, weight = w: MU._triton_grouped_mm_wanted(
-        torch.empty(m, K, device = "cuda", dtype = dtype), weight)
+        torch.empty(m, weight.shape[1], device = "cuda", dtype = dtype), weight)
     assert at(256 * E) and not at(256 * E + 1)
+    many = torch.empty(64, 40, 48, device = "cuda", dtype = torch.bfloat16)
+    assert at(2048 * 64, weight = many) and not at(2048 * 64 + 1, weight = many)
+    lora = torch.empty(E, 40, 16, device = "cuda", dtype = torch.bfloat16)
+    assert at(100000 * E, weight = lora)                          # LoRA class: no row limit
     _mock_cap((8, 9), index)
-    assert at(128 * E) and not at(128 * E + 1)
+    assert at(32 * E) and not at(32 * E + 1)
+    assert at(100000 * E, weight = lora)
     _mock_cap((9, 0), index)
     assert not at(1)
     _mock_cap((8, 0), index)
@@ -173,6 +216,7 @@ def test_gate_rows_threshold_and_operands(monkeypatch):
     assert at(8, torch.bfloat16, torch.nn.Parameter(w.detach().contiguous(), requires_grad = False))
     monkeypatch.setenv("UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS", "16")
     assert at(16 * E) and not at(16 * E + 1)
+    assert at(16 * E, weight = lora) and not at(16 * E + 1, weight = lora)
     monkeypatch.setenv("UNSLOTH_MOE_GROUPED_TRITON", "0")
     assert not at(1)
 

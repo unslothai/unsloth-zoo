@@ -482,11 +482,20 @@ _GROUPED_MM_FP16_OP = _register_grouped_mm_fp16_op()
 
 # Triton grouped GEMM for every MoE model (moe_grouped_fp16's kernels, bf16 / fp16 operands of one dtype).
 # Off sm90 / sm100 torch._grouped_mm is a per-expert cuBLAS loop over host offsets; one Triton launch beats it
-# while experts are small. Measured, one MoE block fwd + bwd with LoRA r=16 (Colab, torch 2.11, Triton 3.6):
-# A100 (sm80) and RTX PRO 6000 (sm120) win up to 256 rows per expert (Qwen3.5-35B-A3B 2.2-17x, Qwen3-30B-A3B
-# 1.3-10x, gpt-oss 1.2-2.9x) and lose above (Mixtral, gpt-oss at 8K tokens: 0.5-0.9x); L4 (sm89) wins up to
-# 128; T4 (sm75) has no MMA in Triton and loses everywhere. sm86 / sm90 / sm100 are unmeasured or native.
-_TRITON_GROUPED_MM_AUTO_ROWS = {(8, 0): 256, (12, 0): 256, (8, 9): 128}
+# while experts are small. Row limits (average rows per expert) per GEMM class, from a sweep over 16..2048 rows
+# per expert with the generic tiles (Qwen3-30B-A3B, Qwen3.5-35B-A3B, Mixtral 8x7B, gpt-oss-20b, GLM-4.5-Air,
+# DeepSeek-V2-Lite expert shapes, bf16 + fp16, Colab A100 / L4 / RTX PRO 6000, torch 2.11, Triton 3.6):
+#   "lora": a dim <= 32 (LoRA A / B and their grads): 2.4-95x on A100 / RTX PRO 6000, 1.03-65x on L4, all rows.
+#   "many" / "few": a frozen or trainable base stack with >= 64 / < 64 experts. Fine-grained MoEs win on
+#     A100 / RTX PRO 6000 at every size measured (1.04-6.7x); Mixtral / gpt-oss lose above ~256 rows. L4 wins
+#     only up to ~32.
+#   "dw": a base stack's own weight gradient (full finetuning), slower than cuBLAS above ~64-128 rows.
+# T4 (sm75) has no MMA in Triton; sm86 is unmeasured; sm90 / sm100 have native grouped GEMMs: all off in auto.
+_TRITON_GROUPED_MM_AUTO_ROWS = {
+    (8, 0):  {"lora": -1, "many": 2048, "few": 256, "dw": 128},
+    (12, 0): {"lora": -1, "many": 2048, "few": 256, "dw": 64},
+    (8, 9):  {"lora": -1, "many": 32,   "few": 32,  "dw": 0},
+}
 _TRITON_GROUPED_MM_CAPABILITY = {}
 _TRITON_GROUPED_MM_POLICY = {}
 
@@ -499,26 +508,26 @@ def _triton_grouped_mm_capability(index):
 
 
 @_assume_constant_result
-def _triton_grouped_mm_max_rows(index):
-    """Average rows per expert up to which the Triton grouped GEMM runs on CUDA device `index`:
-    0 = off, -1 = no limit. UNSLOTH_MOE_GROUPED_TRITON=auto (default: the measured table), 1 (any
-    sm80+ CUDA GPU), 0 (off); UNSLOTH_DISABLE_MOE_TRITON=1 also turns it off;
-    UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS overrides the limit where the path is on (0 turns it off, a
-    negative value lifts it). Evaluated eagerly (and baked in)
-    under torch.compile: no capability probe or environment read inside a trace, so a change after a
-    frame compiled needs torch._dynamo.reset()."""
+def _triton_grouped_mm_max_rows(index, kind = "lora"):
+    """Average rows per expert up to which the Triton grouped GEMM runs a GEMM of class `kind` ("lora",
+    "many", "few", "dw") on CUDA device `index`: 0 = off, -1 = no limit. UNSLOTH_MOE_GROUPED_TRITON=auto
+    (default: the measured table), 1 (every class, any sm80+ CUDA GPU), 0 (off); UNSLOTH_DISABLE_MOE_TRITON=1
+    also turns it off; UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS overrides every class's limit where the path is
+    on (0 turns it off, a negative value lifts it). Evaluated eagerly (and baked in) under torch.compile: no
+    capability probe or environment read inside a trace, so a change after a frame compiled needs
+    torch._dynamo.reset()."""
     environ = os.environ
     key = (
-        index, environ.get("UNSLOTH_MOE_GROUPED_TRITON"), environ.get("UNSLOTH_DISABLE_MOE_TRITON"),
+        index, kind, environ.get("UNSLOTH_MOE_GROUPED_TRITON"), environ.get("UNSLOTH_DISABLE_MOE_TRITON"),
         environ.get("UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS"),
     )
     limit = _TRITON_GROUPED_MM_POLICY.get(key)
     if limit is None:
-        limit = _TRITON_GROUPED_MM_POLICY[key] = _triton_grouped_mm_policy(index, key[1], key[2], key[3])
+        limit = _TRITON_GROUPED_MM_POLICY[key] = _triton_grouped_mm_policy(index, kind, *key[2:])
     return limit
 
 
-def _triton_grouped_mm_policy(index, mode, disabled, override):
+def _triton_grouped_mm_policy(index, kind, mode, disabled, override):
     mode = (mode or "auto").strip().lower()
     if mode in ("0", "false", "off") or disabled == "1":
         return 0
@@ -534,7 +543,7 @@ def _triton_grouped_mm_policy(index, mode, disabled, override):
     if mode in ("1", "true", "on"):
         limit = -1 if cap >= (8, 0) else 0
     else:
-        limit = _TRITON_GROUPED_MM_AUTO_ROWS.get(cap, 0)
+        limit = _TRITON_GROUPED_MM_AUTO_ROWS.get(cap, {}).get(kind, 0)
     if limit != 0 and override:
         try:
             limit = int(override)
@@ -543,17 +552,26 @@ def _triton_grouped_mm_policy(index, mode, disabled, override):
     return limit
 
 
+def _triton_grouped_mm_kind(K, N, E):
+    return "lora" if min(K, N) <= 32 else ("many" if E >= 64 else "few")
+
+
+def _rows_within(limit, M, E):
+    return limit != 0 and (limit < 0 or M <= limit * E)
+
+
 _PLAIN_TENSOR_TYPES = (torch.Tensor, torch.nn.Parameter)
 
 
 def _triton_grouped_mm_wanted(inputs, weight) -> bool:
     """Static gate (shapes, dtypes, device, cached policy; never the offsets' values): torch._grouped_mm(inputs
-    [M, K], weight [E, K, N]) runs as unsloth_zoo::grouped_mm_triton when M <= limit * E."""
+    [M, K], weight [E, K, N]) runs as unsloth_zoo::grouped_mm_triton when M <= limit * E for its class."""
     device = inputs.device
     if device.type != "cuda":
         return False
-    limit = _triton_grouped_mm_max_rows(device.index)   # first: a declined GPU pays only this
-    if limit == 0 or inputs.dim() != 2 or weight.dim() != 3 or weight.device != device:
+    # first: a declined GPU pays only this
+    if _triton_grouped_mm_max_rows(device.index, "lora") == 0 or inputs.dim() != 2 or weight.dim() != 3 \
+            or weight.device != device:
         return False
     dtype = inputs.dtype
     if weight.dtype != dtype or (dtype != torch.bfloat16 and dtype != torch.float16):
@@ -561,10 +579,11 @@ def _triton_grouped_mm_wanted(inputs, weight) -> bool:
     # Tensor subclasses (DTensor, float8 / quantized wrappers) keep torch._grouped_mm's own dispatch.
     if type(inputs) not in _PLAIN_TENSOR_TYPES or type(weight) not in _PLAIN_TENSOR_TYPES:
         return False
-    E = weight.shape[0]
-    if E == 0 or inputs.shape[1] != weight.shape[1] or weight.shape[2] == 0:
+    E, K, N = weight.shape
+    if E == 0 or inputs.shape[1] != K or N == 0:
         return False
-    return limit < 0 or inputs.shape[0] <= limit * E
+    limit = _triton_grouped_mm_max_rows(device.index, _triton_grouped_mm_kind(K, N, E))
+    return _rows_within(limit, inputs.shape[0], E)
 
 
 def _grouped_mm_triton_impl(inputs, weight, offsets):
@@ -580,7 +599,11 @@ def _grouped_mm_triton_wgrad_impl(inputs, grad, offsets):
     if not mg.triton_grouped_available(inputs.device):
         mg.GENERIC_CALLS["fallback"] += 1
         return _grouped_mm_fp16_wgrad_eager(inputs, grad, offsets).contiguous()
-    return mg.generic_grouped_wgrad(inputs, grad, offsets, offsets.shape[0])
+    E, K, N = offsets.shape[0], inputs.shape[1], grad.shape[1]
+    if min(K, N) > 32 and not _rows_within(_triton_grouped_mm_max_rows(inputs.device.index, "dw"), inputs.shape[0], E):
+        # A trainable base stack's dW (full finetuning): cuBLAS beats the Triton reduction at these sizes.
+        return _grouped_mm_fp16_wgrad_eager(inputs, grad, offsets).contiguous()
+    return mg.generic_grouped_wgrad(inputs, grad, offsets, E)
 
 
 class _GroupedMMTriton(torch.autograd.Function):
