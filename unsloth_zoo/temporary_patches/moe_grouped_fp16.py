@@ -196,7 +196,9 @@ def _pow2(n):
 
 # fp32 gpt-oss down GEMM operands per backend when UNSLOTH_GPTOSS_FP16_DOWN_OPERAND=auto.
 # "fp32" is the loop's exact math (IEEE fp32, fp32 dequant stack); "fp16" rounds x / W / dY to fp16
-# (dY per-row power-of-two scaled) with an fp32 accumulate and output. Placeholder, set from benches.
+# (dY per-row power-of-two scaled) with an fp32 accumulate and output. Colab T4 (cuBLAS), 20B layer
+# fwd + bwd vs the loop: fp16 1.9x / 1.7x at 512 / 2048 tokens, fp32 1.33x / 0.97x (no fp32 tensor
+# cores). Triton (sm80+): fp16 runs on the tensor cores, IEEE fp32 on CUDA-core FMA.
 DOWN_OPERAND_AUTO = {"triton": "fp16", "cublas": "fp16"}
 
 
