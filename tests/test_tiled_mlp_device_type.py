@@ -70,3 +70,24 @@ def test_tiled_forward_and_backward_on_every_device_label(reload_tiled_mlp, labe
     for p, q in zip(tiled.parameters(), reference.parameters()):
         torch.testing.assert_close(p.grad, q.grad)
 pass
+
+
+def test_tiled_forward_and_backward_on_this_host():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.manual_seed(0)
+    reference = _MLP().to(device)
+    tiled = _MLP().to(device)
+    tiled.load_state_dict(reference.state_dict())
+    tiled_mlp.patch_mlp(tiled, target_arctic = True)
+
+    x = torch.randn(2, 40, 16, device = device, requires_grad = True)
+    x_ref = x.detach().clone().requires_grad_()
+    with torch.autocast(device, dtype = torch.bfloat16):
+        out = tiled(x)
+        out_ref = reference(x_ref)
+    out.float().pow(2).sum().backward()
+    out_ref.float().pow(2).sum().backward()
+
+    torch.testing.assert_close(out, out_ref)
+    torch.testing.assert_close(x.grad, x_ref.grad)
+pass
