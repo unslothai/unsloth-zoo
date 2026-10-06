@@ -6158,3 +6158,26 @@ def test_text_training_checks_model_capability_with_a_replacement_tokenizer(tmp_
     )
     with pytest.raises(ValueError, match="`text_wrapper` has no vision path"):
         trainer._prepare_data(False)
+
+
+def test_text_forwarding_probe_leaves_dropout_rng_and_mode_untouched():
+    from unsloth_zoo.mlx.loader import _verify_text_only_wrapper
+
+    class Wrapper(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(512, 8)
+            self.drop = nn.Dropout(0.5)
+            self.head = nn.Linear(8, 512)
+
+        def __call__(self, ids):
+            return self.head(self.drop(self.embed(ids)))
+
+    model = Wrapper()
+    model.train()
+    mx.random.seed(7)
+    _verify_text_only_wrapper(model, "wrapper", check_causality=False)
+    probed = mx.random.uniform(shape=(4,))
+    mx.random.seed(7)
+    assert mx.array_equal(probed, mx.random.uniform(shape=(4,))).item()
+    assert model.training and model.drop.training

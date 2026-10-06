@@ -3408,6 +3408,8 @@ def _call_restoring_module_state(model, call):
         return call()
 
     with _mlx_module_state_restored(modules):
+        # Eval mode: dropout would draw from the global RNG a seeded run relies on.
+        model.eval()
         return call()
 
 
