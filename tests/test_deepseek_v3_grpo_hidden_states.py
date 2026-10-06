@@ -19,9 +19,8 @@
 import pytest
 import torch
 
+# Runs on every transformers with DeepseekV3: the wrapper must not depend on DeepseekV3NaiveMoe (absent on 4.x and >= 5.13).
 modeling = pytest.importorskip("transformers.models.deepseek_v3.modeling_deepseek_v3")
-if not hasattr(modeling, "DeepseekV3NaiveMoe"):
-    pytest.skip("this transformers has no DeepseekV3NaiveMoe, so the patch does not apply", allow_module_level = True)
 
 
 def test_return_hidden_states_gives_hidden_states(monkeypatch):
