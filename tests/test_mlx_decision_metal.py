@@ -222,11 +222,11 @@ def test_lora_adapter_is_merged_into_the_decoder_by_layer_name(tmp_path):
 @pytest.mark.parametrize("quantized", [False, True])
 def test_label_scores_are_the_output_head_rows_of_the_last_token(quantized):
     reader, ids, picks = _LabelModel.__new__(_LabelModel), list(range(40, 63)), mx.array([300, 7, 301])
-    reader.model, reader.labels, reader._encode = _decoder(quantized), [("A", 300), ("B", 7), ("C", 301), ("D", 511)], lambda text: ids
-    scores, tokens = reader._label_scores("prompt", 3)
+    reader.model, reader.labels = _decoder(quantized), [("A", 300), ("B", 7), ("C", 301), ("D", 511)]
+    scores = reader._read(SimpleNamespace(options = [None] * 3), ids, reader._hidden(ids))
     logits, hidden = reader.model(mx.array(ids)[None])[0, -1], _forward_text_hidden_states(reader.model, mx.array(ids)[None])[0, -1]
     gap = lambda expected: mx.abs(mx.array(scores) - expected.astype(mx.float32)).max().item()
-    assert tokens == 23 and gap(logits[picks]) <= 2**-5 and (quantized or gap(reader.model.language_model.lm_head.weight[picks].astype(mx.float32) @ hidden.astype(mx.float32)) == 0)
+    assert len(scores) == 3 and gap(logits[picks]) <= 2**-5 and (quantized or gap(reader.model.language_model.lm_head.weight[picks].astype(mx.float32) @ hidden.astype(mx.float32)) == 0)
 
 
 def test_kev_scores_each_option_end_against_the_last_token(tmp_path, monkeypatch):

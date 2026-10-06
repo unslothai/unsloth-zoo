@@ -16,6 +16,7 @@
 
 """Decision requests, prompts and answers; the networks behind them are covered in the *_metal files."""
 
+import contextlib
 import json
 import math
 import types
@@ -194,12 +195,13 @@ def decoder_family(monkeypatch):
 
     loads, prompts = [], []
     # Characters are tokens, so of the two-letter label codes only the two listed here are single tokens.
-    encode = lambda text, add_special_tokens: [900] if text in ("AB", "ZZ") else [1] * add_special_tokens + [ord(c) for c in text]
+    encode = lambda text, add_special_tokens: (prompts.append(text) if text.startswith("<|im_start|>") else None) or ([900] if text in ("AB", "ZZ") else [1] * add_special_tokens + [ord(c) for c in text])
     load = lambda source, **options: loads.append((source, options)) or (types.SimpleNamespace(eval = lambda: None), types.SimpleNamespace(tokenizer = types.SimpleNamespace(encode = encode)))
     monkeypatch.setattr(loader.FastMLXModel, "from_pretrained", load)
     monkeypatch.setattr(decision, "_merge_lora", lambda model, folder: loads.append(folder))
-    monkeypatch.setattr(decision._QwenModel, "_scores", DecisionPipeline._scores)
-    monkeypatch.setattr(decision._LabelModel, "_label_scores", lambda self, prompt, count: prompts.append(prompt) or ([float(i * i) for i in range(count)], 10))
+    monkeypatch.setattr("unsloth_zoo.mlx.generate.generation_mode", lambda model: contextlib.nullcontext())
+    monkeypatch.setattr(decision._QwenModel, "_hidden_states", lambda self, prompts: iter(prompts))
+    monkeypatch.setattr(decision._LabelModel, "_read", lambda self, question, ids, hidden: [float(i * i) for i in range(self._label_count(question))])
     return loads, prompts
 
 
@@ -220,7 +222,7 @@ def test_lev_reads_a_choice_in_both_orders_and_noul_as_a_rating(tmp_path, decode
     asked = head + '{"a": "é", "b": 1}\n\n# Criterion\n{"y": 2, "z": 1}\n\n# Options\n'
     closing = "\nRespond with only the letter of the best option." + tail
     assert prompts == [asked + 'A. x: {"c": 2, "d": 1}\nB. y\nC. z\n' + closing, asked + 'A. z\nB. y\nC. x: {"c": 2, "d": 1}\n' + closing]
-    assert result["answers"]["q"]["probabilities"] == pytest.approx({"x": 0.417874, "y": 0.164252, "z": 0.417874}, abs = 1e-6) and result["usage"]["input_tokens"] == 20
+    assert result["answers"]["q"]["probabilities"] == pytest.approx({"x": 0.417874, "y": 0.164252, "z": 0.417874}, abs = 1e-6) and result["usage"]["input_tokens"] == len(prompts[0]) + len(prompts[1])
     result = model.answer("s", {
         "one": {"type": "choice", "instructions": "", "criteria": {"x": None}},
         "level": {"type": "score", "instructions": "i", "criteria": ["low", "mid", "high"]},
@@ -247,7 +249,7 @@ def test_nimble_lists_every_question_and_names_the_one_to_answer(tmp_path, decod
     # Every fragment is JSON with angle brackets escaped; a noul lists false before true as bare values.
     asked = system.format("one-letter") + r'{"context": "{\"a\": \"\u003cé\u003e\"}", "schema": [{"name": "pick", "description": "\u003ci\u003e", "choices": [{"code": "A", "value": "x\u003c", "description": "{\"d\": \"\u003e\"}"}, {"code": "B", "value": "é"}]}, {"name": "sure", "description": "s", "choices": [{"code": "A", "value": false}, {"code": "B", "value": true}]}]}'
     assert prompts == [asked + f'\n\nRequested field: "{name}"<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n' for name in questions]
-    assert result["answers"]["sure"]["noul"] == pytest.approx(math.e / (1 + math.e)) and result["usage"]["input_tokens"] == 20
+    assert result["answers"]["sure"]["noul"] == pytest.approx(math.e / (1 + math.e)) and result["usage"]["input_tokens"] == sum(map(len, prompts))
     for count, code in ((26, "one-letter"), (27, "short")):
         result = model.answer("s", {"few": {"type": "score", "instructions": "i", "criteria": ["a", "b"]}, "many": {"type": "choice", "instructions": "i", "criteria": dict.fromkeys(map(str, range(count)))}})
         assert prompts[-1].startswith(system.format(code) + '{"context": "s", "schema": [{"name": "few"') and result["answers"]["many"]["choice"] == str(count - 1)

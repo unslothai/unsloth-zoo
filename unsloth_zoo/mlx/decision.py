@@ -697,11 +697,25 @@ class _QwenModel(DecisionPipeline):
 
         return _forward_text_hidden_states(self.model, mx.array(ids)[None])[0]
 
+    def _hidden_states(self, prompts):
+        return map(self._hidden, prompts)
+
     def _scores(self, state, questions):
         from .generate import generation_mode
 
+        prompts = [[self._encode(prompt) for prompt in self._prompts(state, questions, question)] for question in questions]
         with generation_mode(self.model):
-            return super()._scores(state, questions)
+            hidden = self._hidden_states([ids for variants in prompts for ids in variants])
+            scores = [[self._read(question, ids, next(hidden)) for ids in variants] for question, variants in zip(questions, prompts)]
+        return scores, sum(len(ids) for variants in prompts for ids in variants)
+
+    def _prompts(self, state, questions, question):
+        """The prompt of each variant in which a question is asked."""
+        raise NotImplementedError
+
+    def _read(self, question, ids, hidden):
+        """The option scores of a question from the hidden states of one of its prompts."""
+        raise NotImplementedError
 
 
 class _LabelModel(_QwenModel):
@@ -711,10 +725,11 @@ class _LabelModel(_QwenModel):
         self.labels = self._single_tokens(codes, 255)
         self.max_options = len(self.labels)
 
-    def _label_scores(self, prompt, count):
-        ids = self._encode(prompt)
-        scores = _head_scores(self.model, self._hidden(ids)[-1:], [token for _, token in self.labels[:count]])
-        return scores[0].tolist(), len(ids)
+    def _label_count(self, question):
+        return len(question.options)
+
+    def _read(self, question, ids, hidden):
+        return _head_scores(self.model, hidden[-1:], [token for _, token in self.labels[: self._label_count(question)]])[0].tolist()
 
 
 _CODES = [chr(65 + i) for i in range(26)] + [chr(65 + i) + chr(65 + j) for i in range(26) for j in range(26)]
@@ -773,20 +788,17 @@ class _LevModel(_LabelModel):
             f"# Criterion\n{instructions}\n\n{body}\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
         )
 
-    def _score_question(self, state, questions, question):
+    def _label_count(self, question):
+        return self._RATINGS if question.type == "noul" else len(question.options)
+
+    def _prompts(self, state, questions, question):
         # The model was trained on key-sorted JSON; the listed order of the options is kept.
         state, instructions = _sort_keys(state), _sort_keys(question.instructions)
         options = [(key, _sort_keys(description)) for key, description in question.options]
         question = type(question)(question.id, question.type, instructions, options)
-        count = self._RATINGS if question.type == "noul" else len(options)
         # A choice is read in both option orders, which cancels the preference for the first label.
-        orders = [options, options[::-1]] if question.type == "choice" and count > 1 else [options]
-        variants, tokens = [], 0
-        for order in orders:
-            scores, used = self._label_scores(self._prompt(state, question, order), count)
-            variants.append(scores)
-            tokens += used
-        return variants, tokens
+        orders = [options, options[::-1]] if question.type == "choice" and len(options) > 1 else [options]
+        return [self._prompt(state, question, order) for order in orders]
 
 
 def _escaped_json(value):
@@ -822,15 +834,13 @@ class _NimbleModel(_LabelModel):
             choices.append(choice + "}")
         return f'{{"name": {_escaped_json(question.id)}, "description": {_escaped_json(_text(question.instructions))}, "choices": [{", ".join(choices)}]}}'
 
-    def _score_question(self, state, questions, question):
+    def _prompts(self, state, questions, question):
         code = "short" if any(len(q.options) > 26 for q in questions) else "one-letter"
-        prompt = (
+        return [
             f"<|im_start|>system\n{self._SYSTEM.format(code)}<|im_end|>\n<|im_start|>user\n"
             f'{{"context": {_escaped_json(_text(state))}, "schema": [{", ".join(map(self._field, questions))}]}}'
             f"\n\nRequested field: {_escaped_json(question.id)}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
-        )
-        scores, tokens = self._label_scores(prompt, len(question.options))
-        return [scores], tokens
+        ]
 
 
 class _OpenJevModel(_LabelModel):
@@ -862,18 +872,16 @@ class _OpenJevModel(_LabelModel):
         name, default = ("yes", "The statement is true.") if key == "true" else ("no", "The statement is false.")
         return f"{name}: {_text(description) if description else default}"
 
-    def _score_question(self, state, questions, question):
+    def _prompts(self, state, questions, question):
         listed = "".join(
             f"[{letter}] {self._option(question.type, key, description)}\n"
             for (letter, _), (key, description) in zip(self.labels, question.options)
         )
         suffix = " Rate along the ordered levels below (lowest first)." if question.type == "score" else ""
-        prompt = (
+        return [
             f"<|im_start|>user\nState:\n{_text(state)}\n\nQuestion: {_text(question.instructions)}{suffix}\nOptions:\n{listed}"
             "\nAnswer with the letter of the best option only.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
-        )
-        scores, tokens = self._label_scores(prompt, len(question.options))
-        return [scores], tokens
+        ]
 
 
 def _flatten(value, indent = 0):
@@ -942,14 +950,16 @@ class _KevModel(_QwenModel):
         name = _plain(key) if kind != "noul" else "yes" if key == "true" else "no"
         return f"{name}: {description}" if description else name
 
-    def _score_question(self, state, questions, question):
+    def _prompts(self, state, questions, question):
         options = "".join(f"<|box_start|>{self._option(question.type, key, description)}<|box_end|>" for key, description in question.options)
-        ids = self._encode(f"<|fim_prefix|>{_plain(state)}<|fim_middle|>{_plain(question.instructions)}{options}<|fim_suffix|>")
+        return [f"<|fim_prefix|>{_plain(state)}<|fim_middle|>{_plain(question.instructions)}{options}<|fim_suffix|>"]
+
+    def _read(self, question, ids, hidden):
         ends = [index for index, token in enumerate(ids) if token == self.option_end]
-        hidden = self._hidden(ids).astype(mx.float32)
+        hidden = hidden.astype(mx.float32)
         query = hidden[-1] @ self.head["q.weight"].T + self.head["q.bias"]
         keys = hidden[mx.array(ends)] @ self.head["k.weight"].T + self.head["k.bias"]
-        return [((keys @ query) * self.scale).tolist()], len(ids)
+        return ((keys @ query) * self.scale).tolist()
 
 
 # The head's type embedding rows.
