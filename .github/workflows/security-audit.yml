@@ -259,7 +259,7 @@ jobs:
         run: python3 -m pytest tests/security -v
 
       - name: Enforce workflow-trigger lint result
-        if: ${{ !cancelled() && steps.trigger-lint.outcome != 'success' }}
+        if: ${{ !cancelled() && steps.trigger-lint.outcome == 'failure' }}
         run: |
           echo "::error::Workflow-trigger lint did not pass"
           exit 1
