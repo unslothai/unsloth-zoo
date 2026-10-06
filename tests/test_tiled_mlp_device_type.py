@@ -18,10 +18,11 @@
 import importlib
 
 import pytest
-import torch
 
-import unsloth_zoo.device_type as device_type
-from unsloth_zoo import tiled_mlp
+torch = pytest.importorskip("torch")
+
+import unsloth_zoo.device_type as device_type  # noqa: E402
+from unsloth_zoo import tiled_mlp  # noqa: E402
 
 
 class _MLP(torch.nn.Module):
