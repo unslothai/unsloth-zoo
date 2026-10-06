@@ -372,7 +372,8 @@ def _grouped_mm_with_backward_fix(
     and a one-time probe confirms the view matches the contiguous copy on this device before we
     skip the copy; else we keep the copy. Falls back to a per-group matmul when the device has no
     torch._grouped_mm, and on the 16-byte stride error. Bit-exact vs the always-contiguous
-    path in forward and backward.
+    path in forward and backward. Small experts on sm80 / sm89 / sm120 first take the Triton grouped
+    GEMM (_triton_grouped_mm_wanted); everything it declines runs the code below unchanged.
     """
     if _triton_grouped_mm_wanted(inputs, weight):
         return _triton_grouped_mm(inputs, weight, offsets)
@@ -502,8 +503,10 @@ def _triton_grouped_mm_max_rows(index):
     """Average rows per expert up to which the Triton grouped GEMM runs on CUDA device `index`:
     0 = off, -1 = no limit. UNSLOTH_MOE_GROUPED_TRITON=auto (default: the measured table), 1 (any
     sm80+ CUDA GPU), 0 (off); UNSLOTH_DISABLE_MOE_TRITON=1 also turns it off;
-    UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS overrides the limit. Evaluated eagerly (and baked in) under
-    torch.compile: no capability probe or environment read inside a trace."""
+    UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS overrides the limit where the path is on (0 turns it off, a
+    negative value lifts it). Evaluated eagerly (and baked in)
+    under torch.compile: no capability probe or environment read inside a trace, so a change after a
+    frame compiled needs torch._dynamo.reset()."""
     environ = os.environ
     key = (
         index, environ.get("UNSLOTH_MOE_GROUPED_TRITON"), environ.get("UNSLOTH_DISABLE_MOE_TRITON"),
