@@ -357,6 +357,10 @@ def get_forward_moe_backend():
 
 # Grouped MM wrapper around torch._grouped_mm; native backward works correctly.
 
+# Dynamo calls a function decorated with this eagerly at trace time and bakes in its result.
+_assume_constant_result = getattr(torch.compiler, "assume_constant_result", None) or \
+    getattr(torch._dynamo, "assume_constant_result", lambda fn: fn)
+
 
 def _grouped_mm_with_backward_fix(
     inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor
@@ -370,6 +374,8 @@ def _grouped_mm_with_backward_fix(
     torch._grouped_mm, and on the 16-byte stride error. Bit-exact vs the always-contiguous
     path in forward and backward.
     """
+    if _triton_grouped_mm_wanted(inputs, weight):
+        return _GROUPED_MM_TRITON_OP(inputs, weight, offsets)
     if (
         inputs.dtype == torch.float16
         and weight.dtype == torch.float16
@@ -471,6 +477,144 @@ def _register_grouped_mm_fp16_op():
 
 
 _GROUPED_MM_FP16_OP = _register_grouped_mm_fp16_op()
+
+
+# Triton grouped GEMM for every MoE model (moe_grouped_fp16's kernels, bf16 / fp16 operands of one dtype).
+# Off sm90 / sm100 torch._grouped_mm is a per-expert cuBLAS loop over host offsets; one Triton launch beats it
+# while experts are small. Measured, one MoE block fwd + bwd with LoRA r=16 (Colab, torch 2.11, Triton 3.6):
+# A100 (sm80) and RTX PRO 6000 (sm120) win up to 256 rows per expert (Qwen3.5-35B-A3B 2.2-17x, Qwen3-30B-A3B
+# 1.3-10x, gpt-oss 1.2-2.9x) and lose above (Mixtral, gpt-oss at 8K tokens: 0.5-0.9x); L4 (sm89) wins up to
+# 128; T4 (sm75) has no MMA in Triton and loses everywhere. sm86 / sm90 / sm100 are unmeasured or native.
+_TRITON_GROUPED_MM_AUTO_ROWS = {(8, 0): 256, (12, 0): 256, (8, 9): 128}
+_TRITON_GROUPED_MM_CAPABILITY = {}
+
+
+def _triton_grouped_mm_capability(index):
+    cap = _TRITON_GROUPED_MM_CAPABILITY.get(index)
+    if cap is None:
+        cap = _TRITON_GROUPED_MM_CAPABILITY[index] = tuple(torch.cuda.get_device_capability(index))
+    return cap
+
+
+@_assume_constant_result
+def _triton_grouped_mm_max_rows(index):
+    """Average rows per expert up to which the Triton grouped GEMM runs on CUDA device `index`:
+    0 = off, -1 = no limit. UNSLOTH_MOE_GROUPED_TRITON=auto (default: the measured table), 1 (any
+    sm80+ CUDA GPU), 0 (off); UNSLOTH_DISABLE_MOE_TRITON=1 also turns it off;
+    UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS overrides the limit. Evaluated eagerly (and baked in) under
+    torch.compile: no capability probe or environment read inside a trace."""
+    mode = os.environ.get("UNSLOTH_MOE_GROUPED_TRITON", "auto").strip().lower()
+    if mode in ("0", "false", "off") or os.environ.get("UNSLOTH_DISABLE_MOE_TRITON", "0") == "1":
+        return 0
+    if torch.version.hip is not None or _GROUPED_MM_TRITON_OP is None or index is None:
+        return 0
+    try:
+        from unsloth_zoo.temporary_patches.moe_grouped_fp16 import triton as _triton
+        if _triton is None:
+            return 0
+        cap = _triton_grouped_mm_capability(index)
+    except Exception:
+        return 0
+    if mode in ("1", "true", "on"):
+        limit = -1 if cap >= (8, 0) else 0
+    else:
+        limit = _TRITON_GROUPED_MM_AUTO_ROWS.get(cap, 0)
+    override = os.environ.get("UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS")
+    if limit != 0 and override:
+        try:
+            limit = int(override)
+        except ValueError:
+            pass
+    return limit
+
+
+def _triton_grouped_mm_wanted(inputs, weight) -> bool:
+    """Static gate (shapes, dtypes, device, cached policy; never the offsets' values): torch._grouped_mm(inputs
+    [M, K], weight [E, K, N]) runs as unsloth_zoo::grouped_mm_triton when M <= limit * E."""
+    if _GROUPED_MM_TRITON_OP is None or inputs.dim() != 2 or weight.dim() != 3:
+        return False
+    dtype = inputs.dtype
+    if weight.dtype != dtype or (dtype != torch.bfloat16 and dtype != torch.float16):
+        return False
+    device = inputs.device
+    if device.type != "cuda" or weight.device != device:
+        return False
+    E = weight.shape[0]
+    if E == 0 or inputs.shape[1] != weight.shape[1] or weight.shape[2] == 0:
+        return False
+    limit = _triton_grouped_mm_max_rows(device.index)
+    if limit == 0:
+        return False
+    return limit < 0 or inputs.shape[0] <= limit * E
+
+
+def _grouped_mm_triton_impl(inputs, weight, offsets):
+    from unsloth_zoo.temporary_patches import moe_grouped_fp16 as mg
+    if not mg.triton_grouped_available(inputs.device):
+        mg.GENERIC_CALLS["fallback"] += 1
+        return _grouped_mm_eager(inputs, weight, offsets).contiguous()
+    counts = torch.diff(offsets, prepend = offsets.new_zeros(1))
+    return mg.generic_grouped_mm(inputs, weight, counts)
+
+
+def _grouped_mm_triton_wgrad_impl(inputs, grad, offsets):
+    from unsloth_zoo.temporary_patches import moe_grouped_fp16 as mg
+    if not mg.triton_grouped_available(inputs.device):
+        mg.GENERIC_CALLS["fallback"] += 1
+        return _grouped_mm_fp16_wgrad_eager(inputs, grad, offsets).contiguous()
+    counts = torch.diff(offsets, prepend = offsets.new_zeros(1))
+    return mg.generic_grouped_wgrad(inputs, grad, counts, offsets.shape[0])
+
+
+def _register_grouped_mm_triton_op():
+    """torch._grouped_mm(inputs [M, K], weight [E, K, N], offs = cumulative int32 ends) on moe_grouped_fp16's
+    Triton kernels, as an opaque op so compiled MoE frames trace it (its autograd.Function does not).
+    Counts come from the offsets on device: no host sync. Rows past offs[-1] are left unwritten, as
+    torch._grouped_mm leaves them. Registered once per process (the compiled-cache copy reuses it)."""
+    if not hasattr(torch, "library") or not hasattr(torch.library, "custom_op"):
+        return None
+    try:
+        return torch.ops.unsloth_zoo.grouped_mm_triton.default
+    except (AttributeError, RuntimeError):
+        pass
+    try:
+        @torch.library.custom_op("unsloth_zoo::grouped_mm_triton", mutates_args = ())
+        def grouped_mm_triton(inputs: torch.Tensor, weight: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+            return _grouped_mm_triton_impl(inputs, weight, offsets)
+
+        @grouped_mm_triton.register_fake
+        def _(inputs, weight, offsets):
+            return inputs.new_empty((inputs.shape[0], weight.shape[-1]))
+
+        @torch.library.custom_op("unsloth_zoo::grouped_mm_triton_wgrad", mutates_args = ())
+        def grouped_mm_triton_wgrad(inputs: torch.Tensor, grad: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+            return _grouped_mm_triton_wgrad_impl(inputs, grad, offsets)
+
+        @grouped_mm_triton_wgrad.register_fake
+        def _(inputs, grad, offsets):
+            return inputs.new_empty((offsets.shape[0], inputs.shape[1], grad.shape[1]))
+
+        def _setup_context(ctx, inputs, output):
+            x, w, offs = inputs
+            # Only what each gradient reads: a frozen base keeps no activation alive for a dW it never takes.
+            ctx.save_for_backward(x if w.requires_grad else None, w if x.requires_grad else None, offs)
+
+        def _backward(ctx, grad):
+            x, w, offs = ctx.saved_tensors
+            gx = gw = None
+            if ctx.needs_input_grad[0]:
+                gx = torch.ops.unsloth_zoo.grouped_mm_triton(grad, w.transpose(-2, -1), offs)
+            if ctx.needs_input_grad[1]:
+                gw = torch.ops.unsloth_zoo.grouped_mm_triton_wgrad(x, grad, offs)
+            return gx, gw, None
+
+        grouped_mm_triton.register_autograd(_backward, setup_context = _setup_context)
+        return torch.ops.unsloth_zoo.grouped_mm_triton.default
+    except Exception:
+        return None
+
+
+_GROUPED_MM_TRITON_OP = _register_grouped_mm_triton_op()
 
 
 def _grouped_matmul_loop(inputs, weight, offsets, bounds = None):
@@ -2846,10 +2990,6 @@ def _forward_statically_reads_stash(experts_module):
 
 # Dynamo calls this eagerly and bakes in the bool: tracing the scan itself graph-breaks (torch 2.11) or
 # raises under fullgraph once a forward's globals hold an lru_cache wrapper Dynamo cannot getattr through.
-_assume_constant_result = getattr(torch.compiler, "assume_constant_result", None) or \
-    getattr(torch._dynamo, "assume_constant_result", lambda fn: fn)
-
-
 @_assume_constant_result
 def _code_reaches_stash(forward):
     # This Unsloth Zoo code section is licensed under AGPL3

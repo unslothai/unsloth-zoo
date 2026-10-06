@@ -32,7 +32,8 @@ Backends: Triton lowers tl.dot to CUDA-core FMA on sm75 (T4: no mma.sync in the 
 TFLOPs against cuBLAS's ~43), so below sm80 the same calls run per-expert cuBLAS GEMMs over
 host row counts read once per MoE layer (`host` / Groups), fp16 operands with an fp32 output
 through torch.mm(out_dtype=float32) where torch has it. UNSLOTH_GPTOSS_FP16_GEMM=triton|cublas
-overrides the choice."""
+overrides the choice (backend=None); backend="triton" forces the kernel, which the generic MoE
+path (moe_utils, any bf16 / fp16 expert stack) uses on the GPUs its own gate picks."""
 
 __all__ = [
     "Groups",
@@ -42,6 +43,7 @@ __all__ = [
     "grouped_linear",
     "grouped_frozen_linear",
     "fp16_grouped_available",
+    "triton_grouped_available",
     "row_pow2_scale",
 ]
 
@@ -58,6 +60,8 @@ except Exception:  # pragma: no cover
 
 _DISABLED_REASON = None
 CALLS = {"gemm": 0, "wgrad": 0}
+# Generic MoE path (moe_utils.grouped_mm_triton): kernel launches, and self-check fallbacks to torch._grouped_mm.
+GENERIC_CALLS = {"gemm": 0, "wgrad": 0, "fallback": 0}
 
 # A operand handling when x is fp32 and w is fp16 / bf16.
 A_DIRECT, A_CAST, A_SPLIT = 0, 1, 2
@@ -325,12 +329,18 @@ def row_pow2_scale(t, target_exp = 15):
     return torch.ldexp(torch.ones_like(amax), (target_exp - ex)).contiguous()
 
 
+def _cublas_backend(device, backend):
+    # None: the measured gpt-oss choice (use_cublas); "triton" / "cublas" force one.
+    return use_cublas(device) if backend is None else backend == "cublas"
+
+
 def grouped_gemm(a, b, counts, out_dtype, *, b_trans, e_lo = 0, e_hi = None, num_experts = None,
-                 out = None, a_mode = None, row_scale = None, bias = None, config = None):
+                 out = None, a_mode = None, row_scale = None, bias = None, config = None, backend = None):
     """out[m] = a[m] @ (b[e - e_lo].T if b_trans else b[e - e_lo]) for rows of experts in [e_lo, e_hi).
 
     a: [M, K] rows sorted by expert; b: [E', N, K] (b_trans) or [E', K, N]; counts: [E] rows per
-    expert on device. Rows outside the window are not written (pass `out` across windows)."""
+    expert on device. Rows outside the window are not written (pass `out` across windows).
+    backend: None picks per device (use_cublas), "triton" / "cublas" force one."""
     M, K = a.shape
     E = int(num_experts if num_experts is not None else _counts_tensor(counts).numel())
     e_hi = E if e_hi is None else int(e_hi)
@@ -351,7 +361,7 @@ def grouped_gemm(a, b, counts, out_dtype, *, b_trans, e_lo = 0, e_hi = None, num
     ieee = a.dtype == torch.float32 and b.dtype == torch.float32
     if a_mode == A_DIRECT and a.dtype != b.dtype:
         raise TypeError(f"grouped_gemm: {a.dtype} x {b.dtype} needs a_mode cast / split")
-    if use_cublas(a.device):
+    if _cublas_backend(a.device, backend):
         with torch.autocast(device_type = a.device.type, enabled = False):
             _gemm_cublas(a, b, counts, out_dtype, b_trans, int(e_lo), e_hi, out, a_mode, row_scale, bias)
         CALLS["gemm"] += 1
@@ -373,29 +383,37 @@ def grouped_gemm(a, b, counts, out_dtype, *, b_trans, e_lo = 0, e_hi = None, num
     return out
 
 
-def grouped_wgrad(g, x, counts, out_dtype, num_experts = None):
-    """dw[e] = g[rows of e].T @ x[rows of e] -> [E, N, K]; zeros for an expert with no rows."""
+def grouped_wgrad(g, x, counts, out_dtype, num_experts = None, backend = None, config = None):
+    """dw[e] = g[rows of e].T @ x[rows of e] -> [E, N, K]; zeros for an expert with no rows.
+    backend as in grouped_gemm; config = (BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages)."""
     assert g.dtype == x.dtype and g.stride(1) == 1 and x.stride(1) == 1
     M, N = g.shape
     K = x.shape[1]
     E = int(num_experts if num_experts is not None else _counts_tensor(counts).numel())
-    if use_cublas(g.device):
+    if _cublas_backend(g.device, backend):
         CALLS["wgrad"] += 1
         with torch.autocast(device_type = g.device.type, enabled = False):
             return _wgrad_cublas(g, x, counts, out_dtype, E)
     counts = _counts_tensor(counts)
     dw = torch.empty((E, N, K), dtype = out_dtype, device = g.device)
     ieee = g.dtype == torch.float32
-    BM = 32
-    BN = max(16, min(64, _pow2(N)))
-    BK = max(16, min(64, _pow2(K)))
-    stages = 2 if _capability(g.device) < (8, 0) else 3
+    if config is not None:
+        BM, BN, BK, warps, stages = config
+    else:
+        BM = 32
+        BN = max(16, min(64, _pow2(N)))
+        BK = max(16, min(64, _pow2(K)))
+        warps = 4
+        stages = 2 if _capability(g.device) < (8, 0) else 3
+    if E == 0 or N == 0 or K == 0:
+        CALLS["wgrad"] += 1
+        return dw.zero_()
     with _on(g.device):
         _grouped_wgrad_kernel[(E, -(-N // BN), -(-K // BK))](
             g, x, dw, counts, E, N, K,
             g.stride(0), x.stride(0), dw.stride(0), dw.stride(1), dw.stride(2),
             IEEE = ieee, E_POW2 = _pow2(max(E, 2)), BLOCK_M = BM, BLOCK_N = BN, BLOCK_K = BK,
-            num_warps = 4, num_stages = stages,
+            num_warps = warps, num_stages = stages,
         )
     CALLS["wgrad"] += 1
     return dw
@@ -563,3 +581,115 @@ def unavailable_reason():
     if torch.version.hip is not None:
         return "float16 grouped GEMM is CUDA-only"
     return "float16 grouped GEMM unavailable on this device"
+
+
+# Generic MoE path (moe_utils.grouped_mm_triton): torch._grouped_mm semantics on bf16 / fp16 operands of one dtype.
+
+
+def generic_gemm_config(M, E, N, K, device):
+    """Tile config for the generic forward / dX GEMM, or None for _gemm_config's (the gpt-oss tiles)."""
+    return None
+
+
+def generic_wgrad_config(M, E, N, K, device):
+    """Tile config for the generic dW reduction, or None for grouped_wgrad's default."""
+    return None
+
+
+def generic_grouped_mm(inputs, weight, counts):
+    """out[m] = inputs[m] @ weight[e(m)]; inputs [M, K] (any strides), weight [E, K, N] (any strides,
+    a transposed [E, N, K] view included), counts [E] rows per expert on device. Rows past sum(counts)
+    are not written, as torch._grouped_mm leaves them."""
+    M, K = inputs.shape
+    E, _, N = weight.shape
+    config = generic_gemm_config(M, E, N, K, inputs.device)
+    out = grouped_gemm(inputs, weight, counts, inputs.dtype, b_trans = False, num_experts = E,
+                       config = config, backend = "triton")
+    GENERIC_CALLS["gemm"] += 1
+    return out
+
+
+def generic_grouped_wgrad(inputs, grad, counts, num_experts):
+    """dW[e] = inputs[rows of e].T @ grad[rows of e] -> [E, K, N]; zeros for an empty expert."""
+    inputs = inputs if inputs.stride(-1) == 1 else inputs.contiguous()
+    grad = grad if grad.stride(-1) == 1 else grad.contiguous()
+    M, K = inputs.shape
+    N = grad.shape[1]
+    config = generic_wgrad_config(M, num_experts, K, N, inputs.device)
+    dw = grouped_wgrad(inputs, grad, counts, inputs.dtype, num_experts = num_experts,
+                       backend = "triton", config = config)
+    GENERIC_CALLS["wgrad"] += 1
+    return dw
+
+
+_GENERIC_DISABLED_REASON = None
+_GENERIC_SELF_CHECKED = {}
+
+
+def _self_check_generic(device):
+    """bf16 and fp16, weight as a transposed [E, K, N] view, an empty expert, tails on every dim:
+    forward, dX and dW against fp64. Raises on any mismatch."""
+    g = torch.Generator(device = "cpu").manual_seed(0)
+    E, N, K = 4, 40, 24
+    counts = torch.tensor([5, 0, 19, 3], dtype = torch.int32, device = device)
+    M = int(counts.sum())
+    e_of = torch.repeat_interleave(torch.arange(E), counts.cpu().long()).to(device)
+    w_nk = (torch.randn(E, N, K, generator = g) * 0.1).to(device)
+    x = torch.randn(M, K, generator = g).to(device)
+    dy = torch.randn(M, N, generator = g).to(device)
+    w64 = w_nk.double()[e_of]
+    ref_y = torch.einsum("mk,mnk->mn", x.double(), w64)
+    ref_dx = torch.einsum("mn,mnk->mk", dy.double(), w64)
+    ref_dw = torch.stack([x.double()[e_of == e].T @ dy.double()[e_of == e] for e in range(E)])
+    for dtype, tol in ((torch.bfloat16, 2e-2), (torch.float16, 4e-3)):
+        w = w_nk.to(dtype)
+        y = generic_grouped_mm(x.to(dtype), w.transpose(-2, -1), counts).double()
+        dx = generic_grouped_mm(dy.to(dtype), w, counts).double()
+        dw = generic_grouped_wgrad(x.to(dtype), dy.to(dtype), counts, E).double()
+        for name, got, ref in (("forward", y, ref_y), ("dX", dx, ref_dx), ("dW", dw, ref_dw)):
+            if got.shape != ref.shape or not torch.isfinite(got).all() or \
+                    (got - ref).abs().max().item() > tol * max(ref.abs().max().item(), 1.0):
+                raise RuntimeError(
+                    f"generic grouped GEMM self-check {dtype} {name}: "
+                    f"{(got - ref).abs().max().item() if got.shape == ref.shape else tuple(got.shape)}"
+                )
+    if dw[1].abs().max().item() != 0:
+        raise RuntimeError("generic grouped GEMM self-check: dW of an empty expert is not zero")
+
+
+def triton_grouped_available(device) -> bool:
+    """The generic Triton grouped GEMM passed its self-check on this device (checked once per device).
+    A failure is logged once and disables the generic path for the process; OOM propagates."""
+    global _GENERIC_DISABLED_REASON
+    if (
+        triton is None
+        or _GENERIC_DISABLED_REASON is not None
+        or getattr(device, "type", None) != "cuda"
+        or torch.version.hip is not None
+        or os.environ.get("TRITON_INTERPRET", "0") == "1"
+    ):
+        return False
+    key = device.index
+    ok = _GENERIC_SELF_CHECKED.get(key)
+    if ok is None:
+        saved = dict(CALLS), dict(GENERIC_CALLS)
+        try:
+            with torch.cuda.device(device):
+                _self_check_generic(device)
+            ok = True
+        except Exception as exc:
+            if isinstance(exc, torch.OutOfMemoryError):
+                raise
+            _GENERIC_DISABLED_REASON = f"{type(exc).__name__}: {exc}"
+            import logging
+            logging.getLogger(__name__).warning(
+                "Unsloth: the Triton grouped MoE GEMM failed its self-check and is disabled for this "
+                f"process; torch._grouped_mm is used instead. Reason: {_GENERIC_DISABLED_REASON}"
+            )
+            ok = False
+        finally:
+            # The self-check's own launches are not engagement.
+            CALLS.update(saved[0])
+            GENERIC_CALLS.update(saved[1])
+        _GENERIC_SELF_CHECKED[key] = ok
+    return ok
