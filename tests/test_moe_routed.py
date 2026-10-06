@@ -1097,3 +1097,244 @@ def test_non_per_expert_stash_keeps_the_current_path():
         _stash(ex, (gu, dn))
         assert MR.routed_moe_forward(ex, x, idx, w) is not None
     _stash(ex, None)
+
+
+def _bf16_inputs(act, T, seed, lora, bias, e = E, h = H, i = I, top_k = 4):
+    ex = _make(act, quant = False, seed = seed, h = h, i = i, e = e)
+    _, code, interleaved = ACTS[act]
+    x, idx, w = _route(T, top_k = top_k, seed = seed, e = e, h = h)
+    lo = _lora(ex, seed = seed) if lora else None
+    if lora and act != "gptoss":
+        # A strided (transposed) LoRA B: the fused epilogue reads it by stride, no copy.
+        f, s, sc, n = lo[1]
+        lo = (lo[0], (f, s.transpose(1, 2).contiguous().transpose(1, 2), sc, n))
+    if bias and act != "gptoss":
+        g = torch.Generator().manual_seed(seed + 11)
+        ex.gate_up_proj_bias = nn.Parameter((torch.randn(e, 2 * i, generator = g) * 0.1).to(DT).to(DEV), requires_grad = False)
+        ex.down_proj_bias = nn.Parameter((torch.randn(e, h, generator = g) * 0.1).to(DT).to(DEV), requires_grad = False)
+    args = (x, idx, w, ex.gate_up_proj.transpose(1, 2), ex.down_proj.transpose(1, 2),
+            getattr(ex, "gate_up_proj_bias", None), getattr(ex, "down_proj_bias", None), code, interleaved,
+            [lo[0][:3]] if lora else (), [lo[1][:3]] if lora else ())
+    return ex, lo, args
+
+
+@pytest.mark.parametrize("act", list(ACTS))
+@pytest.mark.parametrize("lora", [False, True])
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("T", [1, 3, 8])
+def test_fused_epilogues_match_reference(act, lora, bias, T, monkeypatch):
+    # Fused split-K / bias / LoRA B / act / routing-weight / top-k epilogues vs the torch glue they replace.
+    gots, curs, refs = [], [], []
+    for seed in SEEDS:
+        ex, lo, args = _bf16_inputs(act, T, seed, lora, bias)
+        x, idx, w = args[:3]
+        refs.append(_ref(ex, act, x, idx, w, lo))
+        with torch.no_grad():
+            monkeypatch.setenv("UNSLOTH_MOE_ROUTED_FUSED", "1")
+            got = MR.routed_bf16_moe(*args, out_dtype = torch.float32)
+            assert torch.equal(got, MR.routed_bf16_moe(*args, out_dtype = torch.float32))  # deterministic
+            assert MR.routed_bf16_moe(*args).dtype == DT
+            monkeypatch.setenv("UNSLOTH_MOE_ROUTED_FUSED", "0")
+            curs.append(MR.routed_bf16_moe(*args, out_dtype = torch.float32))
+        gots.append(got)
+    _check_vs_current(gots, curs, refs, max_factor = 1.25)
+
+
+def test_fused_epilogues_engage_and_kill_switch(monkeypatch):
+    calls = []
+    for name in ("_gate_up_act_launch", "_down_sum_launch"):
+        real = getattr(MR, name)
+        monkeypatch.setattr(MR, name, lambda *a, _r = real, **k: calls.append(1) or _r(*a, **k))
+    _, _, args = _bf16_inputs("silu", 2, 1, True, True)
+    with torch.no_grad():
+        monkeypatch.setenv("UNSLOTH_MOE_ROUTED_FUSED", "0")
+        MR.routed_bf16_moe(*args)
+        assert not calls
+        monkeypatch.setenv("UNSLOTH_MOE_ROUTED_FUSED", "1")
+        MR.routed_bf16_moe(*args)
+        assert len(calls) == 2
+        # Two adapters on one projection: the glue path sums both terms.
+        two = list(args)
+        two[9] = [args[9][0], args[9][0]]
+        MR.routed_bf16_moe(*two)
+        assert len(calls) == 2
+
+
+@pytest.mark.parametrize("lora", [False, True])
+@pytest.mark.parametrize("act", ["gptoss", "gelu"])
+def test_fused_epilogues_fullgraph_and_cuda_graph(act, lora, monkeypatch):
+    monkeypatch.setenv("UNSLOTH_MOE_ROUTED_FUSED", "1")
+    _, _, args = _bf16_inputs(act, 4, 1, lora, True)
+    rest = args[3:]
+    f = lambda x, idx, w: MR.routed_bf16_moe(x, idx, w, *rest, out_dtype = torch.float32)
+    torch._dynamo.reset()
+    from torch._dynamo.utils import counters
+    counters.clear()
+    graphs = []
+
+    def backend(gm, inputs):
+        graphs.append(gm.code)
+        return gm.forward
+
+    with torch.no_grad():
+        eager = f(*args[:3])
+        compiled = torch.compile(f, fullgraph = True, backend = backend)(*args[:3])
+        inductor = torch.compile(f, fullgraph = True)(*args[:3])
+    assert sum(counters["graph_break"].values()) == 0
+    fused = any("routed_bf16_gate_up_act" in c and "routed_bf16_down_sum" in c for c in graphs)
+    # Without LoRA a compiled call keeps the glue for Inductor to fuse; with LoRA it takes the fused ops.
+    assert fused == bool(lora)
+    if lora:
+        torch.testing.assert_close(compiled, eager, rtol = 1e-5, atol = 1e-5)
+    torch.testing.assert_close(compiled, eager, rtol = 2e-2, atol = 2e-3)
+    torch.testing.assert_close(inductor, eager, rtol = 2e-2, atol = 2e-3)
+    sx, sidx, sw = (t.clone() for t in args[:3])
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.no_grad(), torch.cuda.stream(s):
+        for _ in range(2):
+            f(sx, sidx, sw)
+    torch.cuda.current_stream().wait_stream(s)
+    graph = torch.cuda.CUDAGraph()
+    with torch.no_grad(), torch.cuda.graph(graph):
+        out = f(sx, sidx, sw)
+    for seed in (5, 6):
+        x2, idx2, w2 = _route(4, seed = seed)
+        sx.copy_(x2)
+        sidx.copy_(idx2)
+        sw.copy_(w2)
+        graph.replay()
+        with torch.no_grad():
+            assert torch.equal(out, f(x2, idx2, w2)), seed
+
+
+@pytest.mark.parametrize("split", [1, 3])
+def test_fused_epilogues_take_external_lora_h(split):
+    # A separate LoRA A kernel hands over H as [P, r] (or [S, P, r] partials) fp32.
+    _, lo, args = _bf16_inputs("silu_interleaved", 4, 2, True, True)
+    x, idx, w, w_gu, w_dn, b_gu, b_dn, code, interleaved = args[:9]
+    (fa, fb, fs, _), (da, db, ds, _) = lo
+    flat = idx.reshape(-1)
+    with torch.no_grad():
+        want = MR.routed_bf16_gate_up_act(x, flat, w_gu, b_gu, fa, fb, None, fs, 4, code, interleaved)
+        h = torch.einsum("ph,phr->pr", x.double().repeat_interleave(4, 0), fa.double()[flat]).float()
+        hs = torch.stack([h / split] * split) if split > 1 else h
+        got = MR.routed_bf16_gate_up_act(x, flat, w_gu, b_gu, None, fb, hs, fs, 4, code, interleaved)
+        torch.testing.assert_close(got, want, rtol = 1e-5, atol = 1e-5)
+        want = MR.routed_bf16_down_sum(got, flat, w, w_dn, b_dn, da, db, None, ds, 4, torch.float32)
+        h = torch.einsum("pi,pir->pr", got.double(), da.double()[flat]).float()
+        got = MR.routed_bf16_down_sum(got, flat, w, w_dn, b_dn, None, db, h, ds, 4, torch.float32)
+        torch.testing.assert_close(got, want, rtol = 1e-5, atol = 1e-5)
+
+
+@pytest.mark.parametrize("top_k", [1, 3, 6])
+@pytest.mark.parametrize("lora", [False, True])
+def test_fused_epilogues_odd_top_k(top_k, lora, monkeypatch):
+    # top-k below / not a power of two: the padded top-k lanes of the down epilogue must stay masked.
+    gots, curs, refs = [], [], []
+    for seed in SEEDS:
+        ex, lo, args = _bf16_inputs("gelu", 5, seed, lora, True, top_k = top_k)
+        x, idx, w = args[:3]
+        refs.append(_ref(ex, "gelu", x, idx, w, lo))
+        with torch.no_grad():
+            monkeypatch.setenv("UNSLOTH_MOE_ROUTED_FUSED", "1")
+            gots.append(MR.routed_bf16_moe(*args, out_dtype = torch.float32))
+            monkeypatch.setenv("UNSLOTH_MOE_ROUTED_FUSED", "0")
+            curs.append(MR.routed_bf16_moe(*args, out_dtype = torch.float32))
+    _check_vs_current(gots, curs, refs, max_factor = 1.25)
+
+
+def _old_lora_delta(x_slots, idx, terms):
+    # The torch path the routed LoRA kernels replace: gather + bmm in the adapter dtype.
+    delta = None
+    for first, second, scaling in terms:
+        h = torch.bmm(x_slots.to(first.dtype)[:, None, :], first[idx])
+        d = torch.bmm(h, second[idx])[:, 0].float() * scaling
+        delta = d if delta is None else delta + d
+    return delta
+
+
+@pytest.mark.parametrize("adt", [torch.float32, torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("r", [1, 7, 16, 64])
+@pytest.mark.parametrize("K,N,row_div", [(512, 2048, 1), (704, 1408, 8), (2880, 5760, 4), (5760, 2880, 2)])
+@pytest.mark.parametrize("cfg", [None, (64, 16, 4), (256, 4, 8)])
+def test_routed_lora_a_b_match_fp64(adt, r, K, N, row_div, cfg, monkeypatch):
+    # In place [E, in, r] reads: no worse than the gather + bmm path at any rank, dtype or K tail.
+    if adt == torch.bfloat16 and not MR._bf16_supported(torch.device(DEV)):
+        pytest.skip("bf16 needs sm80+")
+    if cfg is not None:  # (BLOCK_K, BLOCK_R, num_warps): masked rank blocks, several K steps
+        monkeypatch.setattr(MR, "_LORA_A_CONFIG", cfg)
+    g = torch.Generator().manual_seed(r * K)
+    e, P = 12, 16
+    idx = torch.randint(0, e, (P,), generator = g).to(DEV)
+    x = torch.randn(P // row_div, K, generator = g).to(DT).to(DEV)
+    xs = x.repeat_interleave(row_div, 0)
+    terms = [((torch.randn(e, K, r, generator = g) * K ** -0.5).to(adt).to(DEV),
+              (torch.randn(e, r, N, generator = g) * 0.1).to(adt).to(DEV), sc) for sc in (0.5, 2.0)]
+    h_ref = torch.einsum("pk,pkr->pr", xs.double(), terms[0][0].double()[idx])
+    h = MR.routed_lora_a(x, idx, terms[0][0], row_div)
+    assert h.dtype == torch.float32 and h.shape == (P, r)
+    h_old = torch.bmm(xs.float()[:, None, :], terms[0][0][idx].float())[:, 0]
+    assert _err(h, h_ref)[0] <= 1.5 * _err(h_old, h_ref)[0] + 1e-6
+    base = torch.randn(P, N, generator = g).to(DEV)
+    ref = sum(torch.einsum("pk,pkr,prn->pn", xs.double(), f.double()[idx], s.double()[idx]) * sc for f, s, sc in terms)
+    got = MR.routed_lora_add(base, x, idx, terms, row_div)
+    old = _old_lora_delta(xs, idx, terms)
+    g_max, g_mean = _err(got - base, ref)
+    o_max, o_mean = _err(old, ref)
+    assert g_max <= 1.5 * o_max + 1e-6 and g_mean <= 1.05 * o_mean + 1e-7, (g_max, o_max, g_mean, o_mean)
+    with torch.no_grad():
+        compiled = torch.compile(lambda *a: MR.routed_lora_add(*a, row_div), fullgraph = True)
+        assert torch.equal(compiled(base, x, idx, terms), got)
+
+
+def test_routed_lora_a_reads_strided_adapters_in_place():
+    # A transposed [E, r, in] storage and a non-unit-stride x row are read without a copy.
+    g = torch.Generator().manual_seed(5)
+    e, K, r, P = 6, 200, 5, 8
+    a_t = torch.randn(e, r, K, generator = g).to(DEV)
+    a = a_t.transpose(1, 2)
+    assert not a.is_contiguous()
+    x = torch.randn(P, 2 * K, generator = g).to(DEV)[:, ::2]
+    idx = torch.randint(0, e, (P,), generator = g).to(DEV)
+    want = torch.einsum("pk,pkr->pr", x.double(), a.double()[idx])
+    torch.testing.assert_close(MR.routed_lora_a(x, idx, a).double(), want, rtol = 1e-5, atol = 1e-5)
+    b = torch.randn(e, 2 * 3, r, generator = g).to(DEV).transpose(1, 2)[:, :, ::2]  # [E, r, 3], strided
+    h = MR.routed_lora_a(x, idx, a)
+    want_b = torch.einsum("pr,prn->pn", h.double(), b.double()[idx]) * 0.5
+    torch.testing.assert_close(MR.routed_lora_b(None, h, idx, b, 0.5).double(), want_b, rtol = 1e-5, atol = 1e-5)
+
+
+def test_routed_lora_cuda_graph_reads_live_adapters():
+    # A captured graph reads the adapters in place: an in-place update shows up on replay.
+    g = torch.Generator().manual_seed(9)
+    e, K, r, N, P, top_k = 8, 256, 16, 384, 8, 4
+    first = torch.randn(e, K, r, generator = g).to(DT).to(DEV) * 0.05
+    second = torch.randn(e, r, N, generator = g).to(DT).to(DEV) * 0.05
+    x = torch.randn(P // top_k, K, generator = g).to(DT).to(DEV)
+    idx = torch.randint(0, e, (P,), generator = g).to(DEV)
+    base = torch.randn(P, N, generator = g).to(DEV)
+
+    def f():
+        return MR.routed_lora_add(base, x, idx, [(first, second, 2.0)], top_k)
+
+    with torch.no_grad():
+        compiled = torch.compile(f, fullgraph = True)
+        for fn in (f, compiled):
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                for _ in range(2):
+                    fn()
+            torch.cuda.current_stream().wait_stream(s)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                out = fn()
+            before = out.clone()
+            first.mul_(-1.5)
+            second.add_(0.01)
+            idx.copy_(torch.randint(0, e, (P,), generator = g).to(DEV))
+            graph.replay()
+            want = f()
+            assert not torch.allclose(before, want)
+            assert torch.equal(out, want)

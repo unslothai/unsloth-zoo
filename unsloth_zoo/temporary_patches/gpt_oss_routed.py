@@ -435,9 +435,10 @@ def routed_bf16_forward(experts, hidden_states, router_indices, routing_weights)
         x, idx, routing_weights, _expert_weight_3d(base.gate_up_proj), _expert_weight_3d(base.down_proj),
         base.gate_up_proj_bias, base.down_proj_bias, ACT_GPTOSS, True,
         lora.get("gate_up_proj", ()), lora.get("down_proj", ()),
-        getattr(base, "alpha", 1.702), getattr(base, "limit", 7.0), out_dtype = torch.float32,
+        # fp32 accumulation, one rounding to the output dtype (in the top-k sum kernel when fused).
+        getattr(base, "alpha", 1.702), getattr(base, "limit", 7.0), out_dtype = hidden_states.dtype,
     )
-    return out.view(shape).to(hidden_states.dtype)
+    return out.view(shape)
 
 
 def routed_mlp_forward(mlp, hidden_states, max_slots = ROUTED_MAX_SLOTS):
