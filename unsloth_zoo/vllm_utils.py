@@ -1961,7 +1961,7 @@ def vision_max_num_seqs(
     # V1 caps profiled images by the encoder budget (max_num_batched_tokens), not max_num_seqs.
     seqs = approx_max_num_seqs
     if Version(vllm_version) < Version("0.12.0"):
-        # vLLM 0.11 profiling pads each dummy image to (encoder budget, hidden_size); 0.12 pads to the image's own size.
+        # vLLM 0.11 pads each dummy image to (encoder budget, hidden_size); 0.12 to its own size.
         text_config = getattr(config, "text_config", None) or config
         hidden_size = _config_get(text_config, "hidden_size", 0) or 0
         if hidden_size:

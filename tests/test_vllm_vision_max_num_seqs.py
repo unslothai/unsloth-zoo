@@ -65,7 +65,6 @@ def test_padded_profiling_window_caps_by_kv_memory():
     assert _seqs(version = "0.11.0", kv_gb = 2.0) == 3
     assert _seqs(version = "0.11.2", kv_gb = 0.1) == 1
     assert _seqs(version = "0.11.2", kv_gb = 400.0) == 128
-    # 0.12 pads only to the image's own token count, so the total stays under the encoder budget.
     assert _seqs(version = "0.12.0", kv_gb = 2.0) == 128
 
 
