@@ -306,9 +306,7 @@ if triton is not None:
         X, IDX, A, OUT, K, ROW_DIV, stride_x, stride_ae, stride_ak, stride_ar,
         R: tl.constexpr, BLOCK_R: tl.constexpr, BLOCK_K: tl.constexpr,
     ):
-        # OUT[p, j] = x[p // ROW_DIV] @ A[idx[p], :, j] for BLOCK_R ranks j, A read in place.
-        # One program per (slot, rank block): decode reads are latency bound, so the fan-out matters
-        # more than coalescing, and every program owns whole dot products (no split-K reduction).
+        # One program per (slot, rank block): decode is latency bound, fan-out beats coalescing.
         p = tl.program_id(0)
         Ae = A + tl.load(IDX + p).to(tl.int64) * stride_ae
         x_row = X + (p // ROW_DIV).to(tl.int64) * stride_x
@@ -332,8 +330,7 @@ if triton is not None:
         HAS_BASE: tl.constexpr, HAS_PREV: tl.constexpr, R: tl.constexpr, R_PAD: tl.constexpr,
         BLOCK_N: tl.constexpr,
     ):
-        # OUT[p, n] = BASE[p, n] + (PREV[p, n] + scaling * H[p, :] @ B[idx[p], :, n]), fp32: earlier
-        # terms' deltas (PREV) are summed before the base, as one (x @ A @ B) delta would be.
+        # PREV deltas are summed before BASE, as one (x @ A @ B) delta would be.
         p = tl.program_id(0)
         n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
         nmask = n < N
@@ -683,8 +680,7 @@ _LORA_A_CONFIG = None  # tests / sweeps may force (BLOCK_K, BLOCK_R, num_warps)
 def _lora_a_config(P, K, r):
     if _LORA_A_CONFIG is not None:
         return _LORA_A_CONFIG
-    # B200, E 32-256, in 512-2880, r 7-64: ~128 programs is the sweet spot. Fewer leave the read
-    # latency bound; more re-read each 32-byte sector of A for a few ranks (L2 bound at r 64).
+    # B200 sweep (E 32-256, in 512-2880, r 7-64): ~128 programs is best.
     block_k = max(16, min(1024, triton.next_power_of_2(K)))
     block_r = max(1, min(16, triton.next_power_of_2(P * r) // 128))
     return block_k, block_r, 8 if block_k * block_r >= 8192 else 4
@@ -710,8 +706,7 @@ def _lora_b_launch(base, prev, h, idx, b, scaling):
     P, r = h.shape
     N = b.shape[2]
     r_pad = triton.next_power_of_2(r)
-    # B200, out 1024-5760, r 16, P 4-32: 64-column blocks on one warp beat wider tiles by 1.5-2.3x
-    # (more programs in flight on a latency-bound read); more warps only as the rank tile grows.
+    # B200: 64-column blocks on one warp beat wider tiles by 1.5-2.3x (latency-bound read).
     block_n, warps = _LORA_B_CONFIG or (64, max(1, min(4, r_pad // 16)))
     out = torch.empty((P, N), dtype = torch.float32, device = h.device)
     with torch.cuda.device(h.device):
@@ -991,8 +986,7 @@ if triton is not None:
         TOP_K: tl.constexpr, TOP_K_PAD: tl.constexpr, SPLIT_K: tl.constexpr, HAS_LORA: tl.constexpr,
         SPLIT_H: tl.constexpr, R: tl.constexpr, R_PAD: tl.constexpr, BLOCK: tl.constexpr,
     ):
-        # All top-k slots of token t at once (independent loads); fp32 sums in a fixed order, one store:
-        # no atomics, deterministic.
+        # Fixed-order fp32 sum, one store: no atomics, deterministic.
         t = tl.program_id(0).to(tl.int64)
         n = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
         nmask = n < N
@@ -1019,8 +1013,7 @@ if triton is not None:
 
 
 def _finalize_block(rows, n, programs):
-    # B200 sweep (decode sizes, with and without LoRA): about `programs` programs in flight is best,
-    # one warp each below 256 columns.
+    # B200 sweep: about `programs` programs in flight is best, one warp below 256 columns.
     block = max(16, min(256, triton.next_power_of_2(max(1, rows * n // programs))))
     return block, 4 if block >= 256 else 1
 
@@ -1157,8 +1150,7 @@ def routed_bf16_moe(x, idx, routing_weights, w_gu, w_dn, b_gu, b_dn, act, interl
                     gu_lora = (), dn_lora = (), alpha = 1.702, limit = 7.0, out_dtype = None):
     """[T, H] MoE output from only the routed BF16 / FP16 experts."""
     T, top_k = idx.shape
-    # Compiled without LoRA, Inductor fuses the same glue into as few launches and was 0-3% faster
-    # on B200; the fused kernels win everywhere else (eager, and LoRA under compile).
+    # Compiled without LoRA, Inductor's fused glue was 0-3% faster on B200; fused kernels win elsewhere.
     glue = torch.compiler.is_compiling() and not gu_lora and not dn_lora
     if len(gu_lora) <= 1 and len(dn_lora) <= 1 and not glue and routed_fused_enabled():
         return _routed_bf16_moe_fused(
@@ -1176,7 +1168,6 @@ def routed_bf16_moe(x, idx, routing_weights, w_gu, w_dn, b_gu, b_dn, act, interl
     return out.to(out_dtype if out_dtype is not None else x.dtype)
 
 
-# Generic transformers v5 3D experts modules (Qwen3 MoE, Gemma 4, Mixtral, ...).
 
 def _semantics(experts):
     """Everything besides the weights that _act_code / the plans read; compared on every reuse."""
@@ -1246,8 +1237,7 @@ def _nf4_table(param, device):
         return None
     E, N, K = (int(s) for s in shape)
     blocksize = int(qs.blocksize)
-    # Blocks must not straddle a row, and expert e's rows start at row e * N of the flat buffer:
-    # packed bytes e*N*K/2, absmax e*N*K/blocksize, state2 absmax (e*N*K/blocksize)/blocksize2.
+    # Blocks must not straddle a row; expert e's rows start at row e * N of the flat buffer.
     if blocksize not in (32, 64, 128, 256, 512, 1024) or K % blocksize != 0 or N % 2 != 0:
         return None
     packed = param.data
@@ -1390,8 +1380,7 @@ def _build_stacked_nf4(experts, hidden_dim):
     }
 
 
-# Dynamo before torch 2.10 traces Params4bit as a plain object (no .detach / .view), so compiled
-# NF4 calls keep the current path there.
+# Dynamo before torch 2.10 cannot trace Params4bit, so compiled NF4 keeps the current path there.
 _LIVE_QUANT = tuple(int(v) for v in torch.__version__.split("+")[0].split(".")[:2]) >= (2, 10)
 
 

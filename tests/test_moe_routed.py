@@ -321,7 +321,7 @@ def test_ineligible_calls_fall_back(monkeypatch):
         ex = _make("silu")
         ex.act_fn = nn.ReLU()
         assert MR.routed_moe_forward(ex, x, idx, w) is None
-        assert any("ReLU" in reason for _, reason in MR._DECLINED)  # census of skipped families
+        assert any("ReLU" in reason for _, reason in MR._DECLINED)
         ex = _make("silu")
         type(ex)._unsloth_own_apply_gate = True
         try:
@@ -610,7 +610,6 @@ def test_launches_on_the_tensors_device(quant, mode, monkeypatch):
     _check_vs_current(gots, curs, refs, 2.0 if mode == "grouped" else 1.5)
 
 
-# Real transformers experts classes, configs shrunk to kernel-friendly sizes.
 def _real_experts(kind):
     if kind == "qwen3_moe":
         from transformers.models.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig as C
@@ -901,7 +900,7 @@ def test_gpt_oss_compiled_decode_follows_an_optimizer_step(replay):
     assert graphs and not any("torch.stack(" in code or "aten.stack" in code for code in graphs), "compiled step restacks the adapters"
 
     _train_step(mlp)
-    assert _biases(mlp) == biases  # only the adapters moved, in place
+    assert _biases(mlp) == biases
 
     with torch.no_grad():
         if replay == "cuda_graph":
@@ -966,11 +965,11 @@ def test_lora_pointer_table_h_matches_fp64(dtype, r, row_div):
         pytest.skip("bf16 needs sm80+")
     torch._dynamo.reset()
     g = torch.Generator().manual_seed(r)
-    K, e = 200, 6  # K not a power of two: masked tail
+    K, e = 200, 6
     A = [(torch.randn(r, K, generator = g) * 0.1).to(dtype).to(DEV) for _ in range(e)]
     table, kind = MR.lora_pointer_table(A)
     assert table.dtype == torch.int64 and table.numel() == e and kind == MR.LORA_KINDS[dtype]
-    assert MR.lora_pointer_table(A)[0] is table  # a lookup once built
+    assert MR.lora_pointer_table(A)[0] is table
     idx = torch.tensor([5, 0, 3, 3, 1, 2, 4, 0], device = DEV)
     x = torch.randn(idx.numel() // row_div, K, generator = g).to(DEV)
     got = MR.routed_lora_h(x, idx, A, row_div)
@@ -1120,8 +1119,7 @@ def _bf16_inputs(act, T, seed, lora, bias, e = E, h = H, i = I, top_k = 4):
 
 @pytest.mark.skipif(DT != torch.bfloat16, reason = "needs a bf16 base with an fp16 adapter")
 def test_fused_mixed_dtype_down_lora_keeps_the_activation_precision(monkeypatch):
-    # bf16 base, fp16 down adapter: rounding the activation through bf16 first was ~50x the unfused
-    # error (and ~5x main's); kept in fp32 it is below main's.
+    # bf16 base, fp16 down adapter: rounding the activation through bf16 was ~50x the unfused error.
     def mean_err(fused):
         monkeypatch.setenv("UNSLOTH_MOE_ROUTED_FUSED", "1" if fused else "0")
         errs = []
@@ -1152,7 +1150,7 @@ def test_fused_epilogues_match_reference(act, lora, bias, T, monkeypatch):
         with torch.no_grad():
             monkeypatch.setenv("UNSLOTH_MOE_ROUTED_FUSED", "1")
             got = MR.routed_bf16_moe(*args, out_dtype = torch.float32)
-            assert torch.equal(got, MR.routed_bf16_moe(*args, out_dtype = torch.float32))  # deterministic
+            assert torch.equal(got, MR.routed_bf16_moe(*args, out_dtype = torch.float32))
             assert MR.routed_bf16_moe(*args).dtype == DT
             monkeypatch.setenv("UNSLOTH_MOE_ROUTED_FUSED", "0")
             curs.append(MR.routed_bf16_moe(*args, out_dtype = torch.float32))
@@ -1173,7 +1171,6 @@ def test_fused_epilogues_engage_and_kill_switch(monkeypatch):
         monkeypatch.setenv("UNSLOTH_MOE_ROUTED_FUSED", "1")
         MR.routed_bf16_moe(*args)
         assert len(calls) == 2
-        # Two adapters on one projection: the glue path sums both terms.
         two = list(args)
         two[9] = [args[9][0], args[9][0]]
         MR.routed_bf16_moe(*two)
@@ -1319,7 +1316,7 @@ def test_routed_lora_a_reads_strided_adapters_in_place():
     idx = torch.randint(0, e, (P,), generator = g).to(DEV)
     want = torch.einsum("pk,pkr->pr", x.double(), a.double()[idx])
     torch.testing.assert_close(MR.routed_lora_a(x, idx, a).double(), want, rtol = 1e-5, atol = 1e-5)
-    b = torch.randn(e, 2 * 3, r, generator = g).to(DEV).transpose(1, 2)[:, :, ::2]  # [E, r, 3], strided
+    b = torch.randn(e, 2 * 3, r, generator = g).to(DEV).transpose(1, 2)[:, :, ::2]
     h = MR.routed_lora_a(x, idx, a)
     want_b = torch.einsum("pr,prn->pn", h.double(), b.double()[idx]) * 0.5
     torch.testing.assert_close(MR.routed_lora_b(None, h, idx, b, 0.5).double(), want_b, rtol = 1e-5, atol = 1e-5)

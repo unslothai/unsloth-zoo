@@ -47,8 +47,7 @@ from .moe_routed import (
 
 
 def _mixed_adapter_batch(module):
-    # PEFT mixed-adapter batches inject adapter_names through a pre-hook on each LoRA layer;
-    # the routed kernels never call those layers, so they must leave such batches alone.
+    # Mixed-adapter batches route adapter_names via LoRA-layer pre-hooks the kernels never call.
     return any("adapter_names" in getattr(h, "keywords", ()) for h in getattr(module, "_forward_pre_hooks", {}).values())
 
 
@@ -458,8 +457,7 @@ def routed_mlp_forward(mlp, hidden_states, max_slots = ROUTED_MAX_SLOTS):
         return None
     if not nf4 and not routed_bf16_eligible(experts, hidden_states):
         return None
-    # The router takes [tokens, hidden]: transformers 5 normalizes the top-k scores with
-    # softmax(dim=1), which on a [batch, seq, k] input would run over the sequence instead.
+    # [tokens, hidden]: the router's softmax(dim=1) on [batch, seq, k] would run over the sequence.
     router_out = mlp.router(hidden_states.reshape(-1, hidden_states.shape[-1]))
     scores, indices = router_out[-2], router_out[-1]
     if nf4:
