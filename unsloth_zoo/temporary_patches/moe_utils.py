@@ -604,12 +604,21 @@ class _GroupedMMTriton(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad):
         x, w, offs = ctx.saved_tensors
+        if torch.is_grad_enabled():
+            return _grouped_mm_differentiable_backward(ctx, x, w, offs, grad)
         gx = gw = None
         if ctx.needs_input_grad[0]:
             gx = _grouped_mm_triton_impl(grad, w.transpose(-2, -1), offs)
         if ctx.needs_input_grad[1]:
             gw = _grouped_mm_triton_wgrad_impl(x, grad, offs)
         return gx, gw, None
+
+
+def _grouped_mm_differentiable_backward(ctx, x, w, offs, grad):
+    # create_graph=True: the raw kernels would detach the grads, so take torch._grouped_mm (double backward).
+    gx = _grouped_mm_eager(grad, w.transpose(-2, -1), offs) if ctx.needs_input_grad[0] else None
+    gw = _grouped_mm_fp16_wgrad_eager(x, grad, offs) if ctx.needs_input_grad[1] else None
+    return gx, gw, None
 
 
 def _triton_grouped_mm(inputs, weight, offsets):
@@ -654,6 +663,8 @@ def _register_grouped_mm_triton_op():
 
         def _backward(ctx, grad):
             x, w, offs = ctx.saved_tensors
+            if torch.is_grad_enabled():
+                return _grouped_mm_differentiable_backward(ctx, x, w, offs, grad)
             gx = gw = None
             if ctx.needs_input_grad[0]:
                 gx = torch.ops.unsloth_zoo.grouped_mm_triton(grad, w.transpose(-2, -1), offs)

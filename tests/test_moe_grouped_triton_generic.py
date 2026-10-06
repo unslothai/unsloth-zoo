@@ -608,3 +608,28 @@ def test_transformers_grouped_mm_wrapper(monkeypatch):
     xf = x.float()
     assert torch.equal(tm._grouped_mm(xf, param.transpose(-2, -1), offs), original(xf, param.transpose(-2, -1), offs))
     assert _calls() == before
+
+
+@needs_kernel
+@pytest.mark.parametrize("twin", [True, False])
+def test_double_backward_matches_torch(monkeypatch, twin):
+    """create_graph=True keeps a graph through the grads (gradient penalties, HVPs), like torch._grouped_mm."""
+    if not MU._check_torch_grouped_mm_supported():
+        pytest.skip("needs torch._grouped_mm")
+    _force_on(monkeypatch)
+    x0, param, dy, offs, _ = _problem([12, 0, 40, 7, 1], 64, 96, torch.bfloat16)
+    fn = MU._triton_grouped_mm if twin else MU._GROUPED_MM_TRITON_OP
+
+    def second(f):
+        x = x0.detach().clone().requires_grad_(True)
+        w = param.detach().clone().requires_grad_(True)
+        y = f(x, w.transpose(-2, -1), offs)
+        gx, gw = torch.autograd.grad((y.float() * dy.float()).sum(), (x, w), create_graph = True)
+        assert gx.requires_grad and gw.requires_grad
+        (gx.float().square().sum() + gw.float().square().sum()).backward()
+        return x.grad.float(), w.grad.float()
+
+    ours = second(fn)
+    ref = second(lambda a, b, o: torch._grouped_mm(a, b, offs = o))
+    for a, b in zip(ours, ref):
+        assert torch.isfinite(a).all() and (a - b).norm() <= 2e-2 * b.norm()
