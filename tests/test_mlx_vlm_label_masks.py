@@ -6082,8 +6082,9 @@ def test_restored_image_context_bound_covers_placeholder_expansion(phase):
     assert np.asarray(out["input_ids"])[0].tolist() == [1, 2, 3, 4] + [200] * 8 + [5]
 
 
+@pytest.mark.parametrize("left_padded", [False, True])
 @pytest.mark.parametrize("opaque", [False, True])
-def test_image_rescue_is_sized_by_the_affected_rows(opaque):
+def test_image_rescue_is_sized_by_the_affected_rows(opaque, left_padded):
     from unsloth_zoo.mlx import utils as u
 
     class Processor(_FakeProcessor):
@@ -6095,7 +6096,8 @@ def test_image_rescue_is_sized_by_the_affected_rows(opaque):
             ids = np.zeros((2, width), dtype=np.int32)
             mask = np.zeros_like(ids)
             for index, row in enumerate(rows):
-                ids[index, :len(row)], mask[index, :len(row)] = row, 1
+                cols = slice(width - len(row), None) if left_padded else slice(0, len(row))
+                ids[index, cols], mask[index, cols] = row, 1
             result = dict(input_ids=ids, attention_mask=mask,
                           pixel_values=np.ones((2, 3), dtype=np.float32))
             return {k: mx.array(v) for k, v in result.items()} if opaque else result

@@ -9652,11 +9652,11 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
     )
     if (any(all_images) and max_seq_length
             and _as_numpy_vlm_field(inputs, "input_ids").shape[1] >= max_seq_length):
-        full_inputs = _processor_vlm_inputs(
+        full_inputs = _right_pad_vlm_rows(_processor_vlm_inputs(
             processor, all_texts, all_images, max_seq_length,
             suffixes=all_suffixes, truncation=False, padding_side="right",
             all_audio=all_audio,
-        )
+        ), processor)
         required = _image_span_expansion_required(
             full_inputs, inputs,
             _image_truncation_token_ids(processor, ignore_token_ids), max_seq_length,
