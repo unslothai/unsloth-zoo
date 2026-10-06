@@ -5890,6 +5890,7 @@ def _prepare_labeled_text_dataset(
             isinstance(source, list) and not _looks_like_mlx_chat_messages(source)
         ) else [source]
         for row in sources:
+            _validate_mlx_image_input(tokenizer, _row_has_images(row))
             tokenized = _tokenize_mlx_prompt_completion_row(
                 tokenizer,
                 row,
@@ -12209,6 +12210,7 @@ def _prepare_dataset(dataset, tokenizer, dataset_text_field="text",
     for item in dataset:
         if formatting_func is not None:
             result = formatting_func(item)
+            _validate_mlx_image_input(tokenizer, _row_has_images(result))
             texts = collect_mlx_texts(
                 tokenizer, result, dataset_text_field=dataset_text_field,
                 is_vlm=False,
@@ -12992,6 +12994,7 @@ def _iter_tokenized_text_rows(dataset, tokenizer, dataset_text_field="text",
     for item in dataset:
         if formatting_func is not None:
             item = formatting_func(item)
+            _validate_mlx_image_input(tokenizer, _row_has_images(item))
         texts = collect_mlx_texts(
             tokenizer,
             item,

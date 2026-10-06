@@ -6232,3 +6232,17 @@ def test_text_wrapper_generate_ignores_empty_media_containers(media):
         with pytest.raises(expected) as raised:
             loader._mlx_generate_vlm(model, input_ids=[[1, 2]], **media)
     assert ("no vision path" in str(raised.value)) == bool(any(media.values()))
+
+
+def test_text_wrapper_rejects_images_added_by_an_eager_formatter():
+    from unsloth_zoo.mlx import utils as u
+
+    tokenizer = _FakeTokenizer()
+    tokenizer._unsloth_supports_images = False
+    tokenizer._unsloth_modality_model_type = "text_wrapper"
+    with pytest.raises(ValueError, match="`text_wrapper` has no vision path"):
+        u._prepare_labeled_text_dataset(
+            [{"image_path": "cat.png"}], tokenizer,
+            formatting_func=lambda row: {"prompt": "p", "completion": "c",
+                                         "images": [row["image_path"]]},
+        )
