@@ -102,3 +102,30 @@ def test_load_vllm_routes_vision_models_through_the_rule():
         and node.func.id == "vision_max_num_seqs"
     ]
     assert len(calls) == 1, "load_vllm does not call vision_max_num_seqs"
+
+
+def _engine_max_num_seqs(monkeypatch, float8_kv_cache):
+    import torch
+    transformers = pytest.importorskip("transformers")
+    if not hasattr(transformers, "Qwen2_5_VLConfig"):
+        pytest.skip("Qwen2_5_VLConfig needs a newer transformers")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (9, 0))
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda *a, **k: True)
+    monkeypatch.setattr(vllm_utils, "get_mem_info", lambda: (179 * 1024**3, 180 * 1024**3))
+    config = transformers.Qwen2_5_VLConfig(
+        text_config = dict(hidden_size = 1024, intermediate_size = 2048, num_hidden_layers = 4,
+                           num_attention_heads = 8, num_key_value_heads = 2),
+        vision_config = dict(depth = 2, hidden_size = 256, out_hidden_size = 1024),
+    )
+    args = vllm_utils.load_vllm(
+        model_name = "unsloth/Qwen2.5-VL-3B-Instruct", config = config, max_seq_length = 2048,
+        gpu_memory_utilization = 0.9, use_bitsandbytes = False, is_vision_model = True,
+        return_args = True, dtype = torch.bfloat16, float8_kv_cache = float8_kv_cache,
+    )
+    return args["max_num_seqs"]
+
+
+@pytest.mark.parametrize("float8_kv_cache", [False, True])
+def test_the_vision_cap_holds_after_the_float8_bump(monkeypatch, float8_kv_cache):
+    monkeypatch.setenv("UNSLOTH_VLLM_VISION_MAX_NUM_SEQS", "32")
+    assert _engine_max_num_seqs(monkeypatch, float8_kv_cache) == 32

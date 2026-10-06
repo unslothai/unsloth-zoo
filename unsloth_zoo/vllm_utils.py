@@ -3245,6 +3245,7 @@ def load_vllm(
         elif memory_left_for_kv_cache_gb <= 80: max_num_batched_tokens, approx_max_num_seqs = 8192, 128 # + 16
         elif memory_left_for_kv_cache_gb >  80: max_num_batched_tokens, approx_max_num_seqs = 8192, 256 # + 16
 
+        vision_seq_cap = None
         if is_vision_model:
             # One image is ~6404 tokens (Llama 3.2) / ~16Ki (qwen 2.5 VL); leave room for text.
             max_num_batched_tokens = max(8192, max_seq_length)
@@ -3255,6 +3256,7 @@ def load_vllm(
             if max_num_seqs not in (None, 256):
                 print(f'Unsloth: Vision model detected, honoring max_num_seqs = {max_num_seqs}')
             else:
+                vision_seq_cap = approx_max_num_seqs
                 print(f'Unsloth: Vision model detected, setting approx_max_num_seqs to {approx_max_num_seqs}')
 
         # vLLM only rejects a budget under max_model_len when it cannot chunk. A
@@ -3268,6 +3270,9 @@ def load_vllm(
         # Scale num_seqs by conservativeness
         approx_max_num_seqs = int(approx_max_num_seqs * conservativeness)
         approx_max_num_seqs = max(approx_max_num_seqs, 1)
+        # The vision bounds and UNSLOTH_VLLM_VISION_MAX_NUM_SEQS hold after the float8 bump.
+        if vision_seq_cap is not None:
+            approx_max_num_seqs = min(approx_max_num_seqs, vision_seq_cap)
 
         # Check max RAM usage for vLLM (swap space) default is 4GB
         memory = psutil.virtual_memory()
