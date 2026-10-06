@@ -115,6 +115,24 @@ def test_release_keeps_entries_another_compilation_added_meanwhile():
     assert any(getattr(hook, "__self__", None) is other for hook in convert_frame._bytecode_hooks.values())
 
 
+class _FakeVllmBackend:
+    __module__ = "vllm.compilation.backends"
+
+    def __call__(self, gm, example_inputs):
+        return gm.forward
+
+
+def test_release_unwraps_the_torch_compile_backend_wrapper():
+    torch = pytest.importorskip("torch")
+    snapshot = vllm_utils._snapshot_dynamo_engine_registries()
+    compiled = torch.compile(lambda x: x * 2, backend = _FakeVllmBackend())
+    compiled(torch.ones(2))
+    added = set(eval_frame.cached_backends) - snapshot[0][1]
+    assert added, "torch.compile did not register its backend"
+    vllm_utils._release_failed_vllm_engine(snapshot)
+    assert not (added & set(eval_frame.cached_backends))
+
+
 def test_load_vllm_releases_before_each_retry_outside_the_except_block():
     tree = ast.parse(textwrap.dedent(inspect.getsource(vllm_utils.load_vllm)))
     loops = [node for node in ast.walk(tree) if isinstance(node, ast.While)

@@ -2905,7 +2905,11 @@ pass
 
 def _is_vllm_registry_entry(value):
     # Only vLLM's own entries: another thread may compile while the engine starts.
-    value = getattr(value, "_torchdynamo_orig_backend", value)
+    # torch.compile stores a torch._TorchCompileWrapper whose compiler_fn is the backend.
+    for _ in range(4):
+        inner = getattr(value, "_torchdynamo_orig_backend", None) or getattr(value, "compiler_fn", None)
+        if inner is None or inner is value: break
+        value = inner
     owner = getattr(value, "__self__", value)
     return type(owner).__module__.split(".", 1)[0] == "vllm"
 pass
