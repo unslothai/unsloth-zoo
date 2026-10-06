@@ -6210,3 +6210,25 @@ def test_text_wrapper_rejects_images_added_by_a_streaming_formatter():
     )
     with pytest.raises(ValueError, match="`text_wrapper` has no vision path"):
         list(rows)
+
+
+@pytest.mark.parametrize("media", [{"images": []}, {"videos": ()}, {"images": ["cat.png"]}])
+def test_text_wrapper_generate_ignores_empty_media_containers(media):
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx import loader
+
+    class _ReachedGeneration(Exception):
+        pass
+
+    def fake_stream_generate(*args, **kwargs):
+        raise _ReachedGeneration
+
+    model = SimpleNamespace(_processor="processor", _tokenizer="tokenizer", _is_vlm_model=True,
+                            _unsloth_supports_images=False,
+                            _unsloth_modality_model_type="text_wrapper")
+    expected = (_ReachedGeneration, Exception) if not any(media.values()) else ValueError
+    with mock.patch.dict("sys.modules",
+                         {"mlx_vlm": SimpleNamespace(stream_generate=fake_stream_generate)}):
+        with pytest.raises(expected) as raised:
+            loader._mlx_generate_vlm(model, input_ids=[[1, 2]], **media)
+    assert ("no vision path" in str(raised.value)) == bool(any(media.values()))

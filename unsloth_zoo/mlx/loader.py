@@ -7009,12 +7009,8 @@ def _mlx_generate_vlm(self, *args, **kwargs):
                 "not both."
             )
     inputs.update(kwargs)
-    from .utils import _validate_mlx_image_input
-    _validate_mlx_image_input(self, any(
-        inputs.get(key) is not None for key in (
-            "image", "images", "pixel_values", "video", "videos", "pixel_values_videos",
-        )
-    ))
+    from .utils import _row_has_images, _validate_mlx_image_input
+    _validate_mlx_image_input(self, _row_has_images(inputs))
 
     int8_prefill = inputs.pop("int8_prefill", None)
     streamer = inputs.pop("streamer", None)
