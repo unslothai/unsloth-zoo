@@ -1953,14 +1953,12 @@ def vision_max_num_seqs(
     memory_left_for_kv_cache_gb,
     vllm_version = "0.0.0",
 ):
-    # Explicit max_num_seqs (anything but the 256 default) is honored as is.
     if max_num_seqs not in (None, 256):
         return max_num_seqs
     # vLLM < 0.11 can still run V0, whose profiler gives every sequence an image.
     if Version(vllm_version) < Version("0.11.0"):
         return 1
-    # V1 profiles min(max_num_seqs * images per prompt, encoder budget // image tokens)
-    # images and the encoder budget is max_num_batched_tokens, so keep the text default.
+    # V1 caps profiled images by the encoder budget (max_num_batched_tokens), not max_num_seqs.
     seqs = approx_max_num_seqs
     if Version(vllm_version) < Version("0.13.0"):
         # vLLM 0.11 / 0.12 profiling pads each dummy image to (budget, hidden_size).
@@ -3348,7 +3346,6 @@ def load_vllm(
         # Scale num_seqs by conservativeness
         approx_max_num_seqs = int(approx_max_num_seqs * conservativeness)
         approx_max_num_seqs = max(approx_max_num_seqs, 1)
-        # The vision bounds and UNSLOTH_VLLM_VISION_MAX_NUM_SEQS hold after the float8 bump.
         if vision_seq_cap is not None:
             approx_max_num_seqs = min(approx_max_num_seqs, vision_seq_cap)
 

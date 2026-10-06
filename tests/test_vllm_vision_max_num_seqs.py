@@ -14,10 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""load_vllm pinned every vision model to max_num_seqs = 1, so GRPO rollouts for
-Qwen3.5 / Gemma-4 ran one sequence at a time. vLLM V1 bounds the profiled images
-by the encoder budget, not by max_num_seqs, so vision models now keep the text
-default unless vLLM is older than 0.11 or UNSLOTH_VLLM_VISION_MAX_NUM_SEQS caps it."""
+"""Vision models keep the KV-based max_num_seqs on vLLM V1 instead of 1."""
 
 import ast
 import os
