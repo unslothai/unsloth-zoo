@@ -369,3 +369,30 @@ def test_clef_answers_every_question_from_one_prompt_like_its_reference_head(tmp
     for name, logits in (("route", route), ("level", level)):
         assert list(result["answers"][name]["probabilities"].values()) == pytest.approx(torch.softmax(logits, 0).tolist(), abs = 1e-4)
     assert list(result["answers"]["route"]["probabilities"]) == ["bill", "ship"] and result["answers"]["angry"]["noul"] == pytest.approx(torch.softmax(angry, 0)[0].item(), abs = 1e-4) and result["usage"]["input_tokens"] == len(ids)
+
+
+def test_prompts_of_a_request_run_their_shared_prefix_once(monkeypatch):
+    from unsloth_zoo.mlx import utils
+
+    reader, shared = _LabelModel.__new__(_LabelModel), list(range(40, 80))
+    reader.model = _decoder()
+    # The last prompt is the shared prefix itself, so one of its tokens is left to continue with.
+    prompts = [shared + [7, 8, 9], shared + [7], shared + [300, 301, 302, 303], shared]
+    calls, forward = [], utils._forward_text_hidden_states
+    monkeypatch.setattr(utils, "_forward_text_hidden_states", lambda model, inputs, **kwargs: calls.append((inputs.shape[1], kwargs)) or forward(model, inputs, **kwargs))
+    with generation_mode(reader.model):
+        got = list(reader._hidden_states(prompts))
+        continued, calls[:] = list(calls), []
+        want = [reader._hidden(ids) for ids in prompts]
+        assert all(mx.array_equal(a, b) for a, b in zip(reader._hidden_states([prompts[0]]), want)) and all(mx.array_equal(a, reader._hidden(ids)) for a, ids in zip(reader._hidden_states([[1, 2, 3], [1, 2, 9]]), ([1, 2, 3], [1, 2, 9])))
+    # One prompt, or a shared prefix too short to pay for itself, takes the plain pass.
+    assert not any("cache" in kwargs for _, kwargs in calls)
+    # Prompts that part before the shortest one ends share only up to where they part.
+    with generation_mode(reader.model):
+        calls.clear()
+        list(reader._hidden_states([shared[:20] + [7] * 5, shared[:20] + [9] * 8]))
+    assert [length for length, _ in calls] == [20, 5, 8]
+    assert [length for length, _ in continued] == [39, 4, 2, 5, 1] and len({id(kwargs["cache"]) for _, kwargs in continued}) == 5
+    assert [kwargs["position_ids"][:, 0].tolist() for _, kwargs in continued[1:]] == [[list(range(39, len(ids)))] * 3 for ids in prompts]
+    for a, b in zip(got, want):
+        assert a.shape == b.shape and mx.abs(a.astype(mx.float32) - b.astype(mx.float32)).max().item() <= 2**-4 * mx.abs(b.astype(mx.float32)).max().item()

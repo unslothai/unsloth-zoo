@@ -22,6 +22,7 @@ endpoint, so a model answers the same here as its GGUF does there. A Laya or Jul
 `set_dtype`, the module tree) for callers that keep prompts and calibration themselves.
 """
 
+import copy
 import json
 import math
 import os
@@ -661,6 +662,9 @@ def _output_rows(head, token_ids):
 
 
 class _QwenModel(DecisionPipeline):
+    # Below this many shared tokens a second pass costs more than it saves.
+    _MIN_SHARED = 16
+
     def _load(self, source, revision, dtype, token, adapter = None):
         from .loader import FastMLXModel
 
@@ -698,7 +702,22 @@ class _QwenModel(DecisionPipeline):
         return _forward_text_hidden_states(self.model, mx.array(ids)[None])[0]
 
     def _hidden_states(self, prompts):
-        return map(self._hidden, prompts)
+        """The hidden states of each prompt; the prefix the prompts of a request share is run once and continued per prompt."""
+        from .utils import _forward_text_hidden_states, _get_text_model
+
+        # Every prompt keeps at least one token of its own to continue with.
+        shared = min(len(os.path.commonprefix(prompts)), min(map(len, prompts)) - 1) if len(prompts) > 1 else 0
+        if shared < self._MIN_SHARED:
+            yield from map(self._hidden, prompts)
+            return
+        cache = _get_text_model(self.model).make_cache()
+        head = _forward_text_hidden_states(self.model, mx.array(prompts[0][:shared])[None], cache = cache)[0]
+        mx.eval(head, [entry.state for entry in cache])
+        for ids in prompts:
+            # A continuation is not told where it starts unless it is given its positions.
+            positions = mx.broadcast_to(mx.arange(shared, len(ids)), (3, 1, len(ids) - shared))
+            tail = _forward_text_hidden_states(self.model, mx.array(ids[shared:])[None], cache = copy.deepcopy(cache), position_ids = positions)[0]
+            yield mx.concatenate([head, tail])
 
     def _scores(self, state, questions):
         from .generate import generation_mode
