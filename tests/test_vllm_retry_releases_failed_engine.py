@@ -122,15 +122,35 @@ class _FakeVllmBackend:
         return gm.forward
 
 
+def _wraps(value, target):
+    """True if `value` is `target` or torch's wrapper chain around it."""
+    for _ in range(4):
+        if value is target:
+            return True
+        value = getattr(value, "_torchdynamo_orig_backend", None) or getattr(value, "compiler_fn", None)
+        if value is None:
+            return False
+    return False
+
+
 def test_release_unwraps_the_torch_compile_backend_wrapper():
     torch = pytest.importorskip("torch")
+    # Every dynamo context registers id(backend) here, including disable() with backend None,
+    # and torch._dynamo.reset() clears the dict. Start from that state, which is what an
+    # earlier test on the same xdist worker leaves, so this compile also adds non-vLLM keys.
+    torch._dynamo.reset()
     snapshot = vllm_utils._snapshot_dynamo_engine_registries()
-    compiled = torch.compile(lambda x: x * 2, backend = _FakeVllmBackend())
+    backend = _FakeVllmBackend()
+    compiled = torch.compile(lambda x: x * 2, backend = backend)
     compiled(torch.ones(2))
     added = set(eval_frame.cached_backends) - snapshot[0][1]
-    assert added, "torch.compile did not register its backend"
+    ours = {key for key in added if _wraps(eval_frame.cached_backends[key], backend)}
+    assert ours, "torch.compile did not register its backend"
+    others = added - ours
     vllm_utils._release_failed_vllm_engine(snapshot)
-    assert not (added & set(eval_frame.cached_backends))
+    assert not (ours & set(eval_frame.cached_backends))
+    # Only vLLM's entries go: anything else registered meanwhile stays.
+    assert others <= set(eval_frame.cached_backends)
 
 
 def _load_vllm_with_failing_engine(monkeypatch, errors, inside_handler = False):
