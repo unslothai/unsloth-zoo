@@ -189,3 +189,17 @@ def test_compiled_mixtral_expert_lora_traces(tmp_path, dtype_name):
         # transformers 4.x keeps Mixtral experts as per-expert ModuleLists: no stacked expert LoRA to check.
         pytest.skip(reason = "no stacked expert LoRA in this transformers")
     assert r["grads"] and all(0 < g < float("inf") for g in r["grads"]), r["grads"]
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_modulelist_grouped_mm_fix_compiles(dtype):
+    """The transformers < 5 ModuleList grouped path calls torch._grouped_mm through its own helper."""
+    _supported()
+    from unsloth_zoo.temporary_patches import moe_grouped_modulelist as ML
+    x, base, _, offs = _case(dtype, seed = 5)
+    x = x.detach()
+    w = base.transpose(-2, -1).contiguous()
+    torch._dynamo.reset()
+    eager = ML._grouped_mm_fix(x, w, offs)
+    compiled = torch.compile(ML._grouped_mm_fix, fullgraph = True, backend = "aot_eager")(x, w, offs)
+    assert torch.equal(eager, compiled)
