@@ -92,7 +92,8 @@ def test_tiled_forward_and_backward_on_this_host():
 
     x = torch.randn(2, 40, 16, device = device, requires_grad = True)
     x_ref = x.detach().clone().requires_grad_()
-    with torch.autocast(device, dtype = torch.bfloat16):
+    # amp is keyed to one device type; cpu tensors on an mps-keyed host (macOS runners) run fp32.
+    with torch.autocast(device, dtype = torch.bfloat16, enabled = device == tiled_mlp._AMP_DEVICE_TYPE):
         out = tiled(x)
         out_ref = reference(x_ref)
     out.float().pow(2).sum().backward()
