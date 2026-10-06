@@ -1128,6 +1128,10 @@ jobs:
                 # to a composite model's on-disk weights is a class attribute in
                 # transformers 4 and a registry in 5, and losing it merges nothing
                 # silently, so one pinned version cannot show the merge finds it.
+                # test_fused_ce_coverage is here because a model that stops matching
+                # the fused lm_head + CE rewrite still trains, only with the full
+                # logits tensor; the baseline covers 4.55.0 to 5.18.0, so each pin
+                # checks its own release's fused classes.
                 "$venv/bin/python" -m pytest -v --tb=short -rs \
                   tests/test_upstream_pinned_symbols_transformers.py \
                   tests/test_torchvision_video_removed_message.py \
@@ -1142,6 +1146,7 @@ jobs:
                   tests/test_compiler_rewriter_exhaustive.py \
                   tests/test_compiler_dynamic_exec.py \
                   tests/test_compiler_getsource_tokenerror.py \
+                  tests/test_fused_ce_coverage.py \
                   tests/test_aya_vision_logit_scale.py \
                   tests/test_vision_utils_grid_helpers_eager.py \
                   tests/test_modeling_local_vision_helpers_eager.py \
