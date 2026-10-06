@@ -1147,7 +1147,7 @@ def _routed_bf16_moe_fused(x, flat, rw, w_gu, w_dn, b_gu, b_dn, act, interleaved
     gu = gu_lora[0][:3] if gu_lora else (None, None, 0.0)
     dn = dn_lora[0][:3] if dn_lora else (None, None, 0.0)
     # The down GEMM reads w_dn.dtype (the glue casts too); an fp32 down LoRA A keeps the fp32 activation.
-    act_dtype = torch.float32 if dn[0] is not None and dn[0].dtype == torch.float32 else w_dn.dtype
+    act_dtype = torch.float32 if dn[0] is not None and dn[0].dtype != w_dn.dtype else w_dn.dtype
     inter = routed_bf16_gate_up_act(x, flat, w_gu, b_gu, gu[0], gu[1], None, gu[2], top_k, act, interleaved,
                                     alpha, limit, act_dtype)
     return routed_bf16_down_sum(inter, flat, rw, w_dn, b_dn, dn[0], dn[1], None, dn[2], top_k, out_dtype)

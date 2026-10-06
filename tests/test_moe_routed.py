@@ -1118,6 +1118,26 @@ def _bf16_inputs(act, T, seed, lora, bias, e = E, h = H, i = I, top_k = 4):
     return ex, lo, args
 
 
+@pytest.mark.skipif(DT != torch.bfloat16, reason = "needs a bf16 base with an fp16 adapter")
+def test_fused_mixed_dtype_down_lora_keeps_the_activation_precision(monkeypatch):
+    # bf16 base, fp16 down adapter: rounding the activation through bf16 first was ~50x the unfused
+    # error (and ~5x main's); kept in fp32 it is below main's.
+    def mean_err(fused):
+        monkeypatch.setenv("UNSLOTH_MOE_ROUTED_FUSED", "1" if fused else "0")
+        errs = []
+        for seed in SEEDS:
+            ex, lo, args = _bf16_inputs("silu", 4, seed, True, False)
+            f, s, sc, n = lo[1]
+            lo = (lo[0], (f.to(torch.float16), s.to(torch.float16), sc * 8, n))
+            args = args[:9] + ([lo[0][:3]], [lo[1][:3]])
+            ref = _ref(ex, "silu", *args[:3], lo)
+            with torch.no_grad():
+                got = MR.routed_bf16_moe(*args, out_dtype = torch.float32)
+            errs.append(((got.double() - ref).abs().mean() / ref.abs().mean()).item())
+        return sum(errs) / len(errs)
+    assert mean_err(True) <= 10 * mean_err(False)
+
+
 @pytest.mark.parametrize("act", list(ACTS))
 @pytest.mark.parametrize("lora", [False, True])
 @pytest.mark.parametrize("bias", [False, True])
