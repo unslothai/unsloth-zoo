@@ -44,6 +44,7 @@ __all__ = [
     "DecisionRequestError",
     "DecisionUnsupportedError",
     "load_decision_model",
+    "save_clef_model",
     "save_decision_model",
 ]
 
@@ -1121,6 +1122,9 @@ def _load_joint_head(folder):
     return head
 
 
+_CLEF_CONFIG = "unsloth_decision_config.json"
+
+
 def _compact(value):
     return value if isinstance(value, str) else json.dumps(value, ensure_ascii = False, separators = (",", ":"))
 
@@ -1143,6 +1147,11 @@ class ClefModel(_QwenModel):
     def __init__(self, folder, dtype, base_model, token):
         self._load_beside(folder, dtype, token, "joint_head")
         self.head = _load_joint_head(folder)
+        # A fine-tune's per-type temperatures are relative to its head temperature, which is kept apart only when
+        # it could not be folded into the head's weights.
+        saved = _read_json(folder / _CLEF_CONFIG)
+        scale = float(saved.get("head_temperature", 1.0))
+        self.temperatures = {kind: scale * min(max(float(t), 0.5), 5.0) for kind, t in zip(_TYPES, saved.get("temperature", []))}
 
     def _pieces(self, state, questions):
         """The prompt as (text, mark) pieces; the model was trained with each piece tokenized on its own."""
@@ -1316,3 +1325,122 @@ def save_decision_model(model, folder, source, agent_config = None):
     partial = folder / "rl_agent_config.json.tmp"
     partial.write_text(json.dumps(agent_config, indent = 2), encoding = "utf-8")
     os.replace(partial, folder / "rl_agent_config.json")
+
+
+def _fold_temperature(head, temperature):
+    """Divide the joint head's logits by `temperature` inside its weights; False when a logit scale would pass its cap."""
+    cap = math.log(100.0)
+    scales = {name: min(head[name].item(), cap) - math.log(temperature) for name in ("prior_logit_scale", "joint_logit_scale")}
+    if max(scales.values()) > cap:
+        return False
+    head.update((name, mx.array(value, mx.float32)) for name, value in scales.items())
+    for name in ("residual_scorer.3.weight", "residual_scorer.3.bias"):
+        head[name] = head[name] / temperature
+    return True
+
+
+def _add_in_slices(name, value, terms):
+    """`value` plus the signed `terms`, in float32 and back in its dtype; refuses a result that is not finite."""
+    def add(value, *arrays):
+        # The terms first: equal ones then cancel exactly and leave `value` as it was.
+        total = sum(sign * array.astype(mx.float32) for (sign, _), array in zip(terms, arrays))
+        result = (value.astype(mx.float32) + total).astype(value.dtype)
+        if not mx.isfinite(result).all().item():
+            raise ValueError(f"Unsloth: {name} has values that are not finite, so the model cannot be saved.")
+        return result
+
+    # A slice at a time: one graph over a multi-gigabyte embedding is more than a single GPU command may run.
+    arrays, step = [array for _, array in terms], max(1, (1 << 25) // max(1, value.size // value.shape[0]))
+    parts = [add(value[start : start + step], *(array[start : start + step] for array in arrays)) for start in range(0, value.shape[0], step)]
+    return parts[0] if len(parts) == 1 else mx.concatenate(parts)
+
+
+def _clef_decoder_deltas(decoder, source):
+    """What training added to the decoder's weights, by checkpoint tensor name, as signed terms."""
+    def name(path):
+        for prefix, saved in (("language_model.model.", "model.language_model."), ("language_model.lm_head.", "lm_head.")):
+            if path.startswith(prefix):
+                return saved + path[len(prefix) :]
+        return None
+
+    deltas = {}
+    for path, module in decoder.named_modules():
+        if "lora_a" in module:
+            if type(module).__name__ != "LoRALinear" or name(path) is None:
+                raise ValueError(f"Unsloth: the adapter on {path} cannot be merged into a Clef checkpoint.")
+            deltas[name(path) + ".weight"] = [(1, (module.scale * module.lora_b.T) @ module.lora_a.T)]
+    trained = [
+        (path, value) for path, value in tree_flatten(decoder.trainable_parameters())
+        if path.rsplit(".", 1)[-1] not in ("lora_a", "lora_b")
+    ]
+    if trained:
+        # Weights trained whole: the difference to a fresh load, so whatever the loader converts on the way in cancels out.
+        fresh = dict(tree_flatten(load_decision_model(source, family = "clef").model.parameters()))
+        for path, value in trained:
+            if name(path) is None:
+                raise ValueError(f"Unsloth: the trained {path} has no place in a Clef checkpoint.")
+            deltas.setdefault(name(path), []).extend([(1, value), (-1, fresh[path])])
+    return deltas
+
+
+def save_clef_model(pipeline, folder, source, config = None):
+    """Write a trained Clef pipeline as a Clef checkpoint in `folder`, in the layout of the released models.
+
+    `source` is the checkpoint it was loaded from. LoRA adapters are merged into the source weights, so a quantized
+    training base still saves at the source precision; a full fine-tune adds what its weights moved by since loading. `config` becomes
+    `unsloth_decision_config.json`; its `head_temperature` is folded into the head when the head can absorb it.
+    """
+    folder, source = Path(folder), Path(source)
+    if folder.resolve() == source.resolve():
+        # The trained model is the source plus what training added, so the source has to stay as it was loaded.
+        raise ValueError(f"Unsloth: a fine-tuned Clef cannot be saved over {source}, the checkpoint it was loaded from.")
+    config = {"layout": "clef", "temperature": [1.0, 1.0, 1.0], **(config or {}), "fine_tuned": True}
+    deltas = _clef_decoder_deltas(pipeline.model, source)
+    head = dict(tree_flatten(pipeline.head.parameters()))
+    temperature = float(config.pop("head_temperature", 1.0))
+    if temperature != 1.0:
+        if _fold_temperature(head, temperature):
+            config["folded_temperature"] = float(config.get("folded_temperature", 1.0)) * temperature
+        else:
+            config["head_temperature"] = temperature
+    # The released heads are bfloat16 with their three scalar gates kept in float32.
+    head = {name: value.astype(mx.bfloat16 if value.ndim else mx.float32) for name, value in head.items()}
+
+    folder.mkdir(parents = True, exist_ok = True)
+    staging = Path(tempfile.mkdtemp(dir = folder, prefix = ".saving-"))
+    try:
+        for shard in sorted(source.glob("model*.safetensors")):
+            tensors, changed = mx.load(str(shard)), {}
+            for name, value in tensors.items():
+                if name in deltas:
+                    # Convolution kernels are stored channels-first in the checkpoint.
+                    terms = [(sign, array.swapaxes(1, 2) if value.ndim == 3 else array) for sign, array in deltas.pop(name)]
+                    if terms[0][1].shape != value.shape:
+                        raise ValueError(f"Unsloth: {name} has shape {value.shape} in {source}, not the trained {terms[0][1].shape}.")
+                    changed[name] = _add_in_slices(name, value, terms)
+            if not changed:
+                shutil.copyfile(shard, staging / shard.name)
+                continue
+            tensors.update(changed)
+            mx.save_safetensors(str(staging / shard.name), tensors, metadata = {"format": "pt"})
+        if deltas:
+            raise ValueError(f"Unsloth: {source} holds no weights for the trained {sorted(deltas)[:3]}.")
+        for name, value in head.items():
+            if not mx.isfinite(value).all().item():
+                raise ValueError(f"Unsloth: {name} has values that are not finite, so the model cannot be saved.")
+        mx.save_safetensors(str(staging / "joint_head.safetensors"), head, metadata = {"format": "pt"})
+        (staging / _CLEF_CONFIG).write_text(json.dumps(config, indent = 2), encoding = "utf-8")
+        skipped = {"README.md", _CLEF_CONFIG, "joint_head.safetensors"}
+        for item in source.iterdir():
+            if item.is_file() and not item.name.startswith(".") and item.name not in skipped and not (staging / item.name).exists():
+                shutil.copyfile(item, staging / item.name)
+        # Old files stay until the new ones are in, and the head's file, which makes a folder a checkpoint, goes last.
+        staged = sorted(staging.iterdir(), key = lambda item: item.name == "joint_head.safetensors")
+        for item in staged:
+            os.replace(item, folder / item.name)
+        kept = {item.name for item in staged}
+        for item in [*folder.glob("model*.safetensors"), folder / "model.safetensors.index.json"]:
+            if item.name not in kept:
+                item.unlink(missing_ok = True)
+    finally:
+        shutil.rmtree(staging, ignore_errors = True)

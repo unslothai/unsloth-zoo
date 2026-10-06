@@ -41,7 +41,7 @@ from mlx.nn import Dropout, Embedding, LayerNorm, Linear, quantize  # noqa: E402
 from mlx.utils import tree_flatten, tree_map  # noqa: E402
 from safetensors.torch import load_file, save_file  # noqa: E402
 
-from unsloth_zoo.mlx.decision import _KevModel, _LabelModel, _merge_lora, load_decision_model, save_decision_model  # noqa: E402
+from unsloth_zoo.mlx.decision import _KevModel, _LabelModel, _load_joint_head, _merge_lora, load_decision_model, save_clef_model, save_decision_model  # noqa: E402
 from unsloth_zoo.mlx.decision_trainer import (  # noqa: E402
     MLXDecisionTrainer,
     ClefNetwork,
@@ -625,7 +625,7 @@ def clef(tmp_path, monkeypatch):
     (tmp_path / "joint_head_config.json").write_text(json.dumps(config))
     save_file({name: value.contiguous() for name, value in reference.state_dict().items()}, tmp_path / "joint_head.safetensors")
     encode = lambda text, add_special_tokens: [ord(c) % 512 for c in text]
-    monkeypatch.setattr(ClefModel, "_load", lambda self, *args: vars(self).update(model = _decoder(), tokenizer = SimpleNamespace(encode = encode)))
+    monkeypatch.setattr(ClefModel, "_load", lambda self, *args: vars(self).update(model = (mx.random.seed(7), _decoder())[1], tokenizer = SimpleNamespace(encode = encode)))
     pipeline = load_decision_model(tmp_path)
     questions = pipeline._parse_questions({"route": {"type": "choice", "instructions": "where", "criteria": {"a": "x", "b": None, "c": "z"}}, "ok": {"type": "noul", "instructions": "fine?"}})
 
@@ -683,6 +683,55 @@ def test_clef_full_fine_tune_trains_the_decoder_but_not_the_output_embedding(cle
         _, grads = _clef_record_loss_and_grad(network, clef[2]("hello"))
     assert all(mx.any(grads["encoder"]["language_model"]["model"]["layers"][index]["mlp"]["down_proj"]["weight"]).item() for index in (0, 3))
     assert any(name.startswith("encoder.") for name in names) and not any("lm_head" in name or "vision" in name for name in names) and not checkpointed
+
+
+def _clef_checkpoint_tensors(decoder):
+    # As the real checkpoint differs from the loaded model: its names, channels-first kernels, norm weights stored one lower.
+    tensors = {"model.visual.proj.weight": mx.ones((2, 3), mx.bfloat16), "lm_head.weight": decoder.language_model.lm_head.weight}
+    for name, value in tree_flatten(decoder.language_model.model.parameters()):
+        tensors[f"model.language_model.{name}"] = value.swapaxes(1, 2) if value.ndim == 3 else value - 1 if "norm" in name else value
+    return tensors
+
+
+@pytest.mark.parametrize("mode", ["adapters", "embedding", "full"])
+def test_saved_clef_holds_the_trained_decoder_and_a_head_with_its_temperature_folded_in(clef, tmp_path, mode):
+    pipeline, _, item = clef
+    source, record, out = _clef_checkpoint_tensors(pipeline.model), item("hello"), tmp_path / "out"
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), source)
+    out.mkdir()
+    stale = [out / "model-00001-of-00002.safetensors", out / "model.safetensors.index.json"]
+    [path.write_text("{}") for path in stale]
+    clef_training_network(pipeline, full_finetuning = mode == "full", r = 4, lora_alpha = 8, modules_to_save = ["embed_tokens"] if mode == "embedding" else None)
+    trainable = pipeline.model.trainable_parameters()
+    pipeline.model.update(tree_map(lambda value: value + 0.05 * mx.random.normal(value.shape).astype(value.dtype), trainable))
+    adapters = [module for _, module in pipeline.model.named_modules() if "lora_a" in module]
+    whole = {"model.language_model." + key.split(".", 2)[2] for key, _ in tree_flatten(trainable) if "lora_" not in key}
+    args = record["input_ids"], record["question_spans"], record["option_spans"], record["types"]
+    before = np.array(pipeline.logits(*args))
+    save_clef_model(pipeline, out, tmp_path, {"head_temperature": 2.0, "temperature": [1.0, 1.0, 40.0]})
+    saved, name = mx.load(str(out / "model.safetensors")), "model.language_model.layers.0.linear_attn.{}.weight"
+    moved, trained = {key for key in source if not mx.array_equal(saved[key], source[key])}, _clef_checkpoint_tensors(pipeline.model)
+    assert not any(path.exists() for path in stale) and len(whole) == {"adapters": 0, "embedding": 1}.get(mode, len(source) - 2)
+    assert saved.keys() == source.keys() and all(saved[key].shape == source[key].shape and saved[key].dtype == source[key].dtype for key in source)
+    assert len(moved) == len(adapters) + len(whole) and whole <= moved
+    for key in whole:
+        assert mx.allclose(saved[key].astype(mx.float32), trained[key].astype(mx.float32), atol = 2e-2).item(), key
+    if adapters:
+        low = dict(pipeline.model.named_modules())["language_model.model.layers.0.linear_attn.in_proj_qkv"]
+        delta = np.array(saved[name.format("in_proj_qkv")].astype(mx.float32) - source[name.format("in_proj_qkv")].astype(mx.float32))
+        assert np.abs(delta - np.array(low.scale * low.lora_b.T @ low.lora_a.T)).max() < 2e-2
+    head = mx.load(str(out / "joint_head.safetensors"))
+    assert {str(value.dtype).rsplit(".", 1)[-1] for value in head.values() if value.ndim} == {"bfloat16"} and head["residual_gate"].dtype == mx.float32
+    pipeline.head = _load_joint_head(out)
+    np.testing.assert_allclose(np.array(pipeline.logits(*args)), before / 2, atol = 3e-2)
+    config = json.loads((out / "unsloth_decision_config.json").read_text())
+    assert config["folded_temperature"] == 2.0 and "head_temperature" not in config and config["fine_tuned"] is True
+    assert load_decision_model(out).temperatures == {"choice": 1.0, "score": 1.0, "noul": 5.0}
+    # A temperature the head's logit scales cannot absorb stays in the config and is applied when serving.
+    save_clef_model(pipeline, out, tmp_path, {"head_temperature": 0.001, "temperature": [1.0, 1.0, 40.0]})
+    assert load_decision_model(out).temperatures == pytest.approx({"choice": 0.001, "score": 0.001, "noul": 0.005})
+    with pytest.raises(ValueError, match = "saved over"):
+        save_clef_model(pipeline, tmp_path / "out" / ".." , tmp_path)
 
 
 def test_clef_prompt_gives_up_the_end_of_the_state_only(clef):
