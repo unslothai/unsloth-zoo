@@ -867,6 +867,10 @@ jobs:
       - name: tests/test_mlx_shape_guard.py
         run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_shape_guard.py -v -rs
 
+      - name: tests/test_mlx_decision.py
+        # Decision request validation, prompts and answers; needs no weights.
+        run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_decision.py -v -rs
+
       - name: tests/test_mlx_vlm_label_masks.py
         # Audio collation, label masking and the family/version gate.
         run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_vlm_label_masks.py -v -rs
