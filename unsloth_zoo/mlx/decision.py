@@ -413,7 +413,6 @@ class DecisionPipeline:
         return "2" if count <= 2 else "3_5" if count <= 5 else "6_10" if count <= 10 else "11"
 
     def _temperature(self, question):
-        # Temperatures are fitted per number of options, with the question type's own as the fallback.
         banded = f"{question.type}.{self._bucket(len(question.options))}"
         return self.temperatures.get(banded, self.temperatures.get(question.type, 1.0))
 
@@ -424,7 +423,6 @@ class DecisionPipeline:
         temperature = self._temperature(question)
         probs = [0.0] * len(variants[0])
         for index, scores in enumerate(variants):
-            # The second variant lists the options in reverse.
             ordered = _softmax(scores, temperature)[::-1 if index else 1]
             probs = [total + p / len(variants) for total, p in zip(probs, ordered)]
         if question.type == "noul":
@@ -447,7 +445,6 @@ class DecisionPipeline:
 
 
 def _marker_config(folder):
-    # Julia-1 ships the Laya network with its settings in a file of its own.
     return "julia_config.json" if (folder / "julia_config.json").is_file() else "rl_agent_config.json"
 
 
@@ -751,7 +748,6 @@ class _NimbleModel(_LabelModel):
         return f'{{"name": {_escaped_json(question.id)}, "description": {_escaped_json(_text(question.instructions))}, "choices": [{", ".join(choices)}]}}'
 
     def _score_question(self, state, questions, question):
-        # The prompt lists every question of the request and names the one to answer.
         code = "short" if any(len(q.options) > 26 for q in questions) else "one-letter"
         prompt = (
             f"<|im_start|>system\n{self._SYSTEM.format(code)}<|im_end|>\n<|im_start|>user\n"
