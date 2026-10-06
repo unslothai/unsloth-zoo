@@ -2524,7 +2524,7 @@ def _wrapper_uses_separated_moe_lora(wrapper, experts_module = None) -> bool:
     return _is_moe_experts_module(experts_module)
 
 
-def _wrapper_forward_applies_stash(wrapper):
+def _wrapper_forward_applies_stash(wrapper, store_attr = None):
     """The measured verdict for this wrapper's experts forward, or None if unmeasured.
 
     `_wrapper_uses_separated_moe_lora` answers a structural question, "does the separated
@@ -2547,7 +2547,7 @@ def _wrapper_forward_applies_stash(wrapper):
     if experts_module is None:
         return None
     try:
-        return moe_lora_forward_applies_stash(experts_module, parameter_name)
+        return moe_lora_forward_applies_stash(experts_module, parameter_name, store_attr)
     except Exception:
         return None
 
@@ -2603,7 +2603,11 @@ def moe_lora_b_layout_for_wrapper(wrapper, adapter_name = None) -> str:
     if not _wrapper_has_adapter(wrapper, adapter_name):
         return LORA_B_LAYOUT_RANK_MAJOR
     if _wrapper_uses_separated_moe_lora(wrapper):
-        if _wrapper_forward_applies_stash(wrapper) is False:
+        verdict = _wrapper_forward_applies_stash(wrapper)
+        if verdict is None:
+            # A compiled-only run never reaches the eager probe.
+            verdict = _wrapper_forward_applies_stash(wrapper, _MOE_LORA_COMPILED_VERDICT_ATTR)
+        if verdict is False:
             # The structural test says the separated forward claims this wrapper, but the
             # forward that actually ran did not read the stash, so `_patched_param_wrapper_forward`
             # handed the wrapper back to PEFT and PEFT trained it rank-major. That happens
@@ -2640,6 +2644,7 @@ def moe_lora_b_layout_for_wrapper(wrapper, adapter_name = None) -> str:
 
 _MOE_LORA_STASH_READ_ATTR = "_unsloth_moe_lora_stash_read"
 _MOE_LORA_STASH_VERDICT_ATTR = "_unsloth_moe_lora_forward_applies"
+_MOE_LORA_COMPILED_VERDICT_ATTR = "_unsloth_moe_lora_forward_applies_compiled"
 
 
 def moe_lora_stash_name(parameter_name: str) -> str:
@@ -2702,11 +2707,17 @@ def _resolve_experts_forward(experts_module):
     """The function object that `experts_module(...)` will run, or None."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
-    forward = getattr(experts_module, "forward", None)
+    # Not getattr().__func__: Dynamo yields the bound method, so a traced verdict never matches.
+    try:
+        forward = experts_module.__dict__.get("forward")
+    except AttributeError:
+        forward = None
+    if forward is None:
+        forward = getattr(type(experts_module), "forward", None)
     return getattr(forward, "__func__", forward)
 
 
-def moe_lora_forward_applies_stash(experts_module, parameter_name: str):
+def moe_lora_forward_applies_stash(experts_module, parameter_name: str, store_attr = None):
     """Cached verdict: does this experts forward apply the stashed expert LoRA itself?
 
     True or False once measured, None when it has not been measured for the forward that is
@@ -2715,7 +2726,7 @@ def moe_lora_forward_applies_stash(experts_module, parameter_name: str):
     # This Unsloth Zoo code section is licensed under AGPL3
 
     try:
-        cache = experts_module.__dict__.get(_MOE_LORA_STASH_VERDICT_ATTR)
+        cache = experts_module.__dict__.get(store_attr or _MOE_LORA_STASH_VERDICT_ATTR)
     except AttributeError:
         return None
     if not cache:
@@ -2729,11 +2740,13 @@ def moe_lora_forward_applies_stash(experts_module, parameter_name: str):
     return verdict
 
 
-def _record_moe_lora_forward_verdict(experts_module, parameter_name: str, verdict) -> None:
+def _record_moe_lora_forward_verdict(
+    experts_module, parameter_name: str, verdict, store_attr = None,
+) -> None:
     """Remember `verdict` for `parameter_name` against the forward currently installed."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
-    store = _moe_module_dict(experts_module, _MOE_LORA_STASH_VERDICT_ATTR)
+    store = _moe_module_dict(experts_module, store_attr or _MOE_LORA_STASH_VERDICT_ATTR)
     if store is not None:
         store[parameter_name] = (_resolve_experts_forward(experts_module), bool(verdict))
 
@@ -3263,11 +3276,14 @@ def _patched_param_wrapper_forward(
             # every output and gradient on a family that ignores the stash, silently and
             # for the life of the captured graph. The bytecode says which family this is.
             #
-            # Nothing is recorded either way, so the first eager call still measures and
-            # every later compile follows the real verdict.
+            # Kept apart from the verdict (the first eager call still measures); the marker reads it.
             applies_stash = _forward_statically_reads_stash(experts_module)
             if not applies_stash and _interface_route_reads_stash(experts_module):
                 applies_stash = True
+            if applies_stash is not None:
+                _record_moe_lora_forward_verdict(
+                    experts_module, param_name, applies_stash, _MOE_LORA_COMPILED_VERDICT_ATTR,
+                )
             if applies_stash is False:
                 _log_moe_lora_stash_unread_once(experts_module, param_name)
         elif applies_stash is None:
