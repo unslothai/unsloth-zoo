@@ -354,6 +354,9 @@ def patch_qwen3_vl_moe():
         )
 
         _original_causal_lm_forward = Qwen3VLMoeForConditionalGeneration.forward
+        # Temporary patches run at init, pre_compile and post_compile: wrap each class once.
+        if getattr(_original_causal_lm_forward, "_unsloth_hidden_states_wrapper", False):
+            return
 
         def _patched_causal_lm_forward(
             self,
@@ -433,6 +436,9 @@ def patch_qwen3_vl_moe():
         # Preserve __qualname__ so _unsloth_get_batch_samples can detect this is
         # a ForConditionalGeneration forward and compute num_items_in_batch.
         _patched_causal_lm_forward.__qualname__ = _original_causal_lm_forward.__qualname__
+        # Lets the compiler read (and fuse the loss of) the real forward, as with functools.wraps.
+        _patched_causal_lm_forward.__wrapped__ = _original_causal_lm_forward
+        _patched_causal_lm_forward._unsloth_hidden_states_wrapper = True
         Qwen3VLMoeForConditionalGeneration.forward = _patched_causal_lm_forward
         if UNSLOTH_ENABLE_LOGGING:
             logger.info(
