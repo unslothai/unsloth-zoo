@@ -90,7 +90,7 @@ class _Gemma4KVSharedSafeProxy:
         return getattr(self._real, name)
 
     def __setattr__(self, name, value):
-        # vLLM writes through get_text_config(); a __slots__ proxy would raise, so forward writes.
+        # vLLM writes through get_text_config().
         if name == "_real":
             object.__setattr__(self, name, value)
         else:

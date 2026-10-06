@@ -216,8 +216,7 @@ def _fake_vllm_targets(monkeypatch, vu, names):
 
 
 def _load_lora_from_disk(monkeypatch, tmp_path, names):
-    """Call load_lora's default path branch on a real safetensors adapter, capturing the
-    LoRARequest it builds and the keys the servability check saw."""
+    """Run load_lora's default path branch on a real adapter; capture the LoRARequest and checked keys."""
     import unsloth_zoo.vllm_utils as vu
     from safetensors.torch import save_file
     _fake_vllm_targets(monkeypatch, vu, names)
@@ -244,8 +243,7 @@ def _load_lora_from_disk(monkeypatch, tmp_path, names):
 
 
 def test_a_saved_gemma4_adapter_is_remapped_on_the_default_path(monkeypatch, tmp_path):
-    # load_lora defaults to load_tensors = False, which is what `model.load_lora(dir)` after
-    # `model.save_lora(dir)` uses. vLLM would read the path with HF's `layers.N.experts` names.
+    # load_tensors = False is what `model.load_lora(dir)` after `model.save_lora(dir)` uses.
     names = {"language_model.model.layers.0.moe.experts", "language_model.model.layers.0.self_attn.q_proj"}
     request, checked = _load_lora_from_disk(monkeypatch, tmp_path, names)
     expected = {
@@ -282,8 +280,7 @@ def test_gemma4_config_proxy_forwards_writes():
 
 
 def test_qwen3_5_moe_vision_qkv_stays_merged():
-    # HF Qwen3.5 MoE keeps model.visual.blocks.N.attn.qkv fused (3 * hidden rows); splitting it
-    # left only the v rows in the training model's vision tower.
+    # Splitting the fused attn.qkv left only the v rows in the vision tower.
     from unsloth_zoo.empty_model import QWEN_VL_MERGED_QKV_TYPES
     assert "qwen3_5_moe" in QWEN_VL_MERGED_QKV_TYPES
 
@@ -304,8 +301,7 @@ def test_the_untiled_moe_patch_is_unconditional():
 
 
 def test_a_router_rebuilt_without_the_meta_model_gets_its_real_hidden_dim():
-    # create_empty_model builds with hidden_size = 1; copy_attributes would restore hidden_dim,
-    # but it is skipped when the original meta model cannot be built.
+    # copy_attributes, which restores hidden_dim, is skipped when the meta model cannot be built.
     import torch.nn.functional as F
     import unsloth_zoo.vllm_utils as vu
 
@@ -335,8 +331,7 @@ def test_a_router_rebuilt_without_the_meta_model_gets_its_real_hidden_dim():
 
 
 def test_text_only_gemma4_config_builds_an_empty_causal_lm():
-    # Gemma-4 overrides head_dim on its full-attention layers, so a plain global read raises
-    # AmbiguousGlobalPerLayerAttributeError and text_only reconstruction never started.
+    # Gemma-4's per-layer head_dim made a plain global read raise AmbiguousGlobalPerLayerAttributeError.
     transformers = pytest.importorskip("transformers")
     Gemma4TextConfig = getattr(transformers, "Gemma4TextConfig", None)
     if Gemma4TextConfig is None: pytest.skip("transformers has no Gemma 4")
@@ -373,8 +368,7 @@ def test_memory_estimate_counts_shared_and_dense_mlp_adapters_on_moe(monkeypatch
 
 
 def test_memory_estimate_counts_stacked_expert_lora_at_its_saved_shapes(monkeypatch):
-    # A real gemma-4-26B-A4B r=8 adapter saves per layer: gate_up A (E*r, H), B (2I, E*r);
-    # down A (E*r, I), B (H, E*r). So the experts add E*r*(2H + 3I) elements per layer.
+    # Saved gemma-4-26B-A4B adapter shapes: experts add E*r*(2H + 3I) elements per layer.
     import unsloth_zoo.vllm_utils as vu
     monkeypatch.setattr(vu, "get_mem_info", lambda: (80 * 1024**3, 80 * 1024**3))
     E_, H_, I_, r, layers = 8, 64, 16, 4, 2
