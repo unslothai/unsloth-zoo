@@ -283,7 +283,8 @@ class UnslothFusedLoss(torch.autograd.Function):
         grad_lm_head_bias = torch.zeros_like(lm_head_bias, device = device) if lm_head_bias_requires_grad else None
 
         bsz, qlen, hd = hidden_states.shape
-        accumulated_loss = torch.zeros(1, device = device)[0]
+        # 0-dim, not a [0] view: MoE forwards on transformers 4.x add their aux loss in place.
+        accumulated_loss = torch.zeros((), device = device)
         # Chunk hidden_states and labels
         if "n_chunks" in extra_kwargs:
             n_chunks = extra_kwargs.pop("n_chunks")
