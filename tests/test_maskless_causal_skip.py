@@ -73,9 +73,9 @@ def _decide(patched, **kwargs):
 
 
 def _compile_disabled():
-    """patch_transformers_masks wraps the stock builders uncompiled under UNSLOTH_COMPILE_DISABLE=1."""
-    import os
-    return os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1"
+    """patch_transformers_masks wraps the stock builders uncompiled under UNSLOTH_COMPILE_DISABLE=1 or partial."""
+    from unsloth_zoo.temporary_patches import common
+    return bool(common.UNSLOTH_COMPILE_DISABLE)
 
 
 def _reference(patched, kwargs):
