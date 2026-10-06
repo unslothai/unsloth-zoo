@@ -14,14 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A failed in-process vLLM engine must be freed before load_vllm retries.
-
-vLLM's TorchCompileWithNoGuardsWrapper registers the compiled model's bound
-`bytecode_hook` in torch._dynamo.convert_frame._bytecode_hooks, and torch.compile
-stores its backend (VllmBackend, holding the traced graphs) in
-torch._dynamo.eval_frame.cached_backends. Neither is removed when engine startup
-fails, so the retry used to stack a second copy of the weights on the first.
-"""
+"""A failed in-process vLLM engine must be freed before load_vllm retries."""
 
 from __future__ import annotations
 
@@ -41,7 +34,6 @@ eval_frame = pytest.importorskip("torch._dynamo.eval_frame")
 
 
 class _FakeCompiledModel:
-    """Stands in for a vLLM model: registers itself the way vLLM does, then fails."""
 
     def __init__(self):
         self.weights = bytearray(1 << 20)
@@ -87,7 +79,6 @@ def _restore_registries(monkeypatch):
 
 
 def test_failed_engine_leaks_without_the_release():
-    # The leak this guards against: gc.collect alone cannot free it.
     model_ref = _failed_attempt(release = False)
     assert model_ref() is not None
 
@@ -109,8 +100,6 @@ def test_release_keeps_entries_that_existed_before_the_attempt():
 
 
 def test_load_vllm_releases_before_each_retry_outside_the_except_block():
-    # Inside the except block the traceback still holds the failed engine's frames,
-    # so the release has to run at the top of the next loop iteration.
     tree = ast.parse(textwrap.dedent(inspect.getsource(vllm_utils.load_vllm)))
     loops = [node for node in ast.walk(tree) if isinstance(node, ast.While)
              and any(isinstance(n, ast.Try) for n in node.body)]

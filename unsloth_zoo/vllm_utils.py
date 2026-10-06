@@ -2882,9 +2882,7 @@ def _memory_profiling_race_message(error, trials = 0, unsloth_vllm_standby = Fal
 
 
 def _dynamo_engine_registries():
-    # Process wide Dynamo registries that pin every compiled vLLM model: each
-    # torch.compile backend (cached_backends) and vLLM's bound `bytecode_hook`
-    # (_bytecode_hooks). vLLM never removes either for an engine that failed to start.
+    # Both pin a compiled vLLM model; vLLM never removes them when engine startup fails.
     registries = []
     for module_name, attr in (("torch._dynamo.eval_frame", "cached_backends"),
                               ("torch._dynamo.convert_frame", "_bytecode_hooks")):
@@ -2903,9 +2901,7 @@ pass
 
 
 def _release_failed_vllm_engine(snapshot):
-    # A failed in-process engine stays reachable through the entries its attempt
-    # added, so the retry would stack a second copy of the weights on top of it.
-    # Run this outside the except block so the traceback's frames are gone too.
+    # Call outside the except block: the live traceback still holds the engine's frames.
     for registry, keys_before in snapshot:
         for key in list(registry.keys()):
             if key not in keys_before: registry.pop(key, None)
