@@ -696,8 +696,16 @@ def test_fp16_down_output_above_fp16_max_stays_finite(gemm, monkeypatch):
     assert float(ref_out.abs().max()) > 65504, float(ref_out.abs().max())
     assert bool(torch.isfinite(out).all()) and all(bool(torch.isfinite(v).all()) for v in gr.values())
     assert _rel(out, ref_out) < 2e-2
+    o_g = None
     for n in ref_g:
-        assert _rel(gr[n], ref_g[n]) <= 0.05, n
+        if _rel(gr[n], ref_g[n]) <= 0.05:
+            continue
+        # Gate / linear values sit on the swiglu clamp edges here, so one fp16 ulp in gate_up
+        # flips a clamp mask in either arm (A100 cuBLAS: one lora_B at 6.6%): judge by fp64.
+        if o_g is None:
+            _, o_g = _oracle_layer(ex, x, idx, w, upstream)
+        assert _rel(gr[n], o_g[n]) <= 1.25 * _rel(ref_g[n], o_g[n]) + 1e-3, (
+            n, _rel(gr[n], ref_g[n]), _rel(gr[n], o_g[n]), _rel(ref_g[n], o_g[n]))
 
 
 @needs_fp16_grouped

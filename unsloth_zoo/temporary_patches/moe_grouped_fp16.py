@@ -198,7 +198,8 @@ def _pow2(n):
 # "fp32" is the loop's exact math (IEEE fp32, fp32 dequant stack); "fp16" rounds x / W / dY to fp16
 # (dY per-row power-of-two scaled) with an fp32 accumulate and output. Colab T4 (cuBLAS), 20B layer
 # fwd + bwd vs the loop: fp16 1.9x / 1.7x at 512 / 2048 tokens, fp32 1.33x / 0.97x (no fp32 tensor
-# cores). Triton (sm80+): fp16 runs on the tensor cores, IEEE fp32 on CUDA-core FMA.
+# cores). Triton: fp16 beats fp32 operands on A100 (1.9x / 2.0x at 512 / 2048 tokens), RTX PRO 6000
+# (1.3x / 1.5x), L4 (1.3x / 1.2x); fp16 runs on the tensor cores, IEEE fp32 on CUDA-core FMA.
 DOWN_OPERAND_AUTO = {"triton": "fp16", "cublas": "fp16"}
 
 
@@ -206,7 +207,10 @@ def use_cublas(device) -> bool:
     mode = os.environ.get("UNSLOTH_GPTOSS_FP16_GEMM", "auto")
     if mode in ("cublas", "triton"):
         return mode == "cublas"
-    return device.type == "cuda" and _capability(device) < (8, 0)
+    # Measured, gpt-oss-20b MoE layer fwd + bwd (Colab, torch 2.11, Triton 3.6): Triton wins on
+    # A100 (sm80) and RTX PRO 6000 (sm120) and B200 (sm100); on L4 (sm89) cuBLAS ties at 512
+    # tokens and is 1.43x faster at 2048; on T4 (sm75) Triton has no MMA at all.
+    return device.type == "cuda" and (_capability(device) < (8, 0) or _capability(device) == (8, 9))
 
 
 class Groups:
