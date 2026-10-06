@@ -421,9 +421,8 @@ jobs:
         # test_mlx_embedding_guards: sentence-transformers layout shim and pooling-mode map, under the torch shim.
         # test_output_collector_compile: the capture_outputs collector mirror compiles fullgraph and stays per thread / context.
         # test_top_level_imports_are_declared: every package a zoo module imports at module level is a declared dependency.
-        # MLX export tests stay in separate processes: their shims replace
-        # sys.modules globally. Security's network blocker also stays isolated
-        # from the advisory CPU tests that contact PyPI.
+        # One pytest process per group: MLX export shims replace sys.modules globally,
+        # and the security network blocker would break the advisory PyPI test.
         run: |
           set -euo pipefail
           logs=$(mktemp -d "$RUNNER_TEMP/zoo-cpu-gates.XXXXXX")
@@ -433,8 +432,6 @@ jobs:
             "$@" > "$logs/$name.log" 2>&1 || rc=$?
             printf '%s\n' "$rc" > "$logs/$name.status"
           }
-          # Two lanes on one runner. The behavioral suite overlaps the smaller
-          # gates; each pytest command still owns a fresh Python process.
           behavioral() {
             run_gate behavioral python -m pytest \
               tests/test_ci_cpu_gate_results.py \

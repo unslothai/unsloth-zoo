@@ -221,8 +221,7 @@ jobs:
 
       - name: Run workflow-trigger lint
         id: trigger-lint
-        # Share checkout, Python and PyYAML with the regression suite. Delay
-        # gating until the end so a lint failure does not skip those tests.
+        # Gated by the last step, so a lint failure still runs the regressions.
         continue-on-error: true
         run: python3 scripts/lint_workflow_triggers.py
 

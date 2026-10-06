@@ -1,5 +1,18 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
-# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 """Exercise the actual two-lane CI shell with controlled pytest outcomes."""
 
@@ -25,8 +38,7 @@ def run_gates(tmp_path, failing = "", barrier = False):
         for s in steps
         if s.get("name") == "pytest CPU gates (two process lanes)"
     )
-    # The function intercepts only the child pytest processes. The controller is
-    # the workflow's real shell, including wait, logs, and exit-code collection.
+    # Stubs only the child pytest calls; waiting, logs and exit codes run as the real workflow shell.
     stub = r"""
 python() {
   printf 'executed %s\n' "$*"
