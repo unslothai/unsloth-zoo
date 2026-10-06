@@ -127,8 +127,10 @@ def test_sdpa_turns_none_into_the_same_causal_attention(patched):
 
 
 @pytest.mark.parametrize("attn", ["eager", "flex_attention", "flash_attention_2", "flash_attention_3", None])
-def test_only_sdpa_consumes_none_as_causal(patched, attn):
+def test_only_sdpa_consumes_none_as_causal(patched, attn, monkeypatch):
     # Eager applies no mask at all to None, so returning None there trains on future tokens.
+    if attn == "flex_attention":
+        _register_flex(monkeypatch, reroutes = False)  # stock flex; an imported unsloth reroutes
     kwargs = _kwargs(patched, config = _config(attn))
     assert _decide(patched, **kwargs) is None
 
@@ -367,6 +369,10 @@ def _register_flex(monkeypatch, reroutes):
     mapping = getattr(ALL_ATTENTION_FUNCTIONS, "_global_mapping", None)
     target = mapping if mapping is not None else ALL_ATTENTION_FUNCTIONS
     monkeypatch.setitem(target, "flex_attention", flex_attention_forward)
+    # Dispatch reads the local mapping first; an imported unsloth registers its flex wrapper there.
+    local = getattr(ALL_ATTENTION_FUNCTIONS, "_local_mapping", None)
+    if isinstance(local, dict) and "flex_attention" in local:
+        monkeypatch.setitem(local, "flex_attention", flex_attention_forward)
 
 
 def test_flex_drops_the_mask_only_when_unsloth_reroutes_it_to_sdpa(patched, monkeypatch):
