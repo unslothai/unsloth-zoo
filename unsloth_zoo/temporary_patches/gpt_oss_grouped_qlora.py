@@ -17,7 +17,12 @@
 bnb-exact Triton dequant of all experts per projection, base via _base_grouped_mm, LoRA via
 torch._grouped_mm over stacked per-expert A / B. No host sync, so an expert routed no tokens
 gets zero LoRA grads (the loop leaves None). Unsupported setups return a reason string and
-the caller keeps the per-expert loop."""
+the caller keeps the per-expert loop.
+
+float16 (T4): the loader computes the down experts in fp32 (_pre_set_compute_dtype), since
+their outputs overflow fp16. torch._grouped_mm has no fp32 output for fp16 operands, so this
+path runs moe_grouped_fp16's Triton grouped GEMMs: fp16 operands, fp32 accumulate, the
+loop's output dtype per projection (gate_up fp16, down fp32), LoRA in the loop's dtypes."""
 
 __all__ = [
     "nf4_dequant_expert_stack",
@@ -38,7 +43,10 @@ except Exception:  # pragma: no cover - no Triton / libdevice, no stacked dequan
     triton = None
 
 _DISABLED_REASON = None
-CALLS = {"forward": 0, "forward_lora": 0, "stacked_dequant": 0, "bnb_fallback_dequant": 0}
+CALLS = {"forward": 0, "forward_lora": 0, "stacked_dequant": 0, "bnb_fallback_dequant": 0,
+         "forward_fp16": 0, "forward_fp16_lora": 0, "declined": 0}
+# Last reason the grouped forward handed a layer back to the per-expert loop.
+LAST_DECLINE = {"reason": None}
 
 
 if triton is not None:
@@ -346,31 +354,80 @@ def _tables(experts, dtype):
     return state
 
 
+def _proj_dtypes(projs):
+    """{(compute_dtype, _pre_set_compute_dtype, quant_state.dtype)} over the experts of one projection."""
+    out = set()
+    for proj in projs:
+        base = getattr(proj, "base_layer", proj)
+        out.add((getattr(base, "compute_dtype", None), getattr(base, "_pre_set_compute_dtype", None),
+                 base.weight.quant_state.dtype))
+    return out
+
+
+def _is16(kind, dtype):
+    # Linear4bit computing in `dtype` with no conflicting override.
+    return kind[0] is dtype and kind[1] in (None, dtype) and kind[2] is dtype
+
+
+def compute_mode(experts, input_dtype):
+    """("bf16", None) / ("fp16", down_fp32) when a grouped path reproduces the per-expert
+    loop's dtypes, else (None, reason). Read per call: per-projection, so a dtype edit on
+    any one expert sends the layer back to the loop."""
+    gu, dn = _proj_dtypes(experts.gate_up_projs), _proj_dtypes(experts.down_projs)
+    if len(gu) != 1 or len(dn) != 1:
+        return None, "experts of one projection compute in different dtypes"
+    (gu,), (dn,) = gu, dn
+    if _is16(gu, torch.bfloat16) and _is16(dn, torch.bfloat16):
+        if input_dtype not in (torch.bfloat16, torch.float32):
+            return None, f"bf16 experts with {input_dtype} input"
+        return "bf16", None
+    if _is16(gu, torch.float16):
+        # The loader's fp16 rule: down computes, dequantizes and keeps its bias in fp32.
+        down_fp32 = dn == (torch.float32, torch.float32, torch.float32)
+        if not (down_fp32 or _is16(dn, torch.float16)):
+            return None, f"fp16 gate_up with down compute / override / quant dtypes {dn}"
+        if input_dtype not in (torch.float16, torch.float32):
+            return None, f"fp16 experts with {input_dtype} input"
+        return "fp16", down_fp32
+    return None, f"gate_up compute / override / quant dtypes {gu}, down {dn}"
+
+
+def _decline(reason):
+    CALLS["declined"] += 1
+    if LAST_DECLINE["reason"] != reason:
+        LAST_DECLINE["reason"] = reason
+        if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
+            import logging
+            logging.getLogger(__name__).info(f"Unsloth: gpt-oss grouped QLoRA keeps the per-expert loop: {reason}")
+    return None
+
+
 # Opaque to Dynamo (data_ptr-keyed tables, raw Triton launch): one graph break per call.
 @torch.compiler.disable
 def grouped_qlora_forward(experts, hidden_states, router_indices, routing_weights,
                           batch_size, num_tokens, num_experts, top_k, lora = None):
     """Grouped training forward of GptOssExpertsBnb4bit, with or without per-expert LoRA.
     Returns fp32 [batch, seq, hidden], as the per-expert training loop does, or None when
-    the experts do not compute in bf16 (the caller keeps the loop)."""
+    no grouped path matches the experts' dtypes (the caller keeps the loop)."""
+    mode, why = compute_mode(experts, hidden_states.dtype)
+    if mode == "fp16":
+        return _grouped_qlora_forward_fp16(
+            experts, hidden_states, router_indices, routing_weights,
+            batch_size, num_tokens, num_experts, top_k, lora, down_fp32 = why,
+        )
+    if mode != "bf16":
+        return _decline(why)
     from unsloth_zoo.temporary_patches.moe_utils import (
-        _base_grouped_mm, _moe_recompute_default, combine_permuted_moe_outputs, count_tokens_per_expert,
+        _base_grouped_mm, _check_torch_grouped_mm_supported, _moe_recompute_default,
+        combine_permuted_moe_outputs, count_tokens_per_expert,
     )
     from unsloth_zoo.temporary_patches.gpt_oss import swiglu_torch_forward
 
+    # Readiness also admits a device with only the fp16 Triton path.
+    if not _check_torch_grouped_mm_supported():
+        return _decline("torch._grouped_mm unsupported")
     device = hidden_states.device
-    # Linear4bit computes in compute_dtype whatever the input dtype; _grouped_mm backward needs bf16.
-    for proj in (*experts.gate_up_projs, *experts.down_projs):
-        base = getattr(proj, "base_layer", proj)
-        if (
-            getattr(base, "compute_dtype", None) is not torch.bfloat16
-            or getattr(base, "_pre_set_compute_dtype", None) not in (None, torch.bfloat16)
-            or base.weight.quant_state.dtype is not torch.bfloat16
-        ):
-            return None
     dtype = torch.bfloat16
-    if hidden_states.dtype not in (torch.bfloat16, torch.float32):
-        return None
     # The loop's dtypes: gate_up in the input dtype, swiglu and the down sum in fp32.
     acc_dtype = hidden_states.dtype
     hidden_states = hidden_states.to(dtype)
@@ -410,5 +467,162 @@ def grouped_qlora_forward(experts, hidden_states, router_indices, routing_weight
 
     weighted = out.to(torch.float32) * routing_weights[sorted_tokens, expert_ids, None].to(torch.float32)
     # Fixed-order top_k sum (an index_add_ over repeated tokens is atomic, so not reproducible).
+    next_states = combine_permuted_moe_outputs(weighted, sorted_idx, num_tokens, top_k, out_dtype = torch.float32)
+    return next_states.view(batch_size, -1, experts.hidden_size)
+
+
+class _Fp16StackProvider:
+    """Frozen NF4 experts of one projection as fp16 [hi - lo, N, K] stacks, from the pointer
+    table (one Triton launch; an fp32 quant state rounds once, fp32 -> fp16) or bitsandbytes.
+    windows() splits the experts when a whole stack does not fit in free memory."""
+
+    __slots__ = ("tb", "projs", "N", "K", "num_experts", "dtype", "chunk", "pin")
+
+    def __init__(self, tb, projs, recompute, dtype = torch.float16):
+        qs = getattr(projs[0], "base_layer", projs[0]).weight.quant_state
+        self.tb, self.projs = tb, projs
+        self.N, self.K = int(qs.shape[0]), int(qs.shape[1])
+        self.num_experts = len(projs)
+        self.dtype = dtype
+        device = qs.absmax.device
+        from unsloth_zoo.temporary_patches.moe_grouped_fp16 import use_cublas
+        # Per-expert cuBLAS GEMMs gain nothing from a whole stack: keep its transient small
+        # (a T4 running 20B sits at ~95% of its memory with a 1 GiB gate_up stack).
+        cap = int(os.environ.get("UNSLOTH_GPTOSS_FP16_CUBLAS_STACK_MB", "256")) << 20 if use_cublas(device) else None
+        self.chunk = _expert_window(self.num_experts, self.N * self.K * dtype.itemsize, device, cap)
+        # Pin (skip the backward rebuild) only when asked to and the whole stack fits.
+        self.pin = (not recompute) and self.chunk >= self.num_experts
+
+    def windows(self):
+        E, c = self.num_experts, self.chunk
+        return [(lo, min(lo + c, E)) for lo in range(0, E, c)]
+
+    def __call__(self, lo, hi):
+        tb = self.tb
+        # fp16 from an fp16 or fp32 quant state (one rounding); fp32 only from an fp32 one (exact).
+        ok = (torch.float16, torch.float32) if self.dtype is torch.float16 else (torch.float32,)
+        if tb is not None and tb.get("dtype") in ok:
+            if (lo, hi) != (0, self.num_experts):
+                tb = dict(tb)
+                for k in ("w", "a", "a2", "c2", "off"):
+                    tb[k] = tb[k][lo:hi]
+            w = nf4_dequant_expert_stack(tb, self.dtype)
+            if w is not None:
+                return w
+        import bitsandbytes as bnb
+        CALLS["bnb_fallback_dequant"] += 1
+        return torch.stack([
+            bnb.functional.dequantize_4bit(b.weight.data, b.weight.quant_state).to(self.dtype)
+            for b in (getattr(p, "base_layer", p) for p in self.projs[lo:hi])
+        ])
+
+
+def _expert_window(E, bytes_per_expert, device, cap_bytes = None):
+    """Experts per dequant window: all of them unless the stack would take more than half of
+    the free memory (T4: a 20B gate_up stack is 1 GiB) or cap_bytes. UNSLOTH_GPTOSS_FP16_EXPERT_WINDOW pins it."""
+    pinned = os.environ.get("UNSLOTH_GPTOSS_FP16_EXPERT_WINDOW")
+    if pinned:
+        return max(1, min(E, int(pinned)))
+    try:
+        free, _ = torch.cuda.mem_get_info(device)
+        free += torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+    except Exception:
+        free = None
+    budget = [b for b in (None if free is None else free // 2, cap_bytes) if b is not None]
+    if not budget:
+        return E
+    fit = int(min(budget) // max(bytes_per_expert, 1))
+    return max(1, min(E, fit))
+
+
+def _stack_lora(projs, name, which, dtype):
+    # [E, out, in] in `dtype`; autograd routes each slice's grad to its expert's parameter.
+    mods = [getattr(p, which)[name].weight for p in projs]
+    return torch.stack(mods).to(dtype)
+
+
+def _lora_add_fp16(result, x, counts, projs, lora):
+    """result + scaling * (x.half() @ A.half().T) @ B.T as Unsloth's forced-float32 LoRA forward
+    (compiler.COMPILED_LORA_FORWARD_forced_float32: one addmm in the result's dtype). The second GEMM,
+    the scaling and the add stay fp32 and round once, so an unscaled product past the fp16 range
+    cannot become inf before scaling."""
+    from unsloth_zoo.temporary_patches.moe_grouped_fp16 import grouped_linear
+    name, scaling, _ = lora
+    res_dtype = result.dtype
+    A = _stack_lora(projs, name, "lora_A", torch.float16)
+    B = _stack_lora(projs, name, "lora_B", res_dtype)
+    xa = grouped_linear(x.to(torch.float16), A, counts)
+    delta = grouped_linear(xa.to(res_dtype), B, counts, out_dtype = torch.float32)
+    return (result.float() + delta * scaling).to(res_dtype)
+
+
+def down_operand_dtype(device):
+    """Operand dtype of the fp32 down GEMM. UNSLOTH_GPTOSS_FP16_DOWN_OPERAND = fp16 | fp32 | auto;
+    auto picks from the measured speed per backend (see moe_grouped_fp16.DOWN_OPERAND_AUTO)."""
+    from unsloth_zoo.temporary_patches.moe_grouped_fp16 import DOWN_OPERAND_AUTO, use_cublas
+    mode = os.environ.get("UNSLOTH_GPTOSS_FP16_DOWN_OPERAND", "auto")
+    if mode not in ("fp16", "fp32"):
+        mode = DOWN_OPERAND_AUTO["cublas" if use_cublas(device) else "triton"]
+    return torch.float32 if mode == "fp32" else torch.float16
+
+
+def _grouped_qlora_forward_fp16(experts, hidden_states, router_indices, routing_weights,
+                                batch_size, num_tokens, num_experts, top_k, lora, down_fp32):
+    """The per-expert loop's dtypes on float16 GPUs: gate_up in fp16 (returned in the input's
+    dtype, as Linear4bit does), swiglu in fp32, down on fp16 operands with an fp32 output
+    and fp32 bias when the loader kept down in fp32 (else fp16 output, as the loop)."""
+    from unsloth_zoo.temporary_patches.moe_grouped_fp16 import (
+        Groups, fp16_grouped_available, grouped_frozen_linear, unavailable_reason,
+    )
+    from unsloth_zoo.temporary_patches.moe_utils import (
+        _moe_recompute_default, combine_permuted_moe_outputs, count_tokens_per_expert,
+    )
+    from unsloth_zoo.temporary_patches.gpt_oss import swiglu_torch_forward
+
+    device = hidden_states.device
+    if not fp16_grouped_available(device):
+        return _decline(unavailable_reason())
+    f16 = torch.float16
+    acc_dtype = hidden_states.dtype
+    dn_out_dtype = torch.float32 if down_fp32 else f16
+    x_mode = os.environ.get("UNSLOTH_GPTOSS_FP16_X_MODE", "cast")
+    dy_mode = os.environ.get("UNSLOTH_GPTOSS_FP16_DY_MODE", "scale")
+    # fp32 down (loader rule): fp32 operands reproduce the loop's fp32 GEMM (IEEE, no TF32, no
+    # narrowing of x or dY); fp16 operands with an fp32 output are the speed option.
+    dn_operand = down_operand_dtype(device) if down_fp32 else f16
+    CALLS["forward_fp16"] += 1
+    if lora is not None:
+        CALLS["forward_fp16_lora"] += 1
+    with torch.no_grad():
+        flat_experts = router_indices.flatten()
+        token_ids = torch.arange(num_tokens, device = device).repeat_interleave(top_k)
+        sorted_idx = flat_experts.argsort(stable = True)
+        sorted_tokens = token_ids[sorted_idx]
+        expert_ids = flat_experts[sorted_idx]
+        # Triton backend: counts stay on device. cuBLAS backend (below sm80): one host read
+        # per layer, shared by every GEMM of its forward and backward (the loop reads once too).
+        counts = Groups(count_tokens_per_expert(flat_experts, num_experts, torch.int32))
+
+    recompute = _moe_recompute_default()
+    state = _tables(experts, f16)
+    gu_projs, dn_projs = experts.gate_up_projs, experts.down_projs
+    gu_bias = torch.stack([getattr(p, "base_layer", p).bias for p in gu_projs]).detach()
+    dn_bias = torch.stack([getattr(p, "base_layer", p).bias for p in dn_projs]).detach()
+    gu_w = _Fp16StackProvider(state["gate_up"] if state is not None else None, gu_projs, recompute)
+    dn_w = _Fp16StackProvider(state["down"] if state is not None else None, dn_projs, recompute, dn_operand)
+
+    xs = hidden_states[sorted_tokens]
+    # Linear4bit: x.to(compute dtype), bias in the epilogue, output back in the input's dtype.
+    gate_up = grouped_frozen_linear(xs.to(f16), counts, gu_w, bias = gu_bias, out_dtype = f16).to(acc_dtype)
+    if lora is not None and lora["gate_up"] is not None:
+        gate_up = _lora_add_fp16(gate_up, xs, counts, gu_projs, lora["gate_up"])
+    gated = swiglu_torch_forward(gate_up, experts.alpha, experts.limit, dtype = torch.float32)
+    out = grouped_frozen_linear(
+        gated, counts, dn_w, bias = dn_bias, out_dtype = dn_out_dtype, x_mode = x_mode, dy_mode = dy_mode,
+    ).float()
+    if lora is not None and lora["down"] is not None:
+        out = _lora_add_fp16(out, gated, counts, dn_projs, lora["down"])
+
+    weighted = out * routing_weights[sorted_tokens, expert_ids, None].to(torch.float32)
     next_states = combine_permuted_moe_outputs(weighted, sorted_idx, num_tokens, top_k, out_dtype = torch.float32)
     return next_states.view(batch_size, -1, experts.hidden_size)

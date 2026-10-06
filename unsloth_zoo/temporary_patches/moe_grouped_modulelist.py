@@ -85,8 +85,20 @@ def _grouped_mm_supported() -> bool:
     return ok
 
 
+try:
+    from .moe_utils import _GROUPED_MM_FP16_OP
+except Exception:
+    _GROUPED_MM_FP16_OP = None
+
+
 def _grouped_mm_fix(x: torch.Tensor, w: torch.Tensor, offs: torch.Tensor) -> torch.Tensor:
     """torch._grouped_mm with a per-group matmul fallback for the 16-byte stride error."""
+    # aten._grouped_mm's fake impl rejects float16 under torch.compile; the opaque op (moe_utils) does not.
+    if (
+        x.dtype == torch.float16 and w.dtype == torch.float16
+        and _GROUPED_MM_FP16_OP is not None and torch.compiler.is_compiling()
+    ):
+        return _GROUPED_MM_FP16_OP(x, w, offs)
     x = x.contiguous()
     w = w.contiguous()
     try:

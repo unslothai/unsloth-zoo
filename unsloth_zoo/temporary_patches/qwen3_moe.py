@@ -141,6 +141,9 @@ def _patch_causal_lm_forward_for_hidden_states(
     extra_output_kwargs_fn=None,
 ):
     _original_causal_lm_forward = causal_lm_cls.forward
+    # Temporary patches run at init, pre_compile and post_compile: wrap each class once.
+    if getattr(_original_causal_lm_forward, "_unsloth_hidden_states_wrapper", False):
+        return
 
     def _patched_causal_lm_forward(
         self,
@@ -205,6 +208,9 @@ def _patch_causal_lm_forward_for_hidden_states(
         )
 
     _patched_causal_lm_forward.__qualname__ = _original_causal_lm_forward.__qualname__
+    # Lets the compiler read (and fuse the loss of) the real forward, as with functools.wraps.
+    _patched_causal_lm_forward.__wrapped__ = _original_causal_lm_forward
+    _patched_causal_lm_forward._unsloth_hidden_states_wrapper = True
     causal_lm_cls.forward = _patched_causal_lm_forward
     if UNSLOTH_ENABLE_LOGGING:
         logger.info(f"Unsloth: Patched {model_label}.forward for GRPO hidden states.")

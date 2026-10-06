@@ -6016,6 +6016,110 @@ def test_missing_processor_template_recovers_legacy_json(tmp_path, remote, templ
     assert processor.chat_template == "existing template"
 
 
+@pytest.mark.parametrize("side", ["left", "right"])
+@pytest.mark.parametrize("opaque", [False, True])
+@pytest.mark.parametrize("prompt_completion", [False, True])
+def test_image_truncation_checks_each_row_and_prompt_completion(side, opaque, prompt_completion):
+    from unsloth_zoo.mlx import utils as u
+
+    class Processor(_FakeProcessor):
+        def __call__(self, text, truncation=False, max_length=None, **kwargs):
+            rows = [[11, 12, 13, 14, 15, 16, 17, 18],
+                    [11, 200, 200, 12, 13, 200, 200, 14]]
+            if text == ["completion", "completion"]:
+                rows = [[15], [15]]
+            ids = np.asarray(rows, dtype=np.int32)
+            if truncation and max_length:
+                ids = ids[:, -max_length:] if side == "left" else ids[:, :max_length]
+            result = dict(input_ids=ids, attention_mask=np.ones_like(ids),
+                          pixel_values=np.ones((2, 3), dtype=np.float32))
+            return {k: mx.array(v) for k, v in result.items()} if opaque else result
+
+    processor = Processor()
+    processor.tokenizer = _FakeTokenizer()
+    processor.tokenizer.padding_side = side
+    rows = [{"text": "sample", "images": [Image.new("RGB", (2, 2))]} for _ in range(2)]
+    bad_rows = ([{"prompt": "prompt", "completion": "completion", "images": row["images"]}
+                 for row in rows] if prompt_completion else rows)
+    required = 9 if prompt_completion else 8
+    with pytest.raises(ValueError, match=rf"batch row 1.*max_seq_length>={required}"):
+        staged = u._collate_vlm_batch(bad_rows, processor, 6, None, ignore_token_ids=[200],
+                                    reject_mlx_valued=opaque)
+        u._finalize_vlm_batch(staged)
+    with pytest.raises(ValueError, match=rf"batch row 1.*max_seq_length>={required}"):
+        u._finalize_vlm_batch(u._collate_vlm_batch(
+            bad_rows, processor, 6, None, image_context_limit=required - 1,
+            ignore_token_ids=[200], reject_mlx_valued=opaque,
+        ))
+    with pytest.warns(UserWarning, match=rf"1 row.*to {required} tokens"):
+        expanded = u._finalize_vlm_batch(u._collate_vlm_batch(
+            bad_rows, processor, 6, None, image_context_limit=required,
+            ignore_token_ids=[200], reject_mlx_valued=opaque,
+        ))
+    assert expanded["input_ids"].shape[1] == required
+    assert np.asarray(expanded["input_ids"])[1].tolist().count(200) == 4
+    if prompt_completion:
+        assert np.asarray(expanded["labels"])[1].tolist() == [-100] * 8 + [15]
+    with pytest.raises(ValueError, match="padded image batch width"):
+        u._finalize_vlm_batch_width(expanded, required + 1, 0)
+    for cap in (7, 8):
+        fitting = _finalized_collate(rows, processor, cap, None, ignore_token_ids=[200])
+        expected = processor(["sample", "sample"], truncation=True, max_length=cap)
+        for key in expected:
+            assert np.asarray(fitting[key]).tobytes() == np.asarray(expected[key]).tobytes()
+
+
+@pytest.mark.parametrize("phase", [None, "content"])
+def test_restored_image_context_bound_covers_placeholder_expansion(phase):
+    from unsloth_zoo.mlx import utils as u
+
+    config = dict(model_type="multi_modality", image_token_index=200, num_image_tokens=8)
+    def batch(limit):
+        return dict(input_ids=mx.array([[1, 2, 3, 4, 200, 5]]),
+                    attention_mask=mx.ones((1, 6), dtype=mx.int32),
+                    _unsloth_image_context_limit=limit)
+
+    with pytest.raises(ValueError, match="expanded image batch width 13.*context limit 8"):
+        u._prepare_vlm_batch_for_compile(batch(8), config, phase=phase)
+    out = u._prepare_vlm_batch_for_compile(batch(13), config, phase=phase)
+    assert out["input_ids"].shape[1] == 13
+    assert np.asarray(out["input_ids"])[0].tolist() == [1, 2, 3, 4] + [200] * 8 + [5]
+
+
+@pytest.mark.parametrize("left_padded", [False, True])
+@pytest.mark.parametrize("opaque", [False, True])
+def test_image_rescue_is_sized_by_the_affected_rows(opaque, left_padded):
+    from unsloth_zoo.mlx import utils as u
+
+    class Processor(_FakeProcessor):
+        def __call__(self, text, truncation=False, max_length=None, **kwargs):
+            rows = [[200, 200] + list(range(20, 38)), [11, 200, 200, 12, 13, 200, 200, 14]]
+            if truncation and max_length:
+                rows = [row[:max_length] for row in rows]
+            width = max(map(len, rows))
+            ids = np.zeros((2, width), dtype=np.int32)
+            mask = np.zeros_like(ids)
+            for index, row in enumerate(rows):
+                cols = slice(width - len(row), None) if left_padded else slice(0, len(row))
+                ids[index, cols], mask[index, cols] = row, 1
+            result = dict(input_ids=ids, attention_mask=mask,
+                          pixel_values=np.ones((2, 3), dtype=np.float32))
+            return {k: mx.array(v) for k, v in result.items()} if opaque else result
+
+    processor = Processor()
+    processor.tokenizer = _FakeTokenizer()
+    rows = [{"text": "sample", "images": [Image.new("RGB", (2, 2))]} for _ in range(2)]
+    with pytest.warns(UserWarning, match="1 row.*to 8 tokens"):
+        batch = u._finalize_vlm_batch(u._collate_vlm_batch(
+            rows, processor, 6, None, image_context_limit=10,
+            ignore_token_ids=[200], reject_mlx_valued=opaque,
+        ))
+    ids = np.asarray(batch["input_ids"])
+    assert ids.shape[1] == 8
+    assert ids[1].tolist().count(200) == 4
+    assert ids[0].tolist() == [200, 200] + list(range(20, 26))
+
+
 @pytest.mark.parametrize("eos", [None, "[EOS]"])
 @pytest.mark.parametrize("texts", [["a b", "b"], ["a", "a b"]])
 def test_forwarding_image_processor_uses_its_text_tokenizer(eos, texts):
