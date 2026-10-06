@@ -8849,7 +8849,7 @@ def _validate_mlx_image_input(target, has_images):
     if has_images and getattr(target, "_unsloth_supports_images", None) is False:
         name = getattr(target, "_unsloth_modality_model_type", type(target).__name__)
         raise ValueError(
-            f"Unsloth MLX: `{name}` has no vision path; image inputs are not supported."
+            f"Unsloth MLX: `{name}` has no vision path; image and video inputs are not supported."
         )
 
 
@@ -8858,9 +8858,11 @@ def _row_has_images(item):
         return any(_row_has_images(part) for part in item)
     if not isinstance(item, dict):
         return False
-    if item.get("type") in ("image", "image_url", "input_image"):
+    if item.get("type") in ("image", "image_url", "input_image",
+                            "video", "video_url", "input_video"):
         return True
-    for key in ("image", "images", "image_url", "input_image", "pixel_values"):
+    for key in ("image", "images", "image_url", "input_image", "pixel_values",
+                "video", "videos", "video_url", "input_video", "pixel_values_videos"):
         value = item.get(key)
         if value is not None and not (isinstance(value, (list, tuple)) and not value):
             return True

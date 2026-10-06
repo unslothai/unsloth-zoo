@@ -6181,3 +6181,17 @@ def test_text_forwarding_probe_leaves_dropout_rng_and_mode_untouched():
     mx.random.seed(7)
     assert mx.array_equal(probed, mx.random.uniform(shape=(4,))).item()
     assert model.training and model.drop.training
+
+
+@pytest.mark.parametrize("row", [
+    {"input_ids": [1, 2, 3], "pixel_values_videos": np.ones((2, 3), dtype=np.float32)},
+    {"messages": [{"role": "user", "content": [{"type": "video", "video": "clip.mp4"}]}]},
+])
+def test_text_wrapper_rejects_video_rows(row):
+    from unsloth_zoo.mlx import utils as u
+
+    tokenizer = _FakeTokenizer()
+    tokenizer._unsloth_supports_images = False
+    tokenizer._unsloth_modality_model_type = "text_wrapper"
+    with pytest.raises(ValueError, match="`text_wrapper` has no vision path"):
+        u._prepare_pretokenized_text_dataset([row], tokenizer=tokenizer)

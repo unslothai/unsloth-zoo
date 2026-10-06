@@ -7011,7 +7011,9 @@ def _mlx_generate_vlm(self, *args, **kwargs):
     inputs.update(kwargs)
     from .utils import _validate_mlx_image_input
     _validate_mlx_image_input(self, any(
-        inputs.get(key) is not None for key in ("image", "images", "pixel_values")
+        inputs.get(key) is not None for key in (
+            "image", "images", "pixel_values", "video", "videos", "pixel_values_videos",
+        )
     ))
 
     int8_prefill = inputs.pop("int8_prefill", None)
