@@ -709,6 +709,32 @@ def test_fp16_down_output_above_fp16_max_stays_finite(gemm, monkeypatch):
 
 
 @needs_fp16_grouped
+@pytest.mark.parametrize("gemm", ["triton", "cublas"])
+def test_fp16_lora_scaled_before_rounding(gemm, monkeypatch):
+    # Unscaled x @ A.T @ B.T past 65504 but finite once scaled: the forced-float32 LoRA forward
+    # adds scaling * product in one addmm, so the grouped path must not round the product first.
+    monkeypatch.setenv("UNSLOTH_GPTOSS_FP16_GEMM", gemm)
+    ex = _fp16_lora(_fp16_experts(rule = True))
+    g = torch.Generator(device = "cuda").manual_seed(5)
+    for m in ex.gate_up_projs:
+        m.lora_A["default"].weight.data.copy_(torch.randn(m.lora_A["default"].weight.shape, device = "cuda", generator = g) * 0.5)
+        m.lora_B["default"].weight.data.fill_(30000.0)
+        m.scaling["default"] = 1e-3
+    T = 64
+    x = torch.randn(1, T, H, device = "cuda", dtype = F16, generator = g) * 4
+    idx, w = _routing32(T)
+    upstream = torch.randn(1, T, H, device = "cuda", generator = g) * 1e-6
+    xa = x[0].float() @ ex.gate_up_projs[0].lora_A["default"].weight.float().T
+    assert float((xa.abs().sum(-1) * 30000.0).max()) > 65504   # the unscaled product overflows fp16
+    ref_out, _, _ = _run_up(ex, x, idx, w, False, monkeypatch, upstream)
+    out, gr, calls = _run_up(ex, x, idx, w, True, monkeypatch, upstream)
+    assert calls["forward_fp16_lora"] == 1
+    assert bool(torch.isfinite(ref_out).all())
+    assert bool(torch.isfinite(out).all()), "unscaled LoRA product rounded to fp16 before scaling"
+    assert _rel(out, ref_out) < 2e-2, _rel(out, ref_out)
+
+
+@needs_fp16_grouped
 def test_fp16_kill_switch(monkeypatch):
     ex = _fp16_lora(_fp16_experts())
     T = 64

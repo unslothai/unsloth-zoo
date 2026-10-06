@@ -541,15 +541,19 @@ def _stack_lora(projs, name, which, dtype):
     return torch.stack(mods).to(dtype)
 
 
-def _lora_delta_fp16(x, counts, projs, lora, res_dtype):
-    """Unsloth's forced-float32 LoRA forward per expert (compiler.COMPILED_LORA_FORWARD_forced_float32):
-    xA = x.half() @ A.half().T, then (xA @ B.T) * scaling in the result's dtype."""
+def _lora_add_fp16(result, x, counts, projs, lora):
+    """result + scaling * (x.half() @ A.half().T) @ B.T as Unsloth's forced-float32 LoRA forward
+    (compiler.COMPILED_LORA_FORWARD_forced_float32: one addmm in the result's dtype). The second GEMM,
+    the scaling and the add stay fp32 and round once, so an unscaled product past the fp16 range
+    cannot become inf before scaling."""
     from unsloth_zoo.temporary_patches.moe_grouped_fp16 import grouped_linear
     name, scaling, _ = lora
+    res_dtype = result.dtype
     A = _stack_lora(projs, name, "lora_A", torch.float16)
     B = _stack_lora(projs, name, "lora_B", res_dtype)
     xa = grouped_linear(x.to(torch.float16), A, counts)
-    return grouped_linear(xa.to(res_dtype), B, counts) * scaling
+    delta = grouped_linear(xa.to(res_dtype), B, counts, out_dtype = torch.float32)
+    return (result.float() + delta * scaling).to(res_dtype)
 
 
 def down_operand_dtype(device):
@@ -611,13 +615,13 @@ def _grouped_qlora_forward_fp16(experts, hidden_states, router_indices, routing_
     # Linear4bit: x.to(compute dtype), bias in the epilogue, output back in the input's dtype.
     gate_up = grouped_frozen_linear(xs.to(f16), counts, gu_w, bias = gu_bias, out_dtype = f16).to(acc_dtype)
     if lora is not None and lora["gate_up"] is not None:
-        gate_up = gate_up + _lora_delta_fp16(xs, counts, gu_projs, lora["gate_up"], acc_dtype)
+        gate_up = _lora_add_fp16(gate_up, xs, counts, gu_projs, lora["gate_up"])
     gated = swiglu_torch_forward(gate_up, experts.alpha, experts.limit, dtype = torch.float32)
     out = grouped_frozen_linear(
         gated, counts, dn_w, bias = dn_bias, out_dtype = dn_out_dtype, x_mode = x_mode, dy_mode = dy_mode,
     ).float()
     if lora is not None and lora["down"] is not None:
-        out = out + _lora_delta_fp16(gated, counts, dn_projs, lora["down"], torch.float32)
+        out = _lora_add_fp16(out, gated, counts, dn_projs, lora["down"])
 
     weighted = out * routing_weights[sorted_tokens, expert_ids, None].to(torch.float32)
     next_states = combine_permuted_moe_outputs(weighted, sorted_idx, num_tokens, top_k, out_dtype = torch.float32)
