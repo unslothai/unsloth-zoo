@@ -1229,13 +1229,18 @@ class GptOssExpertsBnb4bit(nn.Module):
                 from bitsandbytes.nn import Params4bit
                 from unsloth_zoo.temporary_patches.moe_utils import _check_torch_grouped_mm_supported
                 if not _check_torch_grouped_mm_supported():
-                    return _fail("torch._grouped_mm unsupported")
+                    # fp16 experts run moe_grouped_fp16's Triton GEMMs, which need no torch._grouped_mm.
+                    from unsloth_zoo.temporary_patches.moe_grouped_fp16 import fp16_grouped_available
+                    first = getattr(self.gate_up_projs[0], "base_layer", self.gate_up_projs[0])
+                    if not fp16_grouped_available(first.weight.device):
+                        return _fail("torch._grouped_mm unsupported")
                 from unsloth_zoo.temporary_patches.gpt_oss_grouped_qlora import expert_lora_state
                 lora = expert_lora_state(self)
                 if isinstance(lora, str):
                     return _fail(f"LoRA-wrapped experts: {lora}")
                 blocksize = fmt = None
-                for lin in list(self.gate_up_projs) + list(self.down_projs):
+                proj_dtype = {}
+                for which, lin in [(0, m) for m in self.gate_up_projs] + [(1, m) for m in self.down_projs]:
                     lin = getattr(lin, "base_layer", lin)
                     w = getattr(lin, "weight", None)
                     if not (isinstance(w, Params4bit) and getattr(w, "quant_state", None) is not None):
@@ -1256,10 +1261,12 @@ class GptOssExpertsBnb4bit(nn.Module):
                     # The bitsandbytes fallback decodes every expert with the first one's format.
                     elif (
                         qs.quant_type != fmt.quant_type
-                        or qs.dtype != fmt.dtype
                         or bool(getattr(qs, "nested", False)) != bool(getattr(fmt, "nested", False))
                         or not (qs.code is fmt.code or torch.equal(qs.code, fmt.code))
                     ):
+                        return _fail("mixed quantization formats across experts")
+                    # One dequant dtype per projection: on float16 the loader keeps down in fp32.
+                    if proj_dtype.setdefault(which, qs.dtype) != qs.dtype:
                         return _fail("mixed quantization formats across experts")
                     b = getattr(lin, "bias", None)
                     # The grouped path stacks per-expert biases.
@@ -1282,14 +1289,15 @@ class GptOssExpertsBnb4bit(nn.Module):
         """Grouped equivalent of the per-expert loop (gpt_oss_grouped_qlora): one gather,
         one stacked NF4 dequant + torch._grouped_mm per projection (rebuilt in backward
         per _moe_recompute_default), the LoRA adapter as grouped_mm over the stacked
-        per-expert A / B, fp32 index_add combine. None (the caller keeps the per-expert
-        loop) unless the experts compute in bf16 and the input is bf16 or fp32.
+        per-expert A / B, fp32 index_add combine. fp16 experts (fp32 down under the
+        loader's rule) take Triton grouped GEMMs with the loop's per-projection dtypes.
+        None (the caller keeps the per-expert loop) when no grouped path matches.
 
         Self-contained (local imports, no module globals) for the standalone
         compiled cache; see _grouped_bnb4bit_ready."""
         from unsloth_zoo.temporary_patches.gpt_oss_grouped_qlora import grouped_qlora_forward
         lora = getattr(self, "_unsloth_grouped_lora", None)
-        if hidden_states.dtype not in (torch.bfloat16, torch.float32):
+        if hidden_states.dtype not in (torch.bfloat16, torch.float16, torch.float32):
             return None
         return grouped_qlora_forward(
             self, hidden_states, router_indices, routing_weights,
@@ -1303,11 +1311,10 @@ class GptOssExpertsBnb4bit(nn.Module):
         num_experts = routing_weights.shape[1]
         top_k = router_indices.shape[1]
 
-        # fp16 keeps the loop path, whose fp32 swiglu + autocast-disabled down
-        # projection protect against fp16 overflow; grouped runs in model dtype.
+        # fp16 experts take the grouped path too: it keeps the loop's fp32 swiglu and
+        # fp32 down output (gpt_oss_grouped_qlora.compute_mode decides per call).
         if (
             self.training
-            and hidden_states.dtype is not torch.float16
             and self._grouped_bnb4bit_ready()
         ):
             try:
@@ -2870,11 +2877,9 @@ def torch_native_forward(
 
     # Grouped bnb-4bit fast path. The class dispatches this module-level
     # function (forward is rebound below), so the gate must live here too.
-    # fp16 keeps the loop path below, whose fp32 swiglu + autocast-disabled
-    # down projection protect against fp16 overflow.
+    # fp16 experts keep the loop's fp32 swiglu and fp32 down output there.
     if (
         self.training
-        and hidden_states.dtype is not torch.float16
         and hasattr(self, "_grouped_bnb4bit_ready")
     ):
         grouped = _try_grouped_bnb4bit(
