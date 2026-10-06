@@ -6080,3 +6080,35 @@ def test_restored_image_context_bound_covers_placeholder_expansion(phase):
     out = u._prepare_vlm_batch_for_compile(batch(13), config, phase=phase)
     assert out["input_ids"].shape[1] == 13
     assert np.asarray(out["input_ids"])[0].tolist() == [1, 2, 3, 4] + [200] * 8 + [5]
+
+
+@pytest.mark.parametrize("opaque", [False, True])
+def test_image_rescue_is_sized_by_the_affected_rows(opaque):
+    from unsloth_zoo.mlx import utils as u
+
+    class Processor(_FakeProcessor):
+        def __call__(self, text, truncation=False, max_length=None, **kwargs):
+            rows = [[200, 200] + list(range(20, 38)), [11, 200, 200, 12, 13, 200, 200, 14]]
+            if truncation and max_length:
+                rows = [row[:max_length] for row in rows]
+            width = max(map(len, rows))
+            ids = np.zeros((2, width), dtype=np.int32)
+            mask = np.zeros_like(ids)
+            for index, row in enumerate(rows):
+                ids[index, :len(row)], mask[index, :len(row)] = row, 1
+            result = dict(input_ids=ids, attention_mask=mask,
+                          pixel_values=np.ones((2, 3), dtype=np.float32))
+            return {k: mx.array(v) for k, v in result.items()} if opaque else result
+
+    processor = Processor()
+    processor.tokenizer = _FakeTokenizer()
+    rows = [{"text": "sample", "images": [Image.new("RGB", (2, 2))]} for _ in range(2)]
+    with pytest.warns(UserWarning, match="1 row.*to 8 tokens"):
+        batch = u._finalize_vlm_batch(u._collate_vlm_batch(
+            rows, processor, 6, None, image_context_limit=10,
+            ignore_token_ids=[200], reject_mlx_valued=opaque,
+        ))
+    ids = np.asarray(batch["input_ids"])
+    assert ids.shape[1] == 8
+    assert ids[1].tolist().count(200) == 4
+    assert ids[0].tolist() == [200, 200] + list(range(20, 26))

@@ -8818,15 +8818,15 @@ def legacy_image_inputs(processor, texts, all_images, max_seq_length, truncation
     if truncation and max_seq_length and ids.shape[1] > max_seq_length:
         side = getattr(processor, "truncation_side", "right")
         columns = slice(-max_seq_length, None) if side == "left" else slice(0, max_seq_length)
-        expanded = _image_span_expansion_required(
+        required = _image_span_expansion_required(
             {"input_ids": ids, "attention_mask": mask},
             {"input_ids": ids[:, columns], "attention_mask": mask[:, columns]},
-            [token_id], max_seq_length, image_context_limit,
+            [token_id], max_seq_length, image_context_limit, side=side,
         )
-        if expanded:
+        if required:
             inputs["_unsloth_image_context_limit"] = image_context_limit
-        else:
-            ids, mask = ids[:, columns], mask[:, columns]
+            columns = slice(-required, None) if side == "left" else slice(0, required)
+        ids, mask = ids[:, columns], mask[:, columns]
     inputs["input_ids"], inputs["attention_mask"] = ids, mask
     inputs[_LEGACY_IMAGE_SPEC] = (token_id, count)
     validate_legacy_image_batch(inputs)
@@ -9269,7 +9269,7 @@ def _vlm_image_context_limit(config):
 
 
 def _image_span_expansion_required(full_inputs, inputs, token_ids, max_seq_length,
-                                   context_limit=None):
+                                   context_limit=None, side="right"):
     full_ids = _as_numpy_vlm_field(full_inputs, "input_ids")
     ids = _as_numpy_vlm_field(inputs, "input_ids")
     full_mask = (np.ones_like(full_ids) if full_inputs.get("attention_mask") is None
@@ -9277,16 +9277,21 @@ def _image_span_expansion_required(full_inputs, inputs, token_ids, max_seq_lengt
     mask = (np.ones_like(ids) if inputs.get("attention_mask") is None
             else _as_numpy_vlm_field(inputs, "attention_mask"))
     lost = []
+    required = 0
     for index, (full_row, row) in enumerate(zip(full_ids, ids)):
+        valid = np.flatnonzero(full_mask[index])
         full_row = full_row[full_mask[index].astype(bool)]
         row = row[mask[index].astype(bool)]
         expected = full_row[np.isin(full_row, token_ids or ()) | (full_row < 0)]
         retained = row[np.isin(row, token_ids or ()) | (row < 0)]
         if not np.array_equal(expected, retained):
             lost.append(index)
+            # Columns the row spans from the kept edge, not the batch width.
+            if valid.size:
+                required = max(required, int(
+                    full_ids.shape[1] - valid[0] if side == "left" else valid[-1] + 1))
     if not lost:
-        return False
-    required = full_ids.shape[1]
+        return 0
     if context_limit is None or required > context_limit:
         raise ValueError(
             f"Unsloth MLX: max_seq_length={max_seq_length} truncates an image "
@@ -9301,7 +9306,7 @@ def _image_span_expansion_required(full_inputs, inputs, token_ids, max_seq_lengt
         f"{required} tokens (model context limit {context_limit}).",
         stacklevel=3,
     )
-    return True
+    return required
 
 
 def _collate_vlm_prompt_completion_batch(
@@ -9494,13 +9499,17 @@ def _combine_vlm_prompt_completion_inputs(
         input_ids, attention_mask, flush_side, max_seq_length, extras,
     )
     if any(prompt_inputs.get(key) is not None for key in ("pixel_values", "images")):
-        expanded = _image_span_expansion_required(
+        required = _image_span_expansion_required(
             full_inputs, {"input_ids": input_ids, "attention_mask": attention_mask},
             image_token_ids or ignore_token_ids, max_seq_length, image_context_limit,
+            side=flush_side,
         )
+        expanded = bool(required)
         if expanded:
-            input_ids, attention_mask = full_inputs["input_ids"], full_inputs["attention_mask"]
-            extras = full_extras
+            input_ids, attention_mask, extras = _truncate_vlm_arrays_by_side(
+                full_inputs["input_ids"], full_inputs["attention_mask"], flush_side,
+                required, full_extras,
+            )
     # Truncation keeps CUDA's side; the rows still have to arrive right-padded.
     input_ids, attention_mask, extras = _flush_vlm_arrays_to_side(
         input_ids, attention_mask, "right", pad_id, extras,
@@ -9648,12 +9657,16 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
             suffixes=all_suffixes, truncation=False, padding_side="right",
             all_audio=all_audio,
         )
-        if _image_span_expansion_required(
+        required = _image_span_expansion_required(
             full_inputs, inputs,
             _image_truncation_token_ids(processor, ignore_token_ids), max_seq_length,
             image_context_limit,
-        ):
-            inputs = _right_pad_vlm_rows(full_inputs, processor)
+        )
+        if required:
+            inputs = _right_pad_vlm_rows(_processor_vlm_inputs(
+                processor, all_texts, all_images, required,
+                suffixes=all_suffixes, padding_side="right", all_audio=all_audio,
+            ), processor)
             inputs["_unsloth_image_context_limit"] = image_context_limit
     audio_counts = [len(clips) for clips in all_audio]
     effective_length = (
