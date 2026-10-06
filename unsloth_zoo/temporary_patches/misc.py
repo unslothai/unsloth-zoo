@@ -592,8 +592,8 @@ pass
 TEMPORARY_PATCHES.append(patch_CsmProcessor_apply_chat_template)
 
 
-# Compiled, `_ignore_causal_mask_sdpa` always refuses, so SDPA loses its `is_causal` kernels
-# (B200 T=8192: 63.1 ms vs 6.8 ms). Plain causal calls run eagerly instead; UNSLOTH_SKIP_CAUSAL_MASK=0 disables.
+# Compiled, `_ignore_causal_mask_sdpa` always refuses, so SDPA loses its `is_causal` kernels.
+# Plain causal calls run eagerly instead; UNSLOTH_SKIP_CAUSAL_MASK=0 disables.
 CAUSAL_MASK_SKIP_STATS = {"skipped": 0}
 _SKIP_CAUSAL_MASK_ENV = "UNSLOTH_SKIP_CAUSAL_MASK"
 # Any other non-None argument (or/and_mask_function, encoder_hidden_states, ...) keeps the mask.
