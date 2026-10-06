@@ -807,7 +807,9 @@ def _flatten(value, indent = 0):
     if isinstance(value, bool):
         return "True" if value else "False"
     if isinstance(value, list):
-        return "\n".join(f"{pad}- {_flatten(item, indent + 1).lstrip(' \t\n\r')}" for item in value)
+        # Not inside the f-string: a backslash there is a SyntaxError before Python 3.12.
+        whitespace = " \t\n\r"
+        return "\n".join(f"{pad}- {_flatten(item, indent + 1).lstrip(whitespace)}" for item in value)
     if isinstance(value, dict):
         lines = []
         for key, item in value.items():
