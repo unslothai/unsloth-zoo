@@ -16,6 +16,7 @@
 
 """Fine-tuning for the MLX Laya decision model: trainable loading, LoRA adapters and the training loop."""
 
+import contextlib
 import copy
 import math
 import random
@@ -35,6 +36,8 @@ __all__ = [
     "HEAD_LEARNING_RATE",
     "MLXDecisionTrainer",
     "add_lora_adapters",
+    "clef_logits",
+    "clef_training_network",
     "collate_decisions",
     "decision_logits",
     "load_trainable_decision_model",
@@ -230,6 +233,175 @@ def _staged_logits(step, batch):
     return model.decide(hidden, keys, batch["marker_pos"], batch["marker_mask"], batch["qtype"])
 
 
+class _MarkerStep:
+    """How the trainer runs a Laya network: padded batches of one decision per row."""
+
+    def __init__(self, model, pad_token_id, compiled = False):
+        self.model, self.pad_token_id = model, pad_token_id
+        # Scoring stays uncompiled: a compiled stage would replay the training-mode trace it was built with.
+        self.staged = _LayerwiseStep(model)
+        if getattr(model, "gradient_checkpointing", False):
+            self.loss_and_grad = _LayerwiseStep(model, compiled)
+        else:
+            value_and_grad = nn.value_and_grad(model, _soft_cross_entropy)
+            self.loss_and_grad = lambda batch: value_and_grad(model, batch)
+            if compiled:
+                state = [model.state, mx.random.state]
+                self.loss_and_grad = mx.compile(self.loss_and_grad, inputs = state, outputs = state)
+
+    def collate(self, items):
+        return collate_decisions(items, self.pad_token_id)
+
+    def __call__(self, batch):
+        return self.loss_and_grad(batch)
+
+    def losses(self, batch):
+        """Summed soft cross-entropy of a batch and the number of decisions in it."""
+        logits = _staged_logits(self.staged, batch)
+        return -(batch["target"] * nn.log_softmax(logits, axis = -1)).sum(), batch["target"].shape[0]
+
+
+_CLEF_LORA_TARGETS = ("q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "in_proj_z", "out_proj", "gate_proj", "up_proj", "down_proj")
+
+
+@contextlib.contextmanager
+def _decoder_training(model, gradient_checkpointing = True):
+    """What `MLXTrainer` sets up around a run for a decoder: differentiable kernels in place of the fused inference ones."""
+    from ..gated_delta_vjp import patch_gated_delta, patch_gated_delta_vlm, patch_gated_delta_vlm_shared
+    from .compile import model_has_gated_delta_layers, model_has_qwen35_attention_layers
+    from .loader import _disable_fused_input_projections, _disable_fused_mrope, _fix_qwen35_attention_cache
+    from .utils import acquire_mlx_training_patches, apply_gradient_checkpointing, release_mlx_training_patches, remove_gradient_checkpointing
+
+    unfused = {"fused_apply": [], "fuse_in": []}
+    acquire_mlx_training_patches()
+    try:
+        if gradient_checkpointing:
+            apply_gradient_checkpointing(model)
+        if model_has_gated_delta_layers(model):
+            # mlx-vlm's copies first, or patch_gated_delta's sweep warns about them.
+            patch_gated_delta_vlm()
+            patch_gated_delta_vlm_shared()
+            patch_gated_delta()
+        if model_has_qwen35_attention_layers(model):
+            _fix_qwen35_attention_cache(model)
+            unfused["fused_apply"] = _disable_fused_mrope(model)
+        unfused["fuse_in"] = _disable_fused_input_projections(model)
+        yield
+    finally:
+        for flag, modules in unfused.items():
+            for module in modules:
+                setattr(module, flag, True)
+        if gradient_checkpointing:
+            remove_gradient_checkpointing(model)
+        release_mlx_training_patches()
+
+
+class ClefNetwork(nn.Module):
+    """A loaded Clef pipeline's decoder (`encoder`) and joint head as the one parameter tree the trainer optimizes."""
+
+    def __init__(self, pipeline, gradient_checkpointing = True):
+        super().__init__()
+        self.encoder, self.head = pipeline.model, pipeline.head
+        self._pipeline, self._gradient_checkpointing = pipeline, bool(gradient_checkpointing)
+
+    def training_run(self):
+        return _decoder_training(self.encoder, self._gradient_checkpointing)
+
+    def decision_step(self, compiled = False):
+        return _ClefStep(self)
+
+
+def clef_training_network(
+    pipeline, full_finetuning = False, r = 64, lora_alpha = 64, target_modules = "all-linear", gradient_checkpointing = True, **lora
+):
+    """Prepare a loaded Clef pipeline for training and return its `ClefNetwork`.
+
+    The float32 joint head always trains. The decoder trains whole under `full_finetuning`, otherwise through LoRA
+    adapters (`lora` is passed to `FastMLXModel.get_peft_model`); `"all-linear"` means its language layers' projections.
+    """
+    from .loader import FastMLXModel
+    from .utils import _get_text_model, describe_output_head
+
+    if full_finetuning:
+        # Only what a text prompt reaches: a trainable weight without a gradient would still decay.
+        pipeline.model.freeze()
+        _get_text_model(pipeline.model).unfreeze()
+        output = describe_output_head(pipeline.model)
+        if output.status != "tied":
+            # The head reads the output embedding without training it.
+            output.module.freeze()
+    else:
+        if target_modules in (None, "all-linear"):
+            target_modules = list(_CLEF_LORA_TARGETS)
+        # Checkpointing is applied around each run instead, so it is gone again when the model serves.
+        FastMLXModel.get_peft_model(
+            pipeline.model, r = r, lora_alpha = lora_alpha, target_modules = target_modules, use_gradient_checkpointing = False, **lora,
+        )
+    pipeline.head.unfreeze()
+    network = ClefNetwork(pipeline, gradient_checkpointing)
+    network.train()
+    return network
+
+
+def _clef_record_loss(network, item):
+    """Soft cross-entropy summed over the questions of one record."""
+    spans = item["option_spans"]
+    logits = network._pipeline.logits(item["input_ids"], item["question_spans"], spans, item["types"])
+    target = np.zeros((len(spans), logits.shape[0]), np.float32)
+    start = 0
+    for row, values in enumerate(item["targets"]):
+        target[row, start : start + len(values)] = values
+        start += len(values)
+    owner = mx.array([row for row, options in enumerate(spans) for _ in options])
+    own = owner[None, :] == mx.arange(len(spans))[:, None]
+    return -(mx.array(target) * nn.log_softmax(mx.where(own, logits[None, :], -1e4), axis = -1)).sum()
+
+
+class _ClefStep:
+    """How the trainer runs a Clef: one record (a prompt holding all its questions) at a time, averaged over questions."""
+
+    def __init__(self, network):
+        self.network = network
+        self.value_and_grad = nn.value_and_grad(network, _clef_record_loss)
+
+    def collate(self, items):
+        return items
+
+    def __call__(self, items):
+        total, grads = 0.0, None
+        for item in items:
+            loss, record = self.value_and_grad(self.network, item)
+            grads = record if grads is None else tree_map(mx.add, grads, record)
+            total = total + loss
+            # A record is evaluated on its own, so memory is bounded by the longest prompt, not the batch.
+            mx.eval(total, grads)
+        count = sum(len(item["targets"]) for item in items)
+        return total / count, tree_map(lambda g: g / count, grads)
+
+    def losses(self, items):
+        total = sum(_clef_record_loss(self.network, item) for item in items)
+        return total, sum(len(item["targets"]) for item in items)
+
+
+def clef_logits(network, items):
+    """Eval-mode option logits of Clef training items: for each item, one float32 numpy array per question."""
+    from .generate import generation_mode
+
+    pipeline, out = network._pipeline, []
+    was_training = network.training
+    network.eval()
+    try:
+        # Scored as requests are served, so temperatures fitted on these logits hold there.
+        with generation_mode(pipeline.model):
+            for item in items:
+                spans = item["option_spans"]
+                logits = np.array(pipeline.logits(item["input_ids"], item["question_spans"], spans, item["types"]))
+                out.append(np.split(logits, np.cumsum([len(options) for options in spans])[:-1]))
+    finally:
+        network.train(was_training)
+    return out
+
+
 def decision_logits(model, items, pad_token_id, batch_size = 16):
     """Eval-mode logits of tokenized decisions: one float32 numpy row per item, as long as its options."""
     step, out = _LayerwiseStep(model), [None] * len(items)
@@ -356,8 +528,9 @@ class MLXDecisionTrainer:
         self.state.log_history.append({**logs, "step": self.state.global_step})
         self._event("on_log", logs = logs)
 
-    def _collate(self, items, batch):
-        return collate_decisions([items[i] for i in batch], self.pad_token_id)
+    def _step(self, compiled = False):
+        build = getattr(self.model, "decision_step", None)
+        return build(compiled) if build else _MarkerStep(self.model, self.pad_token_id, compiled)
 
     def _eval_batches(self):
         size = self.args.per_device_eval_batch_size or self.args.per_device_train_batch_size
@@ -365,21 +538,19 @@ class MLXDecisionTrainer:
         return [order[i : i + size] for i in range(0, len(order), size)]
 
     def evaluate(self):
-        """Mean soft cross-entropy over `eval_dataset`, as `{"eval_loss": ...}`."""
+        """Mean soft cross-entropy over the decisions of `eval_dataset`, as `{"eval_loss": ...}`."""
         model, items = self.model, self.eval_dataset
-        # Uncompiled: a compiled stage would replay the training-mode trace it was built with.
-        step = _LayerwiseStep(model)
+        step = self._step()
         was_training = model.training
         model.eval()
-        total = 0.0
+        total, decisions = 0.0, 0
         try:
             for batch in self._eval_batches():
-                arrays = self._collate(items, batch)
-                logits = _staged_logits(step, arrays)
-                total += -(arrays["target"] * nn.log_softmax(logits, axis = -1)).sum(-1).sum().item()
+                loss, count = step.losses(step.collate([items[i] for i in batch]))
+                total, decisions = total + loss.item(), decisions + count
         finally:
             model.train(was_training)
-        metrics = {"eval_loss": total / len(items), "epoch": self.state.epoch}
+        metrics = {"eval_loss": total / decisions, "epoch": self.state.epoch}
         self._log(metrics)
         self._event("on_evaluate", metrics = metrics)
         return metrics
@@ -394,7 +565,8 @@ class MLXDecisionTrainer:
         if limit is None or limit > 0:
             prior = mx.set_cache_limit(mx.get_peak_memory() if limit is None else int(limit * 1e9))
         try:
-            return self._train()
+            with getattr(self.model, "training_run", contextlib.nullcontext)():
+                return self._train()
         finally:
             if prior is not None:
                 mx.set_cache_limit(prior)
@@ -423,14 +595,7 @@ class MLXDecisionTrainer:
         eval_strategy = "no" if not self.eval_dataset else "steps" if eval_steps else "epoch"
 
         compiled = getattr(args, "compile", True) and getattr(args, "compile_mode", None) != "eager"
-        if getattr(model, "gradient_checkpointing", False):
-            loss_and_grad = _LayerwiseStep(model, compiled)
-        else:
-            value_and_grad = nn.value_and_grad(model, _soft_cross_entropy)
-            loss_and_grad = lambda batch: value_and_grad(model, batch)
-            if compiled:
-                compiled_state = [model.state, mx.random.state]
-                loss_and_grad = mx.compile(loss_and_grad, inputs = compiled_state, outputs = compiled_state)
+        step = self._step(compiled)
 
         state = self.state
         state.max_steps, state.logging_steps, state.train_batch_size = max_steps, logging_steps, batch_size
@@ -444,7 +609,7 @@ class MLXDecisionTrainer:
             self._event("on_epoch_begin")
             accumulated, losses = None, []
             for index, batch in enumerate(batches):
-                loss, grads = loss_and_grad(self._collate(items, batch))
+                loss, grads = step(step.collate([items[i] for i in batch]))
                 if accumulated is not None:
                     grads = tree_map(mx.add, accumulated, grads)
                 mx.eval(loss, grads)

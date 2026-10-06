@@ -44,10 +44,14 @@ from safetensors.torch import load_file, save_file  # noqa: E402
 from unsloth_zoo.mlx.decision import _KevModel, _LabelModel, _merge_lora, load_decision_model, save_decision_model  # noqa: E402
 from unsloth_zoo.mlx.decision_trainer import (  # noqa: E402
     MLXDecisionTrainer,
+    ClefNetwork,
     _LayerwiseStep,
+    _clef_record_loss,
     _length_grouped_batches,
     _soft_cross_entropy,
     add_lora_adapters,
+    clef_logits,
+    clef_training_network,
     collate_decisions,
     decision_logits,
     load_trainable_decision_model,
@@ -496,7 +500,7 @@ def _without_dropout(model):
 
 
 def _parameters(model):
-    return {name: np.array(value) for name, value in tree_flatten(model.parameters())}
+    return {name: np.array(value.astype(mx.float32)) for name, value in tree_flatten(model.parameters())}
 
 
 def test_training_forward_matches_eval_until_dropout_applies(checkpoint):
@@ -607,6 +611,94 @@ def test_decision_logits_match_the_forward_item_by_item(checkpoint):
         want = np.array(model(**{k: v for k, v in collate_decisions([item], 0).items() if k != "target"}))[0]
         np.testing.assert_allclose(row, want, atol = 2e-2)
         assert row.shape == (len(item["markers"]),)
+
+
+@pytest.fixture
+def clef(tmp_path, monkeypatch):
+    from unsloth_zoo.mlx.decision import _TYPE_IDS, ClefModel
+
+    torch.manual_seed(0)
+    config = {"hidden_size": 64, "width": 32, "routing_layers": 2, "layers": 2, "heads": 4, "feedforward": 48}
+    reference = _JointReference(**config)
+    for parameter in reference.parameters():
+        parameter.data.add_(0.3 * torch.randn_like(parameter))
+    (tmp_path / "joint_head_config.json").write_text(json.dumps(config))
+    save_file({name: value.contiguous() for name, value in reference.state_dict().items()}, tmp_path / "joint_head.safetensors")
+    encode = lambda text, add_special_tokens: [ord(c) % 512 for c in text]
+    monkeypatch.setattr(ClefModel, "_load", lambda self, *args: vars(self).update(model = _decoder(), tokenizer = SimpleNamespace(encode = encode)))
+    pipeline = load_decision_model(tmp_path)
+    questions = pipeline._parse_questions({"route": {"type": "choice", "instructions": "where", "criteria": {"a": "x", "b": None, "c": "z"}}, "ok": {"type": "noul", "instructions": "fine?"}})
+
+    def item(state, max_length = None, count = 2):
+        ids, question_spans, option_spans = pipeline.encode(state, questions[:count], max_length)
+        types = [_TYPE_IDS.index(question.type) for question in questions[:count]]
+        return {"input_ids": ids, "question_spans": question_spans, "option_spans": option_spans, "types": types, "targets": [[0.0, 0.25, 0.75], [1.0, 0.0]][:count]}
+
+    return pipeline, reference, item
+
+
+def test_clef_loss_and_head_gradients_match_the_reference_head(clef):
+    pipeline, reference, item = clef
+    record, network = item("hello"), ClefNetwork(pipeline)
+    network.encoder.freeze()
+    network.encoder.language_model.lm_head.unfreeze()
+    loss, grads = _clef_record_loss_and_grad(network, record)
+    ids = torch.tensor(record["input_ids"])
+    hidden = torch.from_numpy(np.array(_forward_text_hidden_states(pipeline.model, mx.array(ids.numpy())[None])[0].astype(mx.float32)))
+    embedding = torch.from_numpy(np.array(pipeline.model.language_model.lm_head.weight.astype(mx.float32)))
+    logits = reference(hidden, embedding, ids, record["question_spans"], record["option_spans"], record["types"])
+    expected = -sum((torch.tensor(target) * torch.log_softmax(row, 0)).sum() for row, target in zip(logits, record["targets"]))
+    expected.backward()
+    assert loss.item() == pytest.approx(expected.item(), rel = 1e-4)
+    got = dict(tree_flatten(grads["head"]))
+    assert not mx.any(grads["encoder"]["language_model"]["lm_head"]["weight"]).item()
+    for name, parameter in reference.named_parameters():
+        np.testing.assert_allclose(np.array(got[name]), parameter.grad.numpy(), atol = 2e-4, rtol = 2e-3, err_msg = name)
+
+
+@pytest.mark.parametrize("encoder_lr, head_lr", [(1e-2, 0.0), (0.0, 1e-2)])
+def test_clef_trains_decoder_adapters_and_head_at_their_own_rates(clef, encoder_lr, head_lr):
+    pipeline, _, item = clef
+    items = [item("hello " * 20), item("bye", count = 1)]
+    network = clef_training_network(pipeline, r = 4, lora_alpha = 4)
+    before, first = _parameters(network), sum(_clef_record_loss(network, record).item() for record in items) / 3
+    adapted = {name.split(".")[-2] for name in before if name.endswith("lora_a")}
+    assert {"q_proj", "in_proj_qkv", "down_proj"} <= adapted and not adapted & {"in_proj_a", "in_proj_b", "lm_head"}
+    args = MLXTrainingConfig(per_device_train_batch_size = 2, max_steps = 3, learning_rate = encoder_lr, warmup_steps = 0, logging_steps = 1, compile = False)
+    trainer = MLXDecisionTrainer(network, args, items, eval_dataset = items, head_learning_rate = head_lr)
+    trainer.train()
+    moved = {name.split(".")[0] for name, value in _parameters(network).items() if not np.array_equal(value, before[name])}
+    assert moved == ({"encoder"} if encoder_lr else {"head"}) and network.training
+    assert trainer.state.log_history[0]["loss"] == pytest.approx(first, rel = 1e-3)
+    assert trainer.evaluate()["eval_loss"] == pytest.approx(sum(_clef_record_loss(network, record).item() for record in items) / 3, rel = 1e-3)
+    assert [len(row) for row in clef_logits(network, items)[0]] == [3, 2]
+
+
+def test_clef_full_fine_tune_trains_the_decoder_but_not_the_output_embedding(clef, monkeypatch):
+    clef[0].model.vision_tower = Linear(2, 2)
+    network, checkpointed = clef_training_network(clef[0], full_finetuning = True, gradient_checkpointing = False), []
+    monkeypatch.setattr("unsloth_zoo.mlx.utils.apply_gradient_checkpointing", checkpointed.append)
+    with network.training_run():
+        names = [name for name, _ in tree_flatten(network.trainable_parameters())]
+        _, grads = _clef_record_loss_and_grad(network, clef[2]("hello"))
+    assert all(mx.any(grads["encoder"]["language_model"]["model"]["layers"][index]["mlp"]["down_proj"]["weight"]).item() for index in (0, 3))
+    assert any(name.startswith("encoder.") for name in names) and not any("lm_head" in name or "vision" in name for name in names) and not checkpointed
+
+
+def test_clef_prompt_gives_up_the_end_of_the_state_only(clef):
+    from unsloth_zoo.mlx.decision import DecisionRequestError
+
+    state = "".join(chr(97 + index % 23) for index in range(240))
+    whole, cut = clef[2](state), clef[2](state, 800)
+    removed = len(whole["input_ids"]) - 800
+    assert removed > 0 and len(cut["input_ids"]) == 800 and cut["input_ids"][-50:] == whole["input_ids"][-50:] and cut["input_ids"][:200] == whole["input_ids"][:200]
+    assert cut["option_spans"][1][1] == tuple(edge - removed for edge in whole["option_spans"][1][1])
+    with pytest.raises(DecisionRequestError, match = "before the state"):
+        clef[2]("state", 100)
+
+
+def _clef_record_loss_and_grad(network, record):
+    return mx.value_and_grad(lambda params: (network.update(params), _clef_record_loss(network, record))[1])(network.trainable_parameters())
 
 
 class _Recorder:

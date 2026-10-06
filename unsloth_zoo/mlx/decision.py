@@ -1109,11 +1109,8 @@ class _JointHead(nn.Module):
         features = mx.concatenate([fields, options, fields * options, mx.abs(fields - options)], axis = -1)
         cosine = (_unit(fields) * _unit(options)).sum(axis = -1)
         joint = mx.exp(mx.minimum(self.joint_logit_scale, math.log(100.0))) * cosine + _apply(self.residual_scorer, features).squeeze(-1)
-        logits = (prior + mx.sigmoid(self.residual_gate) * joint).tolist()
-        bounds = [0]
-        for spans in option_spans:
-            bounds.append(bounds[-1] + len(spans))
-        return [logits[start:end] for start, end in zip(bounds, bounds[1:])]
+        # One logit per option, in question order.
+        return prior + mx.sigmoid(self.residual_gate) * joint
 
 
 def _load_joint_head(folder):
@@ -1166,13 +1163,17 @@ class ClefModel(_QwenModel):
             yield "END FIELD\n", None
         yield "\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:", None
 
-    def _scores(self, state, questions):
-        from .generate import generation_mode
-        from .utils import describe_output_head
-
+    def encode(self, state, questions, max_length = None):
+        """Token ids of the prompt and the (start, end) spans the head reads; a state too long for `max_length` loses its end."""
+        pieces = [(self._encode(text), mark) for text, mark in self._pieces(state, questions)]
+        if max_length is not None:
+            # The state is the second piece; everything else is the schema, which must fit whole.
+            room = max_length - sum(len(piece) for piece, _ in pieces) + len(pieces[1][0])
+            if room < 0:
+                raise DecisionRequestError(f"the questions need {max_length - room} tokens before the state; the maximum is {max_length}")
+            pieces[1] = (pieces[1][0][:room], None)
         ids, question_spans, option_spans = [], [], []
-        for text, mark in self._pieces(state, questions):
-            piece = self._encode(text)
+        for piece, mark in pieces:
             if mark and not piece:
                 raise DecisionRequestError("the instructions and the options of a question must not be empty")
             span = (len(ids), len(ids) + len(piece))
@@ -1182,14 +1183,36 @@ class ClefModel(_QwenModel):
             elif mark == "option":
                 option_spans[-1].append(span)
             ids += piece
+        return ids, question_spans, option_spans
+
+    def _output_head(self):
+        from .utils import describe_output_head
+
         output = describe_output_head(self.model)
         if output.status == "unknown" or not output.raw:
             raise ValueError("Clef reads its options from the output embedding too, which this model's output head does not expose")
+        return output
+
+    def logits(self, ids, question_spans, option_spans, types, output = None):
+        """One logit per option of the prompt, in question order; `types` index `_TYPE_IDS`."""
+        output = output or self._output_head()
+        hidden = self._hidden(ids).astype(mx.float32)
+        # The head reads the output embedding but does not train it.
+        lexical = [mx.stop_gradient(_output_rows(output, ids[start:end])) for spans in option_spans for start, end in spans]
+        return self.head(hidden, lexical, question_spans, option_spans, types)
+
+    def _scores(self, state, questions):
+        from .generate import generation_mode
+
+        ids, question_spans, option_spans = self.encode(state, questions)
+        # Found before generation mode, which swaps a quantized head's class.
+        output = self._output_head()
         with generation_mode(self.model):
-            hidden = self._hidden(ids).astype(mx.float32)
-            lexical = [_output_rows(output, ids[start:end]) for spans in option_spans for start, end in spans]
-            logits = self.head(hidden, lexical, question_spans, option_spans, [_TYPE_IDS.index(q.type) for q in questions])
-        return [[scores] for scores in logits], len(ids)
+            logits = self.logits(ids, question_spans, option_spans, [_TYPE_IDS.index(q.type) for q in questions], output).tolist()
+        bounds = [0]
+        for spans in option_spans:
+            bounds.append(bounds[-1] + len(spans))
+        return [[logits[start:end]] for start, end in zip(bounds, bounds[1:])], len(ids)
 
 
 FAMILIES = {"laya": _MarkerModel, "lev": _LevModel, "nimble": _NimbleModel, "openjev": _OpenJevModel, "kev": _KevModel, "clef": ClefModel}
