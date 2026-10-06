@@ -1584,7 +1584,6 @@ def assert_same_state_dict(old_state_dict, new_state_dict):
     pass
 pass
 
-@torch.inference_mode
 def _refresh_placeholder_dims(parent, attr_name, weight):
     """Replace placeholder sizes of 1 on a Linear / TopKRouter from its real 2-D weight."""
     # All Unsloth Zoo code licensed under LGPLv3
@@ -1596,6 +1595,7 @@ def _refresh_placeholder_dims(parent, attr_name, weight):
 pass
 
 
+@torch.inference_mode
 def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16, bnb_config = None, is_vision_model = False):
     # All Unsloth Zoo code licensed under LGPLv3
     # Unmerges vLLM modules into an HF-compatible model
