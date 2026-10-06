@@ -1368,11 +1368,8 @@ def test_a_real_cold_compile_reaches_the_static_probe_without_a_guard_on_a_bound
 def test_a_compiled_only_run_records_the_layout_its_forward_used(
     restore_param_wrapper, monkeypatch, tmp_path, experts_cls, expected, fullgraph
 ):
-    """A run whose every call is compiled never reaches the eager probe, so the static
-    answer the compiled branch acts on is the only verdict there is. For a family that
-    ignores the stash that answer folds the delta PEFT's way, rank-major, and the saved
-    layout marker has to say so, not fall back to the grouped_by_expert the legacy
-    declaration asks of the separated forward."""
+    """A compiled-only run never reaches the eager probe: a stash-ignoring family folds
+    rank-major there, so the saved marker must say rank_major despite the legacy declaration."""
     monkeypatch.setenv("UNSLOTH_MOE_LORA_B_LAYOUT", MU.LORA_B_LAYOUT_GROUPED_BY_EXPERT)
     assert MU.patch_param_wrapper_for_moe()
     model = _build(experts_cls)
@@ -1393,7 +1390,6 @@ def test_a_compiled_only_run_records_the_layout_its_forward_used(
     finally:
         torch._dynamo.reset()
 
-    # The eager probe is left to measure on the first eager call, as before.
     assert MU.moe_lora_forward_applies_stash(experts, "gate_up_proj") is None
     for wrapper in wrappers:
         assert MU.moe_lora_b_layout_for_wrapper(wrapper, "default") == expected, (

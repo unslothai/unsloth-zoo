@@ -2627,8 +2627,7 @@ def _resolve_experts_forward(experts_module):
     """The function object that `experts_module(...)` will run, or None."""
     # This Unsloth Zoo code section is licensed under AGPL3
 
-    # Not getattr(module, "forward").__func__: under Dynamo that yields the bound method, so
-    # a verdict recorded while tracing would never match the eager lookup.
+    # Not getattr().__func__: Dynamo yields the bound method, so a traced verdict never matches.
     try:
         forward = experts_module.__dict__.get("forward")
     except AttributeError:
@@ -3197,8 +3196,7 @@ def _patched_param_wrapper_forward(
             # every output and gradient on a family that ignores the stash, silently and
             # for the life of the captured graph. The bytecode says which family this is.
             #
-            # Not recorded as the verdict, so the first eager call still measures; kept apart
-            # for the saved lora_B layout marker, which must follow the forward that ran.
+            # Kept apart from the verdict (the first eager call still measures); the marker reads it.
             applies_stash = _forward_statically_reads_stash(experts_module)
             if not applies_stash and _interface_route_reads_stash(experts_module):
                 applies_stash = True
