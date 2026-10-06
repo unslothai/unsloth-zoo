@@ -219,6 +219,18 @@ def test_lora_adapter_is_merged_into_the_decoder_by_layer_name(tmp_path):
         assert after[weight].dtype == mx.bfloat16 and mx.abs(after[weight] - (before[weight].astype(mx.float32) + 3 * delta).astype(mx.bfloat16)).max().item() <= 2**-7
 
 
+def test_shared_prefix_continuations_match_a_full_forward():
+    reader, rng = object.__new__(_LabelModel), np.random.default_rng(0)
+    reader.model = _decoder()
+    prefix = rng.integers(1, 500, 40).tolist()
+    prompts = [prefix + rng.integers(1, 500, n).tolist() for n in (1, 7, 23)]
+    with generation_mode(reader.model):
+        shared = [np.array(hidden.astype(mx.float32)) for hidden in reader._hidden_states(prompts)]
+        full = [np.array(reader._hidden(ids).astype(mx.float32)) for ids in prompts]
+    for got, expected in zip(shared, full):
+        np.testing.assert_allclose(got, expected, atol = 2e-2)
+
+
 @pytest.mark.parametrize("quantized", [False, True])
 def test_label_scores_are_the_output_head_rows_of_the_last_token(quantized):
     reader, ids, picks = _LabelModel.__new__(_LabelModel), list(range(40, 63)), mx.array([300, 7, 301])
