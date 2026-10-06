@@ -5068,6 +5068,31 @@ def _ast_fused_lm_head_fallback(source, module = None, module_class = None):
     return new_source
 
 
+def fused_lm_head_forward(module, module_class, modeling_module_name, source):
+    """The compiler's fused-CE rewrite of one GenerationMixin forward.
+
+    Returns (new_source, route, supports_return_hidden_states); route is "regex", "ast" or None.
+    Pure on the source, so tests/test_fused_ce_coverage.py runs the same decision without compiling.
+    """
+    # Fix some arguments up like for Gemma 3N
+    new_source = fixup_fused_lm_head(source)
+    new_source = fixup_dropped_logit_scale(new_source, module)
+    # Fused CE reads lm_head.weight, which Roberta-style composite heads lack.
+    from unsloth_zoo.fused_losses.forward_install import _head_built_as_linear
+    if not _head_built_as_linear(module_class, "lm_head"):
+        return new_source, None, False
+    fused_source, supports_return_hidden_states = apply_fused_lm_head(new_source, module)
+    route = "regex" if supports_return_hidden_states else None
+    # Only classes defined here: an imported one (4.x Blenderbot) lacks its base classes.
+    if not supports_return_hidden_states and \
+            getattr(module_class, "__module__", None) == modeling_module_name:
+        # AST fallback has no UNSLOTH_RETURN_HIDDEN_STATES branch: GRPO keeps its wrapper.
+        ast_source = _ast_fused_lm_head_fallback(new_source, module, module_class)
+        if ast_source is not None:
+            fused_source, route = ast_source, "ast"
+    return fused_source, route, supports_return_hidden_states
+
+
 def fixup_dropped_logit_scale(source, module = None):
     if module not in _DROPPED_TEXT_LOGIT_SCALE or "logit_scale" in source:
         return source
@@ -6575,25 +6600,9 @@ def unsloth_compile_transformers(
                     source = inspect.getsource(module_class.forward)
                 except:
                     continue
-                # Fix some arguments up like for Gemma 3N
-                new_source = fixup_fused_lm_head(source)
-                new_source = fixup_dropped_logit_scale(new_source, module)
-                # Fused CE reads lm_head.weight, which Roberta-style composite heads lack.
-                from unsloth_zoo.fused_losses.forward_install import _head_built_as_linear
-                if _head_built_as_linear(module_class, "lm_head"):
-                    fused_source, supports_return_hidden_states = apply_fused_lm_head(
-                        new_source, module
-                    )
-                    # Only classes defined here: an imported one (4.x Blenderbot) lacks its base classes.
-                    if not supports_return_hidden_states and \
-                            getattr(module_class, "__module__", None) == modeling_file.__name__:
-                        # AST fallback has no UNSLOTH_RETURN_HIDDEN_STATES branch: GRPO keeps its wrapper.
-                        ast_source = _ast_fused_lm_head_fallback(new_source, module, module_class)
-                        if ast_source is not None:
-                            fused_source = ast_source
-                    new_source = fused_source
-                else:
-                    supports_return_hidden_states = False
+                new_source, _, supports_return_hidden_states = fused_lm_head_forward(
+                    module, module_class, modeling_file.__name__, source,
+                )
                 # print(new_source)
                 new_source = apply_mask_attention_mask_out(new_source)
                 if new_source != source:

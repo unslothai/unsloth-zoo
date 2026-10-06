@@ -117,6 +117,9 @@ def patch_deepseek_v3():
         )
 
         _original_causal_lm_forward = DeepseekV3ForCausalLM.forward
+        # Temporary patches run at init, pre_compile and post_compile: wrap each class once.
+        if getattr(_original_causal_lm_forward, "_unsloth_hidden_states_wrapper", False):
+            return True
 
         def _patched_causal_lm_forward(
             self,
@@ -183,6 +186,9 @@ def patch_deepseek_v3():
         # Preserve __qualname__ so _unsloth_get_batch_samples can detect
         # this is a CausalLM forward and compute num_items_in_batch properly.
         _patched_causal_lm_forward.__qualname__ = _original_causal_lm_forward.__qualname__
+        # Lets the compiler read (and fuse the loss of) the real forward, as with functools.wraps.
+        _patched_causal_lm_forward.__wrapped__ = _original_causal_lm_forward
+        _patched_causal_lm_forward._unsloth_hidden_states_wrapper = True
         DeepseekV3ForCausalLM.forward = _patched_causal_lm_forward
         patch_function(DeepseekV3ForCausalLM, "forward", _patched_causal_lm_forward)
 

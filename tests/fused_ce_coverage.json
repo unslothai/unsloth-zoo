@@ -1,0 +1,1033 @@
+{
+ "versions": [
+  "4.55.0",
+  "4.55.1",
+  "4.55.2",
+  "4.55.3",
+  "4.55.4",
+  "4.56.0",
+  "4.56.1",
+  "4.56.2",
+  "4.57.0",
+  "4.57.1",
+  "4.57.2",
+  "4.57.3",
+  "4.57.4",
+  "4.57.5",
+  "4.57.6",
+  "5.0.0rc0",
+  "5.0.0rc1",
+  "5.0.0rc2",
+  "5.0.0rc3",
+  "5.0.0",
+  "5.1.0",
+  "5.2.0",
+  "5.3.0",
+  "5.4.0",
+  "5.5.0",
+  "5.5.1",
+  "5.5.2",
+  "5.5.3",
+  "5.5.4",
+  "5.6.0",
+  "5.6.1",
+  "5.6.2",
+  "5.7.0",
+  "5.8.0",
+  "5.8.1",
+  "5.9.0",
+  "5.10.0",
+  "5.10.1",
+  "5.10.2",
+  "5.10.4",
+  "5.11.0",
+  "5.12.0",
+  "5.12.1",
+  "5.13.0",
+  "5.13.1",
+  "5.14.0",
+  "5.14.1",
+  "5.15.0",
+  "5.15.1",
+  "5.16.0",
+  "5.16.1",
+  "5.17.0",
+  "5.18.0"
+ ],
+ "fused": {
+  "AXK1ForCausalLM": [
+   "5.15.0..5.18.0"
+  ],
+  "AXK2ForCausalLM": [
+   "5.15.0..5.18.0"
+  ],
+  "AfmoeForCausalLM": [
+   "5.0.0rc0..5.18.0"
+  ],
+  "ApertusForCausalLM": [
+   "4.56.0..5.18.0"
+  ],
+  "ArceeForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "AriaForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "AriaTextForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "AudioFlamingo3ForConditionalGeneration": [
+   "5.10.0..5.18.0"
+  ],
+  "AyaVisionForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "BambaForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "BartForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "BartForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "BigBirdPegasusForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "BigBirdPegasusForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "BioGptForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "BitNetForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "BlenderbotForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "BlenderbotForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "BlenderbotSmallForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "BlenderbotSmallForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "BloomForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "BltForCausalLM": [
+   "4.57.0..5.18.0"
+  ],
+  "CTRLLMHeadModel": [
+   "4.55.0..5.18.0"
+  ],
+  "CanaryForConditionalGeneration": [
+   "5.17.0..5.18.0"
+  ],
+  "ClvpForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "CodeGenForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "Cohere2ForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "Cohere2MoeForCausalLM": [
+   "5.9.0..5.18.0"
+  ],
+  "Cohere2VisionForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "CohereAsrForConditionalGeneration": [
+   "5.15.0..5.18.0"
+  ],
+  "CohereCompassForCausalLM": [
+   "5.16.0..5.18.0"
+  ],
+  "CohereCompassForConditionalGeneration": [
+   "5.16.0..5.18.0"
+  ],
+  "CohereForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "Cosmos3EdgeForConditionalGeneration": [
+   "5.15.0..5.18.0"
+  ],
+  "Cosmos3OmniForConditionalGeneration": [
+   "5.11.0..5.18.0"
+  ],
+  "CpmAntForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "CwmForCausalLM": [
+   "5.0.0rc0..5.18.0"
+  ],
+  "DbrxForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "DeepseekOcr2ForConditionalGeneration": [
+   "5.10.1..5.18.0"
+  ],
+  "DeepseekV2ForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "DeepseekV32ForCausalLM": [
+   "5.11.0..5.18.0"
+  ],
+  "DeepseekV3ForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "DeepseekV4ForCausalLM": [
+   "5.8.0..5.18.0"
+  ],
+  "DeepseekVLForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "DeepseekVLHybridForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "DiffLlamaForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "DogeForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "Dots1ForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "ElectraForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "Emu3ForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "Emu3ForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "Ernie4_5ForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "Ernie4_5_MoeForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "Ernie4_5_VLMoeForConditionalGeneration": [
+   "5.3.0..5.18.0"
+  ],
+  "Ernie4_5_VL_MoeForConditionalGeneration": [
+   "5.0.0rc2..5.18.0"
+  ],
+  "EvollaForProteinText2Text": [
+   "4.55.0..5.18.0"
+  ],
+  "Exaone4ForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "Exaone4_5_ForConditionalGeneration": [
+   "5.8.0..5.18.0"
+  ],
+  "ExaoneMoeForCausalLM": [
+   "5.1.0..5.18.0"
+  ],
+  "FalconForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "FalconH1ForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "FalconMambaForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "FastVlmForConditionalGeneration": [
+   "5.0.0rc1..5.18.0"
+  ],
+  "FlexOlmoForCausalLM": [
+   "4.57.0..5.18.0"
+  ],
+  "Florence2ForConditionalGeneration": [
+   "4.56.0..5.18.0"
+  ],
+  "FunAsrNanoForConditionalGeneration": [
+   "5.17.0..5.18.0"
+  ],
+  "FuyuForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "GPT2LMHeadModel": [
+   "4.55.0..5.18.0"
+  ],
+  "GPTBigCodeForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "GPTJForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "GPTNeoForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "GPTNeoXForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "GPTNeoXJapaneseForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "Gemma2ForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "Gemma3ForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "Gemma3ForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "Gemma3nForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "Gemma3nForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "Gemma4ForCausalLM": [
+   "5.5.0..5.18.0"
+  ],
+  "Gemma4ForConditionalGeneration": [
+   "5.5.0..5.18.0"
+  ],
+  "Gemma4UnifiedForCausalLM": [
+   "5.10.0..5.18.0"
+  ],
+  "Gemma4UnifiedForConditionalGeneration": [
+   "5.10.0..5.18.0"
+  ],
+  "GemmaForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "Glm46VForConditionalGeneration": [
+   "5.0.0rc0..5.18.0"
+  ],
+  "Glm4ForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "Glm4MoeForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "Glm4MoeLiteForCausalLM": [
+   "5.0.0rc3..5.18.0"
+  ],
+  "Glm4vForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "Glm4vMoeForConditionalGeneration": [
+   "4.56.0..5.18.0"
+  ],
+  "Glm5NextForConditionalGeneration": [
+   "5.16.1..5.18.0"
+  ],
+  "GlmAsrForConditionalGeneration": [
+   "5.10.0..5.18.0"
+  ],
+  "GlmForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "GlmImageForConditionalGeneration": [
+   "5.0.0rc3..5.18.0"
+  ],
+  "GlmMoeDsaForCausalLM": [
+   "5.2.0..5.18.0"
+  ],
+  "GlmOcrForConditionalGeneration": [
+   "5.1.0..5.18.0"
+  ],
+  "GotOcr2ForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "GptOssForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "Granite4VisionForConditionalGeneration": [
+   "5.8.0..5.18.0"
+  ],
+  "GraniteForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "GraniteMoeForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "GraniteMoeHybridForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "GraniteMoeSWAForCausalLM": [
+   "5.15.0..5.18.0"
+  ],
+  "GraniteMoeSharedForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "GraniteSWAForCausalLM": [
+   "5.15.0..5.18.0"
+  ],
+  "GraniteSpeechForConditionalGeneration": [
+   "5.10.0..5.18.0"
+  ],
+  "GraniteSpeechPlusForConditionalGeneration": [
+   "5.10.0..5.18.0"
+  ],
+  "HYV3ForCausalLM": [
+   "5.6.0..5.18.0"
+  ],
+  "HYV4ForCausalLM": [
+   "5.17.0..5.18.0"
+  ],
+  "HeliumForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "HrmTextForCausalLM": [
+   "5.9.0..5.18.0"
+  ],
+  "HunYuanDenseV1ForCausalLM": [
+   "4.56.0..5.18.0"
+  ],
+  "HunYuanMoEV1ForCausalLM": [
+   "4.56.0..5.18.0"
+  ],
+  "HunYuanVLForConditionalGeneration": [
+   "5.13.0..5.18.0"
+  ],
+  "HyperCLOVAXForCausalLM": [
+   "5.9.0..5.18.0"
+  ],
+  "HyperCLOVAXVisionV2ForConditionalGeneration": [
+   "5.18.0"
+  ],
+  "Idefics2ForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "Idefics3ForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "IdeficsForVisionText2Text": [
+   "4.55.0..5.18.0"
+  ],
+  "ImageGPTForCausalImageModeling": [
+   "4.55.0..5.18.0"
+  ],
+  "InternVLForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "Jais2ForCausalLM": [
+   "5.0.0rc2..5.18.0"
+  ],
+  "JambaForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "JanusForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "JetMoeForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "KimiLinearForCausalLM": [
+   "5.17.0..5.18.0"
+  ],
+  "Kimi_K25ForConditionalGeneration": [
+   "5.13.0..5.18.0"
+  ],
+  "Kosmos2TextForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "Kosmos2_5TextForCausalLM": [
+   "4.56.0..5.18.0"
+  ],
+  "KyutaiSpeechToTextForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "LEDForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "LagunaForCausalLM": [
+   "5.7.0..5.18.0"
+  ],
+  "Lfm2ForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "Lfm2MoeForCausalLM": [
+   "5.0.0rc0..5.18.0"
+  ],
+  "Lfm2VlForConditionalGeneration": [
+   "4.57.0..5.18.0"
+  ],
+  "LightOnOcrForConditionalGeneration": [
+   "5.0.0rc3..5.18.0"
+  ],
+  "Llama4ForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "LlamaForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "LlavaForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "LlavaNextForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "LlavaNextVideoForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "LlavaOnevisionForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "LongT5ForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "LongcatFlashForCausalLM": [
+   "4.57.0..5.18.0"
+  ],
+  "M2M100ForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "MBartForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "MBartForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "MT5ForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "Mamba2ForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "MambaForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "MarianForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "MarianMTModel": [
+   "4.55.0..5.18.0"
+  ],
+  "MellumForCausalLM": [
+   "5.10.1..5.18.0"
+  ],
+  "MiMoV2FlashForCausalLM": [
+   "5.13.0..5.18.0"
+  ],
+  "MiniCPM3ForCausalLM": [
+   "5.13.0..5.18.0"
+  ],
+  "MiniCPMV4_6ForConditionalGeneration": [
+   "5.7.0..5.18.0"
+  ],
+  "MiniCPMV4_7ForConditionalGeneration": [
+   "5.18.0"
+  ],
+  "MiniMaxForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "MiniMaxM2ForCausalLM": [
+   "5.0.0rc3..5.18.0"
+  ],
+  "MiniMaxM3SparseForConditionalGeneration": [
+   "5.12.0..5.18.0"
+  ],
+  "MiniMaxM3VLForCausalLM": [
+   "5.12.0..5.18.0"
+  ],
+  "Ministral3ForCausalLM": [
+   "5.0.0rc0..5.18.0"
+  ],
+  "MinistralForCausalLM": [
+   "4.57.0..5.18.0"
+  ],
+  "Mistral3ForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "Mistral4ForCausalLM": [
+   "5.4.0..5.18.0"
+  ],
+  "MistralForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "MixtralForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "MllamaForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "MllamaForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "MoonshineForConditionalGeneration": [
+   "5.13.0..5.18.0"
+  ],
+  "MoonshineStreamingForConditionalGeneration": [
+   "5.13.0..5.18.0"
+  ],
+  "MoshiForCausalLM": [
+   "5.17.0..5.18.0"
+  ],
+  "MptForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "MuseGlimmerForConditionalGeneration": [
+   "5.15.0..5.18.0"
+  ],
+  "MusicFlamingoForConditionalGeneration": [
+   "5.10.0..5.18.0"
+  ],
+  "MvpForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "MvpForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "NanoChatForCausalLM": [
+   "5.0.0rc0..5.18.0"
+  ],
+  "NemotronForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "NemotronHForCausalLM": [
+   "5.3.0..5.18.0"
+  ],
+  "OPTForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "Olmo2ForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "Olmo3ForCausalLM": [
+   "4.57.0..5.18.0"
+  ],
+  "OlmoForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "OlmoHybridForCausalLM": [
+   "5.3.0..5.18.0"
+  ],
+  "OlmoeForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "OpenAIGPTLMHeadModel": [
+   "4.55.0..5.18.0"
+  ],
+  "Ovis2ForConditionalGeneration": [
+   "4.56.0..5.18.0"
+  ],
+  "PLBartForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "PLBartForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "PPFormulaNetForConditionalGeneration": [
+   "5.8.0..5.18.0"
+  ],
+  "PaddleOCRVLForConditionalGeneration": [
+   "5.0.0rc1..5.18.0"
+  ],
+  "PaliGemmaForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "PegasusForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "PegasusForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "PegasusXForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "PerceptionLMForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "PersimmonForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "Phi3ForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "Phi4MultimodalForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "PhiForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "PhimoeForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "Pop2PianoForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "QianfanOCRForConditionalGeneration": [
+   "5.6.0..5.18.0"
+  ],
+  "Qwen2AudioForConditionalGeneration": [
+   "5.10.0..5.18.0"
+  ],
+  "Qwen2ForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "Qwen2MoeForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "Qwen2VLForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "Qwen2_5OmniThinkerForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "Qwen2_5_VLForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "Qwen3ASRForConditionalGeneration": [
+   "5.13.0..5.18.0"
+  ],
+  "Qwen3ForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "Qwen3MoeForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "Qwen3NextForCausalLM": [
+   "4.57.0..5.18.0"
+  ],
+  "Qwen3OmniMoeThinkerForConditionalGeneration": [
+   "4.57.0..5.18.0"
+  ],
+  "Qwen3VLForConditionalGeneration": [
+   "4.57.0..5.18.0"
+  ],
+  "Qwen3VLMoeForConditionalGeneration": [
+   "4.57.0..5.18.0"
+  ],
+  "Qwen3_5ForCausalLM": [
+   "5.2.0..5.18.0"
+  ],
+  "Qwen3_5ForConditionalGeneration": [
+   "5.2.0..5.18.0"
+  ],
+  "Qwen3_5MoeForCausalLM": [
+   "5.2.0..5.18.0"
+  ],
+  "Qwen3_5MoeForConditionalGeneration": [
+   "5.2.0..5.18.0"
+  ],
+  "Qwen4ExpForCausalLM": [
+   "5.16.0..5.18.0"
+  ],
+  "Qwen4ExpForConditionalGeneration": [
+   "5.16.0..5.18.0"
+  ],
+  "RecurrentGemmaForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "RwkvForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "SeamlessM4TForSpeechToSpeech": [
+   "4.55.0..5.18.0"
+  ],
+  "SeamlessM4TForSpeechToText": [
+   "4.55.0..5.18.0"
+  ],
+  "SeamlessM4TForTextToSpeech": [
+   "4.55.0..5.18.0"
+  ],
+  "SeamlessM4TForTextToText": [
+   "4.55.0..5.18.0"
+  ],
+  "SeamlessM4TModel": [
+   "4.55.0..5.18.0"
+  ],
+  "SeamlessM4TTextToUnitForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "SeamlessM4Tv2ForSpeechToSpeech": [
+   "4.55.0..5.18.0"
+  ],
+  "SeamlessM4Tv2ForSpeechToText": [
+   "4.55.0..5.18.0"
+  ],
+  "SeamlessM4Tv2ForTextToSpeech": [
+   "4.55.0..5.18.0"
+  ],
+  "SeamlessM4Tv2ForTextToText": [
+   "4.55.0..5.18.0"
+  ],
+  "SeamlessM4Tv2Model": [
+   "4.55.0..5.18.0"
+  ],
+  "SeamlessM4Tv2TextToUnitForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "SeedOssForCausalLM": [
+   "4.56.0..5.18.0"
+  ],
+  "SmolLM3ForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "SmolVLMForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "SolarOpenForCausalLM": [
+   "5.0.0..5.18.0"
+  ],
+  "Speech2TextForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "StableLmForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "Starcoder2ForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "Step3p7ForConditionalGeneration": [
+   "5.16.0..5.18.0"
+  ],
+  "T5ForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "TrOCRForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "UMT5ForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "UdopForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "VaultGemmaForCausalLM": [
+   "4.57.0..5.18.0"
+  ],
+  "VibeVoiceAsrForConditionalGeneration": [
+   "5.10.0..5.18.0"
+  ],
+  "VibeVoiceForConditionalGeneration": [
+   "5.17.0..5.18.0"
+  ],
+  "VideoLlama3ForConditionalGeneration": [
+   "5.0.0rc0..5.18.0"
+  ],
+  "VideoLlavaForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "VipLlavaForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "VoxtralForConditionalGeneration": [
+   "5.10.0..5.18.0"
+  ],
+  "VoxtralRealtimeForConditionalGeneration": [
+   "5.10.0..5.18.0"
+  ],
+  "VoxtralRealtimeTextForCausalLM": [
+   "5.2.0..5.9.0"
+  ],
+  "WhisperForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "WhisperForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "XGLMForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "YoutuForCausalLM": [
+   "5.1.0..5.18.0"
+  ],
+  "Zamba2ForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "ZambaForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "ZayaForCausalLM": [
+   "5.13.0..5.18.0"
+  ]
+ },
+ "unfused_targets": {
+  "BertGenerationDecoder": [
+   "4.55.0..5.18.0"
+  ],
+  "BertLMHeadModel": [
+   "4.55.0..5.18.0"
+  ],
+  "BigBirdForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "Blip2ForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "BlipTextLMHeadModel": [
+   "4.55.0..5.18.0"
+  ],
+  "CamembertForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "ChameleonForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "CohereAsrForConditionalGeneration": [
+   "5.4.0..5.14.1"
+  ],
+  "Data2VecTextForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "DiaForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "EncoderDecoderModel": [
+   "4.55.0..5.18.0"
+  ],
+  "ErnieForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "FSMTForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "GPT2DoubleHeadsModel": [
+   "4.55.0..5.18.0"
+  ],
+  "GitForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "GraniteSpeechForConditionalGeneration": [
+   "4.55.0..5.9.0"
+  ],
+  "GraniteSpeechPlusForConditionalGeneration": [
+   "5.8.0..5.9.0"
+  ],
+  "HiggsAudioV2ForConditionalGeneration": [
+   "5.3.0..5.18.0"
+  ],
+  "InklingForCausalLM": [
+   "5.14.0..5.18.0"
+  ],
+  "InklingForConditionalGeneration": [
+   "5.14.0..5.18.0"
+  ],
+  "InstructBlipForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "InstructBlipVideoForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "Llama4ForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "MegaForCausalLM": [
+   "4.55.0..4.57.6"
+  ],
+  "MegatronBertForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "ModernBertDecoderForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "MoonshineForConditionalGeneration": [
+   "4.55.0..5.12.1"
+  ],
+  "MoonshineStreamingForConditionalGeneration": [
+   "5.2.0..5.12.1"
+  ],
+  "MoshiDepthDecoder": [
+   "4.55.0..5.18.0"
+  ],
+  "MoshiForCausalLM": [
+   "4.55.0..5.16.1"
+  ],
+  "MusicgenForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "MusicgenMelodyForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "Nemotron3_5AsrForRNNT": [
+   "5.13.0..5.18.0"
+  ],
+  "NemotronAsrStreamingForRNNT": [
+   "5.13.0..5.18.0"
+  ],
+  "NemotronH_Omni_Reasoning_V3": [
+   "5.18.0"
+  ],
+  "NllbMoeForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "OpenLlamaForCausalLM": [
+   "4.55.0..4.57.6"
+  ],
+  "ParakeetForRNNT": [
+   "5.12.0..5.18.0"
+  ],
+  "ParakeetForTDT": [
+   "5.9.0..5.18.0"
+  ],
+  "Qwen2AudioForConditionalGeneration": [
+   "4.55.0..5.9.0"
+  ],
+  "Qwen3OmniMoeTalkerCodePredictorModelForConditionalGeneration": [
+   "4.57.0..5.18.0"
+  ],
+  "Qwen3OmniMoeTalkerForConditionalGeneration": [
+   "4.57.0..5.18.0"
+  ],
+  "ReformerModelWithLMHead": [
+   "4.55.0..5.18.0"
+  ],
+  "RemBertForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "RoCBertForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "RoFormerForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "RobertaForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "RobertaPreLayerNormForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "Speech2Text2ForCausalLM": [
+   "4.55.0..4.57.6"
+  ],
+  "SpeechEncoderDecoderModel": [
+   "4.55.0..5.18.0"
+  ],
+  "SpeechT5ForSpeechToText": [
+   "4.55.0..5.18.0"
+  ],
+  "SwitchTransformersForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "T5Gemma2ForConditionalGeneration": [
+   "5.0.0rc0..5.18.0"
+  ],
+  "T5GemmaForConditionalGeneration": [
+   "4.55.0..5.18.0"
+  ],
+  "VisionEncoderDecoderModel": [
+   "4.55.0..5.18.0"
+  ],
+  "XLMRobertaForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "XLMRobertaXLForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "XLNetLMHeadModel": [
+   "4.55.0..5.18.0"
+  ],
+  "XmodForCausalLM": [
+   "4.55.0..5.18.0"
+  ],
+  "xLSTMForCausalLM": [
+   "4.55.0..5.18.0"
+  ]
+ }
+}
