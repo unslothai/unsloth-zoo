@@ -1892,6 +1892,38 @@ def vllm_weights_memory_usage(config, load_in_4bit = False, load_in_8bit = False
 pass
 
 
+def vision_max_num_seqs(
+    approx_max_num_seqs,
+    max_num_seqs,
+    config,
+    max_num_batched_tokens,
+    memory_left_for_kv_cache_gb,
+    vllm_version = "0.0.0",
+):
+    # Explicit max_num_seqs (anything but the 256 default) is honored as is.
+    if max_num_seqs not in (None, 256):
+        return max_num_seqs
+    # vLLM < 0.11 can still run V0, whose profiler gives every sequence an image.
+    if Version(vllm_version) < Version("0.11.0"):
+        return 1
+    # V1 profiles min(max_num_seqs * images per prompt, encoder budget // image tokens)
+    # images and the encoder budget is max_num_batched_tokens, so keep the text default.
+    seqs = approx_max_num_seqs
+    if Version(vllm_version) < Version("0.13.0"):
+        # vLLM 0.11 / 0.12 profiling pads each dummy image to (budget, hidden_size).
+        text_config = getattr(config, "text_config", None) or config
+        hidden_size = getattr(text_config, "hidden_size", None) or 0
+        if hidden_size:
+            item_bytes = max_num_batched_tokens * hidden_size * 2
+            kv_bytes = memory_left_for_kv_cache_gb * 1024 * 1024 * 1024
+            seqs = min(seqs, max(int(0.1 * kv_bytes / item_bytes), 1))
+    cap = os.environ.get("UNSLOTH_VLLM_VISION_MAX_NUM_SEQS", "").strip()
+    if cap.isdigit():
+        seqs = min(seqs, max(int(cap), 1))
+    return seqs
+pass
+
+
 def approximate_vllm_memory_usage(
     config,
     load_in_4bit = False,
@@ -3214,17 +3246,16 @@ def load_vllm(
         elif memory_left_for_kv_cache_gb >  80: max_num_batched_tokens, approx_max_num_seqs = 8192, 256 # + 16
 
         if is_vision_model:
-            # Each sequence carries an image (~thousands of tokens) in vLLM
-            # profiling; cap seqs low for vision models.
-            # TODO: vLLM V1 profiling may cap max seqs by budget; check.
-            if max_num_seqs not in (None, 256):
-                print(f'Unsloth: Vision model detected, honoring max_num_seqs = {max_num_seqs}')
-                approx_max_num_seqs = max_num_seqs
-            else:
-                print(f'Unsloth: Vision model detected, setting approx_max_num_seqs to 1')
-                approx_max_num_seqs = 1
             # One image is ~6404 tokens (Llama 3.2) / ~16Ki (qwen 2.5 VL); leave room for text.
             max_num_batched_tokens = max(8192, max_seq_length)
+            approx_max_num_seqs = vision_max_num_seqs(
+                approx_max_num_seqs, max_num_seqs, config, max_num_batched_tokens,
+                memory_left_for_kv_cache_gb, vllm_version,
+            )
+            if max_num_seqs not in (None, 256):
+                print(f'Unsloth: Vision model detected, honoring max_num_seqs = {max_num_seqs}')
+            else:
+                print(f'Unsloth: Vision model detected, setting approx_max_num_seqs to {approx_max_num_seqs}')
 
         # vLLM only rejects a budget under max_model_len when it cannot chunk. A
         # blanket floor instead would disable chunking for text models.
