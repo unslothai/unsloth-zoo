@@ -1506,7 +1506,7 @@ def vllm_moe_expert_weights(experts, where, config = None):
     expected = None
     if config is not None:
         n_experts = getattr(config, "num_experts", None) or getattr(config, "num_local_experts", None)
-        inter = getattr(config, "moe_intermediate_size", None)
+        inter = getattr(config, "moe_intermediate_size", None) or getattr(config, "expert_intermediate_size", None)
         hidden = getattr(config, "hidden_size", None)
         if isinstance(n_experts, int) and isinstance(inter, int) and isinstance(hidden, int):
             expected = (n_experts, 2 * inter, hidden)

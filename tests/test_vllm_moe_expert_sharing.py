@@ -157,6 +157,21 @@ def test_memory_estimate_accepts_moe_config_without_intermediate_size(monkeypatc
     vu.approximate_vllm_memory_usage(config, max_seq_length = 512)
 
 
+def test_memory_estimate_reads_legacy_gemma4_expert_intermediate_size(monkeypatch):
+    import unsloth_zoo.vllm_utils as vu
+    monkeypatch.setattr(vu, "get_mem_info", lambda: (80 * 1024**3, 80 * 1024**3))
+    base = dict(
+        vocab_size = 1000, hidden_size = 64, max_position_embeddings = 4096, num_hidden_layers = 2,
+        num_key_value_heads = 2, num_attention_heads = 4, num_experts = 8, intermediate_size = 32,
+        enable_moe_block = True, tie_word_embeddings = True,
+    )
+    new = vu.approximate_vllm_memory_usage(types.SimpleNamespace(**base, moe_intermediate_size = 16), max_seq_length = 512)
+    legacy = vu.approximate_vllm_memory_usage(
+        types.SimpleNamespace(**base, moe_intermediate_size = None, expert_intermediate_size = 16), max_seq_length = 512,
+    )
+    assert legacy == new
+
+
 def test_gemma4_lora_keys_are_renamed_onto_moe_experts(monkeypatch):
     import unsloth_zoo.vllm_utils as vu
     names = {"language_model.model.layers.0.moe.experts", "language_model.model.layers.0.self_attn.qkv_proj"}

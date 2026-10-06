@@ -1977,7 +1977,8 @@ def approximate_vllm_memory_usage(
     context_length = config.max_position_embeddings
     # Sparse MoE configs (Qwen3.5 / 3.6, Qwen3-Next) have no dense intermediate_size.
     n_experts   = _config_get(config, "num_experts") or _config_get(config, "num_local_experts") or 0
-    moe_size    = _config_get(config, "moe_intermediate_size")
+    # Early Gemma-4 configs name it expert_intermediate_size (vLLM reads both).
+    moe_size    = _config_get(config, "moe_intermediate_size") or _config_get(config, "expert_intermediate_size")
     shared_size = _config_get(config, "shared_expert_intermediate_size") or 0
     is_moe      = bool(n_experts) and moe_size is not None
 
