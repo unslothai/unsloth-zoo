@@ -90,7 +90,7 @@ class _Gemma4KVSharedSafeProxy:
         return getattr(self._real, name)
 
     def __setattr__(self, name, value):
-        # TRL writes pad_token_id / eos_token_id through get_text_config().
+        # TRL and vLLM write through get_text_config().
         if name == "_real":
             object.__setattr__(self, name, value)
         else:

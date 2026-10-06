@@ -21,6 +21,8 @@ __all__ = [
     "patch_gemma4_vllm_lora_support",
     "patch_gemma4_vllm_k_eq_v_support",
     "extract_gdn_layers",
+    "extract_moe_layers",
+    "vllm_moe_expert_weights",
     "extract_vision_layers",
     "get_model_layer_config",
     "compare_attributes",
@@ -38,7 +40,7 @@ from .log import logger
 from .hf_utils import HAS_TORCH_DTYPE, dtype_from_config, set_dtype_in_config
 
 # get_model_type returns the vision name, which transformers 5 renamed to qwen3_vl_vision.
-QWEN_VL_MERGED_QKV_TYPES = ("qwen2_5_vl", "qwen3_vl", "qwen3_vl_vision", "qwen3_5")
+QWEN_VL_MERGED_QKV_TYPES = ("qwen2_5_vl", "qwen3_vl", "qwen3_vl_vision", "qwen3_5", "qwen3_5_moe")
 
 
 def _is_gemma4_config(config):
@@ -314,7 +316,9 @@ def create_empty_causal_lm(config, dtype = torch.float16):
     })
 
     # Set attention module head_dim
-    head_dim = getattr(causal_config, "head_dim", causal_config.hidden_size // causal_config.num_attention_heads)
+    head_dim = _global_config_value(
+        causal_config, "head_dim", causal_config.hidden_size // causal_config.num_attention_heads,
+    )
     new_config.update({"head_dim" : head_dim})
 
     # "eager" not "sdpa": from_config enforces _supports_sdpa and raises ValueError
@@ -326,11 +330,43 @@ def create_empty_causal_lm(config, dtype = torch.float16):
 
     return new_model, original_meta_model, causal_config.num_hidden_layers
 
+def _global_config_value(config_obj, attr, default):
+    """getattr reading the global value when a per-layer (Gemma-4) attribute raises AmbiguousGlobalPerLayerAttributeError."""
+    try:
+        return getattr(config_obj, attr, default)
+    except Exception:
+        unvalidated = getattr(config_obj, "_getattr_without_heterogeneous_validation", None)
+        if unvalidated is None: raise
+        value = unvalidated(attr)
+        return default if value is None else value
+pass
+
 def _set_config_attrs(config_obj, attrs_to_set):
-    """Helper to set multiple attributes on a config object if they exist."""
+    """Set attributes that exist; per-layer (Gemma-4) attributes are set on each layer config too."""
+    def _per_layer_configs():
+        # No truthiness test: __len__ needs num_hidden_layers, absent on Qwen3.5 vision config.
+        try:
+            per_layer = getattr(config_obj, "per_layer_config", None)
+            return list(per_layer) if per_layer is not None else []
+        except Exception:
+            return []
+
     for attr, value in attrs_to_set.items():
-        if hasattr(config_obj, attr):
-            setattr(config_obj, attr, value)
+        try:
+            present = hasattr(config_obj, attr)
+        except Exception:
+            # Per-layer attribute: shrink per-layer copies too or the placeholder stays full size.
+            present = True
+            for layer_config in _per_layer_configs():
+                try:
+                    if hasattr(layer_config, attr): setattr(layer_config, attr, value)
+                except Exception:
+                    pass
+        if present:
+            try:
+                setattr(config_obj, attr, value)
+            except Exception:
+                pass
 pass
 
 def _get_model_device(model):
@@ -372,11 +408,20 @@ def patch_gemma4_vllm_lora_support():
 
     gemma4_lora_classes = set(gemma4_lora_classes)
 
+    # Without is_3d_moe_weight vLLM serves Gemma 4's stacked experts without the adapter.
+    try:
+        from vllm.lora.layers.fused_moe import FusedMoE3DWithLoRA  # noqa: F401
+        has_3d_moe_lora = True
+    except Exception:
+        has_3d_moe_lora = False
+
     for cls in classes_to_patch:
         if not getattr(cls, "_unsloth_gemma4_class_patched", False):
             cls.supports_lora = True
             if not hasattr(cls, "embedding_modules"):
                 cls.embedding_modules = {}
+            if has_3d_moe_lora and not getattr(cls, "is_3d_moe_weight", False):
+                cls.is_3d_moe_weight = True
             cls._unsloth_gemma4_class_patched = True
 
     _patch_gemma4_vllm_expert_mapping()
@@ -1093,6 +1138,36 @@ def get_model_layer_config(return_non_layered=True):
             "model.layers.{kk}.feed_forward.gate.weight",
             "model.layers.{kk}.feed_forward.expert_bias",
 
+            # Sparse MoE: experts.{gate_up,down}_proj are bare Parameters (no ".weight").
+            "model.language_model.layers.{kk}.mlp.gate.weight",
+            "model.language_model.layers.{kk}.mlp.shared_expert_gate",
+            "model.language_model.layers.{kk}.mlp.shared_expert.gate_proj",
+            "model.language_model.layers.{kk}.mlp.shared_expert.up_proj",
+            "model.language_model.layers.{kk}.mlp.shared_expert.down_proj",
+            "model.language_model.layers.{kk}.mlp.experts.gate_up_proj",
+            "model.language_model.layers.{kk}.mlp.experts.down_proj",
+
+            "model.layers.{kk}.mlp.gate.weight",
+            "model.layers.{kk}.mlp.shared_expert_gate",
+            "model.layers.{kk}.mlp.shared_expert.gate_proj",
+            "model.layers.{kk}.mlp.shared_expert.up_proj",
+            "model.layers.{kk}.mlp.shared_expert.down_proj",
+            "model.layers.{kk}.mlp.experts.gate_up_proj",
+            "model.layers.{kk}.mlp.experts.down_proj",
+
+            # Gemma-4: experts and router are siblings of mlp, else left as 1-wide placeholders.
+            "model.language_model.layers.{kk}.experts.gate_up_proj",
+            "model.language_model.layers.{kk}.experts.down_proj",
+            "model.language_model.layers.{kk}.router.proj",
+            "model.language_model.layers.{kk}.router.scale",
+            "model.language_model.layers.{kk}.router.per_expert_scale",
+
+            "model.layers.{kk}.experts.gate_up_proj",
+            "model.layers.{kk}.experts.down_proj",
+            "model.layers.{kk}.router.proj",
+            "model.layers.{kk}.router.scale",
+            "model.layers.{kk}.router.per_expert_scale",
+
             # Gemma4 per-layer input modules
             "model.language_model.layers.{kk}.per_layer_input_gate",
             "model.language_model.layers.{kk}.per_layer_projection",
@@ -1115,6 +1190,9 @@ def get_model_layer_config(return_non_layered=True):
             "model.language_model.layers.{kk}.post_attention_layernorm",
             "model.language_model.layers.{kk}.pre_feedforward_layernorm",
             "model.language_model.layers.{kk}.post_feedforward_layernorm",
+            "model.language_model.layers.{kk}.pre_feedforward_layernorm_2",
+            "model.language_model.layers.{kk}.post_feedforward_layernorm_1",
+            "model.language_model.layers.{kk}.post_feedforward_layernorm_2",
             "model.language_model.layers.{kk}.self_attn.q_norm",
             "model.language_model.layers.{kk}.self_attn.k_norm",
             "model.language_model.layers.{kk}.cross_attn.q_norm",
@@ -1123,6 +1201,9 @@ def get_model_layer_config(return_non_layered=True):
             "model.layers.{kk}.post_attention_layernorm",
             "model.layers.{kk}.pre_feedforward_layernorm",
             "model.layers.{kk}.post_feedforward_layernorm",
+            "model.layers.{kk}.pre_feedforward_layernorm_2",
+            "model.layers.{kk}.post_feedforward_layernorm_1",
+            "model.layers.{kk}.post_feedforward_layernorm_2",
             "model.layers.{kk}.self_attn.q_norm",
             "model.layers.{kk}.self_attn.k_norm",
             "model.visual.blocks.{kk}.norm1",
@@ -1391,6 +1472,102 @@ def _get_nested_attr(obj, attr_path: str):
     except (AttributeError, IndexError):
         return None
     return None
+
+
+def vllm_moe_expert_weights(experts, where, config = None):
+    """A vLLM FusedMoE's (w13, w2) when exactly HF's stacked expert tensors, else refuse.
+
+    Only TRITON / BATCHED_TRITON keep HF's layout; some rewrites keep the shape (TRT-LLM padding, AITER).
+    """
+    experts = getattr(experts, "base_layer", experts)  # FusedMoEWithLoRA under enable_lora
+    routed = getattr(experts, "routed_experts", experts)  # vLLM >= 0.24: MoERunner.routed_experts
+    w13 = getattr(routed, "w13_weight", None)
+    w2  = getattr(routed, "w2_weight",  None)
+    if w13 is None or w2 is None:
+        raise NotImplementedError(
+            f"Unsloth: fast_inference cannot find stacked MoE expert weights (w13_weight / w2_weight) "
+            f"for {where}; set fast_inference = False."
+        )
+    quant_method = getattr(routed, "quant_method", None)
+    quant_method = getattr(quant_method, "old_quant_method", quant_method)  # FusedMoEModularMethod
+    backend = getattr(quant_method, "unquantized_backend", None)
+    backend = getattr(backend, "name", backend)
+    if backend is None:
+        # vLLM < 0.15 has no backend field; these flags are what rewrote the experts there.
+        if getattr(quant_method, "rocm_aiter_moe_enabled", False): backend = "AITER"
+        elif getattr(quant_method, "flashinfer_cutlass_moe_enabled", False): backend = "FLASHINFER_CUTLASS"
+    expected = None
+    if config is not None:
+        n_experts = getattr(config, "num_experts", None) or getattr(config, "num_local_experts", None)
+        inter = getattr(config, "moe_intermediate_size", None) or getattr(config, "expert_intermediate_size", None)
+        hidden = getattr(config, "hidden_size", None)
+        if isinstance(n_experts, int) and isinstance(inter, int) and isinstance(hidden, int):
+            expected = (n_experts, 2 * inter, hidden)
+    if backend not in (None, "TRITON", "BATCHED_TRITON") or w13.dim() != 3 or w2.dim() != 3 \
+        or w13.shape[0] != w2.shape[0] \
+        or w13.shape[1] != 2 * w2.shape[2] or w13.shape[2] != w2.shape[1] \
+        or (expected is not None and tuple(w13.shape) != expected):
+        raise NotImplementedError(
+            f"Unsloth: fast_inference cannot rebuild MoE experts from vLLM's {backend} layout "
+            f"(w13 {tuple(w13.shape)}, w2 {tuple(w2.shape)}); set fast_inference = False."
+        )
+    for name, value in (("w13", w13), ("w2", w2)):
+        if value.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            raise NotImplementedError(
+                f"Unsloth: fast_inference cannot rebuild quantized MoE weights ({where} {name} is "
+                f"{value.dtype}); load the model in 16-bit (load_in_4bit = False) or set "
+                "fast_inference = False."
+            )
+    return w13, w2
+pass
+
+
+def extract_moe_layers(
+    moe_block, prefix, state_dict, quant_state_dict, get_state_dict, router = None, config = None,
+):
+    """Alias a vLLM sparse MoE block's weights onto HF names. Gemma-4 passes its router (MoE beside the MLP)."""
+    def store(name, value):
+        state_dict[name] = value
+        quant_state_dict[name] = value
+
+    # Store the router WEIGHT: a bare "...mlp.gate" rebuilds HF's TopKRouter as a Linear.
+    gate = getattr(moe_block, "gate", None)
+    if gate is not None:
+        gate_weight = getattr(getattr(gate, "base_layer", gate), "weight", None)
+        if gate_weight is not None:
+            store(f"{prefix}.gate.weight", gate_weight.data)
+
+    shared_expert_gate = getattr(moe_block, "shared_expert_gate", None)
+    if shared_expert_gate is not None:
+        get_state_dict(f"{prefix}.shared_expert_gate", 0, state_dict, shared_expert_gate, slice_weights = False)
+
+    # vLLM moves Gemma-4's per_expert_scale onto the MoE block; HF keeps it under router.
+    if router is not None:
+        if hasattr(router, "proj"):
+            get_state_dict(f"{prefix}.router.proj", 0, state_dict, router.proj, slice_weights = False)
+        router_scale = getattr(router, "scale", None)
+        if router_scale is not None:
+            store(f"{prefix}.router.scale", router_scale.data)
+        per_expert_scale = getattr(moe_block, "per_expert_scale", None)
+        if per_expert_scale is None:
+            per_expert_scale = getattr(router, "per_expert_scale", None)
+        if per_expert_scale is not None:
+            store(f"{prefix}.router.per_expert_scale", per_expert_scale.data)
+
+    shared_expert = getattr(moe_block, "shared_expert", None)
+    if shared_expert is not None and hasattr(shared_expert, "gate_up_proj"):
+        get_state_dict(f"{prefix}.shared_expert.gate_proj", 0, state_dict, shared_expert.gate_up_proj)
+        get_state_dict(f"{prefix}.shared_expert.up_proj",   1, state_dict, shared_expert.gate_up_proj)
+        get_state_dict(f"{prefix}.shared_expert.down_proj", 0, state_dict, shared_expert.down_proj, slice_weights = False)
+
+    experts = getattr(moe_block, "experts", None)
+    if experts is None: return
+    w13, w2 = vllm_moe_expert_weights(experts, prefix, config)
+    w13.requires_grad_(False)
+    w2 .requires_grad_(False)
+    store(f"{prefix}.experts.gate_up_proj", w13.data)
+    store(f"{prefix}.experts.down_proj",    w2 .data)
+pass
 
 
 def extract_gdn_layers(gdn_module, prefix, state_dict, quant_state_dict, get_state_dict):
