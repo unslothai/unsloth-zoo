@@ -2106,7 +2106,14 @@ def test_vlm_planned_vs_unplanned_training_parity(monkeypatch, tmp_path):
         def __call__(self, inputs, pixel_values=None, mask=None, **_kwargs):
             return self.proj(self.embed(inputs))
 
+    from transformers import TrainerCallback
+
     seen_widths = []
+
+    class TrainingWidths(TrainerCallback):
+        def on_train_begin(self, args, state, control, **kwargs):
+            seen_widths.clear()
+
     original_call = TinyVLM.__call__
 
     def recording_call(self, inputs, *args, **kwargs):
@@ -2158,6 +2165,7 @@ def test_vlm_planned_vs_unplanned_training_parity(monkeypatch, tmp_path):
         trainer._is_vlm = True
         trainer.processor = _Proc()
         trainer._batches = plan
+        trainer.add_callback(TrainingWidths())
         if planned:
             enabled_decision = types.SimpleNamespace(
                 should_raise=False, enabled=True, arch="tiny",

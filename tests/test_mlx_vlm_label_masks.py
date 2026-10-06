@@ -1773,14 +1773,18 @@ def test_vlm_host_label_authority_and_staged_finalize():
 
 
 def _vlm_trainer_shell_for(dataset, world_size=1, prefetch=0):
-    import types as _types
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
     trainer = MLXTrainer.__new__(MLXTrainer)
     trainer.args = MLXTrainingConfig(
         per_device_train_batch_size=1, max_seq_length=8, streaming=True,
         streaming_prefetch_batches=prefetch,
     )
-    trainer.model = _types.SimpleNamespace(_config={})
+    class Model(nn.Module):
+        def __call__(self, ids):
+            return ids[..., None].astype(mx.float32)
+
+    trainer.model = Model()
+    trainer.model._config = {}
     trainer.tokenizer = _FakeProcessor()
     trainer.processor = trainer.tokenizer
     trainer.train_dataset = dataset
