@@ -457,7 +457,13 @@ class _MarkerModel(DecisionPipeline):
     """Laya and Julia-1: an encoder that scores each option at a mask token placed before it."""
 
     family = "laya"
+    sources = ("convaiinnovations/laya", "convaiinnovations/laya-multilingual", "convaiinnovations/laya-typed-decisions", "SupersonicLabs/Julia-1")
+    needs = "the network in the source layout (encoder/config.json, its settings file and model.safetensors)"
     _OPTION_TOKENS = 48
+
+    @staticmethod
+    def matches(folder):
+        return (folder / "encoder" / "config.json").is_file() and (folder / _marker_config(folder)).is_file()
 
     def __init__(self, folder, dtype, base_model = None, token = None):
         from tokenizers import Tokenizer
@@ -543,6 +549,44 @@ _UNMERGEABLE = ("use_dora", "use_rslora", "lora_bias", "rank_pattern", "alpha_pa
 
 def _read_json(path):
     return json.loads(path.read_text()) if path.is_file() else {}
+
+
+def _lineage(folder):
+    """Repo ids a folder says it is or derives from: its Hub cache path and its model card's `base_model`."""
+    import yaml
+
+    ids = [part[len("models--") :].replace("--", "/", 1) for part in folder.absolute().parts if part.startswith("models--")]
+    card = next((card for card in (folder / "README.md", folder.parent / "README.md") if card.is_file()), None)
+    text = card.read_text(errors = "replace") if card else ""
+    if text.startswith("---"):
+        try:
+            meta = yaml.safe_load(text.split("---", 2)[1])
+        except yaml.YAMLError:
+            meta = None
+        base = meta.get("base_model") if isinstance(meta, dict) else None
+        ids += [item for item in ([base] if isinstance(base, str) else base or []) if isinstance(item, str)]
+    return ids
+
+
+_FOREIGN_WEIGHTS = (".gguf", ".onnx", ".tflite", ".mlmodel", ".mlpackage", ".bin", ".xml", ".pte")
+
+
+def _foreign_format(folder):
+    """Why the weights in a folder cannot be loaded here, or None: only plain and MLX-format safetensors are read."""
+    weights = sorted(folder.glob("*.safetensors"))
+    foreign = sorted({item.suffix for item in folder.rglob("*") if item.suffix in _FOREIGN_WEIGHTS})
+    if not weights and foreign:
+        return f"it holds no safetensors weights, only {', '.join(foreign)}"
+    for file in weights:
+        with open(file, "rb") as stream:
+            metadata = json.loads(stream.read(int.from_bytes(stream.read(8), "little"))).get("__metadata__") or {}
+        if metadata.get("format", "pt") not in ("pt", "mlx"):
+            return f"{file.name} is in the weight format {metadata['format']!r}"
+    config = _read_json(folder / "config.json")
+    if config.get("quantization_config") and not config.get("quantization"):
+        method = config["quantization_config"].get("quant_method") or "another tool"
+        return f"its weights are quantized with {method}; quantized weights load only in MLX format"
+    return None
 
 
 def _sort_keys(value):
@@ -659,6 +703,12 @@ _CODES = [chr(65 + i) for i in range(26)] + [chr(65 + i) + chr(65 + j) for i in 
 
 class _LevModel(_LabelModel):
     family = "lev"
+    sources = ("interfaze-ai/lev",)
+    needs = "lev_release.json beside the adapter"
+
+    @staticmethod
+    def matches(folder):
+        return (folder / "lev_release.json").is_file()
     _RATINGS = 9
     _SYSTEM = (
         "You are a System One decision model. You read the Evidence and answer each Criterion by choosing exactly one of "
@@ -727,6 +777,12 @@ def _escaped_json(value):
 
 class _NimbleModel(_LabelModel):
     family = "nimble"
+    sources = ("bespokelabs/Bespoke-Nimble-9B-v3",)
+    needs = "schema_config.json beside the adapter"
+
+    @staticmethod
+    def matches(folder):
+        return _read_json(folder / "schema_config.json").get("task") == "schema_candidate_classification_v2"
     _SYSTEM = (
         "Classify the context using the supplied schema. The schema defines each field, its meaning, and allowed choices "
         "with {0} codes. Use choice descriptions when provided. For the requested field, select the single best-fitting "
@@ -762,6 +818,14 @@ class _OpenJevModel(_LabelModel):
     """A full fine-tune, also published as quantized MLX conversions; options are lettered A-Z then a-z."""
 
     family = "openjev"
+    sources = ("openjev/openjev",)
+    # Its weights are a plain Qwen3.5 decoder, so a conversion is known by its lineage alone.
+    needs = None
+
+    @staticmethod
+    def matches(folder):
+        # The source repo ships its reference readout; its 4-bit conversion names the model in a manifest.
+        return (folder / "helper" / "shim.py").is_file() or str(_read_json(folder / "MANIFEST.json").get("model")).startswith("OpenJev")
     noul_true_first = True
     # The serving settings its model card documents.
     temperatures = {"choice": 0.85, "score": 0.85, "noul": 0.85 * 1.829074}
@@ -824,6 +888,12 @@ class _KevModel(_QwenModel):
     """A pointer head: each option is scored where it ends against the last token of the prompt."""
 
     family = "kev"
+    sources = ("jaredpalmer/kev-4b",)
+    needs = "the pointer head (head.pt) beside the adapter"
+
+    @staticmethod
+    def matches(folder):
+        return (folder / "head.pt").is_file() and (folder / "adapter_config.json").is_file()
 
     def __init__(self, folder, dtype, base_model, token):
         import torch
@@ -985,6 +1055,12 @@ class ClefModel(_QwenModel):
     """One prompt holds every question; a joint head scores all their options together."""
 
     family = "clef"
+    sources = ("Cloudflare/clef", "Cloudflare/clef-flash")
+    needs = "the joint head (joint_head_config.json and joint_head.safetensors)"
+
+    @staticmethod
+    def matches(folder):
+        return (folder / "joint_head_config.json").is_file() and (folder / "joint_head.safetensors").is_file()
     noul_true_first = True
     choice_sorted = True
     _SYSTEM = "Read the complete state and schema. Decide every field jointly. Each answer must be exactly one of that field's allowed options."
@@ -1049,23 +1125,24 @@ FAMILIES = {"laya": _MarkerModel, "lev": _LevModel, "nimble": _NimbleModel, "ope
 
 
 def detect_family(folder):
-    if (folder / "joint_head_config.json").is_file():
-        return "clef"
-    if (folder / "lev_release.json").is_file():
-        return "lev"
-    if _read_json(folder / "schema_config.json").get("task") == "schema_candidate_classification_v2":
-        return "nimble"
-    # The source repo ships its reference readout; the MLX conversions name it in their manifest or, lacking one, as the model card's base.
-    card = folder / "README.md"
-    if (
-        (folder / "helper" / "shim.py").is_file()
-        or str(_read_json(folder / "MANIFEST.json").get("model")).startswith("OpenJev")
-        or (card.is_file() and re.search(r"(?m)^base_model:\s*openjev/openjev\s*$", card.read_text(errors = "replace")[:2000]))
-    ):
-        return "openjev"
-    if (folder / "head.pt").is_file() and (folder / "adapter_config.json").is_file():
-        return "kev"
-    return None
+    """The family of the model in `folder`, or None: by the files its loader reads, else by the repo it derives from."""
+    for name, family in FAMILIES.items():
+        if family.matches(folder):
+            return name
+    nested = sorted(item.name for item in folder.iterdir() if item.is_dir() and any(family.matches(item) for family in FAMILIES.values()))
+    if nested:
+        raise ValueError(f"{folder} holds its decision models in subfolders; pass subfolder = one of {nested}")
+    problem = _foreign_format(folder)
+    if problem:
+        raise ValueError(f"{folder} cannot be loaded: {problem}")
+    lineage = {source.lower() for source in _lineage(folder)}
+    derived = [(name, family) for name, family in FAMILIES.items() if lineage & {source.lower() for source in family.sources}]
+    if len(derived) != 1:
+        return None
+    ((name, family),) = derived
+    if family.needs:
+        raise ValueError(f"{folder} derives from a {name} decision model but lacks {family.needs}")
+    return name
 
 
 def load_decision_model(path, compute_dtype = None, *, family = None, subfolder = None, base_model = None, token = None):
@@ -1082,13 +1159,14 @@ def load_decision_model(path, compute_dtype = None, *, family = None, subfolder 
         folder = Path(snapshot_download(str(path), token = token, allow_patterns = f"{subfolder}/*" if subfolder else None))
     if subfolder:
         folder = folder / subfolder
-    if family is None and (folder / "encoder" / "config.json").is_file() and (folder / _marker_config(folder)).is_file():
-        family = "laya"
     family = family or detect_family(folder)
     if family is None:
         raise ValueError(f"{folder} is not a decision model this loader knows")
     if family not in FAMILIES:
         raise ValueError(f"Unknown decision model family {family!r}; known: {sorted(FAMILIES)}")
+    problem = _foreign_format(folder)
+    if problem:
+        raise ValueError(f"{folder} cannot be loaded: {problem}")
     if isinstance(compute_dtype, str):
         compute_dtype = getattr(mx, compute_dtype)
     return FAMILIES[family](folder, compute_dtype, base_model, token)

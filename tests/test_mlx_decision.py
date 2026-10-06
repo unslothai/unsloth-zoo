@@ -273,3 +273,52 @@ def test_openjev_letters_the_options_and_reads_noul_yes_first(tmp_path, decoder_
     with pytest.raises(DecisionRequestError):
         model.answer("s", {"many": {"type": "choice", "instructions": "i", "criteria": dict.fromkeys(map(str, range(53)))}})
     assert model.answer("s", {"many": {"type": "choice", "instructions": "i", "criteria": dict.fromkeys(map(str, range(52)))}})["answers"]["many"]["choice"] == "51"
+
+
+def _safetensors(path, metadata = None):
+    header = json.dumps({"__metadata__": metadata} if metadata else {}).encode()
+    path.write_bytes(len(header).to_bytes(8, "little") + header)
+
+
+def test_family_is_read_from_content_then_lineage(tmp_path):
+    detect = decision.detect_family
+    cached = tmp_path / "models--Org--OpenJev-MLX" / "snapshots" / "rev"
+    source = tmp_path / "models--openjev--openjev" / "snapshots" / "rev"
+    for folder in (cached, source, cached / "big", cached / "small", cached / "notes"):
+        folder.mkdir(parents = True)
+    assert detect(cached) is None and detect(source) == "openjev"
+    # A card may list several bases; one known source among them names the family, two different families name none.
+    (cached / "README.md").write_text("---\nbase_model:\n- Qwen/Qwen3.5-9B\n- OpenJev/OpenJev\n---\n")
+    assert detect(cached) == "openjev"
+    (cached / "README.md").write_text("---\nbase_model: [openjev/openjev, Cloudflare/clef]\n---\n")
+    assert detect(cached) is None
+    # A family with files of its own is not taken on lineage alone, and its files outrank the lineage.
+    (cached / "README.md").write_text("---\nbase_model: Cloudflare/clef-flash\n---\n")
+    with pytest.raises(ValueError, match = "derives from a clef decision model but lacks the joint head"):
+        detect(cached)
+    (source / "lev_release.json").write_text("{}")
+    assert detect(source) == "lev"
+    for name in ("big", "small"):
+        (cached / name / "joint_head_config.json").write_text("{}")
+        _safetensors(cached / name / "joint_head.safetensors")
+    (cached / "notes" / "joint_head_config.json").write_text("{}")
+    with pytest.raises(ValueError, match = r"pass subfolder = one of \['big', 'small'\]"):
+        detect(cached)
+    assert detect(cached / "small") == "clef"
+
+
+def test_other_weight_formats_are_refused_by_name(tmp_path):
+    (tmp_path / "README.md").write_text("---\nbase_model: openjev/openjev\n---\n")
+    (tmp_path / "model.gguf").write_bytes(b"")
+    with pytest.raises(ValueError, match = "no safetensors weights, only .gguf"):
+        load_decision_model(tmp_path)
+    _safetensors(tmp_path / "model-00001-of-00002.safetensors", {"format": "mlx"})
+    _safetensors(tmp_path / "model-00002-of-00002.safetensors", {"format": "packed-v1"})
+    with pytest.raises(ValueError, match = "model-00002-of-00002.safetensors is in the weight format 'packed-v1'"):
+        load_decision_model(tmp_path)
+    _safetensors(tmp_path / "model-00002-of-00002.safetensors")
+    (tmp_path / "config.json").write_text(json.dumps({"quantization_config": {"quant_method": "fp8"}}))
+    with pytest.raises(ValueError, match = "quantized with fp8"):
+        load_decision_model(tmp_path, family = "openjev")
+    (tmp_path / "config.json").write_text(json.dumps({"quantization_config": {"bits": 4}, "quantization": {"bits": 4}}))
+    assert decision._foreign_format(tmp_path) is None
