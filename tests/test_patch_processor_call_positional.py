@@ -1,12 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""patch_processor_call must keep each processor's own positional order.
-
-Qwen3-Omni and Qwen2.5-Omni processors take (text, images, videos, audio), so a
-wrapper that rebinds positionals as (images, text, videos) moves the text into
-the images slot.
-"""
+"""patch_processor_call keeps each processor's positional order (Qwen2.5/3-Omni take text first)."""
 
 import pytest
 
