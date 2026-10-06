@@ -169,3 +169,24 @@ def test_load_vllm_frees_every_failed_engine_including_the_last(monkeypatch, err
     created = _load_vllm_with_failing_engine(monkeypatch, errors)
     assert len(created) == len(errors)
     assert all(ref() is None for ref in created)
+
+
+class _FakeAdapterManager:
+    def __init__(self):
+        self.weights = bytearray(1 << 20)
+
+    def create_dummy_lora(self, lora_id, rank, scaling_factor, embedding_modules):
+        return None
+
+
+def test_dummy_lora_signature_cache_does_not_pin_the_adapter_manager():
+    wm = importlib.import_module("unsloth_zoo.vllm_lora_worker_manager")
+    manager = _FakeAdapterManager()
+    manager_ref = weakref.ref(manager)
+    assert wm.dummy_lora_has_scaling_factor(manager.create_dummy_lora) is True
+    del manager
+    gc.collect()
+    assert manager_ref() is None
+
+    def old_signature(self, lora_id, rank, embedding_modules): return None
+    assert wm.dummy_lora_has_scaling_factor(old_signature) is False
