@@ -7063,6 +7063,14 @@ def unsloth_compile_transformers(
         pass
     pass
 
+    # torch modules were dropped from the import list because a standalone copy was expected. One whose copy
+    # failed (e.g. a forward replaced by a temporary patch whose source the rewriter cannot parse, as
+    # Qwen3MoeRMSNorm under the float16 FORCE_FLOAT32 patches on transformers 4.x) would be neither defined
+    # nor imported, and the first class that builds it raised NameError. Import the (patched) original.
+    for module in torch_modules:
+        if module not in all_standalone_classes and module not in functions and hasattr(modeling_file, module):
+            functions.append(module)
+
     # Order all components
     final_all_standalone_classes = []
     for module in ordered_functions:
