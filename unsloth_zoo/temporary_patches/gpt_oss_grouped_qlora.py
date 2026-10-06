@@ -484,7 +484,12 @@ class _Fp16StackProvider:
         self.N, self.K = int(qs.shape[0]), int(qs.shape[1])
         self.num_experts = len(projs)
         self.dtype = torch.float16
-        self.chunk = _expert_window(self.num_experts, self.N * self.K * 2, qs.absmax.device)
+        device = qs.absmax.device
+        from unsloth_zoo.temporary_patches.moe_grouped_fp16 import use_cublas
+        # Per-expert cuBLAS GEMMs gain nothing from a whole stack: keep its transient small
+        # (a T4 running 20B sits at ~95% of its memory with a 1 GiB gate_up stack).
+        cap = int(os.environ.get("UNSLOTH_GPTOSS_FP16_CUBLAS_STACK_MB", "256")) << 20 if use_cublas(device) else None
+        self.chunk = _expert_window(self.num_experts, self.N * self.K * 2, device, cap)
         # Pin (skip the backward rebuild) only when asked to and the whole stack fits.
         self.pin = (not recompute) and self.chunk >= self.num_experts
 
@@ -510,9 +515,9 @@ class _Fp16StackProvider:
         ])
 
 
-def _expert_window(E, bytes_per_expert, device):
+def _expert_window(E, bytes_per_expert, device, cap_bytes = None):
     """Experts per dequant window: all of them unless the stack would take more than half of
-    the free memory (T4: a 20B gate_up stack is 1 GiB). UNSLOTH_GPTOSS_FP16_EXPERT_WINDOW pins it."""
+    the free memory (T4: a 20B gate_up stack is 1 GiB) or cap_bytes. UNSLOTH_GPTOSS_FP16_EXPERT_WINDOW pins it."""
     pinned = os.environ.get("UNSLOTH_GPTOSS_FP16_EXPERT_WINDOW")
     if pinned:
         return max(1, min(E, int(pinned)))
@@ -520,8 +525,11 @@ def _expert_window(E, bytes_per_expert, device):
         free, _ = torch.cuda.mem_get_info(device)
         free += torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
     except Exception:
+        free = None
+    budget = [b for b in (None if free is None else free // 2, cap_bytes) if b is not None]
+    if not budget:
         return E
-    fit = int(free // 2 // max(bytes_per_expert, 1))
+    fit = int(min(budget) // max(bytes_per_expert, 1))
     return max(1, min(E, fit))
 
 
