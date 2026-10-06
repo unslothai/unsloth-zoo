@@ -240,7 +240,9 @@ _MM_OUT_DTYPE = {}
 
 def _mm(x, w, out_dtype):
     """x @ w with fp32 accumulation, stored in out_dtype (cuBLAS keeps an fp16 x fp16 -> fp32 GEMM
-    on the tensor cores when torch.mm takes out_dtype; else an fp32 GEMM, the loop's own math)."""
+    on the tensor cores when torch.mm takes out_dtype; else an fp32 GEMM, the loop's own math).
+    Callers run it with autocast off: an fp16-autocast fp32 GEMM would round the down output to
+    fp16 (the per-expert loop disables autocast around down for the same reason)."""
     if x.dtype == out_dtype:
         return x @ w
     if out_dtype == torch.float32 and x.dtype in (torch.float16, torch.bfloat16):
@@ -350,7 +352,8 @@ def grouped_gemm(a, b, counts, out_dtype, *, b_trans, e_lo = 0, e_hi = None, num
     if a_mode == A_DIRECT and a.dtype != b.dtype:
         raise TypeError(f"grouped_gemm: {a.dtype} x {b.dtype} needs a_mode cast / split")
     if use_cublas(a.device):
-        _gemm_cublas(a, b, counts, out_dtype, b_trans, int(e_lo), e_hi, out, a_mode, row_scale, bias)
+        with torch.autocast(device_type = a.device.type, enabled = False):
+            _gemm_cublas(a, b, counts, out_dtype, b_trans, int(e_lo), e_hi, out, a_mode, row_scale, bias)
         CALLS["gemm"] += 1
         return out
     counts = _counts_tensor(counts)
@@ -378,7 +381,8 @@ def grouped_wgrad(g, x, counts, out_dtype, num_experts = None):
     E = int(num_experts if num_experts is not None else _counts_tensor(counts).numel())
     if use_cublas(g.device):
         CALLS["wgrad"] += 1
-        return _wgrad_cublas(g, x, counts, out_dtype, E)
+        with torch.autocast(device_type = g.device.type, enabled = False):
+            return _wgrad_cublas(g, x, counts, out_dtype, E)
     counts = _counts_tensor(counts)
     dw = torch.empty((E, N, K), dtype = out_dtype, device = g.device)
     ieee = g.dtype == torch.float32

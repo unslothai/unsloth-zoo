@@ -735,6 +735,29 @@ def test_fp16_lora_scaled_before_rounding(gemm, monkeypatch):
 
 
 @needs_fp16_grouped
+@pytest.mark.parametrize("mm_out_dtype", [True, False])
+@pytest.mark.parametrize("down_operand", ["fp16", "fp32"])
+def test_fp16_cublas_down_stays_fp32_under_autocast(mm_out_dtype, down_operand, monkeypatch):
+    # fp16 autocast must not narrow the cuBLAS down GEMM (its fp32 fallback for torch.mm without
+    # out_dtype, or fp32 operands) to fp16: down outputs past 65504 stay finite, as in the loop.
+    monkeypatch.setenv("UNSLOTH_GPTOSS_FP16_GEMM", "cublas")
+    monkeypatch.setenv("UNSLOTH_GPTOSS_FP16_DOWN_OPERAND", down_operand)
+    monkeypatch.setitem(mg._MM_OUT_DTYPE, F16, None if mm_out_dtype else False)
+    ex = _fp16_lora(_fp16_experts(rule = True, down_scale = 60000.0))
+    T = 64
+    x = torch.randn(1, T, H, device = "cuda", dtype = F16) * 4
+    idx, w = _routing32(T)
+    upstream = torch.randn(1, T, H, device = "cuda") * 1e-6
+    ref_out, _, _ = _run_up(ex, x, idx, w, False, monkeypatch, upstream)
+    with torch.autocast("cuda", dtype = F16):
+        out, gr, calls = _run_up(ex, x, idx, w, True, monkeypatch, upstream)
+    assert calls["forward_fp16"] == 1
+    assert float(ref_out.abs().max()) > 65504
+    assert bool(torch.isfinite(out).all()) and all(bool(torch.isfinite(v).all()) for v in gr.values())
+    assert _rel(out, ref_out) < 2e-2, _rel(out, ref_out)
+
+
+@needs_fp16_grouped
 def test_fp16_kill_switch(monkeypatch):
     ex = _fp16_lora(_fp16_experts())
     T = 64
