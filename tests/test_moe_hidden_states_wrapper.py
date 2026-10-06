@@ -41,6 +41,7 @@ def fresh_forward(monkeypatch):
     # Patches mutate the class; restore the stock forward after each test.
     stock = _stock_forward(modeling.Qwen3MoeForCausalLM.forward)
     monkeypatch.setattr(modeling.Qwen3MoeForCausalLM, "forward", stock)
+    monkeypatch.setattr(modeling.Qwen3MoeForCausalLM, "__UNSLOTH_SUPPORTS_RETURN_HIDDEN_STATES__", False, raising = False)
     return stock
 
 
@@ -67,6 +68,12 @@ def test_repeated_phases_wrap_once(fresh_forward):
         _patch()
     patched = modeling.Qwen3MoeForCausalLM.forward
     assert patched.__wrapped__ is fresh_forward
+
+
+def test_advertises_hidden_states_to_grpo(fresh_forward):
+    _patch()
+    # Without it unsloth's GRPO stacks its output_hidden_states fallback, which keeps every layer's hidden states.
+    assert modeling.Qwen3MoeForCausalLM.__UNSLOTH_SUPPORTS_RETURN_HIDDEN_STATES__ is True
 
 
 def _tiny():
