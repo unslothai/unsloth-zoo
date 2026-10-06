@@ -20,7 +20,6 @@ moe_grouped_modulelist._grouped_mm_fix and transformers' _grouped_mm. On sm90 / 
 mode declines, so the kernel tests force UNSLOTH_MOE_GROUPED_TRITON=1."""
 
 import logging
-import os
 
 import pytest
 import torch
