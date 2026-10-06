@@ -23,6 +23,7 @@ __all__ = [
     "extract_gdn_layers",
     "extract_moe_layers",
     "vllm_moe_expert_weights",
+    "verify_vllm_moe_experts_match_checkpoint",
     "extract_vision_layers",
     "get_model_layer_config",
     "compare_attributes",
@@ -1481,6 +1482,13 @@ def vllm_moe_expert_weights(experts, where, config = None):
     """
     experts = getattr(experts, "base_layer", experts)  # FusedMoEWithLoRA under enable_lora
     routed = getattr(experts, "routed_experts", experts)  # vLLM >= 0.24: MoERunner.routed_experts
+    trtllm = _find_trtllm_moe_kernel(experts, routed)
+    if trtllm is not None:
+        raise NotImplementedError(
+            f"Unsloth: vLLM runs {where}'s experts with {trtllm}, whose tiled TRT-LLM layout cannot be "
+            "shared with training. Upgrade unsloth_zoo (pip install --upgrade unsloth_zoo) or set "
+            "fast_inference = False."
+        )
     w13 = getattr(routed, "w13_weight", None)
     w2  = getattr(routed, "w2_weight",  None)
     if w13 is None or w2 is None:
@@ -1519,6 +1527,134 @@ def vllm_moe_expert_weights(experts, where, config = None):
                 "fast_inference = False."
             )
     return w13, w2
+pass
+
+
+def _is_trtllm_moe_name(name):
+    name = name.lower().replace("_", "")
+    return "trtllm" in name and ("expert" in name or "moe" in name)
+pass
+
+
+def _find_trtllm_moe_kernel(*roots, max_depth = 4, max_visits = 512):
+    """Name of a TRT-LLM MoE experts class reachable from the FusedMoE layer, else None.
+
+    vLLM 0.11 TrtLlmGenExperts, 0.29+ TrtLlm*Experts* (TrtLlmBf16LoRAExperts under LoRA); walked by
+    attribute so a moved holder (quant_method, moe_kernel, fused_experts, experts_cls) is still seen.
+    """
+    seen, frontier = set(), [(r, 0) for r in roots if r is not None]
+    while frontier and len(seen) < max_visits:
+        obj, depth = frontier.pop(0)
+        if id(obj) in seen: continue
+        seen.add(id(obj))
+        cls = obj if isinstance(obj, type) else type(obj)
+        if _is_trtllm_moe_name(cls.__name__):
+            return cls.__name__
+        if isinstance(obj, type) or depth >= max_depth: continue
+        try: children = list(vars(obj).values())
+        except TypeError: continue
+        if isinstance(obj, torch.nn.Module):
+            children += list(obj._modules.values())
+        for child in children:
+            if child is None or isinstance(child, (torch.Tensor, str, bytes, int, float, bool, dict, list, tuple, set)):
+                continue
+            if isinstance(child, type) or hasattr(child, "__dict__"):
+                frontier.append((child, depth + 1))
+    return None
+pass
+
+
+def _resolve_safetensors_index(model_path, revision = None, cache_dir = None):
+    """{tensor name: local file} for a local dir or an already downloaded Hub repo, else None."""
+    import json
+    def read(get):
+        index = get("model.safetensors.index.json")
+        if index is not None:
+            with open(index) as f: weight_map = json.load(f)["weight_map"]
+            files = {name: get(name) for name in set(weight_map.values())}
+            if any(v is None for v in files.values()): return None
+            return {k: files[v] for k, v in weight_map.items()}
+        single = get("model.safetensors")
+        if single is None: return None
+        from safetensors import safe_open
+        with safe_open(single, framework = "pt") as f:
+            return {k: single for k in f.keys()}
+    if model_path is None: return None
+    model_path = str(model_path)
+    if os.path.isdir(model_path):
+        def get(name):
+            path = os.path.join(model_path, name)
+            return path if os.path.isfile(path) else None
+        return read(get)
+    try:
+        from huggingface_hub import hf_hub_download
+    except Exception:
+        return None
+    def get(name):
+        try:
+            return hf_hub_download(model_path, name, revision = revision, cache_dir = cache_dir, local_files_only = True)
+        except Exception:
+            return None
+    return read(get)
+pass
+
+
+def _checkpoint_key(weight_map, key):
+    if key in weight_map: return key
+    tail = key[key.find("layers."):] if "layers." in key else key
+    matches = [k for k in weight_map if k.endswith("." + tail) and not k.startswith("mtp.")]
+    return matches[0] if len(matches) == 1 else None
+pass
+
+
+def verify_vllm_moe_experts_match_checkpoint(state_dict, model_path, revision = None, cache_dir = None):
+    """Compare a few rows of one shared expert against the checkpoint before training aliases it.
+
+    Independent of vLLM internals: a backend that rewrites the experts in place (vLLM >= 0.31's
+    TRT-LLM conversion keeps the 3-D shape) passes every shape / pointer check but not this one.
+    Returns True when verified, None when no comparable checkpoint tensor is available.
+    """
+    w13_key = next((k for k in state_dict if k.endswith(".experts.gate_up_proj")), None)
+    if w13_key is None: return None
+    w2_key = w13_key[: -len("gate_up_proj")] + "down_proj"
+    w13, w2 = state_dict[w13_key], state_dict.get(w2_key)
+    if w2 is None or w13.dim() != 3 or w2.dim() != 3: return None
+    try:
+        weight_map = _resolve_safetensors_index(model_path, revision, cache_dir)
+    except Exception as e:
+        logger.info(f"Unsloth: cannot read the checkpoint to verify MoE experts: {e}")
+        return None
+    if weight_map is None: return None
+    E, M, H = w13.shape
+    I = M // 2
+    e = E - 1
+    from safetensors import safe_open
+    def rows(key, value, idx):
+        ckpt_key = _checkpoint_key(weight_map, key)
+        if ckpt_key is None: return "skip"
+        with safe_open(weight_map[ckpt_key], framework = "pt") as f:
+            sl = f.get_slice(ckpt_key)
+            shape = tuple(sl.get_shape())
+            if shape == tuple(value.shape):
+                ref = torch.stack([sl[e, r:r + 1, :][0] for r in idx])
+            elif shape == (value.shape[0], value.shape[2], value.shape[1]):
+                ref = torch.stack([sl[e, :, r:r + 1][:, 0] for r in idx])
+            else:
+                return "skip"
+        if not ref.is_floating_point(): return "skip"
+        got = value[e, list(idx), :].float().cpu()
+        return torch.equal(got, ref.to(value.dtype).float())
+    results = (
+        rows(w13_key, w13, (0, 1, I - 1, I, M - 1)),
+        rows(w2_key,  w2,  (0, 1, w2.shape[1] // 2, w2.shape[1] - 1)),
+    )
+    if any(r is False for r in results):
+        raise RuntimeError(
+            f"Unsloth: vLLM's MoE expert weights for {w13_key} do not match the checkpoint, so vLLM "
+            "stored them in a kernel-specific (e.g. TRT-LLM tiled) layout that training cannot share. "
+            "Upgrade unsloth_zoo (pip install --upgrade unsloth_zoo) or set fast_inference = False."
+        )
+    return True if all(r is True for r in results) else None
 pass
 
 
