@@ -632,10 +632,7 @@ def _track_local_attention_edits(AttentionInterface):
 
 
 def _a_model_overrides_flex_locally():
-    # A model's own AttentionInterface wins at dispatch over the global registry, so a local
-    # "flex_attention" that is not unsloth's wrapper would read None as bidirectional. Look at
-    # every loaded module (transformers.models.*, trust_remote_code's transformers_modules.*,
-    # user code), under any attribute name.
+    # A module's own AttentionInterface beats the global registry at dispatch; remote code included.
     import sys
     try:
         from transformers.modeling_utils import AttentionInterface
@@ -707,7 +704,6 @@ def _maskless_causal_arguments(signature, args, kwargs):
     config = arguments.get("config", None)
     attn_implementation = getattr(config, "_attn_implementation", None)
     if attn_implementation == "flex_attention":
-        # Stock flex reads None as bidirectional; only unsloth's wrapper reroutes it to SDPA is_causal.
         if not _flex_routes_maskless_to_sdpa():
             return None
     elif attn_implementation != "sdpa":
