@@ -521,14 +521,16 @@ class _MarkerModel(DecisionPipeline):
         return self.tokenizer.encode(text, add_special_tokens = False).ids
 
     def _option_text(self, kind, key, description):
+        # Only None and "" mean no description: 0 and false are criteria.
+        described = description is not None and description != ""
         if self.julia:
-            return _text(description) if description else key
+            return _text(description) if described else key
         if kind == "choice":
-            return f"{key}: {_text(description)}" if description else key
+            return f"{key}: {_text(description)}" if described else key
         if kind == "score":
             return f"level {key}: {_text(description)}"
         default = "yes, the statement holds" if key == "true" else "no, the statement does not hold"
-        return f"{key}: {_text(description) if description else default}"
+        return f"{key}: {_text(description) if described else default}"
 
     def _prompt(self, state, question):
         if self.tokenizer is None:
