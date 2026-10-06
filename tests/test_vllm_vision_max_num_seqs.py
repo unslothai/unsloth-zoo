@@ -60,11 +60,13 @@ def test_v0_capable_vllm_keeps_one_sequence(max_num_seqs):
 
 
 def test_padded_profiling_window_caps_by_kv_memory():
-    # 0.11 / 0.12 pad each dummy image to (8192, hidden): 64 MiB at hidden 4096.
+    # 0.11 pads each dummy image to (8192, hidden): 64 MiB at hidden 4096.
     assert _seqs(version = "0.11.2", kv_gb = 40.0) == 64
-    assert _seqs(version = "0.12.0", kv_gb = 2.0) == 3
+    assert _seqs(version = "0.11.0", kv_gb = 2.0) == 3
     assert _seqs(version = "0.11.2", kv_gb = 0.1) == 1
     assert _seqs(version = "0.11.2", kv_gb = 400.0) == 128
+    # 0.12 pads only to the image's own token count, so the total stays under the encoder budget.
+    assert _seqs(version = "0.12.0", kv_gb = 2.0) == 128
 
 
 def test_kill_switch_restores_the_old_cap(monkeypatch):
