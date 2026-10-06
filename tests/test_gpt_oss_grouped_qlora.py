@@ -22,8 +22,10 @@
   (UNSLOTH_GPTOSS_GROUPED=0) in output and in every LoRA / input gradient, runs without a
   host sync, and moving one expert's lora_B moves the output.
 * Unsupported adapters (dropout, DoRA, lora_bias, several active, disabled), fp16 inputs
-  and experts not computing in bf16 keep the per-expert loop. fp32 inputs (the residual
-  stream after the first MoE layer) take the grouped path in bf16, as Linear4bit does.
+  to bf16 experts and unsupported compute dtypes keep the per-expert loop. fp32 inputs (the
+  residual stream after the first MoE layer) take the grouped path in bf16, as Linear4bit does.
+* float16 experts (the loader keeps down in fp32) take moe_grouped_fp16's Triton GEMMs and
+  match the per-expert loop with Unsloth's forced-float32 LoRA forward, and an fp64 oracle.
 """
 import os
 
@@ -511,3 +513,280 @@ def test_unrouted_expert_gets_zero_lora_grads(monkeypatch):
             assert torch.count_nonzero(grads[n]) == 0, n
     routed = [n for n in ref_g if "lora_" in n]
     assert len(routed) == 4 * (E - 1) and all(_rel(grads[n], ref_g[n]) <= 0.05 for n in routed)
+
+
+# ---------------------------------------------------------------------------------------------
+# float16 (T4): gate_up in fp16, down kept in fp32 by the loader (_pre_set_compute_dtype), the
+# adapters through Unsloth's forced-float32 LoRA forward. moe_grouped_fp16's Triton GEMMs.
+# ---------------------------------------------------------------------------------------------
+import types
+
+from unsloth_zoo.temporary_patches import moe_grouped_fp16 as mg
+
+F16 = torch.float16
+FP16_OK = mg.fp16_grouped_available(torch.device("cuda", torch.cuda.current_device()))
+needs_fp16_grouped = pytest.mark.skipif(not FP16_OK, reason = "fp16 grouped GEMM unavailable")
+
+
+def _fp16_experts(nested = True, rule = True, down_scale = None):
+    """What unsloth's loader leaves for gpt-oss NF4 on float16: gate_up fp16; down with
+    quant_state.dtype / compute_dtype / _pre_set_compute_dtype / bias in fp32 (rule)."""
+    ex = _Experts(nested, dtype = F16)
+    for p in list(ex.gate_up_projs) + list(ex.down_projs):
+        # bitsandbytes < 0.46 adopts an fp32 input's dtype on the first call unless told the
+        # compute dtype is final (>= 0.46 sets this whenever compute_dtype is passed).
+        p.compute_type_is_set = True
+    for p in ex.down_projs:
+        if down_scale is not None:
+            if nested:
+                p.weight.quant_state.state2.absmax.mul_(down_scale)
+            else:
+                p.weight.quant_state.absmax.mul_(down_scale)
+        if rule:
+            p.weight.quant_state.dtype = torch.float32
+            p.compute_dtype = torch.float32
+            p._pre_set_compute_dtype = torch.float32
+            p.bias = torch.nn.Parameter(p.bias.float(), requires_grad = False)
+    return ex
+
+
+def _forced_fp32_lora_forward():
+    from unsloth_zoo import compiler
+    ns = {"torch": torch}
+    exec(compiler.COMPILED_LORA_FORWARD_forced_float32, ns)
+    return ns["lora_forward"]
+
+
+def _use_unsloth_fp16_lora_forward(ex):
+    # patch_lora_forwards under UNSLOTH_FORCE_FLOAT32: lora_forward(result, ...).to(result.dtype).
+    lora_forward = _forced_fp32_lora_forward()
+
+    def forward(self, x, *args, **kwargs):
+        result = self.base_layer(x, *args, **kwargs)
+        name = self.active_adapters[0]
+        return lora_forward(result, self.lora_A[name], self.lora_B[name], self.lora_dropout[name],
+                            x, self.scaling[name]).to(result.dtype)
+
+    for m in list(ex.gate_up_projs) + list(ex.down_projs):
+        m.forward = types.MethodType(forward, m)
+    return ex
+
+
+def _fp16_lora(ex, r = 16, lora_dtype = torch.float32):
+    ex = _lora_wrap(ex, r = r)
+    for n, p in ex.named_parameters():
+        if "lora_" in n:
+            p.data = p.data.to(lora_dtype)
+    return _use_unsloth_fp16_lora_forward(ex).train()
+
+
+def _routing32(T, seed = 0):
+    idx, w = _routing(T, seed)
+    return idx, w.float()
+
+
+def _oracle_layer(ex, x, idx, w, upstream):
+    """fp64 per-expert loop over the bitsandbytes-dequantized weights: output and LoRA grads."""
+    out = torch.zeros(x.shape[1], H, dtype = torch.float64, device = "cuda")
+    x0 = x[0].detach().double().requires_grad_(True)
+    xx = x0
+    params = {}
+    for n, p in ex.named_parameters():
+        if "lora_" in n:
+            params[n] = p.detach().double().requires_grad_(True)
+
+    def proj(kind, e, inp):
+        m = getattr(ex, kind)[e]
+        base = getattr(m, "base_layer", m)
+        W = bnb.functional.dequantize_4bit(base.weight.data, base.weight.quant_state).double()
+        y = inp @ W.T + base.bias.double()
+        if hasattr(m, "lora_A"):
+            A = params[f"{kind}.{e}.lora_A.default.weight"]
+            B = params[f"{kind}.{e}.lora_B.default.weight"]
+            y = y + (inp @ A.T) @ B.T * m.scaling["default"]
+        return y
+
+    for e in range(E):
+        rows = (idx == e).any(-1).nonzero().flatten()
+        if rows.numel() == 0:
+            continue
+        gu = proj("gate_up_projs", e, xx[rows])
+        g, l = gu[:, ::2].clamp(max = ex.limit), gu[:, 1::2].clamp(-ex.limit, ex.limit)
+        gated = g * torch.sigmoid(ex.alpha * g) * (l + 1)
+        out.index_add_(0, rows, proj("down_projs", e, gated) * w[rows, e, None].double())
+    out.backward(upstream.view(-1, H).double())
+    grads = {n: p.grad for n, p in params.items() if p.grad is not None}
+    grads["<input>"] = x0.grad
+    return out.detach(), grads
+
+
+def _run_up(ex, x, idx, w, grouped, monkeypatch, upstream):
+    monkeypatch.setenv("UNSLOTH_GPTOSS_GROUPED", "1" if grouped else "0")
+    monkeypatch.delenv("UNSLOTH_COMPILE_DISABLE", raising = False)
+    for p in ex.parameters():
+        p.grad = None
+    xx = x.detach().clone().requires_grad_(True)
+    before = dict(gq.CALLS)
+    out = ex(xx, idx, w)
+    out.backward(upstream.view_as(out).to(out.dtype))
+    grads = {n: p.grad.detach().float().clone() for n, p in ex.named_parameters() if p.requires_grad and p.grad is not None}
+    grads["<input>"] = xx.grad.detach().float().clone()
+    return out.detach().float(), grads, {k: gq.CALLS[k] - before[k] for k in before}
+
+
+@needs_fp16_grouped
+@pytest.mark.parametrize("r", [16, 7])
+@pytest.mark.parametrize("x_dtype", [F16, torch.float32])
+@pytest.mark.parametrize("rule", [True, False])
+@pytest.mark.parametrize("grad_scale", [1.0, 1e-6])
+@pytest.mark.parametrize("gemm", ["triton", "cublas"])
+def test_fp16_grouped_matches_loop_and_oracle(r, x_dtype, rule, grad_scale, gemm, monkeypatch):
+    monkeypatch.setenv("UNSLOTH_GPTOSS_FP16_GEMM", gemm)
+    ex = _fp16_lora(_fp16_experts(rule = rule), r = r)
+    T = 96
+    g = torch.Generator(device = "cuda").manual_seed(3)
+    x = torch.randn(1, T, H, device = "cuda", generator = g).to(x_dtype)
+    upstream = torch.randn(1, T, H, device = "cuda", generator = g) * grad_scale   # 1e-6: no GradScaler
+    idx, w = _routing32(T)
+    ref_out, ref_g, ref_calls = _run_up(ex, x, idx, w, False, monkeypatch, upstream)
+    aa_out, aa_g, _ = _run_up(ex, x, idx, w, False, monkeypatch, upstream)
+    out, gr, calls = _run_up(ex, x, idx, w, True, monkeypatch, upstream)
+    assert ref_calls["forward_fp16"] == 0
+    assert calls["forward_fp16"] == 1 and calls["forward_fp16_lora"] == 1 and calls["forward"] == 0
+    assert bool(torch.isfinite(out).all())
+    assert set(ref_g) == set(gr) and len([n for n in gr if "lora_" in n]) == 4 * E
+    assert _rel(out, ref_out) < 2e-2, _rel(out, ref_out)
+    assert all(_rel(aa_g[n], ref_g[n]) == 0 for n in ref_g)   # A/A: the loop is run-to-run exact here
+    o_out, o_g = _oracle_layer(ex, x, idx, w, upstream)
+    for n in ref_g:
+        close = _rel(gr[n], ref_g[n]) <= 0.05
+        if grad_scale == 1.0:
+            assert close, (n, _rel(gr[n], ref_g[n]))
+        else:
+            # Unscaled 1e-6 grads sit in fp16's subnormal range on the loop's own fp16 paths
+            # (gate_up and its LoRA, down's xA, a fp16 down's dX), so the loop is no reference
+            # there: the fp64 oracle is.
+            assert close or _rel(gr[n], o_g[n]) <= 1.25 * _rel(ref_g[n], o_g[n]) + 1e-3, (
+                n, _rel(gr[n], ref_g[n]), _rel(gr[n], o_g[n]), _rel(ref_g[n], o_g[n]))
+    # fp64 oracle: the grouped path is no less accurate than the loop (aggregate over LoRA grads).
+    names = [n for n in o_g if n != "<input>"]
+    err = lambda gg: sum(float((gg[n].double() - o_g[n]).norm() ** 2) for n in names) ** 0.5 / sum(
+        float(o_g[n].norm() ** 2) for n in names) ** 0.5
+    assert _rel(out, o_out) <= 1.5 * _rel(ref_out, o_out) + 1e-4, (_rel(out, o_out), _rel(ref_out, o_out))
+    assert err(gr) <= 1.5 * err(ref_g) + 1e-4, (err(gr), err(ref_g))
+
+
+@needs_fp16_grouped
+@pytest.mark.parametrize("gemm", ["triton", "cublas"])
+def test_fp16_down_output_above_fp16_max_stays_finite(gemm, monkeypatch):
+    monkeypatch.setenv("UNSLOTH_GPTOSS_FP16_GEMM", gemm)
+    # Under the loader rule down outputs past 65504 are fine in the loop; grouped must match.
+    ex = _fp16_lora(_fp16_experts(rule = True, down_scale = 60000.0))
+    T = 64
+    x = torch.randn(1, T, H, device = "cuda", dtype = F16) * 4
+    idx, w = _routing32(T)
+    upstream = torch.randn(1, T, H, device = "cuda") * 1e-6
+    ref_out, ref_g, _ = _run_up(ex, x, idx, w, False, monkeypatch, upstream)
+    out, gr, calls = _run_up(ex, x, idx, w, True, monkeypatch, upstream)
+    assert calls["forward_fp16"] == 1
+    assert float(ref_out.abs().max()) > 65504, float(ref_out.abs().max())
+    assert bool(torch.isfinite(out).all()) and all(bool(torch.isfinite(v).all()) for v in gr.values())
+    assert _rel(out, ref_out) < 2e-2
+    for n in ref_g:
+        assert _rel(gr[n], ref_g[n]) <= 0.05, n
+
+
+@needs_fp16_grouped
+def test_fp16_kill_switch(monkeypatch):
+    ex = _fp16_lora(_fp16_experts())
+    T = 64
+    x = torch.randn(1, T, H, device = "cuda", dtype = F16)
+    idx, w = _routing32(T)
+    up = torch.randn(1, T, H, device = "cuda")
+    on, _, c_on = _run_up(ex, x, idx, w, True, monkeypatch, up)
+    monkeypatch.setenv("UNSLOTH_GPTOSS_GROUPED_FP16", "0")
+    off, _, c_off = _run_up(ex, x, idx, w, True, monkeypatch, up)
+    ref, _, _ = _run_up(ex, x, idx, w, False, monkeypatch, up)
+    assert c_on["forward_fp16"] == 1 and c_off["forward_fp16"] == 0 and c_off["declined"] >= 1
+    assert "UNSLOTH_GPTOSS_GROUPED_FP16" in gq.LAST_DECLINE["reason"]
+    assert torch.equal(off, ref)
+
+
+@needs_fp16_grouped
+@pytest.mark.parametrize("case", ["down_bf16", "mixed_down", "gate_up_fp32", "bf16_input"])
+def test_fp16_unsupported_dtypes_keep_loop(case, monkeypatch):
+    ex = _fp16_lora(_fp16_experts())
+    x_dtype = F16
+    if case == "down_bf16":
+        for p in ex.down_projs:
+            p.base_layer.compute_dtype = torch.bfloat16
+            p.base_layer._pre_set_compute_dtype = torch.bfloat16
+    elif case == "mixed_down":
+        ex.down_projs[E // 2].base_layer.compute_dtype = F16
+    elif case == "gate_up_fp32":
+        ex.gate_up_projs[0].base_layer.compute_dtype = torch.float32
+    else:
+        x_dtype = torch.bfloat16
+    T = 32
+    x = torch.randn(1, T, H, device = "cuda", dtype = x_dtype)
+    idx, w = _routing32(T)
+    _, _, calls = _run_up(ex, x, idx, w, True, monkeypatch, torch.randn(1, T, H, device = "cuda"))
+    assert calls["forward_fp16"] == 0 and calls["forward"] == 0, case
+
+
+@needs_fp16_grouped
+@pytest.mark.parametrize("gemm", ["triton", "cublas"])
+def test_fp16_lora_free_and_expert_windows(gemm, monkeypatch):
+    monkeypatch.setenv("UNSLOTH_GPTOSS_FP16_GEMM", gemm)
+    ex = _fp16_experts().train()
+    T = 80
+    x = torch.randn(1, T, H, device = "cuda", dtype = F16)
+    idx, w = _routing32(T)
+    up = torch.randn(1, T, H, device = "cuda")
+    ref, ref_g, _ = _run_up(ex, x, idx, w, False, monkeypatch, up)
+    full, g_full, c = _run_up(ex, x, idx, w, True, monkeypatch, up)
+    monkeypatch.setenv("UNSLOTH_GPTOSS_FP16_EXPERT_WINDOW", "3")
+    win, g_win, _ = _run_up(ex, x, idx, w, True, monkeypatch, up)
+    assert c["forward_fp16"] == 1 and c["forward_fp16_lora"] == 0
+    _assert_dequant_path(c, 4)
+    assert _rel(full, ref) < 2e-2 and _rel(g_full["<input>"], ref_g["<input>"]) < 0.05
+    # Windows change only which experts each launch covers: bit-identical.
+    assert torch.equal(full, win) and torch.equal(g_full["<input>"], g_win["<input>"])
+
+
+@needs_fp16_grouped
+def test_fp16_stack_is_bnb_rounded_once(monkeypatch):
+    # fp32 quant state (loader rule) -> fp16 stack: exactly bitsandbytes' fp32 dequant rounded to fp16.
+    ex = _fp16_experts()
+    state = gq._tables(ex, F16)
+    assert state is not None and state["down"]["dtype"] is torch.float32
+    p = gq._Fp16StackProvider(state["down"], ex.down_projs, True)
+    for lo, hi in ((0, E), (2, 5)):
+        st = p(lo, hi)
+        for e in range(lo, hi):
+            b = ex.down_projs[e]
+            ref = bnb.functional.dequantize_4bit(b.weight.data, b.weight.quant_state)
+            assert ref.dtype == torch.float32 and torch.equal(st[e - lo], ref.half())
+
+
+@needs_fp16_grouped
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] not in (9, 10),
+    reason = "only measured where the bf16 grouped path is also sync-free",
+)
+def test_fp16_grouped_no_host_sync(monkeypatch):
+    ex = _fp16_lora(_fp16_experts())
+    T = 64
+    x = torch.randn(1, T, H, device = "cuda", dtype = F16, requires_grad = True)
+    idx, w = _routing32(T)
+    monkeypatch.setenv("UNSLOTH_GPTOSS_GROUPED", "1")
+    monkeypatch.setenv("UNSLOTH_GPTOSS_FP16_GEMM", "triton")
+    monkeypatch.setenv("UNSLOTH_GPTOSS_FP16_EXPERT_WINDOW", str(E))   # mem_get_info is not a stream sync, but pin it
+    _run_up(ex, x, idx, w, True, monkeypatch, torch.randn(1, T, H, device = "cuda"))
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        out = ex(x, idx, w)
+        out.float().sum().backward()
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
