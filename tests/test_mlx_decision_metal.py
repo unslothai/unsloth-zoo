@@ -310,7 +310,8 @@ class _JointReference(torch.nn.Module):
         return logits
 
 
-def test_clef_answers_every_question_from_one_prompt_like_its_reference_head(tmp_path, monkeypatch):
+@pytest.mark.parametrize("quantized", [False, True])
+def test_clef_answers_every_question_from_one_prompt_like_its_reference_head(tmp_path, monkeypatch, quantized):
     from unsloth_zoo.mlx.decision import ClefModel
 
     torch.manual_seed(0)
@@ -323,7 +324,7 @@ def test_clef_answers_every_question_from_one_prompt_like_its_reference_head(tmp
     # Vowels take two tokens, so a span counted in characters reads the wrong rows.
     tokens = lambda text: [token for c in text for token in ([ord(c) % 512, 7] if c in "aeiou" else [ord(c) % 512])]
     pieces, encode = [], lambda text, add_special_tokens: pieces.append(text) or tokens(text)
-    monkeypatch.setattr(ClefModel, "_load", lambda self, *args: vars(self).update(model = _decoder(), tokenizer = SimpleNamespace(encode = encode)))
+    monkeypatch.setattr(ClefModel, "_load", lambda self, *args: vars(self).update(model = _decoder(quantized), tokenizer = SimpleNamespace(encode = encode)))
     questions = {"route": {"type": "choice", "instructions": {"b": 1, "a": "é"}, "criteria": {"ship": "late", "bill": None}}, "level": {"type": "score", "instructions": "How bad?", "criteria": ["fine", "bad", "awful"]}, "angry": {"type": "noul", "instructions": "Angry?", "criteria": {"false": "calm"}}}
     model = load_decision_model(tmp_path)
     result = model.answer({"z": [1, None], "y": "s"}, questions)
@@ -345,7 +346,10 @@ def test_clef_answers_every_question_from_one_prompt_like_its_reference_head(tmp
     ids = torch.tensor(tokens("".join(pieces)))
     with generation_mode(model.model):
         hidden = torch.from_numpy(np.array(_forward_text_hidden_states(model.model, mx.array(ids.numpy())[None])[0].astype(mx.float32)))
-    embedding = torch.from_numpy(np.array(model.model.language_model.lm_head.weight.astype(mx.float32)))
+    head = model.model.language_model.lm_head
+    # An MLX conversion quantizes the output embedding the options are read from.
+    weight = mx.dequantize(head.weight, head.scales, head.biases, group_size = 64, bits = 8) if quantized else head.weight
+    embedding = torch.from_numpy(np.array(weight.astype(mx.float32)))
     with torch.inference_mode():
         route, level, angry = reference(hidden, embedding, ids, [spans[0], spans[3], spans[7]], [spans[1:3], spans[4:7], spans[8:]], [1, 2, 0])
     for name, logits in (("route", route), ("level", level)):

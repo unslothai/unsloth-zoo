@@ -645,9 +645,19 @@ def _head_scores(model, hidden, token_ids):
     ids = mx.array(token_ids)
     if head.raw and not head.quantized and not head.has_additive_bias:
         # A bf16 logit near 20 is only good to about 0.06, enough to move a calibrated probability.
-        return hidden.astype(mx.float32) @ head.module.weight[ids].astype(mx.float32).T
+        return hidden.astype(mx.float32) @ _output_rows(head, token_ids).T
     logits = head.module.as_linear(hidden) if head.status == "tied" else head.module(hidden)
     return logits[..., ids].astype(mx.float32)
+
+
+def _output_rows(head, token_ids):
+    """float32 rows of the output embedding; an MLX-quantized head is dequantized for those rows only."""
+    module, ids = head.module, mx.array(token_ids)
+    rows = module.weight[ids]
+    if head.quantized:
+        biases = module.biases[ids] if "biases" in module else None
+        rows = mx.dequantize(rows, module.scales[ids], biases, group_size = module.group_size, bits = module.bits, mode = getattr(module, "mode", "affine"))
+    return rows.astype(mx.float32)
 
 
 class _QwenModel(DecisionPipeline):
@@ -1112,11 +1122,11 @@ class ClefModel(_QwenModel):
                 option_spans[-1].append(span)
             ids += piece
         output = describe_output_head(self.model)
-        if output.status == "unknown" or not output.raw or output.quantized:
-            raise ValueError("Clef needs a float output head: its options are also read from the output embedding")
+        if output.status == "unknown" or not output.raw:
+            raise ValueError("Clef reads its options from the output embedding too, which this model's output head does not expose")
         with generation_mode(self.model):
             hidden = self._hidden(ids).astype(mx.float32)
-            lexical = [output.module.weight[mx.array(ids[start:end])].astype(mx.float32) for spans in option_spans for start, end in spans]
+            lexical = [_output_rows(output, ids[start:end]) for spans in option_spans for start, end in spans]
             logits = self.head(hidden, lexical, question_spans, option_spans, [_TYPE_IDS.index(q.type) for q in questions])
         return [[scores] for scores in logits], len(ids)
 
