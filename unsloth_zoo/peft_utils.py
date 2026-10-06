@@ -283,7 +283,9 @@ def get_peft_regex(
     _architectures = " ".join(getattr(_config, "architectures", None) or []).lower()
     _is_gemma_mm   = (
         "gemma4"  in _model_type or "gemma4"  in _architectures or
-        "gemma3n" in _model_type or "gemma3n" in _architectures
+        "gemma3n" in _model_type or "gemma3n" in _architectures or
+        # EmbeddingGemma 2 carries Gemma 4 vision / audio towers under its own model_type.
+        "embedding_gemma2" in _model_type or "embeddinggemma2" in _architectures
     )
 
     def _linear_aware_branches(cores):

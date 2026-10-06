@@ -43,6 +43,8 @@ __all__ = ["FORCE_FLOAT32"]
 # and the trailing comma before comparing, so ``"gpt-oss"`` / ``"gpt_oss"``
 # and ``"gemma3_text"`` / ``"gemma3text"`` all resolve correctly.
 FORCE_FLOAT32 = [
+    "embedding_gemma2",  # fp16 unsupported upstream; text-only loads have no gemma4 sub-config to match
+    "embedding_gemma2_text",  # explicit entry for the MLX exact-match helper
     "gemma3,",     # trailing comma is a substring-path delimiter for the CUDA loader
     "gemma3text",  # EmbeddingGemma / standalone text-only Gemma3 (config: "gemma3_text")
     "gemma3n",
