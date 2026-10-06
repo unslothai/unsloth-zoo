@@ -8867,7 +8867,7 @@ def _row_has_images(item):
         if value is not None and not (isinstance(value, (list, tuple)) and not value):
             return True
     return any(_row_has_images(item.get(key)) for key in (
-        "messages", "conversations", "content", "prompt", "completion",
+        "messages", "conversations", "content", "prompt", "completion", "text",
     ))
 
 

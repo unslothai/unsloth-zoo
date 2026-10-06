@@ -6186,6 +6186,7 @@ def test_text_forwarding_probe_leaves_dropout_rng_and_mode_untouched():
 @pytest.mark.parametrize("row", [
     {"input_ids": [1, 2, 3], "pixel_values_videos": np.ones((2, 3), dtype=np.float32)},
     {"messages": [{"role": "user", "content": [{"type": "video", "video": "clip.mp4"}]}]},
+    {"text": [{"role": "user", "content": [{"type": "image", "image": "cat.png"}]}]},
 ])
 def test_text_wrapper_rejects_video_rows(row):
     from unsloth_zoo.mlx import utils as u
