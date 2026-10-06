@@ -49,7 +49,6 @@ def reload_tiled_mlp():
     importlib.reload(tiled_mlp)
 
 
-# (DEVICE_TYPE, DEVICE_TYPE_TORCH) as unsloth_zoo.device_type translates them.
 @pytest.mark.parametrize("label, torch_label", [("hip", "cuda"), ("mlx", "mps"), ("cuda", "cuda")])
 @pytest.mark.parametrize("mps_autocast", [True, False], ids = ["mps_autocast", "torch_2_4_no_mps_autocast"])
 def test_tiled_forward_and_backward_on_every_device_label(reload_tiled_mlp, monkeypatch, label, torch_label, mps_autocast):

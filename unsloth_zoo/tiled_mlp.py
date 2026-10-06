@@ -38,8 +38,7 @@ FIRST_PASS = True
 UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
 UNSLOTH_ENABLE_TILED_LOGGING = UNSLOTH_ENABLE_LOGGING and os.environ.get("UNSLOTH_ENABLE_TILED_LOGGING", "0") == "1"
 
-# amp rejects DEVICE_TYPE "hip" / "mlx"; DEVICE_TYPE_TORCH is the spelling torch accepts.
-# torch < 2.5 has no mps autocast ("unsupported scalarType"), so fall back to cpu there.
+# amp rejects DEVICE_TYPE "hip" / "mlx"; torch < 2.5 also lacks mps autocast, hence the cpu fallback.
 def _amp_device_type():
     try:
         torch.get_autocast_dtype(DEVICE_TYPE_TORCH)
