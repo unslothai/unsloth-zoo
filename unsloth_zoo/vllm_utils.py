@@ -42,6 +42,7 @@ import gc
 import os
 import ast
 import sys
+import traceback
 import shutil
 import torch
 from torch import __version__ as torch_version
@@ -2911,6 +2912,53 @@ def _memory_profiling_race_message(error, trials = 0, unsloth_vllm_standby = Fal
     )
 
 
+def _dynamo_engine_registries():
+    # Both pin a compiled vLLM model; vLLM never removes them when engine startup fails.
+    registries = []
+    try:
+        from torch._dynamo import eval_frame
+        registries.append(eval_frame.cached_backends)
+    except Exception:
+        pass
+    try:
+        from torch._dynamo import convert_frame
+        registries.append(convert_frame._bytecode_hooks)
+    except Exception:
+        pass
+    return [registry for registry in registries if isinstance(registry, dict)]
+pass
+
+
+def _snapshot_dynamo_engine_registries():
+    return [(registry, set(registry.keys())) for registry in _dynamo_engine_registries()]
+pass
+
+
+def _is_vllm_registry_entry(value):
+    # vLLM's entries only (others may compile meanwhile); unwrap torch's _TorchCompileWrapper.compiler_fn.
+    for _ in range(4):
+        inner = getattr(value, "_torchdynamo_orig_backend", None) or getattr(value, "compiler_fn", None)
+        if inner is None or inner is value: break
+        value = inner
+    owner = getattr(value, "__self__", value)
+    return type(owner).__module__.split(".", 1)[0] == "vllm"
+pass
+
+
+def _release_failed_vllm_engine(snapshot):
+    for registry, keys_before in snapshot:
+        for key in list(registry.keys()):
+            if key in keys_before: continue
+            try:
+                if _is_vllm_registry_entry(registry[key]): registry.pop(key, None)
+            except Exception:
+                pass
+    for _ in range(3):
+        gc.collect()
+        _device_empty_cache()
+pass
+
+
 def load_vllm(
     model_name             : str   = "unsloth/Llama-3.2-3B-Instruct-unsloth-bnb-4bit",
     config                 = None,
@@ -3646,6 +3694,8 @@ def load_vllm(
         trials = 0
         race_trials = 0
         while True:
+            registries_before = _snapshot_dynamo_engine_registries()
+            loaded = False
             try:
                 if use_async:
                     llm = AsyncLLMEngine.from_engine_args(AsyncEngineArgs(**engine_args))
@@ -3654,13 +3704,11 @@ def load_vllm(
                 else:
                     llm = LLM(**engine_args)
                 pass
+                loaded = True
                 break
             except Exception as error:
-                # Cleanup
-                for _ in range(3):
-                    gc.collect()
-                    _device_empty_cache()
-                pass
+                # A terminal raise chains this traceback as __context__: free the engine's frames.
+                traceback.clear_frames(error.__traceback__)
                 error = str(error)
                 # `expandable_segments:True` + sleep/standby mode is a deterministic
                 # config clash raised by CuMemAllocator.__init__, not an OOM, and
@@ -3740,6 +3788,9 @@ def load_vllm(
                             f"Original error: {error}"
                         )
                     raise RuntimeError(error)
+            finally:
+                # Every failed exit drops the engine's registry roots; its frames were cleared above.
+                if not loaded: _release_failed_vllm_engine(registries_before)
             pass
         pass
         # Save maximum requests length since llm.generate fails to partition inputs sometimes
