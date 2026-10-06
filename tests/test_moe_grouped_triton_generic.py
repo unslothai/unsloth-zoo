@@ -316,7 +316,8 @@ def test_rows_past_last_offset_are_ignored(monkeypatch):
 def test_engagement_counter_and_modulelist(monkeypatch):
     from unsloth_zoo.temporary_patches import moe_grouped_modulelist as ML
     x, param, dy, offs, _ = _problem([4, 9, 0, 3], 32, 48, torch.bfloat16)
-    if MU._triton_grouped_mm_max_rows(torch.cuda.current_device()) == 0:   # auto off here (sm90 / sm100 / sm75)
+    # auto off here (sm90 / sm100 / sm75); the declined path is torch._grouped_mm itself (absent on torch 2.7)
+    if MU._triton_grouped_mm_max_rows(torch.cuda.current_device()) == 0 and hasattr(torch, "_grouped_mm"):
         before = _calls()
         ML._grouped_mm_fix(x, param.transpose(-2, -1), offs)
         MU._grouped_mm_with_backward_fix(x, param.transpose(-2, -1), offs)
