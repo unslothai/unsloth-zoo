@@ -14,10 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Generic MoE Triton grouped GEMM (unsloth_zoo::grouped_mm_triton): torch._grouped_mm semantics on
-moe_grouped_fp16's kernels, behind a static shape / arch gate in _grouped_mm_with_backward_fix,
-moe_grouped_modulelist._grouped_mm_fix and transformers' _grouped_mm. On sm90 / sm100 the gate's auto
-mode declines, so the kernel tests force UNSLOTH_MOE_GROUPED_TRITON=1."""
+"""Generic MoE Triton grouped GEMM. Auto declines on sm90 / sm100, so kernel tests force UNSLOTH_MOE_GROUPED_TRITON=1."""
 
 import logging
 
@@ -109,7 +106,6 @@ def _calls():
     return dict(MG.GENERIC_CALLS)
 
 
-# ---------------------------------------------------------------- gate table (capability mocked) ----------------
 
 
 _KINDS = ("lora", "many", "few", "dw")
@@ -157,8 +153,7 @@ def test_gate_kind():
 @needs_cuda
 @pytest.mark.parametrize("rows_per_expert, triton_dw", [(100, True), (200, False)])
 def test_base_dw_above_limit_uses_torch(rows_per_expert, triton_dw):
-    """A trainable base stack's dW (full finetuning) above the "dw" limit goes to torch._grouped_mm while
-    forward and dX stay on Triton; both give the fp64 answer."""
+    """Base dW above the "dw" limit falls back to torch._grouped_mm; forward and dX stay on Triton."""
     if MU._GROUPED_MM_TRITON_OP is None or MG.triton is None or not MU._check_torch_grouped_mm_supported():
         pytest.skip("no custom_op / Triton / torch._grouped_mm")
     index = torch.cuda.current_device()
@@ -220,7 +215,6 @@ def test_gate_rows_threshold_and_operands(monkeypatch):
     assert not at(1)
 
 
-# ---------------------------------------------------------------- numerics vs fp64 -------------------------------
 
 _CASES = {
     "empty_skewed": ([0, 1, 37, 0, 200, 3, 0, 15], 64, 96),
@@ -248,9 +242,7 @@ def _per_expert_matmul(x, w, offs):
 
 
 def _torch_reference(monkeypatch, x, param, dy, offs, transposed):
-    """The main-branch path (torch._grouped_mm). Its native backward rejects rows that are not 16-byte
-    aligned (LoRA rank 1 / 7: forward_native_grouped_mm pads those ranks first), so there the
-    reference is the same-dtype per-expert matmul."""
+    """The main-branch path; its backward rejects unaligned rows (LoRA rank 1 / 7), so compare a per-expert matmul."""
     monkeypatch.setenv("UNSLOTH_MOE_GROUPED_TRITON", "0")
     before = _calls()
     try:
@@ -298,8 +290,7 @@ def test_zero_rows(monkeypatch, dtype):
 
 @needs_kernel
 def test_rows_past_last_offset_are_ignored(monkeypatch):
-    """torch._grouped_mm leaves rows past offs[-1] unwritten (transformers masks its EP sentinel tail); the
-    op matches: those rows never feed the valid output or dW, whatever they hold."""
+    """Rows past offs[-1] stay unwritten, as torch._grouped_mm, and never feed the output or dW."""
     _force_on(monkeypatch)
     x, param, dy, offs, counts = _problem([6, 0, 11], 40, 24, torch.bfloat16)
     M = x.shape[0]
@@ -357,7 +348,6 @@ def test_ends_matches_counts(backend):
     assert torch.equal(a, b)
 
 
-# ---------------------------------------------------------------- declined path == main ---------------------------
 
 
 def _main_branch(inputs, weight, offsets):
@@ -413,7 +403,6 @@ def test_declined_branch_is_the_main_code():
     assert norm(main_body) in norm(body)
 
 
-# ---------------------------------------------------------------- self-check fallback -----------------------------
 
 
 @needs_kernel
@@ -464,7 +453,6 @@ def test_real_self_check_passes():
     assert MG.triton_grouped_available(torch.device("cuda", torch.cuda.current_device()))
 
 
-# ---------------------------------------------------------------- opcheck / compile --------------------------------
 
 
 @needs_kernel
@@ -578,7 +566,6 @@ def test_compile_kill_switch_never_reaches_kernel(monkeypatch):
     assert _calls() == before
 
 
-# ---------------------------------------------------------------- transformers 5.x _grouped_mm ---------------------
 
 
 def _transformers_moe():
@@ -608,7 +595,6 @@ def test_transformers_grouped_mm_wrapper(monkeypatch):
     before = _calls()
     assert torch.equal(tm._grouped_linear(x, param, offs), original(x, param.transpose(-2, -1), offs))
     assert _calls() == before
-    # engaged: through the op, with grads
     _force_on(monkeypatch)
     got = _run(lambda a, w, o: tm._grouped_linear(a, w.transpose(-2, -1), o, is_transposed = False),
                x, param, dy, offs, True)

@@ -355,9 +355,7 @@ def _patch_decode_switch():
 
 
 def _patch_transformers_grouped_mm():
-    """Route transformers.integrations.moe._grouped_mm (dense experts without expert LoRA, custom-gate
-    experts) through moe_utils' Triton grouped GEMM where its gate picks it; anything else calls the
-    original unchanged. Idempotent."""
+    """Route transformers' moe._grouped_mm through moe_utils' Triton grouped GEMM where its gate picks it."""
     try:
         import transformers.integrations.moe as transformers_moe
         moe_utils = _moe_utils_module()

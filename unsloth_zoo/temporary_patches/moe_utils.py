@@ -372,8 +372,7 @@ def _grouped_mm_with_backward_fix(
     and a one-time probe confirms the view matches the contiguous copy on this device before we
     skip the copy; else we keep the copy. Falls back to a per-group matmul when the device has no
     torch._grouped_mm, and on the 16-byte stride error. Bit-exact vs the always-contiguous
-    path in forward and backward. Small experts on sm80 / sm89 / sm120 first take the Triton grouped
-    GEMM (_triton_grouped_mm_wanted); everything it declines runs the code below unchanged.
+    path in forward and backward. Small experts may first take the Triton grouped GEMM.
     """
     if _triton_grouped_mm_wanted(inputs, weight):
         return _triton_grouped_mm(inputs, weight, offsets)
@@ -480,17 +479,9 @@ def _register_grouped_mm_fp16_op():
 _GROUPED_MM_FP16_OP = _register_grouped_mm_fp16_op()
 
 
-# Triton grouped GEMM for every MoE model (moe_grouped_fp16's kernels, bf16 / fp16 operands of one dtype).
-# Off sm90 / sm100 torch._grouped_mm is a per-expert cuBLAS loop over host offsets; one Triton launch beats it
-# while experts are small. Row limits (average rows per expert) per GEMM class, from a sweep over 16..2048 rows
-# per expert with the generic tiles (Qwen3-30B-A3B, Qwen3.5-35B-A3B, Mixtral 8x7B, gpt-oss-20b, GLM-4.5-Air,
-# DeepSeek-V2-Lite expert shapes, bf16 + fp16, Colab A100 / L4 / RTX PRO 6000, torch 2.11, Triton 3.6):
-#   "lora": a dim <= 32 (LoRA A / B and their grads): 2.4-95x on A100 / RTX PRO 6000, 1.03-65x on L4, all rows.
-#   "many" / "few": a frozen or trainable base stack with >= 64 / < 64 experts. Fine-grained MoEs win on
-#     A100 / RTX PRO 6000 at every size measured (1.04-6.7x); Mixtral / gpt-oss lose above ~256 rows. L4 wins
-#     only up to ~32.
-#   "dw": a base stack's own weight gradient (full finetuning), slower than cuBLAS above ~64-128 rows.
-# T4 (sm75) has no MMA in Triton; sm86 is unmeasured; sm90 / sm100 have native grouped GEMMs: all off in auto.
+# Off sm90 / sm100 torch._grouped_mm is a per-expert cuBLAS loop; one Triton launch beats it for small experts.
+# Measured max average rows per expert per class: "lora" (a dim <= 32), "many" / "few" (>= / < 64 experts),
+# "dw" (base weight grad). sm75 has no Triton MMA, sm86 is unmeasured, sm90 / sm100 have native grouped GEMMs.
 _TRITON_GROUPED_MM_AUTO_ROWS = {
     (8, 0):  {"lora": -1, "many": 2048, "few": 256, "dw": 128},
     (12, 0): {"lora": -1, "many": 2048, "few": 256, "dw": 64},
@@ -509,13 +500,9 @@ def _triton_grouped_mm_capability(index):
 
 @_assume_constant_result
 def _triton_grouped_mm_max_rows(index, kind = "lora"):
-    """Average rows per expert up to which the Triton grouped GEMM runs a GEMM of class `kind` ("lora",
-    "many", "few", "dw") on CUDA device `index`: 0 = off, -1 = no limit. UNSLOTH_MOE_GROUPED_TRITON=auto
-    (default: the measured table), 1 (every class, any sm80+ CUDA GPU), 0 (off); UNSLOTH_DISABLE_MOE_TRITON=1
-    also turns it off; UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS overrides every class's limit where the path is
-    on (0 turns it off, a negative value lifts it). Evaluated eagerly (and baked in) under torch.compile: no
-    capability probe or environment read inside a trace, so a change after a frame compiled needs
-    torch._dynamo.reset()."""
+    """Row limit for class `kind` on device `index`: 0 = off, -1 = no limit.
+    UNSLOTH_MOE_GROUPED_TRITON=auto|1|0, UNSLOTH_DISABLE_MOE_TRITON=1, UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS.
+    Baked in under torch.compile: an env change after compiling needs torch._dynamo.reset()."""
     environ = os.environ
     key = (
         index, kind, environ.get("UNSLOTH_MOE_GROUPED_TRITON"), environ.get("UNSLOTH_DISABLE_MOE_TRITON"),
@@ -564,12 +551,10 @@ _PLAIN_TENSOR_TYPES = (torch.Tensor, torch.nn.Parameter)
 
 
 def _triton_grouped_mm_wanted(inputs, weight) -> bool:
-    """Static gate (shapes, dtypes, device, cached policy; never the offsets' values): torch._grouped_mm(inputs
-    [M, K], weight [E, K, N]) runs as unsloth_zoo::grouped_mm_triton when M <= limit * E for its class."""
+    """Static gate (never reads offsets' values): use Triton when M <= limit * E for the GEMM's class."""
     device = inputs.device
     if device.type != "cuda":
         return False
-    # first: a declined GPU pays only this
     if _triton_grouped_mm_max_rows(device.index, "lora") == 0 or inputs.dim() != 2 or weight.dim() != 3 \
             or weight.device != device:
         return False
@@ -607,8 +592,7 @@ def _grouped_mm_triton_wgrad_impl(inputs, grad, offsets):
 
 
 class _GroupedMMTriton(torch.autograd.Function):
-    """Eager twin of unsloth_zoo::grouped_mm_triton: the same impls and the same backward, without the
-    custom op's per-call dispatch cost (~30 us, as much as the launch itself on small experts)."""
+    """Eager twin of unsloth_zoo::grouped_mm_triton, skipping the custom op's ~30 us dispatch cost."""
 
     @staticmethod
     def forward(ctx, inputs, weight, offsets):
@@ -629,8 +613,7 @@ class _GroupedMMTriton(torch.autograd.Function):
 
 
 def _triton_grouped_mm(inputs, weight, offsets):
-    """torch._grouped_mm(inputs, weight, offs = offsets) on the Triton kernels: the custom op when traced,
-    its autograd.Function twin in eager (same kernels, same numbers)."""
+    """torch._grouped_mm on the Triton kernels: custom op when traced, autograd.Function in eager."""
     if torch.compiler.is_compiling():
         return _GROUPED_MM_TRITON_OP(inputs, weight, offsets)
     return _GroupedMMTriton.apply(inputs, weight, offsets)

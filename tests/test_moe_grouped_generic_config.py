@@ -14,15 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""generic_gemm_config / generic_wgrad_config tiles for the generic MoE path.
-
-* Every table config (each arch family) runs on this GPU when it fits its shared memory, bf16 and
-  fp16, base and LoRA-rank shapes, ragged experts (empty expert, a 389-row expert, tails): error
-  vs fp64 within 2% of torch._grouped_mm's (or an fp32-accumulate bound without it).
-* GROUP_M swizzle and the K-mask-free EVEN_K path are bitwise equal to the plain 2D-grid tile.
-* config = None keeps the #1591 tiles (the gpt-oss path); the table helpers clamp to small N / K
-  and fit the device's shared memory.
-"""
+"""generic_gemm_config / generic_wgrad_config tiles: every table config vs fp64, GROUP_M / EVEN_K bitwise."""
 import os
 
 import pytest
@@ -192,7 +184,6 @@ def test_generic_configs_end_to_end(rows, rank, dtype):
 
 
 def test_config_helpers(monkeypatch):
-    # Clamps: skinny N / K take the operand's power of two; big tiles never exceed it.
     for fam, cap, smem in (("sm80", (8, 0), 166912), ("sm89", (8, 9), 101376), ("sm120", (12, 0), 101376),
                            ("sm89", (8, 6), 101376), ("sm80", (9, 0), 232448), ("sm89", (8, 7), 49152)):
         monkeypatch.setitem(mg._SM, DEV.index, cap)
@@ -210,7 +201,6 @@ def test_config_helpers(monkeypatch):
                     w = mg.generic_wgrad_config(M, 64, N, K, DEV, dtype)
                     assert len(w) == 5 and all(isinstance(v, int) for v in w)
                     assert (w[4] - 1) * w[0] * (w[1] + w[2]) * elt <= mg._SMEM[DEV.index]
-    # Below sm80: the #1591 tiles (two stages, small shared memory).
     monkeypatch.setitem(mg._SM, DEV.index, (7, 5))
     assert mg.generic_gemm_config(4096, 32, 2880, 2880, DEV, torch.float16) == mg._gemm_config(4096, 32, 2880, 2880, DEV, False) + (0,)
 

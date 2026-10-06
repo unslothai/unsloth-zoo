@@ -80,10 +80,7 @@ if triton is not None:
         E_POW2: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
         ENDS: tl.constexpr, GROUP_M: tl.constexpr = 0, EVEN_K: tl.constexpr = False,
     ):
-        # C[m, n] = sum_k A[m, k] * B[e(m) - E_LO, k, n] for the rows of experts in [E_LO, E_HI).
-        # COUNTS: rows per expert, or (ENDS) cumulative row ends as torch._grouped_mm's offs.
-        # GROUP_M > 0: a 1D grid walked GROUP_M row tiles at a time (L2 reuse of A and B tiles);
-        # EVEN_K: K % BLOCK_K == 0, no K masks. Both only from generic_gemm_config.
+        # ENDS: COUNTS holds cumulative row ends. GROUP_M > 0: 1D grid, GROUP_M row tiles at a time (L2 reuse).
         if GROUP_M > 0:
             pid = tl.program_id(0)
             num_pid_n = tl.cdiv(N, BLOCK_N)
@@ -350,15 +347,8 @@ def _gemm_config(M, E, N, K, device, split):
     return BM, max(16, min(BN, _pow2(N))), max(16, min(BK if BM == 128 else 64, _pow2(K))), 4 if BM < 128 else 8, 3
 
 
-# Generic MoE path tiles (generic_gemm_config / generic_wgrad_config), from a sweep over rows per expert
-# 16..2048 on Qwen3-30B-A3B, Qwen3.5-35B-A3B, Mixtral 8x7B, gpt-oss-20b, GLM-4.5-Air and DeepSeek-V2-Lite
-# expert shapes (base gate_up / down fwd + dX, LoRA r=16 A / B fwd + dX + dW, base dW), bf16 + fp16,
-# Colab A100 (sm80), L4 (sm89) and RTX PRO 6000 (sm120), torch 2.11 / Triton 3.6. Each entry is the
-# config with the best geomean time over all shapes in its rows-per-expert bucket (1-4% off the per-shape
-# best). Keys: "big" (N > 32 and K > 32), "N" (N <= 32: LoRA A forward, B dX, dA), "K" (K <= 32: LoRA B
-# forward, A dX, dB). Rows: (max rows per expert or None, (BLOCK_M, BLOCK_N, BLOCK_K, warps, stages
-# [, GROUP_M])). GROUP_M > 0 walks the output GROUP_M row tiles at a time (L2 reuse), the main win
-# above ~256 rows per expert. For the wgrad kernel BLOCK_M is the row (reduction) step.
+# Best-geomean tiles per rows-per-expert bucket, swept on A100 / L4 / RTX PRO 6000 over common MoE expert shapes.
+# Keys: "big" (N, K > 32), "N" (N <= 32), "K" (K <= 32). Rows: (max rows per expert or None, tile).
 _GENERIC_GEMM = {
     "sm80": {
         "big": ((16, (32, 256, 64, 8, 3, 0)), (128, (64, 256, 64, 8, 3, 0)), (None, (128, 128, 64, 4, 3, 8))),
@@ -397,8 +387,7 @@ _SMEM = {}
 
 
 def _generic_family(device):
-    """Table for a device: measured sm80 / sm89 / sm120; sm86 / sm87 (~100 KB shared memory per block,
-    like sm89) use sm89's, sm12x sm120's, sm90+ (>= 228 KB) sm80's."""
+    """sm86 / sm87 use sm89's table (similar shared memory), sm12x sm120's, sm90+ sm80's."""
     cap = _capability(device)
     if cap[0] == 12:
         return "sm120"
@@ -428,9 +417,7 @@ def _pick(table, rows):
 
 
 def _fit_smem(BM, BN, BK, stages, elt, limit, wgrad):
-    """Triton keeps (stages - 1) pairs of operand tiles in shared memory (gemm: BM x BK + BK x BN,
-    wgrad: BN x BM + BM x BK): drop stages, then halve BLOCK_K (gemm) or the BLOCK_M row step (wgrad)
-    until they fit (ranks, dtypes or arches the sweep did not cover)."""
+    """Drop stages, then halve BLOCK_K (gemm) / BLOCK_M (wgrad) until (stages - 1) tile pairs fit."""
     while (stages - 1) * (BM * (BN + BK) if wgrad else BK * (BM + BN)) * elt > limit:
         if stages > 2:
             stages -= 1
@@ -444,8 +431,7 @@ def _fit_smem(BM, BN, BK, stages, elt, limit, wgrad):
 
 
 def generic_gemm_config(M, E, N, K, device, dtype):
-    """(BLOCK_M, BLOCK_N, BLOCK_K, warps, stages, GROUP_M) for grouped_gemm(config = ...) on the generic
-    MoE path: out[M, N] = a[M, K] @ b[e], M rows over E experts. Only shapes and the device, no counts."""
+    """(BLOCK_M, BLOCK_N, BLOCK_K, warps, stages, GROUP_M) for grouped_gemm; shapes only, no counts."""
     if device.type == "cuda" and _capability(device) < (8, 0):
         return _gemm_config(M, E, N, K, device, False) + (0,)
     rows = M / max(E, 1)
@@ -459,8 +445,7 @@ def generic_gemm_config(M, E, N, K, device, dtype):
 
 
 def generic_wgrad_config(M, E, N, K, device, dtype):
-    """(BLOCK_M, BLOCK_N, BLOCK_K, warps, stages) for grouped_wgrad(config = ...) on the generic MoE
-    path: dw[e] = g[rows of e].T @ x[rows of e] -> [E, N, K] with g [M, N], x [M, K]."""
+    """(BLOCK_M, BLOCK_N, BLOCK_K, warps, stages) for grouped_wgrad."""
     if device.type == "cuda" and _capability(device) < (8, 0):
         return 32, max(16, min(64, _pow2(N))), max(16, min(64, _pow2(K))), 4, 2
     rows = M / max(E, 1)
@@ -524,8 +509,7 @@ def grouped_gemm(a, b, counts, out_dtype, *, b_trans, e_lo = 0, e_hi = None, num
         CALLS["gemm"] += 1
         return out
     counts = _counts_tensor(counts)
-    # config: (BM, BN, BK, warps, stages) or generic_gemm_config's (..., group_m), which also drops
-    # the K masks when K % BK == 0. None: _gemm_config, the #1591 tiles.
+    # config: generic_gemm_config's tuple; None = _gemm_config (#1591 tiles).
     config = config or _gemm_config(M, E, N, K, a.device, a_mode == A_SPLIT)
     BM, BN, BK, warps, stages = config[:5]
     extra = {}
@@ -549,9 +533,7 @@ def grouped_gemm(a, b, counts, out_dtype, *, b_trans, e_lo = 0, e_hi = None, num
 
 
 def grouped_wgrad(g, x, counts, out_dtype, num_experts = None, backend = None, config = None, ends = False):
-    """dw[e] = g[rows of e].T @ x[rows of e] -> [E, N, K]; zeros for an expert with no rows.
-    backend, ends as in grouped_gemm; config: None (the #1591 tile) or generic_wgrad_config's
-    (BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages)."""
+    """dw[e] = g[rows of e].T @ x[rows of e] -> [E, N, K]; zeros for an expert with no rows."""
     assert g.dtype == x.dtype and g.stride(1) == 1 and x.stride(1) == 1
     M, N = g.shape
     K = x.shape[1]
@@ -755,10 +737,7 @@ def unavailable_reason():
 
 
 def generic_grouped_mm(inputs, weight, offsets):
-    """out[m] = inputs[m] @ weight[e(m)]; inputs [M, K] (any strides), weight [E, K, N] (any strides,
-    a transposed [E, N, K] view included), offsets [E] cumulative row ends on device (read in the
-    kernel: no host sync, no diff launch). Rows past offsets[-1] are not written, as torch._grouped_mm
-    leaves them."""
+    """torch._grouped_mm semantics; offsets are read on device (no host sync). Rows past offsets[-1] stay unwritten."""
     M, K = inputs.shape
     E, _, N = weight.shape
     config = generic_gemm_config(M, E, N, K, inputs.device, inputs.dtype)
@@ -769,8 +748,7 @@ def generic_grouped_mm(inputs, weight, offsets):
 
 
 def generic_grouped_wgrad(inputs, grad, offsets, num_experts):
-    """dW[e] = inputs[rows of e].T @ grad[rows of e] -> [E, K, N]; zeros for an empty expert.
-    offsets as in generic_grouped_mm."""
+    """dW[e] = inputs[rows of e].T @ grad[rows of e] -> [E, K, N]; zeros for an empty expert."""
     inputs = inputs if inputs.stride(-1) == 1 else inputs.contiguous()
     grad = grad if grad.stride(-1) == 1 else grad.contiguous()
     M, K = inputs.shape
@@ -787,8 +765,7 @@ _GENERIC_SELF_CHECKED = {}
 
 
 def _self_check_generic(device):
-    """bf16 and fp16, weight as a transposed [E, K, N] view, an empty expert, tails on every dim:
-    forward, dX and dW against fp64. Raises on any mismatch."""
+    """Forward, dX and dW vs fp64 (bf16, fp16, transposed weight, empty expert, tails); raises on mismatch."""
     g = torch.Generator(device = "cpu").manual_seed(0)
     E, N, K = 4, 40, 24
     counts = torch.tensor([5, 0, 19, 3], dtype = torch.int32, device = device)
@@ -819,8 +796,7 @@ def _self_check_generic(device):
 
 
 def triton_grouped_available(device) -> bool:
-    """The generic Triton grouped GEMM passed its self-check on this device (checked once per device).
-    A failure is logged once and disables the generic path for the process; OOM propagates."""
+    """Self-check once per device; a failure disables the generic path for the process (OOM propagates)."""
     global _GENERIC_DISABLED_REASON
     if (
         triton is None

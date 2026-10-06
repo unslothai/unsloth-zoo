@@ -98,7 +98,6 @@ except Exception:
 
 def _grouped_mm_fix(x: torch.Tensor, w: torch.Tensor, offs: torch.Tensor) -> torch.Tensor:
     """torch._grouped_mm with a per-group matmul fallback for the 16-byte stride error."""
-    # moe_utils' Triton grouped GEMM where its gate picks it (small experts off sm90 / sm100).
     if _triton_grouped_mm_wanted is not None and _triton_grouped_mm_wanted(x, w):
         return _triton_grouped_mm(x, w, offs)
     # aten._grouped_mm's fake impl rejects float16 under torch.compile; the opaque op (moe_utils) does not.
