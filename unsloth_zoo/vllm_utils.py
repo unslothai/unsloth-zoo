@@ -42,6 +42,7 @@ import gc
 import os
 import ast
 import sys
+import traceback
 import shutil
 import torch
 from torch import __version__ as torch_version
@@ -3675,6 +3676,9 @@ def load_vllm(
                 loaded = True
                 break
             except Exception as error:
+                # A terminal raise keeps this traceback as __context__, so drop the failed
+                # engine from its frames now; the printed traceback is unaffected.
+                traceback.clear_frames(error.__traceback__)
                 error = str(error)
                 # `expandable_segments:True` + sleep/standby mode is a deterministic
                 # config clash raised by CuMemAllocator.__init__, not an OOM, and
@@ -3755,8 +3759,7 @@ def load_vllm(
                         )
                     raise RuntimeError(error)
             finally:
-                # After a retry's except block the traceback is gone, so the engine is freed
-                # here; on a final raise the caller's traceback is then the only owner left.
+                # Every failed exit drops the engine's registry roots; its frames were cleared above.
                 if not loaded: _release_failed_vllm_engine(registries_before)
             pass
         pass

@@ -133,7 +133,7 @@ def test_release_unwraps_the_torch_compile_backend_wrapper():
     assert not (added & set(eval_frame.cached_backends))
 
 
-def _load_vllm_with_failing_engine(monkeypatch, errors):
+def _load_vllm_with_failing_engine(monkeypatch, errors, inside_handler = False):
     torch = pytest.importorskip("torch")
     vllm = pytest.importorskip("vllm")
     transformers = pytest.importorskip("transformers")
@@ -152,11 +152,17 @@ def _load_vllm_with_failing_engine(monkeypatch, errors):
         hidden_size = 256, intermediate_size = 512, num_hidden_layers = 2,
         num_attention_heads = 4, num_key_value_heads = 2, vocab_size = 1000,
     )
-    with pytest.raises(RuntimeError):
+    try:
         vllm_utils.load_vllm(
             model_name = "Qwen/Qwen2-0.5B", config = config, max_seq_length = 512,
             gpu_memory_utilization = 0.5, use_bitsandbytes = False, dtype = torch.bfloat16,
         )
+    except RuntimeError:
+        if inside_handler:
+            gc.collect()
+            return created
+    else:
+        pytest.fail("load_vllm did not raise")
     gc.collect()
     return created
 
@@ -165,8 +171,10 @@ def _load_vllm_with_failing_engine(monkeypatch, errors):
     ["engine startup failed"],  # not retried: raised straight away
     ["No available memory for the cache blocks.", "No available memory for the cache blocks."],
 ])
-def test_load_vllm_frees_every_failed_engine_including_the_last(monkeypatch, errors):
-    created = _load_vllm_with_failing_engine(monkeypatch, errors)
+@pytest.mark.parametrize("inside_handler", [False, True])
+def test_load_vllm_frees_every_failed_engine_including_the_last(monkeypatch, errors, inside_handler):
+    # inside_handler: a caller still handling the error (to load again) holds its traceback.
+    created = _load_vllm_with_failing_engine(monkeypatch, errors, inside_handler)
     assert len(created) == len(errors)
     assert all(ref() is None for ref in created)
 
