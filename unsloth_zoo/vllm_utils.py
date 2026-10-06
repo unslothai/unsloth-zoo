@@ -2905,8 +2905,7 @@ pass
 
 
 def _is_vllm_registry_entry(value):
-    # Only vLLM's own entries: another thread may compile while the engine starts.
-    # torch.compile stores a torch._TorchCompileWrapper whose compiler_fn is the backend.
+    # vLLM's entries only (others may compile meanwhile); unwrap torch's _TorchCompileWrapper.compiler_fn.
     for _ in range(4):
         inner = getattr(value, "_torchdynamo_orig_backend", None) or getattr(value, "compiler_fn", None)
         if inner is None or inner is value: break
@@ -2917,7 +2916,6 @@ pass
 
 
 def _release_failed_vllm_engine(snapshot):
-    # Call outside the except block: the live traceback still holds the engine's frames.
     for registry, keys_before in snapshot:
         for key in list(registry.keys()):
             if key in keys_before: continue
@@ -3676,8 +3674,7 @@ def load_vllm(
                 loaded = True
                 break
             except Exception as error:
-                # A terminal raise keeps this traceback as __context__, so drop the failed
-                # engine from its frames now; the printed traceback is unaffected.
+                # A terminal raise chains this traceback as __context__: free the engine's frames.
                 traceback.clear_frames(error.__traceback__)
                 error = str(error)
                 # `expandable_segments:True` + sleep/standby mode is a deterministic
