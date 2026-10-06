@@ -375,7 +375,7 @@ def _grouped_mm_with_backward_fix(
     path in forward and backward.
     """
     if _triton_grouped_mm_wanted(inputs, weight):
-        return _GROUPED_MM_TRITON_OP(inputs, weight, offsets)
+        return _triton_grouped_mm(inputs, weight, offsets)
     if (
         inputs.dtype == torch.float16
         and weight.dtype == torch.float16
@@ -487,6 +487,7 @@ _GROUPED_MM_FP16_OP = _register_grouped_mm_fp16_op()
 # 128; T4 (sm75) has no MMA in Triton and loses everywhere. sm86 / sm90 / sm100 are unmeasured or native.
 _TRITON_GROUPED_MM_AUTO_ROWS = {(8, 0): 256, (12, 0): 256, (8, 9): 128}
 _TRITON_GROUPED_MM_CAPABILITY = {}
+_TRITON_GROUPED_MM_POLICY = {}
 
 
 def _triton_grouped_mm_capability(index):
@@ -503,8 +504,20 @@ def _triton_grouped_mm_max_rows(index):
     sm80+ CUDA GPU), 0 (off); UNSLOTH_DISABLE_MOE_TRITON=1 also turns it off;
     UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS overrides the limit. Evaluated eagerly (and baked in) under
     torch.compile: no capability probe or environment read inside a trace."""
-    mode = os.environ.get("UNSLOTH_MOE_GROUPED_TRITON", "auto").strip().lower()
-    if mode in ("0", "false", "off") or os.environ.get("UNSLOTH_DISABLE_MOE_TRITON", "0") == "1":
+    environ = os.environ
+    key = (
+        index, environ.get("UNSLOTH_MOE_GROUPED_TRITON"), environ.get("UNSLOTH_DISABLE_MOE_TRITON"),
+        environ.get("UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS"),
+    )
+    limit = _TRITON_GROUPED_MM_POLICY.get(key)
+    if limit is None:
+        limit = _TRITON_GROUPED_MM_POLICY[key] = _triton_grouped_mm_policy(index, key[1], key[2], key[3])
+    return limit
+
+
+def _triton_grouped_mm_policy(index, mode, disabled, override):
+    mode = (mode or "auto").strip().lower()
+    if mode in ("0", "false", "off") or disabled == "1":
         return 0
     if torch.version.hip is not None or _GROUPED_MM_TRITON_OP is None or index is None:
         return 0
@@ -519,7 +532,6 @@ def _triton_grouped_mm_max_rows(index):
         limit = -1 if cap >= (8, 0) else 0
     else:
         limit = _TRITON_GROUPED_MM_AUTO_ROWS.get(cap, 0)
-    override = os.environ.get("UNSLOTH_MOE_GROUPED_TRITON_MAX_ROWS")
     if limit != 0 and override:
         try:
             limit = int(override)
@@ -531,19 +543,17 @@ def _triton_grouped_mm_max_rows(index):
 def _triton_grouped_mm_wanted(inputs, weight) -> bool:
     """Static gate (shapes, dtypes, device, cached policy; never the offsets' values): torch._grouped_mm(inputs
     [M, K], weight [E, K, N]) runs as unsloth_zoo::grouped_mm_triton when M <= limit * E."""
-    if _GROUPED_MM_TRITON_OP is None or inputs.dim() != 2 or weight.dim() != 3:
+    device = inputs.device
+    if device.type != "cuda":
+        return False
+    limit = _triton_grouped_mm_max_rows(device.index)   # first: a declined GPU pays only this
+    if limit == 0 or inputs.dim() != 2 or weight.dim() != 3 or weight.device != device:
         return False
     dtype = inputs.dtype
     if weight.dtype != dtype or (dtype != torch.bfloat16 and dtype != torch.float16):
         return False
-    device = inputs.device
-    if device.type != "cuda" or weight.device != device:
-        return False
     E = weight.shape[0]
     if E == 0 or inputs.shape[1] != weight.shape[1] or weight.shape[2] == 0:
-        return False
-    limit = _triton_grouped_mm_max_rows(device.index)
-    if limit == 0:
         return False
     return limit < 0 or inputs.shape[0] <= limit * E
 
@@ -553,8 +563,7 @@ def _grouped_mm_triton_impl(inputs, weight, offsets):
     if not mg.triton_grouped_available(inputs.device):
         mg.GENERIC_CALLS["fallback"] += 1
         return _grouped_mm_eager(inputs, weight, offsets).contiguous()
-    counts = torch.diff(offsets, prepend = offsets.new_zeros(1))
-    return mg.generic_grouped_mm(inputs, weight, counts)
+    return mg.generic_grouped_mm(inputs, weight, offsets)
 
 
 def _grouped_mm_triton_wgrad_impl(inputs, grad, offsets):
@@ -562,8 +571,37 @@ def _grouped_mm_triton_wgrad_impl(inputs, grad, offsets):
     if not mg.triton_grouped_available(inputs.device):
         mg.GENERIC_CALLS["fallback"] += 1
         return _grouped_mm_fp16_wgrad_eager(inputs, grad, offsets).contiguous()
-    counts = torch.diff(offsets, prepend = offsets.new_zeros(1))
-    return mg.generic_grouped_wgrad(inputs, grad, counts, offsets.shape[0])
+    return mg.generic_grouped_wgrad(inputs, grad, offsets, offsets.shape[0])
+
+
+class _GroupedMMTriton(torch.autograd.Function):
+    """Eager twin of unsloth_zoo::grouped_mm_triton: the same impls and the same backward, without the
+    custom op's per-call dispatch cost (~30 us, as much as the launch itself on small experts)."""
+
+    @staticmethod
+    def forward(ctx, inputs, weight, offsets):
+        ctx.save_for_backward(
+            inputs if ctx.needs_input_grad[1] else None, weight if ctx.needs_input_grad[0] else None, offsets,
+        )
+        return _grouped_mm_triton_impl(inputs, weight, offsets)
+
+    @staticmethod
+    def backward(ctx, grad):
+        x, w, offs = ctx.saved_tensors
+        gx = gw = None
+        if ctx.needs_input_grad[0]:
+            gx = _grouped_mm_triton_impl(grad, w.transpose(-2, -1), offs)
+        if ctx.needs_input_grad[1]:
+            gw = _grouped_mm_triton_wgrad_impl(x, grad, offs)
+        return gx, gw, None
+
+
+def _triton_grouped_mm(inputs, weight, offsets):
+    """torch._grouped_mm(inputs, weight, offs = offsets) on the Triton kernels: the custom op when traced,
+    its autograd.Function twin in eager (same kernels, same numbers)."""
+    if torch.compiler.is_compiling():
+        return _GROUPED_MM_TRITON_OP(inputs, weight, offsets)
+    return _GroupedMMTriton.apply(inputs, weight, offsets)
 
 
 def _register_grouped_mm_triton_op():

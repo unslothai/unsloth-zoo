@@ -76,12 +76,18 @@ if triton is not None:
         stride_am, stride_ak, stride_be, stride_bk, stride_bn, stride_cm, stride_bias_e,
         A_MODE: tl.constexpr, ROW_SCALE: tl.constexpr, HAS_BIAS: tl.constexpr, IEEE: tl.constexpr,
         E_POW2: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+        ENDS: tl.constexpr,
     ):
         # C[m, n] = sum_k A[m, k] * B[e(m) - E_LO, k, n] for the rows of experts in [E_LO, E_HI).
+        # COUNTS: rows per expert, or (ENDS) cumulative row ends as torch._grouped_mm's offs.
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
         e_offs = tl.arange(0, E_POW2)
-        counts = tl.load(COUNTS + e_offs, mask = e_offs < E, other = 0).to(tl.int32)
+        if ENDS:
+            counts = (tl.load(COUNTS + e_offs, mask = e_offs < E, other = 0).to(tl.int32)
+                      - tl.load(COUNTS + e_offs - 1, mask = (e_offs > 0) & (e_offs < E), other = 0).to(tl.int32))
+        else:
+            counts = tl.load(COUNTS + e_offs, mask = e_offs < E, other = 0).to(tl.int32)
         tiles = tl.where((e_offs >= E_LO) & (e_offs < E_HI), (counts + BLOCK_M - 1) // BLOCK_M, 0)
         tile_end = tl.cumsum(tiles, 0)
         e = tl.sum((tile_end <= pid_m).to(tl.int32), 0)
@@ -135,14 +141,18 @@ if triton is not None:
         E, N, K,
         stride_gm, stride_xm, stride_de, stride_dn, stride_dk,
         IEEE: tl.constexpr, E_POW2: tl.constexpr,
-        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, ENDS: tl.constexpr,
     ):
         # DW[e, n, k] = sum over the rows m of expert e of G[m, n] * X[m, k]; zero for an empty expert.
         e = tl.program_id(0)
         pid_n = tl.program_id(1)
         pid_k = tl.program_id(2)
         e_offs = tl.arange(0, E_POW2)
-        counts = tl.load(COUNTS + e_offs, mask = e_offs < E, other = 0).to(tl.int32)
+        if ENDS:
+            counts = (tl.load(COUNTS + e_offs, mask = e_offs < E, other = 0).to(tl.int32)
+                      - tl.load(COUNTS + e_offs - 1, mask = (e_offs > 0) & (e_offs < E), other = 0).to(tl.int32))
+        else:
+            counts = tl.load(COUNTS + e_offs, mask = e_offs < E, other = 0).to(tl.int32)
         sel = e_offs == e
         row_end = tl.sum(tl.where(sel, tl.cumsum(counts, 0), 0), 0)
         row_start = row_end - tl.sum(tl.where(sel, counts, 0), 0)
@@ -335,12 +345,14 @@ def _cublas_backend(device, backend):
 
 
 def grouped_gemm(a, b, counts, out_dtype, *, b_trans, e_lo = 0, e_hi = None, num_experts = None,
-                 out = None, a_mode = None, row_scale = None, bias = None, config = None, backend = None):
+                 out = None, a_mode = None, row_scale = None, bias = None, config = None, backend = None,
+                 ends = False):
     """out[m] = a[m] @ (b[e - e_lo].T if b_trans else b[e - e_lo]) for rows of experts in [e_lo, e_hi).
 
     a: [M, K] rows sorted by expert; b: [E', N, K] (b_trans) or [E', K, N]; counts: [E] rows per
     expert on device. Rows outside the window are not written (pass `out` across windows).
-    backend: None picks per device (use_cublas), "triton" / "cublas" force one."""
+    backend: None picks per device (use_cublas), "triton" / "cublas" force one. ends: counts holds
+    cumulative row ends (torch._grouped_mm's offs) instead of rows per expert."""
     M, K = a.shape
     E = int(num_experts if num_experts is not None else _counts_tensor(counts).numel())
     e_hi = E if e_hi is None else int(e_hi)
@@ -362,6 +374,8 @@ def grouped_gemm(a, b, counts, out_dtype, *, b_trans, e_lo = 0, e_hi = None, num
     if a_mode == A_DIRECT and a.dtype != b.dtype:
         raise TypeError(f"grouped_gemm: {a.dtype} x {b.dtype} needs a_mode cast / split")
     if _cublas_backend(a.device, backend):
+        if ends:
+            counts = torch.diff(_counts_tensor(counts), prepend = _counts_tensor(counts).new_zeros(1))
         with torch.autocast(device_type = a.device.type, enabled = False):
             _gemm_cublas(a, b, counts, out_dtype, b_trans, int(e_lo), e_hi, out, a_mode, row_scale, bias)
         CALLS["gemm"] += 1
@@ -376,21 +390,23 @@ def grouped_gemm(a, b, counts, out_dtype, *, b_trans, e_lo = 0, e_hi = None, num
             a.stride(0), a.stride(1), b.stride(0), stride_bk, stride_bn, out.stride(0),
             bias.stride(0) if bias is not None else 0,
             A_MODE = a_mode, ROW_SCALE = row_scale is not None, HAS_BIAS = bias is not None, IEEE = ieee,
-            E_POW2 = _pow2(max(E, 2)), BLOCK_M = BM, BLOCK_N = BN, BLOCK_K = BK,
+            E_POW2 = _pow2(max(E, 2)), BLOCK_M = BM, BLOCK_N = BN, BLOCK_K = BK, ENDS = bool(ends),
             num_warps = warps, num_stages = stages,
         )
     CALLS["gemm"] += 1
     return out
 
 
-def grouped_wgrad(g, x, counts, out_dtype, num_experts = None, backend = None, config = None):
+def grouped_wgrad(g, x, counts, out_dtype, num_experts = None, backend = None, config = None, ends = False):
     """dw[e] = g[rows of e].T @ x[rows of e] -> [E, N, K]; zeros for an expert with no rows.
-    backend as in grouped_gemm; config = (BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages)."""
+    backend, ends as in grouped_gemm; config = (BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages)."""
     assert g.dtype == x.dtype and g.stride(1) == 1 and x.stride(1) == 1
     M, N = g.shape
     K = x.shape[1]
     E = int(num_experts if num_experts is not None else _counts_tensor(counts).numel())
     if _cublas_backend(g.device, backend):
+        if ends:
+            counts = torch.diff(_counts_tensor(counts), prepend = _counts_tensor(counts).new_zeros(1))
         CALLS["wgrad"] += 1
         with torch.autocast(device_type = g.device.type, enabled = False):
             return _wgrad_cublas(g, x, counts, out_dtype, E)
@@ -412,7 +428,7 @@ def grouped_wgrad(g, x, counts, out_dtype, num_experts = None, backend = None, c
         _grouped_wgrad_kernel[(E, -(-N // BN), -(-K // BK))](
             g, x, dw, counts, E, N, K,
             g.stride(0), x.stride(0), dw.stride(0), dw.stride(1), dw.stride(2),
-            IEEE = ieee, E_POW2 = _pow2(max(E, 2)), BLOCK_M = BM, BLOCK_N = BN, BLOCK_K = BK,
+            IEEE = ieee, E_POW2 = _pow2(max(E, 2)), BLOCK_M = BM, BLOCK_N = BN, BLOCK_K = BK, ENDS = bool(ends),
             num_warps = warps, num_stages = stages,
         )
     CALLS["wgrad"] += 1
@@ -596,28 +612,30 @@ def generic_wgrad_config(M, E, N, K, device):
     return None
 
 
-def generic_grouped_mm(inputs, weight, counts):
+def generic_grouped_mm(inputs, weight, offsets):
     """out[m] = inputs[m] @ weight[e(m)]; inputs [M, K] (any strides), weight [E, K, N] (any strides,
-    a transposed [E, N, K] view included), counts [E] rows per expert on device. Rows past sum(counts)
-    are not written, as torch._grouped_mm leaves them."""
+    a transposed [E, N, K] view included), offsets [E] cumulative row ends on device (read in the
+    kernel: no host sync, no diff launch). Rows past offsets[-1] are not written, as torch._grouped_mm
+    leaves them."""
     M, K = inputs.shape
     E, _, N = weight.shape
     config = generic_gemm_config(M, E, N, K, inputs.device)
-    out = grouped_gemm(inputs, weight, counts, inputs.dtype, b_trans = False, num_experts = E,
-                       config = config, backend = "triton")
+    out = grouped_gemm(inputs, weight, offsets, inputs.dtype, b_trans = False, num_experts = E,
+                       config = config, backend = "triton", ends = True)
     GENERIC_CALLS["gemm"] += 1
     return out
 
 
-def generic_grouped_wgrad(inputs, grad, counts, num_experts):
-    """dW[e] = inputs[rows of e].T @ grad[rows of e] -> [E, K, N]; zeros for an empty expert."""
+def generic_grouped_wgrad(inputs, grad, offsets, num_experts):
+    """dW[e] = inputs[rows of e].T @ grad[rows of e] -> [E, K, N]; zeros for an empty expert.
+    offsets as in generic_grouped_mm."""
     inputs = inputs if inputs.stride(-1) == 1 else inputs.contiguous()
     grad = grad if grad.stride(-1) == 1 else grad.contiguous()
     M, K = inputs.shape
     N = grad.shape[1]
     config = generic_wgrad_config(M, num_experts, K, N, inputs.device)
-    dw = grouped_wgrad(inputs, grad, counts, inputs.dtype, num_experts = num_experts,
-                       backend = "triton", config = config)
+    dw = grouped_wgrad(inputs, grad, offsets, inputs.dtype, num_experts = num_experts,
+                       backend = "triton", config = config, ends = True)
     GENERIC_CALLS["wgrad"] += 1
     return dw
 
@@ -632,6 +650,7 @@ def _self_check_generic(device):
     g = torch.Generator(device = "cpu").manual_seed(0)
     E, N, K = 4, 40, 24
     counts = torch.tensor([5, 0, 19, 3], dtype = torch.int32, device = device)
+    offsets = torch.cumsum(counts, 0, dtype = torch.int32)
     M = int(counts.sum())
     e_of = torch.repeat_interleave(torch.arange(E), counts.cpu().long()).to(device)
     w_nk = (torch.randn(E, N, K, generator = g) * 0.1).to(device)
@@ -643,9 +662,9 @@ def _self_check_generic(device):
     ref_dw = torch.stack([x.double()[e_of == e].T @ dy.double()[e_of == e] for e in range(E)])
     for dtype, tol in ((torch.bfloat16, 2e-2), (torch.float16, 4e-3)):
         w = w_nk.to(dtype)
-        y = generic_grouped_mm(x.to(dtype), w.transpose(-2, -1), counts).double()
-        dx = generic_grouped_mm(dy.to(dtype), w, counts).double()
-        dw = generic_grouped_wgrad(x.to(dtype), dy.to(dtype), counts, E).double()
+        y = generic_grouped_mm(x.to(dtype), w.transpose(-2, -1), offsets).double()
+        dx = generic_grouped_mm(dy.to(dtype), w, offsets).double()
+        dw = generic_grouped_wgrad(x.to(dtype), dy.to(dtype), offsets, E).double()
         for name, got, ref in (("forward", y, ref_y), ("dX", dx, ref_dx), ("dW", dw, ref_dw)):
             if got.shape != ref.shape or not torch.isfinite(got).all() or \
                     (got - ref).abs().max().item() > tol * max(ref.abs().max().item(), 1.0):

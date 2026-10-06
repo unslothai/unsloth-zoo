@@ -366,9 +366,9 @@ def _patch_transformers_grouped_mm():
     original = getattr(transformers_moe, "_grouped_mm", None)
     if original is None or getattr(original, "_unsloth_patched", False):
         return
-    op = getattr(moe_utils, "_GROUPED_MM_TRITON_OP", None)
+    op = getattr(moe_utils, "_triton_grouped_mm", None)
     wanted = getattr(moe_utils, "_triton_grouped_mm_wanted", None)
-    if op is None or wanted is None:
+    if op is None or wanted is None or getattr(moe_utils, "_GROUPED_MM_TRITON_OP", None) is None:
         return
 
     @functools.wraps(original)

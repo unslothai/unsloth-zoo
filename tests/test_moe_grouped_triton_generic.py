@@ -42,9 +42,11 @@ def _clean_env(monkeypatch):
     for name in _ENV:
         monkeypatch.delenv(name, raising = False)
     saved_cap = dict(MU._TRITON_GROUPED_MM_CAPABILITY)
+    MU._TRITON_GROUPED_MM_POLICY.clear()
     yield
     MU._TRITON_GROUPED_MM_CAPABILITY.clear()
     MU._TRITON_GROUPED_MM_CAPABILITY.update(saved_cap)
+    MU._TRITON_GROUPED_MM_POLICY.clear()
 
 
 def _force_on(monkeypatch, max_rows = None):
@@ -55,6 +57,7 @@ def _force_on(monkeypatch, max_rows = None):
 
 def _mock_cap(cap, index = 0):
     MU._TRITON_GROUPED_MM_CAPABILITY[index] = cap
+    MU._TRITON_GROUPED_MM_POLICY.clear()
 
 
 def _problem(counts, K, N, dtype, transposed = True, seed = 0, device = "cuda"):
@@ -137,6 +140,7 @@ def test_gate_table(monkeypatch, cap, auto, forced):
 def test_gate_off_on_hip(monkeypatch):
     _mock_cap((8, 0))
     monkeypatch.setattr(torch.version, "hip", "6.4", raising = False)
+    MU._TRITON_GROUPED_MM_POLICY.clear()
     monkeypatch.setenv("UNSLOTH_MOE_GROUPED_TRITON", "1")
     assert MU._triton_grouped_mm_max_rows(0) == 0
 
@@ -278,6 +282,33 @@ def test_engagement_counter_and_modulelist(monkeypatch):
     assert torch.equal(y_ml, y_mu)
 
 
+@needs_kernel
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_eager_twin_is_bitwise_the_custom_op(monkeypatch, dtype):
+    """Eager calls take the autograd.Function twin (no custom-op dispatch cost), traced calls the op."""
+    _force_on(monkeypatch)
+    x, param, dy, offs, _ = _problem([12, 0, 40, 7, 1], 64, 96, dtype)
+    twin = _run(MU._triton_grouped_mm, x, param, dy, offs, True)
+    op = _run(MU._GROUPED_MM_TRITON_OP, x, param, dy, offs, True)
+    for a, b in zip(twin, op):
+        assert torch.equal(a, b)
+
+
+@needs_kernel
+@pytest.mark.parametrize("backend", ["triton", "cublas"])
+def test_ends_matches_counts(backend):
+    """grouped_gemm / grouped_wgrad(ends = True) read cumulative ends like rows per expert."""
+    x, param, dy, offs, counts = _problem([12, 0, 40, 7, 1], 64, 96, torch.bfloat16)
+    c = counts.to("cuda", torch.int32)
+    w = param.transpose(-2, -1)
+    a = MG.grouped_gemm(x, w, c, x.dtype, b_trans = False, backend = backend)
+    b = MG.grouped_gemm(x, w, offs, x.dtype, b_trans = False, backend = backend, ends = True)
+    assert torch.equal(a, b)
+    a = MG.grouped_wgrad(x, dy, c, x.dtype, num_experts = 5, backend = backend)
+    b = MG.grouped_wgrad(x, dy, offs, x.dtype, num_experts = 5, backend = backend, ends = True)
+    assert torch.equal(a, b)
+
+
 # ---------------------------------------------------------------- declined path == main ---------------------------
 
 
@@ -327,7 +358,7 @@ def test_declined_branch_is_the_main_code():
     src = inspect.getsource(MU._grouped_mm_with_backward_fix)
     body = src.split('"""')[-1]
     assert body.strip().startswith(
-        "if _triton_grouped_mm_wanted(inputs, weight):\n        return _GROUPED_MM_TRITON_OP(inputs, weight, offsets)"
+        "if _triton_grouped_mm_wanted(inputs, weight):\n        return _triton_grouped_mm(inputs, weight, offsets)"
     )
     main_body = inspect.getsource(_main_branch).split("zoo main 3e6a7be3).")[-1]
     norm = lambda s: " ".join(s.replace("MU.", "").split())
