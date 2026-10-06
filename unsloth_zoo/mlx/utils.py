@@ -13180,6 +13180,7 @@ def _iter_lazy_tokenized_text_rows(
             if reject_rows and _contains_mlx_values(formatted):
                 # Formatters can introduce MLX values after the row scan.
                 _reject_mlx_valued_text("the formatting function")
+            _validate_mlx_image_input(tokenizer, _row_has_images(formatted))
             formatter_applied = True
             formatter_needs_completion_boundary = (
                 completion_only_loss is None
