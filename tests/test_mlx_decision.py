@@ -24,6 +24,7 @@ import numpy as np
 import pytest
 
 tokenizers = pytest.importorskip("tokenizers")
+pytest.importorskip("mlx.core")
 
 from unsloth_zoo.mlx import decision  # noqa: E402
 from unsloth_zoo.mlx.decision import (  # noqa: E402
