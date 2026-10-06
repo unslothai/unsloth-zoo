@@ -59,6 +59,11 @@ from .log import logger
 import triton
 import regex
 from .peft_utils import get_lora_layer_modules
+from unsloth_zoo.temporary_patches.mhc_sinkhorn import (
+    MHC_SINKHORN_SOURCE,
+    MHC_SINKHORN_REPLACEMENT,
+    mhc_fast_mode,
+)
 from importlib.metadata import version as importlib_version
 import functools
 from .compiler_replacements import compiler_replacements
@@ -229,6 +234,34 @@ MODEL_FUNCTION_SOURCE_REWRITES = {
         ),
     },
 }
+
+
+# {model_type: {class: (old, new, mode)}}: a class whose forward contains `old` exactly once leaves
+# DISABLE_COMPILE_MODULES. mode() -> None (stay listed), "stock" (compile unchanged), else apply old -> new.
+MODULE_FORWARD_SOURCE_REWRITES = {
+    "deepseek_v4": {
+        "DeepseekV4HyperConnection": (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_mode),
+    },
+    "deepseek_v41": {
+        "DeepseekV41HyperConnection": (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_mode),
+    },
+}
+
+
+def module_forward_source_rewrites(modeling_file, model_type):
+    applicable = {}
+    for name, (old, new, mode) in MODULE_FORWARD_SOURCE_REWRITES.get(model_type, {}).items():
+        try:
+            mode = mode()
+            if not mode:
+                continue
+            cls = getattr(modeling_file, name)
+            source = inspect.getsource(_unwrap_undecorated_method(cls.forward, cls.__qualname__))
+        except Exception:
+            continue
+        if source.count(old) == 1:
+            applicable[name] = source if mode == "stock" else source.replace(old, new)
+    return applicable
 
 
 def model_function_source_rewrites(modeling_file, model_type):
@@ -465,6 +498,7 @@ from unsloth_zoo.loss_utils import (
     fused_linear_cross_entropy,
     unsloth_fused_ce_loss,
 )
+from unsloth_zoo.fused_losses.forward_adapter import unsloth_fused_lm_head_loss
 
 scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
 @torch.compiler.disable(recursive = False)
@@ -611,8 +645,9 @@ def replace_with_grouped_query_attention(module, source):
     # a `return super().forward(...)` separated by an arbitrary body
     # (logger warning, raise, etc.). Matches the legacy shape with a
     # looser anchor; still no-ops on 4.50+ where the guard is gone.
+    # `[ \t][^\n]+`, not `[ \t]+[^\n]+`: that split backtracks exponentially (DeepseekOcr2).
     rewritten, n_loose = re.subn(
-        r"if[ \t]+output_attentions[ \t]*:[^\n]*\n(?:[ \t]+[^\n]+\n)*?[ \t]+return[ \t]+super\(\)\.forward\([^)]*\)",
+        r"if[ \t]+output_attentions[ \t]*:[^\n]*\n(?:[ \t][^\n]+\n)*?[ \t]+return[ \t]+super\(\)\.forward\([^)]*\)",
         "if output_attentions: raise RuntimeError('Unsloth: Not supported')",
         source,
         flags=re.MULTILINE,
@@ -2019,6 +2054,8 @@ def create_new_function(
         imports += "from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback\n"
     if "torch_compiler_disable_unless_decode" in new_source:
         imports += "from unsloth_zoo.temporary_patches.utils import torch_compiler_disable_unless_decode\n"
+    if "unsloth_sinkhorn_knopp" in new_source:
+        imports += "from unsloth_zoo.temporary_patches.mhc_sinkhorn import unsloth_sinkhorn_knopp\n"
     if "torch_compile" in new_source:
         imports += "from unsloth_zoo.temporary_patches.common import torch_compile\n"
     if "_maybe_compile" in new_source:
@@ -2905,13 +2942,20 @@ def create_standalone_class(
     pass
 
     source = f"{compile}\n{source}\n"
-    left = re.match(r"[\s\n]{4,}", leftover).span()[1]
     # Use patched function name if forward was replaced by temporary patch
     forward_func_name = patched_forward_info[0] if patched_forward_info else f"{module}_forward"
-    new_forward = definition + leftover[:left] + \
-        f"return {forward_func_name}({parameters})\n"
-    source_to_replace = patched_forward_info[1] if patched_forward_info else old_source
-    full_class = full_class.replace(source_to_replace, new_forward)
+    if add_loss_kwargs and patched_forward_info is None and full_class.find(definition) == -1:
+        # Inherited forward (deprecated aliases): nothing to replace, so append an override.
+        body_indent = re.search(r"([ \t]*)def\s", definition).group(1) + "    "
+        new_forward = definition.lstrip("\n") + "\n" + body_indent + \
+            f"return {forward_func_name}({parameters})\n"
+        full_class = full_class.rstrip() + "\n\n" + new_forward
+    else:
+        left = re.match(r"[\s\n]{4,}", leftover).span()[1]
+        new_forward = definition + leftover[:left] + \
+            f"return {forward_func_name}({parameters})\n"
+        source_to_replace = patched_forward_info[1] if patched_forward_info else old_source
+        full_class = full_class.replace(source_to_replace, new_forward)
 
     # New init as well
     if new_init is not None:
@@ -3177,7 +3221,7 @@ elif labels is None:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
+elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_ and getattr(self.lm_head, "bias", None) is None:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
         lm_weight          = self.lm_head.weight,
@@ -3216,7 +3260,9 @@ $LOGITSCALINGMULTIPLY$
 $LOGITSCALINGDIVISION$
 $LOGITSOFTCAPPING$
 loss = None
-if labels is not None:$SPACES$loss = self.loss_function($NEWLINES$$LOGITS$, $LABELS$, $VOCABSIZE$$KWARGS$$NEWLINES$)
+if labels is not None:$SPACES$
+$LOGITSUPCAST$
+loss = self.loss_function($NEWLINES$$LOGITS$,$NEWLINES$$LABELS$,$NEWLINES$$VOCABSIZE$$KWARGS$,?$NEWLINES$)
 """
 
 cross_entropy_replacement_2 = """
@@ -3269,7 +3315,7 @@ elif labels is None:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
+elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_ and getattr(self.lm_head, "bias", None) is None:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
         lm_weight          = self.lm_head.weight,
@@ -3402,13 +3448,17 @@ else:
     torch._dynamo.mark_dynamic(labels, 1)
     if attention_mask is not None:
         torch._dynamo.mark_dynamic(attention_mask, 1)
+    # Prefix tuning makes the mask longer than the labels; the stock forward keeps its tail.
+    _mask = \\6
+    if _mask is not None and _mask.shape[-1] > labels.shape[-1]:
+        _mask = _mask[..., -labels.shape[-1]:]
     loss = unsloth_fused_ce_loss(
         trainer              = None,
         hidden_states        = _hidden_states,
         lm_head_weight       = lm_head_weight,
         lm_head_bias         = lm_head_bias,
         labels               = labels,
-        mask                 = \\6,
+        mask                 = _mask,
         n_items              = n_items,
         scaling              = getattr(self, "accelerator_scaler", None),
         target_gb            = None,
@@ -3435,9 +3485,137 @@ ce_finders = [
 ]
 
 
+def _normalize_lm_head_source(forward):
+    # `logits = self.lm_head(x) * self.s` on one line (HyperCLOVAX vision) -> two lines.
+    forward = re.sub(
+        r"^([ \t]+)logits = (self\.lm_head\([^\n]+\)) ([\*/]) (self\.[\w\.]+)[ \t]*$",
+        r"\1logits = \2\n\1logits = logits \3 \4",
+        forward,
+        flags = re.MULTILINE,
+    )
+    # transformers 4.x CTRL / OpenAI GPT name it `lm_logits`; rename only if `logits` is unused.
+    if re.search(r"^[ \t]+lm_logits = self\.lm_head\(", forward, flags = re.MULTILINE) \
+            and not re.search(r"(?<![\w.])logits(?![\w=])", forward):
+        forward = re.sub(r"\blm_logits\b", "logits", forward)
+    # Multi-line masked-shift CE (Qwen2-Audio, Granite Speech) -> pattern 3; needs a local head call.
+    if "self.lm_head(" not in forward:
+        return forward
+    forward = re.sub(
+        r"^([ \t]+)loss = loss_fct\(\s*\n\s*shift_logits\.view\(-1, shift_logits\.size\(-1\)\),\s*"
+        r"shift_labels\.view\(-1\)(?:\.to\(([^()\n]*)\))?,?\s*\n\s*\)[ \t]*$",
+        lambda m: (
+            f"{m.group(1)}shift_logits = shift_logits.view(-1, shift_logits.size(-1))\n"
+            f"{m.group(1)}shift_labels = shift_labels.view(-1)\n"
+            f"{m.group(1)}shift_labels = shift_labels.to({m.group(2) or 'shift_logits.device'})\n"
+            f"{m.group(1)}loss = loss_fct(shift_logits, shift_labels)"
+        ),
+        forward,
+        flags = re.MULTILINE,
+    )
+    return _hoist_head_to_loss_preamble(forward)
+
+
+def _hoist_head_to_loss_preamble(forward):
+    """Hoist head-independent rebinds between the head call and `loss = None` (Qwen2-Audio)."""
+    lines = forward.split("\n")
+    for i, line in enumerate(lines):
+        head = re.match(r"^([ \t]+)logits = self\.lm_head\((.*)\)[ \t]*$", line)
+        if head is None:
+            continue
+        indent, head_names = head.group(1), set(re.findall(r"\b\w+\b", head.group(2)))
+        moved, j = [], i + 1
+        while j < len(lines):
+            current = lines[j]
+            if current.strip() == "":
+                j += 1
+                continue
+            if current == f"{indent}loss = None":
+                break
+            assign = re.match(rf"^{indent}(\w+) = (?!.*\blogits\b)[^\n]+$", current)
+            if assign is None or assign.group(1) in head_names or assign.group(1) == "logits":
+                moved = None
+                break
+            moved.append(current)
+            j += 1
+        if not moved or j == len(lines):
+            continue
+        rest = [x for x in lines[i + 1:j] if x not in moved]
+        return "\n".join(lines[:i] + moved + [line] + rest + lines[j:])
+    return forward
+
+
 def apply_fused_lm_head(forward, module=None):
+    # Kept only if it fuses, so unmatched sources come back byte-identical.
+    normalized = _normalize_lm_head_source(forward)
+    if normalized != forward:
+        new_forward, fused = _apply_fused_lm_head(normalized, module)
+        if fused:
+            return new_forward, fused
+    return _apply_fused_lm_head(forward, module)
+
+
+# Patterns 1 and 3 need these tails; their regex otherwise backtracks for seconds.
+_CE_TAIL_VIEW = re.compile(r"(?:shift|flat)_logits = (?:shift|flat)_logits\.view\(-1,")
+_CE_TAIL_CALL = re.compile(r"loss = loss_fct\((?:shift|flat)_logits, (?:shift|flat)_labels\)")
+
+
+def _labels_block_tail(forward, end, indent):
+    """Labels-block source after the matched loss call; None if code shares its line."""
+    rest = forward[end:]
+    newline = rest.find("\n")
+    if newline == -1:
+        return ""
+    if rest[:newline].strip():
+        return None
+    tail = []
+    for line in rest[newline + 1:].split("\n"):
+        if line.strip() and len(line) - len(line.lstrip()) < indent:
+            break
+        tail.append(line)
+    return "\n".join(tail).strip("\n")
+
+
+def _tail_guard(tail):
+    """(COND, block) for one `if COND:` tail, ("", "") for none, None if not replayable."""
+    if not tail.strip():
+        return ("", "")
+    block = textwrap.dedent(tail)
+    try:
+        body = ast.parse(block).body
+    except SyntaxError:
+        return None
+    if not body:
+        return ("", "")
+    if len(body) == 1 and isinstance(body[0], ast.If) and not body[0].orelse:
+        return (ast.unparse(body[0].test), block)
+    return None
+
+
+def _guard_loss_function_replacement(replacement, condition, block):
+    """Fused branches skip `condition` (its block reads real logits); RETURN_LOGITS replays it."""
+    condition = condition.replace("\\", "\\\\")
+    block = block.replace("\\", "\\\\")
+    lines = []
+    for line in replacement.split("\n"):
+        stripped = line.strip()
+        indent = line[: len(line) - len(line.lstrip())]
+        if stripped.startswith("elif ") and stripped.endswith(
+            ("and not requires_grad_:", 'getattr(self.lm_head, "bias", None) is None:', "and NOT_RETURN_LOGITS:")
+        ):
+            line = f"{line[:-1]} and not ({condition}):"
+        elif stripped == 'elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None:':
+            line = f"{line[:-1]} and not NOT_RETURN_LOGITS:"
+        lines.append(line)
+        if stripped.startswith("loss = self.loss_function(logits, labels.to("):
+            lines.extend(indent + x if x.strip() else x for x in block.rstrip("\n").split("\n"))
+    return "\n".join(lines)
+
+
+def _apply_fused_lm_head(forward, module=None):
     # All Unsloth Zoo code licensed under LGPLv3
     UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
+    # Rewrites below run on a working copy; an unmatched source must come back unchanged.
+    original_forward = forward
     for jj, (cross_entropy_find, cross_entropy_replacement) in enumerate(ce_finders):
         cross_entropy_find = (
             cross_entropy_find.strip()
@@ -3473,16 +3651,12 @@ def apply_fused_lm_head(forward, module=None):
                 r"self\.vocab_size|"
                 r"self\.config\.vocab_size|"
                 r"self\.config\.text_config\.vocab_size|"
-                r"self\.config\.get_text_config\(\)\.vocab_size"
+                r"self\.config\.get_text_config\(\)\.vocab_size|"
+                r"shift\_logits\.size\(\-1\)"
                 ")",
             )
-            # Any identifier, not a list of the two names we had seen. transformers
-            # 5.17 renamed gemma3's to `lm_kwargs`, and because a finder that does
-            # not match is a silent no-op, the only symptom was Gemma 3 quietly
-            # losing fused linear cross entropy. One capture group either way, and
-            # the replacements splice the captured NAME in, so a new spelling
-            # works without being enumerated here.
-            .replace("$KWARGS$", r"(?:, \*\*([A-Za-z_]\w*))?")
+            # Any kwargs name (transformers 5.17 renamed gemma3's to `lm_kwargs`); may sit on its own line.
+            .replace("$KWARGS$", r"(?:,[\s\n]{0,}\*\*([A-Za-z_]\w*))?")
             .replace("$LOGITSUPCAST$", r"(?:logits = logits\.float\(\))?")
             .replace("$LABELSDEVICE$", r"(?:labels = labels\.to\([^\)]{1,}\))?")
             .replace(
@@ -3568,7 +3742,7 @@ def apply_fused_lm_head(forward, module=None):
             r"shift_logits\.view\(-1, shift_logits\.size\(-1\)\), "
             r"shift_labels\.view\(-1\)\)$",
             lambda m: (
-                f"{m.group(1)}shift_logits = shift_logits.view(-1, self.config.text_config.vocab_size)\n"
+                f"{m.group(1)}shift_logits = shift_logits.view(-1, shift_logits.size(-1))\n"
                 f"{m.group(1)}shift_labels = shift_labels.view(-1)\n"
                 f"{m.group(1)}shift_labels = shift_labels.to(shift_logits.device)\n"
                 f"{m.group(1)}loss = loss_fct(shift_logits, shift_labels)"
@@ -3608,6 +3782,10 @@ def apply_fused_lm_head(forward, module=None):
                     f"(4) Unsloth skipping patching fast linear cross entropy for {module}"
                 )
             continue
+        if "CrossEntropyLoss" in cross_entropy_find and not (
+            _CE_TAIL_VIEW.search(forward) and _CE_TAIL_CALL.search(forward)
+        ):
+            continue
         try:
             finder = regex.findall(
                 cross_entropy_find,
@@ -3615,6 +3793,12 @@ def apply_fused_lm_head(forward, module=None):
                 flags=regex.DOTALL | regex.MULTILINE,
                 timeout=1,
             )
+        except TimeoutError:
+            if UNSLOTH_ENABLE_LOGGING:
+                print(
+                    f"Unsloth: fast linear cross entropy pattern {jj + 1}/3 timed out for {module}"
+                )
+            continue
         except Exception as e:
             if UNSLOTH_ENABLE_LOGGING:
                 print(
@@ -3635,6 +3819,31 @@ def apply_fused_lm_head(forward, module=None):
             spaces = finder[0][3]
         replacement = cross_entropy_replacement.strip().split("\n")
         replacement = "\n".join((len(spaces) - 4) * " " + x for x in replacement)
+        # A consumed `logits = logits.float()` (transformers 4.x Granite MoE) must still reach the
+        # unfused loss_function calls, which also return those logits.
+        try:
+            matched = regex.search(
+                cross_entropy_find, forward, flags = regex.DOTALL | regex.MULTILINE, timeout = 1,
+            )
+        except Exception:
+            continue
+        if matched is None:
+            continue
+        # Labels-block statements after the loss call only reach the unfused `else` (Bamba z-loss).
+        guard = _labels_block_tail(forward, matched.end(), len(spaces))
+        guard = None if guard is None else _tail_guard(guard)
+        if guard is None or (guard[0] and r"loss\_function" not in cross_entropy_find):
+            continue
+        if guard[0]:
+            replacement = _guard_loss_function_replacement(replacement, *guard)
+        if r"loss\_function" in cross_entropy_find:
+            if "logits = logits.float()" in matched.group(0):
+                replacement = re.sub(
+                    r"^([ \t]*)(loss = self\.loss_function\()",
+                    r"\1logits = logits.float()\n\1\2",
+                    replacement,
+                    flags = re.MULTILINE,
+                )
         if "slice_indices" in forward:
             replacement = (
                 "logits = self.lm_head(hidden_states[:, slice_indices, :]) if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1' else EMPTY_LOGITS\n"
@@ -3683,7 +3892,7 @@ def apply_fused_lm_head(forward, module=None):
         # print(forward)
         return forward, True
     pass
-    return forward, False
+    return original_forward, False
 
 
 pass
@@ -3701,6 +3910,9 @@ def test_apply_fused_lm_head():
     from transformers.models.granite.modeling_granite import GraniteForCausalLM
 
     forwards.append(GraniteForCausalLM)
+    from transformers.models.granitemoehybrid.modeling_granitemoehybrid import GraniteMoeHybridForCausalLM
+
+    forwards.append(GraniteMoeHybridForCausalLM)
     from transformers.models.gemma2.modeling_gemma2 import Gemma2ForCausalLM
 
     forwards.append(Gemma2ForCausalLM)
@@ -4833,6 +5045,54 @@ pass
 _DROPPED_TEXT_LOGIT_SCALE = ("AyaVisionForConditionalGeneration",)
 
 
+def _ast_fused_lm_head_fallback(source, module = None, module_class = None):
+    """Spliced AST rewrite of a forward the regex patterns did not fuse, else None."""
+    if "unsloth_fused_lm_head_loss" in source or "EMPTY_LOGITS" in source:
+        return None  # already rewritten by the import hook
+    try:
+        from unsloth_zoo.fused_losses.ast_rewriter import rewrite_forward_source_spliced
+        new_source, cap = rewrite_forward_source_spliced(source)
+    except Exception as e:
+        if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
+            print(f"Unsloth: AST fused lm_head fallback failed for {module}: {e}")
+        return None
+    # The fused loss reads `.weight` / `.bias`: same head rule as the import hook.
+    from unsloth_zoo.fused_losses.forward_install import _LINEAR_HEAD_ATTRS, _head_built_as_linear
+    if new_source is None or cap.head_attr not in _LINEAR_HEAD_ATTRS:
+        return None
+    # Other head names only where the hook takes them or with a proven aligned token CE (Whisper, TrOCR).
+    if cap.head_attr != "lm_head" and not str(module).endswith("ForCausalLM") and not cap.aligned_target:
+        return None
+    if module_class is not None and not _head_built_as_linear(module_class, cap.head_attr):
+        return None
+    return new_source
+
+
+def fused_lm_head_forward(module, module_class, modeling_module_name, source):
+    """The compiler's fused-CE rewrite of one GenerationMixin forward.
+
+    Returns (new_source, route, supports_return_hidden_states); route is "regex", "ast" or None.
+    Pure on the source, so tests/test_fused_ce_coverage.py runs the same decision without compiling.
+    """
+    # Fix some arguments up like for Gemma 3N
+    new_source = fixup_fused_lm_head(source)
+    new_source = fixup_dropped_logit_scale(new_source, module)
+    # Fused CE reads lm_head.weight, which Roberta-style composite heads lack.
+    from unsloth_zoo.fused_losses.forward_install import _head_built_as_linear
+    if not _head_built_as_linear(module_class, "lm_head"):
+        return new_source, None, False
+    fused_source, supports_return_hidden_states = apply_fused_lm_head(new_source, module)
+    route = "regex" if supports_return_hidden_states else None
+    # Only classes defined here: an imported one (4.x Blenderbot) lacks its base classes.
+    if not supports_return_hidden_states and \
+            getattr(module_class, "__module__", None) == modeling_module_name:
+        # AST fallback has no UNSLOTH_RETURN_HIDDEN_STATES branch: GRPO keeps its wrapper.
+        ast_source = _ast_fused_lm_head_fallback(new_source, module, module_class)
+        if ast_source is not None:
+            fused_source, route = ast_source, "ast"
+    return fused_source, route, supports_return_hidden_states
+
+
 def fixup_dropped_logit_scale(source, module = None):
     if module not in _DROPPED_TEXT_LOGIT_SCALE or "logit_scale" in source:
         return source
@@ -5148,8 +5408,7 @@ DISABLE_COMPILE_MODULES = [
     "Gemma4VisionEncoder",
     "Gemma4VisionEncoderLayer",
     "Gemma4MultimodalEmbedder",
-    # DeepSeek-V4 hyper-connection mixers: Inductor's fused backward of their
-    # Sinkhorn-Knopp division chain overflows to inf; tiny modules, so eager is cheap.
+    # DeepSeek-V4 mixers: HyperConnection leaves via MODULE_FORWARD_SOURCE_REWRITES (#859 saw inf grads compiled).
     "DeepseekV4HyperConnection",
     "DeepseekV4HyperHead",
     "DeepseekV41HyperConnection",
@@ -5519,6 +5778,7 @@ def unsloth_compile_transformers(
     disable_compile_functions.update(DISABLE_COMPILE_MODEL_FUNCTIONS.get(model_type, ()))
     function_source_rewrites = model_function_source_rewrites(modeling_file, model_type)
     disable_compile_functions.difference_update(function_source_rewrites)
+    module_forward_rewrites = module_forward_source_rewrites(modeling_file, model_type)
 
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__"):
         # Get __UNSLOTH_SUPPORTS_SDPA__
@@ -6154,7 +6414,9 @@ def unsloth_compile_transformers(
         pass
 
         # if more modules need to be disabled consider adding to a global list
-        if any([module.endswith(x) for x in DISABLE_COMPILE_MODULES]):
+        if module not in module_forward_rewrites and any(
+            [module.endswith(x) for x in DISABLE_COMPILE_MODULES]
+        ):
             print(
                 f"Unsloth: Disabling compile for {module} since it's marked for disabling."
             )
@@ -6191,7 +6453,9 @@ def unsloth_compile_transformers(
 
     if len(pretrained_modules) > 0:
         for module in pretrained_modules:
-            if any([module.endswith(x) for x in DISABLE_COMPILE_MODULES]):
+            if module not in module_forward_rewrites and any(
+                [module.endswith(x) for x in DISABLE_COMPILE_MODULES]
+            ):
                 print(
                     f"Unsloth: Disabling compile for {module} since it's marked for disabling."
                 )
@@ -6228,6 +6492,7 @@ def unsloth_compile_transformers(
                     functions,
                     fullgraph=False if module in no_fullgraph_modules else fullgraph,
                     disable=disable,
+                    forward_source=module_forward_rewrites.get(module),
                 )
                 print(f"Unsloth: Compiled module {module}.")
                 all_standalone_classes[module] = new_module
@@ -6335,12 +6600,8 @@ def unsloth_compile_transformers(
                     source = inspect.getsource(module_class.forward)
                 except:
                     continue
-                # Fix some arguments up like for Gemma 3N
-                new_source = fixup_fused_lm_head(source)
-                new_source = fixup_dropped_logit_scale(new_source, module)
-                # Apply fused LM transforms
-                new_source, supports_return_hidden_states = apply_fused_lm_head(
-                    new_source, module
+                new_source, _, supports_return_hidden_states = fused_lm_head_forward(
+                    module, module_class, modeling_file.__name__, source,
                 )
                 # print(new_source)
                 new_source = apply_mask_attention_mask_out(new_source)
@@ -6810,6 +7071,14 @@ def unsloth_compile_transformers(
             all_standalone_classes[module] = new_source
         pass
     pass
+
+    # torch modules were dropped from the import list because a standalone copy was expected. One whose copy
+    # failed (e.g. a forward replaced by a temporary patch whose source the rewriter cannot parse, as
+    # Qwen3MoeRMSNorm under the float16 FORCE_FLOAT32 patches on transformers 4.x) would be neither defined
+    # nor imported, and the first class that builds it raised NameError. Import the (patched) original.
+    for module in torch_modules:
+        if module not in all_standalone_classes and module not in functions and hasattr(modeling_file, module):
+            functions.append(module)
 
     # Order all components
     final_all_standalone_classes = []

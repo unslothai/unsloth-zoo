@@ -58,6 +58,27 @@ def qwen4_exp_qsa_indexer_forward(self, hidden_states, position_embeddings, atte
     return _reference_qsa_forward(self, hidden_states, position_embeddings, attention_mask, past_key_values)
 
 
+_reference_ple_forward = None
+
+
+def qwen4_exp_ple_layer_forward(self, hidden_states, input_ids, past_key_values, conv_mask=None):
+    # Compiler copies this source into its cache: use only `torch`, `self`, the arguments, the lazy import.
+    from unsloth_zoo.temporary_patches.qwen4_exp import _reference_ple_forward
+    # Autocast's float32 gate `sum` would make a half residual stream (and every later MoE input) float32.
+    # A float32 residual keeps autocast: it is what casts it for the half short convolution.
+    device_type = hidden_states.device.type
+    if (
+        hidden_states.dtype in (torch.bfloat16, torch.float16)
+        and torch.amp.is_autocast_available(device_type)
+        and torch.is_autocast_enabled(device_type)
+    ):
+        with torch.autocast(device_type, enabled=False):
+            output = _reference_ple_forward(self, hidden_states, input_ids, past_key_values, conv_mask=conv_mask)
+    else:
+        output = _reference_ple_forward(self, hidden_states, input_ids, past_key_values, conv_mask=conv_mask)
+    return output.to(hidden_states.dtype)
+
+
 def _is_transformers_indexer_forward(function):
     """By code file: the compiled copy keeps transformers' ``__module__``."""
     code = getattr(function, "__code__", None)
@@ -93,6 +114,20 @@ def patch_qwen4_exp():
         except Exception as e:
             if UNSLOTH_ENABLE_LOGGING:
                 logger.warning(f"Unsloth: Could not patch Qwen4ExpTextQSAIndexer.forward: {e}")
+
+    global _reference_ple_forward
+    ple_cls = getattr(modeling, "Qwen4ExpTextPLELayer", None)
+    if (
+        ple_cls is not None
+        and ple_cls.forward is not qwen4_exp_ple_layer_forward
+        and _is_transformers_indexer_forward(ple_cls.forward)
+    ):
+        try:
+            _reference_ple_forward = ple_cls.forward
+            ple_cls.forward = qwen4_exp_ple_layer_forward
+        except Exception as e:
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.warning(f"Unsloth: Could not patch Qwen4ExpTextPLELayer.forward: {e}")
 
     experts_cls = getattr(modeling, "Qwen4ExpTextExperts", None)
     block_cls = getattr(modeling, "Qwen4ExpTextSparseMoeBlock", None)

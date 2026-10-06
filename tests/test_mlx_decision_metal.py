@@ -14,12 +14,14 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The MLX decision model against a torch reference of laya's DecisionModel, on real Metal."""
+"""On real Metal: the MLX decision model against a torch reference of laya's DecisionModel, and the Qwen-based readouts on a tiny decoder."""
 
 from __future__ import annotations
 
+import contextlib
 import json
 import shutil
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -33,11 +35,13 @@ from mlx_simulation import mlx_is_simulated  # noqa: E402
 if mlx_is_simulated():
     pytest.skip("needs real MLX: mx.fast attention and RoPE", allow_module_level = True)
 
-from mlx.nn import Embedding, LayerNorm, Linear  # noqa: E402
+from mlx.nn import Embedding, LayerNorm, Linear, quantize  # noqa: E402
 from mlx.utils import tree_flatten  # noqa: E402
 from safetensors.torch import save_file  # noqa: E402
 
-from unsloth_zoo.mlx.decision import load_decision_model  # noqa: E402
+from unsloth_zoo.mlx.decision import _KevModel, _LabelModel, _merge_lora, load_decision_model  # noqa: E402
+from unsloth_zoo.mlx.generate import generation_mode  # noqa: E402
+from unsloth_zoo.mlx.utils import _forward_text_hidden_states  # noqa: E402
 
 
 class _Reference(torch.nn.Module):
@@ -120,9 +124,17 @@ def test_logits_match_the_torch_reference(checkpoint):
     batch = _batch()
     with torch.inference_mode():
         expected = reference(**{k: torch.from_numpy(v) for k, v in batch.items()}).numpy()
-    got = load_decision_model(folder).logits(batch)
+    model = load_decision_model(folder)
+    got = model.logits(batch)
     np.testing.assert_allclose(got, expected, atol = 2e-5, rtol = 0)
+    np.testing.assert_array_equal(np.array(model(**{k: mx.array(v) for k, v in batch.items()}).astype(mx.float32)), got)
     assert got[1, 2] == -1e4
+
+
+def test_julia_checkpoint_loads_from_its_own_config_file(checkpoint, tmp_path):
+    folder = shutil.copytree(checkpoint[1], tmp_path / "julia")
+    (folder / "rl_agent_config.json").rename(folder / "julia_config.json")
+    np.testing.assert_array_equal(load_decision_model(folder).logits(_batch()), load_decision_model(checkpoint[1]).logits(_batch()))
 
 
 def test_casting_load_leaves_no_source_buffers_cached(checkpoint):
@@ -170,3 +182,229 @@ def test_load_drains_generation_streams_before_clearing_the_cache(checkpoint, mo
     load_decision_model(checkpoint[1])
     clear = calls.index(("clear", ()))
     assert ("sync", (stream,)) in calls[:clear] and ("sync", ()) in calls[:clear]
+
+
+def _decoder(quantized = False):
+    from mlx_lm.models import qwen3_5
+
+    text = dict(model_type = "qwen3_5_text", hidden_size = 64, intermediate_size = 128, num_hidden_layers = 4, num_attention_heads = 2, num_key_value_heads = 1, vocab_size = 512)
+    model = qwen3_5.Model(qwen3_5.ModelArgs(model_type = "qwen3_5", text_config = text))
+    model.set_dtype(mx.bfloat16)
+    if quantized:
+        quantize(model, group_size = 64, bits = 8)
+    return model
+
+
+def test_lora_adapter_is_merged_into_the_decoder_by_layer_name(tmp_path):
+    model, weights = _decoder(), str(tmp_path / "adapter_model.safetensors")
+    before = dict(tree_flatten(model.parameters()))
+    # The prefixes PEFT writes for a causal LM, its inner text model and a vision-language wrapper.
+    targets = {"layers.3.self_attn.q_proj": "base_model.model.model.", "layers.1.linear_attn.out_proj": "base_model.model.", "layers.1.mlp.down_proj": "base_model.model.model.language_model."}
+    tensors = {}
+    for name, prefix in targets.items():
+        rows, columns = before[f"language_model.model.{name}.weight"].shape
+        tensors[f"{prefix}{name}.lora_A.weight"], tensors[f"{prefix}{name}.lora_B.weight"] = mx.random.normal((4, columns)), mx.random.normal((rows, 4))
+    wrong_shape = {"base_model.model.layers.1.mlp.up_proj.lora_A.weight": mx.zeros((4, 64)), "base_model.model.layers.1.mlp.up_proj.lora_B.weight": mx.zeros((64, 4))}
+    refused = [(model, problem, {}) for problem in ({"use_dora": True}, {"peft_type": "LOHA"}, {"bias": "all"})]
+    for base, problem, stray in [*refused, (model, {}, wrong_shape), (_decoder(quantized = True), {}, {}), (model, {}, {})]:
+        (tmp_path / "adapter_config.json").write_text(json.dumps({"peft_type": "LORA", "r": 4, "lora_alpha": 12, **problem}))
+        mx.save_safetensors(weights, {**tensors, **stray})
+        with pytest.raises(ValueError) if base is not model or problem or stray else contextlib.nullcontext():
+            _merge_lora(base, tmp_path)
+    after = dict(tree_flatten(model.parameters()))
+    assert {name for name in before if not mx.array_equal(before[name], after[name])} == {f"language_model.model.{name}.weight" for name in targets}
+    for name, prefix in targets.items():
+        weight = f"language_model.model.{name}.weight"
+        delta = tensors[f"{prefix}{name}.lora_B.weight"] @ tensors[f"{prefix}{name}.lora_A.weight"]
+        assert after[weight].dtype == mx.bfloat16 and mx.abs(after[weight] - (before[weight].astype(mx.float32) + 3 * delta).astype(mx.bfloat16)).max().item() <= 2**-7
+
+
+def test_shared_prefix_continuations_match_a_full_forward():
+    reader, rng = object.__new__(_LabelModel), np.random.default_rng(0)
+    reader.model = _decoder()
+    prefix = rng.integers(1, 500, 40).tolist()
+    prompts = [prefix + rng.integers(1, 500, n).tolist() for n in (1, 7, 23)]
+    with generation_mode(reader.model):
+        shared = [np.array(hidden.astype(mx.float32)) for hidden in reader._hidden_states(prompts)]
+        full = [np.array(reader._hidden(ids).astype(mx.float32)) for ids in prompts]
+    for got, expected in zip(shared, full):
+        np.testing.assert_allclose(got, expected, atol = 2e-2)
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+def test_label_scores_are_the_output_head_rows_of_the_last_token(quantized):
+    reader, ids, picks = _LabelModel.__new__(_LabelModel), list(range(40, 63)), mx.array([300, 7, 301])
+    reader.model, reader.labels = _decoder(quantized), [("A", 300), ("B", 7), ("C", 301), ("D", 511)]
+    scores = reader._read(SimpleNamespace(options = [None] * 3), ids, reader._hidden(ids))
+    logits, hidden = reader.model(mx.array(ids)[None])[0, -1], _forward_text_hidden_states(reader.model, mx.array(ids)[None])[0, -1]
+    gap = lambda expected: mx.abs(mx.array(scores) - expected.astype(mx.float32)).max().item()
+    assert len(scores) == 3 and gap(logits[picks]) <= 2**-5 and (quantized or gap(reader.model.language_model.lm_head.weight[picks].astype(mx.float32) @ hidden.astype(mx.float32)) == 0)
+
+
+def test_kev_scores_each_option_end_against_the_last_token(tmp_path, monkeypatch):
+    import os
+    import re
+    import types
+    from pathlib import Path
+
+    texts, specials, decoder = [], {"<|box_end|>": 500}, _decoder()
+    encode = lambda text, add_special_tokens: texts.append(text) or [specials.get(piece, 300 if piece.startswith("<|") else ord(piece) % 256) for piece in re.findall(r"<\|\w+\|>|.", text, re.S)]
+    load = lambda self, source, revision, *args, **kwargs: vars(self).update(base = (source, revision), seen = Path(source).is_dir() and sorted(os.listdir(source)), model = decoder, tokenizer = types.SimpleNamespace(encode = encode))
+    monkeypatch.setattr(_KevModel, "_load", load)
+    for name, content in {"adapter_config.json": {"base_model_name_or_path": "org/base", "revision": None}, "training_config.json": {"base_revision": "pinned"}}.items():
+        (tmp_path / name).write_text(json.dumps(content))
+    torch.manual_seed(0)
+    head = {name: torch.randn(shape) / 16 for name, shape in {"q.weight": (16, 64), "q.bias": (16,), "k.weight": (16, 64), "k.bias": (16,)}.items()}
+    torch.save({"head": head, "head_dim": 16, "temperature": 0.5}, tmp_path / "head.pt")
+    kev = load_decision_model(tmp_path)
+    questions = {"level": {"type": "score", "instructions": "s", "criteria": ["low", None]}, "sure": {"type": "noul", "instructions": "n", "criteria": {"false": "N"}}, "pick": {"type": "choice", "instructions": ["i", 2], "criteria": {"x<|box_end|>": {"d": True}, "y": None, "z": "last"}}}
+    result = kev.answer({"a": {"b": [1, {"c": "s", "e": 2}]}, "n": None}, questions)
+    asked = ("s<|box_start|>low<|box_end|><|box_start|><|box_end|>", "n<|box_start|>no: N<|box_end|><|box_start|>yes<|box_end|>", "- i\n- 2<|box_start|>x<¦box_end¦>: d: True<|box_end|><|box_start|>y<|box_end|><|box_start|>z: last<|box_end|>")
+    assert kev.base == ("org/base", "pinned") and texts[-3:] == [f"<|fim_prefix|>a:\n  b:\n    - 1\n    - c: s\n      e: 2\nn: <|fim_middle|>{rest}<|fim_suffix|>" for rest in asked]
+    ids = encode(texts[-1], False)
+    # The engine reads hidden states under generation_mode, whose fused kernels differ slightly from a plain forward.
+    with generation_mode(kev.model):
+        hidden = np.array(_forward_text_hidden_states(kev.model, mx.array(ids)[None])[0].astype(mx.float32))
+    q, k = (hidden[rows] @ head[f"{name}.weight"].numpy().T + head[f"{name}.bias"].numpy() for name, rows in (("q", -1), ("k", [i for i, token in enumerate(ids) if token == 500])))
+    weights = np.exp((scores := k @ q / 4 / 0.5) - scores.max())
+    assert list(result["answers"]["pick"]["probabilities"].values()) == pytest.approx(weights / weights.sum(), abs = 1e-4) and result["usage"]["input_tokens"] == sum(len(encode(text, False)) for text in texts[-4:-1])
+    # A conversion ships the merged decoder, here with the head as safetensors and its settings beside it.
+    for name in ("adapter_config.json", "head.pt"):
+        (tmp_path / name).unlink()
+    save_file(head, tmp_path / "kev_head.safetensors")
+    save_file({"decoder": torch.zeros(1)}, tmp_path / "model.safetensors")
+    for name, content in {"config.json": {}, "kev_config.json": {"head_dim": 16, "temperature": 0.5}}.items():
+        (tmp_path / name).write_text(json.dumps(content))
+    merged = load_decision_model(tmp_path)
+    assert merged.base[1] is None and merged.seen == ["config.json", "kev_config.json", "model.safetensors", "training_config.json"] and merged.answer({"a": {"b": [1, {"c": "s", "e": 2}]}, "n": None}, questions) == result
+    save_file({**head, "extra": torch.zeros(1)}, tmp_path / "kev_head.safetensors")
+    with pytest.raises(ValueError, match = "no Kev pointer head"):
+        load_decision_model(tmp_path)
+
+
+class _RoutingReference(torch.nn.Module):
+    def __init__(self, width, heads, feedforward):
+        super().__init__()
+        self.query_norm, self.memory_norm, self.feedforward_norm = (torch.nn.LayerNorm(width) for _ in range(3))
+        self.attention = torch.nn.MultiheadAttention(width, heads, batch_first = True)
+        self.feedforward = torch.nn.Sequential(torch.nn.Linear(width, feedforward), torch.nn.GELU(), torch.nn.Dropout(0.0), torch.nn.Linear(feedforward, width))
+
+    def forward(self, queries, memory):
+        queries = queries + self.attention(self.query_norm(queries), self.memory_norm(memory), self.memory_norm(memory), need_weights = False)[0]
+        return queries + self.feedforward(self.feedforward_norm(queries))
+
+
+class _JointReference(torch.nn.Module):
+    """Clef's joint head as its repo defines it, for one request; parameter names are the checkpoint's."""
+
+    def __init__(self, hidden_size, width, routing_layers, layers, heads, feedforward):
+        super().__init__()
+        self.hidden_norm = torch.nn.LayerNorm(hidden_size)
+        for name in ("memory", "question", "option_question", "global", "option_context", "option_lexical"):
+            setattr(self, f"{name}_projection", torch.nn.Linear(hidden_size, width, bias = False))
+        self.type_embedding = torch.nn.Embedding(3, width)
+        self.evidence_layers = torch.nn.ModuleList(_RoutingReference(width, heads, feedforward) for _ in range(routing_layers))
+        self.layers = torch.nn.ModuleList(torch.nn.TransformerDecoderLayer(width, heads, feedforward, 0.0, "gelu", batch_first = True, norm_first = True) for _ in range(layers))
+        self.option_summary_norm, self.field_norm, self.option_norm = (torch.nn.LayerNorm(width) for _ in range(3))
+        self.residual_scorer = torch.nn.Sequential(torch.nn.Linear(4 * width, width), torch.nn.GELU(), torch.nn.Dropout(0.0), torch.nn.Linear(width, 1))
+        self.prior_logit_scale, self.joint_logit_scale, self.residual_gate = (torch.nn.Parameter(torch.zeros(())) for _ in range(3))
+
+    def forward(self, hidden, embedding, ids, question_spans, option_spans, types):
+        normalize, hidden = torch.nn.functional.normalize, self.hidden_norm(hidden)
+        memory, overall = self.memory_projection(hidden)[None], hidden[-1]
+        questions = torch.stack([hidden[start:end].mean(0) for start, end in question_spans])
+        lexical = [torch.stack([embedding[ids[start:end]].mean(0) for start, end in spans]) for spans in option_spans]
+        routed = torch.cat([
+            self.option_context_projection(torch.stack([hidden[start:end].mean(0) for start, end in spans])) + self.option_lexical_projection(rows) + self.option_question_projection(question)
+            for spans, rows, question in zip(option_spans, lexical, questions)
+        ])[None]
+        for layer in self.evidence_layers:
+            routed = layer(routed, memory)
+        routed = torch.split(routed[0], [len(spans) for spans in option_spans])
+        fields = self.question_projection(questions)
+        summaries = torch.stack([torch.softmax(options @ field / options.shape[-1] ** 0.5, 0) @ options for field, options in zip(fields, routed)])
+        fields = (fields + self.option_summary_norm(summaries) + self.global_projection(overall) + self.type_embedding(torch.tensor(types)))[None]
+        for layer in self.layers:
+            fields = layer(fields, memory)
+        logits = []
+        for field, question, rows, options in zip(self.field_norm(fields[0]), questions, lexical, routed):
+            options, field = self.option_norm(options), field.expand(len(options), -1)
+            prior = self.prior_logit_scale.clamp(max = np.log(100.0)).exp() * (normalize(rows, dim = -1) @ normalize(question + overall, dim = -1))
+            residual = self.residual_scorer(torch.cat([field, options, field * options, (field - options).abs()], -1)).squeeze(-1)
+            joint = self.joint_logit_scale.clamp(max = np.log(100.0)).exp() * torch.cosine_similarity(field, options, dim = -1) + residual
+            logits.append(prior + torch.sigmoid(self.residual_gate) * joint)
+        return logits
+
+
+@pytest.mark.parametrize("quantized", [False, True])
+def test_clef_answers_every_question_from_one_prompt_like_its_reference_head(tmp_path, monkeypatch, quantized):
+    from unsloth_zoo.mlx.decision import ClefModel
+
+    torch.manual_seed(0)
+    config = {"hidden_size": 64, "width": 32, "routing_layers": 2, "layers": 2, "heads": 4, "feedforward": 48}
+    reference = _JointReference(**config).eval()
+    for parameter in reference.parameters():
+        parameter.data.add_(0.3 * torch.randn_like(parameter))
+    (tmp_path / "joint_head_config.json").write_text(json.dumps(config))
+    save_file({name: value.contiguous() for name, value in reference.state_dict().items()}, tmp_path / "joint_head.safetensors")
+    # Vowels take two tokens, so a span counted in characters reads the wrong rows.
+    tokens = lambda text: [token for c in text for token in ([ord(c) % 512, 7] if c in "aeiou" else [ord(c) % 512])]
+    pieces, encode = [], lambda text, add_special_tokens: pieces.append(text) or tokens(text)
+    monkeypatch.setattr(ClefModel, "_load", lambda self, *args: vars(self).update(model = _decoder(quantized), tokenizer = SimpleNamespace(encode = encode)))
+    questions = {"route": {"type": "choice", "instructions": {"b": 1, "a": "é"}, "criteria": {"ship": "late", "bill": None}}, "level": {"type": "score", "instructions": "How bad?", "criteria": ["fine", "bad", "awful"]}, "angry": {"type": "noul", "instructions": "Angry?", "criteria": {"false": "calm"}}}
+    model = load_decision_model(tmp_path)
+    result = model.answer({"z": [1, None], "y": "s"}, questions)
+    # Keys sorted, compact JSON, a choice's options sorted, noul yes first with a default description.
+    marked = [
+        '{"a":"é","b":1}', '{"option_id":"bill"}', '{"description":"late","option_id":"ship"}',
+        "How bad?", '{"description":"fine","option_id":"0"}', '{"description":"bad","option_id":"1"}', '{"description":"awful","option_id":"2"}',
+        "Angry?", '{"description":"The proposition is true or the answer is yes.","option_id":"true"}', '{"description":"calm","option_id":"false"}',
+    ]
+    assert "".join(pieces) == (
+        "<|im_start|>system\nRead the complete state and schema. Decide every field jointly. Each answer must be exactly one of that field's allowed options.<|im_end|>\n<|im_start|>user\nSTATE:\n" + '{"y":"s","z":[1,null]}\n\nSCHEMA FIELDS:\n'
+        f"\nFIELD 1\nID: route\nTYPE: choice\nINSTRUCTION: {marked[0]}\nALLOWED OPTIONS:\nOPTION 1: {marked[1]}\nOPTION 2: {marked[2]}\nEND FIELD\n"
+        f"\nFIELD 2\nID: level\nTYPE: score\nINSTRUCTION: {marked[3]}\nALLOWED OPTIONS:\nOPTION 1: {marked[4]}\nOPTION 2: {marked[5]}\nOPTION 3: {marked[6]}\nEND FIELD\n"
+        f"\nFIELD 3\nID: angry\nTYPE: noul\nINSTRUCTION: {marked[7]}\nALLOWED OPTIONS:\nOPTION 1: {marked[8]}\nOPTION 2: {marked[9]}\nEND FIELD\n"
+        "\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:"
+    )
+    starts = np.cumsum([0, *(len(tokens(piece)) for piece in pieces)])
+    spans = [(int(starts[pieces.index(text)]), int(starts[pieces.index(text) + 1])) for text in marked]
+    ids = torch.tensor(tokens("".join(pieces)))
+    with generation_mode(model.model):
+        hidden = torch.from_numpy(np.array(_forward_text_hidden_states(model.model, mx.array(ids.numpy())[None])[0].astype(mx.float32)))
+    head = model.model.language_model.lm_head
+    # An MLX conversion quantizes the output embedding the options are read from.
+    weight = mx.dequantize(head.weight, head.scales, head.biases, group_size = 64, bits = 8) if quantized else head.weight
+    embedding = torch.from_numpy(np.array(weight.astype(mx.float32)))
+    with torch.inference_mode():
+        route, level, angry = reference(hidden, embedding, ids, [spans[0], spans[3], spans[7]], [spans[1:3], spans[4:7], spans[8:]], [1, 2, 0])
+    for name, logits in (("route", route), ("level", level)):
+        assert list(result["answers"][name]["probabilities"].values()) == pytest.approx(torch.softmax(logits, 0).tolist(), abs = 1e-4)
+    assert list(result["answers"]["route"]["probabilities"]) == ["bill", "ship"] and result["answers"]["angry"]["noul"] == pytest.approx(torch.softmax(angry, 0)[0].item(), abs = 1e-4) and result["usage"]["input_tokens"] == len(ids)
+
+
+def test_prompts_of_a_request_run_their_shared_prefix_once(monkeypatch):
+    from unsloth_zoo.mlx import utils
+
+    reader, shared = _LabelModel.__new__(_LabelModel), list(range(40, 80))
+    reader.model = _decoder()
+    # The last prompt is the shared prefix itself, so one of its tokens is left to continue with.
+    prompts = [shared + [7, 8, 9], shared + [7], shared + [300, 301, 302, 303], shared]
+    calls, forward = [], utils._forward_text_hidden_states
+    monkeypatch.setattr(utils, "_forward_text_hidden_states", lambda model, inputs, **kwargs: calls.append((inputs.shape[1], kwargs)) or forward(model, inputs, **kwargs))
+    with generation_mode(reader.model):
+        got = list(reader._hidden_states(prompts))
+        continued, calls[:] = list(calls), []
+        want = [reader._hidden(ids) for ids in prompts]
+        assert all(mx.array_equal(a, b) for a, b in zip(reader._hidden_states([prompts[0]]), want)) and all(mx.array_equal(a, reader._hidden(ids)) for a, ids in zip(reader._hidden_states([[1, 2, 3], [1, 2, 9]]), ([1, 2, 3], [1, 2, 9])))
+    # One prompt, or a shared prefix too short to pay for itself, takes the plain pass.
+    assert not any("cache" in kwargs for _, kwargs in calls)
+    # Prompts that part before the shortest one ends share only up to where they part.
+    with generation_mode(reader.model):
+        calls.clear()
+        list(reader._hidden_states([shared[:20] + [7] * 5, shared[:20] + [9] * 8]))
+    assert [length for length, _ in calls] == [20, 5, 8]
+    assert [length for length, _ in continued] == [39, 4, 2, 5, 1] and len({id(kwargs["cache"]) for _, kwargs in continued}) == 5
+    assert [kwargs["position_ids"][:, 0].tolist() for _, kwargs in continued[1:]] == [[list(range(39, len(ids)))] * 3 for ids in prompts]
+    for a, b in zip(got, want):
+        assert a.shape == b.shape and mx.abs(a.astype(mx.float32) - b.astype(mx.float32)).max().item() <= 2**-4 * mx.abs(b.astype(mx.float32)).max().item()

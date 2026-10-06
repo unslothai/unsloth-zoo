@@ -23,6 +23,7 @@ If a test fails, the failing component identifies the next gap.
 from __future__ import annotations
 
 import dataclasses
+import math
 import os
 import tempfile
 import types
@@ -1218,6 +1219,22 @@ def test_trainer_drives_dynamic_lr_outside_optimizer_scheduler():
     assert zero_steps_ratio_trainer._resolve_warmup_steps(total_steps=100) == 10
 
 
+@pytest.mark.parametrize(
+    "warmup_steps, total_steps",
+    [(0.1, 100), (0.05, 30), (0.1, 8), ("np.float32", 100)],
+)
+def test_fractional_warmup_steps_is_a_ratio_of_total_steps(warmup_steps, total_steps):
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    if warmup_steps == "np.float32":
+        np = pytest.importorskip("numpy")
+        warmup_steps = np.float32(0.1)
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.args = MLXTrainingConfig(warmup_steps=warmup_steps)
+    expected = math.ceil(total_steps * warmup_steps)
+    assert trainer._resolve_warmup_steps(total_steps=total_steps) == expected
+
+
 def test_adamw_weight_decay_uses_hf_bias_norm_filter():
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
 
@@ -1324,6 +1341,34 @@ def test_sgd_weight_decay_is_coupled_not_decoupled():
         assert optimizer._kw["weight_decay"] == 0.0
 
 
+@pytest.mark.parametrize("optim_name", ["adam", "adam_8bit"])
+def test_adam_weight_decay_is_coupled(optim_name):
+    """Adam weight decay is coupled L2 (torch.optim.Adam), never dropped."""
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+
+    class TinyModel:
+        def trainable_parameters(self):
+            return {"proj": {"weight": mx.array([[2.0, -4.0]]),
+                             "bias": mx.array([6.0])}}
+
+    wd = 0.05
+    trainer = MLXTrainer.__new__(MLXTrainer)
+    trainer.model = TinyModel()
+    trainer.args = MLXTrainingConfig(optim=optim_name, weight_decay=wd)
+    trainer._build_optimizer(total_steps=4)
+
+    assert trainer._coupled_weight_decay == pytest.approx(wd)
+    assert trainer._manual_weight_decay == pytest.approx(0.0)
+
+    grad = {"proj": {"weight": mx.array([[1.0, 1.0]]), "bias": mx.array([1.0])}}
+    flat = dict(tree_flatten(trainer._apply_coupled_weight_decay(trainer.model, grad)))
+    # Bias exempt, as in HF param groups.
+    assert flat["proj.weight"].tolist()[0] == pytest.approx([1.0 + wd * 2.0, 1.0 + wd * -4.0])
+    assert flat["proj.bias"].tolist() == pytest.approx([1.0])
+
+
 def test_norm_clip_dtype_restore_keeps_lora_and_norms_promotable():
     from unsloth_zoo.mlx.trainer import MLXTrainer
 
@@ -1428,7 +1473,7 @@ def test_scheduler_lr_matches_expected_optimizer_update_steps(scheduler, warmup)
         lr = trainer.args.learning_rate
         expected = [lr * (total_steps - step) / total_steps for step in range(total_steps)]
         assert values == pytest.approx(expected)
-    elif warmup > 0:
+    elif warmup > 0 and scheduler != "constant":
         assert values[0] == pytest.approx(0.0)
         assert all(value > 0.0 for value in values[1:])
     else:
@@ -8635,6 +8680,28 @@ def test_mlx_schedules_match_transformers_lr_lambdas():
         got = _mlx_lr_curve(total, learning_rate=lr, **config_kwargs)
         expected = [lr * hf_lambda(step, **hf_kwargs) for step in range(total)]
         assert got == pytest.approx(expected, abs=1e-9), config_kwargs
+
+
+def test_constant_schedule_ignores_warmup_like_hf():
+    """HF's get_scheduler("constant") never ramps; constant_with_warmup does."""
+    optimization = pytest.importorskip("transformers.optimization")
+
+    lr, total, warmup = 2e-4, 20, 5
+    expected = [lr * optimization._get_constant_lambda(step) for step in range(total)]
+    assert _mlx_lr_curve(
+        total, learning_rate=lr, lr_scheduler_type="constant", warmup_steps=warmup,
+    ) == pytest.approx(expected, abs=1e-9)
+    assert _mlx_lr_curve(
+        total, learning_rate=lr, lr_scheduler_type="constant", warmup_ratio=0.25,
+    ) == pytest.approx(expected, abs=1e-9)
+
+    ramp = optimization._get_constant_schedule_with_warmup_lr_lambda
+    assert _mlx_lr_curve(
+        total, learning_rate=lr, lr_scheduler_type="constant_with_warmup",
+        warmup_steps=warmup,
+    ) == pytest.approx(
+        [lr * ramp(step, num_warmup_steps=warmup) for step in range(total)], abs=1e-9,
+    )
 
 
 def test_wsd_num_cycles_is_the_hf_wave_count_not_the_decay_window():

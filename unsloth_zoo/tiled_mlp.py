@@ -15,6 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 import os
+import sys
 import math
 from collections import OrderedDict
 from types import MethodType
@@ -27,7 +28,7 @@ from torch.utils.checkpoint import (
     get_device_states,
 )
 from unsloth_zoo.gradient_checkpointing import set_device_states
-from unsloth_zoo.device_type import DEVICE_TYPE
+from unsloth_zoo.device_type import DEVICE_TYPE, DEVICE_TYPE_TORCH
 
 __all__ = [
     "patch_tiled_mlp",
@@ -38,8 +39,17 @@ FIRST_PASS = True
 UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
 UNSLOTH_ENABLE_TILED_LOGGING = UNSLOTH_ENABLE_LOGGING and os.environ.get("UNSLOTH_ENABLE_TILED_LOGGING", "0") == "1"
 
-torch_amp_custom_fwd = torch.amp.custom_fwd(device_type = DEVICE_TYPE)
-torch_amp_custom_bwd = torch.amp.custom_bwd(device_type = DEVICE_TYPE)
+# amp rejects DEVICE_TYPE "hip" / "mlx"; torch < 2.5 also lacks mps autocast, hence the cpu fallback.
+def _amp_device_type():
+    try:
+        torch.get_autocast_dtype(DEVICE_TYPE_TORCH)
+        return DEVICE_TYPE_TORCH
+    except Exception:
+        return "cpu"
+pass
+_AMP_DEVICE_TYPE = _amp_device_type()
+torch_amp_custom_fwd = torch.amp.custom_fwd(device_type = _AMP_DEVICE_TYPE)
+torch_amp_custom_bwd = torch.amp.custom_bwd(device_type = _AMP_DEVICE_TYPE)
 
 @functools.cache
 def get_max_flat_qlen(
@@ -225,6 +235,20 @@ class TiledMLP(torch.autograd.Function):
 
         return None, None, x_gradients, None, None, None
 
+def _mxfp4_instance_forward(mlp_module):
+    # transformers binds mxfp4.mlp_forward on each MXFP4 GptOssMLP; the class forward skips it (unsloth-zoo#385).
+    mxfp4 = sys.modules.get("transformers.integrations.mxfp4")
+    mlp_forward = getattr(mxfp4, "mlp_forward", None)
+    if mlp_forward is None:
+        return None
+    for name in ("forward", "_original_forward"):
+        bound = mlp_module.__dict__.get(name)
+        func = getattr(bound, "__func__", bound)
+        if func is mlp_forward:
+            return func
+    return None
+
+
 def patch_mlp(mlp_module, target_arctic = True, target_gb = None, padded_length = 128):
     preserve_rng_state = False
     for n, m in mlp_module.named_modules():
@@ -233,9 +257,10 @@ def patch_mlp(mlp_module, target_arctic = True, target_gb = None, padded_length 
             break
 
     # unbound
-    mlp_module._original_forward = mlp_module.__class__.forward
+    forward = _mxfp4_instance_forward(mlp_module) or mlp_module.__class__.forward
+    mlp_module._original_forward = forward
     # second is what llama style patch uses
-    mlp_module._unsloth_forward = mlp_module.__class__.forward
+    mlp_module._unsloth_forward = forward
 
 
     def tiled_forward_target_gb(self, x):
@@ -269,7 +294,8 @@ def patch_mlp(mlp_module, target_arctic = True, target_gb = None, padded_length 
     def tiled_forward_arctic_size(self, x):
         B, S, H = x.shape
         chunk_size = max(1, H)
-        n_shards, remainder = divmod(S, chunk_size)
+        # Count over B*S, the axis TiledMLP splits: counting over S puts (B-1)*S rows in the last shard.
+        n_shards, remainder = divmod(B*S, chunk_size)
         n_shards = max(1, n_shards)
         # remainder gets added to the last shard in the forward pass
 

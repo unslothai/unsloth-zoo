@@ -1921,3 +1921,201 @@ def test_declared_classes_outside_a_module_list_are_kept_as_declared():
     assert resolve_no_split_classes(model) == ["LayerNorm", "_Block"]
     model._no_split_modules = ["LayerNorm"]
     assert resolve_no_split_classes(model) == ["LayerNorm"]
+
+
+def _swap_sizes():
+    model = _meta(layers = 8)
+    sizes = _compute_module_sizes(model)
+    return model, sizes[""], sizes["layers.0"]
+
+
+def test_exclude_modules_leaves_layers_out_of_the_map():
+    model, total, layer = _swap_sizes()
+    plan = plan_device_map(
+        model,
+        max_memory = {0: total, 1: total},
+        headroom_bytes = 0,
+        activation_reserve_bytes = 0,
+        exclude_modules = ["layers.6", "layers.7"],
+    )
+    assert not any(k.startswith(("layers.6", "layers.7")) for k in plan.device_map)
+    assert plan.total_weight_bytes == total - 2 * layer
+    with pytest.raises(ValueError, match = "larger placement unit"):
+        plan_device_map(model, max_memory = {0: total, 1: total}, exclude_modules = ["layers.6.mlp"])
+
+
+def test_block_swap_plan_one_device_is_the_fewest_layers_that_fit():
+    from unsloth_zoo.device_map_planner import plan_block_swap
+    model, total, layer = _swap_sizes()
+    reserve = 3 * layer
+    assert plan_block_swap(model = model, max_memory = {0: total + reserve}, reserve_bytes = reserve).layers == 0
+    for short in (1, layer, 2 * layer + 1):
+        plan = plan_block_swap(model = model, max_memory = {0: total + reserve - short}, reserve_bytes = reserve)
+        n = plan.layers
+        # Swapping n layers frees n of them but the depth + 1 slot pool keeps 3 on the card.
+        assert (n - 3) * layer >= short and (n - 4) * layer < short, (short, n)
+
+
+def test_block_swap_plan_multi_gpu_charges_the_pool_to_the_head_card():
+    from unsloth_zoo.device_map_planner import plan_block_swap
+    model, total, layer = _swap_sizes()
+    embed = 512 * 64 * 4
+    budget = embed + 600 + 5 * layer  # room for ten resident layers across both cards
+    plan = plan_block_swap(model = model, max_memory = {0: budget, 1: budget}, reserve_bytes = 0,
+                           headroom_bytes = 0)
+    assert plan.layers == 0
+    budget = embed + 600 + 3 * layer  # room for six layers, three of them taken by the pool
+    plan = plan_block_swap(model = model, max_memory = {0: budget, 1: budget}, reserve_bytes = 0,
+                           headroom_bytes = 0)
+    resident = [k for k in plan.device_plan.device_map if k.startswith("layers.")]
+    assert plan.layers == 5 and len(resident) == 3
+    head = plan.device_plan.head_device
+    assert plan.device_plan.weight_bytes[head] + 3 * layer <= budget
+
+
+class _NarrowBlock(nn.Module):
+    def __init__(self, hidden):
+        super().__init__()
+        self.mlp = nn.Linear(hidden, hidden // 2, bias = False)
+
+
+def test_block_swap_plan_mixed_layers_finds_the_fewest_count():
+    # Spread picks are not nested: these 7 alternating layers free a pool's worth at 4 swapped, nothing at 5.
+    from unsloth_zoo.device_map_planner import plan_block_swap
+    model = _meta(layers = 7)
+    with torch.device("meta"):
+        for i in range(1, 7, 2):
+            model.layers[i] = _NarrowBlock(64)
+    total = _compute_module_sizes(model)[""]
+    plan = plan_block_swap(model = model, max_memory = {0: total + 100 - 1}, reserve_bytes = 100,
+                           placement = "spread")
+    assert plan.layers == 4
+
+
+class _HalvingQuantizer:
+    def adjust_max_memory(self, max_memory):
+        return {k: v // 2 for k, v in max_memory.items()}
+
+
+def test_block_swap_plan_applies_the_quantizer_haircut_once(monkeypatch):
+    from unsloth_zoo import device_map_planner as dmp
+    model, total, layer = _swap_sizes()
+    sizes = dmp._compute_module_sizes(model)
+    # Size the model the same with and without the quantizer: only the budget haircut differs.
+    monkeypatch.setattr(dmp, "_compute_module_sizes", lambda model, hf_quantizer = None: sizes)
+    budget = 512 * 64 * 4 + 600 + 3 * layer
+    kw = dict(model = model, reserve_bytes = 0, headroom_bytes = 0)
+    plain = dmp.plan_block_swap(max_memory = {0: budget, 1: budget}, **kw)
+    halved = dmp.plan_block_swap(max_memory = {0: 2 * budget, 1: 2 * budget}, hf_quantizer = _HalvingQuantizer(), **kw)
+    assert plain.layers > 0 and halved.layers == plain.layers
+
+
+def test_block_swap_plan_counts_no_savings_for_a_block_listed_twice():
+    # One block object at every index: swapping any of them frees nothing, so no count fits.
+    from unsloth_zoo.device_map_planner import plan_block_swap
+    with torch.device("meta"):
+        model = _Tiny(layers = 1)
+        block = model.layers[0]
+        model.layers = nn.ModuleList([block] * 16)
+    total = _compute_module_sizes(model)[""]
+    with pytest.raises(DeviceMapInfeasible):
+        plan_block_swap(model = model, max_memory = {0: total - 1}, reserve_bytes = 0)
+
+
+def test_block_swap_plan_skips_a_card_too_small_for_the_pool():
+    from unsloth_zoo.device_map_planner import plan_block_swap
+    model, total, layer = _swap_sizes()
+    # Three cards; the last (tried first for the pool) cannot hold three slots, so the next one takes it.
+    half = (total - layer) // 2
+    plan = plan_block_swap(model = model, max_memory = {0: half, 1: half, 2: 2 * layer - 1},
+                           reserve_bytes = 0, headroom_bytes = 0)
+    assert plan.layers == 4 and plan.device_plan.head_device == 1
+
+
+def test_block_swap_plan_refuses_when_one_layer_cannot_stay():
+    from unsloth_zoo.device_map_planner import plan_block_swap
+    model, total, layer = _swap_sizes()
+    with pytest.raises(DeviceMapInfeasible, match = "host RAM"):
+        plan_block_swap(model = model, max_memory = {0: layer}, reserve_bytes = 0)
+
+
+def test_block_swap_plan_moves_the_embedding_before_any_layer():
+    from unsloth_zoo.device_map_planner import plan_block_swap
+    model, total, layer = _swap_sizes()
+    embed = 512 * 64 * 4
+    reserve = embed
+    # Short by less than the embedding: moving it is enough, no layer swaps.
+    plan = plan_block_swap(model = model, max_memory = {0: total + reserve - embed // 2},
+                           reserve_bytes = reserve, offload_embedding = True)
+    assert plan.offload_embedding and plan.layers == 0 and plan.embedding_bytes == embed
+    # Not allowed: layers have to go instead.
+    plan = plan_block_swap(model = model, max_memory = {0: total + reserve - embed // 2},
+                           reserve_bytes = reserve)
+    assert not plan.offload_embedding and plan.layers > 0
+    # Short by more: the embedding moves and only the rest is swapped.
+    short = embed + 2 * layer
+    plan = plan_block_swap(model = model, max_memory = {0: total + reserve - short},
+                           reserve_bytes = reserve, offload_embedding = True)
+    assert plan.offload_embedding and (plan.layers - 3) * layer >= 2 * layer > (plan.layers - 4) * layer
+
+
+def test_block_swap_plan_fits_the_pool_before_the_embedding_moves():
+    # Short sequences: the embedding outweighs the reserve, so attach (pool + embedding on the card) is the peak.
+    from unsloth_zoo.device_map_planner import plan_block_swap
+    model = _meta(layers = 16, vocab = 64)
+    sizes = _compute_module_sizes(model)
+    total, layer, embed = sizes[""], sizes["layers.0"], sizes["embed_tokens"]
+    budget = total - embed - 2 * layer
+    plan = plan_block_swap(model = model, max_memory = {0: budget}, reserve_bytes = 0, offload_embedding = True)
+    assert plan.offload_embedding
+    assert total - plan.layers * layer + 3 * layer <= budget
+
+
+class _CachedBlock(nn.Module):
+    def __init__(self, hidden):
+        super().__init__()
+        self.mlp = nn.Linear(hidden, hidden, bias = False)
+        self.register_buffer("cache", torch.zeros(4 * hidden, hidden), persistent = False)
+
+
+def test_block_swap_plan_leaves_layer_buffers_resident():
+    from unsloth_zoo.device_map_planner import plan_block_swap
+    model = _meta(layers = 16)
+    with torch.device("meta"):
+        for i in range(16):
+            model.layers[i] = _CachedBlock(64)
+    sizes = _compute_module_sizes(model)
+    total, weight = sizes[""], sizes["layers.0.mlp"]
+    budget = total - 2 * weight
+    plan = plan_block_swap(model = model, max_memory = {0: budget}, reserve_bytes = 0)
+    # Only weights leave the card: two freed beyond the three-slot pool.
+    assert plan.layers == 5
+
+
+def test_block_swap_plan_keeps_a_tied_embedding():
+    from unsloth_zoo.device_map_planner import plan_block_swap
+    model = _meta(layers = 8, tie = True)
+    sizes = _compute_module_sizes(model)
+    plan = plan_block_swap(model = model, max_memory = {0: sizes[""] + 100 - 1}, reserve_bytes = 100,
+                           offload_embedding = True)
+    assert not plan.offload_embedding and plan.layers > 0
+
+
+def test_block_swap_plan_streams_extra_token_tables_of_a_tied_model(monkeypatch):
+    # Gemma 3n / 4: tied input embedding, but the per-layer table streams to host, freeing its room for training.
+    from unsloth_zoo import block_swap
+    from unsloth_zoo.device_map_planner import plan_block_swap
+    model = _meta(layers = 8, tie = True)
+    model.per_layer = nn.Embedding(512, 64, device = "meta")
+    extra = 512 * 64 * 4
+    monkeypatch.setattr(block_swap, "EXTRA_EMBEDDING_MIN_BYTES", extra)
+    total = _compute_module_sizes(model)[""]
+    budget = total + extra - extra // 2
+    plan = plan_block_swap(model = model, max_memory = {0: budget}, reserve_bytes = extra, offload_embedding = True)
+    assert plan.offload_embedding and plan.layers == 0 and plan.embedding_bytes == extra
+    plan = plan_block_swap(model = model, max_memory = {0: budget}, reserve_bytes = extra)
+    assert not plan.offload_embedding and plan.layers > 0
+    # The table lands on the card whole before it moves: the load still needs room for it.
+    plan = plan_block_swap(model = model, max_memory = {0: total + 100 - extra // 2}, reserve_bytes = 100,
+                           offload_embedding = True)
+    assert plan.layers > 0

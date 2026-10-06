@@ -2026,6 +2026,13 @@ def grpo_accumulated_loss(
                 detached_hidden_states = hidden_states.detach().contiguous()
                 ctx.device = hidden_states.device
                 ctx.copy_event = None
+                # Backward runs outside autocast; recompute must match forward (torch.utils.checkpoint does the same).
+                ctx.autocast_kwargs = dict(
+                    device_type = lm_head.device.type,
+                    enabled = torch.is_autocast_enabled(lm_head.device.type),
+                    dtype = torch.get_autocast_dtype(lm_head.device.type),
+                    cache_enabled = torch.is_autocast_cache_enabled(),
+                )
 
                 # Always offload: this path only runs when the caller is already memory bound
                 # (long completions / large batches), so the win is overlapping the copy.
@@ -2094,7 +2101,7 @@ def grpo_accumulated_loss(
                     lm_head = lm_head.detach().requires_grad_(True)
                 index = ctx.index
 
-                with torch.enable_grad():
+                with torch.enable_grad(), torch.autocast(**ctx.autocast_kwargs):
                     output = chunked_hidden_states_selective_log_softmax(
                         hidden_states, lm_head, index, *ctx.args
                     )

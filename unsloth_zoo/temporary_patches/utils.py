@@ -1919,6 +1919,10 @@ def _fall_back_to_eager_on_recompile_limit(compiled_func, eager_func, label):
     def wrapper(*args, **kwargs):
         if state["eager"]:
             return eager_func(*args, **kwargs)
+        if torch.compiler.is_compiling():
+            # Inlined by an enclosing compile: the bookkeeping below would guard its
+            # graph on `state["compiler_off"] is None`, recompiling it on the next call.
+            return compiled_func(*args, **kwargs)
         if state["compiler_off"] is None:
             state["compiler_off"] = dynamo_tracing_disabled()
         if state["compiler_off"]:

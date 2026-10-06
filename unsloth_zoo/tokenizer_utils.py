@@ -698,8 +698,21 @@ def patch_processor_call(processor):
         return processor
 
     original_call = processor.__class__.__call__
+    # Positional order differs per processor: Qwen3-Omni takes (text, images, ...).
+    try:
+        parameters = list(inspect.signature(original_call).parameters.values())[1:]
+    except (TypeError, ValueError):
+        parameters = []
+    text_index = next(
+        (i for i, p in enumerate(parameters)
+         if p.name == "text" and p.kind is p.POSITIONAL_OR_KEYWORD),
+        None,
+    )
 
-    def patched_call(self, images=None, text=None, videos=None, **kwargs):
+    def patched_call(self, *args, **kwargs):
+        args = list(args)
+        text_in_args = text_index is not None and text_index < len(args)
+        text = args[text_index] if text_in_args else kwargs.get("text")
         if text is not None and _is_conversation_format(text):
             add_generation_prompt = kwargs.pop("add_generation_prompt", True)
             text = self.apply_chat_template(
@@ -707,7 +720,11 @@ def patch_processor_call(processor):
                 tokenize=False,
                 add_generation_prompt=add_generation_prompt,
             )
-        return original_call(self, images=images, text=text, videos=videos, **kwargs)
+            if text_in_args:
+                args[text_index] = text
+            else:
+                kwargs["text"] = text
+        return original_call(self, *args, **kwargs)
 
     # Patch via a dynamic subclass reusing the original class name so
     # save_pretrained writes the correct processor_class (fixes issue #4085).

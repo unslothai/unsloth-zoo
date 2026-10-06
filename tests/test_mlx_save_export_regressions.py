@@ -3531,7 +3531,10 @@ def test_trusted_dir_handles_a_root_trusted_path(monkeypatch, tmp_path):
     # os.path.join(parent, "") keeps a root parent as "/" rather than "//", which
     # a bare parent + os.sep would produce and never match.
     home = tmp_path / ".unsloth"
-    assert _trusted(monkeypatch, tmp_path / "anywhere", home, env_value=os.sep) is True
+    folder = tmp_path / "anywhere"
+    # Drive-qualified on Windows: a bare "\\" never contains C:\...
+    root = os.path.splitdrive(str(folder))[0] + os.sep
+    assert _trusted(monkeypatch, folder, home, env_value=root) is True
 
 
 def test_trusted_dir_is_case_insensitive_on_windows_style_paths(monkeypatch):

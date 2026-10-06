@@ -422,8 +422,11 @@ jobs:
         # test_device_map_planner_compressed_tensors: pack-quantized checkpoints planned at packed bytes.
         # test_grpo_mask_truncated_rows: truncated completions stay out of the GRPO loss; its UnslothEfficientGRPO stubs bind to the real forward.
         # test_mlx_embedding_guards: sentence-transformers layout shim and pooling-mode map, under the torch shim.
+        # test_output_collector_compile: the capture_outputs collector mirror compiles fullgraph and stays per thread / context.
+        # test_top_level_imports_are_declared: every package a zoo module imports at module level is a declared dependency.
         run: |
           python -m pytest \
+            tests/test_top_level_imports_are_declared.py \
             tests/test_training_utils_use_cache.py \
             tests/test_unsloth_train_scheduler_kwargs.py \
             tests/test_loss_normalization_contract.py \
@@ -458,6 +461,7 @@ jobs:
             tests/test_vllm_direct_lora_loading.py \
             tests/test_vllm_flashinfer_block_reversible.py \
             tests/test_vllm_flashinfer_survives_spawn.py \
+            tests/test_vllm_weights_memory_usage.py \
             tests/test_sft_prepare_dataset_double_bos.py \
             tests/test_moe_preprocess_weight_transpose.py \
             tests/test_relative_imports_resolve.py \
@@ -509,6 +513,7 @@ jobs:
             tests/test_gemma3n_kv_sharing_without_cache.py \
             tests/test_gemma3n_rmsnorm_with_scale.py \
             tests/test_mlx_gkd_guards.py \
+            tests/test_output_collector_compile.py \
             -v
 
       - name: pytest MLX adapter-filter gate (HARD GATE)
@@ -862,6 +867,10 @@ jobs:
       - name: tests/test_mlx_shape_guard.py
         run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_shape_guard.py -v -rs
 
+      - name: tests/test_mlx_decision.py
+        # Decision request validation, prompts and answers; needs no weights.
+        run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_decision.py -v -rs
+
       - name: tests/test_mlx_vlm_label_masks.py
         # Audio collation, label masking and the family/version gate.
         run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_vlm_label_masks.py -v -rs
@@ -1123,6 +1132,8 @@ jobs:
                 # to a composite model's on-disk weights is a class attribute in
                 # transformers 4 and a registry in 5, and losing it merges nothing
                 # silently, so one pinned version cannot show the merge finds it.
+                # test_fused_ce_coverage: a model that loses fused CE still trains (full
+                # logits), so each pin is checked against its release in the baseline.
                 "$venv/bin/python" -m pytest -v --tb=short -rs \
                   tests/test_upstream_pinned_symbols_transformers.py \
                   tests/test_torchvision_video_removed_message.py \
@@ -1137,6 +1148,7 @@ jobs:
                   tests/test_compiler_rewriter_exhaustive.py \
                   tests/test_compiler_dynamic_exec.py \
                   tests/test_compiler_getsource_tokenerror.py \
+                  tests/test_fused_ce_coverage.py \
                   tests/test_aya_vision_logit_scale.py \
                   tests/test_vision_utils_grid_helpers_eager.py \
                   tests/test_modeling_local_vision_helpers_eager.py \

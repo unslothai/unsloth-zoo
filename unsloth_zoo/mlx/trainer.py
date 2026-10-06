@@ -42,6 +42,7 @@ import concurrent.futures
 import hashlib
 import json
 import math
+import numbers
 import os
 from pathlib import Path
 import random
@@ -4027,7 +4028,12 @@ class MLXTrainer:
         if callable(get_warmup_steps):
             return max(0, int(get_warmup_steps(total_steps)))
 
-        warmup_steps = int(getattr(self.args, "warmup_steps", 0) or 0)
+        warmup_steps = getattr(self.args, "warmup_steps", 0) or 0
+        if isinstance(warmup_steps, numbers.Real) and 0 < warmup_steps < 1:
+            # HF TrainingArguments.get_warmup_steps: below 1 is a ratio of total steps.
+            # Multiply in the value's own type: float(np.float32(0.1)) * 100 ceils to 11.
+            warmup_steps = math.ceil(max(0, int(total_steps)) * warmup_steps)
+        warmup_steps = int(warmup_steps)
         warmup_ratio = getattr(self.args, "warmup_ratio", 0.0)
         if warmup_ratio is None:
             return max(0, warmup_steps)
@@ -4139,7 +4145,8 @@ class MLXTrainer:
                 else float(total_steps - warmup) - wsd_decay_steps
             )
 
-        if sched_type in ("constant", "constant_with_warmup") and warmup == 0:
+        # HF's get_constant_schedule ignores warmup; only constant_with_warmup ramps.
+        if sched_type == "constant" or (sched_type == "constant_with_warmup" and warmup == 0):
             return lr
 
         # HF cosine_warmup_with_min_lr uses (step + 1): optimization.py:400-406.
@@ -4276,6 +4283,8 @@ class MLXTrainer:
                 **adam_kwargs,
             )
         elif opt_name == "adam":
+            # torch Adam's weight_decay is coupled L2; MLX Adam has none.
+            self._coupled_weight_decay = float(wd or 0.0)
             optimizer = optim.Adam(
                 learning_rate=initial_lr,
                 bias_correction=True,
@@ -4299,6 +4308,7 @@ class MLXTrainer:
                     **adam_kwargs,
                 )
             else:
+                self._coupled_weight_decay = float(wd or 0.0)
                 optimizer = QuantizedMomentAdam(
                     learning_rate=initial_lr,
                     bias_correction=True,
@@ -4383,8 +4393,8 @@ class MLXTrainer:
         """Decoupled HF-parity decay on trainable non-bias/non-norm leaves.
 
         AdamW, Adafactor, Muon and Lion are built with ``weight_decay=0.0`` so
-        this owns the decay term, as HF does via ``param_groups``. SGD uses
-        coupled decay instead (``_apply_coupled_weight_decay``).
+        this owns the decay term, as HF does via ``param_groups``. SGD and Adam
+        use coupled decay instead (``_apply_coupled_weight_decay``).
         """
         wd = float(getattr(self, "_manual_weight_decay", 0.0) or 0.0)
         if wd <= 0:
@@ -8948,7 +8958,16 @@ class MLXTrainer:
             strict=False,
         )
         from .utils import _ensure_vlm_pad_token
+        from .loader import _verify_text_only_wrapper
         _ensure_vlm_pad_token(processor)
+        processor._unsloth_supports_images = getattr(self.model, "_unsloth_supports_images", None)
+        processor._unsloth_modality_model_type = model_type
+        try:
+            _verify_text_only_wrapper(self.model, model_type, check_causality=False)
+        except ValueError as exc:
+            processor._unsloth_text_training_error = str(exc)
+        else:
+            processor._unsloth_text_training_error = None
         self.processor = processor
         return processor
 
@@ -8977,6 +8996,9 @@ class MLXTrainer:
                 is_vlm=False,
                 strict=False,
             )
+            if self.tokenizer is not None:
+                self.tokenizer._unsloth_supports_images = getattr(self.model, "_unsloth_supports_images", None)
+                self.tokenizer._unsloth_modality_model_type = model_type
 
         if self.preference_kind:
             if self.distributed_world_size > 1:
