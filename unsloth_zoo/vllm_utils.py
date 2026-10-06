@@ -3661,11 +3661,9 @@ def load_vllm(
         # Keep trying until success (2 times)
         trials = 0
         race_trials = 0
-        registries_before = None
         while True:
-            if registries_before is not None:
-                _release_failed_vllm_engine(registries_before)
             registries_before = _snapshot_dynamo_engine_registries()
+            loaded = False
             try:
                 if use_async:
                     llm = AsyncLLMEngine.from_engine_args(AsyncEngineArgs(**engine_args))
@@ -3674,6 +3672,7 @@ def load_vllm(
                 else:
                     llm = LLM(**engine_args)
                 pass
+                loaded = True
                 break
             except Exception as error:
                 error = str(error)
@@ -3755,6 +3754,10 @@ def load_vllm(
                             f"Original error: {error}"
                         )
                     raise RuntimeError(error)
+            finally:
+                # After a retry's except block the traceback is gone, so the engine is freed
+                # here; on a final raise the caller's traceback is then the only owner left.
+                if not loaded: _release_failed_vllm_engine(registries_before)
             pass
         pass
         # Save maximum requests length since llm.generate fails to partition inputs sometimes

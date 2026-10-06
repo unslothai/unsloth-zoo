@@ -133,17 +133,39 @@ def test_release_unwraps_the_torch_compile_backend_wrapper():
     assert not (added & set(eval_frame.cached_backends))
 
 
-def test_load_vllm_releases_before_each_retry_outside_the_except_block():
-    tree = ast.parse(textwrap.dedent(inspect.getsource(vllm_utils.load_vllm)))
-    loops = [node for node in ast.walk(tree) if isinstance(node, ast.While)
-             and any(isinstance(n, ast.Try) for n in node.body)]
-    assert len(loops) == 1
-    body = loops[0].body
-    try_at = next(i for i, n in enumerate(body) if isinstance(n, ast.Try))
-    before_try = ast.unparse(ast.Module(body = body[:try_at], type_ignores = []))
-    assert "_release_failed_vllm_engine(" in before_try
-    assert "_snapshot_dynamo_engine_registries()" in before_try
-    assert before_try.index("_release_failed_vllm_engine(") < \
-        before_try.index("_snapshot_dynamo_engine_registries()")
-    for handler in body[try_at].handlers:
-        assert "_release_failed_vllm_engine" not in ast.unparse(handler)
+def _load_vllm_with_failing_engine(monkeypatch, errors):
+    torch = pytest.importorskip("torch")
+    vllm = pytest.importorskip("vllm")
+    transformers = pytest.importorskip("transformers")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (9, 0))
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda *a, **k: True)
+    monkeypatch.setattr(vllm_utils, "get_mem_info", lambda: (79 * 1024**3, 80 * 1024**3))
+    created, errors = [], list(errors)
+
+    def failing_llm(**kwargs):
+        model = _FakeCompiledModel()
+        created.append(weakref.ref(model))
+        raise ValueError(errors.pop(0))
+
+    monkeypatch.setattr(vllm, "LLM", failing_llm)
+    config = transformers.Qwen2Config(
+        hidden_size = 256, intermediate_size = 512, num_hidden_layers = 2,
+        num_attention_heads = 4, num_key_value_heads = 2, vocab_size = 1000,
+    )
+    with pytest.raises(RuntimeError):
+        vllm_utils.load_vllm(
+            model_name = "Qwen/Qwen2-0.5B", config = config, max_seq_length = 512,
+            gpu_memory_utilization = 0.5, use_bitsandbytes = False, dtype = torch.bfloat16,
+        )
+    gc.collect()
+    return created
+
+
+@pytest.mark.parametrize("errors", [
+    ["engine startup failed"],  # not retried: raised straight away
+    ["No available memory for the cache blocks.", "No available memory for the cache blocks."],
+])
+def test_load_vllm_frees_every_failed_engine_including_the_last(monkeypatch, errors):
+    created = _load_vllm_with_failing_engine(monkeypatch, errors)
+    assert len(created) == len(errors)
+    assert all(ref() is None for ref in created)
