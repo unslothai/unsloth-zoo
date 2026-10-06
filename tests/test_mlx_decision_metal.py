@@ -230,12 +230,14 @@ def test_label_scores_are_the_output_head_rows_of_the_last_token(quantized):
 
 
 def test_kev_scores_each_option_end_against_the_last_token(tmp_path, monkeypatch):
+    import os
     import re
     import types
+    from pathlib import Path
 
-    texts, specials = [], {"<|box_end|>": 500}
+    texts, specials, decoder = [], {"<|box_end|>": 500}, _decoder()
     encode = lambda text, add_special_tokens: texts.append(text) or [specials.get(piece, 300 if piece.startswith("<|") else ord(piece) % 256) for piece in re.findall(r"<\|\w+\|>|.", text, re.S)]
-    load = lambda self, source, revision, *args, **kwargs: vars(self).update(base = (source, revision), model = _decoder(), tokenizer = types.SimpleNamespace(encode = encode))
+    load = lambda self, source, revision, *args, **kwargs: vars(self).update(base = (source, revision), seen = Path(source).is_dir() and sorted(os.listdir(source)), model = decoder, tokenizer = types.SimpleNamespace(encode = encode))
     monkeypatch.setattr(_KevModel, "_load", load)
     for name, content in {"adapter_config.json": {"base_model_name_or_path": "org/base", "revision": None}, "training_config.json": {"base_revision": "pinned"}}.items():
         (tmp_path / name).write_text(json.dumps(content))
@@ -254,6 +256,18 @@ def test_kev_scores_each_option_end_against_the_last_token(tmp_path, monkeypatch
     q, k = (hidden[rows] @ head[f"{name}.weight"].numpy().T + head[f"{name}.bias"].numpy() for name, rows in (("q", -1), ("k", [i for i, token in enumerate(ids) if token == 500])))
     weights = np.exp((scores := k @ q / 4 / 0.5) - scores.max())
     assert list(result["answers"]["pick"]["probabilities"].values()) == pytest.approx(weights / weights.sum(), abs = 1e-4) and result["usage"]["input_tokens"] == sum(len(encode(text, False)) for text in texts[-4:-1])
+    # A conversion ships the merged decoder, here with the head as safetensors and its settings beside it.
+    for name in ("adapter_config.json", "head.pt"):
+        (tmp_path / name).unlink()
+    save_file(head, tmp_path / "kev_head.safetensors")
+    save_file({"decoder": torch.zeros(1)}, tmp_path / "model.safetensors")
+    for name, content in {"config.json": {}, "kev_config.json": {"head_dim": 16, "temperature": 0.5}}.items():
+        (tmp_path / name).write_text(json.dumps(content))
+    merged = load_decision_model(tmp_path)
+    assert merged.base[1] is None and merged.seen == ["config.json", "kev_config.json", "model.safetensors", "training_config.json"] and merged.answer({"a": {"b": [1, {"c": "s", "e": 2}]}, "n": None}, questions) == result
+    save_file({**head, "extra": torch.zeros(1)}, tmp_path / "kev_head.safetensors")
+    with pytest.raises(ValueError, match = "no Kev pointer head"):
+        load_decision_model(tmp_path)
 
 
 class _RoutingReference(torch.nn.Module):

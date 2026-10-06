@@ -672,6 +672,15 @@ class _QwenModel(DecisionPipeline):
             _merge_lora(self.model, adapter)
         self.model.eval()
 
+    def _load_beside(self, folder, dtype, token, head_prefix):
+        # The decoder is loaded from a view of the folder without the head's files, which a model loader would read as decoder weights.
+        with tempfile.TemporaryDirectory() as view:
+            for item in folder.iterdir():
+                if not item.name.startswith(head_prefix):
+                    os.symlink(item.resolve(), Path(view) / item.name)
+            self._load(view, None, dtype, token)
+            mx.eval(self.model.parameters())
+
     def _load_adapter(self, folder, dtype, base_model, token):
         repo, revision = _adapter_base(folder)
         self._load(base_model or repo, None if base_model else revision, dtype, token, adapter = folder)
@@ -899,20 +908,31 @@ class _KevModel(_QwenModel):
 
     family = "kev"
     sources = ("jaredpalmer/kev-4b",)
-    needs = "the pointer head (head.pt) beside the adapter"
+    needs = "the pointer head (head.pt, or kev_head.safetensors with kev_config.json) beside the adapter or the merged decoder"
 
     @staticmethod
     def matches(folder):
-        return (folder / "head.pt").is_file() and (folder / "adapter_config.json").is_file()
+        head = (folder / "head.pt").is_file() or ((folder / "kev_head.safetensors").is_file() and (folder / "kev_config.json").is_file())
+        return head and ((folder / "adapter_config.json").is_file() or (folder / "config.json").is_file())
 
     def __init__(self, folder, dtype, base_model, token):
-        import torch
+        if (folder / "adapter_config.json").is_file():
+            self._load_adapter(folder, dtype, base_model, token)
+        else:
+            # A conversion ships the decoder with the adapter already merged, usually quantized.
+            self._load_beside(folder, dtype, token, "kev_head")
+        if (folder / "head.pt").is_file():
+            import torch
 
-        self._load_adapter(folder, dtype, base_model, token)
-        head = torch.load(folder / "head.pt", map_location = "cpu", weights_only = True)
-        self.head = {name: mx.array(tensor.float().numpy()) for name, tensor in head["head"].items()}
-        self.scale = 1 / math.sqrt(head["head_dim"])
-        self.temperatures = dict.fromkeys(("choice", "score", "noul"), float(head["temperature"]))
+            settings = torch.load(folder / "head.pt", map_location = "cpu", weights_only = True)
+            tensors = {name: mx.array(tensor.float().numpy()) for name, tensor in settings["head"].items()}
+        else:
+            settings, tensors = _read_json(folder / "kev_config.json"), mx.load(str(folder / "kev_head.safetensors"))
+        if set(tensors) != {"q.weight", "q.bias", "k.weight", "k.bias"}:
+            raise ValueError(f"{folder} holds no Kev pointer head: its head has the tensors {sorted(tensors)}")
+        self.head = {name: tensor.astype(mx.float32) for name, tensor in tensors.items()}
+        self.scale = 1 / math.sqrt(settings["head_dim"])
+        self.temperatures = dict.fromkeys(("choice", "score", "noul"), float(settings["temperature"]))
         (self.option_end,) = self._encode("<|box_end|>")
 
     def _option(self, kind, key, description):
@@ -1077,13 +1097,7 @@ class ClefModel(_QwenModel):
     _NOUL = {"true": "The proposition is true or the answer is yes.", "false": "The proposition is false or the answer is no."}
 
     def __init__(self, folder, dtype, base_model, token):
-        # The decoder is loaded from a view of the folder without the head's file, which a model loader would read as decoder weights.
-        with tempfile.TemporaryDirectory() as view:
-            for item in folder.iterdir():
-                if not item.name.startswith("joint_head"):
-                    os.symlink(item.resolve(), Path(view) / item.name)
-            self._load(view, None, dtype, token)
-            mx.eval(self.model.parameters())
+        self._load_beside(folder, dtype, token, "joint_head")
         self.head = _load_joint_head(folder)
 
     def _pieces(self, state, questions):
