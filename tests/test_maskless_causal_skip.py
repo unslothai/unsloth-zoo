@@ -72,12 +72,28 @@ def _decide(patched, **kwargs):
     return misc._maskless_causal_arguments(_signature(patched), (), kwargs)
 
 
+def _compile_disabled():
+    """patch_transformers_masks wraps the stock builders uncompiled under UNSLOTH_COMPILE_DISABLE=1 or partial."""
+    from unsloth_zoo.temporary_patches import common
+    return bool(common.UNSLOTH_COMPILE_DISABLE)
+
+
 def _reference(patched, kwargs):
-    """What the unpatched compiled path builds: the original with the skip forced off."""
+    """What the unpatched compiled path builds: the original with the skip forced off.
+
+    Compiled, transformers sees is_compiling() and always builds the mask. Under
+    UNSLOTH_COMPILE_DISABLE=1 the wrapper is the stock function, whose own SDPA
+    shortcut returns None for an unpadded causal batch, so the reference reports
+    compiling the same way to get the mask the compiled path would have built.
+    """
     import os
+    from unittest import mock
     previous = os.environ.get("UNSLOTH_SKIP_CAUSAL_MASK")
     os.environ["UNSLOTH_SKIP_CAUSAL_MASK"] = "0"
     try:
+        if _compile_disabled():
+            with mock.patch.object(torch.compiler, "is_compiling", lambda: True):
+                return patched.create_causal_mask(**kwargs)
         return patched.create_causal_mask(**kwargs)
     finally:
         if previous is None:
@@ -285,8 +301,15 @@ def test_kill_switch(patched, monkeypatch):
     kwargs = _kwargs(patched)
     assert _decide(patched, **kwargs) is None
     before = misc.CAUSAL_MASK_SKIP_STATS["skipped"]
-    assert isinstance(patched.create_causal_mask(**kwargs), torch.Tensor)
+    mask = patched.create_causal_mask(**kwargs)
     assert misc.CAUSAL_MASK_SKIP_STATS["skipped"] == before
+    if _compile_disabled():
+        # Switched off, the call is exactly the stock one, which may itself skip the mask.
+        stock = patched._unsloth_original_create_causal_mask(**kwargs)
+        assert (mask is None) == (stock is None)
+        assert stock is None or torch.equal(mask, stock)
+    else:
+        assert isinstance(mask, torch.Tensor)
 
 
 def test_the_registered_sdpa_mask_interface_still_decides(patched, monkeypatch):

@@ -32,16 +32,20 @@ Backends: Triton lowers tl.dot to CUDA-core FMA on sm75 (T4: no mma.sync in the 
 TFLOPs against cuBLAS's ~43), so below sm80 the same calls run per-expert cuBLAS GEMMs over
 host row counts read once per MoE layer (`host` / Groups), fp16 operands with an fp32 output
 through torch.mm(out_dtype=float32) where torch has it. UNSLOTH_GPTOSS_FP16_GEMM=triton|cublas
-overrides the choice."""
+overrides the choice (backend=None); backend="triton" forces the kernel, which the generic MoE
+path (moe_utils, any bf16 / fp16 expert stack) uses on the GPUs its own gate picks."""
 
 __all__ = [
     "Groups",
     "use_cublas",
     "grouped_gemm",
     "grouped_wgrad",
+    "generic_gemm_config",
+    "generic_wgrad_config",
     "grouped_linear",
     "grouped_frozen_linear",
     "fp16_grouped_available",
+    "triton_grouped_available",
     "row_pow2_scale",
 ]
 
@@ -58,6 +62,8 @@ except Exception:  # pragma: no cover
 
 _DISABLED_REASON = None
 CALLS = {"gemm": 0, "wgrad": 0}
+# Generic MoE path (moe_utils.grouped_mm_triton): kernel launches, and self-check fallbacks to torch._grouped_mm.
+GENERIC_CALLS = {"gemm": 0, "wgrad": 0, "fallback": 0}
 
 # A operand handling when x is fp32 and w is fp16 / bf16.
 A_DIRECT, A_CAST, A_SPLIT = 0, 1, 2
@@ -72,12 +78,27 @@ if triton is not None:
         stride_am, stride_ak, stride_be, stride_bk, stride_bn, stride_cm, stride_bias_e,
         A_MODE: tl.constexpr, ROW_SCALE: tl.constexpr, HAS_BIAS: tl.constexpr, IEEE: tl.constexpr,
         E_POW2: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+        ENDS: tl.constexpr, GROUP_M: tl.constexpr = 0, EVEN_K: tl.constexpr = False,
     ):
-        # C[m, n] = sum_k A[m, k] * B[e(m) - E_LO, k, n] for the rows of experts in [E_LO, E_HI).
-        pid_m = tl.program_id(0)
-        pid_n = tl.program_id(1)
+        # ENDS: COUNTS holds cumulative row ends. GROUP_M > 0: 1D grid, GROUP_M row tiles at a time (L2 reuse).
+        if GROUP_M > 0:
+            pid = tl.program_id(0)
+            num_pid_n = tl.cdiv(N, BLOCK_N)
+            num_pid_m = tl.num_programs(0) // num_pid_n
+            width = GROUP_M * num_pid_n
+            first_m = (pid // width) * GROUP_M
+            size_m = tl.minimum(num_pid_m - first_m, GROUP_M)
+            pid_m = first_m + (pid % width) % size_m
+            pid_n = (pid % width) // size_m
+        else:
+            pid_m = tl.program_id(0)
+            pid_n = tl.program_id(1)
         e_offs = tl.arange(0, E_POW2)
-        counts = tl.load(COUNTS + e_offs, mask = e_offs < E, other = 0).to(tl.int32)
+        if ENDS:
+            counts = (tl.load(COUNTS + e_offs, mask = e_offs < E, other = 0).to(tl.int32)
+                      - tl.load(COUNTS + e_offs - 1, mask = (e_offs > 0) & (e_offs < E), other = 0).to(tl.int32))
+        else:
+            counts = tl.load(COUNTS + e_offs, mask = e_offs < E, other = 0).to(tl.int32)
         tiles = tl.where((e_offs >= E_LO) & (e_offs < E_HI), (counts + BLOCK_M - 1) // BLOCK_M, 0)
         tile_end = tl.cumsum(tiles, 0)
         e = tl.sum((tile_end <= pid_m).to(tl.int32), 0)
@@ -98,11 +119,17 @@ if triton is not None:
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype = tl.float32)
         for k0 in range(0, K, BLOCK_K):
             offs_k = k0 + tl.arange(0, BLOCK_K)
-            mask_k = offs_k < K
-            a = tl.load(A + offs_m64[:, None] * stride_am + offs_k[None, :] * stride_ak,
-                        mask = mask_m[:, None] & mask_k[None, :], other = 0.0)
-            b = tl.load(b_base + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn,
-                        mask = mask_k[:, None] & mask_n[None, :], other = 0.0)
+            if EVEN_K:
+                a = tl.load(A + offs_m64[:, None] * stride_am + offs_k[None, :] * stride_ak,
+                            mask = mask_m[:, None], other = 0.0)
+                b = tl.load(b_base + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn,
+                            mask = mask_n[None, :], other = 0.0)
+            else:
+                mask_k = offs_k < K
+                a = tl.load(A + offs_m64[:, None] * stride_am + offs_k[None, :] * stride_ak,
+                            mask = mask_m[:, None] & mask_k[None, :], other = 0.0)
+                b = tl.load(b_base + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn,
+                            mask = mask_k[:, None] & mask_n[None, :], other = 0.0)
             if ROW_SCALE:
                 a = a * s[:, None]
             if A_MODE == 0:
@@ -131,14 +158,18 @@ if triton is not None:
         E, N, K,
         stride_gm, stride_xm, stride_de, stride_dn, stride_dk,
         IEEE: tl.constexpr, E_POW2: tl.constexpr,
-        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+        BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, ENDS: tl.constexpr,
     ):
         # DW[e, n, k] = sum over the rows m of expert e of G[m, n] * X[m, k]; zero for an empty expert.
         e = tl.program_id(0)
         pid_n = tl.program_id(1)
         pid_k = tl.program_id(2)
         e_offs = tl.arange(0, E_POW2)
-        counts = tl.load(COUNTS + e_offs, mask = e_offs < E, other = 0).to(tl.int32)
+        if ENDS:
+            counts = (tl.load(COUNTS + e_offs, mask = e_offs < E, other = 0).to(tl.int32)
+                      - tl.load(COUNTS + e_offs - 1, mask = (e_offs > 0) & (e_offs < E), other = 0).to(tl.int32))
+        else:
+            counts = tl.load(COUNTS + e_offs, mask = e_offs < E, other = 0).to(tl.int32)
         sel = e_offs == e
         row_end = tl.sum(tl.where(sel, tl.cumsum(counts, 0), 0), 0)
         row_start = row_end - tl.sum(tl.where(sel, counts, 0), 0)
@@ -316,6 +347,117 @@ def _gemm_config(M, E, N, K, device, split):
     return BM, max(16, min(BN, _pow2(N))), max(16, min(BK if BM == 128 else 64, _pow2(K))), 4 if BM < 128 else 8, 3
 
 
+# Best-geomean tiles per rows-per-expert bucket, swept on A100 / L4 / RTX PRO 6000 over common MoE expert shapes.
+# Keys: "big" (N, K > 32), "N" (N <= 32), "K" (K <= 32). Rows: (max rows per expert or None, tile).
+_GENERIC_GEMM = {
+    "sm80": {
+        "big": ((16, (32, 256, 64, 8, 3, 0)), (128, (64, 256, 64, 8, 3, 0)), (None, (128, 128, 64, 4, 3, 8))),
+        "N": ((32, (16, 16, 256, 4, 4, 0)), (None, (64, 16, 256, 4, 4, 0))),
+        "K": ((128, (32, 256, 16, 4, 2, 0)), (None, (64, 256, 16, 8, 2, 0))),
+    },
+    "sm89": {
+        "big": ((32, (32, 128, 128, 4, 3, 0)), (128, (128, 256, 64, 8, 3, 0)), (None, (128, 256, 64, 8, 3, 8))),
+        "N": ((None, (32, 16, 256, 4, 4, 0)),),
+        "K": ((32, (32, 256, 16, 4, 2, 0)), (64, (128, 128, 16, 4, 2, 0)), (None, (64, 256, 16, 8, 2, 0))),
+    },
+    "sm120": {
+        "big": ((128, (32, 128, 64, 4, 3, 0)), (256, (128, 256, 64, 8, 3, 8)), (None, (128, 128, 32, 4, 4, 8))),
+        "N": ((128, (32, 16, 256, 4, 3, 0)), (None, (64, 16, 128, 4, 3, 0))),
+        "K": ((None, (32, 256, 16, 4, 2, 0)),),
+    },
+}
+_GENERIC_WGRAD = {
+    "sm80": {
+        "big": ((256, (32, 128, 256, 8, 4)), (None, (64, 128, 256, 8, 3))),
+        "N": ((None, (32, 16, 256, 4, 3)),),
+        "K": ((None, (32, 256, 16, 4, 3)),),
+    },
+    "sm89": {
+        "big": ((None, (32, 128, 256, 8, 3)),),
+        "N": ((None, (32, 16, 256, 8, 3)),),
+        "K": ((None, (32, 256, 16, 8, 3)),),
+    },
+    "sm120": {
+        "big": ((64, (32, 128, 128, 8, 4)), (None, (32, 128, 256, 8, 4))),
+        "N": ((None, (32, 16, 128, 4, 3)),),
+        "K": ((None, (32, 128, 16, 4, 3)),),
+    },
+}
+_SMEM = {}
+
+
+def _generic_family(device):
+    """sm86 / sm87 use sm89's table (similar shared memory), sm12x sm120's, sm90+ sm80's."""
+    cap = _capability(device)
+    if cap[0] == 12:
+        return "sm120"
+    if cap[0] >= 9 or cap == (8, 0):
+        return "sm80"
+    return "sm89"
+
+
+def _smem_limit(device):
+    key = device.index
+    lim = _SMEM.get(key)
+    if lim is None:
+        lim = 101376
+        if device.type == "cuda":
+            index = device.index if device.index is not None else torch.cuda.current_device()
+            props = torch.cuda.get_device_properties(index)
+            lim = getattr(props, "shared_memory_per_block_optin", 0) or lim
+        _SMEM[key] = lim
+    return lim
+
+
+def _pick(table, rows):
+    for hi, cfg in table:
+        if hi is None or rows <= hi:
+            return cfg
+    return table[-1][1]
+
+
+def _fit_smem(BM, BN, BK, stages, elt, limit, wgrad):
+    """Drop stages, then halve BLOCK_K (gemm) / BLOCK_M (wgrad) until (stages - 1) tile pairs fit."""
+    while (stages - 1) * (BM * (BN + BK) if wgrad else BK * (BM + BN)) * elt > limit:
+        if stages > 2:
+            stages -= 1
+        elif not wgrad and BK > 16:
+            BK //= 2
+        elif wgrad and BM > 16:
+            BM //= 2
+        else:
+            break
+    return BM, BK, stages
+
+
+def generic_gemm_config(M, E, N, K, device, dtype):
+    """(BLOCK_M, BLOCK_N, BLOCK_K, warps, stages, GROUP_M) for grouped_gemm; shapes only, no counts."""
+    if device.type == "cuda" and _capability(device) < (8, 0):
+        return _gemm_config(M, E, N, K, device, False) + (0,)
+    rows = M / max(E, 1)
+    cls = "N" if N <= 32 else ("K" if K <= 32 else "big")
+    BM, BN, BK, warps, stages, group_m = _pick(_GENERIC_GEMM[_generic_family(device)][cls], rows)
+    BN = max(16, _pow2(N)) if cls == "N" else max(16, min(BN, _pow2(N)))
+    BK = max(16, _pow2(K)) if cls == "K" else max(16, min(BK, _pow2(K)))
+    elt = dtype.itemsize
+    BM, BK, stages = _fit_smem(BM, BN, BK, stages, elt, _smem_limit(device), False)
+    return BM, BN, BK, warps, stages, group_m
+
+
+def generic_wgrad_config(M, E, N, K, device, dtype):
+    """(BLOCK_M, BLOCK_N, BLOCK_K, warps, stages) for grouped_wgrad."""
+    if device.type == "cuda" and _capability(device) < (8, 0):
+        return 32, max(16, min(64, _pow2(N))), max(16, min(64, _pow2(K))), 4, 2
+    rows = M / max(E, 1)
+    cls = "N" if N <= 32 else ("K" if K <= 32 else "big")
+    BM, BN, BK, warps, stages = _pick(_GENERIC_WGRAD[_generic_family(device)][cls], rows)
+    BN = max(16, _pow2(N)) if cls == "N" else max(16, min(BN, _pow2(N)))
+    BK = max(16, _pow2(K)) if cls == "K" else max(16, min(BK, _pow2(K)))
+    elt = dtype.itemsize
+    BM, BK, stages = _fit_smem(BM, BN, BK, stages, elt, _smem_limit(device), True)
+    return BM, BN, BK, warps, stages
+
+
 def row_pow2_scale(t, target_exp = 15):
     """Per-row power of two s with max|t[m]| * s in [2^(target-1), 2^target): fp16-safe,
     exactly invertible. Rows of zeros / non-finite rows get a finite scale."""
@@ -325,12 +467,20 @@ def row_pow2_scale(t, target_exp = 15):
     return torch.ldexp(torch.ones_like(amax), (target_exp - ex)).contiguous()
 
 
+def _cublas_backend(device, backend):
+    # None: the measured gpt-oss choice (use_cublas); "triton" / "cublas" force one.
+    return use_cublas(device) if backend is None else backend == "cublas"
+
+
 def grouped_gemm(a, b, counts, out_dtype, *, b_trans, e_lo = 0, e_hi = None, num_experts = None,
-                 out = None, a_mode = None, row_scale = None, bias = None, config = None):
+                 out = None, a_mode = None, row_scale = None, bias = None, config = None, backend = None,
+                 ends = False):
     """out[m] = a[m] @ (b[e - e_lo].T if b_trans else b[e - e_lo]) for rows of experts in [e_lo, e_hi).
 
     a: [M, K] rows sorted by expert; b: [E', N, K] (b_trans) or [E', K, N]; counts: [E] rows per
-    expert on device. Rows outside the window are not written (pass `out` across windows)."""
+    expert on device. Rows outside the window are not written (pass `out` across windows).
+    backend: None picks per device (use_cublas), "triton" / "cublas" force one. ends: counts holds
+    cumulative row ends (torch._grouped_mm's offs) instead of rows per expert."""
     M, K = a.shape
     E = int(num_experts if num_experts is not None else _counts_tensor(counts).numel())
     e_hi = E if e_hi is None else int(e_hi)
@@ -351,14 +501,23 @@ def grouped_gemm(a, b, counts, out_dtype, *, b_trans, e_lo = 0, e_hi = None, num
     ieee = a.dtype == torch.float32 and b.dtype == torch.float32
     if a_mode == A_DIRECT and a.dtype != b.dtype:
         raise TypeError(f"grouped_gemm: {a.dtype} x {b.dtype} needs a_mode cast / split")
-    if use_cublas(a.device):
+    if _cublas_backend(a.device, backend):
+        if ends:
+            counts = torch.diff(_counts_tensor(counts), prepend = _counts_tensor(counts).new_zeros(1))
         with torch.autocast(device_type = a.device.type, enabled = False):
             _gemm_cublas(a, b, counts, out_dtype, b_trans, int(e_lo), e_hi, out, a_mode, row_scale, bias)
         CALLS["gemm"] += 1
         return out
     counts = _counts_tensor(counts)
-    BM, BN, BK, warps, stages = config or _gemm_config(M, E, N, K, a.device, a_mode == A_SPLIT)
+    # config: generic_gemm_config's tuple; None = _gemm_config (#1591 tiles).
+    config = config or _gemm_config(M, E, N, K, a.device, a_mode == A_SPLIT)
+    BM, BN, BK, warps, stages = config[:5]
+    extra = {}
     grid = (-(-M // BM) + min(E, M), -(-N // BN))
+    if len(config) > 5:
+        extra = dict(GROUP_M = int(config[5]), EVEN_K = K % BK == 0)
+        if config[5]:
+            grid = (grid[0] * grid[1],)
     with _on(a.device):
         _grouped_gemm_kernel[grid](
             a, b, out, counts, row_scale if row_scale is not None else a, bias if bias is not None else a,
@@ -366,36 +525,45 @@ def grouped_gemm(a, b, counts, out_dtype, *, b_trans, e_lo = 0, e_hi = None, num
             a.stride(0), a.stride(1), b.stride(0), stride_bk, stride_bn, out.stride(0),
             bias.stride(0) if bias is not None else 0,
             A_MODE = a_mode, ROW_SCALE = row_scale is not None, HAS_BIAS = bias is not None, IEEE = ieee,
-            E_POW2 = _pow2(max(E, 2)), BLOCK_M = BM, BLOCK_N = BN, BLOCK_K = BK,
-            num_warps = warps, num_stages = stages,
+            E_POW2 = _pow2(max(E, 2)), BLOCK_M = BM, BLOCK_N = BN, BLOCK_K = BK, ENDS = bool(ends),
+            num_warps = warps, num_stages = stages, **extra,
         )
     CALLS["gemm"] += 1
     return out
 
 
-def grouped_wgrad(g, x, counts, out_dtype, num_experts = None):
+def grouped_wgrad(g, x, counts, out_dtype, num_experts = None, backend = None, config = None, ends = False):
     """dw[e] = g[rows of e].T @ x[rows of e] -> [E, N, K]; zeros for an expert with no rows."""
     assert g.dtype == x.dtype and g.stride(1) == 1 and x.stride(1) == 1
     M, N = g.shape
     K = x.shape[1]
     E = int(num_experts if num_experts is not None else _counts_tensor(counts).numel())
-    if use_cublas(g.device):
+    if _cublas_backend(g.device, backend):
+        if ends:
+            counts = torch.diff(_counts_tensor(counts), prepend = _counts_tensor(counts).new_zeros(1))
         CALLS["wgrad"] += 1
         with torch.autocast(device_type = g.device.type, enabled = False):
             return _wgrad_cublas(g, x, counts, out_dtype, E)
     counts = _counts_tensor(counts)
-    dw = torch.empty((E, N, K), dtype = out_dtype, device = g.device)
     ieee = g.dtype == torch.float32
-    BM = 32
-    BN = max(16, min(64, _pow2(N)))
-    BK = max(16, min(64, _pow2(K)))
-    stages = 2 if _capability(g.device) < (8, 0) else 3
+    dw = torch.empty((E, N, K), dtype = out_dtype, device = g.device)
+    if config is not None:
+        BM, BN, BK, warps, stages = config
+    else:
+        BM = 32
+        BN = max(16, min(64, _pow2(N)))
+        BK = max(16, min(64, _pow2(K)))
+        warps = 4
+        stages = 2 if _capability(g.device) < (8, 0) else 3
+    if E == 0 or N == 0 or K == 0:
+        CALLS["wgrad"] += 1
+        return dw.zero_()
     with _on(g.device):
         _grouped_wgrad_kernel[(E, -(-N // BN), -(-K // BK))](
             g, x, dw, counts, E, N, K,
             g.stride(0), x.stride(0), dw.stride(0), dw.stride(1), dw.stride(2),
-            IEEE = ieee, E_POW2 = _pow2(max(E, 2)), BLOCK_M = BM, BLOCK_N = BN, BLOCK_K = BK,
-            num_warps = 4, num_stages = stages,
+            IEEE = ieee, E_POW2 = _pow2(max(E, 2)), BLOCK_M = BM, BLOCK_N = BN, BLOCK_K = BK, ENDS = bool(ends),
+            num_warps = warps, num_stages = stages,
         )
     CALLS["wgrad"] += 1
     return dw
@@ -563,3 +731,102 @@ def unavailable_reason():
     if torch.version.hip is not None:
         return "float16 grouped GEMM is CUDA-only"
     return "float16 grouped GEMM unavailable on this device"
+
+
+# Generic MoE path (moe_utils.grouped_mm_triton): torch._grouped_mm semantics on bf16 / fp16 operands of one dtype.
+
+
+def generic_grouped_mm(inputs, weight, offsets):
+    """torch._grouped_mm semantics; offsets are read on device (no host sync). Rows past offsets[-1] stay unwritten."""
+    M, K = inputs.shape
+    E, _, N = weight.shape
+    config = generic_gemm_config(M, E, N, K, inputs.device, inputs.dtype)
+    out = grouped_gemm(inputs, weight, offsets, inputs.dtype, b_trans = False, num_experts = E,
+                       config = config, backend = "triton", ends = True)
+    GENERIC_CALLS["gemm"] += 1
+    return out
+
+
+def generic_grouped_wgrad(inputs, grad, offsets, num_experts):
+    """dW[e] = inputs[rows of e].T @ grad[rows of e] -> [E, K, N]; zeros for an empty expert."""
+    inputs = inputs if inputs.stride(-1) == 1 else inputs.contiguous()
+    grad = grad if grad.stride(-1) == 1 else grad.contiguous()
+    M, K = inputs.shape
+    N = grad.shape[1]
+    config = generic_wgrad_config(M, num_experts, K, N, inputs.device, inputs.dtype)
+    dw = grouped_wgrad(inputs, grad, offsets, inputs.dtype, num_experts = num_experts,
+                       backend = "triton", config = config, ends = True)
+    GENERIC_CALLS["wgrad"] += 1
+    return dw
+
+
+_GENERIC_DISABLED_REASON = None
+_GENERIC_SELF_CHECKED = {}
+
+
+def _self_check_generic(device):
+    """Forward, dX and dW vs fp64 (bf16, fp16, transposed weight, empty expert, tails); raises on mismatch."""
+    g = torch.Generator(device = "cpu").manual_seed(0)
+    E, N, K = 4, 40, 24
+    counts = torch.tensor([5, 0, 19, 3], dtype = torch.int32, device = device)
+    offsets = torch.cumsum(counts, 0, dtype = torch.int32)
+    M = int(counts.sum())
+    e_of = torch.repeat_interleave(torch.arange(E), counts.cpu().long()).to(device)
+    w_nk = (torch.randn(E, N, K, generator = g) * 0.1).to(device)
+    x = torch.randn(M, K, generator = g).to(device)
+    dy = torch.randn(M, N, generator = g).to(device)
+    w64 = w_nk.double()[e_of]
+    ref_y = torch.einsum("mk,mnk->mn", x.double(), w64)
+    ref_dx = torch.einsum("mn,mnk->mk", dy.double(), w64)
+    ref_dw = torch.stack([x.double()[e_of == e].T @ dy.double()[e_of == e] for e in range(E)])
+    for dtype, tol in ((torch.bfloat16, 2e-2), (torch.float16, 4e-3)):
+        w = w_nk.to(dtype)
+        y = generic_grouped_mm(x.to(dtype), w.transpose(-2, -1), offsets).double()
+        dx = generic_grouped_mm(dy.to(dtype), w, offsets).double()
+        dw = generic_grouped_wgrad(x.to(dtype), dy.to(dtype), offsets, E).double()
+        for name, got, ref in (("forward", y, ref_y), ("dX", dx, ref_dx), ("dW", dw, ref_dw)):
+            if got.shape != ref.shape or not torch.isfinite(got).all() or \
+                    (got - ref).abs().max().item() > tol * max(ref.abs().max().item(), 1.0):
+                raise RuntimeError(
+                    f"generic grouped GEMM self-check {dtype} {name}: "
+                    f"{(got - ref).abs().max().item() if got.shape == ref.shape else tuple(got.shape)}"
+                )
+    if dw[1].abs().max().item() != 0:
+        raise RuntimeError("generic grouped GEMM self-check: dW of an empty expert is not zero")
+
+
+def triton_grouped_available(device) -> bool:
+    """Self-check once per device; a failure disables the generic path for the process (OOM propagates)."""
+    global _GENERIC_DISABLED_REASON
+    if (
+        triton is None
+        or _GENERIC_DISABLED_REASON is not None
+        or getattr(device, "type", None) != "cuda"
+        or torch.version.hip is not None
+        or os.environ.get("TRITON_INTERPRET", "0") == "1"
+    ):
+        return False
+    key = device.index
+    ok = _GENERIC_SELF_CHECKED.get(key)
+    if ok is None:
+        saved = dict(CALLS), dict(GENERIC_CALLS)
+        try:
+            with torch.cuda.device(device):
+                _self_check_generic(device)
+            ok = True
+        except Exception as exc:
+            if isinstance(exc, torch.OutOfMemoryError):
+                raise
+            _GENERIC_DISABLED_REASON = f"{type(exc).__name__}: {exc}"
+            import logging
+            logging.getLogger(__name__).warning(
+                "Unsloth: the Triton grouped MoE GEMM failed its self-check and is disabled for this "
+                f"process; torch._grouped_mm is used instead. Reason: {_GENERIC_DISABLED_REASON}"
+            )
+            ok = False
+        finally:
+            # The self-check's own launches are not engagement.
+            CALLS.update(saved[0])
+            GENERIC_CALLS.update(saved[1])
+        _GENERIC_SELF_CHECKED[key] = ok
+    return ok

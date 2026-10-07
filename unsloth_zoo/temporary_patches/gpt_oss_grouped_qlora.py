@@ -35,6 +35,9 @@ import os
 
 import torch
 
+# Model-agnostic expert-LoRA helpers, shared with the ModuleList grouped MoE path.
+from .moe_grouped_modulelist import _lora_delta, _lora_operands, _projs_lora
+
 try:
     import triton
     import triton.language as tl
@@ -162,54 +165,6 @@ class _StackProvider:
         return self.transposed().transpose(1, 2)
 
 
-def _projs_lora(projs):
-    """(name, scaling, rank) of the one active adapter on every expert of `projs`;
-    None when no expert is LoRA-wrapped; a reason string when unsupported."""
-    wrapped = [hasattr(p, "lora_A") for p in projs]
-    if not any(wrapped):
-        return None
-    if not all(wrapped):
-        return "some experts are LoRA-wrapped and some are not"
-    first = projs[0]
-    for h in getattr(first, "_forward_pre_hooks", {}).values():
-        if "adapter_names" in getattr(h, "keywords", ()):
-            return "mixed-adapter batch"
-    for proj in projs:
-        if getattr(proj, "disable_adapters", False):
-            return "adapters disabled"
-        if getattr(proj, "merged", False):
-            return "adapter merged into the base weight"
-    active = list(first.active_adapters)
-    if len(active) != 1:
-        return f"{len(active)} active adapters"
-    name = active[0]
-    scaling = None
-    rank = None
-    for proj in projs:
-        if list(proj.active_adapters) != active or name not in proj.lora_A:
-            return "adapters differ across experts"
-        lora_A, lora_B = proj.lora_A[name], proj.lora_B[name]
-        if not (isinstance(lora_A, torch.nn.Linear) and isinstance(lora_B, torch.nn.Linear)):
-            return f"lora_A is {type(lora_A).__name__}"
-        if proj.use_dora.get(name, False) or getattr(proj, "lora_variant", {}).get(name) is not None:
-            return "DoRA / LoRA variant"
-        if getattr(lora_B, "bias", None) is not None or getattr(lora_A, "bias", None) is not None:
-            return "lora_bias"
-        drop = proj.lora_dropout[name]
-        if not isinstance(drop, torch.nn.Identity) and getattr(drop, "p", 0) > 0 and drop.training:
-            return "lora_dropout > 0"
-        s = proj.scaling[name]
-        if not isinstance(s, (int, float)):
-            return "non-scalar scaling"
-        if scaling is None:
-            scaling, rank = float(s), lora_A.weight.shape[0]
-        elif float(s) != scaling or lora_A.weight.shape[0] != rank:
-            return "scaling / rank differ across experts"
-        if lora_A.weight.dtype != lora_B.weight.dtype:
-            return "lora_A / lora_B dtypes differ"
-    return (name, scaling, rank)
-
-
 @torch.compiler.disable
 def expert_lora_state(experts):
     """None (no LoRA), a reason string (unsupported), or {"gate_up": (...), "down": (...)}."""
@@ -260,26 +215,6 @@ def ready_signature(experts):
     except Exception:
         return None
     return tuple(out)
-
-
-def _lora_operands(projs, name, dtype):
-    """[E, in, R'] and [E, R', out] in `dtype`, rank zero-padded by moe_utils'
-    _pad_lora_rank_for_grouped_mm (torch._grouped_mm rejects ranks 4 / 6 in bf16)."""
-    from unsloth_zoo.temporary_patches.moe_utils import _pad_lora_rank_for_grouped_mm
-    A = torch.stack([p.lora_A[name].weight for p in projs])   # [E, r, in]
-    B = torch.stack([p.lora_B[name].weight for p in projs])   # [E, out, r]
-    A = A.to(dtype).transpose(1, 2)                           # [E, in, r]
-    B = B.to(dtype).transpose(1, 2)                           # [E, r, out]
-    A, B = _pad_lora_rank_for_grouped_mm(A, B)
-    return A.contiguous(), B.contiguous()
-
-
-def _lora_delta(x, offsets, projs, lora, dtype):
-    from unsloth_zoo.temporary_patches.moe_utils import _grouped_mm_with_backward_fix
-    name, scaling, _ = lora
-    A, B = _lora_operands(projs, name, dtype)
-    h = _grouped_mm_with_backward_fix(x, A, offsets)
-    return _grouped_mm_with_backward_fix(h, B, offsets) * scaling
 
 
 def _tensor_key(t):

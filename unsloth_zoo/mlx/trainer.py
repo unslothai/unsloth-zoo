@@ -6589,8 +6589,13 @@ class MLXTrainer:
             qual = getattr(model, "_unsloth_compile_qualification", None) or get_compile_qualification(model)
             if qual is not None:
                 model._unsloth_compile_qualification = qual
-            if _compile_decision is None:
-                _compile_decision = resolve_training_compile(model, policy=compile_policy, args=args)
+            # The loss factory can fall back from CCE after the decision was made.
+            if _compile_decision is None or (
+                _compile_decision.enabled and args.use_cce and not use_cce
+            ):
+                _compile_decision = resolve_training_compile(
+                    model, policy=compile_policy, args=args, use_cce=bool(use_cce),
+                )
             model._unsloth_compile_decision = _compile_decision
             if getattr(args, "compile_trace", True):
                 self._compile_trace = getattr(self, "_compile_trace", None) or trace_compile_application(
