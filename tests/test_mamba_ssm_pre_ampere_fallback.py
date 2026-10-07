@@ -38,7 +38,7 @@ _SRC = MISC.read_text(encoding = "utf-8")
 
 
 _NAMES = (
-    "_MAMBA_SM75_MIN_TRITON", "_mamba_ssm_fast_path_blocker",
+    "_MAMBA_SM75_MIN_TRITON", "_weakest_cuda_capability", "_mamba_ssm_fast_path_blocker",
     "_single_mamba_ssm_autotune_config", "_retrim_mamba_ssm_autotune",
     "patch_mamba_ssm_pre_ampere_fallback",
 )
@@ -68,10 +68,11 @@ CONFIG_MODS = (
 
 
 class _FakeCuda:
-    def __init__(self, available = True, capability = (7, 5)):
-        self._available, self._capability = available, capability
+    def __init__(self, available = True, capability = (7, 5), others = ()):
+        self._available, self._capabilities = available, [capability, *others]
     def is_available(self): return self._available
-    def get_device_capability(self, *a, **k): return self._capability
+    def device_count(self): return len(self._capabilities)
+    def get_device_capability(self, device = 0, **k): return self._capabilities[device]
 
 
 def _set_triton(monkeypatch, version):
@@ -798,6 +799,24 @@ def test_an_already_resolved_hub_kernel_is_trimmed_too(env, monkeypatch):
     assert local_kernel.configs == [local_cheapest]
     assert hub_kernel.configs == [hub_cheapest]
     assert hk._KERNEL_MODULE_MAPPING["mamba-ssm"] is None
+
+
+def test_a_t4_beside_an_ampere_gpu_decides_the_fast_path(env, monkeypatch, capsys):
+    """The current device is sm_80, but a model split across both GPUs also runs on the T4."""
+    model_mod, _iu, _hk = env
+    monkeypatch.setattr(torch, "cuda", _FakeCuda(capability = (8, 0), others = [(7, 5)]), raising = False)
+    _set_triton(monkeypatch, "3.3.1")
+    patch()
+    assert model_mod.is_fast_path_available is False
+    assert "compute capability 7.5" in capsys.readouterr().out
+
+
+def test_two_ampere_gpus_keep_the_fast_path(env, monkeypatch):
+    model_mod, _iu, _hk = env
+    monkeypatch.setattr(torch, "cuda", _FakeCuda(capability = (8, 0), others = [(9, 0)]), raising = False)
+    _set_triton(monkeypatch, "3.3.1")
+    assert patch() is None
+    assert model_mod.is_fast_path_available is True
 
 
 # Keep last: it checks what the `env` fixture left behind after teardown.

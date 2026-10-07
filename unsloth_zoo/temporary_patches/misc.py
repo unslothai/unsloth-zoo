@@ -1312,6 +1312,17 @@ TEMPORARY_PATCHES.append(patch_causal_conv1d_cuda_probe)
 _MAMBA_SM75_MIN_TRITON = (3, 4)
 
 
+def _weakest_cuda_capability():
+    """The lowest compute capability among the visible GPUs.
+
+    A model can be split across every visible GPU, so the fast path has to
+    work on the weakest one, not just the current device.
+    """
+    count = torch.cuda.device_count() if hasattr(torch.cuda, "device_count") else 1
+    return min(tuple(torch.cuda.get_device_capability(i)) for i in range(max(count, 1)))
+pass
+
+
 def _mamba_ssm_fast_path_blocker(capability):
     """None if mamba_ssm's Triton kernels can run on this GPU, else the reason.
 
@@ -1394,7 +1405,7 @@ def _retrim_mamba_ssm_autotune():
     try:
         if not torch.cuda.is_available() or getattr(torch.version, "hip", None) is not None:
             return 0
-        capability = tuple(torch.cuda.get_device_capability())
+        capability = _weakest_cuda_capability()
         if capability >= (8, 0) or _mamba_ssm_fast_path_blocker(capability) is not None:
             return 0
         return _single_mamba_ssm_autotune_config()
@@ -1423,7 +1434,7 @@ def patch_mamba_ssm_pre_ampere_fallback():
     if getattr(torch.version, "hip", None) is not None:
         return  # ROCm: mamba_ssm's requirements are a different question
     try:
-        major, minor = torch.cuda.get_device_capability()
+        major, minor = _weakest_cuda_capability()
     except Exception:
         return
     blocker = _mamba_ssm_fast_path_blocker((major, minor))
@@ -1750,7 +1761,7 @@ def _local_kernel_fallback_allowed():
     if not torch.cuda.is_available() or getattr(torch.version, "hip", None) is not None:
         return False
     try:
-        return _mamba_ssm_fast_path_blocker(torch.cuda.get_device_capability()) is None
+        return _mamba_ssm_fast_path_blocker(_weakest_cuda_capability()) is None
     except Exception:
         return False
 pass
