@@ -2598,6 +2598,14 @@ def test_stream_grid_widens_vlm_batches_at_the_consumer_width_seam():
 # must be bound to]); the merge it replaces, as (class or None, attribute,
 # upstream requires equal counts).
 HOST_GRID_FAMILIES = [
+    ("dots_ocr",
+     [("vision", "VisionModel", "__call__"),
+      ("vision", "VisionModel", "get_pos_ids_by_grid"),
+      ("vision", "VisionModel", "rot_pos_emb"),
+      ("vision", "VisionAttention", "__call__"),
+      ("model", "Model", "merge_input_ids_with_image_features",
+       "_merge_exclusive_special_token_features")],
+     ("Model", "merge_input_ids_with_image_features", False)),
 ]
 
 
