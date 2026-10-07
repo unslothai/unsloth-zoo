@@ -2606,6 +2606,20 @@ HOST_GRID_FAMILIES = [
       ("model", "Model", "merge_input_ids_with_image_features",
        "_merge_exclusive_special_token_features")],
      ("Model", "merge_input_ids_with_image_features", False)),
+    ("muse_glimmer",
+     [("vision", "VisionModel", "__call__"),
+      ("model", "Model", "get_input_embeddings")],
+     ("Model", "get_input_embeddings", True)),
+    ("minimax_m3_vl",
+     [("vision", "MiniMaxVisionTransformer", "__call__"),
+      ("vision", "MiniMaxVisionTransformer", "_segment_grid_thw"),
+      ("vision", "MiniMaxVisionAttention", "__call__"),
+      ("model", "Model", "_merge_visual_tokens"),
+      ("model", "Model", "merge_input_ids_with_visual_features")],
+     ("Model", "merge_input_ids_with_visual_features", True)),
+    ("kimi_k3",
+     [("model", "Model", "_prepare_inputs_for_multimodal")],
+     ("Model", "_prepare_inputs_for_multimodal", True)),
 ]
 
 

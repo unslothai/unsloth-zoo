@@ -5939,6 +5939,11 @@ def test_a_processor_emitted_grid_array_is_never_downgraded():
     ("mage_vl", "image_grid_thw", "image_sizes"),
     ("mage_vl", "video_grid_thw", "image_sizes"),
     ("dots_ocr", "image_grid_thw", "video_grid_thw"),
+    ("muse_glimmer", "video_grid_thw", "image_sizes"),
+    ("minimax_m3_vl", "image_grid_thw", "image_sizes"),
+    ("kimi_k3", "grid_thws", "image_grid_thw"),
+    ("kimi_k3", "image_grid_hws", "image_grid_thw"),
+    ("kimi_k3", "video_grid_hws", "image_grid_thw"),
 ])
 def test_a_family_without_a_patched_embedder_still_gets_its_static_metadata(
     model_type, declared, undeclared,
@@ -6011,6 +6016,23 @@ def test_the_exclusive_merge_carries_the_dots_ocr_count_contract():
     with pytest.raises(ValueError, match="tokens=3, features=2"):
         _merge_exclusive_special_token_features(
             10, 20, features, inputs_embeds, mx.array([[10, 10, 10]]))
+
+
+@pytest.mark.parametrize("key", ["grid_thws", "image_grid_hws", "video_grid_hws"])
+@pytest.mark.parametrize("row", [[1, 16, 16], [16, 16]])
+def test_the_kimi_grid_key_names_are_measured_too(key, row):
+    """Kimi's processor names the grid differently and drops the frame axis for
+    stills, so the measured value has to keep whatever width the row had."""
+    from unsloth_zoo.mlx.utils import _prepare_vlm_batch_for_compile
+
+    raw = mx.array([row])
+    out = _prepare_vlm_batch_for_compile(
+        {"input_ids": mx.array([[1, 2, 3]]), key: raw},
+        {"model_type": "kimi_k3"},
+        phase="content")
+
+    assert out[key] is raw
+    assert out["_unsloth_static_vlm_metadata"][key] == (tuple(row),)
 
 
 def test_a_tower_that_indexes_the_grid_as_an_array_is_left_alone():
