@@ -1927,11 +1927,11 @@ class _MarkerStep:
     def __call__(self, batch):
         return self.loss_and_grad(batch)
 
-    def losses(self, batch):
-        """Summed loss of a batch and the number of decisions in it."""
+    def losses(self, batch, outputs = False):
+        """Summed loss of a batch and the number of decisions in it; with `outputs`, its logits and targets too."""
         logits = _staged_logits(self.staged, batch)
         losses = _decision_losses(logits, batch["target"], batch["marker_mask"], self.objective)[0]
-        return losses.sum(), batch["target"].shape[0]
+        return (losses.sum(), batch["target"].shape[0], *((logits, batch["target"]) if outputs else ()))
 
 
 _CLEF_LORA_TARGETS = ("q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "in_proj_z", "out_proj", "gate_proj", "up_proj", "down_proj")
@@ -2063,7 +2063,7 @@ def clef_training_network(
     return network
 
 
-def _clef_record_loss(network, item, objective = None, ordinal_scale = 0.0, reference = None, kl_weight = 0.0):
+def _clef_record_loss(network, item, objective = None, ordinal_scale = 0.0, reference = None, kl_weight = 0.0, capture = None):
     """The loss summed over the questions of one record; `ordinal_scale` weighs its score questions' ordinal term and
     `kl_weight` the divergence of each question's distribution from that of the `reference` logits."""
     spans = item["option_spans"]
@@ -2076,6 +2076,8 @@ def _clef_record_loss(network, item, objective = None, ordinal_scale = 0.0, refe
     owner = mx.array([row for row, options in enumerate(spans) for _ in options])
     own = owner[None, :] == mx.arange(len(spans))[:, None]
     rows = mx.where(own, logits[None, :], -1e4)
+    if capture is not None:
+        capture.append((logits, item))
     losses, distance = _decision_losses(rows, mx.array(target), own, objective)
     total = losses.sum()
     if distance is not None and ordinal_scale:
@@ -2101,7 +2103,7 @@ class _ClefStep:
 
     def _record_arguments(self, item, scale):
         if self.reference is None:
-            return item, self.objective, scale
+            return item, self.objective, scale, None, 0.0
         head, weight = self.reference
         return item, self.objective, scale, self.network.reference_logits(item, head), weight
 
@@ -2125,10 +2127,22 @@ class _ClefStep:
             mx.eval(total, grads)
         return total / count, tree_map(lambda g: g / count, grads)
 
-    def losses(self, items):
+    def losses(self, items, outputs = False):
         count = sum(len(item["targets"]) for item in items)
         scale = self._ordinal_scale(items, count)
-        return sum(_clef_record_loss(self.network, *self._record_arguments(item, scale)) for item in items), count
+        capture = [] if outputs else None
+        total = sum(_clef_record_loss(self.network, *self._record_arguments(item, scale), capture) for item in items)
+        if not outputs:
+            return total, count
+        # One row per question, as wide as the batch's largest: -1e4 past a question's options and 0 in its target.
+        width = max(len(target) for item in items for target in item["targets"])
+        logits, targets = np.full((count, width), -1e4, np.float32), np.zeros((count, width), np.float32)
+        row = 0
+        for flat, item in capture:
+            for values, target in zip(np.split(np.array(flat.astype(mx.float32)), np.cumsum([len(t) for t in item["targets"]])[:-1]), item["targets"]):
+                logits[row, : len(target)], targets[row, : len(target)] = values, target
+                row += 1
+        return total, count, mx.array(logits), mx.array(targets)
 
 
 def clef_logits(network, items):

@@ -65,7 +65,7 @@ from unsloth_zoo.mlx.decision import (  # noqa: E402
     save_decision_model,
 )
 from unsloth_zoo.mlx.generate import generation_mode  # noqa: E402
-from unsloth_zoo.mlx.trainer import MLXDecisionTrainer, MLXTrainingConfig, _length_grouped_batches  # noqa: E402
+from unsloth_zoo.mlx.trainer import MLXDecisionTrainer, MLXTrainingConfig, _default_flow_evaluates_final_step, _length_grouped_batches  # noqa: E402
 from unsloth_zoo.mlx.utils import _forward_text_hidden_states  # noqa: E402
 
 
@@ -740,6 +740,49 @@ def test_clef_kl_penalty_holds_on_to_the_starting_model_and_fields_are_permuted_
         MLXDecisionTrainer(network, _config(per_device_train_batch_size = 1, gradient_accumulation_steps = 1, max_steps = 2, seed = 5), [record], [record], permute_fields = True).train()
     # Training only, a new order each epoch, and the same ones in a run with the same seed.
     assert len(orders) > 1 and len(draws) == 4 and draws[:2] == draws[2:] and draws[0] != draws[1]
+
+
+def test_evaluation_weighs_records_alike_and_hands_metrics_logits_and_soft_targets(clef):
+    pipeline, network, seen = clef[0], ClefNetwork(clef[0]), []
+    short = {**clef_training_item(pipeline, "x", {"ok": {"type": "noul", "instructions": "fine?"}}), "targets": [[1.0, 0.0]]}
+    items = [clef[2]("hello"), short]
+    def metrics(prediction):
+        seen.append(prediction)
+        return {"hits": float((prediction[0].argmax(-1) == prediction[1].argmax(-1)).mean()), "eval_width": prediction[0].shape[1], "loss": -1.0}
+
+    config = _config(per_device_eval_batch_size = 1)
+    trainer = MLXDecisionTrainer(network, config, items, items, compute_metrics = metrics, preprocess_logits_for_metrics = lambda logits, labels: 2 * logits)
+    got, want = trainer.evaluate(), [_clef_record_loss(network, item).item() / len(item["targets"]) for item in items]
+    assert got["eval_loss"] == pytest.approx(sum(want) / 2, rel = 1e-3) and got["eval_width"] == 3 and "eval_hits" in got and got["eval_runtime"] > 0
+    logits, flat = seen[0].predictions, [row for rows in clef_logits(network, items) for row in rows]
+    np.testing.assert_allclose(seen[0].label_ids, [[0.0, 0.25, 0.75], [1.0, 0.0, 0.0], [1.0, 0.0, -100.0]])
+    np.testing.assert_allclose(logits[1, :2], 2 * flat[1], rtol = 2e-3)
+    # Past a question's own options: -1e4 inside its batch (doubled here), -100 where a later batch is narrower.
+    assert logits[1, 2] == -2e4 and logits[2, 2] == -100 and logits.shape == (3, 3)
+    told = SimpleNamespace(on_predict = lambda *_, metrics, **__: seen.append(metrics))
+    output = MLXDecisionTrainer(network, config, items, callbacks = [told], preprocess_logits_for_metrics = lambda logits, labels: logits.argmax(-1)).predict(items)
+    assert seen[-1] is output.metrics and output.metrics["test_loss"] == pytest.approx(sum(want) / 2, rel = 1e-3) and output.predictions.shape == (3,) and output.label_ids.shape == (3, 3) and trainer.evaluate(items[1:], "held")["held_loss"] == pytest.approx(want[1], rel = 1e-3)
+
+
+def test_trainer_follows_the_evaluation_and_logging_schedule_it_is_given(checkpoint):
+    model, recorder = add_lora_adapters(load_trainable_decision_model(checkpoint[1]), r = 4), _Recorder()
+    args = _config(eval_steps = 2, max_steps = 5, per_device_eval_batch_size = 6)
+    args.eval_strategy, args.eval_delay, args.logging_strategy = "steps", 3, "epoch"
+    trainer = MLXDecisionTrainer(model, args, _items(), _items(), callbacks = [recorder], label_smoothing = 0.2)
+    trainer.train()
+    history = trainer.state.log_history
+    # Two steps an epoch: evaluation waits for step 3 and, as transformers 5 does, takes the last step too; the loss
+    # is logged as each epoch ends, the one the run stops in included.
+    evaluated = [log for log in history if "eval_loss" in log]
+    assert [log["step"] for log in evaluated] == [4, 5][: 1 + _default_flow_evaluates_final_step()] and [log["step"] for log in history if "learning_rate" in log] == [2, 4, 5]
+    model.eval()
+    assert evaluated[-1]["eval_loss"] == pytest.approx(_soft_cross_entropy(model, collate_decisions(_items(), 0), (0.2, 0.0, 0.0)).item(), rel = 1e-3)
+    args = _config(logging_steps = 5)
+    args.dataloader_drop_last, args.logging_first_step, args.eval_strategy = True, True, "no"
+    trainer = MLXDecisionTrainer(model, args, _items()[:5], _items())
+    trainer.train()
+    # The item past two full batches is dropped: one step an epoch, the first is logged, and nothing is evaluated.
+    assert trainer.state.global_step == 2 and [log["step"] for log in trainer.state.log_history if "learning_rate" in log or "eval_loss" in log] == [1]
 
 
 def test_clef_full_fine_tune_trains_the_decoder_but_not_the_output_embedding(clef, monkeypatch):
