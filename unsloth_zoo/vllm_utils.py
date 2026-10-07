@@ -1478,6 +1478,15 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             state_dict["lm_head.weight"] = lm_weight
             quant_state_dict["lm_head.weight"] = lm_weight
 
+    model_config = getattr(llm_engine, "model_config", None)
+    load_config = getattr(getattr(llm_engine, "vllm_config", None), "load_config", None)
+    verify_vllm_moe_experts_match_checkpoint(
+        quant_state_dict,
+        getattr(model_config, "model", None) or getattr(config, "_name_or_path", None),
+        revision = getattr(model_config, "revision", None),
+        cache_dir = getattr(load_config, "download_dir", None),
+    )
+
     if not return_state_dict: state_dict = None
     return state_dict, quant_state_dict
 pass
