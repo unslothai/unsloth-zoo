@@ -214,6 +214,8 @@ def _decoder(quantized = False, bits = 8):
     from mlx_lm.models import qwen3_5
 
     text = dict(model_type = "qwen3_5_text", hidden_size = 64, intermediate_size = 128, num_hidden_layers = 4, num_attention_heads = 2, num_key_value_heads = 1, vocab_size = 512)
+    # The default recurrent state is the full model's, megabytes per token whatever the hidden size.
+    text.update(linear_num_value_heads = 4, linear_num_key_heads = 2, linear_key_head_dim = 32, linear_value_head_dim = 16)
     model = qwen3_5.Model(qwen3_5.ModelArgs(model_type = "qwen3_5", text_config = text))
     model.set_dtype(mx.bfloat16)
     if quantized:
