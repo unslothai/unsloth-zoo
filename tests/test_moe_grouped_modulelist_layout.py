@@ -250,8 +250,10 @@ def _engages(blk, x):
     return ML.CALLS["grouped"] - before == 1
 
 
-def test_signature_tracks_lora_rank_change_via_data():
-    """`.data =` keeps the Parameter, so only the shape shows a new rank on one expert."""
+def test_signature_tracks_lora_rank_change_via_data(monkeypatch):
+    """`.data =` keeps the Parameter, so only the shape shows a new rank on one expert. Per-expert
+    Parameters only: a stacked expert's `weight` is a fresh view, so `.data =` does not reach it."""
+    monkeypatch.setenv("UNSLOTH_MOE_STACKED_LORA", "0")
     model, blk = L.build("qwen3")
     L.enable(model, blk)
     x = torch.randn(1, 64, L.H, device = "cuda", dtype = L.DT)
