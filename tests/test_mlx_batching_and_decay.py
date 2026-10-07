@@ -2894,6 +2894,11 @@ def test_cce_only_compile_family_is_refused_on_the_standard_loss():
     refused = mc.resolve_training_compile(ernie, policy=policy, args=NS(use_cce=False))
     assert not refused.enabled and refused.fallback_allowed
     assert "use_cce=False" in refused.reason
+    # A CCE factory fallback (e.g. a LoRA-wrapped lm_head) lands on the same forward.
+    fell_back = mc.resolve_training_compile(ernie, policy=policy, args=NS(use_cce=True), use_cce=False)
+    assert not fell_back.enabled and "use_cce=False" in fell_back.reason
+    import unsloth_zoo.mlx.trainer as mt
+    assert "use_cce=bool(use_cce)" in inspect.getsource(mt)
     other = type("Model", (), {"__module__": "mlx_vlm.models.glm_ocr.glm_ocr"})()
     other.config = NS(model_type="glm_ocr")
     assert mc.resolve_training_compile(other, policy=policy, args=NS(use_cce=False)).enabled

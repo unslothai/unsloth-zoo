@@ -1707,6 +1707,7 @@ def resolve_training_compile(
     model_or_arch,
     policy: MLXVLMCompilePolicy | None = None,
     args=None,
+    use_cce=None,
 ) -> ResolvedTrainingCompileDecision:
     """Resolve whether a training run should use `mx.compile`.
 
@@ -1881,7 +1882,9 @@ def resolve_training_compile(
             backend_qualifications=backend_qualifications,
         )
     host_reads = _CCE_ONLY_TRAINING_COMPILE_ARCHES.get(arch)
-    if host_reads is not None and getattr(args, "use_cce", True) is False:
+    if use_cce is None:
+        use_cce = getattr(args, "use_cce", True)
+    if host_reads is not None and use_cce is False:
         return finalize(
             arch_name=arch,
             enabled=False,
