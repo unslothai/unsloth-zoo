@@ -1343,6 +1343,41 @@ def _mamba_ssm_fast_path_blocker(capability):
 pass
 
 
+def _single_mamba_ssm_autotune_config():
+    """Keep one autotune config per mamba_ssm Triton kernel; returns how many were cut.
+
+    Below sm_80 every config is compiled before the first step: about 200 in
+    fp16, which took 6 to 9 minutes on a Kaggle T4 versus 20 to 50 seconds
+    for one each, at the same warm step time. The kept config is the one
+    mamba_ssm's own deterministic mode keeps (smallest block product times
+    stages), which also needs the least shared memory.
+    """
+    import sys
+    try:
+        from triton.runtime.autotuner import Autotuner
+    except Exception:
+        return 0
+    def _cost(config):
+        cost = getattr(config, "num_stages", 1) or 1
+        for key, value in getattr(config, "kwargs", {}).items():
+            if key.startswith("BLOCK_SIZE_"):
+                cost *= value
+        return cost
+    pruned = 0
+    for name, module in list(sys.modules.items()):
+        if module is None or not name.startswith("mamba_ssm.ops.triton."):
+            continue
+        for obj in list(module.__dict__.values()):
+            if isinstance(obj, Autotuner) and len(getattr(obj, "configs", ())) > 1:
+                try:
+                    obj.configs = [min(obj.configs, key = _cost)]
+                    pruned += 1
+                except Exception:
+                    pass
+    return pruned
+pass
+
+
 def patch_mamba_ssm_pre_ampere_fallback():
     """Force the Mamba slow path where mamba_ssm's Triton kernels cannot compile.
 
@@ -1368,6 +1403,15 @@ def patch_mamba_ssm_pre_ampere_fallback():
         return
     blocker = _mamba_ssm_fast_path_blocker((major, minor))
     if blocker is None:
+        if (major, minor) < (8, 0):
+            # The fast path runs here, but full autotuning costs minutes of
+            # compiles before the first step. `import mamba_ssm` loads every
+            # ssd kernel module.
+            try:
+                import mamba_ssm  # noqa: F401
+                _single_mamba_ssm_autotune_config()
+            except Exception:
+                pass
         return  # Ampere or newer, or a Triton that compiles the kernels on sm_75
 
     import sys

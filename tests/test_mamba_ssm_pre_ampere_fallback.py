@@ -37,7 +37,10 @@ MISC = Path(__file__).resolve().parents[1] / "unsloth_zoo" / "temporary_patches"
 _SRC = MISC.read_text(encoding = "utf-8")
 
 
-_NAMES = ("_MAMBA_SM75_MIN_TRITON", "_mamba_ssm_fast_path_blocker", "patch_mamba_ssm_pre_ampere_fallback")
+_NAMES = (
+    "_MAMBA_SM75_MIN_TRITON", "_mamba_ssm_fast_path_blocker",
+    "_single_mamba_ssm_autotune_config", "patch_mamba_ssm_pre_ampere_fallback",
+)
 
 
 def _load():
@@ -660,6 +663,70 @@ def test_local_kernel_fallback_follows_the_same_rule():
             seg = ast.get_source_segment(_SRC, node)
     assert seg is not None
     assert "_mamba_ssm_fast_path_blocker(" in seg and "(8, 0)" not in seg
+
+
+# On sm_75 every autotune config compiles before the first step (6 to 9 minutes
+# on a T4), so the fast path keeps one config per mamba_ssm kernel there.
+
+class _FakeAutotuner:
+    def __init__(self, configs):
+        self.configs = list(configs)
+
+
+def _config(stages, **blocks):
+    return types.SimpleNamespace(num_stages = stages, kwargs = dict(blocks))
+
+
+def _autotuned_mamba_module(monkeypatch, mod_name = "mamba_ssm.ops.triton.ssd_chunk_scan"):
+    """A fake triton with an Autotuner class, and a mamba_ssm kernel module using it."""
+    autotuner_mod = types.ModuleType("triton.runtime.autotuner")
+    autotuner_mod.Autotuner = _FakeAutotuner
+    triton_mod = types.ModuleType("triton")
+    triton_mod.__version__ = "3.6.0"
+    triton_mod.__path__ = []
+    runtime_mod = types.ModuleType("triton.runtime")
+    runtime_mod.__path__ = []
+    runtime_mod.autotuner = autotuner_mod
+    triton_mod.runtime = runtime_mod
+    monkeypatch.setitem(sys.modules, "triton", triton_mod)
+    monkeypatch.setitem(sys.modules, "triton.runtime", runtime_mod)
+    monkeypatch.setitem(sys.modules, "triton.runtime.autotuner", autotuner_mod)
+    cheapest = _config(2, BLOCK_SIZE_M = 32, BLOCK_SIZE_N = 64)
+    kernel = _FakeAutotuner([
+        _config(3, BLOCK_SIZE_M = 128, BLOCK_SIZE_N = 256),
+        cheapest,
+        _config(4, BLOCK_SIZE_M = 64, BLOCK_SIZE_N = 64),
+    ])
+    mod = types.ModuleType(mod_name)
+    mod._chunk_scan_fwd_kernel = kernel
+    monkeypatch.setitem(sys.modules, mod_name, mod)
+    return kernel, cheapest
+
+
+def test_t4_fast_path_keeps_one_autotune_config(env, monkeypatch):
+    kernel, cheapest = _autotuned_mamba_module(monkeypatch)
+    assert patch() is None
+    assert kernel.configs == [cheapest]
+
+
+def test_ampere_keeps_every_autotune_config(env, monkeypatch):
+    monkeypatch.setattr(torch, "cuda", _FakeCuda(capability = (8, 0)), raising = False)
+    kernel, _ = _autotuned_mamba_module(monkeypatch)
+    patch()
+    assert len(kernel.configs) == 3
+
+
+def test_autotune_trim_leaves_other_packages_alone(env, monkeypatch):
+    kernel, _ = _autotuned_mamba_module(monkeypatch, mod_name = "fla.ops.gated_delta_rule.chunk")
+    patch()
+    assert len(kernel.configs) == 3
+
+
+def test_slow_path_does_not_trim(env, monkeypatch):
+    kernel, _ = _autotuned_mamba_module(monkeypatch)
+    monkeypatch.setenv("UNSLOTH_MAMBA_PRE_AMPERE_FAST", "0")
+    patch()
+    assert len(kernel.configs) == 3
 
 
 # Keep last: it checks what the `env` fixture left behind after teardown.
