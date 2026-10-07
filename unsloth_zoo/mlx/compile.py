@@ -81,6 +81,7 @@ _VERIFIED_TRAINING_ARCHES: set[str] = {
     "gemma4_unified",
     # Nested `text_config` decoder must qualify too, else gemma4 stays eager.
     "gemma4_text",
+    "dots_ocr",
     "glm_ocr",
     "idefics2",
     "idefics3",
@@ -228,6 +229,7 @@ _TRAINING_VERIFIER_HINTS: dict[str, str] = {
     "gemma4": "verify_gemma4",
     "gemma4_unified": "verify_gemma4_unified",
     "gemma4_text": "verify_gemma4_text",
+    "dots_ocr": "verify_dots_ocr",
     "glm_ocr": "verify_glm_ocr",
     "idefics2": "verify_idefics2",
     "idefics3": "verify_idefics3",
@@ -4059,6 +4061,106 @@ def _install_glm_ocr_compile_patches():
     _PATCHED_ARCHES.add("glm_ocr")
 
 
+def _install_dots_ocr_compile_patches():
+    """Install compile-safe dots_ocr vision and merge patches.
+
+    Its tower reads the grid on the host and reduces the same array with
+    `mx.max`; the merge counts placeholders per row on the device.
+    """
+
+    module = _try_import_module("mlx_vlm.models.dots_ocr.dots_ocr")
+    vision_module = _try_import_module("mlx_vlm.models.dots_ocr.vision")
+    if module is None or vision_module is None:
+        return
+
+    apply_rotary_pos_emb_vision = vision_module.apply_rotary_pos_emb_vision
+
+    def patched_get_pos_ids_by_grid(self, grid_thw):
+        import mlx.core as mx
+
+        merge = self.spatial_merge_size
+        pos_ids = []
+        for t, h, w in _grid_to_tuple(grid_thw):
+            hpos_ids = mx.repeat(mx.arange(h).reshape(h, 1), w, axis=1)
+            hpos_ids = hpos_ids.reshape(h // merge, merge, w // merge, merge)
+            hpos_ids = hpos_ids.transpose(0, 2, 1, 3).flatten()
+
+            wpos_ids = mx.repeat(mx.arange(w).reshape(1, w), h, axis=0)
+            wpos_ids = wpos_ids.reshape(h // merge, merge, w // merge, merge)
+            wpos_ids = wpos_ids.transpose(0, 2, 1, 3).flatten()
+
+            pos_ids.append(mx.tile(mx.stack([hpos_ids, wpos_ids], axis=-1), (t, 1)))
+        return pos_ids
+
+    def patched_rot_pos_emb(self, grid_thw):
+        import mlx.core as mx
+
+        grid_spec = _grid_to_tuple(grid_thw)
+        pos_ids = mx.concatenate(self.get_pos_ids_by_grid(grid_spec), axis=0)
+        max_grid_size = max(max(h, w) for _, h, w in grid_spec)
+        rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
+        return rotary_pos_emb_full[pos_ids].reshape(pos_ids.shape[0], -1)
+
+    def patched_vision_call(self, hidden_states, grid_thw, output_hidden_states=None):
+        del output_hidden_states
+
+        grid_spec = _grid_to_tuple(grid_thw)
+        hidden_states = self.patch_embed(hidden_states, grid_spec)
+        rotary_pos_emb = self.rot_pos_emb(grid_spec)
+        cu_seqlens = _build_cu_seqlens(grid_spec)
+
+        for block in self.blocks:
+            hidden_states = block(
+                hidden_states, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb
+            )
+
+        if self.config.post_norm:
+            hidden_states = self.post_trunk_norm(hidden_states)
+        return self.merger(hidden_states)
+
+    def patched_attention(self, hidden_states, cu_seqlens, rotary_pos_emb):
+        import mlx.core as mx
+
+        seq_length = hidden_states.shape[0]
+        qkv = self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1)
+        qkv = qkv.transpose(1, 0, 2, 3)
+        q, k, v = mx.split(qkv, 3)
+
+        q = apply_rotary_pos_emb_vision(mx.expand_dims(q, 0), rotary_pos_emb)[0]
+        k = apply_rotary_pos_emb_vision(mx.expand_dims(k, 0), rotary_pos_emb)[0]
+        q = q.transpose(0, 2, 1, 3)
+        k = k.transpose(0, 2, 1, 3)
+        v = v.transpose(0, 2, 1, 3)
+
+        split_indices = _split_points(cu_seqlens)
+        attn_outputs = [
+            mx.fast.scaled_dot_product_attention(
+                q_chunk, k_chunk, v_chunk, scale=self.scale
+            )
+            for q_chunk, k_chunk, v_chunk in zip(
+                mx.split(q, split_indices, axis=2),
+                mx.split(k, split_indices, axis=2),
+                mx.split(v, split_indices, axis=2),
+            )
+        ]
+        output = mx.concatenate(attn_outputs, axis=2)
+        output = output.transpose(0, 2, 1, 3).reshape(seq_length, -1)
+        return self.proj(output)
+
+    _patch_method(
+        vision_module.VisionModel, "get_pos_ids_by_grid", patched_get_pos_ids_by_grid
+    )
+    _patch_method(vision_module.VisionModel, "rot_pos_emb", patched_rot_pos_emb)
+    _patch_method(vision_module.VisionModel, "__call__", patched_vision_call)
+    _patch_method(vision_module.VisionAttention, "__call__", patched_attention)
+    _patch_staticmethod(
+        module.Model,
+        "merge_input_ids_with_image_features",
+        _merge_exclusive_special_token_features,
+    )
+    _PATCHED_ARCHES.add("dots_ocr")
+
+
 def _paddleocr_vl_has_batched_vision(vision_module) -> bool:
     """Whether PaddleOCR-VL exposes its newer batched vision contract."""
 
@@ -6222,6 +6324,17 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
             runtime_primitive_names=("phi4_multimodal_spans_runtime",),
         ),
         CompilePatternBundle(
+            name="dots_ocr_vision_compile",
+            description="dots_ocr vision grid-metadata and merge compile patch set.",
+            matcher=lambda arch, report: arch == "dots_ocr",
+            primitive_names=(
+                "vision_metadata_normalization",
+                "compile_safe_feature_merge",
+                "segmented_vision_attention",
+            ),
+            runtime_primitive_names=("dots_ocr_vision_compile_runtime",),
+        ),
+        CompilePatternBundle(
             name="glm_ocr_vision_compile",
             description="GLM OCR vision/merge compile patch set.",
             matcher=lambda arch, report: arch == "glm_ocr",
@@ -6323,6 +6436,7 @@ def _runtime_patch_primitive_installers() -> dict[str, Callable[[], None]]:
         "negative_image_placeholders_runtime": _install_negative_image_placeholder_patches,
         "expanded_image_placeholders_runtime": _install_expanded_image_placeholder_patches,
         "phi4_multimodal_spans_runtime": _install_phi4_multimodal_patches,
+        "dots_ocr_vision_compile_runtime": _install_dots_ocr_compile_patches,
         "glm_ocr_vision_compile_runtime": _install_glm_ocr_compile_patches,
         "paddleocr_vl_multimodal_runtime": _install_paddleocr_vl_compile_patches,
     }
