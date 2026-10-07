@@ -81,6 +81,7 @@ _VERIFIED_TRAINING_ARCHES: set[str] = {
     "gemma4_unified",
     # Nested `text_config` decoder must qualify too, else gemma4 stays eager.
     "gemma4_text",
+    "dots_ocr",
     "ernie4_5_moe_vl",
     "glm_ocr",
     "idefics2",
@@ -91,6 +92,11 @@ _VERIFIED_TRAINING_ARCHES: set[str] = {
     "llava_bunny",
     "llava_next",
     "mage_vl",
+    "kimi_k3",
+    # kimi_k3's nested decoder, which has to be qualified for its parent to be.
+    "kimi_linear",
+    "minimax_m3_vl",
+    "muse_glimmer",
     "mistral3",
     "mistral4",
     "moondream2",
@@ -235,6 +241,7 @@ _TRAINING_VERIFIER_HINTS: dict[str, str] = {
     "gemma4": "verify_gemma4",
     "gemma4_unified": "verify_gemma4_unified",
     "gemma4_text": "verify_gemma4_text",
+    "dots_ocr": "verify_dots_ocr",
     "ernie4_5_moe_vl": "verify_ernie4_5_moe_vl",
     "glm_ocr": "verify_glm_ocr",
     "idefics2": "verify_idefics2",
@@ -245,6 +252,10 @@ _TRAINING_VERIFIER_HINTS: dict[str, str] = {
     "llava_bunny": "verify_llava_bunny",
     "llava_next": "verify_llava_next",
     "mage_vl": "verify_mage_vl",
+    "kimi_k3": "verify_kimi_k3",
+    "kimi_linear": "verify_kimi_linear",
+    "minimax_m3_vl": "verify_minimax_m3_vl",
+    "muse_glimmer": "verify_muse_glimmer",
     "mistral3": "verify_mistral3",
     "mistral4": "verify_mistral4",
     "moondream2": "verify_moondream2",
@@ -4083,6 +4094,374 @@ def _install_glm_ocr_compile_patches():
     _PATCHED_ARCHES.add("glm_ocr")
 
 
+def _install_dots_ocr_compile_patches():
+    """Install compile-safe dots_ocr vision and merge patches.
+
+    Its tower reads the grid on the host and reduces the same array with
+    `mx.max`; the merge counts placeholders per row on the device.
+    """
+
+    module = _try_import_module("mlx_vlm.models.dots_ocr.dots_ocr")
+    vision_module = _try_import_module("mlx_vlm.models.dots_ocr.vision")
+    if module is None or vision_module is None:
+        return
+
+    apply_rotary_pos_emb_vision = vision_module.apply_rotary_pos_emb_vision
+
+    def patched_get_pos_ids_by_grid(self, grid_thw):
+        import mlx.core as mx
+
+        merge = self.spatial_merge_size
+        pos_ids = []
+        for t, h, w in _grid_to_tuple(grid_thw):
+            hpos_ids = mx.repeat(mx.arange(h).reshape(h, 1), w, axis=1)
+            hpos_ids = hpos_ids.reshape(h // merge, merge, w // merge, merge)
+            hpos_ids = hpos_ids.transpose(0, 2, 1, 3).flatten()
+
+            wpos_ids = mx.repeat(mx.arange(w).reshape(1, w), h, axis=0)
+            wpos_ids = wpos_ids.reshape(h // merge, merge, w // merge, merge)
+            wpos_ids = wpos_ids.transpose(0, 2, 1, 3).flatten()
+
+            pos_ids.append(mx.tile(mx.stack([hpos_ids, wpos_ids], axis=-1), (t, 1)))
+        return pos_ids
+
+    def patched_rot_pos_emb(self, grid_thw):
+        import mlx.core as mx
+
+        grid_spec = _grid_to_tuple(grid_thw)
+        pos_ids = mx.concatenate(self.get_pos_ids_by_grid(grid_spec), axis=0)
+        max_grid_size = max(max(h, w) for _, h, w in grid_spec)
+        rotary_pos_emb_full = self.rotary_pos_emb(max_grid_size)
+        return rotary_pos_emb_full[pos_ids].reshape(pos_ids.shape[0], -1)
+
+    def patched_vision_call(self, hidden_states, grid_thw, output_hidden_states=None):
+        del output_hidden_states
+
+        grid_spec = _grid_to_tuple(grid_thw)
+        hidden_states = self.patch_embed(hidden_states, grid_spec)
+        rotary_pos_emb = self.rot_pos_emb(grid_spec)
+        cu_seqlens = _build_cu_seqlens(grid_spec)
+
+        for block in self.blocks:
+            hidden_states = block(
+                hidden_states, cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb
+            )
+
+        if self.config.post_norm:
+            hidden_states = self.post_trunk_norm(hidden_states)
+        return self.merger(hidden_states)
+
+    def patched_attention(self, hidden_states, cu_seqlens, rotary_pos_emb):
+        import mlx.core as mx
+
+        seq_length = hidden_states.shape[0]
+        qkv = self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1)
+        qkv = qkv.transpose(1, 0, 2, 3)
+        q, k, v = mx.split(qkv, 3)
+
+        q = apply_rotary_pos_emb_vision(mx.expand_dims(q, 0), rotary_pos_emb)[0]
+        k = apply_rotary_pos_emb_vision(mx.expand_dims(k, 0), rotary_pos_emb)[0]
+        q = q.transpose(0, 2, 1, 3)
+        k = k.transpose(0, 2, 1, 3)
+        v = v.transpose(0, 2, 1, 3)
+
+        split_indices = _split_points(cu_seqlens)
+        attn_outputs = [
+            mx.fast.scaled_dot_product_attention(
+                q_chunk, k_chunk, v_chunk, scale=self.scale
+            )
+            for q_chunk, k_chunk, v_chunk in zip(
+                mx.split(q, split_indices, axis=2),
+                mx.split(k, split_indices, axis=2),
+                mx.split(v, split_indices, axis=2),
+            )
+        ]
+        output = mx.concatenate(attn_outputs, axis=2)
+        output = output.transpose(0, 2, 1, 3).reshape(seq_length, -1)
+        return self.proj(output)
+
+    _patch_method(
+        vision_module.VisionModel, "get_pos_ids_by_grid", patched_get_pos_ids_by_grid
+    )
+    _patch_method(vision_module.VisionModel, "rot_pos_emb", patched_rot_pos_emb)
+    _patch_method(vision_module.VisionModel, "__call__", patched_vision_call)
+    _patch_method(vision_module.VisionAttention, "__call__", patched_attention)
+    _patch_staticmethod(
+        module.Model,
+        "merge_input_ids_with_image_features",
+        _merge_exclusive_special_token_features,
+    )
+    _PATCHED_ARCHES.add("dots_ocr")
+
+
+def _install_kimi_k3_compile_patches():
+    """Only kimi_k3's merge reads back on the host (numpy); its tower takes a Python grid."""
+
+    module = _try_import_module("mlx_vlm.models.kimi_k3.kimi_k3")
+    if module is None:
+        return
+
+    def patched_prepare_inputs_for_multimodal(
+        self, image_features, inputs_embeds, input_ids, image_token_id=None
+    ):
+        import mlx.core as mx
+
+        candidates = []
+        for token_id in (
+            image_token_id,
+            self.config.image_token_index,
+            getattr(self.config, "media_placeholder_token_id", None),
+        ):
+            if token_id is None:
+                continue
+            if isinstance(token_id, mx.array):
+                if token_id.size == 0:
+                    continue
+                token_id = token_id.item()
+            token_id = int(token_id)
+            if token_id not in candidates:
+                candidates.append(token_id)
+
+        image_mask = mx.zeros(input_ids.shape, dtype=mx.bool_)
+        for token_id in candidates:
+            image_mask = mx.logical_or(image_mask, input_ids == token_id)
+
+        _raise_on_feature_count_mismatch(image_mask, image_features, inputs_embeds)
+        merged, _ = _merge_sequence_mask_features(
+            image_mask, image_features.astype(inputs_embeds.dtype), inputs_embeds
+        )
+        return merged
+
+    _patch_method(
+        module.Model,
+        "_prepare_inputs_for_multimodal",
+        patched_prepare_inputs_for_multimodal,
+    )
+    _PATCHED_ARCHES.add("kimi_k3")
+
+
+def _install_muse_glimmer_compile_patches():
+    """Install compile-safe muse_glimmer vision and merge patches.
+
+    The tower opens by reading the grid on the host, and the merge counts its
+    placeholders on the device before scattering.
+    """
+
+    module = _try_import_module("mlx_vlm.models.muse_glimmer.muse_glimmer")
+    vision_module = _try_import_module("mlx_vlm.models.muse_glimmer.vision")
+    if module is None or vision_module is None:
+        return
+
+    InputEmbeddingsFeatures = module.InputEmbeddingsFeatures
+
+    def patched_vision_call(self, pixel_values, grid_thw):
+        import mlx.core as mx
+
+        grid = [list(row) for row in _grid_to_tuple(grid_thw)]
+        full_split_points = vision_module._cu_seqlens(grid)[1:-1]
+        window_index, window_cu = vision_module._window_index(
+            grid, self.config.pos_emb_height
+        )
+        window_split_points = window_cu[1:-1]
+
+        hidden_states = self.ln_pre(self.patch_embedder(pixel_values, grid))
+        positions = vision_module._position_ids(grid)
+        if window_index is not None:
+            hidden_states = hidden_states[window_index]
+            positions = positions[window_index]
+        cos, sin = self._rotary(positions)
+
+        for idx, block in enumerate(self.layers):
+            split_points = (
+                full_split_points
+                if self.config.layer_types[idx] == "full_attention"
+                else window_split_points
+            )
+            hidden_states = block(hidden_states, split_points, cos, sin)
+
+        if window_index is not None:
+            hidden_states = hidden_states[mx.argsort(window_index)]
+        return self._pixel_shuffle(self.ln_post(hidden_states), grid)
+
+    def patched_get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
+        language_model = self.language_model.model
+        inputs_embeds = language_model.embed_norm(language_model.embed_tokens(input_ids))
+        if pixel_values is None:
+            pixel_values = kwargs.get("pixel_values_videos")
+        if pixel_values is None:
+            return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
+
+        grid_thw = kwargs.get("image_grid_thw")
+        if grid_thw is None:
+            grid_thw = kwargs.get("video_grid_thw")
+        cached = kwargs.get("cached_image_features")
+        image_features = (
+            cached
+            if cached is not None
+            else self._encode_image(pixel_values, image_grid_thw=grid_thw)
+        ).astype(inputs_embeds.dtype)
+
+        token_mask = (input_ids == self.config.image_token_id) | (
+            input_ids == self.config.video_token_id
+        )
+        _raise_on_feature_count_mismatch(token_mask, image_features, inputs_embeds)
+        merged, _ = _merge_sequence_mask_features(
+            token_mask, image_features, inputs_embeds
+        )
+        return InputEmbeddingsFeatures(inputs_embeds=merged)
+
+    _patch_method(vision_module.VisionModel, "__call__", patched_vision_call)
+    _patch_method(module.Model, "get_input_embeddings", patched_get_input_embeddings)
+    _PATCHED_ARCHES.add("muse_glimmer")
+
+
+def _install_minimax_m3_vl_compile_patches():
+    """Install compile-safe minimax_m3_vl vision and merge patches.
+
+    Every host read of the grid runs through `_segment_grid_thw`, the encoder
+    splits on cumulative lengths it reads back, and the merge compares its
+    placeholder count with the feature size on the host.
+    """
+
+    module = _try_import_module("mlx_vlm.models.minimax_m3_vl.minimax_m3_vl")
+    vision_module = _try_import_module("mlx_vlm.models.minimax_m3_vl.vision")
+    if module is None or vision_module is None:
+        return
+
+    def patched_segment_grid_thw(self, grid_thw):
+        max_frames = self.config.vision_segment_max_frames
+        segments = []
+        for t, h, w in _grid_to_tuple(grid_thw):
+            if max_frames is None or t <= max_frames:
+                segments.append((t, h, w))
+                continue
+            for start in range(0, t, max_frames):
+                segments.append((min(max_frames, t - start), h, w))
+        return segments
+
+    def patched_transformer_call(
+        self, pixel_values, grid_thw, output_hidden_states=False
+    ):
+        import mlx.core as mx
+
+        hidden_states = self.embeddings(pixel_values).reshape(
+            -1, self.config.hidden_size
+        )
+        hidden_states = self.pre_layrnorm(hidden_states)
+        rotary_pos_emb = self._rotary_pos_emb(grid_thw)
+        rotary_pos_emb = (mx.cos(rotary_pos_emb), mx.sin(rotary_pos_emb))
+
+        seqlens = [t * h * w for t, h, w in self._segment_grid_thw(grid_thw)]
+        # A tuple instead of the upstream array: the attention below splits on
+        # these boundaries, which has to stay a host value under the tracer.
+        return self.encoder(
+            hidden_states,
+            tuple(accumulate(seqlens, initial=0)),
+            rotary_pos_emb,
+            output_hidden_states=output_hidden_states,
+        )
+
+    def patched_attention(self, hidden_states, cu_seqlens, rotary_pos_emb=None):
+        import mlx.core as mx
+
+        seq_length = hidden_states.shape[0]
+        q = self.q_proj(hidden_states).reshape(seq_length, self.num_heads, -1)
+        k = self.k_proj(hidden_states).reshape(seq_length, self.num_heads, -1)
+        v = self.v_proj(hidden_states).reshape(seq_length, self.num_heads, -1)
+
+        if rotary_pos_emb is not None:
+            q = vision_module._apply_vision_rope(
+                mx.expand_dims(q, axis=0), rotary_pos_emb
+            )[0]
+            k = vision_module._apply_vision_rope(
+                mx.expand_dims(k, axis=0), rotary_pos_emb
+            )[0]
+
+        q = q.transpose(1, 0, 2)[None]
+        k = k.transpose(1, 0, 2)[None]
+        v = v.transpose(1, 0, 2)[None]
+
+        split_points = _split_points(cu_seqlens)
+        if not split_points:
+            output = vision_module.ensure_fused_sdpa(q, k, v, self.scale)
+        else:
+            splits = [
+                mx.split(tensor, split_points, axis=2) for tensor in (q, k, v)
+            ]
+            outputs = [
+                vision_module.ensure_fused_sdpa(q_i, k_i, v_i, self.scale)
+                for q_i, k_i, v_i in zip(*splits)
+            ]
+            output = mx.concatenate(outputs, axis=2)
+        output = output[0].transpose(1, 0, 2).reshape(seq_length, -1)
+        return self.out_proj(output)
+
+    def patched_merge_visual_tokens(self, visual_features, grid_thw):
+        import mlx.core as mx
+
+        merge_size = self.config.vision_config.spatial_merge_size
+        feature_dim = visual_features.shape[-1]
+        outputs = []
+        offset = 0
+        for t, h, w in _grid_to_tuple(grid_thw):
+            length = t * h * w
+            features = visual_features[offset : offset + length]
+            offset += length
+            features = features.reshape(
+                t,
+                h // merge_size,
+                w // merge_size,
+                merge_size,
+                merge_size,
+                feature_dim,
+            )
+            features = features.reshape(-1, merge_size * merge_size * feature_dim)
+            outputs.append(self.patch_merge_mlp(features))
+        return mx.concatenate(outputs, axis=0)
+
+    def patched_merge_input_ids_with_visual_features(
+        inputs_embeds,
+        input_ids,
+        image_features=None,
+        video_features=None,
+        image_token_index=None,
+        video_token_index=None,
+    ):
+        import mlx.core as mx
+
+        visual_mask = mx.zeros(input_ids.shape, dtype=mx.bool_)
+        for features, token_index in (
+            (image_features, image_token_index),
+            (video_features, video_token_index),
+        ):
+            if features is None:
+                continue
+            special_mask = input_ids == token_index
+            _raise_on_feature_count_mismatch(special_mask, features, inputs_embeds)
+            inputs_embeds, _ = _merge_sequence_mask_features(
+                special_mask, features, inputs_embeds
+            )
+            visual_mask = visual_mask | special_mask
+        return inputs_embeds, visual_mask
+
+    _patch_method(
+        vision_module.MiniMaxVisionTransformer,
+        "_segment_grid_thw",
+        patched_segment_grid_thw,
+    )
+    _patch_method(
+        vision_module.MiniMaxVisionTransformer, "__call__", patched_transformer_call
+    )
+    _patch_method(vision_module.MiniMaxVisionAttention, "__call__", patched_attention)
+    _patch_method(module.Model, "_merge_visual_tokens", patched_merge_visual_tokens)
+    _patch_staticmethod(
+        module.Model,
+        "merge_input_ids_with_visual_features",
+        patched_merge_input_ids_with_visual_features,
+    )
+    _PATCHED_ARCHES.add("minimax_m3_vl")
+
+
 def _install_ernie4_5_moe_vl_compile_patches():
     """Install compile-safe ernie4_5_moe_vl vision, resampler and merge patches.
 
@@ -6375,6 +6754,33 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
             runtime_primitive_names=("phi4_multimodal_spans_runtime",),
         ),
         CompilePatternBundle(
+            name="dots_ocr_vision_compile",
+            description="dots_ocr vision grid-metadata and merge compile patch set.",
+            matcher=lambda arch, report: arch == "dots_ocr",
+            primitive_names=(
+                "vision_metadata_normalization",
+                "compile_safe_feature_merge",
+                "segmented_vision_attention",
+            ),
+            runtime_primitive_names=("dots_ocr_vision_compile_runtime",),
+        ),
+        CompilePatternBundle(
+            name="grid_metadata_vision_compile",
+            description="Vision grid-metadata compile patch set for towers that read the grid on the host.",
+            matcher=lambda arch, report: arch
+            in {"muse_glimmer", "minimax_m3_vl", "kimi_k3"},
+            primitive_names=(
+                "vision_metadata_normalization",
+                "compile_safe_feature_merge",
+                "segmented_vision_attention",
+            ),
+            runtime_primitive_names=(
+                "muse_glimmer_vision_compile_runtime",
+                "kimi_k3_vision_compile_runtime",
+                "minimax_m3_vl_vision_compile_runtime",
+            ),
+        ),
+        CompilePatternBundle(
             name="ernie4_5_moe_vl_vision_compile",
             description="ernie4_5_moe_vl vision, resampler and merge compile patch set.",
             matcher=lambda arch, report: arch == "ernie4_5_moe_vl",
@@ -6487,6 +6893,10 @@ def _runtime_patch_primitive_installers() -> dict[str, Callable[[], None]]:
         "negative_image_placeholders_runtime": _install_negative_image_placeholder_patches,
         "expanded_image_placeholders_runtime": _install_expanded_image_placeholder_patches,
         "phi4_multimodal_spans_runtime": _install_phi4_multimodal_patches,
+        "dots_ocr_vision_compile_runtime": _install_dots_ocr_compile_patches,
+        "kimi_k3_vision_compile_runtime": _install_kimi_k3_compile_patches,
+        "muse_glimmer_vision_compile_runtime": _install_muse_glimmer_compile_patches,
+        "minimax_m3_vl_vision_compile_runtime": _install_minimax_m3_vl_compile_patches,
         "ernie4_5_moe_vl_vision_compile_runtime": _install_ernie4_5_moe_vl_compile_patches,
         "glm_ocr_vision_compile_runtime": _install_glm_ocr_compile_patches,
         "paddleocr_vl_multimodal_runtime": _install_paddleocr_vl_compile_patches,
