@@ -954,12 +954,16 @@ def generation_mode(model, int8_prefill = None):
         _require_evaluable(model)()
         _GENERATION_MODE_DEPTH += 1
         entered = True
-        from .inference import (fused_decode_conv_silu, fused_moe_gate_up, fused_moe_routed_experts,
-                                fused_moe_router, fused_residual_norm, fused_residual_norm_handoff,
-                                nax_quantized_linear)
-        with fused_moe_gate_up(model), fused_decode_conv_silu(model), fused_residual_norm(model), \
-                fused_moe_router(model), fused_moe_routed_experts(model), nax_quantized_linear(model, int8_prefill), \
-                fused_residual_norm_handoff(model):
+        from .inference import (_fusion_modules, dense_prefill_linear, fused_decode_conv_silu, fused_moe_gate_up,
+                                fused_moe_routed_experts, fused_moe_router, fused_residual_norm,
+                                fused_residual_norm_handoff, nax_quantized_linear)
+        # The scopes replace classes and weight arrays, not the module graph.
+        modules = tuple(_fusion_modules(model, None))
+        with fused_moe_gate_up(model, _modules = modules), fused_decode_conv_silu(model, _modules = modules), \
+                fused_residual_norm(model, _modules = modules), fused_moe_router(model, _modules = modules), \
+                fused_moe_routed_experts(model, _modules = modules), nax_quantized_linear(model, int8_prefill, _modules = modules), \
+                dense_prefill_linear(model, _modules = modules), \
+                fused_residual_norm_handoff(model, _modules = modules):
             yield model
     except BaseException as exc:
         active_error = exc
@@ -2421,6 +2425,8 @@ class _VLMBatchAdapter:
         self.make_sampler = sample_utils.make_sampler
         self.sample_utils = sample_utils
         self.model = model
+        from .utils import _ensure_vlm_pad_token
+        _ensure_vlm_pad_token(processor)
         self.processor = processor
         self.defaults = defaults
         self.audio_warn_stacklevel = audio_warn_stacklevel
@@ -2962,6 +2968,70 @@ def generate_batch(
     return results
 
 
+# mlx-vlm flushes cache states every 50 steps and each flush idles the GPU for about a step; mlx-lm uses 256.
+_VLM_CACHE_EVAL_INTERVAL = 256
+
+
+class _VLMCacheMaterializer:
+
+    def __init__(self, generator):
+        self.generator = generator
+        self.pending = []
+        self.interval = self.restore = getattr(generator, "_cache_eval_interval", 0)
+        self.stream = getattr(generator, "stream", None)
+        if not (
+            isinstance(self.interval, int) and self.interval > 0
+            and isinstance(getattr(generator, "_steps_counter", None), int)
+            and hasattr(getattr(generator, "_generation_batch", None), "prompt_cache")
+            and self.stream is not None
+        ):
+            self.interval = 0
+        if self.interval:
+            generator._cache_eval_interval = 0
+            if "MLX_VLM_BATCH_CACHE_EVAL_INTERVAL" not in os.environ:
+                self.interval = max(self.interval, _VLM_CACHE_EVAL_INTERVAL)
+
+    def next(self):
+        if not self.interval:
+            return self.generator.next()
+        import mlx.core as mx
+        from mlx.utils import tree_flatten
+
+        self.drain()
+        before = self.generator._steps_counter
+        result = self.generator.next()
+        with mx.stream(self.stream):
+            step = self.generator._steps_counter
+            if step != before and step % self.interval == 0:
+                batch = self.generator._generation_batch
+                states = getattr(batch, "cache_states", None)
+                states = states() if callable(states) else [c.state for c in batch.prompt_cache]
+                # Cache lists and array handles can be updated in place on the next step.
+                self.pending = [copy.copy(value) for _, value in tree_flatten(states) if isinstance(value, mx.array)]
+                if self.pending:
+                    mx.async_eval(*self.pending)
+        return result
+
+    def drain(self):
+        if self.pending:
+            import mlx.core as mx
+            with mx.stream(self.stream):
+                # Complete the previous flush before releasing cached buffers.
+                mx.eval(*self.pending)
+                self.pending = []
+                mx.clear_cache()
+
+    def close(self):
+        try:
+            self.drain()
+        finally:
+            self.pending = []
+            if self.interval:
+                self.generator._cache_eval_interval = self.restore
+            self.generator = None
+            self.interval = 0
+
+
 class _VLMBatchSession:
     """One mlx-vlm ``BatchGenerator`` with its row set left open."""
 
@@ -2986,6 +3056,7 @@ class _VLMBatchSession:
         try:
             self._stack.enter_context(adapter._wired_limit())
             self.generator = self._open()
+            self._cache_materializer = _VLMCacheMaterializer(self.generator)
         except BaseException:
             self._stack.close()
             raise
@@ -3217,7 +3288,7 @@ class _VLMBatchSession:
                     "mlx-vlm ended its event stream before every request "
                     "reported a finish reason."
                 )
-            _, events = self.generator.next()
+            _, events = self._cache_materializer.next()
             if not events:
                 if self.adapter._admission_stalled(self.generator):
                     raise self.adapter._stall_error()
@@ -3260,8 +3331,11 @@ class _VLMBatchSession:
         self._parked.clear()
         closer = getattr(self.generator, "close", None)
         try:
-            if callable(closer):
-                closer()
+            try:
+                self._cache_materializer.close()
+            finally:
+                if callable(closer):
+                    closer()
         finally:
             self.sampler.bind_generator(None)
             self.sampler.release_all()
@@ -3512,6 +3586,8 @@ class BatchStream:
         session = self._require_open()
         validate = _validate_vlm_requests if self._is_vlm else _validate_text_requests
         (validated,) = validate([request], session.adapter.defaults)
+        from .utils import _validate_mlx_image_input
+        _validate_mlx_image_input(session.adapter.model, validated.image is not None)
         return session.add(validated)
 
     def cancel(self, row: int) -> bool:
@@ -3703,6 +3779,8 @@ def _stream_batch(
         if is_vlm
         else _validate_text_requests(requests, defaults)
     )
+    from .utils import _validate_mlx_image_input
+    _validate_mlx_image_input(model, any(request.image is not None for request in validated))
     if is_vlm and (gap := _vlm_quantized_cache_gap(model, defaults)) is not None:
         raise ValueError(gap)
     if any(request.prompt_cache_state is not None for request in validated):

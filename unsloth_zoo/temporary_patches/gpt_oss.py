@@ -1188,8 +1188,10 @@ class GptOssExpertsBnb4bit(nn.Module):
         )
 
     def _grouped_bnb4bit_ready(self):
-        """True when every expert is a plain (LoRA-free) bnb Linear4bit with a
-        populated quant_state, so the grouped torch._grouped_mm path is exact.
+        """True when every expert is a bnb Linear4bit with a populated quant_state,
+        either plain or wrapped by one supported PEFT LoRA adapter (see
+        gpt_oss_grouped_qlora.expert_lora_state), so the grouped torch._grouped_mm
+        path applies. Stores the LoRA state on self._unsloth_grouped_lora.
 
         Self-contained (local imports, no module globals): the compiler can copy
         this class's source into the standalone compiled cache, whose module
@@ -1202,144 +1204,105 @@ class GptOssExpertsBnb4bit(nn.Module):
         # eager per-expert loop, so honor that and fall back.
         if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1":
             return False
-        def _fail(reason):
-            if (
-                os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
-                and not getattr(self, "_unsloth_grouped_logged", False)
-            ):
-                self._unsloth_grouped_logged = True
-                import logging
-                logging.getLogger("unsloth_zoo.temporary_patches").info(
-                    f"Unsloth: gpt-oss grouped path disabled: {reason}"
-                )
-            return False
-        try:
-            import bitsandbytes as bnb
-            from bitsandbytes.nn import Params4bit
-            from unsloth_zoo.temporary_patches.moe_utils import _check_torch_grouped_mm_supported
-            if not _check_torch_grouped_mm_supported():
-                return _fail("torch._grouped_mm unsupported")
-            blocksize = None
-            for lin in list(self.gate_up_projs) + list(self.down_projs):
-                if hasattr(lin, "lora_A") or hasattr(lin, "base_layer"):
-                    return _fail(f"LoRA-wrapped expert {type(lin).__name__}")
-                w = getattr(lin, "weight", None)
-                if not (isinstance(w, Params4bit) and getattr(w, "quant_state", None) is not None):
-                    return _fail(f"expert weight {type(w).__name__} without quant_state")
-                if w.requires_grad:
-                    return _fail("expert weight requires_grad")
-                qs = w.quant_state
-                # The grouped dequant concatenates packed bytes + absmax across
-                # experts, which is exact only when every expert tiles into whole
-                # blocks of one shared blocksize; a trailing partial block would
-                # shift scaling onto the next expert.
-                numel = 1
-                for s in qs.shape:
-                    numel *= int(s)
-                if not qs.blocksize or numel % int(qs.blocksize) != 0:
-                    return _fail(f"expert numel {numel} not a multiple of blocksize {qs.blocksize}")
-                if blocksize is None:
-                    blocksize = int(qs.blocksize)
-                elif int(qs.blocksize) != blocksize:
-                    return _fail(f"mixed blocksizes {blocksize} vs {qs.blocksize}")
-                b = getattr(lin, "bias", None)
-                # Grouped path stacks per-expert biases, so a missing bias would
-                # break torch.stack; require all present and fall back otherwise.
-                if b is None:
-                    return _fail("expert bias is None")
-                if b.requires_grad:
-                    return _fail("expert bias requires_grad")
-        except Exception as e:
-            return _fail(f"{type(e).__name__}: {e}")
-        return True
+        # The full check costs ~0.6 ms per layer; reuse it while ready_signature is unchanged.
+        from unsloth_zoo.temporary_patches.gpt_oss_grouped_qlora import ready_signature
+        sig = ready_signature(self)
+        cached = getattr(self, "_unsloth_grouped_ready", None)
+        if sig is not None and cached is not None and cached[0] == sig:
+            self._unsloth_grouped_lora = cached[2]
+            return cached[1]
+        def _uncached():
+            def _fail(reason):
+                self._unsloth_grouped_lora = None
+                if (
+                    os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
+                    and not getattr(self, "_unsloth_grouped_logged", False)
+                ):
+                    self._unsloth_grouped_logged = True
+                    import logging
+                    logging.getLogger("unsloth_zoo.temporary_patches").info(
+                        f"Unsloth: gpt-oss grouped path disabled: {reason}"
+                    )
+                return False
+            try:
+                import bitsandbytes as bnb
+                from bitsandbytes.nn import Params4bit
+                from unsloth_zoo.temporary_patches.moe_utils import _check_torch_grouped_mm_supported
+                if not _check_torch_grouped_mm_supported():
+                    # fp16 experts run moe_grouped_fp16's Triton GEMMs, which need no torch._grouped_mm.
+                    from unsloth_zoo.temporary_patches.moe_grouped_fp16 import fp16_grouped_available
+                    first = getattr(self.gate_up_projs[0], "base_layer", self.gate_up_projs[0])
+                    if not fp16_grouped_available(first.weight.device):
+                        return _fail("torch._grouped_mm unsupported")
+                from unsloth_zoo.temporary_patches.gpt_oss_grouped_qlora import expert_lora_state
+                lora = expert_lora_state(self)
+                if isinstance(lora, str):
+                    return _fail(f"LoRA-wrapped experts: {lora}")
+                blocksize = fmt = None
+                proj_dtype = {}
+                for which, lin in [(0, m) for m in self.gate_up_projs] + [(1, m) for m in self.down_projs]:
+                    lin = getattr(lin, "base_layer", lin)
+                    w = getattr(lin, "weight", None)
+                    if not (isinstance(w, Params4bit) and getattr(w, "quant_state", None) is not None):
+                        return _fail(f"expert weight {type(w).__name__} without quant_state")
+                    if w.requires_grad:
+                        return _fail("expert weight requires_grad")
+                    qs = w.quant_state
+                    # Concatenating experts is exact only with whole blocks of one shared blocksize.
+                    numel = 1
+                    for s in qs.shape:
+                        numel *= int(s)
+                    if not qs.blocksize or numel % int(qs.blocksize) != 0:
+                        return _fail(f"expert numel {numel} not a multiple of blocksize {qs.blocksize}")
+                    if blocksize is None:
+                        blocksize, fmt = int(qs.blocksize), qs
+                    elif int(qs.blocksize) != blocksize:
+                        return _fail(f"mixed blocksizes {blocksize} vs {qs.blocksize}")
+                    # The bitsandbytes fallback decodes every expert with the first one's format.
+                    elif (
+                        qs.quant_type != fmt.quant_type
+                        or bool(getattr(qs, "nested", False)) != bool(getattr(fmt, "nested", False))
+                        or not (qs.code is fmt.code or torch.equal(qs.code, fmt.code))
+                    ):
+                        return _fail("mixed quantization formats across experts")
+                    # One dequant dtype per projection: on float16 the loader keeps down in fp32.
+                    if proj_dtype.setdefault(which, qs.dtype) != qs.dtype:
+                        return _fail("mixed quantization formats across experts")
+                    b = getattr(lin, "bias", None)
+                    # The grouped path stacks per-expert biases.
+                    if b is None:
+                        return _fail("expert bias is None")
+                    if b.requires_grad:
+                        return _fail("expert bias requires_grad")
+            except Exception as e:
+                return _fail(f"{type(e).__name__}: {e}")
+            self._unsloth_grouped_lora = lora
+            return True
+
+        verdict = _uncached()
+        if sig is not None:
+            self._unsloth_grouped_ready = (sig, verdict, getattr(self, "_unsloth_grouped_lora", None))
+        return verdict
 
     def _forward_grouped_bnb4bit(self, hidden_states, router_indices, routing_weights,
                                  batch_size, num_tokens, num_experts, top_k):
-        """Grouped equivalent of the per-expert loop: one gather, two grouped_mm
-        calls over dequantized stacks (pinned or rebuilt in backward per the adaptive
-        _moe_recompute_default policy), grouped bias adds, fp32 index_add combine.
+        """Grouped equivalent of the per-expert loop (gpt_oss_grouped_qlora): one gather,
+        one stacked NF4 dequant + torch._grouped_mm per projection (rebuilt in backward
+        per _moe_recompute_default), the LoRA adapter as grouped_mm over the stacked
+        per-expert A / B, fp32 index_add combine. fp16 experts (fp32 down under the
+        loader's rule) take Triton grouped GEMMs with the loop's per-projection dtypes.
+        None (the caller keeps the per-expert loop) when no grouped path matches.
 
         Self-contained (local imports, no module globals) for the standalone
         compiled cache; see _grouped_bnb4bit_ready."""
-        import bitsandbytes as bnb
-        from unsloth_zoo.temporary_patches.moe_utils import _base_grouped_mm, _moe_recompute_default
-        from unsloth_zoo.temporary_patches.gpt_oss import swiglu_torch_forward
-
-        device = hidden_states.device
-        with torch.no_grad():
-            flat_experts = router_indices.flatten()
-            token_ids = torch.arange(num_tokens, device=device).repeat_interleave(top_k)
-            sorted_idx = flat_experts.argsort(stable=True)
-            sorted_tokens = token_ids[sorted_idx]
-            sorted_experts = flat_experts[sorted_idx]
-            from unsloth_zoo.temporary_patches.moe_utils import count_tokens_per_expert
-            counts = count_tokens_per_expert(flat_experts, num_experts, torch.int64)
-            offsets = counts.cumsum(0, dtype=torch.int32)
-            # repeat_interleave(arange(E), counts) D2H-syncs for its output size, and
-            # is by construction sorted_experts already.
-            expert_ids = sorted_experts
-
-        recompute = _moe_recompute_default()
-
-        cached = getattr(self, "_unsloth_grouped_qs", None)
-        if cached is None:
-            # One QuantState spanning all experts (packed NF4 is elementwise row-major,
-            # so per-expert byte + fp32 absmax concat is exact): one dequant launch per stack.
-            from bitsandbytes.functional import QuantState
-
-            def _absmax_fp32(qs):
-                # Materialize a QuantState's absmax as flat fp32 (denesting double-quant).
-                if getattr(qs, "nested", False):
-                    absmax = bnb.functional.dequantize_blockwise(qs.absmax, qs.state2)
-                    return (absmax + qs.offset).float()
-                return qs.absmax.float()
-
-            def build_qs(projs):
-                states = [l.weight.quant_state for l in projs]
-                absmax = torch.cat([_absmax_fp32(qs) for qs in states])
-                q0 = states[0]
-                return QuantState(
-                    absmax=absmax,
-                    shape=torch.Size((len(projs),) + tuple(q0.shape)),
-                    code=q0.code,
-                    blocksize=q0.blocksize,
-                    quant_type=q0.quant_type,
-                    dtype=q0.dtype,
-                )
-
-            cached = (
-                build_qs(self.gate_up_projs),
-                build_qs(self.down_projs),
-                torch.stack([l.bias for l in self.gate_up_projs]),  # (E, 2I)
-                torch.stack([l.bias for l in self.down_projs]),     # (E, H)
-            )
-            self._unsloth_grouped_qs = cached
-        gate_up_qs, down_qs, gate_up_bias, down_bias = cached
-
-        def _stack(projs, quant_state):
-            # One fused dequant gives (E, out, in); grouped_mm takes the transposed
-            # view. Cast to the input dtype (a no-op for the usual bf16-on-bf16
-            # case): torch._grouped_mm rejects mismatched dtypes, e.g. fp32 hidden
-            # states under the forced-float32 path against a bf16 quant state.
-            data = torch.cat([l.weight.data.reshape(-1, 1) for l in projs])
-            deq = bnb.functional.dequantize_4bit(data, quant_state)
-            return deq.to(hidden_states.dtype).transpose(1, 2)
-
-        xg = hidden_states[sorted_tokens]
-        gate_up = _base_grouped_mm(
-            xg, offsets, lambda: _stack(self.gate_up_projs, gate_up_qs), recompute)
-        gate_up = gate_up + gate_up_bias[expert_ids]
-        gated = swiglu_torch_forward(gate_up, self.alpha, self.limit)
-        out = _base_grouped_mm(
-            gated, offsets, lambda: _stack(self.down_projs, down_qs), recompute)
-        out = out + down_bias[expert_ids]
-
-        weighted = out.to(torch.float32) * routing_weights[sorted_tokens, sorted_experts, None].to(torch.float32)
-        next_states = torch.zeros(num_tokens, self.hidden_size, dtype=torch.float32, device=device)
-        next_states.index_add_(0, sorted_tokens, weighted)
-        # Grouped path only runs in training; mirror torch_native_forward's
-        # training branch, which returns fp32 (fp16 NaN protection).
-        return next_states.view(batch_size, -1, self.hidden_size).to(torch.float32)
+        from unsloth_zoo.temporary_patches.gpt_oss_grouped_qlora import grouped_qlora_forward
+        lora = getattr(self, "_unsloth_grouped_lora", None)
+        if hidden_states.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+            return None
+        return grouped_qlora_forward(
+            self, hidden_states, router_indices, routing_weights,
+            batch_size, num_tokens, num_experts, top_k, lora = lora,
+        )
 
     def forward(self, hidden_states: torch.Tensor, router_indices=None, routing_weights=None) -> torch.Tensor:
         batch_size = hidden_states.shape[0]
@@ -1348,19 +1311,28 @@ class GptOssExpertsBnb4bit(nn.Module):
         num_experts = routing_weights.shape[1]
         top_k = router_indices.shape[1]
 
-        # fp16 keeps the loop path, whose fp32 swiglu + autocast-disabled down
-        # projection protect against fp16 overflow; grouped runs in model dtype.
+        # fp16 experts take the grouped path too: it keeps the loop's fp32 swiglu and
+        # fp32 down output (gpt_oss_grouped_qlora.compute_mode decides per call).
         if (
             self.training
-            and hidden_states.dtype is not torch.float16
             and self._grouped_bnb4bit_ready()
         ):
             try:
-                return self._forward_grouped_bnb4bit(
+                grouped = self._forward_grouped_bnb4bit(
                     hidden_states, router_indices, routing_weights,
                     batch_size, num_tokens, num_experts, top_k,
                 )
-            except Exception:
+                if grouped is not None:
+                    return grouped
+            except Exception as exc:
+                # Checkpoint early-stop is control flow; an OOM should surface, not retry the loop.
+                from torch.utils import checkpoint as _ckpt
+                control = tuple(
+                    c for c in (getattr(_ckpt, "_StopRecomputationError", None), getattr(_ckpt, "CheckpointError", None))
+                    if c is not None
+                )
+                if isinstance(exc, control) or isinstance(exc, torch.OutOfMemoryError):
+                    raise
                 import os as _os
                 if _os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
                     import traceback; traceback.print_exc()
@@ -2863,6 +2835,33 @@ def should_dequantize_mxfp4():
     return False  # Keep MXFP4 quantized
 
 
+@torch.compiler.disable
+def _try_grouped_bnb4bit(self, hidden_states, router_indices, routing_weights,
+                         batch_size, num_tokens, num_experts, top_k):
+    """The grouped bnb-4bit training forward, or None for the per-expert loop. One opaque
+    call, so a compiled decoder layer (and its gradient-checkpoint replay) takes a single
+    graph break here instead of tracing the readiness checks."""
+    if not self._grouped_bnb4bit_ready():
+        return None
+    try:
+        return self._forward_grouped_bnb4bit(
+            hidden_states, router_indices, routing_weights,
+            batch_size, num_tokens, num_experts, top_k,
+        )
+    except Exception as exc:
+        # Checkpoint early-stop is control flow; an OOM should surface, not retry the loop.
+        from torch.utils import checkpoint as _ckpt
+        control = tuple(
+            c for c in (getattr(_ckpt, "_StopRecomputationError", None), getattr(_ckpt, "CheckpointError", None))
+            if c is not None
+        )
+        if isinstance(exc, control) or isinstance(exc, torch.OutOfMemoryError):
+            raise
+        if UNSLOTH_ENABLE_LOGGING:
+            import traceback; traceback.print_exc()
+        return None  # fall through to the per-expert loop
+
+
 def torch_native_forward(
     self,
     hidden_states: torch.Tensor,
@@ -2878,23 +2877,17 @@ def torch_native_forward(
 
     # Grouped bnb-4bit fast path. The class dispatches this module-level
     # function (forward is rebound below), so the gate must live here too.
-    # fp16 keeps the loop path below, whose fp32 swiglu + autocast-disabled
-    # down projection protect against fp16 overflow.
+    # fp16 experts keep the loop's fp32 swiglu and fp32 down output there.
     if (
         self.training
-        and hidden_states.dtype is not torch.float16
         and hasattr(self, "_grouped_bnb4bit_ready")
-        and self._grouped_bnb4bit_ready()
     ):
-        try:
-            return self._forward_grouped_bnb4bit(
-                hidden_states, router_indices, routing_weights,
-                batch_size, num_tokens, num_experts, top_k,
-            )
-        except Exception:
-            if UNSLOTH_ENABLE_LOGGING:
-                import traceback; traceback.print_exc()
-            # fall through to the per-expert loop
+        grouped = _try_grouped_bnb4bit(
+            self, hidden_states, router_indices, routing_weights,
+            batch_size, num_tokens, num_experts, top_k,
+        )
+        if grouped is not None:
+            return grouped
 
     if self.training:
         with torch.no_grad():

@@ -2106,7 +2106,14 @@ def test_vlm_planned_vs_unplanned_training_parity(monkeypatch, tmp_path):
         def __call__(self, inputs, pixel_values=None, mask=None, **_kwargs):
             return self.proj(self.embed(inputs))
 
+    from transformers import TrainerCallback
+
     seen_widths = []
+
+    class TrainingWidths(TrainerCallback):
+        def on_train_begin(self, args, state, control, **kwargs):
+            seen_widths.clear()
+
     original_call = TinyVLM.__call__
 
     def recording_call(self, inputs, *args, **kwargs):
@@ -2158,6 +2165,7 @@ def test_vlm_planned_vs_unplanned_training_parity(monkeypatch, tmp_path):
         trainer._is_vlm = True
         trainer.processor = _Proc()
         trainer._batches = plan
+        trainer.add_callback(TrainingWidths())
         if planned:
             enabled_decision = types.SimpleNamespace(
                 should_raise=False, enabled=True, arch="tiny",
@@ -3043,3 +3051,47 @@ def test_gemma4_unified_sort_key_never_ties(counts):
     rows = valid.shape[0] * valid.shape[1]
     keys = sorted(_valid_first_sort_key(valid.reshape(rows), rows).tolist())
     assert len(set(keys)) == rows, f"tied keys: {keys}"
+
+
+@metal_only
+@pytest.mark.parametrize("use_cce", [False, True])
+def test_self_routed_vlm_merges_images_inside_loss(use_cce):
+    from types import SimpleNamespace
+
+    class GenerationWrapper(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(16, 8)
+            self.vision = nn.Linear(3, 8, bias=False)
+            self.head = nn.Linear(8, 16, bias=False)
+
+        @property
+        def language_model(self):
+            return self
+
+        def get_input_embeddings(self, ids, pixels, mask=None, **kwargs):
+            h = self.embed(ids)
+            if pixels is not None:
+                h = h + self.vision(pixels)[:, None] * kwargs["image_scale"]
+            return SimpleNamespace(inputs_embeds=h)
+
+        def __call__(self, ids, inputs_embeds=None, **kwargs):
+            h = self.embed(ids) if inputs_embeds is None else inputs_embeds
+            return self.head(h)
+
+    mx.random.seed(12)
+    model = GenerationWrapper()
+    factory = mlx_utils.make_vlm_cce_loss_fn if use_cce else mlx_utils.make_vlm_baseline_loss_fn
+    loss = factory(model)
+    for pixels in ([[1., 2., 3.], [3., -2., 1.]], [[-1., 0., 2.], [2., 1., -3.]]):
+        batch = dict(input_ids=mx.array([[1, 2, 3], [4, 5, 6]]),
+                     pixel_values=mx.array(pixels), image_scale=mx.array(0.7))
+        def reference(m, b):
+            embeds = m.get_input_embeddings(b["input_ids"], b["pixel_values"], image_scale=b["image_scale"])
+            logits = m(b["input_ids"], inputs_embeds=embeds.inputs_embeds)
+            return nn.losses.cross_entropy(logits[:, :-1], b["input_ids"][:, 1:]).mean()
+        expected, expected_grad = nn.value_and_grad(model, reference)(model, batch)
+        (actual, _), grad = nn.value_and_grad(model, loss)(model, batch)
+        assert float(mx.abs(grad["vision"]["weight"]).max()) > 0
+        assert mx.array_equal(actual, expected).item()
+        assert mx.array_equal(grad["vision"]["weight"], expected_grad["vision"]["weight"]).item()

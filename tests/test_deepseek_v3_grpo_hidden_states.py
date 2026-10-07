@@ -19,14 +19,14 @@
 import pytest
 import torch
 
+# Runs on every transformers with DeepseekV3: the wrapper must not depend on DeepseekV3NaiveMoe (absent on 4.x and >= 5.13).
 modeling = pytest.importorskip("transformers.models.deepseek_v3.modeling_deepseek_v3")
-if not hasattr(modeling, "DeepseekV3NaiveMoe"):
-    pytest.skip("this transformers has no DeepseekV3NaiveMoe, so the patch does not apply", allow_module_level = True)
 
 
 def test_return_hidden_states_gives_hidden_states(monkeypatch):
     from unsloth_zoo.temporary_patches.deepseek_v3_moe import patch_deepseek_v3
     patch_deepseek_v3()
+    assert modeling.DeepseekV3ForCausalLM.__UNSLOTH_SUPPORTS_RETURN_HIDDEN_STATES__ is True
     config = modeling.DeepseekV3Config(
         vocab_size = 64, hidden_size = 16, intermediate_size = 32, moe_intermediate_size = 8,
         num_hidden_layers = 2, num_attention_heads = 2, num_key_value_heads = 2, first_k_dense_replace = 0,

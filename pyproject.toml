@@ -78,6 +78,9 @@ dependencies = [
     "msgspec",
     "typing_extensions",
     "filelock",
+    # Imported at module level by llama_cpp, rl_environments and vision_utils. It used to arrive
+    # through datasets, which dropped it in 5.x.
+    "requests",
 ]
 
 [tool.setuptools.dynamic]
@@ -127,6 +130,9 @@ core = [
     "msgspec",
     "typing_extensions",
     "filelock",
+    # Imported at module level by llama_cpp, rl_environments and vision_utils. It used to arrive
+    # through datasets, which dropped it in 5.x.
+    "requests",
 ]
 huggingface = [
     "unsloth_zoo[core]",

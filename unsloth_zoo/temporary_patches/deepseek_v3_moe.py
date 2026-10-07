@@ -46,7 +46,13 @@ from .moe_utils import (
 )
 
 def patch_deepseek_v3():
-    """Patch DeepSeekV3 MoE to support Split LoRA via grouped GEMM."""
+    """Patch DeepSeekV3 MoE to support Split LoRA via grouped GEMM, and the CausalLM forward for GRPO."""
+    _patch_deepseek_v3_naive_moe()
+    # Independent of the MoE classes: transformers 4.x and >= 5.13 have no DeepseekV3NaiveMoe.
+    return _patch_deepseek_v3_causal_lm_forward()
+
+
+def _patch_deepseek_v3_naive_moe():
     # This Unsloth Zoo code section is licensed under AGPL3
 
     try:
@@ -108,15 +114,27 @@ def patch_deepseek_v3():
     if UNSLOTH_ENABLE_LOGGING:
         logger.info("Unsloth: Patched DeepSeekV3 MoE for Split LoRA support.")
 
+
+def _patch_deepseek_v3_causal_lm_forward():
     # Patch DeepseekV3ForCausalLM.forward for GRPO: return hidden_states instead
     # of logits when UNSLOTH_RETURN_HIDDEN_STATES=1.
     try:
-        from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
-            DeepseekV3ForCausalLM,
-            CausalLMOutputWithPast,
+        from transformers.models.deepseek_v3 import modeling_deepseek_v3
+        from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3ForCausalLM
+
+        # transformers 5.19 returns MoeCausalLMOutputWithPast and no longer imports
+        # CausalLMOutputWithPast into this module; earlier versions only have the latter.
+        _output_class = getattr(modeling_deepseek_v3, "MoeCausalLMOutputWithPast", None) or getattr(
+            modeling_deepseek_v3, "CausalLMOutputWithPast", None
         )
+        if _output_class is None:
+            from transformers.modeling_outputs import CausalLMOutputWithPast as _output_class
+        _output_has_router_logits = "router_logits" in getattr(_output_class, "__dataclass_fields__", {})
 
         _original_causal_lm_forward = DeepseekV3ForCausalLM.forward
+        # Temporary patches run at init, pre_compile and post_compile: wrap each class once.
+        if getattr(_original_causal_lm_forward, "_unsloth_hidden_states_wrapper", False):
+            return True
 
         def _patched_causal_lm_forward(
             self,
@@ -172,18 +190,27 @@ def patch_deepseek_v3():
                 hidden_states = hidden_states[:, slice_indices, :]
 
             # Return hidden_states as "logits" for GRPO
-            return CausalLMOutputWithPast(
+            extra = {}
+            if _output_has_router_logits:
+                extra["router_logits"] = getattr(outputs, "router_logits", None)
+            return _output_class(
                 loss=None,
                 logits=hidden_states,
                 past_key_values=outputs.past_key_values,
                 hidden_states=outputs.hidden_states,
                 attentions=outputs.attentions,
+                **extra,
             )
 
         # Preserve __qualname__ so _unsloth_get_batch_samples can detect
         # this is a CausalLM forward and compute num_items_in_batch properly.
         _patched_causal_lm_forward.__qualname__ = _original_causal_lm_forward.__qualname__
+        # Lets the compiler read (and fuse the loss of) the real forward, as with functools.wraps.
+        _patched_causal_lm_forward.__wrapped__ = _original_causal_lm_forward
+        _patched_causal_lm_forward._unsloth_hidden_states_wrapper = True
         DeepseekV3ForCausalLM.forward = _patched_causal_lm_forward
+        # unsloth's GRPO reads this marker and skips its output_hidden_states fallback, which keeps every layer's hidden states.
+        DeepseekV3ForCausalLM.__UNSLOTH_SUPPORTS_RETURN_HIDDEN_STATES__ = True
         patch_function(DeepseekV3ForCausalLM, "forward", _patched_causal_lm_forward)
 
         if UNSLOTH_ENABLE_LOGGING:

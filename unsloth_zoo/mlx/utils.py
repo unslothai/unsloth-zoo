@@ -2914,7 +2914,7 @@ def _finalize_vlm_batch(staged, keep_raw_carrier=False, phase=None):
         )
     if staged.pc_opaque is not None:
         (prompt_inputs, completion_inputs, flush_side, pad_id, max_seq_length,
-         completion_only_loss) = staged.pc_opaque
+         completion_only_loss, image_token_ids, image_context_limit) = staged.pc_opaque
         audio_counts, audio_soft_ids, audio_budget = (
             staged.pc_audio or (None, None, None)
         )
@@ -2923,6 +2923,8 @@ def _finalize_vlm_batch(staged, keep_raw_carrier=False, phase=None):
             max_seq_length,
             ignore_token_ids=staged.ignore_token_ids,
             completion_only_loss=completion_only_loss,
+            image_token_ids=image_token_ids,
+            image_context_limit=image_context_limit,
             audio_counts=audio_counts, audio_soft_ids=audio_soft_ids,
             audio_budget=audio_budget,
         )
@@ -3120,7 +3122,9 @@ def make_vlm_baseline_loss_fn(model=None, assistant_token_id=0,
         # already merges and rescales itself; do the same here so
         # use_cce={True,False} stay in parity instead of differing by that.
         scaled_embeds = None
-        if _vlm_embed_scale(model) is not None:
+        # Self-routed generation wrappers consume premerged embeddings, not pixels.
+        if (_vlm_embed_scale(model) is not None
+                or getattr(model, "language_model", None) is model):
             embed_result = model.get_input_embeddings(
                 inputs,
                 pixel_values,
@@ -4127,6 +4131,12 @@ def _finalize_vlm_batch_width(
     if not padable:
         return batch_dict
     target_width = operator.index(target_width)
+    context_limit = batch_dict.get("_unsloth_image_context_limit")
+    if context_limit is not None and target_width > context_limit:
+        raise ValueError(
+            f"Unsloth MLX: padded image batch width {target_width} exceeds "
+            f"the model context limit {context_limit}."
+        )
     if target_width < width:
         raise ValueError(
             f"Unsloth MLX: VLM width plan endpoint {target_width} is below "
@@ -4383,6 +4393,12 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
                 else:
                     batch_dict["input_ids"], batch_dict["attention_mask"] = _expanded
 
+    context_limit = batch_dict.get("_unsloth_image_context_limit")
+    if context_limit is not None and batch_dict["input_ids"].shape[1] > context_limit:
+        raise ValueError(
+            f"Unsloth MLX: expanded image batch width {batch_dict['input_ids'].shape[1]} "
+            f"exceeds the model context limit {context_limit}."
+        )
     return batch_dict
 
 
@@ -4707,6 +4723,9 @@ def _has_chat_template(obj):
 def _get_processor_tokenizer(processor):
     if processor is None:
         return None
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is not processor and callable(tokenizer):
+        return tokenizer
     # HF fast tokenizers expose the public API directly while their _tokenizer
     # is the low-level Rust backend (no convert_tokens_to_ids / chat_template /
     # apply_chat_template). Only unwrap _tokenizer for wrappers that do not
@@ -5366,6 +5385,7 @@ def render_mlx_chat_example(
     allow_raw_text=True,
 ):
     """Render one text/chat training example for MLX text or VLM pipelines."""
+    _validate_mlx_training_row(target, item)
     if item is None:
         return None
     if isinstance(item, str):
@@ -5886,6 +5906,7 @@ def _prepare_labeled_text_dataset(
             isinstance(source, list) and not _looks_like_mlx_chat_messages(source)
         ) else [source]
         for row in sources:
+            _validate_mlx_image_input(tokenizer, _row_has_images(row))
             tokenized = _tokenize_mlx_prompt_completion_row(
                 tokenizer,
                 row,
@@ -6034,6 +6055,7 @@ def _tokenize_mlx_pretokenized_row(
 def _prepare_pretokenized_text_dataset(
     dataset,
     *,
+    tokenizer=None,
     completion_only_loss=None,
     assistant_only_loss=False,
 ):
@@ -6047,6 +6069,7 @@ def _prepare_pretokenized_text_dataset(
     saw_other = False
     label_states = []
     for item in dataset:
+        _validate_mlx_image_input(tokenizer, _row_has_images(item))
         sources = item if (
             isinstance(item, list) and not _looks_like_mlx_chat_messages(item)
         ) else [item]
@@ -7766,11 +7789,13 @@ def _format_vlm_row_gating_audio(row, formatting_func, processor):
     Callers that format here go on to collate with no formatter, so the
     collation gate would have nothing left to refuse.
     """
-    if formatting_func is None:
-        return row
-    if _raw_row_has_audio(row):
-        _check_audio_family_gate(processor)
-    return formatting_func(row)
+    _validate_mlx_image_input(processor, _row_has_images(row))
+    if formatting_func is not None:
+        if _raw_row_has_audio(row):
+            _check_audio_family_gate(processor)
+        row = formatting_func(row)
+    _validate_mlx_training_row(processor, row)
+    return row
 
 
 def _extract_vlm_audio(item, messages, processor):
@@ -8776,7 +8801,8 @@ def bind_legacy_image_processor(model, processor):
     model._unsloth_legacy_image_token_count = count
 
 
-def legacy_image_inputs(processor, texts, all_images, max_seq_length, truncation=True):
+def legacy_image_inputs(processor, texts, all_images, max_seq_length, truncation=True,
+                        image_context_limit=None):
     from mlx_vlm.models.base import BaseImageProcessor
     if hasattr(processor, "tokenizer") or not isinstance(getattr(processor, "image_processor", None), BaseImageProcessor) or not any(all_images):
         return None
@@ -8801,6 +8827,14 @@ def legacy_image_inputs(processor, texts, all_images, max_seq_length, truncation
     if truncation and max_seq_length and ids.shape[1] > max_seq_length:
         side = getattr(processor, "truncation_side", "right")
         columns = slice(-max_seq_length, None) if side == "left" else slice(0, max_seq_length)
+        required = _image_span_expansion_required(
+            {"input_ids": ids, "attention_mask": mask},
+            {"input_ids": ids[:, columns], "attention_mask": mask[:, columns]},
+            [token_id], max_seq_length, image_context_limit, side=side,
+        )
+        if required:
+            inputs["_unsloth_image_context_limit"] = image_context_limit
+            columns = slice(-required, None) if side == "left" else slice(0, required)
         ids, mask = ids[:, columns], mask[:, columns]
     inputs["input_ids"], inputs["attention_mask"] = ids, mask
     inputs[_LEGACY_IMAGE_SPEC] = (token_id, count)
@@ -8829,7 +8863,46 @@ def _ensure_vlm_pad_token(processor):
         eos = getattr(tokenizer, "eos_token", None)
         if eos is not None:
             tokenizer.pad_token = eos
+        elif callable(getattr(tokenizer, "convert_ids_to_tokens", None)):
+            # Reuse an in-vocabulary id; masks distinguish padding from real tokens.
+            token = tokenizer.convert_ids_to_tokens(0)
+            if token is not None:
+                tokenizer.pad_token = token
     return tokenizer
+
+
+def _validate_mlx_image_input(target, has_images):
+    if has_images and getattr(target, "_unsloth_supports_images", None) is False:
+        name = getattr(target, "_unsloth_modality_model_type", type(target).__name__)
+        raise ValueError(
+            f"Unsloth MLX: `{name}` has no vision path; image and video inputs are not supported."
+        )
+
+
+def _row_has_images(item):
+    if isinstance(item, (list, tuple)):
+        return any(_row_has_images(part) for part in item)
+    if not isinstance(item, dict):
+        return False
+    if item.get("type") in ("image", "image_url", "input_image",
+                            "video", "video_url", "input_video"):
+        return True
+    for key in ("image", "images", "image_url", "input_image", "pixel_values",
+                "video", "videos", "video_url", "input_video", "pixel_values_videos"):
+        value = item.get(key)
+        if value is not None and not (isinstance(value, (list, tuple)) and not value):
+            return True
+    return any(_row_has_images(item.get(key)) for key in (
+        "messages", "conversations", "content", "prompt", "completion", "text",
+    ))
+
+
+def _validate_mlx_training_row(target, item):
+    has_images = _row_has_images(item)
+    _validate_mlx_image_input(target, has_images)
+    error = getattr(target, "_unsloth_text_training_error", None)
+    if error and not has_images and not _raw_row_has_audio(item):
+        raise ValueError(error)
 
 
 def _processor_vlm_inputs(
@@ -8841,8 +8914,12 @@ def _processor_vlm_inputs(
     truncation=True,
     padding_side=None,
     all_audio=None,
+    image_context_limit=None,
 ):
-    legacy = legacy_image_inputs(processor, texts, all_images, max_seq_length, truncation)
+    _validate_mlx_image_input(processor, any(all_images))
+    legacy = legacy_image_inputs(
+        processor, texts, all_images, max_seq_length, truncation, image_context_limit,
+    )
     if legacy is not None:
         return legacy
     tokenizer = _ensure_vlm_pad_token(processor)
@@ -9220,6 +9297,67 @@ def _truncate_vlm_arrays_by_side(input_ids, attention_mask, side, max_seq_length
     )
 
 
+def _image_truncation_token_ids(processor, ignore_token_ids):
+    ids = list(_get_vlm_ignore_token_ids(processor) or ())
+    for token_id in ignore_token_ids or ():
+        _append_unique_int(ids, token_id)
+    for source in (processor, _get_processor_tokenizer(processor)):
+        for key in ("image_token_ids", "image_token_id", "image_token_index"):
+            _append_unique_int(ids, getattr(source, key, None))
+    return ids
+
+
+def _vlm_image_context_limit(config):
+    limits = []
+    for source in (config, _config_get(config, "text_config", None)):
+        for key in ("max_position_embeddings", "max_sequence_length", "max_seq_len"):
+            value = _config_get(source, key, None)
+            if isinstance(value, int) and 0 < value < 2**31:
+                limits.append(value)
+    return min(limits) if limits else None
+
+
+def _image_span_expansion_required(full_inputs, inputs, token_ids, max_seq_length,
+                                   context_limit=None, side="right"):
+    full_ids = _as_numpy_vlm_field(full_inputs, "input_ids")
+    ids = _as_numpy_vlm_field(inputs, "input_ids")
+    full_mask = (np.ones_like(full_ids) if full_inputs.get("attention_mask") is None
+                 else _as_numpy_vlm_field(full_inputs, "attention_mask"))
+    mask = (np.ones_like(ids) if inputs.get("attention_mask") is None
+            else _as_numpy_vlm_field(inputs, "attention_mask"))
+    lost = []
+    required = 0
+    for index, (full_row, row) in enumerate(zip(full_ids, ids)):
+        valid = np.flatnonzero(full_mask[index])
+        full_row = full_row[full_mask[index].astype(bool)]
+        row = row[mask[index].astype(bool)]
+        expected = full_row[np.isin(full_row, token_ids or ()) | (full_row < 0)]
+        retained = row[np.isin(row, token_ids or ()) | (row < 0)]
+        if not np.array_equal(expected, retained):
+            lost.append(index)
+            # Columns the row spans from the kept edge, not the batch width.
+            if valid.size:
+                required = max(required, int(
+                    full_ids.shape[1] - valid[0] if side == "left" else valid[-1] + 1))
+    if not lost:
+        return 0
+    if context_limit is None or required > context_limit:
+        raise ValueError(
+            f"Unsloth MLX: max_seq_length={max_seq_length} truncates an image "
+            f"span in batch row {lost[0]}. Set max_seq_length>={required} to "
+            f"retain the complete row; automatic expansion requires a known "
+            f"model context limit >= {required} (got {context_limit})."
+        )
+    import warnings
+    warnings.warn(
+        f"Unsloth MLX: preserving complete image spans in {len(lost)} row(s) "
+        f"by expanding this batch from max_seq_length={max_seq_length} to "
+        f"{required} tokens (model context limit {context_limit}).",
+        stacklevel=3,
+    )
+    return required
+
+
 def _collate_vlm_prompt_completion_batch(
     items,
     processor,
@@ -9228,6 +9366,7 @@ def _collate_vlm_prompt_completion_batch(
     ignore_token_ids=None,
     completion_only_loss=None,
     reject_mlx_valued=False,
+    image_context_limit=None,
 ):
     prompt_texts = []
     completion_texts = []
@@ -9318,6 +9457,7 @@ def _collate_vlm_prompt_completion_batch(
     audio_soft_ids = (
         _get_vlm_audio_soft_token_ids(processor) if any(audio_counts) else None
     )
+    image_token_ids = _image_truncation_token_ids(processor, ignore_token_ids)
     completion_inputs = _processor_vlm_inputs(
         processor,
         completion_texts,
@@ -9343,13 +9483,15 @@ def _collate_vlm_prompt_completion_batch(
             None, None, host_valued=False,
             ignore_token_ids=ignore_token_ids,
             pc_opaque=(prompt_inputs, completion_inputs, flush_side, pad_id,
-                       max_seq_length, completion_only_loss),
+                       max_seq_length, completion_only_loss, image_token_ids, image_context_limit),
             pc_audio=(audio_counts, audio_soft_ids, audio_budget),
         )
     return _combine_vlm_prompt_completion_inputs(
         prompt_inputs, completion_inputs, flush_side, pad_id, max_seq_length,
         ignore_token_ids=ignore_token_ids,
         completion_only_loss=completion_only_loss,
+        image_token_ids=image_token_ids,
+        image_context_limit=image_context_limit,
         reject_mlx_valued=reject_mlx_valued,
         audio_counts=audio_counts, audio_soft_ids=audio_soft_ids,
         audio_budget=audio_budget,
@@ -9368,6 +9510,8 @@ def _combine_vlm_prompt_completion_inputs(
     audio_counts=None,
     audio_soft_ids=None,
     audio_budget=None,
+    image_token_ids=None,
+    image_context_limit=None,
 ):
     """Concatenate prompt/completion processor outputs into one staged batch.
 
@@ -9397,9 +9541,24 @@ def _combine_vlm_prompt_completion_inputs(
     input_ids, attention_mask, extras = _flush_vlm_arrays_to_side(
         input_ids, attention_mask, flush_side, pad_id, extras,
     )
+    full_inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
+    full_extras = extras
+    expanded = False
     input_ids, attention_mask, extras = _truncate_vlm_arrays_by_side(
         input_ids, attention_mask, flush_side, max_seq_length, extras,
     )
+    if any(prompt_inputs.get(key) is not None for key in ("pixel_values", "images")):
+        required = _image_span_expansion_required(
+            full_inputs, {"input_ids": input_ids, "attention_mask": attention_mask},
+            image_token_ids or ignore_token_ids, max_seq_length, image_context_limit,
+            side=flush_side,
+        )
+        expanded = bool(required)
+        if expanded:
+            input_ids, attention_mask, extras = _truncate_vlm_arrays_by_side(
+                full_inputs["input_ids"], full_inputs["attention_mask"], flush_side,
+                required, full_extras,
+            )
     # Truncation keeps CUDA's side; the rows still have to arrive right-padded.
     input_ids, attention_mask, extras = _flush_vlm_arrays_to_side(
         input_ids, attention_mask, "right", pad_id, extras,
@@ -9410,10 +9569,12 @@ def _combine_vlm_prompt_completion_inputs(
         # run per clip and only its length gives it away.
         _assert_audio_runs_intact_ids(
             input_ids, attention_mask, audio_counts, audio_soft_ids,
-            max_seq_length, budget=audio_budget,
+            input_ids.shape[1] if expanded else max_seq_length, budget=audio_budget,
         )
 
     combined_inputs = dict(prompt_inputs)
+    if expanded:
+        combined_inputs["_unsloth_image_context_limit"] = image_context_limit
     combined_inputs["input_ids"] = input_ids
     combined_inputs["attention_mask"] = attention_mask
     if token_type_key is not None:
@@ -9455,7 +9616,7 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
                        reject_mlx_valued=False,
                        formatting_func=None, ignore_token_ids=None,
                        completion_only_loss=None,
-                       return_prompt_completion=False):
+                       return_prompt_completion=False, image_context_limit=None):
     """Collate a batch of VLM samples using the processor directly.
 
     Mirrors Unsloth's GPU UnslothVisionDataCollator: extract images, resize
@@ -9474,12 +9635,14 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
                 break
     formatted_items = []
     for item in items:
+        _validate_mlx_image_input(processor, _row_has_images(item))
         if formatting_func is not None:
             formatted = formatting_func(item)
             if reject_mlx_valued and _contains_mlx_values(formatted):
                 # Formatters can introduce MLX values after the row scan.
                 _reject_mlx_valued_vlm("the formatting function")
             item = formatted
+        _validate_mlx_training_row(processor, item)
         formatted_items.append(item)
 
     if (
@@ -9493,6 +9656,7 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
             ignore_token_ids=ignore_token_ids,
             completion_only_loss=completion_only_loss,
             reject_mlx_valued=reject_mlx_valued,
+            image_context_limit=image_context_limit,
         )
         return (batch, True) if return_prompt_completion else batch
 
@@ -9533,12 +9697,35 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
             suffixes=all_suffixes,
             padding_side="right",
             all_audio=all_audio,
+            image_context_limit=image_context_limit,
         ),
         processor,
     )
+    if (any(all_images) and max_seq_length
+            and _as_numpy_vlm_field(inputs, "input_ids").shape[1] >= max_seq_length):
+        full_inputs = _right_pad_vlm_rows(_processor_vlm_inputs(
+            processor, all_texts, all_images, max_seq_length,
+            suffixes=all_suffixes, truncation=False, padding_side="right",
+            all_audio=all_audio,
+        ), processor)
+        required = _image_span_expansion_required(
+            full_inputs, inputs,
+            _image_truncation_token_ids(processor, ignore_token_ids), max_seq_length,
+            image_context_limit,
+        )
+        if required:
+            inputs = _right_pad_vlm_rows(_processor_vlm_inputs(
+                processor, all_texts, all_images, required,
+                suffixes=all_suffixes, padding_side="right", all_audio=all_audio,
+            ), processor)
+            inputs["_unsloth_image_context_limit"] = image_context_limit
     audio_counts = [len(clips) for clips in all_audio]
-    _assert_audio_runs_intact(inputs, audio_counts, processor, max_seq_length,
-                              clips=all_audio)
+    effective_length = (
+        _as_numpy_vlm_field(inputs, "input_ids").shape[1]
+        if inputs.get("_unsloth_image_context_limit") is not None else max_seq_length
+    )
+    _assert_audio_runs_intact(inputs, audio_counts, processor, effective_length,
+                             clips=all_audio)
     if _vlm_inputs_host_valued(inputs) and _vlm_ids_integer_host(inputs):
         label_mask = _stage_vlm_label_mask_np(
             inputs, ignore_token_ids=ignore_token_ids,
@@ -9668,6 +9855,7 @@ def _build_response_masked_vlm_batch(
         ignore_token_ids=ignore_token_ids,
         completion_only_loss=completion_only_loss,
         return_prompt_completion=True,
+        image_context_limit=_vlm_image_context_limit(config),
     )
     staged.config = config
     # Unplanned batches keep the historical single-pass order, including its
@@ -11779,8 +11967,7 @@ def _iterate_lazy_vlm_training_batches(
                 "streaming_prefetch_batches=0 for response-masked VLM "
                 "streams."
             )
-        if formatting_func is not None:
-            item = formatting_func(item)
+        item = _format_vlm_row_gating_audio(item, formatting_func, processor)
         batch_dict, is_prompt_completion = _build_response_masked_vlm_batch(
             [item], processor, config, max_seq_length, image_size,
             response_mask_fn=response_mask_fn,
@@ -12160,6 +12347,7 @@ def _prepare_dataset(dataset, tokenizer, dataset_text_field="text",
     for item in dataset:
         if formatting_func is not None:
             result = formatting_func(item)
+            _validate_mlx_image_input(tokenizer, _row_has_images(result))
             texts = collect_mlx_texts(
                 tokenizer, result, dataset_text_field=dataset_text_field,
                 is_vlm=False,
@@ -12278,6 +12466,7 @@ def _create_text_batch_plan(dataset, tokenizer, batch_size, max_seq_length,
     dataset = _ensure_reiterable_text_dataset(dataset)
     tokenized, saw_pretokenized = _prepare_pretokenized_text_dataset(
         dataset,
+        tokenizer=tokenizer,
         completion_only_loss=completion_only_loss,
         assistant_only_loss=assistant_only_loss,
     )
@@ -12789,6 +12978,7 @@ def _create_ordered_text_plan(
     dataset = _ensure_reiterable_text_dataset(dataset)
     tokenized_pairs, saw_pretokenized = _prepare_pretokenized_text_dataset(
         dataset,
+        tokenizer=tokenizer,
         completion_only_loss=completion_only_loss,
         assistant_only_loss=assistant_only_loss,
     )
@@ -12941,6 +13131,7 @@ def _iter_tokenized_text_rows(dataset, tokenizer, dataset_text_field="text",
     for item in dataset:
         if formatting_func is not None:
             item = formatting_func(item)
+            _validate_mlx_image_input(tokenizer, _row_has_images(item))
         texts = collect_mlx_texts(
             tokenizer,
             item,
@@ -13093,6 +13284,7 @@ def _iter_lazy_tokenized_text_rows(
         return () if label_owned else None
 
     for item in dataset:
+        _validate_mlx_image_input(tokenizer, _row_has_images(item))
         if reject_rows and _contains_mlx_values(item):
             # Reject before any parse, truthiness probe, or formatter call.
             _reject_mlx_valued_text("the dataset row")
@@ -13128,6 +13320,7 @@ def _iter_lazy_tokenized_text_rows(
             if reject_rows and _contains_mlx_values(formatted):
                 # Formatters can introduce MLX values after the row scan.
                 _reject_mlx_valued_text("the formatting function")
+            _validate_mlx_image_input(tokenizer, _row_has_images(formatted))
             formatter_applied = True
             formatter_needs_completion_boundary = (
                 completion_only_loss is None
@@ -14443,6 +14636,7 @@ def iterate_training_batches(dataset, tokenizer, batch_size, max_seq_length,
     dataset = _ensure_reiterable_text_dataset(dataset)
     tokenized, saw_pretokenized = _prepare_pretokenized_text_dataset(
         dataset,
+        tokenizer=tokenizer,
         completion_only_loss=completion_only_loss,
         assistant_only_loss=assistant_only_loss,
     )
