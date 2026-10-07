@@ -395,8 +395,7 @@ def test_moonshine_stock_source_is_marked_and_unshifted_is_its_divisor():
 
 
 def test_collator_shift_labels_do_not_change_the_count():
-    # The fused losses train on `labels` and ignore a collator's `shift_labels`, so the divisor must
-    # come from the same `labels[..., 1:]`, or the sum and its divisor cover different targets.
+    # The fused losses train on `labels`, so the divisor counts `labels[..., 1:]`, not `shift_labels`.
     count_batch_items = _loss_utils().count_batch_items
     labels = torch.randint(0, 13, (2, 8))
     shift_labels = torch.full((2, 8), -100)

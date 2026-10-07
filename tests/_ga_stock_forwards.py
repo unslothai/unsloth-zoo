@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-# Verbatim forward sources (docstrings dropped) from the transformers releases named, so these tests
-# exercise the exact stock spellings on any installed version. Generated from the release wheels.
+# Verbatim stock forwards (docstrings dropped) from the named transformers release wheels.
 
 # transformers 5.16.1 Qwen3VLForConditionalGeneration.forward
 QWEN3_VL_5_16_1 = """\
