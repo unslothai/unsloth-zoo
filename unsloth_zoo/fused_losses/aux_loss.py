@@ -14,22 +14,11 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Gradient accumulation weighting for MoE router auxiliary losses.
+"""GA weighting for MoE router aux / z-loss terms.
 
-MoE heads add `loss += self.router_aux_loss_coef * aux_loss` after the LM loss (also spelt
-`loss = loss + aux_loss`, `loss = loss + z_loss + aux_loss` for Switch / NLLB-MoE router terms and
-`loss = loss + self.z_loss_coefficient * z_loss` for Bamba). Once num_items_in_batch reaches the
-forward, the LM term of every micro-batch is sum / N_total and Trainer no longer divides by the
-accumulation steps, but the extra term is still a per micro-batch mean added in full, so over G
-micro-batches it carries G times its full-batch weight. Scaling it by this micro-batch's share of
-the counted target tokens (local / N_total) makes the weights sum to one over the accumulated batch
-(and over ranks: Trainer multiplies the loss by the world size and DDP averages). Without a count,
-nothing changes.
-
-The share is token weighted, which is exact for a term that averages over the same targets and an
-approximation otherwise: a router aux loss averages routing over every token (padding included),
-Bamba's z-loss over every position. Either way the accumulated total weight is one, as it is
-without accumulation.
+Once the LM loss is sum / N_total, a per micro-batch aux mean added in full carries G times its
+weight; scaling it by the micro-batch token share (local / N_total) sums to one. Token weighted, so
+approximate for a router loss that averages over every token.
 """
 
 __all__ = [
@@ -46,16 +35,13 @@ import torch
 
 
 def _local_count(labels, attention_mask, loss_kwargs, model):
-    # The batch counter's own per micro-batch definition (loss_utils.count_batch_items), so the
-    # shares of the micro-batches it summed add up to exactly one.
     from unsloth_zoo.loss_utils import count_batch_items, counts_unshifted_labels, num_items_labels_convention
     convention = num_items_labels_convention(model) if model is not None else None
     unshifted = (convention == "unshifted") if convention is not None else counts_unshifted_labels(model)
     if not (isinstance(attention_mask, torch.Tensor) and attention_mask.shape == labels.shape):
         attention_mask = None
     packed_seq_lengths = loss_kwargs.get("packed_seq_lengths", None) if isinstance(loss_kwargs, dict) else None
-    # The packed-boundary drop indexes by data, which a compiled forward cannot trace; there the
-    # boundaries a collator left unmasked (at most documents - 1 per micro-batch) are counted.
+    # Compiled forwards cannot trace the packed-boundary drop, so unmasked boundaries count there.
     packed = not torch.compiler.is_compiling()
     shift_labels = loss_kwargs.get("shift_labels", None) if isinstance(loss_kwargs, dict) else None
     if not isinstance(shift_labels, torch.Tensor): shift_labels = None
@@ -68,12 +54,7 @@ def _local_count(labels, attention_mask, loss_kwargs, model):
 def unsloth_ga_scale_aux_loss(aux_loss, labels, attention_mask = None, loss_kwargs = None,
                               num_items_in_batch = None, model = None):
     # All Unsloth Zoo code licensed under LGPLv3
-    """`aux_loss * local / num_items_in_batch`, or `aux_loss` unchanged without a usable count.
-
-    The count is the explicit `num_items_in_batch` argument (a forward naming it as a parameter),
-    else `loss_kwargs["num_items_in_batch"]`, else the `n_items` alias. `model` (the head) says
-    whether labels are counted shifted or unshifted, as the batch counter decided.
-    """
+    """`aux_loss * local / num_items_in_batch`, or `aux_loss` unchanged without a usable count."""
     n_items = num_items_in_batch
     if isinstance(loss_kwargs, dict):
         if n_items is None: n_items = loss_kwargs.get("num_items_in_batch", None)
@@ -89,27 +70,21 @@ def unsloth_ga_scale_aux_loss(aux_loss, labels, attention_mask = None, loss_kwar
     if n_items.ndim > 0: n_items = n_items.reshape(-1)[0]
     local = _local_count(labels, attention_mask, loss_kwargs, model)
     local = local.to(device = aux_loss.device, dtype = torch.float32)
-    # fp32 ratio: a half precision count overflows past 65504 tokens. A zero total leaves the term
-    # as is, without a host sync.
+    # fp32: a half precision count overflows past 65504. A zero total keeps the term, no host sync.
     ratio = torch.where(n_items > 0, local / n_items.clamp_min(1), torch.ones_like(local))
     return (aux_loss.float() * ratio).to(aux_loss.dtype)
 pass
 
 
-# Coefficients of a router / z-loss term: router_aux_loss_coef, aux_loss_coef, router_z_loss_coef,
-# z_loss_coefficient (Bamba), moe_loss_weight (4.x DBRX).
 _COEF = re.compile(r"(aux_loss_coef|z_loss_coef|z_loss_coefficient|moe_loss_weight)$")
-# The term itself: aux_loss, z_loss, router_aux_loss, ...
 _TERM = re.compile(r"(^|_)(aux_loss|z_loss)$")
 
 
 def _is_aux_coef(node):
-    # self.router_aux_loss_coef / self.aux_loss_coef / self.config.text_config.router_aux_loss_coef
     return isinstance(node, ast.Attribute) and _COEF.search(node.attr) is not None
 
 
 def _aux_operand(node):
-    # `aux_loss` or `aux_loss.to(...)` (any *_aux_loss / *_z_loss name).
     if isinstance(node, ast.Name):
         return _TERM.search(node.id) is not None
     return (
@@ -153,12 +128,7 @@ def _term_operand(term):
 
 
 def unscaled_extra_loss_terms(source):
-    """Does a forward add anything to `loss` that is not GA weighted? True also when unparsable.
-
-    A rewrite that makes the CE count-aware must not leave such a term behind: once unsloth sees the
-    count consumed, Trainer stops dividing by the accumulation steps and that term would carry G
-    times its weight.
-    """
+    """Does a forward add a term to `loss` that is not GA weighted? True also when unparsable."""
     try:
         tree = ast.parse(textwrap.dedent(source))
     except SyntaxError:
@@ -173,12 +143,7 @@ def unscaled_extra_loss_terms(source):
 def rewrite_aux_loss_ga(source):
     """Wrap the router / z-loss terms a forward adds to `loss` in `unsloth_ga_scale_aux_loss`.
 
-    Handles `loss += <coef> * aux_loss[.to(..)]` and `loss = loss + <term> [+ <term>]` where each
-    term is `<coef> * <aux>` or a bare `*aux_loss` / `*z_loss` name; a statement with any other term
-    is left whole. Text splice over the original source (formatting kept, so later regex passes
-    still match). Needs a `labels` parameter and somewhere the count arrives: a **kwargs parameter
-    or an explicit `num_items_in_batch` one; otherwise the source is returned unchanged.
-    Without a count the helper returns the term as is, so the stock loss is unchanged.
+    Text splice (formatting kept for later regex passes); unchanged without `labels` and a count source.
     """
     if "unsloth_ga_scale_aux_loss" in source or ("aux_loss" not in source and "z_loss" not in source):
         return source
@@ -204,7 +169,6 @@ def rewrite_aux_loss_ga(source):
     if positional and positional[0].arg == "self":
         extra += ", model = self"
 
-    # Columns: dedent removed the same prefix from every non-blank line.
     def indent(text):
         line = next((l for l in text.splitlines() if l.strip()), "")
         return len(line) - len(line.lstrip())
@@ -223,7 +187,6 @@ def rewrite_aux_loss_ga(source):
     if not spans:
         return source
 
-    # Absolute offsets into the original text, replaced back to front.
     starts = [0]
     for line in lines:
         starts.append(starts[-1] + len(line))

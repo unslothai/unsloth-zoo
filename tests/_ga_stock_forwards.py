@@ -70,7 +70,6 @@ QWEN3_VL_5_16_1 = """\
         )
 """
 
-# transformers 5.16.1 XGLMForCausalLM.forward
 XGLM_5_16_1 = """\
     def forward(
         self,
@@ -123,7 +122,6 @@ XGLM_5_16_1 = """\
         )
 """
 
-# transformers 4.55.4 DbrxForCausalLM.forward
 DBRX_4_55_4 = """\
     def forward(
         self,
@@ -208,7 +206,6 @@ DBRX_4_55_4 = """\
         )
 """
 
-# transformers 5.17.0 SwitchTransformersForConditionalGeneration.forward
 SWITCH_5_17_0 = """\
     def forward(
         self,
@@ -316,7 +313,6 @@ SWITCH_5_17_0 = """\
         )
 """
 
-# transformers 4.55.4 SwitchTransformersForConditionalGeneration.forward
 SWITCH_4_55_4 = """\
     def forward(
         self,
@@ -466,7 +462,6 @@ SWITCH_4_55_4 = """\
         )
 """
 
-# transformers 5.17.0 NllbMoeForConditionalGeneration.forward
 NLLB_MOE_5_17_0 = """\
     def forward(
         self,
@@ -548,7 +543,6 @@ NLLB_MOE_5_17_0 = """\
         )
 """
 
-# transformers 5.17.0 BambaForCausalLM.forward
 BAMBA_5_17_0 = """\
     def forward(
         self,
@@ -592,7 +586,6 @@ BAMBA_5_17_0 = """\
         )
 """
 
-# transformers 4.57.6 MixtralForCausalLM.forward
 MIXTRAL_4_57_6 = """\
     def forward(
         self,
@@ -657,7 +650,6 @@ MIXTRAL_4_57_6 = """\
         )
 """
 
-# transformers 5.17.0 MoonshineForConditionalGeneration.forward
 MOONSHINE_5_17_0 = """\
     def forward(
         self,

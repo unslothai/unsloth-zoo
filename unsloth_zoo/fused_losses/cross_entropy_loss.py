@@ -672,17 +672,10 @@ def unsloth_count_aware_cross_entropy(
     vocab_size = None,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
-    """Token cross entropy that honours gradient accumulation's num_items_in_batch.
+    """Token CE as sum / n_items when the GA count is given, else the stock mean.
 
-    Replaces a stock `CrossEntropyLoss()` mean over the micro-batch: with `n_items` (the token count
-    of the whole accumulation window) it returns sum / n_items, so accumulated micro-batches add up
-    to the full-batch mean; without it, the stock mean (all ignored -> nan, as stock).
-    shift=True predicts token t+1 from position t (logits[..., :-1, :], labels[..., 1:]); False for
-    labels already aligned (encoder-decoder, Bart-style ForCausalLM) or pre-shifted by the caller.
-    mask: an attention mask whose zero positions are dropped, cropped to the logits length the way
-    the stock filtered VLM / Llama 4 blocks do. The CE runs in the logits' own dtype, as stock does
-    (no float32 copy of the logits); only the per-token losses are summed in float32, so a half
-    precision sum cannot overflow.
+    Runs in the logits' own dtype as stock does (no fp32 copy); with a count the per-token losses are
+    summed in fp32 so a half precision sum cannot overflow.
     """
     if shift:
         logits = logits[..., :-1, :]
@@ -735,11 +728,7 @@ pass
 
 def unsloth_loss_count_kwargs(loss_function, n_items):
     # All Unsloth Zoo code licensed under LGPLv3
-    """`{"num_items_in_batch": n_items}` for a loss_function call whose stock form took no count.
-
-    Empty when there is no count, or when the loss_function (a user's own, say) accepts neither
-    `num_items_in_batch` nor **kwargs, so the rewritten call never raises where stock would not.
-    """
+    """`{"num_items_in_batch": n_items}`, or {} without a count or for a loss that cannot take it."""
     if n_items is None or not _loss_takes_count(loss_function):
         return {}
     return {"num_items_in_batch": n_items}

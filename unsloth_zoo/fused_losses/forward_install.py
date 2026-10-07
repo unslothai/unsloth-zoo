@@ -245,8 +245,6 @@ def install_for_class(cls) -> bool:
     tier = "2-ast-triplet"
     unshifted = False
     if new_src is None and ".deprecated." in getattr(cls, "__module__", ""):
-        # Tier 3: the compiler never loads deprecated modeling files, so their own mean token CE
-        # (OpenLlama, Speech2Text2) is made count-aware here instead; it cannot be fused.
         new_src, shifted = rewrite_count_aware_ce_spliced(src)
         if new_src is not None:
             tier, unshifted = "3-count-aware-ce", not shifted
@@ -254,7 +252,6 @@ def install_for_class(cls) -> bool:
         with _REGISTRY_LOCK:
             _UNMATCHED[qn] = "no-canonical-triplet"
         return False
-    # MoE router aux loss: weight it by this micro-batch's token share once num_items_in_batch arrives.
     new_src = rewrite_aux_loss_ga(new_src)
     if tier == "3-count-aware-ce" and unscaled_extra_loss_terms(new_src):
         # A count-aware CE beside a term still added in full would give that term G times its weight.

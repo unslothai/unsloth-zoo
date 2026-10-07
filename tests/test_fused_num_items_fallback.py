@@ -14,12 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Every loss branch of a fused forward divides by num_items_in_batch, not only the fused one.
-
-A stock `self.loss_function(...)` without **kwargs (Qwen3-VL <= 5.16.1, Qwen2.5-VL 4.55) used to
-leave the UNSLOTH_RETURN_LOGITS=1 and non-causal branches on a micro-batch mean while the fused
-branch divided by the count, so gradient accumulation scaled differently per branch.
-"""
+"""Every loss branch of a fused forward divides by num_items_in_batch, not only the fused one."""
 import ast
 import os
 import textwrap
@@ -39,7 +34,6 @@ from unsloth_zoo.fused_losses.ast_rewriter import (  # noqa: E402
 )
 
 
-# Qwen3VLForConditionalGeneration.forward on transformers 5.16.1, docstring dropped.
 QWEN3_VL_5_16_1 = '''
     def forward(
         self,
@@ -79,7 +73,6 @@ QWEN3_VL_5_16_1 = '''
         )
 '''
 
-# MambaForCausalLM.forward tail on transformers 5.16.1: the exact legacy shifted CE block.
 MAMBA_5_16_1 = '''
 def forward(self, input_ids=None, labels=None, logits_to_keep=0, **kwargs):
     mamba_outputs = self.backbone(input_ids)
@@ -96,7 +89,6 @@ def forward(self, input_ids=None, labels=None, logits_to_keep=0, **kwargs):
     return loss, logits
 '''
 
-# BartForCausalLM-style aligned (unshifted) CE: its labels are not next-token targets.
 BART_ALIGNED = '''
 def forward(self, input_ids=None, labels=None, **kwargs):
     outputs = self.model.decoder(input_ids)
@@ -109,7 +101,6 @@ def forward(self, input_ids=None, labels=None, **kwargs):
     return loss, logits
 '''
 
-# T5ForConditionalGeneration.forward tail on 5.x: aligned CE in an encoder-decoder **kwargs forward.
 T5_ENC_DEC = '''
 def forward(self, input_ids=None, decoder_input_ids=None, labels=None, **kwargs):
     if labels is not None and decoder_input_ids is None:
@@ -125,7 +116,6 @@ def forward(self, input_ids=None, decoder_input_ids=None, labels=None, **kwargs)
     return loss, lm_logits
 '''
 
-# XGLMForCausalLM.forward tail on 5.4.0 .. 5.16.1: **kwargs forward, loss call without them.
 XGLM_KWARGLESS = '''
 def forward(self, input_ids=None, labels=None, logits_to_keep=0, **kwargs):
     outputs = self.model(input_ids, **kwargs)
@@ -158,11 +148,8 @@ def test_kwargless_vlm_fallback_branches_get_the_count():
     assert ok
     compile(textwrap.dedent(new), "<fused>", "exec")
     calls = _loss_function_calls(new)
-    # The RETURN_LOGITS branch gets the count; the non-causal `else` branch only when there is one,
-    # so a user loss_function without that parameter still runs at eval.
     assert len(calls) == 2
     causal, non_causal = calls
-    # Both go through unsloth_loss_count_kwargs, which also drops it for a loss lacking the parameter.
     for call in (causal, non_causal):
         assert not any(kw.arg == "num_items_in_batch" for kw in call.keywords), ast.unparse(call)
         starred = [ast.unparse(kw.value) for kw in call.keywords if kw.arg is None]
@@ -220,8 +207,6 @@ def test_legacy_shifted_ce_threads_kwargs():
 
 
 def test_decoder_only_aligned_ce_gets_the_count():
-    # BartForCausalLM-style aligned labels: the compiler marks the class so the batch counter counts
-    # unshifted labels, which is what this CE averages over.
     new, cap = rewrite_forward_source_spliced(BART_ALIGNED)
     assert new is not None and cap.aligned
     compile(textwrap.dedent(new), "<fused>", "exec")
@@ -236,13 +221,11 @@ def test_kwargless_hook_forward_gets_the_count():
     compile(new, "<fused>", "exec")
     count = ("kwargs.get('num_items_in_batch', None) if kwargs.get('num_items_in_batch', None) is not None "
              "else kwargs.get('n_items', None)")
-    # The fused call always takes it; the loss_function call only when it has the parameter (strict user losses).
     assert new.count(f"num_items_in_batch={count}") == 1, new
     assert f"**unsloth_loss_count_kwargs(self.loss_function, {count})" in new, new
 
 
 def _run_legacy_unfused(n_items):
-    # Execute the RETURN_LOGITS branch of the rewritten Mamba forward against a real CE reference.
     new = rewrite_forward_source_spliced(MAMBA_5_16_1)[0]
     torch.manual_seed(0)
     vocab, hidden = 11, 8

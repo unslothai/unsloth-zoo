@@ -76,10 +76,7 @@ class TripletCapture:
     logits_bias_src: str | None = None
     bias_idx: int | None = None
     bias_stmt: ast.stmt | None = None
-    # The forward has no **kwargs: the spliced rewrite adds `**kwargs` so Trainer can pass the count.
     add_kwargs: bool = False
-    # The count was added to a loss_function call that took no kwargs (XGLM): pass it there only
-    # when present, so a user loss_function without that parameter still runs at eval.
     count_injected: bool = False
 
 
@@ -365,10 +362,6 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef, extended: bool = False)
         vocab_expr, kwargs_name = None, None
         legacy_body = list(if_node.body)
         aligned_target = aligned is not None
-        # Both CE shapes honour num_items_in_batch: labels[..., 1:] for a shifted next-token block
-        # (Mamba), and the unshifted labels of an aligned block (T5, Whisper, BartForCausalLM), whose
-        # class the compiler marks `_unsloth_counts_unshifted_labels` so the batch counter skips the
-        # shift. A forward without **kwargs (transformers 4.57 encoder-decoders) gets one spliced in.
         kwargs_name = fn.args.kwarg.arg if fn.args.kwarg is not None else "kwargs"
         add_kwargs = fn.args.kwarg is None
     else:
@@ -453,8 +446,6 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef, extended: bool = False)
             if kw.arg in ("logits", "labels", "vocab_size"):
                 continue
             extra_loss_kws.append((kw.arg, kw.value))
-        # A **kwargs forward whose loss call drops them (XGLM, Phi4Multimodal) reduces by a micro-batch
-        # mean. Hand both calls the count, which ForCausalLMLoss divides by; it stays None outside training.
         if (fn.args.kwarg is not None and len(loss_call.args) < 4
                 and not any(kw.arg is None for kw in loss_call.keywords)
                 and all(name != "num_items_in_batch" for name, _ in extra_loss_kws)):
@@ -639,7 +630,6 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
     extra = "".join(
         f", {name}={ast.unparse(value)}" for name, value in cap.extra_loss_kws
     )
-    # The loss_function call gets an injected count only when there is one; the fused call always.
     lf_extra = extra
     if cap.count_injected:
         lf_extra = "".join(
@@ -705,8 +695,7 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
             f"{loss} = unsloth_fused_lm_head_loss({hidden_src}, self.{head_attr}, labels{aligned_kw}{scale_extra}{kwargs_unpack})"
         )
         if cap.kwargs_name:
-            # The stock CE block shifts (or aligns) `labels` itself and never reads a caller's
-            # `shift_labels`; the adapter would, and it collides with `shift_labels=False`.
+            # The stock CE block never reads a caller's `shift_labels`; the adapter would.
             fused_call = f"{cap.kwargs_name}.pop('shift_labels', None)\n" + fused_call
     else:
         unfused = [
@@ -862,7 +851,6 @@ def _labels_if(fn):
 
 
 def _slices_labels_forward(node) -> bool:
-    # `labels[..., 1:]` / `labels[:, 1:]`: the block predicts the next token.
     for sub in ast.walk(node):
         if not (isinstance(sub, ast.Subscript) and isinstance(sub.value, ast.Name) and sub.value.id == "labels"):
             continue
@@ -873,7 +861,6 @@ def _slices_labels_forward(node) -> bool:
 
 
 def _is_labels_cast(node) -> bool:
-    # `labels.to(...)` / `.view(...)` / `.reshape(...)` / `.contiguous()` chains: same values, same count.
     while isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and \
             node.func.attr in ("to", "view", "reshape", "contiguous", "long"):
         node = node.func.value
@@ -885,15 +872,9 @@ def _is_one(node) -> bool:
 
 
 def rewrite_count_aware_ce_spliced(source: str):
-    """Route a forward's own mean token CE through `unsloth_count_aware_cross_entropy`.
+    """Make an unfusable head's own mean token CE count-aware: (new_source, shifted) or (None, None).
 
-    For heads no fused route takes (no Linear lm_head, logits from an inner model as in Llama 4
-    vision, deprecated models): the `if labels is not None:` block keeps its shifting and attention
-    mask filtering, and only its one `CrossEntropyLoss()` (or `F.cross_entropy`) mean becomes the
-    count-aware call. Returns (new_source, shifted) or (None, None). `shifted` False means the CE
-    averages unshifted labels, so the class needs `_unsloth_counts_unshifted_labels`. Bails on a
-    weighted / smoothed / non-mean CE, more than one CE in the forward (an auxiliary loss), or a
-    CE outside the labels block. Spliced by line so `create_standalone_class` can regex-parse it.
+    Bails on a weighted / smoothed / non-mean CE, a second CE, or a CE outside the labels block.
     """
     try:
         tree = ast.parse(textwrap.dedent(source))
@@ -905,8 +886,7 @@ def rewrite_count_aware_ce_spliced(source: str):
     block = _labels_if(fn)
     if block is None or block.orelse:
         return (None, None)
-    # The batch counter counts `labels != -100`: a block that rewrites which labels count (Moshi's
-    # `labels.masked_fill(labels == pad, -100)`) would divide by the wrong number.
+    # A block that changes which labels count (Moshi's masked_fill) would divide by the wrong number.
     for sub in ast.walk(block):
         if (isinstance(sub, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "labels" for t in sub.targets)
                 and not _is_labels_cast(sub.value)):

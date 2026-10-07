@@ -2938,9 +2938,7 @@ def create_standalone_class(
 
     # Add **loss_kwargs
     if add_loss_kwargs and "**" not in parameters:
-        # A rewrite may already have spliced a var-keyword into the forward (the count-aware CE
-        # route does, for 4.57.x encoder-decoders): forward through that one instead of adding a
-        # second, which is a SyntaxError.
+        # Reuse a var-keyword the count-aware rewrite already spliced in: a second one is a SyntaxError.
         spliced = None
         try:
             for node in ast.walk(ast.parse(textwrap.dedent(source))):
@@ -3900,10 +3898,7 @@ def _apply_fused_lm_head(forward, module=None):
             "vocab_size = (",
             forward,
         )
-        # An empty `**\\9`: the stock loss_function call took no kwargs. The fused branch divides by
-        # n_items, so the RETURN_LOGITS / non-causal fallbacks must too, else they return a mean.
-        # The non-causal branch runs a non-ForCausalLMLoss (possibly a user's), so it only gets the
-        # count when there is one, keeping a loss without that parameter working at eval.
+        # Stock call took no kwargs: the fallbacks get the count too, but only for a loss that accepts it.
         forward = forward.replace(
             ", **__UNSLOTH_NON_CAUSAL__)",
             ", **unsloth_loss_count_kwargs(self.loss_function, n_items))",
@@ -5088,16 +5083,12 @@ def _ast_fused_lm_head_fallback(source, module = None, module_class = None):
         return None
     if module_class is not None and not _head_built_as_linear(module_class, cap.head_attr):
         return None
-    # Both average labels as given: an aligned CE, and an aligned target passed as shift_labels
-    # (Moonshine, PPFormulaNet, Cohere ASR, Canary), which ForCausalLMLoss then does not shift.
     if cap.aligned or cap.aligned_target:
         _mark_counts_unshifted_labels(module_class)
     return new_source
 
 
 def _mark_counts_unshifted_labels(module_class):
-    # The rewritten loss averages labels as given (no next-token shift), so the batch counter must
-    # count `labels != -100` without dropping column 0 (loss_utils._unsloth_get_batch_samples).
     if module_class is None:
         return
     try:
@@ -5119,8 +5110,7 @@ def _count_aware_ce_fallback(source, module = None, module_class = None):
         return None
     if new_source is None:
         return None
-    # A count-aware CE beside a term still added in full (a router or z-loss the aux rewrite could
-    # not weight) would hand that term G times its weight once Trainer stops dividing: keep stock.
+    # A term the aux rewrite cannot weight would get G times its weight once Trainer stops dividing.
     from unsloth_zoo.fused_losses.aux_loss import rewrite_aux_loss_ga, unscaled_extra_loss_terms
     new_source = rewrite_aux_loss_ga(new_source)
     if unscaled_extra_loss_terms(new_source):
@@ -5131,11 +5121,7 @@ def _count_aware_ce_fallback(source, module = None, module_class = None):
 
 
 def fused_lm_head_forward(module, module_class, modeling_module_name, source):
-    """The compiler's fused-CE rewrite of one GenerationMixin forward.
-
-    Returns (new_source, route, supports_return_hidden_states); route is "regex", "ast" or None.
-    Pure on the source, so tests/test_fused_ce_coverage.py runs the same decision without compiling.
-    """
+    """Fused-CE rewrite of one forward: (new_source, "regex" | "ast" | None, supports_return_hidden_states)."""
     # Fix some arguments up like for Gemma 3N
     new_source = fixup_fused_lm_head(source)
     new_source = fixup_dropped_logit_scale(new_source, module)
@@ -5144,7 +5130,6 @@ def fused_lm_head_forward(module, module_class, modeling_module_name, source):
     # Only classes defined here: an imported one (4.x Blenderbot) lacks its base classes.
     defined_here = getattr(module_class, "__module__", None) == modeling_module_name
     if not _head_built_as_linear(module_class, "lm_head"):
-        # Not fusable (ModernBertDecoder's decoder head): its own mean CE can still take the count.
         count_source = _count_aware_ce_fallback(new_source, module, module_class) if defined_here else None
         if count_source is not None:
             from unsloth_zoo.fused_losses.aux_loss import rewrite_aux_loss_ga
@@ -5158,12 +5143,10 @@ def fused_lm_head_forward(module, module_class, modeling_module_name, source):
         if ast_source is not None:
             fused_source, route = ast_source, "ast"
         else:
-            # Logits from an inner model (Llama 4 vision) or a head the fused kernel cannot take.
             count_source = _count_aware_ce_fallback(new_source, module, module_class)
             if count_source is not None:
                 fused_source, route = count_source, "count"
     if route is not None:
-        # MoE router aux loss: weight it by this micro-batch's token share once num_items_in_batch arrives.
         from unsloth_zoo.fused_losses.aux_loss import rewrite_aux_loss_ga
         fused_source = rewrite_aux_loss_ga(fused_source)
     return fused_source, route, supports_return_hidden_states
@@ -7204,8 +7187,7 @@ def unsloth_compile_transformers(
     replacement_classes = {}
     for module in all_standalone_classes.keys():
         try:
-            # The rewrite marked the transformers class; the compiled class replacing it must carry
-            # the same counting convention or the batch counter shifts aligned labels.
+            # The compiled replacement class must keep the counting convention the rewrite marked.
             original = getattr(modeling_file, module, None)
             if getattr(original, "_unsloth_counts_unshifted_labels", False) is True:
                 _mark_counts_unshifted_labels(getattr(combined_module, module, None))

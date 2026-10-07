@@ -14,16 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Gradient accumulation count plumbing, on the stock forwards that exposed each gap. CPU only.
-
-- A rewrite that hands the count to a `self.loss_function(...)` call whose stock form took none goes
-  through `unsloth_loss_count_kwargs`, so a loss without that parameter still runs.
-- Generated reads fall back to `n_items` when `num_items_in_batch` is present but None.
-- The batch counter honours unsloth's recorded `_unsloth_num_items_labels` decision.
-- MoE router / z-loss terms are weighted in every stock spelling, by the counter's own per batch
-  count; a count-aware CE never ships beside a term left at full weight.
-- Aligned-target heads (labels passed as `shift_labels`) count unshifted labels.
-"""
+"""Gradient accumulation count plumbing, on the stock forwards that exposed each gap. CPU only."""
 
 import ast
 import importlib
@@ -55,7 +46,6 @@ def _live(module, name):
 
 
 def _isolated(cls):
-    # A same-module subclass, so a class marker the compiler sets never leaks into other tests.
     sub = type(cls.__name__, (cls,), {})
     sub.__module__ = cls.__module__
     return sub
@@ -67,7 +57,6 @@ def _calls(source, name):
             and isinstance(n.func, ast.Name) and n.func.id == name]
 
 
-# ---------------------------------------------------------------- unsloth_loss_count_kwargs
 
 def test_loss_count_kwargs_follows_the_loss_signature():
     helper = ce_mod.unsloth_loss_count_kwargs
@@ -95,8 +84,6 @@ def test_loss_count_kwargs_follows_the_loss_signature():
 
 
 def test_regex_route_hands_the_count_only_to_a_loss_that_takes_it():
-    # transformers 5.16.1 Qwen3-VL calls self.loss_function without **kwargs; the RETURN_LOGITS
-    # branch used to splice `num_items_in_batch = n_items`, a TypeError for a loss lacking it.
     cls = _live("qwen3_vl", "Qwen3VLForConditionalGeneration")
     new, route, _ = compiler.fused_lm_head_forward(cls.__name__, cls, cls.__module__, stock.QWEN3_VL_5_16_1)
     assert route == "regex"
@@ -105,7 +92,6 @@ def test_regex_route_hands_the_count_only_to_a_loss_that_takes_it():
 
 
 def test_ast_route_injection_goes_through_the_helper_and_reads_the_alias():
-    # transformers 5.16.1 XGLM takes **kwargs but drops them from its loss call.
     new, cap = ast_rewriter.rewrite_forward_source_spliced(stock.XGLM_5_16_1)
     assert new is not None and cap.count_injected
     lf = [c for c in ast.walk(ast.parse(textwrap.dedent(new))) if isinstance(c, ast.Call)
@@ -126,7 +112,6 @@ def test_hook_namespace_exports_the_helper():
     assert "unsloth_loss_count_kwargs" in compiler._disabled_sdpa_code
 
 
-# ---------------------------------------------------------------- count reads (#14, #18)
 
 def test_count_route_falls_back_to_n_items_when_the_count_is_none():
     new = compiler._count_aware_ce_fallback(stock.SWITCH_5_17_0, "SwitchTransformersForConditionalGeneration", None)
@@ -149,10 +134,8 @@ def test_count_aware_ce_keeps_a_replica_count_zero_dim():
     torch.testing.assert_close(loss, reference)
 
 
-# ---------------------------------------------------------------- batch counter convention
 
 class NoKwargsForCausalLM(nn.Module):
-    # No **kwargs: on its own the counter would never send this head a count.
     def __init__(self):
         super().__init__()
         self.lm_head = nn.Linear(4, 11, bias = False)
@@ -234,7 +217,6 @@ def test_recorded_convention_keeps_the_guards():
     assert _count(head) is None
 
 
-# ---------------------------------------------------------------- aux weighting helper
 
 def test_aux_helper_reads_the_alias_and_an_explicit_count():
     aux = torch.tensor(2.0)
@@ -281,8 +263,6 @@ class KwargsForCausalLM(NoKwargsForCausalLM):
 
 
 def test_aux_shares_sum_to_one_against_the_counter_with_packing():
-    # Packed rows whose collator left the document boundaries unmasked: the counter zeroes them, so
-    # the aux shares must too or they no longer add up to one.
     batches = []
     for lengths in ((3, 5), (2, 2, 4), (8,)):
         ids = torch.arange(1, 9).reshape(1, 8)
@@ -299,7 +279,6 @@ def test_aux_shares_sum_to_one_against_the_counter_with_packing():
     torch.testing.assert_close(sum(shares), aux)
 
 
-# ---------------------------------------------------------------- router / z-loss spellings
 
 def _scaled_operands(source):
     return [ast.unparse(c.args[0]) for c in _calls(source, "unsloth_ga_scale_aux_loss")]
@@ -363,7 +342,6 @@ def test_count_route_declines_beside_an_unweighted_term():
 
 
 def test_weighted_terms_run_and_stay_stock_without_a_count():
-    # Execute the rewritten NLLB-MoE statement: no count leaves the stock sum, a count weights it.
     new = aux_mod.rewrite_aux_loss_ga(stock.NLLB_MOE_5_17_0)
     (stmt,) = [n for n in ast.walk(ast.parse(textwrap.dedent(new)))
                if isinstance(n, ast.Assign) and "unsloth_ga_scale_aux_loss" in ast.unparse(n)]
@@ -381,7 +359,6 @@ def test_weighted_terms_run_and_stay_stock_without_a_count():
     torch.testing.assert_close(counted["loss"], torch.tensor(1.0 + 0.5 * 3 / 6))
 
 
-# ---------------------------------------------------------------- aligned targets (#9)
 
 @pytest.mark.parametrize("module,name", [
     ("moonshine", "MoonshineForConditionalGeneration"),
@@ -405,8 +382,6 @@ def test_moonshine_stock_source_is_marked_and_unshifted_is_its_divisor():
     new, route, _ = compiler.fused_lm_head_forward(cls.__name__, cls, cls.__module__, stock.MOONSHINE_5_17_0)
     assert route == "ast"
     assert cls.__dict__.get("_unsloth_counts_unshifted_labels") is True
-    # Stock: labels go in as shift_labels, which ForCausalLMLoss does not shift again, so the
-    # divisor that makes it a sum / N over the accumulated batch is the unshifted count.
     from transformers.loss.loss_utils import ForCausalLMLoss
     torch.manual_seed(0)
     logits = torch.randn(2, 5, 13)
@@ -419,8 +394,6 @@ def test_moonshine_stock_source_is_marked_and_unshifted_is_its_divisor():
 
 
 def test_collator_shift_labels_are_counted_as_given():
-    # A context / sequence parallel or padding free collator hands the loss pre-shifted targets in
-    # `shift_labels`; the loss trains on them as given, so transformers >= 5 counts them as given.
     count_batch_items = _loss_utils().count_batch_items
     labels = torch.randint(0, 13, (2, 8))
     shift_labels = torch.full((2, 8), -100)
@@ -429,9 +402,7 @@ def test_collator_shift_labels_are_counted_as_given():
     count, short, degenerate = count_batch_items(labels, shift_labels = shift_labels)
     assert int(count) == 5 and not short and not degenerate
     assert int(count_batch_items(labels)[0]) == 14
-    # An unshifted head counts its own labels whatever the collator added.
     assert int(count_batch_items(labels, shift_labels = shift_labels, unshifted = True)[0]) == 16
-    # The aux share reads the same targets off the forward's kwargs.
     share = aux_mod.unsloth_ga_scale_aux_loss(
         torch.tensor(1.0), labels, None, {"num_items_in_batch": torch.tensor(10), "shift_labels": shift_labels},
     )

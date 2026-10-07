@@ -14,13 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The fused and UNSLOTH_RETURN_LOGITS branches of a rewritten forward compute the same loss.
-
-The legacy CE rewrite (Mamba, T5) hands the fused adapter `**kwargs`, which honours a caller's
-`shift_labels` tensor and the `n_items` alias, while the unfused branch replays the stock block,
-which reads neither. The XGLM-style hook rewrite added `num_items_in_batch=` to a loss_function
-call that took no kwargs, which a strict user loss_function cannot accept at eval.
-"""
+"""The fused and UNSLOTH_RETURN_LOGITS branches of a rewritten forward compute the same loss."""
 import ast
 import os
 import types
@@ -42,8 +36,6 @@ VOCAB, HIDDEN = 11, 8
 
 
 def _fused_stub(hidden_states, lm_head, labels, vocab_size = None, **kwargs):
-    # The adapter's argument handling (forward_adapter.unsloth_fused_lm_head_loss) over plain fp32 CE,
-    # so the branches are compared on what they hand the loss rather than on kernel numerics.
     n_items = kwargs.pop("num_items_in_batch", None)
     if n_items is None:
         n_items = kwargs.pop("n_items", None)
@@ -162,7 +154,6 @@ def test_injected_count_only_reaches_a_loss_function_when_present():
         head = _head(torch.randn(2, 6, HIDDEN))
         head.loss_function = strict
         ns["forward"](head, input_ids = torch.zeros(2, 6, dtype = torch.long), labels = torch.zeros(2, 6, dtype = torch.long))
-        # A loss without the parameter keeps running when a count does arrive.
         ns["forward"](head, input_ids = torch.zeros(2, 6, dtype = torch.long), labels = torch.zeros(2, 6, dtype = torch.long),
                       num_items_in_batch = 9)
         head.loss_function = counting
@@ -196,6 +187,5 @@ def test_sampler_unwraps_training_wrappers():
 
     inner = torch.nn.Linear(1, 1)
     assert _unwrap_training_wrappers(DistributedDataParallel(OptimizedModule(inner))) is inner
-    # A model that merely has a child called `module` is not a wrapper.
     plain = HasModuleChild()
     assert _unwrap_training_wrappers(plain) is plain

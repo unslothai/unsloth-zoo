@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""MoE router aux loss under gradient accumulation: once num_items_in_batch reaches the forward,
-the aux term is weighted by the micro-batch's token share, so its total weight over the
-accumulated batch is one instead of the number of micro-batches. CPU only."""
+"""MoE router aux loss under gradient accumulation: once num_items_in_batch reaches the forward, the aux term is weighted by the micro-batch's token share, so its total weight over the accumulated batch is one instead of the number of micro-batches. CPU only."""
 
 import ast
 import inspect
@@ -63,7 +61,6 @@ def test_rewrite_keeps_indentation_and_wraps_the_operand():
     assert len(calls) == 1
     args = [ast.unparse(a) for a in calls[0].args]
     assert args == ["aux_loss.to(loss.device)", "labels", "attention_mask", "kwargs"]
-    # Only that operand changed; every other line is byte for byte the same.
     old_lines, new_lines = SIMPLE.splitlines(), new.splitlines()
     assert len(old_lines) == len(new_lines)
     assert sum(a != b for a, b in zip(old_lines, new_lines)) == 1
@@ -104,7 +101,6 @@ def test_attention_mask_matches_the_batch_counter():
     aux = torch.tensor(1.0)
     lab = torch.tensor([[1, 2, 3, 4]])
     mask = torch.tensor([[1, 1, 0, 0]])
-    # Only position 1 survives the shifted label AND the shifted mask.
     out = unsloth_ga_scale_aux_loss(aux, lab, mask, {"num_items_in_batch": torch.tensor(4)})
     assert torch.allclose(out, torch.tensor(0.25))
 
@@ -122,8 +118,6 @@ def _real(module, name):
     ("transformers.models.mixtral.modeling_mixtral", "MixtralForCausalLM"),
 ])
 def test_hook_route_rewrites_real_moe_heads(module, name):
-    # Importing unsloth_zoo installed the modeling import hook, so the class forward is the
-    # hook-rewritten one (its source lives in linecache under <unsloth-fused:...>).
     cls = _real(module, name)
     src = textwrap.dedent(inspect.getsource(cls.forward))
     if "unsloth_fused_lm_head_loss" not in src:

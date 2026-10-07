@@ -14,15 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Heads no fused route can take still divide by num_items_in_batch.
-
-A forward whose own mean token CrossEntropyLoss stays unfused (Llama 4 vision on <= 5.16.1 reads
-logits off an inner model; ModernBertDecoder has no Linear head; deprecated models are never
-compiled) is rewritten to route that CE through `unsloth_count_aware_cross_entropy`, which returns
-sum / num_items_in_batch when Trainer passes the count and the stock mean otherwise. Aligned-label
-heads (BartForCausalLM, encoder-decoders) are marked `_unsloth_counts_unshifted_labels` so the batch
-counter counts what their CE averages over.
-"""
+"""Heads no fused route can take still divide by num_items_in_batch."""
 import ast
 import importlib.util
 import os
@@ -39,7 +31,6 @@ from unsloth_zoo.fused_losses.ast_rewriter import rewrite_count_aware_ce_spliced
 from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_count_aware_cross_entropy  # noqa: E402
 
 
-# Llama4ForConditionalGeneration.forward on transformers 5.16.1, docstring and blank lines dropped.
 LLAMA4_CG_5_16_1 = """
     def forward(
         self,
@@ -128,7 +119,6 @@ LLAMA4_CG_5_16_1 = """
         )
 """
 
-# OpenLlamaForCausalLM.forward on transformers 4.57.6 (deprecated, no **kwargs).
 OPEN_LLAMA_4_57_6 = """
     def forward(
         self,
@@ -193,7 +183,6 @@ OPEN_LLAMA_4_57_6 = """
         )
 """
 
-# Two token CEs (GPT2DoubleHeadsModel shape): the multiple choice loss counts other labels.
 TWO_CES = """
     def forward(self, input_ids=None, labels=None, mc_labels=None, **kwargs):
         lm_logits = self.lm_head(self.transformer(input_ids)[0])
@@ -272,9 +261,6 @@ def test_helper_matches_the_stock_mean_and_divides_by_the_count():
 
 
 def test_helper_keeps_the_stock_dtype_and_sums_in_float32():
-    # The stock block it replaces runs CE on the logits as they are (no float32 copy of a
-    # vocab-sized tensor): the mean is that exact call, and only the per-token losses of the
-    # counted sum are accumulated in float32, so a half precision sum cannot overflow.
     logits, labels, _ = _batch()
     half = logits.to(torch.bfloat16)
     stock = nn.CrossEntropyLoss()(half[..., :-1, :].reshape(-1, 13), labels[..., 1:].reshape(-1))
@@ -285,7 +271,6 @@ def test_helper_keeps_the_stock_dtype_and_sums_in_float32():
     counted = unsloth_count_aware_cross_entropy(half, labels, torch.tensor(29))
     assert counted.dtype == torch.float32
     torch.testing.assert_close(counted, per_token / 29)
-    # 6000 tokens of loss ~ln(50000) sum past float16's 65504 limit; the float32 sum stays finite.
     big = torch.zeros(1, 6001, 4, dtype = torch.float16)
     big_labels = torch.zeros(1, 6001, dtype = torch.long)
     big[..., 0] = -12.0
@@ -309,7 +294,6 @@ def test_unfused_mean_ce_becomes_count_aware(source):
     assert "n_items=(kwargs.get('num_items_in_batch', None) if kwargs.get('num_items_in_batch', None) is not None else kwargs.get('n_items', None)), shift=False)" in new
     fn = ast.parse(textwrap.dedent(new)).body[0]
     assert fn.args.kwarg is not None and fn.args.kwarg.arg == "kwargs"
-    # Everything outside the labels block is untouched.
     assert new.split("loss = None", 1)[0] == source.split("loss = None", 1)[0].replace(
         "return_dict: Optional[bool] = None,\n    ) ->", "return_dict: Optional[bool] = None, **kwargs,\n    ) ->"
     )
@@ -378,7 +362,6 @@ def test_deprecated_module_gets_the_count_aware_forward_from_the_hook(tmp_path):
             assert "kwargs" in inspect.signature(cls.forward).parameters
             assert not getattr(cls, "_unsloth_counts_unshifted_labels", False)
         else:
-            # Outside deprecated/ the compiler owns the rewrite, so it can still fuse it.
             assert not installed
 
 
