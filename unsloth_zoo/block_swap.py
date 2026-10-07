@@ -78,13 +78,44 @@ def _pow2_ceil(n):
     return 1 << max(0, (int(n) - 1).bit_length())
 
 
+def _host_reserve(vm):
+    return max(_PIN_RESERVE_MIN_BYTES, int(vm.total * _PIN_RESERVE_FRACTION))
+
+
 def _pin_budget():
     try:
         import psutil
         vm = psutil.virtual_memory()
-        return vm.available - max(_PIN_RESERVE_MIN_BYTES, int(vm.total * _PIN_RESERVE_FRACTION))
+        return vm.available - _host_reserve(vm)
     except Exception:
         return 0
+
+
+def _check_host_fit(blocks):
+    """Refuse an offload whose host copies would not fit in free RAM: running host RAM out freezes the machine."""
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+    except Exception:
+        return
+    sizes = [b.nbytes() for b in blocks]
+    need = sum(sizes)
+    # Weights already in host RAM are replaced by the packed copy, so their bytes come back.
+    on_host = sum(p.data.nbytes for b in blocks for p in b.params if p.data.device.type == "cpu")
+    avail = vm.available + on_host - _host_reserve(vm)
+    if need <= avail:
+        return
+    fit, used = 0, 0
+    for size in sorted(sizes, reverse = True):
+        if used + size > avail:
+            break
+        used, fit = used + size, fit + 1
+    raise ValueError(
+        f"Unsloth: offload_layers asked for {len(blocks)} layers in host RAM, which needs "
+        f"{need / 2**30:.1f} GiB, but only {max(avail, 0) / 2**30:.1f} GiB is available after keeping "
+        f"{_host_reserve(vm) / 2**30:.1f} GiB free for the system. At most {fit} layers would fit; "
+        "lower offload_layers or free host RAM."
+    )
 
 
 class _Registered:
@@ -315,6 +346,7 @@ class BlockSwap:
                 owners.setdefault(id(p), set()).add(li)
         shared = {pid for pid, o in owners.items() if len(o) > 1}
         self.blocks = [_Block(layer, self.streams, self.device, shared) for layer in swapped]
+        _check_host_fit(self.blocks)
         homes = {b.home for b in self.blocks if b.home is not None}
         for li, layer in enumerate(layers):
             if li not in self.pos:

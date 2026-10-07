@@ -991,3 +991,62 @@ def test_grow_pool_adds_a_slot_only_with_room_for_the_next_step(monkeypatch):
     monkeypatch.setattr(_mod, "_free_device_bytes", lambda dv: 0)
     assert not sw._grow_pool() and slots() == before + 1
     sw.remove()
+
+
+_GiB = 1 << 30
+
+
+def _fake_psutil(available, total = 32 * _GiB):
+    import types
+    vm = types.SimpleNamespace(available = available, total = total)
+    return types.SimpleNamespace(virtual_memory = lambda: vm)
+
+
+def _host_blocks(n, nbytes, device = "cuda"):
+    import types
+    p = types.SimpleNamespace(data = types.SimpleNamespace(nbytes = nbytes, device = torch.device(device)))
+    return [types.SimpleNamespace(nbytes = lambda: nbytes, params = [p]) for _ in range(n)]
+
+
+def test_host_fit_passes_when_the_layers_fit(monkeypatch):
+    import sys
+    # 32 GiB box: reserve is max(4 GiB, 15%) = 4.8 GiB, so 20 GiB free leaves ~15.2 GiB for layers.
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(20 * _GiB))
+    _mod._check_host_fit(_host_blocks(30, _GiB // 2))
+
+
+def test_host_fit_refuses_with_the_counts_when_the_layers_do_not_fit(monkeypatch):
+    import sys
+    import pytest
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(20 * _GiB))
+    with pytest.raises(ValueError) as e:
+        _mod._check_host_fit(_host_blocks(63, _GiB // 2))
+    msg = str(e.value)
+    assert "63 layers" in msg and "31.5 GiB" in msg and "15.2 GiB" in msg and "At most 30 layers" in msg
+
+
+def test_host_fit_counts_weights_already_in_host_ram_as_available(monkeypatch):
+    import sys
+    # Layers loaded to host already took their RAM; packing replaces them, it does not add to them.
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(6 * _GiB))
+    _mod._check_host_fit(_host_blocks(20, _GiB // 2, device = "cpu"))
+
+
+def test_host_fit_is_skipped_without_psutil(monkeypatch):
+    import sys
+    monkeypatch.setitem(sys.modules, "psutil", None)
+    _mod._check_host_fit(_host_blocks(1000, _GiB))
+
+
+def test_block_swap_refuses_before_moving_anything(monkeypatch):
+    if not torch.cuda.is_available():
+        return
+    import sys
+    import pytest
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(0))
+    layers = _linear_tail()
+    ptrs = [l.weight.data_ptr() for l in layers]
+    with pytest.raises(ValueError, match = "At most 0 layers"):
+        BlockSwap(layers, 3, prefetch_depth = 1, device = "cuda")
+    assert [l.weight.data_ptr() for l in layers] == ptrs
+    assert all(l.weight.device.type == "cuda" and not l._forward_pre_hooks for l in layers)
