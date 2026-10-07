@@ -4069,11 +4069,7 @@ def _install_glm_ocr_compile_patches():
 
 
 def _install_kimi_k3_compile_patches():
-    """Install a compile-safe kimi_k3 image merge.
-
-    The tower already accepts a Python grid; only the merge reads the
-    placeholder positions back through numpy before scattering.
-    """
+    """Only kimi_k3's merge reads back on the host (numpy); its tower takes a Python grid."""
 
     module = _try_import_module("mlx_vlm.models.kimi_k3.kimi_k3")
     if module is None:
@@ -4104,8 +4100,6 @@ def _install_kimi_k3_compile_patches():
         for token_id in candidates:
             image_mask = mx.logical_or(image_mask, input_ids == token_id)
 
-        # Upstream locates the placeholders with numpy and assigns into them;
-        # this indexes with a cumulative sum instead.
         _raise_on_feature_count_mismatch(image_mask, image_features, inputs_embeds)
         merged, _ = _merge_sequence_mask_features(
             image_mask, image_features.astype(inputs_embeds.dtype), inputs_embeds
@@ -4184,7 +4178,6 @@ def _install_muse_glimmer_compile_patches():
         token_mask = (input_ids == self.config.image_token_id) | (
             input_ids == self.config.video_token_id
         )
-        # Upstream scatters into the mask; this indexes instead.
         _raise_on_feature_count_mismatch(token_mask, image_features, inputs_embeds)
         merged, _ = _merge_sequence_mask_features(
             token_mask, image_features, inputs_embeds
@@ -4318,7 +4311,6 @@ def _install_minimax_m3_vl_compile_patches():
             if features is None:
                 continue
             special_mask = input_ids == token_index
-            # As above: indexed rather than scattered.
             _raise_on_feature_count_mismatch(special_mask, features, inputs_embeds)
             inputs_embeds, _ = _merge_sequence_mask_features(
                 special_mask, features, inputs_embeds
