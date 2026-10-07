@@ -47,7 +47,7 @@ def _dtype(dt):
 
 @contextlib.contextmanager
 def _copy_layout(monkeypatch):
-    """The previous layout: contiguous [E, K, N] stacks, and every grouped GEMM weight copied."""
+    """Reference layout: contiguous [E, K, N] stacks, and every grouped GEMM weight copied."""
     fix, gu, dn = ML._grouped_mm_fix, ML._build_gate_up_stack, ML._build_down_stack
     with monkeypatch.context() as m:
         m.setattr(ML, "_build_gate_up_stack", lambda *a: gu(*a).contiguous())

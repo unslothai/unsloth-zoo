@@ -437,7 +437,7 @@ def _lora_operands(projs, name, dtype):
     from unsloth_zoo.temporary_patches.moe_utils import _pad_lora_rank_for_grouped_mm
     stacks = _lora_stacks(projs, name)
     if stacks is not None:
-        A, B = stacks                                         # the stacked Parameters, same values
+        A, B = stacks
     else:
         A = torch.stack([p.lora_A[name].weight for p in projs])   # [E, r, in]
         B = torch.stack([p.lora_B[name].weight for p in projs])   # [E, out, r]
@@ -801,7 +801,7 @@ def grouped_moe_forward(self, hidden_states: torch.Tensor):
         cu = getattr(self, "_cached_gate_up", None)
         if cu is None or cu.device != dev or cu.dtype != dtype:
             with torch.no_grad():
-                # Resident stacks: one contiguous copy at build time, as before the view builders.
+                # Resident stacks: one contiguous copy at build time.
                 self._cached_gate_up = _build_gate_up_stack(experts, spec, dtype).contiguous()
                 self._cached_down = _build_down_stack(experts, spec, dtype).contiguous()
         gate_up = _grouped_mm_fix(permuted, self._cached_gate_up, offsets)
