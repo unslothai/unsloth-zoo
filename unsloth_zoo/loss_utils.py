@@ -470,16 +470,14 @@ pass
 
 
 def count_batch_items(labels, attention_mask = None, input_ids = None, packed_seq_lengths = None,
-                      unshifted = False, packed = True, shift_labels = None):
+                      unshifted = False, packed = True):
     # All Unsloth Zoo code licensed under LGPLv3
     """Counted targets of one micro-batch, as `(count, short, degenerate)`, without a device sync.
 
-    Shared by the batch counter and the MoE aux weighting. Collator `shift_labels` are counted as
-    given, as transformers >= 5 does.
+    Shared by the batch counter and the MoE aux weighting. Counts `labels`, not a collator's
+    `shift_labels`: the fused losses train on `labels`.
     """
     degenerate = input_ids is not None and labels.ndim != input_ids.ndim
-    if shift_labels is not None and not unshifted:
-        return (shift_labels != -100).sum(), shift_labels.shape[-1] < 1, degenerate
     if unshifted:
         return (labels != -100).sum(), labels.shape[-1] < 1, degenerate
     short = labels.shape[-1] < 2
@@ -646,7 +644,6 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                 count, short, bad = count_batch_items(
                     labels, attention_mask, input_ids,
                     None if unshifted else x.get("packed_seq_lengths"), unshifted = unshifted,
-                    shift_labels = None if unshifted else x.get("shift_labels"),
                 )
                 if not short: all_short = False
                 if bad: degenerate = True

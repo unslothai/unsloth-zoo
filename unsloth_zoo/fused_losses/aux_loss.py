@@ -43,11 +43,8 @@ def _local_count(labels, attention_mask, loss_kwargs, model):
     packed_seq_lengths = loss_kwargs.get("packed_seq_lengths", None) if isinstance(loss_kwargs, dict) else None
     # Compiled forwards cannot trace the packed-boundary drop, so unmasked boundaries count there.
     packed = not torch.compiler.is_compiling()
-    shift_labels = loss_kwargs.get("shift_labels", None) if isinstance(loss_kwargs, dict) else None
-    if not isinstance(shift_labels, torch.Tensor): shift_labels = None
     count, _, _ = count_batch_items(labels, attention_mask, None, packed_seq_lengths,
-                                    unshifted = unshifted, packed = packed,
-                                    shift_labels = None if unshifted else shift_labels)
+                                    unshifted = unshifted, packed = packed)
     return count
 
 
