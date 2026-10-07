@@ -235,6 +235,10 @@ def _decline_model(case):
     if case == "dora":
         model, blk = L.build("qwen3", base = "bf16", r = 8, use_dora = True)
         return model, blk, False
+    if case == "dropout_eval":   # grouped now, but train() later runs the loop: never stacked
+        model, blk = L.build("qwen3", base = "bf16", r = 8, lora_dropout = 0.1)
+        model.eval()
+        return model, blk, True
     if case == "dropout_train":
         model, blk = L.build("qwen3", base = "bf16", r = 8, lora_dropout = 0.1)
         model.train()
@@ -242,7 +246,7 @@ def _decline_model(case):
     raise KeyError(case)
 
 
-@pytest.mark.parametrize("case", ["two_adapters", "frozen_expert", "dora", "dropout_train"])
+@pytest.mark.parametrize("case", ["two_adapters", "frozen_expert", "dora", "dropout_eval", "dropout_train"])
 def test_declines_keep_per_expert_parameters(case):
     model, blk, patched = _decline_model(case)
     ref = {n: p for n, p in model.named_parameters()}

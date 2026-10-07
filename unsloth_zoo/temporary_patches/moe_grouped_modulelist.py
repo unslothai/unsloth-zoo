@@ -543,6 +543,11 @@ def _stackable_lora(projs):
                 return None
         if getattr(p, "lora_variant", None) or getattr(p, "lora_bias", {}).get(name, False):
             return None
+        # Dropout > 0 runs the per-expert loop in train mode; a stack would turn an unrouted
+        # expert's None grad into zeros (weight decay / momentum still move it).
+        drop = p.lora_dropout[name] if name in p.lora_dropout else None
+        if drop is not None and not isinstance(drop, torch.nn.Identity) and getattr(drop, "p", 0) > 0:
+            return None
         for kind in ("A", "B"):
             m = getattr(p, "lora_" + kind)[name]
             if type(m) is not torch.nn.Linear or m.bias is not None:
