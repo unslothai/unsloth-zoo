@@ -37,7 +37,7 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from mlx.utils import tree_flatten, tree_map
+from mlx.utils import tree_flatten, tree_map, tree_unflatten
 
 __all__ = [
     "DecisionModel",
@@ -54,6 +54,7 @@ __all__ = [
     "load_decision_model",
     "load_language_model_as_clef",
     "load_trainable_decision_model",
+    "save_clef_adapter",
     "save_clef_model",
     "save_decision_model",
 ]
@@ -638,16 +639,52 @@ def _adapter_base(folder):
     return config["base_model_name_or_path"], revision
 
 
+def _plain_lora(folder):
+    config = _read_json(folder / "adapter_config.json")
+    unmergeable = [key for key in _UNMERGEABLE if config.get(key)]
+    if config.get("peft_type") != "LORA" or config.get("bias", "none") != "none" or unmergeable:
+        raise ValueError(f"Only a plain LoRA adapter can be put on the base model ({unmergeable or config.get('peft_type')})")
+    return config
+
+
+def _lora_key(name):
+    # PEFT prefixes differ with the class the adapter was trained on; names agree from the layer index on.
+    return name[name.index("layers.") :] if "layers." in name else name.rsplit(".", 1)[-1]
+
+
+def _attach_lora(model, folder):
+    """Put a plain LoRA adapter on the modules it names, as adapters of their own, which a quantized base takes too."""
+    from mlx_lm.tuner.lora import LoRALinear
+
+    config, adapter = _plain_lora(folder), mx.load(str(folder / "adapter_model.safetensors"))
+    stems = {_lora_key(stem): stem for stem in {name.rsplit(".lora_", 1)[0] for name in adapter}}
+    if "lm_head" in stems:
+        raise ValueError(f"The adapter in {folder} is on the output embedding, which a Clef's joint head reads as stored")
+    wrapped = []
+    for path, module in model.named_modules():
+        stem = stems.get(_lora_key(path)) if isinstance(module, (nn.Linear, nn.QuantizedLinear)) else None
+        if stem is None:
+            continue
+        low = LoRALinear.from_base(module, r = config["r"], scale = config["lora_alpha"] / config["r"])
+        down, up = adapter[f"{stem}.lora_A.weight"].T, adapter[f"{stem}.lora_B.weight"].T
+        if (down.shape, up.shape) != (low.lora_a.shape, low.lora_b.shape):
+            raise ValueError(f"LoRA tensor {stem} does not fit the base model")
+        low.lora_a, low.lora_b = down, up
+        wrapped.append((path, low))
+    if len(wrapped) != len(stems):
+        raise ValueError(f"The adapter in {folder} names {len(stems)} modules, of which the base model has {len(wrapped)}")
+    model.update_modules(tree_unflatten(wrapped))
+    model.freeze()
+    mx.eval(model.parameters())
+
+
 def _merge_lora(model, folder):
     """Fold a plain LoRA adapter into the decoder's weights: W += alpha / r * B @ A."""
     from mlx.utils import tree_flatten, tree_unflatten
 
     from .utils import _get_text_model
 
-    config = _read_json(folder / "adapter_config.json")
-    unmergeable = [key for key in _UNMERGEABLE if config.get(key)]
-    if config.get("peft_type") != "LORA" or config.get("bias", "none") != "none" or unmergeable:
-        raise ValueError(f"Only a plain LoRA adapter can be merged into the base model ({unmergeable or config.get('peft_type')})")
+    config = _plain_lora(folder)
     scale = config["lora_alpha"] / config["r"]
     adapter = mx.load(str(folder / "adapter_model.safetensors"))
     decoder = _get_text_model(model)
@@ -1168,7 +1205,20 @@ class ClefModel(_QwenModel):
     _NOUL = {"true": "The proposition is true or the answer is yes.", "false": "The proposition is false or the answer is no."}
 
     def __init__(self, folder, dtype, base_model, token, load_in_4bit = False):
-        self._load_beside(folder, dtype, token, "joint_head", load_in_4bit)
+        decoder = folder
+        if (folder / "adapter_config.json").is_file() and not any(folder.glob("model*.safetensors")):
+            # LoRA adapters beside the head. They stay apart from their base, `base_folder`, so that they also sit
+            # on a quantized base and go on training.
+            repo, revision = _adapter_base(folder)
+            decoder = Path(base_model or repo)
+            if not decoder.is_dir():
+                from huggingface_hub import snapshot_download
+
+                decoder = Path(snapshot_download(str(decoder), revision = None if base_model else revision, token = token))
+            self.base_folder = decoder
+        self._load_beside(decoder, dtype, token, "joint_head", load_in_4bit)
+        if decoder != folder:
+            _attach_lora(self.model, folder)
         self.head = _load_joint_head(folder)
         self.head_config = _read_json(folder / _CLEF_HEAD_CONFIG)
         # A fine-tune's per-type temperatures are relative to its head temperature, which is kept apart only when
@@ -1493,6 +1543,54 @@ def _clef_decoder_deltas(decoder, source):
     return deltas
 
 
+def _apart(folder, source):
+    folder, source = Path(folder), Path(source)
+    if folder.resolve() == source.resolve():
+        # The trained model is the source plus what training added, so the source has to stay as it was loaded.
+        raise ValueError(f"Unsloth: a fine-tuned Clef cannot be saved over {source}, the checkpoint it was loaded from.")
+    return folder, source
+
+
+def _clef_head(pipeline, config):
+    """The joint head's tensors as they are saved; `config`'s `head_temperature` is folded into them when they can absorb it."""
+    head = dict(tree_flatten(pipeline.head.parameters()))
+    temperature = float(config.pop("head_temperature", 1.0))
+    if temperature != 1.0:
+        if _fold_temperature(head, temperature):
+            config["folded_temperature"] = float(config.get("folded_temperature", 1.0)) * temperature
+        else:
+            config["head_temperature"] = temperature
+    # The released heads are bfloat16 with their three scalar gates kept in float32.
+    head = {name: value.astype(mx.bfloat16 if value.ndim else mx.float32) for name, value in head.items()}
+    for name, value in head.items():
+        if not mx.isfinite(value).all().item():
+            raise ValueError(f"Unsloth: {name} has values that are not finite, so the model cannot be saved.")
+    return head
+
+
+_TOKENIZER_FILES = ("tokenizer*", "special_tokens_map.json", "added_tokens.json", "vocab.*", "merges.txt", "chat_template*", "*.model")
+
+
+def _commit_clef(pipeline, staging, folder, source, head, config, copied = ("*",)):
+    """Finish a Clef folder staged in `staging`: the head, the configs and the source's `copied` files, then move it into place."""
+    mx.save_safetensors(str(staging / "joint_head.safetensors"), head, metadata = {"format": "pt"})
+    (staging / _CLEF_CONFIG).write_text(json.dumps(config, indent = 2), encoding = "utf-8")
+    (staging / _CLEF_HEAD_CONFIG).write_text(json.dumps(pipeline.head_config, indent = 2), encoding = "utf-8")
+    skipped = {"README.md", _CLEF_CONFIG, "joint_head.safetensors"}
+    for item in {item for pattern in copied for item in source.glob(pattern)}:
+        if item.is_file() and not item.name.startswith(".") and item.name not in skipped and not (staging / item.name).exists():
+            shutil.copyfile(item, staging / item.name)
+    # Old files stay until the new ones are in, and the head's file, which makes a folder a checkpoint, goes last.
+    staged = sorted(staging.iterdir(), key = lambda item: item.name == "joint_head.safetensors")
+    for item in staged:
+        os.replace(item, folder / item.name)
+    kept = {item.name for item in staged}
+    # What would make the folder read as the other kind of save, merged weights or adapters.
+    for item in [*folder.glob("model*.safetensors"), *(folder / name for name in ("model.safetensors.index.json", "config.json", "adapter_config.json", "adapter_model.safetensors"))]:
+        if item.name not in kept:
+            item.unlink(missing_ok = True)
+
+
 def save_clef_model(pipeline, folder, source, config = None):
     """Write a trained Clef pipeline as a Clef checkpoint in `folder`, in the layout of the released models.
 
@@ -1501,10 +1599,7 @@ def save_clef_model(pipeline, folder, source, config = None):
     it was; a full fine-tune adds what its weights moved by since loading. `config` becomes
     `unsloth_decision_config.json`; its `head_temperature` is folded into the head when the head can absorb it.
     """
-    folder, source = Path(folder), Path(source)
-    if folder.resolve() == source.resolve():
-        # The trained model is the source plus what training added, so the source has to stay as it was loaded.
-        raise ValueError(f"Unsloth: a fine-tuned Clef cannot be saved over {source}, the checkpoint it was loaded from.")
+    folder, source = _apart(folder, source)
     config = {"layout": "clef", "temperature": [1.0, 1.0, 1.0], **(config or {}), "fine_tuned": True}
     deltas, stored, refitted = _clef_decoder_deltas(pipeline.model, source), _stored_tensors(source), {}
     quantization = _read_json(source / "config.json").get("quantization", {})
@@ -1528,15 +1623,7 @@ def save_clef_model(pipeline, folder, source, config = None):
         return refitted[stem].pop(leaf)
 
     packed = {name.rpartition(".")[0] for name in deltas if name.rpartition(".")[0] + ".scales" in stored}
-    head = dict(tree_flatten(pipeline.head.parameters()))
-    temperature = float(config.pop("head_temperature", 1.0))
-    if temperature != 1.0:
-        if _fold_temperature(head, temperature):
-            config["folded_temperature"] = float(config.get("folded_temperature", 1.0)) * temperature
-        else:
-            config["head_temperature"] = temperature
-    # The released heads are bfloat16 with their three scalar gates kept in float32.
-    head = {name: value.astype(mx.bfloat16 if value.ndim else mx.float32) for name, value in head.items()}
+    head = _clef_head(pipeline, config)
 
     folder.mkdir(parents = True, exist_ok = True)
     staging = Path(tempfile.mkdtemp(dir = folder, prefix = ".saving-"))
@@ -1561,24 +1648,44 @@ def save_clef_model(pipeline, folder, source, config = None):
             mx.save_safetensors(str(staging / shard.name), tensors, metadata = {"format": "pt"})
         if deltas:
             raise ValueError(f"Unsloth: {source} holds no weights for the trained {sorted(deltas)[:3]}.")
-        for name, value in head.items():
-            if not mx.isfinite(value).all().item():
-                raise ValueError(f"Unsloth: {name} has values that are not finite, so the model cannot be saved.")
-        mx.save_safetensors(str(staging / "joint_head.safetensors"), head, metadata = {"format": "pt"})
-        (staging / _CLEF_CONFIG).write_text(json.dumps(config, indent = 2), encoding = "utf-8")
-        (staging / _CLEF_HEAD_CONFIG).write_text(json.dumps(pipeline.head_config, indent = 2), encoding = "utf-8")
-        skipped = {"README.md", _CLEF_CONFIG, "joint_head.safetensors"}
-        for item in source.iterdir():
-            if item.is_file() and not item.name.startswith(".") and item.name not in skipped and not (staging / item.name).exists():
-                shutil.copyfile(item, staging / item.name)
-        # Old files stay until the new ones are in, and the head's file, which makes a folder a checkpoint, goes last.
-        staged = sorted(staging.iterdir(), key = lambda item: item.name == "joint_head.safetensors")
-        for item in staged:
-            os.replace(item, folder / item.name)
-        kept = {item.name for item in staged}
-        for item in [*folder.glob("model*.safetensors"), folder / "model.safetensors.index.json"]:
-            if item.name not in kept:
-                item.unlink(missing_ok = True)
+        _commit_clef(pipeline, staging, folder, source, head, config)
+    finally:
+        shutil.rmtree(staging, ignore_errors = True)
+
+
+def save_clef_adapter(pipeline, folder, source, base_model, base_revision = None, config = None):
+    """Write a Clef trained through LoRA adapters as those adapters beside its joint head, as PEFT stores them.
+
+    `source` is the checkpoint the decoder was loaded from and `base_model` the name that checkpoint is loaded by (a
+    repo id or a folder), which `load_decision_model` puts the adapters back on. `config` is as for `save_clef_model`.
+    """
+    (folder, source), decoder, stored = _apart(folder, source), pipeline.model, _stored_tensors(source)
+    adapters = [(path, module) for path, module in decoder.named_modules() if "lora_a" in module]
+    whole = [path for path, _ in tree_flatten(decoder.trainable_parameters()) if path.rsplit(".", 1)[-1] not in ("lora_a", "lora_b")]
+    shapes = {(module.lora_a.shape[1], float(module.scale)) for _, module in adapters}
+    if len(shapes) != 1 or whole:
+        raise ValueError("Unsloth: only a Clef trained through LoRA adapters of one rank saves as adapters; save it merged with save_clef_model.")
+    (rank, scale), = shapes
+    tensors = {}
+    for path, module in adapters:
+        name = _decoder_tensor_name(decoder, f"{path}.weight", stored)
+        if type(module).__name__ != "LoRALinear" or name is None:
+            raise ValueError(f"Unsloth: the adapter on {path} cannot be saved as a PEFT adapter.")
+        stem = "base_model.model." + name[: -len(".weight")]
+        tensors[f"{stem}.lora_A.weight"], tensors[f"{stem}.lora_B.weight"] = module.lora_a.T, module.lora_b.T
+    adapter = {
+        "peft_type": "LORA", "task_type": None, "base_model_name_or_path": str(base_model), "revision": base_revision,
+        "r": rank, "lora_alpha": scale * rank, "lora_dropout": 0.0, "bias": "none", "fan_in_fan_out": False, "inference_mode": True,
+        "target_modules": sorted({path.rsplit(".", 1)[-1] for path, _ in adapters}),
+    }
+    config = {"layout": "clef", "temperature": [1.0, 1.0, 1.0], **(config or {}), "fine_tuned": True, "base_model": str(base_model)}
+    head = _clef_head(pipeline, config)
+    folder.mkdir(parents = True, exist_ok = True)
+    staging = Path(tempfile.mkdtemp(dir = folder, prefix = ".saving-"))
+    try:
+        mx.save_safetensors(str(staging / "adapter_model.safetensors"), tensors, metadata = {"format": "pt"})
+        (staging / "adapter_config.json").write_text(json.dumps(adapter, indent = 2), encoding = "utf-8")
+        _commit_clef(pipeline, staging, folder, source, head, config, _TOKENIZER_FILES)
     finally:
         shutil.rmtree(staging, ignore_errors = True)
 
@@ -1861,13 +1968,19 @@ def clef_training_network(
 
     The float32 joint head always trains. The decoder trains whole under `full_finetuning`, otherwise through LoRA
     adapters (`lora` is passed to `FastMLXModel.get_peft_model`); `"all-linear"` means its language layers' projections.
+    A Clef loaded from adapters keeps training those, whatever `r`, `lora_alpha` and `target_modules` say.
     """
     from .loader import FastMLXModel
     from .utils import _get_text_model, describe_output_head
 
     if full_finetuning and any(path.endswith(".scales") for path, _ in tree_flatten(pipeline.model.parameters())):
         raise ValueError("Unsloth: a quantized decoder trains through LoRA adapters only; pass full_finetuning = False.")
-    if full_finetuning:
+    if any("lora_a" in module for _, module in pipeline.model.named_modules()):
+        # Adapters the checkpoint was loaded with go on training as they are.
+        if full_finetuning:
+            raise ValueError("Unsloth: a Clef loaded from LoRA adapters trains through them; pass full_finetuning = False.")
+        pipeline.model.unfreeze(keys = ["lora_a", "lora_b"], strict = False)
+    elif full_finetuning:
         # Only what a text prompt reaches: a trainable weight without a gradient would still decay.
         pipeline.model.freeze()
         _get_text_model(pipeline.model).unfreeze()

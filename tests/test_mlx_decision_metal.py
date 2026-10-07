@@ -762,6 +762,50 @@ def test_saved_clef_holds_the_trained_decoder_and_a_head_with_its_temperature_fo
         save_clef_model(pipeline, tmp_path / "out" / ".." , tmp_path)
 
 
+@pytest.mark.parametrize("four_bit", [False, True])
+def test_a_clef_saves_as_adapters_that_load_over_their_base_and_go_on_training(clef, tmp_path, four_bit):
+    from unsloth_zoo.mlx.decision import save_clef_adapter
+
+    record, base, out = clef[2]("hello"), tmp_path / "base", tmp_path / "out"
+    base.mkdir(), out.mkdir()
+    pipeline = load_decision_model(tmp_path, load_in_4bit = four_bit)
+    mx.save_safetensors(str(base / "model.safetensors"), _clef_checkpoint_tensors(_decoder()))
+    (base / "tokenizer.json").write_text("{}"), (base / "config.json").write_text("{}"), (out / "model.safetensors").write_text("stale")
+    with pytest.raises(ValueError, match = "through LoRA adapters"):
+        save_clef_adapter(pipeline, out, base, "org/base")
+    # Adapters on every layer, or on the last one only.
+    clef_training_network(pipeline, r = 4, lora_alpha = 8, **({"finetune_last_n_layers": 1} if four_bit else {}))
+    trained = pipeline.model.trainable_parameters()
+    assert any("layers.0." in name for name, _ in tree_flatten(trained)) != four_bit
+    pipeline.model.update(tree_map(lambda value: value + 0.05 * mx.random.normal(value.shape).astype(value.dtype), trained))
+    args = record["input_ids"], record["question_spans"], record["option_spans"], record["types"]
+    before = np.array(pipeline.logits(*args))
+    with pytest.raises(ValueError, match = "saved over"):
+        save_clef_adapter(pipeline, base, base, "org/base")
+    save_clef_adapter(pipeline, out, base, "org/base", "abc", {"head_temperature": 2.0})
+    adapter, tensors = json.loads((out / "adapter_config.json").read_text()), mx.load(str(out / "adapter_model.safetensors"))
+    assert (adapter["base_model_name_or_path"], adapter["revision"], adapter["r"], adapter["lora_alpha"]) == ("org/base", "abc", 4, 8.0)
+    assert sorted(item.name for item in out.iterdir()) == ["adapter_config.json", "adapter_model.safetensors", "joint_head.safetensors", "joint_head_config.json", "tokenizer.json", "unsloth_decision_config.json"]
+    low = dict(pipeline.model.named_modules())["language_model.model.layers.3.mlp.down_proj"]
+    name = "base_model.model.model.language_model.layers.3.mlp.down_proj.lora_{}.weight"
+    assert mx.array_equal(tensors[name.format("A")], low.lora_a.T).item() and mx.array_equal(tensors[name.format("B")], low.lora_b.T).item()
+    served = load_decision_model(out, base_model = base, load_in_4bit = four_bit)
+    assert served.base_folder == base and not tree_flatten(served.model.trainable_parameters())
+    np.testing.assert_allclose(np.array(served.logits(*args)), before / 2, atol = 3e-2)
+    with pytest.raises(ValueError, match = "trains through"):
+        clef_training_network(served, full_finetuning = True)
+    network = clef_training_network(served, r = 64)
+    again = dict(tree_flatten(served.model.trainable_parameters()))
+    assert again.keys() == dict(tree_flatten(trained)).keys() and again["language_model.model.layers.3.mlp.down_proj.lora_a"].shape[1] == 4
+    grads = dict(tree_flatten(_clef_record_loss_and_grad(network, record)[1]))
+    assert mx.any(grads["encoder.language_model.model.layers.3.mlp.down_proj.lora_a"]).item()
+    # An adapter for a module the base does not have, or for the output embedding the joint head reads, is not put on it.
+    for stem, refusal in (("layers.9.mlp.down_proj", "of which the base model has"), ("lm_head", "output embedding")):
+        mx.save_safetensors(str(out / "adapter_model.safetensors"), {key.replace("model.language_model.layers.3.mlp.down_proj", stem): value for key, value in tensors.items()})
+        with pytest.raises(ValueError, match = refusal):
+            load_decision_model(out, base_model = base)
+
+
 def test_a_plain_language_model_gets_a_new_joint_head_and_saves_as_a_clef(clef, tmp_path, monkeypatch):
     from unsloth_zoo.mlx.decision import ClefModel, _decoder_tensor_name, clef_head_config, load_language_model_as_clef
 
