@@ -605,8 +605,20 @@ def test_t4_with_a_new_triton_keeps_fast_path(env, monkeypatch, capsys, version)
     assert patch() is None
     assert model_mod.is_fast_path_available is True
     assert iu.is_mamba_ssm_available() is True
-    assert "mamba-ssm" in hk._HUB_KERNEL_MAPPING
     assert capsys.readouterr().out == ""
+
+
+def test_t4_fast_path_takes_mamba_ssm_from_the_local_package(env, monkeypatch):
+    """Only the local package's autotune configs can be trimmed, so the Hub
+    copies go; causal-conv1d (LFM2) and unrelated kernels stay."""
+    _model_mod, _iu, hk = env
+    _set_triton(monkeypatch, "3.6.0")
+    assert patch() is None
+    for name in ("mamba-ssm", "falcon_mamba-ssm"):
+        assert name not in hk._HUB_KERNEL_MAPPING
+    assert hk._KERNEL_MODULE_MAPPING["mamba-ssm"] is None
+    assert "causal-conv1d" in hk._HUB_KERNEL_MAPPING
+    assert "deep-gemm" in hk._HUB_KERNEL_MAPPING
 
 
 @pytest.mark.parametrize("version", ["3.2.0", "3.3.1", None])

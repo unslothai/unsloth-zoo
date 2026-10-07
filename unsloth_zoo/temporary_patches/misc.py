@@ -1405,8 +1405,19 @@ def patch_mamba_ssm_pre_ampere_fallback():
     if blocker is None:
         if (major, minor) < (8, 0):
             # The fast path runs here, but full autotuning costs minutes of
-            # compiles before the first step. `import mamba_ssm` loads every
-            # ssd kernel module.
+            # compiles before the first step, and only the local package can
+            # be trimmed. So transformers 5 must not fetch mamba-ssm from the
+            # Hub: without the entries it falls back to the local package
+            # (patch_lazy_load_kernel_local_packages) or the slow path.
+            try:
+                from transformers.integrations import hub_kernels as _hk
+                for _kernel in ("mamba-ssm", "falcon_mamba-ssm"):
+                    _hk._HUB_KERNEL_MAPPING.pop(_kernel, None)
+                    if _kernel in _hk._KERNEL_MODULE_MAPPING:
+                        _hk._KERNEL_MODULE_MAPPING[_kernel] = None
+            except Exception:
+                pass
+            # `import mamba_ssm` loads every ssd kernel module.
             try:
                 import mamba_ssm  # noqa: F401
                 _single_mamba_ssm_autotune_config()
