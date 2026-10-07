@@ -553,7 +553,7 @@ def test_decline_falls_back_to_loop(name):
 
 @pytest.mark.parametrize("name", [n for n in DECLINES if n not in ("kill_switch", "lora_dtype_mismatch")])
 def test_decline_guard_is_load_bearing(name, monkeypatch):
-    """Flip: with the readiness guard removed, the grouped forward no longer matches the loop."""
+    """With the readiness guard removed, the grouped forward no longer matches the loop."""
     model, blk, ctx = _decline_case(name)
     _force_engage(monkeypatch)
     if name == "trainable_base":
@@ -620,7 +620,7 @@ def test_expert_bias_declines(wrapped, monkeypatch):
     assert ML._block_is_eligible(blk) is None
     _assert_falls_back(blk)
     assert ML.enable_grouped_moe(model, verbose = False) == 0 and not hasattr(blk, "_orig_moe_forward")
-    # flip: patch directly and force engagement past the guard
+    # patch directly and force engagement past the guard
     enable_direct = _decline_case.__globals__["types"].MethodType
     blk._orig_moe_forward = blk.forward
     blk._unsloth_moe_spec = ML._BLOCK_SPECS[type(blk).__name__]
