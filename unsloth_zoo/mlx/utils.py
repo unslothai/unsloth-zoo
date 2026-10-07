@@ -3551,6 +3551,7 @@ _VLM_STATIC_METADATA_MODEL_TYPES = {
     "minimax_m3_vl": ("image_grid_thw", "video_grid_thw"),
     "muse_glimmer": ("image_grid_thw", "video_grid_thw"),
     "kimi_k3": ("grid_thws", "image_grid_hws", "video_grid_hws"),
+    "ernie4_5_moe_vl": ("image_grid_thw", "video_grid_thw"),
     # One `_as_grid_list` call reads whichever of the two the batch carries.
     "mage_vl": ("image_grid_thw", "video_grid_thw"),
     # Pixtral's vision tower, which mistral3 and mistral4 checkpoints also load.

@@ -82,6 +82,7 @@ _VERIFIED_TRAINING_ARCHES: set[str] = {
     # Nested `text_config` decoder must qualify too, else gemma4 stays eager.
     "gemma4_text",
     "dots_ocr",
+    "ernie4_5_moe_vl",
     "glm_ocr",
     "idefics2",
     "idefics3",
@@ -129,6 +130,12 @@ _MODEL_REPO_TRAINING_COMPILE_BLOCKLIST: tuple[tuple[str, str], ...] = (
         "SmolVLM/Idefics3 real training currently leaves MLX primitive-less arrays after compiled execution",
     ),
 )
+
+# Compiled training here is qualified on the CCE loss only: `use_cce=False` runs
+# the upstream `Model.__call__`, which still reads these values on the host.
+_CCE_ONLY_TRAINING_COMPILE_ARCHES: dict[str, str] = {
+    "ernie4_5_moe_vl": "its token types and rotary positions",
+}
 
 
 _BACKEND_CONFIG_KEYS = (
@@ -235,6 +242,7 @@ _TRAINING_VERIFIER_HINTS: dict[str, str] = {
     "gemma4_unified": "verify_gemma4_unified",
     "gemma4_text": "verify_gemma4_text",
     "dots_ocr": "verify_dots_ocr",
+    "ernie4_5_moe_vl": "verify_ernie4_5_moe_vl",
     "glm_ocr": "verify_glm_ocr",
     "idefics2": "verify_idefics2",
     "idefics3": "verify_idefics3",
@@ -1710,6 +1718,7 @@ def resolve_training_compile(
     model_or_arch,
     policy: MLXVLMCompilePolicy | None = None,
     args=None,
+    use_cce=None,
 ) -> ResolvedTrainingCompileDecision:
     """Resolve whether a training run should use `mx.compile`.
 
@@ -1880,6 +1889,21 @@ def resolve_training_compile(
             strict_requested=strict_requested,
             should_raise=strict_requested,
             reason=reason,
+            qualification=qualification,
+            backend_qualifications=backend_qualifications,
+        )
+    host_reads = _CCE_ONLY_TRAINING_COMPILE_ARCHES.get(arch)
+    if use_cce is None:
+        use_cce = getattr(args, "use_cce", True)
+    if host_reads is not None and use_cce is False:
+        return finalize(
+            arch_name=arch,
+            enabled=False,
+            policy_mode=policy_mode,
+            fallback_allowed=fallback_allowed,
+            strict_requested=strict_requested,
+            should_raise=strict_requested,
+            reason=f"use_cce=False reads {host_reads} on the host",
             qualification=qualification,
             backend_qualifications=backend_qualifications,
         )
@@ -4438,6 +4462,135 @@ def _install_minimax_m3_vl_compile_patches():
     _PATCHED_ARCHES.add("minimax_m3_vl")
 
 
+def _install_ernie4_5_moe_vl_compile_patches():
+    """Install compile-safe ernie4_5_moe_vl vision, resampler and merge patches.
+
+    The tower, the resampler and the merge each read the grid or the placeholder
+    count back on the host; these take the grid as Python tuples instead.
+    """
+
+    module = _try_import_module("mlx_vlm.models.ernie4_5_moe_vl.ernie4_5_moe_vl")
+    vision_module = _try_import_module("mlx_vlm.models.ernie4_5_moe_vl.vision")
+    if module is None or vision_module is None:
+        return
+
+    import numpy as np
+
+    def patched_rot_pos_emb(self, grid_thw, num_pad=0):
+        import mlx.core as mx
+
+        grid_spec = _grid_to_tuple(grid_thw)
+        merge = self.spatial_merge_size
+        pos_ids = []
+        for t, h, w in grid_spec:
+            hpos_ids = np.tile(np.arange(h).reshape(-1, 1), (1, w))
+            wpos_ids = np.tile(np.arange(w).reshape(1, -1), (h, 1))
+            hpos_ids = hpos_ids.reshape(h // merge, merge, w // merge, merge)
+            wpos_ids = wpos_ids.reshape(h // merge, merge, w // merge, merge)
+            hpos_ids = np.transpose(hpos_ids, (0, 2, 1, 3)).flatten()
+            wpos_ids = np.transpose(wpos_ids, (0, 2, 1, 3)).flatten()
+            pos_ids.append(np.tile(np.stack([hpos_ids, wpos_ids], axis=-1), (t, 1)))
+        pos_ids = np.concatenate(pos_ids, axis=0)
+        if num_pad > 0:
+            pos_ids = np.concatenate(
+                [pos_ids, np.zeros((num_pad, 2), dtype=pos_ids.dtype)], axis=0
+            )
+        max_grid_size = max(max(h, w) for _, h, w in grid_spec)
+        rotary = self.rotary_pos_emb(max_grid_size)
+        return rotary[mx.array(pos_ids, dtype=mx.int32)].reshape(pos_ids.shape[0], -1)
+
+    def patched_vision_call(
+        self, hidden_states, grid_thw, output_hidden_states=None, num_pad=0
+    ):
+        del output_hidden_states
+        grid_spec = _grid_to_tuple(grid_thw)
+        hidden_states = self.patch_embed(hidden_states)
+        rotary_pos_emb = self.rot_pos_emb(grid_spec, num_pad=num_pad)
+        # One segment per image, not per frame, as upstream builds it.
+        cu_seqlens = [0]
+        for t, h, w in grid_spec:
+            cu_seqlens.append(cu_seqlens[-1] + t * h * w)
+        if num_pad > 0:
+            cu_seqlens.append(cu_seqlens[-1] + num_pad)
+        for block in self.blocks:
+            hidden_states = block(
+                hidden_states, cu_seqlens=tuple(cu_seqlens), rotary_pos_emb=rotary_pos_emb
+            )
+        return self.ln(hidden_states)
+
+    def patched_attention(self, x, cu_seqlens, rotary_pos_emb=None):
+        import mlx.core as mx
+
+        seq_length = x.shape[0]
+        qkv = (
+            self.qkv(x).reshape(seq_length, 3, self.num_heads, -1).transpose(1, 0, 2, 3)
+        )
+        q, k, v = mx.split(qkv, 3)
+        q = vision_module.apply_rotary_pos_emb_vision(mx.expand_dims(q, 0), rotary_pos_emb)[0]
+        k = vision_module.apply_rotary_pos_emb_vision(mx.expand_dims(k, 0), rotary_pos_emb)[0]
+        q, k, v = (tensor.transpose(0, 2, 1, 3) for tensor in (q, k, v))
+
+        # Upstream splits at its first two boundaries only, which leaves empty
+        # segments for one or two images; an empty segment crashes the compiled
+        # attention kernel, so those are dropped and the rest kept as upstream has them.
+        lengths = [end - start for start, end in zip(cu_seqlens[:-1], cu_seqlens[1:])]
+        split_points = sorted(
+            {point for point in (lengths[0], sum(lengths[:2])) if 0 < point < seq_length}
+        )
+        segments = zip(*(mx.split(tensor, split_points, axis=2) for tensor in (q, k, v)))
+        output = mx.concatenate(
+            [
+                mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask=None)
+                for q, k, v in segments
+            ],
+            axis=2,
+        )
+        return self.proj(output.transpose(0, 2, 1, 3).reshape(seq_length, -1))
+
+    def patched_resampler_call(self, x, grid_thw):
+        import mlx.core as mx
+
+        x = self.spatial_linear(self.spatial_conv_reshape(x))
+        if self.use_temporal_conv:
+            grid = np.array(_grid_to_tuple(grid_thw), dtype=np.int64)
+            spatial_sizes = grid[:, 1:].prod(-1) // (self.spatial_conv_size**2)
+            tokens = grid.prod(-1) // (self.spatial_conv_size**2)
+            offsets = np.concatenate([[0], tokens.cumsum()[:-1]])
+            assert (
+                self.temporal_conv_size == 2
+            ), f"Hard Code: temporal_conv_size==2, got: {self.temporal_conv_size}"
+
+            def frame_rows(first):
+                rows = []
+                for temporal_size, spatial_size, offset in zip(grid[:, 0], spatial_sizes, offsets):
+                    start = first if temporal_size > 1 else 0
+                    for frame in range(start, temporal_size, 2):
+                        rows.append(
+                            np.arange(offset + frame * spatial_size, offset + (frame + 1) * spatial_size)
+                        )
+                return mx.array(np.concatenate(rows).astype(np.int32))
+
+            x = mx.concatenate([x[frame_rows(0), :], x[frame_rows(1), :]], axis=-1)
+            x = self.temporal_linear(x)
+        return self.after_norm(self.mlp(x))
+
+    def patched_merge(self, image_features, inputs_embeds, input_ids):
+        return _merge_exclusive_special_token_features(
+            self.config.image_token_id,
+            self.config.video_token_id,
+            image_features,
+            inputs_embeds,
+            input_ids,
+        )
+
+    _patch_method(vision_module.VisionModel, "rot_pos_emb", patched_rot_pos_emb)
+    _patch_method(vision_module.VisionModel, "__call__", patched_vision_call)
+    _patch_method(vision_module.VisionAttention, "__call__", patched_attention)
+    _patch_method(module.VariableResolutionResamplerModel, "__call__", patched_resampler_call)
+    _patch_method(module.Model, "_merge_input_ids_with_image_features", patched_merge)
+    _PATCHED_ARCHES.add("ernie4_5_moe_vl")
+
+
 def _paddleocr_vl_has_batched_vision(vision_module) -> bool:
     """Whether PaddleOCR-VL exposes its newer batched vision contract."""
 
@@ -6628,6 +6781,17 @@ def list_compile_pattern_bundles() -> tuple[CompilePatternBundle, ...]:
             ),
         ),
         CompilePatternBundle(
+            name="ernie4_5_moe_vl_vision_compile",
+            description="ernie4_5_moe_vl vision, resampler and merge compile patch set.",
+            matcher=lambda arch, report: arch == "ernie4_5_moe_vl",
+            primitive_names=(
+                "vision_metadata_normalization",
+                "compile_safe_feature_merge",
+                "segmented_vision_attention",
+            ),
+            runtime_primitive_names=("ernie4_5_moe_vl_vision_compile_runtime",),
+        ),
+        CompilePatternBundle(
             name="glm_ocr_vision_compile",
             description="GLM OCR vision/merge compile patch set.",
             matcher=lambda arch, report: arch == "glm_ocr",
@@ -6733,6 +6897,7 @@ def _runtime_patch_primitive_installers() -> dict[str, Callable[[], None]]:
         "kimi_k3_vision_compile_runtime": _install_kimi_k3_compile_patches,
         "muse_glimmer_vision_compile_runtime": _install_muse_glimmer_compile_patches,
         "minimax_m3_vl_vision_compile_runtime": _install_minimax_m3_vl_compile_patches,
+        "ernie4_5_moe_vl_vision_compile_runtime": _install_ernie4_5_moe_vl_compile_patches,
         "glm_ocr_vision_compile_runtime": _install_glm_ocr_compile_patches,
         "paddleocr_vl_multimodal_runtime": _install_paddleocr_vl_compile_patches,
     }

@@ -5944,6 +5944,7 @@ def test_a_processor_emitted_grid_array_is_never_downgraded():
     ("kimi_k3", "grid_thws", "image_grid_thw"),
     ("kimi_k3", "image_grid_hws", "image_grid_thw"),
     ("kimi_k3", "video_grid_hws", "image_grid_thw"),
+    ("ernie4_5_moe_vl", "image_grid_thw", "image_sizes"),
 ])
 def test_a_family_without_a_patched_embedder_still_gets_its_static_metadata(
     model_type, declared, undeclared,

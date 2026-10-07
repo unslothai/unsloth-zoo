@@ -2596,7 +2596,7 @@ def test_stream_grid_widens_vlm_batches_at_the_consumer_width_seam():
 # Per family: the rebindings its installer must make, as (module, class or None
 # for a module-level name, attribute[, the `unsloth_zoo.mlx.compile` attribute it
 # must be bound to]); the merge it replaces, as (class or None, attribute,
-# upstream requires equal counts).
+# upstream requires equal counts), or None when it only delegates to a shared one.
 HOST_GRID_FAMILIES = [
     ("dots_ocr",
      [("vision", "VisionModel", "__call__"),
@@ -2620,6 +2620,13 @@ HOST_GRID_FAMILIES = [
     ("kimi_k3",
      [("model", "Model", "_prepare_inputs_for_multimodal")],
      ("Model", "_prepare_inputs_for_multimodal", True)),
+    ("ernie4_5_moe_vl",
+     [("vision", "VisionModel", "__call__"),
+      ("vision", "VisionModel", "rot_pos_emb"),
+      ("vision", "VisionAttention", "__call__"),
+      ("model", "VariableResolutionResamplerModel", "__call__"),
+      ("model", "Model", "_merge_input_ids_with_image_features")],
+     None),
 ]
 
 
@@ -2701,6 +2708,14 @@ def test_each_host_grid_family_is_qualified_and_really_patched(arch, bindings, m
             if len(binding) == 4:
                 assert bound is getattr(mc, binding[3]), binding[2]
 
+        if merge is None:
+            # Image placeholders fill before video ones, and a surplus row is ignored.
+            owner, binding = owners[-1], bindings[-1]
+            merged = getattr(owner, binding[2])(
+                SimpleNamespace(config=SimpleNamespace(image_token_id=10, video_token_id=20)),
+                mx.array([[1.0], [2.0]]), mx.zeros((1, 3, 1)), mx.array([[20, 10, 5]]))
+            assert merged.tolist() == [[[0.0], [1.0], [0.0]]], binding[2]
+            return
         cls, method, exact = merge
         owner = modules["model"] if cls is None else getattr(modules["model"], cls)
         source = inspect.getsource(getattr(owner, method))
@@ -2884,3 +2899,28 @@ def test_gemma4_mask_patch_leaves_pre_overlay_mlx_vlm_alone(monkeypatch):
     mc._runtime_patch_primitive_installers()["gemma4_vision_masks_runtime"]()
     assert Gemma4TextModel._make_masks is upstream
     assert Gemma4TextModel()._make_masks(None, [None, None]) == ["upstream", "upstream"]
+
+
+def test_cce_only_compile_family_is_refused_on_the_standard_loss():
+    """ernie's upstream forward, which `use_cce=False` runs, still reads on the
+    host; compile must be refused up front rather than fail mid-run."""
+    _skip_if_mlx_core_was_replaced()
+    from types import SimpleNamespace as NS
+
+    import unsloth_zoo.mlx.compile as mc
+
+    ernie = type("Model", (), {"__module__": "mlx_vlm.models.ernie4_5_moe_vl.ernie4_5_moe_vl"})()
+    ernie.config = NS(model_type="ernie4_5_moe_vl")
+    policy = mc.MLXVLMCompilePolicy(mode="best_effort")
+    assert mc.resolve_training_compile(ernie, policy=policy, args=NS(use_cce=True)).enabled
+    refused = mc.resolve_training_compile(ernie, policy=policy, args=NS(use_cce=False))
+    assert not refused.enabled and refused.fallback_allowed
+    assert "use_cce=False" in refused.reason
+    # A CCE factory fallback (e.g. a LoRA-wrapped lm_head) lands on the same forward.
+    fell_back = mc.resolve_training_compile(ernie, policy=policy, args=NS(use_cce=True), use_cce=False)
+    assert not fell_back.enabled and "use_cce=False" in fell_back.reason
+    import unsloth_zoo.mlx.trainer as mt
+    assert "use_cce=bool(use_cce)" in inspect.getsource(mt)
+    other = type("Model", (), {"__module__": "mlx_vlm.models.glm_ocr.glm_ocr"})()
+    other.config = NS(model_type="glm_ocr")
+    assert mc.resolve_training_compile(other, policy=policy, args=NS(use_cce=False)).enabled
