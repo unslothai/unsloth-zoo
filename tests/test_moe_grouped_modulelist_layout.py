@@ -25,6 +25,16 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse = True)
+def _fresh_view_probe(monkeypatch):
+    """Re-run moe_utils' view probe here: a flag latched False by an earlier test would keep the
+    copy and make every bitwise check below vacuous."""
+    from unsloth_zoo.temporary_patches import moe_utils
+    monkeypatch.setattr(moe_utils, "_TRANSPOSED_VIEW_GROUPED_MM_SAFE", None)
+    if not moe_utils._transposed_view_grouped_mm_is_safe():
+        pytest.skip("view probe failed on this device: the copy is kept by design")
+
+
 @contextlib.contextmanager
 def _dtype(dt):
     old = L.DT
@@ -126,7 +136,13 @@ def test_view_layout_bitwise_equals_copy_layout(lora, backend, dt, base, policy,
         counts = torch.bincount(sel.flatten(), minlength = L.E)
         assert (counts == 0).sum() >= 3 and counts.max() >= L.T * 0.9
     before = (ML.CALLS["grouped"], dict(calls) if calls is not None else None)
+    views = []
+    real_ok = ML._view_weight_ok
+    monkeypatch.setattr(ML, "_view_weight_ok", lambda w: views.append(real_ok(w)) or views[-1])
     new = _step(blk, x, gout, ckpt = False)
+    monkeypatch.setattr(ML, "_view_weight_ok", real_ok)
+    if backend == "torch":
+        assert any(views) == (policy != "cache"), views   # the uncopied view reached torch._grouped_mm
     assert ML.CALLS["grouped"] == before[0] + 1
     if calls is not None:
         assert calls["gemm"] > before[1]["gemm"], "Triton generic GEMM not engaged"
@@ -176,8 +192,6 @@ def test_gemms_take_views_and_backward_reads_the_stack(monkeypatch):
     """torch._grouped_mm gets the uncopied view in forward and the contiguous stack in backward;
     the copy fallback still applies when the view probe says no."""
     from unsloth_zoo.temporary_patches import moe_utils
-    if not moe_utils._transposed_view_grouped_mm_is_safe():
-        pytest.skip("view probe failed on this device: the copy is kept by design")
     monkeypatch.setenv("UNSLOTH_MOE_GROUPED_TRITON", "0")
     model, blk = _block("nf4", torch.bfloat16, False, "recompute", "uniform")
     x, gout = _inputs(torch.bfloat16, "uniform")
