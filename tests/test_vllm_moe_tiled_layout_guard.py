@@ -29,7 +29,7 @@ PREFIX = "model.language_model.layers.0.mlp"
 
 
 def tile_w13(w13):
-    # Closed form of FlashInfer's BlockMajorK + shuffled w13 (scripts/trtllm_layout/layout_check.py)
+    # Closed form of FlashInfer's BlockMajorK + shuffled w13 (checked against its converter)
     E, M, H = w13.shape; I = M // 2
     x = w13.view(E, 2, I // 16, 8, 2, H // 64, 64).flip(1)
     return x.permute(0, 5, 2, 4, 1, 3, 6).reshape(E, H // 64, M, 64)

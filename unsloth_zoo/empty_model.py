@@ -1604,8 +1604,7 @@ pass
 
 
 def verify_vllm_moe_experts_match_checkpoint(state_dict, model_path, revision = None, cache_dir = None):
-    """Compare a few expert rows to the checkpoint; catches in-place shape-preserving rewrites (vLLM >= 0.31 TRT-LLM).
-    True = verified, None = no comparable checkpoint tensor."""
+    """Few expert rows vs the checkpoint (vLLM >= 0.31 tiles in place); True = verified, None = nothing comparable."""
     w13_key = next((k for k in state_dict if k.endswith(".experts.gate_up_proj")), None)
     if w13_key is None: return None
     w2_key = w13_key[: -len("gate_up_proj")] + "down_proj"
