@@ -91,17 +91,15 @@ def _pin_budget():
         return 0
 
 
-def _check_host_fit(blocks):
-    """Refuse an offload whose host copies would not fit in free RAM: running host RAM out freezes the machine."""
+def _check_host_fit(sizes, on_host = 0):
+    """Refuse an offload whose layers (`sizes`, bytes each) would not fit in free host RAM: running it out
+    freezes the machine. `on_host` bytes of them already sit in host RAM and are counted as available."""
     try:
         import psutil
         vm = psutil.virtual_memory()
     except Exception:
         return
-    sizes = [b.nbytes() for b in blocks]
     need = sum(sizes)
-    # Weights already in host RAM are replaced by the packed copy, so their bytes come back.
-    on_host = sum(p.data.nbytes for b in blocks for p in b.params if p.data.device.type == "cpu")
     avail = vm.available + on_host - _host_reserve(vm)
     if need <= avail:
         return
@@ -111,7 +109,7 @@ def _check_host_fit(blocks):
             break
         used, fit = used + size, fit + 1
     raise ValueError(
-        f"Unsloth: offload_layers asked for {len(blocks)} layers in host RAM, which needs "
+        f"Unsloth: offload_layers asked for {len(sizes)} layers in host RAM, which needs "
         f"{need / 2**30:.1f} GiB, but only {max(avail, 0) / 2**30:.1f} GiB is available after keeping "
         f"{_host_reserve(vm) / 2**30:.1f} GiB free for the system. At most {fit} layers would fit; "
         "lower offload_layers or free host RAM."
@@ -346,7 +344,9 @@ class BlockSwap:
                 owners.setdefault(id(p), set()).add(li)
         shared = {pid for pid, o in owners.items() if len(o) > 1}
         self.blocks = [_Block(layer, self.streams, self.device, shared) for layer in swapped]
-        _check_host_fit(self.blocks)
+        # Weights already in host RAM are replaced by the packed copy, so their bytes come back.
+        _check_host_fit([b.nbytes() for b in self.blocks],
+                        sum(p.data.nbytes for b in self.blocks for p in b.params if p.data.device.type == "cpu"))
         homes = {b.home for b in self.blocks if b.home is not None}
         for li, layer in enumerate(layers):
             if li not in self.pos:
@@ -997,7 +997,7 @@ class _HostLoad:
     def __init__(self, n, placement, embeddings = False):
         self.n, self.placement, self.want_embeddings = n, placement, embeddings
         self.layers, self.indices, self.prefixes = None, [], {}
-        self.done = set()
+        self.done, self.done_bytes = set(), []
         self.embedding_prefixes, self.embeddings = {}, []
 
     def bind(self, model):
@@ -1030,6 +1030,11 @@ class _HostLoad:
         params = list(layer.parameters())
         if not force and any(p.device.type == "meta" for p in params):
             return
+        # Layers still to come are sized like this one; the first check runs before any layer has moved.
+        size = sum(p.nbytes for p in params if p.device.type != "meta")
+        left = len(self.indices) - len(self.done)
+        _check_host_fit(self.done_bytes + [size] * left,
+                        sum(self.done_bytes) + sum(p.nbytes for p in params if p.device.type == "cpu"))
         with torch.no_grad():
             for p in params:
                 if p.is_floating_point():
@@ -1037,6 +1042,7 @@ class _HostLoad:
                 if p.device.type not in ("cpu", "meta"):
                     p.data = p.data.to("cpu")
         self.done.add(i)
+        self.done_bytes.append(size)
 
     def on_param(self, model, target_name):
         self.bind(model)

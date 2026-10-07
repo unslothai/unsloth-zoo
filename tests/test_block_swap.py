@@ -1002,17 +1002,11 @@ def _fake_psutil(available, total = 32 * _GiB):
     return types.SimpleNamespace(virtual_memory = lambda: vm)
 
 
-def _host_blocks(n, nbytes, device = "cuda"):
-    import types
-    p = types.SimpleNamespace(data = types.SimpleNamespace(nbytes = nbytes, device = torch.device(device)))
-    return [types.SimpleNamespace(nbytes = lambda: nbytes, params = [p]) for _ in range(n)]
-
-
 def test_host_fit_passes_when_the_layers_fit(monkeypatch):
     import sys
     # 32 GiB box: reserve is max(4 GiB, 15%) = 4.8 GiB, so 20 GiB free leaves ~15.2 GiB for layers.
     monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(20 * _GiB))
-    _mod._check_host_fit(_host_blocks(30, _GiB // 2))
+    _mod._check_host_fit([_GiB // 2] * 30)
 
 
 def test_host_fit_refuses_with_the_counts_when_the_layers_do_not_fit(monkeypatch):
@@ -1020,7 +1014,7 @@ def test_host_fit_refuses_with_the_counts_when_the_layers_do_not_fit(monkeypatch
     import pytest
     monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(20 * _GiB))
     with pytest.raises(ValueError) as e:
-        _mod._check_host_fit(_host_blocks(63, _GiB // 2))
+        _mod._check_host_fit([_GiB // 2] * 63)
     msg = str(e.value)
     assert "63 layers" in msg and "31.5 GiB" in msg and "15.2 GiB" in msg and "At most 30 layers" in msg
 
@@ -1029,13 +1023,68 @@ def test_host_fit_counts_weights_already_in_host_ram_as_available(monkeypatch):
     import sys
     # Layers loaded to host already took their RAM; packing replaces them, it does not add to them.
     monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(6 * _GiB))
-    _mod._check_host_fit(_host_blocks(20, _GiB // 2, device = "cpu"))
+    _mod._check_host_fit([_GiB // 2] * 20, on_host = 10 * _GiB)
 
 
 def test_host_fit_is_skipped_without_psutil(monkeypatch):
     import sys
     monkeypatch.setitem(sys.modules, "psutil", None)
-    _mod._check_host_fit(_host_blocks(1000, _GiB))
+    _mod._check_host_fit([_GiB] * 1000)
+
+
+def _host_load(n_layers, n, width = 64):
+    layers = nn.ModuleList([nn.Linear(width, width, bias = False) for _ in range(n_layers)])
+    state = _mod._HostLoad(n, "tail")
+    state.layers, state.indices = layers, swap_indices(n_layers, n, "tail")
+    return state, layers
+
+
+def test_host_load_refuses_before_moving_any_layer(monkeypatch):
+    import sys
+    import pytest
+    # Each 64x64 fp32 layer is 16 KiB and the CPU-built one counts as already on host: room for 2 of 3.
+    total = 64 * _GiB
+    reserve = int(total * _mod._PIN_RESERVE_FRACTION)
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(reserve + 64 * 64 * 4 + 100, total))
+    state, layers = _host_load(4, 3)
+    with pytest.raises(ValueError) as e:
+        state.evict(1)
+    assert "3 layers" in str(e.value) and "At most 2 layers" in str(e.value)
+    assert not state.done and layers[1].weight.requires_grad
+
+
+def test_host_load_moves_layers_that_fit(monkeypatch):
+    import sys
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(20 * _GiB))
+    state, layers = _host_load(4, 3)
+    for i in state.indices:
+        state.evict(i)
+    assert state.done == {1, 2, 3} and len(state.done_bytes) == 3
+    assert not layers[1].weight.requires_grad
+
+
+def test_host_load_counts_layers_already_moved_as_used(monkeypatch):
+    import sys
+    import pytest
+    total = 64 * _GiB
+    reserve = int(total * _mod._PIN_RESERVE_FRACTION)
+    state, layers = _host_load(4, 3)
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(20 * _GiB, total))
+    state.evict(1)
+    # RAM dropped after the first layer landed: the next two no longer fit, and the error counts all three.
+    monkeypatch.setitem(sys.modules, "psutil", _fake_psutil(reserve + 100, total))
+    with pytest.raises(ValueError, match = "3 layers"):
+        state.evict(2)
+    assert state.done == {1}
+
+
+def test_host_load_is_unguarded_without_psutil(monkeypatch):
+    import sys
+    monkeypatch.setitem(sys.modules, "psutil", None)
+    state, layers = _host_load(4, 3)
+    for i in state.indices:
+        state.evict(i)
+    assert state.done == {1, 2, 3}
 
 
 def test_block_swap_refuses_before_moving_anything(monkeypatch):
