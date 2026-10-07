@@ -1305,19 +1305,58 @@ pass
 TEMPORARY_PATCHES.append(patch_causal_conv1d_cuda_probe)
 
 
-def patch_mamba_ssm_pre_ampere_fallback():
-    """Force the Mamba slow path on pre-Ampere GPUs.
+# Oldest Triton that compiles mamba_ssm's Mamba-2 kernels on sm_75. Measured on
+# a Kaggle T4 with mamba_ssm 2.3.1: Triton 3.2 (torch 2.6) fails the fp32 chunk
+# scan with `IndexError: map::at`, Triton 3.3 (torch 2.7) fails the fp16 one
+# with `PassManager::run failed`, and 3.4 through 3.6 compile and train.
+_MAMBA_SM75_MIN_TRITON = (3, 4)
 
-    mamba_ssm's Triton kernels need sm_80+. On a T4 the package imports fine
-    and `is_fast_path_available` is True, so transformers routes into
+
+def _mamba_ssm_fast_path_blocker(capability):
+    """None if mamba_ssm's Triton kernels can run on this GPU, else the reason.
+
+    UNSLOTH_MAMBA_PRE_AMPERE_FAST=1 / 0 forces the answer below sm_80.
+    """
+    if tuple(capability) >= (8, 0):
+        return None
+    major, minor = capability
+    forced = os.environ.get("UNSLOTH_MAMBA_PRE_AMPERE_FAST", "").strip()
+    if forced == "1":
+        return None
+    if forced == "0":
+        return "UNSLOTH_MAMBA_PRE_AMPERE_FAST=0 is set"
+    if tuple(capability) < (7, 5):
+        return f"they need compute capability 7.5+ (this GPU is {major}.{minor})"
+    try:
+        import triton
+        version = tuple(int(x) for x in triton.__version__.split(".")[:2])
+    except Exception:
+        version = None
+    if version is None or version < _MAMBA_SM75_MIN_TRITON:
+        found = "is missing" if version is None else f"is {triton.__version__}"
+        return (
+            f"on compute capability {major}.{minor} they need Triton "
+            f"{'.'.join(map(str, _MAMBA_SM75_MIN_TRITON))}+ (torch 2.8+), "
+            f"and Triton {found}"
+        )
+    return None
+pass
+
+
+def patch_mamba_ssm_pre_ampere_fallback():
+    """Force the Mamba slow path where mamba_ssm's Triton kernels cannot compile.
+
+    On a T4 with Triton older than 3.4 the package imports fine and
+    `is_fast_path_available` is True, so transformers routes into
     `cuda_kernels_forward` and Triton only fails once training starts, with an
-    opaque `RuntimeError: PassManager::run failed`.
+    opaque `RuntimeError: PassManager::run failed`. Triton 3.4+ compiles the
+    kernels on sm_75, so there the fast path is kept, as on Ampere and newer.
 
     `is_fast_path_available` is baked in at module import, so flip both the
     availability predicates (for modules imported later) and the flag on
-    already-imported modules. A capability check rather than a trial launch
-    like the causal_conv1d probe above, which would pay a Triton compile at
-    every import just to watch it fail. Real NVIDIA CUDA only.
+    already-imported modules. A capability and version check rather than a
+    trial launch like the causal_conv1d probe above, which would pay a Triton
+    compile at every import just to watch it fail. Real NVIDIA CUDA only.
     """
     if not torch.cuda.is_available():
         return
@@ -1327,8 +1366,9 @@ def patch_mamba_ssm_pre_ampere_fallback():
         major, minor = torch.cuda.get_device_capability()
     except Exception:
         return
-    if (major, minor) >= (8, 0):
-        return  # Ampere or newer; the fast path is fine
+    blocker = _mamba_ssm_fast_path_blocker((major, minor))
+    if blocker is None:
+        return  # Ampere or newer, or a Triton that compiles the kernels on sm_75
 
     import sys
 
@@ -1488,9 +1528,8 @@ def patch_mamba_ssm_pre_ampere_fallback():
     pass
 
     print(
-        f"Unsloth: mamba_ssm's Triton kernels need compute capability 8.0+ "
-        f"(this GPU is {major}.{minor}). Using the PyTorch slow path for "
-        f"Mamba models."
+        f"Unsloth: Using the PyTorch slow path for Mamba models, since "
+        f"mamba_ssm's Triton kernels cannot run here: {blocker}."
     )
     return _touched
 
@@ -1617,7 +1656,7 @@ def _local_kernel_fallback_allowed():
     if not torch.cuda.is_available() or getattr(torch.version, "hip", None) is not None:
         return False
     try:
-        return torch.cuda.get_device_capability() >= (8, 0)
+        return _mamba_ssm_fast_path_blocker(torch.cuda.get_device_capability()) is None
     except Exception:
         return False
 pass

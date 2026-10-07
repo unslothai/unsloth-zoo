@@ -25,6 +25,7 @@ Extracted by AST so the test needs neither a GPU nor a transformers import.
 """
 
 import ast
+import os
 import sys
 import types
 from pathlib import Path
@@ -36,16 +37,23 @@ MISC = Path(__file__).resolve().parents[1] / "unsloth_zoo" / "temporary_patches"
 _SRC = MISC.read_text(encoding = "utf-8")
 
 
+_NAMES = ("_MAMBA_SM75_MIN_TRITON", "_mamba_ssm_fast_path_blocker", "patch_mamba_ssm_pre_ampere_fallback")
+
+
 def _load():
+    ns = {"torch": torch, "os": os}
     for node in ast.parse(_SRC).body:
-        if isinstance(node, ast.FunctionDef) and node.name == "patch_mamba_ssm_pre_ampere_fallback":
-            ns = {"torch": torch}
+        names = [node.name] if isinstance(node, ast.FunctionDef) else [
+            t.id for t in getattr(node, "targets", []) if isinstance(t, ast.Name)]
+        if any(name in _NAMES for name in names):
             exec(ast.get_source_segment(_SRC, node), ns)
-            return ns[node.name]
-    raise AssertionError("patch_mamba_ssm_pre_ampere_fallback not found")
+    missing = [name for name in _NAMES if name not in ns]
+    assert not missing, f"not found in misc.py: {missing}"
+    return ns
 
 
-patch = _load()
+_NS = _load()
+patch = _NS["patch_mamba_ssm_pre_ampere_fallback"]
 
 MODEL_MOD = "transformers.models.granitemoehybrid.modeling_granitemoehybrid"
 
@@ -62,11 +70,22 @@ class _FakeCuda:
     def get_device_capability(self, *a, **k): return self._capability
 
 
+def _set_triton(monkeypatch, version):
+    """Stand-in triton module; None makes `import triton` raise."""
+    if version is None:
+        monkeypatch.setitem(sys.modules, "triton", None)
+    else:
+        monkeypatch.setitem(sys.modules, "triton", types.SimpleNamespace(__version__ = version))
+
+
 @pytest.fixture
 def env(monkeypatch):
     """Pre-Ampere NVIDIA CUDA with mamba_ssm installed and a model imported."""
     monkeypatch.setattr(torch, "cuda", _FakeCuda(), raising = False)
     monkeypatch.setattr(torch.version, "hip", None, raising = False)
+    monkeypatch.delenv("UNSLOTH_MAMBA_PRE_AMPERE_FAST", raising = False)
+    # Triton 3.3, where the sm_75 compile fails, unless a test says otherwise.
+    _set_triton(monkeypatch, "3.3.1")
 
     saved = {k: sys.modules.get(k) for k in ("mamba_ssm", MODEL_MOD,
                                              "transformers.utils.import_utils")}
@@ -554,6 +573,76 @@ def test_non_transformers_modules_are_left_alone(env):
 
 def test_registered_as_a_temporary_patch():
     assert "TEMPORARY_PATCHES.append(patch_mamba_ssm_pre_ampere_fallback)" in _SRC
+
+
+# Triton 3.4+ compiles mamba_ssm's kernels on sm_75 (T4), so the slow path is
+# only forced there on an older Triton.
+
+@pytest.mark.parametrize("version", ["3.4.0", "3.5.1", "3.6.0", "3.10.0", "4.0.0+git1234"])
+def test_t4_with_a_new_triton_keeps_fast_path(env, monkeypatch, capsys, version):
+    model_mod, iu, hk = env
+    _set_triton(monkeypatch, version)
+    assert patch() is None
+    assert model_mod.is_fast_path_available is True
+    assert iu.is_mamba_ssm_available() is True
+    assert "mamba-ssm" in hk._HUB_KERNEL_MAPPING
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("version", ["3.2.0", "3.3.1", None])
+def test_t4_with_an_old_or_missing_triton_falls_back(env, monkeypatch, capsys, version):
+    model_mod, iu, _hk = env
+    _set_triton(monkeypatch, version)
+    patch()
+    assert model_mod.is_fast_path_available is False
+    assert iu.is_mamba_ssm_available() is False
+    out = capsys.readouterr().out
+    assert "Triton 3.4+" in out and "7.5" in out
+    assert ("is missing" if version is None else version) in out
+
+
+@pytest.mark.parametrize("capability", [(7, 0), (6, 1)])
+def test_older_than_t4_falls_back_whatever_the_triton(env, monkeypatch, capsys, capability):
+    model_mod, _iu, _hk = env
+    monkeypatch.setattr(torch, "cuda", _FakeCuda(capability = capability), raising = False)
+    _set_triton(monkeypatch, "3.6.0")
+    patch()
+    assert model_mod.is_fast_path_available is False
+    assert "compute capability 7.5+" in capsys.readouterr().out
+
+
+def test_env_forces_the_fast_path_on(env, monkeypatch):
+    model_mod, _iu, _hk = env
+    monkeypatch.setenv("UNSLOTH_MAMBA_PRE_AMPERE_FAST", "1")
+    assert patch() is None
+    assert model_mod.is_fast_path_available is True
+
+
+def test_env_forces_the_slow_path(env, monkeypatch, capsys):
+    model_mod, _iu, _hk = env
+    _set_triton(monkeypatch, "3.6.0")
+    monkeypatch.setenv("UNSLOTH_MAMBA_PRE_AMPERE_FAST", "0")
+    patch()
+    assert model_mod.is_fast_path_available is False
+    assert "UNSLOTH_MAMBA_PRE_AMPERE_FAST=0" in capsys.readouterr().out
+
+
+def test_env_does_not_touch_ampere(env, monkeypatch):
+    model_mod, _iu, _hk = env
+    monkeypatch.setattr(torch, "cuda", _FakeCuda(capability = (8, 0)), raising = False)
+    monkeypatch.setenv("UNSLOTH_MAMBA_PRE_AMPERE_FAST", "0")
+    assert patch() is None
+    assert model_mod.is_fast_path_available is True
+
+
+def test_local_kernel_fallback_follows_the_same_rule():
+    """transformers 5.15's local mamba_ssm / causal_conv1d fallback asks the same helper."""
+    seg = None
+    for node in ast.parse(_SRC).body:
+        if isinstance(node, ast.FunctionDef) and node.name == "_local_kernel_fallback_allowed":
+            seg = ast.get_source_segment(_SRC, node)
+    assert seg is not None
+    assert "_mamba_ssm_fast_path_blocker(" in seg and "(8, 0)" not in seg
 
 
 # Keep last: it checks what the `env` fixture left behind after teardown.
