@@ -172,7 +172,122 @@ _BLOCK_SPECS = {
 }
 
 
+_NF4_STACK_CALLS = {"stacked": 0, "fallback": 0}
+
+
+def _nf4_stack_key(projs):
+    """Everything the pointer table depends on: addresses (raw data_ptr, no __torch_function__),
+    the copied code / offset (by address and version), and object identity. None if not NF4."""
+    ptr = torch._C.TensorBase.data_ptr
+    key = []
+    for p in projs:
+        base = p._modules.get("base_layer", p)
+        w = base._parameters.get("weight")
+        qs = getattr(w, "quant_state", None)
+        if qs is None:
+            return None
+        a = qs.absmax
+        key += (id(w), id(qs), ptr(w), ptr(a), a._version, ptr(qs.code), qs.code._version)
+        if qs.nested:
+            s2, off = qs.state2, qs.offset
+            key += (ptr(s2.absmax), s2.absmax._version, ptr(s2.code), s2.code._version,
+                    (ptr(off), off._version) if isinstance(off, torch.Tensor) else off)
+    return tuple(key)
+
+
+def _nf4_table(experts, kind, projs):
+    """Cached pointer table (gpt_oss_routed._build_table) over `projs`, or None. The cache holds
+    the projections' weights / quant states, so the addresses in the table cannot be recycled."""
+    try:
+        key = _nf4_stack_key(projs)
+    except Exception:
+        return None
+    if key is None:
+        return None
+    cache = experts.__dict__.setdefault("_unsloth_nf4_stack_tables", {})
+    hit = cache.get(kind)
+    if hit is not None and hit[0] == key:
+        return hit[1]
+    tb = None
+    try:
+        from .gpt_oss_routed import _build_table
+        base0 = getattr(projs[0], "base_layer", projs[0])
+        tb = _build_table(projs, base0.weight.device)
+        if tb is not None:
+            tb["dtype"] = base0.weight.quant_state.dtype
+            tb["_hold"] = [getattr(p, "base_layer", p).weight for p in projs]
+            tb["_hold"] += [w.quant_state for w in tb["_hold"]]
+    except Exception:
+        tb = None
+    cache[kind] = (key, tb)   # a None table is a negative cache under the same key
+    return tb
+
+
+def _nf4_stack(experts, kind, projs, dtype):
+    """[E', N, K] in `dtype` from one Triton launch over `projs`, bit-identical to stacking
+    bnb dequantize_4bit(...).to(dtype), or None (the caller keeps the bitsandbytes builder)."""
+    # Traced code keeps the bitsandbytes builder (data_ptr tables are eager only).
+    if not HAS_BNB or os.environ.get("UNSLOTH_MOE_GROUPED_NF4_STACK", "1") == "0" \
+            or torch.compiler.is_compiling():
+        return None
+    w0 = getattr(getattr(projs[0], "base_layer", projs[0]), "weight", None)
+    if not isinstance(w0, Params4bit) or getattr(w0, "device", None) is None or w0.device.type != "cuda":
+        return None
+    try:
+        from .gpt_oss_grouped_qlora import nf4_dequant_expert_stack, stacked_dequant_available
+    except Exception:
+        return None
+    if not stacked_dequant_available(w0.device):
+        return None
+    tb = _nf4_table(experts, kind, projs)
+    # One rounding on both sides: a quant state in `dtype`, or fp32 rounded once to `dtype`.
+    if tb is None or tb["dtype"] not in (dtype, torch.float32):
+        return None
+    return nf4_dequant_expert_stack(tb, dtype)
+
+
+def _nf4_build_gate_up_stack(experts, spec, dtype):
+    """_build_gate_up_stack from the pointer-table kernel, or None. The table interleaves
+    [g0, u0, g1, u1, ...], so the [2E, inter, hidden] output is [E, 2*inter, hidden] =
+    per expert cat(gate, up, dim=0)."""
+    g_name, u_name = spec[0], spec[1]
+    projs = []
+    for ex in experts:
+        projs += (getattr(ex, g_name), getattr(ex, u_name))
+    w = _nf4_stack(experts, "gate_up", projs, dtype)
+    if w is None:
+        return None
+    E, N, K = len(experts), w.shape[1], w.shape[2]
+    return w.view(E, 2 * N, K).transpose(1, 2).contiguous()
+
+
+def _nf4_build_down_stack(experts, spec, dtype):
+    """_build_down_stack from the pointer-table kernel, or None."""
+    w = _nf4_stack(experts, "down", [getattr(ex, spec[2]) for ex in experts], dtype)
+    return None if w is None else w.transpose(1, 2).contiguous()
+
+
 def _build_gate_up_stack(experts, spec, dtype):
+    """[E, hidden, 2*inter]: per expert cat(gate^T, up^T)."""
+    w = _nf4_build_gate_up_stack(experts, spec, dtype)
+    if w is not None:
+        _NF4_STACK_CALLS["stacked"] += 1
+        return w
+    _NF4_STACK_CALLS["fallback"] += 1
+    return _bnb_build_gate_up_stack(experts, spec, dtype)
+
+
+def _build_down_stack(experts, spec, dtype):
+    """[E, inter, hidden]: per expert down^T."""
+    w = _nf4_build_down_stack(experts, spec, dtype)
+    if w is not None:
+        _NF4_STACK_CALLS["stacked"] += 1
+        return w
+    _NF4_STACK_CALLS["fallback"] += 1
+    return _bnb_build_down_stack(experts, spec, dtype)
+
+
+def _bnb_build_gate_up_stack(experts, spec, dtype):
     """[E, hidden, 2*inter]: per expert cat(gate^T, up^T)."""
     g_name, u_name = spec[0], spec[1]
     rows = []
@@ -183,7 +298,7 @@ def _build_gate_up_stack(experts, spec, dtype):
     return torch.stack(rows, 0).contiguous()
 
 
-def _build_down_stack(experts, spec, dtype):
+def _bnb_build_down_stack(experts, spec, dtype):
     """[E, inter, hidden]: per expert down^T."""
     d_name = spec[2]
     return torch.stack([_expert_weight(getattr(ex, d_name), dtype).t() for ex in experts], 0).contiguous()
