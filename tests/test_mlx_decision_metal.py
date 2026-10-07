@@ -759,6 +759,36 @@ def test_saved_clef_holds_the_trained_decoder_and_a_head_with_its_temperature_fo
         save_clef_model(pipeline, tmp_path / "out" / ".." , tmp_path)
 
 
+def test_a_plain_language_model_gets_a_new_joint_head_and_saves_as_a_clef(clef, tmp_path, monkeypatch):
+    from unsloth_zoo.mlx.decision import ClefModel, _decoder_tensor_name, clef_head_config
+
+    source, record, out = tmp_path / "lm", clef[2]("hello"), tmp_path / "out"
+    source.mkdir()
+    mx.save_safetensors(str(source / "model.safetensors"), _clef_checkpoint_tensors(clef[0].model))
+    assert [clef_head_config(size)[key] for size in (3071, 3072) for key in ("width", "heads", "feedforward")] == [512, 8, 2048, 1024, 16, 4096] and _decoder_tensor_name({}, "model.layers.0.mlp.up_proj.weight") == "model.layers.0.mlp.up_proj.weight"
+    first, again, other = (ClefModel.from_language_model(source, head_width = 128, seed = seed) for seed in (1, 1, 2))
+    assert first.head_config == {"hidden_size": 64, "width": 128, "routing_layers": 2, "layers": 4, "heads": 2, "feedforward": 512}
+    weights = [dict(tree_flatten(pipeline.head.parameters())) for pipeline in (first, again, other)]
+    assert all(mx.array_equal(weights[0][name], weights[1][name]) for name in weights[0]) and not mx.array_equal(weights[0]["question_projection.weight"], weights[2]["question_projection.weight"])
+    assert not weights[0]["residual_gate"].item() and 0.8 < weights[0]["type_embedding.weight"].std().item() < 1.2 and all(mx.any(value[:256]).item() and mx.any(value[256:]).item() for name, value in weights[0].items() if name.endswith("in_proj_weight"))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), {"lm_head.weight": mx.zeros((512, 64))})
+    with pytest.raises(ValueError, match = "another layout"):
+        ClefModel.from_language_model(tmp_path)
+    with pytest.raises(ValueError, match = "hidden size"):
+        ClefModel.from_language_model(source, head_config = {**first.head_config, "hidden_size": 32})
+    args = record["input_ids"], record["question_spans"], record["option_spans"], record["types"]
+    (source / "joint_head_config.json").write_text(json.dumps({**first.head_config, "width": 64}))
+    save_clef_model(first, out, source, {"base_model": "org/lm"})
+    served = load_decision_model(out)
+    assert served.head_config == first.head_config and json.loads((out / "unsloth_decision_config.json").read_text())["base_model"] == "org/lm"
+    np.testing.assert_allclose(np.array(served.logits(*args)), np.array(first.logits(*args)), atol = 3e-2)
+    packed = _decoder(quantized = True)
+    monkeypatch.setattr(ClefModel, "_load", lambda self, *args: vars(self).update(model = packed, tokenizer = None))
+    mx.save_safetensors(str(source / "model.safetensors"), {_decoder_tensor_name(packed, path): value.swapaxes(1, 2) if value.ndim == 3 else value for path, value in tree_flatten(packed.parameters())})
+    with pytest.raises(ValueError, match = "is quantized"):
+        ClefModel.from_language_model(source)
+
+
 def test_clef_prompt_gives_up_the_end_of_the_state_only(clef):
     from unsloth_zoo.mlx.decision import DecisionRequestError
 

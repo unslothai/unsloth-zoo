@@ -52,6 +52,7 @@ __all__ = [
     "collate_decisions",
     "decision_logits",
     "load_decision_model",
+    "load_language_model_as_clef",
     "load_trainable_decision_model",
     "save_clef_model",
     "save_decision_model",
@@ -1126,7 +1127,7 @@ class _JointHead(nn.Module):
 
 
 def _load_joint_head(folder):
-    head = _JointHead(**_read_json(folder / "joint_head_config.json"))
+    head = _JointHead(**_read_json(folder / _CLEF_HEAD_CONFIG))
     head.load_weights([(name, value.astype(mx.float32)) for name, value in mx.load(str(folder / "joint_head.safetensors")).items()], strict = True)
     head.eval()
     mx.eval(head.parameters())
@@ -1134,6 +1135,13 @@ def _load_joint_head(folder):
 
 
 _CLEF_CONFIG = "unsloth_decision_config.json"
+_CLEF_HEAD_CONFIG = "joint_head_config.json"
+
+
+def clef_head_config(hidden_size, width = None):
+    """The shape of a new joint head for a decoder: Clef's own, narrower by default for a small decoder."""
+    width = int(width or (1024 if hidden_size >= 3072 else 512))
+    return {"hidden_size": int(hidden_size), "width": width, "routing_layers": 2, "layers": 4, "heads": max(1, width // 64), "feedforward": 4 * width}
 
 
 def _compact(value):
@@ -1158,11 +1166,33 @@ class ClefModel(_QwenModel):
     def __init__(self, folder, dtype, base_model, token, load_in_4bit = False):
         self._load_beside(folder, dtype, token, "joint_head", load_in_4bit)
         self.head = _load_joint_head(folder)
+        self.head_config = _read_json(folder / _CLEF_HEAD_CONFIG)
         # A fine-tune's per-type temperatures are relative to its head temperature, which is kept apart only when
         # it could not be folded into the head's weights.
         saved = _read_json(folder / _CLEF_CONFIG)
         scale = float(saved.get("head_temperature", 1.0))
         self.temperatures = {kind: scale * min(max(float(t), 0.5), 5.0) for kind, t in zip(_TYPES, saved.get("temperature", []))}
+
+    @classmethod
+    def from_language_model(cls, folder, dtype = None, token = None, head_width = None, head_config = None, seed = 3407):
+        """A plain language model with a new, untrained joint head, to be trained as a Clef."""
+        self = cls.__new__(cls)
+        self._load_beside(Path(folder), dtype, token, "joint_head")
+        _require_clef_source(self.model, folder)
+        hidden_size = _output_rows(self._output_head(), [0]).shape[-1]
+        self.head_config = dict(head_config or clef_head_config(hidden_size, head_width))
+        if self.head_config["hidden_size"] != hidden_size:
+            raise ValueError(f"Unsloth: head_config reads hidden size {self.head_config['hidden_size']}, but {folder} has hidden size {hidden_size}.")
+        mx.random.seed(seed)
+        self.head = _JointHead(**self.head_config)
+        # As the reference head starts: unit-variance type embeddings and Xavier-uniform attention input projections.
+        self.head.type_embedding.weight = mx.random.normal(self.head.type_embedding.weight.shape)
+        for _, module in self.head.named_modules():
+            if isinstance(module, _Attention):
+                module.in_proj_weight = nn.init.glorot_uniform()(module.in_proj_weight)
+        mx.eval(self.head.parameters())
+        self.head.eval()
+        return self
 
     def _pieces(self, state, questions):
         """The prompt as (text, mark) pieces; the model was trained with each piece tokenized on its own."""
@@ -1292,6 +1322,22 @@ def load_decision_model(folder, compute_dtype = None, *, family = None, subfolde
     return FAMILIES[family](folder, compute_dtype, base_model, token)
 
 
+def load_language_model_as_clef(path, compute_dtype = None, *, head_width = None, head_config = None, seed = 3407, token = None):
+    """Load a plain language model (a local folder or a Hugging Face repo id) with a new joint head, to train as a Clef.
+
+    The head is Clef's, 1024 wide for a decoder with hidden size 3072 or more and 512 otherwise unless `head_width` or a
+    whole `head_config` says otherwise, and starts untrained from `seed`, which reseeds MLX's random state. The result trains and saves like a loaded Clef.
+    """
+    folder = Path(path)
+    if not folder.is_dir():
+        from huggingface_hub import snapshot_download
+
+        folder = Path(snapshot_download(str(path), token = token))
+    if isinstance(compute_dtype, str):
+        compute_dtype = getattr(mx, compute_dtype)
+    return ClefModel.from_language_model(folder, compute_dtype, token, head_width, head_config, seed)
+
+
 def _state_name(name):
     return name.replace(".in_proj.weight", ".in_proj_weight").replace(".in_proj.bias", ".in_proj_bias")
 
@@ -1372,13 +1418,30 @@ def _add_in_slices(name, value, terms):
     return parts[0] if len(parts) == 1 else mx.concatenate(parts)
 
 
+def _decoder_tensor_name(decoder, path):
+    if "language_model" not in decoder:
+        return path
+    # A decoder inside a vision-language wrapper is stored under other names than it is loaded with.
+    for prefix, saved in (("language_model.model.", "model.language_model."), ("language_model.lm_head.", "lm_head.")):
+        if path.startswith(prefix):
+            return saved + path[len(prefix) :]
+    return None
+
+
+def _require_clef_source(decoder, source):
+    # Saving adds what training changed to the source's own tensors, so each decoder weight needs its counterpart there.
+    stored = {name: value.shape for shard in Path(source).glob("model*.safetensors") for name, value in mx.load(str(shard)).items()}
+    for path, value in tree_flatten(decoder.parameters()):
+        name = _decoder_tensor_name(decoder, path)
+        packed = path.rsplit(".", 1)[-1] == "scales"
+        if packed or name is not None and stored.get(name) != (value.swapaxes(1, 2) if value.ndim == 3 else value).shape:
+            raise ValueError(f"Unsloth: {source} cannot be trained as a Clef here: its {path} is quantized or stored in another layout. Use the original float checkpoint.")
+
+
 def _clef_decoder_deltas(decoder, source):
     """What training added to the decoder's weights, by checkpoint tensor name, as signed terms."""
     def name(path):
-        for prefix, saved in (("language_model.model.", "model.language_model."), ("language_model.lm_head.", "lm_head.")):
-            if path.startswith(prefix):
-                return saved + path[len(prefix) :]
-        return None
+        return _decoder_tensor_name(decoder, path)
 
     deltas = {}
     for path, module in decoder.named_modules():
@@ -1392,7 +1455,9 @@ def _clef_decoder_deltas(decoder, source):
     ]
     if trained:
         # Weights trained whole: the difference to a fresh load, so whatever the loader converts on the way in cancels out.
-        fresh = dict(tree_flatten(load_decision_model(source, family = "clef").model.parameters()))
+        fresh = ClefModel.__new__(ClefModel)
+        fresh._load_beside(source, None, None, "joint_head")
+        fresh = dict(tree_flatten(fresh.model.parameters()))
         for path, value in trained:
             if name(path) is None:
                 raise ValueError(f"Unsloth: the trained {path} has no place in a Clef checkpoint.")
@@ -1447,6 +1512,7 @@ def save_clef_model(pipeline, folder, source, config = None):
                 raise ValueError(f"Unsloth: {name} has values that are not finite, so the model cannot be saved.")
         mx.save_safetensors(str(staging / "joint_head.safetensors"), head, metadata = {"format": "pt"})
         (staging / _CLEF_CONFIG).write_text(json.dumps(config, indent = 2), encoding = "utf-8")
+        (staging / _CLEF_HEAD_CONFIG).write_text(json.dumps(pipeline.head_config, indent = 2), encoding = "utf-8")
         skipped = {"README.md", _CLEF_CONFIG, "joint_head.safetensors"}
         for item in source.iterdir():
             if item.is_file() and not item.name.startswith(".") and item.name not in skipped and not (staging / item.name).exists():
