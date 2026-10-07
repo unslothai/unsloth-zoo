@@ -2015,11 +2015,7 @@ def _merge_special_token_features(
 
 
 def _flatten_feature_rows(feature_rows, hidden_dim):
-    """Collapse a feature block to the `(rows, hidden)` the merge indexes.
-
-    Upstream scatters the block's elements, so a leading or folded axis is not a
-    different set of features, just a different shape of the same ones.
-    """
+    """Upstream scatters elements, so a leading or folded axis is only a reshape."""
 
     if feature_rows.ndim == 2 and feature_rows.shape[-1] == hidden_dim:
         return feature_rows
@@ -2027,13 +2023,9 @@ def _flatten_feature_rows(feature_rows, hidden_dim):
 
 
 def _raise_on_feature_count_mismatch(mask, feature_rows, inputs_embeds, exact=True):
-    """Reproduce one tower's own refusal of a placeholder / feature mismatch.
+    """Each tower's own upstream count check (equal, or `exact=False`: no shortfall).
 
-    Each patched tower carries the invariant its upstream had, which is why this
-    is called from the towers rather than from the shared merge: some of them
-    require the counts to be equal, while others only require enough to fill the
-    placeholders and ignore a surplus. Reading the count needs a host value, so
-    a mask that is a tracer is left alone.
+    Needs a host value, so a traced mask is left alone.
     """
 
     import mlx.core as mx
@@ -2042,10 +2034,7 @@ def _raise_on_feature_count_mismatch(mask, feature_rows, inputs_embeds, exact=Tr
         tokens = int(mx.sum(mask.astype(mx.int32)).item())
     except Exception:
         return
-    # How many placeholders these features can fill, which is what each upstream
-    # asks however it words it -- some count rows, minimax counts the elements
-    # it scatters -- and is insensitive to a leading or folded axis. A block that
-    # does not divide into rows fills none, since the merge cannot index it.
+    # Placeholders the features can fill (rows, or minimax's elements / hidden).
     features, remainder = divmod(feature_rows.size, inputs_embeds.shape[-1])
     if remainder:
         features = 0
@@ -2091,12 +2080,7 @@ def _merge_exclusive_special_token_features(
     inputs_embeds,
     input_ids,
 ):
-    """Fill the image placeholders, or the video ones when there are no images.
-
-    Upstream picks between the two masks by reducing on the host; `mx.where`
-    makes the same choice inside the trace. Distinct from
-    `_merge_special_token_features`, which fills both.
-    """
+    """Image placeholders, else video ones; upstream's host choice done via `mx.where`."""
 
     import mlx.core as mx
 
@@ -2105,8 +2089,7 @@ def _merge_exclusive_special_token_features(
         special_mask = mx.where(
             mx.sum(special_mask) == 0, input_ids == video_token_id, special_mask
         )
-    # Upstream slices a row's features out and only refuses a shortfall, so a
-    # surplus row and a row with no placeholders both pass.
+    # Upstream refuses only a shortfall.
     _raise_on_feature_count_mismatch(
         special_mask, image_features, inputs_embeds, exact=False
     )
