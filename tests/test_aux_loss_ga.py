@@ -105,6 +105,18 @@ def test_attention_mask_matches_the_batch_counter():
     assert torch.allclose(out, torch.tensor(0.25))
 
 
+def test_compiled_share_drops_the_same_packed_boundaries():
+    aux = torch.tensor(1.0)
+    lab = torch.tensor([[1, 2, 3, 4, 5, 6]])
+    kw = {"num_items_in_batch": torch.tensor(4), "packed_seq_lengths": torch.tensor([2, 0, 2, 2])}
+    eager = unsloth_ga_scale_aux_loss(aux, lab, None, kw)
+    torch._dynamo.reset()
+    compiled = torch.compile(unsloth_ga_scale_aux_loss, backend = "eager", fullgraph = True)(aux, lab, None, kw)
+    torch._dynamo.reset()
+    assert torch.allclose(eager, torch.tensor(0.75))
+    assert torch.allclose(compiled, eager)
+
+
 def _real(module, name):
     import importlib
     try:

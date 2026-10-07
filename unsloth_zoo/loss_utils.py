@@ -469,8 +469,35 @@ def num_items_labels_convention(model):
 pass
 
 
+def _packed_boundary_targets(packed_seq_lengths, token_count):
+    # All Unsloth Zoo code licensed under LGPLv3
+    """Mask over `token_count` (the shifted targets) of the slots that start a later packed document, else None.
+
+    No data-dependent shapes, so a compiled forward drops the same slots as the eager batch count.
+    """
+    if torch.compiler.is_compiling() and isinstance(packed_seq_lengths, torch.Tensor):
+        # Clamping stands in for the eager filter, which lowers to nonzero and cannot trace.
+        lengths = packed_seq_lengths.reshape(-1).long().clamp_min(0)
+    else:
+        lengths = _normalize_packed_seq_lengths(packed_seq_lengths)
+    if lengths is None or lengths.numel() <= 1: return None
+    n_shift = token_count.shape[-1]
+    n_rows  = token_count.numel() // n_shift
+    ends    = torch.cumsum(lengths, dim = 0)
+    starts  = ends[:-1]
+    rows    = torch.div(starts, n_shift + 1, rounding_mode = "floor")
+    cols    = starts - rows * (n_shift + 1)
+    # labels[..., 1:] already dropped column 0, and a start at the last end has no document after it.
+    keep    = (cols > 0) & (rows < n_rows) & (starts < ends[-1])
+    flat    = torch.where(keep, rows * n_shift + cols - 1, n_rows * n_shift).to(token_count.device)
+    drop    = torch.zeros(n_rows * n_shift + 1, dtype = torch.bool, device = token_count.device)
+    drop.index_fill_(0, flat, True)
+    return drop[:-1].reshape(token_count.shape)
+pass
+
+
 def count_batch_items(labels, attention_mask = None, input_ids = None, packed_seq_lengths = None,
-                      unshifted = False, packed = True):
+                      unshifted = False):
     # All Unsloth Zoo code licensed under LGPLv3
     """Counted targets of one micro-batch, as `(count, short, degenerate)`, without a device sync.
 
@@ -488,25 +515,11 @@ def count_batch_items(labels, attention_mask = None, input_ids = None, packed_se
             degenerate = True
         else:
             token_count &= (attention_mask[..., 1:] != 0)
-    seq_lengths = _normalize_packed_seq_lengths(packed_seq_lengths) if packed else None
-    if seq_lengths is not None and token_count.ndim in (1, 2) and token_count.shape[-1] != 0:
+    if token_count.ndim in (1, 2) and token_count.shape[-1] != 0:
         # Zero the N-1 packed boundaries, never subtract: collators often mask them already.
-        # The data-dependent reads below are safe only because _normalize_packed_seq_lengths returned None where they cannot run.
-        n_shift = token_count.shape[-1]
-        n_rows  = token_count.numel() // n_shift
-        starts  = torch.cumsum(seq_lengths, dim = 0)[:-1]
-        rows    = torch.div(starts, n_shift + 1, rounding_mode = "floor")
-        cols    = starts - rows * (n_shift + 1)
-        keep    = (cols > 0) & (rows < n_rows)
-        rows, cols = rows[keep], cols[keep]
-        if rows.numel() != 0:
-            if rows.device != token_count.device:
-                rows = rows.to(token_count.device)
-                cols = cols.to(token_count.device)
-            # Reassign: reshape can copy on a non contiguous input.
-            token_count = token_count.reshape(n_rows, n_shift)
-            token_count[rows, cols - 1] = False
-        pass
+        boundaries = _packed_boundary_targets(packed_seq_lengths, token_count)
+        if boundaries is not None:
+            token_count = token_count & ~boundaries
     pass
     return token_count.sum(), short, degenerate
 pass
