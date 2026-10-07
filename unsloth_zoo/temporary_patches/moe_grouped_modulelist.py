@@ -107,8 +107,25 @@ except Exception:
     _triton_grouped_mm = _triton_grouped_mm_wanted = None
 
 
+def _view_weight_ok(w):
+    """True for a 16-byte aligned transpose(1, 2) view of a contiguous [E, N, K] stack, which
+    torch._grouped_mm takes without a copy once moe_utils' one-time view probe agrees."""
+    if w.dim() != 3:
+        return False
+    E, K, N = w.shape
+    n = w.element_size()
+    if w.stride() != (K * N, 1, K) or (K * n) % 16 or (K * N * n) % 16:
+        return False
+    try:
+        from .moe_utils import _transposed_view_grouped_mm_is_safe
+        return bool(_transposed_view_grouped_mm_is_safe())
+    except Exception:
+        return False
+
+
 def _grouped_mm_fix(x: torch.Tensor, w: torch.Tensor, offs: torch.Tensor) -> torch.Tensor:
-    """torch._grouped_mm with a per-group matmul fallback for the 16-byte stride error."""
+    """torch._grouped_mm with a per-group matmul fallback for the 16-byte stride error. The
+    builders' transposed-view stacks go in uncopied when the view probe passes (_view_weight_ok)."""
     if _triton_grouped_mm_wanted is not None and _triton_grouped_mm_wanted(x, w):
         return _triton_grouped_mm(x, w, offs)
     # aten._grouped_mm's fake impl rejects float16 under torch.compile; the opaque op (moe_utils) does not.
@@ -118,12 +135,15 @@ def _grouped_mm_fix(x: torch.Tensor, w: torch.Tensor, offs: torch.Tensor) -> tor
     ):
         return _GROUPED_MM_FP16_OP(x, w, offs)
     x = x.contiguous()
-    w = w.contiguous()
+    if not _view_weight_ok(w):
+        w = w.contiguous()
     try:
         return torch._grouped_mm(x, w, offs=offs)
     except RuntimeError as e:
         if "strides should be multiple of 16 bytes" not in str(e):
             raise
+        if not w.is_contiguous():   # an unaligned view (e.g. storage offset): the copy may pass
+            return _grouped_mm_fix(x, w.contiguous(), offs)
         # Shared with moe_utils, not looped here: a loop tapes every per-group SLICE,
         # whose shape is the router-decided group size, so non-reentrant checkpointing
         # aborts the backward. Two callers tape this, so the hazard is reachable.
@@ -249,7 +269,7 @@ def _nf4_stack(experts, kind, projs, dtype):
 def _nf4_build_gate_up_stack(experts, spec, dtype):
     """_build_gate_up_stack from the pointer-table kernel, or None. The table interleaves
     [g0, u0, g1, u1, ...], so the [2E, inter, hidden] output is [E, 2*inter, hidden] =
-    per expert cat(gate, up, dim=0)."""
+    per expert cat(gate, up, dim=0), returned as its transposed view (no copy)."""
     g_name, u_name = spec[0], spec[1]
     projs = []
     for ex in experts:
@@ -258,17 +278,18 @@ def _nf4_build_gate_up_stack(experts, spec, dtype):
     if w is None:
         return None
     E, N, K = len(experts), w.shape[1], w.shape[2]
-    return w.view(E, 2 * N, K).transpose(1, 2).contiguous()
+    return w.view(E, 2 * N, K).transpose(1, 2)
 
 
 def _nf4_build_down_stack(experts, spec, dtype):
-    """_build_down_stack from the pointer-table kernel, or None."""
+    """_build_down_stack from the pointer-table kernel (transposed view), or None."""
     w = _nf4_stack(experts, "down", [getattr(ex, spec[2]) for ex in experts], dtype)
-    return None if w is None else w.transpose(1, 2).contiguous()
+    return None if w is None else w.transpose(1, 2)
 
 
 def _build_gate_up_stack(experts, spec, dtype):
-    """[E, hidden, 2*inter]: per expert cat(gate^T, up^T)."""
+    """[E, hidden, 2*inter]: per expert cat(gate^T, up^T), a transposed view of the contiguous
+    [E, 2*inter, hidden] stack (the GEMMs take the view, backward its contiguous transpose)."""
     w = _nf4_build_gate_up_stack(experts, spec, dtype)
     # Not counted while tracing: this can run inside _GroupedFrozenMM, where Dynamo cannot
     # replay a global-dict update (fullgraph fails), and traced code never takes the NF4 kernel.
@@ -283,7 +304,7 @@ def _build_gate_up_stack(experts, spec, dtype):
 
 
 def _build_down_stack(experts, spec, dtype):
-    """[E, inter, hidden]: per expert down^T."""
+    """[E, inter, hidden]: per expert down^T, a transposed view of the contiguous [E, hidden, inter] stack."""
     w = _nf4_build_down_stack(experts, spec, dtype)
     # Not counted while tracing: this can run inside _GroupedFrozenMM, where Dynamo cannot
     # replay a global-dict update (fullgraph fails), and traced code never takes the NF4 kernel.
@@ -298,20 +319,20 @@ def _build_down_stack(experts, spec, dtype):
 
 
 def _bnb_build_gate_up_stack(experts, spec, dtype):
-    """[E, hidden, 2*inter]: per expert cat(gate^T, up^T)."""
+    """[E, hidden, 2*inter]: per expert cat(gate^T, up^T), as a transposed view."""
     g_name, u_name = spec[0], spec[1]
     rows = []
     for ex in experts:
         g = _expert_weight(getattr(ex, g_name), dtype)
         u = _expert_weight(getattr(ex, u_name), dtype)
-        rows.append(torch.cat((g, u), dim=0).t())
-    return torch.stack(rows, 0).contiguous()
+        rows.append(torch.cat((g, u), dim=0))
+    return torch.stack(rows, 0).transpose(1, 2)
 
 
 def _bnb_build_down_stack(experts, spec, dtype):
-    """[E, inter, hidden]: per expert down^T."""
+    """[E, inter, hidden]: per expert down^T, as a transposed view."""
     d_name = spec[2]
-    return torch.stack([_expert_weight(getattr(ex, d_name), dtype).t() for ex in experts], 0).contiguous()
+    return torch.stack([_expert_weight(getattr(ex, d_name), dtype) for ex in experts], 0).transpose(1, 2)
 
 
 class _GroupedFrozenMM(torch.autograd.Function):
@@ -328,7 +349,8 @@ class _GroupedFrozenMM(torch.autograd.Function):
     def backward(ctx, g):
         (offsets,) = ctx.saved_tensors
         with torch.no_grad():
-            Wt = ctx.weight_fn().transpose(1, 2).contiguous()
+            # The builders return transposed views, so this is the contiguous [E, N, K] stack.
+            Wt = ctx.weight_fn().transpose(1, 2)
             dX = _grouped_mm_fix(g.contiguous(), Wt, offsets)
         return dX, None, None
 
@@ -431,8 +453,9 @@ def _ready_signature(experts, spec):
     """Key for caching _experts_grouped_state, built from every expert projection: identities
     (module, base weight, quant state, bias, LoRA modules and weights), frozen flags, and the
     PEFT state the check reads (active / disabled / merged adapters, forward pre-hooks for
-    mixed-adapter batches, dropout mode and p, scaling, DoRA / variants), and every weight's dtype /
-    device (`.to()` keeps a Parameter's identity, and one expert or adapter can be moved alone).
+    mixed-adapter batches, dropout mode and p, scaling, DoRA, which variant entries are set), and
+    every weight's shape / dtype / device (`.data =` and `.to()` keep a Parameter's identity, and
+    one expert or adapter can be changed alone).
     The fields of gpt-oss' _proj_signature, read through __dict__ (~3 us per projection; E=128
     has 384).
 
@@ -459,7 +482,7 @@ def _ready_signature(experts, spec):
                     b = bp.get("bias")
                     qs = getattr(w, "quant_state", None)
                     keep((w, qs, b))
-                    append((p, id(w), id(qs), w is not None and w.requires_grad,
+                    append((p, id(w), id(qs), getattr(w, "shape", None), w is not None and w.requires_grad,
                             id(b), b is not None and b.requires_grad,
                             getattr(w, "dtype", None), getattr(w, "device", None),
                             base.__dict__.get("compute_dtype")))
@@ -469,15 +492,18 @@ def _ready_signature(experts, spec):
                     hooks = d["_forward_pre_hooks"]
                     merged = d.get("merged_adapters")
                     active = d.get("_active_adapter")
+                    variants = d.get("lora_variant") or {}
                     append((active if isinstance(active, str) else tuple(active),
                             tuple(merged) if merged else (), d.get("_disable_adapters"),
                             tuple(hooks) if hooks else (), tuple(d.get("scaling", {}).items()),
-                            tuple(d.get("use_dora", {}).items()), len(d.get("lora_variant") or ())))
+                            tuple(d.get("use_dora", {}).items()),
+                            tuple((k, v is not None) for k, v in variants.items())))
                     for m in (*la.__dict__["_modules"].values(), *pm["lora_B"].__dict__["_modules"].values()):
                         mp = m.__dict__["_parameters"]
                         lw, lb = mp.get("weight"), mp.get("bias")
                         keep((lw, lb))
-                        append((m, id(lw), id(lb), getattr(lw, "dtype", None), getattr(lw, "device", None)))
+                        append((m, id(lw), id(lb), getattr(lw, "shape", None), getattr(lw, "dtype", None),
+                                getattr(lw, "device", None)))
                     for m in pm["lora_dropout"].__dict__["_modules"].values():
                         md = m.__dict__
                         append((m, md.get("training"), md.get("p")))
@@ -624,8 +650,9 @@ def grouped_moe_forward(self, hidden_states: torch.Tensor):
         cu = getattr(self, "_cached_gate_up", None)
         if cu is None or cu.device != dev or cu.dtype != dtype:
             with torch.no_grad():
-                self._cached_gate_up = _build_gate_up_stack(experts, spec, dtype)
-                self._cached_down = _build_down_stack(experts, spec, dtype)
+                # Resident stacks: one contiguous copy at build time, as before the view builders.
+                self._cached_gate_up = _build_gate_up_stack(experts, spec, dtype).contiguous()
+                self._cached_down = _build_down_stack(experts, spec, dtype).contiguous()
         gate_up = _grouped_mm_fix(permuted, self._cached_gate_up, offsets)
     else:
         gate_up = _grouped_expert_gemm(permuted, offsets, lambda: _build_gate_up_stack(experts, spec, dtype), recompute)
@@ -742,10 +769,10 @@ def enable_grouped_moe(model, recompute=None, cache=None, verbose=True):
         module.__dict__.pop("_moe_ready", None)
         module.forward = types.MethodType(grouped_moe_forward, module)
         n += 1
-        if not warmed and any(hasattr(getattr(module.experts[0], name), "lora_A") for name in spec[:3]):
+        if not warmed:
             warmed = True
-            # The LoRA GEMMs (moe_utils._grouped_mm_eager) read a one-time eager probe; run it now,
-            # so a compiled first forward does not graph-break on it.
+            # The base and LoRA GEMMs (_grouped_mm_fix, moe_utils._grouped_mm_eager) read a one-time
+            # eager probe; run it now, so a compiled first forward does not graph-break on it.
             try:
                 from .moe_utils import _transposed_view_grouped_mm_is_safe
                 _transposed_view_grouped_mm_is_safe()
