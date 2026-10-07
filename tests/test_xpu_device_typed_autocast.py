@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,6 +17,8 @@ ROOT = Path(__file__).resolve().parents[1] / "unsloth_zoo"
 def test_nested_quant_state_offset_follows_device():
     F = pytest.importorskip("bitsandbytes.functional")
     vllm_utils = pytest.importorskip("unsloth_zoo.vllm_utils")
+    if getattr(sys.modules.get("bitsandbytes"), "IS_UNSLOTH_STUB", False):
+        pytest.skip("bitsandbytes is stubbed (not installed)")
     _, qs = F.quantize_4bit(torch.randn(64, 64), compress_statistics = True, quant_type = "nf4")
     state = vllm_utils.from_dict.__func__(F.QuantState, qs.as_dict(packed = True), device = torch.device("cpu"))
     assert state.offset.device.type == "cpu"
