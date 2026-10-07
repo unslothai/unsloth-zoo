@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import ast
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,16 +13,38 @@ import torch
 ROOT = Path(__file__).resolve().parents[1] / "unsloth_zoo"
 
 
+def _patched_from_dict():
+    """The patched `QuantState.from_dict`, sliced by AST so CPU CI runs it without bitsandbytes."""
+    tree = ast.parse((ROOT / "vllm_utils.py").read_text(encoding = "utf-8"))
+    fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "from_dict")
+    fn.decorator_list = []
+    ns = {"torch": torch, "os": __import__("os"), "Dict": dict, "Any": object,
+          "unpack_tensor_to_dict": lambda t: dict(t.extra)}
+    exec(compile(ast.Module([fn], []), "vllm_utils.py", "exec"), ns)
+    return ns["from_dict"]
+
+
+class _QuantState:
+    valid_qs_type_keys = ["bitsandbytes__nf4"]
+    valid_qs_keys = {"absmax", "quant_map", "nested_absmax", "nested_quant_map", "quant_state",
+                     "quant_type", "blocksize", "dtype", "shape", "nested_blocksize", "nested_dtype",
+                     "nested_offset"}
+
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
 def test_nested_quant_state_offset_follows_device():
-    F = pytest.importorskip("bitsandbytes.functional")
-    vllm_utils = pytest.importorskip("unsloth_zoo.vllm_utils")
-    if getattr(sys.modules.get("bitsandbytes"), "IS_UNSLOTH_STUB", False):
-        pytest.skip("bitsandbytes is stubbed (not installed)")
-    _, qs = F.quantize_4bit(torch.randn(64, 64), compress_statistics = True, quant_type = "nf4")
-    state = vllm_utils.from_dict.__func__(F.QuantState, qs.as_dict(packed = True), device = torch.device("cpu"))
+    packed = torch.zeros(1)
+    packed.extra = {"quant_type": "nf4", "blocksize": 64, "dtype": "float16", "shape": (64, 64),
+                    "nested_blocksize": 256, "nested_dtype": "float32", "nested_offset": 0.25}
+    qs_dict = {"absmax": torch.zeros(4, dtype = torch.uint8), "quant_map": torch.zeros(16),
+               "nested_absmax": torch.zeros(1), "nested_quant_map": torch.zeros(256),
+               "quant_state.bitsandbytes__nf4": packed}
+    state = _patched_from_dict()(_QuantState, qs_dict, device = torch.device("cpu"))
     assert state.offset.device.type == "cpu"
     assert state.offset.dtype == torch.float32
-    assert torch.equal(state.offset, qs.offset.float())
+    assert state.offset.item() == 0.25
 
 
 def test_gemma3n_fp32_region_overrides_enclosing_autocast():
