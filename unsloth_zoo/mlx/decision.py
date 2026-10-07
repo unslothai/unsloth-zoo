@@ -1174,10 +1174,10 @@ class ClefModel(_QwenModel):
         self.temperatures = {kind: scale * min(max(float(t), 0.5), 5.0) for kind, t in zip(_TYPES, saved.get("temperature", []))}
 
     @classmethod
-    def from_language_model(cls, folder, dtype = None, token = None, head_width = None, head_config = None, seed = 3407):
+    def from_language_model(cls, folder, dtype = None, token = None, head_width = None, head_config = None, seed = 3407, load_in_4bit = False):
         """A plain language model with a new, untrained joint head, to be trained as a Clef."""
         self = cls.__new__(cls)
-        self._load_beside(Path(folder), dtype, token, "joint_head")
+        self._load_beside(Path(folder), dtype, token, "joint_head", load_in_4bit)
         _require_clef_source(self.model, folder)
         hidden_size = _output_rows(self._output_head(), [0]).shape[-1]
         self.head_config = dict(head_config or clef_head_config(hidden_size, head_width))
@@ -1322,11 +1322,11 @@ def load_decision_model(folder, compute_dtype = None, *, family = None, subfolde
     return FAMILIES[family](folder, compute_dtype, base_model, token)
 
 
-def load_language_model_as_clef(path, compute_dtype = None, *, head_width = None, head_config = None, seed = 3407, token = None):
+def load_language_model_as_clef(path, compute_dtype = None, *, head_width = None, head_config = None, seed = 3407, token = None, load_in_4bit = False):
     """Load a plain language model (a local folder or a Hugging Face repo id) with a new joint head, to train as a Clef.
 
     The head is Clef's, 1024 wide for a decoder with hidden size 3072 or more and 512 otherwise unless `head_width` or a
-    whole `head_config` says otherwise, and starts untrained from `seed`, which reseeds MLX's random state. The result trains and saves like a loaded Clef.
+    whole `head_config` says otherwise, and starts untrained from `seed`, which reseeds MLX's random state. `load_in_4bit` quantizes the decoder as it loads, to train through LoRA adapters. The result trains and saves like a loaded Clef.
     """
     folder = Path(path)
     if not folder.is_dir():
@@ -1335,7 +1335,7 @@ def load_language_model_as_clef(path, compute_dtype = None, *, head_width = None
         folder = Path(snapshot_download(str(path), token = token))
     if isinstance(compute_dtype, str):
         compute_dtype = getattr(mx, compute_dtype)
-    return ClefModel.from_language_model(folder, compute_dtype, token, head_width, head_config, seed)
+    return ClefModel.from_language_model(folder, compute_dtype, token, head_width, head_config, seed, load_in_4bit)
 
 
 def _state_name(name):
@@ -1430,11 +1430,24 @@ def _decoder_tensor_name(decoder, path):
 
 def _require_clef_source(decoder, source):
     # Saving adds what training changed to the source's own tensors, so each decoder weight needs its counterpart there.
-    stored = {name: value.shape for shard in Path(source).glob("model*.safetensors") for name, value in mx.load(str(shard)).items()}
-    for path, value in tree_flatten(decoder.parameters()):
-        name = _decoder_tensor_name(decoder, path)
-        packed = path.rsplit(".", 1)[-1] == "scales"
-        if packed or name is not None and stored.get(name) != (value.swapaxes(1, 2) if value.ndim == 3 else value).shape:
+    stored = {name: value for shard in Path(source).glob("model*.safetensors") for name, value in mx.load(str(shard)).items()}
+    packed = any(name.endswith(".scales") for name in stored)
+    weights = tree_flatten(decoder.parameters())
+    # A weight quantized on load keeps its name and rows but not its columns; its source must still be the float tensor.
+    quantized = {path.rpartition(".")[0] for path, _ in weights if path.endswith(".scales")}
+    for path, value in weights:
+        name, source_value = _decoder_tensor_name(decoder, path), None
+        if name is not None:
+            source_value = stored.get(name)
+        if name is None or path.rpartition(".")[0] in quantized and not path.endswith(".weight"):
+            fits = True
+        elif source_value is None:
+            fits = False
+        elif path.rpartition(".")[0] in quantized:
+            fits = mx.issubdtype(source_value.dtype, mx.floating) and source_value.shape[0] == value.shape[0]
+        else:
+            fits = source_value.shape == (value.swapaxes(1, 2) if value.ndim == 3 else value).shape
+        if packed or not fits:
             raise ValueError(f"Unsloth: {source} cannot be trained as a Clef here: its {path} is quantized or stored in another layout. Use the original float checkpoint.")
 
 

@@ -760,7 +760,7 @@ def test_saved_clef_holds_the_trained_decoder_and_a_head_with_its_temperature_fo
 
 
 def test_a_plain_language_model_gets_a_new_joint_head_and_saves_as_a_clef(clef, tmp_path, monkeypatch):
-    from unsloth_zoo.mlx.decision import ClefModel, _decoder_tensor_name, clef_head_config
+    from unsloth_zoo.mlx.decision import ClefModel, _decoder_tensor_name, clef_head_config, load_language_model_as_clef
 
     source, record, out = tmp_path / "lm", clef[2]("hello"), tmp_path / "out"
     source.mkdir()
@@ -783,7 +783,15 @@ def test_a_plain_language_model_gets_a_new_joint_head_and_saves_as_a_clef(clef, 
     assert served.head_config == first.head_config and json.loads((out / "unsloth_decision_config.json").read_text())["base_model"] == "org/lm"
     np.testing.assert_allclose(np.array(served.logits(*args)), np.array(first.logits(*args)), atol = 3e-2)
     packed = _decoder(quantized = True)
-    monkeypatch.setattr(ClefModel, "_load", lambda self, *args: vars(self).update(model = packed, tokenizer = None))
+    monkeypatch.setattr(ClefModel, "_load", lambda self, *args: vars(self).update(model = packed, tokenizer = None, asked = args[-1]))
+    # Quantized on load, a float source still takes the trained update.
+    assert load_language_model_as_clef(source, load_in_4bit = True).asked is True
+    floats = mx.load(str(source / "model.safetensors"))
+    # A source that keeps the names but holds integers, or other rows, cannot take the update.
+    for other in (lambda value: value.astype(mx.uint8), lambda value: mx.zeros((value.shape[0] + 1, value.shape[1]))):
+        mx.save_safetensors(str(source / "model.safetensors"), {name: other(value) if value.ndim == 2 else value for name, value in floats.items()})
+        with pytest.raises(ValueError, match = "is quantized"):
+            ClefModel.from_language_model(source, load_in_4bit = True)
     mx.save_safetensors(str(source / "model.safetensors"), {_decoder_tensor_name(packed, path): value.swapaxes(1, 2) if value.ndim == 3 else value for path, value in tree_flatten(packed.parameters())})
     with pytest.raises(ValueError, match = "is quantized"):
         ClefModel.from_language_model(source)
