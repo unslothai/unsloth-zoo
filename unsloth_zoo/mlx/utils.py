@@ -3236,6 +3236,22 @@ def _apply_static_vlm_metadata(model, batch_dict, kwargs):
         not getattr(model, "training", False) or kwargs.get("position_ids") is None
     ):
         return
+    if not keys:
+        # The family table names keys these towers read as Python only once their
+        # compile patches are in force. An embedder declaration is safe either
+        # way, since the patch that carries it is the tower that reads it, but
+        # the table has to stay off whenever compile is not running -- an
+        # unpatched tower still calls `.tolist()` on what it was handed, and
+        # `patch_mode="unpatched"` reaches exactly that.
+        decision = getattr(model, "_unsloth_compile_decision", None)
+        if decision is None or not getattr(decision, "enabled", False):
+            return
+        keys = _VLM_STATIC_METADATA_MODEL_TYPES.get(
+            _mlx_vlm_canonical_model_type(
+                _config_get(getattr(model, "config", None), "model_type")
+            ),
+            (),
+        )
     static = batch_dict.get("_unsloth_static_vlm_metadata", {})
     for key in keys:
         if key in static:
@@ -3519,9 +3535,11 @@ def _mlx_vlm_canonical_model_type(model_type):
 
 
 # Families whose mlx-vlm code indexes the vision grid as an array (`.tolist()`,
-# `.prod()`, `[:, 1:]`), so a tuple raises inside their tower. Everything else
-# keeps the tuple the Qwen/Paddle compile patches trace: an array becomes a
-# tracer under mx.compile and `.tolist()` raises there instead. Pinned by
+# `.prod()`, `[:, 1:]`), so a tuple raises inside their tower. This is the batch
+# the eager path runs on; a compile-patched tower reads the Python value out of
+# `_unsloth_static_vlm_metadata` instead. Everything else keeps the tuple the
+# Qwen/Paddle compile patches trace: an array becomes a tracer under mx.compile
+# and `.tolist()` raises there instead. Pinned by
 # tests/test_mlx_text_path_contract.py.
 _VLM_ARRAY_GRID_MODEL_TYPES = frozenset({
     "glm4v",
@@ -3530,6 +3548,21 @@ _VLM_ARRAY_GRID_MODEL_TYPES = frozenset({
     "muse_glimmer",
     "glm5_next",
 })
+
+
+# Towers that read this metadata on the host -- `.tolist()`, `int()` -- instead
+# of through MLX ops, so under mx.compile they meet a tracer and raise. These
+# keys are handed over as the Python values the processor measured. Families
+# whose embedder is compile-patched declare the same keys on the patch; naming
+# them per family is not avoidable, since a tuple raises in the towers of
+# `_VLM_ARRAY_GRID_MODEL_TYPES` above.
+_VLM_STATIC_METADATA_MODEL_TYPES = {
+    # One `_as_grid_list` call reads whichever of the two the batch carries.
+    "mage_vl": ("image_grid_thw", "video_grid_thw"),
+    # Pixtral's vision tower, which mistral3 and mistral4 checkpoints also load.
+    "mistral3": ("image_sizes",),
+    "pixtral": ("image_sizes",),
+}
 
 
 def _normalize_size_tuples(values):

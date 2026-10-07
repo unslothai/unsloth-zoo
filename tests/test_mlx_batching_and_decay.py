@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections
+import contextlib
 import inspect
 import json
 import os
@@ -2592,6 +2593,111 @@ def test_stream_grid_widens_vlm_batches_at_the_consumer_width_seam():
     assert target is not None and target > guarded_width
 
 
+# Per family: the rebindings its installer must make, as (module, class or None
+# for a module-level name, attribute[, the `unsloth_zoo.mlx.compile` attribute it
+# must be bound to]); the merge it replaces, as (class or None, attribute,
+# upstream requires equal counts).
+HOST_GRID_FAMILIES = [
+]
+
+
+@contextlib.contextmanager
+def _installer_patches_restored(arch):
+    """Run an installer and put both of its modules back exactly as they were.
+
+    The installers rebind class methods and module-level names, and anything
+    left behind would change what a later test in this session measures.
+    """
+    import importlib
+
+    import unsloth_zoo.mlx.compile as mc
+
+    pytest.importorskip(f"mlx_vlm.models.{arch}.{arch}")
+    modules = {
+        "vision": importlib.import_module(f"mlx_vlm.models.{arch}.vision"),
+        "model": importlib.import_module(f"mlx_vlm.models.{arch}.{arch}"),
+    }
+    owners = list(modules.values()) + [
+        obj for module in modules.values()
+        for obj in vars(module).values() if isinstance(obj, type)]
+    snapshot = {owner: dict(vars(owner)) for owner in owners}
+    patched, bindings = set(mc._PATCHED_ARCHES), set(mc._PATCH_BINDINGS)
+    try:
+        yield mc, modules
+    finally:
+        for owner, members in snapshot.items():
+            for name in set(vars(owner)) - set(members):
+                delattr(owner, name)
+            for name, member in members.items():
+                if vars(owner).get(name) is not member:
+                    setattr(owner, name, member)
+        mc._PATCHED_ARCHES.clear()
+        mc._PATCHED_ARCHES.update(patched)
+        mc._PATCH_BINDINGS.clear()
+        mc._PATCH_BINDINGS.update(bindings)
+
+
+@pytest.mark.parametrize("arch,bindings,merge", HOST_GRID_FAMILIES)
+def test_each_host_grid_family_is_qualified_and_really_patched(arch, bindings, merge):
+    """Qualifying one of these without wiring its installer would compile the
+    unpatched tower, which reads the grid back on the host; a no-op installer
+    would satisfy that wiring and still leave the tower unpatched. The merge it
+    replaces also has to keep refusing what its own upstream refused."""
+    _skip_if_mlx_core_was_replaced()
+    import ast
+    import inspect
+    import textwrap
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.compile import (
+        MLXVLMCompilePolicy,
+        _matching_pattern_bundles,
+        resolve_training_compile,
+    )
+
+    installer = f"{arch}_vision_compile_runtime"
+    with _installer_patches_restored(arch) as (mc, modules):
+        model = type("Model", (), {"__module__": f"mlx_vlm.models.{arch}.{arch}"})()
+        model.config = SimpleNamespace(model_type=arch)
+        decision = resolve_training_compile(
+            model, policy=MLXVLMCompilePolicy(mode="best_effort"))
+        assert decision.enabled, decision.reason
+        assert installer in {
+            name for bundle in _matching_pattern_bundles(arch)
+            for name in bundle.runtime_primitive_names}
+
+        owners = [modules[binding[0]] if binding[1] is None
+                  else getattr(modules[binding[0]], binding[1]) for binding in bindings]
+        originals = [getattr(owner, b[2]) for owner, b in zip(owners, bindings)]
+
+        mc._runtime_patch_primitive_installers()[installer]()
+
+        assert arch in mc._PATCHED_ARCHES
+        for owner, binding, original in zip(owners, bindings, originals):
+            bound = getattr(owner, binding[2])
+            assert bound is not original, binding[2]
+            if len(binding) == 4:
+                assert bound is getattr(mc, binding[3]), binding[2]
+
+        cls, method, exact = merge
+        owner = modules["model"] if cls is None else getattr(modules["model"], cls)
+        source = inspect.getsource(getattr(owner, method))
+
+    # Parsed rather than matched as text, so a commented-out call cannot pass.
+    calls = [
+        node for node in ast.walk(ast.parse(textwrap.dedent(source)))
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "id", None) == "_raise_on_feature_count_mismatch"]
+    assert len(calls) == 1, method
+    # Three positional args: the mask, the features, and the embeddings whose
+    # width turns the feature block into a count of placeholders it can fill.
+    assert len(calls[0].args) == 3, method
+    relaxed = any(
+        keyword.arg == "exact" and keyword.value.value is False
+        for keyword in calls[0].keywords)
+    assert relaxed is not exact, method
+
+
 @pytest.mark.parametrize("arch", ["kimi_vl", "moondream2"])
 def test_a_family_qualified_without_a_patch_still_has_to_clear_the_gate(arch):
     """No compile patch needed: qualification alone decides."""
@@ -2633,6 +2739,7 @@ def test_a_family_qualified_without_a_patch_still_has_to_clear_the_gate(arch):
 
 @pytest.mark.parametrize("parent, decoder", [
     ("gemma4", "gemma4_text"), ("qwen3_5", "qwen3_5_text"), ("qwen3_5_moe", "qwen3_5_moe_text"),
+    ("mage_vl", "qwen3"),
 ])
 def test_nested_text_decoder_qualification_decides_its_parent(parent, decoder):
     """An unqualified `text_config` decoder keeps a qualified parent eager."""

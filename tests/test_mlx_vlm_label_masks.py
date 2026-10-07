@@ -5933,6 +5933,248 @@ def test_a_processor_emitted_grid_array_is_never_downgraded():
     assert out["_unsloth_static_vlm_metadata"]["image_grid_thw"] == ((1, 16, 16),)
 
 
+@pytest.mark.parametrize("model_type,declared,undeclared", [
+    ("pixtral", "image_sizes", "image_grid_thw"),
+    ("mistral3", "image_sizes", "image_grid_thw"),
+    ("mage_vl", "image_grid_thw", "image_sizes"),
+    ("mage_vl", "video_grid_thw", "image_sizes"),
+])
+def test_a_family_without_a_patched_embedder_still_gets_its_static_metadata(
+    model_type, declared, undeclared,
+):
+    """These towers read the metadata on the host, where the processor's array is
+    a tracer under mx.compile, and none of them has a patched embedder to declare
+    the key on. Keys the family does not read stay as the processor emitted them."""
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.utils import _apply_static_vlm_metadata
+
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type=model_type),
+        _unsloth_compile_decision=SimpleNamespace(enabled=True))
+    batch = {"_unsloth_static_vlm_metadata": {
+        declared: ((1, 16, 16),), undeclared: ((2, 8, 8),)}}
+    kwargs = {declared: mx.array([[1, 16, 16]]), undeclared: mx.array([[2, 8, 8]])}
+
+    _apply_static_vlm_metadata(model, batch, kwargs)
+
+    assert kwargs[declared] == ((1, 16, 16),)
+    assert isinstance(kwargs[undeclared], mx.array)
+
+
+@pytest.mark.parametrize("ids,rows,expected_rows", [
+    ([[10, 20, 10]], 2, [0, None, 1]),
+    ([[20, 5, 20]], 2, [0, None, 1]),
+    # One image placeholder, so one feature row: the video token stays text.
+    ([[10, 20, 20]], 1, [0, None, None]),
+    # Image token away from position zero: reading presence off the first token
+    # alone would pick the video placeholders here.
+    ([[20, 10, 10]], 2, [None, 0, 1]),
+])
+def test_the_exclusive_merge_fills_video_placeholders_only_without_images(
+    ids, rows, expected_rows,
+):
+    """dots_ocr and glm_ocr upstream fall back to the video placeholder only when
+    the sequence carries no image one, so a sequence holding both fills the image
+    positions alone."""
+    from unsloth_zoo.mlx.compile import _merge_exclusive_special_token_features
+
+    inputs_embeds = mx.zeros((1, 3, 2))
+    features = mx.array([[1.0, 1.0], [2.0, 2.0]])[:rows]
+
+    merged = _merge_exclusive_special_token_features(
+        10, 20, features, inputs_embeds, mx.array(ids))
+
+    for position, row in enumerate(expected_rows):
+        got = merged[0, position].tolist()
+        assert got == ([0.0, 0.0] if row is None else features[row].tolist()), position
+
+
+def test_the_exclusive_merge_carries_the_dots_ocr_count_contract():
+    """Its upstream prefix-slices the block per row, so a trailing feature row is
+    ignored and only a shortfall is refused. Requiring equality here is the
+    mistake this wiring exists to avoid."""
+    from unsloth_zoo.mlx.compile import _merge_exclusive_special_token_features
+
+    inputs_embeds = mx.zeros((1, 3, 2))
+    features = mx.array([[1.0, 1.0], [2.0, 2.0]])
+
+    surplus = _merge_exclusive_special_token_features(
+        10, 20, features, inputs_embeds, mx.array([[10, 0, 0]]))
+    assert surplus[0, 0].tolist() == [1.0, 1.0]
+
+    untouched = _merge_exclusive_special_token_features(
+        10, 20, features, inputs_embeds, mx.array([[0, 0, 0]]))
+    assert untouched[0, 0].tolist() == [0.0, 0.0]
+
+    with pytest.raises(ValueError, match="tokens=3, features=2"):
+        _merge_exclusive_special_token_features(
+            10, 20, features, inputs_embeds, mx.array([[10, 10, 10]]))
+
+
+def test_a_tower_that_indexes_the_grid_as_an_array_is_left_alone():
+    """glm4v opens with `grid_thw.tolist()` and `mx.max(grid_thw[:, 1:])` on the
+    same object, so substituting the Python value would break it instead."""
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.utils import _apply_static_vlm_metadata
+
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="glm4v"),
+        _unsloth_compile_decision=SimpleNamespace(enabled=True))
+    kwargs = {"image_grid_thw": mx.array([[1, 16, 16]])}
+
+    _apply_static_vlm_metadata(
+        model, {"_unsloth_static_vlm_metadata": {"image_grid_thw": ((1, 16, 16),)}}, kwargs)
+
+    assert isinstance(kwargs["image_grid_thw"], mx.array)
+
+
+# Two placeholders two elements wide: every layout holding four elements can
+# fill them, and (2, 1) cannot however its axes are read.
+@pytest.mark.parametrize("shape,fills", [
+    ((2, 2), True), ((1, 2, 2), True), ((2, 1, 2), True), ((4,), True),
+    ((1, 4), True), ((2, 1), False), ((1, 1, 2), False),
+])
+def test_the_count_is_of_placeholders_the_features_can_fill(shape, fills):
+    """minimax_m3_vl compares the elements it scatters rather than a row count,
+    so a folded or leading axis is not a mismatch there. Measuring an axis
+    instead refuses a batch its upstream accepts."""
+    from unsloth_zoo.mlx.compile import _raise_on_feature_count_mismatch
+
+    mask, inputs_embeds = mx.array([[True, True, False]]), mx.zeros((1, 3, 2))
+
+    if fills:
+        _raise_on_feature_count_mismatch(mask, mx.zeros(shape), inputs_embeds)
+    else:
+        with pytest.raises(ValueError, match="tokens=2, features=[01]"):
+            _raise_on_feature_count_mismatch(mask, mx.zeros(shape), inputs_embeds)
+
+
+def test_a_block_that_does_not_divide_into_rows_fills_nothing():
+    """Three elements cannot be read as rows two wide. Counting them as one row
+    would pass the surplus-tolerant check and then fail to reshape in the merge,
+    which is the shape of every mistake this guard has already made."""
+    from unsloth_zoo.mlx.compile import _raise_on_feature_count_mismatch
+
+    with pytest.raises(ValueError, match="tokens=1, features=0"):
+        _raise_on_feature_count_mismatch(
+            mx.array([[True, False, False]]), mx.zeros((3,)), mx.zeros((1, 3, 2)),
+            exact=False)
+
+
+@pytest.mark.parametrize("shape", [(2, 2), (1, 2, 2), (2, 1, 2), (4,), (1, 4)])
+def test_the_merge_indexes_a_folded_feature_block_by_its_elements(shape):
+    """Upstream scatters the block's elements, so a leading or folded axis holds
+    the same features in a different shape. Accepting one at the count and then
+    failing to index it would be worse than refusing it."""
+    from unsloth_zoo.mlx.compile import _merge_sequence_mask_features
+
+    merged, _ = _merge_sequence_mask_features(
+        mx.array([[True, True, False]]),
+        mx.array([0.0, 1.0, 2.0, 3.0]).reshape(shape),
+        mx.zeros((1, 3, 2)),
+    )
+
+    assert merged.tolist() == [[[0.0, 1.0], [2.0, 3.0], [0.0, 0.0]]]
+
+
+def test_the_shared_merge_itself_refuses_nothing():
+    """Idefics hands it a feature row per padded image slot, so the count
+    belongs to each tower rather than to the merge they share."""
+    from unsloth_zoo.mlx.compile import _merge_sequence_mask_features
+
+    merged, _ = _merge_sequence_mask_features(
+        mx.array([[True, False, False]]),
+        mx.array([[1.0, 1.0], [2.0, 2.0]]),
+        mx.zeros((1, 3, 2)),
+    )
+
+    assert merged[0, 0].tolist() == [1.0, 1.0]
+
+
+def test_the_count_check_steps_aside_for_a_mask_it_cannot_read():
+    """A mask derived from a compiled function's own inputs is a tracer, and the
+    comparison has no host value to make."""
+    from unsloth_zoo.mlx.compile import _raise_on_feature_count_mismatch
+
+    features = mx.array([[1.0, 1.0], [2.0, 2.0]])
+
+    @mx.compile
+    def check(input_ids):
+        _raise_on_feature_count_mismatch(
+            input_ids == 1, features, mx.zeros((1, 3, 2)))
+        return input_ids * 2
+
+    assert check(mx.array([[1, 0, 0]])).shape == (1, 3)
+
+
+@pytest.mark.parametrize("decision", [None, "disabled"])
+def test_the_family_table_stays_off_when_compile_is_not_running(decision):
+    """Its keys name what a patched tower reads. `patch_mode="unpatched"` leaves
+    the upstream tower in place, and that one still calls `.tolist()` on the
+    array it was handed."""
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.utils import _apply_static_vlm_metadata
+
+    model = SimpleNamespace(config=SimpleNamespace(model_type="mage_vl"))
+    if decision == "disabled":
+        model._unsloth_compile_decision = SimpleNamespace(enabled=False)
+    kwargs = {"image_grid_thw": mx.array([[1, 16, 16]])}
+
+    _apply_static_vlm_metadata(
+        model, {"_unsloth_static_vlm_metadata": {"image_grid_thw": ((1, 16, 16),)}}, kwargs)
+
+    assert isinstance(kwargs["image_grid_thw"], mx.array)
+
+
+def test_a_patched_embedder_declaration_still_applies_without_a_decision():
+    """The patch that declares the keys is the tower that reads them, so the
+    declaration cannot outlive the patch the way the table can."""
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.utils import _apply_static_vlm_metadata
+
+    def embedder():
+        raise AssertionError("never called")
+
+    embedder._unsloth_static_vlm_metadata = ("image_grid_thw",)
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="phi3_v"), get_input_embeddings=embedder)
+    kwargs = {"image_grid_thw": mx.array([[1, 16, 16]])}
+
+    _apply_static_vlm_metadata(
+        model, {"_unsloth_static_vlm_metadata": {"image_grid_thw": ((1, 16, 16),)}}, kwargs)
+
+    assert kwargs["image_grid_thw"] == ((1, 16, 16),)
+
+
+def test_a_patched_embedder_declaration_wins_over_the_family_table():
+    """A compile patch knows which keys its own rewritten tower reads."""
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.utils import _apply_static_vlm_metadata
+
+    def embedder():
+        raise AssertionError("never called")
+
+    embedder._unsloth_static_vlm_metadata = ("image_grid_thw",)
+    # An enabled decision, so the competing table path is live: pixtral's entry
+    # names `image_sizes`, which the declaration has to keep out of the kwargs.
+    model = SimpleNamespace(
+        config=SimpleNamespace(model_type="pixtral"), get_input_embeddings=embedder,
+        _unsloth_compile_decision=SimpleNamespace(enabled=True))
+    kwargs = {"image_sizes": mx.array([[16, 16]]),
+              "image_grid_thw": mx.array([[1, 16, 16]])}
+
+    _apply_static_vlm_metadata(model, {"_unsloth_static_vlm_metadata": {
+        "image_sizes": ((16, 16),), "image_grid_thw": ((1, 16, 16),)}}, kwargs)
+
+    assert kwargs["image_grid_thw"] == ((1, 16, 16),)
+    assert isinstance(kwargs["image_sizes"], mx.array)
+
+
 def test_a_sidecar_symlink_out_of_the_model_is_not_dereferenced(tmp_path):
     """A writable model directory is otherwise enough to aim a sidecar at a
     credential file and have the save copy it into a published adapter."""
