@@ -1512,6 +1512,13 @@ def patch_mamba_ssm_pre_ampere_fallback():
         # phase, and can propagate an ImportError out of `import unsloth`.
         if not _mod.__dict__.get("is_fast_path_available", False):
             continue
+        # LFM2 and Qwen3-Next carry the same flag for causal_conv1d / fla
+        # alone; they never call mamba_ssm, so their fast path stays.
+        if not any(_mod.__dict__.get(_sym, None) is not None for _sym in (
+            "selective_state_update", "mamba_chunk_scan_combined",
+            "mamba_split_conv1d_scan_combined", "selective_scan_fn", "mamba_inner_fn",
+        )):
+            continue
         try:
             _mod.is_fast_path_available = False
             for _sym in (

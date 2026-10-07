@@ -191,6 +191,7 @@ def _fake_mixer_module(mod_name, cls_name, weight_attr):
     """
     mod = types.ModuleType(mod_name)
     mod.is_fast_path_available = True
+    mod.selective_scan_fn = lambda *a, **k: None
 
     class Mixer:
         def __init__(self):
@@ -569,6 +570,22 @@ def test_non_transformers_modules_are_left_alone(env):
         assert vllm.is_fast_path_available is True
     finally:
         sys.modules.pop("vllm.model_executor.layers.mamba", None)
+
+
+@pytest.mark.parametrize("name", ["lfm2", "qwen3_next"])
+def test_models_without_mamba_kernels_keep_their_fast_path(env, name):
+    """LFM2 and Qwen3-Next compute the same flag from causal_conv1d / fla only."""
+    mod_name = f"transformers.models.{name}.modeling_{name}"
+    mod = types.ModuleType(mod_name)
+    mod.is_fast_path_available = True
+    mod.causal_conv1d_fn = lambda *a, **k: None
+    sys.modules[mod_name] = mod
+    try:
+        patch()
+        assert mod.is_fast_path_available is True
+        assert mod.causal_conv1d_fn is not None
+    finally:
+        sys.modules.pop(mod_name, None)
 
 
 def test_registered_as_a_temporary_patch():
