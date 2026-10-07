@@ -22,6 +22,7 @@ import math
 import random
 import re
 import time
+import types
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -558,18 +559,24 @@ class MLXDecisionTrainer:
     def train(self):
         # MLX caches freed buffers by size, so every distinct batch shape leaves its working set in the cache: tens of
         # gigabytes over a run. With args.cache_limit_gb unset the cache may hold what a step has needed so far,
-        # which is all the next step can reuse; a value <= 0 leaves the limit alone.
-        limit = getattr(self.args, "cache_limit_gb", None)
-        self._cache_follows_peak = limit is None
+        # which is all the next step can reuse; a value <= 0 or args.disable_memory_limits leaves the limit alone.
+        from .trainer import MLXTrainer
+
+        args = self.args
+        # The memory, wired and explicit cache caps are MLXTrainer's, under the same switches.
+        limits = types.SimpleNamespace(args = args, _bytes_to_gb = MLXTrainer._bytes_to_gb)
+        self._cache_follows_peak = getattr(args, "cache_limit_gb", None) is None and not getattr(args, "disable_memory_limits", False)
         prior = None
-        if limit is None or limit > 0:
-            prior = mx.set_cache_limit(mx.get_peak_memory() if limit is None else int(limit * 1e9))
         try:
+            self._memory_limits_applied = MLXTrainer._configure_memory_limits(limits)
+            if self._cache_follows_peak:
+                prior = mx.set_cache_limit(mx.get_peak_memory())
             with getattr(self.model, "training_run", contextlib.nullcontext)():
                 return self._train()
         finally:
             if prior is not None:
                 mx.set_cache_limit(prior)
+            MLXTrainer._restore_memory_limits(limits)
 
     def _epoch_batches(self, epoch):
         args, lengths = self.args, [len(item["input_ids"]) for item in self.train_dataset]
@@ -640,7 +647,7 @@ class MLXDecisionTrainer:
                 logged_loss, logged_steps, total_loss = logged_loss + step_loss, logged_steps + 1, total_loss + step_loss
                 self._event("on_step_end")
                 if logging_steps and state.global_step % logging_steps == 0:
-                    logs = {"loss": logged_loss / logged_steps, "learning_rate": learning_rate, "epoch": state.epoch}
+                    logs = {"loss": logged_loss / logged_steps, "learning_rate": learning_rate, "epoch": state.epoch, "peak_memory_gb": mx.get_peak_memory() / 1e9}
                     if grad_norm is not None:
                         logs["grad_norm"] = grad_norm.item()
                     logged_loss, logged_steps = 0.0, 0

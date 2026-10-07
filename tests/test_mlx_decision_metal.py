@@ -792,6 +792,28 @@ def test_trainer_takes_datasets_and_fractional_intervals(checkpoint):
     assert [("eval_loss" in log, round(log["epoch"], 2)) for log in recorder.logs[:4]] == [(False, 1.0), (True, 1.0), (False, 2.0), (True, 2.0)]
 
 
+def _metal_limits():
+    limits = mx.set_memory_limit(1 << 40), mx.set_wired_limit(0), mx.set_cache_limit(0)
+    mx.set_memory_limit(limits[0]), mx.set_wired_limit(limits[1]), mx.set_cache_limit(limits[2])
+    return limits
+
+
+def test_trainer_applies_memory_limits_for_the_run_only(checkpoint):
+    model = load_trainable_decision_model(checkpoint[1])
+    before, cap = _metal_limits(), int(mx.device_info()["max_recommended_working_set_size"] / 1e9 * 0.85 * 1e9)
+    cases = (({}, (cap, cap)), ({"wired_limit_gb": 1, "cache_limit_gb": 2}, (cap, 10**9, 2 * 10**9)), ({"disable_memory_limits": True}, before))
+    for kwargs, during in cases:
+        seen = []
+        trainer = MLXDecisionTrainer(model, _config(max_steps = 1, **kwargs), _items())
+        trainer._event = lambda *args, **kwargs: seen.append(_metal_limits()[: len(during)])
+        trainer.train()
+        assert {*seen} == {during} and _metal_limits() == before
+        assert bool(trainer._memory_limits_applied) == ("disable_memory_limits" not in kwargs)
+    with pytest.raises(ValueError):
+        MLXDecisionTrainer(model, _config(wired_limit_gb = 1e6), _items()).train()
+    assert _metal_limits() == before
+
+
 def test_trainer_stops_on_request_and_refuses_other_optimizers(checkpoint):
     model = load_trainable_decision_model(checkpoint[1])
     recorder = _Recorder(stop_at = 1)
