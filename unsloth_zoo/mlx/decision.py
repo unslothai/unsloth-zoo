@@ -695,24 +695,24 @@ class _QwenModel(DecisionPipeline):
     # Below this many shared tokens a second pass costs more than it saves.
     _MIN_SHARED = 16
 
-    def _load(self, source, revision, dtype, token, adapter = None):
+    def _load(self, source, revision, dtype, token, adapter = None, load_in_4bit = False):
         from .loader import FastMLXModel
 
         self.model, tokenizer = FastMLXModel.from_pretrained(
-            str(source), load_in_4bit = False, load_in_16bit = True, text_only = True, dtype = dtype, revision = revision, token = token,
+            str(source), load_in_4bit = load_in_4bit, load_in_16bit = not load_in_4bit, text_only = True, dtype = dtype, revision = revision, token = token,
         )
         self.tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
         if adapter is not None:
             _merge_lora(self.model, adapter)
         self.model.eval()
 
-    def _load_beside(self, folder, dtype, token, head_prefix):
+    def _load_beside(self, folder, dtype, token, head_prefix, load_in_4bit = False):
         # The decoder is loaded from a view of the folder without the head's files, which a model loader would read as decoder weights.
         with tempfile.TemporaryDirectory() as view:
             for item in folder.iterdir():
                 if not item.name.startswith(head_prefix):
                     os.symlink(item.resolve(), Path(view) / item.name)
-            self._load(view, None, dtype, token)
+            self._load(view, None, dtype, token, None, load_in_4bit)
             mx.eval(self.model.parameters())
 
     def _load_adapter(self, folder, dtype, base_model, token):
@@ -1155,8 +1155,8 @@ class ClefModel(_QwenModel):
     _SYSTEM = "Read the complete state and schema. Decide every field jointly. Each answer must be exactly one of that field's allowed options."
     _NOUL = {"true": "The proposition is true or the answer is yes.", "false": "The proposition is false or the answer is no."}
 
-    def __init__(self, folder, dtype, base_model, token):
-        self._load_beside(folder, dtype, token, "joint_head")
+    def __init__(self, folder, dtype, base_model, token, load_in_4bit = False):
+        self._load_beside(folder, dtype, token, "joint_head", load_in_4bit)
         self.head = _load_joint_head(folder)
         # A fine-tune's per-type temperatures are relative to its head temperature, which is kept apart only when
         # it could not be folded into the head's weights.
@@ -1259,12 +1259,14 @@ def detect_family(folder):
     return name
 
 
-def load_decision_model(folder, compute_dtype = None, *, family = None, subfolder = None, base_model = None, token = None):
+def load_decision_model(folder, compute_dtype = None, *, family = None, subfolder = None, base_model = None, token = None, load_in_4bit = False):
     """Load a decision model from its source repo: a local folder, or a Hugging Face repo id that is downloaded.
 
     `compute_dtype` is an MLX dtype or its name (default: float32 for the encoder models, the base model's own for the
     others); `family` names the model family when the files that identify it are missing; `subfolder` selects one checkpoint
-    of a repo that ships several; `base_model` replaces the base an adapter names (a folder or repo id).
+    of a repo that ships several; `base_model` replaces the base an adapter names (a folder or repo id). `load_in_4bit`
+    quantizes a Clef's decoder as it loads, to train LoRA adapters over: `save_clef_model` merges them into the
+    checkpoint's own full-precision weights.
     """
     source, folder = folder, Path(folder)
     if not folder.is_dir():
@@ -1283,6 +1285,10 @@ def load_decision_model(folder, compute_dtype = None, *, family = None, subfolde
         raise ValueError(f"{folder} cannot be loaded: {problem}")
     if isinstance(compute_dtype, str):
         compute_dtype = getattr(mx, compute_dtype)
+    if load_in_4bit:
+        if family != "clef":
+            raise ValueError(f"Unsloth: load_in_4bit is for Clef models; a {family} model loads at its own precision.")
+        return FAMILIES[family](folder, compute_dtype, base_model, token, load_in_4bit = True)
     return FAMILIES[family](folder, compute_dtype, base_model, token)
 
 
@@ -1809,10 +1815,11 @@ def clef_logits(network, items):
     network.eval()
     try:
         # Scored as requests are served, so temperatures fitted on these logits hold there.
+        output = pipeline._output_head()
         with generation_mode(pipeline.model):
             for item in items:
                 spans = item["option_spans"]
-                logits = np.array(pipeline.logits(item["input_ids"], item["question_spans"], spans, item["types"]))
+                logits = np.array(pipeline.logits(item["input_ids"], item["question_spans"], spans, item["types"], output))
                 out.append(np.split(logits, np.cumsum([len(options) for options in spans])[:-1]))
     finally:
         network.train(was_training)

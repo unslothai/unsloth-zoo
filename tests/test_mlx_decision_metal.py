@@ -209,14 +209,14 @@ def test_load_drains_generation_streams_before_clearing_the_cache(checkpoint, mo
     assert ("sync", (stream,)) in calls[:clear] and ("sync", ()) in calls[:clear]
 
 
-def _decoder(quantized = False):
+def _decoder(quantized = False, bits = 8):
     from mlx_lm.models import qwen3_5
 
     text = dict(model_type = "qwen3_5_text", hidden_size = 64, intermediate_size = 128, num_hidden_layers = 4, num_attention_heads = 2, num_key_value_heads = 1, vocab_size = 512)
     model = qwen3_5.Model(qwen3_5.ModelArgs(model_type = "qwen3_5", text_config = text))
     model.set_dtype(mx.bfloat16)
     if quantized:
-        quantize(model, group_size = 64, bits = 8)
+        quantize(model, group_size = 64, bits = bits)
     return model
 
 
@@ -631,7 +631,7 @@ def clef(tmp_path, monkeypatch):
     (tmp_path / "joint_head_config.json").write_text(json.dumps(config))
     save_file({name: value.contiguous() for name, value in reference.state_dict().items()}, tmp_path / "joint_head.safetensors")
     encode = lambda text, add_special_tokens: [ord(c) % 512 for c in text]
-    monkeypatch.setattr(ClefModel, "_load", lambda self, *args: vars(self).update(model = (mx.random.seed(7), _decoder())[1], tokenizer = SimpleNamespace(encode = encode)))
+    monkeypatch.setattr(ClefModel, "_load", lambda self, *args: vars(self).update(model = (mx.random.seed(7), _decoder(args[5], bits = 4))[1], tokenizer = SimpleNamespace(encode = encode)))
     pipeline = load_decision_model(tmp_path)
     questions = {"route": {"type": "choice", "instructions": "where", "criteria": {"c": "z", "a": "x", "b": None}}, "ok": {"type": "noul", "instructions": "fine?"}}
     assert [clef_option_keys(pipeline, question) for question in questions.values()] == [["a", "b", "c"], ["true", "false"]]
@@ -700,25 +700,42 @@ def _clef_checkpoint_tensors(decoder):
     return tensors
 
 
-@pytest.mark.parametrize("mode", ["adapters", "embedding", "full"])
-def test_saved_clef_holds_the_trained_decoder_and_a_head_with_its_temperature_folded_in(clef, tmp_path, mode):
+@pytest.mark.parametrize("mode", ["adapters", "qlora", "embedding", "full"])
+def test_saved_clef_holds_the_trained_decoder_and_a_head_with_its_temperature_folded_in(clef, tmp_path, monkeypatch, mode):
     pipeline, _, item = clef
     source, record, out = _clef_checkpoint_tensors(pipeline.model), item("hello"), tmp_path / "out"
     mx.save_safetensors(str(tmp_path / "model.safetensors"), source)
     out.mkdir()
     stale = [out / "model-00001-of-00002.safetensors", out / "model.safetensors.index.json"]
     [path.write_text("{}") for path in stale]
-    clef_training_network(pipeline, full_finetuning = mode == "full", r = 4, lora_alpha = 8, modules_to_save = ["embed_tokens"] if mode == "embedding" else None)
+    if mode == "qlora":
+        with pytest.raises(ValueError, match = "load_in_4bit"):
+            load_decision_model(tmp_path, family = "laya", load_in_4bit = True)
+        pipeline = load_decision_model(tmp_path, load_in_4bit = True)
+        assert "scales" in pipeline.model.language_model.model.layers[0].linear_attn.in_proj_qkv
+        from unsloth_zoo.mlx.decision import _QwenModel
+
+        asked = {}
+        monkeypatch.setattr("unsloth_zoo.mlx.loader.FastMLXModel.from_pretrained", lambda *args, **kwargs: asked.update(kwargs) or (pipeline.model, None))
+        _QwenModel._load(SimpleNamespace(), tmp_path, None, None, None, None, True)
+        assert (asked["load_in_4bit"], asked["load_in_16bit"]) == (True, False)
+    network = clef_training_network(pipeline, full_finetuning = mode == "full", r = 4, lora_alpha = 8, modules_to_save = ["embed_tokens"] if mode == "embedding" else None)
+    if mode == "qlora":
+        # Adapters over quantized layers receive gradients.
+        grads = dict(tree_flatten(_clef_record_loss_and_grad(network, record)[1]))
+        assert any(name.endswith("lora_b") and mx.any(value).item() for name, value in grads.items())
     trainable = pipeline.model.trainable_parameters()
     pipeline.model.update(tree_map(lambda value: value + 0.05 * mx.random.normal(value.shape).astype(value.dtype), trainable))
     adapters = [module for _, module in pipeline.model.named_modules() if "lora_a" in module]
     whole = {"model.language_model." + key.split(".", 2)[2] for key, _ in tree_flatten(trainable) if "lora_" not in key}
     args = record["input_ids"], record["question_spans"], record["option_spans"], record["types"]
     before = np.array(pipeline.logits(*args))
+    # Scoring runs in generation mode, which swaps a quantized output head's class.
+    assert [len(row) for row in clef_logits(network, [record])[0]] == [3, 2]
     save_clef_model(pipeline, out, tmp_path, {"head_temperature": 2.0, "temperature": [1.0, 1.0, 40.0]})
     saved, name = mx.load(str(out / "model.safetensors")), "model.language_model.layers.0.linear_attn.{}.weight"
     moved, trained = {key for key in source if not mx.array_equal(saved[key], source[key])}, _clef_checkpoint_tensors(pipeline.model)
-    assert not any(path.exists() for path in stale) and len(whole) == {"adapters": 0, "embedding": 1}.get(mode, len(source) - 2)
+    assert not any(path.exists() for path in stale) and len(whole) == {"adapters": 0, "qlora": 0, "embedding": 1}.get(mode, len(source) - 2)
     assert saved.keys() == source.keys() and all(saved[key].shape == source[key].shape and saved[key].dtype == source[key].dtype for key in source)
     assert len(moved) == len(adapters) + len(whole) and whole <= moved
     for key in whole:
