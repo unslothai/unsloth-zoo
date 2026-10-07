@@ -52,6 +52,8 @@ from unsloth_zoo.mlx.decision import (  # noqa: E402
     _soft_cross_entropy,
     add_lora_adapters,
     clef_logits,
+    clef_option_keys,
+    clef_training_item,
     clef_training_network,
     collate_decisions,
     decision_logits,
@@ -631,12 +633,13 @@ def clef(tmp_path, monkeypatch):
     encode = lambda text, add_special_tokens: [ord(c) % 512 for c in text]
     monkeypatch.setattr(ClefModel, "_load", lambda self, *args: vars(self).update(model = (mx.random.seed(7), _decoder())[1], tokenizer = SimpleNamespace(encode = encode)))
     pipeline = load_decision_model(tmp_path)
-    questions = pipeline._parse_questions({"route": {"type": "choice", "instructions": "where", "criteria": {"a": "x", "b": None, "c": "z"}}, "ok": {"type": "noul", "instructions": "fine?"}})
+    questions = {"route": {"type": "choice", "instructions": "where", "criteria": {"c": "z", "a": "x", "b": None}}, "ok": {"type": "noul", "instructions": "fine?"}}
+    assert [clef_option_keys(pipeline, question) for question in questions.values()] == [["a", "b", "c"], ["true", "false"]]
 
     def item(state, max_length = None, count = 2):
-        ids, question_spans, option_spans = pipeline.encode(state, questions[:count], max_length)
-        types = [_TYPE_IDS.index(question.type) for question in questions[:count]]
-        return {"input_ids": ids, "question_spans": question_spans, "option_spans": option_spans, "types": types, "targets": [[0.0, 0.25, 0.75], [1.0, 0.0]][:count]}
+        record = clef_training_item(pipeline, state, dict(list(questions.items())[:count]), max_length)
+        assert record["types"] == [_TYPE_IDS.index(kind) for kind in ("choice", "noul")[:count]]
+        return {**record, "targets": [[0.0, 0.25, 0.75], [1.0, 0.0]][:count]}
 
     return pipeline, reference, item
 

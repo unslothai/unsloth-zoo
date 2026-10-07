@@ -46,6 +46,8 @@ __all__ = [
     "DecisionUnsupportedError",
     "add_lora_adapters",
     "clef_logits",
+    "clef_option_keys",
+    "clef_training_item",
     "clef_training_network",
     "collate_decisions",
     "decision_logits",
@@ -1815,6 +1817,18 @@ def clef_logits(network, items):
     finally:
         network.train(was_training)
     return out
+
+
+def clef_option_keys(pipeline, question):
+    """The option keys of one Clef question, in the order of its logits."""
+    return [key for key, _ in pipeline._parse_questions({"question": question})[0].options]
+
+
+def clef_training_item(pipeline, state, questions, max_length = None):
+    """Tokenize one record as a Clef training item; the caller adds `targets`, a distribution per question over `clef_option_keys`."""
+    parsed = pipeline._parse_questions(questions)
+    ids, question_spans, option_spans = pipeline.encode(state, parsed, max_length)
+    return {"input_ids": ids, "question_spans": question_spans, "option_spans": option_spans, "types": [_TYPE_IDS.index(q.type) for q in parsed]}
 
 
 def decision_logits(model, items, pad_token_id, batch_size = 16):
