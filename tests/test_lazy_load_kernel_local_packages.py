@@ -102,7 +102,13 @@ def test_pre_ampere_and_kill_switch_keep_original(monkeypatch):
         patch_lazy_load_kernel_local_packages()
         assert hub_kernels.lazy_load_kernel is saved[0]
         monkeypatch.delenv("UNSLOTH_LOCAL_MAMBA_KERNELS")
+        # A T4 keeps the fallback with Triton 3.4+, so reject it the way an older Triton would.
+        monkeypatch.setenv("UNSLOTH_MAMBA_PRE_AMPERE_FAST", "0")
         monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (7, 5))
+        patch_lazy_load_kernel_local_packages()
+        assert hub_kernels.lazy_load_kernel is saved[0]
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (7, 0))
+        monkeypatch.delenv("UNSLOTH_MAMBA_PRE_AMPERE_FAST")
         patch_lazy_load_kernel_local_packages()
         assert hub_kernels.lazy_load_kernel is saved[0]
     finally:
