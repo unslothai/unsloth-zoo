@@ -219,6 +219,7 @@ class DraftController:
         seed_weight: int = 10,
         cost_alpha: float = 0.2,
         hysteresis: float = 1.03,
+        plain_margin: float = 1.05,
         probe_margin: float = 1.15,
         probe_every: int = 64,
         probe_rounds: int = 3,
@@ -242,6 +243,7 @@ class DraftController:
         self.seed_weight = seed_weight
         self.cost_alpha = cost_alpha
         self.hysteresis = hysteresis
+        self.plain_margin = plain_margin
         self.probe_margin = probe_margin
         self.probe_every = probe_every
         self.probe_rounds = probe_rounds
@@ -479,9 +481,9 @@ class DraftController:
                 self._reference = max(self.score(plan, rows) for plan in candidates)
                 return self._shorten(probe), True
             self._probe_left = 0
-        best = max(candidates, key = lambda plan: self.score(plan, rows))
+        best = max(candidates, key = lambda plan: self._worth(plan, rows))
         current = next((p for p in candidates if self._identity(p, bucket) == self._current), None)
-        if current is not None and self.score(best, rows) < self.score(current, rows) * self.hysteresis:
+        if current is not None and self._worth(best, rows) < self._worth(current, rows) * self.hysteresis:
             best = current
         if self.steps >= self._next_probe:
             self._next_probe = self.steps + self.probe_every
@@ -513,6 +515,10 @@ class DraftController:
             self._window = self.min_window
         self._current = identity
         return best, False
+
+    def _worth(self, plan: RoundPlan, rows: Sequence[RowState]) -> float:
+        # A round's planning, bookkeeping and broken pipelining are not in its measured seconds, so it must clearly win.
+        return self.score(plan, rows) * (self.plain_margin if plan.kind == "plain" else 1.0)
 
     def _shorten(self, plan: RoundPlan) -> RoundPlan:
         return RoundPlan("plain", min(self.min_window, plan.length)) if plan.kind == "plain" else plan
@@ -568,15 +574,16 @@ class DraftController:
         widest = 1 + min(self.max_copy, max(state.copy_available for state in rows))
         for width in range(2, widest + 1):
             copies = self._round_at(width, copying)
-            if copies.width > 1 and self.score(copies, rows) > plain:
+            if copies.width > 1 and self.score(copies, rows) > plain * self.plain_margin:
                 return True
         return False
 
-    def record_plain(self, rows: Sequence[RowState], steps: int, seconds: float) -> None:
+    def record_plain(self, rows: Sequence[RowState], steps: int, seconds: float, step_seconds: float | None = None) -> None:
         if steps <= 0:
             return
         bucket = _bucket(len(rows))
-        self.plain_cost.setdefault(bucket, _Ema()).update(seconds / steps, self.cost_alpha)
+        if step_seconds is not None or bucket not in self.plain_cost:
+            self.plain_cost.setdefault(bucket, _Ema()).update(seconds / steps if step_seconds is None else step_seconds, self.cost_alpha)
         for state in rows:
             state.stats.tokens += steps
         self.tokens += steps * len(rows)
@@ -1002,14 +1009,19 @@ class SpeculativeEngine:
                     self.drafter.push(rows[i].draft, taken, hidden[i, -1:])
             if last:
                 break
+            if steps == 1:
+                started = time.perf_counter()
             if upcoming is None:
                 with mx.stream(self._stream):
                     upcoming = self._step(tokens[:, None])
-            elif self.controller.interrupts_plain(self._states()):
+            elif steps > 1 and self.controller.interrupts_plain(self._states()):
                 # The next step is already queued, so it becomes the window's last.
                 length = steps + 1
             tokens, scores, hidden = upcoming
-        self.controller.record_plain(states, steps, time.perf_counter() - start)
+        end = time.perf_counter()
+        # Reading a pipelined step's tokens waits for the step queued behind it, so the first read ends two steps in.
+        ran = steps - (2 if pipelined else 1)
+        self.controller.record_plain(states, steps, end - start, (end - started) / ran if ran > 0 else None)
         return emitted
 
     def _round(self, plan: RoundPlan, states: list[RowState]) -> list[list[int]] | None:

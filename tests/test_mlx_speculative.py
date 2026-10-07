@@ -47,7 +47,7 @@ def _run(controller, machine, rows, *, rounds, seed = 0, states = None, report =
         plan = controller.plan(states)
         if plan.kind == "plain":
             seconds, emitted, choice = machine.plain(len(rows)) * plan.length, plan.length * len(rows), "plain"
-            controller.record_plain(states, plan.length, seconds)
+            controller.record_plain(states, plan.length, seconds, machine.plain(len(rows)))
         else:
             accepted, drafting = [], 0.0
             for row, (draft, copy) in zip(plan.rows, rows):
@@ -104,6 +104,14 @@ def test_controller_prefers_plain_decoding_over_width_one_rounds():
     hopeless, states = DraftController(max_depth = 1, can_copy = False), []
     _run(hopeless, machine, [([0.05], None)], rounds = 300, states = states)
     assert hopeless.plan(states).length == hopeless.max_window
+
+
+def test_a_round_must_clearly_beat_plain_decoding_at_its_running_step():
+    for margin, choice in ((1.0, (("draft", 1),)), (1.05, "plain")):
+        assert _run(controller := DraftController(max_depth = 1, can_copy = False, plain_margin = margin), _Machine(draft_slope = 0.8), [([1.0], None)], rounds = 800) == choice
+    for window in ((8, 80.0, 2.0), (1, 9.0)):
+        controller.record_plain([RowState(controller.new_reply())], *window)
+    assert controller.plain_cost[1].value == pytest.approx(1.0 + controller.cost_alpha)
 
 
 def test_controller_follows_cost_drift():
