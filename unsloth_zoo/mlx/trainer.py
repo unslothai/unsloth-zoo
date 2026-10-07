@@ -10684,7 +10684,9 @@ class MLXDecisionTrainer:
         processing_class = None,
     ):
         self.model = model
-        self.args = args or MLXTrainingConfig()
+        # A copy, as in MLXTrainer: callbacks read the metric's direction off the arguments as a real boolean.
+        self.args = copy.copy(args) if args is not None else MLXTrainingConfig()
+        self.args.greater_is_better = _resolve_greater_is_better(self.args)
         self.train_dataset = train_dataset
         self.eval_dataset = eval_dataset
         self.pad_token_id = pad_token_id
@@ -10696,6 +10698,15 @@ class MLXDecisionTrainer:
 
     def _resolve_warmup_steps(self, total_steps):
         return MLXTrainer._resolve_warmup_steps(self, total_steps)
+
+    # What transformers callbacks read from the arguments and the state, as MLXTrainer provides it.
+    _ensure_callback_args_compat = MLXTrainer._ensure_callback_args_compat
+    _sync_synthesized_arg = MLXTrainer._sync_synthesized_arg
+    _metric_for_best_model_name = MLXTrainer._metric_for_best_model_name
+    _update_callback_best_metric = MLXTrainer._update_callback_best_metric
+
+    def _default_callback_eval_strategy(self):
+        return "no" if not self.eval_dataset else "steps" if getattr(self.args, "eval_steps", 0) else "epoch"
 
     def _schedule_multiplier(self, total_steps):
         # As torch schedulers do, one multiplier scales every group's learning rate, so an absolute floor follows the encoder's.
@@ -10777,6 +10788,8 @@ class MLXDecisionTrainer:
         metrics = {"eval_loss": total / decisions, "epoch": self.state.epoch}
         self._log(metrics)
         self._event("on_evaluate", metrics = metrics)
+        # After the callbacks, as transformers' Trainer does: early stopping compares with the best before this one.
+        self._update_callback_best_metric(metrics)
         return metrics
 
     def train(self):
@@ -10793,6 +10806,7 @@ class MLXDecisionTrainer:
             add_step_callback = id, add_eval_callback = id,
         )
         prior = None
+        self._ensure_callback_args_compat()
         try:
             self._memory_limits_applied = MLXTrainer._configure_memory_limits(limits)
             if self._cache_follows_peak:

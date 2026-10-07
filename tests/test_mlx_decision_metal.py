@@ -852,6 +852,32 @@ def test_trainer_reports_its_logs_to_tensorboard(checkpoint, monkeypatch, tmp_pa
     assert written[-1] == "closed" and len(written) > 6 and trainer._report_to == (None, None)
 
 
+def test_early_stopping_ends_the_run_when_its_metric_stops_improving(checkpoint):
+    model = load_trainable_decision_model(checkpoint[1])
+
+    def run(best = None, threshold = 10.0, **chosen):
+        config = _config(max_steps = 6, eval_steps = 1, **chosen)
+        # An improvement of 10 never happens, so the first evaluation that has a best to compare with stops the run.
+        trainer = MLXDecisionTrainer(model, config, _items(), _items(), callbacks = [_Accuracy(), transformers.EarlyStoppingCallback(1, threshold)])
+        trainer.state.best_metric = best
+        trainer.train()
+        return trainer
+
+    class _Accuracy(transformers.TrainerCallback):
+        def on_evaluate(self, args, state, control, metrics = None, **kwargs):
+            metrics["eval_accuracy"] = 0.1 * state.global_step
+
+    trainer = run(metric_for_best_model = "eval_loss")
+    losses = [log["eval_loss"] for log in trainer.state.log_history if "eval_loss" in log]
+    assert trainer.state.global_step == 2 and trainer.state.best_metric == min(losses) and trainer.args.eval_strategy == "steps"
+    # A best loss no evaluation reaches is kept, and the first evaluation already fails to improve on it.
+    trainer = run(best = 0.0, metric_for_best_model = "eval_loss")
+    assert trainer.state.global_step == 1 and trainer.state.best_metric == 0.0
+    # The best metric is the one the callback watches, and both read it as higher-is-better: a rising accuracy never stops the run.
+    trainer = run(threshold = 0.0, metric_for_best_model = "accuracy")
+    assert trainer.state.global_step == 6 and trainer.state.best_metric == pytest.approx(0.6) and trainer.args.greater_is_better is True
+
+
 def test_trainer_stops_on_request_and_refuses_other_optimizers(checkpoint):
     model = load_trainable_decision_model(checkpoint[1])
     recorder = _Recorder(stop_at = 1)
