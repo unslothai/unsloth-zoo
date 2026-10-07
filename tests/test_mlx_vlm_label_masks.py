@@ -5938,6 +5938,7 @@ def test_a_processor_emitted_grid_array_is_never_downgraded():
     ("mistral3", "image_sizes", "image_grid_thw"),
     ("mage_vl", "image_grid_thw", "image_sizes"),
     ("mage_vl", "video_grid_thw", "image_sizes"),
+    ("dots_ocr", "image_grid_thw", "video_grid_thw"),
     ("muse_glimmer", "video_grid_thw", "image_sizes"),
     ("minimax_m3_vl", "image_grid_thw", "image_sizes"),
     ("kimi_k3", "grid_thws", "image_grid_thw"),

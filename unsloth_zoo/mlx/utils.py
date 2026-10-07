@@ -3546,6 +3546,8 @@ _VLM_ARRAY_GRID_MODEL_TYPES = frozenset({
 # Towers that read these keys on the host (a tracer under mx.compile): handed the
 # processor's Python values. Per family, since a tuple raises in the towers above.
 _VLM_STATIC_METADATA_MODEL_TYPES = {
+    # Its embedder reads only the image grid; there is no video pixel path.
+    "dots_ocr": ("image_grid_thw",),
     "minimax_m3_vl": ("image_grid_thw", "video_grid_thw"),
     "muse_glimmer": ("image_grid_thw", "video_grid_thw"),
     "kimi_k3": ("grid_thws", "image_grid_hws", "video_grid_hws"),
