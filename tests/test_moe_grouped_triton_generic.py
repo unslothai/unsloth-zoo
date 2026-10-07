@@ -150,7 +150,7 @@ def test_gate_kind():
     assert MU._triton_grouped_mm_kind(64, 2048, 128) == "many"     # LoRA r=64: base limits
 
 
-@needs_cuda
+@needs_kernel
 @pytest.mark.parametrize("rows_per_expert, triton_dw", [(100, True), (200, False)])
 def test_base_dw_above_limit_uses_torch(rows_per_expert, triton_dw):
     """Base dW above the "dw" limit falls back to torch._grouped_mm; forward and dX stay on Triton."""
@@ -177,7 +177,7 @@ def test_gate_off_on_hip(monkeypatch):
     assert MU._triton_grouped_mm_max_rows(0) == 0
 
 
-@needs_cuda
+@needs_kernel
 def test_gate_rows_threshold_and_operands(monkeypatch):
     if MU._GROUPED_MM_TRITON_OP is None or MG.triton is None:
         pytest.skip("no custom_op / Triton")
