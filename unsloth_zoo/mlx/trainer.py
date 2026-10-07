@@ -10671,7 +10671,9 @@ class MLXDecisionTrainer:
     `args` is an `MLXTrainingConfig`. Parameters under `encoder.` train at `args.learning_rate` and the rest
     at `head_learning_rate`, both under `args.lr_scheduler_type`. `callbacks` are transformers `TrainerCallback`s.
     `label_smoothing` smooths each decision's target toward uniform over its own options, `brier_weight` adds a Brier
-    term, and `ordinal_weight` adds a Clef score question's expected distance from its gold level.
+    term, and `ordinal_weight` adds a Clef score question's expected distance from its gold level. `kl_weight` penalizes
+    a LoRA Clef's divergence from the model it started as (adapters off, the head as it is now). `permute_fields` trains
+    a Clef on each record's questions in a new order every epoch; evaluation keeps the dataset's.
     """
 
     def __init__(
@@ -10687,8 +10689,16 @@ class MLXDecisionTrainer:
         label_smoothing = 0.0,
         brier_weight = 0.0,
         ordinal_weight = 0.0,
+        kl_weight = 0.0,
+        permute_fields = False,
     ):
         self.model = model
+        self._reference = None
+        if kl_weight:
+            if not hasattr(model, "kl_reference"):
+                raise NotImplementedError("Unsloth: kl_weight needs a Clef decision model.")
+            self._reference = (model.kl_reference(), float(kl_weight))
+        self._permute = getattr(model, "permuted_item", None) if permute_fields else None
         objective = tuple(float(value or 0.0) for value in (label_smoothing, brier_weight, ordinal_weight))
         self.objective = objective if any(objective) else None
         # A copy, as in MLXTrainer: callbacks read the metric's direction off the arguments as a real boolean.
@@ -10773,7 +10783,7 @@ class MLXDecisionTrainer:
 
         build = getattr(self.model, "decision_step", None)
         if build:
-            return build(compiled, self.objective)
+            return build(compiled, self.objective, self._reference)
         return _MarkerStep(self.model, self.pad_token_id, compiled, self.objective)
 
     def _eval_batches(self):
@@ -10870,7 +10880,11 @@ class MLXDecisionTrainer:
             self._event("on_epoch_begin")
             accumulated, losses = None, []
             for index, batch in enumerate(batches):
-                loss, grads = step(step.collate([items[i] for i in batch]))
+                rows = [items[i] for i in batch]
+                if self._permute:
+                    # Drawn from the seed, the epoch and the record, so a resumed run encodes a record as this one does.
+                    rows = [self._permute(row, random.Random(f"{args.seed}-{epoch}-{i}")) for row, i in zip(rows, batch)]
+                loss, grads = step(step.collate(rows))
                 if accumulated is not None:
                     grads = tree_map(mx.add, accumulated, grads)
                 mx.eval(loss, grads)

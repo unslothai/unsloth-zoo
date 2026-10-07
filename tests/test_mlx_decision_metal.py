@@ -708,6 +708,40 @@ def test_decision_objectives_match_the_torch_loss(clef, objective):
     assert trainer.evaluate()["eval_loss"] == pytest.approx(want, rel = 2e-3)
 
 
+def test_clef_kl_penalty_holds_on_to_the_starting_model_and_fields_are_permuted_in_training(clef):
+    import random
+
+    pipeline, questions = clef[0], {"grade": {"type": "score", "instructions": "how good", "criteria": ["bad", "fine", "good", "great"]}, "ok": {"type": "noul", "instructions": "fine?"}, "pick": {"type": "choice", "instructions": "which", "criteria": {"a": "x", "b": "y", "c": "z"}}}
+    record = {**clef_training_item(pipeline, "hello there", questions), "targets": [[0.0, 0.1, 0.9, 0.0], [0.3, 0.7], [0.2, 0.8, 0.0]], "source": {"state": "hello there", "questions": questions}}
+    with pytest.raises(NotImplementedError, match = "LoRA Clef"):
+        MLXDecisionTrainer(ClefNetwork(pipeline), _config(), [record], kl_weight = 2.0)
+    network = clef_training_network(pipeline, r = 4, lora_alpha = 4)
+    started = clef_logits(network, [record])[0]
+    trainer = MLXDecisionTrainer(network, _config(), [record], [record], kl_weight = 2.0)
+    plain = lambda: MLXDecisionTrainer(network, _config(), [record], [record]).evaluate()["eval_loss"]
+    assert trainer.evaluate()["eval_loss"] == pytest.approx(plain(), rel = 1e-3)
+    network.update(tree_map(lambda value: value + 0.3 * mx.random.normal(value.shape).astype(value.dtype), network.trainable_parameters()))
+    log = lambda rows: [torch.log_softmax(torch.as_tensor(row), 0) for row in rows]
+    kl = sum((ref.exp() * (ref - now)).sum().item() for ref, now in zip(log(started), log(clef_logits(network, [record])[0]))) / 3
+    assert kl > 1e-2 and trainer.evaluate()["eval_loss"] - plain() == pytest.approx(2.0 * kl, rel = 2e-2)
+    with network.training_run():
+        steps = [network.decision_step(reference = reference)([record]) for reference in (trainer._reference, None)]
+    assert any(not mx.allclose(with_kl, without, rtol = 1e-2, atol = 1e-4).item() for (_, with_kl), (_, without) in zip(*(tree_flatten(grads["head"]) for _, grads in steps)))
+    assert steps[0][0].item() - steps[1][0].item() == pytest.approx(2.0 * kl, rel = 0.1) and all(module.scale for _, module in network.encoder.named_modules() if "lora_a" in module)
+    # Each question keeps its targets and options whatever order the epoch draws.
+    orders = set()
+    for epoch in range(8):
+        shuffled = network.permuted_item(record, random.Random(f"0-{epoch}-0"))
+        orders.add(tuple(shuffled["types"]))
+        assert [len(target) for target in shuffled["targets"]] == [len(spans) for spans in shuffled["option_spans"]] == [{2: 4, 0: 2, 1: 3}[kind] for kind in shuffled["types"]]
+    draws = []
+    object.__setattr__(network, "permuted_item", lambda row, rng: draws.append(rng.random()) or row)
+    for _ in range(2):
+        MLXDecisionTrainer(network, _config(per_device_train_batch_size = 1, gradient_accumulation_steps = 1, max_steps = 2, seed = 5), [record], [record], permute_fields = True).train()
+    # Training only, a new order each epoch, and the same ones in a run with the same seed.
+    assert len(orders) > 1 and len(draws) == 4 and draws[:2] == draws[2:] and draws[0] != draws[1]
+
+
 def test_clef_full_fine_tune_trains_the_decoder_but_not_the_output_embedding(clef, monkeypatch):
     clef[0].model.vision_tower = Linear(2, 2)
     network, checkpointed = clef_training_network(clef[0], full_finetuning = True, gradient_checkpointing = False), []

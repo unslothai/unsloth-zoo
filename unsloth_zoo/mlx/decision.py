@@ -1980,8 +1980,47 @@ class ClefNetwork(nn.Module):
     def training_run(self):
         return _decoder_training(self.encoder, self._gradient_checkpointing)
 
-    def decision_step(self, compiled = False, objective = None):
-        return _ClefStep(self, objective)
+    def decision_step(self, compiled = False, objective = None, reference = None):
+        return _ClefStep(self, objective, reference)
+
+    def kl_reference(self):
+        """A frozen copy of the head as it is now: with the decoder's adapters off, the model a KL penalty holds on to."""
+        whole = [path for path, _ in tree_flatten(self.encoder.trainable_parameters()) if path.rsplit(".", 1)[-1] not in ("lora_a", "lora_b")]
+        if whole or not any("lora_a" in module for _, module in self.encoder.named_modules()):
+            raise NotImplementedError("Unsloth: kl_weight needs a LoRA Clef model, not full finetuning.")
+        head = copy.deepcopy(self.head)
+        head.freeze()
+        return head
+
+    def reference_logits(self, item, head):
+        """`item`'s option logits from the decoder without its adapters and `head`, outside the gradient."""
+        pipeline, adapters = self._pipeline, [module for _, module in self.encoder.named_modules() if "lora_a" in module]
+        scales, own = [module.scale for module in adapters], pipeline.head
+        try:
+            for module in adapters:
+                module.scale = 0.0
+            pipeline.head = head
+            logits = pipeline.logits(item["input_ids"], item["question_spans"], item["option_spans"], item["types"])
+            mx.eval(logits)
+        finally:
+            pipeline.head = own
+            for module, scale in zip(adapters, scales):
+                module.scale = scale
+        return mx.stop_gradient(logits)
+
+    def permuted_item(self, item, rng):
+        """`item` with its questions in an order drawn from `rng` and the prompt encoded again; as it is when it holds no `source`."""
+        source = item.get("source")
+        if source is None:
+            return item
+        order = list(range(len(item["targets"])))
+        rng.shuffle(order)
+        names = list(source["questions"])
+        try:
+            record = clef_training_item(self._pipeline, source["state"], {names[i]: source["questions"][names[i]] for i in order}, source.get("max_length"))
+        except ValueError:
+            return item
+        return {**item, **record, "targets": [item["targets"][i] for i in order]}
 
 
 def clef_training_network(
@@ -2024,8 +2063,9 @@ def clef_training_network(
     return network
 
 
-def _clef_record_loss(network, item, objective = None, ordinal_scale = 0.0):
-    """The loss summed over the questions of one record; `ordinal_scale` weighs its score questions' ordinal term."""
+def _clef_record_loss(network, item, objective = None, ordinal_scale = 0.0, reference = None, kl_weight = 0.0):
+    """The loss summed over the questions of one record; `ordinal_scale` weighs its score questions' ordinal term and
+    `kl_weight` the divergence of each question's distribution from that of the `reference` logits."""
     spans = item["option_spans"]
     logits = network._pipeline.logits(item["input_ids"], item["question_spans"], spans, item["types"])
     target = np.zeros((len(spans), logits.shape[0]), np.float32)
@@ -2035,10 +2075,15 @@ def _clef_record_loss(network, item, objective = None, ordinal_scale = 0.0):
         start += len(values)
     owner = mx.array([row for row, options in enumerate(spans) for _ in options])
     own = owner[None, :] == mx.arange(len(spans))[:, None]
-    losses, distance = _decision_losses(mx.where(own, logits[None, :], -1e4), mx.array(target), own, objective)
-    if distance is None or not ordinal_scale:
-        return losses.sum()
-    return losses.sum() + ordinal_scale * (distance * mx.array(_clef_score_questions(item))).sum()
+    rows = mx.where(own, logits[None, :], -1e4)
+    losses, distance = _decision_losses(rows, mx.array(target), own, objective)
+    total = losses.sum()
+    if distance is not None and ordinal_scale:
+        total = total + ordinal_scale * (distance * mx.array(_clef_score_questions(item))).sum()
+    if reference is not None:
+        log_p, log_ref = nn.log_softmax(rows, axis = -1), nn.log_softmax(mx.where(own, reference[None, :], -1e4), axis = -1)
+        total = total + kl_weight * (mx.exp(log_ref) * (log_ref - log_p) * own).sum()
+    return total
 
 
 def _clef_score_questions(item):
@@ -2048,9 +2093,17 @@ def _clef_score_questions(item):
 class _ClefStep:
     """How the trainer runs a Clef: one record (a prompt holding all its questions) at a time, averaged over questions."""
 
-    def __init__(self, network, objective = None):
+    def __init__(self, network, objective = None, reference = None):
         self.network, self.objective = network, objective
+        # (head, weight) of the KL penalty to the starting model.
+        self.reference = reference
         self.value_and_grad = nn.value_and_grad(network, _clef_record_loss)
+
+    def _record_arguments(self, item, scale):
+        if self.reference is None:
+            return item, self.objective, scale
+        head, weight = self.reference
+        return item, self.objective, scale, self.network.reference_logits(item, head), weight
 
     def _ordinal_scale(self, items, count):
         # The ordinal term averages over the batch's score questions, the other terms over all its questions.
@@ -2065,7 +2118,7 @@ class _ClefStep:
         count = sum(len(item["targets"]) for item in items)
         scale = self._ordinal_scale(items, count)
         for item in items:
-            loss, record = self.value_and_grad(self.network, item, self.objective, scale)
+            loss, record = self.value_and_grad(self.network, *self._record_arguments(item, scale))
             grads = record if grads is None else tree_map(mx.add, grads, record)
             total = total + loss
             # A record is evaluated on its own, so memory is bounded by the longest prompt, not the batch.
@@ -2075,7 +2128,7 @@ class _ClefStep:
     def losses(self, items):
         count = sum(len(item["targets"]) for item in items)
         scale = self._ordinal_scale(items, count)
-        return sum(_clef_record_loss(self.network, item, self.objective, scale) for item in items), count
+        return sum(_clef_record_loss(self.network, *self._record_arguments(item, scale)) for item in items), count
 
 
 def clef_logits(network, items):
