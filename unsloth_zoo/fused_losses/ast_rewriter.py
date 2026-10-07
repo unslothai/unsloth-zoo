@@ -34,6 +34,7 @@ from __future__ import annotations
 __all__ = [
     "rewrite_forward_source",
     "rewrite_forward_source_spliced",
+    "rewrite_count_aware_ce_spliced",
     "TripletCapture",
 ]
 
@@ -75,6 +76,11 @@ class TripletCapture:
     logits_bias_src: str | None = None
     bias_idx: int | None = None
     bias_stmt: ast.stmt | None = None
+    # The forward has no **kwargs: the spliced rewrite adds `**kwargs` so Trainer can pass the count.
+    add_kwargs: bool = False
+    # The count was added to a loss_function call that took no kwargs (XGLM): pass it there only
+    # when present, so a user loss_function without that parameter still runs at eval.
+    count_injected: bool = False
 
 
 def _is_self_attr_call(node: ast.AST) -> bool:
@@ -345,6 +351,8 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef, extended: bool = False)
     legacy_logits = aligned = None
     fused_pre: list = []
     aligned_target = False
+    add_kwargs = False
+    count_injected = False
     if extended and _find_loss_function_call(if_node) is None:
         legacy_logits = _legacy_ce_logits(if_node)
         if legacy_logits is None:
@@ -357,6 +365,12 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef, extended: bool = False)
         vocab_expr, kwargs_name = None, None
         legacy_body = list(if_node.body)
         aligned_target = aligned is not None
+        # Both CE shapes honour num_items_in_batch: labels[..., 1:] for a shifted next-token block
+        # (Mamba), and the unshifted labels of an aligned block (T5, Whisper, BartForCausalLM), whose
+        # class the compiler marks `_unsloth_counts_unshifted_labels` so the batch counter skips the
+        # shift. A forward without **kwargs (transformers 4.57 encoder-decoders) gets one spliced in.
+        kwargs_name = fn.args.kwarg.arg if fn.args.kwarg is not None else "kwargs"
+        add_kwargs = fn.args.kwarg is None
     else:
         legacy_body = []
         loss_positions = [k for k, s in enumerate(if_node.body) if _is_loss_function_assign(s)]
@@ -439,6 +453,16 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef, extended: bool = False)
             if kw.arg in ("logits", "labels", "vocab_size"):
                 continue
             extra_loss_kws.append((kw.arg, kw.value))
+        # A **kwargs forward whose loss call drops them (XGLM, Phi4Multimodal) reduces by a micro-batch
+        # mean. Hand both calls the count, which ForCausalLMLoss divides by; it stays None outside training.
+        if (fn.args.kwarg is not None and len(loss_call.args) < 4
+                and not any(kw.arg is None for kw in loss_call.keywords)
+                and all(name != "num_items_in_batch" for name, _ in extra_loss_kws)):
+            extra_loss_kws.append((
+                "num_items_in_batch",
+                ast.parse(_count_expr(fn.args.kwarg.arg), mode = "eval").body,
+            ))
+            count_injected = True
 
     # Find the lm_head assignment for logits_name (walking upward from if_idx).
     head_attr = None
@@ -559,7 +583,51 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef, extended: bool = False)
         logits_bias_src=bias_src,
         bias_idx=bias_idx,
         bias_stmt=body[bias_idx] if bias_idx is not None else None,
+        add_kwargs=add_kwargs,
+        count_injected=count_injected,
     )
+
+
+
+_FUNCTIONAL_CE = frozenset((
+    "F.cross_entropy", "nn.functional.cross_entropy", "torch.nn.functional.cross_entropy",
+    "functional.cross_entropy",
+))
+
+
+def _count_expr(kwargs_name: str) -> str:
+    """`num_items_in_batch`, else the `n_items` alias, also when the first is present but None.
+    `is not None` keeps a tensor count off the host (no truthiness sync)."""
+    return (
+        f"({kwargs_name}.get('num_items_in_batch', None) "
+        f"if {kwargs_name}.get('num_items_in_batch', None) is not None "
+        f"else {kwargs_name}.get('n_items', None))"
+    )
+
+
+def _count_call(loss: str, args: list, kwargs_name: str) -> str:
+    return (
+        f"{loss} = unsloth_count_aware_cross_entropy({', '.join(ast.unparse(a) for a in args)}, "
+        f"n_items={_count_expr(kwargs_name)}, shift=False)"
+    )
+
+
+def _count_aware_legacy_ce(body: list, kwargs_name: str, loss: str) -> list[str]:
+    """The legacy CE block with its `CrossEntropyLoss()` mean routed through
+    `unsloth_count_aware_cross_entropy`: sum / num_items_in_batch when passed, the mean without."""
+    fct = None
+    out = []
+    for stmt in body:
+        if (isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Call)
+                and ast.unparse(stmt.value.func) in _CE_CTORS):
+            fct = ast.unparse(stmt.targets[0])
+            continue
+        if (fct is not None and isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Call)
+                and ast.unparse(stmt.value.func) == fct):
+            out.append(_count_call(ast.unparse(stmt.targets[0]), stmt.value.args, kwargs_name))
+            continue
+        out.append(ast.unparse(stmt))
+    return out
 
 
 def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
@@ -571,6 +639,14 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
     extra = "".join(
         f", {name}={ast.unparse(value)}" for name, value in cap.extra_loss_kws
     )
+    # The loss_function call gets an injected count only when there is one; the fused call always.
+    lf_extra = extra
+    if cap.count_injected:
+        lf_extra = "".join(
+            (f", **unsloth_loss_count_kwargs(self.loss_function, {ast.unparse(value)})"
+             if name == "num_items_in_batch" else f", {name}={ast.unparse(value)}")
+            for name, value in cap.extra_loss_kws
+        )
     # Fused call only (other branches re-evaluate the RHS); an explicit same-name kwarg wins.
     already = {name for name, _ in cap.extra_loss_kws}
     scale_extra = "".join(
@@ -597,7 +673,7 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
             if labels is not None:
                 if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1':
                     {logits} = {logits_rhs}
-                    {loss} = self.loss_function({logits}, labels, vocab_size={vocab}{extra}{kwargs_unpack})
+                    {loss} = self.loss_function({logits}, labels, vocab_size={vocab}{lf_extra}{kwargs_unpack})
                 else:
                     {loss} = unsloth_fused_lm_head_loss(
                         {hidden_src}, self.{head_attr}, labels,
@@ -618,17 +694,24 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
     post = [ast.unparse(s) for s in cap.post_stmts]
     loss_casts = [ast.unparse(s) for s in cap.post_stmts if s.targets[0].id == loss]
     if cap.legacy_body:
-        unfused = [f"{logits} = {logits_rhs}", *softcap, *(ast.unparse(s) for s in cap.legacy_body)]
+        legacy = [ast.unparse(s) for s in cap.legacy_body]
+        if cap.kwargs_name:
+            legacy = _count_aware_legacy_ce(cap.legacy_body, cap.kwargs_name, loss)
+        unfused = [f"{logits} = {logits_rhs}", *softcap, *legacy]
         aligned_kw = ", shift_labels=False" if cap.aligned else ""
         if cap.logits_bias_src is not None:
             aligned_kw += f", logits_bias={cap.logits_bias_src}"
         fused_call = (
-            f"{loss} = unsloth_fused_lm_head_loss({hidden_src}, self.{head_attr}, labels{aligned_kw}{scale_extra})"
+            f"{loss} = unsloth_fused_lm_head_loss({hidden_src}, self.{head_attr}, labels{aligned_kw}{scale_extra}{kwargs_unpack})"
         )
+        if cap.kwargs_name:
+            # The stock CE block shifts (or aligns) `labels` itself and never reads a caller's
+            # `shift_labels`; the adapter would, and it collides with `shift_labels=False`.
+            fused_call = f"{cap.kwargs_name}.pop('shift_labels', None)\n" + fused_call
     else:
         unfused = [
             f"{logits} = {logits_rhs}", *softcap, *pre,
-            f"{loss} = self.loss_function({logits}, {cap.labels_src}, vocab_size={vocab}{extra}{kwargs_unpack})",
+            f"{loss} = self.loss_function({logits}, {cap.labels_src}, vocab_size={vocab}{lf_extra}{kwargs_unpack})",
             *post,
         ]
         fused_call = (
@@ -736,12 +819,152 @@ def rewrite_forward_source_spliced(source: str) -> tuple[str | None, TripletCapt
             out.append(block)
         if k not in drop:
             out.append(line)
+    if cap.add_kwargs:
+        out = _splice_kwargs(out, fn, len(prefix), "kwargs")
+        if out is None:
+            return (None, None)
     new_source = "".join(out)
     try:
         ast.parse(textwrap.dedent(new_source))
     except SyntaxError:
         return (None, None)
     return (new_source, cap)
+
+
+def _splice_kwargs(lines: list, fn, prefix_len: int, name: str) -> list | None:
+    """Insert `, **name` after the last parameter of `fn`'s signature (lines precede the body)."""
+    args = fn.args
+    nodes = [*args.posonlyargs, *args.args, *args.kwonlyargs, *args.defaults,
+             *(d for d in args.kw_defaults if d is not None)]
+    if args.vararg is not None:
+        nodes.append(args.vararg)
+    nodes = [n for n in nodes if getattr(n, "end_lineno", None) is not None]
+    if not nodes:
+        return None
+    last = max(nodes, key = lambda n: (n.end_lineno, n.end_col_offset))
+    k, col = last.end_lineno - 1, last.end_col_offset + prefix_len
+    if k >= len(lines) or k >= fn.body[0].lineno - 1:
+        return None
+    line = lines[k]
+    return lines[:k] + [line[:col] + f", **{name}" + line[col:]] + lines[k + 1:]
+
+
+def _labels_if(fn):
+    for stmt in fn.body:
+        if not isinstance(stmt, ast.If):
+            continue
+        t = stmt.test
+        if (isinstance(t, ast.Compare) and isinstance(t.left, ast.Name) and t.left.id == "labels"
+                and len(t.ops) == 1 and isinstance(t.ops[0], ast.IsNot)
+                and isinstance(t.comparators[0], ast.Constant) and t.comparators[0].value is None):
+            return stmt
+    return None
+
+
+def _slices_labels_forward(node) -> bool:
+    # `labels[..., 1:]` / `labels[:, 1:]`: the block predicts the next token.
+    for sub in ast.walk(node):
+        if not (isinstance(sub, ast.Subscript) and isinstance(sub.value, ast.Name) and sub.value.id == "labels"):
+            continue
+        parts = sub.slice.elts if isinstance(sub.slice, ast.Tuple) else [sub.slice]
+        if parts and isinstance(parts[-1], ast.Slice) and _is_one(parts[-1].lower) and parts[-1].upper is None:
+            return True
+    return False
+
+
+def _is_labels_cast(node) -> bool:
+    # `labels.to(...)` / `.view(...)` / `.reshape(...)` / `.contiguous()` chains: same values, same count.
+    while isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and \
+            node.func.attr in ("to", "view", "reshape", "contiguous", "long"):
+        node = node.func.value
+    return isinstance(node, ast.Name) and node.id == "labels"
+
+
+def _is_one(node) -> bool:
+    return isinstance(node, ast.Constant) and node.value == 1
+
+
+def rewrite_count_aware_ce_spliced(source: str):
+    """Route a forward's own mean token CE through `unsloth_count_aware_cross_entropy`.
+
+    For heads no fused route takes (no Linear lm_head, logits from an inner model as in Llama 4
+    vision, deprecated models): the `if labels is not None:` block keeps its shifting and attention
+    mask filtering, and only its one `CrossEntropyLoss()` (or `F.cross_entropy`) mean becomes the
+    count-aware call. Returns (new_source, shifted) or (None, None). `shifted` False means the CE
+    averages unshifted labels, so the class needs `_unsloth_counts_unshifted_labels`. Bails on a
+    weighted / smoothed / non-mean CE, more than one CE in the forward (an auxiliary loss), or a
+    CE outside the labels block. Spliced by line so `create_standalone_class` can regex-parse it.
+    """
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except SyntaxError:
+        return (None, None)
+    if not tree.body or not isinstance(tree.body[0], (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return (None, None)
+    fn = tree.body[0]
+    block = _labels_if(fn)
+    if block is None or block.orelse:
+        return (None, None)
+    # The batch counter counts `labels != -100`: a block that rewrites which labels count (Moshi's
+    # `labels.masked_fill(labels == pad, -100)`) would divide by the wrong number.
+    for sub in ast.walk(block):
+        if (isinstance(sub, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "labels" for t in sub.targets)
+                and not _is_labels_cast(sub.value)):
+            return (None, None)
+
+    ctors = [n for n in ast.walk(fn) if isinstance(n, ast.Call) and ast.unparse(n.func) in _CE_CTORS]
+    functional = [n for n in ast.walk(fn) if isinstance(n, ast.Call) and ast.unparse(n.func) in _FUNCTIONAL_CE]
+    if len(ctors) + len(functional) != 1:
+        return (None, None)
+    ctor_stmt = None
+    if ctors:
+        ctor = ctors[0]
+        ctor_stmt = next((s for s in block.body if isinstance(s, ast.Assign) and s.value is ctor), None)
+        if (ctor_stmt is None or len(ctor_stmt.targets) != 1 or not isinstance(ctor_stmt.targets[0], ast.Name)
+                or ctor.args
+                or not all(k.arg == "ignore_index" and ast.unparse(k.value) == "-100" for k in ctor.keywords)):
+            return (None, None)
+        fct = ctor_stmt.targets[0].id
+        calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                 and n.func.id == fct]
+        uses = [n for n in ast.walk(fn) if isinstance(n, ast.Name) and n.id == fct]
+        if len(calls) != 1 or len(uses) != 2 or calls[0].keywords:
+            return (None, None)
+        call = calls[0]
+    else:
+        call = functional[0]
+        if not all(k.arg == "ignore_index" and ast.unparse(k.value) == "-100" for k in call.keywords):
+            return (None, None)
+    call_stmt = next((s for s in block.body if isinstance(s, ast.Assign) and s.value is call), None)
+    if (call_stmt is None or len(call_stmt.targets) != 1 or not isinstance(call_stmt.targets[0], ast.Name)
+            or len(call.args) != 2 or any(isinstance(a, ast.Starred) for a in call.args)):
+        return (None, None)
+
+    kwargs_name = fn.args.kwarg.arg if fn.args.kwarg is not None else "kwargs"
+    lines = source.splitlines(keepends = True)
+    first = next(line for line in lines if line.strip())
+    prefix = first[: len(first) - len(first.lstrip())]
+    indent = prefix + " " * call_stmt.col_offset
+    new_call = textwrap.indent(_count_call(call_stmt.targets[0].id, call.args, kwargs_name), indent) + "\n"
+    drop = set(range(call_stmt.lineno - 1, call_stmt.end_lineno))
+    if ctor_stmt is not None:
+        drop.update(range(ctor_stmt.lineno - 1, ctor_stmt.end_lineno))
+    out = []
+    for k, line in enumerate(lines):
+        if k == call_stmt.lineno - 1:
+            out.append(new_call)
+        if k not in drop:
+            out.append(line)
+    if fn.args.kwarg is None:
+        out = _splice_kwargs(out, fn, len(prefix), kwargs_name)
+        if out is None:
+            return (None, None)
+    new_source = "".join(out)
+    try:
+        ast.parse(textwrap.dedent(new_source))
+    except SyntaxError:
+        return (None, None)
+    return (new_source, _slices_labels_forward(block))
 
 
 def _decorator_name(node: ast.AST) -> str | None:

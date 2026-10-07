@@ -358,6 +358,19 @@ def _loss_shifts_labels(trainer, model, is_encoder_decoder):
         and not is_encoder_decoder
 pass
 
+# Set by the fused-loss rewriter on a head whose loss averages UNSHIFTED labels (aligned decoder
+# heads such as BartForCausalLM, encoder-decoder and speech seq2seq heads). The one place the
+# counter learns to skip the causal labels[..., 1:] shift.
+UNSHIFTED_LABELS_MARKER = "_unsloth_counts_unshifted_labels"
+
+
+def counts_unshifted_labels(model):
+    # All Unsloth Zoo code licensed under LGPLv3
+    if model is None: return False
+    if getattr(model, "__dict__", {}).get(UNSHIFTED_LABELS_MARKER, None) is True: return True
+    return getattr(type(model), UNSHIFTED_LABELS_MARKER, False) is True
+pass
+
 global TRAINING_ITERATIONS
 TRAINING_ITERATIONS = 0
 
@@ -411,13 +424,138 @@ def _normalize_packed_seq_lengths(seq_lengths):
 pass
 
 
+# DDP / DataParallel / torch.compile hold the model under these; a model passed already wrapped
+# must still be judged by its head, as unsloth's accepts_loss_kwargs decision is.
+_TRAINING_WRAPPER_ATTRS = ("module", "_orig_mod", "_fsdp_wrapped_module")
+_TRAINING_WRAPPER_TYPES = frozenset((
+    "DistributedDataParallel", "DataParallel", "OptimizedModule", "FullyShardedDataParallel",
+))
+
+
+def _unwrap_training_wrappers(m):
+    # All Unsloth Zoo code licensed under LGPLv3
+    for _ in range(4):
+        modules = getattr(m, "__dict__", {}).get("_modules") or {}
+        inner = next((modules[a] for a in _TRAINING_WRAPPER_ATTRS if a in modules), None)
+        if inner is None or type(m).__name__ not in _TRAINING_WRAPPER_TYPES:
+            return m
+        m = inner
+    return m
+pass
+
+
+# Written by unsloth on the wrapper chain and head once it decides the head consumes the count:
+# "shifted" (causal next-token targets) or "unshifted" (every labels != -100 is a target). It is
+# the decision itself, so it outranks the forward-signature guess and the class marker below.
+NUM_ITEMS_LABELS_ATTR = "_unsloth_num_items_labels"
+_NUM_ITEMS_LABELS = ("shifted", "unshifted")
+
+
+def num_items_labels_convention(model):
+    # All Unsloth Zoo code licensed under LGPLv3
+    """unsloth's recorded count convention for this model, or None when it recorded none.
+
+    Read as an instance attribute off the model, each training wrapper below it (DDP, DataParallel,
+    torch.compile, FSDP) and the PEFT base model. Never raises.
+    """
+    candidates = []
+    m = model
+    try:
+        for _ in range(4):
+            candidates.append(m)
+            modules = getattr(m, "__dict__", {}).get("_modules") or {}
+            inner = next((modules[a] for a in _TRAINING_WRAPPER_ATTRS if a in modules), None)
+            if inner is None or type(m).__name__ not in _TRAINING_WRAPPER_TYPES: break
+            m = inner
+        get_base_model = getattr(m, "get_base_model", None)
+        if callable(get_base_model):
+            candidates.append(get_base_model())
+    except Exception:
+        pass
+    for m in candidates:
+        value = getattr(m, "__dict__", {}).get(NUM_ITEMS_LABELS_ATTR, None)
+        if isinstance(value, str) and value in _NUM_ITEMS_LABELS:
+            return value
+    return None
+pass
+
+
+def count_batch_items(labels, attention_mask = None, input_ids = None, packed_seq_lengths = None,
+                      unshifted = False, packed = True):
+    # All Unsloth Zoo code licensed under LGPLv3
+    """Counted targets of one micro-batch, as `(count, short, degenerate)`.
+
+    The single definition of what num_items_in_batch counts, shared by the batch counter below and
+    the MoE aux loss weighting (fused_losses/aux_loss.py). `short` means no target column survives
+    (0 columns unshifted, 1 shifted). `degenerate` means the layout is not a token LM batch (labels
+    and input_ids differ in rank, or an attention mask of another shape). Both are shape checks
+    only, so no device sync. `packed = False` skips the packed-boundary drop, whose index reads are
+    data dependent.
+    """
+    degenerate = input_ids is not None and labels.ndim != input_ids.ndim
+    if unshifted:
+        # Every non-ignored label is a target: no shift, so one column is enough, and no causal
+        # attention-mask AND or packed-boundary drop (an aligned CE applies neither).
+        return (labels != -100).sum(), labels.shape[-1] < 1, degenerate
+    short = labels.shape[-1] < 2
+    token_count = (labels[..., 1:] != -100)
+    if attention_mask is not None:
+        # Only AND a mask describing these same targets: a seq2seq mask is the encoder's, a
+        # different length from the decoder labels, which used to raise. Causal shapes always
+        # match, so nothing changes.
+        if attention_mask.shape != labels.shape:
+            degenerate = True
+        else:
+            token_count &= (attention_mask[..., 1:] != 0)
+    seq_lengths = _normalize_packed_seq_lengths(packed_seq_lengths) if packed else None
+    if seq_lengths is not None and token_count.ndim in (1, 2) and token_count.shape[-1] != 0:
+        # Packing N documents leaves N-1 internal boundaries that are
+        # not valid training positions. Zero those exact slots rather
+        # than subtract N-1: many collators already mask them (TRL
+        # >= 0.23.1 labels[position_ids == 0] = -100, transformers'
+        # DataCollatorWithFlattening, completion_only_loss /
+        # assistant_masks), so subtracting double counts them and
+        # inflates loss and grads. Zeroing is idempotent and cannot
+        # go below zero; subtracting had no lower bound and drove the
+        # count to zero or negative on small batches.
+        #
+        # labels[..., 1:] already dropped column 0 of every row, so a
+        # document starting at flat index s sits at column s - 1, and
+        # one starting at a row boundary is already gone. cumsum[:-1]
+        # drops the trailing boundary, making a single document a
+        # provable no-op and keeping truncated metadata harmless.
+        #
+        # The data-dependent reads below (rows[keep], rows.numel())
+        # are unprotected, and safe only because
+        # _normalize_packed_seq_lengths already returned None under
+        # any mode that cannot evaluate them. Keep that ordering.
+        n_shift = token_count.shape[-1]
+        n_rows  = token_count.numel() // n_shift
+        starts  = torch.cumsum(seq_lengths, dim = 0)[:-1]
+        rows    = torch.div(starts, n_shift + 1, rounding_mode = "floor")
+        cols    = starts - rows * (n_shift + 1)
+        keep    = (cols > 0) & (rows < n_rows)
+        rows, cols = rows[keep], cols[keep]
+        if rows.numel() != 0:
+            if rows.device != token_count.device:
+                rows = rows.to(token_count.device)
+                cols = cols.to(token_count.device)
+            # Reassign: reshape can copy on a non contiguous input.
+            token_count = token_count.reshape(n_rows, n_shift)
+            token_count[rows, cols - 1] = False
+        pass
+    pass
+    return token_count.sum(), short, degenerate
+pass
+
+
 def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None, *args, **kwargs):
     # All Unsloth Zoo code licensed under LGPLv3
     batch_samples = []
     num_items_in_batch = None
 
     # Check if model allows **kwargs
-    m = self.model
+    m = _unwrap_training_wrappers(self.model)
     if hasattr(m, "get_base_model"):
         # Removes PeftModelForCausalLM and gets internal model
         m = m.get_base_model()
@@ -430,9 +568,22 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
     top_model = m
     is_encoder_decoder = bool(getattr(getattr(m, "config", None), "is_encoder_decoder", False))
     is_non_causal_head = any(head in model_name for head in NON_CAUSAL_HEADS)
+    # Read every call, never cached: the rewriter may install it after a first count.
+    unshifted = counts_unshifted_labels(top_model)
+    # unsloth's own decision, when it recorded one, settles both questions below: the head consumes
+    # the count (has_kwargs), and which labels it counts.
+    convention = num_items_labels_convention(self.model)
+    if convention is not None:
+        unshifted = convention == "unshifted"
 
+    # Keyed by class name, but checked against the class forward: a rewrite that later installs a
+    # **kwargs forward (so the count can reach the loss) must not keep the stale answer.
+    forward_key = getattr(type(top_model), "forward", None)
     global ALLOWED_NUM_ITEMS_IN_BATCH
-    if model_name not in ALLOWED_NUM_ITEMS_IN_BATCH:
+    cached = ALLOWED_NUM_ITEMS_IN_BATCH.get(model_name)
+    if cached is not None and len(cached) > 2 and cached[2] is not forward_key:
+        cached = None
+    if cached is None:
 
         has_kwargs = False
         is_vlm = False
@@ -464,10 +615,12 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
             if not hasattr(m, "model"): break
             m = m.model
         pass
-        ALLOWED_NUM_ITEMS_IN_BATCH[model_name] = (has_kwargs, is_vlm)
+        ALLOWED_NUM_ITEMS_IN_BATCH[model_name] = (has_kwargs, is_vlm, forward_key)
     else:
-        has_kwargs, is_vlm = ALLOWED_NUM_ITEMS_IN_BATCH[model_name]
+        has_kwargs, is_vlm = cached[0], cached[1]
     pass
+    if convention is not None:
+        has_kwargs = True
 
     # Iterate to find all batches
     for _ in range(num_batches):
@@ -495,9 +648,15 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
         batch_samples[0].get("labels") if len(batch_samples) > 0
         and isinstance(batch_samples[0], Mapping) else None, "ndim", None,
     ) is not None
-    if (not is_non_causal_head) and labels_are_countable \
-            and (has_kwargs or (getattr(self, "compute_loss_func", None) is not None
-                                and _loss_shifts_labels(self, top_model, is_encoder_decoder))):
+    # A marked head counts its unshifted labels; with a compute_loss_func that is only right for an
+    # encoder-decoder, the one case stock 5.x also counts unshifted.
+    if unshifted:
+        has_consumer = has_kwargs or (getattr(self, "compute_loss_func", None) is not None
+                                      and is_encoder_decoder)
+    else:
+        has_consumer = has_kwargs or (getattr(self, "compute_loss_func", None) is not None
+                                      and _loss_shifts_labels(self, top_model, is_encoder_decoder))
+    if (not is_non_causal_head) and labels_are_countable and has_consumer:
         try:
             token_counts = []
             # Shape only, so no device sync and still traceable. Acted on after the
@@ -511,69 +670,28 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
             all_short = True
             for x in batch_samples:
                 labels = x["labels"]
-                if labels.shape[-1] >= 2: all_short = False
-                token_count = (labels[..., 1:] != -100)
+                input_ids = attention_mask = None
                 if "input_ids" in x:
                     input_ids = x["input_ids"]
-                    mark_static (input_ids, 0)
-                    mark_dynamic(input_ids, 1)
-                    # One label per row against 2D input_ids is a classification
-                    # batch, whatever the class is called.
-                    if labels.ndim != input_ids.ndim: degenerate = True
-                if "attention_mask" in x:
+                    if not unshifted:
+                        mark_static (input_ids, 0)
+                        mark_dynamic(input_ids, 1)
+                if "attention_mask" in x and not unshifted:
                     attention_mask = x["attention_mask"]
                     mark_static (attention_mask, 0)
                     mark_dynamic(attention_mask, 1)
-                    # Only AND a mask describing these same targets: a seq2seq mask is
-                    # the encoder's, a different length from the decoder labels, which
-                    # used to raise. Causal shapes always match, so nothing changes.
-                    if attention_mask.shape != labels.shape:
-                        degenerate = True
-                    else:
-                        token_count &= (attention_mask[..., 1:] != 0)
-                if "token_type_ids" in x:
+                if "token_type_ids" in x and not unshifted:
                     token_type_ids = x["token_type_ids"]
                     mark_static (token_type_ids, 0)
                     mark_dynamic(token_type_ids, 1)
-                seq_lengths = _normalize_packed_seq_lengths(x.get("packed_seq_lengths"))
-                if seq_lengths is not None and token_count.ndim in (1, 2) and token_count.shape[-1] != 0:
-                    # Packing N documents leaves N-1 internal boundaries that are
-                    # not valid training positions. Zero those exact slots rather
-                    # than subtract N-1: many collators already mask them (TRL
-                    # >= 0.23.1 labels[position_ids == 0] = -100, transformers'
-                    # DataCollatorWithFlattening, completion_only_loss /
-                    # assistant_masks), so subtracting double counts them and
-                    # inflates loss and grads. Zeroing is idempotent and cannot
-                    # go below zero; subtracting had no lower bound and drove the
-                    # count to zero or negative on small batches.
-                    #
-                    # labels[..., 1:] already dropped column 0 of every row, so a
-                    # document starting at flat index s sits at column s - 1, and
-                    # one starting at a row boundary is already gone. cumsum[:-1]
-                    # drops the trailing boundary, making a single document a
-                    # provable no-op and keeping truncated metadata harmless.
-                    #
-                    # The data-dependent reads below (rows[keep], rows.numel())
-                    # are unprotected, and safe only because
-                    # _normalize_packed_seq_lengths already returned None under
-                    # any mode that cannot evaluate them. Keep that ordering.
-                    n_shift = token_count.shape[-1]
-                    n_rows  = token_count.numel() // n_shift
-                    starts  = torch.cumsum(seq_lengths, dim = 0)[:-1]
-                    rows    = torch.div(starts, n_shift + 1, rounding_mode = "floor")
-                    cols    = starts - rows * (n_shift + 1)
-                    keep    = (cols > 0) & (rows < n_rows)
-                    rows, cols = rows[keep], cols[keep]
-                    if rows.numel() != 0:
-                        if rows.device != token_count.device:
-                            rows = rows.to(token_count.device)
-                            cols = cols.to(token_count.device)
-                        # Reassign: reshape can copy on a non contiguous input.
-                        token_count = token_count.reshape(n_rows, n_shift)
-                        token_count[rows, cols - 1] = False
-                    pass
-                pass
-                count = token_count.sum()
+                # One label per row against 2D input_ids is a classification batch, whatever the
+                # class is called; see count_batch_items for the rest.
+                count, short, bad = count_batch_items(
+                    labels, attention_mask, input_ids,
+                    None if unshifted else x.get("packed_seq_lengths"), unshifted = unshifted,
+                )
+                if not short: all_short = False
+                if bad: degenerate = True
                 token_counts.append(count)
             pass
             num_items_in_batch = sum(token_counts)

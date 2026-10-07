@@ -48,8 +48,10 @@ import threading
 import warnings
 from typing import Any
 
-from .ast_rewriter import rewrite_forward_source
+from .ast_rewriter import rewrite_count_aware_ce_spliced, rewrite_forward_source
+from .cross_entropy_loss import unsloth_count_aware_cross_entropy, unsloth_loss_count_kwargs
 from .forward_adapter import EMPTY_LOGITS, unsloth_fused_lm_head_loss
+from .aux_loss import rewrite_aux_loss_ga, unscaled_extra_loss_terms, unsloth_ga_scale_aux_loss
 
 
 logger = logging.getLogger("unsloth_zoo.fused_forward")
@@ -240,13 +242,30 @@ def install_for_class(cls) -> bool:
         return False
 
     new_src, cap = rewrite_forward_source(src)
+    tier = "2-ast-triplet"
+    unshifted = False
+    if new_src is None and ".deprecated." in getattr(cls, "__module__", ""):
+        # Tier 3: the compiler never loads deprecated modeling files, so their own mean token CE
+        # (OpenLlama, Speech2Text2) is made count-aware here instead; it cannot be fused.
+        new_src, shifted = rewrite_count_aware_ce_spliced(src)
+        if new_src is not None:
+            tier, unshifted = "3-count-aware-ce", not shifted
     if new_src is None:
         with _REGISTRY_LOCK:
             _UNMATCHED[qn] = "no-canonical-triplet"
         return False
+    # MoE router aux loss: weight it by this micro-batch's token share once num_items_in_batch arrives.
+    new_src = rewrite_aux_loss_ga(new_src)
+    if tier == "3-count-aware-ce" and unscaled_extra_loss_terms(new_src):
+        # A count-aware CE beside a term still added in full would give that term G times its weight.
+        with _REGISTRY_LOCK:
+            _UNMATCHED[qn] = "unscaled-extra-loss-term"
+        return False
     # Composite heads (e.g. BigBird's BigBirdOnlyMLMHead via self.cls) lack
     # .weight/.bias and would crash inside the adapter.
-    if cap.head_attr not in _LINEAR_HEAD_ATTRS or not _head_built_as_linear(cls, cap.head_attr):
+    if cap is not None and (
+        cap.head_attr not in _LINEAR_HEAD_ATTRS or not _head_built_as_linear(cls, cap.head_attr)
+    ):
         with _REGISTRY_LOCK:
             _UNMATCHED[qn] = f"non-linear-head: {cap.head_attr}"
         return False
@@ -261,7 +280,10 @@ def install_for_class(cls) -> bool:
         for _name, _value in (getattr(forward, "__globals__", {}) or {}).items():
             ns.setdefault(_name, _value)
     ns["unsloth_fused_lm_head_loss"] = unsloth_fused_lm_head_loss
+    ns["unsloth_count_aware_cross_entropy"] = unsloth_count_aware_cross_entropy
+    ns["unsloth_loss_count_kwargs"] = unsloth_loss_count_kwargs
     ns["EMPTY_LOGITS"] = EMPTY_LOGITS
+    ns["unsloth_ga_scale_aux_loss"] = unsloth_ga_scale_aux_loss
     # The rewritten body reads UNSLOTH_RETURN_LOGITS via os.environ.get.
     ns.setdefault("os", os)
     try:
@@ -320,13 +342,15 @@ def install_for_class(cls) -> bool:
         return False
 
     cls.forward = new_forward
+    if unshifted:
+        cls._unsloth_counts_unshifted_labels = True
     with _REGISTRY_LOCK:
         _PATCHED[qn] = {
-            "tier": "2-ast-triplet",
+            "tier": tier,
             "kind": cls.__name__,
             "hash": fhash,
             "module": getattr(cls, "__module__", ""),
-            "head_attr": cap.head_attr,
+            "head_attr": cap.head_attr if cap is not None else None,
         }
     return True
 

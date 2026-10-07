@@ -18,6 +18,8 @@ __all__ = [
     "unsloth_fused_ce_loss",
     "apply_autograd_function",
     "compute_fused_ce_loss",
+    "unsloth_count_aware_cross_entropy",
+    "unsloth_loss_count_kwargs",
 ]
 
 import torch
@@ -656,6 +658,89 @@ def unsloth_fused_ce_loss(
         mapping.get(key, default) \
         for key, default in zip(_FUSED_LOSS_PARAMETERS, _FUSED_LOSS_DEFAULTS)
     ))
+pass
+
+
+def unsloth_count_aware_cross_entropy(
+    logits,
+    labels,
+    n_items = None,
+    *,
+    shift = True,
+    ignore_index = -100,
+    mask = None,
+    vocab_size = None,
+):
+    # All Unsloth Zoo code licensed under LGPLv3
+    """Token cross entropy that honours gradient accumulation's num_items_in_batch.
+
+    Replaces a stock `CrossEntropyLoss()` mean over the micro-batch: with `n_items` (the token count
+    of the whole accumulation window) it returns sum / n_items, so accumulated micro-batches add up
+    to the full-batch mean; without it, the stock mean (all ignored -> nan, as stock).
+    shift=True predicts token t+1 from position t (logits[..., :-1, :], labels[..., 1:]); False for
+    labels already aligned (encoder-decoder, Bart-style ForCausalLM) or pre-shifted by the caller.
+    mask: an attention mask whose zero positions are dropped, cropped to the logits length the way
+    the stock filtered VLM / Llama 4 blocks do. Computed in float32.
+    """
+    if shift:
+        logits = logits[..., :-1, :]
+        labels = labels[..., 1:]
+    if mask is not None:
+        keep = mask[:, -logits.shape[1]:].to(logits.device) != 0
+        logits = logits[keep]
+        labels = labels[keep.to(labels.device)]
+    if vocab_size is None:
+        vocab_size = logits.shape[-1]
+    logits = logits.reshape(-1, vocab_size).float()
+    labels = labels.reshape(-1).to(logits.device)
+    if n_items is None:
+        return torch.nn.functional.cross_entropy(logits, labels, ignore_index = ignore_index)
+    loss = torch.nn.functional.cross_entropy(
+        logits, labels, ignore_index = ignore_index, reduction = "sum",
+    )
+    if torch.is_tensor(n_items):
+        # A DataParallel replica gets a one-element slice of the repeated count: keep the loss 0-dim.
+        n_items = n_items.to(loss.device)
+        if n_items.ndim > 0: n_items = n_items.reshape(-1)[0]
+    return loss / n_items
+pass
+
+
+_LOSS_TAKES_COUNT = {}
+
+def _loss_takes_count(loss_function):
+    # All Unsloth Zoo code licensed under LGPLv3
+    key = getattr(loss_function, "__func__", loss_function)
+    try:
+        return _LOSS_TAKES_COUNT[key]
+    except (KeyError, TypeError):
+        pass
+    try:
+        parameters = inspect.signature(loss_function).parameters.values()
+        takes = any(
+            p.name == "num_items_in_batch" or p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in parameters
+        )
+    except Exception:
+        takes = False
+    try:
+        _LOSS_TAKES_COUNT[key] = takes
+    except TypeError:
+        pass
+    return takes
+pass
+
+
+def unsloth_loss_count_kwargs(loss_function, n_items):
+    # All Unsloth Zoo code licensed under LGPLv3
+    """`{"num_items_in_batch": n_items}` for a loss_function call whose stock form took no count.
+
+    Empty when there is no count, or when the loss_function (a user's own, say) accepts neither
+    `num_items_in_batch` nor **kwargs, so the rewritten call never raises where stock would not.
+    """
+    if n_items is None or not _loss_takes_count(loss_function):
+        return {}
+    return {"num_items_in_batch": n_items}
 pass
 
 # Unsloth Zoo - Utilities for Unsloth

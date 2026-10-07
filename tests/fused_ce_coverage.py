@@ -114,6 +114,9 @@ def census():
                     route = fused_lm_head_forward(attr, cls, name, source)[1]
                 except Exception:
                     route = None
+                # Count aware but still full logits: not a fused lm_head + CE.
+                if route == "count":
+                    route = None
             if route is not None:
                 routes[attr] = route
             elif _computes_lm_loss(source):
