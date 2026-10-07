@@ -550,6 +550,8 @@ def _stackable_lora(projs):
             w = m._parameters.get("weight")
             if type(w) is not torch.nn.Parameter or w.is_meta or w.dim() != 2:
                 return None
+            if w.grad is not None:   # mid-training: an optimizer may already hold this Parameter
+                return None
             sig = (tuple(w.shape), w.dtype, w.device, w.requires_grad)
             if shapes.setdefault(kind, sig) != sig:
                 return None
@@ -558,16 +560,13 @@ def _stackable_lora(projs):
 
 def _stack_projs_lora(projs, name):
     """Replace every expert's lora_A[name] / lora_B[name] weight Parameter with a slice of one
-    stacked Parameter (see _StackedLoraLinear). Values, dtype, device, requires_grad and any
-    accumulated grad carry over."""
+    stacked Parameter (see _StackedLoraLinear). Values, dtype, device and requires_grad carry over."""
     groups = []
     for attr in ("lora_A", "lora_B"):
         mods = [getattr(p, attr)[name] for p in projs]
         ws = [m.weight for m in mods]
         with torch.no_grad():
             stack = torch.nn.Parameter(torch.stack([w.detach() for w in ws]), requires_grad=ws[0].requires_grad)
-            if any(w.grad is not None for w in ws):
-                stack.grad = torch.stack([torch.zeros_like(w) if w.grad is None else w.grad for w in ws])
         groups.append((mods, stack))
     members = tuple(projs)
     for mods, stack in groups:   # everything allocated: mutate
@@ -890,10 +889,12 @@ def _restore_block(module):
     return True
 
 
-def enable_grouped_moe(model, recompute=None, cache=None, verbose=True):
+def enable_grouped_moe(model, recompute=None, cache=None, verbose=True, stack_lora=False):
     """Patch eligible ModuleList MoE blocks (frozen experts, optionally with a supported expert
     LoRA) to the grouped forward; returns #patched. Re-entrant (a now-ineligible block is
-    restored, so it runs again after get_peft_model), and a no-op without grouped_mm support."""
+    restored, so it runs again after get_peft_model), and a no-op without grouped_mm support.
+    stack_lora replaces the per-expert LoRA Parameters with stacked ones, so it must run before
+    an optimizer or DDP wrapper holds them: only the loader entry points pass it."""
     if os.environ.get("UNSLOTH_MOE_GROUPED", "1") == "0":
         for module in model.modules():
             _restore_block(module)
@@ -922,7 +923,8 @@ def enable_grouped_moe(model, recompute=None, cache=None, verbose=True):
         n += 1
         # One Parameter per projection instead of one per expert (optimizer / clip / autograd cost).
         try:
-            _stack_block_lora(module, spec)
+            if stack_lora:
+                _stack_block_lora(module, spec)
         except Exception as e:
             _decline(f"stacked expert LoRA skipped: {e}", count=False)
         if not warmed:
@@ -947,7 +949,7 @@ def auto_enable_grouped_moe(model):
     """Loader entry point; fully guarded so it never raises into model loading."""
     try:
         if model is not None and hasattr(model, "modules"):
-            enable_grouped_moe(model, verbose=True)
+            enable_grouped_moe(model, verbose=True, stack_lora=True)
     except Exception:
         pass  # optional speedup; never block model loading
 

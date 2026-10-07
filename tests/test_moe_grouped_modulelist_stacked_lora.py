@@ -69,7 +69,7 @@ def _shapes(**kv):
 
 def _enable(model, stacked):
     with _env(UNSLOTH_MOE_STACKED_LORA = "1" if stacked else "0"):
-        return ML.enable_grouped_moe(model, verbose = False)
+        return ML.enable_grouped_moe(model, verbose = False, stack_lora = True)
 
 
 def pair(kind = "qwen3", base = "bf16", r = 8, targets = "all", **kw):
@@ -217,7 +217,7 @@ def test_enable_is_idempotent():
 def test_kill_switch_keeps_per_expert_parameters():
     model, blk = L.build("qwen3", base = "bf16", r = 8)
     with _env(UNSLOTH_MOE_STACKED_LORA = "0"):
-        assert ML.enable_grouped_moe(model, verbose = False) == 1
+        assert ML.enable_grouped_moe(model, verbose = False, stack_lora = True) == 1
     assert n_stacked(model) == 0
     assert all(type(m) is nn.Linear for n, m in model.named_modules() if n.endswith((".lora_A.default", ".lora_B.default")))
 
@@ -246,7 +246,7 @@ def _decline_model(case):
 def test_declines_keep_per_expert_parameters(case):
     model, blk, patched = _decline_model(case)
     ref = {n: p for n, p in model.named_parameters()}
-    n = ML.enable_grouped_moe(model, verbose = False)
+    n = ML.enable_grouped_moe(model, verbose = False, stack_lora = True)
     assert n == int(patched)
     assert n_stacked(model) == (2 * 2 if case == "frozen_expert" else 0)   # gate / down still stack
     if case == "frozen_expert":
@@ -267,18 +267,6 @@ def test_signature_tracks_the_stack_dtype():
 
 def x_dev():
     return torch.device(DEV, torch.cuda.current_device()) if DEV == "cuda" else torch.device(DEV)
-
-
-def test_stacking_carries_accumulated_grads():
-    """Stacking between accumulation micro-steps keeps the grads already accumulated."""
-    model, blk = L.build("qwen3", base = "bf16", r = 8)
-    model_u = copy.deepcopy(model)
-    x, g = _inputs()
-    for m in (model, model_u):
-        fwd_bwd(m.base_model.model.mlp, x, g)   # unpatched: PEFT's loop, per-expert grads
-    assert _enable(model, True) == 1 and _enable(model_u, False) == 1
-    assert n_stacked(model) == 6
-    assert_lora_equal(blk, model_u.base_model.model.mlp)
 
 
 def test_per_expert_weight_is_a_live_view():
@@ -800,3 +788,34 @@ def test_unsloth_fast_language_model_path(tmp_path):
         da, db = load_file(x), load_file(y)
         assert list(da) == list(db) and all(torch.equal(da[k], db[k]) for k in da)
         assert not any(ML._STACK_NAME in k or "lora_" in k for k in da)
+
+
+def test_stacking_is_opt_in():
+    """Only the loader entry points (auto_enable_grouped_moe) stack; a plain enable keeps PEFT's
+    per-expert Parameters, so a later call cannot orphan an optimizer's references."""
+    model, blk = L.build("qwen3", base = "bf16", r = 8)
+    ref = {n: p for n, p in model.named_parameters()}
+    assert ML.enable_grouped_moe(model, verbose = False) == 1
+    assert n_stacked(model) == 0
+    assert all(ref[n] is p for n, p in model.named_parameters())
+    model2, _ = L.build("qwen3", base = "bf16", r = 8)
+    ML.auto_enable_grouped_moe(model2)
+    assert n_stacked(model2) == 3 * 2
+
+
+def test_no_stacking_once_training_started():
+    """An optimizer built over the per-expert Parameters keeps training them: with grads present
+    (training under way) stack_lora declines, and optimizer.step still moves the weights the
+    forward reads."""
+    model, blk = L.build("qwen3", base = "bf16", r = 8)
+    for n, p in model.named_parameters():
+        p.requires_grad_("lora_" in n)
+    opt = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr = 1.0)
+    x = torch.randn(1, 64, L.H, device = L.DEV, dtype = L.DT)
+    blk(x)[0].float().square().sum().backward()
+    assert ML.enable_grouped_moe(model, verbose = False, stack_lora = True) == 1
+    assert n_stacked(model) == 0
+    w = blk.experts[5].up_proj.lora_B["default"].weight
+    before = w.detach().clone()
+    opt.step()
+    assert not torch.equal(blk.experts[5].up_proj.lora_B["default"].weight, before)
