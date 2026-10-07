@@ -23,6 +23,7 @@ import copy
 import json
 import random
 import shutil
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -836,6 +837,19 @@ def test_trainer_applies_memory_limits_for_the_run_only(checkpoint):
     with pytest.raises(ValueError):
         MLXDecisionTrainer(model, _config(wired_limit_gb = 1e6), _items()).train()
     assert _metal_limits() == before
+
+
+def test_trainer_reports_its_logs_to_tensorboard(checkpoint, monkeypatch, tmp_path):
+    written = []
+    writer = SimpleNamespace(add_scalar = lambda *row: written.append(row), close = lambda: written.append("closed"))
+    monkeypatch.setitem(sys.modules, "torch.utils.tensorboard", SimpleNamespace(SummaryWriter = lambda log_dir: writer))
+    config = _config(max_steps = 2, logging_steps = 1, eval_steps = 1, report_to = "tensorboard", output_dir = str(tmp_path))
+    trainer = MLXDecisionTrainer(load_trainable_decision_model(checkpoint[1]), config, _items(), _items())
+    trainer.train()
+    history = trainer.state.log_history
+    for tag, key, kind in (("train/loss", "loss", "learning_rate"), ("train/learning_rate", "learning_rate", "learning_rate"), ("eval/loss", "eval_loss", "eval_loss")):
+        assert [row for row in written if row[0] == tag] == [(tag, log[key], log["step"]) for log in history if kind in log]
+    assert written[-1] == "closed" and len(written) > 6 and trainer._report_to == (None, None)
 
 
 def test_trainer_stops_on_request_and_refuses_other_optimizers(checkpoint):

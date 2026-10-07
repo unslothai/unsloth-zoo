@@ -10692,6 +10692,7 @@ class MLXDecisionTrainer:
         self.state = _MLXTrainerState()
         self.control = _MLXTrainerControl()
         self.callback_handler = _MLXCallbackHandler(callbacks or [], model, processing_class, None, None)
+        self._report_to = (None, None)
 
     def _resolve_warmup_steps(self, total_steps):
         return MLXTrainer._resolve_warmup_steps(self, total_steps)
@@ -10742,6 +10743,12 @@ class MLXDecisionTrainer:
     def _log(self, logs):
         self.state.log_history.append({**logs, "step": self.state.global_step})
         self._event("on_log", logs = logs)
+        on_step, on_eval = self._report_to
+        if on_eval and "eval_loss" in logs:
+            on_eval(self.state.global_step, logs["eval_loss"], None)
+        elif on_step and "learning_rate" in logs:
+            # Decision training counts no tokens.
+            on_step(self.state.global_step, self.state.max_steps, logs["loss"], logs["learning_rate"], 0.0, logs["peak_memory_gb"], 0.0, 0, logs.get("grad_norm"))
 
     def _step(self, compiled = False):
         from .decision import _MarkerStep
@@ -10780,14 +10787,26 @@ class MLXDecisionTrainer:
         # The memory, wired and explicit cache caps are MLXTrainer's, under the same switches.
         limits = types.SimpleNamespace(args = args, _bytes_to_gb = MLXTrainer._bytes_to_gb)
         self._cache_follows_peak = getattr(args, "cache_limit_gb", None) is None and not getattr(args, "disable_memory_limits", False)
+        # args.report_to opens MLXTrainer's W&B and TensorBoard reporters, which this trainer's logs feed.
+        reporters = types.SimpleNamespace(
+            args = args, _last_eval_metrics = None, _report_to_handles = (None, None), _report_to_callbacks = (None, None),
+            add_step_callback = id, add_eval_callback = id,
+        )
         prior = None
         try:
             self._memory_limits_applied = MLXTrainer._configure_memory_limits(limits)
             if self._cache_follows_peak:
                 prior = mx.set_cache_limit(mx.get_peak_memory())
+            MLXTrainer._setup_report_to_callbacks(reporters)
+            self._report_to = reporters._report_to_callbacks
             with getattr(self.model, "training_run", contextlib.nullcontext)():
                 return self._train()
         finally:
+            self._report_to = (None, None)
+            for handle, close in zip(reporters._report_to_handles, ("finish", "close")):
+                if handle is not None:
+                    with contextlib.suppress(Exception):
+                        getattr(handle, close)()
             if prior is not None:
                 mx.set_cache_limit(prior)
             MLXTrainer._restore_memory_limits(limits)
