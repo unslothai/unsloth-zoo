@@ -39,7 +39,8 @@ _SRC = MISC.read_text(encoding = "utf-8")
 
 _NAMES = (
     "_MAMBA_SM75_MIN_TRITON", "_mamba_ssm_fast_path_blocker",
-    "_single_mamba_ssm_autotune_config", "patch_mamba_ssm_pre_ampere_fallback",
+    "_single_mamba_ssm_autotune_config", "_retrim_mamba_ssm_autotune",
+    "patch_mamba_ssm_pre_ampere_fallback",
 )
 
 
@@ -739,6 +740,37 @@ def test_slow_path_does_not_trim(env, monkeypatch):
     monkeypatch.setenv("UNSLOTH_MAMBA_PRE_AMPERE_FAST", "0")
     patch()
     assert len(kernel.configs) == 3
+
+
+def test_retrim_after_reload_on_the_t4_fast_path(env, monkeypatch):
+    """fix_mamba_ssm_float32 reloads ssd_chunk_scan, which recreates every config."""
+    kernel, cheapest = _autotuned_mamba_module(monkeypatch)
+    assert _NS["_retrim_mamba_ssm_autotune"]() == 1
+    assert kernel.configs == [cheapest]
+
+
+@pytest.mark.parametrize("capability, forced", [((8, 0), None), ((7, 5), "0")])
+def test_retrim_leaves_ampere_and_the_slow_path_alone(env, monkeypatch, capability, forced):
+    monkeypatch.setattr(torch, "cuda", _FakeCuda(capability = capability), raising = False)
+    if forced is not None:
+        monkeypatch.setenv("UNSLOTH_MAMBA_PRE_AMPERE_FAST", forced)
+    kernel, _ = _autotuned_mamba_module(monkeypatch)
+    assert _NS["_retrim_mamba_ssm_autotune"]() == 0
+    assert len(kernel.configs) == 3
+
+
+def test_every_ssd_chunk_scan_reload_is_followed_by_a_retrim():
+    for node in ast.parse(_SRC).body:
+        if isinstance(node, ast.FunctionDef) and node.name == "fix_mamba_ssm_float32":
+            seg = ast.get_source_segment(_SRC, node)
+            break
+    else:
+        raise AssertionError("fix_mamba_ssm_float32 not found")
+    lines = seg.splitlines()
+    reloads = [i for i, l in enumerate(lines) if "importlib.reload(" in l]
+    assert len(reloads) == 2
+    for i in reloads:
+        assert "_retrim_mamba_ssm_autotune()" in "\n".join(lines[i + 1:i + 4]), lines[i]
 
 
 # Keep last: it checks what the `env` fixture left behind after teardown.

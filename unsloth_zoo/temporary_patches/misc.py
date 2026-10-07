@@ -1378,6 +1378,24 @@ def _single_mamba_ssm_autotune_config():
 pass
 
 
+def _retrim_mamba_ssm_autotune():
+    """Trim again after a reload recreated the autotuners with every config.
+
+    fix_mamba_ssm_float32 reloads ssd_chunk_scan after this pass's trim, and on
+    the trust_remote_code path no later pass trims again.
+    """
+    try:
+        if not torch.cuda.is_available() or getattr(torch.version, "hip", None) is not None:
+            return 0
+        capability = tuple(torch.cuda.get_device_capability())
+        if capability >= (8, 0) or _mamba_ssm_fast_path_blocker(capability) is not None:
+            return 0
+        return _single_mamba_ssm_autotune_config()
+    except Exception:
+        return 0
+pass
+
+
 def patch_mamba_ssm_pre_ampere_fallback():
     """Force the Mamba slow path where mamba_ssm's Triton kernels cannot compile.
 
@@ -2151,6 +2169,7 @@ def fix_mamba_ssm_float32():
             importlib.reload(module)
         except Exception as e:
             return raise_error("mamba_ssm.ops.triton.ssd_chunk_scan", e)
+        _retrim_mamba_ssm_autotune()
         return
 
     # Atomic rename, not open("w"): truncation lets a concurrent patcher read and write back an empty module.
@@ -2166,6 +2185,7 @@ def fix_mamba_ssm_float32():
         tmp_file = None
         # Reload module since we editted it
         importlib.reload(mamba_ssm.ops.triton.ssd_chunk_scan)
+        _retrim_mamba_ssm_autotune()
     except Exception as e:
         if tmp_file is not None:
             try: os.unlink(tmp_file)
