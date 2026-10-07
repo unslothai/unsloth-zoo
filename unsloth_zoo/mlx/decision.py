@@ -1779,9 +1779,31 @@ def collate_decisions(items, pad_token_id):
     return {name: mx.array(value) for name, value in batch.items()}
 
 
-def _soft_cross_entropy(model, batch):
+def _decision_losses(logits, target, mask, objective = None):
+    """Each decision's loss, and its expected distance from the gold level for the ordinal term.
+
+    `objective` is `(label_smoothing, brier_weight, ordinal_weight)`: cross-entropy against targets smoothed toward
+    uniform over the decision's own options, plus a Brier term. `logits` hold -1e4 where `mask` is off.
+    """
+    smoothing, brier, ordinal = objective or (0.0, 0.0, 0.0)
+    log_p = nn.log_softmax(logits, axis = -1)
+    options = mask.sum(-1, keepdims = True)
+    smoothed = (1.0 - smoothing) * target + smoothing * mask / mx.maximum(options, 1) if smoothing else target
+    losses, distance = -(smoothed * log_p).sum(-1), None
+    if brier or ordinal:
+        p = mx.exp(log_p)
+    if brier:
+        losses = losses + brier * ((p - target) ** 2 * mask).sum(-1)
+    if ordinal:
+        levels = mx.arange(logits.shape[-1])
+        apart = mx.abs(levels[:, None] - levels[None, :]).astype(p.dtype)
+        distance = ((p @ apart) * target).sum(-1) / mx.maximum(options[:, 0] - 1, 1)
+    return losses, distance
+
+
+def _soft_cross_entropy(model, batch, objective = None):
     logits = model(batch["input_ids"], batch["attention_mask"], batch["marker_pos"], batch["marker_mask"], batch["qtype"])
-    return -(batch["target"] * nn.log_softmax(logits, axis = -1)).sum(-1).mean()
+    return _decision_losses(logits, batch["target"], batch["marker_mask"], objective)[0].mean()
 
 
 class _LayerwiseStep:
@@ -1792,7 +1814,7 @@ class _LayerwiseStep:
     layer inputs are kept, and each layer is recomputed for its backward pass, as gradient checkpointing does.
     """
 
-    def __init__(self, model, compile = False):
+    def __init__(self, model, compile = False, objective = None):
         self.model = model
         encoder = model.encoder
         modules = [encoder.embeddings, *encoder.layers]
@@ -1823,7 +1845,7 @@ class _LayerwiseStep:
                 model.update(params)
                 keys = batch["attention_mask"].astype(mx.bool_)[:, None, None, :]
                 logits = model.decide(encoder.final_norm(x), keys, batch["marker_pos"], batch["marker_mask"], batch["qtype"])
-                return -(batch["target"] * nn.log_softmax(logits, axis = -1)).sum(-1).mean()
+                return _decision_losses(logits, batch["target"], batch["marker_mask"], objective)[0].mean()
 
             params = {name: value for name, value in model.trainable_parameters().items() if name != "encoder"}
             params["encoder"] = {"final_norm": encoder.final_norm.trainable_parameters()}
@@ -1886,15 +1908,15 @@ def _staged_logits(step, batch):
 class _MarkerStep:
     """How the trainer runs a Laya network: padded batches of one decision per row."""
 
-    def __init__(self, model, pad_token_id, compiled = False):
-        self.model, self.pad_token_id = model, pad_token_id
+    def __init__(self, model, pad_token_id, compiled = False, objective = None):
+        self.model, self.pad_token_id, self.objective = model, pad_token_id, objective
         # Scoring stays uncompiled: a compiled stage would replay the training-mode trace it was built with.
         self.staged = _LayerwiseStep(model)
         if getattr(model, "gradient_checkpointing", False):
-            self.loss_and_grad = _LayerwiseStep(model, compiled)
+            self.loss_and_grad = _LayerwiseStep(model, compiled, objective)
         else:
             value_and_grad = nn.value_and_grad(model, _soft_cross_entropy)
-            self.loss_and_grad = lambda batch: value_and_grad(model, batch)
+            self.loss_and_grad = lambda batch: value_and_grad(model, batch, objective)
             if compiled:
                 state = [model.state, mx.random.state]
                 self.loss_and_grad = mx.compile(self.loss_and_grad, inputs = state, outputs = state)
@@ -1906,9 +1928,10 @@ class _MarkerStep:
         return self.loss_and_grad(batch)
 
     def losses(self, batch):
-        """Summed soft cross-entropy of a batch and the number of decisions in it."""
+        """Summed loss of a batch and the number of decisions in it."""
         logits = _staged_logits(self.staged, batch)
-        return -(batch["target"] * nn.log_softmax(logits, axis = -1)).sum(), batch["target"].shape[0]
+        losses = _decision_losses(logits, batch["target"], batch["marker_mask"], self.objective)[0]
+        return losses.sum(), batch["target"].shape[0]
 
 
 _CLEF_LORA_TARGETS = ("q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "in_proj_z", "out_proj", "gate_proj", "up_proj", "down_proj")
@@ -1957,8 +1980,8 @@ class ClefNetwork(nn.Module):
     def training_run(self):
         return _decoder_training(self.encoder, self._gradient_checkpointing)
 
-    def decision_step(self, compiled = False):
-        return _ClefStep(self)
+    def decision_step(self, compiled = False, objective = None):
+        return _ClefStep(self, objective)
 
 
 def clef_training_network(
@@ -2001,8 +2024,8 @@ def clef_training_network(
     return network
 
 
-def _clef_record_loss(network, item):
-    """Soft cross-entropy summed over the questions of one record."""
+def _clef_record_loss(network, item, objective = None, ordinal_scale = 0.0):
+    """The loss summed over the questions of one record; `ordinal_scale` weighs its score questions' ordinal term."""
     spans = item["option_spans"]
     logits = network._pipeline.logits(item["input_ids"], item["question_spans"], spans, item["types"])
     target = np.zeros((len(spans), logits.shape[0]), np.float32)
@@ -2012,33 +2035,47 @@ def _clef_record_loss(network, item):
         start += len(values)
     owner = mx.array([row for row, options in enumerate(spans) for _ in options])
     own = owner[None, :] == mx.arange(len(spans))[:, None]
-    return -(mx.array(target) * nn.log_softmax(mx.where(own, logits[None, :], -1e4), axis = -1)).sum()
+    losses, distance = _decision_losses(mx.where(own, logits[None, :], -1e4), mx.array(target), own, objective)
+    if distance is None or not ordinal_scale:
+        return losses.sum()
+    return losses.sum() + ordinal_scale * (distance * mx.array(_clef_score_questions(item))).sum()
+
+
+def _clef_score_questions(item):
+    return [float(kind == _TYPE_IDS.index("score")) for kind in item["types"]]
 
 
 class _ClefStep:
     """How the trainer runs a Clef: one record (a prompt holding all its questions) at a time, averaged over questions."""
 
-    def __init__(self, network):
-        self.network = network
+    def __init__(self, network, objective = None):
+        self.network, self.objective = network, objective
         self.value_and_grad = nn.value_and_grad(network, _clef_record_loss)
+
+    def _ordinal_scale(self, items, count):
+        # The ordinal term averages over the batch's score questions, the other terms over all its questions.
+        scored = sum(sum(_clef_score_questions(item)) for item in items) if self.objective and self.objective[2] else 0
+        return self.objective[2] * count / scored if scored else 0.0
 
     def collate(self, items):
         return items
 
     def __call__(self, items):
         total, grads = 0.0, None
+        count = sum(len(item["targets"]) for item in items)
+        scale = self._ordinal_scale(items, count)
         for item in items:
-            loss, record = self.value_and_grad(self.network, item)
+            loss, record = self.value_and_grad(self.network, item, self.objective, scale)
             grads = record if grads is None else tree_map(mx.add, grads, record)
             total = total + loss
             # A record is evaluated on its own, so memory is bounded by the longest prompt, not the batch.
             mx.eval(total, grads)
-        count = sum(len(item["targets"]) for item in items)
         return total / count, tree_map(lambda g: g / count, grads)
 
     def losses(self, items):
-        total = sum(_clef_record_loss(self.network, item) for item in items)
-        return total, sum(len(item["targets"]) for item in items)
+        count = sum(len(item["targets"]) for item in items)
+        scale = self._ordinal_scale(items, count)
+        return sum(_clef_record_loss(self.network, item, self.objective, scale) for item in items), count
 
 
 def clef_logits(network, items):

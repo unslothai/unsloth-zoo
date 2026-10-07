@@ -10670,6 +10670,8 @@ class MLXDecisionTrainer:
 
     `args` is an `MLXTrainingConfig`. Parameters under `encoder.` train at `args.learning_rate` and the rest
     at `head_learning_rate`, both under `args.lr_scheduler_type`. `callbacks` are transformers `TrainerCallback`s.
+    `label_smoothing` smooths each decision's target toward uniform over its own options, `brier_weight` adds a Brier
+    term, and `ordinal_weight` adds a Clef score question's expected distance from its gold level.
     """
 
     def __init__(
@@ -10682,8 +10684,13 @@ class MLXDecisionTrainer:
         head_learning_rate = None,
         callbacks = None,
         processing_class = None,
+        label_smoothing = 0.0,
+        brier_weight = 0.0,
+        ordinal_weight = 0.0,
     ):
         self.model = model
+        objective = tuple(float(value or 0.0) for value in (label_smoothing, brier_weight, ordinal_weight))
+        self.objective = objective if any(objective) else None
         # A copy, as in MLXTrainer: callbacks read the metric's direction off the arguments as a real boolean.
         self.args = copy.copy(args) if args is not None else MLXTrainingConfig()
         self.args.greater_is_better = _resolve_greater_is_better(self.args)
@@ -10765,7 +10772,9 @@ class MLXDecisionTrainer:
         from .decision import _MarkerStep
 
         build = getattr(self.model, "decision_step", None)
-        return build(compiled) if build else _MarkerStep(self.model, self.pad_token_id, compiled)
+        if build:
+            return build(compiled, self.objective)
+        return _MarkerStep(self.model, self.pad_token_id, compiled, self.objective)
 
     def _eval_batches(self):
         size = self.args.per_device_eval_batch_size or self.args.per_device_train_batch_size

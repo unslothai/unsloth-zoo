@@ -47,6 +47,7 @@ from unsloth_zoo.mlx.decision import (  # noqa: E402
     _KevModel,
     _LabelModel,
     _LayerwiseStep,
+    _MarkerStep,
     _clef_record_loss,
     _load_joint_head,
     _merge_lora,
@@ -587,19 +588,19 @@ def test_lora_adapters_target_encoder_linears_and_merge_on_save(checkpoint, tmp_
     np.testing.assert_allclose(load_decision_model(tmp_path, compute_dtype = mx.float16).logits(_batch()), model.logits(_batch()), atol = 5e-2)
 
 
-@pytest.mark.parametrize("target_modules", ["all-linear", r"layers\.0\.attn\.Wqkv"])
-def test_layerwise_gradients_match_one_graph_under_dropout(checkpoint, target_modules):
+@pytest.mark.parametrize("target_modules, objective", [("all-linear", None), (r"layers\.0\.attn\.Wqkv", (0.1, 0.5, 0.0))])
+def test_layerwise_gradients_match_one_graph_under_dropout(checkpoint, target_modules, objective):
     import mlx.nn as nn
 
     # With one early adapter, the frozen layers after it must still pass the gradient down.
-    model = add_lora_adapters(load_trainable_decision_model(checkpoint[1]), r = 4, lora_dropout = 0.3, target_modules = target_modules)
+    model = add_lora_adapters(load_trainable_decision_model(checkpoint[1], gradient_checkpointing = False), r = 4, lora_dropout = 0.3, target_modules = target_modules)
     batch = collate_decisions(_items(), 0)
     mx.random.seed(7)
-    want_loss, want = nn.value_and_grad(model, _soft_cross_entropy)(model, batch)
+    want_loss, want = _MarkerStep(model, 0, False, objective)(batch)
     key = mx.random.state[0].tolist()
     for compile in (False, True):
         mx.random.seed(7)
-        loss, got = _LayerwiseStep(model, compile)(batch)
+        loss, got = _LayerwiseStep(model, compile, objective)(batch)
         assert abs(loss.item() - want_loss.item()) < 1e-3 and mx.random.state[0].tolist() == key
         want_flat = dict(tree_flatten(want))
         assert {name for name, _ in tree_flatten(got)} == set(want_flat)
@@ -682,6 +683,29 @@ def test_clef_trains_decoder_adapters_and_head_at_their_own_rates(clef, encoder_
     assert trainer.state.log_history[0]["loss"] == pytest.approx(first, rel = 1e-3)
     assert trainer.evaluate()["eval_loss"] == pytest.approx(sum(_clef_record_loss(network, record).item() for record in items) / 3, rel = 1e-3)
     assert [len(row) for row in clef_logits(network, items)[0]] == [3, 2]
+
+
+def _reference_loss(rows, ordinal, smoothing, brier, weight):
+    # The loss of unsloth's torch DecisionTrainer, one decision (its logits and target) at a time.
+    losses, apart = [], []
+    for z, t in ((torch.as_tensor(np.array(z), dtype = torch.float32), torch.as_tensor(np.array(t), dtype = torch.float32)) for z, t in rows):
+        p, levels = torch.softmax(z, 0), torch.arange(len(z)).float()
+        losses.append(-(((1 - smoothing) * t + smoothing / len(z)) * p.log()).sum() + brier * ((p - t) ** 2).sum())
+        apart.append((p[:, None] * (levels[:, None] - levels[None, :]).abs() * t[None, :]).sum() / max(len(z) - 1, 1) * ordinal[len(apart)])
+    return (sum(losses) / len(losses) + weight * sum(apart) / max(sum(ordinal), 1)).item()
+
+
+@pytest.mark.parametrize("objective", [(0.1, 0.0, 0.0), (0.0, 0.5, 0.0), (0.0, 0.0, 0.7), (0.1, 0.5, 0.7)])
+def test_decision_objectives_match_the_torch_loss(clef, objective):
+    scored = {"grade": {"type": "score", "instructions": "how good", "criteria": ["bad", "fine", "good", "great"]}, "ok": {"type": "noul", "instructions": "fine?"}, "rank": {"type": "score", "instructions": "rank", "criteria": ["low", "mid", "high"]}}
+    items = [clef[2]("bye"), {**clef_training_item(clef[0], "hello there", scored), "targets": [[0.0, 0.1, 0.9, 0.0], [0.3, 0.7], [0.2, 0.8, 0.0]]}, clef[2]("hi", count = 1)]
+    network, kinds = ClefNetwork(clef[0]), [kind == 2 for record in items for kind in record["types"]]
+    want = _reference_loss(zip((row for rows in clef_logits(network, items) for row in rows), (t for record in items for t in record["targets"])), kinds, *objective)
+    with network.training_run():
+        loss, grads = network.decision_step(objective = objective)(items)
+    assert loss.item() == pytest.approx(want, rel = 2e-3) and any(mx.any(value).item() for _, value in tree_flatten(grads["head"]))
+    trainer = MLXDecisionTrainer(network, _config(per_device_eval_batch_size = 3), items, items, label_smoothing = objective[0], brier_weight = objective[1], ordinal_weight = objective[2])
+    assert trainer.evaluate()["eval_loss"] == pytest.approx(want, rel = 2e-3)
 
 
 def test_clef_full_fine_tune_trains_the_decoder_but_not_the_output_embedding(clef, monkeypatch):
