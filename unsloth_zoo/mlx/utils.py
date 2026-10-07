@@ -3236,6 +3236,18 @@ def _apply_static_vlm_metadata(model, batch_dict, kwargs):
         not getattr(model, "training", False) or kwargs.get("position_ids") is None
     ):
         return
+    if not keys:
+        # Compile only: an unpatched tower (`patch_mode="unpatched"`) still
+        # calls `.tolist()` on what it is handed.
+        decision = getattr(model, "_unsloth_compile_decision", None)
+        if decision is None or not getattr(decision, "enabled", False):
+            return
+        keys = _VLM_STATIC_METADATA_MODEL_TYPES.get(
+            _mlx_vlm_canonical_model_type(
+                _config_get(getattr(model, "config", None), "model_type")
+            ),
+            (),
+        )
     static = batch_dict.get("_unsloth_static_vlm_metadata", {})
     for key in keys:
         if key in static:
@@ -3530,6 +3542,17 @@ _VLM_ARRAY_GRID_MODEL_TYPES = frozenset({
     "muse_glimmer",
     "glm5_next",
 })
+
+
+# Towers that read these keys on the host (a tracer under mx.compile): handed the
+# processor's Python values. Per family, since a tuple raises in the towers above.
+_VLM_STATIC_METADATA_MODEL_TYPES = {
+    # One `_as_grid_list` call reads whichever of the two the batch carries.
+    "mage_vl": ("image_grid_thw", "video_grid_thw"),
+    # Pixtral's vision tower, which mistral3 and mistral4 checkpoints also load.
+    "mistral3": ("image_sizes",),
+    "pixtral": ("image_sizes",),
+}
 
 
 def _normalize_size_tuples(values):

@@ -89,6 +89,7 @@ _VERIFIED_TRAINING_ARCHES: set[str] = {
     "llava",
     "llava_bunny",
     "llava_next",
+    "mage_vl",
     "mistral3",
     "mistral4",
     "moondream2",
@@ -103,6 +104,7 @@ _VERIFIED_TRAINING_ARCHES: set[str] = {
     "pixtral",
     "qwen2_vl",
     "qwen2_5_vl",
+    "qwen3",
     "qwen3_5",
     "qwen3_5_moe",
     # mlx-vlm 0.7.4+ names these as qwen3_5 / qwen3_5_moe's `text_config` decoders.
@@ -234,6 +236,7 @@ _TRAINING_VERIFIER_HINTS: dict[str, str] = {
     "llava": "verify_llava",
     "llava_bunny": "verify_llava_bunny",
     "llava_next": "verify_llava_next",
+    "mage_vl": "verify_mage_vl",
     "mistral3": "verify_mistral3",
     "mistral4": "verify_mistral4",
     "moondream2": "verify_moondream2",
@@ -248,6 +251,7 @@ _TRAINING_VERIFIER_HINTS: dict[str, str] = {
     "pixtral": "verify_pixtral",
     "qwen2_vl": "verify_qwen2_vl",
     "qwen2_5_vl": "verify_qwen2_5_vl",
+    "qwen3": "verify_qwen3",
     "qwen3_5": "verify_qwen3_5",
     "qwen3_5_moe": "verify_qwen3_5_moe",
     "qwen3_5_moe_text": "verify_qwen3_5_moe_text",
@@ -2001,6 +2005,38 @@ def _merge_special_token_features(
     return _merge_sequence_mask_features(special_mask, image_features, inputs_embeds)
 
 
+def _flatten_feature_rows(feature_rows, hidden_dim):
+    """Upstream scatters elements, so a leading or folded axis is only a reshape."""
+
+    if feature_rows.ndim == 2 and feature_rows.shape[-1] == hidden_dim:
+        return feature_rows
+    return feature_rows.reshape((-1, hidden_dim))
+
+
+def _raise_on_feature_count_mismatch(mask, feature_rows, inputs_embeds, exact=True):
+    """Each tower's own upstream count check (equal, or `exact=False`: no shortfall).
+
+    Needs a host value, so a traced mask is left alone.
+    """
+
+    import mlx.core as mx
+
+    try:
+        tokens = int(mx.sum(mask.astype(mx.int32)).item())
+    except Exception:
+        return
+    # Placeholders the features can fill (rows, or minimax's elements / hidden).
+    features, remainder = divmod(feature_rows.size, inputs_embeds.shape[-1])
+    if remainder:
+        features = 0
+    if tokens != features if exact else tokens > features:
+        raise ValueError(
+            "Unsloth MLX: image features and image tokens do not match: "
+            f"tokens={tokens}, features={features}. A max_seq_length shorter "
+            "than the prompt can truncate an image span; increase it."
+        )
+
+
 def _merge_sequence_mask_features(
     sequence_mask,
     feature_rows,
@@ -2010,12 +2046,9 @@ def _merge_sequence_mask_features(
 
     if sequence_mask.dtype != mx.bool_:
         sequence_mask = sequence_mask.astype(mx.bool_)
-    if feature_rows.ndim == 3 and feature_rows.shape[0] == 1:
-        feature_rows = feature_rows[0]
-    elif feature_rows.ndim > 2:
-        feature_rows = feature_rows.reshape((-1, feature_rows.shape[-1]))
 
     hidden_dim = inputs_embeds.shape[-1]
+    feature_rows = _flatten_feature_rows(feature_rows, hidden_dim)
     flat_mask = sequence_mask.reshape((-1,))
     flat_inputs = inputs_embeds.reshape((-1, hidden_dim))
 
@@ -2029,6 +2062,32 @@ def _merge_sequence_mask_features(
 
     flat_out = mx.where(mx.expand_dims(flat_mask, axis=-1), gathered, flat_inputs)
     return flat_out.reshape(inputs_embeds.shape), mx.expand_dims(sequence_mask, axis=-1)
+
+
+def _merge_exclusive_special_token_features(
+    image_token_id,
+    video_token_id,
+    image_features,
+    inputs_embeds,
+    input_ids,
+):
+    """Image placeholders, else video ones; upstream's host choice done via `mx.where`."""
+
+    import mlx.core as mx
+
+    special_mask = input_ids == image_token_id
+    if video_token_id is not None:
+        special_mask = mx.where(
+            mx.sum(special_mask) == 0, input_ids == video_token_id, special_mask
+        )
+    # Upstream refuses only a shortfall.
+    _raise_on_feature_count_mismatch(
+        special_mask, image_features, inputs_embeds, exact=False
+    )
+    merged, _ = _merge_sequence_mask_features(
+        special_mask, image_features, inputs_embeds
+    )
+    return merged
 
 
 def _merge_special_token_features_only(
