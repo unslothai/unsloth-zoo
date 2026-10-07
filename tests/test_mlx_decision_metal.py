@@ -783,6 +783,8 @@ def test_trainer_follows_the_evaluation_and_logging_schedule_it_is_given(checkpo
     trainer.train()
     # The item past two full batches is dropped: one step an epoch, the first is logged, and nothing is evaluated.
     assert trainer.state.global_step == 2 and [log["step"] for log in trainer.state.log_history if "learning_rate" in log or "eval_loss" in log] == [1]
+    # A second run on the same trainer starts its own count.
+    assert trainer.train().global_step == 2 and len(trainer.state.log_history) == 2
 
 
 def test_clef_full_fine_tune_trains_the_decoder_but_not_the_output_embedding(clef, monkeypatch):
@@ -1123,19 +1125,25 @@ def test_early_stopping_ends_the_run_when_its_metric_stops_improving(checkpoint)
 
     def run(best = None, threshold = 10.0, **chosen):
         config = _config(max_steps = 6, eval_steps = 1, **chosen)
+        accuracy = _Accuracy()
+        accuracy.best = best
         # An improvement of 10 never happens, so the first evaluation that has a best to compare with stops the run.
-        trainer = MLXDecisionTrainer(model, config, _items(), _items(), callbacks = [_Accuracy(), transformers.EarlyStoppingCallback(1, threshold)])
-        trainer.state.best_metric = best
+        trainer = MLXDecisionTrainer(model, config, _items(), _items(), callbacks = [accuracy, transformers.EarlyStoppingCallback(1, threshold)])
         trainer.train()
         return trainer
 
     class _Accuracy(transformers.TrainerCallback):
+        def on_train_begin(self, args, state, control, **kwargs):
+            state.best_metric = self.best
+
         def on_evaluate(self, args, state, control, metrics = None, **kwargs):
             metrics["eval_accuracy"] = 0.1 * state.global_step
 
     trainer = run(metric_for_best_model = "eval_loss")
     losses = [log["eval_loss"] for log in trainer.state.log_history if "eval_loss" in log]
     assert trainer.state.global_step == 2 and trainer.state.best_metric == min(losses) and trainer.args.eval_strategy == "steps"
+    # The stop request ends with its run: the same trainer trains again.
+    assert trainer.train().global_step == 2
     # A best loss no evaluation reaches is kept, and the first evaluation already fails to improve on it.
     trainer = run(best = 0.0, metric_for_best_model = "eval_loss")
     assert trainer.state.global_step == 1 and trainer.state.best_metric == 0.0

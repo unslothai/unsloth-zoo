@@ -10986,7 +10986,9 @@ class MLXDecisionTrainer:
         compiled = getattr(args, "compile", True) and getattr(args, "compile_mode", None) != "eager"
         step = self._step(compiled)
 
-        state = self.state
+        # As transformers does, each run counts from zero, so a trainer can train again.
+        state, self.control = _MLXTrainerState(), _MLXTrainerControl()
+        self.state = state
         state.max_steps, state.logging_steps, state.train_batch_size = max_steps, logging_steps, batch_size
         state.num_train_epochs, state.epoch = math.ceil(max_steps / steps_per_epoch), 0.0
         model.train()
