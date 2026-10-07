@@ -716,10 +716,13 @@ def test_saved_clef_holds_the_trained_decoder_and_a_head_with_its_temperature_fo
         assert "scales" in pipeline.model.language_model.model.layers[0].linear_attn.in_proj_qkv
         from unsloth_zoo.mlx.decision import _QwenModel
 
-        asked = {}
-        monkeypatch.setattr("unsloth_zoo.mlx.loader.FastMLXModel.from_pretrained", lambda *args, **kwargs: asked.update(kwargs) or (pipeline.model, None))
-        _QwenModel._load(SimpleNamespace(), tmp_path, None, None, None, None, True)
+        asked, loaded = {}, [_decoder(), _decoder()]
+        monkeypatch.setattr("unsloth_zoo.mlx.loader.FastMLXModel.from_pretrained", lambda *args, **kwargs: asked.update(kwargs) or (loaded[kwargs["load_in_4bit"]], None))
+        for four in (False, True):
+            _QwenModel._load(SimpleNamespace(), tmp_path, None, None, None, None, four)
         assert (asked["load_in_4bit"], asked["load_in_16bit"]) == (True, False)
+        # What the loader leaves in 16-bit for other trainers, the embedding and the output head, is quantized too.
+        assert [["scales" in module for module in (model.language_model.model.embed_tokens, model.language_model.lm_head)] for model in loaded] == [[False, False], [True, True]]
     network = clef_training_network(pipeline, full_finetuning = mode == "full", r = 4, lora_alpha = 8, modules_to_save = ["embed_tokens"] if mode == "embedding" else None)
     if mode == "qlora":
         # Adapters over quantized layers receive gradients.

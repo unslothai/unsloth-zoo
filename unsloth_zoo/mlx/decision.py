@@ -705,6 +705,10 @@ class _QwenModel(DecisionPipeline):
         self.tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
         if adapter is not None:
             _merge_lora(self.model, adapter)
+        if load_in_4bit:
+            # The loader leaves the embeddings, the output head and the vision tower in 16-bit for the trainers that
+            # train them. No decision head does, and together they are as large again as the quantized layers.
+            nn.quantize(self.model, 64, 4, class_predicate = lambda _, module: hasattr(module, "to_quantized") and module.weight.shape[-1] % 64 == 0)
         self.model.eval()
 
     def _load_beside(self, folder, dtype, token, head_prefix, load_in_4bit = False):
