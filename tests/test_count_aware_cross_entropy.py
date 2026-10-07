@@ -271,6 +271,27 @@ def test_helper_matches_the_stock_mean_and_divides_by_the_count():
     assert unsloth_count_aware_cross_entropy(logits, ignored, 4) == 0
 
 
+def test_helper_keeps_the_stock_dtype_and_sums_in_float32():
+    # The stock block it replaces runs CE on the logits as they are (no float32 copy of a
+    # vocab-sized tensor): the mean is that exact call, and only the per-token losses of the
+    # counted sum are accumulated in float32, so a half precision sum cannot overflow.
+    logits, labels, _ = _batch()
+    half = logits.to(torch.bfloat16)
+    stock = nn.CrossEntropyLoss()(half[..., :-1, :].reshape(-1, 13), labels[..., 1:].reshape(-1))
+    mean = unsloth_count_aware_cross_entropy(half, labels)
+    assert mean.dtype == torch.bfloat16 and torch.equal(mean, stock)
+    per_token = F.cross_entropy(half[..., :-1, :].reshape(-1, 13), labels[..., 1:].reshape(-1),
+                                reduction = "none").float().sum()
+    counted = unsloth_count_aware_cross_entropy(half, labels, torch.tensor(29))
+    assert counted.dtype == torch.float32
+    torch.testing.assert_close(counted, per_token / 29)
+    # 6000 tokens of loss ~ln(50000) sum past float16's 65504 limit; the float32 sum stays finite.
+    big = torch.zeros(1, 6001, 4, dtype = torch.float16)
+    big_labels = torch.zeros(1, 6001, dtype = torch.long)
+    big[..., 0] = -12.0
+    assert torch.isfinite(unsloth_count_aware_cross_entropy(big, big_labels, 6000))
+
+
 def test_helper_mask_matches_the_filtered_stock_block():
     logits, labels, attention_mask = _batch()
     keep = attention_mask[:, -(logits.shape[1] - 1):] != 0
@@ -328,7 +349,7 @@ def test_other_objectives_are_left_alone(source):
 def test_deprecated_module_gets_the_count_aware_forward_from_the_hook(tmp_path):
     from unsloth_zoo.fused_losses import forward_install
     if not forward_install._transformers_version_ok():
-        pytest.skip("hook needs transformers >= 4.56")
+        pytest.skip(reason = "hook needs transformers >= 4.56")
     header = (
         "from typing import Optional, Union\n"
         "import torch\n"
@@ -386,7 +407,7 @@ def test_fused_heads_do_not_take_the_count_route(name):
     transformers = pytest.importorskip("transformers")
     cls = getattr(transformers, name, None)
     if cls is None:
-        pytest.skip(f"{name} not in this transformers")
+        pytest.skip(reason = f"{name} not in this transformers")
     new, route, _ = _fused(cls)
     assert route != "count" and "unsloth_count_aware_cross_entropy" not in new
     assert not getattr(cls, "_unsloth_counts_unshifted_labels", False)

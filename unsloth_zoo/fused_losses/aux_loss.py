@@ -57,8 +57,11 @@ def _local_count(labels, attention_mask, loss_kwargs, model):
     # The packed-boundary drop indexes by data, which a compiled forward cannot trace; there the
     # boundaries a collator left unmasked (at most documents - 1 per micro-batch) are counted.
     packed = not torch.compiler.is_compiling()
+    shift_labels = loss_kwargs.get("shift_labels", None) if isinstance(loss_kwargs, dict) else None
+    if not isinstance(shift_labels, torch.Tensor): shift_labels = None
     count, _, _ = count_batch_items(labels, attention_mask, None, packed_seq_lengths,
-                                    unshifted = unshifted, packed = packed)
+                                    unshifted = unshifted, packed = packed,
+                                    shift_labels = None if unshifted else shift_labels)
     return count
 
 

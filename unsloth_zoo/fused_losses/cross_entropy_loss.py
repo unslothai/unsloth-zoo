@@ -680,7 +680,9 @@ def unsloth_count_aware_cross_entropy(
     shift=True predicts token t+1 from position t (logits[..., :-1, :], labels[..., 1:]); False for
     labels already aligned (encoder-decoder, Bart-style ForCausalLM) or pre-shifted by the caller.
     mask: an attention mask whose zero positions are dropped, cropped to the logits length the way
-    the stock filtered VLM / Llama 4 blocks do. Computed in float32.
+    the stock filtered VLM / Llama 4 blocks do. The CE runs in the logits' own dtype, as stock does
+    (no float32 copy of the logits); only the per-token losses are summed in float32, so a half
+    precision sum cannot overflow.
     """
     if shift:
         logits = logits[..., :-1, :]
@@ -691,13 +693,13 @@ def unsloth_count_aware_cross_entropy(
         labels = labels[keep.to(labels.device)]
     if vocab_size is None:
         vocab_size = logits.shape[-1]
-    logits = logits.reshape(-1, vocab_size).float()
+    logits = logits.reshape(-1, vocab_size)
     labels = labels.reshape(-1).to(logits.device)
     if n_items is None:
         return torch.nn.functional.cross_entropy(logits, labels, ignore_index = ignore_index)
     loss = torch.nn.functional.cross_entropy(
-        logits, labels, ignore_index = ignore_index, reduction = "sum",
-    )
+        logits, labels, ignore_index = ignore_index, reduction = "none",
+    ).float().sum()
     if torch.is_tensor(n_items):
         # A DataParallel replica gets a one-element slice of the repeated count: keep the loss 0-dim.
         n_items = n_items.to(loss.device)

@@ -114,7 +114,7 @@ def _real(module, name):
     try:
         return getattr(importlib.import_module(module), name)
     except Exception as exc:
-        pytest.skip(f"{name} unavailable: {exc}")
+        pytest.skip(reason = f"{name} unavailable: {exc}")
 
 
 @pytest.mark.parametrize("module,name", [
@@ -127,7 +127,7 @@ def test_hook_route_rewrites_real_moe_heads(module, name):
     cls = _real(module, name)
     src = textwrap.dedent(inspect.getsource(cls.forward))
     if "unsloth_fused_lm_head_loss" not in src:
-        pytest.skip(f"{name} not on the hook route here")
+        pytest.skip(reason = f"{name} not on the hook route here")
     calls = _aux_calls(src)
     assert len(calls) == 1, src
     assert ast.unparse(calls[0].args[1]) == "labels"
@@ -142,9 +142,9 @@ def test_compiler_route_rewrites_real_moe_heads(module, name):
     cls = _real(module, name)
     src = inspect.getsource(cls.forward)
     if "aux_loss_coef" not in src:
-        pytest.skip(f"{name} adds no router aux loss here")
+        pytest.skip(reason = f"{name} adds no router aux loss here")
     new, route, _ = fused_lm_head_forward(name, cls, cls.__module__, src)
     if route is None:
-        pytest.skip(f"{name} is not fused here")
+        pytest.skip(reason = f"{name} is not fused here")
     assert len(_aux_calls(new)) >= 1
     compile(textwrap.dedent(new), "<fused>", "exec")

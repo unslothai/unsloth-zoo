@@ -51,7 +51,7 @@ def _live(module, name):
     try:
         return getattr(importlib.import_module(f"transformers.models.{module}.modeling_{module}"), name)
     except Exception as exc:
-        pytest.skip(f"{name} unavailable: {exc}")
+        pytest.skip(reason = f"{name} unavailable: {exc}")
 
 
 def _isolated(cls):
@@ -393,10 +393,10 @@ def test_aligned_target_heads_are_marked_unshifted(module, name):
     cls = _isolated(_live(module, name))
     src = inspect.getsource(_live(module, name).forward)
     if "unsloth_fused_lm_head_loss" in src:
-        pytest.skip(f"{name} is on the hook route here")
+        pytest.skip(reason = f"{name} is on the hook route here")
     new, route, _ = compiler.fused_lm_head_forward(name, cls, cls.__module__, src)
     if route != "ast":
-        pytest.skip(f"{name} is not on the AST route here ({route})")
+        pytest.skip(reason = f"{name} is not on the AST route here ({route})")
     assert cls.__dict__.get("_unsloth_counts_unshifted_labels") is True
 
 
@@ -416,3 +416,23 @@ def test_moonshine_stock_source_is_marked_and_unshifted_is_its_divisor():
     loss = ForCausalLMLoss(logits, None, 13, num_items_in_batch = torch.tensor(n), shift_labels = labels)
     total = F.cross_entropy(logits.reshape(-1, 13).float(), labels.reshape(-1), ignore_index = -100, reduction = "sum")
     torch.testing.assert_close(loss * n, total)
+
+
+def test_collator_shift_labels_are_counted_as_given():
+    # A context / sequence parallel or padding free collator hands the loss pre-shifted targets in
+    # `shift_labels`; the loss trains on them as given, so transformers >= 5 counts them as given.
+    count_batch_items = _loss_utils().count_batch_items
+    labels = torch.randint(0, 13, (2, 8))
+    shift_labels = torch.full((2, 8), -100)
+    shift_labels[0, :3] = 1
+    shift_labels[1, :2] = 2
+    count, short, degenerate = count_batch_items(labels, shift_labels = shift_labels)
+    assert int(count) == 5 and not short and not degenerate
+    assert int(count_batch_items(labels)[0]) == 14
+    # An unshifted head counts its own labels whatever the collator added.
+    assert int(count_batch_items(labels, shift_labels = shift_labels, unshifted = True)[0]) == 16
+    # The aux share reads the same targets off the forward's kwargs.
+    share = aux_mod.unsloth_ga_scale_aux_loss(
+        torch.tensor(1.0), labels, None, {"num_items_in_batch": torch.tensor(10), "shift_labels": shift_labels},
+    )
+    torch.testing.assert_close(share, torch.tensor(0.5))

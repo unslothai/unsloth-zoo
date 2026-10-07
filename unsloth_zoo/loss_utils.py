@@ -481,7 +481,7 @@ pass
 
 
 def count_batch_items(labels, attention_mask = None, input_ids = None, packed_seq_lengths = None,
-                      unshifted = False, packed = True):
+                      unshifted = False, packed = True, shift_labels = None):
     # All Unsloth Zoo code licensed under LGPLv3
     """Counted targets of one micro-batch, as `(count, short, degenerate)`.
 
@@ -490,9 +490,13 @@ def count_batch_items(labels, attention_mask = None, input_ids = None, packed_se
     (0 columns unshifted, 1 shifted). `degenerate` means the layout is not a token LM batch (labels
     and input_ids differ in rank, or an attention mask of another shape). Both are shape checks
     only, so no device sync. `packed = False` skips the packed-boundary drop, whose index reads are
-    data dependent.
+    data dependent. `shift_labels`: targets a collator already shifted (context / sequence parallel,
+    padding free); the loss trains on them as given, so they are counted as given, as transformers
+    >= 5 Trainer._get_num_items_in_batch does.
     """
     degenerate = input_ids is not None and labels.ndim != input_ids.ndim
+    if shift_labels is not None and not unshifted:
+        return (shift_labels != -100).sum(), shift_labels.shape[-1] < 1, degenerate
     if unshifted:
         # Every non-ignored label is a target: no shift, so one column is enough, and no causal
         # attention-mask AND or packed-boundary drop (an aligned CE applies neither).
@@ -689,6 +693,7 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                 count, short, bad = count_batch_items(
                     labels, attention_mask, input_ids,
                     None if unshifted else x.get("packed_seq_lengths"), unshifted = unshifted,
+                    shift_labels = None if unshifted else x.get("shift_labels"),
                 )
                 if not short: all_short = False
                 if bad: degenerate = True
