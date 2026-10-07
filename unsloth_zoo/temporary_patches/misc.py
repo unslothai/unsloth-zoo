@@ -1328,8 +1328,11 @@ def _mamba_ssm_fast_path_blocker(capability):
     if tuple(capability) < (7, 5):
         return f"they need compute capability 7.5+ (this GPU is {major}.{minor})"
     try:
+        import re as _re
         import triton
-        version = tuple(int(x) for x in triton.__version__.split(".")[:2])
+        # Leading major.minor digits, so "3.4rc1" and "3.6.0+git" both parse.
+        _match = _re.match(r"(\d+)\.(\d+)", triton.__version__)
+        version = (int(_match.group(1)), int(_match.group(2))) if _match else None
     except Exception:
         version = None
     if version is None or version < _MAMBA_SM75_MIN_TRITON:
@@ -1765,6 +1768,9 @@ def patch_lazy_load_kernel_local_packages():
             if submodule is not None:
                 # Import ssd_combined so a broken install falls back to None, not a mid-forward crash.
                 importlib.import_module(f"{package}.{submodule}")
+            if package == "mamba_ssm":
+                # A first import here was never trimmed by patch_mamba_ssm_pre_ampere_fallback.
+                _retrim_mamba_ssm_autotune()
             return module
         except Exception as e:
             logger.info(f"Unsloth: local {package} unusable for kernel {kernel_name}: {e}")

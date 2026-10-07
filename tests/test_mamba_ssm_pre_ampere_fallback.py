@@ -599,7 +599,7 @@ def test_registered_as_a_temporary_patch():
 # Triton 3.4+ compiles mamba_ssm's kernels on sm_75 (T4), so the slow path is
 # only forced there on an older Triton.
 
-@pytest.mark.parametrize("version", ["3.4.0", "3.5.1", "3.6.0", "3.10.0", "4.0.0+git1234"])
+@pytest.mark.parametrize("version", ["3.4.0", "3.4rc1", "3.5.1", "3.6.0", "3.10.0", "4.0.0+git1234"])
 def test_t4_with_a_new_triton_keeps_fast_path(env, monkeypatch, capsys, version):
     model_mod, iu, hk = env
     _set_triton(monkeypatch, version)
@@ -622,7 +622,7 @@ def test_t4_fast_path_takes_mamba_ssm_from_the_local_package(env, monkeypatch):
         assert name in hk._HUB_KERNEL_MAPPING
 
 
-@pytest.mark.parametrize("version", ["3.2.0", "3.3.1", None])
+@pytest.mark.parametrize("version", ["3.2.0", "3.3.1", "3.3rc2", None])
 def test_t4_with_an_old_or_missing_triton_falls_back(env, monkeypatch, capsys, version):
     model_mod, iu, _hk = env
     _set_triton(monkeypatch, version)
@@ -771,6 +771,17 @@ def test_every_ssd_chunk_scan_reload_is_followed_by_a_retrim():
     assert len(reloads) == 2
     for i in reloads:
         assert "_retrim_mamba_ssm_autotune()" in "\n".join(lines[i + 1:i + 4]), lines[i]
+
+
+def test_a_late_local_mamba_ssm_import_is_trimmed_too():
+    """transformers 5's local-kernel fallback may import mamba_ssm after the patch ran."""
+    seg = None
+    for node in ast.parse(_SRC).body:
+        if isinstance(node, ast.FunctionDef) and node.name == "patch_lazy_load_kernel_local_packages":
+            seg = ast.get_source_segment(_SRC, node)
+    assert seg is not None
+    local = seg[seg.index("def _import_local"):seg.index("def lazy_load_kernel")]
+    assert "_retrim_mamba_ssm_autotune()" in local
 
 
 # Keep last: it checks what the `env` fixture left behind after teardown.
