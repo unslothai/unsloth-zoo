@@ -10667,6 +10667,11 @@ def _no_decay_names(model):
     return names
 
 
+def _optimizer_states(optimizers):
+    # Each of `MLXDecisionTrainer._optimizers` under the name its state has in a checkpoint.
+    return [(f"{'encoder' if encoder else 'head'}_{'decay' if decay else 'plain'}", optimizer) for (encoder, decay), (_, optimizer) in optimizers.items()]
+
+
 _EvalPrediction = collections.namedtuple("EvalPrediction", ["predictions", "label_ids"])
 _PredictionOutput = collections.namedtuple("PredictionOutput", ["predictions", "label_ids", "metrics"])
 
@@ -10864,7 +10869,59 @@ class MLXDecisionTrainer:
         self._event("on_predict", metrics = metrics)
         return _PredictionOutput(predictions, labels, metrics)
 
-    def train(self):
+    def _save_checkpoint(self, optimizers):
+        import shutil
+        import tempfile
+
+        from .decision import save_trainable
+
+        state, args = self.state, self.args
+        folder = Path(args.output_dir) / f"checkpoint-{state.global_step}"
+        if folder.exists() and not (folder / "trainer_state.json").is_file():
+            raise ValueError(f"Unsloth: {folder} exists and is not a training checkpoint, so it is not replaced; train into another output_dir.")
+        folder.parent.mkdir(parents = True, exist_ok = True)
+        # Written beside under a name of its own and renamed, so that an interrupted save leaves nothing that looks like a checkpoint.
+        staging = Path(tempfile.mkdtemp(dir = folder.parent, prefix = f".{folder.name}-"))
+        try:
+            getattr(self.model, "save_checkpoint", lambda folder: save_trainable(self.model, folder))(staging)
+            moments = {f"{group}.{name}": value for group, optimizer in _optimizer_states(optimizers) for name, value in tree_flatten(optimizer.state)}
+            mx.save_safetensors(str(staging / "optimizer_state.safetensors"), moments)
+            if state.best_global_step == state.global_step:
+                state.best_model_checkpoint = str(folder)
+            (staging / "trainer_state.json").write_text(json.dumps(asdict(state), indent = 2, default = float), encoding = "utf-8")
+            # This step's checkpoint from the run that was resumed, if it got this far.
+            shutil.rmtree(folder, ignore_errors = True)
+            os.replace(staging, folder)
+        finally:
+            shutil.rmtree(staging, ignore_errors = True)
+        best = state.best_model_checkpoint
+        _prune_stale_checkpoints(args.output_dir, args.save_total_limit, keep_step = int(best.rpartition("-")[2]) if best else None)
+        self._event("on_save")
+
+    def _load_model(self, folder):
+        from .decision import load_trainable
+
+        getattr(self.model, "load_checkpoint", lambda folder: load_trainable(self.model, folder))(folder)
+
+    def _resume(self, folder, optimizers):
+        """Put the model, the optimizers and the progress of the checkpoint in `folder` back; `True` means the newest in `output_dir`."""
+        if folder is True:
+            found = [item for item in Path(self.args.output_dir).glob("checkpoint-*") if (item / "trainer_state.json").is_file()]
+            folder = max(found, key = lambda item: int(item.name.rpartition("-")[2]), default = None)
+        if folder is None or not (Path(folder) / "trainer_state.json").is_file():
+            raise ValueError(f"Unsloth: no checkpoint to resume from in {folder or self.args.output_dir}: it needs trainer_state.json.")
+        folder = Path(folder)
+        self._load_model(folder)
+        saved = json.loads((folder / "trainer_state.json").read_text(encoding = "utf-8"))
+        for name in ("global_step", "epoch", "log_history", "best_metric", "best_global_step", "best_model_checkpoint"):
+            setattr(self.state, name, saved[name])
+        moments = mx.load(str(folder / "optimizer_state.safetensors"))
+        for group, optimizer in _optimizer_states(optimizers):
+            optimizer.state = tree_unflatten([(name[len(group) + 1 :], value) for name, value in moments.items() if name.startswith(group + ".")])
+        # Dropout draws are not replayed: a resumed run draws from the seed and the step it resumes at.
+        mx.random.seed(self.args.seed + self.state.global_step)
+
+    def train(self, resume_from_checkpoint = None):
         # MLX caches freed buffers by size, so every distinct batch shape leaves its working set in the cache: tens of
         # gigabytes over a run. With args.cache_limit_gb unset the cache may hold what a step has needed so far,
         # which is all the next step can reuse; a value <= 0 or args.disable_memory_limits leaves the limit alone.
@@ -10886,7 +10943,7 @@ class MLXDecisionTrainer:
             MLXTrainer._setup_report_to_callbacks(reporters)
             self._report_to = reporters._report_to_callbacks
             with getattr(self.model, "training_run", contextlib.nullcontext)():
-                return self._train()
+                return self._train(resume_from_checkpoint)
         finally:
             self._report_to = (None, None)
             for handle, close in zip(reporters._report_to_handles, ("finish", "close")):
@@ -10907,7 +10964,7 @@ class MLXDecisionTrainer:
         rng.shuffle(order)
         return self._batches(order, args.per_device_train_batch_size)
 
-    def _train(self):
+    def _train(self, resume = None):
         args, model, items = self.args, self.model, self.train_dataset
         batch_size, accumulation = args.per_device_train_batch_size, max(1, args.gradient_accumulation_steps)
         steps_per_epoch = math.ceil(len(self._epoch_batches(0)) / accumulation)
@@ -10919,6 +10976,12 @@ class MLXDecisionTrainer:
         eval_strategy = "no" if not self.eval_dataset else self._strategy("eval_strategy", "steps" if eval_steps else "epoch")
         eval_steps, eval_delay = eval_steps or logging_steps, getattr(args, "eval_delay", 0) or 0
         logging_strategy = self._strategy("logging_strategy", "steps")
+        save_steps = _resolve_interval_steps(getattr(args, "save_steps", 0), max_steps)
+        save_strategy = self._strategy("save_strategy", "steps" if save_steps else "no")
+        # As transformers requires: the best evaluation has to be of a state that was also saved.
+        aligned = save_strategy == eval_strategy != "no" and (save_strategy != "steps" or eval_steps and save_steps % eval_steps == 0)
+        if getattr(args, "load_best_model_at_end", False) and not aligned:
+            raise ValueError("Unsloth: load_best_model_at_end needs eval_strategy and save_strategy to match, with save_steps a multiple of eval_steps.")
 
         compiled = getattr(args, "compile", True) and getattr(args, "compile_mode", None) != "eager"
         step = self._step(compiled)
@@ -10939,13 +11002,19 @@ class MLXDecisionTrainer:
             self._log(logs)
 
         final_evaluation = _default_flow_evaluates_final_step()
+        epoch = skipped = saved_step = 0
+        if resume:
+            self._resume(resume, optimizers)
+            (epoch, skipped), saved_step = divmod(state.global_step, steps_per_epoch), state.global_step
+        ran = state.global_step
         self._event("on_train_begin")
-        epoch = 0
         while state.global_step < max_steps and not self.control.should_training_stop:
             batches = self._epoch_batches(epoch)
             self._event("on_epoch_begin")
             accumulated, losses = None, []
             for index, batch in enumerate(batches):
+                if index < skipped * accumulation:
+                    continue
                 rows = [items[i] for i in batch]
                 if self._permute:
                     # Drawn from the seed, the epoch and the record, so a resumed run encodes a record as this one does.
@@ -10987,21 +11056,33 @@ class MLXDecisionTrainer:
                 at_interval = eval_steps and state.global_step % eval_steps == 0 or final_evaluation and state.global_step >= max_steps
                 if eval_strategy == "steps" and at_interval and eval_delay <= state.global_step:
                     self.evaluate()
+                # As transformers does, a run that saves at all also saves its last step.
+                last = save_strategy != "no" and state.global_step >= max_steps
+                # An evaluation that may be loaded back as the best is saved even between intervals.
+                best = getattr(args, "load_best_model_at_end", False) and state.best_global_step == state.global_step
+                if save_strategy == "steps" and (best or save_steps and state.global_step % save_steps == 0) or last and save_strategy != "epoch":
+                    self._save_checkpoint(optimizers)
+                    saved_step = state.global_step
                 if state.global_step >= max_steps or self.control.should_training_stop:
                     break
-            epoch += 1
+            epoch, skipped = epoch + 1, 0
             self._event("on_epoch_end")
             if logging_strategy == "epoch" and logged_steps:
                 log()
             if eval_strategy == "epoch" and eval_delay <= state.epoch:
                 self.evaluate()
+            if save_strategy == "epoch" and saved_step != state.global_step:
+                self._save_checkpoint(optimizers)
+
+        if getattr(args, "load_best_model_at_end", False) and state.best_model_checkpoint:
+            self._load_model(state.best_model_checkpoint)
 
         runtime = time.time() - started
         metrics = {
             "train_runtime": runtime,
             "train_steps": state.global_step,
             "train_steps_per_second": state.global_step / runtime if runtime else 0.0,
-            "train_loss": total_loss / max(1, state.global_step),
+            "train_loss": total_loss / max(1, state.global_step - ran),
             "epoch": state.epoch,
         }
         self._log(metrics)

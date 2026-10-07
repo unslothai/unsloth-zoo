@@ -1551,9 +1551,13 @@ def _apart(folder, source):
     return folder, source
 
 
-def _clef_head(pipeline, config):
-    """The joint head's tensors as they are saved; `config`'s `head_temperature` is folded into them when they can absorb it."""
+def _clef_head(pipeline, config, exact = False):
+    """The joint head's tensors as they are saved; `config`'s `head_temperature` is folded into them when they can absorb it.
+
+    `exact` is for a checkpoint training resumes from: float32, with nothing folded in."""
     head = dict(tree_flatten(pipeline.head.parameters()))
+    if exact:
+        return {name: value.astype(mx.float32) for name, value in head.items()}
     temperature = float(config.pop("head_temperature", 1.0))
     if temperature != 1.0:
         if _fold_temperature(head, temperature):
@@ -1653,11 +1657,12 @@ def save_clef_model(pipeline, folder, source, config = None):
         shutil.rmtree(staging, ignore_errors = True)
 
 
-def save_clef_adapter(pipeline, folder, source, base_model, base_revision = None, config = None):
+def save_clef_adapter(pipeline, folder, source, base_model, base_revision = None, config = None, exact = False):
     """Write a Clef trained through LoRA adapters as those adapters beside its joint head, as PEFT stores them.
 
     `source` is the checkpoint the decoder was loaded from and `base_model` the name that checkpoint is loaded by (a
     repo id or a folder), which `load_decision_model` puts the adapters back on. `config` is as for `save_clef_model`.
+    `exact` keeps the head in float32 with no temperature folded in, for a checkpoint training resumes from.
     """
     (folder, source), decoder, stored = _apart(folder, source), pipeline.model, _stored_tensors(source)
     adapters = [(path, module) for path, module in decoder.named_modules() if "lora_a" in module]
@@ -1679,7 +1684,7 @@ def save_clef_adapter(pipeline, folder, source, base_model, base_revision = None
         "target_modules": sorted({path.rsplit(".", 1)[-1] for path, _ in adapters}),
     }
     config = {"layout": "clef", "temperature": [1.0, 1.0, 1.0], **(config or {}), "fine_tuned": True, "base_model": str(base_model)}
-    head = _clef_head(pipeline, config)
+    head = _clef_head(pipeline, config, exact)
     folder.mkdir(parents = True, exist_ok = True)
     staging = Path(tempfile.mkdtemp(dir = folder, prefix = ".saving-"))
     try:
@@ -1969,13 +1974,56 @@ def _decoder_training(model, gradient_checkpointing = True):
         release_mlx_training_patches()
 
 
-class ClefNetwork(nn.Module):
-    """A loaded Clef pipeline's decoder (`encoder`) and joint head as the one parameter tree the trainer optimizes."""
+def save_trainable(model, folder):
+    """Write `model`'s trainable parameters to `folder`, for training to resume from."""
+    Path(folder).mkdir(parents = True, exist_ok = True)
+    mx.save_safetensors(str(Path(folder) / _TRAINABLE), dict(tree_flatten(model.trainable_parameters())))
 
-    def __init__(self, pipeline, gradient_checkpointing = True):
+
+def load_trainable(model, folder):
+    model.update(tree_unflatten(list(mx.load(str(Path(folder) / _TRAINABLE)).items())))
+    mx.eval(model.parameters())
+
+
+_TRAINABLE = "trainable.safetensors"
+
+
+class ClefNetwork(nn.Module):
+    """A loaded Clef pipeline's decoder (`encoder`) and joint head as the one parameter tree the trainer optimizes.
+
+    `origin` is `(source, base_model, base_revision, config)` as `save_clef_adapter` takes them. With it, a checkpoint
+    of a LoRA Clef is those adapters and the head, which `load_decision_model` loads; without it, or for a full
+    fine-tune, a checkpoint holds the trainable parameters alone.
+    """
+
+    def __init__(self, pipeline, gradient_checkpointing = True, origin = None):
         super().__init__()
         self.encoder, self.head = pipeline.model, pipeline.head
-        self._pipeline, self._gradient_checkpointing = pipeline, bool(gradient_checkpointing)
+        self._pipeline, self._gradient_checkpointing, self._origin = pipeline, bool(gradient_checkpointing), origin
+
+    def _adapters(self):
+        return [(path, module) for path, module in self.encoder.named_modules() if "lora_a" in module]
+
+    def save_checkpoint(self, folder):
+        whole = [path for path, _ in tree_flatten(self.encoder.trainable_parameters()) if path.rsplit(".", 1)[-1] not in ("lora_a", "lora_b")]
+        if self._origin is None or whole or not self._adapters():
+            return save_trainable(self, folder)
+        source, base_model, revision, config = self._origin
+        save_clef_adapter(self._pipeline, folder, source, base_model, revision, dict(config or {}), exact = True)
+
+    def load_checkpoint(self, folder):
+        folder = Path(folder)
+        if not (folder / "adapter_model.safetensors").is_file():
+            return load_trainable(self, folder)
+        if self._origin is None:
+            raise ValueError(f"Unsloth: {folder} holds LoRA adapters, which resume on a Clef loaded with the checkpoint they were trained on.")
+        adapter, stored = mx.load(str(folder / "adapter_model.safetensors")), _stored_tensors(Path(self._origin[0]))
+        for path, module in self._adapters():
+            stem = "base_model.model." + _decoder_tensor_name(self.encoder, f"{path}.weight", stored)[: -len(".weight")]
+            module.lora_a, module.lora_b = adapter[f"{stem}.lora_A.weight"].T, adapter[f"{stem}.lora_B.weight"].T
+        head = mx.load(str(folder / "joint_head.safetensors"))
+        self.head.update(tree_unflatten([(name, value.astype(mx.float32)) for name, value in head.items()]))
+        mx.eval(self.parameters())
 
     def training_run(self):
         return _decoder_training(self.encoder, self._gradient_checkpointing)
@@ -2024,13 +2072,14 @@ class ClefNetwork(nn.Module):
 
 
 def clef_training_network(
-    pipeline, full_finetuning = False, r = 64, lora_alpha = 64, target_modules = "all-linear", gradient_checkpointing = True, **lora
+    pipeline, full_finetuning = False, r = 64, lora_alpha = 64, target_modules = "all-linear", gradient_checkpointing = True, origin = None, **lora
 ):
     """Prepare a loaded Clef pipeline for training and return its `ClefNetwork`.
 
     The float32 joint head always trains. The decoder trains whole under `full_finetuning`, otherwise through LoRA
     adapters (`lora` is passed to `FastMLXModel.get_peft_model`); `"all-linear"` means its language layers' projections.
     A Clef loaded from adapters keeps training those, whatever `r`, `lora_alpha` and `target_modules` say.
+    `origin` is the network's: what lets its checkpoints be written as loadable Clef adapters.
     """
     from .loader import FastMLXModel
     from .utils import _get_text_model, describe_output_head
@@ -2058,7 +2107,7 @@ def clef_training_network(
             pipeline.model, r = r, lora_alpha = lora_alpha, target_modules = target_modules, use_gradient_checkpointing = False, **lora,
         )
     pipeline.head.unfreeze()
-    network = ClefNetwork(pipeline, gradient_checkpointing)
+    network = ClefNetwork(pipeline, gradient_checkpointing, origin)
     network.train()
     return network
 

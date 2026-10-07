@@ -1014,6 +1014,65 @@ def test_trainer_steps_logs_and_separates_learning_rates(checkpoint, encoder_lr,
     assert changed == {name for name, _ in tree_flatten(model.trainable_parameters()) if name.startswith("encoder.") == (encoder_lr > 0)}
 
 
+def test_a_clef_run_resumed_from_a_checkpoint_ends_where_the_uninterrupted_run_does(clef, tmp_path):
+    base, items = tmp_path / "base", [clef[2](text) for text in ("hello", "a longer state", "x", "yes or no")]
+    base.mkdir()
+    mx.save_safetensors(str(base / "model.safetensors"), _clef_checkpoint_tensors(_decoder()))
+    (base / "tokenizer.json").write_text("{}"), (base / "config.json").write_text("{}")
+
+    def run(output, resume = None):
+        mx.random.seed(3)
+        network = clef_training_network(load_decision_model(tmp_path), r = 4, lora_alpha = 4, origin = (base, "org/base", None, {"head_temperature": 2.0}))
+        args = _config(output_dir = str(output), gradient_accumulation_steps = 1, save_steps = 1, save_total_limit = 2, learning_rate = 1e-2)
+        trainer = MLXDecisionTrainer(network, args, items, items)
+        trainer.train(resume_from_checkpoint = resume)
+        return trainer, network
+
+    (whole, network), out = run(tmp_path / "whole"), tmp_path / "part"
+    assert sorted(item.name for item in (tmp_path / "whole").iterdir()) == ["checkpoint-3", "checkpoint-4"]
+    # The third of four steps is the first of the second epoch, so the resumed run starts inside an epoch.
+    shutil.copytree(tmp_path / "whole" / "checkpoint-3", out / "checkpoint-3")
+    (out / "checkpoint-9").mkdir()
+    resumed, again = run(out, True)
+    assert resumed.state.global_step == 4 and sorted(item.name for item in out.iterdir()) == ["checkpoint-4", "checkpoint-9"] and [log["step"] for log in resumed.state.log_history] == [log["step"] for log in whole.state.log_history]
+    assert [log for log in resumed.state.log_history if log["step"] < 4] == [log for log in whole.state.log_history if log["step"] < 4]
+    for (name, value), (_, other) in zip(tree_flatten(network.trainable_parameters()), tree_flatten(again.trainable_parameters()), strict = True):
+        # Not bitwise: Metal's results move in the fourth digit when the GPU is shared.
+        np.testing.assert_allclose(np.array(other.astype(mx.float32)), np.array(value.astype(mx.float32)), atol = 2e-3, err_msg = name)
+    # A checkpoint is the adapters and the head as they are, which also loads to serve.
+    saved, record = out / "checkpoint-4", items[0]
+    assert json.loads((saved / "unsloth_decision_config.json").read_text())["head_temperature"] == 2.0
+    assert all(value.dtype == mx.float32 for value in mx.load(str(saved / "joint_head.safetensors")).values())
+    args = record["input_ids"], record["question_spans"], record["option_spans"], record["types"]
+    np.testing.assert_allclose(np.array(load_decision_model(saved, base_model = base).logits(*args)), np.array(again._pipeline.logits(*args)), atol = 3e-2)
+    with pytest.raises(ValueError, match = "trainer_state.json"):
+        run(tmp_path / "none", True)
+    (tmp_path / "none" / "checkpoint-1").mkdir(parents = True)
+    with pytest.raises(ValueError, match = "is not replaced"):
+        run(tmp_path / "none")
+
+
+def test_trainer_keeps_and_returns_to_its_best_checkpoint(checkpoint, tmp_path):
+    model, scores = add_lora_adapters(load_trainable_decision_model(checkpoint[1]), r = 4), iter([3.0, 1.0, 2.0])
+    args = _config(output_dir = str(tmp_path), num_train_epochs = 3, save_total_limit = 1, load_best_model_at_end = True, metric_for_best_model = "score", greater_is_better = True)
+    args.eval_strategy = args.save_strategy = "epoch"
+    build = lambda: MLXDecisionTrainer(model, args, _items(), _items(), compute_metrics = lambda prediction: {"score": next(scores)})
+    trainer = build()
+    trainer.train()
+    # The first epoch scored best: its checkpoint outlives the limit beside the newest, and the model ends as it was then.
+    assert sorted(item.name for item in tmp_path.iterdir()) == ["checkpoint-2", "checkpoint-6"] and trainer.state.best_model_checkpoint == str(tmp_path / "checkpoint-2")
+    best = mx.load(str(tmp_path / "checkpoint-2" / "trainable.safetensors"))
+    assert all(mx.array_equal(value, best[name]).item() for name, value in tree_flatten(model.trainable_parameters())) and len(best) > 4
+    # Saved every step but evaluated every epoch, the best evaluation could be of a state no checkpoint holds.
+    args.save_strategy, args.save_steps = "steps", 1
+    with pytest.raises(ValueError, match = "load_best_model_at_end needs"):
+        MLXDecisionTrainer(model, args, _items(), _items()).train()
+    # Evaluated every step and saved every other: the best step is saved although it is off the interval.
+    args.eval_strategy, args.eval_steps, args.save_steps, args.output_dir, scores = "steps", 1, 2, str(tmp_path / "steps"), iter([3.0, 1.0, 2.0, 2.0, 2.0, 2.0])
+    build().train()
+    assert sorted(item.name for item in (tmp_path / "steps").iterdir()) == ["checkpoint-1", "checkpoint-6"]
+
+
 def test_trainer_takes_datasets_and_fractional_intervals(checkpoint):
     from datasets import Dataset
 
