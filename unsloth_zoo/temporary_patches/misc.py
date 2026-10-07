@@ -1346,8 +1346,11 @@ def _mamba_ssm_fast_path_blocker(capability):
 pass
 
 
-def _single_mamba_ssm_autotune_config():
+def _single_mamba_ssm_autotune_config(extra_packages = ()):
     """Keep one autotune config per mamba_ssm Triton kernel; returns how many were cut.
+
+    `extra_packages` names other packages to trim too, such as a mamba-ssm Hub
+    kernel that transformers 5 already resolved.
 
     Below sm_80 every config is compiled before the first step: about 200 in
     fp16, which took 6 to 9 minutes on a Kaggle T4 versus 20 to 50 seconds
@@ -1366,9 +1369,10 @@ def _single_mamba_ssm_autotune_config():
             if key.startswith("BLOCK_SIZE_"):
                 cost *= value
         return cost
+    prefixes = ("mamba_ssm.ops.triton.",) + tuple(f"{p}." for p in extra_packages)
     pruned = 0
     for name, module in list(sys.modules.items()):
-        if module is None or not name.startswith("mamba_ssm.ops.triton."):
+        if module is None or not (name.startswith(prefixes) or name in extra_packages):
             continue
         for obj in list(module.__dict__.values()):
             if isinstance(obj, Autotuner) and len(getattr(obj, "configs", ())) > 1:
@@ -1432,9 +1436,15 @@ def patch_mamba_ssm_pre_ampere_fallback():
             # (patch_lazy_load_kernel_local_packages) or the slow path.
             # falcon_mamba-ssm stays: Falcon-Mamba's Mamba-1 kernels are CUDA,
             # not autotuned Triton, and it has no local fallback.
+            # A Hub module resolved before this point may already be bound
+            # into an imported modeling module, so it is trimmed as well.
+            _hub_packages = ()
             try:
                 from transformers.integrations import hub_kernels as _hk
                 _hk._HUB_KERNEL_MAPPING.pop("mamba-ssm", None)
+                _resolved = _hk._KERNEL_MODULE_MAPPING.get("mamba-ssm", None)
+                if isinstance(getattr(_resolved, "__name__", None), str):
+                    _hub_packages = (_resolved.__name__,)
                 if "mamba-ssm" in _hk._KERNEL_MODULE_MAPPING:
                     _hk._KERNEL_MODULE_MAPPING["mamba-ssm"] = None
             except Exception:
@@ -1442,9 +1452,9 @@ def patch_mamba_ssm_pre_ampere_fallback():
             # `import mamba_ssm` loads every ssd kernel module.
             try:
                 import mamba_ssm  # noqa: F401
-                _single_mamba_ssm_autotune_config()
             except Exception:
                 pass
+            _single_mamba_ssm_autotune_config(_hub_packages)
         return  # Ampere or newer, or a Triton that compiles the kernels on sm_75
 
     import sys

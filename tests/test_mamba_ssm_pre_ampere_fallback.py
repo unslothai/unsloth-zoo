@@ -784,6 +784,22 @@ def test_a_late_local_mamba_ssm_import_is_trimmed_too():
     assert "_retrim_mamba_ssm_autotune()" in local
 
 
+def test_an_already_resolved_hub_kernel_is_trimmed_too(env, monkeypatch):
+    """A Hub module bound into a modeling module before the patch keeps running,
+    so its autotuners are trimmed alongside the local package's."""
+    _model_mod, _iu, hk = env
+    local_kernel, local_cheapest = _autotuned_mamba_module(monkeypatch)
+    hub_name = "kernels_hub_mamba_ssm_abc123"
+    hub_pkg = types.ModuleType(hub_name)
+    hk._KERNEL_MODULE_MAPPING["mamba-ssm"] = hub_pkg
+    monkeypatch.setitem(sys.modules, hub_name, hub_pkg)
+    hub_kernel, hub_cheapest = _autotuned_mamba_module(monkeypatch, mod_name = f"{hub_name}.ops.triton.ssd_chunk_scan")
+    assert patch() is None
+    assert local_kernel.configs == [local_cheapest]
+    assert hub_kernel.configs == [hub_cheapest]
+    assert hk._KERNEL_MODULE_MAPPING["mamba-ssm"] is None
+
+
 # Keep last: it checks what the `env` fixture left behind after teardown.
 def test_the_fixture_leaves_no_stub_bound_on_transformers_utils():
     """The stub must not outlive the fixture. `import a.b.c as x` goes through
