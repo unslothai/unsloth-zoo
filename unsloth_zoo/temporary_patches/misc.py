@@ -1305,29 +1305,19 @@ pass
 TEMPORARY_PATCHES.append(patch_causal_conv1d_cuda_probe)
 
 
-# Oldest Triton that compiles mamba_ssm's Mamba-2 kernels on sm_75. Measured on
-# a Kaggle T4 with mamba_ssm 2.3.1: Triton 3.2 (torch 2.6) fails the fp32 chunk
-# scan with `IndexError: map::at`, Triton 3.3 (torch 2.7) fails the fp16 one
-# with `PassManager::run failed`, and 3.4 through 3.6 compile and train.
+# Kaggle T4, mamba_ssm 2.3.1: Triton 3.2 fails (`map::at`), 3.3 fails (`PassManager::run failed`), 3.4-3.6 train.
 _MAMBA_SM75_MIN_TRITON = (3, 4)
 
 
 def _weakest_cuda_capability():
-    """The lowest compute capability among the visible GPUs.
-
-    A model can be split across every visible GPU, so the fast path has to
-    work on the weakest one, not just the current device.
-    """
+    """Lowest capability across visible GPUs: a model can be split over all of them."""
     count = torch.cuda.device_count() if hasattr(torch.cuda, "device_count") else 1
     return min(tuple(torch.cuda.get_device_capability(i)) for i in range(max(count, 1)))
 pass
 
 
 def _mamba_ssm_fast_path_blocker(capability):
-    """None if mamba_ssm's Triton kernels can run on this GPU, else the reason.
-
-    UNSLOTH_MAMBA_PRE_AMPERE_FAST=1 / 0 forces the answer below sm_80.
-    """
+    """None if mamba_ssm's Triton kernels can run, else why. UNSLOTH_MAMBA_PRE_AMPERE_FAST=1/0 forces it below sm_80."""
     if tuple(capability) >= (8, 0):
         return None
     major, minor = capability
@@ -1341,7 +1331,6 @@ def _mamba_ssm_fast_path_blocker(capability):
     try:
         import re as _re
         import triton
-        # Leading major.minor digits, so "3.4rc1" and "3.6.0+git" both parse.
         _match = _re.match(r"(\d+)\.(\d+)", triton.__version__)
         version = (int(_match.group(1)), int(_match.group(2))) if _match else None
     except Exception:
@@ -1358,16 +1347,10 @@ pass
 
 
 def _single_mamba_ssm_autotune_config(extra_packages = ()):
-    """Keep one autotune config per mamba_ssm Triton kernel; returns how many were cut.
+    """Keep one autotune config per mamba_ssm kernel (and per kernel in `extra_packages`).
 
-    `extra_packages` names other packages to trim too, such as a mamba-ssm Hub
-    kernel that transformers 5 already resolved.
-
-    Below sm_80 every config is compiled before the first step: about 200 in
-    fp16, which took 6 to 9 minutes on a Kaggle T4 versus 20 to 50 seconds
-    for one each, at the same warm step time. The kept config is the one
-    mamba_ssm's own deterministic mode keeps (smallest block product times
-    stages), which also needs the least shared memory.
+    Compiling every config before step 1 takes minutes on a T4. Keeps the config
+    mamba_ssm's deterministic mode picks: least shared memory.
     """
     import sys
     try:
@@ -1397,11 +1380,7 @@ pass
 
 
 def _retrim_mamba_ssm_autotune():
-    """Trim again after a reload recreated the autotuners with every config.
-
-    fix_mamba_ssm_float32 reloads ssd_chunk_scan after this pass's trim, and on
-    the trust_remote_code path no later pass trims again.
-    """
+    """Re-trim after fix_mamba_ssm_float32 reloads ssd_chunk_scan (trust_remote_code has no later pass)."""
     try:
         if not torch.cuda.is_available() or getattr(torch.version, "hip", None) is not None:
             return 0
@@ -1417,17 +1396,10 @@ pass
 def patch_mamba_ssm_pre_ampere_fallback():
     """Force the Mamba slow path where mamba_ssm's Triton kernels cannot compile.
 
-    On a T4 with Triton older than 3.4 the package imports fine and
-    `is_fast_path_available` is True, so transformers routes into
-    `cuda_kernels_forward` and Triton only fails once training starts, with an
-    opaque `RuntimeError: PassManager::run failed`. Triton 3.4+ compiles the
-    kernels on sm_75, so there the fast path is kept, as on Ampere and newer.
-
-    `is_fast_path_available` is baked in at module import, so flip both the
-    availability predicates (for modules imported later) and the flag on
-    already-imported modules. A capability and version check rather than a
-    trial launch like the causal_conv1d probe above, which would pay a Triton
-    compile at every import just to watch it fail. Real NVIDIA CUDA only.
+    Below sm_80 with Triton < 3.4 the kernels fail only once training starts
+    (`PassManager::run failed`). `is_fast_path_available` is baked in at import,
+    so flip the predicates (later imports) and the flag (already imported).
+    A version check, not a trial compile at every import. Real NVIDIA CUDA only.
     """
     if not torch.cuda.is_available():
         return
@@ -1440,15 +1412,9 @@ def patch_mamba_ssm_pre_ampere_fallback():
     blocker = _mamba_ssm_fast_path_blocker((major, minor))
     if blocker is None:
         if (major, minor) < (8, 0):
-            # The fast path runs here, but full autotuning costs minutes of
-            # compiles before the first step, and only the local package can
-            # be trimmed. So transformers 5 must not fetch mamba-ssm from the
-            # Hub: without the entry it falls back to the local package
-            # (patch_lazy_load_kernel_local_packages) or the slow path.
-            # falcon_mamba-ssm stays: Falcon-Mamba's Mamba-1 kernels are CUDA,
-            # not autotuned Triton, and it has no local fallback.
-            # A Hub module resolved before this point may already be bound
-            # into an imported modeling module, so it is trimmed as well.
+            # Route mamba-ssm to the local package (patch_lazy_load_kernel_local_packages), which is trimmed.
+            # falcon_mamba-ssm stays: Mamba-1 CUDA kernels, nothing autotuned, no local fallback.
+            # An already-resolved Hub module may be bound into a modeling module: trim it too.
             _hub_packages = ()
             try:
                 from transformers.integrations import hub_kernels as _hk
@@ -1610,8 +1576,7 @@ def patch_mamba_ssm_pre_ampere_fallback():
         # phase, and can propagate an ImportError out of `import unsloth`.
         if not _mod.__dict__.get("is_fast_path_available", False):
             continue
-        # LFM2 and Qwen3-Next carry the same flag for causal_conv1d / fla
-        # alone; they never call mamba_ssm, so their fast path stays.
+        # LFM2 / Qwen3-Next derive this flag from causal_conv1d / fla only.
         if not any(_mod.__dict__.get(_sym, None) is not None for _sym in (
             "selective_state_update", "mamba_chunk_scan_combined",
             "mamba_split_conv1d_scan_combined", "selective_scan_fn", "mamba_inner_fn",
@@ -1790,7 +1755,6 @@ def patch_lazy_load_kernel_local_packages():
                 # Import ssd_combined so a broken install falls back to None, not a mid-forward crash.
                 importlib.import_module(f"{package}.{submodule}")
             if package == "mamba_ssm":
-                # A first import here was never trimmed by patch_mamba_ssm_pre_ampere_fallback.
                 _retrim_mamba_ssm_autotune()
             return module
         except Exception as e:
