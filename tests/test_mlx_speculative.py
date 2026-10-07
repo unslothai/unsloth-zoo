@@ -112,6 +112,7 @@ def test_a_round_must_clearly_beat_plain_decoding_at_its_running_step():
     for window in ((8, 80.0, 2.0), (1, 9.0)):
         controller.record_plain([RowState(controller.new_reply())], *window)
     assert controller.plain_cost[1].value == pytest.approx(1.0 + controller.cost_alpha)
+    assert (cold := DraftController(max_depth = 1, can_copy = False)).record_plain([RowState(cold.new_reply())], 1, 9.0) is None and not cold.plain_cost and (short := DraftController(max_depth = 0, can_copy = False, min_window = 1)).plan([RowState(short.new_reply())]).length == 3
 
 
 def test_controller_follows_cost_drift():
@@ -192,7 +193,7 @@ def test_copy_probe_displaces_a_winning_drafter():
 def test_plain_is_interrupted_only_by_a_worthwhile_copy():
     controller = DraftController(max_depth = 0, max_copy = 16)
     state = [RowState(controller.new_reply(), can_draft = False)]
-    controller.record_plain(state, 1, 1.0)
+    controller.record_plain(state, 1, 1.0, 1.0)
     assert not controller.interrupts_plain(state)
     state[0].copy_available = 16
     for width, seconds in ((2, 1.1), (17, 4.0)):
@@ -266,7 +267,7 @@ def test_rows_switch_to_drafting_together():
         state.stats.copy.value = 1.0
         state.stats.draft = [_Ema(1.0) for _ in range(4)]
         state.stats.probe_at = {"copy": 1 << 30, "draft": 1 << 30}
-    controller.record_plain(states, 1, 5.0)
+    controller.record_plain(states, 1, 5.0, 5.0)
     assert [row.source for row in controller.plan(states).rows] == ["draft", "draft"]
     states[1].stats.draft = [_Ema(0.0) for _ in range(4)]
     states[1].copy_available = 0

@@ -1644,7 +1644,7 @@ class _TextBatchSession:
         self._retire(uid)
         return state
 
-    def step(self) -> Iterator[GenerationEvent]:
+    def step(self, waiting = None) -> Iterator[GenerationEvent]:
         if not self._pending:
             return
         try:
@@ -3285,7 +3285,7 @@ class _VLMBatchSession:
         self._retire(uid)
         return state
 
-    def step(self) -> Iterator[GenerationEvent]:
+    def step(self, waiting = None) -> Iterator[GenerationEvent]:
         if not self._pending:
             return
         try:
@@ -3629,12 +3629,12 @@ class _SpeculativeBatchSession:
                 raise
         return state
 
-    def step(self) -> Iterator[GenerationEvent]:
+    def step(self, waiting = None) -> Iterator[GenerationEvent]:
         try:
             drawn, self._drawn = self._drawn, {}
             for row, (tokens, logprobs, finished) in drawn.items():
                 yield from self._consume(row, tokens, logprobs, finished)
-            for out in self.engine.step():
+            for out in self.engine.step(waiting):
                 state = self._pending.get(out.uid)
                 if state is not None:
                     state.draft_tokens, state.accepted_draft_tokens = out.draft_n, out.draft_n_accepted
@@ -3801,9 +3801,9 @@ class BatchStream:
         """
         return self._require_open().withdraw(row)
 
-    def step(self) -> list[GenerationEvent]:
-        """What the batch produced in one decode step."""
-        return list(self._require_open().step())
+    def step(self, waiting: Callable[[], bool] | None = None) -> list[GenerationEvent]:
+        """What the batch produced in one decode step; a speculative batch's many-token step ends once ``waiting()`` is true."""
+        return list(self._require_open().step(waiting))
 
     def close(self) -> None:
         """Release the batch and the generation lock. Safe to call twice."""

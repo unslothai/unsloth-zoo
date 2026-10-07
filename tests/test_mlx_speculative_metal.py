@@ -159,6 +159,8 @@ def test_single_row_matches_solo_decoding_across_rounds_and_windows(qwen, seed):
     (out,), drafted, _ = _run(model, ids[:1], 160, DraftController(max_depth = 0, max_copy = 16), sampling)
     assert drafted[0][0] > 0
     assert out == _solo(model, ids[0], 160, sampling)
+    (cut,), _, engine = _run(model, ids[:1], 40, DraftController(max_depth = 0), sampling, patch = lambda e: setattr(e, "step", lambda step = e.step, calls = __import__("itertools").count(1): step(lambda: next(calls) % 3 == 0)))
+    assert cut == out[:40] and engine.controller.plain_cost[1].count >= 10
     if seed is not None:
         # Uniform logits: a key that ignored the position would draw one token everywhere.
         assert len({_RowSampler(sampling)(mx.zeros((1, 4096)), position).item() for position in range(8)}) > 1
@@ -171,6 +173,10 @@ def test_ragged_rounds_match_each_row_decoded_alone(qwen):
     out, drafted, _ = _run(model, [ids[0], ids[1], ids[0], ids[0]], 128, _rounds_only(), SamplingParams(), processors = {2: [ban], 3: [_presence()]})
     assert drafted[0][0] > 0 and drafted[2][0] == 0 and drafted[3][1] > 0
     assert out == [_solo(model, ids[0], 128, SamplingParams()), _solo(model, ids[1], 128, SamplingParams()), *(_solo(model, ids[0], 128, SamplingParams(), [fn]) for fn in (ban, _presence()))]
+    (window := _script(("plain", 16))).interrupts_plain, seen = lambda rows: False, []
+    short = lambda e: setattr(e, "add", lambda row, add = e.add: add(__import__("dataclasses").replace(row, max_tokens = 3) if row.uid else row)) or setattr(e, "step", lambda step = e.step: seen.append(len(e._rows)) or step())
+    out, _, _ = _run(model, ids[:2], 12, window, SamplingParams(), patch = short)
+    assert seen == [2, 1] and out == [_solo(model, ids[0], 12, SamplingParams()), _solo(model, ids[1], 3, SamplingParams())]
 
 
 def test_verify_that_replaces_caches_is_refused_and_decoding_continues(qwen):

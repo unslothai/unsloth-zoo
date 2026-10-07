@@ -425,7 +425,7 @@ class DraftController:
             if any(row.source == "draft" for row in warmup):
                 return RoundPlan("round", rows = warmup, split = True)
         if bucket not in self.plain_cost:
-            return RoundPlan("plain", max(1, min(self.min_window, room)))
+            return RoundPlan("plain", max(1, min(max(self.min_window, 3), room)))  # long enough to time a running step
 
         rounds = {}
         for width in range(2, self.max_width + 1):
@@ -582,8 +582,8 @@ class DraftController:
         if steps <= 0:
             return
         bucket = _bucket(len(rows))
-        if step_seconds is not None or bucket not in self.plain_cost:
-            self.plain_cost.setdefault(bucket, _Ema()).update(seconds / steps if step_seconds is None else step_seconds, self.cost_alpha)
+        if step_seconds is not None:
+            self.plain_cost.setdefault(bucket, _Ema()).update(step_seconds, self.cost_alpha)
         for state in rows:
             state.stats.tokens += steps
         self.tokens += steps * len(rows)
@@ -916,7 +916,7 @@ class SpeculativeEngine:
         if self.drafter is not None:
             self.draft_cache = _split(self.draft_cache, keep)
 
-    def step(self) -> list[StepOutput]:
+    def step(self, waiting: Callable[[], bool] | None = None) -> list[StepOutput]:
         """One round or plain window, one output per row. Finished rows leave the engine."""
         if not self._rows:
             return []
@@ -928,7 +928,7 @@ class SpeculativeEngine:
             plan = RoundPlan("plain", self.controller.max_window if room is None else min(room, self.controller.max_window))
         emitted = self._round(plan, states) if plan.kind == "round" else None
         if emitted is None:
-            emitted = self._plain(max(1, plan.length), states)
+            emitted = self._plain(max(1, plan.length), states, waiting)
         out = [
             StepOutput(row.uid, tokens, row.finished, row.draft_n, row.draft_n_accepted, row.scores and row.scores[len(row.scores) - len(tokens) :])
             for row, tokens in zip(self._rows, emitted)
@@ -983,7 +983,7 @@ class SpeculativeEngine:
         out, transaction = self._verify_forward(self.lm, inputs, self.cache, **self._kwargs())
         return out.logits, self._hidden(out), transaction
 
-    def _plain(self, length: int, states: list[RowState]) -> list[list[int]]:
+    def _plain(self, length: int, states: list[RowState], waiting: Callable[[], bool] | None = None) -> list[list[int]]:
         rows = self._rows
         emitted = [[] for _ in rows]
         # A processor that reads more than the history needs each token taken before the next step.
@@ -994,7 +994,8 @@ class SpeculativeEngine:
         steps = 0
         while True:
             steps += 1
-            last = steps >= length or all(row.finished for row in rows)
+            # A finished row leaves only between steps, so it ends the window rather than ride it out.
+            last = steps >= length or any(row.finished for row in rows) or (waiting is not None and waiting())
             upcoming = None
             if not last and pipelined:
                 with mx.stream(self._stream):
