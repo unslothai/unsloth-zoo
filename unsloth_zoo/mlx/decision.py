@@ -1422,50 +1422,61 @@ def _add_in_slices(name, value, terms):
     return parts[0] if len(parts) == 1 else mx.concatenate(parts)
 
 
-def _decoder_tensor_name(decoder, path):
-    if "language_model" not in decoder:
-        return path
-    # A decoder inside a vision-language wrapper is stored under other names than it is loaded with.
-    for prefix, saved in (("language_model.model.", "model.language_model."), ("language_model.lm_head.", "lm_head.")):
-        if path.startswith(prefix):
-            return saved + path[len(prefix) :]
-    return None
+def _stored_tensors(source):
+    """(file, dtype, shape) of each tensor in a checkpoint folder, by name, read from the files' headers."""
+    stored = {}
+    for shard in sorted(Path(source).glob("model*.safetensors")):
+        with open(shard, "rb") as stream:
+            header = json.loads(stream.read(int.from_bytes(stream.read(8), "little")))
+        stored.update({name: (shard, entry["dtype"], tuple(entry["shape"])) for name, entry in header.items() if name != "__metadata__"})
+    return stored
+
+
+def _decoder_tensor_name(decoder, path, stored = ()):
+    name = path
+    if "language_model" in decoder:
+        # transformers stores a decoder inside a vision-language wrapper under other names than it is loaded with.
+        name = None
+        for prefix, saved in (("language_model.model.", "model.language_model."), ("language_model.lm_head.", "lm_head.")):
+            if path.startswith(prefix):
+                name = saved + path[len(prefix) :]
+    # An MLX conversion keeps the names its weights are loaded with.
+    return path if name not in stored and path in stored else name
 
 
 def _require_clef_source(decoder, source):
     # Saving adds what training changed to the source's own tensors, so each decoder weight needs its counterpart there.
-    stored = {name: value for shard in Path(source).glob("model*.safetensors") for name, value in mx.load(str(shard)).items()}
-    packed = any(name.endswith(".scales") for name in stored)
+    stored = _stored_tensors(source)
     weights = tree_flatten(decoder.parameters())
-    # A weight quantized on load keeps its name and rows but not its columns; its source must still be the float tensor.
     quantized = {path.rpartition(".")[0] for path, _ in weights if path.endswith(".scales")}
     for path, value in weights:
-        name, source_value = _decoder_tensor_name(decoder, path), None
-        if name is not None:
-            source_value = stored.get(name)
-        if name is None or path.rpartition(".")[0] in quantized and not path.endswith(".weight"):
-            fits = True
-        elif source_value is None:
-            fits = False
-        elif path.rpartition(".")[0] in quantized:
-            fits = mx.issubdtype(source_value.dtype, mx.floating) and source_value.shape[0] == value.shape[0]
+        name, stem = _decoder_tensor_name(decoder, path, stored), path.rpartition(".")[0]
+        if name is None or stem in quantized and not path.endswith(".weight"):
+            continue
+        _, dtype, shape = stored.get(name) or (None, "", ())
+        if stem in quantized and "F" in dtype:
+            # Quantized on load: the weight keeps its name and rows but not its columns.
+            fits = shape[0] == value.shape[0]
         else:
-            fits = source_value.shape == (value.swapaxes(1, 2) if value.ndim == 3 else value).shape
-        if packed or not fits:
-            raise ValueError(f"Unsloth: {source} cannot be trained as a Clef here: its {path} is quantized or stored in another layout. Use the original float checkpoint.")
+            # transformers stores convolution kernels channels-first, an MLX conversion as they are loaded.
+            fits = shape in (value.shape, value.swapaxes(1, 2).shape if value.ndim == 3 else value.shape)
+        if not fits:
+            raise ValueError(f"Unsloth: {source} cannot be trained as a Clef here: it holds no tensor for the decoder's {path} in a layout MLX reads.")
 
 
 def _clef_decoder_deltas(decoder, source):
     """What training added to the decoder's weights, by checkpoint tensor name, as signed terms."""
+    stored = _stored_tensors(source)
+
     def name(path):
-        return _decoder_tensor_name(decoder, path)
+        return _decoder_tensor_name(decoder, path, stored)
 
     deltas = {}
     for path, module in decoder.named_modules():
         if "lora_a" in module:
-            if type(module).__name__ != "LoRALinear" or name(path) is None:
+            if type(module).__name__ != "LoRALinear" or name(f"{path}.weight") is None:
                 raise ValueError(f"Unsloth: the adapter on {path} cannot be merged into a Clef checkpoint.")
-            deltas[name(path) + ".weight"] = [(1, (module.scale * module.lora_b.T) @ module.lora_a.T)]
+            deltas[name(f"{path}.weight")] = [(1, (module.scale * module.lora_b.T) @ module.lora_a.T)]
     trained = [
         (path, value) for path, value in tree_flatten(decoder.trainable_parameters())
         if path.rsplit(".", 1)[-1] not in ("lora_a", "lora_b")
@@ -1485,8 +1496,9 @@ def _clef_decoder_deltas(decoder, source):
 def save_clef_model(pipeline, folder, source, config = None):
     """Write a trained Clef pipeline as a Clef checkpoint in `folder`, in the layout of the released models.
 
-    `source` is the checkpoint it was loaded from. LoRA adapters are merged into the source weights, so a quantized
-    training base still saves at the source precision; a full fine-tune adds what its weights moved by since loading. `config` becomes
+    `source` is the checkpoint it was loaded from. LoRA adapters are merged into the source weights, so a decoder
+    quantized on load still saves at the source precision, and a source that is itself MLX-quantized is requantized as
+    it was; a full fine-tune adds what its weights moved by since loading. `config` becomes
     `unsloth_decision_config.json`; its `head_temperature` is folded into the head when the head can absorb it.
     """
     folder, source = Path(folder), Path(source)
@@ -1494,7 +1506,28 @@ def save_clef_model(pipeline, folder, source, config = None):
         # The trained model is the source plus what training added, so the source has to stay as it was loaded.
         raise ValueError(f"Unsloth: a fine-tuned Clef cannot be saved over {source}, the checkpoint it was loaded from.")
     config = {"layout": "clef", "temperature": [1.0, 1.0, 1.0], **(config or {}), "fine_tuned": True}
-    deltas = _clef_decoder_deltas(pipeline.model, source)
+    deltas, stored, refitted = _clef_decoder_deltas(pipeline.model, source), _stored_tensors(source), {}
+    quantization = _read_json(source / "config.json").get("quantization", {})
+
+    def refit(stem, leaf, tensors):
+        # A weight the source holds quantized: dequantized, updated and quantized again as it was.
+        if stem not in refitted:
+            names = [f"{stem}.{part}" for part in ("weight", "scales", "biases") if f"{stem}.{part}" in stored]
+            parts = {name.rpartition(".")[2]: (tensors if name in tensors else mx.load(str(stored[name][0])))[name] for name in names}
+            delta = sum(sign * array for sign, array in deltas.pop(f"{stem}.weight"))
+            group, bits = delta.shape[1] // parts["scales"].shape[1], parts["weight"].shape[1] * 32 // delta.shape[1]
+            # A module quantized another way than the rest has an entry of its own, which MLX reads without the rest's.
+            own = quantization.get(stem)
+            mode = (own if isinstance(own, dict) else quantization).get("mode", "affine")
+            weight = mx.dequantize(parts["weight"], parts["scales"], parts.get("biases"), group_size = group, bits = bits, mode = mode)
+            if not mx.isfinite(weight + delta).all().item():
+                raise ValueError(f"Unsloth: {stem}.weight has values that are not finite, so the model cannot be saved.")
+            fitted = mx.quantize(weight.astype(mx.float32) + delta, group, bits, mode = mode)
+            refitted[stem] = {part: value.astype(parts[part].dtype) for part, value in zip(parts, fitted)}
+        # Handed over once, so that a written shard's tensors are not held until the last one.
+        return refitted[stem].pop(leaf)
+
+    packed = {name.rpartition(".")[0] for name in deltas if name.rpartition(".")[0] + ".scales" in stored}
     head = dict(tree_flatten(pipeline.head.parameters()))
     temperature = float(config.pop("head_temperature", 1.0))
     if temperature != 1.0:
@@ -1511,9 +1544,13 @@ def save_clef_model(pipeline, folder, source, config = None):
         for shard in sorted(source.glob("model*.safetensors")):
             tensors, changed = mx.load(str(shard)), {}
             for name, value in tensors.items():
-                if name in deltas:
-                    # Convolution kernels are stored channels-first in the checkpoint.
-                    terms = [(sign, array.swapaxes(1, 2) if value.ndim == 3 else array) for sign, array in deltas.pop(name)]
+                stem, _, leaf = name.rpartition(".")
+                if stem in packed and leaf in ("weight", "scales", "biases"):
+                    changed[name] = refit(stem, leaf, tensors)
+                elif name in deltas:
+                    # transformers stores convolution kernels channels-first.
+                    kernel = value.ndim == 3 and deltas[name][0][1].shape != value.shape
+                    terms = [(sign, array.swapaxes(1, 2) if kernel else array) for sign, array in deltas.pop(name)]
                     if terms[0][1].shape != value.shape:
                         raise ValueError(f"Unsloth: {name} has shape {value.shape} in {source}, not the trained {terms[0][1].shape}.")
                     changed[name] = _add_in_slices(name, value, terms)
@@ -1828,6 +1865,8 @@ def clef_training_network(
     from .loader import FastMLXModel
     from .utils import _get_text_model, describe_output_head
 
+    if full_finetuning and any(path.endswith(".scales") for path, _ in tree_flatten(pipeline.model.parameters())):
+        raise ValueError("Unsloth: a quantized decoder trains through LoRA adapters only; pass full_finetuning = False.")
     if full_finetuning:
         # Only what a text prompt reaches: a trainable weight without a gradient would still decay.
         pipeline.model.freeze()

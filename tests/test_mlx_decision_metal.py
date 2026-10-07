@@ -775,7 +775,7 @@ def test_a_plain_language_model_gets_a_new_joint_head_and_saves_as_a_clef(clef, 
     assert all(mx.array_equal(weights[0][name], weights[1][name]) for name in weights[0]) and not mx.array_equal(weights[0]["question_projection.weight"], weights[2]["question_projection.weight"])
     assert not weights[0]["residual_gate"].item() and 0.8 < weights[0]["type_embedding.weight"].std().item() < 1.2 and all(mx.any(value[:256]).item() and mx.any(value[256:]).item() for name, value in weights[0].items() if name.endswith("in_proj_weight"))
     mx.save_safetensors(str(tmp_path / "model.safetensors"), {"lm_head.weight": mx.zeros((512, 64))})
-    with pytest.raises(ValueError, match = "another layout"):
+    with pytest.raises(ValueError, match = "holds no tensor"):
         ClefModel.from_language_model(tmp_path)
     with pytest.raises(ValueError, match = "hidden size"):
         ClefModel.from_language_model(source, head_config = {**first.head_config, "hidden_size": 32})
@@ -793,11 +793,30 @@ def test_a_plain_language_model_gets_a_new_joint_head_and_saves_as_a_clef(clef, 
     # A source that keeps the names but holds integers, or other rows, cannot take the update.
     for other in (lambda value: value.astype(mx.uint8), lambda value: mx.zeros((value.shape[0] + 1, value.shape[1]))):
         mx.save_safetensors(str(source / "model.safetensors"), {name: other(value) if value.ndim == 2 else value for name, value in floats.items()})
-        with pytest.raises(ValueError, match = "is quantized"):
+        with pytest.raises(ValueError, match = "holds no tensor"):
             ClefModel.from_language_model(source, load_in_4bit = True)
-    mx.save_safetensors(str(source / "model.safetensors"), {_decoder_tensor_name(packed, path): value.swapaxes(1, 2) if value.ndim == 3 else value for path, value in tree_flatten(packed.parameters())})
-    with pytest.raises(ValueError, match = "is quantized"):
-        ClefModel.from_language_model(source)
+    # An MLX-quantized source, under the names it is loaded with, trains through adapters and saves requantized.
+    stored, name = dict(tree_flatten(packed.parameters())), "language_model.model.layers.2.mlp.down_proj"
+    # A weight's scales may be in another file than the weight.
+    apart = {key: stored[key] for key in stored if key.startswith(name) and not key.endswith(".weight")}
+    mx.save_safetensors(str(source / "model.safetensors"), {key: stored[key] for key in stored if key not in apart})
+    mx.save_safetensors(str(source / "model-00002-of-00002.safetensors"), apart)
+    # A module with a quantization entry of its own does not take the mode of the rest.
+    own = {key[: -len(".scales")]: {"group_size": 64, "bits": 8} for key in stored if key.endswith(".scales")}
+    config = json.loads((source / "config.json").read_text()) if (source / "config.json").exists() else {}
+    (source / "config.json").write_text(json.dumps({**config, "quantization": {"mode": "mxfp4", **own}}))
+    pipeline = ClefModel.from_language_model(source, head_width = 128)
+    with pytest.raises(ValueError, match = "adapters only"):
+        clef_training_network(pipeline, full_finetuning = True)
+    clef_training_network(pipeline, r = 4, lora_alpha = 8)
+    low = dict(packed.named_modules())[name]
+    low.lora_b = mx.random.normal(low.lora_b.shape) * 0.05
+    save_clef_model(pipeline, out, source)
+    saved = {**mx.load(str(out / "model.safetensors")), **mx.load(str(out / "model-00002-of-00002.safetensors"))}
+    weights = [mx.dequantize(*(tensors[f"{name}.{leaf}"] for leaf in ("weight", "scales", "biases")), group_size = 64, bits = 8) for tensors in (stored, saved)]
+    assert saved.keys() == stored.keys() and all(saved[key].dtype == stored[key].dtype and saved[key].shape == stored[key].shape for key in stored)
+    assert np.abs(np.array(weights[1] - weights[0] - low.scale * low.lora_b.T @ low.lora_a.T)).max() < 2e-2
+    assert sum(not mx.array_equal(saved[key], stored[key]) for key in stored if key.endswith(".weight")) == len([module for _, module in packed.named_modules() if "lora_a" in module])
 
 
 def test_clef_prompt_gives_up_the_end_of_the_state_only(clef):
