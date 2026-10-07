@@ -174,7 +174,10 @@ def test_builders_return_transposed_views(base):
     spec = blk._unsloth_moe_spec
     builders = [ML._build_gate_up_stack, ML._build_down_stack, ML._bnb_build_gate_up_stack, ML._bnb_build_down_stack]
     if base == "nf4":
-        builders += [ML._nf4_build_gate_up_stack, ML._nf4_build_down_stack]
+        # The pointer-table NF4 kernel is CUDA-only: elsewhere _nf4_* return None by design.
+        from unsloth_zoo.temporary_patches.gpt_oss_grouped_qlora import stacked_dequant_available
+        if stacked_dequant_available(torch.device("cuda", torch.cuda.current_device())):
+            builders += [ML._nf4_build_gate_up_stack, ML._nf4_build_down_stack]
     for build in builders:
         w = build(blk.experts, spec, torch.bfloat16)
         assert w is not None, build.__name__
