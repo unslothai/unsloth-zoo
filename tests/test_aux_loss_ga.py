@@ -106,6 +106,8 @@ def test_attention_mask_matches_the_batch_counter():
 
 
 def test_compiled_share_drops_the_same_packed_boundaries():
+    if getattr(torch.Tensor.to, "_unsloth_mlx_cuda_noop", False):
+        pytest.skip(reason = "unsloth's Apple Silicon shim replaced Tensor.to, which Dynamo cannot trace")
     aux = torch.tensor(1.0)
     lab = torch.tensor([[1, 2, 3, 4, 5, 6]])
     kw = {"num_items_in_batch": torch.tensor(4), "packed_seq_lengths": torch.tensor([2, 0, 2, 2])}
