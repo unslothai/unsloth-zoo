@@ -170,7 +170,7 @@ def rewrite_aux_loss_ga(source):
         extra += ", model = self"
 
     def indent(text):
-        line = next((l for l in text.splitlines() if l.strip()), "")
+        line = next((s for s in text.splitlines() if s.strip()), "")
         return len(line) - len(line.lstrip())
 
     shift = indent(source) - indent(dedented)

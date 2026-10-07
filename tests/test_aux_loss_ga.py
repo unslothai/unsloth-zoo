@@ -83,8 +83,8 @@ def test_no_kwargs_or_no_labels_is_left_alone():
 def test_weight_is_the_token_share_and_sums_to_one():
     aux = torch.tensor(2.0)
     lab = [torch.tensor([[-100, 5, 6, -100]]), torch.tensor([[-100, 1, 2, 3, 4, 5, 6, 7]])]
-    n = sum((l[..., 1:] != -100).sum() for l in lab)
-    scaled = [unsloth_ga_scale_aux_loss(aux, l, None, {"num_items_in_batch": n}) for l in lab]
+    n = sum((t[..., 1:] != -100).sum() for t in lab)
+    scaled = [unsloth_ga_scale_aux_loss(aux, t, None, {"num_items_in_batch": n}) for t in lab]
     assert torch.allclose(sum(scaled), aux)
     assert torch.allclose(scaled[0], aux * 2 / 9)
 
