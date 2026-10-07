@@ -606,6 +606,30 @@ def test_kill_switch_keeps_lora_blocks_on_the_loop():
         os.environ.pop("UNSLOTH_MOE_GROUPED", None)
 
 
+@pytest.mark.parametrize("wrapped", [True, False])
+def test_expert_bias_declines(wrapped, monkeypatch):
+    """A base bias on any expert projection keeps the loop (the grouped GEMMs add none), both at
+    patch time and per call; with the guard removed the grouped output drops the bias."""
+    model, blk = build("qwen3", targets = "all" if wrapped else "gate", seed = 7)
+    if not wrapped:
+        for ex in blk.experts:
+            ex.gate_proj = ex.gate_proj.base_layer
+    enable(model, blk)
+    lin = ML._base_lin(blk.experts[6].up_proj)
+    lin.bias = nn.Parameter(torch.randn(lin.out_features, device = DEV, dtype = DT), requires_grad = False)
+    assert ML._block_is_eligible(blk) is None
+    _assert_falls_back(blk)
+    assert ML.enable_grouped_moe(model, verbose = False) == 0 and not hasattr(blk, "_orig_moe_forward")
+    # flip: patch directly and force engagement past the guard
+    enable_direct = _decline_case.__globals__["types"].MethodType
+    blk._orig_moe_forward = blk.forward
+    blk._unsloth_moe_spec = ML._BLOCK_SPECS[type(blk).__name__]
+    blk._moe_recompute = blk._moe_cache = False
+    blk.forward = enable_direct(ML.grouped_moe_forward, blk)
+    _force_engage(monkeypatch)
+    assert _differs(blk), "forced grouped forward should drop the expert bias"
+
+
 def test_enable_declines_unsupported_lora_at_patch_time():
     model, blk = build("qwen3", use_dora = True)
     assert ML.enable_grouped_moe(model, verbose = False) == 0

@@ -270,20 +270,30 @@ def _nf4_build_down_stack(experts, spec, dtype):
 def _build_gate_up_stack(experts, spec, dtype):
     """[E, hidden, 2*inter]: per expert cat(gate^T, up^T)."""
     w = _nf4_build_gate_up_stack(experts, spec, dtype)
+    # Not counted while tracing: this can run inside _GroupedFrozenMM, where Dynamo cannot
+    # replay a global-dict update (fullgraph fails), and traced code never takes the NF4 kernel.
+    counting = not torch.compiler.is_compiling()
     if w is not None:
-        _NF4_STACK_CALLS["stacked"] += 1
+        if counting:
+            _NF4_STACK_CALLS["stacked"] += 1
         return w
-    _NF4_STACK_CALLS["fallback"] += 1
+    if counting:
+        _NF4_STACK_CALLS["fallback"] += 1
     return _bnb_build_gate_up_stack(experts, spec, dtype)
 
 
 def _build_down_stack(experts, spec, dtype):
     """[E, inter, hidden]: per expert down^T."""
     w = _nf4_build_down_stack(experts, spec, dtype)
+    # Not counted while tracing: this can run inside _GroupedFrozenMM, where Dynamo cannot
+    # replay a global-dict update (fullgraph fails), and traced code never takes the NF4 kernel.
+    counting = not torch.compiler.is_compiling()
     if w is not None:
-        _NF4_STACK_CALLS["stacked"] += 1
+        if counting:
+            _NF4_STACK_CALLS["stacked"] += 1
         return w
-    _NF4_STACK_CALLS["fallback"] += 1
+    if counting:
+        _NF4_STACK_CALLS["fallback"] += 1
     return _bnb_build_down_stack(experts, spec, dtype)
 
 
@@ -493,6 +503,8 @@ def _experts_grouped_state(experts, spec, device, dtype):
                 return f"expert projection {name} has no weight"
             if w.requires_grad:
                 return "trainable expert weight"
+            if getattr(base, "bias", None) is not None:   # the grouped GEMMs carry no bias
+                return f"expert projection {name} has a bias"
             if getattr(w, "device", device) != device:
                 return "expert weight on another device"
             if _lin_compute_dtype(base) != dtype:
@@ -662,6 +674,8 @@ def _block_is_eligible(block):
             lin = getattr(ex, name, None)
             w = getattr(_base_lin(lin), "weight", None) if lin is not None else None
             if w is None:
+                return None
+            if getattr(_base_lin(lin), "bias", None) is not None:   # the grouped GEMMs carry no bias
                 return None
             is_4bit = (HAS_BNB and isinstance(w, Params4bit)
                        and getattr(w, "quant_state", None) is not None and not w.requires_grad)
