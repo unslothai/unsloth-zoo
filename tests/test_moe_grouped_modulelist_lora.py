@@ -630,6 +630,54 @@ def test_expert_bias_declines(wrapped, monkeypatch):
     assert _differs(blk), "forced grouped forward should drop the expert bias"
 
 
+def test_non_lora_peft_wrapper_declines(monkeypatch):
+    """A non-LoRA PEFT tuner (IA3) wraps the experts with base_layer and no lora_A: the block keeps
+    the loop; with the guard removed the grouped output drops the tuner's scaling."""
+    from peft import IA3Config
+    torch.manual_seed(7)
+    _, g, u, d, _ = KINDS["qwen3"]
+    blk = (_hf_block("qwen3") or _synthetic_block("qwen3")).to(DEV)
+    for p in blk.parameters():
+        p.data = p.data.to(DT)
+        p.requires_grad_(False)
+    root = nn.Module()
+    root.mlp = blk
+    model = get_peft_model(root, IA3Config(target_modules = [u], feedforward_modules = [u]))
+    blk = model.base_model.model.mlp
+    with torch.no_grad():
+        for n, p in model.named_parameters():
+            if "ia3_l" in n:
+                p.data = (1 + torch.randn_like(p)).to(p.dtype)
+    model.eval()
+    assert ML._projs_lora([getattr(ex, u) for ex in blk.experts]) == "PEFT wrapper is not LoRA"
+    assert ML._block_is_eligible(blk) is None
+    assert ML.enable_grouped_moe(model, verbose = False) == 0 and not hasattr(blk, "_orig_moe_forward")
+    _assert_falls_back(blk)
+    # patch directly and force engagement past the guard
+    blk._orig_moe_forward = blk.forward
+    blk._unsloth_moe_spec = ML._BLOCK_SPECS[type(blk).__name__]
+    blk._moe_recompute = blk._moe_cache = False
+    blk.forward = types.MethodType(ML.grouped_moe_forward, blk)
+    _force_engage(monkeypatch)
+    assert _differs(blk), "forced grouped forward should drop the IA3 scaling"
+
+
+def test_signature_tracks_dtype_of_every_expert():
+    """Casting one non-first expert's adapter in place keeps every Parameter identity; the cached
+    verdict must still be re-checked (here: lora_A / lora_B dtypes now differ -> loop)."""
+    model, blk = build("qwen3")
+    enable(model, blk)
+    x = torch.randn(1, 64, H, device = DEV, dtype = DT)
+    ok, _ = _engages(blk, x)
+    assert ok
+    key = blk._moe_ready[0]
+    w = blk.experts[5].up_proj.lora_B["default"].weight
+    w.data = w.data.to(torch.bfloat16)
+    _assert_falls_back(blk, x)   # the loop rejects mixed lora_A / lora_B dtypes, so must the block
+    assert blk._moe_ready[0] != key
+    assert ML.LAST_DECLINE["reason"] == "up_proj LoRA: lora_A / lora_B dtypes differ"
+
+
 def test_enable_declines_unsupported_lora_at_patch_time():
     model, blk = build("qwen3", use_dora = True)
     assert ML.enable_grouped_moe(model, verbose = False) == 0

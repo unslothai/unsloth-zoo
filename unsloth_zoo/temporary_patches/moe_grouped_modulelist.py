@@ -361,6 +361,9 @@ def _projs_lora(projs):
     None when no expert is LoRA-wrapped; a reason string when unsupported."""
     wrapped = [hasattr(p, "lora_A") for p in projs]
     if not any(wrapped):
+        # IA3, LoHa, ... wrap with base_layer but no lora_A: the grouped path would drop the tuner.
+        if any(hasattr(p, "base_layer") for p in projs):
+            return "PEFT wrapper is not LoRA"
         return None
     if not all(wrapped):
         return "some experts are LoRA-wrapped and some are not"
@@ -428,10 +431,10 @@ def _ready_signature(experts, spec):
     """Key for caching _experts_grouped_state, built from every expert projection: identities
     (module, base weight, quant state, bias, LoRA modules and weights), frozen flags, and the
     PEFT state the check reads (active / disabled / merged adapters, forward pre-hooks for
-    mixed-adapter batches, dropout mode and p, scaling, DoRA / variants). dtype / device / compute
-    dtype are read from the first expert only: `.to()` keeps a Parameter's identity but moves
-    every expert at once. The fields of gpt-oss' _proj_signature, read through __dict__
-    (~3 us per projection; E=128 has 384).
+    mixed-adapter batches, dropout mode and p, scaling, DoRA / variants), and every weight's dtype /
+    device (`.to()` keeps a Parameter's identity, and one expert or adapter can be moved alone).
+    The fields of gpt-oss' _proj_signature, read through __dict__ (~3 us per projection; E=128
+    has 384).
 
     Returns (key, refs) or None when it cannot be built (no caching). Modules sit in the key as
     objects (identity equality); tensors and quant states by id (their __eq__ is elementwise),
@@ -442,7 +445,6 @@ def _ready_signature(experts, spec):
     keep = refs.append
     try:
         with torch._C.DisableTorchFunctionSubclass():
-            first = True
             for ex in experts:
                 mods = ex.__dict__["_modules"]
                 for name in spec[:3]:
@@ -458,10 +460,9 @@ def _ready_signature(experts, spec):
                     qs = getattr(w, "quant_state", None)
                     keep((w, qs, b))
                     append((p, id(w), id(qs), w is not None and w.requires_grad,
-                            id(b), b is not None and b.requires_grad))
-                    if first:
-                        append((getattr(w, "dtype", None), getattr(w, "device", None),
-                                base.__dict__.get("compute_dtype")))
+                            id(b), b is not None and b.requires_grad,
+                            getattr(w, "dtype", None), getattr(w, "device", None),
+                            base.__dict__.get("compute_dtype")))
                     la = pm.get("lora_A")
                     if la is None:
                         continue
@@ -476,13 +477,10 @@ def _ready_signature(experts, spec):
                         mp = m.__dict__["_parameters"]
                         lw, lb = mp.get("weight"), mp.get("bias")
                         keep((lw, lb))
-                        append((m, id(lw), id(lb)))
-                        if first:
-                            append((getattr(lw, "dtype", None), getattr(lw, "device", None)))
+                        append((m, id(lw), id(lb), getattr(lw, "dtype", None), getattr(lw, "device", None)))
                     for m in pm["lora_dropout"].__dict__["_modules"].values():
                         md = m.__dict__
                         append((m, md.get("training"), md.get("p")))
-                first = False
     except Exception:
         return None
     return tuple(out), refs
