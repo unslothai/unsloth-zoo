@@ -168,15 +168,23 @@ def loop(blk, x):
 
 # ----------------------------------------------------------------------------- oracle
 def _lora_params(blk):
-    """[(expert, proj name, lora_A weight, lora_B weight)] for every wrapped projection."""
+    """[(expert, proj name, lora_A module, lora_B module)] for every wrapped projection."""
     out = []
     for e, ex in enumerate(blk.experts):
         for n in KINDS_BY_CLS[type(blk).__name__][:3]:
             p = getattr(ex, n)
             if hasattr(p, "lora_A"):
                 a = p.active_adapters[0]
-                out.append((e, n, p.lora_A[a].weight, p.lora_B[a].weight))
+                out.append((e, n, p.lora_A[a], p.lora_B[a]))
     return out
+
+
+def _lora_grad(m):
+    """Grad of one expert's lora_A / lora_B weight: its slice of the stack when stacked."""
+    if type(m) is ML._StackedLoraLinear:
+        st = getattr(m._unsloth_stack_owner, ML._STACK_NAME)
+        return None if st.grad is None else st.grad[m._unsloth_stack_index]
+    return m.weight.grad
 
 
 KINDS_BY_CLS = {v[0]: v[1:] for v in KINDS.values()}
@@ -214,8 +222,8 @@ def oracle(blk, x, gout):
                 a = p.active_adapters[0]
                 A = p.lora_A[a].weight.detach().double().requires_grad_(True)
                 B = p.lora_B[a].weight.detach().double().requires_grad_(True)
-                leaves[p.lora_A[a].weight] = A
-                leaves[p.lora_B[a].weight] = B
+                leaves[(e, n, "A")] = A
+                leaves[(e, n, "B")] = B
                 y = y + (xi @ A.t()) @ B.t() * p.scaling[a]
             outs[n] = y
             if n == u:
@@ -227,16 +235,16 @@ def oracle(blk, x, gout):
 
 
 def run(blk, fwd, x, gout, autocast = False):
-    for _, _, A, B in _lora_params(blk):
-        A.grad = B.grad = None
+    blk.zero_grad(set_to_none = True)
     ctx = torch.autocast(DEV, dtype = DT) if autocast else contextlib.nullcontext()
     with ctx:
         out = fwd(x)[0]
     (out.float() * gout).sum().backward()
     grads = {}
-    for _, _, A, B in _lora_params(blk):
-        for w in (A, B):
-            grads[w] = torch.zeros_like(w) if w.grad is None else w.grad.clone()
+    for e, n, A, B in _lora_params(blk):
+        for kind, m in (("A", A), ("B", B)):
+            g = _lora_grad(m)
+            grads[(e, n, kind)] = torch.zeros_like(m.weight) if g is None else g.clone()
     return out.detach(), grads
 
 
@@ -662,9 +670,11 @@ def test_non_lora_peft_wrapper_declines(monkeypatch):
     assert _differs(blk), "forced grouped forward should drop the IA3 scaling"
 
 
-def test_signature_tracks_dtype_of_every_expert():
+def test_signature_tracks_dtype_of_every_expert(monkeypatch):
     """Casting one non-first expert's adapter in place keeps every Parameter identity; the cached
-    verdict must still be re-checked (here: lora_A / lora_B dtypes now differ -> loop)."""
+    verdict must still be re-checked (here: lora_A / lora_B dtypes now differ -> loop). Per-expert
+    Parameters (a stack has one dtype; see the stacked LoRA tests)."""
+    monkeypatch.setenv("UNSLOTH_MOE_STACKED_LORA", "0")
     model, blk = build("qwen3")
     enable(model, blk)
     x = torch.randn(1, 64, H, device = DEV, dtype = DT)
