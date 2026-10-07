@@ -154,13 +154,15 @@ def _rounds_only():
 def test_single_row_matches_solo_decoding_across_rounds_and_windows(qwen, seed):
     from unsloth_zoo.mlx.generate import SamplingParams
     from unsloth_zoo.mlx.speculative import DraftController, _RowSampler
-    model, ids = qwen
+    (model, ids), seen = qwen, []
     sampling = SamplingParams() if seed is None else SamplingParams(temperature = 0.8, top_p = 0.6, seed = seed)
     (out,), drafted, _ = _run(model, ids[:1], 160, DraftController(max_depth = 0, max_copy = 16), sampling)
     assert drafted[0][0] > 0
     assert out == _solo(model, ids[0], 160, sampling)
     (cut,), _, engine = _run(model, ids[:1], 40, DraftController(max_depth = 0), sampling, patch = lambda e: setattr(e, "step", lambda step = e.step, calls = __import__("itertools").count(1): step(lambda: next(calls) % 3 == 0)))
     assert cut == out[:40] and engine.controller.plain_cost[1].count >= 10
+    _run(model, ids[:1], 24, DraftController(max_depth = 0, can_copy = False), sampling, patch = lambda e: setattr(e, "step", lambda step = e.step: (seen.append((len(o.tokens), e._rows[0].emitted)) or o for o in step())))
+    assert seen == [(1, emitted) for emitted in range(2, 25)]
     if seed is not None:
         # Uniform logits: a key that ignored the position would draw one token everywhere.
         assert len({_RowSampler(sampling)(mx.zeros((1, 4096)), position).item() for position in range(8)}) > 1
@@ -421,7 +423,7 @@ def test_speculative_batch_stream_rows_join_and_leave_as_if_decoded_alone(qwen, 
 def test_speculative_batch_stream_leaves_no_row_behind_when_admission_fails(qwen, monkeypatch):
     from dataclasses import replace
     from unsloth_zoo.mlx import generate
-    from unsloth_zoo.mlx.speculative import SpeculativeDraft
+    from unsloth_zoo.mlx.speculative import DraftController, SpeculativeDraft
     model, request = qwen[0], generate.GenerationRequest(prompt = "Name three colours.", max_tokens = 4)
     call = type(model.language_model).__call__
     monkeypatch.setattr(model, "_is_vlm_model", True, raising = False)
@@ -434,6 +436,13 @@ def test_speculative_batch_stream_leaves_no_row_behind_when_admission_fails(qwen
             patch.setattr(type(model.language_model), "__call__", lambda self, *args, **kwargs: replace(call(self, *args, **kwargs), encoder_outputs = mx.zeros(1)))
             pytest.raises(generate.BatchRowRefused, stream.add, request)
         assert (stream.rows_in_flight, stream._session.engine.rows, stream._session.usable) == (0, [], True)
+        assert stream.add(request) is not None and next(events := stream.iter_step()) and (owner := stream._owner) and setattr(stream, "_owner", None) is None and pytest.raises(RuntimeError, next, events) and setattr(stream, "_owner", owner) is None
+    with generate.BatchStream(model, None, speculative = SpeculativeDraft(DraftController(max_depth = 0, can_copy = False))) as stream:
+        row, events = stream.add(replace(request, max_tokens = 12)), stream.iter_step()
+        assert next(events).index == row and stream._session.engine._rows[0].emitted <= 3
+        pytest.raises(RuntimeError, stream.withdraw, row)
+        assert len(list(events)) >= 8 and len(stream.withdraw(row).token_ids) >= 9
+        assert stream.add(replace(request, max_tokens = 12)) is not None and (state := stream._session.engine._rows[0]) and next(events := stream.iter_step()) and (before := state.emitted) and stream.close() is None and (list(events), state.emitted) == ([], before)
 
 
 def _tiny_companion(model, repo):

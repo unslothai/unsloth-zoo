@@ -25,7 +25,7 @@ import time
 from dataclasses import dataclass, field, replace
 from itertools import combinations
 from pathlib import Path
-from typing import Any, Callable, Literal, Sequence
+from typing import Any, Callable, Iterator, Literal, Sequence
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -916,10 +916,10 @@ class SpeculativeEngine:
         if self.drafter is not None:
             self.draft_cache = _split(self.draft_cache, keep)
 
-    def step(self, waiting: Callable[[], bool] | None = None) -> list[StepOutput]:
-        """One round or plain window, one output per row. Finished rows leave the engine."""
+    def step(self, waiting: Callable[[], bool] | None = None) -> Iterator[StepOutput]:
+        """One round or plain window, each row's tokens as they are decoded. Finished rows leave once it is consumed."""
         if not self._rows:
-            return []
+            return
         states = self._states()
         if self._rounds_allowed():
             plan = self.controller.plan(states)
@@ -927,15 +927,12 @@ class SpeculativeEngine:
             room = min((row.remaining for row in self._rows if row.remaining is not None), default = None)
             plan = RoundPlan("plain", self.controller.max_window if room is None else min(room, self.controller.max_window))
         emitted = self._round(plan, states) if plan.kind == "round" else None
-        if emitted is None:
-            emitted = self._plain(max(1, plan.length), states, waiting)
-        out = [
-            StepOutput(row.uid, tokens, row.finished, row.draft_n, row.draft_n_accepted, row.scores and row.scores[len(row.scores) - len(tokens) :])
-            for row, tokens in zip(self._rows, emitted)
-        ]
+        for taken in [emitted] if emitted is not None else self._plain(max(1, plan.length), states, waiting):
+            for row, tokens in zip(self._rows, taken):
+                if tokens or emitted is not None:
+                    yield StepOutput(row.uid, tokens, row.finished, row.draft_n, row.draft_n_accepted, row.scores and row.scores[len(row.scores) - len(tokens) :])
         for row in [row for row in self._rows if row.finished]:
             self.remove(row.uid)
-        return out
 
     def _rounds_allowed(self) -> bool:
         return self.round_refusal is None and (len(self._rows) == 1 or self._batch_rounds)
@@ -983,9 +980,8 @@ class SpeculativeEngine:
         out, transaction = self._verify_forward(self.lm, inputs, self.cache, **self._kwargs())
         return out.logits, self._hidden(out), transaction
 
-    def _plain(self, length: int, states: list[RowState], waiting: Callable[[], bool] | None = None) -> list[list[int]]:
+    def _plain(self, length: int, states: list[RowState], waiting: Callable[[], bool] | None = None) -> Iterator[list[list[int]]]:
         rows = self._rows
-        emitted = [[] for _ in rows]
         # A processor that reads more than the history needs each token taken before the next step.
         pipelined = all(row.speculates for row in rows)
         start = time.perf_counter()
@@ -1002,12 +998,13 @@ class SpeculativeEngine:
                     upcoming = self._step(tokens[:, None], ahead = 1)
                 # Scores too: read unqueued, they cost the GPU another round trip per step.
                 mx.async_eval(*(array for array in upcoming if array is not None))
-            scores = None if scores is None else scores.tolist()
+            scores, emitted = None if scores is None else scores.tolist(), []
             for i, token in enumerate(tokens.tolist()):
                 taken = rows[i].take([token], scores and scores[i : i + 1])
-                emitted[i].extend(taken)
+                emitted.append(taken)
                 if taken and rows[i].draft is not None:
                     self.drafter.push(rows[i].draft, taken, hidden[i, -1:])
+            yield emitted
             if last:
                 break
             if steps == 1:
@@ -1023,7 +1020,6 @@ class SpeculativeEngine:
         # Reading a pipelined step's tokens waits for the step queued behind it, so the first read ends two steps in.
         ran = steps - (2 if pipelined else 1)
         self.controller.record_plain(states, steps, end - start, (end - started) / ran if ran > 0 else None)
-        return emitted
 
     def _round(self, plan: RoundPlan, states: list[RowState]) -> list[list[int]] | None:
         rows, width = self._rows, plan.width

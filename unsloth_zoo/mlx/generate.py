@@ -3750,7 +3750,7 @@ class BatchStream:
         self._stack = ExitStack()
         self._session = None
         self._is_vlm = is_vlm
-        self._closed = False
+        self._closed = self._stepping = False
         self._owner = (threading.get_ident(), _current_async_task())
         try:
             self._stack.enter_context(generation_mode(model))
@@ -3803,7 +3803,20 @@ class BatchStream:
 
     def step(self, waiting: Callable[[], bool] | None = None) -> list[GenerationEvent]:
         """What the batch produced in one decode step; a speculative batch's many-token step ends once ``waiting()`` is true."""
-        return list(self._require_open().step(waiting))
+        return list(self.iter_step(waiting))
+
+    def iter_step(self, waiting: Callable[[], bool] | None = None) -> Iterator[GenerationEvent]:
+        """``step``, each event as it is produced. The batch cannot change until it is exhausted."""
+        session = self._require_open()
+        self._stepping = True
+        try:
+            for event in session.step(waiting):
+                yield event
+                self._require_owner()
+                if self._closed:
+                    return
+        finally:
+            self._stepping = False
 
     def close(self) -> None:
         """Release the batch and the generation lock. Safe to call twice."""
@@ -3847,6 +3860,8 @@ class BatchStream:
         if self._session is None:
             raise RuntimeError("This BatchStream is closed.")
         self._require_owner()
+        if self._stepping:
+            raise RuntimeError("This BatchStream is mid-step; consume its events before changing the batch.")
         if not self._session.usable:
             raise RuntimeError(
                 "This BatchStream holds a batch neither it nor the engine can "
