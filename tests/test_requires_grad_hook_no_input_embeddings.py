@@ -85,3 +85,28 @@ def test_tower_without_embeddings_is_hooked_quietly(caplog):
 def test_unexpected_failure_still_warns(caplog):
     records = _run(RuntimeError("boom"), caplog)
     assert any(r.levelno == logging.WARNING and "boom" in r.getMessage() for r in records)
+
+
+def test_a_failed_registration_still_warns_and_hooks_the_tower(caplog, monkeypatch):
+    # NotImplementedError raised while registering, not by the getter, is a real failure: it must
+    # warn, and the fallback pre-forward hook must go on the tower, not on the embedding.
+    class _Embedding(nn.Linear):
+        def register_forward_hook(self, *args, **kwargs):
+            raise NotImplementedError("cannot hook this embedding")
+
+    torch.manual_seed(0)
+    model = _Composite(NotImplementedError())
+    embedding = _Embedding(8, 8, bias = False)
+    monkeypatch.setattr(model.tower, "get_input_embeddings", lambda: embedding)
+    model.tower.patch_embed.weight.requires_grad_(False)
+    with caplog.at_level(logging.INFO, logger = "unsloth_zoo.log"):
+        requires_grad_for_gradient_checkpointing(model)
+    assert any(
+        r.levelno == logging.WARNING and "cannot hook this embedding" in r.getMessage()
+        for r in caplog.records
+    )
+    assert len(model.tower._forward_pre_hooks) > 0
+    assert len(embedding._forward_pre_hooks) == 0
+    model(torch.randn(2, 8)).sum().backward()
+    for blk in model.tower.blocks:
+        assert blk.proj.weight.grad is not None and blk.proj.weight.grad.abs().sum() > 0
