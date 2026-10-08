@@ -1039,7 +1039,7 @@ def _patches(text, images, return_tensors):
     if any(image.width < 32 for image in images):
         raise ValueError("too thin")
     grids = [(1, image.height // 16, image.width // 16) for image in images]
-    ids = [token for _, rows, columns in grids for token in (501, *[500] * (rows * columns // 4), 502)] + [10]
+    ids = [token for _, rows, columns in grids for token in (501, *[500] * (rows * columns // 4), 502)] + [10] * text[0].endswith("\n")
     pixels = [np.full((rows * columns, 1536), np.asarray(image).mean() / 255, np.float32) for image, (_, rows, columns) in zip(images, grids)]
     return {"input_ids": np.array([ids]), "pixel_values": np.concatenate(pixels), "image_grid_thw": np.array(grids)}
 
@@ -1094,6 +1094,29 @@ def test_clef_reads_images_between_the_opening_and_the_state(clef, monkeypatch):
     assert dark["usage"]["input_tokens"] == len(reader.encode([{"role": "user", "content": ["state"]}], parsed)[0]) + 9
     model._processor = None
     assert not reader.reads_images
+
+
+def test_prompts_that_share_their_images_read_them_once(monkeypatch):
+    from PIL import Image
+
+    from unsloth_zoo.mlx import utils
+
+    reader = _LabelModel.__new__(_LabelModel)
+    reader.model, reader.takes_images = _vision_decoder(), True
+    reader.model._processor = _patches
+    image_ids, media = reader.encode_images([Image.new("RGB", (96, 64), "gray"), Image.new("RGB", (64, 64), "white")])
+    shared = [3, 4, *image_ids, *range(40, 60)]
+    prompts = [shared + [7, 8, 9], shared + [300], shared + [301, 302, 303, 304]]
+    with generation_mode(reader.model):
+        got = list(reader._hidden_states(prompts, media, 2 + len(image_ids)))
+        want = [reader._hidden(ids, media) for ids in prompts]
+        # Prompts that part inside the images cannot share them.
+        calls, forward = [], utils._forward_text_hidden_states
+        monkeypatch.setattr(utils, "_forward_text_hidden_states", lambda model, inputs, **kwargs: calls.append(inputs.shape[1]) or forward(model, inputs, **kwargs))
+        apart = list(reader._hidden_states(prompts, media, len(shared) + 1))
+    assert calls == [len(ids) for ids in prompts] and all(mx.array_equal(a, b) for a, b in zip(apart, want))
+    for a, b in zip(got, want):
+        assert a.shape == b.shape and mx.abs(a.astype(mx.float32) - b.astype(mx.float32)).max().item() <= 2**-8 * mx.abs(b.astype(mx.float32)).max().item()
 
 
 def _clef_record_loss_and_grad(network, record):

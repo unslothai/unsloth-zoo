@@ -773,6 +773,29 @@ def _output_rows(head, token_ids):
 class _QwenModel(DecisionPipeline):
     # Below this many shared tokens a second pass costs more than it saves.
     _MIN_SHARED = 16
+    # Whether the family was trained to read images, and what follows them in its prompt.
+    takes_images = False
+    _IMAGE = "<|vision_start|><|image_pad|><|vision_end|>"
+    _AFTER_IMAGES = ""
+    # The images of a request may not reach this on their own; it is the prompt length Clef's reference serves.
+    _IMAGE_TOKENS = 16384
+
+    @property
+    def reads_images(self):
+        return self.takes_images and hasattr(self.model, "vision_tower") and getattr(self.model, "_processor", None) is not None
+
+    def encode_images(self, images):
+        """The token ids that stand for `images` in the prompt, and the pixels behind them."""
+        if not self.reads_images:
+            raise DecisionUnsupportedError("this model does not support images")
+        try:
+            encoded = self.model._processor(text = [self._IMAGE * len(images) + self._AFTER_IMAGES], images = list(images), return_tensors = "np")
+        except ValueError as error:
+            raise DecisionRequestError(f"an image could not be read: {error}") from error
+        ids = np.asarray(encoded["input_ids"])[0].tolist()
+        if len(ids) >= self._IMAGE_TOKENS:
+            raise DecisionRequestError(f"the images take {len(ids)} tokens; the maximum is {self._IMAGE_TOKENS}, send fewer or smaller images")
+        return ids, {name: mx.array(np.asarray(encoded[name])) for name in ("pixel_values", "image_grid_thw")}
 
     def _load(self, source, revision, dtype, token, adapter = None, load_in_4bit = False):
         from .loader import FastMLXModel
@@ -810,41 +833,58 @@ class _QwenModel(DecisionPipeline):
         encoded = ((code, self._encode(code)) for code in codes)
         return [(code, ids[0]) for code, ids in encoded if len(ids) == 1][:limit]
 
+    def _merged(self, ids, media):
+        # The image features take the place of the placeholder embeddings, and an image advances the positions by
+        # its grid, not by its token count.
+        if media is None:
+            return {}
+        merged = self.model.get_input_embeddings(ids, media["pixel_values"], image_grid_thw = media["image_grid_thw"])
+        return {"inputs_embeds": merged.inputs_embeds, "position_ids": merged.position_ids}
+
     def _hidden(self, ids, media = None):
         from .utils import _forward_text_hidden_states
 
         ids = mx.array(ids)[None]
-        if media is None:
-            return _forward_text_hidden_states(self.model, ids)[0]
-        # The image features take the place of the placeholder embeddings, and an image advances the positions by
-        # its grid, not by its token count.
-        merged = self.model.get_input_embeddings(ids, media["pixel_values"], image_grid_thw = media["image_grid_thw"])
-        return _forward_text_hidden_states(self.model, ids, inputs_embeds = merged.inputs_embeds, position_ids = merged.position_ids)[0]
+        return _forward_text_hidden_states(self.model, ids, **self._merged(ids, media))[0]
 
-    def _hidden_states(self, prompts):
-        """The hidden states of each prompt; the prefix the prompts of a request share is run once and continued per prompt."""
+    def _hidden_states(self, prompts, media = None, images_end = 0):
+        """The hidden states of each prompt; the prefix the prompts of a request share is run once and continued per prompt.
+
+        The images of the prompts, which end at token `images_end`, are read in the shared pass."""
         from .utils import _forward_text_hidden_states, _get_text_model
 
         # Every prompt keeps at least one token of its own to continue with.
         shared = min(len(os.path.commonprefix(prompts)), min(map(len, prompts)) - 1) if len(prompts) > 1 else 0
-        if shared < self._MIN_SHARED:
-            yield from map(self._hidden, prompts)
+        if shared < max(self._MIN_SHARED, images_end):
+            yield from (self._hidden(ids, media) for ids in prompts)
             return
         cache = _get_text_model(self.model).make_cache()
-        head = _forward_text_hidden_states(self.model, mx.array(prompts[0][:shared])[None], cache = cache)[0]
+        prefix = mx.array(prompts[0][:shared])[None]
+        merged = self._merged(prefix, media)
+        head = _forward_text_hidden_states(self.model, prefix, cache = cache, **merged)[0]
         mx.eval(head, [entry.state for entry in cache])
+        # Text continues one position after the other from where the images left the count.
+        start = int(merged["position_ids"][0, 0, -1].item()) + 1 if merged else shared
         for ids in prompts:
             # A continuation is not told where it starts unless it is given its positions.
-            positions = mx.broadcast_to(mx.arange(shared, len(ids)), (3, 1, len(ids) - shared))
+            positions = mx.broadcast_to(mx.arange(start, start + len(ids) - shared), (3, 1, len(ids) - shared))
             tail = _forward_text_hidden_states(self.model, mx.array(ids[shared:])[None], cache = copy.deepcopy(cache), position_ids = positions)[0]
             yield mx.concatenate([head, tail])
 
-    def _scores(self, state, questions):
+    def _scores(self, state, questions, images = ()):
         from .generate import generation_mode
 
-        prompts = [[self._encode(prompt) for prompt in self._prompts(state, questions, question)] for question in questions]
+        image_ids, media = self.encode_images(images) if images else ([], None)
+        prompts = [[self._encode(prompt) for prompt in self._prompts(state, questions, question, *([len(images)] if images else []))] for question in questions]
+        images_end = 0
+        if media is not None:
+            # The tokenizer reads one placeholder per image, the processor as many as the image takes.
+            first = prompts[0][0].index(image_ids[0])
+            images_end = first + len(image_ids)
+            placeholders = len(self._encode(self._IMAGE)) * len(images)
+            prompts = [[ids[:first] + image_ids + ids[first + placeholders :] for ids in variants] for variants in prompts]
         with generation_mode(self.model):
-            hidden = self._hidden_states([ids for variants in prompts for ids in variants])
+            hidden = self._hidden_states([ids for variants in prompts for ids in variants], media, images_end)
             scores = [[self._read(question, ids, next(hidden)) for ids in variants] for question, variants in zip(questions, prompts)]
         return scores, sum(len(ids) for variants in prompts for ids in variants)
 
@@ -997,6 +1037,8 @@ class _OpenJevModel(_LabelModel):
     noul_true_first = True
     # The serving settings its model card documents.
     temperatures = {"choice": 0.85, "score": 0.85, "noul": 0.85 * 1.829074}
+    # A conversion that kept the vision tower reads screenshots; the published MLX ones dropped it.
+    takes_images = True
     _LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
     def __init__(self, folder, dtype, base_model, token):
@@ -1011,14 +1053,15 @@ class _OpenJevModel(_LabelModel):
         name, default = ("yes", "The statement is true.") if key == "true" else ("no", "The statement is false.")
         return f"{name}: {_text(description) if description else default}"
 
-    def _prompts(self, state, questions, question):
+    def _prompts(self, state, questions, question, images = 0):
         listed = "".join(
             f"[{letter}] {self._option(question.type, key, description)}\n"
             for (letter, _), (key, description) in zip(self.labels, question.options)
         )
         suffix = " Rate along the ordered levels below (lowest first)." if question.type == "score" else ""
+        shown = self._IMAGE * images + "The screenshot shows the current screen.\n" if images else ""
         return [
-            f"<|im_start|>user\nState:\n{_text(state)}\n\nQuestion: {_text(question.instructions)}{suffix}\nOptions:\n{listed}"
+            f"<|im_start|>user\n{shown}State:\n{_text(state)}\n\nQuestion: {_text(question.instructions)}{suffix}\nOptions:\n{listed}"
             "\nAnswer with the letter of the best option only.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
         ]
 
@@ -1249,9 +1292,8 @@ class ClefModel(_QwenModel):
         return (folder / "joint_head_config.json").is_file() and (folder / "joint_head.safetensors").is_file()
     noul_true_first = True
     choice_sorted = True
-    _IMAGE = "<|vision_start|><|image_pad|><|vision_end|>"
-    # The prompt length its reference serves, which the images of a request may not reach on their own.
-    _IMAGE_TOKENS = 16384
+    takes_images = True
+    _AFTER_IMAGES = "\n"
     _SYSTEM = "Read the complete state and schema. Decide every field jointly. Each answer must be exactly one of that field's allowed options."
     _NOUL = {"true": "The proposition is true or the answer is yes.", "false": "The proposition is false or the answer is no."}
 
@@ -1317,23 +1359,6 @@ class ClefModel(_QwenModel):
                 yield "\n", None
             yield "END FIELD\n", None
         yield "\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:", None
-
-    @property
-    def reads_images(self):
-        return hasattr(self.model, "vision_tower") and getattr(self.model, "_processor", None) is not None
-
-    def encode_images(self, images):
-        """The token ids that stand for `images` in the prompt, and the pixels behind them."""
-        if not self.reads_images:
-            raise DecisionUnsupportedError("this model does not support images")
-        try:
-            encoded = self.model._processor(text = [self._IMAGE * len(images) + "\n"], images = list(images), return_tensors = "np")
-        except ValueError as error:
-            raise DecisionRequestError(f"an image could not be read: {error}") from error
-        ids = np.asarray(encoded["input_ids"])[0].tolist()
-        if len(ids) >= self._IMAGE_TOKENS:
-            raise DecisionRequestError(f"the images take {len(ids)} tokens; the maximum is {self._IMAGE_TOKENS}, send fewer or smaller images")
-        return ids, {name: mx.array(np.asarray(encoded[name])) for name in ("pixel_values", "image_grid_thw")}
 
     def encode(self, state, questions, max_length = None, image_ids = ()):
         """Token ids of the prompt and the (start, end) spans the head reads; a state too long for `max_length` loses its end.

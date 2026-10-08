@@ -234,7 +234,7 @@ def decoder_family(monkeypatch):
     monkeypatch.setattr(loader.FastMLXModel, "from_pretrained", load)
     monkeypatch.setattr(decision, "_merge_lora", lambda model, folder: loads.append(folder))
     monkeypatch.setattr(generate, "generation_mode", lambda model: contextlib.nullcontext())
-    monkeypatch.setattr(decision._QwenModel, "_hidden_states", lambda self, prompts: iter(prompts))
+    monkeypatch.setattr(decision._QwenModel, "_hidden_states", lambda self, prompts, *images: iter(prompts))
     monkeypatch.setattr(decision._LabelModel, "_read", lambda self, question, ids, hidden: [float(i * i) for i in range(self._label_count(question))])
     return loads, prompts
 
@@ -309,6 +309,31 @@ def test_openjev_letters_the_options_and_reads_noul_yes_first(tmp_path, decoder_
     with pytest.raises(DecisionRequestError):
         model.answer("s", {"many": {"type": "choice", "instructions": "i", "criteria": dict.fromkeys(map(str, range(53)))}})
     assert model.answer("s", {"many": {"type": "choice", "instructions": "i", "criteria": dict.fromkeys(map(str, range(52)))}})["answers"]["many"]["choice"] == "51"
+
+
+def test_openjev_puts_its_screenshots_before_the_state(tmp_path, decoder_family, monkeypatch):
+    (tmp_path / "MANIFEST.json").write_text(json.dumps({"model": "OpenJev MLX 4-bit"}))
+    model, image = load_decision_model(tmp_path), "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGNgAAAAAgABSK+kcQAAAABJRU5ErkJggg=="
+    question = {"sure": {"type": "noul", "instructions": "i"}, "level": {"type": "score", "instructions": "i", "criteria": ["low", "high"]}}
+    with pytest.raises(DecisionUnsupportedError):
+        model.answer("s", question, images = [image])
+    # The processor spends two placeholders on the first image and one on the second; the tokenizer reads one for each.
+    spent, characters = [501, 500, 500, 502, 501, 500, 502], model.tokenizer.encode
+    model.model.vision_tower, model.model._processor = None, lambda text, images, return_tensors: {"input_ids": np.array([spent]), "pixel_values": np.zeros((3, 4)), "image_grid_thw": np.ones((2, 3))}
+    model.tokenizer.encode = lambda text, add_special_tokens: [token for index, piece in enumerate(text.split(model._IMAGE)) for token in ([501, 500, 502] * bool(index) + characters(piece, add_special_tokens))]
+    passes = []
+    monkeypatch.setattr(decision._QwenModel, "_hidden_states", lambda self, prompts, *images: passes.append((prompts, *images)) or iter(prompts))
+    usage = model.answer("s", question, images = [image, image])["usage"]
+    (prompts, media, images_end), opening = passes[0], [ord(c) for c in "<|im_start|>user\n"]
+    head, tail = "The screenshot shows the current screen.\nState:\ns\n\nQuestion: i", "\nAnswer with the letter of the best option only.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    listed = ("\nOptions:\n[A] yes: The statement is true.\n[B] no: The statement is false.\n", " Rate along the ordered levels below (lowest first).\nOptions:\n[A] 0: low\n[B] 1: high\n")
+    assert prompts == [opening + spent + [ord(c) for c in head + options + tail] for options in listed]
+    assert images_end == len(opening) + 7 and usage["input_tokens"] == sum(map(len, prompts))
+    assert media["pixel_values"].shape == (3, 4) and media["image_grid_thw"].shape == (2, 3)
+    # A family that was not trained on images refuses them whatever its decoder holds.
+    monkeypatch.setattr(type(model), "takes_images", False)
+    with pytest.raises(DecisionUnsupportedError):
+        model.answer("s", question, images = [image])
 
 
 def _safetensors(path, metadata = None):
