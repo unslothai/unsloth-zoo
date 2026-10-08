@@ -530,10 +530,8 @@ if _bitsandbytes_is_usable():
         assert set(qs_dict.keys()).issubset(cls.valid_qs_keys)
 
         if "nested_absmax" in qs_dict:
-            # Must use float32 and disable autocasting - vLLM fails!
-            # offset = torch.tensor(float(qs_dict["nested_offset"])).to(device)
-            with torch.autocast(device_type = "cuda", enabled = False):
-                offset = torch.tensor(qs_dict["nested_offset"], dtype = torch.float32, device = "cuda")
+            # Must use float32 - vLLM fails! On `device`, not "cuda", so XPU and CPU loads work.
+            offset = torch.tensor(qs_dict["nested_offset"], dtype = torch.float32, device = device)
             state2 = cls(
                 absmax=qs_dict["nested_absmax"].to(device),
                 blocksize=qs_dict["nested_blocksize"],
