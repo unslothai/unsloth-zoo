@@ -1,17 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2023-present the Unsloth team. All rights reserved.
-"""patch_gemma4_vllm_k_eq_v_support must find the bitsandbytes model loader
-wherever the installed vLLM keeps it.
-
-vLLM 0.28 (PR #43529) moved bitsandbytes out of tree into vllm-bnb-plugin, so
-`vllm.model_executor.model_loader.bitsandbytes_loader` no longer exists and the
-loader lives at `vllm_bnb_plugin.bitsandbytes_loader`. The Gemma 4 k_eq_v patch
-hard imported the in-tree path, so every bitsandbytes Gemma 4 load with
-fast_inference on vLLM >= 0.28 died with ModuleNotFoundError even with the
-plugin installed.
-
-All vLLM modules are mocked through sys.modules; no vLLM install is needed.
-"""
+"""Gemma 4 k_eq_v patch must find the BnB loader in tree or in vllm-bnb-plugin (vLLM >= 0.28). vLLM is mocked."""
 import os
 import sys
 import types
@@ -102,9 +91,6 @@ def test_in_tree_preferred_when_both_present():
 
 
 def test_neither_raises_actionable_error():
-    # vLLM >= 0.28 without the plugin only says "Unknown quantization method:
-    # bitsandbytes", so the patch names the missing package instead of
-    # surfacing a ModuleNotFoundError for a path that no longer exists.
     from unsloth_zoo import empty_model
     with _loader_modules(in_tree = None, plugin = None):
         with pytest.raises(RuntimeError, match = "pip install vllm-bnb-plugin"):
@@ -124,8 +110,6 @@ def test_repeated_patching_wraps_once():
 
 
 def test_patched_plugin_loader_duplicates_k_quant_state_to_v():
-    # End to end through the plugin path: the split k_eq_v layout gets a V
-    # quant state copied from K, which is what the patch exists for.
     import torch
     from unsloth_zoo import empty_model
 
