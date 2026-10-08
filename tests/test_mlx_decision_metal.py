@@ -603,6 +603,17 @@ def test_lora_adapters_target_encoder_linears_and_merge_on_save(checkpoint, tmp_
     np.testing.assert_allclose(load_decision_model(tmp_path, compute_dtype = mx.float16).logits(_batch()), model.logits(_batch()), atol = 5e-2)
 
 
+def test_a_fresh_run_draws_dropout_from_its_seed(checkpoint, tmp_path):
+    losses = []
+    for stray in (1, 2):
+        mx.random.seed(0)
+        model = add_lora_adapters(load_trainable_decision_model(checkpoint[1]), r = 4, lora_dropout = 0.3)
+        mx.random.seed(stray)
+        trainer = MLXDecisionTrainer(model, _config(output_dir = str(tmp_path / str(stray)), max_steps = 2), _items())
+        losses.append(trainer.train().metrics["train_loss"])
+    assert losses[0] == losses[1]
+
+
 @pytest.mark.parametrize("target_modules, objective", [("all-linear", None), (r"layers\.0\.attn\.Wqkv", (0.1, 0.5, 0.0))])
 def test_layerwise_gradients_match_one_graph_under_dropout(checkpoint, target_modules, objective):
     import mlx.nn as nn

@@ -11013,6 +11013,8 @@ class MLXDecisionTrainer:
 
         final_evaluation = _default_flow_evaluates_final_step()
         epoch = skipped = saved_step = 0
+        # As transformers seeds torch: dropout draws follow the seed, not what the process drew before.
+        mx.random.seed(args.seed)
         if resume:
             self._resume(resume, optimizers)
             (epoch, skipped), saved_step = divmod(state.global_step, steps_per_epoch), state.global_step
