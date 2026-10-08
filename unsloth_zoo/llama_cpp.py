@@ -1985,7 +1985,7 @@ def _fork_release_tag_for(tag):
                 break
     except Exception as e:
         logger.warning("Unsloth: Could not list %s releases (%s).", LLAMA_CPP_FORK_REPO, e)
-        return None
+        return _staged_fork_release_tag_for(tag)
     if found:
         _FORK_RELEASE_TAGS[tag] = found
     return found

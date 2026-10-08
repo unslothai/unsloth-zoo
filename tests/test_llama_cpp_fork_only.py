@@ -207,6 +207,25 @@ def test_offline_a_pinned_upstream_tag_finds_its_staged_fork_release(mod, monkey
     assert mod._resolve_converter_revision("/nonexistent") == (None, None)
 
 
+
+def test_a_release_listing_failure_falls_back_to_the_staged_fork_release(mod, monkeypatch):
+    def down(*a, **k):
+        raise OSError("rate limited")
+
+    monkeypatch.setattr(mod, "_requests_get_with_retries", down)
+    monkeypatch.setattr(mod, "_converter_stage_is_usable", lambda path, repo, tag: True)
+    monkeypatch.setattr(mod, "_FORK_RELEASE_TAGS", {})
+    stage = Path(mod._converter_stage_dir(FORK, "b1234-mix-abc1234"))
+    stage.mkdir(parents = True)
+    (stage / mod.UNSLOTH_CONVERTER_STAGE_FILENAME).write_text(json.dumps({
+        "schema": mod.UNSLOTH_CONVERTER_STAGE_SCHEMA, "repo": FORK,
+        "tag": "b1234-mix-abc1234", "completed": True,
+    }))
+    monkeypatch.delenv("UNSLOTH_OFFLINE", raising = False)
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising = False)
+    assert mod._fork_release_tag_for("b1234") == "b1234-mix-abc1234"
+    assert mod._fork_release_tag_for("b4321") is None
+
 # --- converter sources ------------------------------------------------------------
 
 _SHIM = b"""\
