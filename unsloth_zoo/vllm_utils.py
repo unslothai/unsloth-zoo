@@ -54,7 +54,7 @@ import inspect
 from functools import partial
 from .utils import _get_dtype, get_quant_type, Version
 from .empty_model import *
-from .empty_model import _is_gemma4_config
+from .empty_model import _is_gemma4_config, _import_vllm_bnb_loader_module
 from .hf_utils import (
     dtype_from_config,
     add_dtype_kwargs,
@@ -200,16 +200,7 @@ if importlib.util.find_spec("vllm") is not None:
         return quant_states
     try:
         # Same two homes as the quantization module: in tree, else the plugin.
-        _bnb_loader = None
-        for _loader_path in (
-            "vllm.model_executor.model_loader.bitsandbytes_loader",
-            "vllm_bnb_plugin.bitsandbytes_loader",
-        ):
-            try:
-                _bnb_loader = importlib.import_module(_loader_path)
-                break
-            except ImportError:
-                continue
+        _bnb_loader = _import_vllm_bnb_loader_module()
         if _bnb_loader is None:
             raise ImportError("no bitsandbytes model loader")
         if hasattr(_bnb_loader, "dequantize_dq"):

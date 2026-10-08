@@ -495,10 +495,36 @@ pass
 
 # Prequantized BnB Gemma4 k_eq_v layers lack a synthetic v quant-state shard;
 # we duplicate K -> V at loader-side quant-state stacking time.
+# vLLM 0.28 (PR #43529) moved the BnB loader into vllm-bnb-plugin, same class names.
+_VLLM_BNB_LOADER_PATHS = (
+    "vllm.model_executor.model_loader.bitsandbytes_loader",  # vLLM <= 0.27.1
+    "vllm_bnb_plugin.bitsandbytes_loader",                   # vLLM >= 0.28
+)
+
+
+def _import_vllm_bnb_loader_module():
+    import importlib
+    for path in _VLLM_BNB_LOADER_PATHS:
+        try:
+            return importlib.import_module(path)
+        except ImportError:
+            continue
+    return None
+pass
+
+
 def patch_gemma4_vllm_k_eq_v_support():
-    from vllm.model_executor.model_loader.bitsandbytes_loader import (
-        BitsAndBytesModelLoader,
-    )
+    bnb_loader = _import_vllm_bnb_loader_module()
+    if bnb_loader is None:
+        # Otherwise vLLM only says "Unknown quantization method: bitsandbytes".
+        raise RuntimeError(
+            "Unsloth: vLLM >= 0.28 moved bitsandbytes out of tree. "
+            "Install it with `pip install vllm-bnb-plugin` to load bitsandbytes "
+            "Gemma 4 models with fast_inference."
+        )
+    BitsAndBytesModelLoader = getattr(bnb_loader, "BitsAndBytesModelLoader", None)
+    if BitsAndBytesModelLoader is None:
+        return
 
     stack_quantization_states = getattr(
         BitsAndBytesModelLoader, "_stack_quantization_states", None,
