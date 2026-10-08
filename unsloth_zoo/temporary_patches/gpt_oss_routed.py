@@ -44,6 +44,7 @@ from .moe_routed import (
     routed_mode,
     triton,
 )
+from .moe_grouped_modulelist import _StackedLoraLinear, _lora_stacks
 
 
 def _mixed_adapter_batch(module):
@@ -297,6 +298,8 @@ def _lora(projs):
     if first.merged or (first.training and getattr(first.lora_dropout[name], "p", 0) > 0):
         return False
     cache = getattr(projs, "_unsloth_routed_lora", None)
+    if type(first._modules["lora_A"]._modules.get(name)) is _StackedLoraLinear:
+        return _stacked_lora(projs, name, first, cache)
     try:
         A = [proj._modules["lora_A"]._modules[name]._parameters["weight"] for proj in projs]
         B = [proj._modules["lora_B"]._modules[name]._parameters["weight"] for proj in projs]
@@ -306,17 +309,50 @@ def _lora(projs):
         cache is None or cache["name"] != name
         or not all(map(is_, cache["A"], A)) or not all(map(is_, cache["B"], B))
     ):
-        for proj in projs:
-            if (
-                name not in proj.lora_A or proj.scaling[name] != first.scaling[name]
-                or proj.use_dora.get(name, False) or getattr(proj, "lora_variant", {}).get(name) is not None
-                # lora_bias=True: the kernels add only B @ A @ x, not lora_B's bias.
-                or getattr(proj.lora_B[name], "bias", None) is not None
-            ):
-                return False
+        if not _lora_modules_ok(projs, name, first):
+            return False
         cache = {"name": name, "A": A, "B": B}
         if not torch.compiler.is_compiling():
             projs._unsloth_routed_lora = cache
+    return cache["A"], cache["B"], first.scaling[name]
+
+
+def _lora_modules_ok(projs, name, first):
+    for proj in projs:
+        if (
+            name not in proj.lora_A or proj.scaling[name] != first.scaling[name]
+            or proj.use_dora.get(name, False) or getattr(proj, "lora_variant", {}).get(name) is not None
+            # lora_bias=True: the kernels add only B @ A @ x, not lora_B's bias.
+            or getattr(proj.lora_B[name], "bias", None) is not None
+        ):
+            return False
+    return True
+
+
+def _stacked_lora(projs, name, first, cache):
+    """_lora for experts whose adapter is one stacked Parameter per projection
+    (moe_grouped_modulelist._StackedLoraLinear): the per-expert lists are the stack's slices,
+    the same storage and addresses the per-expert weights' pointer tables read."""
+    stacks = _lora_stacks(projs, name)
+    if stacks is None:
+        return False
+    A_st, B_st = stacks
+    if torch.compiler.is_compiling():
+        if not (isinstance(cache, dict) and cache["name"] == name and cache.get("stacks") is not None
+                and cache["stacks"][0] is A_st and cache["stacks"][1] is B_st) \
+                and not _lora_modules_ok(projs, name, first):
+            return False
+        return list(A_st.unbind(0)), list(B_st.unbind(0)), first.scaling[name]
+    # Slices are views: cached while the stacks keep their identity and storage (.data = rebuilds).
+    key = (A_st, B_st, A_st.data_ptr(), B_st.data_ptr())
+    hit = isinstance(cache, dict) and cache["name"] == name and cache.get("stacks") is not None \
+        and all(map(is_, cache["stacks"][:2], key[:2])) and cache["stacks"][2:] == key[2:]
+    if not hit:
+        if not _lora_modules_ok(projs, name, first):
+            return False
+        with torch.no_grad():
+            cache = {"name": name, "A": list(A_st.unbind(0)), "B": list(B_st.unbind(0)), "stacks": key}
+        projs._unsloth_routed_lora = cache
     return cache["A"], cache["B"], first.scaling[name]
 
 

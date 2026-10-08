@@ -22,13 +22,18 @@ the caller keeps the per-expert loop.
 float16 (T4): the loader computes the down experts in fp32 (_pre_set_compute_dtype), since
 their outputs overflow fp16. torch._grouped_mm has no fp32 output for fp16 operands, so this
 path runs moe_grouped_fp16's Triton grouped GEMMs: fp16 operands, fp32 accumulate, the
-loop's output dtype per projection (gate_up fp16, down fp32), LoRA in the loop's dtypes."""
+loop's output dtype per projection (gate_up fp16, down fp32), LoRA in the loop's dtypes.
+
+Stacked LoRA: the loader entry point (stack_expert_lora) gives each projection list one lora_A /
+lora_B Parameter (moe_grouped_modulelist._StackedLoraLinear) when a grouped path trains it; both
+paths read the stacks. UNSLOTH_MOE_STACKED_LORA=0 keeps PEFT's per-expert Parameters."""
 
 __all__ = [
     "nf4_dequant_expert_stack",
     "ready_signature",
     "expert_lora_state",
     "grouped_qlora_forward",
+    "stack_expert_lora",
 ]
 
 import os
@@ -36,7 +41,9 @@ import os
 import torch
 
 # Model-agnostic expert-LoRA helpers, shared with the ModuleList grouped MoE path.
-from .moe_grouped_modulelist import _lora_delta, _lora_operands, _projs_lora
+from .moe_grouped_modulelist import (
+    _STACK_NAME, _lora_delta, _lora_operands, _lora_stacks, _projs_lora, _stack_projs_lora, _stackable_lora,
+)
 
 try:
     import triton
@@ -196,6 +203,12 @@ def _proj_signature(proj, out):
                 tuple(proj._forward_pre_hooks))
         for m in mods["lora_dropout"]._modules.values():
             out += (m, m.training, m.__dict__.get("p"))
+        # Readiness reads the adapter weights' dtype / rank: a stack (stacked LoRA) or a
+        # per-expert weight, whose `.data =` / `.to()` keeps the Parameter's identity.
+        for lm in (*mods["lora_A"]._modules.values(), *mods["lora_B"]._modules.values()):
+            mp = lm._parameters
+            lw = mp.get("weight", mp.get(_STACK_NAME))
+            out += (id(lw), getattr(lw, "shape", None), getattr(lw, "dtype", None), getattr(lw, "device", None))
 
 
 @torch.compiler.disable
@@ -472,6 +485,9 @@ def _expert_window(E, bytes_per_expert, device, cap_bytes = None):
 
 def _stack_lora(projs, name, which, dtype):
     # [E, out, in] in `dtype`; autograd routes each slice's grad to its expert's parameter.
+    stacks = _lora_stacks(projs, name)
+    if stacks is not None:   # stacked LoRA: the stack itself, no per-call torch.stack
+        return stacks[which == "lora_B"].to(dtype)
     mods = [getattr(p, which)[name].weight for p in projs]
     return torch.stack(mods).to(dtype)
 
@@ -561,3 +577,62 @@ def _grouped_qlora_forward_fp16(experts, hidden_states, router_indices, routing_
     weighted = out * routing_weights[sorted_tokens, expert_ids, None].to(torch.float32)
     next_states = combine_permuted_moe_outputs(weighted, sorted_idx, num_tokens, top_k, out_dtype = torch.float32)
     return next_states.view(batch_size, -1, experts.hidden_size)
+
+
+def _grouped_training_applies(experts):
+    """True when a gpt-oss experts module trains on a grouped path: bnb NF4 experts ready for it
+    (_grouped_bnb4bit_ready) whose compute dtype has its backend, torch._grouped_mm for bf16 or
+    moe_grouped_fp16 for fp16. The per-expert loop leaves an unrouted expert's LoRA grad None,
+    a stack would give it zeros (weight decay / momentum still move it), so only these stack."""
+    ready = getattr(experts, "_grouped_bnb4bit_ready", None)
+    if ready is None or not ready():
+        return False
+    kinds = _proj_dtypes(experts.gate_up_projs)
+    if len(kinds) != 1:
+        return False
+    dtype = next(iter(kinds))[0]
+    mode, _ = compute_mode(experts, dtype)
+    if mode == "bf16":
+        from unsloth_zoo.temporary_patches.moe_utils import _check_torch_grouped_mm_supported
+        return bool(_check_torch_grouped_mm_supported())
+    if mode == "fp16":
+        from unsloth_zoo.temporary_patches.moe_grouped_fp16 import fp16_grouped_available
+        base = getattr(experts.gate_up_projs[0], "base_layer", experts.gate_up_projs[0])
+        return bool(fp16_grouped_available(base.weight.device))
+    return False
+
+
+def stack_expert_lora(model, verbose = True):
+    """Stack the expert LoRA of every gpt-oss ModuleList experts module on a grouped training path
+    (one Parameter per projection, see moe_grouped_modulelist._StackedLoraLinear); returns
+    #stacked projection lists. Loader entry point only (auto_enable_grouped_moe): it must run
+    before an optimizer or DDP wrapper holds the per-expert Parameters. Idempotent;
+    UNSLOTH_MOE_STACKED_LORA=0 keeps PEFT's per-expert Parameters."""
+    if os.environ.get("UNSLOTH_MOE_STACKED_LORA", "1") == "0":
+        return 0
+    n = 0
+    for experts in list(model.modules()):
+        projs = (getattr(experts, "gate_up_projs", None), getattr(experts, "down_projs", None))
+        if not all(isinstance(p, torch.nn.ModuleList) and len(p) for p in projs) \
+                or not hasattr(experts, "_grouped_bnb4bit_ready"):
+            continue
+        try:
+            if not _grouped_training_applies(experts):
+                continue
+            stacked = 0
+            for p in projs:
+                name = _stackable_lora(p)
+                if name is not None:
+                    _stack_projs_lora(p, name)
+                    p.__dict__.pop("_unsloth_routed_lora", None)
+                    stacked += 1
+            if stacked:
+                experts.__dict__.pop("_unsloth_grouped_ready", None)
+            n += stacked
+        except Exception as e:
+            if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
+                import logging
+                logging.getLogger(__name__).info(f"Unsloth: gpt-oss stacked expert LoRA skipped: {e}")
+    if verbose and n:
+        print(f"Unsloth: Stacked gpt-oss expert LoRA on {n} projection list(s).", flush = True)
+    return n
