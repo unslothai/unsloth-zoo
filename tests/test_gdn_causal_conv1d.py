@@ -108,6 +108,7 @@ def test_frozen_weight_only_dx():
 
 @requires_cuda
 def test_dispatch_fallbacks_and_kill_switch(monkeypatch):
+    monkeypatch.delenv(gcc._KILL_SWITCH, raising = False)
     x, w, _, _ = _inputs(1, 64, 33, 4, torch.bfloat16, False, True)
     calls = []
 
