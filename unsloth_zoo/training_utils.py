@@ -791,8 +791,9 @@ def unsloth_train(trainer):
                 progress_bar.update(1)
 
                 step += 1
-                if step == max_steps: break
+                if step >= max_steps: break
             pass
+            if step >= max_steps: break
         pass
     pass
     unset_training(model)
