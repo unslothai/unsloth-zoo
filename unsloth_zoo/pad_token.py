@@ -370,7 +370,12 @@ def fix_pad_token(
             )
             return result
 
-    if new_pad is None and _encoder_decoder_pads_with_eos(cfg, eos_token_ids):
+    if (
+        new_pad is None
+        and reason == "equals_eos"
+        and _encoder_decoder_pads_with_eos(cfg, eos_token_ids)
+        and getattr(inner, "pad_token_id", None) == cfg.pad_token_id
+    ):
         # Whisper (all but large-v3) declares pad == eos itself; adding a token would only
         # raise below. Seq2seq collators mask labels by attention mask, so keep it as is.
         result["reason"] = None
