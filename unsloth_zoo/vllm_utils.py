@@ -54,7 +54,11 @@ import inspect
 from functools import partial
 from .utils import _get_dtype, get_quant_type, Version
 from .empty_model import *
-from .empty_model import _is_gemma4_config
+from .empty_model import (
+    _is_gemma4_config,
+    _import_vllm_bnb_loader_module,
+    _resolve_safetensors_index,
+)
 from .hf_utils import (
     dtype_from_config,
     add_dtype_kwargs,
@@ -200,16 +204,7 @@ if importlib.util.find_spec("vllm") is not None:
         return quant_states
     try:
         # Same two homes as the quantization module: in tree, else the plugin.
-        _bnb_loader = None
-        for _loader_path in (
-            "vllm.model_executor.model_loader.bitsandbytes_loader",
-            "vllm_bnb_plugin.bitsandbytes_loader",
-        ):
-            try:
-                _bnb_loader = importlib.import_module(_loader_path)
-                break
-            except ImportError:
-                continue
+        _bnb_loader = _import_vllm_bnb_loader_module()
         if _bnb_loader is None:
             raise ImportError("no bitsandbytes model loader")
         if hasattr(_bnb_loader, "dequantize_dq"):
@@ -1008,6 +1003,25 @@ def vllm_dynamic_quant_supported(
     return True
 pass
 
+
+def _get_multimodal_engine_args(config, is_vision_model):
+    # Audio = 0: profiling the Gemma-4 audio tower aborts with Unsloth's compiled audio modules.
+    # Other audio models (Gemma3n, Qwen2-Audio) keep vLLM's default audio quota.
+    limits = {"image": 1, "video": 0}
+    is_gemma4 = _is_gemma4_config(config)
+    if is_gemma4 and getattr(config, "audio_config", None) is not None:
+        limits["audio"] = 0
+    if is_vision_model:
+        return {"limit_mm_per_prompt": limits}
+    if not is_gemma4:
+        return {}
+    # language_model_only is in vLLM's AOT cache key; zeroed limit_mm_per_prompt is not, so a
+    # multimodal run's cached artifact would be reloaded and crash (vllm-project/vllm#50891).
+    limits["audio"] = 0
+    return {"language_model_only": True, "limit_mm_per_prompt": limits}
+pass
+
+
 def _get_gemma4_bnb_skip_module_aliases(quantization_config):
     if not isinstance(quantization_config, dict):
         return None
@@ -1289,13 +1303,16 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         layer = vllm_text_model.layers[kk]
         if hasattr(layer, "self_attn"):
             prefix = f"{vllm_text_model_prefix}.layers.{kk}.self_attn"
-            qkv_proj = layer.self_attn.qkv_proj
+            # vLLM >= 0.30 builds Gemma-4 KV-shared layers with q_proj only.
+            qkv_proj = getattr(layer.self_attn, "qkv_proj", None)
             # LFM2 names the attention output projection out_proj
             o_proj_name = "o_proj" if hasattr(layer.self_attn, "o_proj") else "out_proj"
             o_proj = getattr(layer.self_attn, o_proj_name)
 
             use_fused_qkv = _is_fused_module("qkv_proj")
-            if use_fused_qkv:
+            if qkv_proj is None:
+                get_state_dict(f"{prefix}.q_proj", 0, state_dict, layer.self_attn.q_proj)
+            elif use_fused_qkv:
                 # phi3 family keeps qkv fused; splitting causes a size mismatch
                 # when activating the adapter.
                 # https://github.com/vllm-project/vllm/blob/9b693d023cf595e60b5346fdeeb41cf2a6eda838/vllm/model_executor/models/phi3.py
@@ -1478,12 +1495,19 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
 
     model_config = getattr(llm_engine, "model_config", None)
     load_config = getattr(getattr(llm_engine, "vllm_config", None), "load_config", None)
+    checkpoint_source = (
+        getattr(model_config, "model", None) or getattr(config, "_name_or_path", None),
+        getattr(model_config, "revision", None),
+        getattr(load_config, "download_dir", None),
+    )
     verify_vllm_moe_experts_match_checkpoint(
         quant_state_dict,
-        getattr(model_config, "model", None) or getattr(config, "_name_or_path", None),
-        revision = getattr(model_config, "revision", None),
-        cache_dir = getattr(load_config, "download_dir", None),
+        checkpoint_source[0],
+        revision = checkpoint_source[1],
+        cache_dir = checkpoint_source[2],
     )
+    # Attribute, not key: consumers iterate tensors; on the HF config it would hit config.json.
+    quant_state_dict._unsloth_checkpoint_source = checkpoint_source
 
     if not return_state_dict: state_dict = None
     return state_dict, quant_state_dict
@@ -1596,6 +1620,120 @@ def _refresh_placeholder_dims(parent, attr_name, weight):
         parent.out_features, parent.in_features = weight.shape
     elif isinstance(getattr(parent, "hidden_dim", None), int) and isinstance(getattr(parent, "num_experts", None), int):
         parent.num_experts, parent.hidden_dim = weight.shape
+pass
+
+
+GEMMA4_AUDIO_PREFIXES = ("model.audio_tower.", "model.embed_audio.")
+# Quantization state saved beside a packed weight (bitsandbytes, fp8, GPTQ / AWQ).
+_QUANT_STATE_SUFFIXES = (
+    "absmax", "quant_map", "nested_absmax", "nested_quant_map", "SCB", "weight_format",
+    "weight_scale", "weight_scale_inv", "input_scale", "scales", "qweight", "qzeros", "g_idx",
+)
+_FLOAT_SAFETENSORS_DTYPES = ("F16", "BF16", "F32", "F64")
+
+
+def _drop_gemma4_audio(new_model, reason):
+    inner = getattr(new_model, "model", new_model)
+    for name in ("audio_tower", "embed_audio"):
+        if getattr(inner, name, None) is not None: setattr(inner, name, None)
+    logger.warning(
+        f"Unsloth: {reason}, so the Gemma-4 audio tower was dropped from the training model. "
+        "Audio inputs need fast_inference = False."
+    )
+    return 0
+pass
+
+
+def _gemma4_audio_missing_reason(new_model, keys):
+    # Incomplete checkpoint = random-init leftovers; aliased tensors need only one name.
+    present = set(keys)
+    groups = {}
+    for name, param in new_model.named_parameters(remove_duplicate = False):
+        if name.startswith(GEMMA4_AUDIO_PREFIXES): groups.setdefault(id(param), []).append(name)
+    for module_name, module in new_model.named_modules(remove_duplicate = False):
+        skip = getattr(module, "_non_persistent_buffers_set", set())
+        for buffer_name, buffer in module._buffers.items():
+            if buffer is None or buffer_name in skip: continue
+            name = f"{module_name}.{buffer_name}" if module_name else buffer_name
+            if name.startswith(GEMMA4_AUDIO_PREFIXES): groups.setdefault(id(buffer), []).append(name)
+    missing = sorted(names[0] for names in groups.values() if not any(n in present for n in names))
+    if len(missing) == 0: return None
+    shown = ", ".join(missing[:3]) + (f" and {len(missing) - 3} more" if len(missing) > 3 else "")
+    return f"the checkpoint has no audio tensor for {shown}"
+pass
+
+
+def _gemma4_audio_quantized_reason(keys, weight_map, installable):
+    # Quantized tower would lose its quant state when cast, so install nothing.
+    for key in keys:
+        last = key.rsplit(".", 1)[-1]
+        if last in _QUANT_STATE_SUFFIXES or "quant_state" in key:
+            return f"the checkpoint stores the audio tower quantized ({key})"
+    from safetensors import safe_open
+    by_file = {}
+    for key in keys:
+        if key in installable: by_file.setdefault(weight_map[key], []).append(key)
+    for file, file_keys in by_file.items():
+        with safe_open(file, framework = "pt") as f:
+            for key in file_keys:
+                sl = f.get_slice(key)
+                dtype, shape = sl.get_dtype(), tuple(sl.get_shape())
+                if dtype not in _FLOAT_SAFETENSORS_DTYPES:
+                    return f"the checkpoint stores {key} as {dtype}, not a 16 / 32-bit float"
+                # Placeholder dims are 1-wide; every other dim must match the model.
+                expected = tuple(installable[key].shape)
+                if len(shape) != len(expected) or any(
+                    e != 1 and e != g for e, g in zip(expected, shape)
+                ):
+                    return f"the checkpoint shape {shape} of {key} does not match {expected}"
+    return None
+pass
+
+
+def _load_gemma4_audio_from_checkpoint(new_model, config, weight_map = None, checkpoint_source = None):
+    # vLLM never builds the audio tower, so load it from the checkpoint; returns tensors loaded.
+    # checkpoint_source = vLLM's (path, revision, cache_dir), else the config's commit hash pins the snapshot.
+    if getattr(config, "audio_config", None) is None: return 0
+    if weight_map is None:
+        if checkpoint_source is not None and checkpoint_source[0] is not None:
+            model_path, revision, cache_dir = checkpoint_source
+        else:
+            model_path = getattr(config, "model_name", None) or getattr(config, "_name_or_path", None)
+            revision, cache_dir = getattr(config, "_commit_hash", None), None
+        try:
+            weight_map = _resolve_safetensors_index(model_path, revision, cache_dir)
+        except Exception:
+            weight_map = None
+    keys = [k for k in (weight_map or {}) if k.startswith(GEMMA4_AUDIO_PREFIXES)]
+    if len(keys) == 0:
+        return _drop_gemma4_audio(new_model, "could not read the audio tower from the checkpoint")
+    from safetensors import safe_open
+    params = dict(new_model.named_parameters(remove_duplicate = False))
+    buffers = dict(new_model.named_buffers(remove_duplicate = False))
+    installable = {k: params.get(k, buffers.get(k)) for k in keys}
+    installable = {k: v for k, v in installable.items() if v is not None}
+    reason = _gemma4_audio_missing_reason(new_model, keys) or \
+        _gemma4_audio_quantized_reason(keys, weight_map, installable)
+    if reason is not None:
+        return _drop_gemma4_audio(new_model, reason)
+    by_file = {}
+    for key in keys: by_file.setdefault(weight_map[key], []).append(key)
+    loaded = 0
+    for file, file_keys in by_file.items():
+        with safe_open(file, framework = "pt") as f:
+            for key in file_keys:
+                old = params.get(key, buffers.get(key))
+                if old is None: continue
+                value = f.get_tensor(key).to(device = old.device, dtype = old.dtype)
+                parent_name, _, attr_name = key.rpartition(".")
+                parent = new_model.get_submodule(parent_name)
+                if key in params:
+                    parent._parameters[attr_name] = torch.nn.Parameter(value, requires_grad = False)
+                    _refresh_placeholder_dims(parent, attr_name, value)
+                else:
+                    parent._buffers[attr_name] = value
+                loaded += 1
+    return loaded
 pass
 
 
@@ -1835,6 +1973,11 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
         quantization_config = quantization_config,
         bnb_config = bnb_config,
     )
+    if is_vision_model and _is_gemma4_config(config):
+        _load_gemma4_audio_from_checkpoint(
+            new_model, config,
+            checkpoint_source = getattr(quant_state_dict, "_unsloth_checkpoint_source", None),
+        )
     # finalize copies every buffer from the meta template (e.g. zeroed LFM2-MoE expert_bias)
     for parent, attr_name, raw_value in loaded_buffers:
         parent._buffers[attr_name] = raw_value
@@ -3596,9 +3739,7 @@ def load_vllm(
             # worker_extension_cls   = "unsloth_zoo.vllm_rlhf_utils.ColocateWorkerExtension",
             enable_sleep_mode      = unsloth_vllm_standby,
         )
-        if is_vision_model:
-            # Limit images/videos per prompt to save memory. TODO: make configurable.
-            engine_args["limit_mm_per_prompt"] = {"image": 1, "video": 0}
+        engine_args.update(_get_multimodal_engine_args(config, is_vision_model))
         if _is_gemma4_config(config) and use_bitsandbytes:
             gemma4_bnb_quantization_config = _get_gemma4_bnb_skip_module_aliases(
                 getattr(config, "quantization_config", None)
