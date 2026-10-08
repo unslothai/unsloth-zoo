@@ -125,10 +125,17 @@ def _flag(module):
     """Mark `module` (the exact object Trainer calls) for the fast path. Declines a class that
     overrides zero_grad or the parameter walk."""
     cls, M = type(module), torch.nn.Module
+    d = module.__dict__
     for name in ("zero_grad", "parameters", "named_parameters", "_named_members", "named_modules", "modules"):
         if getattr(cls, name, None) is not getattr(M, name):
             return False
-    d = module.__dict__
+        # An instance-level override, unless it is ours or torch's own bound to this module (pickle).
+        bound = d.get(name)
+        if bound is not None and not (
+            getattr(bound, "__self__", None) is module
+            and getattr(bound, "__func__", None) in (getattr(M, name), _zero_grad)
+        ):
+            return False
     # A pickled flagged model unpickles with torch's zero_grad bound; rebind it.
     if getattr(d.get("zero_grad"), "__func__", None) is not _zero_grad:
         d["zero_grad"] = _zero_grad.__get__(module)

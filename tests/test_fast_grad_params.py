@@ -422,6 +422,20 @@ def test_declines():
             return super().named_parameters(*a, **k)
     assert not F.enable_fast_grad_params(Walk())
 
+    # Instance-level overrides decline (and stay in place); torch's own bound method does not.
+    for name in ("zero_grad", "parameters", "modules"):
+        inst = _Net()
+        custom = functools.partial(getattr(nn.Module, name), inst)
+        inst.__dict__[name] = custom
+        assert not F.enable_fast_grad_params(inst) and inst.__dict__[name] is custom
+    inst = _Net()
+    inst.__dict__["zero_grad"] = nn.Module.zero_grad.__get__(inst)
+    assert F.enable_fast_grad_params(inst) and inst.zero_grad.__func__ is F._zero_grad
+    other = _Net()
+    inst = _Net()
+    inst.__dict__["zero_grad"] = nn.Module.zero_grad.__get__(other)
+    assert not F.enable_fast_grad_params(inst)
+
 
 def test_pickle_and_deepcopy():
     import copy
