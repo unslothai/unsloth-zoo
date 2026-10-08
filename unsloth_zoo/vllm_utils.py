@@ -4919,8 +4919,9 @@ def _merged_rollout_synchronize(state):
     # All Unsloth Zoo code licensed under LGPLv3
     if not state.entries: return
     device = state.entries[0][1].device
-    if device.type == "cuda": torch.cuda.synchronize(device)
-    elif device.type == "xpu" and hasattr(torch, "xpu"): torch.xpu.synchronize(device)
+    # torch.cuda (also ROCm), torch.xpu, torch.npu (torch_npu) all expose synchronize(device).
+    synchronize = getattr(getattr(torch, device.type, None), "synchronize", None)
+    if device.type != "cpu" and synchronize is not None: synchronize(device)
 pass
 
 
@@ -5027,7 +5028,8 @@ def _reset_merged_rollout_prefix_cache(llm):
         # vLLM 0.11.x LLM / LLMEngine / EngineCore drop the scheduler's bool; ask it directly.
         try: result = llm.llm_engine.engine_core.engine_core.scheduler.reset_prefix_cache()
         except Exception: result = None
-    return result is not False
+    # Unconfirmed (None) counts as failure: the caller then takes the real LoRA path.
+    return bool(result)
 pass
 
 

@@ -538,6 +538,26 @@ def test_compat_reset_none_falls_back_to_scheduler():
     assert calls == [1, 1]
 
 
+def test_unconfirmed_reset_counts_as_failure():
+    # None from LLM.reset_prefix_cache and no reachable scheduler: never assume it reset.
+    class OldLLMNoScheduler:
+        def reset_prefix_cache(self): return None
+    assert vllm_utils._reset_merged_rollout_prefix_cache(OldLLMNoScheduler()) is False
+
+
+def test_synchronize_uses_the_weight_device_backend(monkeypatch):
+    # NPU / XPU / CUDA all sync through torch.<device type>.synchronize(device).
+    synced = []
+    fake_npu = types.SimpleNamespace(synchronize = lambda device: synced.append(device))
+    monkeypatch.setattr(torch, "npu", fake_npu, raising = False)
+    W = types.SimpleNamespace(device = types.SimpleNamespace(type = "npu"))
+    vllm_utils._merged_rollout_synchronize(types.SimpleNamespace(entries = [(None, W, None)]))
+    assert synced == [W.device]
+    cpu = types.SimpleNamespace(device = torch.device("cpu"))
+    vllm_utils._merged_rollout_synchronize(types.SimpleNamespace(entries = [(None, cpu, None)]))
+    assert synced == [W.device]
+
+
 # 8. Prefix-cache reset failures: before the fold -> this call takes the LoRA path, no fold.
 def _failing_reset(llm, how, when):
     real, n = llm.reset_prefix_cache, {"n": 0}
