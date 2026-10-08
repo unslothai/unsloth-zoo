@@ -310,6 +310,14 @@
       "reason": "Loads the fla package vendored inside unsloth_zoo."
     },
     {
+      "file": "unsloth_zoo/temporary_patches/gdn_causal_conv1d.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "8a43c55c018acccf",
+      "count": 1,
+      "reason": "Imports the fixed transformers modeling modules for qwen3_5, qwen3_5_moe and qwen3_next (names built from a constant tuple) on transformers < 5.15."
+    },
+    {
       "file": "unsloth_zoo/temporary_patches/gemma4_float32.py",
       "rule": "dynamic-import",
       "sink": "import_module",
