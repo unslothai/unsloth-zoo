@@ -1182,6 +1182,23 @@ def test_early_stopping_ends_the_run_when_its_metric_stops_improving(checkpoint)
     assert trainer.state.global_step == 6 and trainer.state.best_metric == pytest.approx(0.6) and trainer.args.greater_is_better is True
 
 
+def test_trainer_logs_evaluates_saves_and_ends_an_epoch_when_a_callback_asks(checkpoint, tmp_path):
+    class _Ask(transformers.TrainerCallback):
+        def on_step_end(self, args, state, control, **kwargs):
+            control.should_log = state.global_step == 1
+            control.should_evaluate = control.should_save = control.should_epoch_stop = state.global_step == 2
+
+    args = _config(gradient_accumulation_steps = 1, logging_steps = 100, output_dir = str(tmp_path))
+    args.eval_strategy = args.save_strategy = "no"
+    trainer = MLXDecisionTrainer(load_trainable_decision_model(checkpoint[1]), args, _items(), _items(), callbacks = [_Ask()])
+    trainer.train()
+    history = trainer.state.log_history
+    assert [log["step"] for log in history if "learning_rate" in log] == [1] and [log["step"] for log in history if "eval_loss" in log] == [2]
+    assert sorted(item.name for item in tmp_path.iterdir()) == ["checkpoint-2"]
+    # Three steps an epoch: the first ends after two, so the sixth step is the first of a third epoch.
+    assert trainer.state.global_step == 6 and trainer.state.epoch == pytest.approx(2 + 1 / 3)
+
+
 def test_trainer_stops_on_request_and_refuses_other_optimizers(checkpoint):
     model = load_trainable_decision_model(checkpoint[1])
     recorder = _Recorder(stop_at = 1)

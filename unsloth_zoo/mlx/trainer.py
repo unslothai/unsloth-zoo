@@ -11022,6 +11022,7 @@ class MLXDecisionTrainer:
         self._event("on_train_begin")
         while state.global_step < max_steps and not self.control.should_training_stop:
             batches = self._epoch_batches(epoch)
+            self.control.should_epoch_stop = False
             self._event("on_epoch_begin")
             accumulated, losses = None, []
             for index, batch in enumerate(batches):
@@ -11062,29 +11063,33 @@ class MLXDecisionTrainer:
                 logged_loss, logged_steps, total_loss = logged_loss + step_loss, logged_steps + 1, total_loss + step_loss
                 self._event("on_step_end")
                 first = getattr(args, "logging_first_step", False) and state.global_step == 1
-                if first or logging_strategy == "steps" and logging_steps and state.global_step % logging_steps == 0:
+                # A callback's should_log / should_evaluate / should_save also count, as in transformers.
+                if first or logging_strategy == "steps" and logging_steps and state.global_step % logging_steps == 0 or self.control.should_log:
                     log()
                 # transformers 5 also evaluates the last step when the interval does not land on it.
                 at_interval = eval_steps and state.global_step % eval_steps == 0 or final_evaluation and state.global_step >= max_steps
-                if eval_strategy == "steps" and at_interval and eval_delay <= state.global_step:
+                if eval_strategy == "steps" and at_interval and eval_delay <= state.global_step or self.control.should_evaluate and self.eval_dataset:
                     self.evaluate()
                 # As transformers does, a run that saves at all also saves its last step.
                 last = save_strategy != "no" and state.global_step >= max_steps
                 # An evaluation that may be loaded back as the best is saved even between intervals.
                 best = getattr(args, "load_best_model_at_end", False) and state.best_global_step == state.global_step
-                if save_strategy == "steps" and (best or save_steps and state.global_step % save_steps == 0) or last and save_strategy != "epoch":
+                if save_strategy == "steps" and (best or save_steps and state.global_step % save_steps == 0) or last and save_strategy != "epoch" or self.control.should_save:
                     self._save_checkpoint(optimizers)
                     saved_step = state.global_step
-                if state.global_step >= max_steps or self.control.should_training_stop:
+                self.control.should_log = self.control.should_evaluate = self.control.should_save = False
+                if state.global_step >= max_steps or self.control.should_training_stop or self.control.should_epoch_stop:
                     break
             epoch, skipped = epoch + 1, 0
             self._event("on_epoch_end")
-            if logging_strategy == "epoch" and logged_steps:
+            if (logging_strategy == "epoch" or self.control.should_log) and logged_steps:
                 log()
-            if eval_strategy == "epoch" and eval_delay <= state.epoch:
+            if eval_strategy == "epoch" and eval_delay <= state.epoch or self.control.should_evaluate and self.eval_dataset:
                 self.evaluate()
-            if save_strategy == "epoch" and saved_step != state.global_step:
+            if (save_strategy == "epoch" or self.control.should_save) and saved_step != state.global_step:
                 self._save_checkpoint(optimizers)
+                saved_step = state.global_step
+            self.control.should_log = self.control.should_evaluate = self.control.should_save = False
 
         if getattr(args, "load_best_model_at_end", False) and state.best_model_checkpoint:
             self._load_model(state.best_model_checkpoint)
