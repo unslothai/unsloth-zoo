@@ -1930,6 +1930,8 @@ def _staged_fork_release_tag_for(upstream_tag):
         tag = manifest.get("tag")
         if not isinstance(tag, str) or _upstream_tag_of(tag) != upstream_tag:
             continue
+        if not _converter_stage_is_usable(os.path.join(root, entry), repo = LLAMA_CPP_FORK_REPO, tag = tag):
+            continue
         key = (str(manifest.get("staged_at_utc") or ""), tag)
         if best is None or key > best[0]:
             best = (key, tag)

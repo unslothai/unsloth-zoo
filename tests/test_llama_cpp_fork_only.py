@@ -193,6 +193,7 @@ def test_the_latest_release_row_asks_the_fork(mod, monkeypatch, tmp_path):
 def test_offline_a_pinned_upstream_tag_finds_its_staged_fork_release(mod, monkeypatch):
     monkeypatch.setattr(mod, "_requests_get_with_retries",
                         lambda *a, **k: pytest.fail("offline must not list releases"))
+    monkeypatch.setattr(mod, "_converter_stage_is_usable", lambda path, repo, tag: True)
     stage = Path(mod._converter_stage_dir(FORK, "b1234-mix-abc1234"))
     stage.mkdir(parents = True)
     (stage / mod.UNSLOTH_CONVERTER_STAGE_FILENAME).write_text(json.dumps({
@@ -325,3 +326,19 @@ def test_upstream_tag_mapping_scans_past_three_release_pages(mod, monkeypatch):
     mod._FORK_RELEASE_TAGS.clear()
     assert mod._fork_release_tag_for("b9000") == "b9000-mix-old"
     assert len(calls) == 5
+
+
+def test_offline_pin_skips_a_newer_unusable_stage(mod, monkeypatch):
+    monkeypatch.setattr(mod, "_requests_get_with_retries",
+                        lambda *a, **k: pytest.fail("offline must not list releases"))
+    for tag, when in (("b1234-mix-old", "2026-01-01T00:00:00Z"), ("b1234-mix-new", "2026-02-01T00:00:00Z")):
+        stage = Path(mod._converter_stage_dir(FORK, tag))
+        stage.mkdir(parents = True)
+        (stage / mod.UNSLOTH_CONVERTER_STAGE_FILENAME).write_text(json.dumps({
+            "schema": mod.UNSLOTH_CONVERTER_STAGE_SCHEMA, "repo": FORK,
+            "tag": tag, "completed": True, "staged_at_utc": when,
+        }))
+    monkeypatch.setattr(mod, "_converter_stage_is_usable", lambda path, repo, tag: tag == "b1234-mix-old")
+    monkeypatch.setenv("UNSLOTH_OFFLINE", "1")
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", "b1234")
+    assert mod._resolve_converter_revision("/nonexistent") == (FORK, "b1234-mix-old")
