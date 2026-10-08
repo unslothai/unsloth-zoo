@@ -196,6 +196,14 @@ def _head_built_as_linear(cls, head_attr) -> bool:
     return True
 
 
+def _can_fuse_loss(loss_function):
+    from transformers.loss.loss_utils import ForCausalLMLoss
+
+    # A self-reference, rather than a bool, rejects custom functools.wraps wrappers
+    # which copy the original function's attributes but can change its loss.
+    return getattr(loss_function, "_unsloth_fused_loss", ForCausalLMLoss) is loss_function
+
+
 def install_for_class(cls) -> bool:
     """Try to install the fused forward on `cls`. Returns True on success."""
     if not is_enabled():
@@ -261,6 +269,7 @@ def install_for_class(cls) -> bool:
         for _name, _value in (getattr(forward, "__globals__", {}) or {}).items():
             ns.setdefault(_name, _value)
     ns["unsloth_fused_lm_head_loss"] = unsloth_fused_lm_head_loss
+    ns["_can_fuse_loss"] = _can_fuse_loss
     ns["EMPTY_LOGITS"] = EMPTY_LOGITS
     # The rewritten body reads UNSLOTH_RETURN_LOGITS via os.environ.get.
     ns.setdefault("os", os)

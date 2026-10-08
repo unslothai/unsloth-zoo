@@ -15,6 +15,7 @@ and numerical equivalence of the rewritten forward vs the original.
 
 from __future__ import annotations
 
+import ast
 import os
 import sys
 import types
@@ -108,9 +109,12 @@ def test_ast_rewriter_matches_keyword_form():
     assert cap.logits_name == "logits"
     assert "unsloth_fused_lm_head_loss" in new_src
     assert "EMPTY_LOGITS" in new_src
-    # self.loss_function only on the UNSLOTH_RETURN_LOGITS opt-in path, routing
-    # the loss through materialised logits to avoid a second lm_head matmul.
-    assert new_src.count("self.loss_function") == 1
+    # The guard reads the callable; only the materialized-logits branch calls it.
+    assert sum(
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "loss_function"
+        for node in ast.walk(ast.parse(new_src))
+    ) == 1
     # Labels branch carries the RETURN_LOGITS opt-in; RETURN_HIDDEN_STATES is
     # absent (handled by the compiled forward in unsloth_zoo/compiler.py).
     assert "UNSLOTH_RETURN_LOGITS" in new_src
@@ -407,6 +411,62 @@ def forward(self, hidden_states, labels=None, **kwargs):
 """
 
 
+@pytest.mark.parametrize("shape", ["plain", "scaled", "cast_wrapped"])
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_rewritten_forward_tracks_runtime_custom_loss(
+    fresh_install, enable_env, monkeypatch, shape, wrapped,
+):
+    import functools
+
+    torch = pytest.importorskip("torch")
+    from transformers.loss.loss_utils import ForCausalLMLoss
+
+    monkeypatch.delenv("UNSLOTH_RETURN_LOGITS", raising = False)
+    source = _toy_forward_src()
+    if shape == "scaled":
+        source = source.replace("self.lm_head(hidden_states)", "self.lm_head(hidden_states) * 0.25")
+    elif shape == "cast_wrapped":
+        source = source.replace(
+            "        loss = self.loss_function",
+            "        labels = labels.to(logits.device)\n"
+            "        logits = logits.float()\n"
+            "        loss = self.loss_function",
+        ).replace("    return (loss, logits)", "        loss = loss.to(hidden_states.dtype)\n    return (loss, logits)")
+    cls = _make_synthetic_class(source)
+    original = cls.forward
+    assert fresh_install.install_for_class(cls)
+    model = cls()
+    model.config = types.SimpleNamespace(vocab_size = 16)
+    torch.manual_seed(0)
+    model.lm_head = torch.nn.Linear(8, 16, bias = False)
+    hidden = torch.randn(2, 5, 8, requires_grad = True)
+    labels = torch.randint(0, 16, (2, 5))
+    labels[0, :2] = -100
+    calls = []
+
+    def custom_loss(*args, **kwargs):
+        calls.append(kwargs["num_items_in_batch"])
+        return 3 * ForCausalLMLoss(*args, **kwargs)
+
+    if wrapped:
+        custom_loss = functools.wraps(ForCausalLMLoss)(custom_loss)
+    # One installed instance must re-check the callable after each replacement.
+    for loss_function in (ForCausalLMLoss, custom_loss, ForCausalLMLoss):
+        model.loss_function = loss_function
+        actual, logits = model.forward(hidden, labels = labels, num_items_in_batch = 13)
+        expected, expected_logits = original(model, hidden, labels = labels, num_items_in_batch = 13)
+        torch.testing.assert_close(actual, expected)
+        actual_grads = torch.autograd.grad(actual, (hidden, model.lm_head.weight))
+        expected_grads = torch.autograd.grad(expected, (hidden, model.lm_head.weight))
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads):
+            torch.testing.assert_close(actual_grad, expected_grad)
+        if loss_function is custom_loss:
+            assert calls == [13, 13]
+            torch.testing.assert_close(logits, expected_logits)
+        else:
+            assert logits.numel() == 0
+
+
 def test_rewritten_forward_loss_matches_reference(fresh_install, enable_env):
     torch = pytest.importorskip("torch")
     if not gpu_available:
@@ -423,17 +483,8 @@ def test_rewritten_forward_loss_matches_reference(fresh_install, enable_env):
     instance.config = _Config()
     instance.lm_head = torch.nn.Linear(H, V, bias=False).to(device).to(torch.bfloat16)
 
-    def _reference_loss(logits, labels, vocab_size, **kw):
-        # Mirror unsloth_fused_ce_loss's causal one-token label shift.
-        shifted = labels.clone()
-        shifted[..., :-1] = labels[..., 1:]
-        shifted[..., -1] = -100
-        return torch.nn.functional.cross_entropy(
-            logits.float().view(-1, vocab_size),
-            shifted.view(-1),
-            ignore_index=-100,
-        )
-    instance.loss_function = _reference_loss
+    from transformers.loss.loss_utils import ForCausalLMLoss
+    instance.loss_function = ForCausalLMLoss
 
     hidden = torch.randn(B, T, H, device=device, dtype=torch.bfloat16, requires_grad=True)
     labels = torch.randint(0, V, (B, T), device=device)
@@ -663,16 +714,8 @@ def _toy_instance(cls, dtype, V=64, H=32):
     inst = cls()
     inst.config = _Config()
     inst.lm_head = torch.nn.Linear(H, V, bias=False).to(device).to(dtype)
-    def _reference_loss(logits, labels, vocab_size, **kw):
-        shifted = labels.clone()
-        shifted[..., :-1] = labels[..., 1:]
-        shifted[..., -1] = -100
-        return torch.nn.functional.cross_entropy(
-            logits.float().view(-1, vocab_size),
-            shifted.view(-1),
-            ignore_index=-100,
-        )
-    inst.loss_function = _reference_loss
+    from transformers.loss.loss_utils import ForCausalLMLoss
+    inst.loss_function = ForCausalLMLoss
     return inst
 
 

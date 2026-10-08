@@ -227,6 +227,7 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
     pass
 
     # Now patch the losses!
+    UnslothForCausalLMLoss._unsloth_fused_loss = UnslothForCausalLMLoss
     import transformers.modeling_utils
     LOSS_MAPPING = transformers.loss.loss_utils.LOSS_MAPPING
     # Patch every key still aliased to the stock ForCausalLMLoss. PreTrainedModel

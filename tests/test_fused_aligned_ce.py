@@ -31,6 +31,7 @@ from unsloth_zoo.fused_losses.ast_rewriter import (
     rewrite_forward_source_spliced,
 )
 from unsloth_zoo.fused_losses.forward_adapter import EMPTY_LOGITS, unsloth_fused_lm_head_loss
+from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss
 
 
 @pytest.fixture(autouse = True, scope = "module")
@@ -202,6 +203,7 @@ def _compile(src):
         torch = torch, os = os, CrossEntropyLoss = CrossEntropyLoss,
         unsloth_fused_lm_head_loss = unsloth_fused_lm_head_loss, EMPTY_LOGITS = EMPTY_LOGITS,
         ForCausalLMLoss = ForCausalLMLoss,
+        _can_fuse_loss = _can_fuse_loss,
     )
     exec(textwrap.dedent(src), ns)
     return ns["forward"]
@@ -276,6 +278,8 @@ def test_fused_matches_original(name, monkeypatch):
     src = FIXTURES[name][0]
     original, fused = _compile(src), _compile(rewrite_forward_source_spliced(src)[0])
     model, labels = _model(), _labels()
+    if name != "cohere_asr":
+        del model.loss_function  # Legacy aligned CE does not consult this attribute.
     ref = _run(original, model, name, labels)
     out = _run(fused, model, name, labels)
     assert out[1] is EMPTY_LOGITS

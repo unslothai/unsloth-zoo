@@ -20,6 +20,8 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from unsloth_zoo.fused_losses.ast_rewriter import rewrite_forward_source
+from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss
+from transformers.loss.loss_utils import ForCausalLMLoss
 
 
 PLAIN_FORWARD = '''
@@ -148,14 +150,7 @@ class _Tiny(torch.nn.Module):
         self.model = _Inner(multiplier)
         self.config = _Config(vocab)
 
-    def loss_function(self, logits=None, labels=None, vocab_size=None, **kwargs):
-        logits = logits.float()
-        shifted = torch.empty_like(labels)
-        shifted[..., :-1] = labels[..., 1:]
-        shifted[..., -1] = -100
-        return torch.nn.functional.cross_entropy(
-            logits.view(-1, vocab_size), shifted.view(-1), ignore_index=-100
-        )
+    loss_function = staticmethod(ForCausalLMLoss)
 
     def forward(self, hidden_states, labels=None, **kwargs):
         logits = self.lm_head(hidden_states) * self.model.lm_head_multiplier
@@ -181,6 +176,7 @@ def _install_rewritten(cls):
     ns = {
         "os": os,
         "torch": torch,
+        "_can_fuse_loss": _can_fuse_loss,
         "unsloth_fused_lm_head_loss": unsloth_fused_lm_head_loss,
         "EMPTY_LOGITS": EMPTY_LOGITS,
     }
