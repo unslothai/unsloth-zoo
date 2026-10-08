@@ -634,7 +634,6 @@ def requires_grad_for_gradient_checkpointing(model):
             try:
                 embeddings = module.get_input_embeddings()
             except NotImplementedError:
-                # Vision / audio towers have no token embedding; the pre-forward hook below is their path.
                 logger.info(
                     f"Unsloth: `{module_name}` has no input embeddings; using a pre-forward hook."
                 )
