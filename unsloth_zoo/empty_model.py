@@ -25,6 +25,9 @@ __all__ = [
     "vllm_moe_expert_weights",
     "verify_vllm_moe_experts_match_checkpoint",
     "extract_vision_layers",
+    "align_vision_tower_names",
+    "vision_tower_census",
+    "vllm_vision_name_to_hf",
     "get_model_layer_config",
     "compare_attributes",
     "copy_attributes",
@@ -1473,6 +1476,102 @@ def _get_nested_attr(obj, attr_path: str):
     except (AttributeError, IndexError):
         return None
     return None
+
+
+_VISION_MODEL_SEGMENT = ".vision_model."
+
+
+def _vision_tower_is_flat(new_model, parent_path, child, cache):
+    """True when the HF module at parent_path owns `child` directly and has no `vision_model`.
+
+    vLLM's SigLIP keeps the inner `vision_model` (tower.vision_model.encoder...). transformers 5
+    moved embeddings / encoder / post_layernorm onto SiglipVisionModel itself, while 4.x still
+    nests them. Decided from the module that was actually built, not from a version number.
+    """
+    key = (parent_path, child)
+    if key not in cache:
+        module = _get_nested_attr(new_model, parent_path)
+        cache[key] = (
+            isinstance(module, torch.nn.Module)
+            and not isinstance(getattr(module, "vision_model", None), torch.nn.Module)
+            and hasattr(module, child)
+        )
+    return cache[key]
+
+
+def vllm_vision_name_to_hf(name, new_model, cache = None):
+    """Map a vLLM vision weight name onto the HF model's layout (drops `.vision_model.` if flat)."""
+    if cache is None: cache = {}
+    index = name.find(_VISION_MODEL_SEGMENT)
+    if index <= 0:
+        return name
+    parent_path = name[:index]
+    rest = name[index + len(_VISION_MODEL_SEGMENT):]
+    if _vision_tower_is_flat(new_model, parent_path, rest.split(".", 1)[0], cache):
+        return f"{parent_path}.{rest}"
+    return name
+
+
+def align_vision_tower_names(new_model, quant_state_dict, layer_names):
+    """Rename vLLM vision keys and layer templates to the HF tower layout.
+
+    Returns (quant_state_dict, layer_names, flattened_tower_paths). Unchanged when the HF tower
+    is nested like vLLM's (transformers 4.x) or the model has no SigLIP-style tower.
+    """
+    from collections import OrderedDict
+    cache = {}
+    renamed = OrderedDict()
+    for key, value in quant_state_dict.items():
+        new_key = vllm_vision_name_to_hf(key, new_model, cache)
+        if new_key != key and new_key in quant_state_dict:
+            raise RuntimeError(
+                f"Unsloth: vLLM state dict has both `{key}` and `{new_key}`; cannot map the vision tower."
+            )
+        renamed[new_key] = value
+    layer_names = list(dict.fromkeys(vllm_vision_name_to_hf(name, new_model, cache) for name in layer_names))
+    flattened = sorted({parent_path for (parent_path, _), flat in cache.items() if flat})
+    return renamed, layer_names, flattened
+
+
+def vision_tower_census(new_model, reference_model, tower_paths):
+    """Problems in the rebuilt towers vs the meta reference: [(name, problem)], empty when complete.
+
+    Every parameter and buffer of the reference tower must exist in the rebuilt tower with the
+    same shape and must not be left on the meta device, and no module may alias itself.
+    """
+    problems = []
+    for tower_path in tower_paths:
+        tower = _get_nested_attr(new_model, tower_path)
+        reference = _get_nested_attr(reference_model, tower_path)
+        if not isinstance(tower, torch.nn.Module) or not isinstance(reference, torch.nn.Module):
+            problems.append((tower_path, "tower module not found"))
+            continue
+        for module_name, module in tower.named_modules():
+            for child_name, child in module._modules.items():
+                if child is module:
+                    problems.append((f"{tower_path}.{module_name}.{child_name}".replace("..", "."), "module aliases itself"))
+        for kind, rebuilt, expected in (
+            ("parameter", dict(tower.named_parameters()), dict(reference.named_parameters())),
+            ("buffer", dict(tower.named_buffers()), dict(reference.named_buffers())),
+        ):
+            for name, ref in expected.items():
+                full = f"{tower_path}.{name}"
+                got = rebuilt.get(name)
+                if got is None:
+                    problems.append((full, f"{kind} missing"))
+                    continue
+                # bitsandbytes packs 4-bit weights; the logical shape lives on quant_state
+                quant_state = getattr(got, "quant_state", None)
+                shape = tuple(getattr(quant_state, "shape", None) or got.shape)
+                if shape != tuple(ref.shape):
+                    problems.append((full, f"{kind} shape {shape} != {tuple(ref.shape)}"))
+                elif got.device.type == "meta":
+                    problems.append((full, f"{kind} still on meta"))
+            for name in rebuilt.keys() - expected.keys():
+                if "scale" in name.rsplit(".", 1)[-1]:
+                    continue  # quantized layers add weight_scale / weight_scale_inv
+                problems.append((f"{tower_path}.{name}", f"unexpected {kind}"))
+    return problems
 
 
 def vllm_moe_expert_weights(experts, where, config = None):
