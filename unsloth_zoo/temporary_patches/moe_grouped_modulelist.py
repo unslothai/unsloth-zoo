@@ -1023,7 +1023,7 @@ def _restore_block(module):
     if getattr(getattr(module, "forward", None), "__func__", None) is grouped_moe_forward:
         module.forward = module._orig_moe_forward   # only restore our own patch
     for attr in ("_orig_moe_forward", "_unsloth_moe_spec", "_moe_recompute",
-                 "_moe_cache", "_cached_gate_up", "_cached_down", "_moe_ready"):
+                 "_moe_cache", "_cached_gate_up", "_cached_down", "_moe_ready", "_moe_projs"):
         if hasattr(module, attr):
             delattr(module, attr)
     return True

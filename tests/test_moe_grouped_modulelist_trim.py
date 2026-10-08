@@ -62,3 +62,14 @@ def test_projection_lists_spot_check_without_readiness_change():
     blk.experts[-1]._modules["up_proj"] = blk.experts[0].up_proj   # entry untouched
     again = ML._block_projs(blk, blk.experts, spec)
     assert again is not projs and again.up[-1] is blk.experts[0].up_proj
+
+
+def test_disable_drops_the_projection_lists():
+    """disable_grouped_moe leaves no reference to the experts or their projections on the block."""
+    model, blk = L.build("qwen3")
+    L.enable(model, blk)
+    x = torch.randn(1, 64, L.H, device = "cuda", dtype = L.DT)
+    assert LY._engages(blk, x)
+    assert "_moe_projs" in blk.__dict__
+    ML.disable_grouped_moe(model)
+    assert "_moe_projs" not in blk.__dict__ and "_moe_ready" not in blk.__dict__
