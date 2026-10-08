@@ -1945,7 +1945,7 @@ _CLEF_LORA_TARGETS = ("q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "in
 @contextlib.contextmanager
 def _decoder_training(model, gradient_checkpointing = True):
     """What `MLXTrainer` sets up around a run for a decoder: differentiable kernels in place of the fused inference ones."""
-    from ..gated_delta_vjp import patch_gated_delta, patch_gated_delta_vlm, patch_gated_delta_vlm_shared
+    from unsloth_zoo.gated_delta_vjp import patch_gated_delta, patch_gated_delta_vlm, patch_gated_delta_vlm_shared
     from .compile import model_has_gated_delta_layers, model_has_qwen35_attention_layers
     from .loader import _disable_fused_input_projections, _disable_fused_mrope, _fix_qwen35_attention_cache
     from .utils import acquire_mlx_training_patches, apply_gradient_checkpointing, release_mlx_training_patches, remove_gradient_checkpointing
