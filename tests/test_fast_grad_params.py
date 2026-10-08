@@ -185,7 +185,7 @@ def test_trainer_bitwise(tmp_path, kind, ga, max_grad_norm, set_to_none):
         pytest.importorskip("trl")
     events = {2 * ga: _freeze_after_backward, 4 * ga + 1: _unfreeze}
     c = _both(_llama, tmp_path, kind = kind, ga = ga, max_grad_norm = max_grad_norm, events = events,
-              set_to_none = set_to_none, expect_clip = max_grad_norm > 0 or TV >= (5, 17))
+              set_to_none = set_to_none, expect_clip = max_grad_norm > 0 or TV >= (5, 3))
     assert c["zero_grad"] >= 10
 
 
