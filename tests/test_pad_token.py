@@ -248,6 +248,20 @@ def test_encoder_decoder_pad_eos_exemption_needs_the_declared_alias(pad_token):
         fix_pad_token(tok, model_config=cfg)
 
 
+@pytest.mark.parametrize("pad_id, eos_id", [(-1, -1), (50257, 50256), (50257, None)])
+def test_encoder_decoder_exemption_needs_a_valid_config_declared_alias(pad_id, eos_id):
+    # Only the config's own EOS counts, and the shared id must be a real token id.
+    tok = FakeTokenizer({"<|endoftext|>": pad_id}, pad_token="<|endoftext|>", eos_token="<|endoftext|>")
+    tok.unk_token = "<|endoftext|>"
+    cfg = type(
+        "Cfg",
+        (),
+        {"is_encoder_decoder": True, "vocab_size": 51865, "pad_token_id": pad_id, "eos_token_id": eos_id},
+    )()
+    with pytest.raises(RuntimeError):
+        fix_pad_token(tok, model_config=cfg)
+
+
 def test_config_declared_pad_used_regardless_of_model_type():
     # The config-declared-pad rescue is model-type agnostic: any model whose config
     # declares a valid, distinct pad id pointing at an existing token gets it reused,

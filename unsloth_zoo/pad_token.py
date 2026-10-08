@@ -225,12 +225,16 @@ def _config_declared_pad(inner, cfg, eos_token, eos_token_ids, vocab_size):
     return candidate
 
 
-def _encoder_decoder_pads_with_eos(cfg, eos_token_ids):
-    """True when an encoder-decoder config itself declares pad_token_id as an EOS id."""
+def _encoder_decoder_pads_with_eos(cfg, vocab_size):
+    """True when an encoder-decoder config itself declares a valid pad_token_id equal to its own EOS."""
     if cfg is None or not getattr(cfg, "is_encoder_decoder", False):
         return False
     pad_token_id = getattr(cfg, "pad_token_id", None)
-    return type(pad_token_id) is int and pad_token_id in eos_token_ids
+    if type(pad_token_id) is not int or pad_token_id < 0:
+        return False
+    if vocab_size is not None and pad_token_id >= vocab_size:
+        return False
+    return pad_token_id in _eos_id_set(getattr(cfg, "eos_token_id", None))
 
 
 def _single_token_id(inner, token, vocab_size, eos_token_ids=frozenset()):
@@ -373,9 +377,8 @@ def fix_pad_token(
     if (
         new_pad is None
         and reason == "equals_eos"
-        and _encoder_decoder_pads_with_eos(cfg, eos_token_ids)
+        and _encoder_decoder_pads_with_eos(cfg, vocab_size)
         and getattr(inner, "pad_token_id", None) == cfg.pad_token_id
-        and (vocab_size is None or cfg.pad_token_id < vocab_size)
     ):
         # Whisper (all but large-v3) declares pad == eos itself; adding a token would only
         # raise below. Seq2seq collators mask labels by attention mask, so keep it as is.
