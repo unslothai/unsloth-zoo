@@ -1187,9 +1187,7 @@ def _check_torch_grouped_mm_supported():
     return _run_probe_eagerly(_probe_torch_grouped_mm_supported)
 
 
-# On some ROCm GPUs (Radeon 680M gfx1035 under HSA_OVERRIDE_GFX_VERSION=10.3.0, unsloth#12391) the
-# grouped_mm kernel segfaults instead of raising, which no try/except can catch. Both probe shapes are
-# first run in a throwaway interpreter; only if it survives do the in-process probes run as before.
+# Some ROCm GPUs segfault in grouped_mm instead of raising (unsloth#12391): run the kernels in a throwaway interpreter first.
 _GROUPED_MM_CRASH_PROBE = r"""
 import sys
 if sys.platform == "win32":   # no "python.exe has stopped working" dialog when the kernel faults
@@ -1214,17 +1212,15 @@ def _grouped_mm_survives_out_of_process(device):
     global _GROUPED_MM_SURVIVES
     if _GROUPED_MM_SURVIVES is not None: return _GROUPED_MM_SURVIVES
     _GROUPED_MM_SURVIVES = True
-    # AMD only: NVIDIA (CUDA) and Intel (XPU) builds never launch the child and keep the in-process probe as is.
+    # AMD only: CUDA and XPU keep the in-process probe.
     if getattr(torch.version, "hip", None) is None or device.type != "cuda": return True
-    # A Python kernel already replaces the native one in this process (Studio's gfx120X fallback): a child
-    # without it would crash on the very kernel this process never calls.
+    # Studio's Python _grouped_mm fallback (gfx120X) is active: this process never runs the native kernel.
     try:
         if "CUDA (inactive):" in torch._C._dispatch_dump("aten::_grouped_mm"): return True
     except Exception:
         pass
     import subprocess
-    # A fresh interpreter, not multiprocessing: spawn re-imports the caller's __main__.
-    # Device setup sits outside the child's try, so a child that never reaches the kernel also reads as unsafe.
+    # Not multiprocessing: spawn re-imports the caller's __main__.
     try:
         result = subprocess.run(
             [sys.executable, "-c", _GROUPED_MM_CRASH_PROBE, str(device.index)],

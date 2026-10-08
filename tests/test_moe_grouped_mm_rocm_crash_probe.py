@@ -39,7 +39,6 @@ def fake_rocm(monkeypatch):
 def test_crash_probe_runs_out_of_process(monkeypatch, fake_rocm, child, survives):
     monkeypatch.setattr(moe_utils, "_GROUPED_MM_CRASH_PROBE", child)
     assert moe_utils._grouped_mm_survives_out_of_process(fake_rocm) is survives
-    # Cached: the child is not launched again.
     monkeypatch.setattr(moe_utils, "_GROUPED_MM_CRASH_PROBE", "raise SystemExit(1)")
     assert moe_utils._grouped_mm_survives_out_of_process(fake_rocm) is survives
 
@@ -62,7 +61,6 @@ def test_crash_probe_never_runs_on_nvidia_or_intel(monkeypatch, device):
 
 
 def test_python_kernel_override_skips_child(monkeypatch, fake_rocm):
-    # Studio swaps in a Python _grouped_mm on gfx120X; this process never calls the native kernel then.
     lib = torch.library.Library("aten", "IMPL")
     lib.impl("_grouped_mm", lambda *a, **k: None, "CUDA")
     try:
