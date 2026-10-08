@@ -36,6 +36,13 @@ import test_moe_grouped_modulelist_lora as L  # noqa: E402  (skips without group
 from unsloth_zoo.temporary_patches import moe_grouped_modulelist as ML  # noqa: E402
 from unsloth_zoo.temporary_patches import moe_ready_epoch as RE  # noqa: E402
 from peft import LoraConfig  # noqa: E402
+from unsloth_zoo.temporary_patches import gpt_oss_grouped_qlora as GQ  # noqa: E402
+
+# The NF4 pointer-table stack kernel is CUDA-only (HIP has no libdevice mul_rn): elsewhere the
+# ModuleList path keeps the bitsandbytes builder and never builds `_unsloth_nf4_stack_tables`.
+NF4_TABLES = torch.cuda.is_available() and GQ.stacked_dequant_available(
+    torch.device("cuda", torch.cuda.current_device()))
+needs_nf4_tables = pytest.mark.skipif(not NF4_TABLES, reason = "stacked NF4 dequant kernel is CUDA-only")
 
 FAST = "UNSLOTH_MOE_FAST_READY"
 MID = L.E // 2
@@ -194,7 +201,10 @@ def test_modulelist_steady_state_counters(opt):
     assert ML.CALLS["grouped_lora"] - g0 == 6   # forward + replay per step
     assert d["full"] == 0 and d["table_full"] == 0, d
     assert d["lean"] == 3 and d["cheap"] == 3, d
-    assert d["table_cheap"] >= 3 * 4, d
+    if NF4_TABLES:
+        assert d["table_cheap"] >= 3 * 4, d
+    else:
+        assert d["table_cheap"] == 0, d
 
 
 def test_kill_switch_reads_every_expert(monkeypatch):
@@ -328,6 +338,24 @@ def test_modulelist_invalidation(name, stack):
         assert _delta(before)["cheap"] == 0 and _delta(before)["full"] == 1
 
 
+@needs_nf4_tables
+@pytest.mark.parametrize("change", ["nested_absmax", "quant_state"])
+@pytest.mark.parametrize("stack", [True, False])
+def test_mixed_block_tracks_its_nf4_states(change, stack):
+    """Plain gate / up with NF4 down: an interior down quant state swap and a step re-key the tables."""
+    model, blk = _ml("nf4_down", stack)
+    x = _x()
+    _warm(blk, x)
+    w = blk.experts[MID].down_proj.base_layer.weight
+    if change == "nested_absmax":
+        w.quant_state.state2.absmax = w.quant_state.state2.absmax * 2
+    else:
+        new = _new_params4bit(w, 91)
+        w.data, w.quant_state = new.data, new.quant_state
+    _opt_step()
+    _agree(blk, x, True)
+
+
 def test_disable_merge_unmerge_train_eval_and_grad_toggle():
     model, blk = _ml("nf4", False, lora_dropout = 0.1)
     x = _x()
@@ -360,6 +388,7 @@ def test_dtype_and_device_moves():
     _agree(blk, x, True)
 
 
+@needs_nf4_tables
 def test_nf4_device_round_trip_rebuilds_the_tables():
     model, blk = _ml("nf4", True)
     x = _x()
@@ -377,6 +406,7 @@ def test_nf4_device_round_trip_rebuilds_the_tables():
     assert torch._C.TensorBase.data_ptr(w) in ptrs
 
 
+@needs_nf4_tables
 def test_move_releases_the_tables():
     """A move drops the tables (and the storages they hold) instead of pinning the old copy."""
     model, blk = _ml("nf4", True)
@@ -389,6 +419,7 @@ def test_move_releases_the_tables():
     _agree(blk, x, True)
 
 
+@needs_nf4_tables
 def test_child_move_releases_the_owner_tables():
     """Moving one expert or one projection drops the tables held on the experts container."""
     model, blk = _ml("nf4", True)
@@ -427,6 +458,7 @@ def test_tracked_modules_still_pickle():
     pickle.loads(pickle.dumps(blk.experts[MID]))
 
 
+@needs_nf4_tables
 def test_tables_hold_the_storages():
     """A hook-less swap leaves the old storage alive in the table (stale values, not freed memory)."""
     model, blk = _ml("nf4", True)

@@ -190,8 +190,6 @@ def scan(root):
 
 _get_weight = itemgetter("weight")
 _get_bias = methodcaller("get", "bias")
-_get_quant_state = attrgetter("quant_state")
-_get_absmax = attrgetter("absmax")
 _get_requires_grad = attrgetter("requires_grad")
 _ptr = torch._C.TensorBase.data_ptr
 _get_parameters = itemgetter("_parameters")
@@ -200,6 +198,14 @@ _get_parameters = itemgetter("_parameters")
 def _compute_dtypes(d):
     """Instance-level compute dtypes of a base projection (bnb Linear4bit / unsloth's loader)."""
     return (d.get("compute_dtype"), d.get("_pre_set_compute_dtype"))
+
+
+def _get_qs(w):
+    return w.__dict__.get("quant_state")
+
+
+def _qs_key(qs):
+    return None if qs is None else _qs_ptrs(qs)
 
 
 def _qs_ptrs(qs):
@@ -229,10 +235,9 @@ class Lean:
             self.wptrs = list(map(_ptr, self.ws))
             self.rgs = list(map(_get_requires_grad, self.ws))
             self.brgs = [b is not None and b.requires_grad for b in self.bs]
-            qss = [w.__dict__.get("quant_state") for w in self.ws]
-            # All 4-bit or none (the readiness checks decline mixes); else no quant state check.
-            self.qss = qss if all(q is not None for q in qss) else None
-            self.aptrs = None if self.qss is None else list(map(_qs_ptrs, qss))
+            # Per weight: a block may mix plain and NF4 projections (e.g. NF4 down only).
+            self.qss = list(map(_get_qs, self.ws))
+            self.aptrs = list(map(_qs_key, self.qss))
 
     def same(self):
         try:
@@ -248,10 +253,9 @@ class Lean:
                 if any(self.brgs) or bs.count(None) != len(bs):
                     if [b is not None and b.requires_grad for b in bs] != self.brgs:
                         return False
-                if self.qss is not None:
-                    qss = list(map(_get_quant_state, ws))
-                    if not all(map(is_, qss, self.qss)) or list(map(_qs_ptrs, qss)) != self.aptrs:
-                        return False
+                qss = list(map(_get_qs, ws))
+                if not all(map(is_, qss, self.qss)) or list(map(_qs_key, qss)) != self.aptrs:
+                    return False
             return True
         except Exception:
             return False

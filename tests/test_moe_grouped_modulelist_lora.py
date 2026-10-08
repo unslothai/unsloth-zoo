@@ -129,11 +129,11 @@ def build(kind, base = "bf16", r = 8, targets = "all", lora_dtype = torch.float3
     torch.manual_seed(seed)
     _, g, u, d, _ = KINDS[kind]
     blk = (_hf_block(kind) if prefer_hf else None) or _synthetic_block(kind)
-    if base == "nf4":
+    if base in ("nf4", "nf4_down"):   # nf4_down: plain gate / up, NF4 down (a mixed block)
         pytest.importorskip("bitsandbytes")
         if not ML.HAS_BNB:
             pytest.skip("bitsandbytes not usable")
-        blk = _to_4bit(blk, (g, u, d))
+        blk = _to_4bit(blk, (g, u, d) if base == "nf4" else (d,))
     blk = blk.to(DEV)
     for p in blk.parameters():
         if p.dtype.is_floating_point:
@@ -142,7 +142,7 @@ def build(kind, base = "bf16", r = 8, targets = "all", lora_dtype = torch.float3
     root = nn.Module()
     root.mlp = blk
     # As on a from_pretrained(load_in_4bit=True) model: PEFT then wraps with lora.bnb.Linear4bit.
-    root.is_loaded_in_4bit = base == "nf4"
+    root.is_loaded_in_4bit = base != "bf16"
     tm = {"all": [g, u, d], "gate": [g], "gate_down": [g, d], "up": [u], "down": [d]}[targets]
     cfg = LoraConfig(r = r, lora_alpha = 2 * r, target_modules = tm, **lora_kw)
     model = get_peft_model(root, cfg)
