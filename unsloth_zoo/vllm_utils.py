@@ -1013,12 +1013,14 @@ pass
 
 def _get_multimodal_engine_args(config, is_vision_model):
     # Audio = 0: profiling the Gemma-4 audio tower aborts with Unsloth's compiled audio modules.
+    # Other audio models (Gemma3n, Qwen2-Audio) keep vLLM's default audio quota.
     limits = {"image": 1, "video": 0}
-    if getattr(config, "audio_config", None) is not None:
+    is_gemma4 = _is_gemma4_config(config)
+    if is_gemma4 and getattr(config, "audio_config", None) is not None:
         limits["audio"] = 0
     if is_vision_model:
         return {"limit_mm_per_prompt": limits}
-    if not _is_gemma4_config(config):
+    if not is_gemma4:
         return {}
     # language_model_only is in vLLM's AOT cache key; zeroed limit_mm_per_prompt is not, so a
     # multimodal run's cached artifact would be reloaded and crash (vllm-project/vllm#50891).

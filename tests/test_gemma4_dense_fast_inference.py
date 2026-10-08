@@ -50,6 +50,11 @@ def test_vision_load_without_audio_is_unchanged():
     }
 
 
+def test_other_audio_models_keep_their_audio_quota():
+    gemma3n = SimpleNamespace(model_type = "gemma3n", vision_config = SimpleNamespace(), audio_config = SimpleNamespace())
+    assert _get_multimodal_engine_args(gemma3n, True) == {"limit_mm_per_prompt": {"image": 1, "video": 0}}
+
+
 def test_text_only_gemma4_runs_language_model_only():
     text_config = SimpleNamespace(model_type = "gemma4_text")
     for config in (text_config, _gemma4()):
