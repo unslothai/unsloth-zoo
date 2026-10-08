@@ -587,6 +587,11 @@ def _stack_projs_lora(projs, name):
         owner.register_parameter(_STACK_NAME, stack)
         owner.__dict__["_unsloth_stack_projs"] = members
         owner.register_load_state_dict_post_hook(_stacked_load_post_hook)
+    try:   # the `del m._parameters` above skips torch's registration hooks
+        from unsloth_zoo.fast_grad_params import bump
+        bump()
+    except Exception:
+        pass
 
 
 def _stack_block_lora(block, spec):
@@ -961,7 +966,7 @@ def auto_enable_grouped_moe(model):
 
 def wrap_loader_for_grouped_moe(func):
     """Wrap a from_pretrained / get_peft_model leaf (returns model or (model, tokenizer))
-    so grouped MoE is enabled before it returns. Idempotent."""
+    so grouped MoE and fast grad params are enabled before it returns. Idempotent."""
     if func is None or getattr(func, "_unsloth_grouped_moe_wrapped", False):
         return func
     import functools
@@ -969,10 +974,16 @@ def wrap_loader_for_grouped_moe(func):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         result = func(*args, **kwargs)
+        model = result[0] if isinstance(result, tuple) and result else result
         try:
-            auto_enable_grouped_moe(result[0] if isinstance(result, tuple) and result else result)
+            auto_enable_grouped_moe(model)
         except Exception:
             pass  # optional speedup; never block model loading
+        try:   # Trainer's per-step clip / zero_grad without module-tree walks
+            from unsloth_zoo.fast_grad_params import enable_fast_grad_params
+            enable_fast_grad_params(model)
+        except Exception:
+            pass
         return result
 
     wrapper._unsloth_grouped_moe_wrapped = True
