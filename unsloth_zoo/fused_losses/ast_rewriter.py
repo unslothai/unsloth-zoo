@@ -886,11 +886,21 @@ def rewrite_count_aware_ce_spliced(source: str):
     block = _labels_if(fn)
     if block is None or block.orelse:
         return (None, None)
-    # A block that changes which labels count (Moshi's masked_fill) would divide by the wrong number.
-    for sub in ast.walk(block):
-        if (isinstance(sub, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "labels" for t in sub.targets)
-                and not _is_labels_cast(sub.value)):
-            return (None, None)
+    # Relabelling anywhere (Moshi's masked_fill, Qwen2-Audio's merge that expands labels) would divide by
+    # a count of the batch's labels, not the ones the CE sees.
+    def rebinds_labels(sub):
+        if isinstance(sub, ast.Assign):
+            if (len(sub.targets) == 1 and isinstance(sub.targets[0], ast.Name) and sub.targets[0].id == "labels"
+                    and _is_labels_cast(sub.value)):
+                return False
+            targets = sub.targets
+        elif isinstance(sub, (ast.AugAssign, ast.AnnAssign, ast.NamedExpr)):
+            targets = [sub.target]
+        else:
+            return False
+        return any(isinstance(n, ast.Name) and n.id == "labels" for t in targets for n in ast.walk(t))
+    if any(rebinds_labels(sub) for sub in ast.walk(fn)):
+        return (None, None)
 
     ctors = [n for n in ast.walk(fn) if isinstance(n, ast.Call) and ast.unparse(n.func) in _CE_CTORS]
     functional = [n for n in ast.walk(fn) if isinstance(n, ast.Call) and ast.unparse(n.func) in _FUNCTIONAL_CE]

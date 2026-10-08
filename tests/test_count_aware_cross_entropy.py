@@ -394,3 +394,34 @@ def test_fused_heads_do_not_take_the_count_route(name):
     new, route, _ = _fused(cls)
     assert route != "count" and "unsloth_count_aware_cross_entropy" not in new
     assert not getattr(cls, "_unsloth_counts_unshifted_labels", False)
+
+
+def test_a_forward_that_relabels_before_the_labels_block_keeps_its_mean():
+    # Qwen2-Audio's legacy merge expands labels; a count of the batch's labels would not match the CE's.
+    line = next(l for l in OPEN_LLAMA_4_57_6.splitlines() if l.strip() == "loss = None")
+    indent = line[: len(line) - len(line.lstrip())]
+    relabelled = OPEN_LLAMA_4_57_6.replace(
+        line, f"{indent}hidden_states, labels = self._merge(hidden_states, labels)\n{line}", 1)
+    assert rewrite_count_aware_ce_spliced(relabelled) == (None, None)
+    assert rewrite_count_aware_ce_spliced(OPEN_LLAMA_4_57_6)[0] is not None
+
+
+def test_count_kwargs_read_a_module_loss_forward():
+    from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_loss_count_kwargs
+
+    class Strict(nn.Module):
+        def forward(self, logits, labels, vocab_size = None):
+            return logits.sum()
+
+    class Counted(nn.Module):
+        def forward(self, logits, labels, num_items_in_batch = None):
+            return logits.sum()
+
+    def positional_only(logits, labels, num_items_in_batch, /):
+        return logits.sum()
+
+    count = torch.tensor(7)
+    assert unsloth_loss_count_kwargs(nn.CrossEntropyLoss(), count) == {}
+    assert unsloth_loss_count_kwargs(Strict(), count) == {}
+    assert unsloth_loss_count_kwargs(positional_only, count) == {}
+    assert unsloth_loss_count_kwargs(Counted(), count) == {"num_items_in_batch": count}

@@ -25,6 +25,7 @@ __all__ = [
 import torch
 from typing import Optional, Tuple, Callable, Dict
 import inspect
+import weakref
 import functools
 import math
 import os
@@ -701,19 +702,23 @@ def unsloth_count_aware_cross_entropy(
 pass
 
 
-_LOSS_TAKES_COUNT = {}
+_LOSS_TAKES_COUNT = weakref.WeakKeyDictionary()
 
 def _loss_takes_count(loss_function):
     # All Unsloth Zoo code licensed under LGPLv3
-    key = getattr(loss_function, "__func__", loss_function)
+    # A module's own signature is Module.__call__'s (*args, **kwargs): read its forward. Keyed on the
+    # function, so the cache never keeps a module or its buffers alive.
+    target = loss_function.forward if isinstance(loss_function, torch.nn.Module) else loss_function
+    key = getattr(target, "__func__", target)
     try:
         return _LOSS_TAKES_COUNT[key]
     except (KeyError, TypeError):
         pass
     try:
-        parameters = inspect.signature(loss_function).parameters.values()
+        parameters = inspect.signature(target).parameters.values()
         takes = any(
-            p.name == "num_items_in_batch" or p.kind == inspect.Parameter.VAR_KEYWORD
+            p.kind == inspect.Parameter.VAR_KEYWORD
+            or (p.name == "num_items_in_batch" and p.kind != inspect.Parameter.POSITIONAL_ONLY)
             for p in parameters
         )
     except Exception:
