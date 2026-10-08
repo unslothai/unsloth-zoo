@@ -67,6 +67,7 @@ TEMPORARY_PATCHES_SUBMODULES = [
     "unsloth_zoo.temporary_patches.deepseek_v4",
     "unsloth_zoo.temporary_patches.ernie4_5_moe",
     "unsloth_zoo.temporary_patches.fla_vendor",
+    "unsloth_zoo.temporary_patches.gdn_causal_conv1d",
     "unsloth_zoo.temporary_patches.flex_attention_bwd",
     "unsloth_zoo.temporary_patches.remote_code_vlm",
     "unsloth_zoo.temporary_patches.gemma",
