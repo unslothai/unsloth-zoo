@@ -30,7 +30,11 @@ if not hasattr(torch.compiler, "set_stance"):
     pytest.skip("torch without set_stance", allow_module_level = True)
 
 from unsloth_zoo import compiler
-from unsloth_zoo.temporary_patches.utils import UNSLOTH_DECODE_COMPILE, UNSLOTH_EAGER_STANCE_OWNED
+from unsloth_zoo.temporary_patches.utils import (
+    UNSLOTH_DECODE_COMPILE,
+    UNSLOTH_EAGER_STANCE_OWNED,
+    unsloth_decode_compile,
+)
 
 
 def _stance():
@@ -69,9 +73,9 @@ def _generated_module(compiled, name = "unsloth_compiled_module_test"):
 def _reset_stance():
     torch._dynamo.reset()
     torch.compiler.set_stance("default")
-    UNSLOTH_EAGER_STANCE_OWNED[0] = False
+    UNSLOTH_EAGER_STANCE_OWNED[0] = None
     yield
-    UNSLOTH_EAGER_STANCE_OWNED[0] = False
+    UNSLOTH_EAGER_STANCE_OWNED[0] = None
     torch.compiler.set_stance("default")
     torch._dynamo.reset()
 
@@ -187,3 +191,50 @@ def test_user_stance_survives_unsloth_inference_then_training():
     assert _stance() == "eager_on_recompile"
     _train(ns, module)
     assert _stance() == "eager_on_recompile"
+
+
+def test_user_stance_set_after_unsloth_claimed_it_is_kept():
+    frames, compiled = _counting_compile()
+    ns = _generated_module(compiled)
+    module = torch.nn.Linear(1, 1)
+    _infer(ns, module)
+    assert _stance() == "eager_on_recompile"
+    torch.compiler.set_stance("eager_on_recompile")  # the user's own choice now
+    _train(ns, module)
+    assert _stance() == "eager_on_recompile"
+
+
+def test_user_force_eager_then_eager_on_recompile_is_kept():
+    frames, compiled = _counting_compile()
+    ns = _generated_module(compiled)
+    module = torch.nn.Linear(1, 1)
+    _infer(ns, module)
+    torch.compiler.set_stance("force_eager")
+    torch.compiler.set_stance("eager_on_recompile")
+    _train(ns, module)
+    assert _stance() == "eager_on_recompile"
+
+
+def test_unsloth_stance_still_reset_after_a_scoped_user_stance():
+    # A `with set_stance(...)` block restores the very object Unsloth installed.
+    frames, compiled = _counting_compile()
+    ns = _generated_module(compiled)
+    module = torch.nn.Linear(1, 1)
+    _infer(ns, module)
+    with torch.compiler.set_stance("force_eager"):
+        pass
+    _train(ns, module)
+    assert _stance() == "default"
+
+
+def test_unsloth_stance_still_reset_after_a_compiled_decode_scope():
+    # The decode scope switches to default and back, installing a new stance object.
+    frames, compiled = _counting_compile()
+    ns = _generated_module(compiled)
+    module = torch.nn.Linear(1, 1)
+    _infer(ns, module)
+    with unsloth_decode_compile():
+        assert _stance() == "default"
+    assert _stance() == "eager_on_recompile"
+    _train(ns, module)
+    assert _stance() == "default"

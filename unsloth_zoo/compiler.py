@@ -489,12 +489,16 @@ def unsloth_training_stance():
     # eager_on_recompile is global: left on by generate() or eval forwards, every recompile
     # in a later training step (new sequence length, model.train() without for_training)
     # would silently run the eager body. Training forwards restore the default stance,
-    # unless the user chose eager_on_recompile themselves.
+    # unless the user chose eager_on_recompile themselves. Every set_stance call installs a
+    # fresh stance object, so ours is still active only if the current one `is` it; a user
+    # set_stance since then (even to eager_on_recompile again) is theirs and stays.
     global INFERENCE_RUNS
     INFERENCE_RUNS = 0
-    if UNSLOTH_EAGER_STANCE_OWNED[0] and torch_dynamo_eval_frame is not None:
-        UNSLOTH_EAGER_STANCE_OWNED[0] = False
-        if torch_dynamo_eval_frame._stance.stance == "eager_on_recompile":
+    owned = UNSLOTH_EAGER_STANCE_OWNED[0]
+    if owned is not None and torch_dynamo_eval_frame is not None:
+        UNSLOTH_EAGER_STANCE_OWNED[0] = None
+        current = torch_dynamo_eval_frame._stance
+        if (owned is True or owned is current) and current.stance == "eager_on_recompile":
             torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = False)
 pass
 
@@ -3153,7 +3157,8 @@ __DYNAMO__RECOMPILING__ = """
             torch_compiler_set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = False)
             # Owned only if this call switched it: a stance the user already chose stays theirs.
             if old_stance != "eager_on_recompile":
-                UNSLOTH_EAGER_STANCE_OWNED[0] = True
+                # The stance object itself, or True where torch keeps no such object.
+                UNSLOTH_EAGER_STANCE_OWNED[0] = getattr(torch_dynamo_eval_frame, "_stance", True)
             if UNSLOTH_ENABLE_LOGGING:
                 logger_compiler.info(
                     f"Unsloth: Removing compiler guards after 1 inference run. "\\

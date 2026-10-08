@@ -97,7 +97,7 @@ def _stance_block(calls):
         "torch": torch,
         "INFERENCE_RUNS": 1,
         "UNSLOTH_DECODE_COMPILE": UNSLOTH_DECODE_COMPILE,
-        "UNSLOTH_EAGER_STANCE_OWNED": [False],
+        "UNSLOTH_EAGER_STANCE_OWNED": [None],
         "UNSLOTH_ENABLE_LOGGING": False,
         "torch_dynamo_eval_frame": type("E", (), {"_stance": stance})(),
         "torch_compiler_set_stance": lambda **kw: calls.append(kw["stance"]),

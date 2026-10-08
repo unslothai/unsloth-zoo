@@ -2098,9 +2098,10 @@ def _settle_abandoned_checkpoint_generator():
 # True only while generate() runs a compiled decode step for a model that opted in. A
 # one-element list so Dynamo guards on the value and retraces when it flips.
 UNSLOTH_DECODE_COMPILE = [False]
-# True while the eager_on_recompile stance is one Unsloth's inference forward set (not the
-# user's). Process wide like the stance, so any generated module's training forward can undo it.
-UNSLOTH_EAGER_STANCE_OWNED = [False]
+# The eager_on_recompile stance object Unsloth's inference forward installed (None if it set
+# none, True where torch keeps no stance object). Process wide like the stance, so any
+# generated module's training forward can undo it, but only while that object is current.
+UNSLOTH_EAGER_STANCE_OWNED = [None]
 _DECODE_COMPILE_LOCK = threading.Lock()
 _DECODE_COMPILE_STATE = {"depth": 0, "stance": None}
 
@@ -2117,6 +2118,7 @@ def unsloth_decode_compile():
             UNSLOTH_DECODE_COMPILE[0] = True
             stance = _current_stance()
             _DECODE_COMPILE_STATE["stance"] = stance
+            _DECODE_COMPILE_STATE["owned"] = _stance_is_owned()
             if set_stance is not None and stance is not None and stance[0] != "default":
                 set_stance("default")
     try:
@@ -2130,6 +2132,9 @@ def unsloth_decode_compile():
                 _DECODE_COMPILE_STATE["stance"] = None
                 if set_stance is not None and stance is not None and stance[0] != "default":
                     set_stance(stance[0], skip_guard_eval_unsafe = stance[1])
+                    # Restoring installs a new stance object: keep Unsloth's claim on it.
+                    if _DECODE_COMPILE_STATE.pop("owned", False):
+                        _claim_current_stance()
 
 
 # Set while generate() runs an eager decode step (no grad, one new token per row) on this
@@ -2166,6 +2171,27 @@ def _eager_during_decode(func, compiled):
     dispatch.__wrapped__ = func
     dispatch._unsloth_compiled_func = compiled
     return dispatch
+
+
+def _stance_is_owned():
+    owned = UNSLOTH_EAGER_STANCE_OWNED[0]
+    if owned is None:
+        return False
+    if owned is True:
+        return True
+    try:
+        import torch._dynamo.eval_frame as eval_frame
+        return owned is eval_frame._stance
+    except Exception:
+        return False
+
+
+def _claim_current_stance():
+    try:
+        import torch._dynamo.eval_frame as eval_frame
+        UNSLOTH_EAGER_STANCE_OWNED[0] = eval_frame._stance
+    except Exception:
+        UNSLOTH_EAGER_STANCE_OWNED[0] = True
 
 
 def _current_stance():
