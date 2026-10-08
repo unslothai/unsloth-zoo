@@ -263,6 +263,11 @@ def _nested_offset_then_step(model, blk):
     _opt_step()
 
 
+def _compute_dtype_then_step(model, blk):
+    blk.experts[MID].down_proj.base_layer.compute_dtype = torch.float16   # attribute write, no hook
+    _opt_step()
+
+
 def _lora_dtype_mid(model, blk):
     blk.experts[MID].up_proj.lora_B.to(torch.float16)   # lora_A / lora_B dtypes now differ
 
@@ -293,6 +298,7 @@ CHANGES = {
     "data_swap_then_step": (_data_swap_then_step, True, {}),
     "nested_absmax_then_step": (_nested_absmax_then_step, True, {}),
     "nested_offset_then_step": (_nested_offset_then_step, True, {}),
+    "compute_dtype_then_step": (_compute_dtype_then_step, False, {}),
     "lora_dtype_mid": (_lora_dtype_mid, False, {}),
     "dropout_mid_train": (_dropout_mid_train, False, {"lora_dropout": 0.1}),
     "hf_hook": (_hf_hook_all, True, {}),
@@ -494,7 +500,8 @@ def _go_forward(ex, x, idx, w):
         return ex(x, idx, w)
 
 
-@pytest.mark.parametrize("change", ["data_swap_then_step", "nested_absmax_then_step", "params4bit_setattr", "disable", "bias_grad_then_step",
+@pytest.mark.parametrize("change", ["data_swap_then_step", "nested_absmax_then_step", "compute_dtype_then_step",
+                                    "params4bit_setattr", "disable", "bias_grad_then_step",
                                     "set_adapter", "first_direct", "hf_hook"])
 def test_gpt_oss_invalidation(change):
     """After each change the fast verdict and forward equal the switch-off ones (bitwise)."""
@@ -524,6 +531,9 @@ def test_gpt_oss_invalidation(change):
         qs = base.weight.quant_state
         assert qs.nested
         qs.state2.absmax = qs.state2.absmax * 2
+        _opt_step()
+    elif change == "compute_dtype_then_step":
+        base.compute_dtype = torch.float16   # readiness stays True; _proj_dtypes picks it up
         _opt_step()
     elif change == "params4bit_setattr":
         base.weight = _new_params4bit(base.weight, 6)

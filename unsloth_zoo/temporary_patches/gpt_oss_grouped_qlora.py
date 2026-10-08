@@ -264,9 +264,9 @@ def _quant_key(weight):
 
 
 def _base_params(experts):
-    """The `_parameters` dict of every expert's base projection (moe_ready_epoch.Lean reads them)."""
+    """The `__dict__` of every expert's base projection (moe_ready_epoch.Lean reads them)."""
     return [
-        p._modules.get("base_layer", p)._parameters
+        p._modules.get("base_layer", p).__dict__
         for projs in (experts._modules["gate_up_projs"], experts._modules["down_projs"])
         for p in projs._modules.values()
     ]

@@ -806,13 +806,13 @@ def _decline(reason, count=True):
 
 
 def _base_params(experts, spec):
-    """The `_parameters` dict of every expert's base projection (moe_ready_epoch.Lean reads them)."""
+    """The `__dict__` of every expert's base projection (moe_ready_epoch.Lean reads them)."""
     out = []
     for ex in experts:
         mods = ex.__dict__["_modules"]
         for name in spec[:3]:
             p = mods[name]
-            out.append(p.__dict__["_modules"].get("base_layer", p).__dict__["_parameters"])
+            out.append(p.__dict__["_modules"].get("base_layer", p).__dict__)
     return out
 
 

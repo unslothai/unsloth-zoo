@@ -194,6 +194,12 @@ _get_quant_state = attrgetter("quant_state")
 _get_absmax = attrgetter("absmax")
 _get_requires_grad = attrgetter("requires_grad")
 _ptr = torch._C.TensorBase.data_ptr
+_get_parameters = itemgetter("_parameters")
+
+
+def _compute_dtypes(d):
+    """Instance-level compute dtypes of a base projection (bnb Linear4bit / unsloth's loader)."""
+    return (d.get("compute_dtype"), d.get("_pre_set_compute_dtype"))
 
 
 def _qs_ptrs(qs):
@@ -207,15 +213,17 @@ def _qs_ptrs(qs):
 
 
 class Lean:
-    """What a hook-less `.data =` / quant_state / absmax swap or requires_grad flip changes, over the
-    base projections' `_parameters` dicts: weight and bias identity, weight address and
-    requires_grad, quant state identity and the addresses its tables embed (_qs_ptrs). Re-read in
-    C-level maps (one optimizer step bumps only the step stamp, so this runs once per block per
-    step)."""
-    __slots__ = ("params", "ws", "wptrs", "rgs", "qss", "aptrs", "bs", "brgs")
+    """What a hook-less `.data =` / quant_state / absmax / compute dtype swap or requires_grad flip
+    changes, over the base projections' `__dict__`s: compute dtypes, weight and bias identity,
+    weight address and requires_grad, quant state identity and the addresses its tables embed
+    (_qs_ptrs). Re-read in C-level maps (one optimizer step bumps only the step stamp, so this runs
+    once per block per step)."""
+    __slots__ = ("dicts", "params", "cds", "ws", "wptrs", "rgs", "qss", "aptrs", "bs", "brgs")
 
-    def __init__(self, params):
-        self.params = params
+    def __init__(self, dicts):
+        self.dicts = dicts
+        self.params = params = list(map(_get_parameters, dicts))
+        self.cds = list(map(_compute_dtypes, dicts))
         self.ws, self.bs = list(map(_get_weight, params)), list(map(_get_bias, params))
         with torch._C.DisableTorchFunctionSubclass():
             self.wptrs = list(map(_ptr, self.ws))
@@ -228,6 +236,8 @@ class Lean:
 
     def same(self):
         try:
+            if list(map(_compute_dtypes, self.dicts)) != self.cds:
+                return False
             params = self.params
             ws, bs = list(map(_get_weight, params)), list(map(_get_bias, params))
             if not (all(map(is_, ws, self.ws)) and all(map(is_, bs, self.bs))):
@@ -254,11 +264,11 @@ class Record:
     over every expert once after any expert-state change; a step re-validation keeps it)."""
     __slots__ = ("stamp", "ctx", "spot", "lean", "drops", "drop_state", "gen", "refs")
 
-    def __init__(self, ctx, spot, params, drops, refs):
+    def __init__(self, ctx, spot, dicts, drops, refs):
         self.stamp = stamp()
         self.ctx = ctx
         self.spot = spot
-        self.lean = Lean(params)
+        self.lean = Lean(dicts)
         self.drops = drops
         self.drop_state = drop_state(drops)
         self.gen = object()
