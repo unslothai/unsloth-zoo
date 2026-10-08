@@ -16,6 +16,7 @@
 
 """Training forwards must not inherit the eager_on_recompile stance that inference sets."""
 
+import gc
 import logging
 import os
 import sys
@@ -443,3 +444,17 @@ def test_user_force_eager_before_inference_is_restored_by_training():
     assert _stance() == "eager_on_recompile"
     _train(ns, module)
     assert _stance() == "force_eager"
+
+
+def test_owned_entry_is_dropped_when_the_caller_replaces_the_stance():
+    # The entry holds the replaced stance (a force_backend may capture anything), so it must not
+    # outlive the owned stance object when the caller swaps it out before any training forward.
+    frames, compiled = _counting_compile()
+    ns = _generated_module(compiled)
+    module = torch.nn.Linear(1, 1)
+    torch.compiler.set_stance("force_eager")
+    _infer(ns, module)
+    assert len(UNSLOTH_EAGER_STANCE_OWNED) == 1
+    torch.compiler.set_stance("default")
+    gc.collect()
+    assert UNSLOTH_EAGER_STANCE_OWNED == []
