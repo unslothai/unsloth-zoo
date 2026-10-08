@@ -10978,6 +10978,8 @@ class MLXDecisionTrainer:
         logging_strategy = self._strategy("logging_strategy", "steps")
         save_steps = _resolve_interval_steps(getattr(args, "save_steps", 0), max_steps)
         save_strategy = self._strategy("save_strategy", "steps" if save_steps else "no")
+        if save_strategy == "best":
+            raise NotImplementedError('Unsloth: decision training on MLX has no save_strategy = "best"; save on "steps" or "epoch" with load_best_model_at_end.')
         # As transformers requires: the best evaluation has to be of a state that was also saved.
         aligned = save_strategy == eval_strategy != "no" and (save_strategy != "steps" or eval_steps and save_steps % eval_steps == 0)
         if getattr(args, "load_best_model_at_end", False) and not aligned:

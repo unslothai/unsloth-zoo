@@ -1065,6 +1065,9 @@ def test_trainer_keeps_and_returns_to_its_best_checkpoint(checkpoint, tmp_path):
     assert sorted(item.name for item in tmp_path.iterdir()) == ["checkpoint-2", "checkpoint-6"] and trainer.state.best_model_checkpoint == str(tmp_path / "checkpoint-2")
     best = mx.load(str(tmp_path / "checkpoint-2" / "trainable.safetensors"))
     assert all(mx.array_equal(value, best[name]).item() for name, value in tree_flatten(model.trainable_parameters())) and len(best) > 4
+    args.save_strategy = "best"
+    with pytest.raises(NotImplementedError, match = "save_strategy"):
+        MLXDecisionTrainer(model, args, _items(), _items()).train()
     # Saved every step but evaluated every epoch, the best evaluation could be of a state no checkpoint holds.
     args.save_strategy, args.save_steps = "steps", 1
     with pytest.raises(ValueError, match = "load_best_model_at_end needs"):
