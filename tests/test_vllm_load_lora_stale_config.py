@@ -90,12 +90,13 @@ def test_load_tensors_writes_the_config_once_per_process(tmp_path, load_lora):
     assert second.lora_config["r"] == 16
 
 
-def test_load_tensors_is_not_fooled_by_the_cached_config_reader(tmp_path, load_lora):
+def test_config_reads_after_a_resave_see_the_new_file(tmp_path, load_lora):
     directory = tmp_path / "trainer"
     _write_stale(directory, r = 32)
     assert vu.get_peft_config(str(directory))["r"] == 32
     request = load_lora(_Model(), str(directory), load_tensors = True)
     assert request.lora_config["r"] == 16
+    assert vu.get_peft_config(str(directory))["r"] == 16
 
 
 def test_rank_check_reads_a_resaved_adapter_fresh(tmp_path, load_lora):

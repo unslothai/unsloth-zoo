@@ -4017,7 +4017,7 @@ def save_lora(model, save_directory, *args, **kwargs):
 pass
 
 
-@functools.cache
+# Uncached: a directory can be re-saved with another r / lora_alpha mid-process (#2097).
 def get_peft_config(save_directory):
     with open(os.path.join(save_directory, "adapter_config.json"), encoding = "utf-8") as f:
         config = json.load(f)
@@ -4038,8 +4038,7 @@ def _live_lora_config(model, save_directory):
     cached = _LIVE_LORA_CONFIGS.get(key)
     if cached is None or cached[0] is not config:
         config.save_pretrained(save_directory)
-        # get_peft_config is functools.cache'd and may hold the stale file: read it fresh.
-        cached = (config, get_peft_config.__wrapped__(save_directory))
+        cached = (config, get_peft_config(save_directory))
         _LIVE_LORA_CONFIGS[key] = cached
     return cached[1]
 pass
@@ -4053,7 +4052,7 @@ def _check_lora_rank_fits(model, save_directory):
     """
     # All Unsloth Zoo code licensed under LGPLv3
     try:
-        r = _peft_max_rank(get_peft_config.__wrapped__(save_directory))
+        r = _peft_max_rank(get_peft_config(save_directory))
         engine = model.vllm_engine.llm_engine
         lora_config = getattr(getattr(engine, "vllm_config", None), "lora_config", None) \
             or getattr(engine, "lora_config", None)
