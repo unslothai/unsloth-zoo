@@ -31,6 +31,7 @@ import sys
 import threading
 import types
 import warnings
+import weakref
 from collections.abc import Mapping
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field, replace
@@ -1843,17 +1844,52 @@ def _statements(body):
         yield from _statements(list(ast.iter_child_nodes(node)))
 
 
+def _function_of(method):
+    function = inspect.unwrap(method)
+    function = getattr(function, "__func__", function)
+    if not isinstance(function, types.FunctionType):
+        raise TypeError("no source to read")
+    return function
+
+
+def _per_function(read):
+    """Remember what `read` finds in a function's source for as long as the function lives.
+
+    Keyed weakly on the function, never on a bound method: a model's own closure may hold the model."""
+
+    known = weakref.WeakKeyDictionary()
+
+    @functools.wraps(read)
+    def remembered(function):
+        code = function.__code__
+        entry = known.get(function)
+        if entry is None or entry[0] is not code:
+            known[function] = entry = (code, read(function))
+        return entry[1]
+
+    return remembered
+
+
+def _definition(function):
+    definition = ast.parse(textwrap.dedent(inspect.getsource(function))).body[0]
+    if not isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        raise TypeError("not a function definition")
+    return definition
+
+
 def _draws_by_position(owner, method) -> bool:
     """Whether this draw hands the sampler the rows and positions it draws at."""
 
     try:
-        tree = ast.parse(textwrap.dedent(inspect.getsource(getattr(owner, method))))
+        return _function_draws_by_position(_function_of(getattr(owner, method)))
     except (AttributeError, OSError, TypeError, SyntaxError, IndentationError):
         return False
-    definition = tree.body[0] if tree.body else None
-    if not isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        return False
-    for node in _statements(definition.body):
+
+
+@_per_function
+def _function_draws_by_position(function) -> bool:
+
+    for node in _statements(_definition(function).body):
         if not isinstance(node, ast.Call):
             continue
         called = node.func
@@ -1924,19 +1960,58 @@ def _row_signature(prepared: dict, padded: frozenset) -> dict:
     return {key: _row_shape(key, value, padded) for key, value in prepared.items()}
 
 
-def _own_body(method):
+@_per_function
+def _binds_self(function):
+    """Whether this function binds something on ``self``, and the ``self`` methods it calls."""
 
-    source = textwrap.dedent(inspect.getsource(method))
-    definition = ast.parse(source).body[0]
-    if not isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        raise TypeError("not a function definition")
+    definition = _definition(function)
     nested = {
         inner for node in ast.walk(definition)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
         and node is not definition
         for inner in ast.walk(node)
     }
-    return [node for node in ast.walk(definition) if node not in nested]
+    calls = set()
+    for node in ast.walk(definition):
+        if node in nested:
+            continue
+        targets = (
+            list(node.targets) if isinstance(node, ast.Assign)
+            else [node.target]
+            if isinstance(node, (ast.AugAssign, ast.AnnAssign, ast.For, ast.AsyncFor,
+                                 ast.comprehension))
+            else [item.optional_vars for item in node.items if item.optional_vars]
+            if isinstance(node, (ast.With, ast.AsyncWith))
+            else []
+        )
+        while targets:
+            target = targets.pop()
+            if isinstance(target, (ast.Tuple, ast.List)):
+                targets.extend(target.elts)
+                continue
+            if isinstance(target, ast.Starred):
+                targets.append(target.value)
+                continue
+            while isinstance(target, (ast.Attribute, ast.Subscript)):
+                target = target.value
+            if isinstance(target, ast.Name) and target.id == "self":
+                return True, ()
+        if isinstance(node, ast.Call):
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "setattr"
+                and node.args
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id == "self"
+            ):
+                return True, ()
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "self"
+            ):
+                calls.add(node.func.attr)
+    return False, tuple(sorted(calls))
 
 
 def _keeps_what_it_prepared(model, method = "get_input_embeddings") -> bool:
@@ -1956,48 +2031,10 @@ def _keeps_what_it_prepared(model, method = "get_input_embeddings") -> bool:
             return False
         seen.add(name)
         try:
-            body = _own_body(getattr(model, name))
+            binds, calls = _binds_self(_function_of(getattr(model, name)))
         except (AttributeError, OSError, TypeError, SyntaxError, IndentationError):
             return entry
-        calls = set()
-        for node in body:
-            targets = (
-                list(node.targets) if isinstance(node, ast.Assign)
-                else [node.target]
-                if isinstance(node, (ast.AugAssign, ast.AnnAssign, ast.For, ast.AsyncFor,
-                                     ast.comprehension))
-                else [item.optional_vars for item in node.items if item.optional_vars]
-                if isinstance(node, (ast.With, ast.AsyncWith))
-                else []
-            )
-            while targets:
-                target = targets.pop()
-                if isinstance(target, (ast.Tuple, ast.List)):
-                    targets.extend(target.elts)
-                    continue
-                if isinstance(target, ast.Starred):
-                    targets.append(target.value)
-                    continue
-                while isinstance(target, (ast.Attribute, ast.Subscript)):
-                    target = target.value
-                if isinstance(target, ast.Name) and target.id == "self":
-                    return True
-            if isinstance(node, ast.Call):
-                if (
-                    isinstance(node.func, ast.Name)
-                    and node.func.id == "setattr"
-                    and node.args
-                    and isinstance(node.args[0], ast.Name)
-                    and node.args[0].id == "self"
-                ):
-                    return True
-                if (
-                    isinstance(node.func, ast.Attribute)
-                    and isinstance(node.func.value, ast.Name)
-                    and node.func.value.id == "self"
-                ):
-                    calls.add(node.func.attr)
-        return any(follows(call) for call in sorted(calls))
+        return binds or any(follows(call) for call in calls)
 
     return follows(method, entry = True)
 

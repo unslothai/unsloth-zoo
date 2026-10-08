@@ -63,6 +63,7 @@ def _function_ast(function):
     return ast.parse(textwrap.dedent(inspect.getsource(function))).body[0]
 
 
+@functools.cache
 def _ast_fingerprint(function):
     # ast.unparse is version-stable once the 3.9/3.10 tuple parentheses are dropped; ast.dump is not.
     source = ast.unparse(_function_ast(function))
