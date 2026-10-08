@@ -22,6 +22,8 @@ __all__ = [
     "create_block_mask_cached",
     "create_block_mask",
     "compiled_create_block_mask",
+    "reused_compiled_create_block_mask",
+    "clear_block_mask_cache",
     "FlexAttentionCache",
 
     "causal_mask",
@@ -33,6 +35,7 @@ __all__ = [
     "generate_decoding_sliding_window_mask_with_padding",
 ]
 
+import os
 import torch
 import functools
 from unsloth_zoo.temporary_patches.common import torch_compile, _torch_compile
@@ -105,6 +108,37 @@ try:
         """Create block mask for Flex Attention. Assume bsz=any(None), head=any(None)"""
         # _compile MUST be on to reduce VRAM otherwise O(N^2) usage
         return _create_block_mask(mask_mod, bsz, head, M, N, device = device, _compile = True)
+
+    # Block masks for stateless mask_mods (causal / sliding window) only depend on the
+    # mask_mod and shapes, so every layer, pass and checkpoint replay can share one.
+    # Never pass mask_mods closing over per batch tensors (padding, document ids).
+    _BLOCK_MASK_CACHE = {}
+    _BLOCK_MASK_CACHE_SIZE = 32
+
+    def clear_block_mask_cache():
+        _BLOCK_MASK_CACHE.clear()
+
+    def reused_compiled_create_block_mask(mask_mod, bsz, head, M, N, device = "cuda"):
+        """compiled_create_block_mask cached for stateless mask_mods. UNSLOTH_FLEX_MASK_REUSE=0 disables"""
+        if os.environ.get("UNSLOTH_FLEX_MASK_REUSE", "1") == "0":
+            _BLOCK_MASK_CACHE.clear()   # turning reuse off also frees the retained masks
+            return compiled_create_block_mask(mask_mod, bsz, head, M, N, device = device)
+        dev = torch.device(device)
+        if dev.type == "cuda" and dev.index is None:   # "cuda" means the current device
+            dev = torch.device("cuda", torch.cuda.current_device())
+        # Inference tensors cannot be saved for backward, so keep inference mode masks apart
+        key = (mask_mod, bsz, head, M, N, dev, torch.is_inference_mode_enabled())
+        block_mask = _BLOCK_MASK_CACHE.get(key)
+        if block_mask is None:
+            # Masks grow ~quadratically with length: keep only the current shape's masks (one per
+            # mask_mod in the current inference mode, shared by all layers of one forward), freed first.
+            for k in [k for k in _BLOCK_MASK_CACHE if k[1:] != key[1:]]:
+                del _BLOCK_MASK_CACHE[k]
+            if len(_BLOCK_MASK_CACHE) >= _BLOCK_MASK_CACHE_SIZE:
+                _BLOCK_MASK_CACHE.pop(next(iter(_BLOCK_MASK_CACHE)))
+            block_mask = compiled_create_block_mask(mask_mod, bsz, head, M, N, device = dev)
+            _BLOCK_MASK_CACHE[key] = block_mask
+        return block_mask
 
     def causal_mask(batch_idx, head_idx, q_idx, kv_idx):
         """Causal mask for Flex Attention"""
@@ -362,4 +396,6 @@ except:
     causal_mask = None
     generate_sliding_window_mask = None
     FlexAttentionCache = None
+    reused_compiled_create_block_mask = None
+    clear_block_mask_cache = None
 pass

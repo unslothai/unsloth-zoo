@@ -72,7 +72,9 @@ def _function_source():
 
 def _load(open_fn = open):
     ns = {"inspect": inspect, "importlib": importlib, "re": re, "os": os,
-          "raise_error": lambda *a, **k: None, "open": open_fn}
+          "raise_error": lambda *a, **k: None, "open": open_fn,
+          # Trims autotune configs after a reload on a T4; a no-op here.
+          "_retrim_mamba_ssm_autotune": lambda: 0}
     exec(_function_source(), ns)
     return ns[_NAME]
 
@@ -165,7 +167,7 @@ _WORKER = textwrap.dedent("""
     node = next(n for n in ast.parse(src).body
                 if isinstance(n, ast.FunctionDef) and n.name == "fix_mamba_ssm_float32")
     ns = {"inspect": inspect, "importlib": importlib, "re": re, "os": os,
-          "raise_error": lambda *a, **k: None}
+          "raise_error": lambda *a, **k: None, "_retrim_mamba_ssm_autotune": lambda: 0}
     exec(ast.get_source_segment(src, node), ns)
     for _ in range(rounds):
         for m in [m for m in sys.modules if m.startswith("mamba_ssm")]:

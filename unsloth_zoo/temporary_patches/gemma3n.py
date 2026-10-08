@@ -24,6 +24,13 @@ from .utils import (
     KWARGS_TYPE,
     raise_error,
 )
+import contextlib
+
+def _fp32_autocast(device_type):
+    # float32 autocast is CUDA only; elsewhere it disables the enclosing autocast and fp32 x bf16 weights raise.
+    if device_type != "cuda":
+        return contextlib.nullcontext()
+    return torch.autocast(device_type = device_type, dtype = torch.float32, enabled = True)
 
 def patch_Gemma3nConvNormAct_forward():
     try:
@@ -36,7 +43,7 @@ def patch_Gemma3nConvNormAct_forward():
     def forward(self, x):
         old_dtype = x.dtype
         x = x.to(torch.float32)
-        with torch.autocast(device_type = "cuda", dtype = torch.float32, enabled = True):
+        with _fp32_autocast(x.device.type):
             x = self.conv(x)
         x = self.bn(x)
         aa = getattr(self, 'aa', None)
@@ -82,7 +89,7 @@ def patch_Gemma3nMultimodalEmbedder_forward():
 
         old_dtype = emb_norm.dtype
         emb_norm = emb_norm.to(torch.float32)
-        with torch.autocast(device_type = "cuda", dtype = torch.float32, enabled = True):
+        with _fp32_autocast(emb_norm.device.type):
             emb_norm_proj = self.embedding_projection(emb_norm)
         emb_norm_proj = emb_norm_proj.to(old_dtype)
 

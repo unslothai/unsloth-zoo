@@ -630,6 +630,7 @@ class LoraStats:
     alpha  : float
     magnitude : object = None   # DoRA lora_magnitude_vector weight (None for plain LoRA)
     parameter_name : object = None  # PEFT ParamWrapper target (MoE experts), e.g. "up_proj"
+    lora_B_bias : object = None     # PEFT lora_bias=True: lora_B's bias, merged into the base bias
 pass
 
 
@@ -740,6 +741,7 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
                 lora_A_count += 1
             elif kind == "lora_B":
                 lora_weights[key].lora_B = module.weight
+                lora_weights[key].lora_B_bias = module.bias
                 lora_B_count += 1
             else:
                 lora_weights[key].magnitude = module.weight
@@ -889,9 +891,18 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
                 name = name.rsplit(".modules_to_save.", 1)[0]
 
             if name in lora_weights:
-                state_dict[name + ".weight"]   = lora_weights[name]
-                if getattr(lora_weights[name].module, "bias", None) is not None:
-                    state_dict[name + ".bias"] = lora_weights[name].module.bias
+                stats = lora_weights[name]
+                state_dict[name + ".weight"]   = stats
+                bias = getattr(stats.module, "bias", None)
+                if stats.lora_B_bias is not None and stats.lora_A is not None:
+                    if bias is None:
+                        raise RuntimeError(
+                            f"Unsloth: cannot merge `{name}` trained with lora_bias=True because its "
+                            "base layer has no bias. PEFT's own merge refuses this too."
+                        )
+                    bias = (bias.float() + stats.alpha * stats.lora_B_bias.float()).to(bias.dtype)
+                if bias is not None:
+                    state_dict[name + ".bias"] = bias
                 continue
             elif name in keep_keys:
                 # Quantized modules with no LoRA adapters
@@ -5371,6 +5382,7 @@ def merge_and_overwrite_lora(
         key for key, stats in lora_weights.items()
         if getattr(stats.module, "modules_to_save", None) is not None
         or ("lora_only" in bias_modes and stats.lora_A is not None)
+        or (stats.lora_B_bias is not None and stats.lora_A is not None)
     }
     biases = defaultdict(lambda: None, {
         key[:-len(".bias")] : value for key, value in state_dict.items()
