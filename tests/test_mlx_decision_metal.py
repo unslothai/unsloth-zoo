@@ -1096,6 +1096,46 @@ def test_clef_reads_images_between_the_opening_and_the_state(clef, monkeypatch):
     assert not reader.reads_images
 
 
+def test_clef_trains_on_the_images_of_its_records(clef):
+    import base64, io
+
+    from PIL import Image
+
+    reader, questions = copy.copy(clef[0]), {"route": {"type": "choice", "instructions": "where", "criteria": {"a": "x", "b": None}}, "ok": {"type": "noul", "instructions": "fine?"}}
+    reader.model = _vision_decoder()
+    reader.model._processor = _patches
+    dark, light = Image.new("RGB", (96, 64), "black"), Image.new("RGB", (96, 64), "white")
+    buffer = io.BytesIO()
+    light.save(buffer, "PNG")
+    url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+    part = {"type": "image_url", "image_url": {"url": url}}
+    targets = {"targets": [[1.0, 0.0], [0.0, 1.0]]}
+    items = [{**clef_training_item(reader, "s", questions, None, images), **targets} for images in ([dark], [url])]
+    # An image part of the state is read as an image, after the ones given beside it.
+    mixed = clef_training_item(reader, [{"role": "user", "content": ["s", part]}], questions, None, [dark.resize((64, 64))])
+    assert [image.size for image in clef_training_item(reader, "s", questions, None, [url, dark.resize((64, 64))])["images"]] == [(96, 64), (64, 64)]
+    assert [image.size for image in mixed["images"]] == [(64, 64), (96, 64)] and mixed["source"]["state"] == [{"role": "user", "content": ["s"]}]
+    assert items[0]["input_ids"] == items[1]["input_ids"] and items[0]["input_ids"].count(500) == 6 and mixed["input_ids"].count(500) == 10
+    assert "images" not in clef_training_item(reader, "s", questions)
+
+    network = clef_training_network(reader, r = 4, lora_alpha = 4)
+    tower = {name: np.array(value) for name, value in tree_flatten(reader.model.vision_tower.parameters())}
+    # The logits a record trains on are the ones a request with its images is answered from.
+    route, _ = clef_logits(network, [items[1]])[0]
+    assert list(reader.answer("s", questions, [url])["answers"]["route"]["probabilities"].values()) == pytest.approx(torch.softmax(torch.tensor(route), 0).tolist(), abs = 1e-4)
+    assert _clef_record_loss(network, items[0]).item() != pytest.approx(_clef_record_loss(network, items[1]).item(), rel = 1e-3)
+    shuffled = network.permuted_item(items[0], random.Random(1))
+    assert shuffled["images"] == items[0]["images"] and shuffled["input_ids"].count(500) == 6 and shuffled["targets"] == [[0.0, 1.0], [1.0, 0.0]]
+    whole = {**mixed, **targets, "source": {**mixed["source"], "state": [{"role": "user", "content": ["s", part]}]}}
+    assert network.permuted_item(whole, random.Random(1))["input_ids"].count(500) == 10
+    np.testing.assert_allclose(np.array(network.reference_logits(items[1], network.kl_reference())), np.concatenate(clef_logits(network, [items[1]])[0]), atol = 1e-4)
+
+    before = _parameters(network)
+    MLXDecisionTrainer(network, MLXTrainingConfig(per_device_train_batch_size = 2, max_steps = 2, learning_rate = 1e-2, warmup_steps = 0, compile = False), items).train()
+    assert {name.split(".")[0] for name, value in _parameters(network).items() if not np.array_equal(value, before[name])} == {"encoder", "head"}
+    assert all(np.array_equal(tower[name], np.array(value)) for name, value in tree_flatten(reader.model.vision_tower.parameters()))
+
+
 def test_prompts_that_share_their_images_read_them_once(monkeypatch):
     from PIL import Image
 

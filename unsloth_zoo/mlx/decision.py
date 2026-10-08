@@ -2147,7 +2147,7 @@ class ClefNetwork(nn.Module):
             for module in adapters:
                 module.scale = 0.0
             pipeline.head = head
-            logits = pipeline.logits(item["input_ids"], item["question_spans"], item["option_spans"], item["types"])
+            logits = _item_logits(pipeline, item)
             mx.eval(logits)
         finally:
             pipeline.head = own
@@ -2164,7 +2164,8 @@ class ClefNetwork(nn.Module):
         rng.shuffle(order)
         names = list(source["questions"])
         try:
-            record = clef_training_item(self._pipeline, source["state"], {names[i]: source["questions"][names[i]] for i in order}, source.get("max_length"))
+            # The item already holds the images of the state, which a caller may have kept whole.
+            record = clef_training_item(self._pipeline, _without_image_parts(source["state"]), {names[i]: source["questions"][names[i]] for i in order}, source.get("max_length"), item.get("images"))
         except ValueError:
             return item
         return {**item, **record, "targets": [item["targets"][i] for i in order]}
@@ -2215,7 +2216,7 @@ def _clef_record_loss(network, item, objective = None, ordinal_scale = 0.0, refe
     """The loss summed over the questions of one record; `ordinal_scale` weighs its score questions' ordinal term and
     `kl_weight` the divergence of each question's distribution from that of the `reference` logits."""
     spans = item["option_spans"]
-    logits = network._pipeline.logits(item["input_ids"], item["question_spans"], spans, item["types"])
+    logits = _item_logits(network._pipeline, item)
     target = np.zeros((len(spans), logits.shape[0]), np.float32)
     start = 0
     for row, values in enumerate(item["targets"]):
@@ -2306,7 +2307,7 @@ def clef_logits(network, items):
         with generation_mode(pipeline.model):
             for item in items:
                 spans = item["option_spans"]
-                logits = np.array(pipeline.logits(item["input_ids"], item["question_spans"], spans, item["types"], output))
+                logits = np.array(_item_logits(pipeline, item, output = output))
                 out.append(np.split(logits, np.cumsum([len(options) for options in spans])[:-1]))
     finally:
         network.train(was_training)
@@ -2318,16 +2319,30 @@ def clef_option_keys(pipeline, question):
     return [key for key, _ in pipeline._parse_questions({"question": question})[0].options]
 
 
-def clef_training_item(pipeline, state, questions, max_length = None):
+def clef_training_item(pipeline, state, questions, max_length = None, images = None):
     """Tokenize one record as a Clef training item; the caller adds `targets`, a distribution per question over `clef_option_keys`.
 
+    `images` are PIL images or data URLs; with the image parts of a chat-message state they are read as a request's are.
     `source` keeps the record, which `permute_fields` encodes again with its questions reordered."""
     parsed = pipeline._parse_questions(questions)
-    ids, question_spans, option_spans = pipeline.encode(state, parsed, max_length)
-    return {
+    given = list(images or ())
+    urls = _image_urls(state, [image for image in given if isinstance(image, str)])
+    decoded = iter(_decode_images(urls))
+    images = [next(decoded) if isinstance(image, str) else image for image in given] + list(decoded)
+    if urls:
+        state = _without_image_parts(state)
+    ids, question_spans, option_spans = pipeline.encode(state, parsed, max_length, pipeline.encode_images(images)[0] if images else ())
+    item = {
         "input_ids": ids, "question_spans": question_spans, "option_spans": option_spans, "types": [_TYPE_IDS.index(q.type) for q in parsed],
         "source": {"state": state, "questions": dict(questions), "max_length": max_length},
     }
+    # The pixels are made again whenever the item is read: kept, they would outweigh every other part of a dataset.
+    return {**item, "images": images} if images else item
+
+
+def _item_logits(pipeline, item, output = None):
+    media = pipeline.encode_images(item["images"])[1] if item.get("images") else None
+    return pipeline.logits(item["input_ids"], item["question_spans"], item["option_spans"], item["types"], output, media)
 
 
 def decision_logits(model, items, pad_token_id, batch_size = 16):
