@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -47,15 +48,18 @@ def test_nested_quant_state_offset_follows_device():
     assert state.offset.item() == 0.25
 
 
-def test_gemma3n_fp32_region_overrides_enclosing_autocast():
+def test_gemma3n_region_keeps_enclosing_non_cuda_autocast():
     from unsloth_zoo.temporary_patches import gemma3n
 
-    linear = torch.nn.Linear(4, 4)
-    with torch.autocast("cpu", dtype = torch.bfloat16):
-        with gemma3n._fp32_autocast("cpu"):
-            out = linear(torch.randn(2, 4))
-    assert out.dtype == torch.float32
-    # A backend autocast does not know falls back to no context instead of raising.
+    # bf16 weights, fp32 input, as in the patched forwards: an fp32 "region" off CUDA only disables
+    # the enclosing autocast and the matmul then fails on mixed dtypes.
+    linear = torch.nn.Linear(4, 4).to(torch.bfloat16)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with torch.autocast("cpu", dtype = torch.bfloat16):
+            with gemma3n._fp32_autocast("cpu"):
+                out = linear(torch.randn(2, 4, dtype = torch.float32))
+    assert out.dtype == torch.bfloat16
     with gemma3n._fp32_autocast("not_a_backend"):
         pass
 

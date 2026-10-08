@@ -27,11 +27,11 @@ from .utils import (
 import contextlib
 
 def _fp32_autocast(device_type):
-    # The tensor's device, not "cuda": a "cuda" autocast leaves an enclosing XPU/CPU autocast on.
-    try:
-        return torch.autocast(device_type = device_type, dtype = torch.float32, enabled = True)
-    except (RuntimeError, AssertionError):
+    # fp32 region only where autocast supports float32 (CUDA). Elsewhere float32 autocast just disables
+    # the enclosing autocast, and the fp32 input then meets bf16 weights: keep the enclosing autocast.
+    if device_type != "cuda":
         return contextlib.nullcontext()
+    return torch.autocast(device_type = device_type, dtype = torch.float32, enabled = True)
 
 def patch_Gemma3nConvNormAct_forward():
     try:
