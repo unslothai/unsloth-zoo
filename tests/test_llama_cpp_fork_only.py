@@ -355,3 +355,22 @@ def test_a_plain_llama_tag_pin_resolves_its_fork_release(mod, monkeypatch):
     monkeypatch.setattr(mod, "_requests_get_with_retries", _get)
     assert mod._resolve_llama_cpp_release(mod.LLAMA_CPP_PUBLISHED_RELEASES_API)[0] == "b11443-mix-d65395f"
     assert urls == [f"{mod.LLAMA_CPP_PUBLISHED_RELEASES_API}/tags/b11443-mix-d65395f"]
+
+
+@pytest.mark.parametrize("damage", ["empty", "truncated", "directory"])
+def test_a_damaged_staged_lora_converter_is_restaged(mod, monkeypatch, tmp_path, damage):
+    tag = "b11443-mix-d65395f"
+    downloads = _serve_source(mod, monkeypatch, tmp_path, tag)
+    stage = Path(mod._stage_converter_sources(tag))
+    lora = stage / "convert_lora_to_gguf.py"
+    if damage == "empty":
+        lora.write_text("")
+    elif damage == "truncated":
+        lora.write_text("def broken(:\n")
+    else:
+        lora.unlink()
+        lora.mkdir()
+    assert mod._converter_stage_is_usable(str(stage), repo = FORK, tag = tag) is False
+    n = len(downloads)
+    assert mod._stage_converter_sources(tag) == str(stage)
+    assert len(downloads) > n and lora.is_file()

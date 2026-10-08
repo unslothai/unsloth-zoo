@@ -1509,6 +1509,13 @@ def _staged_sources_are_complete(stage_dir):
     for member in _CONVERTER_STAGE_REQUIRED:
         if not os.path.exists(os.path.join(stage_dir, member)):
             return False
+    try:
+        with open(os.path.join(stage_dir, "convert_lora_to_gguf.py"), "rb") as f: lora_source = f.read()
+        ast.parse(lora_source)
+    except (OSError, SyntaxError, ValueError):
+        return False
+    if not lora_source.strip():
+        return False
     converter = os.path.join(stage_dir, "convert_hf_to_gguf.py")
     try:
         with open(converter, "rb") as f: source = f.read()
