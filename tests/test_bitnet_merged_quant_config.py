@@ -52,6 +52,9 @@ def test_bitnet_online_quantization_config_is_kept(tmp_path):
     # Packed BitNet weights are unpacked on merge, so the offline config must still go.
     {"quant_method": "bitnet", "linear_class": "autobitlinear", "quantization_mode": "offline"},
     {"quant_method": "bitnet", "linear_class": "bitlinear"},
+    # Only AutoBitLinear quantizes online; BitLinear (the default class) expects packed weights.
+    {"quant_method": "bitnet", "linear_class": "bitlinear", "quantization_mode": "online"},
+    {"quant_method": "bitnet", "quantization_mode": "online"},
 ])
 def test_other_quantization_configs_are_still_stripped(tmp_path, quant):
     out = _roundtrip(tmp_path, {
