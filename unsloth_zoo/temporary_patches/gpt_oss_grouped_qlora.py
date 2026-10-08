@@ -31,6 +31,8 @@ paths read the stacks. UNSLOTH_MOE_STACKED_LORA=0 keeps PEFT's per-expert Parame
 __all__ = [
     "nf4_dequant_expert_stack",
     "ready_signature",
+    "cached_ready",
+    "ready_record",
     "expert_lora_state",
     "grouped_qlora_forward",
     "stack_expert_lora",
@@ -40,10 +42,28 @@ import os
 
 import torch
 
+from . import moe_ready_epoch as _ready_epoch
 # Model-agnostic expert-LoRA helpers, shared with the ModuleList grouped MoE path.
 from .moe_grouped_modulelist import (
     _STACK_NAME, _lora_delta, _lora_operands, _lora_stacks, _projs_lora, _stack_projs_lora, _stackable_lora,
 )
+# Read as module attributes in the hot forward (no per-call import machinery; monkeypatches reach them).
+from . import moe_utils as _moe_utils
+_GPT_OSS = None   # gpt_oss imports this module lazily: resolved on first use
+
+
+def _gpt_oss():
+    global _GPT_OSS
+    if _GPT_OSS is None:
+        from . import gpt_oss
+        _GPT_OSS = gpt_oss
+    return _GPT_OSS
+
+
+def _base_layer_params(proj):
+    """_parameters of the frozen base (PEFT's base_layer, else proj): getattr through
+    nn.Module.__getattr__ costs ~1 us per read, and these run per expert per call."""
+    return proj._modules.get("base_layer", proj)._parameters
 
 try:
     import triton
@@ -193,7 +213,7 @@ def _proj_signature(proj, out):
     b = base._parameters.get("bias")
     # Tensors / QuantState by id: their __eq__ is elementwise, not identity.
     out += (proj, id(w), id(getattr(w, "quant_state", None)), w is not None and w.requires_grad,
-            id(b), b is not None and b.requires_grad)
+            id(b), b is not None and b.requires_grad, "_hf_hook" in d or "_hf_hook" in base.__dict__)
     if "lora_A" in mods:
         active = d.get("_active_adapter")
         out += (active if isinstance(active, str) else tuple(active), tuple(d.get("merged_adapters", ())),
@@ -243,6 +263,68 @@ def _quant_key(weight):
     return key
 
 
+def _base_params(experts):
+    """The `__dict__` of every expert's base projection (moe_ready_epoch.Lean reads them)."""
+    return [
+        p._modules.get("base_layer", p).__dict__
+        for projs in (experts._modules["gate_up_projs"], experts._modules["down_projs"])
+        for p in projs._modules.values()
+    ]
+
+
+def _spot_signature(experts):
+    """ready_signature's fields over the first and last expert of each projection list."""
+    out = []
+    try:
+        with torch._C.DisableTorchFunctionSubclass():
+            for projs in (experts._modules["gate_up_projs"], experts._modules["down_projs"]):
+                out += (projs, len(projs))
+                for p in (projs[0], projs[-1]):
+                    _proj_signature(p, out)
+                    out.append(_quant_key(getattr(p, "base_layer", p).weight))
+    except Exception:
+        return None
+    return tuple(out)
+
+
+@torch.compiler.disable
+def cached_ready(experts):
+    """(verdict, lora) of the last full _grouped_bnb4bit_ready check while moe_ready_epoch vouches
+    for it (no expert-state change, end experts unchanged), else None."""
+    if not _ready_epoch.enabled():
+        experts.__dict__.pop(_ready_epoch.VALID, None)
+        return None
+    cached = experts.__dict__.get("_unsloth_grouped_ready")
+    rec = cached[3] if cached is not None and len(cached) > 3 else None
+    if _ready_epoch.valid(rec, (experts,), lambda: _spot_signature(experts)):
+        _ready_epoch.mark_valid(experts, rec)
+        return cached[1], cached[2]
+    experts.__dict__.pop(_ready_epoch.VALID, None)   # the tables re-key until a full check vouches again
+    return None
+
+
+@torch.compiler.disable
+def ready_record(experts):
+    """A moe_ready_epoch.Record for the full check just run, or None (switch off, accelerate hooks)."""
+    if not _ready_epoch.enabled():
+        return None
+    _ready_epoch.COUNTS["full"] += 1
+    rec = None
+    hooked, drops = _ready_epoch.scan(experts)
+    spot = None if hooked else _spot_signature(experts)
+    if spot is not None:
+        _ready_epoch.wrap_peft()   # PEFT tuner classes imported since the last full check
+        try:
+            rec = _ready_epoch.Record((experts,), spot, _base_params(experts), drops, None)
+        except Exception:
+            rec = None
+    if rec is not None:
+        _ready_epoch.mark_valid(experts, rec)
+    else:
+        experts.__dict__.pop(_ready_epoch.VALID, None)
+    return rec
+
+
 def _bnb_fallback_stack(projs, dtype):
     """Concat-and-dequant through bitsandbytes (the pre-existing grouped path)."""
     import bitsandbytes as bnb
@@ -279,8 +361,33 @@ def _storage_key(experts):
     )
 
 
+def _table_spot(experts):
+    out = []
+    with torch._C.DisableTorchFunctionSubclass():
+        for projs in (experts._modules["gate_up_projs"], experts._modules["down_projs"]):
+            for p in (projs[0], projs[-1]):
+                w = getattr(p, "base_layer", p).weight
+                out += (id(w), id(w.quant_state), _quant_key(w))
+    return tuple(out)
+
+
 def _tables(experts, dtype):
-    """Pointer tables for both projections, or None for the bnb fallback."""
+    """Pointer tables for both projections, or None for the bnb fallback. While readiness vouches
+    for the experts' storage at the current moe_ready_epoch stamp, the O(E) storage key and the
+    snapshot check are skipped for a spot key over the end experts."""
+    gen = _ready_epoch.current_gen(experts) if _ready_epoch.enabled() else None
+    spot = None
+    if gen is not None:
+        try:
+            spot = _table_spot(experts)
+        except Exception:
+            spot = None
+        state = experts.__dict__.get("_unsloth_routed_nf4")
+        if isinstance(state, dict) and state.get("ready_gen") is gen and spot is not None \
+                and state.get("ready_spot") == spot:
+            _ready_epoch.COUNTS["table_cheap"] += 1
+            return state
+    _ready_epoch.COUNTS["table_full"] += 1
     try:
         from unsloth_zoo.temporary_patches.gpt_oss_routed import prepare_routed_experts
         # prepare_routed_experts only re-checks the end experts: check every expert here.
@@ -294,6 +401,11 @@ def _tables(experts, dtype):
     if not isinstance(state, dict):
         return None
     state["storage_key"] = key
+    state["ready_gen"], state["ready_spot"] = gen, spot
+    if "storage_hold" not in state:
+        # The weights' storages: a hook-less `.data =` swap then reads old values, not freed memory.
+        with torch._C.DisableTorchFunctionSubclass():
+            state["storage_hold"] = [w.data for w in state.get("weights", ())]
     for key in ("gate_up", "down"):
         tb = state[key]
         if "dtype" not in tb:
@@ -306,9 +418,11 @@ def _proj_dtypes(projs):
     """{(compute_dtype, _pre_set_compute_dtype, quant_state.dtype)} over the experts of one projection."""
     out = set()
     for proj in projs:
-        base = getattr(proj, "base_layer", proj)
-        out.add((getattr(base, "compute_dtype", None), getattr(base, "_pre_set_compute_dtype", None),
-                 base.weight.quant_state.dtype))
+        base = proj._modules.get("base_layer", proj)
+        d = base.__dict__
+        cd = d["compute_dtype"] if "compute_dtype" in d else getattr(base, "compute_dtype", None)
+        pre = d["_pre_set_compute_dtype"] if "_pre_set_compute_dtype" in d else getattr(base, "_pre_set_compute_dtype", None)
+        out.add((cd, pre, d["_parameters"]["weight"].quant_state.dtype))
     return out
 
 
@@ -365,14 +479,9 @@ def grouped_qlora_forward(experts, hidden_states, router_indices, routing_weight
         )
     if mode != "bf16":
         return _decline(why)
-    from unsloth_zoo.temporary_patches.moe_utils import (
-        _base_grouped_mm, _check_torch_grouped_mm_supported, _moe_recompute_default,
-        combine_permuted_moe_outputs, count_tokens_per_expert,
-    )
-    from unsloth_zoo.temporary_patches.gpt_oss import swiglu_torch_forward
-
+    mu = _moe_utils
     # Readiness also admits a device with only the fp16 Triton path.
-    if not _check_torch_grouped_mm_supported():
+    if not mu._check_torch_grouped_mm_supported():
         return _decline("torch._grouped_mm unsupported")
     device = hidden_states.device
     dtype = torch.bfloat16
@@ -388,34 +497,34 @@ def grouped_qlora_forward(experts, hidden_states, router_indices, routing_weight
         sorted_idx = flat_experts.argsort(stable = True)
         sorted_tokens = token_ids[sorted_idx]
         expert_ids = flat_experts[sorted_idx]
-        counts = count_tokens_per_expert(flat_experts, num_experts, torch.int64)
+        counts = mu.count_tokens_per_expert(flat_experts, num_experts, torch.int64)
         offsets = counts.cumsum(0, dtype = torch.int32)
 
-    recompute = _moe_recompute_default()
+    recompute = mu._moe_recompute_default()
     state = _tables(experts, dtype)
     gu_projs, dn_projs = experts.gate_up_projs, experts.down_projs
     # Read live every call, so in-place bias edits are never stale.
-    gu_bias = torch.stack([getattr(p, "base_layer", p).bias for p in gu_projs]).detach()
-    dn_bias = torch.stack([getattr(p, "base_layer", p).bias for p in dn_projs]).detach()
+    gu_bias = torch.stack([_base_layer_params(p)["bias"] for p in gu_projs]).detach()
+    dn_bias = torch.stack([_base_layer_params(p)["bias"] for p in dn_projs]).detach()
     gu_tb = state["gate_up"] if state is not None else None
     dn_tb = state["down"] if state is not None else None
     gu_w = _StackProvider(gu_tb, dtype, lambda: _bnb_fallback_stack(gu_projs, dtype))
     dn_w = _StackProvider(dn_tb, dtype, lambda: _bnb_fallback_stack(dn_projs, dtype))
 
     xg = hidden_states[sorted_tokens]
-    gate_up = _base_grouped_mm(xg, offsets, gu_w, recompute).to(acc_dtype)
+    gate_up = mu._base_grouped_mm(xg, offsets, gu_w, recompute).to(acc_dtype)
     gate_up = gate_up + gu_bias[expert_ids].to(acc_dtype)
     if lora is not None and lora["gate_up"] is not None:
         gate_up = gate_up + _lora_delta(xg, offsets, gu_projs, lora["gate_up"], dtype).to(acc_dtype)
-    gated = swiglu_torch_forward(gate_up, experts.alpha, experts.limit, dtype = torch.float32).to(dtype)
-    out = _base_grouped_mm(gated, offsets, dn_w, recompute).float()
+    gated = _gpt_oss().swiglu_torch_forward(gate_up, experts.alpha, experts.limit, dtype = torch.float32).to(dtype)
+    out = mu._base_grouped_mm(gated, offsets, dn_w, recompute).float()
     out = out + dn_bias[expert_ids].float()
     if lora is not None and lora["down"] is not None:
         out = out + _lora_delta(gated, offsets, dn_projs, lora["down"], dtype).float()
 
     weighted = out.to(torch.float32) * routing_weights[sorted_tokens, expert_ids, None].to(torch.float32)
     # Fixed-order top_k sum (an index_add_ over repeated tokens is atomic, so not reproducible).
-    next_states = combine_permuted_moe_outputs(weighted, sorted_idx, num_tokens, top_k, out_dtype = torch.float32)
+    next_states = mu.combine_permuted_moe_outputs(weighted, sorted_idx, num_tokens, top_k, out_dtype = torch.float32)
     return next_states.view(batch_size, -1, experts.hidden_size)
 
 
