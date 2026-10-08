@@ -48,6 +48,7 @@ def _source_archive(tmp_path, tag, payload = "X = 1\n"):
     (root / "gguf-py" / "gguf").mkdir(parents = True)
     (root / "conversion").mkdir(parents = True)
     (root / "convert_hf_to_gguf.py").write_text(payload, encoding = "utf-8")
+    (root / "convert_lora_to_gguf.py").write_text("# lora converter\n", encoding = "utf-8")
     (root / "conversion" / "__init__.py").write_text(payload, encoding = "utf-8")
     (root / "gguf-py" / "gguf" / "__init__.py").write_text(payload, encoding = "utf-8")
     archive = tmp_path / "source.tar.gz"

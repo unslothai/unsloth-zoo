@@ -308,3 +308,20 @@ def test_hydration_copies_the_lora_converter_into_a_prebuilt_install(mod, monkey
 def test_single_file_converter_fallback_comes_from_the_fork():
     module = _load()
     assert module.LLAMA_CPP_CONVERT_FILE.startswith("https://github.com/unslothai/llama.cpp/")
+
+
+def test_hydration_refuses_a_source_archive_without_the_lora_converter(mod, monkeypatch, tmp_path):
+    tag = "b11443-mix-d65395f"
+    _serve_source(mod, monkeypatch, tmp_path, tag, lora = False)
+    with pytest.raises(Exception):
+        mod._hydrate_converter_sources(tag, str(tmp_path / "install"))
+    assert not (tmp_path / "install" / "convert_hf_to_gguf.py").exists()
+
+
+def test_upstream_tag_mapping_scans_past_three_release_pages(mod, monkeypatch):
+    pages = [[_release(f"b{20000 - p * 100 - i}-mix-x") for i in range(100)] for p in range(4)]
+    pages.append([_release("b9000-mix-old")])
+    calls = _serve_release_list(mod, monkeypatch, pages)
+    mod._FORK_RELEASE_TAGS.clear()
+    assert mod._fork_release_tag_for("b9000") == "b9000-mix-old"
+    assert len(calls) == 5

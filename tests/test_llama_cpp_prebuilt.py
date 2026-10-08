@@ -49,6 +49,7 @@ def _make_binary_archive(path, tag, quantize_script = FAKE_QUANTIZE):
 def _make_source_archive(path, tag):
     with tarfile.open(path, "w:gz") as tar:
         _add_file(tar, f"llama.cpp-{tag}/convert_hf_to_gguf.py", "# converter entrypoint\n")
+        _add_file(tar, f"llama.cpp-{tag}/convert_lora_to_gguf.py", "# lora converter\n")
         _add_file(tar, f"llama.cpp-{tag}/conversion/__init__.py", "TEXT_MODEL_MAP = {}\n")
         _add_file(tar, f"llama.cpp-{tag}/gguf-py/gguf/tensor_mapping.py", "mappings_cfg = {}\n")
 

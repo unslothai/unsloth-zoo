@@ -1730,14 +1730,13 @@ def _extract_converter_sources_into(tag, dest_folder, source_assets = None, arch
         _extract_archive(archive_path, extract_dir)
         root = _single_extracted_root(extract_dir)
         converter = os.path.join(root, "convert_hf_to_gguf.py")
+        lora_converter = os.path.join(root, "convert_lora_to_gguf.py")
         gguf_py = os.path.join(root, "gguf-py")
-        if not (os.path.isfile(converter) and os.path.isdir(gguf_py)):
+        if not (os.path.isfile(converter) and os.path.isfile(lora_converter) and os.path.isdir(gguf_py)):
             raise RuntimeError(f"Unsloth: Source tarball for {tag} is missing converter files.")
         os.makedirs(dest_folder, exist_ok = True)
         shutil.copy2(converter, os.path.join(dest_folder, "convert_hf_to_gguf.py"))
-        lora_converter = os.path.join(root, "convert_lora_to_gguf.py")
-        if os.path.isfile(lora_converter):
-            shutil.copy2(lora_converter, os.path.join(dest_folder, "convert_lora_to_gguf.py"))
+        shutil.copy2(lora_converter, os.path.join(dest_folder, "convert_lora_to_gguf.py"))
         shutil.copytree(gguf_py, os.path.join(dest_folder, "gguf-py"), dirs_exist_ok = True)
         conversion = os.path.join(root, "conversion")
         if os.path.isdir(conversion):
@@ -1904,7 +1903,8 @@ def _read_prebuilt_marker(install_folder):
 # Recorded by older installs of upstream prebuilts; read only, never fetched from.
 _LEGACY_UPSTREAM_REPO = "ggml-org/llama.cpp"
 _FORK_RELEASE_TAGS = {}
-_FORK_RELEASE_PAGES = 3
+# A bound, not a cutoff: the scan stops at the first short page.
+_FORK_RELEASE_PAGES = 100
 
 
 def _upstream_tag_of(fork_tag):
