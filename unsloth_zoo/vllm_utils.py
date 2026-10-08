@@ -1308,13 +1308,16 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         layer = vllm_text_model.layers[kk]
         if hasattr(layer, "self_attn"):
             prefix = f"{vllm_text_model_prefix}.layers.{kk}.self_attn"
-            qkv_proj = layer.self_attn.qkv_proj
+            # vLLM >= 0.30 builds Gemma-4 KV-shared layers with q_proj only.
+            qkv_proj = getattr(layer.self_attn, "qkv_proj", None)
             # LFM2 names the attention output projection out_proj
             o_proj_name = "o_proj" if hasattr(layer.self_attn, "o_proj") else "out_proj"
             o_proj = getattr(layer.self_attn, o_proj_name)
 
             use_fused_qkv = _is_fused_module("qkv_proj")
-            if use_fused_qkv:
+            if qkv_proj is None:
+                get_state_dict(f"{prefix}.q_proj", 0, state_dict, layer.self_attn.q_proj)
+            elif use_fused_qkv:
                 # phi3 family keeps qkv fused; splitting causes a size mismatch
                 # when activating the adapter.
                 # https://github.com/vllm-project/vllm/blob/9b693d023cf595e60b5346fdeeb41cf2a6eda838/vllm/model_executor/models/phi3.py

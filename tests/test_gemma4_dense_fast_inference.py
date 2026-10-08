@@ -318,3 +318,10 @@ def test_completeness_counts_persistent_buffers_and_aliases(tmp_path):
     assert reason is not None and "model.audio_tower.scale" in reason
     # The non-persistent buffer is never required, and the alias is satisfied by proj.weight.
     assert _gemma4_audio_missing_reason(model, keys + ["model.audio_tower.scale"]) is None
+
+
+def test_q_proj_only_kv_shared_layers_are_extracted():
+    # vLLM >= 0.30 builds Gemma-4 KV-shared layers with q_proj only, no qkv_proj.
+    source = inspect.getsource(vllm_utils._get_vllm_state_dict)
+    assert 'qkv_proj = getattr(layer.self_attn, "qkv_proj", None)' in source
+    assert 'get_state_dict(f"{prefix}.q_proj", 0, state_dict, layer.self_attn.q_proj)' in source
