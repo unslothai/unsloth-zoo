@@ -1065,6 +1065,9 @@ def _resolve_llama_cpp_release(releases_api = LLAMA_CPP_RELEASES_API):
     """Return (tag, {asset_name: download_url}) for the UNSLOTH_LLAMA_TAG
     pinned release or the latest one, or None when resolution fails."""
     tag = os.environ.get("UNSLOTH_LLAMA_TAG", "").strip()
+    if tag and "-mix-" not in tag and releases_api == LLAMA_CPP_PUBLISHED_RELEASES_API:
+        # A plain upstream pin (b11443) names the fork release built on it (b11443-mix-...).
+        tag = _fork_release_tag_for(tag) or tag
     url = f"{releases_api}/tags/{tag}" if tag else f"{releases_api}/latest"
     try:
         release = _requests_get_with_retries(url, headers = _github_auth_headers()).json()

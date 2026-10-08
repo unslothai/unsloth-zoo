@@ -342,3 +342,16 @@ def test_offline_pin_skips_a_newer_unusable_stage(mod, monkeypatch):
     monkeypatch.setenv("UNSLOTH_OFFLINE", "1")
     monkeypatch.setenv("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", "b1234")
     assert mod._resolve_converter_revision("/nonexistent") == (FORK, "b1234-mix-old")
+
+
+def test_a_plain_llama_tag_pin_resolves_its_fork_release(mod, monkeypatch):
+    monkeypatch.setenv("UNSLOTH_LLAMA_TAG", "b11443")
+    monkeypatch.setattr(mod, "_fork_release_tag_for", lambda tag: "b11443-mix-d65395f" if tag == "b11443" else None)
+    urls = []
+
+    def _get(url, **kwargs):
+        urls.append(url)
+        return _Response({"tag_name": url.rsplit("/", 1)[1], "assets": []})
+    monkeypatch.setattr(mod, "_requests_get_with_retries", _get)
+    assert mod._resolve_llama_cpp_release(mod.LLAMA_CPP_PUBLISHED_RELEASES_API)[0] == "b11443-mix-d65395f"
+    assert urls == [f"{mod.LLAMA_CPP_PUBLISHED_RELEASES_API}/tags/b11443-mix-d65395f"]
