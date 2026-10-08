@@ -623,7 +623,7 @@ def test_layerwise_gradients_match_one_graph_under_dropout(checkpoint, target_mo
     batch = collate_decisions(_items(), 0)
     mx.random.seed(7)
     want_loss, want = _MarkerStep(model, 0, False, objective)(batch)
-    key = mx.random.state[0].tolist()
+    key, far = mx.random.state[0].tolist(), {}
     for compile in (False, True):
         mx.random.seed(7)
         loss, got = _LayerwiseStep(model, compile, objective)(batch)
@@ -631,9 +631,10 @@ def test_layerwise_gradients_match_one_graph_under_dropout(checkpoint, target_mo
         want_flat = dict(tree_flatten(want))
         assert {name for name, _ in tree_flatten(got)} == set(want_flat)
         for name, value in tree_flatten(got):
-            # float16 noise flips the odd ReLU unit; other dropout masks would change most elements.
             reference = np.array(want_flat[name])
-            assert (np.abs(np.array(value) - reference) > 1e-3 + 0.05 * np.abs(reference)).mean() < 0.05, name
+            far[compile, name] = (np.abs(np.array(value) - reference) > 1e-3 + 0.05 * np.abs(reference)).mean()
+    # float16 noise moves under 1% of a tensor's elements on an M3, and 7% was seen on an M1; other dropout masks move about 80%.
+    assert not {where: round(share, 3) for where, share in far.items() if share >= 0.25}
 
 
 def test_decision_logits_match_the_forward_item_by_item(checkpoint):
