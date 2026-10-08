@@ -10993,6 +10993,7 @@ class MLXDecisionTrainer:
 
         compiled = getattr(args, "compile", True) and getattr(args, "compile_mode", None) != "eager"
         step = self._step(compiled)
+        max_grad_norm, max_grad_value, max_grad_leaf_norm, _ = _resolve_mlx_grad_clipping(args)
 
         # As transformers does, each run counts from zero, so a trainer can train again.
         state, self.control = _MLXTrainerState(), _MLXTrainerControl()
@@ -11049,8 +11050,13 @@ class MLXDecisionTrainer:
                 step_loss, window = sum(losses) / len(losses), len(losses)
                 grads = tree_map(lambda g: g / window, accumulated)
                 grad_norm = None
-                if args.max_grad_norm and args.max_grad_norm > 0:
-                    grads, grad_norm = _clip_grad_norm_fp32(grads, args.max_grad_norm)
+                # The clipping MLXTrainer applies: max_grad_value, else max_grad_leaf_norm (1.0 when nothing is set), else max_grad_norm.
+                if max_grad_value > 0:
+                    grads = _clip_grad_by_value(grads, max_grad_value)
+                elif max_grad_leaf_norm > 0:
+                    grads = _clip_grad_by_leaf_norm(grads, max_grad_leaf_norm)
+                elif max_grad_norm > 0:
+                    grads, grad_norm = _clip_grad_norm_fp32(grads, max_grad_norm)
                 scale = multiplier(state.global_step)
                 learning_rate = args.learning_rate * scale
                 flat = tree_flatten(grads)

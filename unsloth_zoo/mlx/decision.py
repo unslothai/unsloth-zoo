@@ -665,7 +665,7 @@ def _attach_lora(model, folder):
         stem = stems.get(_lora_key(path)) if isinstance(module, (nn.Linear, nn.QuantizedLinear)) else None
         if stem is None:
             continue
-        low = LoRALinear.from_base(module, r = config["r"], scale = config["lora_alpha"] / config["r"])
+        low = LoRALinear.from_base(module, r = config["r"], dropout = float(config.get("lora_dropout") or 0.0), scale = config["lora_alpha"] / config["r"])
         down, up = adapter[f"{stem}.lora_A.weight"].T, adapter[f"{stem}.lora_B.weight"].T
         if (down.shape, up.shape) != (low.lora_a.shape, low.lora_b.shape):
             raise ValueError(f"LoRA tensor {stem} does not fit the base model")
@@ -675,7 +675,14 @@ def _attach_lora(model, folder):
         raise ValueError(f"The adapter in {folder} names {len(stems)} modules, of which the base model has {len(wrapped)}")
     model.update_modules(tree_unflatten(wrapped))
     model.freeze()
+    # New modules start in training mode, where the adapters' dropout would apply while serving.
+    model.eval()
     mx.eval(model.parameters())
+
+
+def _lora_dropout(module):
+    # mlx.nn.Dropout keeps the keep probability.
+    return round(1.0 - float(getattr(module.dropout, "_p_1", 1.0)), 6)
 
 
 def _merge_lora(model, folder):
@@ -1669,10 +1676,10 @@ def save_clef_adapter(pipeline, folder, source, base_model, base_revision = None
     (folder, source), decoder, stored = _apart(folder, source), pipeline.model, _stored_tensors(source)
     adapters = [(path, module) for path, module in decoder.named_modules() if "lora_a" in module]
     whole = [path for path, _ in tree_flatten(decoder.trainable_parameters()) if path.rsplit(".", 1)[-1] not in ("lora_a", "lora_b")]
-    shapes = {(module.lora_a.shape[1], float(module.scale)) for _, module in adapters}
+    shapes = {(module.lora_a.shape[1], float(module.scale), _lora_dropout(module)) for _, module in adapters}
     if len(shapes) != 1 or whole:
         raise ValueError("Unsloth: only a Clef trained through LoRA adapters of one rank saves as adapters; save it merged with save_clef_model.")
-    (rank, scale), = shapes
+    (rank, scale, dropout), = shapes
     tensors = {}
     for path, module in adapters:
         name = _decoder_tensor_name(decoder, f"{path}.weight", stored)
@@ -1682,7 +1689,7 @@ def save_clef_adapter(pipeline, folder, source, base_model, base_revision = None
         tensors[f"{stem}.lora_A.weight"], tensors[f"{stem}.lora_B.weight"] = module.lora_a.T, module.lora_b.T
     adapter = {
         "peft_type": "LORA", "task_type": None, "base_model_name_or_path": str(base_model), "revision": base_revision,
-        "r": rank, "lora_alpha": scale * rank, "lora_dropout": 0.0, "bias": "none", "fan_in_fan_out": False, "inference_mode": True,
+        "r": rank, "lora_alpha": scale * rank, "lora_dropout": dropout, "bias": "none", "fan_in_fan_out": False, "inference_mode": True,
         "target_modules": sorted({path.rsplit(".", 1)[-1] for path, _ in adapters}),
     }
     config = {"layout": "clef", "temperature": [1.0, 1.0, 1.0], **(config or {}), "fine_tuned": True, "base_model": str(base_model)}

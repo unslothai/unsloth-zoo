@@ -931,6 +931,14 @@ def test_a_clef_saves_as_adapters_that_load_over_their_base_and_go_on_training(c
     assert again.keys() == dict(tree_flatten(trained)).keys() and again["language_model.model.layers.3.mlp.down_proj.lora_a"].shape[1] == 4
     grads = dict(tree_flatten(_clef_record_loss_and_grad(network, record)[1]))
     assert mx.any(grads["encoder.language_model.model.layers.3.mlp.down_proj.lora_a"]).item()
+    # A dropout the adapters trained with is saved and comes back with them, off while the model serves.
+    for _, module in pipeline.model.named_modules():
+        if "lora_a" in module:
+            module.dropout = Dropout(0.25)
+    save_clef_adapter(pipeline, out, base, "org/base")
+    assert json.loads((out / "adapter_config.json").read_text())["lora_dropout"] == 0.25
+    reloaded = [module.dropout for _, module in load_decision_model(out, base_model = base, load_in_4bit = four_bit).model.named_modules() if "lora_a" in module]
+    assert reloaded and all(dropout._p_1 == pytest.approx(0.75) and not dropout.training for dropout in reloaded)
     # An adapter for a module the base does not have, or for the output embedding the joint head reads, is not put on it.
     for stem, refusal in (("layers.9.mlp.down_proj", "of which the base model has"), ("lm_head", "output embedding")):
         mx.save_safetensors(str(out / "adapter_model.safetensors"), {key.replace("model.language_model.layers.3.mlp.down_proj", stem): value for key, value in tensors.items()})
@@ -1210,6 +1218,27 @@ def test_trainer_logs_evaluates_saves_and_ends_an_epoch_when_a_callback_asks(che
     trainer = MLXDecisionTrainer(load_trainable_decision_model(checkpoint[1]), args, _items(), _items(), callbacks = [transformers.DefaultFlowCallback()])
     trainer.train()
     assert (trainer.state.eval_steps, trainer.state.save_steps) == (3, 4)
+
+
+def test_trainer_clips_gradients_as_mlx_trainer_does(checkpoint, monkeypatch):
+    from unsloth_zoo.mlx import trainer as module
+
+    seen = []
+    for name in ("_clip_grad_by_value", "_clip_grad_by_leaf_norm", "_clip_grad_norm_fp32"):
+        monkeypatch.setattr(module, name, lambda grads, cap, name = name, original = getattr(module, name): seen.append((name, cap)) or original(grads, cap))
+    model = load_trainable_decision_model(checkpoint[1])
+    # No clip knob is the per-leaf cap of 1.0; a value clamp wins over the others and a leaf cap over a global norm.
+    cases = (
+        ({"max_grad_norm": 0.0}, ("_clip_grad_by_leaf_norm", 1.0)),
+        ({"max_grad_norm": 0.5}, ("_clip_grad_norm_fp32", 0.5)),
+        ({"max_grad_norm": 0.5, "max_grad_leaf_norm": 2.0}, ("_clip_grad_by_leaf_norm", 2.0)),
+        ({"max_grad_norm": 0.5, "max_grad_value": 0.1}, ("_clip_grad_by_value", 0.1)),
+        ({"max_grad_norm": 0.0, "max_grad_leaf_norm": 0.0}, None),
+    )
+    for kwargs, want in cases:
+        seen.clear()
+        MLXDecisionTrainer(model, _config(max_steps = 1, **kwargs), _items()).train()
+        assert seen == ([want] if want else [])
 
 
 def test_trainer_stops_on_request_and_refuses_other_optimizers(checkpoint):
