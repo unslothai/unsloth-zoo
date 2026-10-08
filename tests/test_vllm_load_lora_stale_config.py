@@ -71,7 +71,26 @@ def test_load_tensors_writes_the_config_once_per_process(tmp_path, load_lora):
     (directory / "adapter_config.json").write_text("{}")
     second = load_lora(model, str(directory), load_tensors = True)
     assert second.lora_config == first.lora_config
-    assert second.lora_config is not first.lora_config
+    assert second.lora_config["r"] == 16
+
+
+def test_load_tensors_is_not_fooled_by_the_cached_config_reader(tmp_path, load_lora):
+    directory = tmp_path / "trainer"
+    _write_stale(directory, r = 32)
+    assert vu.get_peft_config(str(directory))["r"] == 32
+    request = load_lora(_Model(), str(directory), load_tensors = True)
+    assert request.lora_config["r"] == 16
+
+
+def test_rank_check_reads_a_resaved_adapter_fresh(tmp_path, load_lora):
+    directory = tmp_path / "adapter"
+    _write_stale(directory, r = 32)
+    with pytest.raises(ValueError):
+        load_lora(_Model(max_lora_rank = 16), str(directory))
+    config = json.loads((directory / "adapter_config.json").read_text())
+    config["r"] = 16
+    (directory / "adapter_config.json").write_text(json.dumps(config))
+    assert load_lora(_Model(max_lora_rank = 16), str(directory)).lora_path == str(directory)
 
 
 def test_path_load_above_max_lora_rank_is_refused_before_vllm(tmp_path, load_lora):

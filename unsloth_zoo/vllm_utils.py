@@ -4038,9 +4038,10 @@ def _live_lora_config(model, save_directory):
     cached = _LIVE_LORA_CONFIGS.get(key)
     if cached is None or cached[0] is not config:
         config.save_pretrained(save_directory)
-        cached = (config, get_peft_config(save_directory))
+        # get_peft_config is functools.cache'd and may hold the stale file: read it fresh.
+        cached = (config, get_peft_config.__wrapped__(save_directory))
         _LIVE_LORA_CONFIGS[key] = cached
-    return dict(cached[1])
+    return cached[1]
 pass
 
 
@@ -4052,7 +4053,7 @@ def _check_lora_rank_fits(model, save_directory):
     """
     # All Unsloth Zoo code licensed under LGPLv3
     try:
-        r = get_peft_config(save_directory).get("r", None)
+        r = get_peft_config.__wrapped__(save_directory).get("r", None)
         engine = model.vllm_engine.llm_engine
         lora_config = getattr(getattr(engine, "vllm_config", None), "lora_config", None) \
             or getattr(engine, "lora_config", None)
