@@ -481,18 +481,19 @@ except:
     torch_compiler_set_stance = None
 pass
 
-# True once the inference branch below switched Dynamo to eager_on_recompile, so a
-# training forward only undoes a stance Unsloth set, never one the user chose.
-UNSLOTH_SET_EAGER_STANCE = False
+# The stance is process wide, so whether Unsloth owns it lives in unsloth_zoo, shared by
+# every generated module: inference in one model's module, training in another's.
+from unsloth_zoo.temporary_patches.utils import UNSLOTH_EAGER_STANCE_OWNED
 
 def unsloth_training_stance():
     # eager_on_recompile is global: left on by generate() or eval forwards, every recompile
     # in a later training step (new sequence length, model.train() without for_training)
-    # would silently run the eager body. Training forwards restore the default stance.
-    global INFERENCE_RUNS, UNSLOTH_SET_EAGER_STANCE
+    # would silently run the eager body. Training forwards restore the default stance,
+    # unless the user chose eager_on_recompile themselves.
+    global INFERENCE_RUNS
     INFERENCE_RUNS = 0
-    if UNSLOTH_SET_EAGER_STANCE and torch_dynamo_eval_frame is not None:
-        UNSLOTH_SET_EAGER_STANCE = False
+    if UNSLOTH_EAGER_STANCE_OWNED[0] and torch_dynamo_eval_frame is not None:
+        UNSLOTH_EAGER_STANCE_OWNED[0] = False
         if torch_dynamo_eval_frame._stance.stance == "eager_on_recompile":
             torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = False)
 pass
@@ -3139,7 +3140,7 @@ pass
 __DYNAMO__RECOMPILING__ = """
 
     # Set compiler stance to fail on recompiles for inference
-    global INFERENCE_RUNS, UNSLOTH_SET_EAGER_STANCE
+    global INFERENCE_RUNS
     # Skipped while tracing (set_stance raises there, and the counter would guard every step)
     # and around a compiled decode step, which eager_on_recompile would otherwise freeze.
     if not torch.compiler.is_compiling() and not UNSLOTH_DECODE_COMPILE[0]:
@@ -3150,7 +3151,9 @@ __DYNAMO__RECOMPILING__ = """
         if old_stance is not None and INFERENCE_RUNS == 1:
             # Skip guards and return to eager -> we still need guards!
             torch_compiler_set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = False)
-            UNSLOTH_SET_EAGER_STANCE = True
+            # Owned only if this call switched it: a stance the user already chose stays theirs.
+            if old_stance != "eager_on_recompile":
+                UNSLOTH_EAGER_STANCE_OWNED[0] = True
             if UNSLOTH_ENABLE_LOGGING:
                 logger_compiler.info(
                     f"Unsloth: Removing compiler guards after 1 inference run. "\\

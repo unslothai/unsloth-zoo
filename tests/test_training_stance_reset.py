@@ -19,6 +19,7 @@
 import logging
 import os
 import textwrap
+import types
 
 os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
 
@@ -29,7 +30,7 @@ if not hasattr(torch.compiler, "set_stance"):
     pytest.skip("torch without set_stance", allow_module_level = True)
 
 from unsloth_zoo import compiler
-from unsloth_zoo.temporary_patches.utils import UNSLOTH_DECODE_COMPILE
+from unsloth_zoo.temporary_patches.utils import UNSLOTH_DECODE_COMPILE, UNSLOTH_EAGER_STANCE_OWNED
 
 
 def _stance():
@@ -37,18 +38,21 @@ def _stance():
     return eval_frame._stance.stance
 
 
-def _generated_module(compiled):
-    """The stance globals of a generated module plus a forward built from the same snippets."""
+def _generated_module(compiled, name = "unsloth_compiled_module_test"):
+    """A module object with the stance globals of a generated module, plus a forward built
+    from the same snippets. Separate calls give separate modules, as two model types would."""
     header = compiler._license_header
     start = header.index("global INFERENCE_RUNS")
     end = header.index("from unsloth_zoo import DEVICE_TYPE_TORCH")
-    namespace = {
+    module = types.ModuleType(name)
+    namespace = module.__dict__
+    namespace.update({
         "torch": torch,
         "UNSLOTH_DECODE_COMPILE": UNSLOTH_DECODE_COMPILE,
         "UNSLOTH_ENABLE_LOGGING": False,
         "logger_compiler": logging.getLogger(__name__),
         "compiled": compiled,
-    }
+    })
     exec(header[start:end], namespace)
     forward = (
         "def forward(self, x, labels = None):\n"
@@ -65,7 +69,9 @@ def _generated_module(compiled):
 def _reset_stance():
     torch._dynamo.reset()
     torch.compiler.set_stance("default")
+    UNSLOTH_EAGER_STANCE_OWNED[0] = False
     yield
+    UNSLOTH_EAGER_STANCE_OWNED[0] = False
     torch.compiler.set_stance("default")
     torch._dynamo.reset()
 
@@ -144,3 +150,40 @@ def test_no_graph_break_when_the_forward_is_traced():
     traced(module, x, labels = x)
     with torch.no_grad():
         traced(module.eval(), torch.randn(8))
+
+
+def _infer(ns, module, calls = 3):
+    module.eval()
+    with torch.no_grad():
+        for _ in range(calls):
+            ns["forward"](module, torch.randn(8))
+
+
+def _train(ns, module):
+    module.train()
+    x = torch.randn(8, requires_grad = True)
+    ns["forward"](module, x, labels = x).sum().backward()
+
+
+def test_inference_in_one_module_training_in_another():
+    frames_a, compiled_a = _counting_compile()
+    frames_b, compiled_b = _counting_compile()
+    ns_a = _generated_module(compiled_a, "unsloth_compiled_module_gemma3")
+    ns_b = _generated_module(compiled_b, "unsloth_compiled_module_qwen3_5")
+    assert ns_a is not ns_b
+    _infer(ns_a, torch.nn.Linear(1, 1))
+    assert _stance() == "eager_on_recompile"
+    _train(ns_b, torch.nn.Linear(1, 1))
+    assert _stance() == "default"
+    assert len(frames_b) == 1, "model B's training step ran the eager body"
+
+
+def test_user_stance_survives_unsloth_inference_then_training():
+    frames, compiled = _counting_compile()
+    ns = _generated_module(compiled)
+    module = torch.nn.Linear(1, 1)
+    torch.compiler.set_stance("eager_on_recompile")
+    _infer(ns, module)
+    assert _stance() == "eager_on_recompile"
+    _train(ns, module)
+    assert _stance() == "eager_on_recompile"

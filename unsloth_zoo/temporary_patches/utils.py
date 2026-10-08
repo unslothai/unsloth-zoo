@@ -2098,6 +2098,9 @@ def _settle_abandoned_checkpoint_generator():
 # True only while generate() runs a compiled decode step for a model that opted in. A
 # one-element list so Dynamo guards on the value and retraces when it flips.
 UNSLOTH_DECODE_COMPILE = [False]
+# True while the eager_on_recompile stance is one Unsloth's inference forward set (not the
+# user's). Process wide like the stance, so any generated module's training forward can undo it.
+UNSLOTH_EAGER_STANCE_OWNED = [False]
 _DECODE_COMPILE_LOCK = threading.Lock()
 _DECODE_COMPILE_STATE = {"depth": 0, "stance": None}
 
