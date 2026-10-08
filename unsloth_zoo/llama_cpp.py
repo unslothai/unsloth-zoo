@@ -1451,10 +1451,10 @@ def _published_source_sha256(checksums, tag):
 def _fork_release_source_assets(tag, source_assets = None):
     """(asset map, checksum artifacts) of the unslothai/llama.cpp release `tag`.
 
-    Reuses source_assets when it already names the source archive, so only the
-    sha256 list is fetched; otherwise reads the release by tag. Raises on failure."""
+    Reuses source_assets when it names both the source archive and the sha256 list;
+    otherwise reads the release by tag. Raises on failure."""
     assets = dict(source_assets or {})
-    if _fork_source_asset_name(tag) not in assets:
+    if _fork_source_asset_name(tag) not in assets or LLAMA_CPP_PREBUILT_SHA256_ASSET not in assets:
         release = _requests_get_with_retries(
             f"{LLAMA_CPP_PUBLISHED_RELEASES_API}/tags/{tag}", headers = _github_auth_headers(),
         ).json()

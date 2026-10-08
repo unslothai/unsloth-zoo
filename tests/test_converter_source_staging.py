@@ -1011,10 +1011,19 @@ def test_staging_uses_the_fork_source_asset_when_the_release_carries_one(mod, tm
 
     mod._stage_converter_sources(
         tag, repo = "unslothai/llama.cpp",
-        source_assets = {name: "https://fork.invalid/src.tar.gz"},
+        source_assets = {name: "https://fork.invalid/src.tar.gz",
+                         "llama-prebuilt-sha256.json": "https://fork.invalid/sha.json"},
     )
     assert seen[-1] == "https://fork.invalid/src.tar.gz"
-    assert api == [], "an asset map naming the source archive needs no release lookup"
+    assert api == [], "an asset map naming the source archive and its sha256 list needs no lookup"
+
+    # Without the sha256 list in the map, the release is read by tag so it can be verified.
+    mod._stage_converter_sources(
+        tag, repo = "unslothai/llama.cpp",
+        source_assets = {name: "https://fork.invalid/src.tar.gz"},
+    )
+    assert api == [f"{mod.LLAMA_CPP_PUBLISHED_RELEASES_API}/tags/{tag}"]
+    api.clear()
 
     mod._stage_converter_sources(tag, repo = "unslothai/llama.cpp")
     assert api == [f"{mod.LLAMA_CPP_PUBLISHED_RELEASES_API}/tags/{tag}"]
