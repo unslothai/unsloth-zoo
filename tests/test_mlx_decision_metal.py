@@ -739,7 +739,7 @@ def test_clef_kl_penalty_holds_on_to_the_starting_model_and_fields_are_permuted_
     import random
 
     pipeline, questions = clef[0], {"grade": {"type": "score", "instructions": "how good", "criteria": ["bad", "fine", "good", "great"]}, "ok": {"type": "noul", "instructions": "fine?"}, "pick": {"type": "choice", "instructions": "which", "criteria": {"a": "x", "b": "y", "c": "z"}}}
-    record = {**clef_training_item(pipeline, "hello there", questions), "targets": [[0.0, 0.1, 0.9, 0.0], [0.3, 0.7], [0.2, 0.8, 0.0]], "source": {"state": "hello there", "questions": questions}}
+    record = {**clef_training_item(pipeline, "hello there", questions), "targets": [[0.0, 0.1, 0.9, 0.0], [0.3, 0.7], [0.2, 0.8, 0.0]]}
     with pytest.raises(NotImplementedError, match = "LoRA Clef"):
         MLXDecisionTrainer(ClefNetwork(pipeline), _config(), [record], kl_weight = 2.0)
     network = clef_training_network(pipeline, r = 4, lora_alpha = 4)
@@ -755,7 +755,7 @@ def test_clef_kl_penalty_holds_on_to_the_starting_model_and_fields_are_permuted_
         steps = [network.decision_step(reference = reference)([record]) for reference in (trainer._reference, None)]
     assert any(not mx.allclose(with_kl, without, rtol = 1e-2, atol = 1e-4).item() for (_, with_kl), (_, without) in zip(*(tree_flatten(grads["head"]) for _, grads in steps)))
     assert steps[0][0].item() - steps[1][0].item() == pytest.approx(2.0 * kl, rel = 0.1) and all(module.scale for _, module in network.encoder.named_modules() if "lora_a" in module)
-    # Each question keeps its targets and options whatever order the epoch draws.
+    # The item as clef_training_item builds it is permutable; each question keeps its targets and options whatever order the epoch draws.
     orders = set()
     for epoch in range(8):
         shuffled = network.permuted_item(record, random.Random(f"0-{epoch}-0"))

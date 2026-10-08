@@ -2222,10 +2222,15 @@ def clef_option_keys(pipeline, question):
 
 
 def clef_training_item(pipeline, state, questions, max_length = None):
-    """Tokenize one record as a Clef training item; the caller adds `targets`, a distribution per question over `clef_option_keys`."""
+    """Tokenize one record as a Clef training item; the caller adds `targets`, a distribution per question over `clef_option_keys`.
+
+    `source` keeps the record, which `permute_fields` encodes again with its questions reordered."""
     parsed = pipeline._parse_questions(questions)
     ids, question_spans, option_spans = pipeline.encode(state, parsed, max_length)
-    return {"input_ids": ids, "question_spans": question_spans, "option_spans": option_spans, "types": [_TYPE_IDS.index(q.type) for q in parsed]}
+    return {
+        "input_ids": ids, "question_spans": question_spans, "option_spans": option_spans, "types": [_TYPE_IDS.index(q.type) for q in parsed],
+        "source": {"state": state, "questions": dict(questions), "max_length": max_length},
+    }
 
 
 def decision_logits(model, items, pad_token_id, batch_size = 16):
