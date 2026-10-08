@@ -14,13 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Gemma-3 vLLM -> HF rebuild against both SigLIP tower layouts.
-
-vLLM names SigLIP weights `vision_tower.vision_model.encoder...`. transformers 4.x nests
-the same way, transformers 5 flattened embeddings / encoder / post_layernorm onto
-SiglipVisionModel. The installed transformers gives one layout for real; the other is
-produced by rebuilding the tower in the opposite shape, so both run on any version.
-"""
+"""Gemma-3 vLLM -> HF rebuild for both SigLIP tower layouts (4.x nested, 5.x flat), on any transformers version."""
 
 import copy
 import os
@@ -93,7 +87,6 @@ def _set_layout(model, flat):
 
 @pytest.fixture
 def layout_patch(monkeypatch, request):
-    """Force every Gemma3ForConditionalGeneration built during the test to one tower layout."""
     flat = request.param
     original_init = Gemma3ForConditionalGeneration.__init__
 
