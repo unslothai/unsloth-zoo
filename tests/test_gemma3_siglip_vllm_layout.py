@@ -56,7 +56,7 @@ class _FlatSiglipTower(torch.nn.Module):
         self.config = nested_tower.config
         for name, child in inner.named_children():
             setattr(self, name, child)
-        self._inner = [inner]  # keep forward, outside the module tree
+        self._inner = [inner]
 
     def forward(self, *args, **kwargs):
         return self._inner[0](*args, **kwargs)
@@ -128,7 +128,7 @@ def _reference(config):
     torch.manual_seed(0)
     model = Gemma3ForConditionalGeneration(copy.deepcopy(config)).eval()
     with torch.no_grad():
-        for param in model.parameters():  # norms init to 0/1; make every weight distinguishable
+        for param in model.parameters():
             param.add_(torch.randn_like(param) * 0.02)
     return model
 
@@ -150,7 +150,6 @@ def test_gemma3_vllm_rebuild_matches_hf(monkeypatch, layout_patch):
         assert got[key].shape == value.shape, key
         assert torch.equal(got[key].float(), value.float()), key
 
-    # Same image features and logits on an image prompt
     torch.manual_seed(1)
     pixel_values = torch.randn(1, 3, 28, 28)
     input_ids = torch.tensor([[2, 93] + [95] * 4 + [94, 10, 11, 12]])

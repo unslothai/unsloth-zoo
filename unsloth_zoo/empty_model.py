@@ -1482,12 +1482,7 @@ _VISION_MODEL_SEGMENT = ".vision_model."
 
 
 def _vision_tower_is_flat(new_model, parent_path, child, cache):
-    """True when the HF module at parent_path owns `child` directly and has no `vision_model`.
-
-    vLLM's SigLIP keeps the inner `vision_model` (tower.vision_model.encoder...). transformers 5
-    moved embeddings / encoder / post_layernorm onto SiglipVisionModel itself, while 4.x still
-    nests them. Decided from the module that was actually built, not from a version number.
-    """
+    """True if the built HF tower owns `child` directly (transformers 5 flat SigLIP), checked on the module, not the version."""
     key = (parent_path, child)
     if key not in cache:
         module = _get_nested_attr(new_model, parent_path)
@@ -1513,11 +1508,7 @@ def vllm_vision_name_to_hf(name, new_model, cache = None):
 
 
 def align_vision_tower_names(new_model, quant_state_dict, layer_names):
-    """Rename vLLM vision keys and layer templates to the HF tower layout.
-
-    Returns (quant_state_dict, layer_names, flattened_tower_paths). Unchanged when the HF tower
-    is nested like vLLM's (transformers 4.x) or the model has no SigLIP-style tower.
-    """
+    """Rename vLLM vision keys / layer names to the HF tower layout; returns (state_dict, layer_names, flattened_paths)."""
     from collections import OrderedDict
     cache = {}
     renamed = OrderedDict()
@@ -1534,11 +1525,7 @@ def align_vision_tower_names(new_model, quant_state_dict, layer_names):
 
 
 def vision_tower_census(new_model, reference_model, tower_paths):
-    """Problems in the rebuilt towers vs the meta reference: [(name, problem)], empty when complete.
-
-    Every parameter and buffer of the reference tower must exist in the rebuilt tower with the
-    same shape and must not be left on the meta device, and no module may alias itself.
-    """
+    """[(name, problem)] for missing / misshaped / meta params and buffers or self-aliasing modules in the rebuilt towers."""
     problems = []
     for tower_path in tower_paths:
         tower = _get_nested_attr(new_model, tower_path)
