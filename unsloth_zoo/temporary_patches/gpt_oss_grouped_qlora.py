@@ -246,27 +246,13 @@ def _quant_key(weight):
     return key
 
 
-def _storage_lean(experts, refs = None):
-    """moe_ready_epoch's lean key: per expert projection, the base weight's identity, address and
-    requires_grad, its quant state's identity and absmax address, and the bias' identity and
-    requires_grad. Re-read once per optimizer step; None when it cannot be built."""
-    ptr = torch._C.TensorBase.data_ptr
-    out = []
-    try:
-        with torch._C.DisableTorchFunctionSubclass():
-            for projs in (experts._modules["gate_up_projs"], experts._modules["down_projs"]):
-                for p in projs._modules.values():
-                    base = p._modules.get("base_layer", p)
-                    bp = base._parameters
-                    w, b = bp["weight"], bp.get("bias")
-                    qs = w.__dict__.get("quant_state")
-                    out += (id(w), ptr(w), w.requires_grad, id(qs), None if qs is None else ptr(qs.absmax),
-                            id(b), b is not None and b.requires_grad)
-                    if refs is not None:
-                        refs.append((w, qs, b))
-    except Exception:
-        return None
-    return tuple(out)
+def _base_params(experts):
+    """The `_parameters` dict of every expert's base projection (moe_ready_epoch.Lean reads them)."""
+    return [
+        p._modules.get("base_layer", p)._parameters
+        for projs in (experts._modules["gate_up_projs"], experts._modules["down_projs"])
+        for p in projs._modules.values()
+    ]
 
 
 def _spot_signature(experts):
@@ -293,7 +279,7 @@ def cached_ready(experts):
         return None
     cached = experts.__dict__.get("_unsloth_grouped_ready")
     rec = cached[3] if cached is not None and len(cached) > 3 else None
-    if _ready_epoch.valid(rec, (experts,), lambda: _spot_signature(experts), lambda: _storage_lean(experts)):
+    if _ready_epoch.valid(rec, (experts,), lambda: _spot_signature(experts)):
         _ready_epoch.mark_valid(experts, rec)
         return cached[1], cached[2]
     experts.__dict__.pop(_ready_epoch.VALID, None)   # the tables re-key until a full check vouches again
@@ -308,12 +294,13 @@ def ready_record(experts):
     _ready_epoch.COUNTS["full"] += 1
     rec = None
     hooked, drops = _ready_epoch.scan(experts)
-    if not hooked:
-        refs = []
-        spot, lean = _spot_signature(experts), _storage_lean(experts, refs)
-        if spot is not None and lean is not None:
-            _ready_epoch.wrap_peft()   # PEFT tuner classes imported since the last full check
-            rec = _ready_epoch.Record((experts,), spot, lean, drops, refs)
+    spot = None if hooked else _spot_signature(experts)
+    if spot is not None:
+        _ready_epoch.wrap_peft()   # PEFT tuner classes imported since the last full check
+        try:
+            rec = _ready_epoch.Record((experts,), spot, _base_params(experts), drops, None)
+        except Exception:
+            rec = None
     if rec is not None:
         _ready_epoch.mark_valid(experts, rec)
     else:

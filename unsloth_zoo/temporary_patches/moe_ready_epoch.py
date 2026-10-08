@@ -34,6 +34,7 @@ UNSLOTH_MOE_FAST_READY=0 (read per call) runs the full checks on every call.
 """
 import functools
 import os
+from operator import attrgetter, is_, itemgetter, methodcaller
 
 import torch
 
@@ -178,18 +179,66 @@ def scan(root):
     return hooked, drops
 
 
+_get_weight = itemgetter("weight")
+_get_bias = methodcaller("get", "bias")
+_get_quant_state = attrgetter("quant_state")
+_get_absmax = attrgetter("absmax")
+_get_requires_grad = attrgetter("requires_grad")
+_ptr = torch._C.TensorBase.data_ptr
+
+
+class Lean:
+    """What a hook-less `.data =` / quant_state / absmax swap or requires_grad flip changes, over the
+    base projections' `_parameters` dicts: weight and bias identity, weight address and
+    requires_grad, quant state identity and absmax address. Re-read in C-level maps (one optimizer
+    step bumps only the step stamp, so this runs once per block per step)."""
+    __slots__ = ("params", "ws", "wptrs", "rgs", "qss", "aptrs", "bs", "brgs")
+
+    def __init__(self, params):
+        self.params = params
+        self.ws, self.bs = list(map(_get_weight, params)), list(map(_get_bias, params))
+        with torch._C.DisableTorchFunctionSubclass():
+            self.wptrs = list(map(_ptr, self.ws))
+            self.rgs = list(map(_get_requires_grad, self.ws))
+            self.brgs = [b is not None and b.requires_grad for b in self.bs]
+            qss = [w.__dict__.get("quant_state") for w in self.ws]
+            # All 4-bit or none (the readiness checks decline mixes); else no quant state check.
+            self.qss = qss if all(q is not None for q in qss) else None
+            self.aptrs = None if self.qss is None else list(map(_ptr, map(_get_absmax, qss)))
+
+    def same(self):
+        try:
+            params = self.params
+            ws, bs = list(map(_get_weight, params)), list(map(_get_bias, params))
+            if not (all(map(is_, ws, self.ws)) and all(map(is_, bs, self.bs))):
+                return False
+            with torch._C.DisableTorchFunctionSubclass():
+                if list(map(_ptr, ws)) != self.wptrs or list(map(_get_requires_grad, ws)) != self.rgs:
+                    return False
+                if any(self.brgs) or bs.count(None) != len(bs):
+                    if [b is not None and b.requires_grad for b in bs] != self.brgs:
+                        return False
+                if self.qss is not None:
+                    qss = list(map(_get_quant_state, ws))
+                    if not all(map(is_, qss, self.qss)) or list(map(_ptr, map(_get_absmax, qss))) != self.aptrs:
+                        return False
+            return True
+        except Exception:
+            return False
+
+
 class Record:
     """What a full check saw: the stamp it is valid at, the call context, the spot signature of
-    the end experts, the lean storage key, non-Identity dropouts and their (training, p), and a
-    token for the NF4 tables (new per full check, so a table re-keys over every expert once after
-    any expert-state change; a step re-validation keeps it)."""
+    the end experts (and what keeps its ids alive), the Lean storage view, non-Identity dropouts and
+    their (training, p), and a token for the NF4 tables (new per full check, so a table re-keys
+    over every expert once after any expert-state change; a step re-validation keeps it)."""
     __slots__ = ("stamp", "ctx", "spot", "lean", "drops", "drop_state", "gen", "refs")
 
-    def __init__(self, ctx, spot, lean, drops, refs):
+    def __init__(self, ctx, spot, params, drops, refs):
         self.stamp = stamp()
         self.ctx = ctx
         self.spot = spot
-        self.lean = lean
+        self.lean = Lean(params)
         self.drops = drops
         self.drop_state = drop_state(drops)
         self.gen = object()
@@ -200,14 +249,14 @@ def drop_state(drops):
     return tuple((m.__dict__.get("training"), m.__dict__.get("p")) for m in drops)
 
 
-def valid(rec, ctx, spot_fn, lean_fn):
+def valid(rec, ctx, spot_fn):
     """True (and the record re-stamped) while `rec` still describes the experts; see Record."""
     if rec is None or rec.ctx != ctx:
         return False
     cur = (_EPOCH[0], _EPOCH[1])
     lean = False
     if rec.stamp != cur:
-        if rec.stamp[0] != cur[0] or lean_fn() != rec.lean:
+        if rec.stamp[0] != cur[0] or not rec.lean.same():
             return False
         lean = True
     if rec.drops and drop_state(rec.drops) != rec.drop_state:

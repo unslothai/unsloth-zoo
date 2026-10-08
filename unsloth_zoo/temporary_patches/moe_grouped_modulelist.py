@@ -754,27 +754,15 @@ def _decline(reason, count=True):
     return None
 
 
-def _storage_lean(experts, spec, refs = None):
-    """moe_ready_epoch's lean key: per expert projection, the base weight's identity, address and
-    requires_grad, its quant state's identity and absmax address (what a hook-less `.data =` or
-    quant_state swap changes). Re-read once per optimizer step; None when it cannot be built."""
-    ptr = torch._C.TensorBase.data_ptr
+def _base_params(experts, spec):
+    """The `_parameters` dict of every expert's base projection (moe_ready_epoch.Lean reads them)."""
     out = []
-    try:
-        with torch._C.DisableTorchFunctionSubclass():
-            for ex in experts:
-                mods = ex.__dict__["_modules"]
-                for name in spec[:3]:
-                    p = mods[name]
-                    base = p.__dict__["_modules"].get("base_layer", p)
-                    w = base.__dict__["_parameters"]["weight"]
-                    qs = w.__dict__.get("quant_state")
-                    out += (id(w), ptr(w), w.requires_grad, id(qs), None if qs is None else ptr(qs.absmax))
-                    if refs is not None:
-                        refs.append((w, qs))
-    except Exception:
-        return None
-    return tuple(out)
+    for ex in experts:
+        mods = ex.__dict__["_modules"]
+        for name in spec[:3]:
+            p = mods[name]
+            out.append(p.__dict__["_modules"].get("base_layer", p).__dict__["_parameters"])
+    return out
 
 
 def _spot_signature(experts, spec):
@@ -788,13 +776,14 @@ def _ready_record(block, experts, spec, ctx):
     if hooked:
         return None
     _ready_epoch.track((block,))
-    refs = []
     spot = _ready_signature((experts[0], experts[-1]), spec)
-    lean = _storage_lean(experts, spec, refs)
-    if spot is None or lean is None:
+    if spot is None:
         return None
     _ready_epoch.wrap_peft()   # PEFT tuner classes imported since the last full check
-    return _ready_epoch.Record(ctx, spot[0], lean, drops, (refs, spot[1]))
+    try:
+        return _ready_epoch.Record(ctx, spot[0], _base_params(experts, spec), drops, spot[1])
+    except Exception:
+        return None
 
 
 @torch.compiler.disable
@@ -808,8 +797,7 @@ def _cached_state(block, experts, spec, device, dtype):
     ctx = (device, dtype, env, experts, len(experts))
     if fast:
         rec = cached[3] if cached is not None else None
-        if _ready_epoch.valid(rec, ctx, lambda: _spot_signature(experts, spec),
-                              lambda: _storage_lean(experts, spec)):
+        if _ready_epoch.valid(rec, ctx, lambda: _spot_signature(experts, spec)):
             _ready_epoch.mark_valid(experts, rec)
             return cached[1]
         _ready_epoch.COUNTS["full"] += 1
