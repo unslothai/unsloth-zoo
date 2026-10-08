@@ -1213,7 +1213,7 @@ _GROUPED_MM_SURVIVES_LOCK = threading.Lock()
 def _grouped_mm_survives_out_of_process(device):
     global _GROUPED_MM_SURVIVES
     if _GROUPED_MM_SURVIVES is not None: return _GROUPED_MM_SURVIVES
-    # Published only once known: a concurrent first caller must not run the kernel while the child is still out.
+    # Publish once known: concurrent first callers wait for the child, never run the kernel.
     with _GROUPED_MM_SURVIVES_LOCK:
         if _GROUPED_MM_SURVIVES is None: _GROUPED_MM_SURVIVES = _run_grouped_mm_crash_probe(device)
     return _GROUPED_MM_SURVIVES

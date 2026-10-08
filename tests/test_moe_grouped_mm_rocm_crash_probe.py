@@ -96,7 +96,6 @@ def test_crashing_probe_disables_both_grouped_mm_probes(monkeypatch, fake_rocm):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU so the probe reaches the kernel call")
 def test_import_survives_segfaulting_grouped_mm(tmp_path):
-    # Every interpreter (this child and the probe's own child) sees ROCm and a grouped_mm that segfaults.
     (tmp_path / "sitecustomize.py").write_text(
         "import os, signal, torch\n"
         "torch.version.hip = '7.1.0'\n"
