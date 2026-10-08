@@ -483,7 +483,7 @@ pass
 
 # The stance is process wide, so whether Unsloth owns it lives in unsloth_zoo, shared by
 # every generated module: inference in one model's module, training in another's.
-from unsloth_zoo.temporary_patches.utils import UNSLOTH_EAGER_STANCE_OWNED
+from unsloth_zoo.temporary_patches.utils import UNSLOTH_EAGER_STANCE_OWNED, unsloth_claim_eager_stance, unsloth_owns_stance
 
 def unsloth_training_stance():
     # eager_on_recompile is global: left on by generate() or eval forwards, every recompile
@@ -494,13 +494,12 @@ def unsloth_training_stance():
     # set_stance since then (even to eager_on_recompile again) is theirs and stays.
     global INFERENCE_RUNS
     INFERENCE_RUNS = 0
-    owned = UNSLOTH_EAGER_STANCE_OWNED[0]
-    if owned is not None and torch_dynamo_eval_frame is not None:
+    if len(UNSLOTH_EAGER_STANCE_OWNED) != 0 and torch_dynamo_eval_frame is not None:
         current = torch_dynamo_eval_frame._stance
-        # Ownership is only dropped once ours is reset: inside a temporary user stance scope the
-        # exit restores our exact object, which a later training forward must still recognise.
-        if (owned is True or owned is current) and current.stance == "eager_on_recompile":
-            UNSLOTH_EAGER_STANCE_OWNED[0] = None
+        # Ownership is only dropped once ours is reset: a temporary stance scope's exit restores
+        # one of our exact objects, which a later training forward must still recognise.
+        if current.stance == "eager_on_recompile" and unsloth_owns_stance(current):
+            UNSLOTH_EAGER_STANCE_OWNED.clear()
             torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = False)
 pass
 
@@ -3161,7 +3160,7 @@ __DYNAMO__RECOMPILING__ = """
             if old_stance != "eager_on_recompile":
                 torch_compiler_set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = False)
                 # The stance object itself, or True where torch keeps no such object.
-                UNSLOTH_EAGER_STANCE_OWNED[0] = getattr(torch_dynamo_eval_frame, "_stance", True)
+                unsloth_claim_eager_stance(getattr(torch_dynamo_eval_frame, "_stance", True))
             if UNSLOTH_ENABLE_LOGGING:
                 logger_compiler.info(
                     f"Unsloth: Removing compiler guards after 1 inference run. "\\

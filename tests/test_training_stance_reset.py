@@ -73,9 +73,9 @@ def _generated_module(compiled, name = "unsloth_compiled_module_test"):
 def _reset_stance():
     torch._dynamo.reset()
     torch.compiler.set_stance("default")
-    UNSLOTH_EAGER_STANCE_OWNED[0] = None
+    UNSLOTH_EAGER_STANCE_OWNED.clear()
     yield
-    UNSLOTH_EAGER_STANCE_OWNED[0] = None
+    UNSLOTH_EAGER_STANCE_OWNED.clear()
     torch.compiler.set_stance("default")
     torch._dynamo.reset()
 
@@ -264,4 +264,21 @@ def test_training_inside_a_scoped_user_stance_keeps_ownership():
         _train(ns, module)
     assert _stance() == "eager_on_recompile"
     _train(ns, module)
+    assert _stance() == "default"
+
+
+def test_scoped_inference_in_a_second_module_keeps_the_first_claim():
+    # A owns the eager stance; B's claiming inference runs inside a temporary default scope,
+    # whose exit restores A's object. Training must still recognise and reset it.
+    frames_a, compiled_a = _counting_compile()
+    frames_b, compiled_b = _counting_compile()
+    ns_a = _generated_module(compiled_a, "unsloth_compiled_module_gemma3")
+    ns_b = _generated_module(compiled_b, "unsloth_compiled_module_qwen3_5")
+    module_b = torch.nn.Linear(1, 1)
+    _infer(ns_a, torch.nn.Linear(1, 1))
+    _infer(ns_b, module_b, calls = 1)
+    with torch.compiler.set_stance("default"):
+        _infer(ns_b, module_b, calls = 1)
+    assert _stance() == "eager_on_recompile"
+    _train(ns_b, module_b)
     assert _stance() == "default"

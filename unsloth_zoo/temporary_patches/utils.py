@@ -2098,10 +2098,19 @@ def _settle_abandoned_checkpoint_generator():
 # True only while generate() runs a compiled decode step for a model that opted in. A
 # one-element list so Dynamo guards on the value and retraces when it flips.
 UNSLOTH_DECODE_COMPILE = [False]
-# The eager_on_recompile stance object Unsloth's inference forward installed (None if it set
-# none, True where torch keeps no stance object). Process wide like the stance, so any
-# generated module's training forward can undo it, but only while that object is current.
-UNSLOTH_EAGER_STANCE_OWNED = [None]
+# The eager_on_recompile stance objects Unsloth installed (True where torch keeps no stance
+# object). Process wide like the stance, so any generated module's training forward can undo
+# it, but only while one of them is current: a temporary scope restores an earlier object.
+UNSLOTH_EAGER_STANCE_OWNED = []
+
+
+def unsloth_claim_eager_stance(stance):
+    UNSLOTH_EAGER_STANCE_OWNED.append(stance)
+    del UNSLOTH_EAGER_STANCE_OWNED[:-8]
+
+
+def unsloth_owns_stance(current):
+    return any(owned is True or owned is current for owned in UNSLOTH_EAGER_STANCE_OWNED)
 _DECODE_COMPILE_LOCK = threading.Lock()
 _DECODE_COMPILE_STATE = {"depth": 0, "stance": None}
 
@@ -2174,24 +2183,20 @@ def _eager_during_decode(func, compiled):
 
 
 def _stance_is_owned():
-    owned = UNSLOTH_EAGER_STANCE_OWNED[0]
-    if owned is None:
-        return False
-    if owned is True:
-        return True
     try:
         import torch._dynamo.eval_frame as eval_frame
-        return owned is eval_frame._stance
+        current = eval_frame._stance
     except Exception:
-        return False
+        current = None
+    return unsloth_owns_stance(current)
 
 
 def _claim_current_stance():
     try:
         import torch._dynamo.eval_frame as eval_frame
-        UNSLOTH_EAGER_STANCE_OWNED[0] = eval_frame._stance
+        unsloth_claim_eager_stance(eval_frame._stance)
     except Exception:
-        UNSLOTH_EAGER_STANCE_OWNED[0] = True
+        unsloth_claim_eager_stance(True)
 
 
 def _current_stance():
