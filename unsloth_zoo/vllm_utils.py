@@ -1651,6 +1651,26 @@ def _drop_gemma4_audio(new_model, reason):
 pass
 
 
+def _gemma4_audio_missing_reason(new_model, keys):
+    # Every audio parameter and persistent buffer needs a checkpoint entry, else part of
+    # the tower would stay at random init. Aliased tensors need only one of their names.
+    present = set(keys)
+    groups = {}
+    for name, param in new_model.named_parameters(remove_duplicate = False):
+        if name.startswith(GEMMA4_AUDIO_PREFIXES): groups.setdefault(id(param), []).append(name)
+    for module_name, module in new_model.named_modules(remove_duplicate = False):
+        skip = getattr(module, "_non_persistent_buffers_set", set())
+        for buffer_name, buffer in module._buffers.items():
+            if buffer is None or buffer_name in skip: continue
+            name = f"{module_name}.{buffer_name}" if module_name else buffer_name
+            if name.startswith(GEMMA4_AUDIO_PREFIXES): groups.setdefault(id(buffer), []).append(name)
+    missing = sorted(names[0] for names in groups.values() if not any(n in present for n in names))
+    if len(missing) == 0: return None
+    shown = ", ".join(missing[:3]) + (f" and {len(missing) - 3} more" if len(missing) > 3 else "")
+    return f"the checkpoint has no audio tensor for {shown}"
+pass
+
+
 def _gemma4_audio_quantized_reason(keys, weight_map, installable):
     # A quantized tower would be cast from packed integer storage and lose its quant
     # state, so any sign of quantization means nothing is installed.
@@ -1705,7 +1725,8 @@ def _load_gemma4_audio_from_checkpoint(new_model, config, weight_map = None, che
     buffers = dict(new_model.named_buffers(remove_duplicate = False))
     installable = {k: params.get(k, buffers.get(k)) for k in keys}
     installable = {k: v for k, v in installable.items() if v is not None}
-    reason = _gemma4_audio_quantized_reason(keys, weight_map, installable)
+    reason = _gemma4_audio_missing_reason(new_model, keys) or \
+        _gemma4_audio_quantized_reason(keys, weight_map, installable)
     if reason is not None:
         return _drop_gemma4_audio(new_model, reason)
     by_file = {}

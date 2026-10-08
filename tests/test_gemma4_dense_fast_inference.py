@@ -291,3 +291,41 @@ def test_mismatched_audio_shape_is_refused(tmp_path):
     before = model.model.language_model.weight.detach().clone()
     weight_map = _quantized_audio_checkpoint(tmp_path, packed = False, siblings = False, shape = (8, 2))
     _assert_nothing_installed(model, before, _load_gemma4_audio_from_checkpoint(model, _gemma4(), weight_map = weight_map))
+
+
+def test_incomplete_audio_checkpoint_installs_nothing(tmp_path):
+    torch.manual_seed(0)
+    ckpt = {
+        "model.audio_tower.proj.weight": torch.randn(4, 4),
+        "model.audio_tower.norm.weight": torch.randn(4),
+        # model.audio_tower.norm.bias is missing
+        "model.embed_audio.embedding_projection.weight": torch.randn(6, 4),
+    }
+    path = str(tmp_path / "model.safetensors")
+    save_file(ckpt, path)
+    model = _Model()
+    before = model.model.language_model.weight.detach().clone()
+    audio, embed = model.model.audio_tower, model.model.embed_audio
+    old = {n: p.detach().clone() for n, p in audio.named_parameters()}
+    loaded = _load_gemma4_audio_from_checkpoint(model, _gemma4(), weight_map = {k: path for k in ckpt})
+    _assert_nothing_installed(model, before, loaded)
+    for n, p in audio.named_parameters():
+        assert torch.equal(p, old[n]), n
+    assert embed.embedding_projection.weight.shape == (1, 4)
+
+
+def test_completeness_counts_persistent_buffers_and_aliases(tmp_path):
+    from unsloth_zoo.vllm_utils import _gemma4_audio_missing_reason
+
+    model = _Model()
+    model.model.audio_tower.register_buffer("scale", torch.ones(4))
+    model.model.audio_tower.register_buffer("cache", torch.ones(4), persistent = False)
+    model.model.audio_tower.alias = model.model.audio_tower.proj  # same weight under two names
+    keys = [
+        "model.audio_tower.proj.weight", "model.audio_tower.norm.weight",
+        "model.audio_tower.norm.bias", "model.embed_audio.embedding_projection.weight",
+    ]
+    reason = _gemma4_audio_missing_reason(model, keys)
+    assert reason is not None and "model.audio_tower.scale" in reason
+    # The non-persistent buffer is never required, and the alias is satisfied by proj.weight.
+    assert _gemma4_audio_missing_reason(model, keys + ["model.audio_tower.scale"]) is None
