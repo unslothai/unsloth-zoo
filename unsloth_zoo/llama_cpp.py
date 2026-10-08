@@ -237,11 +237,8 @@ LLAMA_CPP_DEFAULT_DIR = os.environ.get(
     os.path.join(UNSLOTH_HOME, "llama.cpp"),
 )
 
-# Prebuilt llama.cpp binaries (CPU, CUDA, ROCm, Metal) and the converter sources
-# all come from releases of the unslothai/llama.cpp fork, the same releases Unsloth
-# Studio installs from: bundles are selected via its manifest and every archive is
-# verified against its published llama-prebuilt-sha256.json. Fork tags look like
-# b11443-mix-d65395f, where b11443 is the upstream tag the release is built on.
+# Prebuilts and converter sources come only from unslothai/llama.cpp releases, sha256-verified
+# against llama-prebuilt-sha256.json. Tags are <upstream>-mix-<sha>, e.g. b11443-mix-d65395f.
 # Marker file distinguishes a prebuilt install from a corrupted source checkout.
 UNSLOTH_PREBUILT_INFO_FILENAME = "UNSLOTH_PREBUILT_INFO.json"
 LLAMA_CPP_FORK_REPO = "unslothai/llama.cpp"
@@ -274,8 +271,7 @@ def _converter_cache_root():
     ).strip() or LLAMA_CPP_CONVERTER_CACHE_DIR
 # conversion/ is absent on purpose: pre-split revisions legitimately have none, so
 # it is required only when the entrypoint imports it (_staged_sources_are_complete).
-# convert_lora_to_gguf.py is required so a cache entry staged before it was copied
-# is re-staged: Unsloth Studio's GGUF adapter export runs it from the same tree.
+# convert_lora_to_gguf.py required so older cache entries re-stage (Studio adapter export needs it).
 _CONVERTER_STAGE_REQUIRED = (
     "convert_hf_to_gguf.py",
     "convert_lora_to_gguf.py",
@@ -1739,7 +1735,6 @@ def _extract_converter_sources_into(tag, dest_folder, source_assets = None, arch
             raise RuntimeError(f"Unsloth: Source tarball for {tag} is missing converter files.")
         os.makedirs(dest_folder, exist_ok = True)
         shutil.copy2(converter, os.path.join(dest_folder, "convert_hf_to_gguf.py"))
-        # Unsloth Studio's GGUF adapter export runs this beside the converter.
         lora_converter = os.path.join(root, "convert_lora_to_gguf.py")
         if os.path.isfile(lora_converter):
             shutil.copy2(lora_converter, os.path.join(dest_folder, "convert_lora_to_gguf.py"))
@@ -1906,11 +1901,9 @@ def _read_prebuilt_marker(install_folder):
     return repo.strip(), tag.strip()
 
 
-# What markers written by older unsloth_zoo installs of upstream prebuilts record.
-# Still read, never fetched from: their converter comes from the matching fork release.
+# Recorded by older installs of upstream prebuilts; read only, never fetched from.
 _LEGACY_UPSTREAM_REPO = "ggml-org/llama.cpp"
 _FORK_RELEASE_TAGS = {}
-# Release list pages scanned when mapping an upstream tag (100 releases per page).
 _FORK_RELEASE_PAGES = 3
 
 
