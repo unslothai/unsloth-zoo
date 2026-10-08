@@ -219,17 +219,24 @@ def test_gpu_full_install_happy_path(monkeypatch, tmp_path):
     _make_binary_archive(str(binary), tag)
     _make_source_archive(str(source), tag)
     sha = llama_cpp._sha256_file(str(binary))
+    source_name = f"llama.cpp-source-{tag}.tar.gz"
+    source_sha = llama_cpp._sha256_file(str(source))
 
     _patch_platform(monkeypatch, "Linux", "x86_64")
     monkeypatch.delenv("UNSLOTH_LLAMA_FORCE_COMPILE", raising = False)
     monkeypatch.setattr(llama_cpp, "_detect_gpu_target", lambda: ("cuda", 100, "cuda12"))
     monkeypatch.setattr(
         llama_cpp, "_resolve_llama_cpp_release",
-        lambda releases_api = None: (tag, {asset: f"https://example.invalid/{asset}"}),
+        lambda releases_api = None: (tag, {
+            asset       : f"https://example.invalid/{asset}",
+            source_name : f"https://example.invalid/{source_name}",
+        }),
     )
     monkeypatch.setattr(
         llama_cpp, "_fetch_release_json_asset",
-        lambda assets, name: FORK_MANIFEST if "manifest" in name else {"artifacts": {asset: {"sha256": sha}}},
+        lambda assets, name: FORK_MANIFEST if "manifest" in name else {"artifacts": {
+            asset: {"sha256": sha}, source_name: {"sha256": source_sha},
+        }},
     )
     def fake_download(url, dest_path):
         fixture = binary if "app-" in os.path.basename(dest_path) else source
@@ -463,8 +470,10 @@ def test_extract_and_place_windows_zip(monkeypatch, tmp_path):
 
 
 def _wire_fake_downloads(monkeypatch, tmp_path, tag, quantize_script = FAKE_QUANTIZE):
-    """Point release resolution and downloads at local fixture archives."""
-    binary = tmp_path / "fixtures" / f"llama-{tag}-bin-ubuntu-x64.tar.gz"
+    """Point fork release resolution and downloads at local fixture archives."""
+    asset = f"app-{tag}-linux-x64-cpu.tar.gz"
+    source_name = f"llama.cpp-source-{tag}.tar.gz"
+    binary = tmp_path / "fixtures" / asset
     source = tmp_path / "fixtures" / "source.tar.gz"
     os.makedirs(binary.parent, exist_ok = True)
     _make_binary_archive(str(binary), tag, quantize_script)
@@ -472,15 +481,22 @@ def _wire_fake_downloads(monkeypatch, tmp_path, tag, quantize_script = FAKE_QUAN
 
     _patch_platform(monkeypatch, "Linux", "x86_64")
     monkeypatch.delenv("UNSLOTH_LLAMA_FORCE_COMPILE", raising = False)
-    # The fork (published) release is unreachable here, so this exercises the
-    # ggml-org CPU fallback (attempt 3). The fork CPU path has its own tests.
+    manifest = {"artifacts": [{"asset_name": asset, "install_kind": "linux-cpu"}]}
+    checksums = {"artifacts": {
+        asset       : {"sha256": llama_cpp._sha256_file(str(binary))},
+        source_name : {"sha256": llama_cpp._sha256_file(str(source))},
+    }}
     monkeypatch.setattr(
         llama_cpp, "_resolve_llama_cpp_release",
-        lambda releases_api = None: None if releases_api == llama_cpp.LLAMA_CPP_PUBLISHED_RELEASES_API
-        else _fake_release(tag, [f"llama-{tag}-bin-ubuntu-x64.tar.gz"]),
+        lambda releases_api = None: _fake_release(tag, [asset, source_name])
+        if releases_api == llama_cpp.LLAMA_CPP_PUBLISHED_RELEASES_API else None,
+    )
+    monkeypatch.setattr(
+        llama_cpp, "_fetch_release_json_asset",
+        lambda assets, name: manifest if "manifest" in name else checksums,
     )
     def fake_download(url, dest_path):
-        fixture = binary if "-bin-" in os.path.basename(dest_path) else source
+        fixture = binary if os.path.basename(dest_path) == asset else source
         with open(fixture, "rb") as fr, open(dest_path, "wb") as fw:
             fw.write(fr.read())
     monkeypatch.setattr(llama_cpp, "_download_archive", fake_download)
@@ -501,7 +517,8 @@ def test_full_prebuilt_install_happy_path(monkeypatch, tmp_path):
     assert os.path.isfile(os.path.join(folder, "conversion", "__init__.py"))
     marker = json.load(open(os.path.join(folder, llama_cpp.UNSLOTH_PREBUILT_INFO_FILENAME)))
     assert marker["tag"] == "b9000"
-    assert marker["asset"] == "llama-b9000-bin-ubuntu-x64.tar.gz"
+    assert marker["repo"] == "unslothai/llama.cpp"
+    assert marker["asset"] == "app-b9000-linux-x64-cpu.tar.gz"
     leftovers = [e for e in os.listdir(tmp_path) if e.startswith(".llama_cpp_prebuilt_")]
     assert leftovers == []
 
@@ -617,33 +634,45 @@ def _capture_hydrate_url(monkeypatch):
 
 def test_hydrate_prefers_fork_source_asset(monkeypatch, tmp_path):
     seen = _capture_hydrate_url(monkeypatch)
-    src_assets = {"llama.cpp-source-b9739-mix-2d6bd50.tar.gz": "https://fork.invalid/forksrc.tar.gz"}
+    name = "llama.cpp-source-b9739-mix-2d6bd50.tar.gz"
+    src_assets = {name: "https://fork.invalid/forksrc.tar.gz"}
     with pytest.raises(RuntimeError):
         llama_cpp._hydrate_converter_sources(
             "b9739-mix-2d6bd50", str(tmp_path / "install"), source_assets = src_assets,
+            checksums = {name: {"sha256": "ab" * 32}},
         )
     assert seen["url"] == "https://fork.invalid/forksrc.tar.gz"
 
 
-def test_hydrate_strips_mix_tag_when_no_fork_source(monkeypatch, tmp_path):
-    # Fork mix tag, but no fork source asset -> strip the -mix-... suffix and pull
-    # the matching upstream tag from ggml-org (the verbatim mix tag 404s there).
+def test_hydrate_without_an_asset_map_reads_the_fork_release(monkeypatch, tmp_path):
+    # No asset map: the fork release is read by its tag for the source asset and
+    # its digest. The -mix- suffix is never stripped and ggml-org never asked.
     seen = _capture_hydrate_url(monkeypatch)
+    tag = "b9739-mix-2d6bd50"
+    name = f"llama.cpp-source-{tag}.tar.gz"
+    asked = []
+    monkeypatch.setattr(
+        llama_cpp, "_fork_release_source_assets",
+        lambda t, assets = None: asked.append(t) or (
+            {name: f"https://github.com/unslothai/llama.cpp/releases/download/{t}/{name}"},
+            {name: {"sha256": "ab" * 32}},
+        ),
+    )
     with pytest.raises(RuntimeError):
-        llama_cpp._hydrate_converter_sources(
-            "b9739-mix-2d6bd50", str(tmp_path / "install"), source_assets = None,
-        )
-    assert seen["url"] == llama_cpp.LLAMA_CPP_SOURCE_TARBALL.format(tag = "b9739")
+        llama_cpp._hydrate_converter_sources(tag, str(tmp_path / "install"), source_assets = None)
+    assert asked == [tag]
+    assert seen["url"] == f"https://github.com/unslothai/llama.cpp/releases/download/{tag}/{name}"
 
 
-def test_hydrate_plain_ggml_tag_unchanged(monkeypatch, tmp_path):
+def test_hydrate_refuses_a_source_archive_with_no_published_digest(monkeypatch, tmp_path):
     seen = _capture_hydrate_url(monkeypatch)
-    with pytest.raises(RuntimeError):
+    monkeypatch.setattr(llama_cpp, "_fork_release_source_assets", lambda t, assets = None: ({}, {}))
+    with pytest.raises(RuntimeError, match = "cannot be verified"):
         llama_cpp._hydrate_converter_sources("b9000", str(tmp_path / "install"))
-    assert seen["url"] == llama_cpp.LLAMA_CPP_SOURCE_TARBALL.format(tag = "b9000")
+    assert seen == {}, "an unverifiable archive must not even be downloaded"
 
 
-# --- attempt ORDER across the fork-GPU -> fork-CPU -> ggml-org chain ----------
+# --- attempt ORDER across the fork-GPU -> fork-CPU chain ----------------------
 
 def _wire_attempt_recorder(monkeypatch, *, fork_release, ggml_release, manifest = FORK_MANIFEST):
     """Record (repo, asset_name) for every staged attempt then raise, so the whole
@@ -680,10 +709,8 @@ def test_attempt_order_cpu_only_linux(monkeypatch, tmp_path):
     ggml = _fake_release("b9000", ["llama-b9000-bin-ubuntu-x64.tar.gz"])
     calls = _wire_attempt_recorder(monkeypatch, fork_release = ("b9585", FORK_ASSETS), ggml_release = ggml)
     assert llama_cpp._install_llama_cpp_prebuilt(str(tmp_path / "llama.cpp"), gpu_support = False) is None
-    assert calls == [
-        ("unslothai/llama.cpp", "app-b9585-linux-x64-cpu.tar.gz"),
-        ("ggml-org/llama.cpp",  "llama-b9000-bin-ubuntu-x64.tar.gz"),
-    ]
+    # Fork CPU only: no ggml-org attempt follows, the caller compiles instead.
+    assert calls == [("unslothai/llama.cpp", "app-b9585-linux-x64-cpu.tar.gz")]
 
 
 def test_attempt_order_gpu_cuda_host(monkeypatch, tmp_path):
@@ -745,13 +772,13 @@ def test_attempt_order_darwin_fork_only_no_ggml(monkeypatch, tmp_path):
     assert calls == [("unslothai/llama.cpp", "llama-b9585-bin-macos-arm64.tar.gz")]
 
 
-def test_attempt_order_fork_unreachable_uses_ggml(monkeypatch, tmp_path):
+def test_attempt_order_fork_unreachable_compiles(monkeypatch, tmp_path):
     _patch_platform(monkeypatch, "Linux", "x86_64")
     monkeypatch.delenv("UNSLOTH_LLAMA_FORCE_COMPILE", raising = False)
     ggml = _fake_release("b9000", ["llama-b9000-bin-ubuntu-x64.tar.gz"])
     calls = _wire_attempt_recorder(monkeypatch, fork_release = None, ggml_release = ggml)
     assert llama_cpp._install_llama_cpp_prebuilt(str(tmp_path / "llama.cpp"), gpu_support = False) is None
-    assert calls == [("ggml-org/llama.cpp", "llama-b9000-bin-ubuntu-x64.tar.gz")]
+    assert calls == []
 
 
 @pytest.mark.skipif(not IS_POSIX, reason = "shell-script fake binaries")
@@ -779,9 +806,11 @@ def test_cpu_fork_full_install_happy_path(monkeypatch, tmp_path):
         # Only the fork resolves; ggml is unreachable so the fork CPU bundle wins.
         return (tag, fork_assets) if releases_api == llama_cpp.LLAMA_CPP_PUBLISHED_RELEASES_API else None
     monkeypatch.setattr(llama_cpp, "_resolve_llama_cpp_release", fake_resolve)
+    source_sha = llama_cpp._sha256_file(str(source))
     monkeypatch.setattr(
         llama_cpp, "_fetch_release_json_asset",
-        lambda assets, name: manifest if "manifest" in name else {"artifacts": {}},
+        lambda assets, name: manifest if "manifest" in name
+        else {"artifacts": {fork_source: {"sha256": source_sha}}},
     )
     downloaded = []
     def fake_download(url, dest_path):

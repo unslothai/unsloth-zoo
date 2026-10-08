@@ -23,6 +23,7 @@ tarball on disk.
 from __future__ import annotations
 
 import ast
+import hashlib
 import importlib.util
 import json
 import os
@@ -137,12 +138,17 @@ class Qwen3MoeModel(TextModel):
 """
 
 
+_LORA_ENTRYPOINT = b"#!/usr/bin/env python3\n# convert_lora_to_gguf.py\n"
+
+
 def _write_source_tree(root, *, entrypoint = _SHIM_ENTRYPOINT, conversion = True,
-                       gguf_py = True):
+                       gguf_py = True, lora = True):
     """Write what a llama.cpp source tarball unpacks to, or an install directory."""
     root = Path(root)
     root.mkdir(parents = True, exist_ok = True)
     (root / "convert_hf_to_gguf.py").write_bytes(entrypoint)
+    if lora:
+        (root / "convert_lora_to_gguf.py").write_bytes(_LORA_ENTRYPOINT)
     if gguf_py:
         pkg = root / "gguf-py" / "gguf"
         pkg.mkdir(parents = True, exist_ok = True)
@@ -158,34 +164,72 @@ def _write_source_tree(root, *, entrypoint = _SHIM_ENTRYPOINT, conversion = True
 
 
 def _build_source_tarball(path, *, entrypoint = _SHIM_ENTRYPOINT, conversion = True,
-                          gguf_py = True, tag = "b9000"):
-    """Tarball nested under llama.cpp-{tag}/, the way codeload serves one."""
+                          gguf_py = True, tag = "b9000", lora = True):
+    """Tarball nested under llama.cpp-{tag}/, the way the fork's source asset is."""
     root = Path(path).parent / f"_src_{tag}"
     inner = _write_source_tree(
         root / f"llama.cpp-{tag}", entrypoint = entrypoint,
-        conversion = conversion, gguf_py = gguf_py,
+        conversion = conversion, gguf_py = gguf_py, lora = lora,
     )
     with tarfile.open(path, "w:gz") as archive:
         archive.add(inner, arcname = f"llama.cpp-{tag}")
     return path
 
 
+_FORK = "unslothai/llama.cpp"
+
+
 @pytest.fixture
 def staging_env(mod, tmp_path, monkeypatch):
-    """Cache at tmp_path, downloads served from a real tarball; `downloads` counts them."""
+    """Cache at tmp_path; the fork release metadata and downloads are served from a
+    real tarball whose sha256 the stubbed llama-prebuilt-sha256.json publishes.
+    `downloads` counts downloads, `urls` records what was fetched."""
     cache = tmp_path / "converter-cache"
     monkeypatch.setattr(mod, "LLAMA_CPP_CONVERTER_CACHE_DIR", str(cache))
     state = {"downloads": 0, "entrypoint": _SHIM_ENTRYPOINT, "conversion": True,
-             "gguf_py": True, "fail": None}
+             "gguf_py": True, "lora": True, "fail": None, "urls": [], "blobs": {}}
+    lock = threading.Lock()
+    blob_dir = tmp_path / "_release_blobs"
+
+    def _blob_for(tag):
+        key = (tag, state["entrypoint"], state["conversion"], state["gguf_py"], state["lora"])
+        with lock:
+            if key not in state["blobs"]:
+                path = blob_dir / f"blob{len(state['blobs'])}" / "source.tar.gz"
+                path.parent.mkdir(parents = True)
+                _build_source_tarball(
+                    path, entrypoint = state["entrypoint"], conversion = state["conversion"],
+                    gguf_py = state["gguf_py"], lora = state["lora"],
+                )
+                state["blobs"][key] = path
+            return state["blobs"][key]
+
+    def fake_release_assets(tag, source_assets = None):
+        name = f"llama.cpp-source-{tag}.tar.gz"
+        blob = _blob_for(tag)
+        url = f"https://github.com/{_FORK}/releases/download/{tag}/{name}"
+        digest = hashlib.sha256(blob.read_bytes()).hexdigest()
+        # The URL carries the blob so a download made under one configuration
+        # serves exactly the bytes whose digest was published for it.
+        return {name: url + "#" + str(blob)}, {name: {"sha256": digest}}
 
     def fake_download(url, dest_path):
-        state["downloads"] += 1
+        with lock:
+            state["downloads"] += 1
+            state["urls"].append(url.split("#")[0])
         if state["fail"] is not None:
             raise state["fail"]
-        _build_source_tarball(
-            dest_path, entrypoint = state["entrypoint"],
-            conversion = state["conversion"], gguf_py = state["gguf_py"],
-        )
+        if "#" in url:
+            shutil.copyfile(url.split("#", 1)[1], dest_path)
+        else:
+            _build_source_tarball(
+                dest_path, entrypoint = state["entrypoint"],
+                conversion = state["conversion"], gguf_py = state["gguf_py"],
+                lora = state["lora"],
+            )
+    monkeypatch.setattr(mod, "_fork_release_source_assets", fake_release_assets)
+    # Every tag in this fake world is a fork release; mapping has its own tests.
+    monkeypatch.setattr(mod, "_fork_release_tag_for", lambda tag: tag)
     monkeypatch.setattr(mod, "_download_archive", fake_download)
     monkeypatch.setattr(
         mod, "_resolve_llama_cpp_release",
@@ -247,19 +291,19 @@ def test_a_revision_predating_the_split_needs_no_conversion_package(mod, staging
 def test_a_failed_download_publishes_nothing(mod, staging_env):
     staging_env["fail"] = RuntimeError("connection reset")
     assert mod._stage_converter_sources("b9000") is None
-    assert not os.path.exists(mod._converter_stage_dir("ggml-org/llama.cpp", "b9000"))
+    assert not os.path.exists(mod._converter_stage_dir(_FORK, "b9000"))
 
 
 def test_a_tarball_missing_gguf_py_is_refused(mod, staging_env):
     staging_env["gguf_py"] = False
     assert mod._stage_converter_sources("b9000") is None
-    assert not os.path.exists(mod._converter_stage_dir("ggml-org/llama.cpp", "b9000"))
+    assert not os.path.exists(mod._converter_stage_dir(_FORK, "b9000"))
 
 
 def test_a_shim_tarball_without_its_conversion_package_is_refused(mod, staging_env):
     staging_env["conversion"] = False
     assert mod._stage_converter_sources("b9000") is None
-    assert not os.path.exists(mod._converter_stage_dir("ggml-org/llama.cpp", "b9000"))
+    assert not os.path.exists(mod._converter_stage_dir(_FORK, "b9000"))
 
 
 def test_an_unwritable_cache_root_is_a_miss_not_a_raise(mod, staging_env, monkeypatch):
@@ -431,13 +475,13 @@ def test_offline_reuses_a_revision_this_process_already_resolved(mod, monkeypatc
     monkeypatch.delenv("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", raising = False)
     monkeypatch.delenv("UNSLOTH_LLAMA_TAG", raising = False)
     monkeypatch.setattr(mod, "_resolve_llama_cpp_release", lambda *a, **k: ("b9000", None))
-    assert mod._resolve_converter_revision(str(tmp_path)) == ("ggml-org/llama.cpp", "b9000")
+    assert mod._resolve_converter_revision(str(tmp_path)) == (_FORK, "b9000")
     monkeypatch.setenv("UNSLOTH_OFFLINE", "1")
     monkeypatch.setattr(
         mod, "_resolve_llama_cpp_release",
         lambda *a, **k: pytest.fail("offline must not reach the releases API"),
     )
-    assert mod._resolve_converter_revision(str(tmp_path)) == ("ggml-org/llama.cpp", "b9000")
+    assert mod._resolve_converter_revision(str(tmp_path)) == (_FORK, "b9000")
     mod._latest_converter_release_tag.cache_clear()
 
 
@@ -456,7 +500,7 @@ def test_offline_does_not_reuse_a_revision_resolved_under_another_pin(mod, monke
     monkeypatch.delenv("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", raising = False)
     monkeypatch.delenv("UNSLOTH_LLAMA_TAG", raising = False)
     monkeypatch.setattr(mod, "_resolve_llama_cpp_release", lambda *a, **k: ("b9000", None))
-    assert mod._resolve_converter_revision(str(tmp_path)) == ("ggml-org/llama.cpp", "b9000")
+    assert mod._resolve_converter_revision(str(tmp_path)) == (_FORK, "b9000")
     monkeypatch.setenv("UNSLOTH_LLAMA_TAG", "b1234")
     monkeypatch.setenv("UNSLOTH_OFFLINE", "1")
     assert mod._resolve_converter_revision(str(tmp_path)) == (None, None)
@@ -474,13 +518,17 @@ def test_offline_is_read_at_the_call_not_at_import(mod, monkeypatch):
 # --- revision resolution ------------------------------------------------------
 
 def test_an_explicit_tag_pin_wins(mod, monkeypatch, tmp_path):
-    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", "b1234")
+    monkeypatch.setenv("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", "b1234-mix-abc1234")
     monkeypatch.setattr(
         mod, "_resolve_llama_cpp_release",
         lambda *a, **k: pytest.fail("an explicit pin must not consult the releases API"),
     )
-    mod._write_prebuilt_marker(str(tmp_path), "b5678", "asset.tar.gz")
-    assert mod._resolve_converter_revision(str(tmp_path)) == ("ggml-org/llama.cpp", "b1234")
+    monkeypatch.setattr(
+        mod, "_requests_get_with_retries",
+        lambda *a, **k: pytest.fail("a fork tag pin needs no release listing"),
+    )
+    mod._write_prebuilt_marker(str(tmp_path), "b5678-mix-def5678", "asset.tar.gz")
+    assert mod._resolve_converter_revision(str(tmp_path)) == (_FORK, "b1234-mix-abc1234")
 
 
 def test_the_prebuilt_marker_tag_is_used_when_there_is_no_pin(mod, monkeypatch, tmp_path):
@@ -497,14 +545,14 @@ def test_a_marker_without_a_tag_falls_through(mod, monkeypatch, tmp_path):
     monkeypatch.delenv("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", raising = False)
     (tmp_path / mod.UNSLOTH_PREBUILT_INFO_FILENAME).write_text('{"repo": "x"}', encoding = "utf-8")
     monkeypatch.setattr(mod, "_resolve_llama_cpp_release", lambda *a, **k: ("b9999", {}))
-    assert mod._resolve_converter_revision(str(tmp_path)) == ("ggml-org/llama.cpp", "b9999")
+    assert mod._resolve_converter_revision(str(tmp_path)) == (_FORK, "b9999")
 
 
 def test_a_corrupt_marker_falls_through_rather_than_raising(mod, monkeypatch, tmp_path):
     monkeypatch.delenv("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", raising = False)
     (tmp_path / mod.UNSLOTH_PREBUILT_INFO_FILENAME).write_text("{not json", encoding = "utf-8")
     monkeypatch.setattr(mod, "_resolve_llama_cpp_release", lambda *a, **k: ("b9999", {}))
-    assert mod._resolve_converter_revision(str(tmp_path)) == ("ggml-org/llama.cpp", "b9999")
+    assert mod._resolve_converter_revision(str(tmp_path)) == (_FORK, "b9999")
 
 
 def test_offline_resolution_never_reaches_the_releases_api(mod, monkeypatch, tmp_path):
@@ -535,7 +583,7 @@ def test_release_discovery_runs_once_not_once_per_export(mod, monkeypatch, tmp_p
     )
     mod._latest_converter_release_tag.cache_clear()
     for _ in range(5):
-        assert mod._resolve_converter_revision(str(tmp_path)) == ("ggml-org/llama.cpp", "b9000")
+        assert mod._resolve_converter_revision(str(tmp_path)) == (_FORK, "b9000")
     assert len(calls) == 1
 
 
@@ -561,11 +609,11 @@ def test_the_stage_key_cannot_escape_the_cache_root(mod):
     """Neither half of the key is trusted to stay inside the cache."""
     root = os.path.abspath(mod.LLAMA_CPP_CONVERTER_CACHE_DIR)
     for repo, tag in (
-        ("ggml-org/llama.cpp", "../../etc"),
+        (_FORK, "../../etc"),
         ("../../evil", "b9000"),
-        ("ggml-org/llama.cpp", "..%s.." % os.sep),
-        ("ggml-org/llama.cpp", ".."),
-        ("ggml-org/llama.cpp", "."),
+        (_FORK, "..%s.." % os.sep),
+        (_FORK, ".."),
+        (_FORK, "."),
     ):
         staged = os.path.abspath(mod._converter_stage_dir(repo, tag))
         assert os.path.commonpath([root, staged]) == root
@@ -591,14 +639,20 @@ def test_the_fork_source_asset_is_preferred(mod):
     assert mod._converter_source_url("b9739-mix-2d6bd50", assets) == "https://fork.invalid/src.tar.gz"
 
 
-def test_a_mix_tag_without_a_fork_asset_strips_the_suffix(mod):
-    assert mod._converter_source_url("b9739-mix-2d6bd50", None) == \
-        mod.LLAMA_CPP_SOURCE_TARBALL.format(tag = "b9739")
+def test_a_mix_tag_without_a_fork_asset_uses_the_fork_release_download(mod):
+    """No suffix stripping and no upstream archive: the fork release asset, by tag."""
+    url = mod._converter_source_url("b9739-mix-2d6bd50", None)
+    assert url == (
+        "https://github.com/unslothai/llama.cpp/releases/download/b9739-mix-2d6bd50/"
+        "llama.cpp-source-b9739-mix-2d6bd50.tar.gz"
+    )
 
 
-def test_a_plain_tag_is_unchanged(mod):
-    assert mod._converter_source_url("b9000", None) == \
-        mod.LLAMA_CPP_SOURCE_TARBALL.format(tag = "b9000")
+def test_no_source_url_points_at_upstream(mod):
+    for tag in ("b9000", "b9739-mix-2d6bd50"):
+        url = mod._converter_source_url(tag, None)
+        assert "ggml-org" not in url and "codeload" not in url
+        assert url.startswith("https://github.com/unslothai/llama.cpp/releases/download/")
 
 
 # --- atomic writes ------------------------------------------------------------
@@ -629,7 +683,7 @@ def test_a_failed_atomic_write_leaves_the_original_and_no_temp_file(mod, tmp_pat
 # --- the resolver the patcher actually calls ----------------------------------
 
 def test_the_staged_resolver_returns_the_entrypoint_stat_tuple(mod, staging_env, monkeypatch):
-    monkeypatch.setattr(mod, "_resolve_converter_revision", lambda d: ("ggml-org/llama.cpp", "b9000"))
+    monkeypatch.setattr(mod, "_resolve_converter_revision", lambda d: (_FORK, "b9000"))
     result = mod._resolve_staged_convert_script()
     assert result is not None
     path, mtime_ns, size = result
@@ -644,7 +698,7 @@ def test_the_staged_resolver_returns_none_when_no_revision_resolves(mod, monkeyp
 
 
 def test_the_staged_resolver_returns_none_when_staging_fails(mod, monkeypatch):
-    monkeypatch.setattr(mod, "_resolve_converter_revision", lambda d: ("ggml-org/llama.cpp", "b9000"))
+    monkeypatch.setattr(mod, "_resolve_converter_revision", lambda d: (_FORK, "b9000"))
     monkeypatch.setattr(mod, "_stage_converter_sources", lambda *a, **k: None)
     assert mod._resolve_staged_convert_script() is None
 
@@ -709,13 +763,13 @@ def test_the_incomplete_error_is_not_wrapped_in_the_generic_one(mod, tmp_path, m
 
 def test_a_staged_revision_patches_as_a_package(mod, staging_env, tmp_path, monkeypatch):
     """A staged tree behaves as a prebuilt bundle for every downstream step."""
-    monkeypatch.setattr(mod, "_resolve_converter_revision", lambda d: ("ggml-org/llama.cpp", "b9000"))
+    monkeypatch.setattr(mod, "_resolve_converter_revision", lambda d: (_FORK, "b9000"))
     mod._download_convert_hf_to_gguf_cached.cache_clear()
     try:
         patched_path, text_archs, vision_archs = mod._download_convert_hf_to_gguf("unsloth_convert_hf_to_gguf")
     finally:
         mod._download_convert_hf_to_gguf_cached.cache_clear()
-    stage = mod._converter_stage_dir("ggml-org/llama.cpp", "b9000")
+    stage = mod._converter_stage_dir(_FORK, "b9000")
     assert os.path.dirname(patched_path) == stage
     assert os.path.isfile(os.path.join(stage, "conversion", "__init__.py"))
     assert os.path.isfile(os.path.join(stage, "gguf-py", "gguf", "__init__.py"))
@@ -727,7 +781,7 @@ def test_a_staged_revision_patches_as_a_package(mod, staging_env, tmp_path, monk
 
 def test_the_staged_gguf_py_is_the_one_offered_the_qwen35_mapping(mod, staging_env, monkeypatch):
     """The qwen35 mapping patch is anchored on the staged converter's own directory."""
-    monkeypatch.setattr(mod, "_resolve_converter_revision", lambda d: ("ggml-org/llama.cpp", "b9000"))
+    monkeypatch.setattr(mod, "_resolve_converter_revision", lambda d: (_FORK, "b9000"))
     seen = []
     monkeypatch.setattr(mod, "_patch_tensor_mapping_for_qwen35", lambda d: seen.append(d))
     mod._download_convert_hf_to_gguf_cached.cache_clear()
@@ -735,7 +789,7 @@ def test_the_staged_gguf_py_is_the_one_offered_the_qwen35_mapping(mod, staging_e
         mod._download_convert_hf_to_gguf("unsloth_convert_hf_to_gguf")
     finally:
         mod._download_convert_hf_to_gguf_cached.cache_clear()
-    assert seen == [mod._converter_stage_dir("ggml-org/llama.cpp", "b9000")]
+    assert seen == [mod._converter_stage_dir(_FORK, "b9000")]
 
 
 def test_two_staged_revisions_do_not_share_one_patcher_cache_entry(mod, staging_env, monkeypatch):
@@ -847,7 +901,7 @@ def test_staging_is_reached_only_when_the_three_local_rows_decline(mod, staging_
 
 
 def test_a_machine_with_no_llama_cpp_stages_a_complete_tree(mod, staging_env, monkeypatch):
-    monkeypatch.setattr(mod, "_resolve_converter_revision", lambda d: ("ggml-org/llama.cpp", "b9000"))
+    monkeypatch.setattr(mod, "_resolve_converter_revision", lambda d: (_FORK, "b9000"))
     info = mod._resolve_staged_convert_script()
     assert info is not None
     staged_dir = str(Path(info[0]).parent)
@@ -926,23 +980,45 @@ def test_concurrent_stagers_converge_on_one_entry(mod, staging_env):
 
 
 def test_staging_uses_the_fork_source_asset_when_the_release_carries_one(mod, tmp_path, monkeypatch):
-    """Staging resolves the same URL the prebuilt install would have."""
+    """Staging resolves the same URL the prebuilt install would have, and with no
+    asset map it reads the fork release by tag rather than any upstream archive."""
     monkeypatch.setattr(mod, "LLAMA_CPP_CONVERTER_CACHE_DIR", str(tmp_path / "cache"))
+    tag = "b9739-mix-2d6bd50"
+    name = f"llama.cpp-source-{tag}.tar.gz"
     seen = []
+    api = []
 
     def _record(url, dest_path):
         seen.append(url)
         raise RuntimeError("stop after URL resolution")
+
+    class _Response:
+        def __init__(self, payload): self.payload = payload
+        def json(self): return self.payload
+
+    def _get(url, **kwargs):
+        api.append(url)
+        return _Response({"tag_name": tag, "draft": False, "assets": [
+            {"name": name, "browser_download_url": "https://fork.invalid/by-tag.tar.gz"},
+            {"name": "llama-prebuilt-sha256.json", "browser_download_url": "https://fork.invalid/sha.json"},
+        ]})
     monkeypatch.setattr(mod, "_download_archive", _record)
+    monkeypatch.setattr(mod, "_requests_get_with_retries", _get)
+    monkeypatch.setattr(
+        mod, "_fetch_release_json_asset",
+        lambda assets, asset_name: {"artifacts": {name: {"sha256": "ab" * 32}}},
+    )
 
     mod._stage_converter_sources(
-        "b9739-mix-2d6bd50", repo = "unslothai/llama.cpp",
-        source_assets = {"llama.cpp-source-b9739-mix-2d6bd50.tar.gz": "https://fork.invalid/src.tar.gz"},
+        tag, repo = "unslothai/llama.cpp",
+        source_assets = {name: "https://fork.invalid/src.tar.gz"},
     )
     assert seen[-1] == "https://fork.invalid/src.tar.gz"
+    assert api == [], "an asset map naming the source archive needs no release lookup"
 
-    mod._stage_converter_sources("b9739-mix-2d6bd50", repo = "unslothai/llama.cpp")
-    assert seen[-1] == mod.LLAMA_CPP_SOURCE_TARBALL.format(tag = "b9739")
+    mod._stage_converter_sources(tag, repo = "unslothai/llama.cpp")
+    assert api == [f"{mod.LLAMA_CPP_PUBLISHED_RELEASES_API}/tags/{tag}"]
+    assert seen[-1] == "https://fork.invalid/by-tag.tar.gz"
 
 
 def test_a_read_only_pinned_checkout_still_resolves(mod, tmp_path, monkeypatch):
@@ -970,11 +1046,11 @@ def test_a_read_only_pinned_checkout_still_resolves(mod, tmp_path, monkeypatch):
 
 def _staged_tree_at(mod, tag, root):
     """A published stage for `tag` under `root`, without any download."""
-    stage = Path(mod._converter_stage_dir("ggml-org/llama.cpp", tag))
+    stage = Path(mod._converter_stage_dir(_FORK, tag))
     _write_source_tree(stage)
     (stage / mod.UNSLOTH_CONVERTER_STAGE_FILENAME).write_text(json.dumps({
         "schema"    : mod.UNSLOTH_CONVERTER_STAGE_SCHEMA,
-        "repo"      : "ggml-org/llama.cpp",
+        "repo"      : _FORK,
         "tag"       : tag,
         "completed" : True,
     }), encoding = "utf-8")
@@ -1118,6 +1194,7 @@ def _complete_stage(root, *, package, repo, tag, schema = None, manifest_repo = 
         body = (b"@ModelBase.register(\"LlamaForCausalLM\")\nclass LlamaModel:\n    pass\n"
                 + _ARGPARSE_BLOCK)
     with open(os.path.join(root, "convert_hf_to_gguf.py"), "wb") as f: f.write(body)
+    with open(os.path.join(root, "convert_lora_to_gguf.py"), "wb") as f: f.write(_LORA_ENTRYPOINT)
     with open(os.path.join(root, llama_cpp.UNSLOTH_CONVERTER_STAGE_FILENAME), "w") as f:
         _json.dump({
             "schema"    : schema if schema is not None else llama_cpp.UNSLOTH_CONVERTER_STAGE_SCHEMA,
@@ -1131,38 +1208,38 @@ def _complete_stage(root, *, package, repo, tag, schema = None, manifest_repo = 
 def test_a_stage_whose_manifest_names_another_revision_is_not_a_cache_hit(tmp_path):
     llama_cpp = _load_llama_cpp_module()
     stage = _complete_stage(str(tmp_path / "s"), package = True,
-                            repo = "ggml-org/llama.cpp", tag = "b1111",
+                            repo = _FORK, tag = "b1111",
                             manifest_tag = "b9999")
     assert llama_cpp._converter_stage_is_usable(stage) is True
     assert llama_cpp._converter_stage_is_usable(
-        stage, repo = "ggml-org/llama.cpp", tag = "b1111") is False
+        stage, repo = _FORK, tag = "b1111") is False
     assert llama_cpp._converter_stage_is_usable(
-        stage, repo = "ggml-org/llama.cpp", tag = "b9999") is True
+        stage, repo = _FORK, tag = "b9999") is True
 
 
 def test_a_stage_from_another_repo_is_not_a_cache_hit(tmp_path):
     llama_cpp = _load_llama_cpp_module()
     stage = _complete_stage(str(tmp_path / "s"), package = True,
-                            repo = "ggml-org/llama.cpp", tag = "b1111",
+                            repo = _FORK, tag = "b1111",
                             manifest_repo = "someone/else")
     assert llama_cpp._converter_stage_is_usable(
-        stage, repo = "ggml-org/llama.cpp", tag = "b1111") is False
+        stage, repo = _FORK, tag = "b1111") is False
 
 
 def test_two_tags_that_sanitise_alike_do_not_serve_each_others_sources(tmp_path, monkeypatch):
     """Second line of defence: the manifest comparison, not just the digest."""
     llama_cpp = _load_llama_cpp_module()
     monkeypatch.setattr(llama_cpp, "LLAMA_CPP_CONVERTER_CACHE_DIR", str(tmp_path / "cache"))
-    a = llama_cpp._converter_stage_dir("ggml-org/llama.cpp", "v/a")
+    a = llama_cpp._converter_stage_dir(_FORK, "v/a")
     os.makedirs(a, exist_ok = True)
-    _complete_stage(a, package = True, repo = "ggml-org/llama.cpp", tag = "v/a")
-    assert llama_cpp._converter_stage_is_usable(a, repo = "ggml-org/llama.cpp", tag = "v/a") is True
-    assert llama_cpp._converter_stage_is_usable(a, repo = "ggml-org/llama.cpp", tag = "v_a") is False
+    _complete_stage(a, package = True, repo = _FORK, tag = "v/a")
+    assert llama_cpp._converter_stage_is_usable(a, repo = _FORK, tag = "v/a") is True
+    assert llama_cpp._converter_stage_is_usable(a, repo = _FORK, tag = "v_a") is False
 
 
 def test_publishing_onto_a_directory_that_appeared_does_not_nest_the_tree(mod, staging_env, monkeypatch):
     """Losing the publish race must not bury the loser's tree at <stage>/sources/."""
-    stage_dir = mod._converter_stage_dir("ggml-org/llama.cpp", "b9000")
+    stage_dir = mod._converter_stage_dir(_FORK, "b9000")
     winner_listing = {}
 
     real_download = mod._download_archive
@@ -1172,7 +1249,7 @@ def test_publishing_onto_a_directory_that_appeared_does_not_nest_the_tree(mod, s
         _write_source_tree(stage_dir)
         Path(stage_dir, mod.UNSLOTH_CONVERTER_STAGE_FILENAME).write_text(json.dumps({
             "schema": mod.UNSLOTH_CONVERTER_STAGE_SCHEMA,
-            "repo": "ggml-org/llama.cpp", "tag": "b9000", "completed": True,
+            "repo": _FORK, "tag": "b9000", "completed": True,
         }), encoding = "utf-8")
         winner_listing["files"] = sorted(os.listdir(stage_dir))
     monkeypatch.setattr(mod, "_download_archive", download_then_lose_the_race)
@@ -1211,7 +1288,7 @@ def test_a_staged_monolith_keeps_its_patched_file_beside_its_own_gguf_py(mod, st
         os.environ.pop("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", None)
         mod._download_convert_hf_to_gguf.cache_clear()
 
-    stage_dir = mod._converter_stage_dir("ggml-org/llama.cpp", "b7000")
+    stage_dir = mod._converter_stage_dir(_FORK, "b7000")
     assert os.path.dirname(patched) == stage_dir, (
         f"staged monolith patched file landed in {os.path.dirname(patched)}, "
         f"away from the gguf-py staged with it at {stage_dir}"
@@ -1240,7 +1317,7 @@ def test_the_converter_tag_pin_outranks_a_leftover_self_contained_converter(mod,
     mod._download_convert_hf_to_gguf.cache_clear()
     chosen, _t, _v = mod._download_convert_hf_to_gguf()
     mod._download_convert_hf_to_gguf.cache_clear()
-    assert os.path.dirname(chosen) == mod._converter_stage_dir("ggml-org/llama.cpp", "b9000")
+    assert os.path.dirname(chosen) == mod._converter_stage_dir(_FORK, "b9000")
     assert staging_env["downloads"] == 1
 
 
@@ -1330,12 +1407,12 @@ def test_an_empty_converter_file_is_not_offered_either(mod, tmp_path, monkeypatc
 def test_two_tags_that_sanitise_alike_get_different_directories(mod, tmp_path, monkeypatch):
     """Sanitising is not injective, so identity must not be the sanitised name."""
     monkeypatch.setattr(mod, "LLAMA_CPP_CONVERTER_CACHE_DIR", str(tmp_path / "cache"))
-    a = mod._converter_stage_dir("ggml-org/llama.cpp", "feature/foo")
-    b = mod._converter_stage_dir("ggml-org/llama.cpp", "feature_foo")
+    a = mod._converter_stage_dir(_FORK, "feature/foo")
+    b = mod._converter_stage_dir(_FORK, "feature_foo")
     assert a != b
     assert "feature_foo" in os.path.basename(a)
-    assert a == mod._converter_stage_dir("ggml-org/llama.cpp", "feature/foo")
-    assert a != mod._converter_stage_dir("unslothai/llama.cpp", "feature/foo")
+    assert a == mod._converter_stage_dir(_FORK, "feature/foo")
+    assert a != mod._converter_stage_dir("ggml-org/llama.cpp", "feature/foo")
     assert mod._converter_stage_dir("a", "b_c") != mod._converter_stage_dir("a_b", "c")
 
 
@@ -1345,31 +1422,31 @@ def test_one_revision_never_overwrites_another_revisions_live_tree(mod, staging_
     staging_env["conversion"] = False
     first = mod._stage_converter_sources("feature/foo")
     assert first is not None
-    assert mod._converter_stage_is_usable(first, repo = "ggml-org/llama.cpp", tag = "feature/foo")
+    assert mod._converter_stage_is_usable(first, repo = _FORK, tag = "feature/foo")
 
     second = mod._stage_converter_sources("feature_foo")
     assert second is not None and second != first
-    assert mod._converter_stage_is_usable(first, repo = "ggml-org/llama.cpp", tag = "feature/foo"), \
+    assert mod._converter_stage_is_usable(first, repo = _FORK, tag = "feature/foo"), \
         "staging the colliding tag destroyed the first revision's live tree"
-    assert mod._converter_stage_is_usable(second, repo = "ggml-org/llama.cpp", tag = "feature_foo")
+    assert mod._converter_stage_is_usable(second, repo = _FORK, tag = "feature_foo")
 
 
 def test_a_truncated_cached_converter_is_not_a_cache_hit(mod, staging_env):
     staging_env["entrypoint"] = _MONOLITH_ENTRYPOINT
     staging_env["conversion"] = False
     stage = mod._stage_converter_sources("b9000")
-    assert mod._converter_stage_is_usable(stage, repo = "ggml-org/llama.cpp", tag = "b9000")
+    assert mod._converter_stage_is_usable(stage, repo = _FORK, tag = "b9000")
 
     Path(stage, "convert_hf_to_gguf.py").write_bytes(b"")
-    assert not mod._converter_stage_is_usable(stage, repo = "ggml-org/llama.cpp", tag = "b9000")
+    assert not mod._converter_stage_is_usable(stage, repo = _FORK, tag = "b9000")
 
     Path(stage, "convert_hf_to_gguf.py").write_bytes(b"import sys\n# truncated\n")
-    assert not mod._converter_stage_is_usable(stage, repo = "ggml-org/llama.cpp", tag = "b9000")
+    assert not mod._converter_stage_is_usable(stage, repo = _FORK, tag = "b9000")
 
     staging_env["entrypoint"] = _SHIM_ENTRYPOINT
     staging_env["conversion"] = True
     pkg = mod._stage_converter_sources("b9500")
-    assert mod._converter_stage_is_usable(pkg, repo = "ggml-org/llama.cpp", tag = "b9500")
+    assert mod._converter_stage_is_usable(pkg, repo = _FORK, tag = "b9500")
 
 
 def test_the_revision_pin_beats_a_modern_bundle_install_too(mod, staging_env, monkeypatch):
@@ -1386,7 +1463,7 @@ def test_the_revision_pin_beats_a_modern_bundle_install_too(mod, staging_env, mo
     mod._download_convert_hf_to_gguf.cache_clear()
     chosen, _t, _v = mod._download_convert_hf_to_gguf()
     mod._download_convert_hf_to_gguf.cache_clear()
-    assert os.path.dirname(chosen) == mod._converter_stage_dir("ggml-org/llama.cpp", "b9000")
+    assert os.path.dirname(chosen) == mod._converter_stage_dir(_FORK, "b9000")
     assert staging_env["downloads"] == 1
 
 
@@ -1405,13 +1482,13 @@ def test_an_explicit_scripts_dir_still_outranks_the_revision_pin(mod, staging_en
 def test_a_package_entrypoint_truncated_after_its_import_is_not_a_cache_hit(mod, staging_env):
     """Truncated after the import, so the text still reads as package-based."""
     stage = mod._stage_converter_sources("b9500")
-    assert mod._converter_stage_is_usable(stage, repo = "ggml-org/llama.cpp", tag = "b9500")
+    assert mod._converter_stage_is_usable(stage, repo = _FORK, tag = "b9500")
 
     Path(stage, "convert_hf_to_gguf.py").write_bytes(b"from conversion import (\n    ModelBase,\n")
-    assert not mod._converter_stage_is_usable(stage, repo = "ggml-org/llama.cpp", tag = "b9500")
+    assert not mod._converter_stage_is_usable(stage, repo = _FORK, tag = "b9500")
 
     Path(stage, "convert_hf_to_gguf.py").write_bytes(_SHIM_ENTRYPOINT)
-    assert mod._converter_stage_is_usable(stage, repo = "ggml-org/llama.cpp", tag = "b9500")
+    assert mod._converter_stage_is_usable(stage, repo = _FORK, tag = "b9500")
 
 
 def test_a_failed_release_lookup_is_not_remembered(mod, monkeypatch):
@@ -1420,7 +1497,7 @@ def test_a_failed_release_lookup_is_not_remembered(mod, monkeypatch):
     calls = {"n": 0}
     outcomes = [None, None, ("b11037", {})]
 
-    def flaky():
+    def flaky(*args, **kwargs):
         calls["n"] += 1
         return outcomes[min(calls["n"] - 1, len(outcomes) - 1)]
     monkeypatch.setattr(mod, "_resolve_llama_cpp_release", flaky)
@@ -1437,7 +1514,7 @@ def test_a_failed_release_lookup_is_not_remembered(mod, monkeypatch):
 
 def test_a_stage_repaired_by_another_process_is_adopted_not_destroyed(mod, staging_env, monkeypatch):
     """Asserted on the operation: stage_dir must not be moved at all."""
-    stage_dir = mod._converter_stage_dir("ggml-org/llama.cpp", "b9000")
+    stage_dir = mod._converter_stage_dir(_FORK, "b9000")
     _write_source_tree(stage_dir)
     Path(stage_dir, "convert_hf_to_gguf.py").write_bytes(b"")   # damaged: enters repair
 
@@ -1473,7 +1550,7 @@ def test_a_stage_repaired_by_another_process_is_adopted_not_destroyed(mod, stagi
 
 def test_a_replacement_published_during_the_move_is_restored_not_deleted(mod, staging_env, monkeypatch):
     """A valid tree moved aside between guard and move must be restored."""
-    stage_dir = mod._converter_stage_dir("ggml-org/llama.cpp", "b9000")
+    stage_dir = mod._converter_stage_dir(_FORK, "b9000")
     _write_source_tree(stage_dir)
     Path(stage_dir, "convert_hf_to_gguf.py").write_bytes(b"")   # damaged: enters repair
 
@@ -1488,7 +1565,7 @@ def test_a_replacement_published_during_the_move_is_restored_not_deleted(mod, st
             Path(stage_dir, "WINNER").write_text("published by the other process\n")
             Path(stage_dir, mod.UNSLOTH_CONVERTER_STAGE_FILENAME).write_text(json.dumps({
                 "schema": mod.UNSLOTH_CONVERTER_STAGE_SCHEMA,
-                "repo": "ggml-org/llama.cpp", "tag": "b9000",
+                "repo": _FORK, "tag": "b9000",
                 "archive_sha256": "winner", "completed": True,
             }))
         return real_rename(src, dst, *a, **k)
@@ -1504,7 +1581,7 @@ def test_a_replacement_published_during_the_move_is_restored_not_deleted(mod, st
         "the winner's tree was replaced rather than restored, so the export still "
         "holding that path lost the files underneath it"
     )
-    assert mod._converter_stage_is_usable(stage_dir, repo = "ggml-org/llama.cpp", tag = "b9000")
+    assert mod._converter_stage_is_usable(stage_dir, repo = _FORK, tag = "b9000")
 
 
 def test_a_monolith_without_its_gguf_py_is_left_to_staging(mod, tmp_path, monkeypatch):
@@ -1562,12 +1639,12 @@ def test_a_read_only_cache_hit_is_copied_somewhere_writable(mod, tmp_path, monke
     monkeypatch.setattr(mod, "UNSLOTH_HOME", str(home))
     _read_only(stage)
     try:
-        resolved = mod._writable_stage(stage, repo = "ggml-org/llama.cpp", tag = "b9000")
+        resolved = mod._writable_stage(stage, repo = _FORK, tag = "b9000")
         assert resolved is not None
         assert os.path.abspath(resolved) != os.path.abspath(stage)
         assert os.access(resolved, os.W_OK)
         assert mod._converter_stage_is_usable(
-            resolved, repo = "ggml-org/llama.cpp", tag = "b9000",
+            resolved, repo = _FORK, tag = "b9000",
         )
         Path(resolved, "unsloth_convert_hf_to_gguf.py").write_bytes(b"# patched\n")
     finally:
@@ -1584,9 +1661,9 @@ def test_the_writable_copy_is_made_once_and_then_reused(mod, tmp_path, monkeypat
     monkeypatch.setattr(mod, "UNSLOTH_HOME", str(home))
     _read_only(stage)
     try:
-        first = mod._writable_stage(stage, repo = "ggml-org/llama.cpp", tag = "b9000")
+        first = mod._writable_stage(stage, repo = _FORK, tag = "b9000")
         Path(first, "MARKER").write_text("first copy\n")
-        second = mod._writable_stage(stage, repo = "ggml-org/llama.cpp", tag = "b9000")
+        second = mod._writable_stage(stage, repo = _FORK, tag = "b9000")
         assert second == first
         assert Path(second, "MARKER").is_file(), "it copied again instead of reusing"
     finally:
@@ -1597,7 +1674,7 @@ def test_a_writable_stage_is_returned_untouched(mod, tmp_path, monkeypatch, stag
     stage = mod._stage_converter_sources("b9000")
     home = tmp_path / "home"
     monkeypatch.setattr(mod, "UNSLOTH_HOME", str(home))
-    assert mod._writable_stage(stage, repo = "ggml-org/llama.cpp", tag = "b9000") == stage
+    assert mod._writable_stage(stage, repo = _FORK, tag = "b9000") == stage
     assert not home.exists(), "a writable stage was copied anyway"
 
 @pytest.mark.skipif(
@@ -1616,7 +1693,7 @@ def test_a_read_only_default_cache_is_reported_rather_than_copied_onto_itself(
     )
     _read_only(stage)
     try:
-        assert mod._writable_stage(stage, repo = "ggml-org/llama.cpp", tag = "b9000") is None
+        assert mod._writable_stage(stage, repo = _FORK, tag = "b9000") is None
     finally:
         os.chmod(stage, 0o755)
 
@@ -1633,7 +1710,7 @@ def test_the_resolver_hands_back_a_writable_directory_from_a_read_only_cache(
     assert stage is not None
     monkeypatch.setattr(mod, "UNSLOTH_HOME", str(tmp_path / "home"))
     monkeypatch.setattr(mod, "_resolve_converter_revision",
-                        lambda *a, **k: ("ggml-org/llama.cpp", "b9000"))
+                        lambda *a, **k: (_FORK, "b9000"))
     _read_only(stage)
     try:
         info = mod._resolve_staged_convert_script()
@@ -1694,12 +1771,12 @@ def test_an_unpinned_export_still_falls_back_when_staging_fails(mod, tmp_path, m
 def test_a_package_entrypoint_cut_to_one_statement_is_not_a_cache_hit(mod, tmp_path):
     """Parsing is not evidence: the entrypoint must show a real CLI parser."""
     stage = _complete_stage(str(tmp_path / "s"), package = True,
-                            repo = "ggml-org/llama.cpp", tag = "b9000")
+                            repo = _FORK, tag = "b9000")
     assert mod._converter_stage_is_usable(
-        stage, repo = "ggml-org/llama.cpp", tag = "b9000") is True
+        stage, repo = _FORK, tag = "b9000") is True
     Path(stage, "convert_hf_to_gguf.py").write_bytes(b"from conversion import ModelBase\n")
     assert mod._converter_stage_is_usable(
-        stage, repo = "ggml-org/llama.cpp", tag = "b9000") is False
+        stage, repo = _FORK, tag = "b9000") is False
 
 
 def test_a_damaged_package_entrypoint_is_restaged_rather_than_served_forever(mod, staging_env):
@@ -1719,11 +1796,11 @@ def test_a_real_shim_is_still_accepted(mod, tmp_path):
     stage = _write_source_tree(tmp_path / "real")
     Path(stage, mod.UNSLOTH_CONVERTER_STAGE_FILENAME).write_text(json.dumps({
         "schema": mod.UNSLOTH_CONVERTER_STAGE_SCHEMA,
-        "repo": "ggml-org/llama.cpp", "tag": "b9000",
+        "repo": _FORK, "tag": "b9000",
         "archive_sha256": "x", "completed": True,
     }))
     assert mod._converter_stage_is_usable(
-        str(stage), repo = "ggml-org/llama.cpp", tag = "b9000") is True
+        str(stage), repo = _FORK, tag = "b9000") is True
 
 @pytest.mark.skipif(
     os.name == "nt",
@@ -1735,10 +1812,10 @@ def test_a_cached_mirror_that_lost_its_write_bit_is_restored(mod, tmp_path, monk
     monkeypatch.setattr(mod, "UNSLOTH_HOME", str(tmp_path / "home"))
     _read_only(stage)
     try:
-        mirror = mod._writable_stage(stage, repo = "ggml-org/llama.cpp", tag = "b9000")
+        mirror = mod._writable_stage(stage, repo = _FORK, tag = "b9000")
         assert mirror is not None
         _read_only(mirror)
-        again = mod._writable_stage(stage, repo = "ggml-org/llama.cpp", tag = "b9000")
+        again = mod._writable_stage(stage, repo = _FORK, tag = "b9000")
         assert again == mirror
         assert os.access(again, os.W_OK), "an unwritable mirror was handed back"
         Path(again, "unsloth_convert_hf_to_gguf.py").write_bytes(b"# patched\n")
@@ -1755,12 +1832,12 @@ def test_a_mirror_whose_write_bit_cannot_be_restored_is_reported(mod, tmp_path, 
     monkeypatch.setattr(mod, "UNSLOTH_HOME", str(tmp_path / "home"))
     _read_only(stage)
     try:
-        mirror = mod._writable_stage(stage, repo = "ggml-org/llama.cpp", tag = "b9000")
+        mirror = mod._writable_stage(stage, repo = _FORK, tag = "b9000")
         _read_only(mirror)
         def refuse(*a, **k):
             raise PermissionError(1, "Operation not permitted")
         monkeypatch.setattr(mod.os, "chmod", refuse)
-        assert mod._writable_stage(stage, repo = "ggml-org/llama.cpp", tag = "b9000") is None
+        assert mod._writable_stage(stage, repo = _FORK, tag = "b9000") is None
     finally:
         monkeypatch.undo()
         os.chmod(stage, 0o755)
@@ -1775,13 +1852,13 @@ def test_a_mirror_tightened_recursively_is_restored_throughout(mod, tmp_path, mo
     monkeypatch.setattr(mod, "UNSLOTH_HOME", str(tmp_path / "home"))
     _read_only(stage)
     try:
-        mirror = mod._writable_stage(stage, repo = "ggml-org/llama.cpp", tag = "b9000")
+        mirror = mod._writable_stage(stage, repo = _FORK, tag = "b9000")
         assert mirror is not None
         # Not the mirror root: a read-only root makes os.access short-circuit the
         # `or`, so _tree_is_writable is never consulted and this stops testing it.
         for relative in ("conversion", os.path.join("gguf-py", "gguf")):
             os.chmod(os.path.join(mirror, relative), 0o555)
-        again = mod._writable_stage(stage, repo = "ggml-org/llama.cpp", tag = "b9000")
+        again = mod._writable_stage(stage, repo = _FORK, tag = "b9000")
         assert again == mirror
         Path(again, "unsloth_convert_hf_to_gguf.py").write_bytes(b"# patched\n")
         Path(again, "conversion", "base.py").write_bytes(b"# patched\n")
@@ -1815,14 +1892,14 @@ def test_a_second_filename_that_is_also_unusable_is_still_refused(mod, tmp_path,
 def test_a_monolith_truncated_after_its_registrations_is_not_a_cache_hit(mod, tmp_path):
     """Registrations without a parser are not enough."""
     stage = _complete_stage(str(tmp_path / "s"), package = False,
-                            repo = "ggml-org/llama.cpp", tag = "b9000")
+                            repo = _FORK, tag = "b9000")
     assert mod._converter_stage_is_usable(
-        stage, repo = "ggml-org/llama.cpp", tag = "b9000") is True
+        stage, repo = _FORK, tag = "b9000") is True
     Path(stage, "convert_hf_to_gguf.py").write_bytes(
         b"@ModelBase.register(\"LlamaForCausalLM\")\nclass LlamaModel:\n    pass\n"
     )
     assert mod._converter_stage_is_usable(
-        stage, repo = "ggml-org/llama.cpp", tag = "b9000") is False
+        stage, repo = _FORK, tag = "b9000") is False
 
 
 def test_a_real_monolith_is_still_accepted(mod, tmp_path):
@@ -1830,11 +1907,11 @@ def test_a_real_monolith_is_still_accepted(mod, tmp_path):
                                entrypoint = _MONOLITH_ENTRYPOINT, conversion = False)
     Path(stage, mod.UNSLOTH_CONVERTER_STAGE_FILENAME).write_text(json.dumps({
         "schema": mod.UNSLOTH_CONVERTER_STAGE_SCHEMA,
-        "repo": "ggml-org/llama.cpp", "tag": "b9000",
+        "repo": _FORK, "tag": "b9000",
         "archive_sha256": "x", "completed": True,
     }))
     assert mod._converter_stage_is_usable(
-        str(stage), repo = "ggml-org/llama.cpp", tag = "b9000") is True
+        str(stage), repo = _FORK, tag = "b9000") is True
 
 
 def test_an_installed_monolith_without_a_parser_is_left_to_staging(mod, tmp_path, monkeypatch):
@@ -2011,7 +2088,7 @@ def test_an_unusable_prebuilt_marker_is_announced_not_silently_ignored(mod, tmp_
     for name, payload in (
         ("not_json", "{not json at all"),
         ("not_an_object", '["b7062"]'),
-        ("no_tag", '{"repo": "ggml-org/llama.cpp"}'),
+        ("no_tag", '{"repo": _FORK}'),
         ("blank_tag", '{"tag": "   "}'),
     ):
         install = tmp_path / name
@@ -2068,7 +2145,7 @@ def test_a_stale_mirror_is_replaced_rather_than_blocking_every_retry(
     monkeypatch.setattr(mod, "UNSLOTH_HOME", str(home))
     _read_only(stage)
     try:
-        mirror = mod._writable_stage(stage, repo = "ggml-org/llama.cpp", tag = "b9000")
+        mirror = mod._writable_stage(stage, repo = _FORK, tag = "b9000")
         assert mirror is not None
 
         manifest = Path(mirror, mod.UNSLOTH_CONVERTER_STAGE_FILENAME)
@@ -2076,17 +2153,17 @@ def test_a_stale_mirror_is_replaced_rather_than_blocking_every_retry(
         stale["schema"] = mod.UNSLOTH_CONVERTER_STAGE_SCHEMA + 1
         manifest.write_text(json.dumps(stale))
         assert not mod._converter_stage_is_usable(
-            mirror, repo = "ggml-org/llama.cpp", tag = "b9000",
+            mirror, repo = _FORK, tag = "b9000",
         )
 
         for attempt in range(3):
-            again = mod._writable_stage(stage, repo = "ggml-org/llama.cpp", tag = "b9000")
+            again = mod._writable_stage(stage, repo = _FORK, tag = "b9000")
             assert again == mirror, (
                 f"attempt {attempt + 1} returned {again}: a stale mirror blocks the "
                 f"read-only cache path forever instead of being replaced"
             )
         assert mod._converter_stage_is_usable(
-            mirror, repo = "ggml-org/llama.cpp", tag = "b9000",
+            mirror, repo = _FORK, tag = "b9000",
         )
         assert not list(Path(mirror).parent.glob("*.superseded_*")), (
             "the displaced tree was left behind"
@@ -2136,7 +2213,7 @@ def test_a_mirror_published_during_our_repair_is_adopted_not_deleted(
     monkeypatch.setattr(mod, "UNSLOTH_HOME", str(home))
     _read_only(stage)
     try:
-        mirror = mod._writable_stage(stage, repo = "ggml-org/llama.cpp", tag = "b9000")
+        mirror = mod._writable_stage(stage, repo = _FORK, tag = "b9000")
         assert mirror is not None
         marker = Path(mirror, "conversion", "base.py")
         marker.write_text("# patched by the export that won the race\n")
@@ -2157,7 +2234,7 @@ def test_a_mirror_published_during_our_repair_is_adopted_not_deleted(
             return real_usable(path, *args, **kwargs)
 
         monkeypatch.setattr(mod, "_converter_stage_is_usable", _stale_once)
-        again = mod._writable_stage(stage, repo = "ggml-org/llama.cpp", tag = "b9000")
+        again = mod._writable_stage(stage, repo = _FORK, tag = "b9000")
 
         assert again == mirror
         assert marker.read_text() == "# patched by the export that won the race\n", (
