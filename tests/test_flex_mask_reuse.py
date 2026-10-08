@@ -98,7 +98,8 @@ def test_new_shape_builds_new_mask(builds):
     _run([_attn(128)], seq = 256)
     _run([_attn(128)], seq = 384)
     _run([_attn(128)], seq = 256)
-    assert [c[2] for c in builds] == [256, 384]
+    # Only the current shape's masks are kept (they grow ~quadratically with length)
+    assert [c[2] for c in builds] == [256, 384, 256]
 
 
 def test_inference_mode_mask_kept_apart(builds):
@@ -112,10 +113,19 @@ def test_inference_mode_mask_kept_apart(builds):
     assert len(builds) == 2
 
 
+def test_cache_keeps_only_the_current_shape(builds):
+    utils, _ = _mods()
+    for n in range(4):
+        utils.reused_compiled_create_block_mask(utils.causal_mask, 1, 1, 128 * (n + 1), 128 * (n + 1), device = "cuda")
+        utils.reused_compiled_create_block_mask(utils.generate_sliding_window_mask(64), 1, 1, 128 * (n + 1), 128 * (n + 1), device = "cuda")
+        assert {k[3] for k in utils._BLOCK_MASK_CACHE} == {128 * (n + 1)}
+        assert len(utils._BLOCK_MASK_CACHE) == 2
+
+
 def test_cache_bounded(builds):
     utils, _ = _mods()
     for n in range(utils._BLOCK_MASK_CACHE_SIZE + 4):
-        utils.reused_compiled_create_block_mask(utils.causal_mask, 1, 1, 128 * (n + 1), 128 * (n + 1), device = "cuda")
+        utils.reused_compiled_create_block_mask(utils.generate_sliding_window_mask(n + 1), 1, 1, 128, 128, device = "cuda")
     assert len(utils._BLOCK_MASK_CACHE) == utils._BLOCK_MASK_CACHE_SIZE
 
 

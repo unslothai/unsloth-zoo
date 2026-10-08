@@ -126,9 +126,13 @@ try:
         key = (mask_mod, bsz, head, M, N, torch.device(device), torch.is_inference_mode_enabled())
         block_mask = _BLOCK_MASK_CACHE.get(key)
         if block_mask is None:
-            block_mask = compiled_create_block_mask(mask_mod, bsz, head, M, N, device = device)
+            # Masks grow ~quadratically with length: keep only the current shape's masks (one per
+            # mask_mod, all layers of one forward share it), freed before building the new one.
+            for k in [k for k in _BLOCK_MASK_CACHE if k[1:6] != key[1:6]]:
+                del _BLOCK_MASK_CACHE[k]
             if len(_BLOCK_MASK_CACHE) >= _BLOCK_MASK_CACHE_SIZE:
                 _BLOCK_MASK_CACHE.pop(next(iter(_BLOCK_MASK_CACHE)))
+            block_mask = compiled_create_block_mask(mask_mod, bsz, head, M, N, device = device)
             _BLOCK_MASK_CACHE[key] = block_mask
         return block_mask
 
