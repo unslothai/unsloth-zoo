@@ -526,6 +526,21 @@ def test_training_forward_matches_eval_until_dropout_applies(checkpoint):
         assert np.abs(dropped - want)[np.array(batch["marker_mask"])].min() > 1e-4
 
 
+def test_decay_skips_what_transformers_skips_by_class_and_by_name():
+    import mlx.nn as nn
+    from unsloth_zoo.mlx.trainer import _no_decay_names
+
+    class Gated(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight, self.dt_bias = mx.ones(2), mx.zeros(2)
+
+    block = nn.Module()
+    block.proj, block.ln, block.norm, block.q_norm, block.gate = Linear(2, 2), LayerNorm(2), Gated(), nn.RMSNorm(2), Gated()
+    block.normalize = Linear(2, 2, bias = False)
+    assert _no_decay_names(block) == {"proj.bias", "ln.weight", "ln.bias", "norm.weight", "norm.dt_bias", "q_norm.weight", "gate.dt_bias"}
+
+
 @pytest.mark.parametrize("gradient_checkpointing", [True, False])
 def test_two_training_steps_match_torch_adamw(checkpoint, gradient_checkpointing):
     reference, folder = checkpoint

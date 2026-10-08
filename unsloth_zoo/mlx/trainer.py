@@ -48,6 +48,7 @@ import numbers
 import os
 from pathlib import Path
 import random
+import re
 import socket
 import time
 import types
@@ -10658,12 +10659,17 @@ def _length_grouped_batches(lengths, batch_size, rng):
     return [first] + batches + short
 
 
+# transformers.Trainer.get_decay_parameter_names: LayerNorm modules, and biases and norms by name.
+_NO_DECAY_NAME = re.compile(r"bias|layernorm|rmsnorm|(?:^|\.)norm(?:$|\.)|_norm(?:$|\.)")
+
+
 def _no_decay_names(model):
     names = set()
     for path, module in model.named_modules():
         for name, _ in tree_flatten(module.trainable_parameters()):
-            if isinstance(module, nn.LayerNorm) or name == "bias":
-                names.add(f"{path}.{name}" if path else name)
+            full = f"{path}.{name}" if path else name
+            if isinstance(module, nn.LayerNorm) or _NO_DECAY_NAME.search(full.lower()):
+                names.add(full)
     return names
 
 
