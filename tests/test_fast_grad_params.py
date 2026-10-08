@@ -432,6 +432,12 @@ def test_pickle_and_deepcopy():
         clone.zero_grad()
         assert clone.a.weight.grad is None
         assert not any(p is q for p in clone.parameters() for q in fast.parameters())
+    # Unpickling binds torch's zero_grad; enabling again rebinds the fast one.
+    clone = pickle.loads(pickle.dumps(fast))
+    assert F.enable_fast_grad_params(clone)
+    n = F.FAST_GRAD_CALLS["zero_grad"]
+    clone.zero_grad()
+    assert F.FAST_GRAD_CALLS["zero_grad"] == n + 1
 
 
 def test_flat_params_is_parameters_order():

@@ -129,9 +129,10 @@ def _flag(module):
         if getattr(cls, name, None) is not getattr(M, name):
             return False
     d = module.__dict__
-    if not d.get(_FLAG, False):
-        d[_FLAG] = True
+    # A pickled flagged model unpickles with torch's zero_grad bound; rebind it.
+    if getattr(d.get("zero_grad"), "__func__", None) is not _zero_grad:
         d["zero_grad"] = _zero_grad.__get__(module)
+    d[_FLAG] = True
     return True
 
 
