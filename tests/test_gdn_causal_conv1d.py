@@ -1,5 +1,6 @@
 """Triton GatedDeltaNet causal conv vs the transformers torch fallback."""
 
+import inspect
 import os
 
 import pytest
@@ -173,8 +174,9 @@ def hub_kernels(monkeypatch):
     if not hasattr(hub_kernels, "use_kernel_func_from_hub_with_fallback"):
         pytest.skip("transformers without use_kernel_func_from_hub_with_fallback")
     import transformers.integrations as integrations
-    # Restored on teardown, whatever the patch rebinds.
-    original = hub_kernels.use_kernel_func_from_hub_with_fallback
+    # Restored on teardown, whatever the patch rebinds. On a CUDA host importing
+    # unsloth_zoo already patched it, so start from the unpatched decorator.
+    original = _unpatched_decorator(hub_kernels.use_kernel_func_from_hub_with_fallback)
     monkeypatch.setattr(hub_kernels, "use_kernel_func_from_hub_with_fallback", original)
     monkeypatch.setattr(integrations, "use_kernel_func_from_hub_with_fallback", original)
     monkeypatch.setattr(gcc, "_real_causal_conv1d_available", lambda: False)
@@ -182,12 +184,22 @@ def hub_kernels(monkeypatch):
     return hub_kernels
 
 
+def _unpatched_decorator(decorator):
+    return decorator.__wrapped__ if getattr(decorator, gcc._HUB_MARK, False) else decorator
+
+
 def _real_gdn_modeling(monkeypatch):
     modeling = pytest.importorskip("transformers.models.qwen3_5.modeling_qwen3_5")
     if getattr(modeling, "causal_conv1d_fn", None) is None:
         pytest.skip("transformers < 5.15 GatedDeltaNet")
-    monkeypatch.setattr(modeling, "causal_conv1d_fn", modeling.causal_conv1d_fn)
-    monkeypatch.setattr(modeling, "use_kernel_func_from_hub_with_fallback", modeling.use_kernel_func_from_hub_with_fallback)
+    decorator = _unpatched_decorator(modeling.use_kernel_func_from_hub_with_fallback)
+    fn = modeling.causal_conv1d_fn
+    if gcc._is_marked(fn):
+        # Patched at import on a CUDA host: rebuild the unpatched hub function.
+        dispatch = inspect.unwrap(fn, stop = lambda f: getattr(f, gcc._MARK, False))
+        fn = decorator("causal_conv1d_fn", "causal_conv1d")(dispatch.__wrapped__)
+    monkeypatch.setattr(modeling, "causal_conv1d_fn", fn)
+    monkeypatch.setattr(modeling, "use_kernel_func_from_hub_with_fallback", decorator)
     return modeling
 
 
