@@ -75,9 +75,6 @@ def test_nested_bnb_stripped_next_to_kept_bitnet(tmp_path):
 
 
 def test_merged_bitnet_reloads_with_autobitlinear(tmp_path):
-    transformers = pytest.importorskip("transformers")
-    if not hasattr(transformers, "BitNetConfig"):
-        pytest.skip("transformers without BitNet")
     from transformers import AutoModelForCausalLM, BitNetConfig
     from transformers.integrations.bitnet import AutoBitLinear
 
