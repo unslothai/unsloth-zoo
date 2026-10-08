@@ -199,18 +199,24 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
     
     # Causal LM loss
     def UnslothForCausalLMLoss(
-        logits, labels, vocab_size: int, num_items_in_batch: int = None, ignore_index: int = -100, **kwargs
+        logits, labels, vocab_size: int, num_items_in_batch: int = None, ignore_index: int = -100,
+        shift_labels: Optional[torch.Tensor] = None, **kwargs
     ):
-        if labels is None: return None
-        # Flat (tokens, vocab) logits (Ling-2.6-flash MTP head): take the labels' rows, as stock shifts per label row.
-        if logits.dim() == 2:
-            labels = labels.reshape(1, -1) if labels.dim() < 2 else labels.reshape(-1, labels.shape[-1])
-            logits = logits.view(*labels.shape, logits.shape[-1])
-        shift_logits = logits
-        shift_labels = torch.empty_like(labels, device = shift_logits.device)
-        shift_labels[..., :-1] = labels[..., 1:]
-        shift_labels[..., -1] = ignore_index
-        loss = unsloth_fixed_cross_entropy(shift_logits, shift_labels, num_items_in_batch, ignore_index, **kwargs)
+        if shift_labels is None:
+            if labels is None: return None
+            # Flat (tokens, vocab) logits (Ling-2.6-flash MTP head): take the labels' rows, as stock shifts per label row.
+            if logits.dim() == 2:
+                labels = labels.reshape(1, -1) if labels.dim() < 2 else labels.reshape(-1, labels.shape[-1])
+                logits = logits.view(*labels.shape, logits.shape[-1])
+            shift_labels = torch.empty_like(labels, device = logits.device)
+            shift_labels[..., :-1] = labels[..., 1:]
+            shift_labels[..., -1] = ignore_index
+        else:
+            # Explicit targets are already aligned to logits.
+            if logits.dim() == 2:
+                logits = logits.unsqueeze(0)
+            shift_labels = shift_labels.reshape(logits.shape[:-1]).to(logits.device).contiguous()
+        loss = unsloth_fixed_cross_entropy(logits, shift_labels, num_items_in_batch, ignore_index, **kwargs)
         return loss
     pass
 
@@ -504,15 +510,15 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
             # collectives below, never by breaking out: skipping accelerator.gather on
             # one rank alone would hang the others.
             degenerate = False
-            # One column leaves labels[..., 1:] empty. Only fatal when EVERY microbatch
-            # is short, since then the total is 0 and a sum/count loss divides by it. A
-            # short member of a mixed group just contributes 0, and voiding the group
-            # for it would lose GA invariance.
+            # Decline only when EVERY microbatch has no targets: an empty member of a mixed group adds 0.
             all_short = True
             for x in batch_samples:
                 labels = x["labels"]
-                if labels.shape[-1] >= 2: all_short = False
-                token_count = (labels[..., 1:] != -100)
+                shift_labels = x.get("shift_labels")
+                # Pre-shifted targets carry their own mask: never re-shift or re-mask them below.
+                targets = labels[..., 1:] if shift_labels is None else shift_labels
+                if targets.shape[-1] != 0: all_short = False
+                token_count = (targets != -100)
                 if "input_ids" in x:
                     input_ids = x["input_ids"]
                     mark_static (input_ids, 0)
@@ -527,15 +533,17 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
                     # Only AND a mask describing these same targets: a seq2seq mask is
                     # the encoder's, a different length from the decoder labels, which
                     # used to raise. Causal shapes always match, so nothing changes.
-                    if attention_mask.shape != labels.shape:
-                        degenerate = True
-                    else:
-                        token_count &= (attention_mask[..., 1:] != 0)
+                    if shift_labels is None:
+                        if attention_mask.shape != labels.shape:
+                            degenerate = True
+                        else:
+                            token_count &= (attention_mask[..., 1:] != 0)
                 if "token_type_ids" in x:
                     token_type_ids = x["token_type_ids"]
                     mark_static (token_type_ids, 0)
                     mark_dynamic(token_type_ids, 1)
-                seq_lengths = _normalize_packed_seq_lengths(x.get("packed_seq_lengths"))
+                seq_lengths = _normalize_packed_seq_lengths(x.get("packed_seq_lengths")) \
+                    if shift_labels is None else None
                 if seq_lengths is not None and token_count.ndim in (1, 2) and token_count.shape[-1] != 0:
                     # Packing N documents leaves N-1 internal boundaries that are
                     # not valid training positions. Zero those exact slots rather
