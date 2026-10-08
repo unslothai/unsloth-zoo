@@ -66,8 +66,13 @@ def _layer_norm_eager(
     # activations. CUDA torch.layer_norm rejects that mix, and this body runs eagerly whenever
     # Dynamo does not compile (FX tracing, compile disabled, eager_on_recompile after inference
     # forwards), so normalise in the wider of the two dtypes; nothing is ever downcast.
-    if weight is not None and weight.dtype != input.dtype and weight.is_floating_point() and input.is_floating_point():
+    if (
+        weight is not None and input.is_floating_point() and weight.is_floating_point()
+        and (bias is None or bias.is_floating_point())
+        and (weight.dtype != input.dtype or (bias is not None and bias.dtype != input.dtype))
+    ):
         dtype = torch.promote_types(input.dtype, weight.dtype)
+        if bias is not None: dtype = torch.promote_types(dtype, bias.dtype)
         return torch.layer_norm(
             input.to(dtype),
             normalized_shape,
