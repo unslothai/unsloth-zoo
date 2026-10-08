@@ -846,19 +846,10 @@ class _PerRowSampler:
         )
 
 
-def _iter_model_modules(model) -> list[Any]:
-    named_modules = getattr(model, "named_modules", None)
-    if callable(named_modules):
-        modules = [module for _, module in named_modules()]
-        if modules:
-            return modules
-    return [model]
-
-
-def _snapshot_training_flags(model) -> list[tuple[Any, bool]]:
+def _snapshot_training_flags(modules) -> list[tuple[Any, bool]]:
     states = []
     seen = set()
-    for module in _iter_model_modules(model):
+    for module in modules:
         if id(module) in seen or not hasattr(module, "training"):
             continue
         seen.add(id(module))
@@ -951,15 +942,15 @@ def generation_mode(model, int8_prefill = None):
     try:
         if _GENERATION_MODE_DEPTH == 0:
             _GENERATION_LIMIT_SNAPSHOT = _snapshot_metal_limits()
-        training_states = _snapshot_training_flags(model)
-        _require_evaluable(model)()
-        _GENERATION_MODE_DEPTH += 1
-        entered = True
         from .inference import (_fusion_modules, dense_prefill_linear, fused_decode_conv_silu, fused_moe_gate_up,
                                 fused_moe_routed_experts, fused_moe_router, fused_residual_norm,
                                 fused_residual_norm_handoff, nax_quantized_linear)
-        # The scopes replace classes and weight arrays, not the module graph.
+        # One walk serves the flags and every scope: eval and the scopes leave the module graph alone.
         modules = tuple(_fusion_modules(model, None))
+        training_states = _snapshot_training_flags([module for _, module in modules] or [model])
+        _require_evaluable(model)()
+        _GENERATION_MODE_DEPTH += 1
+        entered = True
         with fused_moe_gate_up(model, _modules = modules), fused_decode_conv_silu(model, _modules = modules), \
                 fused_residual_norm(model, _modules = modules), fused_moe_router(model, _modules = modules), \
                 fused_moe_routed_experts(model, _modules = modules), nax_quantized_linear(model, int8_prefill, _modules = modules), \

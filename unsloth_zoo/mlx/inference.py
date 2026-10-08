@@ -497,46 +497,51 @@ def _decode_conv_sites(outer):
     return None
 
 
+@functools.cache
+def _decode_conv_bodies_hold(call, prepare, conv):
+    """Whether these bodies are the ones the fused decode convolution rewrites; live bindings are the caller's."""
+    outer, inner = _function_ast(call), _function_ast(prepare)
+    target = inner.body[-1].value
+    if not (isinstance(inner.body[-1], ast.Return) and isinstance(target, ast.Call)
+            and isinstance(target.func, ast.Name)
+            and [_source_expression(a) for a in target.args] == ["conv_input", "weight"]
+            and not target.keywords):
+        return False
+    # The fused call reads the prepared taps before any window exists.
+    if any(isinstance(n, ast.Name) and n.id == "conv_input"
+           for statement in inner.body[:-1] for n in ast.walk(statement)):
+        return False
+    if [_source_expression(n) for n in _function_ast(conv).body] != [
+        "out = mx.sum(conv_input.astype(mx.float32) * weight[None, :, :], axis=1)",
+        "return out.astype(conv_input.dtype)[:, None, :]",
+    ]:
+        return False
+    names = [n for n in ast.walk(outer) if isinstance(n, ast.Name)]
+    if (sum(n.id == "conv_input" and isinstance(n.ctx, ast.Store) for n in names) != 1
+            or sum(n.id == "conv_out" and isinstance(n.ctx, ast.Load) for n in names) != 1
+            or any(n.id == "_unsloth_qkv" for n in names)):
+        return False
+    calls = [_source_expression(n) for n in ast.walk(outer) if isinstance(n, ast.Call)]
+    return (calls.count("nn.silu(self._causal_conv1d_decode(conv_input))") == 1
+            and calls.count(_SPLIT) == 1 and _decode_conv_sites(outer) is not None)
+
+
 def _decode_conv_contract(base):
     call = getattr(base, "__call__", None)
     prepare = getattr(base, "_causal_conv1d_decode", None)
     if not isinstance(call, FunctionType) or not isinstance(prepare, FunctionType):
         return None
     try:
-        outer, inner = _function_ast(call), _function_ast(prepare)
-        target = inner.body[-1].value
-        if not (isinstance(inner.body[-1], ast.Return) and isinstance(target, ast.Call)
-                and isinstance(target.func, ast.Name)
-                and [_source_expression(a) for a in target.args] == ["conv_input", "weight"]
-                and not target.keywords):
-            return None
-        # The fused call reads the prepared taps before any window exists.
-        if any(isinstance(n, ast.Name) and n.id == "conv_input"
-               for statement in inner.body[:-1] for n in ast.walk(statement)):
-            return None
-        conv = prepare.__globals__.get(target.func.id)
+        conv = prepare.__globals__.get(_function_ast(prepare).body[-1].value.func.id)
         if any(hasattr(f, "__wrapped__") for f in (call, prepare, conv)):
             return None
-        arithmetic = _function_ast(conv)
-        if [_source_expression(n) for n in arithmetic.body] != [
-            "out = mx.sum(conv_input.astype(mx.float32) * weight[None, :, :], axis=1)",
-            "return out.astype(conv_input.dtype)[:, None, :]",
-        ] or inspect.unwrap(conv).__globals__.get("mx") is not mx:
+        if not _decode_conv_bodies_hold(call, prepare, conv) or inspect.unwrap(conv).__globals__.get("mx") is not mx:
             return None
         if _resolved_bindings(_CONV_SILU_CONTRACT) is None:
             return None
         if call.__closure__ or prepare.__closure__:
             return None
         if call.__globals__.get("nn") is not nn or call.__globals__.get("mx") is not mx:
-            return None
-        names = [n for n in ast.walk(outer) if isinstance(n, ast.Name)]
-        if (sum(n.id == "conv_input" and isinstance(n.ctx, ast.Store) for n in names) != 1
-                or sum(n.id == "conv_out" and isinstance(n.ctx, ast.Load) for n in names) != 1
-                or any(n.id == "_unsloth_qkv" for n in names)):
-            return None
-        calls = [_source_expression(n) for n in ast.walk(outer) if isinstance(n, ast.Call)]
-        if (calls.count("nn.silu(self._causal_conv1d_decode(conv_input))") != 1
-                or calls.count(_SPLIT) != 1 or _decode_conv_sites(outer) is None):
             return None
         return call, prepare, conv, nn.silu
     except (OSError, TypeError, SyntaxError, AttributeError, IndexError):

@@ -1878,9 +1878,9 @@ def test_generation_mode_discovers_fusion_modules_once_per_entry(monkeypatch):
         mx.eval(expected)
         before = len(walks)
         with generation_mode(root):
-            assert len(walks) - before == 2  # Training flags, then post-eval fusion discovery.
+            assert len(walks) - before == 1  # Training flags and fusion discovery share it.
             with generation_mode(root):
-                assert len(walks) - before == 4
+                assert len(walks) - before == 2
                 for layer, native in zip(root.layers, expected):
                     assert type(layer) is not ResidualNormBlock
                     _residual_equal(layer(x)[0], native)
