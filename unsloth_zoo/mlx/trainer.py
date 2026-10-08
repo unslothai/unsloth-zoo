@@ -10998,6 +10998,8 @@ class MLXDecisionTrainer:
         state, self.control = _MLXTrainerState(), _MLXTrainerControl()
         self.state = state
         state.max_steps, state.logging_steps, state.train_batch_size = max_steps, logging_steps, batch_size
+        # The intervals a DefaultFlowCallback steps by; one this run does not use never comes round.
+        state.eval_steps, state.save_steps = eval_steps or max_steps + 1, save_steps or max_steps + 1
         state.num_train_epochs, state.epoch = math.ceil(max_steps / steps_per_epoch), 0.0
         model.train()
         started, logged_loss, logged_steps, total_loss = time.time(), 0.0, 0, 0.0

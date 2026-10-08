@@ -1205,6 +1205,11 @@ def test_trainer_logs_evaluates_saves_and_ends_an_epoch_when_a_callback_asks(che
     assert sorted(item.name for item in tmp_path.iterdir()) == ["checkpoint-2"]
     # Three steps an epoch: the first ends after two, so the sixth step is the first of a third epoch.
     assert trainer.state.global_step == 6 and trainer.state.epoch == pytest.approx(2 + 1 / 3)
+    # Callbacks step by the run's own intervals, not TrainerState's defaults.
+    args = _config(max_steps = 1, eval_steps = 3, save_steps = 4, output_dir = str(tmp_path / "flow"))
+    trainer = MLXDecisionTrainer(load_trainable_decision_model(checkpoint[1]), args, _items(), _items(), callbacks = [transformers.DefaultFlowCallback()])
+    trainer.train()
+    assert (trainer.state.eval_steps, trainer.state.save_steps) == (3, 4)
 
 
 def test_trainer_stops_on_request_and_refuses_other_optimizers(checkpoint):
