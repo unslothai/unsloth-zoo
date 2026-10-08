@@ -25,7 +25,6 @@ something to check against on the path Unsloth actually uses.
 
 import hashlib
 import importlib.util
-import logging
 import os
 import pathlib
 import sys
@@ -49,6 +48,7 @@ def _source_archive(tmp_path, tag, payload = "X = 1\n"):
     (root / "gguf-py" / "gguf").mkdir(parents = True)
     (root / "conversion").mkdir(parents = True)
     (root / "convert_hf_to_gguf.py").write_text(payload, encoding = "utf-8")
+    (root / "convert_lora_to_gguf.py").write_text("# lora converter\n", encoding = "utf-8")
     (root / "conversion" / "__init__.py").write_text(payload, encoding = "utf-8")
     (root / "gguf-py" / "gguf" / "__init__.py").write_text(payload, encoding = "utf-8")
     archive = tmp_path / "source.tar.gz"
@@ -104,20 +104,21 @@ def test_a_matching_source_archive_installs(tmp_path, monkeypatch):
     assert (install / "gguf-py" / "gguf" / "__init__.py").is_file()
 
 
-def test_a_release_with_no_published_digest_says_so(tmp_path, monkeypatch, caplog):
-    """There is nothing to check against, so it installs. Saying nothing at all
-    was the problem: the comment beside the scan claimed the bundle's own sha256
-    covered these files, and it never did.
-    """
+def test_a_release_with_no_published_digest_is_refused(tmp_path, monkeypatch):
+    """There is nothing to check these bytes against, and they become the
+    converter, so they are not used: the prebuilt attempt fails instead. The
+    release's own sha256 list is consulted first, in case the caller had none."""
     llama_cpp = _load("llama_cpp_tarball_nodigest_probe", "unsloth_zoo/llama_cpp.py")
 
     tag = "b1-mix-abc"
     archive = _source_archive(tmp_path, tag)
-
-    caplog.clear()
-    with caplog.at_level(logging.WARNING):
-        install = _install(llama_cpp, tmp_path, archive, {}, monkeypatch, tag = tag)
-    assert (install / "convert_hf_to_gguf.py").is_file()
-    assert any("cannot be verified" in record.message for record in caplog.records), (
-        [r.message for r in caplog.records]
+    consulted = []
+    monkeypatch.setattr(
+        llama_cpp, "_fork_release_source_assets",
+        lambda t, assets = None: consulted.append(t) or (dict(assets or {}), {}),
     )
+
+    with pytest.raises(RuntimeError, match = "cannot be verified"):
+        _install(llama_cpp, tmp_path, archive, {}, monkeypatch, tag = tag)
+    assert consulted == [tag]
+    assert not (tmp_path / "install" / "convert_hf_to_gguf.py").exists()
