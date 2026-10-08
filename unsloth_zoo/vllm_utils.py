@@ -1501,12 +1501,20 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
 
     model_config = getattr(llm_engine, "model_config", None)
     load_config = getattr(getattr(llm_engine, "vllm_config", None), "load_config", None)
+    checkpoint_source = (
+        getattr(model_config, "model", None) or getattr(config, "_name_or_path", None),
+        getattr(model_config, "revision", None),
+        getattr(load_config, "download_dir", None),
+    )
     verify_vllm_moe_experts_match_checkpoint(
         quant_state_dict,
-        getattr(model_config, "model", None) or getattr(config, "_name_or_path", None),
-        revision = getattr(model_config, "revision", None),
-        cache_dir = getattr(load_config, "download_dir", None),
+        checkpoint_source[0],
+        revision = checkpoint_source[1],
+        cache_dir = checkpoint_source[2],
     )
+    # An attribute, not a key: every consumer iterates the tensors, and the HF config would
+    # serialise anything set on it into config.json.
+    quant_state_dict._unsloth_checkpoint_source = checkpoint_source
 
     if not return_state_dict: state_dict = None
     return state_dict, quant_state_dict
@@ -1625,15 +1633,22 @@ pass
 GEMMA4_AUDIO_PREFIXES = ("model.audio_tower.", "model.embed_audio.")
 
 
-def _load_gemma4_audio_from_checkpoint(new_model, config, weight_map = None):
+def _load_gemma4_audio_from_checkpoint(new_model, config, weight_map = None, checkpoint_source = None):
     # vLLM runs with audio = 0 so it never builds the audio tower, and the training model's
     # copy is left at random init (embed_audio a 1-wide placeholder). Read it from the
     # checkpoint instead; returns how many tensors were loaded.
+    # checkpoint_source = (path, revision, cache_dir) vLLM resolved, so a pinned revision or
+    # custom cache_dir is read from the same snapshot. Without it, the config's commit hash
+    # pins the snapshot the config came from.
     if getattr(config, "audio_config", None) is None: return 0
     if weight_map is None:
-        model_path = getattr(config, "model_name", None) or getattr(config, "_name_or_path", None)
+        if checkpoint_source is not None and checkpoint_source[0] is not None:
+            model_path, revision, cache_dir = checkpoint_source
+        else:
+            model_path = getattr(config, "model_name", None) or getattr(config, "_name_or_path", None)
+            revision, cache_dir = getattr(config, "_commit_hash", None), None
         try:
-            weight_map = _resolve_safetensors_index(model_path)
+            weight_map = _resolve_safetensors_index(model_path, revision, cache_dir)
         except Exception:
             weight_map = None
     keys = [k for k in (weight_map or {}) if k.startswith(GEMMA4_AUDIO_PREFIXES)]
@@ -1901,7 +1916,10 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
         bnb_config = bnb_config,
     )
     if is_vision_model and _is_gemma4_config(config):
-        _load_gemma4_audio_from_checkpoint(new_model, config)
+        _load_gemma4_audio_from_checkpoint(
+            new_model, config,
+            checkpoint_source = getattr(quant_state_dict, "_unsloth_checkpoint_source", None),
+        )
     # finalize copies every buffer from the meta template (e.g. zeroed LFM2-MoE expert_bias)
     for parent, attr_name, raw_value in loaded_buffers:
         parent._buffers[attr_name] = raw_value

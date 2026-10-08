@@ -145,4 +145,90 @@ def test_no_audio_config_is_a_no_op():
 
 def test_convert_loads_audio_on_the_vision_path():
     source = inspect.getsource(vllm_utils.convert_vllm_to_huggingface)
-    assert "_load_gemma4_audio_from_checkpoint(new_model, config)" in source
+    assert "_load_gemma4_audio_from_checkpoint(" in source
+    assert 'getattr(quant_state_dict, "_unsloth_checkpoint_source", None)' in source
+
+
+def test_state_dict_carries_vllms_checkpoint_source_as_an_attribute():
+    source = inspect.getsource(vllm_utils._get_vllm_state_dict)
+    assert 'getattr(model_config, "revision", None)' in source
+    assert 'getattr(load_config, "download_dir", None)' in source
+    assert "quant_state_dict._unsloth_checkpoint_source = checkpoint_source" in source
+    # An OrderedDict attribute is not a key, so nothing iterating the tensors sees it.
+    from collections import OrderedDict
+
+    quant_state_dict = OrderedDict(w = torch.zeros(1))
+    quant_state_dict._unsloth_checkpoint_source = ("org/repo", "rev", "/cache")
+    assert list(quant_state_dict) == ["w"]
+
+
+def _two_revision_hub(tmp_path, monkeypatch):
+    """A fake Hub cache holding `main` and `rev-b` snapshots with different audio weights."""
+    import huggingface_hub
+
+    snapshots, calls = {}, []
+    for revision, seed in (("main", 0), ("rev-b", 1)):
+        torch.manual_seed(seed)
+        tensors = {
+            "model.audio_tower.proj.weight": torch.randn(4, 4),
+            "model.audio_tower.norm.weight": torch.randn(4),
+            "model.audio_tower.norm.bias": torch.randn(4),
+            "model.embed_audio.embedding_projection.weight": torch.randn(6, 4),
+        }
+        folder = tmp_path / revision
+        folder.mkdir()
+        save_file(tensors, str(folder / "model.safetensors"))
+        snapshots[revision] = (folder, tensors)
+
+    def fake_download(repo_id, filename, revision = None, cache_dir = None, local_files_only = False, **kwargs):
+        calls.append({"repo_id": repo_id, "filename": filename, "revision": revision, "cache_dir": cache_dir})
+        folder, _ = snapshots[revision or "main"] if (revision or "main") in snapshots else (None, None)
+        path = None if folder is None else folder / filename
+        if path is None or not path.exists():
+            raise FileNotFoundError(filename)
+        return str(path)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+    return snapshots, calls
+
+
+def test_requested_revision_and_cache_dir_are_honoured(tmp_path, monkeypatch):
+    snapshots, calls = _two_revision_hub(tmp_path, monkeypatch)
+    model = _Model()
+    loaded = _load_gemma4_audio_from_checkpoint(
+        model, _gemma4(), checkpoint_source = ("org/gemma-4-e2b", "rev-b", "/custom/cache"),
+    )
+    assert loaded == 4
+    assert calls and all(
+        c["repo_id"] == "org/gemma-4-e2b" and c["revision"] == "rev-b" and c["cache_dir"] == "/custom/cache"
+        for c in calls
+    )
+    params = dict(model.named_parameters())
+    for key, value in snapshots["rev-b"][1].items():
+        assert torch.equal(params[key], value), key
+        assert not torch.equal(params[key], snapshots["main"][1][key]), key
+
+
+def test_default_snapshot_is_not_used_for_another_revision(tmp_path, monkeypatch):
+    _, calls = _two_revision_hub(tmp_path, monkeypatch)
+    model = _Model()
+    loaded = _load_gemma4_audio_from_checkpoint(
+        model, _gemma4(), checkpoint_source = ("org/gemma-4-e2b", "rev-missing", None),
+    )
+    # rev-missing is not cached: drop the tower rather than read main's weights.
+    assert loaded == 0
+    assert model.model.audio_tower is None
+    assert calls and all(c["revision"] == "rev-missing" for c in calls)
+
+
+def test_config_commit_hash_pins_the_snapshot_without_a_source(tmp_path, monkeypatch):
+    snapshots, calls = _two_revision_hub(tmp_path, monkeypatch)
+    config = _gemma4()
+    config._name_or_path = "org/gemma-4-e2b"
+    config._commit_hash = "rev-b"
+    model = _Model()
+    assert _load_gemma4_audio_from_checkpoint(model, config) == 4
+    assert calls and all(c["revision"] == "rev-b" for c in calls)
+    assert torch.equal(
+        model.model.audio_tower.proj.weight, snapshots["rev-b"][1]["model.audio_tower.proj.weight"]
+    )
