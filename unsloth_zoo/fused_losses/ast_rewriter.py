@@ -886,8 +886,7 @@ def rewrite_count_aware_ce_spliced(source: str):
     block = _labels_if(fn)
     if block is None or block.orelse:
         return (None, None)
-    # Relabelling anywhere (Moshi's masked_fill, Qwen2-Audio's merge that expands labels) would divide by
-    # a count of the batch's labels, not the ones the CE sees.
+    # Relabelled targets (Moshi's masked_fill, Qwen2-Audio's merge) no longer match the batch count.
     def rebinds_labels(sub):
         if isinstance(sub, ast.Assign):
             if (len(sub.targets) == 1 and isinstance(sub.targets[0], ast.Name) and sub.targets[0].id == "labels"

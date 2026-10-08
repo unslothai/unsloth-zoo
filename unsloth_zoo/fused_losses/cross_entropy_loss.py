@@ -706,8 +706,7 @@ _LOSS_TAKES_COUNT = weakref.WeakKeyDictionary()
 
 def _loss_takes_count(loss_function):
     # All Unsloth Zoo code licensed under LGPLv3
-    # A module's own signature is Module.__call__'s (*args, **kwargs): read its forward. Keyed on the
-    # function, so the cache never keeps a module or its buffers alive.
+    # Module.__call__ is (*args, **kwargs), so read forward; keyed on the function to hold no module alive.
     target = loss_function.forward if isinstance(loss_function, torch.nn.Module) else loss_function
     key = getattr(target, "__func__", target)
     try:
