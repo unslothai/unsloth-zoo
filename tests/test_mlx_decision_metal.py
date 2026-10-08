@@ -936,6 +936,14 @@ def test_a_clef_saves_as_adapters_that_load_over_their_base_and_go_on_training(c
         mx.save_safetensors(str(out / "adapter_model.safetensors"), {key.replace("model.language_model.layers.3.mlp.down_proj", stem): value for key, value in tensors.items()})
         with pytest.raises(ValueError, match = refusal):
             load_decision_model(out, base_model = base)
+    # A save over that checkpoint which stops part way leaves a folder that no longer reads as a Clef.
+    from unsloth_zoo.mlx import decision
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(decision.os, "replace", lambda *args: (_ for _ in ()).throw(OSError("interrupted")))
+        with pytest.raises(OSError, match = "interrupted"):
+            save_clef_adapter(pipeline, out, base, "org/base")
+    assert not decision.ClefModel.matches(out)
 
 
 def test_a_plain_language_model_gets_a_new_joint_head_and_saves_as_a_clef(clef, tmp_path, monkeypatch):

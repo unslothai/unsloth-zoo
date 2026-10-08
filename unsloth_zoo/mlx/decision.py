@@ -1584,7 +1584,9 @@ def _commit_clef(pipeline, staging, folder, source, head, config, copied = ("*",
     for item in {item for pattern in copied for item in source.glob(pattern)}:
         if item.is_file() and not item.name.startswith(".") and item.name not in skipped and not (staging / item.name).exists():
             shutil.copyfile(item, staging / item.name)
-    # Old files stay until the new ones are in, and the head's file, which makes a folder a checkpoint, goes last.
+    # The head's file makes a folder a checkpoint: an old one goes first and the new one last, so an interrupted
+    # save over an earlier checkpoint never reads as complete.
+    (folder / "joint_head.safetensors").unlink(missing_ok = True)
     staged = sorted(staging.iterdir(), key = lambda item: item.name == "joint_head.safetensors")
     for item in staged:
         os.replace(item, folder / item.name)
