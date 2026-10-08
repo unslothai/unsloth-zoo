@@ -3188,20 +3188,16 @@ __DYNAMO__RECOMPILING__ = """
         INFERENCE_RUNS += 1
 """
 
-# Training forwards (train mode, grad on) never run under the inference stance above.
-# is_compiling() goes first: Dynamo folds it to True, so a traced forward skips the call.
+# is_compiling() first: Dynamo folds it to True, so traced forwards skip the call.
 __DYNAMO__TRAINING_STANCE__ = """if not torch.compiler.is_compiling() and torch.is_grad_enabled() and getattr(self, "training", False):
     unsloth_training_stance()"""
 
-# Placeholder line in the lm_head templates. `_place_training_stance` swaps it for nothing once
-# the reset sits at the top of the forward, or for the reset itself if that is not possible.
 _TRAINING_STANCE_MARKER = "__UNSLOTH_TRAINING_STANCE_MARKER__"
 _TRAINING_STANCE_MARKER_LINE = re.compile(r"^([ \t]*)" + _TRAINING_STANCE_MARKER + r"[ \t]*\n", re.MULTILINE)
 
 
 def _place_training_stance(forward):
-    """Reset the stance as the first statement of the fused forward. At the logits site it came
-    after the decoder body, so the first training step after inference still ran that body eager."""
+    """Reset at forward entry: at the logits site the decoder body already ran eager."""
     def at_marker(match):
         return textwrap.indent(__DYNAMO__TRAINING_STANCE__, match.group(1)) + "\n"
     try:

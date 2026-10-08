@@ -2098,12 +2098,8 @@ def _settle_abandoned_checkpoint_generator():
 # True only while generate() runs a compiled decode step for a model that opted in. A
 # one-element list so Dynamo guards on the value and retraces when it flips.
 UNSLOTH_DECODE_COMPILE = [False]
-# [weak reference to an eager_on_recompile stance object Unsloth installed (True where torch
-# keeps no stance object), the stance object it replaced]. Process wide like the stance, so any
-# generated module's training forward can undo it while one of them is current, putting back
-# what the caller had. Weak, so an object any enclosing scope can still restore stays
-# recognised however deep the nesting, and an entry (with the stance it holds) is dropped as soon
-# as its stance object is collected.
+# [weakref to an eager stance Unsloth installed (True if torch has none), stance it replaced].
+# Weak so nested scopes restoring it stay recognised, and dead entries drop themselves.
 UNSLOTH_EAGER_STANCE_OWNED = []
 
 
@@ -2135,7 +2131,6 @@ def unsloth_owns_stance(current):
 
 
 def unsloth_release_stance(current):
-    """Forget the owned entry for `current` and return the stance it replaced (None if unknown)."""
     entry = _owned_entry(current)
     UNSLOTH_EAGER_STANCE_OWNED[:] = [e for e in UNSLOTH_EAGER_STANCE_OWNED if e is not entry]
     return None if entry is None else entry[1]
@@ -2214,7 +2209,6 @@ def _eager_during_decode(func, compiled):
 
 
 def _stance_is_owned():
-    """The owned entry for the current stance, or None."""
     try:
         import torch._dynamo.eval_frame as eval_frame
         current = eval_frame._stance

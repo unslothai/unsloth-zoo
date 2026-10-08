@@ -44,9 +44,6 @@ def _stance():
     return eval_frame._stance.stance
 
 
-# A causal LM forward in the shape transformers writes them: decoder body, then the lm_head and
-# loss. Production runs it through `apply_fused_lm_head`; so does the harness, so the stance
-# hooks land exactly where generated modules have them.
 CAUSAL_LM_FORWARD = """    def forward(self, input_ids, labels=None, logits_to_keep=0, **kwargs):
         \"\"\"Mirrors a transformers *ForCausalLM.forward.\"\"\"
         hidden_states = self.model(input_ids)
@@ -117,7 +114,6 @@ def _generated_module(compiled, name = "unsloth_compiled_module_test"):
     assert x_shape_guard(generated_forward)
 
     def forward(owner, x, labels = None):
-        # Calls the generated forward captured above, never the "forward" slot this replaces.
         assert x.numel() == 8, "harness input must stay (8,)"
         causal_lm.train(owner.training)
         ids = x.repeat(2)
@@ -131,7 +127,6 @@ def _generated_module(compiled, name = "unsloth_compiled_module_test"):
 
 
 def x_shape_guard(generated_forward):
-    # The wrapper below must not be its own target.
     return generated_forward.__name__ == "forward" and "owner" not in generated_forward.__code__.co_varnames
 
 
@@ -383,8 +378,7 @@ def test_training_inside_a_scoped_user_stance_keeps_ownership():
 
 
 def test_scoped_inference_in_a_second_module_keeps_the_first_claim():
-    # A owns the eager stance; B's claiming inference runs inside a temporary default scope,
-    # whose exit restores A's object. Training must still recognise and reset it.
+    # B's scope exit restores A's object; training must still reset it.
     frames_a, compiled_a = _counting_compile()
     frames_b, compiled_b = _counting_compile()
     ns_a = _generated_module(compiled_a, "unsloth_compiled_module_gemma3")
@@ -400,8 +394,7 @@ def test_scoped_inference_in_a_second_module_keeps_the_first_claim():
 
 
 def test_training_inside_a_scope_keeps_the_outer_owned_stance():
-    # Outer Unsloth stance saved by a default scope; inference inside claims a second one and a
-    # training forward resets it. The scope's exit restores the outer one, which is still ours.
+    # Scope exit restores the outer owned stance after the inner one was reset.
     frames, compiled = _counting_compile()
     ns = _generated_module(compiled)
     module = torch.nn.Linear(1, 1)
@@ -417,8 +410,7 @@ def test_training_inside_a_scope_keeps_the_outer_owned_stance():
 
 
 def test_deeply_nested_scopes_keep_the_outer_owned_stance():
-    # Nine nested default scopes, each with a claiming inference inside: the outermost stance is
-    # still restorable when they unwind, so it must still be recognised (no fixed-size cap).
+    # Nine nested scopes: no fixed-size cap on owned stances.
     import contextlib
     frames, compiled = _counting_compile()
     ns = _generated_module(compiled)
@@ -447,8 +439,7 @@ def test_user_force_eager_before_inference_is_restored_by_training():
 
 
 def test_owned_entry_is_dropped_when_the_caller_replaces_the_stance():
-    # The entry holds the replaced stance (a force_backend may capture anything), so it must not
-    # outlive the owned stance object when the caller swaps it out before any training forward.
+    # The entry (holding the replaced stance) must die with its owned stance object.
     frames, compiled = _counting_compile()
     ns = _generated_module(compiled)
     module = torch.nn.Linear(1, 1)
