@@ -641,6 +641,14 @@ def requires_grad_for_gradient_checkpointing(model):
                 module.register_forward_hook(requires_grad_post_hook)
                 logger.info(f"Unsloth: Registered output gradient hook on `{module_name}` input embeddings.")
                 still_need_patching = False
+            except NotImplementedError:
+                # Vision and audio towers (Qwen2.5-VL `visual`, Gemma 4 `audio_tower`) have no token
+                # embedding, so transformers' fallback getter raises. The pre-forward hook below is
+                # the intended path for them, so there is nothing to warn about.
+                logger.info(
+                    f"Unsloth: `{module_name}` has no input embeddings; using a pre-forward hook."
+                )
+                still_need_patching = True
             except Exception as exception:
                 logger.warning(
                     f"Unsloth: Failed to register input-embedding hook for `{module_name}`: {exception}. "
