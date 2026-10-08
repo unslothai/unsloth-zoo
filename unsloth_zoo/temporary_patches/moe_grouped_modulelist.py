@@ -508,7 +508,7 @@ def _stacked_load_post_hook(module, incompatible_keys):
 
 def _lora_stacks(projs, name):
     """(A [E, r, in], B [E, out, r]) when `projs` are, in order, the projections one stack pair was
-    built over, else None (per-expert Parameters, another adapter, gpt-oss' projections)."""
+    built over, else None (per-expert Parameters, another adapter, another projection list)."""
     a0, b0 = projs[0].lora_A[name], projs[0].lora_B[name]
     if type(a0) is not _StackedLoraLinear or type(b0) is not _StackedLoraLinear:
         return None
@@ -962,6 +962,13 @@ def auto_enable_grouped_moe(model):
             enable_grouped_moe(model, verbose=True, stack_lora=True)
     except Exception:
         pass  # optional speedup; never block model loading
+    try:
+        # gpt-oss experts have their own grouped path (no torch._grouped_mm needed on fp16).
+        if model is not None and hasattr(model, "modules"):
+            from .gpt_oss_grouped_qlora import stack_expert_lora
+            stack_expert_lora(model)
+    except Exception:
+        pass
 
 
 def wrap_loader_for_grouped_moe(func):
