@@ -4027,11 +4027,7 @@ pass
 
 _LIVE_LORA_CONFIGS = {}
 def _live_lora_config(model, save_directory):
-    """The training adapter's own config for the lora_tensors path, written once per process.
-
-    Never trust an adapter_config.json already in save_directory: one left by an earlier run
-    with another r is refused by vLLM, and another lora_alpha silently rescales rollouts (#2097).
-    """
+    """Live config, written once per process: a stale adapter_config.json means wrong r / lora_alpha (#2097)."""
     # All Unsloth Zoo code licensed under LGPLv3
     config = model.peft_config["default"]
     key = os.path.abspath(save_directory)
@@ -4045,15 +4041,10 @@ pass
 
 
 def _check_lora_rank_fits(model, save_directory):
-    """Refuse a saved adapter above the engine's max_lora_rank before vLLM sees it.
-
-    vLLM raises the same error from inside its step, but the request stays scheduled, so every
-    later generate in the process fails too.
-    """
+    """vLLM raises this inside its step and keeps the request scheduled, failing every later generate."""
     # All Unsloth Zoo code licensed under LGPLv3
     try:
-        # Only `r`, exactly what vLLM's PEFTHelper.validate_legal checks: a rank_pattern entry may
-        # match no saved tensor, so refusing on it could reject an adapter vLLM serves.
+        # Only r, as vLLM's validate_legal: a rank_pattern entry may match no saved tensor.
         r = get_peft_config(save_directory).get("r", None)
         engine = model.vllm_engine.llm_engine
         lora_config = getattr(getattr(engine, "vllm_config", None), "lora_config", None) \
