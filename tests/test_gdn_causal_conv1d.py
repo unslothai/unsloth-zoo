@@ -81,7 +81,6 @@ def test_matches_reference(B, D, T, W, dtype, bias, act, channel_last):
     torch_ = _run(gcc.causal_conv1d_reference, x, w, b, dy, act)
     oracle = _oracle(x, w, b, dy, act)
     assert ours[0].shape == torch_[0].shape and ours[0].dtype == torch_[0].dtype
-    # Output stored channel-last: the GDN forward transposes it back to contiguous.
     assert ours[0].transpose(1, 2).is_contiguous()
     names = ("y", "dx", "dw", "db")
     for name, o, t, r in zip(names, ours, torch_, oracle):
@@ -92,17 +91,14 @@ def test_matches_reference(B, D, T, W, dtype, bias, act, channel_last):
         if dtype == torch.float32:
             assert e_ours < 1e-5, (name, e_ours, e_torch)
         else:
-            # Within bf16/fp16 rounding: no worse than torch's own error by more than 2x,
-            # plus a tiny floor for tensors where torch happens to be near exact.
+            # At most 2x torch's own rounding error, plus a small floor.
             floor = 4e-3 if dtype == torch.bfloat16 else 5e-4
             assert e_ours <= 2 * e_torch + floor, (name, e_ours, e_torch)
-            # And elementwise close to the torch bf16/fp16 result.
             assert _rel(o, t.to(o.dtype)) < 2 * floor + 2 * e_torch, (name, _rel(o, t), e_torch)
 
 
 @requires_cuda
 def test_bitwise_forward_bf16_no_bias():
-    # Kernel 4, fp32 accumulate, round, SiLU: matches torch's forward closely in bf16.
     x, w, _, _ = _inputs(2, 6144, 512, 4, torch.bfloat16, False, True)
     y = gcc.triton_causal_conv1d(x, w, None, "silu")
     ref = gcc.causal_conv1d_reference(x, w, None, "silu")
@@ -134,7 +130,6 @@ def test_dispatch_fallbacks_and_kill_switch(monkeypatch):
     before = dict(gcc.GDN_CAUSAL_CONV1D_STATS)
     fn(x, w, None, "silu")
     assert gcc.GDN_CAUSAL_CONV1D_STATS["triton_fwd"] == before["triton_fwd"] + 1 and not calls
-    # CPU, dtype mismatch, odd activation -> torch fallback.
     fn(x.float().cpu(), w.float().cpu(), None, "silu")
     fn(x, w.float(), None, "silu")
     fn(x, w, None, "gelu")
@@ -169,7 +164,6 @@ def test_legacy_seq_idx_cpu():
         gcc.causal_conv1d_reference(x[:, :, s:e], w, b, "silu") for s, e in ((0, 3), (3, 7), (7, 10))
     ], dim = -1)
     torch.testing.assert_close(y, ref)
-    # A single segment is the plain conv.
     y = gcc._legacy_causal_conv1d_fn(x = x, weight = w, bias = b, activation = "silu", seq_idx = torch.zeros(1, 10, dtype = torch.int32))
     torch.testing.assert_close(y, gcc.causal_conv1d_reference(x, w, b, "silu"))
     with pytest.raises(NotImplementedError):
@@ -190,8 +184,7 @@ def hub_kernels(monkeypatch):
     if not hasattr(hub_kernels, "use_kernel_func_from_hub_with_fallback"):
         pytest.skip("transformers without use_kernel_func_from_hub_with_fallback")
     import transformers.integrations as integrations
-    # Restored on teardown, whatever the patch rebinds. On a CUDA host importing
-    # unsloth_zoo already patched it, so start from the unpatched decorator.
+    # On a CUDA host importing unsloth_zoo already patched it: start unpatched.
     original = _unpatched_decorator(hub_kernels.use_kernel_func_from_hub_with_fallback)
     monkeypatch.setattr(hub_kernels, "use_kernel_func_from_hub_with_fallback", original)
     monkeypatch.setattr(integrations, "use_kernel_func_from_hub_with_fallback", original)
@@ -228,7 +221,6 @@ def test_hub_decorator_wraps_only_gdn_fallbacks(hub_kernels):
     assert not gcc._is_marked(patched("causal_conv1d_fn", "causal_conv1d")(_gdn_fn("transformers.models.mamba2.modeling_mamba2")))
     assert not gcc._is_marked(patched("causal_conv1d_update", "causal_conv1d")(gdn_fn))
 
-    # transformers < 5.15 layout: a None global becomes the package-style entry point.
     import types
     legacy = types.ModuleType("legacy")
     legacy.causal_conv1d_fn = None
@@ -237,15 +229,12 @@ def test_hub_decorator_wraps_only_gdn_fallbacks(hub_kernels):
 
 
 def test_patch_rebinds_the_real_modeling_module(hub_kernels, monkeypatch):
-    # Already-imported modeling module: its global and its decorator binding are
-    # rebound, and the dispatch keeps the torch path for an ineligible (CPU) input.
     pytest.importorskip("triton")
     modeling = _real_gdn_modeling(monkeypatch)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.version, "hip", None)
     assert not gcc._is_marked(modeling.causal_conv1d_fn)
 
-    # Kill switch or a usable real package at patch time: nothing is touched.
     monkeypatch.setenv(gcc._KILL_SWITCH, "1")
     gcc.patch_gdn_causal_conv1d()
     monkeypatch.delenv(gcc._KILL_SWITCH)
@@ -272,7 +261,6 @@ def test_real_package_must_be_usable(monkeypatch):
     fake.causal_conv1d_fn = None
     monkeypatch.setitem(sys.modules, "causal_conv1d", fake)
     monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a, **k: object())
-    # Installed but nulled by the CUDA probe: not usable.
     assert not gcc._real_causal_conv1d_available()
     fake.causal_conv1d_fn = lambda *a, **k: None
     assert gcc._real_causal_conv1d_available()
@@ -280,8 +268,6 @@ def test_real_package_must_be_usable(monkeypatch):
 
 @requires_cuda
 def test_gated_delta_net_layer_engages_triton(hub_kernels, monkeypatch):
-    # End to end through the real layer: Triton runs in forward and backward and
-    # matches the unpatched layer.
     modeling = _real_gdn_modeling(monkeypatch)
     from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
     config = Qwen3_5TextConfig(
@@ -314,8 +300,7 @@ def test_gated_delta_net_layer_engages_triton(hub_kernels, monkeypatch):
 
 
 def test_legacy_modeling_imported_at_patch_time(monkeypatch):
-    # transformers < 5.15: no decorator to hook, so the patch imports the modeling
-    # modules itself and fills their None global before any model is built.
+    # transformers < 5.15: the patch imports modeling modules itself.
     import importlib
     import sys
     import types

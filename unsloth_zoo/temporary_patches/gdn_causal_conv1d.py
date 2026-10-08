@@ -14,32 +14,14 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Triton short causal conv for the GatedDeltaNet mixer when `causal_conv1d` is missing.
+"""Triton causal depthwise conv (+ SiLU) for GatedDeltaNet when `causal_conv1d` is missing.
 
-Qwen3.5 / Qwen3.6 (dense and MoE) and Qwen3-Next run `in_proj_qkv` and then a
-depthwise causal conv (kernel 4) + SiLU over the channel dim. Without the
-`causal-conv1d` wheel transformers falls back to `F.conv1d` on a channel-first
-`(B, D, T)` view of the channel-last `(B, T, D)` projection output. The torch
-depthwise conv wants a channel-first contiguous input, so every call pays a
-transposing `.contiguous()` on the input, another on `grad_output` in backward,
-runs the slow `conv_depthwise2d` kernels, and hands a channel-first output to
-`chunk_gated_delta_rule`, whose input guard transposes it back.
-
-This module replaces only that torch fallback with a Triton kernel that reads
-the channel-last input through its strides and writes a channel-last output, so
-the copies go away and the conv itself becomes a single memory-bound pass. The
-kernel layout follows fla's `causal_conv1d` (fla-org/flash-linear-attention,
-MIT); it is reimplemented here self-contained without varlen / initial state
-support because the call site never passes them.
-
-Numerics follow the torch path: fp32 accumulation, the pre-activation is
-rounded to the input dtype before SiLU, and in backward the SiLU gradient is
-rounded to the input dtype before the conv transpose, as the separate torch ops
-do.
-
-Env: ``UNSLOTH_DISABLE_TRITON_CAUSAL_CONV1D=1`` keeps the torch fallback (read
-per call). The real `causal_conv1d` package always wins when it imports with a callable
-`causal_conv1d_fn`.
+Replaces the transformers `F.conv1d` fallback (Qwen3.5/3.6, Qwen3-Next), reading and
+writing channel-last directly to skip the transpose copies. Layout follows fla's
+`causal_conv1d` (fla-org/flash-linear-attention, MIT), without varlen / initial state.
+Numerics match torch: fp32 accumulate, pre-activation and SiLU grad rounded to input dtype.
+``UNSLOTH_DISABLE_TRITON_CAUSAL_CONV1D=1`` keeps the torch fallback; a usable
+`causal_conv1d` package always wins.
 """
 
 __all__ = [
@@ -65,14 +47,12 @@ _KILL_SWITCH = "UNSLOTH_DISABLE_TRITON_CAUSAL_CONV1D"
 _MARK = "_unsloth_triton_causal_conv1d"
 _HUB_MARK = "_unsloth_triton_causal_conv1d_hub"
 
-# Modeling packages whose GatedDeltaNet uses the depthwise causal conv fallback.
 _GDN_MODELING = ("qwen3_5", "qwen3_5_moe", "qwen3_next")
 _GDN_LEAVES = frozenset(
     f"{prefix}_{package}" for package in _GDN_MODELING
     for prefix in ("modeling", "unsloth_compiled_module")
 )
 
-# Engagement counters (Triton forward calls / backward calls / torch fallbacks).
 GDN_CAUSAL_CONV1D_STATS = {"triton_fwd": 0, "triton_bwd": 0, "fallback": 0}
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
@@ -80,7 +60,6 @@ _MAX_WIDTH = 8
 _ACTIVATIONS = (None, "silu", "swish")
 
 _kernels = None
-# Set after a Triton failure so a broken compile is not retried on every call.
 _broken = False
 
 
@@ -89,8 +68,7 @@ def _disabled():
 
 
 def _real_causal_conv1d_available():
-    # Usable, not just installed: a broken wheel fails to import, and misc.py's
-    # patch_causal_conv1d_cuda_probe sets causal_conv1d_fn = None on GPUs it lacks kernels for.
+    # Usable, not just installed: misc.py's CUDA probe may set causal_conv1d_fn = None.
     try:
         if importlib.util.find_spec("causal_conv1d") is None:
             return False
@@ -176,8 +154,7 @@ def _build_kernels():
             b_bias = tl.load(bias + o_d, mask = m_d, other = 0).to(tl.float32)
 
         b_dx = tl.zeros((BT, BD), dtype = tl.float32)
-        # k = how far ahead the output row is: dx[s] += w[W - 1 - k] * g[s + k],
-        # where g = d(loss)/d(pre-activation).
+        # dx[s] += w[W - 1 - k] * g[s + k], g = d(loss)/d(pre-activation).
         for k in tl.static_range(W):
             r_t = o_t + k
             m_r = r_t < T
@@ -232,9 +209,7 @@ def _build_kernels():
     return _kernels
 
 
-# (BT, BD, num_warps). Small tiles: the backward recomputes W shifted pre-activations
-# per tile and spills with larger ones. Picked on B200 (bf16, D 6144, T 4096); the
-# forward is memory bound and flat across tile sizes.
+# (BT, BD, num_warps). Small: backward recomputes W pre-activations per tile and spills.
 _FWD_CONFIG = (32, 64, 2)
 _BWD_CONFIG = (16, 64, 2)
 # CUDA caps grid dims 1 and 2 at 65535: T tiles ride dim 1, batch rides dim 2.
@@ -296,7 +271,6 @@ def _launch_bwd(x_btd, weight, bias, dy_btd, activation, need_dx, need_dw, need_
 class _CausalConv1dFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x_bdt, weight, bias, activation):
-        # x_bdt is (B, D, T); usually a transposed view of a (B, T, D) tensor.
         y_btd = _launch_fwd(x_bdt.transpose(1, 2), weight, bias, activation)
         ctx.save_for_backward(x_bdt, weight, bias)
         ctx.activation = activation
@@ -306,8 +280,6 @@ class _CausalConv1dFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dy_bdt):
         x_bdt, weight, bias = ctx.saved_tensors
-        # needs_input_grad is False for a None bias, and autograd only calls
-        # backward when some input needs a gradient.
         dx, dw, db = _launch_bwd(
             x_bdt.transpose(1, 2), weight, bias, dy_bdt.transpose(1, 2),
             ctx.activation, *ctx.needs_input_grad[:3],
@@ -348,8 +320,7 @@ def _eligible(x, weight, bias, activation):
 
 
 def triton_causal_conv1d(x, weight, bias = None, activation = None):
-    """Causal depthwise conv over x (B, D, T) with weight (D, W); returns (B, D, T)
-    stored channel-last. Same semantics as the transformers torch fallback."""
+    """x (B, D, T), weight (D, W) -> (B, D, T) stored channel-last."""
     return _CausalConv1dFunction.apply(x, weight, bias, activation)
 
 
@@ -377,8 +348,7 @@ def _count_fallback():
 
 
 def _make_hub_dispatch(torch_function):
-    """Wrap the transformers torch fallback `causal_conv1d_fn(hidden_states, weight,
-    bias=None, activation=None, **kwargs)`, which ignores its kwargs."""
+    """Wrap the transformers torch fallback (which ignores its kwargs)."""
     @functools.wraps(torch_function)
     def causal_conv1d_fn(hidden_states, weight, bias = None, activation = None, **kwargs):
         out = _try_fast(hidden_states, weight, bias, activation)
@@ -392,8 +362,7 @@ def _make_hub_dispatch(torch_function):
 
 
 def _causal_conv1d_reference_seq_idx(x, weight, bias, activation, seq_idx):
-    """Torch causal conv whose taps do not cross `seq_idx` boundaries (the
-    `causal_conv1d` package semantics). x (B, D, T), seq_idx (B, T)."""
+    """Torch causal conv whose taps do not cross `seq_idx` (B, T) boundaries."""
     import torch.nn.functional as F
     W, T = weight.shape[-1], x.shape[-1]
     acc = torch.promote_types(weight.dtype, torch.float32)
@@ -413,13 +382,9 @@ def _causal_conv1d_reference_seq_idx(x, weight, bias, activation, seq_idx):
 
 
 def _legacy_causal_conv1d_fn(x, weight, bias = None, activation = None, **kwargs):
-    """Stands in for `causal_conv1d.causal_conv1d_fn` on transformers < 5.15, whose
-    GatedDeltaNet calls `self.causal_conv1d_fn(x=, weight=, bias=, activation=,
-    seq_idx=...)` only when the global is not None.
-
-    `seq_idx` is not a named parameter on purpose: unsloth's hybrid packing gate
-    enables packing when the conv signature names it. Passed (transformers 5.9 to
-    5.14 forward `kwargs.get("seq_idx")`), it is honoured by a per-segment torch path."""
+    """`causal_conv1d_fn` stand-in for transformers < 5.15 (used only when not None).
+    `seq_idx` is deliberately not named: the hybrid packing gate enables packing when the
+    signature names it. If passed (5.9 to 5.14), a per-segment torch path honours it."""
     seq_idx = kwargs.pop("seq_idx", None)
     unsupported = sorted(k for k, v in kwargs.items() if v is not None and v is not False)
     if unsupported:
@@ -445,9 +410,8 @@ def _is_gdn_function(torch_function):
 
 
 def _patch_hub_decorator():
-    """Wrap `use_kernel_func_from_hub_with_fallback` (transformers >= 5.15) so a
-    GatedDeltaNet `causal_conv1d_fn` decorated later (including Unsloth's compiled
-    copies, which import the decorator from the modeling module) gets the Triton dispatch."""
+    """transformers >= 5.15: hook the hub decorator so later-decorated GDN convs
+    (incl. compiled copies) get the Triton dispatch."""
     try:
         import transformers.integrations as integrations
         from transformers.integrations import hub_kernels
@@ -473,10 +437,8 @@ def _patch_hub_decorator():
 
 
 def _rebind_module(module, patched_decorator):
-    """Rebind one already-imported modeling (or compiled) module. Returns True if
-    its `causal_conv1d_fn` now dispatches to Triton. Only called without a usable
-    `causal_conv1d` package, and re-decorating re-resolves the implementation, so a
-    wrapper that captured a since-disabled package kernel is replaced too."""
+    """Rebind an imported module; True if it now dispatches to Triton. Re-decorating
+    also replaces a wrapper that captured a since-disabled package kernel."""
     names = vars(module)
     if patched_decorator is not None and "use_kernel_func_from_hub_with_fallback" in names:
         module.use_kernel_func_from_hub_with_fallback = patched_decorator
@@ -484,8 +446,7 @@ def _rebind_module(module, patched_decorator):
         return False
     current = module.causal_conv1d_fn
     if current is None:
-        # transformers < 5.15: None unless the package imported; the layer copies
-        # this global onto `self.causal_conv1d_fn` in __init__.
+        # transformers < 5.15: None unless the package imported; copied in layer __init__.
         module.causal_conv1d_fn = _legacy_causal_conv1d_fn
         return True
     if _is_marked(current):
@@ -510,8 +471,7 @@ def patch_gdn_causal_conv1d():
     patched_decorator = _patch_hub_decorator()
     names = [f"transformers.models.{p}.modeling_{p}" for p in _GDN_MODELING]
     if patched_decorator is None:
-        # transformers < 5.15 has no decorator to hook, so a modeling module imported
-        # later would keep its None global: import them now and rebind.
+        # transformers < 5.15 has no decorator to hook: import modeling modules now.
         for name in names:
             try:
                 importlib.import_module(name)
