@@ -1012,9 +1012,7 @@ pass
 
 
 def _get_multimodal_engine_args(config, is_vision_model):
-    # Unsloth only feeds vLLM images, so audio is 0: vLLM then skips building and profiling
-    # the audio tower (Gemma-4 E2B/E4B), which aborted the process in the profiling run once
-    # Unsloth's compiled transformers audio modules were in place.
+    # Audio = 0: profiling the Gemma-4 audio tower aborts with Unsloth's compiled audio modules.
     limits = {"image": 1, "video": 0}
     if getattr(config, "audio_config", None) is not None:
         limits["audio"] = 0
@@ -1022,10 +1020,8 @@ def _get_multimodal_engine_args(config, is_vision_model):
         return {"limit_mm_per_prompt": limits}
     if not _is_gemma4_config(config):
         return {}
-    # text_only passes the text config, but vLLM reads the checkpoint and builds the
-    # multimodal class anyway. language_model_only skips every encoder and is part of
-    # vLLM's AOT compile cache key; zeroing limit_mm_per_prompt instead is not, so a cached
-    # artifact from a multimodal run is reloaded and crashes (vllm-project/vllm#50891).
+    # language_model_only is in vLLM's AOT cache key; zeroed limit_mm_per_prompt is not, so a
+    # multimodal run's cached artifact would be reloaded and crash (vllm-project/vllm#50891).
     limits["audio"] = 0
     return {"language_model_only": True, "limit_mm_per_prompt": limits}
 pass
@@ -1512,8 +1508,7 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         revision = checkpoint_source[1],
         cache_dir = checkpoint_source[2],
     )
-    # An attribute, not a key: every consumer iterates the tensors, and the HF config would
-    # serialise anything set on it into config.json.
+    # Attribute, not key: consumers iterate tensors; on the HF config it would hit config.json.
     quant_state_dict._unsloth_checkpoint_source = checkpoint_source
 
     if not return_state_dict: state_dict = None
@@ -1652,8 +1647,7 @@ pass
 
 
 def _gemma4_audio_missing_reason(new_model, keys):
-    # Every audio parameter and persistent buffer needs a checkpoint entry, else part of
-    # the tower would stay at random init. Aliased tensors need only one of their names.
+    # Incomplete checkpoint = random-init leftovers; aliased tensors need only one name.
     present = set(keys)
     groups = {}
     for name, param in new_model.named_parameters(remove_duplicate = False):
@@ -1672,8 +1666,7 @@ pass
 
 
 def _gemma4_audio_quantized_reason(keys, weight_map, installable):
-    # A quantized tower would be cast from packed integer storage and lose its quant
-    # state, so any sign of quantization means nothing is installed.
+    # Quantized tower would lose its quant state when cast, so install nothing.
     for key in keys:
         last = key.rsplit(".", 1)[-1]
         if last in _QUANT_STATE_SUFFIXES or "quant_state" in key:
@@ -1700,12 +1693,8 @@ pass
 
 
 def _load_gemma4_audio_from_checkpoint(new_model, config, weight_map = None, checkpoint_source = None):
-    # vLLM runs with audio = 0 so it never builds the audio tower, and the training model's
-    # copy is left at random init (embed_audio a 1-wide placeholder). Read it from the
-    # checkpoint instead; returns how many tensors were loaded.
-    # checkpoint_source = (path, revision, cache_dir) vLLM resolved, so a pinned revision or
-    # custom cache_dir is read from the same snapshot. Without it, the config's commit hash
-    # pins the snapshot the config came from.
+    # vLLM never builds the audio tower, so load it from the checkpoint; returns tensors loaded.
+    # checkpoint_source = vLLM's (path, revision, cache_dir), else the config's commit hash pins the snapshot.
     if getattr(config, "audio_config", None) is None: return 0
     if weight_map is None:
         if checkpoint_source is not None and checkpoint_source[0] is not None:

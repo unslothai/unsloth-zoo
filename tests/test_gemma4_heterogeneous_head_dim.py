@@ -14,10 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""transformers >= 5.15 raises AmbiguousGlobalPerLayerAttributeError on config.head_dim for
-Gemma-4 (256 on sliding layers, 512 on full ones). A bare getattr in the fast_inference path
-killed text_only loads; every read there must go around it.
-"""
+"""transformers >= 5.15 raises on Gemma-4 config.head_dim (256/512 per layer); never getattr it bare."""
 import inspect
 
 import pytest

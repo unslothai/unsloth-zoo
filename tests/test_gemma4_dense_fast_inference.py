@@ -14,13 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Dense Gemma-4 (E2B / E4B) with fast_inference.
-
-vLLM profiled the audio tower Unsloth never feeds, and with Unsloth's compiled transformers
-audio modules in place that aborted the process. A text_only load must also not share a
-vLLM AOT compile artifact with a multimodal run (vllm-project/vllm#50891). With audio off in
-vLLM, the training model's audio tower has to come from the checkpoint.
-"""
+"""Dense Gemma-4 fast_inference: audio off in vLLM, tower from checkpoint (vllm-project/vllm#50891)."""
 import inspect
 from types import SimpleNamespace
 
@@ -57,7 +51,6 @@ def test_vision_load_without_audio_is_unchanged():
 
 
 def test_text_only_gemma4_runs_language_model_only():
-    # text_only hands load_vllm the text config, which has no vision / audio sub-config.
     text_config = SimpleNamespace(model_type = "gemma4_text")
     for config in (text_config, _gemma4()):
         args = _get_multimodal_engine_args(config, is_vision_model = False)
@@ -90,7 +83,6 @@ class _Inner(torch.nn.Module):
         super().__init__()
         self.audio_tower = _Audio()
         self.embed_audio = torch.nn.Module()
-        # create_empty_model's 1-wide placeholder
         self.embed_audio.embedding_projection = torch.nn.Linear(4, 1, bias = False)
         self.language_model = torch.nn.Linear(4, 4, bias = False)
 
@@ -125,7 +117,6 @@ def test_audio_tower_is_read_from_the_checkpoint(tmp_path):
         assert not params[key].requires_grad
     proj = model.model.embed_audio.embedding_projection
     assert (proj.out_features, proj.in_features) == (6, 4)
-    # Only the audio prefixes are touched; the rest is shared with vLLM.
     assert torch.equal(model.model.language_model.weight, lm_before)
 
 
@@ -154,7 +145,6 @@ def test_state_dict_carries_vllms_checkpoint_source_as_an_attribute():
     assert 'getattr(model_config, "revision", None)' in source
     assert 'getattr(load_config, "download_dir", None)' in source
     assert "quant_state_dict._unsloth_checkpoint_source = checkpoint_source" in source
-    # An OrderedDict attribute is not a key, so nothing iterating the tensors sees it.
     from collections import OrderedDict
 
     quant_state_dict = OrderedDict(w = torch.zeros(1))
@@ -264,7 +254,6 @@ def _assert_nothing_installed(model, before, loaded):
 def test_bnb_packed_audio_tower_is_never_installed(tmp_path):
     model = _Model()
     before = model.model.language_model.weight.detach().clone()
-    # Keep references: the tower must not have been written before it was dropped.
     audio = model.model.audio_tower
     proj_before = audio.proj.weight.detach().clone()
     loaded = _load_gemma4_audio_from_checkpoint(model, _gemma4(), weight_map = _quantized_audio_checkpoint(tmp_path))
