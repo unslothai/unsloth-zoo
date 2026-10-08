@@ -349,6 +349,38 @@ def _image_urls(state, images):
     return urls
 
 
+def _decode_images(urls):
+    import base64
+    import io
+
+    from PIL import Image
+
+    images = []
+    for url in urls:
+        try:
+            image = Image.open(io.BytesIO(base64.b64decode(url.partition(",")[2], validate = True)))
+            image.load()
+        except Exception as error:
+            raise DecisionRequestError("an image could not be decoded") from error
+        images.append(image)
+    return images
+
+
+def _without_image_parts(state):
+    """A chat-message state without its image parts, which are read as images and not as text."""
+    wrapped = isinstance(state, dict) and "messages" in state
+    messages = state["messages"] if wrapped else state
+    if not isinstance(messages, list):
+        return state
+    kept = []
+    for message in messages:
+        if isinstance(message, dict) and isinstance(message.get("content"), list):
+            parts = [part for part in message["content"] if not (isinstance(part, dict) and part.get("type") == "image_url" and "image_url" in part)]
+            message = {**message, "content": parts}
+        kept.append(message)
+    return {**state, "messages": kept} if wrapped else kept
+
+
 def _softmax(scores, temperature):
     if not all(math.isfinite(score) for score in scores):
         raise RuntimeError("the model could not evaluate the decision")
@@ -381,16 +413,18 @@ class DecisionPipeline:
     max_options = 255
     noul_true_first = False
     choice_sorted = False
+    reads_images = False
     temperatures = {}
 
     def answer(self, state, questions, images = None):
-        """Answers keyed by question id, and the prompt tokens spent. Image input is refused."""
+        """Answers keyed by question id, and the prompt tokens spent. Images are refused unless `reads_images`."""
         if state is None:
             raise DecisionRequestError('"state" must be provided')
         parsed = self._parse_questions(questions)
-        if _image_urls(state, images):
+        urls = _image_urls(state, images)
+        if urls and not self.reads_images:
             raise DecisionUnsupportedError("this model does not support images")
-        scores, tokens = self._scores(state, parsed)
+        scores, tokens = self._scores(_without_image_parts(state), parsed, _decode_images(urls)) if urls else self._scores(state, parsed)
         answers = {question.id: self._format_answer(question, variants) for question, variants in zip(parsed, scores)}
         return {"answers": answers, "usage": {"input_tokens": tokens, "output_tokens": 0}}
 
@@ -752,7 +786,8 @@ class _QwenModel(DecisionPipeline):
         if load_in_4bit:
             # The loader leaves the embeddings, the output head and the vision tower in 16-bit for the trainers that
             # train them. No decision head does, and together they are as large again as the quantized layers.
-            nn.quantize(self.model, 64, 4, class_predicate = lambda _, module: hasattr(module, "to_quantized") and module.weight.shape[-1] % 64 == 0)
+            # The vision tower is left as loaded: a model that reads images sees them through it.
+            nn.quantize(self.model, 64, 4, class_predicate = lambda path, module: not path.startswith("vision_tower") and hasattr(module, "to_quantized") and module.weight.shape[-1] % 64 == 0)
         self.model.eval()
 
     def _load_beside(self, folder, dtype, token, head_prefix, load_in_4bit = False):
@@ -775,10 +810,16 @@ class _QwenModel(DecisionPipeline):
         encoded = ((code, self._encode(code)) for code in codes)
         return [(code, ids[0]) for code, ids in encoded if len(ids) == 1][:limit]
 
-    def _hidden(self, ids):
+    def _hidden(self, ids, media = None):
         from .utils import _forward_text_hidden_states
 
-        return _forward_text_hidden_states(self.model, mx.array(ids)[None])[0]
+        ids = mx.array(ids)[None]
+        if media is None:
+            return _forward_text_hidden_states(self.model, ids)[0]
+        # The image features take the place of the placeholder embeddings, and an image advances the positions by
+        # its grid, not by its token count.
+        merged = self.model.get_input_embeddings(ids, media["pixel_values"], image_grid_thw = media["image_grid_thw"])
+        return _forward_text_hidden_states(self.model, ids, inputs_embeds = merged.inputs_embeds, position_ids = merged.position_ids)[0]
 
     def _hidden_states(self, prompts):
         """The hidden states of each prompt; the prefix the prompts of a request share is run once and continued per prompt."""
@@ -1208,6 +1249,9 @@ class ClefModel(_QwenModel):
         return (folder / "joint_head_config.json").is_file() and (folder / "joint_head.safetensors").is_file()
     noul_true_first = True
     choice_sorted = True
+    _IMAGE = "<|vision_start|><|image_pad|><|vision_end|>"
+    # The prompt length its reference serves, which the images of a request may not reach on their own.
+    _IMAGE_TOKENS = 16384
     _SYSTEM = "Read the complete state and schema. Decide every field jointly. Each answer must be exactly one of that field's allowed options."
     _NOUL = {"true": "The proposition is true or the answer is yes.", "false": "The proposition is false or the answer is no."}
 
@@ -1274,9 +1318,29 @@ class ClefModel(_QwenModel):
             yield "END FIELD\n", None
         yield "\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:", None
 
-    def encode(self, state, questions, max_length = None):
-        """Token ids of the prompt and the (start, end) spans the head reads; a state too long for `max_length` loses its end."""
+    @property
+    def reads_images(self):
+        return hasattr(self.model, "vision_tower") and getattr(self.model, "_processor", None) is not None
+
+    def encode_images(self, images):
+        """The token ids that stand for `images` in the prompt, and the pixels behind them."""
+        if not self.reads_images:
+            raise DecisionUnsupportedError("this model does not support images")
+        try:
+            encoded = self.model._processor(text = [self._IMAGE * len(images) + "\n"], images = list(images), return_tensors = "np")
+        except ValueError as error:
+            raise DecisionRequestError(f"an image could not be read: {error}") from error
+        ids = np.asarray(encoded["input_ids"])[0].tolist()
+        if len(ids) >= self._IMAGE_TOKENS:
+            raise DecisionRequestError(f"the images take {len(ids)} tokens; the maximum is {self._IMAGE_TOKENS}, send fewer or smaller images")
+        return ids, {name: mx.array(np.asarray(encoded[name])) for name in ("pixel_values", "image_grid_thw")}
+
+    def encode(self, state, questions, max_length = None, image_ids = ()):
+        """Token ids of the prompt and the (start, end) spans the head reads; a state too long for `max_length` loses its end.
+
+        `image_ids`, from `encode_images`, go between the prompt's opening and the state."""
         pieces = [(self._encode(text), mark) for text, mark in self._pieces(state, questions)]
+        pieces[0] = (pieces[0][0] + list(image_ids), None)
         if max_length is not None:
             # The state is the second piece; everything else is the schema, which must fit whole.
             room = max_length - sum(len(piece) for piece, _ in pieces) + len(pieces[1][0])
@@ -1304,22 +1368,23 @@ class ClefModel(_QwenModel):
             raise ValueError("Clef reads its options from the output embedding too, which this model's output head does not expose")
         return output
 
-    def logits(self, ids, question_spans, option_spans, types, output = None):
+    def logits(self, ids, question_spans, option_spans, types, output = None, media = None):
         """One logit per option of the prompt, in question order; `types` index `_TYPE_IDS`."""
         output = output or self._output_head()
-        hidden = self._hidden(ids).astype(mx.float32)
+        hidden = self._hidden(ids, media).astype(mx.float32)
         # The head reads the output embedding but does not train it.
         lexical = [mx.stop_gradient(_output_rows(output, ids[start:end])) for spans in option_spans for start, end in spans]
         return self.head(hidden, lexical, question_spans, option_spans, types)
 
-    def _scores(self, state, questions):
+    def _scores(self, state, questions, images = ()):
         from .generate import generation_mode
 
-        ids, question_spans, option_spans = self.encode(state, questions)
+        image_ids, media = self.encode_images(images) if images else ((), None)
+        ids, question_spans, option_spans = self.encode(state, questions, image_ids = image_ids)
         # Found before generation mode, which swaps a quantized head's class.
         output = self._output_head()
         with generation_mode(self.model):
-            logits = self.logits(ids, question_spans, option_spans, [_TYPE_IDS.index(q.type) for q in questions], output).tolist()
+            logits = self.logits(ids, question_spans, option_spans, [_TYPE_IDS.index(q.type) for q in questions], output, media).tolist()
         bounds = [0]
         for spans in option_spans:
             bounds.append(bounds[-1] + len(spans))

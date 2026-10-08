@@ -1023,6 +1023,79 @@ def test_clef_prompt_gives_up_the_end_of_the_state_only(clef):
         clef[2]("state", 100)
 
 
+def _vision_decoder():
+    from mlx_vlm.models import qwen3_5
+
+    text = dict(model_type = "qwen3_5_text", hidden_size = 64, intermediate_size = 128, num_hidden_layers = 4, num_attention_heads = 2, num_key_value_heads = 1, vocab_size = 512, head_dim = 32)
+    text.update(linear_num_value_heads = 4, linear_num_key_heads = 2, linear_key_head_dim = 32, linear_value_head_dim = 16, linear_conv_kernel_dim = 4, rms_norm_eps = 1e-6, max_position_embeddings = 4096)
+    vision = dict(model_type = "qwen3_5", depth = 1, hidden_size = 32, intermediate_size = 64, num_heads = 2, out_hidden_size = 64, num_position_embeddings = 64, patch_size = 16)
+    tokens = dict(image_token_id = 500, vision_start_token_id = 501, vision_end_token_id = 502)
+    mx.random.seed(7)
+    return qwen3_5.Model(qwen3_5.ModelConfig.from_dict({"model_type": "qwen3_5", "text_config": text, "vision_config": vision, **tokens}))
+
+
+def _patches(text, images, return_tensors):
+    # As the Qwen processor answers: one placeholder per 2x2 patches, and the patches of every image in one array.
+    if any(image.width < 32 for image in images):
+        raise ValueError("too thin")
+    grids = [(1, image.height // 16, image.width // 16) for image in images]
+    ids = [token for _, rows, columns in grids for token in (501, *[500] * (rows * columns // 4), 502)] + [10]
+    pixels = [np.full((rows * columns, 1536), np.asarray(image).mean() / 255, np.float32) for image, (_, rows, columns) in zip(images, grids)]
+    return {"input_ids": np.array([ids]), "pixel_values": np.concatenate(pixels), "image_grid_thw": np.array(grids)}
+
+
+def test_clef_reads_images_between_the_opening_and_the_state(clef, monkeypatch):
+    from PIL import Image
+
+    from unsloth_zoo.mlx.decision import ClefModel, DecisionRequestError, DecisionUnsupportedError
+
+    text_only, questions = clef[0], {"ok": {"type": "noul", "instructions": "fine?"}}
+    images = [Image.new("RGB", size, shade) for size, shade in (((96, 64), "black"), ((64, 64), "white"))]
+    with pytest.raises(DecisionUnsupportedError):
+        text_only.encode_images(images)
+    model = _vision_decoder()
+    model._processor = _patches
+    reader = copy.copy(text_only)
+    reader.model = model
+    assert reader.reads_images and not text_only.reads_images
+    monkeypatch.setattr(ClefModel, "_IMAGE_TOKENS", 15)
+    with pytest.raises(DecisionRequestError, match = "the images take 15 tokens"):
+        reader.encode_images(images)
+    monkeypatch.setattr(ClefModel, "_IMAGE_TOKENS", 16)
+    with pytest.raises(DecisionRequestError, match = "could not be read: too thin"):
+        reader.encode_images([Image.new("RGB", (16, 16))])
+
+    parsed = reader._parse_questions(questions)
+    image_ids, media = reader.encode_images(images)
+    plain, with_images = reader.encode("state", parsed), reader.encode("state", parsed, image_ids = image_ids)
+    opening = len(reader._encode(next(reader._pieces("state", parsed))[0]))
+    assert image_ids == [501, *[500] * 6, 502, 501, *[500] * 4, 502, 10] and media["image_grid_thw"].tolist() == [[1, 4, 6], [1, 4, 4]] and with_images[0] == plain[0][:opening] + image_ids + plain[0][opening:]
+    assert with_images[1:] == ([(start + 15, end + 15) for start, end in plain[1]], [[(start + 15, end + 15) for start, end in spans] for spans in plain[2]])
+    # Only the state gives way to a length limit, images included in what must fit.
+    assert reader.encode("state", parsed, len(with_images[0]) - 2, image_ids)[0] == with_images[0][: opening + 15 + 3] + with_images[0][opening + 15 + 5 :]
+
+    ids = mx.array(with_images[0])[None]
+    with generation_mode(model):
+        hidden = reader._hidden(with_images[0], media)
+        # mlx-vlm's own forward places the image features and positions.
+        expected = model(ids, media["pixel_values"], image_grid_thw = media["image_grid_thw"]).logits[0]
+        np.testing.assert_allclose(np.array(model.language_model.lm_head(hidden).astype(mx.float32)), np.array(expected.astype(mx.float32)), atol = 1e-4)
+        assert mx.abs(hidden - reader._hidden(with_images[0])).max().item() > 1e-2
+
+    def url(image):
+        import base64, io
+
+        buffer = io.BytesIO()
+        image.save(buffer, "PNG")
+        return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+
+    dark, light = (reader.answer([{"role": "user", "content": ["state", {"type": "image_url", "image_url": url(image.resize((96, 64)))}]}], questions) for image in images)
+    assert dark["usage"] == light["usage"] and dark["answers"]["ok"]["noul"] != light["answers"]["ok"]["noul"]
+    assert dark["usage"]["input_tokens"] == len(reader.encode([{"role": "user", "content": ["state"]}], parsed)[0]) + 9
+    model._processor = None
+    assert not reader.reads_images
+
+
 def _clef_record_loss_and_grad(network, record):
     return mx.value_and_grad(lambda params: (network.update(params), _clef_record_loss(network, record))[1])(network.trainable_parameters())
 

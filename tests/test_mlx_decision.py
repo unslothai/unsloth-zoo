@@ -120,6 +120,40 @@ def test_images_are_validated_then_refused_as_unsupported():
     assert model.answer(text_only, question, images = [])["answers"]
 
 
+def test_a_model_that_reads_images_gets_them_decoded_and_out_of_the_state():
+    import base64
+    import io
+
+    Image = pytest.importorskip("PIL.Image")
+    seen = []
+
+    class Reader(_Scripted):
+        reads_images = True
+
+        def _scores(self, state, questions, images = ()):
+            seen.append((state, [image.size for image in images]))
+            return [[[0.0, 0.0]]], 3
+
+    def url(size):
+        buffer = io.BytesIO()
+        Image.new("RGB", size).save(buffer, "PNG")
+        return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+
+    part, text, question = {"type": "image_url", "image_url": {"url": url((3, 2))}}, {"type": "text", "text": "t"}, {"q": {"type": "noul", "instructions": "i"}}
+    wrapped = {"messages": [{"role": "user", "content": [text, part]}, "x"], "k": 1}
+    Reader(None).answer(wrapped, question, images = [url((5, 4))])
+    Reader(None).answer([{"content": [text]}, {"content": [part, text, part]}], question)
+    Reader(None).answer("s", question)
+    # The images of the field come first; the state keeps everything but its image parts, and is not edited in place.
+    assert seen == [({"messages": [{"role": "user", "content": [text]}, "x"], "k": 1}, [(5, 4), (3, 2)]), ([{"content": [text]}, {"content": [text]}], [(3, 2)] * 2), ("s", [])]
+    assert wrapped["messages"][0]["content"] == [text, part]
+    # Not base64, not an image, and an image cut short.
+    cut = "data:image/png;base64," + base64.b64encode(base64.b64decode(url((64, 64)).partition(",")[2])[:60]).decode()
+    for broken in ("data:image/png;base64,A", "data:image/png;base64,AA==", cut):
+        with pytest.raises(DecisionRequestError, match = "could not be decoded"):
+            Reader(None).answer("s", question, images = [broken])
+
+
 @pytest.fixture
 def marker_checkpoint(tmp_path, monkeypatch):
     words = [f"w{i}" for i in range(80)] + 'choice score noul question : level 0 1 k yes no , the statement holds does not hold true false " { }'.split()
