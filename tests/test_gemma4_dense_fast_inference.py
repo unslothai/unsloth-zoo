@@ -232,3 +232,62 @@ def test_config_commit_hash_pins_the_snapshot_without_a_source(tmp_path, monkeyp
     assert torch.equal(
         model.model.audio_tower.proj.weight, snapshots["rev-b"][1]["model.audio_tower.proj.weight"]
     )
+
+
+def _quantized_audio_checkpoint(tmp_path, packed = True, siblings = True, shape = None):
+    torch.manual_seed(0)
+    ckpt = {
+        "model.audio_tower.norm.weight": torch.randn(4),
+        "model.audio_tower.norm.bias": torch.randn(4),
+        "model.embed_audio.embedding_projection.weight": torch.randn(6, 4),
+    }
+    if packed:
+        # bitsandbytes 4-bit: (out * in / 2, 1) uint8 plus its quant state
+        ckpt["model.audio_tower.proj.weight"] = torch.randint(0, 255, (8, 1), dtype = torch.uint8)
+    else:
+        ckpt["model.audio_tower.proj.weight"] = torch.randn(*(shape or (4, 4)))
+    if siblings:
+        ckpt["model.audio_tower.proj.weight.absmax"] = torch.rand(1)
+        ckpt["model.audio_tower.proj.weight.quant_map"] = torch.rand(16)
+        ckpt["model.audio_tower.proj.weight.quant_state.bitsandbytes__nf4"] = torch.zeros(8, dtype = torch.uint8)
+    path = str(tmp_path / "model.safetensors")
+    save_file(ckpt, path)
+    return {k: path for k in ckpt}
+
+
+def _assert_nothing_installed(model, before, loaded):
+    assert loaded == 0
+    assert model.model.audio_tower is None and model.model.embed_audio is None
+    assert torch.equal(model.model.language_model.weight, before)
+
+
+def test_bnb_packed_audio_tower_is_never_installed(tmp_path):
+    model = _Model()
+    before = model.model.language_model.weight.detach().clone()
+    # Keep references: the tower must not have been written before it was dropped.
+    audio = model.model.audio_tower
+    proj_before = audio.proj.weight.detach().clone()
+    loaded = _load_gemma4_audio_from_checkpoint(model, _gemma4(), weight_map = _quantized_audio_checkpoint(tmp_path))
+    _assert_nothing_installed(model, before, loaded)
+    assert audio.proj.weight.dtype == torch.float32 and torch.equal(audio.proj.weight, proj_before)
+
+
+def test_integer_audio_weight_without_quant_state_is_refused(tmp_path):
+    model = _Model()
+    before = model.model.language_model.weight.detach().clone()
+    weight_map = _quantized_audio_checkpoint(tmp_path, packed = True, siblings = False)
+    _assert_nothing_installed(model, before, _load_gemma4_audio_from_checkpoint(model, _gemma4(), weight_map = weight_map))
+
+
+def test_quant_state_siblings_alone_are_refused(tmp_path):
+    model = _Model()
+    before = model.model.language_model.weight.detach().clone()
+    weight_map = _quantized_audio_checkpoint(tmp_path, packed = False, siblings = True)
+    _assert_nothing_installed(model, before, _load_gemma4_audio_from_checkpoint(model, _gemma4(), weight_map = weight_map))
+
+
+def test_mismatched_audio_shape_is_refused(tmp_path):
+    model = _Model()
+    before = model.model.language_model.weight.detach().clone()
+    weight_map = _quantized_audio_checkpoint(tmp_path, packed = False, siblings = False, shape = (8, 2))
+    _assert_nothing_installed(model, before, _load_gemma4_audio_from_checkpoint(model, _gemma4(), weight_map = weight_map))

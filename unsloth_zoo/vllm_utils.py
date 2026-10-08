@@ -1631,6 +1631,52 @@ pass
 
 
 GEMMA4_AUDIO_PREFIXES = ("model.audio_tower.", "model.embed_audio.")
+# Quantization state saved beside a packed weight (bitsandbytes, fp8, GPTQ / AWQ).
+_QUANT_STATE_SUFFIXES = (
+    "absmax", "quant_map", "nested_absmax", "nested_quant_map", "SCB", "weight_format",
+    "weight_scale", "weight_scale_inv", "input_scale", "scales", "qweight", "qzeros", "g_idx",
+)
+_FLOAT_SAFETENSORS_DTYPES = ("F16", "BF16", "F32", "F64")
+
+
+def _drop_gemma4_audio(new_model, reason):
+    inner = getattr(new_model, "model", new_model)
+    for name in ("audio_tower", "embed_audio"):
+        if getattr(inner, name, None) is not None: setattr(inner, name, None)
+    logger.warning(
+        f"Unsloth: {reason}, so the Gemma-4 audio tower was dropped from the training model. "
+        "Audio inputs need fast_inference = False."
+    )
+    return 0
+pass
+
+
+def _gemma4_audio_quantized_reason(keys, weight_map, installable):
+    # A quantized tower would be cast from packed integer storage and lose its quant
+    # state, so any sign of quantization means nothing is installed.
+    for key in keys:
+        last = key.rsplit(".", 1)[-1]
+        if last in _QUANT_STATE_SUFFIXES or "quant_state" in key:
+            return f"the checkpoint stores the audio tower quantized ({key})"
+    from safetensors import safe_open
+    by_file = {}
+    for key in keys:
+        if key in installable: by_file.setdefault(weight_map[key], []).append(key)
+    for file, file_keys in by_file.items():
+        with safe_open(file, framework = "pt") as f:
+            for key in file_keys:
+                sl = f.get_slice(key)
+                dtype, shape = sl.get_dtype(), tuple(sl.get_shape())
+                if dtype not in _FLOAT_SAFETENSORS_DTYPES:
+                    return f"the checkpoint stores {key} as {dtype}, not a 16 / 32-bit float"
+                # Placeholder dims are 1-wide; every other dim must match the model.
+                expected = tuple(installable[key].shape)
+                if len(shape) != len(expected) or any(
+                    e != 1 and e != g for e, g in zip(expected, shape)
+                ):
+                    return f"the checkpoint shape {shape} of {key} does not match {expected}"
+    return None
+pass
 
 
 def _load_gemma4_audio_from_checkpoint(new_model, config, weight_map = None, checkpoint_source = None):
@@ -1653,17 +1699,15 @@ def _load_gemma4_audio_from_checkpoint(new_model, config, weight_map = None, che
             weight_map = None
     keys = [k for k in (weight_map or {}) if k.startswith(GEMMA4_AUDIO_PREFIXES)]
     if len(keys) == 0:
-        inner = getattr(new_model, "model", new_model)
-        for name in ("audio_tower", "embed_audio"):
-            if getattr(inner, name, None) is not None: setattr(inner, name, None)
-        logger.warning(
-            "Unsloth: could not read the Gemma-4 audio tower from the checkpoint, so it was "
-            "dropped from the training model. Audio inputs need fast_inference = False."
-        )
-        return 0
+        return _drop_gemma4_audio(new_model, "could not read the audio tower from the checkpoint")
     from safetensors import safe_open
     params = dict(new_model.named_parameters(remove_duplicate = False))
     buffers = dict(new_model.named_buffers(remove_duplicate = False))
+    installable = {k: params.get(k, buffers.get(k)) for k in keys}
+    installable = {k: v for k, v in installable.items() if v is not None}
+    reason = _gemma4_audio_quantized_reason(keys, weight_map, installable)
+    if reason is not None:
+        return _drop_gemma4_audio(new_model, reason)
     by_file = {}
     for key in keys: by_file.setdefault(weight_map[key], []).append(key)
     loaded = 0
