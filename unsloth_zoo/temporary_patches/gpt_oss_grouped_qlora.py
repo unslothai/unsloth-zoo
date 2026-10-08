@@ -57,7 +57,7 @@ def _gpt_oss():
     return _GPT_OSS
 
 
-def _base_params(proj):
+def _base_layer_params(proj):
     """_parameters of the frozen base (PEFT's base_layer, else proj): getattr through
     nn.Module.__getattr__ costs ~1 us per read, and these run per expert per call."""
     return proj._modules.get("base_layer", proj)._parameters
@@ -409,8 +409,8 @@ def grouped_qlora_forward(experts, hidden_states, router_indices, routing_weight
     state = _tables(experts, dtype)
     gu_projs, dn_projs = experts.gate_up_projs, experts.down_projs
     # Read live every call, so in-place bias edits are never stale.
-    gu_bias = torch.stack([_base_params(p)["bias"] for p in gu_projs]).detach()
-    dn_bias = torch.stack([_base_params(p)["bias"] for p in dn_projs]).detach()
+    gu_bias = torch.stack([_base_layer_params(p)["bias"] for p in gu_projs]).detach()
+    dn_bias = torch.stack([_base_layer_params(p)["bias"] for p in dn_projs]).detach()
     gu_tb = state["gate_up"] if state is not None else None
     dn_tb = state["down"] if state is not None else None
     gu_w = _StackProvider(gu_tb, dtype, lambda: _bnb_fallback_stack(gu_projs, dtype))
