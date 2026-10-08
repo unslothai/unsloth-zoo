@@ -249,6 +249,20 @@ def _data_swap_then_step(model, blk):
     _opt_step()
 
 
+def _nested_absmax_then_step(model, blk):
+    qs = blk.experts[MID].down_proj.base_layer.weight.quant_state
+    assert qs.nested
+    qs.state2.absmax = qs.state2.absmax * 2   # new storage and scales, no hook sees it
+    _opt_step()
+
+
+def _nested_offset_then_step(model, blk):
+    qs = blk.experts[MID].gate_proj.base_layer.weight.quant_state
+    assert qs.nested
+    qs.offset = qs.offset + 0.01
+    _opt_step()
+
+
 def _lora_dtype_mid(model, blk):
     blk.experts[MID].up_proj.lora_B.to(torch.float16)   # lora_A / lora_B dtypes now differ
 
@@ -277,6 +291,8 @@ CHANGES = {
     "requires_grad_mid": (_requires_grad_mid, False, {"base": "bf16"}),
     "params4bit_setattr": (_params4bit_setattr, True, {}),
     "data_swap_then_step": (_data_swap_then_step, True, {}),
+    "nested_absmax_then_step": (_nested_absmax_then_step, True, {}),
+    "nested_offset_then_step": (_nested_offset_then_step, True, {}),
     "lora_dtype_mid": (_lora_dtype_mid, False, {}),
     "dropout_mid_train": (_dropout_mid_train, False, {"lora_dropout": 0.1}),
     "hf_hook": (_hf_hook_all, True, {}),
@@ -440,7 +456,7 @@ def _go_forward(ex, x, idx, w):
         return ex(x, idx, w)
 
 
-@pytest.mark.parametrize("change", ["data_swap_then_step", "params4bit_setattr", "disable", "bias_grad_then_step",
+@pytest.mark.parametrize("change", ["data_swap_then_step", "nested_absmax_then_step", "params4bit_setattr", "disable", "bias_grad_then_step",
                                     "set_adapter", "first_direct", "hf_hook"])
 def test_gpt_oss_invalidation(change):
     """After each change the fast verdict and forward equal the switch-off ones (bitwise)."""
@@ -465,6 +481,11 @@ def test_gpt_oss_invalidation(change):
     if change == "data_swap_then_step":
         new = _new_params4bit(base.weight, 5)
         base.weight.data, base.weight.quant_state = new.data, new.quant_state
+        _opt_step()
+    elif change == "nested_absmax_then_step":
+        qs = base.weight.quant_state
+        assert qs.nested
+        qs.state2.absmax = qs.state2.absmax * 2
         _opt_step()
     elif change == "params4bit_setattr":
         base.weight = _new_params4bit(base.weight, 6)

@@ -187,11 +187,22 @@ _get_requires_grad = attrgetter("requires_grad")
 _ptr = torch._C.TensorBase.data_ptr
 
 
+def _qs_ptrs(qs):
+    """Addresses the NF4 pointer tables embed: absmax, code and, when nested, state2 (absmax /
+    code) and the offset (a hook-less swap of any of them must re-key the tables)."""
+    key = (_ptr(qs.absmax), _ptr(qs.code))
+    if getattr(qs, "nested", False):
+        s2, off = qs.state2, qs.offset
+        key += (id(s2), _ptr(s2.absmax), _ptr(s2.code), _ptr(off) if isinstance(off, torch.Tensor) else off)
+    return key
+
+
 class Lean:
     """What a hook-less `.data =` / quant_state / absmax swap or requires_grad flip changes, over the
     base projections' `_parameters` dicts: weight and bias identity, weight address and
-    requires_grad, quant state identity and absmax address. Re-read in C-level maps (one optimizer
-    step bumps only the step stamp, so this runs once per block per step)."""
+    requires_grad, quant state identity and the addresses its tables embed (_qs_ptrs). Re-read in
+    C-level maps (one optimizer step bumps only the step stamp, so this runs once per block per
+    step)."""
     __slots__ = ("params", "ws", "wptrs", "rgs", "qss", "aptrs", "bs", "brgs")
 
     def __init__(self, params):
@@ -204,7 +215,7 @@ class Lean:
             qss = [w.__dict__.get("quant_state") for w in self.ws]
             # All 4-bit or none (the readiness checks decline mixes); else no quant state check.
             self.qss = qss if all(q is not None for q in qss) else None
-            self.aptrs = None if self.qss is None else list(map(_ptr, map(_get_absmax, qss)))
+            self.aptrs = None if self.qss is None else list(map(_qs_ptrs, qss))
 
     def same(self):
         try:
@@ -220,7 +231,7 @@ class Lean:
                         return False
                 if self.qss is not None:
                     qss = list(map(_get_quant_state, ws))
-                    if not all(map(is_, qss, self.qss)) or list(map(_ptr, map(_get_absmax, qss))) != self.aptrs:
+                    if not all(map(is_, qss, self.qss)) or list(map(_qs_ptrs, qss)) != self.aptrs:
                         return False
             return True
         except Exception:
