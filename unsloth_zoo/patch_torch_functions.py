@@ -62,10 +62,8 @@ def _layer_norm_eager(
             bias=bias,
             eps=eps,
         ).to(input.dtype)
-    # Unsloth keeps some LayerNorm weights (SigLIP vision towers) in float32 under bfloat16
-    # activations. CUDA torch.layer_norm rejects that mix, and this body runs eagerly whenever
-    # Dynamo does not compile (FX tracing, compile disabled, eager_on_recompile after inference
-    # forwards), so normalise in the wider of the two dtypes; nothing is ever downcast.
+    # SigLIP norms keep float32 weights under bfloat16 activations and this body runs eagerly when
+    # Dynamo does not compile; CUDA rejects mixed dtypes, so normalise in the wider dtype.
     if (
         weight is not None and input.is_floating_point() and weight.is_floating_point()
         and (bias is None or bias.is_floating_point())

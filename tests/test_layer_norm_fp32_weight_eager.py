@@ -14,14 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Unsloth keeps vision LayerNorm weights in float32 while activations stay bfloat16.
-
-The compiled ``F.layer_norm`` replacement handles that mix, but its eager body runs whenever
-Dynamo does not compile: FX tracing, ``UNSLOTH_COMPILE_DISABLE``, the recompile limit, or the
-``eager_on_recompile`` stance the compiled CausalLM forward sets after two inference forwards.
-CUDA ``torch.layer_norm`` rejects a bfloat16 input with float32 weights, so a training forward
-after two eval forwards crashed in the SigLIP encoder of Gemma 3.
-"""
+"""Eager layer_norm with float32 weights and bfloat16 activations (Gemma 3 SigLIP train-after-eval crash)."""
 
 import pytest
 import torch
@@ -61,7 +54,6 @@ def test_eager_layer_norm_fp32_input_bf16_weight_is_not_downcast():
     b = (0.1 * torch.randn(64, device = "cuda", generator = g)).to(torch.bfloat16)
     y = _layer_norm_eager(x, (64,), w, b, 1e-6)
     assert y.dtype == torch.float32
-    # Normalised in float32 with the bfloat16 weights upcast, not in bfloat16
     ref = torch.nn.functional.layer_norm(x, (64,), w.float(), b.float(), 1e-6)
     torch.testing.assert_close(y, ref, rtol = 0, atol = 1e-6)
 
@@ -74,7 +66,6 @@ def test_eager_layer_norm_wider_bias_is_not_downcast():
     b = (0.1 * torch.randn(64, device = "cuda", generator = g)).double()
     y = _layer_norm_eager(x, (64,), w, b, 1e-6)
     assert y.dtype == torch.float32
-    # Exactly the float64 computation: a float32 one (bias downcast) differs in the last bits
     ref = torch.nn.functional.layer_norm(x.double(), (64,), w.double(), b, 1e-6).float()
     assert torch.equal(y, ref)
 
@@ -85,12 +76,10 @@ def test_patched_layer_norm_train_after_eval_under_eager_on_recompile():
     from unsloth_zoo.patch_torch_functions import layer_norm
     torch._dynamo.reset()
     try:
-        # Eval forward compiles under no_grad, then the compiled CausalLM forward flips the stance
         x, w, b = _inputs(False)
         with torch.no_grad():
             layer_norm(x, (64,), w, b, 1e-6)
         torch.compiler.set_stance("eager_on_recompile")
-        # Training forward: grad mode guard fails, so the call recompiles, i.e. runs eagerly
         x, w, b = _inputs(True)
         y = layer_norm(x, (64,), w, b, 1e-6)
         assert y.dtype == torch.bfloat16
