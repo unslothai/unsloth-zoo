@@ -383,6 +383,44 @@ def test_move_releases_the_tables():
     _agree(blk, x, True)
 
 
+def test_child_move_releases_the_owner_tables():
+    """Moving one expert or one projection drops the tables held on the experts container."""
+    model, blk = _ml("nf4", True)
+    x = _x()
+    for move in (lambda: blk.experts[MID].cpu(), lambda: blk.experts[0].up_proj.base_layer.cpu()):
+        _warm(blk, x)
+        assert "_unsloth_nf4_stack_tables" in blk.experts.__dict__
+        move()
+        assert "_unsloth_nf4_stack_tables" not in blk.experts.__dict__
+        blk.cuda()
+        _agree(blk, x, True)
+
+
+def test_gpt_oss_child_move_releases_the_owner_tables():
+    S = _gpt_oss()
+    if not S.BF16_OK:
+        pytest.skip("bf16 grouped_mm unavailable")
+    os.environ["UNSLOTH_MOE_STACKED_LORA"] = "0"
+    model = S.build("bf16")
+    ex = S.experts_of(model)
+    T = 64
+    x = torch.randn(1, T, S.G.H, device = "cuda", dtype = S.G.DT)
+    idx, w = S.G._routing(T)
+    with _fast(True):
+        _go_forward(ex, x, idx, w)
+    if not ex.__dict__.get("_unsloth_routed_nf4"):
+        pytest.skip("NF4 routed tables not built here")
+    ex.down_projs[S.G.E // 2].cpu()
+    assert "_unsloth_routed_nf4" not in ex.__dict__
+
+
+def test_tracked_modules_still_pickle():
+    import pickle
+    model, blk = _ml("bf16", False)
+    _warm(blk, _x())
+    pickle.loads(pickle.dumps(blk.experts[MID]))
+
+
 def test_tables_hold_the_storages():
     """A hook-less swap leaves the old storage alive in the table (stale values, not freed memory)."""
     model, blk = _ml("nf4", True)

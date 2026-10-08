@@ -34,6 +34,7 @@ UNSLOTH_MOE_FAST_READY=0 (read per call) runs the full checks on every call.
 """
 import functools
 import os
+import weakref
 from operator import attrgetter, is_, itemgetter, methodcaller
 
 import torch
@@ -54,6 +55,9 @@ _PEFT_METHODS = (
 _WRAPPED = "_unsloth_moe_ready_wrapped"
 # Pointer-table caches whose held storages a move must release (rebuilt on the next call).
 _TABLES = ("_unsloth_nf4_stack_tables", "_unsloth_routed_nf4")
+# Tracked module -> weakref to the experts container that holds those caches (a move of one
+# expert or projection must release its ancestor's tables). Kept off the module so it pickles.
+_OWNER = weakref.WeakKeyDictionary()
 
 
 def bump(*args, **kwargs):
@@ -138,8 +142,11 @@ def install():
                 d = self.__dict__
                 if d.get(_TRACKED, False):
                     _EPOCH[0] += 1
-                    for name in _TABLES:
-                        d.pop(name, None)
+                    owner = _OWNER.get(self)
+                    owner = None if owner is None else owner()
+                    for t in (d,) if owner is None else (d, owner.__dict__):
+                        for name in _TABLES:
+                            t.pop(name, None)
                 return apply(self, *args, **kwargs)
             setattr(_apply, _WRAPPED, True)
             M._apply = _apply
@@ -167,10 +174,12 @@ def scan(root):
     drops = []
     dropout = torch.nn.modules.dropout._DropoutNd
     stack = [root]
+    ref = weakref.ref(root)
     while stack:
         m = stack.pop()
         d = m.__dict__
         d[_TRACKED] = True
+        _OWNER[m] = ref
         if "_hf_hook" in d:
             hooked = True
         if isinstance(m, dropout):
