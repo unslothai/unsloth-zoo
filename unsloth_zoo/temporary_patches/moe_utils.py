@@ -1214,7 +1214,8 @@ def _grouped_mm_survives_out_of_process(device):
     global _GROUPED_MM_SURVIVES
     if _GROUPED_MM_SURVIVES is not None: return _GROUPED_MM_SURVIVES
     _GROUPED_MM_SURVIVES = True
-    if getattr(torch.version, "hip", None) is None: return True
+    # AMD only: NVIDIA (CUDA) and Intel (XPU) builds never launch the child and keep the in-process probe as is.
+    if getattr(torch.version, "hip", None) is None or device.type != "cuda": return True
     # A Python kernel already replaces the native one in this process (Studio's gfx120X fallback): a child
     # without it would crash on the very kernel this process never calls.
     try:

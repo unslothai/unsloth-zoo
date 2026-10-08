@@ -51,11 +51,14 @@ def test_crash_probe_timeout_is_unsupported(monkeypatch, fake_rocm):
     assert moe_utils._grouped_mm_survives_out_of_process(fake_rocm) is False
 
 
-def test_crash_probe_skipped_off_rocm(monkeypatch):
+@pytest.mark.parametrize("device", [torch.device("cuda", 0), torch.device("xpu", 0)])
+def test_crash_probe_never_runs_on_nvidia_or_intel(monkeypatch, device):
+    def boom(*a, **k): raise AssertionError("child probe launched off AMD")
     monkeypatch.setattr(torch.version, "hip", None, raising = False)
     monkeypatch.setattr(moe_utils, "_GROUPED_MM_SURVIVES", None)
-    monkeypatch.setattr(moe_utils, "_GROUPED_MM_CRASH_PROBE", "raise SystemExit(1)")
-    assert moe_utils._grouped_mm_survives_out_of_process(torch.device("cuda", 0)) is True
+    monkeypatch.setattr(subprocess, "run", boom)
+    monkeypatch.setattr(torch._C, "_dispatch_dump", boom)
+    assert moe_utils._grouped_mm_survives_out_of_process(device) is True
 
 
 def test_python_kernel_override_skips_child(monkeypatch, fake_rocm):
