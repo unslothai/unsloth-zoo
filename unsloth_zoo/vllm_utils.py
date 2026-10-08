@@ -3966,6 +3966,9 @@ def load_vllm(
         pass
         # Save maximum requests length since llm.generate fails to partition inputs sometimes
         llm.approx_max_num_seqs = approx_max_num_seqs
+        if _merged_rollout_mode() != "0":
+            # Opt-in merged-weight rollouts: route the trainer's sentinel through a fold.
+            install_merged_rollout_engine_wrapper(llm)
         if _UNSLOTH_FLASHINFER_UNUSABLE:
             # This engine now depends on the block for its lazy run time imports.
             _UNSLOTH_FLASHINFER_BLOCK_OWNERS += 1
@@ -4594,6 +4597,389 @@ def _check_lora_is_servable(model, keys, source, peft_config):
 pass
 
 
+# Merged-weight GRPO rollouts (opt-in, UNSLOTH_VLLM_MERGED_ROLLOUT).
+#
+# With fast_inference=True every HF base weight is a row view of vLLM's own parameter
+# storage, and today each rollout hands vLLM the adapter as a fresh LoRARequest, so vLLM
+# runs punica shrink/expand on every targeted layer. In merged mode the trainer's rollout
+# instead folds W = P + s * B @ A into those shared views right before generate (one
+# rounding, from a pristine bf16 copy P of only the targeted weights) and restores
+# W.copy_(P) in a finally, so the base is bit-exact again before the training forward.
+# The naive `W += sBA; W -= sBA` (PEFT merge/unmerge) is NOT used: in bf16 it drifts.
+#
+#   UNSLOTH_VLLM_MERGED_ROLLOUT = 0     (default) today's punica path, unchanged.
+#   UNSLOTH_VLLM_MERGED_ROLLOUT = 1     merged when eligible; P on the GPU, else pinned CPU.
+#   UNSLOTH_VLLM_MERGED_ROLLOUT = auto  merged when eligible and P fits on the GPU.
+# Anything ineligible falls back to the punica path with a one-time message saying why.
+# Must be set before the model is loaded: load_vllm wraps the engine's generate / chat.
+
+_MERGED_ROLLOUT_ADAPTER = "default"
+_MERGED_ROLLOUT_LOGGED = set()
+_MERGED_ROLLOUT_NON_LANGUAGE = re.compile(
+    r"(?:^|\.)(?:vision_tower|vision_model|visual|vision|multi_modal_projector|mm_projector|"
+    r"embed_vision|audio_tower|audio_model|audio|embed_audio|speech_encoder)(?:\.|$)"
+)
+_MERGED_ROLLOUT_EMBEDDING_LEAVES = frozenset((
+    "embed_tokens", "lm_head", "wte", "wpe", "embed_in", "embed_out", "word_embeddings", "output",
+))
+
+
+def _merged_rollout_mode():
+    """'0' (off), '1' or 'auto', read from UNSLOTH_VLLM_MERGED_ROLLOUT."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    value = os.environ.get("UNSLOTH_VLLM_MERGED_ROLLOUT", "0").strip().lower()
+    if value in ("", "0", "false", "off", "no"): return "0"
+    if value == "auto": return "auto"
+    return "1"
+pass
+
+
+def _merged_rollout_log_once(message):
+    # All Unsloth Zoo code licensed under LGPLv3
+    if message in _MERGED_ROLLOUT_LOGGED: return
+    _MERGED_ROLLOUT_LOGGED.add(message)
+    print(message)
+pass
+
+
+class _MergedLoRARequest:
+    """Stand-in for a LoRARequest meaning "fold the adapter into the shared weights".
+
+    Deliberately not a vLLM LoRARequest: it carries no tensors, and only the engine
+    wrapper installed by load_vllm understands it. If it ever reached vLLM unwrapped,
+    vLLM would reject it loudly instead of silently sampling from the base weights.
+    """
+    __slots__ = ("state",)
+    _unsloth_merged = True
+
+    def __init__(self, state):
+        self.state = state
+    def __repr__(self):
+        return f"_MergedLoRARequest(targets = {len(self.state.entries)})"
+pass
+
+
+class _MergedRolloutState:
+    # All Unsloth Zoo code licensed under LGPLv3
+    __slots__ = ("entries", "adapters", "depth", "nbytes", "device")
+
+    def __init__(self, entries, adapters):
+        # entries: list of (lora module, W the shared base weight, P its pristine copy)
+        self.entries = entries
+        self.adapters = adapters
+        self.depth = 0
+        self.nbytes = sum(P.numel() * P.element_size() for _, _, P in entries)
+        self.device = entries[0][2].device if entries else None
+    pass
+
+    def is_valid_for(self, model):
+        if tuple(getattr(model, "peft_config", {}) or {}) != self.adapters: return False
+        for module, W, _ in self.entries:
+            if getattr(getattr(module, "base_layer", None), "weight", None) is not W: return False
+            lora_A = getattr(module, "lora_A", None)
+            if lora_A is None or tuple(lora_A.keys()) != (_MERGED_ROLLOUT_ADAPTER,): return False
+        return True
+    pass
+pass
+
+
+def _active_adapter_names(model):
+    # All Unsloth Zoo code licensed under LGPLv3
+    active = getattr(model, "active_adapters", None)
+    if callable(active):
+        try: active = active()
+        except Exception: active = None
+    if active is None: active = getattr(model, "active_adapter", None)
+    if isinstance(active, str): active = [active]
+    return list(active) if active is not None else None
+pass
+
+
+def _merged_rollout_targets(model):
+    """(targets, None) when the adapter can be folded, else (None, reason).
+
+    targets is a list of (module_name, lora module, W) where W is the base weight that
+    aliases vLLM's storage. Anything not provably a plain 16-bit dense Linear LoRA on the
+    language model, served from shared storage, is refused; the caller then keeps the
+    punica path, which handles every case below correctly today.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    if _is_bitsandbytes_quantized(model):
+        return None, "the base is bitsandbytes 4bit/8bit, so folding would need requantising"
+    quant_config = getattr(getattr(model, "config", None), "quantization_config", None)
+    if quant_config is not None:
+        return None, "the base model is quantized, so folding would need requantising"
+
+    peft_config = getattr(model, "peft_config", None)
+    if not isinstance(peft_config, dict) or len(peft_config) == 0:
+        return None, "there is no PEFT adapter"
+    if list(peft_config) != [_MERGED_ROLLOUT_ADAPTER]:
+        return None, f"more than one adapter is attached ({', '.join(map(str, peft_config))})"
+    config = peft_config[_MERGED_ROLLOUT_ADAPTER]
+    if getattr(config, "use_dora", False):
+        return None, "DoRA is not a plain low-rank delta"
+    if getattr(config, "lora_bias", False):
+        return None, "lora_bias adds a bias term"
+    if getattr(config, "fan_in_fan_out", False):
+        return None, "fan_in_fan_out stores transposed weights"
+    if getattr(config, "modules_to_save", None):
+        return None, "modules_to_save trains full copies that the punica path serves separately"
+    if getattr(config, "trainable_token_indices", None):
+        return None, "trainable_token_indices adapts the embeddings"
+    if getattr(config, "target_parameters", None):
+        return None, "target_parameters (MoE expert LoRA) is not folded yet"
+    active = _active_adapter_names(model)
+    if active is not None and active != [_MERGED_ROLLOUT_ADAPTER]:
+        return None, f"the active adapter is {active}, not ['{_MERGED_ROLLOUT_ADAPTER}']"
+
+    targets = []
+    for name, module in model.named_modules():
+        if getattr(module, "modules_to_save", None) is not None and len(module.modules_to_save) != 0:
+            return None, f"{name} is a modules_to_save copy"
+        for attr in ("lora_embedding_A", "lora_embedding_B"):
+            embedding = getattr(module, attr, None)
+            if embedding is not None and len(embedding) != 0:
+                return None, f"{name} has an embedding LoRA"
+        lora_A = getattr(module, "lora_A", None)
+        if not isinstance(lora_A, torch.nn.ModuleDict) or len(lora_A) == 0: continue
+
+        if _is_moe_expert_lora_key(name + ".lora_A.weight"):
+            return None, f"{name} is a MoE expert LoRA"
+        if _MERGED_ROLLOUT_NON_LANGUAGE.search(name):
+            return None, f"{name} is on the vision / audio tower or projector"
+        if name.rsplit(".", 1)[-1] in _MERGED_ROLLOUT_EMBEDDING_LEAVES:
+            return None, f"{name} is an embedding or lm_head (possibly tied)"
+        if tuple(lora_A.keys()) != (_MERGED_ROLLOUT_ADAPTER,):
+            return None, f"{name} holds adapters {list(lora_A.keys())}"
+        if len(getattr(module, "merged_adapters", None) or []) != 0:
+            return None, f"{name} already has a PEFT-merged adapter"
+        if getattr(module, "disable_adapters", False):
+            return None, f"{name} has its adapters disabled"
+        for attr, what in (("use_dora", "DoRA"), ("lora_bias", "lora_bias")):
+            flags = getattr(module, attr, None)
+            if isinstance(flags, dict) and flags.get(_MERGED_ROLLOUT_ADAPTER, False):
+                return None, f"{name} uses {what}"
+        if getattr(module, "fan_in_fan_out", False):
+            return None, f"{name} uses fan_in_fan_out"
+
+        lora_B = getattr(module, "lora_B", None)
+        A = lora_A[_MERGED_ROLLOUT_ADAPTER]
+        B = lora_B[_MERGED_ROLLOUT_ADAPTER] if isinstance(lora_B, torch.nn.ModuleDict) and \
+            _MERGED_ROLLOUT_ADAPTER in lora_B else None
+        if type(A) is not torch.nn.Linear or type(B) is not torch.nn.Linear or \
+            A.bias is not None or B.bias is not None:
+            return None, f"{name} is not a plain Linear LoRA"
+        scaling = getattr(module, "scaling", {}).get(_MERGED_ROLLOUT_ADAPTER, None)
+        if isinstance(scaling, bool) or not isinstance(scaling, (int, float)):
+            return None, f"{name} has a non-scalar LoRA scaling"
+
+        base_layer = getattr(module, "base_layer", None)
+        W = getattr(base_layer, "weight", None)
+        if not isinstance(base_layer, torch.nn.Linear) or W is None or \
+            type(W) not in (torch.Tensor, torch.nn.Parameter) or \
+            hasattr(W, "quant_state") or hasattr(base_layer, "weight_scale") or \
+            hasattr(base_layer, "quant_state"):
+            return None, f"{name} is not a plain dense Linear (quantized or custom)"
+        if W.dtype not in (torch.bfloat16, torch.float16):
+            return None, f"{name} base weight is {W.dtype}, not 16-bit"
+        if W.ndim != 2 or tuple(A.weight.shape) != (A.weight.shape[0], W.shape[1]) or \
+            tuple(B.weight.shape) != (W.shape[0], A.weight.shape[0]):
+            return None, f"{name} LoRA shapes do not match its base weight"
+        if W.requires_grad:
+            return None, f"{name} base weight is trainable"
+        targets.append((name, module, W))
+    pass
+    if len(targets) == 0:
+        return None, "there are no LoRA Linear layers"
+
+    # The fold must land in the exact storage vLLM reads, or vLLM samples the base.
+    vllm_model = _get_vllm_lora_model(model)
+    if vllm_model is None:
+        return None, "the vLLM model could not be inspected to confirm shared weights"
+    storages = set()
+    try:
+        for tensor in list(vllm_model.parameters()) + list(vllm_model.buffers()):
+            storages.add(tensor.untyped_storage().data_ptr())
+    except Exception:
+        return None, "the vLLM model weights could not be enumerated"
+    for name, module, W in targets:
+        if W.untyped_storage().data_ptr() not in storages:
+            return None, f"{name} does not share storage with the vLLM engine"
+    return targets, None
+pass
+
+
+def merged_rollout_ineligible_reason(model):
+    """Why this model's adapter cannot be folded for rollouts, or None when it can."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    return _merged_rollout_targets(model)[1]
+pass
+
+
+def _build_pristine_copies(targets, mode):
+    """P per target: on W's device, else (mode '1' only) pinned CPU. None when auto cannot fit."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    copies = []
+    try:
+        with torch.no_grad():
+            for name, module, W in targets: copies.append(W.detach().clone())
+        return copies, None
+    except torch.cuda.OutOfMemoryError:
+        del copies
+        _device_empty_cache()
+        if mode == "auto":
+            return None, "the pristine copy of the targeted weights does not fit on the GPU"
+    pin = torch.cuda.is_available()
+    with torch.no_grad():
+        copies = [
+            torch.empty(W.shape, dtype = W.dtype, device = "cpu", pin_memory = pin).copy_(W)
+            for name, module, W in targets
+        ]
+    return copies, None
+pass
+
+
+def prepare_merged_rollout(model, mode = None):
+    """Build (once) and return the fold state, or None after logging why it falls back."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if mode is None: mode = _merged_rollout_mode()
+    if mode == "0": return None
+    state = getattr(model, "_unsloth_merged_rollout_state", None)
+    if state is not None:
+        if state.depth != 0 or state.is_valid_for(model): return state
+        # Adapter set changed: drop the old copies before checking again.
+        model._unsloth_merged_rollout_state = None
+        del state
+    pass
+
+    reason = None
+    if not getattr(getattr(model, "vllm_engine", None), "_unsloth_merged_rollout_wrapped", False):
+        reason = "the vLLM engine was not wrapped (set UNSLOTH_VLLM_MERGED_ROLLOUT before loading the model)"
+    targets = None
+    if reason is None: targets, reason = _merged_rollout_targets(model)
+    copies = None
+    if reason is None: copies, reason = _build_pristine_copies(targets, mode)
+    if reason is not None:
+        _merged_rollout_log_once(
+            f"Unsloth: UNSLOTH_VLLM_MERGED_ROLLOUT is on but falling back to vLLM LoRA (punica) because {reason}."
+        )
+        return None
+    entries = [(module, W, P) for (name, module, W), P in zip(targets, copies)]
+    state = _MergedRolloutState(entries, tuple(model.peft_config))
+    model._unsloth_merged_rollout_state = state
+    _merged_rollout_log_once(
+        f"Unsloth: Merged-weight rollouts on: folding the adapter into {len(entries)} shared weights; "
+        f"pristine copy is {state.nbytes / 1024**3:.2f} GB on {state.device}."
+    )
+    return state
+pass
+
+
+@contextlib.contextmanager
+def merged_rollout(state):
+    """Fold W = P + s * B @ A into every shared weight, then restore W = P bit-exactly."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if state.depth != 0:
+        # Already folded by an outer call (chat -> generate): only the outermost restores.
+        state.depth += 1
+        try: yield
+        finally: state.depth -= 1
+        return
+    pass
+    state.depth = 1
+    adapter = _MERGED_ROLLOUT_ADAPTER
+    try:
+        with torch.inference_mode():
+            for module, W, P in state.entries:
+                A = module.lora_A[adapter].weight.to(W.dtype)
+                B = module.lora_B[adapter].weight.to(W.dtype)
+                scaling = module.scaling[adapter]
+                if P.device == W.device:
+                    torch.addmm(P, B, A, alpha = scaling, out = W)
+                else:
+                    W.copy_(P, non_blocking = True)
+                    W.addmm_(B, A, alpha = scaling)
+            pass
+        pass
+        yield
+    finally:
+        with torch.inference_mode():
+            for module, W, P in state.entries:
+                W.copy_(P, non_blocking = P.is_pinned())
+        state.depth = 0
+    pass
+pass
+
+
+def _is_merged_lora_request(value):
+    # All Unsloth Zoo code licensed under LGPLv3
+    return isinstance(value, _MergedLoRARequest)
+pass
+
+
+def _reset_merged_rollout_prefix_cache(llm):
+    """Drop vLLM's prefix cache around a merged rollout.
+
+    The merged generate runs with lora_request = None, so its KV blocks are hashed as
+    base-model blocks even though they were computed from folded weights that change every
+    step. Without a reset, the next step (or a plain fast_generate after restore) would
+    reuse stale KV for any shared prefix such as the system prompt. Today's path is immune
+    because every step uses a fresh LoRA id, which is part of the block hash.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    reset = getattr(llm, "reset_prefix_cache", None)
+    if reset is None: return
+    if reset() is False:
+        _merged_rollout_log_once(
+            "Unsloth: vLLM refused to reset its prefix cache around a merged rollout; "
+            "cached prefixes may come from older weights."
+        )
+pass
+
+
+def _wrap_merged_rollout_call(bound, llm = None):
+    # All Unsloth Zoo code licensed under LGPLv3
+    @functools.wraps(bound)
+    def unsloth_merged_rollout_call(*args, **kwargs):
+        state = None
+        if _is_merged_lora_request(kwargs.get("lora_request", None)):
+            state = kwargs["lora_request"].state
+            kwargs["lora_request"] = None
+        elif any(_is_merged_lora_request(x) for x in args):
+            args = list(args)
+            for i, x in enumerate(args):
+                if _is_merged_lora_request(x):
+                    state = x.state
+                    args[i] = None
+            args = tuple(args)
+        if state is None: return bound(*args, **kwargs)
+        outermost = state.depth == 0
+        try:
+            with merged_rollout(state):
+                if outermost: _reset_merged_rollout_prefix_cache(llm)
+                return bound(*args, **kwargs)
+        finally:
+            if outermost: _reset_merged_rollout_prefix_cache(llm)
+    pass
+    unsloth_merged_rollout_call._unsloth_merged_rollout_wrapper = True
+    return unsloth_merged_rollout_call
+pass
+
+
+def install_merged_rollout_engine_wrapper(llm):
+    """Wrap llm.generate / llm.chat once so a merged sentinel becomes lora_request = None
+    inside a fold/restore. Every other request passes through untouched."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if llm is None or getattr(llm, "_unsloth_merged_rollout_wrapped", False): return llm
+    for name in ("generate", "chat"):
+        bound = getattr(llm, name, None)
+        if bound is None: continue
+        setattr(llm, name, _wrap_merged_rollout_call(bound, llm))
+    llm._unsloth_merged_rollout_wrapped = True
+    return llm
+pass
+
+
 @torch.inference_mode
 def load_lora(model, save_directory, load_tensors = False, lora_request_id = None):
     # vllm_lora_already_loaded(model)
@@ -4613,6 +4999,12 @@ def load_lora(model, save_directory, load_tensors = False, lora_request_id = Non
 
     if lora_request_id is None:
         lora_request_id = LORA_REQUEST_ID
+
+    if load_tensors and _merged_rollout_mode() != "0":
+        # Merged-weight rollout: fold into the shared weights instead of shipping tensors.
+        state = prepare_merged_rollout(model)
+        if state is not None: return _MergedLoRARequest(state)
+    pass
 
     # Check if path exists
     if not os.path.exists(save_directory) or lora_request_id == 1:
