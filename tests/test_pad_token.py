@@ -232,7 +232,7 @@ def test_encoder_decoder_declaring_pad_equal_eos_is_kept(is_encoder_decoder):
     assert tok.get_vocab() == {"<|endoftext|>": 50257}
 
 
-@pytest.mark.parametrize("pad_token", [None, "<|big|>"])
+@pytest.mark.parametrize("pad_token", [None, "<|big|>", "<|endoftext|>"])
 def test_encoder_decoder_pad_eos_exemption_needs_the_declared_alias(pad_token):
     # A missing or out-of-range pad is still repaired (and raises here), not exempted.
     tok = FakeTokenizer({"<|endoftext|>": 50257, "<|big|>": 60000}, pad_token=pad_token, eos_token="<|endoftext|>", added=["<|endoftext|>"])
@@ -242,6 +242,8 @@ def test_encoder_decoder_pad_eos_exemption_needs_the_declared_alias(pad_token):
         (),
         {"is_encoder_decoder": True, "vocab_size": 51865, "pad_token_id": 50257, "eos_token_id": 50257},
     )()
+    if pad_token == "<|endoftext|>":
+        cfg.vocab_size = 50000  # the shared pad/eos id is past the embeddings
     with pytest.raises(RuntimeError):
         fix_pad_token(tok, model_config=cfg)
 
