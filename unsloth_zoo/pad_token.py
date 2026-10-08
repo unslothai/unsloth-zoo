@@ -225,6 +225,14 @@ def _config_declared_pad(inner, cfg, eos_token, eos_token_ids, vocab_size):
     return candidate
 
 
+def _encoder_decoder_pads_with_eos(cfg, eos_token_ids):
+    """True when an encoder-decoder config itself declares pad_token_id as an EOS id."""
+    if cfg is None or not getattr(cfg, "is_encoder_decoder", False):
+        return False
+    pad_token_id = getattr(cfg, "pad_token_id", None)
+    return type(pad_token_id) is int and pad_token_id in eos_token_ids
+
+
 def _single_token_id(inner, token, vocab_size, eos_token_ids=frozenset()):
     """Return token's id if it encodes to exactly one in-vocab, non-EOS id, else None."""
     try:
@@ -361,6 +369,12 @@ def fix_pad_token(
                 f"Using model config pad_token_id = {pad_token_id} ({config_pad!r})."
             )
             return result
+
+    if new_pad is None and _encoder_decoder_pads_with_eos(cfg, eos_token_ids):
+        # Whisper (all but large-v3) declares pad == eos itself; adding a token would only
+        # raise below. Seq2seq collators mask labels by attention mask, so keep it as is.
+        result["reason"] = None
+        return result
 
     added = False
     if new_pad is None:
