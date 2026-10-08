@@ -4052,7 +4052,9 @@ def _check_lora_rank_fits(model, save_directory):
     """
     # All Unsloth Zoo code licensed under LGPLv3
     try:
-        r = _peft_max_rank(get_peft_config(save_directory))
+        # Only `r`, exactly what vLLM's PEFTHelper.validate_legal checks: a rank_pattern entry may
+        # match no saved tensor, so refusing on it could reject an adapter vLLM serves.
+        r = get_peft_config(save_directory).get("r", None)
         engine = model.vllm_engine.llm_engine
         lora_config = getattr(getattr(engine, "vllm_config", None), "lora_config", None) \
             or getattr(engine, "lora_config", None)
