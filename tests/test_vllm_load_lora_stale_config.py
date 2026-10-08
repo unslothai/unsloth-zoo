@@ -38,7 +38,7 @@ def load_lora(monkeypatch):
     monkeypatch.setattr(vu, "_remap_moe_expert_lora_keys", lambda model, sd: sd)
     monkeypatch.setattr(vu, "_check_lora_is_servable", lambda *a, **k: None)
     monkeypatch.setattr(vu, "_saved_adapter_lora_keys", lambda d: [])
-    monkeypatch.setattr(vu, "_LIVE_LORA_CONFIGS", {})
+    monkeypatch.setattr(vu, "_LIVE_LORA_CONFIGS", {}, raising = False)
     # Not the first request of the process: an earlier generate already loaded a LoRA.
     monkeypatch.setattr(vu, "LORA_REQUEST_ID", 5, raising = False)
     return vu.load_lora
