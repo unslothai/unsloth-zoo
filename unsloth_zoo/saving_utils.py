@@ -3349,7 +3349,12 @@ def _remove_quantization_config(config_path: Path):
     def _strip_quantization_config(obj):
         removed = False
         if isinstance(obj, dict):
-            if "quantization_config" in obj:
+            # BitNet online mode ternarizes the bf16 master weights at runtime; without this config
+            # the merge reloads as a dense model and outputs garbage (unsloth#2390).
+            qc = obj.get("quantization_config")
+            bitnet_online = isinstance(qc, dict) and qc.get("quant_method") == "bitnet" \
+                and qc.get("quantization_mode") == "online"
+            if "quantization_config" in obj and not bitnet_online:
                 del obj["quantization_config"]
                 removed = True
             for value in obj.values():
