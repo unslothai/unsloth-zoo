@@ -111,6 +111,8 @@ def test_inference_mode_mask_kept_apart(builds):
     attn.training = True
     _run([attn])  # must not reuse an inference tensor mask for backward
     assert len(builds) == 2
+    utils, _ = _mods()
+    assert [k[6] for k in utils._BLOCK_MASK_CACHE] == [False]   # the inference-mode mask was freed
 
 
 def test_cache_keeps_only_the_current_shape(builds):

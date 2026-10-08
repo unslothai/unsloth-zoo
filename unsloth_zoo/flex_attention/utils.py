@@ -127,8 +127,8 @@ try:
         block_mask = _BLOCK_MASK_CACHE.get(key)
         if block_mask is None:
             # Masks grow ~quadratically with length: keep only the current shape's masks (one per
-            # mask_mod, all layers of one forward share it), freed before building the new one.
-            for k in [k for k in _BLOCK_MASK_CACHE if k[1:6] != key[1:6]]:
+            # mask_mod in the current inference mode, shared by all layers of one forward), freed first.
+            for k in [k for k in _BLOCK_MASK_CACHE if k[1:] != key[1:]]:
                 del _BLOCK_MASK_CACHE[k]
             if len(_BLOCK_MASK_CACHE) >= _BLOCK_MASK_CACHE_SIZE:
                 _BLOCK_MASK_CACHE.pop(next(iter(_BLOCK_MASK_CACHE)))
