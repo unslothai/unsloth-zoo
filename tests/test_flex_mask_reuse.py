@@ -102,6 +102,9 @@ def test_new_shape_builds_new_mask(builds):
     assert [c[2] for c in builds] == [256, 384, 256]
 
 
+# ROCm: the compiled create_block_mask fails under inference_mode with inductor memory planning
+# ("_alloc_from_pool ... may not alias any inputs"), with or without mask reuse.
+@pytest.mark.skipif(torch.version.hip is not None, reason = "compiled create_block_mask under inference_mode fails on ROCm")
 def test_inference_mode_mask_kept_apart(builds):
     _, sink = _mods()
     attn = _attn(128, training = False)
