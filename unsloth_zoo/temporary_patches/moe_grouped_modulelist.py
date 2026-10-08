@@ -36,6 +36,7 @@ UNSLOTH_MOE_STACKED_LORA=0 keeps PEFT's per-expert LoRA Parameters (see _Stacked
 optimizer state saved before stacking does not load into a stacked model).
 """
 from __future__ import annotations
+import collections
 import os
 import types
 import torch
@@ -107,6 +108,23 @@ try:
     from .moe_utils import _triton_grouped_mm, _triton_grouped_mm_wanted
 except Exception:
     _triton_grouped_mm = _triton_grouped_mm_wanted = None
+
+# Hot-path helpers are read as module attributes (one lookup per call, no import machinery);
+# monkeypatching moe_utils / gpt_oss_grouped_qlora still reaches them.
+try:
+    from . import moe_utils as _moe_utils
+except Exception:
+    _moe_utils = None
+# gpt_oss_grouped_qlora imports this module at its top: resolved on first use.
+_GOQ = None
+
+
+def _goq():
+    global _GOQ
+    if _GOQ is None:
+        from . import gpt_oss_grouped_qlora
+        _GOQ = gpt_oss_grouped_qlora
+    return _GOQ
 
 
 def _view_weight_ok(w):
@@ -256,26 +274,23 @@ def _nf4_stack(experts, kind, projs, dtype):
     if not isinstance(w0, Params4bit) or getattr(w0, "device", None) is None or w0.device.type != "cuda":
         return None
     try:
-        from .gpt_oss_grouped_qlora import nf4_dequant_expert_stack, stacked_dequant_available
+        goq = _goq()
     except Exception:
         return None
-    if not stacked_dequant_available(w0.device):
+    if not goq.stacked_dequant_available(w0.device):
         return None
     tb = _nf4_table(experts, kind, projs)
     # One rounding on both sides: a quant state in `dtype`, or fp32 rounded once to `dtype`.
     if tb is None or tb["dtype"] not in (dtype, torch.float32):
         return None
-    return nf4_dequant_expert_stack(tb, dtype)
+    return goq.nf4_dequant_expert_stack(tb, dtype)
 
 
-def _nf4_build_gate_up_stack(experts, spec, dtype):
+def _nf4_build_gate_up_stack(experts, spec, dtype, projs = None):
     """_build_gate_up_stack from the pointer-table kernel, or None. The table interleaves
     [g0, u0, g1, u1, ...], so the [2E, inter, hidden] output is [E, 2*inter, hidden] =
     per expert cat(gate, up, dim=0), returned as its transposed view (no copy)."""
-    g_name, u_name = spec[0], spec[1]
-    projs = []
-    for ex in experts:
-        projs += (getattr(ex, g_name), getattr(ex, u_name))
+    projs = (_expert_projs(experts, spec) if projs is None else projs).gate_up
     w = _nf4_stack(experts, "gate_up", projs, dtype)
     if w is None:
         return None
@@ -283,16 +298,17 @@ def _nf4_build_gate_up_stack(experts, spec, dtype):
     return w.view(E, 2 * N, K).transpose(1, 2)
 
 
-def _nf4_build_down_stack(experts, spec, dtype):
+def _nf4_build_down_stack(experts, spec, dtype, projs = None):
     """_build_down_stack from the pointer-table kernel (transposed view), or None."""
-    w = _nf4_stack(experts, "down", [getattr(ex, spec[2]) for ex in experts], dtype)
+    w = _nf4_stack(experts, "down", (_expert_projs(experts, spec) if projs is None else projs).down, dtype)
     return None if w is None else w.transpose(1, 2)
 
 
-def _build_gate_up_stack(experts, spec, dtype):
+def _build_gate_up_stack(experts, spec, dtype, projs = None):
     """[E, hidden, 2*inter]: per expert cat(gate^T, up^T), a transposed view of the contiguous
-    [E, 2*inter, hidden] stack (the GEMMs take the view, backward its contiguous transpose)."""
-    w = _nf4_build_gate_up_stack(experts, spec, dtype)
+    [E, 2*inter, hidden] stack (the GEMMs take the view, backward its contiguous transpose).
+    `projs` is the block's _ExpertProjs (read from `experts` when omitted)."""
+    w = _nf4_build_gate_up_stack(experts, spec, dtype, projs)
     # Not counted while tracing: this can run inside _GroupedFrozenMM, where Dynamo cannot
     # replay a global-dict update (fullgraph fails), and traced code never takes the NF4 kernel.
     counting = not torch.compiler.is_compiling()
@@ -302,12 +318,12 @@ def _build_gate_up_stack(experts, spec, dtype):
         return w
     if counting:
         _NF4_STACK_CALLS["fallback"] += 1
-    return _bnb_build_gate_up_stack(experts, spec, dtype)
+    return _bnb_build_gate_up_stack(experts, spec, dtype, projs)
 
 
-def _build_down_stack(experts, spec, dtype):
+def _build_down_stack(experts, spec, dtype, projs = None):
     """[E, inter, hidden]: per expert down^T, a transposed view of the contiguous [E, hidden, inter] stack."""
-    w = _nf4_build_down_stack(experts, spec, dtype)
+    w = _nf4_build_down_stack(experts, spec, dtype, projs)
     # Not counted while tracing: this can run inside _GroupedFrozenMM, where Dynamo cannot
     # replay a global-dict update (fullgraph fails), and traced code never takes the NF4 kernel.
     counting = not torch.compiler.is_compiling()
@@ -317,24 +333,60 @@ def _build_down_stack(experts, spec, dtype):
         return w
     if counting:
         _NF4_STACK_CALLS["fallback"] += 1
-    return _bnb_build_down_stack(experts, spec, dtype)
+    return _bnb_build_down_stack(experts, spec, dtype, projs)
 
 
-def _bnb_build_gate_up_stack(experts, spec, dtype):
+def _bnb_build_gate_up_stack(experts, spec, dtype, projs = None):
     """[E, hidden, 2*inter]: per expert cat(gate^T, up^T), as a transposed view."""
-    g_name, u_name = spec[0], spec[1]
+    if projs is None:
+        projs = _expert_projs(experts, spec)
     rows = []
-    for ex in experts:
-        g = _expert_weight(getattr(ex, g_name), dtype)
-        u = _expert_weight(getattr(ex, u_name), dtype)
-        rows.append(torch.cat((g, u), dim=0))
+    for g, u in zip(projs.gate, projs.up):
+        rows.append(torch.cat((_expert_weight(g, dtype), _expert_weight(u, dtype)), dim=0))
     return torch.stack(rows, 0).transpose(1, 2)
 
 
-def _bnb_build_down_stack(experts, spec, dtype):
+def _bnb_build_down_stack(experts, spec, dtype, projs = None):
     """[E, inter, hidden]: per expert down^T, as a transposed view."""
-    d_name = spec[2]
-    return torch.stack([_expert_weight(getattr(ex, d_name), dtype) for ex in experts], 0).transpose(1, 2)
+    if projs is None:
+        projs = _expert_projs(experts, spec)
+    return torch.stack([_expert_weight(d, dtype) for d in projs.down], 0).transpose(1, 2)
+
+
+# The gate / up / down projection of every expert, plus the [g0, u0, g1, u1, ...] list the
+# gate_up pointer table reads. Built once per readiness verdict (_block_projs), not per call.
+_ExpertProjs = collections.namedtuple("_ExpertProjs", ("gate", "up", "down", "gate_up"))
+
+
+def _expert_projs(experts, spec):
+    gate = [getattr(ex, spec[0]) for ex in experts]
+    up = [getattr(ex, spec[1]) for ex in experts]
+    down = [getattr(ex, spec[2]) for ex in experts]
+    gate_up = []
+    for g, u in zip(gate, up):
+        gate_up += (g, u)
+    return _ExpertProjs(gate, up, down, gate_up)
+
+
+def _block_projs(block, experts, spec):
+    """_ExpertProjs of `block`, reused while the block's readiness cache entry (_moe_ready) is the
+    same object: _cached_state replaces it whenever any expert projection's identity changes, so
+    the lists cannot go stale. Rebuilt every call when there is no entry (uncached readiness)."""
+    ready = block.__dict__.get("_moe_ready")
+    if ready is None:
+        return _expert_projs(experts, spec)
+    hit = block.__dict__.get("_moe_projs")
+    if hit is not None and hit[0] is ready and hit[1] is experts and hit[2] == len(experts):
+        projs = hit[3]
+        # O(1) spot check of the end experts, in case a readiness cache keeps its entry across a swap.
+        first, last = experts[0]._modules, experts[-1]._modules
+        if first.get(spec[0]) is projs.gate[0] and first.get(spec[1]) is projs.up[0] \
+                and first.get(spec[2]) is projs.down[0] and last.get(spec[0]) is projs.gate[-1] \
+                and last.get(spec[1]) is projs.up[-1] and last.get(spec[2]) is projs.down[-1]:
+            return projs
+    projs = _expert_projs(experts, spec)
+    block.__dict__["_moe_projs"] = (ready, experts, len(experts), projs)
+    return projs
 
 
 class _GroupedFrozenMM(torch.autograd.Function):
@@ -434,7 +486,6 @@ def _projs_lora(projs):
 def _lora_operands(projs, name, dtype):
     """[E, in, R'] and [E, R', out] in `dtype`, rank zero-padded by moe_utils'
     _pad_lora_rank_for_grouped_mm (torch._grouped_mm rejects ranks 4 / 6 in bf16)."""
-    from unsloth_zoo.temporary_patches.moe_utils import _pad_lora_rank_for_grouped_mm
     stacks = _lora_stacks(projs, name)
     if stacks is not None:
         A, B = stacks
@@ -443,16 +494,47 @@ def _lora_operands(projs, name, dtype):
         B = torch.stack([p.lora_B[name].weight for p in projs])   # [E, out, r]
     A = A.to(dtype).transpose(1, 2)                           # [E, in, r]
     B = B.to(dtype).transpose(1, 2)                           # [E, r, out]
-    A, B = _pad_lora_rank_for_grouped_mm(A, B)
+    A, B = _moe_utils._pad_lora_rank_for_grouped_mm(A, B)
     return A.contiguous(), B.contiguous()
 
 
+def _lora_stack_pair(projs, name):
+    """(A [E, r, in], B [E, out, r]): the stacked Parameters, else a per-call torch.stack."""
+    stacks = _lora_stacks(projs, name)
+    if stacks is not None:
+        return stacks
+    return (torch.stack([p.lora_A[name].weight for p in projs]),
+            torch.stack([p.lora_B[name].weight for p in projs]))
+
+
+def _fused_gate_up_lora(lora_g, lora_u):
+    """True when UNSLOTH_MOE_FUSED_GATE_UP_LORA=1 and gate / up share rank and scaling."""
+    if os.environ.get("UNSLOTH_MOE_FUSED_GATE_UP_LORA", "0") != "1":
+        return False
+    return lora_g is not None and lora_u is not None and lora_g[1] == lora_u[1] and lora_g[2] == lora_u[2]
+
+
+def _lora_delta_gate_up(x, offsets, projs, lora_g, lora_u, dtype):
+    """Gate and up LoRA deltas as one [T, 2*inter] tensor laid out as gate_up: one grouped GEMM
+    over A = cat(A_gate, A_up) [E, in, 2r] and one over the block-diagonal B [E, 2r, 2*inter]
+    (zero off-diagonal blocks contribute exact zeros), instead of four GEMMs and two adds."""
+    gmm = _moe_utils._grouped_mm_with_backward_fix
+    Ag, Bg = _lora_stack_pair(projs.gate, lora_g[0])
+    Au, Bu = _lora_stack_pair(projs.up, lora_u[0])
+    r = Ag.shape[1]
+    A = torch.cat((Ag.to(dtype), Au.to(dtype)), 1).transpose(1, 2)                   # [E, in, 2r]
+    B = torch.cat((F.pad(Bg.to(dtype), (0, r)), F.pad(Bu.to(dtype), (r, 0))), 1)    # [E, 2*inter, 2r]
+    A, B = _moe_utils._pad_lora_rank_for_grouped_mm(A, B.transpose(1, 2))
+    h = gmm(x, A.contiguous(), offsets)
+    return gmm(h, B.contiguous(), offsets) * lora_g[1]
+
+
 def _lora_delta(x, offsets, projs, lora, dtype):
-    from unsloth_zoo.temporary_patches.moe_utils import _grouped_mm_with_backward_fix
+    gmm = _moe_utils._grouped_mm_with_backward_fix
     name, scaling, _ = lora
     A, B = _lora_operands(projs, name, dtype)
-    h = _grouped_mm_with_backward_fix(x, A, offsets)
-    return _grouped_mm_with_backward_fix(h, B, offsets) * scaling
+    h = gmm(x, A, offsets)
+    return gmm(h, B, offsets) * scaling
 
 
 # Stacked expert LoRA. PEFT gives every expert its own lora_A / lora_B Parameter (36,864 tensors on
@@ -793,9 +875,8 @@ def grouped_moe_forward(self, hidden_states: torch.Tensor):
     flat_e = sel.reshape(-1)
     flat_w = rw.reshape(-1)
     tok_of_pair = torch.arange(T, device=dev).repeat_interleave(top_k)
-    from .moe_utils import count_tokens_per_expert
     # int64 matches what bincount returned, so cumsum is unchanged.
-    counts = count_tokens_per_expert(flat_e, num_experts, torch.int64)
+    counts = _moe_utils.count_tokens_per_expert(flat_e, num_experts, torch.int64)
     order = torch.argsort(flat_e, stable=True)
     sorted_tok = tok_of_pair[order]
     sorted_w = flat_w[order]
@@ -805,30 +886,36 @@ def grouped_moe_forward(self, hidden_states: torch.Tensor):
     recompute = getattr(self, "_moe_recompute", False)
     cache = getattr(self, "_moe_cache", False)
     act = getattr(experts[0], "act_fn", None) or F.silu
+    # Traced code reads the experts live (Dynamo guards on them); eager reuses the cached lists.
+    projs = _expert_projs(experts, spec) if torch.compiler.is_compiling() else _block_projs(self, experts, spec)
 
     if cache:
         cu = getattr(self, "_cached_gate_up", None)
         if cu is None or cu.device != dev or cu.dtype != dtype:
             with torch.no_grad():
                 # Resident stacks: one contiguous copy at build time.
-                self._cached_gate_up = _build_gate_up_stack(experts, spec, dtype).contiguous()
-                self._cached_down = _build_down_stack(experts, spec, dtype).contiguous()
+                self._cached_gate_up = _build_gate_up_stack(experts, spec, dtype, projs).contiguous()
+                self._cached_down = _build_down_stack(experts, spec, dtype, projs).contiguous()
         gate_up = _grouped_mm_fix(permuted, self._cached_gate_up, offsets)
     else:
-        gate_up = _grouped_expert_gemm(permuted, offsets, lambda: _build_gate_up_stack(experts, spec, dtype), recompute)
-    gate, up = gate_up.chunk(2, dim=-1)
+        gate_up = _grouped_expert_gemm(permuted, offsets, lambda: _build_gate_up_stack(experts, spec, dtype, projs), recompute)
     # Expert LoRA: each wrapped projection adds its grouped delta to its base output, as the loop does.
-    if lora["gate"] is not None:
-        gate = gate + _lora_delta(permuted, offsets, [getattr(ex, spec[0]) for ex in experts], lora["gate"], dtype)
-    if lora["up"] is not None:
-        up = up + _lora_delta(permuted, offsets, [getattr(ex, spec[1]) for ex in experts], lora["up"], dtype)
+    if _fused_gate_up_lora(lora["gate"], lora["up"]):
+        gate_up = gate_up + _lora_delta_gate_up(permuted, offsets, projs, lora["gate"], lora["up"], dtype)
+        gate, up = gate_up.chunk(2, dim=-1)
+    else:
+        gate, up = gate_up.chunk(2, dim=-1)
+        if lora["gate"] is not None:
+            gate = gate + _lora_delta(permuted, offsets, projs.gate, lora["gate"], dtype)
+        if lora["up"] is not None:
+            up = up + _lora_delta(permuted, offsets, projs.up, lora["up"], dtype)
     inter = act(gate) * up
     if cache:
         down = _grouped_mm_fix(inter, self._cached_down, offsets)
     else:
-        down = _grouped_expert_gemm(inter, offsets, lambda: _build_down_stack(experts, spec, dtype), recompute)
+        down = _grouped_expert_gemm(inter, offsets, lambda: _build_down_stack(experts, spec, dtype, projs), recompute)
     if lora["down"] is not None:
-        down = down + _lora_delta(inter, offsets, [getattr(ex, spec[2]) for ex in experts], lora["down"], dtype)
+        down = down + _lora_delta(inter, offsets, projs.down, lora["down"], dtype)
 
     down = down * sorted_w.unsqueeze(-1)
     final = torch.zeros((T, hidden_dim), dtype=torch.float32, device=dev)

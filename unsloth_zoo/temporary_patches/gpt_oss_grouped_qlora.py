@@ -44,6 +44,23 @@ import torch
 from .moe_grouped_modulelist import (
     _STACK_NAME, _lora_delta, _lora_operands, _lora_stacks, _projs_lora, _stack_projs_lora, _stackable_lora,
 )
+# Read as module attributes in the hot forward (no per-call import machinery; monkeypatches reach them).
+from . import moe_utils as _moe_utils
+_GPT_OSS = None   # gpt_oss imports this module lazily: resolved on first use
+
+
+def _gpt_oss():
+    global _GPT_OSS
+    if _GPT_OSS is None:
+        from . import gpt_oss
+        _GPT_OSS = gpt_oss
+    return _GPT_OSS
+
+
+def _base_params(proj):
+    """_parameters of the frozen base (PEFT's base_layer, else proj): getattr through
+    nn.Module.__getattr__ costs ~1 us per read, and these run per expert per call."""
+    return proj._modules.get("base_layer", proj)._parameters
 
 try:
     import triton
@@ -306,9 +323,11 @@ def _proj_dtypes(projs):
     """{(compute_dtype, _pre_set_compute_dtype, quant_state.dtype)} over the experts of one projection."""
     out = set()
     for proj in projs:
-        base = getattr(proj, "base_layer", proj)
-        out.add((getattr(base, "compute_dtype", None), getattr(base, "_pre_set_compute_dtype", None),
-                 base.weight.quant_state.dtype))
+        base = proj._modules.get("base_layer", proj)
+        d = base.__dict__
+        cd = d["compute_dtype"] if "compute_dtype" in d else getattr(base, "compute_dtype", None)
+        pre = d["_pre_set_compute_dtype"] if "_pre_set_compute_dtype" in d else getattr(base, "_pre_set_compute_dtype", None)
+        out.add((cd, pre, d["_parameters"]["weight"].quant_state.dtype))
     return out
 
 
@@ -365,14 +384,9 @@ def grouped_qlora_forward(experts, hidden_states, router_indices, routing_weight
         )
     if mode != "bf16":
         return _decline(why)
-    from unsloth_zoo.temporary_patches.moe_utils import (
-        _base_grouped_mm, _check_torch_grouped_mm_supported, _moe_recompute_default,
-        combine_permuted_moe_outputs, count_tokens_per_expert,
-    )
-    from unsloth_zoo.temporary_patches.gpt_oss import swiglu_torch_forward
-
+    mu = _moe_utils
     # Readiness also admits a device with only the fp16 Triton path.
-    if not _check_torch_grouped_mm_supported():
+    if not mu._check_torch_grouped_mm_supported():
         return _decline("torch._grouped_mm unsupported")
     device = hidden_states.device
     dtype = torch.bfloat16
@@ -388,34 +402,34 @@ def grouped_qlora_forward(experts, hidden_states, router_indices, routing_weight
         sorted_idx = flat_experts.argsort(stable = True)
         sorted_tokens = token_ids[sorted_idx]
         expert_ids = flat_experts[sorted_idx]
-        counts = count_tokens_per_expert(flat_experts, num_experts, torch.int64)
+        counts = mu.count_tokens_per_expert(flat_experts, num_experts, torch.int64)
         offsets = counts.cumsum(0, dtype = torch.int32)
 
-    recompute = _moe_recompute_default()
+    recompute = mu._moe_recompute_default()
     state = _tables(experts, dtype)
     gu_projs, dn_projs = experts.gate_up_projs, experts.down_projs
     # Read live every call, so in-place bias edits are never stale.
-    gu_bias = torch.stack([getattr(p, "base_layer", p).bias for p in gu_projs]).detach()
-    dn_bias = torch.stack([getattr(p, "base_layer", p).bias for p in dn_projs]).detach()
+    gu_bias = torch.stack([_base_params(p)["bias"] for p in gu_projs]).detach()
+    dn_bias = torch.stack([_base_params(p)["bias"] for p in dn_projs]).detach()
     gu_tb = state["gate_up"] if state is not None else None
     dn_tb = state["down"] if state is not None else None
     gu_w = _StackProvider(gu_tb, dtype, lambda: _bnb_fallback_stack(gu_projs, dtype))
     dn_w = _StackProvider(dn_tb, dtype, lambda: _bnb_fallback_stack(dn_projs, dtype))
 
     xg = hidden_states[sorted_tokens]
-    gate_up = _base_grouped_mm(xg, offsets, gu_w, recompute).to(acc_dtype)
+    gate_up = mu._base_grouped_mm(xg, offsets, gu_w, recompute).to(acc_dtype)
     gate_up = gate_up + gu_bias[expert_ids].to(acc_dtype)
     if lora is not None and lora["gate_up"] is not None:
         gate_up = gate_up + _lora_delta(xg, offsets, gu_projs, lora["gate_up"], dtype).to(acc_dtype)
-    gated = swiglu_torch_forward(gate_up, experts.alpha, experts.limit, dtype = torch.float32).to(dtype)
-    out = _base_grouped_mm(gated, offsets, dn_w, recompute).float()
+    gated = _gpt_oss().swiglu_torch_forward(gate_up, experts.alpha, experts.limit, dtype = torch.float32).to(dtype)
+    out = mu._base_grouped_mm(gated, offsets, dn_w, recompute).float()
     out = out + dn_bias[expert_ids].float()
     if lora is not None and lora["down"] is not None:
         out = out + _lora_delta(gated, offsets, dn_projs, lora["down"], dtype).float()
 
     weighted = out.to(torch.float32) * routing_weights[sorted_tokens, expert_ids, None].to(torch.float32)
     # Fixed-order top_k sum (an index_add_ over repeated tokens is atomic, so not reproducible).
-    next_states = combine_permuted_moe_outputs(weighted, sorted_idx, num_tokens, top_k, out_dtype = torch.float32)
+    next_states = mu.combine_permuted_moe_outputs(weighted, sorted_idx, num_tokens, top_k, out_dtype = torch.float32)
     return next_states.view(batch_size, -1, experts.hidden_size)
 
 
