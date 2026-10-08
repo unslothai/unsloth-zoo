@@ -303,3 +303,8 @@ def test_hydration_copies_the_lora_converter_into_a_prebuilt_install(mod, monkey
     mod._hydrate_converter_sources(tag, str(install))
     assert (install / "convert_lora_to_gguf.py").is_file()
     assert (install / "convert_hf_to_gguf.py").is_file()
+
+
+def test_single_file_converter_fallback_comes_from_the_fork():
+    module = _load()
+    assert module.LLAMA_CPP_CONVERT_FILE.startswith("https://github.com/unslothai/llama.cpp/")

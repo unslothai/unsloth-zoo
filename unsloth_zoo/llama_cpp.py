@@ -84,7 +84,7 @@ if not logger.hasHandlers():
     logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s: %(message)s')
 
 LLAMA_CPP_CONVERT_FILE = \
-    "https://github.com/ggerganov/llama.cpp/raw/refs/heads/master/convert_hf_to_gguf.py"
+    "https://github.com/unslothai/llama.cpp/raw/refs/heads/master/convert_hf_to_gguf.py"
 
 _TEMP_NAME_ATTEMPTS = 16
 LLAMA_CPP_CONVERTER_FILENAMES = ("convert_hf_to_gguf.py", "convert-hf-to-gguf.py")
