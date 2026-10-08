@@ -39,8 +39,6 @@ BLOCKED = [
     # check ever seeing them. The member is denied; operator itself stays.
     ("operator.attrgetter", 'def matmul(A, B):\n    import operator\n    return operator.attrgetter("__class__.__bases__")(1)\n', AttributeError),
     ("operator.methodcaller", 'def matmul(A, B):\n    import operator\n    return operator.methodcaller("__str__")(1)\n', AttributeError),
-    # global_enum copies members into sys.modules[cls.__module__]; the functional
-    # API lets the caller name "builtins", which would replace the host's len.
     ("enum.global_enum", 'def matmul(A, B):\n    import enum\n    return enum.global_enum(enum.IntEnum("Hijack", {"len": 7}, module = "builtins"))\n', AttributeError),
     # Formatter.get_field resolves a dotted string and returns the object, so
     # it recovers the real __import__. str.format walks attributes the same way
