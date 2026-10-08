@@ -481,6 +481,22 @@ except:
     torch_compiler_set_stance = None
 pass
 
+# True once the inference branch below switched Dynamo to eager_on_recompile, so a
+# training forward only undoes a stance Unsloth set, never one the user chose.
+UNSLOTH_SET_EAGER_STANCE = False
+
+def unsloth_training_stance():
+    # eager_on_recompile is global: left on by generate() or eval forwards, every recompile
+    # in a later training step (new sequence length, model.train() without for_training)
+    # would silently run the eager body. Training forwards restore the default stance.
+    global INFERENCE_RUNS, UNSLOTH_SET_EAGER_STANCE
+    INFERENCE_RUNS = 0
+    if UNSLOTH_SET_EAGER_STANCE and torch_dynamo_eval_frame is not None:
+        UNSLOTH_SET_EAGER_STANCE = False
+        if torch_dynamo_eval_frame._stance.stance == "eager_on_recompile":
+            torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = False)
+pass
+
 from unsloth_zoo import DEVICE_TYPE_TORCH, DEVICE_COUNT
 from unsloth_zoo.temporary_patches.utils import UNSLOTH_DECODE_COMPILE
 """
@@ -3123,7 +3139,7 @@ pass
 __DYNAMO__RECOMPILING__ = """
 
     # Set compiler stance to fail on recompiles for inference
-    global INFERENCE_RUNS
+    global INFERENCE_RUNS, UNSLOTH_SET_EAGER_STANCE
     # Skipped while tracing (set_stance raises there, and the counter would guard every step)
     # and around a compiled decode step, which eager_on_recompile would otherwise freeze.
     if not torch.compiler.is_compiling() and not UNSLOTH_DECODE_COMPILE[0]:
@@ -3134,6 +3150,7 @@ __DYNAMO__RECOMPILING__ = """
         if old_stance is not None and INFERENCE_RUNS == 1:
             # Skip guards and return to eager -> we still need guards!
             torch_compiler_set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = False)
+            UNSLOTH_SET_EAGER_STANCE = True
             if UNSLOTH_ENABLE_LOGGING:
                 logger_compiler.info(
                     f"Unsloth: Removing compiler guards after 1 inference run. "\\
@@ -3154,6 +3171,11 @@ __DYNAMO__RECOMPILING__ = """
             INFERENCE_RUNS = 0
         INFERENCE_RUNS += 1
 """
+
+# Training forwards (train mode, grad on) never run under the inference stance above.
+# is_compiling() goes first: Dynamo folds it to True, so a traced forward skips the call.
+__DYNAMO__TRAINING_STANCE__ = """if not torch.compiler.is_compiling() and torch.is_grad_enabled() and getattr(self, "training", False):
+    unsloth_training_stance()"""
 
 # Replace Cross Entropy cells with fused linear lm heads
 cross_entropy_find_1 = """
@@ -3203,6 +3225,7 @@ pass
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
+__DYNAMO__TRAINING_STANCE__
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
@@ -3252,7 +3275,7 @@ else:
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) != () else 0,
     )
-""".replace("__DYNAMO__RECOMPILING__", __DYNAMO__RECOMPILING__)
+""".replace("__DYNAMO__RECOMPILING__", __DYNAMO__RECOMPILING__).replace("__DYNAMO__TRAINING_STANCE__", __DYNAMO__TRAINING_STANCE__)
 
 cross_entropy_find_2 = """
 logits = self.lm_head(hidden_states$INDEXING$
@@ -3297,6 +3320,7 @@ pass
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
+__DYNAMO__TRAINING_STANCE__
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
@@ -3371,7 +3395,7 @@ else:
         logits = torch.tanh(logits)
         logits = logits * (\\4)
     loss = self.loss_function(\\6, \\7.to(self.lm_head.weight.device), vocab_size=\\8, **\\9)
-""".replace("__DYNAMO__RECOMPILING__", __DYNAMO__RECOMPILING__)
+""".replace("__DYNAMO__RECOMPILING__", __DYNAMO__RECOMPILING__).replace("__DYNAMO__TRAINING_STANCE__", __DYNAMO__TRAINING_STANCE__)
 
 cross_entropy_find_3 = """
 $OUTPUTLOGITS$
@@ -3420,6 +3444,7 @@ pass
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
+__DYNAMO__TRAINING_STANCE__
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
@@ -3467,7 +3492,7 @@ else:
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) != () else 0,
     )
-""".replace("__DYNAMO__RECOMPILING__", __DYNAMO__RECOMPILING__)
+""".replace("__DYNAMO__RECOMPILING__", __DYNAMO__RECOMPILING__).replace("__DYNAMO__TRAINING_STANCE__", __DYNAMO__TRAINING_STANCE__)
 
 ce_finders = [
     (
