@@ -1204,12 +1204,20 @@ class GptOssExpertsBnb4bit(nn.Module):
         # eager per-expert loop, so honor that and fall back.
         if os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1":
             return False
-        # The full check costs ~0.6 ms per layer; reuse it while ready_signature is unchanged.
-        from unsloth_zoo.temporary_patches.gpt_oss_grouped_qlora import ready_signature
+        # The full check costs ~0.6 ms per layer; reuse it while ready_signature is unchanged,
+        # and skip even that while no expert state changed (moe_ready_epoch).
+        from unsloth_zoo.temporary_patches.gpt_oss_grouped_qlora import (
+            cached_ready, ready_record, ready_signature,
+        )
+        hit = cached_ready(self)
+        if hit is not None:
+            self._unsloth_grouped_lora = hit[1]
+            return hit[0]
         sig = ready_signature(self)
         cached = getattr(self, "_unsloth_grouped_ready", None)
         if sig is not None and cached is not None and cached[0] == sig:
             self._unsloth_grouped_lora = cached[2]
+            self._unsloth_grouped_ready = cached[:3] + (ready_record(self),)
             return cached[1]
         def _uncached():
             def _fail(reason):
@@ -1281,7 +1289,8 @@ class GptOssExpertsBnb4bit(nn.Module):
 
         verdict = _uncached()
         if sig is not None:
-            self._unsloth_grouped_ready = (sig, verdict, getattr(self, "_unsloth_grouped_lora", None))
+            lora = getattr(self, "_unsloth_grouped_lora", None)
+            self._unsloth_grouped_ready = (sig, verdict, lora, ready_record(self))
         return verdict
 
     def _forward_grouped_bnb4bit(self, hidden_states, router_indices, routing_weights,

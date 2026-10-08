@@ -31,6 +31,8 @@ paths read the stacks. UNSLOTH_MOE_STACKED_LORA=0 keeps PEFT's per-expert Parame
 __all__ = [
     "nf4_dequant_expert_stack",
     "ready_signature",
+    "cached_ready",
+    "ready_record",
     "expert_lora_state",
     "grouped_qlora_forward",
     "stack_expert_lora",
@@ -40,6 +42,7 @@ import os
 
 import torch
 
+from . import moe_ready_epoch as _ready_epoch
 # Model-agnostic expert-LoRA helpers, shared with the ModuleList grouped MoE path.
 from .moe_grouped_modulelist import (
     _STACK_NAME, _lora_delta, _lora_operands, _lora_stacks, _projs_lora, _stack_projs_lora, _stackable_lora,
@@ -193,7 +196,7 @@ def _proj_signature(proj, out):
     b = base._parameters.get("bias")
     # Tensors / QuantState by id: their __eq__ is elementwise, not identity.
     out += (proj, id(w), id(getattr(w, "quant_state", None)), w is not None and w.requires_grad,
-            id(b), b is not None and b.requires_grad)
+            id(b), b is not None and b.requires_grad, "_hf_hook" in d or "_hf_hook" in base.__dict__)
     if "lora_A" in mods:
         active = d.get("_active_adapter")
         out += (active if isinstance(active, str) else tuple(active), tuple(d.get("merged_adapters", ())),
@@ -243,6 +246,81 @@ def _quant_key(weight):
     return key
 
 
+def _storage_lean(experts, refs = None):
+    """moe_ready_epoch's lean key: per expert projection, the base weight's identity, address and
+    requires_grad, its quant state's identity and absmax address, and the bias' identity and
+    requires_grad. Re-read once per optimizer step; None when it cannot be built."""
+    ptr = torch._C.TensorBase.data_ptr
+    out = []
+    try:
+        with torch._C.DisableTorchFunctionSubclass():
+            for projs in (experts._modules["gate_up_projs"], experts._modules["down_projs"]):
+                for p in projs._modules.values():
+                    base = p._modules.get("base_layer", p)
+                    bp = base._parameters
+                    w, b = bp["weight"], bp.get("bias")
+                    qs = w.__dict__.get("quant_state")
+                    out += (id(w), ptr(w), w.requires_grad, id(qs), None if qs is None else ptr(qs.absmax),
+                            id(b), b is not None and b.requires_grad)
+                    if refs is not None:
+                        refs.append((w, qs, b))
+    except Exception:
+        return None
+    return tuple(out)
+
+
+def _spot_signature(experts):
+    """ready_signature's fields over the first and last expert of each projection list."""
+    out = []
+    try:
+        with torch._C.DisableTorchFunctionSubclass():
+            for projs in (experts._modules["gate_up_projs"], experts._modules["down_projs"]):
+                out += (projs, len(projs))
+                for p in (projs[0], projs[-1]):
+                    _proj_signature(p, out)
+                    out.append(_quant_key(getattr(p, "base_layer", p).weight))
+    except Exception:
+        return None
+    return tuple(out)
+
+
+@torch.compiler.disable
+def cached_ready(experts):
+    """(verdict, lora) of the last full _grouped_bnb4bit_ready check while moe_ready_epoch vouches
+    for it (no expert-state change, end experts unchanged), else None."""
+    if not _ready_epoch.enabled():
+        experts.__dict__.pop(_ready_epoch.VALID, None)
+        return None
+    cached = experts.__dict__.get("_unsloth_grouped_ready")
+    rec = cached[3] if cached is not None and len(cached) > 3 else None
+    if _ready_epoch.valid(rec, (experts,), lambda: _spot_signature(experts), lambda: _storage_lean(experts)):
+        _ready_epoch.mark_valid(experts, rec)
+        return cached[1], cached[2]
+    experts.__dict__.pop(_ready_epoch.VALID, None)   # the tables re-key until a full check vouches again
+    return None
+
+
+@torch.compiler.disable
+def ready_record(experts):
+    """A moe_ready_epoch.Record for the full check just run, or None (switch off, accelerate hooks)."""
+    if not _ready_epoch.enabled():
+        return None
+    _ready_epoch.COUNTS["full"] += 1
+    rec = None
+    hooked, drops = _ready_epoch.scan(experts)
+    if not hooked:
+        refs = []
+        spot, lean = _spot_signature(experts), _storage_lean(experts, refs)
+        if spot is not None and lean is not None:
+            _ready_epoch.wrap_peft()   # PEFT tuner classes imported since the last full check
+            rec = _ready_epoch.Record((experts,), spot, lean, drops, refs)
+    if rec is not None:
+        _ready_epoch.mark_valid(experts, rec)
+    else:
+        experts.__dict__.pop(_ready_epoch.VALID, None)
+    return rec
+
+
 def _bnb_fallback_stack(projs, dtype):
     """Concat-and-dequant through bitsandbytes (the pre-existing grouped path)."""
     import bitsandbytes as bnb
@@ -279,8 +357,33 @@ def _storage_key(experts):
     )
 
 
+def _table_spot(experts):
+    out = []
+    with torch._C.DisableTorchFunctionSubclass():
+        for projs in (experts._modules["gate_up_projs"], experts._modules["down_projs"]):
+            for p in (projs[0], projs[-1]):
+                w = getattr(p, "base_layer", p).weight
+                out += (id(w), id(w.quant_state), _quant_key(w))
+    return tuple(out)
+
+
 def _tables(experts, dtype):
-    """Pointer tables for both projections, or None for the bnb fallback."""
+    """Pointer tables for both projections, or None for the bnb fallback. While readiness vouches
+    for the experts' storage at the current moe_ready_epoch stamp, the O(E) storage key and the
+    snapshot check are skipped for a spot key over the end experts."""
+    gen = _ready_epoch.current_gen(experts) if _ready_epoch.enabled() else None
+    spot = None
+    if gen is not None:
+        try:
+            spot = _table_spot(experts)
+        except Exception:
+            spot = None
+        state = experts.__dict__.get("_unsloth_routed_nf4")
+        if isinstance(state, dict) and state.get("ready_gen") is gen and spot is not None \
+                and state.get("ready_spot") == spot:
+            _ready_epoch.COUNTS["table_cheap"] += 1
+            return state
+    _ready_epoch.COUNTS["table_full"] += 1
     try:
         from unsloth_zoo.temporary_patches.gpt_oss_routed import prepare_routed_experts
         # prepare_routed_experts only re-checks the end experts: check every expert here.
@@ -294,6 +397,11 @@ def _tables(experts, dtype):
     if not isinstance(state, dict):
         return None
     state["storage_key"] = key
+    state["ready_gen"], state["ready_spot"] = gen, spot
+    if "storage_hold" not in state:
+        # The weights' storages: a hook-less `.data =` swap then reads old values, not freed memory.
+        with torch._C.DisableTorchFunctionSubclass():
+            state["storage_hold"] = [w.data for w in state.get("weights", ())]
     for key in ("gate_up", "down"):
         tb = state[key]
         if "dtype" not in tb:

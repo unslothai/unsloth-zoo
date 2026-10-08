@@ -27,7 +27,8 @@ runs as above through `base_layer`, and each adapter adds a grouped delta over t
 per-expert A / B (_lora_delta, bf16 operands as the loop under autocast). Unsupported adapter
 states (dropout > 0 while training, DoRA, lora bias, several / disabled / merged adapters,
 mixed-adapter batches, heterogeneous rank or scaling) keep the loop; readiness is re-checked
-every call, cached on a signature of every expert projection.
+every call, cached on a signature of every expert projection, which is itself only re-read after
+an expert-state change (moe_ready_epoch; UNSLOTH_MOE_FAST_READY=0 re-reads it every call).
 
 Env: UNSLOTH_MOE_GROUPED=0 disables; UNSLOTH_MOE_GROUPED_LORA=0 keeps expert-LoRA blocks on the
 loop; UNSLOTH_MOE_GROUPED_RECOMPUTE=1 rebuilds the dequant stack in backward (auto-on without
@@ -40,6 +41,8 @@ import os
 import types
 import torch
 import torch.nn.functional as F
+
+from . import moe_ready_epoch as _ready_epoch
 
 __all__ = [
     "enable_grouped_moe",
@@ -219,16 +222,30 @@ def _nf4_stack_key(projs):
 
 def _nf4_table(experts, kind, projs):
     """Cached pointer table (gpt_oss_routed._build_table) over `projs`, or None. The cache holds
-    the projections' weights / quant states, so the addresses in the table cannot be recycled."""
+    the projections' weights / quant states and their storages, so the addresses in the table
+    cannot be recycled. While readiness vouches for the experts' storage at the current
+    moe_ready_epoch stamp, the O(E) key is skipped for a spot key over the end projections."""
+    cache = experts.__dict__.setdefault("_unsloth_nf4_stack_tables", {})
+    hit = cache.get(kind)
+    gen = _ready_epoch.current_gen(experts) if _ready_epoch.enabled() else None
+    spot = None
+    if gen is not None:
+        try:
+            spot = _nf4_stack_key([*projs[:2], *projs[-2:]])
+        except Exception:
+            spot = None
+        if hit is not None and hit[2] is gen and hit[3] == len(projs) and spot is not None and hit[4] == spot:
+            _ready_epoch.COUNTS["table_cheap"] += 1
+            return hit[1]
+    _ready_epoch.COUNTS["table_full"] += 1
     try:
         key = _nf4_stack_key(projs)
     except Exception:
         return None
     if key is None:
         return None
-    cache = experts.__dict__.setdefault("_unsloth_nf4_stack_tables", {})
-    hit = cache.get(kind)
     if hit is not None and hit[0] == key:
+        cache[kind] = (key, hit[1], gen, len(projs), spot)
         return hit[1]
     tb = None
     try:
@@ -237,11 +254,18 @@ def _nf4_table(experts, kind, projs):
         tb = _build_table(projs, base0.weight.device)
         if tb is not None:
             tb["dtype"] = base0.weight.quant_state.dtype
-            tb["_hold"] = [getattr(p, "base_layer", p).weight for p in projs]
-            tb["_hold"] += [w.quant_state for w in tb["_hold"]]
+            ws = [getattr(p, "base_layer", p).weight for p in projs]
+            tb["_hold"] = ws + [w.quant_state for w in ws]
+            # The storages too: a hook-less `.data =` / absmax swap then reads old values, not freed memory.
+            with torch._C.DisableTorchFunctionSubclass():
+                for w in ws:
+                    qs = w.quant_state
+                    tb["_hold"] += (w.data, qs.absmax, qs.code)
+                    if qs.nested:
+                        tb["_hold"] += (qs.state2.absmax, qs.state2.code)
     except Exception:
         tb = None
-    cache[kind] = (key, tb)   # a None table is a negative cache under the same key
+    cache[kind] = (key, tb, gen, len(projs), spot)   # a None table is a negative cache under the same key
     return tb
 
 
@@ -615,7 +639,7 @@ def _ready_signature(experts, spec):
     PEFT state the check reads (active / disabled / merged adapters, forward pre-hooks for
     mixed-adapter batches, dropout mode and p, scaling, DoRA, which variant entries are set), and
     every weight's shape / dtype / device (`.data =` and `.to()` keep a Parameter's identity, and
-    one expert or adapter can be changed alone).
+    one expert or adapter can be changed alone), and accelerate hooks.
     The fields of gpt-oss' _proj_signature, read through __dict__ (~3 us per projection; E=128
     has 384).
 
@@ -629,7 +653,10 @@ def _ready_signature(experts, spec):
     try:
         with torch._C.DisableTorchFunctionSubclass():
             for ex in experts:
-                mods = ex.__dict__["_modules"]
+                exd = ex.__dict__
+                mods = exd["_modules"]
+                if "_hf_hook" in exd:
+                    append("_hf_hook")
                 for name in spec[:3]:
                     p = mods.get(name)
                     if p is None:
@@ -637,7 +664,8 @@ def _ready_signature(experts, spec):
                     d = p.__dict__
                     pm = d["_modules"]
                     base = pm.get("base_layer", p)
-                    bp = base.__dict__["_parameters"]
+                    bd = base.__dict__
+                    bp = bd["_parameters"]
                     w = bp.get("weight")
                     b = bp.get("bias")
                     qs = getattr(w, "quant_state", None)
@@ -645,7 +673,7 @@ def _ready_signature(experts, spec):
                     append((p, id(w), id(qs), getattr(w, "shape", None), w is not None and w.requires_grad,
                             id(b), b is not None and b.requires_grad,
                             getattr(w, "dtype", None), getattr(w, "device", None),
-                            base.__dict__.get("compute_dtype")))
+                            bd.get("compute_dtype"), "_hf_hook" in d or "_hf_hook" in bd))
                     la = pm.get("lora_A")
                     if la is None:
                         continue
@@ -726,21 +754,83 @@ def _decline(reason, count=True):
     return None
 
 
+def _storage_lean(experts, spec, refs = None):
+    """moe_ready_epoch's lean key: per expert projection, the base weight's identity, address and
+    requires_grad, its quant state's identity and absmax address (what a hook-less `.data =` or
+    quant_state swap changes). Re-read once per optimizer step; None when it cannot be built."""
+    ptr = torch._C.TensorBase.data_ptr
+    out = []
+    try:
+        with torch._C.DisableTorchFunctionSubclass():
+            for ex in experts:
+                mods = ex.__dict__["_modules"]
+                for name in spec[:3]:
+                    p = mods[name]
+                    base = p.__dict__["_modules"].get("base_layer", p)
+                    w = base.__dict__["_parameters"]["weight"]
+                    qs = w.__dict__.get("quant_state")
+                    out += (id(w), ptr(w), w.requires_grad, id(qs), None if qs is None else ptr(qs.absmax))
+                    if refs is not None:
+                        refs.append((w, qs))
+    except Exception:
+        return None
+    return tuple(out)
+
+
+def _spot_signature(experts, spec):
+    sig = _ready_signature((experts[0], experts[-1]), spec)
+    return None if sig is None else sig[0]
+
+
+def _ready_record(block, experts, spec, ctx):
+    """A moe_ready_epoch.Record for the full check just run, or None (accelerate hooks, no key)."""
+    hooked, drops = _ready_epoch.scan(experts)
+    if hooked:
+        return None
+    _ready_epoch.track((block,))
+    refs = []
+    spot = _ready_signature((experts[0], experts[-1]), spec)
+    lean = _storage_lean(experts, spec, refs)
+    if spot is None or lean is None:
+        return None
+    _ready_epoch.wrap_peft()   # PEFT tuner classes imported since the last full check
+    return _ready_epoch.Record(ctx, spot[0], lean, drops, (refs, spot[1]))
+
+
 @torch.compiler.disable
 def _cached_state(block, experts, spec, device, dtype):
     """_experts_grouped_state, reused while the signature of every expert projection, the input
-    device / dtype and UNSLOTH_MOE_GROUPED_LORA are unchanged (the full check is O(experts))."""
-    sig = _ready_signature(experts, spec)
-    key = None if sig is None else (device, dtype, os.environ.get("UNSLOTH_MOE_GROUPED_LORA", "1"), sig[0])
+    device / dtype and UNSLOTH_MOE_GROUPED_LORA are unchanged (the full check is O(experts)).
+    Between expert-state changes (moe_ready_epoch) only the end experts are re-read."""
+    env = os.environ.get("UNSLOTH_MOE_GROUPED_LORA", "1")
     cached = block.__dict__.get("_moe_ready")
+    fast = _ready_epoch.enabled()
+    ctx = (device, dtype, env, experts, len(experts))
+    if fast:
+        rec = cached[3] if cached is not None else None
+        if _ready_epoch.valid(rec, ctx, lambda: _spot_signature(experts, spec),
+                              lambda: _storage_lean(experts, spec)):
+            _ready_epoch.mark_valid(experts, rec)
+            return cached[1]
+        _ready_epoch.COUNTS["full"] += 1
+    else:
+        experts.__dict__.pop(_ready_epoch.VALID, None)
+    sig = _ready_signature(experts, spec)
+    key = None if sig is None else (device, dtype, env, sig[0])
     if key is not None and cached is not None and cached[0] == key:
-        return cached[1]
-    state = _experts_grouped_state(experts, spec, device, dtype)
-    if cached is not None:
-        # Something changed (e.g. a merge / unmerge edits the base in place): rebuild resident stacks.
-        block.__dict__.pop("_cached_gate_up", None)
-        block.__dict__.pop("_cached_down", None)
-    block.__dict__["_moe_ready"] = (key, state, sig[1]) if key is not None else None
+        state = cached[1]
+    else:
+        state = _experts_grouped_state(experts, spec, device, dtype)
+        if cached is not None:
+            # Something changed (e.g. a merge / unmerge edits the base in place): rebuild resident stacks.
+            block.__dict__.pop("_cached_gate_up", None)
+            block.__dict__.pop("_cached_down", None)
+    rec = _ready_record(block, experts, spec, ctx) if fast and key is not None else None
+    block.__dict__["_moe_ready"] = (key, state, sig[1], rec) if key is not None else None
+    if rec is not None:
+        _ready_epoch.mark_valid(experts, rec)
+    else:
+        experts.__dict__.pop(_ready_epoch.VALID, None)
     return state
 
 
