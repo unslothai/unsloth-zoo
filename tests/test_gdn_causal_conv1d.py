@@ -34,12 +34,8 @@ def _run(fn, x, w, b, dy, act):
     return y.detach(), x.grad, w.grad, (b.grad if b is not None else None)
 
 
-def _to64(t):
-    return t.double() if t is not None else None
-
-
 def _oracle(x, w, b, dy, act):
-    to64 = _to64
+    to64 = lambda t: t.double() if t is not None else None
     return _run(gcc.causal_conv1d_reference, to64(x), to64(w), to64(b), to64(dy), act)
 
 
@@ -133,77 +129,157 @@ def test_dispatch_fallbacks_and_kill_switch(monkeypatch):
 
 
 @requires_cuda
-def test_legacy_entry_point():
+def test_legacy_entry_point(monkeypatch):
+    monkeypatch.delenv(gcc._KILL_SWITCH, raising = False)
     x, w, b, _ = _inputs(2, 64, 40, 4, torch.bfloat16, True, True)
+    before = gcc.GDN_CAUSAL_CONV1D_STATS["triton_fwd"]
     y = gcc._legacy_causal_conv1d_fn(x = x, weight = w, bias = b, activation = "silu", seq_idx = None)
-    ref = gcc.causal_conv1d_reference(x, w, b, "silu")
-    assert _rel(y, ref) < 1e-2
+    assert gcc.GDN_CAUSAL_CONV1D_STATS["triton_fwd"] == before + 1
+    assert _rel(y, gcc.causal_conv1d_reference(x, w, b, "silu")) < 1e-2
+
+
+def test_legacy_seq_idx_cpu():
+    import inspect
+    # Not advertised: unsloth's hybrid packing gate keys on a named `seq_idx`.
+    assert "seq_idx" not in inspect.signature(gcc._legacy_causal_conv1d_fn).parameters
+    g = torch.Generator().manual_seed(0)
+    x = torch.randn(1, 8, 10, generator = g, dtype = torch.float64)
+    w = torch.randn(8, 4, generator = g, dtype = torch.float64)
+    b = torch.randn(8, generator = g, dtype = torch.float64)
+    seq_idx = torch.tensor([[0, 0, 0, 1, 1, 1, 1, 2, 2, 2]], dtype = torch.int32)
+    y = gcc._legacy_causal_conv1d_fn(x = x, weight = w, bias = b, activation = "silu", seq_idx = seq_idx)
+    ref = torch.cat([
+        gcc.causal_conv1d_reference(x[:, :, s:e], w, b, "silu") for s, e in ((0, 3), (3, 7), (7, 10))
+    ], dim = -1)
+    torch.testing.assert_close(y, ref)
+    # A single segment is the plain conv.
+    y = gcc._legacy_causal_conv1d_fn(x = x, weight = w, bias = b, activation = "silu", seq_idx = torch.zeros(1, 10, dtype = torch.int32))
+    torch.testing.assert_close(y, gcc.causal_conv1d_reference(x, w, b, "silu"))
     with pytest.raises(NotImplementedError):
-        gcc._legacy_causal_conv1d_fn(x = x.cpu(), weight = w.cpu(), seq_idx = torch.zeros(1))
+        gcc._legacy_causal_conv1d_fn(x = x, weight = w, initial_states = torch.zeros(1))
 
 
-def _fake_module(name, fn_module):
-    import types
-    module = types.ModuleType(name)
-
+def _gdn_fn(module_name):
     def causal_conv1d_fn(hidden_states, weight, bias = None, activation = None, **kwargs):
         return gcc.causal_conv1d_reference(hidden_states, weight, bias, activation)
 
-    causal_conv1d_fn.__module__ = fn_module
-    return module, causal_conv1d_fn
+    causal_conv1d_fn.__module__ = module_name
+    return causal_conv1d_fn
 
 
-def test_hub_decorator_wraps_only_gdn_fallbacks(monkeypatch):
+@pytest.fixture
+def hub_kernels(monkeypatch):
     hub_kernels = pytest.importorskip("transformers.integrations.hub_kernels")
     if not hasattr(hub_kernels, "use_kernel_func_from_hub_with_fallback"):
         pytest.skip("transformers without use_kernel_func_from_hub_with_fallback")
-    monkeypatch.setattr(gcc, "_real_causal_conv1d_available", lambda: False)
+    import transformers.integrations as integrations
+    # Restored on teardown, whatever the patch rebinds.
     original = hub_kernels.use_kernel_func_from_hub_with_fallback
-    try:
-        patched = gcc._patch_hub_decorator()
-        assert getattr(patched, gcc._HUB_MARK, False)
-        # Idempotent.
-        assert gcc._patch_hub_decorator() is patched
-        _, gdn_fn = _fake_module("m", "transformers.models.qwen3_5.modeling_qwen3_5")
-        _, other_fn = _fake_module("m", "transformers.models.mamba2.modeling_mamba2")
-        assert gcc._wraps_marked(patched("causal_conv1d_fn", "causal_conv1d")(gdn_fn))
-        assert not gcc._wraps_marked(patched("causal_conv1d_fn", "causal_conv1d")(other_fn))
-        assert not gcc._wraps_marked(patched("causal_conv1d_update", "causal_conv1d")(gdn_fn))
-
-        # Already-decorated module global: rebound to the dispatch.
-        module, gdn_fn = _fake_module("transformers.models.qwen3_5.modeling_qwen3_5", "transformers.models.qwen3_5.modeling_qwen3_5")
-        module.causal_conv1d_fn = original("causal_conv1d_fn", "causal_conv1d")(gdn_fn)
-        module.use_kernel_func_from_hub_with_fallback = original
-        assert gcc._rebind_module(module, patched)
-        assert gcc._wraps_marked(module.causal_conv1d_fn)
-        assert module.use_kernel_func_from_hub_with_fallback is patched
-
-        # transformers < 5.16 layout: a None global becomes the package-style entry point.
-        legacy, _ = _fake_module("legacy", "x")
-        legacy.causal_conv1d_fn = None
-        assert gcc._rebind_module(legacy, patched)
-        assert legacy.causal_conv1d_fn is gcc._legacy_causal_conv1d_fn
-    finally:
-        hub_kernels.use_kernel_func_from_hub_with_fallback = original
-        import transformers.integrations as integrations
-        if getattr(integrations, "use_kernel_func_from_hub_with_fallback", None) is not original:
-            integrations.use_kernel_func_from_hub_with_fallback = original
+    monkeypatch.setattr(hub_kernels, "use_kernel_func_from_hub_with_fallback", original)
+    monkeypatch.setattr(integrations, "use_kernel_func_from_hub_with_fallback", original)
+    monkeypatch.setattr(gcc, "_real_causal_conv1d_available", lambda: False)
+    monkeypatch.delenv(gcc._KILL_SWITCH, raising = False)
+    return hub_kernels
 
 
-def test_rebind_leaves_a_real_kernel_alone():
-    module, gdn_fn = _fake_module("transformers.models.qwen3_5.modeling_qwen3_5", "transformers.models.qwen3_5.modeling_qwen3_5")
+def _real_gdn_modeling(monkeypatch):
+    modeling = pytest.importorskip("transformers.models.qwen3_5.modeling_qwen3_5")
+    if getattr(modeling, "causal_conv1d_fn", None) is None:
+        pytest.skip("transformers < 5.15 GatedDeltaNet")
+    monkeypatch.setattr(modeling, "causal_conv1d_fn", modeling.causal_conv1d_fn)
+    monkeypatch.setattr(modeling, "use_kernel_func_from_hub_with_fallback", modeling.use_kernel_func_from_hub_with_fallback)
+    return modeling
 
-    def real_kernel(x, weight, bias = None, activation = None):
-        return x
 
-    def make_wrapper(implementation, torch_function):
-        import functools
+def test_hub_decorator_wraps_only_gdn_fallbacks(hub_kernels):
+    patched = gcc._patch_hub_decorator()
+    assert getattr(patched, gcc._HUB_MARK, False)
+    assert gcc._patch_hub_decorator() is patched
+    gdn_fn = _gdn_fn("transformers.models.qwen3_5.modeling_qwen3_5")
+    assert gcc._is_marked(patched("causal_conv1d_fn", "causal_conv1d")(gdn_fn))
+    assert not gcc._is_marked(patched("causal_conv1d_fn", "causal_conv1d")(_gdn_fn("transformers.models.mamba2.modeling_mamba2")))
+    assert not gcc._is_marked(patched("causal_conv1d_update", "causal_conv1d")(gdn_fn))
 
-        @functools.wraps(torch_function)
-        def wrapped(*args, **kwargs):
-            return implementation(*args, **kwargs)
-        return wrapped
+    # transformers < 5.15 layout: a None global becomes the package-style entry point.
+    import types
+    legacy = types.ModuleType("legacy")
+    legacy.causal_conv1d_fn = None
+    assert gcc._rebind_module(legacy, patched)
+    assert legacy.causal_conv1d_fn is gcc._legacy_causal_conv1d_fn
 
-    module.causal_conv1d_fn = make_wrapper(real_kernel, gdn_fn)
-    assert not gcc._rebind_module(module, lambda *a, **k: (lambda f: f))
-    assert module.causal_conv1d_fn.__wrapped__ is gdn_fn
+
+def test_patch_rebinds_the_real_modeling_module(hub_kernels, monkeypatch):
+    # Already-imported modeling module: its global and its decorator binding are
+    # rebound, and the dispatch keeps the torch path for an ineligible (CPU) input.
+    pytest.importorskip("triton")
+    modeling = _real_gdn_modeling(monkeypatch)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.version, "hip", None)
+    assert not gcc._is_marked(modeling.causal_conv1d_fn)
+
+    # Kill switch or a usable real package at patch time: nothing is touched.
+    monkeypatch.setenv(gcc._KILL_SWITCH, "1")
+    gcc.patch_gdn_causal_conv1d()
+    monkeypatch.delenv(gcc._KILL_SWITCH)
+    monkeypatch.setattr(gcc, "_real_causal_conv1d_available", lambda: True)
+    gcc.patch_gdn_causal_conv1d()
+    assert not gcc._is_marked(modeling.causal_conv1d_fn)
+    assert not getattr(hub_kernels.use_kernel_func_from_hub_with_fallback, gcc._HUB_MARK, False)
+
+    monkeypatch.setattr(gcc, "_real_causal_conv1d_available", lambda: False)
+    gcc.patch_gdn_causal_conv1d()
+    assert gcc._is_marked(modeling.causal_conv1d_fn)
+    assert getattr(modeling.use_kernel_func_from_hub_with_fallback, gcc._HUB_MARK, False)
+    x, w = torch.randn(1, 8, 5), torch.randn(8, 4)
+    before = gcc.GDN_CAUSAL_CONV1D_STATS["fallback"]
+    torch.testing.assert_close(modeling.causal_conv1d_fn(x, w, None, activation = "silu"), gcc.causal_conv1d_reference(x, w, None, "silu"))
+    assert gcc.GDN_CAUSAL_CONV1D_STATS["fallback"] == before + 1
+
+
+def test_real_package_must_be_usable(monkeypatch):
+    import sys
+    import types
+    import importlib.util
+    fake = types.ModuleType("causal_conv1d")
+    fake.causal_conv1d_fn = None
+    monkeypatch.setitem(sys.modules, "causal_conv1d", fake)
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a, **k: object())
+    # Installed but nulled by the CUDA probe: not usable.
+    assert not gcc._real_causal_conv1d_available()
+    fake.causal_conv1d_fn = lambda *a, **k: None
+    assert gcc._real_causal_conv1d_available()
+
+
+@requires_cuda
+def test_gated_delta_net_layer_engages_triton(hub_kernels, monkeypatch):
+    # End to end through the real layer: Triton runs in forward and backward and
+    # matches the unpatched layer.
+    modeling = _real_gdn_modeling(monkeypatch)
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+    config = Qwen3_5TextConfig(
+        hidden_size = 64, linear_num_value_heads = 2, linear_num_key_heads = 2,
+        linear_key_head_dim = 16, linear_value_head_dim = 16, num_hidden_layers = 1,
+        layer_types = ["linear_attention"],
+    )
+    torch.manual_seed(0)
+    layer = modeling.Qwen3_5GatedDeltaNet(config, 0).cuda().to(torch.bfloat16)
+    x = torch.randn(2, 33, 64, device = "cuda", dtype = torch.bfloat16)
+
+    def run():
+        layer.zero_grad(set_to_none = True)
+        xr = x.clone().requires_grad_(True)
+        y = layer(xr)
+        y.float().square().sum().backward()
+        return y.detach(), xr.grad, layer.conv1d.weight.grad
+
+    ref = run()
+    stats = dict(gcc.GDN_CAUSAL_CONV1D_STATS)
+    gcc.patch_gdn_causal_conv1d()
+    ours = run()
+    assert gcc.GDN_CAUSAL_CONV1D_STATS["triton_fwd"] == stats["triton_fwd"] + 1
+    assert gcc.GDN_CAUSAL_CONV1D_STATS["triton_bwd"] == stats["triton_bwd"] + 1
+    for o, r in zip(ours, ref):
+        assert _rel(o, r) < 2e-2
+    monkeypatch.setenv(gcc._KILL_SWITCH, "1")
+    run()
+    assert gcc.GDN_CAUSAL_CONV1D_STATS["triton_fwd"] == stats["triton_fwd"] + 1

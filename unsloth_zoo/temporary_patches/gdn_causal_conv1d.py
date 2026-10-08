@@ -38,18 +38,17 @@ rounded to the input dtype before the conv transpose, as the separate torch ops
 do.
 
 Env: ``UNSLOTH_DISABLE_TRITON_CAUSAL_CONV1D=1`` keeps the torch fallback (read
-per call). The real `causal_conv1d` package always wins when importable.
+per call). The real `causal_conv1d` package always wins when it imports with a callable
+`causal_conv1d_fn`.
 """
 
 __all__ = [
     "patch_gdn_causal_conv1d",
-    "triton_causal_conv1d",
-    "causal_conv1d_reference",
-    "GDN_CAUSAL_CONV1D_STATS",
 ]
 
 import os
 import sys
+import inspect
 import functools
 import importlib.util
 
@@ -67,6 +66,10 @@ _HUB_MARK = "_unsloth_triton_causal_conv1d_hub"
 
 # Modeling packages whose GatedDeltaNet uses the depthwise causal conv fallback.
 _GDN_MODELING = ("qwen3_5", "qwen3_5_moe", "qwen3_next")
+_GDN_LEAVES = frozenset(
+    f"{prefix}_{package}" for package in _GDN_MODELING
+    for prefix in ("modeling", "unsloth_compiled_module")
+)
 
 # Engagement counters (Triton forward calls / backward calls / torch fallbacks).
 GDN_CAUSAL_CONV1D_STATS = {"triton_fwd": 0, "triton_bwd": 0, "fallback": 0}
@@ -76,6 +79,8 @@ _MAX_WIDTH = 8
 _ACTIVATIONS = (None, "silu", "swish")
 
 _kernels = None
+# Set after a Triton failure so a broken compile is not retried on every call.
+_broken = False
 
 
 def _disabled():
@@ -83,10 +88,19 @@ def _disabled():
 
 
 def _real_causal_conv1d_available():
+    # Usable, not just installed: a broken wheel fails to import, and misc.py's
+    # patch_causal_conv1d_cuda_probe sets causal_conv1d_fn = None on GPUs it lacks kernels for.
     try:
-        return importlib.util.find_spec("causal_conv1d") is not None
+        if importlib.util.find_spec("causal_conv1d") is None:
+            return False
+        import causal_conv1d
+        return callable(getattr(causal_conv1d, "causal_conv1d_fn", None))
     except Exception:
         return False
+
+
+def _is_marked(fn):
+    return getattr(inspect.unwrap(fn, stop = lambda f: getattr(f, _MARK, False)), _MARK, False)
 
 
 def _build_kernels():
@@ -111,6 +125,8 @@ def _build_kernels():
         o_t = i_t * BT + tl.arange(0, BT)
         o_d = i_d * BD + tl.arange(0, BD)
         m_d = o_d < D
+        # int64: channel-first x / dy has stride_d = T, and (D - 1) * T can pass 2**31.
+        o_d64 = o_d.to(tl.int64)
         p_x = x + tl.cast(i_b, tl.int64) * stride_x_b
         acc = tl.zeros((BT, BD), dtype = tl.float32)
         for i_w in tl.static_range(W):
@@ -118,7 +134,7 @@ def _build_kernels():
             s_t = o_t - (W - 1) + i_w
             m = ((s_t >= 0) & (s_t < T))[:, None] & m_d[None, :]
             b_x = tl.load(
-                p_x + s_t.to(tl.int64)[:, None] * stride_x_t + o_d[None, :] * stride_x_d,
+                p_x + s_t.to(tl.int64)[:, None] * stride_x_t + o_d64[None, :] * stride_x_d,
                 mask = m, other = 0,
             ).to(tl.float32)
             b_w = tl.load(weight + o_d * W + i_w, mask = m_d, other = 0).to(tl.float32)
@@ -151,6 +167,8 @@ def _build_kernels():
         o_t = i_t * BT + tl.arange(0, BT)
         o_d = i_d * BD + tl.arange(0, BD)
         m_d = o_d < D
+        # int64: channel-first x / dy has stride_d = T, and (D - 1) * T can pass 2**31.
+        o_d64 = o_d.to(tl.int64)
         p_x = x + tl.cast(i_b, tl.int64) * stride_x_b
         p_dy = dy + tl.cast(i_b, tl.int64) * stride_dy_b
         if HAS_BIAS:
@@ -163,7 +181,7 @@ def _build_kernels():
             r_t = o_t + k
             m_r = r_t < T
             b_g = tl.load(
-                p_dy + r_t.to(tl.int64)[:, None] * stride_dy_t + o_d[None, :] * stride_dy_d,
+                p_dy + r_t.to(tl.int64)[:, None] * stride_dy_t + o_d64[None, :] * stride_dy_d,
                 mask = m_r[:, None] & m_d[None, :], other = 0,
             ).to(tl.float32)
             if ACTIVATION:
@@ -173,7 +191,7 @@ def _build_kernels():
                     s_t = r_t - (W - 1) + j
                     m = ((s_t >= 0) & (s_t < T))[:, None] & m_d[None, :]
                     b_xs = tl.load(
-                        p_x + s_t.to(tl.int64)[:, None] * stride_x_t + o_d[None, :] * stride_x_d,
+                        p_x + s_t.to(tl.int64)[:, None] * stride_x_t + o_d64[None, :] * stride_x_d,
                         mask = m, other = 0,
                     ).to(tl.float32)
                     b_wj = tl.load(weight + o_d * W + j, mask = m_d, other = 0).to(tl.float32)
@@ -195,7 +213,7 @@ def _build_kernels():
                         s_t = o_t - (W - 1) + j
                         m = ((s_t >= 0) & (s_t < T))[:, None] & m_d[None, :]
                         b_xs = tl.load(
-                            p_x + s_t.to(tl.int64)[:, None] * stride_x_t + o_d[None, :] * stride_x_d,
+                            p_x + s_t.to(tl.int64)[:, None] * stride_x_t + o_d64[None, :] * stride_x_d,
                             mask = m, other = 0,
                         ).to(tl.float32)
                         tl.store(
@@ -218,6 +236,8 @@ def _build_kernels():
 # forward is memory bound and flat across tile sizes.
 _FWD_CONFIG = (32, 64, 2)
 _BWD_CONFIG = (16, 64, 2)
+# CUDA caps grid dims 1 and 2 at 65535: T tiles ride dim 1, batch rides dim 2.
+_MAX_GRID_YZ = 65535
 
 
 def _launch_fwd(x_btd, weight, bias, activation):
@@ -276,8 +296,7 @@ class _CausalConv1dFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x_bdt, weight, bias, activation):
         # x_bdt is (B, D, T); usually a transposed view of a (B, T, D) tensor.
-        x_btd = x_bdt.transpose(1, 2)
-        y_btd = _launch_fwd(x_btd, weight, bias, activation)
+        y_btd = _launch_fwd(x_bdt.transpose(1, 2), weight, bias, activation)
         ctx.save_for_backward(x_bdt, weight, bias)
         ctx.activation = activation
         GDN_CAUSAL_CONV1D_STATS["triton_fwd"] += 1
@@ -286,19 +305,14 @@ class _CausalConv1dFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dy_bdt):
         x_bdt, weight, bias = ctx.saved_tensors
-        need_dx, need_dw, need_db = ctx.needs_input_grad[:3]
-        need_db = need_db and bias is not None
-        if not (need_dx or need_dw or need_db):
-            return None, None, None, None
+        # needs_input_grad is False for a None bias, and autograd only calls
+        # backward when some input needs a gradient.
         dx, dw, db = _launch_bwd(
             x_bdt.transpose(1, 2), weight, bias, dy_bdt.transpose(1, 2),
-            ctx.activation, need_dx, need_dw, need_db,
+            ctx.activation, *ctx.needs_input_grad[:3],
         )
         GDN_CAUSAL_CONV1D_STATS["triton_bwd"] += 1
-        return (
-            dx.transpose(1, 2) if dx is not None else None,
-            dw, db, None,
-        )
+        return (dx.transpose(1, 2) if dx is not None else None), dw, db, None
 
 
 def causal_conv1d_reference(x, weight, bias = None, activation = None):
@@ -315,31 +329,21 @@ def causal_conv1d_reference(x, weight, bias = None, activation = None):
 
 
 def _eligible(x, weight, bias, activation):
-    if not (isinstance(x, torch.Tensor) and isinstance(weight, torch.Tensor)):
-        return False
-    if x.device.type != "cuda" or weight.device != x.device:
-        return False
-    if getattr(torch.version, "hip", None) is not None:
-        # Not validated on ROCm yet.
-        return False
-    if x.dim() != 3 or weight.dim() != 2:
-        return False
-    if x.dtype not in _SUPPORTED_DTYPES or weight.dtype != x.dtype:
-        return False
-    if weight.shape[0] != x.shape[1] or not (1 <= weight.shape[1] <= _MAX_WIDTH):
-        return False
-    if x.shape[2] == 0 or x.shape[0] == 0:
-        return False
-    if not weight.is_contiguous():
-        return False
-    if bias is not None and (
-        not isinstance(bias, torch.Tensor) or bias.dtype != x.dtype
-        or bias.device != x.device or bias.shape != (x.shape[1],) or not bias.is_contiguous()
+    # The patch only installs on CUDA (not ROCm) with triton importable.
+    if not (
+        x.is_cuda and x.dim() == 3 and x.numel() > 0 and x.dtype in _SUPPORTED_DTYPES
+        and weight.dim() == 2 and weight.dtype == x.dtype and weight.device == x.device
+        and weight.is_contiguous() and weight.shape[0] == x.shape[1]
+        and 1 <= weight.shape[1] <= _MAX_WIDTH and activation in _ACTIVATIONS
+        and (bias is None or (
+            bias.dtype == x.dtype and bias.device == x.device
+            and bias.shape == (x.shape[1],) and bias.is_contiguous()
+        ))
     ):
         return False
-    if activation not in _ACTIVATIONS:
-        return False
-    return True
+    # Both launches must fit the grid: the backward tiles T finer and has no fallback.
+    min_bt = min(_FWD_CONFIG[0], _BWD_CONFIG[0])
+    return x.shape[0] <= _MAX_GRID_YZ and (x.shape[2] + min_bt - 1) // min_bt <= _MAX_GRID_YZ
 
 
 def triton_causal_conv1d(x, weight, bias = None, activation = None):
@@ -348,25 +352,18 @@ def triton_causal_conv1d(x, weight, bias = None, activation = None):
     return _CausalConv1dFunction.apply(x, weight, bias, activation)
 
 
-def _try_fast(x, weight, bias, activation, extra):
+def _try_fast(x, weight, bias, activation):
     """Run the Triton kernel, or return None to use the torch fallback."""
+    global _broken
     # Under torch.compile (decode regions) trace the torch path, never the launcher.
-    try:
-        if torch.compiler.is_compiling():
-            return None
-    except Exception:
+    if _broken or torch.compiler.is_compiling() or _disabled():
         return None
-    if _disabled():
-        return None
-    # Anything beyond the plain call (seq_idx, initial_states, ...) keeps the fallback.
-    for value in extra.values():
-        if value is not None and value is not False:
-            return None
     if not _eligible(x, weight, bias, activation):
         return None
     try:
         return triton_causal_conv1d(x, weight, bias, activation)
     except Exception as e:
+        _broken = True
         if UNSLOTH_ENABLE_LOGGING:
             logger.warning(f"Unsloth: Triton causal_conv1d failed, using torch: {e}")
         return None
@@ -374,13 +371,10 @@ def _try_fast(x, weight, bias, activation, extra):
 
 def _make_hub_dispatch(torch_function):
     """Wrap the transformers torch fallback `causal_conv1d_fn(hidden_states, weight,
-    bias=None, activation=None, **kwargs)`."""
-    if getattr(torch_function, _MARK, False):
-        return torch_function
-
+    bias=None, activation=None, **kwargs)`, which ignores its kwargs."""
     @functools.wraps(torch_function)
     def causal_conv1d_fn(hidden_states, weight, bias = None, activation = None, **kwargs):
-        out = _try_fast(hidden_states, weight, bias, activation, {})
+        out = _try_fast(hidden_states, weight, bias, activation)
         if out is not None:
             return out
         GDN_CAUSAL_CONV1D_STATS["fallback"] += 1
@@ -390,26 +384,48 @@ def _make_hub_dispatch(torch_function):
     return causal_conv1d_fn
 
 
-def _legacy_causal_conv1d_fn(
-    x, weight, bias = None, seq_idx = None, initial_states = None,
-    return_final_states = False, final_states_out = None, activation = None,
-):
-    """Stands in for `causal_conv1d.causal_conv1d_fn` on transformers < 5.16, where
-    the GatedDeltaNet calls `self.causal_conv1d_fn(x=, weight=, bias=, activation=,
-    seq_idx=None)` only when the package imported."""
-    extra = dict(
-        seq_idx = seq_idx, initial_states = initial_states,
-        return_final_states = return_final_states, final_states_out = final_states_out,
-    )
-    out = _try_fast(x, weight, bias, activation, extra)
-    if out is not None:
-        return out
-    GDN_CAUSAL_CONV1D_STATS["fallback"] += 1
-    if any(v is not None and v is not False for v in extra.values()):
+def _causal_conv1d_reference_seq_idx(x, weight, bias, activation, seq_idx):
+    """Torch causal conv whose taps do not cross `seq_idx` boundaries (the
+    `causal_conv1d` package semantics). x (B, D, T), seq_idx (B, T)."""
+    import torch.nn.functional as F
+    W, T = weight.shape[-1], x.shape[-1]
+    acc = torch.promote_types(weight.dtype, torch.float32)
+    xp = F.pad(x.to(acc), (W - 1, 0))
+    sp = F.pad(seq_idx.to(torch.int64), (W - 1, 0), value = -1)
+    w = weight.to(acc)
+    out = torch.zeros_like(xp[:, :, :T])
+    for j in range(W):
+        same = (sp[:, j:j + T] == seq_idx).unsqueeze(1)
+        out = out + xp[:, :, j:j + T] * w[:, j].view(1, -1, 1) * same
+    if bias is not None:
+        out = out + bias.to(acc).view(1, -1, 1)
+    out = out.to(weight.dtype)
+    if activation is not None:
+        out = F.silu(out)
+    return out.to(x.dtype)
+
+
+def _legacy_causal_conv1d_fn(x, weight, bias = None, activation = None, **kwargs):
+    """Stands in for `causal_conv1d.causal_conv1d_fn` on transformers < 5.15, whose
+    GatedDeltaNet calls `self.causal_conv1d_fn(x=, weight=, bias=, activation=,
+    seq_idx=...)` only when the global is not None.
+
+    `seq_idx` is not a named parameter on purpose: unsloth's hybrid packing gate
+    enables packing when the conv signature names it. Passed (transformers 5.9 to
+    5.14 forward `kwargs.get("seq_idx")`), it is honoured by a per-segment torch path."""
+    seq_idx = kwargs.pop("seq_idx", None)
+    unsupported = sorted(k for k, v in kwargs.items() if v is not None and v is not False)
+    if unsupported:
         raise NotImplementedError(
-            "Unsloth: the torch causal_conv1d fallback does not support "
-            "seq_idx / initial_states / final states."
+            f"Unsloth: the torch causal_conv1d fallback does not support {unsupported}."
         )
+    if seq_idx is None:
+        out = _try_fast(x, weight, bias, activation)
+        if out is not None:
+            return out
+    GDN_CAUSAL_CONV1D_STATS["fallback"] += 1
+    if seq_idx is not None:
+        return _causal_conv1d_reference_seq_idx(x, weight, bias, activation, seq_idx)
     return causal_conv1d_reference(x, weight, bias, activation)
 
 
@@ -417,23 +433,19 @@ setattr(_legacy_causal_conv1d_fn, _MARK, True)
 
 
 def _is_gdn_function(torch_function):
-    module = getattr(torch_function, "__module__", "") or ""
-    for package in _GDN_MODELING:
-        if module.endswith(f"modeling_{package}") or module.endswith(f"unsloth_compiled_module_{package}"):
-            return True
-    return False
+    module = getattr(torch_function, "__module__", None) or ""
+    return module.rsplit(".", 1)[-1] in _GDN_LEAVES
 
 
 def _patch_hub_decorator():
-    """Wrap `use_kernel_func_from_hub_with_fallback` so a GatedDeltaNet
-    `causal_conv1d_fn` decorated later (including Unsloth's compiled copies, which
-    import the decorator from the modeling module) gets the Triton dispatch."""
+    """Wrap `use_kernel_func_from_hub_with_fallback` (transformers >= 5.15) so a
+    GatedDeltaNet `causal_conv1d_fn` decorated later (including Unsloth's compiled
+    copies, which import the decorator from the modeling module) gets the Triton dispatch."""
     try:
+        import transformers.integrations as integrations
         from transformers.integrations import hub_kernels
+        original = hub_kernels.use_kernel_func_from_hub_with_fallback
     except Exception:
-        return None
-    original = getattr(hub_kernels, "use_kernel_func_from_hub_with_fallback", None)
-    if original is None:
         return None
     if getattr(original, _HUB_MARK, False):
         return original
@@ -443,113 +455,65 @@ def _patch_hub_decorator():
         decorator = original(func_name, package, *args, **kwargs)
         if func_name != "causal_conv1d_fn" or package != "causal_conv1d":
             return decorator
-
-        def wrap(torch_function):
-            if _real_causal_conv1d_available() or not _is_gdn_function(torch_function):
-                return decorator(torch_function)
-            return decorator(_make_hub_dispatch(torch_function))
-
-        return wrap
+        # A usable package still wins: the hub wrapper only calls this torch fallback without it.
+        return lambda fn: decorator(_make_hub_dispatch(fn) if _is_gdn_function(fn) else fn)
 
     setattr(use_kernel_func_from_hub_with_fallback, _HUB_MARK, True)
     hub_kernels.use_kernel_func_from_hub_with_fallback = use_kernel_func_from_hub_with_fallback
-    try:
-        import transformers.integrations as integrations
-        if getattr(integrations, "use_kernel_func_from_hub_with_fallback", None) is original:
-            integrations.use_kernel_func_from_hub_with_fallback = use_kernel_func_from_hub_with_fallback
-    except Exception:
-        pass
+    if getattr(integrations, "use_kernel_func_from_hub_with_fallback", None) is original:
+        integrations.use_kernel_func_from_hub_with_fallback = use_kernel_func_from_hub_with_fallback
     return use_kernel_func_from_hub_with_fallback
 
 
 def _rebind_module(module, patched_decorator):
     """Rebind one already-imported modeling (or compiled) module. Returns True if
-    its `causal_conv1d_fn` now dispatches to Triton."""
-    if module is None:
-        return False
-    if patched_decorator is not None and "use_kernel_func_from_hub_with_fallback" in vars(module):
-        current = module.use_kernel_func_from_hub_with_fallback
-        if not getattr(current, _HUB_MARK, False):
-            module.use_kernel_func_from_hub_with_fallback = patched_decorator
-
-    if "causal_conv1d_fn" not in vars(module):
+    its `causal_conv1d_fn` now dispatches to Triton. Only called without a usable
+    `causal_conv1d` package, and re-decorating re-resolves the implementation, so a
+    wrapper that captured a since-disabled package kernel is replaced too."""
+    names = vars(module)
+    if patched_decorator is not None and "use_kernel_func_from_hub_with_fallback" in names:
+        module.use_kernel_func_from_hub_with_fallback = patched_decorator
+    if "causal_conv1d_fn" not in names:
         return False
     current = module.causal_conv1d_fn
     if current is None:
-        # transformers < 5.16: None unless the package imported; the layer copies
+        # transformers < 5.15: None unless the package imported; the layer copies
         # this global onto `self.causal_conv1d_fn` in __init__.
         module.causal_conv1d_fn = _legacy_causal_conv1d_fn
         return True
-    if getattr(current, _MARK, False):
+    if _is_marked(current):
         return True
     torch_function = getattr(current, "__wrapped__", None)
     if torch_function is None or patched_decorator is None:
         return False
-    # Only replace a wrapper that resolved to its own torch fallback.
-    implementation = None
-    code = getattr(current, "__code__", None)
-    for name, cell in zip(getattr(code, "co_freevars", ()), getattr(current, "__closure__", None) or ()):
-        if name == "implementation":
-            try:
-                implementation = cell.cell_contents
-            except ValueError:
-                implementation = None
-    if implementation is not None and implementation is not torch_function:
-        return False
-    if implementation is None and _real_causal_conv1d_available():
-        return False
-    try:
-        module.causal_conv1d_fn = patched_decorator("causal_conv1d_fn", "causal_conv1d")(torch_function)
-    except Exception:
-        return False
-    return getattr(module.causal_conv1d_fn, _MARK, False) or _wraps_marked(module.causal_conv1d_fn)
-
-
-def _wraps_marked(fn):
-    seen = 0
-    while fn is not None and seen < 5:
-        if getattr(fn, _MARK, False):
-            return True
-        for cell in getattr(fn, "__closure__", None) or ():
-            try:
-                value = cell.cell_contents
-            except ValueError:
-                continue
-            if callable(value) and getattr(value, _MARK, False):
-                return True
-        fn = getattr(fn, "__wrapped__", None)
-        seen += 1
-    return False
+    module.causal_conv1d_fn = patched_decorator("causal_conv1d_fn", "causal_conv1d")(torch_function)
+    return _is_marked(module.causal_conv1d_fn)
 
 
 def patch_gdn_causal_conv1d():
-    if _disabled():
-        return False
-    if _real_causal_conv1d_available():
-        return False
+    if _disabled() or _real_causal_conv1d_available():
+        return
+    if not torch.cuda.is_available() or torch.version.hip is not None:
+        return
     try:
-        if not torch.cuda.is_available() or getattr(torch.version, "hip", None) is not None:
-            return False
         import triton  # noqa: F401
     except Exception:
-        return False
+        return
 
     patched_decorator = _patch_hub_decorator()
-    rebound = []
-    for package in _GDN_MODELING:
-        name = f"transformers.models.{package}.modeling_{package}"
-        # Not imported yet: the patched decorator covers its first import.
-        if _rebind_module(sys.modules.get(name), patched_decorator):
-            rebound.append(name)
-    for name in sorted(list(sys.modules)):
-        leaf = name.rsplit(".", 1)[-1]
-        if leaf not in tuple(f"unsloth_compiled_module_{p}" for p in _GDN_MODELING):
-            continue
-        if _rebind_module(sys.modules.get(name), patched_decorator):
-            rebound.append(name)
+    # Modeling modules not imported yet are covered by the patched decorator.
+    names = [f"transformers.models.{p}.modeling_{p}" for p in _GDN_MODELING]
+    names += sorted(
+        name for name in list(sys.modules)
+        if name.rsplit(".", 1)[-1].startswith("unsloth_compiled_module_")
+        and name.rsplit(".", 1)[-1] in _GDN_LEAVES
+    )
+    rebound = [
+        name for name in names
+        if sys.modules.get(name) is not None and _rebind_module(sys.modules[name], patched_decorator)
+    ]
     if rebound and UNSLOTH_ENABLE_LOGGING:
         logger.info(f"Unsloth: Triton causal_conv1d for the GatedDeltaNet short conv on {', '.join(rebound)}")
-    return bool(rebound) or patched_decorator is not None
 
 
 TEMPORARY_PATCHES.append(patch_gdn_causal_conv1d)
