@@ -54,7 +54,11 @@ import inspect
 from functools import partial
 from .utils import _get_dtype, get_quant_type, Version
 from .empty_model import *
-from .empty_model import _is_gemma4_config, _resolve_safetensors_index
+from .empty_model import (
+    _is_gemma4_config,
+    _import_vllm_bnb_loader_module,
+    _resolve_safetensors_index,
+)
 from .hf_utils import (
     dtype_from_config,
     add_dtype_kwargs,
@@ -200,16 +204,7 @@ if importlib.util.find_spec("vllm") is not None:
         return quant_states
     try:
         # Same two homes as the quantization module: in tree, else the plugin.
-        _bnb_loader = None
-        for _loader_path in (
-            "vllm.model_executor.model_loader.bitsandbytes_loader",
-            "vllm_bnb_plugin.bitsandbytes_loader",
-        ):
-            try:
-                _bnb_loader = importlib.import_module(_loader_path)
-                break
-            except ImportError:
-                continue
+        _bnb_loader = _import_vllm_bnb_loader_module()
         if _bnb_loader is None:
             raise ImportError("no bitsandbytes model loader")
         if hasattr(_bnb_loader, "dequantize_dq"):
@@ -530,10 +525,8 @@ if _bitsandbytes_is_usable():
         assert set(qs_dict.keys()).issubset(cls.valid_qs_keys)
 
         if "nested_absmax" in qs_dict:
-            # Must use float32 and disable autocasting - vLLM fails!
-            # offset = torch.tensor(float(qs_dict["nested_offset"])).to(device)
-            with torch.autocast(device_type = "cuda", enabled = False):
-                offset = torch.tensor(qs_dict["nested_offset"], dtype = torch.float32, device = "cuda")
+            # Must use float32 - vLLM fails! On `device`, not "cuda", so XPU and CPU loads work.
+            offset = torch.tensor(qs_dict["nested_offset"], dtype = torch.float32, device = device)
             state2 = cls(
                 absmax=qs_dict["nested_absmax"].to(device),
                 blocksize=qs_dict["nested_blocksize"],
@@ -1758,6 +1751,12 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
             set_dtype_in_config(subconfig, dtype)
     new_model, original_meta_model, layer_count, layer_names = create_empty_model(config, dtype, is_vision_model)
     new_model = new_model.to(device = get_target_device(), dtype = dtype)
+    flattened_vision_towers = []
+    if is_vision_model:
+        # vLLM names SigLIP weights tower.vision_model.*; transformers 5 flattened that tower.
+        quant_state_dict, layer_names, flattened_vision_towers = align_vision_tower_names(
+            new_model, quant_state_dict, layer_names,
+        )
     quantization_config = getattr(config, "quantization_config", {})
     quant_method = get_quant_type(config)
     kwargs = dict()
@@ -1982,6 +1981,14 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     # finalize copies every buffer from the meta template (e.g. zeroed LFM2-MoE expert_bias)
     for parent, attr_name, raw_value in loaded_buffers:
         parent._buffers[attr_name] = raw_value
+
+    if flattened_vision_towers and original_meta_model is not None:
+        problems = vision_tower_census(new_model, original_meta_model, flattened_vision_towers)
+        if problems:
+            listed = "\n".join(f"  {name}: {problem}" for name, problem in problems[:20])
+            raise RuntimeError(
+                f"Unsloth: rebuilt vision tower does not match the HF model ({len(problems)} problems):\n{listed}"
+            )
 
     # Must override or else Bitsandbytes will error
     new_model.to = partial(_override_to, new_model)
@@ -3914,6 +3921,8 @@ def load_vllm(
                 if "gpu_memory_utilization" in error or "memory" in error:
                     approx_max_num_seqs = max(int(approx_max_num_seqs * 0.75), 1)
                     engine_args["max_num_seqs"] = approx_max_num_seqs
+                    max_num_batched_tokens = min(max_num_batched_tokens, approx_max_num_seqs * max_seq_length)
+                    engine_args["max_num_batched_tokens"] = max_num_batched_tokens
                     engine_args["gpu_memory_utilization"] *= 0.85
                     print(
                         f"Unsloth: Retrying vLLM to process {approx_max_num_seqs} sequences and {max_num_batched_tokens} tokens in tandem.\n"\

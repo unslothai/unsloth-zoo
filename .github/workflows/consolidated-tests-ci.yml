@@ -424,11 +424,13 @@ jobs:
         # test_mlx_embedding_guards: sentence-transformers layout shim and pooling-mode map, under the torch shim.
         # test_output_collector_compile: the capture_outputs collector mirror compiles fullgraph and stays per thread / context.
         # test_top_level_imports_are_declared: every package a zoo module imports at module level is a declared dependency.
+        # test_xpu_device_typed_autocast: nested bnb offset, Gemma3n fp32 regions and unsloth_train autocast follow the accelerator, not "cuda".
         run: |
           python -m pytest \
             tests/test_top_level_imports_are_declared.py \
             tests/test_training_utils_use_cache.py \
             tests/test_unsloth_train_scheduler_kwargs.py \
+            tests/test_xpu_device_typed_autocast.py \
             tests/test_loss_normalization_contract.py \
             tests/test_mlx_finetune_last_n_layers.py \
             tests/test_mlx_double_quant_reject.py \

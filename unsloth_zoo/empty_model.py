@@ -25,6 +25,9 @@ __all__ = [
     "vllm_moe_expert_weights",
     "verify_vllm_moe_experts_match_checkpoint",
     "extract_vision_layers",
+    "align_vision_tower_names",
+    "vision_tower_census",
+    "vllm_vision_name_to_hf",
     "get_model_layer_config",
     "compare_attributes",
     "copy_attributes",
@@ -492,10 +495,36 @@ pass
 
 # Prequantized BnB Gemma4 k_eq_v layers lack a synthetic v quant-state shard;
 # we duplicate K -> V at loader-side quant-state stacking time.
+# vLLM 0.28 (PR #43529) moved the BnB loader into vllm-bnb-plugin, same class names.
+_VLLM_BNB_LOADER_PATHS = (
+    "vllm.model_executor.model_loader.bitsandbytes_loader",  # vLLM <= 0.27.1
+    "vllm_bnb_plugin.bitsandbytes_loader",                   # vLLM >= 0.28
+)
+
+
+def _import_vllm_bnb_loader_module():
+    import importlib
+    for path in _VLLM_BNB_LOADER_PATHS:
+        try:
+            return importlib.import_module(path)
+        except ImportError:
+            continue
+    return None
+pass
+
+
 def patch_gemma4_vllm_k_eq_v_support():
-    from vllm.model_executor.model_loader.bitsandbytes_loader import (
-        BitsAndBytesModelLoader,
-    )
+    bnb_loader = _import_vllm_bnb_loader_module()
+    if bnb_loader is None:
+        # Otherwise vLLM only says "Unknown quantization method: bitsandbytes".
+        raise RuntimeError(
+            "Unsloth: vLLM >= 0.28 moved bitsandbytes out of tree. "
+            "Install it with `pip install vllm-bnb-plugin` to load bitsandbytes "
+            "Gemma 4 models with fast_inference."
+        )
+    BitsAndBytesModelLoader = getattr(bnb_loader, "BitsAndBytesModelLoader", None)
+    if BitsAndBytesModelLoader is None:
+        return
 
     stack_quantization_states = getattr(
         BitsAndBytesModelLoader, "_stack_quantization_states", None,
@@ -1473,6 +1502,89 @@ def _get_nested_attr(obj, attr_path: str):
     except (AttributeError, IndexError):
         return None
     return None
+
+
+_VISION_MODEL_SEGMENT = ".vision_model."
+
+
+def _vision_tower_is_flat(new_model, parent_path, child, cache):
+    """True if the built HF tower owns `child` directly (transformers 5 flat SigLIP), checked on the module, not the version."""
+    key = (parent_path, child)
+    if key not in cache:
+        module = _get_nested_attr(new_model, parent_path)
+        cache[key] = (
+            isinstance(module, torch.nn.Module)
+            and not isinstance(getattr(module, "vision_model", None), torch.nn.Module)
+            and hasattr(module, child)
+        )
+    return cache[key]
+
+
+def vllm_vision_name_to_hf(name, new_model, cache = None):
+    """Map a vLLM vision weight name onto the HF model's layout (drops `.vision_model.` if flat)."""
+    if cache is None: cache = {}
+    index = name.find(_VISION_MODEL_SEGMENT)
+    if index <= 0:
+        return name
+    parent_path = name[:index]
+    rest = name[index + len(_VISION_MODEL_SEGMENT):]
+    if _vision_tower_is_flat(new_model, parent_path, rest.split(".", 1)[0], cache):
+        return f"{parent_path}.{rest}"
+    return name
+
+
+def align_vision_tower_names(new_model, quant_state_dict, layer_names):
+    """Rename vLLM vision keys / layer names to the HF tower layout; returns (state_dict, layer_names, flattened_paths)."""
+    from collections import OrderedDict
+    cache = {}
+    renamed = OrderedDict()
+    for key, value in quant_state_dict.items():
+        new_key = vllm_vision_name_to_hf(key, new_model, cache)
+        if new_key != key and new_key in quant_state_dict:
+            raise RuntimeError(
+                f"Unsloth: vLLM state dict has both `{key}` and `{new_key}`; cannot map the vision tower."
+            )
+        renamed[new_key] = value
+    layer_names = list(dict.fromkeys(vllm_vision_name_to_hf(name, new_model, cache) for name in layer_names))
+    flattened = sorted({parent_path for (parent_path, _), flat in cache.items() if flat})
+    return renamed, layer_names, flattened
+
+
+def vision_tower_census(new_model, reference_model, tower_paths):
+    """[(name, problem)] for missing / misshaped / meta params and buffers or self-aliasing modules in the rebuilt towers."""
+    problems = []
+    for tower_path in tower_paths:
+        tower = _get_nested_attr(new_model, tower_path)
+        reference = _get_nested_attr(reference_model, tower_path)
+        if not isinstance(tower, torch.nn.Module) or not isinstance(reference, torch.nn.Module):
+            problems.append((tower_path, "tower module not found"))
+            continue
+        for module_name, module in tower.named_modules():
+            for child_name, child in module._modules.items():
+                if child is module:
+                    problems.append((f"{tower_path}.{module_name}.{child_name}".replace("..", "."), "module aliases itself"))
+        for kind, rebuilt, expected in (
+            ("parameter", dict(tower.named_parameters()), dict(reference.named_parameters())),
+            ("buffer", dict(tower.named_buffers()), dict(reference.named_buffers())),
+        ):
+            for name, ref in expected.items():
+                full = f"{tower_path}.{name}"
+                got = rebuilt.get(name)
+                if got is None:
+                    problems.append((full, f"{kind} missing"))
+                    continue
+                # bitsandbytes packs 4-bit weights; the logical shape lives on quant_state
+                quant_state = getattr(got, "quant_state", None)
+                shape = tuple(getattr(quant_state, "shape", None) or got.shape)
+                if shape != tuple(ref.shape):
+                    problems.append((full, f"{kind} shape {shape} != {tuple(ref.shape)}"))
+                elif got.device.type == "meta":
+                    problems.append((full, f"{kind} still on meta"))
+            for name in rebuilt.keys() - expected.keys():
+                if "scale" in name.rsplit(".", 1)[-1]:
+                    continue  # quantized layers add weight_scale / weight_scale_inv
+                problems.append((f"{tower_path}.{name}", f"unexpected {kind}"))
+    return problems
 
 
 def vllm_moe_expert_weights(experts, where, config = None):
