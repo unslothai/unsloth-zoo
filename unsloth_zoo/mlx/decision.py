@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Decision models on MLX, inference only.
+"""Decision models on MLX: loading, serving, saving and what fine-tuning needs from the model. `MLXDecisionTrainer` is in `trainer`.
 
 `load_decision_model` loads any supported decision model from its source repo. The result answers typed-decision requests
 (`choice` / `score` / `noul`) through `answer`; request validation, prompts, calibration and answers follow llama.cpp's decision
@@ -23,10 +23,12 @@ endpoint, so a model answers the same here as its GGUF does there. A Laya or Jul
 """
 
 import copy
+import contextlib
 import json
 import math
 import os
 import re
+import shutil
 import tempfile
 from dataclasses import dataclass
 from functools import partial
@@ -35,13 +37,26 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from mlx.utils import tree_flatten, tree_map, tree_unflatten
 
 __all__ = [
     "DecisionModel",
     "DecisionPipeline",
     "DecisionRequestError",
     "DecisionUnsupportedError",
+    "add_lora_adapters",
+    "clef_logits",
+    "clef_option_keys",
+    "clef_training_item",
+    "clef_training_network",
+    "collate_decisions",
+    "decision_logits",
     "load_decision_model",
+    "load_language_model_as_clef",
+    "load_trainable_decision_model",
+    "save_clef_adapter",
+    "save_clef_model",
+    "save_decision_model",
 ]
 
 
@@ -139,10 +154,13 @@ class _Encoder(nn.Module):
             config["hidden_size"], eps = config.get("norm_eps", 1e-5), bias = config.get("norm_bias", False)
         )
 
-    def __call__(self, input_ids, keys):
-        positions = mx.arange(input_ids.shape[1])
+    def masks(self, keys):
+        positions = mx.arange(keys.shape[-1])
         near = mx.abs(positions[:, None] - positions[None, :]) <= self.window
-        masks = {"full_attention": keys, "sliding_attention": keys & near}
+        return {"full_attention": keys, "sliding_attention": keys & near}
+
+    def __call__(self, input_ids, keys):
+        masks = self.masks(keys)
         x = self.embeddings(input_ids)
         for layer in self.layers:
             x = layer(x, masks[layer.layer_type])
@@ -150,11 +168,12 @@ class _Encoder(nn.Module):
 
 
 class _HeadAttention(nn.Module):
-    def __init__(self, dims, heads):
+    def __init__(self, dims, heads, dropout):
         super().__init__()
         self.heads = heads
         self.in_proj = _Linear(dims, 3 * dims)
         self.out_proj = _Linear(dims, dims)
+        self.dropout = nn.Dropout(dropout)
 
     def __call__(self, x, mask, rows = None):
         B, _, D = x.shape
@@ -162,15 +181,22 @@ class _HeadAttention(nn.Module):
         if rows is not None:
             q = _gather_rows(q, rows)
         q, k, v = (t.reshape(B, t.shape[1], self.heads, -1).transpose(0, 2, 1, 3) for t in (q, k, v))
-        out = mx.fast.scaled_dot_product_attention(q, k, v, scale = q.shape[-1]**-0.5, mask = mask)
+        scale = q.shape[-1]**-0.5
+        if self.training:
+            # The fused attention cannot drop attention weights, which torch does in training.
+            weights = mx.softmax(mx.where(mask, (q * scale) @ k.swapaxes(-1, -2), -mx.inf), axis = -1)
+            out = self.dropout(weights) @ v
+        else:
+            out = mx.fast.scaled_dot_product_attention(q, k, v, scale = scale, mask = mask)
         return self.out_proj(out.transpose(0, 2, 1, 3).reshape(B, -1, D))
 
 
 class _HeadLayer(nn.Module):
     # torch.nn.TransformerEncoderLayer(norm_first = True) with its default ReLU feed-forward.
-    def __init__(self, dims, heads):
+    def __init__(self, dims, heads, dropout):
         super().__init__()
-        self.self_attn = _HeadAttention(dims, heads)
+        self.self_attn = _HeadAttention(dims, heads, dropout)
+        self.dropout = nn.Dropout(dropout)
         self.norm1 = nn.LayerNorm(dims)
         self.norm2 = nn.LayerNorm(dims)
         self.linear1 = _Linear(dims, 4 * dims)
@@ -178,31 +204,35 @@ class _HeadLayer(nn.Module):
 
     def __call__(self, x, mask, rows = None):
         # `rows`: queries and feed-forward only at those rows (the scored markers); keys and values span every token.
-        attended = self.self_attn(self.norm1(x), mask, rows)
+        attended = self.dropout(self.self_attn(self.norm1(x), mask, rows))
         x = (x if rows is None else _gather_rows(x, rows)) + attended
-        return x + self.linear2(nn.relu(self.linear1(self.norm2(x))))
+        return x + self.dropout(self.linear2(self.dropout(nn.relu(self.linear1(self.norm2(x))))))
 
 
 class _Head(nn.Module):
-    def __init__(self, dims, count):
+    def __init__(self, dims, count, dropout):
         super().__init__()
-        self.layers = [_HeadLayer(dims, max(1, dims // 64)) for _ in range(count)]
+        self.layers = [_HeadLayer(dims, max(1, dims // 64), dropout) for _ in range(count)]
 
 
 class DecisionModel(nn.Module):
-    """Upstream `DecisionModel` without the act head. Parameter names follow the checkpoint."""
+    """Upstream `DecisionModel` without the act head. Parameter names follow the checkpoint; `dropout` is the head's and applies only in training."""
 
-    def __init__(self, encoder_config, head_layers):
+    def __init__(self, encoder_config, head_layers, dropout = 0.1):
         super().__init__()
         dims = encoder_config["hidden_size"]
         self.encoder = _Encoder(encoder_config)
-        self.head = _Head(dims, head_layers)
+        self.head = _Head(dims, head_layers, dropout)
         self.type_emb = nn.Embedding(3, dims)
         self.scorer = [nn.LayerNorm(dims), _Linear(dims, dims), nn.GELU(), _Linear(dims, 1)]
 
     def __call__(self, input_ids, attention_mask, marker_pos, marker_mask, qtype):
         keys = attention_mask.astype(mx.bool_)[:, None, None, :]
-        h = self.encoder(input_ids, keys) + self.type_emb(qtype)[:, None, :]
+        return self.decide(self.encoder(input_ids, keys), keys, marker_pos, marker_mask, qtype)
+
+    def decide(self, hidden, keys, marker_pos, marker_mask, qtype):
+        """Decision logits from the encoder's output."""
+        h = hidden + self.type_emb(qtype)[:, None, :]
         layers = self.head.layers
         for layer in layers[:-1]:
             h = layer(h, keys)
@@ -502,14 +532,16 @@ class _MarkerModel(DecisionPipeline):
         return self.tokenizer.encode(text, add_special_tokens = False).ids
 
     def _option_text(self, kind, key, description):
+        # Only None and "" mean no description: 0 and false are criteria.
+        described = description is not None and description != ""
         if self.julia:
-            return _text(description) if description else key
+            return _text(description) if described else key
         if kind == "choice":
-            return f"{key}: {_text(description)}" if description else key
+            return f"{key}: {_text(description)}" if described else key
         if kind == "score":
             return f"level {key}: {_text(description)}"
         default = "yes, the statement holds" if key == "true" else "no, the statement does not hold"
-        return f"{key}: {_text(description) if description else default}"
+        return f"{key}: {_text(description) if described else default}"
 
     def _prompt(self, state, question):
         if self.tokenizer is None:
@@ -607,16 +639,59 @@ def _adapter_base(folder):
     return config["base_model_name_or_path"], revision
 
 
+def _plain_lora(folder):
+    config = _read_json(folder / "adapter_config.json")
+    unmergeable = [key for key in _UNMERGEABLE if config.get(key)]
+    if config.get("peft_type") != "LORA" or config.get("bias", "none") != "none" or unmergeable:
+        raise ValueError(f"Only a plain LoRA adapter can be put on the base model ({unmergeable or config.get('peft_type')})")
+    return config
+
+
+def _lora_key(name):
+    # PEFT prefixes differ with the class the adapter was trained on; names agree from the layer index on.
+    return name[name.index("layers.") :] if "layers." in name else name.rsplit(".", 1)[-1]
+
+
+def _attach_lora(model, folder):
+    """Put a plain LoRA adapter on the modules it names, as adapters of their own, which a quantized base takes too."""
+    from mlx_lm.tuner.lora import LoRALinear
+
+    config, adapter = _plain_lora(folder), mx.load(str(folder / "adapter_model.safetensors"))
+    stems = {_lora_key(stem): stem for stem in {name.rsplit(".lora_", 1)[0] for name in adapter}}
+    if "lm_head" in stems:
+        raise ValueError(f"The adapter in {folder} is on the output embedding, which a Clef's joint head reads as stored")
+    wrapped = []
+    for path, module in model.named_modules():
+        stem = stems.get(_lora_key(path)) if isinstance(module, (nn.Linear, nn.QuantizedLinear)) else None
+        if stem is None:
+            continue
+        low = LoRALinear.from_base(module, r = config["r"], dropout = float(config.get("lora_dropout") or 0.0), scale = config["lora_alpha"] / config["r"])
+        down, up = adapter[f"{stem}.lora_A.weight"].T, adapter[f"{stem}.lora_B.weight"].T
+        if (down.shape, up.shape) != (low.lora_a.shape, low.lora_b.shape):
+            raise ValueError(f"LoRA tensor {stem} does not fit the base model")
+        low.lora_a, low.lora_b = down, up
+        wrapped.append((path, low))
+    if len(wrapped) != len(stems):
+        raise ValueError(f"The adapter in {folder} names {len(stems)} modules, of which the base model has {len(wrapped)}")
+    model.update_modules(tree_unflatten(wrapped))
+    model.freeze()
+    # New modules start in training mode, where the adapters' dropout would apply while serving.
+    model.eval()
+    mx.eval(model.parameters())
+
+
+def _lora_dropout(module):
+    # mlx.nn.Dropout keeps the keep probability.
+    return round(1.0 - float(getattr(module.dropout, "_p_1", 1.0)), 6)
+
+
 def _merge_lora(model, folder):
     """Fold a plain LoRA adapter into the decoder's weights: W += alpha / r * B @ A."""
     from mlx.utils import tree_flatten, tree_unflatten
 
     from .utils import _get_text_model
 
-    config = _read_json(folder / "adapter_config.json")
-    unmergeable = [key for key in _UNMERGEABLE if config.get(key)]
-    if config.get("peft_type") != "LORA" or config.get("bias", "none") != "none" or unmergeable:
-        raise ValueError(f"Only a plain LoRA adapter can be merged into the base model ({unmergeable or config.get('peft_type')})")
+    config = _plain_lora(folder)
     scale = config["lora_alpha"] / config["r"]
     adapter = mx.load(str(folder / "adapter_model.safetensors"))
     decoder = _get_text_model(model)
@@ -665,24 +740,28 @@ class _QwenModel(DecisionPipeline):
     # Below this many shared tokens a second pass costs more than it saves.
     _MIN_SHARED = 16
 
-    def _load(self, source, revision, dtype, token, adapter = None):
+    def _load(self, source, revision, dtype, token, adapter = None, load_in_4bit = False):
         from .loader import FastMLXModel
 
         self.model, tokenizer = FastMLXModel.from_pretrained(
-            str(source), load_in_4bit = False, load_in_16bit = True, text_only = True, dtype = dtype, revision = revision, token = token,
+            str(source), load_in_4bit = load_in_4bit, load_in_16bit = not load_in_4bit, text_only = True, dtype = dtype, revision = revision, token = token,
         )
         self.tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
         if adapter is not None:
             _merge_lora(self.model, adapter)
+        if load_in_4bit:
+            # The loader leaves the embeddings, the output head and the vision tower in 16-bit for the trainers that
+            # train them. No decision head does, and together they are as large again as the quantized layers.
+            nn.quantize(self.model, 64, 4, class_predicate = lambda _, module: hasattr(module, "to_quantized") and module.weight.shape[-1] % 64 == 0)
         self.model.eval()
 
-    def _load_beside(self, folder, dtype, token, head_prefix):
+    def _load_beside(self, folder, dtype, token, head_prefix, load_in_4bit = False):
         # The decoder is loaded from a view of the folder without the head's files, which a model loader would read as decoder weights.
         with tempfile.TemporaryDirectory() as view:
             for item in folder.iterdir():
                 if not item.name.startswith(head_prefix):
                     os.symlink(item.resolve(), Path(view) / item.name)
-            self._load(view, None, dtype, token)
+            self._load(view, None, dtype, token, None, load_in_4bit)
             mx.eval(self.model.parameters())
 
     def _load_adapter(self, folder, dtype, base_model, token):
@@ -1091,19 +1170,26 @@ class _JointHead(nn.Module):
         features = mx.concatenate([fields, options, fields * options, mx.abs(fields - options)], axis = -1)
         cosine = (_unit(fields) * _unit(options)).sum(axis = -1)
         joint = mx.exp(mx.minimum(self.joint_logit_scale, math.log(100.0))) * cosine + _apply(self.residual_scorer, features).squeeze(-1)
-        logits = (prior + mx.sigmoid(self.residual_gate) * joint).tolist()
-        bounds = [0]
-        for spans in option_spans:
-            bounds.append(bounds[-1] + len(spans))
-        return [logits[start:end] for start, end in zip(bounds, bounds[1:])]
+        # One logit per option, in question order.
+        return prior + mx.sigmoid(self.residual_gate) * joint
 
 
 def _load_joint_head(folder):
-    head = _JointHead(**_read_json(folder / "joint_head_config.json"))
+    head = _JointHead(**_read_json(folder / _CLEF_HEAD_CONFIG))
     head.load_weights([(name, value.astype(mx.float32)) for name, value in mx.load(str(folder / "joint_head.safetensors")).items()], strict = True)
     head.eval()
     mx.eval(head.parameters())
     return head
+
+
+_CLEF_CONFIG = "unsloth_decision_config.json"
+_CLEF_HEAD_CONFIG = "joint_head_config.json"
+
+
+def clef_head_config(hidden_size, width = None):
+    """The shape of a new joint head for a decoder: Clef's own, narrower by default for a small decoder."""
+    width = int(width or (1024 if hidden_size >= 3072 else 512))
+    return {"hidden_size": int(hidden_size), "width": width, "routing_layers": 2, "layers": 4, "heads": max(1, width // 64), "feedforward": 4 * width}
 
 
 def _compact(value):
@@ -1125,9 +1211,49 @@ class ClefModel(_QwenModel):
     _SYSTEM = "Read the complete state and schema. Decide every field jointly. Each answer must be exactly one of that field's allowed options."
     _NOUL = {"true": "The proposition is true or the answer is yes.", "false": "The proposition is false or the answer is no."}
 
-    def __init__(self, folder, dtype, base_model, token):
-        self._load_beside(folder, dtype, token, "joint_head")
+    def __init__(self, folder, dtype, base_model, token, load_in_4bit = False):
+        decoder = folder
+        if (folder / "adapter_config.json").is_file() and not any(folder.glob("model*.safetensors")):
+            # LoRA adapters beside the head. They stay apart from their base, `base_folder`, so that they also sit
+            # on a quantized base and go on training.
+            repo, revision = _adapter_base(folder)
+            decoder = Path(base_model or repo)
+            if not decoder.is_dir():
+                from huggingface_hub import snapshot_download
+
+                decoder = Path(snapshot_download(str(decoder), revision = None if base_model else revision, token = token))
+            self.base_folder = decoder
+        self._load_beside(decoder, dtype, token, "joint_head", load_in_4bit)
+        if decoder != folder:
+            _attach_lora(self.model, folder)
         self.head = _load_joint_head(folder)
+        self.head_config = _read_json(folder / _CLEF_HEAD_CONFIG)
+        # A fine-tune's per-type temperatures are relative to its head temperature, which is kept apart only when
+        # it could not be folded into the head's weights.
+        saved = _read_json(folder / _CLEF_CONFIG)
+        scale = float(saved.get("head_temperature", 1.0))
+        self.temperatures = {kind: scale * min(max(float(t), 0.5), 5.0) for kind, t in zip(_TYPES, saved.get("temperature", []))}
+
+    @classmethod
+    def from_language_model(cls, folder, dtype = None, token = None, head_width = None, head_config = None, seed = 3407, load_in_4bit = False):
+        """A plain language model with a new, untrained joint head, to be trained as a Clef."""
+        self = cls.__new__(cls)
+        self._load_beside(Path(folder), dtype, token, "joint_head", load_in_4bit)
+        _require_clef_source(self.model, folder)
+        hidden_size = _output_rows(self._output_head(), [0]).shape[-1]
+        self.head_config = dict(head_config or clef_head_config(hidden_size, head_width))
+        if self.head_config["hidden_size"] != hidden_size:
+            raise ValueError(f"Unsloth: head_config reads hidden size {self.head_config['hidden_size']}, but {folder} has hidden size {hidden_size}.")
+        mx.random.seed(seed)
+        self.head = _JointHead(**self.head_config)
+        # As the reference head starts: unit-variance type embeddings and Xavier-uniform attention input projections.
+        self.head.type_embedding.weight = mx.random.normal(self.head.type_embedding.weight.shape)
+        for _, module in self.head.named_modules():
+            if isinstance(module, _Attention):
+                module.in_proj_weight = nn.init.glorot_uniform()(module.in_proj_weight)
+        mx.eval(self.head.parameters())
+        self.head.eval()
+        return self
 
     def _pieces(self, state, questions):
         """The prompt as (text, mark) pieces; the model was trained with each piece tokenized on its own."""
@@ -1148,13 +1274,17 @@ class ClefModel(_QwenModel):
             yield "END FIELD\n", None
         yield "\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:", None
 
-    def _scores(self, state, questions):
-        from .generate import generation_mode
-        from .utils import describe_output_head
-
+    def encode(self, state, questions, max_length = None):
+        """Token ids of the prompt and the (start, end) spans the head reads; a state too long for `max_length` loses its end."""
+        pieces = [(self._encode(text), mark) for text, mark in self._pieces(state, questions)]
+        if max_length is not None:
+            # The state is the second piece; everything else is the schema, which must fit whole.
+            room = max_length - sum(len(piece) for piece, _ in pieces) + len(pieces[1][0])
+            if room < 0:
+                raise DecisionRequestError(f"the questions need {max_length - room} tokens before the state; the maximum is {max_length}")
+            pieces[1] = (pieces[1][0][:room], None)
         ids, question_spans, option_spans = [], [], []
-        for text, mark in self._pieces(state, questions):
-            piece = self._encode(text)
+        for piece, mark in pieces:
             if mark and not piece:
                 raise DecisionRequestError("the instructions and the options of a question must not be empty")
             span = (len(ids), len(ids) + len(piece))
@@ -1164,14 +1294,36 @@ class ClefModel(_QwenModel):
             elif mark == "option":
                 option_spans[-1].append(span)
             ids += piece
+        return ids, question_spans, option_spans
+
+    def _output_head(self):
+        from .utils import describe_output_head
+
         output = describe_output_head(self.model)
         if output.status == "unknown" or not output.raw:
             raise ValueError("Clef reads its options from the output embedding too, which this model's output head does not expose")
+        return output
+
+    def logits(self, ids, question_spans, option_spans, types, output = None):
+        """One logit per option of the prompt, in question order; `types` index `_TYPE_IDS`."""
+        output = output or self._output_head()
+        hidden = self._hidden(ids).astype(mx.float32)
+        # The head reads the output embedding but does not train it.
+        lexical = [mx.stop_gradient(_output_rows(output, ids[start:end])) for spans in option_spans for start, end in spans]
+        return self.head(hidden, lexical, question_spans, option_spans, types)
+
+    def _scores(self, state, questions):
+        from .generate import generation_mode
+
+        ids, question_spans, option_spans = self.encode(state, questions)
+        # Found before generation mode, which swaps a quantized head's class.
+        output = self._output_head()
         with generation_mode(self.model):
-            hidden = self._hidden(ids).astype(mx.float32)
-            lexical = [_output_rows(output, ids[start:end]) for spans in option_spans for start, end in spans]
-            logits = self.head(hidden, lexical, question_spans, option_spans, [_TYPE_IDS.index(q.type) for q in questions])
-        return [[scores] for scores in logits], len(ids)
+            logits = self.logits(ids, question_spans, option_spans, [_TYPE_IDS.index(q.type) for q in questions], output).tolist()
+        bounds = [0]
+        for spans in option_spans:
+            bounds.append(bounds[-1] + len(spans))
+        return [[logits[start:end]] for start, end in zip(bounds, bounds[1:])], len(ids)
 
 
 FAMILIES = {"laya": _MarkerModel, "lev": _LevModel, "nimble": _NimbleModel, "openjev": _OpenJevModel, "kev": _KevModel, "clef": ClefModel}
@@ -1198,12 +1350,14 @@ def detect_family(folder):
     return name
 
 
-def load_decision_model(folder, compute_dtype = None, *, family = None, subfolder = None, base_model = None, token = None):
+def load_decision_model(folder, compute_dtype = None, *, family = None, subfolder = None, base_model = None, token = None, load_in_4bit = False):
     """Load a decision model from its source repo: a local folder, or a Hugging Face repo id that is downloaded.
 
     `compute_dtype` is an MLX dtype or its name (default: float32 for the encoder models, the base model's own for the
     others); `family` names the model family when the files that identify it are missing; `subfolder` selects one checkpoint
-    of a repo that ships several; `base_model` replaces the base an adapter names (a folder or repo id).
+    of a repo that ships several; `base_model` replaces the base an adapter names (a folder or repo id). `load_in_4bit`
+    quantizes a Clef's decoder as it loads, to train LoRA adapters over: `save_clef_model` merges them into the
+    checkpoint's own full-precision weights.
     """
     source, folder = folder, Path(folder)
     if not folder.is_dir():
@@ -1222,4 +1376,882 @@ def load_decision_model(folder, compute_dtype = None, *, family = None, subfolde
         raise ValueError(f"{folder} cannot be loaded: {problem}")
     if isinstance(compute_dtype, str):
         compute_dtype = getattr(mx, compute_dtype)
+    if load_in_4bit:
+        if family != "clef":
+            raise ValueError(f"Unsloth: load_in_4bit is for Clef models; a {family} model loads at its own precision.")
+        return FAMILIES[family](folder, compute_dtype, base_model, token, load_in_4bit = True)
     return FAMILIES[family](folder, compute_dtype, base_model, token)
+
+
+def load_language_model_as_clef(path, compute_dtype = None, *, head_width = None, head_config = None, seed = 3407, token = None, load_in_4bit = False):
+    """Load a plain language model (a local folder or a Hugging Face repo id) with a new joint head, to train as a Clef.
+
+    The head is Clef's, 1024 wide for a decoder with hidden size 3072 or more and 512 otherwise unless `head_width` or a
+    whole `head_config` says otherwise, and starts untrained from `seed`, which reseeds MLX's random state. `load_in_4bit` quantizes the decoder as it loads, to train through LoRA adapters. The result trains and saves like a loaded Clef.
+    """
+    folder = Path(path)
+    if not folder.is_dir():
+        from huggingface_hub import snapshot_download
+
+        folder = Path(snapshot_download(str(path), token = token))
+    if isinstance(compute_dtype, str):
+        compute_dtype = getattr(mx, compute_dtype)
+    return ClefModel.from_language_model(folder, compute_dtype, token, head_width, head_config, seed, load_in_4bit)
+
+
+def _state_name(name):
+    return name.replace(".in_proj.weight", ".in_proj_weight").replace(".in_proj.bias", ".in_proj_bias")
+
+
+def _merged_parameters(model):
+    params = dict(tree_flatten(model.parameters()))
+    for path, module in model.named_modules():
+        if "lora_a" in module:
+            delta = (module.scale * module.lora_b.T) @ module.lora_a.T
+            for name in ("weight", "bias"):
+                if f"{path}.linear.{name}" in params:
+                    params[f"{path}.{name}"] = params.pop(f"{path}.linear.{name}")
+            params[f"{path}.weight"] = params[f"{path}.weight"].astype(mx.float32) + delta
+            del params[f"{path}.lora_a"], params[f"{path}.lora_b"]
+    return params
+
+
+def save_decision_model(model, folder, source, agent_config = None):
+    """Write `model` as a float16 Laya checkpoint in `folder`, with any LoRA adapters merged into the saved weights.
+
+    `source` is the checkpoint `model` was loaded from: it supplies the encoder config, the tokenizer and
+    the tensors the MLX model does not hold. `agent_config` replaces its `rl_agent_config.json`.
+    """
+    folder, source = Path(folder), Path(source)
+    if agent_config is None:
+        agent_config = json.loads((source / "rl_agent_config.json").read_text(encoding = "utf-8"))
+    weights = {
+        name: value
+        for name, value in mx.load(str(source / "model.safetensors")).items()
+        if name.startswith("act_head.") or name == "temperature"
+    }
+    weights.update((_state_name(name), value) for name, value in _merged_parameters(model).items())
+    weights = {name: value.astype(mx.float16) for name, value in weights.items()}
+    for name, value in weights.items():
+        if not mx.isfinite(value).all().item():
+            raise ValueError(f"Unsloth: {name} has NaN or values too large for float16, so the model cannot be saved.")
+
+    folder.mkdir(parents = True, exist_ok = True)
+    (folder / "rl_agent_config.json").unlink(missing_ok = True)
+    # Replaced, not written in place: in a Hugging Face cache the file is a link to a blob other revisions share.
+    partial = folder / "model.partial.safetensors"
+    mx.save_safetensors(str(partial), weights)
+    os.replace(partial, folder / "model.safetensors")
+    if folder.resolve() != source.resolve():
+        for name in ("encoder", "tokenizer"):
+            shutil.copytree(source / name, folder / name, dirs_exist_ok = True)
+    # Written last: a folder with rl_agent_config.json is a complete checkpoint.
+    partial = folder / "rl_agent_config.json.tmp"
+    partial.write_text(json.dumps(agent_config, indent = 2), encoding = "utf-8")
+    os.replace(partial, folder / "rl_agent_config.json")
+
+
+def _fold_temperature(head, temperature):
+    """Divide the joint head's logits by `temperature` inside its weights; False when a logit scale would pass its cap."""
+    cap = math.log(100.0)
+    scales = {name: min(head[name].item(), cap) - math.log(temperature) for name in ("prior_logit_scale", "joint_logit_scale")}
+    if max(scales.values()) > cap:
+        return False
+    head.update((name, mx.array(value, mx.float32)) for name, value in scales.items())
+    for name in ("residual_scorer.3.weight", "residual_scorer.3.bias"):
+        head[name] = head[name] / temperature
+    return True
+
+
+def _add_in_slices(name, value, terms):
+    """`value` plus the signed `terms`, in float32 and back in its dtype; refuses a result that is not finite."""
+    def add(value, *arrays):
+        # The terms first: equal ones then cancel exactly and leave `value` as it was.
+        total = sum(sign * array.astype(mx.float32) for (sign, _), array in zip(terms, arrays))
+        result = (value.astype(mx.float32) + total).astype(value.dtype)
+        if not mx.isfinite(result).all().item():
+            raise ValueError(f"Unsloth: {name} has values that are not finite, so the model cannot be saved.")
+        return result
+
+    # A slice at a time: one graph over a multi-gigabyte embedding is more than a single GPU command may run.
+    arrays, step = [array for _, array in terms], max(1, (1 << 25) // max(1, value.size // value.shape[0]))
+    parts = [add(value[start : start + step], *(array[start : start + step] for array in arrays)) for start in range(0, value.shape[0], step)]
+    return parts[0] if len(parts) == 1 else mx.concatenate(parts)
+
+
+def _stored_tensors(source):
+    """(file, dtype, shape) of each tensor in a checkpoint folder, by name, read from the files' headers."""
+    stored = {}
+    for shard in sorted(Path(source).glob("model*.safetensors")):
+        with open(shard, "rb") as stream:
+            header = json.loads(stream.read(int.from_bytes(stream.read(8), "little")))
+        stored.update({name: (shard, entry["dtype"], tuple(entry["shape"])) for name, entry in header.items() if name != "__metadata__"})
+    return stored
+
+
+def _decoder_tensor_name(decoder, path, stored = ()):
+    name = path
+    if "language_model" in decoder:
+        # transformers stores a decoder inside a vision-language wrapper under other names than it is loaded with.
+        name = None
+        for prefix, saved in (("language_model.model.", "model.language_model."), ("language_model.lm_head.", "lm_head.")):
+            if path.startswith(prefix):
+                name = saved + path[len(prefix) :]
+    # An MLX conversion keeps the names its weights are loaded with.
+    return path if name not in stored and path in stored else name
+
+
+def _require_clef_source(decoder, source):
+    # Saving adds what training changed to the source's own tensors, so each decoder weight needs its counterpart there.
+    stored = _stored_tensors(source)
+    weights = tree_flatten(decoder.parameters())
+    quantized = {path.rpartition(".")[0] for path, _ in weights if path.endswith(".scales")}
+    for path, value in weights:
+        name, stem = _decoder_tensor_name(decoder, path, stored), path.rpartition(".")[0]
+        if name is None or stem in quantized and not path.endswith(".weight"):
+            continue
+        _, dtype, shape = stored.get(name) or (None, "", ())
+        if stem in quantized and "F" in dtype:
+            # Quantized on load: the weight keeps its name and rows but not its columns.
+            fits = shape[0] == value.shape[0]
+        else:
+            # transformers stores convolution kernels channels-first, an MLX conversion as they are loaded.
+            fits = shape in (value.shape, value.swapaxes(1, 2).shape if value.ndim == 3 else value.shape)
+        if not fits:
+            raise ValueError(f"Unsloth: {source} cannot be trained as a Clef here: it holds no tensor for the decoder's {path} in a layout MLX reads.")
+
+
+def _clef_decoder_deltas(decoder, source):
+    """What training added to the decoder's weights, by checkpoint tensor name, as signed terms."""
+    stored = _stored_tensors(source)
+
+    def name(path):
+        return _decoder_tensor_name(decoder, path, stored)
+
+    deltas = {}
+    for path, module in decoder.named_modules():
+        if "lora_a" in module:
+            if type(module).__name__ != "LoRALinear" or name(f"{path}.weight") is None:
+                raise ValueError(f"Unsloth: the adapter on {path} cannot be merged into a Clef checkpoint.")
+            deltas[name(f"{path}.weight")] = [(1, (module.scale * module.lora_b.T) @ module.lora_a.T)]
+    trained = [
+        (path, value) for path, value in tree_flatten(decoder.trainable_parameters())
+        if path.rsplit(".", 1)[-1] not in ("lora_a", "lora_b")
+    ]
+    if trained:
+        # Weights trained whole: the difference to a fresh load, so whatever the loader converts on the way in cancels out.
+        fresh = ClefModel.__new__(ClefModel)
+        fresh._load_beside(source, None, None, "joint_head")
+        fresh = dict(tree_flatten(fresh.model.parameters()))
+        for path, value in trained:
+            if name(path) is None:
+                raise ValueError(f"Unsloth: the trained {path} has no place in a Clef checkpoint.")
+            deltas.setdefault(name(path), []).extend([(1, value), (-1, fresh[path])])
+    return deltas
+
+
+def _apart(folder, source):
+    folder, source = Path(folder), Path(source)
+    if folder.resolve() == source.resolve():
+        # The trained model is the source plus what training added, so the source has to stay as it was loaded.
+        raise ValueError(f"Unsloth: a fine-tuned Clef cannot be saved over {source}, the checkpoint it was loaded from.")
+    return folder, source
+
+
+def _clef_head(pipeline, config, exact = False):
+    """The joint head's tensors as they are saved; `config`'s `head_temperature` is folded into them when they can absorb it.
+
+    `exact` is for a checkpoint training resumes from: float32, with nothing folded in."""
+    head = dict(tree_flatten(pipeline.head.parameters()))
+    if exact:
+        return {name: value.astype(mx.float32) for name, value in head.items()}
+    temperature = float(config.pop("head_temperature", 1.0))
+    if temperature != 1.0:
+        if _fold_temperature(head, temperature):
+            config["folded_temperature"] = float(config.get("folded_temperature", 1.0)) * temperature
+        else:
+            config["head_temperature"] = temperature
+    # The released heads are bfloat16 with their three scalar gates kept in float32.
+    head = {name: value.astype(mx.bfloat16 if value.ndim else mx.float32) for name, value in head.items()}
+    for name, value in head.items():
+        if not mx.isfinite(value).all().item():
+            raise ValueError(f"Unsloth: {name} has values that are not finite, so the model cannot be saved.")
+    return head
+
+
+_TOKENIZER_FILES = ("tokenizer*", "special_tokens_map.json", "added_tokens.json", "vocab.*", "merges.txt", "chat_template*", "*.model")
+
+
+def _commit_clef(pipeline, staging, folder, source, head, config, copied = ("*",)):
+    """Finish a Clef folder staged in `staging`: the head, the configs and the source's `copied` files, then move it into place."""
+    mx.save_safetensors(str(staging / "joint_head.safetensors"), head, metadata = {"format": "pt"})
+    (staging / _CLEF_CONFIG).write_text(json.dumps(config, indent = 2), encoding = "utf-8")
+    (staging / _CLEF_HEAD_CONFIG).write_text(json.dumps(pipeline.head_config, indent = 2), encoding = "utf-8")
+    skipped = {"README.md", _CLEF_CONFIG, "joint_head.safetensors"}
+    for item in {item for pattern in copied for item in source.glob(pattern)}:
+        if item.is_file() and not item.name.startswith(".") and item.name not in skipped and not (staging / item.name).exists():
+            shutil.copyfile(item, staging / item.name)
+    # The head's file makes a folder a checkpoint: an old one goes first and the new one last, so an interrupted
+    # save over an earlier checkpoint never reads as complete.
+    (folder / "joint_head.safetensors").unlink(missing_ok = True)
+    staged = sorted(staging.iterdir(), key = lambda item: item.name == "joint_head.safetensors")
+    for item in staged:
+        os.replace(item, folder / item.name)
+    kept = {item.name for item in staged}
+    # What would make the folder read as the other kind of save, merged weights or adapters.
+    for item in [*folder.glob("model*.safetensors"), *(folder / name for name in ("model.safetensors.index.json", "config.json", "adapter_config.json", "adapter_model.safetensors"))]:
+        if item.name not in kept:
+            item.unlink(missing_ok = True)
+
+
+def save_clef_model(pipeline, folder, source, config = None):
+    """Write a trained Clef pipeline as a Clef checkpoint in `folder`, in the layout of the released models.
+
+    `source` is the checkpoint it was loaded from. LoRA adapters are merged into the source weights, so a decoder
+    quantized on load still saves at the source precision, and a source that is itself MLX-quantized is requantized as
+    it was; a full fine-tune adds what its weights moved by since loading. `config` becomes
+    `unsloth_decision_config.json`; its `head_temperature` is folded into the head when the head can absorb it.
+    """
+    folder, source = _apart(folder, source)
+    config = {"layout": "clef", "temperature": [1.0, 1.0, 1.0], **(config or {}), "fine_tuned": True}
+    deltas, stored, refitted = _clef_decoder_deltas(pipeline.model, source), _stored_tensors(source), {}
+    quantization = _read_json(source / "config.json").get("quantization", {})
+
+    def refit(stem, leaf, tensors):
+        # A weight the source holds quantized: dequantized, updated and quantized again as it was.
+        if stem not in refitted:
+            names = [f"{stem}.{part}" for part in ("weight", "scales", "biases") if f"{stem}.{part}" in stored]
+            parts = {name.rpartition(".")[2]: (tensors if name in tensors else mx.load(str(stored[name][0])))[name] for name in names}
+            delta = sum(sign * array for sign, array in deltas.pop(f"{stem}.weight"))
+            group, bits = delta.shape[1] // parts["scales"].shape[1], parts["weight"].shape[1] * 32 // delta.shape[1]
+            # A module quantized another way than the rest has an entry of its own, which MLX reads without the rest's.
+            own = quantization.get(stem)
+            mode = (own if isinstance(own, dict) else quantization).get("mode", "affine")
+            weight = mx.dequantize(parts["weight"], parts["scales"], parts.get("biases"), group_size = group, bits = bits, mode = mode)
+            if not mx.isfinite(weight + delta).all().item():
+                raise ValueError(f"Unsloth: {stem}.weight has values that are not finite, so the model cannot be saved.")
+            fitted = mx.quantize(weight.astype(mx.float32) + delta, group, bits, mode = mode)
+            refitted[stem] = {part: value.astype(parts[part].dtype) for part, value in zip(parts, fitted)}
+        # Handed over once, so that a written shard's tensors are not held until the last one.
+        return refitted[stem].pop(leaf)
+
+    packed = {name.rpartition(".")[0] for name in deltas if name.rpartition(".")[0] + ".scales" in stored}
+    head = _clef_head(pipeline, config)
+
+    folder.mkdir(parents = True, exist_ok = True)
+    staging = Path(tempfile.mkdtemp(dir = folder, prefix = ".saving-"))
+    try:
+        for shard in sorted(source.glob("model*.safetensors")):
+            tensors, changed = mx.load(str(shard)), {}
+            for name, value in tensors.items():
+                stem, _, leaf = name.rpartition(".")
+                if stem in packed and leaf in ("weight", "scales", "biases"):
+                    changed[name] = refit(stem, leaf, tensors)
+                elif name in deltas:
+                    # transformers stores convolution kernels channels-first.
+                    kernel = value.ndim == 3 and deltas[name][0][1].shape != value.shape
+                    terms = [(sign, array.swapaxes(1, 2) if kernel else array) for sign, array in deltas.pop(name)]
+                    if terms[0][1].shape != value.shape:
+                        raise ValueError(f"Unsloth: {name} has shape {value.shape} in {source}, not the trained {terms[0][1].shape}.")
+                    changed[name] = _add_in_slices(name, value, terms)
+            if not changed:
+                shutil.copyfile(shard, staging / shard.name)
+                continue
+            tensors.update(changed)
+            mx.save_safetensors(str(staging / shard.name), tensors, metadata = {"format": "pt"})
+        if deltas:
+            raise ValueError(f"Unsloth: {source} holds no weights for the trained {sorted(deltas)[:3]}.")
+        _commit_clef(pipeline, staging, folder, source, head, config)
+    finally:
+        shutil.rmtree(staging, ignore_errors = True)
+
+
+def save_clef_adapter(pipeline, folder, source, base_model, base_revision = None, config = None, exact = False):
+    """Write a Clef trained through LoRA adapters as those adapters beside its joint head, as PEFT stores them.
+
+    `source` is the checkpoint the decoder was loaded from and `base_model` the name that checkpoint is loaded by (a
+    repo id or a folder), which `load_decision_model` puts the adapters back on. `config` is as for `save_clef_model`.
+    `exact` keeps the head in float32 with no temperature folded in, for a checkpoint training resumes from.
+    """
+    (folder, source), decoder, stored = _apart(folder, source), pipeline.model, _stored_tensors(source)
+    adapters = [(path, module) for path, module in decoder.named_modules() if "lora_a" in module]
+    whole = [path for path, _ in tree_flatten(decoder.trainable_parameters()) if path.rsplit(".", 1)[-1] not in ("lora_a", "lora_b")]
+    shapes = {(module.lora_a.shape[1], float(module.scale), _lora_dropout(module)) for _, module in adapters}
+    if len(shapes) != 1 or whole:
+        raise ValueError("Unsloth: only a Clef trained through LoRA adapters of one rank saves as adapters; save it merged with save_clef_model.")
+    (rank, scale, dropout), = shapes
+    tensors = {}
+    for path, module in adapters:
+        name = _decoder_tensor_name(decoder, f"{path}.weight", stored)
+        if type(module).__name__ != "LoRALinear" or name is None:
+            raise ValueError(f"Unsloth: the adapter on {path} cannot be saved as a PEFT adapter.")
+        stem = "base_model.model." + name[: -len(".weight")]
+        tensors[f"{stem}.lora_A.weight"], tensors[f"{stem}.lora_B.weight"] = module.lora_a.T, module.lora_b.T
+    adapter = {
+        "peft_type": "LORA", "task_type": None, "base_model_name_or_path": str(base_model), "revision": base_revision,
+        "r": rank, "lora_alpha": scale * rank, "lora_dropout": dropout, "bias": "none", "fan_in_fan_out": False, "inference_mode": True,
+        "target_modules": sorted({path.rsplit(".", 1)[-1] for path, _ in adapters}),
+    }
+    config = {"layout": "clef", "temperature": [1.0, 1.0, 1.0], **(config or {}), "fine_tuned": True, "base_model": str(base_model)}
+    head = _clef_head(pipeline, config, exact)
+    folder.mkdir(parents = True, exist_ok = True)
+    staging = Path(tempfile.mkdtemp(dir = folder, prefix = ".saving-"))
+    try:
+        mx.save_safetensors(str(staging / "adapter_model.safetensors"), tensors, metadata = {"format": "pt"})
+        (staging / "adapter_config.json").write_text(json.dumps(adapter, indent = 2), encoding = "utf-8")
+        _commit_clef(pipeline, staging, folder, source, head, config, _TOKENIZER_FILES)
+    finally:
+        shutil.rmtree(staging, ignore_errors = True)
+
+
+_ENCODER_LINEARS = ("attn.Wqkv", "attn.Wo", "mlp.Wi", "mlp.Wo")
+
+
+def load_trainable_decision_model(folder, full_finetuning = False, gradient_checkpointing = True):
+    """Load a Laya checkpoint for training.
+
+    A full fine-tune trains every weight in float32. Otherwise the encoder is frozen with float16 matmuls,
+    ready for `add_lora_adapters`, and only the float32 decision head trains.
+    """
+    # The trainer works on the network; the loaded pipeline around it only serves requests.
+    model = load_decision_model(folder, compute_dtype = mx.float32 if full_finetuning else mx.float16).model
+    model.freeze()
+    if full_finetuning:
+        model.unfreeze()
+    else:
+        for part in (model.head, model.type_emb, *model.scorer):
+            part.set_dtype(mx.float32)
+            part.unfreeze()
+    model.gradient_checkpointing = bool(gradient_checkpointing)
+    model.train()
+    return model
+
+
+def _targeted(name, target_modules):
+    if target_modules == "all-linear":
+        return True
+    if isinstance(target_modules, str):
+        return re.fullmatch(target_modules, name) is not None
+    return any(name == target or name.endswith("." + target) for target in target_modules)
+
+
+def add_lora_adapters(
+    model,
+    r = 64,
+    lora_alpha = 64,
+    lora_dropout = 0.0,
+    use_rslora = False,
+    target_modules = "all-linear",
+    random_state = 3407,
+):
+    """Add trainable float32 LoRA adapters to the encoder's linear layers.
+
+    `target_modules` selects them as PEFT does: `"all-linear"`, a list of names or dotted suffixes
+    (`"Wqkv"`, `"mlp.Wo"`), or a regular expression matching the whole name (`"layers.0.attn.Wqkv"`).
+    """
+    from mlx_lm.tuner.lora import LoRALinear
+
+    if any(isinstance(module, LoRALinear) for module in model.modules()):
+        raise RuntimeError("Unsloth: You already added LoRA adapters to your model!")
+    mx.random.seed(random_state)
+    scale = lora_alpha / (math.sqrt(r) if use_rslora else r)
+    matched = 0
+    for index, layer in enumerate(model.encoder.layers):
+        for path in _ENCODER_LINEARS:
+            if not _targeted(f"layers.{index}.{path}", target_modules):
+                continue
+            parent, name = path.split(".")
+            parent = getattr(layer, parent)
+            setattr(parent, name, LoRALinear.from_base(getattr(parent, name), r = r, dropout = lora_dropout, scale = scale))
+            matched += 1
+    if not matched:
+        raise ValueError(f"Unsloth: target_modules = {target_modules!r} matches no encoder linear layer.")
+    model.train(model.training)
+    return model
+
+
+def collate_decisions(items, pad_token_id):
+    """Pad tokenized decisions (`input_ids`, `markers`, `qtype`, `target`) into one batch of MLX arrays."""
+    rows = len(items)
+    length = max(len(item["input_ids"]) for item in items)
+    options = max(len(item["markers"]) for item in items)
+    batch = {
+        "input_ids": np.full((rows, length), pad_token_id, np.int64),
+        "attention_mask": np.zeros((rows, length), np.int64),
+        "marker_pos": np.zeros((rows, options), np.int64),
+        "marker_mask": np.zeros((rows, options), np.bool_),
+        "qtype": np.array([item["qtype"] for item in items], np.int64),
+        "target": np.zeros((rows, options), np.float32),
+    }
+    for i, item in enumerate(items):
+        ids, markers = item["input_ids"], item["markers"]
+        batch["input_ids"][i, : len(ids)] = ids
+        batch["attention_mask"][i, : len(ids)] = 1
+        batch["marker_pos"][i, : len(markers)] = markers
+        batch["marker_mask"][i, : len(markers)] = True
+        batch["target"][i, : len(item["target"])] = item["target"]
+    return {name: mx.array(value) for name, value in batch.items()}
+
+
+def _decision_losses(logits, target, mask, objective = None):
+    """Each decision's loss, and its expected distance from the gold level for the ordinal term.
+
+    `objective` is `(label_smoothing, brier_weight, ordinal_weight)`: cross-entropy against targets smoothed toward
+    uniform over the decision's own options, plus a Brier term. `logits` hold -1e4 where `mask` is off.
+    """
+    smoothing, brier, ordinal = objective or (0.0, 0.0, 0.0)
+    log_p = nn.log_softmax(logits, axis = -1)
+    options = mask.sum(-1, keepdims = True)
+    smoothed = (1.0 - smoothing) * target + smoothing * mask / mx.maximum(options, 1) if smoothing else target
+    losses, distance = -(smoothed * log_p).sum(-1), None
+    if brier or ordinal:
+        p = mx.exp(log_p)
+    if brier:
+        losses = losses + brier * ((p - target) ** 2 * mask).sum(-1)
+    if ordinal:
+        levels = mx.arange(logits.shape[-1])
+        apart = mx.abs(levels[:, None] - levels[None, :]).astype(p.dtype)
+        distance = ((p @ apart) * target).sum(-1) / mx.maximum(options[:, 0] - 1, 1)
+    return losses, distance
+
+
+def _soft_cross_entropy(model, batch, objective = None):
+    logits = model(batch["input_ids"], batch["attention_mask"], batch["marker_pos"], batch["marker_mask"], batch["qtype"])
+    return _decision_losses(logits, batch["target"], batch["marker_mask"], objective)[0].mean()
+
+
+class _LayerwiseStep:
+    """Soft cross-entropy and its gradients, with the encoder run and differentiated one layer at a time.
+
+    One evaluation of the whole graph keeps every layer's temporaries alive until it ends, and MLX's buffer cache then
+    holds that working set once per batch shape. Evaluating at each layer bounds it to a single layer's worth: only
+    layer inputs are kept, and each layer is recomputed for its backward pass, as gradient checkpointing does.
+    """
+
+    def __init__(self, model, compile = False, objective = None):
+        self.model = model
+        encoder = model.encoder
+        modules = [encoder.embeddings, *encoder.layers]
+        # A stage needs its input's gradient only if something trainable lies below it.
+        trainable = [bool(tree_flatten(module.trainable_parameters())) for module in modules]
+        self.first = trainable.index(True) if True in trainable else len(modules)
+        state = [model.state, mx.random.state]
+        wrap = (lambda fn: mx.compile(fn, inputs = state, outputs = state)) if compile else (lambda fn: fn)
+
+        def stage(index, module):
+            run = (lambda x, mask: module(x, mask)) if index else (lambda ids, mask: module(ids))
+            argnums = [0, 1] if trainable[index] and index > self.first else 0 if trainable[index] else 1
+
+            def backward(x, mask, cotangent):
+                # Gradients of sum(run(x) * cotangent) are the vector-Jacobian products, for parameter trees too.
+                def paired(params, x):
+                    module.update(params)
+                    return (run(x, mask) * cotangent).sum()
+
+                return mx.grad(paired, argnums = argnums)(module.trainable_parameters(), x)
+
+            return wrap(run), wrap(backward), argnums
+
+        self.stages = [stage(index, module) for index, module in enumerate(modules)]
+
+        def top(x, batch):
+            def loss(params, x):
+                model.update(params)
+                keys = batch["attention_mask"].astype(mx.bool_)[:, None, None, :]
+                logits = model.decide(encoder.final_norm(x), keys, batch["marker_pos"], batch["marker_mask"], batch["qtype"])
+                return _decision_losses(logits, batch["target"], batch["marker_mask"], objective)[0].mean()
+
+            params = {name: value for name, value in model.trainable_parameters().items() if name != "encoder"}
+            params["encoder"] = {"final_norm": encoder.final_norm.trainable_parameters()}
+            return mx.value_and_grad(loss, argnums = [0, 1] if self.first < len(modules) else 0)(params, x)
+
+        self.top = wrap(top)
+
+    def encode(self, batch, seeds = None):
+        """The last encoder layer's output and each stage's input."""
+        from .utils import _mlx_rng_key
+
+        encoder = self.model.encoder
+        masks = encoder.masks(batch["attention_mask"].astype(mx.bool_)[:, None, None, :])
+        masks = [None] + [masks[layer.layer_type] for layer in encoder.layers]
+        x, inputs = batch["input_ids"], []
+        for (run, _, _), mask in zip(self.stages, masks):
+            inputs.append(x)
+            if seeds is not None:
+                # The backward pass recomputes the stage, which must then draw the same dropout masks.
+                seeds.append(_mlx_rng_key())
+            x = run(x, mask)
+            mx.eval(x)
+        return x, inputs, masks
+
+    def __call__(self, batch):
+        from .utils import _mlx_rng_key, _restore_mlx_rng_key
+
+        seeds = []
+        x, inputs, masks = self.encode(batch, seeds)
+        loss, grads = self.top(x, batch)
+        cotangent = None
+        if self.first < len(self.stages):
+            grads, cotangent = grads
+        mx.eval(loss, grads, cotangent)
+        resume = _mlx_rng_key()
+        layer_grads = [{} for _ in self.stages[1:]]
+        for index in range(len(self.stages) - 1, self.first - 1, -1):
+            _, backward, argnums = self.stages[index]
+            _restore_mlx_rng_key(seeds[index])
+            result = backward(inputs[index], masks[index], cotangent)
+            stage_grads, cotangent = result if argnums == [0, 1] else (result, None) if argnums == 0 else ({}, result)
+            mx.eval(stage_grads, cotangent)
+            if index:
+                layer_grads[index - 1] = stage_grads
+            else:
+                grads["encoder"]["embeddings"] = stage_grads
+        _restore_mlx_rng_key(resume)
+        if self.first < len(self.stages):
+            grads["encoder"]["layers"] = layer_grads
+        return loss, grads
+
+
+def _staged_logits(step, batch):
+    model = step.model
+    keys = batch["attention_mask"].astype(mx.bool_)[:, None, None, :]
+    hidden = model.encoder.final_norm(step.encode(batch)[0])
+    return model.decide(hidden, keys, batch["marker_pos"], batch["marker_mask"], batch["qtype"])
+
+
+class _MarkerStep:
+    """How the trainer runs a Laya network: padded batches of one decision per row."""
+
+    def __init__(self, model, pad_token_id, compiled = False, objective = None):
+        self.model, self.pad_token_id, self.objective = model, pad_token_id, objective
+        # Scoring stays uncompiled: a compiled stage would replay the training-mode trace it was built with.
+        self.staged = _LayerwiseStep(model)
+        if getattr(model, "gradient_checkpointing", False):
+            self.loss_and_grad = _LayerwiseStep(model, compiled, objective)
+        else:
+            value_and_grad = nn.value_and_grad(model, _soft_cross_entropy)
+            self.loss_and_grad = lambda batch: value_and_grad(model, batch, objective)
+            if compiled:
+                state = [model.state, mx.random.state]
+                self.loss_and_grad = mx.compile(self.loss_and_grad, inputs = state, outputs = state)
+
+    def collate(self, items):
+        return collate_decisions(items, self.pad_token_id)
+
+    def __call__(self, batch):
+        return self.loss_and_grad(batch)
+
+    def losses(self, batch, outputs = False):
+        """Summed loss of a batch and the number of decisions in it; with `outputs`, its logits and targets too."""
+        logits = _staged_logits(self.staged, batch)
+        losses = _decision_losses(logits, batch["target"], batch["marker_mask"], self.objective)[0]
+        return (losses.sum(), batch["target"].shape[0], *((logits, batch["target"]) if outputs else ()))
+
+
+_CLEF_LORA_TARGETS = ("q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "in_proj_z", "out_proj", "gate_proj", "up_proj", "down_proj")
+
+
+@contextlib.contextmanager
+def _decoder_training(model, gradient_checkpointing = True):
+    """What `MLXTrainer` sets up around a run for a decoder: differentiable kernels in place of the fused inference ones."""
+    from unsloth_zoo.gated_delta_vjp import patch_gated_delta, patch_gated_delta_vlm, patch_gated_delta_vlm_shared
+    from .compile import model_has_gated_delta_layers, model_has_qwen35_attention_layers
+    from .loader import _disable_fused_input_projections, _disable_fused_mrope, _fix_qwen35_attention_cache
+    from .utils import acquire_mlx_training_patches, apply_gradient_checkpointing, release_mlx_training_patches, remove_gradient_checkpointing
+
+    unfused = {"fused_apply": [], "fuse_in": []}
+    acquire_mlx_training_patches()
+    try:
+        if gradient_checkpointing:
+            apply_gradient_checkpointing(model)
+        if model_has_gated_delta_layers(model):
+            # mlx-vlm's copies first, or patch_gated_delta's sweep warns about them.
+            patch_gated_delta_vlm()
+            patch_gated_delta_vlm_shared()
+            patch_gated_delta()
+        if model_has_qwen35_attention_layers(model):
+            _fix_qwen35_attention_cache(model)
+            unfused["fused_apply"] = _disable_fused_mrope(model)
+        unfused["fuse_in"] = _disable_fused_input_projections(model)
+        yield
+    finally:
+        for flag, modules in unfused.items():
+            for module in modules:
+                setattr(module, flag, True)
+        if gradient_checkpointing:
+            remove_gradient_checkpointing(model)
+        release_mlx_training_patches()
+
+
+def save_trainable(model, folder):
+    """Write `model`'s trainable parameters to `folder`, for training to resume from."""
+    Path(folder).mkdir(parents = True, exist_ok = True)
+    mx.save_safetensors(str(Path(folder) / _TRAINABLE), dict(tree_flatten(model.trainable_parameters())))
+
+
+def load_trainable(model, folder):
+    model.update(tree_unflatten(list(mx.load(str(Path(folder) / _TRAINABLE)).items())))
+    mx.eval(model.parameters())
+
+
+_TRAINABLE = "trainable.safetensors"
+
+
+class ClefNetwork(nn.Module):
+    """A loaded Clef pipeline's decoder (`encoder`) and joint head as the one parameter tree the trainer optimizes.
+
+    `origin` is `(source, base_model, base_revision, config)` as `save_clef_adapter` takes them. With it, a checkpoint
+    of a LoRA Clef is those adapters and the head, which `load_decision_model` loads; without it, or for a full
+    fine-tune, a checkpoint holds the trainable parameters alone.
+    """
+
+    def __init__(self, pipeline, gradient_checkpointing = True, origin = None):
+        super().__init__()
+        self.encoder, self.head = pipeline.model, pipeline.head
+        self._pipeline, self._gradient_checkpointing, self._origin = pipeline, bool(gradient_checkpointing), origin
+
+    def _adapters(self):
+        return [(path, module) for path, module in self.encoder.named_modules() if "lora_a" in module]
+
+    def save_checkpoint(self, folder):
+        whole = [path for path, _ in tree_flatten(self.encoder.trainable_parameters()) if path.rsplit(".", 1)[-1] not in ("lora_a", "lora_b")]
+        if self._origin is None or whole or not self._adapters():
+            return save_trainable(self, folder)
+        source, base_model, revision, config = self._origin
+        save_clef_adapter(self._pipeline, folder, source, base_model, revision, dict(config or {}), exact = True)
+
+    def load_checkpoint(self, folder):
+        folder = Path(folder)
+        if not (folder / "adapter_model.safetensors").is_file():
+            return load_trainable(self, folder)
+        if self._origin is None:
+            raise ValueError(f"Unsloth: {folder} holds LoRA adapters, which resume on a Clef loaded with the checkpoint they were trained on.")
+        adapter, stored = mx.load(str(folder / "adapter_model.safetensors")), _stored_tensors(Path(self._origin[0]))
+        for path, module in self._adapters():
+            stem = "base_model.model." + _decoder_tensor_name(self.encoder, f"{path}.weight", stored)[: -len(".weight")]
+            module.lora_a, module.lora_b = adapter[f"{stem}.lora_A.weight"].T, adapter[f"{stem}.lora_B.weight"].T
+        head = mx.load(str(folder / "joint_head.safetensors"))
+        self.head.update(tree_unflatten([(name, value.astype(mx.float32)) for name, value in head.items()]))
+        mx.eval(self.parameters())
+
+    def training_run(self):
+        return _decoder_training(self.encoder, self._gradient_checkpointing)
+
+    def decision_step(self, compiled = False, objective = None, reference = None):
+        return _ClefStep(self, objective, reference)
+
+    def kl_reference(self):
+        """A frozen copy of the head as it is now: with the decoder's adapters off, the model a KL penalty holds on to."""
+        whole = [path for path, _ in tree_flatten(self.encoder.trainable_parameters()) if path.rsplit(".", 1)[-1] not in ("lora_a", "lora_b")]
+        if whole or not any("lora_a" in module for _, module in self.encoder.named_modules()):
+            raise NotImplementedError("Unsloth: kl_weight needs a LoRA Clef model, not full finetuning.")
+        head = copy.deepcopy(self.head)
+        head.freeze()
+        return head
+
+    def reference_logits(self, item, head):
+        """`item`'s option logits from the decoder without its adapters and `head`, outside the gradient."""
+        pipeline, adapters = self._pipeline, [module for _, module in self.encoder.named_modules() if "lora_a" in module]
+        scales, own = [module.scale for module in adapters], pipeline.head
+        try:
+            for module in adapters:
+                module.scale = 0.0
+            pipeline.head = head
+            logits = pipeline.logits(item["input_ids"], item["question_spans"], item["option_spans"], item["types"])
+            mx.eval(logits)
+        finally:
+            pipeline.head = own
+            for module, scale in zip(adapters, scales):
+                module.scale = scale
+        return mx.stop_gradient(logits)
+
+    def permuted_item(self, item, rng):
+        """`item` with its questions in an order drawn from `rng` and the prompt encoded again; as it is when it holds no `source`."""
+        source = item.get("source")
+        if source is None:
+            return item
+        order = list(range(len(item["targets"])))
+        rng.shuffle(order)
+        names = list(source["questions"])
+        try:
+            record = clef_training_item(self._pipeline, source["state"], {names[i]: source["questions"][names[i]] for i in order}, source.get("max_length"))
+        except ValueError:
+            return item
+        return {**item, **record, "targets": [item["targets"][i] for i in order]}
+
+
+def clef_training_network(
+    pipeline, full_finetuning = False, r = 64, lora_alpha = 64, target_modules = "all-linear", gradient_checkpointing = True, origin = None, **lora
+):
+    """Prepare a loaded Clef pipeline for training and return its `ClefNetwork`.
+
+    The float32 joint head always trains. The decoder trains whole under `full_finetuning`, otherwise through LoRA
+    adapters (`lora` is passed to `FastMLXModel.get_peft_model`); `"all-linear"` means its language layers' projections.
+    A Clef loaded from adapters keeps training those, whatever `r`, `lora_alpha` and `target_modules` say.
+    `origin` is the network's: what lets its checkpoints be written as loadable Clef adapters.
+    """
+    from .loader import FastMLXModel
+    from .utils import _get_text_model, describe_output_head
+
+    if full_finetuning and any(path.endswith(".scales") for path, _ in tree_flatten(pipeline.model.parameters())):
+        raise ValueError("Unsloth: a quantized decoder trains through LoRA adapters only; pass full_finetuning = False.")
+    if any("lora_a" in module for _, module in pipeline.model.named_modules()):
+        # Adapters the checkpoint was loaded with go on training as they are.
+        if full_finetuning:
+            raise ValueError("Unsloth: a Clef loaded from LoRA adapters trains through them; pass full_finetuning = False.")
+        pipeline.model.unfreeze(keys = ["lora_a", "lora_b"], strict = False)
+    elif full_finetuning:
+        # Only what a text prompt reaches: a trainable weight without a gradient would still decay.
+        pipeline.model.freeze()
+        _get_text_model(pipeline.model).unfreeze()
+        output = describe_output_head(pipeline.model)
+        if output.status != "tied":
+            # The head reads the output embedding without training it.
+            output.module.freeze()
+    else:
+        if target_modules in (None, "all-linear"):
+            target_modules = list(_CLEF_LORA_TARGETS)
+        # Checkpointing is applied around each run instead, so it is gone again when the model serves.
+        FastMLXModel.get_peft_model(
+            pipeline.model, r = r, lora_alpha = lora_alpha, target_modules = target_modules, use_gradient_checkpointing = False, **lora,
+        )
+    pipeline.head.unfreeze()
+    network = ClefNetwork(pipeline, gradient_checkpointing, origin)
+    network.train()
+    return network
+
+
+def _clef_record_loss(network, item, objective = None, ordinal_scale = 0.0, reference = None, kl_weight = 0.0, capture = None):
+    """The loss summed over the questions of one record; `ordinal_scale` weighs its score questions' ordinal term and
+    `kl_weight` the divergence of each question's distribution from that of the `reference` logits."""
+    spans = item["option_spans"]
+    logits = network._pipeline.logits(item["input_ids"], item["question_spans"], spans, item["types"])
+    target = np.zeros((len(spans), logits.shape[0]), np.float32)
+    start = 0
+    for row, values in enumerate(item["targets"]):
+        target[row, start : start + len(values)] = values
+        start += len(values)
+    owner = mx.array([row for row, options in enumerate(spans) for _ in options])
+    own = owner[None, :] == mx.arange(len(spans))[:, None]
+    rows = mx.where(own, logits[None, :], -1e4)
+    if capture is not None:
+        capture.append((logits, item))
+    losses, distance = _decision_losses(rows, mx.array(target), own, objective)
+    total = losses.sum()
+    if distance is not None and ordinal_scale:
+        total = total + ordinal_scale * (distance * mx.array(_clef_score_questions(item))).sum()
+    if reference is not None:
+        log_p, log_ref = nn.log_softmax(rows, axis = -1), nn.log_softmax(mx.where(own, reference[None, :], -1e4), axis = -1)
+        total = total + kl_weight * (mx.exp(log_ref) * (log_ref - log_p) * own).sum()
+    return total
+
+
+def _clef_score_questions(item):
+    return [float(kind == _TYPE_IDS.index("score")) for kind in item["types"]]
+
+
+class _ClefStep:
+    """How the trainer runs a Clef: one record (a prompt holding all its questions) at a time, averaged over questions."""
+
+    def __init__(self, network, objective = None, reference = None):
+        self.network, self.objective = network, objective
+        # (head, weight) of the KL penalty to the starting model.
+        self.reference = reference
+        self.value_and_grad = nn.value_and_grad(network, _clef_record_loss)
+
+    def _record_arguments(self, item, scale):
+        if self.reference is None:
+            return item, self.objective, scale, None, 0.0
+        head, weight = self.reference
+        return item, self.objective, scale, self.network.reference_logits(item, head), weight
+
+    def _ordinal_scale(self, items, count):
+        # The ordinal term averages over the batch's score questions, the other terms over all its questions.
+        scored = sum(sum(_clef_score_questions(item)) for item in items) if self.objective and self.objective[2] else 0
+        return self.objective[2] * count / scored if scored else 0.0
+
+    def collate(self, items):
+        return items
+
+    def __call__(self, items):
+        total, grads = 0.0, None
+        count = sum(len(item["targets"]) for item in items)
+        scale = self._ordinal_scale(items, count)
+        for item in items:
+            loss, record = self.value_and_grad(self.network, *self._record_arguments(item, scale))
+            grads = record if grads is None else tree_map(mx.add, grads, record)
+            total = total + loss
+            # A record is evaluated on its own, so memory is bounded by the longest prompt, not the batch.
+            mx.eval(total, grads)
+        return total / count, tree_map(lambda g: g / count, grads)
+
+    def losses(self, items, outputs = False):
+        count = sum(len(item["targets"]) for item in items)
+        scale = self._ordinal_scale(items, count)
+        capture = [] if outputs else None
+        total = sum(_clef_record_loss(self.network, *self._record_arguments(item, scale), capture) for item in items)
+        if not outputs:
+            return total, count
+        # One row per question, as wide as the batch's largest: -1e4 past a question's options and 0 in its target.
+        width = max(len(target) for item in items for target in item["targets"])
+        logits, targets = np.full((count, width), -1e4, np.float32), np.zeros((count, width), np.float32)
+        row = 0
+        for flat, item in capture:
+            for values, target in zip(np.split(np.array(flat.astype(mx.float32)), np.cumsum([len(t) for t in item["targets"]])[:-1]), item["targets"]):
+                logits[row, : len(target)], targets[row, : len(target)] = values, target
+                row += 1
+        return total, count, mx.array(logits), mx.array(targets)
+
+
+def clef_logits(network, items):
+    """Eval-mode option logits of Clef training items: for each item, one float32 numpy array per question."""
+    from .generate import generation_mode
+
+    pipeline, out = network._pipeline, []
+    was_training = network.training
+    network.eval()
+    try:
+        # Scored as requests are served, so temperatures fitted on these logits hold there.
+        output = pipeline._output_head()
+        with generation_mode(pipeline.model):
+            for item in items:
+                spans = item["option_spans"]
+                logits = np.array(pipeline.logits(item["input_ids"], item["question_spans"], spans, item["types"], output))
+                out.append(np.split(logits, np.cumsum([len(options) for options in spans])[:-1]))
+    finally:
+        network.train(was_training)
+    return out
+
+
+def clef_option_keys(pipeline, question):
+    """The option keys of one Clef question, in the order of its logits."""
+    return [key for key, _ in pipeline._parse_questions({"question": question})[0].options]
+
+
+def clef_training_item(pipeline, state, questions, max_length = None):
+    """Tokenize one record as a Clef training item; the caller adds `targets`, a distribution per question over `clef_option_keys`.
+
+    `source` keeps the record, which `permute_fields` encodes again with its questions reordered."""
+    parsed = pipeline._parse_questions(questions)
+    ids, question_spans, option_spans = pipeline.encode(state, parsed, max_length)
+    return {
+        "input_ids": ids, "question_spans": question_spans, "option_spans": option_spans, "types": [_TYPE_IDS.index(q.type) for q in parsed],
+        "source": {"state": state, "questions": dict(questions), "max_length": max_length},
+    }
+
+
+def decision_logits(model, items, pad_token_id, batch_size = 16):
+    """Eval-mode logits of tokenized decisions: one float32 numpy row per item, as long as its options."""
+    step, out = _LayerwiseStep(model), [None] * len(items)
+    order = sorted(range(len(items)), key = lambda i: -len(items[i]["input_ids"]))
+    was_training = model.training
+    model.eval()
+    try:
+        for start in range(0, len(order), batch_size):
+            chunk = order[start : start + batch_size]
+            logits = np.array(_staged_logits(step, collate_decisions([items[i] for i in chunk], pad_token_id)))
+            for row, i in enumerate(chunk):
+                out[i] = logits[row, : len(items[i]["markers"])]
+    finally:
+        model.train(was_training)
+    return out
