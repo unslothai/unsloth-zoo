@@ -68,7 +68,7 @@ def test_python_kernel_override_skips_child(monkeypatch, fake_rocm):
         assert moe_utils._grouped_mm_survives_out_of_process(fake_rocm) is True
     finally:
         lib._destroy()
-    assert "CUDA (inactive):" not in torch._C._dispatch_dump("aten::_grouped_mm")
+    assert all(".cpp:" in l for l in torch._C._dispatch_dump("aten::_grouped_mm").splitlines() if l.startswith("CUDA:"))
 
 def test_crashing_probe_disables_both_grouped_mm_probes(monkeypatch, fake_rocm):
     monkeypatch.setattr(moe_utils, "_GROUPED_MM_SURVIVES", False)

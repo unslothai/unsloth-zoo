@@ -1216,7 +1216,8 @@ def _grouped_mm_survives_out_of_process(device):
     if getattr(torch.version, "hip", None) is None or device.type != "cuda": return True
     # Studio's Python _grouped_mm fallback (gfx120X) is active: this process never runs the native kernel.
     try:
-        if "CUDA (inactive):" in torch._C._dispatch_dump("aten::_grouped_mm"): return True
+        dump = torch._C._dispatch_dump("aten::_grouped_mm").splitlines()
+        if any(l.startswith("CUDA:") and ".cpp:" not in l for l in dump): return True
     except Exception:
         pass
     import subprocess
