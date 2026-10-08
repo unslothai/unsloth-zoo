@@ -24,6 +24,7 @@ import shutil
 import stat
 import tempfile
 import sys
+import threading
 import time
 import warnings
 import importlib
@@ -1206,12 +1207,19 @@ probe(torch.ones(32, 32, **bf16), w_t, [8, 16, 24, 32])
 probe(torch.ones(32, 32, **bf16), w_t.contiguous(), [8, 16, 24, 32])
 """
 _GROUPED_MM_SURVIVES = None
+_GROUPED_MM_SURVIVES_LOCK = threading.Lock()
 
 
 def _grouped_mm_survives_out_of_process(device):
     global _GROUPED_MM_SURVIVES
     if _GROUPED_MM_SURVIVES is not None: return _GROUPED_MM_SURVIVES
-    _GROUPED_MM_SURVIVES = True
+    # Published only once known: a concurrent first caller must not run the kernel while the child is still out.
+    with _GROUPED_MM_SURVIVES_LOCK:
+        if _GROUPED_MM_SURVIVES is None: _GROUPED_MM_SURVIVES = _run_grouped_mm_crash_probe(device)
+    return _GROUPED_MM_SURVIVES
+
+
+def _run_grouped_mm_crash_probe(device):
     # AMD only: CUDA and XPU keep the in-process probe.
     if getattr(torch.version, "hip", None) is None or device.type != "cuda": return True
     # Studio's Python _grouped_mm fallback (gfx120X) is active: this process never runs the native kernel.
@@ -1230,10 +1238,9 @@ def _grouped_mm_survives_out_of_process(device):
         ).returncode
     except Exception as e:
         result = type(e).__name__
-    if result != 0:
-        _GROUPED_MM_SURVIVES = False
-        _log_info(f"Unsloth: torch._grouped_mm probe crashed on this ROCm GPU ({result}); disabling grouped_mm.")
-    return _GROUPED_MM_SURVIVES
+    if result == 0: return True
+    _log_info(f"Unsloth: torch._grouped_mm probe crashed on this ROCm GPU ({result}); disabling grouped_mm.")
+    return False
 
 
 def _probe_torch_grouped_mm_supported():

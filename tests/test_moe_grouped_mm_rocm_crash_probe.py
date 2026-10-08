@@ -43,6 +43,17 @@ def test_crash_probe_runs_out_of_process(monkeypatch, fake_rocm, child, survives
     assert moe_utils._grouped_mm_survives_out_of_process(fake_rocm) is survives
 
 
+def test_concurrent_first_call_waits_for_the_child(monkeypatch, fake_rocm):
+    import threading, time
+    monkeypatch.setattr(moe_utils, "_GROUPED_MM_CRASH_PROBE", "import time; time.sleep(2); raise SystemExit(1)")
+    first = {}
+    t = threading.Thread(target = lambda: first.setdefault("v", moe_utils._grouped_mm_survives_out_of_process(fake_rocm)))
+    t.start()
+    time.sleep(0.5)
+    assert moe_utils._grouped_mm_survives_out_of_process(fake_rocm) is False
+    t.join()
+    assert first["v"] is False
+
 def test_crash_probe_timeout_is_unsupported(monkeypatch, fake_rocm):
     real_run = subprocess.run
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: real_run(*a, **{**k, "timeout": 1}))
