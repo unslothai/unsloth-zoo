@@ -2098,19 +2098,34 @@ def _settle_abandoned_checkpoint_generator():
 # True only while generate() runs a compiled decode step for a model that opted in. A
 # one-element list so Dynamo guards on the value and retraces when it flips.
 UNSLOTH_DECODE_COMPILE = [False]
-# The eager_on_recompile stance objects Unsloth installed (True where torch keeps no stance
-# object). Process wide like the stance, so any generated module's training forward can undo
-# it, but only while one of them is current: a temporary scope restores an earlier object.
+# Weak references to the eager_on_recompile stance objects Unsloth installed (True where torch
+# keeps no stance object). Process wide like the stance, so any generated module's training
+# forward can undo it while one of them is current. Weak, so an object any enclosing scope can
+# still restore stays recognised however deep the nesting, and dead ones drop out by themselves.
 UNSLOTH_EAGER_STANCE_OWNED = []
 
 
+def _owned_stance(entry):
+    return True if entry is True else entry()
+
+
 def unsloth_claim_eager_stance(stance):
-    UNSLOTH_EAGER_STANCE_OWNED.append(stance)
-    del UNSLOTH_EAGER_STANCE_OWNED[:-8]
+    UNSLOTH_EAGER_STANCE_OWNED[:] = [o for o in UNSLOTH_EAGER_STANCE_OWNED if _owned_stance(o) is not None]
+    try:
+        UNSLOTH_EAGER_STANCE_OWNED.append(True if stance is True else weakref.ref(stance))
+    except TypeError:
+        UNSLOTH_EAGER_STANCE_OWNED.append(True)
 
 
 def unsloth_owns_stance(current):
-    return any(owned is True or owned is current for owned in UNSLOTH_EAGER_STANCE_OWNED)
+    return any(o is True or _owned_stance(o) is current for o in UNSLOTH_EAGER_STANCE_OWNED)
+
+
+def unsloth_release_stance(current):
+    UNSLOTH_EAGER_STANCE_OWNED[:] = [
+        o for o in UNSLOTH_EAGER_STANCE_OWNED
+        if o is not True and _owned_stance(o) is not None and _owned_stance(o) is not current
+    ]
 _DECODE_COMPILE_LOCK = threading.Lock()
 _DECODE_COMPILE_STATE = {"depth": 0, "stance": None}
 

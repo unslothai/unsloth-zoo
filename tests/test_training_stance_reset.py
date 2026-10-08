@@ -413,3 +413,21 @@ def test_training_inside_a_scope_keeps_the_outer_owned_stance():
     assert _stance() == "eager_on_recompile"
     _train(ns, module)
     assert _stance() == "default"
+
+
+def test_deeply_nested_scopes_keep_the_outer_owned_stance():
+    # Nine nested default scopes, each with a claiming inference inside: the outermost stance is
+    # still restorable when they unwind, so it must still be recognised (no fixed-size cap).
+    import contextlib
+    frames, compiled = _counting_compile()
+    ns = _generated_module(compiled)
+    module = torch.nn.Linear(1, 1)
+    _infer(ns, module)
+    with contextlib.ExitStack() as stack:
+        for _ in range(9):
+            stack.enter_context(torch.compiler.set_stance("default"))
+            _infer(ns, module)
+            assert _stance() == "eager_on_recompile"
+    assert _stance() == "eager_on_recompile"
+    _train(ns, module)
+    assert _stance() == "default"

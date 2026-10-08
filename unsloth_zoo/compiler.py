@@ -483,7 +483,7 @@ pass
 
 # The stance is process wide, so whether Unsloth owns it lives in unsloth_zoo, shared by
 # every generated module: inference in one model's module, training in another's.
-from unsloth_zoo.temporary_patches.utils import UNSLOTH_EAGER_STANCE_OWNED, unsloth_claim_eager_stance, unsloth_owns_stance
+from unsloth_zoo.temporary_patches.utils import UNSLOTH_EAGER_STANCE_OWNED, unsloth_claim_eager_stance, unsloth_owns_stance, unsloth_release_stance
 
 def unsloth_training_stance():
     # eager_on_recompile is global: left on by generate() or eval forwards, every recompile
@@ -500,7 +500,7 @@ def unsloth_training_stance():
         # one of our exact objects, which a later training forward must still recognise.
         if current.stance == "eager_on_recompile" and unsloth_owns_stance(current):
             # Only the reset object: an outer scope may still restore another one of ours.
-            UNSLOTH_EAGER_STANCE_OWNED[:] = [o for o in UNSLOTH_EAGER_STANCE_OWNED if o is not current]
+            unsloth_release_stance(current)
             torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = False)
 pass
 
