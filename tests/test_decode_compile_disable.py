@@ -98,7 +98,7 @@ def _stance_block(calls):
         "INFERENCE_RUNS": 1,
         "UNSLOTH_DECODE_COMPILE": UNSLOTH_DECODE_COMPILE,
         "UNSLOTH_EAGER_STANCE_OWNED": [],
-        "unsloth_claim_eager_stance": lambda stance: None,
+        "unsloth_claim_eager_stance": lambda stance, previous = None: None,
         "unsloth_owns_stance": lambda current: False,
         "UNSLOTH_ENABLE_LOGGING": False,
         "torch_dynamo_eval_frame": type("E", (), {"_stance": stance})(),

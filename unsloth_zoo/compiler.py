@@ -500,8 +500,12 @@ def unsloth_training_stance():
         # one of our exact objects, which a later training forward must still recognise.
         if current.stance == "eager_on_recompile" and unsloth_owns_stance(current):
             # Only the reset object: an outer scope may still restore another one of ours.
-            unsloth_release_stance(current)
-            torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = False)
+            # Put back what the caller had before Unsloth switched (force_eager, a backend, ...).
+            previous = unsloth_release_stance(current)
+            if previous is not None and hasattr(torch_dynamo_eval_frame, "_set_stance"):
+                torch_dynamo_eval_frame._set_stance(previous)
+            else:
+                torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = False)
 pass
 
 from unsloth_zoo import DEVICE_TYPE_TORCH, DEVICE_COUNT
@@ -3159,9 +3163,10 @@ __DYNAMO__RECOMPILING__ = """
             # Already eager (another model's inference, or the user's choice): leave that stance
             # object, and so its ownership, as it is. Otherwise switch and claim the new object.
             if old_stance != "eager_on_recompile":
+                previous = getattr(torch_dynamo_eval_frame, "_stance", None)
                 torch_compiler_set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = False)
                 # The stance object itself, or True where torch keeps no such object.
-                unsloth_claim_eager_stance(getattr(torch_dynamo_eval_frame, "_stance", True))
+                unsloth_claim_eager_stance(getattr(torch_dynamo_eval_frame, "_stance", True), previous)
             if UNSLOTH_ENABLE_LOGGING:
                 logger_compiler.info(
                     f"Unsloth: Removing compiler guards after 1 inference run. "\\

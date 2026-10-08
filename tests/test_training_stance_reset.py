@@ -431,3 +431,15 @@ def test_deeply_nested_scopes_keep_the_outer_owned_stance():
     assert _stance() == "eager_on_recompile"
     _train(ns, module)
     assert _stance() == "default"
+
+
+def test_user_force_eager_before_inference_is_restored_by_training():
+    # Unsloth's inference replaces the caller's force_eager; training must put it back, not default.
+    frames, compiled = _counting_compile()
+    ns = _generated_module(compiled)
+    module = torch.nn.Linear(1, 1)
+    torch.compiler.set_stance("force_eager")
+    _infer(ns, module)
+    assert _stance() == "eager_on_recompile"
+    _train(ns, module)
+    assert _stance() == "force_eager"

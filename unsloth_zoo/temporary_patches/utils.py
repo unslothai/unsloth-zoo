@@ -2098,34 +2098,47 @@ def _settle_abandoned_checkpoint_generator():
 # True only while generate() runs a compiled decode step for a model that opted in. A
 # one-element list so Dynamo guards on the value and retraces when it flips.
 UNSLOTH_DECODE_COMPILE = [False]
-# Weak references to the eager_on_recompile stance objects Unsloth installed (True where torch
-# keeps no stance object). Process wide like the stance, so any generated module's training
-# forward can undo it while one of them is current. Weak, so an object any enclosing scope can
-# still restore stays recognised however deep the nesting, and dead ones drop out by themselves.
+# [weak reference to an eager_on_recompile stance object Unsloth installed (True where torch
+# keeps no stance object), the stance object it replaced]. Process wide like the stance, so any
+# generated module's training forward can undo it while one of them is current, putting back
+# what the caller had. Weak, so an object any enclosing scope can still restore stays
+# recognised however deep the nesting, and dead ones drop out by themselves.
 UNSLOTH_EAGER_STANCE_OWNED = []
 
 
 def _owned_stance(entry):
-    return True if entry is True else entry()
+    return True if entry[0] is True else entry[0]()
 
 
-def unsloth_claim_eager_stance(stance):
-    UNSLOTH_EAGER_STANCE_OWNED[:] = [o for o in UNSLOTH_EAGER_STANCE_OWNED if _owned_stance(o) is not None]
+def unsloth_claim_eager_stance(stance, previous = None):
+    UNSLOTH_EAGER_STANCE_OWNED[:] = [e for e in UNSLOTH_EAGER_STANCE_OWNED if _owned_stance(e) is not None]
     try:
-        UNSLOTH_EAGER_STANCE_OWNED.append(True if stance is True else weakref.ref(stance))
+        ref = True if stance is True else weakref.ref(stance)
     except TypeError:
-        UNSLOTH_EAGER_STANCE_OWNED.append(True)
+        ref = True
+    UNSLOTH_EAGER_STANCE_OWNED.append([ref, previous])
+
+
+def _owned_entry(current):
+    for entry in UNSLOTH_EAGER_STANCE_OWNED:
+        if entry[0] is True or _owned_stance(entry) is current:
+            return entry
+    return None
 
 
 def unsloth_owns_stance(current):
-    return any(o is True or _owned_stance(o) is current for o in UNSLOTH_EAGER_STANCE_OWNED)
+    return _owned_entry(current) is not None
 
 
 def unsloth_release_stance(current):
+    """Forget the owned entry for `current` and return the stance it replaced (None if unknown)."""
+    entry = _owned_entry(current)
     UNSLOTH_EAGER_STANCE_OWNED[:] = [
-        o for o in UNSLOTH_EAGER_STANCE_OWNED
-        if o is not True and _owned_stance(o) is not None and _owned_stance(o) is not current
+        e for e in UNSLOTH_EAGER_STANCE_OWNED if e is not entry and _owned_stance(e) is not None
     ]
+    return None if entry is None else entry[1]
+
+
 _DECODE_COMPILE_LOCK = threading.Lock()
 _DECODE_COMPILE_STATE = {"depth": 0, "stance": None}
 
@@ -2157,8 +2170,9 @@ def unsloth_decode_compile():
                 if set_stance is not None and stance is not None and stance[0] != "default":
                     set_stance(stance[0], skip_guard_eval_unsafe = stance[1])
                     # Restoring installs a new stance object: keep Unsloth's claim on it.
-                    if _DECODE_COMPILE_STATE.pop("owned", False):
-                        _claim_current_stance()
+                    owned = _DECODE_COMPILE_STATE.pop("owned", None)
+                    if owned is not None:
+                        _claim_current_stance(owned[1])
 
 
 # Set while generate() runs an eager decode step (no grad, one new token per row) on this
@@ -2198,20 +2212,21 @@ def _eager_during_decode(func, compiled):
 
 
 def _stance_is_owned():
+    """The owned entry for the current stance, or None."""
     try:
         import torch._dynamo.eval_frame as eval_frame
         current = eval_frame._stance
     except Exception:
         current = None
-    return unsloth_owns_stance(current)
+    return _owned_entry(current)
 
 
-def _claim_current_stance():
+def _claim_current_stance(previous = None):
     try:
         import torch._dynamo.eval_frame as eval_frame
-        unsloth_claim_eager_stance(eval_frame._stance)
+        unsloth_claim_eager_stance(eval_frame._stance, previous)
     except Exception:
-        unsloth_claim_eager_stance(True)
+        unsloth_claim_eager_stance(True, previous)
 
 
 def _current_stance():
