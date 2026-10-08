@@ -53,6 +53,19 @@ def test_eager_layer_norm_fp32_weight_bf16_input():
     assert torch.isfinite(x.grad).all() and torch.isfinite(w.grad).all()
 
 
+def test_eager_layer_norm_fp32_input_bf16_weight_is_not_downcast():
+    from unsloth_zoo.patch_torch_functions import _layer_norm_eager
+    g = torch.Generator(device = "cuda").manual_seed(1)
+    x = torch.randn(2, 16, 64, device = "cuda", generator = g)
+    w = (1 + 0.1 * torch.randn(64, device = "cuda", generator = g)).to(torch.bfloat16)
+    b = (0.1 * torch.randn(64, device = "cuda", generator = g)).to(torch.bfloat16)
+    y = _layer_norm_eager(x, (64,), w, b, 1e-6)
+    assert y.dtype == torch.float32
+    # Normalised in float32 with the bfloat16 weights upcast, not in bfloat16
+    ref = torch.nn.functional.layer_norm(x, (64,), w.float(), b.float(), 1e-6)
+    torch.testing.assert_close(y, ref, rtol = 0, atol = 1e-6)
+
+
 def test_patched_layer_norm_train_after_eval_under_eager_on_recompile():
     if not hasattr(torch.compiler, "set_stance"):
         pytest.skip("torch.compiler.set_stance unavailable")
