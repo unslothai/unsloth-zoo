@@ -121,9 +121,13 @@ try:
     def reused_compiled_create_block_mask(mask_mod, bsz, head, M, N, device = "cuda"):
         """compiled_create_block_mask cached for stateless mask_mods. UNSLOTH_FLEX_MASK_REUSE=0 disables"""
         if os.environ.get("UNSLOTH_FLEX_MASK_REUSE", "1") == "0":
+            _BLOCK_MASK_CACHE.clear()   # turning reuse off also frees the retained masks
             return compiled_create_block_mask(mask_mod, bsz, head, M, N, device = device)
+        dev = torch.device(device)
+        if dev.type == "cuda" and dev.index is None:   # "cuda" means the current device
+            dev = torch.device("cuda", torch.cuda.current_device())
         # Inference tensors cannot be saved for backward, so keep inference mode masks apart
-        key = (mask_mod, bsz, head, M, N, torch.device(device), torch.is_inference_mode_enabled())
+        key = (mask_mod, bsz, head, M, N, dev, torch.is_inference_mode_enabled())
         block_mask = _BLOCK_MASK_CACHE.get(key)
         if block_mask is None:
             # Masks grow ~quadratically with length: keep only the current shape's masks (one per
@@ -132,7 +136,7 @@ try:
                 del _BLOCK_MASK_CACHE[k]
             if len(_BLOCK_MASK_CACHE) >= _BLOCK_MASK_CACHE_SIZE:
                 _BLOCK_MASK_CACHE.pop(next(iter(_BLOCK_MASK_CACHE)))
-            block_mask = compiled_create_block_mask(mask_mod, bsz, head, M, N, device = device)
+            block_mask = compiled_create_block_mask(mask_mod, bsz, head, M, N, device = dev)
             _BLOCK_MASK_CACHE[key] = block_mask
         return block_mask
 

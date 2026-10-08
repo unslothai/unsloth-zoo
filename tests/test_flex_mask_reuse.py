@@ -143,3 +143,24 @@ def test_padding_prefill_mask_not_cached(builds):
         sink.flex_attention_with_sink(attn, q.clone(), k.clone(), v.clone(), attention_mask = mask)
     utils, _ = _mods()
     assert len(utils._BLOCK_MASK_CACHE) == 0
+
+
+def test_kill_switch_frees_retained_masks(builds, monkeypatch):
+    utils, _ = _mods()
+    utils.reused_compiled_create_block_mask(utils.causal_mask, 1, 1, 128, 128, device = "cuda")
+    assert len(utils._BLOCK_MASK_CACHE) == 1
+    monkeypatch.setenv("UNSLOTH_FLEX_MASK_REUSE", "0")
+    utils.reused_compiled_create_block_mask(utils.causal_mask, 1, 1, 128, 128, device = "cuda")
+    assert len(utils._BLOCK_MASK_CACHE) == 0
+
+
+def test_unindexed_cuda_device_keys_on_the_current_device(builds):
+    utils, _ = _mods()
+    utils.reused_compiled_create_block_mask(utils.causal_mask, 1, 1, 128, 128, device = "cuda")
+    (key,) = utils._BLOCK_MASK_CACHE
+    assert key[5] == torch.device("cuda", torch.cuda.current_device())
+    if torch.cuda.device_count() > 1:
+        other = (torch.cuda.current_device() + 1) % torch.cuda.device_count()
+        with torch.cuda.device(other):
+            bm = utils.reused_compiled_create_block_mask(utils.causal_mask, 1, 1, 128, 128, device = "cuda")
+        assert bm.kv_num_blocks.device == torch.device("cuda", other)
