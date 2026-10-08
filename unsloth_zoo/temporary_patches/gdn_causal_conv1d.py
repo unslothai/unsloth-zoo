@@ -50,6 +50,7 @@ import os
 import sys
 import inspect
 import functools
+import importlib
 import importlib.util
 
 import torch
@@ -206,7 +207,7 @@ def _build_kernels():
                 b_g = b_g.to(dx.dtype.element_ty).to(tl.float32)
             if k == 0:
                 if NEED_DB:
-                    tl.store(db + tl.cast(i_b * NT + i_t, tl.int64) * D + o_d, tl.sum(b_g, 0), mask = m_d)
+                    tl.store(db + (tl.cast(i_b, tl.int64) * NT + i_t) * D + o_d, tl.sum(b_g, 0), mask = m_d)
                 if NEED_DW:
                     # dw[j] = sum_t g[t] * x[t - (W - 1) + j] over this tile's rows.
                     for j in tl.static_range(W):
@@ -217,7 +218,7 @@ def _build_kernels():
                             mask = m, other = 0,
                         ).to(tl.float32)
                         tl.store(
-                            dw + (tl.cast(i_b * NT + i_t, tl.int64) * D + o_d) * W + j,
+                            dw + ((tl.cast(i_b, tl.int64) * NT + i_t) * D + o_d) * W + j,
                             tl.sum(b_g * b_xs, 0), mask = m_d,
                         )
             if NEED_DX:
@@ -369,6 +370,12 @@ def _try_fast(x, weight, bias, activation):
         return None
 
 
+def _count_fallback():
+    # Not while tracing: a global counter read inside a compiled region becomes a guard.
+    if not torch.compiler.is_compiling():
+        GDN_CAUSAL_CONV1D_STATS["fallback"] += 1
+
+
 def _make_hub_dispatch(torch_function):
     """Wrap the transformers torch fallback `causal_conv1d_fn(hidden_states, weight,
     bias=None, activation=None, **kwargs)`, which ignores its kwargs."""
@@ -377,7 +384,7 @@ def _make_hub_dispatch(torch_function):
         out = _try_fast(hidden_states, weight, bias, activation)
         if out is not None:
             return out
-        GDN_CAUSAL_CONV1D_STATS["fallback"] += 1
+        _count_fallback()
         return torch_function(hidden_states, weight, bias, activation, **kwargs)
 
     setattr(causal_conv1d_fn, _MARK, True)
@@ -423,7 +430,7 @@ def _legacy_causal_conv1d_fn(x, weight, bias = None, activation = None, **kwargs
         out = _try_fast(x, weight, bias, activation)
         if out is not None:
             return out
-    GDN_CAUSAL_CONV1D_STATS["fallback"] += 1
+    _count_fallback()
     if seq_idx is not None:
         return _causal_conv1d_reference_seq_idx(x, weight, bias, activation, seq_idx)
     return causal_conv1d_reference(x, weight, bias, activation)
@@ -501,8 +508,16 @@ def patch_gdn_causal_conv1d():
         return
 
     patched_decorator = _patch_hub_decorator()
-    # Modeling modules not imported yet are covered by the patched decorator.
     names = [f"transformers.models.{p}.modeling_{p}" for p in _GDN_MODELING]
+    if patched_decorator is None:
+        # transformers < 5.15 has no decorator to hook, so a modeling module imported
+        # later would keep its None global: import them now and rebind.
+        for name in names:
+            try:
+                importlib.import_module(name)
+            except Exception:
+                pass
+    # On >= 5.15 modeling modules not imported yet are covered by the patched decorator.
     names += sorted(
         name for name in list(sys.modules)
         if name.rsplit(".", 1)[-1].startswith("unsloth_compiled_module_")

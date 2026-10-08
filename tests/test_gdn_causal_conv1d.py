@@ -295,3 +295,46 @@ def test_gated_delta_net_layer_engages_triton(hub_kernels, monkeypatch):
     monkeypatch.setenv(gcc._KILL_SWITCH, "1")
     run()
     assert gcc.GDN_CAUSAL_CONV1D_STATS["triton_fwd"] == stats["triton_fwd"] + 1
+
+
+def test_legacy_modeling_imported_at_patch_time(monkeypatch):
+    # transformers < 5.15: no decorator to hook, so the patch imports the modeling
+    # modules itself and fills their None global before any model is built.
+    import importlib
+    import sys
+    import types
+    monkeypatch.setattr(gcc, "_patch_hub_decorator", lambda: None)
+    monkeypatch.setattr(gcc, "_real_causal_conv1d_available", lambda: False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.delenv(gcc._KILL_SWITCH, raising = False)
+    pytest.importorskip("triton")
+    imported = []
+    for name in [f"transformers.models.{p}.modeling_{p}" for p in gcc._GDN_MODELING]:
+        monkeypatch.delitem(sys.modules, name, raising = False)
+
+    def fake_import(name):
+        module = types.ModuleType(name)
+        module.causal_conv1d_fn = None
+        sys.modules[name] = module
+        imported.append(name)
+        return module
+
+    monkeypatch.setattr(importlib, "import_module", fake_import)
+    try:
+        gcc.patch_gdn_causal_conv1d()
+        assert len(imported) == len(gcc._GDN_MODELING)
+        assert all(sys.modules[name].causal_conv1d_fn is gcc._legacy_causal_conv1d_fn for name in imported)
+    finally:
+        for name in imported:
+            sys.modules.pop(name, None)
+
+
+def test_fallback_counter_is_not_read_while_tracing(monkeypatch):
+    # A global read inside a compiled region would become a guard and recompile every call.
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    x, w = torch.randn(1, 8, 5), torch.randn(8, 4)
+    before = dict(gcc.GDN_CAUSAL_CONV1D_STATS)
+    gcc._legacy_causal_conv1d_fn(x, w, None, activation = "silu")
+    gcc._make_hub_dispatch(gcc.causal_conv1d_reference)(x, w, None, "silu")
+    assert gcc.GDN_CAUSAL_CONV1D_STATS == before
