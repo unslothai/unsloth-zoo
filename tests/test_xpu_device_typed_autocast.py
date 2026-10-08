@@ -51,8 +51,6 @@ def test_nested_quant_state_offset_follows_device():
 def test_gemma3n_region_keeps_enclosing_non_cuda_autocast():
     from unsloth_zoo.temporary_patches import gemma3n
 
-    # bf16 weights, fp32 input, as in the patched forwards: an fp32 "region" off CUDA only disables
-    # the enclosing autocast and the matmul then fails on mixed dtypes.
     linear = torch.nn.Linear(4, 4).to(torch.bfloat16)
     with warnings.catch_warnings():
         warnings.simplefilter("error")

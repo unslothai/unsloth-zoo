@@ -27,8 +27,7 @@ from .utils import (
 import contextlib
 
 def _fp32_autocast(device_type):
-    # fp32 region only where autocast supports float32 (CUDA). Elsewhere float32 autocast just disables
-    # the enclosing autocast, and the fp32 input then meets bf16 weights: keep the enclosing autocast.
+    # float32 autocast is CUDA only; elsewhere it disables the enclosing autocast and fp32 x bf16 weights raise.
     if device_type != "cuda":
         return contextlib.nullcontext()
     return torch.autocast(device_type = device_type, dtype = torch.float32, enabled = True)
