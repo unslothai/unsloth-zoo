@@ -499,7 +499,8 @@ def unsloth_training_stance():
         # Ownership is only dropped once ours is reset: a temporary stance scope's exit restores
         # one of our exact objects, which a later training forward must still recognise.
         if current.stance == "eager_on_recompile" and unsloth_owns_stance(current):
-            UNSLOTH_EAGER_STANCE_OWNED.clear()
+            # Only the reset object: an outer scope may still restore another one of ours.
+            UNSLOTH_EAGER_STANCE_OWNED[:] = [o for o in UNSLOTH_EAGER_STANCE_OWNED if o is not current]
             torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = False)
 pass
 

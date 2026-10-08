@@ -282,3 +282,20 @@ def test_scoped_inference_in_a_second_module_keeps_the_first_claim():
     assert _stance() == "eager_on_recompile"
     _train(ns_b, module_b)
     assert _stance() == "default"
+
+
+def test_training_inside_a_scope_keeps_the_outer_owned_stance():
+    # Outer Unsloth stance saved by a default scope; inference inside claims a second one and a
+    # training forward resets it. The scope's exit restores the outer one, which is still ours.
+    frames, compiled = _counting_compile()
+    ns = _generated_module(compiled)
+    module = torch.nn.Linear(1, 1)
+    _infer(ns, module)
+    with torch.compiler.set_stance("default"):
+        _infer(ns, module)
+        assert _stance() == "eager_on_recompile"
+        _train(ns, module)
+        assert _stance() == "default"
+    assert _stance() == "eager_on_recompile"
+    _train(ns, module)
+    assert _stance() == "default"
