@@ -1191,7 +1191,10 @@ def _check_torch_grouped_mm_supported():
 # grouped_mm kernel segfaults instead of raising, which no try/except can catch. Both probe shapes are
 # first run in a throwaway interpreter; only if it survives do the in-process probes run as before.
 _GROUPED_MM_CRASH_PROBE = r"""
-import sys, torch
+import sys
+if sys.platform == "win32":   # no "python.exe has stopped working" dialog when the kernel faults
+    import ctypes; ctypes.windll.kernel32.SetErrorMode(0x0003)
+import torch
 d = torch.device("cuda", int(sys.argv[1]))
 def probe(x, w, offs):
     offs = torch.tensor(offs, device = d, dtype = torch.int32)
@@ -1212,6 +1215,12 @@ def _grouped_mm_survives_out_of_process(device):
     if _GROUPED_MM_SURVIVES is not None: return _GROUPED_MM_SURVIVES
     _GROUPED_MM_SURVIVES = True
     if getattr(torch.version, "hip", None) is None: return True
+    # A Python kernel already replaces the native one in this process (Studio's gfx120X fallback): a child
+    # without it would crash on the very kernel this process never calls.
+    try:
+        if "CUDA (inactive):" in torch._C._dispatch_dump("aten::_grouped_mm"): return True
+    except Exception:
+        pass
     import subprocess
     # A fresh interpreter, not multiprocessing: spawn re-imports the caller's __main__.
     # Device setup sits outside the child's try, so a child that never reaches the kernel also reads as unsafe.
@@ -1219,6 +1228,7 @@ def _grouped_mm_survives_out_of_process(device):
         result = subprocess.run(
             [sys.executable, "-c", _GROUPED_MM_CRASH_PROBE, str(device.index)],
             stdout = subprocess.DEVNULL, stderr = subprocess.DEVNULL, timeout = 180,
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0),
         ).returncode
     except Exception as e:
         result = type(e).__name__

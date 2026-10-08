@@ -1,5 +1,7 @@
 """unsloth#12391: on ROCm a grouped_mm probe that segfaults must not take the importing process down."""
+import os
 import subprocess
+import sys
 
 import pytest
 import torch
@@ -40,6 +42,17 @@ def test_crash_probe_skipped_off_rocm(monkeypatch):
     assert moe_utils._grouped_mm_survives_out_of_process(torch.device("cuda", 0)) is True
 
 
+def test_python_kernel_override_skips_child(monkeypatch, fake_rocm):
+    # Studio swaps in a Python _grouped_mm on gfx120X; this process never calls the native kernel then.
+    lib = torch.library.Library("aten", "IMPL")
+    lib.impl("_grouped_mm", lambda *a, **k: None, "CUDA")
+    try:
+        monkeypatch.setattr(moe_utils, "_GROUPED_MM_CRASH_PROBE", "raise SystemExit(1)")
+        assert moe_utils._grouped_mm_survives_out_of_process(fake_rocm) is True
+    finally:
+        lib._destroy()
+    assert "CUDA (inactive):" not in torch._C._dispatch_dump("aten::_grouped_mm")
+
 def test_crashing_probe_disables_both_grouped_mm_probes(monkeypatch, fake_rocm):
     monkeypatch.setattr(moe_utils, "_GROUPED_MM_SURVIVES", False)
     monkeypatch.setattr(moe_utils, "_TORCH_GROUPED_MM_SUPPORTED", None)
@@ -51,3 +64,22 @@ def test_crashing_probe_disables_both_grouped_mm_probes(monkeypatch, fake_rocm):
     assert moe_utils._probe_torch_grouped_mm_supported() is False
     assert moe_utils._probe_transposed_view_grouped_mm_is_safe() is False
     assert called == []
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs a GPU so the probe reaches the kernel call")
+def test_import_survives_segfaulting_grouped_mm(tmp_path):
+    # Every interpreter (this child and the probe's own child) sees ROCm and a grouped_mm that segfaults.
+    (tmp_path / "sitecustomize.py").write_text(
+        "import os, signal, torch\n"
+        "torch.version.hip = '7.1.0'\n"
+        "torch._grouped_mm = lambda *a, **k: os.kill(os.getpid(), signal.SIGSEGV)\n"
+    )
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = dict(os.environ, PYTHONPATH = os.pathsep.join([str(tmp_path), root]), UNSLOTH_IS_PRESENT = "1")
+    code = (
+        "from unsloth_zoo.temporary_patches import moe_utils as m; "
+        "print(m._check_torch_grouped_mm_supported(), m._transposed_view_grouped_mm_is_safe())"
+    )
+    r = subprocess.run([sys.executable, "-c", code], env = env, capture_output = True, text = True, timeout = 600)
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert r.stdout.split()[-2:] == ["False", "False"]
