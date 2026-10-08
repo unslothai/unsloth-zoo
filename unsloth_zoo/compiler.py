@@ -3188,6 +3188,40 @@ __DYNAMO__RECOMPILING__ = """
 __DYNAMO__TRAINING_STANCE__ = """if not torch.compiler.is_compiling() and torch.is_grad_enabled() and getattr(self, "training", False):
     unsloth_training_stance()"""
 
+# Placeholder line in the lm_head templates. `_place_training_stance` swaps it for nothing once
+# the reset sits at the top of the forward, or for the reset itself if that is not possible.
+_TRAINING_STANCE_MARKER = "__UNSLOTH_TRAINING_STANCE_MARKER__"
+_TRAINING_STANCE_MARKER_LINE = re.compile(r"^([ \t]*)" + _TRAINING_STANCE_MARKER + r"[ \t]*\n", re.MULTILINE)
+
+
+def _place_training_stance(forward):
+    """Reset the stance as the first statement of the fused forward. At the logits site it came
+    after the decoder body, so the first training step after inference still ran that body eager."""
+    def at_marker(match):
+        return textwrap.indent(__DYNAMO__TRAINING_STANCE__, match.group(1)) + "\n"
+    try:
+        dedented = textwrap.dedent(forward)
+        tree = ast.parse(dedented)
+        function = next(x for x in tree.body if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef)))
+        body = function.body
+        first = body[0]
+        if isinstance(first, ast.Expr) and isinstance(getattr(first, "value", None), ast.Constant) \
+            and isinstance(first.value.value, str):
+            first = body[1]  # after the docstring
+        lines = forward.split("\n")
+        line = lines[first.lineno - 1]
+        indent = line[: len(line) - len(line.lstrip())]
+        shift = len(line) - len(dedented.split("\n")[first.lineno - 1])
+        if first.lineno == function.lineno or first.col_offset + shift != len(indent) or not indent:
+            raise ValueError("forward body does not start on its own line")
+        lines.insert(first.lineno - 1, textwrap.indent(__DYNAMO__TRAINING_STANCE__, indent))
+        placed = "\n".join(lines)
+        placed = _TRAINING_STANCE_MARKER_LINE.sub("", placed)
+        ast.parse(textwrap.dedent(placed))
+        return placed
+    except Exception:
+        return _TRAINING_STANCE_MARKER_LINE.sub(at_marker, forward)
+
 # Replace Cross Entropy cells with fused linear lm heads
 cross_entropy_find_1 = """
 logits = self.lm_head(hidden_states$INDEXING$
@@ -3236,7 +3270,7 @@ pass
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
-__DYNAMO__TRAINING_STANCE__
+__UNSLOTH_TRAINING_STANCE_MARKER__
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
@@ -3286,7 +3320,7 @@ else:
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) != () else 0,
     )
-""".replace("__DYNAMO__RECOMPILING__", __DYNAMO__RECOMPILING__).replace("__DYNAMO__TRAINING_STANCE__", __DYNAMO__TRAINING_STANCE__)
+""".replace("__DYNAMO__RECOMPILING__", __DYNAMO__RECOMPILING__)
 
 cross_entropy_find_2 = """
 logits = self.lm_head(hidden_states$INDEXING$
@@ -3331,7 +3365,7 @@ pass
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
-__DYNAMO__TRAINING_STANCE__
+__UNSLOTH_TRAINING_STANCE_MARKER__
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
@@ -3406,7 +3440,7 @@ else:
         logits = torch.tanh(logits)
         logits = logits * (\\4)
     loss = self.loss_function(\\6, \\7.to(self.lm_head.weight.device), vocab_size=\\8, **\\9)
-""".replace("__DYNAMO__RECOMPILING__", __DYNAMO__RECOMPILING__).replace("__DYNAMO__TRAINING_STANCE__", __DYNAMO__TRAINING_STANCE__)
+""".replace("__DYNAMO__RECOMPILING__", __DYNAMO__RECOMPILING__)
 
 cross_entropy_find_3 = """
 $OUTPUTLOGITS$
@@ -3455,7 +3489,7 @@ pass
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
-__DYNAMO__TRAINING_STANCE__
+__UNSLOTH_TRAINING_STANCE_MARKER__
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
@@ -3503,7 +3537,7 @@ else:
         logit_scale_divide   = (\\3) if (\\3) != () else 0,
         logit_softcapping    = (\\4) if (\\4) != () else 0,
     )
-""".replace("__DYNAMO__RECOMPILING__", __DYNAMO__RECOMPILING__).replace("__DYNAMO__TRAINING_STANCE__", __DYNAMO__TRAINING_STANCE__)
+""".replace("__DYNAMO__RECOMPILING__", __DYNAMO__RECOMPILING__)
 
 ce_finders = [
     (
@@ -3925,6 +3959,7 @@ def _apply_fused_lm_head(forward, module=None):
         forward = forward.replace(", **)", ")")
         forward = forward.replace(",**)", ")")
         forward = forward.replace(",** )", ")")
+        forward = _place_training_stance(forward)
         # print(forward)
         return forward, True
     pass

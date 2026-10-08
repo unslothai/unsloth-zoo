@@ -18,6 +18,7 @@
 
 import logging
 import os
+import sys
 import textwrap
 import types
 
@@ -42,13 +43,104 @@ def _stance():
     return eval_frame._stance.stance
 
 
+# A causal LM forward in the shape transformers writes them: decoder body, then the lm_head and
+# loss. Production runs it through `apply_fused_lm_head`; so does the harness, so the stance
+# hooks land exactly where generated modules have them.
+CAUSAL_LM_FORWARD = """    def forward(self, input_ids, labels=None, logits_to_keep=0, **kwargs):
+        \"\"\"Mirrors a transformers *ForCausalLM.forward.\"\"\"
+        hidden_states = self.model(input_ids)
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+        loss = None
+        if labels is not None:
+            loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
+
+        return loss, logits
+"""
+
+
+def ForCausalLMLoss(logits, labels, vocab_size = None, **kwargs):
+    return torch.nn.functional.cross_entropy(
+        logits[:, :-1].reshape(-1, logits.shape[-1]).float(), labels[:, 1:].reshape(-1), ignore_index = -100,
+    )
+
+
+def _fused_ce(hidden_states, lm_head_weight, labels, **kwargs):
+    return ForCausalLMLoss(hidden_states @ lm_head_weight.t(), labels)
+
+
+class _CausalLM(torch.nn.Module):
+    def __init__(self, body):
+        super().__init__()
+        self.model = body
+        self.lm_head = torch.nn.Linear(8, 16, bias = False)
+        self.loss_function = ForCausalLMLoss
+        self.config = types.SimpleNamespace(vocab_size = 16)
+
+
+def _generated_forward_source():
+    source, fused = compiler.apply_fused_lm_head(CAUSAL_LM_FORWARD, "TestForCausalLM")
+    assert fused
+    return textwrap.dedent(source)
+
+
 def _generated_module(compiled, name = "unsloth_compiled_module_test"):
-    """A module object with the stance globals of a generated module, plus a forward built
-    from the same snippets. Separate calls give separate modules, as two model types would."""
+    """A module object with the stance globals of a generated module and the forward
+    `apply_fused_lm_head` produces. Separate calls give separate modules, as two model types
+    would. `compiled` is the decoder body; the returned `forward(module, x, labels)` follows
+    `module`'s train / eval mode."""
     header = compiler._license_header
     start = header.index("global INFERENCE_RUNS")
     end = header.index("from unsloth_zoo import DEVICE_TYPE_TORCH")
     module = types.ModuleType(name)
+    sys.modules[name] = module
+    namespace = module.__dict__
+    namespace.update({
+        "torch": torch,
+        "os": os,
+        "EMPTY_LOGITS": torch.empty(0),
+        "UNSLOTH_ENABLE_CCE": False,
+        "HAS_CUT_CROSS_ENTROPY": False,
+        "UNSLOTH_COMPILE_DISABLE": True,
+        "unsloth_fused_ce_loss": _fused_ce,
+        "UNSLOTH_DECODE_COMPILE": UNSLOTH_DECODE_COMPILE,
+        "UNSLOTH_ENABLE_LOGGING": False,
+        "logger_compiler": logging.getLogger(__name__),
+    })
+    exec(header[start:end], namespace)
+    exec(_generated_forward_source(), namespace)
+    causal_lm = _CausalLM(lambda ids: compiled(ids).view(1, 2, 8))
+
+    generated_forward = namespace["forward"]
+    assert x_shape_guard(generated_forward)
+
+    def forward(owner, x, labels = None):
+        # Calls the generated forward captured above, never the "forward" slot this replaces.
+        assert x.numel() == 8, "harness input must stay (8,)"
+        causal_lm.train(owner.training)
+        ids = x.repeat(2)
+        if labels is None:
+            return generated_forward(causal_lm, ids)[1]
+        return generated_forward(causal_lm, ids, labels = torch.zeros(1, 2, dtype = torch.long))[0]
+
+    namespace["generated_forward"] = generated_forward
+    namespace["forward"] = forward
+    return namespace
+
+
+def x_shape_guard(generated_forward):
+    # The wrapper below must not be its own target.
+    return generated_forward.__name__ == "forward" and "owner" not in generated_forward.__code__.co_varnames
+
+
+def _snippet_module(compiled):
+    """Only the stance hooks around a compiled call, small enough to trace with fullgraph."""
+    header = compiler._license_header
+    start = header.index("global INFERENCE_RUNS")
+    end = header.index("from unsloth_zoo import DEVICE_TYPE_TORCH")
+    module = types.ModuleType("unsloth_compiled_module_snippet")
+    sys.modules[module.__name__] = module
     namespace = module.__dict__
     namespace.update({
         "torch": torch,
@@ -88,14 +180,36 @@ def _counting_compile():
     return frames, torch.compile(lambda x: x.sin() * 2 + 1, backend = backend)
 
 
-def test_every_lm_head_template_resets_before_branching():
+def test_reset_runs_before_the_decoder_body():
+    source = _generated_forward_source()
+    assert source.count("unsloth_training_stance()") == 1
+    assert source.index("unsloth_training_stance()") < source.index("self.model(input_ids)")
+    assert compiler._TRAINING_STANCE_MARKER not in source
     for template in (
         compiler.cross_entropy_replacement_1,
         compiler.cross_entropy_replacement_2,
         compiler.cross_entropy_replacement_3,
     ):
-        assert "unsloth_training_stance()" in template
-        assert template.index("unsloth_training_stance()") < template.index("if RETURN_HIDDEN_STATES:")
+        assert "unsloth_training_stance()" not in template
+
+
+def test_reset_falls_back_to_the_logits_site():
+    # A forward the parser cannot place it in still gets the reset where the marker was.
+    source = "def forward(self, x): (\n    " + compiler._TRAINING_STANCE_MARKER + "\n"
+    placed = compiler._place_training_stance(source)
+    assert "unsloth_training_stance()" in placed and compiler._TRAINING_STANCE_MARKER not in placed
+
+
+def test_first_training_forward_after_inference_compiles_the_body():
+    frames, compiled = _counting_compile()
+    ns = _generated_module(compiled)
+    module = torch.nn.Linear(1, 1)
+    _infer(ns, module)
+    assert _stance() == "eager_on_recompile"
+    assert len(frames) == 1
+    _train(ns, module)
+    assert len(frames) == 2, "the first training step ran the decoder body eager"
+    assert _stance() == "default"
 
 
 def test_training_after_inference_compiles_again():
@@ -147,7 +261,7 @@ def test_user_stance_is_left_alone():
 
 def test_no_graph_break_when_the_forward_is_traced():
     frames, compiled = _counting_compile()
-    ns = _generated_module(compiled)
+    ns = _snippet_module(compiled)
     module = torch.nn.Linear(1, 1).train()
     traced = torch.compile(ns["forward"], fullgraph = True, backend = "eager")
     x = torch.randn(8, requires_grad = True)
