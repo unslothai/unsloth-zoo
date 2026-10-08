@@ -4053,7 +4053,7 @@ def _check_lora_rank_fits(model, save_directory):
     """
     # All Unsloth Zoo code licensed under LGPLv3
     try:
-        r = get_peft_config.__wrapped__(save_directory).get("r", None)
+        r = _peft_max_rank(get_peft_config.__wrapped__(save_directory))
         engine = model.vllm_engine.llm_engine
         lora_config = getattr(getattr(engine, "vllm_config", None), "lora_config", None) \
             or getattr(engine, "lora_config", None)

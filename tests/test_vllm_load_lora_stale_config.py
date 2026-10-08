@@ -116,6 +116,13 @@ def test_path_load_above_max_lora_rank_is_refused_before_vllm(tmp_path, load_lor
         load_lora(_Model(max_lora_rank = 16), str(directory))
 
 
+def test_path_load_with_a_rank_pattern_above_max_lora_rank_is_refused(tmp_path, load_lora):
+    directory = tmp_path / "patterned"
+    _write_stale(directory, r = 16, rank_pattern = {"q_proj": 32})
+    with pytest.raises(ValueError, match = r"r = 32 .* max_lora_rank = 16"):
+        load_lora(_Model(max_lora_rank = 16), str(directory))
+
+
 def test_path_load_within_max_lora_rank_is_passed_through(tmp_path, load_lora):
     directory = tmp_path / "adapter"
     _write_stale(directory, r = 16)
