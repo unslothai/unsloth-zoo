@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Vision / audio towers have no token embedding: transformers' fallback `get_input_embeddings`
-raises NotImplementedError there (Qwen2.5-VL `visual`, Gemma 4 `audio_tower`). The requires-grad
-hook must take its pre-forward path quietly instead of warning at every LoRA setup."""
+"""Towers whose `get_input_embeddings` raises NotImplementedError take the pre-forward hook quietly."""
 
 import logging
 
@@ -88,8 +86,7 @@ def test_unexpected_failure_still_warns(caplog):
 
 
 def test_a_failed_registration_still_warns_and_hooks_the_tower(caplog, monkeypatch):
-    # NotImplementedError raised while registering, not by the getter, is a real failure: it must
-    # warn, and the fallback pre-forward hook must go on the tower, not on the embedding.
+    # Raised while registering, not by the getter: warn, and hook the tower, not the embedding.
     class _Embedding(nn.Linear):
         def register_forward_hook(self, *args, **kwargs):
             raise NotImplementedError("cannot hook this embedding")
