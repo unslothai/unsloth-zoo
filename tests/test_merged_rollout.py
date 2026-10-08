@@ -1034,3 +1034,18 @@ def test_failed_reset_after_restore_blocks_plain_calls_until_it_resets(how):
     assert llm.calls[-1][1] is None
     llm.generate(["plain"], lora_request = None)
     assert n["n"] == 4
+
+
+def test_async_engine_is_not_wrapped_and_keeps_vllm_lora(monkeypatch, _isolate):
+    # AsyncLLMEngine.generate is an async generator: a fold around the call would be
+    # restored before inference, so such engines stay on the vLLM LoRA path.
+    model, llm, vllm_model = _make_model(wrap = False)
+
+    async def generate(prompts, sampling_params = None, *, lora_request = None):
+        yield prompts
+
+    llm.generate = generate
+    install_merged_rollout_engine_wrapper(llm)
+    assert llm.generate is generate
+    assert not getattr(llm, "_unsloth_merged_rollout_wrapped", False)
+    assert type(load_lora(model, _ADAPTER_DIR, load_tensors = True)) is _isolate.LoRARequest

@@ -5150,6 +5150,15 @@ def install_merged_rollout_engine_wrapper(llm):
     sentinel becomes lora_request = None inside a fold/restore. Other requests pass through."""
     # All Unsloth Zoo code licensed under LGPLv3
     if llm is None or getattr(llm, "_unsloth_merged_rollout_wrapped", False): return llm
+    # Only the synchronous LLM: an async engine's generate yields after the call returns,
+    # so a fold around the call would be restored before inference ran. Unwrapped engines
+    # never get a sentinel from load_lora, so they keep the vLLM LoRA path.
+    if any(
+        inspect.iscoroutinefunction(fn) or inspect.isasyncgenfunction(fn)
+        for fn in (getattr(llm, name, None) for name in ("generate", "chat"))
+    ):
+        _merged_rollout_log_once("Unsloth: merged-weight rollouts need the synchronous vLLM LLM; using vLLM LoRA.")
+        return llm
     for name in ("generate", "chat"):
         bound = getattr(llm, name, None)
         if bound is not None: setattr(llm, name, _wrap_merged_rollout_call(bound, llm))
