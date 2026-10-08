@@ -498,37 +498,6 @@ def _lora_operands(projs, name, dtype):
     return A.contiguous(), B.contiguous()
 
 
-def _lora_stack_pair(projs, name):
-    """(A [E, r, in], B [E, out, r]): the stacked Parameters, else a per-call torch.stack."""
-    stacks = _lora_stacks(projs, name)
-    if stacks is not None:
-        return stacks
-    return (torch.stack([p.lora_A[name].weight for p in projs]),
-            torch.stack([p.lora_B[name].weight for p in projs]))
-
-
-def _fused_gate_up_lora(lora_g, lora_u):
-    """True when UNSLOTH_MOE_FUSED_GATE_UP_LORA=1 and gate / up share rank and scaling."""
-    if os.environ.get("UNSLOTH_MOE_FUSED_GATE_UP_LORA", "0") != "1":
-        return False
-    return lora_g is not None and lora_u is not None and lora_g[1] == lora_u[1] and lora_g[2] == lora_u[2]
-
-
-def _lora_delta_gate_up(x, offsets, projs, lora_g, lora_u, dtype):
-    """Gate and up LoRA deltas as one [T, 2*inter] tensor laid out as gate_up: one grouped GEMM
-    over A = cat(A_gate, A_up) [E, in, 2r] and one over the block-diagonal B [E, 2r, 2*inter]
-    (zero off-diagonal blocks contribute exact zeros), instead of four GEMMs and two adds."""
-    gmm = _moe_utils._grouped_mm_with_backward_fix
-    Ag, Bg = _lora_stack_pair(projs.gate, lora_g[0])
-    Au, Bu = _lora_stack_pair(projs.up, lora_u[0])
-    r = Ag.shape[1]
-    A = torch.cat((Ag.to(dtype), Au.to(dtype)), 1).transpose(1, 2)                   # [E, in, 2r]
-    B = torch.cat((F.pad(Bg.to(dtype), (0, r)), F.pad(Bu.to(dtype), (r, 0))), 1)    # [E, 2*inter, 2r]
-    A, B = _moe_utils._pad_lora_rank_for_grouped_mm(A, B.transpose(1, 2))
-    h = gmm(x, A.contiguous(), offsets)
-    return gmm(h, B.contiguous(), offsets) * lora_g[1]
-
-
 def _lora_delta(x, offsets, projs, lora, dtype):
     gmm = _moe_utils._grouped_mm_with_backward_fix
     name, scaling, _ = lora
@@ -900,15 +869,11 @@ def grouped_moe_forward(self, hidden_states: torch.Tensor):
     else:
         gate_up = _grouped_expert_gemm(permuted, offsets, lambda: _build_gate_up_stack(experts, spec, dtype, projs), recompute)
     # Expert LoRA: each wrapped projection adds its grouped delta to its base output, as the loop does.
-    if _fused_gate_up_lora(lora["gate"], lora["up"]):
-        gate_up = gate_up + _lora_delta_gate_up(permuted, offsets, projs, lora["gate"], lora["up"], dtype)
-        gate, up = gate_up.chunk(2, dim=-1)
-    else:
-        gate, up = gate_up.chunk(2, dim=-1)
-        if lora["gate"] is not None:
-            gate = gate + _lora_delta(permuted, offsets, projs.gate, lora["gate"], dtype)
-        if lora["up"] is not None:
-            up = up + _lora_delta(permuted, offsets, projs.up, lora["up"], dtype)
+    gate, up = gate_up.chunk(2, dim=-1)
+    if lora["gate"] is not None:
+        gate = gate + _lora_delta(permuted, offsets, projs.gate, lora["gate"], dtype)
+    if lora["up"] is not None:
+        up = up + _lora_delta(permuted, offsets, projs.up, lora["up"], dtype)
     inter = act(gate) * up
     if cache:
         down = _grouped_mm_fix(inter, self._cached_down, offsets)
