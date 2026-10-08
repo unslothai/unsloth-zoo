@@ -73,3 +73,26 @@ def test_disable_drops_the_projection_lists():
     assert "_moe_projs" in blk.__dict__
     ML.disable_grouped_moe(model)
     assert "_moe_projs" not in blk.__dict__ and "_moe_ready" not in blk.__dict__
+
+
+def test_compiled_forward_reads_the_live_projections():
+    """An eager forward fills _moe_projs; after an interior projection is replaced, a compiled trace
+    must use the new module, not the cached lists."""
+    import copy
+    model, blk = L.build("qwen3", base = "bf16", prefer_hf = False)
+    L.enable(model, blk)
+    x = torch.randn(1, 64, L.H, device = "cuda", dtype = L.DT)
+    with torch.no_grad():
+        stale = blk(x)[0]
+    assert "_moe_projs" in blk.__dict__
+    new = copy.deepcopy(blk.experts[4].down_proj)
+    with torch.no_grad():
+        new.lora_B["default"].weight.mul_(50)
+    blk.experts[4].down_proj = new
+    with torch.no_grad():
+        eager = blk(x)[0]
+        torch._dynamo.reset()
+        compiled = torch.compile(blk.forward, fullgraph = True)(x)[0]
+    swap = (eager - stale).abs().max().item()
+    assert swap > 1, swap   # the replacement moves the output
+    assert (compiled - eager).abs().max().item() < 0.02 * swap   # bf16 compile noise, not the old module
