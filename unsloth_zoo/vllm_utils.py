@@ -4621,6 +4621,9 @@ _MERGED_ROLLOUT_EMBEDDING_LEAVES = frozenset((
     "embed_tokens", "lm_head", "wte", "wpe", "embed_in", "embed_out", "word_embeddings", "output",
 ))
 _MERGED_ROLLOUT_OOM = getattr(torch, "OutOfMemoryError", torch.cuda.OutOfMemoryError)
+# One process-wide lock: prepare, fold -> generate -> restore, and every call through a
+# wrapped engine. vLLM's LLM is not thread-safe anyway, and no call may see folded weights.
+_MERGED_ROLLOUT_LOCK = threading.RLock()
 
 
 def _merged_rollout_enabled():
@@ -4637,12 +4640,33 @@ def _merged_rollout_log_once(message):
 pass
 
 
+def _merged_rollout_lora_layers(model):
+    # All Unsloth Zoo code licensed under LGPLv3
+    return [
+        module for module in model.modules()
+        if isinstance(getattr(module, "lora_A", None), torch.nn.ModuleDict) and len(module.lora_A) != 0
+    ]
+pass
+
+
+def _merged_rollout_lora_params(module):
+    # All Unsloth Zoo code licensed under LGPLv3
+    params = []
+    for name in ("lora_A", "lora_B"):
+        holder = getattr(module, name, None)
+        if isinstance(holder, torch.nn.Module): params.extend(holder.parameters())
+    return params
+pass
+
+
 def _merged_rollout_layer_key(module):
     """Everything a fold relies on for one LoRA layer; any change invalidates a cached verdict."""
     # All Unsloth Zoo code licensed under LGPLv3
     W = getattr(getattr(module, "base_layer", None), "weight", None)
     lora_A = getattr(module, "lora_A", None)
     key = (
+        id(module),
+        tuple(id(p) for p in _merged_rollout_lora_params(module)),
         tuple(lora_A.keys()) if isinstance(lora_A, torch.nn.ModuleDict) else None,
         len(getattr(module, "merged_adapters", None) or ()),
         bool(getattr(module, "disable_adapters", False)),
@@ -4657,9 +4681,9 @@ pass
 
 
 class _MergedRolloutVerdict:
-    """Cached ineligible verdict for a model, reused until one of its LoRA layers changes."""
+    """Cached verdict for a model, reused until its current LoRA layers change."""
     # All Unsloth Zoo code licensed under LGPLv3
-    __slots__ = ("reason", "adapters", "modules", "keys", "__weakref__")
+    __slots__ = ("reason", "adapters", "modules", "keys", "pins", "__weakref__")
 
     def __init__(self, model, modules, reason = None):
         self.reason = reason
@@ -4670,28 +4694,39 @@ class _MergedRolloutVerdict:
 
     def record(self):
         self.keys = [_merged_rollout_layer_key(module) for module in self.modules]
+        # Keep the A / B parameters alive so their ids in keys cannot be reused.
+        self.pins = [_merged_rollout_lora_params(module) for module in self.modules]
     pass
 
     def is_valid_for(self, model):
-        return tuple(getattr(model, "peft_config", None) or ()) == self.adapters and \
-            [_merged_rollout_layer_key(module) for module in self.modules] == self.keys
+        # Re-read the model's current LoRA layers: replaced modules or A / B objects invalidate.
+        if tuple(getattr(model, "peft_config", None) or ()) != self.adapters: return False
+        return [_merged_rollout_layer_key(module) for module in _merged_rollout_lora_layers(model)] == self.keys
     pass
 pass
 
 
 class _MergedRolloutState(_MergedRolloutVerdict):
-    """Fold state for an eligible model: the shared weights, their pristine copies and a lock."""
+    """Fold state for an eligible model: the shared weights, their pristine copies, the engine."""
     # All Unsloth Zoo code licensed under LGPLv3
-    __slots__ = ("entries", "depth", "lock", "poisoned", "model_ref")
+    __slots__ = ("entries", "depth", "poisoned", "model_ref", "engine_ref")
 
     def __init__(self, model, entries):
         self.entries = entries   # (lora module, W the shared base weight, P its pristine copy)
         self.depth = 0
-        self.lock = threading.RLock()   # held fold -> generate -> restore
-        self.poisoned = None            # set when the restore failed twice
+        self.poisoned = None     # set when the restore failed twice
         self.model_ref = weakref.ref(model)
+        # The engine whose storage W aliases: the only one a fold may serve.
+        self.engine_ref = _merged_rollout_ref(getattr(model, "vllm_engine", None))
         super().__init__(model, [module for module, _, _ in entries])
     pass
+pass
+
+
+def _merged_rollout_ref(obj):
+    # All Unsloth Zoo code licensed under LGPLv3
+    try: return weakref.ref(obj)
+    except TypeError: return lambda: obj
 pass
 
 
@@ -4825,6 +4860,14 @@ def prepare_merged_rollout(model):
     Both verdicts are cached on the model until a validity check changes."""
     # All Unsloth Zoo code licensed under LGPLv3
     if not _merged_rollout_enabled(): return None
+    # Under the lock, so P is never cloned while another thread has the weights folded.
+    with _MERGED_ROLLOUT_LOCK:
+        return _prepare_merged_rollout_locked(model)
+pass
+
+
+def _prepare_merged_rollout_locked(model):
+    # All Unsloth Zoo code licensed under LGPLv3
     cached = getattr(model, "_unsloth_merged_rollout_state", None)
     if isinstance(cached, _MergedRolloutState):
         if cached.poisoned is not None:
@@ -4852,10 +4895,7 @@ def prepare_merged_rollout(model):
             _device_empty_cache()
             reason = "the pristine copy of the targeted weights does not fit on the GPU"
     if reason is not None:
-        modules = [
-            module for module in model.modules()
-            if isinstance(getattr(module, "lora_A", None), torch.nn.ModuleDict) and len(module.lora_A) != 0
-        ]
+        modules = _merged_rollout_lora_layers(model)
         model._unsloth_merged_rollout_state = _MergedRolloutVerdict(model, modules, reason)
         _merged_rollout_log_once(
             f"Unsloth: UNSLOTH_VLLM_MERGED_ROLLOUT is on but falling back to vLLM LoRA (punica) because {reason}."
@@ -4873,13 +4913,43 @@ pass
 
 
 def _merged_rollout_synchronize(state):
-    # The fold must land before vLLM reads it, and vLLM must finish reading before the
-    # restore overwrites it, in case the engine runs on another stream.
+    # The fold must land before vLLM reads it, vLLM must finish reading before the restore
+    # overwrites it, and the restore must land before the lock is released, in case the
+    # engine runs on another stream.
     # All Unsloth Zoo code licensed under LGPLv3
     if not state.entries: return
     device = state.entries[0][1].device
     if device.type == "cuda": torch.cuda.synchronize(device)
     elif device.type == "xpu" and hasattr(torch, "xpu"): torch.xpu.synchronize(device)
+pass
+
+
+def _merged_rollout_sample(W):
+    # First, middle and last rows and columns plus the diagonal, as int16 bit patterns.
+    # All Unsloth Zoo code licensed under LGPLv3
+    rows, cols = W.shape
+    parts = [W[0], W[rows // 2], W[-1], W[:, 0], W[:, cols // 2], W[:, -1], W.diagonal()]
+    return [part.view(torch.int16) for part in parts]
+pass
+
+
+def _merged_rollout_refresh_pristine(state):
+    """At depth 0 W is the base. A reload that skips _version (vLLM load_weights into
+    inference tensors, .data writes) leaves P stale, so compare a sample of W with P and
+    re-copy P from W on any mismatch. Cost: about 3 * (rows + cols) elements per target,
+    one cat and one host sync per rollout, under 0.1% of the weights for real models."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    sample_W, sample_P = [], []
+    for _, W, P in state.entries:
+        sample_W.extend(_merged_rollout_sample(W))
+        sample_P.extend(_merged_rollout_sample(P))
+    if torch.equal(torch.cat(sample_W), torch.cat(sample_P)): return False
+    for _, W, P in state.entries: P.copy_(W)
+    _merged_rollout_log_once(
+        "Unsloth: the base weights were rewritten outside autograd (e.g. a vLLM weight reload); "
+        "refreshed the merged-rollout pristine copy from them."
+    )
+    return True
 pass
 
 
@@ -4893,6 +4963,7 @@ def _merged_rollout_restore(state):
             _merged_rollout_synchronize(state)
             with torch.inference_mode():
                 for module, W, P in state.entries: W.copy_(P)
+            _merged_rollout_synchronize(state)
             state.record()
             break
         except BaseException as error:
@@ -4911,10 +4982,10 @@ pass
 @contextlib.contextmanager
 def merged_rollout(state):
     """Fold W = P + s * B @ A into every shared weight, then restore W = P bit-exactly.
-    Holds state.lock throughout. Re-entrant (chat -> generate): only the outermost call
-    folds and restores."""
+    Holds the module lock throughout. Re-entrant (chat -> generate): only the outermost
+    call folds and restores."""
     # All Unsloth Zoo code licensed under LGPLv3
-    with state.lock:
+    with _MERGED_ROLLOUT_LOCK:
         if state.poisoned is not None:
             raise RuntimeError(
                 f"Unsloth: the merged-weight rollout state is unusable after a failed restore ({state.poisoned})."
@@ -4925,6 +4996,7 @@ def merged_rollout(state):
         try:
             if outermost:
                 with torch.inference_mode():
+                    _merged_rollout_refresh_pristine(state)
                     for module, W, P in state.entries:
                         A = module.lora_A[adapter].weight.to(W.dtype)
                         B = module.lora_B[adapter].weight.to(W.dtype)
@@ -4959,6 +5031,22 @@ def _reset_merged_rollout_prefix_cache(llm):
 pass
 
 
+def _merged_rollout_clean_cache(llm):
+    """If the reset after a restore failed, KV from folded weights is still cached under base
+    hashes: reset before any call, and refuse to run if that fails. True if it reset."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    if not getattr(llm, "_unsloth_merged_rollout_dirty", False): return False
+    if not _reset_merged_rollout_prefix_cache(llm):
+        raise RuntimeError(
+            "Unsloth: vLLM's prefix cache still holds KV blocks computed with merged adapter weights "
+            "under base-model hashes, and resetting it failed again, so this call could reuse them. "
+            "Retry once the engine is idle, or unset UNSLOTH_VLLM_MERGED_ROLLOUT and reload."
+        )
+    llm._unsloth_merged_rollout_dirty = False
+    return True
+pass
+
+
 def _merged_rollout_lora_fallback(request, reason):
     """A real LoRARequest for this call, built exactly as load_lora does without merging."""
     # All Unsloth Zoo code licensed under LGPLv3
@@ -4975,35 +5063,62 @@ def _merged_rollout_lora_fallback(request, reason):
 pass
 
 
-def _merged_rollout_call(request, llm, call):
+def _merged_rollout_call(request, llm, call, cache_was_reset = False):
+    # Runs under _MERGED_ROLLOUT_LOCK.
     # All Unsloth Zoo code licensed under LGPLv3
     state = request.state
-    with state.lock:
-        if state.depth != 0:
-            # Nested on this thread (chat -> generate): already folded.
-            with merged_rollout(state): return call(None)
-        model = state.model_ref()
-        if state.poisoned is None and (model is None or not state.is_valid_for(model)):
-            # Held across an adapter or base-weight change: rebuild, never fold a stale P.
-            fresh = prepare_merged_rollout(model) if model is not None else None
-            if fresh is None:
-                return call(_merged_rollout_lora_fallback(
-                    request, "the adapter or base weights changed and the model is no longer eligible"
-                ))
-            if fresh is not state:
-                return _merged_rollout_call(_MergedLoRARequest(fresh, request.save_directory), llm, call)
-        pass
-        if not _reset_merged_rollout_prefix_cache(llm):
-            return call(_merged_rollout_lora_fallback(request, "vLLM did not reset its prefix cache before the fold"))
-        try:
-            with merged_rollout(state): return call(None)
-        finally:
-            if not _reset_merged_rollout_prefix_cache(llm):
-                _merged_rollout_log_once(
-                    "Unsloth: vLLM did not reset its prefix cache after a merged rollout. The base weights "
-                    "are restored; the next merged call resets again before folding."
-                )
+    if state.engine_ref() is not llm:
+        # Folding here would change another engine's weights and sample this one's base.
+        return call(_merged_rollout_lora_fallback(request, "the request was passed to a different vLLM engine"))
+    if state.depth != 0:
+        # Nested on this thread (chat -> generate): already folded.
+        with merged_rollout(state): return call(None)
+    model = state.model_ref()
+    if state.poisoned is None and (model is None or not state.is_valid_for(model)):
+        # Held across an adapter or base-weight change: rebuild, never fold a stale P.
+        fresh = prepare_merged_rollout(model) if model is not None else None
+        if fresh is None:
+            return call(_merged_rollout_lora_fallback(
+                request, "the adapter or base weights changed and the model is no longer eligible"
+            ))
+        if fresh is not state:
+            return _merged_rollout_call(_MergedLoRARequest(fresh, request.save_directory), llm, call, cache_was_reset)
     pass
+    if not cache_was_reset and not _reset_merged_rollout_prefix_cache(llm):
+        return call(_merged_rollout_lora_fallback(request, "vLLM did not reset its prefix cache before the fold"))
+    try:
+        with merged_rollout(state): return call(None)
+    finally:
+        if not _reset_merged_rollout_prefix_cache(llm):
+            llm._unsloth_merged_rollout_dirty = True
+            _merged_rollout_log_once(
+                "Unsloth: vLLM did not reset its prefix cache after a merged rollout. The base weights "
+                "are restored; every later call resets it first and refuses to run if that fails."
+            )
+    pass
+pass
+
+
+def _merged_rollout_has_sentinel(request):
+    # All Unsloth Zoo code licensed under LGPLv3
+    if isinstance(request, _MergedLoRARequest): return True
+    return isinstance(request, (list, tuple)) and any(isinstance(x, _MergedLoRARequest) for x in request)
+pass
+
+
+def _merged_rollout_dispatch(request, llm, call, cache_was_reset):
+    # All Unsloth Zoo code licensed under LGPLv3
+    if isinstance(request, _MergedLoRARequest):
+        return _merged_rollout_call(request, llm, call, cache_was_reset)
+    # Per-prompt list: one state for every prompt folds once; anything mixed uses vLLM LoRA.
+    if all(isinstance(x, _MergedLoRARequest) for x in request) and len({id(x.state) for x in request}) == 1:
+        return _merged_rollout_call(request[0], llm, call, cache_was_reset)
+    real = {}
+    for x in request:
+        if isinstance(x, _MergedLoRARequest) and id(x.state) not in real:
+            real[id(x.state)] = _merged_rollout_lora_fallback(x, "a per-prompt lora_request list mixed requests")
+    converted = [real[id(x.state)] if isinstance(x, _MergedLoRARequest) else x for x in request]
+    return call(type(request)(converted))
 pass
 
 
@@ -5011,24 +5126,26 @@ def _wrap_merged_rollout_call(bound, llm):
     # All Unsloth Zoo code licensed under LGPLv3
     @functools.wraps(bound)
     def unsloth_merged_rollout_call(*args, **kwargs):
-        request = kwargs.get("lora_request", None)
-        position = None
-        if not isinstance(request, _MergedLoRARequest):
-            position = next((i for i, x in enumerate(args) if isinstance(x, _MergedLoRARequest)), None)
-            if position is None: return bound(*args, **kwargs)
-            request = args[position]
-        def call(lora_request):
-            if position is None: return bound(*args, **{**kwargs, "lora_request": lora_request})
-            return bound(*args[:position], lora_request, *args[position + 1:], **kwargs)
-        return _merged_rollout_call(request, llm, call)
+        with _MERGED_ROLLOUT_LOCK:
+            cache_was_reset = _merged_rollout_clean_cache(llm)
+            request = kwargs.get("lora_request", None)
+            position = None
+            if not _merged_rollout_has_sentinel(request):
+                position = next((i for i, x in enumerate(args) if _merged_rollout_has_sentinel(x)), None)
+                if position is None: return bound(*args, **kwargs)
+                request = args[position]
+            def call(lora_request):
+                if position is None: return bound(*args, **{**kwargs, "lora_request": lora_request})
+                return bound(*args[:position], lora_request, *args[position + 1:], **kwargs)
+            return _merged_rollout_dispatch(request, llm, call, cache_was_reset)
     pass
     return unsloth_merged_rollout_call
 pass
 
 
 def install_merged_rollout_engine_wrapper(llm):
-    """Wrap llm.generate / llm.chat once so the merged sentinel becomes lora_request = None
-    inside a fold/restore. Every other request passes through untouched."""
+    """Wrap llm.generate / llm.chat once: every call takes the module lock, and the merged
+    sentinel becomes lora_request = None inside a fold/restore. Other requests pass through."""
     # All Unsloth Zoo code licensed under LGPLv3
     if llm is None or getattr(llm, "_unsloth_merged_rollout_wrapped", False): return llm
     for name in ("generate", "chat"):

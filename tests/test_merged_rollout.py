@@ -21,6 +21,7 @@ fast_inference sets up, and the vLLM engine is a stub whose generate records wha
 weights held while it ran. No vLLM engine is built.
 """
 
+import copy
 import inspect
 import sys
 import threading
@@ -811,7 +812,8 @@ def test_synchronize_runs_after_fold_and_before_restore(monkeypatch):
     state = prepare_merged_rollout(model)
     with merged_rollout(state):
         events.append("generate")
-    assert events == ["sync", "generate", "sync"]
+    # The last sync lands the restore before the lock is released.
+    assert events == ["sync", "generate", "sync", "sync"]
 
 
 def test_sentinel_keeps_the_probe_marker():
@@ -851,3 +853,164 @@ def test_load_vllm_only_wraps_when_enabled():
     )
     assert source.count("install_merged_rollout_engine_wrapper") == 1
     assert source.count("_merged_rollout") == 2
+
+
+# 12. Round 2: untracked reloads, per-prompt lists, one lock, current modules, engine, dirty cache.
+def _expected_fold(module, base):
+    A = module.lora_A["default"].weight.to(DTYPE)
+    B = module.lora_B["default"].weight.to(DTYPE)
+    return torch.addmm(base, B, A, alpha = module.scaling["default"])
+
+
+def test_untracked_base_reload_refreshes_P(capsys):
+    model, llm, vllm_model = _make_model(target_modules = ("q_proj",))
+    req = _req(model)
+    module = _lora_modules(model)[0]
+    # vLLM load_weights / .data writes do not bump the view's _version.
+    with torch.no_grad():
+        for p in vllm_model.parameters(): p.data.add_(1.0)
+    assert req.state.is_valid_for(model)
+    new_base = _snapshot(vllm_model)
+    new_q = module.base_layer.weight.detach().clone()
+    llm.generate(["hi"], lora_request = req)
+    assert llm.calls[-1][1] is None
+    folded_q = llm.calls[-1][2][0][:Q]
+    assert torch.equal(folded_q, _expected_fold(module, new_q))
+    _assert_bitwise(new_base, vllm_model)
+    assert "refreshed the merged-rollout pristine copy" in capsys.readouterr().out
+
+
+def test_refresh_check_is_a_no_op_when_unchanged(monkeypatch):
+    model, llm, vllm_model = _make_model()
+    state = prepare_merged_rollout(model)
+    copies = []
+    real = vllm_utils._merged_rollout_refresh_pristine
+    monkeypatch.setattr(vllm_utils, "_merged_rollout_refresh_pristine", lambda s: copies.append(real(s)))
+    for _ in range(3):
+        with merged_rollout(state): pass
+    assert copies == [False, False, False]
+
+
+def test_per_prompt_list_of_one_state_folds_once(_isolate):
+    model, llm, vllm_model = _make_model()
+    before = _snapshot(vllm_model)
+    req = _req(model)
+    llm.generate(["a", "b"], lora_request = [req, _req(model)])
+    kind, seen_request, seen = llm.calls[-1]
+    assert seen_request is None and _folded(before, seen)
+    assert len(llm.resets) == 2
+    _assert_bitwise(before, vllm_model)
+
+
+@pytest.mark.parametrize("container", [list, tuple])
+def test_per_prompt_mixed_list_converts_sentinels(container, _isolate):
+    model, llm, vllm_model = _make_model()
+    before = _snapshot(vllm_model)
+    req = _req(model)
+    other = _isolate.LoRARequest("x", 99)
+    llm.generate(["a", "b", "c"], lora_request = container([req, None, other]))
+    kind, seen_request, seen = llm.calls[-1]
+    assert type(seen_request) is container
+    assert type(seen_request[0]) is _isolate.LoRARequest and seen_request[0].lora_tensors
+    assert seen_request[1] is None and seen_request[2] is other
+    assert not any(isinstance(x, _MergedLoRARequest) for x in seen_request)
+    assert not _folded(before, seen)
+    _assert_bitwise(before, vllm_model)
+
+
+def test_plain_call_waits_for_a_fold_on_another_thread():
+    model, llm, vllm_model = _make_model()
+    before = _snapshot(vllm_model)
+    in_a, release_a, seen = threading.Event(), threading.Event(), {}
+
+    class SlowLLM(_FakeLLM):
+        def generate(self, prompts, sampling_params = None, *, use_tqdm = True, lora_request = None):
+            if prompts[0] == "A": in_a.set(); release_a.wait(5)
+            seen[prompts[0]] = _snapshot(vllm_model)
+            return ["out"]
+    llm = SlowLLM(vllm_model)
+    install_merged_rollout_engine_wrapper(llm)
+    model.vllm_engine = llm
+    req = _req(model)
+    ta = threading.Thread(target = lambda: llm.generate(["A"], lora_request = req)); ta.start(); in_a.wait(5)
+    tb = threading.Thread(target = lambda: llm.generate(["B"], lora_request = None)); tb.start(); time.sleep(0.3)
+    assert "B" not in seen
+    release_a.set(); ta.join(); tb.join()
+    assert _folded(before, seen["A"])
+    assert not _folded(before, seen["B"])
+
+
+def test_prepare_never_snapshots_folded_weights():
+    model, llm, vllm_model = _make_model()
+    before = _snapshot(vllm_model)
+    state = prepare_merged_rollout(model)
+    inside, release, built = threading.Event(), threading.Event(), {}
+    def outer():
+        with merged_rollout(state):
+            inside.set(); release.wait(5)
+    def other():
+        model._unsloth_merged_rollout_state = None
+        built["state"] = prepare_merged_rollout(model)
+    ta = threading.Thread(target = outer); ta.start(); inside.wait(5)
+    tb = threading.Thread(target = other); tb.start(); time.sleep(0.3)
+    assert "state" not in built
+    release.set(); ta.join(); tb.join()
+    _assert_bitwise(before, vllm_model)
+    for _, W, P in built["state"].entries:
+        assert torch.equal(W, P)
+
+
+def test_replaced_lora_layer_invalidates_the_state():
+    model, llm, vllm_model = _make_model(target_modules = ("q_proj",))
+    state = prepare_merged_rollout(model)
+    attn = model.base_model.model.model.layers[0].self_attn
+    old = attn.q_proj
+    # A new LoRA layer object on the same base weight, with a new B.
+    new = copy.copy(old)
+    new._modules = dict(old._modules)
+    new.lora_B = nn.ModuleDict({"default": nn.Linear(8, Q, bias = False)})
+    nn.init.normal_(new.lora_B["default"].weight, std = 0.5)
+    attn.q_proj = new
+    assert not state.is_valid_for(model)
+    base_q = new.base_layer.weight.detach().clone()
+    llm.generate(["hi"], lora_request = _MergedLoRARequest(state, _ADAPTER_DIR))
+    assert llm.calls[-1][1] is None
+    assert torch.equal(llm.calls[-1][2][0][:Q], _expected_fold(new, base_q))
+
+
+def test_replaced_lora_B_parameter_invalidates_the_state():
+    model, llm, vllm_model = _make_model(target_modules = ("q_proj",))
+    state = prepare_merged_rollout(model)
+    _lora_modules(model)[0].lora_B["default"] = nn.Linear(8, Q, bias = False)
+    assert not state.is_valid_for(model)
+
+
+def test_sentinel_on_another_engine_uses_a_real_lora_request(_isolate):
+    model, llm, vllm_model = _make_model()
+    before = _snapshot(vllm_model)
+    req = _req(model)
+    other_model = _FakeVllmModel(2)
+    other = install_merged_rollout_engine_wrapper(_FakeLLM(other_model))
+    other.generate(["hi"], lora_request = req)
+    assert type(other.calls[-1][1]) is _isolate.LoRARequest
+    assert llm.calls == [] and llm.resets == []
+    _assert_bitwise(before, vllm_model)
+
+
+@pytest.mark.parametrize("how", ["false", "raise"])
+def test_failed_reset_after_restore_blocks_plain_calls_until_it_resets(how):
+    model, llm, vllm_model = _make_model()
+    req = _req(model)
+    n = _failing_reset(llm, how, when = {2, 3})
+    llm.generate(["hi"], lora_request = req)
+    assert n["n"] == 2
+    calls = len(llm.calls)
+    with pytest.raises(RuntimeError, match = "prefix cache still holds"):
+        llm.generate(["plain"], lora_request = None)
+    assert len(llm.calls) == calls and n["n"] == 3
+    # The retry works: the plain call runs after the reset, with no extra one.
+    llm.generate(["plain"], lora_request = None)
+    assert n["n"] == 4
+    assert llm.calls[-1][1] is None
+    llm.generate(["plain"], lora_request = None)
+    assert n["n"] == 4
