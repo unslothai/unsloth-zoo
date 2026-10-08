@@ -39,6 +39,9 @@ BLOCKED = [
     # check ever seeing them. The member is denied; operator itself stays.
     ("operator.attrgetter", 'def matmul(A, B):\n    import operator\n    return operator.attrgetter("__class__.__bases__")(1)\n', AttributeError),
     ("operator.methodcaller", 'def matmul(A, B):\n    import operator\n    return operator.methodcaller("__str__")(1)\n', AttributeError),
+    # global_enum copies members into sys.modules[cls.__module__]; the functional
+    # API lets the caller name "builtins", which would replace the host's len.
+    ("enum.global_enum", 'def matmul(A, B):\n    import enum\n    return enum.global_enum(enum.IntEnum("Hijack", {"len": 7}, module = "builtins"))\n', AttributeError),
     # Formatter.get_field resolves a dotted string and returns the object, so
     # it recovers the real __import__. str.format walks attributes the same way
     # but only returns text, which is why only this one matters.
@@ -145,6 +148,16 @@ def test_public_members_of_allowlisted_modules_still_work():
         "    return math.floor(2.7) + random.choice([0])\n"
     )
     assert create_locked_down_function(source)([[0]]) == 2
+
+
+def test_rest_of_enum_still_works():
+    source = (
+        "def strategy(board):\n"
+        "    import enum\n"
+        "    Move = enum.Enum(\"Move\", [\"LEFT\", \"RIGHT\"])\n"
+        "    return Move.RIGHT.name[0]\n"
+    )
+    assert create_locked_down_function(source)([[0]]) == "R"
 
 
 def test_operator_itemgetter_still_works():
