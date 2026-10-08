@@ -895,7 +895,6 @@ def create_lora_statistics(model, merge_into_original = False, return_state_dict
                 state_dict[name + ".weight"]   = stats
                 bias = getattr(stats.module, "bias", None)
                 if stats.lora_B_bias is not None and stats.lora_A is not None:
-                    # Like PEFT's merge: base bias + scaling * lora_B bias, and no base bias to fold into is an error.
                     if bias is None:
                         raise RuntimeError(
                             f"Unsloth: cannot merge `{name}` trained with lora_bias=True because its "
