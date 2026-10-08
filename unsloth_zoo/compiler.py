@@ -496,9 +496,11 @@ def unsloth_training_stance():
     INFERENCE_RUNS = 0
     owned = UNSLOTH_EAGER_STANCE_OWNED[0]
     if owned is not None and torch_dynamo_eval_frame is not None:
-        UNSLOTH_EAGER_STANCE_OWNED[0] = None
         current = torch_dynamo_eval_frame._stance
+        # Ownership is only dropped once ours is reset: inside a temporary user stance scope the
+        # exit restores our exact object, which a later training forward must still recognise.
         if (owned is True or owned is current) and current.stance == "eager_on_recompile":
+            UNSLOTH_EAGER_STANCE_OWNED[0] = None
             torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = False)
 pass
 
@@ -3154,9 +3156,10 @@ __DYNAMO__RECOMPILING__ = """
             old_stance = None
         if old_stance is not None and INFERENCE_RUNS == 1:
             # Skip guards and return to eager -> we still need guards!
-            torch_compiler_set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = False)
-            # Owned only if this call switched it: a stance the user already chose stays theirs.
+            # Already eager (another model's inference, or the user's choice): leave that stance
+            # object, and so its ownership, as it is. Otherwise switch and claim the new object.
             if old_stance != "eager_on_recompile":
+                torch_compiler_set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = False)
                 # The stance object itself, or True where torch keeps no such object.
                 UNSLOTH_EAGER_STANCE_OWNED[0] = getattr(torch_dynamo_eval_frame, "_stance", True)
             if UNSLOTH_ENABLE_LOGGING:

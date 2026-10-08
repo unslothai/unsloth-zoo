@@ -238,3 +238,30 @@ def test_unsloth_stance_still_reset_after_a_compiled_decode_scope():
     assert _stance() == "eager_on_recompile"
     _train(ns, module)
     assert _stance() == "default"
+
+
+def test_inference_in_two_modules_then_training_compiles():
+    # Model B's inference finds the stance already eager and must not take it over unclaimed.
+    frames_a, compiled_a = _counting_compile()
+    frames_b, compiled_b = _counting_compile()
+    ns_a = _generated_module(compiled_a, "unsloth_compiled_module_gemma3")
+    ns_b = _generated_module(compiled_b, "unsloth_compiled_module_qwen3_5")
+    _infer(ns_a, torch.nn.Linear(1, 1))
+    _infer(ns_b, torch.nn.Linear(1, 1))
+    assert _stance() == "eager_on_recompile"
+    _train(ns_b, torch.nn.Linear(1, 1))
+    assert _stance() == "default"
+    assert len(frames_b) == 1, "model B's training step ran the eager body"
+
+
+def test_training_inside_a_scoped_user_stance_keeps_ownership():
+    # The scope's exit restores Unsloth's object, so a later training forward still resets it.
+    frames, compiled = _counting_compile()
+    ns = _generated_module(compiled)
+    module = torch.nn.Linear(1, 1)
+    _infer(ns, module)
+    with torch.compiler.set_stance("force_eager"):
+        _train(ns, module)
+    assert _stance() == "eager_on_recompile"
+    _train(ns, module)
+    assert _stance() == "default"
