@@ -2284,6 +2284,24 @@ def approximate_vllm_memory_usage(
 pass
 
 
+def _fit_max_seq_length_to_kv_cache(max_seq_length, kv_cache_tokens):
+    # Report the requested length, not the clamped one: printing 256 twice hid why prompts failed (#2666).
+    requested = max_seq_length
+    if kv_cache_tokens <= 0:
+        max_seq_length = kv_cache_tokens = 256
+    if kv_cache_tokens <= max_seq_length:
+        if kv_cache_tokens < requested:
+            print(
+                f"Unsloth: Your GPU cannot handle sequence lengths of {requested} due to limited GPU memory.\n"\
+                f"Unsloth: Your GPU can only handle approximately the maximum sequence length of {kv_cache_tokens}.\n"\
+                "Unsloth: vLLM will reject prompts longer than this. Increase `gpu_memory_utilization`, "\
+                "lower `max_seq_length` or use a smaller model to allow longer sequences."
+            )
+        max_seq_length = kv_cache_tokens
+    return max_seq_length
+pass
+
+
 @functools.cache
 def get_lora_supported_ranks():
     possible_max_ranks = [8, 16, 32, 64, 128, 256, 320, 512]
@@ -3325,18 +3343,7 @@ def load_vllm(
         assert max_seq_length >= 8192, "Unsloth: MLLama requires max_seq_length >= 8192 for fast inference"
 
     else:
-        # max_num_batched_tokens must be >= max_seq_length
-        if max_num_batched_tokens <= 0:
-            max_seq_length = 256
-            max_num_batched_tokens = 256
-
-        if max_num_batched_tokens <= max_seq_length:
-            print(
-                f"Unsloth: Your GPU cannot handle sequence lengths of {max_seq_length} due to limited GPU memory.\n"\
-                f"Unsloth: Your GPU can only handle approximately the maximum sequence length of {max_seq_length}."
-            )
-            max_seq_length = max_num_batched_tokens
-        pass
+        max_seq_length = _fit_max_seq_length_to_kv_cache(max_seq_length, max_num_batched_tokens)
 
     # Get correct dtype
     if DEVICE_TYPE == "cuda" and major_version >= 8: _dtype = torch.bfloat16
