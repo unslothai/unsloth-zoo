@@ -54,7 +54,7 @@ import inspect
 from functools import partial
 from .utils import _get_dtype, get_quant_type, Version
 from .empty_model import *
-from .empty_model import _is_gemma4_config
+from .empty_model import _is_gemma4_config, _resolve_safetensors_index
 from .hf_utils import (
     dtype_from_config,
     add_dtype_kwargs,
@@ -1010,6 +1010,27 @@ def vllm_dynamic_quant_supported(
     return True
 pass
 
+
+def _get_multimodal_engine_args(config, is_vision_model):
+    # Unsloth only feeds vLLM images, so audio is 0: vLLM then skips building and profiling
+    # the audio tower (Gemma-4 E2B/E4B), which aborted the process in the profiling run once
+    # Unsloth's compiled transformers audio modules were in place.
+    limits = {"image": 1, "video": 0}
+    if getattr(config, "audio_config", None) is not None:
+        limits["audio"] = 0
+    if is_vision_model:
+        return {"limit_mm_per_prompt": limits}
+    if not _is_gemma4_config(config):
+        return {}
+    # text_only passes the text config, but vLLM reads the checkpoint and builds the
+    # multimodal class anyway. language_model_only skips every encoder and is part of
+    # vLLM's AOT compile cache key; zeroing limit_mm_per_prompt instead is not, so a cached
+    # artifact from a multimodal run is reloaded and crashes (vllm-project/vllm#50891).
+    limits["audio"] = 0
+    return {"language_model_only": True, "limit_mm_per_prompt": limits}
+pass
+
+
 def _get_gemma4_bnb_skip_module_aliases(quantization_config):
     if not isinstance(quantization_config, dict):
         return None
@@ -1601,6 +1622,54 @@ def _refresh_placeholder_dims(parent, attr_name, weight):
 pass
 
 
+GEMMA4_AUDIO_PREFIXES = ("model.audio_tower.", "model.embed_audio.")
+
+
+def _load_gemma4_audio_from_checkpoint(new_model, config, weight_map = None):
+    # vLLM runs with audio = 0 so it never builds the audio tower, and the training model's
+    # copy is left at random init (embed_audio a 1-wide placeholder). Read it from the
+    # checkpoint instead; returns how many tensors were loaded.
+    if getattr(config, "audio_config", None) is None: return 0
+    if weight_map is None:
+        model_path = getattr(config, "model_name", None) or getattr(config, "_name_or_path", None)
+        try:
+            weight_map = _resolve_safetensors_index(model_path)
+        except Exception:
+            weight_map = None
+    keys = [k for k in (weight_map or {}) if k.startswith(GEMMA4_AUDIO_PREFIXES)]
+    if len(keys) == 0:
+        inner = getattr(new_model, "model", new_model)
+        for name in ("audio_tower", "embed_audio"):
+            if getattr(inner, name, None) is not None: setattr(inner, name, None)
+        logger.warning(
+            "Unsloth: could not read the Gemma-4 audio tower from the checkpoint, so it was "
+            "dropped from the training model. Audio inputs need fast_inference = False."
+        )
+        return 0
+    from safetensors import safe_open
+    params = dict(new_model.named_parameters(remove_duplicate = False))
+    buffers = dict(new_model.named_buffers(remove_duplicate = False))
+    by_file = {}
+    for key in keys: by_file.setdefault(weight_map[key], []).append(key)
+    loaded = 0
+    for file, file_keys in by_file.items():
+        with safe_open(file, framework = "pt") as f:
+            for key in file_keys:
+                old = params.get(key, buffers.get(key))
+                if old is None: continue
+                value = f.get_tensor(key).to(device = old.device, dtype = old.dtype)
+                parent_name, _, attr_name = key.rpartition(".")
+                parent = new_model.get_submodule(parent_name)
+                if key in params:
+                    parent._parameters[attr_name] = torch.nn.Parameter(value, requires_grad = False)
+                    _refresh_placeholder_dims(parent, attr_name, value)
+                else:
+                    parent._buffers[attr_name] = value
+                loaded += 1
+    return loaded
+pass
+
+
 @torch.inference_mode
 def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16, bnb_config = None, is_vision_model = False):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -1831,6 +1900,8 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
         quantization_config = quantization_config,
         bnb_config = bnb_config,
     )
+    if is_vision_model and _is_gemma4_config(config):
+        _load_gemma4_audio_from_checkpoint(new_model, config)
     # finalize copies every buffer from the meta template (e.g. zeroed LFM2-MoE expert_bias)
     for parent, attr_name, raw_value in loaded_buffers:
         parent._buffers[attr_name] = raw_value
@@ -3584,9 +3655,7 @@ def load_vllm(
             # worker_extension_cls   = "unsloth_zoo.vllm_rlhf_utils.ColocateWorkerExtension",
             enable_sleep_mode      = unsloth_vllm_standby,
         )
-        if is_vision_model:
-            # Limit images/videos per prompt to save memory. TODO: make configurable.
-            engine_args["limit_mm_per_prompt"] = {"image": 1, "video": 0}
+        engine_args.update(_get_multimodal_engine_args(config, is_vision_model))
         if _is_gemma4_config(config) and use_bitsandbytes:
             gemma4_bnb_quantization_config = _get_gemma4_bnb_skip_module_aliases(
                 getattr(config, "quantization_config", None)
