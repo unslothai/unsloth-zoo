@@ -129,9 +129,9 @@
       "file": "unsloth_zoo/llama_cpp.py",
       "rule": "unpinned-code-fetch",
       "sink": "branch-head-url",
-      "digest": "ea797cf7bba56742",
+      "digest": "80810a33aa75c309",
       "count": 1,
-      "reason": "Known residual: the converter tracks llama.cpp master so new architectures convert. converter_scan.py screens the download; pinning it is a separate change."
+      "reason": "Known residual: the single-file fallback tracks the unslothai/llama.cpp master so new architectures convert. converter_scan.py screens the download; staged converter sources are the pinned, sha256-verified path."
     },
     {
       "file": "unsloth_zoo/llama_cpp.py",
