@@ -112,10 +112,9 @@ print('RESULT ' + json.dumps(res))
 
 
 def test_bnb4bit_router_swap_keeps_router_logits_without_compile():
-    M = pytest.importorskip("transformers.models.gpt_oss.modeling_gpt_oss")
+    # GPT-OSS exists from transformers 4.55, which already records router_logits by class.
+    pytest.importorskip("transformers.models.gpt_oss.modeling_gpt_oss")
     pytest.importorskip("peft")
-    if not isinstance(getattr(M.GptOssPreTrainedModel, "_can_record_outputs", None), dict):
-        pytest.skip("this transformers has no class-keyed output recorders")
     env = dict(os.environ)
     env["CUDA_VISIBLE_DEVICES"] = ""
     env.pop("PYTORCH_NVML_BASED_CUDA_CHECK", None)
