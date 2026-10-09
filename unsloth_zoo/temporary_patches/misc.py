@@ -78,11 +78,21 @@ def patch_tokenizer_convert_added_tokens():
     if hasattr(original_convert_added_tokens, "_unsloth_patched"):
         return
 
+    # Response parsers (transformers >= 5.13, set by TRL tools=) hold field dicts like
+    # {"content": "text"}: converting them breaks save (json) and parse_response.
+    parser_keys = ("response_template", "response_schema")
+
     @classmethod
     def patched_convert_added_tokens(cls, obj, save=False, add_type_field=True):
-        # Only convert when "content" is a string (AddedToken expects str).
-        if isinstance(obj, dict) and "content" in obj and "__type" not in obj and isinstance(obj["content"], str):
-            return AddedToken(**obj)
+        if isinstance(obj, dict):
+            # Only convert when "content" is a string (AddedToken expects str); never on save.
+            if not save and "content" in obj and "__type" not in obj and isinstance(obj["content"], str):
+                return AddedToken(**obj)
+            if any(key in obj for key in parser_keys):
+                return {
+                    key: value if key in parser_keys else cls.convert_added_tokens(value, save=save, add_type_field=add_type_field)
+                    for key, value in obj.items()
+                }
         return original_convert_added_tokens.__func__(cls, obj, save=save, add_type_field=add_type_field)
 
     patched_convert_added_tokens._unsloth_patched = True
