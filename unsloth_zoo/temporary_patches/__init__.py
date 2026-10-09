@@ -46,6 +46,7 @@ from .compiled_model_identity import *
 from .bitsandbytes_large_tensors import *
 from .remote_mamba2 import *
 from .ernie4_5_moe import *
+from .olmoe import *
 from .pixtral import *
 from .ministral import *
 from .amd_aiter import *
