@@ -95,6 +95,7 @@ SKIP_QUANTIZATION_MODULES = [
     'mamba',
     "audio_tower",              # Gemma3N audio encoder conformer
     "vision_tower",             # Gemma3 vision encoder (SigLIP)
+    "visual",                   # Qwen2/2.5/3-VL, Qwen3.5, GLM-4V vision encoder
     "vision_embedder",          # multimodal embedders kept in full precision
     "embed_vision",
     "embed_audio",
