@@ -94,6 +94,14 @@
       "reason": "_from_config_remote_aware is only called when the caller passed trust_remote_code."
     },
     {
+      "file": "unsloth_zoo/empty_model.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "228679880d1b3db7",
+      "count": 1,
+      "reason": "Iterates the fixed _VLLM_BNB_LOADER_PATHS pair of vLLM bitsandbytes loader modules."
+    },
+    {
       "file": "unsloth_zoo/hf_xet_fallback.py",
       "rule": "dynamic-import",
       "sink": "import_module",
@@ -121,9 +129,9 @@
       "file": "unsloth_zoo/llama_cpp.py",
       "rule": "unpinned-code-fetch",
       "sink": "branch-head-url",
-      "digest": "ea797cf7bba56742",
+      "digest": "80810a33aa75c309",
       "count": 1,
-      "reason": "Known residual: the converter tracks llama.cpp master so new architectures convert. converter_scan.py screens the download; pinning it is a separate change."
+      "reason": "Known residual: the single-file fallback tracks the unslothai/llama.cpp master so new architectures convert. converter_scan.py screens the download; staged converter sources are the pinned, sha256-verified path."
     },
     {
       "file": "unsloth_zoo/llama_cpp.py",
@@ -500,14 +508,6 @@
       "digest": "54cfcec6d18cb37d",
       "count": 1,
       "reason": "Fixed vLLM bitsandbytes module path held in a local."
-    },
-    {
-      "file": "unsloth_zoo/vllm_utils.py",
-      "rule": "dynamic-import",
-      "sink": "import_module",
-      "digest": "5e3c38bbbb4cb386",
-      "count": 1,
-      "reason": "Fixed vLLM loader module path held in a local."
     }
   ]
 }

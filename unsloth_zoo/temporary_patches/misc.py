@@ -1305,30 +1305,134 @@ pass
 TEMPORARY_PATCHES.append(patch_causal_conv1d_cuda_probe)
 
 
+# Kaggle T4, mamba_ssm 2.3.1: Triton 3.2 fails (`map::at`), 3.3 fails (`PassManager::run failed`), 3.4-3.6 train.
+_MAMBA_SM75_MIN_TRITON = (3, 4)
+
+
+def _weakest_cuda_capability():
+    """Lowest capability across visible GPUs: a model can be split over all of them."""
+    count = torch.cuda.device_count() if hasattr(torch.cuda, "device_count") else 1
+    return min(tuple(torch.cuda.get_device_capability(i)) for i in range(max(count, 1)))
+pass
+
+
+def _mamba_ssm_fast_path_blocker(capability):
+    """None if mamba_ssm's Triton kernels can run, else why. UNSLOTH_MAMBA_PRE_AMPERE_FAST=1/0 forces it below sm_80."""
+    if tuple(capability) >= (8, 0):
+        return None
+    major, minor = capability
+    forced = os.environ.get("UNSLOTH_MAMBA_PRE_AMPERE_FAST", "").strip()
+    if forced == "1":
+        return None
+    if forced == "0":
+        return "UNSLOTH_MAMBA_PRE_AMPERE_FAST=0 is set"
+    if tuple(capability) < (7, 5):
+        return f"they need compute capability 7.5+ (this GPU is {major}.{minor})"
+    try:
+        import re as _re
+        import triton
+        _match = _re.match(r"(\d+)\.(\d+)", triton.__version__)
+        version = (int(_match.group(1)), int(_match.group(2))) if _match else None
+    except Exception:
+        version = None
+    if version is None or version < _MAMBA_SM75_MIN_TRITON:
+        found = "is missing" if version is None else f"is {triton.__version__}"
+        return (
+            f"on compute capability {major}.{minor} they need Triton "
+            f"{'.'.join(map(str, _MAMBA_SM75_MIN_TRITON))}+ (torch 2.8+), "
+            f"and Triton {found}"
+        )
+    return None
+pass
+
+
+def _single_mamba_ssm_autotune_config(extra_packages = ()):
+    """Keep one autotune config per mamba_ssm kernel (and per kernel in `extra_packages`).
+
+    Compiling every config before step 1 takes minutes on a T4. Keeps the config
+    mamba_ssm's deterministic mode picks: least shared memory.
+    """
+    import sys
+    try:
+        from triton.runtime.autotuner import Autotuner
+    except Exception:
+        return 0
+    def _cost(config):
+        cost = getattr(config, "num_stages", 1) or 1
+        for key, value in getattr(config, "kwargs", {}).items():
+            if key.startswith("BLOCK_SIZE_"):
+                cost *= value
+        return cost
+    prefixes = ("mamba_ssm.ops.triton.",) + tuple(f"{p}." for p in extra_packages)
+    pruned = 0
+    for name, module in list(sys.modules.items()):
+        if module is None or not (name.startswith(prefixes) or name in extra_packages):
+            continue
+        for obj in list(module.__dict__.values()):
+            if isinstance(obj, Autotuner) and len(getattr(obj, "configs", ())) > 1:
+                try:
+                    obj.configs = [min(obj.configs, key = _cost)]
+                    pruned += 1
+                except Exception:
+                    pass
+    return pruned
+pass
+
+
+def _retrim_mamba_ssm_autotune():
+    """Re-trim after fix_mamba_ssm_float32 reloads ssd_chunk_scan (trust_remote_code has no later pass)."""
+    try:
+        if not torch.cuda.is_available() or getattr(torch.version, "hip", None) is not None:
+            return 0
+        capability = _weakest_cuda_capability()
+        if capability >= (8, 0) or _mamba_ssm_fast_path_blocker(capability) is not None:
+            return 0
+        return _single_mamba_ssm_autotune_config()
+    except Exception:
+        return 0
+pass
+
+
 def patch_mamba_ssm_pre_ampere_fallback():
-    """Force the Mamba slow path on pre-Ampere GPUs.
+    """Force the Mamba slow path where mamba_ssm's Triton kernels cannot compile.
 
-    mamba_ssm's Triton kernels need sm_80+. On a T4 the package imports fine
-    and `is_fast_path_available` is True, so transformers routes into
-    `cuda_kernels_forward` and Triton only fails once training starts, with an
-    opaque `RuntimeError: PassManager::run failed`.
-
-    `is_fast_path_available` is baked in at module import, so flip both the
-    availability predicates (for modules imported later) and the flag on
-    already-imported modules. A capability check rather than a trial launch
-    like the causal_conv1d probe above, which would pay a Triton compile at
-    every import just to watch it fail. Real NVIDIA CUDA only.
+    Below sm_80 with Triton < 3.4 the kernels fail only once training starts
+    (`PassManager::run failed`). `is_fast_path_available` is baked in at import,
+    so flip the predicates (later imports) and the flag (already imported).
+    A version check, not a trial compile at every import. Real NVIDIA CUDA only.
     """
     if not torch.cuda.is_available():
         return
     if getattr(torch.version, "hip", None) is not None:
         return  # ROCm: mamba_ssm's requirements are a different question
     try:
-        major, minor = torch.cuda.get_device_capability()
+        major, minor = _weakest_cuda_capability()
     except Exception:
         return
-    if (major, minor) >= (8, 0):
-        return  # Ampere or newer; the fast path is fine
+    blocker = _mamba_ssm_fast_path_blocker((major, minor))
+    if blocker is None:
+        if (major, minor) < (8, 0):
+            # Route mamba-ssm to the local package (patch_lazy_load_kernel_local_packages), which is trimmed.
+            # falcon_mamba-ssm stays: Mamba-1 CUDA kernels, nothing autotuned, no local fallback.
+            # An already-resolved Hub module may be bound into a modeling module: trim it too.
+            _hub_packages = ()
+            try:
+                from transformers.integrations import hub_kernels as _hk
+                _hk._HUB_KERNEL_MAPPING.pop("mamba-ssm", None)
+                _resolved = _hk._KERNEL_MODULE_MAPPING.get("mamba-ssm", None)
+                if isinstance(getattr(_resolved, "__name__", None), str):
+                    _hub_packages = (_resolved.__name__,)
+                if "mamba-ssm" in _hk._KERNEL_MODULE_MAPPING:
+                    _hk._KERNEL_MODULE_MAPPING["mamba-ssm"] = None
+            except Exception:
+                pass
+            # `import mamba_ssm` loads every ssd kernel module.
+            try:
+                import mamba_ssm  # noqa: F401
+            except Exception:
+                pass
+            _single_mamba_ssm_autotune_config(_hub_packages)
+        return  # Ampere or newer, or a Triton that compiles the kernels on sm_75
 
     import sys
 
@@ -1472,6 +1576,12 @@ def patch_mamba_ssm_pre_ampere_fallback():
         # phase, and can propagate an ImportError out of `import unsloth`.
         if not _mod.__dict__.get("is_fast_path_available", False):
             continue
+        # LFM2 / Qwen3-Next derive this flag from causal_conv1d / fla only.
+        if not any(_mod.__dict__.get(_sym, None) is not None for _sym in (
+            "selective_state_update", "mamba_chunk_scan_combined",
+            "mamba_split_conv1d_scan_combined", "selective_scan_fn", "mamba_inner_fn",
+        )):
+            continue
         try:
             _mod.is_fast_path_available = False
             for _sym in (
@@ -1488,9 +1598,8 @@ def patch_mamba_ssm_pre_ampere_fallback():
     pass
 
     print(
-        f"Unsloth: mamba_ssm's Triton kernels need compute capability 8.0+ "
-        f"(this GPU is {major}.{minor}). Using the PyTorch slow path for "
-        f"Mamba models."
+        f"Unsloth: Using the PyTorch slow path for Mamba models, since "
+        f"mamba_ssm's Triton kernels cannot run here: {blocker}."
     )
     return _touched
 
@@ -1617,7 +1726,7 @@ def _local_kernel_fallback_allowed():
     if not torch.cuda.is_available() or getattr(torch.version, "hip", None) is not None:
         return False
     try:
-        return torch.cuda.get_device_capability() >= (8, 0)
+        return _mamba_ssm_fast_path_blocker(_weakest_cuda_capability()) is None
     except Exception:
         return False
 pass
@@ -1645,6 +1754,8 @@ def patch_lazy_load_kernel_local_packages():
             if submodule is not None:
                 # Import ssd_combined so a broken install falls back to None, not a mid-forward crash.
                 importlib.import_module(f"{package}.{submodule}")
+            if package == "mamba_ssm":
+                _retrim_mamba_ssm_autotune()
             return module
         except Exception as e:
             logger.info(f"Unsloth: local {package} unusable for kernel {kernel_name}: {e}")
@@ -2050,6 +2161,7 @@ def fix_mamba_ssm_float32():
             importlib.reload(module)
         except Exception as e:
             return raise_error("mamba_ssm.ops.triton.ssd_chunk_scan", e)
+        _retrim_mamba_ssm_autotune()
         return
 
     # Atomic rename, not open("w"): truncation lets a concurrent patcher read and write back an empty module.
@@ -2065,6 +2177,7 @@ def fix_mamba_ssm_float32():
         tmp_file = None
         # Reload module since we editted it
         importlib.reload(mamba_ssm.ops.triton.ssd_chunk_scan)
+        _retrim_mamba_ssm_autotune()
     except Exception as e:
         if tmp_file is not None:
             try: os.unlink(tmp_file)

@@ -263,14 +263,13 @@ You can use our pre-built Docker container with all dependencies to use Unsloth 
 **This container requires installing [NVIDIA's Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)**.
 
 ```bash
-docker run -d -e JUPYTER_PASSWORD="mypassword" \
-  -p 8888:8888 -p 2222:22 \
+docker run -d --name unsloth --gpus all \
+  -p 127.0.0.1:8888:8888 \
   -v $(pwd)/work:/workspace/work \
-  --gpus all \
-  unsloth/unsloth
+  unsloth/unsloth && docker logs -f unsloth
 ```
 
-Access Jupyter Lab at `http://localhost:8888` and start fine-tuning!
+Access Jupyter Lab at `http://localhost:8888` with the password printed in the logs (or set your own with `-e JUPYTER_PASSWORD=...`) and start fine-tuning! The port is bound to `127.0.0.1` so Jupyter is not reachable from other machines; use an SSH tunnel for remote access.
 
 ## 📜 Documentation
 - Go to our official [Documentation](https://docs.unsloth.ai) for saving to GGUF, checkpointing, evaluation and more!

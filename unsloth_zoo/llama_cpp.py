@@ -84,7 +84,7 @@ if not logger.hasHandlers():
     logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s: %(message)s')
 
 LLAMA_CPP_CONVERT_FILE = \
-    "https://github.com/ggerganov/llama.cpp/raw/refs/heads/master/convert_hf_to_gguf.py"
+    "https://github.com/unslothai/llama.cpp/raw/refs/heads/master/convert_hf_to_gguf.py"
 
 _TEMP_NAME_ATTEMPTS = 16
 LLAMA_CPP_CONVERTER_FILENAMES = ("convert_hf_to_gguf.py", "convert-hf-to-gguf.py")
@@ -237,15 +237,16 @@ LLAMA_CPP_DEFAULT_DIR = os.environ.get(
     os.path.join(UNSLOTH_HOME, "llama.cpp"),
 )
 
-# Prebuilt llama.cpp binaries. CPU builds come from upstream ggml-org
-# releases; GPU (CUDA/ROCm/Metal) bundles come from the unslothai/llama.cpp
-# fork that Unsloth Studio also installs from, selected via its manifest and
-# verified against its published sha256 list. Marker file distinguishes a
-# prebuilt install from a corrupted source checkout.
+# Prebuilts and converter sources come only from unslothai/llama.cpp releases, sha256-verified
+# against llama-prebuilt-sha256.json. Tags are <upstream>-mix-<sha>, e.g. b11443-mix-d65395f.
+# Marker file distinguishes a prebuilt install from a corrupted source checkout.
 UNSLOTH_PREBUILT_INFO_FILENAME = "UNSLOTH_PREBUILT_INFO.json"
-LLAMA_CPP_RELEASES_API = "https://api.github.com/repos/ggml-org/llama.cpp/releases"
+LLAMA_CPP_FORK_REPO = "unslothai/llama.cpp"
 LLAMA_CPP_PUBLISHED_RELEASES_API = "https://api.github.com/repos/unslothai/llama.cpp/releases"
-LLAMA_CPP_SOURCE_TARBALL = "https://codeload.github.com/ggml-org/llama.cpp/tar.gz/refs/tags/{tag}"
+LLAMA_CPP_RELEASES_API = LLAMA_CPP_PUBLISHED_RELEASES_API
+LLAMA_CPP_SOURCE_TARBALL = (
+    "https://github.com/unslothai/llama.cpp/releases/download/{tag}/llama.cpp-source-{tag}.tar.gz"
+)
 LLAMA_CPP_PREBUILT_MANIFEST_ASSET = "llama-prebuilt-manifest.json"
 LLAMA_CPP_PREBUILT_SHA256_ASSET = "llama-prebuilt-sha256.json"
 
@@ -270,8 +271,10 @@ def _converter_cache_root():
     ).strip() or LLAMA_CPP_CONVERTER_CACHE_DIR
 # conversion/ is absent on purpose: pre-split revisions legitimately have none, so
 # it is required only when the entrypoint imports it (_staged_sources_are_complete).
+# convert_lora_to_gguf.py required so older cache entries re-stage (Studio adapter export needs it).
 _CONVERTER_STAGE_REQUIRED = (
     "convert_hf_to_gguf.py",
+    "convert_lora_to_gguf.py",
     os.path.join("gguf-py", "gguf", "__init__.py"),
 )
 
@@ -1062,6 +1065,9 @@ def _resolve_llama_cpp_release(releases_api = LLAMA_CPP_RELEASES_API):
     """Return (tag, {asset_name: download_url}) for the UNSLOTH_LLAMA_TAG
     pinned release or the latest one, or None when resolution fails."""
     tag = os.environ.get("UNSLOTH_LLAMA_TAG", "").strip()
+    if tag and "-mix-" not in tag and releases_api == LLAMA_CPP_PUBLISHED_RELEASES_API:
+        # A plain upstream pin (b11443) names the fork release built on it (b11443-mix-...).
+        tag = _fork_release_tag_for(tag) or tag
     url = f"{releases_api}/tags/{tag}" if tag else f"{releases_api}/latest"
     try:
         release = _requests_get_with_retries(url, headers = _github_auth_headers()).json()
@@ -1222,9 +1228,10 @@ def _sha256_file(path):
 
 
 def _select_prebuilt_asset(tag, assets):
-    """Map this host to the official CPU archive. llama-quantize is CPU-only,
-    so the CPU bundle suffices even on GPU machines. Returns (name, url) or
-    None for unsupported platforms or releases missing the asset."""
+    """Map this host to an upstream-style llama-{tag}-bin-* CPU archive name.
+    Kept for callers outside this module: _install_llama_cpp_prebuilt no longer
+    uses it, since prebuilts come only from the fork (_select_cpu_assets). Returns
+    (name, url) or None for unsupported platforms or releases missing the asset."""
     machine = platform.machine().lower()
     if machine in ("x86_64", "amd64"): arch = "x64"
     elif machine in ("aarch64", "arm64"): arch = "arm64"
@@ -1415,18 +1422,48 @@ def _place_prebuilt_binaries(extracted_root, install_folder):
         raise RuntimeError("Unsloth: No executables found in the prebuilt archive.")
 
 
-def _converter_source_url(tag, source_assets = None):
-    """URL of the source tarball carrying convert_hf_to_gguf.py, conversion/ and
-    gguf-py/ for one tag.
+def _fork_source_asset_name(tag):
+    """Name of the source archive every unslothai/llama.cpp release publishes."""
+    return f"llama.cpp-source-{tag}.tar.gz"
 
-    Fork "mix" tags (e.g. b9739-mix-2d6bd50) do not exist on ggml-org, so prefer the
-    fork release's own source asset; otherwise strip the -mix-... suffix to get the
-    matching upstream tag. A no-op for plain ggml-org tags, which carry no suffix."""
-    fork_source_name = f"llama.cpp-source-{tag}.tar.gz"
-    expected_sha256 = None
+
+def _converter_source_url(tag, source_assets = None):
+    """URL of the unslothai/llama.cpp release asset carrying convert_hf_to_gguf.py,
+    convert_lora_to_gguf.py, conversion/ and gguf-py/ for one fork release tag.
+
+    The release's own asset URL when known, else the release download URL built
+    from the tag. Never an upstream archive: upstream publishes no digest for it."""
+    fork_source_name = _fork_source_asset_name(tag)
     if source_assets and fork_source_name in source_assets:
         return source_assets[fork_source_name]
-    return LLAMA_CPP_SOURCE_TARBALL.format(tag = tag.split("-mix-")[0])
+    return LLAMA_CPP_SOURCE_TARBALL.format(tag = tag)
+
+
+def _published_source_sha256(checksums, tag):
+    """The sha256 llama-prebuilt-sha256.json publishes for this tag's source archive."""
+    entry = (checksums or {}).get(_fork_source_asset_name(tag))
+    if not isinstance(entry, dict):
+        return None
+    digest = entry.get("sha256")
+    return digest if isinstance(digest, str) and digest.strip() else None
+
+
+def _fork_release_source_assets(tag, source_assets = None):
+    """(asset map, checksum artifacts) of the unslothai/llama.cpp release `tag`.
+
+    Reuses source_assets when it names both the source archive and the sha256 list;
+    otherwise reads the release by tag. Raises on failure."""
+    assets = dict(source_assets or {})
+    if _fork_source_asset_name(tag) not in assets or LLAMA_CPP_PREBUILT_SHA256_ASSET not in assets:
+        release = _requests_get_with_retries(
+            f"{LLAMA_CPP_PUBLISHED_RELEASES_API}/tags/{tag}", headers = _github_auth_headers(),
+        ).json()
+        if not isinstance(release, dict) or release.get("draft"):
+            raise RuntimeError(f"Unsloth: {LLAMA_CPP_FORK_REPO} has no published release {tag}.")
+        assets = {a["name"]: a["browser_download_url"] for a in release.get("assets", [])}
+    published = _fetch_release_json_asset(assets, LLAMA_CPP_PREBUILT_SHA256_ASSET) or {}
+    artifacts = published.get("artifacts") if isinstance(published, dict) else None
+    return assets, (artifacts if isinstance(artifacts, dict) else {})
 
 
 def _source_imports_conversion_package(entry_content_bytes):
@@ -1472,6 +1509,13 @@ def _staged_sources_are_complete(stage_dir):
     for member in _CONVERTER_STAGE_REQUIRED:
         if not os.path.exists(os.path.join(stage_dir, member)):
             return False
+    try:
+        with open(os.path.join(stage_dir, "convert_lora_to_gguf.py"), "rb") as f: lora_source = f.read()
+        ast.parse(lora_source)
+    except (OSError, SyntaxError, ValueError):
+        return False
+    if not lora_source.strip():
+        return False
     converter = os.path.join(stage_dir, "convert_hf_to_gguf.py")
     try:
         with open(converter, "rb") as f: source = f.read()
@@ -1654,32 +1698,25 @@ def _unsupported_arch_message(arch, converter_location):
 
 def _extract_converter_sources_into(tag, dest_folder, source_assets = None, archive_dir = None,
                                     checksums = None):
-    """Download one source tarball for `tag` and copy the three converter trees
-    into dest_folder. Returns the archive's sha256, or None when it could not be
-    computed. Raises when the tarball does not carry the converter.
+    """Download the unslothai/llama.cpp source archive for `tag` and copy the
+    converter trees into dest_folder. Returns the archive's sha256. Raises when the
+    archive cannot be verified or does not carry the converter.
 
-    These are the files the converter subprocess executes, so the archive is checked
-    against the release's own published sha256 when there is one. Only a fork release
-    publishes a digest for its source asset; the ggml-org codeload fallback publishes
-    none, which is reported rather than silently trusted."""
-    source_url = _converter_source_url(tag, source_assets)
-    fork_source_name = f"llama.cpp-source-{tag}.tar.gz"
-    # The same condition _converter_source_url used to pick the URL, so the digest
-    # is always looked up for the asset actually being downloaded.
-    if source_assets and fork_source_name in source_assets:
-        expected_sha256 = ((checksums or {}).get(fork_source_name) or {}).get("sha256")
-        if not expected_sha256:
-            logger.warning(
-                "Unsloth: The %s release publishes no sha256 for %s, so the "
-                "converter sources it holds cannot be verified.", tag, fork_source_name,
-            )
-    else:
-        expected_sha256 = None
-        logger.warning(
-            "Unsloth: Falling back to the ggml-org source archive for %s, which "
-            "publishes no sha256, so the converter sources cannot be verified.",
-            tag.split("-mix-")[0],
+    These are the files the converter subprocess executes, so the archive must match
+    the sha256 its release publishes in llama-prebuilt-sha256.json. When the caller
+    has no digest for it, the release's own list is fetched; a release publishing
+    none is refused rather than trusted."""
+    fork_source_name = _fork_source_asset_name(tag)
+    expected_sha256 = _published_source_sha256(checksums, tag)
+    if not expected_sha256:
+        source_assets, checksums = _fork_release_source_assets(tag, source_assets)
+        expected_sha256 = _published_source_sha256(checksums, tag)
+    if not expected_sha256:
+        raise RuntimeError(
+            f"Unsloth: The {LLAMA_CPP_FORK_REPO} release {tag} publishes no sha256 for "
+            f"{fork_source_name}, so the converter sources it holds cannot be verified."
         )
+    source_url = _converter_source_url(tag, source_assets)
     scratch_parent = archive_dir or os.path.dirname(dest_folder) or "."
     with tempfile.TemporaryDirectory(dir = scratch_parent) as source_dir:
         archive_path = os.path.join(source_dir, "source.tar.gz")
@@ -1688,27 +1725,28 @@ def _extract_converter_sources_into(tag, dest_folder, source_assets = None, arch
             archive_sha256 = _sha256_file(archive_path)
         except OSError:
             archive_sha256 = None
-        if expected_sha256:
-            if archive_sha256 is None:
-                raise RuntimeError(
-                    f"Unsloth: could not read {fork_source_name} back to verify its "
-                    f"sha256, so the converter sources it holds are unverified."
-                )
-            if archive_sha256 != expected_sha256:
-                raise RuntimeError(
-                    f"Unsloth: sha256 mismatch for {fork_source_name}: expected "
-                    f"{expected_sha256}, got {archive_sha256}"
-                )
+        if archive_sha256 is None:
+            raise RuntimeError(
+                f"Unsloth: could not read {fork_source_name} back to verify its "
+                f"sha256, so the converter sources it holds are unverified."
+            )
+        if archive_sha256 != expected_sha256.strip().lower():
+            raise RuntimeError(
+                f"Unsloth: sha256 mismatch for {fork_source_name}: expected "
+                f"{expected_sha256}, got {archive_sha256}"
+            )
         extract_dir = os.path.join(source_dir, "extracted")
         os.makedirs(extract_dir)
         _extract_archive(archive_path, extract_dir)
         root = _single_extracted_root(extract_dir)
         converter = os.path.join(root, "convert_hf_to_gguf.py")
+        lora_converter = os.path.join(root, "convert_lora_to_gguf.py")
         gguf_py = os.path.join(root, "gguf-py")
-        if not (os.path.isfile(converter) and os.path.isdir(gguf_py)):
+        if not (os.path.isfile(converter) and os.path.isfile(lora_converter) and os.path.isdir(gguf_py)):
             raise RuntimeError(f"Unsloth: Source tarball for {tag} is missing converter files.")
         os.makedirs(dest_folder, exist_ok = True)
         shutil.copy2(converter, os.path.join(dest_folder, "convert_hf_to_gguf.py"))
+        shutil.copy2(lora_converter, os.path.join(dest_folder, "convert_lora_to_gguf.py"))
         shutil.copytree(gguf_py, os.path.join(dest_folder, "gguf-py"), dirs_exist_ok = True)
         conversion = os.path.join(root, "conversion")
         if os.path.isdir(conversion):
@@ -1716,9 +1754,11 @@ def _extract_converter_sources_into(tag, dest_folder, source_assets = None, arch
     return archive_sha256
 
 
-def _stage_converter_sources(tag, repo = "ggml-org/llama.cpp", source_assets = None):
-    """Return a directory holding convert_hf_to_gguf.py, conversion/ and gguf-py/
-    all taken from the same llama.cpp revision, or None when that is impossible.
+def _stage_converter_sources(tag, repo = LLAMA_CPP_FORK_REPO, source_assets = None):
+    """Return a directory holding convert_hf_to_gguf.py, convert_lora_to_gguf.py,
+    conversion/ and gguf-py/ all taken from the same unslothai/llama.cpp release, or
+    None when that is impossible. `tag` is a fork release tag; `repo` only names the
+    cache entry, the sources always come from the fork release's verified archive.
 
     Transactional: probe, acquire into a private staging directory, validate,
     write `completed` LAST, publish by moving the directory into place. An
@@ -1865,22 +1905,105 @@ def _read_prebuilt_marker(install_folder):
         return _unusable_prebuilt_marker(marker, "it names no `tag`")
     repo = info.get("repo")
     if not isinstance(repo, str) or not repo.strip():
-        repo = "ggml-org/llama.cpp"
-    return repo, tag.strip()
+        # Markers have always named their repo; one that does not predates the fork.
+        repo = _LEGACY_UPSTREAM_REPO
+    return repo.strip(), tag.strip()
+
+
+# Recorded by older installs of upstream prebuilts; read only, never fetched from.
+_LEGACY_UPSTREAM_REPO = "ggml-org/llama.cpp"
+_FORK_RELEASE_TAGS = {}
+# A bound, not a cutoff: the scan stops at the first short page.
+_FORK_RELEASE_PAGES = 100
+
+
+def _upstream_tag_of(fork_tag):
+    """b11443 for b11443-mix-d65395f: fork release tags are <upstream_tag>-mix-<sha>,
+    the same upstream_tag each release's llama-prebuilt-sha256.json records."""
+    return fork_tag.split("-mix-")[0]
+
+
+def _staged_fork_release_tag_for(upstream_tag):
+    """Newest fork release tag for upstream_tag already staged in the converter cache.
+
+    The offline answer: no network, so only revisions on disk can be named."""
+    root = _converter_cache_root()
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        return None
+    best = None
+    for entry in entries:
+        manifest = _read_converter_stage_manifest(os.path.join(root, entry))
+        if manifest is None or manifest.get("repo") != LLAMA_CPP_FORK_REPO:
+            continue
+        tag = manifest.get("tag")
+        if not isinstance(tag, str) or _upstream_tag_of(tag) != upstream_tag:
+            continue
+        if not _converter_stage_is_usable(os.path.join(root, entry), repo = LLAMA_CPP_FORK_REPO, tag = tag):
+            continue
+        key = (str(manifest.get("staged_at_utc") or ""), tag)
+        if best is None or key > best[0]:
+            best = (key, tag)
+    return best[1] if best else None
+
+
+def _fork_release_tag_for(tag):
+    """The unslothai/llama.cpp release tag that serves `tag`, or None.
+
+    A fork tag (contains -mix-) is its own answer. A plain upstream tag such as
+    b9999 maps to the newest published (non-draft, non-prerelease) fork release built
+    on it; None when the fork never released on that upstream tag. Positive answers
+    are memoized; offline, only revisions already staged in the cache are named."""
+    tag = (tag or "").strip()
+    if not tag:
+        return None
+    if "-mix-" in tag:
+        return tag
+    if tag in _FORK_RELEASE_TAGS:
+        return _FORK_RELEASE_TAGS[tag]
+    if not _converter_network_allowed():
+        return _staged_fork_release_tag_for(tag)
+    found = None
+    try:
+        for page in range(1, _FORK_RELEASE_PAGES + 1):
+            releases = _requests_get_with_retries(
+                f"{LLAMA_CPP_PUBLISHED_RELEASES_API}?per_page=100&page={page}",
+                headers = _github_auth_headers(),
+            ).json()
+            if not isinstance(releases, list) or not releases:
+                break
+            # Newest first, so the first match is the latest release on that tag.
+            for release in releases:
+                if not isinstance(release, dict) or release.get("draft") or release.get("prerelease"):
+                    continue
+                name = release.get("tag_name")
+                if isinstance(name, str) and _upstream_tag_of(name) == tag:
+                    found = name
+                    break
+            if found or len(releases) < 100:
+                break
+    except Exception as e:
+        logger.warning("Unsloth: Could not list %s releases (%s).", LLAMA_CPP_FORK_REPO, e)
+        return _staged_fork_release_tag_for(tag)
+    if found:
+        _FORK_RELEASE_TAGS[tag] = found
+    return found
 
 
 _CONVERTER_RELEASE_TAGS = {}
 
 
 def _latest_converter_release_tag(_llama_tag_pin):
-    """The release tag a fresh install would get, memoized for the process.
+    """The unslothai/llama.cpp release tag a fresh install would get, memoized for
+    the process. The releases/latest endpoint never returns a draft or prerelease.
 
     Otherwise a warm cache still pays a releases API round-trip per export.
     UNSLOTH_LLAMA_TAG is the cache key, not read inside, so changing the pin
     mid-process still re-resolves."""
     if _llama_tag_pin in _CONVERTER_RELEASE_TAGS:
         return _CONVERTER_RELEASE_TAGS[_llama_tag_pin]
-    release = _resolve_llama_cpp_release()
+    release = _resolve_llama_cpp_release(LLAMA_CPP_PUBLISHED_RELEASES_API)
     if release is None:
         # Failures are NOT remembered: a tag is immutable, but a failed lookup only
         # describes the network a second ago.
@@ -1893,37 +2016,60 @@ _latest_converter_release_tag.cache_clear = _CONVERTER_RELEASE_TAGS.clear
 
 
 def _resolve_converter_revision(llama_cpp_dir):
-    """Which llama.cpp revision the converter sources should come from, as
+    """Which unslothai/llama.cpp release the converter sources should come from, as
     (repo, tag), or (None, None) when the answer is "whatever is already on disk".
+    The repo is always unslothai/llama.cpp: converter sources are never fetched from
+    upstream.
 
     Precedence, highest first:
 
       1. UNSLOTH_LLAMA_CPP_CONVERTER_TAG, the explicit escape hatch for an
-         architecture that exists upstream but not yet in the installed release.
+         architecture newer than the installed release. A fork tag
+         (b11443-mix-d65395f) is used as is; a plain upstream tag (b11443) maps to
+         the newest fork release built on it. No such release resolves to
+         (None, None), and the caller then fails the export naming the pin.
       2. UNSLOTH_PREBUILT_INFO.json, so the converter matches the binaries that
-         will quantize its output.
-      3. the latest release, which is the revision a fresh install would get.
+         will quantize its output. A marker left by an older install of an upstream
+         ggml-org prebuilt maps its tag the same way, else falls through to 3.
+      3. the latest fork release, which is the revision a fresh install would get.
 
     UNSLOTH_LLAMA_CPP_SCRIPTS_DIR is NOT a row: that explicit pin is authoritative
     and its caller returns before reaching here."""
     pinned = os.environ.get("UNSLOTH_LLAMA_CPP_CONVERTER_TAG", "").strip()
     if pinned:
-        return "ggml-org/llama.cpp", pinned
+        fork_tag = _fork_release_tag_for(pinned)
+        if fork_tag is None:
+            logger.warning(
+                f"Unsloth: UNSLOTH_LLAMA_CPP_CONVERTER_TAG='{pinned}' matches no "
+                f"{LLAMA_CPP_FORK_REPO} release (fork releases are tagged like "
+                f"b11443-mix-d65395f and a plain upstream tag maps to the newest one "
+                f"built on it), so no converter can be staged for it."
+            )
+            return None, None
+        return LLAMA_CPP_FORK_REPO, fork_tag
     repo, tag = _read_prebuilt_marker(llama_cpp_dir)
     if tag:
-        return repo, tag
+        if repo == LLAMA_CPP_FORK_REPO:
+            return LLAMA_CPP_FORK_REPO, tag
+        fork_tag = _fork_release_tag_for(tag)
+        if fork_tag:
+            return LLAMA_CPP_FORK_REPO, fork_tag
+        logger.info(
+            f"Unsloth: The installed {repo} prebuilt {tag} has no matching "
+            f"{LLAMA_CPP_FORK_REPO} release, so the latest fork release's converter is used."
+        )
     llama_tag_pin = os.environ.get("UNSLOTH_LLAMA_TAG", "").strip()
     if not _converter_network_allowed():
         # A revision this process already resolved is a local fact, so a process
         # switched offline after staging can still find its own warm cache.
         memoized = _CONVERTER_RELEASE_TAGS.get(llama_tag_pin)
         if memoized:
-            return "ggml-org/llama.cpp", memoized
+            return LLAMA_CPP_FORK_REPO, memoized
         return None, None
     tag = _latest_converter_release_tag(llama_tag_pin)
     if not tag:
         return None, None
-    return "ggml-org/llama.cpp", tag
+    return LLAMA_CPP_FORK_REPO, tag
 
 
 def _hydrate_converter_sources(tag, install_folder, source_assets = None, checksums = None):
@@ -1940,7 +2086,7 @@ def _hydrate_converter_sources(tag, install_folder, source_assets = None, checks
     )
 
 
-def _write_prebuilt_marker(install_folder, tag, asset_name, repo = "ggml-org/llama.cpp"):
+def _write_prebuilt_marker(install_folder, tag, asset_name, repo = LLAMA_CPP_FORK_REPO):
     try:
         info = {
             "source"           : f"{repo} prebuilt release",
@@ -1955,7 +2101,7 @@ def _write_prebuilt_marker(install_folder, tag, asset_name, repo = "ggml-org/lla
         logger.warning("Unsloth: Could not write prebuilt marker (%s).", e)
 
 
-def _stage_prebuilt_install(llama_cpp_folder, tag, asset_name, asset_url, expected_sha256 = None, repo = "ggml-org/llama.cpp", source_assets = None, checksums = None):
+def _stage_prebuilt_install(llama_cpp_folder, tag, asset_name, asset_url, expected_sha256 = None, repo = LLAMA_CPP_FORK_REPO, source_assets = None, checksums = None):
     """Download one prebuilt asset, verify, hydrate, validate in staging,
     then activate into llama_cpp_folder. Raises on any failure. source_assets is
     the release's asset map, used so the converter sources hydrate from the fork's
@@ -1997,13 +2143,11 @@ def _stage_prebuilt_install(llama_cpp_folder, tag, asset_name, asset_url, expect
 
 def _install_llama_cpp_prebuilt(llama_cpp_folder, gpu_support = False, print_output = False):
     """Install prebuilt llama.cpp binaries plus same-tag converter sources into
-    llama_cpp_folder, always preferring the unslothai/llama.cpp fork. Tries, in
-    order: the fork GPU bundle (CUDA/ROCm/Metal) when a GPU target is present, the
-    fork CPU bundle (the final prebuilt fallback -- its app-*-cpu archive also ships
-    llama-quantize), then ggml-org's upstream CPU build for extra resilience on
-    non-macOS hosts. Returns (quantizer, converter) on the first asset that installs,
-    else None so the caller compiles from source as before. ggml-org is skipped on
-    macOS: its recent CPU build targets a newer macOS and fails to load on 14/15."""
+    llama_cpp_folder, only ever from unslothai/llama.cpp fork releases. Tries, in
+    order: the fork GPU bundle (CUDA/ROCm/Metal) when a GPU target is present, then
+    the fork CPU bundle (its app-*-cpu archive also ships llama-quantize). Returns
+    (quantizer, converter) on the first asset that installs, else None so the
+    caller compiles from source as before."""
     try:
         is_darwin = platform.system() == "Darwin"
         # Each attempt carries its own (repo, tag, checksums, source_assets) so
@@ -2021,9 +2165,7 @@ def _install_llama_cpp_prebuilt(llama_cpp_folder, gpu_support = False, print_out
                 seen.add(key)
                 attempts.append((repo, tag, checksums, source_assets, asset_name, asset_url))
 
-        # 1 + 2: unslothai/llama.cpp fork bundles (GPU then CPU). Best-effort: a
-        # failed fork release resolution still lets ggml-org be tried below.
-        fork_repo = "unslothai/llama.cpp"
+        fork_repo = LLAMA_CPP_FORK_REPO
         resolved = _resolve_llama_cpp_release(LLAMA_CPP_PUBLISHED_RELEASES_API)
         if resolved is not None:
             fork_tag, fork_assets = resolved
@@ -2046,20 +2188,9 @@ def _install_llama_cpp_prebuilt(llama_cpp_folder, gpu_support = False, print_out
                 _extend(fork_repo, fork_tag, fork_checksums, fork_assets,
                         _select_cpu_assets(fork_tag, fork_assets, manifest))
         else:
-            logger.warning("Unsloth: Could not resolve a unslothai/llama.cpp release - "
-                           "trying upstream ggml-org instead.")
-
-        # 3: ggml-org upstream CPU, non-Darwin CPU installs only (its Darwin CPU
-        # build is unusable on macOS 14/15, and a GPU request must not be shadowed
-        # by a CPU-only prebuilt -- it falls through to a source GPU build).
-        if not is_darwin and not gpu_support:
-            ggml_repo = "ggml-org/llama.cpp"
-            resolved = _resolve_llama_cpp_release()
-            if resolved is not None:
-                ggml_tag, ggml_assets = resolved
-                selected = _select_prebuilt_asset(ggml_tag, ggml_assets)
-                if selected is not None:
-                    _extend(ggml_repo, ggml_tag, {}, None, [selected])
+            logger.warning(f"Unsloth: Could not resolve a {LLAMA_CPP_FORK_REPO} release - "
+                           "falling back to source build.")
+            return None
 
         if not attempts:
             logger.warning("Unsloth: No prebuilt llama.cpp bundle matches this host - "
@@ -3499,10 +3630,10 @@ def _resolve_staged_convert_script():
     repo, tag = _resolve_converter_revision(LLAMA_CPP_DEFAULT_DIR)
     if not tag:
         return None
-    stage_dir = _stage_converter_sources(tag, repo = repo or "ggml-org/llama.cpp")
+    stage_dir = _stage_converter_sources(tag, repo = repo or LLAMA_CPP_FORK_REPO)
     if stage_dir is None:
         return None
-    stage_dir = _writable_stage(stage_dir, repo = repo or "ggml-org/llama.cpp", tag = tag)
+    stage_dir = _writable_stage(stage_dir, repo = repo or LLAMA_CPP_FORK_REPO, tag = tag)
     if stage_dir is None:
         return None
     candidate = os.path.join(stage_dir, "convert_hf_to_gguf.py")
@@ -4093,8 +4224,10 @@ def _download_convert_hf_to_gguf(name = "unsloth_convert_hf_to_gguf"):
         raise _ConverterSourcesIncomplete(
             f"Unsloth: UNSLOTH_LLAMA_CPP_CONVERTER_TAG is set to "
             f"'{os.environ.get('UNSLOTH_LLAMA_CPP_CONVERTER_TAG', '').strip()}' but its "
-            f"converter sources could not be staged. Check the tag exists at "
-            f"https://github.com/ggml-org/llama.cpp/releases, that this process is not "
+            f"converter sources could not be staged. Check that a release with that "
+            f"tag (or, for a plain upstream tag such as b11443, one built on it like "
+            f"b11443-mix-d65395f) exists at "
+            f"https://github.com/unslothai/llama.cpp/releases, that this process is not "
             f"offline, and that the converter cache is writable. Unset the variable to "
             f"use the revision matching the installed llama.cpp, or point "
             f"UNSLOTH_LLAMA_CPP_SCRIPTS_DIR at a checkout holding convert_hf_to_gguf.py, "
@@ -4229,8 +4362,7 @@ def _download_convert_hf_to_gguf_cached(
         # is a second download from the one the bundle's own sha256 covers. An
         # earlier version of this comment said the bundle's digest covered them;
         # it does not, and until that archive was verified as well nothing did.
-        # From an unpinned `git clone`, or the ggml-org codeload fallback, there
-        # is still no digest to check, and a payload can sit in
+        # From an unpinned `git clone` there is still no digest to check, and a payload can sit in
         # conversion/__init__.py behind a clean entrypoint.
         # Always, pinned or not. The entrypoint itself is scanned either way and
         # only the refusal is waived for a pin; skipping the sibling packages

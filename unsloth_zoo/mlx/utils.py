@@ -3236,6 +3236,18 @@ def _apply_static_vlm_metadata(model, batch_dict, kwargs):
         not getattr(model, "training", False) or kwargs.get("position_ids") is None
     ):
         return
+    if not keys:
+        # Compile only: an unpatched tower (`patch_mode="unpatched"`) still
+        # calls `.tolist()` on what it is handed.
+        decision = getattr(model, "_unsloth_compile_decision", None)
+        if decision is None or not getattr(decision, "enabled", False):
+            return
+        keys = _VLM_STATIC_METADATA_MODEL_TYPES.get(
+            _mlx_vlm_canonical_model_type(
+                _config_get(getattr(model, "config", None), "model_type")
+            ),
+            (),
+        )
     static = batch_dict.get("_unsloth_static_vlm_metadata", {})
     for key in keys:
         if key in static:
@@ -3526,10 +3538,26 @@ def _mlx_vlm_canonical_model_type(model_type):
 _VLM_ARRAY_GRID_MODEL_TYPES = frozenset({
     "glm4v",
     "glm_ocr",
-    # Not compile-patched, and opens with `grid_thw.tolist()`.
     "muse_glimmer",
     "glm5_next",
 })
+
+
+# Towers that read these keys on the host (a tracer under mx.compile): handed the
+# processor's Python values. Per family, since a tuple raises in the towers above.
+_VLM_STATIC_METADATA_MODEL_TYPES = {
+    # Its embedder reads only the image grid; there is no video pixel path.
+    "dots_ocr": ("image_grid_thw",),
+    "minimax_m3_vl": ("image_grid_thw", "video_grid_thw"),
+    "muse_glimmer": ("image_grid_thw", "video_grid_thw"),
+    "kimi_k3": ("grid_thws", "image_grid_hws", "video_grid_hws"),
+    "ernie4_5_moe_vl": ("image_grid_thw", "video_grid_thw"),
+    # One `_as_grid_list` call reads whichever of the two the batch carries.
+    "mage_vl": ("image_grid_thw", "video_grid_thw"),
+    # Pixtral's vision tower, which mistral3 and mistral4 checkpoints also load.
+    "mistral3": ("image_sizes",),
+    "pixtral": ("image_sizes",),
+}
 
 
 def _normalize_size_tuples(values):
@@ -4208,6 +4236,11 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
 
     image_grid_thw = _normalize_grid_thw(batch_dict.get("image_grid_thw"))
     video_grid_thw = _normalize_grid_thw(batch_dict.get("video_grid_thw"))
+    # Kimi's processor names the same `(t, h, w)` metadata differently and emits
+    # two-element rows for stills.
+    grid_thws = _normalize_grid_thw(batch_dict.get("grid_thws"))
+    image_grid_hws = _normalize_grid_thw(batch_dict.get("image_grid_hws"))
+    video_grid_hws = _normalize_grid_thw(batch_dict.get("video_grid_hws"))
     image_sizes = _normalize_size_tuples(batch_dict.get("image_sizes"))
     spatial_shapes = _normalize_size_tuples(batch_dict.get("spatial_shapes"))
     images_spatial_crop = _normalize_size_tuples(batch_dict.get("images_spatial_crop"))
@@ -4224,6 +4257,9 @@ def _prepare_vlm_batch_for_compile(batch_dict, config, phase=None):
         ("spatial_shapes", spatial_shapes),
         ("image_sizes", image_sizes),
         ("images_spatial_crop", images_spatial_crop),
+        ("grid_thws", grid_thws),
+        ("image_grid_hws", image_grid_hws),
+        ("video_grid_hws", video_grid_hws),
     ):
         if normalized is not None:
             value = batch_dict[key]
