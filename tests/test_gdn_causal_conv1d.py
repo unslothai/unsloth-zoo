@@ -150,6 +150,28 @@ def test_legacy_entry_point(monkeypatch):
     assert _rel(y, gcc.causal_conv1d_reference(x, w, b, "silu")) < 1e-2
 
 
+def test_oom_propagates_without_disabling(monkeypatch):
+    monkeypatch.delenv(gcc._KILL_SWITCH, raising = False)
+    monkeypatch.setattr(gcc, "_broken", False)
+    monkeypatch.setattr(gcc, "_eligible", lambda *a: True)
+    x = torch.zeros(1, 4, 3)
+
+    def oom(*a):
+        raise torch.cuda.OutOfMemoryError("CUDA out of memory")
+
+    monkeypatch.setattr(gcc, "triton_causal_conv1d", oom)
+    with pytest.raises(torch.cuda.OutOfMemoryError):
+        gcc._try_fast(x, x[0], None, "silu")
+    assert gcc._broken is False
+
+    def fail(*a):
+        raise RuntimeError("triton launch failed")
+
+    monkeypatch.setattr(gcc, "triton_causal_conv1d", fail)
+    assert gcc._try_fast(x, x[0], None, "silu") is None
+    assert gcc._broken is True
+
+
 def test_legacy_seq_idx_cpu():
     import inspect
     # Not advertised: unsloth's hybrid packing gate keys on a named `seq_idx`.

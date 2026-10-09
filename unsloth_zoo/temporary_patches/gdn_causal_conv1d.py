@@ -334,6 +334,9 @@ def _try_fast(x, weight, bias, activation):
         return None
     try:
         return triton_causal_conv1d(x, weight, bias, activation)
+    except torch.cuda.OutOfMemoryError:
+        # Not a kernel fault: a caught OOM (batch size finders) must not disable it for good.
+        raise
     except Exception as e:
         _broken = True
         if UNSLOTH_ENABLE_LOGGING:
