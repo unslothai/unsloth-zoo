@@ -2098,8 +2098,7 @@ def _settle_abandoned_checkpoint_generator():
 # True only while generate() runs a compiled decode step for a model that opted in. A
 # one-element list so Dynamo guards on the value and retraces when it flips.
 UNSLOTH_DECODE_COMPILE = [False]
-# [weakref to an eager stance Unsloth installed (True if torch has none), stance it replaced].
-# Weak so nested scopes restoring it stay recognised, and dead entries drop themselves.
+# [weakref to an eager stance Unsloth installed (True if torch has none), stance it replaced]
 UNSLOTH_EAGER_STANCE_OWNED = []
 
 
