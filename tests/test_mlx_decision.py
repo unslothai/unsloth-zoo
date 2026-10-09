@@ -319,7 +319,7 @@ def test_openjev_puts_its_screenshots_before_the_state(tmp_path, decoder_family,
         model.answer("s", question, images = [image])
     # The processor spends two placeholders on the first image and one on the second; the tokenizer reads one for each.
     spent, characters = [501, 500, 500, 502, 501, 500, 502], model.tokenizer.encode
-    model.model.vision_tower, model.model._processor = None, lambda text, images, return_tensors: {"input_ids": np.array([spent]), "pixel_values": np.zeros((3, 4)), "image_grid_thw": np.ones((2, 3))}
+    model.model.vision_tower, model.model._processor = object(), lambda text, images, return_tensors: {"input_ids": np.array([spent]), "pixel_values": np.zeros((3, 4)), "image_grid_thw": np.ones((2, 3))}
     model.tokenizer.encode = lambda text, add_special_tokens: [token for index, piece in enumerate(text.split(model._IMAGE)) for token in ([501, 500, 502] * bool(index) + characters(piece, add_special_tokens))]
     passes = []
     monkeypatch.setattr(decision._QwenModel, "_hidden_states", lambda self, prompts, *images: passes.append((prompts, *images)) or iter(prompts))

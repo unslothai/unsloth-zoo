@@ -1058,6 +1058,10 @@ def test_clef_reads_images_between_the_opening_and_the_state(clef, monkeypatch):
     reader = copy.copy(text_only)
     reader.model = model
     assert reader.reads_images and not text_only.reads_images
+    towerless = copy.copy(reader)
+    towerless.model = copy.copy(model)
+    towerless.model.vision_tower = None
+    assert not towerless.reads_images
     monkeypatch.setattr(ClefModel, "_IMAGE_TOKENS", 15)
     with pytest.raises(DecisionRequestError, match = "the images take 15 tokens"):
         reader.encode_images(images)

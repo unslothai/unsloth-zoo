@@ -782,7 +782,8 @@ class _QwenModel(DecisionPipeline):
 
     @property
     def reads_images(self):
-        return self.takes_images and hasattr(self.model, "vision_tower") and getattr(self.model, "_processor", None) is not None
+        # A conversion that ships no vision weights loads with the tower set to None.
+        return self.takes_images and getattr(self.model, "vision_tower", None) is not None and getattr(self.model, "_processor", None) is not None
 
     def encode_images(self, images):
         """The token ids that stand for `images` in the prompt, and the pixels behind them."""
