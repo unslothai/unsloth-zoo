@@ -280,6 +280,9 @@ class GenerationResult:
     stop_match: str | None = None
     prompt_token_count: int = 0
     cached_token_count: int = 0
+    # Speculative decoding: tokens the reply's drafts proposed, and how many the target accepted.
+    draft_tokens: int = 0
+    accepted_draft_tokens: int = 0
 
 
 def _validate_positive_int(value: Any, name: str):
@@ -739,6 +742,7 @@ def _sequential_history(processor):
             state["offset"] = max(int(tokens.shape[0]) - 1, 0)
         return processor(tokens[state["offset"] :], logits)
 
+    _shown.history_only = getattr(processor, "history_only", False)
     return _shown
 
 
@@ -1401,6 +1405,8 @@ class _PendingResult:
     released: int = 0
     finish_reason: Literal["stop", "length", "stop_string"] | None = None
     stop_match: str | None = None
+    draft_tokens: int = 0
+    accepted_draft_tokens: int = 0
 
     def release(self) -> str:
         delta = self.text[self.released :]
@@ -1464,6 +1470,8 @@ class _PendingResult:
             stop_match=self.stop_match,
             prompt_token_count=self.prompt_token_count,
             cached_token_count=self.cached_token_count,
+            draft_tokens=self.draft_tokens,
+            accepted_draft_tokens=self.accepted_draft_tokens,
         )
 
 
@@ -1628,7 +1636,7 @@ class _TextBatchSession:
         self._retire(uid)
         return state
 
-    def step(self) -> Iterator[GenerationEvent]:
+    def step(self, waiting = None) -> Iterator[GenerationEvent]:
         if not self._pending:
             return
         try:
@@ -3303,7 +3311,7 @@ class _VLMBatchSession:
         self._retire(uid)
         return state
 
-    def step(self) -> Iterator[GenerationEvent]:
+    def step(self, waiting = None) -> Iterator[GenerationEvent]:
         if not self._pending:
             return
         try:
@@ -3498,6 +3506,193 @@ class _VLMBatchSession:
         self._retire(event.uid)
 
 
+class _SpeculativeBatchSession:
+    """Rows prefilled alone by mlx-vlm and decoded together by the speculative engine."""
+
+    def __init__(self, adapter: "_VLMBatchAdapter", speculative):
+        from .speculative import SpeculativeEngine, install_speculative_seam
+
+        defaults = adapter.defaults
+        if defaults.kv_bits is not None or defaults.max_kv_size is not None:
+            raise ValueError("Speculative batches run on full-precision, unbounded KV caches; omit kv_bits and max_kv_size.")
+        install_speculative_seam()
+        self.adapter = adapter
+        self.speculative = speculative
+        self.tokenizer = getattr(adapter.processor, "tokenizer", adapter.processor)
+        criteria = getattr(self.tokenizer, "stopping_criteria", None)
+        self.stop_tokens = frozenset(getattr(criteria, "eos_token_ids", None) or (ids[0] for ids in _eos_stop_tokens(self.tokenizer)))
+        self.engine = SpeculativeEngine(adapter.model, speculative.controller, speculative.drafter, logprobs = True)
+        self._pending: dict[int, _PendingResult] = {}
+        # Rows whose prefill drew tokens the next step reports.
+        self._drawn: dict[int, tuple[list[int], list[float], bool]] = {}
+        self._next_row = 0
+        self.usable = True
+        self._stack = ExitStack()
+        self._stack.enter_context(adapter._wired_limit())
+
+    @property
+    def rows_in_flight(self) -> int:
+        return len(self._pending)
+
+    def add(self, request: GenerationRequest) -> int:
+        from .speculative import EngineRow
+
+        adapter = self.adapter
+        if request.audio is not None:
+            raise BatchRowRefused("An audio request decodes on its own and cannot join a batch; generate it with generate_batch or stream_batch.")
+        request = adapter._decode_image(request)
+        inputs = adapter.prepare_inputs(
+            adapter.processor,
+            images = None if request.image is None else [request.image],
+            audio = None,
+            prompts = [request.prompt],
+            image_token_index = getattr(getattr(adapter.model, "config", None), "image_token_index", None),
+            resize_shape = None,
+            add_special_tokens = adapter._add_special_tokens(),
+            pad_to_uniform_size = False,
+        )
+        input_ids, mask = inputs["input_ids"], inputs.get("attention_mask")
+        extra = {key: value for key, value in inputs.items() if key not in ("input_ids", "pixel_values", "attention_mask")}
+        row = self._next_row
+        pending = EngineRow(
+            cache = None, pending = 0, prompt = input_ids[0].tolist(), sampling = request.sampling or adapter.defaults.sampling,
+            max_tokens = int(request.max_tokens or adapter.defaults.max_tokens), stop_tokens = self.stop_tokens,
+            processors = _row_processors(request), uid = row,
+        )
+        prefix = self._resume(request.prompt_cache_state, pending.prompt, input_ids, mask, extra)
+        state = _PendingResult(
+            detokenizer = _new_detokenizer(self.tokenizer, require_independent = True),
+            scanner = _StopStringScanner(adapter.defaults.stop_strings),
+            prompt_token_count = len(pending.prompt),
+            cached_token_count = prefix,
+        )
+        # The engine row keeps the whole prompt, for copies and the drafter; only the forward starts past the prefix.
+        with self._embedded(len(pending.prompt) - prefix):
+            admitted, logprob = self.speculative.admit(adapter.model, pending, input_ids[:, prefix:], None if prefix else inputs.get("pixel_values"), mask, **extra)
+        finished = admitted.pending in self.stop_tokens or admitted.max_tokens == 1
+        if not finished:
+            try:
+                self.engine.add(admitted)
+            except BaseException:
+                self.usable = False
+                raise
+        self._next_row += 1
+        self._pending[row] = state
+        self._drawn[row] = ([admitted.pending], [logprob], finished)
+        return row
+
+    def _resume(self, state, prompt: list[int], input_ids, mask, extra: dict) -> int:
+        """Open the row's own prompt cache into ``extra`` as ``generate_step`` takes it, and return
+        the prefix it already holds. Position metadata is derived from the whole prompt first, as
+        mlx-vlm does before it trims a cached prefix."""
+        if state is None:
+            return 0
+        cache, lengths = state.open(list(prompt))
+        cache = list(cache)
+        if any(isinstance(entry, _quantized_cache_types()) for entry in cache):
+            raise BatchRowRefused("This request's prompt cache is quantized; speculative batches run on full-precision KV caches.")
+        prefix = _cache_offset(cache)
+        if prefix is None:
+            raise BatchRowRefused("This request's prompt cache holds no offset to resume from.")
+        if prefix >= len(prompt):
+            raise BatchRowRefused(
+                f"This request's prompt cache holds {prefix} of its {len(prompt)} prompt tokens; at least the last one must be prefilled."
+            )
+        media = _media_token_ids(getattr(self.adapter.model, "config", None))
+        if prefix:
+            if any(token in media for token in prompt[prefix:]):
+                raise BatchRowRefused("This request's prompt cache ends before its media tokens; a resumed row prefills text only.")
+            from mlx_vlm.generate.dispatch import _prime_cached_prefix_rope_state
+
+            if not _prime_cached_prefix_rope_state(self.adapter.model, input_ids, mask, extra):
+                raise BatchRowRefused("This request's positions past its cached prefix could not be derived.")
+        extra.update(
+            prompt_cache = cache,
+            # A checkpoint counts embedding columns, which the tokens name only while media stays within its placeholders.
+            prompt_cache_checkpoint = lambda done, entries: self._addressed and state.checkpoint(prefix + done, entries),
+            prompt_cache_checkpoint_lengths = [length - prefix for length in lengths],
+        )
+        return prefix
+
+    @contextmanager
+    def _embedded(self, tokens: int):
+        """Note whether the prompt ``generate_step`` embeds has one column per token."""
+        model = self.adapter.model
+        embed, own = model.get_input_embeddings, vars(model).get("get_input_embeddings")
+
+        def counted(*args, **kwargs):
+            out = embed(*args, **kwargs)
+            self._addressed = out.inputs_embeds.shape[1] == tokens
+            return out
+
+        model.get_input_embeddings = counted
+        try:
+            yield
+        finally:
+            # An instance override that was already there (the audio merge patch) goes back.
+            if own is None:
+                del model.get_input_embeddings
+            else:
+                model.get_input_embeddings = own
+
+    def cancel(self, row: int) -> bool:
+        return self._take_back(row) is not None
+
+    def withdraw(self, row: int) -> GenerationResult | None:
+        state = self._take_back(row)
+        return None if state is None else _cancelled_result(self.tokenizer, state)
+
+    def _take_back(self, row: int) -> "_PendingResult | None":
+        state = self._pending.pop(row, None)
+        if state is None:
+            return None
+        self._drawn.pop(row, None)
+        if row in self.engine.rows:
+            try:
+                self.engine.remove(row)
+            except BaseException:
+                self.usable = False
+                raise
+        return state
+
+    def step(self, waiting = None) -> Iterator[GenerationEvent]:
+        try:
+            drawn, self._drawn = self._drawn, {}
+            for row, (tokens, logprobs, finished) in drawn.items():
+                yield from self._consume(row, tokens, logprobs, finished)
+            for out in self.engine.step(waiting):
+                state = self._pending.get(out.uid)
+                if state is not None:
+                    state.draft_tokens, state.accepted_draft_tokens = out.draft_n, out.draft_n_accepted
+                yield from self._consume(out.uid, out.tokens, out.logprobs, out.finished)
+        except BaseException:
+            self.usable = False
+            raise
+
+    def close(self):
+        self.engine = None
+        self._pending.clear()
+        self._drawn.clear()
+        self._stack.close()
+
+    def _consume(self, row: int, tokens: list[int], logprobs: list[float], finished: bool) -> Iterator[GenerationEvent]:
+        state = self._pending.get(row)
+        if state is None:
+            return
+        for i, (token, logprob) in enumerate(zip(tokens, logprobs)):
+            if finished and i == len(tokens) - 1:
+                # The last token of a finished row ends it as mlx-vlm's batch reports it: a stop token is not text.
+                if token not in self.stop_tokens:
+                    state.add_terminal(token, logprob)
+                state.finish(self.tokenizer, "stop" if token in self.stop_tokens else "length")
+                yield from _finished_events(row, state, self.tokenizer)
+                del self._pending[row]
+                return
+            # BatchStream refuses stop strings, so appending never ends the row.
+            state.append(self.tokenizer, token, logprob)
+            yield from _text_events(row, state)
+
+
 def _stream_setup(model, tokenizer, defaults: GenerationDefaults):
     """What a stream settles before it takes anything: vision or not, and the adapter."""
     if bool(getattr(model, "_is_vlm_model", False)):
@@ -3557,6 +3752,9 @@ class BatchStream:
     sorts its unprocessed prompts shortest-first on every insert, so a long vision
     prompt waits behind shorter ones that arrived after it. Rows already decoding are
     unaffected either way.
+
+    With ``speculative`` (a ``SpeculativeDraft``), each row prefills alone as it joins and the
+    batch decodes through the speculative engine, which verifies every row's drafts together.
     """
 
     def __init__(
@@ -3565,6 +3763,7 @@ class BatchStream:
         tokenizer,
         *,
         defaults: GenerationDefaults | None = None,
+        speculative = None,
     ):
         if defaults is None:
             defaults = GenerationDefaults()
@@ -3572,16 +3771,19 @@ class BatchStream:
             raise TypeError("defaults must be GenerationDefaults.")
         _install_arrays_cache_advance_fix()
         is_vlm, adapter = _stream_setup(model, tokenizer, defaults)
+        if speculative is not None and not is_vlm:
+            raise ValueError("Speculative batches decode models loaded through mlx-vlm.")
         self._stack = ExitStack()
         self._session = None
         self._is_vlm = is_vlm
-        self._closed = False
+        self._closed = self._stepping = False
         self._owner = (threading.get_ident(), _current_async_task())
         try:
             self._stack.enter_context(generation_mode(model))
             self._stack.enter_context(_generation_cache_hygiene())
             self._session = (
-                _VLMBatchSession(adapter) if is_vlm else _TextBatchSession(adapter)
+                _SpeculativeBatchSession(adapter, speculative) if speculative is not None
+                else _VLMBatchSession(adapter) if is_vlm else _TextBatchSession(adapter)
             )
             self._stack.callback(self._session.close)
         except BaseException as active_error:
@@ -3625,9 +3827,22 @@ class BatchStream:
         """
         return self._require_open().withdraw(row)
 
-    def step(self) -> list[GenerationEvent]:
-        """What the batch produced in one decode step."""
-        return list(self._require_open().step())
+    def step(self, waiting: Callable[[], bool] | None = None) -> list[GenerationEvent]:
+        """What the batch produced in one decode step; a speculative batch's many-token step ends once ``waiting()`` is true."""
+        return list(self.iter_step(waiting))
+
+    def iter_step(self, waiting: Callable[[], bool] | None = None) -> Iterator[GenerationEvent]:
+        """``step``, each event as it is produced. The batch cannot change until it is exhausted."""
+        session = self._require_open()
+        self._stepping = True
+        try:
+            for event in session.step(waiting):
+                yield event
+                self._require_owner()
+                if self._closed:
+                    return
+        finally:
+            self._stepping = False
 
     def close(self) -> None:
         """Release the batch and the generation lock. Safe to call twice."""
@@ -3671,6 +3886,8 @@ class BatchStream:
         if self._session is None:
             raise RuntimeError("This BatchStream is closed.")
         self._require_owner()
+        if self._stepping:
+            raise RuntimeError("This BatchStream is mid-step; consume its events before changing the batch.")
         if not self._session.usable:
             raise RuntimeError(
                 "This BatchStream holds a batch neither it nor the engine can "
