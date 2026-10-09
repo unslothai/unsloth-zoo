@@ -481,6 +481,33 @@ except:
     torch_compiler_set_stance = None
 pass
 
+# The stance is process wide, so whether Unsloth owns it lives in unsloth_zoo, shared by
+# every generated module: inference in one model's module, training in another's.
+from unsloth_zoo.temporary_patches.utils import UNSLOTH_EAGER_STANCE_OWNED, unsloth_claim_eager_stance, unsloth_owns_stance, unsloth_release_stance
+
+def unsloth_training_stance():
+    # eager_on_recompile is global: left on by generate() or eval forwards, every recompile
+    # in a later training step (new sequence length, model.train() without for_training)
+    # would silently run the eager body. Training forwards restore the default stance,
+    # unless the user chose eager_on_recompile themselves. Every set_stance call installs a
+    # fresh stance object, so ours is still active only if the current one `is` it; a user
+    # set_stance since then (even to eager_on_recompile again) is theirs and stays.
+    global INFERENCE_RUNS
+    INFERENCE_RUNS = 0
+    if len(UNSLOTH_EAGER_STANCE_OWNED) != 0 and torch_dynamo_eval_frame is not None:
+        current = torch_dynamo_eval_frame._stance
+        # Ownership is only dropped once ours is reset: a temporary stance scope's exit restores
+        # one of our exact objects, which a later training forward must still recognise.
+        if current.stance == "eager_on_recompile" and unsloth_owns_stance(current):
+            # Only the reset object: an outer scope may still restore another one of ours.
+            # Put back what the caller had before Unsloth switched (force_eager, a backend, ...).
+            previous = unsloth_release_stance(current)
+            if previous is not None and hasattr(torch_dynamo_eval_frame, "_set_stance"):
+                torch_dynamo_eval_frame._set_stance(previous)
+            else:
+                torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = False)
+pass
+
 from unsloth_zoo import DEVICE_TYPE_TORCH, DEVICE_COUNT
 from unsloth_zoo.temporary_patches.utils import UNSLOTH_DECODE_COMPILE
 """
@@ -3146,7 +3173,13 @@ __DYNAMO__RECOMPILING__ = """
             old_stance = None
         if old_stance is not None and INFERENCE_RUNS == 1:
             # Skip guards and return to eager -> we still need guards!
-            torch_compiler_set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = False)
+            # Already eager (another model's inference, or the user's choice): leave that stance
+            # object, and so its ownership, as it is. Otherwise switch and claim the new object.
+            if old_stance != "eager_on_recompile":
+                previous = getattr(torch_dynamo_eval_frame, "_stance", None)
+                torch_compiler_set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = False)
+                # The stance object itself, or True where torch keeps no such object.
+                unsloth_claim_eager_stance(getattr(torch_dynamo_eval_frame, "_stance", True), previous)
             if UNSLOTH_ENABLE_LOGGING:
                 logger_compiler.info(
                     f"Unsloth: Removing compiler guards after 1 inference run. "\\
@@ -3167,6 +3200,41 @@ __DYNAMO__RECOMPILING__ = """
             INFERENCE_RUNS = 0
         INFERENCE_RUNS += 1
 """
+
+# is_compiling() first: Dynamo folds it to True, so traced forwards skip the call.
+__DYNAMO__TRAINING_STANCE__ = """if not torch.compiler.is_compiling() and torch.is_grad_enabled() and getattr(self, "training", False):
+    unsloth_training_stance()"""
+
+_TRAINING_STANCE_MARKER = "__UNSLOTH_TRAINING_STANCE_MARKER__"
+_TRAINING_STANCE_MARKER_LINE = re.compile(r"^([ \t]*)" + _TRAINING_STANCE_MARKER + r"[ \t]*\n", re.MULTILINE)
+
+
+def _place_training_stance(forward):
+    """Reset at forward entry: at the logits site the decoder body already ran eager."""
+    def at_marker(match):
+        return textwrap.indent(__DYNAMO__TRAINING_STANCE__, match.group(1)) + "\n"
+    try:
+        dedented = textwrap.dedent(forward)
+        tree = ast.parse(dedented)
+        function = next(x for x in tree.body if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef)))
+        body = function.body
+        first = body[0]
+        if isinstance(first, ast.Expr) and isinstance(getattr(first, "value", None), ast.Constant) \
+            and isinstance(first.value.value, str):
+            first = body[1]  # after the docstring
+        lines = forward.split("\n")
+        line = lines[first.lineno - 1]
+        indent = line[: len(line) - len(line.lstrip())]
+        shift = len(line) - len(dedented.split("\n")[first.lineno - 1])
+        if first.lineno == function.lineno or first.col_offset + shift != len(indent) or not indent:
+            raise ValueError("forward body does not start on its own line")
+        lines.insert(first.lineno - 1, textwrap.indent(__DYNAMO__TRAINING_STANCE__, indent))
+        placed = "\n".join(lines)
+        placed = _TRAINING_STANCE_MARKER_LINE.sub("", placed)
+        ast.parse(textwrap.dedent(placed))
+        return placed
+    except Exception:
+        return _TRAINING_STANCE_MARKER_LINE.sub(at_marker, forward)
 
 # Replace Cross Entropy cells with fused linear lm heads
 cross_entropy_find_1 = """
@@ -3216,6 +3284,7 @@ pass
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
+__UNSLOTH_TRAINING_STANCE_MARKER__
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
@@ -3310,6 +3379,7 @@ pass
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
+__UNSLOTH_TRAINING_STANCE_MARKER__
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
@@ -3433,6 +3503,7 @@ pass
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
+__UNSLOTH_TRAINING_STANCE_MARKER__
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
@@ -3907,6 +3978,7 @@ def _apply_fused_lm_head(forward, module=None):
         forward = forward.replace(", **)", ", **unsloth_loss_count_kwargs(self.loss_function, n_items))")
         forward = forward.replace(",**)", ", **unsloth_loss_count_kwargs(self.loss_function, n_items))")
         forward = forward.replace(",** )", ", **unsloth_loss_count_kwargs(self.loss_function, n_items))")
+        forward = _place_training_stance(forward)
         # print(forward)
         return forward, True
     pass
