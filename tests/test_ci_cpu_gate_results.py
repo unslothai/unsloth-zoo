@@ -19,7 +19,9 @@
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
+import time
 
 import pytest
 import yaml
@@ -31,13 +33,13 @@ WORKFLOW = (
 pytestmark = pytest.mark.skipif(not shutil.which("bash"), reason = "requires bash")
 
 
-def run_gates(tmp_path, failing = "", barrier = False):
+def step_script(name):
     steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["repo-tests-cpu"]["steps"]
-    script = next(
-        s["run"]
-        for s in steps
-        if s.get("name") == "pytest CPU gates (two process lanes)"
-    )
+    return next(s["run"] for s in steps if s.get("name") == name)
+
+
+def run_gates(tmp_path, failing = "", barrier = False):
+    script = step_script("pytest CPU gates (two process lanes)")
     # Stubs only the child pytest calls; waiting, logs and exit codes run as the real workflow shell.
     stub = r"""
 python() {
@@ -56,6 +58,9 @@ python() {
       [ -e "$RUNNER_TEMP/$peer" ] || return 9
     fi
   fi
+  if [ "$FAIL_FILE" = hang ] && [[ "$*" == *tests/test_ci_cpu_gate_results.py* ]]; then
+    sleep 60
+  fi
   if [ "$FAIL_FILE" = crash ] && [[ "$*" == *tests/test_ci_cpu_gate_results.py* ]]; then
     kill -TERM "$BASHPID"
   fi
@@ -64,14 +69,42 @@ python() {
   fi
 }
 """
-    return subprocess.run(
+    env = {
+        **os.environ,
+        "RUNNER_TEMP": str(tmp_path),
+        "FAIL_FILE": failing,
+        "BARRIER": str(int(barrier)),
+    }
+    if failing != "hang":
+        return subprocess.run(
+            ["bash", "-c", stub + script],
+            env = env,
+            capture_output = True,
+            text = True,
+            timeout = 15,
+        )
+    # Stand-in for the step timeout: kill the whole step once the other lane is done.
+    proc = subprocess.Popen(
         ["bash", "-c", stub + script],
-        env = {
-            **os.environ,
-            "RUNNER_TEMP": str(tmp_path),
-            "FAIL_FILE": failing,
-            "BARRIER": str(int(barrier)),
-        },
+        env = env,
+        stdout = subprocess.DEVNULL,
+        stderr = subprocess.DEVNULL,
+        start_new_session = True,
+    )
+    try:
+        for _ in range(500):
+            if (tmp_path / "zoo-cpu-gates" / "cpu-advisory.status").exists():
+                break
+            time.sleep(0.02)
+    finally:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+
+
+def print_logs_after_timeout(tmp_path):
+    return subprocess.run(
+        ["bash", "-c", step_script("Print CPU gate logs after a step timeout")],
+        env = {**os.environ, "RUNNER_TEMP": str(tmp_path)},
         capture_output = True,
         text = True,
         timeout = 15,
@@ -114,3 +147,19 @@ def test_missing_result_after_a_lane_crash_is_a_failure(tmp_path):
     assert result.returncode == 1, result.stdout + result.stderr
     assert "::error::behavioral exited missing" in result.stdout
     assert result.stdout.count("executed -m pytest") == 8
+
+
+def test_lane_logs_survive_a_step_timeout(tmp_path):
+    run_gates(tmp_path, "hang")
+    assert not (tmp_path / "zoo-cpu-gates" / ".reported").exists()
+    result = print_logs_after_timeout(tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "executed -m pytest tests/test_ci_cpu_gate_results.py" in result.stdout
+    assert result.stdout.count("executed -m pytest") == 8
+
+
+def test_logs_are_not_printed_twice(tmp_path):
+    run_gates(tmp_path, "tests/security")
+    result = print_logs_after_timeout(tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout == ""

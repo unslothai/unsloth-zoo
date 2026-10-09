@@ -260,6 +260,9 @@ jobs:
           cache-hit: ${{ steps.pip-cache.outputs.cache-hit }}
 
       - name: pytest CPU gates (two process lanes)
+        id: cpu-gates
+        # Under the job's 20: a hung test fails this step, and the next step still prints the lane logs.
+        timeout-minutes: 15
         # Deterministic, CPU-pure, sub-second files executed as a gate.
         # test_mlx_finetune_last_n_layers was born broken in #669 and stayed
         # invisible until #739 because no job executed it (collect-only plus
@@ -426,7 +429,8 @@ jobs:
         # and the security network blocker would break the advisory PyPI test.
         run: |
           set -euo pipefail
-          logs=$(mktemp -d "$RUNNER_TEMP/zoo-cpu-gates.XXXXXX")
+          logs="$RUNNER_TEMP/zoo-cpu-gates"
+          mkdir -p "$logs"
           run_gate() {
             local name=$1 rc=0
             shift
@@ -564,7 +568,20 @@ jobs:
             fi
             echo "::endgroup::"
           done
+          : > "$logs/.reported"
           exit "$failed"
+
+      - name: Print CPU gate logs after a step timeout
+        if: ${{ failure() && steps.cpu-gates.outcome == 'failure' }}
+        run: |
+          logs="$RUNNER_TEMP/zoo-cpu-gates"
+          [ ! -e "$logs/.reported" ] || exit 0
+          for log in "$logs"/*.log; do
+            [ -e "$log" ] || continue
+            echo "::group::$(basename "$log" .log)"
+            cat "$log"
+            echo "::endgroup::"
+          done
 
   # Real MLX numerics on Linux. mlx-cpu publishes a manylinux x86-64 wheel and
   # mx.quantize/dequantize/compile all run on it, so the 8-bit optimizer state
