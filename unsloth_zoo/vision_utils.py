@@ -1044,6 +1044,63 @@ def collapse_fps(fps, tol=1e-4):
     return float(f0) if all(math.isclose(v, f0, rel_tol=tol, abs_tol=tol) for v in vals[1:]) else vals
 
 
+def _video_metadata_support():
+    """(processor accepts video_metadata, rate is read from it rather than from fps=)."""
+    try:
+        from transformers.processing_utils import VideosKwargs
+        from transformers.video_utils import VideoMetadata
+    except Exception:
+        return False, False
+    takes = "video_metadata" in getattr(VideosKwargs, "__annotations__", {})
+    return takes, takes and hasattr(VideoMetadata, "sampled_fps")
+
+_PROCESSOR_TAKES_VIDEO_METADATA, _VIDEO_RATE_FROM_METADATA = _video_metadata_support()
+
+
+def video_processor_kwargs(processor, videos, fps):
+    """(videos, processor kwargs) carrying each video's sampling rate.
+
+    `videos` is one list of decoded videos per example (frames tensor or list of frames), `fps`
+    the matching flat list of sample rates. transformers 5 ignores `fps=` here and reads the rate
+    from `video_metadata` (else assumes 24 fps), which collapses Qwen2.5-VL temporal positions and
+    makes Qwen3-VL drop most frames; a list `fps=` is rejected outright.
+    Fixed-count samplers (Gemma 4, `num_frames=32`) cannot sample a shorter clip, so frames are
+    subsampled here instead and the processor told not to resample.
+    """
+    flat = [v for per_example in videos for v in per_example]
+    fps = list(fps) if isinstance(fps, (list, tuple)) else ([fps] * len(flat) if fps is not None else [])
+    if not _PROCESSOR_TAKES_VIDEO_METADATA or len(fps) != len(flat):
+        return videos, {"fps": collapse_fps(fps)}
+    video_processor = getattr(processor, "video_processor", None)
+    cap = getattr(video_processor, "num_frames", None) if getattr(video_processor, "do_sample_frames", False) else None
+    metadata, new_videos, i = [], [], 0
+    for per_example in videos:
+        kept = []
+        for video in per_example:
+            n = int(video.shape[0]) if hasattr(video, "shape") else len(video)
+            indices = list(range(n))
+            if cap and n > cap:
+                indices = torch.linspace(0, n - 1, cap).round().long().tolist()
+                video = video[indices] if hasattr(video, "shape") else [video[j] for j in indices]
+            rate = float(fps[i])
+            i += 1
+            metadata.append({
+                "total_num_frames": n,
+                "fps": rate,
+                "duration": n / rate if rate > 0 else None,
+                "frames_indices": indices,
+            })
+            kept.append(video)
+        new_videos.append(kept)
+    kwargs = {"video_metadata": metadata}
+    if not _VIDEO_RATE_FROM_METADATA:
+        # transformers 4.x Qwen2.5-VL still takes the rate from fps= and ignores the metadata
+        kwargs["fps"] = collapse_fps(fps)
+    if cap:
+        kwargs["do_sample_frames"] = False
+    return new_videos, kwargs
+
+
 def extract_vision_info(conversations: Union[List[Dict], List[List[Dict]]]) -> List[Dict]:
     vision_infos = []
     if len(conversations) == 0:
@@ -1835,10 +1892,9 @@ class UnslothVisionDataCollator:
         if has_images:
             proc_kwargs["images"] = images
         if videos:
+            videos, extra = video_processor_kwargs(self.processor, videos, video_kwargs["fps"])
             proc_kwargs["videos"] = videos
-            video_kwargs["fps"] = collapse_fps(video_kwargs['fps'])
-            for k, v in video_kwargs.items():
-                proc_kwargs[k] = v
+            proc_kwargs.update(extra)
         if audios:
             proc_kwargs[getattr(self, "audio_call_kwarg", "audio")] = audios
         if self.pad_to_multiple_of is not None:
@@ -2468,10 +2524,9 @@ class UnslothVisionDataCollator:
         if pc_has_images:
             prompt_kwargs["images"] = images
         if len(videos) > 0:
+            videos, extra = video_processor_kwargs(self.processor, videos, video_kwargs["fps"])
             prompt_kwargs["videos"] = videos
-            video_kwargs["fps"] = collapse_fps(video_kwargs['fps'])
-            for k, v in video_kwargs.items():
-                prompt_kwargs[k] = v
+            prompt_kwargs.update(extra)
         if audios:
             prompt_kwargs[getattr(self, "audio_call_kwarg", "audio")] = audios
 
