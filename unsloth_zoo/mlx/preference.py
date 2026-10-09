@@ -700,13 +700,27 @@ def _media_in(messages, what):
 
 def _vision_prompt_images(row, image_size):
     """The prompt's images, refusing media the CUDA path would not condition on."""
-    columns = [row.get(key) for key in ("audio", "audios")]
+    filled = lambda *keys: any(
+        row.get(key) is not None and (not isinstance(row[key], list) or row[key])
+        for key in keys
+    )
     if (
-        any(value is not None and (not isinstance(value, list) or value) for value in columns)
+        filled("audio", "audios")
         or any(_media_in(row[key], "audio") for key in ("prompt", "chosen", "rejected"))
     ):
         raise ValueError(
             "Unsloth MLX preference: audio rows are not supported for preference "
+            "training."
+        )
+    if filled("video", "videos") or any(
+        isinstance(part, dict) and (part.get("type") == "video" or "video" in part)
+        for key in ("prompt", "chosen", "rejected") if _is_messages(row[key])
+        for message in _normalize_mlx_messages(row[key], is_vlm=True)
+        if isinstance(message.get("content"), list)
+        for part in message["content"]
+    ):
+        raise ValueError(
+            "Unsloth MLX preference: video rows are not supported for preference "
             "training."
         )
     if any(_media_in(row[key], "image") for key in ("chosen", "rejected")):
