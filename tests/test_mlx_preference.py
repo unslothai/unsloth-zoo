@@ -2863,6 +2863,8 @@ def test_a_vision_plan_repeats_the_pixels_for_both_branches():
         {"type": "input_video", "input_video": "clip.mp4"}]}]), "video rows"),
     ("dpo", vision_row(rejected=[{"role": "assistant", "content": [{"type": "image"}]}]),
      "belong to the prompt"),
+    ("dpo", {**rows(1)[0], "image_url": "cat.png"}, "does not place"),
+    ("orpo", {**rows(1)[0], "pixel_values": [[1.0]]}, "does not place"),
 ])
 def test_vision_rows_refuse_media_the_cuda_path_does_not_condition_on(kind, row, message):
     from unsloth_zoo.mlx.preference import tokenize_vision_preference_row

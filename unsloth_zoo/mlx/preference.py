@@ -700,6 +700,7 @@ def _media_in(messages, what):
 
 
 _VIDEO_KEYS = ("video", "videos", "video_url", "input_video", "pixel_values_videos")
+_IMAGE_KEYS = ("image", "images", "image_url", "input_image", "pixel_values")
 
 
 def _vision_prompt_images(row, image_size):
@@ -738,7 +739,14 @@ def _vision_prompt_images(row, image_size):
     messages = (
         _normalize_mlx_messages(prompt, is_vlm=True) if _is_messages(prompt) else []
     )
-    return tuple(_extract_vlm_images(row, messages, image_size))
+    images = tuple(_extract_vlm_images(row, messages, image_size))
+    if not images and filled(row, *_IMAGE_KEYS):
+        raise ValueError(
+            "Unsloth MLX preference: this row carries an image its prompt does not "
+            "place, so it would train as text. Pass images under `images` with an "
+            "image part in the prompt."
+        )
+    return images
 
 
 def tokenize_vision_preference_row(
