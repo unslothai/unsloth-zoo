@@ -146,7 +146,6 @@ def _build_kernels():
         o_t = i_t * BT + tl.arange(0, BT)
         o_d = i_d * BD + tl.arange(0, BD)
         m_d = o_d < D
-        # int64: channel-first x / dy has stride_d = T, and (D - 1) * T can pass 2**31.
         o_d64 = o_d.to(tl.int64)
         p_x = x + tl.cast(i_b, tl.int64) * stride_x_b
         p_dy = dy + tl.cast(i_b, tl.int64) * stride_dy_b
@@ -163,7 +162,6 @@ def _build_kernels():
                 mask = m_r[:, None] & m_d[None, :], other = 0,
             ).to(tl.float32)
             if ACTIVATION:
-                # Recompute the pre-activation for rows r_t.
                 b_pre = tl.zeros((BT, BD), dtype = tl.float32)
                 for j in tl.static_range(W):
                     s_t = r_t - (W - 1) + j
@@ -289,7 +287,6 @@ class _CausalConv1dFunction(torch.autograd.Function):
 
 
 def _act(activation):
-    # Same mapping as the torch path it replaces (the layer's configured hidden_act).
     from transformers.activations import ACT2FN
     return ACT2FN[activation]
 
@@ -308,7 +305,6 @@ def causal_conv1d_reference(x, weight, bias = None, activation = None):
 
 
 def _eligible(x, weight, bias, activation):
-    # The patch only installs on CUDA (not ROCm) with triton importable.
     if not (
         x.is_cuda and x.dim() == 3 and x.numel() > 0 and x.dtype in _SUPPORTED_DTYPES
         and weight.dim() == 2 and weight.dtype == x.dtype and weight.device == x.device
