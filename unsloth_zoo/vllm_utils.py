@@ -4030,7 +4030,7 @@ def _live_lora_config(model, save_directory):
     """Live config, written once per process: a stale adapter_config.json means wrong r / lora_alpha (#2097)."""
     # All Unsloth Zoo code licensed under LGPLv3
     config = model.peft_config["default"]
-    # Raw path as key, no os.path.abspath (a getcwd syscall per GRPO step): the dict returned is the live config either way.
+    # Raw path key: os.path.abspath would cost a getcwd syscall per GRPO step.
     cached = _LIVE_LORA_CONFIGS.get(save_directory)
     if cached is None or cached[0] is not config:
         config.save_pretrained(save_directory)
