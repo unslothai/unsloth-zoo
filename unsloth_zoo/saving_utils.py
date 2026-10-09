@@ -3794,14 +3794,16 @@ def _copy_export_remote_code(model_name, save_directory, token, model):
 pass
 
 
-def _source_config_model_type(model_name, token = None):
+def _source_config_model_type(model_name, token = None, commit = None):
+    # `commit`: the loaded Hub commit, so a branch that moved since the load is not mixed in.
     try:
         if os.path.isdir(str(model_name)):
             path = os.path.join(str(model_name), "config.json")
         else:
             from huggingface_hub import hf_hub_download
             repo_id, revision = _hub_repo_and_revision(model_name)
-            path = hf_hub_download(repo_id = repo_id, filename = "config.json", token = token, revision = revision)
+            path = hf_hub_download(repo_id = repo_id, filename = "config.json", token = token,
+                                   revision = revision or commit)
         with open(path, "r", encoding = "utf-8") as f:
             model_type = json.load(f).get("model_type")
     except Exception:
@@ -5050,7 +5052,10 @@ def merge_and_overwrite_lora(
         else:
             _carry_over_vocab_size(base_config, config)
         # Read before saving: an in-place export overwrites the source config.json.
-        source_model_type = _source_config_model_type(model_name, token) if _is_remote_code_config(base_config) else None
+        source_model_type = None
+        if _is_remote_code_config(base_config):
+            loaded_commit = _trusted_code_commit(model) if _is_export_source_loaded_repo(model_name, model) else None
+            source_model_type = _source_config_model_type(model_name, token, loaded_commit)
         base_config.save_pretrained(save_directory)
         if _is_remote_code_config(base_config):
             _restore_source_model_type(Path(save_directory) / "config.json", source_model_type)

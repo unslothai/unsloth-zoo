@@ -316,3 +316,16 @@ def test_pinned_revision_applies_to_same_repo_code_only():
     from transformers import dynamic_module_utils as D
     src = inspect.getsource(D.get_class_from_dynamic_module)
     assert "if code_revision is None and pretrained_model_name_or_path == repo_id:" in src
+
+
+def test_hub_model_type_is_read_at_the_loaded_commit(monkeypatch, tmp_path):
+    import huggingface_hub
+    from unsloth_zoo import saving_utils as S
+    config = os.path.join(str(tmp_path), "config.json")
+    json.dump({"model_type": "tiny_vl_zoo"}, open(config, "w"))
+    asked = []
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download",
+                        lambda **kw: asked.append(kw["revision"]) or config)
+    assert S._source_config_model_type("org/repo", None, "abc123") == "tiny_vl_zoo"
+    assert S._source_config_model_type("org/repo@dev", None, "abc123") == "tiny_vl_zoo"
+    assert asked == ["abc123", "dev"]
