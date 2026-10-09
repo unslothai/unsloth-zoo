@@ -2855,4 +2855,5 @@ def test_dpo_trains_and_evaluates_image_rows_on_a_vision_language_model(monkeypa
     run.args.generate_during_eval, run.args.include_num_input_tokens_seen = False, "non_padding"
     assert _run_generation_trainer(run, monkeypatch, [])["train_steps"] == 1 and sum(Model.pixels) == 2
     guard, tokens = run._compile_shape_guard_report, run.state.num_input_tokens_seen
-    assert (guard.action, guard.reason) == ("eager", "vision_preference") and tokens > 0
+    assert (guard.action, guard.reason) == ("not_applicable", "vlm_compile_unqualified")
+    assert tokens > 0 and run._compile_decision is not None

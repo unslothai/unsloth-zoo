@@ -39,15 +39,20 @@ from .utils import (
     _normalize_mlx_messages,
     _normalize_seed,
     _prepare_vlm_batch_for_compile,
+    _preserved_preprocessing_rng,
     _processor_vlm_inputs,
     _render_vlm_messages,
     _to_mx_vlm_batch,
     _torch_randperm_order,
     _vlm_audio_part_state,
+    _vlm_batch_family,
+    _vlm_family_divergence,
     _vlm_forward_logits,
     _vlm_hidden_states,
+    _vlm_pipeline_disposable_keys,
     _vlm_token_aligned_sidecars,
     _vlm_vision_part_state,
+    _vlm_width_survey,
     collect_mlx_lora_adapter_tensors,
     encode_mlx_text,
     is_mlx_dora_module,
@@ -1012,7 +1017,7 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
         width = self._widths[index]
         if self._shape_plan is not None and phase is not None:
             family = self.batch_family(index)
-            width = self._shape_plan.endpoint_for(family, width)
+            width = self._shape_plan.endpoint_for(family, self.batch_width(index))
         batch, lengths = _pack_rows(rows, width, self.pad_id)
         materialized = (
             self._inputs(rows, batch, lengths), mx.array(lengths),
@@ -1039,15 +1044,74 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
 class FiniteVisionPreferenceBatchPlan(FinitePreferenceBatchPlan):
     """Preference plan whose batches carry the processor's vision inputs."""
 
-    __slots__ = ("_processor", "_model_config")
+    __slots__ = ("_processor", "_model_config", "_families", "_event_widths")
 
     def __init__(self, rows, schedule, *, processor, model_config, **kwargs):
         super().__init__(rows, schedule, **kwargs)
         self._processor = processor
         self._model_config = model_config
+        self._families = self._event_widths = None
 
     def _inputs(self, rows, batch, lengths):
         return _vision_batch(self._processor, self._model_config, rows, batch, lengths)
+
+    def _survey(self, inputs):
+        _width, axes, padable, forbidden = _vlm_width_survey(
+            inputs, disposable_keys=_vlm_pipeline_disposable_keys(self._model_config),
+        )
+        family = _vlm_batch_family(inputs, symbolic_axes=axes if padable else None)
+        return family, padable, forbidden
+
+    def ensure_descriptors(self):
+        """Survey every batch's compile-key family once, as the vision SFT plan does."""
+        if self._families is not None:
+            return
+        surveyed = []
+        with _preserved_preprocessing_rng():
+            for index, indices in enumerate(self._schedule):
+                rows = [self._rows[item] for item in indices]
+                packed = _pack_rows(rows, self._widths[index], self.pad_id)
+                surveyed.append(self._survey(self._inputs(rows, *packed)))
+        forbidden = set().union(*(extents for _family, _padable, extents in surveyed))
+        widths = []
+        for width, (_family, padable, _extents) in zip(self._widths, surveyed):
+            # A text width equal to an extent of an array padding leaves alone
+            # would reclassify the batch.
+            while padable and width in forbidden:
+                width += 1
+            widths.append(width)
+        self._families = tuple(family for family, _padable, _extents in surveyed)
+        self._event_widths = tuple(widths)
+
+    def batch_width(self, index):
+        return (self._event_widths or self._widths)[index]
+
+    def batch_family(self, index):
+        family = super().batch_family(index)
+        return family if self._families is None else (*family, self._families[index])
+
+    def materialize(self, index, *, phase=None):
+        planned = self._shape_plan is not None and phase is not None
+        if planned and not self._shape_plan.allows(
+            self.batch_family(index), self.batch_width(index), phase,
+        ):
+            raise RuntimeError(
+                "Unsloth MLX preference: compiled batch signature was not "
+                "admitted by the finite shape plan."
+            )
+        materialized = super().materialize(index, phase=phase)
+        if planned:
+            divergence = _vlm_family_divergence(
+                self._families[index], self._survey(materialized[0])[0],
+            )
+            if divergence is not None:
+                raise RuntimeError(
+                    f"Unsloth MLX preference: batch {index} drifted from its "
+                    f"surveyed compile family ({divergence}). The processor must "
+                    "produce structurally identical batches on every visit; "
+                    "train this pipeline with compile disabled."
+                )
+        return materialized
 
 
 def _preference_width(rows, max_seq_length):

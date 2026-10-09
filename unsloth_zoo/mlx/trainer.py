@@ -2265,20 +2265,30 @@ def _plan_single_process_text_shapes(
     configured_cap = getattr(args, "compile_max_variants", None)
     automatic = configured_cap is None
     cap = resolve_compile_max_variants(configured_cap)
-    if isinstance(batches, FiniteVisionPreferenceBatchPlan):
+    vision_preference = isinstance(batches, FiniteVisionPreferenceBatchPlan)
+    strict = compile_policy.mode == "strict"
+    if vision_preference:
+        # The vision SFT planner's gates; the trainer reports an unqualified arch.
         if compile_policy.mode == "eager":
             return None, _shape_guard_report(
-                "not_applicable", "compile_disabled", cap, lazy_batches=False,
+                "not_applicable", "compile_disabled", cap,
             ), True, None
-        if compile_policy.mode == "strict":
-            raise RuntimeError(
-                "Unsloth: strict mx.compile is not supported for vision-language "
-                "preference training."
-            )
-        return None, _shape_guard_report(
-            "eager", "vision_preference", cap, lazy_batches=False,
-        ), False, None
-    if is_vlm:
+        if not getattr(vlm_compile_decision, "enabled", False):
+            return None, _shape_guard_report(
+                "not_applicable", "vlm_compile_unqualified", cap,
+            ), True, None
+        strict = _effective_compile_mode(
+            compile_policy, vlm_compile_decision,
+        ) == "strict"
+        if (
+            _resolve_mlx_grad_clipping(args)[0] > 0
+            and args.gradient_accumulation_steps > 1
+        ):
+            # Compilation is disabled later here, so skip the survey.
+            return None, _shape_guard_report(
+                "not_applicable", "compile_ineligible_global_norm", cap,
+            ), False, None
+    elif is_vlm:
         return _plan_single_process_vlm_shapes(
             batches,
             batch_iter,
@@ -2329,6 +2339,26 @@ def _plan_single_process_text_shapes(
         )
     else:
         total_microsteps = total_steps * grad_accum
+    if vision_preference:
+        batches.ensure_descriptors()
+        unplannable = sorted(
+            index
+            for index in {
+                batches.batch_index_for_visit(microstep)
+                for microstep in range(total_microsteps)
+            }
+            if not _vlm_family_is_plannable(batches.batch_family(index))
+        )
+        if unplannable:
+            if strict:
+                raise RuntimeError(
+                    "Unsloth: strict mx.compile cannot plan VLM batch "
+                    f"{unplannable[0]}: its compile-key family is not stable "
+                    "enough to group safely."
+                )
+            return None, _shape_guard_report(
+                "eager", "vlm_unplannable_family", cap, compile_scope,
+            ), False, None
     event_counts = {}
     for microstep in range(total_microsteps):
         # Same visit mapping as the runtime fetch, so the enumerated catalog
@@ -2360,7 +2390,13 @@ def _plan_single_process_text_shapes(
         frontier = build_text_shape_frontier(
             events, compile_scope=compile_scope,
         )
-        shape_plan = select_text_shape_padding_budget(frontier)
+        shape_plan = select_text_shape_padding_budget(
+            frontier,
+            # Media families keep their own endpoints, so padding buys no reuse.
+            exact_signature_threshold=(
+                AUTOMATIC_TEXT_COMPILE_CEILING if vision_preference else None
+            ),
+        )
     else:
         shape_plan = plan_text_shape_buckets(
             events,
@@ -2368,7 +2404,7 @@ def _plan_single_process_text_shapes(
             compile_scope=compile_scope,
         )
     if shape_plan.report.action == "eager":
-        if compile_policy.mode == "strict" and distributed_world_size <= 1:
+        if strict and distributed_world_size <= 1:
             raise RuntimeError(
                 "Unsloth: strict mx.compile finite text shape planning failed "
                 f"({shape_plan.report.reason})."
@@ -5361,10 +5397,7 @@ class MLXTrainer:
             self._compile_decision = None
             self._compile_trace = None
             self._compile_auto_tune_applied = []
-            if (
-                self._is_vlm and not self.preference_kind
-                and (args.compile or args.compile_trace)
-            ):
+            if self._is_vlm and (args.compile or args.compile_trace):
                 compile_policy = build_compile_policy(args=args)
                 qual = getattr(model, "_unsloth_compile_qualification", None) or get_compile_qualification(model)
                 if qual is not None:
