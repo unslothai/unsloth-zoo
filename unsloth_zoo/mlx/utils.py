@@ -3081,8 +3081,7 @@ def _vlm_forward_logits(model, batch_dict):
     # need it); mirrors `_vlm_hidden_states` so use_cce={True,False} stay in parity.
     inputs = input_ids
 
-    # Pass through extras (e.g. image_grid_thw); strip the private
-    # `_unsloth_*` carriers, matching _vlm_cce_forward's filter.
+    # Extras (e.g. image_grid_thw) pass through; `_unsloth_*` carriers do not.
     fwd_kwargs = {
         k: v for k, v in batch_dict.items()
         if k not in ("input_ids", "pixel_values", "attention_mask", "labels")
@@ -3099,12 +3098,8 @@ def _vlm_forward_logits(model, batch_dict):
     shared_kv = _build_shared_kv_caches(model)
     if shared_kv is not None:
         fwd_kwargs["cache"] = shared_kv
-    # gemma3n scales token embeddings by sqrt(hidden_size) on the ids path
-    # only, and `Model.__call__` sends ids through `get_input_embeddings`,
-    # which does not scale. Handing the model ids therefore trains on text
-    # embeddings ~45x too small beside merged features. `_vlm_cce_forward`
-    # already merges and rescales itself; do the same here so
-    # use_cce={True,False} stay in parity instead of differing by that.
+    # gemma3n scales embeddings only on the ids path; merge + rescale here as
+    # `_vlm_cce_forward` does, or text embeddings train ~45x too small.
     scaled_embeds = None
     # Self-routed generation wrappers consume premerged embeddings, not pixels.
     if (_vlm_embed_scale(model) is not None
@@ -3125,12 +3120,8 @@ def _vlm_forward_logits(model, batch_dict):
         for key, value in embed_kwargs.items():
             fwd_kwargs.setdefault(key, value)
     if scaled_embeds is not None:
-        # Not `model(...)`: mlx-vlm up to 0.4.4 -- the floor this package
-        # declares -- re-embeds from ids inside `Model.__call__` and drops
-        # a supplied `inputs_embeds`, so the rescale above would be thrown
-        # away on exactly the versions that need it. 0.5.0 onwards honors
-        # it by forwarding straight to the language model; do that here on
-        # every version, which is what `_vlm_cce_forward` already does.
+        # Not `model(...)`: mlx-vlm <= 0.4.4 re-embeds from ids there and drops
+        # `inputs_embeds`, losing the rescale.
         output = _get_text_model(model)(
             inputs, inputs_embeds=scaled_embeds,
             **_drop_pair_token_type_ids(batch_dict, fwd_kwargs),

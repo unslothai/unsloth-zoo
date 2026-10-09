@@ -473,9 +473,7 @@ def _encode_dpo_branches(
     """
     prompt_text = _shared_prefix(prompt_text, chosen_text, rejected_text)
     if encode_prompt is None:
-        # add_special_tokens=False for the prompt too, or a tokenizer closing with
-        # its own EOS lands one between prompt and completion. The BOS is re-added
-        # below.
+        # No special tokens: a closing EOS would land between prompt and completion.
         prompt_ids = [int(x) for x in encode_mlx_text(
             tokenizer, prompt_text, add_special_tokens=False,
         )]
