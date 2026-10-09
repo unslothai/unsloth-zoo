@@ -1516,6 +1516,7 @@ def patch_gpt_oss_bnb4bit():
     # but transformers v5 bypasses it (accelerate's set_module_tensor_to_device), so weights
     # stayed randomly initialized -> high loss (~4-5).
     transformers.models.gpt_oss.modeling_gpt_oss.GptOssTopKRouter = GptOssTopKRouter
+    _record_gpt_oss_router_logits(GptOssTopKRouter)
 
     logger.info("Unsloth: Patched GPT OSS with BitsAndBytes 4bit compatible classes")
     os.environ["UNSLOTH_GPT_OSS_BNB4BIT_PATCHED"] = "1"
@@ -1533,6 +1534,29 @@ def patch_gpt_oss_bnb4bit():
 
 
 pass
+
+
+class _AnyRouterClass(type):
+    # isinstance against any member; keeps the stock __name__ so name-based retargets (the unsloth
+    # compiler, transformers patch mappings) still map it.
+    def __instancecheck__(cls, obj):
+        return isinstance(obj, cls._members)
+
+
+def _record_gpt_oss_router_logits(router_cls):
+    # Stock GptOssModel.forward records router_logits by isinstance on the import-time router class,
+    # which the BnB swap replaces; whenever the stock forward runs (UNSLOTH_COMPILE_DISABLE) nothing is
+    # recorded and load_balancing_loss_func fails. Widen target_class in place, so registries already
+    # holding this spec see it; a PEFT wrapper around a router is not an instance, so one hook each.
+    import transformers.models.gpt_oss.modeling_gpt_oss as modeling
+    recorders = getattr(modeling.GptOssPreTrainedModel, "_can_record_outputs", None)
+    spec = recorders.get("router_logits") if isinstance(recorders, dict) else None
+    target = getattr(spec, "target_class", None)
+    if not isinstance(target, type):
+        return
+    members = getattr(target, "_members", (target,))
+    if router_cls not in members:
+        spec.target_class = _AnyRouterClass(target.__name__, (), {"_members": members + (router_cls,)})
 
 
 def _gpt_oss_class_is_bnb4bit(cls):
