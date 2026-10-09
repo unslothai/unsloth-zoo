@@ -947,6 +947,11 @@ GRPO_VISION_KEYS = (
     "num_images",
     "token_type_ids",
     "mm_token_type_ids",
+    # Qwen2-VL style video: patch rows by video, one grid row (and Qwen2.5-VL time step) per video.
+    "pixel_values_videos",
+    "video_grid_thw",
+    "second_per_grid_ts",
+    "num_videos",
 )
 
 
@@ -1203,6 +1208,25 @@ def grpo_vision_chunks(vision, total_samples, batch_size):
 
     total_images = None if num_images is None else sum(num_images)
 
+    pixel_values_videos = vision.get("pixel_values_videos", None)
+    video_grid_thw = vision.get("video_grid_thw", None)
+    second_per_grid_ts = vision.get("second_per_grid_ts", None)
+    num_videos = _as_int_list(vision.get("num_videos", None))
+    if num_videos is not None and len(num_videos) != total_samples:
+        num_videos = None
+    cum_videos = cum_video_rows = None
+    if pixel_values_videos is not None and video_grid_thw is not None:
+        if num_videos is None or sum(num_videos) != video_grid_thw.shape[0]:
+            raise ValueError(
+                "Unsloth: GRPO cannot tell which sample each video belongs to: "
+                f"{video_grid_thw.shape[0]} videos over {total_samples} samples and no matching num_videos."
+            )
+        cum_videos = torch.tensor([0] + num_videos).cumsum(0)
+        cum_video_rows = torch.cat([
+            torch.zeros(1, dtype = torch.long),
+            video_grid_thw.prod(dim = -1).cumsum(0).cpu(),
+        ])
+
     def _row_axis_is_images(value, flat_ndim):
         """Whether this tensor's first dimension counts IMAGES rather than samples.
 
@@ -1268,6 +1292,16 @@ def grpo_vision_chunks(vision, total_samples, batch_size):
         img_start = img_end = None
         if cum_imgs is not None:
             img_start, img_end = int(cum_imgs[start]), int(cum_imgs[end])
+        vid_start = vid_end = 0
+        if cum_videos is not None:
+            vid_start, vid_end = int(cum_videos[start]), int(cum_videos[end])
+        if vid_end > vid_start:
+            chunk["pixel_values_videos"] = pixel_values_videos[
+                int(cum_video_rows[vid_start]) : int(cum_video_rows[vid_end])
+            ]
+            chunk["video_grid_thw"] = video_grid_thw[vid_start:vid_end]
+            if second_per_grid_ts is not None:
+                chunk["second_per_grid_ts"] = second_per_grid_ts[vid_start:vid_end]
 
         if pixel_values is None:
             if image_sizes is not None:
@@ -1384,6 +1418,11 @@ def grpo_accumulated_loss(
     vision_inputs = _grpo_get_vision_inputs(kwargs)
     pixel_values = vision_inputs.get('pixel_values', None)
     image_grid_thw = vision_inputs.get('image_grid_thw', None)
+    video_grid_thw = vision_inputs.get('video_grid_thw', None)
+    if pixel_values is None:
+        # Only a sentinel below (the chunks carry the tensors): video rows must take the vision
+        # path too, since left and sequence packing move M-RoPE video positions.
+        pixel_values = vision_inputs.get('pixel_values_videos', None)
     # Released unsloth 2026.9.4 decides whether multi-image GRPO is supported by grepping
     # inspect.getsource(grpo_accumulated_loss) for "num_images", so moving the handling into
     # grpo_vision_chunks makes that probe answer no and raise "Please upgrade unsloth_zoo" at
@@ -1393,7 +1432,7 @@ def grpo_accumulated_loss(
     # Transformers 5.x requires token_type_ids/mm_token_type_ids for some vision models
     token_type_ids = vision_inputs.get('token_type_ids', None)
     mm_token_type_ids = vision_inputs.get('mm_token_type_ids', None)
-    if mm_token_type_ids is not None or image_grid_thw is not None:
+    if mm_token_type_ids is not None or image_grid_thw is not None or video_grid_thw is not None:
         mm_token_type_ids = _unsloth_fix_mm_token_type_ids(
             trainer.processing_class, input_ids, mm_token_type_ids
         )
