@@ -14,13 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""InternVL on a split device map (unslothai/unsloth#3419): `InternVLVisionEmbeddings_forward`
-(fullgraph = False) calls `InternVLVisionPatchEmbeddings_forward` (fullgraph = True), whose Conv2d
-carries accelerate's `AlignDevicesHook`. Since accelerate 1.13 its `pre_forward` is
-`torch.compiler.disable`d, and the nested fullgraph region made that graph break fatal:
-
-    Unsupported: Skip calling `torch.compiler.disable()`d function
-"""
+"""unslothai/unsloth#3419: a fullgraph = False region calling a fullgraph = True one whose Conv2d
+carries accelerate's disabled `AlignDevicesHook` (InternVL on a split device map) must not raise."""
 
 import os
 import subprocess

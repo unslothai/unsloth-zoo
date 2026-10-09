@@ -2154,12 +2154,8 @@ def unsloth_eager_decode():
 def _eager_during_decode(func, compiled):
     """`compiled`, except inside `unsloth_eager_decode()` where `func` runs directly. Carries
     the compiled markers so "is this compiled?" checks and `unwrap_already_compiled` behave
-    exactly as they did on `compiled`.
-
-    An enclosing compile traces `func` too, so its own graph-break policy governs: a nested
-    `fullgraph = True` region inside a `fullgraph = False` one otherwise turns any break into a
-    hard error, e.g. accelerate >= 1.13's disabled `AlignDevicesHook.pre_forward` on a split
-    model (InternVL's patch embedding Conv2d under `device_map = "balanced"`)."""
+    exactly as they did on `compiled`. An enclosing compile traces `func`, so its graph-break
+    policy governs: a nested fullgraph region made accelerate >= 1.13's disabled hooks fatal."""
     @functools.wraps(compiled)
     def dispatch(*args, **kwargs):
         if torch.compiler.is_compiling() or eager_decode_active():
