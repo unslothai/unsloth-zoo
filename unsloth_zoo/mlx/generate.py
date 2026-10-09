@@ -1844,9 +1844,7 @@ def _function_of(method):
 
 
 def _per_function(read):
-    """Remember what `read` finds in a function's source for as long as the function lives.
-
-    Keyed weakly on the function, never on a bound method: a model's own closure may hold the model."""
+    """Memoise `read` per function and code object, weakly: a model's own closure may hold the model."""
 
     known = weakref.WeakKeyDictionary()
 
