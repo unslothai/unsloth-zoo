@@ -71,6 +71,13 @@ _CHILD = textwrap.dedent(
             return _fake_torch
         return _real(name, *a, **k)
     _m.version = _version
+    _fake_release = os.environ.pop("_FAKE_KERNEL_RELEASE", "") or None
+    if _fake_release:
+        _real_uname = os.uname
+        def _uname():
+            u = _real_uname()
+            return os.uname_result((u.sysname, u.nodename, _fake_release, u.version, u.machine))
+        os.uname = _uname
     # Fake the device backend by injecting a stub unsloth_zoo.device_type BEFORE
     # unsloth_zoo import (faking torch.version.hip instead would make torch route
     # device_count() through amdsmi and crash on a CUDA box). DEVICE_TYPE_TORCH is
@@ -96,11 +103,13 @@ _CHILD = textwrap.dedent(
 
 
 def _conf(*, torch_version, wsl=False, wsl_interop=False, windows=False,
-          standby=False, opt_out=False, device=None, preset=None):
+          standby=False, opt_out=False, device=None, preset=None, kernel_release=None):
     """Import unsloth_zoo in a fresh child with the given fake env and return the
     resulting allocator env vars as a dict (values may be ``None``)."""
     env = {k: v for k, v in os.environ.items() if k not in _WIPE and k != "_FAKE_TORCH_VERSION"}
     env["_FAKE_TORCH_VERSION"] = torch_version
+    # Pin the kernel so a run on a real WSL host does not turn the Linux cases into WSL ones.
+    env["_FAKE_KERNEL_RELEASE"] = kernel_release or "6.8.0-1021-generic"
     env["CUDA_VISIBLE_DEVICES"] = env.get("CUDA_VISIBLE_DEVICES", "0")
     env.setdefault("UNSLOTH_ALLOW_CPU", "1")   # import unsloth_zoo without a real GPU
     env["PYTHONPATH"] = _REPO_ROOT + os.pathsep + env.get("PYTHONPATH", "")
@@ -172,6 +181,19 @@ class TestWindowsWslFallback:
     def test_wsl_interop_also_triggers(self):
         conf = _conf(torch_version="2.10.0", wsl_interop=True)
         assert conf["PYTORCH_ALLOC_CONF"] == ROUNDUP, conf
+
+    @pytest.mark.parametrize("ver,key", [("2.9.1", "PYTORCH_CUDA_ALLOC_CONF"), ("2.10.0", "PYTORCH_ALLOC_CONF")])
+    @pytest.mark.parametrize("release", ["6.6.87.2-microsoft-standard-WSL2", "5.15.153.1-microsoft-standard-WSL2"])
+    def test_docker_on_wsl2_kernel_triggers(self, ver, key, release):
+        # Docker on WSL2 sets no WSL_* variables; only the shared kernel says WSL (unslothai/unsloth#3511).
+        conf = _conf(torch_version=ver, kernel_release=release)
+        assert conf[key] == ROUNDUP, conf
+        assert all("expandable_segments" not in (v or "") for v in conf.values()), conf
+
+    @pytest.mark.parametrize("release", ["6.8.0-1021-azure", "6.10.14-linuxkit", "6.17.0-1007-aws"])
+    def test_non_wsl_kernels_keep_expandable(self, release):
+        conf = _conf(torch_version="2.10.0", kernel_release=release)
+        assert conf["PYTORCH_ALLOC_CONF"] == "expandable_segments:True", conf
 
     def test_linux_2_10_no_fallback(self):
         # Regression guard: native Linux keeps expandable, never gets roundup.
