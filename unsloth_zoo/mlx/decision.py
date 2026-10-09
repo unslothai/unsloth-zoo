@@ -779,7 +779,6 @@ def _output_rows(head, token_ids):
 class _QwenModel(DecisionPipeline):
     # Below this many shared tokens a second pass costs more than it saves.
     _MIN_SHARED = 16
-    # Whether the family was trained to read images, and what follows them in its prompt.
     takes_images = False
     _IMAGE = "<|vision_start|><|image_pad|><|vision_end|>"
     _AFTER_IMAGES = ""
@@ -788,8 +787,7 @@ class _QwenModel(DecisionPipeline):
 
     @property
     def reads_images(self):
-        # A conversion that ships no vision weights loads with the tower set to None. The image layout and the
-        # forward here are Qwen3.5's: another architecture marks and merges its images differently.
+        # Tower-less conversions load vision_tower=None; the layout and forward here are Qwen3.5's only.
         known = getattr(getattr(self.model, "config", None), "model_type", None) == "qwen3_5"
         # Without its processor files a model loads with a bare tokenizer in the processor's place.
         processor = getattr(getattr(self.model, "_processor", None), "image_processor", None)
@@ -820,7 +818,6 @@ class _QwenModel(DecisionPipeline):
         if load_in_4bit:
             # The loader leaves the embeddings, the output head and the vision tower in 16-bit for the trainers that
             # train them. No decision head does, and together they are as large again as the quantized layers.
-            # The vision tower is left as loaded when the model reads images: it sees them through it.
             tower = "vision_tower" if self.reads_images else "\0"
             nn.quantize(self.model, 64, 4, class_predicate = lambda path, module: not path.startswith(tower) and hasattr(module, "to_quantized") and module.weight.shape[-1] % 64 == 0)
         self.model.eval()
@@ -846,8 +843,7 @@ class _QwenModel(DecisionPipeline):
         return [(code, ids[0]) for code, ids in encoded if len(ids) == 1][:limit]
 
     def _merged(self, ids, media):
-        # The image features take the place of the placeholder embeddings, and an image advances the positions by
-        # its grid, not by its token count.
+        # An image advances positions by its grid, not its token count.
         if media is None:
             return {}
         merged = self.model.get_input_embeddings(ids, media["pixel_values"], image_grid_thw = media["image_grid_thw"])
@@ -2350,8 +2346,7 @@ def clef_training_item(pipeline, state, questions, max_length = None, images = N
         "input_ids": ids, "question_spans": question_spans, "option_spans": option_spans, "types": [_TYPE_IDS.index(q.type) for q in parsed],
         "source": {"state": state, "questions": dict(questions), "max_length": max_length},
     }
-    # A data URL stays one, and the pixels are made again whenever the item is read: kept, they would outweigh every
-    # other part of a dataset.
+    # Kept as data URLs, decoded per read: stored pixels would outweigh the rest of a dataset.
     return {**item, "images": kept} if kept else item
 
 
