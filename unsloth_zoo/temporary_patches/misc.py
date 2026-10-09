@@ -78,8 +78,7 @@ def patch_tokenizer_convert_added_tokens():
     if hasattr(original_convert_added_tokens, "_unsloth_patched"):
         return
 
-    # Response parsers (transformers >= 5.13, set by TRL tools=) hold field dicts like
-    # {"content": "text"}: converting them breaks save (json) and parse_response.
+    # TRL tools= response parsers hold {"content": "text"} field dicts: converting them breaks save.
     parser_keys = ("response_template", "response_schema")
 
     @classmethod
