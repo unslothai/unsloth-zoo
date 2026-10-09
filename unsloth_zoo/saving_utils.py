@@ -3795,7 +3795,7 @@ pass
 
 
 def _source_config_model_type(model_name, token = None, commit = None):
-    # `commit`: the loaded Hub commit, so a branch that moved since the load is not mixed in.
+    # `commit` pins a moved branch to the loaded revision.
     try:
         if os.path.isdir(str(model_name)):
             path = os.path.join(str(model_name), "config.json")
@@ -3813,8 +3813,7 @@ pass
 
 
 def _restore_source_model_type(config_path, model_type):
-    # A repo-code config writes its class `model_type`, not the checkpoint's: DeepSeek-OCR's
-    # `DeepseekOCRConfig` writes `DeepseekOCR` over `deepseek_vl_v2`, which vLLM needs (#3911).
+    # Repo-code configs write their class `model_type` (`DeepseekOCR`); vLLM needs the checkpoint's (#3911).
     if model_type is None or not config_path.exists(): return
     try:
         with open(config_path, "r", encoding = "utf-8") as f:
