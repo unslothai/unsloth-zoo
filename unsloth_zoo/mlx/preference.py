@@ -197,10 +197,8 @@ def resolve_preference_length_policy(kind, args, *, max_seq_length, tokenizer=No
 
 def _kto_carry(tokenizer, append_eos):
     """How far TRL's KTO rows can run past max_length."""
-    # No slot is reserved for a BOS already leading the prompt or an EOS already
-    # ending the answer, and an overrun cut drops it before TRL adds it back. With
-    # no bos_token_id a prompt still pays a BOS slot, which absorbs the EOS; an
-    # empty prompt leaves the answer the whole prompt bound short instead.
+    # TRL reserves no slot for a leading BOS / trailing EOS but re-adds them after
+    # the cut; without bos_token_id the prompt's BOS slot absorbs the EOS.
     if getattr(tokenizer, "bos_token_id", None) is None:
         return 0
     return 1 + (append_eos and getattr(tokenizer, "eos_token_id", None) is not None)
@@ -2311,8 +2309,7 @@ def make_preference_eval_fn(objective, *, reference_policy=None, model=None):
 
 KTO_LOSS_TYPES = ("kto", "apo_zero_unpaired")
 
-# Summed per side so a window divides by its own row counts, as TRL's KTOTrainer.log
-# does; the KL estimate is averaged over the batches that produced it.
+# Summed per side, divided by each side's rows (TRL KTOTrainer.log); KL per batch.
 KTO_METRICS = (
     "rewards/chosen", "rewards/rejected", "logps/chosen", "logps/rejected",
     "logits/chosen", "logits/rejected", "kl",
@@ -2347,8 +2344,7 @@ def _kto_scores(model, batch, lengths, labels, objective, *, reference_policy,
     rows = labels.shape[0]
     completions, completion_lengths = batch[:rows], lengths[:rows]
     mask = _response_mask(completions[:, 1:], completion_lengths)
-    # Positions predicting a real token, prompt included; TRL's sum also takes in
-    # its batch's padding, which depends on how its collator padded.
+    # Real-token positions only; TRL's sum also counts its collator's padding.
     positions = (
         mx.arange(1, completions.shape[1]) < completion_lengths[:, 1:]
     ).astype(mx.float32)
@@ -2378,8 +2374,7 @@ def _kto_scores(model, batch, lengths, labels, objective, *, reference_policy,
     zero = mx.array(0.0, mx.float32)
     kl = zero
     if objective.with_kl:
-        # TRL scores the KL rows under no_grad, so they get a forward of their own
-        # rather than joining the completions' differentiated one.
+        # TRL scores KL rows under no_grad: a separate, undifferentiated forward.
         policy_kl = mx.stop_gradient(score(model, batch[rows:], lengths[rows:]))
         kl = (policy_kl.astype(mx.float32) - reference[rows:]).mean()
         if kl_mean is not None:

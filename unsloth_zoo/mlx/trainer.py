@@ -7019,8 +7019,7 @@ class MLXTrainer:
                         if _samples_prompts else None
                     )
                     if self.preference_kind == "kto":
-                        # TRL pairs evaluation rows for the KL term in chunks of
-                        # the training batch size, whatever the eval batch size.
+                        # TRL pairs eval KL rows in chunks of the train batch size.
                         return create_kto_batch_plan(
                             _format_preference_split(_split_name, eval_dataset),
                             self.tokenizer,
