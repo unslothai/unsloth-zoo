@@ -719,3 +719,67 @@ def test_a_patch_padded_image_tensor_outranks_the_flat_form_and_is_still_sliced_
     assert torch.equal(chunks[1]["pixel_values"], flat[2:3])
     assert torch.equal(chunks[0]["image_sizes"], sizes[0:2])
     assert torch.equal(chunks[1]["image_sizes"], sizes[2:3])
+
+
+def test_qwen_videos_are_sliced_by_video_rows_per_sample():
+    # rows per video: 8, 16, 8; sample 0 has one video, sample 1 two, sample 2 none
+    grid = torch.tensor([[2, 2, 2], [2, 4, 2], [2, 2, 2]])
+    pixel_values_videos = torch.arange(32).unsqueeze(-1).float()
+    second_per_grid_ts = torch.tensor([1.0, 2.0, 0.5])
+    vision = {
+        "pixel_values_videos": pixel_values_videos,
+        "video_grid_thw": grid,
+        "second_per_grid_ts": second_per_grid_ts,
+        "num_videos": [1, 2, 0],
+    }
+    chunks = grpo_vision_chunks(vision, total_samples = 3, batch_size = 1)
+    assert torch.equal(chunks[0]["pixel_values_videos"], pixel_values_videos[0:8])
+    assert torch.equal(chunks[0]["video_grid_thw"], grid[0:1])
+    assert torch.equal(chunks[0]["second_per_grid_ts"], second_per_grid_ts[0:1])
+    assert torch.equal(chunks[1]["pixel_values_videos"], pixel_values_videos[8:32])
+    assert torch.equal(chunks[1]["video_grid_thw"], grid[1:3])
+    assert torch.equal(chunks[1]["second_per_grid_ts"], second_per_grid_ts[1:3])
+    # a sample without a video forwards no video kwargs at all
+    assert "pixel_values_videos" not in chunks[2]
+    assert "video_grid_thw" not in chunks[2]
+
+    together = grpo_vision_chunks(vision, total_samples = 3, batch_size = 2)
+    assert torch.equal(together[0]["pixel_values_videos"], pixel_values_videos)
+    assert torch.equal(together[0]["video_grid_thw"], grid)
+    assert "pixel_values_videos" not in together[1]
+
+
+def test_one_video_per_sample_needs_no_counts():
+    grid = torch.tensor([[2, 2, 2], [4, 2, 2]])
+    pixel_values_videos = torch.arange(24).unsqueeze(-1).float()
+    chunks = grpo_vision_chunks(
+        {"pixel_values_videos": pixel_values_videos, "video_grid_thw": grid},
+        total_samples = 2,
+        batch_size = 1,
+    )
+    assert torch.equal(chunks[0]["pixel_values_videos"], pixel_values_videos[0:8])
+    assert torch.equal(chunks[1]["pixel_values_videos"], pixel_values_videos[8:24])
+    assert torch.equal(chunks[1]["video_grid_thw"], grid[1:2])
+
+
+def test_video_keys_are_forwarded_by_both_passes():
+    for key in ("pixel_values_videos", "video_grid_thw", "second_per_grid_ts", "num_videos"):
+        assert key in GRPO_VISION_KEYS, key
+
+
+def test_video_rows_take_the_vision_path_in_the_gradient_pass():
+    # Left packing and sequence packing move tokens, which breaks Qwen M-RoPE video positions.
+    source = inspect.getsource(grpo_accumulated_loss)
+    sentinel = source.index("pixel_values = vision_inputs.get('pixel_values_videos', None)")
+    assert sentinel < source.index("if pixel_values is None:\n            left_pad_tokens_per_prompt")
+
+
+def test_videos_that_cannot_be_assigned_to_samples_fail_loudly():
+    import pytest
+
+    vision = {
+        "pixel_values_videos": torch.zeros(24, 1),
+        "video_grid_thw": torch.tensor([[2, 2, 2], [2, 2, 2], [2, 2, 2]]),
+    }
+    with pytest.raises(ValueError, match = "which sample each video belongs to"):
+        grpo_vision_chunks(vision, total_samples = 2, batch_size = 1)
