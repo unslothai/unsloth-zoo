@@ -291,8 +291,10 @@ def test_generate_step_decodes_our_drafter_through_the_engine(request, monkeypat
         start = draft.drafter.start
         monkeypatch.setattr(draft.drafter, "start", lambda prompt, hidden, pending: started.append(hidden) or start(prompt, hidden, pending))
     generate = lambda **kwargs: [int(token) for token, _ in ar.generate_step(mx.array([ids[0]]), model, None, None, max_tokens = 96, temperature = 0.0, **kwargs)]
-    plain, penalized = generate(), _solo(model, ids[0], 96, SamplingParams(), [_presence()])
     for prefill_step_size in (16, None):  # unchunked, the final forward returns every prompt position's hidden
+        # Chunking the prefill alone can flip a bf16 near-tie on Metal (M1 runners), so the reference is prefilled alike.
+        plain = generate(prefill_step_size = prefill_step_size)
+        penalized = generate(prefill_step_size = prefill_step_size, logits_processors = [_presence()])
         draft.prepare(ids[0], SamplingParams())
         assert generate(draft_model = draft, draft_kind = draft.draft_kind, prefill_step_size = prefill_step_size) == plain
         draft.prepare(ids[0], SamplingParams(), [penalty := _presence()])
@@ -472,9 +474,11 @@ def test_dflash_family_drafts_from_every_committed_feature_alone_batched_and_thr
     [monkeypatch.setattr(ar, name, getattr(ar, name)) for name in ("run_speculative_rounds", "SpeculativePrefill")]
     speculative.install_speculative_seam()
     (draft := speculative.SpeculativeDraft(_script(("draft", 4)), drafter)).prepare(ids[0], SamplingParams())
-    sequences.append([*ids[0], *(int(token) for token, _ in ar.generate_step(
-        mx.array([ids[0]]), model, None, None, max_tokens = 48, temperature = 0.0, draft_model = draft, draft_kind = draft.draft_kind, prefill_step_size = 16))])
-    assert sequences[-1] == sequences[0] and start(ids[0], None, 0) == (None, [])
+    step = lambda **kwargs: [*ids[0], *(int(token) for token, _ in ar.generate_step(
+        mx.array([ids[0]]), model, None, None, max_tokens = 48, temperature = 0.0, prefill_step_size = 16, **kwargs))]
+    sequences.append(step(draft_model = draft, draft_kind = draft.draft_kind))
+    # Against plain decoding chunked alike: chunking alone can flip a bf16 near-tie on Metal.
+    assert sequences[-1] == step() and start(ids[0], None, 0) == (None, [])
     # Contexts run on from the prompt's first position (six prefill chunks); anchors follow; drafts equal a fresh drafter's.
     for row, sequence in zip(rows, sequences, strict = True):
         reference, fed, fresh = drafter.features(model.language_model(mx.array([sequence]), **drafter.capture))[0], 0, drafter.model.make_cache()
