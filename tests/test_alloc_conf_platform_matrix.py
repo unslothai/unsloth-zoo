@@ -72,7 +72,7 @@ _CHILD = textwrap.dedent(
         return _real(name, *a, **k)
     _m.version = _version
     _fake_release = os.environ.pop("_FAKE_KERNEL_RELEASE", "") or None
-    if _fake_release:
+    if _fake_release and hasattr(os, "uname"):
         _real_uname = os.uname
         def _uname():
             u = _real_uname()
