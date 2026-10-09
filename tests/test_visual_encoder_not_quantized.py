@@ -31,6 +31,8 @@ OTHERS_CONVERT = ["model.language_model.layers.0.self_attn.q_proj",
 
 def _should_convert_module():
     module = pytest.importorskip("transformers.quantizers.quantizers_utils")
+    # Nested names need zoo's component matcher, installed on import, not test order.
+    pytest.importorskip("unsloth_zoo.patching_utils")
     function = getattr(module, "should_convert_module", None)
     if function is None:
         pytest.skip(reason = "transformers < 5.0 has no should_convert_module")
