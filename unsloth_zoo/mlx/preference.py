@@ -807,15 +807,13 @@ def tokenize_vision_preference_row(
     )
     kept_arrays = []
     for response in (chosen, rejected):
-        # Truncating the positions, not the ids, yields the indices this branch keeps.
         kept, _ = _truncate_dpo_branch(range(len(prompt_ids)), response, length_policy)
         if any(
             # Negative ids are image placeholders (Phi-3 Vision).
             token in media_token_ids or token < 0
             for position, token in enumerate(prompt_ids) if position not in kept
         ):
-            # Every image's features take the positions of its tokens, so a cut
-            # run leaves features without a place: CUDA fails in the forward.
+            # A cut image run leaves features without positions; CUDA fails in the forward.
             raise ValueError(
                 "Unsloth MLX DPO: the length budget cuts into this row's image "
                 "tokens. Raise max_length, max_prompt_length and max_seq_length, "
@@ -877,7 +875,6 @@ def _vision_batch(processor, model_config, rows, ids, lengths):
             truncation=False, padding_side="right",
         )
         text_shape = _as_numpy_vlm_field(outputs, "input_ids").shape
-        # The position phase below rebuilds these from the packed ids.
         model_type = _config_get(model_config, "model_type")
         rebuilt = (
             _VLM_WIDTH_GENERATED_KEYS
@@ -1115,8 +1112,7 @@ class FiniteVisionPreferenceBatchPlan(FinitePreferenceBatchPlan):
         forbidden = set().union(*(extents for _family, _padable, extents in surveyed))
         widths = []
         for width, (_family, padable, _extents) in zip(self._widths, surveyed):
-            # A text width equal to an extent of an array padding leaves alone
-            # would reclassify the batch.
+            # A width equal to an unpadded array extent would reclassify the batch.
             while padable and width in forbidden:
                 width += 1
             widths.append(width)

@@ -3090,8 +3090,7 @@ def _vlm_forward_logits(model, batch_dict):
     }
     _apply_static_vlm_metadata(model, batch_dict, fwd_kwargs)
     fwd_kwargs = _trim_sequence_aligned_vlm_kwargs(fwd_kwargs, inputs.shape[1])
-    # Always sent: 13 families declare `mask` without a default. None lets
-    # them build the mask they would use for generation.
+    # Always sent: 13 families declare `mask` without a default (None = their own).
     fwd_kwargs["mask"] = (
         attention_mask if _keeps_forwarded_mask(model) else None
     )
@@ -3115,8 +3114,7 @@ def _vlm_forward_logits(model, batch_dict):
             embed_result, model, input_ids=inputs, attention_mask=attention_mask,
         )
         scaled_embeds = _apply_vlm_embed_scale(model, inputs, merged_embeds)
-        # per_layer_inputs and friends: the merge produced them, and
-        # recomputing from ids inside the stack would redo the work.
+        # per_layer_inputs etc. come from the merge; do not recompute from ids.
         for key, value in embed_kwargs.items():
             fwd_kwargs.setdefault(key, value)
     if scaled_embeds is not None:

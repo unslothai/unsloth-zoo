@@ -2291,7 +2291,6 @@ def _plan_single_process_text_shapes(
             _resolve_mlx_grad_clipping(args)[0] > 0
             and args.gradient_accumulation_steps > 1
         ):
-            # Compilation is disabled later here, so skip the survey.
             return None, _shape_guard_report(
                 "not_applicable", "compile_ineligible_global_norm", cap,
             ), False, None
