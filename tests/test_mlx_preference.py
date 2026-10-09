@@ -2818,6 +2818,18 @@ def test_a_vision_plan_repeats_the_pixels_for_both_branches():
     assert batch["attention_mask"].sum(axis=1).tolist() == lengths[:, 1].tolist()
     plan.configure_cce_compaction(True)
     assert plan.prepare_cce_batch(0, plan[0])[0] is not None
+
+    class CropsAndWholeImages(VisionProcessor):
+        def __call__(self, **kwargs):
+            import numpy as np
+            outputs = super().__call__(**kwargs)
+            return {**outputs, "pixel_values": [np.zeros((3, 2)), outputs["pixel_values"]]}
+
+    pixels = create_preference_batch_plan(
+        [vision_row()], None, batch_size=1, length_policy=policy(), grad_accum=1,
+        processor=CropsAndWholeImages(), model_config={"model_type": "deepseekocr"},
+    )[0][0]["pixel_values"]
+    assert [part.shape[0] for part in pixels] == [6, 2]
     named_on_processor = VisionProcessor()
     del named_on_processor.tokenizer.image_token_id
     named_on_processor.image_token, named_on_processor.image_token_id = None, 60

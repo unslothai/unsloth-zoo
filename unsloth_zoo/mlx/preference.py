@@ -838,6 +838,9 @@ def _repeated_for_both_branches(value):
 # truncation and padding all move.
 _VLM_TOKEN_SPAN_KEYS = ("image_bound", "audio_bounds")
 
+# Their pixels are a [crops, whole images] pair, each batched along its own axis.
+_PIXEL_COMPONENT_MODEL_TYPES = ("deepseekocr", "deepseekocr_2")
+
 
 def _vision_batch(processor, model_config, rows, ids, lengths):
     """A vision batch dict for packed rows: chosen rows first, then rejected."""
@@ -865,9 +868,10 @@ def _vision_batch(processor, model_config, rows, ids, lengths):
         )
         text_shape = _as_numpy_vlm_field(outputs, "input_ids").shape
         # The position phase below rebuilds these from the packed ids.
+        model_type = _config_get(model_config, "model_type")
         rebuilt = (
             _VLM_WIDTH_GENERATED_KEYS
-            if _config_get(model_config, "model_type") in _VLM_POSITION_GENERATING_MODEL_TYPES
+            if model_type in _VLM_POSITION_GENERATING_MODEL_TYPES
             else ()
         )
         for key, value in outputs.items():
@@ -888,7 +892,13 @@ def _vision_batch(processor, model_config, rows, ids, lengths):
                     "preference batching re-lays. This model is not supported "
                     "for preference training on image rows."
                 )
-            inputs[key] = _repeated_for_both_branches(value)
+            if (
+                key in ("images", "pixel_values") and isinstance(value, (list, tuple))
+                and model_type in _PIXEL_COMPONENT_MODEL_TYPES
+            ):
+                inputs[key] = [_repeated_for_both_branches(part) for part in value]
+            else:
+                inputs[key] = _repeated_for_both_branches(value)
     batch = _to_mx_vlm_batch(inputs)
     batch.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
     batch = _prepare_vlm_batch_for_compile(batch, model_config)
