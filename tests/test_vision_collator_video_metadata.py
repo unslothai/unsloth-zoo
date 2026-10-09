@@ -15,13 +15,8 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
-"""The collator's per video sampling rate reaches the processor (unslothai/unsloth#3357).
-
-transformers 5 ignores `fps=` for already decoded frames and reads the rate from
-`video_metadata`, else assumes 24 fps: Qwen2.5-VL got second_per_grid_ts = 2/24 instead of
-2/2, which puts every frame of a short clip on one temporal position, and Qwen3-VL resampled
-the clip as if it were 12 times shorter.
-"""
+"""transformers 5 reads a decoded video's rate from video_metadata, not fps= (else 24 fps).
+unslothai/unsloth#3357."""
 
 import types
 
@@ -74,7 +69,6 @@ def test_no_metadata_support_falls_back_to_fps(monkeypatch):
 
 
 def test_fixed_count_sampler_gets_its_frames_from_us(monkeypatch):
-    # Gemma 4 samples num_frames = 32 and cannot sample a shorter clip, so subsample here.
     monkeypatch.setattr(vu, "_PROCESSOR_TAKES_VIDEO_METADATA", True)
     monkeypatch.setattr(vu, "_VIDEO_RATE_FROM_METADATA", True)
     long_video = torch.arange(10).view(10, 1, 1, 1).expand(10, 3, 2, 2)
@@ -86,7 +80,7 @@ def test_fixed_count_sampler_gets_its_frames_from_us(monkeypatch):
     assert out_videos[0][0][:, 0, 0, 0].tolist() == [0, 3, 6, 9]
     assert kwargs["video_metadata"][0]["frames_indices"] == [0, 3, 6, 9]
     assert kwargs["video_metadata"][0]["total_num_frames"] == 10
-    assert out_videos[1][0].shape[0] == 3  # shorter clips keep every frame
+    assert out_videos[1][0].shape[0] == 3
 
 
 def test_mismatched_rates_fall_back_to_fps(monkeypatch):
@@ -104,7 +98,6 @@ def test_real_qwen2_5_vl_processor_gets_the_rate():
     videos = [[torch.randint(0, 255, (4, 3, 56, 56), dtype = torch.uint8)]]
     videos, kwargs = vu.video_processor_kwargs(processor, videos, [1.0])
     out = processor(text = [text], videos = videos, return_tensors = "pt", **kwargs)
-    # temporal_patch_size 2 over frames sampled at 1 fps = 2 seconds per grid step
     assert out["second_per_grid_ts"].tolist() == [2.0]
 
 
