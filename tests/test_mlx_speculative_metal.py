@@ -43,6 +43,10 @@ def qwen_mtp():
 @pytest.fixture(scope = "module")
 def gemma():
     from unsloth_zoo.mlx.speculative import companion_drafter
+    # The bf16 per-layer embedding table is one 5.6 GB buffer, past the Metal buffer cap of 8 GB machines.
+    limit = (getattr(mx, "device_info", None) or mx.metal.device_info)().get("max_buffer_length", 1 << 62)
+    if limit < 6 << 30:
+        pytest.skip(f"{GEMMA} needs a 5.6 GB Metal buffer; this device allows {limit} bytes")
     model, ids = _load(GEMMA, PAST_WINDOW)
     return model, ids, companion_drafter(GEMMA_ASSISTANT, model)
 
@@ -223,7 +227,8 @@ def test_mtp_catches_up_after_plain_windows_and_copies(qwen_mtp, max_lag):
     (out,), _, _ = _run(model, ids[:1], 128, controller, SamplingParams(), drafter = drafter)
     assert out == _solo(model, ids[0], 128, SamplingParams())
     assert any(drafter.dropped.values()) == (max_lag < 8)
-    assert sum(count for count, _ in accepted) >= 0.6 * sum(length for _, length in accepted)
+    # A head that dropped context past max_lag accepts less; a misaligned catch-up would accept next to nothing.
+    assert sum(count for count, _ in accepted) >= (0.6 if max_lag >= 8 else 0.5) * sum(length for _, length in accepted)
 
 
 def test_native_mtp_head_is_built_in_memory_from_mtp_tensors_only(qwen_mtp, monkeypatch):
