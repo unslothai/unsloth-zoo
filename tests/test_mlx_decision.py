@@ -120,7 +120,7 @@ def test_images_are_validated_then_refused_as_unsupported():
     assert model.answer(text_only, question, images = [])["answers"]
 
 
-def test_a_model_that_reads_images_gets_them_decoded_and_out_of_the_state():
+def test_a_model_that_reads_images_gets_them_decoded_and_out_of_the_state(monkeypatch):
     import base64
     import io
 
@@ -152,6 +152,10 @@ def test_a_model_that_reads_images_gets_them_decoded_and_out_of_the_state():
     for broken in ("data:image/png;base64,A", "data:image/png;base64,AA==", cut):
         with pytest.raises(DecisionRequestError, match = "could not be decoded"):
             Reader(None).answer("s", question, images = [broken])
+    monkeypatch.setattr(decision, "_MAX_IMAGE_PIXELS", 19)
+    Reader(None).answer("s", question, images = [url((19, 1))])
+    with pytest.raises(DecisionRequestError, match = "larger than 19 pixels"):
+        Reader(None).answer("s", question, images = [url((5, 4))])
 
 
 @pytest.fixture
@@ -319,6 +323,7 @@ def test_openjev_puts_its_screenshots_before_the_state(tmp_path, decoder_family,
         model.answer("s", question, images = [image])
     # The processor spends two placeholders on the first image and one on the second; the tokenizer reads one for each.
     spent, characters = [501, 500, 500, 502, 501, 500, 502], model.tokenizer.encode
+    model.model.config = types.SimpleNamespace(model_type = "qwen3_5")
     model.model.vision_tower, model.model._processor = object(), lambda text, images, return_tensors: {"input_ids": np.array([spent]), "pixel_values": np.zeros((3, 4)), "image_grid_thw": np.ones((2, 3))}
     model.tokenizer.encode = lambda text, add_special_tokens: [token for index, piece in enumerate(text.split(model._IMAGE)) for token in ([501, 500, 502] * bool(index) + characters(piece, add_special_tokens))]
     passes = []

@@ -1062,6 +1062,11 @@ def test_clef_reads_images_between_the_opening_and_the_state(clef, monkeypatch):
     towerless.model = copy.copy(model)
     towerless.model.vision_tower = None
     assert not towerless.reads_images
+    other = copy.copy(reader)
+    other.model = copy.copy(model)
+    other.model.config = copy.copy(model.config)
+    other.model.config.model_type = "qwen3_vl"
+    assert not other.reads_images
     monkeypatch.setattr(ClefModel, "_IMAGE_TOKENS", 15)
     with pytest.raises(DecisionRequestError, match = "the images take 15 tokens"):
         reader.encode_images(images)
@@ -1121,6 +1126,8 @@ def test_clef_trains_on_the_images_of_its_records(clef):
     assert [image.size for image in mixed["images"]] == [(64, 64), (96, 64)] and mixed["source"]["state"] == [{"role": "user", "content": ["s"]}]
     assert items[0]["input_ids"] == items[1]["input_ids"] and items[0]["input_ids"].count(500) == 6 and mixed["input_ids"].count(500) == 10
     assert "images" not in clef_training_item(reader, "s", questions)
+    with pytest.raises(ValueError, match = "too many images"):
+        clef_training_item(reader, "s", questions, None, [dark] * 8 + [url])
 
     network = clef_training_network(reader, r = 4, lora_alpha = 4)
     tower = {name: np.array(value) for name, value in tree_flatten(reader.model.vision_tower.parameters())}

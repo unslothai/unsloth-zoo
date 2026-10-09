@@ -293,6 +293,8 @@ def _load_network(folder, compute_dtype):
 
 _TYPES = ("choice", "score", "noul")
 _MAX_IMAGES = 8
+# An image is refused by its size before its pixels are read, which the processor's own limit comes too late for.
+_MAX_IMAGE_PIXELS = 4096 * 4096
 
 
 class DecisionRequestError(ValueError):
@@ -359,9 +361,13 @@ def _decode_images(urls):
     for url in urls:
         try:
             image = Image.open(io.BytesIO(base64.b64decode(url.partition(",")[2], validate = True)))
-            image.load()
+            large = image.width * image.height > _MAX_IMAGE_PIXELS
+            if not large:
+                image.load()
         except Exception as error:
             raise DecisionRequestError("an image could not be decoded") from error
+        if large:
+            raise DecisionRequestError(f"an image is larger than {_MAX_IMAGE_PIXELS} pixels")
         images.append(image)
     return images
 
@@ -782,8 +788,10 @@ class _QwenModel(DecisionPipeline):
 
     @property
     def reads_images(self):
-        # A conversion that ships no vision weights loads with the tower set to None.
-        return self.takes_images and getattr(self.model, "vision_tower", None) is not None and getattr(self.model, "_processor", None) is not None
+        # A conversion that ships no vision weights loads with the tower set to None. The image layout and the
+        # forward here are Qwen3.5's: another architecture marks and merges its images differently.
+        known = getattr(getattr(self.model, "config", None), "model_type", None) == "qwen3_5"
+        return self.takes_images and known and getattr(self.model, "vision_tower", None) is not None and getattr(self.model, "_processor", None) is not None
 
     def encode_images(self, images):
         """The token ids that stand for `images` in the prompt, and the pixels behind them."""
@@ -2330,6 +2338,8 @@ def clef_training_item(pipeline, state, questions, max_length = None, images = N
     urls = _image_urls(state, [image for image in given if isinstance(image, str)])
     decoded = iter(_decode_images(urls))
     images = [next(decoded) if isinstance(image, str) else image for image in given] + list(decoded)
+    if len(images) > _MAX_IMAGES:
+        raise DecisionRequestError(f"too many images, the maximum is {_MAX_IMAGES}")
     if urls:
         state = _without_image_parts(state)
     ids, question_spans, option_spans = pipeline.encode(state, parsed, max_length, pipeline.encode_images(images)[0] if images else ())
