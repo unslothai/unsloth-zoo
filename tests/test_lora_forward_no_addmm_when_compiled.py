@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-# unsloth#3271: traced inside a compiled decoder MLP, torch 2.8 / 2.9 inductor miscompiled the
-# addmm(alpha = scaling, beta = 1) LoRA epilogue (Qwen2.5-VL text-only LoRA diverged).
+# unsloth#3271: torch 2.8 / 2.9 inductor miscompiles the traced addmm(alpha, beta) LoRA epilogue.
 import pytest
 import torch
 
