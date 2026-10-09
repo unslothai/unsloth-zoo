@@ -1153,6 +1153,9 @@ class GptOssExpertsBnb4bit(nn.Module):
     so BitsAndBytes can quantize them.
     """
 
+    # Eval calls with more (token, expert) rows skip the all-experts dense branch (unsloth#3411).
+    _dense_eval_max_rows = 8192
+
     def __init__(self, config):
         super().__init__()
 
@@ -1320,10 +1323,17 @@ class GptOssExpertsBnb4bit(nn.Module):
         num_experts = routing_weights.shape[1]
         top_k = router_indices.shape[1]
 
+        # The dense eval branch runs every expert on every token (27.5 GiB in one layer of a
+        # 120B GRPO prefill, unsloth#3411): long eval calls take the grouped path or the loop.
+        eval_routed = (
+            not self.training
+            and num_tokens * num_experts > self._dense_eval_max_rows
+            and not torch.compiler.is_compiling()
+        )
         # fp16 experts take the grouped path too: it keeps the loop's fp32 swiglu and
         # fp32 down output (gpt_oss_grouped_qlora.compute_mode decides per call).
         if (
-            self.training
+            (self.training or eval_routed)
             and self._grouped_bnb4bit_ready()
         ):
             try:
@@ -1332,7 +1342,7 @@ class GptOssExpertsBnb4bit(nn.Module):
                     batch_size, num_tokens, num_experts, top_k,
                 )
                 if grouped is not None:
-                    return grouped
+                    return grouped if self.training else grouped.to(hidden_states.dtype)
             except Exception as exc:
                 # Checkpoint early-stop is control flow; an OOM should surface, not retry the loop.
                 from torch.utils import checkpoint as _ckpt
@@ -1347,7 +1357,7 @@ class GptOssExpertsBnb4bit(nn.Module):
                     import traceback; traceback.print_exc()
                 # fall through to the per-expert loop
 
-        if self.training:
+        if self.training or eval_routed:
             with torch.no_grad():
                 flat_experts = router_indices.flatten()  # [tokens * topk]
                 token_ids = torch.arange(num_tokens, device=hidden_states.device).repeat_interleave(top_k)
@@ -2871,10 +2881,6 @@ def _try_grouped_bnb4bit(self, hidden_states, router_indices, routing_weights,
         return None  # fall through to the per-expert loop
 
 
-# Eval calls with more (token, expert) rows than this skip the all-experts dense branch.
-DENSE_EVAL_MAX_ROWS = 8192
-
-
 def torch_native_forward(
     self,
     hidden_states: torch.Tensor,
@@ -2904,13 +2910,26 @@ def torch_native_forward(
 
     # The dense eval branch below runs every expert on every token, so its fp32 swiglu
     # temporaries grow as experts x tokens (27.5 GiB in one layer of a 120B GRPO prefill,
-    # unsloth#3411). Eval calls past DENSE_EVAL_MAX_ROWS take the routed loop instead.
-    if self.training or (
-        num_tokens * num_experts > DENSE_EVAL_MAX_ROWS and not torch.compiler.is_compiling()
-    ):
-        if not self.training and not torch.is_grad_enabled():
+    # unsloth#3411). Long eval calls take the grouped path, else the loop. The class body's
+    # forward (emitted standalone by the compiled cache) routes the same way.
+    eval_routed = (
+        not self.training
+        and num_tokens * num_experts > getattr(self, "_dense_eval_max_rows", GptOssExpertsBnb4bit._dense_eval_max_rows)
+        and not torch.compiler.is_compiling()
+    )
+    if eval_routed:
+        if not torch.is_grad_enabled():
             # Eager prefill builds the routed tables a compiled decode step then reads.
             prepare_routed_experts(self)
+        if hasattr(self, "_grouped_bnb4bit_ready"):
+            grouped = _try_grouped_bnb4bit(
+                self, hidden_states, router_indices, routing_weights,
+                batch_size, num_tokens, num_experts, top_k,
+            )
+            if grouped is not None:
+                return grouped.to(hidden_states.dtype)
+
+    if self.training or eval_routed:
         with torch.no_grad():
             flat_experts = router_indices.flatten()  # [tokens * topk]
             token_ids = torch.arange(num_tokens, device=hidden_states.device).repeat_interleave(top_k)
