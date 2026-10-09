@@ -288,6 +288,12 @@ class _CausalConv1dFunction(torch.autograd.Function):
         return (dx.transpose(1, 2) if dx is not None else None), dw, db, None
 
 
+def _act(activation):
+    # Same mapping as the torch path it replaces (the layer's configured hidden_act).
+    from transformers.activations import ACT2FN
+    return ACT2FN[activation]
+
+
 def causal_conv1d_reference(x, weight, bias = None, activation = None):
     """The transformers torch fallback: x (B, D, T), weight (D, W)."""
     import torch.nn.functional as F
@@ -297,7 +303,7 @@ def causal_conv1d_reference(x, weight, bias = None, activation = None):
         padding = weight.shape[-1] - 1, groups = D,
     )[:, :, :T]
     if activation is not None:
-        out = F.silu(out)
+        out = _act(activation)(out)
     return out.to(x.dtype)
 
 
@@ -380,7 +386,7 @@ def _causal_conv1d_reference_seq_idx(x, weight, bias, activation, seq_idx):
         out = out + bias.to(acc).view(1, -1, 1)
     out = out.to(weight.dtype)
     if activation is not None:
-        out = F.silu(out)
+        out = _act(activation)(out)
     return out.to(x.dtype)
 
 

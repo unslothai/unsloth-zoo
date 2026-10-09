@@ -172,6 +172,18 @@ def test_oom_propagates_without_disabling(monkeypatch):
     assert gcc._broken is True
 
 
+def test_legacy_keeps_configured_activation_cpu():
+    import torch.nn.functional as F
+    torch.manual_seed(0)
+    x, w = torch.randn(2, 8, 11), torch.randn(8, 4)
+    expected = F.gelu(F.conv1d(x, w.unsqueeze(1), None, padding = 3, groups = 8)[:, :, :11])
+    torch.testing.assert_close(gcc._legacy_causal_conv1d_fn(x = x, weight = w, activation = "gelu"), expected)
+    seq_idx = torch.zeros(2, 11, dtype = torch.int32)
+    torch.testing.assert_close(
+        gcc._legacy_causal_conv1d_fn(x = x, weight = w, activation = "gelu", seq_idx = seq_idx), expected,
+    )
+
+
 def test_legacy_seq_idx_cpu():
     import inspect
     # Not advertised: unsloth's hybrid packing gate keys on a named `seq_idx`.
