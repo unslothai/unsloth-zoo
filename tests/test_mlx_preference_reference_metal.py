@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Real-runtime contracts of the MLX DPO reference policy."""
+"""Real-runtime contracts of MLX preference training."""
 
 import functools
 
@@ -153,3 +153,48 @@ def test_reference_overrides_hold_inside_a_compiled_step(mode):
     expected = _response_logps(pristine, tokens, lengths)
     assert mx.allclose(scored, expected, atol=1e-5).item()
     assert loss.item() != 0.0, "the loss sees the gap"
+
+
+def test_a_qualified_vision_plan_is_surveyed_and_planned_for_compile():
+    from types import SimpleNamespace
+    from unsloth_zoo.mlx.compile import build_compile_policy
+    from unsloth_zoo.mlx.preference import FiniteVisionPreferenceBatchPlan
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, _plan_single_process_text_shapes
+
+    class Plan(FiniteVisionPreferenceBatchPlan):
+        pixel_width = 33
+        def _inputs(self, rows, batch, lengths):
+            inputs = {"input_ids": mx.array(batch), "attention_mask": mx.array(
+                (batch != self.pad_id).astype("int32"))}
+            if rows[0].image:
+                inputs["pixel_values"] = mx.zeros((len(batch), self.pixel_width))
+            return inputs
+
+    row = lambda length, image: SimpleNamespace(
+        chosen=(1,) * length, rejected=(1,) * (length - 2), image=image,
+        chosen_prompt_ids=(1, 1), rejected_prompt_ids=(1, 1))
+
+    plan = Plan(
+        [row(20, False), row(50, True)], [[0], [1]], processor=None, model_config={},
+        normalizers=[(1, 1, 1)] * 2, cycle_length=2, max_seq_length=64, pad_id=0)
+    args = MLXDPOConfig(max_steps=2, gradient_accumulation_steps=1, max_grad_norm=0.0)
+
+    def planned(decision):
+        return _plan_single_process_text_shapes(
+            plan, None, args=args, total_steps=2, is_vlm=True, distributed_world_size=1,
+            compile_policy=build_compile_policy(args=args), vlm_compile_decision=decision)
+
+    assert planned(None)[1].reason == "vlm_compile_unqualified" and plan.batch_width(0) == 33
+    assert planned(SimpleNamespace(enabled=True))[1:3] == (plan._shape_plan.report, True)
+    # The text batch steps off the width the image batch's pixels already use.
+    assert [plan.batch_width(index) for index in (0, 1)] == [34, 64]
+    assert plan.batch_family(0)[4] != plan.batch_family(1)[4]
+    text, image = (plan.materialize(index, phase="single")[0] for index in (0, 1))
+    assert text["input_ids"].shape == (2, 34) and "pixel_values" not in text
+    assert image["input_ids"].shape == (2, 64) and image["pixel_values"].shape == (2, 33)
+    assert plan[0][0]["input_ids"].shape == (2, 33)
+    with pytest.raises(RuntimeError, match="not admitted"):
+        plan.materialize(1, phase="update")
+    Plan.pixel_width = 16
+    with pytest.raises(RuntimeError, match="drifted from its surveyed compile family"):
+        plan.materialize(1, phase="single")

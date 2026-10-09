@@ -40,6 +40,7 @@ bnb = pytest.importorskip("bitsandbytes")
 peft = pytest.importorskip("peft")
 
 from unsloth_zoo.temporary_patches import gpt_oss_grouped_qlora as gq
+from unsloth_zoo.temporary_patches import moe_ready_epoch
 from unsloth_zoo.temporary_patches.gpt_oss import GptOssExpertsBnb4bit, torch_native_forward
 from unsloth_zoo.temporary_patches.gpt_oss_routed import _build_table
 from unsloth_zoo.temporary_patches.moe_utils import _check_torch_grouped_mm_supported
@@ -348,8 +349,10 @@ def test_fallback_sees_replaced_nested_absmax(monkeypatch):
 @needs_grouped_mm
 @pytest.mark.parametrize("kernel", ["1", "0"])
 @pytest.mark.parametrize("edit", ["absmax", "state2_absmax", "offset", "code"])
-def test_in_place_quant_edit_is_not_stale(kernel, edit, monkeypatch):
+@pytest.mark.parametrize("fast", ["1", "0"])
+def test_in_place_quant_edit_is_not_stale(kernel, edit, fast, monkeypatch):
     monkeypatch.setenv("UNSLOTH_MOE_TRITON_KERNELS", kernel)
+    monkeypatch.setenv("UNSLOTH_MOE_FAST_READY", fast)
     ex = _Experts(True).train()
     T = 64
     x = torch.randn(1, T, H, device = "cuda", dtype = DT)
@@ -365,6 +368,10 @@ def test_in_place_quant_edit_is_not_stale(kernel, edit, monkeypatch):
             qs.offset.add_(0.05)
         else:
             qs.code = qs.code.flip(0)
+    # A hook-less edit of one interior expert: seen per call with UNSLOTH_MOE_FAST_READY=0, else at
+    # the next bump (in-place absmax edits need neither: the tables read them live).
+    if fast == "1" and edit in ("offset", "code"):
+        moe_ready_epoch.bump()
     out, _, delta = _run(ex, x, idx, w, True, monkeypatch)
     ref, _, _ = _run(ex, x, idx, w, False, monkeypatch)
     # A codebook differing from the other experts' must send the layer back to the loop.
@@ -466,8 +473,12 @@ def test_replaced_middle_expert_rebuilds_tables(proj, monkeypatch):
 
 @needs_grouped_mm
 @pytest.mark.parametrize("change", ["dropout", "dropout_p", "merge", "disable", "dora_flag", "unwrap"])
-def test_ready_cache_sees_a_middle_expert(change, monkeypatch):
-    # A direct edit of one middle expert must re-run the check.
+@pytest.mark.parametrize("fast", ["1", "0"])
+def test_ready_cache_sees_a_middle_expert(change, fast, monkeypatch):
+    # A direct edit of one middle expert must re-run the check: per call with
+    # UNSLOTH_MOE_FAST_READY=0; else through the hooks / dropout compare, or at the next bump for
+    # hook-less edits (merged_adapters / use_dora written directly).
+    monkeypatch.setenv("UNSLOTH_MOE_FAST_READY", fast)
     monkeypatch.delenv("UNSLOTH_GPTOSS_GROUPED", raising = False)
     monkeypatch.delenv("UNSLOTH_COMPILE_DISABLE", raising = False)
     ex = _lora_wrap(_Experts(True)).train()
@@ -487,6 +498,8 @@ def test_ready_cache_sees_a_middle_expert(change, monkeypatch):
         mid.use_dora["default"] = True
     elif change == "unwrap":
         ex.down_projs[E // 2] = mid.base_layer
+    if fast == "1" and change in ("merge", "dora_flag"):
+        moe_ready_epoch.bump()
     assert ex._grouped_bnb4bit_ready() is False, change
     T = 64
     x = torch.randn(1, T, H, device = "cuda", dtype = DT)

@@ -24,6 +24,7 @@ import shutil
 import stat
 import tempfile
 import sys
+import threading
 import time
 import warnings
 import importlib
@@ -1187,12 +1188,67 @@ def _check_torch_grouped_mm_supported():
     return _run_probe_eagerly(_probe_torch_grouped_mm_supported)
 
 
+# Some ROCm GPUs segfault in grouped_mm instead of raising (unsloth#12391): run the kernels in a throwaway interpreter first.
+_GROUPED_MM_CRASH_PROBE = r"""
+import sys
+if sys.platform == "win32":   # no "python.exe has stopped working" dialog when the kernel faults
+    import ctypes; ctypes.windll.kernel32.SetErrorMode(0x0003)
+import torch
+d = torch.device("cuda", int(sys.argv[1]))
+def probe(x, w, offs):
+    offs = torch.tensor(offs, device = d, dtype = torch.int32)
+    try: torch._grouped_mm(x, w, offs = offs); torch.cuda.synchronize(d)
+    except Exception: pass   # a Python error is caught in-process too; only a crash or hang matters here
+half = dict(device = d, dtype = torch.float16)
+bf16 = dict(device = d, dtype = torch.bfloat16)
+w_t  = torch.ones(4, 64, 32, **bf16).transpose(-2, -1)
+probe(torch.ones(1, 8, **half), torch.ones(1, 8, 8, **half), [1])
+probe(torch.ones(32, 32, **bf16), w_t, [8, 16, 24, 32])
+probe(torch.ones(32, 32, **bf16), w_t.contiguous(), [8, 16, 24, 32])
+"""
+_GROUPED_MM_SURVIVES = None
+_GROUPED_MM_SURVIVES_LOCK = threading.Lock()
+
+
+def _grouped_mm_survives_out_of_process(device):
+    global _GROUPED_MM_SURVIVES
+    if _GROUPED_MM_SURVIVES is not None: return _GROUPED_MM_SURVIVES
+    # Publish once known: concurrent first callers wait for the child, never run the kernel.
+    with _GROUPED_MM_SURVIVES_LOCK:
+        if _GROUPED_MM_SURVIVES is None: _GROUPED_MM_SURVIVES = _run_grouped_mm_crash_probe(device)
+    return _GROUPED_MM_SURVIVES
+
+
+def _run_grouped_mm_crash_probe(device):
+    # AMD only: CUDA and XPU keep the in-process probe.
+    if getattr(torch.version, "hip", None) is None or device.type != "cuda": return True
+    # Studio's Python _grouped_mm fallback (gfx120X) is active: this process never runs the native kernel.
+    try:
+        dump = torch._C._dispatch_dump("aten::_grouped_mm").splitlines()
+        if any(l.startswith("CUDA:") and ".cpp:" not in l for l in dump): return True
+    except Exception:
+        pass
+    import subprocess
+    # Not multiprocessing: spawn re-imports the caller's __main__.
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", _GROUPED_MM_CRASH_PROBE, str(device.index)],
+            stdout = subprocess.DEVNULL, stderr = subprocess.DEVNULL, timeout = 180,
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        ).returncode
+    except Exception as e:
+        result = type(e).__name__
+    if result == 0: return True
+    _log_info(f"Unsloth: torch._grouped_mm probe crashed on this ROCm GPU ({result}); disabling grouped_mm.")
+    return False
+
+
 def _probe_torch_grouped_mm_supported():
     global _TORCH_GROUPED_MM_SUPPORTED
     if _TORCH_GROUPED_MM_SUPPORTED is not None: return _TORCH_GROUPED_MM_SUPPORTED
 
     device = _grouped_mm_probe_device() if _TORCH_GROUPED_MM_AVAILABLE else None
-    if device is None:
+    if device is None or not _grouped_mm_survives_out_of_process(device):
         _TORCH_GROUPED_MM_SUPPORTED = False
         return False
 
@@ -1237,7 +1293,7 @@ def _probe_transposed_view_grouped_mm_is_safe():
     safe = False
     try:
         device = _grouped_mm_probe_device()
-        if _TORCH_GROUPED_MM_AVAILABLE and device is not None:
+        if _TORCH_GROUPED_MM_AVAILABLE and device is not None and _grouped_mm_survives_out_of_process(device):
             E, N, K, M = 4, 64, 32, 32
             # local generator: never touch the process-wide RNG (manual_seed would shift training)
             gen = torch.Generator(device=device).manual_seed(0)

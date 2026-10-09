@@ -37,8 +37,10 @@ Usage mirrors TRL notebooks:
 """
 
 from dataclasses import MISSING, asdict, dataclass, field, fields, is_dataclass, replace
+import collections
 import copy
 import concurrent.futures
+import contextlib
 import hashlib
 import json
 import math
@@ -46,8 +48,10 @@ import numbers
 import os
 from pathlib import Path
 import random
+import re
 import socket
 import time
+import types
 import unicodedata
 import weakref
 
@@ -55,6 +59,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
+import numpy as np
 
 _PAD_MULTIPLE = 32
 SUPPORTED_MLX_OPTIMIZERS = (
@@ -608,7 +613,6 @@ from .utils import (
     iter_mlx_lora_modules,
     apply_gradient_checkpointing,
     remove_gradient_checkpointing,
-    _tokenize_mlx_prompt_completion_row,
     _get_transformer_layers,
     _is_vlm_model,
     _mlx_norm_path_part_is_norm,
@@ -630,18 +634,23 @@ from .utils import (
 )
 from .preference import (
     FinitePreferenceBatchPlan,
+    FiniteVisionPreferenceBatchPlan,
     PreferenceRunContext,
     build_reference_policy,
+    create_kto_batch_plan,
     create_preference_batch_plan,
     encode_generation_prompt_text,
     make_dpo_loss_fn,
     make_dpo_cce_loss_fn,
+    make_kto_loss_fn,
+    make_kto_cce_loss_fn,
     make_orpo_loss_fn,
     make_orpo_cce_loss_fn,
     make_preference_eval_fn,
     precompute_reference_logps,
     resolve_preference_objective,
     resolve_preference_length_policy,
+    warn_kto_weight_balance,
 )
 from .compile import (
     build_compile_policy,
@@ -684,6 +693,13 @@ _FINITE_BATCH_PLAN_TYPES = (
 # processor, so a refetch would draw twice and offset every later batch; it
 # reuses the materialized batch instead, whose planned padding is masked.
 _EAGER_REFETCHABLE_PLAN_TYPES = (FiniteTextBatchPlan, FinitePreferenceBatchPlan)
+
+
+def _eager_refetchable(batches):
+    # A vision preference plan reruns the processor like the VLM plan.
+    return isinstance(batches, _EAGER_REFETCHABLE_PLAN_TYPES) and not isinstance(
+        batches, FiniteVisionPreferenceBatchPlan,
+    )
 
 
 def _is_hf_tokenizer(tokenizer):
@@ -1349,7 +1365,8 @@ def _mlx_batch_input_token_count(batch_data, mode="all", pad_token_id=None):
 
     Uses ``.shape`` (a tuple under both real mlx and the torch test shim) rather
     than a backend-specific ``.size`` / ``.numel``. Handles the text/preference/
-    GRPO tuple batch (input ids first) and the VLM dict batch (``input_ids`` key);
+    GRPO tuple batch (input ids, or a vision preference dict, first) and the VLM
+    dict batch (``input_ids`` key);
     returns 0 when no input-id tensor is present so the counter simply does not
     advance rather than raising.
     """
@@ -1361,6 +1378,8 @@ def _mlx_batch_input_token_count(batch_data, mode="all", pad_token_id=None):
         attention_mask = batch_data.get("attention_mask")
     elif isinstance(batch_data, (tuple, list)) and batch_data:
         arr = batch_data[0]
+        if isinstance(arr, dict):
+            arr = arr.get("input_ids")
         lengths = batch_data[1] if len(batch_data) > 1 else None
     else:
         arr = None
@@ -1734,6 +1753,32 @@ class MLXDPOConfig(MLXTrainingConfig):
     max_completion_length: int | None = field(default=None, kw_only=True)
     truncation_mode: str = field(default="keep_end", kw_only=True)
     # As MLXORPOConfig; a referenced run also samples the frozen base policy.
+    generate_during_eval: bool = field(default=False, kw_only=True)
+    num_generation_prompts: int = field(default=8, kw_only=True)
+    generation_max_tokens: int = field(default=128, kw_only=True)
+    generation_temperature: float = field(default=0.0, kw_only=True)
+
+
+@dataclass(init=False)
+class MLXKTOConfig(MLXTrainingConfig):
+    """Configuration owned by MLXKTOTrainer.
+
+    Batches are cut in dataset order, as TRL's KTOTrainer does, since each row's
+    KL pair takes the completion of its neighbor within a batch;
+    ``dataset_order="torch_randperm"`` reorders whole batches.
+    """
+
+    beta: float = field(default=0.1, kw_only=True)
+    loss_type: str = field(default="kto", kw_only=True)
+    desirable_weight: float = field(default=1.0, kw_only=True)
+    undesirable_weight: float = field(default=1.0, kw_only=True)
+    precompute_ref_log_probs: bool = field(default=False, kw_only=True)
+    precompute_ref_batch_size: int | None = field(default=None, kw_only=True)
+    disable_dropout: bool = field(default=True, kw_only=True)
+    max_length: int | None = field(default=1024, kw_only=True)
+    max_prompt_length: int | None = field(default=512, kw_only=True)
+    max_completion_length: int | None = field(default=None, kw_only=True)
+    truncation_mode: str = field(default="keep_end", kw_only=True)
     generate_during_eval: bool = field(default=False, kw_only=True)
     num_generation_prompts: int = field(default=8, kw_only=True)
     generation_max_tokens: int = field(default=128, kw_only=True)
@@ -2256,7 +2301,29 @@ def _plan_single_process_text_shapes(
     configured_cap = getattr(args, "compile_max_variants", None)
     automatic = configured_cap is None
     cap = resolve_compile_max_variants(configured_cap)
-    if is_vlm:
+    vision_preference = isinstance(batches, FiniteVisionPreferenceBatchPlan)
+    strict = compile_policy.mode == "strict"
+    if vision_preference:
+        # The vision SFT planner's gates; the trainer reports an unqualified arch.
+        if compile_policy.mode == "eager":
+            return None, _shape_guard_report(
+                "not_applicable", "compile_disabled", cap,
+            ), True, None
+        if not getattr(vlm_compile_decision, "enabled", False):
+            return None, _shape_guard_report(
+                "not_applicable", "vlm_compile_unqualified", cap,
+            ), True, None
+        strict = _effective_compile_mode(
+            compile_policy, vlm_compile_decision,
+        ) == "strict"
+        if (
+            _resolve_mlx_grad_clipping(args)[0] > 0
+            and args.gradient_accumulation_steps > 1
+        ):
+            return None, _shape_guard_report(
+                "not_applicable", "compile_ineligible_global_norm", cap,
+            ), False, None
+    elif is_vlm:
         return _plan_single_process_vlm_shapes(
             batches,
             batch_iter,
@@ -2307,6 +2374,26 @@ def _plan_single_process_text_shapes(
         )
     else:
         total_microsteps = total_steps * grad_accum
+    if vision_preference:
+        batches.ensure_descriptors()
+        unplannable = sorted(
+            index
+            for index in {
+                batches.batch_index_for_visit(microstep)
+                for microstep in range(total_microsteps)
+            }
+            if not _vlm_family_is_plannable(batches.batch_family(index))
+        )
+        if unplannable:
+            if strict:
+                raise RuntimeError(
+                    "Unsloth: strict mx.compile cannot plan VLM batch "
+                    f"{unplannable[0]}: its compile-key family is not stable "
+                    "enough to group safely."
+                )
+            return None, _shape_guard_report(
+                "eager", "vlm_unplannable_family", cap, compile_scope,
+            ), False, None
     event_counts = {}
     for microstep in range(total_microsteps):
         # Same visit mapping as the runtime fetch, so the enumerated catalog
@@ -2338,7 +2425,13 @@ def _plan_single_process_text_shapes(
         frontier = build_text_shape_frontier(
             events, compile_scope=compile_scope,
         )
-        shape_plan = select_text_shape_padding_budget(frontier)
+        shape_plan = select_text_shape_padding_budget(
+            frontier,
+            # Media families keep their own endpoints, so padding buys no reuse.
+            exact_signature_threshold=(
+                AUTOMATIC_TEXT_COMPILE_CEILING if vision_preference else None
+            ),
+        )
     else:
         shape_plan = plan_text_shape_buckets(
             events,
@@ -2346,7 +2439,7 @@ def _plan_single_process_text_shapes(
             compile_scope=compile_scope,
         )
     if shape_plan.report.action == "eager":
-        if compile_policy.mode == "strict" and distributed_world_size <= 1:
+        if strict and distributed_world_size <= 1:
             raise RuntimeError(
                 "Unsloth: strict mx.compile finite text shape planning failed "
                 f"({shape_plan.report.reason})."
@@ -2414,6 +2507,17 @@ def _preference_metric_values(names, denominators, summed):
     return values
 
 
+def _preference_report(loss_fn, summed):
+    """A loss function's own report of its summed stats, else one mean per metric."""
+    report = getattr(loss_fn, "_unsloth_preference_report", None)
+    if report is not None:
+        return report(summed)
+    return _preference_metric_values(
+        loss_fn._unsloth_preference_metrics,
+        loss_fn._unsloth_preference_denominators, summed,
+    )
+
+
 def _warn_resume_adapter_mismatch(model, adapter_file):
     """Say so when a checkpoint does not cover the LoRA modules now wrapped.
 
@@ -2472,25 +2576,56 @@ class MLXTrainer:
         if policy is None:
             policy = resolve_preference_length_policy(
                 self.preference_kind, args, max_seq_length=args.max_seq_length,
+                tokenizer=self.tokenizer if self.preference_kind == "kto" else None,
             )
             self._resolved_preference_length_policy = policy
         return policy
 
-    def _build_dpo_reference(self, model, *, resume_provenance):
+    def _kto_objective(self, args):
+        return resolve_preference_objective(
+            "kto", beta=args.beta, loss_type=args.loss_type,
+            desirable_weight=args.desirable_weight,
+            undesirable_weight=args.undesirable_weight,
+        )
+
+    def _uses_reference(self, args):
+        return self.preference_kind == "kto" or (
+            self.preference_kind == "dpo" and not bool(args.reference_free)
+        )
+
+    def _reference_adapter_names(self, args):
+        return (
+            getattr(args, "model_adapter_name", None),
+            getattr(args, "ref_adapter_name", None),
+        )
+
+    def _preference_vision_options(self):
+        """What a preference plan needs to encode rows for a vision-language model."""
+        if not self._is_vlm:
+            return {}
+        return dict(
+            processor=self._resolve_vlm_processor(),
+            model_config=getattr(self.model, "_config", {}),
+            image_size=getattr(self.args, "image_size", None),
+        )
+
+    def _build_reference(self, model, *, resume_provenance):
         args = self.args
+        model_adapter_name, ref_adapter_name = self._reference_adapter_names(args)
         return build_reference_policy(
             model,
-            reference_free=bool(args.reference_free),
+            reference_free=not self._uses_reference(args),
             resume_provenance=resume_provenance,
             neftune=(
                 [self._neftune_emb]
                 if getattr(self, "_neftune_emb", None) is not None else []
             ),
-            ref_adapter_name=getattr(args, "ref_adapter_name", None),
-            model_adapter_name=getattr(args, "model_adapter_name", None),
+            ref_adapter_name=ref_adapter_name,
+            model_adapter_name=model_adapter_name,
             ref_model=getattr(self, "ref_model", None),
             force_use_ref_model=bool(getattr(args, "force_use_ref_model", False)),
             sync_ref_model=bool(getattr(args, "sync_ref_model", False)),
+            objective_name=self.preference_kind.upper(),
         )
 
     def __init__(
@@ -4718,10 +4853,6 @@ class MLXTrainer:
             metrics = {}
             # Set by the preference scorer, which has no perplexity to report.
             metric_names = getattr(loss_fn, "_unsloth_preference_metrics", None)
-            # Means over tokens carry their own denominator in the same vector.
-            metric_denominators = getattr(
-                loss_fn, "_unsloth_preference_denominators", None,
-            ) or {}
 
             def _record(prefix, losses, weights, stats):
                 """Write one scope's metrics and return its mean loss."""
@@ -4737,8 +4868,8 @@ class MLXTrainer:
                             stats[0].item() / total
                         )
                 elif total > 0:
-                    for name, metric in _preference_metric_values(
-                        metric_names, metric_denominators, stats.tolist(),
+                    for name, metric in _preference_report(
+                        loss_fn, stats.tolist(),
                     ).items():
                         metrics[f"{prefix}{name}"] = metric
                 return value
@@ -5358,7 +5489,10 @@ class MLXTrainer:
             # setup in between is rank-deterministic and needs no collectives.
             # A strict abort here unwinds through train()'s finally, and the
             # state that persists is idempotent if train() is called again.
-            if self._is_vlm and hasattr(self, "_batches"):
+            if (
+                self._is_vlm and not self.preference_kind
+                and hasattr(self, "_batches")
+            ):
                 preflight_error = None
                 batches = batch_iter = None
                 total_steps = 0
@@ -6026,7 +6160,7 @@ class MLXTrainer:
         self._reset_run_state()
 
         _resume_step = 0
-        _dpo_reference = None
+        _reference = None
         _sync_reference = (
             preference_kind == "dpo" and not bool(args.reference_free)
             and bool(getattr(args, "sync_ref_model", False))
@@ -6068,9 +6202,15 @@ class MLXTrainer:
                     raise ValueError(
                         "Unsloth MLX DPO: checkpoint reference mode does not match."
                     )
-                if preference_kind == "dpo" and not bool(args.reference_free):
+                if preference_kind == "kto":
+                    resume_provenance = dict(resume_provenance)
+                    if resume_provenance.pop("objective", None) != "kto":
+                        raise ValueError(
+                            "Unsloth MLX KTO: checkpoint objective does not match."
+                        )
+                if self._uses_reference(args):
                     # Built before the checkpoint hydrates the model.
-                    _dpo_reference = self._build_dpo_reference(
+                    _reference = self._build_reference(
                         model, resume_provenance=resume_provenance,
                     )
 
@@ -6087,7 +6227,7 @@ class MLXTrainer:
                 # 2. Restore optimizer state (Adam moments m,v, step counter).
                 load_optimizer_state(optimizer, _resume_from)
                 if _sync_reference:
-                    _dpo_reference[0].load(_resume_from)
+                    _reference[0].load(_resume_from)
                 # 3. Restore trainer scalars (step counter, loss history, and
                 #    best-model / early-stopping tracking). .get defaults keep
                 #    pre-fix SFT checkpoints resumable.
@@ -6192,6 +6332,27 @@ class MLXTrainer:
                     "kind": "orpo_no_reference"
                 }
                 _main_print(f"Unsloth: Using ORPO loss (beta={args.beta}).")
+            elif preference_kind == "kto":
+                objective = self._kto_objective(args)
+                if _reference is None:
+                    _reference = self._build_reference(model, resume_provenance=None)
+                reference_policy, provenance = _reference
+                self._preference_reference_provenance = {**provenance, "objective": "kto"}
+                _sampling_reference = reference_policy
+                loss_fn = (
+                    make_kto_cce_loss_fn(model, objective, reference_policy=reference_policy)
+                    if args.use_cce else
+                    make_kto_loss_fn(objective, reference_policy=reference_policy)
+                )
+                use_cce = hasattr(loss_fn, "_unsloth_cce_backend")
+                warn_kto_weight_balance(
+                    [row.label for row in batches.rows],
+                    objective.desirable_weight, objective.undesirable_weight,
+                )
+                _main_print(
+                    f"Unsloth: Using KTO loss (beta={args.beta}, "
+                    f"loss_type={objective.loss_types[0]})."
+                )
             else:
                 objective = resolve_preference_objective(
                     "dpo",
@@ -6202,11 +6363,11 @@ class MLXTrainer:
                     discopop_tau=args.discopop_tau,
                     reference_free=bool(args.reference_free),
                 )
-                if _dpo_reference is None:
-                    _dpo_reference = self._build_dpo_reference(
+                if _reference is None:
+                    _reference = self._build_reference(
                         model, resume_provenance=ts.get("preference_reference"),
                     )
-                reference_policy, provenance = _dpo_reference
+                reference_policy, provenance = _reference
                 self._preference_reference_provenance = provenance
                 _sampling_reference = reference_policy
                 loss_fn = (make_dpo_cce_loss_fn(model, objective, reference_policy=reference_policy)
@@ -6925,6 +7086,24 @@ class MLXTrainer:
             else:
                 def _create_eval_batches(eval_dataset, _split_name=None):
                     """Build evaluation batches for one dataset split."""
+                    prompt_sink = (
+                        (lambda text, _n=_split_name: _capture_generation_prompt(_n, text))
+                        if _samples_prompts else None
+                    )
+                    if self.preference_kind == "kto":
+                        # TRL pairs eval KL rows in chunks of the train batch size.
+                        return create_kto_batch_plan(
+                            _format_preference_split(_split_name, eval_dataset),
+                            self.tokenizer,
+                            batch_size=eval_batch_size,
+                            kl_batch_size=args.per_device_train_batch_size,
+                            length_policy=self._preference_length_policy(args),
+                            with_kl=self._kto_objective(args).with_kl,
+                            num_epochs=1,
+                            grad_accum=1,
+                            append_eos=bool(args.append_eos),
+                            prompt_sink=prompt_sink,
+                        )
                     if self.preference_kind:
                         # Sequential, so every evaluation scores the same
                         # batches in the declared order. grad_accum=1 leaves each
@@ -6940,11 +7119,8 @@ class MLXTrainer:
                             seed=args.seed,
                             append_eos=bool(args.append_eos),
                             formatting_func=None,
-                            prompt_sink=(
-                                (lambda text, _n=_split_name:
-                                 _capture_generation_prompt(_n, text))
-                                if _samples_prompts else None
-                            ),
+                            prompt_sink=prompt_sink,
+                            **self._preference_vision_options(),
                         )
                     if is_vlm:
                         if not _vlm_has_sized_index_space(eval_dataset):
@@ -7039,8 +7215,8 @@ class MLXTrainer:
                 _sampling_reference.release()
             _main_print(
                 "Unsloth: precomputed the reference log probabilities "
-                f"({len(batches.rows)} training rows, {_train_chunk} pairs "
-                "per chunk)."
+                f"({len(batches.rows)} training rows, {_train_chunk} "
+                f"{'rows' if preference_kind == 'kto' else 'pairs'} per chunk)."
             )
 
         def _fire(event, **kwargs):
@@ -7368,11 +7544,7 @@ class MLXTrainer:
                     metric_stats, stream=mx.cpu,
                 )
                 mx.eval(summed_stats)
-                logs.update(_preference_metric_values(
-                    loss_fn._unsloth_preference_metrics,
-                    loss_fn._unsloth_preference_denominators,
-                    summed_stats.tolist(),
-                ))
+                logs.update(_preference_report(loss_fn, summed_stats.tolist()))
             # HF's Trainer.log stamps the epoch onto every payload, so a persisted
             # log_history entry keeps it after state.epoch has moved on.
             if self.state.epoch is not None:
@@ -7525,7 +7697,8 @@ class MLXTrainer:
             try:
                 val_loss, ppl = self._evaluate(
                     current_eval_batches, preference_eval_fn or loss_fn,
-                    is_vlm=is_vlm,
+                    # A preference batch is a tuple even when it carries pixels.
+                    is_vlm=is_vlm and not preference_kind,
                 )
             finally:
                 resume_mlx_training_patches(_paused_window)
@@ -7553,12 +7726,16 @@ class MLXTrainer:
             elif ppl is None:
                 # No per-token likelihood to exponentiate.
                 _scores = self._last_eval_metrics or {}
-                _accuracy = _scores.get("eval_rewards/accuracies", float("nan"))
                 _margin = _scores.get("eval_rewards/margins", float("nan"))
+                # KTO rows are unpaired, so there is no accuracy; TRL logs its KL.
+                _signal = (
+                    f"KL: {_scores.get('eval_kl', float('nan')):.4f}"
+                    if preference_kind == "kto" else
+                    f"Rewards Acc: {_scores.get('eval_rewards/accuracies', float('nan')):.4f}"
+                )
                 _main_print(
                     f"  Eval  {current_step}/{total_steps} | "
-                    f"Val Loss: {val_loss:.4f} | "
-                    f"Rewards Acc: {_accuracy:.4f} | "
+                    f"Val Loss: {val_loss:.4f} | {_signal} | "
                     f"Margin: {_margin:.4f}"
                 )
             else:
@@ -7967,7 +8144,7 @@ class MLXTrainer:
                 _ddp_compile_local_grad = False
                 if _stream_policy is not None:
                     _stream_policy.armed = False
-                if isinstance(batches, _EAGER_REFETCHABLE_PLAN_TYPES):
+                if _eager_refetchable(batches):
                     batch_data = batches[scheduled_index]
                 state = [
                     model.state, optimizer.state, mx.random.state,
@@ -8378,7 +8555,7 @@ class MLXTrainer:
                         _compile_fallback_reason = "runtime_error"
                         if _stream_policy is not None:
                             _stream_policy.armed = False
-                        if isinstance(batches, _EAGER_REFETCHABLE_PLAN_TYPES):
+                        if _eager_refetchable(batches):
                             batch_data = batches[scheduled_index]
                         _restore_mlx_rng_key(rng_state_before)
                         state = [
@@ -8985,9 +9162,9 @@ class MLXTrainer:
         model_type = config.get("model_type") if isinstance(config, dict) else None
         model_name = getattr(self.model, "_hf_repo", None)
 
-        if self.preference_kind and is_vlm:
+        if self.preference_kind == "kto" and is_vlm:
             raise ValueError(
-                "Unsloth MLX preference: vision-language models are not supported."
+                "Unsloth MLX KTO: vision-language models are not supported."
             )
 
         if is_vlm:
@@ -9074,6 +9251,13 @@ class MLXTrainer:
                     "eval_dataset instead."
                 )
             if _sampling_eval:
+                if is_vlm:
+                    raise ValueError(
+                        "Unsloth MLX preference: generate_during_eval samples "
+                        "from token ids alone, so a vision-language model's "
+                        "prompts would lose their images. Turn it off for this "
+                        "model."
+                    )
                 if self.eval_dataset is None:
                     raise ValueError(
                         "Unsloth MLX preference: generate_during_eval needs an "
@@ -9135,6 +9319,15 @@ class MLXTrainer:
                 )
             if not math.isfinite(float(args.beta)) or float(args.beta) < 0:
                 raise ValueError("Unsloth MLX preference: beta must be finite and non-negative.")
+            if self.preference_kind == "kto":
+                objective = self._kto_objective(args)
+                if objective.with_kl and args.per_device_train_batch_size <= 1:
+                    raise ValueError(
+                        "Unsloth MLX KTO: loss_type='kto' needs "
+                        "per_device_train_batch_size > 1, since each row's KL term "
+                        "scores its prompt against another row's completion in its "
+                        "batch; with one row it equals the row's own reward."
+                    )
             if self.preference_kind == "dpo":
                 smoothing = float(args.label_smoothing)
                 if not math.isfinite(smoothing) or not 0 <= smoothing < 0.5:
@@ -9157,19 +9350,19 @@ class MLXTrainer:
                         )
                 if bool(getattr(args, "precompute_ref_log_probs", False)) and not bool(
                     args.reference_free
-                ):
-                    if bool(getattr(args, "sync_ref_model", False)):
-                        raise ValueError(
-                            "Unsloth MLX DPO: precompute_ref_log_probs scores "
-                            "the reference once, and sync_ref_model moves it "
-                            "during the run. Use one of the two."
-                        )
-                    chunk = getattr(args, "precompute_ref_batch_size", None)
-                    if chunk is not None and int(chunk) < 1:
-                        raise ValueError(
-                            "Unsloth MLX DPO: precompute_ref_batch_size must be "
-                            "at least 1."
-                        )
+                ) and bool(getattr(args, "sync_ref_model", False)):
+                    raise ValueError(
+                        "Unsloth MLX DPO: precompute_ref_log_probs scores "
+                        "the reference once, and sync_ref_model moves it "
+                        "during the run. Use one of the two."
+                    )
+            if bool(getattr(args, "precompute_ref_log_probs", False)) and self._uses_reference(args):
+                chunk = getattr(args, "precompute_ref_batch_size", None)
+                if chunk is not None and int(chunk) < 1:
+                    raise ValueError(
+                        f"Unsloth MLX {self.preference_kind.upper()}: "
+                        "precompute_ref_batch_size must be at least 1."
+                    )
             try:
                 len(train_dataset)
                 train_dataset[0]
@@ -9187,6 +9380,23 @@ class MLXTrainer:
                 if args.max_steps <= 0 and args.num_train_epochs > 0 else None
             )
             self._prepared_batches_include_epochs = preference_epochs is not None
+            if self.preference_kind == "kto":
+                return create_kto_batch_plan(
+                    train_dataset,
+                    self.tokenizer,
+                    batch_size=args.per_device_train_batch_size,
+                    kl_batch_size=args.per_device_train_batch_size,
+                    length_policy=self._preference_length_policy(args),
+                    with_kl=self._kto_objective(args).with_kl,
+                    num_batches=total_batches_needed,
+                    num_epochs=preference_epochs,
+                    grad_accum=args.gradient_accumulation_steps,
+                    append_eos=bool(args.append_eos),
+                    formatting_func=self.formatting_func,
+                    dataset_order=args.dataset_order,
+                    preserve_dataset_order=args.preserve_dataset_order,
+                    seed=args.seed,
+                ), None
             return create_preference_batch_plan(
                 train_dataset,
                 self.tokenizer,
@@ -9200,6 +9410,7 @@ class MLXTrainer:
                 seed=args.seed,
                 append_eos=bool(args.append_eos),
                 formatting_func=self.formatting_func,
+                **self._preference_vision_options(),
             ), None
 
         if self._batches is not None:
@@ -9688,6 +9899,32 @@ class MLXDPOTrainer(MLXTrainer):
     def __init__(self, *args, ref_model=None, **kwargs):
         self.ref_model = ref_model
         super().__init__(*args, **kwargs)
+
+
+class MLXKTOTrainer(MLXTrainer):
+    """MLX trainer for Kahneman-Tversky Optimization on unpaired, labeled
+    completions; the reference is chosen as for MLXDPOTrainer. As in TRL,
+    ``model_adapter_name`` and ``ref_adapter_name`` are trainer arguments."""
+
+    config_class = MLXKTOConfig
+    preference_kind = "kto"
+
+    # Positional order differs from MLXTrainer's: the config has always come fourth here.
+    def __init__(
+        self, model, tokenizer, train_dataset, args=None, eval_dataset=None,
+        processor=None, ref_model=None, model_adapter_name=None,
+        ref_adapter_name=None, **kwargs,
+    ):
+        self.ref_model = ref_model
+        self.model_adapter_name = model_adapter_name
+        self.ref_adapter_name = ref_adapter_name
+        super().__init__(
+            model, tokenizer, train_dataset, args=args, eval_dataset=eval_dataset,
+            processor=processor, **kwargs,
+        )
+
+    def _reference_adapter_names(self, args):
+        return self.model_adapter_name, self.ref_adapter_name
 
 
 def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
@@ -10311,327 +10548,474 @@ def train_on_responses_only(
     return trainer
 
 
-# KTO (TRL KTOTrainer, loss_type="kto", arXiv:2402.01306 Eqn 7).
+HEAD_LEARNING_RATE = 1e-4
 
 
-@dataclass(init=False)
-class MLXKTOConfig(MLXTrainingConfig):
-    """TRL KTOConfig fields. init=False: a generated __init__ would bypass MLXTrainingConfig.__init__."""
-
-    beta: float = 0.1
-    desirable_weight: float = 1.0
-    undesirable_weight: float = 1.0
-    max_length: int = 1024
-    max_prompt_length: int = 512
-    max_completion_length: int | None = None
-    loss_type: str = "kto"
-    disable_dropout: bool = True
-
-
-def _kto_sum_logp(logits, labels):
-    """TRL get_batch_logps(average_log_prob=False): summed shifted logps, -100 masked."""
-    inp = logits[:, :-1, :]
-    tgt = labels[:, 1:]
-    mask = (tgt != -100).astype(mx.float32)
-    safe = mx.where(tgt == -100, mx.array(0, dtype=tgt.dtype), tgt)
-    return (-nn.losses.cross_entropy(inp, safe) * mask).sum(axis=1)
+def _length_grouped_batches(lengths, batch_size, rng):
+    # Similar-length micro-batches, shuffled so a step mixes lengths; the longest first so an out-of-memory shows early.
+    order = list(range(len(lengths)))
+    rng.shuffle(order)
+    mega = batch_size * max(1, min(len(order) // (batch_size * 4), 50))
+    order = [i for start in range(0, len(order), mega) for i in sorted(order[start : start + mega], key = lambda i: -lengths[i])]
+    batches = [order[i : i + batch_size] for i in range(0, len(order), batch_size)]
+    short = [batches.pop()] if len(batches) > 1 and len(batches[-1]) < batch_size else []
+    longest = max(range(len(batches)), key = lambda b: max(lengths[i] for i in batches[b]))
+    first = batches.pop(longest)
+    rng.shuffle(batches)
+    return [first] + batches + short
 
 
-def _kto_kl_baseline(pol_kl, ref_kl):
-    """Detached clamp(mean(policy_KL - reference_KL), min=0), as in TRL."""
-    return mx.stop_gradient(mx.maximum((pol_kl - ref_kl).mean(), 0.0))
+# transformers.Trainer.get_decay_parameter_names: LayerNorm modules, and biases and norms by name.
+_NO_DECAY_NAME = re.compile(r"bias|layernorm|rmsnorm|(?:^|\.)norm(?:$|\.)|_norm(?:$|\.)")
 
 
-def _kto_loss(policy, reference, desirable, kl, beta, desirable_weight, undesirable_weight):
-    """TRL kto loss averaged over every row; gradient flows only through ``policy``."""
-    logratio = policy - reference
-    chosen = desirable_weight * (1 - mx.sigmoid(beta * (logratio - kl)))
-    rejected = undesirable_weight * (1 - mx.sigmoid(beta * (kl - logratio)))
-    return mx.where(desirable, chosen, rejected).mean()
+def _no_decay_names(model):
+    names = set()
+    for path, module in model.named_modules():
+        for name, _ in tree_flatten(module.trainable_parameters()):
+            full = f"{path}.{name}" if path else name
+            if isinstance(module, nn.LayerNorm) or _NO_DECAY_NAME.search(full.lower()):
+                names.add(full)
+    return names
 
 
-def _kto_pad(seqs, fill):
-    length = max(len(s) for s in seqs)
-    return mx.array([list(s) + [fill] * (length - len(s)) for s in seqs])
+def _optimizer_states(optimizers):
+    # Each of `MLXDecisionTrainer._optimizers` under the name its state has in a checkpoint.
+    return [(f"{'encoder' if encoder else 'head'}_{'decay' if decay else 'plain'}", optimizer) for (encoder, decay), (_, optimizer) in optimizers.items()]
 
 
-def _kto_fit_prompt(prompt_ids, completion_ids, max_length):
-    if max_length and max_length > 0 and len(prompt_ids) + len(completion_ids) > max_length:
-        keep = max_length - len(completion_ids)
-        return prompt_ids[-keep:] if keep > 0 else []
-    return prompt_ids
+_EvalPrediction = collections.namedtuple("EvalPrediction", ["predictions", "label_ids"])
+_PredictionOutput = collections.namedtuple("PredictionOutput", ["predictions", "label_ids", "metrics"])
 
 
-def _kto_tokenize_row(tokenizer, row, args):
-    # Joint encode like SFT and TRL: BOS, chat template (with tools) for conversational rows, EOS policy.
-    keys = ("prompt", "completion", "tools", "chat_template_kwargs")
-    encoded = _tokenize_mlx_prompt_completion_row(
-        tokenizer, {k: row[k] for k in keys if k in row}, append_eos=bool(args.append_eos),
-    )
-    if encoded is None:
-        raise ValueError("Unsloth: KTO rows need a text or conversational 'prompt' and 'completion'.")
-    input_ids, labels = encoded
-    split = next((i for i, lab in enumerate(labels) if lab != -100), len(labels))
-    p, c = list(input_ids[:split]), list(input_ids[split:])
-    caps = [x for x in (args.max_completion_length, args.max_length) if x and x > 0]
-    if caps and len(c) > min(caps):
-        # Unlike TRL, keep a trailing EOS so truncated rows still teach termination.
-        eos = getattr(tokenizer, "eos_token_id", None)
-        keep_eos = int(eos is not None and c[-1] == eos)
-        c = c[:min(caps) - keep_eos] + [eos] * keep_eos
-    if args.max_prompt_length and args.max_prompt_length > 0:
-        p = p[-args.max_prompt_length:]
-    return _kto_fit_prompt(p, c, args.max_length), c
+def _stack_ragged(arrays):
+    # Batches differ in their widest decision; transformers pads what it gathers across batches with -100.
+    if arrays[0].ndim < 2:
+        return np.concatenate(arrays)
+    width, rest = max(array.shape[1] for array in arrays), [(0, 0)] * (arrays[0].ndim - 2)
+    return np.concatenate([np.pad(array, [(0, 0), (0, width - array.shape[1]), *rest], constant_values = -100) for array in arrays])
 
 
-_KTO_LABELS = {"true": True, "1": True, "1.0": True, "yes": True,
-               "false": False, "0": False, "0.0": False, "no": False}
+class MLXDecisionTrainer:
+    """Trains a decision model on soft cross-entropy over each decision's option logits.
 
+    `args` is an `MLXTrainingConfig`. Parameters under `encoder.` train at `args.learning_rate` and the rest
+    at `head_learning_rate`, both under `args.lr_scheduler_type`. `callbacks` are transformers `TrainerCallback`s.
+    `label_smoothing` smooths each decision's target toward uniform over its own options, `brier_weight` adds a Brier
+    term, and `ordinal_weight` adds a Clef score question's expected distance from its gold level. `kl_weight` penalizes
+    a LoRA Clef's divergence from the model it started as (adapters off, the head as it is now). `permute_fields` trains
+    a Clef on each record's questions in a new order every epoch; evaluation keeps the dataset's.
 
-def _kto_parse_label(value):
-    # bool("false") is True, so CSV string labels are parsed, never truth-tested.
-    if isinstance(value, (bool, int, float)):
-        return bool(value)
-    if isinstance(value, str) and value.strip().lower() in _KTO_LABELS:
-        return _KTO_LABELS[value.strip().lower()]
-    raise ValueError(f"Unsloth: KTO label {value!r} is not a boolean (use True/False, 1/0 or 'true'/'false').")
+    Evaluation follows `transformers.Trainer`: `args.eval_strategy`, `eval_steps` and `eval_delay` schedule it, each
+    batch's loss is its mean over decisions and batches weigh by their rows, and `compute_metrics` receives the option
+    logits and the soft targets, one row per decision (`preprocess_logits_for_metrics` first, when given).
+    """
 
+    def __init__(
+        self,
+        model,
+        args = None,
+        train_dataset = None,
+        eval_dataset = None,
+        pad_token_id = 0,
+        head_learning_rate = None,
+        callbacks = None,
+        processing_class = None,
+        label_smoothing = 0.0,
+        brier_weight = 0.0,
+        ordinal_weight = 0.0,
+        kl_weight = 0.0,
+        permute_fields = False,
+        compute_metrics = None,
+        preprocess_logits_for_metrics = None,
+    ):
+        self.compute_metrics, self.preprocess_logits_for_metrics = compute_metrics, preprocess_logits_for_metrics
+        self.model = model
+        self._reference = None
+        if kl_weight:
+            if not hasattr(model, "kl_reference"):
+                raise NotImplementedError("Unsloth: kl_weight needs a Clef decision model.")
+            self._reference = (model.kl_reference(), float(kl_weight))
+        self._permute = getattr(model, "permuted_item", None) if permute_fields else None
+        objective = tuple(float(value or 0.0) for value in (label_smoothing, brier_weight, ordinal_weight))
+        self.objective = objective if any(objective) else None
+        # A copy, as in MLXTrainer: callbacks read the metric's direction off the arguments as a real boolean.
+        self.args = copy.copy(args) if args is not None else MLXTrainingConfig()
+        self.args.greater_is_better = _resolve_greater_is_better(self.args)
+        self.train_dataset = train_dataset
+        self.eval_dataset = eval_dataset
+        self.pad_token_id = pad_token_id
+        self.head_learning_rate = HEAD_LEARNING_RATE if head_learning_rate is None else head_learning_rate
+        self.state = _MLXTrainerState()
+        self.control = _MLXTrainerControl()
+        self.callback_handler = _MLXCallbackHandler(callbacks or [], model, processing_class, None, None)
+        self._report_to = (None, None)
 
-def _kto_rows(dataset, tokenizer, args):
-    """Tokenized rows; each carries the previous row's completion within its batch as the KL
-    completion, assigned in dataset order (TRL _get_kl_dataset)."""
-    rows = []
-    for ex in dataset:
-        missing = [k for k in ("prompt", "completion", "label") if k not in ex]
-        if missing:
-            raise ValueError(f"Unsloth: KTO rows need 'prompt', 'completion' and a binary 'label'; missing {missing}.")
-        p, c = _kto_tokenize_row(tokenizer, ex, args)
-        if c:
-            rows.append((p, c, _kto_parse_label(ex["label"])))
-    bs = int(args.per_device_train_batch_size)
-    out = []
-    for i in range(0, len(rows), bs):
-        chunk = rows[i:i + bs]
-        # A lone tail row borrows the previous row's completion rather than scoring its own.
-        rolled = chunk[-1:] + chunk[:-1] if len(chunk) > 1 else rows[i - 1:i]
-        for (p, c, label), (_, kl_c, _) in zip(chunk, rolled):
-            # A prompt fitted to its own completion can overflow max_length with another row's.
-            out.append((p, c, _kto_fit_prompt(p, kl_c, args.max_length), kl_c, label))
-    return out
+    def _resolve_warmup_steps(self, total_steps):
+        return MLXTrainer._resolve_warmup_steps(self, total_steps)
 
+    # What transformers callbacks read from the arguments and the state, as MLXTrainer provides it.
+    _ensure_callback_args_compat = MLXTrainer._ensure_callback_args_compat
+    _sync_synthesized_arg = MLXTrainer._sync_synthesized_arg
+    _metric_for_best_model_name = MLXTrainer._metric_for_best_model_name
+    _update_callback_best_metric = MLXTrainer._update_callback_best_metric
 
-def _kto_batch(rows, pad_id):
-    return dict(
-        comp_ids=_kto_pad([p + c for p, c, _, _, _ in rows], pad_id),
-        comp_labels=_kto_pad([[-100] * len(p) + c for p, c, _, _, _ in rows], -100),
-        kl_ids=_kto_pad([p + c for _, _, p, c, _ in rows], pad_id),
-        kl_labels=_kto_pad([[-100] * len(p) + c for _, _, p, c, _ in rows], -100),
-        desirable=mx.array([label for *_, label in rows]),
-    )
+    def _default_callback_eval_strategy(self):
+        return "no" if not self.eval_dataset else "steps" if getattr(self.args, "eval_steps", 0) else "epoch"
 
+    def _strategy(self, name, default):
+        value = getattr(self.args, name, None)
+        return str(getattr(value, "value", value) or default).lower()
 
-def _kto_logps(model, ids, labels):
-    return _kto_sum_logp(model(ids), labels)
+    def _schedule_multiplier(self, total_steps):
+        # As torch schedulers do, one multiplier scales every group's learning rate, so an absolute floor follows the encoder's.
+        base = self.args.learning_rate or self.head_learning_rate
+        if not base:
+            return lambda step: 0.0
+        host = copy.copy(self)
+        host.args = copy.copy(self.args)
+        host.args.learning_rate = base
+        schedule = MLXTrainer._build_schedule(host, total_steps)
+        return lambda step: float(MLXTrainer._schedule_value(schedule, step)) / base
 
-
-def _kto_reference_logps(model, reference, batch):
-    """Score with the start weights, like TRL's frozen "ref" adapter copy (a fresh LoRA scores as the base)."""
-    current = tree_flatten(model.trainable_parameters())
-    model.update(tree_unflatten(reference))
-    try:
-        return (_kto_logps(model, batch["comp_ids"], batch["comp_labels"]),
-                _kto_logps(model, batch["kl_ids"], batch["kl_labels"]))
-    finally:
-        model.update(tree_unflatten(current))
-
-
-class MLXKTOTrainer(MLXTrainer):
-    """MLX KTO trainer (TRL KTOTrainer API) for LoRA models; the reference is the policy at the start."""
-
-    def __init__(self, model, tokenizer, train_dataset, args=None,
-                 eval_dataset=None, processor=None, ref_model=None, **kwargs):
-        self._kto_ignored_kwargs = sorted(kwargs)
-        args = MLXKTOConfig() if args is None else args
-        if not isinstance(args, MLXKTOConfig):
-            raise TypeError(f"Unsloth: MLXKTOTrainer requires an MLXKTOConfig, got {type(args).__name__}.")
-        self.model, self.tokenizer, self.processor, self.args = model, tokenizer, processor, args
-        self.train_dataset, self.eval_dataset, self.ref_model = train_dataset, eval_dataset, ref_model
-        self._is_vlm = False
-        self.formatting_func = None
-        self._ensure_lora_frozen(model)
-        self._reset_run_state()
-        self._run_generation = 0
-        self.stop_requested = False
-        self._batches = None
-        self._step_callbacks = []
-        self._eval_callbacks = []
-        self._kl_history = []
-        self._kto_reference = None
-
-    def _reject_unsupported(self, resume_from_checkpoint):
-        args, model = self.args, self.model
-        unsupported = {
-            "loss_type other than 'kto'": args.loss_type != "kto",
-            "ref_model (the reference is the policy's start weights)": self.ref_model is not None,
-            "models without LoRA adapters (call get_peft_model first)":
-                next(iter_mlx_lora_modules(model), None) is None,
-            "gated-delta models (Qwen3.5 / Qwen3-Next)": model_has_gated_delta_layers(model),
-            "vision-language models": any(
-                hasattr(x, "image_processor") for x in (self.tokenizer, self.processor)
-            ),
-            "per_device_train_batch_size < 2 (the KL rows need two rows)":
-                int(args.per_device_train_batch_size) < 2,
-            "streaming datasets": bool(getattr(args, "streaming", False))
-                or not hasattr(self.train_dataset, "__len__"),
-            "lora_plus_ratio": float(getattr(args, "lora_plus_ratio", 0) or 0) > 0,
-            "embedding_learning_rate": float(getattr(args, "embedding_learning_rate", 0) or 0) > 0,
-            "neftune_noise_alpha": float(getattr(args, "neftune_noise_alpha", 0) or 0) > 0,
-            "report_to trackers (use add_step_callback)": any(
-                r not in ("none", "") for r in ([args.report_to] if isinstance(args.report_to, str) else args.report_to or [])
-            ),
-            f"dataset_order={args.dataset_order!r} (use 'default', 'sequential' or 'torch_randperm')":
-                args.dataset_order not in (None, "default", "sequential", "torch_randperm"),
-            "resume_from_checkpoint": resume_from_checkpoint is not None,
-            "save_steps > 0 (adapters are saved at the end)": int(args.save_steps or 0) > 0,
-            "eval_dataset": self.eval_dataset is not None,
-            "distributed training": self.distributed_world_size > 1,
-            f"arguments {self._kto_ignored_kwargs}": bool(self._kto_ignored_kwargs),
-        }
-        found = [name for name, hit in unsupported.items() if hit]
-        if found:
-            raise NotImplementedError("Unsloth: MLXKTOTrainer does not support " + "; ".join(found) + ".")
-
-    def train(self, resume_from_checkpoint: str | None = None):
-        self._reject_unsupported(resume_from_checkpoint)
-        # As MLXTrainer.train: drop only a stop an earlier run latched, never a pre-train() cancel.
-        if self._stop_request_generation() < self._run_generation:
-            self.stop_requested = False
-        args, model = self.args, self.model
-        if args.chat_template is not None:
-            config = getattr(model, "_config", {})
-            self.tokenizer = normalize_mlx_chat_template(
-                self.tokenizer, chat_template=args.chat_template,
-                model_name=getattr(model, "_hf_repo", None),
-                model_type=config.get("model_type") if isinstance(config, dict) else None,
-                is_vlm=False, strict=False,
-            )
-        rows = _kto_rows(self.train_dataset, self.tokenizer, args)
-        if not rows:
-            raise ValueError("Unsloth: KTO needs at least 2 rows with non-empty completions.")
-        tok = self.tokenizer
-        pad_id = next((x for x in (tok.pad_token_id, tok.eos_token_id) if x is not None), 0)
-        bs = int(args.per_device_train_batch_size)
-        grad_accum = max(int(args.gradient_accumulation_steps), 1)
-        steps_per_epoch = math.ceil(math.ceil(len(rows) / bs) / grad_accum)  # a partial window still steps
-        if args.max_steps and args.max_steps > 0:
-            total_steps = args.max_steps
+    def _optimizers(self):
+        args = self.args
+        name = _normalize_mlx_optimizer_name(self.args.optim)
+        if name == "adamw":
+            cls = optim.AdamW
+        elif name == "adamw_8bit":
+            from .optimizers_quantized import QuantizedMomentAdamW as cls
         else:
-            epochs = float(args.num_train_epochs) if args.num_train_epochs and args.num_train_epochs > 0 else 1.0
-            total_steps = max(math.ceil(epochs * steps_per_epoch), 1)  # fractional epochs stop part-way
-        # Sequential like TRL's KTOConfig: KL partners share a fixed batch; torch_randperm moves whole batches.
-        permute = args.dataset_order == "torch_randperm" and not args.preserve_dataset_order
-        from .utils import _normalize_seed, _torch_randperm_order
-        seed = _normalize_seed(args.seed)
-        fixed_batches = [rows[j:j + bs] for j in range(0, len(rows), bs)]
-        optimizer = self._build_optimizer(total_steps)
-        max_grad_norm, max_grad_value, max_grad_leaf_norm, _ = _resolve_mlx_grad_clipping(args)
-        if self._kto_reference is None:
-            self._kto_reference = tree_flatten(model.trainable_parameters())
-
-        def loss_fn(model, batch, ref, kl):
-            return _kto_loss(
-                _kto_logps(model, batch["comp_ids"], batch["comp_labels"]), ref, batch["desirable"], kl,
-                args.beta, args.desirable_weight, args.undesirable_weight,
+            raise NotImplementedError(
+                f"Unsloth: decision models train with AdamW on MLX (adamw or adamw_8bit), not {self.args.optim!r}."
             )
+        # MLX defaults bias_correction to False, unlike torch.
+        kwargs = {"bias_correction": True}
+        if args.adam_beta1 is not None or args.adam_beta2 is not None:
+            kwargs["betas"] = (
+                float(0.9 if args.adam_beta1 is None else args.adam_beta1),
+                float(0.999 if args.adam_beta2 is None else args.adam_beta2),
+            )
+        if args.adam_epsilon is not None:
+            kwargs["eps"] = _resolve_adam_epsilon(args.adam_epsilon)
+        no_decay = _no_decay_names(self.model)
+        groups = {}
+        for name, _ in tree_flatten(self.model.trainable_parameters()):
+            groups.setdefault((name.startswith("encoder."), name not in no_decay), []).append(name)
+        return {
+            key: (set(names), cls(learning_rate = 0.0, weight_decay = float(args.weight_decay or 0.0) if key[1] else 0.0, **kwargs))
+            for key, names in groups.items()
+        }
 
-        value_and_grad = nn.value_and_grad(model, loss_fn)
-        start_time = time.perf_counter()
-        self._train_loss_history, self._kl_history, self._global_step = [], [], 0
-        dropout, checkpointed, patched, trained_tokens = None, False, False, 0
+    def _event(self, name, **kwargs):
+        self.control = self.callback_handler.call_event(name, self.args, self.state, self.control, **kwargs)
+
+    def _log(self, logs):
+        self.state.log_history.append({**logs, "step": self.state.global_step})
+        self._event("on_log", logs = logs)
+        on_step, on_eval = self._report_to
+        if on_eval and "eval_loss" in logs:
+            on_eval(self.state.global_step, logs["eval_loss"], None)
+        elif on_step and "learning_rate" in logs:
+            # Decision training counts no tokens.
+            on_step(self.state.global_step, self.state.max_steps, logs["loss"], logs["learning_rate"], 0.0, logs["peak_memory_gb"], 0.0, 0, logs.get("grad_norm"))
+
+    def _step(self, compiled = False):
+        from .decision import _MarkerStep
+
+        build = getattr(self.model, "decision_step", None)
+        if build:
+            return build(compiled, self.objective, self._reference)
+        return _MarkerStep(self.model, self.pad_token_id, compiled, self.objective)
+
+    def _batches(self, order, size, grouped = None):
+        batches = grouped or [order[i : i + size] for i in range(0, len(order), size)]
+        if getattr(self.args, "dataloader_drop_last", False) and len(batches) > 1 and len(batches[-1]) < size:
+            batches.pop()
+        return batches
+
+    def _evaluation(self, items, prefix, keep = False):
+        """Metrics of `items` in their own order, with the padded logits and targets when something reads them."""
+        model, args, step = self.model, self.args, self._step()
+        keep = keep or self.compute_metrics is not None
+        size = args.per_device_eval_batch_size or args.per_device_train_batch_size
+        was_training, started = model.training, time.time()
+        model.eval()
+        total, rows, outputs = 0.0, 0, ([], [])
         try:
-            self._memory_limits_applied = self._configure_memory_limits()
-            if args.gradient_checkpointing:
-                apply_gradient_checkpointing(model)
-                checkpointed = True
-            acquire_mlx_training_patches()
-            patched = True
-            # As TRL's disable_dropout: policy, reference and KL forwards must not draw separate masks.
-            dropout = PreferenceRunContext(model, enabled=bool(args.disable_dropout))
-            model.train()
-            step, epoch = 0, 0
-            windows = []
-            while step < total_steps and not self.stop_requested:
-                if not windows:
-                    order = range(len(fixed_batches))
-                    if permute:
-                        order = _torch_randperm_order(len(fixed_batches), seed + epoch)
-                    epoch += 1
-                    batches = [fixed_batches[i] for i in order]
-                    windows = [batches[j:j + grad_accum] for j in range(0, len(batches), grad_accum)]
-                acc_grad, acc_loss, acc_kl, acc_n = None, 0.0, 0.0, 0
-                for batch in map(lambda b: _kto_batch(b, pad_id), windows.pop(0)):
-                    ref, ref_kl = _kto_reference_logps(model, self._kto_reference, batch)
-                    kl = _kto_kl_baseline(_kto_logps(model, batch["kl_ids"], batch["kl_labels"]), ref_kl)
-                    ref = mx.stop_gradient(ref)
-                    mx.eval(ref, kl)
-                    loss, grad = value_and_grad(model, batch, ref, kl)
-                    # Weight by rows: a smaller trailing batch must not count as much as a full one.
-                    n = batch["comp_ids"].shape[0]
-                    grad = tree_map(lambda g: g * n, grad)
-                    acc_grad = grad if acc_grad is None else tree_map(mx.add, acc_grad, grad)
-                    acc_loss += float(loss) * n
-                    acc_kl += float(kl) * n
-                    acc_n += n
-                    trained_tokens += int((batch["comp_labels"] != -100).sum())
-                    mx.eval(acc_grad)
-                grad = tree_map(lambda g: g / acc_n, acc_grad)
-                self._set_optimizer_lr_for_step(optimizer, step)  # decay below reads this LR
-                if max_grad_norm > 0:
-                    grad, _ = _clip_grad_norm_fp32(grad, max_norm=max_grad_norm)
-                if max_grad_value is not None and max_grad_value > 0:
-                    grad = _clip_grad_by_value(grad, max_grad_value)
-                if max_grad_leaf_norm is not None and max_grad_leaf_norm > 0:
-                    grad = _clip_grad_by_leaf_norm(grad, max_grad_leaf_norm)
-                grad = self._apply_coupled_weight_decay(model, grad)
-                self._apply_manual_weight_decay(model, optimizer, grad)
-                optimizer.update(model, grad)
-                mx.eval(model.parameters(), optimizer.state)
-                self._train_loss_history.append(acc_loss / acc_n)
-                self._kl_history.append(acc_kl / acc_n)
-                step += 1
-                self._global_step = step
-                if args.logging_steps and step % max(int(args.logging_steps), 1) == 0:
-                    print(f"Unsloth KTO: step {step}/{total_steps} "
-                          f"loss={self._train_loss_history[-1]:.4f} kl={self._kl_history[-1]:.4f}")
-                    elapsed = time.perf_counter() - start_time
-                    for cb in self._step_callbacks if self.is_main_process else ():
-                        try:
-                            cb(step, total_steps, self._train_loss_history[-1], float(optimizer.learning_rate),
-                               trained_tokens / max(elapsed, 1e-9), mx.get_peak_memory() / 1e9, elapsed,
-                               trained_tokens, None)
-                        except Exception as e:
-                            print(f"Unsloth: step callback error: {e}")
+            for batch in self._batches(list(range(len(items))), size):
+                loss, count, *arrays = step.losses(step.collate([items[i] for i in batch]), keep)
+                # As transformers' evaluation loop: a batch's loss is its mean, and batches weigh by their rows.
+                total, rows = total + loss.item() / count * len(batch), rows + len(batch)
+                if keep:
+                    logits, targets = (np.array(value.astype(mx.float32)) for value in arrays)
+                    if self.preprocess_logits_for_metrics is not None:
+                        logits = np.asarray(self.preprocess_logits_for_metrics(logits, targets))
+                    outputs[0].append(logits)
+                    outputs[1].append(targets)
         finally:
-            self._run_generation += 1  # a stop latched by this run is stale for the next one
-            if dropout is not None:
-                dropout.restore()
-            if patched:
-                release_mlx_training_patches()
-            if checkpointed:
-                remove_gradient_checkpointing(model)
-            self._restore_memory_limits()
+            model.train(was_training)
+        predictions, labels = (_stack_ragged(arrays) for arrays in outputs) if keep else (None, None)
+        metrics = {}
+        if self.compute_metrics is not None:
+            for name, value in self.compute_metrics(_EvalPrediction(predictions, labels)).items():
+                metrics[name if name.startswith(f"{prefix}_") else f"{prefix}_{name}"] = value
+        # After the metrics, as transformers does: they cannot replace the loss, and their time counts.
+        runtime = time.time() - started
+        metrics.update({f"{prefix}_loss": total / rows, f"{prefix}_runtime": runtime, f"{prefix}_samples_per_second": len(items) / runtime if runtime else 0.0})
+        return metrics, predictions, labels
 
-        if self.is_main_process:
-            try:
-                self.save_model()
-                print(f"Unsloth: Saved final adapters to {args.output_dir}")
-            except ValueError as e:
-                print(f"Unsloth: skipped final save ({e})")
+    def evaluate(self, eval_dataset = None, metric_key_prefix = "eval"):
+        """Evaluate `eval_dataset`, by default the trainer's own, and log the metrics under `metric_key_prefix`."""
+        items = self.eval_dataset if eval_dataset is None else eval_dataset
+        metrics = {**self._evaluation(items, metric_key_prefix)[0], "epoch": self.state.epoch}
+        self._log(metrics)
+        self._event("on_evaluate", metrics = metrics)
+        # After the callbacks, as transformers' Trainer does: early stopping compares with the best before this one.
+        self._update_callback_best_metric(metrics)
+        return metrics
 
-        history = self._train_loss_history
-        return MLXTrainOutput({
-            "train_loss": sum(history) / len(history) if history else 0.0,
-            "train_runtime": time.perf_counter() - start_time,
-            "train_steps": self._global_step,
-            "total_train_steps": total_steps,
-        })
+    def predict(self, test_dataset, metric_key_prefix = "test"):
+        """Option logits and soft targets of `test_dataset`, one row per decision, with its metrics."""
+        metrics, predictions, labels = self._evaluation(test_dataset, metric_key_prefix, keep = True)
+        self._event("on_predict", metrics = metrics)
+        return _PredictionOutput(predictions, labels, metrics)
+
+    def _save_checkpoint(self, optimizers):
+        import shutil
+        import tempfile
+
+        from .decision import save_trainable
+
+        state, args = self.state, self.args
+        folder = Path(args.output_dir) / f"checkpoint-{state.global_step}"
+        if folder.exists() and not (folder / "trainer_state.json").is_file():
+            raise ValueError(f"Unsloth: {folder} exists and is not a training checkpoint, so it is not replaced; train into another output_dir.")
+        folder.parent.mkdir(parents = True, exist_ok = True)
+        # Written beside under a name of its own and renamed, so that an interrupted save leaves nothing that looks like a checkpoint.
+        staging = Path(tempfile.mkdtemp(dir = folder.parent, prefix = f".{folder.name}-"))
+        try:
+            getattr(self.model, "save_checkpoint", lambda folder: save_trainable(self.model, folder))(staging)
+            moments = {f"{group}.{name}": value for group, optimizer in _optimizer_states(optimizers) for name, value in tree_flatten(optimizer.state)}
+            mx.save_safetensors(str(staging / "optimizer_state.safetensors"), moments)
+            if state.best_global_step == state.global_step:
+                state.best_model_checkpoint = str(folder)
+            (staging / "trainer_state.json").write_text(json.dumps(asdict(state), indent = 2, default = float), encoding = "utf-8")
+            # This step's checkpoint from the run that was resumed, if it got this far.
+            shutil.rmtree(folder, ignore_errors = True)
+            os.replace(staging, folder)
+        finally:
+            shutil.rmtree(staging, ignore_errors = True)
+        best = state.best_model_checkpoint
+        _prune_stale_checkpoints(args.output_dir, args.save_total_limit, keep_step = int(best.rpartition("-")[2]) if best else None)
+        self._event("on_save")
+
+    def _load_model(self, folder):
+        from .decision import load_trainable
+
+        getattr(self.model, "load_checkpoint", lambda folder: load_trainable(self.model, folder))(folder)
+
+    def _resume(self, folder, optimizers):
+        """Put the model, the optimizers and the progress of the checkpoint in `folder` back; `True` means the newest in `output_dir`."""
+        if folder is True:
+            found = [item for item in Path(self.args.output_dir).glob("checkpoint-*") if (item / "trainer_state.json").is_file()]
+            folder = max(found, key = lambda item: int(item.name.rpartition("-")[2]), default = None)
+        if folder is None or not (Path(folder) / "trainer_state.json").is_file():
+            raise ValueError(f"Unsloth: no checkpoint to resume from in {folder or self.args.output_dir}: it needs trainer_state.json.")
+        folder = Path(folder)
+        self._load_model(folder)
+        saved = json.loads((folder / "trainer_state.json").read_text(encoding = "utf-8"))
+        for name in ("global_step", "epoch", "log_history", "best_metric", "best_global_step", "best_model_checkpoint"):
+            setattr(self.state, name, saved[name])
+        moments = mx.load(str(folder / "optimizer_state.safetensors"))
+        for group, optimizer in _optimizer_states(optimizers):
+            optimizer.state = tree_unflatten([(name[len(group) + 1 :], value) for name, value in moments.items() if name.startswith(group + ".")])
+        # Dropout draws are not replayed: a resumed run draws from the seed and the step it resumes at.
+        mx.random.seed(self.args.seed + self.state.global_step)
+
+    def train(self, resume_from_checkpoint = None):
+        # MLX caches freed buffers by size, so every distinct batch shape leaves its working set in the cache: tens of
+        # gigabytes over a run. With args.cache_limit_gb unset the cache may hold what a step has needed so far,
+        # which is all the next step can reuse; a value <= 0 or args.disable_memory_limits leaves the limit alone.
+        args = self.args
+        # The memory, wired and explicit cache caps are MLXTrainer's, under the same switches.
+        limits = types.SimpleNamespace(args = args, _bytes_to_gb = MLXTrainer._bytes_to_gb)
+        self._cache_follows_peak = getattr(args, "cache_limit_gb", None) is None and not getattr(args, "disable_memory_limits", False)
+        # args.report_to opens MLXTrainer's W&B and TensorBoard reporters, which this trainer's logs feed.
+        reporters = types.SimpleNamespace(
+            args = args, _last_eval_metrics = None, _report_to_handles = (None, None), _report_to_callbacks = (None, None),
+            add_step_callback = id, add_eval_callback = id,
+        )
+        prior = None
+        self._ensure_callback_args_compat()
+        try:
+            self._memory_limits_applied = MLXTrainer._configure_memory_limits(limits)
+            if self._cache_follows_peak:
+                prior = mx.set_cache_limit(mx.get_peak_memory())
+            MLXTrainer._setup_report_to_callbacks(reporters)
+            self._report_to = reporters._report_to_callbacks
+            with getattr(self.model, "training_run", contextlib.nullcontext)():
+                return self._train(resume_from_checkpoint)
+        finally:
+            self._report_to = (None, None)
+            for handle, close in zip(reporters._report_to_handles, ("finish", "close")):
+                if handle is not None:
+                    with contextlib.suppress(Exception):
+                        getattr(handle, close)()
+            if prior is not None:
+                mx.set_cache_limit(prior)
+            MLXTrainer._restore_memory_limits(limits)
+
+    def _epoch_batches(self, epoch):
+        args, lengths = self.args, [len(item["input_ids"]) for item in self.train_dataset]
+        rng = random.Random(args.seed + epoch)
+        if max(1, args.gradient_accumulation_steps) > 1:
+            return self._batches(None, args.per_device_train_batch_size, _length_grouped_batches(lengths, args.per_device_train_batch_size, rng))
+        # With one micro-batch per step, length grouping would make each step one question type.
+        order = list(range(len(lengths)))
+        rng.shuffle(order)
+        return self._batches(order, args.per_device_train_batch_size)
+
+    def _train(self, resume = None):
+        args, model, items = self.args, self.model, self.train_dataset
+        batch_size, accumulation = args.per_device_train_batch_size, max(1, args.gradient_accumulation_steps)
+        steps_per_epoch = math.ceil(len(self._epoch_batches(0)) / accumulation)
+        max_steps = args.max_steps if args.max_steps > 0 else math.ceil(args.num_train_epochs * steps_per_epoch)
+        multiplier = self._schedule_multiplier(max_steps)
+        optimizers = self._optimizers()
+        logging_steps, eval_steps = (_resolve_interval_steps(value, max_steps) for value in (args.logging_steps, args.eval_steps))
+        # Without an eval_strategy, a positive eval_steps evaluates on steps, otherwise once per epoch.
+        eval_strategy = "no" if not self.eval_dataset else self._strategy("eval_strategy", "steps" if eval_steps else "epoch")
+        eval_steps, eval_delay = eval_steps or logging_steps, getattr(args, "eval_delay", 0) or 0
+        logging_strategy = self._strategy("logging_strategy", "steps")
+        save_steps = _resolve_interval_steps(getattr(args, "save_steps", 0), max_steps)
+        save_strategy = self._strategy("save_strategy", "steps" if save_steps else "no")
+        if save_strategy == "best":
+            raise NotImplementedError('Unsloth: decision training on MLX has no save_strategy = "best"; save on "steps" or "epoch" with load_best_model_at_end.')
+        # As transformers requires: the best evaluation has to be of a state that was also saved.
+        aligned = save_strategy == eval_strategy != "no" and (save_strategy != "steps" or eval_steps and save_steps % eval_steps == 0)
+        if getattr(args, "load_best_model_at_end", False) and not aligned:
+            raise ValueError("Unsloth: load_best_model_at_end needs eval_strategy and save_strategy to match, with save_steps a multiple of eval_steps.")
+
+        compiled = getattr(args, "compile", True) and getattr(args, "compile_mode", None) != "eager"
+        step = self._step(compiled)
+        max_grad_norm, max_grad_value, max_grad_leaf_norm, _ = _resolve_mlx_grad_clipping(args)
+
+        # As transformers does, each run counts from zero, so a trainer can train again.
+        state, self.control = _MLXTrainerState(), _MLXTrainerControl()
+        self.state = state
+        state.max_steps, state.logging_steps, state.train_batch_size = max_steps, logging_steps, batch_size
+        # The intervals a DefaultFlowCallback steps by; one this run does not use never comes round.
+        state.eval_steps, state.save_steps = eval_steps or max_steps + 1, save_steps or max_steps + 1
+        state.num_train_epochs, state.epoch = math.ceil(max_steps / steps_per_epoch), 0.0
+        model.train()
+        started, logged_loss, logged_steps, total_loss = time.time(), 0.0, 0, 0.0
+        learning_rate = grad_norm = None
+
+        def log():
+            nonlocal logged_loss, logged_steps
+            logs = {"loss": logged_loss / logged_steps, "learning_rate": learning_rate, "epoch": state.epoch, "peak_memory_gb": mx.get_peak_memory() / 1e9}
+            if grad_norm is not None:
+                logs["grad_norm"] = grad_norm.item()
+            logged_loss, logged_steps = 0.0, 0
+            self._log(logs)
+
+        final_evaluation = _default_flow_evaluates_final_step()
+        epoch = skipped = saved_step = 0
+        # As transformers seeds torch: dropout draws follow the seed, not what the process drew before.
+        mx.random.seed(args.seed)
+        if resume:
+            self._resume(resume, optimizers)
+            (epoch, skipped), saved_step = divmod(state.global_step, steps_per_epoch), state.global_step
+        ran = state.global_step
+        self._event("on_train_begin")
+        while state.global_step < max_steps and not self.control.should_training_stop:
+            batches = self._epoch_batches(epoch)
+            self.control.should_epoch_stop = False
+            self._event("on_epoch_begin")
+            accumulated, losses = None, []
+            for index, batch in enumerate(batches):
+                if index < skipped * accumulation:
+                    continue
+                rows = [items[i] for i in batch]
+                if self._permute:
+                    # Drawn from the seed, the epoch and the record, so a resumed run encodes a record as this one does.
+                    rows = [self._permute(row, random.Random(f"{args.seed}-{epoch}-{i}")) for row, i in zip(rows, batch)]
+                loss, grads = step(step.collate(rows))
+                if accumulated is not None:
+                    grads = tree_map(mx.add, accumulated, grads)
+                mx.eval(loss, grads)
+                if self._cache_follows_peak:
+                    mx.set_cache_limit(mx.get_peak_memory())
+                accumulated = grads
+                losses.append(loss.item())
+                if (index + 1) % accumulation and index + 1 < len(batches):
+                    continue
+
+                # The epoch's last step may hold fewer micro-batches and averages over those it has.
+                step_loss, window = sum(losses) / len(losses), len(losses)
+                grads = tree_map(lambda g: g / window, accumulated)
+                grad_norm = None
+                # The clipping MLXTrainer applies: max_grad_value, else max_grad_leaf_norm (1.0 when nothing is set), else max_grad_norm.
+                if max_grad_value > 0:
+                    grads = _clip_grad_by_value(grads, max_grad_value)
+                elif max_grad_leaf_norm > 0:
+                    grads = _clip_grad_by_leaf_norm(grads, max_grad_leaf_norm)
+                elif max_grad_norm > 0:
+                    grads, grad_norm = _clip_grad_norm_fp32(grads, max_grad_norm)
+                scale = multiplier(state.global_step)
+                learning_rate = args.learning_rate * scale
+                flat = tree_flatten(grads)
+                for (encoder, _), (names, optimizer) in optimizers.items():
+                    optimizer.learning_rate = learning_rate if encoder else self.head_learning_rate * scale
+                    optimizer.update(model, tree_unflatten([(name, g) for name, g in flat if name in names]))
+                mx.eval(model.parameters(), [optimizer.state for _, optimizer in optimizers.values()])
+                accumulated, losses = None, []
+
+                state.global_step += 1
+                state.epoch = epoch + (index + 1) / len(batches)
+                logged_loss, logged_steps, total_loss = logged_loss + step_loss, logged_steps + 1, total_loss + step_loss
+                self._event("on_step_end")
+                first = getattr(args, "logging_first_step", False) and state.global_step == 1
+                # A callback's should_log / should_evaluate / should_save also count, as in transformers.
+                if first or logging_strategy == "steps" and logging_steps and state.global_step % logging_steps == 0 or self.control.should_log:
+                    log()
+                # transformers 5 also evaluates the last step when the interval does not land on it.
+                at_interval = eval_steps and state.global_step % eval_steps == 0 or final_evaluation and state.global_step >= max_steps
+                if eval_strategy == "steps" and at_interval and eval_delay <= state.global_step or self.control.should_evaluate and self.eval_dataset:
+                    self.evaluate()
+                # As transformers does, a run that saves at all also saves its last step.
+                last = save_strategy != "no" and state.global_step >= max_steps
+                # An evaluation that may be loaded back as the best is saved even between intervals.
+                best = getattr(args, "load_best_model_at_end", False) and state.best_global_step == state.global_step
+                if save_strategy == "steps" and (best or save_steps and state.global_step % save_steps == 0) or last and save_strategy != "epoch" or self.control.should_save:
+                    self._save_checkpoint(optimizers)
+                    saved_step = state.global_step
+                self.control.should_log = self.control.should_evaluate = self.control.should_save = False
+                if state.global_step >= max_steps or self.control.should_training_stop or self.control.should_epoch_stop:
+                    break
+            epoch, skipped = epoch + 1, 0
+            self._event("on_epoch_end")
+            if (logging_strategy == "epoch" or self.control.should_log) and logged_steps:
+                log()
+            if eval_strategy == "epoch" and eval_delay <= state.epoch or self.control.should_evaluate and self.eval_dataset:
+                self.evaluate()
+            if (save_strategy == "epoch" or self.control.should_save) and saved_step != state.global_step:
+                self._save_checkpoint(optimizers)
+                saved_step = state.global_step
+            self.control.should_log = self.control.should_evaluate = self.control.should_save = False
+
+        if getattr(args, "load_best_model_at_end", False) and state.best_model_checkpoint:
+            self._load_model(state.best_model_checkpoint)
+
+        runtime = time.time() - started
+        metrics = {
+            "train_runtime": runtime,
+            "train_steps": state.global_step,
+            "train_steps_per_second": state.global_step / runtime if runtime else 0.0,
+            "train_loss": total_loss / max(1, state.global_step - ran),
+            "epoch": state.epoch,
+        }
+        self._log(metrics)
+        self._event("on_train_end")
+        return MLXTrainOutput(metrics)

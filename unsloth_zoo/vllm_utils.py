@@ -54,7 +54,11 @@ import inspect
 from functools import partial
 from .utils import _get_dtype, get_quant_type, Version
 from .empty_model import *
-from .empty_model import _is_gemma4_config
+from .empty_model import (
+    _is_gemma4_config,
+    _import_vllm_bnb_loader_module,
+    _resolve_safetensors_index,
+)
 from .hf_utils import (
     dtype_from_config,
     add_dtype_kwargs,
@@ -200,16 +204,7 @@ if importlib.util.find_spec("vllm") is not None:
         return quant_states
     try:
         # Same two homes as the quantization module: in tree, else the plugin.
-        _bnb_loader = None
-        for _loader_path in (
-            "vllm.model_executor.model_loader.bitsandbytes_loader",
-            "vllm_bnb_plugin.bitsandbytes_loader",
-        ):
-            try:
-                _bnb_loader = importlib.import_module(_loader_path)
-                break
-            except ImportError:
-                continue
+        _bnb_loader = _import_vllm_bnb_loader_module()
         if _bnb_loader is None:
             raise ImportError("no bitsandbytes model loader")
         if hasattr(_bnb_loader, "dequantize_dq"):
@@ -530,10 +525,8 @@ if _bitsandbytes_is_usable():
         assert set(qs_dict.keys()).issubset(cls.valid_qs_keys)
 
         if "nested_absmax" in qs_dict:
-            # Must use float32 and disable autocasting - vLLM fails!
-            # offset = torch.tensor(float(qs_dict["nested_offset"])).to(device)
-            with torch.autocast(device_type = "cuda", enabled = False):
-                offset = torch.tensor(qs_dict["nested_offset"], dtype = torch.float32, device = "cuda")
+            # Must use float32 - vLLM fails! On `device`, not "cuda", so XPU and CPU loads work.
+            offset = torch.tensor(qs_dict["nested_offset"], dtype = torch.float32, device = device)
             state2 = cls(
                 absmax=qs_dict["nested_absmax"].to(device),
                 blocksize=qs_dict["nested_blocksize"],
@@ -1010,6 +1003,25 @@ def vllm_dynamic_quant_supported(
     return True
 pass
 
+
+def _get_multimodal_engine_args(config, is_vision_model):
+    # Audio = 0: profiling the Gemma-4 audio tower aborts with Unsloth's compiled audio modules.
+    # Other audio models (Gemma3n, Qwen2-Audio) keep vLLM's default audio quota.
+    limits = {"image": 1, "video": 0}
+    is_gemma4 = _is_gemma4_config(config)
+    if is_gemma4 and getattr(config, "audio_config", None) is not None:
+        limits["audio"] = 0
+    if is_vision_model:
+        return {"limit_mm_per_prompt": limits}
+    if not is_gemma4:
+        return {}
+    # language_model_only is in vLLM's AOT cache key; zeroed limit_mm_per_prompt is not, so a
+    # multimodal run's cached artifact would be reloaded and crash (vllm-project/vllm#50891).
+    limits["audio"] = 0
+    return {"language_model_only": True, "limit_mm_per_prompt": limits}
+pass
+
+
 def _get_gemma4_bnb_skip_module_aliases(quantization_config):
     if not isinstance(quantization_config, dict):
         return None
@@ -1291,13 +1303,16 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
         layer = vllm_text_model.layers[kk]
         if hasattr(layer, "self_attn"):
             prefix = f"{vllm_text_model_prefix}.layers.{kk}.self_attn"
-            qkv_proj = layer.self_attn.qkv_proj
+            # vLLM >= 0.30 builds Gemma-4 KV-shared layers with q_proj only.
+            qkv_proj = getattr(layer.self_attn, "qkv_proj", None)
             # LFM2 names the attention output projection out_proj
             o_proj_name = "o_proj" if hasattr(layer.self_attn, "o_proj") else "out_proj"
             o_proj = getattr(layer.self_attn, o_proj_name)
 
             use_fused_qkv = _is_fused_module("qkv_proj")
-            if use_fused_qkv:
+            if qkv_proj is None:
+                get_state_dict(f"{prefix}.q_proj", 0, state_dict, layer.self_attn.q_proj)
+            elif use_fused_qkv:
                 # phi3 family keeps qkv fused; splitting causes a size mismatch
                 # when activating the adapter.
                 # https://github.com/vllm-project/vllm/blob/9b693d023cf595e60b5346fdeeb41cf2a6eda838/vllm/model_executor/models/phi3.py
@@ -1480,12 +1495,19 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
 
     model_config = getattr(llm_engine, "model_config", None)
     load_config = getattr(getattr(llm_engine, "vllm_config", None), "load_config", None)
+    checkpoint_source = (
+        getattr(model_config, "model", None) or getattr(config, "_name_or_path", None),
+        getattr(model_config, "revision", None),
+        getattr(load_config, "download_dir", None),
+    )
     verify_vllm_moe_experts_match_checkpoint(
         quant_state_dict,
-        getattr(model_config, "model", None) or getattr(config, "_name_or_path", None),
-        revision = getattr(model_config, "revision", None),
-        cache_dir = getattr(load_config, "download_dir", None),
+        checkpoint_source[0],
+        revision = checkpoint_source[1],
+        cache_dir = checkpoint_source[2],
     )
+    # Attribute, not key: consumers iterate tensors; on the HF config it would hit config.json.
+    quant_state_dict._unsloth_checkpoint_source = checkpoint_source
 
     if not return_state_dict: state_dict = None
     return state_dict, quant_state_dict
@@ -1601,6 +1623,120 @@ def _refresh_placeholder_dims(parent, attr_name, weight):
 pass
 
 
+GEMMA4_AUDIO_PREFIXES = ("model.audio_tower.", "model.embed_audio.")
+# Quantization state saved beside a packed weight (bitsandbytes, fp8, GPTQ / AWQ).
+_QUANT_STATE_SUFFIXES = (
+    "absmax", "quant_map", "nested_absmax", "nested_quant_map", "SCB", "weight_format",
+    "weight_scale", "weight_scale_inv", "input_scale", "scales", "qweight", "qzeros", "g_idx",
+)
+_FLOAT_SAFETENSORS_DTYPES = ("F16", "BF16", "F32", "F64")
+
+
+def _drop_gemma4_audio(new_model, reason):
+    inner = getattr(new_model, "model", new_model)
+    for name in ("audio_tower", "embed_audio"):
+        if getattr(inner, name, None) is not None: setattr(inner, name, None)
+    logger.warning(
+        f"Unsloth: {reason}, so the Gemma-4 audio tower was dropped from the training model. "
+        "Audio inputs need fast_inference = False."
+    )
+    return 0
+pass
+
+
+def _gemma4_audio_missing_reason(new_model, keys):
+    # Incomplete checkpoint = random-init leftovers; aliased tensors need only one name.
+    present = set(keys)
+    groups = {}
+    for name, param in new_model.named_parameters(remove_duplicate = False):
+        if name.startswith(GEMMA4_AUDIO_PREFIXES): groups.setdefault(id(param), []).append(name)
+    for module_name, module in new_model.named_modules(remove_duplicate = False):
+        skip = getattr(module, "_non_persistent_buffers_set", set())
+        for buffer_name, buffer in module._buffers.items():
+            if buffer is None or buffer_name in skip: continue
+            name = f"{module_name}.{buffer_name}" if module_name else buffer_name
+            if name.startswith(GEMMA4_AUDIO_PREFIXES): groups.setdefault(id(buffer), []).append(name)
+    missing = sorted(names[0] for names in groups.values() if not any(n in present for n in names))
+    if len(missing) == 0: return None
+    shown = ", ".join(missing[:3]) + (f" and {len(missing) - 3} more" if len(missing) > 3 else "")
+    return f"the checkpoint has no audio tensor for {shown}"
+pass
+
+
+def _gemma4_audio_quantized_reason(keys, weight_map, installable):
+    # Quantized tower would lose its quant state when cast, so install nothing.
+    for key in keys:
+        last = key.rsplit(".", 1)[-1]
+        if last in _QUANT_STATE_SUFFIXES or "quant_state" in key:
+            return f"the checkpoint stores the audio tower quantized ({key})"
+    from safetensors import safe_open
+    by_file = {}
+    for key in keys:
+        if key in installable: by_file.setdefault(weight_map[key], []).append(key)
+    for file, file_keys in by_file.items():
+        with safe_open(file, framework = "pt") as f:
+            for key in file_keys:
+                sl = f.get_slice(key)
+                dtype, shape = sl.get_dtype(), tuple(sl.get_shape())
+                if dtype not in _FLOAT_SAFETENSORS_DTYPES:
+                    return f"the checkpoint stores {key} as {dtype}, not a 16 / 32-bit float"
+                # Placeholder dims are 1-wide; every other dim must match the model.
+                expected = tuple(installable[key].shape)
+                if len(shape) != len(expected) or any(
+                    e != 1 and e != g for e, g in zip(expected, shape)
+                ):
+                    return f"the checkpoint shape {shape} of {key} does not match {expected}"
+    return None
+pass
+
+
+def _load_gemma4_audio_from_checkpoint(new_model, config, weight_map = None, checkpoint_source = None):
+    # vLLM never builds the audio tower, so load it from the checkpoint; returns tensors loaded.
+    # checkpoint_source = vLLM's (path, revision, cache_dir), else the config's commit hash pins the snapshot.
+    if getattr(config, "audio_config", None) is None: return 0
+    if weight_map is None:
+        if checkpoint_source is not None and checkpoint_source[0] is not None:
+            model_path, revision, cache_dir = checkpoint_source
+        else:
+            model_path = getattr(config, "model_name", None) or getattr(config, "_name_or_path", None)
+            revision, cache_dir = getattr(config, "_commit_hash", None), None
+        try:
+            weight_map = _resolve_safetensors_index(model_path, revision, cache_dir)
+        except Exception:
+            weight_map = None
+    keys = [k for k in (weight_map or {}) if k.startswith(GEMMA4_AUDIO_PREFIXES)]
+    if len(keys) == 0:
+        return _drop_gemma4_audio(new_model, "could not read the audio tower from the checkpoint")
+    from safetensors import safe_open
+    params = dict(new_model.named_parameters(remove_duplicate = False))
+    buffers = dict(new_model.named_buffers(remove_duplicate = False))
+    installable = {k: params.get(k, buffers.get(k)) for k in keys}
+    installable = {k: v for k, v in installable.items() if v is not None}
+    reason = _gemma4_audio_missing_reason(new_model, keys) or \
+        _gemma4_audio_quantized_reason(keys, weight_map, installable)
+    if reason is not None:
+        return _drop_gemma4_audio(new_model, reason)
+    by_file = {}
+    for key in keys: by_file.setdefault(weight_map[key], []).append(key)
+    loaded = 0
+    for file, file_keys in by_file.items():
+        with safe_open(file, framework = "pt") as f:
+            for key in file_keys:
+                old = params.get(key, buffers.get(key))
+                if old is None: continue
+                value = f.get_tensor(key).to(device = old.device, dtype = old.dtype)
+                parent_name, _, attr_name = key.rpartition(".")
+                parent = new_model.get_submodule(parent_name)
+                if key in params:
+                    parent._parameters[attr_name] = torch.nn.Parameter(value, requires_grad = False)
+                    _refresh_placeholder_dims(parent, attr_name, value)
+                else:
+                    parent._buffers[attr_name] = value
+                loaded += 1
+    return loaded
+pass
+
+
 @torch.inference_mode
 def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16, bnb_config = None, is_vision_model = False):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -1615,6 +1751,12 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
             set_dtype_in_config(subconfig, dtype)
     new_model, original_meta_model, layer_count, layer_names = create_empty_model(config, dtype, is_vision_model)
     new_model = new_model.to(device = get_target_device(), dtype = dtype)
+    flattened_vision_towers = []
+    if is_vision_model:
+        # vLLM names SigLIP weights tower.vision_model.*; transformers 5 flattened that tower.
+        quant_state_dict, layer_names, flattened_vision_towers = align_vision_tower_names(
+            new_model, quant_state_dict, layer_names,
+        )
     quantization_config = getattr(config, "quantization_config", {})
     quant_method = get_quant_type(config)
     kwargs = dict()
@@ -1831,9 +1973,22 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
         quantization_config = quantization_config,
         bnb_config = bnb_config,
     )
+    if is_vision_model and _is_gemma4_config(config):
+        _load_gemma4_audio_from_checkpoint(
+            new_model, config,
+            checkpoint_source = getattr(quant_state_dict, "_unsloth_checkpoint_source", None),
+        )
     # finalize copies every buffer from the meta template (e.g. zeroed LFM2-MoE expert_bias)
     for parent, attr_name, raw_value in loaded_buffers:
         parent._buffers[attr_name] = raw_value
+
+    if flattened_vision_towers and original_meta_model is not None:
+        problems = vision_tower_census(new_model, original_meta_model, flattened_vision_towers)
+        if problems:
+            listed = "\n".join(f"  {name}: {problem}" for name, problem in problems[:20])
+            raise RuntimeError(
+                f"Unsloth: rebuilt vision tower does not match the HF model ({len(problems)} problems):\n{listed}"
+            )
 
     # Must override or else Bitsandbytes will error
     new_model.to = partial(_override_to, new_model)
@@ -2126,6 +2281,24 @@ def approximate_vllm_memory_usage(
     return \
         max_num_batched_tokens, approx_max_num_seqs, \
         actual_gpu_memory_utilization, memory_left_for_kv_cache_gb
+pass
+
+
+def _fit_max_seq_length_to_kv_cache(max_seq_length, kv_cache_tokens):
+    # Report the requested length, not the clamped one: printing 256 twice hid why prompts failed (#2666).
+    requested = max_seq_length
+    if kv_cache_tokens <= 0:
+        max_seq_length = kv_cache_tokens = 256
+    if kv_cache_tokens <= max_seq_length:
+        if kv_cache_tokens < requested:
+            print(
+                f"Unsloth: Your GPU cannot handle sequence lengths of {requested} due to limited GPU memory.\n"\
+                f"Unsloth: Your GPU can only handle approximately the maximum sequence length of {kv_cache_tokens}.\n"\
+                "Unsloth: vLLM will reject prompts longer than this. Increase `gpu_memory_utilization`, "\
+                "lower `max_seq_length` or use a smaller model to allow longer sequences."
+            )
+        max_seq_length = kv_cache_tokens
+    return max_seq_length
 pass
 
 
@@ -3170,18 +3343,7 @@ def load_vllm(
         assert max_seq_length >= 8192, "Unsloth: MLLama requires max_seq_length >= 8192 for fast inference"
 
     else:
-        # max_num_batched_tokens must be >= max_seq_length
-        if max_num_batched_tokens <= 0:
-            max_seq_length = 256
-            max_num_batched_tokens = 256
-
-        if max_num_batched_tokens <= max_seq_length:
-            print(
-                f"Unsloth: Your GPU cannot handle sequence lengths of {max_seq_length} due to limited GPU memory.\n"\
-                f"Unsloth: Your GPU can only handle approximately the maximum sequence length of {max_seq_length}."
-            )
-            max_seq_length = max_num_batched_tokens
-        pass
+        max_seq_length = _fit_max_seq_length_to_kv_cache(max_seq_length, max_num_batched_tokens)
 
     # Get correct dtype
     if DEVICE_TYPE == "cuda" and major_version >= 8: _dtype = torch.bfloat16
@@ -3584,9 +3746,7 @@ def load_vllm(
             # worker_extension_cls   = "unsloth_zoo.vllm_rlhf_utils.ColocateWorkerExtension",
             enable_sleep_mode      = unsloth_vllm_standby,
         )
-        if is_vision_model:
-            # Limit images/videos per prompt to save memory. TODO: make configurable.
-            engine_args["limit_mm_per_prompt"] = {"image": 1, "video": 0}
+        engine_args.update(_get_multimodal_engine_args(config, is_vision_model))
         if _is_gemma4_config(config) and use_bitsandbytes:
             gemma4_bnb_quantization_config = _get_gemma4_bnb_skip_module_aliases(
                 getattr(config, "quantization_config", None)
@@ -3768,6 +3928,8 @@ def load_vllm(
                 if "gpu_memory_utilization" in error or "memory" in error:
                     approx_max_num_seqs = max(int(approx_max_num_seqs * 0.75), 1)
                     engine_args["max_num_seqs"] = approx_max_num_seqs
+                    max_num_batched_tokens = min(max_num_batched_tokens, approx_max_num_seqs * max_seq_length)
+                    engine_args["max_num_batched_tokens"] = max_num_batched_tokens
                     engine_args["gpu_memory_utilization"] *= 0.85
                     print(
                         f"Unsloth: Retrying vLLM to process {approx_max_num_seqs} sequences and {max_num_batched_tokens} tokens in tandem.\n"\
@@ -3862,11 +4024,48 @@ def save_lora(model, save_directory, *args, **kwargs):
 pass
 
 
-@functools.cache
+# Uncached: a directory can be re-saved with another r / lora_alpha mid-process (#2097).
 def get_peft_config(save_directory):
     with open(os.path.join(save_directory, "adapter_config.json"), encoding = "utf-8") as f:
         config = json.load(f)
     return config
+pass
+
+
+_LIVE_LORA_CONFIGS = {}
+def _live_lora_config(model, save_directory):
+    """Live config, written once per process: a stale adapter_config.json means wrong r / lora_alpha (#2097)."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    config = model.peft_config["default"]
+    # Raw path key: os.path.abspath would cost a getcwd syscall per GRPO step.
+    cached = _LIVE_LORA_CONFIGS.get(save_directory)
+    if cached is None or cached[0] is not config:
+        config.save_pretrained(save_directory)
+        cached = (config, get_peft_config(save_directory))
+        _LIVE_LORA_CONFIGS[save_directory] = cached
+    return cached[1]
+pass
+
+
+def _check_lora_rank_fits(model, save_directory):
+    """vLLM raises this inside its step and keeps the request scheduled, failing every later generate."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    try:
+        # Only r, as vLLM's validate_legal: a rank_pattern entry may match no saved tensor.
+        r = get_peft_config(save_directory).get("r", None)
+        engine = model.vllm_engine.llm_engine
+        lora_config = getattr(getattr(engine, "vllm_config", None), "lora_config", None) \
+            or getattr(engine, "lora_config", None)
+        max_lora_rank = lora_config.max_lora_rank
+    except Exception:
+        return
+    if isinstance(r, int) and isinstance(max_lora_rank, int) and r > max_lora_rank:
+        raise ValueError(
+            f"Unsloth: The LoRA adapter in {save_directory} has r = {r} (its adapter_config.json), "
+            f"but vLLM was started with max_lora_rank = {max_lora_rank}.\n"
+            "That folder may be from an earlier run with a larger rank: re-save it with "
+            f"model.save_lora, or load the model with max_lora_rank >= {r}."
+        )
 pass
 
 
@@ -4452,19 +4651,13 @@ def load_lora(model, save_directory, load_tensors = False, lora_request_id = Non
     if lora_request_id is None:
         lora_request_id = LORA_REQUEST_ID
 
-    # Check if path exists
-    if not os.path.exists(save_directory) or lora_request_id == 1:
-        if load_tensors:
-            # We need to save and load the config file once!
-            model.peft_config["default"].save_pretrained(save_directory)
-        elif not os.path.exists(save_directory):
-            raise OSError(f"Unsloth: LoRA filepath = {save_directory} does not exist!")
-    pass
+    if not load_tensors and not os.path.exists(save_directory):
+        raise OSError(f"Unsloth: LoRA filepath = {save_directory} does not exist!")
 
     from vllm.lora.request import LoRARequest
     if load_tensors:
         # We extract it directly from the model's state_dict
-        peft_config = get_peft_config(save_directory)
+        peft_config = _live_lora_config(model, save_directory)
         state_dict = model.state_dict()
         items = state_dict.items()
         state_dict = {k.replace(".default", ""):v for k, v in items if ".lora_A." in k or ".lora_B." in k}
@@ -4483,6 +4676,7 @@ def load_lora(model, save_directory, load_tensors = False, lora_request_id = Non
         # vllm_lora_already_loaded(model)
             # model.saved_vllm_lora_request = lora_request
     else:
+        _check_lora_rank_fits(model, save_directory)
         # Same checks on the path branch, read off the checkpoint header.
         _saved_keys = _saved_adapter_lora_keys(save_directory)
         _saved_peft_config = None

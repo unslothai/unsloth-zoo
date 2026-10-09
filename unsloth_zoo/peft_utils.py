@@ -95,6 +95,7 @@ SKIP_QUANTIZATION_MODULES = [
     'mamba',
     "audio_tower",              # Gemma3N audio encoder conformer
     "vision_tower",             # Gemma3 vision encoder (SigLIP)
+    "visual",                   # Qwen2/2.5/3-VL, Qwen3.5, GLM-4V vision encoder
     "vision_embedder",          # multimodal embedders kept in full precision
     "embed_vision",
     "embed_audio",
@@ -630,23 +631,35 @@ def requires_grad_for_gradient_checkpointing(model):
         # Check if input_embeddings exists
         if hasattr(module, "get_input_embeddings"):
             # Use forward hook after Embedding() is called
+            embeddings = None
             try:
-                module = module.get_input_embeddings()
-                register_other_hooks(
-                    "requires_grad_post_hook",
-                    "requires_grad_post_hook",
-                    module,
-                    "_forward_hooks",
+                embeddings = module.get_input_embeddings()
+            except NotImplementedError:
+                logger.info(
+                    f"Unsloth: `{module_name}` has no input embeddings; using a pre-forward hook."
                 )
-                module.register_forward_hook(requires_grad_post_hook)
-                logger.info(f"Unsloth: Registered output gradient hook on `{module_name}` input embeddings.")
-                still_need_patching = False
             except Exception as exception:
                 logger.warning(
                     f"Unsloth: Failed to register input-embedding hook for `{module_name}`: {exception}. "
                     "Falling back to pre-forward hook."
                 )
-                still_need_patching = True
+            else:
+                # Keep `module` on the tower: the fallback below hooks it.
+                try:
+                    register_other_hooks(
+                        "requires_grad_post_hook",
+                        "requires_grad_post_hook",
+                        embeddings,
+                        "_forward_hooks",
+                    )
+                    embeddings.register_forward_hook(requires_grad_post_hook)
+                    logger.info(f"Unsloth: Registered output gradient hook on `{module_name}` input embeddings.")
+                    still_need_patching = False
+                except Exception as exception:
+                    logger.warning(
+                        f"Unsloth: Failed to register input-embedding hook for `{module_name}`: {exception}. "
+                        "Falling back to pre-forward hook."
+                    )
         pass
 
         if still_need_patching:

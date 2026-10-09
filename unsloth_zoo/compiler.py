@@ -526,6 +526,8 @@ from unsloth_zoo.loss_utils import (
     unsloth_fused_ce_loss,
 )
 from unsloth_zoo.fused_losses.forward_adapter import unsloth_fused_lm_head_loss
+from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_count_aware_cross_entropy, unsloth_loss_count_kwargs
+from unsloth_zoo.fused_losses.aux_loss import unsloth_ga_scale_aux_loss
 
 scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
 @torch.compiler.disable(recursive = False)
@@ -2963,9 +2965,20 @@ def create_standalone_class(
 
     # Add **loss_kwargs
     if add_loss_kwargs and "**" not in parameters:
-        parameters += ", **loss_kwargs"
-        definition = re.sub(r"(\,[\n][\s]{1,}\))", r",**loss_kwargs\1", definition)
-        source = re.sub(r"(\,[\n]\) \-\>)", r",**loss_kwargs\1", source)
+        # Reuse a var-keyword the count-aware rewrite already spliced in: a second one is a SyntaxError.
+        spliced = None
+        try:
+            for node in ast.walk(ast.parse(textwrap.dedent(source))):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    spliced = node.args.kwarg.arg if node.args.kwarg is not None else None
+                    break
+        except SyntaxError:
+            spliced = None
+        name = spliced or "loss_kwargs"
+        parameters += f", **{name}"
+        definition = re.sub(r"(\,[\n][\s]{1,}\))", rf",**{name}\1", definition)
+        if spliced is None:
+            source = re.sub(r"(\,[\n]\) \-\>)", r",**loss_kwargs\1", source)
     pass
 
     source = f"{compile}\n{source}\n"
@@ -3440,7 +3453,7 @@ else:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-    loss = self.loss_function(\\6, \\7.to(self.lm_head.weight.device), vocab_size=\\8, **\\9)
+    loss = self.loss_function(\\6, \\7.to(self.lm_head.weight.device), vocab_size=\\8, **\\9__UNSLOTH_NON_CAUSAL__)
 """.replace("__DYNAMO__RECOMPILING__", __DYNAMO__RECOMPILING__)
 
 cross_entropy_find_3 = """
@@ -3956,10 +3969,15 @@ def _apply_fused_lm_head(forward, module=None):
             "vocab_size = (",
             forward,
         )
-        # Fix , **
-        forward = forward.replace(", **)", ")")
-        forward = forward.replace(",**)", ")")
-        forward = forward.replace(",** )", ")")
+        # Stock call took no kwargs: the fallbacks get the count too, but only for a loss that accepts it.
+        forward = forward.replace(
+            ", **__UNSLOTH_NON_CAUSAL__)",
+            ", **unsloth_loss_count_kwargs(self.loss_function, n_items))",
+        )
+        forward = forward.replace("__UNSLOTH_NON_CAUSAL__)", ")")
+        forward = forward.replace(", **)", ", **unsloth_loss_count_kwargs(self.loss_function, n_items))")
+        forward = forward.replace(",**)", ", **unsloth_loss_count_kwargs(self.loss_function, n_items))")
+        forward = forward.replace(",** )", ", **unsloth_loss_count_kwargs(self.loss_function, n_items))")
         forward = _place_training_stance(forward)
         # print(forward)
         return forward, True
@@ -5137,31 +5155,72 @@ def _ast_fused_lm_head_fallback(source, module = None, module_class = None):
         return None
     if module_class is not None and not _head_built_as_linear(module_class, cap.head_attr):
         return None
+    if cap.aligned or cap.aligned_target:
+        _mark_counts_unshifted_labels(module_class)
+    return new_source
+
+
+def _mark_counts_unshifted_labels(module_class):
+    if module_class is None:
+        return
+    try:
+        module_class._unsloth_counts_unshifted_labels = True
+    except Exception:
+        pass
+
+
+def _count_aware_ce_fallback(source, module = None, module_class = None):
+    """A forward no fused route took whose own mean token CE becomes count-aware, else None."""
+    if "unsloth_fused_lm_head_loss" in source or "unsloth_count_aware_cross_entropy" in source:
+        return None
+    try:
+        from unsloth_zoo.fused_losses.ast_rewriter import rewrite_count_aware_ce_spliced
+        new_source, shifted = rewrite_count_aware_ce_spliced(source)
+    except Exception as e:
+        if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
+            print(f"Unsloth: count aware cross entropy rewrite failed for {module}: {e}")
+        return None
+    if new_source is None:
+        return None
+    # A term the aux rewrite cannot weight would get G times its weight once Trainer stops dividing.
+    from unsloth_zoo.fused_losses.aux_loss import rewrite_aux_loss_ga, unscaled_extra_loss_terms
+    new_source = rewrite_aux_loss_ga(new_source)
+    if unscaled_extra_loss_terms(new_source):
+        return None
+    if not shifted:
+        _mark_counts_unshifted_labels(module_class)
     return new_source
 
 
 def fused_lm_head_forward(module, module_class, modeling_module_name, source):
-    """The compiler's fused-CE rewrite of one GenerationMixin forward.
-
-    Returns (new_source, route, supports_return_hidden_states); route is "regex", "ast" or None.
-    Pure on the source, so tests/test_fused_ce_coverage.py runs the same decision without compiling.
-    """
+    """Fused-CE rewrite of one forward: (new_source, "regex" | "ast" | None, supports_return_hidden_states)."""
     # Fix some arguments up like for Gemma 3N
     new_source = fixup_fused_lm_head(source)
     new_source = fixup_dropped_logit_scale(new_source, module)
     # Fused CE reads lm_head.weight, which Roberta-style composite heads lack.
     from unsloth_zoo.fused_losses.forward_install import _head_built_as_linear
+    # Only classes defined here: an imported one (4.x Blenderbot) lacks its base classes.
+    defined_here = getattr(module_class, "__module__", None) == modeling_module_name
     if not _head_built_as_linear(module_class, "lm_head"):
+        count_source = _count_aware_ce_fallback(new_source, module, module_class) if defined_here else None
+        if count_source is not None:
+            from unsloth_zoo.fused_losses.aux_loss import rewrite_aux_loss_ga
+            return rewrite_aux_loss_ga(count_source), "count", False
         return new_source, None, False
     fused_source, supports_return_hidden_states = apply_fused_lm_head(new_source, module)
     route = "regex" if supports_return_hidden_states else None
-    # Only classes defined here: an imported one (4.x Blenderbot) lacks its base classes.
-    if not supports_return_hidden_states and \
-            getattr(module_class, "__module__", None) == modeling_module_name:
+    if not supports_return_hidden_states and defined_here:
         # AST fallback has no UNSLOTH_RETURN_HIDDEN_STATES branch: GRPO keeps its wrapper.
         ast_source = _ast_fused_lm_head_fallback(new_source, module, module_class)
         if ast_source is not None:
             fused_source, route = ast_source, "ast"
+        else:
+            count_source = _count_aware_ce_fallback(new_source, module, module_class)
+            if count_source is not None:
+                fused_source, route = count_source, "count"
+    if route is not None:
+        from unsloth_zoo.fused_losses.aux_loss import rewrite_aux_loss_ga
+        fused_source = rewrite_aux_loss_ga(fused_source)
     return fused_source, route, supports_return_hidden_states
 
 
@@ -7199,6 +7258,13 @@ def unsloth_compile_transformers(
     # Import and replace with new module
     replacement_classes = {}
     for module in all_standalone_classes.keys():
+        try:
+            # The compiled replacement class must keep the counting convention the rewrite marked.
+            original = getattr(modeling_file, module, None)
+            if getattr(original, "_unsloth_counts_unshifted_labels", False) is True:
+                _mark_counts_unshifted_labels(getattr(combined_module, module, None))
+        except Exception:
+            pass
         try:
             exec(
                 f"{model_location}.{module} = combined_module.{module}",
