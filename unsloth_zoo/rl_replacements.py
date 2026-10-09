@@ -1216,13 +1216,10 @@ def grpo_vision_chunks(vision, total_samples, batch_size):
         num_videos = None
     cum_videos = cum_video_rows = None
     if pixel_values_videos is not None and video_grid_thw is not None:
-        if num_videos is None:
-            # One video per sample is the only layout without counts that is unambiguous.
-            num_videos = [1] * total_samples if video_grid_thw.shape[0] == total_samples else None
         if num_videos is None or sum(num_videos) != video_grid_thw.shape[0]:
             raise ValueError(
                 "Unsloth: GRPO cannot tell which sample each video belongs to: "
-                f"{video_grid_thw.shape[0]} videos over {total_samples} samples and no num_videos."
+                f"{video_grid_thw.shape[0]} videos over {total_samples} samples and no matching num_videos."
             )
         cum_videos = torch.tensor([0] + num_videos).cumsum(0)
         cum_video_rows = torch.cat([

@@ -749,17 +749,16 @@ def test_qwen_videos_are_sliced_by_video_rows_per_sample():
     assert "pixel_values_videos" not in together[1]
 
 
-def test_one_video_per_sample_needs_no_counts():
-    grid = torch.tensor([[2, 2, 2], [4, 2, 2]])
-    pixel_values_videos = torch.arange(24).unsqueeze(-1).float()
-    chunks = grpo_vision_chunks(
-        {"pixel_values_videos": pixel_values_videos, "video_grid_thw": grid},
-        total_samples = 2,
-        batch_size = 1,
-    )
-    assert torch.equal(chunks[0]["pixel_values_videos"], pixel_values_videos[0:8])
-    assert torch.equal(chunks[1]["pixel_values_videos"], pixel_values_videos[8:24])
-    assert torch.equal(chunks[1]["video_grid_thw"], grid[1:2])
+def test_videos_without_counts_are_refused_even_when_the_totals_agree():
+    # [2, 0] videos over two samples has as many grid rows as samples.
+    import pytest
+
+    vision = {
+        "pixel_values_videos": torch.zeros(16, 1),
+        "video_grid_thw": torch.tensor([[2, 2, 2], [2, 2, 2]]),
+    }
+    with pytest.raises(ValueError, match = "which sample each video belongs to"):
+        grpo_vision_chunks(vision, total_samples = 2, batch_size = 1)
 
 
 def test_video_keys_are_forwarded_by_both_passes():
