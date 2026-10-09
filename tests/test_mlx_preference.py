@@ -2828,8 +2828,10 @@ def test_a_vision_plan_repeats_the_pixels_for_both_branches():
     ("dpo", vision_row(chosen=[{"role": "assistant", "content": [
         {"type": "image"}, {"type": "text", "text": "yes"}]}]), "belong to the prompt"),
     ("dpo", vision_row(audio=__import__("numpy").zeros(4)), "audio rows"),
-    ("dpo", vision_row(videos=["clip.mp4"]), "video rows"),
+    ("dpo", vision_row(video_url="clip.mp4"), "video rows"),
     ("dpo", vision_row(prompt=[{"role": "user", "content": [{"type": "video"}]}]), "video rows"),
+    ("dpo", vision_row(prompt=[{"role": "user", "content": [
+        {"type": "input_video", "input_video": "clip.mp4"}]}]), "video rows"),
     ("dpo", vision_row(rejected=[{"role": "assistant", "content": [{"type": "image"}]}]),
      "belong to the prompt"),
 ])
