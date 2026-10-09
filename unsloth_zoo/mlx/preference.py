@@ -1,4 +1,4 @@
-"""MLX text preference tokenization, finite batching, and objectives."""
+"""MLX preference tokenization, finite batching, and objectives."""
 
 import json
 import os
@@ -19,17 +19,43 @@ import numpy as np
 # on the missing file. See tests/test_relative_imports_resolve.py.
 from unsloth_zoo.mlx.cce.runtime_cce import _apply_softcap, _chunk_matmul, _resolve_chunk_size
 from .utils import (
+    _RAW_INPUT_IDS_FOR_LABELS,
+    _VLM_POSITION_GENERATING_MODEL_TYPES,
+    _VLM_RELOCATABLE_SIDECAR_KEYS,
+    _VLM_WIDTH_GENERATED_KEYS,
     _FiniteVisitMixin,
+    _as_numpy_vlm_field,
+    _config_get,
     _encode_mlx_prompt_completion,
+    _extract_vlm_images,
     _finite_batch_schedule,
     _finite_row_schedule,
     _finite_text_pad_width,
+    _forward_text_hidden_states,
     _get_mlx_dropout_probability,
     _mlx_prompt_completion_boundary,
+    _get_processor_tokenizer,
+    _get_vlm_ignore_token_ids,
+    _image_truncation_token_ids,
     _model_logits,
     _normalize_mlx_messages,
     _normalize_seed,
+    _prepare_vlm_batch_for_compile,
+    _preserved_preprocessing_rng,
+    _processor_vlm_inputs,
+    _render_vlm_messages,
+    _row_has_images,
+    _to_mx_vlm_batch,
     _torch_randperm_order,
+    _vlm_audio_part_state,
+    _vlm_batch_family,
+    _vlm_family_divergence,
+    _vlm_forward_logits,
+    _vlm_hidden_states,
+    _vlm_pipeline_disposable_keys,
+    _vlm_token_aligned_sidecars,
+    _vlm_vision_part_state,
+    _vlm_width_survey,
     collect_mlx_lora_adapter_tensors,
     encode_mlx_text,
     is_mlx_dora_module,
@@ -53,6 +79,20 @@ class TokenizedPreferenceRow:
     @property
     def rejected(self):
         return self.rejected_prompt_ids + self.rejected_ids
+
+
+@dataclass(frozen=True)
+class VisionPreferenceRow(TokenizedPreferenceRow):
+    """A row encoded through a processor; its images belong to the prompt.
+
+    Each branch's arrays pair a processor field name with the values aligned to
+    that branch's kept prompt ids.
+    """
+
+    prompt_text: str = ""
+    images: tuple = ()
+    chosen_prompt_arrays: tuple = ()
+    rejected_prompt_arrays: tuple = ()
 
 
 TRUNCATION_MODES = ("keep_end", "keep_start")
@@ -321,10 +361,12 @@ def _maybe_extract_prompt(row):
     return {**row, "prompt": prompt, "chosen": chosen, "rejected": rejected}, True
 
 
-def _chat_template(tokenizer, messages, *, tools, kwargs, **mode):
+def _chat_template(tokenizer, messages, *, tools, kwargs, is_vlm=False, **mode):
     options = dict(kwargs or {})
     if tools is not None:
         options["tools"] = tools
+    if is_vlm:
+        return _render_vlm_messages(tokenizer, messages, **mode, **options)
     return tokenizer.apply_chat_template(
         messages, tokenize=False, **mode, **options,
     )
@@ -337,17 +379,25 @@ def _continues_assistant(*completions):
     )
 
 
+def _content_parts(content):
+    if isinstance(content, list):
+        return list(content)
+    return [{"type": "text", "text": str(content)}] if content else []
+
+
 def _append_to_assistant(prompt, completion):
     merged = [dict(message) for message in prompt]
-    merged[-1]["content"] = (
-        str(merged[-1].get("content", ""))
-        + str(completion[0].get("content", ""))
-    )
+    head = merged[-1].get("content", "")
+    tail = completion[0].get("content", "")
+    if isinstance(head, list) or isinstance(tail, list):
+        merged[-1]["content"] = _content_parts(head) + _content_parts(tail)
+    else:
+        merged[-1]["content"] = str(head) + str(tail)
     merged.extend(dict(message) for message in completion[1:])
     return merged
 
 
-def _render_completions(tokenizer, row, names, *, extracted=False):
+def _render_completions(tokenizer, row, names, *, extracted=False, is_vlm=False):
     """Render the prompt and, per completion field in ``names``, the prompt
     followed by that completion."""
     prompt = row["prompt"]
@@ -374,26 +424,25 @@ def _render_completions(tokenizer, row, names, *, extracted=False):
         return prompt, [prompt + completion for completion in completions]
 
     completions = [
-        _normalize_mlx_messages(completion, is_vlm=False)
+        _normalize_mlx_messages(completion, is_vlm=is_vlm)
         for completion in completions
     ]
-    tools = row.get("tools")
-    kwargs = row.get("chat_template_kwargs")
+
+    def render(messages, **mode):
+        return _chat_template(
+            tokenizer, messages, tools=row.get("tools"),
+            kwargs=row.get("chat_template_kwargs"), is_vlm=is_vlm, **mode,
+        )
+
     if not prompt:
         return "", [
-            _chat_template(
-                tokenizer, completion, tools=tools, kwargs=kwargs,
-                add_generation_prompt=False,
-            )
+            render(completion, add_generation_prompt=False)
             for completion in completions
         ]
-    prompt = _normalize_mlx_messages(prompt, is_vlm=False)
+    prompt = _normalize_mlx_messages(prompt, is_vlm=is_vlm)
     role = prompt[-1].get("role")
     if role == "assistant":
-        prompt_text = _chat_template(
-            tokenizer, prompt, tools=tools, kwargs=kwargs,
-            continue_final_message=True,
-        )
+        prompt_text = render(prompt, continue_final_message=True)
         if not extracted and _continues_assistant(*completions):
             # The completions finish this partial turn, so they join its message.
             conversations = [
@@ -404,10 +453,7 @@ def _render_completions(tokenizer, row, names, *, extracted=False):
             # A whole turn instead, so its closing marker falls to the response.
             conversations = [prompt + completion for completion in completions]
     elif role == "user":
-        prompt_text = _chat_template(
-            tokenizer, prompt, tools=tools, kwargs=kwargs,
-            add_generation_prompt=True,
-        )
+        prompt_text = render(prompt, add_generation_prompt=True)
         conversations = [prompt + completion for completion in completions]
     else:
         raise ValueError(
@@ -415,17 +461,13 @@ def _render_completions(tokenizer, row, names, *, extracted=False):
             "user or assistant message."
         )
     return prompt_text, [
-        _chat_template(
-            tokenizer, messages, tools=tools, kwargs=kwargs,
-            add_generation_prompt=False,
-        )
-        for messages in conversations
+        render(messages, add_generation_prompt=False) for messages in conversations
     ]
 
 
-def _render_preference_row(tokenizer, row, *, extracted=False):
+def _render_preference_row(tokenizer, row, *, extracted=False, is_vlm=False):
     prompt_text, (chosen_text, rejected_text) = _render_completions(
-        tokenizer, row, ("chosen", "rejected"), extracted=extracted,
+        tokenizer, row, ("chosen", "rejected"), extracted=extracted, is_vlm=is_vlm,
     )
     return prompt_text, chosen_text, rejected_text
 
@@ -461,21 +503,29 @@ def _emitted_bos_id(tokenizer):
 
 def _encode_dpo_branches(
     tokenizer, prompt_text, chosen_text, rejected_text, *, append_eos,
+    encode_prompt=None,
 ):
     """Tokenize the prompt and each completion apart, as TRL's DPOTrainer does.
 
     ORPO tokenizes the pair together and folds a merged boundary token back into
     the completion; DPO never sees the pair, so a mid-token prompt splits there.
+    ``encode_prompt`` encodes the prompt in place of ``tokenizer``, returning its
+    ids and a dict of arrays aligned with them; the returned arrays follow any BOS
+    added here.
     """
     prompt_text = _shared_prefix(prompt_text, chosen_text, rejected_text)
-    # add_special_tokens=False for the prompt too, or a tokenizer closing with its
-    # own EOS lands one between prompt and completion. The BOS is re-added below.
-    prompt_ids = [int(x) for x in encode_mlx_text(
-        tokenizer, prompt_text, add_special_tokens=False,
-    )]
+    if encode_prompt is None:
+        # No special tokens: a closing EOS would land between prompt and completion.
+        prompt_ids = [int(x) for x in encode_mlx_text(
+            tokenizer, prompt_text, add_special_tokens=False,
+        )]
+        arrays = {}
+    else:
+        prompt_ids, arrays = encode_prompt(prompt_text)
     bos_id = _emitted_bos_id(tokenizer)
     if bos_id is not None and (not prompt_ids or prompt_ids[0] != bos_id):
         prompt_ids.insert(0, bos_id)
+        arrays = {name: [0, *values] for name, values in arrays.items()}
     eos_id = getattr(tokenizer, "eos_token_id", None)
 
     def response(text):
@@ -488,7 +538,7 @@ def _encode_dpo_branches(
             ids.append(int(eos_id))
         return ids
 
-    return prompt_ids, response(chosen_text), response(rejected_text)
+    return prompt_ids, response(chosen_text), response(rejected_text), arrays
 
 
 def _reject_diverging_orpo_prompts(chosen_prompt_ids, rejected_prompt_ids):
@@ -529,11 +579,16 @@ def _require_preference_fields(row):
         )
 
 
-def prepare_preference_row(tokenizer, row):
-    """Validate, recover an implicit prompt, and render, in that order."""
+def prepare_preference_row(tokenizer, row, *, is_vlm=False):
+    """Validate, recover an implicit prompt, and render, in that order.
+
+    ``is_vlm`` renders through a processor, keeping image parts in the messages.
+    """
     _require_preference_fields(row)
     row, extracted = _maybe_extract_prompt(row)
-    return _render_preference_row(tokenizer, row, extracted=extracted)
+    return _render_preference_row(
+        tokenizer, row, extracted=extracted, is_vlm=is_vlm,
+    )
 
 
 def tokenize_preference_row(
@@ -548,7 +603,7 @@ def tokenize_preference_row(
         prepare_preference_row(tokenizer, row) if rendered is None else rendered
     )
     if length_policy.kind == "dpo":
-        chosen_prompt, chosen_response, rejected_response = _encode_dpo_branches(
+        chosen_prompt, chosen_response, rejected_response, _ = _encode_dpo_branches(
             tokenizer, prompt_text, chosen_text, rejected_text,
             append_eos=append_eos,
         )
@@ -577,6 +632,18 @@ def tokenize_preference_row(
         # Without this two different prefixes reach the loss as one context. On the
         # resolved boundaries: judging before the clip refuses rows that agree.
         _reject_diverging_orpo_prompts(chosen_prompt, rejected_prompt)
+    return TokenizedPreferenceRow(*(tuple(ids) for ids in _truncate_preference_row(
+        chosen_prompt, chosen_response, rejected_prompt, rejected_response,
+        length_policy,
+    )))
+
+
+def _truncate_preference_row(
+    chosen_prompt, chosen_response, rejected_prompt, rejected_response,
+    length_policy,
+):
+    """Apply the objective's length budget to encoded branches, refusing a row
+    it leaves untrainable."""
     if not chosen_response or not rejected_response:
         raise ValueError(
             "Unsloth MLX preference: chosen and rejected must each contain at "
@@ -626,10 +693,7 @@ def tokenize_preference_row(
             f"max_prompt_length={length_policy.max_prompt_length} is not below "
             f"max_length={length_policy.max_length}. Lower max_prompt_length."
         )
-    return TokenizedPreferenceRow(
-        tuple(chosen_prompt), tuple(chosen_response),
-        tuple(rejected_prompt), tuple(rejected_response),
-    )
+    return chosen_prompt, chosen_response, rejected_prompt, rejected_response
 
 
 def encode_generation_prompt(tokenizer, row, *, max_seq_length, max_new_tokens):
@@ -665,6 +729,235 @@ def encode_generation_prompt_text(
             "Unsloth MLX preference: a row rendered an empty prompt."
         )
     return prompt_text, tuple(prompt_ids[-budget:])
+
+
+def _media_in(messages, what):
+    messages = _normalize_mlx_messages(messages, is_vlm=True) if _is_messages(messages) else []
+    bare, payload = (
+        _vlm_audio_part_state(messages) if what == "audio"
+        else _vlm_vision_part_state(messages)
+    )
+    return bool(bare or payload)
+
+
+_VIDEO_KEYS = ("video", "videos", "video_url", "input_video", "pixel_values_videos")
+_IMAGE_KEYS = ("image", "images", "image_url", "input_image", "pixel_values")
+
+
+def _vision_prompt_images(row, image_size):
+    """The prompt's images, refusing media the CUDA path would not condition on."""
+    filled = lambda item, *keys: any(
+        item.get(key) is not None and (not isinstance(item[key], list) or item[key])
+        for key in keys
+    )
+    if (
+        filled(row, "audio", "audios")
+        or any(_media_in(row[key], "audio") for key in ("prompt", "chosen", "rejected"))
+    ):
+        raise ValueError(
+            "Unsloth MLX preference: audio rows are not supported for preference "
+            "training."
+        )
+    if filled(row, *_VIDEO_KEYS) or any(
+        isinstance(part, dict)
+        and (part.get("type") in _VIDEO_KEYS or filled(part, *_VIDEO_KEYS))
+        for key in ("prompt", "chosen", "rejected") if _is_messages(row[key])
+        for message in _normalize_mlx_messages(row[key], is_vlm=True)
+        if isinstance(message.get("content"), list)
+        for part in message["content"]
+    ):
+        raise ValueError(
+            "Unsloth MLX preference: video rows are not supported for preference "
+            "training."
+        )
+    if any(_media_in(row[key], "image") for key in ("chosen", "rejected")):
+        raise ValueError(
+            "Unsloth MLX preference: images belong to the prompt. TRL tokenizes "
+            "chosen and rejected as plain text, so an image in a completion "
+            "would never reach the model."
+        )
+    prompt = row["prompt"]
+    messages = (
+        _normalize_mlx_messages(prompt, is_vlm=True) if _is_messages(prompt) else []
+    )
+    images = tuple(_extract_vlm_images(row, messages, image_size))
+    if not images and (
+        filled(row, *_IMAGE_KEYS)
+        or _row_has_images([row[key] for key in ("prompt", "chosen", "rejected")])
+    ):
+        raise ValueError(
+            "Unsloth MLX preference: this row carries an image its prompt does not "
+            "place, so it would train as text. Pass images under `images` with an "
+            "image part in the prompt."
+        )
+    return images
+
+
+def tokenize_vision_preference_row(
+    processor, row, *, length_policy, append_eos=True, image_size=None,
+    media_token_ids=(), rendered=None,
+):
+    """Tokenize one row for a vision-language model, as unsloth's CUDA DPO does.
+
+    The processor renders every row and encodes an image row's prompt with its
+    images; completions, and every text-only row, tokenize through its inner
+    tokenizer exactly as on a text model. ``media_token_ids`` are the tokens a
+    truncation may not cut from an image row's prompt.
+    """
+    tokenizer = _get_processor_tokenizer(processor)
+    _require_preference_fields(row)
+    row, extracted = _maybe_extract_prompt(row)
+    images = _vision_prompt_images(row, image_size)
+    if rendered is None:
+        rendered = _render_preference_row(
+            processor, row, extracted=extracted, is_vlm=True,
+        )
+    prompt_text = _shared_prefix(*rendered)
+    if not images:
+        encoded = tokenize_preference_row(
+            tokenizer, row, length_policy=length_policy, append_eos=append_eos,
+            rendered=rendered,
+        )
+        return VisionPreferenceRow(
+            encoded.chosen_prompt_ids, encoded.chosen_ids,
+            encoded.rejected_prompt_ids, encoded.rejected_ids,
+            prompt_text=prompt_text,
+        )
+    if length_policy.kind != "dpo":
+        raise ValueError(
+            "Unsloth MLX ORPO: rows with images are not supported. TRL's "
+            "ORPOTrainer has no vision path; train text-only rows, or use DPO."
+        )
+
+    def encode_prompt(text):
+        inputs = _processor_vlm_inputs(
+            processor, [text], [list(images)], None,
+            truncation=False, padding_side="right",
+        )
+        ids = _as_numpy_vlm_field(inputs, "input_ids")
+        arrays = _vlm_token_aligned_sidecars(inputs, ids.shape)
+        return (
+            [int(token) for token in ids[0]],
+            {name: [int(value) for value in values[0]] for name, values in arrays.items()},
+        )
+
+    prompt_ids, chosen, rejected, arrays = _encode_dpo_branches(
+        tokenizer, *rendered, append_eos=append_eos, encode_prompt=encode_prompt,
+    )
+    truncated = _truncate_preference_row(
+        list(prompt_ids), chosen, list(prompt_ids), rejected, length_policy,
+    )
+    kept_arrays = []
+    for response in (chosen, rejected):
+        kept, _ = _truncate_dpo_branch(range(len(prompt_ids)), response, length_policy)
+        if any(
+            # Negative ids are image placeholders (Phi-3 Vision).
+            token in media_token_ids or token < 0
+            for position, token in enumerate(prompt_ids) if position not in kept
+        ):
+            # A cut image run leaves features without positions; CUDA fails in the forward.
+            raise ValueError(
+                "Unsloth MLX DPO: the length budget cuts into this row's image "
+                "tokens. Raise max_length, max_prompt_length and max_seq_length, "
+                "or pass a smaller image_size."
+            )
+        kept_arrays.append(tuple(
+            (name, tuple(values[position] for position in kept))
+            for name, values in arrays.items()
+        ))
+    return VisionPreferenceRow(
+        *(tuple(ids) for ids in truncated),
+        prompt_text=prompt_text, images=images,
+        chosen_prompt_arrays=kept_arrays[0], rejected_prompt_arrays=kept_arrays[1],
+    )
+
+
+def _repeated_for_both_branches(value):
+    """Chosen rows then rejected rows share the images, as TRL concatenates them."""
+    if isinstance(value, mx.array):
+        return mx.concatenate([value, value]) if value.ndim else value
+    if hasattr(value, "shape"):
+        value = np.asarray(value)
+        return np.concatenate([value, value]) if value.ndim else value
+    if isinstance(value, (list, tuple)):
+        return [*value, *value]
+    return value
+
+
+# Spans into the prompt as the processor laid it out, which BOS insertion,
+# truncation and padding all move.
+_VLM_TOKEN_SPAN_KEYS = ("image_bound", "audio_bounds")
+
+# Their pixels are a [crops, whole images] pair, each batched along its own axis.
+_PIXEL_COMPONENT_MODEL_TYPES = ("deepseekocr", "deepseekocr_2")
+
+
+def _vision_batch(processor, model_config, rows, ids, lengths):
+    """A vision batch dict for packed rows: chosen rows first, then rejected."""
+    pairs = len(rows)
+    width = ids.shape[1]
+    inputs = {
+        "input_ids": ids,
+        "attention_mask": (np.arange(width)[None, :] < lengths[:, 1:]).astype(np.int32),
+    }
+    for offset, row in enumerate(rows):
+        for output_row, arrays in (
+            (offset, row.chosen_prompt_arrays),
+            (offset + pairs, row.rejected_prompt_arrays),
+        ):
+            for name, values in arrays:
+                if name not in inputs:
+                    inputs[name] = np.zeros(ids.shape, dtype=np.int32)
+                values = values[:width]
+                inputs[name][output_row, :len(values)] = values
+    if any(row.images for row in rows):
+        outputs = _processor_vlm_inputs(
+            processor, [row.prompt_text for row in rows],
+            [list(row.images) for row in rows], None,
+            truncation=False, padding_side="right",
+        )
+        text_shape = _as_numpy_vlm_field(outputs, "input_ids").shape
+        model_type = _config_get(model_config, "model_type")
+        rebuilt = (
+            _VLM_WIDTH_GENERATED_KEYS
+            if model_type in _VLM_POSITION_GENERATING_MODEL_TYPES
+            else ()
+        )
+        for key, value in outputs.items():
+            if (
+                key in ("input_ids", "attention_mask", "labels")
+                or key in _VLM_RELOCATABLE_SIDECAR_KEYS or key in rebuilt
+                or key.startswith("_unsloth_")
+            ):
+                continue
+            shape = getattr(value, "shape", None)
+            if key in _VLM_TOKEN_SPAN_KEYS or (
+                shape is not None and len(shape) >= 2
+                and tuple(shape[:2]) == tuple(text_shape)
+            ):
+                raise NotImplementedError(
+                    f"Unsloth MLX preference: {type(processor).__name__} returns "
+                    f"{key!r} aligned with the prompt as it laid it out, which "
+                    "preference batching re-lays. This model is not supported "
+                    "for preference training on image rows."
+                )
+            if (
+                key in ("images", "pixel_values") and isinstance(value, (list, tuple))
+                and model_type in _PIXEL_COMPONENT_MODEL_TYPES
+            ):
+                inputs[key] = [_repeated_for_both_branches(part) for part in value]
+            else:
+                inputs[key] = _repeated_for_both_branches(value)
+    batch = _to_mx_vlm_batch(inputs)
+    batch.pop(_RAW_INPUT_IDS_FOR_LABELS, None)
+    batch = _prepare_vlm_batch_for_compile(batch, model_config)
+    if tuple(batch["input_ids"].shape) != tuple(ids.shape):
+        raise NotImplementedError(
+            "Unsloth MLX preference: this model expands its image tokens after "
+            "the processor, which moves the response spans. It is not supported "
+            "for preference training on image rows."
+        )
+    return batch
 
 
 class FinitePreferenceBatchPlan(_FiniteVisitMixin):
@@ -810,7 +1103,7 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
                 self._cce_capacities[family, width] = capacity
 
     def prepare_cce_batch(self, index, batch):
-        width = batch[0].shape[1]
+        width = _preference_ids(batch[0]).shape[1]
         capacity = self._cce_capacities.get((self.batch_family(index), width))
         if capacity is None:
             return batch
@@ -831,7 +1124,9 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
     def _materialized_width(self, index, phase):
         width = self._widths[index]
         if self._shape_plan is not None and phase is not None:
-            width = self._shape_plan.endpoint_for(self.batch_family(index), width)
+            width = self._shape_plan.endpoint_for(
+                self.batch_family(index), self.batch_width(index),
+            )
         return width
 
     def materialize(self, index, *, phase=None):
@@ -839,7 +1134,7 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
         rows = [self._rows[item] for item in indices]
         batch, lengths = self.pack(rows, self._materialized_width(index, phase))
         materialized = (
-            mx.array(batch), mx.array(lengths),
+            self._inputs(rows, batch, lengths), mx.array(lengths),
             mx.array(self._normalizers[index], dtype=mx.int32),
         )
         if self._reference is None:
@@ -856,6 +1151,82 @@ class FinitePreferenceBatchPlan(_FiniteVisitMixin):
     def materialize_all(self):
         return [self[index] for index in range(len(self))]
 
+    def _inputs(self, rows, batch, lengths):
+        """The model input for packed rows; a vision plan returns a batch dict."""
+        return mx.array(batch)
+
+
+class FiniteVisionPreferenceBatchPlan(FinitePreferenceBatchPlan):
+    """Preference plan whose batches carry the processor's vision inputs."""
+
+    __slots__ = ("_processor", "_model_config", "_families", "_event_widths")
+
+    def __init__(self, rows, schedule, *, processor, model_config, **kwargs):
+        super().__init__(rows, schedule, **kwargs)
+        self._processor = processor
+        self._model_config = model_config
+        self._families = self._event_widths = None
+
+    def _inputs(self, rows, batch, lengths):
+        return _vision_batch(self._processor, self._model_config, rows, batch, lengths)
+
+    def _survey(self, inputs):
+        _width, axes, padable, forbidden = _vlm_width_survey(
+            inputs, disposable_keys=_vlm_pipeline_disposable_keys(self._model_config),
+        )
+        family = _vlm_batch_family(inputs, symbolic_axes=axes if padable else None)
+        return family, padable, forbidden
+
+    def ensure_descriptors(self):
+        """Survey every batch's compile-key family once, as the vision SFT plan does."""
+        if self._families is not None:
+            return
+        surveyed = []
+        with _preserved_preprocessing_rng():
+            for index, indices in enumerate(self._schedule):
+                rows = [self._rows[item] for item in indices]
+                packed = self.pack(rows, self._widths[index])
+                surveyed.append(self._survey(self._inputs(rows, *packed)))
+        forbidden = set().union(*(extents for _family, _padable, extents in surveyed))
+        widths = []
+        for width, (_family, padable, _extents) in zip(self._widths, surveyed):
+            # A width equal to an unpadded array extent would reclassify the batch.
+            while padable and width in forbidden:
+                width += 1
+            widths.append(width)
+        self._families = tuple(family for family, _padable, _extents in surveyed)
+        self._event_widths = tuple(widths)
+
+    def batch_width(self, index):
+        return (self._event_widths or self._widths)[index]
+
+    def batch_family(self, index):
+        family = super().batch_family(index)
+        return family if self._families is None else (*family, self._families[index])
+
+    def materialize(self, index, *, phase=None):
+        planned = self._shape_plan is not None and phase is not None
+        if planned and not self._shape_plan.allows(
+            self.batch_family(index), self.batch_width(index), phase,
+        ):
+            raise RuntimeError(
+                "Unsloth MLX preference: compiled batch signature was not "
+                "admitted by the finite shape plan."
+            )
+        materialized = super().materialize(index, phase=phase)
+        if planned:
+            divergence = _vlm_family_divergence(
+                self._families[index], self._survey(materialized[0])[0],
+            )
+            if divergence is not None:
+                raise RuntimeError(
+                    f"Unsloth MLX preference: batch {index} drifted from its "
+                    f"surveyed compile family ({divergence}). The processor must "
+                    "produce structurally identical batches on every visit; "
+                    "train this pipeline with compile disabled."
+                )
+        return materialized
+
 
 def precompute_reference_logps(plan, model, reference_policy, *, batch_size, scorer=None):
     """Precompute reference logps per row of ``plan``; kernels round per chunk shape, so batch like the live forward."""
@@ -865,11 +1236,11 @@ def precompute_reference_logps(plan, model, reference_policy, *, batch_size, sco
     for start in range(0, len(rows), batch_size):
         chunk = rows[start:start + batch_size]
         batch, lengths = plan.pack(chunk)
-        batch, lengths = mx.array(batch), mx.array(lengths)
+        batch, lengths = plan._inputs(chunk, batch, lengths), mx.array(lengths)
         options = {}
         # The live forward scores through CCE too; full logits would defeat it.
         if scorer is not None and reference_policy.model is None:
-            mask = _response_mask(batch[:, 1:], lengths)
+            mask = _response_mask(_preference_ids(batch)[:, 1:], lengths)
             options["response_scorer"] = lambda model, batch, _lengths: -(
                 scorer(model, batch, mask > 0)[0] * mask
             ).sum(axis=1)
@@ -919,12 +1290,22 @@ def create_preference_batch_plan(
     append_eos=True,
     formatting_func=None,
     prompt_sink=None,
+    processor=None,
+    model_config=None,
+    image_size=None,
 ):
     """Build the finite preference plan consumed by both objectives.
 
     ``prompt_sink`` receives each row's rendered prompt text as the plan is
-    built, so a caller wanting it does not render the row a second time.
+    built, so a caller wanting it does not render the row a second time. A
+    ``processor`` builds a vision plan for a vision-language model, encoding image
+    prompts through it and all other text through its inner tokenizer.
     """
+    if processor is not None:
+        tokenizer = _get_processor_tokenizer(processor)
+        media_token_ids = frozenset(_image_truncation_token_ids(
+            processor, _get_vlm_ignore_token_ids(processor, model_config),
+        ))
     rows = []
     for index, raw in enumerate(dataset):
         row = formatting_func(raw) if formatting_func is not None else raw
@@ -935,13 +1316,21 @@ def create_preference_batch_plan(
         rendered = None
         if prompt_sink is not None:
             # One rendering for sampler and tokenizer: a stateful template may differ.
-            rendered = prepare_preference_row(tokenizer, row)
+            rendered = prepare_preference_row(
+                processor or tokenizer, row, is_vlm=processor is not None,
+            )
             prompt_sink(rendered[0])
         try:
-            rows.append(tokenize_preference_row(
-                tokenizer, row, length_policy=length_policy,
-                append_eos=append_eos, rendered=rendered,
-            ))
+            rows.append(
+                tokenize_preference_row(
+                    tokenizer, row, length_policy=length_policy,
+                    append_eos=append_eos, rendered=rendered,
+                ) if processor is None else tokenize_vision_preference_row(
+                    processor, row, length_policy=length_policy,
+                    append_eos=append_eos, image_size=image_size,
+                    media_token_ids=media_token_ids, rendered=rendered,
+                )
+            )
         except ValueError as exc:
             # Tokenized up front, so without the index one bad row aborts blindly.
             raise ValueError(
@@ -993,12 +1382,16 @@ def create_preference_batch_plan(
     pad_id = getattr(tokenizer, "pad_token_id", None)
     if pad_id is None:
         pad_id = getattr(tokenizer, "eos_token_id", 0)
-    return FinitePreferenceBatchPlan(
+    vision = {} if processor is None else dict(
+        processor=processor, model_config=model_config,
+    )
+    return (FiniteVisionPreferenceBatchPlan if vision else FinitePreferenceBatchPlan)(
         rows, schedule,
         normalizers=_window_normalizers(rows, schedule, cycle_length, grad_accum),
         cycle_length=cycle_length,
         max_seq_length=length_policy.max_seq_length,
         pad_id=0 if pad_id is None else pad_id,
+        **vision,
     )
 
 
@@ -1608,12 +2001,57 @@ class ReferencePolicy:
             self._store_synced(index, restored)
 
 
-def _response_logps(model, batch, lengths):
-    targets = batch[:, 1:]
-    ce = nn.losses.cross_entropy(
-        _model_logits(model(batch[:, :-1])), targets, reduction="none",
+def _preference_ids(batch):
+    """A vision batch is a dict carrying its token ids beside the pixels."""
+    return batch["input_ids"] if isinstance(batch, Mapping) else batch
+
+
+def _next_token_positions(values, ids, what):
+    """Drop the last position, once the output is known to cover every token.
+
+    A family expanding tokens inside its forward would shift every response
+    position the lengths name, so the scores would silently read other tokens.
+    """
+    if values.shape[1] != ids.shape[1]:
+        raise ValueError(
+            f"Unsloth MLX preference: this model returned {what} for "
+            f"{values.shape[1]} positions from {ids.shape[1]} tokens, so the "
+            "response spans cannot be located in them."
+        )
+    return values[:, :-1]
+
+
+def _preference_logits(model, batch):
+    """Logits predicting each next token, for every position but the last."""
+    if isinstance(batch, Mapping):
+        return _next_token_positions(
+            _vlm_forward_logits(model, batch), batch["input_ids"], "logits",
+        )
+    return _model_logits(model(batch[:, :-1]))
+
+
+def _preference_hidden(model, batch):
+    if isinstance(batch, Mapping):
+        return _next_token_positions(
+            _vlm_hidden_states(model, batch), batch["input_ids"], "hidden states",
+        )
+    return _forward_text_hidden_states(model, batch[:, :-1])
+
+
+def _token_cross_entropy(logits, targets, mask):
+    # An image token may lie past the output head (Mllama's does), so unscored
+    # labels are gathered as token 0, as TRL does.
+    targets = mx.where(mask > 0, targets, 0)
+    return nn.losses.cross_entropy(
+        logits, targets, reduction="none",
     ).reshape(targets.shape)
-    return -(ce * _response_mask(targets, lengths)).sum(axis=1)
+
+
+def _response_logps(model, batch, lengths):
+    targets = _preference_ids(batch)[:, 1:]
+    mask = _response_mask(targets, lengths)
+    ce = _token_cross_entropy(_preference_logits(model, batch), targets, mask)
+    return -(ce * mask).sum(axis=1)
 
 
 # TRL's own warning list, narrower than the set that drops the value.
@@ -1971,6 +2409,8 @@ def _make_preference_cce_scorer(model):
     tm = utils._get_text_model(model)
     if getattr(tm, "model", None) is None and not utils._has_direct_hidden_stack(model):
         return None
+    if utils._is_vlm_model(model) and not hasattr(model, "get_input_embeddings"):
+        return None
     desc = utils.describe_output_head(model)
     if utils._cce_head_ineligibility(desc) is not None:
         return None
@@ -1998,8 +2438,8 @@ def _make_preference_cce_scorer(model):
         kernel to those rows, which then also limits the logit sums unless
         ``every_position``.
         """
-        targets = batch[:, 1:]
-        hidden = utils._forward_text_hidden_states(model, batch[:, :-1])
+        targets = _preference_ids(batch)[:, 1:]
+        hidden = _preference_hidden(model, batch)
         head = utils._resolve_module_path(model, desc.path)
         # Before compaction: the logit sums below may read every row.
         hidden = utils._rotate_head_input(head, hidden.reshape((-1, hidden.shape[-1])))
@@ -2173,29 +2613,26 @@ def _preference_stats(
     )
 
 
-def _preference_forward(model, batch, lengths):
-    """Logits, per-token cross entropy, and the response mask for one batch."""
-    targets = batch[:, 1:]
-    logits = _model_logits(model(batch[:, :-1]))
-    ce = nn.losses.cross_entropy(
-        logits, targets, reduction="none",
-    ).reshape(targets.shape)
-    return logits, ce, _response_mask(targets, lengths)
+def _preference_forward(model, batch, supervised):
+    """Logits and per-token cross entropy, scoring the ``supervised`` positions."""
+    logits = _preference_logits(model, batch)
+    return logits, _token_cross_entropy(logits, _preference_ids(batch)[:, 1:], supervised)
 
 
 def _orpo_scores(model, batch, lengths, beta, *, scorer=None, cce_indices=None):
     """Unreduced: training normalizes over its window, evaluation over the batch."""
-    pairs = batch.shape[0] // 2
+    ids = _preference_ids(batch)
+    pairs = ids.shape[0] // 2
     nll_mask = (
-        mx.arange(1, batch.shape[1]) < lengths[:pairs, 1:]
+        mx.arange(1, ids.shape[1]) < lengths[:pairs, 1:]
     ).astype(mx.float32)
     logits = logit_totals = None
+    mask = _response_mask(ids[:, 1:], lengths)
+    # The chosen NLL spans the whole sequence, not only the response.
+    supervised = mx.concatenate([nll_mask, mask[pairs:]]) > 0
     if scorer is None:
-        logits, ce, mask = _preference_forward(model, batch, lengths)
+        logits, ce = _preference_forward(model, batch, supervised)
     else:
-        mask = _response_mask(batch[:, 1:], lengths)
-        # The chosen NLL spans the whole sequence, not only the response.
-        supervised = mx.concatenate([nll_mask, mask[pairs:]]) > 0
         ce, sums = scorer(model, batch, supervised, cce_indices, every_position=True)
         logit_totals = _logit_totals(sums, mx.ones(sums.shape, mx.float32), scorer.vocab)
     response_logp = -(ce * mask).sum(axis=1) / mx.maximum(
@@ -2219,12 +2656,12 @@ def _orpo_scores(model, batch, lengths, beta, *, scorer=None, cce_indices=None):
 def _dpo_scores(model, batch, lengths, objective, *, reference_policy,
                 scorer=None, cce_indices=None, reference=None):
     """Score one DPO batch; ``reference`` holds precomputed reference log probabilities."""
-    pairs = batch.shape[0] // 2
+    pairs = lengths.shape[0] // 2
     logits = logit_totals = None
+    mask = _response_mask(_preference_ids(batch)[:, 1:], lengths)
     if scorer is None:
-        logits, ce, mask = _preference_forward(model, batch, lengths)
+        logits, ce = _preference_forward(model, batch, mask)
     else:
-        mask = _response_mask(batch[:, 1:], lengths)
         ce, sums = scorer(model, batch, mask > 0, cce_indices)
         logit_totals = _logit_totals(sums, mask, scorer.vocab)
     logps = -(ce * mask).sum(axis=1)
@@ -2280,7 +2717,7 @@ def make_preference_eval_fn(objective, *, reference_policy=None, model=None):
         return _make_kto_eval_fn(objective, reference_policy, scorer)
 
     def eval_fn(model, batch, lengths, _normalizers=None, cce_indices=None, reference=None):
-        pairs = batch.shape[0] // 2
+        pairs = lengths.shape[0] // 2
         if kind == "orpo":
             nll_sum, nll_tokens, ratio, stats = _orpo_scores(
                 model, batch, lengths, beta, scorer=scorer, cce_indices=cce_indices,
@@ -2349,7 +2786,7 @@ def _kto_scores(model, batch, lengths, labels, objective, *, reference_policy,
         mx.arange(1, completions.shape[1]) < completion_lengths[:, 1:]
     ).astype(mx.float32)
     if scorer is None:
-        logits, ce, _ = _preference_forward(model, completions, completion_lengths)
+        logits, ce = _preference_forward(model, completions, mask)
         logit_sums = (_row_logit_sum(logits) * positions).sum(axis=1)
     else:
         ce, sums = scorer(model, completions, mask > 0, every_position=True)
