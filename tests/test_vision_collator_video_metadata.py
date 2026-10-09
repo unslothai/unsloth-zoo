@@ -97,12 +97,9 @@ def test_mismatched_rates_fall_back_to_fps(monkeypatch):
 
 def test_real_qwen2_5_vl_processor_gets_the_rate():
     transformers = pytest.importorskip("transformers")
-    try:
-        processor = transformers.AutoProcessor.from_pretrained(
-            "trl-internal-testing/tiny-Qwen2_5_VLForConditionalGeneration"
-        )
-    except Exception as e:
-        pytest.skip(f"processor unavailable: {e}")
+    processor = transformers.AutoProcessor.from_pretrained(
+        "trl-internal-testing/tiny-Qwen2_5_VLForConditionalGeneration"
+    )
     text = "<|vision_start|><|video_pad|><|vision_end|>hi"
     videos = [[torch.randint(0, 255, (4, 3, 56, 56), dtype = torch.uint8)]]
     videos, kwargs = vu.video_processor_kwargs(processor, videos, [1.0])
@@ -115,11 +112,8 @@ def test_collator_puts_qwen2_5_vl_frames_at_their_real_rate():
     transformers = pytest.importorskip("transformers")
     from PIL import Image
     name = "trl-internal-testing/tiny-Qwen2_5_VLForConditionalGeneration"
-    try:
-        processor = transformers.AutoProcessor.from_pretrained(name)
-        config = transformers.AutoConfig.from_pretrained(name)
-    except Exception as e:
-        pytest.skip(f"processor unavailable: {e}")
+    processor = transformers.AutoProcessor.from_pretrained(name)
+    config = transformers.AutoConfig.from_pretrained(name)
     model = transformers.AutoModelForImageTextToText.from_config(config)
     collator = vu.UnslothVisionDataCollator(model, processor)
     frames = [Image.new("RGB", (56, 56), (i * 40, 0, 0)) for i in range(4)]
