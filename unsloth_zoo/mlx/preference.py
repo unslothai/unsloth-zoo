@@ -43,6 +43,7 @@ from .utils import (
     _preserved_preprocessing_rng,
     _processor_vlm_inputs,
     _render_vlm_messages,
+    _row_has_images,
     _to_mx_vlm_batch,
     _torch_randperm_order,
     _vlm_audio_part_state,
@@ -740,7 +741,10 @@ def _vision_prompt_images(row, image_size):
         _normalize_mlx_messages(prompt, is_vlm=True) if _is_messages(prompt) else []
     )
     images = tuple(_extract_vlm_images(row, messages, image_size))
-    if not images and filled(row, *_IMAGE_KEYS):
+    if not images and (
+        filled(row, *_IMAGE_KEYS)
+        or _row_has_images([row[key] for key in ("prompt", "chosen", "rejected")])
+    ):
         raise ValueError(
             "Unsloth MLX preference: this row carries an image its prompt does not "
             "place, so it would train as text. Pass images under `images` with an "
