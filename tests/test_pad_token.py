@@ -512,3 +512,46 @@ def test_single_vocab_models_keep_the_old_bound():
     })()
     with pytest.raises(RuntimeError):
         fix_pad_token(tok, model_config=cfg)
+
+
+class _FakeEmbeddingModel:
+    """Model stand-in exposing only an input-embedding row count and a resize hook."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.resized_to = None
+        self.config = type("Cfg", (), {"update": lambda self, d: None})()
+
+    def get_input_embeddings(self):
+        return type("E", (), {"weight": type("W", (), {"shape": (self.rows, 8)})()})()
+
+    def resize_token_embeddings(self, n):
+        self.resized_to = n
+        self.rows = n
+
+
+def _phi4_mm_like_tokenizer():
+    # Phi-4-mini / Phi-4-multimodal: pad == eos == unk, no reserved or pad-named token.
+    return FakeTokenizer(
+        {"<|endoftext|>": 199999, "<|end|>": 200020, "<|tag|>": 200028},
+        pad_token="<|endoftext|>",
+        eos_token="<|endoftext|>",
+    )
+
+
+def test_added_pad_inside_padded_embedding_rows_does_not_raise():
+    tok = _phi4_mm_like_tokenizer()
+    cfg = type("Cfg", (), {"model_type": "phi4_multimodal", "vocab_size": 200064, "eos_token_id": [199999, 200020]})()
+    model = _FakeEmbeddingModel(rows=200064)
+    res = fix_pad_token(tok, model=model, model_config=cfg)
+    assert res["added"] is True and res["new_pad"] == tok.pad_token
+    assert tok.pad_token_id == 200029 and model.resized_to is None
+    # Idempotent: the healed pad is now valid.
+    assert fix_pad_token(tok, model=model, model_config=cfg)["changed"] is False
+
+
+def test_added_pad_needing_resize_still_raises():
+    tok = _phi4_mm_like_tokenizer()
+    cfg = type("Cfg", (), {"model_type": "phi4_multimodal", "vocab_size": 200029, "eos_token_id": 199999})()
+    with pytest.raises(RuntimeError):
+        fix_pad_token(tok, model=_FakeEmbeddingModel(rows=200029), model_config=cfg)
