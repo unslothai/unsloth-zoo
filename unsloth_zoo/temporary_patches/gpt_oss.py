@@ -2871,6 +2871,10 @@ def _try_grouped_bnb4bit(self, hidden_states, router_indices, routing_weights,
         return None  # fall through to the per-expert loop
 
 
+# Eval calls with more (token, expert) rows than this skip the all-experts dense branch.
+DENSE_EVAL_MAX_ROWS = 8192
+
+
 def torch_native_forward(
     self,
     hidden_states: torch.Tensor,
@@ -2898,7 +2902,15 @@ def torch_native_forward(
         if grouped is not None:
             return grouped
 
-    if self.training:
+    # The dense eval branch below runs every expert on every token, so its fp32 swiglu
+    # temporaries grow as experts x tokens (27.5 GiB in one layer of a 120B GRPO prefill,
+    # unsloth#3411). Eval calls past DENSE_EVAL_MAX_ROWS take the routed loop instead.
+    if self.training or (
+        num_tokens * num_experts > DENSE_EVAL_MAX_ROWS and not torch.compiler.is_compiling()
+    ):
+        if not self.training and not torch.is_grad_enabled():
+            # Eager prefill builds the routed tables a compiled decode step then reads.
+            prepare_routed_experts(self)
         with torch.no_grad():
             flat_experts = router_indices.flatten()  # [tokens * topk]
             token_ids = torch.arange(num_tokens, device=hidden_states.device).repeat_interleave(top_k)
@@ -2944,7 +2956,7 @@ def torch_native_forward(
             
             offset += count
         next_states = next_states.view(batch_size, -1, self.hidden_size)
-        return next_states.to(torch.float32)
+        return next_states.to(torch.float32 if self.training else hidden_states.dtype)
     elif (
         num_tokens * top_k <= ROUTED_MAX_SLOTS
         and (routed := routed_experts_forward(self, hidden_states, router_indices, routing_weights)) is not None
