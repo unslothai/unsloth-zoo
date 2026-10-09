@@ -897,6 +897,8 @@ def test_an_objective_is_valid_however_it_was_built():
          "discopop_tau"),
         ("dpo", dict(loss_types=("aot",), reference_free=True),
          "reference_free never computes"),
+        ("kto", dict(loss_types=("kto", "sigmoid")), "loss_type must be one of"),
+        ("kto", dict(loss_types=("kto",), undesirable_weight=math.inf), "must be finite"),
     ):
         with pytest.raises(ValueError, match=match):
             PreferenceObjective(kind=kind, **{"beta": 0.1, **options})
@@ -914,7 +916,8 @@ def test_an_objective_is_valid_however_it_was_built():
         kind="orpo", beta=0.1, label_smoothing=0.5).label_smoothing == 0.5
     assert {f.name for f in dataclasses.fields(PreferenceObjective)} == {
         "kind", "beta", "label_smoothing", "loss_types", "weights",
-        "discopop_tau", "reference_free"}
+        "discopop_tau", "reference_free", "desirable_weight",
+        "undesirable_weight"}
 
     dpo = resolve_preference_objective("dpo", beta=0.1)
     assert (dpo.loss_types, dpo.weights, dpo.label_smoothing) == (
@@ -1584,7 +1587,7 @@ def test_the_trainer_syncs_the_reference_on_its_cadence(tmp_path, monkeypatch, s
         )),
     )
     synced = []
-    build = trainer._build_dpo_reference
+    build = trainer._build_reference
 
     def capture(*args, **kwargs):
         policy, provenance = build(*args, **kwargs)
@@ -1593,7 +1596,7 @@ def test_the_trainer_syncs_the_reference_on_its_cadence(tmp_path, monkeypatch, s
                 (trainer._global_step, alpha, model is trainer.model))
         return policy, provenance
 
-    trainer._build_dpo_reference = capture
+    trainer._build_reference = capture
     _run_generation_trainer(trainer, monkeypatch, [])
     assert synced == ([(2, 0.25, True), (4, 0.25, True)] if sync is True else [])
     if sync == "reference_free":
@@ -1630,7 +1633,7 @@ def test_the_trainer_precomputes_the_reference_once_per_split(
         )),
     )
     forwards, tables, built = [], [], []
-    build = trainer._build_dpo_reference
+    build = trainer._build_reference
 
     def capture(*args, **kwargs):
         policy, provenance = build(*args, **kwargs)
@@ -1653,7 +1656,7 @@ def test_the_trainer_precomputes_the_reference_once_per_split(
         ))
         return precompute(plan, model, policy, batch_size=batch_size, **kwargs)
 
-    trainer._build_dpo_reference = capture
+    trainer._build_reference = capture
     monkeypatch.setattr(trainer_module, "precompute_reference_logps", recording)
     _run_generation_trainer(trainer, monkeypatch, [])
     assert trainer._global_step == 2
@@ -1861,7 +1864,7 @@ def _run_generation_trainer(
     return trainer.train()
 
 
-@pytest.mark.parametrize("config_cls_name", ["MLXDPOConfig", "MLXORPOConfig"])
+@pytest.mark.parametrize("config_cls_name", ["MLXDPOConfig", "MLXORPOConfig", "MLXKTOConfig"])
 def test_a_preference_field_a_dump_predates_still_reads_as_a_wholesale_copy(
         config_cls_name):
     """An unregistered appended field flips the copy detection, losing warmup_ratio."""
@@ -2632,6 +2635,344 @@ def test_evaluation_accepts_a_wrapped_model_output(objective):
     assert int(from_bare[1]) == int(from_wrapped[1])
 
 
+def kto_plan(dataset, **kwargs):
+    from unsloth_zoo.mlx.preference import create_kto_batch_plan
+    options = dict(
+        batch_size=3, kl_batch_size=3, num_epochs=1, grad_accum=1,
+        length_policy=policy("kto", max_prompt_length=32),
+    )
+    options.update(kwargs)
+    return create_kto_batch_plan(dataset, Tokenizer(), **options)
+
+
+def test_kto_unpairs_in_trl_blocks_and_pairs_kl_within_each_chunk(monkeypatch):
+    from unsloth_zoo.mlx import preference
+
+    monkeypatch.setattr(preference, "_UNPAIR_BLOCK", 2)
+    encode = Tokenizer().encode
+    plan = kto_plan([
+        {"prompt": f"p{i}", "chosen": f"c{i}", "rejected": f"r{i}"} for i in range(3)
+    ])
+    order = [("p0", "c0"), ("p1", "c1"), ("p0", "r0"), ("p1", "r1"), ("p2", "c2"), ("p2", "r2")]
+    assert [row.label for row in plan.rows] == [True, True, False, False, True, False]
+    # The previous row in its chunk of three, the first taking the chunk's last.
+    for row, (prompt, answer), partner in zip(plan.rows, order, [2, 0, 1, 5, 3, 4]):
+        assert row.sequence == (*encode(prompt + answer), 2)
+        assert row.kl == (*encode(prompt + order[partner][1]), 2)
+        assert row.kl_prompt_ids == row.prompt_ids == tuple(encode(prompt))
+    assert plan.schedule == ((0, 1, 2), (3, 4, 5))
+
+
+@pytest.mark.parametrize("bos,mode,prompt,answer,expected", [
+    (None, "keep_end", 8, 6, ((14, 15, 16, 17), (20, 21, 22, 23, 2))),
+    (1, "keep_start", 8, 6, ((1, 10, 11, 12, 13), (20, 21, 22, 23, 2))),
+    # TRL reserves a BOS slot unless one leads, even when there is none to add.
+    (10, "keep_end", 4, 5, ((10, 11, 12, 13), (20, 21, 22, 23, 24, 2))),
+    (None, "keep_end", 4, 5, ((10, 11, 12, 13), (20, 21, 22, 23, 2))),
+    # The answer cut spends the whole prompt bound, not the prompt's real length.
+    (None, "keep_end", 2, 12, ((10, 11), (20, 21, 22, 23, 2))),
+])
+def test_kto_truncates_the_way_trl_processes_tokens(bos, mode, prompt, answer, expected):
+    from unsloth_zoo.mlx.preference import _truncate_kto
+
+    length_policy = policy("kto", max_length=10, max_prompt_length=4, truncation_mode=mode)
+    assert _truncate_kto(
+        list(range(10, 10 + prompt)), list(range(20, 20 + answer)), length_policy,
+        bos_id=bos, eos_id=2,
+    ) == expected
+
+
+def test_a_kl_pair_joins_the_processed_prompt_to_the_raw_answer():
+    plan = kto_plan(
+        [{"prompt": "abcde", "completion": "x" * 10, "label": True},
+         {"prompt": "fg", "completion": "y", "label": False},
+         {"prompt": "p", "completion": "x" * 7, "label": True},
+         {"prompt": "abcde", "completion": "y", "label": False}],
+        batch_size=2, kl_batch_size=2,
+        length_policy=policy("kto", max_length=10, max_prompt_length=3),
+    )
+    # A prompt its own answer cut stays cut, though its KL answer is short.
+    assert plan.rows[0].kl_prompt_ids == plan.rows[0].prompt_ids == tuple(
+        Tokenizer().encode("cde"))
+    # The partner's answer before its EOS: with one it would keep a sixth token.
+    assert plan.rows[3].kl_completion_ids == (*Tokenizer().encode("x" * 5), 2)
+    # The KL row masks its own, shorter prompt.
+    assert plan[1][1].tolist()[3] == [3, len(plan.rows[3].kl)]
+
+
+class SpelledSpecialsTokenizer(Tokenizer):
+    """Spells BOS as "^" and EOS as "$", so rows can lead or end with them."""
+
+    bos_token_id = 1
+
+    def encode(self, text, add_special_tokens=True):
+        plain = super().encode
+        return [{"^": 1, "$": 2}.get(c) or plain(c)[0] for c in text]
+
+
+@pytest.mark.parametrize("tokenizer,append_eos,expected_max_length,expected", [
+    # A BOS-led prompt and an EOS-ended answer both lose their token to the cut
+    # and get it back, two tokens TRL reserved no room for.
+    (SpelledSpecialsTokenizer(), True, 8, (1, *Tokenizer().encode("defgxxxx"), 2)),
+    # With no EOS appended only the BOS comes back.
+    (SpelledSpecialsTokenizer(), False, 9, (1, *Tokenizer().encode("defgxxxxx"))),
+    # Without a BOS the prompt always spends a slot: TRL's budget stands.
+    (Tokenizer(), True, 10, (*Tokenizer().encode("defgxxxx"), 2)),
+])
+def test_a_kto_row_fits_the_batch_with_the_tokens_trl_adds_past_max_length(
+    tokenizer, append_eos, expected_max_length, expected,
+):
+    from unsloth_zoo.mlx.preference import (
+        create_kto_batch_plan, resolve_preference_length_policy,
+    )
+
+    args = types.SimpleNamespace(
+        max_length=10, max_prompt_length=4, append_eos=append_eos,
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        length_policy = resolve_preference_length_policy(
+            "kto", args, max_seq_length=10, tokenizer=tokenizer,
+        )
+    assert length_policy.max_length == expected_max_length
+    assert any(
+        f"using {expected_max_length}" in str(w.message) for w in caught
+    ) == (expected_max_length < 10)
+    dataset = [{"prompt": "^abcdefg", "completion": "x" * 8 + "$", "label": True}]
+    plan = create_kto_batch_plan(
+        dataset, tokenizer, batch_size=2, kl_batch_size=2,
+        length_policy=length_policy, num_epochs=1, append_eos=append_eos,
+    )
+    assert plan.rows[0].sequence == expected
+
+
+def test_kto_lengths_resolve_only_against_a_tokenizer():
+    from unsloth_zoo.mlx.preference import resolve_preference_length_policy
+
+    args = types.SimpleNamespace(max_length=10, max_prompt_length=4)
+    with pytest.raises(ValueError, match="needs the tokenizer"):
+        resolve_preference_length_policy("kto", args, max_seq_length=10)
+
+
+def test_a_kto_plan_refuses_a_policy_resolved_without_its_eos():
+    from unsloth_zoo.mlx.preference import (
+        create_kto_batch_plan, resolve_preference_length_policy,
+    )
+
+    args = types.SimpleNamespace(max_length=10, max_prompt_length=4, append_eos=False)
+    with pytest.warns(RuntimeWarning, match="using 9"):
+        length_policy = resolve_preference_length_policy(
+            "kto", args, max_seq_length=10, tokenizer=SpelledSpecialsTokenizer(),
+        )
+    with pytest.raises(ValueError, match="resolve the length policy"):
+        create_kto_batch_plan(
+            [{"prompt": "p", "completion": "c", "label": True}],
+            SpelledSpecialsTokenizer(), batch_size=2, kl_batch_size=2,
+            length_policy=length_policy, num_epochs=1, append_eos=True,
+        )
+
+
+def test_kto_labels_are_parsed_not_truth_tested():
+    import numpy as np
+    values = ("false", "0", "0.0", "no", " TRUE ", "yes", "1", "1.0", True, 0, 1.0, np.int64(0), np.float32(1), np.bool_(False))
+    plan = kto_plan([{"prompt": "p", "completion": "c", "label": v} for v in values])
+    assert [row.label for row in plan.rows] == [False] * 4 + [True] * 5 + [False, True, False, True, False]
+    with pytest.raises(ValueError, match="dataset row 0 .*boolean"):
+        kto_plan([{"prompt": "p", "completion": "c", "label": "maybe"}])
+
+
+def test_a_shuffled_kto_plan_moves_whole_batches():
+    rows = [{"prompt": f"p{i}", "completion": "c" * (i + 1), "label": True} for i in range(11)]
+    from unsloth_zoo.mlx.preference import _torch_randperm_order
+    shuffled = dict(dataset_order="torch_randperm", seed=3, num_epochs=3)
+    fixed = [tuple(range(start, min(start + 3, 11))) for start in range(0, 11, 3)]
+    assert kto_plan(rows, **shuffled).schedule == tuple(
+        fixed[index] for epoch in range(3) for index in _torch_randperm_order(4, 3 + epoch))
+    for unshuffled in (dict(num_epochs=3), dict(shuffled, preserve_dataset_order=True)):
+        assert kto_plan(rows, **unshuffled).schedule == tuple(fixed * 3)
+    with pytest.raises(ValueError, match="unsupported dataset_order 'shuffle'"):
+        kto_plan(rows, dataset_order="shuffle")
+
+
+@pytest.mark.parametrize("with_kl", [True, False])
+def test_a_kto_batch_holds_completions_then_kl_rows_and_their_reference(with_kl):
+    import mlx.core as mx
+    from unsloth_zoo.mlx.preference import precompute_reference_logps
+
+    plan = kto_plan(
+        [{"prompt": f"q{i}", "completion": "a" * (i + 1), "label": i != 1} for i in range(3)],
+        batch_size=2, kl_batch_size=2, with_kl=with_kl,
+    )
+    batch, lengths, normalizers, labels = plan[0]
+    first, second, third = plan.rows
+    sequences = [first.sequence, second.sequence]
+    sequences += [first.kl, second.kl] if with_kl else []
+    assert [row[:len(sequence)] for row, sequence in zip(batch.tolist(), sequences)] == [
+        list(sequence) for sequence in sequences]
+    assert len(batch.tolist()) == len(sequences)
+    assert lengths.tolist()[0] == [2, len(first.sequence)]
+    assert labels.tolist() == [True, False] and normalizers.tolist() == [0, 2, 1]
+
+    class Scorer:
+        def forward(self, model, batch, lengths):
+            return lengths[:, 1].astype(mx.float32)
+
+    table = precompute_reference_logps(plan, None, Scorer(), batch_size=2)
+    kl_sizes = [len(row.kl) if with_kl else 0 for row in plan.rows]
+    assert table.tolist() == [[len(row.sequence), kl] for row, kl in zip(plan.rows, kl_sizes)]
+    assert plan[1][4].tolist() == [len(third.sequence)] + ([len(third.kl)] if with_kl else [])
+
+
+@pytest.mark.parametrize("labels,weights,warns", [
+    ([True] * 3 + [False], (1.0, 1.0), True),
+    ([True] * 3 + [False], (0.4, 1.0), False),
+    ([True] * 3 + [False], (1.0, 3.0), False),
+    ([True, False], (1.0, 5.0), False),
+])
+def test_kto_warns_when_neither_weight_balances_the_labels(labels, weights, warns):
+    from unsloth_zoo.mlx.preference import warn_kto_weight_balance
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        warn_kto_weight_balance(labels, *weights)
+    assert bool(caught) == warns
+
+
+@pytest.mark.parametrize("loss_type,labels", [
+    ("kto", [True, False, True]), ("kto", [False] * 3),
+    ("apo_zero_unpaired", [True, False, True]),
+])
+def test_the_kto_loss_is_trls_weighted_row_mean(loss_type, labels):
+    from unsloth_zoo.mlx.preference import (
+        ReferencePolicy, _response_logps, make_kto_loss_fn,
+        make_preference_eval_fn, precompute_reference_logps,
+        resolve_preference_objective)
+    objective = resolve_preference_objective(
+        "kto", beta=0.5, loss_type=loss_type, desirable_weight=1.5, undesirable_weight=0.7)
+    # TinyModel's logits see one token, so answers starting alike would give the KL
+    # rows the completions' own log probabilities.
+    dataset = [{"prompt": f"p{i}", "completion": ("a", "bc", "def")[i], "label": label}
+               for i, label in enumerate(labels)]
+    plan = kto_plan(dataset, with_kl=objective.with_kl)
+    n = len(labels)
+    policy, reference = TinyModel(), ReferencePolicy(model=TinyModel())
+    own, ref = (_response_logps(m, *plan[0][:2]).tolist() for m in (policy, reference.model))
+    ratios = [a - b for a, b in zip(own, ref)]
+    raw_kl = sum(ratios[n:]) / n if objective.with_kl else None
+    local_kl = max(raw_kl or 0.0, 0.0)
+
+    def expected(kl):
+        sig = lambda x: 1 / (1 + math.exp(-x))
+        kto = loss_type == "kto"
+        return sum(
+            1.5 * (1 - sig(0.5 * (r - kl if kto else r))) if label
+            else 0.7 * (1 - sig(0.5 * (kl - r)) if kto else sig(0.5 * r))
+            for r, label in zip(ratios, labels)) / n
+
+    def loss_fn(kl_mean):
+        return make_kto_loss_fn(objective, reference_policy=reference, kl_mean=kl_mean)
+
+    # The cross-process reducer takes the unclamped estimate over the KL rows.
+    shared = 0.0 if raw_kl is None else raw_kl + 100
+    loss, _, stats = loss_fn(lambda kl: kl + 100)(policy, *plan[0])
+    assert [float(loss), float(stats[6])] == pytest.approx([expected(shared), shared], rel=1e-5)
+    assert float(loss_fn(lambda kl: kl - 100)(policy, *plan[0])[2][6]) == 0.0
+    eval_loss, rows, eval_stats = make_preference_eval_fn(
+        objective, reference_policy=reference)(policy, *plan[0])
+    assert (float(eval_loss), int(rows)) == (pytest.approx(expected(local_kl), rel=1e-5), n)
+    side = lambda values, want: sum(v for v, l in zip(values, labels) if l == want)
+    logits = [sum(map(sum, row[:end - 1])) for row, (_, end) in zip(
+        policy(plan[0][0][:n, :-1]).tolist(), plan[0][1].tolist())]
+    assert eval_stats.tolist() == pytest.approx([
+        0.5 * side(ratios, True), 0.5 * side(ratios, False), side(own, True),
+        side(own, False), side(logits, True), side(logits, False), local_kl,
+        sum(labels), n - sum(labels), 1.0], rel=1e-4, abs=1e-4)
+    micro = kto_plan(dataset, with_kl=objective.with_kl, batch_size=2, grad_accum=2)
+    assert sum(float(loss_fn(lambda kl: kl * 0 + 0.3)(policy, *micro[i])[0])
+               for i in range(2)) / 2 == pytest.approx(expected(0.3), rel=1e-5)
+    precompute_reference_logps(plan, policy, reference, batch_size=2)
+    reference.forward = None  # read from the batch from here on
+    assert float(make_preference_eval_fn(objective, reference_policy=reference)(
+        policy, *plan[0])[0]) == pytest.approx(expected(local_kl), rel=1e-5)
+
+
+def test_kto_metrics_average_each_side_over_its_own_rows():
+    from unsloth_zoo.mlx.preference import kto_metric_values
+    # A side without rows is left out, and so is the margin between the sides.
+    assert kto_metric_values([0, 3.0, 0, -9.0, 0, 30.0, 0.6, 0, 3, 4]) == pytest.approx({
+        "rewards/rejected": 1.0, "logps/rejected": -3.0, "logits/rejected": 10.0, "kl": 0.15})
+    assert kto_metric_values([4.0, 3.0, 0, 0, 0, 0, 0, 2, 3, 1])["rewards/margins"] == 1.0
+
+
+def kto_rows(n):
+    return [{"prompt": f"question {i}: ", "completion": f"answer{'!' * i}", "label": i % 3 != 1} for i in range(n)]
+
+
+@pytest.mark.parametrize("loss_type,precompute", [("kto", False), ("kto", True), ("apo_zero_unpaired", False)])
+def test_the_kto_trainer_trains_and_evaluates_against_its_reference(
+        tmp_path, monkeypatch, loss_type, precompute):
+    from unsloth_zoo.mlx import trainer as trainer_module
+    from unsloth_zoo.mlx.trainer import MLXKTOConfig, MLXKTOTrainer
+    built, plans, calls = [], [], []
+    for name in ("make_kto_loss_fn", "make_kto_cce_loss_fn"):
+        make = getattr(trainer_module, name)
+        monkeypatch.setattr(trainer_module, name, lambda *a, make=make, **kw: (
+            built.append((a[-1], kw["reference_policy"])), make(*a, **kw))[1])
+    plan = trainer_module.create_kto_batch_plan
+    monkeypatch.setattr(trainer_module, "create_kto_batch_plan", lambda *a, **kw: (
+        plans.append((kw, plan(*a, **kw))) or plans[-1][1]))
+    trainer = MLXKTOTrainer(
+        _tiny_model(tail=True), Tokenizer(), kto_rows(6), eval_dataset=kto_rows(5),
+        args=MLXKTOConfig(**_generation_common(
+            tmp_path, generate_during_eval=precompute, loss_type=loss_type,
+            desirable_weight=1.25, undesirable_weight=2.0, per_device_eval_batch_size=5,
+            precompute_ref_log_probs=precompute,
+            dataset_order="torch_randperm" if precompute else "default")))
+    _run_generation_trainer(trainer, monkeypatch, calls)
+    # The training plan takes the run's order; evaluation keeps dataset order.
+    order = ("torch_randperm" if precompute else "default", False, trainer.args.seed)
+    assert [tuple(map(p.get, ("dataset_order", "preserve_dataset_order", "seed"))) for p, _ in plans] == [order, (None,) * 3]
+    (objective, reference), = built
+    assert reference is not None and (objective.loss_types, objective.desirable_weight,
+                                      objective.undesirable_weight) == ((loss_type,), 1.25, 2.0)
+    # Eval rows pair for the KL term in chunks of the training batch size.
+    with_kl = loss_type == "kto"
+    assert [(p["batch_size"], p["kl_batch_size"], p["with_kl"],
+             made._reference is not None) for p, made in plans] == [
+        (2, 2, with_kl, precompute), (5, 2, with_kl, precompute)]
+    assert len(calls) == 2 * precompute and all(
+        sample["reference"] for sample in trainer.last_generation_samples)
+    logged = next(e for e in trainer.state.log_history if "rewards/chosen" in e)
+    evaluated = trainer._last_eval_metrics
+    for name in ("rewards/chosen", "rewards/rejected", "rewards/margins", "logps/chosen",
+                 "logps/rejected", "logits/chosen", "logits/rejected", "kl"):
+        assert name in logged and f"eval_{name}" in evaluated, name
+    assert with_kl or evaluated["eval_kl"] == logged["kl"] == 0
+
+
+@pytest.mark.parametrize("overrides,trainer_kwargs,match", [
+    ({"per_device_train_batch_size": 1}, {}, "needs per_device_train_batch_size > 1"),
+    ({}, {"model_adapter_name": "policy"}, "model_adapter_name names one of several"),
+    ({}, {"ref_adapter_name": "ref"}, "ref_adapter_name replaces"),
+])
+def test_the_kto_trainer_refuses_a_run_trl_would_not_train(
+        tmp_path, monkeypatch, overrides, trainer_kwargs, match):
+    from unsloth_zoo.mlx.trainer import MLXKTOConfig, MLXKTOTrainer
+    trainer = MLXKTOTrainer(
+        _tiny_model(), Tokenizer(), kto_rows(4), **trainer_kwargs,
+        args=MLXKTOConfig(**_generation_common(
+            tmp_path, generate_during_eval=False, **overrides)))
+    with pytest.raises(ValueError, match=match):
+        _run_generation_trainer(trainer, monkeypatch, [])
+    # Without a KL term a single-row batch is fine; the config and eval dataset are positional.
+    trainer = MLXKTOTrainer(
+        _tiny_model(), Tokenizer(), kto_rows(4), MLXKTOConfig(**_generation_common(
+            tmp_path, generate_during_eval=False, loss_type="apo_zero_unpaired",
+            per_device_train_batch_size=1)), kto_rows(3))
+    _run_generation_trainer(trainer, monkeypatch, [])
+    assert (trainer._global_step, trainer.args.loss_type, len(trainer.eval_dataset)) == (1, "apo_zero_unpaired", 3)
+
+
 class VisionModel(TinyModel):
     """Takes the full sequence, the pixels and a mask, as an mlx-vlm model does;
     token 64 is an image placeholder past the 64-entry output head."""
@@ -2894,3 +3235,14 @@ def test_dpo_trains_and_evaluates_image_rows_on_a_vision_language_model(monkeypa
     guard, tokens = run._compile_shape_guard_report, run.state.num_input_tokens_seen
     assert (guard.action, guard.reason) == ("not_applicable", "vlm_compile_unqualified")
     assert tokens > 0 and run._compile_decision is not None
+
+
+def test_the_kto_trainer_still_refuses_a_vision_language_model(tmp_path):
+    from unsloth_zoo.mlx.trainer import MLXKTOConfig, MLXKTOTrainer
+    class Model(type(_tiny_model())):
+        _is_vlm_model = True
+    trainer = MLXKTOTrainer(
+        Model(), Tokenizer(), kto_rows(4), processor=VisionProcessor(),
+        args=MLXKTOConfig(**_generation_common(tmp_path, generate_during_eval=False)))
+    with pytest.raises(ValueError, match="KTO: vision-language models are not supported"):
+        trainer._prepare_data(True)
