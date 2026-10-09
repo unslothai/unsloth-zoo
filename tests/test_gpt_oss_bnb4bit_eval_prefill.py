@@ -14,14 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Eval-mode GptOssExpertsBnb4bit must not run every expert on every token for long inputs.
-
-The dense eval branch holds experts x tokens fp32 swiglu temporaries: a GRPO prefill of
-4 x 4608 tokens on gpt-oss-120b asked for 27.5 GiB in one layer (unsloth#3411). Long eval
-calls now take the grouped path (else the per-expert loop); short ones keep the dense
-branch. Both entry points are covered: the module-level torch_native_forward bound to the
-class, and the class body's forward, which the compiled cache emits standalone.
-"""
+"""Long eval calls of GptOssExpertsBnb4bit skip the all-experts dense branch (unsloth#3411),
+through both the bound torch_native_forward and the class body the compiled cache emits."""
 import ast
 import inspect
 import os
@@ -44,7 +38,6 @@ FORWARDS = ["module", "class"]
 
 
 def _class_body_forward():
-    # The class attribute is rebound to torch_native_forward; load the class body's own forward.
     src = inspect.getsource(gpt_oss)
     cls = next(n for n in ast.parse(src).body if isinstance(n, ast.ClassDef) and n.name == "GptOssExpertsBnb4bit")
     fn = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "forward")
@@ -96,7 +89,6 @@ def _reference(experts, x, idx, weights):
 @pytest.mark.parametrize("which", FORWARDS)
 @pytest.mark.parametrize("num_tokens, dense", [(4, True), (64, False)])
 def test_eval_branch_by_size(monkeypatch, which, num_tokens, dense):
-    # Plain nn.Linear experts are not grouped-ready, so long calls take the per-expert loop.
     monkeypatch.setenv("UNSLOTH_GPTOSS_GROUPED", "0")
     experts, rows = _experts(which)
     monkeypatch.setattr(GptOssExpertsBnb4bit, "_dense_eval_max_rows", 16 * E, raising = False)

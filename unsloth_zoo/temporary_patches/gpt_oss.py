@@ -1153,7 +1153,7 @@ class GptOssExpertsBnb4bit(nn.Module):
     so BitsAndBytes can quantize them.
     """
 
-    # Eval calls with more (token, expert) rows skip the all-experts dense branch (unsloth#3411).
+    # Eval calls above this many (token, expert) rows skip the all-experts dense branch.
     _dense_eval_max_rows = 8192
 
     def __init__(self, config):
@@ -1323,8 +1323,7 @@ class GptOssExpertsBnb4bit(nn.Module):
         num_experts = routing_weights.shape[1]
         top_k = router_indices.shape[1]
 
-        # The dense eval branch runs every expert on every token (27.5 GiB in one layer of a
-        # 120B GRPO prefill, unsloth#3411): long eval calls take the grouped path or the loop.
+        # Dense eval is experts x tokens: 27.5 GiB in one layer of a 120B GRPO prefill (unsloth#3411).
         eval_routed = (
             not self.training
             and num_tokens * num_experts > self._dense_eval_max_rows
@@ -2908,10 +2907,8 @@ def torch_native_forward(
         if grouped is not None:
             return grouped
 
-    # The dense eval branch below runs every expert on every token, so its fp32 swiglu
-    # temporaries grow as experts x tokens (27.5 GiB in one layer of a 120B GRPO prefill,
-    # unsloth#3411). Long eval calls take the grouped path, else the loop. The class body's
-    # forward (emitted standalone by the compiled cache) routes the same way.
+    # Dense eval is experts x tokens (unsloth#3411). Keep in step with the class-body forward,
+    # which the compiled cache emits standalone.
     eval_routed = (
         not self.training
         and num_tokens * num_experts > getattr(self, "_dense_eval_max_rows", GptOssExpertsBnb4bit._dense_eval_max_rows)
