@@ -33,6 +33,9 @@ import textwrap
 
 import pytest
 
+# The child fakes a Linux CUDA box: os.name == "nt" always takes the Windows branch and macOS has no CUDA device.
+pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="Linux CUDA allocator matrix")
+
 ROUNDUP = "roundup_power2_divisions:[32:256,64:128,256:64,>:32]"
 _ALLOC_KEYS = ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF", "PYTORCH_HIP_ALLOC_CONF")
 _WIPE = _ALLOC_KEYS + (
