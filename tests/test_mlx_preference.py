@@ -993,7 +993,8 @@ def test_the_training_loss_and_its_reported_metrics_follow_the_objective():
     # Weights summing to zero separate TRL's per-entry copies from one scaled copy.
     reward_chosen = _ordered(beta * (chosen - ref_chosen), weights)
     reward_rejected = _ordered(beta * (rejected - ref_rejected), weights)
-    logits, _ce, mask = preference._preference_forward(model, batch, lengths)
+    mask = preference._response_mask(batch[:, 1:], lengths)
+    logits, _ce = preference._preference_forward(model, batch, mask)
     rows, vocab = logits.astype(mx.float32).sum(axis=-1), logits.shape[-1]
     _assert_reported_stats("dpo", stats, {
         "rewards/chosen": reward_chosen.sum(),
@@ -2629,3 +2630,267 @@ def test_evaluation_accepts_a_wrapped_model_output(objective):
     assert math.isclose(float(from_bare[0]), float(from_wrapped[0]),
                         rel_tol=1e-6, abs_tol=1e-6)
     assert int(from_bare[1]) == int(from_wrapped[1])
+
+
+class VisionModel(TinyModel):
+    """Takes the full sequence, the pixels and a mask, as an mlx-vlm model does;
+    token 64 is an image placeholder past the 64-entry output head."""
+
+    extra = 0
+
+    def __call__(self, tokens, pixel_values, mask, **kwargs):
+        import mlx.core as mx
+        self.pixels, self.kwargs = pixel_values, kwargs
+        tokens = mx.where(tokens >= 64, 0, tokens)
+        if self.extra:
+            tokens = mx.concatenate([tokens[:, :self.extra], tokens], axis=1)
+        return super().__call__(tokens)
+
+
+@pytest.mark.parametrize("objective", ["orpo", "dpo", "dpo_referenced"])
+def test_a_vision_batch_scores_through_the_vision_forward(objective, monkeypatch):
+    from unsloth_zoo.mlx import preference
+    from unsloth_zoo.mlx.preference import (
+        ReferencePolicy, make_preference_eval_fn, resolve_preference_objective)
+
+    kind = objective.split("_")[0]
+    referenced = objective == "dpo_referenced"
+    text, vision = TinyModel(), VisionModel()
+    vision.embedding, vision.output = text.embedding, text.output
+
+    def score(model, batch):
+        reference = ReferencePolicy(model=model) if referenced else None
+        eval_fn = make_preference_eval_fn(resolve_preference_objective(
+            kind, beta=0.1, reference_free=not referenced), reference_policy=reference)
+        return eval_fn(model, batch, *plan[0][1:])
+
+    import mlx.core as mx
+    plan = build_plan(dataset=rows(2))
+    ids, lengths = plan[0][:2]
+    pairs = ids.shape[0] // 2
+    # A placeholder in the rejected prompts, which no objective scores.
+    placed = lambda token: mx.concatenate([ids[:, :1], mx.concatenate(
+        [ids[:pairs, 1:2], 0 * ids[pairs:, 1:2] + token]), ids[:, 2:]], axis=1)
+    expected = score(text, placed(0))
+    image_ids = placed(64)
+    gathered, cross_entropy = [], preference.nn.losses.cross_entropy
+    monkeypatch.setattr(preference.nn.losses, "cross_entropy",
+                        lambda logits, targets, **kw: gathered.append(targets)
+                        or cross_entropy(logits, targets, **kw))
+    got = score(vision, {"input_ids": image_ids, "pixel_values": "pixels",
+                         "image_grid_thw": "grid", "_unsloth_marker": True})
+    assert vision.pixels == "pixels" and vision.kwargs == {"image_grid_thw": "grid"}
+    scored = preference._response_mask(image_ids[:, 1:], lengths) > 0
+    if kind == "orpo":  # the chosen NLL spans the whole sequence
+        whole = mx.arange(1, ids.shape[1]) < lengths[:, 1:]
+        scored = mx.concatenate([whole[:pairs], scored[pairs:]])
+    assert gathered and all(
+        t.tolist() == mx.where(scored, image_ids[:, 1:], 0).tolist() for t in gathered)
+    assert math.isclose(float(expected[0]), float(got[0]), rel_tol=1e-6, abs_tol=1e-6)
+    assert expected[2].tolist() == pytest.approx(got[2].tolist(), rel=1e-5, abs=1e-5)
+    vision.extra = 1
+    with pytest.raises(ValueError, match="cannot be located"):
+        score(vision, {"input_ids": ids})
+
+
+class VisionProcessor:
+    """Renders an image part as <img> and encodes it as two image tokens."""
+
+    chat_template = "parts"
+    image_token = "<img>"
+
+    def __init__(self):
+        self.tokenizer = Tokenizer()
+        self.tokenizer.image_token_id = 60
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False,
+                            continue_final_message=False, **kwargs):
+        def text(content):
+            if isinstance(content, str):
+                return content
+            return "".join(
+                "<img>" if part.get("type") == "image" else part.get("text", "")
+                for part in content)
+        rendered = "".join(f"<{m['role']}>{text(m['content'])}" for m in messages)
+        return rendered + ("<assistant>" if add_generation_prompt else "")
+
+    def __call__(self, text=None, images=None, **kwargs):
+        import re
+        import numpy as np
+        rows = []
+        for sample in text:
+            ids, types = [], []
+            for piece in re.split("(<img>)", sample):
+                encoded = [60, 61] if piece == "<img>" else self.tokenizer.encode(
+                    piece, add_special_tokens=False)
+                ids += encoded
+                types += [int(piece == "<img>")] * len(encoded)
+            rows.append((ids, types))
+        width = max(len(ids) for ids, _ in rows)
+        pad = lambda values: values + [0] * (width - len(values))
+        flat = [image for group in images for image in (
+            group if isinstance(group, list) else [group])]
+        return {
+            "input_ids": np.array([pad(ids) for ids, _ in rows]),
+            "attention_mask": np.array([pad([1] * len(ids)) for ids, _ in rows]),
+            "token_type_ids": np.array([pad(types) for _, types in rows]),
+            "pixel_values": np.array([[float(image.width)] for image in flat]),
+        }
+
+
+def vision_row(**extra):
+    from PIL import Image
+    return {
+        "images": [Image.new("RGB", (4, 4))],
+        "prompt": [{"role": "user", "content": [
+            {"type": "image"}, {"type": "text", "text": "hi"}]}],
+        "chosen": [{"role": "assistant", "content": "yes"}],
+        "rejected": [{"role": "assistant", "content": "no"}],
+        **extra,
+    }
+
+
+def test_an_image_row_encodes_its_prompt_through_the_processor():
+    from unsloth_zoo.mlx.preference import tokenize_vision_preference_row
+
+    encode = Tokenizer().encode
+    prompt = encode("<user>") + [60, 61] + encode("hi<assistant>")
+    types = [0] * 6 + [1, 1] + [0] * 13
+
+    def tokenize(row=vision_row(), processor=VisionProcessor(), **options):
+        return tokenize_vision_preference_row(
+            processor, row, length_policy=policy(**options), media_token_ids={60})
+
+    row = tokenize()
+    assert row.chosen_prompt_ids == row.rejected_prompt_ids == tuple(prompt)
+    assert row.chosen_ids == tuple(encode("yes") + [2])
+    assert row.chosen_prompt_arrays == (("token_type_ids", tuple(types)),)
+    cut = tokenize(max_prompt_length=len(prompt) - 3)
+    assert cut.chosen_prompt_ids == tuple(prompt[3:])
+    assert cut.rejected_prompt_arrays == (("token_type_ids", tuple(types[3:])),)
+    with pytest.raises(ValueError, match="image tokens"):
+        tokenize(max_prompt_length=len(prompt) - 7)
+
+    class NegativePlaceholders(VisionProcessor):
+        def __call__(self, **kwargs):
+            outputs = super().__call__(**kwargs)
+            ids = outputs["input_ids"]
+            return {**outputs, "input_ids": ids * (1 - 2 * (ids >= 60))}
+
+    with pytest.raises(ValueError, match="image tokens"):
+        tokenize_vision_preference_row(
+            NegativePlaceholders(), vision_row(),
+            length_policy=policy(max_prompt_length=len(prompt) - 7))
+    assert tokenize_vision_preference_row(
+        NegativePlaceholders(), vision_row(), length_policy=policy()).chosen_prompt_ids[6] == -60
+    longer = tokenize(vision_row(rejected=[{"role": "assistant", "content": "nooo"}]),
+                      max_length=len(prompt) + 4)
+    assert longer.chosen_prompt_arrays == (("token_type_ids", tuple(types)),)
+    assert longer.rejected_prompt_arrays == (("token_type_ids", tuple(types[1:])),)
+    bos = VisionProcessor()
+    bos.tokenizer.bos_token_id = 1
+    bos.tokenizer.encode = lambda text, add_special_tokens=True: (
+        [1] * add_special_tokens + encode(text))
+    row = tokenize(processor=bos)
+    assert row.chosen_prompt_ids == (1, *prompt)
+    assert row.chosen_prompt_arrays == (("token_type_ids", (0, *types)),)
+
+
+def test_a_vision_plan_repeats_the_pixels_for_both_branches():
+    from unsloth_zoo.mlx.preference import (
+        create_preference_batch_plan, precompute_reference_logps,
+        tokenize_preference_row)
+
+    text_row = rows(1)[0]
+    plan = create_preference_batch_plan(
+        [vision_row(), text_row], None, batch_size=2, length_policy=policy(),
+        dataset_order="sequential", grad_accum=1,
+        processor=VisionProcessor(), model_config={})
+    batch, lengths, _ = plan[0]
+    image, text = plan.rows
+    assert text.chosen == tokenize_preference_row(
+        Tokenizer(), text_row, length_policy=policy()).chosen
+    assert batch["input_ids"][1, :len(text.chosen)].tolist() == list(text.chosen)
+    assert batch["pixel_values"].tolist() == [[4.0], [4.0]]
+    types = batch["token_type_ids"].tolist()
+    assert types[0][:21] == types[2][:21] == list(image.chosen_prompt_arrays[0][1])
+    assert not any(types[1] + types[3])
+    assert batch["attention_mask"].sum(axis=1).tolist() == lengths[:, 1].tolist()
+    plan.configure_cce_compaction(True)
+    assert plan.prepare_cce_batch(0, plan[0])[0] is not None
+
+    class CropsAndWholeImages(VisionProcessor):
+        def __call__(self, **kwargs):
+            import numpy as np
+            outputs = super().__call__(**kwargs)
+            return {**outputs, "pixel_values": [np.zeros((3, 2)), outputs["pixel_values"]]}
+
+    pixels = create_preference_batch_plan(
+        [vision_row()], None, batch_size=1, length_policy=policy(), grad_accum=1,
+        processor=CropsAndWholeImages(), model_config={"model_type": "deepseekocr"},
+    )[0][0]["pixel_values"]
+    assert [part.shape[0] for part in pixels] == [6, 2]
+    named_on_processor = VisionProcessor()
+    del named_on_processor.tokenizer.image_token_id
+    named_on_processor.image_token, named_on_processor.image_token_id = None, 60
+    for processor in (VisionProcessor(), named_on_processor):
+        with pytest.raises(ValueError, match="image tokens"):
+            create_preference_batch_plan(
+                [vision_row()], None, batch_size=1, length_policy=policy(max_prompt_length=12),
+                grad_accum=1, processor=processor, model_config={})
+
+    seen = []
+
+    class Scorer:
+        model = None
+        def forward(self, model, batch, lengths, **_cce):
+            import mlx.core as mx
+            seen.append("pixel_values" in batch)
+            return mx.zeros((lengths.shape[0],))
+
+    precompute_reference_logps(plan, None, Scorer(), batch_size=1, scorer=object())
+    assert seen == [True, False]
+
+
+@pytest.mark.parametrize("kind,row,message", [
+    ("orpo", vision_row(), "ORPOTrainer has no vision path"),
+    ("dpo", vision_row(chosen=[{"role": "assistant", "content": [
+        {"type": "image"}, {"type": "text", "text": "yes"}]}]), "belong to the prompt"),
+    ("dpo", vision_row(audio=__import__("numpy").zeros(4)), "audio rows"),
+    ("dpo", vision_row(video_url="clip.mp4"), "video rows"),
+    ("dpo", vision_row(prompt=[{"role": "user", "content": [{"type": "video"}]}]), "video rows"),
+    ("dpo", vision_row(prompt=[{"role": "user", "content": [
+        {"type": "input_video", "input_video": "clip.mp4"}]}]), "video rows"),
+    ("dpo", vision_row(rejected=[{"role": "assistant", "content": [{"type": "image"}]}]),
+     "belong to the prompt"),
+    ("dpo", {**rows(1)[0], "image_url": "cat.png"}, "does not place"),
+    ("orpo", {**rows(1)[0], "pixel_values": [[1.0]]}, "does not place"),
+    ("dpo", vision_row(images=None, prompt=[{"role": "user", "content": [
+        {"type": "text", "text": "hi", "pixel_values": [[1.0]]}]}]), "does not place"),
+])
+def test_vision_rows_refuse_media_the_cuda_path_does_not_condition_on(kind, row, message):
+    from unsloth_zoo.mlx.preference import tokenize_vision_preference_row
+
+    with pytest.raises(ValueError, match=message):
+        tokenize_vision_preference_row(
+            VisionProcessor(), row, length_policy=policy(kind))
+
+
+def test_dpo_trains_and_evaluates_image_rows_on_a_vision_language_model(monkeypatch, tmp_path):
+    from mlx_vlm import prompt_utils
+    from unsloth_zoo.mlx.trainer import MLXDPOConfig, MLXDPOTrainer
+    monkeypatch.setattr(prompt_utils, "get_message_json", lambda *_a, **_k: None, raising=False)
+    class Model(type(_tiny_model())):
+        _is_vlm_model, pixels = True, []
+        def __call__(self, tokens, pixel_values=None, mask=None, **kwargs):
+            return Model.pixels.append(pixel_values is not None) or super().__call__(tokens)
+    data = [vision_row(), rows(1)[0]]
+    run = MLXDPOTrainer(Model(), Tokenizer(), data, eval_dataset=data, processor=VisionProcessor(),
+                        args=MLXDPOConfig(**_generation_common(tmp_path, reference_free=True)))
+    with pytest.raises(ValueError, match="lose their images"):
+        run._prepare_data(True)
+    run.args.generate_during_eval, run.args.include_num_input_tokens_seen = False, "non_padding"
+    assert _run_generation_trainer(run, monkeypatch, [])["train_steps"] == 1 and sum(Model.pixels) == 2
+    guard, tokens = run._compile_shape_guard_report, run.state.num_input_tokens_seen
+    assert (guard.action, guard.reason) == ("not_applicable", "vlm_compile_unqualified")
+    assert tokens > 0 and run._compile_decision is not None

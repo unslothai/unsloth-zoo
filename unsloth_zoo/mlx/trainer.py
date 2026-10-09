@@ -635,6 +635,7 @@ from .utils import (
 )
 from .preference import (
     FinitePreferenceBatchPlan,
+    FiniteVisionPreferenceBatchPlan,
     PreferenceRunContext,
     build_reference_policy,
     create_preference_batch_plan,
@@ -689,6 +690,13 @@ _FINITE_BATCH_PLAN_TYPES = (
 # processor, so a refetch would draw twice and offset every later batch; it
 # reuses the materialized batch instead, whose planned padding is masked.
 _EAGER_REFETCHABLE_PLAN_TYPES = (FiniteTextBatchPlan, FinitePreferenceBatchPlan)
+
+
+def _eager_refetchable(batches):
+    # A vision preference plan reruns the processor like the VLM plan.
+    return isinstance(batches, _EAGER_REFETCHABLE_PLAN_TYPES) and not isinstance(
+        batches, FiniteVisionPreferenceBatchPlan,
+    )
 
 
 def _is_hf_tokenizer(tokenizer):
@@ -1354,7 +1362,8 @@ def _mlx_batch_input_token_count(batch_data, mode="all", pad_token_id=None):
 
     Uses ``.shape`` (a tuple under both real mlx and the torch test shim) rather
     than a backend-specific ``.size`` / ``.numel``. Handles the text/preference/
-    GRPO tuple batch (input ids first) and the VLM dict batch (``input_ids`` key);
+    GRPO tuple batch (input ids, or a vision preference dict, first) and the VLM
+    dict batch (``input_ids`` key);
     returns 0 when no input-id tensor is present so the counter simply does not
     advance rather than raising.
     """
@@ -1366,6 +1375,8 @@ def _mlx_batch_input_token_count(batch_data, mode="all", pad_token_id=None):
         attention_mask = batch_data.get("attention_mask")
     elif isinstance(batch_data, (tuple, list)) and batch_data:
         arr = batch_data[0]
+        if isinstance(arr, dict):
+            arr = arr.get("input_ids")
         lengths = batch_data[1] if len(batch_data) > 1 else None
     else:
         arr = None
@@ -2261,7 +2272,29 @@ def _plan_single_process_text_shapes(
     configured_cap = getattr(args, "compile_max_variants", None)
     automatic = configured_cap is None
     cap = resolve_compile_max_variants(configured_cap)
-    if is_vlm:
+    vision_preference = isinstance(batches, FiniteVisionPreferenceBatchPlan)
+    strict = compile_policy.mode == "strict"
+    if vision_preference:
+        # The vision SFT planner's gates; the trainer reports an unqualified arch.
+        if compile_policy.mode == "eager":
+            return None, _shape_guard_report(
+                "not_applicable", "compile_disabled", cap,
+            ), True, None
+        if not getattr(vlm_compile_decision, "enabled", False):
+            return None, _shape_guard_report(
+                "not_applicable", "vlm_compile_unqualified", cap,
+            ), True, None
+        strict = _effective_compile_mode(
+            compile_policy, vlm_compile_decision,
+        ) == "strict"
+        if (
+            _resolve_mlx_grad_clipping(args)[0] > 0
+            and args.gradient_accumulation_steps > 1
+        ):
+            return None, _shape_guard_report(
+                "not_applicable", "compile_ineligible_global_norm", cap,
+            ), False, None
+    elif is_vlm:
         return _plan_single_process_vlm_shapes(
             batches,
             batch_iter,
@@ -2312,6 +2345,26 @@ def _plan_single_process_text_shapes(
         )
     else:
         total_microsteps = total_steps * grad_accum
+    if vision_preference:
+        batches.ensure_descriptors()
+        unplannable = sorted(
+            index
+            for index in {
+                batches.batch_index_for_visit(microstep)
+                for microstep in range(total_microsteps)
+            }
+            if not _vlm_family_is_plannable(batches.batch_family(index))
+        )
+        if unplannable:
+            if strict:
+                raise RuntimeError(
+                    "Unsloth: strict mx.compile cannot plan VLM batch "
+                    f"{unplannable[0]}: its compile-key family is not stable "
+                    "enough to group safely."
+                )
+            return None, _shape_guard_report(
+                "eager", "vlm_unplannable_family", cap, compile_scope,
+            ), False, None
     event_counts = {}
     for microstep in range(total_microsteps):
         # Same visit mapping as the runtime fetch, so the enumerated catalog
@@ -2343,7 +2396,13 @@ def _plan_single_process_text_shapes(
         frontier = build_text_shape_frontier(
             events, compile_scope=compile_scope,
         )
-        shape_plan = select_text_shape_padding_budget(frontier)
+        shape_plan = select_text_shape_padding_budget(
+            frontier,
+            # Media families keep their own endpoints, so padding buys no reuse.
+            exact_signature_threshold=(
+                AUTOMATIC_TEXT_COMPILE_CEILING if vision_preference else None
+            ),
+        )
     else:
         shape_plan = plan_text_shape_buckets(
             events,
@@ -2351,7 +2410,7 @@ def _plan_single_process_text_shapes(
             compile_scope=compile_scope,
         )
     if shape_plan.report.action == "eager":
-        if compile_policy.mode == "strict" and distributed_world_size <= 1:
+        if strict and distributed_world_size <= 1:
             raise RuntimeError(
                 "Unsloth: strict mx.compile finite text shape planning failed "
                 f"({shape_plan.report.reason})."
@@ -2480,6 +2539,16 @@ class MLXTrainer:
             )
             self._resolved_preference_length_policy = policy
         return policy
+
+    def _preference_vision_options(self):
+        """What a preference plan needs to encode rows for a vision-language model."""
+        if not self._is_vlm:
+            return {}
+        return dict(
+            processor=self._resolve_vlm_processor(),
+            model_config=getattr(self.model, "_config", {}),
+            image_size=getattr(self.args, "image_size", None),
+        )
 
     def _build_dpo_reference(self, model, *, resume_provenance):
         args = self.args
@@ -5363,7 +5432,10 @@ class MLXTrainer:
             # setup in between is rank-deterministic and needs no collectives.
             # A strict abort here unwinds through train()'s finally, and the
             # state that persists is idempotent if train() is called again.
-            if self._is_vlm and hasattr(self, "_batches"):
+            if (
+                self._is_vlm and not self.preference_kind
+                and hasattr(self, "_batches")
+            ):
                 preflight_error = None
                 batches = batch_iter = None
                 total_steps = 0
@@ -6950,6 +7022,7 @@ class MLXTrainer:
                                  _capture_generation_prompt(_n, text))
                                 if _samples_prompts else None
                             ),
+                            **self._preference_vision_options(),
                         )
                     if is_vlm:
                         if not _vlm_has_sized_index_space(eval_dataset):
@@ -7530,7 +7603,8 @@ class MLXTrainer:
             try:
                 val_loss, ppl = self._evaluate(
                     current_eval_batches, preference_eval_fn or loss_fn,
-                    is_vlm=is_vlm,
+                    # A preference batch is a tuple even when it carries pixels.
+                    is_vlm=is_vlm and not preference_kind,
                 )
             finally:
                 resume_mlx_training_patches(_paused_window)
@@ -7972,7 +8046,7 @@ class MLXTrainer:
                 _ddp_compile_local_grad = False
                 if _stream_policy is not None:
                     _stream_policy.armed = False
-                if isinstance(batches, _EAGER_REFETCHABLE_PLAN_TYPES):
+                if _eager_refetchable(batches):
                     batch_data = batches[scheduled_index]
                 state = [
                     model.state, optimizer.state, mx.random.state,
@@ -8383,7 +8457,7 @@ class MLXTrainer:
                         _compile_fallback_reason = "runtime_error"
                         if _stream_policy is not None:
                             _stream_policy.armed = False
-                        if isinstance(batches, _EAGER_REFETCHABLE_PLAN_TYPES):
+                        if _eager_refetchable(batches):
                             batch_data = batches[scheduled_index]
                         _restore_mlx_rng_key(rng_state_before)
                         state = [
@@ -8990,11 +9064,6 @@ class MLXTrainer:
         model_type = config.get("model_type") if isinstance(config, dict) else None
         model_name = getattr(self.model, "_hf_repo", None)
 
-        if self.preference_kind and is_vlm:
-            raise ValueError(
-                "Unsloth MLX preference: vision-language models are not supported."
-            )
-
         if is_vlm:
             processor = self._resolve_vlm_processor()
         else:
@@ -9079,6 +9148,13 @@ class MLXTrainer:
                     "eval_dataset instead."
                 )
             if _sampling_eval:
+                if is_vlm:
+                    raise ValueError(
+                        "Unsloth MLX preference: generate_during_eval samples "
+                        "from token ids alone, so a vision-language model's "
+                        "prompts would lose their images. Turn it off for this "
+                        "model."
+                    )
                 if self.eval_dataset is None:
                     raise ValueError(
                         "Unsloth MLX preference: generate_during_eval needs an "
@@ -9205,6 +9281,7 @@ class MLXTrainer:
                 seed=args.seed,
                 append_eos=bool(args.append_eos),
                 formatting_func=self.formatting_func,
+                **self._preference_vision_options(),
             ), None
 
         if self._batches is not None:
