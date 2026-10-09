@@ -29,7 +29,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 if not hasattr(torch.compiler, "set_stance"):
-    pytest.skip("torch without set_stance", allow_module_level = True)
+    pytest.skip("torch < 2.6 has no torch.compiler.set_stance, so Unsloth never switches the stance", allow_module_level = True)
 
 from unsloth_zoo import compiler
 from unsloth_zoo.temporary_patches.utils import (
