@@ -692,6 +692,13 @@ _FINITE_BATCH_PLAN_TYPES = (
 _EAGER_REFETCHABLE_PLAN_TYPES = (FiniteTextBatchPlan, FinitePreferenceBatchPlan)
 
 
+def _eager_refetchable(batches):
+    # A vision preference plan reruns the processor like the VLM plan.
+    return isinstance(batches, _EAGER_REFETCHABLE_PLAN_TYPES) and not isinstance(
+        batches, FiniteVisionPreferenceBatchPlan,
+    )
+
+
 def _is_hf_tokenizer(tokenizer):
     """Check whether a wrapper has already resolved to an HF tokenizer."""
     try:
@@ -8040,7 +8047,7 @@ class MLXTrainer:
                 _ddp_compile_local_grad = False
                 if _stream_policy is not None:
                     _stream_policy.armed = False
-                if isinstance(batches, _EAGER_REFETCHABLE_PLAN_TYPES):
+                if _eager_refetchable(batches):
                     batch_data = batches[scheduled_index]
                 state = [
                     model.state, optimizer.state, mx.random.state,
@@ -8451,7 +8458,7 @@ class MLXTrainer:
                         _compile_fallback_reason = "runtime_error"
                         if _stream_policy is not None:
                             _stream_policy.armed = False
-                        if isinstance(batches, _EAGER_REFETCHABLE_PLAN_TYPES):
+                        if _eager_refetchable(batches):
                             batch_data = batches[scheduled_index]
                         _restore_mlx_rng_key(rng_state_before)
                         state = [
