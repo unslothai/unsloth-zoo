@@ -1,3 +1,14 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Pin MLXTrainer's batch padding to match mlx-lm's iterate_batches:
+# `1 + _PAD_MULTIPLE * ceil(L / _PAD_MULTIPLE)`.
+#
+# mlx-lm (mlx_lm/tuner/trainer.py:158) pads to `1 + 32*ceil(max_len/32)`;
+# default_loss then slices [:, :-1] / [:, 1:]. unsloth_zoo's
+# create_text_batches previously dropped the `+1`, leaving the input one
+# token short after the autoregressive shift, which shifted small fixtures
+# into a different convergence basin (probe 31 = 67% vs probe 33-37 = 40-53%,
+# see danielhanchen/unsloth-staging-2).
+
 from types import SimpleNamespace
 
 import pytest
