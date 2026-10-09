@@ -14,13 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""The convert_added_tokens patch must leave response parsers alone.
-
-TRL GRPOTrainer(tools=...) / environment_factory sets tokenizer.response_template, whose
-field dicts carry "content": "text" / "json". Turning those into AddedToken made every
-checkpoint save raise "Object of type AddedToken is not JSON serializable" and broke
-parse_response on a reloaded tokenizer.
-"""
+"""TRL tools= sets response_template; AddedToken-converting its {"content": ...} fields broke tokenizer save."""
 
 import copy
 import json
