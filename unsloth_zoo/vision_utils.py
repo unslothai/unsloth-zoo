@@ -1057,6 +1057,26 @@ def _video_metadata_support():
 _PROCESSOR_TAKES_VIDEO_METADATA, _VIDEO_RATE_FROM_METADATA = _video_metadata_support()
 
 
+def _fixed_frame_count(video_processor):
+    """num_frames of a processor that samples exactly that many frames per clip (Gemma 4), else None.
+
+    Only the stock sampler honours num_frames; GLM4V and others override sample_frames and size
+    the clip by duration and fps, keeping num_frames as an unused default.
+    """
+    if not getattr(video_processor, "do_sample_frames", False):
+        return None
+    num_frames = getattr(video_processor, "num_frames", None)
+    if not num_frames:
+        return None
+    try:
+        from transformers.video_processing_utils import BaseVideoProcessor
+    except Exception:
+        return None
+    if getattr(type(video_processor), "sample_frames", None) is not BaseVideoProcessor.sample_frames:
+        return None
+    return int(num_frames)
+
+
 def video_processor_kwargs(processor, videos, fps):
     """(videos, processor kwargs) carrying each video's sampling rate.
 
@@ -1064,22 +1084,23 @@ def video_processor_kwargs(processor, videos, fps):
     the matching flat list of sample rates. transformers 5 ignores `fps=` here and reads the rate
     from `video_metadata` (else assumes 24 fps), which collapses Qwen2.5-VL temporal positions and
     makes Qwen3-VL drop most frames; a list `fps=` is rejected outright.
-    Fixed-count samplers (Gemma 4, `num_frames=32`) cannot sample a shorter clip, so frames are
-    subsampled here instead and the processor told not to resample.
+    Fixed-count samplers (Gemma 4, `num_frames=32`) cannot sample a shorter clip, so every clip
+    is resampled to that count here instead and the processor told not to resample.
     """
     flat = [v for per_example in videos for v in per_example]
     fps = list(fps) if isinstance(fps, (list, tuple)) else ([fps] * len(flat) if fps is not None else [])
     if not _PROCESSOR_TAKES_VIDEO_METADATA or len(fps) != len(flat):
         return videos, {"fps": collapse_fps(fps)}
-    video_processor = getattr(processor, "video_processor", None)
-    cap = getattr(video_processor, "num_frames", None) if getattr(video_processor, "do_sample_frames", False) else None
+    cap = _fixed_frame_count(getattr(processor, "video_processor", None))
     metadata, new_videos, i = [], [], 0
     for per_example in videos:
         kept = []
         for video in per_example:
             n = int(video.shape[0]) if hasattr(video, "shape") else len(video)
             indices = list(range(n))
-            if cap and n > cap:
+            if cap and n != cap:
+                # Every clip gets exactly cap frames (short ones repeat frames), as the
+                # processor stacks them into one tensor.
                 indices = torch.linspace(0, n - 1, cap).round().long().tolist()
                 video = video[indices] if hasattr(video, "shape") else [video[j] for j in indices]
             rate = float(fps[i])

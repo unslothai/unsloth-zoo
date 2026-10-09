@@ -30,12 +30,14 @@ def _video(n):
     return torch.zeros(n, 3, 8, 8, dtype = torch.uint8)
 
 
-def _processor(do_sample_frames = False, num_frames = None):
-    return types.SimpleNamespace(
-        video_processor = types.SimpleNamespace(
-            do_sample_frames = do_sample_frames, num_frames = num_frames,
-        )
-    )
+def _processor(do_sample_frames = False, num_frames = None, sampler = None):
+    from transformers.video_processing_utils import BaseVideoProcessor
+
+    cls = type("VP", (), {"sample_frames": sampler or BaseVideoProcessor.sample_frames})
+    video_processor = cls()
+    video_processor.do_sample_frames = do_sample_frames
+    video_processor.num_frames = num_frames
+    return types.SimpleNamespace(video_processor = video_processor)
 
 
 def test_rate_travels_in_video_metadata_on_transformers_5(monkeypatch):
@@ -68,19 +70,34 @@ def test_no_metadata_support_falls_back_to_fps(monkeypatch):
     assert kwargs == {"fps": 2.0}
 
 
-def test_fixed_count_sampler_gets_its_frames_from_us(monkeypatch):
+def test_fixed_count_sampler_gets_exactly_its_frame_count(monkeypatch):
     monkeypatch.setattr(vu, "_PROCESSOR_TAKES_VIDEO_METADATA", True)
     monkeypatch.setattr(vu, "_VIDEO_RATE_FROM_METADATA", True)
     long_video = torch.arange(10).view(10, 1, 1, 1).expand(10, 3, 2, 2)
+    short_video = torch.arange(3).view(3, 1, 1, 1).expand(3, 3, 2, 2)
     out_videos, kwargs = vu.video_processor_kwargs(
-        _processor(do_sample_frames = True, num_frames = 4), [[long_video], [_video(3)]], [2.0, 2.0],
+        _processor(do_sample_frames = True, num_frames = 4), [[long_video], [short_video]], [2.0, 2.0],
     )
     assert kwargs["do_sample_frames"] is False
-    assert out_videos[0][0].shape[0] == 4
     assert out_videos[0][0][:, 0, 0, 0].tolist() == [0, 3, 6, 9]
     assert kwargs["video_metadata"][0]["frames_indices"] == [0, 3, 6, 9]
     assert kwargs["video_metadata"][0]["total_num_frames"] == 10
-    assert out_videos[1][0].shape[0] == 3
+    # same length as the others, so the processor can stack the batch
+    assert out_videos[1][0].shape[0] == 4
+    assert kwargs["video_metadata"][1]["frames_indices"] == [0, 1, 1, 2]
+
+
+def test_a_custom_sampler_keeps_its_own_frame_count(monkeypatch):
+    # GLM4V keeps num_frames = 16 but sizes clips by duration and fps in its own sample_frames.
+    monkeypatch.setattr(vu, "_PROCESSOR_TAKES_VIDEO_METADATA", True)
+    monkeypatch.setattr(vu, "_VIDEO_RATE_FROM_METADATA", True)
+    videos = [[_video(20)]]
+    out_videos, kwargs = vu.video_processor_kwargs(
+        _processor(do_sample_frames = True, num_frames = 16, sampler = lambda self, *a, **k: None),
+        videos, [2.0],
+    )
+    assert out_videos[0][0].shape[0] == 20
+    assert "do_sample_frames" not in kwargs
 
 
 def test_mismatched_rates_fall_back_to_fps(monkeypatch):
