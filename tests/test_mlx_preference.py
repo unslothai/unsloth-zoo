@@ -2818,10 +2818,14 @@ def test_a_vision_plan_repeats_the_pixels_for_both_branches():
     assert batch["attention_mask"].sum(axis=1).tolist() == lengths[:, 1].tolist()
     plan.configure_cce_compaction(True)
     assert plan.prepare_cce_batch(0, plan[0])[0] is not None
-    with pytest.raises(ValueError, match="image tokens"):
-        create_preference_batch_plan(
-            [vision_row()], None, batch_size=1, length_policy=policy(max_prompt_length=12),
-            grad_accum=1, processor=VisionProcessor(), model_config={})
+    named_on_processor = VisionProcessor()
+    del named_on_processor.tokenizer.image_token_id
+    named_on_processor.image_token, named_on_processor.image_token_id = None, 60
+    for processor in (VisionProcessor(), named_on_processor):
+        with pytest.raises(ValueError, match="image tokens"):
+            create_preference_batch_plan(
+                [vision_row()], None, batch_size=1, length_policy=policy(max_prompt_length=12),
+                grad_accum=1, processor=processor, model_config={})
 
     seen = []
 

@@ -35,6 +35,7 @@ from .utils import (
     _get_mlx_dropout_probability,
     _get_processor_tokenizer,
     _get_vlm_ignore_token_ids,
+    _image_truncation_token_ids,
     _model_logits,
     _normalize_mlx_messages,
     _normalize_seed,
@@ -1227,9 +1228,9 @@ def create_preference_batch_plan(
     """
     if processor is not None:
         tokenizer = _get_processor_tokenizer(processor)
-        media_token_ids = frozenset(
-            _get_vlm_ignore_token_ids(processor, model_config) or ()
-        )
+        media_token_ids = frozenset(_image_truncation_token_ids(
+            processor, _get_vlm_ignore_token_ids(processor, model_config),
+        ))
     rows = []
     for index, raw in enumerate(dataset):
         row = formatting_func(raw) if formatting_func is not None else raw
