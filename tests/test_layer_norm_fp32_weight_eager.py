@@ -72,7 +72,7 @@ def test_eager_layer_norm_wider_bias_is_not_downcast():
 
 def test_patched_layer_norm_train_after_eval_under_eager_on_recompile():
     if not hasattr(torch.compiler, "set_stance"):
-        pytest.skip("torch.compiler.set_stance unavailable")
+        pytest.skip(reason = "torch.compiler.set_stance was added in torch 2.6; torch 2.4/2.5 have no eager_on_recompile stance")
     from unsloth_zoo.patch_torch_functions import layer_norm
     torch._dynamo.reset()
     try:
