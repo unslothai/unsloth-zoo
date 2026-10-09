@@ -2770,6 +2770,19 @@ def test_an_image_row_encodes_its_prompt_through_the_processor():
     assert cut.rejected_prompt_arrays == (("token_type_ids", tuple(types[3:])),)
     with pytest.raises(ValueError, match="image tokens"):
         tokenize(max_prompt_length=len(prompt) - 7)
+
+    class NegativePlaceholders(VisionProcessor):
+        def __call__(self, **kwargs):
+            outputs = super().__call__(**kwargs)
+            ids = outputs["input_ids"]
+            return {**outputs, "input_ids": ids * (1 - 2 * (ids >= 60))}
+
+    with pytest.raises(ValueError, match="image tokens"):
+        tokenize_vision_preference_row(
+            NegativePlaceholders(), vision_row(),
+            length_policy=policy(max_prompt_length=len(prompt) - 7))
+    assert tokenize_vision_preference_row(
+        NegativePlaceholders(), vision_row(), length_policy=policy()).chosen_prompt_ids[6] == -60
     longer = tokenize(vision_row(rejected=[{"role": "assistant", "content": "nooo"}]),
                       max_length=len(prompt) + 4)
     assert longer.chosen_prompt_arrays == (("token_type_ids", tuple(types)),)

@@ -799,7 +799,8 @@ def tokenize_vision_preference_row(
         # Truncating the positions, not the ids, yields the indices this branch keeps.
         kept, _ = _truncate_dpo_branch(range(len(prompt_ids)), response, length_policy)
         if any(
-            token in media_token_ids
+            # Negative ids are image placeholders (Phi-3 Vision).
+            token in media_token_ids or token < 0
             for position, token in enumerate(prompt_ids) if position not in kept
         ):
             # Every image's features take the positions of its tokens, so a cut
