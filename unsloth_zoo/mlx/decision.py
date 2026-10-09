@@ -791,7 +791,9 @@ class _QwenModel(DecisionPipeline):
         # A conversion that ships no vision weights loads with the tower set to None. The image layout and the
         # forward here are Qwen3.5's: another architecture marks and merges its images differently.
         known = getattr(getattr(self.model, "config", None), "model_type", None) == "qwen3_5"
-        return self.takes_images and known and getattr(self.model, "vision_tower", None) is not None and getattr(self.model, "_processor", None) is not None
+        # Without its processor files a model loads with a bare tokenizer in the processor's place.
+        processor = getattr(getattr(self.model, "_processor", None), "image_processor", None)
+        return self.takes_images and known and getattr(self.model, "vision_tower", None) is not None and processor is not None
 
     def encode_images(self, images):
         """The token ids that stand for `images` in the prompt, and the pixels behind them."""
@@ -818,8 +820,9 @@ class _QwenModel(DecisionPipeline):
         if load_in_4bit:
             # The loader leaves the embeddings, the output head and the vision tower in 16-bit for the trainers that
             # train them. No decision head does, and together they are as large again as the quantized layers.
-            # The vision tower is left as loaded: a model that reads images sees them through it.
-            nn.quantize(self.model, 64, 4, class_predicate = lambda path, module: not path.startswith("vision_tower") and hasattr(module, "to_quantized") and module.weight.shape[-1] % 64 == 0)
+            # The vision tower is left as loaded when the model reads images: it sees them through it.
+            tower = "vision_tower" if self.reads_images else "\0"
+            nn.quantize(self.model, 64, 4, class_predicate = lambda path, module: not path.startswith(tower) and hasattr(module, "to_quantized") and module.weight.shape[-1] % 64 == 0)
         self.model.eval()
 
     def _load_beside(self, folder, dtype, token, head_prefix, load_in_4bit = False):
@@ -2336,8 +2339,8 @@ def clef_training_item(pipeline, state, questions, max_length = None, images = N
     parsed = pipeline._parse_questions(questions)
     given = list(images or ())
     urls = _image_urls(state, [image for image in given if isinstance(image, str)])
-    decoded = iter(_decode_images(urls))
-    images = [next(decoded) if isinstance(image, str) else image for image in given] + list(decoded)
+    kept = given + urls[sum(isinstance(image, str) for image in given):]
+    images = _pictures(kept)
     if len(images) > _MAX_IMAGES:
         raise DecisionRequestError(f"too many images, the maximum is {_MAX_IMAGES}")
     if urls:
@@ -2347,12 +2350,18 @@ def clef_training_item(pipeline, state, questions, max_length = None, images = N
         "input_ids": ids, "question_spans": question_spans, "option_spans": option_spans, "types": [_TYPE_IDS.index(q.type) for q in parsed],
         "source": {"state": state, "questions": dict(questions), "max_length": max_length},
     }
-    # The pixels are made again whenever the item is read: kept, they would outweigh every other part of a dataset.
-    return {**item, "images": images} if images else item
+    # A data URL stays one, and the pixels are made again whenever the item is read: kept, they would outweigh every
+    # other part of a dataset.
+    return {**item, "images": kept} if kept else item
+
+
+def _pictures(images):
+    decoded = iter(_decode_images([image for image in images if isinstance(image, str)]))
+    return [next(decoded) if isinstance(image, str) else image for image in images]
 
 
 def _item_logits(pipeline, item, output = None):
-    media = pipeline.encode_images(item["images"])[1] if item.get("images") else None
+    media = pipeline.encode_images(_pictures(item["images"]))[1] if item.get("images") else None
     return pipeline.logits(item["input_ids"], item["question_spans"], item["option_spans"], item["types"], output, media)
 
 

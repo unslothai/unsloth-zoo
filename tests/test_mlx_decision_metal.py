@@ -851,10 +851,16 @@ def test_saved_clef_holds_the_trained_decoder_and_a_head_with_its_temperature_fo
         asked, loaded = {}, [_decoder(), _decoder()]
         monkeypatch.setattr("unsloth_zoo.mlx.loader.FastMLXModel.from_pretrained", lambda *args, **kwargs: asked.update(kwargs) or (loaded[kwargs["load_in_4bit"]], None))
         for four in (False, True):
-            _QwenModel._load(SimpleNamespace(), tmp_path, None, None, None, None, four)
+            _QwenModel._load(SimpleNamespace(reads_images = False), tmp_path, None, None, None, None, four)
         assert (asked["load_in_4bit"], asked["load_in_16bit"]) == (True, False)
         # What the loader leaves in 16-bit for other trainers, the embedding and the output head, is quantized too.
         assert [["scales" in module for module in (model.language_model.model.embed_tokens, model.language_model.lm_head)] for model in loaded] == [[False, False], [True, True]]
+        # The vision tower keeps its precision only for a model that reads images through it.
+        for reads in (True, False):
+            loaded[True] = _decoder()
+            loaded[True].vision_tower = Linear(64, 64)
+            _QwenModel._load(SimpleNamespace(reads_images = reads), tmp_path, None, None, None, None, True)
+            assert ("scales" in loaded[True].vision_tower) != reads
     network = clef_training_network(pipeline, full_finetuning = mode == "full", r = 4, lora_alpha = 8, modules_to_save = ["embed_tokens"] if mode == "embedding" else None)
     if mode == "qlora":
         # Adapters over quantized layers receive gradients.
@@ -1044,6 +1050,9 @@ def _patches(text, images, return_tensors):
     return {"input_ids": np.array([ids]), "pixel_values": np.concatenate(pixels), "image_grid_thw": np.array(grids)}
 
 
+_patches.image_processor = True
+
+
 def test_clef_reads_images_between_the_opening_and_the_state(clef, monkeypatch):
     from PIL import Image
 
@@ -1067,6 +1076,10 @@ def test_clef_reads_images_between_the_opening_and_the_state(clef, monkeypatch):
     other.model.config = copy.copy(model.config)
     other.model.config.model_type = "qwen3_vl"
     assert not other.reads_images
+    bare = copy.copy(reader)
+    bare.model = copy.copy(model)
+    bare.model._processor = SimpleNamespace(encode = None)
+    assert not bare.reads_images
     monkeypatch.setattr(ClefModel, "_IMAGE_TOKENS", 15)
     with pytest.raises(DecisionRequestError, match = "the images take 15 tokens"):
         reader.encode_images(images)
@@ -1122,8 +1135,9 @@ def test_clef_trains_on_the_images_of_its_records(clef):
     items = [{**clef_training_item(reader, "s", questions, None, images), **targets} for images in ([dark], [url])]
     # An image part of the state is read as an image, after the ones given beside it.
     mixed = clef_training_item(reader, [{"role": "user", "content": ["s", part]}], questions, None, [dark.resize((64, 64))])
-    assert [image.size for image in clef_training_item(reader, "s", questions, None, [url, dark.resize((64, 64))])["images"]] == [(96, 64), (64, 64)]
-    assert [image.size for image in mixed["images"]] == [(64, 64), (96, 64)] and mixed["source"]["state"] == [{"role": "user", "content": ["s"]}]
+    # Given order is kept, and a data URL stays one on the item: it is decoded when the item is read.
+    assert [getattr(image, "size", image) for image in clef_training_item(reader, "s", questions, None, [url, dark.resize((64, 64))])["images"]] == [url, (64, 64)]
+    assert [getattr(image, "size", image) for image in mixed["images"]] == [(64, 64), url] and mixed["source"]["state"] == [{"role": "user", "content": ["s"]}]
     assert items[0]["input_ids"] == items[1]["input_ids"] and items[0]["input_ids"].count(500) == 6 and mixed["input_ids"].count(500) == 10
     assert "images" not in clef_training_item(reader, "s", questions)
     with pytest.raises(ValueError, match = "too many images"):
