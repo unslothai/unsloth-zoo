@@ -1153,6 +1153,9 @@ class GptOssExpertsBnb4bit(nn.Module):
     so BitsAndBytes can quantize them.
     """
 
+    # Eval calls above this many (token, expert) rows skip the all-experts dense branch.
+    _dense_eval_max_rows = 8192
+
     def __init__(self, config):
         super().__init__()
 
@@ -1320,10 +1323,16 @@ class GptOssExpertsBnb4bit(nn.Module):
         num_experts = routing_weights.shape[1]
         top_k = router_indices.shape[1]
 
+        # Dense eval is experts x tokens: 27.5 GiB in one layer of a 120B GRPO prefill (unsloth#3411).
+        eval_routed = (
+            not self.training
+            and num_tokens * num_experts > self._dense_eval_max_rows
+            and not torch.compiler.is_compiling()
+        )
         # fp16 experts take the grouped path too: it keeps the loop's fp32 swiglu and
         # fp32 down output (gpt_oss_grouped_qlora.compute_mode decides per call).
         if (
-            self.training
+            (self.training or eval_routed)
             and self._grouped_bnb4bit_ready()
         ):
             try:
@@ -1332,7 +1341,7 @@ class GptOssExpertsBnb4bit(nn.Module):
                     batch_size, num_tokens, num_experts, top_k,
                 )
                 if grouped is not None:
-                    return grouped
+                    return grouped if self.training else grouped.to(hidden_states.dtype)
             except Exception as exc:
                 # Checkpoint early-stop is control flow; an OOM should surface, not retry the loop.
                 from torch.utils import checkpoint as _ckpt
@@ -1347,7 +1356,7 @@ class GptOssExpertsBnb4bit(nn.Module):
                     import traceback; traceback.print_exc()
                 # fall through to the per-expert loop
 
-        if self.training:
+        if self.training or eval_routed:
             with torch.no_grad():
                 flat_experts = router_indices.flatten()  # [tokens * topk]
                 token_ids = torch.arange(num_tokens, device=hidden_states.device).repeat_interleave(top_k)
@@ -2922,7 +2931,26 @@ def torch_native_forward(
         if grouped is not None:
             return grouped
 
-    if self.training:
+    # Dense eval is experts x tokens (unsloth#3411). Keep in step with the class-body forward,
+    # which the compiled cache emits standalone.
+    eval_routed = (
+        not self.training
+        and num_tokens * num_experts > getattr(self, "_dense_eval_max_rows", GptOssExpertsBnb4bit._dense_eval_max_rows)
+        and not torch.compiler.is_compiling()
+    )
+    if eval_routed:
+        if not torch.is_grad_enabled():
+            # Eager prefill builds the routed tables a compiled decode step then reads.
+            prepare_routed_experts(self)
+        if hasattr(self, "_grouped_bnb4bit_ready"):
+            grouped = _try_grouped_bnb4bit(
+                self, hidden_states, router_indices, routing_weights,
+                batch_size, num_tokens, num_experts, top_k,
+            )
+            if grouped is not None:
+                return grouped.to(hidden_states.dtype)
+
+    if self.training or eval_routed:
         with torch.no_grad():
             flat_experts = router_indices.flatten()  # [tokens * topk]
             token_ids = torch.arange(num_tokens, device=hidden_states.device).repeat_interleave(top_k)
@@ -2960,6 +2988,11 @@ def torch_native_forward(
             # fallback, which takes F.linear and ignores compute_dtype. It does not keep the
             # adapter matmuls in float32 -- the forced-float32 LoRA path casts those to
             # float16 itself.
+            if not self.training:
+                # Eval also reaches here with unquantized 16-bit experts (llm_int8_skip_modules).
+                w = getattr(getattr(down_proj, "base_layer", down_proj), "weight", None)
+                if w is not None and w.dtype.is_floating_point:
+                    gated_output = gated_output.to(w.dtype)
             with torch.autocast(device_type=device_type, enabled=False):
                 out = down_proj(gated_output)
             
@@ -2968,7 +3001,7 @@ def torch_native_forward(
             
             offset += count
         next_states = next_states.view(batch_size, -1, self.hidden_size)
-        return next_states.to(torch.float32)
+        return next_states.to(torch.float32 if self.training else hidden_states.dtype)
     elif (
         num_tokens * top_k <= ROUTED_MAX_SLOTS
         and (routed := routed_experts_forward(self, hidden_states, router_indices, routing_weights)) is not None
