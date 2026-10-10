@@ -1543,9 +1543,8 @@ class _AnyRouterClass(type):
 
 
 def _record_gpt_oss_router_logits(router_cls):
-    # The stock forward (UNSLOTH_COMPILE_DISABLE) records router_logits by isinstance on the router
-    # class the BnB swap replaced. Widened in place so registries holding the spec see it; not a path
-    # match, which double-captures a PEFT-wrapped router.
+    # The stock forward (UNSLOTH_COMPILE_DISABLE) records by isinstance on the router class the BnB swap
+    # replaced. Widened in place for registries holding the spec; a path match double-captures PEFT routers.
     import transformers.models.gpt_oss.modeling_gpt_oss as modeling
     recorders = getattr(modeling.GptOssPreTrainedModel, "_can_record_outputs", None)
     spec = recorders.get("router_logits") if isinstance(recorders, dict) else None
@@ -1553,8 +1552,7 @@ def _record_gpt_oss_router_logits(router_cls):
     if not isinstance(target, type):
         return
     members = getattr(target, "_members", (target,))
-    # The saved stock router too: the compiler retargets by name, dropping it, and restore_gpt_oss_original
-    # brings it back for a later bf16 load in the same process.
+    # Plus the saved stock router: a compiler retarget drops it, a later bf16 load restores it.
     stock = getattr(modeling, "_original_GptOssTopKRouter", None)
     missing = tuple(c for c in (stock, router_cls) if isinstance(c, type) and c not in members)
     if missing:
@@ -4430,8 +4428,7 @@ def patch_gpt_oss_for_grpo(phase="post_compile"):
             # This Unsloth Zoo code section is licensed under AGPL3
 
             # Generation passes a per-type mask mapping load_balancing_loss_func cannot read, and no labels.
-            # transformers 4.x passes a 2D mask covering the cache, which it then sizes against the router
-            # logits of the new tokens only (RuntimeError on every cached decode step).
+            # transformers 4.x sizes a 2D cached-decode mask against new-token router logits (RuntimeError).
             tokens = input_ids if input_ids is not None else inputs_embeds
             cached_decode = (
                 isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 2
