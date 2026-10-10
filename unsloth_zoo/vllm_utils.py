@@ -4588,6 +4588,80 @@ def _remap_moe_expert_lora_keys(model, state_dict):
 pass
 
 
+_MOE_STACKED_LORA_KEY = re.compile(r"^(.*)\.(lora_A|lora_B)\.weight$")
+
+
+def _moe_lone_expert_lora_prefixes(keys):
+    """Stacked expert prefixes that carry only ONE of the gate_up / down_proj LoRA pairs.
+
+    PEFT nests one ParamWrapper per targeted parameter, so with both gate_up_proj and
+    down_proj targeted gate_up lands at `<experts>.base_layer.lora_*` and down_proj at
+    `<experts>.lora_*`. Targeting only one of them leaves a lone `<experts>.lora_*` pair,
+    which vLLM's FusedMoE3DWithLoRA cannot take: `_stack_moe_lora_weights` asserts that
+    the `.base_layer` half exists and reads the outer half as down_proj.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    outer, base = set(), set()
+    for key in keys:
+        if not _is_moe_expert_lora_key(key): continue
+        match = _MOE_STACKED_LORA_KEY.match(key)
+        if match is None: continue
+        prefix = match.group(1)
+        if prefix.endswith(".base_layer"): base.add(prefix[:-len(".base_layer")])
+        else: outer.add(prefix)
+    return sorted(outer - base)
+pass
+
+
+def _pad_lone_moe_expert_lora(model, state_dict):
+    """Give a gate_up-only or down_proj-only stacked expert adapter the zero half vLLM expects.
+
+    The missing projection gets A = 0 and B = 0, so its delta is exactly zero and the
+    served adapter equals the trained one. Which half is present is read off the tensor
+    shapes against the live FusedMoE3DWithLoRA buffers (gate_up: A in = hidden, B out =
+    2 * intermediate; down: A in = intermediate, B out = hidden), which cannot both match.
+    Anything that does not match is left alone for vLLM to reject.
+    """
+    # All Unsloth Zoo code licensed under LGPLv3
+    lone = _moe_lone_expert_lora_prefixes(state_dict)
+    if len(lone) == 0: return state_dict
+    runner = _get_vllm_model_runner(model)
+    manager = _get_vllm_lora_manager(model, runner)
+    modules = getattr(manager, "modules", None)
+    if not isinstance(modules, dict): return state_dict
+    vllm_model = _get_vllm_lora_model(model, runner)
+    weights_mapper = getattr(vllm_model, "hf_to_vllm_mapper", None)
+    if weights_mapper is not None:
+        from .vllm_lora_worker_manager import _drop_stacked_weight_maps
+        weights_mapper = _drop_stacked_weight_maps(weights_mapper)
+
+    padded = dict(state_dict)
+    for prefix in lone:
+        A = state_dict.get(f"{prefix}.lora_A.weight")
+        B = state_dict.get(f"{prefix}.lora_B.weight")
+        if not torch.is_tensor(A) or not torch.is_tensor(B) or A.dim() != 2 or B.dim() != 2: continue
+        module = modules.get(_resolve_lora_key_to_module(f"{prefix}.lora_A.weight", weights_mapper))
+        try:
+            hidden = module.w13_lora_a_stacked[0].shape[-1]
+            gate_up_out = module.w13_lora_b_stacked[0].shape[-2]
+            intermediate = module.w2_lora_a_stacked[0].shape[-1]
+        except Exception:
+            continue
+        if len(module.w13_lora_b_stacked) != 1: continue  # 2D wrapper, not the stacked layout
+        rank_experts = A.shape[0]
+        zeros = lambda *shape: torch.zeros(shape, dtype = A.dtype, device = A.device)
+        if A.shape[1] == hidden and B.shape[0] == gate_up_out:
+            padded[f"{prefix}.base_layer.lora_A.weight"] = A
+            padded[f"{prefix}.base_layer.lora_B.weight"] = B
+            padded[f"{prefix}.lora_A.weight"] = zeros(rank_experts, intermediate)
+            padded[f"{prefix}.lora_B.weight"] = zeros(hidden, rank_experts)
+        elif A.shape[1] == intermediate and B.shape[0] == hidden:
+            padded[f"{prefix}.base_layer.lora_A.weight"] = zeros(rank_experts, hidden)
+            padded[f"{prefix}.base_layer.lora_B.weight"] = zeros(gate_up_out, rank_experts)
+    return padded
+pass
+
+
 def _check_lora_is_servable(model, keys, source, peft_config):
     """Refuse an adapter vLLM would accept and then silently ignore.
 
@@ -4664,6 +4738,7 @@ def load_lora(model, save_directory, load_tensors = False, lora_request_id = Non
 
         state_dict = _remap_moe_expert_lora_keys(model, state_dict)
         _check_lora_is_servable(model, list(state_dict), "the training model", peft_config)
+        state_dict = _pad_lone_moe_expert_lora(model, state_dict)
 
         # vllm_lora_already_loaded(model)
         lora_request = LoRARequest(str(lora_request_id), lora_request_id, lora_tensors = state_dict, lora_config = peft_config)
@@ -4685,11 +4760,14 @@ def load_lora(model, save_directory, load_tensors = False, lora_request_id = Non
                 _saved_peft_config = get_peft_config(save_directory)
             except Exception:
                 _saved_peft_config = None
-        # Loading by path skips the Gemma-4 expert rename, so pass tensors only when a key changed.
+        # Loading by path skips the Gemma-4 expert rename and the lone expert pair padding,
+        # so pass tensors only when one of them applies.
         _remapped_keys = list(_remap_moe_expert_lora_keys(model, dict.fromkeys(_saved_keys)))
-        if _saved_peft_config is not None and _remapped_keys != _saved_keys:
+        _lone_expert_pairs = len(_moe_lone_expert_lora_prefixes(_remapped_keys)) != 0
+        if _saved_peft_config is not None and (_remapped_keys != _saved_keys or _lone_expert_pairs):
             state_dict = _remap_moe_expert_lora_keys(model, _saved_adapter_lora_tensors(save_directory))
             _check_lora_is_servable(model, list(state_dict), save_directory, _saved_peft_config)
+            state_dict = _pad_lone_moe_expert_lora(model, state_dict)
             lora_request = LoRARequest(
                 str(lora_request_id), lora_request_id,
                 lora_tensors = state_dict, lora_config = _saved_peft_config,
