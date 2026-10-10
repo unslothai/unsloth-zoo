@@ -35,11 +35,29 @@ from .log import logger
 from .empty_model import _get_module_attribute
 
 # Leaf names of MoE routers, kept out of the automatically chosen LoRA targets.
-# A bare "gate" leaf is deliberately absent: it is the router in several families
-# but a plain projection in others, and no model in the sweep failed because of it.
+# A bare "gate" is not here: it is also a plain projection (D-FINE's gateway.gate),
+# so a `gate` counts as a router only by position, see _moe_router_gate_names.
 MOE_ROUTER_MODULES = frozenset((
     "router",
 ))
+
+
+def _moe_router_gate_names(model):
+    """`gate` Linears beside `experts` (Qwen3-MoE on transformers 4.x, LFM2-MoE and
+    DeepSeek-V2 on 5.0-5.12) or inside a router module (AfMoE's mlp.router.gate)."""
+    modules = dict(model.named_modules())
+    names = []
+    for name, module in modules.items():
+        parent_name, _, leaf = name.rpartition(".")
+        if leaf != "gate" or not isinstance(module, torch.nn.Linear):
+            continue
+        parent = modules.get(parent_name)
+        if parent is None:
+            continue
+        if hasattr(parent, "experts") or "router" in type(parent).__name__.lower():
+            names.append(name)
+    return names
+
 
 # Mirrors PEFT's _check_lora_target_modules_mamba in peft/tuners/tuners_utils.py.
 MAMBA_MODEL_TYPES = frozenset(("falcon_h1", "mamba", "mamba2", "falcon_mamba", "nemotron_h"))
@@ -387,8 +405,21 @@ def get_peft_regex(
             f"Unsloth: leaving {len(placeholders)} parameter-free placeholder module(s) out of "
             f"the LoRA targets, e.g. {placeholders[0]}"
         )
+    # Training the router reshuffles which experts run and can overflow (unsloth#3690);
+    # only an explicit target_modules naming it trains it.
+    router_gates = [] if target_modules is not None else [
+        name for name in _moe_router_gate_names(model)
+        if re.fullmatch(regex_matcher, name, flags = re.DOTALL)
+    ]
+    if router_gates:
+        logger.info(
+            f"Unsloth: leaving {len(router_gates)} MoE router gate(s) out of the LoRA targets, "
+            f"e.g. {router_gates[0]}. Add \"gate\" to target_modules to train them."
+        )
+    excluded = placeholders + router_gates
+    if excluded:
         regex_matcher = (
-            r"(?!(?:" + "|".join(re.escape(x) for x in placeholders) + r")$)(?:" + regex_matcher + r")"
+            r"(?!(?:" + "|".join(re.escape(x) for x in excluded) + r")$)(?:" + regex_matcher + r")"
         )
     pass
 
