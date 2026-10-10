@@ -231,3 +231,25 @@ def test_named_template_set_does_not_break_marker_detection():
     tokenizer.chat_template = {"default": tokenizer.chat_template, "tool_use": tokenizer.chat_template}
     input_ids, labels = _prepare(tokenizer, chat_template = None, fallback = False)
     _assert_trajectory_masks(_trained_text(tokenizer, input_ids, labels))
+
+
+def _prepare_args(**overrides):
+    args = dict(
+        max_length = 4096, dataset_text_field = "text", dataset_num_proc = None,
+        assistant_only_loss = True, completion_only_loss = None, packing = False,
+    )
+    args.update(overrides)
+    return SimpleNamespace(**args)
+
+
+def test_messages_truncation_honours_keep_end_and_no_limit():
+    tokenizer = _tokenizer("unsloth/Qwen3-0.6B")
+    rows = datasets.Dataset.from_list([{"messages": CONVERSATION, "tools": TOOLS}] * 2)
+    full = tokenizer.apply_chat_template(CONVERSATION, tools = TOOLS, tokenize = True, return_dict = True)["input_ids"]
+    trainer = lambda: SimpleNamespace(chat_template = None, _unsloth_assistant_mask_fallback = True, data_collator = None)
+    tail = sft_prepare_dataset(
+        trainer(), rows, tokenizer, _prepare_args(max_length = 64, truncation_mode = "keep_end"), False, None, "train"
+    )[0]["input_ids"]
+    assert list(tail) == list(full)[-64:]
+    whole = sft_prepare_dataset(trainer(), rows, tokenizer, _prepare_args(max_length = None), False, None, "train")
+    assert list(whole[0]["input_ids"]) == list(full)

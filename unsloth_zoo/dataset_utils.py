@@ -2890,8 +2890,11 @@ def sft_prepare_dataset(
                 response_labels = _response_labels(
                     None, tokenizer = tokenizer, return_function = True, **marker_kwargs,
                 )
-            truncate_messages = do_truncation and max_seq_length > 0 and \
+            truncate_messages = do_truncation and isinstance(max_seq_length, int) and max_seq_length > 0 and \
                 not locals().get("_unsloth_wrapped_packing", False)
+            # As TRL: keep_end keeps the tail, usually the final assistant answer.
+            message_cut = slice(-max_seq_length, None) if truncate_messages and \
+                getattr(args, "truncation_mode", "keep_start") == "keep_end" else slice(None, max_seq_length)
             if assistant_only_loss:
                 used_column_names.append("assistant_masks")
 
@@ -2930,7 +2933,7 @@ def sft_prepare_dataset(
                             masks = masks[0]
                         result["assistant_masks"] = list(masks)
                 if truncate_messages:
-                    result = {k: v[:max_seq_length] for k, v in result.items()}
+                    result = {k: v[message_cut] for k, v in result.items()}
                 if _needs_token_type_ids:
                     result["token_type_ids"] = [0] * len(result["input_ids"])
                 return result
