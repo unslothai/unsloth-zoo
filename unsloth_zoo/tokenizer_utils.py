@@ -21,6 +21,8 @@ except ImportError:
     # torch and they are never called on MLX, so keep the module importable so the
     # torch-free patch_tokenizer stays usable (e.g. get_chat_template on MLX).
     torch = None
+import copy
+import copyreg
 import functools
 import gc
 import inspect
@@ -683,6 +685,37 @@ def _is_conversation_format(text):
 pass
 
 
+def _patched_processor_reduce_ex(self, protocol):
+    # All Unsloth Zoo code licensed under LGPLv3
+    # The patched subclass shares the stock class's module and name, so pickle cannot find it by
+    # reference (spawn DataLoader workers, TRL's AsyncGRPO rollout worker). Pickle as the stock
+    # class instead: the reader needs no Unsloth Zoo, and only loses the chat-template __call__.
+    state = dict(self.__dict__)
+    state.pop("_unsloth_patched_call", None)
+    # copyreg.__newobj__ insists on the instance's own class; _reconstructor does not.
+    return (copyreg._reconstructor, (type(self)._unsloth_original_class, object, None), state)
+pass
+
+
+def _patched_processor_copy(self):
+    # All Unsloth Zoo code licensed under LGPLv3
+    # Copies stay in this process, so they keep the patched class (__reduce_ex__ would drop it).
+    new = type(self).__new__(type(self))
+    new.__dict__.update(self.__dict__)
+    return new
+pass
+
+
+def _patched_processor_deepcopy(self, memo):
+    # All Unsloth Zoo code licensed under LGPLv3
+    new = type(self).__new__(type(self))
+    memo[id(self)] = new
+    for key, value in self.__dict__.items():
+        new.__dict__[key] = copy.deepcopy(value, memo)
+    return new
+pass
+
+
 def patch_processor_call(processor):
     """
     Patch processor's __call__ to auto-apply the chat template when text is in
@@ -736,6 +769,10 @@ def patch_processor_call(processor):
             "__call__": patched_call,
             "__module__": original_class.__module__,
             "__qualname__": original_class.__qualname__,
+            "_unsloth_original_class": original_class,
+            "__reduce_ex__": _patched_processor_reduce_ex,
+            "__copy__": _patched_processor_copy,
+            "__deepcopy__": _patched_processor_deepcopy,
         }
     )
     processor.__class__ = patched_class
