@@ -101,6 +101,25 @@ modifications =
       on triton 3.4.0, 3.5.1, 3.6.0 and 3.7.1 (torch 2.8.0 to 2.13.0), and on
       3.7.1 the autotuner picks one of those configs, so excluding them there
       cost up to 2.7% of a KDA layer fwd+bwd (B 1, T 8192, H 64, D 128).
+    - Backported fla PR #1229 in ops/common/chunk_o.py (+ inline "Unsloth:
+      backported from fla PR #1229" comment): on Blackwell the chunk_fwd_kernel_o
+      autotune drops its 8-warp BK=BV=128 config, which hits a Triton tl.dot
+      recurrence race. Reproduced on B200 with triton 3.7.1: with cu_seqlens and
+      48 or 64 value heads the autotuner picks that config, and o differs from
+      the dense path by up to 0.08 and between identical runs.
+    - Sequence start offsets past 2**31 elements (fixed upstream after 0.5.1 by
+      fla PR #1329, which forces int64 program ids everywhere). In
+      ops/gated_delta_rule/chunk_fwd.py, ops/kda/{chunk_bwd,chunk_intra,
+      chunk_intra_token_parallel,gate,wy_fast}.py, ops/utils/cumsum.py and
+      ops/common/chunk_delta_h.py, kernels that add `bos * H * K`-style
+      sequence start offsets in int32 take a LONG_INDEXING constexpr that
+      widens `bos` to int64 only when the launcher's shapes can pass 2**31
+      elements, so normal sizes keep the int32 code (forced int64 is slower).
+      Without it a packed batch or a batch whose later sequences start past
+      2**31 / (heads * 128) tokens silently returned wrong outputs and
+      gradients (KDA: non-finite). Offsets inside one sequence are unchanged:
+      a single KDA sequence past 2**31 / (heads * 128) tokens still indexes
+      in-chunk raw pointers in int32, as in 0.5.1.
     - Dropped fla/ops/gated_delta_rule/naive.py (the only einops dependency; the
       reference implementation is unused on the fast path).
     - Dropped the three heavy tilelang kernel files
