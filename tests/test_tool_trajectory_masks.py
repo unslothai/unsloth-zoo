@@ -117,8 +117,10 @@ def test_gpt_oss_role_marker_is_not_cut_to_shared_opener():
     assert "<|call|>" in trained  # the model must learn to end a tool call
 
 
-def _prepare(tokenizer, chat_template = None, fallback = False, assistant_only_loss = True):
+def _prepare(tokenizer, chat_template = None, fallback = False, assistant_only_loss = True, text = None):
     rows = [{"messages": CONVERSATION, "tools": TOOLS}] * 2
+    if text is not None:
+        rows = [dict(row, text = text) for row in rows]
     trainer = SimpleNamespace(
         chat_template = chat_template,
         _unsloth_assistant_mask_fallback = fallback,
@@ -179,3 +181,13 @@ def test_messages_dataset_assistant_only_loss_without_generation_markers(repo):
     tokenizer = _tokenizer(repo)
     input_ids, labels = _prepare(tokenizer, chat_template = None, fallback = False)
     _assert_trajectory_masks(_trained_text(tokenizer, input_ids, labels))
+
+
+def test_assistant_only_loss_reads_messages_beside_a_text_column():
+    tokenizer = _tokenizer("unsloth/Qwen3-0.6B")
+    text = tokenizer.apply_chat_template(CONVERSATION, tools = TOOLS, tokenize = False)
+    input_ids, labels = _prepare(tokenizer, fallback = True, text = text)
+    _assert_trajectory_masks(_trained_text(tokenizer, input_ids, labels))
+    # Without assistant_only_loss the text column is still what gets tokenized, as before.
+    input_ids, labels = _prepare(tokenizer, assistant_only_loss = False, text = "plain text row")
+    assert tokenizer.decode(input_ids).endswith("plain text row")

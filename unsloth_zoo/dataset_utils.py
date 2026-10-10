@@ -2706,12 +2706,13 @@ def sft_prepare_dataset(
         # before calling us -- we must NOT overwrite it here.
         do_prompt_completion = True
         used_column_names.append("completion_mask")
-    elif dataset_text_field not in column_names and formatting_func is None and \
-        not is_vlm and "messages" in column_names and \
+    elif (dataset_text_field not in column_names or getattr(args, "assistant_only_loss", False)) and \
+        formatting_func is None and not is_vlm and "messages" in column_names and \
         isinstance(_first_messages := next(iter(dataset))["messages"], list) and \
         len(_first_messages) != 0 and isinstance(_first_messages[0], dict) and \
         "role" in _first_messages[0]:
-        # Conversational rows (TRL's "messages" + optional "tools"), e.g. agent trajectories.
+        # Conversational rows (TRL's "messages" + optional "tools"), e.g. agent trajectories. A text column
+        # cannot carry assistant masks, so assistant_only_loss reads the messages even when one exists.
         do_messages = True
     elif dataset_text_field not in column_names:
         do_formatting_func = True
