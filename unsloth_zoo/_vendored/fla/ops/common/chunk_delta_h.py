@@ -383,6 +383,8 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
         bos, eos = i_n * T, i_n * T + T
         NT = tl.cdiv(T, BT)
         boh = i_n * NT
+    if LONG_INDEXING:
+        bos = bos.to(tl.int64)
 
     if STATE_V_FIRST:
         b_dh1 = tl.zeros([BV, 64], dtype=tl.float32)
@@ -684,7 +686,7 @@ def chunk_gated_delta_rule_fwd_h(
         V=V,
         BT=BT,
         STATE_V_FIRST=state_v_first,
-        LONG_INDEXING=gk is not None and B * T * HV * K > 2**31,
+        LONG_INDEXING=B * T * HV * (K if gk is not None else 1) > 2**31,
     )
     return h, v_new, final_state
 
@@ -747,6 +749,6 @@ def chunk_gated_delta_rule_bwd_dhu(
         V=V,
         BT=BT,
         STATE_V_FIRST=state_v_first,
-        LONG_INDEXING=gk is not None and T * HV * K > 2**31,
+        LONG_INDEXING=B * T * HV * (K if gk is not None else 1) > 2**31,
     )
     return dh, dh0, dv2

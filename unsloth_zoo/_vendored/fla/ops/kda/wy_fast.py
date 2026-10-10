@@ -296,7 +296,7 @@ def recompute_w_u_fwd(
         BT=BT,
         BK=BK,
         BV=BV,
-        LONG_INDEXING=B * T * max(H, HV) * max(K, V) > 2**31,
+        LONG_INDEXING=B * T * max(H, HV) * max(K, V, BT) > 2**31,
     )
     return w, u, qg, kg
 
