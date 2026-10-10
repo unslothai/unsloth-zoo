@@ -85,6 +85,25 @@ def _layer_norm_eager(
 pass
 _layer_norm_compiled = torch_compile(_layer_norm_eager)
 
+_FAKE_MODE_KEY = torch._C._TorchDispatchModeKey.FAKE
+_PROXY_MODE_KEY = torch._C._TorchDispatchModeKey.PROXY
+try:
+    from torch._subclasses.fake_tensor import FakeTensor as _FakeTensor
+except Exception:
+    _FakeTensor = ()
+
+
+def _in_fake_or_proxy_mode(input) -> bool:
+    # torch.distributed.init_process_group (vLLM's in-process engine) clears Dynamo's rule map, which
+    # then lists this replacement as the in-graph F.layer_norm and runs it on fake tensors with
+    # symbolic sizes; a compiled callee there aborts the process ("Cannot call numel() on tensor
+    # with symbolic sizes/strides"). The eager body traces fine.
+    return (
+        isinstance(input, _FakeTensor)
+        or torch._C._get_dispatch_mode(_FAKE_MODE_KEY) is not None
+        or torch._C._get_dispatch_mode(_PROXY_MODE_KEY) is not None
+    )
+
 
 def layer_norm(
     input: Tensor,
@@ -94,7 +113,7 @@ def layer_norm(
     eps: float = 1e-5,
 ) -> Tensor:
     # Dynamo raises when FX symbolic tracing (e.g. vLLM on Gemma 4 audio) enters a compiled fn.
-    if _is_fx_symbolic_tracing():
+    if _is_fx_symbolic_tracing() or _in_fake_or_proxy_mode(input):
         return _layer_norm_eager(input, normalized_shape, weight, bias, eps)
     return _layer_norm_compiled(input, normalized_shape, weight, bias, eps)
 pass
