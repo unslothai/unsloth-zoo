@@ -3278,7 +3278,6 @@ def dense_prefill_linear(model, *, _modules = None):
                     module.__dict__.pop("_unsloth_dense_qmm_scopes", None)
 
 
-
 # The mlx-vlm bodies the verify scope wraps, and the projection kernels whose row bound its slices follow.
 # 0.7.1 added the verifier's `verify` entry; earlier releases miss it and stay native.
 _EXACT_VERIFY_CONTRACT = {
@@ -3286,6 +3285,8 @@ _EXACT_VERIFY_CONTRACT = {
         "Qwen3_5BatchInvariantForward.verify": "14bdd46f35e8adfa",
         "Qwen3_5BatchInvariantForward._linear": "6e38296bd3f89d5a",
         "Qwen3_5BatchInvariantForward._linears": "1f44efb5714938af",
+        "Qwen3_5BatchInvariantForward._layer": "f3f59ff9d0b68a50",
+        "Qwen3_5BatchInvariantForward._model": "142df8a42c27c4f7",
         "_target_verify_linear": "190517e318ba4d7b",
         "_target_verify_linears": "2d4c9adbc50be66e",
     },
@@ -3370,14 +3371,25 @@ def _exact_verify_class(base, *cache_key):
     def sliced_linears(self, linears, x):
         return _verify_sliced(lambda rows: base._linears(self, linears, rows), linears, x, eligible)
 
+    def submitted_layer(self, *args, **kwargs):
+        hidden = base._layer(self, *args, **kwargs)
+        if getattr(_VERIFY_STATE, "serving", False):
+            try:
+                mx.async_eval(hidden)
+            except ValueError:  # not allowed inside a function transformation
+                pass
+        return hidden
+
     return type(f"_ScopedVerify{base.__name__}", (base,), {
-        "verify": verify, "_linear": sliced_linear, "_linears": sliced_linears, "_unsloth_verify_native": base})
+        "verify": verify, "_linear": sliced_linear, "_linears": sliced_linears, "_layer": submitted_layer,
+        "_unsloth_verify_native": base})
 
 
 @contextmanager
 def exact_speculative_verify(model, *, _modules = None):
     """Speed up mlx-vlm's exact speculative verifier for Qwen3.5 language models during serialized inference.
 
+    Each layer of a verify block is submitted for evaluation as it is built, so the GPU runs while the host builds on.
     A verify block wider than the eight rows mlx-vlm's fused verify kernels serve runs each frozen
     quantized projection over balanced row slices, once its first block of that shape matched the
     native call bit for bit. Only verify calls of the language models found here are served; other,
@@ -3398,7 +3410,7 @@ def exact_speculative_verify(model, *, _modules = None):
                 # qwen3_5_moe inherits the call; a shared module is yielded once per path.
                 found = {id(module): module for _, module in _fusion_modules(model, _modules)
                          if getattr(type(module), "__call__", None) is call}
-                methods = [vars(native).get(name) for name in ("verify", "_linear", "_linears")]
+                methods = [vars(native).get(name) for name in ("verify", "_linear", "_linears", "_layer")]
                 patched = _exact_verify_class(native, *methods) if found else None
                 if patched is not None:
                     target.__class__ = patched

@@ -369,9 +369,36 @@ def test_the_verify_scope_serves_only_its_own_models_and_restores_the_verifier(q
         patch.setattr(model, "_unsloth_mlx_distributed_parallel_mode", True, raising = False)
         with inference.exact_speculative_verify(model):
             assert type(verifier) is native
-    monkeypatch.setattr(native, "_linears", lambda self, linears, x: tuple(self._linear(linear, x) for linear in linears))
+    for name in ("_linears", "_layer"):
+        with monkeypatch.context() as patch:
+            patch.setattr(native, name, lambda self, *args: None)
+            with inference.exact_speculative_verify(model):
+                assert type(verifier) is native
+
+
+def _submissions(monkeypatch):
+    submitted, submit = [], mx.async_eval
+    monkeypatch.setattr(mx, "async_eval", lambda *arrays: (submit(*arrays), submitted.append(arrays))[0])
+    return submitted
+
+
+def test_a_served_verify_call_submits_each_layer_as_it_is_built(qwen_4bit, monkeypatch):
+    import copy
+    from unsloth_zoo.mlx import inference
+    model, ids, cache = qwen_4bit
+    lm, block = model.language_model, mx.array([ids[0][24:29]])
+    unscoped, native = copy.copy(lm), {keep: _verified(lm, cache, block, keep) for keep in (0, 3)}
+    submitted = _submissions(monkeypatch)
     with inference.exact_speculative_verify(model):
-        assert type(verifier) is native
+        assert _verified(unscoped, cache, block, 0) and not submitted
+        assert all(_same(expected, _verified(lm, cache, block, keep)) for keep, expected in native.items())
+        assert len(submitted) == 2 * len(lm.model.layers) and not submitted.clear()
+        # Each submission is that layer's own output: the captured layers sit at their own positions.
+        out = lm(block, cache = _clone(cache), speculative_verify = True, **_captured(lm))
+        assert [index for index, (layer,) in enumerate(submitted) if any(layer is hidden for hidden in out.hidden_states)] == _captured(lm)["capture_layer_ids"]
+        # A function transformation cannot evaluate: the layers are built and nothing is submitted.
+        assert mx.compile(lambda x: lm(x, cache = _clone(cache), speculative_verify = True).logits)(block).shape[1] == 5
+    assert len(submitted) == len(lm.model.layers)
 
 
 def test_engine_tokens_and_scores_are_unchanged_by_the_verify_scope_over_wide_ragged_rounds(qwen_4bit, monkeypatch):
@@ -397,14 +424,20 @@ def test_engine_tokens_and_scores_are_unchanged_by_the_verify_scope_over_wide_ra
     assert any(served.count(key) > 1 for key in wide)
 
 
-def test_mtp_rounds_match_solo_decoding(qwen_mtp):
+def test_mtp_rounds_match_solo_decoding(qwen_mtp, monkeypatch):
     from unsloth_zoo.mlx.generate import SamplingParams
+    from unsloth_zoo.mlx.inference import exact_speculative_verify
     from unsloth_zoo.mlx.speculative import DraftController
     model, ids = qwen_mtp
     greedy = SamplingParams()
     solo = [_solo(model, prompt, 96, greedy) for prompt in ids]
+    submitted = _submissions(monkeypatch)
     out, drafted, _ = _run(model, ids, 96, _script(("draft", 3), ("copy", 4)), greedy, drafter = _drafter(model))
     assert out == solo and all(accepted >= 0.6 * count for count, accepted in drafted.values())
+    unscoped = len(submitted)
+    with exact_speculative_verify(model):
+        assert _run(model, ids, 96, _script(("draft", 3), ("copy", 4)), greedy, drafter = _drafter(model))[0] == solo
+    assert len(submitted) > 2 * unscoped + len(model.language_model.model.layers)
     (out,), drafted, _ = _run(model, ids[:1], 96, DraftController(max_depth = 4, max_copy = 16), greedy, drafter = _drafter(model))
     assert out == solo[0] and drafted[0][1] > 0
 
