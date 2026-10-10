@@ -181,3 +181,24 @@ def test_eval_prefill_on_nf4_experts(monkeypatch, which, dtype):
     assert out.dtype == x.dtype and out.shape == dense.shape
     rel = float((out.float() - dense.float()).norm() / dense.float().norm())
     assert rel < 2e-2, rel
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("which", FORWARDS)
+def test_eval_prefill_unquantized_16bit_experts(monkeypatch, which, dtype):
+    # Experts left in 16-bit (llm_int8_skip_modules) must keep their dtype on the routed path.
+    if dtype is torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        pytest.skip("no bf16")
+    monkeypatch.setenv("UNSLOTH_GPTOSS_GROUPED", "0")
+    config = GptOssConfig(
+        num_local_experts = E, num_experts_per_tok = TOP_K, hidden_size = H,
+        intermediate_size = INTER, num_hidden_layers = 1, torch_dtype = dtype,
+    )
+    experts = _bind(GptOssExpertsBnb4bit(config).to("cuda", dtype).eval(), which)
+    T = getattr(experts, "_dense_eval_max_rows", 8192) // E + 1
+    x = torch.randn(1, T, H, device = "cuda", dtype = dtype)
+    idx, weights = _routing(T, "cuda")
+    with torch.no_grad():
+        out = experts(x, router_indices = idx, routing_weights = weights.to(dtype))
+    assert out.dtype == dtype and bool(torch.isfinite(out).all())

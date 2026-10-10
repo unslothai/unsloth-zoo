@@ -2964,6 +2964,11 @@ def torch_native_forward(
             # fallback, which takes F.linear and ignores compute_dtype. It does not keep the
             # adapter matmuls in float32 -- the forced-float32 LoRA path casts those to
             # float16 itself.
+            if not self.training:
+                # Eval also reaches here with unquantized 16-bit experts (llm_int8_skip_modules).
+                w = getattr(getattr(down_proj, "base_layer", down_proj), "weight", None)
+                if w is not None and w.dtype.is_floating_point:
+                    gated_output = gated_output.to(w.dtype)
             with torch.autocast(device_type=device_type, enabled=False):
                 out = down_proj(gated_output)
             
