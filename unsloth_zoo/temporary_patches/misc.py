@@ -858,6 +858,9 @@ def patch_transformers_masks():
                         CAUSAL_MASK_SKIP_STATS["skipped"] += 1
                     return mask
             return f(*args, **kwargs)
+        # Remote code (Nemotron-Labs-Diffusion's prefill) filters its arguments by inspect.signature(create_causal_mask).
+        if signature is not None:
+            return_attention_mask.__signature__ = signature
         return return_attention_mask
     pass
 
