@@ -1171,6 +1171,8 @@ jobs:
                 # and >= 5.13 too, where DeepseekV3NaiveMoe does not exist.
                 # test_moe_hidden_states_wrapper: the Qwen3 MoE wrapper stays transparent to the
                 # compiler, wraps once and carries the marker unsloth's GRPO reads.
+                # test_fp16_casts_leftover_bf16_params: needs bitsandbytes, which only these
+                # lanes install, so in repo-tests-cpu it could only skip.
                 "$venv/bin/python" -m pytest -v --tb=short -rs \
                   tests/test_upstream_pinned_symbols_transformers.py \
                   tests/test_torchvision_video_removed_message.py \
@@ -1211,7 +1213,8 @@ jobs:
                   tests/test_gemma4_dtype_drift_guards.py \
                   tests/test_gemma4_unified_forced_float32.py \
                   tests/test_gemma3_processor_token_type_ids.py \
-                  tests/test_fp16_path_tiny_models.py >> "$log" 2>&1 || trc=$?
+                  tests/test_fp16_path_tiny_models.py \
+                  tests/test_fp16_casts_leftover_bf16_params.py >> "$log" 2>&1 || trc=$?
                 echo "$trc" > ".lanes/$id.tests"
               else
                 echo "skipped" > ".lanes/$id.tests"
