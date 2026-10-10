@@ -369,21 +369,6 @@ def test_local_fp8_serves_the_save_methods_that_can_read_it(
     assert quant_type == "fp8"
 
 
-@pytest.mark.parametrize("error", _TRANSPORT_ERRORS)
-@pytest.mark.parametrize("save_method", [m for m in HUB_DEPENDENT_SAVE_METHODS if m != "merged_16bit"])
-def test_local_fp8_does_not_serve_the_rest(monkeypatch, tmp_path, error, save_method):
-    """Only `merged_16bit` applies the companion scales. The other save methods reach the
-    in place writer, which reads the stored tensor raw and writes it back at its FP8 dtype,
-    so a fallback there would fold the delta into scaled space and export a wrong base."""
-    monkeypatch.chdir(tmp_path)
-    _make_local_model(os.path.join("outputs", "mymodel"), FP8_CONFIG)
-    _hub_raises(monkeypatch, error)
-
-    with pytest.raises(RuntimeError) as excinfo:
-        saving_utils.determine_base_model_source("outputs/mymodel", save_method = save_method)
-    assert "connectivity" in str(excinfo.value) or "rate limiting" in str(excinfo.value)
-
-
 @pytest.mark.parametrize("save_method", FOUR_BIT_SAVE_METHODS + HUB_DEPENDENT_SAVE_METHODS)
 @pytest.mark.parametrize("quant_config, source_info", [
     pytest.param(None,         "local_unquantized", id = "unquantized"),

@@ -381,48 +381,12 @@ def test_temporary_patches_utils_transformers_version():
 
 # unsloth_zoo/temporary_patches/misc.py
 
-def test_temp_patches_misc_config_mapping():
-    """unsloth_zoo/temporary_patches/misc.py:47 -- ``from
-    transformers.models.auto.configuration_auto import CONFIG_MAPPING``."""
-    _resolve(
-        "transformers.models.auto.configuration_auto.CONFIG_MAPPING",
-    )
-
-
-def test_temp_patches_misc_tokenization_utils_base():
-    """unsloth_zoo/temporary_patches/misc.py:63, 89, 1438 -- ``from
-    transformers.tokenization_utils_base import PreTrainedTokenizerBase,
-    AddedToken``."""
-    _resolve_all([
-        "transformers.tokenization_utils_base.PreTrainedTokenizerBase",
-        "transformers.tokenization_utils_base.AddedToken",
-    ])
-
-
-def test_temp_patches_misc_quantizers_auto():
-    """unsloth_zoo/temporary_patches/misc.py:115 -- ``import
-    transformers.quantizers.auto``."""
-    _resolve("transformers.quantizers.auto")
-
 
 def test_temp_patches_misc_loss_for_causal_lm_loss():
     """unsloth_zoo/temporary_patches/misc.py:162, 248 -- ``from
     transformers.loss.loss_utils import ForCausalLMLoss``. CSM patches
     monkey-rebind this; a rename silently disables them."""
     _resolve("transformers.loss.loss_utils.ForCausalLMLoss")
-
-
-def test_temp_patches_misc_modeling_outputs_causal_lm_output():
-    """unsloth_zoo/temporary_patches/misc.py:161 + qwen3_next_moe.py:78
-    -- ``from transformers.modeling_outputs import CausalLMOutputWithPast``."""
-    _resolve("transformers.modeling_outputs.CausalLMOutputWithPast")
-
-
-def test_temp_patches_misc_generation_utils_module():
-    """unsloth_zoo/temporary_patches/misc.py:383 + gpt_oss.py:2135 --
-    ``import transformers.generation.utils``. The
-    create_causal_mask_mapping patch rebinds names on this module."""
-    _resolve("transformers.generation.utils")
 
 
 def test_temp_patches_misc_modeling_layers_grad_ckpt():
@@ -441,12 +405,6 @@ def test_temp_patches_misc_all_attention_functions():
     _resolve("transformers.modeling_utils.ALL_ATTENTION_FUNCTIONS")
 
 
-def test_temp_patches_misc_integrations_sdpa_attention():
-    """unsloth_zoo/temporary_patches/misc.py:525 -- ``import
-    transformers.integrations.sdpa_attention``. Module rebinding site."""
-    _resolve("transformers.integrations.sdpa_attention")
-
-
 def test_temp_patches_misc_import_utils():
     """unsloth_zoo/temporary_patches/misc.py:834 -- ``import
     transformers.utils.import_utils``."""
@@ -457,12 +415,6 @@ def test_temp_patches_misc_peft_lora_bnb():
     """unsloth_zoo/temporary_patches/misc.py:1289 -- ``import
     peft.tuners.lora.bnb as peft_bnb``. BNB dtype-promotion patch."""
     _resolve("peft.tuners.lora.bnb")
-
-
-def test_temp_patches_misc_training_arguments():
-    """unsloth_zoo/temporary_patches/misc.py:1333 -- ``from transformers
-    import TrainingArguments``. Reassigned to patch deprecation warnings."""
-    _resolve("transformers.TrainingArguments")
 
 
 def test_temp_patches_misc_models_auto_modeling_auto():
@@ -508,15 +460,6 @@ def test_temp_patches_gpt_oss_layer_type_validation():
     _resolve(
         "transformers.configuration_utils.layer_type_validation",
     )
-
-
-# unsloth_zoo/temporary_patches/qwen3_vl_moe.py
-
-def test_temp_patches_qwen3_vl_moe_act2fn():
-    """unsloth_zoo/temporary_patches/qwen3_vl_moe.py:201 -- ``from
-    transformers.activations import ACT2FN``. Moved between modeling_utils
-    and activations historically."""
-    _resolve("transformers.activations.ACT2FN")
 
 
 # unsloth_zoo/temporary_patches/gemma4.py

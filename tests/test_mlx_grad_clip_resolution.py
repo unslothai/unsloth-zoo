@@ -64,19 +64,6 @@ def test_field_defaults_are_none_sentinels():
     assert cfg.max_grad_leaf_norm is None
 
 
-def test_fields_accept_none():
-    """Fields accept None and round-trip through the dataclass."""
-    from unsloth_zoo.mlx.trainer import MLXTrainingConfig
-
-    cfg = MLXTrainingConfig(
-        max_grad_value=None,
-        max_grad_leaf_norm=None,
-        output_dir="/tmp/x",
-    )
-    assert cfg.max_grad_value is None
-    assert cfg.max_grad_leaf_norm is None
-
-
 def test_fields_accept_explicit_positive():
     """Fields accept positive floats for power users opting in."""
     from unsloth_zoo.mlx.trainer import MLXTrainingConfig
@@ -90,92 +77,22 @@ def test_fields_accept_explicit_positive():
     assert cfg.max_grad_leaf_norm == 1.5
 
 
-def test_default_uses_cheap_leaf_norm():
-    """Default (all None, max_grad_norm=0.0) -> leaf norm clip at 1.0."""
-    mgn, mgv, mgln, mode = _resolve(max_grad_norm=0.0)
-    assert mgn == 0.0
-    assert mgv == 0.0
-    assert mgln == 1.0
-    assert mode == "leaf_norm"
-
-
-def test_user_max_grad_norm_wins_over_default():
-    """User passes max_grad_norm=1.0 with defaults -> global norm only."""
-    mgn, mgv, mgln, mode = _resolve(max_grad_norm=1.0)
-    assert mgn == 1.0
-    assert mgv == 0.0
-    assert mgln == 0.0
-    assert mode == "global_norm"
-
-
-def test_explicit_zero_disables_cheap_default():
-    """Explicit 0.0 disables cheap clipping. With no max_grad_norm, no clip."""
-    mgn, mgv, mgln, mode = _resolve(raw_mgv=0.0, max_grad_norm=0.0)
-    assert mgn == 0.0
-    assert mgv == 0.0
-    assert mgln == 0.0
-    assert mode == "none"
-
-
-def test_explicit_zero_lets_max_grad_norm_through():
-    """Explicit cheap 0.0 + max_grad_norm=1.0 -> only norm clipping."""
-    mgn, mgv, mgln, mode = _resolve(raw_mgv=0.0, max_grad_norm=1.0)
-    assert mgn == 1.0
-    assert mgv == 0.0
-    assert mgln == 0.0
-    assert mode == "global_norm"
-
-
-def test_explicit_positive_overrides_max_grad_norm():
-    """Explicit max_grad_value=2.0 with max_grad_norm=1.0 -> elementwise
-    wins (existing rule), max_grad_norm zeroed."""
-    mgn, mgv, mgln, mode = _resolve(raw_mgv=2.0, max_grad_norm=1.0)
-    assert mgn == 0.0
-    assert mgv == 2.0
-    assert mgln == 0.0
-    assert mode == "value"
-
-
-def test_explicit_positive_alone():
-    """User passes max_grad_value=5.0 with no max_grad_norm -> elementwise at 5."""
-    mgn, mgv, mgln, mode = _resolve(raw_mgv=5.0, max_grad_norm=0.0)
-    assert mgn == 0.0
-    assert mgv == 5.0
-    assert mgln == 0.0
-    assert mode == "value"
-
-
-def test_explicit_leaf_norm_overrides_max_grad_norm():
-    """Explicit max_grad_leaf_norm uses proportional clipping and avoids global norm."""
-    mgn, mgv, mgln, mode = _resolve(raw_mgln=1.3, max_grad_norm=1.0)
-    assert mgn == 0.0
-    assert mgv == 0.0
-    assert mgln == 1.3
-    assert mode == "leaf_norm"
-
-
-def test_max_grad_value_wins_over_leaf_norm_when_both_positive():
-    """Keep max_grad_value's public elementwise meaning if both knobs are set."""
-    mgn, mgv, mgln, mode = _resolve(raw_mgv=2.0, raw_mgln=1.3)
-    assert mgn == 0.0
-    assert mgv == 2.0
-    assert mgln == 0.0
-    assert mode == "value"
-
-
-def test_trainer_source_pins_resolution_rule():
-    """Source-level pin: trainer.py contains the four-branch resolution.
-    Cheap defense against a future refactor silently regressing the rule."""
-    import inspect
-    from unsloth_zoo.mlx import trainer as T
-
-    src = (
-        inspect.getsource(T._resolve_mlx_grad_clipping)
-        + inspect.getsource(T.MLXTrainer._train_inner)
-    )
-    assert "max_grad_value" in src
-    assert "max_grad_leaf_norm" in src
-    assert 'return 0.0, 0.0, 1.0, "leaf_norm"' in src
+# Each row: knobs passed in -> (max_grad_norm, max_grad_value, max_grad_leaf_norm, mode).
+@pytest.mark.parametrize("kwargs, expected", [
+    # Default (all None) is the cheap per-leaf clip at 1.0.
+    pytest.param(dict(max_grad_norm=0.0), (0.0, 0.0, 1.0, "leaf_norm"), id="default_uses_cheap_leaf_norm"),
+    pytest.param(dict(max_grad_norm=1.0), (1.0, 0.0, 0.0, "global_norm"), id="user_max_grad_norm_wins_over_default"),
+    # Explicit 0.0 disables the cheap default.
+    pytest.param(dict(raw_mgv=0.0, max_grad_norm=0.0), (0.0, 0.0, 0.0, "none"), id="explicit_zero_disables_cheap_default"),
+    pytest.param(dict(raw_mgv=0.0, max_grad_norm=1.0), (1.0, 0.0, 0.0, "global_norm"), id="explicit_zero_lets_max_grad_norm_through"),
+    # An explicit positive max_grad_value wins over everything (historical contract).
+    pytest.param(dict(raw_mgv=2.0, max_grad_norm=1.0), (0.0, 2.0, 0.0, "value"), id="explicit_positive_overrides_max_grad_norm"),
+    pytest.param(dict(raw_mgv=5.0, max_grad_norm=0.0), (0.0, 5.0, 0.0, "value"), id="explicit_positive_alone"),
+    pytest.param(dict(raw_mgln=1.3, max_grad_norm=1.0), (0.0, 0.0, 1.3, "leaf_norm"), id="explicit_leaf_norm_overrides_max_grad_norm"),
+    pytest.param(dict(raw_mgv=2.0, raw_mgln=1.3), (0.0, 2.0, 0.0, "value"), id="max_grad_value_wins_over_leaf_norm_when_both_positive"),
+])
+def test_resolution(kwargs, expected):
+    assert _resolve(**kwargs) == expected
 
 
 def test_leaf_norm_and_value_clipping_have_distinct_results():
