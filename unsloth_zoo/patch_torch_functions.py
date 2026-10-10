@@ -90,12 +90,19 @@ try:
     _TRACING_MODE_KEYS = (torch._C._TorchDispatchModeKey.FAKE, torch._C._TorchDispatchModeKey.PROXY)
 except Exception:
     _FakeTensor, _TRACING_MODE_KEYS = (), ()
+try:
+    from torch.compiler import is_dynamo_compiling as _is_dynamo_compiling
+except Exception:
+    def _is_dynamo_compiling(): return False
 
 
 def _in_fake_or_proxy_mode(input) -> bool:
     # vLLM's init_process_group resets Dynamo rules; compiled callee aborts on fake tensors (symbolic numel).
     if isinstance(input, _FakeTensor):
         return True
+    # Dynamo inlining this cannot trace _get_dispatch_mode and would break the graph.
+    if _is_dynamo_compiling():
+        return False
     for key in _TRACING_MODE_KEYS:
         if torch._C._get_dispatch_mode(key) is not None:
             return True
