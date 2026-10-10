@@ -2932,6 +2932,9 @@ def sft_prepare_dataset(
                     _tokenize_messages, batched=False,
                     remove_columns=list(column_names), **map_kwargs,
                 )
+            if assistant_only_loss:
+                # Truncation can cut every assistant token from a long prefix; such a row has no target.
+                dataset = dataset.filter(lambda row: any(row["assistant_masks"]))
         else:
             if use_desc: map_kwargs["desc"] = f'Unsloth: Tokenizing ["{dataset_text_field}"]'
             import warnings as _w

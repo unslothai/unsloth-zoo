@@ -117,7 +117,7 @@ def test_gpt_oss_role_marker_is_not_cut_to_shared_opener():
     assert "<|call|>" in trained  # the model must learn to end a tool call
 
 
-def _prepare(tokenizer, chat_template = None, fallback = False, assistant_only_loss = True, text = None):
+def _prepare(tokenizer, chat_template = None, fallback = False, assistant_only_loss = True, text = None, max_length = 4096, return_dataset = False):
     rows = [{"messages": CONVERSATION, "tools": TOOLS}] * 2
     if text is not None:
         rows = [dict(row, text = text) for row in rows]
@@ -127,7 +127,7 @@ def _prepare(tokenizer, chat_template = None, fallback = False, assistant_only_l
         data_collator = None,
     )
     args = SimpleNamespace(
-        max_length = 4096,
+        max_length = max_length,
         dataset_text_field = "text",
         dataset_num_proc = None,
         assistant_only_loss = assistant_only_loss,
@@ -137,6 +137,8 @@ def _prepare(tokenizer, chat_template = None, fallback = False, assistant_only_l
     dataset = sft_prepare_dataset(
         trainer, datasets.Dataset.from_list(rows), tokenizer, args, False, None, "train"
     )
+    if return_dataset:
+        return dataset
     row = dataset[0]
     if "labels" in row:
         labels = row["labels"]
@@ -191,3 +193,20 @@ def test_assistant_only_loss_reads_messages_beside_a_text_column():
     # Without assistant_only_loss the text column is still what gets tokenized, as before.
     input_ids, labels = _prepare(tokenizer, assistant_only_loss = False, text = "plain text row")
     assert tokenizer.decode(input_ids).endswith("plain text row")
+
+
+def test_rows_truncated_before_any_assistant_token_are_dropped(monkeypatch):
+    tokenizer = _tokenizer("unsloth/Qwen3-0.6B")
+    long_system = {"role": "system", "content": "Be careful. " * 400}
+    rows = [
+        {"messages": [long_system] + CONVERSATION[1:], "tools": TOOLS},
+        {"messages": CONVERSATION, "tools": TOOLS},
+    ]
+    monkeypatch.setattr(datasets.Dataset, "from_list", classmethod(lambda cls, _: _ORIGINAL_FROM_LIST(rows)))
+    dataset = _prepare(tokenizer, fallback = True, max_length = 1024, return_dataset = True)
+    assert len(dataset) == 1
+    row = dataset[0]
+    assert any(row["assistant_masks"]) if "assistant_masks" in row else any(l != -100 for l in row["labels"])
+
+
+_ORIGINAL_FROM_LIST = datasets.Dataset.from_list
