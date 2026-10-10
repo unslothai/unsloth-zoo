@@ -60,6 +60,7 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
     BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_SAFE_GATE: tl.constexpr,
+    LONG_INDEXING: tl.constexpr = False,
 ):
     """
     Fused kernel: compute inter-subchunk Akk + solve_tril in one pass.
@@ -83,6 +84,9 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
+    # Unsloth: fla PR #1329 (int32 bos offsets wrap past 2**31), gated so normal sizes stay int32.
+    if LONG_INDEXING:
+        bos = bos.to(tl.int64)
 
     if i_t * BT >= T:
         return
@@ -406,6 +410,7 @@ def chunk_kda_bwd_kernel_intra(
     IS_VARLEN: tl.constexpr,
     SAFE_GATE: tl.constexpr,
     USE_GATHER: tl.constexpr,
+    LONG_INDEXING: tl.constexpr = False,
 ):
     i_kc, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_hv = i_bh // HV, i_bh % HV
@@ -419,6 +424,8 @@ def chunk_kda_bwd_kernel_intra(
     else:
         bos, eos = i_b * T, i_b * T + T
     T = eos - bos
+    if LONG_INDEXING:
+        bos = bos.to(tl.int64)
 
     i_ti = i_t * BT + i_i * BC
     if i_ti >= T:
@@ -675,6 +682,7 @@ def chunk_kda_fwd_kernel_intra_sub_chunk(
     BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_GATHER: tl.constexpr,
+    LONG_INDEXING: tl.constexpr = False,
 ):
     i_t, i_i, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_hv = i_bh // HV, i_bh % HV
@@ -686,6 +694,8 @@ def chunk_kda_fwd_kernel_intra_sub_chunk(
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
+    if LONG_INDEXING:
+        bos = bos.to(tl.int64)
 
     i_ti = i_t * BT + i_i * BC
     if i_ti >= T:
@@ -813,6 +823,7 @@ def chunk_kda_fwd_intra(
             BC=BC,
             BK=BK,
             USE_GATHER=IS_GATHER_SUPPORTED,
+            LONG_INDEXING=B * T * max(H, HV) * max(K, BT) > 2**31,
         )
     else:
         Aqk, Akkd = chunk_kda_fwd_intra_token_parallel(
@@ -849,6 +860,7 @@ def chunk_kda_fwd_intra(
         BC=BC,
         NC=NC,
         USE_SAFE_GATE=safe_gate,
+        LONG_INDEXING=B * T * max(H, HV) * max(K, BT) > 2**31,
     )
     w, u, qg, kg = recompute_w_u_fwd(
         k=k,
@@ -922,6 +934,7 @@ def chunk_kda_bwd_intra(
         NC=NC,
         SAFE_GATE=safe_gate,
         USE_GATHER=IS_GATHER_SUPPORTED,
+        LONG_INDEXING=B * T * max(H, HV) * max(K, BT) > 2**31,
     )
     dq = dq2
     dk = dk2

@@ -54,6 +54,7 @@ def recompute_w_u_fwd_kda_kernel(
     STORE_QG: tl.constexpr,
     STORE_KG: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    LONG_INDEXING: tl.constexpr = False,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_hv = i_bh // HV, i_bh % HV
@@ -64,6 +65,9 @@ def recompute_w_u_fwd_kda_kernel(
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
+    # Unsloth: fla PR #1329 (int32 bos offsets wrap past 2**31), gated so normal sizes stay int32.
+    if LONG_INDEXING:
+        bos = bos.to(tl.int64)
 
     k += (bos * H + i_h) * K
     v += (bos * HV + i_hv) * V
@@ -159,6 +163,7 @@ def prepare_wy_repr_bwd_kda_kernel(
     BK: tl.constexpr,
     BV: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    LONG_INDEXING: tl.constexpr = False,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_hv = i_bh // HV, i_bh % HV
@@ -169,6 +174,8 @@ def prepare_wy_repr_bwd_kda_kernel(
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
+    if LONG_INDEXING:
+        bos = bos.to(tl.int64)
 
     k += (bos * H + i_h) * K
     v += (bos * HV + i_hv) * V
@@ -290,6 +297,7 @@ def recompute_w_u_fwd(
         BT=BT,
         BK=BK,
         BV=BV,
+        LONG_INDEXING=B * T * max(H, HV) * max(K, V) > 2**31,
     )
     return w, u, qg, kg
 
@@ -347,6 +355,7 @@ def prepare_wy_repr_bwd(
         BT=BT,
         BK=BK,
         BV=BV,
+        LONG_INDEXING=B * T * max(H, HV) * max(K, V, BT) > 2**31,
     )
     dk = dk2
     dg = dg2

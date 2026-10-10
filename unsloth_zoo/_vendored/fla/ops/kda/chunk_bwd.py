@@ -60,6 +60,7 @@ def chunk_kda_bwd_kernel_dAv(
     BK: tl.constexpr,
     BV: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    LONG_INDEXING: tl.constexpr = False,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_hv = i_bh // HV, i_bh % HV
@@ -70,6 +71,9 @@ def chunk_kda_bwd_kernel_dAv(
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
+    # Unsloth: fla PR #1329 (int32 bos offsets wrap past 2**31), gated so normal sizes stay int32.
+    if LONG_INDEXING:
+        bos = bos.to(tl.int64)
 
     # offset calculation
     q += (bos * H + i_h) * K
@@ -348,6 +352,7 @@ def chunk_kda_bwd_dAv(
         BT=BT,
         BK=BK,
         BV=BV,
+        LONG_INDEXING=B * T * max(H, HV) * max(K, V, BT) > 2**31,
     )
     return dA, dv
 

@@ -47,6 +47,7 @@ def chunk_kda_fwd_kernel_intra_token_parallel(
     BC: tl.constexpr,
     BH: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    LONG_INDEXING: tl.constexpr = False,
 ):
     i_tg, i_hg = tl.program_id(0), tl.program_id(1)
 
@@ -72,6 +73,9 @@ def chunk_kda_fwd_kernel_intra_token_parallel(
     else:
         bos = (i_tg // T) * T
         i_t = i_tg % T
+    # Unsloth: fla PR #1329 (int32 bos offsets wrap past 2**31), gated so normal sizes stay int32.
+    if LONG_INDEXING:
+        bos = bos.to(tl.int64)
 
     if i_t >= T:
         return
@@ -174,5 +178,6 @@ def chunk_kda_fwd_intra_token_parallel(
         K=K,
         BT=BT,
         BC=BC,
+        LONG_INDEXING=B * T * max(H, HV) * max(K, BT) > 2**31,
     )
     return Aqk, Akk
