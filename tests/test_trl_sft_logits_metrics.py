@@ -100,6 +100,11 @@ def sft():
     sftmod = pytest.importorskip("trl.trainer.sft_trainer")
     if not hasattr(sftmod, "SFTTrainer"):
         pytest.skip("this trl has no SFTTrainer")
+    # trl 1.15 computes the loss, entropy and accuracy from its own fused LM head
+    # (`model(**inputs, fused_lm_head=True)`) and never reads `outputs.logits`, so the
+    # empty-logits path these tests drive does not exist there.
+    if "fused_lm_head" in inspect.getsource(sftmod.SFTTrainer.compute_loss):
+        pytest.skip("this trl scores SFT through its fused LM head, not outputs.logits")
     from unsloth_zoo.temporary_patches.misc import (
         patch_trl_entropy_from_logits, patch_trl_sft_logits_metrics,
     )
