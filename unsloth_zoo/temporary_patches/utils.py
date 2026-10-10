@@ -2196,10 +2196,11 @@ def unsloth_eager_decode():
 def _eager_during_decode(func, compiled):
     """`compiled`, except inside `unsloth_eager_decode()` where `func` runs directly. Carries
     the compiled markers so "is this compiled?" checks and `unwrap_already_compiled` behave
-    exactly as they did on `compiled`."""
+    exactly as they did on `compiled`. An enclosing compile traces `func`, so its graph-break
+    policy governs: a nested fullgraph region made accelerate >= 1.13's disabled hooks fatal."""
     @functools.wraps(compiled)
     def dispatch(*args, **kwargs):
-        if not torch.compiler.is_compiling() and eager_decode_active():
+        if torch.compiler.is_compiling() or eager_decode_active():
             return func(*args, **kwargs)
         return compiled(*args, **kwargs)
     dispatch.__wrapped__ = func
