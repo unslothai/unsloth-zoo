@@ -35,16 +35,14 @@ from .log import logger
 from .empty_model import _get_module_attribute
 
 # Leaf names of MoE routers, kept out of the automatically chosen LoRA targets.
-# A bare "gate" is not here: it is also a plain projection (D-FINE's gateway.gate),
-# so a `gate` counts as a router only by position, see _moe_router_gate_names.
+# Not "gate": D-FINE's gateway.gate is a plain projection, so _moe_router_gate_names decides by position.
 MOE_ROUTER_MODULES = frozenset((
     "router",
 ))
 
 
 def _moe_router_gate_names(model):
-    """`gate` Linears beside `experts` (Qwen3-MoE on transformers 4.x, LFM2-MoE and
-    DeepSeek-V2 on 5.0-5.12) or inside a router module (AfMoE's mlp.router.gate)."""
+    """`gate` Linears beside `experts` or inside a router module (AfMoE's mlp.router.gate)."""
     modules = dict(model.named_modules())
     names = []
     for name, module in modules.items():
@@ -405,8 +403,7 @@ def get_peft_regex(
             f"Unsloth: leaving {len(placeholders)} parameter-free placeholder module(s) out of "
             f"the LoRA targets, e.g. {placeholders[0]}"
         )
-    # Training the router reshuffles which experts run and can overflow (unsloth#3690);
-    # only an explicit target_modules naming it trains it.
+    # A trained router can overflow (unsloth#3690); only an explicit target_modules trains it.
     router_gates = [] if target_modules is not None else [
         name for name in _moe_router_gate_names(model)
         if re.fullmatch(regex_matcher, name, flags = re.DOTALL)

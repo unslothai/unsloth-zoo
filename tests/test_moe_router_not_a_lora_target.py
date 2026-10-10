@@ -161,8 +161,7 @@ def test_the_router_returns_a_tuple_so_peft_cannot_adapt_it(family, config_cls_n
 
 
 def _build_moe(gate_parent="block", experts=True):
-    """Qwen3-MoE on transformers 4.57 (`mlp.gate` beside `mlp.experts`), or AfMoE
-    (`mlp.router.gate`, the router a module of its own) with gate_parent="router"."""
+    """Qwen3-MoE 4.57 layout (`mlp.gate` beside `mlp.experts`); gate_parent="router" is AfMoE's."""
     model = _build(router_leaf=None, model_type="qwen3_moe")
     for block in model.model.layers:
         mlp = block.mlp
