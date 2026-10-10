@@ -22,6 +22,12 @@ def _model():
     model.norm = torch.nn.LayerNorm(4).to(torch.float32)
     model.pinned = torch.nn.Linear(4, 4).to(torch.bfloat16)
     model.pinned.weight._pre_set_compute_dtype = torch.bfloat16
+    # The repository's usual convention pins the module, not the parameter; a bfloat16 value
+    # past the float16 range must survive.
+    model.module_pinned = torch.nn.Sequential(torch.nn.Linear(4, 4)).to(torch.bfloat16)
+    model.module_pinned._pre_set_compute_dtype = torch.float32
+    with torch.no_grad():
+        model.module_pinned[0].weight[0, 0] = 1e6
     # A 4-bit weight packed into bfloat16 storage: its bits are not bfloat16 values.
     model.packed = torch.nn.Linear(4, 4, bias = False).to(torch.bfloat16)
     model.packed.weight.quant_state = object()
@@ -46,6 +52,8 @@ def test_float16_load_casts_leftover_bfloat16_params():
     assert model.norm.weight.dtype == torch.float32
     assert model.pinned.weight.dtype == torch.bfloat16
     assert model.packed.weight.dtype == torch.bfloat16
+    assert model.module_pinned[0].weight.dtype == torch.float32
+    assert torch.isfinite(model.module_pinned[0].weight).all()
 
 
 def test_bfloat16_load_is_untouched():

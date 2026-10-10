@@ -628,9 +628,17 @@ def patch_model_and_tokenizer(
         pass
     elif correct_dtype == torch.float16:
         # A pre-quantized checkpoint keeps its skipped layers and biases in the bfloat16 it was saved in. On a GPU without bfloat16 (T4) Inductor skips every graph reading one, so a non-reentrant checkpoint recompute stops matching its forward (unsloth#3459).
+        # A module pin covers its whole subtree: the pass below moves it with module.to().
+        _pinned = {
+            id(p)
+            for m in model.modules() if hasattr(m, "_pre_set_compute_dtype")
+            for p in m.parameters()
+        }
         _cast_devices = set()
         for param in model.parameters():
             if param.dtype != torch.bfloat16 or hasattr(param, "_pre_set_compute_dtype"):
+                continue
+            if id(param) in _pinned:
                 continue
             # bfloat16 quant storage (FSDP-QLoRA) packs 4-bit weights into a bfloat16 tensor.
             if getattr(param, "quant_state", None) is not None:
