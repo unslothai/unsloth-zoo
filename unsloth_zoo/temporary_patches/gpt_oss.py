@@ -4430,7 +4430,14 @@ def patch_gpt_oss_for_grpo(phase="post_compile"):
             # This Unsloth Zoo code section is licensed under AGPL3
 
             # Generation passes a per-type mask mapping load_balancing_loss_func cannot read, and no labels.
-            if isinstance(attention_mask, dict) and labels is None:
+            # transformers 4.x passes a 2D mask covering the cache, which it then sizes against the router
+            # logits of the new tokens only (RuntimeError on every cached decode step).
+            tokens = input_ids if input_ids is not None else inputs_embeds
+            cached_decode = (
+                isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 2
+                and tokens is not None and attention_mask.shape[1] > tokens.shape[1]
+            )
+            if labels is None and (isinstance(attention_mask, dict) or cached_decode):
                 kwargs["output_router_logits"] = False
 
             RETURN_HIDDEN_STATES = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"

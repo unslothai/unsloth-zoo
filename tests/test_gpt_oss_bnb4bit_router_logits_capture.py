@@ -102,6 +102,17 @@ def wrapped():
     res['peft_wrapped'] = type(pm.base_model.model.model.layers[0].mlp.router).__name__
     return pm.base_model.model
 res['patched_peft'] = run(wrapped())
+# Cached generate after training with router logits on (TRL leaves config.output_router_logits=True).
+G.patch_gpt_oss_for_grpo()
+m.eval()
+def gen(**kw):
+    try:
+        return m.generate(input_ids=ids[:1, :7], attention_mask=torch.ones_like(ids[:1, :7]), max_new_tokens=3,
+                          do_sample=False, use_cache=True, **kw)[0, 7:].tolist()
+    except Exception as e:
+        return f'{type(e).__name__}: {e}'
+res['gen_router_logits'] = gen(output_router_logits=True)
+res['gen_plain'] = gen(output_router_logits=False)
 G.restore_gpt_oss_original()
 res['stock'] = run(build())
 res['stock_peft'] = run(wrapped())
@@ -142,6 +153,7 @@ def test_bnb4bit_router_swap_keeps_router_logits_without_compile():
     assert res["patched_again"]["n_router_logits"] == 4, res
     assert res["peft_wrapped"] == "ModulesToSaveWrapper", res
     assert res["patched_peft"]["n_router_logits"] == 4 and res["patched_peft"]["match_reference"], res
+    assert isinstance(res["gen_plain"], list) and res["gen_router_logits"] == res["gen_plain"], res
     assert res["stock"]["error"] is None and res["stock"]["n_router_logits"] == 4, res
     assert res["stock"]["match_reference"], res
     assert res["stock_peft"]["n_router_logits"] == 4 and res["stock_peft"]["match_reference"], res
