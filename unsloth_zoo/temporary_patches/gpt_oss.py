@@ -1537,17 +1537,15 @@ pass
 
 
 class _AnyRouterClass(type):
-    # isinstance against any member; keeps the stock __name__ so name-based retargets (the unsloth
-    # compiler, transformers patch mappings) still map it.
+    # Keeps the stock __name__: the unsloth compiler and transformers patch mappings retarget by name.
     def __instancecheck__(cls, obj):
         return isinstance(obj, cls._members)
 
 
 def _record_gpt_oss_router_logits(router_cls):
-    # Stock GptOssModel.forward records router_logits by isinstance on the import-time router class,
-    # which the BnB swap replaces; whenever the stock forward runs (UNSLOTH_COMPILE_DISABLE) nothing is
-    # recorded and load_balancing_loss_func fails. Widen target_class in place, so registries already
-    # holding this spec see it; a PEFT wrapper around a router is not an instance, so one hook each.
+    # The stock forward (UNSLOTH_COMPILE_DISABLE) records router_logits by isinstance on the router
+    # class the BnB swap replaced. Widened in place so registries holding the spec see it; not a path
+    # match, which double-captures a PEFT-wrapped router.
     import transformers.models.gpt_oss.modeling_gpt_oss as modeling
     recorders = getattr(modeling.GptOssPreTrainedModel, "_can_record_outputs", None)
     spec = recorders.get("router_logits") if isinstance(recorders, dict) else None

@@ -14,9 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-# Guards: after patch_gpt_oss_bnb4bit swaps GptOssTopKRouter, the stock GptOssModel.forward (used
-# under UNSLOTH_COMPILE_DISABLE) recorded no router_logits, so load_balancing_loss_func raised
-# IndexError on the first training step.
+# With compile disabled the stock forward recorded no router_logits for the BnB router: IndexError at step 1.
 from __future__ import annotations
 
 import json
