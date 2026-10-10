@@ -425,6 +425,7 @@ jobs:
         # test_output_collector_compile: the capture_outputs collector mirror compiles fullgraph and stays per thread / context.
         # test_top_level_imports_are_declared: every package a zoo module imports at module level is a declared dependency.
         # test_xpu_device_typed_autocast: nested bnb offset, Gemma3n fp32 regions and unsloth_train autocast follow the accelerator, not "cuda".
+        # test_xpu_empty_cache_arms: gradient checkpointing buffers and patch_model_and_tokenizer release cached memory through torch.xpu on XPU.
         # One pytest process per group: MLX export shims replace sys.modules globally,
         # and the security network blocker would break the advisory PyPI test.
         run: |
@@ -444,6 +445,7 @@ jobs:
               tests/test_training_utils_use_cache.py \
               tests/test_unsloth_train_scheduler_kwargs.py \
               tests/test_xpu_device_typed_autocast.py \
+              tests/test_xpu_empty_cache_arms.py \
               tests/test_loss_normalization_contract.py \
               tests/test_mlx_finetune_last_n_layers.py \
               tests/test_mlx_double_quant_reject.py \
