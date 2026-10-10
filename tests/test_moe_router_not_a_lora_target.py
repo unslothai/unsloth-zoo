@@ -17,7 +17,8 @@
 """The MoE router must not be an automatically chosen LoRA target.
 
 A router leaf is an nn.Linear, so the automatic search counted it as an ordinary
-projection; Llama 4's and PhiMoE's return a tuple, which PEFT cannot adapt.
+projection; Llama 4's and PhiMoE's return a tuple, which PEFT cannot adapt, and a
+trained Qwen3-MoE `mlp.gate` overflowed into a merge failure (unsloth#3690).
 """
 
 from __future__ import annotations
@@ -157,3 +158,109 @@ def test_the_router_returns_a_tuple_so_peft_cannot_adapt_it(family, config_cls_n
     assert not hasattr(out, "dtype"), (
         "PEFT reads .dtype off this return value; if it has one, LoRA would work"
     )
+
+
+def _build_moe(gate_parent="block", experts=True):
+    """Qwen3-MoE 4.57 layout (`mlp.gate` beside `mlp.experts`); gate_parent="router" is AfMoE's."""
+    model = _build(router_leaf=None, model_type="qwen3_moe")
+    for block in model.model.layers:
+        mlp = block.mlp
+        if experts:
+            mlp.experts = nn.ModuleList(nn.Module() for _ in range(2))
+            for expert in mlp.experts:
+                for leaf in ("gate_proj", "up_proj", "down_proj"):
+                    setattr(expert, leaf, nn.Linear(8, 8))
+        if gate_parent == "router":
+            router = type("AfmoeTokenChoiceRouter", (nn.Module,), {})()
+            router.gate = nn.Linear(8, 4, bias=False)
+            mlp.router = router
+        elif gate_parent == "block":
+            mlp.gate = nn.Linear(8, 4, bias=False)
+    return model
+
+
+def _gates(targets):
+    return [t for t in targets if t.rsplit(".")[-1] == "gate"]
+
+
+def test_gate_beside_experts_is_not_auto_selected():
+    regex, targets = _targets(_build_moe())
+    assert not _gates(targets), f"MoE router gate auto-selected: {_gates(targets)}"
+    assert {t.rsplit(".")[-1] for t in targets} >= {"q_proj", "k_proj", "v_proj", "o_proj"}
+    assert "model.layers.0.self_attn.q_proj" in targets
+
+
+def test_gate_inside_a_router_module_is_not_auto_selected():
+    _, targets = _targets(_build_moe(gate_parent="router", experts=True))
+    assert not _gates(targets), f"router module's gate auto-selected: {_gates(targets)}"
+
+
+def test_gate_with_no_experts_beside_it_stays_a_target():
+    """D-FINE's gateway.gate mixes two residual streams; it routes nothing."""
+    _, targets = _targets(_build_moe(experts=False))
+    assert len(_gates(targets)) == N_LAYERS
+
+
+def test_an_explicit_gate_still_trains_the_router():
+    _, targets = _targets(_build_moe(), target_modules=["q_proj", "gate"])
+    assert len(_gates(targets)) == N_LAYERS
+
+
+def test_router_gate_skip_leaves_other_targets_unchanged():
+    _, with_router = _targets(_build_moe())
+    _, without_router = _targets(_build_moe(gate_parent=None))
+    assert with_router == [t for t in without_router if t.rsplit(".")[-1] != "gate"]
+
+
+def _shrunk_default_config(model_type):
+    transformers = pytest.importorskip("transformers")
+    try:
+        config = transformers.AutoConfig.for_model(model_type)
+    except (KeyError, ValueError):
+        pytest.skip(f"transformers {transformers.__version__} has no {model_type}")
+    text = getattr(config, "text_config", None) or config
+    text.num_hidden_layers = 2
+    # Keep every layer sparse so a router exists at two layers.
+    for key, value in (("first_k_dense_replace", 0), ("decoder_sparse_step", 1),
+                       ("mlp_only_layers", []), ("num_dense_layers", 0)):
+        if hasattr(text, key):
+            setattr(text, key, value)
+    return transformers, config
+
+
+def _num_experts(config):
+    text = getattr(config, "text_config", None) or config
+    for key in ("num_experts", "n_routed_experts", "moe_num_experts", "num_local_experts"):
+        if isinstance(getattr(text, key, None), int):
+            return getattr(text, key)
+    return None
+
+
+@pytest.mark.parametrize("model_type", [
+    "qwen3_moe", "qwen2_moe", "olmoe", "flex_olmo", "ernie4_5_moe", "qwen3_next",
+    "deepseek_v2", "afmoe",
+])
+def test_real_moe_families_keep_router_gates_out(model_type):
+    import torch
+
+    transformers, config = _shrunk_default_config(model_type)
+    with torch.device("meta"):
+        try:
+            model = transformers.AutoModelForCausalLM.from_config(config)
+        except Exception as error:
+            pytest.skip(f"{model_type} does not build from its default config: {error}")
+    modules = dict(model.named_modules())
+    routers = [
+        name for name, module in modules.items()
+        if name.endswith(".gate") and isinstance(module, nn.Linear)
+        and module.out_features == _num_experts(config)
+    ]
+    if not routers:
+        pytest.skip(f"{model_type} has no nn.Linear router gate on transformers "
+                    f"{transformers.__version__}")
+    regex = get_peft_regex(model)
+    targets = [name for name, module in model.named_modules()
+               if isinstance(module, nn.Linear) and re.fullmatch(regex, name)]
+    assert not set(routers) & set(targets)
+    assert any(t.endswith("q_proj") or t.endswith("qkv_proj") or t.endswith("in_proj_qkvz")
+               or t.endswith("q_a_proj") for t in targets)
