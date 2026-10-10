@@ -632,6 +632,9 @@ def patch_model_and_tokenizer(
         for param in model.parameters():
             if param.dtype != torch.bfloat16 or hasattr(param, "_pre_set_compute_dtype"):
                 continue
+            # bfloat16 quant storage (FSDP-QLoRA) packs 4-bit weights into a bfloat16 tensor.
+            if getattr(param, "quant_state", None) is not None:
+                continue
             if param.device.type == "cuda":
                 _cast_devices.add(param.device)
                 if param.numel() * param.element_size() >= _FORCED_FLOAT32_STAGE_BYTES:

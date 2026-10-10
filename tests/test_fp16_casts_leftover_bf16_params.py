@@ -22,6 +22,9 @@ def _model():
     model.norm = torch.nn.LayerNorm(4).to(torch.float32)
     model.pinned = torch.nn.Linear(4, 4).to(torch.bfloat16)
     model.pinned.weight._pre_set_compute_dtype = torch.bfloat16
+    # A 4-bit weight packed into bfloat16 storage: its bits are not bfloat16 values.
+    model.packed = torch.nn.Linear(4, 4, bias = False).to(torch.bfloat16)
+    model.packed.weight.quant_state = object()
     return model
 
 
@@ -42,6 +45,7 @@ def test_float16_load_casts_leftover_bfloat16_params():
     assert torch.equal(model.skipped.weight.float(), before)
     assert model.norm.weight.dtype == torch.float32
     assert model.pinned.weight.dtype == torch.bfloat16
+    assert model.packed.weight.dtype == torch.bfloat16
 
 
 def test_bfloat16_load_is_untouched():
@@ -66,3 +70,4 @@ def test_large_leftover_param_takes_the_bounded_cast(monkeypatch):
     assert model.skipped.weight.dtype == torch.float16
     assert torch.equal(model.skipped.weight.float(), before)
     assert model.pinned.weight.dtype == torch.bfloat16
+    assert model.packed.weight.dtype == torch.bfloat16
