@@ -117,52 +117,70 @@ def test_default_cap_routes_long_prefill(monkeypatch, which):
     assert sum(rows) == TOP_K * num_tokens
 
 
-def _grouped_ready():
-    if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
+def _bnb_cuda():
+    if not torch.cuda.is_available():
         return False
     try:
         import bitsandbytes  # noqa: F401
-        from unsloth_zoo.temporary_patches.moe_utils import _check_torch_grouped_mm_supported
-        return _check_torch_grouped_mm_supported()
+        return True
     except Exception:
         return False
 
 
-@pytest.mark.skipif(not _grouped_ready(), reason = "needs CUDA bf16, bitsandbytes and torch._grouped_mm")
+def _grouped_mm_bf16():
+    from unsloth_zoo.temporary_patches.moe_utils import _check_torch_grouped_mm_supported
+    return torch.cuda.is_bf16_supported() and _check_torch_grouped_mm_supported()
+
+
+@pytest.mark.skipif(not _bnb_cuda(), reason = "needs CUDA and bitsandbytes")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("which", FORWARDS)
-def test_eval_prefill_takes_grouped_path(monkeypatch, which):
+def test_eval_prefill_on_nf4_experts(monkeypatch, which, dtype):
+    # bf16 with torch._grouped_mm must take the grouped path; elsewhere (fp16, T4) grouped or the
+    # loop, but never the dense branch, and the output must match it.
     import bitsandbytes as bnb
     from unsloth_zoo.temporary_patches import gpt_oss_grouped_qlora as gq
+    if dtype is torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        pytest.skip("no bf16")
     monkeypatch.delenv("UNSLOTH_GPTOSS_GROUPED", raising = False)
     monkeypatch.delenv("UNSLOTH_COMPILE_DISABLE", raising = False)
     H4, I4 = 256, 192
     config = GptOssConfig(
         num_local_experts = E, num_experts_per_tok = TOP_K, hidden_size = H4,
-        intermediate_size = I4, num_hidden_layers = 1, torch_dtype = torch.bfloat16,
+        intermediate_size = I4, num_hidden_layers = 1, torch_dtype = dtype,
     )
     experts = GptOssExpertsBnb4bit(config)
     g = torch.Generator().manual_seed(0)
+    rows = []
     for name, (i, o) in (("gate_up_projs", (H4, 2 * I4)), ("down_projs", (I4, H4))):
         lins = []
         for _ in range(E):
-            lin = bnb.nn.Linear4bit(i, o, bias = True, compute_dtype = torch.bfloat16, quant_type = "nf4")
-            lin.weight = bnb.nn.Params4bit((torch.randn(o, i, generator = g) * 0.05).to(torch.bfloat16),
+            lin = bnb.nn.Linear4bit(i, o, bias = True, compute_dtype = dtype, quant_type = "nf4")
+            lin.weight = bnb.nn.Params4bit((torch.randn(o, i, generator = g) * 0.05).to(dtype),
                                            requires_grad = False, quant_type = "nf4")
-            lin.bias = torch.nn.Parameter((torch.randn(o, generator = g) * 0.1).to(torch.bfloat16), requires_grad = False)
+            lin.bias = torch.nn.Parameter((torch.randn(o, generator = g) * 0.1).to(dtype), requires_grad = False)
+            if name == "gate_up_projs":
+                lin.register_forward_hook(lambda m, args, out: rows.append(args[0].shape[0]))
             lins.append(lin)
         setattr(experts, name, torch.nn.ModuleList(lins))
     experts = _bind(experts.cuda().eval(), which)
     T = getattr(experts, "_dense_eval_max_rows", 8192) // E + 1
-    x = torch.randn(1, T, H4, device = "cuda", dtype = torch.bfloat16)
+    x = torch.randn(1, T, H4, device = "cuda", dtype = dtype)
     idx, weights = _routing(T, "cuda")
-    weights = weights.to(torch.bfloat16)
+    weights = weights.to(dtype)
     with torch.no_grad():
-        before = gq.CALLS["forward"]
+        before = gq.CALLS["forward"] + gq.CALLS.get("forward_fp16", 0)
         out = experts(x, router_indices = idx, routing_weights = weights)
-        assert gq.CALLS["forward"] == before + 1
+        grouped = gq.CALLS["forward"] + gq.CALLS.get("forward_fp16", 0) - before
+        fed = sum(rows)
         monkeypatch.setattr(experts, "_dense_eval_max_rows", 10**12, raising = False)
+        rows.clear()
         dense = experts(x, router_indices = idx, routing_weights = weights)
-        assert gq.CALLS["forward"] == before + 1
+        assert sum(rows) == E * T
+    if dtype is torch.bfloat16 and _grouped_mm_bf16():
+        assert grouped == 1 and fed == 0
+    else:
+        assert (grouped, fed) in ((1, 0), (0, TOP_K * T)), (grouped, fed)
     assert out.dtype == x.dtype and out.shape == dense.shape
     rel = float((out.float() - dense.float()).norm() / dense.float().norm())
     assert rel < 2e-2, rel
