@@ -93,8 +93,7 @@ except Exception:
 
 
 def _in_fake_or_proxy_mode(input) -> bool:
-    # vLLM's in-process init_process_group clears Dynamo's rule map, so Dynamo can trace this replacement on
-    # fake tensors, where the compiled callee aborts ("Cannot call numel() on tensor with symbolic sizes").
+    # vLLM's init_process_group resets Dynamo rules; compiled callee aborts on fake tensors (symbolic numel).
     if isinstance(input, _FakeTensor):
         return True
     for key in _TRACING_MODE_KEYS:

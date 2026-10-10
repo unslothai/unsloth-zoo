@@ -47,7 +47,6 @@ _CHILD = textwrap.dedent(
 
 
 def test_patched_layer_norm_survives_in_graph_classification():
-    # The failure is a C++ abort, so it has to run in a child process.
     env = dict(os.environ, UNSLOTH_IS_PRESENT = "1")
     out = subprocess.run(
         [sys.executable, "-c", _CHILD], env = env, capture_output = True, text = True, timeout = 600,
