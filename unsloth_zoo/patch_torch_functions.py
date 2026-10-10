@@ -85,24 +85,22 @@ def _layer_norm_eager(
 pass
 _layer_norm_compiled = torch_compile(_layer_norm_eager)
 
-_FAKE_MODE_KEY = torch._C._TorchDispatchModeKey.FAKE
-_PROXY_MODE_KEY = torch._C._TorchDispatchModeKey.PROXY
 try:
     from torch._subclasses.fake_tensor import FakeTensor as _FakeTensor
+    _TRACING_MODE_KEYS = (torch._C._TorchDispatchModeKey.FAKE, torch._C._TorchDispatchModeKey.PROXY)
 except Exception:
-    _FakeTensor = ()
+    _FakeTensor, _TRACING_MODE_KEYS = (), ()
 
 
 def _in_fake_or_proxy_mode(input) -> bool:
-    # torch.distributed.init_process_group (vLLM's in-process engine) clears Dynamo's rule map, which
-    # then lists this replacement as the in-graph F.layer_norm and runs it on fake tensors with
-    # symbolic sizes; a compiled callee there aborts the process ("Cannot call numel() on tensor
-    # with symbolic sizes/strides"). The eager body traces fine.
-    return (
-        isinstance(input, _FakeTensor)
-        or torch._C._get_dispatch_mode(_FAKE_MODE_KEY) is not None
-        or torch._C._get_dispatch_mode(_PROXY_MODE_KEY) is not None
-    )
+    # vLLM's in-process init_process_group clears Dynamo's rule map, so Dynamo can trace this replacement on
+    # fake tensors, where the compiled callee aborts ("Cannot call numel() on tensor with symbolic sizes").
+    if isinstance(input, _FakeTensor):
+        return True
+    for key in _TRACING_MODE_KEYS:
+        if torch._C._get_dispatch_mode(key) is not None:
+            return True
+    return False
 
 
 def layer_norm(
