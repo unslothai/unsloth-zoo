@@ -2719,12 +2719,11 @@ def sft_prepare_dataset(
         if formatting_func is None:
             raise RuntimeError("Unsloth: You must specify a `formatting_func`")
     pass
-    if do_tokenize and not do_messages and getattr(self, "_unsloth_assistant_mask_fallback", False) and \
-        getattr(args, "assistant_only_loss", False):
-        # Only the messages path can mask from markers; formatted text would silently train every token.
+    if do_tokenize and not do_messages and not do_prompt_completion and getattr(args, "assistant_only_loss", False):
+        # Formatted or plain text carries no assistant masks, so every token would silently be trained.
         raise ValueError(
-            "Unsloth: assistant_only_loss with this chat template needs a conversational `messages` dataset "
-            "and no formatting_func. Or use `train_on_responses_only` on your formatted text."
+            "Unsloth: assistant_only_loss needs a conversational `messages` dataset and no formatting_func. "
+            "Or use `train_on_responses_only` on your formatted text."
         )
 
     if do_tokenize:

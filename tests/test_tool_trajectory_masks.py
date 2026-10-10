@@ -212,9 +212,10 @@ def test_rows_truncated_before_any_assistant_token_are_dropped(monkeypatch):
 _ORIGINAL_FROM_LIST = datasets.Dataset.from_list
 
 
-def test_marker_fallback_refuses_a_formatting_func():
+@pytest.mark.parametrize("fallback", [True, False])
+def test_assistant_only_loss_refuses_a_formatting_func(fallback):
     tokenizer = _tokenizer("unsloth/Qwen3-0.6B")
-    trainer = SimpleNamespace(chat_template = None, _unsloth_assistant_mask_fallback = True, data_collator = None)
+    trainer = SimpleNamespace(chat_template = None, _unsloth_assistant_mask_fallback = fallback, data_collator = None)
     args = SimpleNamespace(
         max_length = 4096, dataset_text_field = "text", dataset_num_proc = None,
         assistant_only_loss = True, completion_only_loss = None, packing = False,
