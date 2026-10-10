@@ -276,6 +276,7 @@ def test_verify_admission_serves_a_key_only_after_its_first_block_matched_bit_fo
     assert admit("pair", lambda: (a, zero), lambda: (b, zero))[0] is a and admit("pair", lambda: (a, zero), lambda: (b, zero))[0] is b
     # The second output differs in its sign bit only.
     assert all(admit("signed", lambda: (a, zero), lambda: (b, minus))[0] is a for _ in range(2))
+    assert admit("refused", lambda: a, lambda: None) is a and admit("one", lambda: a, lambda: None) is a
     assert inference._VERIFY_VERDICTS == {"one": True, "pair": True, "signed": False}
 
 
@@ -369,7 +370,7 @@ def test_the_verify_scope_serves_only_its_own_models_and_restores_the_verifier(q
         patch.setattr(model, "_unsloth_mlx_distributed_parallel_mode", True, raising = False)
         with inference.exact_speculative_verify(model):
             assert type(verifier) is native
-    for name in ("_linears", "_layer"):
+    for name in ("_linears", "_layer", "_feed_forward"):
         with monkeypatch.context() as patch:
             patch.setattr(native, name, lambda self, *args: None)
             with inference.exact_speculative_verify(model):

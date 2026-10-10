@@ -2657,8 +2657,8 @@ def fused_moe_routed_experts(model, *, _modules = None):
     Gate/up with SwiGLU, and down with the routing-weight combine and shared-expert add, serve
     calls whose routes MLX gathers unsorted, each checked bitwise against the native experts at
     first use; where they serve a call, the routing launch also writes the shared-expert gate's
-    sigmoid. The kernels run from `fused_moe_router`'s fused call, so without that scope the
-    blocks stay native. Training and distributed models keep the native experts, and so does
+    sigmoid. The kernels run from `fused_moe_router`'s fused call and from `exact_speculative_verify`'s
+    verify blocks, so without either scope the blocks stay native. Training and distributed models keep the native experts, and so does
     every model while UNSLOTH_MLX_ROUTED_EXPERTS=0.
     """
     changed = []
@@ -3287,6 +3287,8 @@ _EXACT_VERIFY_CONTRACT = {
         "Qwen3_5BatchInvariantForward._linears": "1f44efb5714938af",
         "Qwen3_5BatchInvariantForward._layer": "f3f59ff9d0b68a50",
         "Qwen3_5BatchInvariantForward._model": "142df8a42c27c4f7",
+        "Qwen3_5BatchInvariantForward._feed_forward": "d1c424074fbf0c21",
+        "Qwen3_5BatchInvariantForward._switch_glu": "6aa1f4defb45f54a",
         "_target_verify_linear": "190517e318ba4d7b",
         "_target_verify_linears": "2d4c9adbc50be66e",
     },
@@ -3302,6 +3304,7 @@ _EXACT_VERIFY_CONTRACT = {
 }
 # mlx-vlm's `optimized_affine_linears` serves 1 < rows <= 8; a wider block leaves its fused verify kernels.
 _VERIFY_FUSED_ROWS = 8
+_VERIFY_METHODS = ("verify", "_linear", "_linears", "_layer", "_feed_forward")
 _VERIFY_LOCK = RLock()
 _VERIFY_VERDICTS = {}
 # The verifier is one object per process: whether a call is served is kept per thread, not on it.
@@ -3309,13 +3312,13 @@ _VERIFY_STATE = local()
 
 
 def _verify_admitted(key, native, fused):
-    """`fused()` once `key`'s first block matched `native()` bit for bit; that block and a failed key take `native()`."""
+    """`fused()` once `key`'s first block matched `native()` bit for bit; that block, a failed key and a `fused()` of None take `native()`."""
     verdict = _VERIFY_VERDICTS.get(key)
-    if verdict:
-        return fused()
+    served = fused() if verdict else None
+    if served is not None:
+        return served
     reference = native()
-    if verdict is None:
-        candidate = fused()
+    if verdict is None and (candidate := fused()) is not None:
         pairs = zip(reference, candidate) if isinstance(reference, tuple) else ((reference, candidate),)
         try:
             verdict = all(a.dtype == b.dtype and a.shape == b.shape
@@ -3380,9 +3383,33 @@ def _exact_verify_class(base, *cache_key):
                 pass
         return hidden
 
+    def routed_feed_forward(self, feed_forward, x):
+        experts, mlp = getattr(feed_forward, "_unsloth_moe_routed", None), getattr(feed_forward, "switch_mlp", None)
+        projections = [getattr(mlp, name, None) for name in ("gate_proj", "up_proj", "down_proj")]
+        # The routed object refuses projections it was not built for; only quantized, frozen ones reach it.
+        if (experts is None or x.ndim != 3 or not getattr(_VERIFY_STATE, "serving", False)
+                or any(getattr(p, "bits", None) is None or p.trainable_parameters() for p in projections)):
+            return base._feed_forward(self, feed_forward, x)
+
+        def routed():
+            # The verifier's own routing, shared expert and shared gate; the routed kernels take every row at once.
+            gates = mx.softmax(self._linear(feed_forward.gate, x), axis = -1, precise = True)
+            indices = mx.argpartition(gates, kth = -feed_forward.top_k, axis = -1)[..., -feed_forward.top_k:]
+            scores = mx.take_along_axis(gates, indices, axis = -1)
+            scores = scores / scores.sum(axis = -1, keepdims = True)
+            shared = self._feed_forward(feed_forward.shared_expert, x)
+            scale = mx.sigmoid(self._linear(feed_forward.shared_expert_gate, x))
+            rows = (x.shape[0] * x.shape[1], 1, -1)
+            out = experts(feed_forward, *(a.reshape(rows) for a in (x, indices, scores, scale, shared)))
+            return None if out is None else out.reshape(*x.shape[:2], -1)
+
+        key = (x.shape[:2], x.dtype, feed_forward.top_k,
+               *((p.weight.shape, p.bits, p.group_size, p.mode) for p in projections))
+        return _verify_admitted(key, lambda: base._feed_forward(self, feed_forward, x), routed)
+
     return type(f"_ScopedVerify{base.__name__}", (base,), {
         "verify": verify, "_linear": sliced_linear, "_linears": sliced_linears, "_layer": submitted_layer,
-        "_unsloth_verify_native": base})
+        "_feed_forward": routed_feed_forward, "_unsloth_verify_native": base})
 
 
 @contextmanager
@@ -3392,7 +3419,7 @@ def exact_speculative_verify(model, *, _modules = None):
     Each layer of a verify block is submitted for evaluation as it is built, so the GPU runs while the host builds on.
     A verify block wider than the eight rows mlx-vlm's fused verify kernels serve runs each frozen
     quantized projection over balanced row slices, once its first block of that shape matched the
-    native call bit for bit. Only verify calls of the language models found here are served; other,
+    native call bit for bit. A sparse block's routed experts run on the decode kernels on the same condition. Only verify calls of the language models found here are served; other,
     training and distributed models, and an mlx-vlm whose verifier drifted, keep the native methods.
     """
     owners, verifier = [], None
@@ -3410,7 +3437,7 @@ def exact_speculative_verify(model, *, _modules = None):
                 # qwen3_5_moe inherits the call; a shared module is yielded once per path.
                 found = {id(module): module for _, module in _fusion_modules(model, _modules)
                          if getattr(type(module), "__call__", None) is call}
-                methods = [vars(native).get(name) for name in ("verify", "_linear", "_linears", "_layer")]
+                methods = [vars(native).get(name) for name in _VERIFY_METHODS]
                 patched = _exact_verify_class(native, *methods) if found else None
                 if patched is not None:
                     target.__class__ = patched
