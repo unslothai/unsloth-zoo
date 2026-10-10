@@ -772,11 +772,13 @@ def unsloth_train(trainer):
                 pass
 
                 if float16_scaler is None:
-                    clip_grad_norm_(trainable_parameters, max_grad_norm)
+                    if max_grad_norm is not None and max_grad_norm > 0:
+                        clip_grad_norm_(trainable_parameters, max_grad_norm)
                     optimizer.step()
                 else:
                     float16_scaler.unscale_(optimizer)
-                    clip_grad_norm_(trainable_parameters, max_grad_norm)
+                    if max_grad_norm is not None and max_grad_norm > 0:
+                        clip_grad_norm_(trainable_parameters, max_grad_norm)
                     float16_scaler.step(optimizer)
                     float16_scaler.update()
                 lr_scheduler.step()
@@ -789,8 +791,9 @@ def unsloth_train(trainer):
                 progress_bar.update(1)
 
                 step += 1
-                if step == max_steps: break
+                if step >= max_steps: break
             pass
+            if step >= max_steps: break
         pass
     pass
     unset_training(model)
