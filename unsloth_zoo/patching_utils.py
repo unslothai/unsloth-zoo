@@ -626,6 +626,11 @@ def patch_model_and_tokenizer(
             elif buffer.dtype == torch.bfloat16:
                 buffer.data = buffer.data.to(torch.float16)
         pass
+    elif correct_dtype == torch.float16:
+        # A pre-quantized checkpoint keeps its skipped layers and biases in the bfloat16 it was saved in. On a GPU without bfloat16 (T4) Inductor skips every graph reading one, so a non-reentrant checkpoint recompute stops matching its forward (unsloth#3459).
+        for param in model.parameters():
+            if param.dtype == torch.bfloat16 and not hasattr(param, "_pre_set_compute_dtype"):
+                param.data = param.data.to(torch.float16)
     pass
 
     # Upcast ot downcast if explicitly set
