@@ -30,6 +30,7 @@ __all__ = [
 ]
 
 from .compiler import UNSLOTH_COMPILE_LOCATION
+from .device_type import DEVICE_TYPE
 from .utils import _get_dtype, Version
 from .hf_utils import dtype_from_config, set_dtype_in_config, HAS_TORCH_DTYPE
 
@@ -803,7 +804,8 @@ def patch_model_and_tokenizer(
     # Clear deleted GPU items
     for _ in range(3):
         gc.collect()
-        torch.cuda.empty_cache()
+        if DEVICE_TYPE == "xpu": torch.xpu.empty_cache()
+        else: torch.cuda.empty_cache()
     return model, tokenizer
 pass
 
