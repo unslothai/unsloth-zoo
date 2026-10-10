@@ -219,36 +219,37 @@ def test_set_dtype_in_config_no_torch_dtype_deprecation():
 
 
 def test_set_dtype_in_config_writes_torch_dtype_value():
-    # set_dtype_in_config stores a JSON-safe string ("float16") so
-    # config.save_pretrained() and patching_utils string comparisons work.
+    # transformers 4.x stores `torch_dtype` as a JSON-safe string; 5.x stores `dtype` as a
+    # torch.dtype, which modeling code passes straight to torch ops (unsloth-zoo#1556).
     from transformers import PretrainedConfig
-    from unsloth_zoo.hf_utils import set_dtype_in_config, dtype_from_config
+    from unsloth_zoo.hf_utils import set_dtype_in_config, dtype_from_config, HAS_TORCH_DTYPE
     cfg = PretrainedConfig()
     set_dtype_in_config(cfg, torch.float16)
     got = dtype_from_config(cfg)
-    assert got == "float16"
+    assert got == ("float16" if HAS_TORCH_DTYPE else torch.float16)
+    if not HAS_TORCH_DTYPE:
+        assert torch.empty(1, dtype = got).dtype == torch.float16
 
 
 def test_set_dtype_in_config_accepts_string_input():
     from transformers import PretrainedConfig
-    from unsloth_zoo.hf_utils import set_dtype_in_config, dtype_from_config
+    from unsloth_zoo.hf_utils import set_dtype_in_config, dtype_from_config, HAS_TORCH_DTYPE
     cfg = PretrainedConfig()
     set_dtype_in_config(cfg, "bfloat16")
     got = dtype_from_config(cfg)
-    assert got == "bfloat16"
+    assert got == ("bfloat16" if HAS_TORCH_DTYPE else torch.bfloat16)
 
 
 def test_set_dtype_in_config_stores_json_safe_string():
-    # Regression: storing torch.dtype objects broke config.save_pretrained()
-    # JSON serialization and string equality in patching_utils.
+    # Regression: storing torch.dtype objects broke config.save_pretrained() JSON
+    # serialization on 4.x. 5.x's to_dict() converts a torch.dtype back to a string.
     import json
     from transformers import PretrainedConfig
-    from unsloth_zoo.hf_utils import set_dtype_in_config, dtype_from_config
+    from unsloth_zoo.hf_utils import set_dtype_in_config
     cfg = PretrainedConfig()
     set_dtype_in_config(cfg, torch.bfloat16)
-    value = dtype_from_config(cfg)
-    assert isinstance(value, str)
-    json.dumps({"dtype": value})
+    saved = json.loads(cfg.to_json_string())
+    assert saved.get("torch_dtype", saved.get("dtype")) == "bfloat16"
 
 
 def test_normalize_state_dict_tensor_guards_non_tensor():
@@ -567,7 +568,7 @@ def test_set_dtype_in_config_else_branch_picks_correct_field():
     set_dtype_in_config(obj, torch.float16)
     expected_field = "torch_dtype" if HAS_TORCH_DTYPE else "dtype"
     other_field = "dtype" if HAS_TORCH_DTYPE else "torch_dtype"
-    assert getattr(obj, expected_field, None) == "float16"
+    assert getattr(obj, expected_field, None) == ("float16" if HAS_TORCH_DTYPE else torch.float16)
     assert getattr(obj, other_field, None) is None
 
 
@@ -721,7 +722,8 @@ def test_finalize_huggingface_model_dtype_propagates_to_replaced_live_config():
         model, None, input_cfg, torch.float16,
         quantization_config={"x": 1}, bnb_config=None,
     )
-    assert model.config.dtype == "float16"
+    from unsloth_zoo.hf_utils import HAS_TORCH_DTYPE
+    assert model.config.dtype == ("float16" if HAS_TORCH_DTYPE else torch.float16)
 
 
 def test_finalize_huggingface_model_vision_rotary_uses_identity_check():
