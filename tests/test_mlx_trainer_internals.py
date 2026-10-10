@@ -2972,7 +2972,7 @@ def test_vlm_cce_prefers_collated_position_ids_for_cuda_parity():
     import inspect
     from unsloth_zoo.mlx import utils as mlx_utils
 
-    forward_source = inspect.getsource(mlx_utils._vlm_cce_forward)
+    forward_source = inspect.getsource(mlx_utils._vlm_hidden_states)
     unpack_source = inspect.getsource(mlx_utils._unpack_embed_result)
     # The marker is set by the position-recording prepare phase.
     prepare_source = inspect.getsource(mlx_utils._vlm_positions_for_compile)

@@ -44,6 +44,10 @@ NF4_TABLES = torch.cuda.is_available() and GQ.stacked_dequant_available(
     torch.device("cuda", torch.cuda.current_device()))
 needs_nf4_tables = pytest.mark.skipif(not NF4_TABLES, reason = "stacked NF4 dequant kernel is CUDA-only")
 
+# Every case here builds through L.build, so it needs what that module needs: importing it does
+# not carry its module-level skip over to this file.
+pytestmark = L.pytestmark
+
 FAST = "UNSLOTH_MOE_FAST_READY"
 MID = L.E // 2
 

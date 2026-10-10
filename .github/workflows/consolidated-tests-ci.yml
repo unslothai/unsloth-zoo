@@ -259,10 +259,10 @@ jobs:
           key: ${{ steps.pip-cache.outputs.key }}
           cache-hit: ${{ steps.pip-cache.outputs.cache-hit }}
 
-      - name: pytest tests/security (HARD GATE)
-        run: python -m pytest tests/security -v
-
-      - name: pytest behavioral gates (HARD GATE)
+      - name: pytest CPU gates (two process lanes)
+        id: cpu-gates
+        # Under the job's 20: a hung test fails this step, and the next step still prints the lane logs.
+        timeout-minutes: 15
         # Deterministic, CPU-pure, sub-second files executed as a gate.
         # test_mlx_finetune_last_n_layers was born broken in #669 and stayed
         # invisible until #739 because no job executed it (collect-only plus
@@ -425,136 +425,164 @@ jobs:
         # test_output_collector_compile: the capture_outputs collector mirror compiles fullgraph and stays per thread / context.
         # test_top_level_imports_are_declared: every package a zoo module imports at module level is a declared dependency.
         # test_xpu_device_typed_autocast: nested bnb offset, Gemma3n fp32 regions and unsloth_train autocast follow the accelerator, not "cuda".
+        # One pytest process per group: MLX export shims replace sys.modules globally,
+        # and the security network blocker would break the advisory PyPI test.
         run: |
-          python -m pytest \
-            tests/test_top_level_imports_are_declared.py \
-            tests/test_training_utils_use_cache.py \
-            tests/test_unsloth_train_scheduler_kwargs.py \
-            tests/test_xpu_device_typed_autocast.py \
-            tests/test_loss_normalization_contract.py \
-            tests/test_mlx_finetune_last_n_layers.py \
-            tests/test_mlx_double_quant_reject.py \
-            tests/test_mlx_incomplete_config.py \
-            tests/test_mlx_incomplete_config_vlm.py \
-            tests/test_mlx_adam_epsilon.py \
-            tests/test_mlx_optimizer_torch_parity.py \
-            tests/test_hf_xet_fallback.py \
-            tests/test_hf_xet_fallback_blob_scoped_redownload.py \
-            tests/test_llama_cpp_install_consent.py \
-            tests/test_llama_cpp_consent_platforms.py \
-            tests/test_converter_source_staging.py \
-            tests/test_get_transformers_model_type_empty.py \
-            tests/test_train_on_responses_list_labels.py \
-            tests/test_mlx_preference.py \
-            tests/test_mlx_trainer_internals.py \
-            tests/test_mlx_arrays_cache_advance.py \
-            tests/test_prepare_model_for_training_embedding_lora.py \
-            tests/test_mlx_quantized_optimizer_routing.py \
-            tests/test_mlx_embedding_guards.py \
-            tests/test_fp16_emulation.py \
-            tests/test_check_hf_model_exists_transport_errors.py \
-            tests/test_hub_transport_errors_single_segment.py \
-            tests/test_quant_status_transport_errors.py \
-            tests/test_local_base_model_resolution_offline.py \
-            tests/test_local_fp8_base_offline_resolution.py \
-            tests/test_local_4bit_merge_offline_resolution.py \
-            tests/test_gated_and_offline_config_classification.py \
-            tests/test_find_common_token_ids_no_match.py \
-            tests/test_vllm_direct_lora_loading.py \
-            tests/test_vllm_flashinfer_block_reversible.py \
-            tests/test_vllm_flashinfer_survives_spawn.py \
-            tests/test_vllm_weights_memory_usage.py \
-            tests/test_sft_prepare_dataset_double_bos.py \
-            tests/test_moe_preprocess_weight_transpose.py \
-            tests/test_relative_imports_resolve.py \
-            tests/test_grpo_mask_truncated_rows.py \
-            tests/test_deepseek_v41_compile_entries.py \
-            tests/test_moe_weight_preprocessor_registry_shared.py \
-            tests/test_moe_triton_down_lora_roworder.py \
-            tests/test_moe_router_not_a_lora_target.py \
-            tests/test_moe_router_under_moe_block_not_quantized.py \
-            tests/test_moe_stacked_expert_lora_reaches_forward.py \
-            tests/test_bnb_expert_stack_slicing.py \
-            tests/test_bnb_expert_stack_slicing_cpu.py \
-            tests/test_bnb_expert_stack_merge_slicing.py \
-            tests/test_fp8_expert_dequant_tile_limit.py \
-            tests/test_gpt_oss_mxfp4_blackwell_value_layout.py \
-            tests/test_python39_compatibility.py \
-            tests/test_checkpoint_modes.py \
-            tests/test_gc_rewriter_bound_keywords.py \
-            tests/test_wheel_top_level_packages.py \
-            tests/test_vision_url_ssrf_guard.py \
-            tests/test_vision_url_dns_rebinding.py \
-            tests/test_merge_index_weight_map_traversal.py \
-            tests/test_gguf_converter_child_env.py \
-            tests/test_responses_only_last_turn_header.py \
-            tests/test_gguf_post_conversion_validation.py \
-            tests/test_mtp_config_reconcile.py \
-            tests/test_llama_cpp_converter_scan.py \
-            tests/test_compiled_cache_fail_closed.py \
-            tests/test_forced_float32_lora_forward_result_dtype.py \
-            tests/test_inductor_codegen_fallback.py \
-            tests/test_inductor_single_compile_worker.py \
-            tests/test_eager_fallback_latch.py \
-            tests/test_recompile_limit_fallback.py \
-            tests/test_checkpoint_compile_mix.py \
-            tests/test_disabled_hook_graph_break.py \
-            tests/test_missing_parent_package_is_drift.py \
-            tests/test_sibling_imports_do_not_go_through_a_tests_package.py \
-            tests/test_hip_bf16_offload_dtype.py \
-            tests/test_offload_recompute_dtype.py \
-            tests/test_disabled_hook_checkpoint_guard.py \
-            tests/test_conftest_module_leak_gate.py \
-            tests/test_compiled_cache_collective.py \
-            tests/test_gpt_oss_matmul_ogs_for.py \
-            tests/test_compiled_cache_collective_gloo.py \
-            tests/test_undefined_name_gate.py \
-            tests/test_safe_serialization_none.py \
-            tests/test_published_version_window.py \
-            tests/test_device_map_planner_compressed_tensors.py \
-            tests/test_gemma3n_kv_sharing_without_cache.py \
-            tests/test_gemma3n_rmsnorm_with_scale.py \
-            tests/test_mlx_gkd_guards.py \
-            tests/test_output_collector_compile.py \
-            -v
+          set -euo pipefail
+          logs="$RUNNER_TEMP/zoo-cpu-gates"
+          mkdir -p "$logs"
+          run_gate() {
+            local name=$1 rc=0
+            shift
+            "$@" > "$logs/$name.log" 2>&1 || rc=$?
+            printf '%s\n' "$rc" > "$logs/$name.status"
+          }
+          behavioral() {
+            run_gate behavioral python -m pytest \
+              tests/test_ci_cpu_gate_results.py \
+              tests/test_top_level_imports_are_declared.py \
+              tests/test_training_utils_use_cache.py \
+              tests/test_unsloth_train_scheduler_kwargs.py \
+              tests/test_xpu_device_typed_autocast.py \
+              tests/test_loss_normalization_contract.py \
+              tests/test_mlx_finetune_last_n_layers.py \
+              tests/test_mlx_double_quant_reject.py \
+              tests/test_mlx_incomplete_config.py \
+              tests/test_mlx_incomplete_config_vlm.py \
+              tests/test_mlx_adam_epsilon.py \
+              tests/test_mlx_optimizer_torch_parity.py \
+              tests/test_hf_xet_fallback.py \
+              tests/test_hf_xet_fallback_blob_scoped_redownload.py \
+              tests/test_llama_cpp_install_consent.py \
+              tests/test_llama_cpp_consent_platforms.py \
+              tests/test_converter_source_staging.py \
+              tests/test_get_transformers_model_type_empty.py \
+              tests/test_train_on_responses_list_labels.py \
+              tests/test_mlx_preference.py \
+              tests/test_mlx_trainer_internals.py \
+              tests/test_mlx_arrays_cache_advance.py \
+              tests/test_prepare_model_for_training_embedding_lora.py \
+              tests/test_mlx_quantized_optimizer_routing.py \
+              tests/test_mlx_embedding_guards.py \
+              tests/test_fp16_emulation.py \
+              tests/test_check_hf_model_exists_transport_errors.py \
+              tests/test_hub_transport_errors_single_segment.py \
+              tests/test_quant_status_transport_errors.py \
+              tests/test_local_base_model_resolution_offline.py \
+              tests/test_local_fp8_base_offline_resolution.py \
+              tests/test_local_4bit_merge_offline_resolution.py \
+              tests/test_gated_and_offline_config_classification.py \
+              tests/test_find_common_token_ids_no_match.py \
+              tests/test_vllm_direct_lora_loading.py \
+              tests/test_vllm_flashinfer_block_reversible.py \
+              tests/test_vllm_flashinfer_survives_spawn.py \
+              tests/test_vllm_weights_memory_usage.py \
+              tests/test_sft_prepare_dataset_double_bos.py \
+              tests/test_moe_preprocess_weight_transpose.py \
+              tests/test_relative_imports_resolve.py \
+              tests/test_grpo_mask_truncated_rows.py \
+              tests/test_deepseek_v41_compile_entries.py \
+              tests/test_moe_weight_preprocessor_registry_shared.py \
+              tests/test_moe_triton_down_lora_roworder.py \
+              tests/test_moe_router_not_a_lora_target.py \
+              tests/test_moe_router_under_moe_block_not_quantized.py \
+              tests/test_visual_encoder_not_quantized.py \
+              tests/test_moe_stacked_expert_lora_reaches_forward.py \
+              tests/test_bnb_expert_stack_slicing.py \
+              tests/test_bnb_expert_stack_slicing_cpu.py \
+              tests/test_bnb_expert_stack_merge_slicing.py \
+              tests/test_fp8_expert_dequant_tile_limit.py \
+              tests/test_gpt_oss_mxfp4_blackwell_value_layout.py \
+              tests/test_python39_compatibility.py \
+              tests/test_checkpoint_modes.py \
+              tests/test_gc_rewriter_bound_keywords.py \
+              tests/test_wheel_top_level_packages.py \
+              tests/test_vision_url_ssrf_guard.py \
+              tests/test_vision_url_dns_rebinding.py \
+              tests/test_merge_index_weight_map_traversal.py \
+              tests/test_gguf_converter_child_env.py \
+              tests/test_responses_only_last_turn_header.py \
+              tests/test_gguf_post_conversion_validation.py \
+              tests/test_mtp_config_reconcile.py \
+              tests/test_llama_cpp_converter_scan.py \
+              tests/test_compiled_cache_fail_closed.py \
+              tests/test_forced_float32_lora_forward_result_dtype.py \
+              tests/test_inductor_codegen_fallback.py \
+              tests/test_inductor_single_compile_worker.py \
+              tests/test_eager_fallback_latch.py \
+              tests/test_recompile_limit_fallback.py \
+              tests/test_checkpoint_compile_mix.py \
+              tests/test_disabled_hook_graph_break.py \
+              tests/test_missing_parent_package_is_drift.py \
+              tests/test_sibling_imports_do_not_go_through_a_tests_package.py \
+              tests/test_hip_bf16_offload_dtype.py \
+              tests/test_offload_recompute_dtype.py \
+              tests/test_disabled_hook_checkpoint_guard.py \
+              tests/test_conftest_module_leak_gate.py \
+              tests/test_compiled_cache_collective.py \
+              tests/test_gpt_oss_matmul_ogs_for.py \
+              tests/test_compiled_cache_collective_gloo.py \
+              tests/test_undefined_name_gate.py \
+              tests/test_safe_serialization_none.py \
+              tests/test_published_version_window.py \
+              tests/test_device_map_planner_compressed_tensors.py \
+              tests/test_gemma3n_kv_sharing_without_cache.py \
+              tests/test_gemma3n_rmsnorm_with_scale.py \
+              tests/test_mlx_gkd_guards.py \
+              tests/test_output_collector_compile.py \
+              -v
+          }
+          other_gates() {
+            run_gate security python -m pytest tests/security -v
+            run_gate mlx-adapters python -m pytest tests/test_mlx_save_lora_adapters_filter.py -v
+            run_gate mlx-export python -m pytest tests/test_mlx_save_export_regressions.py -v
+            run_gate mlx-export-edges python -m pytest tests/test_mlx_save_export_edge_cases.py -v
+            run_gate mlx-moe-export python -m pytest tests/test_mlx_moe_gguf_export_invariants.py -v
+            run_gate tokens python -m pytest tests/test_add_new_tokens_padded_vocab.py -v
+            run_gate cpu-advisory python -m pytest \
+              tests/test_mlx_module_exports.py \
+              tests/test_rl_replacements_cpu.py \
+              tests/test_temporary_patches_imports.py \
+              tests/test_zoo_history_regressions.py \
+              tests/test_pypi_version_sync.py \
+              -v
+          }
+          behavioral &
+          behavioral_pid=$!
+          other_gates &
+          other_pid=$!
+          failed=0
+          wait "$behavioral_pid" || failed=1
+          wait "$other_pid" || failed=1
+          for name in security behavioral mlx-adapters mlx-export mlx-export-edges mlx-moe-export tokens cpu-advisory; do
+            echo "::group::$name"
+            cat "$logs/$name.log" || failed=1
+            rc=$(cat "$logs/$name.status" 2>/dev/null) || rc=missing
+            if [ "$rc" != 0 ]; then
+              # Preserve the pre-existing continue-on-error on these CPU tests.
+              if [ "$name" = cpu-advisory ] && [ "$rc" != missing ]; then
+                echo "::warning::$name exited $rc"
+              else
+                echo "::error::$name exited $rc"
+                failed=1
+              fi
+            fi
+            echo "::endgroup::"
+          done
+          : > "$logs/.reported"
+          exit "$failed"
 
-      - name: pytest MLX adapter-filter gate (HARD GATE)
-        # Run in a fresh process so its module-scoped MLX simulation does not
-        # inherit module state from another MLX test file.
-        run: python -m pytest tests/test_mlx_save_lora_adapters_filter.py -v
-
-      - name: pytest MLX GGUF export gates (HARD GATE)
-        # One invocation each, for the reason above: tests/mlx_simulation/ replaces
-        # sys.modules["mlx.core"] process-wide, so a file collected after another
-        # inherits its shim.
-        #
-        # These are here because they were in NO job, which is the failure the
-        # comment above already lists four times. The MoE name-restoration work
-        # changed the arguments _prepare_mlx_gguf_export_directory is called with and
-        # took 13 tests in test_mlx_save_export_edge_cases.py down; every check on
-        # that pull request stayed green, because `pytest tests/ --collect-only`
-        # proves only that a file imports.
+      - name: Print CPU gate logs after a step timeout
+        if: ${{ failure() && steps.cpu-gates.outcome == 'failure' }}
         run: |
-          python -m pytest tests/test_mlx_save_export_regressions.py -v
-          python -m pytest tests/test_mlx_save_export_edge_cases.py -v
-          python -m pytest tests/test_mlx_moe_gguf_export_invariants.py -v
-
-      - name: Token initialization regressions
-        run: python -m pytest tests/test_add_new_tokens_padded_vocab.py -v
-
-      - name: pytest tests/test_mlx_module_exports + zoo-specific CPU tests
-        # Run as SEPARATE pytest invocation: tests/security/conftest.py installs a
-        # session-scoped network_blocker autouse fixture that would otherwise block
-        # test_pypi_version_sync from reaching pypi.org.
-        continue-on-error: true
-        run: |
-          python -m pytest \
-            tests/test_mlx_module_exports.py \
-            tests/test_rl_replacements_cpu.py \
-            tests/test_temporary_patches_imports.py \
-            tests/test_zoo_history_regressions.py \
-            tests/test_pypi_version_sync.py \
-            -v
+          logs="$RUNNER_TEMP/zoo-cpu-gates"
+          [ ! -e "$logs/.reported" ] || exit 0
+          for log in "$logs"/*.log; do
+            [ -e "$log" ] || continue
+            echo "::group::$(basename "$log" .log)"
+            cat "$log"
+            echo "::endgroup::"
+          done
 
   # Real MLX numerics on Linux. mlx-cpu publishes a manylinux x86-64 wheel and
   # mx.quantize/dequantize/compile all run on it, so the 8-bit optimizer state

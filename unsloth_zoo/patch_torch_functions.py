@@ -62,6 +62,23 @@ def _layer_norm_eager(
             bias=bias,
             eps=eps,
         ).to(input.dtype)
+    # SigLIP norms keep float32 weights under bfloat16 activations and this body runs eagerly when
+    # Dynamo does not compile; CUDA rejects mixed dtypes, so normalise in the wider dtype.
+    if (
+        weight is not None and input.is_floating_point() and weight.is_floating_point()
+        and (bias is None or bias.is_floating_point())
+        and (weight.dtype != input.dtype or (bias is not None and bias.dtype != input.dtype))
+    ):
+        dtype = torch.promote_types(input.dtype, weight.dtype)
+        if bias is not None: dtype = torch.promote_types(dtype, bias.dtype)
+        return torch.layer_norm(
+            input.to(dtype),
+            normalized_shape,
+            weight.to(dtype),
+            bias.to(dtype) if bias is not None else None,
+            eps,
+            torch.backends.cudnn.enabled,
+        ).to(input.dtype)
     return torch.layer_norm(
         input, normalized_shape, weight, bias, eps, torch.backends.cudnn.enabled
     ).to(input.dtype)

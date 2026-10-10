@@ -4024,11 +4024,48 @@ def save_lora(model, save_directory, *args, **kwargs):
 pass
 
 
-@functools.cache
+# Uncached: a directory can be re-saved with another r / lora_alpha mid-process (#2097).
 def get_peft_config(save_directory):
     with open(os.path.join(save_directory, "adapter_config.json"), encoding = "utf-8") as f:
         config = json.load(f)
     return config
+pass
+
+
+_LIVE_LORA_CONFIGS = {}
+def _live_lora_config(model, save_directory):
+    """Live config, written once per process: a stale adapter_config.json means wrong r / lora_alpha (#2097)."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    config = model.peft_config["default"]
+    # Raw path key: os.path.abspath would cost a getcwd syscall per GRPO step.
+    cached = _LIVE_LORA_CONFIGS.get(save_directory)
+    if cached is None or cached[0] is not config:
+        config.save_pretrained(save_directory)
+        cached = (config, get_peft_config(save_directory))
+        _LIVE_LORA_CONFIGS[save_directory] = cached
+    return cached[1]
+pass
+
+
+def _check_lora_rank_fits(model, save_directory):
+    """vLLM raises this inside its step and keeps the request scheduled, failing every later generate."""
+    # All Unsloth Zoo code licensed under LGPLv3
+    try:
+        # Only r, as vLLM's validate_legal: a rank_pattern entry may match no saved tensor.
+        r = get_peft_config(save_directory).get("r", None)
+        engine = model.vllm_engine.llm_engine
+        lora_config = getattr(getattr(engine, "vllm_config", None), "lora_config", None) \
+            or getattr(engine, "lora_config", None)
+        max_lora_rank = lora_config.max_lora_rank
+    except Exception:
+        return
+    if isinstance(r, int) and isinstance(max_lora_rank, int) and r > max_lora_rank:
+        raise ValueError(
+            f"Unsloth: The LoRA adapter in {save_directory} has r = {r} (its adapter_config.json), "
+            f"but vLLM was started with max_lora_rank = {max_lora_rank}.\n"
+            "That folder may be from an earlier run with a larger rank: re-save it with "
+            f"model.save_lora, or load the model with max_lora_rank >= {r}."
+        )
 pass
 
 
@@ -4614,19 +4651,13 @@ def load_lora(model, save_directory, load_tensors = False, lora_request_id = Non
     if lora_request_id is None:
         lora_request_id = LORA_REQUEST_ID
 
-    # Check if path exists
-    if not os.path.exists(save_directory) or lora_request_id == 1:
-        if load_tensors:
-            # We need to save and load the config file once!
-            model.peft_config["default"].save_pretrained(save_directory)
-        elif not os.path.exists(save_directory):
-            raise OSError(f"Unsloth: LoRA filepath = {save_directory} does not exist!")
-    pass
+    if not load_tensors and not os.path.exists(save_directory):
+        raise OSError(f"Unsloth: LoRA filepath = {save_directory} does not exist!")
 
     from vllm.lora.request import LoRARequest
     if load_tensors:
         # We extract it directly from the model's state_dict
-        peft_config = get_peft_config(save_directory)
+        peft_config = _live_lora_config(model, save_directory)
         state_dict = model.state_dict()
         items = state_dict.items()
         state_dict = {k.replace(".default", ""):v for k, v in items if ".lora_A." in k or ".lora_B." in k}
@@ -4645,6 +4676,7 @@ def load_lora(model, save_directory, load_tensors = False, lora_request_id = Non
         # vllm_lora_already_loaded(model)
             # model.saved_vllm_lora_request = lora_request
     else:
+        _check_lora_rank_fits(model, save_directory)
         # Same checks on the path branch, read off the checkpoint header.
         _saved_keys = _saved_adapter_lora_keys(save_directory)
         _saved_peft_config = None
