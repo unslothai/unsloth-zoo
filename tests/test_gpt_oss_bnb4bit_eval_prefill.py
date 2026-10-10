@@ -25,12 +25,9 @@ import torch
 
 os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
 
-try:
-    from transformers import GptOssConfig
-    from unsloth_zoo.temporary_patches import gpt_oss
-    from unsloth_zoo.temporary_patches.gpt_oss import GptOssExpertsBnb4bit
-except Exception as e:  # pragma: no cover - unsloth_zoo import needs an accelerator
-    pytest.skip(f"cannot import unsloth_zoo gpt_oss patches: {e}", allow_module_level=True)
+from transformers import GptOssConfig
+from unsloth_zoo.temporary_patches import gpt_oss
+from unsloth_zoo.temporary_patches.gpt_oss import GptOssExpertsBnb4bit
 
 
 E, TOP_K, H, INTER = 8, 2, 16, 12
