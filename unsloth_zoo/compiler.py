@@ -2098,6 +2098,13 @@ def create_new_function(
         # upstream source can reference functools too. Neither the license header
         # nor the model module's own imports are guaranteed to provide it.
         imports += "import functools\n"
+    if "transformers." in new_source:
+        # Copied upstream modeling code can reference the transformers package
+        # itself (e.g. `transformers.PreTrainedConfig` in gemma4's modeling
+        # file), and neither the license header nor the `from {model_location}
+        # import ...` line below imports it, so a direct load of the compiled
+        # cache module dies with `name 'transformers' is not defined`.
+        imports += "import transformers\n"
     if (
         "forward_moe_backend" in new_source
         or "select_moe_backend" in new_source
