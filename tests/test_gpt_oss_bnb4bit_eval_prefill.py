@@ -133,8 +133,7 @@ def _grouped_mm_bf16():
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("which", FORWARDS)
 def test_eval_prefill_on_nf4_experts(monkeypatch, which, dtype):
-    # bf16 with torch._grouped_mm must take the grouped path; elsewhere (fp16, T4) grouped or the
-    # loop, but never the dense branch, and the output must match it.
+    # Grouped (required on bf16 + torch._grouped_mm) or the loop on fp16 / T4; never dense.
     import bitsandbytes as bnb
     from unsloth_zoo.temporary_patches import gpt_oss_grouped_qlora as gq
     if dtype is torch.bfloat16 and not torch.cuda.is_bf16_supported():
