@@ -2354,9 +2354,9 @@ def _distillation_jsd_chunk(
     valid, divisor,
     student_logit_scale, student_final_logit_softcapping,
     teacher_logit_scale, teacher_final_logit_softcapping,
-    beta, temperature,
+    beta, temperature, grad_scale,
 ):
-    """One chunk, already divided by the reduction denominator. Differentiated with ``torch.func.grad_and_value`` in the forward, so the positional order IS the argnums order: student hidden states, then head, then bias. Entropy is aux: a logged metric, not part of the objective."""
+    """One normalized chunk, scaled before ``torch.func.grad_and_value``. The positional order IS the argnums order: student hidden states, then head, then bias. The unscaled loss and entropy are auxiliary outputs."""
     student_logits = _distillation_project_logits(
         student_hidden_states, student_lm_head, student_lm_head_bias,
         student_logit_scale, student_final_logit_softcapping,
@@ -2392,7 +2392,8 @@ def _distillation_jsd_chunk(
     # The final chunk's tail holds positions packed out of the valid prefix.
     per_token_jsd = jsd.sum(dim = -1) * valid
     per_token_entropy = -(student_log_probs.exp() * student_log_probs).sum(dim = -1) * valid
-    return per_token_jsd.sum() / divisor, (per_token_entropy.sum(),)
+    loss = per_token_jsd.sum() / divisor
+    return loss * grad_scale, (loss, per_token_entropy.sum())
 pass
 
 
@@ -2473,7 +2474,7 @@ class _UnslothDistillationJSD(torch.autograd.Function):
         student_lm_head_bias, teacher_lm_head_bias,
         student_logit_scale, teacher_logit_scale,
         student_final_logit_softcapping, teacher_final_logit_softcapping,
-        temperature,
+        temperature, scaling,
     ):
         flat_student = student_hidden_states.reshape(-1, student_hidden_states.shape[-1])
         flat_teacher = teacher_hidden_states.reshape(-1, teacher_hidden_states.shape[-1])
@@ -2512,7 +2513,7 @@ class _UnslothDistillationJSD(torch.autograd.Function):
             flat_teacher = torch.cat([flat_teacher, flat_teacher.new_zeros(pad, flat_teacher.shape[-1])])
             sorted_valid = torch.cat([sorted_valid, sorted_valid.new_zeros(pad)])
 
-        # Divide inside the chunk so the accumulated gradient needs no rescale.
+        # Apply the reduction inside each chunk.
         if num_items_in_batch is None:
             # Clamped for the same reason a chunk always runs below: a fully
             # masked batch has to reduce to a finite zero rather than 0 / 0.
@@ -2549,16 +2550,20 @@ class _UnslothDistillationJSD(torch.autograd.Function):
 
         loss = flat_student.new_zeros((), dtype = torch.float32)
         entropy_sum = flat_student.new_zeros((), dtype = torch.float32)
+        # Scale before differentiation: saving an unscaled FP16 gradient can
+        # underflow before the outer GradScaler ever reaches backward.
+        grad_scale = loss.new_tensor(scaling)
+        ctx.scaling = scaling
 
         for start in range(0, n_padded, chunk_size):
             stop = start + chunk_size
-            grads, (chunk_loss, (chunk_entropy,)) = grad_fn(
+            grads, (_, (chunk_loss, chunk_entropy)) = grad_fn(
                 flat_student[start : stop], student_lm_head, student_lm_head_bias,
                 flat_teacher[start : stop], teacher_lm_head, teacher_lm_head_bias,
                 sorted_valid[start : stop].to(flat_student.dtype), divisor,
                 student_logit_scale, student_final_logit_softcapping,
                 teacher_logit_scale, teacher_final_logit_softcapping,
-                beta, temperature,
+                beta, temperature, grad_scale,
             )
             grad_hidden[start : stop] = grads[0]
             if head_position is not None:
@@ -2586,6 +2591,7 @@ class _UnslothDistillationJSD(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output, _grad_entropy, _grad_n_valid):
         grad_hidden, grad_head, grad_bias = ctx.saved_tensors
+        grad_output = grad_output / ctx.scaling
         # Saved as empty rather than None: save_for_backward rejects None, and an
         # empty tensor is the cheap way to say "this input was not trainable".
         return (
@@ -2594,7 +2600,7 @@ class _UnslothDistillationJSD(torch.autograd.Function):
             grad_output * grad_head if grad_head.numel() != 0 else None,
             None, None, None, None, None,
             grad_output * grad_bias if grad_bias.numel() != 0 else None,
-            None, None, None, None, None, None,
+            None, None, None, None, None, None, None,
         )
 pass
 
@@ -2615,6 +2621,7 @@ def distillation_chunked_jsd(
     student_final_logit_softcapping: float = 0.0,
     teacher_final_logit_softcapping: float = 0.0,
     temperature: float = 1.0,
+    scaler = None,
 ):
     """Memory efficient generalized JSD between a student and a frozen teacher.
 
@@ -2642,6 +2649,8 @@ def distillation_chunked_jsd(
         num_items_in_batch: total valid tokens across the global batch. When given
             the reduction is ``sum / num_items_in_batch``, which is what makes
             gradient accumulation exact; when ``None`` it is the local mean.
+        scaler: current GradScaler, applied before the chunk gradients are
+            computed. The returned loss remains unscaled.
     Returns:
         ``(loss, entropy_sum, n_valid_tokens)``. The last two are raw local sums so
         a distributed caller can reduce them itself.
@@ -2653,7 +2662,7 @@ def distillation_chunked_jsd(
         student_lm_head_bias, teacher_lm_head_bias,
         student_logit_scale, teacher_logit_scale,
         student_final_logit_softcapping, teacher_final_logit_softcapping,
-        temperature,
+        temperature, scaler.get_scale() if scaler is not None else 1.0,
     )
 pass
 RL_REPLACEMENTS["distillation_chunked_jsd"] = distillation_chunked_jsd
