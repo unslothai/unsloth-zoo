@@ -105,6 +105,13 @@ res['patched_peft'] = run(wrapped())
 G.restore_gpt_oss_original()
 res['stock'] = run(build())
 res['stock_peft'] = run(wrapped())
+# The compiler retargets the spec by name to its compiled router; a later patch + restore (a bf16 load in the
+# same process) must still capture the stock router.
+spec = M.GptOssPreTrainedModel._can_record_outputs['router_logits']
+spec.target_class = type('GptOssTopKRouter', (torch.nn.Module,), {})
+G.patch_gpt_oss_bnb4bit()
+G.restore_gpt_oss_original()
+res['stock_after_retarget'] = run(build())
 print('RESULT ' + json.dumps(res))
 """
 
@@ -138,4 +145,6 @@ def test_bnb4bit_router_swap_keeps_router_logits_without_compile():
     assert res["stock"]["error"] is None and res["stock"]["n_router_logits"] == 4, res
     assert res["stock"]["match_reference"], res
     assert res["stock_peft"]["n_router_logits"] == 4 and res["stock_peft"]["match_reference"], res
+    assert res["stock_after_retarget"]["n_router_logits"] == 4, res
+    assert res["stock_after_retarget"]["match_reference"], res
     assert res["target_widened"], res

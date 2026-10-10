@@ -1553,8 +1553,12 @@ def _record_gpt_oss_router_logits(router_cls):
     if not isinstance(target, type):
         return
     members = getattr(target, "_members", (target,))
-    if router_cls not in members:
-        spec.target_class = _AnyRouterClass(target.__name__, (), {"_members": members + (router_cls,)})
+    # The saved stock router too: the compiler retargets by name, dropping it, and restore_gpt_oss_original
+    # brings it back for a later bf16 load in the same process.
+    stock = getattr(modeling, "_original_GptOssTopKRouter", None)
+    missing = tuple(c for c in (stock, router_cls) if isinstance(c, type) and c not in members)
+    if missing:
+        spec.target_class = _AnyRouterClass(target.__name__, (), {"_members": members + missing})
 
 
 def _gpt_oss_class_is_bnb4bit(cls):
