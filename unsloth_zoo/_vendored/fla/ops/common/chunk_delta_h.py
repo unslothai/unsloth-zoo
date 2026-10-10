@@ -363,6 +363,7 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
     USE_FINAL_STATE_GRADIENT: tl.constexpr,
     STATE_V_FIRST: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    LONG_INDEXING: tl.constexpr = False,
 ):
     # Unsloth: backported from fla PR #1077. N*HV on grid axis 1 hit the 65535
     # block cap, so a varlen batch of more than 65535/HV sequences failed to
@@ -468,6 +469,8 @@ def chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64(
             tl.store(p_dh4, b_dh4.to(p_dh4.dtype.element_ty), boundary_check=(0, 1))
 
         last_idx = min((i_t + 1) * BT, T) - 1
+        if LONG_INDEXING:
+            last_idx = last_idx.to(tl.int64)
         if USE_G:
             bg_last = tl.load(g + (bos + last_idx) * HV + i_h).to(tl.float32)
             p_g = tl.make_block_ptr(g + bos * HV + i_h, (T,), (HV,), (i_t * BT,), (BT,), (0,))
@@ -744,5 +747,6 @@ def chunk_gated_delta_rule_bwd_dhu(
         V=V,
         BT=BT,
         STATE_V_FIRST=state_v_first,
+        LONG_INDEXING=gk is not None and T * HV * K > 2**31,
     )
     return dh, dh0, dv2

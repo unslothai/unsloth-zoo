@@ -196,13 +196,15 @@ modifications =
     - Sequence start offsets past 2**31 elements (fixed upstream after 0.5.1 by
       fla PR #1329, which forces int64 program ids everywhere). In
       ops/gated_delta_rule/chunk_fwd.py, ops/kda/{chunk_bwd,chunk_intra,
-      chunk_intra_token_parallel,wy_fast}.py, ops/utils/cumsum.py and
+      chunk_intra_token_parallel,gate,wy_fast}.py, ops/utils/cumsum.py and
       ops/common/chunk_delta_h.py, kernels that add `bos * H * K`-style offsets
-      in int32 take a LONG_INDEXING constexpr that widens `bos` to int64 only
-      when the launcher's shapes can pass 2**31 elements, so normal sizes keep
-      the int32 code (forced int64 is slower). Without it a packed batch or a
-      batch whose later sequences start past 2**31 / (heads * 128) tokens
-      silently returned wrong outputs and gradients (KDA: non-finite).
+      (and the dhu backward's in-sequence `last_idx * HV * K`) in int32 take a
+      LONG_INDEXING constexpr that widens them to int64 only when the
+      launcher's shapes can pass 2**31 elements, so normal sizes keep the int32
+      code (forced int64 is slower). Without it a packed batch, a batch whose
+      later sequences start past 2**31 / (heads * 128) tokens, or a single KDA
+      sequence that long silently returned wrong outputs and gradients (KDA:
+      non-finite).
     - Dropped fla/ops/gated_delta_rule/naive.py (the only einops dependency; the
       reference implementation is unused on the fast path).
     - Dropped the three heavy tilelang kernel files
