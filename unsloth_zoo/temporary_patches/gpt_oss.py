@@ -1516,6 +1516,7 @@ def patch_gpt_oss_bnb4bit():
     # but transformers v5 bypasses it (accelerate's set_module_tensor_to_device), so weights
     # stayed randomly initialized -> high loss (~4-5).
     transformers.models.gpt_oss.modeling_gpt_oss.GptOssTopKRouter = GptOssTopKRouter
+    _record_gpt_oss_router_logits(GptOssTopKRouter)
 
     logger.info("Unsloth: Patched GPT OSS with BitsAndBytes 4bit compatible classes")
     os.environ["UNSLOTH_GPT_OSS_BNB4BIT_PATCHED"] = "1"
@@ -1533,6 +1534,29 @@ def patch_gpt_oss_bnb4bit():
 
 
 pass
+
+
+class _AnyRouterClass(type):
+    # Keeps the stock __name__: the unsloth compiler and transformers patch mappings retarget by name.
+    def __instancecheck__(cls, obj):
+        return isinstance(obj, cls._members)
+
+
+def _record_gpt_oss_router_logits(router_cls):
+    # The stock forward (UNSLOTH_COMPILE_DISABLE) records by isinstance on the router class the BnB swap
+    # replaced. Widened in place for registries holding the spec; a path match double-captures PEFT routers.
+    import transformers.models.gpt_oss.modeling_gpt_oss as modeling
+    recorders = getattr(modeling.GptOssPreTrainedModel, "_can_record_outputs", None)
+    spec = recorders.get("router_logits") if isinstance(recorders, dict) else None
+    target = getattr(spec, "target_class", None)
+    if not isinstance(target, type):
+        return
+    members = getattr(target, "_members", (target,))
+    # Plus the saved stock router: a compiler retarget drops it, a later bf16 load restores it.
+    stock = getattr(modeling, "_original_GptOssTopKRouter", None)
+    missing = tuple(c for c in (stock, router_cls) if isinstance(c, type) and c not in members)
+    if missing:
+        spec.target_class = _AnyRouterClass(target.__name__, (), {"_members": members + missing})
 
 
 def _gpt_oss_class_is_bnb4bit(cls):
@@ -4404,7 +4428,13 @@ def patch_gpt_oss_for_grpo(phase="post_compile"):
             # This Unsloth Zoo code section is licensed under AGPL3
 
             # Generation passes a per-type mask mapping load_balancing_loss_func cannot read, and no labels.
-            if isinstance(attention_mask, dict) and labels is None:
+            # transformers 4.x sizes a 2D cached-decode mask against new-token router logits (RuntimeError).
+            tokens = input_ids if input_ids is not None else inputs_embeds
+            cached_decode = (
+                isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 2
+                and tokens is not None and attention_mask.shape[1] > tokens.shape[1]
+            )
+            if labels is None and (isinstance(attention_mask, dict) or cached_decode):
                 kwargs["output_router_logits"] = False
 
             RETURN_HIDDEN_STATES = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
