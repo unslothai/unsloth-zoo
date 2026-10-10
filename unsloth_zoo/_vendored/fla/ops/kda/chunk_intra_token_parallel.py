@@ -73,7 +73,6 @@ def chunk_kda_fwd_kernel_intra_token_parallel(
     else:
         bos = (i_tg // T) * T
         i_t = i_tg % T
-    # Unsloth: fla PR #1329 (int32 bos offsets wrap past 2**31), gated so normal sizes stay int32.
     if LONG_INDEXING:
         bos = bos.to(tl.int64)
 

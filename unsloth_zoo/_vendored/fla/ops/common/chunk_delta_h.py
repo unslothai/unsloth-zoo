@@ -96,7 +96,6 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
         bos, eos = i_n * T, i_n * T + T
         NT = tl.cdiv(T, BT)
         boh = i_n * NT
-    # Unsloth: fla PR #1329 (int32 bos offsets wrap past 2**31), gated so normal sizes stay int32.
     if LONG_INDEXING:
         bos = bos.to(tl.int64)
 

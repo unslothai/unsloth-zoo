@@ -65,7 +65,6 @@ def recompute_w_u_fwd_kda_kernel(
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
-    # Unsloth: fla PR #1329 (int32 bos offsets wrap past 2**31), gated so normal sizes stay int32.
     if LONG_INDEXING:
         bos = bos.to(tl.int64)
 
