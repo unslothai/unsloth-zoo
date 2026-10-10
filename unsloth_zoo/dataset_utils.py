@@ -2856,7 +2856,13 @@ def sft_prepare_dataset(
             training_chat_template = getattr(self, "chat_template", None)
             # Set by Unsloth when TRL has no training template for this chat template (Unsloth's own
             # templates are not in TRL's exact-text table): mask with train_on_responses_only markers.
-            marker_masks = assistant_only_loss and getattr(self, "_unsloth_assistant_mask_fallback", False)
+            # Also when the template in use renders no {% generation %} markers (TRL < 1.7 never swaps
+            # one in): return_assistant_tokens_mask would be all zeros and train nothing.
+            import re as _re
+            marker_masks = assistant_only_loss and (
+                getattr(self, "_unsloth_assistant_mask_fallback", False) or
+                _re.search(r"\{%-?\s*generation\s*-?%\}", training_chat_template or chat_template or "") is None
+            )
             response_labels = None
             if marker_masks:
                 from unsloth_zoo.dataset_utils import train_on_responses_only as _response_labels

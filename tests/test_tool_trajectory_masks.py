@@ -170,3 +170,12 @@ def test_messages_dataset_without_assistant_only_loss_trains_everything():
     expected = tokenizer.apply_chat_template(CONVERSATION, tools = TOOLS, tokenize = True, return_dict = True)["input_ids"]
     assert input_ids == list(expected)
     assert all(label != -100 for label in labels)
+
+
+@pytest.mark.parametrize("repo", ["unsloth/Qwen3-0.6B", "unsloth/Llama-3.2-1B-Instruct"])
+def test_messages_dataset_assistant_only_loss_without_generation_markers(repo):
+    # TRL before 1.7 never swaps a training template and Unsloth sets no fallback flag there, so a
+    # template without {% generation %} must still mask by markers instead of training on nothing.
+    tokenizer = _tokenizer(repo)
+    input_ids, labels = _prepare(tokenizer, chat_template = None, fallback = False)
+    _assert_trajectory_masks(_trained_text(tokenizer, input_ids, labels))
