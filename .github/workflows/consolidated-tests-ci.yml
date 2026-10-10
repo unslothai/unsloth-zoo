@@ -933,6 +933,18 @@ jobs:
       # gradient regression from #776 and the consumer-binding sweep shipped
       # ungated. They need mlx core plus mlx-lm, not Metal, so they belong here;
       # the Metal-only halves skip and stay the macOS lane's job.
+      - name: tests/test_mlx_qat.py
+        run: >-
+          .lanes/venv-suites/bin/python -m pytest tests/test_mlx_qat.py -v -rs
+          --junitxml="$RUNNER_TEMP/mlx-reports/qat.xml"
+
+      - name: Fail if the QAT tests skipped
+        run: |
+          python3 scripts/pytest_junit_gate.py \
+            --report "$RUNNER_TEMP/mlx-reports/qat.xml" \
+            --require no-skips \
+            --message "real mlx is installed but the QAT tests skipped"
+
       - name: tests/test_mlx_gated_delta.py
         run: .lanes/venv-suites/bin/python -m pytest tests/test_mlx_gated_delta.py -v -rs
 
