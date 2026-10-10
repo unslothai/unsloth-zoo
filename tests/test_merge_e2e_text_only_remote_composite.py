@@ -73,7 +73,7 @@ _LLM = dict(hidden_size = 16, intermediate_size = 32, num_hidden_layers = 2, num
             num_key_value_heads = 1, vocab_size = 64, max_position_embeddings = 64, tie_word_embeddings = False)
 
 
-def _write_base(tmp_path):
+def _write_base(tmp_path, model_type = "tiny_omni_zoo"):
     import transformers as T
     from safetensors.torch import save_file
     base = os.path.join(str(tmp_path), "base")
@@ -81,7 +81,7 @@ def _write_base(tmp_path):
     open(os.path.join(base, "configuration_tiny_omni.py"), "w").write(_CONFIGURATION)
     open(os.path.join(base, "modeling_tiny_omni.py"), "w").write(_MODELING)
     json.dump({
-        "model_type": "tiny_omni_zoo", "architectures": ["TinyOmni"],
+        "model_type": model_type, "architectures": ["TinyOmni"],
         "auto_map": {"AutoConfig": "configuration_tiny_omni.TinyOmniConfig",
                      "AutoModel": "modeling_tiny_omni.TinyOmni",
                      "AutoModelForCausalLM": "modeling_tiny_omni.TinyOmni"},
@@ -143,6 +143,21 @@ def test_remote_composite_export_is_the_composite_with_its_code(tmp_path):
     with torch.no_grad():
         got = reloaded.language_model(input_ids = ids).logits
     torch.testing.assert_close(got, trained, atol = 1e-4, rtol = 1e-4)
+
+
+def test_checkpoint_model_type_survives_a_different_config_class_type(tmp_path):
+    # DeepSeek-OCR: config.json says `deepseek_vl_v2`, `DeepseekOCRConfig.model_type` is
+    # `DeepseekOCR`; vLLM only loads the former (#3911).
+    import transformers as T
+    H.set_offline_cpu_env()
+    os.environ["HF_MODULES_CACHE"] = os.path.join(str(tmp_path), "modules")
+    base, state = _write_base(tmp_path, model_type = "tiny_vl_zoo")
+    out = os.path.join(str(tmp_path), "merged")
+    H.run_merge(_text_only_peft(base, state, trusted = True), base, out, save_dtype = torch.float32)
+    assert json.load(open(os.path.join(out, "config.json")))["model_type"] == "tiny_vl_zoo"
+    reloaded = T.AutoModel.from_pretrained(out, trust_remote_code = True, local_files_only = True,
+                                           dtype = torch.float32)
+    assert type(reloaded).__name__ == "TinyOmni"
 
 
 def test_untrusted_load_keeps_the_warned_fallback(tmp_path):
@@ -301,3 +316,16 @@ def test_pinned_revision_applies_to_same_repo_code_only():
     from transformers import dynamic_module_utils as D
     src = inspect.getsource(D.get_class_from_dynamic_module)
     assert "if code_revision is None and pretrained_model_name_or_path == repo_id:" in src
+
+
+def test_hub_model_type_is_read_at_the_loaded_commit(monkeypatch, tmp_path):
+    import huggingface_hub
+    from unsloth_zoo import saving_utils as S
+    config = os.path.join(str(tmp_path), "config.json")
+    json.dump({"model_type": "tiny_vl_zoo"}, open(config, "w"))
+    asked = []
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download",
+                        lambda **kw: asked.append(kw["revision"]) or config)
+    assert S._source_config_model_type("org/repo", None, "abc123") == "tiny_vl_zoo"
+    assert S._source_config_model_type("org/repo@dev", None, "abc123") == "tiny_vl_zoo"
+    assert asked == ["abc123", "dev"]

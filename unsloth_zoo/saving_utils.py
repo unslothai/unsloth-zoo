@@ -3794,6 +3794,39 @@ def _copy_export_remote_code(model_name, save_directory, token, model):
 pass
 
 
+def _source_config_model_type(model_name, token = None, commit = None):
+    # `commit` pins a moved branch to the loaded revision.
+    try:
+        if os.path.isdir(str(model_name)):
+            path = os.path.join(str(model_name), "config.json")
+        else:
+            from huggingface_hub import hf_hub_download
+            repo_id, revision = _hub_repo_and_revision(model_name)
+            path = hf_hub_download(repo_id = repo_id, filename = "config.json", token = token,
+                                   revision = revision or commit)
+        with open(path, "r", encoding = "utf-8") as f:
+            model_type = json.load(f).get("model_type")
+    except Exception:
+        return None
+    return model_type if isinstance(model_type, str) and model_type else None
+pass
+
+
+def _restore_source_model_type(config_path, model_type):
+    # Repo-code configs write their class `model_type` (`DeepseekOCR`); vLLM needs the checkpoint's (#3911).
+    if model_type is None or not config_path.exists(): return
+    try:
+        with open(config_path, "r", encoding = "utf-8") as f:
+            config = json.load(f)
+    except Exception:
+        return
+    if config.get("model_type") == model_type: return
+    config["model_type"] = model_type
+    with open(config_path, "w", encoding = "utf-8") as f:
+        json.dump(config, f, indent = 4)
+pass
+
+
 def _text_configs(config):
     # Where a composite config keeps its text vocab. `get_text_config()` also finds sections
     # not named `text_config` (qwen2_5_omni, t5gemma); it returns `config` itself for a plain LM.
@@ -5017,8 +5050,14 @@ def merge_and_overwrite_lora(
             base_config = config
         else:
             _carry_over_vocab_size(base_config, config)
+        # Read before saving: an in-place export overwrites the source config.json.
+        source_model_type = None
+        if _is_remote_code_config(base_config):
+            loaded_commit = _trusted_code_commit(model) if _is_export_source_loaded_repo(model_name, model) else None
+            source_model_type = _source_config_model_type(model_name, token, loaded_commit)
         base_config.save_pretrained(save_directory)
         if _is_remote_code_config(base_config):
+            _restore_source_model_type(Path(save_directory) / "config.json", source_model_type)
             _copy_export_remote_code(model_name, save_directory, token, model)
         _remove_quantization_config(config_path = Path(save_directory) / "config.json")
         _remove_transformers_version(config_path = Path(save_directory) / "config.json")
