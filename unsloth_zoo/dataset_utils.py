@@ -2867,9 +2867,14 @@ def sft_prepare_dataset(
             # Also when the template in use renders no {% generation %} markers (TRL < 1.7 never swaps
             # one in): return_assistant_tokens_mask would be all zeros and train nothing.
             import re as _re
+            def _template_text(template):
+                # Named template sets ({"default": ..., "tool_use": ...}) are picked per call: check them all.
+                if isinstance(template, dict):
+                    return "\n".join(v for v in template.values() if isinstance(v, str))
+                return template or ""
             marker_masks = assistant_only_loss and (
                 getattr(self, "_unsloth_assistant_mask_fallback", False) or
-                _re.search(r"\{%-?\s*generation\s*-?%\}", training_chat_template or chat_template or "") is None
+                _re.search(r"\{%-?\s*generation\s*-?%\}", _template_text(training_chat_template or chat_template)) is None
             )
             response_labels = None
             if marker_masks:
@@ -2877,7 +2882,7 @@ def sft_prepare_dataset(
                 marker_kwargs = {}
                 # Harmony (gpt-oss) writes analysis, tool calls and the answer as separate
                 # "<|start|>assistant..." messages; auto-detection would keep only the final channel.
-                if "<|channel|>" in (getattr(tokenizer, "chat_template", None) or "") and \
+                if "<|channel|>" in _template_text(getattr(tokenizer, "chat_template", None)) and \
                     not hasattr(tokenizer, "_unsloth_output_part"):
                     marker_kwargs = dict(
                         instruction_part = "<|start|>user<|message|>",

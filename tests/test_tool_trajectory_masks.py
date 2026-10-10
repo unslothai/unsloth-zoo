@@ -223,3 +223,10 @@ def test_marker_fallback_refuses_a_formatting_func():
     formatting = lambda row: tokenizer.apply_chat_template(row["messages"], tokenize = False)
     with pytest.raises(ValueError, match = "assistant_only_loss"):
         sft_prepare_dataset(trainer, rows, tokenizer, args, False, formatting, "train")
+
+
+def test_named_template_set_does_not_break_marker_detection():
+    tokenizer = _tokenizer("unsloth/Llama-3.2-1B-Instruct")
+    tokenizer.chat_template = {"default": tokenizer.chat_template, "tool_use": tokenizer.chat_template}
+    input_ids, labels = _prepare(tokenizer, chat_template = None, fallback = False)
+    _assert_trajectory_masks(_trained_text(tokenizer, input_ids, labels))
