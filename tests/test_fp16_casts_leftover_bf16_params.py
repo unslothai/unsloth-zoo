@@ -49,3 +49,20 @@ def test_bfloat16_load_is_untouched():
     _patch(model, torch.bfloat16)
     assert model.skipped.weight.dtype == torch.bfloat16
     assert model.kept.weight.dtype == torch.float16
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
+def test_large_leftover_param_takes_the_bounded_cast(monkeypatch):
+    import unsloth_zoo.patching_utils as pu
+
+    calls = []
+    real = pu._cast_large_param
+    monkeypatch.setattr(pu, "_FORCED_FLOAT32_STAGE_BYTES", 0)
+    monkeypatch.setattr(pu, "_cast_large_param", lambda p, d: (calls.append(d), real(p, d)))
+    model = _model().cuda()
+    before = model.skipped.weight.detach().float().clone()
+    _patch(model, torch.float16)
+    assert calls and set(calls) == {torch.float16}
+    assert model.skipped.weight.dtype == torch.float16
+    assert torch.equal(model.skipped.weight.float(), before)
+    assert model.pinned.weight.dtype == torch.bfloat16

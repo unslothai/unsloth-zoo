@@ -628,9 +628,19 @@ def patch_model_and_tokenizer(
         pass
     elif correct_dtype == torch.float16:
         # A pre-quantized checkpoint keeps its skipped layers and biases in the bfloat16 it was saved in. On a GPU without bfloat16 (T4) Inductor skips every graph reading one, so a non-reentrant checkpoint recompute stops matching its forward (unsloth#3459).
+        _cast_devices = set()
         for param in model.parameters():
-            if param.dtype == torch.bfloat16 and not hasattr(param, "_pre_set_compute_dtype"):
-                param.data = param.data.to(torch.float16)
+            if param.dtype != torch.bfloat16 or hasattr(param, "_pre_set_compute_dtype"):
+                continue
+            if param.device.type == "cuda":
+                _cast_devices.add(param.device)
+                if param.numel() * param.element_size() >= _FORCED_FLOAT32_STAGE_BYTES:
+                    _cast_large_param(param, torch.float16)
+                    continue
+            param.data = param.data.to(torch.float16)
+        # The casts are async and a later empty_cache() releases cached blocks on every device, see above.
+        for _device in _cast_devices:
+            torch.cuda.synchronize(_device)
     pass
 
     # Upcast ot downcast if explicitly set
