@@ -845,8 +845,7 @@ def train_on_responses_only(
         )
     pass
 
-    # Edge trimming can cut a marker back to the opener every role shares (gpt-oss
-    # "<|start|>assistant" -> "<|start|>"), which then matches user and tool turns too.
+    # Edge trimming can cut a marker to the opener all roles share (gpt-oss "<|start|>"), matching every turn.
     if A_must == Q_must[:len(A_must)] and A_right:
         A_must, A_right = A_must + A_right, []
     if Q_must == A_must[:len(Q_must)] and Q_right:
@@ -2711,8 +2710,7 @@ def sft_prepare_dataset(
         isinstance(_first_messages := next(iter(dataset))["messages"], list) and \
         len(_first_messages) != 0 and isinstance(_first_messages[0], dict) and \
         "role" in _first_messages[0]:
-        # Conversational rows (TRL's "messages" + optional "tools"), e.g. agent trajectories. A text column
-        # cannot carry assistant masks, so assistant_only_loss reads the messages even when one exists.
+        # Text columns carry no assistant masks, so assistant_only_loss prefers "messages" even if text exists.
         do_messages = True
     elif dataset_text_field not in column_names:
         do_formatting_func = True
@@ -2720,7 +2718,6 @@ def sft_prepare_dataset(
             raise RuntimeError("Unsloth: You must specify a `formatting_func`")
     pass
     if do_tokenize and not do_messages and not do_prompt_completion and getattr(args, "assistant_only_loss", False):
-        # Formatted or plain text carries no assistant masks, so every token would silently be trained.
         raise ValueError(
             "Unsloth: assistant_only_loss needs a conversational `messages` dataset and no formatting_func. "
             "Or use `train_on_responses_only` on your formatted text."
@@ -2859,15 +2856,12 @@ def sft_prepare_dataset(
                 )
         elif do_messages:
             assistant_only_loss = bool(getattr(args, "assistant_only_loss", False))
-            # TRL's training template (prefix-preserving, {% generation %} markers) when it swapped one in.
             training_chat_template = getattr(self, "chat_template", None)
-            # Set by Unsloth when TRL has no training template for this chat template (Unsloth's own
-            # templates are not in TRL's exact-text table): mask with train_on_responses_only markers.
-            # Also when the template in use renders no {% generation %} markers (TRL < 1.7 never swaps
-            # one in): return_assistant_tokens_mask would be all zeros and train nothing.
+            # No {% generation %} markers (or no TRL training template): assistant masks would be all zeros,
+            # so mask with train_on_responses_only markers instead.
             import re as _re
             def _template_text(template):
-                # Named template sets ({"default": ..., "tool_use": ...}) are picked per call: check them all.
+                # Named template sets are picked per call: check them all.
                 if isinstance(template, dict):
                     return "\n".join(v for v in template.values() if isinstance(v, str))
                 return template or ""
@@ -2879,8 +2873,7 @@ def sft_prepare_dataset(
             if marker_masks:
                 from unsloth_zoo.dataset_utils import train_on_responses_only as _response_labels
                 marker_kwargs = {}
-                # Harmony (gpt-oss) writes analysis, tool calls and the answer as separate
-                # "<|start|>assistant..." messages; auto-detection would keep only the final channel.
+                # Harmony (gpt-oss): auto-detection would keep only the final channel, not analysis/tool calls.
                 if "<|channel|>" in _template_text(getattr(tokenizer, "chat_template", None)) and \
                     not hasattr(tokenizer, "_unsloth_output_part"):
                     marker_kwargs = dict(
@@ -2892,7 +2885,6 @@ def sft_prepare_dataset(
                 )
             truncate_messages = do_truncation and isinstance(max_seq_length, int) and max_seq_length > 0 and \
                 not locals().get("_unsloth_wrapped_packing", False)
-            # As TRL: keep_end keeps the tail, usually the final assistant answer.
             message_cut = slice(-max_seq_length, None) if truncate_messages and \
                 getattr(args, "truncation_mode", "keep_start") == "keep_end" else slice(None, max_seq_length)
             if assistant_only_loss:
@@ -2902,8 +2894,7 @@ def sft_prepare_dataset(
                 template_kwargs = dict(example.get("chat_template_kwargs") or {})
                 if training_chat_template is not None:
                     template_kwargs["chat_template"] = training_chat_template
-                # Arrow fills keys absent from some messages with None ("tool_calls": None on plain
-                # turns), which templates testing `is defined` then index: drop them.
+                # Arrow fills missing keys with None, which `is defined` template checks then index.
                 messages = [
                     {k: v for k, v in message.items() if v is not None}
                     if isinstance(message, dict) else message
@@ -2947,7 +2938,7 @@ def sft_prepare_dataset(
                     remove_columns=list(column_names), **map_kwargs,
                 )
             if assistant_only_loss:
-                # Truncation can cut every assistant token from a long prefix; such a row has no target.
+                # Truncation can drop every assistant token; such a row has no target.
                 dataset = dataset.filter(lambda row: any(row["assistant_masks"]))
         else:
             if use_desc: map_kwargs["desc"] = f'Unsloth: Tokenizing ["{dataset_text_field}"]'

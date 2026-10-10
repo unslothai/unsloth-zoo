@@ -100,8 +100,7 @@ def test_train_on_responses_only_trains_tool_calls(repo):
 
 
 def test_gpt_oss_role_marker_is_not_cut_to_shared_opener():
-    # "<|start|>assistant" used to resolve to the bare "<|start|>" opener ("assistant" was treated as an
-    # optional BPE edge), so every system, user and tool message counted as a response.
+    # "<|start|>assistant" used to resolve to bare "<|start|>", so every turn counted as a response.
     tokenizer = _tokenizer("unsloth/gpt-oss-20b")
     text = tokenizer.apply_chat_template(CONVERSATION, tools = TOOLS, tokenize = False)
     input_ids = tokenizer(text, add_special_tokens = False)["input_ids"]
@@ -178,8 +177,7 @@ def test_messages_dataset_without_assistant_only_loss_trains_everything():
 
 @pytest.mark.parametrize("repo", ["unsloth/Qwen3-0.6B", "unsloth/Llama-3.2-1B-Instruct"])
 def test_messages_dataset_assistant_only_loss_without_generation_markers(repo):
-    # TRL before 1.7 never swaps a training template and Unsloth sets no fallback flag there, so a
-    # template without {% generation %} must still mask by markers instead of training on nothing.
+    # TRL < 1.7 sets no training template: no {% generation %} must still mask by markers.
     tokenizer = _tokenizer(repo)
     input_ids, labels = _prepare(tokenizer, chat_template = None, fallback = False)
     _assert_trajectory_masks(_trained_text(tokenizer, input_ids, labels))
@@ -190,7 +188,6 @@ def test_assistant_only_loss_reads_messages_beside_a_text_column():
     text = tokenizer.apply_chat_template(CONVERSATION, tools = TOOLS, tokenize = False)
     input_ids, labels = _prepare(tokenizer, fallback = True, text = text)
     _assert_trajectory_masks(_trained_text(tokenizer, input_ids, labels))
-    # Without assistant_only_loss the text column is still what gets tokenized, as before.
     input_ids, labels = _prepare(tokenizer, assistant_only_loss = False, text = "plain text row")
     assert tokenizer.decode(input_ids).endswith("plain text row")
 
