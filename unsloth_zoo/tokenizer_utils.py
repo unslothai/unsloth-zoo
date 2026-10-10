@@ -687,9 +687,7 @@ pass
 
 def _patched_processor_reduce_ex(self, protocol):
     # All Unsloth Zoo code licensed under LGPLv3
-    # The patched subclass shares the stock class's module and name, so pickle cannot find it by
-    # reference (spawn DataLoader workers, TRL's AsyncGRPO rollout worker). Pickle as the stock
-    # class instead: the reader needs no Unsloth Zoo, and only loses the chat-template __call__.
+    # Patched class is not importable by name, so pickle as the stock class (spawn workers, AsyncGRPO).
     state = dict(self.__dict__)
     state.pop("_unsloth_patched_call", None)
     # copyreg.__newobj__ insists on the instance's own class; _reconstructor does not.
@@ -699,7 +697,7 @@ pass
 
 def _patched_processor_copy(self):
     # All Unsloth Zoo code licensed under LGPLv3
-    # Copies stay in this process, so they keep the patched class (__reduce_ex__ would drop it).
+    # In-process copies keep the patched class (__reduce_ex__ would drop it).
     new = type(self).__new__(type(self))
     new.__dict__.update(self.__dict__)
     return new

@@ -45,7 +45,6 @@ def test_pickle_round_trip_gives_the_stock_class():
     assert type(loaded) is _Processor
     assert loaded.extra == 3
     assert not hasattr(loaded, "_unsloth_patched_call")
-    # The live processor keeps its patch.
     assert processor(text = CONVERSATION)["text"] == "hi"
     assert type(processor) is not _Processor
 
