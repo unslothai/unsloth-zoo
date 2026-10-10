@@ -4724,12 +4724,22 @@ pass
 COMPILED_LORA_FORWARD = """
 torch_addmm = torch.addmm
 torch_add   = torch.add
+torch_is_compiling = torch.compiler.is_compiling
+# torch 2.8 / 2.9 inductor miscompiles addmm(alpha = scaling, beta = 1) traced inside a
+# compiled block (e.g. the VLM decoder MLP), forward and backward; fixed in 2.10 (unsloth#3271).
+torch_lora_no_compiled_addmm = tuple(int(v) for v in torch.__version__.split(".")[:2]) < (2, 10)
 # @torch.compile(fullgraph = False, dynamic = True, options = torch_compile_options)
 def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
     # Use result.dtype (bfloat16 from base layer) since x may have been cast to float32
     # by _cast_input_dtype when autocast is disabled
     target_dtype = result.dtype
     xA = dropout(x).to(target_dtype) @ lora_A.weight.to(target_dtype).t()
+    if torch_lora_no_compiled_addmm and torch_is_compiling():
+        output = result + scaling * (xA @ lora_B.weight.to(target_dtype).t())
+        bias = lora_B.bias
+        if bias is not None:
+            output = output + scaling * bias.to(target_dtype)
+        return output
     # output = result + scaling * xA @ lora_B.weight.t()
     shape = result.shape
     output = torch_addmm(
@@ -4756,6 +4766,9 @@ COMPILED_LORA_FORWARD_forced_float32 = """
 torch_addmm = torch.addmm
 torch_add   = torch.add
 torch_float16 = torch.float16
+torch_is_compiling = torch.compiler.is_compiling
+# See COMPILED_LORA_FORWARD (unsloth#3271).
+torch_lora_no_compiled_addmm = tuple(int(v) for v in torch.__version__.split(".")[:2]) < (2, 10)
 # @torch.compile(fullgraph = False, dynamic = True, options = torch_compile_options)
 def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
     xA = dropout(x.to(torch_float16)) @ lora_A.weight.to(torch_float16).t()
@@ -4764,6 +4777,12 @@ def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
     # 66795) overflows if rounded to float16 here. Float16 results take the same kernel.
     shape = result.shape
     result_dtype = result.dtype
+    if torch_lora_no_compiled_addmm and torch_is_compiling():
+        output = result + scaling * (xA.to(result_dtype) @ lora_B.weight.to(result_dtype).t())
+        bias = lora_B.bias
+        if bias is not None:
+            output = output + scaling * bias.to(result_dtype)
+        return output
     output = torch_addmm(
         result.view(-1, shape[-1]),
         xA.view(-1, xA.shape[-1]).to(result_dtype),
