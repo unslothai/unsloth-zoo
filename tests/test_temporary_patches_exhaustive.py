@@ -92,7 +92,7 @@ def _try_get_class(dotted_module: str, class_name: str):
     """Import ``dotted_module`` and return ``class_name`` off it (or None).
     Used to skip 5.0+-gated tests on a 4.x install.
 
-    ``None`` means drift, and 15 of the 23 callers below fail on it: either the
+    ``None`` means drift, and most callers below fail on it: either the
     module imported without the attribute, or a ``ModuleNotFoundError`` named
     the module we asked for. A module that exists but RAISES on the way in says
     nothing about upstream, so it skips instead. Swallowing every exception
@@ -722,23 +722,24 @@ def test_gemma4_text_mlp_has_required_attrs():
 # gemma4_moe.py: Gemma4Text{Experts,DecoderLayer,MoEBlock}{.forward,
 # .__init__}, Gemma4ForConditionalGeneration.forward. 5.0+-gated.
 
-def test_gemma4_text_experts_forward_signature():
-    """gemma4_moe.py:239 patches Gemma4TextExperts.forward(self,
-    hidden_states, top_k_index, top_k_weights)."""
-    cls = _try_get_class(
-        "transformers.models.gemma4.modeling_gemma4", "Gemma4TextExperts",
-    )
+# Each target is a 5.0+ stacked-experts class whose forward zoo rebinds; absent on 4.x.
+@pytest.mark.parametrize("module, cls_name, zoo_file, absent_note", [
+    pytest.param("transformers.models.gemma4.modeling_gemma4", "Gemma4TextExperts", "gemma4_moe.py", "5.0+-only", id = "gemma4_text_experts_forward_signature"),
+    pytest.param("transformers.models.gemma4.modeling_gemma4", "Gemma4TextMoEBlock", "gemma4_moe.py", "5.0+-only legacy MoE layout", id = "gemma4_text_moe_block_forward_signature"),
+    pytest.param("transformers.models.glm4_moe_lite.modeling_glm4_moe_lite", "Glm4MoeLiteNaiveMoe", "glm4_moe.py", "glm4_moe_lite is 5.0+-only", id = "glm4_moe_lite_naive_moe_forward_signature"),
+    pytest.param("transformers.models.glm4_moe_lite.modeling_glm4_moe_lite", "Glm4MoeLiteMoE", "glm4_moe.py", "glm4_moe_lite is 5.0+-only", id = "glm4_moe_lite_moe_forward_signature"),
+    pytest.param("transformers.models.qwen3_5_moe.modeling_qwen3_5_moe", "Qwen3_5MoeSparseMoeBlock", "qwen3_5_moe.py", "qwen3_5_moe is 5.0+-only", id = "qwen3_5_moe_sparse_moe_block_forward_signature"),
+    pytest.param("transformers.models.qwen3_5_moe.modeling_qwen3_5_moe", "Qwen3_5MoeExperts", "qwen3_5_moe.py", "qwen3_5_moe is 5.0+-only", id = "qwen3_5_moe_experts_forward_signature"),
+    pytest.param("transformers.models.qwen3_moe.modeling_qwen3_moe", "Qwen3MoeExperts", "qwen3_moe.py", "5.0+-only; zoo gracefully patches the old SparseMoeBlock instead", id = "qwen3_moe_experts_forward_signature_5x"),
+    pytest.param("transformers.models.qwen3_next.modeling_qwen3_next", "Qwen3NextExperts", "qwen3_next_moe.py", "5.0+-only", id = "qwen3_next_experts_forward_signature"),
+])
+def test_moe_forward_signature(module, cls_name, zoo_file, absent_note):
+    cls = _try_get_class(module, cls_name)
     if cls is None:
-        pytest.skip(
-            f"Gemma4TextExperts absent on transformers {_TX_VERSION} "
-            "(5.0+-only)"
-        )
-    fwd = _assert_method_exists(cls, "forward", "gemma4_moe.py")
+        pytest.skip(f"{cls_name} absent on transformers {_TX_VERSION} ({absent_note})")
+    fwd = _assert_method_exists(cls, "forward", zoo_file)
     _assert_params_superset(
-        fwd,
-        required=["hidden_states"],
-        zoo_file="gemma4_moe.py",
-        label="Gemma4TextExperts.forward",
+        fwd, required = ["hidden_states"], zoo_file = zoo_file, label = f"{cls_name}.forward",
     )
 
 
@@ -758,26 +759,6 @@ def test_gemma4_text_decoder_layer_init_signature():
         required=["config", "layer_idx"],
         zoo_file="gemma4_moe.py",
         label="Gemma4TextDecoderLayer.__init__",
-    )
-
-
-def test_gemma4_text_moe_block_forward_signature():
-    """gemma4_moe.py:301 patches Gemma4TextMoEBlock.forward(self,
-    hidden_states, top_k_index, top_k_weights)."""
-    cls = _try_get_class(
-        "transformers.models.gemma4.modeling_gemma4", "Gemma4TextMoEBlock",
-    )
-    if cls is None:
-        pytest.skip(
-            f"Gemma4TextMoEBlock absent on transformers {_TX_VERSION} "
-            "(5.0+-only legacy MoE layout)"
-        )
-    fwd = _assert_method_exists(cls, "forward", "gemma4_moe.py")
-    _assert_params_superset(
-        fwd,
-        required=["hidden_states"],
-        zoo_file="gemma4_moe.py",
-        label="Gemma4TextMoEBlock.forward",
     )
 
 
@@ -833,47 +814,6 @@ def test_gemma4_causal_lm_output_with_past_kwargs():
 
 
 # glm4_moe.py: Glm4MoeLite{NaiveMoe,MoE}.forward (5.0+-only).
-
-def test_glm4_moe_lite_naive_moe_forward_signature():
-    """glm4_moe.py:97 patches Glm4MoeLiteNaiveMoe.forward via
-    ``get_forward_moe_backend()`` (self, hidden_states, ...)."""
-    cls = _try_get_class(
-        "transformers.models.glm4_moe_lite.modeling_glm4_moe_lite",
-        "Glm4MoeLiteNaiveMoe",
-    )
-    if cls is None:
-        pytest.skip(
-            f"Glm4MoeLiteNaiveMoe absent on transformers {_TX_VERSION} "
-            "(glm4_moe_lite is 5.0+-only)"
-        )
-    fwd = _assert_method_exists(cls, "forward", "glm4_moe.py")
-    _assert_params_superset(
-        fwd,
-        required=["hidden_states"],
-        zoo_file="glm4_moe.py",
-        label="Glm4MoeLiteNaiveMoe.forward",
-    )
-
-
-def test_glm4_moe_lite_moe_forward_signature():
-    """glm4_moe.py:98 patches Glm4MoeLiteMoE.forward(self,
-    hidden_states)."""
-    cls = _try_get_class(
-        "transformers.models.glm4_moe_lite.modeling_glm4_moe_lite",
-        "Glm4MoeLiteMoE",
-    )
-    if cls is None:
-        pytest.skip(
-            f"Glm4MoeLiteMoE absent on transformers {_TX_VERSION} "
-            "(glm4_moe_lite is 5.0+-only)"
-        )
-    fwd = _assert_method_exists(cls, "forward", "glm4_moe.py")
-    _assert_params_superset(
-        fwd,
-        required=["hidden_states"],
-        zoo_file="glm4_moe.py",
-        label="Glm4MoeLiteMoE.forward",
-    )
 
 
 # gpt_oss.py: Mxfp4GptOssExperts, GptOssConfig (source-only),
@@ -1305,28 +1245,25 @@ def test_misc_quantizers_auto_module_present():
         )
 
 
-def test_misc_granitemoehybrid_class_present():
-    """misc.py:1061 patches GraniteMoeHybridMambaLayer; pin class."""
-    cls = _try_get_class(
-        "transformers.models.granitemoehybrid.modeling_granitemoehybrid",
-        "GraniteMoeHybridMambaLayer",
-    )
-    if cls is None:
-        pytest.skip(
-            f"GraniteMoeHybridMambaLayer absent on transformers {_TX_VERSION}"
-        )
-
-
-def test_misc_siglip_encoder_layer_class_present():
-    """misc.py:1228 patches SiglipEncoderLayer."""
-    cls = _try_get_class(
-        "transformers.models.siglip.modeling_siglip", "SiglipEncoderLayer",
-    )
-    if cls is None:
+@pytest.mark.parametrize("module, name, zoo_site", [
+    pytest.param("transformers.models.siglip.modeling_siglip", "SiglipEncoderLayer", "misc.py:1228", id = "misc_siglip_encoder_layer_class_present"),
+    pytest.param("transformers.models.gemma3.modeling_gemma3", "Gemma3DecoderLayer", "gemma.py", id = "gemma3_decoder_layer_class_present"),
+    pytest.param("transformers.models.gemma3.modeling_gemma3", "Gemma3TextModel", "gemma.py:233", id = "gemma3_text_model_class_present"),
+    pytest.param("transformers.models.gemma3.modeling_gemma3", "Gemma3PreTrainedModel", "gemma.py", id = "gemma3_pre_trained_model_class_present"),
+    pytest.param("transformers.models.gemma3n.modeling_gemma3n", "Gemma3nForConditionalGeneration", "gemma3n.py", id = "gemma3n_for_conditional_generation_class_present"),
+    pytest.param("transformers.models.gemma3n.modeling_gemma3n", "Gemma3nRMSNorm", "gemma3n.py:53", id = "gemma3n_RMSNorm_class_present"),
+    pytest.param("transformers.models.qwen3_moe.modeling_qwen3_moe", "Qwen3MoeRMSNorm", "qwen3_moe.py", id = "qwen3_moe_rms_norm_class_present"),
+    pytest.param("transformers.models.qwen3_moe.modeling_qwen3_moe", "Qwen3MoePreTrainedModel", "qwen3_moe.py", id = "qwen3_moe_pre_trained_model_present"),
+    pytest.param("transformers.models.qwen3_moe.modeling_qwen3_moe", "Qwen3MoeModel", "qwen3_moe.py:170", id = "qwen3_moe_model_present"),
+    pytest.param("transformers.models.qwen3_next.modeling_qwen3_next", "Qwen3NextModel", "qwen3_next_moe.py", id = "qwen3_next_model_class_present"),
+    pytest.param("transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe", "Qwen3VLMoeTextModel", "qwen3_vl_moe.py", id = "qwen3_vl_moe_text_model_class_present"),
+    pytest.param("transformers.models.pixtral.configuration_pixtral", "PixtralVisionConfig", "pixtral.py:36", id = "pixtral_vision_config_class_present"),
+])
+def test_patched_class_present(module, name, zoo_site):
+    if _try_get_class(module, name) is None:
         pytest.fail(
-            "DRIFT DETECTED: zoo temporary_patches/misc.py:1228 expects "
-            "transformers.models.siglip.modeling_siglip.SiglipEncoderLayer but "
-            f"it is missing on transformers {_TX_VERSION}"
+            f"DRIFT DETECTED: zoo temporary_patches/{zoo_site} expects {module}.{name} "
+            f"but it is missing on transformers {_TX_VERSION}"
         )
 
 
@@ -1735,16 +1672,16 @@ def test_pixtral_attention_forward_signature():
     )
 
 
-def test_pixtral_apply_rotary_pos_emb_present():
-    """pixtral.py:30 imports apply_rotary_pos_emb from modeling_pixtral;
-    re-export pin."""
-    mod = importlib.import_module(
-        "transformers.models.pixtral.modeling_pixtral"
-    )
-    if not hasattr(mod, "apply_rotary_pos_emb"):
+@pytest.mark.parametrize("module, name, zoo_site", [
+    pytest.param("transformers.models.pixtral.modeling_pixtral", "apply_rotary_pos_emb", "pixtral.py:30", id = "pixtral_apply_rotary_pos_emb_present"),
+    pytest.param("transformers.models.qwen3_moe.modeling_qwen3_moe", "MoeCausalLMOutputWithPast", "qwen3_moe.py:349", id = "qwen3_moe_for_causal_lm_output_class_present"),
+    pytest.param("transformers.quantizers.quantizer_mxfp4", "is_kernels_available", "gpt_oss.py:136", id = "gpt_oss_mxfp4_quantizer_is_kernels_available_present"),
+    pytest.param("transformers.models.gpt_oss.modeling_gpt_oss", "GptOssPreTrainedModel", "gpt_oss.py:2832", id = "gpt_oss_pretrained_model_present"),
+])
+def test_patched_module_attribute_present(module, name, zoo_site):
+    if not hasattr(importlib.import_module(module), name):
         pytest.fail(
-            "DRIFT DETECTED: zoo temporary_patches/pixtral.py:30 expects "
-            "transformers.models.pixtral.modeling_pixtral.apply_rotary_pos_emb "
+            f"DRIFT DETECTED: zoo temporary_patches/{zoo_site} expects {module}.{name} "
             f"but it is missing on transformers {_TX_VERSION}"
         )
 
@@ -1771,45 +1708,6 @@ def test_pixtral_attention_init_attrs_present():
 
 # qwen3_5_moe.py: Qwen3_5Moe{Experts,SparseMoeBlock,ForCausalLM}.forward
 # (5.0+-only).
-
-def test_qwen3_5_moe_sparse_moe_block_forward_signature():
-    """qwen3_5_moe.py:66 patches Qwen3_5MoeSparseMoeBlock.forward."""
-    cls = _try_get_class(
-        "transformers.models.qwen3_5_moe.modeling_qwen3_5_moe",
-        "Qwen3_5MoeSparseMoeBlock",
-    )
-    if cls is None:
-        pytest.skip(
-            f"Qwen3_5MoeSparseMoeBlock absent on transformers {_TX_VERSION} "
-            "(qwen3_5_moe is 5.0+-only)"
-        )
-    fwd = _assert_method_exists(cls, "forward", "qwen3_5_moe.py")
-    _assert_params_superset(
-        fwd,
-        required=["hidden_states"],
-        zoo_file="qwen3_5_moe.py",
-        label="Qwen3_5MoeSparseMoeBlock.forward",
-    )
-
-
-def test_qwen3_5_moe_experts_forward_signature():
-    """qwen3_5_moe.py:56 patches Qwen3_5MoeExperts.forward."""
-    cls = _try_get_class(
-        "transformers.models.qwen3_5_moe.modeling_qwen3_5_moe",
-        "Qwen3_5MoeExperts",
-    )
-    if cls is None:
-        pytest.skip(
-            f"Qwen3_5MoeExperts absent on transformers {_TX_VERSION} "
-            "(qwen3_5_moe is 5.0+-only)"
-        )
-    fwd = _assert_method_exists(cls, "forward", "qwen3_5_moe.py")
-    _assert_params_superset(
-        fwd,
-        required=["hidden_states"],
-        zoo_file="qwen3_5_moe.py",
-        label="Qwen3_5MoeExperts.forward",
-    )
 
 
 def test_qwen3_5_moe_for_causal_lm_class_present():
@@ -1846,25 +1744,6 @@ def test_qwen3_5_moe_for_causal_lm_class_present():
 # qwen3_moe.py: Qwen3MoeExperts.forward (5.0+),
 # Qwen3MoeForCausalLM.forward (tail).
 
-def test_qwen3_moe_experts_forward_signature_5x():
-    """qwen3_moe.py:339 patches Qwen3MoeExperts.forward(hidden_states,
-    top_k_index, top_k_weights) on 5.0+ stacked-experts branch."""
-    cls = _try_get_class(
-        "transformers.models.qwen3_moe.modeling_qwen3_moe", "Qwen3MoeExperts",
-    )
-    if cls is None:
-        pytest.skip(
-            f"Qwen3MoeExperts absent on transformers {_TX_VERSION} "
-            "(5.0+-only; zoo gracefully patches the old SparseMoeBlock instead)"
-        )
-    fwd = _assert_method_exists(cls, "forward", "qwen3_moe.py")
-    _assert_params_superset(
-        fwd,
-        required=["hidden_states"],
-        zoo_file="qwen3_moe.py",
-        label="Qwen3MoeExperts.forward",
-    )
-
 
 def test_qwen3_moe_for_causal_lm_forward_named_params():
     """qwen3_moe.py:351 patches Qwen3MoeForCausalLM.forward via
@@ -1894,42 +1773,7 @@ def test_qwen3_moe_for_causal_lm_forward_named_params():
     )
 
 
-def test_qwen3_moe_for_causal_lm_output_class_present():
-    """qwen3_moe.py:349 imports MoeCausalLMOutputWithPast from
-    modeling_qwen3_moe."""
-    mod = importlib.import_module(
-        "transformers.models.qwen3_moe.modeling_qwen3_moe"
-    )
-    if not hasattr(mod, "MoeCausalLMOutputWithPast"):
-        pytest.fail(
-            "DRIFT DETECTED: zoo temporary_patches/qwen3_moe.py:349 expects "
-            "transformers.models.qwen3_moe.modeling_qwen3_moe."
-            f"MoeCausalLMOutputWithPast but it is missing on transformers "
-            f"{_TX_VERSION}"
-        )
-
-
 # qwen3_next_moe.py: Qwen3Next{Experts,ForCausalLM}.forward tail.
-
-def test_qwen3_next_experts_forward_signature():
-    """qwen3_next_moe.py:57 patches Qwen3NextExperts.forward(self,
-    hidden_states, ...) on 5.0+."""
-    cls = _try_get_class(
-        "transformers.models.qwen3_next.modeling_qwen3_next",
-        "Qwen3NextExperts",
-    )
-    if cls is None:
-        pytest.skip(
-            f"Qwen3NextExperts absent on transformers {_TX_VERSION} "
-            "(5.0+-only)"
-        )
-    fwd = _assert_method_exists(cls, "forward", "qwen3_next_moe.py")
-    _assert_params_superset(
-        fwd,
-        required=["hidden_states"],
-        zoo_file="qwen3_next_moe.py",
-        label="Qwen3NextExperts.forward",
-    )
 
 
 def test_qwen3_next_for_causal_lm_forward_named_params():
@@ -2018,33 +1862,6 @@ def test_qwen3_vl_moe_causal_lm_output_with_past_kwargs():
             )
 
 
-def test_qwen3_vl_moe_text_top_k_router_class_present():
-    """qwen3_vl_moe.py:326 expects ``self.gate ==
-    Qwen3VLMoeTextTopKRouter`` on 5.x; tuple-unpack fallback otherwise."""
-    cls = _try_get_class(
-        "transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe",
-        "Qwen3VLMoeTextTopKRouter",
-    )
-    if cls is None:
-        # 5.x-only; zoo's tuple-unpack fallback (qwen3_vl_moe.py:333) handles.
-        pytest.skip(
-            f"Qwen3VLMoeTextTopKRouter absent on transformers {_TX_VERSION} "
-            "(zoo gracefully falls back to old-style logit gate)"
-        )
-
-
-def test_qwen3_vl_moe_text_experts_class_present():
-    """qwen3_vl_moe.py:73 imports Qwen3VLMoeTextExperts."""
-    cls = _try_get_class(
-        "transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe",
-        "Qwen3VLMoeTextExperts",
-    )
-    if cls is None:
-        pytest.skip(
-            f"Qwen3VLMoeTextExperts absent on transformers {_TX_VERSION}"
-        )
-
-
 def test_qwen3_vl_moe_act2fn_dict_present():
     """qwen3_vl_moe.py:201 imports ACT2FN; patched __init__ does
     ``self.act_fn = ACT2FN[config.hidden_act]``."""
@@ -2058,18 +1875,6 @@ def test_qwen3_vl_moe_act2fn_dict_present():
 
 # moe_utils.py / moe_bnb.py / flex_attention_bwd.py: helper modules
 # (no patch_function call sites); consumer sites covered elsewhere.
-
-def test_moe_utils_param_wrapper_target_present():
-    """moe_utils.py registers patches against
-    peft.tuners.lora.layer.ParamWrapper (split-LoRA grouped-GEMM)."""
-    peft = pytest.importorskip("peft")
-    try:
-        from peft.tuners.lora.layer import ParamWrapper  # noqa: F401
-    except Exception as exc:
-        pytest.fail(
-            "DRIFT DETECTED: zoo temporary_patches/moe_utils.py expects "
-            "peft.tuners.lora.layer.ParamWrapper but it is missing: " + str(exc)
-        )
 
 
 # misc.py additional patch sites: config-mapping, tokenizer attrs,
@@ -2162,18 +1967,6 @@ def test_misc_masking_utils_create_block_mask_available_or_compile_flag():
             )
 
 
-def test_misc_generation_utils_create_masks_for_generate():
-    """misc.py:447 reassigns
-    ``transformers.generation.utils.create_masks_for_generate``."""
-    gu = importlib.import_module("transformers.generation.utils")
-    if not hasattr(gu, "create_masks_for_generate"):
-        pytest.fail(
-            "DRIFT DETECTED: zoo temporary_patches/misc.py:447 expects "
-            "transformers.generation.utils.create_masks_for_generate but it "
-            f"is missing on transformers {_TX_VERSION}"
-        )
-
-
 def test_misc_masking_utils_padding_and_packed_helpers():
     """misc.py:472 / :490 wraps padding_mask_function /
     packed_sequence_mask_function on masking_utils (hasattr-gated)."""
@@ -2208,18 +2001,6 @@ def test_misc_sdpa_attention_forward_present():
             "DRIFT DETECTED: zoo temporary_patches/misc.py:530 expects "
             "transformers.integrations.sdpa_attention.sdpa_attention_forward "
             f"but it is missing on transformers {_TX_VERSION}"
-        )
-
-
-def test_misc_all_attention_functions_modeling_utils_top_level():
-    """misc.py:526 imports
-    ``transformers.modeling_utils.ALL_ATTENTION_FUNCTIONS``."""
-    mu = importlib.import_module("transformers.modeling_utils")
-    if not hasattr(mu, "ALL_ATTENTION_FUNCTIONS"):
-        pytest.fail(
-            "DRIFT DETECTED: zoo temporary_patches/misc.py:526 expects "
-            "transformers.modeling_utils.ALL_ATTENTION_FUNCTIONS but it is "
-            f"missing on transformers {_TX_VERSION}"
         )
 
 
@@ -2372,19 +2153,6 @@ def test_misc_apply_chat_template_signature_has_return_dict():
         )
 
 
-def test_misc_qwen2_vl_image_processor_class_present():
-    """misc.py:1485 imports Qwen2VLImageProcessor (max_pixels /
-    min_pixels properties)."""
-    cls = _try_get_class(
-        "transformers.models.qwen2_vl.image_processing_qwen2_vl",
-        "Qwen2VLImageProcessor",
-    )
-    if cls is None:
-        pytest.skip(
-            f"Qwen2VLImageProcessor absent on transformers {_TX_VERSION}"
-        )
-
-
 # gpt_oss.py additional patch sites (beyond existing tests).
 
 def test_gpt_oss_mxfp4_quantizer_class_present():
@@ -2402,18 +2170,6 @@ def test_gpt_oss_mxfp4_quantizer_class_present():
             "DRIFT DETECTED: zoo temporary_patches/gpt_oss.py:127 expects "
             "transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer but it "
             f"is missing on transformers {_TX_VERSION}"
-        )
-
-
-def test_gpt_oss_mxfp4_quantizer_is_kernels_available_present():
-    """gpt_oss.py:136 reassigns
-    ``transformers.quantizers.quantizer_mxfp4.is_kernels_available``."""
-    mod = importlib.import_module("transformers.quantizers.quantizer_mxfp4")
-    if not hasattr(mod, "is_kernels_available"):
-        pytest.fail(
-            "DRIFT DETECTED: zoo temporary_patches/gpt_oss.py:136 expects "
-            "transformers.quantizers.quantizer_mxfp4.is_kernels_available "
-            f"but it is missing on transformers {_TX_VERSION}"
         )
 
 
@@ -2451,32 +2207,6 @@ def test_gpt_oss_layer_type_validation_module_path():
             "DRIFT DETECTED: zoo temporary_patches/gpt_oss.py:2803 expects "
             "transformers.models.gpt_oss.configuration_gpt_oss.GptOssConfig "
             f"but it is missing on {_TX_VERSION}"
-        )
-
-
-def test_gpt_oss_pretrained_model_present():
-    """gpt_oss.py:2832 reads ``GptOssPreTrainedModel`` for
-    _init_weights patch."""
-    mod = importlib.import_module(
-        "transformers.models.gpt_oss.modeling_gpt_oss"
-    )
-    if not hasattr(mod, "GptOssPreTrainedModel"):
-        pytest.fail(
-            "DRIFT DETECTED: zoo temporary_patches/gpt_oss.py:2832 expects "
-            "GptOssPreTrainedModel but it is missing on transformers "
-            f"{_TX_VERSION}"
-        )
-
-
-def test_gpt_oss_model_module_dynamic_cache_present():
-    """gpt_oss.py:2126 fallback path pins
-    ``transformers.cache_utils.DynamicCache``."""
-    cu = importlib.import_module("transformers.cache_utils")
-    if not hasattr(cu, "DynamicCache"):
-        pytest.fail(
-            "DRIFT DETECTED: zoo temporary_patches/gpt_oss.py expects "
-            "transformers.cache_utils.DynamicCache but it is missing on "
-            f"transformers {_TX_VERSION}"
         )
 
 
@@ -2557,152 +2287,8 @@ def test_gpt_oss_eager_attention_forward_present():
 # gemma.py transitive deps: Gemma3DecoderLayer, Gemma3TextModel,
 # Gemma3PreTrainedModel.
 
-def test_gemma3_decoder_layer_class_present():
-    """gemma.py imports Gemma3Attention; the decoder-layer parent
-    Gemma3DecoderLayer must exist."""
-    cls = _try_get_class(
-        "transformers.models.gemma3.modeling_gemma3", "Gemma3DecoderLayer",
-    )
-    if cls is None:
-        pytest.fail(
-            "DRIFT DETECTED: gemma.py expects Gemma3DecoderLayer (parent of "
-            f"Gemma3Attention) but it is missing on transformers {_TX_VERSION}"
-        )
-
-
-def test_gemma3_text_model_class_present():
-    """gemma.py:233 references Gemma3Model; pin Gemma3TextModel
-    (LM head backbone)."""
-    cls = _try_get_class(
-        "transformers.models.gemma3.modeling_gemma3", "Gemma3TextModel",
-    )
-    if cls is None:
-        pytest.fail(
-            "DRIFT DETECTED: gemma.py expects Gemma3TextModel but it is "
-            f"missing on transformers {_TX_VERSION}"
-        )
-
-
-def test_gemma3_pre_trained_model_class_present():
-    """gemma.py touches Gemma3 surfaces; pin Gemma3PreTrainedModel base."""
-    cls = _try_get_class(
-        "transformers.models.gemma3.modeling_gemma3", "Gemma3PreTrainedModel",
-    )
-    if cls is None:
-        pytest.fail(
-            "DRIFT DETECTED: gemma.py expects Gemma3PreTrainedModel but it "
-            f"is missing on transformers {_TX_VERSION}"
-        )
-
-
-def test_gemma3_processor_kwargs_class_present():
-    """gemma.py:218 reads ``Gemma3ProcessorKwargs`` (Unpack type for
-    __call__)."""
-    mod = importlib.import_module(
-        "transformers.models.gemma3.processing_gemma3"
-    )
-    if not hasattr(mod, "Gemma3ProcessorKwargs"):
-        pytest.fail(
-            "DRIFT DETECTED: zoo temporary_patches/gemma.py:218 expects "
-            "Gemma3ProcessorKwargs but it is missing on transformers "
-            f"{_TX_VERSION}"
-        )
-
-
-def test_gemma3n_for_conditional_generation_class_present():
-    """gemma3n.py patches Gemma3nModel.get_placeholder_mask; pin
-    Gemma3nForConditionalGeneration."""
-    cls = _try_get_class(
-        "transformers.models.gemma3n.modeling_gemma3n",
-        "Gemma3nForConditionalGeneration",
-    )
-    if cls is None:
-        pytest.fail(
-            "DRIFT DETECTED: gemma3n.py expects Gemma3nForConditionalGeneration "
-            f"but it is missing on transformers {_TX_VERSION}"
-        )
-
-
-def test_gemma3n_RMSNorm_class_present():
-    """gemma3n.py:53 Gemma3nRMSNorm_forward delegate needs upstream
-    Gemma3nRMSNorm class (self.weight / self._norm references)."""
-    cls = _try_get_class(
-        "transformers.models.gemma3n.modeling_gemma3n", "Gemma3nRMSNorm",
-    )
-    if cls is None:
-        pytest.fail(
-            "DRIFT DETECTED: gemma3n.py:53 helper expects Gemma3nRMSNorm but "
-            f"it is missing on transformers {_TX_VERSION}"
-        )
-
 
 # qwen3_moe.py / qwen3_5_moe.py / qwen3_next_moe.py shared deps.
-
-def test_qwen3_moe_rms_norm_class_present():
-    """qwen3_moe.py patched forward calls .gate / .experts; pin
-    Qwen3MoeRMSNorm sibling so namespace rename surfaces."""
-    cls = _try_get_class(
-        "transformers.models.qwen3_moe.modeling_qwen3_moe", "Qwen3MoeRMSNorm",
-    )
-    if cls is None:
-        pytest.fail(
-            "DRIFT DETECTED: qwen3_moe.py expects Qwen3MoeRMSNorm class "
-            f"namespace on transformers {_TX_VERSION}"
-        )
-
-
-def test_qwen3_moe_pre_trained_model_present():
-    """qwen3_moe.py patches Qwen3MoeForCausalLM.forward; pin
-    Qwen3MoePreTrainedModel base."""
-    cls = _try_get_class(
-        "transformers.models.qwen3_moe.modeling_qwen3_moe",
-        "Qwen3MoePreTrainedModel",
-    )
-    if cls is None:
-        pytest.fail(
-            "DRIFT DETECTED: qwen3_moe.py expects Qwen3MoePreTrainedModel "
-            f"on transformers {_TX_VERSION}"
-        )
-
-
-def test_qwen3_moe_model_present():
-    """qwen3_moe.py:170-179 calls self.model(...); self.model is
-    Qwen3MoeModel."""
-    cls = _try_get_class(
-        "transformers.models.qwen3_moe.modeling_qwen3_moe", "Qwen3MoeModel",
-    )
-    if cls is None:
-        pytest.fail(
-            "DRIFT DETECTED: qwen3_moe.py:170 calls self.model(...) where "
-            "self is Qwen3MoeForCausalLM -- Qwen3MoeModel is missing on "
-            f"transformers {_TX_VERSION}"
-        )
-
-
-def test_qwen3_next_model_class_present():
-    """qwen3_next_moe.py needs inner ``Qwen3NextModel``."""
-    cls = _try_get_class(
-        "transformers.models.qwen3_next.modeling_qwen3_next", "Qwen3NextModel",
-    )
-    if cls is None:
-        pytest.fail(
-            "DRIFT DETECTED: qwen3_next_moe.py expects Qwen3NextModel on "
-            f"transformers {_TX_VERSION}"
-        )
-
-
-def test_qwen3_vl_moe_text_model_class_present():
-    """qwen3_vl_moe.py patches Qwen3VLMoeTextSparseMoeBlock; pin parent
-    Qwen3VLMoeTextModel."""
-    cls = _try_get_class(
-        "transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe",
-        "Qwen3VLMoeTextModel",
-    )
-    if cls is None:
-        pytest.fail(
-            "DRIFT DETECTED: qwen3_vl_moe.py expects Qwen3VLMoeTextModel on "
-            f"transformers {_TX_VERSION}"
-        )
 
 
 # Cache-output-class signature pins (constructed by zoo patch wrappers).
@@ -2737,17 +2323,6 @@ def test_modeling_outputs_moe_causal_lm_output_with_past_kwargs():
                 f"DRIFT DETECTED: zoo constructs MoeCausalLMOutputWithPast"
                 f"({req}=...) but installed dataclass has fields {field_names}"
             )
-
-
-def test_static_cache_class_present():
-    """gemma.py:255 isinstance(past_key_values, StaticCache)."""
-    cu = importlib.import_module("transformers.cache_utils")
-    if not hasattr(cu, "StaticCache"):
-        pytest.fail(
-            "DRIFT DETECTED: zoo temporary_patches/gemma.py:255 uses "
-            "transformers.cache_utils.StaticCache via isinstance but it is "
-            f"missing on transformers {_TX_VERSION}"
-        )
 
 
 def test_hybrid_cache_class_present():
@@ -2807,20 +2382,6 @@ def test_bitsandbytes_linear4bit_init_signature():
         zoo_file="bitsandbytes.py",
         label="bitsandbytes.nn.modules.Linear4bit.__init__",
     )
-
-
-def test_pixtral_vision_config_class_present():
-    """pixtral.py:36 reads self.config attrs; pin PixtralVisionConfig."""
-    cls = _try_get_class(
-        "transformers.models.pixtral.configuration_pixtral",
-        "PixtralVisionConfig",
-    )
-    if cls is None:
-        pytest.fail(
-            "DRIFT DETECTED: pixtral.py:36 reads self.config attrs but "
-            "PixtralVisionConfig is missing on transformers "
-            f"{_TX_VERSION}"
-        )
 
 
 def test_gemma3n_text_config_class_present():

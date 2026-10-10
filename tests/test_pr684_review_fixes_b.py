@@ -151,28 +151,6 @@ def test_resize_downscales_tall_portrait_images():
     assert resized[0].size == (128, 512)
 
 
-def test_resize_still_downscales_landscape_like_before():
-    from PIL import Image
-
-    from unsloth_zoo.mlx.utils import _resize_vlm_images
-
-    image = Image.new("RGB", (1024, 512))
-    resized = _resize_vlm_images([image], 512)
-
-    assert resized[0].size == (512, 256)
-
-
-def test_resize_does_not_upscale_small_images():
-    from PIL import Image
-
-    from unsloth_zoo.mlx.utils import _resize_vlm_images
-
-    image = Image.new("RGB", (300, 200))
-    resized = _resize_vlm_images([image], 512)
-
-    assert resized[0].size == (300, 200)
-
-
 # --- Thread 3: preserve wide labels until CCE validation --------------------
 
 

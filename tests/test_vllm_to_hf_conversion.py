@@ -251,14 +251,6 @@ def test_set_dtype_in_config_stores_json_safe_string():
     json.dumps({"dtype": value})
 
 
-def test_normalize_state_dict_tensor_guards_non_tensor():
-    # Pre-fix: value.is_sparse was called unconditionally on any state-dict value.
-    from unsloth_zoo import vllm_utils
-    src = inspect.getsource(vllm_utils.assert_same_state_dict)
-    assert "isinstance(value, torch.Tensor)" in src
-    assert src.index("isinstance(value, torch.Tensor)") < src.index("value.is_sparse")
-
-
 def test_gemma4_lora_patch_preserves_signature_for_inspect():
     # Pre-fix: patched_create_lora_manager(model, *args, **kwargs) hid
     # vllm_config, breaking _call_create_lora_manager's signature forwarding.

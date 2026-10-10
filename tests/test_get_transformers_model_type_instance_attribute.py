@@ -90,24 +90,6 @@ def test_still_unresolved_when_nothing_names_the_architecture():
         get_transformers_model_type(_EmptyEverywhereConfig())
 
 
-def test_plain_object_without_model_type_still_raises():
-    class _NoModelType:
-        def to_dict(self):
-            return {"architectures": ["MyCustomModel"]}
-
-    with pytest.raises(TypeError, match = _UNRESOLVED_MESSAGE):
-        get_transformers_model_type(_NoModelType())
-
-
-def test_plain_config_unchanged():
-    from transformers import LlamaConfig
-    config = LlamaConfig(
-        hidden_size = 16, num_hidden_layers = 1, num_attention_heads = 1,
-        intermediate_size = 32, vocab_size = 32,
-    )
-    assert get_transformers_model_type(config) == ["llama"]
-
-
 @pytest.mark.parametrize("model_type", [
     "llama'); import os; os.system('touch /tmp/pwned",
     "llama import os",

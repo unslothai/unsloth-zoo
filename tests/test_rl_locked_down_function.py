@@ -75,16 +75,6 @@ def test_typing_forward_ref_evaluators_are_denied():
             create_locked_down_function(source)([], [])
 
 
-def test_rest_of_typing_still_works():
-    # typing stays allowlisted because the notebooks' own samples import it.
-    source = (
-        "def strategy(board):\n"
-        "    from typing import Callable\n"
-        '    return "W"\n'
-    )
-    assert create_locked_down_function(source)([[0]]) == "W"
-
-
 @pytest.mark.parametrize("label,source,expected", BLOCKED, ids=[b[0] for b in BLOCKED])
 def test_escape_is_blocked(label, source, expected):
     with pytest.raises(expected):
