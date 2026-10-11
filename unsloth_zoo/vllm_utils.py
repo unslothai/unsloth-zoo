@@ -2229,6 +2229,7 @@ def approximate_vllm_memory_usage(
     parallel_sequences = 64,
     cuda_graph_overhead = True,
     weight_bytes = None,
+    max_num_batched_tokens = 8192, # chunked prefill budget; sliding-window layers keep window + 2x this
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     # Gets approximate max model length and max num sequences
@@ -2254,7 +2255,7 @@ def approximate_vllm_memory_usage(
     # Group Query Attention. head_dim is not always hidden_size / heads (Qwen3, Gemma-3, gpt-oss).
     # Per-layer (Gemma-4) head_dim raises: keep hidden_size / heads for the weight formula there.
     # MLA (DeepSeek-V2/V3) sets head_dim to the rope part only (64 of a 192 wide query head), so it
-    # would shrink the activation reserve: keep hidden_size / heads there.
+    # would shrink the projection / LoRA shapes: keep hidden_size / heads there.
     try:
         head_dim = None if getattr(config, "kv_lora_rank", None) else getattr(config, "head_dim", None)
     except Exception:
@@ -2308,7 +2309,10 @@ def approximate_vllm_memory_usage(
 
     # Activation memory - assume bsz=2
     bsz = 2
-    activation_qkv  = max_seq_length * bsz * (q_size + kv_size + kv_size)
+    # Kept on hidden_size / heads: this reserve sets the gpu_memory_utilization handed to vLLM, and the
+    # real head_dim (wider q on Qwen3) shrank it enough to fail long-context loads that work on main.
+    kv_size_hidden  = hd // n_heads * n_kv_heads
+    activation_qkv  = max_seq_length * bsz * (hd + kv_size_hidden + kv_size_hidden)
     residual_memory = (max_seq_length * bsz)*2
     activation_mlp  = max_seq_length * bsz * (mlp_size + mlp_size)
     weights = mlp_size * hd
@@ -2358,6 +2362,7 @@ def approximate_vllm_memory_usage(
         full_kv_elements * float_bytes,
         [(window, elements * float_bytes) for window, elements in sliding_kv_elements],
         context_length,
+        in_flight_tokens = 2 * max(int(max_num_batched_tokens or 0), 8192),
     )
     # Round by 256
     max_num_batched_tokens = (max_num_batched_tokens // 256) * 256
@@ -3414,6 +3419,13 @@ def load_vllm(
         account_for_gradients = training,
         weight_bytes = vllm_weights_memory_usage(
             config, load_in_4bit = use_bitsandbytes, load_in_8bit = is_fp8,
+        ),
+        # Vision models chunk max(8192, max_seq_length) tokens per step, and an explicit budget is
+        # used as given; sliding-window layers hold that many in-flight tokens past their window.
+        max_num_batched_tokens = max(
+            8192,
+            max_seq_length if is_vision_model else 0,
+            int(requested_max_num_batched_tokens or 0),
         ),
     )
 

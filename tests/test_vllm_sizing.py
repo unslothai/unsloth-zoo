@@ -77,9 +77,9 @@ def test_mla_caches_one_latent(monkeypatch):
     assert tokens == _tokens(kv_gb, 27 * 576 * 2)
 
 
-def test_mla_rope_head_dim_keeps_the_activation_reserve(monkeypatch):
-    # DeepSeek-V2 configs set head_dim to the rope width (64 of a 192 wide query head); reading it
-    # would shrink the training activation reserve and hand vLLM more memory than on main.
+def test_mla_rope_head_dim_is_not_the_query_width(monkeypatch):
+    # DeepSeek-V2 configs set head_dim to the rope width (64 of a 192 wide query head); it must not
+    # shrink the projection / LoRA shapes below main's hidden_size / heads.
     def mla(**kw):
         return _config(kv_lora_rank = 512, qk_rope_head_dim = 64, num_attention_heads = 16,
                        num_key_value_heads = 16, hidden_size = 2048, **kw)
@@ -87,7 +87,32 @@ def test_mla_rope_head_dim_keeps_the_activation_reserve(monkeypatch):
     run = lambda c: vllm_utils.approximate_vllm_memory_usage(
         c, max_seq_length = 32768, weight_bytes = 8 * GiB, gpu_memory_utilization = 0.9,
     )
-    assert run(mla(head_dim = 64))[2] == run(mla())[2]
+    assert run(mla(head_dim = 64)) == run(mla())
+
+
+def test_head_dim_leaves_the_vllm_memory_share_alone(monkeypatch):
+    # The training activation reserve sets the gpu_memory_utilization vLLM gets. Reading Qwen3's
+    # wider query (32 x 128 > 2560) there cut it and failed long-context loads that work on main
+    # (Qwen3-4B, max_seq_length 53248, L4).
+    monkeypatch.setattr(vllm_utils, "get_mem_info", lambda: (22 * GiB, 22 * GiB))
+    run = lambda c: vllm_utils.approximate_vllm_memory_usage(
+        c, max_seq_length = 53248, weight_bytes = 8 * GiB, gpu_memory_utilization = 0.9,
+    )[2]
+    assert run(_config(head_dim = 128)) == run(_config())
+
+
+def test_sliding_layers_hold_the_whole_prefill_budget(monkeypatch):
+    # Vision models chunk max(8192, max_seq_length) tokens, so vLLM keeps window - 1 + 2 x that per
+    # sliding layer: with a 32768 budget every layer grows over the whole sequence.
+    layer_types = (["sliding_attention"] * 5 + ["full_attention"]) * 5 + ["sliding_attention"] * 4
+    config = _config(num_hidden_layers = 34, num_attention_heads = 8, num_key_value_heads = 4,
+                     head_dim = 256, sliding_window = 1024, layer_types = layer_types)
+    monkeypatch.setattr(vllm_utils, "get_mem_info", lambda: (16 * GiB, 16 * GiB))
+    tokens, _, _, kv_gb = vllm_utils.approximate_vllm_memory_usage(
+        config, max_seq_length = 32768, weight_bytes = 8 * GiB, max_num_batched_tokens = 32768,
+    )
+    assert tokens < 1024 + 2 * 32768
+    assert tokens == _tokens(kv_gb, 34 * 2 * 4 * 256 * 2)
 
 
 def test_linear_attention_layers_hold_no_per_token_cache(monkeypatch):
