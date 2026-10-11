@@ -62,9 +62,12 @@ UNSLOTH_MXFP4_NO_DEQUANTIZE = os.environ.get("UNSLOTH_MXFP4_NO_DEQUANTIZE", "0")
 # Set when patch_GptOssAttention installs the forward that routes training through
 # flex_attention_with_sink, which builds its own BlockMask and ignores these masks.
 _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED = False
-# Eval eager attention splits the query rows when one shot's logits + float32 softmax exceed both this
-# and half the free CUDA memory; each chunk then holds up to the larger of the two.
-_EAGER_ATTENTION_CHUNK_BYTES = max(1, int(os.environ.get("UNSLOTH_GPT_OSS_ATTN_CHUNK_MB", "1024"))) << 20
+# Eval eager attention logits + float32 softmax above _EAGER_ATTENTION_CHECK_BYTES are split into
+# query chunks of half the free CUDA memory (or _EAGER_ATTENTION_CHUNK_BYTES when set). The memory
+# queries cost ~0.3 ms, so they run once per forward (layer 0) and only for large prefills.
+_EAGER_ATTENTION_CHUNK_BYTES = None
+_EAGER_ATTENTION_CHECK_BYTES = 1 << 30
+_EAGER_ATTENTION_FREE = [None, 0]
 _TRAINING_FLAG_ATTR = "_unsloth_gpt_oss_model_training"
 
 
@@ -3204,15 +3207,19 @@ def patch_GptOssAttention():
         # layer of a 4 x 4608 token gpt-oss-120b prefill. Softmax is per row, so query chunks give
         # the same rows in bounded memory.
         rows = qlen
-        if not module.training and not torch.compiler.is_compiling():
+        if qlen > 1 and not module.training and not torch.compiler.is_compiling():
             per_row = bsz * n_heads * (kvlen + 1) * (query.element_size() + 4)
             budget = _EAGER_ATTENTION_CHUNK_BYTES
-            if per_row * qlen > budget and query.is_cuda:
-                # Chunks are slower (+4.6% prefill at 4 x 4096 with 1 GiB), so only split when it would not fit.
-                free, _ = torch.cuda.mem_get_info(query.device)
-                cached = torch.cuda.memory_reserved(query.device) - torch.cuda.memory_allocated(query.device)
-                budget = max(budget, (free + cached) // 2)
-            rows = max(1, min(qlen, budget // per_row))
+            if budget is None and query.is_cuda and per_row * qlen > _EAGER_ATTENTION_CHECK_BYTES:
+                # Chunks are slower (+4.6% prefill at 4 x 4096 with 1 GiB ones), so split only when one shot would not fit.
+                key = (query.device, bsz, qlen)
+                if getattr(module, "layer_idx", 0) == 0 or _EAGER_ATTENTION_FREE[0] != key:
+                    free, _ = torch.cuda.mem_get_info(query.device)
+                    cached = torch.cuda.memory_reserved(query.device) - torch.cuda.memory_allocated(query.device)
+                    _EAGER_ATTENTION_FREE[:] = [key, free + cached]
+                budget = _EAGER_ATTENTION_FREE[1] // 2
+            if budget is not None:
+                rows = max(1, min(qlen, budget // per_row))
         if rows >= qlen:
             attn_output = _eager_attention_rows(module, query, key_states, value_states, attention_mask, scaling, dropout)
         else:

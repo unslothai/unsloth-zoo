@@ -112,7 +112,9 @@ with torch.no_grad():
 assert torch.allclose(a, b, rtol = 1e-5, atol = 1e-6)
 
 if torch.cuda.is_available():
-    # On CUDA the budget grows to half the free memory: single shot while it fits, chunks once it does not.
+    # By default the budget is half the free CUDA memory: single shot while it fits, chunks once it does not.
+    G._EAGER_ATTENTION_CHUNK_BYTES = None
+    G._EAGER_ATTENTION_CHECK_BYTES = 0
     attn, x, mask = attn.cuda(), x.cuda(), mask.cuda()
     cos_sin = tuple(t.cuda() for t in cos_sin)
     roomy, n_roomy = run()
