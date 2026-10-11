@@ -211,6 +211,30 @@ def test_fp8_experts_swap_binds_without_allocating():
     assert experts.block_size == (128, 128)
 
 
+def test_fp8_experts_swap_keeps_step3p7_swiglu_limits():
+    pytest.importorskip("transformers.integrations.finegrained_fp8", reason = "transformers without FP8")
+    from transformers.integrations import finegrained_fp8
+    if not hasattr(finegrained_fp8, "FP8Experts"):
+        pytest.skip("transformers without FP8Experts")
+    from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM
+    from unsloth_zoo.vllm_utils import _swap_in_fp8_experts
+    cfg = Qwen3MoeConfig(hidden_size = H, moe_intermediate_size = I, num_experts = E, num_hidden_layers = 2,
+                         num_attention_heads = 2, num_key_value_heads = 1, vocab_size = 32)
+    with torch.device("meta"):
+        model = Qwen3MoeForCausalLM(cfg)
+    Step3p7Experts = type("Step3p7Experts", (torch.nn.Module,), {})
+    for layer, limit in zip(model.model.layers, (7.0, float("inf"))):
+        layer.mlp.experts = Step3p7Experts()
+        layer.mlp.experts.limit = limit
+    scale = _fp8_routed().w13_weight_scale_inv.data
+    qsd = {f"model.layers.{i}.mlp.experts.gate_up_proj_scale_inv": scale for i in range(2)}
+    _swap_in_fp8_experts(model, qsd, cfg)
+    clamped, unclamped = (layer.mlp.experts for layer in model.model.layers)
+    assert isinstance(clamped, finegrained_fp8.FP8Experts) and clamped.limit == 7.0
+    assert clamped._apply_gate.__func__.__name__ == "_step3p7_apply_gate"
+    assert getattr(unclamped, "_unsloth_own_apply_gate", False) is False
+
+
 def test_missing_fp8_experts_is_refused_cleanly(monkeypatch):
     import unsloth_zoo.vllm_utils as vu
     monkeypatch.setattr(vu, "_fp8_experts_class", lambda: None)

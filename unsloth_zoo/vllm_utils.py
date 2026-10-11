@@ -1800,6 +1800,7 @@ def _swap_in_fp8_experts(new_model, quant_state_dict, config):
             "16-bit (BF16) checkpoint, or set fast_inference = False."
         )
     text_config = getattr(config, "text_config", None) or config
+    step3p7_limits = []
     for name in names:
         path = name[: -len(suffix)].replace("language_model.model", "language_model")
         old = new_model.get_submodule(path)
@@ -1808,6 +1809,12 @@ def _swap_in_fp8_experts(new_model, quant_state_dict, config):
         new.requires_grad_(False)
         new._unsloth_vllm_shared_fp8 = True
         new_model.set_submodule(path, new)
+        if type(old).__name__ == "Step3p7Experts":
+            step3p7_limits.append((new_model.get_submodule(path.rpartition(".")[0]), getattr(old, "limit", None)))
+    if step3p7_limits:
+        # As replace_with_fp8_linear's Step-3.7 wrapper: keep each layer's post-activation swiglu clamp.
+        from .temporary_patches.step3p7_moe import _adopt_step3p7_fp8_experts
+        _adopt_step3p7_fp8_experts(new_model, step3p7_limits)
 pass
 
 
