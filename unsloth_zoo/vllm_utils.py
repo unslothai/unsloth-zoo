@@ -1165,7 +1165,10 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             offsets = np.cumsum(offsets)
             scale_suffix = '.weight_scale'
             if weight_scale.ndim == 2:
-                if weight_scale.shape[1] > 1:
+                # A block scale over in_features <= block is [n, 1], the same shape as a per-row
+                # scale, so read vLLM's own block flag first (None for per-row / per-tensor).
+                is_block_quant = isinstance(getattr(proj, "weight_block_size", None), (list, tuple))
+                if is_block_quant or weight_scale.shape[1] > 1:
                     # Block quantized: 2D weight scale. vLLM stores it transposed
                     # vs what HF expects (e.g. qwen3 qkv [6144,4096], scale.T [48,32]).
                     scale_suffix = '.weight_scale_inv'
