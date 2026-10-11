@@ -52,7 +52,6 @@ def _tokens(kv_gb, bytes_per_token):
     return int(0.95 * kv_gb * GiB / bytes_per_token) // 256 * 256
 
 
-# ---------------------------------------------------------------- KV estimate
 def test_kv_estimate_uses_config_head_dim(monkeypatch):
     # Qwen3-4B: head_dim 128, not 2560 / 32 = 80.
     tokens, _, _, kv_gb = _estimate(monkeypatch, _config(head_dim = 128))
@@ -78,8 +77,7 @@ def test_mla_caches_one_latent(monkeypatch):
 
 
 def test_mla_rope_head_dim_is_not_the_query_width(monkeypatch):
-    # DeepSeek-V2 configs set head_dim to the rope width (64 of a 192 wide query head); it must not
-    # shrink the projection / LoRA shapes below main's hidden_size / heads.
+    # DeepSeek-V2 head_dim is the rope width only; it must not shrink projection / LoRA shapes.
     def mla(**kw):
         return _config(kv_lora_rank = 512, qk_rope_head_dim = 64, num_attention_heads = 16,
                        num_key_value_heads = 16, hidden_size = 2048, **kw)
@@ -91,9 +89,7 @@ def test_mla_rope_head_dim_is_not_the_query_width(monkeypatch):
 
 
 def test_head_dim_leaves_the_vllm_memory_share_alone(monkeypatch):
-    # The training activation reserve sets the gpu_memory_utilization vLLM gets. Reading Qwen3's
-    # wider query (32 x 128 > 2560) there cut it and failed long-context loads that work on main
-    # (Qwen3-4B, max_seq_length 53248, L4).
+    # The activation reserve sets vLLM's gpu_memory_utilization; Qwen3's real head_dim there failed Qwen3-4B 53248 on L4.
     monkeypatch.setattr(vllm_utils, "get_mem_info", lambda: (22 * GiB, 22 * GiB))
     run = lambda c: vllm_utils.approximate_vllm_memory_usage(
         c, max_seq_length = 53248, weight_bytes = 8 * GiB, gpu_memory_utilization = 0.9,
@@ -102,8 +98,7 @@ def test_head_dim_leaves_the_vllm_memory_share_alone(monkeypatch):
 
 
 def test_sliding_layers_hold_the_whole_prefill_budget(monkeypatch):
-    # Vision models chunk max(8192, max_seq_length) tokens, so vLLM keeps window - 1 + 2 x that per
-    # sliding layer: with a 32768 budget every layer grows over the whole sequence.
+    # Vision prefill budget max(8192, max_seq_length): at 32768 every sliding layer spans the sequence.
     layer_types = (["sliding_attention"] * 5 + ["full_attention"]) * 5 + ["sliding_attention"] * 4
     config = _config(num_hidden_layers = 34, num_attention_heads = 8, num_key_value_heads = 4,
                      head_dim = 256, sliding_window = 1024, layer_types = layer_types)
@@ -174,14 +169,11 @@ def test_per_layer_config_shapes(monkeypatch):
     assert sliding_elements == [(1024, 5 * 2 * 256 * 16)]
 
 
-# ---------------------------------------------------------------- max_num_seqs
 def _load_args(monkeypatch, **kwargs):
     monkeypatch.setattr(vllm_utils, "get_mem_info", lambda: (80 * GiB, 80 * GiB))
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (9, 0))
     if "vllm_version" not in vars(vllm_utils):
-        # load_vllm raises ImportError without vLLM, and past that guard it patches vLLM's own
-        # modules, so these engine-arg checks cannot run on a CPU-only install. The sizing
-        # helpers above cover the vLLM-free part of this change.
+        # load_vllm imports and patches vLLM's modules, so these engine-arg checks need vLLM installed.
         pytest.skip(reason = "load_vllm needs vLLM installed: it imports and patches vLLM modules")
     config = _config(head_dim = 128, architectures = ["Qwen3ForCausalLM"], torch_dtype = "bfloat16")
     return vllm_utils.load_vllm(

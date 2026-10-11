@@ -2252,10 +2252,7 @@ def approximate_vllm_memory_usage(
     n_layers = config.num_hidden_layers
     n_kv_heads = _config_get(config, "num_key_value_heads", 1)
     n_heads    = _config_get(config, "num_attention_heads", 1)
-    # Group Query Attention. head_dim is not always hidden_size / heads (Qwen3, Gemma-3, gpt-oss).
-    # Per-layer (Gemma-4) head_dim raises: keep hidden_size / heads for the weight formula there.
-    # MLA (DeepSeek-V2/V3) sets head_dim to the rope part only (64 of a 192 wide query head), so it
-    # would shrink the projection / LoRA shapes: keep hidden_size / heads there.
+    # head_dim != hidden_size / heads on Qwen3 / Gemma-3 / gpt-oss; Gemma-4 per-layer head_dim raises and MLA head_dim is rope-only, so both keep hidden_size / heads.
     try:
         head_dim = None if getattr(config, "kv_lora_rank", None) else getattr(config, "head_dim", None)
     except Exception:
@@ -2309,8 +2306,7 @@ def approximate_vllm_memory_usage(
 
     # Activation memory - assume bsz=2
     bsz = 2
-    # Kept on hidden_size / heads: this reserve sets the gpu_memory_utilization handed to vLLM, and the
-    # real head_dim (wider q on Qwen3) shrank it enough to fail long-context loads that work on main.
+    # Stays on hidden_size / heads: it sets vLLM's gpu_memory_utilization, and the real head_dim broke long-context loads.
     kv_size_hidden  = hd // n_heads * n_kv_heads
     activation_qkv  = max_seq_length * bsz * (hd + kv_size_hidden + kv_size_hidden)
     residual_memory = (max_seq_length * bsz)*2
@@ -3420,8 +3416,7 @@ def load_vllm(
         weight_bytes = vllm_weights_memory_usage(
             config, load_in_4bit = use_bitsandbytes, load_in_8bit = is_fp8,
         ),
-        # Vision models chunk max(8192, max_seq_length) tokens per step, and an explicit budget is
-        # used as given; sliding-window layers hold that many in-flight tokens past their window.
+        # Sliding layers hold the prefill budget past their window: max(8192, max_seq_length) for vision models.
         max_num_batched_tokens = max(
             8192,
             max_seq_length if is_vision_model else 0,
@@ -3670,10 +3665,8 @@ def load_vllm(
             max_num_batched_tokens = max(max_num_batched_tokens, max_seq_length)
 
         if not explicit_max_num_seqs:
-            # float8 KV cache fits more sequences -> more throughput
             if float8_kv_cache: approx_max_num_seqs = int(approx_max_num_seqs * 1.05)
 
-            # Scale num_seqs by conservativeness
             approx_max_num_seqs = int(approx_max_num_seqs * conservativeness)
             approx_max_num_seqs = max(approx_max_num_seqs, 1)
             if vision_seq_cap is not None:
