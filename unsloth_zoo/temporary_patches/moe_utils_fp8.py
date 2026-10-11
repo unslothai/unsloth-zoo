@@ -968,14 +968,18 @@ def _release_dequantized_banks_until_backward(output, inputs, banks):
                     piece = _dequantize_full_expert_weights(piece_base, piece_quant, target.dtype, quant_kind = quant_kind)
                     target[start:end].copy_(piece)
                     del piece
+        if not input_hooked:
+            # No input gradient to wait for (frozen inputs): free once this backward pass ends.
+            torch.autograd.Variable._execution_engine.queue_callback(free)
         return None
 
     def release(grad):
         free()
         return None
 
+    input_hooked = isinstance(inputs, torch.Tensor) and inputs.requires_grad
     output.grad_fn.register_prehook(refill)
-    if isinstance(inputs, torch.Tensor) and inputs.requires_grad:
+    if input_hooked:
         inputs.register_hook(release)
     free()
 

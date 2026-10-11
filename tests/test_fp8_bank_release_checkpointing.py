@@ -108,3 +108,15 @@ def test_refill_keeps_the_block_size_of_a_non_aligned_bank():
     ref_x = x.detach().clone().requires_grad_(True)
     torch.nn.functional.linear(ref_x, reference.view(-1, hidden)).square().sum().backward()
     assert torch.equal(x.grad, ref_x.grad)
+
+
+def test_refilled_bank_is_released_when_the_expert_inputs_are_frozen(bank):
+    base, quant, refills = bank
+    x = torch.randn(3, K, dtype = torch.bfloat16)  # frozen inputs: no input hook to release on
+    scale = torch.ones((), dtype = torch.bfloat16, requires_grad = True)
+    dequantized = (base.to(torch.bfloat16) * quant).contiguous()
+    out = torch.nn.functional.linear(x * scale, dequantized.view(-1, K))
+    M._release_dequantized_banks_until_backward(out, x, ((dequantized, base, quant, None),))
+    out.float().square().sum().backward()
+    assert sum(refills) == E and scale.grad is not None
+    assert dequantized.untyped_storage().nbytes() == 0  # freed at the end of backward, not kept with the graph
