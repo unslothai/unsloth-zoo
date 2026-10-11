@@ -14,10 +14,13 @@
 from __future__ import annotations
 
 import json
+import locale
 import os
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 from unsloth_zoo.diffusion_studio import visual_engine as V
 
@@ -79,7 +82,16 @@ def test_replies_survive_a_non_utf8_locale(tmp_path):
 
 def test_request_path_keeps_the_locale_encoding(tmp_path):
     """stdin carries a path the server opens with narrow fopen: forcing UTF-8 there broke non-ASCII temp dirs."""
-    req_dir = tmp_path / "Jürgen"
+    encoding = locale.getpreferredencoding(False)
+    for name in ("Jürgen", "Дмитрий", "日本語"):  # cp1252, cp1251, cp932 users
+        try:
+            name.encode(encoding)
+            break
+        except UnicodeEncodeError:
+            continue
+    else:
+        pytest.skip(f"no non-ASCII directory name survives the {encoding} locale")
+    req_dir = tmp_path / name
     req_dir.mkdir()
     srv = V.VisualServer(str(_stub(tmp_path)), server_bin = sys.executable, req_path = str(req_dir / "request.json"))
     try:
