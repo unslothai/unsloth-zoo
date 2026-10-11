@@ -38,10 +38,11 @@ _MARK = "_unsloth_block_checkpoint_reentrant"
 _ORDER = "_unsloth_block_checkpoint_order"
 _INDEX = "_unsloth_block_checkpoint_index"
 _FORWARD = "_unsloth_block_checkpoint_forward"
-# Per-block extras that cannot be pickled or should not follow a copy: a custom checkpoint function and a forward that
-# was already patched on the instance. A copy falls back to torch's checkpoint and its class forward.
+# A custom checkpoint function may not pickle and should not follow a copy: a copy falls back to torch's checkpoint.
 _CUSTOM = weakref.WeakKeyDictionary()
-_PREVIOUS = weakref.WeakKeyDictionary()
+# A forward already patched on the instance stays in the block's own __dict__: it often references the block (accelerate's
+# hooks bind it), which a global registry would keep alive, and it copies / pickles exactly as it did before.
+_PREVIOUS = "_unsloth_block_checkpoint_previous_forward"
 
 
 class _Order:
@@ -143,7 +144,7 @@ def _accepts(method, name):
 
 
 def _inner_forward(block):
-    previous = _PREVIOUS.get(block)
+    previous = block.__dict__.get(_PREVIOUS)
     return previous if previous is not None else type(block).forward.__get__(block, type(block))
 
 
@@ -207,7 +208,7 @@ def _is_wrapped(block):
 
 def _unwrap(block):
     if _is_wrapped(block):
-        previous = _PREVIOUS.pop(block, None)
+        previous = block.__dict__.pop(_PREVIOUS, None)
         if previous is not None:
             block.forward = previous
         else:
@@ -226,7 +227,7 @@ def _wrap_blocks(model, every_n_blocks, use_reentrant, checkpoint_function):
         if index % every_n_blocks:
             continue
         if "forward" in block.__dict__:
-            _PREVIOUS[block] = block.__dict__["forward"]
+            block.__dict__[_PREVIOUS] = block.__dict__["forward"]
         if checkpoint_function is not None:
             _CUSTOM[block] = checkpoint_function
         setattr(block, _MARK, bool(use_reentrant))

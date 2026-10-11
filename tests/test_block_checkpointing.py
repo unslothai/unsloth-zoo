@@ -425,3 +425,19 @@ def test_an_enabled_diffusers_model_still_saves_whole(every_n):
     loaded = torch.load(buffer, weights_only = False)
     x = torch.randn(1, 4, requires_grad = True)
     torch.testing.assert_close(loaded(x), model(x))
+
+
+def test_a_block_with_a_self_referencing_patched_forward_is_still_freed():
+    import gc
+    import weakref
+
+    model = _Stack(2)
+    block = model.layers[0]
+    # accelerate-style patch: a partial bound to the block itself.
+    block.forward = functools.partial(lambda module, x: type(module).forward(module, x), block)
+    bc.enable_block_gradient_checkpointing(model)
+    model(torch.randn(1, 8, requires_grad = True)).sum().backward()
+    ref = weakref.ref(block)
+    del model, block
+    gc.collect()
+    assert ref() is None
