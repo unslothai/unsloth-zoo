@@ -2250,9 +2250,8 @@ def grpo_accumulated_loss(
                 device = completion_mask.device, dtype = completion_mask.dtype,
             )
 
-        # Only DeepSpeed (no Accelerate scaler) needs grad_output: undo the extra 1/GAS training_step divides by.
-        # transformers >= 5.19 skips that division when loss_is_scaled_for_ga (TRL >= 1.15 GRPO), older ones when
-        # compute_loss_func is set.
+        # DeepSpeed (no scaler) only: undo training_step's 1/GAS, which transformers >= 5.19 skips when
+        # loss_is_scaled_for_ga (TRL >= 1.15 GRPO) and older ones when compute_loss_func is set.
         upstream_scale = None
         if trainer.accelerator.scaler is None and getattr(trainer, "is_deepspeed_enabled", False):
             import transformers as _unsloth_transformers

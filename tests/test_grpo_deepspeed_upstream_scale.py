@@ -89,13 +89,11 @@ def _upstream_scale(monkeypatch, deepspeed = True, **trainer_attrs):
 
 @pytest.fixture
 def trainer_reads_the_flag(monkeypatch):
-    """transformers >= 5.19: Trainer declares loss_is_scaled_for_ga and training_step reads it."""
     monkeypatch.setattr(transformers.Trainer, "loss_is_scaled_for_ga", None, raising = False)
 
 
 @pytest.fixture
 def trainer_ignores_the_flag(monkeypatch):
-    """transformers < 5.19: no such class attribute, training_step decides from compute_loss_func."""
     if hasattr(transformers.Trainer, "loss_is_scaled_for_ga"):
         monkeypatch.delattr(transformers.Trainer, "loss_is_scaled_for_ga")
 
