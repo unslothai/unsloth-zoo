@@ -140,3 +140,66 @@ def test_text_load_keeps_non_config_init_type_error(monkeypatch, tmp_path):
     _stub_text_load(monkeypatch, tmp_path, {"model_type": "lfm2"}, message)
     with pytest.raises(TypeError, match="output_dims"):
         loader._load_mlx_lm_with_strict_fallback("unsloth/Example", "lfm2", None, {})
+
+
+def _stub_model_args(monkeypatch, *required):
+    import dataclasses
+    import mlx_lm.utils as lm_utils
+
+    fields = [(name, object) for name in ("model_type", *required)]
+    fields.append(("hidden_size", int, dataclasses.field(default=0)))
+    args_class = dataclasses.make_dataclass("ModelArgs", fields)
+    monkeypatch.setattr(
+        lm_utils, "_get_classes", lambda config: (object, args_class), raising=False
+    )
+
+
+def _backfill(tmp_path, config, model_config=None):
+    import json
+    from unsloth_zoo.mlx.loader import _mlx_lm_config_backfill
+
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    return _mlx_lm_config_backfill("unsloth/Example", str(tmp_path), model_config or {})
+
+
+def test_backfill_restores_keys_dropped_by_resaves(monkeypatch, tmp_path):
+    # Values the transformers re-saves of unsloth/Qwen3-Coder-Next, LFM2.5-230M and ERNIE-4.5 dropped (#8126).
+    _stub_model_args(monkeypatch, "rope_theta", "block_ff_dim", "tie_word_embeddings")
+    filled = _backfill(tmp_path, {
+        "model_type": "ernie4_5",
+        "rope_parameters": {"rope_theta": 5000000, "rope_type": "default"},
+        "intermediate_size": 2560,
+    })
+    assert filled == {"rope_theta": 5000000, "block_ff_dim": 2560, "tie_word_embeddings": True}
+
+
+def test_backfill_leaves_complete_and_underivable_configs(monkeypatch, tmp_path):
+    _stub_model_args(monkeypatch, "rope_theta", "num_hidden_layers")
+    complete = {"temperature": 0.5}
+    assert _backfill(tmp_path, {"model_type": "qwen3_next", "rope_theta": 1e6}, complete) is complete
+    assert _backfill(tmp_path, {"model_type": "nemotron_h"}) == {}
+    # Explicit values and the model_config override always win.
+    assert _backfill(
+        tmp_path, {"model_type": "qwen3_next", "rope_parameters": {"rope_theta": 1}},
+        {"rope_theta": 7},
+    ) == {"rope_theta": 7}
+
+
+def test_text_load_passes_backfilled_config(monkeypatch, tmp_path):
+    import json
+    import mlx_lm.utils as lm_utils
+    import unsloth_zoo.mlx.loader as loader
+
+    _stub_model_args(monkeypatch, "block_ff_dim")
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "lfm2", "intermediate_size": 2560}))
+    monkeypatch.setattr(lm_utils, "_download", lambda *a, **k: tmp_path)
+    seen = {}
+
+    def load_model(path, lazy=False, strict=True, model_config=None):
+        seen.update(model_config)
+        raise TypeError(_LFM2_MSG)
+
+    monkeypatch.setattr(lm_utils, "load_model", load_model)
+    with pytest.raises(ValueError, match="block_ff_dim"):
+        loader._load_mlx_lm_with_strict_fallback("unsloth/LFM2.5-230M", "lfm2", None, {})
+    assert seen == {"block_ff_dim": 2560}
