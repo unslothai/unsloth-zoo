@@ -657,6 +657,209 @@ def fused_decode_conv_silu(model, *, _modules = None):
                          "_unsloth_decode_patched"):
                 module.__dict__.pop(name, None)
 
+
+# The generic kernel builder is pinned because the packed kernel repeats its arithmetic.
+_GATED_DELTA_BODIES = {"gated_delta_kernel": "84cd89879cc05264", "_make_gated_delta_kernel": "d3141d83bfd26d47",
+                       "_gated_delta_kernel": None}
+_GATED_DELTA_CONTRACT = {"mlx_vlm.models.qwen3_5.gated_delta": _GATED_DELTA_BODIES,
+                         "mlx_lm.models.gated_delta": _GATED_DELTA_BODIES}
+_GATED_DELTA_LOCK = RLock()
+_GATED_DELTA_SCOPES = {}
+_GATED_DELTA_VERDICTS = {}
+
+
+@functools.cache
+def _packed_gated_delta_kernel():
+    # The layout and reduction order of mlx-lm's packed kernel (ml-explore/mlx-lm#1559): four lanes own
+    # a value row and hold 32 state elements each, and the sums follow the tree simd_sum lowers to.
+    try:
+        if not mx.metal.is_available():
+            return None
+        return mx.fast.metal_kernel(
+            name = "unsloth_gated_delta_packed",
+            input_names = ["q", "k", "v", "g", "beta", "state_in", "T"], output_names = ["y", "state_out"],
+            source = """
+                constexpr int lanes_per_row = 4;
+                constexpr int rows_per_simdgroup = 32 / lanes_per_row;
+                constexpr int values_per_lane = Dk / lanes_per_row;
+                constexpr int partials_per_lane = values_per_lane / 4;
+
+                auto n = thread_position_in_grid.z;
+                auto b_idx = n / Hv;
+                auto hv_idx = n % Hv;
+                auto hk_idx = hv_idx / (Hv / Hk);
+
+                auto lane = thread_index_in_simdgroup;
+                auto row_in_simdgroup = lane / lanes_per_row;
+                auto lane_in_row = lane & (lanes_per_row - 1);
+                auto dv_idx = thread_position_in_grid.y * rows_per_simdgroup + row_in_simdgroup;
+
+                auto q_ = q + (b_idx * T * Hk + hk_idx) * Dk + lane_in_row * values_per_lane;
+                auto k_ = k + (b_idx * T * Hk + hk_idx) * Dk + lane_in_row * values_per_lane;
+                auto v_ = v + (b_idx * T * Hv + hv_idx) * Dv;
+                y += (b_idx * T * Hv + hv_idx) * Dv;
+                auto i_state = state_in + (n * Dv + dv_idx) * Dk + lane_in_row * values_per_lane;
+                auto o_state = state_out + (n * Dv + dv_idx) * Dk + lane_in_row * values_per_lane;
+
+                float state[values_per_lane];
+                for (int i = 0; i < values_per_lane; ++i) {
+                    state[i] = static_cast<float>(i_state[i]);
+                }
+
+                auto g_ = g + b_idx * T * Hv;
+                auto beta_ = beta + b_idx * T * Hv;
+
+                for (int t = 0; t < T; ++t) {
+                    float gt = static_cast<float>(g_[hv_idx]);
+
+                    // Each 4-element chain is one lane's sequential accumulation in the generic kernel.
+                    float part[partials_per_lane];
+                    for (int pb = 0; pb < partials_per_lane; ++pb) {
+                        float acc = 0.0f;
+                        for (int i = 0; i < 4; ++i) {
+                            int e = pb * 4 + i;
+                            state[e] = state[e] * gt;
+                            acc += state[e] * static_cast<float>(k_[e]);
+                        }
+                        part[pb] = acc;
+                    }
+                    // Butterfly levels xor 1, 2, 4 fall inside this lane; 8 and 16 are the row shuffles.
+                    float kv_mem =
+                        ((part[0] + part[1]) + (part[2] + part[3])) +
+                        ((part[4] + part[5]) + (part[6] + part[7]));
+                    kv_mem += simd_shuffle_xor(kv_mem, 1);
+                    kv_mem += simd_shuffle_xor(kv_mem, 2);
+
+                    auto delta = (static_cast<float>(v_[dv_idx]) - kv_mem) * static_cast<float>(beta_[hv_idx]);
+
+                    for (int pb = 0; pb < partials_per_lane; ++pb) {
+                        float acc = 0.0f;
+                        for (int i = 0; i < 4; ++i) {
+                            int e = pb * 4 + i;
+                            state[e] = state[e] + static_cast<float>(k_[e]) * delta;
+                            acc += state[e] * static_cast<float>(q_[e]);
+                        }
+                        part[pb] = acc;
+                    }
+                    float out =
+                        ((part[0] + part[1]) + (part[2] + part[3])) +
+                        ((part[4] + part[5]) + (part[6] + part[7]));
+                    out += simd_shuffle_xor(out, 1);
+                    out += simd_shuffle_xor(out, 2);
+                    if (lane_in_row == 0) {
+                        y[dv_idx] = static_cast<InT>(out);
+                    }
+
+                    q_ += Hk * Dk;
+                    k_ += Hk * Dk;
+                    v_ += Hv * Dv;
+                    y += Hv * Dv;
+                    g_ += Hv;
+                    beta_ += Hv;
+                }
+
+                for (int i = 0; i < values_per_lane; ++i) {
+                    o_state[i] = static_cast<StT>(state[i]);
+                }
+            """,
+        )
+    except (AttributeError, TypeError):
+        return None
+
+
+def _packed_gated_delta(q, k, v, g, beta, state):
+    B, T, Hk, Dk = k.shape
+    Hv, Dv = v.shape[2:]
+    return _packed_gated_delta_kernel()(
+        inputs = [q, k, v, g, beta, state, T],
+        template = [("InT", q.dtype), ("StT", state.dtype), ("Dk", Dk), ("Dv", Dv), ("Hk", Hk), ("Hv", Hv)],
+        grid = (32, Dv // 8, B * Hv), threadgroup = (32, 2, 1),
+        output_shapes = [(B, T, Hv, Dv), state.shape], output_dtypes = [q.dtype, state.dtype],
+    )
+
+
+def _packed_gated_delta_route(native, bindings):
+    def gated_delta_kernel(q, k, v, g, beta, state, mask = None):
+        # One-token decode, masks, vector gates and other key widths keep the generic kernel.
+        if (mask is not None or g.ndim != 3 or k.shape[1] < 2 or k.shape[3] != 128 or v.shape[3] % 8
+                or g.dtype != mx.float32 or state.dtype != mx.float32 or not _bindings_intact(bindings)):
+            return native(q, k, v, g, beta, state, mask)
+        key = (k.shape[2], *v.shape[2:], q.dtype, k.dtype, v.dtype, beta.dtype)
+        verdict = _GATED_DELTA_VERDICTS.get(key)
+        if verdict:
+            return _packed_gated_delta(q, k, v, g, beta, state)
+        stock = native(q, k, v, g, beta, state, mask)
+        if verdict is None:
+            try:
+                verdict = all(bool(mx.array_equal(a.view(mx.uint8), b.view(mx.uint8)).item())
+                              for a, b in zip(_packed_gated_delta(q, k, v, g, beta, state), stock))
+            except (RuntimeError, ValueError):
+                return stock  # inside a function transformation, which cannot evaluate; checked later
+            _GATED_DELTA_VERDICTS[key] = verdict
+            if not verdict:
+                logger.warning("the packed gated-delta kernel differs from the generic one for %d key heads, "
+                               "%d value heads of width %d and %s inputs; the generic kernel stays in use",
+                               *key[:4])
+        return stock
+
+    return gated_delta_kernel
+
+
+def _gated_delta_sources(modules):
+    """The pinned gated-delta modules whose `gated_delta_update` a layer of these modules calls."""
+    updates = set()
+    for cls in {type(module) for _, module in modules}:
+        for base in cls.__mro__:
+            update = getattr(sys.modules.get(base.__module__), "gated_delta_update", None)
+            if update is not None:
+                updates.add(id(update))
+    return [name for name in _GATED_DELTA_CONTRACT
+            if id(getattr(sys.modules.get(name), "gated_delta_update", None)) in updates]
+
+
+@contextmanager
+def fused_packed_gated_delta(model, *, _modules = None):
+    """Run multi-token gated-delta recurrences with eight value rows per SIMD group instead of one.
+
+    Covers calls of two or more tokens with 128-wide keys, a scalar float32 gate, float32 state, no mask and
+    a value width divisible by eight, bit-identical to the generic kernel; each head layout and dtype is
+    compared bit for bit on its first use and keeps the generic kernel if it differs. One-token decode and
+    every other shape take the generic kernel. The gated-delta module's `gated_delta_kernel` is rebound for
+    as long as any scope is open, so it is restored when the last one exits. An mlx-lm or mlx-vlm that
+    ships its own packed kernel is left alone. `UNSLOTH_MLX_PACKED_GATED_DELTA=0` turns the route off.
+    """
+    entered = []
+    try:
+        with _GATED_DELTA_LOCK:
+            if (os.environ.get("UNSLOTH_MLX_PACKED_GATED_DELTA", "1") != "0"
+                    and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)
+                    and _packed_gated_delta_kernel() is not None):
+                for name in _gated_delta_sources(_fusion_modules(model, _modules)):
+                    namespace = vars(sys.modules[name])
+                    held = _GATED_DELTA_SCOPES.get(name)
+                    if held is None:
+                        if "_gated_delta_kernel_packed" in namespace:
+                            continue
+                        bindings = _resolved_bindings({name: _GATED_DELTA_BODIES})
+                        if bindings is None:
+                            continue
+                        native = namespace["gated_delta_kernel"]
+                        route = _packed_gated_delta_route(native, [b for b in bindings if b[2] is not native])
+                        namespace["gated_delta_kernel"] = route
+                        held = _GATED_DELTA_SCOPES[name] = [0, name, namespace, native, route]
+                    held[0] += 1
+                    entered.append(held)
+        yield model
+    finally:
+        with _GATED_DELTA_LOCK:
+            for held in entered:
+                held[0] -= 1
+                if not held[0]:
+                    _, name, namespace, native, route = held
+                    del _GATED_DELTA_SCOPES[name]
+                    if namespace.get("gated_delta_kernel") is route:
+                        namespace["gated_delta_kernel"] = native
+
 def _single_row(x):
     # The fused kernel reduces one row per launch, so anything wider keeps the native path.
     return x.size == x.shape[-1]

@@ -434,3 +434,133 @@ def test_prenorm_layers_keep_native_when_the_kernel_disagrees(monkeypatch):
     expected = model(tokens)
     with decode.fused_residual_norm_handoff(model):
         _equal(model(tokens), expected)
+
+
+from mlx_lm.models import cache as lm_cache, gated_delta as lm_gated_delta, qwen3_5 as lm_qwen3_5
+from mlx_vlm.models.qwen3_5 import gated_delta as vlm_gated_delta
+
+_PACKED_SOURCES = [(native, vlm_gated_delta, native.Qwen3_5GatedDeltaNet, native.ArraysCache),
+                   (lm_qwen3_5, lm_gated_delta, lm_qwen3_5.GatedDeltaNet, lm_cache.ArraysCache)]
+
+
+def _packable_model(layer = native.Qwen3_5GatedDeltaNet):
+    model = layer(SimpleNamespace(
+        hidden_size = 64, linear_num_value_heads = 4, linear_num_key_heads = 2,
+        linear_key_head_dim = 128, linear_value_head_dim = 24,
+        linear_conv_kernel_dim = 4, rms_norm_eps = 1e-6,
+    ))
+    model.set_dtype(mx.bfloat16)
+    model.eval()
+    model.freeze()
+    return model
+
+
+def _recurrence(dtype, B = 2, T = 7, Hk = 2, Hv = 4, Dk = 128, Dv = 24, gate = None):
+    q, k = (mx.random.normal((B, T, Hk, Dk)).astype(dtype) * Dk ** -0.5 for _ in range(2))
+    v = mx.random.normal((B, T, Hv, Dv)).astype(dtype)
+    g = mx.random.uniform(0.5, 1.0, gate or (B, T, Hv))
+    beta = mx.random.uniform(0.0, 1.0, (B, T, Hv)).astype(dtype)
+    return q, k, v, g, beta, mx.random.normal((B, Hv, Dv, Dk))
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16, mx.float32])
+def test_packed_gated_delta_kernel_matches_the_generic_kernel_bitwise(dtype):
+    for shape in [dict(B = 1, T = 2, Hk = 1, Hv = 1, Dv = 8), dict(), dict(B = 1, T = 300, Hk = 16, Hv = 32, Dv = 128)]:
+        args = _recurrence(dtype, **shape)
+        for actual, expected in zip(decode._packed_gated_delta(*args), vlm_gated_delta.gated_delta_kernel(*args)):
+            _equal(actual, expected)
+
+
+@pytest.mark.parametrize("consumer, source, layer, cache_type", _PACKED_SOURCES)
+def test_packed_scope_preserves_prefill_and_decode_and_restores(consumer, source, layer, cache_type, monkeypatch):
+    model = _packable_model(layer)
+    samples = [mx.random.normal((2, n, 64)).astype(mx.bfloat16) for n in (5, 1, 3)]
+    cache, expected = cache_type(size = 2), []
+    for x in samples:
+        out = model(x, cache = cache)
+        mx.eval(out, cache.state)
+        expected.append((out, list(cache.state)))
+    stock, update, packed, calls = source.gated_delta_kernel, source.gated_delta_update, decode._packed_gated_delta, []
+    patched = lambda *args, **kwargs: update(*args, **kwargs)  # the training patches rebind source and consumers alike
+    monkeypatch.setattr(source, "gated_delta_update", patched)
+    monkeypatch.setattr(consumer, "gated_delta_update", patched)
+    monkeypatch.setattr(decode, "_packed_gated_delta", lambda *args: calls.append(None) or packed(*args))
+    monkeypatch.setattr(decode, "_GATED_DELTA_VERDICTS", {})
+    cache = cache_type(size = 2)
+    with pytest.raises(RuntimeError, match = "cancel"):
+        with decode.fused_decode_conv_silu(model), decode.fused_packed_gated_delta(model):
+            route = source.gated_delta_kernel
+            with decode.fused_packed_gated_delta(model):
+                assert source.gated_delta_kernel is route is not stock
+            assert source.gated_delta_kernel is route
+            for x, (out, states) in zip(samples, expected):
+                calls.clear()
+                _equal(model(x, cache = cache), out)
+                for actual, state in zip(cache.state, states):
+                    _equal(actual, state)
+                assert len(calls) == (x.shape[1] > 1)
+            assert all(decode._GATED_DELTA_VERDICTS.values())
+            raise RuntimeError("cancel")
+    assert source.gated_delta_kernel is stock
+
+
+def test_packed_route_keeps_other_shapes_and_a_differing_kernel_on_the_generic_kernel(monkeypatch, caplog):
+    stock, packed = vlm_gated_delta.gated_delta_kernel, decode._packed_gated_delta
+    monkeypatch.setattr(decode, "_GATED_DELTA_VERDICTS", {})
+    with decode.fused_packed_gated_delta(_packable_model()):
+        route = vlm_gated_delta.gated_delta_kernel
+        args = _recurrence(mx.bfloat16)
+        route(*args)
+        monkeypatch.setattr(decode, "_packed_gated_delta", lambda *a: ("packed",))
+        assert route(*args) == ("packed",)
+        monkeypatch.setattr(decode, "_packed_gated_delta", lambda *a: pytest.fail("ineligible call was packed"))
+        others = [_recurrence(mx.bfloat16, T = 1), _recurrence(mx.bfloat16, Dk = 64), _recurrence(mx.bfloat16, Dv = 12),
+                  _recurrence(mx.bfloat16, gate = (2, 7, 4, 128)), (*args, mx.ones((2, 7), mx.bool_)),
+                  (*args[:3], args[3].astype(mx.float16), *args[4:]), (*args[:5], args[5].astype(mx.float16))]
+        for other in others:
+            for actual, expected in zip(route(*other), stock(*other)):
+                _equal(actual, expected)
+        for dtype, y, state in [(mx.float16, 0, 1), (mx.float32, 1, 0)]:
+            monkeypatch.setattr(decode, "_packed_gated_delta", lambda *a: (packed(*a)[0] + y, packed(*a)[1] + state))
+            args = _recurrence(dtype)
+            for _ in range(2):
+                for actual, expected in zip(route(*args), stock(*args)):
+                    _equal(actual, expected)
+                monkeypatch.setattr(decode, "_packed_gated_delta", lambda *a: pytest.fail("rejected layout was packed"))
+            assert caplog.text.count("packed gated-delta kernel differs") == y + 1
+        monkeypatch.setattr(decode, "_packed_gated_delta", lambda *a: pytest.fail("drifted binding was packed"))
+        monkeypatch.setattr(vlm_gated_delta, "_gated_delta_kernel", vlm_gated_delta._make_gated_delta_kernel())
+        route(*_recurrence(mx.bfloat16))
+
+
+@pytest.mark.parametrize("reason", ["switch", "upstream", "body", "kernel", "distributed", "model"])
+def test_packed_scope_steps_aside(reason, monkeypatch, caplog):
+    stock, model = vlm_gated_delta.gated_delta_kernel, _packable_model()
+    if reason == "switch":
+        monkeypatch.setenv("UNSLOTH_MLX_PACKED_GATED_DELTA", "0")
+    elif reason == "upstream":
+        monkeypatch.setattr(vlm_gated_delta, "_gated_delta_kernel_packed", object(), raising = False)
+    elif reason == "body":
+        monkeypatch.setattr(vlm_gated_delta, "_make_gated_delta_kernel", lambda *args, **kwargs: None)
+    elif reason == "kernel":
+        monkeypatch.setattr(decode, "_packed_gated_delta_kernel", lambda: None)
+    elif reason == "distributed":
+        model._unsloth_mlx_distributed_parallel_mode = "tensor"
+    else:
+        model = _model().in_proj_qkv
+    with caplog.at_level("WARNING"), decode.fused_packed_gated_delta(model):
+        assert vlm_gated_delta.gated_delta_kernel is stock
+    assert ("differs from the version" in caplog.text) == (reason == "body")
+
+
+def test_packed_scope_leaves_a_binding_it_no_longer_owns(monkeypatch):
+    stock, model, foreign = vlm_gated_delta.gated_delta_kernel, _packable_model(), lambda *args: None
+    with decode.fused_packed_gated_delta(model):
+        monkeypatch.setattr(vlm_gated_delta, "gated_delta_kernel", foreign)
+        with decode.fused_packed_gated_delta(model):
+            pass
+    assert vlm_gated_delta.gated_delta_kernel is foreign
+    monkeypatch.setattr(vlm_gated_delta, "gated_delta_kernel", stock)
+    with decode.fused_packed_gated_delta(model):
+        assert vlm_gated_delta.gated_delta_kernel is not stock
+    assert vlm_gated_delta.gated_delta_kernel is stock
