@@ -1819,7 +1819,7 @@ def _swap_in_fp8_experts(new_model, quant_state_dict, config):
             step3p7_limits.append((new_model.get_submodule(path.rpartition(".")[0]), getattr(old, "limit", None)))
     if step3p7_limits:
         # As replace_with_fp8_linear's Step-3.7 wrapper: keep each layer's post-activation swiglu clamp.
-        from .temporary_patches.step3p7_moe import _adopt_step3p7_fp8_experts
+        from unsloth_zoo.temporary_patches.step3p7_moe import _adopt_step3p7_fp8_experts
         _adopt_step3p7_fp8_experts(new_model, step3p7_limits)
 pass
 
