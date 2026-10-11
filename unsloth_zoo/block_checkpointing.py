@@ -34,10 +34,30 @@ __all__ = [
 ]
 
 _MARK = "_unsloth_block_checkpoint_reentrant"
+_ORDER = "_unsloth_block_checkpoint_order"
+_INDEX = "_unsloth_block_checkpoint_index"
+_RECOMPUTING = "_unsloth_block_checkpoint_recomputing"
+_FORWARD = "_unsloth_block_checkpoint_forward"
 # Per-block extras that cannot be pickled or should not follow a copy: a custom checkpoint function and a forward that
 # was already patched on the instance. A copy falls back to torch's checkpoint and its class forward.
 _CUSTOM = weakref.WeakKeyDictionary()
 _PREVIOUS = weakref.WeakKeyDictionary()
+
+
+class _Order:
+    # Per model, stamped on every submodule: deepcopy and pickle give a copy its own counter, and each block keeps the
+    # index it was given, so a copy checkpoints the same blocks as its original.
+    __slots__ = ("next",)
+
+    def __init__(self):
+        self.next = 0
+
+
+def _stamp_order(model):
+    order = _Order()
+    for module in model.modules():
+        module.__dict__.pop(_INDEX, None)
+        module.__dict__[_ORDER] = order
 
 
 def _owner(function):
@@ -70,10 +90,17 @@ def every_n_checkpoint_function(every_n_blocks = 1, use_reentrant = False, check
     every_n_blocks = max(1, int(every_n_blocks))
     if every_n_blocks == 1:
         return base
-    order = {}
+    fallback = _Order()
 
     def every_n(function, *args, **kwargs):
-        index = order.setdefault(id(_owner(function)), len(order))
+        owner = _owner(function)
+        state = getattr(owner, "__dict__", None)
+        index = None if state is None else state.get(_INDEX)
+        if index is None:
+            order = (state or {}).get(_ORDER) or fallback
+            index, order.next = order.next, order.next + 1
+            if state is not None:
+                state[_INDEX] = index
         if index % every_n_blocks:
             return function(*args, **kwargs)
         return base(function, *args, **kwargs)
@@ -111,6 +138,21 @@ def _inner_forward(block):
     return previous if previous is not None else type(block).forward.__get__(block, type(block))
 
 
+def _recompute_body(block, inner, *args, **kwargs):
+    # The checkpointed function. In the forward pass the wrapper's flag is set and the body runs (the block's hooks
+    # already ran around it). Recompute comes later, flag cleared, and re-enters through Module.__call__ so hooks that
+    # load weights or set transient state run again, as in torch's composable checkpoint
+    # (torch.distributed._composable.checkpoint). It only reads flags: a write inside a compiled checkpoint is an
+    # unsafe side effect.
+    if block.__dict__.get(_FORWARD):
+        return inner(*args, **kwargs)
+    block.__dict__[_RECOMPUTING] = True
+    try:
+        return block(*args, **kwargs)
+    finally:
+        block.__dict__.pop(_RECOMPUTING, None)
+
+
 class _CheckpointedForward:
     # A block's instance ``forward``. A plain object holding its block: deepcopy and pickle carry it along with the
     # block (a bound method pickles as getattr(block, "forward"), which reloads as the unwrapped class forward).
@@ -122,10 +164,14 @@ class _CheckpointedForward:
     def __call__(self, *args, **kwargs):
         block = self.block
         inner = _inner_forward(block)
-        if block.training and torch.is_grad_enabled():
-            run = _CUSTOM.get(block) or _torch_checkpoint(getattr(block, _MARK, False))
-            return run(inner, *args, **kwargs)
-        return inner(*args, **kwargs)
+        if block.__dict__.get(_RECOMPUTING) or not (block.training and torch.is_grad_enabled()):
+            return inner(*args, **kwargs)
+        run = _CUSTOM.get(block) or _torch_checkpoint(getattr(block, _MARK, False))
+        block.__dict__[_FORWARD] = True
+        try:
+            return run(functools.partial(_recompute_body, block, inner), *args, **kwargs)
+        finally:
+            block.__dict__.pop(_FORWARD, None)
 
 
 def _is_wrapped(block):
@@ -144,7 +190,8 @@ def _unwrap(block):
 
 
 def _wrap_blocks(model, every_n_blocks, use_reentrant, checkpoint_function):
-    blocks = find_repeated_blocks(model)
+    # A weight-shared block listed twice is one caller: a later alias must not undo the first one's wrapper.
+    blocks = list({id(block): block for block in find_repeated_blocks(model)}.values())
     if not blocks:
         raise ValueError(f"{type(model).__name__} has no repeated blocks to checkpoint.")
     for index, block in enumerate(blocks):
@@ -168,6 +215,7 @@ def enable_block_gradient_checkpointing(model, every_n_blocks = 1, use_reentrant
     LoRA), and reentrant recompute of a bnb 4-bit LoRA linear can hit an illegal memory access on FLUX."""
     every_n_blocks = max(1, int(every_n_blocks))
     function = every_n_checkpoint_function(every_n_blocks, use_reentrant, checkpoint_function)
+    _stamp_order(model)
     enable = getattr(model, "enable_gradient_checkpointing", None)
     if callable(enable) and _accepts(enable, "gradient_checkpointing_func"):
         enable(gradient_checkpointing_func = function)

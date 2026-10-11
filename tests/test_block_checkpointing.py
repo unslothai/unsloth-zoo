@@ -280,3 +280,91 @@ def test_find_repeated_blocks_prefers_declared_classes_then_the_heaviest_list():
     assert all(isinstance(m, nn.Linear) for m in bc.find_repeated_blocks(model))
     with pytest.raises(ValueError):
         bc.enable_block_gradient_checkpointing(nn.Linear(2, 2))
+
+
+class _NeedsState(nn.Module):
+    # A forward that only works while its hooks hold transient state, like block swapping's weight fetch / release.
+    def __init__(self):
+        super().__init__()
+        self.lin = nn.Linear(4, 4)
+
+    def forward(self, x):
+        # State used by the first op, as fetched weights are: recompute cannot stop before reaching it.
+        return self.lin(x * self.scale)
+
+
+def _transient_state_stack(events):
+    stack = nn.ModuleList([_NeedsState() for _ in range(3)])
+    for block in stack:
+        def pre(module, args):
+            module.scale = 2.0
+            events.append("pre")
+
+        def post(module, args, output):
+            del module.scale
+
+        block.register_forward_pre_hook(pre)
+        block.register_forward_hook(post)
+    return stack
+
+
+@pytest.mark.parametrize("use_reentrant", [False, True])
+def test_recompute_runs_the_blocks_hooks_again(use_reentrant):
+    torch.manual_seed(0)
+    ref_events, events = [], []
+    ref, model = _transient_state_stack(ref_events), _transient_state_stack(events)
+    model.load_state_dict(ref.state_dict())
+    bc.enable_block_gradient_checkpointing(model, use_reentrant = use_reentrant)
+    x = torch.randn(2, 4, requires_grad = True)
+
+    def step(m):
+        h = x
+        for block in m:
+            h = block(h)
+        return h.pow(2).mean()
+
+    _assert_same(_grads(ref, step), _grads(model, step))
+    # 3 forward calls, then 3 recomputes through Module.__call__.
+    assert len(ref_events) == 3 and len(events) == 6
+
+
+class _FakeDiffusers(nn.Module):
+    # Routes gradient_checkpointing_func like diffusers: the parent calls it with each block.
+    def __init__(self, n = 4):
+        super().__init__()
+        self.blocks = nn.ModuleList([nn.Linear(4, 4) for _ in range(n)])
+        self.func = None
+
+    def enable_gradient_checkpointing(self, gradient_checkpointing_func = None):
+        self.func = gradient_checkpointing_func
+
+    def forward(self, x):
+        for block in self.blocks:
+            x = self.func(block, x)
+        return x
+
+
+@pytest.mark.parametrize("copy_after_running", [False, True])
+def test_a_copied_model_checkpoints_the_same_blocks_as_its_original(copy_after_running):
+    import copy
+
+    run, calls = _counting_checkpoint()
+    model = _FakeDiffusers(3)
+    bc.enable_block_gradient_checkpointing(model, 2, checkpoint_function = run)
+    x = torch.randn(1, 4, requires_grad = True)
+    if copy_after_running:
+        model(x).sum().backward()
+    clone = copy.deepcopy(model)
+    if not copy_after_running:
+        model(x).sum().backward()
+    calls.clear()
+    clone(x).sum().backward()
+    assert calls == [clone.blocks[0], clone.blocks[2]]
+
+
+def test_an_aliased_block_is_one_caller():
+    shared, other = nn.Linear(4, 4), nn.Linear(4, 4)
+    model = nn.Module()
+    model.layers = nn.ModuleList([shared, shared, other])
+    bc.enable_block_gradient_checkpointing(model, 2)
+    assert bc._is_wrapped(shared) and not bc._is_wrapped(other)
