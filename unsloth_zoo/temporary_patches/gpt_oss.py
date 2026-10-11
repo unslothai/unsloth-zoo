@@ -3212,8 +3212,8 @@ def patch_GptOssAttention():
                 if getattr(module, "layer_idx", 0) == 0 or _EAGER_ATTENTION_FREE[0] != key_id:
                     free, _ = torch.cuda.mem_get_info(query.device)
                     cached = torch.cuda.memory_reserved(query.device) - torch.cuda.memory_allocated(query.device)
-                    # Later layers still add their K/V to the cache during this prefill.
-                    kv_cache = (key.numel() + value.numel()) * key.element_size() * getattr(module.config, "num_hidden_layers", 1)
+                    # Later layers still append this prefill's qlen K/V rows to the cache.
+                    kv_cache = (key.numel() + value.numel()) // key.shape[-2] * qlen * key.element_size() * getattr(module.config, "num_hidden_layers", 1)
                     _EAGER_ATTENTION_FREE[:] = [key_id, max(0, free + cached - kv_cache)]
                 budget = _EAGER_ATTENTION_FREE[1] // 2
             if budget is not None:
