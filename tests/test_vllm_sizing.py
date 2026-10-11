@@ -141,7 +141,10 @@ def _load_args(monkeypatch, **kwargs):
     monkeypatch.setattr(vllm_utils, "get_mem_info", lambda: (80 * GiB, 80 * GiB))
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (9, 0))
     if "vllm_version" not in vars(vllm_utils):
-        pytest.skip("vLLM is not installed")
+        # load_vllm raises ImportError without vLLM, and past that guard it patches vLLM's own
+        # modules, so these engine-arg checks cannot run on a CPU-only install. The sizing
+        # helpers above cover the vLLM-free part of this change.
+        pytest.skip(reason = "load_vllm needs vLLM installed: it imports and patches vLLM modules")
     config = _config(head_dim = 128, architectures = ["Qwen3ForCausalLM"], torch_dtype = "bfloat16")
     return vllm_utils.load_vllm(
         "unsloth/Qwen3-4B", config = config, max_seq_length = 2048, use_bitsandbytes = False,
