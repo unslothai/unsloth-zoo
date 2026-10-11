@@ -89,3 +89,22 @@ def test_non_reentrant_checkpoint_still_releases_the_first_forward(bank):
     ref_x = x.detach().clone().requires_grad_(True)
     torch.einsum("tk,enk->tn", ref_x, (base.to(torch.bfloat16) * quant)).float().square().sum().backward()
     assert torch.equal(x.grad, ref_x.grad)
+
+
+def test_refill_keeps_the_block_size_of_a_non_aligned_bank():
+    # H = 192 is not a multiple of 128: a sliced bank without block_size would infer 96-wide blocks.
+    torch.manual_seed(0)
+    experts, rows, hidden = 2, 256, 192
+    base = torch.randn(experts, rows, hidden).to(torch.float8_e4m3fn)
+    scale = torch.rand(experts, 2, 2) + 0.5
+    base.block_size = scale.block_size = (128, 128)
+    dequantized = M._dequantize_full_expert_weights(base, scale, torch.float32, quant_kind = "weight_scale_inv")
+    reference = dequantized.clone()
+    x = torch.randn(3, hidden, requires_grad = True)
+    # F.linear saves the bank's own storage (a view), so the input gradient reads the refilled values.
+    out = torch.nn.functional.linear(x, dequantized.view(-1, hidden))
+    M._release_dequantized_banks_until_backward(out, x, ((dequantized, base, scale, "weight_scale_inv"),))
+    out.square().sum().backward()
+    ref_x = x.detach().clone().requires_grad_(True)
+    torch.nn.functional.linear(ref_x, reference.view(-1, hidden)).square().sum().backward()
+    assert torch.equal(x.grad, ref_x.grad)

@@ -955,11 +955,17 @@ def _release_dequantized_banks_until_backward(output, inputs, banks):
                 storage.resize_(nbytes)
                 # .data: a fresh version counter, so the refill does not count as an in-place edit
                 target = dequantized.data
+                # Slices drop the block_size attribute; without it a non-128-aligned dim infers another block.
+                block_size = getattr(base, "block_size", None) or getattr(quant, "block_size", None)
                 step = max(1, base.shape[0] // 8)  # bounded transient: an eighth of the bank at a time
                 for start in range(0, base.shape[0], step):
                     end = min(start + step, base.shape[0])
+                    piece_base = base[start:end]
                     piece_quant = quant[start:end] if isinstance(quant, torch.Tensor) and quant.ndim == base.ndim else quant
-                    piece = _dequantize_full_expert_weights(base[start:end], piece_quant, target.dtype, quant_kind = quant_kind)
+                    if block_size is not None:
+                        _try_attach_block_size(piece_base, block_size)
+                        if isinstance(piece_quant, torch.Tensor): _try_attach_block_size(piece_quant, block_size)
+                    piece = _dequantize_full_expert_weights(piece_base, piece_quant, target.dtype, quant_kind = quant_kind)
                     target[start:end].copy_(piece)
                     del piece
         return None

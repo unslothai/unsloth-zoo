@@ -1805,6 +1805,8 @@ def _vllm_fp8_moe_contract(routed, w13, w2, where):
     tp, ep = getattr(parallel, "tp_size", 1), getattr(parallel, "ep_size", 1)
     if tp != 1 or ep != 1 or getattr(parallel, "use_ep", False):
         refuse(f"vLLM shards the experts (tp_size = {tp}, ep_size = {ep})")
+    if getattr(routed, "w13_bias", None) is not None or getattr(routed, "w2_bias", None) is not None:
+        refuse("its experts carry biases, which the FP8Experts training copy cannot hold")
     w13_scale = getattr(routed, "w13_weight_scale_inv", None)
     w2_scale = getattr(routed, "w2_weight_scale_inv", None)
     if w13_scale is None or w2_scale is None:

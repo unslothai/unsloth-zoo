@@ -141,6 +141,13 @@ def test_intermediate_not_block_aligned_is_refused():
         vllm_moe_expert_descriptor(_fp8_routed(inter = 192), "layer 0", _cfg(192))
 
 
+def test_fp8_experts_with_biases_are_refused():
+    routed = _fp8_routed()
+    routed.w13_bias = torch.nn.Parameter(torch.zeros(E, 2 * I), requires_grad = False)
+    with pytest.raises(NotImplementedError, match = "biases"):
+        vllm_moe_expert_descriptor(routed, "layer 0", _cfg())
+
+
 def test_fnuz_and_int8_experts_are_refused():
     routed = _fp8_routed()
     routed.w13_weight = torch.nn.Parameter(torch.zeros(E, 2 * I, H, dtype = torch.float8_e4m3fnuz), requires_grad = False)
