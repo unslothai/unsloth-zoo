@@ -60,3 +60,27 @@ def test_batches_follow_the_model_device(tmp_path):
     assert model.seen_devices, "the model never ran"
     expected = model.embed.weight.device
     assert all(ids == expected and labels == expected for ids, labels in model.seen_devices)
+
+
+def test_offloaded_embedding_uses_the_hook_execution_device(tmp_path):
+    # With accelerate offloading the embedding weight is meta between forwards; batches must go to the hook's
+    # execution device, never to meta.
+    model = _TinyLM()
+    meta_embed = torch.nn.Embedding(16, 8, device = "meta")
+    meta_embed._hf_hook = SimpleNamespace(execution_device = torch.device("cpu"))
+    model.get_input_embeddings = lambda: meta_embed
+    trainer = SimpleNamespace(
+        args = TrainingArguments(
+            output_dir = str(tmp_path),
+            max_steps = 1,
+            per_device_train_batch_size = 2,
+            report_to = "none",
+            use_cpu = True,
+            dataloader_pin_memory = False,
+        ),
+        model = model,
+        train_dataset = [{"input_ids": [1, 2, 3, 4]}] * 2,
+        data_collator = _collate,
+    )
+    training_utils.unsloth_train(trainer)
+    assert model.seen_devices and all(ids.type == "cpu" for ids, _ in model.seen_devices)

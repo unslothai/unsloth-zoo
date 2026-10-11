@@ -711,11 +711,19 @@ def unsloth_train(trainer):
         )
     pass
 
-    # Batches go where the model's inputs live, not a hard-coded first GPU.
+    # Batches go where the model's inputs run, not a hard-coded first GPU; an offloaded embedding is meta,
+    # so its accelerate hook's execution device wins.
+    from .device_map_planner import _first_execution_device
     try:
-        train_device = model.get_input_embeddings().weight.device
+        train_device = _first_execution_device(model.get_input_embeddings())
     except Exception:
-        train_device = next(model.parameters()).device
+        train_device = None
+    if train_device is None:
+        train_device = next(
+            (p.device for p in model.parameters() if p.device.type != "meta"),
+            torch.device(f"{DEVICE_TYPE_TORCH}:0"),
+        )
+    train_device = torch.device(train_device)
     step = 0
     accumulated_loss = torch.zeros(1, device = train_device, dtype = torch.float32)[0]
     debug_info = \
