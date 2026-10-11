@@ -441,3 +441,21 @@ def test_a_block_with_a_self_referencing_patched_forward_is_still_freed():
     del model, block
     gc.collect()
     assert ref() is None
+
+
+def test_re_enabling_a_transformers_model_keeps_one_embedding_hook():
+    transformers = pytest.importorskip("transformers")
+    config = transformers.LlamaConfig(
+        vocab_size = 32, hidden_size = 16, intermediate_size = 32, num_hidden_layers = 2,
+        num_attention_heads = 2, num_key_value_heads = 2, max_position_embeddings = 16,
+    )
+    model = transformers.LlamaForCausalLM(config).train()
+    for every_n in (1, 2, 1):
+        bc.enable_block_gradient_checkpointing(model, every_n)
+    assert len(model.get_input_embeddings()._forward_hooks) == 1
+
+
+def test_parameterless_repeated_blocks_are_found():
+    model = nn.Module()
+    model.acts = nn.ModuleList([nn.GELU() for _ in range(3)])
+    assert bc.find_repeated_blocks(model) == list(model.acts)

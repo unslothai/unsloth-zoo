@@ -131,7 +131,7 @@ def find_repeated_blocks(model):
     for module in model.modules():
         if isinstance(module, torch.nn.ModuleList) and len(module) >= 2:
             count = sum(p.numel() for p in module.parameters())
-            if count > best_count:
+            if count > best_count or not best:
                 best, best_count = list(module), count
     return best
 
@@ -252,8 +252,10 @@ def enable_block_gradient_checkpointing(model, every_n_blocks = 1, use_reentrant
     if callable(getattr(model, "gradient_checkpointing_enable", None)) and callable(setter) and _accepts(
         setter, "gradient_checkpointing_func"
     ):
-        # gradient_checkpointing_enable also wires input grads for PEFT; the setter then installs our function.
-        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": use_reentrant})
+        # gradient_checkpointing_enable also wires input grads for PEFT; the setter then installs our function. Once
+        # only: each call registers another embedding hook and orphans the previous handle.
+        if getattr(model, "is_gradient_checkpointing", False) is not True:
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": use_reentrant})
         setter(enable = True, gradient_checkpointing_func = function)
         return "transformers"
     return _wrap_blocks(model, every_n_blocks, use_reentrant, checkpoint_function)
