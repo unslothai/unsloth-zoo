@@ -121,3 +121,16 @@ def test_non_reentrant_checkpoint_does_not_refill_the_discarded_bank(bank):
     ref_x = x.detach().clone().requires_grad_(True)
     torch.einsum("tk,enk->tn", ref_x, (base.to(torch.bfloat16) * quant)).float().square().sum().backward()
     assert torch.equal(x.grad, ref_x.grad)
+
+
+def test_bank_is_kept_when_checkpoint_hooks_cannot_be_inspected(bank, monkeypatch):
+    # torch 2.6 has no _top_saved_tensors_default_hooks: a non-reentrant checkpoint would be invisible,
+    # so the bank must stay (no release, no refill) rather than risk holding two.
+    base, quant, refills = bank
+    monkeypatch.delattr(torch._C._autograd, "_top_saved_tensors_default_hooks", raising = False)
+    x = torch.randn(3, K, dtype = torch.bfloat16, requires_grad = True)
+    seen = []
+    out = _layer(x, base, quant, seen)
+    assert seen == [E * N * K * 2]  # bf16 bank still allocated
+    out.float().square().sum().backward()
+    assert refills == []

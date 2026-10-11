@@ -931,8 +931,12 @@ def _release_dequantized_banks_until_backward(output, inputs, banks):
     if _graph_task_id is not None and _graph_task_id() != -1:
         return
     # Non-reentrant checkpointing recomputes the banks in backward; refilling the originals would hold two.
+    # torch < 2.8 has no way to read the active saved-tensor hooks, so keep the bank there rather than
+    # risk two of them under a checkpoint we cannot see.
     _top_hooks = getattr(torch._C._autograd, "_top_saved_tensors_default_hooks", None)
-    hooks = _top_hooks(False) if _top_hooks is not None else None
+    if _top_hooks is None:
+        return
+    hooks = _top_hooks(False)
     if hooks is not None and getattr(hooks[0], "__qualname__", "").startswith("_checkpoint_hook"):
         return
     tracked = []
