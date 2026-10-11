@@ -37,6 +37,7 @@ import torch
 import re
 import os
 import functools
+import itertools
 import inspect
 from copy import deepcopy
 from .utils import get_quant_type
@@ -948,6 +949,54 @@ def set_additional_modules(new_model, quant_state_dict, config):
     pass
 pass
 
+_FLOAT8_DTYPES = tuple(
+    getattr(torch, name)
+    for name in ("float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnuz", "float8_e8m0fnu")
+    if hasattr(torch, name)
+)
+
+
+def _is_quantized_tensor(tensor):
+    """float8 storage, or a tensor subclass (torchao Float8Tensor) whose dtype reports the 16-bit compute dtype."""
+    if tensor.dtype in _FLOAT8_DTYPES:
+        return True
+    data = tensor.data if isinstance(tensor, torch.nn.Parameter) else tensor
+    return type(data) not in (torch.Tensor, torch.nn.Parameter)
+
+
+def _has_quantized_tensors(model):
+    return any(
+        _is_quantized_tensor(t)
+        for t in itertools.chain(model.parameters(), model.buffers())
+    )
+
+
+def _cast_unquantized_(model, device, dtype):
+    """In-place model.to(device, dtype) that leaves quantized modules untouched: their float8 /
+    tensor-subclass weights and fp32 scales are the vLLM-shared tensors."""
+    for module in model.modules():
+        own = itertools.chain(module._parameters.values(), module._buffers.values())
+        if any(t is not None and _is_quantized_tensor(t) for t in own):
+            continue
+        for name, param in list(module._parameters.items()):
+            if param is None or _is_quantized_tensor(param):
+                continue
+            if param.is_floating_point() or param.is_complex():
+                new = param.data.to(device = device, dtype = dtype)
+            else:
+                new = param.data.to(device)
+            if new is not param.data:
+                param.data = new  # in place, like Module.to: keeps tied weights tied
+        for name, buffer in list(module._buffers.items()):
+            if buffer is None or _is_quantized_tensor(buffer):
+                continue
+            if buffer.is_floating_point() or buffer.is_complex():
+                module._buffers[name] = buffer.to(device = device, dtype = dtype)
+            else:
+                module._buffers[name] = buffer.to(device)
+    return model
+
+
 @torch.inference_mode
 def finalize_huggingface_model(
     new_model,
@@ -1095,7 +1144,13 @@ def finalize_huggingface_model(
     _copy_rotary_buffers(original_meta_model, new_model)
 
     if (quantization_config or {}) == {} and bnb_config is None:
-        new_model = new_model.to(device = target_device, dtype = dtype)
+        # Online FP8 (load_in_fp8 on a 16-bit checkpoint) leaves no quantization_config, but the
+        # vLLM-shared weights are float8 / torchao subclasses: a whole-model cast would dequantize
+        # (or fail on) them, so cast only plain 16/32-bit tensors.
+        if _has_quantized_tensors(new_model):
+            _cast_unquantized_(new_model, target_device, dtype)
+        else:
+            new_model = new_model.to(device = target_device, dtype = dtype)
         _reinit_rotary_embeddings(new_model)
         _copy_rotary_buffers(original_meta_model, new_model)
         for module in new_model.modules():
