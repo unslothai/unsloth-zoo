@@ -641,7 +641,10 @@ def _hf_config_default(model_type, key):
 # into rope_parameters, to_diff_dict drops class defaults, lfm2's block_ff_dim is intermediate_size.
 # Each value is what transformers itself loads; anything else keeps the incomplete-config error.
 _MLX_LM_CONFIG_BACKFILLS = {
-    "rope_theta": lambda config: (config.get("rope_parameters") or {}).get("rope_theta"),
+    "rope_theta": lambda config: (
+        config["rope_parameters"].get("rope_theta")
+        if isinstance(config.get("rope_parameters"), dict) else None
+    ),
     "block_ff_dim": lambda config: config.get("intermediate_size"),
     "tie_word_embeddings": lambda config: _hf_config_default(config.get("model_type"), "tie_word_embeddings"),
 }
