@@ -1018,9 +1018,7 @@ def train_on_responses_only(
 
     _num_proc_was_auto = num_proc is None or type(num_proc) is not int
     if _num_proc_was_auto:
-        # Same policy as every other map site: CPUs this process may use (affinity, cgroup quota), memory under the
-        # cgroup limit, and the start method datasets actually forks with. cpu_count + 4 counted the host, so a
-        # taskset / Slurm / container job forked up to 64 workers onto the few cores it was given.
+        # Shared policy (affinity, cgroup CPU and memory, datasets' start method); cpu_count + 4 counted the whole host.
         from .dataset_num_proc import get_dataset_num_proc
         num_proc = get_dataset_num_proc(None)
 
