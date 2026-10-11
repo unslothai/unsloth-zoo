@@ -24,7 +24,7 @@ import functools
 import inspect
 
 import torch
-from torch.utils.checkpoint import checkpoint
+import torch.utils.checkpoint
 
 __all__ = [
     "every_n_checkpoint_function",
@@ -42,12 +42,20 @@ def _owner(function):
     return getattr(function, "__self__", function)
 
 
+def _torch_checkpoint(use_reentrant):
+    # Looked up per call, so a checkpoint patched in later (Unsloth's offloaded one, a test probe) is the one used.
+    def run(function, *args, **kwargs):
+        return torch.utils.checkpoint.checkpoint(function, *args, use_reentrant = use_reentrant, **kwargs)
+
+    return run
+
+
 def every_n_checkpoint_function(every_n_blocks = 1, use_reentrant = False, checkpoint_function = None):
     """A ``gradient_checkpointing_func`` that checkpoints every Nth distinct caller in first-call (forward) order.
 
     Counting callers rather than a class list makes it exact wherever a model routes the function: the SDXL UNet
     also checkpoints ResnetBlock2D, which its ``_repeated_blocks`` (BasicTransformerBlock only) does not list."""
-    base = checkpoint_function or functools.partial(checkpoint, use_reentrant = use_reentrant)
+    base = checkpoint_function or _torch_checkpoint(use_reentrant)
     every_n_blocks = max(1, int(every_n_blocks))
     if every_n_blocks == 1:
         return base
@@ -130,5 +138,5 @@ def enable_block_gradient_checkpointing(model, every_n_blocks = 1, use_reentrant
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": use_reentrant})
         setter(enable = True, gradient_checkpointing_func = function)
         return "transformers"
-    base = checkpoint_function or functools.partial(checkpoint, use_reentrant = use_reentrant)
+    base = checkpoint_function or _torch_checkpoint(use_reentrant)
     return _wrap_blocks(model, every_n_blocks, base)

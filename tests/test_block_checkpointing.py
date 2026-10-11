@@ -173,6 +173,15 @@ def test_transformers_model_checkpoints_with_identical_grads():
     assert len(calls) == 2
 
 
+def test_default_checkpoint_is_looked_up_per_call(monkeypatch):
+    seen = []
+    real = torch.utils.checkpoint.checkpoint
+    function = bc.every_n_checkpoint_function(1)
+    monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", lambda f, *a, **k: seen.append(k) or real(f, *a, **k))
+    function(nn.Linear(2, 2), torch.randn(1, 2, requires_grad = True))
+    assert seen == [{"use_reentrant": False}]
+
+
 def test_find_repeated_blocks_prefers_declared_classes_then_the_heaviest_list():
     model = _Stack(3)
     assert bc.find_repeated_blocks(model) == list(model.layers)
