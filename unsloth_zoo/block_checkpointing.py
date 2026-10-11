@@ -43,9 +43,12 @@ def _owner(function):
 
 
 def _torch_checkpoint(use_reentrant):
-    # Looked up per call, so a checkpoint patched in later (Unsloth's offloaded one, a test probe) is the one used.
+    # torch's own checkpoint, looked up per call. Unsloth's LLM shims (patch_gradient_checkpointing and friends) force
+    # reentrant / offloaded recompute, so the pristine function they stash wins over whatever is patched in now.
     def run(function, *args, **kwargs):
-        return torch.utils.checkpoint.checkpoint(function, *args, use_reentrant = use_reentrant, **kwargs)
+        ck = torch.utils.checkpoint
+        fn = getattr(ck, "_unsloth_pristine_checkpoint", None) or ck.checkpoint
+        return fn(function, *args, use_reentrant = use_reentrant, **kwargs)
 
     return run
 

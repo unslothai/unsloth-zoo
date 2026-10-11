@@ -180,6 +180,14 @@ def test_default_checkpoint_is_looked_up_per_call(monkeypatch):
     monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", lambda f, *a, **k: seen.append(k) or real(f, *a, **k))
     function(nn.Linear(2, 2), torch.randn(1, 2, requires_grad = True))
     assert seen == [{"use_reentrant": False}]
+    # An Unsloth shim patched over torch's checkpoint is bypassed for the pristine function it stashed.
+    pristine = []
+    monkeypatch.setattr(
+        torch.utils.checkpoint, "_unsloth_pristine_checkpoint",
+        lambda f, *a, **k: pristine.append(k) or real(f, *a, **k), raising = False,
+    )
+    function(nn.Linear(2, 2), torch.randn(1, 2, requires_grad = True))
+    assert seen == [{"use_reentrant": False}] and pristine == [{"use_reentrant": False}]
 
 
 def test_find_repeated_blocks_prefers_declared_classes_then_the_heaviest_list():
