@@ -209,3 +209,27 @@ def test_missing_fp8_experts_is_refused_cleanly(monkeypatch):
     monkeypatch.setattr(vu, "_fp8_experts_class", lambda: None)
     with pytest.raises(NotImplementedError, match = "FP8Experts"):
         vu._swap_in_fp8_experts(torch.nn.Module(), {"model.layers.0.mlp.experts.gate_up_proj_scale_inv": None}, None)
+
+
+@pytest.mark.parametrize("skip", [
+    dict(modules_to_not_convert = ["lm_head", "model.layers.0.mlp.experts"]),
+    dict(modules_to_not_convert = ["mlp.experts.3.down_proj"]),
+    dict(ignore = ["re:.*experts.*"]),
+])
+def test_unquantized_experts_are_left_to_the_16bit_path(skip):
+    # FP8 attention with 16-bit experts: vLLM keeps the experts 16-bit, which are shared as before.
+    assert fp8_moe_checkpoint_scheme(_qcfg(weight_block_size = None, **skip)) is None
+    # A shareable block checkpoint keeps its verdict (Unsloth still pins the Triton FP8 MoE kernel).
+    assert fp8_moe_checkpoint_scheme(_qcfg(**skip)) == (True, None)
+
+
+def test_shared_experts_skip_is_not_routed_experts():
+    cfg = _qcfg(weight_block_size = None, modules_to_not_convert = ["model.layers.0.mlp.shared_experts"])
+    assert fp8_moe_checkpoint_scheme(cfg)[0] is False
+
+
+def test_16bit_refusal_names_a_working_alternative():
+    with pytest.raises(NotImplementedError) as err:
+        vllm_moe_expert_weights(_fp8_routed(), "layer 0")
+    assert "BF16" in str(err.value) and "fast_inference = False" in str(err.value)
+    assert "(load_in_4bit = False)" not in str(err.value)

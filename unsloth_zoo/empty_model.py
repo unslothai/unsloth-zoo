@@ -1662,8 +1662,8 @@ def vllm_moe_expert_weights(experts, where, config = None):
         if value.dtype not in (torch.float16, torch.bfloat16, torch.float32):
             raise NotImplementedError(
                 f"Unsloth: fast_inference cannot rebuild quantized MoE weights ({where} {name} is "
-                f"{value.dtype}); load the model in 16-bit (load_in_4bit = False) or set "
-                "fast_inference = False."
+                f"{value.dtype}); load_in_4bit = False does not change a checkpoint's own quantization. "
+                "Load the 16-bit (BF16) checkpoint, or set fast_inference = False."
             )
     return w13, w2
 pass
@@ -1726,6 +1726,26 @@ def fp8_moe_checkpoint_scheme(config):
     if method == "modelopt":
         is_fp8 = "FP8" in str(quant.get("quant_algo", "")).upper()
     if not is_fp8: return None
+    verdict = _fp8_moe_block_verdict(method, quant, text_config)
+    if not verdict[0] and _quant_config_skips_experts(quant):
+        # The checkpoint keeps its experts unquantized, so vLLM holds them in 16-bit and they are
+        # shared like a BF16 checkpoint's; vllm_moe_expert_descriptor checks the runtime tensors.
+        return None
+    return verdict
+pass
+
+
+def _quant_config_skips_experts(quant):
+    """Whether an FP8 quantization_config leaves routed experts unquantized (skip / ignore lists)."""
+    for key in ("modules_to_not_convert", "ignore", "ignored_layers", "exclude_modules"):
+        for entry in quant.get(key, None) or ():
+            if isinstance(entry, str) and re.search(r"(^|[.:*])experts($|[.$*])", entry):
+                return True
+    return False
+pass
+
+
+def _fp8_moe_block_verdict(method, quant, text_config):
     if method != "fp8":
         return False, f"its {method} FP8 format is not vLLM's block FP8 (quant_method = 'fp8')"
     block = quant.get("weight_block_size", None)
