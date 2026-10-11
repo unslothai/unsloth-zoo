@@ -35,6 +35,15 @@ CHILD = textwrap.dedent(
     import json, math, sys
     import torch, torch._dynamo
     from torch._dynamo.utils import counters
+    # Dynamo only: the guard on the traced chunk list is what recompiled, and inductor's CPU
+    # codegen for a 32-chunk forward and backward overran CI's 300 s timeout.
+    _compile = torch.compile
+    def _dynamo_only(fn = None, **kw):
+        kw.pop("options", None)
+        kw.pop("mode", None)
+        kw["backend"] = "eager"
+        return _compile(**kw) if fn is None else _compile(fn, **kw)
+    torch.compile = _dynamo_only
     import unsloth_zoo.rl_replacements as R
 
     chunks, hidden, vocab = 32, 24, 64
