@@ -925,6 +925,11 @@ def _release_dequantized_banks_until_backward(output, inputs, banks):
     """
     if not torch.is_grad_enabled() or not isinstance(output, torch.Tensor) or output.grad_fn is None:
         return
+    # A forward running inside backward is a gradient checkpointing recompute (Unsloth's and reentrant
+    # checkpointing): this layer's backward follows at once, so releasing would only re-dequantize.
+    _graph_task_id = getattr(torch._C, "_current_graph_task_id", None)
+    if _graph_task_id is not None and _graph_task_id() != -1:
+        return
     tracked = []
     for dequantized, base, quant, quant_kind in banks:
         if (

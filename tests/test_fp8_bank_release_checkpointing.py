@@ -1,0 +1,91 @@
+# Unsloth Zoo - Utilities for Unsloth
+# Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+"""The BF16 dequantized FP8 expert banks are released between forward and backward, except when the
+forward is a gradient checkpointing recompute (it runs inside backward, and this layer's backward follows
+at once), where releasing would only re-dequantize the banks for nothing."""
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+import pytest
+import torch
+import torch.utils.checkpoint as tuc
+
+import unsloth_zoo.temporary_patches.moe_utils_fp8 as M
+
+E, N, K = 2, 8, 4
+
+
+@pytest.fixture
+def bank(monkeypatch):
+    refills = []
+
+    def fake_dequant(base, quant, dtype, quant_kind = None):
+        refills.append(base.shape[0])
+        return base.to(dtype) * quant
+    monkeypatch.setattr(M, "_dequantize_full_expert_weights", fake_dequant)
+    torch.manual_seed(0)
+    base = torch.randn(E, N, K).to(torch.float8_e4m3fn)
+    quant = torch.tensor(0.5)
+    return base, quant, refills
+
+
+def _layer(x, base, quant, nbytes_after_release):
+    dequantized = (base.to(torch.bfloat16) * quant).contiguous()
+    out = torch.einsum("tk,enk->tn", x, dequantized)
+    M._release_dequantized_banks_until_backward(out, x, ((dequantized, base, quant, None),))
+    nbytes_after_release.append(dequantized.untyped_storage().nbytes())
+    return out
+
+
+def test_plain_forward_releases_and_refills_for_backward(bank):
+    base, quant, refills = bank
+    x = torch.randn(3, K, dtype = torch.bfloat16, requires_grad = True)
+    seen = []
+    out = _layer(x, base, quant, seen)
+    assert seen == [0]  # released after forward
+    out.float().square().sum().backward()
+    assert sum(refills) == E  # the whole bank refilled once for this backward
+    ref_x = x.detach().clone().requires_grad_(True)
+    torch.einsum("tk,enk->tn", ref_x, (base.to(torch.bfloat16) * quant)).float().square().sum().backward()
+    assert torch.equal(x.grad, ref_x.grad)
+
+
+def test_reentrant_checkpoint_recompute_keeps_the_bank(bank):
+    base, quant, refills = bank
+    x = torch.randn(3, K, dtype = torch.bfloat16, requires_grad = True)
+    seen = []
+    out = tuc.checkpoint(lambda h: _layer(h, base, quant, seen), x, use_reentrant = True)
+    out.float().square().sum().backward()
+    # First forward under no_grad, recompute inside backward: neither releases, nothing is re-dequantized.
+    assert len(seen) == 2 and all(nbytes > 0 for nbytes in seen), seen
+    assert refills == []
+    ref_x = x.detach().clone().requires_grad_(True)
+    torch.einsum("tk,enk->tn", ref_x, (base.to(torch.bfloat16) * quant)).float().square().sum().backward()
+    assert torch.equal(x.grad, ref_x.grad)
+
+
+def test_non_reentrant_checkpoint_still_releases_the_first_forward(bank):
+    base, quant, refills = bank
+    x = torch.randn(3, K, dtype = torch.bfloat16, requires_grad = True)
+    seen = []
+    out = tuc.checkpoint(lambda h: _layer(h, base, quant, seen), x, use_reentrant = False)
+    assert seen == [0]  # the first forward runs with grad: its bank is released until backward
+    out.float().square().sum().backward()
+    assert all(nbytes > 0 for nbytes in seen[1:]), seen  # a recompute that reaches the hook keeps it
+    ref_x = x.detach().clone().requires_grad_(True)
+    torch.einsum("tk,enk->tn", ref_x, (base.to(torch.bfloat16) * quant)).float().square().sum().backward()
+    assert torch.equal(x.grad, ref_x.grad)
