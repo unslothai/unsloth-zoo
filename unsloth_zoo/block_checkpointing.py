@@ -164,9 +164,10 @@ def _recompute_body(block, inner, *args, **kwargs):
     for hook_id, hook in _hooks(block, "forward_pre_hooks"):
         hook(block, args, kwargs) if hook_id in with_kwargs else hook(block, args)
     output = inner(*args, **kwargs)
-    from torch.nn.modules.module import _global_forward_hooks_with_kwargs
+    from torch.nn.modules import module
 
-    with_kwargs = {**block._forward_hooks_with_kwargs, **_global_forward_hooks_with_kwargs}
+    # torch < 2.6 has no global kwargs-hook registry.
+    with_kwargs = {**block._forward_hooks_with_kwargs, **getattr(module, "_global_forward_hooks_with_kwargs", {})}
     for hook_id, hook in _hooks(block, "forward_hooks"):
         hook(block, args, kwargs, output) if hook_id in with_kwargs else hook(block, args, output)
     return output

@@ -393,8 +393,12 @@ def test_an_aliased_block_is_one_caller():
 
 
 def test_a_global_kwargs_forward_hook_reruns_with_its_signature():
+    import inspect
+
     from torch.nn.modules.module import register_module_forward_hook
 
+    if "with_kwargs" not in inspect.signature(register_module_forward_hook).parameters:
+        pytest.skip("global kwargs forward hooks need torch >= 2.6")
     seen = []
     handle = register_module_forward_hook(lambda module, args, kwargs, output: seen.append(kwargs), with_kwargs = True)
     try:
