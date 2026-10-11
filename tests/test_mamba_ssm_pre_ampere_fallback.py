@@ -892,29 +892,35 @@ def test_installed_kernels_keep_the_fast_path(env, monkeypatch):
     assert Config().use_mamba_kernels is True
 
 
-def test_hub_kernels_keep_the_fast_path(env, monkeypatch):
-    """transformers 5 fetches mamba-ssm through `kernels` without a local wheel."""
-    _set_specs(monkeypatch, ("kernels",))
+@pytest.mark.parametrize("available", [True, False])
+def test_hub_kernels_on_5_2_to_5_10_follow_kernels_available(env, monkeypatch, available):
+    """5.2 - 5.10 lazy_load_kernel fetches from the Hub iff `from kernels import ...` worked."""
+    _set_specs(monkeypatch, ("kernels",))  # the package is installed
+    env[2]._kernels_available = available
     _mod, Config = _fake_config_module(CONFIG_MODS[1], "ZambaConfig")
     missing_patch()
-    assert Config().use_mamba_kernels is True
+    assert Config().use_mamba_kernels is available
 
 
-def test_kernels_package_without_a_mamba_hub_entry_still_falls_back(env, monkeypatch):
+@pytest.mark.parametrize("compatible, enabled, fast", [
+    (True, True, True), (False, True, False), (True, False, False),
+])
+def test_hub_kernels_on_5_14_follow_its_loader_gate(env, monkeypatch, compatible, enabled, fast):
+    """5.14 lazy_load_kernel: `is_kernels_available() and _kernels_enabled` (USE_HUB_KERNELS)."""
+    _set_specs(monkeypatch, ("kernels",))  # the package is installed
+    env[2].is_kernels_available = lambda: compatible
+    env[2]._kernels_enabled = enabled
+    _mod, Config = _fake_config_module(CONFIG_MODS[1], "ZambaConfig")
+    missing_patch()
+    assert Config().use_mamba_kernels is fast
+
+
+def test_no_mamba_hub_entry_still_falls_back(env, monkeypatch):
     """transformers 4.57 has hub_kernels but no mamba-ssm entry: Jamba imports locally."""
-    _set_specs(monkeypatch, ("kernels",))
+    _set_specs(monkeypatch, ("kernels",))  # the package is installed
+    env[2]._kernels_available = True
     env[2]._HUB_KERNEL_MAPPING.pop("mamba-ssm")
     _mod, Config = _fake_config_module(CONFIG_MODS[0], "JambaConfig")
-    missing_patch()
-    assert Config().use_mamba_kernels is False
-
-
-def test_hub_kernels_disabled_by_env_still_falls_back(env, monkeypatch):
-    """USE_HUB_KERNELS=0 sets hub_kernels._kernels_enabled False; on 5.14
-    lazy_load_kernel then returns None although the registry entry stays."""
-    _set_specs(monkeypatch, ("kernels",))
-    env[2]._kernels_enabled = False
-    _mod, Config = _fake_config_module(CONFIG_MODS[1], "ZambaConfig")
     missing_patch()
     assert Config().use_mamba_kernels is False
 

@@ -1645,14 +1645,14 @@ def _mamba_fast_kernels_missing():
             return False  # Unknown: keep upstream behaviour
     else:
         return False
-    # transformers 5 can fetch the kernels from the Hub through `kernels`.
+    # transformers 5 can fetch the kernels from the Hub: mirror lazy_load_kernel's own gate.
     try:
-        if importlib.util.find_spec("kernels") is None:
-            return True
         from transformers.integrations import hub_kernels as _hk
-        if _hk.__dict__.get("_kernels_enabled", True) is False:
-            return True  # USE_HUB_KERNELS=0 (lazy_load_kernel honours it on 5.14)
-        return "mamba-ssm" not in getattr(_hk, "_HUB_KERNEL_MAPPING", {})
+        if "mamba-ssm" not in getattr(_hk, "_HUB_KERNEL_MAPPING", {}):
+            return True
+        if "_kernels_available" in _hk.__dict__:
+            return not _hk._kernels_available  # 5.2 - 5.10: `from kernels import ...` succeeded
+        return not (_hk.is_kernels_available() and _hk.__dict__.get("_kernels_enabled", True))
     except Exception:
         return True
 pass
