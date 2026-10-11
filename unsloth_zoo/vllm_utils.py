@@ -4594,11 +4594,9 @@ _MOE_STACKED_LORA_KEY = re.compile(r"^(.*)\.(lora_A|lora_B)\.weight$")
 def _moe_lone_expert_lora_prefixes(keys):
     """Stacked expert prefixes that carry only ONE of the gate_up / down_proj LoRA pairs.
 
-    PEFT nests one ParamWrapper per targeted parameter, so with both gate_up_proj and
-    down_proj targeted gate_up lands at `<experts>.base_layer.lora_*` and down_proj at
-    `<experts>.lora_*`. Targeting only one of them leaves a lone `<experts>.lora_*` pair,
-    which vLLM's FusedMoE3DWithLoRA cannot take: `_stack_moe_lora_weights` asserts that
-    the `.base_layer` half exists and reads the outer half as down_proj.
+    PEFT nests a ParamWrapper per target: gate_up at `<experts>.base_layer.lora_*`, down_proj at
+    `<experts>.lora_*`. vLLM's `_stack_moe_lora_weights` asserts the `.base_layer` half exists and
+    reads the outer half as down_proj, so a lone pair breaks it.
     """
     # All Unsloth Zoo code licensed under LGPLv3
     outer, base = set(), set()
