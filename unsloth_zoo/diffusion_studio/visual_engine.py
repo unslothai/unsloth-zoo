@@ -260,8 +260,7 @@ class VisualServer:
         self.p = subprocess.Popen([self.server_bin, self.gguf], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   env=self.env, bufsize=1, text=True,
                                   preexec_fn=_set_pdeathsig if os.name == "posix" else None)
-        # The server prints raw UTF-8 JSON, but opens the request path we send on stdin with narrow
-        # fopen (the ANSI code page on Windows), so only stdout is UTF-8; stdin keeps the locale encoding.
+        # Only stdout is UTF-8: the server fopen()s the stdin request path, which is ANSI on Windows.
         self.p.stdout = io.TextIOWrapper(self.p.stdout.detach(), encoding="utf-8")
         line = self.p.stdout.readline().strip()
         if not line.startswith("READY"):

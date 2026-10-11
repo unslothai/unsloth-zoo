@@ -7,9 +7,7 @@
 # (at your option) any later version.
 # SPDX-License-Identifier: AGPL-3.0-or-later
 
-# The visual server prints raw UTF-8 but opens the request path from stdin with narrow
-# fopen, so a non-UTF-8 locale (Windows ANSI code page) must not mangle its replies
-# (unsloth#6489) nor the request path. The stub mirrors the server at the byte level.
+# unsloth#6489: the stub mirrors the visual server at the byte level (raw UTF-8 out, fopen of the stdin path).
 
 from __future__ import annotations
 
