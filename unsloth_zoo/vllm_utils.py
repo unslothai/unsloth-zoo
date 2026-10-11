@@ -1067,6 +1067,13 @@ def get_vllm_state_dict(
         return _get_vllm_state_dict(llm, return_state_dict, config, is_vision_model)
 
 
+def _block_scale_rows(start, end, block_size):
+    """Scale rows covering weight rows [start, end): every block the slice touches. A block shared by
+    two fused projections (widths not a multiple of the block) goes to both, as each one needs it."""
+    return start // block_size, -(-end // block_size)
+pass
+
+
 def _block_scale_grid_matches(weight_shape, scale_shape, block_size):
     """A block FP8 scale grid has ceil(dim / block) entries per dimension, so a dimension smaller
     than (or not a multiple of) its block still gets one scale for the partial block."""
@@ -1202,10 +1209,9 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
                     qweight = qweight.T
                     block_size = 1
 
-                # Ceil: a partial last block (dimension not a multiple of the block) still owns a scale row.
-                scale_offsets = [-(-x // block_size) for x in offsets]
                 if slice_weights:
-                    weight_scale = weight_scale[scale_offsets[kk] : scale_offsets[kk + 1]]
+                    lo, hi = _block_scale_rows(offsets[kk], offsets[kk + 1], block_size)
+                    weight_scale = weight_scale[lo : hi]
 
             if slice_weights:
                 weight = qweight[offsets[kk] : offsets[kk + 1]]

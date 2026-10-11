@@ -18,7 +18,7 @@ multiple of) its block: the scale grid has ceil(dim / block) entries, not dim //
 
 import pytest
 
-from unsloth_zoo.vllm_utils import _block_scale_grid_matches
+from unsloth_zoo.vllm_utils import _block_scale_grid_matches, _block_scale_rows
 
 
 @pytest.mark.parametrize("weight, scale", [
@@ -38,3 +38,26 @@ def test_valid_grids_match(weight, scale):
 ])
 def test_wrong_grids_are_refused(weight, scale):
     assert not _block_scale_grid_matches(weight, scale, (128, 128))
+
+
+def _slices(widths, block):
+    offsets = [0]
+    for w in widths:
+        offsets.append(offsets[-1] + w)
+    return [_block_scale_rows(offsets[k], offsets[k + 1], block) for k in range(len(widths))]
+
+
+def test_aligned_fused_slices_are_disjoint():
+    # qkv [4096, 1024, 1024] at block 128: exactly the old floor offsets.
+    assert _slices([4096, 1024, 1024], 128) == [(0, 32), (32, 40), (40, 48)]
+
+
+def test_unaligned_fused_slices_keep_their_shared_blocks():
+    # Three 16-row projections in one 128-row block: each needs that block, none gets an empty scale.
+    assert _slices([16, 16, 16], 128) == [(0, 1), (0, 1), (0, 1)]
+    # A boundary inside a block goes to both neighbours.
+    assert _slices([200, 100], 128) == [(0, 2), (1, 3)]
+
+
+def test_per_row_scales_slice_exactly():
+    assert _slices([3, 5], 1) == [(0, 3), (3, 8)]
