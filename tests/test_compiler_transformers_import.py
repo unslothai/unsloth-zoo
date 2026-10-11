@@ -98,5 +98,4 @@ def test_gemma4_compiles_with_patched_mask_builders(tmp_path):
     line = [row for row in result.stdout.splitlines() if row.startswith("@@@")]
     assert line, result.stdout[-4000:] + result.stderr[-4000:]
     payload = json.loads(line[-1][3:])
-    # Re-emitting the wrapper under create_causal_mask's name left its closure names unbound.
     assert payload == {"error": None, "emits_wrapper": False, "signature_kept": True}, payload
