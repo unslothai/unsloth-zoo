@@ -60,7 +60,20 @@ def _block_mask(w, nb, device):
     return m
 
 
-def _mask_is_plain_band(mask, S, w, _block=1024):
+def _packed_documents(packed_seq_lengths):
+    """True when packed_seq_lengths names more than one document (no host sync)."""
+    if packed_seq_lengths is None:
+        return False
+    numel = getattr(packed_seq_lengths, "numel", None)
+    if callable(numel):
+        return numel() > 1
+    try:
+        return len(packed_seq_lengths) > 1
+    except TypeError:
+        return True
+
+
+def _mask_is_plain_band(mask, S, w, _block=1024, packed_seq_lengths=None):
     """True only if `mask` is exactly the causal+sliding band with no token padding.
 
     Shared by both the FlashAttention-2 window path and the banded SDPA fallback,
@@ -70,9 +83,11 @@ def _mask_is_plain_band(mask, S, w, _block=1024):
     (shape[1] > 1) masks are rejected as well: the banded kernel applies one block
     mask to every head, so it cannot honour them. The verdict is stashed on the
     tensor itself, so it can never collide with a recycled object id.
+    A packed row (packed_seq_lengths with several documents) arriving with no mask
+    is not a plain band: its document boundaries are not in the mask to verify.
     """
     if mask is None:
-        return True
+        return not _packed_documents(packed_seq_lengths)
     if not torch.is_tensor(mask) or mask.dim() != 4:
         return False
     # Under torch.compile the band verdict drives Python control flow via .item()
@@ -142,3 +157,90 @@ def _banded_sdpa_core(query, key, value, w, scaling, dropout, num_key_value_grou
     out = F.scaled_dot_product_attention(qb, kw, vw, attn_mask=mask, dropout_p=dropout, scale=scaling)
     out = out.reshape(B, nb, H, w, d).permute(0, 2, 1, 3, 4).reshape(B, H, Sp, d)[:, :, :S]
     return out.transpose(1, 2).contiguous()               # (B,S,H,d) to match sdpa_attention_forward
+
+
+_PACKED_DOC_ENGAGED = [0]    # count of per-document packed SDPA invocations (debug)
+
+
+def _packed_lengths(packed_seq_lengths):
+    """Host tuple of document lengths, cached on the lengths tensor (one sync per batch)."""
+    cached = getattr(packed_seq_lengths, "_unsloth_lengths_tuple", None)
+    if cached is not None:
+        return cached
+    if torch.is_tensor(packed_seq_lengths):
+        lengths = tuple(int(x) for x in packed_seq_lengths.reshape(-1).tolist())
+    else:
+        lengths = tuple(int(x) for x in packed_seq_lengths)
+    try:
+        packed_seq_lengths._unsloth_lengths_tuple = lengths
+    except Exception:
+        pass
+    return lengths
+
+
+def _mask_is_block_causal(mask, lengths, w, _block=1024):
+    """True only if `mask` (1, 1, T, T) is exactly causal (k > q - w when windowed) inside each
+    document of `lengths` and closed across them, with no in-band bias."""
+    T = sum(lengths)
+    if (not torch.is_tensor(mask) or mask.dim() != 4 or mask.shape[0] != 1 or mask.shape[1] != 1
+            or mask.shape[-2] != T or mask.shape[-1] != T or min(lengths, default=0) <= 0):
+        return False
+    try:
+        key = (lengths, w, mask._version)
+    except RuntimeError:
+        key = None  # inference tensors carry no version counter: always rechecked
+    cached = getattr(mask, "_unsloth_block_causal", None)
+    if key is not None and cached is not None and cached[0] == key:
+        return cached[1]
+    device = mask.device
+    segment = torch.repeat_interleave(
+        torch.arange(len(lengths), device=device),
+        torch.tensor(lengths, device=device),
+    )
+    idx = torch.arange(T, device=device)
+    m = mask[0, 0]
+    is_bool = m.dtype == torch.bool
+    ok = True
+    for start in range(0, T, _block):
+        rows = idx[start : start + _block]
+        allowed = (segment[rows, None] == segment[None, :]) & (idx[None, :] <= rows[:, None])
+        if w:
+            allowed &= idx[None, :] > rows[:, None] - w
+        msl = m[start : start + _block]
+        match = (msl == allowed) if is_bool else torch.where(allowed, msl == 0, msl <= -1e4)
+        if not bool(match.all().item()):
+            ok = False
+            break
+    if key is not None:
+        try:
+            mask._unsloth_block_causal = (key, ok)
+        except Exception:
+            pass
+    return ok
+
+
+def _packed_document_sdpa(query, key, value, mask, packed_seq_lengths, w, scaling, num_key_value_groups):
+    """SDPA per packed document instead of over the (T, T) block-causal mask: the same result
+    without the T x T scores. q (1,H,T,d), k / v (1,Hkv,T,d) -> (1,H,T,d); None when the mask
+    is anything but the block-causal (windowed by w) mask of `packed_seq_lengths`."""
+    if query.shape[0] != 1 or key.shape[2] != query.shape[2]:
+        return None
+    lengths = _packed_lengths(packed_seq_lengths)
+    if not lengths or not _mask_is_block_causal(mask, lengths, w):
+        return None
+    if num_key_value_groups > 1:
+        # Repeated heads keep SDPA's efficient kernel (enable_gqa leaves fp32 on the math one).
+        key = key.repeat_interleave(num_key_value_groups, dim=1)
+        value = value.repeat_interleave(num_key_value_groups, dim=1)
+    outs, start = [], 0
+    for L in lengths:
+        q, k, v = (x[:, :, start : start + L] for x in (query, key, value))
+        if w and L > w:
+            i = torch.arange(L, device=query.device)
+            band = (i[None, :] <= i[:, None]) & (i[None, :] > i[:, None] - w)
+            outs.append(F.scaled_dot_product_attention(q, k, v, attn_mask=band, scale=scaling))
+        else:
+            outs.append(F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scaling))
+        start += L
+    _PACKED_DOC_ENGAGED[0] += 1
+    return torch.cat(outs, dim=2)

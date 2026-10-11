@@ -365,6 +365,10 @@ def _patch_gemma4_text_attention(module, prefix):
     ALL_ATTENTION_FUNCTIONS = module.ALL_ATTENTION_FUNCTIONS
     scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
     scaled_dot_product_attention = torch.compiler.disable(scaled_dot_product_attention, recursive = True)
+    from .gemma4_banded_attention import _packed_document_sdpa
+    # Eager like the SDPA above: the mask check reads the mask on the host.
+    packed_document_sdpa = torch.compiler.disable(_packed_document_sdpa, recursive = True)
+    packed_documents = os.environ.get("UNSLOTH_GEMMA4_PACKED_DOCUMENTS", "1") != "0"
 
     def forward(
         self,
@@ -481,16 +485,36 @@ def _patch_gemma4_text_attention(module, prefix):
             if isinstance(attn_mask, torch.Tensor) and attn_mask.dtype != torch.bool:
                 attn_mask = attn_mask.to(torch.float32)
             is_causal = attn_mask is None and query_states.shape[2] > 1 and getattr(self, "is_causal", True)
-            attn_output = scaled_dot_product_attention(
-                query_states,
-                key_states,
-                value_states,
-                attn_mask = attn_mask,
-                dropout_p = self.attention_dropout if self.training else 0.0,
-                is_causal = is_causal,
-                scale = self.scaling,
-                enable_gqa = getattr(self, "num_key_value_groups", 1) != 1,
-            )
+            attn_output = None
+            if (
+                kwargs.get("packed_seq_lengths", None) is not None
+                and attn_mask is not None
+                and not (self.training and self.attention_dropout)
+                and getattr(self, "is_causal", True)
+                and packed_documents
+            ):
+                # A packed row: SDPA per document, not over the (T, T) block-causal mask.
+                attn_output = packed_document_sdpa(
+                    query_states,
+                    key_states,
+                    value_states,
+                    attn_mask,
+                    kwargs["packed_seq_lengths"],
+                    getattr(self, "sliding_window", None),
+                    self.scaling,
+                    getattr(self, "num_key_value_groups", 1) or 1,
+                )
+            if attn_output is None:
+                attn_output = scaled_dot_product_attention(
+                    query_states,
+                    key_states,
+                    value_states,
+                    attn_mask = attn_mask,
+                    dropout_p = self.attention_dropout if self.training else 0.0,
+                    is_causal = is_causal,
+                    scale = self.scaling,
+                    enable_gqa = getattr(self, "num_key_value_groups", 1) != 1,
+                )
             attn_output = attn_output.transpose(1, 2)  # (b, h, q, d) -> (b, q, h, d)
 
         # (b, q, h, d) -> (b, q, h*d), down-cast to fp16 for o_proj.
