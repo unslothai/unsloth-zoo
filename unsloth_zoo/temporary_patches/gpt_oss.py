@@ -3212,11 +3212,13 @@ def patch_GptOssAttention():
             budget = _EAGER_ATTENTION_CHUNK_BYTES
             if budget is None and query.is_cuda and per_row * qlen > _EAGER_ATTENTION_CHECK_BYTES:
                 # Chunks are slower (+4.6% prefill at 4 x 4096 with 1 GiB ones), so split only when one shot would not fit.
-                key = (query.device, bsz, qlen)
-                if getattr(module, "layer_idx", 0) == 0 or _EAGER_ATTENTION_FREE[0] != key:
+                key_id = (query.device, bsz, qlen)
+                if getattr(module, "layer_idx", 0) == 0 or _EAGER_ATTENTION_FREE[0] != key_id:
                     free, _ = torch.cuda.mem_get_info(query.device)
                     cached = torch.cuda.memory_reserved(query.device) - torch.cuda.memory_allocated(query.device)
-                    _EAGER_ATTENTION_FREE[:] = [key, free + cached]
+                    # Later layers still add their K/V to the cache during this prefill.
+                    kv_cache = (key.numel() + value.numel()) * key.element_size() * getattr(module.config, "num_hidden_layers", 1)
+                    _EAGER_ATTENTION_FREE[:] = [key_id, max(0, free + cached - kv_cache)]
                 budget = _EAGER_ATTENTION_FREE[1] // 2
             if budget is not None:
                 rows = max(1, min(qlen, budget // per_row))
