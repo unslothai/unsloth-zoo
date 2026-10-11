@@ -2187,7 +2187,9 @@ def _kv_cache_elements_per_token(config):
             n_kv_heads = _get(None, "num_global_key_value_heads") or n_kv_heads
         if not head_dim: head_dim = hd // n_heads
         if not n_kv_heads: n_kv_heads = n_heads
-        elements = 2 * head_dim * n_kv_heads
+        # vLLM sizes K and V separately (head_size + head_size_v); MiMo-V2 has v_head_dim != head_dim.
+        v_head_dim = _get(layer, "v_head_dim") or head_dim
+        elements = (head_dim + v_head_dim) * n_kv_heads
         window = _get(layer, "sliding_window") or sliding_window
         if layer_type == "sliding_attention" and window:
             sliding[window] = sliding.get(window, 0) + elements

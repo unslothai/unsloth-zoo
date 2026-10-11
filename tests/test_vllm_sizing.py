@@ -58,6 +58,12 @@ def test_kv_estimate_uses_config_head_dim(monkeypatch):
     assert tokens == _tokens(kv_gb, 36 * 2 * 8 * 128 * 2)
 
 
+def test_kv_estimate_separate_value_head_dim():
+    # MiMo-V2-Flash style: K is 192 wide, V 128; vLLM caches (head_size + head_size_v) per KV head.
+    config = _config(head_dim = 192, v_head_dim = 128, num_key_value_heads = 4)
+    assert vllm_utils._kv_cache_elements_per_token(config) == (36 * (192 + 128) * 4, [])
+
+
 def test_kv_estimate_without_head_dim_is_unchanged(monkeypatch):
     tokens, _, _, kv_gb = _estimate(monkeypatch, _config())
     assert tokens == _tokens(kv_gb, 36 * 2 * 8 * 80 * 2)
