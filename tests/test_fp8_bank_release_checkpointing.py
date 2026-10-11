@@ -154,3 +154,17 @@ def test_refill_slices_per_expert_2d_scales(scale_shape):
     ref_x = x.detach().clone().requires_grad_(True)
     torch.einsum("tk,enk->tn", ref_x, want).float().square().sum().backward()
     assert torch.equal(x.grad, ref_x.grad)
+
+
+def test_refilled_bank_is_released_when_autograd_prunes_the_input_gradient(bank):
+    # The output node also depends on routing weights r. Asking only for r's gradient runs that node
+    # (so the bank is refilled) but prunes the x branch, so x's release hook never fires.
+    base, quant, refills = bank
+    x = torch.randn(3, K, dtype = torch.bfloat16, requires_grad = True)
+    r = torch.rand(3, N, dtype = torch.bfloat16, requires_grad = True)
+    dequantized = (base.to(torch.bfloat16) * quant).contiguous()
+    out = torch.einsum("tk,enk->tn", x, dequantized) * r
+    M._release_dequantized_banks_until_backward(out, x, ((dequantized, base, quant, None),))
+    (gr,) = torch.autograd.grad(out.float().square().sum(), [r])
+    assert sum(refills) == E and gr is not None
+    assert dequantized.untyped_storage().nbytes() == 0  # released at the end of that backward
