@@ -40,14 +40,12 @@ _INDEX = "_unsloth_block_checkpoint_index"
 _FORWARD = "_unsloth_block_checkpoint_forward"
 # A custom checkpoint function may not pickle and should not follow a copy: a copy falls back to torch's checkpoint.
 _CUSTOM = weakref.WeakKeyDictionary()
-# A forward already patched on the instance stays in the block's own __dict__: it often references the block (accelerate's
-# hooks bind it), which a global registry would keep alive, and it copies / pickles exactly as it did before.
+# A pre-patched forward stays on the block: it often references the block (accelerate), so a global registry leaks it.
 _PREVIOUS = "_unsloth_block_checkpoint_previous_forward"
 
 
 class _Order:
-    # Per model, stamped on every submodule: deepcopy and pickle give a copy its own counter, and each block keeps the
-    # index it was given, so a copy checkpoints the same blocks as its original.
+    # Per model, on every submodule: a copy gets its own counter and keeps its blocks' indices.
     __slots__ = ("next",)
 
     def __init__(self):
@@ -69,10 +67,8 @@ def _owner(function):
 
 
 class _TorchCheckpoint:
-    # torch's own checkpoint, looked up per call. Unsloth's LLM shims (patch_gradient_checkpointing and friends) force
-    # reentrant / offloaded recompute, so the pristine function they stash wins over whatever is patched in now.
-    # Module-level callables, not closures: diffusers / transformers store the function on the model, which must
-    # still pickle with torch.save.
+    # Looked up per call: Unsloth's LLM shims force reentrant / offloaded recompute, so their stashed pristine one wins.
+    # A class, not a closure: diffusers / transformers store it on the model, which must still pickle.
     __slots__ = ("use_reentrant",)
 
     def __init__(self, use_reentrant):
@@ -155,10 +151,8 @@ def _hooks(block, name):
 
 
 def _recompute_body(block, inner, *args, **kwargs):
-    # The checkpointed function. In the forward pass (flag set by the wrapper) the body runs with the block's hooks
-    # already applied around it. Recompute reruns the hooks for their side effects only (fetched weights, transient
-    # state) and ignores what they return: the saved inputs already carry the forward's argument rewrite. It only reads
-    # flags: a write inside a compiled checkpoint is an unsafe side effect.
+    # Forward (flag set): the body, hooks already ran around it. Recompute: hooks rerun for side effects only, their
+    # return ignored (saved inputs carry the rewrite). Reads flags only: a write inside a compiled checkpoint is unsafe.
     if block.__dict__.get(_FORWARD):
         return inner(*args, **kwargs)
     with_kwargs = block._forward_pre_hooks_with_kwargs
@@ -175,8 +169,7 @@ def _recompute_body(block, inner, *args, **kwargs):
 
 
 class _CheckpointedForward:
-    # A block's instance ``forward``. A plain object holding its block: deepcopy and pickle carry it along with the
-    # block (a bound method pickles as getattr(block, "forward"), which reloads as the unwrapped class forward).
+    # Instance ``forward``: an object holding its block, so deepcopy / pickle keep it (a bound method reloads unwrapped).
     __slots__ = ("block",)
 
     def __init__(self, block):
@@ -188,8 +181,7 @@ class _CheckpointedForward:
         if not (block.training and torch.is_grad_enabled()):
             return inner(*args, **kwargs)
         run = _CUSTOM.get(block) or _TorchCheckpoint(getattr(block, _MARK, False))
-        # Eager non-reentrant recompute stops once the saved tensors are back, before a post-hook that releases state.
-        # Compiled, recompute is part of the backward graph and runs no Python hooks.
+        # Eager non-reentrant recompute stops early, before a releasing post-hook; compiled recompute runs no hooks.
         hooked = not torch.compiler.is_compiling() and (
             any(_hooks(block, "forward_pre_hooks")) or any(_hooks(block, "forward_hooks"))
         )
@@ -252,8 +244,7 @@ def enable_block_gradient_checkpointing(model, every_n_blocks = 1, use_reentrant
     if callable(getattr(model, "gradient_checkpointing_enable", None)) and callable(setter) and _accepts(
         setter, "gradient_checkpointing_func"
     ):
-        # gradient_checkpointing_enable also wires input grads for PEFT; the setter then installs our function. Once
-        # only: each call registers another embedding hook and orphans the previous handle.
+        # Enable once (it wires PEFT input grads; repeats stack embedding hooks), then the setter installs our function.
         if getattr(model, "is_gradient_checkpointing", False) is not True:
             model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": use_reentrant})
         setter(enable = True, gradient_checkpointing_func = function)
