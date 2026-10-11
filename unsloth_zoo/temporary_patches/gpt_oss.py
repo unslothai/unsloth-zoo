@@ -3206,10 +3206,12 @@ def patch_GptOssAttention():
         if qlen > 1 and not module.training and not torch.compiler.is_compiling():
             per_row = bsz * n_heads * (kvlen + 1) * (query.element_size() + 4)
             budget = _EAGER_ATTENTION_CHUNK_BYTES
+            if getattr(module, "layer_idx", 0) == 0:
+                _EAGER_ATTENTION_FREE[0] = None  # a new forward; sliding layer 0 may skip the query below
             if budget is None and query.is_cuda and per_row * qlen > _EAGER_ATTENTION_CHECK_BYTES:
                 # Chunks cost prefill speed, so split only when one shot would not fit; memory queries take ~0.3 ms, so once per forward.
                 key_id = (query.device, bsz, qlen)
-                if getattr(module, "layer_idx", 0) == 0 or _EAGER_ATTENTION_FREE[0] != key_id:
+                if _EAGER_ATTENTION_FREE[0] != key_id:
                     free, _ = torch.cuda.mem_get_info(query.device)
                     cached = torch.cuda.memory_reserved(query.device) - torch.cuda.memory_allocated(query.device)
                     # Later layers still append this prefill's qlen K/V rows to the cache.
