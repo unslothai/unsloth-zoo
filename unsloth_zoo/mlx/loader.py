@@ -629,6 +629,36 @@ def _raise_if_incomplete_mlx_config(
     ) from error
 
 
+# transformers 5 Lfm2Config pops block_ff_dim into intermediate_size, so re-saved
+# configs drop it; mlx-lm <0.32 requires it (unslothai/unsloth#7306, ml-explore/mlx-lm lfm2.py).
+_MLX_LM_CONFIG_ALIASES = {"lfm2": (("block_ff_dim", "intermediate_size"),)}
+
+
+def _mlx_lm_config_backfill(config):
+    """Keys mlx-lm requires that a transformers 5 re-save renamed away, read from *config*."""
+    if not isinstance(config, dict):
+        return {}
+    backfill = {}
+    for key, source in _MLX_LM_CONFIG_ALIASES.get(config.get("model_type"), ()):
+        value = config.get(source)
+        if key not in config and isinstance(value, int) and not isinstance(value, bool):
+            backfill[key] = value
+    return backfill
+
+
+def _mlx_lm_backfill_model_config(model_path, model_config):
+    try:
+        with open(os.path.join(model_path, "config.json"), "r", encoding="utf-8") as f:
+            config = json.load(f)
+    except (OSError, ValueError):
+        return model_config
+    backfill = {
+        key: value for key, value in _mlx_lm_config_backfill(config).items()
+        if key not in model_config
+    }
+    return {**model_config, **backfill} if backfill else model_config
+
+
 def _raise_if_qk_norm_version_gap(model_type, message, error):
     """A strict load rejecting q_norm / k_norm means mlx-lm / mlx-vlm is too old for
     this QK-norm arch; dropping those weights breaks the model, so raise instead."""
@@ -1237,6 +1267,7 @@ def _load_mlx_lm_with_strict_fallback(
 
     with _temporary_hf_token_env(hf_token):
         model_path = _download(model_name, revision=revision)
+    model_config = _mlx_lm_backfill_model_config(model_path, model_config)
 
     try:
         model, config = load_model(
@@ -1403,6 +1434,7 @@ def _load_mlx_lm_distributed(
             revision=revision,
             allow_patterns=_mlx_lm_metadata_allow_patterns(),
         )
+        model_config = _mlx_lm_backfill_model_config(model_path, model_config)
         with _temporary_mlx_lm_snapshot_view(model_path) as metadata_model_path:
             try:
                 model, config = load_model(

@@ -140,3 +140,75 @@ def test_text_load_keeps_non_config_init_type_error(monkeypatch, tmp_path):
     _stub_text_load(monkeypatch, tmp_path, {"model_type": "lfm2"}, message)
     with pytest.raises(TypeError, match="output_dims"):
         loader._load_mlx_lm_with_strict_fallback("unsloth/Example", "lfm2", None, {})
+
+
+def _capture_text_load(monkeypatch, tmp_path, config):
+    import json
+    import mlx_lm.utils as lm_utils
+
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    monkeypatch.setattr(lm_utils, "_download", lambda *a, **k: tmp_path)
+    seen = {}
+
+    class _Stop(Exception):
+        pass
+
+    def load_model(*args, **kwargs):
+        seen.update(kwargs.get("model_config") or {})
+        raise _Stop
+
+    monkeypatch.setattr(lm_utils, "load_model", load_model)
+    return seen, _Stop
+
+
+_LFM25_RESAVED = {"model_type": "lfm2", "intermediate_size": 2560, "block_dim": 1024}
+
+
+def test_lfm2_resaved_config_backfills_block_ff_dim(monkeypatch, tmp_path):
+    import unsloth_zoo.mlx.loader as loader
+
+    seen, stop = _capture_text_load(monkeypatch, tmp_path, _LFM25_RESAVED)
+    with pytest.raises(stop):
+        loader._load_mlx_lm_with_strict_fallback("unsloth/LFM2.5-230M", "lfm2", None, {})
+    assert seen == {"block_ff_dim": 2560}
+
+
+@pytest.mark.parametrize(
+    "model_type, config, model_config",
+    [
+        ("lfm2", {"model_type": "lfm2", "block_ff_dim": 6656, "intermediate_size": 1}, {}),
+        ("lfm2", {"model_type": "lfm2", "block_ff_dim": 6656}, {}),
+        ("lfm2", _LFM25_RESAVED, {"block_ff_dim": 7}),
+        ("lfm2_moe", {"model_type": "lfm2_moe", "intermediate_size": 2560}, {}),
+        ("llama", {"model_type": "llama", "intermediate_size": 2560}, {}),
+    ],
+)
+def test_backfill_leaves_other_configs_untouched(monkeypatch, tmp_path, model_type, config, model_config):
+    import unsloth_zoo.mlx.loader as loader
+
+    seen, stop = _capture_text_load(monkeypatch, tmp_path, config)
+    with pytest.raises(stop):
+        loader._load_mlx_lm_with_strict_fallback(
+            "unsloth/Example", model_type, None, {"model_config": dict(model_config)}
+        )
+    assert seen == model_config
+
+
+def test_config_backfill_is_shared_rule():
+    from unsloth_zoo.mlx.loader import _mlx_lm_config_backfill
+
+    assert _mlx_lm_config_backfill(_LFM25_RESAVED) == {"block_ff_dim": 2560}
+    assert _mlx_lm_config_backfill({**_LFM25_RESAVED, "block_ff_dim": 1}) == {}
+    assert _mlx_lm_config_backfill({"model_type": "lfm2"}) == {}
+    assert _mlx_lm_config_backfill({"model_type": "lfm2", "intermediate_size": True}) == {}
+    assert _mlx_lm_config_backfill(None) == {}
+
+
+def test_distributed_load_backfills_block_ff_dim(monkeypatch, tmp_path):
+    import unsloth_zoo.mlx.loader as loader
+
+    seen, stop = _capture_text_load(monkeypatch, tmp_path, _LFM25_RESAVED)
+    monkeypatch.setattr(loader, "_mlx_active_distributed_groups", lambda p, t: (None, None))
+    with pytest.raises(stop):
+        loader._load_mlx_lm_distributed("unsloth/LFM2.5-230M", "lfm2", {})
+    assert seen == {"block_ff_dim": 2560}
