@@ -2253,10 +2253,13 @@ def approximate_vllm_memory_usage(
     n_heads    = _config_get(config, "num_attention_heads", 1)
     # Group Query Attention. head_dim is not always hidden_size / heads (Qwen3, Gemma-3, gpt-oss).
     # Per-layer (Gemma-4) head_dim raises: keep hidden_size / heads for the weight formula there.
+    # MLA (DeepSeek-V2/V3) sets head_dim to the rope part only (64 of a 192 wide query head), so it
+    # would shrink the activation reserve: keep hidden_size / heads there.
     try:
-        head_dim = getattr(config, "head_dim", None) or hd // n_heads
+        head_dim = None if getattr(config, "kv_lora_rank", None) else getattr(config, "head_dim", None)
     except Exception:
-        head_dim = hd // n_heads
+        head_dim = None
+    head_dim = head_dim or hd // n_heads
     q_size  = head_dim * n_heads
     kv_size = head_dim * n_kv_heads
 

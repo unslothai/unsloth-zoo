@@ -77,6 +77,19 @@ def test_mla_caches_one_latent(monkeypatch):
     assert tokens == _tokens(kv_gb, 27 * 576 * 2)
 
 
+def test_mla_rope_head_dim_keeps_the_activation_reserve(monkeypatch):
+    # DeepSeek-V2 configs set head_dim to the rope width (64 of a 192 wide query head); reading it
+    # would shrink the training activation reserve and hand vLLM more memory than on main.
+    def mla(**kw):
+        return _config(kv_lora_rank = 512, qk_rope_head_dim = 64, num_attention_heads = 16,
+                       num_key_value_heads = 16, hidden_size = 2048, **kw)
+    monkeypatch.setattr(vllm_utils, "get_mem_info", lambda: (16 * GiB, 16 * GiB))
+    run = lambda c: vllm_utils.approximate_vllm_memory_usage(
+        c, max_seq_length = 32768, weight_bytes = 8 * GiB, gpu_memory_utilization = 0.9,
+    )
+    assert run(mla(head_dim = 64))[2] == run(mla())[2]
+
+
 def test_linear_attention_layers_hold_no_per_token_cache(monkeypatch):
     # Qwen3.5 / Qwen3-Next: 3 of every 4 layers are linear attention.
     layer_types = ["linear_attention"] * 3 + ["full_attention"]
