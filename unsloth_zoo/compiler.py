@@ -289,11 +289,8 @@ def calls_disable_compile_function(source, disable_compile_functions):
 
 
 def function_defined_elsewhere(modeling_file, name):
-    """True when `modeling_file.<name>` provably lives in another file. `def <name>` in the
-    modeling source can be a same-named method (Gemma 4's staticmethod
-    `create_masks_for_generate`) while the module attribute is an import, and once Unsloth
-    wraps it in a closure (temporary_patches/misc.py) getsource returns the closure body
-    with free variables. Unknown origin keeps the old behaviour (False)."""
+    """True when `modeling_file.<name>` is an import from another file (a same-named method can
+    match `def <name>`, and getsource on a wrapped closure returns free variables). Unknown: False."""
     try:
         function = inspect.unwrap(getattr(modeling_file, name))
         if not inspect.isfunction(function):
@@ -308,10 +305,7 @@ def function_defined_elsewhere(modeling_file, name):
 
 
 def signature_with_string_annotations(signature):
-    """`str(inspect.signature)` renders annotations by module path
-    (`transformers.cache_utils.Cache`, `collections.abc.Callable`), which the generated
-    module never imports, so `def f{signature}:` raises NameError at cache import.
-    Quoted annotations are never evaluated at def time; defaults are untouched."""
+    """Quote annotations: module-path names the generated file never imports raise NameError."""
     empty = inspect.Parameter.empty
     def stringify(annotation):
         if annotation is empty or isinstance(annotation, str):

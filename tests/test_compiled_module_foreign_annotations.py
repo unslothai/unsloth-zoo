@@ -14,13 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""unslothai/unsloth#13245: Gemma 4 on transformers 5.x died at cache import with
-`name 'transformers' is not defined`. Gemma 4 defines a staticmethod
-`create_masks_for_generate` and imports the masking_utils function of the same name,
-which Unsloth wraps in a closure carrying the original `__signature__`. The compiler took
-the method's `def` as proof the function was local, then emitted
-`def create_masks_for_generate{str(signature)}:` (annotations rendered as
-`transformers.cache_utils.Cache`) over the closure body."""
+"""unslothai/unsloth#13245: an imported closure shadowed by a same-named method was emitted as
+`def f{str(signature)}:` with unimported `transformers.*` annotations (NameError at cache import)."""
 
 import importlib.util
 import inspect
