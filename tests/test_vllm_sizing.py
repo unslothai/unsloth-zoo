@@ -142,12 +142,10 @@ def test_sliding_layers_stop_growing_at_their_window(monkeypatch):
     memory = 0.95 * kv_gb * GiB
     expected = int(cap + (memory - cap * 34 * layer) / (5 * layer)) // 256 * 256
     assert tokens == expected
-    # Never less than counting every layer as full attention.
     assert tokens >= _tokens(kv_gb, 34 * layer)
 
 
 def test_kv_cache_tokens_short_memory_counts_every_layer():
-    # Below the sliding cap every layer grows with the sequence.
     assert vllm_utils._kv_cache_tokens(1000 * 10, 4, [(1024, 6)], 4096) == 1000
     assert vllm_utils._kv_cache_tokens(0, 4, [(1024, 6)], 4096) == 0
     # Only sliding layers: past the cap nothing grows, so the context length is the limit.
@@ -190,7 +188,6 @@ def _load_args(monkeypatch, **kwargs):
 
 def test_default_max_num_seqs_keeps_memory_tier(monkeypatch):
     args = _load_args(monkeypatch)
-    # 80 GB free -> the 40-80 GB KV tier: 128 sequences, 8192 tokens.
     assert args["max_num_seqs"] == 128
     assert args["max_num_batched_tokens"] == 8192
 

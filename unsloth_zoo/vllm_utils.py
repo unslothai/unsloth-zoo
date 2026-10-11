@@ -2154,7 +2154,6 @@ def _kv_cache_elements_per_token(config):
     if kv_lora_rank:
         if os.environ.get("VLLM_MLA_DISABLE", "0") in ("0", ""):
             return (kv_lora_rank + rope_dim) * n_layers, []
-        # MLA disabled: vLLM caches full K (nope + rope) and V per head.
         mla_head_dim = (getattr(config, "qk_nope_head_dim", None) or 0) + rope_dim or None
 
     layer_types = getattr(config, "layer_types", None)
@@ -2208,7 +2207,6 @@ def _kv_cache_tokens(memory_bytes, full_bytes, sliding_bytes, context_length, in
     sliding layer (kv_cache_interface.SlidingWindowSpec); full layers grow with the sequence."""
     if memory_bytes <= 0: return 0
     caps = sorted((window + in_flight_tokens, b) for window, b in sliding_bytes)
-    # Piecewise linear in the length T: every sliding group stops growing past its cap.
     growing = full_bytes + sum(b for _, b in caps)
     used, start = 0, 0
     for cap, b in caps:
@@ -2258,7 +2256,7 @@ def approximate_vllm_memory_usage(
     n_layers = config.num_hidden_layers
     n_kv_heads = _config_get(config, "num_key_value_heads", 1)
     n_heads    = _config_get(config, "num_attention_heads", 1)
-    # head_dim != hidden_size / heads on Qwen3 / Gemma-3 / gpt-oss; Gemma-4 per-layer head_dim raises and MLA head_dim is rope-only, so both keep hidden_size / heads.
+    # Real head_dim (Qwen3 / Gemma-3 / gpt-oss); MLA's is rope-only and Gemma-4's raises, so both keep hidden_size / heads.
     try:
         head_dim = None if getattr(config, "kv_lora_rank", None) else getattr(config, "head_dim", None)
     except Exception:
@@ -2358,7 +2356,6 @@ def approximate_vllm_memory_usage(
 
     if memory_left_for_kv_cache <= 0: memory_left_for_kv_cache = 0
 
-    # Approx maximum # of KV cache tokens for one sequence (sliding layers stop growing at their window)
     max_num_batched_tokens = _kv_cache_tokens(
         0.95 * memory_left_for_kv_cache,
         full_kv_elements * float_bytes,
