@@ -2149,9 +2149,13 @@ def _kv_cache_elements_per_token(config):
     n_heads  = _config_get(config, "num_attention_heads", 1) or 1
     # MLA (DeepSeek-V2/V3) caches one latent + rope key per token, not K and V per head.
     kv_lora_rank = getattr(config, "kv_lora_rank", None)
+    rope_dim = getattr(config, "qk_rope_head_dim", None) or 0
+    mla_head_dim = None
     if kv_lora_rank:
-        rope_dim = getattr(config, "qk_rope_head_dim", None) or 0
-        return (kv_lora_rank + rope_dim) * n_layers, []
+        if os.environ.get("VLLM_MLA_DISABLE", "0") in ("0", ""):
+            return (kv_lora_rank + rope_dim) * n_layers, []
+        # MLA disabled: vLLM caches full K (nope + rope) and V per head.
+        mla_head_dim = (getattr(config, "qk_nope_head_dim", None) or 0) + rope_dim or None
 
     layer_types = getattr(config, "layer_types", None)
     layer_types = list(layer_types) if layer_types is not None else []
@@ -2179,7 +2183,7 @@ def _kv_cache_elements_per_token(config):
     for i, (layer_type, layer) in enumerate(zip(layer_types, per_layer)):
         if i >= n_layers - n_shared: break
         if layer_type in ("linear_attention", "mamba", "conv"): continue
-        head_dim   = _get(layer, "head_dim")
+        head_dim   = mla_head_dim or _get(layer, "head_dim")
         n_kv_heads = _get(layer, "num_key_value_heads")
         if layer is None and layer_type == "full_attention":
             # Older Gemma-4 configs spell the full-attention shape as global_*.

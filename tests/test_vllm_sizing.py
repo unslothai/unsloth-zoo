@@ -228,3 +228,13 @@ def test_explicit_small_budget_lowers_auto_max_num_seqs(monkeypatch):
     args = _load_args(monkeypatch, max_num_batched_tokens = 64)
     assert args["max_num_batched_tokens"] == 64
     assert args["max_num_seqs"] == 64
+
+
+def test_mla_disabled_caches_full_k_and_v(monkeypatch):
+    # VLLM_MLA_DISABLE=1: vLLM stores K (nope + rope) and V per head instead of the latent.
+    monkeypatch.setenv("VLLM_MLA_DISABLE", "1")
+    config = _config(
+        num_hidden_layers = 27, num_attention_heads = 16, num_key_value_heads = 16, head_dim = 64,
+        kv_lora_rank = 512, qk_rope_head_dim = 64, qk_nope_head_dim = 128, v_head_dim = 128,
+    )
+    assert vllm_utils._kv_cache_elements_per_token(config) == (27 * (192 + 128) * 16, [])
