@@ -22,6 +22,8 @@
 
 import functools
 import inspect
+import types
+import weakref
 
 import torch
 import torch.utils.checkpoint
@@ -32,7 +34,11 @@ __all__ = [
     "enable_block_gradient_checkpointing",
 ]
 
-_WRAPPED = "_unsloth_block_checkpoint_forward"
+_MARK = "_unsloth_block_checkpoint_reentrant"
+# Per-block extras that cannot be pickled or should not follow a copy: a custom checkpoint function and a forward that
+# was already patched on the instance. A copy falls back to torch's checkpoint and its class forward.
+_CUSTOM = weakref.WeakKeyDictionary()
+_PREVIOUS = weakref.WeakKeyDictionary()
 
 
 def _owner(function):
@@ -101,26 +107,53 @@ def _accepts(method, name):
         return False
 
 
-def _wrap_blocks(model, every_n_blocks, base):
+def _inner_forward(block):
+    previous = _PREVIOUS.get(block)
+    return previous if previous is not None else type(block).forward.__get__(block, type(block))
+
+
+def _checkpointed_forward(self, *args, **kwargs):
+    # Bound to a block as its instance ``forward``: deepcopy rebinds a bound method to the copy, and pickle stores it
+    # as getattr(block, __name__), so copied and saved models never alias or fail.
+    inner = _inner_forward(self)
+    if self.training and torch.is_grad_enabled():
+        run = _CUSTOM.get(self) or _torch_checkpoint(getattr(self, _MARK, False))
+        return run(inner, *args, **kwargs)
+    return inner(*args, **kwargs)
+
+
+_checkpointed_forward.__name__ = "forward"
+
+
+def _is_wrapped(block):
+    return getattr(block.__dict__.get("forward"), "__func__", None) is _checkpointed_forward
+
+
+def _unwrap(block):
+    if _is_wrapped(block):
+        previous = _PREVIOUS.pop(block, None)
+        if previous is not None:
+            block.forward = previous
+        else:
+            del block.forward
+    _CUSTOM.pop(block, None)
+    block.__dict__.pop(_MARK, None)
+
+
+def _wrap_blocks(model, every_n_blocks, use_reentrant, checkpoint_function):
     blocks = find_repeated_blocks(model)
     if not blocks:
         raise ValueError(f"{type(model).__name__} has no repeated blocks to checkpoint.")
     for index, block in enumerate(blocks):
-        original = getattr(block, _WRAPPED, None) or block.forward
+        _unwrap(block)
         if index % every_n_blocks:
-            if getattr(block, _WRAPPED, None) is not None:
-                block.forward = original
-                delattr(block, _WRAPPED)
             continue
-
-        @functools.wraps(original)
-        def forward(*args, _forward = original, _block = block, **kwargs):
-            if _block.training and torch.is_grad_enabled():
-                return base(_forward, *args, **kwargs)
-            return _forward(*args, **kwargs)
-
-        block.forward = forward
-        setattr(block, _WRAPPED, original)
+        if "forward" in block.__dict__:
+            _PREVIOUS[block] = block.__dict__["forward"]
+        if checkpoint_function is not None:
+            _CUSTOM[block] = checkpoint_function
+        setattr(block, _MARK, bool(use_reentrant))
+        block.forward = types.MethodType(_checkpointed_forward, block)
     return "modules"
 
 
@@ -144,5 +177,4 @@ def enable_block_gradient_checkpointing(model, every_n_blocks = 1, use_reentrant
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = {"use_reentrant": use_reentrant})
         setter(enable = True, gradient_checkpointing_func = function)
         return "transformers"
-    base = checkpoint_function or _torch_checkpoint(use_reentrant)
-    return _wrap_blocks(model, every_n_blocks, base)
+    return _wrap_blocks(model, every_n_blocks, use_reentrant, checkpoint_function)

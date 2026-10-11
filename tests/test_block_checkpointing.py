@@ -217,6 +217,49 @@ def test_block_keyword_arguments_reach_the_checkpointed_forward(use_reentrant):
     _assert_same(_grads(ref, step), _grads(model, step))
 
 
+def test_copied_and_saved_plain_models_keep_their_own_checkpointed_blocks():
+    import copy
+    import io
+
+    torch.manual_seed(0)
+    model = _Stack(4)
+    run, calls = _counting_checkpoint()
+    bc.enable_block_gradient_checkpointing(model, checkpoint_function = run)
+    clone = copy.deepcopy(model)
+    x = torch.randn(2, 8)
+    clone(x).pow(2).mean().backward()
+    # The copy trains its own parameters (the original sees no gradient) and still checkpoints, through torch's own
+    # function since the custom one stays with the original.
+    assert all(p.grad is None for p in model.parameters())
+    assert all(p.grad is not None for p in clone.parameters())
+    assert not calls and all(bc._is_wrapped(b) for b in clone.layers)
+    buffer = io.BytesIO()
+    torch.save(model, buffer)
+    buffer.seek(0)
+    loaded = torch.load(buffer, weights_only = False)
+    torch.testing.assert_close(loaded(x), model(x))
+
+
+def test_a_forward_patched_before_enabling_is_kept_and_restored():
+    model = _Stack(2)
+    block = model.layers[0]
+    seen = []
+    original = block.forward
+
+    def patched(x):
+        seen.append(1)
+        return original(x)
+
+    block.forward = patched
+    bc.enable_block_gradient_checkpointing(model)
+    model(torch.randn(1, 8, requires_grad = True)).sum().backward()
+    assert seen  # forward ran (and again on recompute) through the earlier patch
+    bc.enable_block_gradient_checkpointing(model, 2)
+    assert bc._is_wrapped(model.layers[0]) and block.__dict__["forward"].__func__ is bc._checkpointed_forward
+    bc._unwrap(block)
+    assert block.forward is patched
+
+
 def test_find_repeated_blocks_prefers_declared_classes_then_the_heaviest_list():
     model = _Stack(3)
     assert bc.find_repeated_blocks(model) == list(model.layers)
