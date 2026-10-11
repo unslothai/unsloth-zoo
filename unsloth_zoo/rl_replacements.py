@@ -57,6 +57,8 @@ def chunked_selective_log_softmax(
     # Fixed `chunks` row ranges; see chunked_hidden_states_selective_log_softmax.
     flat_logits = logits.reshape(-1, logits.shape[-1])
     flat_index = index.reshape(-1)
+    # Fewer rows than chunks: one row per range, as torch.chunk did, never empty ranges.
+    chunks = max(1, min(chunks, flat_logits.shape[0]))
     bounds = [(i * flat_logits.shape[0]) // chunks for i in range(chunks + 1)]
     chunked_logits = [flat_logits[a:b] for a, b in zip(bounds[:-1], bounds[1:])]
     chunked_index  = [flat_index[a:b] for a, b in zip(bounds[:-1], bounds[1:])]
@@ -140,6 +142,7 @@ def chunked_hidden_states_selective_log_softmax(
             chunks = chunks // 2
 
     n_rows = flat_hidden_states.shape[0]
+    chunks = max(1, min(chunks, n_rows))
     bounds = [(i * n_rows) // chunks for i in range(chunks + 1)]
     chunked_hidden_states = [flat_hidden_states[a:b] for a, b in zip(bounds[:-1], bounds[1:])]
     chunked_index = [flat_index[a:b] for a, b in zip(bounds[:-1], bounds[1:])]

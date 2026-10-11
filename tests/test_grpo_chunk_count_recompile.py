@@ -60,6 +60,21 @@ CHILD = textwrap.dedent(
             ref = torch.log_softmax((h @ lm_head.t()).float(), -1).gather(-1, idx.unsqueeze(-1)).squeeze(-1)
             worst = max(worst, (got - ref).abs().max().item())
         out[name] = dict(graphs = counters["stats"]["unique_graphs"], err = worst)
+    # Fewer rows than chunks (frozen head, packed raw logits): one row per range, no empty ranges.
+    with torch.no_grad():
+        for name in ("hidden", "logits"):
+            torch._dynamo.reset()
+            worst = 0.0
+            for T in range(1, 8):
+                h = torch.randn(1, T, hidden)
+                idx = torch.randint(0, vocab, (1, T))
+                if name == "hidden":
+                    got = R.chunked_hidden_states_selective_log_softmax(h, lm_head, idx, chunks = 8)
+                else:
+                    got = R.chunked_selective_log_softmax(h @ lm_head.t(), idx, chunks = 8)
+                ref = torch.log_softmax((h @ lm_head.t()).float(), -1).gather(-1, idx.unsqueeze(-1)).squeeze(-1)
+                worst = max(worst, (got - ref).abs().max().item())
+            out[name + "_short"] = dict(graphs = 0, err = worst)
     print("RESULT " + json.dumps(out))
     """
 )
