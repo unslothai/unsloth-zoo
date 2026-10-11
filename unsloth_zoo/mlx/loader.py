@@ -4104,6 +4104,55 @@ def _ensure_audio_conv_sanitize(model_type: str) -> None:
     _AUDIO_CONV_SANITIZE_PATCHED.add(model_type)
 
 
+def _encode_audio_clips_one_at_a_time(get_audio_features):
+    @wraps(get_audio_features)
+    def per_clip(self, input_features, feature_attention_mask=None,
+                 audio_feature_lengths=None):
+        if input_features.ndim != 3 or input_features.shape[0] < 2:
+            return get_audio_features(
+                self, input_features, feature_attention_mask, audio_feature_lengths,
+            )
+        import mlx.core as mx
+
+        return mx.concatenate([
+            get_audio_features(
+                self,
+                input_features[index:index + 1],
+                None if feature_attention_mask is None
+                else feature_attention_mask[index:index + 1],
+                None if audio_feature_lengths is None
+                else audio_feature_lengths[index:index + 1],
+            )
+            for index in range(input_features.shape[0])
+        ], axis=0)
+
+    return per_clip
+
+
+def _ensure_qwen3_omni_audio_per_clip(model_type: str) -> None:
+    """Keep each clip's own audio when Qwen3-Omni encodes several at once.
+
+    mlx-vlm up to 0.7.4 masks the audio tower's chunks by clip index, which is
+    right for one clip only: a second clip's positions are filled from the
+    first clip's chunks. Encoding the clips one at a time gives each the output
+    it has alone. Patched by the tower's source, so a fixed mlx-vlm is left as is.
+    """
+    cls = _resolve_mlx_vlm_model_class(model_type)
+    if cls is None or cls.__module__ != "mlx_vlm.models.qwen3_omni_moe.qwen3_omni_moe":
+        return
+    thinker = importlib.import_module("mlx_vlm.models.qwen3_omni_moe.thinker").Thinker
+    audio = importlib.import_module("mlx_vlm.models.qwen3_omni_moe.audio")
+    source = _safe_getsource(audio.AudioModel.__call__) or ""
+    if (
+        "enumerate(feature_lens_after_cnn)" not in source
+        or getattr(thinker.get_audio_features, "__wrapped__", None) is not None
+    ):
+        return
+    thinker.get_audio_features = _encode_audio_clips_one_at_a_time(
+        thinker.get_audio_features,
+    )
+
+
 def _fp16_needs_bf16_modules(model):
     """Modules that should stay bf16 under fp16 training.
 
@@ -9307,6 +9356,7 @@ class FastMLXModel:
             _ensure_minicpmo_mlx_sanitize(model_type)
             _ensure_minicpmo_vision_dtype(model_type)
             _ensure_audio_conv_sanitize(model_type)
+            _ensure_qwen3_omni_audio_per_clip(model_type)
             _ensure_native_vlm_weight_names(model_type)
 
             quant_state = _ensure_quantization_compatible(

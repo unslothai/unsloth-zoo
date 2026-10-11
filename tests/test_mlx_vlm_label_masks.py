@@ -4844,11 +4844,6 @@ def test_a_clip_past_the_window_is_split_into_near_equal_pieces():
     for rendered, clips in (("Hello.", []), ("<audio>", [long])):
         assert _split_audio_past_the_window(rendered, clips, processor)[0] is rendered
 
-    # A tower that misencodes a second clip keeps the cut instead.
-    type(processor).__module__ = "mlx_vlm.models.qwen3_omni_moe.processing_qwen3_omni_moe"
-    same, clips = _split_audio_past_the_window(messages, [short, long], processor)
-    assert same is messages
-
 
 @pytest.mark.parametrize("row", ["messages", "prompt_completion"])
 def test_collation_gives_each_piece_of_a_long_clip_its_own_run(monkeypatch, row):

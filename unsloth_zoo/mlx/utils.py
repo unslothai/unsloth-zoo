@@ -8140,12 +8140,6 @@ def _audio_clip_limit_samples(processor):
     return min((limit for limit in limits if limit), default=None)
 
 
-# mlx-vlm's Qwen3-Omni audio tower masks chunks by clip index, so a second clip's
-# positions are filled from the first clip's chunks (fixed upstream in #2349,
-# after 0.7.4). Splitting there would replace a cut with the wrong audio.
-_AUDIO_FAMILIES_MISENCODING_A_SECOND_CLIP = {"qwen3_omni_moe"}
-
-
 def _split_audio_past_the_window(messages, clips, processor):
     """Give each clip longer than the processor keeps a placeholder per piece.
 
@@ -8153,8 +8147,6 @@ def _split_audio_past_the_window(messages, clips, processor):
     too short to frame. Returns its arguments when there is nothing to split.
     """
     limit = _audio_clip_limit_samples(processor)
-    if _audio_family_from_processor(processor) in _AUDIO_FAMILIES_MISENCODING_A_SECOND_CLIP:
-        limit = None
     counts = [-(-len(clip) // limit) if limit else 1 for clip in clips]
     # Rows the dataset rendered itself reach here as a string.
     if max(counts, default=1) < 2 or not isinstance(messages, list):
@@ -8270,11 +8262,10 @@ def _assert_audio_runs_cover_their_clips(clips, processor):
     Gemma 4 unified caps the run but keeps every frame, so the surplus is merged
     into the next clip's positions; the batch's last clip has no next one. A cut
     that keeps the row aligned is not refused: a row may validly ask about the
-    start of a clip. Message rows are split before they get here, unless the
-    model misencodes a second clip.
+    start of a clip. Only rows rendered by the dataset get here with a long
+    clip; message rows are split first.
     """
-    splits = _audio_family_from_processor(processor) not in _AUDIO_FAMILIES_MISENCODING_A_SECOND_CLIP
-    advice = "Split the clip" + (", or give the row as messages." if splits else ".")
+    advice = "Split the clip, or give the row as messages."
     limit = _audio_clip_limit_samples(processor)
     cut = limit == _extractor_window_samples(processor)
     name = type(processor).__name__
