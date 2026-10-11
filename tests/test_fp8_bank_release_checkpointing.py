@@ -168,3 +168,19 @@ def test_refilled_bank_is_released_when_autograd_prunes_the_input_gradient(bank)
     (gr,) = torch.autograd.grad(out.float().square().sum(), [r])
     assert sum(refills) == E and gr is not None
     assert dequantized.untyped_storage().nbytes() == 0  # released at the end of that backward
+
+
+def test_create_graph_backward_keeps_the_bank_for_the_second_derivative(bank):
+    # A plain matmul on a view saves the bank's own storage in the higher-order graph.
+    base, quant, refills = bank
+    x = torch.randn(3, K, dtype = torch.float32, requires_grad = True)
+    dequantized = (base.to(torch.float32) * quant).contiguous()
+    out = x @ dequantized.view(E * N, K).t()
+    M._release_dequantized_banks_until_backward(out, x, ((dequantized, base, quant, None),))
+    (g,) = torch.autograd.grad(out.square().sum(), x, create_graph = True)
+    (h,) = torch.autograd.grad(g.square().sum(), x)  # needs the banks the first backward saved
+    ref_x = x.detach().clone().requires_grad_(True)
+    ref = ref_x @ (base.to(torch.float32) * quant).view(E * N, K).t()
+    (rg,) = torch.autograd.grad(ref.square().sum(), ref_x, create_graph = True)
+    (rh,) = torch.autograd.grad(rg.square().sum(), ref_x)
+    assert torch.equal(g, rg) and torch.equal(h, rh)

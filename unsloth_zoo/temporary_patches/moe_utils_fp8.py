@@ -952,11 +952,19 @@ def _release_dequantized_banks_until_backward(output, inputs, banks):
     if not tracked:
         return
 
+    keep = []  # set once a backward builds a higher-order graph that saves the refilled banks
+
     def free():
+        if keep:
+            return
         for _, storage, _, _, _, _ in tracked:
             storage.resize_(0)
 
     def refill(*args):
+        # Grad mode is on inside backward only for create_graph=True: the new graph saves these banks
+        # for the next derivative, so from then on they stay allocated, as without the release.
+        if torch.is_grad_enabled():
+            keep.append(True)
         with torch.no_grad():
             for dequantized, storage, nbytes, base, quant, quant_kind in tracked:
                 if storage.nbytes() == nbytes:
