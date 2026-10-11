@@ -62,6 +62,8 @@ UNSLOTH_MXFP4_NO_DEQUANTIZE = os.environ.get("UNSLOTH_MXFP4_NO_DEQUANTIZE", "0")
 # Set when patch_GptOssAttention installs the forward that routes training through
 # flex_attention_with_sink, which builds its own BlockMask and ignores these masks.
 _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED = False
+# Eval eager attention splits the query rows so one chunk's logits + float32 softmax stay under this.
+_EAGER_ATTENTION_CHUNK_BYTES = max(1, int(os.environ.get("UNSLOTH_GPT_OSS_ATTN_CHUNK_MB", "1024"))) << 20
 _TRAINING_FLAG_ATTR = "_unsloth_gpt_oss_model_training"
 
 
@@ -3147,22 +3149,8 @@ def patch_GptOssAttention():
             attention_mask = attention_mask[:, :, :, :kvlen]
         return key_states, value_states, attention_mask
 
-    def inplace_eager_attention_forward(
-        module: nn.Module,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        attention_mask: Optional[torch.Tensor],
-        scaling: float,
-        dropout: float = 0.0,
-        **kwargs,
-    ):
-        key_states = repeat_kv(key, module.num_key_value_groups)
-        value_states = repeat_kv(value, module.num_key_value_groups)
-        key_states, value_states, attention_mask = _align_kv_to_mask(
-            key_states, value_states, attention_mask
-        )
-
+    def _eager_attention_rows(module, query, key_states, value_states, attention_mask, scaling, dropout):
+        # Writes the attention output for these query rows into `query` in place.
         bsz, n_heads, qlen, _  = query.shape
         bsz, n_heads, kvlen, _ = key_states.shape
         # promote_types, not result_type: result_type returns a dtype, which graph-breaks Dynamo.
@@ -3192,7 +3180,44 @@ def patch_GptOssAttention():
         scores = probs[..., :-1]  # we drop the sink here
         attn_weights = F_dropout(scores, p=dropout, training=module.training, inplace=True)
         attn_weights = attn_weights.to(value_states.dtype)
-        attn_output = matmul(attn_weights, value_states, out = query)
+        return matmul(attn_weights, value_states, out = query)
+
+    def inplace_eager_attention_forward(
+        module: nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        scaling: float,
+        dropout: float = 0.0,
+        **kwargs,
+    ):
+        key_states = repeat_kv(key, module.num_key_value_groups)
+        value_states = repeat_kv(value, module.num_key_value_groups)
+        key_states, value_states, attention_mask = _align_kv_to_mask(
+            key_states, value_states, attention_mask
+        )
+        bsz, n_heads, qlen, _ = query.shape
+        kvlen = key_states.shape[-2]
+        # The logits and their float32 softmax are bsz x heads x qlen x kvlen each: ~32 GiB in one
+        # layer of a 4 x 4608 token gpt-oss-120b prefill. Softmax is per row, so query chunks give
+        # the same rows in bounded memory.
+        rows = qlen
+        if not module.training and not torch.compiler.is_compiling():
+            per_row = bsz * n_heads * (kvlen + 1) * (query.element_size() + 4)
+            rows = max(1, min(qlen, _EAGER_ATTENTION_CHUNK_BYTES // per_row))
+        if rows >= qlen:
+            attn_output = _eager_attention_rows(module, query, key_states, value_states, attention_mask, scaling, dropout)
+        else:
+            for start in range(0, qlen, rows):
+                end = min(qlen, start + rows)
+                mask = attention_mask
+                if mask is not None and mask.shape[-2] != 1:
+                    mask = mask[:, :, start:end]
+                _eager_attention_rows(
+                    module, query[:, :, start:end], key_states, value_states, mask, scaling, dropout,
+                )
+            attn_output = query
         attn_output = attn_output.transpose(1, 2).contiguous()
         return attn_output, None
 
