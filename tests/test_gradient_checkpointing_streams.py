@@ -35,6 +35,8 @@ import pytest
 import torch
 
 needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA")
+# Pre-Ampere GPUs have no BF16 compute; the production initializer falls back to FP16 the same way.
+DTYPE = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
 
 HIDDEN = 1024
 SEQ = 2048          # (1, 2048, 1024) bf16 = 4 MB per activation, above the 2 MB offload cutoff
@@ -49,8 +51,8 @@ def _gc():
 
 def _make_weights(seed):
     g = torch.Generator(device = "cuda").manual_seed(seed)
-    w_in = (torch.randn(HIDDEN, HIDDEN, device = "cuda", generator = g) / HIDDEN ** 0.5).to(torch.bfloat16)
-    ws = [(torch.randn(HIDDEN, HIDDEN, device = "cuda", generator = g) / HIDDEN ** 0.5).to(torch.bfloat16)
+    w_in = (torch.randn(HIDDEN, HIDDEN, device = "cuda", generator = g) / HIDDEN ** 0.5).to(DTYPE)
+    ws = [(torch.randn(HIDDEN, HIDDEN, device = "cuda", generator = g) / HIDDEN ** 0.5).to(DTYPE)
           for _ in range(N_LAYERS)]
     w_in.requires_grad_(True)
     for w in ws: w.requires_grad_(True)
@@ -104,7 +106,7 @@ def _run(streams, inputs, checkpointed, sleep):
 
 def _inputs(n):
     g = torch.Generator(device = "cuda").manual_seed(7)
-    return [torch.randn(1, SEQ, HIDDEN, device = "cuda", generator = g).to(torch.bfloat16) for _ in range(n)]
+    return [torch.randn(1, SEQ, HIDDEN, device = "cuda", generator = g).to(DTYPE) for _ in range(n)]
 
 
 @pytest.fixture
@@ -112,13 +114,13 @@ def smart_gc(request, monkeypatch):
     prefetch = getattr(request, "param", False)
     monkeypatch.setenv("UNSLOTH_GC_PREFETCH", "1" if prefetch else "0")
     G = _gc()
-    G.initialize_unsloth_gradient_checkpointing(torch.bfloat16)
+    G.initialize_unsloth_gradient_checkpointing(DTYPE)
     stats = getattr(G, "GC_PREFETCH_STATS", None)
     if stats is not None:
         for k in stats: stats[k] = 0
     yield G
     monkeypatch.setenv("UNSLOTH_GC_PREFETCH", "0")
-    G.initialize_unsloth_gradient_checkpointing(torch.bfloat16)
+    G.initialize_unsloth_gradient_checkpointing(DTYPE)
 
 
 def _compare(got, ref):
