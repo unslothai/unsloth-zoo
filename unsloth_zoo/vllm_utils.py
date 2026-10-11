@@ -2191,7 +2191,7 @@ def _kv_cache_elements_per_token(config):
             n_kv_heads = _get(None, "num_global_key_value_heads") or n_kv_heads
         if not head_dim: head_dim = hd // n_heads
         if not n_kv_heads: n_kv_heads = n_heads
-        # vLLM sizes K and V separately (head_size + head_size_v); MiMo-V2 has v_head_dim != head_dim.
+        # vLLM caches head_size + head_size_v (MiMo-V2: v_head_dim != head_dim).
         v_head_dim = _get(layer, "v_head_dim") or head_dim
         elements = (head_dim + v_head_dim) * n_kv_heads
         window = _get(layer, "sliding_window") or sliding_window
@@ -3683,8 +3683,7 @@ def load_vllm(
         reachable_tokens = approx_max_num_seqs * max_seq_length
         if max_num_batched_tokens > reachable_tokens and requested_max_num_batched_tokens is None:
             max_num_batched_tokens = reachable_tokens
-        # vLLM rejects a token budget below max_num_seqs: raise the budget, or with an explicit budget lower the
-        # auto-picked sequence count.
+        # vLLM rejects a token budget below max_num_seqs.
         if max_num_batched_tokens < approx_max_num_seqs:
             if requested_max_num_batched_tokens is None:
                 max_num_batched_tokens = approx_max_num_seqs
