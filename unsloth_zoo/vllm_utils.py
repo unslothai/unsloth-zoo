@@ -55,6 +55,7 @@ from functools import partial
 from .utils import _get_dtype, get_quant_type, Version
 from .empty_model import *
 from .empty_model import (
+    FP8_MOE_SHARED_BLOCK,
     _is_gemma4_config,
     _import_vllm_bnb_loader_module,
     _resolve_safetensors_index,
@@ -1393,18 +1394,24 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             get_state_dict(f"{prefix}.w2", 0, state_dict, feed_forward.w2)
         elif not hasattr(layer, "mlp") and hasattr(getattr(experts, "routed_experts", experts), "w13_weight"):
             # LFM2-MoE: FusedMoE w13 [E, 2I, H] / w2 [E, H, I] = HF gate_up_proj / down_proj (vLLM >= 0.24: on routed_experts)
-            w13, w2 = vllm_moe_expert_weights(experts, f"layer {kk}", text_config)
+            found = vllm_moe_expert_descriptor(experts, f"layer {kk}", text_config)
             moe_tensors = {
-                f"{prefix}.experts.gate_up_proj": w13,
-                f"{prefix}.experts.down_proj": w2,
+                f"{prefix}.experts.gate_up_proj": found["w13"],
+                f"{prefix}.experts.down_proj": found["w2"],
                 f"{prefix}.gate.weight": feed_forward.gate.weight,
             }
             expert_bias = getattr(feed_forward.gate, "e_score_correction_bias", None)
             if expert_bias is not None:
                 moe_tensors[f"{prefix}.expert_bias"] = expert_bias
+            fp8_keys = set()
+            if found["scheme"] == "fp8_block":
+                # Block FP8 experts keep their fp32 dequant multipliers beside them, both aliased.
+                for key, name in (("w13", "gate_up_proj"), ("w2", "down_proj")):
+                    fp8_keys.add(f"{prefix}.experts.{name}")
+                    moe_tensors[f"{prefix}.experts.{name}_scale_inv"] = found[f"{key}_scale_inv"]
             for key, value in moe_tensors.items():
-                # float8 also passes is_floating_point(); its scales are not carried over
-                if value.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+                # float8 also passes is_floating_point(); only the descriptor's FP8 experts are allowed
+                if key not in fp8_keys and value.dtype not in (torch.float16, torch.bfloat16, torch.float32):
                     raise NotImplementedError(
                         f"Unsloth: fast_inference cannot rebuild quantized MoE weights ({key}); "
                         "load the model in 16-bit or set fast_inference = False."
@@ -1746,6 +1753,61 @@ def _accepted_kwargs(cls, kwargs):
 pass
 
 
+def _fp8_experts_class():
+    """transformers' FP8Experts routed through its experts interface (as `replace_with_fp8_linear` builds it)."""
+    try:
+        from transformers.integrations.finegrained_fp8 import FP8Experts, ALL_FP8_EXPERTS_FUNCTIONS
+        from transformers.integrations.moe import use_experts_implementation
+    except Exception:
+        return None
+    return functools.partial(
+        _build_fp8_experts, FP8Experts, ALL_FP8_EXPERTS_FUNCTIONS, use_experts_implementation,
+    )
+pass
+
+
+def _build_fp8_experts(FP8Experts, interface, use_experts_implementation, config, block_size):
+    kwargs = dict(has_bias = False, has_gate = True)
+    try:
+        cls = use_experts_implementation(experts_class = FP8Experts, experts_interface = interface, **kwargs)
+    except TypeError:
+        cls = use_experts_implementation(experts_class = FP8Experts, experts_interface = interface)
+    with torch.device("meta"):
+        return cls(**_accepted_kwargs(FP8Experts, dict(
+            config = config, block_size = tuple(block_size), activation_scheme = "dynamic",
+            scale_fmt = "float", **kwargs,
+        )))
+pass
+
+
+def _swap_in_fp8_experts(new_model, quant_state_dict, config):
+    """Replace each HF experts module whose vLLM experts are block FP8 by a meta FP8Experts.
+
+    The binding loop then points gate_up_proj / down_proj and their *_scale_inv at vLLM's tensors,
+    so nothing is allocated and no float8 tensor is ever cast.
+    """
+    suffix = ".gate_up_proj_scale_inv"
+    names = [k for k in quant_state_dict if k.endswith(".experts" + suffix)]
+    if not names: return
+    build = _fp8_experts_class()
+    if build is None:
+        raise NotImplementedError(
+            "Unsloth: fast_inference with block FP8 MoE experts needs transformers' FP8Experts "
+            "(transformers >= 5), which this transformers does not have. Upgrade transformers, load the "
+            "16-bit (BF16) checkpoint, or set fast_inference = False."
+        )
+    text_config = getattr(config, "text_config", None) or config
+    for name in names:
+        path = name[: -len(suffix)].replace("language_model.model", "language_model")
+        old = new_model.get_submodule(path)
+        experts_config = getattr(old, "config", None) or text_config
+        new = build(experts_config, list(FP8_MOE_SHARED_BLOCK))
+        new.requires_grad_(False)
+        new._unsloth_vllm_shared_fp8 = True
+        new_model.set_submodule(path, new)
+pass
+
+
 @torch.inference_mode
 def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16, bnb_config = None, is_vision_model = False):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -1770,6 +1832,8 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     quant_method = get_quant_type(config)
     kwargs = dict()
     compute_dtype = dtype  # Do not use config file's dtype!
+    # Block FP8 experts shared with vLLM: the HF experts become FP8Experts before the binding loop.
+    _swap_in_fp8_experts(new_model, quant_state_dict, config)
 
     if quantization_config != {} or bnb_config is not None:
         # Get quantization_config flags
@@ -3396,6 +3460,20 @@ def load_vllm(
 
     assert not (use_bitsandbytes and is_fp8), f'`load_in_4bit` and `load_in_8bit` should be set to false for loading FP8 quantized models with fast inference'
 
+    # Sparse MoE FP8 checkpoints: training shares vLLM's FP8 experts, which only works for block FP8.
+    fp8_moe = fp8_moe_checkpoint_scheme(config)
+    if fp8_moe is not None:
+        shareable, reason = fp8_moe
+        if shareable and _fp8_experts_class() is None:
+            shareable, reason = False, "this transformers has no FP8Experts (transformers >= 5 needed)"
+        if not shareable:
+            raise NotImplementedError(
+                f"Unsloth: fast_inference = True cannot share this FP8 MoE checkpoint's experts with "
+                f"training: {reason}. Supported: block FP8 (quant_method = 'fp8', weight_block_size = "
+                "[128, 128], dynamic activations). Load the 16-bit (BF16) checkpoint, or set "
+                "fast_inference = False."
+            )
+
     max_num_batched_tokens, approx_max_num_seqs, \
     actual_gpu_memory_utilization, memory_left_for_kv_cache_gb = \
     approximate_vllm_memory_usage(
@@ -3848,6 +3926,10 @@ def load_vllm(
             enable_sleep_mode      = unsloth_vllm_standby,
         )
         engine_args.update(_get_multimodal_engine_args(config, is_vision_model))
+        if fp8_moe is not None:
+            # Only the Triton FP8 MoE kernel keeps the checkpoint's expert layout, which training aliases.
+            # vLLM without moe_backend drops the key below; the descriptor then checks what it picked.
+            engine_args["moe_backend"] = "triton"
         if _is_gemma4_config(config) and use_bitsandbytes:
             gemma4_bnb_quantization_config = _get_gemma4_bnb_skip_module_aliases(
                 getattr(config, "quantization_config", None)
