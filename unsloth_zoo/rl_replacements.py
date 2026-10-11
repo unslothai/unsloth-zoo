@@ -54,8 +54,8 @@ def chunked_selective_log_softmax(
     temperature: float = 1.0,
     chunks: int = 4,
 ):
-    # tensor_split: exactly `chunks` pieces for any T, so the traced loop length does
-    # not move with T (see chunked_hidden_states_selective_log_softmax).
+    # Exactly `chunks` row ranges for any T, so the traced loop length does not move
+    # with T (see chunked_hidden_states_selective_log_softmax).
     flat_logits = logits.reshape(-1, logits.shape[-1])
     flat_index = index.reshape(-1)
     bounds = [(i * flat_logits.shape[0]) // chunks for i in range(chunks + 1)]
@@ -132,11 +132,12 @@ def chunked_hidden_states_selective_log_softmax(
 
     # A one-row chunk's head gradient is a K=1 matmul Inductor mis-lowers under dynamic shapes (illegal
     # memory access or NaN head gradients, torch 2.13), so keep chunks at 2+ rows when the head trains.
-    # tensor_split, not torch.chunk: it returns exactly `chunks` pieces (rows differ by at
-    # most one, empty when rows < chunks), so this fullgraph trace unrolls a loop whose
-    # length depends only on `chunks`. torch.chunk returns ceil(T / ceil(T / chunks))
-    # pieces, which moves with the token count T and recompiled a graph unrolling every
-    # chunk for each new count (598 s of a 639 s, 60 step GRPO run).
+    # Exactly `chunks` row ranges [i*T//chunks, (i+1)*T//chunks) (sizes differ by at most
+    # one, empty when T < chunks), so this fullgraph trace unrolls a loop whose length
+    # depends only on `chunks`. torch.chunk returns ceil(T / ceil(T / chunks)) pieces,
+    # which moves with T and recompiled a graph unrolling every chunk per new count (598 s
+    # of a 639 s, 60 step GRPO run). torch.tensor_split is no better: Dynamo guards on
+    # T % chunks, one graph per remainder.
     # The smallest piece has floor(rows / chunks) rows, so halving chunks until
     # rows >= 2 * chunks keeps every piece at 2+ rows when the head trains; the halvings
     # depend on T only through log2(chunks) guards, not one graph per chunk count.
