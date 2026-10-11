@@ -40,7 +40,8 @@ _SRC = MISC.read_text(encoding = "utf-8")
 _NAMES = (
     "_MAMBA_SM75_MIN_TRITON", "_weakest_cuda_capability", "_mamba_ssm_fast_path_blocker",
     "_single_mamba_ssm_autotune_config", "_retrim_mamba_ssm_autotune",
-    "patch_mamba_ssm_pre_ampere_fallback",
+    "_force_slow_path_on_raising_mamba_mixers", "patch_mamba_ssm_pre_ampere_fallback",
+    "_mamba_fast_kernels_missing", "patch_mamba_kernels_missing_fallback",
 )
 
 
@@ -58,6 +59,7 @@ def _load():
 
 _NS = _load()
 patch = _NS["patch_mamba_ssm_pre_ampere_fallback"]
+missing_patch = _NS["patch_mamba_kernels_missing_fallback"]
 
 MODEL_MOD = "transformers.models.granitemoehybrid.modeling_granitemoehybrid"
 
@@ -837,3 +839,95 @@ def test_the_fixture_leaves_no_stub_bound_on_transformers_utils():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# Without mamba_ssm / causal_conv1d, Jamba (transformers 4.x) and Zamba (up to
+# 5.14) raise on every GPU, not only below sm_80; 5.15 falls back instead.
+
+def _set_specs(monkeypatch, present):
+    import importlib.util
+    real = importlib.util.find_spec
+    def find_spec(name, *a, **k):
+        if name in ("mamba_ssm", "causal_conv1d", "kernels"):
+            return object() if name in present else None
+        return real(name, *a, **k)
+    monkeypatch.setattr(importlib.util, "find_spec", find_spec)
+
+
+@pytest.mark.parametrize("present", [(), ("mamba_ssm",), ("causal_conv1d",)])
+@pytest.mark.parametrize("cfg_mod_name, cls_name", [
+    (CONFIG_MODS[0], "JambaConfig"), (CONFIG_MODS[1], "ZambaConfig"),
+])
+@pytest.mark.parametrize("capability", [(8, 0), (9, 0), (10, 0), (7, 5)])
+def test_missing_kernels_take_the_slow_path_on_any_gpu(
+    env, monkeypatch, present, cfg_mod_name, cls_name, capability,
+):
+    monkeypatch.setattr(torch, "cuda", _FakeCuda(capability = capability), raising = False)
+    _set_triton(monkeypatch, "3.5.1")
+    _set_specs(monkeypatch, present)
+    _mod, Config = _fake_config_module(cfg_mod_name, cls_name)
+    with pytest.raises(ValueError):
+        _ConfigBoundMixer(Config()).forward()
+    missing_patch()
+    assert Config(use_mamba_kernels = True).use_mamba_kernels is False
+    assert _ConfigBoundMixer(Config()).forward() == "SLOW PATH"
+
+
+@pytest.mark.parametrize("hip", [None, "6.4"])
+def test_missing_kernels_take_the_slow_path_without_cuda_or_on_rocm(env, monkeypatch, hip):
+    monkeypatch.setattr(torch, "cuda", _FakeCuda(available = hip is not None), raising = False)
+    monkeypatch.setattr(torch.version, "hip", hip, raising = False)
+    _set_specs(monkeypatch, ())
+    _mod, Config = _fake_config_module(CONFIG_MODS[0], "JambaConfig")
+    missing_patch()
+    assert Config().use_mamba_kernels is False
+
+
+def test_installed_kernels_keep_the_fast_path(env, monkeypatch):
+    _set_specs(monkeypatch, ("mamba_ssm", "causal_conv1d"))
+    _mod, Config = _fake_config_module(CONFIG_MODS[0], "JambaConfig")
+    before = Config.__init__
+    missing_patch()
+    assert Config.__init__ is before
+    assert Config().use_mamba_kernels is True
+
+
+def test_hub_kernels_keep_the_fast_path(env, monkeypatch):
+    """transformers 5 fetches mamba-ssm through `kernels` without a local wheel."""
+    _set_specs(monkeypatch, ("kernels",))
+    _mod, Config = _fake_config_module(CONFIG_MODS[1], "ZambaConfig")
+    missing_patch()
+    assert Config().use_mamba_kernels is True
+
+
+def test_kernels_package_without_a_mamba_hub_entry_still_falls_back(env, monkeypatch):
+    """transformers 4.57 has hub_kernels but no mamba-ssm entry: Jamba imports locally."""
+    _set_specs(monkeypatch, ("kernels",))
+    env[2]._HUB_KERNEL_MAPPING.pop("mamba-ssm")
+    _mod, Config = _fake_config_module(CONFIG_MODS[0], "JambaConfig")
+    missing_patch()
+    assert Config().use_mamba_kernels is False
+
+
+def test_unknown_spec_keeps_upstream_behaviour(env, monkeypatch):
+    import importlib.util
+    def find_spec(name, *a, **k):
+        raise ValueError(f"{name}.__spec__ is None")
+    monkeypatch.setattr(importlib.util, "find_spec", find_spec)
+    _mod, Config = _fake_config_module(CONFIG_MODS[0], "JambaConfig")
+    missing_patch()
+    assert Config().use_mamba_kernels is True
+
+
+def test_missing_kernels_wrapper_is_applied_once(env, monkeypatch):
+    _set_specs(monkeypatch, ())
+    _mod, Config = _fake_config_module(CONFIG_MODS[1], "ZambaConfig")
+    missing_patch()
+    first = Config.__init__
+    missing_patch()
+    patch()
+    assert Config.__init__ is first
+
+
+def test_missing_kernels_fallback_is_registered():
+    assert "TEMPORARY_PATCHES.append(patch_mamba_kernels_missing_fallback)" in _SRC
