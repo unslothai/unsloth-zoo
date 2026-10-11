@@ -8111,9 +8111,25 @@ def _extractor_window_samples(processor):
     )
     samples = getattr(extractor, "n_samples", None)
     try:
+        if samples is None:
+            # Gemma's extractors state the window as call defaults instead.
+            defaults = inspect.signature(extractor.__call__).parameters
+            if defaults["truncation"].default is True:
+                samples = defaults["max_length"].default
         return int(samples) if samples is not None else None
-    except (TypeError, ValueError):
+    except (AttributeError, KeyError, TypeError, ValueError):
         return None
+
+
+def _audio_run_cap_samples(processor):
+    length = getattr(processor, "audio_seq_length", None)
+    period = getattr(processor, "audio_ms_per_token", None)
+    rate = audio_extractor_sampling_rate(processor)
+    # A corrected count follows the audio the extractor keeps, not the cap.
+    corrected = _audio_family_from_processor(processor) in _AUDIO_PROCESSOR_REPAIRS
+    if corrected or not (length and period and rate):
+        return None
+    return int(length) * int(period) * int(rate) // 1000
 
 
 def _audio_delimiter_strings(processor):
@@ -8197,6 +8213,50 @@ def _assert_audio_clips_fit_the_extractor(clips, processor):
             )
 
 
+_reported_cut_audio = set()
+
+
+def _assert_audio_runs_cover_their_clips(clips, processor):
+    """Reject clips a capped placeholder run cannot cover; warn where audio is cut.
+
+    Gemma 4 unified caps the run but keeps every frame, so the surplus is merged
+    into the next clip's positions; the batch's last clip has no next one. A cut
+    that keeps the row aligned is not refused: a row may validly ask about the
+    start of a clip.
+    """
+    window = _extractor_window_samples(processor)
+    cap = _audio_run_cap_samples(processor)
+    cut = not cap or (window is not None and window <= cap)
+    limit = window if cut else cap
+    name = type(processor).__name__
+    if not limit or not clips:
+        return
+    rate = audio_extractor_sampling_rate(processor)
+    seconds = f" ({limit / rate:.0f}s)" if rate else ""
+    batch = [(index, clip) for index, row in enumerate(clips) for clip in row or ()]
+    for position, (index, clip) in enumerate(batch):
+        length = int(np.asarray(clip).shape[0])
+        if length <= limit:
+            continue
+        if not cut and position + 1 < len(batch):
+            raise ValueError(
+                f"Unsloth MLX: row {index} carries a {length}-sample audio "
+                f"clip but {name} writes placeholders for at most {limit} "
+                f"samples of one clip{seconds} while keeping all of its "
+                f"audio, so the surplus lands on the next clip's positions. "
+                f"Split the clip."
+            )
+        if name not in _reported_cut_audio:
+            _reported_cut_audio.add(name)
+            warnings.warn(
+                f"Unsloth MLX: {name} uses only the first {limit} samples of "
+                f"an audio clip{seconds} and this dataset has a longer one "
+                f"({length} samples), so the rest is not trained on. Split "
+                f"such clips, or trim their target text to the audio kept.",
+                stacklevel=2,
+            )
+
+
 def _assert_audio_runs_intact(inputs, audio_counts, processor, max_seq_length,
                               truncated=True, clips=None):
     """Reject rows whose audio placeholder runs did not survive tokenization.
@@ -8214,9 +8274,9 @@ def _assert_audio_runs_intact(inputs, audio_counts, processor, max_seq_length,
 
     Processors that state their spans take a different route, since their run
     carries no identifying token. Those rows are held to the conditions in
-    ``_assert_audio_bounds_intact`` instead of the two above, and additionally
-    to one the run path has no equivalent of: a clip may not be longer than the
-    window its feature extractor keeps.
+    ``_assert_audio_bounds_intact`` instead of the two above, and their clips
+    may not be longer than the window the feature extractor keeps. On the run
+    path a clip may not be longer than a cap on its run that its audio ignores.
     """
     ids = inputs.get("input_ids") if isinstance(inputs, Mapping) else None
     if ids is None:
@@ -8254,6 +8314,7 @@ def _assert_audio_runs_intact(inputs, audio_counts, processor, max_seq_length,
     # Placeholders with nothing behind them misalign the sequence however they
     # got there -- e.g. a formatter that kept the text but dropped the clip.
     _assert_audio_features_present(inputs, total_runs, processor)
+    _assert_audio_runs_cover_their_clips(clips, processor)
 
 
 def _assert_audio_runs_intact_ids(ids, attention_mask, audio_counts, soft_ids,
@@ -9508,6 +9569,7 @@ def _collate_vlm_prompt_completion_batch(
         )
     _assert_audio_runs_intact(
         prompt_inputs, audio_counts, processor, None, truncated=False,
+        clips=all_audio,
     )
     audio_budget = _audio_fixed_budget(processor)
     audio_soft_ids = (

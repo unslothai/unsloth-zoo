@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import re
+import warnings
 
 import numpy as np
 import pytest
@@ -4718,6 +4719,101 @@ def test_collation_hands_the_clip_lengths_to_the_window_check(monkeypatch):
     _qualify(monkeypatch, processor=processor)
     with pytest.raises(ValueError, match="audio clip"):
         _finalized_collate([_audio_row(_CLIP)], processor, 16, None)
+
+
+def _run_capped_processor(window=None, n_samples=None, cap=True):
+    """A cap of 8 samples: two tokens of 250 ms at 16 Hz."""
+    class _Extractor:
+        sampling_rate = 16
+
+    if window is not None:
+        _Extractor.__call__ = lambda self, audio, max_length=window, truncation=True: None
+    if n_samples is not None:
+        _Extractor.n_samples = n_samples
+
+    class _Processor:
+        feature_extractor = _Extractor()
+        audio_seq_length = 2 if cap else None
+        audio_ms_per_token = 250 if cap else None
+
+    return _Processor()
+
+
+@pytest.mark.parametrize("window", [None, 16])
+def test_a_clip_longer_than_its_capped_run_is_refused_when_its_audio_is_kept(
+        monkeypatch, window):
+    """Gemma 4 unified caps the run but keeps every frame, and the model fills
+    placeholders from the batch's frames in order, so the surplus is merged into
+    the next clip's positions."""
+    from unsloth_zoo.mlx import utils
+
+    monkeypatch.setattr(utils, "_reported_cut_audio", set())
+    processor = _run_capped_processor(window=window)
+    fits, long = np.zeros(8, np.float32), np.zeros(9, np.float32)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        utils._assert_audio_runs_cover_their_clips([[fits], [fits, fits]], processor)
+    # The batch's last clip has no next one for its surplus to land on.
+    with pytest.warns(UserWarning, match="first 8 samples"):
+        utils._assert_audio_runs_cover_their_clips([[fits], [fits, long]], processor)
+    with pytest.raises(ValueError, match="row 1 carries a 9-sample.*at most 8 samples"):
+        utils._assert_audio_runs_cover_their_clips([[fits], [long, fits]], processor)
+
+
+@pytest.mark.parametrize("kwargs", [
+    dict(window=8), dict(window=6), dict(n_samples=8, cap=False),
+    dict(window=8, cap=False),
+])
+def test_a_clip_its_extractor_cuts_is_warned_about_once(monkeypatch, kwargs):
+    """Gemma 4, Gemma 3n and Qwen3-Omni cut the waveform and size the run from
+    what is left, so the row stays aligned and only loses audio."""
+    from unsloth_zoo.mlx import utils
+
+    monkeypatch.setattr(utils, "_reported_cut_audio", set())
+    processor = _run_capped_processor(**kwargs)
+    limit = kwargs.get("window") or kwargs["n_samples"]
+    fits, long = np.zeros(limit, np.float32), np.zeros(limit + 1, np.float32)
+    rows = [[fits, long], [fits]]
+    with pytest.warns(UserWarning, match=f"first {limit} samples"):
+        utils._assert_audio_runs_cover_their_clips(rows, processor)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        utils._assert_audio_runs_cover_their_clips(rows, processor)
+        utils._assert_audio_runs_cover_their_clips(
+            rows, _run_capped_processor(cap=False))
+
+
+def test_a_cap_the_corrected_count_ignores_refuses_nothing(monkeypatch):
+    """Gemma 4's placeholder count is replaced by one read off the extractor's
+    frames, so a clip past its configured cap is still fully covered."""
+    from unsloth_zoo.mlx import utils
+
+    monkeypatch.setattr(utils, "_reported_cut_audio", set())
+    processor = _run_capped_processor(window=16)
+    monkeypatch.setattr(utils, "_AUDIO_PROCESSOR_REPAIRS", {
+        utils._audio_family_from_processor(processor): None})
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        utils._assert_audio_runs_cover_their_clips(
+            [[np.zeros(16, np.float32)]], processor)
+    with pytest.warns(UserWarning, match="first 16 samples"):
+        utils._assert_audio_runs_cover_their_clips(
+            [[np.zeros(17, np.float32)]], processor)
+
+
+@pytest.mark.parametrize("row", ["messages", "prompt_completion"])
+def test_collation_hands_the_clip_lengths_to_the_run_cap_check(monkeypatch, row):
+    class _Capped(_FakeGemmaAudioProcessor):  # a cap of 16 samples
+        audio_seq_length = 1
+        audio_ms_per_token = 1
+
+    processor = _Capped()
+    _qualify(monkeypatch, processor=processor)
+    item = _audio_row({"array": np.zeros(17, np.float32), "sampling_rate": 16000})
+    if row == "prompt_completion":
+        item = {"prompt": item["messages"][:1], "completion": item["messages"][1:]}
+    with pytest.raises(ValueError, match="Split the clip"):
+        _finalized_collate([item, item], processor, 16, None)
 
 
 def test_ids_the_run_path_rejects_are_rejected_on_the_bounds_path_too():
