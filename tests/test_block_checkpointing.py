@@ -390,3 +390,34 @@ def test_an_aliased_block_is_one_caller():
     model.layers = nn.ModuleList([shared, shared, other])
     bc.enable_block_gradient_checkpointing(model, 2)
     assert bc._is_wrapped(shared) and not bc._is_wrapped(other)
+
+
+def test_a_global_kwargs_forward_hook_reruns_with_its_signature():
+    from torch.nn.modules.module import register_module_forward_hook
+
+    seen = []
+    handle = register_module_forward_hook(lambda module, args, kwargs, output: seen.append(kwargs), with_kwargs = True)
+    try:
+        model = nn.ModuleList([nn.Linear(4, 4), nn.Linear(4, 4)])
+        bc.enable_block_gradient_checkpointing(model)
+        h = torch.randn(2, 4, requires_grad = True)
+        for block in model:
+            h = torch.tanh(block(h))
+        h.sum().backward()
+    finally:
+        handle.remove()
+    assert seen
+
+
+@pytest.mark.parametrize("every_n", [1, 2])
+def test_an_enabled_diffusers_model_still_saves_whole(every_n):
+    import io
+
+    model = _FakeDiffusers(3)
+    bc.enable_block_gradient_checkpointing(model, every_n)
+    buffer = io.BytesIO()
+    torch.save(model, buffer)
+    buffer.seek(0)
+    loaded = torch.load(buffer, weights_only = False)
+    x = torch.randn(1, 4, requires_grad = True)
+    torch.testing.assert_close(loaded(x), model(x))

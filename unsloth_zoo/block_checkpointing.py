@@ -67,18 +67,44 @@ def _owner(function):
     return getattr(function, "__self__", function)
 
 
-def _torch_checkpoint(use_reentrant):
+class _TorchCheckpoint:
     # torch's own checkpoint, looked up per call. Unsloth's LLM shims (patch_gradient_checkpointing and friends) force
     # reentrant / offloaded recompute, so the pristine function they stash wins over whatever is patched in now.
-    def run(function, *args, **kwargs):
+    # Module-level callables, not closures: diffusers / transformers store the function on the model, which must
+    # still pickle with torch.save.
+    __slots__ = ("use_reentrant",)
+
+    def __init__(self, use_reentrant):
+        self.use_reentrant = bool(use_reentrant)
+
+    def __call__(self, function, *args, **kwargs):
         ck = torch.utils.checkpoint
         fn = getattr(ck, "_unsloth_pristine_checkpoint", None) or ck.checkpoint
         if kwargs:
             # Bind block kwargs: reentrant rejects them, and non-reentrant would take debug / context_fn as its own.
             function = functools.partial(function, **kwargs)
-        return fn(function, *args, use_reentrant = use_reentrant)
+        return fn(function, *args, use_reentrant = self.use_reentrant)
 
-    return run
+
+
+class _EveryN:
+    __slots__ = ("every_n_blocks", "base", "fallback")
+
+    def __init__(self, every_n_blocks, base):
+        self.every_n_blocks, self.base, self.fallback = every_n_blocks, base, _Order()
+
+    def __call__(self, function, *args, **kwargs):
+        owner = _owner(function)
+        state = getattr(owner, "__dict__", None)
+        index = None if state is None else state.get(_INDEX)
+        if index is None:
+            order = (state or {}).get(_ORDER) or self.fallback
+            index, order.next = order.next, order.next + 1
+            if state is not None:
+                state[_INDEX] = index
+        if index % self.every_n_blocks:
+            return function(*args, **kwargs)
+        return self.base(function, *args, **kwargs)
 
 
 def every_n_checkpoint_function(every_n_blocks = 1, use_reentrant = False, checkpoint_function = None):
@@ -86,26 +112,9 @@ def every_n_checkpoint_function(every_n_blocks = 1, use_reentrant = False, check
 
     Counting callers rather than a class list makes it exact wherever a model routes the function: the SDXL UNet
     also checkpoints ResnetBlock2D, which its ``_repeated_blocks`` (BasicTransformerBlock only) does not list."""
-    base = checkpoint_function or _torch_checkpoint(use_reentrant)
+    base = checkpoint_function or _TorchCheckpoint(use_reentrant)
     every_n_blocks = max(1, int(every_n_blocks))
-    if every_n_blocks == 1:
-        return base
-    fallback = _Order()
-
-    def every_n(function, *args, **kwargs):
-        owner = _owner(function)
-        state = getattr(owner, "__dict__", None)
-        index = None if state is None else state.get(_INDEX)
-        if index is None:
-            order = (state or {}).get(_ORDER) or fallback
-            index, order.next = order.next, order.next + 1
-            if state is not None:
-                state[_INDEX] = index
-        if index % every_n_blocks:
-            return function(*args, **kwargs)
-        return base(function, *args, **kwargs)
-
-    return every_n
+    return base if every_n_blocks == 1 else _EveryN(every_n_blocks, base)
 
 
 def find_repeated_blocks(model):
@@ -155,7 +164,9 @@ def _recompute_body(block, inner, *args, **kwargs):
     for hook_id, hook in _hooks(block, "forward_pre_hooks"):
         hook(block, args, kwargs) if hook_id in with_kwargs else hook(block, args)
     output = inner(*args, **kwargs)
-    with_kwargs = block._forward_hooks_with_kwargs
+    from torch.nn.modules.module import _global_forward_hooks_with_kwargs
+
+    with_kwargs = {**block._forward_hooks_with_kwargs, **_global_forward_hooks_with_kwargs}
     for hook_id, hook in _hooks(block, "forward_hooks"):
         hook(block, args, kwargs, output) if hook_id in with_kwargs else hook(block, args, output)
     return output
@@ -174,7 +185,7 @@ class _CheckpointedForward:
         inner = _inner_forward(block)
         if not (block.training and torch.is_grad_enabled()):
             return inner(*args, **kwargs)
-        run = _CUSTOM.get(block) or _torch_checkpoint(getattr(block, _MARK, False))
+        run = _CUSTOM.get(block) or _TorchCheckpoint(getattr(block, _MARK, False))
         # Eager non-reentrant recompute stops once the saved tensors are back, before a post-hook that releases state.
         # Compiled, recompute is part of the backward graph and runs no Python hooks.
         hooked = not torch.compiler.is_compiling() and (
