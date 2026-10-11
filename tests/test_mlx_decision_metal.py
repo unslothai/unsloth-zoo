@@ -1233,6 +1233,71 @@ def test_clef_omni_hears_audio_after_its_images(clef, monkeypatch):
     assert not reader.reads_audio
 
 
+def test_a_plain_omni_model_trains_as_a_clef_on_images_and_audio(clef, tmp_path, monkeypatch):
+    from PIL import Image
+
+    from unsloth_zoo.mlx.decision import ClefModel, DecisionRequestError, _decoder_tensor_name, load_language_model_as_clef, save_clef_adapter
+
+    def load(self, *args):
+        self.model, self.tokenizer = _omni_decoder(), clef[0].tokenizer
+        self.model._processor = _omni_processor(asked)
+
+    monkeypatch.setattr(ClefModel, "_load", load)
+    source, out, tensors, asked = tmp_path / "omni", tmp_path / "out", {}, []
+    # As transformers stores it: the decoder under the thinker's own names, each expert of a layer apart.
+    for name, value in tree_flatten(_omni_decoder().parameters()):
+        name = name.replace("thinker.language_model.model.", "thinker.model.").replace("thinker.language_model.lm_head.", "thinker.lm_head.")
+        tensors.update({name.replace(".switch_mlp.", f".experts.{index}."): expert for index, expert in enumerate(value)} if ".switch_mlp." in name else {name: value})
+    source.mkdir()
+    mx.save_safetensors(str(source / "model.safetensors"), tensors)
+    pipeline = load_language_model_as_clef(source, head_width = 64)
+    stacked = "thinker.language_model.model.layers.0.mlp.switch_mlp.up_proj.weight"
+    # An MLX conversion stores the stack under the name it is loaded with.
+    assert _decoder_tensor_name(pipeline.model, stacked, tensors) is None and _decoder_tensor_name(pipeline.model, stacked, {stacked}) == stacked
+
+    questions = {"route": {"type": "choice", "instructions": "where", "criteria": {"a": "x", "b": None}}, "ok": {"type": "noul", "instructions": "fine?"}}
+    image, clip = Image.new("RGB", (96, 64), "white"), {"array": np.sin(np.arange(16000) / 9).astype(np.float32), "sampling_rate": 16000}
+    records = (([image], [clip]), ([], [_wav(clip["array"][:4000], 8000)]))
+    items = [{**clef_training_item(pipeline, "s", questions, None, images, audio), "targets": [[1.0, 0.0], [0.0, 1.0]]} for images, audio in records]
+    assert items[0]["audio"] == [clip] and [item["input_ids"].count(503) for item in items] == [13, 13] and "images" not in items[1]
+    for bad in ({**clip, "sampling_rate": 8000}, {**clip, "array": np.zeros((2, 8))}, clip["array"], {**clip, "array": []}, {"sampling_rate": 16000}):
+        with pytest.raises(DecisionRequestError, match = "mono samples at 16000 Hz"):
+            clef_training_item(pipeline, "s", questions, None, None, [bad])
+    with pytest.raises(DecisionRequestError, match = "too many audio clips"):
+        clef_training_item(pipeline, "s", questions, None, None, [clip] * 9)
+
+    # What could not be saved afterwards is refused before it trains.
+    for refused, why in (({"full_finetuning": True}, "each expert of its mixture apart"), ({"target_modules": ["q_proj", "up_proj"]}, "stacked experts")):
+        with pytest.raises(ValueError, match = why):
+            clef_training_network(pipeline, **refused)
+    network = clef_training_network(pipeline, r = 4, lora_alpha = 4)
+    adapted = [path for path, module in pipeline.model.named_modules() if "lora_a" in module]
+    # Not on the stacked experts, which have no one tensor in the checkpoint, nor on a tower.
+    assert {path.rsplit(".", 1)[-1] for path in adapted} == {"q_proj", "k_proj", "v_proj", "o_proj"} and all(path.startswith("thinker.language_model.") for path in adapted)
+    # A record is scored with its clip, which is decoded and resampled as it is read.
+    assert [_clef_record_loss(network, item).item() and asked[-1][1] for item in items] == [[16000], [8000]]
+    shuffled = network.permuted_item(items[0], random.Random(1))
+    assert shuffled["audio"] == [clip] and shuffled["input_ids"].count(503) == 13 and shuffled["targets"] == [[0.0, 1.0], [1.0, 0.0]]
+    towers = {name: np.array(value) for name, value in tree_flatten(pipeline.model.parameters()) if "_tower." in name}
+    MLXDecisionTrainer(network, MLXTrainingConfig(per_device_train_batch_size = 2, max_steps = 2, learning_rate = 1e-2, warmup_steps = 0, compile = False), items).train()
+    assert towers and all(np.array_equal(towers[name], np.array(value)) for name, value in tree_flatten(pipeline.model.parameters()) if name in towers)
+
+    save_clef_model(pipeline, out / "merged", source)
+    saved, low = mx.load(str(out / "merged" / "model.safetensors")), dict(pipeline.model.named_modules())["thinker.language_model.model.layers.1.self_attn.q_proj"]
+    name = "thinker.model.layers.1.self_attn.q_proj.weight"
+    np.testing.assert_allclose(np.array(saved[name] - tensors[name]), np.array(low.scale * low.lora_b.T @ low.lora_a.T), atol = 1e-5)
+    assert saved.keys() == tensors.keys() and mx.any(low.lora_b).item() and all(mx.array_equal(saved[key], tensors[key]).item() for key in tensors if ".experts." in key or "_tower" in key or "visual" in key)
+    # The merged checkpoint keeps its experts apart too, and says so when it is loaded.
+    with pytest.raises(ValueError, match = "each expert of its mixture apart"):
+        clef_training_network(load_decision_model(out / "merged"), full_finetuning = True)
+    save_clef_adapter(pipeline, out / "adapter", source, "org/omni")
+    assert f"base_model.model.{name[: -len('.weight')]}.lora_A.weight" in mx.load(str(out / "adapter" / "adapter_model.safetensors"))
+    # The adapters go back on the decoder's layers, not on the audio tower's of the same numbers.
+    served = load_decision_model(out / "adapter", base_model = source)
+    args = items[1]["input_ids"], items[1]["question_spans"], items[1]["option_spans"], items[1]["types"]
+    np.testing.assert_allclose(np.array(served.logits(*args)), np.array(pipeline.logits(*args)), atol = 3e-2)
+
+
 def test_clef_trains_on_the_images_of_its_records(clef):
     import base64, io
 

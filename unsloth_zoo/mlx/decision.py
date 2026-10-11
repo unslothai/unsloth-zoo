@@ -747,13 +747,16 @@ def _attach_lora(model, folder):
     """Put a plain LoRA adapter on the modules it names, as adapters of their own, which a quantized base takes too."""
     from mlx_lm.tuner.lora import LoRALinear
 
+    from .utils import _get_text_model
+
     config, adapter = _plain_lora(folder), mx.load(str(folder / "adapter_model.safetensors"))
     stems = {_lora_key(stem): stem for stem in {name.rsplit(".lora_", 1)[0] for name in adapter}}
     if "lm_head" in stems:
         raise ValueError(f"The adapter in {folder} is on the output embedding, which a Clef's joint head reads as stored")
-    wrapped = []
+    # An audio tower numbers its layers as the decoder does, whose adapter this is.
+    decoder, wrapped = {id(module) for _, module in _get_text_model(model).named_modules()}, []
     for path, module in model.named_modules():
-        stem = stems.get(_lora_key(path)) if isinstance(module, (nn.Linear, nn.QuantizedLinear)) else None
+        stem = stems.get(_lora_key(path)) if id(module) in decoder and isinstance(module, (nn.Linear, nn.QuantizedLinear)) else None
         if stem is None:
             continue
         low = LoRALinear.from_base(module, r = config["r"], dropout = float(config.get("lora_dropout") or 0.0), scale = config["lora_alpha"] / config["r"])
@@ -842,11 +845,10 @@ class _QwenModel(DecisionPipeline):
         return getattr(getattr(self.model, "config", None), "model_type", None)
 
     def _reads(self, tower, part):
-        # The layouts and forwards here are those of these architectures only, which keep their towers in different places.
+        # The layouts and forwards here are those of these architectures only.
         owner = {"qwen3_5": self.model, "qwen3_omni_moe": getattr(self.model, "thinker", None)}.get(self._architecture)
         # Without its processor files a model loads with a bare tokenizer in the processor's place.
         processor = getattr(getattr(self.model, "_processor", None), part, None)
-        # Tower-less conversions load vision_tower=None.
         return getattr(owner, tower, None) is not None and processor is not None
 
     @property
@@ -868,8 +870,9 @@ class _QwenModel(DecisionPipeline):
         clips = dict(audio = list(audio), sampling_rate = _AUDIO_RATE, padding = True, truncation = False, return_attention_mask = True) if audio else {}
         try:
             encoded = self.model._processor(text = [self._media_text(len(images), len(audio))], images = list(images) or None, return_tensors = "np", **clips)
-        except ValueError as error:
-            raise DecisionRequestError(f"{'an image' if images else 'an audio clip'} could not be read: {error}") from error
+        except (ValueError, RuntimeError) as error:
+            # A clip shorter than the feature window fails inside the extractor.
+            raise DecisionRequestError(f"{' or '.join(name for name, given in (('an image', images), ('an audio clip', audio)) if given)} could not be read: {error}") from error
         ids = np.asarray(encoded["input_ids"])[0].tolist()
         if len(ids) >= self._IMAGE_TOKENS:
             named = " and ".join(name for name, given in (("images", images), ("audio clips", audio)) if given)
@@ -1380,8 +1383,12 @@ class ClefModel(_QwenModel):
     # Clef Omni resizes an image into these bounds, narrower than its processor's own.
     _OMNI_PIXELS = (65536, 1048576)
 
-    def _load_beside(self, *args, **kwargs):
-        super()._load_beside(*args, **kwargs)
+    def _load_beside(self, source, *args, **kwargs):
+        super()._load_beside(source, *args, **kwargs)
+        stacks = [path for path, _ in tree_flatten(self.model.parameters()) if ".switch_mlp." in path]
+        stored = _stored_tensors(source) if stacks else ()
+        # A mixture's experts stored apart load as one stack, which then has no tensor of its own to be saved to.
+        self._experts_apart = any(_decoder_tensor_name(self.model, path, stored) is None for path in stacks)
         if self._architecture == "qwen3_omni_moe" and self.reads_images:
             sizes = self.model._processor.image_processor
             sizes.min_pixels, sizes.max_pixels = self._OMNI_PIXELS
@@ -1676,14 +1683,19 @@ def _stored_tensors(source):
 
 def _decoder_tensor_name(decoder, path, stored = ()):
     name = path
-    if "language_model" in decoder:
-        # transformers stores a decoder inside a vision-language wrapper under other names than it is loaded with.
-        name = None
-        for prefix, saved in (("language_model.model.", "model.language_model."), ("language_model.lm_head.", "lm_head.")):
-            if path.startswith(prefix):
-                name = saved + path[len(prefix) :]
+    # transformers stores a decoder inside a vision-language or an omni wrapper under other names than it is loaded with.
+    wrappers = {
+        "language_model": (("language_model.model.", "model.language_model."), ("language_model.lm_head.", "lm_head.")),
+        "thinker": (("thinker.language_model.model.", "thinker.model."), ("thinker.language_model.lm_head.", "thinker.lm_head.")),
+    }
+    for wrapper, renamed in wrappers.items():
+        if wrapper in decoder:
+            name = next((saved + path[len(prefix) :] for prefix, saved in renamed if path.startswith(prefix)), None)
     # An MLX conversion keeps the names its weights are loaded with.
-    return path if name not in stored and path in stored else name
+    if name not in stored and path in stored:
+        return path
+    # transformers stores each expert of a mixture apart, with no one tensor for the stack they are loaded as.
+    return None if name and name not in stored and name.replace(".switch_mlp.", ".experts.0.") in stored else name
 
 
 def _require_clef_source(decoder, source):
@@ -2260,7 +2272,7 @@ class ClefNetwork(nn.Module):
         names = list(source["questions"])
         try:
             # The item already holds the images of the state, which a caller may have kept whole.
-            record = clef_training_item(self._pipeline, _without_image_parts(source["state"]), {names[i]: source["questions"][names[i]] for i in order}, source.get("max_length"), item.get("images"))
+            record = clef_training_item(self._pipeline, _without_image_parts(source["state"]), {names[i]: source["questions"][names[i]] for i in order}, source.get("max_length"), item.get("images"), item.get("audio"))
         except ValueError:
             return item
         return {**item, **record, "targets": [item["targets"][i] for i in order]}
@@ -2281,6 +2293,9 @@ def clef_training_network(
 
     if full_finetuning and any(path.endswith(".scales") for path, _ in tree_flatten(pipeline.model.parameters())):
         raise ValueError("Unsloth: a quantized decoder trains through LoRA adapters only; pass full_finetuning = False.")
+    stacked = {path.rsplit(".", 1)[-1] for path, module in pipeline.model.named_modules() if "SwitchLinear" in type(module).__name__}
+    if full_finetuning and pipeline._experts_apart:
+        raise ValueError("Unsloth: this checkpoint stores each expert of its mixture apart, so it trains through LoRA adapters only; pass full_finetuning = False.")
     if any("lora_a" in module for _, module in pipeline.model.named_modules()):
         # Adapters the checkpoint was loaded with go on training as they are.
         if full_finetuning:
@@ -2296,7 +2311,10 @@ def clef_training_network(
             output.module.freeze()
     else:
         if target_modules in (None, "all-linear"):
-            target_modules = list(_CLEF_LORA_TARGETS)
+            target_modules = [name for name in _CLEF_LORA_TARGETS if name not in stacked]
+        elif stacked & set([target_modules] if isinstance(target_modules, str) else target_modules):
+            # An adapter over the stacked experts of a mixture has no one checkpoint tensor to be merged into, in any layout.
+            raise ValueError(f"Unsloth: adapters on the stacked experts of a mixture cannot be saved; leave {sorted(stacked)} out of target_modules.")
         # Checkpointing is applied around each run instead, so it is gone again when the model serves.
         FastMLXModel.get_peft_model(
             pipeline.model, r = r, lora_alpha = lora_alpha, target_modules = target_modules, use_gradient_checkpointing = False, **lora,
@@ -2414,10 +2432,11 @@ def clef_option_keys(pipeline, question):
     return [key for key, _ in pipeline._parse_questions({"question": question})[0].options]
 
 
-def clef_training_item(pipeline, state, questions, max_length = None, images = None):
+def clef_training_item(pipeline, state, questions, max_length = None, images = None, audio = None):
     """Tokenize one record as a Clef training item; the caller adds `targets`, a distribution per question over `clef_option_keys`.
 
     `images` are PIL images or data URLs; with the image parts of a chat-message state they are read as a request's are.
+    `audio` clips are data URLs or decoded `{"array", "sampling_rate"}` clips, mono at 16 kHz.
     `source` keeps the record, which `permute_fields` encodes again with its questions reordered."""
     parsed = pipeline._parse_questions(questions)
     given = list(images or ())
@@ -2428,13 +2447,16 @@ def clef_training_item(pipeline, state, questions, max_length = None, images = N
         raise DecisionRequestError(f"too many images, the maximum is {_MAX_IMAGES}")
     if urls:
         state = _without_image_parts(state)
-    ids, question_spans, option_spans = pipeline.encode(state, parsed, max_length, pipeline.encode_media(images)[0] if images else ())
+    audio = list(audio or ())
+    if len(audio) > _MAX_AUDIO:
+        raise DecisionRequestError(f"too many audio clips, the maximum is {_MAX_AUDIO}")
+    ids, question_spans, option_spans = pipeline.encode(state, parsed, max_length, pipeline.encode_media(images, _clips(audio))[0] if images or audio else ())
     item = {
         "input_ids": ids, "question_spans": question_spans, "option_spans": option_spans, "types": [_TYPE_IDS.index(q.type) for q in parsed],
         "source": {"state": state, "questions": dict(questions), "max_length": max_length},
     }
-    # Kept as data URLs, decoded per read: stored pixels would outweigh the rest of a dataset.
-    return {**item, "images": kept} if kept else item
+    # Kept as given, data URLs decoded per read: stored pixels would outweigh the rest of a dataset.
+    return {**item, **({"images": kept} if kept else {}), **({"audio": audio} if audio else {})}
 
 
 def _pictures(images):
@@ -2442,8 +2464,21 @@ def _pictures(images):
     return [next(decoded) if isinstance(image, str) else image for image in images]
 
 
+def _clips(audio):
+    decoded, clips = iter(_decode_audio(_data_urls([clip for clip in audio if isinstance(clip, str)], "audio", _MAX_AUDIO))), []
+    for clip in audio:
+        if not isinstance(clip, str):
+            samples = np.asarray(clip.get("array") if isinstance(clip, dict) else None, np.float32)
+            # Without its rate a clip's length is unknown, and at another rate it is heard as other sounds.
+            if samples.ndim != 1 or not samples.size or clip.get("sampling_rate") != _AUDIO_RATE:
+                raise DecisionRequestError(f'a decoded audio clip must be {{"array", "sampling_rate"}} with mono samples at {_AUDIO_RATE} Hz')
+        clips.append(next(decoded) if isinstance(clip, str) else samples)
+    return clips
+
+
 def _item_logits(pipeline, item, output = None):
-    media = pipeline.encode_media(_pictures(item["images"]))[1] if item.get("images") else None
+    images, audio = item.get("images") or (), item.get("audio") or ()
+    media = pipeline.encode_media(_pictures(images), _clips(audio))[1] if images or audio else None
     return pipeline.logits(item["input_ids"], item["question_spans"], item["option_spans"], item["types"], output, media)
 
 
