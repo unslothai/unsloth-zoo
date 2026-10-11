@@ -786,19 +786,27 @@ class _QwenModel(DecisionPipeline):
     _IMAGE_TOKENS = 16384
 
     @property
+    def _architecture(self):
+        return getattr(getattr(self.model, "config", None), "model_type", None)
+
+    @property
     def reads_images(self):
-        # Tower-less conversions load vision_tower=None; the layout and forward here are Qwen3.5's only.
-        known = getattr(getattr(self.model, "config", None), "model_type", None) == "qwen3_5"
+        # The layouts and forwards here are those of these architectures only, which keep their towers in different places.
+        owner = {"qwen3_5": self.model, "qwen3_omni_moe": getattr(self.model, "thinker", None)}.get(self._architecture)
         # Without its processor files a model loads with a bare tokenizer in the processor's place.
         processor = getattr(getattr(self.model, "_processor", None), "image_processor", None)
-        return self.takes_images and known and getattr(self.model, "vision_tower", None) is not None and processor is not None
+        # Tower-less conversions load vision_tower=None.
+        return self.takes_images and getattr(owner, "vision_tower", None) is not None and processor is not None
+
+    def _image_text(self, count):
+        return self._IMAGE * count + self._AFTER_IMAGES
 
     def encode_images(self, images):
         """The token ids that stand for `images` in the prompt, and the pixels behind them."""
         if not self.reads_images:
             raise DecisionUnsupportedError("this model does not support images")
         try:
-            encoded = self.model._processor(text = [self._IMAGE * len(images) + self._AFTER_IMAGES], images = list(images), return_tensors = "np")
+            encoded = self.model._processor(text = [self._image_text(len(images))], images = list(images), return_tensors = "np")
         except ValueError as error:
             raise DecisionRequestError(f"an image could not be read: {error}") from error
         ids = np.asarray(encoded["input_ids"])[0].tolist()
@@ -819,7 +827,7 @@ class _QwenModel(DecisionPipeline):
             # The loader leaves the embeddings, the output head and the vision tower in 16-bit for the trainers that
             # train them. No decision head does, and together they are as large again as the quantized layers.
             tower = "vision_tower" if self.reads_images else "\0"
-            nn.quantize(self.model, 64, 4, class_predicate = lambda path, module: not path.startswith(tower) and hasattr(module, "to_quantized") and module.weight.shape[-1] % 64 == 0)
+            nn.quantize(self.model, 64, 4, class_predicate = lambda path, module: tower not in path.split(".") and hasattr(module, "to_quantized") and module.weight.shape[-1] % 64 == 0)
         self.model.eval()
 
     def _load_beside(self, folder, dtype, token, head_prefix, load_in_4bit = False):
@@ -847,7 +855,9 @@ class _QwenModel(DecisionPipeline):
         if media is None:
             return {}
         merged = self.model.get_input_embeddings(ids, media["pixel_values"], image_grid_thw = media["image_grid_thw"])
-        return {"inputs_embeds": merged.inputs_embeds, "position_ids": merged.position_ids}
+        # Qwen3-Omni also adds features of its tower's inner layers to the image tokens after the first decoder layers.
+        names = ("inputs_embeds", "position_ids", "visual_pos_masks", "deepstack_visual_embeds")
+        return {name: getattr(merged, name) for name in names if getattr(merged, name, None) is not None}
 
     def _hidden(self, ids, media = None):
         from .utils import _forward_text_hidden_states
@@ -1292,7 +1302,7 @@ class ClefModel(_QwenModel):
     """One prompt holds every question; a joint head scores all their options together."""
 
     family = "clef"
-    sources = ("Cloudflare/clef", "Cloudflare/clef-flash")
+    sources = ("Cloudflare/clef", "Cloudflare/clef-flash", "Cloudflare/clef-omni")
     needs = "the joint head (joint_head_config.json and joint_head.safetensors)"
 
     @staticmethod
@@ -1304,6 +1314,18 @@ class ClefModel(_QwenModel):
     _AFTER_IMAGES = "\n"
     _SYSTEM = "Read the complete state and schema. Decide every field jointly. Each answer must be exactly one of that field's allowed options."
     _NOUL = {"true": "The proposition is true or the answer is yes.", "false": "The proposition is false or the answer is no."}
+    # Clef Omni resizes an image into these bounds, narrower than its processor's own.
+    _OMNI_PIXELS = (65536, 1048576)
+
+    def _load_beside(self, *args, **kwargs):
+        super()._load_beside(*args, **kwargs)
+        if self._architecture == "qwen3_omni_moe" and self.reads_images:
+            sizes = self.model._processor.image_processor
+            sizes.min_pixels, sizes.max_pixels = self._OMNI_PIXELS
+
+    def _image_text(self, count):
+        # Clef Omni was trained with a line break after each image, Clef with one after them all.
+        return (self._IMAGE + "\n") * count if self._architecture == "qwen3_omni_moe" else super()._image_text(count)
 
     def __init__(self, folder, dtype, base_model, token, load_in_4bit = False):
         decoder = folder

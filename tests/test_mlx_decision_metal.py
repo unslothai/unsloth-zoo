@@ -38,7 +38,7 @@ from mlx_simulation import mlx_is_simulated  # noqa: E402
 if mlx_is_simulated():
     pytest.skip("needs real MLX: mx.fast attention and RoPE", allow_module_level = True)
 
-from mlx.nn import Dropout, Embedding, LayerNorm, Linear, quantize  # noqa: E402
+from mlx.nn import Dropout, Embedding, LayerNorm, Linear, Sequential, quantize  # noqa: E402
 from mlx.utils import tree_flatten, tree_map  # noqa: E402
 from safetensors.torch import load_file, save_file  # noqa: E402
 
@@ -859,8 +859,11 @@ def test_saved_clef_holds_the_trained_decoder_and_a_head_with_its_temperature_fo
         for reads in (True, False):
             loaded[True] = _decoder()
             loaded[True].vision_tower = Linear(64, 64)
+            # Qwen3-Omni keeps its towers inside its thinker.
+            loaded[True].thinker = Sequential()
+            loaded[True].thinker.vision_tower = Linear(64, 64)
             _QwenModel._load(SimpleNamespace(reads_images = reads), tmp_path, None, None, None, None, True)
-            assert ("scales" in loaded[True].vision_tower) != reads
+            assert ("scales" in loaded[True].vision_tower) != reads and ("scales" in loaded[True].thinker.vision_tower) != reads
     network = clef_training_network(pipeline, full_finetuning = mode == "full", r = 4, lora_alpha = 8, modules_to_save = ["embed_tokens"] if mode == "embedding" else None)
     if mode == "qlora":
         # Adapters over quantized layers receive gradients.
@@ -1115,6 +1118,46 @@ def test_clef_reads_images_between_the_opening_and_the_state(clef, monkeypatch):
     assert dark["usage"] == light["usage"] and dark["answers"]["ok"]["noul"] != light["answers"]["ok"]["noul"]
     assert dark["usage"]["input_tokens"] == len(reader.encode([{"role": "user", "content": ["state"]}], parsed)[0]) + 9
     model._processor = None
+    assert not reader.reads_images
+
+
+def _omni_decoder():
+    from mlx_vlm.models import qwen3_omni_moe
+
+    text = dict(model_type = "qwen3_omni_moe_text", hidden_size = 64, intermediate_size = 64, moe_intermediate_size = 64, num_hidden_layers = 4, num_attention_heads = 2, num_key_value_heads = 1, head_dim = 32, vocab_size = 512)
+    text.update(num_experts = 4, num_experts_per_tok = 2, decoder_sparse_step = 1, mlp_only_layers = [], rms_norm_eps = 1e-6, rope_theta = 1e6, max_position_embeddings = 4096, rope_scaling = {"mrope_section": [6, 5, 5]}, use_qk_norm = True)
+    vision = dict(depth = 2, deepstack_visual_indexes = [0], hidden_size = 32, intermediate_size = 64, num_heads = 2, out_hidden_size = 64)
+    audio = dict(d_model = 32, encoder_layers = 1, num_hidden_layers = 1, encoder_attention_heads = 2, encoder_ffn_dim = 64, downsample_hidden_size = 16, output_dim = 64)
+    thinker = dict(text_config = text, vision_config = vision, audio_config = audio, image_token_id = 500, vision_start_token_id = 501, vision_end_token_id = 502)
+    mx.random.seed(7)
+    config = {"model_type": "qwen3_omni_moe", "enable_audio_output": False, "thinker_config": thinker, "talker_config": {"text_config": text}}
+    return qwen3_omni_moe.Model(qwen3_omni_moe.ModelConfig.from_dict(config))
+
+
+def test_clef_omni_reads_images_through_its_thinker(clef, tmp_path, monkeypatch):
+    from PIL import Image
+
+    from unsloth_zoo.mlx.decision import ClefModel
+
+    reader, model, asked = copy.copy(clef[0]), _omni_decoder(), []
+    reader.model = model
+    model._processor = lambda text, images, return_tensors: asked.append(text[0]) or _patches(text, images, return_tensors)
+    model._processor.image_processor = SimpleNamespace(min_pixels = 1, max_pixels = 2)
+    images = [Image.new("RGB", size, shade) for size, shade in (((96, 64), "black"), ((64, 64), "white"))]
+    assert reader.reads_images
+    image_ids, media = reader.encode_images(images)
+    # A line break follows each image, not only the last.
+    assert asked == [(reader._IMAGE + "\n") * 2] and image_ids.count(500) == 10
+    ids = reader.encode("state", reader._parse_questions({"ok": {"type": "noul", "instructions": "fine?"}}), image_ids = image_ids)[0]
+    with generation_mode(model):
+        hidden = reader._hidden(ids, media)
+        # mlx-vlm's own forward places the image features, their positions and the features added after the first layers.
+        expected = model.thinker(mx.array(ids)[None], media["pixel_values"], image_grid_thw = media["image_grid_thw"]).logits[0]
+        np.testing.assert_allclose(np.array(model.language_model.lm_head(hidden).astype(mx.float32)), np.array(expected.astype(mx.float32)), atol = 1e-4)
+    monkeypatch.setattr(ClefModel, "_load", lambda self, *args: vars(self).update(model = model))
+    reader._load_beside(tmp_path, None, None, "joint_head")
+    assert (model._processor.image_processor.min_pixels, model._processor.image_processor.max_pixels) == (65536, 1048576)
+    model.thinker.vision_tower = None
     assert not reader.reads_images
 
 
