@@ -4717,8 +4717,9 @@ def test_collation_hands_the_clip_lengths_to_the_window_check(monkeypatch):
 
     processor = _Spans()
     _qualify(monkeypatch, processor=processor)
+    # Pre-rendered text cannot be given a placeholder per piece.
     with pytest.raises(ValueError, match="audio clip"):
-        _finalized_collate([_audio_row(_CLIP)], processor, 16, None)
+        _finalized_collate([{"text": "<audio>", "audio": [_CLIP]}], processor, 16, None)
 
 
 def _run_capped_processor(window=None, n_samples=None, cap=True):
@@ -4809,11 +4810,73 @@ def test_collation_hands_the_clip_lengths_to_the_run_cap_check(monkeypatch, row)
 
     processor = _Capped()
     _qualify(monkeypatch, processor=processor)
-    item = _audio_row({"array": np.zeros(17, np.float32), "sampling_rate": 16000})
+    # Pre-rendered text cannot be given a placeholder per piece.
+    audio = [{"array": np.zeros(17, np.float32), "sampling_rate": 16000}]
+    item = {"text": "<audio>", "audio": audio}
     if row == "prompt_completion":
-        item = {"prompt": item["messages"][:1], "completion": item["messages"][1:]}
+        item = {"prompt": "<audio>", "completion": "ok", "audio": audio}
     with pytest.raises(ValueError, match="Split the clip"):
         _finalized_collate([item, item], processor, 16, None)
+
+
+def test_a_clip_past_the_window_is_split_into_near_equal_pieces():
+    from unsloth_zoo.mlx.utils import _AudioClip, _split_audio_past_the_window
+
+    processor = _run_capped_processor()  # keeps 8 samples of a clip
+    short = _AudioClip(np.arange(8, dtype=np.float32), 16)
+    long = _AudioClip(np.arange(17, dtype=np.float32), 16)
+    messages = [
+        {"role": "user", "content": [{"type": "audio"}, {"type": "text", "text": "A"}]},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": [{"type": "text", "text": "B"}, {"type": "audio"}]},
+    ]
+    split, pieces = _split_audio_past_the_window(messages, [short, long], processor)
+    assert [[part["type"] for part in m["content"]] if isinstance(m["content"], list)
+            else m["content"] for m in split] == [
+        ["audio", "text"], "ok", ["text", "audio", "audio", "audio"]]
+    assert [len(piece) for piece in pieces] == [8, 6, 6, 5]
+    assert np.array_equal(np.concatenate(pieces[1:]), long)
+    assert {piece.sampling_rate for piece in pieces} == {16}
+
+    for unsplit in ([short, short], [long]):  # nothing over; parts and clips differ
+        same, clips = _split_audio_past_the_window(messages, unsplit, processor)
+        assert same is messages and clips is unsplit
+    for rendered, clips in (("Hello.", []), ("<audio>", [long])):
+        assert _split_audio_past_the_window(rendered, clips, processor)[0] is rendered
+
+    # A tower that misencodes a second clip keeps the cut instead.
+    type(processor).__module__ = "mlx_vlm.models.qwen3_omni_moe.processing_qwen3_omni_moe"
+    same, clips = _split_audio_past_the_window(messages, [short, long], processor)
+    assert same is messages
+
+
+@pytest.mark.parametrize("row", ["messages", "prompt_completion"])
+def test_collation_gives_each_piece_of_a_long_clip_its_own_run(monkeypatch, row):
+    """Otherwise the audio past the window is never trained on."""
+    seen = {}
+
+    class _Capped(_FakeGemmaAudioProcessor):  # a cap of 16 samples
+        audio_seq_length = 1
+        audio_ms_per_token = 1
+
+        def __call__(self, text, audio=None, max_length=None, **kwargs):
+            seen["audio"] = audio or seen.get("audio")
+            return super().__call__(text, audio, max_length, **kwargs)
+
+    processor = _Capped()
+    _qualify(monkeypatch, processor=processor)
+    wave = np.arange(32, dtype=np.float32)
+    item = _audio_row({"array": wave, "sampling_rate": 16000})
+    if row == "prompt_completion":
+        item = {"prompt": item["messages"][:1], "completion": item["messages"][1:]}
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        batch = _finalized_collate([item], processor, 64, None)
+    batch = batch[0] if isinstance(batch, tuple) else batch
+    assert [np.asarray(piece).tolist() for piece in seen["audio"]] == [
+        wave[:16].tolist(), wave[16:].tolist()]
+    ids = np.asarray(batch["input_ids"])[0].tolist()
+    assert ids.count(301) == 2 and ids.count(300) == 2 * processor.soft_tokens
 
 
 def test_ids_the_run_path_rejects_are_rejected_on_the_bounds_path_too():

@@ -8135,6 +8135,51 @@ def _audio_run_cap_samples(processor):
     return int(length) * int(period) * int(rate) // 1000
 
 
+def _audio_clip_limit_samples(processor):
+    limits = (_extractor_window_samples(processor), _audio_run_cap_samples(processor))
+    return min((limit for limit in limits if limit), default=None)
+
+
+# mlx-vlm's Qwen3-Omni audio tower masks chunks by clip index, so a second clip's
+# positions are filled from the first clip's chunks (fixed upstream in #2349,
+# after 0.7.4). Splitting there would replace a cut with the wrong audio.
+_AUDIO_FAMILIES_MISENCODING_A_SECOND_CLIP = {"qwen3_omni_moe"}
+
+
+def _split_audio_past_the_window(messages, clips, processor):
+    """Give each clip longer than the processor keeps a placeholder per piece.
+
+    Pieces are near-equal rather than window-sized with a remainder, so none is
+    too short to frame. Returns its arguments when there is nothing to split.
+    """
+    limit = _audio_clip_limit_samples(processor)
+    if _audio_family_from_processor(processor) in _AUDIO_FAMILIES_MISENCODING_A_SECOND_CLIP:
+        limit = None
+    counts = [-(-len(clip) // limit) if limit else 1 for clip in clips]
+    # Rows the dataset rendered itself reach here as a string.
+    if max(counts, default=1) < 2 or not isinstance(messages, list):
+        return messages, clips
+    parts = sum(
+        _is_vlm_audio_part(part) for message in messages
+        if isinstance(message.get("content"), list) for part in message["content"]
+    )
+    if parts != len(clips):
+        return messages, clips
+    repeats = iter(counts)
+    split = [
+        {**message, "content": [
+            copy for part in message["content"]
+            for copy in [part] * (next(repeats) if _is_vlm_audio_part(part) else 1)
+        ]} if isinstance(message.get("content"), list) else message
+        for message in messages
+    ]
+    pieces = []
+    for clip, count in zip(clips, counts):
+        size = -(-len(clip) // count)
+        pieces.extend(clip[start:start + size] for start in range(0, len(clip), size))
+    return split, pieces
+
+
 def _audio_delimiter_strings(processor):
     tokenizer = _get_processor_tokenizer(processor)
     convert = getattr(tokenizer, "convert_ids_to_tokens", None)
@@ -8225,12 +8270,13 @@ def _assert_audio_runs_cover_their_clips(clips, processor):
     Gemma 4 unified caps the run but keeps every frame, so the surplus is merged
     into the next clip's positions; the batch's last clip has no next one. A cut
     that keeps the row aligned is not refused: a row may validly ask about the
-    start of a clip.
+    start of a clip. Message rows are split before they get here, unless the
+    model misencodes a second clip.
     """
-    window = _extractor_window_samples(processor)
-    cap = _audio_run_cap_samples(processor)
-    cut = not cap or (window is not None and window <= cap)
-    limit = window if cut else cap
+    splits = _audio_family_from_processor(processor) not in _AUDIO_FAMILIES_MISENCODING_A_SECOND_CLIP
+    advice = "Split the clip" + (", or give the row as messages." if splits else ".")
+    limit = _audio_clip_limit_samples(processor)
+    cut = limit == _extractor_window_samples(processor)
     name = type(processor).__name__
     if not limit or not clips:
         return
@@ -8247,15 +8293,14 @@ def _assert_audio_runs_cover_their_clips(clips, processor):
                 f"clip but {name} writes placeholders for at most {limit} "
                 f"samples of one clip{seconds} while keeping all of its "
                 f"audio, so the surplus lands on the next clip's positions. "
-                f"Split the clip."
+                f"{advice}"
             )
         if name not in _reported_cut_audio:
             _reported_cut_audio.add(name)
             warnings.warn(
                 f"Unsloth MLX: {name} uses only the first {limit} samples of "
                 f"an audio clip{seconds} and this dataset has a longer one "
-                f"({length} samples), so the rest is not trained on. Split "
-                f"such clips, or trim their target text to the audio kept.",
+                f"({length} samples), so the rest is not trained on. {advice}",
                 stacklevel=2,
             )
 
@@ -9504,6 +9549,19 @@ def _collate_vlm_prompt_completion_batch(
             prompt = [{"role": "user", "content": prompt}]
         prompt_messages = prompt if isinstance(prompt, list) else None
         completion_messages = completion if isinstance(completion, list) else None
+        # Audio conditions the response, so it belongs to the prompt half;
+        # scanning the completion keeps a misplaced clip from passing the gate.
+        if any(_vlm_audio_part_state(completion_messages or [])):
+            raise ValueError(
+                "Unsloth MLX: audio in the completion half is not supported; "
+                "put the audio in the prompt so it conditions the response."
+            )
+        audio = _extract_vlm_audio(item, prompt_messages or [], processor)
+        if prompt_messages is not None:
+            prompt_messages, audio = _split_audio_past_the_window(
+                prompt_messages, audio, processor,
+            )
+        all_audio.append(audio)
 
         if prompt_messages is not None:
             prompt_text = _render_vlm_messages(
@@ -9533,16 +9591,6 @@ def _collate_vlm_prompt_completion_batch(
         prompt_texts.append(prompt_text)
         completion_texts.append(completion_text)
         all_images.append(images)
-        # Audio conditions the response, so it belongs to the prompt half;
-        # scanning the completion keeps a misplaced clip from passing the gate.
-        if any(_vlm_audio_part_state(completion_messages or [])):
-            raise ValueError(
-                "Unsloth MLX: audio in the completion half is not supported; "
-                "put the audio in the prompt so it conditions the response."
-            )
-        all_audio.append(
-            _extract_vlm_audio(item, prompt_messages or [], processor)
-        )
 
     prompt_inputs = _processor_vlm_inputs(
         processor,
@@ -9805,6 +9853,10 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
             )
         images = _extract_vlm_images(item, messages, image_size)
         audio = _extract_vlm_audio(item, messages, processor)
+        if raw is not item:
+            split, audio = _split_audio_past_the_window(messages, audio, processor)
+            if split is not messages:
+                text = _render_vlm_messages(processor, split)
         all_texts.append(text)
         all_images.append(images)
         all_audio.append(audio)
