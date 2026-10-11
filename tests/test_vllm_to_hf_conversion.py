@@ -219,8 +219,7 @@ def test_set_dtype_in_config_no_torch_dtype_deprecation():
 
 
 def test_set_dtype_in_config_writes_torch_dtype_value():
-    # transformers 4.x stores `torch_dtype` as a JSON-safe string; 5.x stores `dtype` as a
-    # torch.dtype, which modeling code passes straight to torch ops (unsloth-zoo#1556).
+    # 4.x: JSON-safe string; 5.x: torch.dtype, passed straight to torch ops (#1556).
     from transformers import PretrainedConfig
     from unsloth_zoo.hf_utils import set_dtype_in_config, dtype_from_config, HAS_TORCH_DTYPE
     cfg = PretrainedConfig()
@@ -241,8 +240,7 @@ def test_set_dtype_in_config_accepts_string_input():
 
 
 def test_set_dtype_in_config_stores_json_safe_string():
-    # Regression: storing torch.dtype objects broke config.save_pretrained() JSON
-    # serialization on 4.x. 5.x's to_dict() converts a torch.dtype back to a string.
+    # 5.x to_dict() serialises a torch.dtype back to a string.
     import json
     from transformers import PretrainedConfig
     from unsloth_zoo.hf_utils import set_dtype_in_config

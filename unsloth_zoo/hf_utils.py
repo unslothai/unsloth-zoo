@@ -51,8 +51,7 @@ def dtype_from_config(config):
     return dtype
 
 def _as_torch_dtype(dtype):
-    # transformers 5.x keeps `config.dtype` as a torch.dtype and only converts strings
-    # in __init__, so a string set later reaches torch ops as-is (unsloth-zoo#1556)
+    # 5.x only converts a string dtype in __init__; later strings reach torch ops (#1556)
     return getattr(torch, dtype, dtype) if isinstance(dtype, str) else dtype
 
 def set_dtype_in_config(config, dtype):
