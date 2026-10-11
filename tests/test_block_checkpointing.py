@@ -21,6 +21,7 @@ Loaded from its file, like test_block_swap: ``import unsloth_zoo`` needs unsloth
 import functools
 import importlib.util
 import os
+import sys
 
 import pytest
 import torch
@@ -31,6 +32,7 @@ _HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _spec = importlib.util.spec_from_file_location(
     "block_checkpointing_under_test", os.path.join(_HERE, "unsloth_zoo", "block_checkpointing.py"))
 bc = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = bc  # pickle imports the wrapper class by module name
 _spec.loader.exec_module(bc)
 
 
@@ -195,8 +197,9 @@ class _Scaled(nn.Module):
         super().__init__()
         self.lin = nn.Linear(4, 4)
 
-    def forward(self, x, scale = 1.0):
-        return self.lin(x) * scale
+    def forward(self, x, scale = 1.0, debug = False):
+        # debug shares its name with a torch.utils.checkpoint keyword: it must still reach the block.
+        return self.lin(x) * (scale + float(debug))
 
 
 @pytest.mark.parametrize("use_reentrant", [False, True])
@@ -211,7 +214,7 @@ def test_block_keyword_arguments_reach_the_checkpointed_forward(use_reentrant):
     def step(m):
         h = x
         for block in m:
-            h = block(h, scale = 2.0)
+            h = block(h, scale = 2.0, debug = True)
         return h.pow(2).mean()
 
     _assert_same(_grads(ref, step), _grads(model, step))
@@ -238,6 +241,16 @@ def test_copied_and_saved_plain_models_keep_their_own_checkpointed_blocks():
     buffer.seek(0)
     loaded = torch.load(buffer, weights_only = False)
     torch.testing.assert_close(loaded(x), model(x))
+    # The loaded model still checkpoints its own blocks (through torch's function: the custom one is not saved).
+    assert all(bc._is_wrapped(b) and b.forward.block is b for b in loaded.layers)
+    seen = []
+    real = torch.utils.checkpoint.checkpoint
+    torch.utils.checkpoint.checkpoint = lambda f, *a, **k: seen.append(1) or real(f, *a, **k)
+    try:
+        loaded(x).pow(2).mean().backward()
+    finally:
+        torch.utils.checkpoint.checkpoint = real
+    assert len(seen) == 4
 
 
 def test_a_forward_patched_before_enabling_is_kept_and_restored():
@@ -255,7 +268,7 @@ def test_a_forward_patched_before_enabling_is_kept_and_restored():
     model(torch.randn(1, 8, requires_grad = True)).sum().backward()
     assert seen  # forward ran (and again on recompute) through the earlier patch
     bc.enable_block_gradient_checkpointing(model, 2)
-    assert bc._is_wrapped(model.layers[0]) and block.__dict__["forward"].__func__ is bc._checkpointed_forward
+    assert bc._is_wrapped(model.layers[0]) and block.__dict__["forward"].block is block
     bc._unwrap(block)
     assert block.forward is patched
 

@@ -22,7 +22,6 @@
 
 import functools
 import inspect
-import types
 import weakref
 
 import torch
@@ -54,10 +53,10 @@ def _torch_checkpoint(use_reentrant):
     def run(function, *args, **kwargs):
         ck = torch.utils.checkpoint
         fn = getattr(ck, "_unsloth_pristine_checkpoint", None) or ck.checkpoint
-        if use_reentrant and kwargs:
-            # Reentrant checkpoint rejects keyword arguments for the function, so bind them first.
-            function, kwargs = functools.partial(function, **kwargs), {}
-        return fn(function, *args, use_reentrant = use_reentrant, **kwargs)
+        if kwargs:
+            # Bind block kwargs: reentrant rejects them, and non-reentrant would take debug / context_fn as its own.
+            function = functools.partial(function, **kwargs)
+        return fn(function, *args, use_reentrant = use_reentrant)
 
     return run
 
@@ -112,21 +111,25 @@ def _inner_forward(block):
     return previous if previous is not None else type(block).forward.__get__(block, type(block))
 
 
-def _checkpointed_forward(self, *args, **kwargs):
-    # Bound to a block as its instance ``forward``: deepcopy rebinds a bound method to the copy, and pickle stores it
-    # as getattr(block, __name__), so copied and saved models never alias or fail.
-    inner = _inner_forward(self)
-    if self.training and torch.is_grad_enabled():
-        run = _CUSTOM.get(self) or _torch_checkpoint(getattr(self, _MARK, False))
-        return run(inner, *args, **kwargs)
-    return inner(*args, **kwargs)
+class _CheckpointedForward:
+    # A block's instance ``forward``. A plain object holding its block: deepcopy and pickle carry it along with the
+    # block (a bound method pickles as getattr(block, "forward"), which reloads as the unwrapped class forward).
+    __slots__ = ("block",)
 
+    def __init__(self, block):
+        self.block = block
 
-_checkpointed_forward.__name__ = "forward"
+    def __call__(self, *args, **kwargs):
+        block = self.block
+        inner = _inner_forward(block)
+        if block.training and torch.is_grad_enabled():
+            run = _CUSTOM.get(block) or _torch_checkpoint(getattr(block, _MARK, False))
+            return run(inner, *args, **kwargs)
+        return inner(*args, **kwargs)
 
 
 def _is_wrapped(block):
-    return getattr(block.__dict__.get("forward"), "__func__", None) is _checkpointed_forward
+    return isinstance(block.__dict__.get("forward"), _CheckpointedForward)
 
 
 def _unwrap(block):
@@ -153,7 +156,7 @@ def _wrap_blocks(model, every_n_blocks, use_reentrant, checkpoint_function):
         if checkpoint_function is not None:
             _CUSTOM[block] = checkpoint_function
         setattr(block, _MARK, bool(use_reentrant))
-        block.forward = types.MethodType(_checkpointed_forward, block)
+        block.forward = _CheckpointedForward(block)
     return "modules"
 
 
