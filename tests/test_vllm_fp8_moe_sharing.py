@@ -80,7 +80,6 @@ def test_triton_block_fp8_is_shared_weights_and_scales():
     assert found["w13"] is routed.w13_weight and found["w2"] is routed.w2_weight
     assert found["w13_scale_inv"] is routed.w13_weight_scale_inv
     assert found["w2_scale_inv"] is routed.w2_weight_scale_inv
-    # The 16-bit API keeps refusing float8.
     with pytest.raises(NotImplementedError, match = "quantized MoE"):
         vllm_moe_expert_weights(routed, "layer 0")
 

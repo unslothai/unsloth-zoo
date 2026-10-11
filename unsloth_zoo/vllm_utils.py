@@ -1848,7 +1848,6 @@ def convert_vllm_to_huggingface(quant_state_dict, config, dtype = torch.float16,
     quant_method = get_quant_type(config)
     kwargs = dict()
     compute_dtype = dtype  # Do not use config file's dtype!
-    # Block FP8 experts shared with vLLM: the HF experts become FP8Experts before the binding loop.
     _swap_in_fp8_experts(new_model, quant_state_dict, config)
 
     if quantization_config != {} or bnb_config is not None:
