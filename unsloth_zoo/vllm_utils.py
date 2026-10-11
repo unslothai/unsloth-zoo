@@ -1067,6 +1067,14 @@ def get_vllm_state_dict(
         return _get_vllm_state_dict(llm, return_state_dict, config, is_vision_model)
 
 
+def _block_scale_grid_matches(weight_shape, scale_shape, block_size):
+    """A block FP8 scale grid has ceil(dim / block) entries per dimension, so a dimension smaller
+    than (or not a multiple of) its block still gets one scale for the partial block."""
+    (a, b), (p, q) = tuple(weight_shape), tuple(scale_shape)
+    return -(-a // block_size[0]) == p and -(-b // block_size[1]) == q
+pass
+
+
 def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_vision_model = False):
     # All Unsloth Zoo code licensed under LGPLv3
     # Unmerges vLLM modules and returns HF equivalent state_dict
@@ -1186,17 +1194,16 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
                             weight_scale = weight_scale.T
                             logger.info(f"Unsloth: Transposed weight scale for {prefix} for weight shape {qweight.shape} and scale shape {weight_scale.shape}")
                     pass
-                    a, b = qweight.shape
-                    p, q = weight_scale.shape
                     # Sanity check against wrongly sliced [0, x] weights
-                    assert a // p == proj.weight_block_size[0] and b // q == proj.weight_block_size[1], f"Unsloth: vLLM weight for {prefix} has unexpected weight shape {qweight.shape} and scale {weight_scale.shape} and block size {proj.weight_block_size}"
+                    assert _block_scale_grid_matches(qweight.shape, weight_scale.shape, proj.weight_block_size), f"Unsloth: vLLM weight for {prefix} has unexpected weight shape {qweight.shape} and scale {weight_scale.shape} and block size {proj.weight_block_size}"
                 else:
                     # Dynamic (per row/column) quant: scale [n,1], weight [4096,6144];
                     # transpose then slice.
                     qweight = qweight.T
                     block_size = 1
 
-                scale_offsets = [x//block_size for x in offsets]
+                # Ceil: a partial last block (dimension not a multiple of the block) still owns a scale row.
+                scale_offsets = [-(-x // block_size) for x in offsets]
                 if slice_weights:
                     weight_scale = weight_scale[scale_offsets[kk] : scale_offsets[kk + 1]]
 
