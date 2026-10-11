@@ -78,3 +78,11 @@ def test_both_halves_and_mismatched_shapes_are_untouched(live):
     assert vu._pad_lone_moe_expert_lora(object(), both) is both
     odd = {f"{P}.lora_A.weight": torch.randn(R * E, 7), f"{P}.lora_B.weight": torch.randn(5, R * E)}
     assert set(vu._pad_lone_moe_expert_lora(object(), odd)) == set(odd)
+
+
+def test_dense_prefilter_never_hides_an_expert_key():
+    # The "experts" / "moe" substring prefilter must stay a superset of _is_moe_expert_lora_key.
+    names = list(vu._MOE_EXPERT_LORA_SEGMENTS) + [p for p, _ in vu._MOE_EXPERT_LORA_QUALIFIED_SEGMENTS]
+    assert all("experts" in n or "moe" in n for n in names), names
+    keys = [f"base_model.model.model.layers.0.block_sparse_moe.input_linear.lora_{ab}.weight" for ab in "AB"]
+    assert vu._moe_lone_expert_lora_prefixes(keys) == ["base_model.model.model.layers.0.block_sparse_moe.input_linear"]

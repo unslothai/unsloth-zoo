@@ -4603,6 +4603,8 @@ def _moe_lone_expert_lora_prefixes(keys):
     # All Unsloth Zoo code licensed under LGPLv3
     outer, base = set(), set()
     for key in keys:
+        # Every expert segment contains "experts" or "moe": dense adapters skip the per-key split.
+        if "experts" not in key and "moe" not in key: continue
         if not _is_moe_expert_lora_key(key): continue
         match = _MOE_STACKED_LORA_KEY.match(key)
         if match is None: continue
