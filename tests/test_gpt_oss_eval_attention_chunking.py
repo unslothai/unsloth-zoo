@@ -110,6 +110,17 @@ with torch.no_grad():
     G._EAGER_ATTENTION_CHUNK_BYTES = 1
     b = attn(x.clone(), position_embeddings = cos_sin, attention_mask = mask1)[0]
 assert torch.allclose(a, b, rtol = 1e-5, atol = 1e-6)
+
+if torch.cuda.is_available():
+    # On CUDA the budget grows to half the free memory: single shot while it fits, chunks once it does not.
+    attn, x, mask = attn.cuda(), x.cuda(), mask.cuda()
+    cos_sin = tuple(t.cuda() for t in cos_sin)
+    roomy, n_roomy = run()
+    torch.cuda.mem_get_info = lambda *a, **k: (0, 0)
+    torch.cuda.memory_reserved = torch.cuda.memory_allocated
+    tight, n_tight = run()
+    assert (n_roomy, n_tight) == (1, T), (n_roomy, n_tight)
+    assert torch.allclose(roomy, tight, rtol = 1e-4, atol = 1e-5)
 print('CHUNK_OK', n_full, n_chunked, diff)
 """)
 

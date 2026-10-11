@@ -62,7 +62,8 @@ UNSLOTH_MXFP4_NO_DEQUANTIZE = os.environ.get("UNSLOTH_MXFP4_NO_DEQUANTIZE", "0")
 # Set when patch_GptOssAttention installs the forward that routes training through
 # flex_attention_with_sink, which builds its own BlockMask and ignores these masks.
 _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED = False
-# Eval eager attention splits the query rows so one chunk's logits + float32 softmax stay under this.
+# Eval eager attention splits the query rows when one shot's logits + float32 softmax exceed both this
+# and half the free CUDA memory; each chunk then holds up to the larger of the two.
 _EAGER_ATTENTION_CHUNK_BYTES = max(1, int(os.environ.get("UNSLOTH_GPT_OSS_ATTN_CHUNK_MB", "1024"))) << 20
 _TRAINING_FLAG_ATTR = "_unsloth_gpt_oss_model_training"
 
@@ -3205,7 +3206,13 @@ def patch_GptOssAttention():
         rows = qlen
         if not module.training and not torch.compiler.is_compiling():
             per_row = bsz * n_heads * (kvlen + 1) * (query.element_size() + 4)
-            rows = max(1, min(qlen, _EAGER_ATTENTION_CHUNK_BYTES // per_row))
+            budget = _EAGER_ATTENTION_CHUNK_BYTES
+            if per_row * qlen > budget and query.is_cuda:
+                # Chunks are slower (+4.6% prefill at 4 x 4096 with 1 GiB), so only split when it would not fit.
+                free, _ = torch.cuda.mem_get_info(query.device)
+                cached = torch.cuda.memory_reserved(query.device) - torch.cuda.memory_allocated(query.device)
+                budget = max(budget, (free + cached) // 2)
+            rows = max(1, min(qlen, budget // per_row))
         if rows >= qlen:
             attn_output = _eager_attention_rows(module, query, key_states, value_states, attention_mask, scaling, dropout)
         else:
