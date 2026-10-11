@@ -41,7 +41,7 @@ from typing import NamedTuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from . import nax
+from . import nax, qmm
 
 
 logger = logging.getLogger(__name__)
@@ -3213,6 +3213,35 @@ _NAX_INT8_QMM_VERIFIED = {}
 _NAX_SORTED_GATHER_VERIFIED = {}
 
 
+class _SmallRowRoute(NamedTuple):
+    """A small-row kernel, by its module and the prefix its functions share there (resolved at call time)."""
+    module: object
+    kernel: str
+    tag: str
+    label: str
+    switch: str
+    gap: str
+    probe: tuple
+    takes_blocks: bool   # whether one sequence's [1, T, K] block routes
+
+    def call(self, suffix, *args):
+        return getattr(self.module, self.kernel + suffix)(*args)
+
+
+_NAX_QMM_ROUTE = _SmallRowRoute(nax, "small_m_qmm", "Nax", "NAX", "UNSLOTH_MLX_NAX_QMM", "small_m_qmm",
+                                ("QMM_PROBE_KEY", "probe_small_m_qmm"), True)
+# Leaves single-sequence blocks native: Auto depth drafts those shallow, where a few-row verify gains nothing.
+_SIMD_QMM_ROUTE = _SmallRowRoute(qmm, "simd_qmm", "Simd", "SIMD small-row", "UNSLOTH_MLX_SIMD_QMM",
+                                 "small_m_qmm_simd", ("SIMD_QMM_PROBE_KEY", "probe_simd_qmm"), False)
+
+
+def _small_row_route():
+    """The small-row kernel this GPU runs, or None: stock's NAX kernels decide, not `UNSLOTH_MLX_NAX`."""
+    if nax.nax_available():
+        return _NAX_QMM_ROUTE
+    return _SIMD_QMM_ROUTE if qmm.simd_qmm_available() else None
+
+
 def _nax_qmm_matches_native(x, w, scales, biases, group_size, bits, routed):
     """Compare the kernel with stock's fp32 qmv of each row, within fp32 reordering of K products.
 
@@ -3234,6 +3263,16 @@ def _nax_qmm_matches_native(x, w, scales, biases, group_size, bits, routed):
 
 def _nax_small_m_qmm(module, x, bindings):
     """The small-row kernel's result for this call, or None when it takes the native call."""
+    # A shape already verified for this weight layout skips the checks, which cost more host time than a few
+    # rows save.
+    ready = module.__dict__.get("_unsloth_nax_qmm_ready", {}).get(x.shape) if type(x) is mx.array else None
+    if ready is not None and not module.training and _bindings_intact(bindings):
+        w, scales, biases = module.get("weight"), module.get("scales"), module.get("biases")
+        if (type(w) is type(scales) is type(biases) is mx.array and ready[1] == (
+                x.dtype, w.dtype, w.shape, scales.dtype, scales.shape, biases.dtype, biases.shape,
+                module.group_size, module.bits, module.mode)):
+            return module._unsloth_nax_qmm_route.call("", x.reshape(ready[0], -1), w, scales, biases,
+                                                      module.group_size, module.bits).reshape(*x.shape[:-1], -1)
     low, high = module._unsloth_nax_qmm_rows
     if not isinstance(x, mx.array) or x.ndim < 2 or not x.shape[-1] or not low <= x.size // x.shape[-1] <= high:
         return None
@@ -3244,35 +3283,40 @@ def _nax_small_m_qmm(module, x, bindings):
         return None
     N, K = w.shape[0], x.shape[-1]
     M = x.size // K
-    group_size, bits = module.group_size, module.bits
-    if (not nax.small_m_qmm_supported(N, K, group_size, bits, module.mode)
+    group_size, bits, route = module.group_size, module.bits, module._unsloth_nax_qmm_route
+    if (not route.call("_supported", N, K, group_size, bits, module.mode)
             or x.dtype not in (mx.bfloat16, mx.float16) or not x.dtype == scales.dtype == biases.dtype
             or w.dtype != mx.uint32 or w.shape != (N, K * bits // 32)
             or scales.shape != (N, K // group_size) or biases.shape != scales.shape):
         return None
     # Every kernel variant a call can select is checked on its own first use; a ragged row count
     # selects the bounds-checked one.
-    geometry = nax.small_m_qmm_geometry(M, N, K, group_size)
+    geometry = route.call("_geometry", M, N, K, group_size)
     key = (N, K, bits, group_size, x.dtype, geometry, M % geometry[0] == 0)
     verified = _NAX_QMM_VERIFIED.get(key)
     if verified is False:
         return None
     flat = x.reshape(M, K)
-    routed = nax.small_m_qmm(flat, w, scales, biases, group_size, bits)
+    routed = route.call("", flat, w, scales, biases, group_size, bits)
     if verified is None:
         try:
             verified = _nax_qmm_matches_native(flat, w, scales, biases, group_size, bits, routed)
         except (RuntimeError, ValueError):
             return None  # inside a function transformation, which cannot evaluate; checked later
         if verified and not any(_NAX_QMM_VERIFIED.values()):
-            logger.info("small-batch quantized projections now run on the NAX kernel; "
-                        "UNSLOTH_MLX_NAX_QMM=0 keeps the native call")
+            logger.info("small-batch quantized projections now run on the %s kernel; "
+                        "%s=0 keeps the native call", route.label, route.switch)
         _NAX_QMM_VERIFIED[key] = verified
         if not verified:
-            logger.warning("the NAX small-row quantized matmul disagrees with the native one for "
-                           "N=%d K=%d %d-bit group %d %s; the native call stays in use", N, K, bits,
+            logger.warning("the %s small-row quantized matmul disagrees with the native one for "
+                           "N=%d K=%d %d-bit group %d %s; the native call stays in use", route.label, N, K, bits,
                            group_size, x.dtype)
-    return routed.reshape(*x.shape[:-1], N) if verified else None
+    if not verified:
+        return None
+    module.__dict__.setdefault("_unsloth_nax_qmm_ready", {})[x.shape] = (
+        M, (x.dtype, w.dtype, w.shape, scales.dtype, scales.shape, biases.dtype, biases.shape, group_size, bits,
+            module.mode))
+    return routed.reshape(*x.shape[:-1], N)
 
 
 def _nax_qmm_eligible(supported, K, dtype, w, scales, biases, group_size, bits, mode):
@@ -3436,12 +3480,27 @@ def _nax_sorted_gather_route(module):
 # Keyed by the current methods: a transient wrapper, such as the training patches', misses only
 # while it is installed. Fallbacks read the base method at call time so a later one is honored.
 @functools.cache
-def _nax_qmm_classes(*cache_key):
+def _nax_qmm_classes(route, *cache_key):
     bindings = _resolved_bindings(_NAX_QMM_CONTRACT)
     if bindings is None:
         return {}
 
+    # Calls no route takes skip the checks: below every route's rows, between the small-row and the next
+    # route's rows, or a single-sequence block the route leaves native.
+    def declined(self, x):
+        if type(x) is not mx.array:
+            return False
+        n = x.size
+        if n < self._unsloth_nax_qmm_floor or self._unsloth_nax_qmm_ceiling < n < self._unsloth_nax_qmm_next:
+            return True
+        if route.takes_blocks or n > self._unsloth_nax_qmm_ceiling:
+            return False
+        shape = x.shape
+        return len(shape) > 2 and shape[-2] * shape[-1] == n
+
     def linear(self, x):
+        if declined(self, x):
+            return nn.QuantizedLinear.__call__(self, x)
         routed = _nax_small_m_qmm(self, x, bindings)
         if routed is None:
             routed = _nax_int8_prefill_dense(self, x, bindings)
@@ -3452,12 +3511,16 @@ def _nax_qmm_classes(*cache_key):
         return routed + self["bias"] if "bias" in self else routed
 
     def as_linear(self, x):
+        if declined(self, x):
+            return nn.QuantizedEmbedding.as_linear(self, x)
         routed = _nax_small_m_qmm(self, x, bindings)
         return nn.QuantizedEmbedding.as_linear(self, x) if routed is None else routed
 
     return {
-        base: type(f"_NaxSmallM{base.__name__}", (base,),
-                   {name: method, "_unsloth_nax_qmm_native": base, "_unsloth_nax_int8_prefill_rows": 0})
+        base: type(f"_{route.tag}SmallM{base.__name__}", (base,),
+                   {name: method, "_unsloth_nax_qmm_native": base, "_unsloth_nax_qmm_route": route,
+                    "_unsloth_nax_qmm_floor": 0, "_unsloth_nax_qmm_ceiling": 0, "_unsloth_nax_qmm_next": 0,
+                    "_unsloth_nax_int8_prefill_rows": 0})
         for base, name, method in ((nn.QuantizedLinear, "__call__", linear),
                                    (nn.QuantizedEmbedding, "as_linear", as_linear))
     }
@@ -3497,15 +3560,15 @@ def _nax_switch_classes():
     return classes
 
 
-def _nax_qmm_row_range(module):
-    """The rows at which this module's calls take the kernel, or None when none ever would."""
+def _nax_qmm_row_range(module, route):
+    """The rows at which this module's calls take the route's kernel, or None when none ever would."""
     weight = module.get("weight")
     if module.training or not isinstance(weight, mx.array) or weight.ndim != 2 or module.get("biases") is None:
         return None
     N, K = weight.shape[0], weight.shape[1] * 32 // module.bits
-    if not nax.small_m_qmm_supported(N, K, module.group_size, module.bits, module.mode):
+    if not route.call("_supported", N, K, module.group_size, module.bits, module.mode):
         return None
-    low, high = nax.small_m_qmm_row_range(N, K, module.group_size, module.bits)
+    low, high = route.call("_row_range", N, K, module.group_size, module.bits)
     return (low, high) if low <= high else None
 
 
@@ -3566,7 +3629,7 @@ def int8_prefill_available(model):
         return Int8PrefillStatus(False, "nax_unavailable", 0)
     if getattr(model, "_unsloth_mlx_distributed_parallel_mode", None):
         return Int8PrefillStatus(False, "distributed", 0)
-    classes = _nax_qmm_classes(nn.QuantizedLinear.__call__, nn.QuantizedEmbedding.as_linear)
+    classes = _nax_qmm_classes(_NAX_QMM_ROUTE, nn.QuantizedLinear.__call__, nn.QuantizedEmbedding.as_linear)
     switches, packed = _nax_switch_classes(), _nax_int8_prefill_packed(model)
     modules = {id(module): module for _, module in model.named_modules()} if hasattr(model, "named_modules") else {}
     return _int8_prefill_status(sum(bool(_nax_int8_prefill_route(module, classes, switches, packed))
@@ -3629,8 +3692,11 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
     faster than stock for their shape on this GPU use a matmul2d kernel that reads the stock
     packed codes and keeps stock's per-group factorization in fp32; each (shape, quantization,
     dtype, kernel variant) is checked against stock's fp32 arithmetic at first use. Single rows,
-    training, other quantizations and devices without NAX keep the native call.
-    `UNSLOTH_MLX_NAX_QMM=0` turns the route off.
+    training and other quantizations keep the native call. `UNSLOTH_MLX_NAX_QMM=0` turns the route off.
+
+    Where stock MLX has no NAX kernels (the GPUs before M5), 4- and 8-bit projections take the
+    small-row kernels of `qmm` under their own row table and the same first-use check;
+    `UNSLOTH_MLX_SIMD_QMM=0` turns that route off.
 
     `int8_prefill=True`, or `UNSLOTH_MLX_INT8_PREFILL=1` when it is None, also runs affine 3- to
     8-bit linears and routed experts with int8 activations: faster, but lossy enough to raise the
@@ -3651,12 +3717,15 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
                 int8_prefill = os.environ.get("UNSLOTH_MLX_INT8_PREFILL", "0") == "1"
             if tracked:
                 model.__dict__["_unsloth_nax_int8_prefill_scope"] = (depth + 1, bool(int8_prefill))
-            small_m = os.environ.get("UNSLOTH_MLX_NAX_QMM", "1") != "0" and nax.gap_open("small_m_qmm")
-            sorted_gather = (os.environ.get("UNSLOTH_MLX_NAX_SORTED_GATHER", "1") != "0"
+            route = _small_row_route()
+            small_m = (route is not None and os.environ.get(route.switch, "1") != "0"
+                       and nax.gap_open(route.gap))
+            int8_prefill = bool(int8_prefill) and route is _NAX_QMM_ROUTE
+            sorted_gather = (route is _NAX_QMM_ROUTE and os.environ.get("UNSLOTH_MLX_NAX_SORTED_GATHER", "1") != "0"
                              and nax.gap_open("sorted_gather_qmm"))
-            if ((small_m or int8_prefill or sorted_gather) and nax.nax_available()
+            if ((small_m or int8_prefill or sorted_gather)
                     and not getattr(model, "_unsloth_mlx_distributed_parallel_mode", None)):
-                classes = _nax_qmm_classes(nn.QuantizedLinear.__call__, nn.QuantizedEmbedding.as_linear)
+                classes = _nax_qmm_classes(route, nn.QuantizedLinear.__call__, nn.QuantizedEmbedding.as_linear)
                 switches = _nax_switch_classes() if int8_prefill or sorted_gather else {}
                 packed = _nax_int8_prefill_packed(model) if int8_prefill else set()
                 nested, fresh, seen = [], [], set()
@@ -3669,7 +3738,7 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
                         if getattr(module, "_unsloth_nax_qmm_scopes", 0):
                             nested.append(module)
                     elif base in classes:
-                        rows = _nax_qmm_row_range(module) if small_m else None
+                        rows = _nax_qmm_row_range(module, route) if small_m else None
                         int8_prefill_rows = (int8_prefill and not module.training
                                      and _nax_int8_prefill_route(module, classes, switches, packed))
                         if rows is not None or int8_prefill_rows:
@@ -3680,7 +3749,8 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
                         if int8 or gather:
                             fresh.append((module, None, int8, gather))
                 if any(rows is not None for _, rows, _, _ in fresh) and not nax.kernel_probe_passed(
-                        nax.QMM_PROBE_KEY, nax.__name__, "probe_small_m_qmm"):
+                        getattr(route.module, route.probe[0]), route.module.__name__, route.probe[1],
+                        _small_row_route):
                     fresh = [(module, None, int8, gather) for module, _, int8, gather in fresh]
                 if any(int8 for _, _, int8, _ in fresh) and not nax.kernel_probe_passed(
                         nax.INT8_QMM_PROBE_KEY, nax.__name__, "probe_int8_qmm"):
@@ -3698,6 +3768,11 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
                         module.__class__ = switches[type(module)]
                         continue
                     module._unsloth_nax_qmm_rows = (0, -1) if rows is None else rows
+                    K = module["weight"].shape[-1] * 32 // module.bits
+                    after = min(row for row in (_DENSE_QMM_MIN_ROWS, int8_prefill_rows) if row)
+                    module._unsloth_nax_qmm_floor = min(after, rows[0] if rows else after) * K
+                    module._unsloth_nax_qmm_ceiling = (rows[1] if rows else -1) * K
+                    module._unsloth_nax_qmm_next = after * K
                     if int8_prefill_rows:
                         module._unsloth_nax_int8_prefill_rows = int8_prefill_rows
                     module.__class__ = classes[type(module)]
@@ -3719,8 +3794,9 @@ def nax_quantized_linear(model, int8_prefill = None, *, _modules = None):
                 native = getattr(type(module), "_unsloth_nax_qmm_native", None)
                 if native is not None:
                     module.__class__ = native
-                for name in ("_unsloth_nax_qmm_scopes", "_unsloth_nax_int8_prefill_rows", "_unsloth_nax_int8_prefill",
-                             "_unsloth_nax_sorted_gather"):
+                for name in ("_unsloth_nax_qmm_scopes", "_unsloth_nax_qmm_floor", "_unsloth_nax_qmm_ceiling",
+                             "_unsloth_nax_qmm_next", "_unsloth_nax_int8_prefill_rows",
+                             "_unsloth_nax_int8_prefill", "_unsloth_nax_sorted_gather", "_unsloth_nax_qmm_ready"):
                     module.__dict__.pop(name, None)
                 module.pop("_unsloth_nax_qmm_rows", None)   # a tuple is stored in the module mapping
 

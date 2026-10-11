@@ -108,6 +108,8 @@ _GAPS = {
     # A few rows of a transposed quantized matmul run qmv/qmv_wide below the qmv batch limit,
     # then qmm_t_splitk until the output is wide enough for qmm_nax.
     "small_m_qmm": Gap(open_in = ("0.32.2", "0.32.3"), closed_on_main = False),
+    # Without NAX the same rows run qmv_wide (plain qmv before generation 15), then qmm_t_splitk.
+    "small_m_qmm_simd": Gap(open_in = ("0.32.3",), closed_on_main = False),
     # MLX's sorted gather kernel runs 32-row tiles below 64 rows per expert, with two barriers per K step.
     "sorted_gather_qmm": Gap(open_in = ("0.32.3",), closed_on_main = False),
 }
@@ -173,14 +175,15 @@ def _run_probe(module, function):
     return lines[-1] if lines else f"exit code {result.returncode}"
 
 
-def kernel_probe_passed(key: str, module: str, function: str) -> bool:
+def kernel_probe_passed(key: str, module: str, function: str, available = None) -> bool:
     """Run `module.function()` once in a subprocess; cache pass/fail per (macOS build, MLX version, key).
 
-    A Metal build failure inside `mx.fast.metal_kernel` can abort the process, so each NAX kernel is
-    first built and checked here, where a failure only disables it.
+    A Metal build failure inside `mx.fast.metal_kernel` can abort the process, so each kernel is
+    first built and checked here, where a failure only disables it. `available` says whether the
+    kernel's route exists on this GPU; by default, whether NAX does.
     """
     try:
-        if not nax_available():
+        if not (available or nax_available)():
             return False
         entry = f"{platform.mac_ver()[0]}|{_os_build()}|{mx.__version__}|{key}"
         with _PROBE_LOCK:
@@ -192,12 +195,12 @@ def kernel_probe_passed(key: str, module: str, function: str) -> bool:
                     if failure is not None:  # a timeout is retried by the next process
                         _store_probe(entry, passed)
                     if not passed:
-                        logger.warning("NAX kernel %s failed its probe (%s); the native path stays in use",
+                        logger.warning("kernel %s failed its probe (%s); the native path stays in use",
                                        key, failure or "timed out")
                 _PROBES[entry] = passed
             return _PROBES[entry]
     except Exception as error:
-        logger.warning("NAX kernel %s could not be probed (%s); the native path stays in use", key, error)
+        logger.warning("kernel %s could not be probed (%s); the native path stays in use", key, error)
         return False
 
 
@@ -425,14 +428,18 @@ _QMM_ROWS_UNMEASURED = (
 )
 
 
-def small_m_qmm_row_range(N, K, group_size, bits):
-    """The row counts (lowest, highest) where the kernel is measured faster than stock for `[N, K]`."""
-    for entry in _QMM_ROWS_BY_GPU.get(_gpu_generation(), _QMM_ROWS_UNMEASURED):
-        entry_bits, entry_group_size, fewest, widest, low, high = entry
+def _measured_row_range(table, most, N, K, group_size, bits):
+    for entry_bits, entry_group_size, fewest, widest, low, high in table:
         if (bits == entry_bits and entry_group_size in (None, group_size) and N * K >= fewest
                 and (widest is None or N <= widest)):
-            return max(low, 2), min(high, _QMM_MAX_ROWS)  # one row stays on stock qmv, at the bandwidth roofline
+            return max(low, 2), min(high, most)  # one row stays on stock qmv, at the bandwidth roofline
     return 0, -1
+
+
+def small_m_qmm_row_range(N, K, group_size, bits):
+    """The row counts (lowest, highest) where the kernel is measured faster than stock for `[N, K]`."""
+    table = _QMM_ROWS_BY_GPU.get(_gpu_generation(), _QMM_ROWS_UNMEASURED)
+    return _measured_row_range(table, _QMM_MAX_ROWS, N, K, group_size, bits)
 
 
 def probe_small_m_qmm():
@@ -450,7 +457,6 @@ def probe_small_m_qmm():
                     got = small_m_qmm(x, w, scales, biases, group_size, bits).astype(mx.float32)
                     error = mx.abs(got - native).max().item()
                     assert error <= 0.02 * mx.abs(native).max().item(), (bits, group_size, M, error)
-
 
 
 # Prefill `x @ W^T` with int8 activations (oMLX's QxA8 design), reading the stock packed codes,
