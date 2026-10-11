@@ -2098,6 +2098,9 @@ def create_new_function(
         # upstream source can reference functools too. Neither the license header
         # nor the model module's own imports are guaranteed to provide it.
         imports += "import functools\n"
+    if "transformers." in new_source:
+        # The signature fix-up spells annotations fully qualified (`transformers.cache_utils.Cache`).
+        imports += "import transformers\n"
     if (
         "forward_moe_backend" in new_source
         or "select_moe_backend" in new_source
@@ -7036,6 +7039,9 @@ def unsloth_compile_transformers(
                 source = inspect.getsource(function)
             except Exception as e:
                 print(f"Unsloth: Cannot run inspect.getsource on {module} with error = {e}")
+                continue
+            # A wrapper borrowing the original's __signature__ would be emitted with its closure body (unsloth#13245).
+            if re.search(rf"^\s*def\s+{re.escape(module)}\s*\(", source, flags = re.MULTILINE) is None:
                 continue
 
             # str(inspect.signature) can disagree with source on quote
