@@ -2279,7 +2279,7 @@ def approximate_vllm_memory_usage(
     lm_head = 0 if getattr(config, "tie_word_embeddings", True) else vocab_size * hd
 
     # LoRA modules on all QKVO, MLP
-    qkvo_A = hd * max_lora_rank * 4
+    qkvo_A = max_lora_rank * (hd * 3 + q_size) # o_proj reads the attention width
     qkvo_B = max_lora_rank * (q_size + kv_size + kv_size + hd)
     mlp_A  = hd * max_lora_rank * 2 + mlp_size * max_lora_rank
     mlp_B  = max_lora_rank * (mlp_size + mlp_size) + max_lora_rank * hd
@@ -3679,9 +3679,13 @@ def load_vllm(
         reachable_tokens = approx_max_num_seqs * max_seq_length
         if max_num_batched_tokens > reachable_tokens and requested_max_num_batched_tokens is None:
             max_num_batched_tokens = reachable_tokens
-        # vLLM rejects a token budget below max_num_seqs.
-        if max_num_batched_tokens < approx_max_num_seqs and requested_max_num_batched_tokens is None:
-            max_num_batched_tokens = approx_max_num_seqs
+        # vLLM rejects a token budget below max_num_seqs: raise the budget, or with an explicit budget lower the
+        # auto-picked sequence count.
+        if max_num_batched_tokens < approx_max_num_seqs:
+            if requested_max_num_batched_tokens is None:
+                max_num_batched_tokens = approx_max_num_seqs
+            elif not explicit_max_num_seqs:
+                approx_max_num_seqs = max_num_batched_tokens
 
         # Check max RAM usage for vLLM (swap space) default is 4GB
         memory = psutil.virtual_memory()

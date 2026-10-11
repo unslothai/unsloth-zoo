@@ -221,3 +221,10 @@ def test_explicit_budget_reaches_the_vision_seq_cap(monkeypatch):
     args = _load_args(monkeypatch, is_vision_model = True, max_num_batched_tokens = 32768)
     assert seen == [32768]
     assert args["max_num_batched_tokens"] == 32768
+
+
+def test_explicit_small_budget_lowers_auto_max_num_seqs(monkeypatch):
+    # vLLM refuses max_num_batched_tokens < max_num_seqs; only the auto-picked count may move.
+    args = _load_args(monkeypatch, max_num_batched_tokens = 64)
+    assert args["max_num_batched_tokens"] == 64
+    assert args["max_num_seqs"] == 64
