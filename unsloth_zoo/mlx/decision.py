@@ -295,6 +295,10 @@ _TYPES = ("choice", "score", "noul")
 _MAX_IMAGES = 8
 # An image is refused by its size before its pixels are read, which the processor's own limit comes too late for.
 _MAX_IMAGE_PIXELS = 4096 * 4096
+_MAX_AUDIO = 8
+_AUDIO_RATE = 16000
+# Decoding stops here: about what the prompt has room for at 13 tokens a second.
+_MAX_AUDIO_SECONDS = 1200
 
 
 class DecisionRequestError(ValueError):
@@ -339,16 +343,57 @@ def _image_urls(state, images):
             if isinstance(part, dict) and part.get("type") == "image_url" and "image_url" in part:
                 url = part["image_url"]
                 found.append(url["url"] if isinstance(url, dict) and "url" in url else url)
+    return _data_urls(found, "image", _MAX_IMAGES)
+
+
+def _data_urls(found, kind, most):
+    """`found`, the base64 data URLs of a request's images or audio clips, checked without decoding them."""
+    field, many = ("images", "images") if kind == "image" else (kind, f"{kind} clips")
+    if found is not None and not isinstance(found, list):
+        raise DecisionRequestError(f'"{field}" must be an array')
     urls = []
-    for url in found:
-        # "data:image/<type>;base64,<payload>"; the payload itself is only decoded by a model that reads images.
+    for url in found or []:
+        # "data:<kind>/<type>;base64,<payload>"; the payload itself is only decoded by a model that reads it.
         header, comma, payload = url.partition(",") if isinstance(url, str) else ("", "", "")
-        if not (header.startswith("data:image/") and header.endswith("base64") and comma and "," not in payload):
-            raise DecisionRequestError("images must be data URLs (data:image/...;base64,...)")
-        if len(urls) >= _MAX_IMAGES:
-            raise DecisionRequestError(f"too many images, the maximum is {_MAX_IMAGES}")
+        if not (header.startswith(f"data:{kind}/") and header.endswith("base64") and comma and "," not in payload):
+            raise DecisionRequestError(f"{field} must be data URLs (data:{kind}/...;base64,...)")
+        if len(urls) >= most:
+            raise DecisionRequestError(f"too many {many}, the maximum is {most}")
         urls.append(url)
     return urls
+
+
+def _decode_audio(urls):
+    """The mono samples of each clip at the rate the models hear, resampled as they are decoded."""
+    import base64
+    import io
+    import itertools
+
+    try:
+        import av
+    except ImportError as error:
+        raise DecisionUnsupportedError("audio is decoded with PyAV, which is not installed: pip install av") from error
+    clips, total = [], 0
+    for url in urls:
+        try:
+            with av.open(io.BytesIO(base64.b64decode(url.partition(",")[2], validate = True))) as container:
+                resampler, chunks = av.AudioResampler(format = "flt", layout = "mono", rate = _AUDIO_RATE), []
+                # A last empty frame hands over what the resampler still holds.
+                for frame in itertools.chain(container.decode(audio = 0), (None,)):
+                    parts = [part.to_ndarray().reshape(-1) for part in resampler.resample(frame)]
+                    chunks += parts
+                    total += sum(map(len, parts))
+                    if total > _MAX_AUDIO_SECONDS * _AUDIO_RATE:
+                        break
+            samples = np.concatenate(chunks)
+        except Exception as error:
+            raise DecisionRequestError("an audio clip could not be decoded") from error
+        if total > _MAX_AUDIO_SECONDS * _AUDIO_RATE:
+            raise DecisionRequestError(f"the audio is longer than {_MAX_AUDIO_SECONDS} seconds")
+        if not len(samples):
+            raise DecisionRequestError("an audio clip could not be decoded")
+        clips.append(samples)
+    return clips
 
 
 def _decode_images(urls):
@@ -419,18 +464,24 @@ class DecisionPipeline:
     max_options = 255
     noul_true_first = False
     choice_sorted = False
-    reads_images = False
+    reads_images = reads_audio = False
     temperatures = {}
 
-    def answer(self, state, questions, images = None):
-        """Answers keyed by question id, and the prompt tokens spent. Images are refused unless `reads_images`."""
+    def answer(self, state, questions, images = None, audio = None):
+        """Answers keyed by question id, and the prompt tokens spent.
+
+        Images are refused unless `reads_images`, and `audio`, an array of base64 data URLs, unless `reads_audio`."""
         if state is None:
             raise DecisionRequestError('"state" must be provided')
         parsed = self._parse_questions(questions)
-        urls = _image_urls(state, images)
-        if urls and not self.reads_images:
-            raise DecisionUnsupportedError("this model does not support images")
-        scores, tokens = self._scores(_without_image_parts(state), parsed, _decode_images(urls)) if urls else self._scores(state, parsed)
+        urls, clips = _image_urls(state, images), _data_urls(audio, "audio", _MAX_AUDIO)
+        for given, reads, name in ((urls, self.reads_images, "images"), (clips, self.reads_audio, "audio")):
+            if given and not reads:
+                raise DecisionUnsupportedError(f"this model does not support {name}")
+        if clips:
+            scores, tokens = self._scores(_without_image_parts(state), parsed, _decode_images(urls), _decode_audio(clips))
+        else:
+            scores, tokens = self._scores(_without_image_parts(state), parsed, _decode_images(urls)) if urls else self._scores(state, parsed)
         answers = {question.id: self._format_answer(question, variants) for question, variants in zip(parsed, scores)}
         return {"answers": answers, "usage": {"input_tokens": tokens, "output_tokens": 0}}
 
@@ -779,40 +830,52 @@ def _output_rows(head, token_ids):
 class _QwenModel(DecisionPipeline):
     # Below this many shared tokens a second pass costs more than it saves.
     _MIN_SHARED = 16
-    takes_images = False
+    takes_images = takes_audio = False
     _IMAGE = "<|vision_start|><|image_pad|><|vision_end|>"
+    _AUDIO = "<|audio_start|><|audio_pad|><|audio_end|>"
     _AFTER_IMAGES = ""
-    # The images of a request may not reach this on their own; it is the prompt length Clef's reference serves.
+    # The images and audio of a request may not reach this on their own; it is the prompt length Clef's reference serves.
     _IMAGE_TOKENS = 16384
 
     @property
     def _architecture(self):
         return getattr(getattr(self.model, "config", None), "model_type", None)
 
-    @property
-    def reads_images(self):
+    def _reads(self, tower, part):
         # The layouts and forwards here are those of these architectures only, which keep their towers in different places.
         owner = {"qwen3_5": self.model, "qwen3_omni_moe": getattr(self.model, "thinker", None)}.get(self._architecture)
         # Without its processor files a model loads with a bare tokenizer in the processor's place.
-        processor = getattr(getattr(self.model, "_processor", None), "image_processor", None)
+        processor = getattr(getattr(self.model, "_processor", None), part, None)
         # Tower-less conversions load vision_tower=None.
-        return self.takes_images and getattr(owner, "vision_tower", None) is not None and processor is not None
+        return getattr(owner, tower, None) is not None and processor is not None
 
-    def _image_text(self, count):
-        return self._IMAGE * count + self._AFTER_IMAGES
+    @property
+    def reads_images(self):
+        return self.takes_images and self._reads("vision_tower", "image_processor")
 
-    def encode_images(self, images):
-        """The token ids that stand for `images` in the prompt, and the pixels behind them."""
-        if not self.reads_images:
-            raise DecisionUnsupportedError("this model does not support images")
+    @property
+    def reads_audio(self):
+        return self.takes_audio and self._reads("audio_tower", "feature_extractor")
+
+    def _media_text(self, images, audio):
+        return self._IMAGE * images + self._AFTER_IMAGES
+
+    def encode_media(self, images = (), audio = ()):
+        """The token ids that stand for `images`, then for the `audio` clips, in the prompt, and what the processor made of them."""
+        for given, reads, name in ((images, self.reads_images, "images"), (audio, self.reads_audio, "audio")):
+            if given and not reads:
+                raise DecisionUnsupportedError(f"this model does not support {name}")
+        clips = dict(audio = list(audio), sampling_rate = _AUDIO_RATE, padding = True, truncation = False, return_attention_mask = True) if audio else {}
         try:
-            encoded = self.model._processor(text = [self._image_text(len(images))], images = list(images), return_tensors = "np")
+            encoded = self.model._processor(text = [self._media_text(len(images), len(audio))], images = list(images) or None, return_tensors = "np", **clips)
         except ValueError as error:
-            raise DecisionRequestError(f"an image could not be read: {error}") from error
+            raise DecisionRequestError(f"{'an image' if images else 'an audio clip'} could not be read: {error}") from error
         ids = np.asarray(encoded["input_ids"])[0].tolist()
         if len(ids) >= self._IMAGE_TOKENS:
-            raise DecisionRequestError(f"the images take {len(ids)} tokens; the maximum is {self._IMAGE_TOKENS}, send fewer or smaller images")
-        return ids, {name: mx.array(np.asarray(encoded[name])) for name in ("pixel_values", "image_grid_thw")}
+            named = " and ".join(name for name, given in (("images", images), ("audio clips", audio)) if given)
+            raise DecisionRequestError(f"the {named} take {len(ids)} tokens; the maximum is {self._IMAGE_TOKENS}, send fewer or smaller {named}")
+        tensors = ("pixel_values", "image_grid_thw", "input_features", "feature_attention_mask")
+        return ids, {name: mx.array(np.asarray(encoded[name])) for name in tensors if encoded.get(name) is not None}
 
     def _load(self, source, revision, dtype, token, adapter = None, load_in_4bit = False):
         from .loader import FastMLXModel
@@ -824,10 +887,10 @@ class _QwenModel(DecisionPipeline):
         if adapter is not None:
             _merge_lora(self.model, adapter)
         if load_in_4bit:
-            # The loader leaves the embeddings, the output head and the vision tower in 16-bit for the trainers that
+            # The loader leaves the embeddings, the output head and the towers in 16-bit for the trainers that
             # train them. No decision head does, and together they are as large again as the quantized layers.
-            tower = "vision_tower" if self.reads_images else "\0"
-            nn.quantize(self.model, 64, 4, class_predicate = lambda path, module: tower not in path.split(".") and hasattr(module, "to_quantized") and module.weight.shape[-1] % 64 == 0)
+            read = {name for name, reads in (("vision_tower", self.reads_images), ("audio_tower", self.reads_audio)) if reads}
+            nn.quantize(self.model, 64, 4, class_predicate = lambda path, module: not read & set(path.split(".")) and hasattr(module, "to_quantized") and module.weight.shape[-1] % 64 == 0)
         self.model.eval()
 
     def _load_beside(self, folder, dtype, token, head_prefix, load_in_4bit = False):
@@ -854,7 +917,7 @@ class _QwenModel(DecisionPipeline):
         # An image advances positions by its grid, not its token count.
         if media is None:
             return {}
-        merged = self.model.get_input_embeddings(ids, media["pixel_values"], image_grid_thw = media["image_grid_thw"])
+        merged = self.model.get_input_embeddings(ids, media.get("pixel_values"), **{name: value for name, value in media.items() if name != "pixel_values"})
         # Qwen3-Omni also adds features of its tower's inner layers to the image tokens after the first decoder layers.
         names = ("inputs_embeds", "position_ids", "visual_pos_masks", "deepstack_visual_embeds")
         return {name: getattr(merged, name) for name in names if getattr(merged, name, None) is not None}
@@ -892,7 +955,7 @@ class _QwenModel(DecisionPipeline):
     def _scores(self, state, questions, images = ()):
         from .generate import generation_mode
 
-        image_ids, media = self.encode_images(images) if images else ([], None)
+        image_ids, media = self.encode_media(images) if images else ([], None)
         prompts = [[self._encode(prompt) for prompt in self._prompts(state, questions, question, *([len(images)] if images else []))] for question in questions]
         images_end = 0
         if media is not None:
@@ -1310,7 +1373,7 @@ class ClefModel(_QwenModel):
         return (folder / "joint_head_config.json").is_file() and (folder / "joint_head.safetensors").is_file()
     noul_true_first = True
     choice_sorted = True
-    takes_images = True
+    takes_images = takes_audio = True
     _AFTER_IMAGES = "\n"
     _SYSTEM = "Read the complete state and schema. Decide every field jointly. Each answer must be exactly one of that field's allowed options."
     _NOUL = {"true": "The proposition is true or the answer is yes.", "false": "The proposition is false or the answer is no."}
@@ -1323,9 +1386,11 @@ class ClefModel(_QwenModel):
             sizes = self.model._processor.image_processor
             sizes.min_pixels, sizes.max_pixels = self._OMNI_PIXELS
 
-    def _image_text(self, count):
-        # Clef Omni was trained with a line break after each image, Clef with one after them all.
-        return (self._IMAGE + "\n") * count if self._architecture == "qwen3_omni_moe" else super()._image_text(count)
+    def _media_text(self, images, audio):
+        # Clef Omni was trained with a line break after each image and clip, Clef with one after all its images.
+        if self._architecture == "qwen3_omni_moe":
+            return (self._IMAGE + "\n") * images + (self._AUDIO + "\n") * audio
+        return super()._media_text(images, audio)
 
     def __init__(self, folder, dtype, base_model, token, load_in_4bit = False):
         decoder = folder
@@ -1393,7 +1458,7 @@ class ClefModel(_QwenModel):
     def encode(self, state, questions, max_length = None, image_ids = ()):
         """Token ids of the prompt and the (start, end) spans the head reads; a state too long for `max_length` loses its end.
 
-        `image_ids`, from `encode_images`, go between the prompt's opening and the state."""
+        `image_ids`, from `encode_media`, go between the prompt's opening and the state."""
         pieces = [(self._encode(text), mark) for text, mark in self._pieces(state, questions)]
         pieces[0] = (pieces[0][0] + list(image_ids), None)
         if max_length is not None:
@@ -1431,10 +1496,10 @@ class ClefModel(_QwenModel):
         lexical = [mx.stop_gradient(_output_rows(output, ids[start:end])) for spans in option_spans for start, end in spans]
         return self.head(hidden, lexical, question_spans, option_spans, types)
 
-    def _scores(self, state, questions, images = ()):
+    def _scores(self, state, questions, images = (), audio = ()):
         from .generate import generation_mode
 
-        image_ids, media = self.encode_images(images) if images else ((), None)
+        image_ids, media = self.encode_media(images, audio) if images or audio else ((), None)
         ids, question_spans, option_spans = self.encode(state, questions, image_ids = image_ids)
         # Found before generation mode, which swaps a quantized head's class.
         output = self._output_head()
@@ -2363,7 +2428,7 @@ def clef_training_item(pipeline, state, questions, max_length = None, images = N
         raise DecisionRequestError(f"too many images, the maximum is {_MAX_IMAGES}")
     if urls:
         state = _without_image_parts(state)
-    ids, question_spans, option_spans = pipeline.encode(state, parsed, max_length, pipeline.encode_images(images)[0] if images else ())
+    ids, question_spans, option_spans = pipeline.encode(state, parsed, max_length, pipeline.encode_media(images)[0] if images else ())
     item = {
         "input_ids": ids, "question_spans": question_spans, "option_spans": option_spans, "types": [_TYPE_IDS.index(q.type) for q in parsed],
         "source": {"state": state, "questions": dict(questions), "max_length": max_length},
@@ -2378,7 +2443,7 @@ def _pictures(images):
 
 
 def _item_logits(pipeline, item, output = None):
-    media = pipeline.encode_images(_pictures(item["images"]))[1] if item.get("images") else None
+    media = pipeline.encode_media(_pictures(item["images"]))[1] if item.get("images") else None
     return pipeline.logits(item["input_ids"], item["question_spans"], item["option_spans"], item["types"], output, media)
 
 
