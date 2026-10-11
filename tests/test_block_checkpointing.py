@@ -190,6 +190,33 @@ def test_default_checkpoint_is_looked_up_per_call(monkeypatch):
     assert seen == [{"use_reentrant": False}] and pristine == [{"use_reentrant": False}]
 
 
+class _Scaled(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.lin = nn.Linear(4, 4)
+
+    def forward(self, x, scale = 1.0):
+        return self.lin(x) * scale
+
+
+@pytest.mark.parametrize("use_reentrant", [False, True])
+def test_block_keyword_arguments_reach_the_checkpointed_forward(use_reentrant):
+    torch.manual_seed(0)
+    ref = nn.ModuleList([_Scaled(), _Scaled()])
+    model = nn.ModuleList([_Scaled(), _Scaled()])
+    model.load_state_dict(ref.state_dict())
+    bc.enable_block_gradient_checkpointing(model, use_reentrant = use_reentrant)
+    x = torch.randn(2, 4, requires_grad = True)
+
+    def step(m):
+        h = x
+        for block in m:
+            h = block(h, scale = 2.0)
+        return h.pow(2).mean()
+
+    _assert_same(_grads(ref, step), _grads(model, step))
+
+
 def test_find_repeated_blocks_prefers_declared_classes_then_the_heaviest_list():
     model = _Stack(3)
     assert bc.find_repeated_blocks(model) == list(model.layers)

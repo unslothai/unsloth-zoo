@@ -48,6 +48,9 @@ def _torch_checkpoint(use_reentrant):
     def run(function, *args, **kwargs):
         ck = torch.utils.checkpoint
         fn = getattr(ck, "_unsloth_pristine_checkpoint", None) or ck.checkpoint
+        if use_reentrant and kwargs:
+            # Reentrant checkpoint rejects keyword arguments for the function, so bind them first.
+            function, kwargs = functools.partial(function, **kwargs), {}
         return fn(function, *args, use_reentrant = use_reentrant, **kwargs)
 
     return run
