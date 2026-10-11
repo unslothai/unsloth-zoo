@@ -637,5 +637,4 @@ def test_grad_scaler_is_applied_before_the_fp16_gradient_is_saved():
 
     assert error(unscaled) > 0.5, "negative control: an unscaled fp16 gradient should underflow here"
     assert error(got) < 1e-2, f"scaled fp16 gradient relative error {error(got):.3e}"
-    # The returned loss stays unscaled so logging and the outer GradScaler see the true value.
     torch.testing.assert_close(got_loss, want_loss, rtol = 1e-2, atol = 0)

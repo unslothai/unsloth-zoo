@@ -2513,7 +2513,6 @@ class _UnslothDistillationJSD(torch.autograd.Function):
             flat_teacher = torch.cat([flat_teacher, flat_teacher.new_zeros(pad, flat_teacher.shape[-1])])
             sorted_valid = torch.cat([sorted_valid, sorted_valid.new_zeros(pad)])
 
-        # Apply the reduction inside each chunk.
         if num_items_in_batch is None:
             # Clamped for the same reason a chunk always runs below: a fully
             # masked batch has to reduce to a finite zero rather than 0 / 0.
@@ -2550,8 +2549,7 @@ class _UnslothDistillationJSD(torch.autograd.Function):
 
         loss = flat_student.new_zeros((), dtype = torch.float32)
         entropy_sum = flat_student.new_zeros((), dtype = torch.float32)
-        # Scale before differentiation: saving an unscaled FP16 gradient can
-        # underflow before the outer GradScaler ever reaches backward.
+        # Scale before differentiation: an unscaled saved FP16 gradient underflows before GradScaler's backward.
         grad_scale = loss.new_tensor(scaling)
         ctx.scaling = scaling
 
