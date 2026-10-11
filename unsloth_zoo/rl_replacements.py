@@ -135,11 +135,10 @@ def chunked_hidden_states_selective_log_softmax(
     # memory access or NaN head gradients, torch 2.13), so keep chunks at 2+ rows when the head trains.
     # Exactly `chunks` row ranges, so the unrolled loop length never depends on T: torch.chunk
     # returns ceil(T / ceil(T / chunks)) pieces and recompiled per new count; tensor_split guards
-    # on T % chunks. Halving chunks until rows >= 2 * chunks keeps every piece at 2+ rows.
+    # on T % chunks. At most rows // 2 chunks when the head trains keeps every piece at 2+ rows.
     lm_head_grad = torch.is_grad_enabled() and lm_head.requires_grad
-    if lm_head_grad:
-        while chunks > 1 and flat_hidden_states.shape[0] < 2 * chunks:
-            chunks = chunks // 2
+    if lm_head_grad and flat_hidden_states.shape[0] < 2 * chunks:
+        chunks = max(flat_hidden_states.shape[0] // 2, 1)
 
     n_rows = flat_hidden_states.shape[0]
     chunks = max(1, min(chunks, n_rows))
