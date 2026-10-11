@@ -5878,6 +5878,41 @@ def test_rendering_does_not_copy_the_row_media():
     assert copied == []
 
 
+@pytest.mark.parametrize("stem, expected", [
+    ("<|audio_", "<user><|audio_1|>A<|audio_2|>B<assistant>ok<user><|audio_3|>C"),
+    (None, "<user>AB<assistant>ok<user>C"),
+])
+def test_string_only_templates_number_the_audio_parts_a_processor_declares(
+        monkeypatch, stem, expected):
+    """Phi-4's template concatenates content as a string, so a typed audio part
+    reaches it only as the `<|audio_N|>` its processor module declares."""
+    import sys
+    from unsloth_zoo.mlx.utils import _render_vlm_messages
+
+    monkeypatch.setattr(sys.modules[__name__], "AUDIO_PLACEHOLDER_PATTERN", stem,
+                        raising=False)
+
+    class _Processor:
+        image_token = None
+        boi_token = None
+        chat_template = ("{% for m in messages %}"
+                         "{{ '<' + m['role'] + '>' + m['content'] }}{% endfor %}")
+
+        def apply_chat_template(self, messages, **kwargs):
+            import jinja2
+            return jinja2.Template(self.chat_template).render(messages=messages)
+
+    clip = {"array": np.zeros(8, dtype=np.float32), "sampling_rate": 16000}
+    messages = [
+        {"role": "user", "content": [
+            {"type": "audio", "audio": clip}, {"type": "text", "text": "A"},
+            {"type": "audio", "audio": clip}, {"type": "text", "text": "B"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+        {"role": "user", "content": [{"type": "audio"}, {"type": "text", "text": "C"}]},
+    ]
+    assert _render_vlm_messages(_Processor(), messages) == expected
+
+
 def test_compile_preparation_adds_no_metadata_key_without_metadata():
     """Every VLM batch goes through the compile preparation, so writing the
     static-metadata dict unconditionally puts a new key in every text-only

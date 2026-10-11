@@ -5127,7 +5127,14 @@ def _collapse_vlm_assistant_content(messages):
     return collapsed
 
 
-def _flatten_vlm_content_for_text_template(messages, image_token=None):
+def _vlm_numbered_audio_stem(processor):
+    # mlx-vlm states the stem where its processor expands `<|audio_N|>` (Phi-4).
+    module = sys.modules.get(type(processor).__module__)
+    stem = getattr(module, "AUDIO_PLACEHOLDER_PATTERN", None)
+    return stem if isinstance(stem, str) and stem.startswith("<|") else None
+
+
+def _flatten_vlm_content_for_text_template(messages, image_token=None, audio_stem=None):
     """Render list-style VLM content as text for text-only chat templates.
 
     Rebuilt shallowly rather than deep-copied: only `content` is replaced, and a
@@ -5135,6 +5142,7 @@ def _flatten_vlm_content_for_text_template(messages, image_token=None):
     sample, so that cost is the whole collator's.
     """
     flattened = []
+    clips = 0
     for message in messages:
         content = message.get("content", "")
         if not isinstance(content, list):
@@ -5146,6 +5154,9 @@ def _flatten_vlm_content_for_text_template(messages, image_token=None):
                 texts.append(str(part.get("text", "")))
             elif isinstance(part, dict) and part.get("type") == "image" and image_token:
                 texts.append(image_token)
+            elif audio_stem and _is_vlm_audio_part(part):
+                clips += 1
+                texts.append(f"{audio_stem}{clips}|>")
             elif isinstance(part, str):
                 texts.append(part)
         flattened.append({**message, "content": "".join(texts)})
@@ -5320,10 +5331,13 @@ def _render_vlm_messages(
     tokenizer = _get_processor_tokenizer(processor)
     renderer = processor if callable(getattr(processor, "apply_chat_template", None)) else tokenizer
     image_token = _vlm_image_token(processor)
+    audio_stem = _vlm_numbered_audio_stem(processor)
     if not _has_chat_template(renderer):
         return "\n".join(
             message.get("content", "")
-            for message in _flatten_vlm_content_for_text_template(messages, image_token)
+            for message in _flatten_vlm_content_for_text_template(
+                messages, image_token, audio_stem,
+            )
         )
 
     render_messages = _vlm_token_messages(processor, messages)
@@ -5339,7 +5353,7 @@ def _render_vlm_messages(
         yield render_messages
         marked = _mark_vlm_image_parts(render_messages, image_token)
         yield marked
-        yield _flatten_vlm_content_for_text_template(messages, image_token)
+        yield _flatten_vlm_content_for_text_template(messages, image_token, audio_stem)
         yield _flatten_vlm_messages_to_content_parts(marked)
         if rendered is None:
             yield messages
@@ -7746,6 +7760,15 @@ def _normalize_audio_clip(clip, expected_rate):
     return _AudioClip(np.asarray(samples, dtype=np.float32), int(rate))
 
 
+def _is_vlm_audio_part(part):
+    # Key-only `{"audio": clip}` too: the template renders a placeholder for
+    # it, so skipping it left the row a waveform short.
+    return isinstance(part, dict) and (
+        part.get("type") in _AUDIO_PART_TYPES
+        or any(key in part for key in _AUDIO_PART_TYPES)
+    )
+
+
 def _vlm_audio_part_state(messages):
     bare_placeholders = False
     payloads = []
@@ -7758,13 +7781,7 @@ def _vlm_audio_part_state(messages):
         if not isinstance(content, list):
             continue
         for part in content:
-            if not isinstance(part, dict):
-                continue
-            # Key-only `{"audio": clip}` too: the template renders a
-            # placeholder for it, so skipping it left the row a waveform short.
-            if part.get("type") not in _AUDIO_PART_TYPES and not any(
-                key in part for key in _AUDIO_PART_TYPES
-            ):
+            if not _is_vlm_audio_part(part):
                 continue
             payload = None
             for key in _AUDIO_PART_TYPES:
