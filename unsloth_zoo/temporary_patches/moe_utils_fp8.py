@@ -307,6 +307,14 @@ def _dequantize_full_expert_weights_unsloth(weight, scale, target_dtype):
         from unsloth.kernels.fp8 import weight_dequant_block
     except ImportError:
         return None
+    try:
+        from unsloth.kernels.fp8 import _fp8_kernel_unsupported
+    except ImportError:
+        _fp8_kernel_unsupported = None
+    # The kernel loads fp8e4nv, which triton cannot compile on pre-sm89 CUDA or on ROCm archs
+    # without OCP fp8 (gfx90a, gfx11xx): let the torch fallback in the caller dequantize instead.
+    if _fp8_kernel_unsupported is not None and _fp8_kernel_unsupported(weight):
+        return None
 
     E, M, N = weight.shape
     p, q = scale.shape[1], scale.shape[2]
