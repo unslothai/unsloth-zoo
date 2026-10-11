@@ -2407,8 +2407,7 @@ def _make_preference_cce_scorer(model):
     """
     from . import utils
 
-    tm = utils._get_text_model(model)
-    if getattr(tm, "model", None) is None and not utils._has_direct_hidden_stack(model):
+    if utils._get_text_backbone(model) is None and not utils._has_direct_hidden_stack(model):
         return None
     if utils._is_vlm_model(model) and not hasattr(model, "get_input_embeddings"):
         return None
