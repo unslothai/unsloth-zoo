@@ -194,6 +194,10 @@ jobs:
         # A finished load must own its weights.
         run: python -m pytest tests/test_mlx_load_residency_metal.py -v -rs
 
+      - name: tests/test_mlx_lfm2_resaved_config_metal.py
+        # A transformers 5 saved lfm2 config (no block_ff_dim) loads on the pinned mlx-lm.
+        run: python -m pytest tests/test_mlx_lfm2_resaved_config_metal.py -v -rs
+
       - name: tests/test_mlx_generate_metal.py
         # Batched generation on real models: batched-vs-sequential greedy
         # equivalence with aligned sampled-token logprobs, memory-limit
