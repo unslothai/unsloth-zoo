@@ -2099,11 +2099,8 @@ def create_new_function(
         # nor the model module's own imports are guaranteed to provide it.
         imports += "import functools\n"
     if "transformers." in new_source:
-        # Copied upstream modeling code can reference the transformers package
-        # itself (e.g. `transformers.PreTrainedConfig` in gemma4's modeling
-        # file), and neither the license header nor the `from {model_location}
-        # import ...` line below imports it, so a direct load of the compiled
-        # cache module dies with `name 'transformers' is not defined`.
+        # The signature fix-up emits `def f{inspect.signature(f)}`, which spells class annotations
+        # fully qualified (`transformers.cache_utils.Cache`); nothing else here imports the package.
         imports += "import transformers\n"
     if (
         "forward_moe_backend" in new_source
@@ -7043,6 +7040,10 @@ def unsloth_compile_transformers(
                 source = inspect.getsource(function)
             except Exception as e:
                 print(f"Unsloth: Cannot run inspect.getsource on {module} with error = {e}")
+                continue
+            # A wrapper carrying the original's __signature__ (patch_transformers_masks) has its own
+            # body: re-emitted under `module`, its closure names are unbound (unslothai/unsloth#13245).
+            if re.search(rf"^\s*def\s+{re.escape(module)}\s*\(", source, flags = re.MULTILINE) is None:
                 continue
 
             # str(inspect.signature) can disagree with source on quote
