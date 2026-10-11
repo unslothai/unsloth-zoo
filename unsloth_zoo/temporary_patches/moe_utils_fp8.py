@@ -970,7 +970,10 @@ def _release_dequantized_banks_until_backward(output, inputs, banks):
                 for start in range(0, base.shape[0], step):
                     end = min(start + step, base.shape[0])
                     piece_base = base[start:end]
-                    piece_quant = quant[start:end] if isinstance(quant, torch.Tensor) and quant.ndim == base.ndim else quant
+                    # Scales indexed by expert ((E, 1), (E, M), (E, N), 3-D block grids) follow the chunk;
+                    # a scalar or a 1-D scale shared by every expert does not.
+                    expert_indexed = isinstance(quant, torch.Tensor) and quant.ndim >= 2 and quant.shape[0] == base.shape[0]
+                    piece_quant = quant[start:end] if expert_indexed else quant
                     if block_size is not None:
                         _try_attach_block_size(piece_base, block_size)
                         if isinstance(piece_quant, torch.Tensor): _try_attach_block_size(piece_quant, block_size)

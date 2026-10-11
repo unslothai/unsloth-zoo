@@ -134,3 +134,23 @@ def test_bank_is_kept_when_checkpoint_hooks_cannot_be_inspected(bank, monkeypatc
     assert seen == [E * N * K * 2]  # bf16 bank still allocated
     out.float().square().sum().backward()
     assert refills == []
+
+
+@pytest.mark.parametrize("scale_shape", [(16, 1), (16, N)])
+def test_refill_slices_per_expert_2d_scales(scale_shape):
+    # Real dequantizer, 16 experts so the refill runs in 8 chunks; (E, 1) / (E, M) scales must be
+    # chunked with the weight or the dequantizer sees a short weight with all E scale rows.
+    torch.manual_seed(0)
+    base = torch.randn(16, N, K).to(torch.float8_e4m3fn)
+    scale = torch.rand(*scale_shape) + 0.5
+    want = M._dequantize_full_expert_weights(base, scale, torch.bfloat16)
+    assert want is not None
+    dequantized = want.clone().contiguous()
+    x = torch.randn(3, K, dtype = torch.bfloat16, requires_grad = True)
+    out = torch.einsum("tk,enk->tn", x, dequantized)
+    M._release_dequantized_banks_until_backward(out, x, ((dequantized, base, scale, None),))
+    assert dequantized.untyped_storage().nbytes() == 0
+    out.float().square().sum().backward()  # the refill runs here
+    ref_x = x.detach().clone().requires_grad_(True)
+    torch.einsum("tk,enk->tn", ref_x, want).float().square().sum().backward()
+    assert torch.equal(x.grad, ref_x.grad)
