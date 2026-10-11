@@ -30,6 +30,7 @@ __all__ = [
 ]
 
 from .compiler import UNSLOTH_COMPILE_LOCATION
+from .device_type import DEVICE_TYPE
 from .utils import _get_dtype, Version
 from .hf_utils import dtype_from_config, set_dtype_in_config, HAS_TORCH_DTYPE
 
@@ -154,11 +155,37 @@ def stop_compiling_weak_dictionary_writes():
     return marked
 
 
+def patch_dynamo_cleanup_hook_shutdown():
+    # CleanupHook.__call__ reads the global _cleanup_owners from a weakref callback, which at
+    # interpreter exit can run after module globals became None ("'NoneType' ... 'pop'").
+    try:
+        import torch._dynamo.utils as dynamo_utils
+    except Exception:
+        return
+    hook_class = getattr(dynamo_utils, "CleanupHook", None)
+    if hook_class is None or not hasattr(dynamo_utils, "_cleanup_owners"):
+        return
+    original_call = hook_class.__call__
+    if getattr(original_call, "_unsloth_shutdown_safe", False):
+        return
+    # Bind the module dict itself: it outlives the wipe of its values.
+    dynamo_globals = dynamo_utils.__dict__
+
+    def __call__(self, *args, _original_call = original_call, _globals = dynamo_globals):
+        if _globals.get("_cleanup_owners") is None:
+            return None
+        return _original_call(self, *args)
+    __call__._unsloth_shutdown_safe = True
+    hook_class.__call__ = __call__
+pass
+
+
 def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
     # All Unsloth Zoo code licensed under LGPLv3
     assert(type(debug) is bool)
     assert(type(O3)    is bool)
     import os, logging
+    patch_dynamo_cleanup_hook_shutdown()
 
     if debug:
         DEBUGGING = " with debugging"
@@ -281,6 +308,9 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
     pass
     import torch._dynamo.config as config
     for _try_dynamo_argument in torch_dynamo_arguments:
+        # Torch 2.13 deprecates inline_inbuilt_nn_modules (always True) and warns on every write.
+        _key = _try_dynamo_argument.split("=", 1)[0].strip()[len("config."):]
+        if getattr(getattr(config, "_config", {}).get(_key), "deprecated", False): continue
         try:    exec(_try_dynamo_argument)
         except: pass
     pass
@@ -597,6 +627,32 @@ def patch_model_and_tokenizer(
             elif buffer.dtype == torch.bfloat16:
                 buffer.data = buffer.data.to(torch.float16)
         pass
+    elif correct_dtype == torch.float16:
+        # A pre-quantized checkpoint keeps its skipped layers and biases in the bfloat16 it was saved in. On a GPU without bfloat16 (T4) Inductor skips every graph reading one, so a non-reentrant checkpoint recompute stops matching its forward (unsloth#3459).
+        # A module pin covers its whole subtree: the pass below moves it with module.to().
+        _pinned = {
+            id(p)
+            for m in model.modules() if hasattr(m, "_pre_set_compute_dtype")
+            for p in m.parameters()
+        }
+        _cast_devices = set()
+        for param in model.parameters():
+            if param.dtype != torch.bfloat16 or hasattr(param, "_pre_set_compute_dtype"):
+                continue
+            if id(param) in _pinned:
+                continue
+            # bfloat16 quant storage (FSDP-QLoRA) packs 4-bit weights into a bfloat16 tensor.
+            if getattr(param, "quant_state", None) is not None:
+                continue
+            if param.device.type == "cuda":
+                _cast_devices.add(param.device)
+                if param.numel() * param.element_size() >= _FORCED_FLOAT32_STAGE_BYTES:
+                    _cast_large_param(param, torch.float16)
+                    continue
+            param.data = param.data.to(torch.float16)
+        # The casts are async and a later empty_cache() releases cached blocks on every device, see above.
+        for _device in _cast_devices:
+            torch.cuda.synchronize(_device)
     pass
 
     # Upcast ot downcast if explicitly set
@@ -774,7 +830,8 @@ def patch_model_and_tokenizer(
     # Clear deleted GPU items
     for _ in range(3):
         gc.collect()
-        torch.cuda.empty_cache()
+        if DEVICE_TYPE == "xpu": torch.xpu.empty_cache()
+        else: torch.cuda.empty_cache()
     return model, tokenizer
 pass
 

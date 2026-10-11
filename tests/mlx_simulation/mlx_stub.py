@@ -426,8 +426,17 @@ def sign(a, **kw): return torch.sign(a)
 def conj(a, **kw): return torch.conj(a)
 
 
-def maximum(a, b, **kw): return torch.maximum(a, b)
-def minimum(a, b, **kw): return torch.minimum(a, b)
+def _binary_operands(a, b):
+    # MLX broadcasts Python scalars; torch.maximum/minimum require tensors.
+    if not torch.is_tensor(a):
+        a = torch.as_tensor(a, dtype=b.dtype, device=b.device)
+    if not torch.is_tensor(b):
+        b = torch.as_tensor(b, dtype=a.dtype, device=a.device)
+    return a, b
+
+
+def maximum(a, b, **kw): return torch.maximum(*_binary_operands(a, b))
+def minimum(a, b, **kw): return torch.minimum(*_binary_operands(a, b))
 def clip(a, lo=None, hi=None, **kw): return torch.clamp(a, min=lo, max=hi)
 
 

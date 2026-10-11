@@ -94,6 +94,14 @@ jobs:
         # scripts/dynamic_exec_allowlist.json.
         run: python scripts/lint_dynamic_exec.py
 
+      - name: Risky-loader gate self-test
+        run: python scripts/lint_risky_loaders.py --self-test
+
+      # Dynamic imports, trust_remote_code turned on in code, unpinned code fetches and
+      # unsafe deserialization. Existing sites live in scripts/risky_loaders_baseline.json.
+      - name: No new risky loader call sites
+        run: python scripts/lint_risky_loaders.py
+
       - name: Workflow triggers (pull_request_target / cache-poisoning)
         # Also a job in security-audit.yml, but that workflow's pull_request paths do not
         # list .github/workflows/**, so the one change this most needs to see -- a workflow

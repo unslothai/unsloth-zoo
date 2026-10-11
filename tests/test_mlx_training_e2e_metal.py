@@ -30,6 +30,7 @@ _UNTRANSPOSED = dict(k=192, rows=1, out_width=128, transpose=False, rhs_indices=
 if _METAL:
     # Module scope: leaked mlx-simulation shims must not hijack test-time imports.
     import mlx.nn as nn
+    import mlx.optimizers as optim
     from mlx.utils import tree_flatten, tree_map
     from unsloth_zoo.mlx.loader import FastMLXModel
     from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
@@ -91,6 +92,27 @@ def test_cached_position_attribute_does_not_imply_multiaxis_rope():
     expected = lm(inputs).logits
     actual = lm.lm_head(mlx_utils._forward_text_hidden_states(lm, inputs))
     assert mx.allclose(actual, expected, atol=1e-5).item()
+
+
+@metal_only
+def test_qwen3_vl_pos_embed_interpolation_with_quantized_table():
+    from types import SimpleNamespace
+    from mlx_vlm.models.qwen3_vl.vision import VisionModel
+    from unsloth_zoo.mlx import compile as mc
+
+    mc._install_qwen3_family_compile_patches()
+    assert VisionModel.fast_pos_embed_interpolate.__module__ == mc.__name__
+    table = nn.QuantizedEmbedding.from_embedding(nn.Embedding(16, 64))
+
+    class Dense:  # the same rows behind a float weight
+        weight = mx.zeros((1,))
+        __call__ = staticmethod(table)
+
+    out = [VisionModel.fast_pos_embed_interpolate(
+        SimpleNamespace(num_grid_per_side=4, pos_embed=embed, config=SimpleNamespace(spatial_merge_size=2)),
+        [(1, 6, 8)]) for embed in (table, Dense())]
+    assert table.weight.dtype == mx.uint32
+    assert mx.array_equal(out[0], out[1]).item()
 
 
 @metal_only
@@ -488,6 +510,28 @@ def test_hf_callbacks_receive_mlx_trainer_lifecycle(tmp_path):
 
 
 @metal_only
+def test_eval_reports_mean_token_accuracy_on_metal(tmp_path):
+    from transformers import TrainerCallback
+    from unsloth_zoo.mlx.utils import make_baseline_loss_fn
+
+    class Recorder(TrainerCallback):
+        metrics = None
+
+        def on_evaluate(self, args, state, control, metrics, **_kwargs):
+            self.metrics = dict(metrics)
+
+    recorder = Recorder()
+    trainer = _callback_trainer(tmp_path, [recorder], max_steps=1)
+    trainer.train()
+    _, ntoks, correct = make_baseline_loss_fn()(
+        trainer.model, *_callback_batch(), return_correct=True,
+    )
+    expected = correct.item() / ntoks.item()
+    assert 0.0 <= expected <= 1.0
+    assert recorder.metrics["eval_mean_token_accuracy"] == pytest.approx(expected)
+
+
+@metal_only
 def test_hf_callback_on_save_only_fires_for_checkpoints(tmp_path, monkeypatch):
     from pathlib import Path
     from transformers import TrainerCallback
@@ -829,6 +873,42 @@ def test_cce_compacts_finite_supervision_with_one_trace(monkeypatch, quantized):
 
 
 @metal_only
+def test_cce_rotates_hidden_states_into_a_hadamard_packed_head(monkeypatch):
+    pack = pytest.importorskip("mlx_vlm.models.prism_hadamard_qwen35.prism_hadamard_qwen35")
+    from unsloth_zoo.mlx import preference
+    mx.random.seed(611)
+    model = _cce_text_model(2053, 1024, quantized=True)
+    head = pack.HadamardQuantizedLinear(1024, 8192, 512)
+    head.signs = mx.where(mx.random.uniform(shape=(1024,)) < 0.5, -1.0, 1.0)
+    rotated = pack.hadamard_transform(mx.random.normal((8192, 1024)) * 0.05, 512, head.signs)
+    head.weight, scales, biases = mx.quantize(rotated, group_size=128, bits=2)
+    head.scales, head.biases = scales.astype(mx.float16), biases.astype(mx.float16)
+    model.lm_head = head
+    ids = mx.random.randint(0, 2053, (2, 65))
+    lengths = mx.array([[0, 65], [0, 40]], dtype=mx.int32)
+    want = nn.value_and_grad(model, make_baseline_loss_fn())(model, ids, lengths)
+    loss_fn = mlx_utils.make_cce_loss_fn(model)
+    assert loss_fn._unsloth_cce_backend == "runtime-cce"
+    got = nn.value_and_grad(model, loss_fn)(model, ids, lengths)
+    mx.eval(want, got)
+    assert got[0][0].item() == pytest.approx(want[0][0].item(), rel=1e-4)
+    for (_, expected), (_, actual) in zip(tree_flatten(want[1]), tree_flatten(got[1])):
+        assert mx.allclose(expected, actual, atol=1e-5, rtol=1e-3).item()
+    score = preference._make_preference_cce_scorer(model)
+    supervised = mx.arange(64)[None] < lengths[:, 1:] - 1
+    ce, _ = score(model, ids, supervised)
+    logits = model(ids[:, :-1]).astype(mx.float32)
+    dense = nn.losses.cross_entropy(logits, ids[:, 1:], reduction="none")
+    assert mx.allclose(ce, dense * supervised, atol=1e-4, rtol=1e-4).item()
+    model.get_input_embeddings = lambda *args, **kwargs: None
+    monkeypatch.setattr(mlx_utils, "_vlm_cce_forward", lambda m, b, **kwargs: (
+        m.model(b["input_ids"][:, :-1]), b["input_ids"][:, 1:], mx.array(b["input_ids"][:, 1:].size)))
+    vlm_loss = mlx_utils.make_vlm_cce_loss_fn(model)
+    assert vlm_loss._unsloth_cce_backend == "runtime-cce"
+    assert vlm_loss(model, {"input_ids": ids})[0].item() == pytest.approx(dense.mean().item(), rel=1e-4)
+
+
+@metal_only
 @pytest.mark.parametrize("compiled", [False, True])
 @pytest.mark.parametrize("softcap", [0.0, 7.0])
 def test_frozen_dense_cce_preserves_gradients_with_lower_peak(monkeypatch, compiled, softcap):
@@ -884,6 +964,168 @@ def test_frozen_dense_cce_preserves_gradients_with_lower_peak(monkeypatch, compi
         peaks.append(mx.get_peak_memory() - resident)
         del result
     assert peaks[1] < peaks[0]
+
+
+@metal_only
+@pytest.mark.parametrize("quantized", [False, True])
+def test_compiled_update_reuses_parameter_and_moment_buffers(quantized):
+    import gc
+    import weakref
+    from unsloth_zoo.mlx.optimizers_quantized import QuantizedMomentAdamW
+
+    shape = (2048, 8192)
+    leaf = shape[0] * shape[1] * 2
+    results, peaks = [], []
+    for trainer_built in (False, True):
+        mx.random.seed(3)
+        params = {"w": (mx.random.normal(shape) * 0.02).astype(mx.bfloat16)}
+        grads = [(mx.random.normal(shape) * 1e-3).astype(mx.bfloat16) for _ in range(3)]
+        if trainer_built:
+            trainer = MLXTrainer.__new__(MLXTrainer)
+            trainer.args = MLXTrainingConfig(
+                optim="adamw_8bit" if quantized else "adamw", learning_rate=1e-3,
+                lr_scheduler_type="constant", warmup_steps=0, weight_decay=0.0,
+            )
+            opt = trainer._build_optimizer(total_steps=3)
+        else:
+            cls = QuantizedMomentAdamW if quantized else optim.AdamW
+            opt = cls(learning_rate=1e-3, weight_decay=0.0, bias_correction=True)
+        opt.init(params)
+        state = [params, opt.state]
+        step = mx.compile(lambda g: params.update(opt.apply_gradients({"w": g}, params)),
+                          inputs=state, outputs=state)
+        mx.eval(state, grads)
+        for g in grads:
+            gc.collect()
+            mx.synchronize()
+            resident = mx.get_active_memory()
+            mx.reset_peak_memory()
+            step(g)
+            mx.eval(state)
+            mx.synchronize()
+        peaks.append(mx.get_peak_memory() - resident)
+        results.append(tree_flatten(state))
+    for (name, left), (_, right) in zip(*results):
+        assert mx.array_equal(left, right).item(), name
+    assert peaks[0] >= 3 * leaf
+    if quantized:
+        # 8-bit m is repacked either way; only the parameter is donated.
+        assert peaks[1] <= peaks[0] - leaf
+    else:
+        assert peaks[1] < leaf / 8
+    released = weakref.ref(trainer._build_optimizer(total_steps=3))
+    assert released() is None
+
+
+@metal_only
+def test_layer_ordered_update_frees_gradients_during_backward():
+    import gc
+    from unsloth_zoo.mlx.trainer import _async_eval_by_layer, _donate_optimizer_state
+
+    class Net(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Linear(2048, 2048, bias=False)
+            self.layers = [nn.Linear(2048, 2048, bias=False) for _ in range(16)]
+
+        def __call__(self, x):
+            x = self.embed(x)
+            for layer in self.layers:
+                def block(params, x, layer=layer):
+                    layer.update(params)
+                    return x + nn.gelu(layer(x))
+                x = mx.checkpoint(block)(layer.trainable_parameters(), x)
+            return x
+
+    results, peaks = [], []
+    for ordered in (False, True):
+        mx.random.seed(5)
+        model = Net()
+        model.set_dtype(mx.bfloat16)
+        opt = _donate_optimizer_state(optim.AdamW(learning_rate=1e-3, weight_decay=0.0))
+        opt.init(model.trainable_parameters())
+        grad_fn = nn.value_and_grad(model, lambda m, x: m(x).astype(mx.float32).square().mean())
+        state = [model.state, opt.state]
+
+        def step(x):
+            loss, grads = grad_fn(model, x)
+            opt.update(model, grads)
+            return loss
+
+        step = mx.compile(step, inputs=state, outputs=state)
+        xs = [mx.random.normal((4096, 2048)).astype(mx.bfloat16) for _ in range(3)]
+        mx.eval(state, xs)
+        for x in xs:
+            gc.collect()
+            mx.synchronize()
+            resident = mx.get_active_memory()
+            mx.reset_peak_memory()
+            loss = step(x)
+            if ordered:
+                _async_eval_by_layer(model.trainable_parameters(), "layers.")
+            mx.eval(loss, state)
+            mx.synchronize()
+        peaks.append(mx.get_peak_memory() - resident)
+        results.append(tree_flatten(state))
+    for (name, left), (_, right) in zip(*results):
+        assert mx.array_equal(left, right).item(), name
+    layer_grads = 16 * 2048 * 2048 * 2
+    assert peaks[1] <= peaks[0] - 2 * layer_grads
+
+
+@metal_only
+def test_trainer_schedules_the_update_layer_by_layer(monkeypatch, tmp_path):
+    from unsloth_zoo.mlx import trainer as trainer_module
+
+    calls, schedule = [], trainer_module._async_eval_by_layer
+
+    def spy(tree, prefix):
+        if created:  # the first step's state must already be allocated
+            before = mx.get_active_memory()
+            mx.eval(created)
+            unallocated.append(mx.get_active_memory() - before)
+            created.clear()
+        params = tree_flatten(model.trainable_parameters())
+        is_params = all(a is b for (_, a), (_, b) in zip(tree_flatten(tree), params))
+        calls.append((tree, prefix, is_params))
+        schedule(tree, prefix)
+
+    monkeypatch.setattr(trainer_module, "_async_eval_by_layer", spy)
+    in_trace, created, unallocated, build = [], [], [], MLXTrainer._build_optimizer
+
+    def build_spy(self, total_steps):
+        optimizer = build(self, total_steps)
+        init = optimizer.init
+
+        def init_spy(parameters):
+            try:
+                mx.eval(tree_flatten(parameters)[0][1])
+                in_trace.append(False)
+            except ValueError:
+                in_trace.append(True)
+            init(parameters)
+            created.extend(a for _, a in tree_flatten(optimizer.state) if a.size > 1)
+
+        optimizer.init = init_spy
+        return optimizer
+
+    monkeypatch.setattr(MLXTrainer, "_build_optimizer", build_spy)
+    model, tokenizer = FastMLXModel.from_pretrained(
+        str(_tiny_base(tmp_path / "base")), load_in_4bit=False, max_seq_length=64,
+        full_finetuning=True,
+    )
+    MLXTrainer(model=model, tokenizer=tokenizer, train_dataset=_dataset(8), args=MLXTrainingConfig(
+        per_device_train_batch_size=2, gradient_accumulation_steps=2, max_steps=2,
+        output_dir=str(tmp_path / "out"), report_to="none",
+    )).train()
+    # Optimizer state is created before, not inside, the first compiled step.
+    assert in_trace == [False] and unallocated == [0]
+    assert {prefix for _, prefix, _ in calls} == {"model.layers."}
+    # Accumulation substeps schedule the accumulated gradient, update steps the parameters.
+    assert [is_params for _, _, is_params in calls] == [False, True, False, True]
+    trainable = {name for name, _ in tree_flatten(model.trainable_parameters())}
+    for tree, _, _ in calls:
+        assert {name for name, _ in tree_flatten(tree)} == trainable
 
 
 @metal_only
@@ -1536,6 +1778,64 @@ def test_preference_cce_scores_hidden_states_like_the_logits(monkeypatch, head, 
 
 
 @metal_only
+@pytest.mark.parametrize("frozen", [False, True])
+def test_preference_cce_declares_a_frozen_head(monkeypatch, frozen):
+    """A trainable-declared head may compute its weight gradient despite stop_gradient."""
+    from unsloth_zoo.mlx import preference as p, utils
+
+    model = _cce_text_model(2053, 64, quantized=False)
+    if frozen:
+        model.freeze()
+        model.model.unfreeze()
+    seen, build = [], utils._get_runtime_cce
+    monkeypatch.setattr(utils, "_get_runtime_cce", lambda **kw: seen.append(kw) or build(**kw))
+    assert p._make_preference_cce_scorer(model) is not None
+    assert [kw["weight_is_frozen"] for kw in seen] == [frozen]
+
+
+@metal_only
+@pytest.mark.parametrize("head", ["dense", "quantized", "softcap"])
+@pytest.mark.parametrize("loss_type", ["kto", "apo_zero_unpaired"])
+def test_kto_cce_scores_hidden_states_like_the_logits(head, loss_type):
+    from unsloth_zoo.mlx import preference as p
+    from mlx_lm.tuner.lora import LoRAEmbedding
+    mx.random.seed(941)
+    calls = []
+    model = _cce_text_model(2053, 64, quantized=head == "quantized", calls=calls,
+                            softcap=0.5 if head == "softcap" else 0.0)
+    adapter = LoRAEmbedding.from_base(model.model.embed_tokens, r=4, scale=2.0)
+    adapter.lora_b = mx.random.normal(adapter.lora_b.shape) * 0.02
+    model.model.embed_tokens = adapter
+    model.freeze()
+    adapter.unfreeze(keys=["lora_a", "lora_b"])
+    reference = p.ReferencePolicy(scales=[(adapter, 0.0)])
+    seq = lambda step, i, size: tuple((j * step + i) % 2053 for j in range(size))
+    rows = [p.TokenizedKTORow(
+        seq(7, i, 13 + i), seq(11, i, 40 + 3 * i), label=i % 3 != 0,
+        kl_prompt_ids=seq(7, i, 13 + i), kl_completion_ids=seq(5, i, 30 + i)) for i in range(4)]
+    objective = p.resolve_preference_objective("kto", beta=0.2, loss_type=loss_type)
+    plan = p.FiniteKTOBatchPlan(rows, [(0, 1, 2, 3)], with_kl=objective.with_kl,
+                                normalizers=[(0, 4, 1)], cycle_length=1, max_seq_length=128, pad_id=0)
+    dense = nn.value_and_grad(model, p.make_kto_loss_fn(objective, reference_policy=reference))
+    grad = nn.value_and_grad(model, p.make_kto_cce_loss_fn(model, objective, reference_policy=reference))
+    mx.eval(expected := dense(model, *plan[0]))
+    calls.clear()
+    run = mx.compile(lambda *b: grad(model, *b), inputs=model.state, outputs=model.state)
+    mx.eval(actual := run(*plan[0]))
+    # The KL rows and the reference score through the kernel, not the logits.
+    assert "model" not in calls and adapter.scale == 2.0
+    for want, got in zip(expected[0], actual[0]):
+        assert mx.allclose(want, got, atol=1e-4, rtol=1e-5).item()
+    for (_, want), (_, got) in zip(tree_flatten(expected[1]), tree_flatten(actual[1])):
+        assert mx.allclose(want, got, atol=2e-5, rtol=2e-4).item()
+    scorer = p.make_kto_cce_loss_fn(model, objective, reference_policy=reference)._unsloth_cce_scorer
+    want = p.precompute_reference_logps(plan, model, reference, batch_size=4)
+    calls.clear()
+    got = p.precompute_reference_logps(plan, model, reference, batch_size=4, scorer=scorer)
+    assert "model" not in calls and abs(want - got).max() < 2e-3 and want.any()
+
+
+@metal_only
 @pytest.mark.parametrize("quantized", [False, True])
 @pytest.mark.parametrize("labeled", [False, True])
 def test_text_eval_compacts_finite_batches(monkeypatch, quantized, labeled):
@@ -1848,7 +2148,14 @@ def test_vlm_planned_vs_unplanned_training_parity(monkeypatch, tmp_path):
         def __call__(self, inputs, pixel_values=None, mask=None, **_kwargs):
             return self.proj(self.embed(inputs))
 
+    from transformers import TrainerCallback
+
     seen_widths = []
+
+    class TrainingWidths(TrainerCallback):
+        def on_train_begin(self, args, state, control, **kwargs):
+            seen_widths.clear()
+
     original_call = TinyVLM.__call__
 
     def recording_call(self, inputs, *args, **kwargs):
@@ -1900,6 +2207,7 @@ def test_vlm_planned_vs_unplanned_training_parity(monkeypatch, tmp_path):
         trainer._is_vlm = True
         trainer.processor = _Proc()
         trainer._batches = plan
+        trainer.add_callback(TrainingWidths())
         if planned:
             enabled_decision = types.SimpleNamespace(
                 should_raise=False, enabled=True, arch="tiny",
@@ -2785,3 +3093,47 @@ def test_gemma4_unified_sort_key_never_ties(counts):
     rows = valid.shape[0] * valid.shape[1]
     keys = sorted(_valid_first_sort_key(valid.reshape(rows), rows).tolist())
     assert len(set(keys)) == rows, f"tied keys: {keys}"
+
+
+@metal_only
+@pytest.mark.parametrize("use_cce", [False, True])
+def test_self_routed_vlm_merges_images_inside_loss(use_cce):
+    from types import SimpleNamespace
+
+    class GenerationWrapper(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(16, 8)
+            self.vision = nn.Linear(3, 8, bias=False)
+            self.head = nn.Linear(8, 16, bias=False)
+
+        @property
+        def language_model(self):
+            return self
+
+        def get_input_embeddings(self, ids, pixels, mask=None, **kwargs):
+            h = self.embed(ids)
+            if pixels is not None:
+                h = h + self.vision(pixels)[:, None] * kwargs["image_scale"]
+            return SimpleNamespace(inputs_embeds=h)
+
+        def __call__(self, ids, inputs_embeds=None, **kwargs):
+            h = self.embed(ids) if inputs_embeds is None else inputs_embeds
+            return self.head(h)
+
+    mx.random.seed(12)
+    model = GenerationWrapper()
+    factory = mlx_utils.make_vlm_cce_loss_fn if use_cce else mlx_utils.make_vlm_baseline_loss_fn
+    loss = factory(model)
+    for pixels in ([[1., 2., 3.], [3., -2., 1.]], [[-1., 0., 2.], [2., 1., -3.]]):
+        batch = dict(input_ids=mx.array([[1, 2, 3], [4, 5, 6]]),
+                     pixel_values=mx.array(pixels), image_scale=mx.array(0.7))
+        def reference(m, b):
+            embeds = m.get_input_embeddings(b["input_ids"], b["pixel_values"], image_scale=b["image_scale"])
+            logits = m(b["input_ids"], inputs_embeds=embeds.inputs_embeds)
+            return nn.losses.cross_entropy(logits[:, :-1], b["input_ids"][:, 1:]).mean()
+        expected, expected_grad = nn.value_and_grad(model, reference)(model, batch)
+        (actual, _), grad = nn.value_and_grad(model, loss)(model, batch)
+        assert float(mx.abs(grad["vision"]["weight"]).max()) > 0
+        assert mx.array_equal(actual, expected).item()
+        assert mx.array_equal(grad["vision"]["weight"], expected_grad["vision"]["weight"]).item()

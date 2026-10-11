@@ -76,3 +76,14 @@ def test_proxy_semantics_unchanged():
     assert c.hidden_size == 8 and not hasattr(c, "num_kv_shared_layers")
     pk = pickle.loads(pickle.dumps(p))
     assert pk.hidden_size == 8 and not hasattr(pk, "num_kv_shared_layers")
+
+
+def test_proxy_writes_reach_the_real_config():
+    # TRL's SFTTrainer sets pad_token_id on model.config.get_text_config(), which is the proxy.
+    cfg = _Cfg()
+    p = g4._Gemma4KVSharedSafeProxy(cfg)
+    p.pad_token_id = 7
+    assert cfg.pad_token_id == 7 and p.pad_token_id == 7
+    del p.pad_token_id
+    assert not hasattr(cfg, "pad_token_id")
+    assert p._real is cfg and not hasattr(p, "num_kv_shared_layers")

@@ -59,6 +59,11 @@ from .log import logger
 import triton
 import regex
 from .peft_utils import get_lora_layer_modules
+from unsloth_zoo.temporary_patches.mhc_sinkhorn import (
+    MHC_SINKHORN_SOURCE,
+    MHC_SINKHORN_REPLACEMENT,
+    mhc_fast_mode,
+)
 from importlib.metadata import version as importlib_version
 import functools
 from .compiler_replacements import compiler_replacements
@@ -199,6 +204,19 @@ DISABLE_COMPILE_FUNCTIONS = [
 # trailing `x[..., -rope_dim:]` slice reads out of bounds, giving wrong / NaN grads (pytorch#198553).
 DISABLE_COMPILE_MODEL_FUNCTIONS = {
     "deepseek_v4": ["apply_rotary_pos_emb"],
+    # Community port: V4 rope slice plus host-side helpers (dynamo cannot trace tokenizers `NFKC.__new__`).
+    "deepseek_v41": [
+        "apply_rotary_pos_emb",
+        "build_compressed_token_map",
+        "compute_hash_multipliers",
+        "_is_prime",
+        "_find_next_prime",
+        "_mesh_process_group",
+        "_tp_grad_group",
+        "_validate_attention_tp_divisibility",
+        # QAT STE autograd.Function: Dynamo raises InternalTorchDynamoError the fallback does not catch.
+        "_quantize_qat",
+    ],
 }
 
 # Matched rewrites leave DISABLE_COMPILE_MODEL_FUNCTIONS; deepseek_v4 `split` avoids the slice pytorch#198553 miscompiles.
@@ -209,7 +227,41 @@ MODEL_FUNCTION_SOURCE_REWRITES = {
             "nope, rope = x.split([x.shape[-1] - rope_dim, rope_dim], dim = -1)",
         ),
     },
+    "deepseek_v41": {
+        "apply_rotary_pos_emb": (
+            "nope, rope = x[..., :-rope_dim], x[..., -rope_dim:]",
+            "nope, rope = x.split([x.shape[-1] - rope_dim, rope_dim], dim = -1)",
+        ),
+    },
 }
+
+
+# {model_type: {class: (old, new, mode)}}: a class whose forward contains `old` exactly once leaves
+# DISABLE_COMPILE_MODULES. mode() -> None (stay listed), "stock" (compile unchanged), else apply old -> new.
+MODULE_FORWARD_SOURCE_REWRITES = {
+    "deepseek_v4": {
+        "DeepseekV4HyperConnection": (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_mode),
+    },
+    "deepseek_v41": {
+        "DeepseekV41HyperConnection": (MHC_SINKHORN_SOURCE, MHC_SINKHORN_REPLACEMENT, mhc_fast_mode),
+    },
+}
+
+
+def module_forward_source_rewrites(modeling_file, model_type):
+    applicable = {}
+    for name, (old, new, mode) in MODULE_FORWARD_SOURCE_REWRITES.get(model_type, {}).items():
+        try:
+            mode = mode()
+            if not mode:
+                continue
+            cls = getattr(modeling_file, name)
+            source = inspect.getsource(_unwrap_undecorated_method(cls.forward, cls.__qualname__))
+        except Exception:
+            continue
+        if source.count(old) == 1:
+            applicable[name] = source if mode == "stock" else source.replace(old, new)
+    return applicable
 
 
 def model_function_source_rewrites(modeling_file, model_type):
@@ -275,6 +327,57 @@ def function_has_tensor_inputs(source: str) -> bool:
         if not names <= scalar_names | {"Optional", "Union", "List", "Tuple", "Dict", "Set", "torch", "typing"}:
             return True
     return False
+pass
+
+
+_INIT_ONLY_CALLERS = frozenset(("__init__", "__post_init__", "_init_weights", "post_init"))
+
+
+def function_only_called_at_init(module_source: str, name: str) -> bool:
+    """True if ``name`` is only reached from ``__init__``-time methods (directly or via such
+    helpers): these build buffers on meta, so compiling them fails at load. False if unparseable."""
+    try:
+        tree = ast.parse(textwrap.dedent(module_source))
+    except Exception:
+        return False
+    callers_of = {}
+    # owner = (name, is_method); nested defs keep their enclosing owner.
+    def visit(node, owner):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if isinstance(node, ast.ClassDef):
+                    visit(child, (child.name, True))
+                else:
+                    visit(child, (child.name, False) if owner is None else owner)
+                continue
+            if isinstance(child, ast.Call):
+                func = child.func
+                called = func.id if isinstance(func, ast.Name) else None
+                if called is not None:
+                    callers_of.setdefault(called, set()).add(owner)
+            visit(child, owner)
+    visit(tree, None)
+    seen = set()
+    def init_only(fn):
+        if fn in seen:
+            return True
+        seen.add(fn)
+        owners = callers_of.get(fn)
+        if not owners:
+            return False
+        for owner in owners:
+            if owner is None:
+                return False  # called at module import time or from a class body
+            owner_name, is_method = owner
+            if is_method:
+                # self.<name>() calls are untracked (MPT forward: self.build_mpt_alibi_tensor).
+                if owner_name in _INIT_ONLY_CALLERS:
+                    continue
+                return False
+            if not init_only(owner_name):
+                return False
+        return True
+    return init_only(name)
 pass
 
 
@@ -378,7 +481,35 @@ except:
     torch_compiler_set_stance = None
 pass
 
+# The stance is process wide, so whether Unsloth owns it lives in unsloth_zoo, shared by
+# every generated module: inference in one model's module, training in another's.
+from unsloth_zoo.temporary_patches.utils import UNSLOTH_EAGER_STANCE_OWNED, unsloth_claim_eager_stance, unsloth_owns_stance, unsloth_release_stance
+
+def unsloth_training_stance():
+    # eager_on_recompile is global: left on by generate() or eval forwards, every recompile
+    # in a later training step (new sequence length, model.train() without for_training)
+    # would silently run the eager body. Training forwards restore the default stance,
+    # unless the user chose eager_on_recompile themselves. Every set_stance call installs a
+    # fresh stance object, so ours is still active only if the current one `is` it; a user
+    # set_stance since then (even to eager_on_recompile again) is theirs and stays.
+    global INFERENCE_RUNS
+    INFERENCE_RUNS = 0
+    if len(UNSLOTH_EAGER_STANCE_OWNED) != 0 and torch_dynamo_eval_frame is not None:
+        current = torch_dynamo_eval_frame._stance
+        # Ownership is only dropped once ours is reset: a temporary stance scope's exit restores
+        # one of our exact objects, which a later training forward must still recognise.
+        if current.stance == "eager_on_recompile" and unsloth_owns_stance(current):
+            # Only the reset object: an outer scope may still restore another one of ours.
+            # Put back what the caller had before Unsloth switched (force_eager, a backend, ...).
+            previous = unsloth_release_stance(current)
+            if previous is not None and hasattr(torch_dynamo_eval_frame, "_set_stance"):
+                torch_dynamo_eval_frame._set_stance(previous)
+            else:
+                torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = False)
+pass
+
 from unsloth_zoo import DEVICE_TYPE_TORCH, DEVICE_COUNT
+from unsloth_zoo.temporary_patches.utils import UNSLOTH_DECODE_COMPILE
 """
 )
 
@@ -394,6 +525,9 @@ from unsloth_zoo.loss_utils import (
     fused_linear_cross_entropy,
     unsloth_fused_ce_loss,
 )
+from unsloth_zoo.fused_losses.forward_adapter import unsloth_fused_lm_head_loss
+from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_count_aware_cross_entropy, unsloth_loss_count_kwargs
+from unsloth_zoo.fused_losses.aux_loss import unsloth_ga_scale_aux_loss
 
 scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
 @torch.compiler.disable(recursive = False)
@@ -540,8 +674,9 @@ def replace_with_grouped_query_attention(module, source):
     # a `return super().forward(...)` separated by an arbitrary body
     # (logger warning, raise, etc.). Matches the legacy shape with a
     # looser anchor; still no-ops on 4.50+ where the guard is gone.
+    # `[ \t][^\n]+`, not `[ \t]+[^\n]+`: that split backtracks exponentially (DeepseekOcr2).
     rewritten, n_loose = re.subn(
-        r"if[ \t]+output_attentions[ \t]*:[^\n]*\n(?:[ \t]+[^\n]+\n)*?[ \t]+return[ \t]+super\(\)\.forward\([^)]*\)",
+        r"if[ \t]+output_attentions[ \t]*:[^\n]*\n(?:[ \t][^\n]+\n)*?[ \t]+return[ \t]+super\(\)\.forward\([^)]*\)",
         "if output_attentions: raise RuntimeError('Unsloth: Not supported')",
         source,
         flags=re.MULTILINE,
@@ -1946,6 +2081,10 @@ def create_new_function(
         # Emitted in place of a bare `torch.compile(fullgraph = True)`, so the
         # name must resolve in the generated module.
         imports += "from unsloth_zoo.temporary_patches.utils import torch_compile_with_fallback\n"
+    if "torch_compiler_disable_unless_decode" in new_source:
+        imports += "from unsloth_zoo.temporary_patches.utils import torch_compiler_disable_unless_decode\n"
+    if "unsloth_sinkhorn_knopp" in new_source:
+        imports += "from unsloth_zoo.temporary_patches.mhc_sinkhorn import unsloth_sinkhorn_knopp\n"
     if "torch_compile" in new_source:
         imports += "from unsloth_zoo.temporary_patches.common import torch_compile\n"
     if "_maybe_compile" in new_source:
@@ -2775,7 +2914,7 @@ def create_standalone_class(
         compile = (
             f"@torch_compile_with_fallback(fullgraph = {fullgraph}, dynamic = True, options = torch_compile_options)"
             if not disable
-            else "@torch.compiler.disable(recursive = False)"
+            else "@torch_compiler_disable_unless_decode"
         )
     else:
         compile = ""
@@ -2826,19 +2965,37 @@ def create_standalone_class(
 
     # Add **loss_kwargs
     if add_loss_kwargs and "**" not in parameters:
-        parameters += ", **loss_kwargs"
-        definition = re.sub(r"(\,[\n][\s]{1,}\))", r",**loss_kwargs\1", definition)
-        source = re.sub(r"(\,[\n]\) \-\>)", r",**loss_kwargs\1", source)
+        # Reuse a var-keyword the count-aware rewrite already spliced in: a second one is a SyntaxError.
+        spliced = None
+        try:
+            for node in ast.walk(ast.parse(textwrap.dedent(source))):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    spliced = node.args.kwarg.arg if node.args.kwarg is not None else None
+                    break
+        except SyntaxError:
+            spliced = None
+        name = spliced or "loss_kwargs"
+        parameters += f", **{name}"
+        definition = re.sub(r"(\,[\n][\s]{1,}\))", rf",**{name}\1", definition)
+        if spliced is None:
+            source = re.sub(r"(\,[\n]\) \-\>)", r",**loss_kwargs\1", source)
     pass
 
     source = f"{compile}\n{source}\n"
-    left = re.match(r"[\s\n]{4,}", leftover).span()[1]
     # Use patched function name if forward was replaced by temporary patch
     forward_func_name = patched_forward_info[0] if patched_forward_info else f"{module}_forward"
-    new_forward = definition + leftover[:left] + \
-        f"return {forward_func_name}({parameters})\n"
-    source_to_replace = patched_forward_info[1] if patched_forward_info else old_source
-    full_class = full_class.replace(source_to_replace, new_forward)
+    if add_loss_kwargs and patched_forward_info is None and full_class.find(definition) == -1:
+        # Inherited forward (deprecated aliases): nothing to replace, so append an override.
+        body_indent = re.search(r"([ \t]*)def\s", definition).group(1) + "    "
+        new_forward = definition.lstrip("\n") + "\n" + body_indent + \
+            f"return {forward_func_name}({parameters})\n"
+        full_class = full_class.rstrip() + "\n\n" + new_forward
+    else:
+        left = re.match(r"[\s\n]{4,}", leftover).span()[1]
+        new_forward = definition + leftover[:left] + \
+            f"return {forward_func_name}({parameters})\n"
+        source_to_replace = patched_forward_info[1] if patched_forward_info else old_source
+        full_class = full_class.replace(source_to_replace, new_forward)
 
     # New init as well
     if new_init is not None:
@@ -3007,33 +3164,77 @@ __DYNAMO__RECOMPILING__ = """
 
     # Set compiler stance to fail on recompiles for inference
     global INFERENCE_RUNS
-    if torch_dynamo_eval_frame is not None:
-        old_stance = torch_dynamo_eval_frame._stance.stance
-    else:
-        old_stance = None
-    if old_stance is not None and INFERENCE_RUNS == 1:
-        # Skip guards and return to eager -> we still need guards!
-        torch_compiler_set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = False)
-        if UNSLOTH_ENABLE_LOGGING:
-            logger_compiler.info(
-                f"Unsloth: Removing compiler guards after 1 inference run. "\\
-                f"DYNAMO_STANCE.stance = {torch_dynamo_eval_frame._stance.stance} "\\
-                f"DYNAMO_STANCE.skip_guard_eval_unsafe = {torch_dynamo_eval_frame._stance.skip_guard_eval_unsafe}"
-            )
-    elif old_stance == "eager_on_recompile":
-        pass
-    elif old_stance == "default" and INFERENCE_RUNS > 1:
-        # Reset compiler stance
-        torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = False)
-        if UNSLOTH_ENABLE_LOGGING:
-            logger_compiler.info(
-                f"Unsloth: Reseting guards. "\\
-                f"DYNAMO_STANCE.stance = {torch_dynamo_eval_frame._stance.stance} "\\
-                f"DYNAMO_STANCE.skip_guard_eval_unsafe = {torch_dynamo_eval_frame._stance.skip_guard_eval_unsafe}"
-            )
-        INFERENCE_RUNS = 0
-    INFERENCE_RUNS += 1
+    # Skipped while tracing (set_stance raises there, and the counter would guard every step)
+    # and around a compiled decode step, which eager_on_recompile would otherwise freeze.
+    if not torch.compiler.is_compiling() and not UNSLOTH_DECODE_COMPILE[0]:
+        if torch_dynamo_eval_frame is not None:
+            old_stance = torch_dynamo_eval_frame._stance.stance
+        else:
+            old_stance = None
+        if old_stance is not None and INFERENCE_RUNS == 1:
+            # Skip guards and return to eager -> we still need guards!
+            # Already eager (another model's inference, or the user's choice): leave that stance
+            # object, and so its ownership, as it is. Otherwise switch and claim the new object.
+            if old_stance != "eager_on_recompile":
+                previous = getattr(torch_dynamo_eval_frame, "_stance", None)
+                torch_compiler_set_stance(stance = "eager_on_recompile", skip_guard_eval_unsafe = False)
+                # The stance object itself, or True where torch keeps no such object.
+                unsloth_claim_eager_stance(getattr(torch_dynamo_eval_frame, "_stance", True), previous)
+            if UNSLOTH_ENABLE_LOGGING:
+                logger_compiler.info(
+                    f"Unsloth: Removing compiler guards after 1 inference run. "\\
+                    f"DYNAMO_STANCE.stance = {torch_dynamo_eval_frame._stance.stance} "\\
+                    f"DYNAMO_STANCE.skip_guard_eval_unsafe = {torch_dynamo_eval_frame._stance.skip_guard_eval_unsafe}"
+                )
+        elif old_stance == "eager_on_recompile":
+            pass
+        elif old_stance == "default" and INFERENCE_RUNS > 1:
+            # Reset compiler stance
+            torch_compiler_set_stance(stance = "default", skip_guard_eval_unsafe = False)
+            if UNSLOTH_ENABLE_LOGGING:
+                logger_compiler.info(
+                    f"Unsloth: Reseting guards. "\\
+                    f"DYNAMO_STANCE.stance = {torch_dynamo_eval_frame._stance.stance} "\\
+                    f"DYNAMO_STANCE.skip_guard_eval_unsafe = {torch_dynamo_eval_frame._stance.skip_guard_eval_unsafe}"
+                )
+            INFERENCE_RUNS = 0
+        INFERENCE_RUNS += 1
 """
+
+# is_compiling() first: Dynamo folds it to True, so traced forwards skip the call.
+__DYNAMO__TRAINING_STANCE__ = """if not torch.compiler.is_compiling() and torch.is_grad_enabled() and getattr(self, "training", False):
+    unsloth_training_stance()"""
+
+_TRAINING_STANCE_MARKER = "__UNSLOTH_TRAINING_STANCE_MARKER__"
+_TRAINING_STANCE_MARKER_LINE = re.compile(r"^([ \t]*)" + _TRAINING_STANCE_MARKER + r"[ \t]*\n", re.MULTILINE)
+
+
+def _place_training_stance(forward):
+    """Reset at forward entry: at the logits site the decoder body already ran eager."""
+    def at_marker(match):
+        return textwrap.indent(__DYNAMO__TRAINING_STANCE__, match.group(1)) + "\n"
+    try:
+        dedented = textwrap.dedent(forward)
+        tree = ast.parse(dedented)
+        function = next(x for x in tree.body if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef)))
+        body = function.body
+        first = body[0]
+        if isinstance(first, ast.Expr) and isinstance(getattr(first, "value", None), ast.Constant) \
+            and isinstance(first.value.value, str):
+            first = body[1]  # after the docstring
+        lines = forward.split("\n")
+        line = lines[first.lineno - 1]
+        indent = line[: len(line) - len(line.lstrip())]
+        shift = len(line) - len(dedented.split("\n")[first.lineno - 1])
+        if first.lineno == function.lineno or first.col_offset + shift != len(indent) or not indent:
+            raise ValueError("forward body does not start on its own line")
+        lines.insert(first.lineno - 1, textwrap.indent(__DYNAMO__TRAINING_STANCE__, indent))
+        placed = "\n".join(lines)
+        placed = _TRAINING_STANCE_MARKER_LINE.sub("", placed)
+        ast.parse(textwrap.dedent(placed))
+        return placed
+    except Exception:
+        return _TRAINING_STANCE_MARKER_LINE.sub(at_marker, forward)
 
 # Replace Cross Entropy cells with fused linear lm heads
 cross_entropy_find_1 = """
@@ -3083,6 +3284,7 @@ pass
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
+__UNSLOTH_TRAINING_STANCE_MARKER__
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
@@ -3101,7 +3303,7 @@ elif labels is None:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
+elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_ and getattr(self.lm_head, "bias", None) is None:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
         lm_weight          = self.lm_head.weight,
@@ -3140,7 +3342,9 @@ $LOGITSCALINGMULTIPLY$
 $LOGITSCALINGDIVISION$
 $LOGITSOFTCAPPING$
 loss = None
-if labels is not None:$SPACES$loss = self.loss_function($NEWLINES$$LOGITS$, $LABELS$, $VOCABSIZE$$KWARGS$$NEWLINES$)
+if labels is not None:$SPACES$
+$LOGITSUPCAST$
+loss = self.loss_function($NEWLINES$$LOGITS$,$NEWLINES$$LABELS$,$NEWLINES$$VOCABSIZE$$KWARGS$,?$NEWLINES$)
 """
 
 cross_entropy_replacement_2 = """
@@ -3175,6 +3379,7 @@ pass
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
+__UNSLOTH_TRAINING_STANCE_MARKER__
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
@@ -3193,7 +3398,7 @@ elif labels is None:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_:
+elif ((\\2) == () and (\\3) == ()) and (UNSLOTH_ENABLE_CCE and HAS_CUT_CROSS_ENTROPY) and NOT_RETURN_LOGITS and self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None and not requires_grad_ and getattr(self.lm_head, "bias", None) is None:
     loss = fused_linear_cross_entropy(
         hidden_states      = hidden_states\\1,
         lm_weight          = self.lm_head.weight,
@@ -3248,7 +3453,7 @@ else:
         logits = logits / (\\4)
         logits = torch.tanh(logits)
         logits = logits * (\\4)
-    loss = self.loss_function(\\6, \\7.to(self.lm_head.weight.device), vocab_size=\\8, **\\9)
+    loss = self.loss_function(\\6, \\7.to(self.lm_head.weight.device), vocab_size=\\8, **\\9__UNSLOTH_NON_CAUSAL__)
 """.replace("__DYNAMO__RECOMPILING__", __DYNAMO__RECOMPILING__)
 
 cross_entropy_find_3 = """
@@ -3298,6 +3503,7 @@ pass
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
+__UNSLOTH_TRAINING_STANCE_MARKER__
 if RETURN_HIDDEN_STATES:
     logits = hidden_states\\1
 elif labels is None:
@@ -3326,13 +3532,17 @@ else:
     torch._dynamo.mark_dynamic(labels, 1)
     if attention_mask is not None:
         torch._dynamo.mark_dynamic(attention_mask, 1)
+    # Prefix tuning makes the mask longer than the labels; the stock forward keeps its tail.
+    _mask = \\6
+    if _mask is not None and _mask.shape[-1] > labels.shape[-1]:
+        _mask = _mask[..., -labels.shape[-1]:]
     loss = unsloth_fused_ce_loss(
         trainer              = None,
         hidden_states        = _hidden_states,
         lm_head_weight       = lm_head_weight,
         lm_head_bias         = lm_head_bias,
         labels               = labels,
-        mask                 = \\6,
+        mask                 = _mask,
         n_items              = n_items,
         scaling              = getattr(self, "accelerator_scaler", None),
         target_gb            = None,
@@ -3359,9 +3569,137 @@ ce_finders = [
 ]
 
 
+def _normalize_lm_head_source(forward):
+    # `logits = self.lm_head(x) * self.s` on one line (HyperCLOVAX vision) -> two lines.
+    forward = re.sub(
+        r"^([ \t]+)logits = (self\.lm_head\([^\n]+\)) ([\*/]) (self\.[\w\.]+)[ \t]*$",
+        r"\1logits = \2\n\1logits = logits \3 \4",
+        forward,
+        flags = re.MULTILINE,
+    )
+    # transformers 4.x CTRL / OpenAI GPT name it `lm_logits`; rename only if `logits` is unused.
+    if re.search(r"^[ \t]+lm_logits = self\.lm_head\(", forward, flags = re.MULTILINE) \
+            and not re.search(r"(?<![\w.])logits(?![\w=])", forward):
+        forward = re.sub(r"\blm_logits\b", "logits", forward)
+    # Multi-line masked-shift CE (Qwen2-Audio, Granite Speech) -> pattern 3; needs a local head call.
+    if "self.lm_head(" not in forward:
+        return forward
+    forward = re.sub(
+        r"^([ \t]+)loss = loss_fct\(\s*\n\s*shift_logits\.view\(-1, shift_logits\.size\(-1\)\),\s*"
+        r"shift_labels\.view\(-1\)(?:\.to\(([^()\n]*)\))?,?\s*\n\s*\)[ \t]*$",
+        lambda m: (
+            f"{m.group(1)}shift_logits = shift_logits.view(-1, shift_logits.size(-1))\n"
+            f"{m.group(1)}shift_labels = shift_labels.view(-1)\n"
+            f"{m.group(1)}shift_labels = shift_labels.to({m.group(2) or 'shift_logits.device'})\n"
+            f"{m.group(1)}loss = loss_fct(shift_logits, shift_labels)"
+        ),
+        forward,
+        flags = re.MULTILINE,
+    )
+    return _hoist_head_to_loss_preamble(forward)
+
+
+def _hoist_head_to_loss_preamble(forward):
+    """Hoist head-independent rebinds between the head call and `loss = None` (Qwen2-Audio)."""
+    lines = forward.split("\n")
+    for i, line in enumerate(lines):
+        head = re.match(r"^([ \t]+)logits = self\.lm_head\((.*)\)[ \t]*$", line)
+        if head is None:
+            continue
+        indent, head_names = head.group(1), set(re.findall(r"\b\w+\b", head.group(2)))
+        moved, j = [], i + 1
+        while j < len(lines):
+            current = lines[j]
+            if current.strip() == "":
+                j += 1
+                continue
+            if current == f"{indent}loss = None":
+                break
+            assign = re.match(rf"^{indent}(\w+) = (?!.*\blogits\b)[^\n]+$", current)
+            if assign is None or assign.group(1) in head_names or assign.group(1) == "logits":
+                moved = None
+                break
+            moved.append(current)
+            j += 1
+        if not moved or j == len(lines):
+            continue
+        rest = [x for x in lines[i + 1:j] if x not in moved]
+        return "\n".join(lines[:i] + moved + [line] + rest + lines[j:])
+    return forward
+
+
 def apply_fused_lm_head(forward, module=None):
+    # Kept only if it fuses, so unmatched sources come back byte-identical.
+    normalized = _normalize_lm_head_source(forward)
+    if normalized != forward:
+        new_forward, fused = _apply_fused_lm_head(normalized, module)
+        if fused:
+            return new_forward, fused
+    return _apply_fused_lm_head(forward, module)
+
+
+# Patterns 1 and 3 need these tails; their regex otherwise backtracks for seconds.
+_CE_TAIL_VIEW = re.compile(r"(?:shift|flat)_logits = (?:shift|flat)_logits\.view\(-1,")
+_CE_TAIL_CALL = re.compile(r"loss = loss_fct\((?:shift|flat)_logits, (?:shift|flat)_labels\)")
+
+
+def _labels_block_tail(forward, end, indent):
+    """Labels-block source after the matched loss call; None if code shares its line."""
+    rest = forward[end:]
+    newline = rest.find("\n")
+    if newline == -1:
+        return ""
+    if rest[:newline].strip():
+        return None
+    tail = []
+    for line in rest[newline + 1:].split("\n"):
+        if line.strip() and len(line) - len(line.lstrip()) < indent:
+            break
+        tail.append(line)
+    return "\n".join(tail).strip("\n")
+
+
+def _tail_guard(tail):
+    """(COND, block) for one `if COND:` tail, ("", "") for none, None if not replayable."""
+    if not tail.strip():
+        return ("", "")
+    block = textwrap.dedent(tail)
+    try:
+        body = ast.parse(block).body
+    except SyntaxError:
+        return None
+    if not body:
+        return ("", "")
+    if len(body) == 1 and isinstance(body[0], ast.If) and not body[0].orelse:
+        return (ast.unparse(body[0].test), block)
+    return None
+
+
+def _guard_loss_function_replacement(replacement, condition, block):
+    """Fused branches skip `condition` (its block reads real logits); RETURN_LOGITS replays it."""
+    condition = condition.replace("\\", "\\\\")
+    block = block.replace("\\", "\\\\")
+    lines = []
+    for line in replacement.split("\n"):
+        stripped = line.strip()
+        indent = line[: len(line) - len(line.lstrip())]
+        if stripped.startswith("elif ") and stripped.endswith(
+            ("and not requires_grad_:", 'getattr(self.lm_head, "bias", None) is None:', "and NOT_RETURN_LOGITS:")
+        ):
+            line = f"{line[:-1]} and not ({condition}):"
+        elif stripped == 'elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not None:':
+            line = f"{line[:-1]} and not NOT_RETURN_LOGITS:"
+        lines.append(line)
+        if stripped.startswith("loss = self.loss_function(logits, labels.to("):
+            lines.extend(indent + x if x.strip() else x for x in block.rstrip("\n").split("\n"))
+    return "\n".join(lines)
+
+
+def _apply_fused_lm_head(forward, module=None):
     # All Unsloth Zoo code licensed under LGPLv3
     UNSLOTH_ENABLE_LOGGING = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
+    # Rewrites below run on a working copy; an unmatched source must come back unchanged.
+    original_forward = forward
     for jj, (cross_entropy_find, cross_entropy_replacement) in enumerate(ce_finders):
         cross_entropy_find = (
             cross_entropy_find.strip()
@@ -3397,16 +3735,12 @@ def apply_fused_lm_head(forward, module=None):
                 r"self\.vocab_size|"
                 r"self\.config\.vocab_size|"
                 r"self\.config\.text_config\.vocab_size|"
-                r"self\.config\.get_text_config\(\)\.vocab_size"
+                r"self\.config\.get_text_config\(\)\.vocab_size|"
+                r"shift\_logits\.size\(\-1\)"
                 ")",
             )
-            # Any identifier, not a list of the two names we had seen. transformers
-            # 5.17 renamed gemma3's to `lm_kwargs`, and because a finder that does
-            # not match is a silent no-op, the only symptom was Gemma 3 quietly
-            # losing fused linear cross entropy. One capture group either way, and
-            # the replacements splice the captured NAME in, so a new spelling
-            # works without being enumerated here.
-            .replace("$KWARGS$", r"(?:, \*\*([A-Za-z_]\w*))?")
+            # Any kwargs name (transformers 5.17 renamed gemma3's to `lm_kwargs`); may sit on its own line.
+            .replace("$KWARGS$", r"(?:,[\s\n]{0,}\*\*([A-Za-z_]\w*))?")
             .replace("$LOGITSUPCAST$", r"(?:logits = logits\.float\(\))?")
             .replace("$LABELSDEVICE$", r"(?:labels = labels\.to\([^\)]{1,}\))?")
             .replace(
@@ -3492,7 +3826,7 @@ def apply_fused_lm_head(forward, module=None):
             r"shift_logits\.view\(-1, shift_logits\.size\(-1\)\), "
             r"shift_labels\.view\(-1\)\)$",
             lambda m: (
-                f"{m.group(1)}shift_logits = shift_logits.view(-1, self.config.text_config.vocab_size)\n"
+                f"{m.group(1)}shift_logits = shift_logits.view(-1, shift_logits.size(-1))\n"
                 f"{m.group(1)}shift_labels = shift_labels.view(-1)\n"
                 f"{m.group(1)}shift_labels = shift_labels.to(shift_logits.device)\n"
                 f"{m.group(1)}loss = loss_fct(shift_logits, shift_labels)"
@@ -3532,6 +3866,10 @@ def apply_fused_lm_head(forward, module=None):
                     f"(4) Unsloth skipping patching fast linear cross entropy for {module}"
                 )
             continue
+        if "CrossEntropyLoss" in cross_entropy_find and not (
+            _CE_TAIL_VIEW.search(forward) and _CE_TAIL_CALL.search(forward)
+        ):
+            continue
         try:
             finder = regex.findall(
                 cross_entropy_find,
@@ -3539,6 +3877,12 @@ def apply_fused_lm_head(forward, module=None):
                 flags=regex.DOTALL | regex.MULTILINE,
                 timeout=1,
             )
+        except TimeoutError:
+            if UNSLOTH_ENABLE_LOGGING:
+                print(
+                    f"Unsloth: fast linear cross entropy pattern {jj + 1}/3 timed out for {module}"
+                )
+            continue
         except Exception as e:
             if UNSLOTH_ENABLE_LOGGING:
                 print(
@@ -3559,6 +3903,31 @@ def apply_fused_lm_head(forward, module=None):
             spaces = finder[0][3]
         replacement = cross_entropy_replacement.strip().split("\n")
         replacement = "\n".join((len(spaces) - 4) * " " + x for x in replacement)
+        # A consumed `logits = logits.float()` (transformers 4.x Granite MoE) must still reach the
+        # unfused loss_function calls, which also return those logits.
+        try:
+            matched = regex.search(
+                cross_entropy_find, forward, flags = regex.DOTALL | regex.MULTILINE, timeout = 1,
+            )
+        except Exception:
+            continue
+        if matched is None:
+            continue
+        # Labels-block statements after the loss call only reach the unfused `else` (Bamba z-loss).
+        guard = _labels_block_tail(forward, matched.end(), len(spaces))
+        guard = None if guard is None else _tail_guard(guard)
+        if guard is None or (guard[0] and r"loss\_function" not in cross_entropy_find):
+            continue
+        if guard[0]:
+            replacement = _guard_loss_function_replacement(replacement, *guard)
+        if r"loss\_function" in cross_entropy_find:
+            if "logits = logits.float()" in matched.group(0):
+                replacement = re.sub(
+                    r"^([ \t]*)(loss = self\.loss_function\()",
+                    r"\1logits = logits.float()\n\1\2",
+                    replacement,
+                    flags = re.MULTILINE,
+                )
         if "slice_indices" in forward:
             replacement = (
                 "logits = self.lm_head(hidden_states[:, slice_indices, :]) if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1' else EMPTY_LOGITS\n"
@@ -3600,14 +3969,20 @@ def apply_fused_lm_head(forward, module=None):
             "vocab_size = (",
             forward,
         )
-        # Fix , **
-        forward = forward.replace(", **)", ")")
-        forward = forward.replace(",**)", ")")
-        forward = forward.replace(",** )", ")")
+        # Stock call took no kwargs: the fallbacks get the count too, but only for a loss that accepts it.
+        forward = forward.replace(
+            ", **__UNSLOTH_NON_CAUSAL__)",
+            ", **unsloth_loss_count_kwargs(self.loss_function, n_items))",
+        )
+        forward = forward.replace("__UNSLOTH_NON_CAUSAL__)", ")")
+        forward = forward.replace(", **)", ", **unsloth_loss_count_kwargs(self.loss_function, n_items))")
+        forward = forward.replace(",**)", ", **unsloth_loss_count_kwargs(self.loss_function, n_items))")
+        forward = forward.replace(",** )", ", **unsloth_loss_count_kwargs(self.loss_function, n_items))")
+        forward = _place_training_stance(forward)
         # print(forward)
         return forward, True
     pass
-    return forward, False
+    return original_forward, False
 
 
 pass
@@ -3625,6 +4000,9 @@ def test_apply_fused_lm_head():
     from transformers.models.granite.modeling_granite import GraniteForCausalLM
 
     forwards.append(GraniteForCausalLM)
+    from transformers.models.granitemoehybrid.modeling_granitemoehybrid import GraniteMoeHybridForCausalLM
+
+    forwards.append(GraniteMoeHybridForCausalLM)
     from transformers.models.gemma2.modeling_gemma2 import Gemma2ForCausalLM
 
     forwards.append(Gemma2ForCausalLM)
@@ -4346,12 +4724,22 @@ pass
 COMPILED_LORA_FORWARD = """
 torch_addmm = torch.addmm
 torch_add   = torch.add
+torch_is_compiling = torch.compiler.is_compiling
+# torch 2.8 / 2.9 inductor miscompiles addmm(alpha = scaling, beta = 1) traced inside a
+# compiled block (e.g. the VLM decoder MLP), forward and backward; fixed in 2.10 (unsloth#3271).
+torch_lora_no_compiled_addmm = tuple(int(v) for v in torch.__version__.split(".")[:2]) < (2, 10)
 # @torch.compile(fullgraph = False, dynamic = True, options = torch_compile_options)
 def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
     # Use result.dtype (bfloat16 from base layer) since x may have been cast to float32
     # by _cast_input_dtype when autocast is disabled
     target_dtype = result.dtype
     xA = dropout(x).to(target_dtype) @ lora_A.weight.to(target_dtype).t()
+    if torch_lora_no_compiled_addmm and torch_is_compiling():
+        output = result + scaling * (xA @ lora_B.weight.to(target_dtype).t())
+        bias = lora_B.bias
+        if bias is not None:
+            output = output + scaling * bias.to(target_dtype)
+        return output
     # output = result + scaling * xA @ lora_B.weight.t()
     shape = result.shape
     output = torch_addmm(
@@ -4378,6 +4766,9 @@ COMPILED_LORA_FORWARD_forced_float32 = """
 torch_addmm = torch.addmm
 torch_add   = torch.add
 torch_float16 = torch.float16
+torch_is_compiling = torch.compiler.is_compiling
+# See COMPILED_LORA_FORWARD (unsloth#3271).
+torch_lora_no_compiled_addmm = tuple(int(v) for v in torch.__version__.split(".")[:2]) < (2, 10)
 # @torch.compile(fullgraph = False, dynamic = True, options = torch_compile_options)
 def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
     xA = dropout(x.to(torch_float16)) @ lora_A.weight.to(torch_float16).t()
@@ -4386,6 +4777,12 @@ def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
     # 66795) overflows if rounded to float16 here. Float16 results take the same kernel.
     shape = result.shape
     result_dtype = result.dtype
+    if torch_lora_no_compiled_addmm and torch_is_compiling():
+        output = result + scaling * (xA.to(result_dtype) @ lora_B.weight.to(result_dtype).t())
+        bias = lora_B.bias
+        if bias is not None:
+            output = output + scaling * bias.to(result_dtype)
+        return output
     output = torch_addmm(
         result.view(-1, shape[-1]),
         xA.view(-1, xA.shape[-1]).to(result_dtype),
@@ -4757,6 +5154,95 @@ pass
 _DROPPED_TEXT_LOGIT_SCALE = ("AyaVisionForConditionalGeneration",)
 
 
+def _ast_fused_lm_head_fallback(source, module = None, module_class = None):
+    """Spliced AST rewrite of a forward the regex patterns did not fuse, else None."""
+    if "unsloth_fused_lm_head_loss" in source or "EMPTY_LOGITS" in source:
+        return None  # already rewritten by the import hook
+    try:
+        from unsloth_zoo.fused_losses.ast_rewriter import rewrite_forward_source_spliced
+        new_source, cap = rewrite_forward_source_spliced(source)
+    except Exception as e:
+        if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
+            print(f"Unsloth: AST fused lm_head fallback failed for {module}: {e}")
+        return None
+    # The fused loss reads `.weight` / `.bias`: same head rule as the import hook.
+    from unsloth_zoo.fused_losses.forward_install import _LINEAR_HEAD_ATTRS, _head_built_as_linear
+    if new_source is None or cap.head_attr not in _LINEAR_HEAD_ATTRS:
+        return None
+    # Other head names only where the hook takes them or with a proven aligned token CE (Whisper, TrOCR).
+    if cap.head_attr != "lm_head" and not str(module).endswith("ForCausalLM") and not cap.aligned_target:
+        return None
+    if module_class is not None and not _head_built_as_linear(module_class, cap.head_attr):
+        return None
+    if cap.aligned or cap.aligned_target:
+        _mark_counts_unshifted_labels(module_class)
+    return new_source
+
+
+def _mark_counts_unshifted_labels(module_class):
+    if module_class is None:
+        return
+    try:
+        module_class._unsloth_counts_unshifted_labels = True
+    except Exception:
+        pass
+
+
+def _count_aware_ce_fallback(source, module = None, module_class = None):
+    """A forward no fused route took whose own mean token CE becomes count-aware, else None."""
+    if "unsloth_fused_lm_head_loss" in source or "unsloth_count_aware_cross_entropy" in source:
+        return None
+    try:
+        from unsloth_zoo.fused_losses.ast_rewriter import rewrite_count_aware_ce_spliced
+        new_source, shifted = rewrite_count_aware_ce_spliced(source)
+    except Exception as e:
+        if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
+            print(f"Unsloth: count aware cross entropy rewrite failed for {module}: {e}")
+        return None
+    if new_source is None:
+        return None
+    # A term the aux rewrite cannot weight would get G times its weight once Trainer stops dividing.
+    from unsloth_zoo.fused_losses.aux_loss import rewrite_aux_loss_ga, unscaled_extra_loss_terms
+    new_source = rewrite_aux_loss_ga(new_source)
+    if unscaled_extra_loss_terms(new_source):
+        return None
+    if not shifted:
+        _mark_counts_unshifted_labels(module_class)
+    return new_source
+
+
+def fused_lm_head_forward(module, module_class, modeling_module_name, source):
+    """Fused-CE rewrite of one forward: (new_source, "regex" | "ast" | None, supports_return_hidden_states)."""
+    # Fix some arguments up like for Gemma 3N
+    new_source = fixup_fused_lm_head(source)
+    new_source = fixup_dropped_logit_scale(new_source, module)
+    # Fused CE reads lm_head.weight, which Roberta-style composite heads lack.
+    from unsloth_zoo.fused_losses.forward_install import _head_built_as_linear
+    # Only classes defined here: an imported one (4.x Blenderbot) lacks its base classes.
+    defined_here = getattr(module_class, "__module__", None) == modeling_module_name
+    if not _head_built_as_linear(module_class, "lm_head"):
+        count_source = _count_aware_ce_fallback(new_source, module, module_class) if defined_here else None
+        if count_source is not None:
+            from unsloth_zoo.fused_losses.aux_loss import rewrite_aux_loss_ga
+            return rewrite_aux_loss_ga(count_source), "count", False
+        return new_source, None, False
+    fused_source, supports_return_hidden_states = apply_fused_lm_head(new_source, module)
+    route = "regex" if supports_return_hidden_states else None
+    if not supports_return_hidden_states and defined_here:
+        # AST fallback has no UNSLOTH_RETURN_HIDDEN_STATES branch: GRPO keeps its wrapper.
+        ast_source = _ast_fused_lm_head_fallback(new_source, module, module_class)
+        if ast_source is not None:
+            fused_source, route = ast_source, "ast"
+        else:
+            count_source = _count_aware_ce_fallback(new_source, module, module_class)
+            if count_source is not None:
+                fused_source, route = count_source, "count"
+    if route is not None:
+        from unsloth_zoo.fused_losses.aux_loss import rewrite_aux_loss_ga
+        fused_source = rewrite_aux_loss_ga(fused_source)
+    return fused_source, route, supports_return_hidden_states
+
+
 def fixup_dropped_logit_scale(source, module = None):
     if module not in _DROPPED_TEXT_LOGIT_SCALE or "logit_scale" in source:
         return source
@@ -5072,10 +5558,10 @@ DISABLE_COMPILE_MODULES = [
     "Gemma4VisionEncoder",
     "Gemma4VisionEncoderLayer",
     "Gemma4MultimodalEmbedder",
-    # DeepSeek-V4 hyper-connection mixers: Inductor's fused backward of their
-    # Sinkhorn-Knopp division chain overflows to inf; tiny modules, so eager is cheap.
+    # DeepSeek-V4 mixers: HyperConnection leaves via MODULE_FORWARD_SOURCE_REWRITES (#859 saw inf grads compiled).
     "DeepseekV4HyperConnection",
     "DeepseekV4HyperHead",
+    "DeepseekV41HyperConnection",
 ]
 
 FIX_GC_LAYER_CALLER_MODULES = [
@@ -5442,6 +5928,7 @@ def unsloth_compile_transformers(
     disable_compile_functions.update(DISABLE_COMPILE_MODEL_FUNCTIONS.get(model_type, ()))
     function_source_rewrites = model_function_source_rewrites(modeling_file, model_type)
     disable_compile_functions.difference_update(function_source_rewrites)
+    module_forward_rewrites = module_forward_source_rewrites(modeling_file, model_type)
 
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__"):
         # Get __UNSLOTH_SUPPORTS_SDPA__
@@ -6077,7 +6564,9 @@ def unsloth_compile_transformers(
         pass
 
         # if more modules need to be disabled consider adding to a global list
-        if any([module.endswith(x) for x in DISABLE_COMPILE_MODULES]):
+        if module not in module_forward_rewrites and any(
+            [module.endswith(x) for x in DISABLE_COMPILE_MODULES]
+        ):
             print(
                 f"Unsloth: Disabling compile for {module} since it's marked for disabling."
             )
@@ -6114,7 +6603,9 @@ def unsloth_compile_transformers(
 
     if len(pretrained_modules) > 0:
         for module in pretrained_modules:
-            if any([module.endswith(x) for x in DISABLE_COMPILE_MODULES]):
+            if module not in module_forward_rewrites and any(
+                [module.endswith(x) for x in DISABLE_COMPILE_MODULES]
+            ):
                 print(
                     f"Unsloth: Disabling compile for {module} since it's marked for disabling."
                 )
@@ -6151,6 +6642,7 @@ def unsloth_compile_transformers(
                     functions,
                     fullgraph=False if module in no_fullgraph_modules else fullgraph,
                     disable=disable,
+                    forward_source=module_forward_rewrites.get(module),
                 )
                 print(f"Unsloth: Compiled module {module}.")
                 all_standalone_classes[module] = new_module
@@ -6258,12 +6750,8 @@ def unsloth_compile_transformers(
                     source = inspect.getsource(module_class.forward)
                 except:
                     continue
-                # Fix some arguments up like for Gemma 3N
-                new_source = fixup_fused_lm_head(source)
-                new_source = fixup_dropped_logit_scale(new_source, module)
-                # Apply fused LM transforms
-                new_source, supports_return_hidden_states = apply_fused_lm_head(
-                    new_source, module
+                new_source, _, supports_return_hidden_states = fused_lm_head_forward(
+                    module, module_class, modeling_file.__name__, source,
                 )
                 # print(new_source)
                 new_source = apply_mask_attention_mask_out(new_source)
@@ -6386,13 +6874,23 @@ def unsloth_compile_transformers(
             # MOE routing weights cast fix takes effect in v5
             new_source, new_methods = patch_moe_routing_weights_cast(module_cls, source)
             if new_source != source or len(new_methods) > 0:
+                # Disabled, the router breaks the compiled MoE block around it (Ernie 4.5, Laguna).
+                compile_router = (
+                    compile_custom_modules
+                    and module in torch_modules
+                    and module not in bad_torch_modules
+                )
                 try:
                     new_module = create_standalone_class(
                         module,
                         model_location,
                         functions,
-                        fullgraph=False,
-                        disable=True,
+                        fullgraph=(
+                            compile_router
+                            and module not in no_fullgraph_modules
+                            and torch_modules[module]
+                        ),
+                        disable=disable if compile_router else True,
                         forward_source=new_source,
                         new_methods=new_methods,
                     )
@@ -6584,7 +7082,7 @@ def unsloth_compile_transformers(
             _mask_builders = calls_mask_creation_function(parameters)
             if module in disable_compile_functions:
                 parameters = (
-                    "@torch.compiler.disable(recursive = False)\n"
+                    "@torch_compiler_disable_unless_decode\n"
                     + parameters
                 )
             elif len(_mask_builders) != 0:
@@ -6669,6 +7167,9 @@ def unsloth_compile_transformers(
                 if not function_has_tensor_inputs(source):
                     bad = True
                     bad_reason = "it takes no tensor inputs"
+                elif function_only_called_at_init(full_source, module):
+                    bad = True
+                    bad_reason = "it is only called while constructing modules"
             pass
             if not bad:
                 # Functions defined inside an if/else come back indented
@@ -6679,11 +7180,11 @@ def unsloth_compile_transformers(
                 if module in disable_compile_functions:
                     source = re.sub(
                         r"@torch.compile\([^\n]*\)\n",
-                        "@torch.compiler.disable(recursive = False)\n",
+                        "@torch_compiler_disable_unless_decode\n",
                         source,
                     )
-                    if "@torch.compiler.disable(recursive = False)\n" not in source:
-                        source = "@torch.compiler.disable(recursive = False)\n" + source
+                    if "@torch_compiler_disable_unless_decode\n" not in source:
+                        source = "@torch_compiler_disable_unless_decode\n" + source
                 elif not disable:
                     _fullgraph = UNSLOTH_FULLGRAPH and not calls_disable_compile_function(
                         source, disable_compile_functions
@@ -6720,6 +7221,14 @@ def unsloth_compile_transformers(
             all_standalone_classes[module] = new_source
         pass
     pass
+
+    # torch modules were dropped from the import list because a standalone copy was expected. One whose copy
+    # failed (e.g. a forward replaced by a temporary patch whose source the rewriter cannot parse, as
+    # Qwen3MoeRMSNorm under the float16 FORCE_FLOAT32 patches on transformers 4.x) would be neither defined
+    # nor imported, and the first class that builds it raised NameError. Import the (patched) original.
+    for module in torch_modules:
+        if module not in all_standalone_classes and module not in functions and hasattr(modeling_file, module):
+            functions.append(module)
 
     # Order all components
     final_all_standalone_classes = []
@@ -6769,6 +7278,13 @@ def unsloth_compile_transformers(
     replacement_classes = {}
     for module in all_standalone_classes.keys():
         try:
+            # The compiled replacement class must keep the counting convention the rewrite marked.
+            original = getattr(modeling_file, module, None)
+            if getattr(original, "_unsloth_counts_unshifted_labels", False) is True:
+                _mark_counts_unshifted_labels(getattr(combined_module, module, None))
+        except Exception:
+            pass
+        try:
             exec(
                 f"{model_location}.{module} = combined_module.{module}",
                 globals(),
@@ -6790,10 +7306,11 @@ def unsloth_compile_transformers(
             continue
 
         for key, value in item.items():
-            value = str(value)
+            # Exact name: a substring swapped JambaAttentionDecoderLayer for JambaAttention.
+            value = getattr(value, "__name__", None) if isinstance(value, type) else None
             found = False
             for replaced_class in replaced_classes:
-                if replaced_class in value:
+                if replaced_class == value:
                     try:
                         exec(
                             f"{model_location}.{check}['{key}'] = combined_module.{replaced_class}",

@@ -379,6 +379,7 @@ def kda_gate_chunk_cumsum_vector_kernel(
     HAS_SCALE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
+    LONG_INDEXING: tl.constexpr = False,
 ):
     i_s, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
@@ -388,6 +389,8 @@ def kda_gate_chunk_cumsum_vector_kernel(
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
+    if LONG_INDEXING:
+        bos = bos.to(tl.int64)
 
     p_s = tl.make_block_ptr(s + (bos * H + i_h) * S, (T, S), (H*S, 1), (i_t * BT, i_s * BS), (BT, BS), (1, 0))
     p_o = tl.make_block_ptr(o + (bos * H + i_h) * S, (T, S), (H*S, 1), (i_t * BT, i_s * BS), (BT, BS), (1, 0))
@@ -457,5 +460,6 @@ def kda_gate_chunk_cumsum(
         S=S,
         BT=BT,
         REVERSE=False,
+        LONG_INDEXING=B * T * H * S > 2**31,
     )
     return g

@@ -229,7 +229,7 @@ def test_synthetic_data_dependent_helper_is_disabled_and_its_callers_demoted(tmp
     decorators = _decorators(generated)
     context = "\n--- compiler log ---\n" + payload["log"]
 
-    assert "torch.compiler.disable(recursive = False)" in decorators.get(
+    assert "torch_compiler_disable_unless_decode" in decorators.get(
         "synthetic_item_helper", ""
     ), (
         "synthetic_item_helper calls lengths.max().item(); emitting it fullgraph = True "
@@ -317,7 +317,7 @@ def test_qwen3_omni_audio_helpers_are_not_fullgraph(tmp_path):
     context = "\n--- compiler log ---\n" + payload["log"]
 
     for name in _QWEN3_OMNI_HELPERS:
-        assert "torch.compiler.disable(recursive = False)" in decorators.get(name, ""), (
+        assert "torch_compiler_disable_unless_decode" in decorators.get(name, ""), (
             f"{name} pulls tensor data into Python (.tolist() / .item() / .nonzero()) "
             f"but was emitted as:\n{decorators.get(name, '<not emitted>')}" + context
         )

@@ -26,7 +26,7 @@ import time
 from typing import Any, Optional, List, Dict, Tuple
 from .utils import _get_dtype, Version
 from .hf_utils import dtype_from_config
-from .device_type import DEVICE_TYPE
+from .device_type import DEVICE_TYPE, DEVICE_TYPE_TORCH
 from .gradient_checkpointing import (
     unpatch_unsloth_gradient_checkpointing,
     unpatch_unsloth_smart_gradient_checkpointing,
@@ -408,7 +408,12 @@ def prepare_model_for_training(
         _keep_param_dtype = False
         _is_norm = _is_norm_parameter(original_name, param)
         if not full_finetuning:
-            if ".lora_A." in name or ".lora_B." in name or ".lora_magnitude_vector" in name:
+            # nn.Embedding LoRA is lora_embedding_A/B; omitting it silently freezes it.
+            if (".lora_A." in name
+                    or ".lora_B." in name
+                    or ".lora_embedding_A." in name
+                    or ".lora_embedding_B." in name
+                    or ".lora_magnitude_vector" in name):
                 upcast = True
                 requires_grad = True
             elif (_is_peft_model and "bias" in name and param.requires_grad
@@ -672,7 +677,7 @@ def unsloth_train(trainer):
     #     .to(device = "cuda:0", non_blocking = True)[0]
 
     # Mixed precision scaling
-    _amp_device = "npu" if DEVICE_TYPE == "npu" else "cuda"
+    _amp_device = DEVICE_TYPE_TORCH if DEVICE_TYPE in ("xpu", "npu") else "cuda"
     torch_version = torch.__version__
     config_dtype = dtype_from_config(model.config)
     if config_dtype == torch.float16:

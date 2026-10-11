@@ -34,11 +34,8 @@ def _is_float8_tensor(tensor: Optional[torch.Tensor]) -> bool:
 
 
 def _get_fp8_dequant_target_dtype(hidden_states: torch.Tensor) -> torch.dtype:
-    if hidden_states.dtype in (torch.float32, torch.float16, torch.bfloat16):
-        return hidden_states.dtype
-    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-        return torch.bfloat16
-    return torch.float16
+    from .moe_utils import moe_compute_dtype
+    return moe_compute_dtype(hidden_states)
 
 
 def _log_moe_fp8_backend_once(experts_module, message: str):
@@ -866,7 +863,10 @@ def _forward_native_fp8_expert_loop(self, hidden_states, top_k_index, top_k_weig
         elif _is_float8_tensor(expert_gate_up):
             target_dtype = _get_fp8_dequant_target_dtype(current_state)
             expert_dequant = _dequantize_expert_slice(expert_gate_up, gate_up_qstate, target_dtype)
-            gate_up_out = F.linear(current_state, expert_dequant, gate_up_bias_expert)
+            gate_up_out = F.linear(
+                current_state.to(target_dtype), expert_dequant,
+                None if gate_up_bias_expert is None else gate_up_bias_expert.to(target_dtype),
+            )
         else:
             gate_up_out = F.linear(current_state, expert_gate_up, gate_up_bias_expert)
 
@@ -900,7 +900,10 @@ def _forward_native_fp8_expert_loop(self, hidden_states, top_k_index, top_k_weig
         elif _is_float8_tensor(expert_down):
             target_dtype = _get_fp8_dequant_target_dtype(current_hidden_states)
             expert_dequant = _dequantize_expert_slice(expert_down, down_qstate, target_dtype)
-            current_hidden_states = F.linear(current_hidden_states, expert_dequant, down_bias_expert)
+            current_hidden_states = F.linear(
+                current_hidden_states.to(target_dtype), expert_dequant,
+                None if down_bias_expert is None else down_bias_expert.to(target_dtype),
+            )
         else:
             current_hidden_states = F.linear(current_hidden_states, expert_down, down_bias_expert)
 
@@ -985,7 +988,7 @@ def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
             _log_moe_fp8_backend_once(self, "Unsloth: MoE FP8 is using dequantize-plus-native_torch loop.")
             forward_fn = forward_native_moe_loop
 
-        return swap_moe_weights_for_call(
+        output = swap_moe_weights_for_call(
             self,
             gate_up_weight,
             down_weight,
@@ -994,6 +997,10 @@ def forward_moe_backend_fp8(self, hidden_states, top_k_index, top_k_weights):
             top_k_index,
             top_k_weights,
         )
+        # Caller's dtype back, as the eager experts' index_add_ into zeros_like(hidden_states).
+        if isinstance(output, torch.Tensor) and output.dtype != hidden_states.dtype:
+            output = output.to(hidden_states.dtype)
+        return output
 
     # 3. Last resort: per-expert fp8_linear loop
     _log_moe_fp8_backend_once(

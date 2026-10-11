@@ -125,8 +125,20 @@ def chunked_hidden_states_selective_log_softmax(
         chunks = max(chunks, -(-n_rows // max_rows_per_chunk))
         chunks = min(chunks, max(n_rows, 1))
 
-    chunked_hidden_states = torch.chunk(flat_hidden_states, chunks=chunks, dim=0)
-    chunked_index = torch.chunk(flat_index, chunks=chunks, dim=0)
+    # A one-row chunk's head gradient is a K=1 matmul Inductor mis-lowers under dynamic shapes (illegal
+    # memory access or NaN head gradients, torch 2.13), so keep chunks at 2+ rows when the head trains.
+    lm_head_grad = torch.is_grad_enabled() and lm_head.requires_grad
+    if lm_head_grad and chunks >= flat_hidden_states.shape[0]:
+        chunks = max(flat_hidden_states.shape[0] // 2, 1)
+
+    chunked_hidden_states = list(torch.chunk(flat_hidden_states, chunks=chunks, dim=0))
+    chunked_index = list(torch.chunk(flat_index, chunks=chunks, dim=0))
+    if lm_head_grad and len(chunked_hidden_states) > 1 and chunked_hidden_states[-1].shape[0] == 1:
+        # Re-split with the previous chunk: max_rows_per_chunk then only breaks for a cap of 2 over odd rows.
+        for chunked in (chunked_hidden_states, chunked_index):
+            pair = torch.cat(chunked[-2:])
+            half = (pair.shape[0] + 1) // 2
+            chunked[-2:] = [pair[:half], pair[half:]] if pair.shape[0] >= 4 else [pair]
 
     all_per_token_logps = []
 
@@ -643,13 +655,15 @@ def grpo_compute_loss(
     if loss_type in ["grpo", "sapo"]:
         loss = ((loss_i * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)).mean()
         loss = loss / current_gradient_accumulation_steps
-    elif loss_type == "bnpo":
+    elif loss_type == "bnpo" and num_items_in_batch is None:
+        # TRL < 0.22 passes no global token count: per micro-batch, so the loss depends on how the batch is split.
         loss = (loss_i * mask).sum() / mask.sum().clamp(min=1.0)
         loss = loss / current_gradient_accumulation_steps
     elif loss_type == "dr_grpo":
         loss = (loss_i * mask).sum() / (loss_i.size(0) * max_completion_length)
         loss = loss / current_gradient_accumulation_steps
-    elif loss_type in ["cispo", "dapo", "vespo"]:
+    elif loss_type in ["bnpo", "cispo", "dapo", "vespo"]:
+        # bnpo too: a per micro-batch token mean changes with the GPU / accumulation split, the global count does not.
         # Floor at 1 like TRL: a fully masked batch (mask_truncated_completions) is 0/0 = nan otherwise.
         if torch.is_tensor(num_items_in_batch):
             normalizer = num_items_in_batch.clamp(min = 1.0) / num_processes
@@ -933,6 +947,11 @@ GRPO_VISION_KEYS = (
     "num_images",
     "token_type_ids",
     "mm_token_type_ids",
+    # Qwen2-VL style video: patch rows by video, one grid row (and Qwen2.5-VL time step) per video.
+    "pixel_values_videos",
+    "video_grid_thw",
+    "second_per_grid_ts",
+    "num_videos",
 )
 
 
@@ -1189,6 +1208,25 @@ def grpo_vision_chunks(vision, total_samples, batch_size):
 
     total_images = None if num_images is None else sum(num_images)
 
+    pixel_values_videos = vision.get("pixel_values_videos", None)
+    video_grid_thw = vision.get("video_grid_thw", None)
+    second_per_grid_ts = vision.get("second_per_grid_ts", None)
+    num_videos = _as_int_list(vision.get("num_videos", None))
+    if num_videos is not None and len(num_videos) != total_samples:
+        num_videos = None
+    cum_videos = cum_video_rows = None
+    if pixel_values_videos is not None and video_grid_thw is not None:
+        if num_videos is None or sum(num_videos) != video_grid_thw.shape[0]:
+            raise ValueError(
+                "Unsloth: GRPO cannot tell which sample each video belongs to: "
+                f"{video_grid_thw.shape[0]} videos over {total_samples} samples and no matching num_videos."
+            )
+        cum_videos = torch.tensor([0] + num_videos).cumsum(0)
+        cum_video_rows = torch.cat([
+            torch.zeros(1, dtype = torch.long),
+            video_grid_thw.prod(dim = -1).cumsum(0).cpu(),
+        ])
+
     def _row_axis_is_images(value, flat_ndim):
         """Whether this tensor's first dimension counts IMAGES rather than samples.
 
@@ -1254,6 +1292,16 @@ def grpo_vision_chunks(vision, total_samples, batch_size):
         img_start = img_end = None
         if cum_imgs is not None:
             img_start, img_end = int(cum_imgs[start]), int(cum_imgs[end])
+        vid_start = vid_end = 0
+        if cum_videos is not None:
+            vid_start, vid_end = int(cum_videos[start]), int(cum_videos[end])
+        if vid_end > vid_start:
+            chunk["pixel_values_videos"] = pixel_values_videos[
+                int(cum_video_rows[vid_start]) : int(cum_video_rows[vid_end])
+            ]
+            chunk["video_grid_thw"] = video_grid_thw[vid_start:vid_end]
+            if second_per_grid_ts is not None:
+                chunk["second_per_grid_ts"] = second_per_grid_ts[vid_start:vid_end]
 
         if pixel_values is None:
             if image_sizes is not None:
@@ -1370,6 +1418,11 @@ def grpo_accumulated_loss(
     vision_inputs = _grpo_get_vision_inputs(kwargs)
     pixel_values = vision_inputs.get('pixel_values', None)
     image_grid_thw = vision_inputs.get('image_grid_thw', None)
+    video_grid_thw = vision_inputs.get('video_grid_thw', None)
+    if pixel_values is None:
+        # Only a sentinel below (the chunks carry the tensors): video rows must take the vision
+        # path too, since left and sequence packing move M-RoPE video positions.
+        pixel_values = vision_inputs.get('pixel_values_videos', None)
     # Released unsloth 2026.9.4 decides whether multi-image GRPO is supported by grepping
     # inspect.getsource(grpo_accumulated_loss) for "num_images", so moving the handling into
     # grpo_vision_chunks makes that probe answer no and raise "Please upgrade unsloth_zoo" at
@@ -1379,7 +1432,7 @@ def grpo_accumulated_loss(
     # Transformers 5.x requires token_type_ids/mm_token_type_ids for some vision models
     token_type_ids = vision_inputs.get('token_type_ids', None)
     mm_token_type_ids = vision_inputs.get('mm_token_type_ids', None)
-    if mm_token_type_ids is not None or image_grid_thw is not None:
+    if mm_token_type_ids is not None or image_grid_thw is not None or video_grid_thw is not None:
         mm_token_type_ids = _unsloth_fix_mm_token_type_ids(
             trainer.processing_class, input_ids, mm_token_type_ids
         )
@@ -1481,7 +1534,9 @@ def grpo_accumulated_loss(
         kwargs["vllm_importance_sampling_clip_max"] = kwargs["vllm_importance_sampling_cap"]
 
     if not hasattr(trainer, '_autocast_dtype'):
-        trainer._autocast_dtype = torch.float16 if os.environ.get('ACCELERATE_MIXED_PRECISION', 'fp16') == 'fp16' else torch.bfloat16
+        # "no" is float32 training (a T4 / V100 without bfloat16): autocasting it to bfloat16 raises there.
+        _mixed_precision = os.environ.get('ACCELERATE_MIXED_PRECISION', 'fp16')
+        trainer._autocast_dtype = None if _mixed_precision == 'no' else (torch.float16 if _mixed_precision == 'fp16' else torch.bfloat16)
         if os.environ.get('UNSLOTH_FORCE_FLOAT32', '0') == '1': trainer._autocast_dtype = None
     pass
     # Restored in `finally`: an OOM or interrupt below must not leave later forwards returning hidden states.
@@ -1489,7 +1544,9 @@ def grpo_accumulated_loss(
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
     try:
         lm_head = trainer.model.get_output_embeddings().weight
-        dtype_bytes = 16 if trainer._autocast_dtype in [torch.float16, torch.bfloat16] else 32
+        # Unsloth keeps _autocast_dtype set when it turns autocast off (float32 training on a GPU without bfloat16).
+        _autocast_on = trainer._autocast_dtype is not None and getattr(trainer, "_autocast_enabled", True)
+        dtype_bytes = 16 if _autocast_on and trainer._autocast_dtype in [torch.float16, torch.bfloat16] else 32
 
         total_rows = input_ids.shape[0]
         seq_len = input_ids.shape[1]
@@ -1589,7 +1646,7 @@ def grpo_accumulated_loss(
         # not the one that actually runs in production.
         from contextlib import nullcontext
 
-        if trainer._autocast_dtype is None:
+        if not _autocast_on:
             autocaster = nullcontext()
         else:
             autocaster = torch.amp.autocast(device_type = trainer.model.device.type, dtype = trainer._autocast_dtype)
@@ -2008,6 +2065,13 @@ def grpo_accumulated_loss(
                 detached_hidden_states = hidden_states.detach().contiguous()
                 ctx.device = hidden_states.device
                 ctx.copy_event = None
+                # Backward runs outside autocast; recompute must match forward (torch.utils.checkpoint does the same).
+                ctx.autocast_kwargs = dict(
+                    device_type = lm_head.device.type,
+                    enabled = torch.is_autocast_enabled(lm_head.device.type),
+                    dtype = torch.get_autocast_dtype(lm_head.device.type),
+                    cache_enabled = torch.is_autocast_cache_enabled(),
+                )
 
                 # Always offload: this path only runs when the caller is already memory bound
                 # (long completions / large batches), so the win is overlapping the copy.
@@ -2076,7 +2140,7 @@ def grpo_accumulated_loss(
                     lm_head = lm_head.detach().requires_grad_(True)
                 index = ctx.index
 
-                with torch.enable_grad():
+                with torch.enable_grad(), torch.autocast(**ctx.autocast_kwargs):
                     output = chunked_hidden_states_selective_log_softmax(
                         hidden_states, lm_head, index, *ctx.args
                     )

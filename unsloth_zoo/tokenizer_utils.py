@@ -21,6 +21,8 @@ except ImportError:
     # torch and they are never called on MLX, so keep the module importable so the
     # torch-free patch_tokenizer stays usable (e.g. get_chat_template on MLX).
     torch = None
+import copy
+import copyreg
 import functools
 import gc
 import inspect
@@ -683,6 +685,35 @@ def _is_conversation_format(text):
 pass
 
 
+def _patched_processor_reduce_ex(self, protocol):
+    # All Unsloth Zoo code licensed under LGPLv3
+    # Patched class is not importable by name, so pickle as the stock class (spawn workers, AsyncGRPO).
+    state = dict(self.__dict__)
+    state.pop("_unsloth_patched_call", None)
+    # copyreg.__newobj__ insists on the instance's own class; _reconstructor does not.
+    return (copyreg._reconstructor, (type(self)._unsloth_original_class, object, None), state)
+pass
+
+
+def _patched_processor_copy(self):
+    # All Unsloth Zoo code licensed under LGPLv3
+    # In-process copies keep the patched class (__reduce_ex__ would drop it).
+    new = type(self).__new__(type(self))
+    new.__dict__.update(self.__dict__)
+    return new
+pass
+
+
+def _patched_processor_deepcopy(self, memo):
+    # All Unsloth Zoo code licensed under LGPLv3
+    new = type(self).__new__(type(self))
+    memo[id(self)] = new
+    for key, value in self.__dict__.items():
+        new.__dict__[key] = copy.deepcopy(value, memo)
+    return new
+pass
+
+
 def patch_processor_call(processor):
     """
     Patch processor's __call__ to auto-apply the chat template when text is in
@@ -698,8 +729,21 @@ def patch_processor_call(processor):
         return processor
 
     original_call = processor.__class__.__call__
+    # Positional order differs per processor: Qwen3-Omni takes (text, images, ...).
+    try:
+        parameters = list(inspect.signature(original_call).parameters.values())[1:]
+    except (TypeError, ValueError):
+        parameters = []
+    text_index = next(
+        (i for i, p in enumerate(parameters)
+         if p.name == "text" and p.kind is p.POSITIONAL_OR_KEYWORD),
+        None,
+    )
 
-    def patched_call(self, images=None, text=None, videos=None, **kwargs):
+    def patched_call(self, *args, **kwargs):
+        args = list(args)
+        text_in_args = text_index is not None and text_index < len(args)
+        text = args[text_index] if text_in_args else kwargs.get("text")
         if text is not None and _is_conversation_format(text):
             add_generation_prompt = kwargs.pop("add_generation_prompt", True)
             text = self.apply_chat_template(
@@ -707,7 +751,11 @@ def patch_processor_call(processor):
                 tokenize=False,
                 add_generation_prompt=add_generation_prompt,
             )
-        return original_call(self, images=images, text=text, videos=videos, **kwargs)
+            if text_in_args:
+                args[text_index] = text
+            else:
+                kwargs["text"] = text
+        return original_call(self, *args, **kwargs)
 
     # Patch via a dynamic subclass reusing the original class name so
     # save_pretrained writes the correct processor_class (fixes issue #4085).
@@ -719,6 +767,10 @@ def patch_processor_call(processor):
             "__call__": patched_call,
             "__module__": original_class.__module__,
             "__qualname__": original_class.__qualname__,
+            "_unsloth_original_class": original_class,
+            "__reduce_ex__": _patched_processor_reduce_ex,
+            "__copy__": _patched_processor_copy,
+            "__deepcopy__": _patched_processor_deepcopy,
         }
     )
     processor.__class__ = patched_class

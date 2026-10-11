@@ -186,7 +186,7 @@ if Version(torch_version) < Version("2.4.0"):
     torch_amp_custom_fwd = torch.cuda.amp.custom_fwd
     torch_amp_custom_bwd = torch.cuda.amp.custom_bwd
 else:
-    _amp_device_type = "npu" if DEVICE_TYPE == "npu" else "cuda"
+    _amp_device_type = DEVICE_TYPE_TORCH if DEVICE_TYPE in ("xpu", "npu") else "cuda"
     torch_amp_custom_fwd = torch.amp.custom_fwd(device_type = _amp_device_type)
     torch_amp_custom_bwd = torch.amp.custom_bwd(device_type = _amp_device_type)
 pass
@@ -1342,6 +1342,7 @@ def unpatch_unsloth_smart_gradient_checkpointing():
         BUFFER_EVENTS_B = None
         NEXT_BUFFER_SLOT = None
         if DEVICE_TYPE == "npu": torch.npu.empty_cache()
+        elif DEVICE_TYPE == "xpu": torch.xpu.empty_cache()
         else: torch.cuda.empty_cache()
         gc.collect()
 
@@ -1462,6 +1463,7 @@ def reset_unsloth_gradient_checkpointing_buffers():
             pass
 
     if DEVICE_TYPE == "npu": torch.npu.empty_cache()
+    elif DEVICE_TYPE == "xpu": torch.xpu.empty_cache()
     else: torch.cuda.empty_cache()
     gc.collect()
 pass

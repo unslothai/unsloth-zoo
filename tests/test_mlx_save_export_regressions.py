@@ -2351,6 +2351,105 @@ def test_copy_source_sidecars_preserves_image_processor_metadata(tmp_path):
         assert not (dst / skipped).exists()
 
 
+def test_copy_source_sidecars_refuses_symlinks_leaving_the_model(tmp_path):
+    import unsloth_zoo.mlx.utils as mutils
+
+    secret = tmp_path / "secret.txt"
+    secret.write_text("private", encoding="utf-8")
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    dst.mkdir()
+    (src / "vocab.txt").write_text("vocab", encoding="utf-8")
+    (src / "leak.txt").symlink_to(secret)
+    (src / "inside.txt").symlink_to(src / "vocab.txt")
+
+    assert mutils._copy_source_sidecars(src, dst) == 2
+    assert not (dst / "leak.txt").exists()
+    assert (dst / "inside.txt").read_text(encoding="utf-8") == "vocab"
+
+
+def test_copy_source_sidecars_follows_hf_snapshot_blob_links(tmp_path):
+    import unsloth_zoo.mlx.utils as mutils
+
+    repo = tmp_path / "models--org--name"
+    blob = repo / "blobs" / "abc123"
+    blob.parent.mkdir(parents=True)
+    blob.write_text("template", encoding="utf-8")
+    snapshot = repo / "snapshots" / "sha"
+    snapshot.mkdir(parents=True)
+    (snapshot / "chat_template.jinja").symlink_to(blob)
+    dst = tmp_path / "dst"
+    dst.mkdir()
+
+    assert mutils._copy_source_sidecars(snapshot, dst) == 1
+    assert (dst / "chat_template.jinja").read_text(encoding="utf-8") == "template"
+
+
+def test_copy_source_sidecars_follows_shared_hf_blob_store(tmp_path):
+    # huggingface_hub >= 1.32: snapshot -> models--*/blobs/<etag> -> <cache>/blobs/<xx>/<hash>.
+    import unsloth_zoo.mlx.utils as mutils
+
+    shared = tmp_path / "blobs" / "91" / "91bf"
+    shared.parent.mkdir(parents=True)
+    shared.write_bytes(b"sentencepiece")
+    repo = tmp_path / "models--org--name"
+    (repo / "blobs").mkdir(parents=True)
+    (repo / "blobs" / "etag").symlink_to(shared)
+    snapshot = repo / "snapshots" / "sha"
+    snapshot.mkdir(parents=True)
+    (snapshot / "tokenizer.model").symlink_to(repo / "blobs" / "etag")
+    dst = tmp_path / "dst"
+    dst.mkdir()
+
+    assert mutils._copy_source_sidecars(snapshot, dst) == 1
+    assert (dst / "tokenizer.model").read_bytes() == b"sentencepiece"
+
+
+def test_a_config_symlink_out_of_the_model_is_not_recovered(tmp_path):
+    from unsloth_zoo.mlx.utils import _save_vlm_processor_assets
+
+    secret = tmp_path / "docker_config.json"
+    secret.write_text('{"auths": {"x": "SECRET"}}')
+    src = tmp_path / "model"
+    src.mkdir()
+    (src / "config.json").symlink_to(secret)
+    out = tmp_path / "out"
+    out.mkdir()
+
+    class _P:
+        def save_pretrained(self, directory):
+            Path(directory, "tokenizer_config.json").write_text("{}")
+
+    _save_vlm_processor_assets(_P(), out, (str(src),))
+    assert not (out / "config.json").exists()
+
+
+def test_a_config_override_dir_falls_back_to_the_snapshot_config(tmp_path):
+    # The VLM config override dir links unpatched files back to the snapshot.
+    from unsloth_zoo.mlx.utils import _save_vlm_processor_assets
+
+    repo = tmp_path / "models--org--name"
+    blobs = repo / "blobs"
+    blobs.mkdir(parents=True)
+    snapshot = repo / "snapshots" / "abc123"
+    snapshot.mkdir(parents=True)
+    (blobs / "deadbeef").write_text('{"model_type": "real"}')
+    (snapshot / "config.json").symlink_to(blobs / "deadbeef")
+    override = tmp_path / "unsloth_mlx_vlm_config_x"
+    override.mkdir()
+    (override / "config.json").symlink_to(snapshot / "config.json")
+    out = tmp_path / "out"
+    out.mkdir()
+
+    class _P:
+        def save_pretrained(self, directory):
+            Path(directory, "tokenizer_config.json").write_text("{}")
+
+    _save_vlm_processor_assets(_P(), out, (str(override), str(snapshot)))
+    assert (out / "config.json").read_text() == '{"model_type": "real"}'
+
+
 def test_copy_source_sidecars_ignores_non_directory_source(tmp_path):
     import unsloth_zoo.mlx.utils as mutils
 
@@ -3432,7 +3531,10 @@ def test_trusted_dir_handles_a_root_trusted_path(monkeypatch, tmp_path):
     # os.path.join(parent, "") keeps a root parent as "/" rather than "//", which
     # a bare parent + os.sep would produce and never match.
     home = tmp_path / ".unsloth"
-    assert _trusted(monkeypatch, tmp_path / "anywhere", home, env_value=os.sep) is True
+    folder = tmp_path / "anywhere"
+    # Drive-qualified on Windows: a bare "\\" never contains C:\...
+    root = os.path.splitdrive(str(folder))[0] + os.sep
+    assert _trusted(monkeypatch, folder, home, env_value=root) is True
 
 
 def test_trusted_dir_is_case_insensitive_on_windows_style_paths(monkeypatch):

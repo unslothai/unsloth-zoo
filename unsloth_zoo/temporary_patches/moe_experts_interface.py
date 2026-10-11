@@ -185,7 +185,8 @@ def _dense_experts_without_expert_lora(module) -> bool:
         param = params.get(name)
         if param is None:
             continue
-        if type(param) is not nn.Parameter or param.dtype not in _DENSE_STACK_DTYPES:
+        # A plain tensor is a stack folded as W + delta for this call (_fold_moe_lora_without_parametrization).
+        if type(param) not in (nn.Parameter, torch.Tensor) or param.dtype not in _DENSE_STACK_DTYPES:
             return False
         if state.get("_unsloth_lora_" + name) is not None:
             return False
@@ -193,8 +194,8 @@ def _dense_experts_without_expert_lora(module) -> bool:
     return found
 
 
-def _custom_gate_dense_standard(module) -> bool:
-    if getattr(module, "has_gate", True) is False or not _has_custom_gate(module):
+def _dense_standard_experts(module) -> bool:
+    if getattr(module, "has_gate", True) is False:
         return False
     params = module._parameters
     if any(
@@ -209,25 +210,25 @@ def _custom_gate_dense_standard(module) -> bool:
         return False
 
 
-def _custom_gate_with_expert_lora(module) -> bool:
+def _dense_standard_with_expert_lora(module) -> bool:
     state = module.__dict__
     if not any(state.get("_unsloth_lora_" + name) is not None for name in _EXPERT_STACK_NAMES):
         return False
-    return _custom_gate_dense_standard(module)
+    return _dense_standard_experts(module)
 
 
-def own_gate_route_reads_stash(module) -> bool:
+def interface_route_reads_stash(module) -> bool:
     if not hasattr(getattr(type(module), "forward", None), "__wrapped__"):
         return False
     config = getattr(module, "config", None)
     if getattr(config, "_experts_implementation", None) != UNSLOTH_EXPERTS_IMPLEMENTATION:
         return False
-    return _custom_gate_dense_standard(module)
+    return _dense_standard_experts(module)
 
 
-def _forward_own_gate_with_expert_lora(self, hidden_states, top_k_index, top_k_weights):
+def _forward_dense_with_expert_lora(self, hidden_states, top_k_index, top_k_weights):
     # Traced, unlike _unsloth_experts_dispatch: dense stacks have nothing dequantized for AOT autograd to save.
-    if not self.__dict__.get("_unsloth_own_apply_gate", False):
+    if not self.__dict__.get("_unsloth_own_apply_gate", False) and _has_custom_gate(self):
         self.__dict__["_unsloth_own_apply_gate"] = True
     moe_utils = _moe_utils_module()
     # The resolved backend, not get_forward_moe_backend(): its cache-file lookup (os.path) breaks the graph.
@@ -258,9 +259,9 @@ def unsloth_experts_forward(
         if _DECODING_DEPTH and _TRANSFORMERS_BATCHED_MM is not None and not torch.is_grad_enabled():
             return _TRANSFORMERS_BATCHED_MM(self, hidden_states, top_k_index, top_k_weights)
         return _TRANSFORMERS_GROUPED_MM(self, hidden_states, top_k_index, top_k_weights)
-    if _custom_gate_with_expert_lora(self):
-        # transformers' grouped_mm ignores the expert LoRA stash; the moe_utils backends apply it with the own gate.
-        return _forward_own_gate_with_expert_lora(self, hidden_states, top_k_index, top_k_weights)
+    if _dense_standard_with_expert_lora(self):
+        # transformers' grouped_mm ignores the expert LoRA stash; the moe_utils backends apply it (with any own gate).
+        return _forward_dense_with_expert_lora(self, hidden_states, top_k_index, top_k_weights)
     return _unsloth_experts_dispatch(self, hidden_states, top_k_index, top_k_weights)
 
 
@@ -280,8 +281,8 @@ def _unsloth_experts_dispatch(
     top_k_index: torch.Tensor,
     top_k_weights: torch.Tensor,
 ) -> torch.Tensor:
-    if _custom_gate_with_expert_lora(self):
-        return _forward_own_gate_with_expert_lora(self, hidden_states, top_k_index, top_k_weights)
+    if _dense_standard_with_expert_lora(self):
+        return _forward_dense_with_expert_lora(self, hidden_states, top_k_index, top_k_weights)
     if getattr(self, "has_gate", True) is False or _has_custom_gate(self):
         interface = _experts_interface()
         fallback = interface["grouped_mm"] if interface is not None and "grouped_mm" in interface else None
@@ -353,10 +354,37 @@ def _patch_decode_switch():
     GenerationMixin._optimize_model_for_decode = _optimize_model_for_decode
 
 
+def _patch_transformers_grouped_mm():
+    """Route transformers' moe._grouped_mm through moe_utils' Triton grouped GEMM where its gate picks it."""
+    try:
+        import transformers.integrations.moe as transformers_moe
+        moe_utils = _moe_utils_module()
+    except Exception:
+        return
+    original = getattr(transformers_moe, "_grouped_mm", None)
+    if original is None or getattr(original, "_unsloth_patched", False):
+        return
+    op = getattr(moe_utils, "_triton_grouped_mm", None)
+    wanted = getattr(moe_utils, "_triton_grouped_mm_wanted", None)
+    if op is None or wanted is None or getattr(moe_utils, "_GROUPED_MM_TRITON_OP", None) is None:
+        return
+
+    @functools.wraps(original)
+    def _grouped_mm(input, weight, offs, *args, **kwargs):
+        if not args and not kwargs and input.dtype == weight.dtype and wanted(input, weight):
+            return op(input, weight, offs)
+        return original(input, weight, offs, *args, **kwargs)
+
+    _grouped_mm._unsloth_patched = True
+    _grouped_mm._unsloth_original = original
+    transformers_moe._grouped_mm = _grouped_mm
+
+
 def patch_experts_interface():
     interface = _experts_interface()
     if interface is None:
         return
+    _patch_transformers_grouped_mm()
     try:
         from transformers.modeling_utils import PreTrainedModel
     except Exception as e:

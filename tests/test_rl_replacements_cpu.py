@@ -1193,6 +1193,47 @@ def test_offloaded_log_softmax_preserves_preexisting_head_grad():
     assert torch.allclose(got, ref, atol=1e-6), (got - ref).abs().max()
 
 
+@pytest.mark.parametrize("lm_requires_grad", [False, True])
+def test_offloaded_log_softmax_recompute_restores_forward_autocast(lm_requires_grad):
+    # Forward under autocast, backward outside it: an fp32 head must not recompute in fp32.
+    Fn = _extract_offloaded_log_softmax(_eager_selective_log_softmax)
+    args = (4, 0.0, 0.0, 0.0, 1.0)
+
+    def run(op):
+        torch.manual_seed(0)
+        hs = torch.randn(3, 32, 16, dtype=torch.bfloat16).requires_grad_(True)
+        lm = torch.randn(64, 16).requires_grad_(lm_requires_grad)
+        idx = torch.randint(0, 64, (3, 32))
+        go = torch.randn(3, 32)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            out = op(hs, lm, idx, *args)
+        out.backward(go)
+        return out.detach(), hs.grad, (lm.grad if lm_requires_grad else None)
+
+    out_ref, hs_ref, lm_ref = run(_eager_selective_log_softmax)
+    out_fn, hs_fn, lm_fn = run(Fn.apply)
+    assert torch.equal(out_fn, out_ref)
+    assert torch.equal(hs_fn, hs_ref), (hs_fn.float() - hs_ref.float()).abs().max()
+    if lm_requires_grad:
+        assert torch.equal(lm_fn, lm_ref), (lm_fn - lm_ref).abs().max()
+
+
+def test_offloaded_log_softmax_recompute_keeps_autocast_off_when_forward_had_none():
+    seen = []
+
+    def probe(*a):
+        seen.append(torch.is_autocast_enabled("cpu"))
+        return _eager_selective_log_softmax(*a)
+
+    Fn = _extract_offloaded_log_softmax(probe)
+    hs = torch.randn(2, 8, 16).requires_grad_(True)
+    lm = torch.randn(32, 16)
+    out = Fn.apply(hs, lm, torch.randint(0, 32, (2, 8)), 2, 0.0, 0.0, 0.0, 1.0)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        out.sum().backward()
+    assert seen == [False, False]
+
+
 
 # get_off_policy_mask adapter: TRL renamed its 3rd parameter old_per_token_logps ->
 # sampling_per_token_logps in 0.27.1 (huggingface/trl#4857), so the old hardcoded keyword

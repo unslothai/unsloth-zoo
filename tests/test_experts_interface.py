@@ -527,7 +527,7 @@ def test_custom_gate_expert_lora_casts_under_non_cuda_autocast(monkeypatch):
         seen["dtype"] = h.dtype
         return h
 
-    monkeypatch.setattr(mei, "_custom_gate_with_expert_lora", lambda m: True)
+    monkeypatch.setattr(mei, "_dense_standard_with_expert_lora", lambda m: True)
     monkeypatch.setattr(mei, "_moe_utils_module", lambda: types.SimpleNamespace(get_forward_moe_backend = lambda: backend))
     experts = nn.Module()
     experts.gate_up_proj = nn.Parameter(torch.zeros(2, 8, 4, dtype = torch.bfloat16))
@@ -538,7 +538,7 @@ def test_custom_gate_expert_lora_casts_under_non_cuda_autocast(monkeypatch):
     assert out.dtype == torch.float32
 
 
-def _own_gate_experts(implementation):
+def _interface_experts(implementation):
     import unsloth_zoo.temporary_patches.moe_experts_interface as mei
 
     class Experts(nn.Module):
@@ -546,25 +546,46 @@ def _own_gate_experts(implementation):
             return h
         forward.__wrapped__ = forward
 
-        def _apply_gate(self, gate_up):
-            return gate_up
-
     m = Experts()
+    m.act_fn = nn.SiLU()
     m.gate_up_proj = nn.Parameter(torch.zeros(2, 8, 4, dtype = torch.bfloat16))
     m.down_proj = nn.Parameter(torch.zeros(2, 4, 4, dtype = torch.bfloat16))
     m.config = types.SimpleNamespace(_experts_implementation = implementation)
     return mei, m
 
 
-def test_own_gate_route_static_answer_needs_the_unsloth_implementation(monkeypatch):
-    mei, m = _own_gate_experts("unsloth")
-    monkeypatch.setattr(mei, "_has_custom_gate", lambda module: True)
-    assert mei.own_gate_route_reads_stash(m) is True
+@pytest.mark.parametrize("custom_gate", [False, True])
+def test_interface_route_static_answer_needs_the_unsloth_implementation(monkeypatch, custom_gate):
+    mei, m = _interface_experts("unsloth")
+    monkeypatch.setattr(mei, "_has_custom_gate", lambda module: custom_gate)
+    assert mei.interface_route_reads_stash(m) is True
     m.config._experts_implementation = "grouped_mm"
-    assert mei.own_gate_route_reads_stash(m) is False
+    assert mei.interface_route_reads_stash(m) is False
     m.config._experts_implementation = "unsloth"
+    m.has_gate = False
+    assert mei.interface_route_reads_stash(m) is False
+    del m.has_gate
     m.gate_up_proj = nn.Parameter(torch.zeros(2, 8, 4, dtype = torch.uint8), requires_grad = False)
-    assert mei.own_gate_route_reads_stash(m) is False
+    assert mei.interface_route_reads_stash(m) is False
+
+
+@pytest.mark.parametrize("custom_gate", [False, True])
+def test_dense_expert_lora_route_is_traced_and_flags_only_own_gates(monkeypatch, custom_gate):
+    mei, m = _interface_experts("unsloth")
+    calls = []
+
+    def backend(module, h, idx, w):
+        calls.append(module)
+        return h
+
+    monkeypatch.setattr(mei, "_has_custom_gate", lambda module: custom_gate)
+    monkeypatch.setattr(mei, "_moe_utils_module", lambda: types.SimpleNamespace(_CACHED_FORWARD_MOE_BACKEND = backend))
+    monkeypatch.setattr(mei, "_unsloth_experts_dispatch", lambda *a: pytest.fail("dense expert LoRA reached the disabled dispatch"))
+    m._unsloth_lora_gate_up_proj = object()
+    h = torch.randn(3, 4, dtype = torch.bfloat16)
+    mei.unsloth_experts_forward(m, h, torch.zeros(3, 1, dtype = torch.long), torch.ones(3, 1, dtype = torch.bfloat16))
+    assert calls == [m]
+    assert m.__dict__.get("_unsloth_own_apply_gate", False) is custom_gate
 
 
 def test_backend_warmup_only_for_experts_interface_classes(monkeypatch):

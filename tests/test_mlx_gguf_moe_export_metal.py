@@ -43,9 +43,8 @@ def _static_sanitize_family(loader):
 
     The flavour is what matters here, not the family: a staticmethod sanitize is the
     second owner this test needs. It is resolved at runtime because llava_onevision
-    only exists from mlx-vlm 0.7.0, while pyproject caps mlx-vlm below that (0.6.4 is
-    the newest that fits the transformers pin), so naming it would fail the supported
-    install with ModuleNotFoundError rather than skip.
+    only exists from mlx-vlm 0.7.0, and pyproject still admits 0.6.4, so naming it
+    would fail that supported install with ModuleNotFoundError rather than skip.
     """
     import importlib
     import inspect
