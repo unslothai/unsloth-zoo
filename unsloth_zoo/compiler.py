@@ -288,6 +288,47 @@ def calls_disable_compile_function(source, disable_compile_functions):
     )
 
 
+def function_defined_elsewhere(modeling_file, name):
+    """True when `modeling_file.<name>` provably lives in another file. `def <name>` in the
+    modeling source can be a same-named method (Gemma 4's staticmethod
+    `create_masks_for_generate`) while the module attribute is an import, and once Unsloth
+    wraps it in a closure (temporary_patches/misc.py) getsource returns the closure body
+    with free variables. Unknown origin keeps the old behaviour (False)."""
+    try:
+        function = inspect.unwrap(getattr(modeling_file, name))
+        if not inspect.isfunction(function):
+            return False
+        function_file = inspect.getsourcefile(function)
+        modeling_source_file = inspect.getsourcefile(modeling_file)
+    except Exception:
+        return False
+    if function_file is None or modeling_source_file is None:
+        return False
+    return os.path.realpath(function_file) != os.path.realpath(modeling_source_file)
+
+
+def signature_with_string_annotations(signature):
+    """`str(inspect.signature)` renders annotations by module path
+    (`transformers.cache_utils.Cache`, `collections.abc.Callable`), which the generated
+    module never imports, so `def f{signature}:` raises NameError at cache import.
+    Quoted annotations are never evaluated at def time; defaults are untouched."""
+    empty = inspect.Parameter.empty
+    def stringify(annotation):
+        if annotation is empty or isinstance(annotation, str):
+            return annotation
+        return inspect.formatannotation(annotation)
+    try:
+        return signature.replace(
+            parameters = [
+                parameter.replace(annotation = stringify(parameter.annotation))
+                for parameter in signature.parameters.values()
+            ],
+            return_annotation = stringify(signature.return_annotation),
+        )
+    except Exception:
+        return signature
+
+
 def function_has_tensor_inputs(source: str) -> bool:
     """False when every parameter has a non-tensor annotation: nothing for Dynamo to trace."""
     try:
@@ -6291,6 +6332,8 @@ def unsloth_compile_transformers(
             r"[\s]{1,}" + re.escape(function) + r"\(.+?\)", full_source, flags=re.DOTALL
         )
         if len(defined) != 0 and len(called) != 0:
+            if function_defined_elsewhere(modeling_file, function):
+                continue
             called_functions.append(function)
     pass
 
@@ -7060,6 +7103,7 @@ def unsloth_compile_transformers(
             if len(bad_params) == 0:
                 continue
 
+            parameters = signature_with_string_annotations(parameters)
             for bad_param in bad_params:
                 parameters = re.sub(
                     re.escape(bad_param) + r"[\s]{0,}\=[\s]{0,}None[\s]{0,}\,",
