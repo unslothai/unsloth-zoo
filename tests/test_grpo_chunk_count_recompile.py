@@ -37,10 +37,10 @@ CHILD = textwrap.dedent(
     from torch._dynamo.utils import counters
     import unsloth_zoo.rl_replacements as R
 
-    chunks, hidden, vocab = 8, 24, 64
-    # 4 distinct chunk counts: 8, 5, 7, 6.
-    Ts = [16, 9, 13, 17, 15, 10]
-    assert len({math.ceil(t / math.ceil(t / chunks)) for t in Ts}) == 4
+    chunks, hidden, vocab = 32, 24, 64
+    Ts = list(range(40, 400, 9))
+    # 9 distinct chunk counts, 20 to 32.
+    assert len({math.ceil(t / math.ceil(t / chunks)) for t in Ts}) == 9
     torch._dynamo.config.cache_size_limit = 64
     torch.manual_seed(0)
     lm_head = (torch.randn(vocab, hidden) * 0.1).requires_grad_(True)
@@ -77,10 +77,10 @@ def test_graph_count_does_not_grow_with_the_chunk_count():
     import json
     got = json.loads(line[0][len("RESULT "):])
     for name, res in got.items():
-        # main compiled a graph per distinct chunk count (4 here, 6 graphs). The
-        # chunk body needs one, plus a non-view variant (the 1-row re-split cats)
-        # or a 1-row specialisation, independent of T.
-        assert res["graphs"] <= 3, (name, res)
+        # main compiled a graph per distinct chunk count (14 graphs here). Now a
+        # fixed set independent of T: the chunk graph, plus at most a non-view
+        # variant (the 1-row re-split cats) and a duck-sizing respecialisation.
+        assert res["graphs"] <= 4, (name, res)
         assert res["err"] < 1e-4, (name, res)
 
 
