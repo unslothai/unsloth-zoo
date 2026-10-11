@@ -2924,3 +2924,15 @@ def test_cce_only_compile_family_is_refused_on_the_standard_loss():
     other = type("Model", (), {"__module__": "mlx_vlm.models.glm_ocr.glm_ocr"})()
     other.config = NS(model_type="glm_ocr")
     assert mc.resolve_training_compile(other, policy=policy, args=NS(use_cce=False)).enabled
+
+
+def test_vision_preference_plan_is_excluded_from_eager_fallback_refetch():
+    from unsloth_zoo.mlx import trainer as trainer_module
+    from unsloth_zoo.mlx.preference import (
+        FinitePreferenceBatchPlan, FiniteVisionPreferenceBatchPlan,
+    )
+
+    text = FinitePreferenceBatchPlan.__new__(FinitePreferenceBatchPlan)
+    vision = FiniteVisionPreferenceBatchPlan.__new__(FiniteVisionPreferenceBatchPlan)
+    assert trainer_module._eager_refetchable(text)
+    assert not trainer_module._eager_refetchable(vision)

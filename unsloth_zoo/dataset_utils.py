@@ -845,6 +845,12 @@ def train_on_responses_only(
         )
     pass
 
+    # Edge trimming can cut a marker to the opener all roles share (gpt-oss "<|start|>"), matching every turn.
+    if A_must == Q_must[:len(A_must)] and A_right:
+        A_must, A_right = A_must + A_right, []
+    if Q_must == A_must[:len(Q_must)] and Q_right:
+        Q_must, Q_right = Q_must + Q_right, []
+
     # Store some temporary stuff
     A_first = A_must[0]
     len_A_must = len(A_must)
@@ -2665,6 +2671,7 @@ def sft_prepare_dataset(
     do_formatting_func = False
     do_tokenize = True
     do_prompt_completion = False
+    do_messages = False
 
     # Get correct column names
     column_names = set(next(iter(dataset)).keys())
@@ -2698,11 +2705,23 @@ def sft_prepare_dataset(
         # before calling us -- we must NOT overwrite it here.
         do_prompt_completion = True
         used_column_names.append("completion_mask")
+    elif (dataset_text_field not in column_names or getattr(args, "assistant_only_loss", False)) and \
+        formatting_func is None and not is_vlm and "messages" in column_names and \
+        isinstance(_first_messages := next(iter(dataset))["messages"], list) and \
+        len(_first_messages) != 0 and isinstance(_first_messages[0], dict) and \
+        "role" in _first_messages[0]:
+        # Text columns carry no assistant masks, so assistant_only_loss prefers "messages" even if text exists.
+        do_messages = True
     elif dataset_text_field not in column_names:
         do_formatting_func = True
         if formatting_func is None:
             raise RuntimeError("Unsloth: You must specify a `formatting_func`")
     pass
+    if do_tokenize and not do_messages and not do_prompt_completion and getattr(args, "assistant_only_loss", False):
+        raise ValueError(
+            "Unsloth: assistant_only_loss needs a conversational `messages` dataset and no formatting_func. "
+            "Or use `train_on_responses_only` on your formatted text."
+        )
 
     if do_tokenize:
         if do_formatting_func:
@@ -2729,6 +2748,8 @@ def sft_prepare_dataset(
                 test_text = _first_ex["prompt"]
             else:
                 test_text = None  # chat template handles BOS
+        elif do_messages:
+            test_text = None  # chat template handles BOS
         else:
             # No [0] on a str: that is the first CHARACTER, so startswith(bos_token)
             # below could never match. Only unwrap when the field really is a list.
@@ -2833,6 +2854,92 @@ def sft_prepare_dataset(
                     _tokenize_pc, batched=False,
                     remove_columns=list(column_names), **map_kwargs,
                 )
+        elif do_messages:
+            assistant_only_loss = bool(getattr(args, "assistant_only_loss", False))
+            training_chat_template = getattr(self, "chat_template", None)
+            # No {% generation %} markers (or no TRL training template): assistant masks would be all zeros,
+            # so mask with train_on_responses_only markers instead.
+            import re as _re
+            def _template_text(template):
+                # Named template sets are picked per call: check them all.
+                if isinstance(template, dict):
+                    return "\n".join(v for v in template.values() if isinstance(v, str))
+                return template or ""
+            marker_masks = assistant_only_loss and (
+                getattr(self, "_unsloth_assistant_mask_fallback", False) or
+                _re.search(r"\{%-?\s*generation\s*-?%\}", _template_text(training_chat_template or chat_template)) is None
+            )
+            response_labels = None
+            if marker_masks:
+                from unsloth_zoo.dataset_utils import train_on_responses_only as _response_labels
+                marker_kwargs = {}
+                # Harmony (gpt-oss): auto-detection would keep only the final channel, not analysis/tool calls.
+                if "<|channel|>" in _template_text(getattr(tokenizer, "chat_template", None)) and \
+                    not hasattr(tokenizer, "_unsloth_output_part"):
+                    marker_kwargs = dict(
+                        instruction_part = "<|start|>user<|message|>",
+                        response_part = "<|start|>assistant",
+                    )
+                response_labels = _response_labels(
+                    None, tokenizer = tokenizer, return_function = True, **marker_kwargs,
+                )
+            truncate_messages = do_truncation and isinstance(max_seq_length, int) and max_seq_length > 0 and \
+                not locals().get("_unsloth_wrapped_packing", False)
+            message_cut = slice(-max_seq_length, None) if truncate_messages and \
+                getattr(args, "truncation_mode", "keep_start") == "keep_end" else slice(None, max_seq_length)
+            if assistant_only_loss:
+                used_column_names.append("assistant_masks")
+
+            def _tokenize_messages(example):
+                template_kwargs = dict(example.get("chat_template_kwargs") or {})
+                if training_chat_template is not None:
+                    template_kwargs["chat_template"] = training_chat_template
+                # Arrow fills missing keys with None, which `is defined` template checks then index.
+                messages = [
+                    {k: v for k, v in message.items() if v is not None}
+                    if isinstance(message, dict) else message
+                    for message in example["messages"]
+                ]
+                tools = example.get("tools")
+                if isinstance(tools, str):
+                    import json as _json
+                    tools = _json.loads(tools)
+                processed = processing_class.apply_chat_template(
+                    messages, tools = tools,
+                    tokenize = True, return_dict = True,
+                    return_assistant_tokens_mask = assistant_only_loss and not marker_masks,
+                    **template_kwargs,
+                )
+                input_ids = processed["input_ids"]
+                if input_ids and isinstance(input_ids[0], list):
+                    input_ids = input_ids[0]
+                result = {"input_ids": list(input_ids)}
+                if assistant_only_loss:
+                    if marker_masks:
+                        labels = response_labels({"input_ids": [result["input_ids"]]})["labels"][0]
+                        result["assistant_masks"] = [int(x != -100) for x in labels]
+                    else:
+                        masks = processed["assistant_masks"]
+                        if masks and isinstance(masks[0], list):
+                            masks = masks[0]
+                        result["assistant_masks"] = list(masks)
+                if truncate_messages:
+                    result = {k: v[message_cut] for k, v in result.items()}
+                if _needs_token_type_ids:
+                    result["token_type_ids"] = [0] * len(result["input_ids"])
+                return result
+
+            if use_desc: map_kwargs["desc"] = 'Unsloth: Tokenizing ["messages"]'
+            import warnings as _w
+            with _w.catch_warnings():
+                _w.filterwarnings("ignore", message = ".*couldn't be hashed properly.*")
+                dataset = dataset.map(
+                    _tokenize_messages, batched=False,
+                    remove_columns=list(column_names), **map_kwargs,
+                )
+            if assistant_only_loss:
+                # Truncation can drop every assistant token; such a row has no target.
+                dataset = dataset.filter(lambda row: any(row["assistant_masks"]))
         else:
             if use_desc: map_kwargs["desc"] = f'Unsloth: Tokenizing ["{dataset_text_field}"]'
             import warnings as _w

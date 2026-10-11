@@ -84,10 +84,12 @@ def _kernels():
         q_ptr, out_ptr, code_ptr,
         absmax_ptr, code2_ptr, absmax2_ptr, offset_ptr,
         n_bytes,
-        NESTED: tl.constexpr, BLOCKSIZE2: tl.constexpr, BLOCK: tl.constexpr,
+        NESTED: tl.constexpr, BLOCKSIZE2: tl.constexpr, BLOCK: tl.constexpr, LONG_INDEXING: tl.constexpr,
     ):
-        pid = tl.program_id(0).to(tl.int64)
-        offs = pid * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
+        pid = tl.program_id(0)
+        if LONG_INDEXING:
+            pid = pid.to(tl.int64)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
         mask = offs < n_bytes
         qw = tl.load(q_ptr + offs, mask = mask, other = 0)
         blk = offs // 32                      # 64 elements = 32 bytes per absmax block
@@ -103,7 +105,7 @@ def _kernels():
         vh = (tl.load(code_ptr + hi) * am).to(out_ptr.dtype.element_ty)
         vl = (tl.load(code_ptr + lo) * am).to(out_ptr.dtype.element_ty)
         w = tl.reshape(tl.join(vh, vl), (2 * BLOCK,))
-        offs2 = pid * (2 * BLOCK) + tl.arange(0, 2 * BLOCK).to(tl.int64)
+        offs2 = pid * (2 * BLOCK) + tl.arange(0, 2 * BLOCK)
         # Not offs2 < 2 * n_bytes (int32 wraps for 2**31..2**32 weights) nor offs2 // 2 (~15% slower).
         tl.store(out_ptr + offs2, w, mask = (offs2 - n_bytes) < n_bytes)
 
@@ -255,7 +257,8 @@ def nf4_dequant_triton(packed, quant_state, out_shape = None):
             kernel[(triton.cdiv(n_bytes, BLOCK),)](
                 q, out, code, absmax, code2, absmax2, offset, n_bytes,
                 NESTED = nested, BLOCKSIZE2 = (quant_state.state2.blocksize if nested else 1),
-                BLOCK = BLOCK, num_warps = 4, enable_fp_fusion = False,
+                BLOCK = BLOCK, LONG_INDEXING = 2 * n_bytes + 2 * BLOCK > 2**31, num_warps = 4,
+                enable_fp_fusion = False,
             )
     except Exception as exc:
         _disable("nf4_dequant_triton", exc)

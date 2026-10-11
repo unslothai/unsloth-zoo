@@ -230,6 +230,22 @@
       "reason": "Module name comes from a fixed tuple or table in this file, not from a model, request or download."
     },
     {
+      "file": "unsloth_zoo/mlx/speculative.py",
+      "rule": "dynamic-import",
+      "sink": "__import__",
+      "digest": "b0d2b11936c8679d",
+      "count": 1,
+      "reason": "Family is one of the two literals this file passes (qwen3_5, gemma4), bounded to mlx_vlm.models.<family>.language."
+    },
+    {
+      "file": "unsloth_zoo/mlx/speculative.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "357660739aa0ab3b",
+      "count": 1,
+      "reason": "Module name is the output_model_type of mlx-vlm's own MTP splitter class, bounded to the installed mlx_vlm.speculative.drafters package."
+    },
+    {
       "file": "unsloth_zoo/mlx/utils.py",
       "rule": "dynamic-import",
       "sink": "import_module",
@@ -308,6 +324,14 @@
       "digest": "992d2ddf3e2ecc8d",
       "count": 1,
       "reason": "Loads the fla package vendored inside unsloth_zoo."
+    },
+    {
+      "file": "unsloth_zoo/temporary_patches/gdn_causal_conv1d.py",
+      "rule": "dynamic-import",
+      "sink": "import_module",
+      "digest": "8a43c55c018acccf",
+      "count": 1,
+      "reason": "Imports the fixed transformers modeling modules for qwen3_5, qwen3_5_moe and qwen3_next (names built from a constant tuple) on transformers < 5.15."
     },
     {
       "file": "unsloth_zoo/temporary_patches/gemma4_float32.py",

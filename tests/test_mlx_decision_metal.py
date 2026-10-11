@@ -851,10 +851,16 @@ def test_saved_clef_holds_the_trained_decoder_and_a_head_with_its_temperature_fo
         asked, loaded = {}, [_decoder(), _decoder()]
         monkeypatch.setattr("unsloth_zoo.mlx.loader.FastMLXModel.from_pretrained", lambda *args, **kwargs: asked.update(kwargs) or (loaded[kwargs["load_in_4bit"]], None))
         for four in (False, True):
-            _QwenModel._load(SimpleNamespace(), tmp_path, None, None, None, None, four)
+            _QwenModel._load(SimpleNamespace(reads_images = False), tmp_path, None, None, None, None, four)
         assert (asked["load_in_4bit"], asked["load_in_16bit"]) == (True, False)
         # What the loader leaves in 16-bit for other trainers, the embedding and the output head, is quantized too.
         assert [["scales" in module for module in (model.language_model.model.embed_tokens, model.language_model.lm_head)] for model in loaded] == [[False, False], [True, True]]
+        # The vision tower keeps its precision only for a model that reads images through it.
+        for reads in (True, False):
+            loaded[True] = _decoder()
+            loaded[True].vision_tower = Linear(64, 64)
+            _QwenModel._load(SimpleNamespace(reads_images = reads), tmp_path, None, None, None, None, True)
+            assert ("scales" in loaded[True].vision_tower) != reads
     network = clef_training_network(pipeline, full_finetuning = mode == "full", r = 4, lora_alpha = 8, modules_to_save = ["embed_tokens"] if mode == "embedding" else None)
     if mode == "qlora":
         # Adapters over quantized layers receive gradients.
@@ -1021,6 +1027,161 @@ def test_clef_prompt_gives_up_the_end_of_the_state_only(clef):
     assert cut["option_spans"][1][1] == tuple(edge - removed for edge in whole["option_spans"][1][1])
     with pytest.raises(DecisionRequestError, match = "before the state"):
         clef[2]("state", 100)
+
+
+def _vision_decoder():
+    from mlx_vlm.models import qwen3_5
+
+    text = dict(model_type = "qwen3_5_text", hidden_size = 64, intermediate_size = 128, num_hidden_layers = 4, num_attention_heads = 2, num_key_value_heads = 1, vocab_size = 512, head_dim = 32)
+    text.update(linear_num_value_heads = 4, linear_num_key_heads = 2, linear_key_head_dim = 32, linear_value_head_dim = 16, linear_conv_kernel_dim = 4, rms_norm_eps = 1e-6, max_position_embeddings = 4096)
+    vision = dict(model_type = "qwen3_5", depth = 1, hidden_size = 32, intermediate_size = 64, num_heads = 2, out_hidden_size = 64, num_position_embeddings = 64, patch_size = 16)
+    tokens = dict(image_token_id = 500, vision_start_token_id = 501, vision_end_token_id = 502)
+    mx.random.seed(7)
+    return qwen3_5.Model(qwen3_5.ModelConfig.from_dict({"model_type": "qwen3_5", "text_config": text, "vision_config": vision, **tokens}))
+
+
+def _patches(text, images, return_tensors):
+    # As the Qwen processor answers: one placeholder per 2x2 patches, and the patches of every image in one array.
+    if any(image.width < 32 for image in images):
+        raise ValueError("too thin")
+    grids = [(1, image.height // 16, image.width // 16) for image in images]
+    ids = [token for _, rows, columns in grids for token in (501, *[500] * (rows * columns // 4), 502)] + [10] * text[0].endswith("\n")
+    pixels = [np.full((rows * columns, 1536), np.asarray(image).mean() / 255, np.float32) for image, (_, rows, columns) in zip(images, grids)]
+    return {"input_ids": np.array([ids]), "pixel_values": np.concatenate(pixels), "image_grid_thw": np.array(grids)}
+
+
+_patches.image_processor = True
+
+
+def test_clef_reads_images_between_the_opening_and_the_state(clef, monkeypatch):
+    from PIL import Image
+
+    from unsloth_zoo.mlx.decision import ClefModel, DecisionRequestError, DecisionUnsupportedError
+
+    text_only, questions = clef[0], {"ok": {"type": "noul", "instructions": "fine?"}}
+    images = [Image.new("RGB", size, shade) for size, shade in (((96, 64), "black"), ((64, 64), "white"))]
+    with pytest.raises(DecisionUnsupportedError):
+        text_only.encode_images(images)
+    model = _vision_decoder()
+    model._processor = _patches
+    reader = copy.copy(text_only)
+    reader.model = model
+    assert reader.reads_images and not text_only.reads_images
+    towerless = copy.copy(reader)
+    towerless.model = copy.copy(model)
+    towerless.model.vision_tower = None
+    assert not towerless.reads_images
+    other = copy.copy(reader)
+    other.model = copy.copy(model)
+    other.model.config = copy.copy(model.config)
+    other.model.config.model_type = "qwen3_vl"
+    assert not other.reads_images
+    bare = copy.copy(reader)
+    bare.model = copy.copy(model)
+    bare.model._processor = SimpleNamespace(encode = None)
+    assert not bare.reads_images
+    monkeypatch.setattr(ClefModel, "_IMAGE_TOKENS", 15)
+    with pytest.raises(DecisionRequestError, match = "the images take 15 tokens"):
+        reader.encode_images(images)
+    monkeypatch.setattr(ClefModel, "_IMAGE_TOKENS", 16)
+    with pytest.raises(DecisionRequestError, match = "could not be read: too thin"):
+        reader.encode_images([Image.new("RGB", (16, 16))])
+
+    parsed = reader._parse_questions(questions)
+    image_ids, media = reader.encode_images(images)
+    plain, with_images = reader.encode("state", parsed), reader.encode("state", parsed, image_ids = image_ids)
+    opening = len(reader._encode(next(reader._pieces("state", parsed))[0]))
+    assert image_ids == [501, *[500] * 6, 502, 501, *[500] * 4, 502, 10] and media["image_grid_thw"].tolist() == [[1, 4, 6], [1, 4, 4]] and with_images[0] == plain[0][:opening] + image_ids + plain[0][opening:]
+    assert with_images[1:] == ([(start + 15, end + 15) for start, end in plain[1]], [[(start + 15, end + 15) for start, end in spans] for spans in plain[2]])
+    # Only the state gives way to a length limit, images included in what must fit.
+    assert reader.encode("state", parsed, len(with_images[0]) - 2, image_ids)[0] == with_images[0][: opening + 15 + 3] + with_images[0][opening + 15 + 5 :]
+
+    ids = mx.array(with_images[0])[None]
+    with generation_mode(model):
+        hidden = reader._hidden(with_images[0], media)
+        # mlx-vlm's own forward places the image features and positions.
+        expected = model(ids, media["pixel_values"], image_grid_thw = media["image_grid_thw"]).logits[0]
+        np.testing.assert_allclose(np.array(model.language_model.lm_head(hidden).astype(mx.float32)), np.array(expected.astype(mx.float32)), atol = 1e-4)
+        assert mx.abs(hidden - reader._hidden(with_images[0])).max().item() > 1e-2
+
+    def url(image):
+        import base64, io
+
+        buffer = io.BytesIO()
+        image.save(buffer, "PNG")
+        return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+
+    dark, light = (reader.answer([{"role": "user", "content": ["state", {"type": "image_url", "image_url": url(image.resize((96, 64)))}]}], questions) for image in images)
+    assert dark["usage"] == light["usage"] and dark["answers"]["ok"]["noul"] != light["answers"]["ok"]["noul"]
+    assert dark["usage"]["input_tokens"] == len(reader.encode([{"role": "user", "content": ["state"]}], parsed)[0]) + 9
+    model._processor = None
+    assert not reader.reads_images
+
+
+def test_clef_trains_on_the_images_of_its_records(clef):
+    import base64, io
+
+    from PIL import Image
+
+    reader, questions = copy.copy(clef[0]), {"route": {"type": "choice", "instructions": "where", "criteria": {"a": "x", "b": None}}, "ok": {"type": "noul", "instructions": "fine?"}}
+    reader.model = _vision_decoder()
+    reader.model._processor = _patches
+    dark, light = Image.new("RGB", (96, 64), "black"), Image.new("RGB", (96, 64), "white")
+    buffer = io.BytesIO()
+    light.save(buffer, "PNG")
+    url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+    part = {"type": "image_url", "image_url": {"url": url}}
+    targets = {"targets": [[1.0, 0.0], [0.0, 1.0]]}
+    items = [{**clef_training_item(reader, "s", questions, None, images), **targets} for images in ([dark], [url])]
+    # An image part of the state is read as an image, after the ones given beside it.
+    mixed = clef_training_item(reader, [{"role": "user", "content": ["s", part]}], questions, None, [dark.resize((64, 64))])
+    # Given order is kept, and a data URL stays one on the item: it is decoded when the item is read.
+    assert [getattr(image, "size", image) for image in clef_training_item(reader, "s", questions, None, [url, dark.resize((64, 64))])["images"]] == [url, (64, 64)]
+    assert [getattr(image, "size", image) for image in mixed["images"]] == [(64, 64), url] and mixed["source"]["state"] == [{"role": "user", "content": ["s"]}]
+    assert items[0]["input_ids"] == items[1]["input_ids"] and items[0]["input_ids"].count(500) == 6 and mixed["input_ids"].count(500) == 10
+    assert "images" not in clef_training_item(reader, "s", questions)
+    with pytest.raises(ValueError, match = "too many images"):
+        clef_training_item(reader, "s", questions, None, [dark] * 8 + [url])
+
+    network = clef_training_network(reader, r = 4, lora_alpha = 4)
+    tower = {name: np.array(value) for name, value in tree_flatten(reader.model.vision_tower.parameters())}
+    # The logits a record trains on are the ones a request with its images is answered from.
+    route, _ = clef_logits(network, [items[1]])[0]
+    assert list(reader.answer("s", questions, [url])["answers"]["route"]["probabilities"].values()) == pytest.approx(torch.softmax(torch.tensor(route), 0).tolist(), abs = 1e-4)
+    assert _clef_record_loss(network, items[0]).item() != pytest.approx(_clef_record_loss(network, items[1]).item(), rel = 1e-3)
+    shuffled = network.permuted_item(items[0], random.Random(1))
+    assert shuffled["images"] == items[0]["images"] and shuffled["input_ids"].count(500) == 6 and shuffled["targets"] == [[0.0, 1.0], [1.0, 0.0]]
+    whole = {**mixed, **targets, "source": {**mixed["source"], "state": [{"role": "user", "content": ["s", part]}]}}
+    assert network.permuted_item(whole, random.Random(1))["input_ids"].count(500) == 10
+    np.testing.assert_allclose(np.array(network.reference_logits(items[1], network.kl_reference())), np.concatenate(clef_logits(network, [items[1]])[0]), atol = 1e-4)
+
+    before = _parameters(network)
+    MLXDecisionTrainer(network, MLXTrainingConfig(per_device_train_batch_size = 2, max_steps = 2, learning_rate = 1e-2, warmup_steps = 0, compile = False), items).train()
+    assert {name.split(".")[0] for name, value in _parameters(network).items() if not np.array_equal(value, before[name])} == {"encoder", "head"}
+    assert all(np.array_equal(tower[name], np.array(value)) for name, value in tree_flatten(reader.model.vision_tower.parameters()))
+
+
+def test_prompts_that_share_their_images_read_them_once(monkeypatch):
+    from PIL import Image
+
+    from unsloth_zoo.mlx import utils
+
+    reader = _LabelModel.__new__(_LabelModel)
+    reader.model, reader.takes_images = _vision_decoder(), True
+    reader.model._processor = _patches
+    image_ids, media = reader.encode_images([Image.new("RGB", (96, 64), "gray"), Image.new("RGB", (64, 64), "white")])
+    shared = [3, 4, *image_ids, *range(40, 60)]
+    prompts = [shared + [7, 8, 9], shared + [300], shared + [301, 302, 303, 304]]
+    with generation_mode(reader.model):
+        got = list(reader._hidden_states(prompts, media, 2 + len(image_ids)))
+        want = [reader._hidden(ids, media) for ids in prompts]
+        # Prompts that part inside the images cannot share them.
+        calls, forward = [], utils._forward_text_hidden_states
+        monkeypatch.setattr(utils, "_forward_text_hidden_states", lambda model, inputs, **kwargs: calls.append(inputs.shape[1]) or forward(model, inputs, **kwargs))
+        apart = list(reader._hidden_states(prompts, media, len(shared) + 1))
+    assert calls == [len(ids) for ids in prompts] and all(mx.array_equal(a, b) for a, b in zip(apart, want))
+    for a, b in zip(got, want):
+        assert a.shape == b.shape and mx.abs(a.astype(mx.float32) - b.astype(mx.float32)).max().item() <= 2**-8 * mx.abs(b.astype(mx.float32)).max().item()
 
 
 def _clef_record_loss_and_grad(network, record):

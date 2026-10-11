@@ -86,11 +86,15 @@ if triton is not None:
         W_PTRS, A_PTRS, A2_PTRS, C2_PTRS, OFFSETS, LUT, OUT,
         n_bytes,
         BLOCKSIZE: tl.constexpr, BLOCKSIZE2: tl.constexpr, NESTED: tl.constexpr, BLOCK: tl.constexpr,
+        LONG_INDEXING: tl.constexpr,
     ):
-        pid = tl.program_id(0).to(tl.int64)
-        e = tl.program_id(1).to(tl.int64)
+        pid = tl.program_id(0)
+        e = tl.program_id(1)
+        if LONG_INDEXING:
+            pid = pid.to(tl.int64)
+            e = e.to(tl.int64)
         W = tl.load(W_PTRS + e).to(tl.pointer_type(tl.uint8))
-        offs = pid * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
         mask = offs < n_bytes
         qw = tl.load(W + offs, mask = mask, other = 0)
         blk = offs // (BLOCKSIZE // 2)
@@ -109,7 +113,7 @@ if triton is not None:
         vh = libdevice.mul_rn(tl.load(LUT + (qw >> 4).to(tl.int32)), am).to(OUT.dtype.element_ty)
         vl = libdevice.mul_rn(tl.load(LUT + (qw & 15).to(tl.int32)), am).to(OUT.dtype.element_ty)
         w = tl.reshape(tl.join(vh, vl), (2 * BLOCK,))
-        offs2 = pid * (2 * BLOCK) + tl.arange(0, 2 * BLOCK).to(tl.int64)
+        offs2 = pid * (2 * BLOCK) + tl.arange(0, 2 * BLOCK)
         tl.store(OUT + e * (2 * n_bytes) + offs2, w, mask = offs2 < 2 * n_bytes)
 
 
@@ -157,7 +161,8 @@ def nf4_dequant_expert_stack(tb, dtype, out = None):
             _nf4_dequant_stack_kernel[(-(-n_bytes // BLOCK), E)](
                 w_ptrs, tb["a"], tb["a2"], tb["c2"], tb["off"], tb["lut"], out, n_bytes,
                 BLOCKSIZE = blocksize, BLOCKSIZE2 = int(tb["blocksize2"]), NESTED = bool(tb["nested"]),
-                BLOCK = BLOCK, num_warps = 4, enable_fp_fusion = False,
+                BLOCK = BLOCK, LONG_INDEXING = E * 2 * n_bytes + 2 * BLOCK > 2**31, num_warps = 4,
+                enable_fp_fusion = False,
             )
     except Exception as exc:
         from torch.utils import checkpoint

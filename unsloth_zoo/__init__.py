@@ -296,7 +296,17 @@ if not _SKIP_GPU_INIT:
     IS_TORCH_2_10_OR_NEWER = (major_torch > 2) or (major_torch == 2 and minor_torch >= 10)
     IS_TORCH_ROCM_BUILD = "+rocm" in torch_version_raw.lower()
     # expandable_segments is unsupported on Windows/WSL.
-    IS_WSL_OR_WINDOWS = bool(os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP")) or os.name == "nt"
+    def _is_wsl():
+        if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
+            return True
+        # Docker on WSL2 has no WSL_* variables but shares the *-microsoft-standard-WSL2 kernel,
+        # where expandable_segments dies with `CUDA driver error: unknown error` (unslothai/unsloth#3511).
+        try:
+            return "microsoft" in os.uname().release.lower()
+        except Exception:
+            return False
+    IS_WSL_OR_WINDOWS = os.name == "nt" or _is_wsl()
+    del _is_wsl
 
     # Nor on an NVIDIA Tegra board, where the CUDA VMM calls it is built on fail: a 1MiB
     # buffer dies with `RuntimeError: CUDA driver error: out of memory` on a board with 50GB
