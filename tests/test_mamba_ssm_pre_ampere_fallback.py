@@ -909,6 +909,16 @@ def test_kernels_package_without_a_mamba_hub_entry_still_falls_back(env, monkeyp
     assert Config().use_mamba_kernels is False
 
 
+def test_hub_kernels_disabled_by_env_still_falls_back(env, monkeypatch):
+    """USE_HUB_KERNELS=0 sets hub_kernels._kernels_enabled False; on 5.14
+    lazy_load_kernel then returns None although the registry entry stays."""
+    _set_specs(monkeypatch, ("kernels",))
+    env[2]._kernels_enabled = False
+    _mod, Config = _fake_config_module(CONFIG_MODS[1], "ZambaConfig")
+    missing_patch()
+    assert Config().use_mamba_kernels is False
+
+
 def test_unknown_spec_keeps_upstream_behaviour(env, monkeypatch):
     import importlib.util
     def find_spec(name, *a, **k):

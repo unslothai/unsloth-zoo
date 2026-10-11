@@ -1650,6 +1650,8 @@ def _mamba_fast_kernels_missing():
         if importlib.util.find_spec("kernels") is None:
             return True
         from transformers.integrations import hub_kernels as _hk
+        if _hk.__dict__.get("_kernels_enabled", True) is False:
+            return True  # USE_HUB_KERNELS=0 (lazy_load_kernel honours it on 5.14)
         return "mamba-ssm" not in getattr(_hk, "_HUB_KERNEL_MAPPING", {})
     except Exception:
         return True
