@@ -21,7 +21,6 @@ ceil(T / ceil(T / chunks)), which moves with the token count T: every new count
 recompiled a graph unrolling every chunk (598 s of a 639 s, 60 step GRPO run).
 The chunks are now `chunks` row ranges [i*T//chunks, (i+1)*T//chunks), so the
 traced loop length depends only on `chunks` and the graph count stays flat in T."""
-import math
 import os
 import subprocess
 import sys
