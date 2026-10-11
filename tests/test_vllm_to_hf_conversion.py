@@ -219,7 +219,7 @@ def test_set_dtype_in_config_no_torch_dtype_deprecation():
 
 
 def test_set_dtype_in_config_writes_torch_dtype_value():
-    # 4.x: JSON-safe string; 5.x: torch.dtype, passed straight to torch ops (#1556).
+    # `torch_dtype` field: JSON-safe string; `dtype` field: torch.dtype, passed to torch ops (#1556).
     from transformers import PretrainedConfig
     from unsloth_zoo.hf_utils import set_dtype_in_config, dtype_from_config, HAS_TORCH_DTYPE
     cfg = PretrainedConfig()
@@ -720,8 +720,8 @@ def test_finalize_huggingface_model_dtype_propagates_to_replaced_live_config():
         model, None, input_cfg, torch.float16,
         quantization_config={"x": 1}, bnb_config=None,
     )
-    from unsloth_zoo.hf_utils import HAS_TORCH_DTYPE
-    assert model.config.dtype == ("float16" if HAS_TORCH_DTYPE else torch.float16)
+    from unsloth_zoo.hf_utils import HAS_TORCH_DTYPE, dtype_from_config
+    assert dtype_from_config(model.config) == ("float16" if HAS_TORCH_DTYPE else torch.float16)
 
 
 def test_finalize_huggingface_model_vision_rotary_uses_identity_check():
