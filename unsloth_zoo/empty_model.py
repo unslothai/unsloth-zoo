@@ -1146,9 +1146,7 @@ def finalize_huggingface_model(
     _copy_rotary_buffers(original_meta_model, new_model)
 
     if (quantization_config or {}) == {} and bnb_config is None:
-        # Online FP8 (load_in_fp8 on a 16-bit checkpoint) leaves no quantization_config, but the
-        # vLLM-shared weights are float8 / torchao subclasses: a whole-model cast would dequantize
-        # (or fail on) them, so cast only plain 16/32-bit tensors.
+        # Online FP8 leaves no quantization_config but float8 / torchao weights: cast only plain tensors.
         if _has_quantized_tensors(new_model):
             _cast_unquantized_(new_model, target_device, dtype)
         else:

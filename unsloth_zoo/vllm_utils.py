@@ -2528,12 +2528,9 @@ def _get_torchao_fp8_config(fp8_mode: str):
     )
 
 
-# load_in_fp8 mode -> vLLM native online FP8 scheme. Same granularity as the torchao
-# configs above: row = per-output-channel weight + per-token activation, block = 128x128
-# weight + 1x128 activation. Unlike torchao's Float8Tensor (no _scaled_mm derivative), the
-# training model rebuilds these as FP8Linear / FbgemmFp8Linear and can backprop through them.
-# fp8_per_block shipped in vLLM 0.20.0, fp8_per_channel in 0.24.0;
-# vLLM 0.31 drops online quantization="fp8" for BF16 checkpoints, never use it here.
+# load_in_fp8 mode -> vLLM native online FP8 (same granularity as the torchao configs above); training
+# rebuilds them as FP8Linear / FbgemmFp8Linear, which have a backward (torchao's Float8Tensor does not).
+# fp8_per_block: vLLM >= 0.20, fp8_per_channel: >= 0.24; 0.31 rejects quantization="fp8" for BF16.
 _VLLM_ONLINE_FP8_SCHEMES = {"row": "fp8_per_channel", "block": "fp8_per_block"}
 
 
@@ -2560,11 +2557,8 @@ def _get_vllm_online_fp8_quantization(fp8_mode, quantization_methods = None, dev
     scheme = _VLLM_ONLINE_FP8_SCHEMES[fp8_mode]
     if scheme not in quantization_methods:
         return None
-    # vLLM 0.29 - 0.31 quantize online blocks with non power-of-two scales (use_ue8m0=False):
-    # DeepGEMM asserts on them on Blackwell (smxx_layout.cuh) and the CUTLASS fallback fails in
-    # triton_scaled_mm; plain vLLM 0.29 crashes on B200 for dense and MoE alike. Keep the torchao
-    # route there, as before native online FP8 was used: it loads and generates, but torchao's
-    # blockwise FP8 matmul has no backward, so training needs row-wise FP8 or a block checkpoint.
+    # vLLM 0.29 - 0.31 online blocks use non power-of-two scales, which DeepGEMM asserts on (Blackwell,
+    # smxx_layout.cuh) and the CUTLASS fallback fails; keep the old torchao route (generates, no backward).
     if fp8_mode == "block" and choice != "native" and device_capability is not None and device_capability[0] >= 10:
         print(
             "Unsloth: vLLM's online per-block FP8 crashes on Blackwell GPUs, so `load_in_fp8 = 'block'` "
@@ -3871,10 +3865,8 @@ def load_vllm(
                         # [rank0]: TypeError: 'NoneType' object does not support the context manager protocol
                     )
                 )
-                # With persistent TMA matmuls on, torchao's Float8Tensor (_scaled_mm) graphs
-                # specialize the token dim to max_num_batched_tokens: "Constraints violated
-                # (input_ids, positions)". Plain vLLM with this inductor config fails the same
-                # way; leave it to Inductor's default on the torchao route.
+                # Persistent TMA matmuls specialize torchao _scaled_mm graphs to max_num_batched_tokens
+                # ("Constraints violated (input_ids, positions)", plain vLLM too).
                 if torchao_fp8:
                     compile_flags["inductor_compile_config"].pop("triton.enable_persistent_tma_matmul", None)
                 good_keys = inspect.signature(CompilationConfig).parameters.keys()
