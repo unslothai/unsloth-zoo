@@ -61,6 +61,13 @@ def _get_mapping(autograd):
     return tuple(parameters.keys()), tuple([x.default for x in parameters.values()])
 pass
 
+def _nonzero_count(n_items):
+    """A label count to divide by, with 0 replaced by 1: no labelled tokens gives loss 0 and zero grads, not 0 / 0."""
+    if torch.is_tensor(n_items):
+        return torch.where(n_items == 0, torch.ones_like(n_items), n_items)
+    return n_items if n_items != 0 else 1
+pass
+
 def apply_autograd_function(autograd, mapping):
     parameters, defaults = _get_mapping(autograd)
     return getattr(autograd, "apply")(*(
@@ -129,16 +136,16 @@ def compute_fused_ce_loss(
         logits = torch.tanh(logits)
         logits = logits * logit_softcapping
 
-    # Calculate cross entropy loss
-    reduction = "sum" if n_items is not None else "mean"
+    # Calculate cross entropy loss: sum / n_items, or sum / labelled tokens (the stock mean)
+    target = labels.view(-1).to(device).contiguous()
     loss = torch.nn.functional.cross_entropy(
         input  = logits.view(-1, vocab_size).float().contiguous(),
-        target = labels.view(-1).to(device).contiguous(),
-        reduction = reduction,
+        target = target,
+        reduction = "sum",
         ignore_index = ignore_index,
         label_smoothing = label_smoothing,
     )
-    loss = loss / n_items if n_items is not None else loss
+    loss = loss / _nonzero_count(n_items if n_items is not None else (target != ignore_index).sum())
     # Scale loss if needed for mixed precision training
     scaled_loss = loss * scaling if scaling is not None else loss
     # Must add .loss.detach otherwise autograd uses 2x VRAM
@@ -274,7 +281,7 @@ class UnslothFusedLoss(torch.autograd.Function):
             divisor = torch.tensor(divisor, dtype = torch.float32, device = device)
         # Counteract DataParallel having multiple items since it does scatter & gather
         if divisor.numel() != 1: divisor = divisor.ravel()[0]
-        divisor = divisor.to(dtype = torch.float32, device = device)
+        divisor = _nonzero_count(divisor.to(dtype = torch.float32, device = device))
         # Check what needs gradients
         lm_head_requires_grad = lm_head_weight is not None and lm_head_weight.requires_grad
         lm_head_bias_requires_grad = lm_head_bias is not None and lm_head_bias.requires_grad
@@ -698,7 +705,7 @@ def unsloth_count_aware_cross_entropy(
         # A DataParallel replica gets a one-element slice of the repeated count: keep the loss 0-dim.
         n_items = n_items.to(loss.device)
         if n_items.ndim > 0: n_items = n_items.reshape(-1)[0]
-    return loss / n_items
+    return loss / _nonzero_count(n_items)
 pass
 
 
