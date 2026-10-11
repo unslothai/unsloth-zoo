@@ -178,7 +178,6 @@ def test_backfill_leaves_complete_and_underivable_configs(monkeypatch, tmp_path)
     complete = {"temperature": 0.5}
     assert _backfill(tmp_path, {"model_type": "qwen3_next", "rope_theta": 1e6}, complete) is complete
     assert _backfill(tmp_path, {"model_type": "nemotron_h"}) == {}
-    # Explicit values and the model_config override always win.
     assert _backfill(
         tmp_path, {"model_type": "qwen3_next", "rope_parameters": {"rope_theta": 1}},
         {"rope_theta": 7},
