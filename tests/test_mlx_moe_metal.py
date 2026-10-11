@@ -694,7 +694,7 @@ def test_routed_experts_run_under_the_int8_prefill_scope(int8_prefill_first, mon
     with contextlib.ExitStack() as stack:
         for scope in scopes if int8_prefill_first else scopes[::-1]:
             stack.enter_context(scope(block))
-        assert type(block.switch_mlp.down_proj).__name__.startswith("_NaxInt8Prefill")
+        assert type(block.switch_mlp.down_proj).__name__.startswith("_NaxGather")
         mx.eval(block(x))
         gathers.clear()
         _identical(block(x), expected)

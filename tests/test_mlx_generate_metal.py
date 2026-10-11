@@ -1552,8 +1552,8 @@ def test_nax_int8_prefill_routes_dense_and_expert_calls_from_their_row_minimum(m
     monkeypatch.delenv("UNSLOTH_MLX_INT8_PREFILL")
     for scope, packed in ((inference.nax_quantized_linear, False), (generation_mode, True)):
         with scope(model, True):   # alone, and with the gate and up projections packed into one gathered call
-            assert not type(model.odd).__name__.startswith("_NaxInt8Prefill")
-            assert type(model.moe.down_proj).__name__.startswith("_NaxInt8Prefill")
+            assert not type(model.odd).__name__.startswith("_NaxGather")
+            assert type(model.moe.down_proj).__name__.startswith("_NaxGather")
             assert (type(model.moe).__name__ != "SwitchGLU") is packed
             for rows, native in natives.items():
                 routed = run(rows)
@@ -1597,7 +1597,7 @@ def test_nax_int8_prefill_packs_moe_gate_and_up_in_either_scope_order(monkeypatc
     indices = mx.random.randint(0, 8, (1, 100, 2), key = mx.random.key(1)).astype(mx.uint32)
     int8 = lambda m: inference.nax_quantized_linear(m, True)
     with int8(model):   # swapped ahead of a pack, but unpacked calls stay native
-        assert type(model.moe.gate_proj).__name__.startswith("_NaxInt8Prefill")
+        assert type(model.moe.gate_proj).__name__.startswith("_NaxGather")
         mx.eval(model.moe(x, indices))
         assert not calls
     outputs = []
@@ -1737,22 +1737,120 @@ def test_nax_int8_prefill_differentiates_through_the_stock_op(monkeypatch):
     assert all(mx.array_equal(a, b).item() for (_, a), (_, b) in zip(after, state))
 
 
+@nax_only
+def test_nax_sorted_gather_reproduces_stock_bitwise():
+    from unsloth_zoo.mlx import nax
+
+    nax.probe_sorted_gather_qmm()
+
+
+@nax_only
+def test_nax_sorted_gather_routes_sorted_expert_calls_in_its_row_range(monkeypatch):
+    from unsloth_zoo.mlx import inference, nax
+    from unsloth_zoo.mlx.generate import generation_mode
+
+    model = _QuantizedMoE()
+    calls = []
+    kernel = nax.sorted_gather_qmm
+    monkeypatch.setattr(nax, "sorted_gather_qmm", lambda *a: calls.append(
+        (a[0].shape[0], a[1].shape[1], len(a) > 6 and a[6] is not None)) or kernel(*a))
+    monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: True)
+    monkeypatch.setattr(nax, "_SORTED_GATHER_ROWS_BY_GPU", {nax._gpu_generation(): {8: (16, 100)}})
+    monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {})
+    monkeypatch.setattr(nax, "_INT8_PREFILL_EXPERT_ROWS", {8: (20, 30)})
+    monkeypatch.setattr(inference, "_NAX_SORTED_GATHER_VERIFIED", {})
+    monkeypatch.setattr(inference, "_NAX_INT8_QMM_VERIFIED", {})
+
+    def run(rows):
+        calls.clear()
+        x = mx.random.normal((1, rows, 256), key = mx.random.key(rows)).astype(mx.bfloat16)
+        indices = mx.random.randint(0, 8, (1, rows, 2), key = mx.random.key(rows + 1)).astype(mx.uint32)
+        return model.moe(x, indices)
+
+    natives = {rows: run(rows) for rows in (40, 100, 600)}   # 2 * rows sorted rows; 8 experts route 128 to 800
+    packed, down = (100, 256, True), (200, 256, False)
+    for scope, expected in ((generation_mode, [packed, down]),   # the packed gate/up reads its token rows in place
+                            (inference.nax_quantized_linear, [(200, 128, False)] * 2 + [down])):
+        with scope(model):
+            assert type(model.moe.down_proj).__name__.startswith("_NaxGather")
+            for rows, native in natives.items():
+                assert mx.array_equal(run(rows), native).item()
+                assert calls == (expected if rows == 100 else [])
+            model.train()
+            run(100)
+            assert not calls
+            model.eval()
+        assert type(model.moe.down_proj).__name__ == "QuantizedSwitchLinear"
+        assert "_unsloth_nax_sorted_gather" not in model.moe.down_proj.__dict__
+    assert len(inference._NAX_SORTED_GATHER_VERIFIED) == 3 and all(inference._NAX_SORTED_GATHER_VERIFIED.values())
+    with generation_mode(model, True):   # int8 keeps priority
+        run(100)
+        assert calls == [down]
+        monkeypatch.setattr(nax, "_INT8_PREFILL_EXPERT_ROWS", {8: (20, 20)})
+        run(100)
+        assert not calls
+    monkeypatch.setenv("UNSLOTH_MLX_NAX_SORTED_GATHER", "0")
+    with generation_mode(model):
+        assert mx.array_equal(run(100), natives[100]).item() and not calls
+
+
+@nax_only
+def test_nax_sorted_gather_first_use_check_rejects_a_wrong_kernel(monkeypatch):
+    from unsloth_zoo.mlx import inference, nax
+
+    model = _QuantizedMoE()
+    kernel = nax.sorted_gather_qmm
+    monkeypatch.setattr(nax, "sorted_gather_qmm", lambda *a: kernel(*a) * (1 + 2.0 ** -7))
+    monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: True)
+    monkeypatch.setattr(inference, "_NAX_SORTED_GATHER_VERIFIED", {})
+    x = mx.random.normal((1, 100, 256), key = mx.random.key(0)).astype(mx.bfloat16)
+    indices = mx.random.randint(0, 8, (1, 100, 2), key = mx.random.key(1)).astype(mx.uint32)
+    native = model.moe(x, indices)
+    with inference.nax_quantized_linear(model):
+        assert mx.array_equal(model.moe(x, indices), native).item()
+    assert list(inference._NAX_SORTED_GATHER_VERIFIED.values()) == [False] * 2
+
+
+@metal_only
+def test_nax_sorted_gather_stays_off_unmeasured_gpu_generations(monkeypatch):
+    from unsloth_zoo.mlx import inference, nax
+
+    model = _QuantizedMoE()
+    monkeypatch.setattr(nax, "nax_available", lambda: True)
+    monkeypatch.setattr(nax, "kernel_probe_passed", lambda *args: True)
+    monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {})
+    monkeypatch.setattr(nax, "_gpu_generation", lambda: 17)
+    assert nax.sorted_gather_row_range(256, 8) == (1024, 32768) and nax.sorted_gather_row_range(2, 4) == (16, 256)
+    assert nax.sorted_gather_row_range(256, 5) == (1024, -256)
+    assert nax.sorted_gather_qmm_supported(1024, 2048, 64, 8, "affine")
+    for shape in ((1024, 2080, 32, 8, "affine"), (1056, 2048, 64, 8, "affine"), (1024, 2048, 64, 6, "affine"),
+                  (1024, 2048, 32, 4, "mxfp4")):
+        assert not nax.sorted_gather_qmm_supported(*shape)
+    monkeypatch.setattr(nax, "_gpu_generation", lambda: 18)
+    assert nax.sorted_gather_row_range(256, 8) == (1024, -256)
+    with inference.nax_quantized_linear(model):
+        assert type(model.moe.down_proj).__name__ == "QuantizedSwitchLinear"
+
+
 @metal_only
 def test_nax_int8_prefill_probes_gate_their_own_route(monkeypatch):
     from unsloth_zoo.mlx import inference, nax
 
     model = _QuantizedMoE()
     monkeypatch.setattr(nax, "nax_available", lambda: True)
+    monkeypatch.setattr(nax, "_gpu_generation", lambda: 17)
     _int8_prefill_dense_from_64_rows(monkeypatch)
     monkeypatch.setattr(nax, "_QMM_ROWS_BY_GPU", {nax._gpu_generation(): _EVERY_ROW})
     monkeypatch.setattr(nax, "_INT8_PREFILL_EXPERT_ROWS", {8: (20, 20)})
-    for failed in (nax.QMM_PROBE_KEY, nax.INT8_QMM_PROBE_KEY):
+    for failed in (nax.QMM_PROBE_KEY, nax.INT8_QMM_PROBE_KEY, nax.SORTED_GATHER_PROBE_KEY):
         monkeypatch.setattr(nax, "kernel_probe_passed", lambda key, *args: key != failed)
         with inference.nax_quantized_linear(model, True):
             assert (model.proj._unsloth_nax_qmm_rows != (0, -1)) is (failed != nax.QMM_PROBE_KEY)
             assert bool(model.proj._unsloth_nax_int8_prefill_rows) is (failed != nax.INT8_QMM_PROBE_KEY)
-            assert (type(model.moe.down_proj).__name__.startswith("_NaxInt8Prefill")
+            assert (("_unsloth_nax_int8_prefill" in model.moe.down_proj.__dict__)
                     is (failed != nax.INT8_QMM_PROBE_KEY))
+            assert (("_unsloth_nax_sorted_gather" in model.moe.down_proj.__dict__)
+                    is (failed != nax.SORTED_GATHER_PROBE_KEY))
 
 
 @metal_only
