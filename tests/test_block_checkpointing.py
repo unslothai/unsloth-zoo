@@ -290,7 +290,8 @@ class _NeedsState(nn.Module):
 
     def forward(self, x):
         # State used by the first op, as fetched weights are: recompute cannot stop before reaching it.
-        return self.lin(x * self.scale)
+        # A trailing op that saves nothing: non-reentrant recompute would stop before the post-hook.
+        return self.lin(x * self.scale) + 1
 
 
 def _transient_state_stack(events):
@@ -324,8 +325,29 @@ def test_recompute_runs_the_blocks_hooks_again(use_reentrant):
         return h.pow(2).mean()
 
     _assert_same(_grads(ref, step), _grads(model, step))
-    # 3 forward calls, then 3 recomputes through Module.__call__.
+    # 3 forward calls, then 3 recomputes rerunning the hooks; every post-hook ran, so no state is left behind.
     assert len(ref_events) == 3 and len(events) == 6
+    assert not any("scale" in block.__dict__ for block in model)
+
+
+@pytest.mark.parametrize("use_reentrant", [False, True])
+def test_an_argument_rewriting_pre_hook_is_applied_once(use_reentrant):
+    torch.manual_seed(0)
+    ref = nn.ModuleList([nn.Linear(4, 4) for _ in range(2)])
+    model = nn.ModuleList([nn.Linear(4, 4) for _ in range(2)])
+    model.load_state_dict(ref.state_dict())
+    for block in (*ref, *model):
+        block.register_forward_pre_hook(lambda module, args: (args[0] * 3.0,))
+    bc.enable_block_gradient_checkpointing(model, use_reentrant = use_reentrant)
+    x = torch.randn(2, 4, requires_grad = True)
+
+    def step(m):
+        h = x
+        for block in m:
+            h = torch.tanh(block(h))
+        return h.pow(2).mean()
+
+    _assert_same(_grads(ref, step), _grads(model, step))
 
 
 class _FakeDiffusers(nn.Module):

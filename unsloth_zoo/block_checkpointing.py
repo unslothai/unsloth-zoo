@@ -20,6 +20,7 @@
 (fewer recomputes, more activation memory). Only torch is imported, so the file also loads on its own (no package init).
 """
 
+import contextlib
 import functools
 import inspect
 import weakref
@@ -36,7 +37,6 @@ __all__ = [
 _MARK = "_unsloth_block_checkpoint_reentrant"
 _ORDER = "_unsloth_block_checkpoint_order"
 _INDEX = "_unsloth_block_checkpoint_index"
-_RECOMPUTING = "_unsloth_block_checkpoint_recomputing"
 _FORWARD = "_unsloth_block_checkpoint_forward"
 # Per-block extras that cannot be pickled or should not follow a copy: a custom checkpoint function and a forward that
 # was already patched on the instance. A copy falls back to torch's checkpoint and its class forward.
@@ -138,19 +138,27 @@ def _inner_forward(block):
     return previous if previous is not None else type(block).forward.__get__(block, type(block))
 
 
+def _hooks(block, name):
+    from torch.nn.modules import module
+
+    return (*getattr(module, f"_global_{name}").items(), *getattr(block, f"_{name}").items())
+
+
 def _recompute_body(block, inner, *args, **kwargs):
-    # The checkpointed function. In the forward pass the wrapper's flag is set and the body runs (the block's hooks
-    # already ran around it). Recompute comes later, flag cleared, and re-enters through Module.__call__ so hooks that
-    # load weights or set transient state run again, as in torch's composable checkpoint
-    # (torch.distributed._composable.checkpoint). It only reads flags: a write inside a compiled checkpoint is an
-    # unsafe side effect.
+    # The checkpointed function. In the forward pass (flag set by the wrapper) the body runs with the block's hooks
+    # already applied around it. Recompute reruns the hooks for their side effects only (fetched weights, transient
+    # state) and ignores what they return: the saved inputs already carry the forward's argument rewrite. It only reads
+    # flags: a write inside a compiled checkpoint is an unsafe side effect.
     if block.__dict__.get(_FORWARD):
         return inner(*args, **kwargs)
-    block.__dict__[_RECOMPUTING] = True
-    try:
-        return block(*args, **kwargs)
-    finally:
-        block.__dict__.pop(_RECOMPUTING, None)
+    with_kwargs = block._forward_pre_hooks_with_kwargs
+    for hook_id, hook in _hooks(block, "forward_pre_hooks"):
+        hook(block, args, kwargs) if hook_id in with_kwargs else hook(block, args)
+    output = inner(*args, **kwargs)
+    with_kwargs = block._forward_hooks_with_kwargs
+    for hook_id, hook in _hooks(block, "forward_hooks"):
+        hook(block, args, kwargs, output) if hook_id in with_kwargs else hook(block, args, output)
+    return output
 
 
 class _CheckpointedForward:
@@ -164,12 +172,19 @@ class _CheckpointedForward:
     def __call__(self, *args, **kwargs):
         block = self.block
         inner = _inner_forward(block)
-        if block.__dict__.get(_RECOMPUTING) or not (block.training and torch.is_grad_enabled()):
+        if not (block.training and torch.is_grad_enabled()):
             return inner(*args, **kwargs)
         run = _CUSTOM.get(block) or _torch_checkpoint(getattr(block, _MARK, False))
+        # Eager non-reentrant recompute stops once the saved tensors are back, before a post-hook that releases state.
+        # Compiled, recompute is part of the backward graph and runs no Python hooks.
+        hooked = not torch.compiler.is_compiling() and (
+            any(_hooks(block, "forward_pre_hooks")) or any(_hooks(block, "forward_hooks"))
+        )
+        early_stop = torch.utils.checkpoint.set_checkpoint_early_stop(False) if hooked else contextlib.nullcontext()
         block.__dict__[_FORWARD] = True
         try:
-            return run(functools.partial(_recompute_body, block, inner), *args, **kwargs)
+            with early_stop:
+                return run(functools.partial(_recompute_body, block, inner), *args, **kwargs)
         finally:
             block.__dict__.pop(_FORWARD, None)
 
