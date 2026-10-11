@@ -5975,8 +5975,9 @@ def test_rendering_does_not_copy_the_row_media():
 
 
 @pytest.mark.parametrize("stem, expected", [
-    ("<|audio_", "<user><|audio_1|>A<|audio_2|>B<assistant>ok<user><|audio_3|>C"),
-    (None, "<user>AB<assistant>ok<user>C"),
+    ("<|audio_", "<user><|audio_1|>A<|audio_2|>B<assistant>ok"
+                 "<user>D<|audio_3|>\n<|audio_4|>C"),
+    (None, "<user>AB<assistant>ok<user>DC"),
 ])
 def test_string_only_templates_number_the_audio_parts_a_processor_declares(
         monkeypatch, stem, expected):
@@ -6004,7 +6005,10 @@ def test_string_only_templates_number_the_audio_parts_a_processor_declares(
             {"type": "audio", "audio": clip}, {"type": "text", "text": "A"},
             {"type": "audio", "audio": clip}, {"type": "text", "text": "B"}]},
         {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
-        {"role": "user", "content": [{"type": "audio"}, {"type": "text", "text": "C"}]},
+        # Back to back, the two expanded runs would read as one clip.
+        {"role": "user", "content": [
+            {"type": "text", "text": "D"}, {"type": "audio"}, {"type": "text", "text": ""},
+            {"type": "audio"}, {"type": "text", "text": "C"}]},
     ]
     assert _render_vlm_messages(_Processor(), messages) == expected
 

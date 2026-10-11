@@ -5155,6 +5155,9 @@ def _flatten_vlm_content_for_text_template(messages, image_token=None, audio_ste
             elif isinstance(part, dict) and part.get("type") == "image" and image_token:
                 texts.append(image_token)
             elif audio_stem and _is_vlm_audio_part(part):
+                # Back-to-back runs of one soft token would count as one clip.
+                if clips and "".join(texts).endswith(f"{audio_stem}{clips}|>"):
+                    texts.append("\n")
                 clips += 1
                 texts.append(f"{audio_stem}{clips}|>")
             elif isinstance(part, str):
