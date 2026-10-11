@@ -188,10 +188,50 @@ def distributed_function(n = 1, function = None, *args, **kwargs):
         obj_list = [None for _ in range(n)]
 
     if torch_distributed_is_initialized():
-        dist.broadcast_object_list(obj_list, src = 0)
-        dist.barrier()  # wait until main is done
+        device = _collective_device()
+        dist.broadcast_object_list(obj_list, src = 0, device = device)
+        # barrier() also defaults to the current device, so name this rank's GPU.
+        if device.type == "cuda" and device.index is not None:
+            dist.barrier(device_ids = [device.index])  # wait until main is done
+        else:
+            dist.barrier()  # wait until main is done
 
     return obj_list[0] if n == 1 else obj_list
+pass
+
+def _collective_device():
+    """Device for this rank's small agreement collectives.
+
+    Object collectives on NCCL default to torch.cuda.current_device(), which is
+    cuda:0 on every rank until set_device runs. unsloth is often imported (and
+    compiles) right after init_process_group, so rank 1 would open a context on
+    GPU 0 and NCCL sees two ranks on one device. Prefer the device the process
+    group is bound to, then one the caller already selected, then LOCAL_RANK.
+    """
+    try:
+        device_type = dist.distributed_c10d._get_object_coll_device()
+    except Exception:
+        device_type = "cuda" if "nccl" in str(dist.get_backend()).lower() else "cpu"
+    if device_type != "cuda":
+        if device_type == "cpu" or not hasattr(torch, device_type):
+            return torch.device("cpu")
+        return torch.device(device_type, getattr(torch, device_type).current_device())
+
+    try:
+        bound = dist.distributed_c10d._get_default_group().bound_device_id
+    except Exception:
+        bound = None
+    if bound is not None:
+        return bound
+    if torch.cuda.is_initialized() and torch.cuda.current_device() != 0:
+        return torch.device("cuda", torch.cuda.current_device())
+    try:
+        local_rank = int(os.environ.get("LOCAL_RANK", ""))
+    except ValueError:
+        local_rank = -1
+    if 0 <= local_rank < torch.cuda.device_count():
+        return torch.device("cuda", local_rank)
+    return torch.device("cuda", torch.cuda.current_device())
 pass
 
 def distributed_any(value):
@@ -203,9 +243,11 @@ def distributed_any(value):
     if not torch_distributed_is_initialized():
         return bool(value)
 
-    flags = [None for _ in range(dist.get_world_size())]
-    dist.all_gather_object(flags, bool(value))
-    return any(flags)
+    # A MAX all_reduce on a one-element tensor on this rank's own device, not
+    # all_gather_object, whose NCCL buffers land on cuda:0 before set_device.
+    flag = torch.tensor([1 if value else 0], dtype = torch.int32, device = _collective_device())
+    dist.all_reduce(flag, op = dist.ReduceOp.MAX)
+    return bool(flag.item())
 pass
 
 def _lock_path_for(target: str) -> str:
