@@ -16,9 +16,7 @@
 
 """Eval gpt-oss eager attention splits long prefills into query chunks with unchanged output.
 
-A 4 x 4608 token gpt-oss-120b prefill held ~32 GiB of logits + float32 softmax in one layer.
-Runs in a subprocess so torch.compile is identity before unsloth_zoo imports (as in
-tests/test_gpt_oss_attention_mask.py). CPU-only.
+Subprocess so torch.compile is identity before unsloth_zoo imports (tests/test_gpt_oss_attention_mask.py).
 """
 from __future__ import annotations
 

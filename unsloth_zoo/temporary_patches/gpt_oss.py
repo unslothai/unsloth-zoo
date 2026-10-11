@@ -62,9 +62,7 @@ UNSLOTH_MXFP4_NO_DEQUANTIZE = os.environ.get("UNSLOTH_MXFP4_NO_DEQUANTIZE", "0")
 # Set when patch_GptOssAttention installs the forward that routes training through
 # flex_attention_with_sink, which builds its own BlockMask and ignores these masks.
 _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED = False
-# Eval eager attention logits + float32 softmax above _EAGER_ATTENTION_CHECK_BYTES are split into
-# query chunks of half the free CUDA memory (or _EAGER_ATTENTION_CHUNK_BYTES when set). The memory
-# queries cost ~0.3 ms, so they run once per forward (layer 0) and only for large prefills.
+# Eval eager attention: above CHECK_BYTES, query chunks of half the free CUDA memory (CHUNK_BYTES overrides).
 _EAGER_ATTENTION_CHUNK_BYTES = None
 _EAGER_ATTENTION_CHECK_BYTES = 1 << 30
 _EAGER_ATTENTION_FREE = [None, 0]
@@ -3203,15 +3201,13 @@ def patch_GptOssAttention():
         )
         bsz, n_heads, qlen, _ = query.shape
         kvlen = key_states.shape[-2]
-        # The logits and their float32 softmax are bsz x heads x qlen x kvlen each: ~32 GiB in one
-        # layer of a 4 x 4608 token gpt-oss-120b prefill. Softmax is per row, so query chunks give
-        # the same rows in bounded memory.
+        # Logits + float32 softmax are ~32 GiB per layer at 4 x 4608 on 120b; softmax is per row, so chunks are exact.
         rows = qlen
         if qlen > 1 and not module.training and not torch.compiler.is_compiling():
             per_row = bsz * n_heads * (kvlen + 1) * (query.element_size() + 4)
             budget = _EAGER_ATTENTION_CHUNK_BYTES
             if budget is None and query.is_cuda and per_row * qlen > _EAGER_ATTENTION_CHECK_BYTES:
-                # Chunks are slower (+4.6% prefill at 4 x 4096 with 1 GiB ones), so split only when one shot would not fit.
+                # Chunks cost prefill speed, so split only when one shot would not fit; memory queries take ~0.3 ms, so once per forward.
                 key_id = (query.device, bsz, qlen)
                 if getattr(module, "layer_idx", 0) == 0 or _EAGER_ATTENTION_FREE[0] != key_id:
                     free, _ = torch.cuda.mem_get_info(query.device)
