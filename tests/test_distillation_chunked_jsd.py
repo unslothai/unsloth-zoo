@@ -604,3 +604,35 @@ def test_double_backward_is_not_silently_wrong():
     # The saved gradient is a constant with respect to the inputs, so a second
     # derivative through it is zero rather than a silently wrong value.
     assert grad_hidden.grad_fn is not None or not grad_hidden.requires_grad
+
+
+class _Scaler:
+    def get_scale(self):
+        return 65536.0
+
+
+def _fp16_hidden_grad(scaler, dtype):
+    torch.manual_seed(0)
+    sh = torch.randn(1, 64, 32).to(dtype).requires_grad_(True)
+    th = torch.randn(1, 64, 48).to(dtype)
+    swt = (torch.randn(1024, 32) * 0.02).to(dtype)
+    twt = (torch.randn(1024, 48) * 0.02).to(dtype)
+    mask = torch.ones(1, 64, dtype = torch.long)
+    # A global token count this large puts every unscaled per-element gradient below fp16's subnormal floor.
+    loss, _, _ = rr.distillation_chunked_jsd(
+        sh, th, swt, twt, mask, beta = 0.5, chunk_size = 16, num_items_in_batch = 2**20, scaler = scaler,
+    )
+    scale = 1.0 if scaler is None else scaler.get_scale()
+    (loss * scale).backward()  # scaler.scale(loss).backward()
+    return loss.detach(), sh.grad.double() / scale
+
+
+def test_grad_scaler_is_applied_before_the_fp16_gradient_is_saved():
+    want_loss, want = _fp16_hidden_grad(None, torch.float32)
+    got_loss, got = _fp16_hidden_grad(_Scaler(), torch.float16)
+    _, unscaled = _fp16_hidden_grad(None, torch.float16)
+    error = lambda g: ((g - want).norm() / want.norm()).item()
+    assert error(unscaled) > 0.5, "negative control: an unscaled fp16 gradient should underflow here"
+    assert error(got) < 1e-2, f"scaled fp16 gradient relative error {error(got):.3e}"
+    # The returned loss stays unscaled so logging and the outer GradScaler see the true value.
+    torch.testing.assert_close(got_loss, want_loss, rtol = 1e-2, atol = 0)
