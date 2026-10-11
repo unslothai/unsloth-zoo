@@ -351,7 +351,7 @@ def test_grpo_softcap_formula_is_cap_times_tanh():
     `logits * tanh(logits/cap)` (else saturates to no-op)."""
     src = _get_source(
         "unsloth_zoo.rl_replacements",
-        "_hidden_states_selective_log_softmax_chunk",
+        "chunked_hidden_states_selective_log_softmax",
     )
     correct = re.search(
         r"=\s*logit_softcapping\s*\*\s*torch\.tanh\([^)]+/\s*logit_softcapping\)",

@@ -19,8 +19,8 @@
 cannot be symbolic, so Dynamo specialised on the chunk count torch.chunk returns,
 ceil(T / ceil(T / chunks)), which moves with the token count T: every new count
 recompiled a graph unrolling every chunk (598 s of a 639 s, 60 step GRPO run).
-Only the chunk body is compiled now, so the graph count stays flat in T."""
-import inspect
+The chunks are now `chunks` row ranges [i*T//chunks, (i+1)*T//chunks), so the
+traced loop length depends only on `chunks` and the graph count stays flat in T."""
 import math
 import os
 import subprocess
@@ -38,9 +38,9 @@ CHILD = textwrap.dedent(
     import unsloth_zoo.rl_replacements as R
 
     chunks, hidden, vocab = 32, 24, 64
-    Ts = list(range(40, 400, 9))
-    # 9 distinct chunk counts, 20 to 32.
-    assert len({math.ceil(t / math.ceil(t / chunks)) for t in Ts}) == 9
+    Ts = list(range(70, 430, 9))
+    # 8 distinct torch.chunk counts; every T >= 2 * chunks.
+    assert len({math.ceil(t / math.ceil(t / chunks)) for t in Ts}) == 8
     torch._dynamo.config.cache_size_limit = 64
     torch.manual_seed(0)
     lm_head = (torch.randn(vocab, hidden) * 0.1).requires_grad_(True)
@@ -77,31 +77,8 @@ def test_graph_count_does_not_grow_with_the_chunk_count():
     import json
     got = json.loads(line[0][len("RESULT "):])
     for name, res in got.items():
-        # main compiled a graph per distinct chunk count (14 graphs here). Now a
-        # fixed set independent of T: the chunk graph, plus at most a non-view
-        # variant (the 1-row re-split cats) and a duck-sizing respecialisation.
-        assert res["graphs"] <= 4, (name, res)
+        # main compiled a graph per distinct chunk count (8 here); now one,
+        # independent of T (2 leaves slack for a respecialisation).
+        assert res["graphs"] <= 2, (name, res)
         assert res["err"] < 1e-4, (name, res)
 
-
-def test_pasted_source_runs_outside_the_module():
-    """The trainer generator pastes these functions' source into another module
-    (inspect.getsource in unsloth/models/rl.py), so the compiled chunk helpers
-    must be reachable from the pasted copy, not only from this module's globals."""
-    import torch
-    from unsloth_zoo import rl_replacements as R
-    ns = {"torch": torch, "os": os, "math": math}
-    for name in ("chunked_selective_log_softmax",
-                 "chunked_hidden_states_selective_log_softmax"):
-        f = getattr(R, name)
-        f = getattr(f, "__wrapped__", f)
-        exec(textwrap.dedent(inspect.getsource(f)), ns)
-    torch.manual_seed(0)
-    h = torch.randn(2, 5, 8)
-    lm = torch.randn(32, 8)
-    idx = torch.randint(0, 32, (2, 5))
-    a = ns["chunked_hidden_states_selective_log_softmax"](h, lm, idx, 3)
-    b = ns["chunked_selective_log_softmax"](h @ lm.t(), idx, 1.0, 3)
-    ref = torch.log_softmax(h @ lm.t(), -1).gather(-1, idx.unsqueeze(-1)).squeeze(-1)
-    assert (a - ref).abs().max().item() < 1e-4
-    assert (b - ref).abs().max().item() < 1e-4

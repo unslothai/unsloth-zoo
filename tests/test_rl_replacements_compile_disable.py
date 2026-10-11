@@ -37,11 +37,9 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# The chunk bodies are the compiled regions; the chunk loops around them run
-# eagerly so the graph count does not track the chunk count.
 FUNCS = [
-    "_selective_log_softmax_chunk",
-    "_hidden_states_selective_log_softmax_chunk",
+    "chunked_selective_log_softmax",
+    "chunked_hidden_states_selective_log_softmax",
 ]
 
 
@@ -94,7 +92,7 @@ def test_an_unset_flag_behaves_like_zero():
     env = dict(os.environ, PYTHONPATH=str(ROOT))
     env.pop("UNSLOTH_COMPILE_DISABLE", None)
     script = ("import unsloth_zoo.rl_replacements as R;"
-              "f=R._hidden_states_selective_log_softmax_chunk;"
+              "f=R.chunked_hidden_states_selective_log_softmax;"
               "print('COMPILED', bool(getattr(f,'_torchdynamo_orig_callable',None)))")
     r = subprocess.run([sys.executable, "-c", script], capture_output=True,
                        text=True, timeout=600, env=env)

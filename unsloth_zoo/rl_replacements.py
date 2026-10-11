@@ -46,37 +46,32 @@ def selective_log_softmax(logits, index):
     return per_token_logps
 pass
 
-# One chunk of chunked_selective_log_softmax. Only the chunk body is compiled and the
-# chunk loop runs in Python: a list's length cannot be symbolic, so compiling the loop
-# specialises on the chunk count torch.chunk returns, ceil(T / ceil(T / chunks)), which
-# moves with the token count T, and every new count recompiled a graph unrolling every
-# chunk (6-200 s each; 598 s of a 639 s 60 step GRPO run).
-@_maybe_compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
-def _selective_log_softmax_chunk(chunk_logits, chunk_index, temperature: float = 1.0):
-    chunk_logits = chunk_logits.to(torch.float32)
-    if temperature != 1.0:
-        chunk_logits = chunk_logits / temperature
-    selected_logits = torch.gather(chunk_logits, dim = -1, index = chunk_index.unsqueeze(-1)).squeeze(-1)
-    logsumexp_values = torch.logsumexp(chunk_logits, dim = -1)
-    return selected_logits - logsumexp_values
-pass
-
 # Memory-efficient chunked variant of the above on (bsz+qlen); exactly equivalent.
+@_maybe_compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
 def chunked_selective_log_softmax(
     logits,
     index,
     temperature: float = 1.0,
     chunks: int = 4,
 ):
-    # Imported here, not taken from the module scope: the trainer generator pastes this
-    # function's source into its own module, where the helper is not defined.
-    from unsloth_zoo.rl_replacements import _selective_log_softmax_chunk
-    chunked_logits = torch.chunk(logits.reshape(-1, logits.shape[-1]), chunks = chunks, dim = 0)
-    chunked_index  = torch.chunk(index.reshape(-1), chunks = chunks, dim = 0)
-    all_per_token_logps = [
-        _selective_log_softmax_chunk(chunk_logits, chunk_index, temperature)
-        for chunk_logits, chunk_index in zip(chunked_logits, chunked_index)
-    ]
+    # tensor_split: exactly `chunks` pieces for any T, so the traced loop length does
+    # not move with T (see chunked_hidden_states_selective_log_softmax).
+    flat_logits = logits.reshape(-1, logits.shape[-1])
+    flat_index = index.reshape(-1)
+    bounds = [(i * flat_logits.shape[0]) // chunks for i in range(chunks + 1)]
+    chunked_logits = [flat_logits[a:b] for a, b in zip(bounds[:-1], bounds[1:])]
+    chunked_index  = [flat_index[a:b] for a, b in zip(bounds[:-1], bounds[1:])]
+    all_per_token_logps = []
+    # Per-chunk selective_log_softmax.
+    for chunk_logits, chunk_index in zip(chunked_logits, chunked_index):
+        chunk_logits = chunk_logits.to(torch.float32)
+        if temperature != 1.0:
+            chunk_logits = chunk_logits / temperature
+        selected_logits = torch.gather(chunk_logits, dim = -1, index = chunk_index.unsqueeze(-1)).squeeze(-1)
+        logsumexp_values = torch.logsumexp(chunk_logits, dim = -1)
+        per_token_logps = selected_logits - logsumexp_values
+        all_per_token_logps.append(per_token_logps)
+    pass
     all_per_token_logps = torch.concat(all_per_token_logps)
     all_per_token_logps = all_per_token_logps.reshape((logits.shape[0], logits.shape[1]))
     return all_per_token_logps
@@ -84,47 +79,7 @@ pass
 
 RL_REPLACEMENTS["selective_log_softmax"] = chunked_selective_log_softmax
 
-# One chunk of chunked_hidden_states_selective_log_softmax; compiled alone for the same
-# reason as _selective_log_softmax_chunk, so the graph count no longer grows with T.
 @_maybe_compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
-def _hidden_states_selective_log_softmax_chunk(
-    chunk_hidden_states: torch.Tensor,
-    lm_head: torch.Tensor,
-    chunk_index: torch.Tensor,
-    logit_scale_multiply: float = 0.0,
-    logit_scale_divide: float = 0.0,
-    logit_softcapping: float = 0.0,
-    temperature: float = 1.0,
-) -> torch.Tensor:
-    # All Unsloth Zoo code licensed under AGPL3
-    # When the model is dispatched over several devices, the output head can
-    # sit on a different one from the hidden states, because accelerate
-    # places the tail of the model on the last device it fills. Co-locate on
-    # the head's device before the matmul, otherwise this raises
-    #   Unhandled FakeTensor Device Propagation for aten.mm.default,
-    #   found two different devices cuda:0, cuda:1
-    # On a single device every .to() here is a no-op.
-    chunk_hidden_states = chunk_hidden_states.to(device = lm_head.device, dtype = lm_head.dtype)
-    chunk_index = chunk_index.to(lm_head.device)
-    chunk_logits = chunk_hidden_states @ lm_head.t()
-
-    if logit_scale_multiply != 0.0:
-        chunk_logits = chunk_logits * logit_scale_multiply
-    if logit_scale_divide != 0.0:
-        chunk_logits = chunk_logits / logit_scale_divide
-    if logit_softcapping != 0.0:
-        chunk_logits = logit_softcapping * torch.tanh(chunk_logits / logit_softcapping)
-
-    chunk_logits = chunk_logits.to(torch.float32)
-
-    if temperature != 1.0:
-        chunk_logits = chunk_logits / temperature
-
-    selected_logits = torch.gather(chunk_logits, dim=-1, index=chunk_index.unsqueeze(-1)).squeeze(-1)
-    logsumexp_values = torch.logsumexp(chunk_logits, dim=-1)
-    return selected_logits - logsumexp_values
-pass
-
 def chunked_hidden_states_selective_log_softmax(
     hidden_states: torch.Tensor,
     lm_head: torch.Tensor,
@@ -134,12 +89,18 @@ def chunked_hidden_states_selective_log_softmax(
     logit_scale_divide: float = 0.0,
     logit_softcapping: float = 0.0,
     temperature: float = 1.0,
-    # Rows per chunk cap, read once at import. It stays a default rather than a
-    # body read: this body was traced with fullgraph = True before the chunk loop
-    # went eager, where `os.environ` is unsupported on torch 2.4, and callers or
-    # tests may still pass it explicitly. A non-numeric value is ignored rather
-    # than raised on, so a typo cannot break the import. 0 keeps the previous
-    # chunk boundaries exactly.
+    # Rows per chunk cap. Read HERE, in the default, not in the body: the body
+    # is traced with fullgraph = True, and `os.environ` is an unsupported op
+    # there on torch 2.4 -- Dynamo raises
+    #   torch._dynamo.exc.Unsupported: const method call bytes.decode
+    # from os._Environ.__getitem__, which the eager fallback does not catch
+    # (it only catches recompile-limit and disabled-hook breaks), so the very
+    # first call would die even with the variable unset. A default is evaluated
+    # once when the def runs, which is import time, outside any traced region.
+    # It is also a plain int argument, so Dynamo guards on it instead of
+    # constant-folding an unguarded read (2.7+ never notice a later change).
+    # A non-numeric value is ignored rather than raised on, so a typo cannot
+    # break the import. 0 keeps the previous chunk boundaries exactly.
     max_rows_per_chunk: int = (
         int(os.environ.get("UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK", "0").strip())
         if os.environ.get("UNSLOTH_GRPO_MAX_ROWS_PER_CHUNK", "0").strip().isdigit()
@@ -147,9 +108,6 @@ def chunked_hidden_states_selective_log_softmax(
     ),
 ) -> torch.Tensor:
     # All Unsloth Zoo code licensed under AGPL3
-    # The chunk loop is eager on purpose; see _selective_log_softmax_chunk. Imported
-    # here because the trainer generator pastes this source into another module.
-    from unsloth_zoo.rl_replacements import _hidden_states_selective_log_softmax_chunk
     # Reshape on this tensor's own last dim: a no-op, so a wrong-width caller
     # cannot have its row count silently rewritten and instead fails at the
     # matmul below, which prints both operands. Do not swap in a bare
@@ -174,28 +132,57 @@ def chunked_hidden_states_selective_log_softmax(
 
     # A one-row chunk's head gradient is a K=1 matmul Inductor mis-lowers under dynamic shapes (illegal
     # memory access or NaN head gradients, torch 2.13), so keep chunks at 2+ rows when the head trains.
+    # tensor_split, not torch.chunk: it returns exactly `chunks` pieces (rows differ by at
+    # most one, empty when rows < chunks), so this fullgraph trace unrolls a loop whose
+    # length depends only on `chunks`. torch.chunk returns ceil(T / ceil(T / chunks))
+    # pieces, which moves with the token count T and recompiled a graph unrolling every
+    # chunk for each new count (598 s of a 639 s, 60 step GRPO run).
+    # The smallest piece has floor(rows / chunks) rows, so halving chunks until
+    # rows >= 2 * chunks keeps every piece at 2+ rows when the head trains; the halvings
+    # depend on T only through log2(chunks) guards, not one graph per chunk count.
     lm_head_grad = torch.is_grad_enabled() and lm_head.requires_grad
-    if lm_head_grad and chunks >= flat_hidden_states.shape[0]:
-        chunks = max(flat_hidden_states.shape[0] // 2, 1)
+    if lm_head_grad:
+        while chunks > 1 and flat_hidden_states.shape[0] < 2 * chunks:
+            chunks = chunks // 2
 
-    chunked_hidden_states = list(torch.chunk(flat_hidden_states, chunks=chunks, dim=0))
-    chunked_index = list(torch.chunk(flat_index, chunks=chunks, dim=0))
-    if lm_head_grad and len(chunked_hidden_states) > 1 and chunked_hidden_states[-1].shape[0] == 1:
-        # Re-split with the previous chunk: max_rows_per_chunk then only breaks for a cap of 2 over odd rows.
-        for chunked in (chunked_hidden_states, chunked_index):
-            pair = torch.cat(chunked[-2:])
-            half = (pair.shape[0] + 1) // 2
-            chunked[-2:] = [pair[:half], pair[half:]] if pair.shape[0] >= 4 else [pair]
+    n_rows = flat_hidden_states.shape[0]
+    bounds = [(i * n_rows) // chunks for i in range(chunks + 1)]
+    chunked_hidden_states = [flat_hidden_states[a:b] for a, b in zip(bounds[:-1], bounds[1:])]
+    chunked_index = [flat_index[a:b] for a, b in zip(bounds[:-1], bounds[1:])]
 
-    all_per_token_logps = [
-        # Back on the caller's device so the concatenation below and every
+    all_per_token_logps = []
+
+    for chunk_hidden_states, chunk_index in zip(chunked_hidden_states, chunked_index):
+        # When the model is dispatched over several devices, the output head can
+        # sit on a different one from the hidden states, because accelerate
+        # places the tail of the model on the last device it fills. Co-locate on
+        # the head's device before the matmul, otherwise this raises
+        #   Unhandled FakeTensor Device Propagation for aten.mm.default,
+        #   found two different devices cuda:0, cuda:1
+        # On a single device every .to() here is a no-op and the result is
+        # bit-identical to before.
+        chunk_hidden_states = chunk_hidden_states.to(device = lm_head.device, dtype = lm_head.dtype)
+        chunk_index = chunk_index.to(lm_head.device)
+        chunk_logits = chunk_hidden_states @ lm_head.t()
+
+        if logit_scale_multiply != 0.0:
+            chunk_logits = chunk_logits * logit_scale_multiply
+        if logit_scale_divide != 0.0:
+            chunk_logits = chunk_logits / logit_scale_divide
+        if logit_softcapping != 0.0:
+            chunk_logits = logit_softcapping * torch.tanh(chunk_logits / logit_softcapping)
+
+        chunk_logits = chunk_logits.to(torch.float32)
+
+        if temperature != 1.0:
+            chunk_logits = chunk_logits / temperature
+
+        selected_logits = torch.gather(chunk_logits, dim=-1, index=chunk_index.unsqueeze(-1)).squeeze(-1)
+        logsumexp_values = torch.logsumexp(chunk_logits, dim=-1)
+        per_token_logps = selected_logits - logsumexp_values
+        # Return to the caller's device so the concatenation below and every
         # downstream consumer see the device they started on.
-        _hidden_states_selective_log_softmax_chunk(
-            chunk_hidden_states, lm_head, chunk_index,
-            logit_scale_multiply, logit_scale_divide, logit_softcapping, temperature,
-        ).to(hidden_states.device)
-        for chunk_hidden_states, chunk_index in zip(chunked_hidden_states, chunked_index)
-    ]
+        all_per_token_logps.append(per_token_logps.to(hidden_states.device))
 
     all_per_token_logps = torch.concat(all_per_token_logps)
 
