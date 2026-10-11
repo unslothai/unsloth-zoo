@@ -3871,13 +3871,53 @@ def _target_regex_for(names, all_names):
     return "(?:" + "|".join(re.escape(n) for n in sorted(wanted)) + ")"
 
 
+# Pre-fusion expert names PEFT's v5 MoE conversion probes under a fused expert container.
+_PRE_FUSION_EXPERT_NAMES = ("gate_proj", "up_proj", "down_proj", "w1", "w2", "w3")
+
+
+def _all_target_names(base_model):
+    return [
+        n for n, _ in base_model.named_modules()
+        if n and not (set(n.split(".")) & _LORA_INTERNAL_NAMES)
+    ]
+
+
+def _portable_regex_target_modules(base_model, adapter_name, regex):
+    """Exact regex over the wrapped modules when `regex` also fullmatches `<experts>.gate_proj`.
+
+    Unsloth's get_peft_regex matches `mlp.experts.gate_proj` / `up_proj`, which PEFT's v5 MoE conversion
+    reads as a v4 adapter and doubles gate_up_proj's rank, so plain PEFT fails to load (unsloth#6930).
+    """
+    import re
+    wrapped, has_param_lora = _lora_wrapped_module_names(base_model, adapter_name)
+    if not has_param_lora:
+        return None
+    containers = set()
+    for name, module in base_model.named_modules():
+        if getattr(module, "parameter_name", None):
+            while name.endswith(".base_layer"):
+                name = name[: -len(".base_layer")]
+            containers.add(name)
+    try:
+        if not any(
+            re.fullmatch(regex, f"{container}.{leaf}")
+            for container in containers for leaf in _PRE_FUSION_EXPERT_NAMES
+        ):
+            return None
+    except re.error:
+        return None
+    if not wrapped:
+        return []
+    return _target_regex_for(wrapped, _all_target_names(base_model))
+
+
 def portable_lora_target_modules(peft_model, adapter_name, target_modules):
-    """`target_modules` that plain PEFT loads as Unsloth trained, or None if already fine (list form only).
+    """`target_modules` that plain PEFT loads as Unsloth trained, or None if already fine.
 
     Gemma 4: LoRA sits on the inner `.linear`; plain PEFT would pick the unsupported wrapper, so write a regex.
     Fused experts: unmatched gate_proj / up_proj make PEFT's v5 MoE conversion double gate_up_proj's rank; drop them.
     """
-    if not isinstance(target_modules, (list, tuple, set)) or not target_modules:
+    if not target_modules or not isinstance(target_modules, (str, list, tuple, set)):
         return None
     try:
         base_model = peft_model.get_base_model()
@@ -3885,6 +3925,8 @@ def portable_lora_target_modules(peft_model, adapter_name, target_modules):
         base_model = getattr(getattr(peft_model, "base_model", None), "model", None)
     if base_model is None:
         return None
+    if isinstance(target_modules, str):
+        return _portable_regex_target_modules(base_model, adapter_name, target_modules)
     wrapped, has_param_lora = _lora_wrapped_module_names(base_model, adapter_name)
     targets = [t for t in target_modules if isinstance(t, str)]
     if len(targets) != len(target_modules):
@@ -3898,11 +3940,7 @@ def portable_lora_target_modules(peft_model, adapter_name, target_modules):
         if n.endswith(".linear") and any(hit(n[: -len(".linear")], t) for t in targets)
     ]
     if redirected:
-        all_names = [
-            n for n, _ in base_model.named_modules()
-            if n and not (set(n.split(".")) & _LORA_INTERNAL_NAMES)
-        ]
-        return _target_regex_for(wrapped, all_names)
+        return _target_regex_for(wrapped, _all_target_names(base_model))
     if has_param_lora:
         kept = [t for t in targets if any(hit(n, t) for n in wrapped)]
         if len(kept) != len(targets):
