@@ -1068,9 +1068,19 @@ def get_vllm_state_dict(
 
 
 def _block_scale_rows(start, end, block_size):
-    """Scale rows covering weight rows [start, end): every block the slice touches. A block shared by
-    two fused projections (widths not a multiple of the block) goes to both, as each one needs it."""
-    return start // block_size, -(-end // block_size)
+    """Scale rows for weight rows [start, end) of a fused block-FP8 projection.
+
+    The rebuilt layer indexes scales from its own row 0, so a slice is only representable when it
+    starts on a block boundary, or sits inside one block (a block shared by small projections then
+    goes to each of them). A slice starting mid-block and crossing into the next would get the wrong
+    scale for its later rows, so it is refused rather than rebuilt wrongly."""
+    first, last = start // block_size, (end - 1) // block_size
+    if start % block_size != 0 and first != last:
+        raise ValueError(
+            f"Unsloth: a fused block FP8 slice [{start}, {end}) starts inside a {block_size}-row block and "
+            f"crosses into the next one, which cannot be rebuilt with per-block scales."
+        )
+    return first, last + 1
 pass
 
 
