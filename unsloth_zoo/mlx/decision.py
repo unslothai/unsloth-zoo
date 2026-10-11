@@ -834,6 +834,8 @@ class _QwenModel(DecisionPipeline):
     # Below this many shared tokens a second pass costs more than it saves.
     _MIN_SHARED = 16
     takes_images = takes_audio = False
+    # Where the towers of the architectures read here sit in the model: on it, or on this part of it.
+    _TOWERS = {"qwen3_5": "", "qwen3_omni_moe": "thinker"}
     _IMAGE = "<|vision_start|><|image_pad|><|vision_end|>"
     _AUDIO = "<|audio_start|><|audio_pad|><|audio_end|>"
     _AFTER_IMAGES = ""
@@ -844,12 +846,59 @@ class _QwenModel(DecisionPipeline):
     def _architecture(self):
         return getattr(getattr(self.model, "config", None), "model_type", None)
 
+    @property
+    def _trainer_family(self):
+        """The family of a model whose media the MLX trainer prepares and forwards, as it does when it trains that family."""
+        from .utils import _AUDIO_QUALIFIED_FAMILIES, _audio_family_from_processor
+
+        family = _audio_family_from_processor(getattr(self.model, "_processor", None))
+        return family if family in _AUDIO_QUALIFIED_FAMILIES and self._architecture not in self._TOWERS else None
+
     def _reads(self, tower, part):
-        # The layouts and forwards here are those of these architectures only.
-        owner = {"qwen3_5": self.model, "qwen3_omni_moe": getattr(self.model, "thinker", None)}.get(self._architecture)
-        # Without its processor files a model loads with a bare tokenizer in the processor's place.
-        processor = getattr(getattr(self.model, "_processor", None), part, None)
-        return getattr(owner, tower, None) is not None and processor is not None
+        processor = getattr(self.model, "_processor", None)
+        if self._architecture in self._TOWERS:
+            # The layouts and forwards here are those of these architectures, as their references define them.
+            # Without its processor files a model loads with a bare tokenizer in the processor's place.
+            owner = self._TOWERS[self._architecture]
+            return getattr(processor, part, None) is not None and getattr(getattr(self.model, owner, None) if owner else self.model, tower, None) is not None
+        if not self._trainer_family:
+            return False
+        read = self.__dict__.setdefault("_media_checks", {})
+        if tower not in read:
+            read[tower] = self._trainer_reads(tower, processor)
+        return read[tower]
+
+    def _trainer_reads(self, tower, processor):
+        from .utils import _check_audio_family_gate, audio_extractor_sampling_rate, audio_input_capability
+
+        try:
+            if tower == "vision_tower":
+                return bool(getattr(self.model, "_unsloth_supports_images", False))
+            _check_audio_family_gate(processor)
+            sound = self._trainer_text(0, 1)
+            if audio_extractor_sampling_rate(processor) != _AUDIO_RATE or not audio_input_capability(self.model, processor, [sound]).capable:
+                return False
+            # A family whose rendering names no place for a clip fails the trainer's checks on its processor's output.
+            self._trainer_media([], [np.zeros(_AUDIO_RATE, np.float32)])
+        except (ValueError, RuntimeError):
+            return False
+        return True
+
+    def _trainer_text(self, images, audio):
+        """What the MLX trainer's rendering of a turn adds for this many images, then for this many clips."""
+        from .utils import _render_vlm_messages
+
+        processor, mark = self.model._processor, "STATE"
+        turn = lambda parts: _render_vlm_messages(processor, [{"role": "user", "content": [*parts, {"type": "text", "text": mark}]}]).partition(mark)
+        head, _, tail = turn([])
+
+        def added(parts):
+            # A family's rendering may put its media on either side of the text.
+            before, _, after = turn(parts)
+            return before.removeprefix(head) + after.removesuffix(tail)
+
+        # A rendering that adds nothing for a clip, as without a chat template, leaves its place to the token the processor names.
+        return added([{"type": "image"}] * images) + (added([{"type": "audio"}] * audio) or (getattr(processor, "audio_token", None) or "") * audio)
 
     @property
     def reads_images(self):
@@ -862,23 +911,46 @@ class _QwenModel(DecisionPipeline):
     def _media_text(self, images, audio):
         return self._IMAGE * images + self._AFTER_IMAGES
 
+    def _trainer_media(self, images, audio):
+        """`encode_media` as the MLX trainer collates a row, with its corrections for the family's processor."""
+        from .utils import _AudioClip, _assert_audio_runs_intact, _processor_vlm_inputs, _to_mx_vlm_batch, audio_merge_patch_needed, install_audio_merge_patch
+
+        processor = self.model._processor
+        if audio and audio_merge_patch_needed(self.model.config) and not self._media_checks.get("merge"):
+            # Held for good: this model only ever merges audio for the decision engine.
+            self._media_checks["merge"] = install_audio_merge_patch(self.model, self.model.config.audio_token_id)
+        text = self._trainer_text(len(images), len(audio)) + "\n"
+        clips = [[_AudioClip(clip, _AUDIO_RATE) for clip in audio]] if audio else None
+        inputs = dict(_processor_vlm_inputs(processor, [text], [list(images)], None, truncation = False, all_audio = clips))
+        _assert_audio_runs_intact(inputs, [len(audio)], processor, None, truncated = False, clips = clips)
+        batch = _to_mx_vlm_batch(inputs)
+        ids = batch.pop("input_ids")[0].tolist()
+        # `run` places what the processor aligned to these tokens once they sit in a prompt.
+        return ids, {"run": ids, **{name: value for name, value in batch.items() if name != "attention_mask" and not name.startswith("_unsloth_")}}
+
     def encode_media(self, images = (), audio = ()):
         """The token ids that stand for `images`, then for the `audio` clips, in the prompt, and what the processor made of them."""
         for given, reads, name in ((images, self.reads_images, "images"), (audio, self.reads_audio, "audio")):
             if given and not reads:
                 raise DecisionUnsupportedError(f"this model does not support {name}")
-        clips = dict(audio = list(audio), sampling_rate = _AUDIO_RATE, padding = True, truncation = False, return_attention_mask = True) if audio else {}
         try:
-            encoded = self.model._processor(text = [self._media_text(len(images), len(audio))], images = list(images) or None, return_tensors = "np", **clips)
+            if self._trainer_family:
+                ids, media = self._trainer_media(list(images), list(audio))
+            else:
+                clips = dict(audio = list(audio), sampling_rate = _AUDIO_RATE, padding = True, truncation = False, return_attention_mask = True) if audio else {}
+                encoded = self.model._processor(text = [self._media_text(len(images), len(audio))], images = list(images) or None, return_tensors = "np", **clips)
+                ids = np.asarray(encoded["input_ids"])[0].tolist()
+                tensors = ("pixel_values", "image_grid_thw", "input_features", "feature_attention_mask")
+                media = {name: mx.array(np.asarray(encoded[name])) for name in tensors if encoded.get(name) is not None}
+        except DecisionRequestError:
+            raise
         except (ValueError, RuntimeError) as error:
             # A clip shorter than the feature window fails inside the extractor.
             raise DecisionRequestError(f"{' or '.join(name for name, given in (('an image', images), ('an audio clip', audio)) if given)} could not be read: {error}") from error
-        ids = np.asarray(encoded["input_ids"])[0].tolist()
         if len(ids) >= self._IMAGE_TOKENS:
             named = " and ".join(name for name, given in (("images", images), ("audio clips", audio)) if given)
             raise DecisionRequestError(f"the {named} take {len(ids)} tokens; the maximum is {self._IMAGE_TOKENS}, send fewer or smaller {named}")
-        tensors = ("pixel_values", "image_grid_thw", "input_features", "feature_attention_mask")
-        return ids, {name: mx.array(np.asarray(encoded[name])) for name in tensors if encoded.get(name) is not None}
+        return ids, media
 
     def _load(self, source, revision, dtype, token, adapter = None, load_in_4bit = False):
         from .loader import FastMLXModel
@@ -892,8 +964,9 @@ class _QwenModel(DecisionPipeline):
         if load_in_4bit:
             # The loader leaves the embeddings, the output head and the towers in 16-bit for the trainers that
             # train them. No decision head does, and together they are as large again as the quantized layers.
-            read = {name for name, reads in (("vision_tower", self.reads_images), ("audio_tower", self.reads_audio)) if reads}
-            nn.quantize(self.model, 64, 4, class_predicate = lambda path, module: not read & set(path.split(".")) and hasattr(module, "to_quantized") and module.weight.shape[-1] % 64 == 0)
+            # A tower and what embeds its output are named for what they read.
+            read = [kind for kind, reads in (("vision", self.reads_images), ("audio", self.reads_audio)) if reads]
+            nn.quantize(self.model, 64, 4, class_predicate = lambda path, module: not any(kind in path for kind in read) and hasattr(module, "to_quantized") and module.weight.shape[-1] % 64 == 0)
         self.model.eval()
 
     def _load_beside(self, folder, dtype, token, head_prefix, load_in_4bit = False):
@@ -926,8 +999,22 @@ class _QwenModel(DecisionPipeline):
         return {name: getattr(merged, name) for name in names if getattr(merged, name, None) is not None}
 
     def _hidden(self, ids, media = None):
-        from .utils import _forward_text_hidden_states
+        from .utils import _VLM_PER_ROW_MEDIA_KEYS, _VLM_RELOCATABLE_SIDECAR_KEYS, _forward_text_hidden_states, _vlm_hidden_states
 
+        if self._trainer_family and (self.reads_images or self.reads_audio):
+            # Text alone goes the same way, so that the records of one dataset are read alike.
+            batch = {"input_ids": mx.array(ids)[None], "attention_mask": mx.ones((1, len(ids)), mx.int32)}
+            if media is not None:
+                run, start = media["run"], ids.index(media["run"][0])
+                for name, value in media.items():
+                    if name in _VLM_RELOCATABLE_SIDECAR_KEYS and value.shape == (1, len(run)):
+                        value = mx.concatenate([mx.zeros((1, start), value.dtype), value, mx.zeros((1, len(ids) - start - len(run)), value.dtype)], axis = 1)
+                    elif name in _VLM_PER_ROW_MEDIA_KEYS and "bound" in name:
+                        # Spans a processor states are columns of its own output.
+                        value = [np.asarray(row) + start for row in value]
+                    if name != "run":
+                        batch[name] = value
+            return _vlm_hidden_states(self.model, batch)[0]
         ids = mx.array(ids)[None]
         return _forward_text_hidden_states(self.model, ids, **self._merged(ids, media))[0]
 

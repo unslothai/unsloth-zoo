@@ -1298,6 +1298,76 @@ def test_a_plain_omni_model_trains_as_a_clef_on_images_and_audio(clef, tmp_path,
     np.testing.assert_allclose(np.array(served.logits(*args)), np.array(pipeline.logits(*args)), atol = 3e-2)
 
 
+def test_an_omni_family_of_the_trainer_reads_media_as_the_trainer_does(clef, monkeypatch):
+    from unsloth_zoo.mlx import utils
+    from unsloth_zoo.mlx.decision import DecisionRequestError
+
+    asked, forwards, merges, checked = [], [], [], []
+    Processor = type("Gemma4Processor", (), {"__module__": "mlx_vlm.models.gemma4.processing_gemma4", "audio_token": "<A>", "feature_extractor": SimpleNamespace(sampling_rate = 16000)})
+    # A rendering that puts images before the text of a turn and clips after it.
+    render = lambda parts: "".join("<i>" for part in parts if part["type"] == "image") + parts[-1]["text"] + "".join("<a>" for part in parts if part["type"] == "audio")
+    monkeypatch.setattr(utils, "_render_vlm_messages", lambda processor, messages: "<turn>" + render(messages[0]["content"]) + "</turn>")
+
+    def reader(gate = lambda processor: "gemma4"):
+        made = copy.copy(clef[0])
+        made.__dict__.pop("_media_checks", None)
+        made.model = SimpleNamespace(config = SimpleNamespace(model_type = "gemma4", audio_token_id = 7), _processor = Processor(), _unsloth_supports_images = True)
+        monkeypatch.setattr(utils, "_check_audio_family_gate", gate)
+        return made
+
+    def inputs(processor, texts, images, max_seq_length, truncation, all_audio):
+        asked.append((texts, images, [clip.sampling_rate for clip in all_audio[0]]))
+        return {"input_ids": np.array([[7, 7, 9]]), "attention_mask": np.ones((1, 3), np.int32), "mm_token_type_ids": np.array([[2, 2, 0]]), "input_features": np.ones((1, 4, 2), np.float32), "audio_bounds": [np.array([[0, 2]])]}
+
+    # A checkpoint whose processor drops audio is deaf, whatever its family.
+    monkeypatch.setattr(utils, "audio_input_capability", lambda model, processor, texts: SimpleNamespace(capable = False))
+    assert not reader().reads_audio
+    monkeypatch.setattr(utils, "audio_input_capability", lambda model, processor, texts: SimpleNamespace(capable = texts == ["<a>"]))
+    monkeypatch.setattr(utils, "_processor_vlm_inputs", inputs)
+    monkeypatch.setattr(utils, "_assert_audio_runs_intact", lambda inputs, counts, processor, length, truncated, clips: checked.append(counts))
+    monkeypatch.setattr(utils, "install_audio_merge_patch", lambda model, token: merges.append(token) or True)
+    monkeypatch.setattr(utils, "_vlm_hidden_states", lambda model, batch: forwards.append(batch) or mx.zeros((1, batch["input_ids"].shape[1], 4)))
+
+    def unverified(processor):
+        raise NotImplementedError("not verified")
+
+    deaf = reader(unverified)
+    assert deaf.reads_images and not deaf.reads_audio
+    deaf = reader()
+    deaf.model._unsloth_supports_images = False
+    assert not deaf.reads_images
+    # The families are the trainer's own.
+    with monkeypatch.context() as patch:
+        patch.setattr(utils, "_AUDIO_QUALIFIED_FAMILIES", {"gemma3n": None})
+        assert not reader().reads_images
+    # Nor does a model hear whose clip the trainer's checks find no place for in its processor's output.
+    with monkeypatch.context() as patch:
+        patch.setattr(utils, "_assert_audio_runs_intact", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("no placeholder run")))
+        assert not reader().reads_audio
+    del asked[:], merges[:], checked[:]
+    made = reader()
+    assert made.reads_images and made.reads_audio
+    clip = np.zeros(1600, np.float32)
+    ids, media = made.encode_media(["image"], [clip])
+    made.encode_media([], [clip])
+    # A rendering with no place for a clip leaves it to the token the processor names.
+    with monkeypatch.context() as patch:
+        patch.setattr(utils, "_render_vlm_messages", lambda processor, messages: "".join(part.get("text", "") for part in messages[0]["content"]))
+        assert made._trainer_text(1, 2) == "<A><A>"
+    # The marks the trainer renders for the media, the clips at their rate, and Gemma 4's audio merge corrected once.
+    assert asked[1] == (["<i><a>\n"], [["image"]], [16000]) and ids == [7, 7, 9] and merges == [7] and checked == [[1], [1], [1]]
+    with monkeypatch.context() as patch:
+        patch.setattr(utils, "_assert_audio_runs_intact", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("keeps only the first")))
+        with pytest.raises(DecisionRequestError, match = "could not be read: keeps only the first"):
+            made.encode_media([], [clip])
+    made._hidden([1, 2, 7, 7, 9, 3], media)
+    made._hidden([1, 2], None)
+    # What the processor aligned to its tokens moves with them into the prompt; text alone is forwarded the same way.
+    assert forwards[0]["mm_token_type_ids"].tolist() == [[0, 0, 2, 2, 0, 0]] and forwards[0]["input_ids"].tolist() == [[1, 2, 7, 7, 9, 3]]
+    assert np.asarray(forwards[0]["audio_bounds"]).tolist() == [[[2, 4]]]
+    assert set(forwards[0]) == {"input_ids", "attention_mask", "mm_token_type_ids", "input_features", "audio_bounds"} and set(forwards[1]) == {"input_ids", "attention_mask"}
+
+
 def test_clef_trains_on_the_images_of_its_records(clef):
     import base64, io
 
