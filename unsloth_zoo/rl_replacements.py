@@ -54,8 +54,7 @@ def chunked_selective_log_softmax(
     temperature: float = 1.0,
     chunks: int = 4,
 ):
-    # Exactly `chunks` row ranges for any T, so the traced loop length does not move
-    # with T (see chunked_hidden_states_selective_log_softmax).
+    # Fixed `chunks` row ranges; see chunked_hidden_states_selective_log_softmax.
     flat_logits = logits.reshape(-1, logits.shape[-1])
     flat_index = index.reshape(-1)
     bounds = [(i * flat_logits.shape[0]) // chunks for i in range(chunks + 1)]
@@ -132,15 +131,9 @@ def chunked_hidden_states_selective_log_softmax(
 
     # A one-row chunk's head gradient is a K=1 matmul Inductor mis-lowers under dynamic shapes (illegal
     # memory access or NaN head gradients, torch 2.13), so keep chunks at 2+ rows when the head trains.
-    # Exactly `chunks` row ranges [i*T//chunks, (i+1)*T//chunks) (sizes differ by at most
-    # one, empty when T < chunks), so this fullgraph trace unrolls a loop whose length
-    # depends only on `chunks`. torch.chunk returns ceil(T / ceil(T / chunks)) pieces,
-    # which moves with T and recompiled a graph unrolling every chunk per new count (598 s
-    # of a 639 s, 60 step GRPO run). torch.tensor_split is no better: Dynamo guards on
-    # T % chunks, one graph per remainder.
-    # The smallest piece has floor(rows / chunks) rows, so halving chunks until
-    # rows >= 2 * chunks keeps every piece at 2+ rows when the head trains; the halvings
-    # depend on T only through log2(chunks) guards, not one graph per chunk count.
+    # Exactly `chunks` row ranges, so the unrolled loop length never depends on T: torch.chunk
+    # returns ceil(T / ceil(T / chunks)) pieces and recompiled per new count; tensor_split guards
+    # on T % chunks. Halving chunks until rows >= 2 * chunks keeps every piece at 2+ rows.
     lm_head_grad = torch.is_grad_enabled() and lm_head.requires_grad
     if lm_head_grad:
         while chunks > 1 and flat_hidden_states.shape[0] < 2 * chunks:
