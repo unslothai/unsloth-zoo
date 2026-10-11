@@ -200,3 +200,18 @@ def test_explicit_max_num_batched_tokens_is_honoured(monkeypatch):
     args = _load_args(monkeypatch, max_num_seqs = 4, max_num_batched_tokens = 16384)
     assert args["max_num_seqs"] == 4
     assert args["max_num_batched_tokens"] == 16384
+
+
+def test_explicit_budget_reaches_the_vision_seq_cap(monkeypatch):
+    # vLLM 0.11 pads each profiled image to the scheduler budget, so the vision cap must see the requested one.
+    seen = []
+    real = vllm_utils.vision_max_num_seqs
+
+    def spy(approx, max_num_seqs, config, budget, *args, **kwargs):
+        seen.append(budget)
+        return real(approx, max_num_seqs, config, budget, *args, **kwargs)
+
+    monkeypatch.setattr(vllm_utils, "vision_max_num_seqs", spy)
+    args = _load_args(monkeypatch, is_vision_model = True, max_num_batched_tokens = 32768)
+    assert seen == [32768]
+    assert args["max_num_batched_tokens"] == 32768

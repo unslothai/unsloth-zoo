@@ -3642,10 +3642,14 @@ def load_vllm(
         explicit_max_num_seqs = max_num_seqs not in (None, 256)
         if explicit_max_num_seqs: approx_max_num_seqs = max(int(max_num_seqs), 1)
 
+        if requested_max_num_batched_tokens is not None:
+            max_num_batched_tokens = max(int(requested_max_num_batched_tokens), 1)
+
         vision_seq_cap = None
         if is_vision_model:
             # One image is ~6404 tokens (Llama 3.2) / ~16Ki (qwen 2.5 VL); leave room for text.
-            max_num_batched_tokens = max(8192, max_seq_length)
+            if requested_max_num_batched_tokens is None:
+                max_num_batched_tokens = max(8192, max_seq_length)
             approx_max_num_seqs = vision_max_num_seqs(
                 approx_max_num_seqs, max_num_seqs, config, max_num_batched_tokens,
                 memory_left_for_kv_cache_gb, vllm_version,
@@ -3655,9 +3659,6 @@ def load_vllm(
             else:
                 vision_seq_cap = approx_max_num_seqs
                 print(f'Unsloth: Vision model detected, setting approx_max_num_seqs to {approx_max_num_seqs}')
-
-        if requested_max_num_batched_tokens is not None:
-            max_num_batched_tokens = max(int(requested_max_num_batched_tokens), 1)
 
         # vLLM only rejects a budget under max_model_len when it cannot chunk. A
         # blanket floor instead would disable chunking for text models.
