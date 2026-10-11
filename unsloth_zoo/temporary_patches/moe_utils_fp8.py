@@ -232,6 +232,9 @@ def _dequantize_expert_slice(
     return expert_weight.to(target_dtype)
 
 
+# Temporaries per chunk in the block-scaled vectorized dequant (converted weight + expanded scale).
+_VECTORIZED_DEQUANT_CHUNK_BYTES = 256 * 1024 * 1024
+
 def _dequantize_full_expert_weights_vectorized(weight: torch.Tensor, quant_state, target_dtype: torch.dtype,) -> Optional[torch.Tensor]:
     """Dequantize all experts in one batched op."""
     if weight.ndim != 3 or weight.dtype != torch.float8_e4m3fn:
@@ -263,13 +266,22 @@ def _dequantize_full_expert_weights_vectorized(weight: torch.Tensor, quant_state
         else:
             bm = _ceil_div(M, p)
             bn = _ceil_div(N, q)
-        # Expand block scales (E, p, q) -> (E, p*bm, q*bn), trim to (E, M, N)
-        s_expanded = (
-            s.to(target_dtype)
-            .repeat_interleave(bm, dim=1)[:, :M, :]
-            .repeat_interleave(bn, dim=2)[:, :, :N]
-        )
-        return w * s_expanded
+        # Expand block scales (E, p, q) -> (E, p*bm, q*bn), trimmed to (E, M, N), a few experts at a
+        # time into one preallocated result: the whole-stack version held the converted weight, the
+        # expanded scale and the result at once (3x the dequantized size).
+        del w
+        out = torch.empty((E, M, N), dtype=target_dtype, device=weight.device)
+        per_expert = M * N * out.element_size()
+        step = max(1, _VECTORIZED_DEQUANT_CHUNK_BYTES // max(per_expert, 1))
+        for e0 in range(0, E, step):
+            e1 = min(E, e0 + step)
+            s_expanded = (
+                s[e0:e1].to(target_dtype)
+                .repeat_interleave(bm, dim=1)[:, :M, :]
+                .repeat_interleave(bn, dim=2)[:, :, :N]
+            )
+            torch.mul(weight[e0:e1].to(target_dtype), s_expanded, out=out[e0:e1])
+        return out
 
     # 2D per-row scales: (E, M) or (E, 1)
     if s.ndim == 2 and s.shape[0] == E:

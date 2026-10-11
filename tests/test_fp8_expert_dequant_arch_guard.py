@@ -84,3 +84,32 @@ def test_supported_device_keeps_the_triton_kernel(monkeypatch):
     w, s = _expert_stack()
     assert F._dequantize_full_expert_weights_unsloth(w, s, torch.bfloat16) is not None
     assert calls == [128]
+
+
+def _block_scaled(E, M, N, device):
+    g = torch.Generator(device = "cpu").manual_seed(0)
+    w = (torch.randn(E, M, N, generator = g) * 0.5).to(torch.float8_e4m3fn).to(device)
+    s = (torch.rand(E, M // 128, N // 128, generator = g) + 0.5).to(device)
+    return w, s
+
+
+def test_vectorized_block_dequant_in_chunks_matches_one_shot(monkeypatch):
+    w, s = _block_scaled(5, 256, 384, "cpu")
+    ref = w.to(torch.bfloat16) * s.to(torch.bfloat16).repeat_interleave(128, 1).repeat_interleave(128, 2)
+    monkeypatch.setattr(F, "_VECTORIZED_DEQUANT_CHUNK_BYTES", 2 * 256 * 384 * 2)  # 2 experts per chunk
+    torch.testing.assert_close(F._dequantize_full_expert_weights_vectorized(w, s, torch.bfloat16), ref, rtol = 0, atol = 0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = "needs CUDA for the peak memory check")
+def test_vectorized_block_dequant_peak_stays_near_the_result(monkeypatch):
+    # The guarded GPUs land here: the whole-stack version peaked at about 3x the result
+    # (converted weight + expanded scale + result).
+    w, s = _block_scaled(32, 1024, 1024, "cuda")
+    monkeypatch.setattr(F, "_VECTORIZED_DEQUANT_CHUNK_BYTES", 4 * 1024 * 1024 * 2)
+    result_bytes = 32 * 1024 * 1024 * 2
+    torch.cuda.synchronize(); torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    out = F._dequantize_full_expert_weights_vectorized(w, s, torch.bfloat16)
+    torch.cuda.synchronize()
+    assert out.shape == (32, 1024, 1024)
+    assert torch.cuda.max_memory_allocated() - base < 1.5 * result_bytes
