@@ -235,6 +235,28 @@ def test_fp8_experts_swap_keeps_step3p7_swiglu_limits():
     assert getattr(unclamped, "_unsloth_own_apply_gate", False) is False
 
 
+def test_fp8_experts_swap_builds_lfm2_moe_with_its_implicit_silu():
+    pytest.importorskip("transformers.integrations.finegrained_fp8", reason = "transformers without FP8")
+    from transformers.integrations import finegrained_fp8
+    if not hasattr(finegrained_fp8, "FP8Experts"):
+        pytest.skip("transformers without FP8Experts")
+    lfm2 = pytest.importorskip("transformers.models.lfm2_moe.modeling_lfm2_moe", reason = "transformers without LFM2-MoE")
+    from unsloth_zoo.vllm_utils import _swap_in_fp8_experts
+    cfg = lfm2.Lfm2MoeConfig(hidden_size = H, moe_intermediate_size = I, intermediate_size = I, num_experts = E,
+                             num_experts_per_tok = 2, num_hidden_layers = 1, num_dense_layers = 0,
+                             num_attention_heads = 2, num_key_value_heads = 1, vocab_size = 32, layer_types = ["full_attention"])
+    assert getattr(cfg, "hidden_act", None) is None and getattr(cfg, "hidden_activation", None) is None
+    with torch.device("meta"):
+        model = lfm2.Lfm2MoeForCausalLM(cfg)
+    qsd = {"model.layers.0.feed_forward.experts.gate_up_proj_scale_inv": _fp8_routed().w13_weight_scale_inv.data}
+    _swap_in_fp8_experts(model, qsd, cfg)
+    experts = model.model.layers[0].feed_forward.experts
+    assert isinstance(experts, finegrained_fp8.FP8Experts)
+    x = torch.randn(4)
+    assert torch.equal(experts.act_fn(x), torch.nn.functional.silu(x))
+    assert getattr(cfg, "hidden_act", None) is None  # the model config is not modified
+
+
 def test_missing_fp8_experts_is_refused_cleanly(monkeypatch):
     import unsloth_zoo.vllm_utils as vu
     monkeypatch.setattr(vu, "_fp8_experts_class", lambda: None)

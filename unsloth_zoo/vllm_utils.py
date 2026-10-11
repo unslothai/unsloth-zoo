@@ -48,6 +48,7 @@ import torch
 from torch import __version__ as torch_version
 import json
 import psutil
+import copy
 import functools
 import contextlib
 import inspect
@@ -1805,6 +1806,11 @@ def _swap_in_fp8_experts(new_model, quant_state_dict, config):
         path = name[: -len(suffix)].replace("language_model.model", "language_model")
         old = new_model.get_submodule(path)
         experts_config = getattr(old, "config", None) or text_config
+        if getattr(old, "act_fn", None) is torch.nn.functional.silu and getattr(experts_config, "hidden_act", None) is None \
+            and getattr(experts_config, "hidden_activation", None) is None:
+            # LFM2-MoE hard-codes F.silu and names no activation, which FP8Experts reads.
+            experts_config = copy.copy(experts_config)
+            experts_config.hidden_act = "silu"
         new = build(experts_config, list(FP8_MOE_SHARED_BLOCK))
         new.requires_grad_(False)
         new._unsloth_vllm_shared_fp8 = True
