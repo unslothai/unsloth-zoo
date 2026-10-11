@@ -56,9 +56,6 @@ from .utils import (
 from unsloth_zoo.hf_utils import dtype_from_config
 torch_cuda_device = torch.cuda.device
 
-# UNSLOTH_MXFP4_NO_DEQUANTIZE=1 keeps MXFP4 quantized (needs triton_kernels); else dequantized to bf16 for LoRA.
-UNSLOTH_MXFP4_NO_DEQUANTIZE = os.environ.get("UNSLOTH_MXFP4_NO_DEQUANTIZE", "0") == "1"
-
 # Set when patch_GptOssAttention installs the forward that routes training through
 # flex_attention_with_sink, which builds its own BlockMask and ignores these masks.
 _GPT_OSS_FLEX_SINK_ATTENTION_INSTALLED = False
@@ -2755,8 +2752,7 @@ def forward_mxfp4_gpt_oss_with_lora(
             "Either:\n"
             "  1. Install triton_kernels from OpenAI, OR\n"
             "  2. Load model with dequantization: Mxfp4Config(dequantize=True), OR\n"
-            "  3. Use the BF16 model: 'unsloth/gpt-oss-20b-BF16'\n"
-            "Set UNSLOTH_MXFP4_NO_DEQUANTIZE=0 (default) to auto-dequantize."
+            "  3. Use the BF16 model: 'unsloth/gpt-oss-20b-BF16'"
         )
     gate_up_wrapper = _get_lora_wrapper_for_param(self, "gate_up_proj")
     down_wrapper = _get_lora_wrapper_for_param(self, "down_proj")
@@ -2842,43 +2838,6 @@ def patch_mxfp4_gpt_oss_for_lora():
 
 
 TEMPORARY_PATCHES.append(patch_mxfp4_gpt_oss_for_lora)
-
-
-_MXFP4_DEQUANT_WARNED = False
-
-
-def should_dequantize_mxfp4():
-    """
-    Whether MXFP4 should be dequantized to bf16. False only when
-    UNSLOTH_MXFP4_NO_DEQUANTIZE="1" AND triton_kernels is available.
-    Memory for GPT-OSS 20B: ~10GB quantized vs ~40GB dequantized to bf16.
-    """
-    global _MXFP4_DEQUANT_WARNED
-
-    if not UNSLOTH_MXFP4_NO_DEQUANTIZE:
-        # Default: dequantize to bf16
-        if UNSLOTH_ENABLE_LOGGING and not _MXFP4_DEQUANT_WARNED:
-            _MXFP4_DEQUANT_WARNED = True
-            logger.warning(
-                "Unsloth: MXFP4 will be dequantized to bf16 (~4x memory increase). "
-                "To keep 4-bit: set UNSLOTH_MXFP4_NO_DEQUANTIZE=1 and install triton_kernels."
-            )
-        return True
-
-    if not is_triton_kernels_available():
-        if UNSLOTH_ENABLE_LOGGING and not _MXFP4_DEQUANT_WARNED:
-            _MXFP4_DEQUANT_WARNED = True
-            logger.warning(
-                "Unsloth: UNSLOTH_MXFP4_NO_DEQUANTIZE=1 but triton_kernels not available. "
-                "Will dequantize MXFP4 to bf16 (~4x memory increase). "
-                "Install triton_kernels to keep 4-bit quantized weights."
-            )
-        return True  # triton_kernels required for native MXFP4
-
-    if UNSLOTH_ENABLE_LOGGING and not _MXFP4_DEQUANT_WARNED:
-        _MXFP4_DEQUANT_WARNED = True
-        logger.info("Unsloth: Keeping MXFP4 quantized (triton_kernels available)")
-    return False  # Keep MXFP4 quantized
 
 
 @torch.compiler.disable
