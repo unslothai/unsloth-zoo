@@ -428,7 +428,7 @@ def test_engine_tokens_and_scores_are_unchanged_by_the_verify_scope_over_wide_ra
 def test_mtp_rounds_match_solo_decoding(qwen_mtp, monkeypatch):
     from unsloth_zoo.mlx.generate import SamplingParams
     from unsloth_zoo.mlx.inference import exact_speculative_verify
-    from unsloth_zoo.mlx.speculative import DraftController
+    from unsloth_zoo.mlx.speculative import DraftController, _ShortlistHead, tree_flatten
     model, ids = qwen_mtp
     greedy = SamplingParams()
     solo = [_solo(model, prompt, 96, greedy) for prompt in ids]
@@ -439,8 +439,32 @@ def test_mtp_rounds_match_solo_decoding(qwen_mtp, monkeypatch):
     with exact_speculative_verify(model):
         assert _run(model, ids, 96, _script(("draft", 3), ("copy", 4)), greedy, drafter = _drafter(model))[0] == solo
     assert len(submitted) > 2 * unscoped + len(model.language_model.model.layers)
+    picked, pick = [], _ShortlistHead.__call__
+    monkeypatch.setattr(_ShortlistHead, "__call__", lambda self, hidden: picked.append(self._source is self.table.weight) or pick(self, hidden))
     (out,), drafted, _ = _run(model, ids[:1], 96, DraftController(max_depth = 4, max_copy = 16), greedy, drafter = _drafter(model))
-    assert out == solo[0] and drafted[0][1] > 0
+    assert out == solo[0] and drafted[0][1] > 0 and picked and all(picked)
+    built = _drafter(model)
+    assert built.weight_bytes == sum(a.nbytes for _, a in tree_flatten(built.model.parameters())) + built._shortlist.nbytes
+
+
+def test_the_shortlist_head_takes_the_tables_own_best_of_its_coarse_copys_few(monkeypatch):
+    from unsloth_zoo.mlx import speculative
+    monkeypatch.setattr(speculative, "_SHORTLIST_CHUNK", 100)
+    nn, _, hidden = speculative.nn, mx.random.seed(0), mx.random.normal((6, 1, 192))
+    dense, narrow, packed = nn.Linear(192, 512, bias = False), nn.Linear(96, 512, bias = False), lambda linear: nn.QuantizedLinear.from_linear(linear, group_size = 32, bits = 8)
+    lm = lambda table, tied: SimpleNamespace(args = SimpleNamespace(tie_word_embeddings = tied), lm_head = None if tied else table, model = SimpleNamespace(embed_tokens = table if tied else None))
+    for tied, (group, table) in enumerate(((64, dense), (32, packed(dense)))):
+        (head := speculative._ShortlistHead.of(lm(table, bool(tied)))).prepare()
+        table.update({name: table[name][::-1] for name in ("weight", "scales", "biases") if name in table})
+        head.prepare()
+        rows = mx.dequantize(table.weight, table.scales, table.biases, group, 8) if tied else table.weight
+        scan = mx.quantize(rows, 64, 2)
+        assert all(mx.array_equal(a, b) for a, b in zip(head._scan, scan)) and head.nbytes == sum(a.nbytes for a in scan)
+        coarse, logits = mx.quantized_matmul(hidden, *scan, True, 64, 2), hidden @ rows.T
+        few = mx.argsort(-coarse, axis = -1)[..., :8]
+        best = mx.take_along_axis(few, mx.argmax(mx.take_along_axis(logits, few, axis = -1), axis = -1, keepdims = True), axis = -1)
+        assert head(hidden).tolist() == best.squeeze(-1).tolist() != mx.argmax(coarse, axis = -1).tolist()
+    assert speculative._ShortlistHead.of(lm(packed(dense), False)).nbytes == speculative._ShortlistHead.of(lm(dense, False)).nbytes and all(speculative._ShortlistHead.of(lm(uncovered, False)) is None for uncovered in (nn.Linear(192, 512), narrow, packed(narrow), nn.QuantizedLinear(192, 512, bias = False, bits = 2)))
 
 
 @pytest.mark.parametrize("max_lag", [128, 4])
