@@ -1405,69 +1405,20 @@ def _retrim_mamba_ssm_autotune():
 pass
 
 
-def patch_mamba_ssm_pre_ampere_fallback():
-    """Force the Mamba slow path where mamba_ssm's Triton kernels cannot compile.
+def _force_slow_path_on_raising_mamba_mixers():
+    """Make Jamba / Zamba take the slow path where they would raise instead.
 
-    Below sm_80 with Triton < 3.4 the kernels fail only once training starts
-    (`PassManager::run failed`). `is_fast_path_available` is baked in at import,
-    so flip the predicates (later imports) and the flag (already imported).
-    A version check, not a trial compile at every import. Real NVIDIA CUDA only.
+    Both bind `use_fast_kernels = config.use_mamba_kernels` (True by default)
+    and raise `Fast Mamba kernels are not available` when the kernels are
+    missing (Jamba on transformers 4.x, Zamba up to 5.14), where every other
+    Mamba family falls back to its PyTorch path. Idempotent.
     """
-    if not torch.cuda.is_available():
-        return
-    if getattr(torch.version, "hip", None) is not None:
-        return  # ROCm: mamba_ssm's requirements are a different question
-    try:
-        major, minor = _weakest_cuda_capability()
-    except Exception:
-        return
-    blocker = _mamba_ssm_fast_path_blocker((major, minor))
-    if blocker is None:
-        if (major, minor) < (8, 0):
-            # Route mamba-ssm to the local package (patch_lazy_load_kernel_local_packages), which is trimmed.
-            # falcon_mamba-ssm stays: Mamba-1 CUDA kernels, nothing autotuned, no local fallback.
-            # An already-resolved Hub module may be bound into a modeling module: trim it too.
-            _hub_packages = ()
-            try:
-                from transformers.integrations import hub_kernels as _hk
-                _hk._HUB_KERNEL_MAPPING.pop("mamba-ssm", None)
-                _resolved = _hk._KERNEL_MODULE_MAPPING.get("mamba-ssm", None)
-                if isinstance(getattr(_resolved, "__name__", None), str):
-                    _hub_packages = (_resolved.__name__,)
-                if "mamba-ssm" in _hk._KERNEL_MODULE_MAPPING:
-                    _hk._KERNEL_MODULE_MAPPING["mamba-ssm"] = None
-            except Exception:
-                pass
-            # `import mamba_ssm` loads every ssd kernel module.
-            try:
-                import mamba_ssm  # noqa: F401
-            except Exception:
-                pass
-            _single_mamba_ssm_autotune_config(_hub_packages)
-        return  # Ampere or newer, or a Triton that compiles the kernels on sm_75
-
     import sys
-
-    # 0. transformers 5 can also fetch these kernels from the Hub, through
-    #    `lazy_load_kernel`, which needs no local wheel and never consults the
-    #    predicates below. Drop the registry entries so it returns None and the
-    #    fast path stays unavailable. Before the local-wheel check, since the
-    #    Hub path is exactly the one that reaches a pre-Ampere GPU without one.
-    try:
-        from transformers.integrations import hub_kernels as _hk
-        for _kernel in ("mamba-ssm", "falcon_mamba-ssm", "causal-conv1d"):
-            _hk._HUB_KERNEL_MAPPING.pop(_kernel, None)
-            # An already-resolved module has to go too. None is enough:
-            # lazy_load_kernel only short-circuits on a real module object.
-            _hk._KERNEL_MODULE_MAPPING[_kernel] = None
-    except Exception:
-        pass
-    pass
 
     # 0b. Jamba and Zamba bind `self.use_fast_kernels = config.use_mamba_kernels`
     #     (True by default) at construction and RAISE inside that branch when the
-    #     fast path is unavailable, so step 0 above and step 1 below turn their
-    #     forward into `ValueError: Fast Mamba kernels are not available` instead
+    #     fast path is unavailable, so the pre-Ampere steps 0 and 1, or a missing
+    #     mamba_ssm / causal_conv1d, turn their forward into `ValueError: Fast Mamba kernels are not available` instead
     #     of the slow path this guard promises. Wrapping the mixer is the only
     #     thing that clears the instance flag, so it must not hang off the
     #     module's `is_fast_path_available`:
@@ -1556,6 +1507,70 @@ def patch_mamba_ssm_pre_ampere_fallback():
             pass
         pass
     pass
+pass
+
+
+def patch_mamba_ssm_pre_ampere_fallback():
+    """Force the Mamba slow path where mamba_ssm's Triton kernels cannot compile.
+
+    Below sm_80 with Triton < 3.4 the kernels fail only once training starts
+    (`PassManager::run failed`). `is_fast_path_available` is baked in at import,
+    so flip the predicates (later imports) and the flag (already imported).
+    A version check, not a trial compile at every import. Real NVIDIA CUDA only.
+    """
+    if not torch.cuda.is_available():
+        return
+    if getattr(torch.version, "hip", None) is not None:
+        return  # ROCm: mamba_ssm's requirements are a different question
+    try:
+        major, minor = _weakest_cuda_capability()
+    except Exception:
+        return
+    blocker = _mamba_ssm_fast_path_blocker((major, minor))
+    if blocker is None:
+        if (major, minor) < (8, 0):
+            # Route mamba-ssm to the local package (patch_lazy_load_kernel_local_packages), which is trimmed.
+            # falcon_mamba-ssm stays: Mamba-1 CUDA kernels, nothing autotuned, no local fallback.
+            # An already-resolved Hub module may be bound into a modeling module: trim it too.
+            _hub_packages = ()
+            try:
+                from transformers.integrations import hub_kernels as _hk
+                _hk._HUB_KERNEL_MAPPING.pop("mamba-ssm", None)
+                _resolved = _hk._KERNEL_MODULE_MAPPING.get("mamba-ssm", None)
+                if isinstance(getattr(_resolved, "__name__", None), str):
+                    _hub_packages = (_resolved.__name__,)
+                if "mamba-ssm" in _hk._KERNEL_MODULE_MAPPING:
+                    _hk._KERNEL_MODULE_MAPPING["mamba-ssm"] = None
+            except Exception:
+                pass
+            # `import mamba_ssm` loads every ssd kernel module.
+            try:
+                import mamba_ssm  # noqa: F401
+            except Exception:
+                pass
+            _single_mamba_ssm_autotune_config(_hub_packages)
+        return  # Ampere or newer, or a Triton that compiles the kernels on sm_75
+
+    import sys
+
+    # 0. transformers 5 can also fetch these kernels from the Hub, through
+    #    `lazy_load_kernel`, which needs no local wheel and never consults the
+    #    predicates below. Drop the registry entries so it returns None and the
+    #    fast path stays unavailable. Before the local-wheel check, since the
+    #    Hub path is exactly the one that reaches a pre-Ampere GPU without one.
+    try:
+        from transformers.integrations import hub_kernels as _hk
+        for _kernel in ("mamba-ssm", "falcon_mamba-ssm", "causal-conv1d"):
+            _hk._HUB_KERNEL_MAPPING.pop(_kernel, None)
+            # An already-resolved module has to go too. None is enough:
+            # lazy_load_kernel only short-circuits on a real module object.
+            _hk._KERNEL_MODULE_MAPPING[_kernel] = None
+    except Exception:
+        pass
+    pass
+
+    # 0b / 0c. Jamba and Zamba raise instead of taking the slow path.
+    _force_slow_path_on_raising_mamba_mixers()
 
     try:
         import mamba_ssm  # noqa: F401
@@ -1617,6 +1632,43 @@ def patch_mamba_ssm_pre_ampere_fallback():
 
 
 TEMPORARY_PATCHES.append(patch_mamba_ssm_pre_ampere_fallback)
+
+
+def _mamba_fast_kernels_missing():
+    """True only when Jamba / Zamba cannot get the fast kernels from anywhere."""
+    import importlib.util
+    for _pkg in ("mamba_ssm", "causal_conv1d"):
+        try:
+            if importlib.util.find_spec(_pkg) is None:
+                break
+        except Exception:
+            return False  # Unknown: keep upstream behaviour
+    else:
+        return False
+    # transformers 5 can fetch the kernels from the Hub: mirror lazy_load_kernel's own gate.
+    try:
+        from transformers.integrations import hub_kernels as _hk
+        if "mamba-ssm" not in getattr(_hk, "_HUB_KERNEL_MAPPING", {}):
+            return True
+        if "_kernels_available" in _hk.__dict__:
+            return not _hk._kernels_available  # 5.2 - 5.10: `from kernels import ...` succeeded
+        return not (_hk.is_kernels_available() and _hk.__dict__.get("_kernels_enabled", True))
+    except Exception:
+        return True
+pass
+
+
+def patch_mamba_kernels_missing_fallback():
+    """Without mamba_ssm / causal_conv1d, Jamba and Zamba raise on any device.
+
+    transformers 4.57 Jamba and Zamba up to 5.14 raise `Fast Mamba kernels are
+    not available` in the first forward unless `use_mamba_kernels=False`;
+    transformers 5.15 falls back to the slow path instead (#47527). Do the same.
+    """
+    if _mamba_fast_kernels_missing():
+        _force_slow_path_on_raising_mamba_mixers()
+pass
+TEMPORARY_PATCHES.append(patch_mamba_kernels_missing_fallback)
 
 
 def _mamba_fused_split_needs_causal_conv1d_unusable():
