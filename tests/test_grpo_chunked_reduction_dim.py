@@ -79,10 +79,12 @@ def test_the_sibling_helper_is_left_alone():
 
 def test_the_function_is_still_compiled_by_default():
     """The point is to make the compiled path work, not to opt out of it."""
-    body = _fn_source()
-    i = SRC.index(body)
+    # The chunk body is compiled; the chunk loop stays eager so the graph
+    # count does not grow with the chunk count.
+    i = SRC.index("def _hidden_states_selective_log_softmax_chunk(")
     preceding = SRC[max(0, i - 300):i]
     assert "_maybe_compile(dynamic = True, fullgraph = True" in preceding
+    assert "_hidden_states_selective_log_softmax_chunk(" in _fn_source()
 
 
 
