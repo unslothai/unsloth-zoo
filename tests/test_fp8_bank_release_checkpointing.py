@@ -78,19 +78,6 @@ def test_reentrant_checkpoint_recompute_keeps_the_bank(bank):
     assert torch.equal(x.grad, ref_x.grad)
 
 
-def test_non_reentrant_checkpoint_still_releases_the_first_forward(bank):
-    base, quant, refills = bank
-    x = torch.randn(3, K, dtype = torch.bfloat16, requires_grad = True)
-    seen = []
-    out = tuc.checkpoint(lambda h: _layer(h, base, quant, seen), x, use_reentrant = False)
-    assert seen == [0]  # the first forward runs with grad: its bank is released until backward
-    out.float().square().sum().backward()
-    assert all(nbytes > 0 for nbytes in seen[1:]), seen  # a recompute that reaches the hook keeps it
-    ref_x = x.detach().clone().requires_grad_(True)
-    torch.einsum("tk,enk->tn", ref_x, (base.to(torch.bfloat16) * quant)).float().square().sum().backward()
-    assert torch.equal(x.grad, ref_x.grad)
-
-
 def test_refill_keeps_the_block_size_of_a_non_aligned_bank():
     # H = 192 is not a multiple of 128: a sliced bank without block_size would infer 96-wide blocks.
     torch.manual_seed(0)
@@ -120,3 +107,17 @@ def test_refilled_bank_is_released_when_the_expert_inputs_are_frozen(bank):
     out.float().square().sum().backward()
     assert sum(refills) == E and scale.grad is not None
     assert dequantized.untyped_storage().nbytes() == 0  # freed at the end of backward, not kept with the graph
+
+
+def test_non_reentrant_checkpoint_does_not_refill_the_discarded_bank(bank):
+    base, quant, refills = bank
+    x = torch.randn(3, K, dtype = torch.bfloat16, requires_grad = True)
+    seen = []
+    out = tuc.checkpoint(lambda h: _layer(h, base, quant, seen), x, use_reentrant = False)
+    out.float().square().sum().backward()
+    # The first forward under checkpoint hooks keeps its bank (the recompute may stop before this hook).
+    assert seen and all(nbytes > 0 for nbytes in seen), seen
+    assert refills == []
+    ref_x = x.detach().clone().requires_grad_(True)
+    torch.einsum("tk,enk->tn", ref_x, (base.to(torch.bfloat16) * quant)).float().square().sum().backward()
+    assert torch.equal(x.grad, ref_x.grad)
