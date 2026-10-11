@@ -3152,7 +3152,6 @@ def patch_GptOssAttention():
         return key_states, value_states, attention_mask
 
     def _eager_attention_rows(module, query, key_states, value_states, attention_mask, scaling, dropout):
-        # Writes the attention output for these query rows into `query` in place.
         bsz, n_heads, qlen, _  = query.shape
         bsz, n_heads, kvlen, _ = key_states.shape
         # promote_types, not result_type: result_type returns a dtype, which graph-breaks Dynamo.
