@@ -22,6 +22,7 @@ tests/test_gpt_oss_attention_mask.py). CPU-only.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import textwrap
@@ -114,5 +115,7 @@ print('CHUNK_OK', n_full, n_chunked, diff)
 
 
 def test_eval_attention_chunks_match_single_shot():
-    r = subprocess.run([sys.executable, "-c", _SUBPROCESS], capture_output = True, text = True, timeout = 600)
+    # An NVML-based check reports CUDA on a GPU host whose devices are hidden, then CUDA init fails.
+    env = {k: v for k, v in os.environ.items() if k != "PYTORCH_NVML_BASED_CUDA_CHECK"}
+    r = subprocess.run([sys.executable, "-c", _SUBPROCESS], capture_output = True, text = True, timeout = 600, env = env)
     assert r.returncode == 0 and "CHUNK_OK" in r.stdout, (r.stdout[-3000:], r.stderr[-3000:])
