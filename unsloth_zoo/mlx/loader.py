@@ -5630,6 +5630,15 @@ def _text_decoder_paths(model):
     return tuple(path for path, module in model.named_modules() if module is text_model)
 
 
+def _beside_text_decoder(path, decoder_paths):
+    """Whether ``path`` is a tower, a connector or a head on one: outside the decoder, and no speech generator."""
+    return (
+        bool(decoder_paths)
+        and not _under_any(path, decoder_paths)
+        and not any(name in path.split(".") for name in _SPEECH_OUTPUT_MODULES)
+    )
+
+
 def _compose_mlx_quant_predicate(model, spec: _MLXQuantizationSpec, *, is_vlm, user_predicate=None):
     model_predicate = getattr(model, "quant_predicate", None)
     include_patterns = spec.quantize_modules
@@ -5651,12 +5660,7 @@ def _compose_mlx_quant_predicate(model, spec: _MLXQuantizationSpec, *, is_vlm, u
                 return False
             if any(fragment in path_parts for fragment in _MULTIMODAL_SKIP_FRAGMENTS):
                 return False
-            # Whatever else sits beside the decoder is a tower, a connector or a head on one.
-            if (
-                decoder_paths
-                and not _under_any(path, decoder_paths)
-                and not any(name in path_parts for name in _SPEECH_OUTPUT_MODULES)
-            ):
+            if _beside_text_decoder(path, decoder_paths):
                 return False
 
         if not explicitly_included:
