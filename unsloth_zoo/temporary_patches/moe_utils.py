@@ -4122,9 +4122,8 @@ def _patch_peft_save_pretrained_for_moe_layout():
     return True
 
 
-# Transformers families whose experts forward read a fused expert lora_B grouped by expert
-# from unsloth_zoo#450 until the packing fix (#1269, unsloth_zoo 2026.9.6). Any other
-# family stayed on PEFT's own forward and was trained rank_major.
+# Families whose experts forward read lora_B grouped by expert from #450 to #1269 (2026.9.6);
+# every other family stayed on PEFT's forward, i.e. rank_major.
 _LEGACY_GROUPED_LORA_B_FAMILIES = frozenset((
     "deepseek_v3", "ernie4_5_moe", "ernie4_5_vl_moe", "gemma4", "glm4_moe", "glm4_moe_lite",
     "gpt_oss", "lfm2_moe", "mixtral", "qwen3_5_moe", "qwen3_moe", "qwen3_next", "qwen3_vl_moe",
@@ -4149,13 +4148,8 @@ def _experts_family(module):
 
 
 def saved_lora_b_layouts(config) -> dict:
-    """{parameter_name or None: layout} a saved adapter_config.json declares or implies.
-
-    The marker (#1232) decides when present. Without it, an adapter Unsloth saved
-    (`auto_mapping.unsloth_fixed`) with fused expert `target_parameters` predates 2026.9.6
-    and was packed grouped by expert; the None key carries that inference, which the
-    caller limits to `_LEGACY_GROUPED_LORA_B_FAMILIES`. Anything else is PEFT's rank_major.
-    """
+    """{parameter_name: layout} from the #1232 marker, else {None: grouped_by_expert} for a
+    marker-less Unsloth save (`unsloth_fixed`) with fused expert targets, i.e. pre-2026.9.6."""
     if not isinstance(config, dict):
         return {}
     detail = config.get(FUSED_EXPERT_LORA_DETAIL_KEY)
