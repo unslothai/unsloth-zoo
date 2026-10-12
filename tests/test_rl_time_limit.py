@@ -102,6 +102,16 @@ def strategy(board):
             pass
 """
 
+STUCK_IN_HANDLER = """
+def strategy(board):
+    try:
+        while True:
+            pass
+    except Exception:
+        while True:
+            pass
+"""
+
 
 def _run(strategy, repeats = 1):
     try:
@@ -125,6 +135,10 @@ def test_strategy_looping_over_try_except_does_not_hang():
 
 def test_strategy_catching_every_timeout_does_not_hang():
     _run(NESTED_LOOP_CATCHES)
+
+
+def test_strategy_stuck_in_its_except_block_does_not_hang():
+    _run(STUCK_IN_HANDLER)
 
 
 def test_state_restored_after_repeated_swallowed_timeouts():

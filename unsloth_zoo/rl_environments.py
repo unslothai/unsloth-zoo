@@ -946,6 +946,8 @@ _CONTEXTMANAGER_FRAMES = frozenset((
 ))
 # After the deadline SIGALRM re-fires at this period until the body unwinds.
 _TIME_LIMIT_REFIRE_S = 0.01
+# Cleanup still unwinding the first timeout gets this long before re-fires raise.
+_TIME_LIMIT_CLEANUP_GRACE_S = 1.0
 
 class _TimeLimitExceeded(BaseException):
     # Raised by the re-fires: `except Exception` in generated code catches the
@@ -992,10 +994,11 @@ def time_limit(seconds: float, *, strict: bool = True, leeway: float = 0.05):
     deadline = seconds if prev_remaining <= 0.0 else min(seconds, prev_remaining)
 
     fired = False  # set by our handler
+    fired_at = 0.0
     stopping = False
 
     def _handler(signum, frame):
-        nonlocal fired
+        nonlocal fired, fired_at
         if stopping:
             return
         # Keep firing until the body unwinds: code that swallows the TimeoutError
@@ -1005,10 +1008,11 @@ def time_limit(seconds: float, *, strict: bool = True, leeway: float = 0.05):
         if frame is not None and frame.f_code in _CONTEXTMANAGER_FRAMES:
             return
         if fired:
-            if _timeout_unwinding():
+            if _timeout_unwinding() and time.monotonic() - fired_at < _TIME_LIMIT_CLEANUP_GRACE_S:
                 return
             raise _TimeLimitExceeded()
         fired = True
+        fired_at = time.monotonic()
         # include the intended arming deadline for debugging
         raise TimeoutError(f"Timed out after {deadline:g}s")
 
