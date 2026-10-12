@@ -646,7 +646,7 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
     lf_args = (f"logits={logits}" if cap.logits_kw else logits) + ", " + (
         f"labels={cap.labels_src}" if cap.labels_kw else cap.labels_src
     ) + "".join(f", {a}" for a in cap.loss_pos_tail)
-    if not cap.loss_pos_tail:
+    if not cap.loss_pos_tail and cap.vocab_expr is not None:
         lf_args += f", vocab_size={vocab}"
     lf_extra = extra
     if cap.count_injected:

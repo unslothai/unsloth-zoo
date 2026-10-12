@@ -411,7 +411,7 @@ def forward(self, hidden_states, labels=None, **kwargs):
 
 
 @pytest.mark.parametrize("shape", ["plain", "scaled", "cast_wrapped"])
-@pytest.mark.parametrize("wrapped", [False, True, "kwargs_only", "positional_only"])
+@pytest.mark.parametrize("wrapped", [False, True, "kwargs_only", "positional_only", "no_vocab"])
 def test_rewritten_forward_tracks_runtime_custom_loss(
     fresh_install, enable_env, monkeypatch, shape, wrapped,
 ):
@@ -431,6 +431,8 @@ def test_rewritten_forward_tracks_runtime_custom_loss(
             "        logits = logits.float()\n"
             "        loss = self.loss_function",
         ).replace("    return (loss, logits)", "        loss = loss.to(hidden_states.dtype)\n    return (loss, logits)")
+    if wrapped == "no_vocab":
+        source = source.replace(", vocab_size=self.config.vocab_size, **kwargs)", ", **kwargs)")
     if wrapped == "positional_only":
         source = source.replace(
             "self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)",
@@ -452,7 +454,11 @@ def test_rewritten_forward_tracks_runtime_custom_loss(
         calls.append(kwargs["num_items_in_batch"])
         return 3 * ForCausalLMLoss(*args, **kwargs)
 
-    if wrapped == "positional_only":
+    if wrapped == "no_vocab":
+        def custom_loss(logits, labels, **kwargs):
+            calls.append(kwargs["num_items_in_batch"])
+            return 3 * ForCausalLMLoss(logits, labels, 16, **kwargs)
+    elif wrapped == "positional_only":
         def custom_loss(logits, labels, size, /, **kwargs):
             calls.append(kwargs["num_items_in_batch"])
             return 3 * ForCausalLMLoss(logits, labels, size, **kwargs)
@@ -462,7 +468,8 @@ def test_rewritten_forward_tracks_runtime_custom_loss(
             return 3 * ForCausalLMLoss(**kwargs)
     elif wrapped:
         custom_loss = functools.wraps(ForCausalLMLoss)(custom_loss)
-    for loss_function in (ForCausalLMLoss, custom_loss, ForCausalLMLoss):
+    # Stock requires vocab_size, so a forward omitting it only ever runs a custom loss.
+    for loss_function in (custom_loss,) if wrapped == "no_vocab" else (ForCausalLMLoss, custom_loss, ForCausalLMLoss):
         model.loss_function = loss_function
         actual, logits = model.forward(hidden, labels = labels, num_items_in_batch = 13)
         expected, expected_logits = original(model, hidden, labels = labels, num_items_in_batch = 13)
