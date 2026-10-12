@@ -938,8 +938,7 @@ def _retry_eintr(func, *args):
             raise
 pass
 
-# Raising in these frames would skip time_limit's teardown (the with-body is
-# not entered yet, or contextlib is already unwinding it).
+# Raising in these frames would skip time_limit's teardown.
 _CONTEXTMANAGER_FRAMES = frozenset((
     contextlib._GeneratorContextManager.__enter__.__code__,
     contextlib._GeneratorContextManager.__exit__.__code__,
@@ -950,13 +949,11 @@ _TIME_LIMIT_REFIRE_S = 0.01
 _TIME_LIMIT_CLEANUP_GRACE_S = 1.0
 
 class _TimeLimitExceeded(BaseException):
-    # Raised by the re-fires: `except Exception` in generated code catches the
-    # first TimeoutError but not this. time_limit turns it into TimeoutError.
+    # Re-fires raise this so `except Exception` cannot catch it; time_limit converts it.
     pass
 
 def _timeout_unwinding():
-    # True while a timeout is still running finally / except / __exit__ blocks
-    # on its way out: re-fires must not cut that cleanup short.
+    # A timeout still unwinding through finally / except / __exit__: let that cleanup run.
     exc = sys.exc_info()[1]
     for _ in range(32):
         if exc is None:
@@ -1001,9 +998,7 @@ def time_limit(seconds: float, *, strict: bool = True, leeway: float = 0.05):
         nonlocal fired, fired_at
         if stopping:
             return
-        # Keep firing until the body unwinds: code that swallows the TimeoutError
-        # (a model-written strategy with a bare except, called in a loop) would
-        # otherwise never stop, since a one-shot alarm fires only once.
+        # Re-fire until the body unwinds: a one-shot alarm is lost once generated code swallows it.
         signal.setitimer(signal.ITIMER_REAL, _TIME_LIMIT_REFIRE_S)
         if frame is not None and frame.f_code in _CONTEXTMANAGER_FRAMES:
             return
@@ -1129,9 +1124,7 @@ pass
 _VALID_START_METHODS = frozenset({"fork", "spawn", "forkserver"})
 
 def _stop_generated_code_at_deadline(value, deadline, seconds):
-    # A strategy from create_locked_down_function can swallow the TimeoutError
-    # raised inside it while its caller keeps looping; checking around each
-    # call raises it in the caller instead.
+    # Generated code can swallow the TimeoutError raised inside it; re-raise it in the caller.
     if not (isinstance(value, types.FunctionType) and value.__code__.co_filename == "<user_code>"):
         return value
 
