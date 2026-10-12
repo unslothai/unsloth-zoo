@@ -4340,6 +4340,53 @@ def test_connectors_between_a_tower_and_the_decoder_are_not_quantized():
     assert all(text(path, object()) for path in kept)
 
 
+def _module_tree(base=nn.Module, **children):
+    module = base()
+    for name, child in children.items():
+        setattr(module, name, child)
+    return module
+
+
+def test_a_quantizing_load_skips_whatever_sits_beside_the_text_decoder():
+    import unsloth_zoo.mlx.loader as mlx_loader
+    linear = lambda: nn.Linear(2, 2)
+
+    class _Nested(nn.Module):
+        language_model = property(lambda self: self.thinker.language_model)
+
+    # A decoder may hold layers named like a connector or a speech module (Gemma's `per_layer_projection`).
+    decoder = _module_tree(per_layer_projection=linear(), image_proj=linear(), tts=linear(), layers=[_module_tree(q_proj=linear())])
+    model = _module_tree(
+        _Nested,
+        thinker=_module_tree(language_model=decoder, bridge=linear(), language_model_norm=linear()),
+        image_proj=_module_tree(linear1=linear()),
+        spatial_projectors=[_module_tree(dense=linear())],
+        tts_adapter=linear(),
+        talker=_module_tree(text_projection=linear(), code_predictor=linear()),
+        wrapper=_module_tree(tts=_module_tree(head=linear())),
+    )
+
+    def quantized(model, spec=mlx_loader._MLXQuantizationSpec(), is_vlm=True):
+        predicate = mlx_loader._compose_mlx_quant_predicate(model, spec, is_vlm=is_vlm)
+        return {path for path, module in model.named_modules() if hasattr(module, "to_quantized") and predicate(path, module)}
+
+    inside = {f"thinker.language_model.{leaf}" for leaf in ("per_layer_projection", "image_proj", "tts", "layers.0.q_proj")}
+    # Speech generators are quantized like the decoder, wherever they sit; mlx-vlm keeps the code predictor dense.
+    assert quantized(model) == inside | {"talker.text_projection", "wrapper.tts.head"}
+    # Naming a module beside the decoder does not bring it back.
+    assert quantized(model, mlx_loader._MLXQuantizationSpec(quantize_modules=("image_proj",))) == {"thinker.language_model.image_proj"}
+    assert "image_proj.linear1" in quantized(model, is_vlm=False)
+    predicate =mlx_loader._compose_mlx_quant_predicate(model, mlx_loader._MLXQuantizationSpec(), is_vlm=True)
+    assert predicate("thinker.language_model.layers.0.q_proj", linear())
+
+    # Without a decoder of its own to go by (Molmo Point), only names are skipped.
+    class _Flat(nn.Module):
+        language_model = property(lambda self: self)
+
+    flat = _module_tree(_Flat, lm=_module_tree(q_proj=linear()), point_predictor=linear(), build_vit_embedding=linear())
+    assert quantized(flat) == {"lm.q_proj", "point_predictor"}
+
+
 def test_qwen3_omni_nested_audio_tower_is_frozen():
     from unsloth_zoo.mlx.utils import freeze_audio_modules
     audio_tower = _FrozenAudioModule()

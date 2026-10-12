@@ -4258,7 +4258,12 @@ _MULTIMODAL_SKIP_FRAGMENTS = (
     "audio_encoder", "audio_projection", "embed_audio", "sound_encoder", "sound_projection",
     # Connectors no name above matches: MiniCPM-o's two, ERNIE 4.5's, and the one of InternVL-style models.
     "resampler", "audio_projection_layer", "resampler_model", "mlp1",
+    # Molmo Point's, whose decoder is not a module of its own to tell it from.
+    "build_vit_embedding",
 )
+
+# Speech generators beside the decoder are language models of their own, quantized like it.
+_SPEECH_OUTPUT_MODULES = ("talker", "code2wav", "tts")
 
 _MLX_QUANT_MODE_DEFAULTS = {
     "affine": (64, 4),
@@ -5616,6 +5621,15 @@ def _path_matches_any(path, patterns):
     )
 
 
+def _text_decoder_paths(model):
+    """Where the text decoder sits in ``model``; empty when it is not a module of its own."""
+    from .utils import _get_text_model
+    text_model = _get_text_model(model)
+    if text_model is model or not hasattr(model, "named_modules"):
+        return ()
+    return tuple(path for path, module in model.named_modules() if module is text_model)
+
+
 def _compose_mlx_quant_predicate(model, spec: _MLXQuantizationSpec, *, is_vlm, user_predicate=None):
     model_predicate = getattr(model, "quant_predicate", None)
     include_patterns = spec.quantize_modules
@@ -5623,6 +5637,8 @@ def _compose_mlx_quant_predicate(model, spec: _MLXQuantizationSpec, *, is_vlm, u
         from mlx_vlm.utils import skip_multimodal_module
     except ImportError:
         skip_multimodal_module = None
+    # By path, not identity: a forced requantize replaces the decoder's modules first.
+    decoder_paths = _text_decoder_paths(model)
 
     def predicate(path: str, module):
         path_parts = path.split(".")
@@ -5634,6 +5650,13 @@ def _compose_mlx_quant_predicate(model, spec: _MLXQuantizationSpec, *, is_vlm, u
             if skip_multimodal_module is not None and skip_multimodal_module(path):
                 return False
             if any(fragment in path_parts for fragment in _MULTIMODAL_SKIP_FRAGMENTS):
+                return False
+            # Whatever else sits beside the decoder is a tower, a connector or a head on one.
+            if (
+                decoder_paths
+                and not _under_any(path, decoder_paths)
+                and not any(name in path_parts for name in _SPEECH_OUTPUT_MODULES)
+            ):
                 return False
 
         if not explicitly_included:
