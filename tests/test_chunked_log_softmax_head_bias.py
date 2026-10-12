@@ -53,7 +53,6 @@ def test_head_bias_matches_linear(softcap, temperature):
     want = [ref.detach()] + [t.grad for t in (states, weight, bias)]
     for a, b in zip(got, want):
         torch.testing.assert_close(a.double(), b.double(), rtol = 1e-5, atol = 1e-5)
-    # The bias is material here: dropping it moves the log-probabilities.
     assert (ref - _reference(states, weight, None, index, softcap, temperature)).abs().max() > 0.1
 
 
