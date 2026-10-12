@@ -14,13 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""distributed_any() must agree across ranks on each rank's own device.
-
-It used all_gather_object, whose NCCL buffers go to torch.cuda.current_device():
-cuda:0 on every rank until set_device runs. unsloth compiles (and calls
-distributed_any) right after init_process_group in scripts that pick the device
-later, so rank 1 opened a context on GPU 0 and NCCL saw two ranks on one GPU.
-"""
+"""distributed_any() must run on each rank's own device, not cuda:0 before set_device."""
 
 from __future__ import annotations
 

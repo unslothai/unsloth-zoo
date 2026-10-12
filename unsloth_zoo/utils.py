@@ -200,14 +200,8 @@ def distributed_function(n = 1, function = None, *args, **kwargs):
 pass
 
 def _collective_device():
-    """Device for this rank's small agreement collectives.
-
-    Object collectives on NCCL default to torch.cuda.current_device(), which is
-    cuda:0 on every rank until set_device runs. unsloth is often imported (and
-    compiles) right after init_process_group, so rank 1 would open a context on
-    GPU 0 and NCCL sees two ranks on one device. Prefer the device the process
-    group is bound to, then one the caller already selected, then LOCAL_RANK.
-    """
+    """This rank's device: NCCL object collectives default to cuda:0 until set_device.
+    Prefer the bound device, then the caller's current device, then LOCAL_RANK."""
     try:
         device_type = dist.distributed_c10d._get_object_coll_device()
     except Exception:
@@ -243,8 +237,7 @@ def distributed_any(value):
     if not torch_distributed_is_initialized():
         return bool(value)
 
-    # A MAX all_reduce on a one-element tensor on this rank's own device, not
-    # all_gather_object, whose NCCL buffers land on cuda:0 before set_device.
+    # Not all_gather_object: its NCCL buffers land on cuda:0 before set_device.
     flag = torch.tensor([1 if value else 0], dtype = torch.int32, device = _collective_device())
     dist.all_reduce(flag, op = dist.ReduceOp.MAX)
     return bool(flag.item())
