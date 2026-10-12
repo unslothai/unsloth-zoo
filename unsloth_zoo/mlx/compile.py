@@ -3957,8 +3957,7 @@ def _install_qwen3_family_compile_patches():
 def _install_qwen3_omni_compile_patches(
     module, thinker_module, vision_module, language_module, tower_patches
 ):
-    """Bind the Qwen3 VL patches to Qwen3-Omni's thinker, which carries the same
-    vision tower and deepstack decoder under its own modules."""
+    """Bind the Qwen3 VL tower / deepstack patches to Qwen3-Omni's thinker modules."""
 
     import mlx.core as mx
 
@@ -3968,9 +3967,8 @@ def _install_qwen3_omni_compile_patches(
     original_deepstack = backbone_cls._deepstack_process
 
     def patched_deepstack(self, hidden_states, visual_pos_masks, visual_embeds):
-        # The patched embedder hands over one mask and one row block per modality.
-        # Upstream's embedder (inference, audio) scatters full-length residuals,
-        # which the Qwen3 VL row gather would misplace: keep its own add.
+        # Upstream's embedder (inference, audio) scatters full-length residuals that
+        # the row gather would misplace; the patched one hands a tuple of row blocks.
         if not isinstance(visual_pos_masks, tuple):
             return original_deepstack(self, hidden_states, visual_pos_masks, visual_embeds)
         for mask, rows in zip(visual_pos_masks, visual_embeds):
@@ -3989,8 +3987,7 @@ def _install_qwen3_omni_compile_patches(
         output_hidden_states=False,
         output_hidden_state_idx=None,
     ):
-        # Upstream's body without its `mx.eval(h)` every fourth layer, which
-        # cannot run inside a trace and leaves the values unchanged.
+        # Upstream's body minus its per-layer `mx.eval(h)`, which cannot run in a trace.
         h = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
         if cache is None:
             cache = [None] * len(self.layers)
@@ -4041,8 +4038,7 @@ def _install_qwen3_omni_compile_patches(
         return call(self, *args, **kwargs)
 
     def patched_get_input_embeddings(self, input_ids=None, pixel_values=None, **kwargs):
-        # Audio batches train eagerly, where upstream's merge is the one to run;
-        # its rope index reads the grids as arrays, not the static tuples.
+        # Audio trains eagerly through upstream, whose rope index wants array grids.
         if kwargs.get("input_features") is not None:
             for key in ("image_grid_thw", "video_grid_thw"):
                 if isinstance(kwargs.get(key), tuple):
@@ -4056,8 +4052,7 @@ def _install_qwen3_omni_compile_patches(
         pixel_values_videos = kwargs.get("pixel_values_videos", None)
         inputs_embeds = thinker.language_model.model.embed_tokens(input_ids)
         dtype = thinker.vision_tower.patch_embed.proj.weight.dtype
-        # One (mask, per-level rows) pair per modality present; image and video
-        # positions are disjoint, so their deepstack additions are independent.
+        # Image and video positions are disjoint, so each deepstack add is independent.
         visual_masks, visual_levels = [], []
 
         for pixels, grid, token_id in (
@@ -4100,8 +4095,7 @@ def _install_qwen3_omni_compile_patches(
         self, inputs, inputs_embeds=None, mask=None, cache=None,
         visual_pos_masks=None, deepstack_visual_embeds=None, **kwargs,
     ):
-        # With explicit positions and no cache, upstream's body reduces to this
-        # minus its `mx.eval(position_ids)`, which cannot run inside a trace.
+        # Upstream's body for explicit positions, minus its traced-illegal `mx.eval`.
         position_ids = kwargs.get("position_ids")
         if not getattr(self, "training", False) or position_ids is None or cache is not None:
             return original_language_call(
@@ -4131,8 +4125,7 @@ def _install_qwen3_omni_compile_patches(
     def training_model_call(
         self, input_ids, pixel_values=None, pixel_values_videos=None, mask=None, cache=None, **kwargs
     ):
-        # Upstream hands the batch to the thinker, whose own merge bypasses the
-        # patched embedder; route through it as Qwen3 VL's `Model.__call__` does.
+        # Upstream's thinker call would bypass the patched embedder.
         if not getattr(self, "training", False) or kwargs.get("position_ids") is None:
             return original_model_call(
                 self, input_ids, pixel_values, pixel_values_videos, mask, cache, **kwargs
