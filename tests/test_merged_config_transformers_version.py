@@ -52,14 +52,14 @@ def _write(path, version):
     return path
 
 
-@pytest.mark.parametrize("version", ["4.57.3", "4.57.6", "5.0.0.dev0", "5.17.0"])
+@pytest.mark.parametrize("version", ["4.57.3", "4.57.3.dev0", "4.57.6", "5.0.0.dev0", "5.17.0"])
 def test_version_without_the_4_57_2_crash_is_kept(tmp_path, version):
     path = _write(tmp_path / "config.json", version)
     _remove_transformers_version(path)
     assert json.loads(path.read_text())["transformers_version"] == version
 
 
-@pytest.mark.parametrize("version", ["4.56.2", "4.57.1", "4.57.2", "not-a-version"])
+@pytest.mark.parametrize("version", ["4.56.2", "4.57.1", "4.57.2", "4.57.2.dev0", "4.57.2rc1", "not-a-version"])
 def test_version_that_crashes_transformers_4_57_2_is_dropped(tmp_path, version):
     path = _write(tmp_path / "config.json", version)
     _remove_transformers_version(path)

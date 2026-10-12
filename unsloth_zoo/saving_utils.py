@@ -3382,12 +3382,12 @@ def _remove_transformers_version(config_path: Path):
         return
     if "transformers_version" not in config:
         return
-    # Only versions <= 4.57.2 are dropped: transformers 4.57.2 crashes loading such a tokenizer
-    # (`_config.model_type` on a dict). Without the field, transformers >= 4.57.3 cannot rule out
-    # an old Mistral tokenizer and wrongly tells every merged model to set `fix_mistral_regex=True`,
-    # which breaks non-Mistral tokenizers (unsloth#4996).
+    # Drop only <= 4.57.2 (transformers 4.57.2 crashes on `_config.model_type`); a missing field makes
+    # >= 4.57.3 tell every merged model to set `fix_mistral_regex=True` (unsloth#4996).
+    # packaging, not utils.Version: that maps 4.57.2.dev0 to 4.57.2.1.
+    from packaging.version import Version as PackagingVersion
     try:
-        if Version(str(config["transformers_version"])).release > (4, 57, 2):
+        if PackagingVersion(str(config["transformers_version"])).release > (4, 57, 2):
             return
     except Exception:
         pass
