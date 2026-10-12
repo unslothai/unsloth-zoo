@@ -1384,6 +1384,14 @@ def test_an_omni_family_of_the_trainer_reads_media_as_the_trainer_does(clef, mon
         patch.setattr(utils, "_assert_audio_runs_intact", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("keeps only the first")))
         with pytest.raises(DecisionRequestError, match = "could not be read: keeps only the first"):
             made.encode_media([], [clip])
+    # A clip longer than the extractor keeps gets a mark and a place of its own for each piece, as the trainer splits a row's.
+    with monkeypatch.context() as patch:
+        patch.setattr(Processor, "feature_extractor", SimpleNamespace(sampling_rate = 16000, n_samples = 1000))
+        patch.setattr(utils, "_assert_audio_runs_intact", lambda inputs, counts, processor, length, truncated, clips: checked.append([np.asarray(piece).tolist() for piece in clips[0]]))
+        del asked[:], checked[:]
+        ramp = np.arange(1600, dtype = np.float32)
+        made.encode_media([], [ramp[:900], ramp])
+        assert asked == [(["<a><a><a>\n"], [[]], [16000] * 3)] and checked == [[ramp[:900].tolist(), ramp[:800].tolist(), ramp[800:].tolist()]]
     made._hidden([1, 2, 7, 7, 9, 3], media)
     made._hidden([1, 2], None)
     # The trainer's preparation runs in its two halves: content on the media run, which may grow it (Phi-4 expands

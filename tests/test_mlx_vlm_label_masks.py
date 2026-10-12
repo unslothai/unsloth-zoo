@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import re
+import warnings
 
 import numpy as np
 import pytest
@@ -4716,8 +4717,167 @@ def test_collation_hands_the_clip_lengths_to_the_window_check(monkeypatch):
 
     processor = _Spans()
     _qualify(monkeypatch, processor=processor)
+    # Pre-rendered text cannot be given a placeholder per piece.
     with pytest.raises(ValueError, match="audio clip"):
-        _finalized_collate([_audio_row(_CLIP)], processor, 16, None)
+        _finalized_collate([{"text": "<audio>", "audio": [_CLIP]}], processor, 16, None)
+
+
+def _run_capped_processor(window=None, n_samples=None, cap=True):
+    """A cap of 8 samples: two tokens of 250 ms at 16 Hz."""
+    class _Extractor:
+        sampling_rate = 16
+
+    if window is not None:
+        _Extractor.__call__ = lambda self, audio, max_length=window, truncation=True: None
+    if n_samples is not None:
+        _Extractor.n_samples = n_samples
+
+    class _Processor:
+        feature_extractor = _Extractor()
+        audio_seq_length = 2 if cap else None
+        audio_ms_per_token = 250 if cap else None
+
+    return _Processor()
+
+
+@pytest.mark.parametrize("window", [None, 16])
+def test_a_clip_longer_than_its_capped_run_is_refused_when_its_audio_is_kept(
+        monkeypatch, window):
+    """Gemma 4 unified caps the run but keeps every frame, and the model fills
+    placeholders from the batch's frames in order, so the surplus is merged into
+    the next clip's positions."""
+    from unsloth_zoo.mlx import utils
+
+    monkeypatch.setattr(utils, "_reported_cut_audio", set())
+    processor = _run_capped_processor(window=window)
+    fits, long = np.zeros(8, np.float32), np.zeros(9, np.float32)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        utils._assert_audio_runs_cover_their_clips([[fits], [fits, fits]], processor)
+    # The batch's last clip has no next one for its surplus to land on.
+    with pytest.warns(UserWarning, match="first 8 samples"):
+        utils._assert_audio_runs_cover_their_clips([[fits], [fits, long]], processor)
+    with pytest.raises(ValueError, match="row 1 carries a 9-sample.*at most 8 samples"):
+        utils._assert_audio_runs_cover_their_clips([[fits], [long, fits]], processor)
+
+
+@pytest.mark.parametrize("kwargs", [
+    dict(window=8), dict(window=6), dict(n_samples=8, cap=False),
+    dict(window=8, cap=False),
+])
+def test_a_clip_its_extractor_cuts_is_warned_about_once(monkeypatch, kwargs):
+    """Gemma 4, Gemma 3n and Qwen3-Omni cut the waveform and size the run from
+    what is left, so the row stays aligned and only loses audio."""
+    from unsloth_zoo.mlx import utils
+
+    monkeypatch.setattr(utils, "_reported_cut_audio", set())
+    processor = _run_capped_processor(**kwargs)
+    limit = kwargs.get("window") or kwargs["n_samples"]
+    fits, long = np.zeros(limit, np.float32), np.zeros(limit + 1, np.float32)
+    rows = [[fits, long], [fits]]
+    with pytest.warns(UserWarning, match=f"first {limit} samples"):
+        utils._assert_audio_runs_cover_their_clips(rows, processor)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        utils._assert_audio_runs_cover_their_clips(rows, processor)
+        utils._assert_audio_runs_cover_their_clips(
+            rows, _run_capped_processor(cap=False))
+
+
+def test_a_cap_the_corrected_count_ignores_refuses_nothing(monkeypatch):
+    """Gemma 4's placeholder count is replaced by one read off the extractor's
+    frames, so a clip past its configured cap is still fully covered."""
+    from unsloth_zoo.mlx import utils
+
+    monkeypatch.setattr(utils, "_reported_cut_audio", set())
+    processor = _run_capped_processor(window=16)
+    monkeypatch.setattr(utils, "_AUDIO_PROCESSOR_REPAIRS", {
+        utils._audio_family_from_processor(processor): None})
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        utils._assert_audio_runs_cover_their_clips(
+            [[np.zeros(16, np.float32)]], processor)
+    with pytest.warns(UserWarning, match="first 16 samples"):
+        utils._assert_audio_runs_cover_their_clips(
+            [[np.zeros(17, np.float32)]], processor)
+
+
+@pytest.mark.parametrize("row", ["messages", "prompt_completion"])
+def test_collation_hands_the_clip_lengths_to_the_run_cap_check(monkeypatch, row):
+    class _Capped(_FakeGemmaAudioProcessor):  # a cap of 16 samples
+        audio_seq_length = 1
+        audio_ms_per_token = 1
+
+    processor = _Capped()
+    _qualify(monkeypatch, processor=processor)
+    # Pre-rendered text cannot be given a placeholder per piece.
+    audio = [{"array": np.zeros(17, np.float32), "sampling_rate": 16000}]
+    item = {"text": "<audio>", "audio": audio}
+    if row == "prompt_completion":
+        item = {"prompt": "<audio>", "completion": "ok", "audio": audio}
+    with pytest.raises(ValueError, match="Split the clip"):
+        _finalized_collate([item, item], processor, 16, None)
+
+
+def test_a_clip_past_the_window_is_split_into_near_equal_pieces():
+    from unsloth_zoo.mlx.utils import _AudioClip, _split_audio_past_the_window
+
+    processor = _run_capped_processor()  # keeps 8 samples of a clip
+    short = _AudioClip(np.arange(8, dtype=np.float32), 16)
+    long = _AudioClip(np.arange(17, dtype=np.float32), 16)
+    messages = [
+        {"role": "user", "content": [{"type": "audio"}, {"type": "text", "text": "A"}]},
+        {"role": "assistant", "content": "ok"},
+        {"role": "user", "content": [{"type": "text", "text": "B"}, {"type": "audio"}]},
+    ]
+    split, pieces = _split_audio_past_the_window(messages, [short, long], processor)
+    assert [[part["type"] for part in m["content"]] if isinstance(m["content"], list)
+            else m["content"] for m in split] == [
+        ["audio", "text"], "ok", ["text", "audio", "audio", "audio"]]
+    assert [len(piece) for piece in pieces] == [8, 6, 6, 5]
+    assert np.array_equal(np.concatenate(pieces[1:]), long)
+    assert {piece.sampling_rate for piece in pieces} == {16}
+
+    empty = _AudioClip(np.zeros(0, dtype=np.float32), 16)
+    split, pieces = _split_audio_past_the_window(messages, [empty, long], processor)
+    assert pieces[0] is empty and [len(piece) for piece in pieces[1:]] == [6, 6, 5]
+
+    for unsplit in ([short, short], [long]):  # nothing over; parts and clips differ
+        same, clips = _split_audio_past_the_window(messages, unsplit, processor)
+        assert same is messages and clips is unsplit
+    for rendered, clips in (("Hello.", []), ("<audio>", [long])):
+        assert _split_audio_past_the_window(rendered, clips, processor)[0] is rendered
+
+
+@pytest.mark.parametrize("row", ["messages", "bare_list", "prompt_completion"])
+def test_collation_gives_each_piece_of_a_long_clip_its_own_run(monkeypatch, row):
+    """Otherwise the audio past the window is never trained on."""
+    seen = {}
+
+    class _Capped(_FakeGemmaAudioProcessor):  # a cap of 16 samples
+        audio_seq_length = 1
+        audio_ms_per_token = 1
+
+        def __call__(self, text, audio=None, max_length=None, **kwargs):
+            seen["audio"] = audio or seen.get("audio")
+            return super().__call__(text, audio, max_length, **kwargs)
+
+    processor = _Capped()
+    _qualify(monkeypatch, processor=processor)
+    wave = np.arange(32, dtype=np.float32)
+    item = _audio_row({"array": wave, "sampling_rate": 16000})
+    if row == "prompt_completion":
+        item = {"prompt": item["messages"][:1], "completion": item["messages"][1:]}
+    if row == "bare_list":
+        item = item["messages"]
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        batch = _finalized_collate([item], processor, 64, None)
+    batch = batch[0] if isinstance(batch, tuple) else batch
+    assert [np.asarray(piece).tolist() for piece in seen["audio"]] == [
+        wave[:16].tolist(), wave[16:].tolist()]
+    ids = np.asarray(batch["input_ids"])[0].tolist()
+    assert ids.count(301) == 2 and ids.count(300) == 2 * processor.soft_tokens
 
 
 def test_ids_the_run_path_rejects_are_rejected_on_the_bounds_path_too():
@@ -5876,6 +6036,45 @@ def test_rendering_does_not_copy_the_row_media():
                              {"type": "text", "text": "Q"}]}]
     assert _render_vlm_messages(_Processor(), messages) == "<image>Q"
     assert copied == []
+
+
+@pytest.mark.parametrize("stem, expected", [
+    ("<|audio_", "<user><|audio_1|>A<|audio_2|>B<assistant>ok"
+                 "<user>D<|audio_3|>\n<|audio_4|>C"),
+    (None, "<user>AB<assistant>ok<user>DC"),
+])
+def test_string_only_templates_number_the_audio_parts_a_processor_declares(
+        monkeypatch, stem, expected):
+    """Phi-4's template concatenates content as a string, so a typed audio part
+    reaches it only as the `<|audio_N|>` its processor module declares."""
+    import sys
+    from unsloth_zoo.mlx.utils import _render_vlm_messages
+
+    monkeypatch.setattr(sys.modules[__name__], "AUDIO_PLACEHOLDER_PATTERN", stem,
+                        raising=False)
+
+    class _Processor:
+        image_token = None
+        boi_token = None
+        chat_template = ("{% for m in messages %}"
+                         "{{ '<' + m['role'] + '>' + m['content'] }}{% endfor %}")
+
+        def apply_chat_template(self, messages, **kwargs):
+            import jinja2
+            return jinja2.Template(self.chat_template).render(messages=messages)
+
+    clip = {"array": np.zeros(8, dtype=np.float32), "sampling_rate": 16000}
+    messages = [
+        {"role": "user", "content": [
+            {"type": "audio", "audio": clip}, {"type": "text", "text": "A"},
+            {"type": "audio", "audio": clip}, {"type": "text", "text": "B"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+        # Back to back, the two expanded runs would read as one clip.
+        {"role": "user", "content": [
+            {"type": "text", "text": "D"}, {"type": "audio"}, {"type": "text", "text": ""},
+            {"type": "audio"}, {"type": "text", "text": "C"}]},
+    ]
+    assert _render_vlm_messages(_Processor(), messages) == expected
 
 
 def test_compile_preparation_adds_no_metadata_key_without_metadata():
