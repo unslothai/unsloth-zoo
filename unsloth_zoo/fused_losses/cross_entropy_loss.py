@@ -62,7 +62,7 @@ def _get_mapping(autograd):
 pass
 
 def _nonzero_count(n_items):
-    """A label count to divide by, with 0 replaced by 1: no labelled tokens gives loss 0 and zero grads, not 0 / 0."""
+    """0 -> 1 so an all-masked batch gives loss 0, not 0 / 0."""
     if torch.is_tensor(n_items):
         return torch.where(n_items == 0, torch.ones_like(n_items), n_items)
     return n_items if n_items != 0 else 1
@@ -136,7 +136,7 @@ def compute_fused_ce_loss(
         logits = torch.tanh(logits)
         logits = logits * logit_softcapping
 
-    # Calculate cross entropy loss: sum / n_items, or sum / labelled tokens (the stock mean)
+    # sum / n_items, else sum / labelled tokens (the stock mean)
     target = labels.view(-1).to(device).contiguous()
     loss = torch.nn.functional.cross_entropy(
         input  = logits.view(-1, vocab_size).float().contiguous(),

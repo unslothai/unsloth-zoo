@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""A batch with no labelled tokens (every label -100) must give loss 0 and zero gradients, not 0 / 0 = NaN.
-That happens when truncation cuts a whole response away under train_on_responses_only at batch size 1."""
+"""All labels -100 (e.g. truncated response, batch size 1) must give loss 0 and zero grads, not NaN."""
 
 import pytest
 import torch
@@ -58,7 +57,6 @@ def test_count_aware_cross_entropy_all_masked_with_a_zero_count():
 
 
 def test_count_aware_cross_entropy_without_a_count_stays_the_stock_mean():
-    # n_items = None is the stock CrossEntropyLoss() fallback: same result as torch, NaN included.
     logits = torch.randn(16, V)
     labels = torch.full((16,), -100)
     stock = torch.nn.functional.cross_entropy(logits, labels)
