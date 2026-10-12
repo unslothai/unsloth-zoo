@@ -878,8 +878,6 @@ def test_host_arena_is_registered_portable(monkeypatch):
 
 
 def test_pin_budget_is_split_across_the_ranks_on_this_host(monkeypatch):
-    """Each rank of a torchrun launch pins its own host copy of the swapped layers and reads the
-    same free RAM, so each may only claim its share of the headroom."""
     import sys
     import types
     gib = 1 << 30
