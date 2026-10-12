@@ -483,9 +483,11 @@ _GROUPED_MM_FP16_OP = _register_grouped_mm_fp16_op()
 # Off sm90 / sm100 torch._grouped_mm is a per-expert cuBLAS loop; one Triton launch beats it for small experts.
 # Measured max average rows per expert per class: "lora" (a dim <= 32), "many" / "few" (>= / < 64 experts),
 # "dw" (base weight grad). sm75 has no Triton MMA, sm86 is unmeasured, sm90 / sm100 have native grouped GEMMs.
+# sm121 (GB10 / DGX Spark) takes sm120's tiles and limits (1.15x on Qwen3.5-35B-A3B QLoRA, unsloth-zoo#1661).
 _TRITON_GROUPED_MM_AUTO_ROWS = {
     (8, 0):  {"lora": -1, "many": 2048, "few": 256, "dw": 128},
     (12, 0): {"lora": -1, "many": 2048, "few": 256, "dw": 64},
+    (12, 1): {"lora": -1, "many": 2048, "few": 256, "dw": 64},
     (8, 9):  {"lora": -1, "many": 32,   "few": 32,  "dw": 0},
 }
 _TRITON_GROUPED_MM_CAPABILITY = {}
