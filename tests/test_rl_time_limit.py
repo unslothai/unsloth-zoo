@@ -65,7 +65,7 @@ HARNESS = textwrap.dedent('''
         assert signal.getsignal(signal.SIGALRM) is signal.SIG_DFL
         assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
         assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
-        assert R._catch_all_helper is None  # a timed-out helper is killed, not reused
+        assert getattr(R, "_catch_all_helper", None) is None  # a timed-out helper is killed, not reused
     time.sleep(0.2)  # a leftover alarm would kill the process here
     print("OK", round(elapsed, 2))
 ''')
@@ -200,9 +200,13 @@ def test_catch_all_strategy_still_returns_and_raises(tmp_path, monkeypatch):
         @execute_with_time_limit(5)
         def play(strategy, board):
             return [strategy(board) for _ in range(200)]
+
+        @execute_with_time_limit(0.05)
+        def play_once(strategy, board):
+            return strategy(board)
     """))
     monkeypatch.syspath_prepend(str(tmp_path))
-    from rl_play import play
+    from rl_play import play, play_once
 
     strategy = create_locked_down_function(
         "def strategy(board):\n"
@@ -216,6 +220,9 @@ def test_catch_all_strategy_still_returns_and_raises(tmp_path, monkeypatch):
     assert strategy._unsloth_catch_all is not None
     import unsloth_zoo.rl_environments as R
 
+    R._stop_catch_all_helper()
+    # Starting the helper takes longer than this limit; it is not charged to the strategy.
+    assert play_once(strategy, [[1, 2], [3, 4]]) == "D"
     assert play(strategy, [[1, 2], [3, 4]]) == ["D"] * 200
     helper = R._catch_all_helper[0]
     with pytest.raises(ValueError, match = "negative tile"):

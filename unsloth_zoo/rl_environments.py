@@ -1157,6 +1157,7 @@ module._catch_all_helper_main(Connection(int(sys.argv[2]), writable = False), Co
 _catch_all_helper = None
 
 def _catch_all_helper_main(requests_conn, replies_conn):
+    replies_conn.send(None)  # ready: imports done, so the first call is not charged for them
     compiled = {}
     while True:
         try:
@@ -1211,7 +1212,14 @@ def _ensure_catch_all_helper():
     os.close(request_r)
     os.close(reply_w)
     _catch_all_helper = (process, Connection(request_w, readable = False), Connection(reply_r, writable = False), os.getpid())
-    return True
+    try:
+        if _catch_all_helper[2].poll(60):
+            _catch_all_helper[2].recv()
+            return True
+    except (EOFError, OSError):
+        pass
+    _stop_catch_all_helper()
+    return False
 pass
 
 def _call_in_catch_all_helper(fn, deadline, seconds, args, kwargs):
