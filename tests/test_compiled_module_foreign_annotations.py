@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""unslothai/unsloth#13245: an imported closure shadowed by a same-named method was emitted as
-`def f{str(signature)}:` with unimported `transformers.*` annotations (NameError at cache import)."""
+"""unslothai/unsloth#13245: imported closure re-emitted with unimported annotations (NameError)."""
 
 import importlib.util
 import inspect
@@ -40,7 +39,6 @@ def test_signature_annotations_are_quoted():
         namespace,
     )
     rendered = str(signature_with_string_annotations(inspect.signature(namespace["f"])))
-    # Defining it where none of the annotation names exist must not raise.
     exec(f"def g{rendered}: pass", {})
     assert "d=1" in rendered.replace(" ", "")
     assert rendered.count("'") >= 8, rendered
@@ -185,8 +183,6 @@ def test_generated_module_imports_with_foreign_wrapper_and_annotations(tmp_path)
     assert payload["error"] is None, (
         payload["error"] + "\n" + generated[-3000:] + "\n--- log ---\n" + payload["log"]
     )
-    # The imported closure must stay an import, not a module-level def over its body.
     assert "\ndef build_mask(" not in generated, generated[-3000:]
-    # The local helper still goes through the signature fix-up (unused_arg dropped).
     assert "\ndef local_helper(" in generated, payload["log"]
     assert "unused_arg" not in generated.split("\ndef local_helper(", 1)[1].split("\n", 1)[0]

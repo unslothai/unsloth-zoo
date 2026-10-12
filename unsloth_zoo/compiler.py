@@ -289,8 +289,7 @@ def calls_disable_compile_function(source, disable_compile_functions):
 
 
 def function_defined_elsewhere(modeling_file, name):
-    """True when `modeling_file.<name>` is an import from another file (a same-named method can
-    match `def <name>`, and getsource on a wrapped closure returns free variables). Unknown: False."""
+    """True if `modeling_file.<name>` is imported from another file (a same-named method can match `def <name>`)."""
     try:
         function = inspect.unwrap(getattr(modeling_file, name))
         if not inspect.isfunction(function):
