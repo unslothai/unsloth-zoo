@@ -119,7 +119,8 @@ def test_seq_idx_matches_reference_and_per_document(D, W, rows, dtype, bias, act
         e_ours, e_torch = _rel(o, r), _rel(t, r)
         if dtype == torch.float32:
             assert e_ours < 1e-5, (name, e_ours)
-            assert _rel(o, p) < 1e-5, (name, _rel(o, p))
+            # The fp32 torch conv may run on cuDNN TF32 (torch < 2.9 default): allow its own error.
+            assert _rel(o, p) < 1e-5 + 2 * _rel(p, r), (name, _rel(o, p), _rel(p, r))
         else:
             floor = 4e-3 if dtype == torch.bfloat16 else 5e-4
             assert e_ours <= 2 * e_torch + floor, (name, e_ours, e_torch)
@@ -158,7 +159,7 @@ def test_seq_idx_leak_is_visible_without_the_mask():
     rows = [[5, 1, 7, 3, 48]]
     x, w, b, dy = _inputs(1, 64, 64, 4, torch.float32, True)
     seq_idx = _seq_idx_from_lengths(rows, "cuda")
-    per_doc = _run(_per_document, x, w, b, dy, "silu", seq_idx)
+    per_doc = _run(_per_document, _to64(x), _to64(w), _to64(b), _to64(dy), "silu", seq_idx)
     leaky = _run(lambda x, w, b, a, s: gcc.triton_causal_conv1d(x, w, b, a), x, w, b, dy, "silu", None)
     ours = _run(_triton, x, w, b, dy, "silu", seq_idx)
     for name, l, o, p in zip(("y", "dx", "dw", "db"), leaky, ours, per_doc):

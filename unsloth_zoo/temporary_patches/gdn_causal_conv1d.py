@@ -84,7 +84,9 @@ def _is_marked(fn):
 
 
 def _build_kernels():
-    global _kernels
+    # `tl` is a module global: Triton 3.3 resolves the `tl.constexpr` annotations of these nested
+    # kernels through their globals, not this function's locals ("tl is not defined").
+    global _kernels, tl
     if _kernels is not None:
         return _kernels
     import triton
