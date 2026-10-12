@@ -80,10 +80,15 @@ class _Inner(nn.Module):
         self.layers = nn.ModuleList([_Layer(), _Layer()])
 
 
+class _Config(types.SimpleNamespace):
+    # PEFT 0.18.0 calls model.config.to_dict().get(...).
+    def to_dict(self): return dict(vars(self))
+
+
 class _Tiny(nn.Module):
     def __init__(self, extra = None):
         super().__init__()
-        self.config = types.SimpleNamespace(model_type = "tiny", tie_word_embeddings = False)
+        self.config = _Config(model_type = "tiny", tie_word_embeddings = False)
         self.model = _Inner()
         self.lm_head = nn.Linear(H, 50, bias = False)
         if extra == "visual":
