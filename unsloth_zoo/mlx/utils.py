@@ -3553,6 +3553,7 @@ _VLM_STATIC_METADATA_MODEL_TYPES = {
     "muse_glimmer": ("image_grid_thw", "video_grid_thw"),
     "kimi_k3": ("grid_thws", "image_grid_hws", "video_grid_hws"),
     "ernie4_5_moe_vl": ("image_grid_thw", "video_grid_thw"),
+    "glm5_next": ("image_grid_thw", "video_grid_thw"),
     # One `_as_grid_list` call reads whichever of the two the batch carries.
     "mage_vl": ("image_grid_thw", "video_grid_thw"),
     # Pixtral's vision tower, which mistral3 and mistral4 checkpoints also load.
@@ -3996,6 +3997,9 @@ _VLM_QWEN_POSITION_MODEL_TYPES = frozenset({
     "qwen3_5_moe",
     "qwen4_exp",
     "prism_hadamard_qwen35",
+    # Their upstream `get_rope_index` computes the same positions.
+    "glm4v",
+    "glm4v_moe",
 })
 _VLM_POSITION_GENERATING_MODEL_TYPES = (
     _VLM_QWEN_POSITION_MODEL_TYPES | {"glm_ocr"}
