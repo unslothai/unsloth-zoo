@@ -924,7 +924,8 @@ def create_locked_down_function(function, *, builtins_policy: str = "allowlist")
     # parameter recently, but the attribute is writable on every version we
     # support. Without it `def f(x, *, k = 1)` loses k and raises TypeError.
     locked.__kwdefaults__ = f.__kwdefaults__
-    if _catches_everything(ast.parse(function)):
+    # Full builtins can reach signal itself, so only a separate process bounds them.
+    if builtins_policy == "full" or _catches_everything(ast.parse(function)):
         locked._unsloth_catch_all = (function, builtins_policy)
     return locked
 pass
@@ -1125,16 +1126,22 @@ pass
 
 _VALID_START_METHODS = frozenset({"fork", "spawn", "forkserver"})
 
+# Handler names that provably cannot catch the re-fires' BaseException subclass.
+_NARROW_EXCEPTIONS = frozenset(
+    name for name, value in vars(_py_builtins).items()
+    if isinstance(value, type) and issubclass(value, Exception)
+)
+
 def _catches_everything(tree):
-    # Constructs that can absorb any exception, including the re-fires' BaseException.
+    # Conservative: anything not provably unable to absorb the re-fires counts.
+    bound = _bound_names(tree)[0]
     for node in ast.walk(tree):
         if isinstance(node, ast.ExceptHandler):
             names = node.type.elts if isinstance(node.type, ast.Tuple) else [node.type]
-            if any(n is None or (isinstance(n, ast.Name) and n.id == "BaseException") for n in names):
+            if not all(isinstance(n, ast.Name) and n.id in _NARROW_EXCEPTIONS and n.id not in bound for n in names):
                 return True
         elif isinstance(node, ast.Try) or type(node).__name__ == "TryStar":
-            if any(isinstance(n, (ast.Return, ast.Break, ast.Continue))
-                   for stmt in node.finalbody for n in ast.walk(stmt)):
+            if node.finalbody:  # can return / continue, or raise something an outer handler eats
                 return True
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "__exit__":
             return True

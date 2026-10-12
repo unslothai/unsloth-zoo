@@ -142,6 +142,28 @@ def strategy(board):
         finally:
             continue
 """,
+    "aliased_base_exception": """
+def strategy(board):
+    E = BaseException
+    while True:
+        try:
+            while True:
+                pass
+        except E:
+            pass
+""",
+    "finally_raises": """
+def strategy(board):
+    while True:
+        try:
+            try:
+                while True:
+                    pass
+            finally:
+                raise ValueError()
+        except ValueError:
+            pass
+""",
     "suppressing_exit": """
 def strategy(board):
     class Quiet:
@@ -232,11 +254,12 @@ def test_catch_all_strategy_still_returns_and_raises(tmp_path, monkeypatch):
     assert helper.poll() is not None
 
 
-def test_ordinary_strategy_stays_in_process():
+@pytest.mark.parametrize("handler", ["except Exception:", "except (ValueError, IndexError) as e:", "except KeyError:"])
+def test_ordinary_strategy_stays_in_process(handler):
     from unsloth_zoo.rl_environments import create_locked_down_function
 
     strategy = create_locked_down_function(
-        "def strategy(board):\n    try:\n        return 'W'\n    except Exception:\n        return 'A'\n"
+        f"def strategy(board):\n    try:\n        return 'W'\n    {handler}\n        return 'A'\n"
     )
     assert getattr(strategy, "_unsloth_catch_all", None) is None
 
