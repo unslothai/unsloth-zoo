@@ -129,7 +129,6 @@ def test_diffusers_transformer_checkpoints_with_identical_grads():
     )
     step = lambda m: m(**inputs).sample.pow(2).mean()  # noqa: E731
     _assert_same(_grads(ref, step), _grads(model, step))
-    # 2 double + 2 single blocks, every 2nd caller checkpointed.
     assert len(calls) == 2
 
 
@@ -231,8 +230,7 @@ def test_copied_and_saved_plain_models_keep_their_own_checkpointed_blocks():
     clone = copy.deepcopy(model)
     x = torch.randn(2, 8)
     clone(x).pow(2).mean().backward()
-    # The copy trains its own parameters (the original sees no gradient) and still checkpoints, through torch's own
-    # function since the custom one stays with the original.
+    # The copy trains its own parameters and checkpoints via torch's function (the custom one stays with the original).
     assert all(p.grad is None for p in model.parameters())
     assert all(p.grad is not None for p in clone.parameters())
     assert not calls and all(bc._is_wrapped(b) for b in clone.layers)
@@ -325,7 +323,6 @@ def test_recompute_runs_the_blocks_hooks_again(use_reentrant):
         return h.pow(2).mean()
 
     _assert_same(_grads(ref, step), _grads(model, step))
-    # 3 forward calls, then 3 recomputes rerunning the hooks; every post-hook ran, so no state is left behind.
     assert len(ref_events) == 3 and len(events) == 6
     assert not any("scale" in block.__dict__ for block in model)
 
@@ -351,7 +348,6 @@ def test_an_argument_rewriting_pre_hook_is_applied_once(use_reentrant):
 
 
 class _FakeDiffusers(nn.Module):
-    # Routes gradient_checkpointing_func like diffusers: the parent calls it with each block.
     def __init__(self, n = 4):
         super().__init__()
         self.blocks = nn.ModuleList([nn.Linear(4, 4) for _ in range(n)])
@@ -433,7 +429,6 @@ def test_a_block_with_a_self_referencing_patched_forward_is_still_freed():
 
     model = _Stack(2)
     block = model.layers[0]
-    # accelerate-style patch: a partial bound to the block itself.
     block.forward = functools.partial(lambda module, x: type(module).forward(module, x), block)
     bc.enable_block_gradient_checkpointing(model)
     model(torch.randn(1, 8, requires_grad = True)).sum().backward()

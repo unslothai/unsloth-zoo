@@ -60,7 +60,6 @@ def _stamp_order(model):
 
 
 def _owner(function):
-    # diffusers passes the module, transformers' GradientCheckpointingLayer a partial of its bound __call__.
     while isinstance(function, functools.partial):
         function = function.func
     return getattr(function, "__self__", function)
@@ -151,8 +150,8 @@ def _hooks(block, name):
 
 
 def _recompute_body(block, inner, *args, **kwargs):
-    # Forward (flag set): the body, hooks already ran around it. Recompute: hooks rerun for side effects only, their
-    # return ignored (saved inputs carry the rewrite). Reads flags only: a write inside a compiled checkpoint is unsafe.
+    # Recompute reruns hooks for side effects only, return ignored (saved inputs carry the rewrite); only reads flags
+    # (compiled checkpoints must not write).
     if block.__dict__.get(_FORWARD):
         return inner(*args, **kwargs)
     with_kwargs = block._forward_pre_hooks_with_kwargs
