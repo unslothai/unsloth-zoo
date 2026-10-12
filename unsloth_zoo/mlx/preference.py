@@ -1117,6 +1117,7 @@ def _dpo_apo_down(objective, terms):
 def _dpo_discopop(objective, terms):
     scaled = objective.beta * terms.delta
     modulation = mx.sigmoid(scaled / objective.discopop_tau)
+    # TRL's exp(-scaled) * modulation is inf * 0 = NaN once scaled < -88.
     return (
         -_log_sigmoid(scaled) * (1.0 - modulation)
         + mx.exp(_log_sigmoid(scaled / objective.discopop_tau) - scaled)
