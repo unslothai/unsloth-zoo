@@ -8146,7 +8146,7 @@ def _split_audio_past_the_window(messages, clips, processor):
     if not clips:
         return messages, clips
     limit = _audio_clip_limit_samples(processor)
-    counts = [-(-len(clip) // limit) if limit else 1 for clip in clips]
+    counts = [max(1, -(-len(clip) // limit)) if limit else 1 for clip in clips]
     # Rows the dataset rendered itself reach here as a string.
     if max(counts, default=1) < 2 or not isinstance(messages, list):
         return messages, clips
@@ -8166,6 +8166,9 @@ def _split_audio_past_the_window(messages, clips, processor):
     ]
     pieces = []
     for clip, count in zip(clips, counts):
+        if count == 1:
+            pieces.append(clip)
+            continue
         size = -(-len(clip) // count)
         pieces.extend(clip[start:start + size] for start in range(0, len(clip), size))
     return split, pieces

@@ -4838,6 +4838,10 @@ def test_a_clip_past_the_window_is_split_into_near_equal_pieces():
     assert np.array_equal(np.concatenate(pieces[1:]), long)
     assert {piece.sampling_rate for piece in pieces} == {16}
 
+    empty = _AudioClip(np.zeros(0, dtype=np.float32), 16)
+    split, pieces = _split_audio_past_the_window(messages, [empty, long], processor)
+    assert pieces[0] is empty and [len(piece) for piece in pieces[1:]] == [6, 6, 5]
+
     for unsplit in ([short, short], [long]):  # nothing over; parts and clips differ
         same, clips = _split_audio_past_the_window(messages, unsplit, processor)
         assert same is messages and clips is unsplit
