@@ -39,6 +39,7 @@ import os, gc, time, statistics
 import collections
 import numpy as np
 import signal
+import warnings
 import contextlib
 from contextlib import contextmanager
 from functools import wraps
@@ -924,6 +925,8 @@ def create_locked_down_function(function, *, builtins_policy: str = "allowlist")
     # parameter recently, but the attribute is writable on every version we
     # support. Without it `def f(x, *, k = 1)` loses k and raises TypeError.
     locked.__kwdefaults__ = f.__kwdefaults__
+    if _catches_everything(ast.parse(function)):
+        locked._unsloth_catch_all = (function, builtins_policy)
     return locked
 pass
 
@@ -1123,10 +1126,100 @@ pass
 
 _VALID_START_METHODS = frozenset({"fork", "spawn", "forkserver"})
 
+def _catches_everything(tree):
+    # Constructs that can absorb any exception, including the re-fires' BaseException.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ExceptHandler):
+            names = node.type.elts if isinstance(node.type, ast.Tuple) else [node.type]
+            if any(n is None or (isinstance(n, ast.Name) and n.id == "BaseException") for n in names):
+                return True
+        elif isinstance(node, ast.Try) or type(node).__name__ == "TryStar":
+            if any(isinstance(n, (ast.Return, ast.Break, ast.Continue))
+                   for stmt in node.finalbody for n in ast.walk(stmt)):
+                return True
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "__exit__":
+            return True
+    return False
+pass
+
+# (process, connection, owner pid): the forked child running catch-all strategy calls
+# for one execute_with_time_limit call. Killed when that call ends, so it never pins
+# copy-on-write pages of a long training run.
+_catch_all_worker = None
+
+def _catch_all_worker_main(conn):
+    compiled = {}
+    while True:
+        try:
+            source, policy, args, kwargs = conn.recv()
+        except (EOFError, OSError):
+            return
+        try:
+            fn = compiled.get((source, policy))
+            if fn is None:
+                fn = compiled[(source, policy)] = create_locked_down_function(source, builtins_policy = policy)
+            reply = (True, fn(*args, **kwargs))
+        except BaseException as e:
+            reply = (False, e)
+        try:
+            conn.send(reply)
+        except Exception as e:
+            conn.send((False, RuntimeError(f"Unsloth: could not send the strategy result back: {e!r}")))
+pass
+
+def _stop_catch_all_worker():
+    global _catch_all_worker
+    worker, _catch_all_worker = _catch_all_worker, None
+    if worker is None or worker[2] != os.getpid():
+        return
+    process, conn, _ = worker
+    process.kill()
+    process.join()
+    conn.close()
+pass
+
+def _call_in_catch_all_worker(fn, deadline, seconds, args, kwargs):
+    global _catch_all_worker
+    source, policy = fn._unsloth_catch_all
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError(f"Timed out after {seconds:g}s")
+    try:
+        if _catch_all_worker is None or _catch_all_worker[2] != os.getpid() or not _catch_all_worker[0].is_alive():
+            ctx = mp.get_context("fork")
+            conn, child_conn = ctx.Pipe()
+            with warnings.catch_warnings():
+                # Python 3.12+ warns on fork with threads; the child only runs pure Python.
+                warnings.simplefilter("ignore", DeprecationWarning)
+                process = ctx.Process(target = _catch_all_worker_main, args = (child_conn,), daemon = True)
+                process.start()
+            child_conn.close()
+            _catch_all_worker = (process, conn, os.getpid())
+        conn = _catch_all_worker[1]
+        conn.send((source, policy, args, kwargs))
+        if not conn.poll(max(deadline - time.monotonic(), 0.0)):
+            raise TimeoutError(f"Timed out after {seconds:g}s")
+        ok, value = conn.recv()
+    except BaseException:
+        # Killed mid-call, its next reply would answer the wrong request.
+        _stop_catch_all_worker()
+        raise
+    if not ok:
+        raise value
+    return value
+pass
+
 def _stop_generated_code_at_deadline(value, deadline, seconds):
     # Generated code can swallow the TimeoutError raised inside it; re-raise it in the caller.
     if not (isinstance(value, types.FunctionType) and value.__code__.co_filename == "<user_code>"):
         return value
+    # A bare except / except BaseException can absorb every in-process signal, so
+    # that code runs in a child the deadline can kill.
+    if getattr(value, "_unsloth_catch_all", None) is not None and "fork" in mp.get_all_start_methods():
+        @wraps(value)
+        def in_child(*args, **kwargs):
+            return _call_in_catch_all_worker(value, deadline, seconds, args, kwargs)
+        return in_child
 
     @wraps(value)
     def guarded(*args, **kwargs):
@@ -1191,8 +1284,11 @@ def execute_with_time_limit(
                 deadline = time.monotonic() + seconds
                 args = tuple(_stop_generated_code_at_deadline(a, deadline, seconds) for a in args)
                 kwargs = {k: _stop_generated_code_at_deadline(v, deadline, seconds) for k, v in kwargs.items()}
-                with time_limit(seconds):
-                    return func(*args, **kwargs)
+                try:
+                    with time_limit(seconds):
+                        return func(*args, **kwargs)
+                finally:
+                    _stop_catch_all_worker()
             elif effective_backend == "process":
                 return _run_in_subprocess(func, seconds, args, kwargs,
                                           start_method=start_method, kill_grace=kill_grace)
