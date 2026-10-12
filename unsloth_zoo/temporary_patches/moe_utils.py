@@ -4243,7 +4243,76 @@ def convert_legacy_lora_b(peft_model, adapter_name, config) -> int:
         permutation = _moe_lora_b_column_permutation(num_experts, rank, weight.device, invert = True)
         with torch.no_grad():
             weight.copy_(weight.index_select(1, permutation))
+        # A resumed Trainer restores optimizer state in the old column order after this.
+        weight._unsloth_lora_b_repacked = (num_experts, rank)
     return len(targets)
+
+
+def repack_optimizer_state_for_legacy_lora_b(optimizer) -> Tuple[int, int]:
+    """Move the optimizer state of lora_B tensors `convert_legacy_lora_b` repacked into the
+    same column order; state that cannot be permuted (8-bit blockwise) is dropped and
+    re-initialised on the next step. Returns (moved, reset)."""
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    moved = reset = 0
+    for group in getattr(optimizer, "param_groups", ()):
+        for param in group["params"]:
+            repacked = getattr(param, "_unsloth_lora_b_repacked", None)
+            if repacked is None:
+                continue
+            del param._unsloth_lora_b_repacked
+            state = optimizer.state.get(param)
+            if not state:
+                continue
+            permutation = _moe_lora_b_column_permutation(*repacked, param.device, invert = True)
+            tensors = [v for v in state.values() if torch.is_tensor(v) and v.shape == param.shape]
+            if tensors and all(v.is_floating_point() for v in tensors) and not any(
+                torch.is_tensor(v) and v.dim() > 0 and v.shape != param.shape for v in state.values()
+            ):
+                with torch.no_grad():
+                    for value in tensors:
+                        value.copy_(value.index_select(1, permutation.to(value.device)))
+                moved += 1
+            else:
+                optimizer.state.pop(param, None)
+                reset += 1
+    return moved, reset
+
+
+_original_trainer_load_optimizer_and_scheduler = None
+
+
+def _patched_trainer_load_optimizer_and_scheduler(self, checkpoint, *args, **kwargs):
+    result = _original_trainer_load_optimizer_and_scheduler(self, checkpoint, *args, **kwargs)
+    try:
+        moved, reset = repack_optimizer_state_for_legacy_lora_b(self.optimizer) if checkpoint else (0, 0)
+    except Exception:
+        moved = reset = 0
+    if moved or reset:
+        print(
+            f"Unsloth: resumed optimizer state for repacked fused MoE expert lora_B: {moved} "
+            f"tensors moved to the new column order, {reset} reset (8-bit state cannot be permuted)."
+        )
+    return result
+
+
+def _patch_trainer_resume_for_legacy_lora_b():
+    # This Unsloth Zoo code section is licensed under AGPL3
+
+    global _original_trainer_load_optimizer_and_scheduler
+    try:
+        from transformers import Trainer
+    except Exception:
+        return False
+    method = getattr(Trainer, "_load_optimizer_and_scheduler", None)
+    if method is None or getattr(method, "_unsloth_moe_layout_patched", False):
+        return method is not None
+    if _original_trainer_load_optimizer_and_scheduler is None:
+        _original_trainer_load_optimizer_and_scheduler = method
+    patched = wraps(method)(_patched_trainer_load_optimizer_and_scheduler)
+    patched._unsloth_moe_layout_patched = True
+    Trainer._load_optimizer_and_scheduler = patched
+    return True
 
 
 def _has_fused_expert_lora(peft_model, adapter_name) -> bool:
@@ -4362,6 +4431,7 @@ def patch_param_wrapper_for_moe():
 
         _patch_peft_save_pretrained_for_moe_layout()
         _patch_peft_load_adapter_for_moe_layout()
+        _patch_trainer_resume_for_legacy_lora_b()
         _patch_peft_get_peft_model_for_moe()
 
         return True

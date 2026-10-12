@@ -259,3 +259,34 @@ def test_merged_lora_mode_is_not_inferred_as_grouped(monkeypatch):
     assert MU.saved_lora_b_layouts(config) == {}
     monkeypatch.delenv("UNSLOTH_MOE_LORA_MERGED")
     assert MU.saved_lora_b_layouts(config) == {None: MU.LORA_B_LAYOUT_GROUPED_BY_EXPERT}
+
+
+def test_resumed_optimizer_state_follows_the_repack(tmp_path, patched_load):
+    _legacy_adapter(tmp_path, _keep)
+    loaded = PeftModel.from_pretrained(_base(), str(tmp_path), is_trainable = True)
+    params = [p for n, p in loaded.named_parameters() if "lora_B" in n and "experts" in n]
+    assert params and all(hasattr(p, "_unsloth_lora_b_repacked") for p in params)
+    to_grouped = torch.arange(E * R).view(R, E).t().reshape(-1)
+    adam = torch.optim.AdamW(params[:1])
+    moment = torch.randn(params[0].shape)
+    # optimizer.pt was written in the old (grouped) column order.
+    adam.state[params[0]] = {"step": torch.tensor(5.0), "exp_avg": moment[:, to_grouped].clone(), "exp_avg_sq": moment[:, to_grouped].abs()}
+    eight_bit = torch.optim.AdamW(params[1:2])
+    eight_bit.state[params[1]] = {"state1": torch.zeros(params[1].shape, dtype = torch.uint8), "absmax1": torch.ones(3)}
+    assert MU.repack_optimizer_state_for_legacy_lora_b(adam) == (1, 0)
+    assert torch.equal(adam.state[params[0]]["exp_avg"], moment)
+    assert MU.repack_optimizer_state_for_legacy_lora_b(eight_bit) == (0, 1)
+    assert params[1] not in eight_bit.state
+    # Once only: a second load_state_dict into the same params is not permuted again.
+    assert MU.repack_optimizer_state_for_legacy_lora_b(adam) == (0, 0)
+
+
+def test_trainer_resume_hook_installs(monkeypatch):
+    from transformers import Trainer
+    original = Trainer._load_optimizer_and_scheduler
+    while hasattr(original, "__wrapped__"):
+        original = original.__wrapped__
+    monkeypatch.setattr(Trainer, "_load_optimizer_and_scheduler", original)
+    monkeypatch.setattr(MU, "_original_trainer_load_optimizer_and_scheduler", None)
+    assert MU._patch_trainer_resume_for_legacy_lora_b()
+    assert Trainer._load_optimizer_and_scheduler._unsloth_moe_layout_patched
