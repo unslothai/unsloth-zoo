@@ -1162,6 +1162,15 @@ module._catch_all_helper_main(Connection(int(sys.argv[2]), writable = False), Co
 """
 
 _catch_all_ids = itertools.count()
+_DEFERRED_BODY = inspect.CO_GENERATOR | inspect.CO_COROUTINE | inspect.CO_ASYNC_GENERATOR
+
+def _runs_in_helper(value):
+    # Async and generator functions return an object without running their body, so they stay in-process.
+    return (
+        getattr(value, "_unsloth_catch_all", None) is not None
+        and not (value.__code__.co_flags & _DEFERRED_BODY)
+    )
+pass
 
 # (process, request connection, reply connection, owner pid), reused across calls and
 # replaced only after a timeout kills it.
@@ -1262,7 +1271,7 @@ def _stop_generated_code_at_deadline(value, deadline, seconds):
         return value
     # A bare except / except BaseException can absorb every in-process signal, so
     # that code runs in a helper process the deadline can kill.
-    if getattr(value, "_unsloth_catch_all", None) is not None:
+    if _runs_in_helper(value):
         @wraps(value)
         def in_helper(*args, **kwargs):
             return _call_in_catch_all_helper(value, deadline, seconds, args, kwargs)
@@ -1328,7 +1337,7 @@ def execute_with_time_limit(
         @wraps(func)
         def wrapper(*args, **kwargs) -> T:
             if effective_backend == "signal":
-                if any(getattr(v, "_unsloth_catch_all", None) is not None for v in (*args, *kwargs.values())):
+                if any(_runs_in_helper(v) for v in (*args, *kwargs.values())):
                     _ensure_catch_all_helper()  # started before the clock, not on the strategy's time
                 deadline = time.monotonic() + seconds
                 args = tuple(_stop_generated_code_at_deadline(a, deadline, seconds) for a in args)
