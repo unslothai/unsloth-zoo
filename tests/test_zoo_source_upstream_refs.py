@@ -381,7 +381,6 @@ def test_temporary_patches_utils_transformers_version():
 
 # unsloth_zoo/temporary_patches/misc.py
 
-
 def test_temp_patches_misc_loss_for_causal_lm_loss():
     """unsloth_zoo/temporary_patches/misc.py:162, 248 -- ``from
     transformers.loss.loss_utils import ForCausalLMLoss``. CSM patches

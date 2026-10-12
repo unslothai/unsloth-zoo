@@ -813,9 +813,6 @@ def test_gemma4_causal_lm_output_with_past_kwargs():
             )
 
 
-# glm4_moe.py: Glm4MoeLite{NaiveMoe,MoE}.forward (5.0+-only).
-
-
 # gpt_oss.py: Mxfp4GptOssExperts, GptOssConfig (source-only),
 # GptOssForCausalLM.forward (tail not covered by siblings).
 
@@ -1706,9 +1703,7 @@ def test_pixtral_attention_init_attrs_present():
             )
 
 
-# qwen3_5_moe.py: Qwen3_5Moe{Experts,SparseMoeBlock,ForCausalLM}.forward
-# (5.0+-only).
-
+# qwen3_5_moe.py: Qwen3_5MoeForCausalLM (5.0+-only).
 
 def test_qwen3_5_moe_for_causal_lm_class_present():
     """qwen3_5_moe.py:77-78 reads Qwen3_5MoeForCausalLM +
@@ -1741,9 +1736,7 @@ def test_qwen3_5_moe_for_causal_lm_class_present():
         )
 
 
-# qwen3_moe.py: Qwen3MoeExperts.forward (5.0+),
-# Qwen3MoeForCausalLM.forward (tail).
-
+# qwen3_moe.py: Qwen3MoeForCausalLM.forward (tail).
 
 def test_qwen3_moe_for_causal_lm_forward_named_params():
     """qwen3_moe.py:351 patches Qwen3MoeForCausalLM.forward via
@@ -1773,8 +1766,7 @@ def test_qwen3_moe_for_causal_lm_forward_named_params():
     )
 
 
-# qwen3_next_moe.py: Qwen3Next{Experts,ForCausalLM}.forward tail.
-
+# qwen3_next_moe.py: Qwen3NextForCausalLM.forward tail.
 
 def test_qwen3_next_for_causal_lm_forward_named_params():
     """qwen3_next_moe.py:79 patches Qwen3NextForCausalLM.forward via
@@ -1871,10 +1863,6 @@ def test_qwen3_vl_moe_act2fn_dict_present():
             "DRIFT DETECTED: zoo temporary_patches/qwen3_vl_moe.py:236 expects "
             "transformers.activations.ACT2FN['silu'] but the key is missing"
         )
-
-
-# moe_utils.py / moe_bnb.py / flex_attention_bwd.py: helper modules
-# (no patch_function call sites); consumer sites covered elsewhere.
 
 
 # misc.py additional patch sites: config-mapping, tokenizer attrs,
@@ -2282,13 +2270,6 @@ def test_gpt_oss_eager_attention_forward_present():
             f"positionals -- but installed signature accepts only "
             f"{len(params)}: {inspect.signature(fn)}"
         )
-
-
-# gemma.py transitive deps: Gemma3DecoderLayer, Gemma3TextModel,
-# Gemma3PreTrainedModel.
-
-
-# qwen3_moe.py / qwen3_5_moe.py / qwen3_next_moe.py shared deps.
 
 
 # Cache-output-class signature pins (constructed by zoo patch wrappers).
