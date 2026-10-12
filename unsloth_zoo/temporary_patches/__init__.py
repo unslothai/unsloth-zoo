@@ -17,6 +17,7 @@
 
 from .common import *
 from .fla_vendor import *
+from .gdn_causal_conv1d import *
 from .gemma import *
 from .misc import *
 from .granitemoehybrid import *

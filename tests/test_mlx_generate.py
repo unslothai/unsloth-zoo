@@ -1438,6 +1438,49 @@ def test_a_model_keeping_state_is_seen_to_keep_it_however_it_says_so():
         assert _keeps_what_it_prepared(model()) is (model in keeping), model.__name__
 
 
+def test_a_method_is_read_once_and_never_outlives_its_model(monkeypatch):
+    import gc, weakref
+    from unsloth_zoo.mlx import generate
+
+    class Model:
+        def _measure(self, ids): return len(ids)
+        def get_input_embeddings(self, ids): return self._measure(ids)
+
+    reads = []
+    source = inspect.getsource
+    monkeypatch.setattr(inspect, "getsource", lambda target: reads.append(target) or source(target))
+    assert not generate._keeps_what_it_prepared(Model())
+    assert not generate._keeps_what_it_prepared(Model())
+    assert not generate._draws_by_position(Model, "_measure") and not generate._draws_by_position(Model(), "_measure")
+    assert reads == [Model.get_input_embeddings, Model._measure, Model._measure]
+    assert generate._binds_self(Model._measure) is generate._binds_self(Model._measure)
+
+    # A method a model defines around itself is remembered only while that model lives.
+    model = Model()
+    def measure(ids, model = model): return len(ids) + len(vars(model))
+    model._measure = measure
+    assert not generate._keeps_what_it_prepared(model)
+    alive = weakref.ref(model)
+    del model, measure, reads[:]
+    gc.collect()
+    assert alive() is None
+
+    def keeping(self, ids): self._ids = ids
+
+    class Wrapper:
+        def __init__(self, wrapped): self.__wrapped__ = wrapped
+        def __call__(self, ids): return self.__wrapped__(self, ids)
+
+    wrapper = Wrapper(Model.get_input_embeddings)
+    wrapped = types.SimpleNamespace(get_input_embeddings = wrapper, _measure = len)
+    assert not generate._keeps_what_it_prepared(wrapped)
+    wrapper.__wrapped__ = keeping
+    assert generate._keeps_what_it_prepared(wrapped)
+
+    Model._measure.__code__ = keeping.__code__
+    assert generate._keeps_what_it_prepared(Model())
+
+
 def test_a_vision_stream_runs_the_prefill_with_the_fewest_tokens_left():
     from unsloth_zoo.mlx.generate import _schedules_prefill
 

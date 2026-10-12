@@ -170,7 +170,11 @@ def _fake_trainer(model, accepts, compute_loss_func = None, shifts = True):
         parallelism_config = None
 
     class Trainer:
-        pass
+        # transformers 5.19 divides the count by tp * cp * sp. This stand-in has no
+        # parallelism (parallelism_config is None above), which is 1 for each.
+        def get_tp_size(self): return 1
+        def get_cp_size(self): return 1
+        def get_sp_size(self): return 1
 
     t = Trainer()
     t.model = model

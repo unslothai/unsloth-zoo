@@ -513,12 +513,15 @@ _SAFE_IMPORT_MODULES = frozenset({
 #     3.14. Denied on every version; 3.13 reaches it only via private
 #     _evaluate, which the private-attribute rule already covers.
 #   mutators -- time.clock_settime(_ns) sets the host clock given the
-#     privilege a root container has. Read-only clocks stay.
+#     privilege a root container has. Read-only clocks stay. enum.global_enum
+#     copies members into sys.modules[cls.__module__], which the functional
+#     API lets the caller name (module="builtins").
 _DENIED_MODULE_ATTRS = frozenset({
     "functools.update_wrapper",
     "functools.wraps",
     "time.clock_settime",
     "time.clock_settime_ns",
+    "enum.global_enum",
     "operator.attrgetter",
     "operator.methodcaller",
     "typing.ForwardRef",

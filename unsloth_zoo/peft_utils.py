@@ -35,11 +35,27 @@ from .log import logger
 from .empty_model import _get_module_attribute
 
 # Leaf names of MoE routers, kept out of the automatically chosen LoRA targets.
-# A bare "gate" leaf is deliberately absent: it is the router in several families
-# but a plain projection in others, and no model in the sweep failed because of it.
+# Not "gate": D-FINE's gateway.gate is a plain projection, so _moe_router_gate_names decides by position.
 MOE_ROUTER_MODULES = frozenset((
     "router",
 ))
+
+
+def _moe_router_gate_names(model):
+    """`gate` Linears beside `experts` or inside a router module (AfMoE's mlp.router.gate)."""
+    modules = dict(model.named_modules())
+    names = []
+    for name, module in modules.items():
+        parent_name, _, leaf = name.rpartition(".")
+        if leaf != "gate" or not isinstance(module, torch.nn.Linear):
+            continue
+        parent = modules.get(parent_name)
+        if parent is None:
+            continue
+        if hasattr(parent, "experts") or "router" in type(parent).__name__.lower():
+            names.append(name)
+    return names
+
 
 # Mirrors PEFT's _check_lora_target_modules_mamba in peft/tuners/tuners_utils.py.
 MAMBA_MODEL_TYPES = frozenset(("falcon_h1", "mamba", "mamba2", "falcon_mamba", "nemotron_h"))
@@ -95,6 +111,7 @@ SKIP_QUANTIZATION_MODULES = [
     'mamba',
     "audio_tower",              # Gemma3N audio encoder conformer
     "vision_tower",             # Gemma3 vision encoder (SigLIP)
+    "visual",                   # Qwen2/2.5/3-VL, Qwen3.5, GLM-4V vision encoder
     "vision_embedder",          # multimodal embedders kept in full precision
     "embed_vision",
     "embed_audio",
@@ -283,7 +300,9 @@ def get_peft_regex(
     _architectures = " ".join(getattr(_config, "architectures", None) or []).lower()
     _is_gemma_mm   = (
         "gemma4"  in _model_type or "gemma4"  in _architectures or
-        "gemma3n" in _model_type or "gemma3n" in _architectures
+        "gemma3n" in _model_type or "gemma3n" in _architectures or
+        # EmbeddingGemma 2 carries Gemma 4 vision / audio towers under its own model_type.
+        "embedding_gemma2" in _model_type or "embeddinggemma2" in _architectures
     )
 
     def _linear_aware_branches(cores):
@@ -384,8 +403,20 @@ def get_peft_regex(
             f"Unsloth: leaving {len(placeholders)} parameter-free placeholder module(s) out of "
             f"the LoRA targets, e.g. {placeholders[0]}"
         )
+    # A trained router can overflow (unsloth#3690); only an explicit target_modules trains it.
+    router_gates = [] if target_modules is not None else [
+        name for name in _moe_router_gate_names(model)
+        if re.fullmatch(regex_matcher, name, flags = re.DOTALL)
+    ]
+    if router_gates:
+        logger.info(
+            f"Unsloth: leaving {len(router_gates)} MoE router gate(s) out of the LoRA targets, "
+            f"e.g. {router_gates[0]}. Add \"gate\" to target_modules to train them."
+        )
+    excluded = placeholders + router_gates
+    if excluded:
         regex_matcher = (
-            r"(?!(?:" + "|".join(re.escape(x) for x in placeholders) + r")$)(?:" + regex_matcher + r")"
+            r"(?!(?:" + "|".join(re.escape(x) for x in excluded) + r")$)(?:" + regex_matcher + r")"
         )
     pass
 
@@ -628,23 +659,35 @@ def requires_grad_for_gradient_checkpointing(model):
         # Check if input_embeddings exists
         if hasattr(module, "get_input_embeddings"):
             # Use forward hook after Embedding() is called
+            embeddings = None
             try:
-                module = module.get_input_embeddings()
-                register_other_hooks(
-                    "requires_grad_post_hook",
-                    "requires_grad_post_hook",
-                    module,
-                    "_forward_hooks",
+                embeddings = module.get_input_embeddings()
+            except NotImplementedError:
+                logger.info(
+                    f"Unsloth: `{module_name}` has no input embeddings; using a pre-forward hook."
                 )
-                module.register_forward_hook(requires_grad_post_hook)
-                logger.info(f"Unsloth: Registered output gradient hook on `{module_name}` input embeddings.")
-                still_need_patching = False
             except Exception as exception:
                 logger.warning(
                     f"Unsloth: Failed to register input-embedding hook for `{module_name}`: {exception}. "
                     "Falling back to pre-forward hook."
                 )
-                still_need_patching = True
+            else:
+                # Keep `module` on the tower: the fallback below hooks it.
+                try:
+                    register_other_hooks(
+                        "requires_grad_post_hook",
+                        "requires_grad_post_hook",
+                        embeddings,
+                        "_forward_hooks",
+                    )
+                    embeddings.register_forward_hook(requires_grad_post_hook)
+                    logger.info(f"Unsloth: Registered output gradient hook on `{module_name}` input embeddings.")
+                    still_need_patching = False
+                except Exception as exception:
+                    logger.warning(
+                        f"Unsloth: Failed to register input-embedding hook for `{module_name}`: {exception}. "
+                        "Falling back to pre-forward hook."
+                    )
         pass
 
         if still_need_patching:

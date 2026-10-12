@@ -377,7 +377,10 @@ def test_from_pretrained_distributed_vlm_forwards_normalized_override(monkeypatc
 
     def distributed(_name, model_type, *, config_override_data=None, allow_remote_code=None, **_kwargs):
         calls.append((model_type, config_override_data, allow_remote_code))
-        return types.SimpleNamespace(), types.SimpleNamespace(
+        # from_pretrained walks the model's modules for an image path (#1587), so the fake
+        # answers named_modules() the way an mlx.nn.Module with no submodules does.
+        model = types.SimpleNamespace(named_modules=lambda: iter([("", None)]))
+        return model, types.SimpleNamespace(
             tokenizer=types.SimpleNamespace(stopping_criteria=object()), detokenizer=object(),
         )
 

@@ -202,8 +202,10 @@ def test_wrap_loader_idempotent_and_enables():
 
 
 def test_auto_enable_reevaluates_after_adapter_attaches():
-    """Re-running auto_enable after a PEFT adapter attaches restores an expert-LoRA block to the
-    original loop while a frozen block stays grouped (what makes the loader leaf-wrap safe)."""
+    """Re-running auto_enable after an adapter attaches restores a block whose expert LoRA the
+    grouped path cannot run (here only one expert is wrapped) to the original loop, while a
+    frozen block stays grouped (what makes the loader leaf-wrap safe). Supported expert LoRA
+    stays grouped: tests/test_moe_grouped_modulelist_lora.py."""
     spec = _BLOCK_SPECS["Qwen3MoeSparseMoeBlock"]
     model = nn.Module()
     model.layers = nn.ModuleList(
@@ -215,11 +217,11 @@ def test_auto_enable_reevaluates_after_adapter_attaches():
     assert frozen_blk.forward.__func__ is grouped_moe_forward
     assert lora_blk.forward.__func__ is grouped_moe_forward
 
-    # Simulate an expert-targeting adapter attaching to the second block only.
+    # Simulate an adapter that wraps one expert of the second block only.
     getattr(lora_blk.experts[0], spec[0]).lora_A = nn.Identity()
 
     auto_enable_grouped_moe(model)  # exactly what loader.py calls after patch_peft_model
-    assert lora_blk.forward.__func__ is not grouped_moe_forward, "expert-LoRA block must be restored"
+    assert lora_blk.forward.__func__ is not grouped_moe_forward, "partially wrapped block must be restored"
     assert getattr(lora_blk, "_unsloth_moe_spec", None) is None, "restored block must be cleaned up"
     assert frozen_blk.forward.__func__ is grouped_moe_forward, "frozen block must stay on grouped path"
 

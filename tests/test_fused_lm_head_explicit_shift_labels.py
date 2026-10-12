@@ -41,6 +41,7 @@ def _fused_forward():
         HAS_CUT_CROSS_ENTROPY = False,
         UNSLOTH_COMPILE_DISABLE = True,
         unsloth_fused_ce_loss = unsloth_fused_ce_loss,
+        unsloth_training_stance = lambda: None,
         EMPTY_LOGITS = None,
     )
     source = textwrap.dedent(source)

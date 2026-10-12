@@ -55,7 +55,9 @@ npu.empty_cache = lambda: calls.append("empty_cache")
 npu.is_bf16_supported = lambda: True
 torch.npu = npu
 dt.npu_is_available.cache_clear()
-dt.DEVICE_TYPE = "npu"
+# Both names, as on a real Ascend host: gradient_checkpointing picks its autocast device from
+# DEVICE_TYPE_TORCH at import, which the import-time probe above left at "cuda".
+dt.DEVICE_TYPE = dt.DEVICE_TYPE_TORCH = "npu"
 dt.device_synchronize(); dt.device_empty_cache()
 print("HELPERS", ",".join(calls), dt.device_is_bf16_supported())
 

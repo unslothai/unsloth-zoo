@@ -17,6 +17,7 @@ from fla.ops.utils.cache import fla_cache_autotune
 from fla.ops.utils.op import exp2
 from fla.utils import (
     IS_NVIDIA,
+    IS_NVIDIA_BLACKWELL,
     IS_NVIDIA_HOPPER,
     TRITON_ABOVE_3_4_0,
     TRITON_ABOVE_3_7_1,
@@ -86,7 +87,8 @@ def _is_hopper_tensor(x):
 })
 @fla_cache_autotune(
     configs=[
-        triton.Config({'BK': 128, 'BV': 128}, num_warps=8, num_stages=3),
+        # Unsloth: backported from fla PR #1229. The 8-warp config hits a Blackwell tl.dot race (wrong, nondeterministic o).
+        *([] if IS_NVIDIA_BLACKWELL else [triton.Config({'BK': 128, 'BV': 128}, num_warps=8, num_stages=3)]),
         triton.Config({'BK': 64, 'BV': 64}, num_warps=4, num_stages=3),
         triton.Config({'BK': 32, 'BV': 32}, num_warps=2, num_stages=3),
     ],

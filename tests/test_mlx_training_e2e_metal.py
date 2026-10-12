@@ -1794,6 +1794,48 @@ def test_preference_cce_declares_a_frozen_head(monkeypatch, frozen):
 
 
 @metal_only
+@pytest.mark.parametrize("head", ["dense", "quantized", "softcap"])
+@pytest.mark.parametrize("loss_type", ["kto", "apo_zero_unpaired"])
+def test_kto_cce_scores_hidden_states_like_the_logits(head, loss_type):
+    from unsloth_zoo.mlx import preference as p
+    from mlx_lm.tuner.lora import LoRAEmbedding
+    mx.random.seed(941)
+    calls = []
+    model = _cce_text_model(2053, 64, quantized=head == "quantized", calls=calls,
+                            softcap=0.5 if head == "softcap" else 0.0)
+    adapter = LoRAEmbedding.from_base(model.model.embed_tokens, r=4, scale=2.0)
+    adapter.lora_b = mx.random.normal(adapter.lora_b.shape) * 0.02
+    model.model.embed_tokens = adapter
+    model.freeze()
+    adapter.unfreeze(keys=["lora_a", "lora_b"])
+    reference = p.ReferencePolicy(scales=[(adapter, 0.0)])
+    seq = lambda step, i, size: tuple((j * step + i) % 2053 for j in range(size))
+    rows = [p.TokenizedKTORow(
+        seq(7, i, 13 + i), seq(11, i, 40 + 3 * i), label=i % 3 != 0,
+        kl_prompt_ids=seq(7, i, 13 + i), kl_completion_ids=seq(5, i, 30 + i)) for i in range(4)]
+    objective = p.resolve_preference_objective("kto", beta=0.2, loss_type=loss_type)
+    plan = p.FiniteKTOBatchPlan(rows, [(0, 1, 2, 3)], with_kl=objective.with_kl,
+                                normalizers=[(0, 4, 1)], cycle_length=1, max_seq_length=128, pad_id=0)
+    dense = nn.value_and_grad(model, p.make_kto_loss_fn(objective, reference_policy=reference))
+    grad = nn.value_and_grad(model, p.make_kto_cce_loss_fn(model, objective, reference_policy=reference))
+    mx.eval(expected := dense(model, *plan[0]))
+    calls.clear()
+    run = mx.compile(lambda *b: grad(model, *b), inputs=model.state, outputs=model.state)
+    mx.eval(actual := run(*plan[0]))
+    # The KL rows and the reference score through the kernel, not the logits.
+    assert "model" not in calls and adapter.scale == 2.0
+    for want, got in zip(expected[0], actual[0]):
+        assert mx.allclose(want, got, atol=1e-4, rtol=1e-5).item()
+    for (_, want), (_, got) in zip(tree_flatten(expected[1]), tree_flatten(actual[1])):
+        assert mx.allclose(want, got, atol=2e-5, rtol=2e-4).item()
+    scorer = p.make_kto_cce_loss_fn(model, objective, reference_policy=reference)._unsloth_cce_scorer
+    want = p.precompute_reference_logps(plan, model, reference, batch_size=4)
+    calls.clear()
+    got = p.precompute_reference_logps(plan, model, reference, batch_size=4, scorer=scorer)
+    assert "model" not in calls and abs(want - got).max() < 2e-3 and want.any()
+
+
+@metal_only
 @pytest.mark.parametrize("quantized", [False, True])
 @pytest.mark.parametrize("labeled", [False, True])
 def test_text_eval_compacts_finite_batches(monkeypatch, quantized, labeled):
@@ -2106,7 +2148,14 @@ def test_vlm_planned_vs_unplanned_training_parity(monkeypatch, tmp_path):
         def __call__(self, inputs, pixel_values=None, mask=None, **_kwargs):
             return self.proj(self.embed(inputs))
 
+    from transformers import TrainerCallback
+
     seen_widths = []
+
+    class TrainingWidths(TrainerCallback):
+        def on_train_begin(self, args, state, control, **kwargs):
+            seen_widths.clear()
+
     original_call = TinyVLM.__call__
 
     def recording_call(self, inputs, *args, **kwargs):
@@ -2158,6 +2207,7 @@ def test_vlm_planned_vs_unplanned_training_parity(monkeypatch, tmp_path):
         trainer._is_vlm = True
         trainer.processor = _Proc()
         trainer._batches = plan
+        trainer.add_callback(TrainingWidths())
         if planned:
             enabled_decision = types.SimpleNamespace(
                 should_raise=False, enabled=True, arch="tiny",
@@ -3043,3 +3093,47 @@ def test_gemma4_unified_sort_key_never_ties(counts):
     rows = valid.shape[0] * valid.shape[1]
     keys = sorted(_valid_first_sort_key(valid.reshape(rows), rows).tolist())
     assert len(set(keys)) == rows, f"tied keys: {keys}"
+
+
+@metal_only
+@pytest.mark.parametrize("use_cce", [False, True])
+def test_self_routed_vlm_merges_images_inside_loss(use_cce):
+    from types import SimpleNamespace
+
+    class GenerationWrapper(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = nn.Embedding(16, 8)
+            self.vision = nn.Linear(3, 8, bias=False)
+            self.head = nn.Linear(8, 16, bias=False)
+
+        @property
+        def language_model(self):
+            return self
+
+        def get_input_embeddings(self, ids, pixels, mask=None, **kwargs):
+            h = self.embed(ids)
+            if pixels is not None:
+                h = h + self.vision(pixels)[:, None] * kwargs["image_scale"]
+            return SimpleNamespace(inputs_embeds=h)
+
+        def __call__(self, ids, inputs_embeds=None, **kwargs):
+            h = self.embed(ids) if inputs_embeds is None else inputs_embeds
+            return self.head(h)
+
+    mx.random.seed(12)
+    model = GenerationWrapper()
+    factory = mlx_utils.make_vlm_cce_loss_fn if use_cce else mlx_utils.make_vlm_baseline_loss_fn
+    loss = factory(model)
+    for pixels in ([[1., 2., 3.], [3., -2., 1.]], [[-1., 0., 2.], [2., 1., -3.]]):
+        batch = dict(input_ids=mx.array([[1, 2, 3], [4, 5, 6]]),
+                     pixel_values=mx.array(pixels), image_scale=mx.array(0.7))
+        def reference(m, b):
+            embeds = m.get_input_embeddings(b["input_ids"], b["pixel_values"], image_scale=b["image_scale"])
+            logits = m(b["input_ids"], inputs_embeds=embeds.inputs_embeds)
+            return nn.losses.cross_entropy(logits[:, :-1], b["input_ids"][:, 1:]).mean()
+        expected, expected_grad = nn.value_and_grad(model, reference)(model, batch)
+        (actual, _), grad = nn.value_and_grad(model, loss)(model, batch)
+        assert float(mx.abs(grad["vision"]["weight"]).max()) > 0
+        assert mx.array_equal(actual, expected).item()
+        assert mx.array_equal(grad["vision"]["weight"], expected_grad["vision"]["weight"]).item()
