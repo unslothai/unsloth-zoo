@@ -1252,7 +1252,7 @@ def _ensure_catch_all_helper():
             [sys.executable, "-c", _CATCH_ALL_HELPER, os.path.abspath(__file__), str(request_r), str(reply_w)],
             pass_fds = (request_r, reply_w), stdin = subprocess.DEVNULL,
         )
-    except OSError:
+    except (OSError, ValueError):  # ValueError: pass_fds on Windows
         for fd in (request_r, request_w, reply_r, reply_w):
             os.close(fd)
         return False
@@ -1275,7 +1275,7 @@ def _call_in_catch_all_helper(fn, deadline, seconds, args, kwargs):
         raise TimeoutError(f"Timed out after {seconds:g}s")
     try:
         if not _ensure_catch_all_helper():
-            raise RuntimeError("Unsloth: could not start the strategy helper process")
+            raise RuntimeError("Unsloth: could not restart the strategy helper process")
         _, requests_conn, replies_conn, _ = _catch_all_helper
         requests_conn.send((fn._unsloth_catch_all, args, kwargs))
         if not replies_conn.poll(max(deadline - time.monotonic(), 0.0)):
@@ -1295,8 +1295,8 @@ def _stop_generated_code_at_deadline(value, deadline, seconds):
     if not (isinstance(value, types.FunctionType) and value.__code__.co_filename == "<user_code>"):
         return value
     # A bare except / except BaseException can absorb every in-process signal, so
-    # that code runs in a helper process the deadline can kill.
-    if _runs_in_helper(value):
+    # that code runs in a helper process the deadline can kill (in-process if none started).
+    if _runs_in_helper(value) and _catch_all_helper is not None:
         @wraps(value)
         def in_helper(*args, **kwargs):
             return _call_in_catch_all_helper(value, deadline, seconds, args, kwargs)

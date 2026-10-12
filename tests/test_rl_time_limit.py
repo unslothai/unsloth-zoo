@@ -288,6 +288,26 @@ def test_catch_all_instances_keep_separate_globals(tmp_path, monkeypatch):
     assert [call(first), call(first), call(second), call(first)] == [1, 2, 1, 3]
 
 
+def test_catch_all_strategy_runs_in_process_when_helper_cannot_start(tmp_path, monkeypatch):
+    import unsloth_zoo.rl_environments as R
+
+    (tmp_path / "rl_nohelper.py").write_text(textwrap.dedent("""
+        from unsloth_zoo.rl_environments import execute_with_time_limit
+
+        @execute_with_time_limit(5)
+        def call(strategy):
+            return strategy()
+    """))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    from rl_nohelper import call
+
+    R._stop_catch_all_helper()
+    monkeypatch.setattr(R.sys, "executable", str(tmp_path / "missing-python"))
+    strategy = R.create_locked_down_function("def strategy():\n    try:\n        return 'W'\n    except:\n        return 'A'\n")
+    assert call(strategy) == "W"
+    assert R._catch_all_helper is None
+
+
 def test_catch_all_reply_cannot_run_code_in_the_parent(tmp_path, monkeypatch, capfd):
     import pickle
     from unsloth_zoo.rl_environments import _inert_loads, create_locked_down_function
