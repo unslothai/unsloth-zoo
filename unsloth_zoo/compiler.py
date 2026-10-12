@@ -2070,11 +2070,16 @@ def create_new_function(
             new_source = _insert_kwargs_alias(new_source, name, kwargs_alias)
     pass
 
-    # Import items to make the function executable
+    # Import items to make the function executable. Only a module-level def counts as local: a
+    # same-named method does not define the bare name its body may call.
     items = [
         x
         for x in functions
-        if ((x in new_source) and (x != name) and not (f"def {x}(" in new_source))
+        if (
+            (x in new_source)
+            and (x != name)
+            and not re.search(r"^def " + re.escape(x) + r"\(", new_source, flags = re.MULTILINE)
+        )
     ]
     # Patch for SiglipEncoder and others
     if "SiglipEncoder" in new_source:

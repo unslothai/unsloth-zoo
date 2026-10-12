@@ -136,17 +136,26 @@ with contextlib.redirect_stdout(buf):
 path = os.path.join("unsloth_compiled_cache", f"unsloth_compiled_module_{MT}.py")
 generated = open(path, encoding = "utf-8").read()
 error = None
+forward_error = None
 try:
     spec = importlib.util.spec_from_file_location("synthetic_generated", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 except Exception as exception:
     error = f"{type(exception).__name__}: {exception}"
+else:
+    # The method shadows the foreign helper by name but calls it bare: it must still resolve.
+    try:
+        output = module.SyntheticModel()(torch.full((2, 3, 8), 0.5))
+        assert torch.equal(output, torch.full((2, 3, 8), 2.0)), output
+    except Exception as exception:
+        forward_error = f"{type(exception).__name__}: {exception}"
 
 print("@@@" + json.dumps({
     "generated"     : generated,
     "modeling_file" : modeling_file.__file__,
     "error"         : error,
+    "forward_error" : forward_error,
     "log"           : buf.getvalue()[-4000:],
 }))
 '''
@@ -183,6 +192,7 @@ def test_generated_module_imports_with_foreign_wrapper_and_annotations(tmp_path)
     assert payload["error"] is None, (
         payload["error"] + "\n" + generated[-3000:] + "\n--- log ---\n" + payload["log"]
     )
+    assert payload["forward_error"] is None, payload["forward_error"] + "\n" + generated[-3000:]
     assert "\ndef build_mask(" not in generated, generated[-3000:]
     assert "\ndef local_helper(" in generated, payload["log"]
     assert "unused_arg" not in generated.split("\ndef local_helper(", 1)[1].split("\n", 1)[0]
