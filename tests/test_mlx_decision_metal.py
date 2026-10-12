@@ -1231,6 +1231,10 @@ def test_clef_omni_hears_audio_after_its_images(clef, monkeypatch):
     monkeypatch.setattr(decision, "_MAX_AUDIO_SECONDS", 0.5)
     with pytest.raises(DecisionRequestError, match = "longer than 0.5 seconds"):
         reader.answer("state", questions, audio = [_wav(low[:2000], 8000), _wav(low[:2400], 8000)])
+    # Below the mlx-vlm release the trainer qualifies for Qwen3-Omni audio, audio is refused; images are not.
+    monkeypatch.setattr(sys.modules["unsloth_zoo.mlx.utils"], "_installed_mlx_vlm_version", lambda: "0.6.6")
+    assert not reader.reads_audio and reader.reads_images
+    monkeypatch.undo()
     model.thinker.audio_tower = None
     assert not reader.reads_audio
 

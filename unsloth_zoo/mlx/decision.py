@@ -874,7 +874,13 @@ class _QwenModel(DecisionPipeline):
         if self._architecture in self._TOWERS:
             # The layouts and forwards here are those of these architectures, as their references define them.
             # Without its processor files a model loads with a bare tokenizer in the processor's place.
+            from .utils import _AUDIO_QUALIFIED_FAMILIES, _installed_mlx_vlm_version
+
             owner = self._TOWERS[self._architecture]
+            # Audio only on the mlx-vlm releases the trainer qualifies for this architecture's processing.
+            qualified = _AUDIO_QUALIFIED_FAMILIES.get(self._architecture)
+            if tower == "audio_tower" and not (qualified and qualified.admits(_installed_mlx_vlm_version())):
+                return False
             return getattr(processor, part, None) is not None and getattr(getattr(self.model, owner, None) if owner else self.model, tower, None) is not None
         if not self._trainer_family:
             return False
