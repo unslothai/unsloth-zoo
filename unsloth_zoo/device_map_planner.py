@@ -755,12 +755,12 @@ def _compute_module_sizes(model: nn.Module, hf_quantizer: Any = None) -> dict[st
             if isinstance(out, Mapping) and "" in out:
                 sizes = {k: int(v) for k, v in out.items()}
                 if complete:
-                    return sizes
+                    return _drop_tied_head_bytes(model, sizes)
                 if fallback is None:
                     fallback = sizes
                 break
     if fallback is not None:
-        return fallback
+        return _drop_tied_head_bytes(model, fallback)
     sizes: dict[str, int] = {}
     for name, tensor in list(model.named_parameters()) + list(model.named_buffers()):
         nbytes = tensor.numel() * tensor.element_size()
@@ -768,6 +768,54 @@ def _compute_module_sizes(model: nn.Module, hf_quantizer: Any = None) -> dict[st
         for i in range(len(parts) + 1):
             sizes[".".join(parts[:i])] = sizes.get(".".join(parts[:i]), 0) + nbytes
     sizes.setdefault("", 0)
+    return _drop_tied_head_bytes(model, sizes)
+
+
+def _drop_tied_head_bytes(model: nn.Module, sizes: dict[str, int]) -> dict[str, int]:
+    """Charge a tied output head's weight once, whichever sizing path ran.
+
+    A meta model built under ``init_empty_weights`` is never tied by identity:
+    accelerate's patched ``register_parameter`` re-wraps the embedding weight in
+    a fresh meta Parameter when ``tie_weights`` assigns it to the head. Real
+    loads share the one tensor. transformers 5 sizing skips the head anyway (it
+    drops ``all_tied_weights_keys``), but accelerate's ``compute_module_sizes``,
+    used on transformers 4, and the plain walk count the head a second time,
+    about 300 MiB on Qwen3-0.6B. Only a head the config declares tied, that is
+    not already the same object as the input embedding and has the same shape,
+    is dropped, and only by what the table still charges for it, so an untied
+    head and an already deduplicated table are left alone.
+    """
+    head_name, head = resolve_output_head(model)
+    if not head_name or head is None or not head_is_tied(model, head):
+        return sizes
+    getter = getattr(model, "get_input_embeddings", None)
+    try:
+        inp = getter() if callable(getter) else None
+    except Exception:
+        inp = None
+    hw, iw = getattr(head, "weight", None), getattr(inp, "weight", None)
+    if not isinstance(hw, torch.Tensor) or not isinstance(iw, torch.Tensor) or hw is iw:
+        return sizes
+    if tuple(hw.shape) != tuple(iw.shape):
+        return sizes
+    # transformers 5 names exactly which tensors it ties; trust that over the flag.
+    tied_keys = getattr(model, "all_tied_weights_keys", None)
+    if isinstance(tied_keys, Mapping) and f"{head_name}.weight" not in tied_keys:
+        return sizes
+    # Whatever else the head owns (a bias, buffers) is real and stays charged.
+    other = sum(
+        t.numel() * t.element_size()
+        for t in list(head.parameters()) + list(head.buffers()) if t is not hw
+    )
+    drop = min(sizes.get(head_name, 0) - other, hw.numel() * hw.element_size())
+    if drop <= 0:
+        return sizes
+    sizes = dict(sizes)
+    parts = head_name.split(".")
+    for i in range(len(parts) + 1):
+        key = ".".join(parts[:i])
+        if key in sizes:
+            sizes[key] = max(0, sizes[key] - drop)
     return sizes
 
 
