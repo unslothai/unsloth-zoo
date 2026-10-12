@@ -24,6 +24,7 @@ import signal
 import subprocess
 import sys
 import textwrap
+import time
 
 import pytest
 
@@ -145,23 +146,36 @@ def test_state_restored_after_repeated_swallowed_timeouts():
     _run(SWALLOW_ONCE, repeats = 5)
 
 
-def _assert_outer_timer_restored(before):
+_RESTORE_TOLERANCE_S = 0.1
+
+
+def _outer_timer():
+    # The timer armed before the test, and when it was read.
+    return signal.getitimer(signal.ITIMER_REAL), time.monotonic()
+
+
+def _assert_outer_timer_restored(outer):
     # time_limit puts back whatever ITIMER_REAL was armed before it, less the time
     # it spent, so the end state is the caller's timer, not (0, 0). pytest-timeout's
     # signal method arms one around every test (Core zoo runs with PYTEST_TIMEOUT).
+    (before_remaining, before_interval), read_at = outer
     remaining, interval = signal.getitimer(signal.ITIMER_REAL)
-    if before == (0.0, 0.0):
+    elapsed = time.monotonic() - read_at
+    if (before_remaining, before_interval) == (0.0, 0.0):
         assert (remaining, interval) == (0.0, 0.0)
-    else:
-        assert interval == before[1]
-        assert 0.0 < remaining <= before[0]
+        return
+    assert interval == before_interval
+    # Rearming the caller's original duration would leave this near before_remaining,
+    # extending the caller's deadline by the time spent inside time_limit.
+    assert abs(remaining - (before_remaining - elapsed)) < _RESTORE_TOLERANCE_S, (
+        remaining, before_remaining, elapsed,
+    )
 
 
 def test_cleanup_after_timeout_runs_to_completion():
     from unsloth_zoo.rl_environments import time_limit
-    import time
 
-    before = signal.getitimer(signal.ITIMER_REAL)
+    outer = _outer_timer()
     done = []
     with pytest.raises(TimeoutError):
         with time_limit(0.05):
@@ -174,13 +188,13 @@ def test_cleanup_after_timeout_runs_to_completion():
                     pass
                 done.append(True)
     assert done == [True]
-    _assert_outer_timer_restored(before)
+    _assert_outer_timer_restored(outer)
 
 
 def test_fast_body_unchanged():
     from unsloth_zoo.rl_environments import execute_with_time_limit, time_limit
 
-    before = signal.getitimer(signal.ITIMER_REAL)
+    outer = _outer_timer()
 
     @execute_with_time_limit(5)
     def add(a, b):
@@ -191,7 +205,7 @@ def test_fast_body_unchanged():
         with time_limit(0.05):
             while True:
                 pass
-    _assert_outer_timer_restored(before)
+    _assert_outer_timer_restored(outer)
 
 
 def test_an_outer_timer_and_handler_survive_a_timeout():
@@ -204,15 +218,19 @@ def test_an_outer_timer_and_handler_survive_a_timeout():
     saved_timer = signal.getitimer(signal.ITIMER_REAL)
     signal.signal(signal.SIGALRM, outer)
     signal.setitimer(signal.ITIMER_REAL, 100.0, 7.0)
+    armed_at = time.monotonic()
     try:
+        # Long enough that leaving out the elapsed time is far outside the tolerance.
         with pytest.raises(TimeoutError):
-            with time_limit(0.05):
+            with time_limit(0.3):
                 while True:
                     pass
         assert signal.getsignal(signal.SIGALRM) is outer
         remaining, interval = signal.getitimer(signal.ITIMER_REAL)
+        elapsed = time.monotonic() - armed_at
         assert interval == 7.0
-        assert 95.0 < remaining <= 100.0
+        assert elapsed >= 0.3
+        assert abs(remaining - (100.0 - elapsed)) < _RESTORE_TOLERANCE_S, (remaining, elapsed)
     finally:
         signal.setitimer(signal.ITIMER_REAL, *saved_timer)
         signal.signal(signal.SIGALRM, saved_handler)
