@@ -42,7 +42,10 @@ def _base():
         num_experts = E, num_experts_per_tok = 2, num_hidden_layers = 1,
         num_attention_heads = 2, num_key_value_heads = 1, head_dim = 4,
     )
-    return Qwen3MoeForCausalLM(config).eval()
+    model = Qwen3MoeForCausalLM(config).eval()
+    if not hasattr(model.model.layers[0].mlp.experts, "gate_up_proj"):
+        pytest.skip(reason = "transformers < 5 keeps per-expert Linears: no fused expert LoRA to repack")
+    return model
 
 
 def _expert_lora_B(model):
@@ -158,8 +161,8 @@ def test_inference_is_limited_to_families_the_old_forward_owned():
     assert MU.saved_lora_b_layouts({"target_parameters": ["experts.gate_up_proj"], "auto_mapping": {"unsloth_fixed": True}}) == {
         None: MU.LORA_B_LAYOUT_GROUPED_BY_EXPERT,
     }
-    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeExperts
-    assert MU._experts_family(Qwen3MoeExperts.__new__(Qwen3MoeExperts)) in MU._LEGACY_GROUPED_LORA_B_FAMILIES
+    upstream = type("Qwen3MoeExperts", (torch.nn.Module,), {"__module__": "transformers.models.qwen3_moe.modeling_qwen3_moe"})
+    assert MU._experts_family(upstream()) == "qwen3_moe"
 
     compiled = type("Qwen3MoeExperts", (torch.nn.Module,), {"__module__": "unsloth_compiled_module_qwen3_moe"})
     assert MU._experts_family(compiled()) == "qwen3_moe"
