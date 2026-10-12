@@ -947,6 +947,11 @@ _CONTEXTMANAGER_FRAMES = frozenset((
 # After the deadline SIGALRM re-fires at this period until the body unwinds.
 _TIME_LIMIT_REFIRE_S = 0.01
 
+class _TimeLimitExceeded(BaseException):
+    # Raised by the re-fires: `except Exception` in generated code catches the
+    # first TimeoutError but not this. time_limit turns it into TimeoutError.
+    pass
+
 @contextmanager
 def time_limit(seconds: float, *, strict: bool = True, leeway: float = 0.05):
     """
@@ -984,9 +989,11 @@ def time_limit(seconds: float, *, strict: bool = True, leeway: float = 0.05):
         # Keep firing until the body unwinds: code that swallows the TimeoutError
         # (a model-written strategy with a bare except, called in a loop) would
         # otherwise never stop, since a one-shot alarm fires only once.
-        _retry_eintr(signal.setitimer, signal.ITIMER_REAL, _TIME_LIMIT_REFIRE_S)
+        signal.setitimer(signal.ITIMER_REAL, _TIME_LIMIT_REFIRE_S)
         if frame is not None and frame.f_code in _CONTEXTMANAGER_FRAMES:
             return
+        if fired:
+            raise _TimeLimitExceeded()
         fired = True
         # include the intended arming deadline for debugging
         raise TimeoutError(f"Timed out after {deadline:g}s")
@@ -1003,6 +1010,8 @@ def time_limit(seconds: float, *, strict: bool = True, leeway: float = 0.05):
 
         _retry_eintr(signal.setitimer, signal.ITIMER_REAL, deadline)
         yield
+    except _TimeLimitExceeded:
+        raise TimeoutError(f"Timed out after {deadline:g}s") from None
     finally:
         stopping = True
         # Make teardown atomic wrt SIGINT and robust to EINTR
