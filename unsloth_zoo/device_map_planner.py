@@ -772,29 +772,20 @@ def _compute_module_sizes(model: nn.Module, hf_quantizer: Any = None) -> dict[st
 
 
 def _drop_tied_head_bytes(model: nn.Module, sizes: dict[str, int]) -> dict[str, int]:
-    """Charge a tied output head's weight once, whichever sizing path ran.
+    """Charge a tied output head's weight once.
 
-    A meta model built under ``init_empty_weights`` is never tied by identity:
-    accelerate's patched ``register_parameter`` re-wraps the embedding weight in
-    a fresh meta Parameter when ``tie_weights`` assigns it to the head. Real
-    loads share the one tensor. transformers 5 sizing skips the head anyway (it
-    drops ``all_tied_weights_keys``), but accelerate's ``compute_module_sizes``,
-    used on transformers 4, and the plain walk count the head a second time,
-    about 300 MiB on Qwen3-0.6B. Only a head the config declares tied, that is
-    not already the same object as the input embedding and has the same shape,
-    is dropped, and only by what the table still charges for it, so an untied
-    head and an already deduplicated table are left alone.
+    On transformers 4 the head is counted twice: init_empty_weights re-wraps the
+    tied embedding in a fresh meta Parameter, so the head is not the same object.
     """
     head_name, head = resolve_output_head(model)
     if not head_name or head is None:
         return sizes
-    # Any explicit False wins: a composite model's outer config can untie a head its text config
-    # marks tied (Qwen2.5-Omni Thinker), and dropping a resident head would underestimate.
+    # Any explicit False wins: a composite outer config can untie (Qwen2.5-Omni Thinker).
     cfg = _config_attr(model, "config")
     flags = [_config_attr(h, "tie_word_embeddings") for h in (cfg, _config_attr(cfg, "text_config"))]
     if any(f is False for f in flags) or not any(f is True for f in flags):
         return sizes
-    # transformers 4 clones instead of sharing when torchscript is set: the head stays resident.
+    # torchscript clones instead of tying on transformers 4, so the head stays charged.
     if any(_config_attr(h, "torchscript") is True for h in (cfg, _config_attr(cfg, "text_config"))):
         return sizes
     getter = getattr(model, "get_input_embeddings", None)
@@ -807,11 +798,9 @@ def _drop_tied_head_bytes(model: nn.Module, sizes: dict[str, int]) -> dict[str, 
         return sizes
     if tuple(hw.shape) != tuple(iw.shape):
         return sizes
-    # transformers 5 names exactly which tensors it ties; trust that over the flag.
     tied_keys = getattr(model, "all_tied_weights_keys", None)
     if isinstance(tied_keys, Mapping) and f"{head_name}.weight" not in tied_keys:
         return sizes
-    # Whatever else the head owns (a bias, buffers) is real and stays charged.
     other = sum(
         t.numel() * t.element_size()
         for t in list(head.parameters()) + list(head.buffers()) if t is not hw

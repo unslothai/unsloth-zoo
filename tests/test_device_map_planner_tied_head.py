@@ -2,14 +2,7 @@
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 
-"""A tied output head is sized once on every transformers version.
-
-A meta model built under ``init_empty_weights`` is not tied by identity, so
-accelerate's ``compute_module_sizes`` (the path on transformers 4) used to
-charge the head a second time. Real loads share the weight.
-
-Meta-device models only: no GPU, no weights, no network.
-"""
+"""A tied output head is sized once on every transformers version (meta models only)."""
 import pytest
 import torch
 
@@ -36,7 +29,6 @@ def _config(cls, tied):
 
 
 def _true_bytes(config):
-    """Unique parameter + buffer bytes of a real (tied when configured) model."""
     torch.manual_seed(0)
     model = AutoModelForCausalLM.from_config(config, torch_dtype = torch.bfloat16)
     tensors = {id(t): t for t in list(model.parameters()) + list(model.buffers())}
@@ -83,7 +75,6 @@ def test_block_swap_plans_meta_like_real_model(tied):
         expected = _plan(real, budget)
         assert _plan(meta, budget, quantizer) == expected, budget
         plans.append(expected)
-    # The sweep crossed from infeasible through swapping to fully resident.
     assert None in plans and (0, 0) in plans
     assert any(p is not None and p[0] > 0 for p in plans)
 
@@ -123,8 +114,7 @@ def test_multimodal_tied_head_sized_from_text_config(tied):
 
 
 def test_outer_config_untie_keeps_the_head_charged():
-    """Outer tie_word_embeddings = False with a tied text config (Qwen2.5-Omni Thinker shape): the head
-    stays charged, so the plan can only overestimate, never drop a resident head."""
+    """Outer tie_word_embeddings = False beats a tied text config: the head stays charged."""
     from transformers import AutoModelForImageTextToText, Gemma3Config
     config = Gemma3Config(
         text_config = dict(
@@ -151,8 +141,7 @@ def test_outer_config_untie_keeps_the_head_charged():
 
 
 def test_torchscript_clone_keeps_the_head_charged():
-    """torchscript = True makes transformers 4 clone the embedding into the head instead of sharing it,
-    so the plan must not drop the head (it may overestimate on transformers 5, never underestimate)."""
+    """torchscript clones the head on transformers 4, so it must stay charged."""
     from transformers import Qwen3Config, AutoModelForCausalLM
     config = Qwen3Config(
         vocab_size = 1024, hidden_size = 64, intermediate_size = 128, num_hidden_layers = 2,
