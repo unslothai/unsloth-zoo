@@ -4750,6 +4750,20 @@ def _install_glm5_next_compile_patches():
     vision_module = _try_import_module("mlx_vlm.models.glm5_next.vision")
     if module is None or vision_module is None:
         return
+    # mlx-vlm 0.7.0 ships an older tower (no VisionAttention / _video_grid): stay eager.
+    if not all(
+        callable(getattr(owner, name, None))
+        for owner, name in (
+            (vision_module, "VisionAttention"),
+            (vision_module, "_apply_rotary"),
+            (getattr(vision_module, "VisionModel", None), "_rotary_embeddings"),
+            (getattr(module, "Model", None), "_video_grid"),
+            (module, "_replace_features"),
+        )
+    ):
+        _VERIFIED_TRAINING_ARCHES.discard("glm5_next")
+        _PATCHED_ARCHES.discard("glm5_next")
+        return
 
     def patched_rotary_embeddings(self, grid_thw):
         import mlx.core as mx

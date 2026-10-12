@@ -2775,6 +2775,22 @@ def test_the_glm5_next_merge_really_refuses_a_count_mismatch():
         assert merged[0, 0].tolist() == [1.0, 1.0]
 
 
+def test_glm5_next_on_an_older_tower_contract_stays_eager(monkeypatch):
+    """mlx-vlm 0.7.0's glm5_next has no VisionAttention: installing must neither
+    raise (it would abort every family's install) nor qualify the family."""
+    _skip_if_mlx_core_was_replaced()
+
+    with _installer_patches_restored("glm5_next") as (mc, modules):
+        monkeypatch.setattr(mc, "_VERIFIED_TRAINING_ARCHES", set(mc._VERIFIED_TRAINING_ARCHES))
+        mc._PATCHED_ARCHES.discard("glm5_next")
+        vision_call = modules["vision"].VisionModel.__call__
+        monkeypatch.delattr(modules["vision"], "VisionAttention")
+        mc._install_glm5_next_compile_patches()
+        assert "glm5_next" not in mc._VERIFIED_TRAINING_ARCHES
+        assert "glm5_next" not in mc._PATCHED_ARCHES
+        assert modules["vision"].VisionModel.__call__ is vision_call
+
+
 @pytest.mark.parametrize("arch", ["kimi_vl", "moondream2"])
 def test_a_family_qualified_without_a_patch_still_has_to_clear_the_gate(arch):
     """No compile patch needed: qualification alone decides."""
