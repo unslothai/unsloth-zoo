@@ -794,6 +794,9 @@ def _drop_tied_head_bytes(model: nn.Module, sizes: dict[str, int]) -> dict[str, 
     flags = [_config_attr(h, "tie_word_embeddings") for h in (cfg, _config_attr(cfg, "text_config"))]
     if any(f is False for f in flags) or not any(f is True for f in flags):
         return sizes
+    # transformers 4 clones instead of sharing when torchscript is set: the head stays resident.
+    if any(_config_attr(h, "torchscript") is True for h in (cfg, _config_attr(cfg, "text_config"))):
+        return sizes
     getter = getattr(model, "get_input_embeddings", None)
     try:
         inp = getter() if callable(getter) else None

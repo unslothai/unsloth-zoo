@@ -148,3 +148,19 @@ def test_outer_config_untie_keeps_the_head_charged():
 
     meta, quantizer, _ = planner.build_meta_model("org/unused", config = config, dtype = torch.bfloat16)
     assert planner._compute_module_sizes(meta, quantizer)[""] == charged_total
+
+
+def test_torchscript_clone_keeps_the_head_charged():
+    """torchscript = True makes transformers 4 clone the embedding into the head instead of sharing it,
+    so the plan must not drop the head (it may overestimate on transformers 5, never underestimate)."""
+    from transformers import Qwen3Config, AutoModelForCausalLM
+    config = Qwen3Config(
+        vocab_size = 1024, hidden_size = 64, intermediate_size = 128, num_hidden_layers = 2,
+        num_attention_heads = 2, num_key_value_heads = 1, head_dim = 32, tie_word_embeddings = True,
+    )
+    config.torchscript = True
+    real = AutoModelForCausalLM.from_config(config, torch_dtype = torch.bfloat16)
+    tensors = {id(t): t for t in list(real.parameters()) + list(real.buffers())}
+    unique_total = sum(t.numel() * t.element_size() for t in tensors.values())
+    meta, quantizer, _ = planner.build_meta_model("org/unused", config = config, dtype = torch.bfloat16)
+    assert planner._compute_module_sizes(meta, quantizer)[""] >= unique_total
