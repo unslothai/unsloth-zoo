@@ -2070,8 +2070,7 @@ def create_new_function(
             new_source = _insert_kwargs_alias(new_source, name, kwargs_alias)
     pass
 
-    # Import items to make the function executable. Only a module-level def counts as local: a
-    # same-named method does not define the bare name its body may call.
+    # Import items to make the function executable; a same-named method is not a local def
     items = [
         x
         for x in functions
