@@ -25,6 +25,7 @@ import pytest
 import torch
 
 from unsloth_zoo import compiler
+from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss
 
 # Mirrors BambaForCausalLM.forward's head + labels block (transformers 4.55 .. 5.18).
 FORWARD = """    def forward(self, hidden_states, labels=None, logits_to_keep=0, **kwargs):
@@ -49,7 +50,10 @@ def ForCausalLMLoss(logits, labels, vocab_size = None, **kwargs):
     )
 
 
-def _run(source, z, return_logits):
+ForCausalLMLoss._unsloth_fused_loss = ForCausalLMLoss
+
+
+def _run(source, z, return_logits, loss_function = ForCausalLMLoss):
     calls = []
 
     def fused(hidden_states, lm_head_weight, labels, **kwargs):
@@ -59,12 +63,13 @@ def _run(source, z, return_logits):
     ns = dict(
         torch = torch, os = os, EMPTY_LOGITS = torch.empty(0), UNSLOTH_ENABLE_CCE = False,
         HAS_CUT_CROSS_ENTROPY = False, UNSLOTH_COMPILE_DISABLE = True, unsloth_fused_ce_loss = fused,
+        _can_fuse_loss = _can_fuse_loss,
     )
     exec(textwrap.dedent(source), ns)
     torch.manual_seed(0)
     lm_head = torch.nn.Linear(8, 16, bias = False)
     model = types.SimpleNamespace(
-        lm_head = lm_head, loss_function = ForCausalLMLoss, z_loss_coefficient = z,
+        lm_head = lm_head, loss_function = loss_function, z_loss_coefficient = z,
         config = types.SimpleNamespace(vocab_size = 16),
     )
     hidden = torch.randn(2, 5, 8)
@@ -91,6 +96,21 @@ def test_trailing_if_block_keeps_z_loss(z, return_logits):
     torch.testing.assert_close(got, expected)
     # The fused kernel runs only when the trailing block would not read the logits.
     assert n_fused == (1 if (z == 0.0 and not return_logits) else 0)
+
+
+def test_custom_loss_copying_stock_attributes_is_not_fused():
+    import functools
+
+    @functools.wraps(ForCausalLMLoss)
+    def custom(*args, **kwargs):
+        return 3 * ForCausalLMLoss(*args, **kwargs)
+
+    new, fused = compiler.apply_fused_lm_head(FORWARD, "BambaForCausalLM")
+    assert fused
+    expected, _ = _run(FORWARD, 0.0, False, custom)
+    got, n_fused = _run(new, 0.0, False, custom)
+    torch.testing.assert_close(got, expected)
+    assert n_fused == 0
 
 
 def test_other_trailing_statements_are_not_fused():
