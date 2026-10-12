@@ -411,7 +411,7 @@ def forward(self, hidden_states, labels=None, **kwargs):
 
 
 @pytest.mark.parametrize("shape", ["plain", "scaled", "cast_wrapped"])
-@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("wrapped", [False, True, "kwargs_only"])
 def test_rewritten_forward_tracks_runtime_custom_loss(
     fresh_install, enable_env, monkeypatch, shape, wrapped,
 ):
@@ -447,7 +447,11 @@ def test_rewritten_forward_tracks_runtime_custom_loss(
         calls.append(kwargs["num_items_in_batch"])
         return 3 * ForCausalLMLoss(*args, **kwargs)
 
-    if wrapped:
+    if wrapped == "kwargs_only":
+        def custom_loss(**kwargs):
+            calls.append(kwargs["num_items_in_batch"])
+            return 3 * ForCausalLMLoss(**kwargs)
+    elif wrapped:
         custom_loss = functools.wraps(ForCausalLMLoss)(custom_loss)
     for loss_function in (ForCausalLMLoss, custom_loss, ForCausalLMLoss):
         model.loss_function = loss_function

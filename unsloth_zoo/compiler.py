@@ -3440,7 +3440,7 @@ elif _can_fuse_loss(self.loss_function) and labels is not None and NOT_RETURN_LO
         logit_softcapping    = (\\4) if (\\4) != () else 0,
         shift_labels         = explicit_shift_labels is None,
     )
-elif labels is not None and not NOT_RETURN_LOGITS:
+elif _can_fuse_loss(self.loss_function) and labels is not None and not NOT_RETURN_LOGITS:
     # UNSLOTH_RETURN_LOGITS=1 path. Prepended `logits = self.lm_head(...)`
     # already materialised the full lm_head matmul; apply the captured logit
     # scale/softcap transforms and route loss through self.loss_function on

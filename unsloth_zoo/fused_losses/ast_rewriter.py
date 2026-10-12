@@ -65,6 +65,9 @@ class TripletCapture:
     softcap_expr: ast.AST | None = None
     # Compiler fallback only (extended=True); defaults keep the hook's output unchanged.
     labels_src: str = "labels"
+    # The captured call passed logits / labels by keyword; a runtime custom loss may require it.
+    logits_kw: bool = False
+    labels_kw: bool = False
     guarded_scale_idx: int | None = None
     guarded_scale_stmt: ast.stmt | None = None
     guarded_scale_expr: ast.AST | None = None
@@ -362,6 +365,7 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef, extended: bool = False)
         vocab_expr, kwargs_name = None, None
         legacy_body = list(if_node.body)
         aligned_target = aligned is not None
+        logits_kw = labels_kw = False
         kwargs_name = fn.args.kwarg.arg if fn.args.kwarg is not None else "kwargs"
         add_kwargs = fn.args.kwarg is None
     else:
@@ -425,6 +429,8 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef, extended: bool = False)
         if labels_arg != "labels":
             return None
         aligned_target = aligned_target or bool(fused_pre)
+        logits_kw = not loss_call.args
+        labels_kw = len(loss_call.args) < 2
 
         # vocab_size: keyword preferred, else 3rd positional.
         vocab_expr = None
@@ -564,6 +570,8 @@ def _capture(fn: ast.FunctionDef | ast.AsyncFunctionDef, extended: bool = False)
         softcap_stmt=body[softcap_idx] if softcap_idx is not None else None,
         softcap_expr=softcap_expr,
         labels_src=labels_src,
+        logits_kw=logits_kw,
+        labels_kw=labels_kw,
         guarded_scale_idx=guarded_idx,
         guarded_scale_stmt=body[guarded_idx] if guarded_idx is not None else None,
         guarded_scale_expr=guarded_expr,
@@ -630,6 +638,9 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
     extra = "".join(
         f", {name}={ast.unparse(value)}" for name, value in cap.extra_loss_kws
     )
+    lf_args = (f"logits={logits}" if cap.logits_kw else logits) + ", " + (
+        f"labels={cap.labels_src}" if cap.labels_kw else cap.labels_src
+    )
     lf_extra = extra
     if cap.count_injected:
         lf_extra = "".join(
@@ -661,7 +672,7 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
             if labels is not None:
                 if os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '1' or not _can_fuse_loss(self.loss_function):
                     {logits} = {logits_rhs}
-                    {loss} = self.loss_function({logits}, labels, vocab_size={vocab}{lf_extra}{kwargs_unpack})
+                    {loss} = self.loss_function({lf_args}, vocab_size={vocab}{lf_extra}{kwargs_unpack})
                 else:
                     {loss} = unsloth_fused_lm_head_loss(
                         {hidden_src}, self.{head_attr}, labels,
@@ -698,7 +709,7 @@ def _build_replacement(cap: TripletCapture) -> list[ast.stmt]:
     else:
         unfused = [
             f"{logits} = {logits_rhs}", *softcap, *pre,
-            f"{loss} = self.loss_function({logits}, {cap.labels_src}, vocab_size={vocab}{lf_extra}{kwargs_unpack})",
+            f"{loss} = self.loss_function({lf_args}, vocab_size={vocab}{lf_extra}{kwargs_unpack})",
             *post,
         ]
         fused_call = (
