@@ -8146,6 +8146,8 @@ def _split_audio_past_the_window(messages, clips, processor):
     Pieces are near-equal rather than window-sized with a remainder, so none is
     too short to frame. Returns its arguments when there is nothing to split.
     """
+    if not clips:
+        return messages, clips
     limit = _audio_clip_limit_samples(processor)
     counts = [-(-len(clip) // limit) if limit else 1 for clip in clips]
     # Rows the dataset rendered itself reach here as a string.
@@ -8265,11 +8267,13 @@ def _assert_audio_runs_cover_their_clips(clips, processor):
     start of a clip. Only rows rendered by the dataset get here with a long
     clip; message rows are split first.
     """
+    if not any(clips or ()):
+        return
     advice = "Split the clip, or give the row as messages."
     limit = _audio_clip_limit_samples(processor)
     cut = limit == _extractor_window_samples(processor)
     name = type(processor).__name__
-    if not limit or not clips:
+    if not limit:
         return
     rate = audio_extractor_sampling_rate(processor)
     seconds = f" ({limit / rate:.0f}s)" if rate else ""
