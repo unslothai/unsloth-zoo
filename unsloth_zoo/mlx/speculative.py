@@ -1296,6 +1296,63 @@ class DraftRow:
         return self.last is not None or bool(self.tokens)
 
 
+_SHORTLIST_BITS, _SHORTLIST_KEEP, _SHORTLIST_GROUP, _SHORTLIST_CHUNK, _SHORTLIST_COLUMNS = 2, 128, 64, 1 << 14, 2048
+
+
+class _ShortlistHead:
+    """Greedy tokens for drafting without a full pass over the target's output table: a 2-bit copy of its leading columns
+    picks a few candidates and the table's own rows choose among them. A draft is only a proposal, so a pick the
+    full head would not have made costs acceptance, never output."""
+
+    def __init__(self, table: nn.Module, columns: int, nbytes: int):
+        self.table, self.columns, self.nbytes, self._source, self._scan = table, columns, nbytes, None, None
+
+    @classmethod
+    def of(cls, lm: nn.Module) -> "_ShortlistHead | None":
+        """The shortlist head of a language model's output table; None leaves a table it does not cover to the full head."""
+        tied = getattr(getattr(lm, "args", None), "tie_word_embeddings", False)
+        table = getattr(getattr(lm, "model", None), "embed_tokens", None) if tied else getattr(lm, "lm_head", None)
+        weight, bits = getattr(table, "weight", None), getattr(table, "bits", None)
+        if not isinstance(weight, mx.array) or weight.ndim != 2 or "bias" in table:
+            return None
+        if bits is not None and not (bits > _SHORTLIST_BITS and getattr(table, "mode", "affine") == "affine"):
+            return None
+        # Width and size are the same for a quantized table and for the unquantized stand-in a load is sized from.
+        sides = weight if bits is None else table.scales
+        width = sides.shape[1] * (1 if bits is None else table.group_size)
+        if width % _SHORTLIST_GROUP:
+            return None
+        if sides.shape[0] <= _SHORTLIST_KEEP:
+            return None
+        columns = min(width, _SHORTLIST_COLUMNS)
+        return cls(table, columns, sides.shape[0] * (columns // _SHORTLIST_GROUP) * (_SHORTLIST_GROUP * _SHORTLIST_BITS // 8 + 2 * sides.dtype.size))
+
+    def _rows(self, rows) -> mx.array:
+        table = self.table
+        if getattr(table, "bits", None) is None:
+            return table.weight[rows]
+        return mx.dequantize(table.weight[rows], table.scales[rows], table.biases[rows], table.group_size, table.bits, mode = table.mode)
+
+    def prepare(self) -> None:
+        """Build the copy, in row chunks so the table is never held dequantized whole; again if the table's weight was replaced."""
+        if self._source is self.table.weight:
+            return
+        parts = []
+        for start in range(0, self.table.weight.shape[0], _SHORTLIST_CHUNK):
+            parts.append(mx.quantize(self._rows(slice(start, start + _SHORTLIST_CHUNK))[:, :self.columns], _SHORTLIST_GROUP, _SHORTLIST_BITS))
+            mx.eval(parts[-1])
+        self._scan = tuple(mx.concatenate(column) for column in zip(*parts))
+        mx.eval(self._scan)
+        self._source = self.table.weight
+
+    def __call__(self, hidden: mx.array) -> mx.array:
+        coarse = mx.quantized_matmul(hidden[..., :self.columns], *self._scan, True, _SHORTLIST_GROUP, _SHORTLIST_BITS)
+        best = mx.argpartition(-coarse, _SHORTLIST_KEEP, axis = -1)[..., :_SHORTLIST_KEEP]
+        rows = self._rows(best.reshape(-1)).reshape(*best.shape, -1)
+        exact = (rows @ hidden[..., None].astype(rows.dtype)).squeeze(-1)
+        return mx.take_along_axis(best, mx.argmax(exact, axis = -1, keepdims = True), axis = -1).squeeze(-1)
+
+
 class MTPDrafter:
     """Drafts greedily with a Qwen-style MTP head, whose KV cache slot ``j`` holds the pair (token ``j + 1``,
     target hidden ``j``). Plain windows and copy rounds only record pairs; a row replays them just before
@@ -1309,6 +1366,7 @@ class MTPDrafter:
         self.model = model.bind(target)
         lm = getattr(target, "language_model", target)
         self._draft_hidden = getattr(lm, "speculative_draft_hidden", None)
+        self._shortlist = _ShortlistHead.of(lm)
         # A longer stretch replays only its tail, leaving a gap the head attends across.
         self.max_lag = max_lag
 
@@ -1319,6 +1377,9 @@ class MTPDrafter:
         """A row from its prompt, the target hidden ``[1, N, H]`` of its last N prompt positions
         (or None), and its pending token; returns its state and its head cache."""
         cache = self.new_cache()
+        if self._shortlist is not None:
+            # Here rather than in the first round, whose time the controller takes as the cost of drafting.
+            self._shortlist.prepare()
         count = 0 if hidden is None else min(int(hidden.shape[1]), len(prompt))
         row = DraftRow(len(prompt) - count)
         if count:
@@ -1384,11 +1445,12 @@ class MTPDrafter:
         like = next(row.last for row in rows if row is not None and row.last is not None)
         hidden = mx.concatenate([row.last if row is not None and row.last is not None else mx.zeros_like(like) for row in rows])
         starts = mx.array([row.position if row is not None else 0 for row in rows])[:, None]
-        token = self.model._greedy_token(hidden)
+        greedy = self.model._greedy_token if self._shortlist is None else self._shortlist
+        token = greedy(hidden)
         drafts = [token]
         for step in range(depth - 1):
             hidden = self._forward(cache, token, hidden, starts + step)
-            token = self.model._greedy_token(hidden)
+            token = greedy(hidden)
             drafts.append(token)
         return mx.concatenate(drafts, axis = 1)
 
@@ -1694,7 +1756,7 @@ def _built(wrapper, model: nn.Module, target: nn.Module, **kwargs):
     # factories evaluate nothing mlx-vlm's loader leaves lazy (it converts ModelOpt/compressed-tensors exports eagerly).
     weight_bytes = sum(value.nbytes for _, value in tree_flatten(model.parameters()))
     drafter = wrapper(model, target, **kwargs)
-    drafter.weight_bytes = weight_bytes
+    drafter.weight_bytes = weight_bytes + getattr(getattr(drafter, "_shortlist", None), "nbytes", 0)
     return drafter
 
 

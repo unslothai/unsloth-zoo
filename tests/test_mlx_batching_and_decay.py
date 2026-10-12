@@ -267,7 +267,7 @@ def test_compiler_review_guards_are_present():
     mlx_compile_source = inspect.getsource(mlx_compile)
 
     assert (
-        'self.loss_function.__name__.endswith("ForCausalLMLoss") '
+        "_can_fuse_loss(self.loss_function) "
         "and labels is not None and NOT_RETURN_LOGITS"
     ) in compiler_source
     assert '"weight" in norm' not in mlx_compile_source
@@ -2627,6 +2627,24 @@ HOST_GRID_FAMILIES = [
       ("model", "VariableResolutionResamplerModel", "__call__"),
       ("model", "Model", "_merge_input_ids_with_image_features")],
      None),
+    ("glm5_next",
+     [("vision", "VisionModel", "__call__"),
+      ("vision", "VisionModel", "_rotary_embeddings"),
+      ("vision", "VisionAttention", "__call__"),
+      ("model", "Model", "_video_grid"),
+      ("model", None, "_replace_features")],
+     (None, "_replace_features", True)),
+    *[(arch,
+       [("vision", f"{prefix}VisionRotaryEmbedding", "__call__"),
+        ("vision", "VisionModel", "rot_pos_emb"),
+        ("vision", "VisionModel", "__call__"),
+        *attention,
+        ("model", "Model", "get_input_embeddings"),
+        ("model", "Model", "merge_input_ids_with_image_features",
+         "_merge_exclusive_special_token_features")],
+       ("Model", "merge_input_ids_with_image_features", False))
+      for arch, prefix, attention in (
+          ("glm4v", "Glm4v", [("vision", "Glm4vVisionAttention", "__call__")]),)],
 ]
 
 
@@ -2814,6 +2832,63 @@ def test_qwen3_omni_thinker_merges_on_device_and_trains_without_eval(monkeypatch
     assert backbone._deepstack_process(
         mx.zeros((1, 4, 1)), mx.array([[False, False, True, True]]), full
     ).tolist() == [[[0.0], [0.0], [5.0], [7.0]]]
+
+
+def test_the_glm5_next_merge_really_refuses_a_count_mismatch():
+    """Its upstream refuses either direction, so the installed replacement has
+    to as well. Its merge takes no model, so it can be called directly."""
+    _skip_if_mlx_core_was_replaced()
+
+    with _installer_patches_restored("glm5_next") as (mc, modules):
+        mc._install_glm5_next_compile_patches()
+        replace = modules["model"]._replace_features
+        features = mx.array([[1.0, 1.0], [2.0, 2.0]])
+
+        with pytest.raises(ValueError, match="tokens=1, features=2"):
+            replace(mx.zeros((1, 3, 2)), mx.array([[True, False, False]]),
+                    features, "Image")
+        with pytest.raises(ValueError, match="tokens=3, features=2"):
+            replace(mx.zeros((1, 3, 2)), mx.array([[True, True, True]]),
+                    features, "Image")
+        merged = replace(mx.zeros((1, 3, 2)), mx.array([[True, False, True]]),
+                         features, "Image")
+        assert merged[0, 0].tolist() == [1.0, 1.0]
+
+
+def test_glm4v_moe_is_patched_but_not_qualified_for_compiled_training():
+    """Its decoder does not compile on MLX 0.32 (IndexError the runtime fallback
+    does not catch), so it must stay eager even though its tower is patched."""
+    _skip_if_mlx_core_was_replaced()
+    from types import SimpleNamespace
+
+    from unsloth_zoo.mlx.compile import MLXVLMCompilePolicy, resolve_training_compile
+
+    with _installer_patches_restored("glm4v_moe") as (mc, modules):
+        assert "glm4v_moe" not in mc._VERIFIED_TRAINING_ARCHES
+        tower = modules["vision"].VisionModel.__call__
+        mc._runtime_patch_primitive_installers()["glm4v_moe_vision_compile_runtime"]()
+        assert modules["vision"].VisionModel.__call__ is not tower
+        model = type("Model", (), {"__module__": "mlx_vlm.models.glm4v_moe.glm4v_moe"})()
+        model.config = SimpleNamespace(model_type="glm4v_moe")
+        decision = resolve_training_compile(
+            model, policy=MLXVLMCompilePolicy(mode="best_effort"))
+        assert not decision.enabled
+
+
+def test_glm5_next_on_an_older_tower_contract_stays_eager(monkeypatch):
+    """mlx-vlm 0.7.0's glm5_next has no VisionAttention: installing must neither
+    raise (it would abort every family's install) nor qualify the family."""
+    _skip_if_mlx_core_was_replaced()
+
+    with _installer_patches_restored("glm5_next") as (mc, modules):
+        monkeypatch.setattr(mc, "_VERIFIED_TRAINING_ARCHES", set(mc._VERIFIED_TRAINING_ARCHES))
+        mc._PATCHED_ARCHES.discard("glm5_next")
+        vision_call = modules["vision"].VisionModel.__call__
+        monkeypatch.delattr(modules["vision"], "VisionAttention")
+        mc._install_glm5_next_compile_patches()
+        assert "glm5_next" not in mc._VERIFIED_TRAINING_ARCHES
+        assert "glm5_next" not in mc._PATCHED_ARCHES
+        assert modules["vision"].VisionModel.__call__ is vision_call
 
 
 @pytest.mark.parametrize("arch", ["kimi_vl", "moondream2"])
