@@ -465,9 +465,12 @@ def test_a_stance_freed_at_interpreter_shutdown_does_not_raise(monkeypatch):
 
     raised = []
     monkeypatch.setattr(sys, "unraisablehook", raised.append)
-    monkeypatch.setattr(stance_utils, "UNSLOTH_EAGER_STANCE_OWNED", [])
+    # Our own reference keeps the claimed weakref alive past the teardown, so its callback runs.
+    owned = []
+    monkeypatch.setattr(stance_utils, "UNSLOTH_EAGER_STANCE_OWNED", owned)
     stance = Stance()
     stance_utils.unsloth_claim_eager_stance(stance)
+    assert len(owned) == 1
     monkeypatch.setattr(stance_utils, "UNSLOTH_EAGER_STANCE_OWNED", None)
     del stance
     gc.collect()
