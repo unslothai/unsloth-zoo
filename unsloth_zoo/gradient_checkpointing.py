@@ -725,12 +725,7 @@ elif DEVICE_TYPE == "npu":
 
 
 def _compute_stream(device_index):
-    """The stream the caller computes on for this device right now.
-
-    Offload copies are ordered against this, never a stream cached at init: a
-    caller training under `torch.cuda.stream(s)` produces every activation on `s`,
-    and autograd runs each backward on the stream its forward used.
-    """
+    """Current compute stream; never cache it at init (callers may train under `torch.cuda.stream(s)`)."""
     if DEVICE_TYPE in ("cuda", "hip"):
         return torch.cuda.current_stream(device_index)
     elif DEVICE_TYPE == "xpu":
@@ -752,10 +747,8 @@ def _new_device_event():
 pass
 
 
-# Opt-in backward prefetch (UNSLOTH_GC_PREFETCH=1): while checkpoint k runs its
-# backward, the host to device copy of checkpoint k-1's activation is issued into
-# the other double buffer slot so it overlaps k's recompute. Only taken along a
-# verified sequential chain; anything else falls back to the on-demand reload.
+# UNSLOTH_GC_PREFETCH=1: during checkpoint k's backward, reload k-1 into the other slot.
+# Only along a verified sequential chain; otherwise falls back to on-demand reload.
 GC_PREFETCH = os.environ.get("UNSLOTH_GC_PREFETCH", "0") == "1"
 GC_PREFETCH_STATS = {"issued": 0, "consumed": 0, "dropped": 0}
 OFFLOAD_GENERATION = 0      # bumped at the first offload of every forward
@@ -782,13 +775,7 @@ pass
 
 
 def _prefetch_offloaded_input(cpu_index, device_index, generation, current_slot):
-    """Issue the reload of offloaded activation `cpu_index` into its double buffer slot.
-
-    Returns True when a copy was queued; `_take_prefetched` later decides whether
-    the consumer may use it. Any doubt (not double buffered, slot or device
-    mismatch, pageable host memory, buffer too small, a copy error) returns False
-    and the consumer reloads on demand exactly as without prefetch.
-    """
+    """Queue reload of `cpu_index` into its slot; any doubt returns False (on-demand reload)."""
     if not GC_PREFETCH or not USE_DOUBLE_BUFFER or GPU_BUFFERS_B is None: return False
     if cpu_index < 0 or cpu_index >= len(OFFLOAD_SLOT_META): return False
     meta = OFFLOAD_SLOT_META[cpu_index]
@@ -808,7 +795,6 @@ def _prefetch_offloaded_input(cpu_index, device_index, generation, current_slot)
         buffer = _view_bytes_as(gpu_staging, new_size, store_dtype, shape)
         x = _view_bytes_as(host_buffer, new_size, store_dtype, shape)
         EXTRA_STREAM = EXTRA_STREAMS[device_index]
-        # Wait for the last recompute that read this slot (recorded at the end of its backward).
         event_buffer = BUFFER_EVENTS_B if buffer_slot == 1 else BUFFER_EVENTS_A
         EXTRA_STREAM.wait_event(event_buffer[device_index])
         with torch_gpu_stream(EXTRA_STREAM):
@@ -1051,7 +1037,6 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         device = arg.device
                         device_index = device.index
                         GPU_BUFFER   = GPU_BUFFERS  [device_index]
-                        # The stream producing arg, read now: not necessarily the default stream.
                         MAIN_STREAM  = _compute_stream(device_index)
                         EXTRA_STREAM = EXTRA_STREAMS[device_index]
 
@@ -1221,7 +1206,6 @@ class UnslothCheckpointFunction(torch.autograd.Function):
             host_is_pinned = getattr(host_buffer, HOST_PINNED_ATTR, False)
             x = _view_bytes_as(host_buffer, new_size, store_dtype, shape)
 
-            # Autograd runs this backward on the stream its forward used; order against that one.
             MAIN_STREAM = _compute_stream(device_index)
             generation = getattr(ctx, "_offload_generation", None)
             use_prefetch = GC_PREFETCH and USE_DOUBLE_BUFFER and generation is not None \

@@ -14,22 +14,8 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Smart gradient checkpointing (CPU offload) when training runs on a non-default stream.
-
-The offload copies run on a side stream and must be ordered against the stream
-that produces and consumes each activation. That stream is whatever is current
-when forward / backward runs, not the device's default stream: a caller that
-trains under `torch.cuda.stream(s)` produces every activation on `s`.
-
-The stress test runs a checkpointed stack forward + backward on side streams
-(switching stream every step, fresh inputs every step) and compares every
-gradient with the same stack run without checkpointing. A `torch.cuda._sleep`
-inside each layer keeps the compute stream behind the host so an unordered copy
-reads the activation before it is written.
-
-The same harness checks the opt-in backward prefetch (UNSLOTH_GC_PREFETCH=1):
-gradients must be bit-equal with it on and off, and it must actually engage.
-"""
+"""Smart GC offload on non-default streams (incl. UNSLOTH_GC_PREFETCH=1): grads must match
+a non-checkpointed stack; `torch.cuda._sleep` in each layer exposes unordered copies."""
 
 import pytest
 import torch
