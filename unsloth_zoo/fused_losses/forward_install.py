@@ -198,12 +198,17 @@ def _head_built_as_linear(cls, head_attr) -> bool:
     return True
 
 
-def _can_fuse_loss(loss_function):
-    from transformers.loss.loss_utils import ForCausalLMLoss
+# Pinned at import: a later rebinding of the module symbol must not pass as stock.
+try:
+    from transformers.loss.loss_utils import ForCausalLMLoss as _STOCK_CAUSAL_LM_LOSS
+except ImportError:
+    _STOCK_CAUSAL_LM_LOSS = None
 
+
+def _can_fuse_loss(loss_function):
     # A self-reference, rather than a bool, rejects custom functools.wraps wrappers
     # which copy the original function's attributes but can change its loss.
-    return getattr(loss_function, "_unsloth_fused_loss", ForCausalLMLoss) is loss_function
+    return loss_function is not None and getattr(loss_function, "_unsloth_fused_loss", _STOCK_CAUSAL_LM_LOSS) is loss_function
 
 
 def install_for_class(cls) -> bool:

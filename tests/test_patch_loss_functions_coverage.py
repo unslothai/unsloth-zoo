@@ -163,3 +163,17 @@ def test_compiled_patched_loss_fuses_inside_dynamo():
     finally:
         _restore(lu.LOSS_MAPPING, saved)
         torch._dynamo.reset()
+
+
+def test_rebound_stock_symbol_is_not_fusable(monkeypatch):
+    lu = pytest.importorskip("transformers.loss.loss_utils")
+    from unsloth_zoo.fused_losses.forward_install import _can_fuse_loss
+
+    stock = lu.ForCausalLMLoss
+
+    def custom(*args, **kwargs):
+        return 3 * stock(*args, **kwargs)
+
+    monkeypatch.setattr(lu, "ForCausalLMLoss", custom)
+    assert not _can_fuse_loss(custom)
+    assert _can_fuse_loss(stock)
