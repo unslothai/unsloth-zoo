@@ -1791,7 +1791,7 @@ def test_backbone_stack_hidden_states_and_cce_match_the_logits(family, tied):
             **common, max_position_embeddings=256, num_attention_heads=4,
             num_key_value_heads=2, attention_bias=False, mamba_num_heads=4, mamba_head_dim=16,
             mamba_proj_bias=False, ssm_state_size=16, mlp_bias=False, head_dim=16,
-            hybrid_override_pattern=["M", "*", "-", "M"],
+            hybrid_override_pattern=["M", "*", "-", "M"], num_hidden_layers=4,
         )
     else:
         args = mod.ModelArgs(
