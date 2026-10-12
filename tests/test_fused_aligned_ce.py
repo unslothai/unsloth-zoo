@@ -30,6 +30,7 @@ from unsloth_zoo.fused_losses.ast_rewriter import (
     rewrite_forward_source,
     rewrite_forward_source_spliced,
 )
+from unsloth_zoo.fused_losses.cross_entropy_loss import unsloth_count_aware_cross_entropy
 from unsloth_zoo.fused_losses.forward_adapter import EMPTY_LOGITS, unsloth_fused_lm_head_loss
 
 
@@ -202,6 +203,7 @@ def _compile(src):
         torch = torch, os = os, CrossEntropyLoss = CrossEntropyLoss,
         unsloth_fused_lm_head_loss = unsloth_fused_lm_head_loss, EMPTY_LOGITS = EMPTY_LOGITS,
         ForCausalLMLoss = ForCausalLMLoss,
+        unsloth_count_aware_cross_entropy = unsloth_count_aware_cross_entropy,
     )
     exec(textwrap.dedent(src), ns)
     return ns["forward"]

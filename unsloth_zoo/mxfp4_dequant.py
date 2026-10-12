@@ -97,15 +97,16 @@ if _HAS_TRITON:
         N, G,
         stride_out_e, stride_out_n, stride_out_k,
         BLOCK_N: tl.constexpr, BLOCK_G: tl.constexpr, USE_EXPERTS: tl.constexpr, USE_COUNTS: tl.constexpr,
-        BF16_BITS: tl.constexpr,
+        BF16_BITS: tl.constexpr, LONG_INDEXING: tl.constexpr,
     ):
         pid_e = tl.program_id(0)
         pid_n = tl.program_id(1)
         pid_g = tl.program_id(2)
         if USE_EXPERTS:
-            e = tl.load(experts_ptr + pid_e).to(tl.int64)
+            e = tl.load(experts_ptr + pid_e)
         else:
-            e = pid_e.to(tl.int64)
+            e = pid_e
+        e = e.to(tl.int64) if LONG_INDEXING else e.to(tl.int32)
         if USE_COUNTS:
             if tl.load(counts_ptr + e) == 0:
                 return
@@ -272,13 +273,15 @@ def _kernel_dequantize(blocks, scales, dtype, transpose, experts, token_counts, 
     else:
         BLOCK_N, BLOCK_G = (128, 1) if transpose else (64, 2)
     grid = (n_programs_e, triton.cdiv(N, BLOCK_N), triton.cdiv(G, BLOCK_G))
+    # int32 offsets only when transposed: untransposed expert-subset dequant ran ~5% slower in int32 (B200).
+    long_indexing = not transpose or E * N * K + BLOCK_N * K > 2**31
     _launch(grid, blocks, scales, out, experts, token_counts, N, G, stride_e, stride_n, stride_k,
-            BLOCK_N, BLOCK_G, bf16_bits)
+            BLOCK_N, BLOCK_G, bf16_bits, long_indexing)
     return out
 
 
 def _launch(grid, blocks, scales, out, experts, token_counts, N, G, stride_e, stride_n, stride_k,
-            BLOCK_N, BLOCK_G, bf16_bits):
+            BLOCK_N, BLOCK_G, bf16_bits, long_indexing):
     with torch.cuda.device(blocks.device):
         _mxfp4_dequant_kernel[grid](
             blocks, scales, out, experts if experts is not None else blocks,
@@ -287,7 +290,7 @@ def _launch(grid, blocks, scales, out, experts, token_counts, N, G, stride_e, st
             stride_e, stride_n, stride_k,
             BLOCK_N = BLOCK_N, BLOCK_G = BLOCK_G, USE_EXPERTS = experts is not None,
             USE_COUNTS = token_counts is not None,
-            BF16_BITS = bf16_bits, num_warps = 4,
+            BF16_BITS = bf16_bits, LONG_INDEXING = long_indexing, num_warps = 4,
         )
 
 

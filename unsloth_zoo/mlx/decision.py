@@ -293,6 +293,8 @@ def _load_network(folder, compute_dtype):
 
 _TYPES = ("choice", "score", "noul")
 _MAX_IMAGES = 8
+# An image is refused by its size before its pixels are read, which the processor's own limit comes too late for.
+_MAX_IMAGE_PIXELS = 4096 * 4096
 
 
 class DecisionRequestError(ValueError):
@@ -349,6 +351,42 @@ def _image_urls(state, images):
     return urls
 
 
+def _decode_images(urls):
+    import base64
+    import io
+
+    from PIL import Image
+
+    images = []
+    for url in urls:
+        try:
+            image = Image.open(io.BytesIO(base64.b64decode(url.partition(",")[2], validate = True)))
+            large = image.width * image.height > _MAX_IMAGE_PIXELS
+            if not large:
+                image.load()
+        except Exception as error:
+            raise DecisionRequestError("an image could not be decoded") from error
+        if large:
+            raise DecisionRequestError(f"an image is larger than {_MAX_IMAGE_PIXELS} pixels")
+        images.append(image)
+    return images
+
+
+def _without_image_parts(state):
+    """A chat-message state without its image parts, which are read as images and not as text."""
+    wrapped = isinstance(state, dict) and "messages" in state
+    messages = state["messages"] if wrapped else state
+    if not isinstance(messages, list):
+        return state
+    kept = []
+    for message in messages:
+        if isinstance(message, dict) and isinstance(message.get("content"), list):
+            parts = [part for part in message["content"] if not (isinstance(part, dict) and part.get("type") == "image_url" and "image_url" in part)]
+            message = {**message, "content": parts}
+        kept.append(message)
+    return {**state, "messages": kept} if wrapped else kept
+
+
 def _softmax(scores, temperature):
     if not all(math.isfinite(score) for score in scores):
         raise RuntimeError("the model could not evaluate the decision")
@@ -381,16 +419,18 @@ class DecisionPipeline:
     max_options = 255
     noul_true_first = False
     choice_sorted = False
+    reads_images = False
     temperatures = {}
 
     def answer(self, state, questions, images = None):
-        """Answers keyed by question id, and the prompt tokens spent. Image input is refused."""
+        """Answers keyed by question id, and the prompt tokens spent. Images are refused unless `reads_images`."""
         if state is None:
             raise DecisionRequestError('"state" must be provided')
         parsed = self._parse_questions(questions)
-        if _image_urls(state, images):
+        urls = _image_urls(state, images)
+        if urls and not self.reads_images:
             raise DecisionUnsupportedError("this model does not support images")
-        scores, tokens = self._scores(state, parsed)
+        scores, tokens = self._scores(_without_image_parts(state), parsed, _decode_images(urls)) if urls else self._scores(state, parsed)
         answers = {question.id: self._format_answer(question, variants) for question, variants in zip(parsed, scores)}
         return {"answers": answers, "usage": {"input_tokens": tokens, "output_tokens": 0}}
 
@@ -739,6 +779,32 @@ def _output_rows(head, token_ids):
 class _QwenModel(DecisionPipeline):
     # Below this many shared tokens a second pass costs more than it saves.
     _MIN_SHARED = 16
+    takes_images = False
+    _IMAGE = "<|vision_start|><|image_pad|><|vision_end|>"
+    _AFTER_IMAGES = ""
+    # The images of a request may not reach this on their own; it is the prompt length Clef's reference serves.
+    _IMAGE_TOKENS = 16384
+
+    @property
+    def reads_images(self):
+        # Tower-less conversions load vision_tower=None; the layout and forward here are Qwen3.5's only.
+        known = getattr(getattr(self.model, "config", None), "model_type", None) == "qwen3_5"
+        # Without its processor files a model loads with a bare tokenizer in the processor's place.
+        processor = getattr(getattr(self.model, "_processor", None), "image_processor", None)
+        return self.takes_images and known and getattr(self.model, "vision_tower", None) is not None and processor is not None
+
+    def encode_images(self, images):
+        """The token ids that stand for `images` in the prompt, and the pixels behind them."""
+        if not self.reads_images:
+            raise DecisionUnsupportedError("this model does not support images")
+        try:
+            encoded = self.model._processor(text = [self._IMAGE * len(images) + self._AFTER_IMAGES], images = list(images), return_tensors = "np")
+        except ValueError as error:
+            raise DecisionRequestError(f"an image could not be read: {error}") from error
+        ids = np.asarray(encoded["input_ids"])[0].tolist()
+        if len(ids) >= self._IMAGE_TOKENS:
+            raise DecisionRequestError(f"the images take {len(ids)} tokens; the maximum is {self._IMAGE_TOKENS}, send fewer or smaller images")
+        return ids, {name: mx.array(np.asarray(encoded[name])) for name in ("pixel_values", "image_grid_thw")}
 
     def _load(self, source, revision, dtype, token, adapter = None, load_in_4bit = False):
         from .loader import FastMLXModel
@@ -752,7 +818,8 @@ class _QwenModel(DecisionPipeline):
         if load_in_4bit:
             # The loader leaves the embeddings, the output head and the vision tower in 16-bit for the trainers that
             # train them. No decision head does, and together they are as large again as the quantized layers.
-            nn.quantize(self.model, 64, 4, class_predicate = lambda _, module: hasattr(module, "to_quantized") and module.weight.shape[-1] % 64 == 0)
+            tower = "vision_tower" if self.reads_images else "\0"
+            nn.quantize(self.model, 64, 4, class_predicate = lambda path, module: not path.startswith(tower) and hasattr(module, "to_quantized") and module.weight.shape[-1] % 64 == 0)
         self.model.eval()
 
     def _load_beside(self, folder, dtype, token, head_prefix, load_in_4bit = False):
@@ -775,35 +842,57 @@ class _QwenModel(DecisionPipeline):
         encoded = ((code, self._encode(code)) for code in codes)
         return [(code, ids[0]) for code, ids in encoded if len(ids) == 1][:limit]
 
-    def _hidden(self, ids):
+    def _merged(self, ids, media):
+        # An image advances positions by its grid, not its token count.
+        if media is None:
+            return {}
+        merged = self.model.get_input_embeddings(ids, media["pixel_values"], image_grid_thw = media["image_grid_thw"])
+        return {"inputs_embeds": merged.inputs_embeds, "position_ids": merged.position_ids}
+
+    def _hidden(self, ids, media = None):
         from .utils import _forward_text_hidden_states
 
-        return _forward_text_hidden_states(self.model, mx.array(ids)[None])[0]
+        ids = mx.array(ids)[None]
+        return _forward_text_hidden_states(self.model, ids, **self._merged(ids, media))[0]
 
-    def _hidden_states(self, prompts):
-        """The hidden states of each prompt; the prefix the prompts of a request share is run once and continued per prompt."""
+    def _hidden_states(self, prompts, media = None, images_end = 0):
+        """The hidden states of each prompt; the prefix the prompts of a request share is run once and continued per prompt.
+
+        The images of the prompts, which end at token `images_end`, are read in the shared pass."""
         from .utils import _forward_text_hidden_states, _get_text_model
 
         # Every prompt keeps at least one token of its own to continue with.
         shared = min(len(os.path.commonprefix(prompts)), min(map(len, prompts)) - 1) if len(prompts) > 1 else 0
-        if shared < self._MIN_SHARED:
-            yield from map(self._hidden, prompts)
+        if shared < max(self._MIN_SHARED, images_end):
+            yield from (self._hidden(ids, media) for ids in prompts)
             return
         cache = _get_text_model(self.model).make_cache()
-        head = _forward_text_hidden_states(self.model, mx.array(prompts[0][:shared])[None], cache = cache)[0]
+        prefix = mx.array(prompts[0][:shared])[None]
+        merged = self._merged(prefix, media)
+        head = _forward_text_hidden_states(self.model, prefix, cache = cache, **merged)[0]
         mx.eval(head, [entry.state for entry in cache])
+        # Text continues one position after the other from where the images left the count.
+        start = int(merged["position_ids"][0, 0, -1].item()) + 1 if merged else shared
         for ids in prompts:
             # A continuation is not told where it starts unless it is given its positions.
-            positions = mx.broadcast_to(mx.arange(shared, len(ids)), (3, 1, len(ids) - shared))
+            positions = mx.broadcast_to(mx.arange(start, start + len(ids) - shared), (3, 1, len(ids) - shared))
             tail = _forward_text_hidden_states(self.model, mx.array(ids[shared:])[None], cache = copy.deepcopy(cache), position_ids = positions)[0]
             yield mx.concatenate([head, tail])
 
-    def _scores(self, state, questions):
+    def _scores(self, state, questions, images = ()):
         from .generate import generation_mode
 
-        prompts = [[self._encode(prompt) for prompt in self._prompts(state, questions, question)] for question in questions]
+        image_ids, media = self.encode_images(images) if images else ([], None)
+        prompts = [[self._encode(prompt) for prompt in self._prompts(state, questions, question, *([len(images)] if images else []))] for question in questions]
+        images_end = 0
+        if media is not None:
+            # The tokenizer reads one placeholder per image, the processor as many as the image takes.
+            first = prompts[0][0].index(image_ids[0])
+            images_end = first + len(image_ids)
+            placeholders = len(self._encode(self._IMAGE)) * len(images)
+            prompts = [[ids[:first] + image_ids + ids[first + placeholders :] for ids in variants] for variants in prompts]
         with generation_mode(self.model):
-            hidden = self._hidden_states([ids for variants in prompts for ids in variants])
+            hidden = self._hidden_states([ids for variants in prompts for ids in variants], media, images_end)
             scores = [[self._read(question, ids, next(hidden)) for ids in variants] for question, variants in zip(questions, prompts)]
         return scores, sum(len(ids) for variants in prompts for ids in variants)
 
@@ -956,6 +1045,8 @@ class _OpenJevModel(_LabelModel):
     noul_true_first = True
     # The serving settings its model card documents.
     temperatures = {"choice": 0.85, "score": 0.85, "noul": 0.85 * 1.829074}
+    # A conversion that kept the vision tower reads screenshots; the published MLX ones dropped it.
+    takes_images = True
     _LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
     def __init__(self, folder, dtype, base_model, token):
@@ -970,14 +1061,15 @@ class _OpenJevModel(_LabelModel):
         name, default = ("yes", "The statement is true.") if key == "true" else ("no", "The statement is false.")
         return f"{name}: {_text(description) if description else default}"
 
-    def _prompts(self, state, questions, question):
+    def _prompts(self, state, questions, question, images = 0):
         listed = "".join(
             f"[{letter}] {self._option(question.type, key, description)}\n"
             for (letter, _), (key, description) in zip(self.labels, question.options)
         )
         suffix = " Rate along the ordered levels below (lowest first)." if question.type == "score" else ""
+        shown = self._IMAGE * images + "The screenshot shows the current screen.\n" if images else ""
         return [
-            f"<|im_start|>user\nState:\n{_text(state)}\n\nQuestion: {_text(question.instructions)}{suffix}\nOptions:\n{listed}"
+            f"<|im_start|>user\n{shown}State:\n{_text(state)}\n\nQuestion: {_text(question.instructions)}{suffix}\nOptions:\n{listed}"
             "\nAnswer with the letter of the best option only.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
         ]
 
@@ -1208,6 +1300,8 @@ class ClefModel(_QwenModel):
         return (folder / "joint_head_config.json").is_file() and (folder / "joint_head.safetensors").is_file()
     noul_true_first = True
     choice_sorted = True
+    takes_images = True
+    _AFTER_IMAGES = "\n"
     _SYSTEM = "Read the complete state and schema. Decide every field jointly. Each answer must be exactly one of that field's allowed options."
     _NOUL = {"true": "The proposition is true or the answer is yes.", "false": "The proposition is false or the answer is no."}
 
@@ -1274,9 +1368,12 @@ class ClefModel(_QwenModel):
             yield "END FIELD\n", None
         yield "\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:", None
 
-    def encode(self, state, questions, max_length = None):
-        """Token ids of the prompt and the (start, end) spans the head reads; a state too long for `max_length` loses its end."""
+    def encode(self, state, questions, max_length = None, image_ids = ()):
+        """Token ids of the prompt and the (start, end) spans the head reads; a state too long for `max_length` loses its end.
+
+        `image_ids`, from `encode_images`, go between the prompt's opening and the state."""
         pieces = [(self._encode(text), mark) for text, mark in self._pieces(state, questions)]
+        pieces[0] = (pieces[0][0] + list(image_ids), None)
         if max_length is not None:
             # The state is the second piece; everything else is the schema, which must fit whole.
             room = max_length - sum(len(piece) for piece, _ in pieces) + len(pieces[1][0])
@@ -1304,22 +1401,23 @@ class ClefModel(_QwenModel):
             raise ValueError("Clef reads its options from the output embedding too, which this model's output head does not expose")
         return output
 
-    def logits(self, ids, question_spans, option_spans, types, output = None):
+    def logits(self, ids, question_spans, option_spans, types, output = None, media = None):
         """One logit per option of the prompt, in question order; `types` index `_TYPE_IDS`."""
         output = output or self._output_head()
-        hidden = self._hidden(ids).astype(mx.float32)
+        hidden = self._hidden(ids, media).astype(mx.float32)
         # The head reads the output embedding but does not train it.
         lexical = [mx.stop_gradient(_output_rows(output, ids[start:end])) for spans in option_spans for start, end in spans]
         return self.head(hidden, lexical, question_spans, option_spans, types)
 
-    def _scores(self, state, questions):
+    def _scores(self, state, questions, images = ()):
         from .generate import generation_mode
 
-        ids, question_spans, option_spans = self.encode(state, questions)
+        image_ids, media = self.encode_images(images) if images else ((), None)
+        ids, question_spans, option_spans = self.encode(state, questions, image_ids = image_ids)
         # Found before generation mode, which swaps a quantized head's class.
         output = self._output_head()
         with generation_mode(self.model):
-            logits = self.logits(ids, question_spans, option_spans, [_TYPE_IDS.index(q.type) for q in questions], output).tolist()
+            logits = self.logits(ids, question_spans, option_spans, [_TYPE_IDS.index(q.type) for q in questions], output, media).tolist()
         bounds = [0]
         for spans in option_spans:
             bounds.append(bounds[-1] + len(spans))
@@ -2057,7 +2155,7 @@ class ClefNetwork(nn.Module):
             for module in adapters:
                 module.scale = 0.0
             pipeline.head = head
-            logits = pipeline.logits(item["input_ids"], item["question_spans"], item["option_spans"], item["types"])
+            logits = _item_logits(pipeline, item)
             mx.eval(logits)
         finally:
             pipeline.head = own
@@ -2074,7 +2172,8 @@ class ClefNetwork(nn.Module):
         rng.shuffle(order)
         names = list(source["questions"])
         try:
-            record = clef_training_item(self._pipeline, source["state"], {names[i]: source["questions"][names[i]] for i in order}, source.get("max_length"))
+            # The item already holds the images of the state, which a caller may have kept whole.
+            record = clef_training_item(self._pipeline, _without_image_parts(source["state"]), {names[i]: source["questions"][names[i]] for i in order}, source.get("max_length"), item.get("images"))
         except ValueError:
             return item
         return {**item, **record, "targets": [item["targets"][i] for i in order]}
@@ -2125,7 +2224,7 @@ def _clef_record_loss(network, item, objective = None, ordinal_scale = 0.0, refe
     """The loss summed over the questions of one record; `ordinal_scale` weighs its score questions' ordinal term and
     `kl_weight` the divergence of each question's distribution from that of the `reference` logits."""
     spans = item["option_spans"]
-    logits = network._pipeline.logits(item["input_ids"], item["question_spans"], spans, item["types"])
+    logits = _item_logits(network._pipeline, item)
     target = np.zeros((len(spans), logits.shape[0]), np.float32)
     start = 0
     for row, values in enumerate(item["targets"]):
@@ -2216,7 +2315,7 @@ def clef_logits(network, items):
         with generation_mode(pipeline.model):
             for item in items:
                 spans = item["option_spans"]
-                logits = np.array(pipeline.logits(item["input_ids"], item["question_spans"], spans, item["types"], output))
+                logits = np.array(_item_logits(pipeline, item, output = output))
                 out.append(np.split(logits, np.cumsum([len(options) for options in spans])[:-1]))
     finally:
         network.train(was_training)
@@ -2228,16 +2327,37 @@ def clef_option_keys(pipeline, question):
     return [key for key, _ in pipeline._parse_questions({"question": question})[0].options]
 
 
-def clef_training_item(pipeline, state, questions, max_length = None):
+def clef_training_item(pipeline, state, questions, max_length = None, images = None):
     """Tokenize one record as a Clef training item; the caller adds `targets`, a distribution per question over `clef_option_keys`.
 
+    `images` are PIL images or data URLs; with the image parts of a chat-message state they are read as a request's are.
     `source` keeps the record, which `permute_fields` encodes again with its questions reordered."""
     parsed = pipeline._parse_questions(questions)
-    ids, question_spans, option_spans = pipeline.encode(state, parsed, max_length)
-    return {
+    given = list(images or ())
+    urls = _image_urls(state, [image for image in given if isinstance(image, str)])
+    kept = given + urls[sum(isinstance(image, str) for image in given):]
+    images = _pictures(kept)
+    if len(images) > _MAX_IMAGES:
+        raise DecisionRequestError(f"too many images, the maximum is {_MAX_IMAGES}")
+    if urls:
+        state = _without_image_parts(state)
+    ids, question_spans, option_spans = pipeline.encode(state, parsed, max_length, pipeline.encode_images(images)[0] if images else ())
+    item = {
         "input_ids": ids, "question_spans": question_spans, "option_spans": option_spans, "types": [_TYPE_IDS.index(q.type) for q in parsed],
         "source": {"state": state, "questions": dict(questions), "max_length": max_length},
     }
+    # Kept as data URLs, decoded per read: stored pixels would outweigh the rest of a dataset.
+    return {**item, "images": kept} if kept else item
+
+
+def _pictures(images):
+    decoded = iter(_decode_images([image for image in images if isinstance(image, str)]))
+    return [next(decoded) if isinstance(image, str) else image for image in images]
+
+
+def _item_logits(pipeline, item, output = None):
+    media = pipeline.encode_images(_pictures(item["images"]))[1] if item.get("images") else None
+    return pipeline.logits(item["input_ids"], item["question_spans"], item["option_spans"], item["types"], output, media)
 
 
 def decision_logits(model, items, pad_token_id, batch_size = 16):

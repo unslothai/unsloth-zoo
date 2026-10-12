@@ -96,6 +96,15 @@ def test_decode_and_prefill_preserve_outputs_and_cache(monkeypatch):
             assert len(calls) == (1 if x.shape[1] == 1 else 0)
 
 
+def test_reentering_the_scope_does_not_reread_the_bodies(monkeypatch):
+    model = _model()
+    with decode.fused_decode_conv_silu(model):
+        pass
+    monkeypatch.setattr(decode, "_source_expression", lambda node: pytest.fail("read again"))
+    with decode.fused_decode_conv_silu(model):
+        assert type(model) is not native.Qwen3_5GatedDeltaNet
+
+
 def test_unsupported_geometry_uses_native(monkeypatch):
     monkeypatch.setattr(decode, "_decode_conv", lambda *args: pytest.fail("unsupported window reached Metal fusion"))
     wide, model = _model(9), _model()

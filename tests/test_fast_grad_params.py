@@ -101,6 +101,9 @@ def _train(model, out, kind = "hf", ga = 1, max_grad_norm = 1.0, steps = 10, eve
         tok.pad_token = tok.eos_token
         kw = dict(processing_class = tok, train_dataset = _dataset(labels = False))
         extra.setdefault("max_length", 64)
+        # SFTConfig turns bf16 on by default, which TrainingArguments refuses on a host without a bf16
+        # accelerator; TrainingArguments' own default (off) is what the hf arm already runs with there.
+        extra.setdefault("bf16", torch.cuda.is_available() and torch.cuda.is_bf16_supported())
     else:
         base, Args = Trainer, TrainingArguments
         kw = dict(train_dataset = _dataset())
@@ -183,6 +186,11 @@ def _unfreeze(model):
 def test_trainer_bitwise(tmp_path, kind, ga, max_grad_norm, set_to_none):
     if kind == "sft":
         pytest.importorskip("trl")
+        import inspect
+        from trl.trainer import sft_trainer
+        # trl 1.15 trains SFT through its fused LM head, a Triton kernel with no CPU path.
+        if not torch.cuda.is_available() and "fused_lm_head" in inspect.getsource(sft_trainer.SFTTrainer.compute_loss):
+            pytest.skip("this trl's SFT loss is a Triton GPU kernel")
     events = {2 * ga: _freeze_after_backward, 4 * ga + 1: _unfreeze}
     c = _both(_llama, tmp_path, kind = kind, ga = ga, max_grad_norm = max_grad_norm, events = events,
               set_to_none = set_to_none, expect_clip = max_grad_norm > 0 or TV >= (5, 3))
