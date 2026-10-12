@@ -14,8 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Packed Gemma-4 rows: the band probe never takes a mask-free packed row, and the forced-float32
-attention runs SDPA per document instead of over the dense block-causal mask."""
+"""Packed Gemma-4 rows: band probe rejects mask-free packed rows; float32 path runs per-document SDPA."""
 
 import pytest
 import torch
@@ -141,7 +140,6 @@ def test_per_document_sdpa_declines_other_masks():
     leaky = _block_causal(lengths)
     leaky[0, 0, 8, 2] = True
     assert _packed_document_sdpa(q, q, q, leaky, psl, None, 1.0, 1) is None
-    # A pad tail past the documents, a batch of rows, a window the mask does not carry.
     assert _packed_document_sdpa(q, q, q, _block_causal(lengths), torch.tensor([5, 6]), None, 1.0, 1) is None
     assert _packed_document_sdpa(q.expand(2, -1, -1, -1), q.expand(2, -1, -1, -1), q.expand(2, -1, -1, -1),
                                  _block_causal(lengths), psl, None, 1.0, 1) is None

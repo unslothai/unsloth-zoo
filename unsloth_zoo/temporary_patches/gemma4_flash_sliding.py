@@ -106,8 +106,6 @@ def _sdpa_maybe_flash_sliding(module, query, key, value, attention_mask,
         packed_seq_lengths = kwargs.get("packed_seq_lengths", None)
         if (attention_mask is None and _packed_documents(packed_seq_lengths)
                 and not torch.compiler.is_compiling()):
-            # No position_ids reached the mask builder, so transformers saw one sequence; the
-            # documents attend each other on every path from here.
             logger.warning_once(
                 "Unsloth: a packed gemma-4 row reached attention without a document mask "
                 "(no position_ids?), so its documents attend each other."

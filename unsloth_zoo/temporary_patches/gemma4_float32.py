@@ -366,7 +366,7 @@ def _patch_gemma4_text_attention(module, prefix):
     scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
     scaled_dot_product_attention = torch.compiler.disable(scaled_dot_product_attention, recursive = True)
     from .gemma4_banded_attention import _packed_document_sdpa
-    # Eager like the SDPA above: the mask check reads the mask on the host.
+    # Eager: the mask check syncs to host.
     packed_document_sdpa = torch.compiler.disable(_packed_document_sdpa, recursive = True)
     packed_documents = os.environ.get("UNSLOTH_GEMMA4_PACKED_DOCUMENTS", "1") != "0"
 
@@ -493,7 +493,6 @@ def _patch_gemma4_text_attention(module, prefix):
                 and getattr(self, "is_causal", True)
                 and packed_documents
             ):
-                # A packed row: SDPA per document, not over the (T, T) block-causal mask.
                 attn_output = packed_document_sdpa(
                     query_states,
                     key_states,

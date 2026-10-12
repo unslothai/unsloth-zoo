@@ -61,7 +61,7 @@ def _block_mask(w, nb, device):
 
 
 def _packed_documents(packed_seq_lengths):
-    """True when packed_seq_lengths names more than one document (no host sync)."""
+    """More than one packed document (no host sync)."""
     if packed_seq_lengths is None:
         return False
     numel = getattr(packed_seq_lengths, "numel", None)
@@ -83,8 +83,7 @@ def _mask_is_plain_band(mask, S, w, _block=1024, packed_seq_lengths=None):
     (shape[1] > 1) masks are rejected as well: the banded kernel applies one block
     mask to every head, so it cannot honour them. The verdict is stashed on the
     tensor itself, so it can never collide with a recycled object id.
-    A packed row (packed_seq_lengths with several documents) arriving with no mask
-    is not a plain band: its document boundaries are not in the mask to verify.
+    A mask-free packed row of several documents is not a plain band.
     """
     if mask is None:
         return not _packed_documents(packed_seq_lengths)
@@ -159,11 +158,11 @@ def _banded_sdpa_core(query, key, value, w, scaling, dropout, num_key_value_grou
     return out.transpose(1, 2).contiguous()               # (B,S,H,d) to match sdpa_attention_forward
 
 
-_PACKED_DOC_ENGAGED = [0]    # count of per-document packed SDPA invocations (debug)
+_PACKED_DOC_ENGAGED = [0]    # debug counter
 
 
 def _packed_lengths(packed_seq_lengths):
-    """Host tuple of document lengths, cached on the lengths tensor (one sync per batch)."""
+    # Cached on the tensor: one host sync per batch.
     cached = getattr(packed_seq_lengths, "_unsloth_lengths_tuple", None)
     if cached is not None:
         return cached
@@ -179,8 +178,7 @@ def _packed_lengths(packed_seq_lengths):
 
 
 def _mask_is_block_causal(mask, lengths, w, _block=1024):
-    """True only if `mask` (1, 1, T, T) is exactly causal (k > q - w when windowed) inside each
-    document of `lengths` and closed across them, with no in-band bias."""
+    """True only if `mask` (1,1,T,T) is exactly the (windowed) block-causal mask of `lengths`."""
     T = sum(lengths)
     if (not torch.is_tensor(mask) or mask.dim() != 4 or mask.shape[0] != 1 or mask.shape[1] != 1
             or mask.shape[-2] != T or mask.shape[-1] != T or min(lengths, default=0) <= 0):
@@ -188,7 +186,7 @@ def _mask_is_block_causal(mask, lengths, w, _block=1024):
     try:
         key = (lengths, w, mask._version)
     except RuntimeError:
-        key = None  # inference tensors carry no version counter: always rechecked
+        key = None  # inference tensors have no version: always recheck
     cached = getattr(mask, "_unsloth_block_causal", None)
     if key is not None and cached is not None and cached[0] == key:
         return cached[1]
@@ -220,16 +218,14 @@ def _mask_is_block_causal(mask, lengths, w, _block=1024):
 
 
 def _packed_document_sdpa(query, key, value, mask, packed_seq_lengths, w, scaling, num_key_value_groups):
-    """SDPA per packed document instead of over the (T, T) block-causal mask: the same result
-    without the T x T scores. q (1,H,T,d), k / v (1,Hkv,T,d) -> (1,H,T,d); None when the mask
-    is anything but the block-causal (windowed by w) mask of `packed_seq_lengths`."""
+    """Per-document SDPA for a packed row; None unless `mask` is its block-causal mask."""
     if query.shape[0] != 1 or key.shape[2] != query.shape[2]:
         return None
     lengths = _packed_lengths(packed_seq_lengths)
     if not lengths or not _mask_is_block_causal(mask, lengths, w):
         return None
     if num_key_value_groups > 1:
-        # Repeated heads keep SDPA's efficient kernel (enable_gqa leaves fp32 on the math one).
+        # enable_gqa would put fp32 on the math kernel.
         key = key.repeat_interleave(num_key_value_groups, dim=1)
         value = value.repeat_interleave(num_key_value_groups, dim=1)
     outs, start = [], 0
