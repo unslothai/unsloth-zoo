@@ -1370,6 +1370,21 @@ def test_an_omni_family_of_the_trainer_reads_media_as_the_trainer_does(clef, mon
             made.encode_media([], [clip])
     made._hidden([1, 2, 7, 7, 9, 3], media)
     made._hidden([1, 2], None)
+    # The trainer's preparation runs in its two halves: content on the media run, which may grow it (Phi-4 expands
+    # each image placeholder), positions on the whole prompt.
+    phases, prepare = [], utils._prepare_vlm_batch_for_compile
+
+    def grown(batch, config, phase = None):
+        phases.append(phase)
+        if phase == "content":
+            batch = {**batch, "input_ids": mx.array([[7, 7, 7, 9]]), "mm_token_type_ids": mx.array([[2, 2, 2, 0]])}
+        return prepare(batch, config, phase = phase)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(utils, "_prepare_vlm_batch_for_compile", grown)
+        longer, more = made.encode_media(["image"], [clip])
+        made._hidden([1, *longer, 3], more)
+    assert longer == [7, 7, 7, 9] and phases == ["content", "positions"] and forwards[-1]["mm_token_type_ids"].tolist() == [[0, 2, 2, 2, 0, 0]]
     # What the processor aligned to its tokens moves with them into the prompt; text alone is forwarded the same way.
     assert forwards[0]["mm_token_type_ids"].tolist() == [[0, 0, 2, 2, 0, 0]] and forwards[0]["input_ids"].tolist() == [[1, 2, 7, 7, 9, 3]]
     assert np.asarray(forwards[0]["audio_bounds"]).tolist() == [[[2, 4]]]

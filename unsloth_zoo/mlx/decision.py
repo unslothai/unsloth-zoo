@@ -746,12 +746,22 @@ def _lora_key(name):
     return name[name.index("layers.") :] if "layers." in name else name.rsplit(".", 1)[-1]
 
 
-def _off_decoder(stem):
-    """Whether an adapter stem's prefix, which `_lora_key` drops, names a tower, a projector or the talker."""
+def _layers_owner(name):
+    """What holds a path's numbered layers: `encoder` for `apm.encoder.layers.0.fc1`, None without numbered layers."""
+    return name.partition("layers.")[0].rstrip(".").rsplit(".", 1)[-1] if "layers." in name else None
+
+
+def _off_decoder(stem, owners):
+    """Whether an adapter stem names a tower, a projector or the talker, which the prefix `_lora_key` drops would say.
+
+    `owners` are what holds the decoder's layers in this model; a checkpoint stores it as `model` or `language_model`.
+    """
     from .loader import _OTHER_MODALITY_TOKENS, _STRONG_PROJECTOR_TOKENS, _VISION_ROLE_TOKENS, _role_tokens
 
     prefix = stem.partition("layers.")[0] if "layers." in stem else stem.rpartition(".")[0]
-    return bool(_role_tokens(prefix) & (_VISION_ROLE_TOKENS | _OTHER_MODALITY_TOKENS | _STRONG_PROJECTOR_TOKENS))
+    if _role_tokens(prefix) & (_VISION_ROLE_TOKENS | _OTHER_MODALITY_TOKENS | _STRONG_PROJECTOR_TOKENS):
+        return True
+    return "layers." in stem and _layers_owner(stem) not in {"model", "language_model", *owners}
 
 
 def _attach_lora(model, folder):
@@ -763,13 +773,14 @@ def _attach_lora(model, folder):
     config, adapter = _plain_lora(folder), mx.load(str(folder / "adapter_model.safetensors"))
     named = {name.rsplit(".lora_", 1)[0] for name in adapter}
     stems = {_lora_key(stem): stem for stem in named}
+    # An audio tower numbers its layers as the decoder does, whose adapter this is.
+    decoder, wrapped = {id(module) for _, module in _get_text_model(model).named_modules()}, []
+    owners = {_layers_owner(path) for path, module in model.named_modules() if id(module) in decoder} - {None}
     # Keys drop the prefix that says which tower a layer is in: same-numbered layers would collapse or land on the decoder.
-    if len(stems) != len(named) or any(_off_decoder(stem) for stem in named):
+    if len(stems) != len(named) or any(_off_decoder(stem, owners) for stem in named):
         raise ValueError(f"The adapter in {folder} is on a tower besides the decoder; only the decoder's adapters can be put on a Clef")
     if "lm_head" in stems:
         raise ValueError(f"The adapter in {folder} is on the output embedding, which a Clef's joint head reads as stored")
-    # An audio tower numbers its layers as the decoder does, whose adapter this is.
-    decoder, wrapped = {id(module) for _, module in _get_text_model(model).named_modules()}, []
     for path, module in model.named_modules():
         stem = stems.get(_lora_key(path)) if id(module) in decoder and isinstance(module, (nn.Linear, nn.QuantizedLinear)) else None
         if stem is None:
@@ -862,6 +873,11 @@ class _QwenModel(DecisionPipeline):
         return getattr(getattr(self.model, "config", None), "model_type", None)
 
     @property
+    def _vlm_config(self):
+        # What the trainer prepares a batch with: the loader's config mapping, else the model's.
+        return getattr(self.model, "_config", None) or self.model.config
+
+    @property
     def _trainer_family(self):
         """The family of a model whose media the MLX trainer prepares and forwards, as it does when it trains that family."""
         from .utils import _AUDIO_QUALIFIED_FAMILIES, _audio_family_from_processor
@@ -934,7 +950,10 @@ class _QwenModel(DecisionPipeline):
 
     def _trainer_media(self, images, audio):
         """`encode_media` as the MLX trainer collates a row, with its corrections for the family's processor."""
-        from .utils import _AudioClip, _assert_audio_runs_intact, _processor_vlm_inputs, _to_mx_vlm_batch, audio_merge_patch_needed, install_audio_merge_patch
+        from .utils import (
+            _AudioClip, _assert_audio_runs_intact, _prepare_vlm_batch_for_compile, _processor_vlm_inputs, _to_mx_vlm_batch, audio_merge_patch_needed,
+            install_audio_merge_patch,
+        )
 
         processor = self.model._processor
         if audio and audio_merge_patch_needed(self.model.config) and not self._media_checks.get("merge"):
@@ -944,7 +963,8 @@ class _QwenModel(DecisionPipeline):
         clips = [[_AudioClip(clip, _AUDIO_RATE) for clip in audio]] if audio else None
         inputs = dict(_processor_vlm_inputs(processor, [text], [list(images)], None, truncation = False, all_audio = clips))
         _assert_audio_runs_intact(inputs, [len(audio)], processor, None, truncated = False, clips = clips)
-        batch = _to_mx_vlm_batch(inputs)
+        # The content half of the trainer's preparation, which may expand placeholders (Phi-4's per-image runs).
+        batch = _prepare_vlm_batch_for_compile(_to_mx_vlm_batch(inputs), self._vlm_config, phase = "content")
         ids = batch.pop("input_ids")[0].tolist()
         # `run` places what the processor aligned to these tokens once they sit in a prompt.
         return ids, {"run": ids, **{name: value for name, value in batch.items() if name != "attention_mask" and not name.startswith("_unsloth_")}}
@@ -1029,7 +1049,7 @@ class _QwenModel(DecisionPipeline):
         return {name: getattr(merged, name) for name in names if getattr(merged, name, None) is not None}
 
     def _hidden(self, ids, media = None):
-        from .utils import _VLM_PER_ROW_MEDIA_KEYS, _VLM_RELOCATABLE_SIDECAR_KEYS, _forward_text_hidden_states, _vlm_hidden_states
+        from .utils import _VLM_PER_ROW_MEDIA_KEYS, _VLM_RELOCATABLE_SIDECAR_KEYS, _forward_text_hidden_states, _prepare_vlm_batch_for_compile, _vlm_hidden_states
 
         if self._trainer_family and (self.reads_images or self.reads_audio):
             # Text alone goes the same way, so that the records of one dataset are read alike.
@@ -1044,7 +1064,8 @@ class _QwenModel(DecisionPipeline):
                         value = [np.asarray(row) + start for row in value]
                     if name != "run":
                         batch[name] = value
-            return _vlm_hidden_states(self.model, batch)[0]
+            # Its positions half sees the whole prompt, as the trainer's sees the padded batch.
+            return _vlm_hidden_states(self.model, _prepare_vlm_batch_for_compile(batch, self._vlm_config, phase = "positions"))[0]
         ids = mx.array(ids)[None]
         return _forward_text_hidden_states(self.model, ids, **self._merged(ids, media))[0]
 
