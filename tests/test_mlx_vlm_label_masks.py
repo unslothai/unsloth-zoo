@@ -4845,7 +4845,7 @@ def test_a_clip_past_the_window_is_split_into_near_equal_pieces():
         assert _split_audio_past_the_window(rendered, clips, processor)[0] is rendered
 
 
-@pytest.mark.parametrize("row", ["messages", "prompt_completion"])
+@pytest.mark.parametrize("row", ["messages", "bare_list", "prompt_completion"])
 def test_collation_gives_each_piece_of_a_long_clip_its_own_run(monkeypatch, row):
     """Otherwise the audio past the window is never trained on."""
     seen = {}
@@ -4864,6 +4864,8 @@ def test_collation_gives_each_piece_of_a_long_clip_its_own_run(monkeypatch, row)
     item = _audio_row({"array": wave, "sampling_rate": 16000})
     if row == "prompt_completion":
         item = {"prompt": item["messages"][:1], "completion": item["messages"][1:]}
+    if row == "bare_list":
+        item = item["messages"]
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         batch = _finalized_collate([item], processor, 64, None)

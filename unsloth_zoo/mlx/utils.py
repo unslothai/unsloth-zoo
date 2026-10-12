@@ -9844,9 +9844,11 @@ def _collate_vlm_batch(items, processor, max_seq_length, image_size,
             )
         images = _extract_vlm_images(item, messages, image_size)
         audio = _extract_vlm_audio(item, messages, processor)
-        if raw is not item:
+        if raw is not item or isinstance(item, list):
             split, audio = _split_audio_past_the_window(messages, audio, processor)
-            if split is not messages:
+            if split is not messages and raw is item:
+                text = render_mlx_chat_example(processor, split, is_vlm=True)
+            elif split is not messages:
                 text = _render_vlm_messages(processor, split)
         all_texts.append(text)
         all_images.append(images)
